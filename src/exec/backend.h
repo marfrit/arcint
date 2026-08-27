@@ -6,6 +6,7 @@
 #include <string_view>
 #include <vector>
 
+#include "core/chat.h"
 #include "core/model_registry.h"
 #include "core/sampling.h"
 
@@ -86,6 +87,12 @@ public:
     virtual const ModelStatus& status() const = 0;
     virtual Tokenizer&         tokenizer()    = 0;
 
+    // Renders a chat request into the model's own prompt format. DESIGN.md §3.7
+    // makes the artifact the single source of truth for the template, so this
+    // is the backend's job: only it knows which template shipped with the
+    // weights. The stub answers with ChatML because it has no artifact.
+    virtual std::string render_chat(const ChatRequest& req) const = 0;
+
     virtual FinishReason generate(const GenerationInput& in, const TokenCallback& on_piece,
                                   GenerationStats& stats) = 0;
 };
@@ -95,5 +102,15 @@ public:
 // streaming can be observed; zero for the fastest possible round-trip.
 std::unique_ptr<Backend> make_stub_backend(const ModelEntry& entry, Quant quant, int n_ctx,
                                            int delay_ms = 0);
+
+#ifdef LIGENCE_OPENVINO
+struct Artifact;
+
+// M1: the OpenVINO executor. Throws std::runtime_error with a readable message
+// if the artifact cannot be compiled or validated.
+std::unique_ptr<Backend> make_ov_backend(const Artifact& artifact, Quant quant, int n_ctx,
+                                         const std::string& device,
+                                         const std::string& cache_dir);
+#endif
 
 }  // namespace lgc

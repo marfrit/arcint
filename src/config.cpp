@@ -39,8 +39,11 @@ std::string usage_text() {
         "  --model PATH              OpenVINO IR directory to serve\n"
         "  --stub                    serve the M0 stub backend (no model, no GPU)\n"
         "  --stub-delay-ms N         stub only: artificial latency per token\n"
-        "  --model-id ID             allowlist entry to validate against\n"
+        "  --model-id ID             allowlist entry to assert (default: from the\n"
+        "                            artifact directory name)\n"
         "  --quant q4|q8             weight format (default: q4)\n"
+        "  --device DEV              OpenVINO device (default: GPU.0)\n"
+        "  --cache-dir PATH          compiled-blob cache directory\n"
         "\n"
         "server\n"
         "  --host ADDR               bind address (default: 127.0.0.1)\n"
@@ -101,6 +104,12 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             const auto q = quant_parse(v);
             if (!q) return fail("--quant must be q4 or q8");
             cfg.quant = *q;
+        } else if (arg == "--device") {
+            if (!value(v)) return fail("--device needs a value");
+            cfg.device = std::string(v);
+        } else if (arg == "--cache-dir") {
+            if (!value(v)) return fail("--cache-dir needs a path");
+            cfg.cache_dir = std::string(v);
         } else if (arg == "--host") {
             if (!value(v)) return fail("--host needs a value");
             cfg.host = std::string(v);
@@ -155,32 +164,34 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     }
 #endif
 
-    if (cfg.model_id.empty()) {
-        if (!cfg.stub) {
-            return fail("--model-id is required: an artifact is validated against the allowlist");
-        }
-        cfg.model_id = kDefaultStubModel;
-    }
+    // With --model the allowlist entry comes from the artifact's own directory
+    // name, so --model-id is optional there; when it is given it is a claim that
+    // load_artifact checks against what it actually read.
+    if (cfg.model_id.empty() && cfg.stub) cfg.model_id = kDefaultStubModel;
 
-    const ModelEntry* entry = find_model(cfg.model_id);
-    if (entry == nullptr) {
-        std::string known;
-        for (const std::string& id : model_ids()) {
-            if (!known.empty()) known += ", ";
-            known += id;
+    const ModelEntry* entry = nullptr;
+    if (!cfg.model_id.empty()) {
+        entry = find_model(cfg.model_id);
+        if (entry == nullptr) {
+            std::string known;
+            for (const std::string& id : model_ids()) {
+                if (!known.empty()) known += ", ";
+                known += id;
+            }
+            return fail(log::format("'%s' is not in the allowlist (known: %s)",
+                                    cfg.model_id.c_str(), known.c_str()));
         }
-        return fail(log::format("'%s' is not in the allowlist (known: %s)", cfg.model_id.c_str(),
-                                known.c_str()));
-    }
-    if (!entry->accepts(cfg.quant)) {
-        return fail(log::format("%s does not allow quant %s", cfg.model_id.c_str(),
-                                quant_name(cfg.quant)));
+        if (!entry->accepts(cfg.quant)) {
+            return fail(log::format("%s does not allow quant %s", cfg.model_id.c_str(),
+                                    quant_name(cfg.quant)));
+        }
     }
 
     if (cfg.port < 1 || cfg.port > 65535) return fail("--port must be in [1, 65535]");
     if (cfg.parallel < 1) return fail("--parallel must be >= 1");
     if (cfg.http_threads < 0) return fail("--http-threads must be >= 0");
     if (cfg.stub_delay_ms < 0) return fail("--stub-delay-ms must be >= 0");
+    if (cfg.device.empty()) return fail("--device must not be empty");
     if (cfg.stub_delay_ms > 0 && !cfg.stub) return fail("--stub-delay-ms only applies to --stub");
     if (cfg.n_ctx < 0) return fail("--n-ctx must be >= 0");
     if (cfg.kv_block_size != 16 && cfg.kv_block_size != 32) {
@@ -195,7 +206,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.mtp != "on" && cfg.mtp != "off" && cfg.mtp != "auto") {
         return fail("--mtp must be on, off, or auto");
     }
-    if (cfg.mtp == "on" && !entry->has_mtp_head) {
+    if (cfg.mtp == "on" && entry != nullptr && !entry->has_mtp_head) {
         return fail(log::format("--mtp on: %s ships no MTP head", cfg.model_id.c_str()));
     }
 

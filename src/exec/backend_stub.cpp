@@ -103,6 +103,10 @@ public:
     const ModelStatus& status() const override { return status_; }
     Tokenizer&         tokenizer() override { return tokenizer_; }
 
+    std::string render_chat(const ChatRequest& req) const override {
+        return render_chatml_stub(req);
+    }
+
     FinishReason generate(const GenerationInput& in, const TokenCallback& on_piece,
                           GenerationStats& stats) override {
         using clock = std::chrono::steady_clock;

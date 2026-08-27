@@ -109,6 +109,21 @@ I/O**: attention layers take KV page tensors in and out, GDN layers take their
 recurrent state in and out. ligence owns every byte of cache; OV owns the
 math. Three compiled entry points:
 
+**What the artifact actually exports.** The IR is a *stateful* graph, not the
+stateless one this section assumes: the language model carries 80 internal
+variables — `cache_params.past.{key,value}.N` for the 10 full-attention layers
+and `conv`/`ssm` pairs for the 30 GDN layers — and takes `inputs_embeds`,
+`attention_mask`, `position_ids` and `beam_idx`, returning `logits`. The export
+is a VLM (`Qwen3_5MoeForConditionalGeneration`), so token ids go through a
+separate text-embeddings graph first; v1 never compiles the vision graphs.
+
+M1 therefore runs the stateful graph as exported, one sequence per
+`InferRequest`. That is not a retreat from ligence owning the cache: the state
+is reachable through `ov::VariableState::get_state()`/`set_state()`, which is
+exactly the handle the GDN ledger and its block-aligned checkpoints need, and
+`ov::pass::SDPAToPagedAttention` is available for the attention side. The
+three entry points below describe M2's shape, not M1's:
+
 1. **prefill graph** — chunked, variable token count, writes KV pages and GDN
    states.
 2. **decode graph** — fixed small shapes (1..k tokens per sequence for MTP
@@ -117,9 +132,31 @@ math. Three compiled entry points:
 
 Compiled blobs are cached on disk. The campaign found the OV default cache
 embeds weights in the blob and breaks fused-MoE import ("expert weight
-provider not initialized", openvino#37607); ligence uses the weightless mode
-with absolute weight paths, which was verified to import correctly (63 s warm
-vs 156 s cold on the A770).
+provider not initialized", openvino#37607); the weightless mode with absolute
+weight paths was expected to make imports safe (63 s warm vs 156 s cold on the
+A770).
+
+**Measured 2026-08-28 on the B60 with the b5 coder artifact: it does not.**
+Weightless mode still produced a poisoned blob, and the failure is worse than a
+slow start — the import succeeds, so the server comes up healthy and then
+throws `expert weight provider not initialized` on the *first infer*, i.e. it
+500s every request. Four cases, same artifact and device:
+
+| cache | compile | result |
+|---|---|---|
+| none | 44.6 s | correct output |
+| weightless blob written by an earlier process | 15.6 s | **poisoned** — 500 on first infer |
+| weightless, fresh directory | 53.3 s | correct output, no reusable blob written |
+| same fresh directory, second run | 50.7 s | correct output, still recompiled |
+
+The only genuinely fast import observed was the broken one. So M1 takes the
+position the rest of this document takes everywhere else: a cache that can
+change the answer is not a cache. The blob cache is opt-in (`--cache-dir`,
+off by default), and whatever it returns is **proven by a real forward pass at
+load time** before the server binds its socket. A graph that fails that proof
+is discarded and the IR is recompiled with caching switched off, so a poisoned
+blob cannot reach a request. The cost of being wrong is ~45 s of startup; the
+cost of trusting it is every answer.
 
 ### 3.3 Memory: paged KV + GDN ledger
 
@@ -320,7 +357,7 @@ and owns the state.
 | # | milestone | exit criterion | state |
 |---|---|---|---|
 | M0 | skeleton: HTTP server, /health, /props, console format | curl round-trip | **done** (`e55e33b`) |
-| M1 | single-sequence stateless-graph inference, greedy, 27B coder q4 on B60 | Prüfstand 10/10, ≥ 45 t/s | next |
+| M1 | single-sequence inference, greedy, 27B coder q4 on B60 | Prüfstand 10/10, ≥ 45 t/s | executor up, 51.4 t/s; gate pending |
 | M2 | paged KV + GDN ledger, chunked prefill | equivalence suite green, 256k context loads | |
 | M3 | prefix caching (block-aligned checkpoints) | warm/cold byte-equality, hit-rate stats on console | |
 | M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance | |

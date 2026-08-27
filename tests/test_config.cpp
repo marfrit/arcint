@@ -46,6 +46,20 @@ TEST(config_model_needs_an_openvino_build) {
     // This test binary is built without the OV backend, so --model must refuse
     // rather than start something that cannot run.
     CHECK(rejected({"--model", "/models/ov/x", "--model-id", "qwen3.8-27b"}));
+    CHECK(rejected({"--model", "/models/ov/x"}));
+}
+
+TEST(config_device_and_cache_dir) {
+    Config cfg;
+    CHECK(run({"--stub", "--device", "GPU.1", "--cache-dir", "/tmp/blobs"}, cfg).ok);
+    CHECK_EQ(cfg.device, std::string("GPU.1"));
+    CHECK_EQ(cfg.cache_dir, std::string("/tmp/blobs"));
+
+    Config def;
+    CHECK(run({"--stub"}, def).ok);
+    CHECK_EQ(def.device, std::string("GPU.0"));
+    CHECK(def.cache_dir.empty());
+    CHECK(rejected({"--stub", "--device"}));
 }
 
 TEST(config_enforces_the_allowlist) {

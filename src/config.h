@@ -14,6 +14,13 @@ struct Config {
     std::string model_id;  // allowlist entry; defaults to the coder under --stub
     Quant       quant = Quant::Q4;
 
+    // OpenVINO device string. GPU.0 is the B60 and GPU.1 the A770 on dirac;
+    // CPU is useful for correctness work when a card is busy.
+    std::string device = "GPU.0";
+
+    // Compiled-blob cache. Empty disables it; a cold MoE compile is ~2 minutes.
+    std::string cache_dir;
+
     std::string host = "127.0.0.1";
     int         port = 8090;
 

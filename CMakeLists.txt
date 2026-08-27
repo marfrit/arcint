@@ -47,8 +47,10 @@ target_include_directories(ligence_vendor SYSTEM INTERFACE "${CMAKE_CURRENT_SOUR
 add_library(ligence_core STATIC
   src/config.cpp
   src/util/log.cpp
+  src/util/sha256.cpp
   src/util/utf8.cpp
   src/util/text.cpp
+  src/core/artifact.cpp
   src/core/model_registry.cpp
   src/core/sampling.cpp
   src/core/stop.cpp
@@ -69,13 +71,6 @@ if(LIGENCE_WERROR)
 endif()
 
 if(LIGENCE_OPENVINO)
-  # The executor lands in M1. Say so plainly rather than failing with CMake's
-  # "Cannot find source file", which reads like a broken checkout.
-  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/exec/backend_ov.cpp")
-    message(FATAL_ERROR
-      "LIGENCE_OPENVINO=ON, but the OpenVINO executor does not exist yet "
-      "(milestone M1). Build without it and run with --stub.")
-  endif()
   find_package(OpenVINO REQUIRED COMPONENTS Runtime)
   target_sources(ligence_core PRIVATE src/exec/backend_ov.cpp)
   target_link_libraries(ligence_core PUBLIC openvino::runtime)
@@ -101,6 +96,7 @@ if(LIGENCE_TESTS)
     tests/test_text.cpp
     tests/test_config.cpp
     tests/test_provenance.cpp
+    tests/test_sha256.cpp
   )
   target_link_libraries(ligence-test PRIVATE ligence_core)
   target_include_directories(ligence-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")

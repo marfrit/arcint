@@ -312,7 +312,7 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
 
     for (const ToolSpec& t : prep.req.tools) prep.input.tool_names.push_back(t.name);
 
-    const std::string prompt = render_chatml_stub(prep.req);
+    const std::string prompt = ctx.backend->render_chat(prep.req);
     if (auto err = finish_prepare(ctx, prompt, prep.req.sampler, prep.input, prep.prompt_tokens)) {
         return err;
     }
