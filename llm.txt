@@ -1,0 +1,61 @@
+# ligence
+
+> Narrow LLM inference engine for Intel Arc GPUs (A770 16GB, B60 24GB).
+> Serves exactly three hybrid GDN/attention Qwen models (Qwen3.6-35B-A3B,
+> Qwen3.6-27B-A3B-Coder, Qwen3.8-27B) in q4/q8. Uses OpenVINO as compiler
+> and kernel library; owns scheduling, paged KV cache, GDN recurrent-state
+> ledger, prefix caching, MTP speculative decoding, sampling, and HTTP
+> serving. NInfer philosophy (specialize, then be honest about numbers),
+> Intel substrate.
+
+## Contracts
+
+- HTTP: POST /v1/chat/completions, POST /v1/completions (OpenAI-compatible,
+  SSE streaming), GET /health, GET /props. No UI.
+- Console: llama.cpp-style one-line state/timing prints on stderr
+  (load, mem map, per-slot prefill/decode rates, cache hits, MTP acceptance).
+- Model input: OpenVINO IR (offline export), validated against a built-in
+  allowlist; anything else is rejected at load.
+- Hard invariant: greedy output is byte-identical across cold/warm prefix
+  cache, MTP on/off, chunked/unchunked prefill. Equivalence is a CI gate.
+
+## Key design points
+
+- All target models are hybrids: GatedDeltaNet (linear attention, fixed-size
+  recurrent state) on most layers + full attention (paged KV) on few.
+- GDN state checkpoints are block-aligned with KV pages so prefix-cache hits
+  restore both sides exactly; no approximate resume, ever.
+- Prefix index: keyed 128-bit block hashes with token verification on hit.
+- MTP: native head for Qwen3.8 (draft n, verify in one decode call);
+  external-drafter hook later. Draft tokens in scratch pages, promoted on
+  acceptance.
+- Compiled-blob disk cache in weightless mode with absolute weight paths
+  (avoids openvino#37607 embedded-weights import bug).
+- Quant: q4/q8 weights, fp16/q8 KV. Single GPU, single process, Xe KMD only.
+- Tokenizer + chat template ship in the model artifact (template hash in the
+  allowlist); incremental UTF-8-safe detokenization for streaming.
+- Tool calls parsed server-side (Qwen XML format) into OpenAI tool_calls;
+  never executed; no tools declared = raw text untouched.
+- Model-aware sampling defaults per allowlist entry; request fields override.
+- Context overflow = HTTP 400 with prompt_tokens/n_ctx/overflow. No
+  truncation, no context shift (GDN recurrent state cannot un-see tokens).
+- Client disconnect aborts GPU work at next scheduler boundary.
+- Prefill throughput is a first-class regression metric per card (measured
+  pain: 58 t/s prefill on A770/Vulkan = 6 min TTFT at 21k context).
+
+## Files
+
+- README.md: scope, features, non-goals, why-not-X.
+- DESIGN.md: architecture (§3), caching (§3.3–3.4), MTP (§3.5), serving (§4),
+  test gates (§5), evidence against upstream pipeline layer (§6),
+  milestones M0–M5 (§7), open questions (§8).
+
+## Provenance
+
+Design grounded in 2026-08 fleet measurement campaigns (ARCstory B5–B14):
+OpenVINO 60 t/s vs Vulkan 7.9 t/s on B60 for the same checkpoint; SE
+calibration degenerates greedy on dense Qwen3.8; OV GenAI CB path diverges
+from stateful under greedy (upstream issue 4367, CI equality test skipped
+since 2025-02); OV model-cache import bug and workaround (upstream issue
+37607). Performance bar: beat 60 t/s (27B q4, B60) while holding the
+equivalence invariants.
