@@ -19,6 +19,21 @@ anything; the invariants in §3.4/§3.8 and the gates in §5 are not negotiable.
   - **GPU.1 = Arc A770** (16 GB): `llama-agent.service` on :8087 (llama.cpp
     Vulkan, 262k). May be borrowed for experiments:
     `systemctl --user stop llama-agent`, restore after.
+  - **The cards are FULL while their services run.** Both units hold their
+    model VRAM permanently (B60 ~16 GiB coder IR, A770 the agent model).
+    Any ligence process that wants a card must **stop the resident service
+    first** — loading next to it fails with allocation errors at best, host
+    OOM at worst. Test-window ritual (both cards):
+
+        systemctl --user stop llama-agent      # A770 free
+        systemctl --user stop openarc-coder    # B60 free — PRODUCTION OFF,
+                                               # announce/keep windows short
+        ...experiment...
+        systemctl --user start openarc-coder llama-agent   # ALWAYS restore
+
+    Production restored after every window is fleet law, not courtesy.
+    Verify with `curl dirac.fritz.box:8080/v1/models` (coder, ~1 min reload)
+    and `:8087/v1/models` (agent) before calling the window closed.
   - Unit changes on dirac/boltzmann/bosch go through the **Roundhouse MCP**
     (`switch_preview`/`edit_rollout` etc.), NOT hand-edited systemctl/sed.
     Hand edits without a commit in `~/.config/systemd/user` crash roundhouse.
