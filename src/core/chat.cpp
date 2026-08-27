@@ -1,5 +1,7 @@
 #include "core/chat.h"
 
+#include <cstdint>
+
 #include "util/log.h"
 #include "util/text.h"
 
@@ -30,7 +32,7 @@ std::optional<std::string> read_content(const json& v, std::string& out, size_t 
 
     std::string joined;
     for (const json& part : v) {
-        if (!part.is_object() || !part.contains("type")) {
+        if (!part.is_object() || !part.contains("type") || !part["type"].is_string()) {
             return log::format("messages[%zu].content parts must be typed objects", index);
         }
         const std::string type = part["type"].get<std::string>();
@@ -107,10 +109,17 @@ std::optional<std::string> read_sampler(const json& b, SamplerOverrides& s) {
         dst = b[key].get<float>();
         return std::nullopt;
     };
+    // Read as int64 and range-check before narrowing: get<int>() on a value
+    // that does not fit wraps silently, and a client that asked for 2^33 tokens
+    // would quietly get four.
     auto integer = [&](const char* key, std::optional<int>& dst) -> std::optional<std::string> {
         if (!b.contains(key) || b[key].is_null()) return std::nullopt;
         if (!b[key].is_number_integer()) return log::format("%s must be an integer", key);
-        dst = b[key].get<int>();
+        const int64_t v = b[key].get<int64_t>();
+        if (v < INT32_MIN || v > INT32_MAX) {
+            return log::format("%s is out of range: %lld", key, static_cast<long long>(v));
+        }
+        dst = static_cast<int>(v);
         return std::nullopt;
     };
 
@@ -142,13 +151,15 @@ std::optional<std::string> read_sampler(const json& b, SamplerOverrides& s) {
         std::vector<int> ids;
         for (const json& e : b["stop_token_ids"]) {
             if (!e.is_number_integer()) return "stop_token_ids entries must be integers";
-            ids.push_back(e.get<int>());
+            const int64_t v = e.get<int64_t>();
+            if (v < INT32_MIN || v > INT32_MAX) return "stop_token_ids entries are out of range";
+            ids.push_back(static_cast<int>(v));
         }
         s.stop_token_ids = std::move(ids);
     }
 
     if (b.contains("n") && !b["n"].is_null()) {
-        if (!b["n"].is_number_integer() || b["n"].get<int>() != 1) {
+        if (!b["n"].is_number_integer() || b["n"].get<int64_t>() != 1) {
             // No n > 1 in v1: one slot serves one sequence, and fanning out
             // silently would misreport usage.
             return "n must be 1 (multiple choices per request are not supported)";
@@ -221,7 +232,10 @@ std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out
         if (msg.role == "tool" && msg.tool_call_id.empty()) {
             return log::format("messages[%zu]: a tool message needs tool_call_id", index);
         }
-        if (msg.content.empty() && msg.tool_calls.empty() && msg.role != "assistant") {
+        // A tool that returns an empty string must still be replayable; forcing
+        // the client to invent content would change what the model sees.
+        if (msg.content.empty() && msg.tool_calls.empty() && msg.role != "assistant" &&
+            msg.role != "tool") {
             return log::format("messages[%zu]: content must not be empty for role '%s'", index,
                                msg.role.c_str());
         }
@@ -267,7 +281,15 @@ std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out
                 return "tool_choice must be 'auto', 'none', 'required', or a function object";
             }
         } else if (tc.is_object()) {
+            // {"type":"function","function":{"name":"f"}} forces one named tool.
+            // Collapsing it to a bare "required" would drop which one.
             req.tool_choice = "required";
+            if (tc.contains("function") && tc["function"].is_object() &&
+                tc["function"].contains("name") && tc["function"]["name"].is_string()) {
+                req.tool_choice_function = tc["function"]["name"].get<std::string>();
+            } else {
+                return "tool_choice object must carry function.name";
+            }
         } else {
             return "tool_choice must be a string or an object";
         }
@@ -320,8 +342,7 @@ std::optional<std::string> parse_completion_request(const json& body, Completion
         req.echo = body["echo"].get<bool>();
     }
 
-    bool include_usage = true;
-    if (auto e = read_stream(body, req.stream, include_usage)) return e;
+    if (auto e = read_stream(body, req.stream, req.stream_include_usage)) return e;
     if (auto e = read_sampler(body, req.sampler)) return e;
 
     out = std::move(req);

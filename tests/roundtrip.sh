@@ -197,6 +197,68 @@ assert text == json.load(open(sys.argv[2]))["choices"][0]["text"], repr(text)
 PY
 check "streamed completion matches the non-streamed body" $?
 
+# ------------------------------------------------- regressions from the review
+#
+# Each of these was reproduced against a running server before it was fixed.
+
+code=$(curl -sS -o "${WORK}/badpart.json" -w '%{http_code}' "${BASE}/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":[{"type":123}]}]}')
+check "a malformed content part is a 400, not a 500" "$([[ $code == 400 ]] && echo 0 || echo 1)"
+jassert "${WORK}/badpart.json" '"json.exception" not in d["error"]["message"]'
+check "parser internals do not leak into the error body" $?
+
+code=$(curl -sS -o "${WORK}/bigmax.json" -w '%{http_code}' "${BASE}/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":8589934596}')
+check "an out-of-range max_tokens is rejected, not wrapped" "$([[ $code == 400 ]] && echo 0 || echo 1)"
+
+code=$(curl -sS -o /dev/null -w '%{http_code}' "${BASE}/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":null,"tool_calls":[{"id":"c0","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c0","content":""}]}')
+check "an empty tool result is accepted" "$([[ $code == 200 ]] && echo 0 || echo 1)"
+
+curl -sSN "${BASE}/v1/completions" -H 'Content-Type: application/json' \
+  -d '{"prompt":"x","temperature":0,"stream":true,"stream_options":{"include_usage":true}}' \
+  -o "${WORK}/compusage.sse"
+python3 - "${WORK}/compusage.sse" <<'PY2'
+import json, sys
+objs = [json.loads(l[6:]) for l in open(sys.argv[1], encoding="utf-8")
+        if l.startswith("data: ") and l.strip() != "data: [DONE]"]
+usage = [o["usage"] for o in objs if "usage" in o]
+assert len(usage) == 1, f"expected exactly one usage frame, got {len(usage)}"
+assert usage[0]["completion_tokens"] > 0
+PY2
+check "a streamed completion honours stream_options.include_usage" $?
+
+python3 - "${WORK}/tools.sse" <<'PY2'
+import json, sys
+objs = [json.loads(l[6:]) for l in open(sys.argv[1], encoding="utf-8")
+        if l.startswith("data: ") and l.strip() != "data: [DONE]"]
+deltas = [c["delta"]["tool_calls"] for o in objs for c in o["choices"]
+          if "tool_calls" in c.get("delta", {})]
+assert deltas, "no tool_calls delta"
+for group in deltas:
+    for i, call in enumerate(group):
+        # The OpenAI SDKs model ChoiceDeltaToolCall.index as a required int.
+        assert call.get("index") == i, f"missing or wrong index: {call}"
+PY2
+check "streamed tool_calls deltas carry the required index" $?
+
+# The SSE content provider must not report a normal end as a cancellation, or
+# httplib tears the connection down after every stream.
+curl -sSN "${BASE}/v1/chat/completions" -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"a"}],"temperature":0,"stream":true}' -o /dev/null \
+  --next -sSN "${BASE}/v1/chat/completions" -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"b"}],"temperature":0,"stream":true}' -o /dev/null \
+  -v 2>"${WORK}/keepalive.log"
+if grep -q 'Re-using existing' "${WORK}/keepalive.log" && \
+   ! grep -q 'shutting down connection' "${WORK}/keepalive.log"; then
+  pass "streaming keeps the connection alive for the next request"
+else
+  fail "streaming keeps the connection alive for the next request"
+fi
+
 # ----------------------------------------------------- context overflow (§3.8)
 python3 -c 'import json;print(json.dumps({"messages":[{"role":"user","content":"word "*4000}]}))' \
   > "${WORK}/big.json"

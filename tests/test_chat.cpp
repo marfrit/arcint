@@ -56,6 +56,81 @@ TEST(chat_rejects_non_text_content_parts) {
     CHECK(parse_chat_request(body, req).has_value());
 }
 
+TEST(chat_rejects_a_non_string_content_part_type) {
+    // Must be a 400 from the parser, not a 500 from nlohmann throwing.
+    json body                      = minimal_chat();
+    body["messages"][0]["content"] = json::array({{{"type", 123}}});
+
+    ChatRequest req;
+    CHECK(parse_chat_request(body, req).has_value());
+}
+
+TEST(chat_rejects_out_of_range_integers_instead_of_wrapping) {
+    // get<int>() on 2^33+4 wraps to 4: the client asks for billions of tokens
+    // and silently gets four.
+    auto rejects = [](const char* key, int64_t value) {
+        json body  = minimal_chat();
+        body[key]  = value;
+        ChatRequest req;
+        return parse_chat_request(body, req).has_value();
+    };
+
+    CHECK(rejects("max_tokens", 8589934596LL));   // 2^33 + 4
+    CHECK(rejects("max_tokens", 2147483648LL));   // 2^31
+    CHECK(rejects("top_k", 4294967296LL));
+    CHECK(rejects("max_completion_tokens", 8589934596LL));
+
+    json body               = minimal_chat();
+    body["stop_token_ids"]  = json::array({8589934596LL});
+    ChatRequest req;
+    CHECK(parse_chat_request(body, req).has_value());
+}
+
+TEST(chat_accepts_an_empty_tool_result) {
+    // A tool that legitimately returns "" must be replayable without the client
+    // inventing content.
+    json body = minimal_chat();
+    body["messages"].push_back(
+        json{{"role", "tool"}, {"tool_call_id", "call_0"}, {"content", ""}});
+
+    ChatRequest req;
+    CHECK(!parse_chat_request(body, req).has_value());
+    CHECK_EQ(req.messages.size(), 2u);
+    CHECK_EQ(req.messages[1].content, std::string(""));
+}
+
+TEST(chat_tool_choice_object_keeps_the_named_function) {
+    json body           = minimal_chat();
+    body["tool_choice"] = json{{"type", "function"}, {"function", {{"name", "edit"}}}};
+
+    ChatRequest req;
+    CHECK(!parse_chat_request(body, req).has_value());
+    CHECK_EQ(req.tool_choice, std::string("required"));
+    CHECK_EQ(req.tool_choice_function, std::string("edit"));
+
+    // An object without function.name silently constrained nothing before.
+    json bad           = minimal_chat();
+    bad["tool_choice"] = json{{"type", "function"}};
+    ChatRequest ignored;
+    CHECK(parse_chat_request(bad, ignored).has_value());
+}
+
+TEST(completion_carries_stream_include_usage) {
+    CompletionRequest req;
+    CHECK(!parse_completion_request(
+               json{{"prompt", "x"},
+                    {"stream", true},
+                    {"stream_options", {{"include_usage", false}}}},
+               req)
+               .has_value());
+    CHECK(req.stream);
+    CHECK(!req.stream_include_usage);
+
+    CompletionRequest def;
+    CHECK(!parse_completion_request(json{{"prompt", "x"}}, def).has_value());
+    CHECK(def.stream_include_usage);
+}
+
 TEST(chat_reads_sampler_fields) {
     json body            = minimal_chat();
     body["temperature"]  = 0.2;

@@ -11,9 +11,17 @@
 //
 // The pinned numbers below are transcribed from models/allowlist-raw.json,
 // which was read off the actual IR directories on dirac:/models/ov/ on
-// 2026-08-28. Nothing here is inferred from the prose: the console sketch in
-// DESIGN.md §4 quotes "41 GDN + 7 attn layers", which the artifacts contradict
-// (40 layers, one in four full attention). The artifacts win.
+// 2026-08-28, and a test holds the two together. Where the artifacts and the
+// prose disagree the artifacts win: the console sketch in DESIGN.md §4 quotes
+// "41 GDN + 7 attn layers", and the IRs say 40 layers with one in four full
+// attention.
+//
+// One field is the exception and is marked as such: `has_mtp_head` comes from
+// DESIGN.md §3.5, not from any artifact, because the raw metadata records no
+// MTP field at all. It is therefore carried with `mtp_head_pinned = false`,
+// which downgrades a mismatch from a load refusal to a warning. Refusing to
+// load a real artifact over an unsourced claim would be the tail wagging the
+// dog.
 //
 // Provenance is part of the contract: the campaign showed scale-estimation
 // calibration degenerating greedy decoding on the dense 3.8 (0/10) where
@@ -52,8 +60,13 @@ struct ModelEntry {
     // Structure, as reported by the IR.
     std::string ov_arch;     // e.g. "Qwen3_5MoeForConditionalGeneration"
     std::string model_type;  // e.g. "qwen3_5_moe"
-    bool        moe          = false;
-    bool        has_mtp_head = false;  // DESIGN.md §3.5
+    bool moe = false;
+
+    // From DESIGN.md §3.5, not from the IR — see the header comment. Until an
+    // artifact confirms it, `mtp_head_pinned` stays false and validation only
+    // warns on a mismatch.
+    bool has_mtp_head    = false;
+    bool mtp_head_pinned = false;
     int         n_embd       = 0;
     int         n_expert     = 0;  // 0 for the dense model
 

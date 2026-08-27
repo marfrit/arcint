@@ -150,12 +150,25 @@ TEST(registry_validation_rejects_a_layer_mismatch) {
     CHECK(!res.errors.empty());
 }
 
-TEST(registry_validation_rejects_an_mtp_head_that_should_not_exist) {
+TEST(registry_unpinned_mtp_flag_only_warns) {
+    // has_mtp_head comes from DESIGN.md §3.5, not from any artifact. An
+    // unsourced claim must not refuse to load a real IR — it warns and the
+    // artifact wins.
     const ModelEntry* e = find_model("qwen3.6-27b-a3b-coder");
-    ArtifactInfo      a = good_coder_artifact();
-    a.has_mtp_head      = true;
+    CHECK(!e->mtp_head_pinned);
 
-    CHECK(!validate_artifact(*e, a).ok);
+    ArtifactInfo a = good_coder_artifact();
+    a.has_mtp_head = true;
+
+    const ValidationResult res = validate_artifact(*e, a);
+    CHECK(res.ok);
+    CHECK_EQ(res.warnings.size(), 1u);
+}
+
+TEST(registry_no_mtp_flag_claims_to_be_pinned) {
+    // If one is ever pinned, it must be because an artifact confirmed it — and
+    // then this test is the place to say so.
+    for (const ModelEntry& e : registry()) CHECK(!e.mtp_head_pinned);
 }
 
 TEST(registry_validation_rejects_a_foreign_id) {

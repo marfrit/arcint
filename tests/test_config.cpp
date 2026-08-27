@@ -54,6 +54,24 @@ TEST(config_enforces_the_allowlist) {
     CHECK(run({"--stub", "--model-id", "qwen3.8-27b"}, cfg).ok);
 }
 
+TEST(config_long_arguments_do_not_dangle) {
+    // strtol's out-pointer addresses the buffer it parsed; a temporary
+    // std::string leaves it dangling. Short values survive on SSO, so the bug
+    // only shows past the small-string threshold.
+    CHECK(rejected({"--stub", "--port", "1234567890123456789012345678901234567890"}));
+    CHECK(rejected({"--stub", "--port", "00000000000000000000000000000000000008090x"}));
+
+    Config cfg;
+    CHECK(run({"--stub", "--port", "0000000000000000000000000008090"}, cfg).ok);
+    CHECK_EQ(cfg.port, 8090);
+}
+
+TEST(config_rejects_out_of_range_integers) {
+    CHECK(rejected({"--stub", "--port", "99999999999999999999"}));
+    CHECK(rejected({"--stub", "--n-ctx", "2147483648"}));
+    CHECK(rejected({"--stub", "--parallel", "-9999999999"}));
+}
+
 TEST(config_validates_ranges) {
     CHECK(rejected({"--stub", "--port", "0"}));
     CHECK(rejected({"--stub", "--port", "70000"}));

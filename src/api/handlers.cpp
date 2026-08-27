@@ -38,12 +38,18 @@ json usage_json(const GenerationStats& s) {
                 {"total_tokens", s.prompt_tokens + s.completion_tokens}};
 }
 
-json tool_calls_json(const std::vector<ToolCall>& calls) {
+// `with_index` adds the per-call index. A streaming delta requires it (the
+// official OpenAI SDKs model ChoiceDeltaToolCall.index as a required int, and
+// reject a chunk without it); a non-streaming message does not carry it.
+json tool_calls_json(const std::vector<ToolCall>& calls, bool with_index) {
     json out = json::array();
-    for (const ToolCall& c : calls) {
-        out.push_back({{"id", c.id},
-                       {"type", "function"},
-                       {"function", {{"name", c.name}, {"arguments", c.arguments}}}});
+    for (size_t i = 0; i < calls.size(); ++i) {
+        const ToolCall& c = calls[i];
+        json            entry{{"id", c.id},
+                              {"type", "function"},
+                              {"function", {{"name", c.name}, {"arguments", c.arguments}}}};
+        if (with_index) entry["index"] = static_cast<int>(i);
+        out.push_back(std::move(entry));
     }
     return out;
 }
@@ -365,7 +371,7 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep) {
     } else {
         message["content"] =
             text::trim(content).empty() ? json(nullptr) : json(content);
-        message["tool_calls"] = tool_calls_json(calls);
+        message["tool_calls"] = tool_calls_json(calls, /*with_index=*/false);
     }
 
     const char* finish = calls.empty() ? finish_reason_name(reason) : "tool_calls";
@@ -457,7 +463,12 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, const SseWriter& 
             // is buffered and comes back as a tool_calls delta at the end. The
             // partial-suffix hold-back is what stops "<tool" going out on its
             // own when the marker straddles two pieces.
-            const size_t marker = accumulated.find(kToolOpen);
+            // Scan only the unexamined tail plus enough overlap for a marker
+            // that straddles the boundary. Rescanning from zero on every token
+            // is quadratic, and this path runs at 262k context.
+            const size_t scan_from =
+                streamed >= kToolOpen.size() ? streamed - kToolOpen.size() + 1 : 0;
+            const size_t marker = accumulated.find(kToolOpen, scan_from);
             const size_t safe_end =
                 marker != std::string::npos
                     ? marker
@@ -501,7 +512,9 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, const SseWriter& 
 
     if (!calls.empty()) {
         if (!sse_send(write, chunk(json::array({{{"index", 0},
-                                                 {"delta", {{"tool_calls", tool_calls_json(calls)}}},
+                                                 {"delta",
+                                                  {{"tool_calls",
+                                                    tool_calls_json(calls, /*with_index=*/true)}}},
                                                  {"finish_reason", nullptr}}})))) {
             return;
         }
@@ -583,6 +596,10 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep,
                                              {"logprobs", nullptr},
                                              {"finish_reason", finish_reason_name(reason)}}})))) {
         return;
+    }
+
+    if (prep.req.stream_include_usage) {
+        if (!sse_send(write, chunk(json::array(), json{{"usage", usage_json(stats)}}))) return;
     }
     write("data: [DONE]\n\n");
 }

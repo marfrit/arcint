@@ -122,7 +122,10 @@ void HttpServer::Impl::route() {
                     return sink.write(data.data(), data.size());
                 });
                 sink.done();
-                return false;
+                // httplib reads `false` as Error::Canceled and tears the
+                // connection down; the stream ended normally, so say so and let
+                // keep-alive survive.
+                return true;
             });
     });
 
@@ -150,7 +153,7 @@ void HttpServer::Impl::route() {
                     return sink.write(data.data(), data.size());
                 });
                 sink.done();
-                return false;
+                return true;
             });
     });
 }

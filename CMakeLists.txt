@@ -69,6 +69,13 @@ if(LIGENCE_WERROR)
 endif()
 
 if(LIGENCE_OPENVINO)
+  # The executor lands in M1. Say so plainly rather than failing with CMake's
+  # "Cannot find source file", which reads like a broken checkout.
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/exec/backend_ov.cpp")
+    message(FATAL_ERROR
+      "LIGENCE_OPENVINO=ON, but the OpenVINO executor does not exist yet "
+      "(milestone M1). Build without it and run with --stub.")
+  endif()
   find_package(OpenVINO REQUIRED COMPONENTS Runtime)
   target_sources(ligence_core PRIVATE src/exec/backend_ov.cpp)
   target_link_libraries(ligence_core PUBLIC openvino::runtime)
@@ -93,9 +100,13 @@ if(LIGENCE_TESTS)
     tests/test_chat.cpp
     tests/test_text.cpp
     tests/test_config.cpp
+    tests/test_provenance.cpp
   )
   target_link_libraries(ligence-test PRIVATE ligence_core)
   target_include_directories(ligence-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  # The provenance test reads models/allowlist-raw.json from the source tree.
+  target_compile_definitions(ligence-test PRIVATE
+    LIGENCE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   target_compile_options(ligence-test PRIVATE -Wall -Wextra -Wpedantic)
   add_test(NAME unit COMMAND ligence-test)
 

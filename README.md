@@ -110,9 +110,10 @@ holds the IR metadata the allowlist is pinned against.
 
     ./build/ligence --stub --port 8090 -v
 
-`-DLIGENCE_OPENVINO=ON` adds the executor backend (M1); without it `--model`
-is refused rather than silently starting something that cannot run.
-`-DLIGENCE_WERROR=ON` for the warning-clean build CI should use.
+`-DLIGENCE_OPENVINO=ON` is reserved for the executor backend and refuses to
+configure until M1 lands it; meanwhile `--model` is refused at startup rather
+than silently starting something that cannot run, and `--stub` is the only way
+in. `-DLIGENCE_WERROR=ON` for the warning-clean build CI should use.
 
 ## Why not just use …
 

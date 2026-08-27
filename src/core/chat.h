@@ -30,7 +30,11 @@ struct ChatRequest {
     std::vector<ChatMessage> messages;
     std::vector<ToolSpec>    tools;
     std::string              tool_choice = "auto";
-    bool                     stream      = false;
+
+    // Set when tool_choice named one function explicitly; empty otherwise.
+    std::string tool_choice_function;
+
+    bool stream = false;
 
     // stream_options.include_usage. Defaults on: DESIGN.md §3.7 requires usage
     // in the final chunk, so opting out is the client's explicit choice.
@@ -48,6 +52,7 @@ struct CompletionRequest {
     std::string      prompt;
     bool             stream = false;
     bool             echo   = false;
+    bool             stream_include_usage = true;
     SamplerOverrides sampler;
 };
 

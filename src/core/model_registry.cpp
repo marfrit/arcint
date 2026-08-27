@@ -39,6 +39,7 @@ std::vector<ModelEntry> build_registry() {
         e.model_type              = "qwen3_5_moe";
         e.moe                     = true;
         e.has_mtp_head            = false;  // no bundled MTP head on the 3.6 pair (§3.5)
+        e.mtp_head_pinned         = false;  // design prose, not artifact metadata
         e.n_embd                  = 2048;
         e.n_expert                = 184;  // pruned from 256
         e.full_attention_interval = 4;
@@ -63,6 +64,7 @@ std::vector<ModelEntry> build_registry() {
         e.model_type              = "qwen3_5_moe";
         e.moe                     = true;
         e.has_mtp_head            = false;  // §3.5
+        e.mtp_head_pinned         = false;
         e.n_embd                  = 2048;
         e.n_expert                = 256;
         e.full_attention_interval = 4;
@@ -87,6 +89,7 @@ std::vector<ModelEntry> build_registry() {
         e.model_type              = "qwen3_5";
         e.moe                     = false;  // dense (§2)
         e.has_mtp_head            = true;   // native MTP head (§3.5)
+        e.mtp_head_pinned         = false;  // unconfirmed by any artifact yet
         e.n_embd                  = 5120;
         e.n_expert                = 0;
         e.full_attention_interval = 4;
@@ -202,9 +205,16 @@ ValidationResult validate_artifact(const ModelEntry& entry, const ArtifactInfo& 
                                          entry.id.c_str()));
     }
     if (entry.has_mtp_head != seen.has_mtp_head) {
-        res.errors.push_back(log::format("MTP head mismatch: allowlist %s, artifact %s",
-                                         entry.has_mtp_head ? "present" : "absent",
-                                         seen.has_mtp_head ? "present" : "absent"));
+        const std::string msg = log::format("MTP head mismatch: allowlist %s, artifact %s",
+                                            entry.has_mtp_head ? "present" : "absent",
+                                            seen.has_mtp_head ? "present" : "absent");
+        // Only a refusal when the claim has a source. The allowlist's MTP flag
+        // is currently design prose, and prose must not block a real artifact.
+        if (entry.mtp_head_pinned) {
+            res.errors.push_back(msg);
+        } else {
+            res.warnings.push_back(msg + " (allowlist value is unpinned; artifact wins)");
+        }
     }
 
     check_int(res, "n_layer", entry.n_layer, seen.n_layer);

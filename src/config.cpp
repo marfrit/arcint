@@ -1,5 +1,6 @@
 #include "config.h"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -14,10 +15,16 @@ constexpr const char* kDefaultStubModel = "qwen3.6-27b-a3b-coder";
 
 bool parse_int(std::string_view s, int& out) {
     if (s.empty()) return false;
-    char*      end   = nullptr;
-    const long value = std::strtol(std::string(s).c_str(), &end, 10);
-    if (end == nullptr || *end != '\0') return false;
-    if (value < INT32_MIN || value > INT32_MAX) return false;
+
+    // The string must outlive `end`: strtol's out-pointer addresses the buffer
+    // it parsed, so handing it a temporary's c_str() leaves it dangling.
+    const std::string text(s);
+    char*             end = nullptr;
+    errno                 = 0;
+    const long long   value = std::strtoll(text.c_str(), &end, 10);
+
+    if (end == text.c_str() || end == nullptr || *end != '\0') return false;
+    if (errno == ERANGE || value < INT32_MIN || value > INT32_MAX) return false;
     out = static_cast<int>(value);
     return true;
 }
