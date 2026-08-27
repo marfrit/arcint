@@ -39,9 +39,18 @@ session that needs the cards past 03:00:
 
 The lock is self-expiring (epoch deadline; forgetting it costs watts, not
 mornings) and never overwrites a running foreign lock. If data is off, wake:
-plug on via hertz (`plug-switch`, AIN in fleet memory / ask `his`), then the
-boot chain brings dirac (`onboot=1`) and its user units up by itself; the
-coder API answers a few minutes after power-on.
+**FRITZ!DECT plug, AIN `11630 0190371`** —
+`ssh hertz 'sudo /opt/herding/power/plug-switch 116300190371 on'` (scripts
+address the plug by AIN, not by name). The boot chain then brings dirac
+(`onboot=1`) and its user units up by itself; the coder API answers a few
+minutes after power-on.
+
+**If data freezes or dies silently** (GPU experiments can do that): its
+kernel log survives on another box. data ships kmsg via **netconsole**
+(from .201/nic2, UDP :6666) to the hertz listener —
+`ssh hertz 'sudo tail -100 /var/log/boltz-netcon.log'` (shared capture file,
+lines carry the source IP; data's are the 192.168.88.201 ones). Check this
+FIRST after a freeze; the local journal dies with the box.
 
 ## Measurement discipline
 
