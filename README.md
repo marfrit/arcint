@@ -73,8 +73,31 @@ the design — see [DESIGN.md](DESIGN.md).
 
 ## Status
 
-Design phase. See [DESIGN.md](DESIGN.md) for the architecture and milestones,
+**M0 complete** — the serving skeleton runs on a stub backend: HTTP surface,
+console format, allowlist, sampler merging, stop sequences, UTF-8-safe
+streaming, tool-call parsing, context-overflow rejection and request
+cancellation, all covered by 83 unit cases and a 41-check curl round-trip.
+No model is loaded and no OpenVINO is linked yet; nothing here is a model
+result. **M1 next**: the OpenVINO executor, on dirac's B60.
+
+See [DESIGN.md](DESIGN.md) for the architecture and milestones,
 [llm.txt](llm.txt) for a machine-readable summary.
+
+## Building
+
+C++20, CMake, no network at build time — `third_party/` holds the two vendored
+single headers (cpp-httplib, nlohmann/json) and `models/allowlist-raw.json`
+holds the IR metadata the allowlist is pinned against.
+
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+    cmake --build build
+    ctest --test-dir build --output-on-failure
+
+    ./build/ligence --stub --port 8090 -v
+
+`-DLIGENCE_OPENVINO=ON` adds the executor backend (M1); without it `--model`
+is refused rather than silently starting something that cannot run.
+`-DLIGENCE_WERROR=ON` for the warning-clean build CI should use.
 
 ## Why not just use …
 
