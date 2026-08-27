@@ -13,9 +13,12 @@ anything; the invariants in §3.4/§3.8 and the gates in §5 are not negotiable.
   both Intel cards passed through, xe KMD):
   - Access: `ssh root@data 'pct exec 130 -- sudo -u mfritsche <cmd>'`, or the
     HTTP endpoints directly at `dirac.fritz.box`.
-  - **GPU.0 = Arc Pro B60** (24 GB, ~22.7 usable): PRODUCTION —
-    `openarc-coder.service` (user unit, mfritsche) serves `qwen3.6-coder` on
-    :8080, ~60 t/s. Do not disturb without an announced test window.
+  - **GPU.0 = Arc Pro B60** (24 GB, ~22.7 usable): `openarc-coder.service`
+    (user unit, mfritsche) serves `qwen3.6-coder` on :8080, ~60 t/s — the
+    performance baseline to beat. **No live consumers currently: this session
+    has full autonomy over both cards until further notice** (owner decision
+    2026-08-28). Stop/start services as the work requires, no announcements
+    needed.
   - **GPU.1 = Arc A770** (16 GB): `llama-agent.service` on :8087 (llama.cpp
     Vulkan, 262k). May be borrowed for experiments:
     `systemctl --user stop llama-agent`, restore after.
@@ -29,11 +32,12 @@ anything; the invariants in §3.4/§3.8 and the gates in §5 are not negotiable.
         systemctl --user stop openarc-coder    # B60 free — PRODUCTION OFF,
                                                # announce/keep windows short
         ...experiment...
-        systemctl --user start openarc-coder llama-agent   # ALWAYS restore
+        systemctl --user start openarc-coder llama-agent   # restore when done
 
-    Production restored after every window is fleet law, not courtesy.
-    Verify with `curl dirac.fritz.box:8080/v1/models` (coder, ~1 min reload)
-    and `:8087/v1/models` (agent) before calling the window closed.
+    Restore both services at the end of a work session so the fleet returns
+    to its normal state (boot defaults stay enabled either way). Verify with
+    `curl dirac.fritz.box:8080/v1/models` (coder, ~1 min reload) and
+    `:8087/v1/models` (agent).
   - Unit changes on dirac/boltzmann/bosch go through the **Roundhouse MCP**
     (`switch_preview`/`edit_rollout` etc.), NOT hand-edited systemctl/sed.
     Hand edits without a commit in `~/.config/systemd/user` crash roundhouse.
