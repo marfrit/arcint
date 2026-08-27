@@ -93,7 +93,7 @@ above are authoritative and the allowlist follows them.
 - src/: config, util/ (log, utf8, text), core/ (model_registry, sampling,
   stop, toolcall, chat), exec/ (backend interface + stub), api/ (error,
   handlers), http/ (cpp-httplib wiring).
-- tests/: 95 unit cases (hand-rolled harness, no framework) plus
+- tests/: 96 unit cases (hand-rolled harness, no framework) plus
   roundtrip.sh, a 48-check curl round-trip. Both wired into ctest.
 - third_party/: cpp-httplib 0.18.3, nlohmann/json 3.11.3, single headers.
 

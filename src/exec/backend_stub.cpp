@@ -175,6 +175,13 @@ private:
             in.sampler.greedy() ? "greedy"
                                 : log::format("temp %.2f", in.sampler.temperature).c_str());
 
+        // A four-byte code point, deliberately surrounded by ASCII so the
+        // tokenizer hands it out as its own piece and emit_split() tears it in
+        // half. Without one, nothing in the HTTP path ever exercises the
+        // streaming hold-back against a full-width sequence — the rest of this
+        // reply is two-byte Latin-1 supplement at most.
+        out += " \xf0\x9f\xa7\xa9";
+
         if (!in.tool_names.empty()) {
             out += "\n<tool_call>\n{\"name\": \"";
             out += in.tool_names.front();

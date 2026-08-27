@@ -14,7 +14,7 @@ constexpr size_t kMaxPayloadBytes = 64ull * 1024 * 1024;
 
 void send_json(httplib::Response& res, int status, const json& body) {
     res.status = status;
-    res.set_content(body.dump(), "application/json");
+    res.set_content(api::dump_json(body), "application/json");
 }
 
 bool read_json(const httplib::Request& req, httplib::Response& res, json& out) {

@@ -4,6 +4,11 @@
 
 namespace lgc::api {
 
+std::string dump_json(const nlohmann::json& body) {
+    return body.dump(-1, ' ', /*ensure_ascii=*/false,
+                     nlohmann::json::error_handler_t::replace);
+}
+
 nlohmann::json error_body(std::string_view message, std::string_view type,
                           std::string_view code, std::string_view param) {
     nlohmann::json err;

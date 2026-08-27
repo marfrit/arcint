@@ -269,7 +269,7 @@ One line per event, greppable, no colors by default, `-v` raises verbosity
   all byte-exact under greedy, all in CI, none skippable.
 - **Determinism**: two identical greedy runs produce identical bytes (verified
   on the A770/Vulkan agent baseline as achievable on this hardware class).
-- **In CI today (M0)**: 83 unit cases plus a 41-check curl round-trip, both
+- **In CI today (M0)**: 96 unit cases plus a 48-check curl round-trip, both
   under `ctest`. They cover the parts of the contract that need no GPU and are
   therefore already gateable — the overflow 400 and its numbers, tool-call
   parsing in both wire forms, the UTF-8 and stop-sequence hold-backs, the

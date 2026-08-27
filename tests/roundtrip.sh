@@ -128,7 +128,11 @@ assert len(usage) == 1 and usage[0]["completion_tokens"] > 0, "final chunk carri
 
 reference = json.load(open(whole))["choices"][0]["message"]["content"]
 assert text == reference, f"streamed text differs from non-streamed:\n{text!r}\n{reference!r}"
-assert "ü" in text and "·" in text, "multi-byte characters survived the stream"
+assert "ü" in text and "·" in text, "two-byte characters survived the stream"
+# A four-byte code point is the case that actually breaks naive chunking: the
+# stub emits it split across two callbacks.
+assert "\U0001F9E9" in text, f"four-byte code point did not survive: {text!r}"
+text.encode("utf-8").decode("utf-8")  # raises if anything got torn
 PY
 check "stream reassembles byte-identically to the non-streamed body" $?
 

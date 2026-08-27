@@ -82,3 +82,36 @@ TEST(utf8_count_codepoints) {
     CHECK_EQ(utf8::count_codepoints("\xe2\x82\xac"), 1u);
     CHECK_EQ(utf8::count_codepoints("a\xf0\x9f\xa7\xa9""b"), 3u);
 }
+
+// --------------------------------------------------------------------------
+// Serialisation of torn output. Streamer::flush() deliberately hands back an
+// incomplete sequence at end of stream; that must not cost the whole response.
+#include <nlohmann/json.hpp>
+
+#include "api/error.h"
+
+TEST(api_dump_survives_a_truncated_code_point) {
+    utf8::Streamer s;
+    CHECK_EQ(s.push("done \xf0\x9f"), std::string("done "));
+
+    const std::string tail = s.flush();  // half an emoji
+    CHECK_EQ(tail, std::string("\xf0\x9f"));
+    CHECK(!utf8::is_valid(tail));
+
+    const nlohmann::json body = {{"choices", {{{"message", {{"content", "done " + tail}}}}}}};
+
+    // The default dump() throws type_error.316 here, which the HTTP layer would
+    // report as a 500 and lose an entire generation over one torn character.
+    bool threw = false;
+    try {
+        (void)body.dump();
+    } catch (const nlohmann::json::exception&) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    const std::string out = lgc::api::dump_json(body);
+    CHECK(!out.empty());
+    CHECK(utf8::is_valid(out));
+    CHECK(out.find("done ") != std::string::npos);
+}

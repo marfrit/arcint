@@ -61,7 +61,7 @@ int effective_n_ctx(const Context& ctx) { return ctx.backend->status().n_ctx; }
 
 bool sse_send(const SseWriter& write, const json& payload) {
     std::string frame = "data: ";
-    frame += payload.dump();
+    frame += dump_json(payload);
     frame += "\n\n";
     return write(frame);
 }
