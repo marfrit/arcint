@@ -29,8 +29,7 @@ anything; the invariants in §3.4/§3.8 and the gates in §5 are not negotiable.
     OOM at worst. Test-window ritual (both cards):
 
         systemctl --user stop llama-agent      # A770 free
-        systemctl --user stop openarc-coder    # B60 free — PRODUCTION OFF,
-                                               # announce/keep windows short
+        systemctl --user stop openarc-coder    # B60 free
         ...experiment...
         systemctl --user start openarc-coder llama-agent   # restore when done
 
@@ -79,7 +78,7 @@ FIRST after a freeze; the local journal dies with the box.
   the bar; equivalence (cold/warm cache, MTP on/off) must be byte-exact.
 - A test must be able to fail (run the red case first), measurements at the
   endpoint that matters, no theatre.
-- Production restored after every test window; report what actually happened.
+- Services restored at the end of a work session; report what actually happened.
 
 ## Model selection for agents / subagents
 
