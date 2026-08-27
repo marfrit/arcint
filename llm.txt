@@ -10,7 +10,8 @@
 
 ## Status
 
-M0 done (commit e55e33b): serving skeleton on a stub backend. C++20/CMake,
+M0 done (e55e33b, reviewed and fixed in 9179f4e): serving skeleton on a stub
+backend. C++20/CMake,
 cpp-httplib + nlohmann/json vendored in third_party/, no network at build
 time. No OpenVINO linked, no weights, no caches — nothing it prints is a
 model result. M1 next: the OpenVINO executor on dirac's B60.
@@ -92,8 +93,8 @@ above are authoritative and the allowlist follows them.
 - src/: config, util/ (log, utf8, text), core/ (model_registry, sampling,
   stop, toolcall, chat), exec/ (backend interface + stub), api/ (error,
   handlers), http/ (cpp-httplib wiring).
-- tests/: 83 unit cases (hand-rolled harness, no framework) plus
-  roundtrip.sh, a 41-check curl round-trip. Both wired into ctest.
+- tests/: 95 unit cases (hand-rolled harness, no framework) plus
+  roundtrip.sh, a 48-check curl round-trip. Both wired into ctest.
 - third_party/: cpp-httplib 0.18.3, nlohmann/json 3.11.3, single headers.
 
 ## Build
@@ -102,9 +103,11 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ctest --test-dir build --output-on-failure
 ./build/ligence --stub --port 8090 -v
 
--DLIGENCE_OPENVINO=ON adds the executor backend (M1); without it --model is
-refused rather than starting something that cannot run. -DLIGENCE_WERROR=ON
-is warning-clean. UBSan clean; ASan does not run on aarch64 containers.
+-DLIGENCE_OPENVINO=ON is reserved for the executor and refuses to configure
+until M1; --model is refused at startup meanwhile, so --stub is the only way
+in. -DLIGENCE_WERROR=ON is warning-clean. Clean under ASan+UBSan with
+-fno-sanitize-recover, but ASan must run on x86_64 (dirac): it aborts at
+startup on aarch64 containers.
 
 ## Provenance
 

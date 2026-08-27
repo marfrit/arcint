@@ -276,11 +276,15 @@ One line per event, greppable, no colors by default, `-v` raises verbosity
   stream/non-stream equality of generated content, cancellation on client
   disconnect, slot accounting, and the allowlist's refusal of anything outside
   the table. The suite is verified red before green (breaking the UTF-8
-  boundary rule fails five cases and exits non-zero), builds warning-clean
-  under `-Wall -Wextra -Wpedantic -Werror`, and runs clean under UBSan with
-  `-fno-sanitize-recover`. ASan is not available on the aarch64 build container
-  (its allocator address-space check aborts at startup); that gap is open and
-  should be closed on an x86_64 host.
+  boundary rule fails five cases and exits non-zero), and builds warning-clean
+  under `-Wall -Wextra -Wpedantic -Werror`.
+- **Sanitizers**: clean under ASan + UBSan with `-fno-sanitize-recover`, unit
+  suite and round-trip both, plus a 200-request 24-way concurrency stress
+  across 8 slots with every slot exercised and released. ASan has to run on
+  dirac: it aborts at startup on the aarch64 build container (allocator
+  address-space check), so x86_64 is where that gate lives. It earns its
+  keep — the M0 review's use-after-free in the argument parser reproduces as
+  a clean ASan report on dirac and disappears with the fix.
 - Perf regression tracking against the campaign numbers: B60 ≥ 60 t/s decode
   for the 27B coder q4 (the OpenVINO baseline it must beat to justify its
   existence), A770 ≥ 17 t/s for the dense 3.8.

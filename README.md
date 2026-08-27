@@ -91,7 +91,8 @@ run against a model yet — there is no OpenVINO in the build until M1.
 **M0 complete** — the serving skeleton runs on a stub backend: HTTP surface,
 console format, allowlist, sampler merging, stop sequences, UTF-8-safe
 streaming, tool-call parsing, context-overflow rejection and request
-cancellation, all covered by 83 unit cases and a 41-check curl round-trip.
+cancellation, all covered by 95 unit cases and a 48-check curl round-trip
+(clean under ASan+UBSan).
 No model is loaded and no OpenVINO is linked yet; nothing here is a model
 result. **M1 next**: the OpenVINO executor, on dirac's B60.
 
