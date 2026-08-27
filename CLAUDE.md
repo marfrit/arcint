@@ -2,7 +2,7 @@
 
 Source of truth: README.md (scope), DESIGN.md (architecture, invariants,
 milestones), llm.txt (machine summary). Read DESIGN.md before touching
-anything; the invariants in §3.4/§3.7 and the gates in §5 are not negotiable.
+anything; the invariants in §3.4/§3.8 and the gates in §5 are not negotiable.
 
 ## Infra (this session does NOT inherit the fleet CLAUDE.md or its memory)
 

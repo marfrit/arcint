@@ -147,7 +147,7 @@ decoding sends some reasoning models into thinking spirals that look like
 quant damage). Requests without explicit sampler fields get the card values;
 explicit fields always win; `/props` shows both.
 
-### 3.8 Tokenizer, templates, tool calls
+### 3.7 Tokenizer, templates, tool calls
 
 - **Tokenizer and chat template ship inside the model artifact** (the OV IR
   directory already carries `openvino_tokenizers` and the jinja template).
@@ -171,7 +171,7 @@ explicit fields always win; `/props` shows both.
   and retry; a card that keeps computing for a dead socket is wasted joules
   and a blocked slot.
 
-### 3.7 Context-overflow policy
+### 3.8 Context-overflow policy
 
 A prompt (or a continuation) that exceeds the model context is **rejected with
 HTTP 400** and a JSON body carrying the numbers (`prompt_tokens`, `n_ctx`,
