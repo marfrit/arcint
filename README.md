@@ -13,13 +13,16 @@ the KV and recurrent-state memory, prefix caching, and speculative decoding.
 
 ## Scope
 
-**Models** (these, and nothing else):
+**Models** (these, and nothing else). Geometry read off the IRs on
+2026-08-28 and kept in [models/allowlist-raw.json](models/allowlist-raw.json);
+all three are `full_attention_interval = 4`, 262144 context, and share one
+tokenizer:
 
-| model | architecture | quant |
-|---|---|---|
-| Qwen3.6-35B-A3B | hybrid GDN + attention, MoE | q4, q8 |
-| Qwen3.6-27B-A3B-Coder | hybrid GDN + attention, MoE | q4, q8 |
-| Qwen3.8-27B | hybrid GDN + attention, dense | q4, q8 |
+| model | architecture | layers (GDN + attn) | experts | weights | quant |
+|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B | hybrid GDN + attention, MoE | 40 (30 + 10) | 256 | 17.4 GiB | q4, q8 |
+| Qwen3.6-27B-A3B-Coder | hybrid GDN + attention, MoE | 40 (30 + 10) | 184, pruned from 256 | 12.8 GiB | q4, q8 |
+| Qwen3.8-27B | hybrid GDN + attention, dense | 64 (48 + 16) | dense | 13.4 GiB | q4, q8 |
 
 **Hardware** (these, and nothing else):
 
@@ -34,32 +37,44 @@ the design — see [DESIGN.md](DESIGN.md).
 
 ## Features
 
-- OpenAI-compatible **`/v1/chat/completions`** and **`/v1/completions`** over HTTP.
-- **`/health`** (liveness, model-loaded, queue depth) and **`/props`**
+Marked **[M0]** where it works today against the stub backend, and **[planned]**
+where the design exists but the code does not. Nothing marked [M0] has been
+run against a model yet — there is no OpenVINO in the build until M1.
+
+- **[M0]** OpenAI-compatible **`/v1/chat/completions`** and **`/v1/completions`** over HTTP.
+- **[M0]** **`/health`** (liveness, model-loaded, queue depth) and **`/props`**
   (model metadata, context length, quant, cache configuration, build info).
-- **Prefix caching** for the full hybrid state — attention KV pages *and* GDN
+- **[planned]** **Prefix caching** for the full hybrid state — attention KV pages *and* GDN
   recurrent state — with a hard invariant: greedy output with a warm cache is
   byte-identical to greedy output with a cold one. Cache reuse that changes the
   answer is treated as a bug, not a documented quirk.
-- **Paged KV cache** for the attention layers; block-aligned GDN state
+- **[planned]** **Paged KV cache** for the attention layers; block-aligned GDN state
   checkpoints for the linear-attention layers.
-- **MTP speculative decoding** using the models' native multi-token-prediction
+- **[planned]** **MTP speculative decoding** using the models' native multi-token-prediction
   heads where the checkpoint ships one (Qwen3.8), with a hook for external
   drafters.
-- **Flash-attention-style fused SDPA** on the full-attention layers, where the
+- **[planned]** **Flash-attention-style fused SDPA** on the full-attention layers, where the
   OpenVINO kernel library provides it for the target Xe generation.
-- **Tool-call parsing**: native Qwen tool-call output is returned as structured
+- **[M0]** **Tool-call parsing**: native Qwen tool-call output is returned as structured
   `tool_calls` (OpenAI-compatible). Parsed, never executed; requests without
   declared tools get raw text untouched.
-- **Tokenizer and chat template come from the model artifact**, never from the
-  server — the template hash is part of the model allowlist.
-- **Model-aware sampling defaults** from the model card, per allowlist entry;
+- **[planned]** **Tokenizer and chat template come from the model artifact**, never from the
+  server — the template hash is part of the model allowlist. The hashes are
+  pinned already; M0 stands in a reversible splitter and a ChatML renderer that
+  M1 replaces with the artifact's own, and both are labelled as stubs in the
+  code.
+- **[M0]** **Model-aware sampling defaults** from the model card, per allowlist entry;
   explicit request fields always win.
-- **Hard context-overflow rejection**: HTTP 400 with the numbers. No silent
+- **[M0]** **Hard context-overflow rejection**: HTTP 400 with the numbers. No silent
   truncation, no context shift — on hybrid GDN models a shift is not even
   honestly implementable (the recurrent state cannot un-see past tokens).
   History management belongs to the client.
-- **Console state output** in the llama.cpp tradition: per-request timing lines
+- **[M0]** **Streaming that does not corrupt anything**: a multi-byte code
+  point is never split across two SSE chunks, a stop sequence never leaks out
+  one fragment at a time, and tool-call syntax never reaches a content delta.
+- **[M0]** **Cancellation**: a dropped client aborts the request at the next
+  scheduler boundary and frees its slot.
+- **[M0]** **Console state output** in the llama.cpp tradition: per-request timing lines
   (prefill/decode token counts and rates), slot states, memory-map printouts at
   startup, cache hit statistics. stderr is the dashboard.
 

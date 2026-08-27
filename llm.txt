@@ -8,16 +8,50 @@
 > serving. NInfer philosophy (specialize, then be honest about numbers),
 > Intel substrate.
 
+## Status
+
+M0 done (commit e55e33b): serving skeleton on a stub backend. C++20/CMake,
+cpp-httplib + nlohmann/json vendored in third_party/, no network at build
+time. No OpenVINO linked, no weights, no caches — nothing it prints is a
+model result. M1 next: the OpenVINO executor on dirac's B60.
+
+Implemented: the full HTTP surface, allowlist validation, sampler merging,
+stop sequences, UTF-8-safe streaming, tool-call parsing, context-overflow
+rejection, client-disconnect cancellation, console format.
+Not implemented: OpenVINO backend, KV pool, GDN ledger, prefix cache, MTP.
+Placeholders that must not survive M1: the stub tokenizer (a reversible
+splitter, not a BPE) and render_chatml_stub (not the model's template).
+
 ## Contracts
 
 - HTTP: POST /v1/chat/completions, POST /v1/completions (OpenAI-compatible,
-  SSE streaming), GET /health, GET /props. No UI.
+  SSE streaming), GET /health, GET /props, GET /v1/models. No UI.
 - Console: llama.cpp-style one-line state/timing prints on stderr
   (load, mem map, per-slot prefill/decode rates, cache hits, MTP acceptance).
 - Model input: OpenVINO IR (offline export), validated against a built-in
   allowlist; anything else is rejected at load.
 - Hard invariant: greedy output is byte-identical across cold/warm prefix
   cache, MTP on/off, chunked/unchunked prefill. Equivalence is a CI gate.
+
+## Target models (measured, models/allowlist-raw.json, dirac 2026-08-28)
+
+All three: full_attention_interval 4 (one layer in four is full attention),
+ctx 262144, tokenizer sha 87a7830d63fcf43b (shared), VLM-capable exports
+(*ForConditionalGeneration).
+
+- qwen3.6-27b-a3b-coder / qwen36-coder-b5-ov: qwen3_5_moe, 40 layers
+  (30 GDN + 10 attn), n_embd 2048, 184 experts (pruned from 256),
+  12.8 GiB, production, 10/10 on the Pruefstand.
+- qwen3.6-35b-a3b / qwen36-35b-a3b-int4-ov: qwen3_5_moe, 40 layers
+  (30 GDN + 10 attn), n_embd 2048, 256 experts, 17.4 GiB, unmeasured
+  against the current harness.
+- qwen3.8-27b / qwen38-b7c1-ov: qwen3_5 dense, 64 layers (48 GDN + 16 attn),
+  n_embd 5120, 13.4 GiB, provisional 7/10 (AWQ-only; SE calibration
+  degenerates greedy - do not re-add SE).
+
+Note: DESIGN.md section 4's original console sketch said "41 GDN + 7 attn
+layers | weights 15.9 GiB". That was illustrative and is wrong; the artifacts
+above are authoritative and the allowlist follows them.
 
 ## Key design points
 
@@ -34,21 +68,43 @@
 - Quant: q4/q8 weights, fp16/q8 KV. Single GPU, single process, Xe KMD only.
 - Tokenizer + chat template ship in the model artifact (template hash in the
   allowlist); incremental UTF-8-safe detokenization for streaming.
-- Tool calls parsed server-side (Qwen XML format) into OpenAI tool_calls;
-  never executed; no tools declared = raw text untouched.
+- Tool calls parsed server-side into OpenAI tool_calls; both Qwen wire forms
+  (JSON body, and the coder's <function=>/<parameter=> XML with schema-driven
+  type coercion); deterministic call ids; never executed; no tools declared =
+  parser never runs, raw text untouched.
 - Model-aware sampling defaults per allowlist entry; request fields override.
+  Still marked "provisional": allowlist-raw.json carries no sampler settings,
+  so the values are inherited from the Qwen3 family card, and /props says so.
 - Context overflow = HTTP 400 with prompt_tokens/n_ctx/overflow. No
   truncation, no context shift (GDN recurrent state cannot un-see tokens).
 - Client disconnect aborts GPU work at next scheduler boundary.
 - Prefill throughput is a first-class regression metric per card (measured
   pain: 58 t/s prefill on A770/Vulkan = 6 min TTFT at 21k context).
 
-## Files
+## Layout
 
-- README.md: scope, features, non-goals, why-not-X.
+- README.md: scope, features, non-goals, status, building, why-not-X.
 - DESIGN.md: architecture (§3), caching (§3.3–3.4), MTP (§3.5), serving (§4),
   test gates (§5), evidence against upstream pipeline layer (§6),
   milestones M0–M5 (§7), open questions (§8).
+- CLAUDE.md: session rules, dev hardware (dirac), measurement discipline.
+- models/allowlist-raw.json: raw IR metadata, the allowlist's provenance.
+- src/: config, util/ (log, utf8, text), core/ (model_registry, sampling,
+  stop, toolcall, chat), exec/ (backend interface + stub), api/ (error,
+  handlers), http/ (cpp-httplib wiring).
+- tests/: 83 unit cases (hand-rolled harness, no framework) plus
+  roundtrip.sh, a 41-check curl round-trip. Both wired into ctest.
+- third_party/: cpp-httplib 0.18.3, nlohmann/json 3.11.3, single headers.
+
+## Build
+
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
+ctest --test-dir build --output-on-failure
+./build/ligence --stub --port 8090 -v
+
+-DLIGENCE_OPENVINO=ON adds the executor backend (M1); without it --model is
+refused rather than starting something that cannot run. -DLIGENCE_WERROR=ON
+is warning-clean. UBSan clean; ASan does not run on aarch64 containers.
 
 ## Provenance
 

@@ -1,8 +1,11 @@
 # ligence — Design
 
-Status: draft, pre-implementation. Numbers cited below come from the 2026-08
-measurement campaigns on the actual target hardware (A770 on PCIe x4 Gen3, B60
-on x8 Gen4, both behind the xe KMD).
+Status: **M0 implemented** (serving skeleton on a stub backend, no OpenVINO
+linked, no weights loaded); M1 next. Performance numbers cited below come from
+the 2026-08 measurement campaigns on the actual target hardware (A770 on PCIe
+x4 Gen3, B60 on x8 Gen4, both behind the xe KMD). Model-structure numbers come
+from `models/allowlist-raw.json`, read off the IR directories on
+`dirac:/models/ov/` on 2026-08-28.
 
 ## 1. The one idea
 
@@ -25,7 +28,20 @@ So: **OpenVINO as compiler and kernel library, ligence as everything else.**
   layers carry a fixed-size recurrent state (GatedDeltaNet: conv state +
   delta-rule state per layer); a minority are classic full-attention layers
   with a KV cache. Qwen3.8-27B is dense; the two 3.6 models are MoE with a
-  shared expert.
+  shared expert. The IRs put concrete numbers on "majority" — every one of the
+  three reports `full_attention_interval = 4`, i.e. one layer in four is full
+  attention:
+
+  | model | IR arch | layers | GDN | attn | n_embd | experts | ctx | weights |
+  |---|---|---|---|---|---|---|---|---|
+  | Qwen3.6-27B-A3B-Coder | `qwen3_5_moe` | 40 | 30 | 10 | 2048 | 184 (pruned from 256) | 262144 | 12.8 GiB |
+  | Qwen3.6-35B-A3B | `qwen3_5_moe` | 40 | 30 | 10 | 2048 | 256 | 262144 | 17.4 GiB |
+  | Qwen3.8-27B | `qwen3_5` | 64 | 48 | 16 | 5120 | dense | 262144 | 13.4 GiB |
+
+  All three share one tokenizer (`87a7830d63fcf43b`), which is what makes a
+  single tokenizer implementation viable across the whole target set. The two
+  3.6 artifacts differ only in expert count: the coder is the 35B with 72 of
+  its 256 experts pruned away.
 - Recurrent state per sequence is **fixed-size and small** (tens of MB range);
   attention KV grows with context. This inverts the usual memory math: at 256k
   context the KV of the few attention layers dominates, at 4k the weights
@@ -73,6 +89,18 @@ else. Calibration lessons are encoded in the allowlist: the campaign showed
 that scale-estimation (SE) calibration degenerates greedy decoding on the
 dense 3.8 (0/10) while AWQ-only stays healthy (7/10) — artifact provenance is
 therefore part of the contract, not the user's problem.
+
+The allowlist is compiled in (`src/core/model_registry.cpp`); the values are
+transcribed from `models/allowlist-raw.json`, which is the raw IR read and
+stays in the tree as the provenance record. Each entry pins the architecture
+hash (`lm_xml_sha`), the chat-template hash and the tokenizer hash, plus the
+layer geometry and the trained context. A field the raw metadata does not
+carry is left unpinned: the artifact's observed value is then recorded and
+warned about rather than enforced, and `/props` reports it as `null` instead
+of a number. This is why the sampler defaults are still marked
+`"provenance": "provisional"` — `allowlist-raw.json` carries no sampler
+settings, so those values are inherited from the Qwen3 family card and are not
+yet a measured property of any artifact.
 
 ### 3.2 Graph strategy
 
@@ -199,16 +227,36 @@ to do it well.
 | `GET /health` | 200 + JSON: model, loaded, slots free/total, queue depth |
 | `GET /props` | model metadata: context length, quant, block size, KV dtype, GDN checkpoint config, MTP on/off, build info, sampler defaults |
 
-Console output (stderr), llama.cpp tradition:
+Console output (stderr), llama.cpp tradition. This is what M0 actually prints
+(copied from a run on a clean tree; a dirty tree appends `-dirty` to the sha):
 
 ```
-lgc  load: qwen3.6-27b-a3b-coder q4 | 41 GDN + 7 attn layers | weights 15.9 GiB
+lgc  boot: ligence 0.0.1 (b0ebc5c1ffcb) Release, GNU 14.2.0
+lgc  boot: stub backend: no model, no OpenVINO, synthetic output. Nothing measured here is a model result.
+lgc  load: qwen3.6-27b-a3b-coder q4 | 30 GDN + 10 attn layers | n_ctx 262144 (allowlist)
+lgc  mem:  kv pool and GDN ledger are not allocated before M2
+lgc  http: listening on 127.0.0.1:8090 | 2 slots
+lgc  slot 0: prefill    31 tok in  0.00 s (5231184.6 t/s)
+lgc  slot 0: decode     48 tok in  0.00 s (4755771.3 t/s)
+```
+
+The absurd stub rates are left as they are on purpose: a stub that emits
+tokens in microseconds should look like one. Capping the number would make the
+skeleton read like a measurement.
+
+The same lines once the executor and the caches exist (M2/M3, **illustrative
+formatting — the cache figures are not yet measured**; the model figures are
+the real ones from the table in §2):
+
+```
+lgc  load: qwen3.6-27b-a3b-coder q4 | 30 GDN + 10 attn layers | weights 12.8 GiB
 lgc  mem:  kv pool 4.2 GiB (2688 blocks à 32 tok) | gdn ledger 380 MiB | free 1.9 GiB
 lgc  slot 0: prefill  3812 tok in  4.31 s (884.5 t/s) | cache hit 2816 tok (73.9%)
 lgc  slot 0: decode    592 tok in  9.86 s ( 60.0 t/s) | mtp accept 61.2%
 ```
 
-One line per event, greppable, no colors by default, `-v` raises verbosity.
+One line per event, greppable, no colors by default, `-v` raises verbosity
+(`-v` adds one `http:` line per request, `-vv` is debug).
 
 ## 5. Testing and acceptance
 
@@ -221,6 +269,18 @@ One line per event, greppable, no colors by default, `-v` raises verbosity.
   all byte-exact under greedy, all in CI, none skippable.
 - **Determinism**: two identical greedy runs produce identical bytes (verified
   on the A770/Vulkan agent baseline as achievable on this hardware class).
+- **In CI today (M0)**: 83 unit cases plus a 41-check curl round-trip, both
+  under `ctest`. They cover the parts of the contract that need no GPU and are
+  therefore already gateable — the overflow 400 and its numbers, tool-call
+  parsing in both wire forms, the UTF-8 and stop-sequence hold-backs, the
+  stream/non-stream equality of generated content, cancellation on client
+  disconnect, slot accounting, and the allowlist's refusal of anything outside
+  the table. The suite is verified red before green (breaking the UTF-8
+  boundary rule fails five cases and exits non-zero), builds warning-clean
+  under `-Wall -Wextra -Wpedantic -Werror`, and runs clean under UBSan with
+  `-fno-sanitize-recover`. ASan is not available on the aarch64 build container
+  (its allocator address-space check aborts at startup); that gap is open and
+  should be closed on an x86_64 host.
 - Perf regression tracking against the campaign numbers: B60 ≥ 60 t/s decode
   for the 27B coder q4 (the OpenVINO baseline it must beat to justify its
   existence), A770 ≥ 17 t/s for the dense 3.8.
@@ -253,14 +313,23 @@ and owns the state.
 
 ## 7. Milestones
 
-| # | milestone | exit criterion |
-|---|---|---|
-| M0 | skeleton: HTTP server, /health, /props, console format | curl round-trip |
-| M1 | single-sequence stateless-graph inference, greedy, 27B coder q4 on B60 | Prüfstand 10/10, ≥ 45 t/s |
-| M2 | paged KV + GDN ledger, chunked prefill | equivalence suite green, 256k context loads |
-| M3 | prefix caching (block-aligned checkpoints) | warm/cold byte-equality, hit-rate stats on console |
-| M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance |
-| M5 | 35B MoE q4 on A770 (16 GB fit), q8 variants on B60 | all three models pass their gates |
+| # | milestone | exit criterion | state |
+|---|---|---|---|
+| M0 | skeleton: HTTP server, /health, /props, console format | curl round-trip | **done** (`e55e33b`) |
+| M1 | single-sequence stateless-graph inference, greedy, 27B coder q4 on B60 | Prüfstand 10/10, ≥ 45 t/s | next |
+| M2 | paged KV + GDN ledger, chunked prefill | equivalence suite green, 256k context loads | |
+| M3 | prefix caching (block-aligned checkpoints) | warm/cold byte-equality, hit-rate stats on console | |
+| M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance | |
+| M5 | 35B MoE q4 on A770 (16 GB fit), q8 variants on B60 | all three models pass their gates | |
+
+M0 went past its exit criterion on purpose: everything that does not need a
+GPU was implemented properly rather than stubbed, because that is where the
+invariants live and they are cheaper to get right before an executor is
+underneath them. What is genuinely absent is OpenVINO, weights, the KV pool,
+the GDN ledger, the prefix cache and MTP. Two placeholders are marked as such
+in the code and must not survive M1: the stub tokenizer is a reversible
+splitter and not a BPE, and `render_chatml_stub` is not the model's chat
+template — §3.7 keeps that in the artifact, and M1 takes both from the IR.
 
 Performance target that justifies the project, stated once: beat the OpenVINO
 GenAI baseline on the same card and artifact (60 t/s, 27B q4, B60) while
@@ -278,8 +347,11 @@ holding the equivalence invariants that upstream skips.
 - External drafter (dflash-style) for the 3.6 pair: NInfer ships DFlash with
   draft windows up to 15 for exactly this model — evidence the payoff is
   real. Pulled forward to an M4/M5 decision rather than "someday".
-- **Multimodal** (image/video): the target IRs are VLM exports, so the door
-  is open; v1 is text-only to keep the core small. Revisit after M5.
+- **Multimodal** (image/video): confirmed — all three IRs export as
+  `*ForConditionalGeneration` (`Qwen3_5MoeForConditionalGeneration`,
+  `Qwen3_5ForConditionalGeneration`), so the door is open. v1 is text-only to
+  keep the core small, and the request parser rejects non-text content parts
+  outright rather than dropping them silently. Revisit after M5.
 - **Anthropic Messages API** and a **local CLI** (`--prompt`, `--messages
   FILE`): small adapters over the same executor, useful for Claude-family
   clients and offline Prüfstand runs. Candidates for M0.5, not committed.
