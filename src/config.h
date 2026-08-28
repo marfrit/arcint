@@ -41,6 +41,13 @@ struct Config {
     // this is a real budget, not a formality (§3.3).
     int prefix_cache_mib = 0;
 
+    // Slice the hidden state to its last row before the LM head, so prefill
+    // computes one logit row rather than one per prompt token. On by default:
+    // it is what makes deep prompts fit at all, it is faster, and it does not
+    // change the output. The switch exists so the equivalence suite can prove
+    // that last claim rather than assert it.
+    bool slice_logits = true;
+
     int         kv_block_size             = 32;      // 16 or 32 — §8 benchmarks this
     std::string kv_dtype                  = "fp16";  // fp16 | q8
     int         gdn_checkpoint_budget_mib = 512;     // §3.3

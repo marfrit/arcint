@@ -57,6 +57,8 @@ std::string usage_text() {
         "  --prefill-chunk N         prefill chunk in tokens (0 = unchunked, the\n"
         "                            default; chunking is not bit-exact here)\n"
         "  --prefix-cache-mib N      prefix-cache budget in MiB (default: 0, off)\n"
+        "  --no-logits-slice         compute logits for every prompt token (slower,\n"
+        "                            and runs out of memory past a few thousand)\n"
         "  --kv-dtype fp16|q8        KV cache element type (default: fp16)\n"
         "  --gdn-checkpoint-budget N GDN checkpoint budget in MiB (default: 512)\n"
         "  --mtp on|off|auto         speculative decoding (default: auto)\n"
@@ -140,6 +142,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.prefix_cache_mib)) {
                 return fail("--prefix-cache-mib needs an integer");
             }
+        } else if (arg == "--no-logits-slice") {
+            cfg.slice_logits = false;
         } else if (arg == "--kv-block-size") {
             if (!value(v) || !parse_int(v, cfg.kv_block_size)) {
                 return fail("--kv-block-size needs an integer");

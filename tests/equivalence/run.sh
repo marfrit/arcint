@@ -71,6 +71,17 @@ cmp -s "$WORK/det1.txt" "$WORK/det2.txt" && pass "two greedy runs are byte-ident
 
 cp "$WORK/det1.txt" "$WORK/base.txt"
 
+# ------------------------------- the logits slice must not change the answer
+#
+# Slicing the hidden state to its last row before the LM head is what lets a
+# deep prompt fit at all. It is only safe because nothing samples the other
+# rows, and that is a claim worth gating rather than asserting.
+start_server "$WORK/noslice.log" --no-logits-slice || exit 1
+ask "$WORK/noslice.txt" "$PROMPT"
+cmp -s "$WORK/base.txt" "$WORK/noslice.txt" \
+  && pass "slicing logits to the last token does not change the answer" \
+  || fail "slicing logits to the last token does not change the answer"
+
 # --------------------------------- chunked vs unchunked: MEASURED, not gated
 #
 # Chunked prefill is not bit-exact on the OpenVINO GPU backend. That is a

@@ -15,11 +15,15 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <stdexcept>
 
 #include <openvino/openvino.hpp>
+#include <openvino/op/constant.hpp>
+#include <openvino/op/matmul.hpp>
+#include <openvino/op/slice.hpp>
 
 #include <minja/chat-template.hpp>
 
@@ -191,6 +195,49 @@ ov::Tensor deserialise_state(const std::vector<uint8_t>& blob) {
     return t;
 }
 
+// Only the final token's logits are ever sampled, but the graph computes them
+// for every prompt token: `logits` is [tokens, 1, 248320], so an unchunked 8k
+// prefill materialises 8.1 GiB of logits on top of 12.8 GiB of weights and the
+// card answers CL_OUT_OF_RESOURCES. Slicing the hidden state to its last row
+// just before the LM head makes prefill produce one row instead of `tokens`.
+//
+// This is a pure win, and it retires a trade-off rather than balancing one:
+// measured on the coder, unchunked prefill went from failing at ~8k to 9156 tok
+// at 2247 t/s and 27444 tok at 732 t/s, greedy output byte-identical to the
+// unsliced graph. It is faster than chunking *and* keeps the equality gate
+// chunking had to give up.
+bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model) {
+    const auto& results = model->get_results();
+    if (results.empty()) return false;
+
+    // Walk back through shape-only ops to the matmul that is the LM head.
+    std::shared_ptr<ov::Node> node = results[0]->input_value(0).get_node_shared_ptr();
+    for (int hop = 0; hop < 8 && node && node->get_input_size() > 0; ++hop) {
+        if (ov::as_type_ptr<ov::op::v0::MatMul>(node) != nullptr) break;
+        const std::string t = node->get_type_name();
+        if (t != "Convert" && t != "Reshape") return false;
+        node = node->input_value(0).get_node_shared_ptr();
+    }
+    if (ov::as_type_ptr<ov::op::v0::MatMul>(node) == nullptr) return false;
+
+    const ov::Output<ov::Node> hidden = node->input_value(0);
+    const ov::PartialShape&    ps     = hidden.get_partial_shape();
+    if (ps.rank().is_dynamic() || ps.rank().get_length() < 2) return false;
+    const int64_t axis = ps.rank().get_length() - 2;  // [..., tokens, hidden]
+
+    using ov::op::v0::Constant;
+    const auto start = Constant::create(ov::element::i64, {1}, {int64_t{-1}});
+    const auto stop  = Constant::create(ov::element::i64, {1},
+                                       {std::numeric_limits<int64_t>::max()});
+    const auto step  = Constant::create(ov::element::i64, {1}, {int64_t{1}});
+    const auto ax    = Constant::create(ov::element::i64, {1}, {axis});
+
+    const auto slice = std::make_shared<ov::op::v8::Slice>(hidden, start, stop, step, ax);
+    node->input(0).replace_source_output(slice->output(0));
+    model->validate_nodes_and_infer_types();
+    return true;
+}
+
 // -------------------------------------------------------------------- backend
 class OvBackend final : public Backend {
 public:
@@ -215,6 +262,18 @@ public:
 
         embed_req_ = embeddings_.create_infer_request();
 
+        std::shared_ptr<ov::Model> model = core_.read_model(artifact.language_model_xml);
+        if (cfg.slice_logits) {
+            if (slice_logits_to_last_token(model)) {
+                log::info("load", "%s", "logits sliced to the last token: prefill computes one "
+                                        "row instead of one per prompt token");
+            } else {
+                log::warn("load", "%s",
+                          "could not find the LM head to slice; prefill will materialise logits "
+                          "for every prompt token and will run out of memory at depth");
+            }
+        }
+
         log::info("load", "compiling language model on %s (%d layers, %d GDN + %d attn)",
                   device.c_str(), artifact.n_layer, artifact.n_gdn_layer, artifact.n_attn_layer);
 
@@ -237,7 +296,7 @@ public:
 
             auto t_cached = std::chrono::steady_clock::now();
             try {
-                language_    = core_.compile_model(artifact.language_model_xml, device, cfg);
+                language_    = core_.compile_model(model, device, cfg);
                 logits_port_ = language_.output(0);
                 lm_req_      = language_.create_infer_request();
                 warmup();
@@ -255,7 +314,7 @@ public:
             // blob cannot be read back in on the retry.
             core_.set_property(ov::cache_dir(""));
             auto t_cold  = std::chrono::steady_clock::now();
-            language_    = core_.compile_model(artifact.language_model_xml, device);
+            language_    = core_.compile_model(model, device);
             logits_port_ = language_.output(0);
             lm_req_      = language_.create_infer_request();
             warmup();

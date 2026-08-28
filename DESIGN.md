@@ -138,25 +138,28 @@ gate. The equivalence suite reports the chunking delta rather than gating on it,
 because gating on something the backend cannot deliver would only produce a
 permanently red test.
 
-**But chunking is not optional past a few thousand tokens, and the reason is
-not the KV.** The graph emits `logits` for *every* prompt token —
-`[tokens, 1, 248320]` — so an unchunked 8k prefill materialises 8.1 GiB of
-logits on top of 12.8 GiB of weights, and the B60 answers with
-`CL_OUT_OF_RESOURCES` from oneDNN. The attention KV at that depth is about
-335 MiB; it is nowhere near the problem. Measured on the coder, same card,
-same prompt of ~9.6k tokens:
+**The depth wall was never the KV, and it is now gone.** The graph emits
+`logits` for *every* prompt token — `[tokens, 1, 248320]` — so an unchunked 8k
+prefill materialised 8.1 GiB of logits on top of 12.8 GiB of weights and the
+B60 answered `CL_OUT_OF_RESOURCES` from oneDNN. The attention KV at that depth
+is about 335 MiB; it was nowhere near the problem.
+
+Nothing samples those rows. `slice_logits_to_last_token` inserts a `Slice` on
+the hidden state immediately before the LM head, so prefill computes one logit
+row instead of one per token. It is on by default (`--no-logits-slice` turns it
+off, and the equivalence suite uses that switch to *prove* the two agree rather
+than assert it). Measured on the coder, same card:
 
 | prefill | result |
 |---|---|
-| unchunked | HTTP 500, `CL_OUT_OF_RESOURCES` at ~8k tokens |
-| chunked at 512 | 9615 tok in 8.28 s (**1161 t/s**), no allocation failures |
+| unchunked, no slice | HTTP 500, `CL_OUT_OF_RESOURCES` at ~8k tokens |
+| chunked at 512, no slice | 9615 tok in 8.28 s (1161 t/s) — but not bit-exact |
+| **unchunked + slice** | 9156 tok at **2247 t/s**; 18303 tok in 17.6 s; 36591 tok in 99.5 s |
 
-So the two halves of the trade-off are both real: exact but shallow, or deep
-but not bit-exact. Neither can currently be had at once, and pretending
-otherwise by defaulting to chunking would silently give up the equality gate
-for prompts that never needed it. The right fix is to stop materialising
-logits for tokens nobody samples — a graph change, not a flag — and that is
-the first thing to try at M2 proper.
+That retires the trade-off instead of balancing it: deeper than chunking
+reached, faster than chunking ran, and bit-exact where chunking was not.
+Chunking stays for whatever eventually exceeds even this, and `--prefill-chunk`
+stays at 0.
 
 1. **prefill graph** — chunked, variable token count, writes KV pages and GDN
    states.
