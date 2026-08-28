@@ -350,7 +350,7 @@ public:
         std::shared_ptr<ov::Model> model = core_.read_model(artifact.language_model_xml);
 
         if (cfg.kv_dtype != "fp32") {
-            const ov::element::Type kv = cfg.kv_dtype == "q8" ? ov::element::i8 : ov::element::f16;
+            const ov::element::Type kv = ov::element::f16;  // config refuses anything else
             try {
                 const size_t n = store_kv_state_as(model, kv);
                 if (n > 0) {

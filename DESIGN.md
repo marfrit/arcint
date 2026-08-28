@@ -229,11 +229,29 @@ cost of trusting it is every answer.
   conv/ssm variables are untouched because they are fixed-size and are not what
   grows.
 
-  Measured on the coder: KV **12.9 → 6.0 MiB** at 306 tokens, greedy output
-  **byte-identical** to fp32, about 10% slower from the extra Converts.
-  Extrapolated to 262144 tokens that is 10.7 → 5.4 GiB, putting the coder at
-  ~19.2 GiB on a 22.7 GiB card. `--kv-dtype` defaults to `fp16`; `fp32` gives
-  back what the artifact exports.
+  Measured on the coder at three depths each (4096 / 8192 / 16384), so the
+  extrapolation is arithmetic rather than hope:
+
+  | stored type | bytes per context token | at 262144 |
+  |---|---|---|
+  | fp32 (as exported) | 40,960 | 10.00 GiB |
+  | fp16 (retyped) | 20,480 | **5.00 GiB** |
+
+  Exactly half, exactly linear. Greedy output is **byte-identical** to fp32,
+  about 10% slower from the extra Converts. The coder's 262144 budget is then
+  12.8 (weights) + 5.0 (KV) + 0.06 (GDN, context-independent) + ~1
+  (activations, chunked) ≈ **18.9 GiB against 22.7 usable — it fits**, where
+  fp32's 23.9 GiB does not. `--kv-dtype` defaults to `fp16`; `fp32` gives back
+  what the artifact exports.
+
+  **`q8` is refused, on purpose.** Retyping the state to int8 the same way is a
+  numeric cast, not quantisation — no scales, so every value rounds to an
+  integer. Tested: it does not crash and does not emit garbage, it emits a
+  plausible and quietly worse answer, which is the exact failure mode this
+  engine exists to refuse. Real q8 KV needs per-block scales; the paged path
+  gets them from the plugin, which is another reason to finish it. The 35B and
+  the dense 3.8 need q8 to reach 262144 on this card (5.0 and 8.0 GiB of fp16
+  KV respectively against tighter weight budgets), so they wait on it.
 - **KV pages**: fixed block size (16 or 32 tokens, benchmark decides), fp16 or
   q8 per config, pool sized at startup from free VRAM after weights. Standard
   vLLM-style block tables, no eviction in v1 (a full pool rejects admission).
@@ -299,6 +317,15 @@ checkpoints declare `mtp_num_hidden_layers: 1` — the 3.6 MoE pair is not
 headless — and *none* of the three OpenVINO exports contains an MTP graph. Each
 one has a single output, `logits`, and no `openvino_mtp_*.xml` beside it. The
 optimum-intel export drops the head.
+
+**The weights themselves are on the fleet.** `/models/gptq/qwen38-gptq-mtp`
+carries a complete single-layer head — 15 tensors: `mtp.fc.weight`,
+`mtp.layers.0.{self_attn.{q,k,v,o}_proj, q_norm, k_norm, mlp.{gate,up,down}_proj,
+input_layernorm, post_attention_layernorm}`, `mtp.norm.weight`,
+`mtp.pre_fc_norm_embedding.weight` — and its GPTQ config excludes them from
+quantisation (`dynamic: {"-:.*mtp.*": {}}`), so they are at original precision.
+So M4 is not blocked on weights that do not exist; it is blocked on an export
+that keeps them, which is offline artifact work.
 
 So MTP is not implementable against these artifacts, by anyone: there is no
 draft head to call. What unblocks it is a re-export that keeps the MTP layer,
@@ -610,7 +637,7 @@ and owns the state.
 | M1 | single-sequence inference, greedy, 27B coder q4 on B60 | Prüfstand 10/10, ≥ 45 t/s | **done** — 51.4 t/s, 10/10 at artifact sampling defaults (§5) |
 | M2 | paged KV + GDN ledger, chunked prefill | equivalence suite green, 256k context loads | partly — suite green, chunking in (not bit-exact, off by default); paged path mapped but not adopted; 256k unproven |
 | M3 | prefix caching (block-aligned checkpoints) | warm/cold byte-equality, hit-rate stats on console | **done** — warm/cold byte-identical, hit stats on console |
-| M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance | sampling **done** (M1); MTP **blocked twice** — no export contains the head, and rollback on the stateful graph costs 7.7 tokens per verify step (§3.5) |
+| M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance | sampling **done** (M1); MTP needs an export that keeps the head — **the weights exist** (§3.5) |
 | M5 | 35B MoE q4 on A770 (16 GB fit), q8 variants on B60 | all three models pass their gates | gates **done** — all three serve and reach 10/10; A770 fit **fails**, no q8 artifacts exist |
 
 M0 went past its exit criterion on purpose: everything that does not need a
