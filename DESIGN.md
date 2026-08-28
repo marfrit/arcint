@@ -1049,6 +1049,42 @@ Performance target that justifies the project, stated once: beat the OpenVINO
 GenAI baseline on the same card and artifact (60 t/s, 27B q4, B60) while
 holding the equivalence invariants that upstream skips.
 
+### 7.0 What the paged path is worth, measured against the same compiler
+
+The argument for the paged path has always been indirect: optimized GDN kernels
+exist only there, `IndirectSDPA` cannot express the depth curve, rollback would
+become block-table arithmetic. All true, all inference. There is a direct
+measurement available and it had not been taken.
+
+`openarc-coder` on the fleet serves **the same IR file** (`qwen36-coder-b5-ov`)
+on the same card through **the same OpenVINO compiler**, but drives it with
+GenAI's `ContinuousBatchingPipeline` — that is, the paged path. So openarc
+against ligence holds the kernels and the graph constant and varies only the
+pipeline. Measured 2026-08-28 on the B60, identical prompt, five runs each with
+the first discarded as warm-up, wall clock including prefill:
+
+| | median | runs |
+|---|---|---|
+| openarc, GenAI continuous batching (paged) | **53.8 t/s** | 51.6, 57.8, 51.7, 55.9 |
+| ligence, stateful | **46.6 t/s** | 46.0, 46.0, 47.8, 47.1 |
+
+**13.4%**, and it is compute rather than serving overhead: ligence's own console
+reports prefill 0.12 s plus decode 2.42 s against 2.58 s of wall clock, so HTTP
+and detokenization account for about 1.5%.
+
+That number is the honest size of the prize, and it is smaller than the
+component estimates suggested — the decode profile puts `gated_delta_net::ref`
+at 9.1% and `permute_ref` at 9.0%, and the paged path should retire much of
+both. Two readings are possible: the paged kernels win less than the profile
+implies, or openarc pays overheads of its own that mask part of the win. Either
+way, 13.4% is what a rewrite has to beat, measured rather than assumed, and it
+is the right yardstick to hold the work to.
+
+Note also what this says about where to hunt. The MoE coder decodes at roughly
+a fifth of its bandwidth roofline while the dense model sits near 60% of its
+own, so the headroom is on the MoE side — and only the MoE has an external
+baseline on the identical artifact.
+
 ### 7.1 The 35B on the A770: the knob was there all along
 
 For most of this project the record said the 35B could not run on the A770 —
@@ -1068,10 +1104,20 @@ Measured 2026-08-28, through the engine, 120 greedy tokens:
 | A770, `--offload-ratio 20` | **1.8 t/s**, coherent output |
 | B60, no offload | **52.2 t/s** |
 
-Every ratio from 5 to 40 loads and all decode at the same speed, which says the
-binding constraint is the streaming path and not how much is streamed — the
-A770's PCIe is x4 Gen3 (~3.1 GB/s) on this host, and the working set does not
-stay resident. So the honest reading is: **the 35B runs on the A770, and it is
+Every ratio from 5 to 40 loads, and none of them is faster than the others.
+Through the engine on the real prompt: 0.6 t/s at 5%, 0.7 at 20%, 0.5 at 40% —
+no monotonic trend, and the ordering is noise. **The offload ratio does not
+control the cost**, which rules out a simple "bandwidth proportional to the
+offloaded share" story and leaves two candidates: a fixed per-token cost, or a
+provider that streams the active expert weights every token regardless of the
+setting. The arithmetic favours the second — 3B active params at int4 is ~1.5 GB
+per token, and 1.5 GB over the A770's x4 Gen3 link (~3.1 GB/s) is ~480 ms
+against a measured 555 ms at the first attempt.
+
+Be careful with these numbers: the same configuration measured 1.8 t/s in one
+run and 0.7 t/s in another, so the run-to-run spread is a factor of 2.5. What is
+robust is that it works, that the ratio does not matter, and that it is one to
+two orders of magnitude slower than keeping the weights resident. So the honest reading is: **the 35B runs on the A770, and it is
 29× slower than on the B60.** That is a capability, not a recommendation, and it
 is exactly the shape the fleet's own `-ncmoe` experience predicts. What is not
 yet measured is how it compares to llama.cpp `-ncmoe 30` on the same card, which

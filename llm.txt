@@ -28,6 +28,14 @@ surgery takes 262144 context from 10.00 to 5.00 GiB - measured 20480 vs 40960
 bytes per context token - which fits the B60's 22.7 GiB alongside 12.8 GiB of
 weights. Neither changes greedy output.
 
+How much the paged path is worth is now measured rather than argued: openarc
+serves the SAME IR on the SAME card through the SAME compiler but via GenAI's
+ContinuousBatchingPipeline (the paged path), and beats ligence's stateful loop
+by 13.4% - 53.8 vs 46.6 t/s median wall clock, five runs each, B60, coder. That
+is the number a rewrite has to beat. It is also smaller than the component
+estimates (gated_delta_net::ref 9.1% + permute_ref 9.0% of decode), which is
+worth knowing before committing to the work.
+
 What is left is OpenVINO's paged-attention path. Its decode-side block-table
 convention is undocumented and not yet reverse-engineered; prefill through it
 reproduces the stateful path exactly, decode does not. M4's measurements
