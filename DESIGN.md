@@ -885,6 +885,29 @@ holding the equivalence invariants that upstream skips.
 
 ## 8. Open questions and deliberate deferrals
 
+**A static sequence dimension at decode is worth more than any kernel we can
+write.** Measured 2026-08-28 (`kernels/README.md` has the full workings). The
+GDN head-major transposes are 1.23 ms of an 11.16 ms decode step — 90 copies of
+`[B, S, 32, 128] -> [B, 32, S, 128]`. At *static* `S = 1` OpenVINO deletes them
+outright, because the permutation is then a layout no-op; at any dynamic shape
+it falls back to `permute_ref__f16`, the generic kernel, and one static
+dimension is the entire difference between that and the specialised
+`permute_f_y_axes__f16`.
+
+A hand-written OpenCL replacement is **8.6× faster than `permute_ref`** on the
+identical op in the real model (1.59 µs against 13.6 µs per node) and still
+loses end-to-end, because OpenVINO's only supported injection path makes the
+node opaque to its own graph optimiser: RoPE un-fuses into f32 primitives and
+180 previously-eliminated transposes return, costing ~1.6 ms against a 1.08 ms
+win. So the kernel is not the bottleneck and neither is the hardware — the
+shape is. What is worth investigating is a decode-specialised compiled model
+(static `S = 1`) alongside the dynamic one, which would remove these copies
+*and* let every other op pick a specialised kernel; the obstacle is whether
+OpenVINO can share one set of device weights between two compiled models, since
+12.8 GiB twice does not fit. `--custom-kernels` stays as an off-by-default
+measurement switch.
+
+
 - Exact KV block size (16 vs 32) and q8-KV numerics on Xe — benchmark at M2.
 - Whether OV's fused SDPA is exposed cleanly enough for the decode graph, or
   whether the attention layers are better served by the PagedAttention op with
