@@ -687,10 +687,13 @@ public:
         }
         if (past == 0) lm_req_.reset_state();
 
-        // The head's own state follows the base model's, and skips whatever the
-        // prefix cache let the base model skip.
-        mtp_reset();
-        mtp_seek(past);
+        // The head's own state follows the base model's. A cache hit restores it
+        // along with everything else (see snapshot), so only a cold start needs
+        // the cursor moved by hand.
+        if (stats.cache_hit_tokens == 0) {
+            mtp_reset();
+            mtp_seek(past);
+        }
 
         // The boundary worth remembering is the last block edge strictly inside
         // the prompt: a snapshot of the whole prompt is useless to this prompt
@@ -705,7 +708,9 @@ public:
                 ? ((prompt_ids.size() - 1) / grid) * grid
                 : 0;
 
+        snapshot_seconds_ = &stats.snapshot_seconds;
         ov::Tensor logits = prefill(prompt_ids, past, snap_at);
+        snapshot_seconds_ = nullptr;
         stats.prefill_seconds = std::chrono::duration<double>(clock::now() - t_prefill).count();
 
         int next = pick(sampler, logits);
@@ -929,6 +934,10 @@ private:
     // sequence is split can flip a near-tie. Chunking is used by default anyway
     // because the alternative is unbounded activation memory, and the size is
     // large enough (2048) that ordinary prompts are a single chunk.
+    // `snapshot_seconds_` is where prefill reports what the cache checkpoint
+    // cost; it points at the caller's stats for the duration of one request.
+    double* snapshot_seconds_ = nullptr;
+
     ov::Tensor prefill(const std::vector<int>& tokens, size_t past, size_t snapshot_at) {
         ov::Tensor   logits;
         const size_t grid = prefill_chunk_ > 0 ? static_cast<size_t>(prefill_chunk_) : 0;
@@ -972,8 +981,11 @@ private:
                 // grows with the prefix, so ask first whether it could be kept
                 // at all rather than copying hundreds of MiB to have it dropped.
                 if (prefix_cache_->may_accept(estimated_state_bytes())) {
+                    const auto             t_snap = std::chrono::steady_clock::now();
                     PrefixCache::StateBlob blob;
-                    if (snapshot(blob)) prefix_cache_->insert(tokens, past, std::move(blob));
+                    const bool             took = snapshot(blob);
+                    if (snapshot_seconds_ != nullptr) *snapshot_seconds_ += seconds_since(t_snap);
+                    if (took) prefix_cache_->insert(tokens, past, std::move(blob));
                 }
             }
         }
@@ -1037,6 +1049,29 @@ private:
             for (ov::VariableState& v : lm_req_.query_state()) {
                 out.push_back(serialise_state(v.get_state()));
             }
+            // The MTP head has its own attention KV over the same prefix. Left
+            // out, a warm run would draft from an empty head while a cold run
+            // drafts from a primed one -- different drafts, so possibly a
+            // different answer, which is the one thing §3.4 does not allow.
+            // Its cursor goes in as well: the head lags the base model by a
+            // position, and that offset cannot be recovered from the tensors.
+            if (mtp_ready_) {
+                for (ov::VariableState& v : mtp_req_.query_state()) {
+                    out.push_back(serialise_state(v.get_state()));
+                }
+                ov::Tensor cursor(ov::element::i64, ov::Shape{3});
+                cursor.data<int64_t>()[0] = static_cast<int64_t>(mtp_len_);
+                cursor.data<int64_t>()[1] = static_cast<int64_t>(mtp_pos_);
+                cursor.data<int64_t>()[2] = mtp_has_pending_ ? 1 : 0;
+                out.push_back(serialise_state(cursor));
+                // ...and the row it is holding. The head consumes (h_t, x_{t+1}),
+                // so at a checkpoint it always has one hidden row waiting for a
+                // token that has not arrived yet. Dropping it would leave the
+                // head a position behind after a restore.
+                out.push_back(serialise_state(
+                    mtp_has_pending_ ? mtp_pending_
+                                     : ov::Tensor(ov::element::f32, ov::Shape{1, 1, 1})));
+            }
             return true;
         } catch (const std::exception& e) {
             log::warn("cache", "state snapshot failed, continuing without caching: %s", e.what());
@@ -1051,6 +1086,12 @@ private:
             for (ov::VariableState& v : lm_req_.query_state()) {
                 state_bytes_ += v.get_state().get_byte_size() + 64;
             }
+            if (mtp_ready_) {
+                for (ov::VariableState& v : mtp_req_.query_state()) {
+                    state_bytes_ += v.get_state().get_byte_size() + 64;
+                }
+                state_bytes_ += 128 + 4 * 5120;  // the cursor and the pending row
+            }
         } catch (const std::exception&) {
             state_bytes_ = 0;
         }
@@ -1059,10 +1100,26 @@ private:
 
     bool restore(const PrefixCache::StateBlob& blob) {
         std::vector<ov::VariableState> states = lm_req_.query_state();
-        if (states.size() != blob.size()) return false;
+        std::vector<ov::VariableState> mtp_states;
+        size_t                         want = states.size();
+        if (mtp_ready_) {
+            mtp_states = mtp_req_.query_state();
+            want += mtp_states.size() + 2;  // + the cursor and the pending row
+        }
+        if (want != blob.size()) return false;
         try {
             for (size_t i = 0; i < states.size(); ++i) {
                 states[i].set_state(deserialise_state(blob[i]));
+            }
+            for (size_t i = 0; i < mtp_states.size(); ++i) {
+                mtp_states[i].set_state(deserialise_state(blob[states.size() + i]));
+            }
+            if (mtp_ready_) {
+                const ov::Tensor cursor = deserialise_state(blob[blob.size() - 2]);
+                mtp_len_         = static_cast<size_t>(cursor.data<const int64_t>()[0]);
+                mtp_pos_         = static_cast<size_t>(cursor.data<const int64_t>()[1]);
+                mtp_has_pending_ = cursor.data<const int64_t>()[2] != 0;
+                if (mtp_has_pending_) mtp_pending_ = deserialise_state(blob.back());
             }
         } catch (const std::exception& e) {
             log::warn("cache", "state restore failed, falling back to a cold prefill: %s",

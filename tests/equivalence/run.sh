@@ -182,6 +182,21 @@ if [[ -f "$MODEL/openvino_mtp_layer.xml" && -f "$MODEL/openvino_mtp_lm_head.xml"
     echo "     MTP: DIFFERS from plain greedy -- near-tie, expected (§3.2)"
   fi
 
+  # Combination, not just each feature alone. The head keeps its own attention
+  # KV over the prompt, so a warm run that skipped the prompt would draft from
+  # an empty head unless that state travels in the cache blob with everything
+  # else. Single-feature gates cannot see this.
+  start_server "$WORK/mtppc.log" --mtp on --prefix-cache-mib 4096 \
+               --kv-block-size 32 --prefill-chunk 64 || exit 1
+  ask "$WORK/mtpcold.txt" "$PROMPT"     # populates
+  ask "$WORK/mtpwarm.txt" "$PROMPT"     # must hit, with the head restored too
+  cmp -s "$WORK/mtpcold.txt" "$WORK/mtpwarm.txt" \
+    && pass "MTP + prefix cache: warm output is byte-identical to cold" \
+    || fail "MTP + prefix cache: warm output is byte-identical to cold"
+  grep -q 'cache hit' "$WORK/mtppc.log" \
+    && pass "MTP + prefix cache: the cache actually hit" \
+    || fail "MTP + prefix cache: the cache actually hit (equality proved nothing)"
+
   macc=$(grep -o 'draft accept \([0-9.]*\)%' "$WORK/mtpon.log" | tail -1 | grep -o '[0-9.]*')
   if [[ -n "$macc" ]] && awk "BEGIN{exit !(${macc:-0} > 10)}"; then
     pass "the MTP head is actually accepting (${macc}%)"

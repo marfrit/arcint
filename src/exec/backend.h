@@ -73,6 +73,10 @@ struct GenerationStats {
     int    draft_accepted    = 0;
     // Wall time spent copying the whole model state so a rejected draft can be
     // rolled back. On the stateful path this is the price of speculation.
+    // What the prefix cache costs on the way in. It is the same host round-trip
+    // that makes speculation unprofitable, paid once per prompt, and it would
+    // otherwise hide inside prefill_seconds and be read as prefill being slow.
+    double snapshot_seconds = 0.0;
     double draft_rollback_seconds = 0.0;
     double draft_verify_seconds   = 0.0;   // the one pass that checks all drafts
     double draft_reforward_seconds = 0.0;  // re-running the accepted prefix after a reject

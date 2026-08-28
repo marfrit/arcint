@@ -78,8 +78,12 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
         prefill_suffix = log::format(" | cache hit %d tok (%.1f%%)", stats.cache_hit_tokens,
                                      100.0 * stats.cache_hit_tokens / stats.prompt_tokens);
     }
+    if (stats.snapshot_seconds > 0.0) {
+        prefill_suffix += log::format(" | cache snapshot %.2f s", stats.snapshot_seconds);
+    }
     log_slot_line(slot, "prefill", stats.prompt_tokens, stats.prefill_seconds,
                   stats.prefill_rate(), prefill_suffix);
+
     std::string decode_suffix;
     if (stats.draft_proposed > 0) {
         decode_suffix = log::format(
