@@ -19,7 +19,7 @@ coder q4; all three target models reach 10/10 on the fleet harness.
   M2 chunked prefill, ledger      done bar the paged path
   M3 prefix caching               done - warm/cold byte-identical
   M4 MTP                          done - 93.3% acceptance (not byte-identical)
-  M5 all three models             gates done; 35B does not fit the A770
+  M5 all three models             done; 35B fits the A770 via --offload-ratio
 
 Two M2 walls came down. Slicing logits to the last token before the LM head
 removed an out-of-memory wall at ~8k tokens (the graph computed logits for
@@ -35,9 +35,12 @@ promoted it: it is the precondition for speculative decoding paying at all
 (rollback becomes block-table arithmetic instead of a 171 MiB state copy),
 worth ~2x decode on the dense model, on top of speed and real q8 KV.
 
-Known open, all outside the engine: expert offload for the 35B on a 16 GB card,
-which OpenVINO's fused MoE op does not expose, and q8 KV, which needs per-block
-scales. The MTP head is no longer among them - tools/export_mtp.py builds it.
+Known open: q8 KV, which needs per-block scales and is only reachable on the
+paged path. Two former entries are closed - tools/export_mtp.py builds the MTP
+head, and expert offload for the 35B on a 16 GB card turned out to be a native
+GPU-plugin property (OFFLOAD_RATIO), not something the fused MoE op withholds:
+--offload-ratio 20 serves the 35B on the A770 at 1.8 t/s where it previously
+refused to load, against 52.2 t/s on the B60.
 
 Verification: 142 unit cases, a 48-check curl round-trip, an equivalence suite
 that runs where the card is. Clean under ASan and UBSan on x86_64.

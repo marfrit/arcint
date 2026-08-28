@@ -63,11 +63,11 @@ So: **OpenVINO as compiler and kernel library, ligence as everything else.**
              └───────────────┬────────────────────────────────┘
                              │ request objects
              ┌───────────────▼───────────────┐
-             │ Scheduler                     │  slot model (llama.cpp-style),
-             │  admission, batching,         │  continuous batching within a
-             │  slot lifecycle               │  strict numerics budget (§6)
+             │ SlotPool                      │  slot model (llama.cpp-style):
+             │  admission, slot lifecycle    │  admission accounting only.
+             │  (one at a time today)        │  See the note below.
              └───────────────┬───────────────┘
-                             │ micro-batches
+                             │ one request at a time
      ┌───────────────────────▼─────────────────────────┐
      │ Executor                                        │
      │  ┌───────────────┐   ┌──────────────────────┐   │
@@ -78,6 +78,24 @@ So: **OpenVINO as compiler and kernel library, ligence as everything else.**
      │  └───────────────┘   └──────────────────────┘   │
      │  sampling (greedy, temp/top-p/top-k, penalties) │
      └─────────────────────────────────────────────────┘
+
+**What the box marked SlotPool actually does today.** It admits and accounts;
+it does not run sequences concurrently. `generate()` takes a single backend
+mutex and there is one `lm_req_`, so `--parallel N` buys queueing, not
+concurrency, and the slot counts in `/health` describe admission capacity rather
+than sequences in flight. That is consistent with M1's wording ("single
+sequence") and inconsistent with the diagram as it was drawn, which is why the
+diagram now says so.
+
+The upgrade is cheaper than it looks and is written down here so it is not
+rediscovered: OpenVINO's stateful API already isolates state *per
+`InferRequest`*, so one compiled model with N infer requests gives N sequences
+with the weights loaded once. The per-sequence cost is that sequence's KV plus a
+GDN state slab (~70 MiB coder, ~171 MiB dense), which is what admission would
+have to be bounded by — by a memory reservation, not by a lock. The
+embeddings and MTP requests are shared today and would need per-slot twins. At
+deep context the KV dominates and binds the slot count hard: two sequences at
+262144 tokens is 2 × 5 GiB of fp16 KV, which does not fit beside the weights.
 ```
 
 ### 3.1 Model artifacts
@@ -410,11 +428,12 @@ wrong one sits near zero. `tools/export_mtp.py` builds the head on that basis;
 So MTP is not implementable against these artifacts, by anyone: there is no
 draft head to call. What unblocks it is a re-export that keeps the MTP layer,
 which is offline artifact work and outside the engine (README's non-goals put
-artifact production offline on purpose). The allowlist now pins
-`has_mtp_head = false` for all three — the flag gates serving, so it has to
-follow the export — and records `mtp_in_checkpoint` separately so the reason is
-visible. `--mtp on` is refused for every model rather than quietly doing
-ordinary decoding under a speculative label.
+artifact production offline on purpose). **That is now done**: the allowlist pins
+`has_mtp_head = true` for qwen3.8-27b, because `tools/export_mtp.py` writes the
+head beside the artifact (§3.5.2), and `false` for the MoE pair, whose exports
+still carry none. The flag gates serving, so it follows the export;
+`mtp_in_checkpoint` records separately that all three checkpoints declare a head.
+`--mtp on` is accepted for the dense model and refused for the other two.
 
 **And even with a head, speculation would not pay on the stateful graph.**
 Verifying a draft of k tokens advances the state by k whatever the outcome, so
@@ -944,7 +963,7 @@ and owns the state.
 | M2 | paged KV + GDN ledger, chunked prefill | equivalence suite green, 256k context loads | **done** — suite green, **257,167 tokens loaded** (§5); paged path mapped but not adopted |
 | M3 | prefix caching (block-aligned checkpoints) | warm/cold byte-equality, hit-rate stats on console | **done** — warm/cold byte-identical, hit stats on console |
 | M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance | **acceptance done** — 93.3% on the dense model, verification exact (§3.5.2). Greedy-invariance is **not achievable on this backend** and the criterion was wrong to assume it was: a multi-token verify pass and a single-token plain pass differ (§3.2), so any speculative scheme can flip a near-tie. Also a net slowdown until the paged path lands. |
-| M5 | 35B MoE q4 on A770 (16 GB fit), q8 variants on B60 | all three models pass their gates | **done** — all three serve and reach 10/10 (§7). The hardware targets named in the milestone column are not reachable with these artifacts: the 35B is larger than the A770 and HETERO cannot place experts, and no q8 export exists. |
+| M5 | 35B MoE q4 on A770 (16 GB fit), q8 variants on B60 | all three models pass their gates | **done**, and the 16 GB fit now works too: `--offload-ratio 20` serves the 35B on the A770 at 1.8 t/s where it previously refused to load (§7). The q8 half still waits on an export. |
 
 M0 went past its exit criterion on purpose: everything that does not need a
 GPU was implemented properly rather than stubbed, because that is where the
@@ -1020,6 +1039,41 @@ them.
 Performance target that justifies the project, stated once: beat the OpenVINO
 GenAI baseline on the same card and artifact (60 t/s, 27B q4, B60) while
 holding the equivalence invariants that upstream skips.
+
+### 7.1 The 35B on the A770: the knob was there all along
+
+For most of this project the record said the 35B could not run on the A770 —
+17.4 GiB of weights against 15.1 usable, HETERO could not place experts, and
+OpenVINO's fused MoE op "exposes nothing", so the gap was filed as offline
+artifact work outside the engine. **That was wrong.** The GPU plugin ships
+`OFFLOAD_RATIO` ("percentage of model weights to offload... currently supported
+for MoE experts only"), with an LRU of resident expert slots and on-demand loads
+from the weightless `.bin`. It is advertised in `SUPPORTED_PROPERTIES` on both
+cards. Nobody had tried it.
+
+Measured 2026-08-28, through the engine, 120 greedy tokens:
+
+| | |
+|---|---|
+| A770, `--offload-ratio 0` | **refuses to load** — `[GPU] ProgramBuilder build failed`, `CL_OUT_OF_RESOURCES` |
+| A770, `--offload-ratio 20` | **1.8 t/s**, coherent output |
+| B60, no offload | **52.2 t/s** |
+
+Every ratio from 5 to 40 loads and all decode at the same speed, which says the
+binding constraint is the streaming path and not how much is streamed — the
+A770's PCIe is x4 Gen3 (~3.1 GB/s) on this host, and the working set does not
+stay resident. So the honest reading is: **the 35B runs on the A770, and it is
+29× slower than on the B60.** That is a capability, not a recommendation, and it
+is exactly the shape the fleet's own `-ncmoe` experience predicts. What is not
+yet measured is how it compares to llama.cpp `-ncmoe 30` on the same card, which
+serves the same model today; that comparison is the one that decides whether
+this is worth using rather than merely worth having.
+
+One methodology note, because it cost an hour: a failed compile poisons later
+attempts *in the same process*. The first sweep reported every ratio failing
+because ratio 0 was tried first and ran the device out of memory. Each ratio
+needs its own process, and the control (no offload, clean process) is what makes
+the result mean anything.
 
 ## 8. Open questions and deliberate deferrals
 

@@ -475,8 +475,7 @@ reference projects'; the next milestone is mostly reading what upstream wrote.
 
 ---
 
-*Generated 2026-08-28 by pica. Repo clones: /tmp/ref/{ninfer,ov,openvino-genai,
-vllm,lcpp} on pica; per-repo technique extractions in /tmp/ref/reports/. Hardware
+*Generated 2026-08-28 by pica. Repo clones: ~/ref/{ninfer,ov,openvino-genai,vllm,lcpp} on pica (moved from /tmp/ref on 2026-08-28); per-repo technique extractions in ~/ref/reports/. Hardware
 facts: Intel ARK SKU 229151 (A770), Intel Arc Pro B60 datasheet (2026-03), Xe2
 architecture analyses. Roofline figures derived from those plus DESIGN's measured
 weights sizes.*

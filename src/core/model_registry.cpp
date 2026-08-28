@@ -109,8 +109,12 @@ std::vector<ModelEntry> build_registry() {
         e.template_hash           = "c3cf9e34abf4f9e3";
         e.tokenizer_hash          = "87a7830d63fcf43b";
         e.weights_bytes           = 14405167394ull;
-        e.status = "provisional, 7/10 (AWQ-only; SE calibration degenerates greedy - do not "
-                   "re-add SE)";
+        // Measured through ligence (§7), not inherited from the artifact card:
+        // 8/10 under greedy, deterministically, and 10/10 at the artifact's own
+        // sampling defaults on two seeds of three. The old "provisional, 7/10"
+        // predated serving it at all.
+        e.status = "8/10 greedy, 10/10 at artifact sampling defaults (2 of 3 seeds); "
+                   "AWQ-only - SE calibration degenerates greedy, do not re-add SE";
         e.sampler = qwen_card_defaults();
         split_layers(e);
         r.push_back(std::move(e));

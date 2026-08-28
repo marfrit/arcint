@@ -66,6 +66,7 @@ std::string usage_text() {
         "  --draft N                 speculative draft length, 0 = off\n"
         "  --draft-ngram K           drafter match length (default: 3)\n"
         "  --custom-kernels FILE     OpenVINO custom-layer XML (hand-written OpenCL)\n"
+        "  --offload-ratio N         %% of MoE expert weights to stream, 0 = all resident\n"
         "\n"
         "misc\n"
         "  -v, -vv                   raise console verbosity\n"
@@ -170,6 +171,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--custom-kernels") {
             if (!value(v)) return fail("--custom-kernels needs a path");
             cfg.custom_kernels = std::string(v);
+        } else if (arg == "--offload-ratio") {
+            if (!value(v) || !parse_int(v, cfg.offload_ratio)) {
+                return fail("--offload-ratio needs an integer");
+            }
         } else if (arg == "--mtp") {
             if (!value(v)) return fail("--mtp needs a value");
             cfg.mtp = std::string(v);
@@ -239,6 +244,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     }
     if (cfg.kv_dtype != "fp16" && cfg.kv_dtype != "fp32") {
         return fail("--kv-dtype must be fp16 or fp32");
+    }
+    if (cfg.offload_ratio < 0 || cfg.offload_ratio > 100) {
+        return fail("--offload-ratio must be a percentage in [0, 100]");
     }
     if (cfg.prefill_chunk < 0) return fail("--prefill-chunk must be >= 0");
 

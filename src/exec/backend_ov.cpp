@@ -59,6 +59,20 @@ constexpr const char* kBeamIdx       = "beam_idx";
 // tokens before the state is reused.
 constexpr uint64_t kPrefixCacheKey = 0x6c6967656e636531ull;  // "ligence1"
 
+// The block hashes are keyed, and the key has to name the thing the cached state
+// belongs to. Today the cache lives inside one process serving one artifact, so a
+// constant would do; the day a process reloads a different artifact, or the MTP
+// export changes what a blob even contains, a stale hit would be silent rather
+// than a miss. vLLM carries the same idea as per-entry "extra keys".
+uint64_t prefix_cache_key(const Artifact& a) {
+    uint64_t k = kPrefixCacheKey;
+    for (char c : a.arch_hash) k = k * 1099511628211ull ^ static_cast<uint64_t>(c);
+    // The blob's own layout depends on this: with a head loaded it carries the
+    // head's KV, cursor and pending row as well.
+    k = k * 1099511628211ull ^ (a.has_mtp_head ? 0x4d545031ull : 0x4e4f4e45ull);
+    return k;
+}
+
 std::string tokenizers_extension_path() {
     // Shipped alongside the OpenVINO wheel rather than with the runtime, so the
     // path is deployment configuration. The environment wins; otherwise use
@@ -448,7 +462,7 @@ public:
         if (cfg.prefix_cache_mib > 0) {
             prefix_cache_ = std::make_unique<PrefixCache>(
                 static_cast<size_t>(cfg.prefix_cache_mib) * 1024 * 1024, cfg.kv_block_size,
-                kPrefixCacheKey);
+                prefix_cache_key(artifact));
         }
         core_.add_extension(tokenizers_extension_path());
         if (!cache_dir.empty()) core_.set_property(ov::cache_dir(cache_dir));
@@ -484,6 +498,12 @@ public:
 
         // Order matters: the head must see every prompt position, so this runs
         // before the slice rewires the LM head's input.
+        offload_ratio_ = cfg.offload_ratio;
+        if (offload_ratio_ > 0) {
+            log::info("load", "expert offload at %d%%: the plugin keeps that share of the MoE "
+                              "expert weights off the card and streams them",
+                      offload_ratio_);
+        }
         want_mtp_ = cfg.mtp != "off" && artifact.has_mtp_head;
         if (want_mtp_ && !expose_hidden_state(model)) {
             log::warn("mtp", "%s", "could not expose the hidden state; MTP disabled");
@@ -538,6 +558,7 @@ public:
             ov::AnyMap cfg;
             cfg[ov::cache_mode.name()]   = ov::CacheMode::OPTIMIZE_SIZE;
             cfg[ov::weights_path.name()] = artifact.language_model_bin;
+            if (offload_ratio_ > 0) cfg["OFFLOAD_RATIO"] = offload_ratio_;
             if (std::getenv("LIGENCE_PROFILE") != nullptr) cfg[ov::enable_profiling.name()] = true;
 
             auto t_cached = std::chrono::steady_clock::now();
@@ -562,6 +583,12 @@ public:
             auto t_cold  = std::chrono::steady_clock::now();
             ov::AnyMap props;
             if (std::getenv("LIGENCE_PROFILE") != nullptr) props[ov::enable_profiling.name()] = true;
+            if (offload_ratio_ > 0) {
+                // Expert offload needs the weights on disk to stream from: the
+                // plugin loads them on demand rather than keeping them resident.
+                props["OFFLOAD_RATIO"]        = offload_ratio_;
+                props[ov::weights_path.name()] = artifact.language_model_bin;
+            }
             language_    = core_.compile_model(model, device, props);
             logits_port_ = language_.output(0);
             lm_req_      = language_.create_infer_request();
@@ -1090,7 +1117,11 @@ private:
                 for (ov::VariableState& v : mtp_req_.query_state()) {
                     state_bytes_ += v.get_state().get_byte_size() + 64;
                 }
-                state_bytes_ += 128 + 4 * 5120;  // the cursor and the pending row
+                // The cursor plus the pending hidden row. Derived, not a baked
+                // n_embd: this has to follow whatever model is loaded.
+                state_bytes_ += 128;
+                if (mtp_pending_) state_bytes_ += mtp_pending_.get_byte_size() + 64;
+                else state_bytes_ += static_cast<size_t>(artifact_.n_embd) * 4 + 64;
             }
         } catch (const std::exception&) {
             state_bytes_ = 0;
@@ -1459,6 +1490,7 @@ private:
     bool                           mtp_has_pending_ = false;
     size_t                         mtp_len_ = 0;    // positions in the head's KV
     size_t                         mtp_pos_ = 0;    // true position, for rope
+    int                            offload_ratio_ = 0;
     std::vector<ov::Tensor>        rollback_;   // reused speculation scratch
     bool                           logged_rollback_size_ = false;
     std::unique_ptr<Drafter>       drafter_;

@@ -28,7 +28,7 @@ tokenizer:
 
 | card | VRAM | notes |
 |---|---|---|
-| Intel Arc A770 (DG2/Alchemist) | 16 GB | ~560 GB/s |
+| Intel Arc A770 (DG2/Alchemist) | 16 GB | ~560 GB/s; the 35B needs `--offload-ratio` here |
 | Intel Arc Pro B60 (BMG G21) | 24 GB (~22.7 usable) | ~456 GB/s |
 
 All three target models are hybrids: most layers use linear attention
@@ -108,8 +108,8 @@ Serving the real models on Intel Arc. Measured on a B60 with the 27B coder q4:
 | M1 executor, greedy, 27B coder on B60 | done — 51.4 t/s, 10/10 |
 | M2 chunked prefill, cache ledger, long context | done — **257,167 tokens loaded** |
 | M3 prefix caching | done — warm/cold byte-identical, hit stats on console |
-| M4 MTP | done — byte-identical with `--mtp on`, **93.3% acceptance** on Qwen3.8 |
-| M5 all three models | done — all three serve and reach 10/10; the 35B does not fit the A770 |
+| M4 MTP | acceptance done — **93.3%** on Qwen3.8, verification exact. *Not* byte-identical to plain greedy; no speculative scheme can be on this backend (§3.2) |
+| M5 all three models | done — all three serve; the 35B now fits the A770 too, via `--offload-ratio` |
 
 M4 is done, and the measurement is the result. The Qwen3.8 MTP head — which no
 public implementation can export, and which `tools/export_mtp.py` reconstructs

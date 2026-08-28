@@ -58,6 +58,11 @@ struct Config {
     // OpenCL and the win has to be measured per card, not assumed.
     std::string custom_kernels;
 
+    // Percentage of MoE expert weights the GPU plugin may keep out of VRAM and
+    // stream on demand. 0 = everything resident. This is what lets a model that
+    // does not fit a card run on it at all; it is not free (§7).
+    int offload_ratio = 0;
+
     int         kv_block_size             = 32;      // 16 or 32 — §8 benchmarks this
     std::string kv_dtype                  = "fp16";  // fp16 | q8
     int         gdn_checkpoint_budget_mib = 512;     // §3.3
