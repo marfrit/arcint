@@ -90,9 +90,13 @@ std::vector<ModelEntry> build_registry() {
         e.ov_arch                 = "Qwen3_5ForConditionalGeneration";
         e.model_type              = "qwen3_5";
         e.moe                     = false;  // dense (§2)
-        // §3.5 says this one ships a native MTP head. The export does not:
-        // it outputs `logits` and nothing else, like the other two.
-        e.has_mtp_head            = false;
+        // §3.5 says this one ships a native MTP head. optimum-intel's export
+        // drops it, so for a long time the answer here was "no". It is now
+        // "yes": tools/export_mtp.py reconstructs the head from the weights in
+        // the checkpoint and writes openvino_mtp_{layer,lm_head}.xml beside the
+        // model. An artifact without those files still loads -- the check
+        // against this flag is what tells the user their export lacks them.
+        e.has_mtp_head            = true;
         e.mtp_head_pinned         = true;
         e.mtp_in_checkpoint       = true;
         e.n_embd                  = 5120;

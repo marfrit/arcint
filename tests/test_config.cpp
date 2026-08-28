@@ -118,10 +118,13 @@ TEST(config_accepts_the_documented_choices) {
 }
 
 TEST(config_mtp_on_requires_an_mtp_head) {
-    // No export in the allowlist contains an MTP graph, so --mtp on has nothing
-    // to switch on for any of them. It must refuse rather than quietly do
-    // ordinary decoding while claiming speculation.
+    // --mtp on must refuse where there is nothing to switch on, rather than
+    // quietly do ordinary decoding while claiming speculation. The dense export
+    // carries a head now, so it is the one model that accepts it.
+    Config cfg;
+    CHECK(run({"--stub", "--model-id", "qwen3.8-27b", "--mtp", "on"}, cfg).ok);
     for (const std::string& id : model_ids()) {
+        if (id == "qwen3.8-27b") continue;
         CHECK(rejected({"--stub", "--model-id", id.c_str(), "--mtp", "on"}));
     }
 }

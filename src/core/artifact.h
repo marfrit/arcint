@@ -60,6 +60,9 @@ struct Artifact {
     SamplerDefaults sampler;
 
     bool has_mtp_head = false;
+    // Written by tools/export_mtp.py beside the model; empty when absent.
+    std::string mtp_layer_xml;
+    std::string mtp_lm_head_xml;
 
     ArtifactInfo to_info(Quant quant) const;
 };

@@ -41,7 +41,8 @@ TEST(registry_matches_the_measured_ir_metadata) {
     CHECK(!dense->moe);
     // §3.5 claims a native MTP head here. The export does not contain one, and
     // the export is what can be served — see registry_mtp_reflects_the_export.
-    CHECK(!dense->has_mtp_head);
+    // The dense export carries a head again once tools/export_mtp.py has run.
+    CHECK(dense->has_mtp_head);
     CHECK(dense->mtp_in_checkpoint);
     CHECK_EQ(dense->n_layer, 64);
     CHECK_EQ(dense->n_attn_layer, 16);
@@ -154,14 +155,17 @@ TEST(registry_validation_rejects_a_layer_mismatch) {
 }
 
 TEST(registry_mtp_reflects_the_export_not_the_checkpoint) {
-    // Inspected 2026-08-28: every checkpoint declares mtp_num_hidden_layers 1,
-    // and no export contains an MTP graph. The flag that gates serving must
-    // follow the export.
+    // Every checkpoint declares mtp_num_hidden_layers 1, but that is a fact
+    // about the checkpoint. What can be served is a fact about the export, and
+    // the two must be tracked separately: the dense export carries a head
+    // (reconstructed by tools/export_mtp.py), the MoE pair still does not.
     for (const ModelEntry& e : registry()) {
-        CHECK(!e.has_mtp_head);
         CHECK(e.mtp_head_pinned);
         CHECK(e.mtp_in_checkpoint);
     }
+    CHECK(find_model("qwen3.8-27b")->has_mtp_head);
+    CHECK(!find_model("qwen3.6-27b-a3b-coder")->has_mtp_head);
+    CHECK(!find_model("qwen3.6-35b-a3b")->has_mtp_head);
 }
 
 namespace {
@@ -194,7 +198,7 @@ TEST(registry_a_matching_dense_artifact_is_accepted) {
 TEST(registry_pinned_mtp_mismatch_is_a_refusal) {
     const ModelEntry* e = find_model("qwen3.8-27b");
     ArtifactInfo      a = good_dense_artifact();
-    a.has_mtp_head      = true;  // an export that suddenly has one
+    a.has_mtp_head      = false;  // an export that suddenly lacks one
 
     const ValidationResult res = validate_artifact(*e, a);
     CHECK(!res.ok);

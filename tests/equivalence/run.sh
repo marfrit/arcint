@@ -146,6 +146,31 @@ else
   fail "the drafter is actually accepting (got ${racc:-no}% -- verification is inert)"
 fi
 
+# ------------------------------------------------------------- MTP (§3.5.2)
+#
+# Only where the export carries a head. Same two gates as the lookup drafter,
+# for the same reason: byte-identity alone would also pass a head that is never
+# accepted, so acceptance has to be non-zero too.
+if [[ -f "$MODEL/openvino_mtp_layer.xml" && -f "$MODEL/openvino_mtp_lm_head.xml" ]]; then
+  start_server "$WORK/mtpoff.log" --mtp off || exit 1
+  ask "$WORK/mtpoff.txt" "$PROMPT"
+  start_server "$WORK/mtpon.log" --mtp on || exit 1
+  ask "$WORK/mtpon.txt" "$PROMPT"
+
+  cmp -s "$WORK/mtpoff.txt" "$WORK/mtpon.txt" \
+    && pass "MTP on is byte-identical to MTP off" \
+    || fail "MTP on is byte-identical to MTP off"
+
+  macc=$(grep -o 'draft accept \([0-9.]*\)%' "$WORK/mtpon.log" | tail -1 | grep -o '[0-9.]*')
+  if [[ -n "$macc" ]] && awk "BEGIN{exit !(${macc:-0} > 10)}"; then
+    pass "the MTP head is actually accepting (${macc}%)"
+  else
+    fail "the MTP head is actually accepting (got ${macc:-no}% -- the head is inert)"
+  fi
+else
+  echo "  --   no MTP head in $MODEL; skipping the MTP gates"
+fi
+
 # ------------------------------------------------- cold vs warm cache (§3.4)
 #
 # This is the invariant the design actually states: for any prompt and any

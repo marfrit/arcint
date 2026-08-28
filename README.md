@@ -53,11 +53,13 @@ run against a model yet — there is no OpenVINO in the build until M1.
 - **[M4]** **Speculative decoding** with a hard greedy-invariance guarantee: a
   drafted token is accepted only when it equals what the sampler would have
   picked anyway, so the answer is byte-identical to non-speculative greedy.
-  Ships with a prompt-lookup drafter (`--draft N`, off by default) through the
-  external-drafter hook; the native MTP head needs an export that keeps it.
-  Measured: 88.6 % acceptance on a copy-the-input prompt — and a **net loss**
-  on the A3B MoE checkpoints, because rolling back 69.9 MiB of mostly-GDN
-  recurrent state costs ~90 ms against a 19 ms decode step. See DESIGN §3.5.1.
+  Two drafters: the **native MTP head** for Qwen3.8 (`--mtp on`, **93.3%
+  acceptance**) and a prompt-lookup drafter (`--draft N`) through the
+  external-drafter hook. optimum-intel drops the MTP head on export, so
+  `tools/export_mtp.py` reconstructs it from the checkpoint's own weights.
+  Both are **off by default and both are currently a net loss**, for one
+  reason: rolling the graph state back costs 66% of decode time. Net of it,
+  MTP is 1.35× faster. See DESIGN §3.5.1–3.5.2.
 - **[planned]** **Flash-attention-style fused SDPA** on the full-attention layers, where the
   OpenVINO kernel library provides it for the target Xe generation.
 - **[M0]** **Tool-call parsing**: native Qwen tool-call output is returned as structured
@@ -103,15 +105,18 @@ Serving the real models on Intel Arc. Measured on a B60 with the 27B coder q4:
 | M1 executor, greedy, 27B coder on B60 | done — 51.4 t/s, 10/10 |
 | M2 chunked prefill, cache ledger, long context | done — **257,167 tokens loaded** |
 | M3 prefix caching | done — warm/cold byte-identical, hit stats on console |
-| M4 MTP | machinery done and measured; MTP itself needs an export that keeps the head |
+| M4 MTP | done — byte-identical with `--mtp on`, **93.3% acceptance** on Qwen3.8 |
 | M5 all three models | done — all three serve and reach 10/10; the 35B does not fit the A770 |
 
-M4's machinery is done and measured, and the measurement is the result: greedy
-speculation is byte-identical to plain greedy, reaches 88.6 % acceptance where a
-lookup drafter can work at all, and is still slower than not speculating on the
-MoE checkpoints. It stays off by default. The two things that would change that
-— the paged path, and a dense export with its MTP head — are the same two §3.5
-named before any of it was built.
+M4 is done, and the measurement is the result. Speculative decoding is
+byte-identical to plain greedy by construction, and the Qwen3.8 MTP head — which
+no public implementation can export, and which `tools/export_mtp.py`
+reconstructs from the raw weights — reaches **93.3% acceptance**. It is still
+slower than not speculating, and by now the reason is precisely located:
+rolling back 171 MiB of mostly-GDN recurrent state costs 66% of decode time,
+inside OpenVINO's `VariableState` API. Net of that, MTP is 1.35× faster. So the
+paged decode path is no longer an optimisation — it is the precondition, and it
+is worth about 2× on Qwen3.8.
 
 M2 is done and measured: slicing logits to the last token removed a wall at
 ~8k tokens, storing the attention KV as fp16 took 262144 context from 10.0 GiB

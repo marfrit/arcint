@@ -312,10 +312,13 @@ executor keeps running the graph as exported.
 
 ### 3.5 Speculative decoding (MTP)
 
-**Measured 2026-08-28, and it contradicts this section twice.** All three
-checkpoints declare `mtp_num_hidden_layers: 1` — the 3.6 MoE pair is not
-headless — and *none* of the three OpenVINO exports contains an MTP graph. Each
-one has a single output, `logits`, and no `openvino_mtp_*.xml` beside it. The
+**Resolved 2026-08-28. The head exists and runs: 93.3% draft acceptance,
+byte-identical output.** The rest of this section is kept as the record of how
+it was blocked, because the way it came unblocked matters — see §3.5.2.
+
+All three checkpoints declare `mtp_num_hidden_layers: 1` — the 3.6 MoE pair is
+not headless — and *none* of the three OpenVINO exports contained an MTP graph.
+Each had a single output, `logits`, and no `openvino_mtp_*.xml` beside it. The
 optimum-intel export drops the head.
 
 **The weights themselves are on the fleet.** `/models/gptq/qwen38-gptq-mtp`
@@ -344,9 +347,17 @@ it lowers draft acceptance, which is the silent-divergence class this engine
 exists to refuse.
 
 Two things would unblock it, neither of them code in this repository: an
-upstream implementation of the head, or the model authors' reference. And even
-then §3.5's arithmetic applies — 7.7 accepted tokens per verify step to break
-even on the stateful graph — so MTP wants the paged path as well.
+upstream implementation of the head, or the model authors' reference.
+
+**That reasoning was wrong, and §3.5.1 is what made it wrong.** The objection
+was that a reconstruction has no oracle — that a mistake would not fail, it
+would quietly lower acceptance, which is the silent-divergence class this
+engine refuses. But the verifier built in §3.5.1 accepts a drafted token only
+when it equals what the sampler would have picked anyway, so a wrong head
+*cannot* change the answer. It can only cost acceptance. Acceptance therefore
+became the oracle, and a sharp one: a correct head lands in a known band and a
+wrong one sits near zero. `tools/export_mtp.py` builds the head on that basis;
+§3.5.2 has the result.
 
 So MTP is not implementable against these artifacts, by anyone: there is no
 draft head to call. What unblocks it is a re-export that keeps the MTP layer,
@@ -493,6 +504,61 @@ Both of M4's blockers are the ones §3.5 named before any of this was built: the
 paged path, and an export that keeps the head. What is new is that they are now
 measured rather than estimated, the machinery is in place behind them, and the
 invariant they have to preserve is gated in CI.
+
+#### 3.5.2 The head, reconstructed and measured
+
+`tools/export_mtp.py` builds the MTP head as an OpenVINO IR from the
+unquantised `mtp.*` tensors in the checkpoint, and extracts the base model's LM
+head as a second IR so a draft can be turned into a token. The extraction is
+exact — fed the base model's own hidden state it reproduces the base logits to
+`max abs diff 0.00000`.
+
+The head's forward pass is not documented anywhere, so every choice in it was
+**measured** rather than assumed, scored by how often it predicts the token the
+base model actually produces:
+
+| | acceptance |
+|---|---|
+| final | **66.0%** |
+| with a swish gate instead of sigmoid | 13.2% |
+| with q and gate split as two contiguous halves | 13.2% |
+| with no output gate at all | 15.1% |
+| from the pre-final-norm hidden state | 49.1% |
+| with plain RMSNorm instead of `(1 + w)` | **0.0%** |
+
+Two of those were not guessable. The norms are **zero-centred** and applied as
+`(1 + w)`: `pre_fc_norm_embedding` is entirely negative, which is not a scale,
+and the plain form scores exactly zero. And `q_proj` interleaves each head's
+query with its gate — `[head0_q | head0_gate | head1_q | …]` — rather than
+emitting two contiguous halves, which is worth 53 points. The config's
+`output_gate_type: swish` is a red herring; a plain sigmoid scores 66% where
+swish scores 13%.
+
+**In the engine, on the B60, dense Qwen3.8-27B, greedy, 200 tokens:**
+
+| | decode | accept | verify | re-forward | rollback |
+|---|---|---|---|---|---|
+| `--mtp off` | **19.9 t/s** | — | — | — | — |
+| `--mtp on` | 9.0 t/s | **93.3%** (97/104) | 5.78 s | 0.67 s | 14.75 s |
+
+Output is byte-identical between the two, which is M4's exit criterion together
+with the measured acceptance. In-engine acceptance is higher than the 66% above
+because the head is primed over the whole prompt and scored only on generated
+positions.
+
+The head runs one position behind the base model, consuming `(h_t, emb(x_{t+1}))`
+to predict `x_{t+2}`, and is fed one position per committed token. That makes
+its own attention KV **exempt from rollback**: every input it has consumed is a
+token the model committed to. Only the base model's state needs rewinding.
+
+And that is the whole result: **rollback is 66% of decode time.** Net of it,
+7.43 s for 200 tokens is 26.9 t/s against a 19.9 t/s baseline — MTP is
+**1.35× faster** and the state copy turns it into 2.2× slower. Note how little
+re-forward costs now (0.67 s): at 93.3% acceptance the rejection path is nearly
+free, which is exactly the regime speculation is designed for. The remaining
+obstacle is not the drafter, the head, the kernel or the hardware. It is
+`VariableState::get_state()`/`set_state()` copying 171 MiB of mostly-GDN
+recurrent state every step, and the paged path is what removes it.
 
 ### 3.6 Sampling
 
@@ -805,7 +871,7 @@ and owns the state.
 | M1 | single-sequence inference, greedy, 27B coder q4 on B60 | Prüfstand 10/10, ≥ 45 t/s | **done** — 51.4 t/s, 10/10 at artifact sampling defaults (§5) |
 | M2 | paged KV + GDN ledger, chunked prefill | equivalence suite green, 256k context loads | **done** — suite green, **257,167 tokens loaded** (§5); paged path mapped but not adopted |
 | M3 | prefix caching (block-aligned checkpoints) | warm/cold byte-equality, hit-rate stats on console | **done** — warm/cold byte-identical, hit stats on console |
-| M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance | sampling **done** (M1); MTP needs an export that keeps the head — **the weights exist** (§3.5) |
+| M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance | **done** — byte-identical output with `--mtp on`, 93.3% acceptance on the dense model (§3.5.2). It is a net slowdown until the paged path lands, and is off for the two MoE exports, which carry no head. |
 | M5 | 35B MoE q4 on A770 (16 GB fit), q8 variants on B60 | all three models pass their gates | **done** — all three serve and reach 10/10 (§7). The hardware targets named in the milestone column are not reachable with these artifacts: the 35B is larger than the A770 and HETERO cannot place experts, and no q8 export exists. |
 
 M0 went past its exit criterion on purpose: everything that does not need a

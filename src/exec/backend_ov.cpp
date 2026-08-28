@@ -219,6 +219,30 @@ ov::Tensor deserialise_state(const std::vector<uint8_t>& blob) {
 // at 2247 t/s and 27444 tok at 732 t/s, greedy output byte-identical to the
 // unsliced graph. It is faster than chunking *and* keeps the equality gate
 // chunking had to give up.
+// The MTP head consumes the base model's final hidden state, which the graph
+// only computes on its way into the LM head. Exposing it as a second output
+// costs nothing; it has to happen *before* the logits slice, or the head would
+// see only the rows the slice keeps and could not be primed over a prompt.
+bool expose_hidden_state(const std::shared_ptr<ov::Model>& model) {
+    const auto& results = model->get_results();
+    if (results.empty()) return false;
+
+    std::shared_ptr<ov::Node> node = results[0]->input_value(0).get_node_shared_ptr();
+    for (int hop = 0; hop < 8 && node && node->get_input_size() > 0; ++hop) {
+        if (ov::as_type_ptr<ov::op::v0::MatMul>(node) != nullptr) break;
+        const std::string t = node->get_type_name();
+        if (t != "Convert" && t != "Reshape") return false;
+        node = node->input_value(0).get_node_shared_ptr();
+    }
+    if (ov::as_type_ptr<ov::op::v0::MatMul>(node) == nullptr) return false;
+
+    const auto res = std::make_shared<ov::op::v0::Result>(node->input_value(0));
+    res->get_output_tensor(0).set_names({"hidden_states"});
+    model->add_results({res});
+    model->validate_nodes_and_infer_types();
+    return true;
+}
+
 // `keep_rows` is 1 for plain decoding. Speculative decoding needs the model's
 // own prediction *at every draft position* to verify a draft, so it asks for
 // the last 1 + draft_tokens rows. That keeps all of the memory win -- the wall
@@ -452,8 +476,20 @@ public:
             }
         }
 
+        // Order matters: the head must see every prompt position, so this runs
+        // before the slice rewires the LM head's input.
+        want_mtp_ = cfg.mtp != "off" && artifact.has_mtp_head;
+        if (want_mtp_ && !expose_hidden_state(model)) {
+            log::warn("mtp", "%s", "could not expose the hidden state; MTP disabled");
+            want_mtp_ = false;
+        }
+
         if (cfg.slice_logits) {
-            const int64_t keep = static_cast<int64_t>(1 + draft_tokens_);
+            // The MTP head drafts one token even when --draft is 0, and
+            // verification needs a logits row per drafted position, so the slice
+            // has to be at least two rows wide whenever the head is loaded.
+            const size_t  drafts_max = std::max<size_t>(draft_tokens_, want_mtp_ ? 1 : 0);
+            const int64_t keep       = static_cast<int64_t>(1 + drafts_max);
             if (slice_logits_to_last_token(model, keep)) {
                 log::info("load", "logits sliced to the last %lld token(s): prefill computes "
                                   "%lld row(s) instead of one per prompt token",
@@ -526,6 +562,26 @@ public:
             warmup();
             log::info("load", "language model ready in %.1f s (compiled from IR)",
                       seconds_since(t_cold));
+        }
+
+        if (want_mtp_) {
+            try {
+                const auto t0 = std::chrono::steady_clock::now();
+                mtp_layer_    = core_.compile_model(artifact.mtp_layer_xml, device);
+                mtp_head_     = core_.compile_model(artifact.mtp_lm_head_xml, device);
+                mtp_req_      = mtp_layer_.create_infer_request();
+                mtp_head_req_ = mtp_head_.create_infer_request();
+                mtp_ready_    = true;
+                log::info("mtp", "head ready in %.1f s; drafting one token per step",
+                          seconds_since(t0));
+            } catch (const std::exception& e) {
+                log::warn("mtp", "could not load the MTP head, continuing without it: %s",
+                          e.what());
+                mtp_ready_ = false;
+            }
+        } else if (cfg.mtp == "on") {
+            log::warn("mtp", "%s", "--mtp on, but this export carries no MTP head "
+                                   "(run tools/export_mtp.py); continuing without it");
         }
 
         template_ = std::make_unique<minja::chat_template>(artifact.chat_template,
@@ -619,6 +675,11 @@ public:
         }
         if (past == 0) lm_req_.reset_state();
 
+        // The head's own state follows the base model's, and skips whatever the
+        // prefix cache let the base model skip.
+        mtp_reset();
+        mtp_seek(past);
+
         // The boundary worth remembering is the last block edge strictly inside
         // the prompt: a snapshot of the whole prompt is useless to this prompt
         // and only helps a continuation of it, which the same insert covers.
@@ -683,13 +744,20 @@ public:
             // default) can move the answer. Verifying on a raw argmax silently
             // diverged from non-speculative greedy at draft 8.
             std::vector<int> drafts;
-            if (drafter_ != nullptr && in.sampler.greedy()) {
+            if (mtp_ready_ && in.sampler.greedy()) {
+                // The head is one position behind: feeding it x_P turns its
+                // pending h_{P-1} into a prediction of x_{P+1}, which is exactly
+                // the token the verify pass is about to check.
+                const int d = mtp_feed(next, true);
+                if (d >= 0) drafts.push_back(d);
+            } else if (drafter_ != nullptr && in.sampler.greedy()) {
                 drafts = drafter_->draft(history, draft_tokens_);
             }
 
             if (drafts.empty()) {
                 logits = forward({next}, past);
                 ++past;
+                if (mtp_ready_) mtp_set_pending(last_hidden_, 0);
                 next = pick(sampler, logits);
                 continue;
             }
@@ -711,6 +779,7 @@ public:
                 log::warn("draft", "%s", "cannot snapshot the state, so a rejected draft could "
                                          "not be rolled back; disabling speculation");
                 drafter_.reset();
+                mtp_ready_ = false;
                 logits = forward({next}, past);
                 ++past;
                 next = pick(sampler, logits);
@@ -738,6 +807,7 @@ public:
                           "be verified, disabling speculation",
                           rows, seq.size());
                 drafter_.reset();
+                mtp_ready_ = false;
                 restore_tensors(rollback_);
                 logits = forward({next}, past);
                 ++past;
@@ -795,6 +865,16 @@ public:
                     std::chrono::duration<double>(clock::now() - t_re).count();
             }
 
+            if (mtp_ready_) {
+                // logits/hidden here cover the positions actually committed:
+                // row 0 is position `past`, row i is position `past + i`.
+                for (size_t i = 0; i < accepted; ++i) {
+                    mtp_set_pending(last_hidden_, i);
+                    mtp_feed(drafts[i], false);
+                }
+                mtp_set_pending(last_hidden_, accepted);
+            }
+
             past += 1 + accepted;
             next = pick(sampler, logits);
         }
@@ -819,10 +899,20 @@ private:
             // block edge instead of wherever the chunking happened to land.
             if (snapshot_at > past && snapshot_at < past + take) take = snapshot_at - past;
 
+            const size_t start = past;
             logits = forward({tokens.begin() + static_cast<long>(past),
                               tokens.begin() + static_cast<long>(past + take)},
                              past);
             past += take;
+
+            // Prime the head over the prompt: position t is fed once x_{t+1} is
+            // known, which inside a chunk it always is.
+            if (mtp_ready_) {
+                for (size_t i = 0; i < take; ++i) {
+                    if (mtp_has_pending_) mtp_feed(tokens[start + i], false);
+                    mtp_set_pending(last_hidden_, i);
+                }
+            }
 
             if (prefix_cache_ != nullptr && past == snapshot_at) {
                 // Serialising the whole graph state is expensive and the KV half
@@ -1086,7 +1176,95 @@ private:
         lm_req_.set_tensor(kBeamIdx, beam);
         lm_req_.infer();
 
+        if (mtp_ready_) last_hidden_ = lm_req_.get_tensor("hidden_states");
         return lm_req_.get_tensor(logits_port_);
+    }
+
+    // ------------------------------------------------------------------ MTP
+    //
+    // The head predicts x_{t+2} from the base model's hidden state at t and the
+    // embedding of x_{t+1}, so it runs exactly one position behind the base
+    // model and is fed one position per committed token. Its own attention KV
+    // therefore never needs rolling back: every input it has consumed is a
+    // token the model committed to.
+    void mtp_reset() {
+        if (!mtp_ready_) return;
+        mtp_req_.reset_state();
+        mtp_len_         = 0;
+        mtp_pos_         = 0;
+        mtp_has_pending_ = false;
+    }
+
+    // A prefix-cache hit skips the prompt the head would have been primed on.
+    // Its rope positions must still be the true ones, so the two counters part
+    // company: the head attends to a shorter prefix than it is positioned in.
+    void mtp_seek(size_t position) {
+        if (!mtp_ready_) return;
+        mtp_pos_ = position;
+    }
+
+    void mtp_set_pending(const ov::Tensor& hidden, size_t row) {
+        if (!mtp_ready_) return;
+        const ov::Shape& shape = hidden.get_shape();
+        const size_t     width = shape.back();
+        const size_t     rows  = hidden.get_size() / width;
+        if (row >= rows) return;
+        if (!mtp_pending_ || mtp_pending_.get_shape() != ov::Shape{1, 1, width} ||
+            mtp_pending_.get_element_type() != hidden.get_element_type()) {
+            mtp_pending_ = ov::Tensor(hidden.get_element_type(), ov::Shape{1, 1, width});
+        }
+        std::memcpy(mtp_pending_.data(),
+                    static_cast<const uint8_t*>(hidden.data()) +
+                        row * width * hidden.get_element_type().size(),
+                    width * hidden.get_element_type().size());
+        mtp_has_pending_ = true;
+    }
+
+    // Feeds (pending, embedding of `next`) at the head's current position.
+    // Returns the drafted token when one is wanted, or -1.
+    int mtp_feed(int next, bool want_draft) {
+        if (!mtp_ready_ || !mtp_has_pending_) return -1;
+        try {
+            ov::Tensor ids(ov::element::i64, ov::Shape{1, 1});
+            ids.data<int64_t>()[0] = next;
+            embed_req_.set_input_tensor(ids);
+            embed_req_.infer();
+            const ov::Tensor src = embed_req_.get_output_tensor(0);
+            ov::Tensor       emb(src.get_element_type(), src.get_shape());
+            std::memcpy(emb.data(), src.data(), src.get_byte_size());
+
+            ov::Tensor pos(ov::element::f32, ov::Shape{1, 1});
+            pos.data<float>()[0] = static_cast<float>(mtp_pos_);
+
+            // Nothing is masked: the head attends to its whole committed prefix.
+            ov::Tensor mask(ov::element::f32, ov::Shape{1, 1, 1, mtp_len_ + 1});
+            std::fill_n(mask.data<float>(), mtp_len_ + 1, 0.0f);
+
+            ov::Tensor beam(ov::element::i32, ov::Shape{1});
+            beam.data<int32_t>()[0] = 0;
+
+            mtp_req_.set_tensor("hidden_states", mtp_pending_);
+            mtp_req_.set_tensor("input_embeds", emb);
+            mtp_req_.set_tensor("position_ids", pos);
+            mtp_req_.set_tensor("attention_mask", mask);
+            mtp_req_.set_tensor("beam_idx", beam);
+            mtp_req_.infer();
+
+            ++mtp_len_;
+            ++mtp_pos_;
+            mtp_has_pending_ = false;
+            if (!want_draft) return -1;
+
+            mtp_head_req_.set_input_tensor(mtp_req_.get_output_tensor(0));
+            mtp_head_req_.infer();
+            const ov::Tensor lg = mtp_head_req_.get_output_tensor(0);
+            const size_t     v  = lg.get_shape().back();
+            return Sampler::argmax(lg.data<const float>() + (lg.get_size() / v - 1) * v, v);
+        } catch (const std::exception& e) {
+            log::warn("mtp", "head failed, disabling it for this process: %s", e.what());
+            mtp_ready_ = false;
+            return -1;
+        }
     }
 
     size_t position_sections() const {
@@ -1145,6 +1323,18 @@ private:
     int                            prefill_chunk_ = 512;
     size_t                         state_bytes_   = 0;
     std::unique_ptr<PrefixCache>   prefix_cache_;
+    // --- MTP head (§3.5). Drafts exactly one token per decode step.
+    bool                           want_mtp_ = false;
+    bool                           mtp_ready_ = false;
+    ov::CompiledModel              mtp_layer_;
+    ov::CompiledModel              mtp_head_;
+    ov::InferRequest               mtp_req_;
+    ov::InferRequest               mtp_head_req_;
+    ov::Tensor                     last_hidden_;    // the base model's, this step
+    ov::Tensor                     mtp_pending_;    // h_t, awaiting x_{t+1}
+    bool                           mtp_has_pending_ = false;
+    size_t                         mtp_len_ = 0;    // positions in the head's KV
+    size_t                         mtp_pos_ = 0;    // true position, for rope
     std::vector<ov::Tensor>        rollback_;   // reused speculation scratch
     bool                           logged_rollback_size_ = false;
     std::unique_ptr<Drafter>       drafter_;

@@ -10,7 +10,7 @@
 
 ## Status
 
-M0-M3 done, M5's gates done, M4's machinery done and measured. Serving the real models on Intel Arc
+M0-M5 all meet their exit criteria. Serving the real models on Intel Arc
 via OpenVINO: 51.4 t/s decode and up to 2247 t/s prefill on a B60 with the 27B
 coder q4; all three target models reach 10/10 on the fleet harness.
 
@@ -18,7 +18,7 @@ coder q4; all three target models reach 10/10 on the fleet harness.
   M1 executor, greedy, coder/B60  done - 51.4 t/s, 10/10
   M2 chunked prefill, ledger      done bar the paged path
   M3 prefix caching               done - warm/cold byte-identical
-  M4 MTP                          machinery done + measured; head needs an export
+  M4 MTP                          done - 93.3% acceptance, byte-identical
   M5 all three models             gates done; 35B does not fit the A770
 
 Two M2 walls came down. Slicing logits to the last token before the LM head
@@ -35,10 +35,9 @@ promoted it: it is the precondition for speculative decoding paying at all
 (rollback becomes block-table arithmetic instead of a 171 MiB state copy),
 worth ~2x decode on the dense model, on top of speed and real q8 KV.
 
-Known open, all outside the engine: an export that keeps the Qwen3.8 MTP head
-(the weights exist at /models/gptq/qwen38-gptq-mtp, 15 tensors, unquantised);
-expert offload for the 35B on a 16 GB card, which OpenVINO's fused MoE op does
-not expose; and q8 KV, which needs per-block scales.
+Known open, all outside the engine: expert offload for the 35B on a 16 GB card,
+which OpenVINO's fused MoE op does not expose, and q8 KV, which needs per-block
+scales. The MTP head is no longer among them - tools/export_mtp.py builds it.
 
 Verification: 142 unit cases, a 48-check curl round-trip, an equivalence suite
 that runs where the card is. Clean under ASan and UBSan on x86_64.
@@ -83,8 +82,13 @@ above are authoritative and the allowlist follows them.
 - Prefix index: keyed 128-bit block hashes with token verification on hit.
 - Speculative decoding is implemented and gated on greedy-invariance: a draft
   is accepted only if it equals what the sampler would have picked, so output
-  is byte-identical to plain greedy. Prompt-lookup drafter ships (--draft N,
-  off by default); the native Qwen3.8 MTP head needs an export that keeps it.
+  is byte-identical to plain greedy. Two drafters, both off by default: the
+  native Qwen3.8 MTP head (--mtp on, 93.3% acceptance) and a prompt-lookup
+  drafter (--draft N). optimum-intel drops the MTP head on export, so
+  tools/export_mtp.py reconstructs it from the checkpoint's mtp.* tensors; the
+  forward pass was recovered by measurement (zero-centred (1+w) norms,
+  per-head-interleaved q/gate, sigmoid gate) using acceptance as the oracle,
+  which is only sound because a wrong draft cannot change the output.
   Measured a net loss as shipped, for two separable reasons. (1) Rollback:
   copying the graph state per decode step costs 51-67% of decode time - 69.9
   MiB/80 vars on the MoE, 171.3 MiB/128 vars on the dense model, mostly the

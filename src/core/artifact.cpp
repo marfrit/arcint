@@ -210,19 +210,14 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out) 
     // mtp_num_hidden_layers, but optimum-intel drops the graph, and only the
     // graph can be served. Detect it rather than trusting either the config or
     // DESIGN.md §3.5.
-    a.has_mtp_head = false;
-    if (DIR* dir = ::opendir(dir_c.c_str())) {
-        while (dirent* e = ::readdir(dir)) {
-            std::string name(e->d_name);
-            for (char& c : name) c = static_cast<char>(::tolower(c));
-            if (name.size() > 4 && name.compare(name.size() - 4, 4, ".xml") == 0 &&
-                (name.find("mtp") != std::string::npos ||
-                 name.find("nextn") != std::string::npos)) {
-                a.has_mtp_head = true;
-                break;
-            }
-        }
-        ::closedir(dir);
+    // Both halves are needed: the head's own layer, and the LM head extracted
+    // from the base model so the draft can be turned into a token.
+    a.mtp_layer_xml   = dir + "/openvino_mtp_layer.xml";
+    a.mtp_lm_head_xml = dir + "/openvino_mtp_lm_head.xml";
+    a.has_mtp_head    = file_exists(a.mtp_layer_xml) && file_exists(a.mtp_lm_head_xml);
+    if (!a.has_mtp_head) {
+        a.mtp_layer_xml.clear();
+        a.mtp_lm_head_xml.clear();
     }
 
     a.arch_hash      = hash_prefix(sha256_file(a.language_model_xml));
