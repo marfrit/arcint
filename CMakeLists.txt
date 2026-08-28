@@ -25,6 +25,14 @@ find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------- build info
 # Resolved at configure time, not build time: reconfigure to refresh the sha.
+# A deployed binary must be able to say which commit it is. Builds from an
+# exported tree have no .git to ask, so the sha can be passed in instead:
+#   cmake -S . -B build -DLIGENCE_GIT_SHA=$(git rev-parse --short=12 HEAD)
+set(LIGENCE_GIT_SHA "" CACHE STRING "Git sha to stamp in, when there is no .git to read")
+if(LIGENCE_GIT_SHA)
+  message(STATUS "ligence: build stamped with the supplied sha ${LIGENCE_GIT_SHA}")
+endif()
+if(NOT LIGENCE_GIT_SHA)
 set(LIGENCE_GIT_SHA "unknown")
 find_package(Git QUIET)
 if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
@@ -43,6 +51,7 @@ if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
   if(NOT LIGENCE_GIT_DIRTY STREQUAL "")
     set(LIGENCE_GIT_SHA "${LIGENCE_GIT_SHA}-dirty")
   endif()
+endif()
 endif()
 configure_file(cmake/build_info.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/build_info.h" @ONLY)
 

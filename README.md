@@ -154,6 +154,35 @@ configure until M1 lands it; meanwhile `--model` is refused at startup rather
 than silently starting something that cannot run, and `--stub` is the only way
 in. `-DLIGENCE_WERROR=ON` for the warning-clean build CI should use.
 
+## Deploying it
+
+The installed binary is self-contained: it resolves the OpenVINO runtime and
+the tokenizers extension through RPATH, both found at configure time, so a unit
+file carries flags and not a library search path. Verified on dirac — with
+`LD_LIBRARY_PATH` unset there are no unresolved objects, and it serves `/health`
+under `env -i`.
+
+    cmake -S . -B build-ov -DLIGENCE_OPENVINO=ON -DCMAKE_BUILD_TYPE=Release \
+          -DLIGENCE_GIT_SHA=$(git rev-parse --short=12 HEAD)
+    cmake --build build-ov -j"$(nproc)"
+    cmake --install build-ov --prefix ~/.local
+
+`packaging/ligence.service` and `packaging/ligence.env` are a systemd **user**
+unit and its configuration, matching how the fleet already runs its inference
+services. Every ligence setting is a command line flag, so the env file holds
+the flags and the unit itself never has to be edited. `-DLIGENCE_GIT_SHA` is
+worth passing whenever the build tree has no `.git` — otherwise `--version` and
+`/props` report `unknown`, and a running binary cannot say what it is.
+
+On dirac specifically, unit changes go through the Roundhouse MCP rather than
+hand-edited systemctl: a hand edit without a commit in `~/.config/systemd/user`
+crashes roundhouse. The file is the content to hand it, not permission to
+install it by hand.
+
+Note the port: ligence and the fleet's existing coder endpoint both want the
+same card, and the B60 holds a model's VRAM for the process lifetime. Running
+ligence there means replacing that endpoint, not sitting beside it.
+
 ## Why not just use …
 
 - **OpenVINO GenAI**: its continuous-batching path (required for prefix
