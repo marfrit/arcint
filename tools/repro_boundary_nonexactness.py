@@ -19,11 +19,15 @@ Run against any of the three target artifacts:
 Measured 2026-08-28 on an Arc Pro B60, OpenVINO 2026.4, xe KMD, with
 qwen38-b7c1-ov:
 
-    row 0 of forward([x, y])  vs forward([x])                  identical
-    last row, batched vs sequential                            differs, 0.013
-    cold (one 235-token forward) vs warm (224 then 11)         differs, 0.210
-      ... with a top-2 margin at that position of              0.145
-    both paths split at the same boundary                      identical
+    row 0, batched vs alone                                    0.000000
+    last row, batched vs sequential                            0.014414
+    cold vs warm                                               0.210437
+      ... with a top-2 margin at that position of                0.1445
+    same boundary on both paths                                0.000000
+
+(DESIGN.md quotes 0.013 for the second line: that came from the same experiment
+run against the model's own greedy continuation rather than the random tokens
+used here. The size is the point, not the digits.)
 
 The last line is the point: the backend is allowed to be chunk-sensitive, and
 equality comes back by construction as soon as no two paths hand the model a
