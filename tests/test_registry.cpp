@@ -164,12 +164,41 @@ TEST(registry_mtp_reflects_the_export_not_the_checkpoint) {
     }
 }
 
+namespace {
+// A dense-3.8 artifact that matches its entry in every respect, so a test can
+// flip exactly one field and know that field caused the refusal.
+ArtifactInfo good_dense_artifact() {
+    const ModelEntry* e = find_model("qwen3.8-27b");
+    ArtifactInfo      a;
+    a.id             = e->id;
+    a.quant          = Quant::Q4;
+    a.n_layer        = e->n_layer;
+    a.n_gdn_layer    = e->n_gdn_layer;
+    a.n_attn_layer   = e->n_attn_layer;
+    a.n_ctx_train    = e->n_ctx_train;
+    a.arch_hash      = e->arch_hash;
+    a.template_hash  = e->template_hash;
+    a.tokenizer_hash = e->tokenizer_hash;
+    a.has_mtp_head   = e->has_mtp_head;
+    return a;
+}
+}  // namespace
+
+TEST(registry_a_matching_dense_artifact_is_accepted) {
+    // The control: without this, the refusal test below could pass for any
+    // reason at all.
+    const ModelEntry* e = find_model("qwen3.8-27b");
+    CHECK(validate_artifact(*e, good_dense_artifact()).ok);
+}
+
 TEST(registry_pinned_mtp_mismatch_is_a_refusal) {
     const ModelEntry* e = find_model("qwen3.8-27b");
-    ArtifactInfo      a = good_coder_artifact();
-    a.id                = "qwen3.8-27b";
+    ArtifactInfo      a = good_dense_artifact();
     a.has_mtp_head      = true;  // an export that suddenly has one
-    CHECK(!validate_artifact(*e, a).ok);
+
+    const ValidationResult res = validate_artifact(*e, a);
+    CHECK(!res.ok);
+    CHECK_EQ(res.errors.size(), 1u);  // and only for the MTP flag
 }
 
 TEST(registry_validation_rejects_a_foreign_id) {

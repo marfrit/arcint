@@ -156,10 +156,30 @@ than assert it). Measured on the coder, same card:
 | chunked at 512, no slice | 9615 tok in 8.28 s (1161 t/s) — but not bit-exact |
 | **unchunked + slice** | 9156 tok at **2247 t/s**; 18303 tok in 17.6 s; 36591 tok in 99.5 s |
 
-That retires the trade-off instead of balancing it: deeper than chunking
-reached, faster than chunking ran, and bit-exact where chunking was not.
-Chunking stays for whatever eventually exceeds even this, and `--prefill-chunk`
-stays at 0.
+That removes the *logits* term. It does not remove the others, and it is worth
+being blunt about that, because the first version of this section was: an
+unchunked prefill still holds activations for every prompt token at once, so
+"deep context" bought that way scales with host RAM. Serving 262144 tokens by
+owning enough memory to hold 262144 tokens of activations is not a design, it
+is a bigger machine — and it is what took `data` down on 2026-08-28.
+
+**The reference on this fleet already answers this.** `llama-agent.service`
+serves 262144 context with the *35B* on a *16 GB* A770:
+
+    -c 262144  -fa on  -ctk q8_0 -ctv q8_0  -ncmoe 30  --parallel 1
+
+Four levers, none of them "more memory": flash attention (attention activations
+independent of sequence length), **q8 KV** (a quarter of the fp32 this graph's
+state variables use), MoE expert host-spill (§8's `-ncmoe` question, answered in
+the affirmative), and llama.cpp's micro-batched prefill at n_ubatch 512, which
+bounds activations by the batch rather than by the prompt.
+
+So chunking is not the compromise, it is the mechanism, and `--prefill-chunk`
+now defaults to **2048**: ordinary prompts still land in one chunk and stay
+bit-identical to an unchunked run, while a long prompt is split rather than
+allowed to grow without limit. The slice and the chunk are complementary — one
+bounds the logits term, the other bounds the activation term — and what remains
+for 262144 on the B60 is the KV term, which is where q8 comes in.
 
 1. **prefill graph** — chunked, variable token count, writes KV pages and GDN
    states.

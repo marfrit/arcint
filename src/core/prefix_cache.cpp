@@ -102,7 +102,15 @@ void PrefixCache::insert(const std::vector<int>& tokens, size_t prefix_len, Stat
     }
 
     for (const Entry& e : entries_) {
-        if (e.hi == hi && e.lo == lo) return;  // already held
+        if (e.hi != hi || e.lo != lo) continue;
+        // Same rule as lookup: a hash match is not identity. Without the token
+        // check a collision would silently discard a genuinely different prefix
+        // and never be counted.
+        if (e.tokens.size() == prefix_len &&
+            std::equal(e.tokens.begin(), e.tokens.end(), tokens.begin())) {
+            return;  // already held
+        }
+        ++stats_.collisions;
     }
 
     Entry entry;

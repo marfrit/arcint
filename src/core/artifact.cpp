@@ -1,6 +1,8 @@
 #include "core/artifact.h"
 
+#include <cctype>
 #include <cstdio>
+#include <dirent.h>
 #include <fstream>
 #include <sstream>
 #include <sys/stat.h>
@@ -83,7 +85,8 @@ ArtifactInfo Artifact::to_info(Quant quant) const {
 }
 
 std::optional<std::string> load_artifact(const std::string& dir, Artifact& out) {
-    Artifact a;
+    const std::string dir_c = dir;
+    Artifact          a;
     a.dir            = dir;
     a.directory_name = basename_of(dir);
 
@@ -203,6 +206,25 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out) 
     }
 
     // ---------------------------------------------------------------- hashes
+    // Does the export actually carry an MTP head? The checkpoints all declare
+    // mtp_num_hidden_layers, but optimum-intel drops the graph, and only the
+    // graph can be served. Detect it rather than trusting either the config or
+    // DESIGN.md §3.5.
+    a.has_mtp_head = false;
+    if (DIR* dir = ::opendir(dir_c.c_str())) {
+        while (dirent* e = ::readdir(dir)) {
+            std::string name(e->d_name);
+            for (char& c : name) c = static_cast<char>(::tolower(c));
+            if (name.size() > 4 && name.compare(name.size() - 4, 4, ".xml") == 0 &&
+                (name.find("mtp") != std::string::npos ||
+                 name.find("nextn") != std::string::npos)) {
+                a.has_mtp_head = true;
+                break;
+            }
+        }
+        ::closedir(dir);
+    }
+
     a.arch_hash      = hash_prefix(sha256_file(a.language_model_xml));
     a.template_hash  = hash_prefix(sha256_hex(a.chat_template));
     a.tokenizer_hash = hash_prefix(sha256_file(tokenizer_json));

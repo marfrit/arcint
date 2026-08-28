@@ -146,17 +146,18 @@ int main(int argc, char** argv) {
                            ? lgc::log::format("chunked at %d tok", cfg.prefill_chunk).c_str()
                            : "unchunked");
         if (cfg.prefill_chunk > 0) {
-            lgc::log::warn("load", "%s",
-                           "chunked prefill is not bit-exact on this backend: greedy output "
-                           "can differ from an unchunked run (DESIGN.md 3.2). Use it when the "
-                           "activations would not otherwise fit, not by default.");
+            lgc::log::verbose("load",
+                              "prompts over %d tokens are prefilled in chunks; chunk boundaries "
+                              "are not bit-exact on this backend (DESIGN.md 3.2), shorter "
+                              "prompts are unaffected",
+                              cfg.prefill_chunk);
         }
         if (cfg.prefix_cache_mib > 0) {
             lgc::log::warn("load", "%s",
-                           "the prefix cache checkpoints mid-prompt, which splits the prefill "
-                           "and therefore inherits that same non-exactness against a "
-                           "cache-off run. Warm-vs-cold equality is unaffected and is the "
-                           "invariant that is gated.");
+                           "the prefix cache checkpoints mid-prompt, which splits the prefill. "
+                           "Repeating an identical prompt is gated byte-equal; a CONTINUATION "
+                           "of a cached prompt takes a different prefill split than a cold run "
+                           "and inherits this backend's chunk non-exactness (DESIGN.md 3.2).");
         }
         if (cfg.prefix_cache_mib > 0) {
             lgc::log::info("mem", "prefix cache %d MiB, block %d tok | state lives in the OV "

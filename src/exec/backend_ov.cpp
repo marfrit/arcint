@@ -147,6 +147,7 @@ private:
 // depends on the live state happening to have the same shape it had when the
 // snapshot was taken.
 uint32_t get_u32(const std::vector<uint8_t>& in, size_t& off) {
+    if (off + 4 > in.size()) throw std::runtime_error("state blob truncated");
     uint32_t v = 0;
     for (int i = 0; i < 4; ++i) v |= static_cast<uint32_t>(in[off + static_cast<size_t>(i)]) << (i * 8);
     off += 4;
@@ -182,6 +183,7 @@ std::vector<uint8_t> serialise_state(const ov::Tensor& t) {
 ov::Tensor deserialise_state(const std::vector<uint8_t>& blob) {
     size_t         off = 0;
     const uint32_t tlen = get_u32(blob, off);
+    if (off + tlen > blob.size()) throw std::runtime_error("state blob truncated (type)");
     const std::string type(reinterpret_cast<const char*>(blob.data() + off), tlen);
     off += tlen;
 
@@ -191,6 +193,9 @@ ov::Tensor deserialise_state(const std::vector<uint8_t>& blob) {
     for (uint32_t i = 0; i < rank; ++i) shape.push_back(get_u32(blob, off));
 
     ov::Tensor t(ov::element::Type(type), shape);
+    if (off + t.get_byte_size() > blob.size()) {
+        throw std::runtime_error("state blob truncated (payload)");
+    }
     std::memcpy(t.data(), blob.data() + off, t.get_byte_size());
     return t;
 }
@@ -218,7 +223,18 @@ bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model) {
         if (t != "Convert" && t != "Reshape") return false;
         node = node->input_value(0).get_node_shared_ptr();
     }
-    if (ov::as_type_ptr<ov::op::v0::MatMul>(node) == nullptr) return false;
+    const auto matmul = ov::as_type_ptr<ov::op::v0::MatMul>(node);
+    if (matmul == nullptr) return false;
+
+    // Rewriting the wrong operand would silently produce wrong logits with no
+    // error, which is the one failure mode a graph rewrite must not have. Only
+    // proceed when input 0 is unmistakably the activation: not transposed, and
+    // not a constant weight.
+    if (matmul->get_transpose_a()) return false;
+    if (ov::as_type_ptr<ov::op::v0::Constant>(
+            node->input_value(0).get_node_shared_ptr()) != nullptr) {
+        return false;
+    }
 
     const ov::Output<ov::Node> hidden = node->input_value(0);
     const ov::PartialShape&    ps     = hidden.get_partial_shape();
@@ -370,16 +386,25 @@ public:
 
         // An unseeded request still gets a seed, it just gets a fresh one — and
         // it is logged, so any answer can be reproduced exactly (§3.6).
-        const uint64_t seed = in.sampler.seeded ? in.sampler.seed : std::random_device{}();
-        Sampler        sampler(in.sampler, seed);
+        // random_device yields 32 bits; two draws fill the 64-bit seed, and it
+        // is logged at info so "reproducible" means reproducible by the operator
+        // who has the default log level, not only by one running with -v.
+        uint64_t seed = in.sampler.seed;
+        if (!in.sampler.seeded) {
+            std::random_device rd;
+            seed = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+        }
+        Sampler sampler(in.sampler, seed);
         if (!in.sampler.greedy()) {
-            log::verbose("sample", "temp %.2f top_p %.2f top_k %d seed %llu",
-                         in.sampler.temperature, in.sampler.top_p, in.sampler.top_k,
-                         static_cast<unsigned long long>(seed));
+            log::info("sample", "temp %.2f top_p %.2f top_k %d seed %llu",
+                      static_cast<double>(in.sampler.temperature),
+                      static_cast<double>(in.sampler.top_p), in.sampler.top_k,
+                      static_cast<unsigned long long>(seed));
         }
 
-        // History feeds the penalties; the prompt counts, as it does upstream.
-        std::vector<int> history = prompt_ids;
+        // The prompt counts toward repetition_penalty only; the sampler keeps
+        // the two scopes apart and maintains its counts incrementally.
+        sampler.set_prompt(prompt_ids);
 
         // -------------------------------------------------------- prefill
         const auto t_prefill = clock::now();
@@ -410,7 +435,7 @@ public:
         ov::Tensor logits = prefill(prompt_ids, past, snap_at);
         stats.prefill_seconds = std::chrono::duration<double>(clock::now() - t_prefill).count();
 
-        int next = pick(sampler, logits, history);
+        int next = pick(sampler, logits);
 
         const std::vector<int>& eos = tokenizer_->eos_ids();
         auto is_eos = [&](int id) {
@@ -443,10 +468,10 @@ public:
                 break;
             }
 
-            history.push_back(next);
+            sampler.observe(next);
             logits = forward({next}, past);
             ++past;
-            next = pick(sampler, logits, history);
+            next = pick(sampler, logits);
         }
 
         stats.decode_seconds = std::chrono::duration<double>(clock::now() - t_decode).count();
@@ -475,18 +500,44 @@ private:
             past += take;
 
             if (prefix_cache_ != nullptr && past == snapshot_at) {
-                prefix_cache_->insert(tokens, past, snapshot());
+                // Serialising the whole graph state is expensive and the KV half
+                // grows with the prefix, so ask first whether it could be kept
+                // at all rather than copying hundreds of MiB to have it dropped.
+                if (prefix_cache_->may_accept(estimated_state_bytes())) {
+                    PrefixCache::StateBlob blob;
+                    if (snapshot(blob)) prefix_cache_->insert(tokens, past, std::move(blob));
+                }
             }
         }
         return logits;
     }
 
-    PrefixCache::StateBlob snapshot() {
-        PrefixCache::StateBlob out;
-        for (ov::VariableState& v : lm_req_.query_state()) {
-            out.push_back(serialise_state(v.get_state()));
+    // Mirrors restore()'s contract: a failure degrades to "no caching", never
+    // to a 500 on an otherwise healthy request.
+    bool snapshot(PrefixCache::StateBlob& out) {
+        try {
+            out.clear();
+            for (ov::VariableState& v : lm_req_.query_state()) {
+                out.push_back(serialise_state(v.get_state()));
+            }
+            return true;
+        } catch (const std::exception& e) {
+            log::warn("cache", "state snapshot failed, continuing without caching: %s", e.what());
+            out.clear();
+            return false;
         }
-        return out;
+    }
+
+    size_t estimated_state_bytes() {
+        if (state_bytes_ != 0) return state_bytes_;
+        try {
+            for (ov::VariableState& v : lm_req_.query_state()) {
+                state_bytes_ += v.get_state().get_byte_size() + 64;
+            }
+        } catch (const std::exception&) {
+            state_bytes_ = 0;
+        }
+        return state_bytes_;
     }
 
     bool restore(const PrefixCache::StateBlob& blob) {
@@ -622,14 +673,14 @@ private:
     // Copies the last logit row out of the graph's output tensor and hands it
     // to the sampler. The copy is deliberate: the sampler mutates the row for
     // penalties, and the tensor belongs to the InferRequest.
-    int pick(Sampler& sampler, const ov::Tensor& logits, const std::vector<int>& history) {
+    int pick(Sampler& sampler, const ov::Tensor& logits) {
         const ov::Shape& shape = logits.get_shape();
         const size_t     vocab = shape.back();
         const size_t     rows  = logits.get_size() / vocab;
         const float*     row   = logits.data<const float>() + (rows - 1) * vocab;
 
         logit_scratch_.assign(row, row + vocab);
-        return sampler.sample(logit_scratch_.data(), vocab, history);
+        return sampler.sample(logit_scratch_.data(), vocab);
     }
 
     Artifact                       artifact_;
@@ -646,6 +697,7 @@ private:
     std::vector<float>             logit_scratch_;
     ov::Tensor                     embeds_;
     int                            prefill_chunk_ = 512;
+    size_t                         state_bytes_   = 0;
     std::unique_ptr<PrefixCache>   prefix_cache_;
     mutable size_t                 position_sections_ = 0;
 };

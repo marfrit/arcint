@@ -63,7 +63,7 @@ Be precise about what information is irrecoverably mixed together. $(python3 -c 
 echo "== ligence equivalence suite on $DEV"
 
 # ---------------------------------------------------- greedy determinism (§5)
-start_server "$WORK/a.log" --prefill-chunk 512 || exit 1
+start_server "$WORK/a.log" || exit 1   # shipped defaults: this IS the baseline
 ask "$WORK/det1.txt" "$PROMPT"
 ask "$WORK/det2.txt" "$PROMPT"
 cmp -s "$WORK/det1.txt" "$WORK/det2.txt" && pass "two greedy runs are byte-identical" \
@@ -76,7 +76,7 @@ cp "$WORK/det1.txt" "$WORK/base.txt"
 # Slicing the hidden state to its last row before the LM head is what lets a
 # deep prompt fit at all. It is only safe because nothing samples the other
 # rows, and that is a claim worth gating rather than asserting.
-start_server "$WORK/noslice.log" --no-logits-slice || exit 1
+start_server "$WORK/noslice.log" --no-logits-slice || exit 1   # only the slice differs
 ask "$WORK/noslice.txt" "$PROMPT"
 cmp -s "$WORK/base.txt" "$WORK/noslice.txt" \
   && pass "slicing logits to the last token does not change the answer" \
@@ -96,7 +96,7 @@ for chunk in 1 7 64; do
   if cmp -s "$WORK/base.txt" "$WORK/chunk$chunk.txt"; then
     echo "     chunk $chunk: matches the unchunked baseline"
   else
-    echo "     chunk $chunk: DIFFERS from unchunked (expected on this backend)"
+    echo "     chunk $chunk: DIFFERS from the unchunked baseline (expected here)"
   fi
 done
 
@@ -117,11 +117,20 @@ else
   fail "the console reports a cache hit (no hit happened, so equality proved nothing)"
 fi
 
-# A continuation of a cached prompt must reuse the prefix and still be correct.
-ask "$WORK/cont.txt" "$PROMPT Then add one more sentence about block alignment."
+# A continuation of a cached prompt must reuse the prefix AND still match a cold
+# run of the same prompt. Asserting only that a hit occurred would prove nothing
+# about the answer, which is the whole point of §3.4.
+CONT="$PROMPT Then add one more sentence about block alignment."
+ask "$WORK/cont-warm.txt" "$CONT"
 hits=$(grep -c 'cache hit' "$WORK/pc.log")
 [[ "$hits" -ge 2 ]] && pass "a continuation of a cached prompt also hits" \
                     || fail "a continuation of a cached prompt also hits"
+
+start_server "$WORK/cold.log" || exit 1          # no cache at all
+ask "$WORK/cont-cold.txt" "$CONT"
+cmp -s "$WORK/cont-cold.txt" "$WORK/cont-warm.txt" \
+  && pass "a continuation restored from cache matches a cold run" \
+  || fail "a continuation restored from cache matches a cold run"
 
 stop_server
 echo

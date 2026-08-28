@@ -29,12 +29,17 @@ struct Config {
 
     // Prefill chunk in tokens, 0 = one call for the whole prompt.
     //
-    // Default off, and that is a correctness decision rather than a
-    // performance one: chunking is NOT bit-exact on the OpenVINO GPU backend
-    // (measured — see DESIGN.md §3.2), so the shipped default is the
-    // configuration that satisfies the equality gate. Chunking remains
-    // available for prompts whose activations will not otherwise fit.
-    int prefill_chunk = 0;
+    // Bounding the chunk is what bounds activation memory, and that — not a
+    // bigger host — is how deep context is actually served. The reference on
+    // this fleet (llama.cpp, 262144 context, 35B on a 16 GB A770) does exactly
+    // this, at n_ubatch 512.
+    //
+    // 2048 is chosen so that ordinary prompts still land in a single chunk and
+    // are therefore bit-identical to an unchunked run, while a long prompt is
+    // split rather than allowed to scale activations without limit. Chunk
+    // boundaries are not bit-exact on this backend (DESIGN.md §3.2), so this is
+    // a real trade and the number is where it bites least.
+    int prefill_chunk = 2048;
 
     // Prefix-cache budget in MiB, host-side. Zero disables it. A snapshot of
     // this architecture's state is tens of MiB (the GDN half is fixed-size), so

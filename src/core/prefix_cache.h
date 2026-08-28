@@ -51,6 +51,10 @@ public:
     // a multiple of the block size.
     void insert(const std::vector<int>& tokens, size_t prefix_len, StateBlob state);
 
+    // Would an entry of this size survive insertion? Lets a caller skip an
+    // expensive serialisation whose result would only be dropped.
+    bool may_accept(size_t bytes) const { return budget_ > 0 && bytes > 0 && bytes <= budget_; }
+
     void            clear();
     PrefixCacheStats stats() const { return stats_; }
     int              block_size() const { return block_size_; }
