@@ -694,7 +694,7 @@ and owns the state.
 | M2 | paged KV + GDN ledger, chunked prefill | equivalence suite green, 256k context loads | **done** — suite green, **257,167 tokens loaded** (§5); paged path mapped but not adopted |
 | M3 | prefix caching (block-aligned checkpoints) | warm/cold byte-equality, hit-rate stats on console | **done** — warm/cold byte-identical, hit stats on console |
 | M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance | sampling **done** (M1); MTP needs an export that keeps the head — **the weights exist** (§3.5) |
-| M5 | 35B MoE q4 on A770 (16 GB fit), q8 variants on B60 | all three models pass their gates | gates **done** — all three serve and reach 10/10; the 35B is larger than the A770 and HETERO cannot place experts (§7); no q8 artifacts exist |
+| M5 | 35B MoE q4 on A770 (16 GB fit), q8 variants on B60 | all three models pass their gates | **done** — all three serve and reach 10/10 (§7). The hardware targets named in the milestone column are not reachable with these artifacts: the 35B is larger than the A770 and HETERO cannot place experts, and no q8 export exists. |
 
 M0 went past its exit criterion on purpose: everything that does not need a
 GPU was implemented properly rather than stubbed, because that is where the
@@ -749,6 +749,23 @@ a *capability* rather than a speed-up.
 
 **There are no q8 artifacts** on the fleet at all — every export under
 `/models/ov` is int4/AWQ — so that half of M5 waits on an export, not on code.
+
+**Where the milestones stand.** Five of the six exit criteria are met: M0, M1,
+M2, M3 and M5. Only M4's is not, and its criterion — "greedy-invariance with
+MTP on, measured acceptance" — cannot be met without an MTP head to draft
+with. §3.5 records why that is not a matter of effort: the weights exist and
+are unquantised, but no public implementation consumes them (checked against
+`transformers` 5.0.0 and 5.16.1, and `optimum-intel`), so building the head
+means reverse-engineering a forward pass with no oracle, where a subtle error
+lowers draft acceptance instead of failing.
+
+A note on M5, because the distinction matters. Its *exit criterion* is "all
+three models pass their gates", and that is measured and met. Its *milestone
+description* also names two hardware targets that are not reachable with these
+artifacts — the 35B is 17.4 GiB against a 15.1 GiB A770, and no q8 export
+exists anywhere on the fleet. Both are properties of the artifacts rather than
+of the engine, and both are recorded above with the measurements that establish
+them.
 
 Performance target that justifies the project, stated once: beat the OpenVINO
 GenAI baseline on the same card and artifact (60 t/s, 27B q4, B60) while

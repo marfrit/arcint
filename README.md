@@ -99,7 +99,7 @@ Serving the real models on Intel Arc. Measured on a B60 with the 27B coder q4:
 | M2 chunked prefill, cache ledger, long context | done — **257,167 tokens loaded** |
 | M3 prefix caching | done — warm/cold byte-identical, hit stats on console |
 | M4 MTP | sampling done; MTP needs an export that keeps the head |
-| M5 all three models | gates done; the 35B does not fit the A770 |
+| M5 all three models | done — all three serve and reach 10/10; the 35B does not fit the A770 |
 
 M2 is done and measured: slicing logits to the last token removed a wall at
 ~8k tokens, storing the attention KV as fp16 took 262144 context from 10.0 GiB
