@@ -272,7 +272,23 @@ follow the export — and records `mtp_in_checkpoint` separately so the reason i
 visible. `--mtp on` is refused for every model rather than quietly doing
 ordinary decoding under a speculative label.
 
-The plan below stands unchanged for the day an export carries the head:
+**And even with a head, speculation would not pay on the stateful graph.**
+Verifying a draft of k tokens advances the state by k whatever the outcome, so
+a partial acceptance needs a rollback. The KV half could be truncated, but the
+GDN conv/ssm states are overwritten in place every step and can only be undone
+from a snapshot — the same 75 MiB snapshot §3.4 uses, at 0.08 s to take and
+0.07 s to restore. Against 19.5 ms per decoded token at 51.4 t/s, that is
+**7.7 accepted tokens per verify step just to break even**, well above the 2–4
+that MTP heads typically deliver. Speculation would be a net loss.
+
+This is the second thing the paged path buys, and the sharper one: with draft
+tokens in scratch pages, rollback is block-table arithmetic instead of a
+75 MiB copy. §3.5's own sentence — "draft tokens live in scratch pages and are
+promoted only on acceptance" — turns out to be load-bearing rather than an
+implementation detail. So M4 depends on M2's paged decode convention as well as
+on a re-export.
+
+The plan below stands unchanged for the day both arrive:
 
 - Qwen3.8-27B: native MTP head, greedy draft of n tokens, verified in one
   decode-graph call (draft acceptance measured 45–75 % depending on language
@@ -491,7 +507,7 @@ and owns the state.
 | M1 | single-sequence inference, greedy, 27B coder q4 on B60 | Prüfstand 10/10, ≥ 45 t/s | **done** — 51.4 t/s, 10/10 at artifact sampling defaults (§5) |
 | M2 | paged KV + GDN ledger, chunked prefill | equivalence suite green, 256k context loads | partly — suite green, chunking in (not bit-exact, off by default); paged path mapped but not adopted; 256k unproven |
 | M3 | prefix caching (block-aligned checkpoints) | warm/cold byte-equality, hit-rate stats on console | **done** — warm/cold byte-identical, hit stats on console |
-| M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance | sampling **done** (M1); MTP **blocked** — no export contains the head (§3.5) |
+| M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance | sampling **done** (M1); MTP **blocked twice** — no export contains the head, and rollback on the stateful graph costs 7.7 tokens per verify step (§3.5) |
 | M5 | 35B MoE q4 on A770 (16 GB fit), q8 variants on B60 | all three models pass their gates | gates **done** — all three serve and reach 10/10; A770 fit **fails**, no q8 artifacts exist |
 
 M0 went past its exit criterion on purpose: everything that does not need a
