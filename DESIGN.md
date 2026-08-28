@@ -1068,22 +1068,105 @@ the first discarded as warm-up, wall clock including prefill:
 | openarc, GenAI continuous batching (paged) | **53.8 t/s** | 51.6, 57.8, 51.7, 55.9 |
 | ligence, stateful | **46.6 t/s** | 46.0, 46.0, 47.8, 47.1 |
 
-**13.4%**, and it is compute rather than serving overhead: ligence's own console
-reports prefill 0.12 s plus decode 2.42 s against 2.58 s of wall clock, so HTTP
-and detokenization account for about 1.5%.
+**13.4%** end to end. But that number measures openarc's *whole pipeline*, and
+taking it as the size of the prize was wrong — the graph and the pipeline had to
+be separated, and separating them changes the answer by a factor of four.
 
-That number is the honest size of the prize, and it is smaller than the
-component estimates suggested — the decode profile puts `gated_delta_net::ref`
-at 9.1% and `permute_ref` at 9.0%, and the paged path should retire much of
-both. Two readings are possible: the paged kernels win less than the profile
-implies, or openarc pays overheads of its own that mask part of the win. Either
-way, 13.4% is what a rewrite has to beat, measured rather than assumed, and it
-is the right yardstick to hold the work to.
+**The graph, profiled directly.** Same card, same artifact, same 256-token
+depth, steady-state decode step (not the first after a prefill, which is slower,
+and not depth 64, which hides the attention and transpose growth):
+
+| | stateful | paged | delta |
+|---|---|---|---|
+| **decode step** | **19.01 ms** | **≈11.3 ms** | **−41%** |
+| `FullyConnectedCompressed` ×371 | 9608 µs | 7217 µs | −2391 |
+| `Transpose` → `permute_ref` ×90 | **3207 µs** | **eliminated** | **−3207** |
+| `DynamicQuantize` ×160 | 1308 µs | 1296 µs | — |
+| `MOECompressed` ×40 | 1180 µs | 569 µs | −611 |
+| `GatedDeltaNet ref` → `PagedGatedDeltaNet opt` ×30 | 1105 µs | 468 µs | −637 |
+| `StridedSlice` ×101 → ×40 | 495 µs | 140 µs | −355 |
+| `Concat` ×50 → ×20 | 272 µs | 74 µs | −198 |
+| `IndirectSDPA` → `PagedAttentionExtension` ×10 | 185 µs | ~0 | −185 |
+
+Nearly half the saving is the transposes vanishing outright — the ones the
+custom-kernel excursion could not beat from outside and §8 predicted would
+dissolve here. The optimized paged GDN kernel is worth another 0.64 ms, and
+`PagedAttention` costs essentially nothing where `IndirectSDPA` was already
+visible at this shallow depth and grows as L^1.46.
+
+**So the prize is 1.68× on the graph, not 13.4% end to end.** The difference
+between those two numbers is GenAI's own pipeline: it reaches 51.0 t/s wall on a
+graph that should allow far more, while ligence's serving loop measures at
+**2%** of a decode step (graph 2.77 s of 2.82 s over 144 tokens; embed 0.4%,
+sample 0.7%, emit 0.7%). Neither combination exists today. ligence keeping its
+loop and running the paged graph projects to **≈87 t/s** on the coder against
+51.1 measured — and that projection, not 13.4%, is what the work is worth.
+
+A caution that cost an hour: `PERF_COUNT` inflates wall clock badly (53.6 ms
+measured for a step whose node sum is 19.01 ms and whose real serving cost is
+19.2 ms/token), and it reports the *last* inference. Profile a steady-state step
+at a realistic depth or the numbers mean nothing — a depth-64 first-step profile
+said the two paths were identical, which is how this was nearly missed.
 
 Note also what this says about where to hunt. The MoE coder decodes at roughly
 a fifth of its bandwidth roofline while the dense model sits near 60% of its
 own, so the headroom is on the MoE side — and only the MoE has an external
 baseline on the identical artifact.
+
+### 7.0.1 The bus was not the explanation — retracted
+
+An earlier version of this section explained the A770's behaviour, and part of
+the MoE decode gap, by PCIe bandwidth. That was wrong, and the retraction is
+recorded here rather than deleted because the error is instructive: the story
+was plausible, arithmetically decorated, and never checked against the one
+decomposition that would have falsified it.
+
+The check is: sum the per-kernel times for one decode step, compare with the
+step's wall clock, then multiply the bytes actually claimed to cross the link by
+the measured link rate and see whether the product fills the difference.
+
+| | |
+|---|---|
+| node-time sum, B60, depth 256 | **19.01 ms** |
+| serving decode, same conditions | **19.2 ms/token** |
+| ligence's host-side work (embed + sample + emit) | **2%** |
+| bytes over the link per step: sliced logits 248320 × 4 B | **993 KB** |
+| plus the embeddings hop | ~8 KB |
+| that traffic at x8 Gen4 / x4 Gen3 | **0.06 / 0.32 ms** |
+
+The kernels are the step. There is no unexplained residue for the bus to fill,
+and the traffic that does cross is 0.3–1.7% of it. A fully resident model moves
+tokens over the link, not weights. The cross-card evidence says the same: a 5×
+link difference produces a 1.15× throughput difference on the dense model, which
+no bandwidth-governed system does.
+
+**Where the bus genuinely is the explanation**, and where it should have been
+confined: `VariableState::get_state`/`set_state` snapshots — §3.5.1 measured
+that at 51–67% of decode, moving 69.9–171.3 MiB per step — prefix-cache
+serialisation, which is the same copy paid once per prompt, and expert-offload
+streaming (§7.1). Those are host round-trips of tens to hundreds of MiB. Plain
+decode of a resident model is not.
+
+### 7.0.2 The two cards do not run the same kernels
+
+Same graph, same artifact, same depth 256, steady-state step:
+
+| | A770 | B60 |
+|---|---|---|
+| decode step, node time | **31.19 ms** | **19.01 ms** |
+| serving decode, coder | **37.7 t/s** | **51.1 t/s** |
+| `FullyConnectedCompressed` | 14464 µs (46.4%) | 9608 µs (50.5%) |
+| `Transpose` → `permute_ref` | 4812 µs (15.4%) | 3207 µs (16.9%) |
+| `GatedDeltaNet ref` | 3197 µs (10.3%) | 1105 µs (5.8%) |
+| `IndirectSDPA` | 1155 µs (3.7%) | 185 µs (1.0%) |
+| `Reorder` bfyx→blocked | 489 µs | 120 µs |
+
+The GDN reference kernel costs 2.9× more on the A770 and `IndirectSDPA` 6.2×,
+against 1.5× on the GEMMs — so the gap between the cards is not uniform, and it
+is largest exactly on the kernels the paged path replaces. The plugin selects
+differently per generation (Xe2 has no SIMD8, and the plugin's own permute
+kernel says so), so a kernel-level conclusion drawn on one card does not
+transfer to the other. Host-side work is 2% on both.
 
 ### 7.1 The 35B on the A770: the knob was there all along
 

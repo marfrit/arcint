@@ -85,6 +85,15 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
                   stats.prefill_rate(), prefill_suffix);
 
     std::string decode_suffix;
+    if (stats.decode_seconds > 0.0) {
+        const double other = stats.decode_seconds - stats.decode_forward_seconds -
+                             stats.decode_embed_seconds - stats.decode_sample_seconds -
+                             stats.decode_emit_seconds;
+        decode_suffix = log::format(
+            " | graph %.2f s, embed %.2f s, sample %.2f s, emit %.2f s, other %.2f s",
+            stats.decode_forward_seconds, stats.decode_embed_seconds,
+            stats.decode_sample_seconds, stats.decode_emit_seconds, other);
+    }
     if (stats.draft_proposed > 0) {
         decode_suffix = log::format(
             " | draft accept %.1f%% (%d/%d), verify %.2f s, re-forward %.2f s, rollback %.2f s",

@@ -754,6 +754,7 @@ public:
                 : 0;
 
         snapshot_seconds_ = &stats.snapshot_seconds;
+        step_stats_       = &stats;
         ov::Tensor logits = prefill(prompt_ids, past, snap_at);
         snapshot_seconds_ = nullptr;
         stats.prefill_seconds = std::chrono::duration<double>(clock::now() - t_prefill).count();
@@ -767,6 +768,13 @@ public:
         };
 
         // --------------------------------------------------------- decode
+        //
+        // The step counters are for decode only; prefill goes through the same
+        // forward() and would otherwise be counted twice.
+        stats.decode_forward_seconds = 0.0;
+        stats.decode_embed_seconds   = 0.0;
+        stats.decode_sample_seconds  = 0.0;
+        stats.decode_emit_seconds    = 0.0;
         const auto   t_decode = clock::now();
         FinishReason reason   = FinishReason::Stop;
         past                  = prompt_ids.size();
@@ -776,7 +784,9 @@ public:
         auto commit = [&](int tok, Control& out) {
             if (trace) log::info("trace", "commit pos=%zu tok=%d", past, tok);
             ++stats.completion_tokens;
+            const auto t_emit = std::chrono::steady_clock::now();
             out = on_piece(tokenizer_->decode_one(tok), tok);
+            stats.decode_emit_seconds += seconds_since(t_emit);
             sampler.observe(tok);
             if (drafter_ != nullptr) history.push_back(tok);
             return out == Control::Continue;
@@ -981,7 +991,8 @@ private:
     // large enough (2048) that ordinary prompts are a single chunk.
     // `snapshot_seconds_` is where prefill reports what the cache checkpoint
     // cost; it points at the caller's stats for the duration of one request.
-    double* snapshot_seconds_ = nullptr;
+    double*          snapshot_seconds_ = nullptr;
+    GenerationStats* step_stats_        = nullptr;
 
     ov::Tensor prefill(const std::vector<int>& tokens, size_t past, size_t snapshot_at) {
         ov::Tensor   logits;
@@ -1192,10 +1203,24 @@ private:
     // the reference-kernel fallbacks stand out, which is what the numbers are
     // usually for. Needs PERF_COUNT at compile time (LIGENCE_PROFILE sets it).
     void profile_step() {
+        // Depth matters: a profile at 64 tokens of context is not the step a
+        // real request takes. LIGENCE_PROFILE=<n> sets the prefix length.
+        size_t      depth = 64;
+        const char* env   = std::getenv("LIGENCE_PROFILE");
+        if (env != nullptr && env[0] >= '1' && env[0] <= '9') {
+            depth = static_cast<size_t>(std::strtoul(env, nullptr, 10));
+        }
         lm_req_.reset_state();
-        std::vector<int> warm(64, 0);
+        std::vector<int> warm(depth, 0);
         forward(warm, 0);
-        forward({0}, 64);
+
+        // Wall clock for the same step, so the node total can be compared
+        // against what the step actually costs.
+        const auto t0 = std::chrono::steady_clock::now();
+        const int  reps = 10;
+        for (int i = 0; i < reps; ++i) forward({0}, depth + static_cast<size_t>(i));
+        const double wall_ms = 1000.0 * seconds_since(t0) / reps;
+        log::info("profile", "decode step wall clock %.2f ms at depth %zu", wall_ms, depth);
 
         struct Agg { double us = 0.0; int n = 0; };
         std::map<std::string, Agg> by_kernel;
@@ -1296,8 +1321,10 @@ private:
         int64_t*   idp = id_tensor.data<int64_t>();
         for (size_t i = 0; i < n; ++i) idp[i] = ids[i];
 
+        const auto t_embed = std::chrono::steady_clock::now();
         embed_req_.set_input_tensor(id_tensor);
         embed_req_.infer();
+        if (step_stats_ != nullptr) step_stats_->decode_embed_seconds += seconds_since(t_embed);
 
         // Copy the embeddings out instead of handing the language model the
         // embeddings request's own output buffer. Sharing it made chunked
@@ -1333,7 +1360,9 @@ private:
         lm_req_.set_tensor(kAttentionMask, mask);
         lm_req_.set_tensor(kPositionIds, pos);
         lm_req_.set_tensor(kBeamIdx, beam);
+        const auto t_lm = std::chrono::steady_clock::now();
         lm_req_.infer();
+        if (step_stats_ != nullptr) step_stats_->decode_forward_seconds += seconds_since(t_lm);
 
         if (mtp_ready_) {
             // Our own copy, for exactly the reason embeds_ above is a copy: this
@@ -1476,7 +1505,10 @@ private:
 
     int pick(Sampler& sampler, const ov::Tensor& logits) {
         const size_t vocab = logits.get_shape().back();
-        return pick_row(sampler, logits, logits.get_size() / vocab - 1);
+        const auto   t0    = std::chrono::steady_clock::now();
+        const int    tok   = pick_row(sampler, logits, logits.get_size() / vocab - 1);
+        if (step_stats_ != nullptr) step_stats_->decode_sample_seconds += seconds_since(t0);
+        return tok;
     }
 
     Artifact                       artifact_;

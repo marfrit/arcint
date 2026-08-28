@@ -28,13 +28,27 @@ surgery takes 262144 context from 10.00 to 5.00 GiB - measured 20480 vs 40960
 bytes per context token - which fits the B60's 22.7 GiB alongside 12.8 GiB of
 weights. Neither changes greedy output.
 
-How much the paged path is worth is now measured rather than argued: openarc
-serves the SAME IR on the SAME card through the SAME compiler but via GenAI's
-ContinuousBatchingPipeline (the paged path), and beats ligence's stateful loop
-by 13.4% - 53.8 vs 46.6 t/s median wall clock, five runs each, B60, coder. That
-is the number a rewrite has to beat. It is also smaller than the component
-estimates (gated_delta_net::ref 9.1% + permute_ref 9.0% of decode), which is
-worth knowing before committing to the work.
+How much the paged path is worth is measured, and the graph must be separated
+from the pipeline. End to end GenAI's ContinuousBatchingPipeline beats ligence
+by ~10-13% on the same IR and card. But profiled directly - same card, depth
+256, steady state - the paged GRAPH costs 11.3 ms per decode step against the
+stateful graph's 19.01 ms: 1.68x. Nearly half of that is 90 Transpose nodes
+(3207 us) disappearing; the optimized paged GDN kernel is 0.64 ms more, and
+PagedAttention replaces IndirectSDPA for free. GenAI gives most of the win back
+in its own scheduler; ligence's serving loop is 2% of a decode step. ligence on
+the paged graph therefore projects to ~87 t/s on the coder against 51.1 today,
+and that projection is what the work is worth.
+
+Caution: PERF_COUNT inflates wall clock (53.6 ms for a step whose node sum is
+19.01 ms) and reports the LAST inference. A depth-64 first-step profile said the
+two paths were identical; they are not.
+
+PCIe bandwidth does NOT govern decode of a resident model - an earlier claim
+here, retracted by measurement. Node time (19.01 ms) equals the serving step
+(19.2 ms/token), host work is 2%, and the only per-step link traffic is the
+993 KB sliced-logits readback plus an 8 KB embeddings hop = 0.06-0.32 ms, under
+2%. The bus IS the explanation for state snapshots/rollback (51-67% of decode,
+69.9-171.3 MiB per step), prefix-cache serialisation, and expert offload.
 
 What is left is OpenVINO's paged-attention path. Its decode-side block-table
 convention is undocumented and not yet reverse-engineered; prefill through it

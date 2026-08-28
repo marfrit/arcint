@@ -77,6 +77,12 @@ struct GenerationStats {
     // that makes speculation unprofitable, paid once per prompt, and it would
     // otherwise hide inside prefill_seconds and be read as prefill being slow.
     double snapshot_seconds = 0.0;
+    // Where a decode step actually goes. The graph is only part of it, and the
+    // rest was invisible until these existed.
+    double decode_forward_seconds = 0.0;   // the language model
+    double decode_embed_seconds   = 0.0;   // the embeddings model, once per token
+    double decode_sample_seconds  = 0.0;   // logits copy + penalties + argmax
+    double decode_emit_seconds    = 0.0;   // detokenize, stop scan, stream out
     double draft_rollback_seconds = 0.0;
     double draft_verify_seconds   = 0.0;   // the one pass that checks all drafts
     double draft_reforward_seconds = 0.0;  // re-running the accepted prefix after a reject
