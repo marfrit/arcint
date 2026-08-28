@@ -594,6 +594,25 @@ One line per event, greppable, no colors by default, `-v` raises verbosity
   Not yet pinned to a node. The next step is `get_runtime_model()` at two depths
   and a diff of per-node `execTimeMcs`, looking for an output shaped `[…, L, L]`
   and for `_cpu_impl` on anything in the attention path.
+- **256k context loads — measured, not extrapolated.** With fp16 KV storage,
+  chunked prefill at 2048 and the logits slice, ligence loaded **257,167
+  tokens** on the B60 in 8.1 minutes (528 t/s prefill), which is 98% of the
+  artifact's 262,144 maximum. The rungs below it:
+
+  | prompt | time | prefill rate |
+  |---|---|---|
+  | 74,927 | 47.6 s | 1573 t/s |
+  | 149,823 | 160.5 s | 934 t/s |
+  | **257,167** | **486.7 s** | **528 t/s** |
+
+  A prompt sized past the context was correctly refused with the §3.8 400 and
+  its numbers, which is the other half of the criterion working.
+
+  The three levers compound and each was necessary: the slice removes a logits
+  term that made 8k impossible, chunking bounds activations, fp16 KV halves the
+  only state that grows. Scaling is still superlinear — exponent 1.88 overall,
+  against 2.11–2.50 before these changes — so the O(L²) term in §5 is reduced
+  but not gone, and the paged path remains the way to remove it.
 - **Prefill, measured through ligence on the B60** (coder q4, chunked at 512):
   781–1723 t/s across 1.2k–18k tokens, e.g. 9615 tok in 8.28 s (1161 t/s) and
   18308 tok in 21.1 s (867 t/s). That is one to two orders above the 58 t/s
@@ -635,7 +654,7 @@ and owns the state.
 |---|---|---|---|
 | M0 | skeleton: HTTP server, /health, /props, console format | curl round-trip | **done** (`e55e33b`) |
 | M1 | single-sequence inference, greedy, 27B coder q4 on B60 | Prüfstand 10/10, ≥ 45 t/s | **done** — 51.4 t/s, 10/10 at artifact sampling defaults (§5) |
-| M2 | paged KV + GDN ledger, chunked prefill | equivalence suite green, 256k context loads | partly — suite green, chunking in (not bit-exact, off by default); paged path mapped but not adopted; 256k unproven |
+| M2 | paged KV + GDN ledger, chunked prefill | equivalence suite green, 256k context loads | **done** — suite green, **257,167 tokens loaded** (§5); paged path mapped but not adopted |
 | M3 | prefix caching (block-aligned checkpoints) | warm/cold byte-equality, hit-rate stats on console | **done** — warm/cold byte-identical, hit stats on console |
 | M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance | sampling **done** (M1); MTP needs an export that keeps the head — **the weights exist** (§3.5) |
 | M5 | 35B MoE q4 on A770 (16 GB fit), q8 variants on B60 | all three models pass their gates | gates **done** — all three serve and reach 10/10; A770 fit **fails**, no q8 artifacts exist |

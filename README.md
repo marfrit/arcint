@@ -96,16 +96,17 @@ Serving the real models on Intel Arc. Measured on a B60 with the 27B coder q4:
 |---|---|
 | M0 skeleton | done |
 | M1 executor, greedy, 27B coder on B60 | done — 51.4 t/s, 10/10 |
-| M2 chunked prefill, cache ledger, long context | done bar the paged path — see below |
+| M2 chunked prefill, cache ledger, long context | done — **257,167 tokens loaded** |
 | M3 prefix caching | done — warm/cold byte-identical, hit stats on console |
 | M4 MTP | sampling done; MTP needs an export that keeps the head |
 | M5 all three models | gates done; the 35B does not fit the A770 |
 
-M2's depth and memory questions are both answered: slicing logits to the last
-token removed a wall at ~8k tokens, and storing the attention KV as fp16 takes
-262144 context from 10.0 GiB to 5.0 GiB, which fits the B60. What remains is
-OpenVINO's paged-attention path, whose decode-side block-table convention is
-undocumented; it is now an optimisation rather than a blocker.
+M2 is done and measured: slicing logits to the last token removed a wall at
+~8k tokens, storing the attention KV as fp16 took 262144 context from 10.0 GiB
+to 5.0 GiB, and with both in place ligence loaded **257,167 tokens** — 98% of
+the artifact's maximum — in 8.1 minutes. What remains is OpenVINO's
+paged-attention path, whose decode-side block-table convention is undocumented;
+it is an optimisation now, not a blocker.
 
 Verification: 133 unit cases, a 48-check curl round-trip, and an equivalence
 suite that runs where the card is. Clean under ASan and UBSan on x86_64.
