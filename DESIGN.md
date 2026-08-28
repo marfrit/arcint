@@ -678,7 +678,7 @@ and owns the state.
 | M2 | paged KV + GDN ledger, chunked prefill | equivalence suite green, 256k context loads | **done** — suite green, **257,167 tokens loaded** (§5); paged path mapped but not adopted |
 | M3 | prefix caching (block-aligned checkpoints) | warm/cold byte-equality, hit-rate stats on console | **done** — warm/cold byte-identical, hit stats on console |
 | M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance | sampling **done** (M1); MTP needs an export that keeps the head — **the weights exist** (§3.5) |
-| M5 | 35B MoE q4 on A770 (16 GB fit), q8 variants on B60 | all three models pass their gates | gates **done** — all three serve and reach 10/10; A770 fit **fails**, no q8 artifacts exist |
+| M5 | 35B MoE q4 on A770 (16 GB fit), q8 variants on B60 | all three models pass their gates | gates **done** — all three serve and reach 10/10; the 35B is larger than the A770 and HETERO cannot place experts (§7); no q8 artifacts exist |
 
 M0 went past its exit criterion on purpose: everything that does not need a
 GPU was implemented properly rather than stubbed, because that is where the
@@ -704,13 +704,35 @@ artifact that needs sampling to get there, not the harness. And the 3.8 is
 recorded in the allowlist as "provisional, 7/10", yet scores 10/10 greedy here;
 that entry deserves re-measuring rather than being carried forward.
 
-M5's other two clauses do not hold, for artifact reasons rather than engine
-ones. **The 35B q4 does not fit the A770**: the artifact is 17.4 GiB against a
-16 GB card, and the load fails in the OpenCL runtime. Fitting it needs either
-the host-spill tier §8 leaves open or a smaller quant, not a change here.
+**What each card can actually serve** (measured 2026-08-28):
+
+| model | weights | B60 (22.7 GiB) | A770 (15.1 GiB) |
+|---|---|---|---|
+| coder | 12.8 GiB | serves, 51.4 t/s | **serves, 29.4 t/s** |
+| qwen3.8-27b | 13.4 GiB | serves | fits by arithmetic, untested |
+| qwen3.6-35b | 17.4 GiB | serves | **`CL_OUT_OF_RESOURCES`** |
+
+M5's other two clauses do not hold, and the reasons are now measured rather
+than assumed. **The 35B q4 does not fit the A770** because the artifact is
+larger than the card — 17.4 against 15.1 GiB usable — and the failure is a
+plain allocation failure in the OpenCL runtime, not a subtlety.
+
+Three ways round it were tried and none works today:
+`GPU_ENABLE_LARGE_ALLOCATIONS` (same failure — the limit is total memory, not
+per-allocation), and **HETERO:GPU.1,CPU**, which fails because HETERO partitions
+by op *support*, not by memory pressure; there is nothing to tell it that the
+expert weights specifically should live on the host. Note too that the graph
+carries **no MoE-typed op before compile-time fusion**, so there is no node to
+hang a per-op affinity hint on either.
+
+That leaves what llama.cpp's `-ncmoe` does — placing the routed expert weights
+in host memory and computing those FFNs on the CPU, so PCIe carries activations
+rather than weights. OpenVINO's MoE is a single fused op and does not expose
+that placement. This is the one place in the project where owning a kernel buys
+a *capability* rather than a speed-up.
+
 **There are no q8 artifacts** on the fleet at all — every export under
-`/models/ov` is int4/AWQ — so the q8 half of M5 is waiting on an export, not on
-code.
+`/models/ov` is int4/AWQ — so that half of M5 waits on an export, not on code.
 
 Performance target that justifies the project, stated once: beat the OpenVINO
 GenAI baseline on the same card and artifact (60 t/s, 27B q4, B60) while
