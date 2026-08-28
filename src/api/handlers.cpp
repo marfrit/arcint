@@ -313,6 +313,12 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     for (const ToolSpec& t : prep.req.tools) prep.input.tool_names.push_back(t.name);
 
     const std::string prompt = ctx.backend->render_chat(prep.req);
+    // The rendered prompt is the one thing that decides what the model saw.
+    // When an answer differs from a reference run this is the first question,
+    // and reconstructing it after the fact is guesswork (§3.7).
+    if (log::enabled(log::Level::Debug)) {
+        log::debug("prompt", "%zu bytes:\n%s", prompt.size(), prompt.c_str());
+    }
     if (auto err = finish_prepare(ctx, prompt, prep.req.sampler, prep.input, prep.prompt_tokens)) {
         return err;
     }

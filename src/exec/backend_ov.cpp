@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstring>
 #include <mutex>
+#include <random>
 #include <stdexcept>
 
 #include <openvino/openvino.hpp>
@@ -23,6 +24,7 @@
 #include <minja/chat-template.hpp>
 
 #include "core/artifact.h"
+#include "core/sampler.h"
 #include "exec/backend.h"
 #include "util/log.h"
 
@@ -235,6 +237,19 @@ public:
         stats.prompt_tokens               = static_cast<int>(prompt_ids.size());
         if (prompt_ids.empty()) return FinishReason::Stop;
 
+        // An unseeded request still gets a seed, it just gets a fresh one — and
+        // it is logged, so any answer can be reproduced exactly (§3.6).
+        const uint64_t seed = in.sampler.seeded ? in.sampler.seed : std::random_device{}();
+        Sampler        sampler(in.sampler, seed);
+        if (!in.sampler.greedy()) {
+            log::verbose("sample", "temp %.2f top_p %.2f top_k %d seed %llu",
+                         in.sampler.temperature, in.sampler.top_p, in.sampler.top_k,
+                         static_cast<unsigned long long>(seed));
+        }
+
+        // History feeds the penalties; the prompt counts, as it does upstream.
+        std::vector<int> history = prompt_ids;
+
         lm_req_.reset_state();
 
         // -------------------------------------------------------- prefill
@@ -242,7 +257,7 @@ public:
         ov::Tensor logits    = forward(prompt_ids, /*past=*/0);
         stats.prefill_seconds = std::chrono::duration<double>(clock::now() - t_prefill).count();
 
-        int next = argmax_last(logits);
+        int next = pick(sampler, logits, history);
 
         const std::vector<int>& eos = tokenizer_->eos_ids();
         auto is_eos = [&](int id) {
@@ -275,9 +290,10 @@ public:
                 break;
             }
 
+            history.push_back(next);
             logits = forward({next}, past);
             ++past;
-            next = argmax_last(logits);
+            next = pick(sampler, logits, history);
         }
 
         stats.decode_seconds = std::chrono::duration<double>(clock::now() - t_decode).count();
@@ -387,21 +403,17 @@ private:
         return position_sections_;
     }
 
-    static int argmax_last(const ov::Tensor& logits) {
+    // Copies the last logit row out of the graph's output tensor and hands it
+    // to the sampler. The copy is deliberate: the sampler mutates the row for
+    // penalties, and the tensor belongs to the InferRequest.
+    int pick(Sampler& sampler, const ov::Tensor& logits, const std::vector<int>& history) {
         const ov::Shape& shape = logits.get_shape();
         const size_t     vocab = shape.back();
         const size_t     rows  = logits.get_size() / vocab;
         const float*     row   = logits.data<const float>() + (rows - 1) * vocab;
 
-        size_t best = 0;
-        float  top  = row[0];
-        for (size_t i = 1; i < vocab; ++i) {
-            if (row[i] > top) {
-                top  = row[i];
-                best = i;
-            }
-        }
-        return static_cast<int>(best);
+        logit_scratch_.assign(row, row + vocab);
+        return sampler.sample(logit_scratch_.data(), vocab, history);
     }
 
     Artifact                       artifact_;
@@ -415,6 +427,7 @@ private:
     std::unique_ptr<minja::chat_template> template_;
     ModelStatus                    status_;
     std::mutex                     mutex_;
+    std::vector<float>             logit_scratch_;
     mutable size_t                 position_sections_ = 0;
 };
 

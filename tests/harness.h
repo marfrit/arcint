@@ -19,13 +19,29 @@ int  register_case(const char* name, void (*fn)());
 void fail(const char* file, int line, const std::string& msg);
 
 template <typename T>
+std::string show(const T& v);
+
+inline std::string show(bool v) { return v ? "true" : "false"; }
+inline std::string show(const std::string& v) { return "\"" + v + "\""; }
+
+// Containers print as {a, b, c} so a failing comparison of two sequences says
+// which element differs instead of refusing to compile.
+template <typename T>
+std::string show(const std::vector<T>& v) {
+    std::string out = "{";
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (i != 0) out += ", ";
+        out += show(v[i]);
+    }
+    return out + "}";
+}
+
+template <typename T>
 std::string show(const T& v) {
     std::ostringstream os;
     os << v;
     return os.str();
 }
-inline std::string show(bool v) { return v ? "true" : "false"; }
-inline std::string show(const std::string& v) { return "\"" + v + "\""; }
 
 }  // namespace t
 

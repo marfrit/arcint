@@ -52,6 +52,7 @@ add_library(ligence_core STATIC
   src/util/text.cpp
   src/core/artifact.cpp
   src/core/model_registry.cpp
+  src/core/sampler.cpp
   src/core/sampling.cpp
   src/core/stop.cpp
   src/core/toolcall.cpp
@@ -89,6 +90,7 @@ if(LIGENCE_TESTS)
     tests/test_main.cpp
     tests/test_utf8.cpp
     tests/test_toolcall.cpp
+    tests/test_sampler.cpp
     tests/test_sampling.cpp
     tests/test_stop.cpp
     tests/test_registry.cpp
