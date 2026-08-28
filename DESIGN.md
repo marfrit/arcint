@@ -696,7 +696,8 @@ sits above the 77.8–93.3% natural-prompt band):
 | B60, paged, **MTP on** | **36.1 t/s** (96.7% acc) | **32.1 t/s** | all green |
 | B60, stateful engine (baseline) | 19.9 t/s | — | |
 | A770, paged, MTP off | 18.1 t/s | 17.7 t/s | all green |
-| A770, paged, MTP on | **refused by reservation**: base 13.59 + embeddings 0.97 + head 1.66 = 15.25 of 15.11 GiB | | |
+| A770 single-card, MTP on | **refused by reservation**: base 13.59 + embeddings 0.97 + head 1.66 = 15.25 of 15.11 GiB | | |
+| A770, **MTP on, head + embeddings on the B60** | **26.6 t/s** (96.7% acc) | **22.4 t/s** | all green |
 
 **1.81× over the stateful baseline at depth 512, 1.61× at 4096** — the kickoff
 expectation was 35–40 t/s on the B60 and the measurement landed at 36.1/32.1.
@@ -707,11 +708,23 @@ primed KV). The warm-restore gate doubles as the paged prefix-cache primitive:
 restore the committed row, reuse the untouched prompt KV blocks, re-prime the
 head — tokens *and* final state bitwise-equal a cold run, with speculation on.
 
-On the A770 the head does not fit beside the dense model with these artifacts,
-and the reservation says so with numbers instead of `CL_OUT_OF_RESOURCES`
-mid-request. Two A770 lessons for the port: compile the big model *first* (its
+On the A770 alone the head does not fit beside the dense model with these
+artifacts, and the reservation says so with numbers instead of
+`CL_OUT_OF_RESOURCES` mid-request. But the box has two cards, and the head is a
+separate graph glued through host memory: per step only a 5120-float hidden row
+and a token embedding cross, ~20 KB each — weights stay put, activations
+travel. With the head and the embeddings gather on the **B60** (1.66 + 0.97 GiB,
+which fits beside the coder production's 13.3 of 22.7), the A770 serves dense
+MTP at **26.6 t/s** — 1.47× its own paged baseline, 1.54× its stateful one —
+and the head costs the same there as it does locally (0.56 s vs 0.52 s per 120
+tokens; the cross-card hop is invisible next to the infer itself). The
+embeddings placement matters more than expected: the CPU gather cost 0.38 s per
+120 tokens against 0.02 on a GPU, an 8% swing on its own.
+
+Two more A770 lessons for the port: compile the big model *first* (its
 compile-time peak on top of a resident embeddings model OOMs where the reverse
-order fits), and the embeddings gather does not need the card at all.
+order fits), and a single-card reservation refusal is not the end of the
+answer when the box has a second card with room on it.
 
 What the C++ port inherits from the prototype as requirements: zeroed rows,
 device-resident tables set once, compile ordering, the reservation, the

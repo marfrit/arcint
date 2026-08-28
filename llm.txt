@@ -47,9 +47,12 @@ tools/paged_spec.py adds speculative decoding on the paged path (dense model,
 MTP head drafting): rollback is row promotion, zero state bytes move on
 rejection. Measured on the B60: 36.1 t/s at depth 512 and 32.1 at 4096 against
 the 19.9 t/s stateful baseline (1.81x / 1.61x), 96.7% acceptance, with bitwise
-determinism and bitwise warm-restore equality as gates. On the A770 the head
+determinism and bitwise warm-restore equality as gates. On the A770 alone the head
 does not fit beside the dense model (15.25 of 15.11 GiB, refused by
-reservation); paged without MTP runs there at 18.1 t/s vs 17.3 stateful.
+reservation) -- but with the head and embeddings hosted on the B60 (fits beside
+coder production; only ~20 KB of activations cross per step) the A770 serves
+dense MTP at 26.6 t/s (512) / 22.4 (4096) vs 17.3 stateful: 1.54x. Paged
+without MTP runs there at 18.1 t/s.
 Found and fixed en route: state rows MUST be zeroed before first use - the
 kernels read the committed row even at past_lens 0.
 

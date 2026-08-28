@@ -39,7 +39,17 @@ core = ov.Core(); ctxd = core.get_default_context(DEV)
 # card), and the prefill chunk drops to keep the activation peak inside the
 # reservation. The MTP head does not fit at all there -- handled below.
 TIGHT = DEV != "GPU.0"
-EMB_DEV = "CPU" if TIGHT else DEV
+# The embeddings result crosses host memory either way, so the gather might as
+# well run where there is room -- next to the head on the other card. Measured:
+# 0.38 s per 120 tokens on the CPU against 0.02 on a GPU.
+EMB_DEV = "GPU.0" if TIGHT else DEV
+# The head does not fit beside the dense model on the A770 (13.59 + 0.97 +
+# 1.66 = 15.25 of 15.11 GiB) -- but the box has a second card, and the head is
+# a separate graph glued through host memory: per step only a 5120-float hidden
+# row and a token embedding cross, ~20 KB each. Weights stay put, activations
+# travel. On the B60 the head fits beside the coder production (13.3 + 1.66 +
+# 0.97 of 22.7 GiB), so both cards stay productive.
+HEAD_DEV = "GPU.0" if TIGHT else DEV
 if TIGHT: CHUNK = 256
 
 # ---- paged base model, hidden state exposed for the head -------------------
@@ -95,8 +105,8 @@ def fwd(ids_or_emb, past, la_rows, interval, n=None):
 # ---- the MTP head (stateful, one position behind, committed tokens only) ---
 class Head:
     def __init__(self):
-        self.layer = core.compile_model(MODEL + "/openvino_mtp_layer.xml", DEV).create_infer_request()
-        self.lm = core.compile_model(MODEL + "/openvino_mtp_lm_head.xml", DEV).create_infer_request()
+        self.layer = core.compile_model(MODEL + "/openvino_mtp_layer.xml", HEAD_DEV).create_infer_request()
+        self.lm = core.compile_model(MODEL + "/openvino_mtp_lm_head.xml", HEAD_DEV).create_infer_request()
         self.len = 0; self.pos = 0
 
     def feed(self, hidden, tok_emb, want_draft):
@@ -220,14 +230,6 @@ rng = np.random.default_rng(11)
 prompt = [int(x) for x in rng.integers(1000, 40000, size=DEPTH)]
 
 off, st_off = generate(prompt, NEW, use_mtp=False)
-if TIGHT:
-    print(f"== {DEV}, depth {DEPTH}, {NEW} new tokens ==")
-    print(f"  mtp OFF : {st_off['tps']:5.1f} t/s  ({st_off['passes']} passes)")
-    print("  mtp ON  : REFUSED by reservation on this card: base 13.59 GiB "
-          "resident + embeddings 0.97 + mtp head 1.66 = 15.25 of 15.11 GiB "
-          "before activations. The head does not fit beside the dense model "
-          "on a 16 GB card with these artifacts.")
-    sys.exit(0)
 on1, st_on1 = generate(prompt, NEW, use_mtp=True, keep_snapshot=True)
 s_a = read_rows(st_on1["final_row"])       # before the next run scribbles on it
 on2, st_on2 = generate(prompt, NEW, use_mtp=True, committed_row=1)
@@ -236,7 +238,7 @@ on3, st_on3 = generate(prompt, NEW, use_mtp=True, warm=st_on1["snapshot"])
 s_c = read_rows(st_on3["final_row"])
 
 acc = 100.0 * st_on1["accepted"] / max(1, st_on1["proposed"])
-print(f"== {DEV}, depth {DEPTH}, {NEW} new tokens ==")
+print(f"== {DEV} (head on {HEAD_DEV}), depth {DEPTH}, {NEW} new tokens ==")
 print(f"  mtp OFF : {st_off['tps']:5.1f} t/s  ({st_off['passes']} passes)")
 print(f"  mtp ON  : {st_on1['tps']:5.1f} t/s  ({st_on1['passes']} passes, "
       f"accept {acc:.1f}% = {st_on1['accepted']}/{st_on1['proposed']})")
