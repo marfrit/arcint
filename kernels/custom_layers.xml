@@ -1,0 +1,26 @@
+<!-- Binds a ligence OpenCL kernel into OpenVINO's GPU plugin.
+
+     Verified working on this hardware: the plugin matches CustomLayer/@name
+     against an op's type name, so rewriting a graph node to "LgcPermute" makes
+     this kernel run in its place with the rest of the model untouched. Correct
+     on both static and fully dynamic shapes.
+
+     Point the plugin at this file via its CONFIG_FILE property.
+
+     The macros the plugin injects are INPUT0_TYPE / OUTPUT0_TYPE and the
+     arrays INPUT0_DIMS / INPUT0_PITCHES / INPUT0_OFFSET. The SIZE_X /
+     FEATURE_NUM / BATCH_NUM family that built-in kernels use is NOT available
+     here, and there are no OUTPUT0_* shape macros at all - output dimensions
+     have to be derived from the input. There is no build log on failure either:
+     a bad macro name surfaces only as CL_BUILD_PROGRAM_FAILURE. -->
+<CustomLayer name="LgcPermute" type="SimpleGPU" version="1">
+  <Kernel entry="lgc_permute">
+    <Source filename="permute.cl"/>
+  </Kernel>
+  <Buffers>
+    <Tensor arg-index="0" type="input"  port-index="0" format="BFYX"/>
+    <Tensor arg-index="1" type="output" port-index="0" format="BFYX"/>
+  </Buffers>
+  <CompilerOptions options="-cl-mad-enable"/>
+  <WorkSizes global="X,Y,B*F"/>
+</CustomLayer>
