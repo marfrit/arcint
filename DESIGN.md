@@ -236,11 +236,27 @@ executor keeps running the graph as exported.
 
 ### 3.5 Speculative decoding (MTP)
 
+**Measured 2026-08-28, and it contradicts this section twice.** All three
+checkpoints declare `mtp_num_hidden_layers: 1` — the 3.6 MoE pair is not
+headless — and *none* of the three OpenVINO exports contains an MTP graph. Each
+one has a single output, `logits`, and no `openvino_mtp_*.xml` beside it. The
+optimum-intel export drops the head.
+
+So MTP is not implementable against these artifacts, by anyone: there is no
+draft head to call. What unblocks it is a re-export that keeps the MTP layer,
+which is offline artifact work and outside the engine (README's non-goals put
+artifact production offline on purpose). The allowlist now pins
+`has_mtp_head = false` for all three — the flag gates serving, so it has to
+follow the export — and records `mtp_in_checkpoint` separately so the reason is
+visible. `--mtp on` is refused for every model rather than quietly doing
+ordinary decoding under a speculative label.
+
+The plan below stands unchanged for the day an export carries the head:
+
 - Qwen3.8-27B: native MTP head, greedy draft of n tokens, verified in one
   decode-graph call (draft acceptance measured 45–75 % depending on language
   and domain in the vLLM campaigns; the same head, so similar rates expected).
-- The 3.6 MoE pair has no bundled MTP head; the hook accepts an external
-  drafter graph (dflash-style) later. v1 ships MTP for 3.8 only.
+- The hook accepts an external drafter graph (dflash-style) later.
 - MTP interacts with the caches trivially by design: draft tokens live in
   scratch pages and are promoted only on acceptance.
 
@@ -446,8 +462,8 @@ and owns the state.
 | M1 | single-sequence inference, greedy, 27B coder q4 on B60 | Prüfstand 10/10, ≥ 45 t/s | **done** — 51.4 t/s, 10/10 at artifact sampling defaults (§5) |
 | M2 | paged KV + GDN ledger, chunked prefill | equivalence suite green, 256k context loads | partly — suite green, chunking in (not bit-exact, off by default); paged path mapped but not adopted; 256k unproven |
 | M3 | prefix caching (block-aligned checkpoints) | warm/cold byte-equality, hit-rate stats on console | **done** — warm/cold byte-identical, hit stats on console |
-| M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance | |
-| M5 | 35B MoE q4 on A770 (16 GB fit), q8 variants on B60 | all three models pass their gates | |
+| M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance | sampling **done** (M1); MTP **blocked** — no export contains the head (§3.5) |
+| M5 | 35B MoE q4 on A770 (16 GB fit), q8 variants on B60 | all three models pass their gates | gates **done** — all three serve and reach 10/10; A770 fit **fails**, no q8 artifacts exist |
 
 M0 went past its exit criterion on purpose: everything that does not need a
 GPU was implemented properly rather than stubbed, because that is where the
@@ -457,6 +473,29 @@ the GDN ledger, the prefix cache and MTP. Two placeholders are marked as such
 in the code and must not survive M1: the stub tokenizer is a reversible
 splitter and not a BPE, and `render_chatml_stub` is not the model's chat
 template — §3.7 keeps that in the artifact, and M1 takes both from the IR.
+
+**All three models, measured through ligence on the B60, 2026-08-28** (the
+Prüfstand task, `enable_thinking` off):
+
+| model | weights | greedy | at the artifact's sampling defaults |
+|---|---|---|---|
+| qwen3.6-27b-a3b-coder | 12.8 GiB | 8/10 | 10/10, 10/10, 8/10 (seeds 1–3) |
+| qwen3.8-27b | 13.4 GiB | **10/10** | — |
+| qwen3.6-35b-a3b | 17.4 GiB | **10/10** | 8/10 (seed 1) |
+
+Two things fall out of that table. The "10/10 greedy" bar *is* reachable — for
+two of the three models — which sharpens §5's finding: the coder is the one
+artifact that needs sampling to get there, not the harness. And the 3.8 is
+recorded in the allowlist as "provisional, 7/10", yet scores 10/10 greedy here;
+that entry deserves re-measuring rather than being carried forward.
+
+M5's other two clauses do not hold, for artifact reasons rather than engine
+ones. **The 35B q4 does not fit the A770**: the artifact is 17.4 GiB against a
+16 GB card, and the load fails in the OpenCL runtime. Fitting it needs either
+the host-spill tier §8 leaves open or a smaller quant, not a change here.
+**There are no q8 artifacts** on the fleet at all — every export under
+`/models/ov` is int4/AWQ — so the q8 half of M5 is waiting on an export, not on
+code.
 
 Performance target that justifies the project, stated once: beat the OpenVINO
 GenAI baseline on the same card and artifact (60 t/s, 27B q4, B60) while

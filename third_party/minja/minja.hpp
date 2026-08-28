@@ -1347,6 +1347,13 @@ public:
               if (name == "iterable") return l.is_iterable();
               if (name == "sequence") return l.is_array();
               if (name == "defined") return !l.is_null();
+              // ligence patch (2026-08-28): upstream minja knows `defined` but
+              // not its complement, and Qwen3.8's chat template opens with
+              // `{%- if enable_thinking is undefined or ... %}`. Without this,
+              // rendering that artifact's own template throws — and DESIGN.md
+              // §3.7 makes the artifact's template the contract, so falling
+              // back to a polyfill would be the drift we refuse.
+              if (name == "undefined") return l.is_null();
               if (name == "true") return l.to_bool();
               if (name == "false") return !l.to_bool();
               throw std::runtime_error("Unknown type for 'is' operator: " + name);

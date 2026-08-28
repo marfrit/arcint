@@ -38,8 +38,9 @@ std::vector<ModelEntry> build_registry() {
         e.ov_arch                 = "Qwen3_5MoeForConditionalGeneration";
         e.model_type              = "qwen3_5_moe";
         e.moe                     = true;
-        e.has_mtp_head            = false;  // no bundled MTP head on the 3.6 pair (§3.5)
-        e.mtp_head_pinned         = false;  // design prose, not artifact metadata
+        e.has_mtp_head            = false;  // no MTP graph in the export
+        e.mtp_head_pinned         = true;   // inspected 2026-08-28
+        e.mtp_in_checkpoint       = true;   // config: mtp_num_hidden_layers 1
         e.n_embd                  = 2048;
         e.n_expert                = 184;  // pruned from 256
         e.full_attention_interval = 4;
@@ -63,8 +64,9 @@ std::vector<ModelEntry> build_registry() {
         e.ov_arch                 = "Qwen3_5MoeForConditionalGeneration";
         e.model_type              = "qwen3_5_moe";
         e.moe                     = true;
-        e.has_mtp_head            = false;  // §3.5
-        e.mtp_head_pinned         = false;
+        e.has_mtp_head            = false;  // no MTP graph in the export
+        e.mtp_head_pinned         = true;
+        e.mtp_in_checkpoint       = true;
         e.n_embd                  = 2048;
         e.n_expert                = 256;
         e.full_attention_interval = 4;
@@ -88,8 +90,11 @@ std::vector<ModelEntry> build_registry() {
         e.ov_arch                 = "Qwen3_5ForConditionalGeneration";
         e.model_type              = "qwen3_5";
         e.moe                     = false;  // dense (§2)
-        e.has_mtp_head            = true;   // native MTP head (§3.5)
-        e.mtp_head_pinned         = false;  // unconfirmed by any artifact yet
+        // §3.5 says this one ships a native MTP head. The export does not:
+        // it outputs `logits` and nothing else, like the other two.
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;
+        e.mtp_in_checkpoint       = true;
         e.n_embd                  = 5120;
         e.n_expert                = 0;
         e.full_attention_interval = 4;

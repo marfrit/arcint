@@ -1,4 +1,5 @@
 #include "config.h"
+#include "core/model_registry.h"
 #include "harness.h"
 
 #include <vector>
@@ -107,16 +108,19 @@ TEST(config_accepts_the_documented_choices) {
         Config cfg;
         CHECK(run({"--stub", "--kv-dtype", dt}, cfg).ok);
     }
-    for (const char* m : {"on", "off", "auto"}) {
+    for (const char* m : {"off", "auto"}) {
         Config cfg;
-        // "on" is only valid for a model that ships an MTP head.
-        const bool ok = run({"--stub", "--model-id", "qwen3.8-27b", "--mtp", m}, cfg).ok;
-        CHECK(ok);
+        CHECK(run({"--stub", "--model-id", "qwen3.8-27b", "--mtp", m}, cfg).ok);
     }
 }
 
 TEST(config_mtp_on_requires_an_mtp_head) {
-    CHECK(rejected({"--stub", "--model-id", "qwen3.6-27b-a3b-coder", "--mtp", "on"}));
+    // No export in the allowlist contains an MTP graph, so --mtp on has nothing
+    // to switch on for any of them. It must refuse rather than quietly do
+    // ordinary decoding while claiming speculation.
+    for (const std::string& id : model_ids()) {
+        CHECK(rejected({"--stub", "--model-id", id.c_str(), "--mtp", "on"}));
+    }
 }
 
 TEST(config_stub_delay_is_stub_only_and_non_negative) {

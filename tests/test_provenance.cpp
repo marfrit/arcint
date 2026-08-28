@@ -65,6 +65,14 @@ TEST(provenance_every_entry_matches_its_artifact) {
         CHECK_EQ(e.n_attn_layer, layers / interval);
         CHECK_EQ(e.n_gdn_layer, layers - layers / interval);
 
+        if (m.contains("mtp_head_exported")) {
+            CHECK_EQ(e.has_mtp_head, m.at("mtp_head_exported").get<bool>());
+            CHECK(e.mtp_head_pinned);
+        }
+        if (m.contains("mtp_num_hidden_layers")) {
+            CHECK_EQ(e.mtp_in_checkpoint, m.at("mtp_num_hidden_layers").get<int>() > 0);
+        }
+
         const json& experts = m.at("experts");
         if (experts.is_null()) {
             CHECK(!e.moe);

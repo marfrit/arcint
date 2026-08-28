@@ -1,6 +1,57 @@
 {
-  "_comment": "Raw IR metadata pulled from dirac:/models/ov/ on 2026-08-28 (pre-M0 handover). sha256 prefixes, 16 hex chars. All three share tokenizer 87a7830d63fcf43b. full_attention_interval 4 = 1 in 4 layers full attention, rest GDN. Coder is expert-PRUNED: 184 of 256.",
-  "qwen36-coder-b5-ov": {"arch": ["Qwen3_5MoeForConditionalGeneration"], "model_type": "qwen3_5_moe", "hidden": 2048, "layers": 40, "experts": 184, "ctx": 262144, "full_attention_interval": 4, "template_sha": "e84f32a23fdda276", "tokenizer_sha": "87a7830d63fcf43b", "lm_xml_sha": "6745cfe3d57e3f0f", "lm_bin_bytes": 13760293946, "status": "production, 10/10"},
-  "qwen36-35b-a3b-int4-ov": {"arch": ["Qwen3_5MoeForConditionalGeneration"], "model_type": "qwen3_5_moe", "hidden": 2048, "layers": 40, "experts": 256, "ctx": 262144, "full_attention_interval": 4, "template_sha": "c3f7038f278583e1", "tokenizer_sha": "87a7830d63fcf43b", "lm_xml_sha": "21fe4d57d6d016f5", "lm_bin_bytes": 18646558274, "status": "unmeasured against current harness"},
-  "qwen38-b7c1-ov": {"arch": ["Qwen3_5ForConditionalGeneration"], "model_type": "qwen3_5", "hidden": 5120, "layers": 64, "experts": null, "ctx": 262144, "full_attention_interval": 4, "template_sha": "c3cf9e34abf4f9e3", "tokenizer_sha": "87a7830d63fcf43b", "lm_xml_sha": "5892b9b333bf0ab3", "lm_bin_bytes": 14405167394, "status": "provisional, 7/10 (AWQ-only; SE calibration degenerates greedy - do not re-add SE)"}
+  "_comment": "Raw IR metadata pulled from dirac:/models/ov/ on 2026-08-28 (pre-M0 handover). sha256 prefixes, 16 hex chars. All three share tokenizer 87a7830d63fcf43b. full_attention_interval 4 = 1 in 4 layers full attention, rest GDN. Coder is expert-PRUNED: 184 of 256. 2026-08-28: mtp fields added after inspecting the IRs \u2014 all three checkpoints declare mtp_num_hidden_layers 1, and NONE of the exports contain an MTP graph (only 'logits'), so no MTP head is servable from these artifacts.",
+  "qwen36-coder-b5-ov": {
+    "arch": [
+      "Qwen3_5MoeForConditionalGeneration"
+    ],
+    "model_type": "qwen3_5_moe",
+    "hidden": 2048,
+    "layers": 40,
+    "experts": 184,
+    "ctx": 262144,
+    "full_attention_interval": 4,
+    "template_sha": "e84f32a23fdda276",
+    "tokenizer_sha": "87a7830d63fcf43b",
+    "lm_xml_sha": "6745cfe3d57e3f0f",
+    "lm_bin_bytes": 13760293946,
+    "status": "production, 10/10",
+    "mtp_num_hidden_layers": 1,
+    "mtp_head_exported": false
+  },
+  "qwen36-35b-a3b-int4-ov": {
+    "arch": [
+      "Qwen3_5MoeForConditionalGeneration"
+    ],
+    "model_type": "qwen3_5_moe",
+    "hidden": 2048,
+    "layers": 40,
+    "experts": 256,
+    "ctx": 262144,
+    "full_attention_interval": 4,
+    "template_sha": "c3f7038f278583e1",
+    "tokenizer_sha": "87a7830d63fcf43b",
+    "lm_xml_sha": "21fe4d57d6d016f5",
+    "lm_bin_bytes": 18646558274,
+    "status": "unmeasured against current harness",
+    "mtp_num_hidden_layers": 1,
+    "mtp_head_exported": false
+  },
+  "qwen38-b7c1-ov": {
+    "arch": [
+      "Qwen3_5ForConditionalGeneration"
+    ],
+    "model_type": "qwen3_5",
+    "hidden": 5120,
+    "layers": 64,
+    "experts": null,
+    "ctx": 262144,
+    "full_attention_interval": 4,
+    "template_sha": "c3cf9e34abf4f9e3",
+    "tokenizer_sha": "87a7830d63fcf43b",
+    "lm_xml_sha": "5892b9b333bf0ab3",
+    "lm_bin_bytes": 14405167394,
+    "status": "provisional, 7/10 (AWQ-only; SE calibration degenerates greedy - do not re-add SE)",
+    "mtp_num_hidden_layers": 1,
+    "mtp_head_exported": false
+  }
 }

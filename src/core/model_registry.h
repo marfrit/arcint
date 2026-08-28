@@ -16,12 +16,17 @@
 // "41 GDN + 7 attn layers", and the IRs say 40 layers with one in four full
 // attention.
 //
-// One field is the exception and is marked as such: `has_mtp_head` comes from
-// DESIGN.md §3.5, not from any artifact, because the raw metadata records no
-// MTP field at all. It is therefore carried with `mtp_head_pinned = false`,
-// which downgrades a mismatch from a load refusal to a warning. Refusing to
-// load a real artifact over an unsourced claim would be the tail wagging the
-// dog.
+// `has_mtp_head` was the one field that came from prose rather than an
+// artifact, and inspecting the IRs on 2026-08-28 settled it against the prose:
+// DESIGN.md §3.5 says the 3.8 ships a native MTP head and the 3.6 pair ships
+// none. In fact all three checkpoints declare `mtp_num_hidden_layers: 1`, and
+// none of the three exports contain an MTP graph — every one of them outputs
+// `logits` and nothing else. So no MTP head is servable from these artifacts,
+// the flag is now pinned to what the exports actually contain, and
+// `mtp_in_checkpoint` records that a re-export is what would unblock M4.
+//
+// Had that flag stayed a load-refusing error, ligence would now refuse to load
+// qwen3.8 entirely on the strength of a sentence.
 //
 // Provenance is part of the contract: the campaign showed scale-estimation
 // calibration degenerating greedy decoding on the dense 3.8 (0/10) where
@@ -62,11 +67,15 @@ struct ModelEntry {
     std::string model_type;  // e.g. "qwen3_5_moe"
     bool moe = false;
 
-    // From DESIGN.md §3.5, not from the IR — see the header comment. Until an
-    // artifact confirms it, `mtp_head_pinned` stays false and validation only
-    // warns on a mismatch.
+    // Whether the *export* contains an MTP head, which is the only thing that
+    // matters for serving. All three checkpoints declare mtp_num_hidden_layers
+    // 1, and none of the exports carry the graph — see the header comment.
     bool has_mtp_head    = false;
     bool mtp_head_pinned = false;
+
+    // The checkpoint declares an MTP head even though the export drops it.
+    // Recorded so that re-exporting is visibly the thing that unblocks MTP.
+    bool mtp_in_checkpoint = false;
     int         n_embd       = 0;
     int         n_expert     = 0;  // 0 for the dense model
 
