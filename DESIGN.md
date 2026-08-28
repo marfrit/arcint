@@ -1126,7 +1126,7 @@ subtraction):
 | openarc production (B60, GenAI CB) | 867 t/s (36.8 s to first token) | 21.3 t/s |
 | ligence (B60, stateful) | **2444 t/s (13.1 s)** | **32.3 t/s** |
 | ligence (A770, chunk 512) | 901 t/s | 13.4 t/s |
-| openarc / GenAI (A770) | **cannot load this model at all** (§7.0.2a) | — |
+| openarc / GenAI CB path (A770) | **refuses at startup** (§7.0.2a; GenAI's *stateful* path did serve here) | — |
 
 At depth the stateful engine beats the production pipeline 2.8× on prefill and
 1.5× on decode — the opposite of the short-prompt result. So "GenAI's pipeline
@@ -1174,8 +1174,8 @@ decode of a resident model is not.
 
 ### 7.0.2a Admission by measured reservation — the paged driver on the card GenAI refuses
 
-GenAI's `ContinuousBatchingPipeline` will not start the coder on the A770 at
-all: it refuses at startup even at `num_kv_blocks = 256` — 80 MiB of KV —
+GenAI's `ContinuousBatchingPipeline` will not start the coder on the A770:
+it refuses at startup even at `num_kv_blocks = 256` — 80 MiB of KV —
 because its budget check prices in its own worst-case assumptions (batched
 prefill activations, a minimum block pool, and a checkpoint pool of ~33 MiB
 LA rows sized by its adaptive multiplier), and those exceed the 1.81 GiB left
@@ -1201,8 +1201,17 @@ is inadmissible on this card outright (the earlier "it ran anyway" was the
 plugin silently spilling 1.89 GiB to host), chunk 1024 admits ctx ≤ 20320,
 chunk 512 admits ctx ≤ 50480, chunk 256 admits ctx ≤ 65344.
 
-So the sentence this section exists for, with the numbers in it: **GenAI
-refuses the coder on the A770 outright under its assumptions; the paged driver
+Scope, before the sentence: this is a statement about GenAI's
+**continuous-batching path and its admission check**, not about GenAI or the
+card. This exact model served production on this exact card for two days
+through GenAI's *stateful* path (VLMPipeline, 43 t/s, 10/10 on the harness)
+before the B60 arrived and the GPU.0 pin silently migrated to it. What the
+A770 cannot get from GenAI is the paged path — the one with the optimized GDN
+kernels, real q8 KV, and rollback-by-arithmetic — because the CB budget check
+prices its worst-case assumptions into a residue they do not fit.
+
+So the sentence this section exists for, with the numbers in it: **GenAI's CB
+path refuses the coder on the A770 outright under its assumptions; the paged driver
 serves ctx 49152 at chunk 512 because its measured peak is
 13.30 + 0.57 + 0.03 + 0.94 + 0.25 = 15.09 of 15.11 GiB** — prefill 586 t/s,
 decode 37.1 t/s at depth 4096, device at 14.33 GiB with the difference being

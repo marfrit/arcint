@@ -50,7 +50,10 @@ startup reservation in which every term is measured (weights+graph via
 GPU_MEMORY_STATISTICS, activation peak by running one chunk - linear in chunk
 size - GDN slab, KV at 20 KiB/token, stated margin). Admission is refused with
 the numbers, never discovered at runtime as CL_OUT_OF_RESOURCES. Result on the
-A770, where GenAI refuses the coder outright: ctx 49152 at chunk 512 serves at
+A770, where GenAI's continuous-batching path refuses the coder at startup (its
+stateful VLMPipeline served this model on this card in production before the
+B60 arrived; the refusal is the CB admission check, not the card or GenAI):
+ctx 49152 at chunk 512 serves at
 586 t/s prefill / 37.1 t/s decode, 15.09 of 15.11 GiB accounted.
 
 PCIe bandwidth does NOT govern decode of a resident model - an earlier claim
