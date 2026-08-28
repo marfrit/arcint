@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <random>
 #include <stdexcept>
@@ -28,6 +29,8 @@
 #include <openvino/op/convert.hpp>
 #include <openvino/op/read_value.hpp>
 #include <openvino/op/slice.hpp>
+#include <openvino/op/transpose.hpp>
+#include <openvino/core/graph_util.hpp>
 
 #include <minja/chat-template.hpp>
 
@@ -221,6 +224,75 @@ ov::Tensor deserialise_state(const std::vector<uint8_t>& blob) {
 // the last 1 + draft_tokens rows. That keeps all of the memory win -- the wall
 // was one row per prompt token (8.1 GiB at 8k), not nine rows (5.4 MiB) -- and
 // the last row still means what it meant before, so greedy output is unchanged.
+// A graph node whose *type name* is LgcPermute, which is how OpenVINO's GPU
+// plugin binds a custom OpenCL kernel: the CustomLayer entry in the XML is
+// matched against the op's type, so putting this node in the graph is what
+// makes kernels/permute.cl run in its place.
+//
+// It carries no attributes on purpose. The permutation is (0,2,1,3), fixed, and
+// lives in the kernel; a node that could express any permutation would need the
+// order passed through a second buffer the custom-layer ABI does not give us.
+class LgcPermute : public ov::op::Op {
+public:
+    OPENVINO_OP("LgcPermute");
+
+    LgcPermute() = default;
+    explicit LgcPermute(const ov::Output<ov::Node>& arg) : ov::op::Op({arg}) {
+        constructor_validate_and_infer_types();
+    }
+
+    void validate_and_infer_types() override {
+        const ov::PartialShape& in = get_input_partial_shape(0);
+        ov::PartialShape        out = in;
+        if (in.rank().is_static() && in.rank().get_length() == 4) {
+            out = ov::PartialShape{in[0], in[2], in[1], in[3]};
+        }
+        set_output_type(0, get_input_element_type(0), out);
+    }
+
+    std::shared_ptr<ov::Node> clone_with_new_inputs(const ov::OutputVector& args) const override {
+        check_new_args_count(this, args);
+        return std::make_shared<LgcPermute>(args.at(0));
+    }
+
+    bool visit_attributes(ov::AttributeVisitor&) override { return true; }
+};
+
+// Replaces exactly the (0,2,1,3) rank-4 transposes -- the head-major swap the
+// GDN layers do three times each -- and leaves every other Transpose alone.
+// That selectivity is the point: the custom-layer binding is by type name, so
+// without it one kernel would have to serve every permutation in the graph.
+size_t route_head_swap_permutes(const std::shared_ptr<ov::Model>& model) {
+    const std::vector<int64_t> head_swap{0, 2, 1, 3};
+    size_t                     n = 0;
+
+    for (const std::shared_ptr<ov::Node>& node : model->get_ordered_ops()) {
+        const auto t = ov::as_type_ptr<ov::op::v1::Transpose>(node);
+        if (t == nullptr) continue;
+
+        const auto order =
+            ov::as_type_ptr<ov::op::v0::Constant>(t->input_value(1).get_node_shared_ptr());
+        if (order == nullptr || order->cast_vector<int64_t>() != head_swap) continue;
+
+        const ov::PartialShape& in = t->get_input_partial_shape(0);
+        if (in.rank().is_dynamic() || in.rank().get_length() != 4) continue;
+
+        // Only the GDN head-major swap: [B, S, 32, 128]. A custom node is a
+        // fusion barrier -- OpenVINO cannot pattern-match through an opaque op
+        // -- so routing every (0,2,1,3) transpose in the graph costs more in
+        // broken fusions than the faster kernel wins. Take the hot class only.
+        if (in[2].is_dynamic() || in[3].is_dynamic()) continue;
+        if (in[2].get_length() != 32 || in[3].get_length() != 128) continue;
+
+        const auto rep = std::make_shared<LgcPermute>(t->input_value(0));
+        rep->set_friendly_name(t->get_friendly_name());
+        ov::replace_node(t, rep);
+        ++n;
+    }
+    if (n > 0) model->validate_nodes_and_infer_types();
+    return n;
+}
+
 bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model,
                                 int64_t keep_rows) {
     const auto& results = model->get_results();
@@ -337,7 +409,7 @@ public:
     OvBackend(const Artifact& artifact, const Config& cfg, int n_ctx)
         : artifact_(artifact), prefill_chunk_(cfg.prefill_chunk) {
         const std::string& device    = cfg.device;
-        const std::string& cache_dir = cfg.cache_dir;
+        std::string cache_dir = cfg.cache_dir;
         if (cfg.draft_tokens > 0) {
             drafter_     = std::make_unique<NgramDrafter>(static_cast<size_t>(cfg.draft_ngram),
                                                           static_cast<size_t>(cfg.draft_tokens));
@@ -393,6 +465,18 @@ public:
             }
         }
 
+        if (!cfg.custom_kernels.empty()) {
+            const size_t n = route_head_swap_permutes(model);
+            core_.set_property(device, ov::AnyMap{{"CONFIG_FILE", cfg.custom_kernels}});
+            // A blob cache keyed on the plugin config would otherwise let a
+            // graph compiled with these kernels be served without them, or the
+            // other way round. This is a measurement switch; make it cold.
+            cache_dir.clear();
+            log::info("load", "custom kernels from %s: %zu head-swap permutes routed to "
+                              "LgcPermute (blob cache off)",
+                      cfg.custom_kernels.c_str(), n);
+        }
+
         log::info("load", "compiling language model on %s (%d layers, %d GDN + %d attn)",
                   device.c_str(), artifact.n_layer, artifact.n_gdn_layer, artifact.n_attn_layer);
 
@@ -412,6 +496,7 @@ public:
             ov::AnyMap cfg;
             cfg[ov::cache_mode.name()]   = ov::CacheMode::OPTIMIZE_SIZE;
             cfg[ov::weights_path.name()] = artifact.language_model_bin;
+            if (std::getenv("LIGENCE_PROFILE") != nullptr) cfg[ov::enable_profiling.name()] = true;
 
             auto t_cached = std::chrono::steady_clock::now();
             try {
@@ -433,7 +518,9 @@ public:
             // blob cannot be read back in on the retry.
             core_.set_property(ov::cache_dir(""));
             auto t_cold  = std::chrono::steady_clock::now();
-            language_    = core_.compile_model(model, device);
+            ov::AnyMap props;
+            if (std::getenv("LIGENCE_PROFILE") != nullptr) props[ov::enable_profiling.name()] = true;
+            language_    = core_.compile_model(model, device, props);
             logits_port_ = language_.output(0);
             lm_req_      = language_.create_infer_request();
             warmup();
@@ -849,6 +936,41 @@ private:
         forward({0}, 0);
         lm_req_.reset_state();
         if (std::getenv("LIGENCE_BENCH_FORWARD") != nullptr) bench_forward();
+        if (std::getenv("LIGENCE_PROFILE") != nullptr) profile_step();
+    }
+
+    // Per-kernel breakdown of one decode step. Aggregated by (op, kernel) so
+    // the reference-kernel fallbacks stand out, which is what the numbers are
+    // usually for. Needs PERF_COUNT at compile time (LIGENCE_PROFILE sets it).
+    void profile_step() {
+        lm_req_.reset_state();
+        std::vector<int> warm(64, 0);
+        forward(warm, 0);
+        forward({0}, 64);
+
+        struct Agg { double us = 0.0; int n = 0; };
+        std::map<std::string, Agg> by_kernel;
+        double                     total = 0.0;
+        for (const ov::ProfilingInfo& p : lm_req_.get_profiling_info()) {
+            const double us = static_cast<double>(p.real_time.count());
+            if (us <= 0.0) continue;
+            Agg& a = by_kernel[p.node_type + "  " + p.exec_type];
+            a.us += us;
+            a.n += 1;
+            total += us;
+        }
+
+        std::vector<std::pair<std::string, Agg>> rows(by_kernel.begin(), by_kernel.end());
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto& a, const auto& b) { return a.second.us > b.second.us; });
+
+        log::info("profile", "decode step %.2f ms across %zu (op, kernel) pairs",
+                  total / 1000.0, rows.size());
+        for (size_t i = 0; i < rows.size() && i < 20; ++i) {
+            log::info("profile", "%8.1f us %5d  %5.1f%%  %s", rows[i].second.us, rows[i].second.n,
+                      100.0 * rows[i].second.us / total, rows[i].first.c_str());
+        }
+        lm_req_.reset_state();
     }
 
     // Speculative decoding only pays when a k-token forward costs about what a

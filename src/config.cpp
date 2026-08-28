@@ -65,6 +65,7 @@ std::string usage_text() {
         "  --mtp on|off|auto         speculative decoding (default: auto)\n"
         "  --draft N                 speculative draft length, 0 = off\n"
         "  --draft-ngram K           drafter match length (default: 3)\n"
+        "  --custom-kernels FILE     OpenVINO custom-layer XML (hand-written OpenCL)\n"
         "\n"
         "misc\n"
         "  -v, -vv                   raise console verbosity\n"
@@ -166,6 +167,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.draft_ngram)) {
                 return fail("--draft-ngram needs an integer");
             }
+        } else if (arg == "--custom-kernels") {
+            if (!value(v)) return fail("--custom-kernels needs a path");
+            cfg.custom_kernels = std::string(v);
         } else if (arg == "--mtp") {
             if (!value(v)) return fail("--mtp needs a value");
             cfg.mtp = std::string(v);

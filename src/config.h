@@ -53,6 +53,11 @@ struct Config {
     // that last claim rather than assert it.
     bool slice_logits = true;
 
+    // Path to an OpenVINO custom-layer XML. Empty = use the plugin's own
+    // kernels only. Opt-in because it replaces graph nodes with hand-written
+    // OpenCL and the win has to be measured per card, not assumed.
+    std::string custom_kernels;
+
     int         kv_block_size             = 32;      // 16 or 32 — §8 benchmarks this
     std::string kv_dtype                  = "fp16";  // fp16 | q8
     int         gdn_checkpoint_budget_mib = 512;     // §3.3
