@@ -5,3 +5,8 @@
 #define LIGENCE_GIT_SHA    "@LIGENCE_GIT_SHA@"
 #define LIGENCE_BUILD_TYPE "@CMAKE_BUILD_TYPE@"
 #define LIGENCE_COMPILER   "@CMAKE_CXX_COMPILER_ID@ @CMAKE_CXX_COMPILER_VERSION@"
+
+// Where the OpenVINO tokenizers extension was found at configure time. Empty
+// when it was not found, in which case the loader searches the usual paths.
+// LIGENCE_TOKENIZERS_SO in the environment always wins over this.
+#define LIGENCE_TOKENIZERS_SO_DEFAULT "@LIGENCE_TOKENIZERS_SO@"

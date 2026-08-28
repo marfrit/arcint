@@ -14,6 +14,13 @@ option(LIGENCE_OPENVINO "Build the OpenVINO executor backend (M1+)" OFF)
 option(LIGENCE_WERROR   "Treat compiler warnings as errors"         OFF)
 option(LIGENCE_TESTS    "Build the test binaries"                   ON)
 
+# The tokenizers extension ships with the OpenVINO wheel rather than with the
+# runtime, so its path is deployment configuration. Baking the configure-time
+# location in is what lets the installed binary start without a wrapper script
+# that has to know where a Python virtualenv lives.
+set(LIGENCE_TOKENIZERS_SO "" CACHE FILEPATH
+    "Path to libopenvino_tokenizers.so (default: found next to the OpenVINO runtime)")
+
 find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------- build info
@@ -78,12 +85,57 @@ if(LIGENCE_OPENVINO)
   target_sources(ligence_core PRIVATE src/exec/backend_ov.cpp)
   target_link_libraries(ligence_core PUBLIC openvino::runtime)
   target_compile_definitions(ligence_core PUBLIC LIGENCE_OPENVINO=1)
+
+  # Where OpenVINO's own shared objects live; the installed binary needs to
+  # find them without LD_LIBRARY_PATH being set by hand at every start.
+  get_target_property(_ov_lib openvino::runtime IMPORTED_LOCATION_RELEASE)
+  if(NOT _ov_lib)
+    get_target_property(_ov_lib openvino::runtime IMPORTED_LOCATION)
+  endif()
+  if(_ov_lib)
+    get_filename_component(LIGENCE_OV_LIBDIR "${_ov_lib}" DIRECTORY)
+  endif()
+
+  if(NOT LIGENCE_TOKENIZERS_SO AND LIGENCE_OV_LIBDIR)
+    # The wheel puts it in a sibling package, not beside the runtime.
+    file(GLOB _tok
+         "${LIGENCE_OV_LIBDIR}/../../openvino_tokenizers/lib/libopenvino_tokenizers.so"
+         "${LIGENCE_OV_LIBDIR}/libopenvino_tokenizers.so")
+    if(_tok)
+      list(GET _tok 0 _tok0)
+      get_filename_component(LIGENCE_TOKENIZERS_SO "${_tok0}" REALPATH)
+    endif()
+  endif()
+  if(LIGENCE_TOKENIZERS_SO)
+    message(STATUS "ligence: tokenizers extension ${LIGENCE_TOKENIZERS_SO}")
+  else()
+    message(WARNING "ligence: libopenvino_tokenizers.so not found; set "
+                    "LIGENCE_TOKENIZERS_SO at configure time or in the environment")
+  endif()
 endif()
 
 # ----------------------------------------------------------------------- exe
 add_executable(ligence src/main.cpp)
 target_link_libraries(ligence PRIVATE ligence_core)
 target_compile_options(ligence PRIVATE -Wall -Wextra -Wpedantic)
+
+# ------------------------------------------------------------------- install
+#
+# Enough to run the engine from a systemd unit: a binary that resolves its own
+# shared objects, so the unit carries flags rather than a library search path.
+if(LIGENCE_OV_LIBDIR)
+  get_filename_component(_tok_dir "${LIGENCE_TOKENIZERS_SO}" DIRECTORY)
+  set_target_properties(ligence PROPERTIES
+    INSTALL_RPATH "${LIGENCE_OV_LIBDIR};${_tok_dir}"
+    BUILD_WITH_INSTALL_RPATH FALSE)
+endif()
+
+include(GNUInstallDirs)
+install(TARGETS ligence RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+install(FILES models/allowlist-raw.json
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/ligence")
+install(PROGRAMS tools/export_mtp.py
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/ligence/tools")
 
 # --------------------------------------------------------------------- tests
 if(LIGENCE_TESTS)

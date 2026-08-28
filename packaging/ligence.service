@@ -1,0 +1,57 @@
+# ligence, as a systemd *user* unit on dirac (mfritsche), matching how
+# openarc-coder and llama-agent already run there.
+#
+# Install:
+#   cmake --install build-ov --prefix ~/.local
+#   cp packaging/ligence.service ~/.config/systemd/user/
+#   cp packaging/ligence.env     ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now ligence
+#
+# On dirac, unit changes go through the Roundhouse MCP (switch_preview /
+# edit_rollout), not hand-edited systemctl: a hand edit without a commit in
+# ~/.config/systemd/user crashes roundhouse. This file is the content to hand
+# to it, not a licence to install it by hand.
+#
+# The binary resolves its own OpenVINO libraries via RPATH, so there is no
+# LD_LIBRARY_PATH here on purpose. If you see "libopenvino.so not found", the
+# build was configured without OpenVINO's location or was moved after install.
+
+[Unit]
+Description=ligence — LLM inference for Intel Arc
+Documentation=https://git.reauktion.de/marfrit/ligence
+After=graphical-session.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/systemd/user/ligence.env
+ExecStart=%h/.local/bin/ligence \
+    --model ${LIGENCE_MODEL} \
+    --device ${LIGENCE_DEVICE} \
+    --host ${LIGENCE_HOST} \
+    --port ${LIGENCE_PORT} \
+    --n-ctx ${LIGENCE_N_CTX} \
+    --prefix-cache-mib ${LIGENCE_PREFIX_CACHE_MIB} \
+    $LIGENCE_EXTRA_ARGS
+
+# The card holds the model's VRAM for the process lifetime, so a restart is a
+# full reload (minutes). Restart on failure, but do not thrash.
+Restart=on-failure
+RestartSec=30s
+
+# Loading a 13 GiB model and compiling the graph takes minutes on a cold blob
+# cache. systemd must not call that a hung start.
+TimeoutStartSec=20min
+TimeoutStopSec=60s
+
+# stderr is the dashboard (llama.cpp-style state lines); let journald have it.
+StandardOutput=journal
+StandardError=journal
+
+# It reads model artifacts and writes only its blob cache.
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectHome=read-only
+ReadWritePaths=%h/.cache/ligence
+
+[Install]
+WantedBy=default.target

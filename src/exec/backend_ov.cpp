@@ -22,6 +22,8 @@
 #include <random>
 #include <stdexcept>
 
+#include "build_info.h"
+
 #include <openvino/openvino.hpp>
 #include <openvino/op/constant.hpp>
 #include <openvino/op/matmul.hpp>
@@ -58,9 +60,13 @@ constexpr const char* kBeamIdx       = "beam_idx";
 constexpr uint64_t kPrefixCacheKey = 0x6c6967656e636531ull;  // "ligence1"
 
 std::string tokenizers_extension_path() {
-    // Shipped alongside the OpenVINO wheel. The path is configuration, not a
-    // guess: LIGENCE_TOKENIZERS_SO overrides it for an unusual install.
+    // Shipped alongside the OpenVINO wheel rather than with the runtime, so the
+    // path is deployment configuration. The environment wins; otherwise use
+    // whatever CMake found at configure time, so an installed binary starts
+    // without a wrapper that knows where a virtualenv lives; otherwise let the
+    // loader search.
     if (const char* env = std::getenv("LIGENCE_TOKENIZERS_SO")) return env;
+    if (std::strlen(LIGENCE_TOKENIZERS_SO_DEFAULT) > 0) return LIGENCE_TOKENIZERS_SO_DEFAULT;
     return "libopenvino_tokenizers.so";
 }
 
@@ -566,6 +572,12 @@ public:
 
         if (want_mtp_) {
             try {
+                // The cold path above clears the cache dir so a poisoned MoE
+                // blob cannot be read back (openvino#37607). That guard does not
+                // apply to these two: they are dense graphs this repository
+                // generated. Without restoring it they recompile on every start,
+                // and the LM head is a 248320 x 5120 MatMul.
+                if (!cfg.cache_dir.empty()) core_.set_property(ov::cache_dir(cfg.cache_dir));
                 const auto t0 = std::chrono::steady_clock::now();
                 mtp_layer_    = core_.compile_model(artifact.mtp_layer_xml, device);
                 mtp_head_     = core_.compile_model(artifact.mtp_lm_head_xml, device);
@@ -595,7 +607,7 @@ public:
         status_.n_layer          = artifact.n_layer;
         status_.n_gdn_layer      = artifact.n_gdn_layer;
         status_.n_attn_layer     = artifact.n_attn_layer;
-        status_.mtp_enabled      = false;  // M4
+        status_.mtp_enabled      = mtp_ready_;
         status_.weights_bytes    = artifact.weights_bytes;
         status_.sampler_defaults = artifact.sampler;
     }
@@ -683,11 +695,15 @@ public:
         // The boundary worth remembering is the last block edge strictly inside
         // the prompt: a snapshot of the whole prompt is useless to this prompt
         // and only helps a continuation of it, which the same insert covers.
-        const size_t block = prefix_cache_ != nullptr
-                                 ? static_cast<size_t>(prefix_cache_->block_size())
-                                 : 0;
+        // The checkpoint has to sit on the prefill grid, not merely on a KV block
+        // edge: a hit is where a warm run starts, and a warm run must traverse
+        // the same boundaries a cold one does. Restoring at a position the cold
+        // path never stopped at is what made warm-vs-cold margin-backed.
+        const size_t grid = prefill_chunk_ > 0 ? static_cast<size_t>(prefill_chunk_) : 0;
         const size_t snap_at =
-            block > 0 && prompt_ids.size() > block ? ((prompt_ids.size() - 1) / block) * block : 0;
+            prefix_cache_ != nullptr && grid > 0 && prompt_ids.size() > grid
+                ? ((prompt_ids.size() - 1) / grid) * grid
+                : 0;
 
         ov::Tensor logits = prefill(prompt_ids, past, snap_at);
         stats.prefill_seconds = std::chrono::duration<double>(clock::now() - t_prefill).count();
@@ -706,7 +722,9 @@ public:
         past                  = prompt_ids.size();
 
         // Emits one committed token; returns false when the caller wants to stop.
+        const bool trace = std::getenv("LIGENCE_TRACE_TOKENS") != nullptr;
         auto commit = [&](int tok, Control& out) {
+            if (trace) log::info("trace", "commit pos=%zu tok=%d", past, tok);
             ++stats.completion_tokens;
             out = on_piece(tokenizer_->decode_one(tok), tok);
             sampler.observe(tok);
@@ -757,8 +775,8 @@ public:
             if (drafts.empty()) {
                 logits = forward({next}, past);
                 ++past;
-                if (mtp_ready_) mtp_set_pending(last_hidden_, 0);
                 next = pick(sampler, logits);
+                if (mtp_ready_) mtp_set_pending(last_hidden_, 0);
                 continue;
             }
 
@@ -822,7 +840,13 @@ public:
             size_t accepted = 0;
             bool   stop     = false;
             for (size_t i = 0; i < drafts.size(); ++i) {
-                if (pick_row(sampler, logits, i) != drafts[i]) break;
+                const int want = pick_row(sampler, logits, i);
+                if (trace) {
+                    log::info("trace", "verify i=%zu next=%d draft=%d want=%d rows=%zu %s", i,
+                              next, drafts[i], want, rows,
+                              want == drafts[i] ? "ACCEPT" : "reject");
+                }
+                if (want != drafts[i]) break;
                 ++accepted;
 
                 // A drafted token clears the same gates, in the same order, as
@@ -836,7 +860,7 @@ public:
                     break;
                 }
                 if (status_.n_ctx > 0 &&
-                    static_cast<int>(past + i) + 1 >= status_.n_ctx) {
+                    static_cast<int>(past + i) + 2 >= status_.n_ctx) {
                     reason = FinishReason::Length;
                     stop   = true;
                     break;
@@ -848,7 +872,16 @@ public:
                 }
             }
             stats.draft_accepted += static_cast<int>(accepted);
-            if (stop) break;
+            if (stop) {
+                // Leaving here means the state still holds the whole drafted
+                // tail, including tokens that were never committed. Nothing
+                // reads it today -- every entry path rebuilds the state first --
+                // but "safe because of what the callers happen to do" is not a
+                // property worth relying on, and the rollback buffer is already
+                // in hand.
+                restore_tensors(rollback_);
+                break;
+            }
 
             if (accepted < drafts.size()) {
                 // Over-advanced by the rejected tail. Roll the state back and
@@ -865,18 +898,24 @@ public:
                     std::chrono::duration<double>(clock::now() - t_re).count();
             }
 
+            // Sample before the head runs. `logits` is the language model
+            // request's own output tensor, and mtp_feed() infers two other
+            // requests; reading it afterwards returned a token the model never
+            // predicted, which is how a drafted token got inserted into an
+            // otherwise identical answer.
+            past += 1 + accepted;
+            next = pick(sampler, logits);
+
             if (mtp_ready_) {
-                // logits/hidden here cover the positions actually committed:
-                // row 0 is position `past`, row i is position `past + i`.
+                // hidden here covers the positions actually committed: row 0 is
+                // position `past`, row i is position `past + i`. It is a copy
+                // (see forward), so feeding the head cannot disturb it.
                 for (size_t i = 0; i < accepted; ++i) {
                     mtp_set_pending(last_hidden_, i);
                     mtp_feed(drafts[i], false);
                 }
                 mtp_set_pending(last_hidden_, accepted);
             }
-
-            past += 1 + accepted;
-            next = pick(sampler, logits);
         }
 
         stats.decode_seconds = std::chrono::duration<double>(clock::now() - t_decode).count();
@@ -884,20 +923,34 @@ public:
     }
 
 private:
-    // Chunked prefill (§3.2). Verified byte-identical to a single call at chunk
-    // sizes 32/64/128 on the artifact, which is what makes it safe to use by
-    // default rather than only for prompts that would otherwise not fit.
+    // Chunked prefill (§3.2). NOT byte-identical to a single call: measured
+    // 2026-08-28, forward([x, y]) and forward([x]) then forward([y]) differ at
+    // the last position by up to 0.013 in the logits, so any change in how a
+    // sequence is split can flip a near-tie. Chunking is used by default anyway
+    // because the alternative is unbounded activation memory, and the size is
+    // large enough (2048) that ordinary prompts are a single chunk.
     ov::Tensor prefill(const std::vector<int>& tokens, size_t past, size_t snapshot_at) {
         ov::Tensor   logits;
-        const size_t chunk =
-            prefill_chunk_ > 0 ? static_cast<size_t>(prefill_chunk_) : tokens.size();
+        const size_t grid = prefill_chunk_ > 0 ? static_cast<size_t>(prefill_chunk_) : 0;
 
         while (past < tokens.size()) {
-            size_t take = std::min(std::max<size_t>(chunk, 1), tokens.size() - past);
-
-            // Stop exactly on the snapshot boundary so the checkpoint lands on a
-            // block edge instead of wherever the chunking happened to land.
-            if (snapshot_at > past && snapshot_at < past + take) take = snapshot_at - past;
+            // Chunk on an ABSOLUTE grid -- multiples of the chunk size counted
+            // from position 0 -- rather than in steps of `chunk` from wherever
+            // this call happens to start.
+            //
+            // This is what makes a warm run equal a cold one. §3.2 measured that
+            // advancing the state by k tokens in one call differs from advancing
+            // it k times by one, so a cache hit, which is a boundary, would
+            // otherwise hand the model a different split of the same tokens than
+            // the cold run saw. Measured on the dense model: cold-vs-warm logits
+            // differed by up to 0.210 with a top-2 margin of 0.145 -- the gate
+            // was passing on margin, not by construction. With both paths on the
+            // same grid the difference is exactly zero.
+            size_t take = tokens.size() - past;
+            if (grid > 0) {
+                const size_t edge = ((past / grid) + 1) * grid;
+                take = std::min(edge, tokens.size()) - past;
+            }
 
             const size_t start = past;
             logits = forward({tokens.begin() + static_cast<long>(past),
@@ -1176,7 +1229,20 @@ private:
         lm_req_.set_tensor(kBeamIdx, beam);
         lm_req_.infer();
 
-        if (mtp_ready_) last_hidden_ = lm_req_.get_tensor("hidden_states");
+        if (mtp_ready_) {
+            // Our own copy, for exactly the reason embeds_ above is a copy: this
+            // is the request's output buffer, and the MTP head runs two more
+            // inferences before these rows are all read. Reading a live request
+            // buffer across another infer is what broke chunked prefill once
+            // already.
+            const ov::Tensor src = lm_req_.get_tensor("hidden_states");
+            if (!hidden_copy_ || hidden_copy_.get_shape() != src.get_shape() ||
+                hidden_copy_.get_element_type() != src.get_element_type()) {
+                hidden_copy_ = ov::Tensor(src.get_element_type(), src.get_shape());
+            }
+            std::memcpy(hidden_copy_.data(), src.data(), src.get_byte_size());
+            last_hidden_ = hidden_copy_;
+        }
         return lm_req_.get_tensor(logits_port_);
     }
 
@@ -1331,6 +1397,7 @@ private:
     ov::InferRequest               mtp_req_;
     ov::InferRequest               mtp_head_req_;
     ov::Tensor                     last_hidden_;    // the base model's, this step
+    ov::Tensor                     hidden_copy_;    // owned; last_hidden_ points here
     ov::Tensor                     mtp_pending_;    // h_t, awaiting x_{t+1}
     bool                           mtp_has_pending_ = false;
     size_t                         mtp_len_ = 0;    // positions in the head's KV

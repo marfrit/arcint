@@ -18,7 +18,7 @@ coder q4; all three target models reach 10/10 on the fleet harness.
   M1 executor, greedy, coder/B60  done - 51.4 t/s, 10/10
   M2 chunked prefill, ledger      done bar the paged path
   M3 prefix caching               done - warm/cold byte-identical
-  M4 MTP                          done - 93.3% acceptance, byte-identical
+  M4 MTP                          done - 93.3% acceptance (not byte-identical)
   M5 all three models             gates done; 35B does not fit the A770
 
 Two M2 walls came down. Slicing logits to the last token before the LM head
@@ -50,8 +50,13 @@ that runs where the card is. Clean under ASan and UBSan on x86_64.
   (load, mem map, per-slot prefill/decode rates, cache hits, MTP acceptance).
 - Model input: OpenVINO IR (offline export), validated against a built-in
   allowlist; anything else is rejected at load.
-- Hard invariant: greedy output is byte-identical across cold/warm prefix
-  cache, MTP on/off, chunked/unchunked prefill. Equivalence is a CI gate.
+- Hard invariant: greedy output is byte-identical across cold/warm prefix cache
+  (gated in CI). NOT across chunked/unchunked prefill or speculation on/off:
+  measured 2026-08-28, advancing the state by two tokens in one forward differs
+  from advancing it twice by one (last-row logits up to 0.013 apart, GDN scan
+  kernel), so any change to how a sequence is split can flip a near-tie. Those
+  comparisons are reported, not gated; determinism at a fixed configuration and
+  non-zero draft acceptance are gated instead.
 
 ## Target models (measured, models/allowlist-raw.json, dirac 2026-08-28)
 
@@ -81,8 +86,10 @@ above are authoritative and the allowlist follows them.
   restore both sides exactly; no approximate resume, ever.
 - Prefix index: keyed 128-bit block hashes with token verification on hit.
 - Speculative decoding is implemented and gated on greedy-invariance: a draft
-  is accepted only if it equals what the sampler would have picked, so output
-  is byte-identical to plain greedy. Two drafters, both off by default: the
+  is accepted only if it equals what the sampler would have picked for that
+  logits row, so a draft is never taken on faith. Output is NOT byte-identical
+  to plain greedy - see the invariant note above. Two drafters, both off by
+  default: the
   native Qwen3.8 MTP head (--mtp on, 93.3% acceptance) and a prompt-lookup
   drafter (--draft N). optimum-intel drops the MTP head on export, so
   tools/export_mtp.py reconstructs it from the checkpoint's mtp.* tensors; the

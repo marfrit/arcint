@@ -169,3 +169,20 @@ TEST(config_verbosity_flags) {
     CHECK(run({"--stub", "-vv"}, two).ok);
     CHECK_EQ(two.verbosity, 2);
 }
+
+
+// The prefill grid and the cache grid must be one grid: a hit is where a warm
+// run starts, and it has to traverse the boundaries a cold run did.
+TEST(config_prefix_cache_requires_an_aligned_prefill_grid) {
+    Config cfg;
+    CHECK(run({"--stub", "--prefix-cache-mib", "512", "--kv-block-size", "32",
+               "--prefill-chunk", "2048"}, cfg).ok);
+    CHECK(rejected({"--stub", "--prefix-cache-mib", "512", "--prefill-chunk", "0"}));
+    CHECK(rejected({"--stub", "--prefix-cache-mib", "512", "--kv-block-size", "48",
+                    "--prefill-chunk", "2048"}));
+    // Without the cache there is nothing to align to, so unchunked stays legal.
+    // A fresh Config: parse_args mutates rather than resets, so reusing the one
+    // above would carry --prefix-cache-mib into this case.
+    Config nocache;
+    CHECK(run({"--stub", "--prefill-chunk", "0"}, nocache).ok);
+}

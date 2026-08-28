@@ -241,6 +241,25 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         return fail("--kv-dtype must be fp16 or fp32");
     }
     if (cfg.prefill_chunk < 0) return fail("--prefill-chunk must be >= 0");
+
+    // The prefill grid and the cache grid have to be the same grid. A cache hit
+    // is where a warm run starts, and a warm run must present the model the same
+    // chunk boundaries a cold one did, or the two compute different logits for
+    // the same tokens (DESIGN §3.2). That requires every checkpoint position to
+    // be a prefill boundary, so the chunk size must be a whole number of blocks.
+    if (cfg.prefix_cache_mib > 0) {
+        if (cfg.prefill_chunk == 0) {
+            return fail("prefix caching needs a prefill grid to align to: "
+                        "--prefill-chunk 0 (unchunked) cannot guarantee that a warm "
+                        "run matches a cold one");
+        }
+        if (cfg.kv_block_size <= 0 || cfg.prefill_chunk % cfg.kv_block_size != 0) {
+            return fail(log::format(
+                "--prefill-chunk (%d) must be a multiple of --kv-block-size (%d) so that "
+                "cache checkpoints land on prefill boundaries",
+                cfg.prefill_chunk, cfg.kv_block_size));
+        }
+    }
     if (cfg.draft_tokens < 0) return fail("--draft must be >= 0");
     if (cfg.draft_ngram < 1) return fail("--draft-ngram must be >= 1");
     if (cfg.prefix_cache_mib < 0) return fail("--prefix-cache-mib must be >= 0");

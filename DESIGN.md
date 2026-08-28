@@ -124,19 +124,66 @@ exactly the handle the GDN ledger and its block-aligned checkpoints need, and
 `ov::pass::SDPAToPagedAttention` is available for the attention side. The
 three entry points below describe M2's shape, not M1's:
 
-**Chunked prefill is not bit-exact on this backend.** Measured 2026-08-28 with
-a pure-Python driver over the same graph, so this is the backend's property and
-not ligence's: splitting a 224-token prefill changes the last-row logits by up
-to ~2.8 in absolute value — kernel-path differences, not rounding noise — and
-at chunk 7 that flips a generated token 25 steps in. Chunk sizes 1, 7 and 64
-all differ from the unchunked run.
+**Chunked prefill is not bit-exact on this backend, and the cause is now
+isolated.** Measured 2026-08-28 with a pure-Python driver over the same graph:
+splitting a 224-token prefill changes the last-row logits by up to ~2.8 in
+absolute value — kernel-path differences, not rounding noise — and at chunk 7
+that flips a generated token 25 steps in. Chunk sizes 1, 7 and 64 all differ
+from the unchunked run.
 
-§3.4's rule applies to ligence's own configuration first: a path that cannot
-meet the equality gate is configured out, not papered over. So `--prefill-chunk`
-defaults to **0 (unchunked)**, which is the configuration that satisfies the
-gate. The equivalence suite reports the chunking delta rather than gating on it,
-because gating on something the backend cannot deliver would only produce a
-permanently red test.
+The minimal case pins it down. Starting from one state, on the dense model:
+
+| | result |
+|---|---|
+| row 0 of `forward([x, y])` vs `forward([x])` | **bit-identical** |
+| last row of `forward([x, y])` vs `forward([x])` then `forward([y])` | **differs, max 0.013** |
+
+So it is not batching per se, and it is not the position: it is that advancing
+the state by two tokens in one call is a different computation from advancing it
+twice by one. The GDN layers are the obvious suspect — a recurrent scan over k
+tokens is a different kernel path from k scans of one — and that is a property
+of `ocl::gated_delta_net::ref`, not of ligence.
+
+**This one fact governs three features.** Anything that changes how a token
+sequence is divided into forward passes can move a near-tie: chunked prefill
+(§3.2), speculative decoding (§3.5.1) and MTP (§3.5.2) are all the same
+phenomenon.
+
+**It governed the prefix cache too, and that one was not safe.** A cache hit
+*is* a boundary: the cold run computed the tail of the prompt inside one long
+forward, the warm run computed it as a short forward from the restored state.
+Measured on the dense model, a 235-token prompt restored at 224:
+
+| | |
+|---|---|
+| cold-vs-warm, last-row logits | **differ by up to 0.210** |
+| the top-2 margin at that position | **0.145** |
+| both paths split at the same boundary | **bit-identical, 0.000000** |
+
+The perturbation was larger than the margin. §3.4's invariant was holding on
+luck, and the equivalence gate was measuring luck. The fix is in the last row of
+that table: **prefill chunks on an absolute grid** — multiples of the chunk size
+counted from position 0, not steps from wherever a call begins — and cache
+checkpoints are restricted to that same grid. A warm run then starts on a
+boundary the cold run also stopped at, and its remaining boundaries are the tail
+of the cold run's. Equality is by construction again, on a backend that is
+allowed to be chunk-sensitive, because no two paths ever hand the model a
+different split of the same tokens.
+
+The cost is that **cache granularity is now the prefill grid**: with
+`--prefill-chunk 2048` a prompt shorter than 2048 tokens never reaches a
+checkpoint. Finer reuse means a finer grid means more forward calls in prefill
+(measured: 2247 t/s unchunked against 1161 t/s at chunk 512), so the two are one
+setting and are validated as one — `--prefill-chunk` must be a non-zero multiple
+of `--kv-block-size` whenever the cache is on. Speculation cannot be fixed the
+same way, because its verify pass is a multi-token forward by definition; that
+is why the cache is gated and speculation is reported.
+
+`--prefill-chunk` defaults to **2048**, not 0: see the measurement further down
+this section — chunking is the mechanism that bounds activation memory, and the
+size is chosen so ordinary prompts land in a single chunk. The equivalence suite
+reports the chunking delta rather than gating on it, because gating on something
+the backend cannot deliver would only produce a permanently red test.
 
 **The depth wall was never the KV, and it is now gone.** The graph emits
 `logits` for *every* prompt token — `[tokens, 1, 248320]` — so an unchunked 8k
@@ -175,9 +222,10 @@ the affirmative), and llama.cpp's micro-batched prefill at n_ubatch 512, which
 bounds activations by the batch rather than by the prompt.
 
 So chunking is not the compromise, it is the mechanism, and `--prefill-chunk`
-now defaults to **2048**: ordinary prompts still land in one chunk and stay
-bit-identical to an unchunked run, while a long prompt is split rather than
-allowed to grow without limit. The slice and the chunk are complementary — one
+now defaults to **2048**: ordinary prompts still land in one chunk and are
+therefore literally unchunked, while a long prompt is split rather than allowed
+to grow without limit. A prompt that does cross the boundary is not bit-identical
+to an unchunked run, for the reason measured at the top of this section. The slice and the chunk are complementary — one
 bounds the logits term, the other bounds the activation term — and what remains
 for 262144 on the B60 is the KV term, which is where q8 comes in.
 
@@ -401,8 +449,25 @@ it proposes the continuation that followed the last time the current suffix
 appeared. `--draft N --draft-ngram K` turns it on; it is **off by default**.
 
 Speculation runs only under greedy, and acceptance is defined as *the token the
-sampler would have picked here equals the guess* — which makes the output
-identical to non-speculative greedy by construction. Two details make that true
+sampler would have picked here equals the guess*.
+
+**That makes verification exact, but it does not make the output identical to
+non-speculative greedy, and this section originally claimed it did.** The
+verify pass is a multi-token forward; plain decoding computes the same position
+with a single-token forward; and §3.2's measurement shows those two differ by up
+to 0.013 in the logits. Acceptance is exact *with respect to the logits the
+verify pass computed* — a drafted token is never taken on faith — but the
+counterfactual trajectory is computed slightly differently, so a near-tie can
+land the other way. Measured: on the dense model at 77.8% acceptance, one token
+in 64 flipped, and the answers then reconverged. On the coder, and on other
+prompts, no divergence appeared at all.
+
+So the honest statement is: speculation does not corrupt anything and cannot
+emit a token the model did not rank first *in the pass that verified it*, but
+"byte-identical to non-speculative greedy" is not deliverable on this backend
+and the suite reports the comparison instead of gating it. The gates that remain
+are the ones that mean something: determinism at a fixed configuration, and
+non-zero acceptance. Two details make that true
 rather than merely intended, and both were bugs first:
 
 - **Acceptance is the sampler's decision, not a raw argmax.** Penalties are
@@ -541,10 +606,17 @@ swish scores 13%.
 | `--mtp off` | **19.9 t/s** | — | — | — | — |
 | `--mtp on` | 9.0 t/s | **93.3%** (97/104) | 5.78 s | 0.67 s | 14.75 s |
 
-Output is byte-identical between the two, which is M4's exit criterion together
-with the measured acceptance. In-engine acceptance is higher than the 66% above
-because the head is primed over the whole prompt and scored only on generated
-positions.
+In-engine acceptance is higher than the 66% above because the head is primed
+over the whole prompt and scored only on generated positions.
+
+**The output is not byte-identical to `--mtp off`, and finding that out is what
+located §3.2's root cause.** On this prompt one token in 64 differed — the head's
+draft was accepted on a row the verify pass computed, and plain decoding computed
+that position in a single-token forward that ranked a different token first by a
+hair. The two answers reconverged immediately. So M4's exit criterion is met in
+the half that is deliverable (measured acceptance, and verification that never
+takes a draft on faith) and not in the half that this backend cannot deliver for
+*any* speculative scheme.
 
 The head runs one position behind the base model, consuming `(h_t, emb(x_{t+1}))`
 to predict `x_{t+2}`, and is fed one position per committed token. That makes
@@ -871,7 +943,7 @@ and owns the state.
 | M1 | single-sequence inference, greedy, 27B coder q4 on B60 | Prüfstand 10/10, ≥ 45 t/s | **done** — 51.4 t/s, 10/10 at artifact sampling defaults (§5) |
 | M2 | paged KV + GDN ledger, chunked prefill | equivalence suite green, 256k context loads | **done** — suite green, **257,167 tokens loaded** (§5); paged path mapped but not adopted |
 | M3 | prefix caching (block-aligned checkpoints) | warm/cold byte-equality, hit-rate stats on console | **done** — warm/cold byte-identical, hit stats on console |
-| M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance | **done** — byte-identical output with `--mtp on`, 93.3% acceptance on the dense model (§3.5.2). It is a net slowdown until the paged path lands, and is off for the two MoE exports, which carry no head. |
+| M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance | **acceptance done** — 93.3% on the dense model, verification exact (§3.5.2). Greedy-invariance is **not achievable on this backend** and the criterion was wrong to assume it was: a multi-token verify pass and a single-token plain pass differ (§3.2), so any speculative scheme can flip a near-tie. Also a net slowdown until the paged path lands. |
 | M5 | 35B MoE q4 on A770 (16 GB fit), q8 variants on B60 | all three models pass their gates | **done** — all three serve and reach 10/10 (§7). The hardware targets named in the milestone column are not reachable with these artifacts: the 35B is larger than the A770 and HETERO cannot place experts, and no q8 export exists. |
 
 M0 went past its exit criterion on purpose: everything that does not need a
