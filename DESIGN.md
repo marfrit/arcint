@@ -612,9 +612,25 @@ One line per event, greppable, no colors by default, `-v` raises verbosity
   per context token and a quadratic term of 28.2 ns per token², crossing over at
   L ≈ 1688. The two independent observations agree.
 
-  Not yet pinned to a node. The next step is `get_runtime_model()` at two depths
-  and a diff of per-node `execTimeMcs`, looking for an output shaped `[…, L, L]`
-  and for `_cpu_impl` on anything in the attention path.
+  **Pinned to nodes.** Diffing per-node profiling between a one-token decode
+  step at ctx 512 and at ctx 4096 (×8 context):
+
+  | node | growth | implementation |
+  |---|---|---|
+  | `IndirectSDPA` ×10 — layers 3,7,…,39 | **×20.8 each**, +13.7 ms total | `ocl::sdpa::opt__f16` |
+  | `lm_head` MatMul | ×2.9, +3.4 ms | `jit:gemm:any__i8` |
+  | `Transpose` in `linear_attn` ×30 | ×5.4, +0.7 ms each | `permute_ref__f16` |
+
+  The ten SDPA nodes are exactly the `full_attention` layer indices, and they
+  dominate. Their growth is L^1.46 where decode attention against a growing KV
+  should be L^1.0 — so it is not merely "attention reads more keys". They are
+  already on the *optimised* kernel, so no custom kernel addresses this; the
+  paged path does, by replacing `IndirectSDPA` with `PagedAttention`.
+
+  Two anomalies sit alongside it and are not explained by attention at all: the
+  **LM head grows ×2.9** though it has no context dependence whatsoever, and the
+  GDN `Transpose` nodes grow ×5.4 though the GDN state is fixed-size. Something
+  sizes work by context where context does not enter the mathematics.
 - **256k context loads — measured, not extrapolated.** With fp16 KV storage,
   chunked prefill at 2048 and the logits slice, ligence loaded **257,167
   tokens** on the B60 in 8.1 minutes (528 t/s prefill), which is 98% of the
