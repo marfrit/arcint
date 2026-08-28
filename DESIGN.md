@@ -324,8 +324,29 @@ carries a complete single-layer head — 15 tensors: `mtp.fc.weight`,
 input_layernorm, post_attention_layernorm}`, `mtp.norm.weight`,
 `mtp.pre_fc_norm_embedding.weight` — and its GPTQ config excludes them from
 quantisation (`dynamic: {"-:.*mtp.*": {}}`), so they are at original precision.
-So M4 is not blocked on weights that do not exist; it is blocked on an export
-that keeps them, which is offline artifact work.
+So M4 is not blocked on weights that do not exist. It is blocked on something
+narrower and harder: **no public implementation consumes them.** Checked
+2026-08-28:
+
+| where | Qwen3.5 architecture | MTP head |
+|---|---|---|
+| `transformers` 5.0.0 (installed) | absent (`qwen3_next` is the nearest) | — |
+| `transformers` 5.16.1 (latest) | **present**, `qwen3_5` + `qwen3_5_moe`, 28 classes | **absent** — no MTP class, no `pre_fc_norm`, no `attn_output_gate` |
+| `optimum-intel` (installed) | present, 5 files reference `qwen3_5` | absent |
+
+The nearest reference, `qwen3_next`, also lacks `attn_output_gate` — and this
+head uses it (`mtp.layers.0.self_attn.q_proj` is `[12288, 5120]`, twice the
+24×256 head width, so q and its gate come out together). Building the head
+therefore means reverse-engineering a forward pass — gated attention, the
+4-section mrope, the `pre_fc_norm_hidden`/`pre_fc_norm_embedding` concatenation
+order — with **no oracle to check it against**. A mistake there does not fail;
+it lowers draft acceptance, which is the silent-divergence class this engine
+exists to refuse.
+
+Two things would unblock it, neither of them code in this repository: an
+upstream implementation of the head, or the model authors' reference. And even
+then §3.5's arithmetic applies — 7.7 accepted tokens per verify step to break
+even on the stateful graph — so MTP wants the paged path as well.
 
 So MTP is not implementable against these artifacts, by anyone: there is no
 draft head to call. What unblocks it is a re-export that keeps the MTP layer,
