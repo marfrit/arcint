@@ -454,6 +454,26 @@ One line per event, greppable, no colors by default, `-v` raises verbosity
   the table. The suite is verified red before green (breaking the UTF-8
   boundary rule fails five cases and exits non-zero), and builds warning-clean
   under `-Wall -Wextra -Wpedantic -Werror`.
+- **Host memory is part of the measurement, not a footnote.** Deep-context runs
+  are bounded by the *host*, not only by VRAM, and on this fleet the binding
+  constraint is ZFS: `zfs_arc_max` is 40 GiB of the 62 GiB on `data`, ARC
+  refills to ~24 GiB within minutes of boot because every compile reads a
+  12.8 GiB weights file through it, and `MemAvailable` does not count ARC as
+  reclaimable. ARC does shrink under pressure, but not fast enough to cover a
+  large sudden allocation.
+
+  Measured the hard way on 2026-08-28: a 64k unchunked prefill run alongside a
+  resident `openarc-coder` (~26 GiB) and a full 21 GiB **zram** swap — which is
+  compressed swap living in RAM, so filling it makes the squeeze worse rather
+  than relieving it — produced three global OOMs, killed the engine, and left a
+  zombie holding ~41 GiB of shmem that never came back. The same depth run with
+  the resident services stopped and ARC at ~12 GiB never dropped below 30 GiB
+  free.
+
+  So: stop the resident services before a depth run (they are not just holding
+  VRAM), watch host `MemAvailable` and `arcstats` rather than the container's
+  view — lxcfs shows a container its cgroup cap, not the host's state — and put
+  a watchdog on it. Nothing about this is visible from inside dirac.
 - **Sanitizers**: clean under ASan + UBSan with `-fno-sanitize-recover`, unit
   suite and round-trip both, plus a 200-request 24-way concurrency stress
   across 8 slots with every slot exercised and released. ASan has to run on
