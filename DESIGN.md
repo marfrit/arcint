@@ -1042,6 +1042,7 @@ and owns the state.
 | M2 | paged KV + GDN ledger, chunked prefill | equivalence suite green, 256k context loads | **done** — suite green, **257,167 tokens loaded** (§5); paged path mapped but not adopted |
 | M3 | prefix caching (block-aligned checkpoints) | warm/cold byte-equality, hit-rate stats on console | **done** — warm/cold byte-identical, hit stats on console |
 | M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance | **acceptance done** — 93.3% on the dense model, verification exact (§3.5.2). Greedy-invariance is **not achievable on this backend** and the criterion was wrong to assume it was: a multi-token verify pass and a single-token plain pass differ (§3.2), so any speculative scheme can flip a near-tie. Also a net slowdown until the paged path lands. |
+| M6 | per-slot InferRequest scheduler | N slots = N InferRequests (embeddings and MTP twins included); admission bounded by the measured reservation curve (§7.0.2a terms, per slot); the 200-request 24-way concurrency stress passes; single-stream latency regresses < 5% with the suite green. Any regression beyond that gets a profile naming the contended resource before any tuning. | **open** — §3's SlotPool serialises on one mutex today; OV's stateful API already isolates state per request, so the mechanism is known (§3) |
 | M5 | 35B MoE q4 on A770 (16 GB fit), q8 variants on B60 | all three models pass their gates | **done**, and the 16 GB fit now works too: `--offload-ratio 20` serves the 35B on the A770 at 1.8 t/s where it previously refused to load (§7). The q8 half still waits on an export. |
 
 M0 went past its exit criterion on purpose: everything that does not need a
@@ -1208,6 +1209,28 @@ Small open lead from the same run: ligence's emit accounting rose to 0.43 s for
 120 tokens at 32k (3.6 ms/token, ~12% of decode) where it is ~0.2 ms/token at
 short context. The graph still dominates; worth a look, not a fire.
 
+#### 7.0.0b The bar, so "done" has a definition
+
+Decode rooflines by **parameter arithmetic** — active weight bytes per token
+over memory bandwidth, explicitly *not* measured DRAM traffic, see the caveat:
+
+| B60, q4, greedy | active bytes/token | roofline | measured | of roofline |
+|---|---|---|---|---|
+| coder MoE (~3B active) | ~1.5–1.9 GB | ~240–300 t/s | 52 t/s | **~20%** |
+| dense Qwen3.8 (all 13.4 GiB) | ~13.4 GB | ~34 t/s | 19.9 t/s | **~59%** |
+
+The caveat that keeps this table honest: the 19.01 ms measured decode step
+would move **8.7 GB** at full bandwidth — 4.6–5.8× the active-weight
+arithmetic. Two readings fit that gap and the per-kernel profile cannot
+separate them: the kernels run far below bandwidth (the reference-kernel share
+and the FC-dominated profile point this way), or real traffic exceeds the
+arithmetic (router, shared experts, activations re-read). Separating them
+needs DRAM counters (Level-Zero/PTI), not `PERF_COUNT`. Until then the
+ceiling is quoted only as arithmetic, and the operational bar stands
+regardless of which reading wins: **the MoE has ~4–5× of generic headroom on
+this card, the dense model ~1.7×**, which is why generic substrate work aims
+at the MoE and the model-specific lever (MTP) at the dense model.
+
 ### 7.0.1 The bus was not the explanation — retracted
 
 An earlier version of this section explained the A770's behaviour, and part of
@@ -1318,6 +1341,50 @@ differently per generation (Xe2 has no SIMD8, and the plugin's own permute
 kernel says so), so a kernel-level conclusion drawn on one card does not
 transfer to the other. Host-side work is 2% on both.
 
+#### 7.0.2b The XMX question cannot be decided from the profile
+
+The proposed five-minute check — grep a `LIGENCE_PROFILE` for `dpas`/systolic
+markers in the GEMM kernel names — was run on both cards and is **inconclusive
+at this observability level**: the distinct GEMM `exec_type` strings are
+identical on the A770 and the B60 (`jit:gemm:any__i8`, `gemm_tiled_opt__f32`,
+`ocl::moe::moe_3gemm_swiglu_opt___f16`) and none carries any ISA marker.
+Whether the B60 engages its matrix engines where the A770 could not is a real
+question with a real consequence (per-card tuning of prefill and the lm_head),
+but answering it needs instruction-level tracing (onetrace / Level-Zero PTI),
+not `PERF_COUNT`. Recorded so the grep is not proposed again. What decode
+numbers say regardless: nothing in the decode profiles is matrix-engine-shaped
+— chase bytes, not TOPS.
+
+#### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
+
+The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,
+with plugin-managed scales — the real quantised KV that §3.3 refuses to fake
+with a plain cast. Measured on the paged coder (Python driver, greedy, 100
+tokens, one process per cell):
+
+| decode t/s | depth 512 | 4096 | 32768 |
+|---|---|---|---|
+| B60 f16 | 64.5 | 63.3 | 55.4 |
+| B60 **u8** | 64.9 | 63.6 | **56.8** |
+| B60 u4 | 65.2 | 65.4 | **52.0** |
+| A770 f16 / u8 / u4 (512) | 43.4 / 43.5 / 43.2 | 42.4 / 42.9 / — | |
+
+**u8 is never slower, is +2.5% at 32k, and halves KV memory** — at 262k that
+is 5 GiB → 2.5 GiB on the coder. **u4 quarters the memory and costs 6% at
+32k**, and the mechanism is named, not narrated: the profiled 32k step puts
+`PagedAttentionExtension` at 58.6 ms under f16 and **95.4 ms under u4 (+63%)**
+while every other kernel line is identical to the tenth of a millisecond — the
+u4 dequant path costs far more than the 4× bandwidth it saves. So u4 is a
+capacity lever only, priced; u8 is the default candidate.
+
+What is measured about quality so far: greedy token streams under u8/u4
+diverge from f16 within the first tokens (first divergence at token 4–37
+across cells) — a numerics change of the §3.2 near-tie class, not evidence of
+degradation either way. The full 10-point harness at u8 vs f16 is the
+outstanding half of this protocol and needs the C++ paged port (the prototype
+has no HTTP endpoint for the Prüfstand to talk to). No default changes until
+that verdict exists.
+
 ### 7.1 The 35B on the A770: the knob was there all along
 
 For most of this project the record said the 35B could not run on the A770 —
@@ -1380,12 +1447,17 @@ loses end-to-end, because OpenVINO's only supported injection path makes the
 node opaque to its own graph optimiser: RoPE un-fuses into f32 primitives and
 180 previously-eliminated transposes return, costing ~1.6 ms against a 1.08 ms
 win. So the kernel is not the bottleneck and neither is the hardware — the
-shape is. What is worth investigating is a decode-specialised compiled model
-(static `S = 1`) alongside the dynamic one, which would remove these copies
-*and* let every other op pick a specialised kernel; the obstacle is whether
-OpenVINO can share one set of device weights between two compiled models, since
-12.8 GiB twice does not fit. `--custom-kernels` stays as an off-by-default
-measurement switch.
+shape is. The decode-specialised second compiled model that was floated here is
+**dead, question answered**: constant dedup in the GPU plugin is per-compile
+(`ops/constant.cpp:103-172` — read in the third outside review, and now
+**measured**: compiling the 791 MB MTP layer twice takes device residency from
+0.791 to 1.582 GiB, delta exactly one full copy), so two compiled models mean
+two full weight allocations and 12.8 GiB
+twice does not fit either card. The static-shape win goes where it is already
+being collected instead: on the paged path, sequence identity is *input data*
+(`past_lens`, block tables), the transposed subgraph is replaced by the paged
+GDN/conv kernels, and no recompilation exists to want. `--custom-kernels`
+stays as an off-by-default measurement switch.
 
 
 - Exact KV block size (16 vs 32) and q8-KV numerics on Xe — benchmark at M2.
@@ -1398,6 +1470,16 @@ measurement switch.
 - External drafter (dflash-style) for the 3.6 pair: NInfer ships DFlash with
   draft windows up to 15 for exactly this model — evidence the payoff is
   real. Pulled forward to an M4/M5 decision rather than "someday".
+- KV codec beyond u8/i4: NInfer's int8 group-64 codec with a fused 256-wide
+  Hadamard pre-rotation (encode fused into append, decode fused into
+  attention), with published AIME/GPQA quality deltas. Recorded as the known
+  upgrade path — and after the fusion-barrier measurement (§8 above), any
+  custom-kernel proposal here must include a fusion-impact profile of the
+  surrounding graph, not just the kernel micro-benchmark.
+- MoE speculation revisit: blocked on the dense spec-paged numbers landing in
+  the engine. The 1.37× verify-amortisation figure was measured on the
+  *stateful* kernels and must be re-measured on the paged ones before any
+  verdict is reused.
 - **Multimodal** (image/video): confirmed — all three IRs export as
   `*ForConditionalGeneration` (`Qwen3_5MoeForConditionalGeneration`,
   `Qwen3_5ForConditionalGeneration`), so the door is open. v1 is text-only to

@@ -43,6 +43,15 @@ Caution: PERF_COUNT inflates wall clock (53.6 ms for a step whose node sum is
 19.01 ms) and reports the LAST inference. A depth-64 first-step profile said the
 two paths were identical; they are not.
 
+KV precision on the paged path, measured (7.0.3): u8 is never slower, +2.5%
+at 32k depth, and halves KV memory - the default candidate pending the quality
+harness. u4 quarters memory but costs 6% at 32k; mechanism profiled, not
+narrated: PagedAttentionExtension goes 58.6 -> 95.4 ms (+63%) under u4 while
+every other kernel is unchanged. Also measured: device weights are NOT shared
+between compiled models (0.791 -> 1.582 GiB for two compiles of one graph),
+and kernel exec_type strings carry no ISA marker on either card, so the XMX
+question needs Level-Zero tracing, not PERF_COUNT.
+
 tools/paged_spec.py adds speculative decoding on the paged path (dense model,
 MTP head drafting): rollback is row promotion, zero state bytes move on
 rejection. Measured on the B60: 36.1 t/s at depth 512 and 32.1 at 4096 against
