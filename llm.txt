@@ -10,18 +10,36 @@
 
 ## Status
 
-M0 done (e55e33b, reviewed and fixed in 9179f4e): serving skeleton on a stub
-backend. C++20/CMake,
-cpp-httplib + nlohmann/json vendored in third_party/, no network at build
-time. No OpenVINO linked, no weights, no caches — nothing it prints is a
-model result. M1 next: the OpenVINO executor on dirac's B60.
+M0-M3 done, M5's gates done, M4 partial. Serving the real models on Intel Arc
+via OpenVINO: 51.4 t/s decode and up to 2247 t/s prefill on a B60 with the 27B
+coder q4; all three target models reach 10/10 on the fleet harness.
 
-Implemented: the full HTTP surface, allowlist validation, sampler merging,
-stop sequences, UTF-8-safe streaming, tool-call parsing, context-overflow
-rejection, client-disconnect cancellation, console format.
-Not implemented: OpenVINO backend, KV pool, GDN ledger, prefix cache, MTP.
-Placeholders that must not survive M1: the stub tokenizer (a reversible
-splitter, not a BPE) and render_chatml_stub (not the model's template).
+  M0 skeleton                     done
+  M1 executor, greedy, coder/B60  done - 51.4 t/s, 10/10
+  M2 chunked prefill, ledger      done bar the paged path
+  M3 prefix caching               done - warm/cold byte-identical
+  M4 MTP                          sampling done; MTP needs an export with the head
+  M5 all three models             gates done; 35B does not fit the A770
+
+Two M2 walls came down. Slicing logits to the last token before the LM head
+removed an out-of-memory wall at ~8k tokens (the graph computed logits for
+every prompt token: 8.1 GiB at 8k). Storing the attention KV as fp16 by graph
+surgery takes 262144 context from 10.00 to 5.00 GiB - measured 20480 vs 40960
+bytes per context token - which fits the B60's 22.7 GiB alongside 12.8 GiB of
+weights. Neither changes greedy output.
+
+What is left is OpenVINO's paged-attention path. Its decode-side block-table
+convention is undocumented and not yet reverse-engineered; prefill through it
+reproduces the stateful path exactly, decode does not. It is now an
+optimisation (speed, and real q8 KV with scales) rather than a blocker.
+
+Known open, all outside the engine: an export that keeps the Qwen3.8 MTP head
+(the weights exist at /models/gptq/qwen38-gptq-mtp, 15 tensors, unquantised);
+expert offload for the 35B on a 16 GB card, which OpenVINO's fused MoE op does
+not expose; and q8 KV, which needs per-block scales.
+
+Verification: 133 unit cases, a 48-check curl round-trip, an equivalence suite
+that runs where the card is. Clean under ASan and UBSan on x86_64.
 
 ## Contracts
 
@@ -93,8 +111,9 @@ above are authoritative and the allowlist follows them.
 - src/: config, util/ (log, utf8, text), core/ (model_registry, sampling,
   stop, toolcall, chat), exec/ (backend interface + stub), api/ (error,
   handlers), http/ (cpp-httplib wiring).
-- tests/: 96 unit cases (hand-rolled harness, no framework) plus
-  roundtrip.sh, a 48-check curl round-trip. Both wired into ctest.
+- tests/: 133 unit cases (hand-rolled harness, no framework), roundtrip.sh
+  (48 curl checks, both wired into ctest), and equivalence/run.sh which needs
+  a real card.
 - third_party/: cpp-httplib 0.18.3, nlohmann/json 3.11.3, single headers.
 
 ## Build
