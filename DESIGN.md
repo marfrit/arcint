@@ -134,11 +134,29 @@ all differ from the unchunked run.
 §3.4's rule applies to ligence's own configuration first: a path that cannot
 meet the equality gate is configured out, not papered over. So `--prefill-chunk`
 defaults to **0 (unchunked)**, which is the configuration that satisfies the
-gate, and chunking stays available for prompts whose activations would not
-otherwise fit — with a warning at startup and a measured note here. The
-equivalence suite reports the chunking delta rather than gating on it, because
-gating on something the backend cannot deliver would only produce a permanently
-red test.
+gate. The equivalence suite reports the chunking delta rather than gating on it,
+because gating on something the backend cannot deliver would only produce a
+permanently red test.
+
+**But chunking is not optional past a few thousand tokens, and the reason is
+not the KV.** The graph emits `logits` for *every* prompt token —
+`[tokens, 1, 248320]` — so an unchunked 8k prefill materialises 8.1 GiB of
+logits on top of 12.8 GiB of weights, and the B60 answers with
+`CL_OUT_OF_RESOURCES` from oneDNN. The attention KV at that depth is about
+335 MiB; it is nowhere near the problem. Measured on the coder, same card,
+same prompt of ~9.6k tokens:
+
+| prefill | result |
+|---|---|
+| unchunked | HTTP 500, `CL_OUT_OF_RESOURCES` at ~8k tokens |
+| chunked at 512 | 9615 tok in 8.28 s (**1161 t/s**), no allocation failures |
+
+So the two halves of the trade-off are both real: exact but shallow, or deep
+but not bit-exact. Neither can currently be had at once, and pretending
+otherwise by defaulting to chunking would silently give up the equality gate
+for prompts that never needed it. The right fix is to stop materialising
+logits for tokens nobody samples — a graph change, not a flag — and that is
+the first thing to try at M2 proper.
 
 1. **prefill graph** — chunked, variable token count, writes KV pages and GDN
    states.
@@ -427,6 +445,14 @@ One line per event, greppable, no colors by default, `-v` raises verbosity
 - Perf regression tracking against the campaign numbers: B60 ≥ 60 t/s decode
   for the 27B coder q4 (the OpenVINO baseline it must beat to justify its
   existence), A770 ≥ 17 t/s for the dense 3.8.
+- **Prefill, measured through ligence on the B60** (coder q4, chunked at 512):
+  781–1723 t/s across 1.2k–18k tokens, e.g. 9615 tok in 8.28 s (1161 t/s) and
+  18308 tok in 21.1 s (867 t/s). That is one to two orders above the 58 t/s
+  llama.cpp-Vulkan figure below, which was the measured pain this project was
+  started over. Decode at depth is the open problem instead: 51 t/s at short
+  context, but 3.6 t/s at ~2.3k and 0.1 t/s at ~18k on the stateful graph.
+  That collapse is what the paged path exists to fix, and it is the strongest
+  argument for finishing §3.2's decode-side convention.
 - **Prefill is its own bar, not a footnote**: the llama.cpp-Vulkan agent
   measured ~58 t/s prefill on the A770 (six minutes to first token at 21k
   context) while decode quality held (9/10 at 21k depth, failure was an
