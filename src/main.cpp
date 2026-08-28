@@ -136,15 +136,35 @@ int main(int argc, char** argv) {
 
         const int n_ctx = cfg.n_ctx > 0 ? cfg.n_ctx : artifact.n_ctx_train;
         try {
-            backend = lgc::make_ov_backend(artifact, cfg.quant, n_ctx, cfg.device, cfg.cache_dir);
+            backend = lgc::make_ov_backend(artifact, cfg, n_ctx);
         } catch (const std::exception& e) {
             lgc::log::error("load", "could not bring up the OpenVINO executor: %s", e.what());
             return 1;
         }
-        lgc::log::info("load", "n_ctx %d | device %s", n_ctx, cfg.device.c_str());
-        lgc::log::info("mem", "%s",
-                       "cache is inside the OV graph at M1; the paged KV pool and the GDN "
-                       "ledger arrive at M2");
+        lgc::log::info("load", "n_ctx %d | device %s | prefill %s", n_ctx, cfg.device.c_str(),
+                       cfg.prefill_chunk > 0
+                           ? lgc::log::format("chunked at %d tok", cfg.prefill_chunk).c_str()
+                           : "unchunked");
+        if (cfg.prefill_chunk > 0) {
+            lgc::log::warn("load", "%s",
+                           "chunked prefill is not bit-exact on this backend: greedy output "
+                           "can differ from an unchunked run (DESIGN.md 3.2). Use it when the "
+                           "activations would not otherwise fit, not by default.");
+        }
+        if (cfg.prefix_cache_mib > 0) {
+            lgc::log::warn("load", "%s",
+                           "the prefix cache checkpoints mid-prompt, which splits the prefill "
+                           "and therefore inherits that same non-exactness against a "
+                           "cache-off run. Warm-vs-cold equality is unaffected and is the "
+                           "invariant that is gated.");
+        }
+        if (cfg.prefix_cache_mib > 0) {
+            lgc::log::info("mem", "prefix cache %d MiB, block %d tok | state lives in the OV "
+                                  "graph and is checkpointed whole (KV and GDN together)",
+                           cfg.prefix_cache_mib, cfg.kv_block_size);
+        } else {
+            lgc::log::info("mem", "%s", "prefix cache off (--prefix-cache-mib enables it)");
+        }
 #else
         // Unreachable: parse_args refuses --model on a build without OpenVINO.
         lgc::log::error("boot", "%s", "no backend available for --model in this build");

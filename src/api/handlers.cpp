@@ -66,14 +66,20 @@ bool sse_send(const SseWriter& write, const json& payload) {
     return write(frame);
 }
 
-void log_slot_line(int slot, const char* phase, int tokens, double seconds, double rate) {
-    log::info(log::format("slot %d", slot), "%-7s %5d tok in %5.2f s (%5.1f t/s)", phase, tokens,
-              seconds, rate);
+void log_slot_line(int slot, const char* phase, int tokens, double seconds, double rate,
+                   const std::string& suffix = {}) {
+    log::info(log::format("slot %d", slot), "%-7s %5d tok in %5.2f s (%5.1f t/s)%s", phase, tokens,
+              seconds, rate, suffix.c_str());
 }
 
 void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
+    std::string prefill_suffix;
+    if (stats.cache_hit_tokens > 0 && stats.prompt_tokens > 0) {
+        prefill_suffix = log::format(" | cache hit %d tok (%.1f%%)", stats.cache_hit_tokens,
+                                     100.0 * stats.cache_hit_tokens / stats.prompt_tokens);
+    }
     log_slot_line(slot, "prefill", stats.prompt_tokens, stats.prefill_seconds,
-                  stats.prefill_rate());
+                  stats.prefill_rate(), prefill_suffix);
     log_slot_line(slot, "decode", stats.completion_tokens, stats.decode_seconds,
                   stats.decode_rate());
     if (reason == FinishReason::Abort) {

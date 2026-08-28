@@ -27,6 +27,20 @@ struct Config {
     int n_ctx    = 0;  // 0: take the model's trained context
     int parallel = 1;  // slots (DESIGN.md §4 /health reports free/total)
 
+    // Prefill chunk in tokens, 0 = one call for the whole prompt.
+    //
+    // Default off, and that is a correctness decision rather than a
+    // performance one: chunking is NOT bit-exact on the OpenVINO GPU backend
+    // (measured — see DESIGN.md §3.2), so the shipped default is the
+    // configuration that satisfies the equality gate. Chunking remains
+    // available for prompts whose activations will not otherwise fit.
+    int prefill_chunk = 0;
+
+    // Prefix-cache budget in MiB, host-side. Zero disables it. A snapshot of
+    // this architecture's state is tens of MiB (the GDN half is fixed-size), so
+    // this is a real budget, not a formality (§3.3).
+    int prefix_cache_mib = 0;
+
     int         kv_block_size             = 32;      // 16 or 32 — §8 benchmarks this
     std::string kv_dtype                  = "fp16";  // fp16 | q8
     int         gdn_checkpoint_budget_mib = 512;     // §3.3

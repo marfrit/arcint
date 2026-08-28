@@ -54,6 +54,9 @@ std::string usage_text() {
         "memory\n"
         "  --n-ctx N                 context length (default: the model's own)\n"
         "  --kv-block-size 16|32     KV page size in tokens (default: 32)\n"
+        "  --prefill-chunk N         prefill chunk in tokens (0 = unchunked, the\n"
+        "                            default; chunking is not bit-exact here)\n"
+        "  --prefix-cache-mib N      prefix-cache budget in MiB (default: 0, off)\n"
         "  --kv-dtype fp16|q8        KV cache element type (default: fp16)\n"
         "  --gdn-checkpoint-budget N GDN checkpoint budget in MiB (default: 512)\n"
         "  --mtp on|off|auto         speculative decoding (default: auto)\n"
@@ -129,6 +132,14 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             }
         } else if (arg == "--n-ctx") {
             if (!value(v) || !parse_int(v, cfg.n_ctx)) return fail("--n-ctx needs an integer");
+        } else if (arg == "--prefill-chunk") {
+            if (!value(v) || !parse_int(v, cfg.prefill_chunk)) {
+                return fail("--prefill-chunk needs an integer");
+            }
+        } else if (arg == "--prefix-cache-mib") {
+            if (!value(v) || !parse_int(v, cfg.prefix_cache_mib)) {
+                return fail("--prefix-cache-mib needs an integer");
+            }
         } else if (arg == "--kv-block-size") {
             if (!value(v) || !parse_int(v, cfg.kv_block_size)) {
                 return fail("--kv-block-size needs an integer");
@@ -200,6 +211,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.kv_dtype != "fp16" && cfg.kv_dtype != "q8") {
         return fail("--kv-dtype must be fp16 or q8");
     }
+    if (cfg.prefill_chunk < 0) return fail("--prefill-chunk must be >= 0");
+    if (cfg.prefix_cache_mib < 0) return fail("--prefix-cache-mib must be >= 0");
     if (cfg.gdn_checkpoint_budget_mib < 0) {
         return fail("--gdn-checkpoint-budget must be >= 0");
     }

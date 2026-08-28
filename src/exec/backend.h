@@ -68,7 +68,7 @@ struct GenerationInput {
 struct GenerationStats {
     int    prompt_tokens     = 0;
     int    completion_tokens = 0;
-    int    cache_hit_tokens  = 0;  // M3
+    int    cache_hit_tokens  = 0;
     double prefill_seconds   = 0.0;
     double decode_seconds    = 0.0;
 
@@ -108,9 +108,8 @@ struct Artifact;
 
 // M1: the OpenVINO executor. Throws std::runtime_error with a readable message
 // if the artifact cannot be compiled or validated.
-std::unique_ptr<Backend> make_ov_backend(const Artifact& artifact, Quant quant, int n_ctx,
-                                         const std::string& device,
-                                         const std::string& cache_dir);
+struct Config;
+std::unique_ptr<Backend> make_ov_backend(const Artifact& artifact, const Config& cfg, int n_ctx);
 #endif
 
 }  // namespace lgc

@@ -23,7 +23,9 @@
 
 #include <minja/chat-template.hpp>
 
+#include "config.h"
 #include "core/artifact.h"
+#include "core/prefix_cache.h"
 #include "core/sampler.h"
 #include "exec/backend.h"
 #include "util/log.h"
@@ -37,6 +39,11 @@ constexpr const char* kInputsEmbeds  = "inputs_embeds";
 constexpr const char* kAttentionMask = "attention_mask";
 constexpr const char* kPositionIds   = "position_ids";
 constexpr const char* kBeamIdx       = "beam_idx";
+
+// Fixed process-wide key for the prefix hash chain. It is not a secret — the
+// point is that a hash is never trusted on its own; every hit re-verifies the
+// tokens before the state is reused.
+constexpr uint64_t kPrefixCacheKey = 0x6c6967656e636531ull;  // "ligence1"
 
 std::string tokenizers_extension_path() {
     // Shipped alongside the OpenVINO wheel. The path is configuration, not a
@@ -125,12 +132,77 @@ private:
     std::vector<int>  eos_ids_;
 };
 
+// ------------------------------------------------------------ state blobs
+//
+// A cached prefix must restore the attention KV *and* the GDN recurrent state
+// at the same boundary — both or neither (§3.4). On this graph both live as
+// OpenVINO variables, so a snapshot is simply every variable's tensor, and the
+// "both" part is free: there is no way to restore one without the other.
+//
+// Each blob is self-describing (type name, shape, bytes) so a restore never
+// depends on the live state happening to have the same shape it had when the
+// snapshot was taken.
+uint32_t get_u32(const std::vector<uint8_t>& in, size_t& off) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; ++i) v |= static_cast<uint32_t>(in[off + static_cast<size_t>(i)]) << (i * 8);
+    off += 4;
+    return v;
+}
+
+std::vector<uint8_t> serialise_state(const ov::Tensor& t) {
+    const std::string type  = t.get_element_type().get_type_name();
+    const ov::Shape&  shape = t.get_shape();
+
+    // Sized once and filled by offset. Growing it with reserve() plus range
+    // inserts is equivalent but makes GCC -O3 emit a spurious
+    // -Wfree-nonheap-object, and a header this small does not need the
+    // ceremony of proving that diagnostic wrong on every build.
+    const size_t header = 4 + type.size() + 4 + 4 * shape.size();
+    std::vector<uint8_t> out(header + t.get_byte_size());
+
+    size_t off = 0;
+    auto   u32 = [&](uint32_t v) {
+        for (int i = 0; i < 4; ++i) out[off++] = static_cast<uint8_t>(v >> (i * 8));
+    };
+
+    u32(static_cast<uint32_t>(type.size()));
+    std::memcpy(out.data() + off, type.data(), type.size());
+    off += type.size();
+    u32(static_cast<uint32_t>(shape.size()));
+    for (size_t d : shape) u32(static_cast<uint32_t>(d));
+
+    std::memcpy(out.data() + off, t.data(), t.get_byte_size());
+    return out;
+}
+
+ov::Tensor deserialise_state(const std::vector<uint8_t>& blob) {
+    size_t         off = 0;
+    const uint32_t tlen = get_u32(blob, off);
+    const std::string type(reinterpret_cast<const char*>(blob.data() + off), tlen);
+    off += tlen;
+
+    const uint32_t rank = get_u32(blob, off);
+    ov::Shape      shape;
+    shape.reserve(rank);
+    for (uint32_t i = 0; i < rank; ++i) shape.push_back(get_u32(blob, off));
+
+    ov::Tensor t(ov::element::Type(type), shape);
+    std::memcpy(t.data(), blob.data() + off, t.get_byte_size());
+    return t;
+}
+
 // -------------------------------------------------------------------- backend
 class OvBackend final : public Backend {
 public:
-    OvBackend(const Artifact& artifact, Quant quant, int n_ctx, const std::string& device,
-              const std::string& cache_dir)
-        : artifact_(artifact) {
+    OvBackend(const Artifact& artifact, const Config& cfg, int n_ctx)
+        : artifact_(artifact), prefill_chunk_(cfg.prefill_chunk) {
+        const std::string& device    = cfg.device;
+        const std::string& cache_dir = cfg.cache_dir;
+        if (cfg.prefix_cache_mib > 0) {
+            prefix_cache_ = std::make_unique<PrefixCache>(
+                static_cast<size_t>(cfg.prefix_cache_mib) * 1024 * 1024, cfg.kv_block_size,
+                kPrefixCacheKey);
+        }
         core_.add_extension(tokenizers_extension_path());
         if (!cache_dir.empty()) core_.set_property(ov::cache_dir(cache_dir));
 
@@ -195,7 +267,7 @@ public:
                                                            artifact.bos_token, artifact.eos_token);
 
         status_.id               = artifact.id;
-        status_.quant            = quant;
+        status_.quant            = cfg.quant;
         status_.loaded           = true;
         status_.stub             = false;
         status_.n_ctx            = n_ctx > 0 ? n_ctx : artifact.n_ctx_train;
@@ -250,11 +322,33 @@ public:
         // History feeds the penalties; the prompt counts, as it does upstream.
         std::vector<int> history = prompt_ids;
 
-        lm_req_.reset_state();
-
         // -------------------------------------------------------- prefill
         const auto t_prefill = clock::now();
-        ov::Tensor logits    = forward(prompt_ids, /*past=*/0);
+
+        size_t past = 0;
+        if (prefix_cache_ != nullptr) {
+            const PrefixCache::Hit hit = prefix_cache_->lookup(prompt_ids);
+            if (hit.matched_tokens > 0 && restore(*hit.state)) {
+                past                   = hit.matched_tokens;
+                stats.cache_hit_tokens = static_cast<int>(past);
+            } else {
+                lm_req_.reset_state();
+            }
+        } else {
+            lm_req_.reset_state();
+        }
+        if (past == 0) lm_req_.reset_state();
+
+        // The boundary worth remembering is the last block edge strictly inside
+        // the prompt: a snapshot of the whole prompt is useless to this prompt
+        // and only helps a continuation of it, which the same insert covers.
+        const size_t block = prefix_cache_ != nullptr
+                                 ? static_cast<size_t>(prefix_cache_->block_size())
+                                 : 0;
+        const size_t snap_at =
+            block > 0 && prompt_ids.size() > block ? ((prompt_ids.size() - 1) / block) * block : 0;
+
+        ov::Tensor logits = prefill(prompt_ids, past, snap_at);
         stats.prefill_seconds = std::chrono::duration<double>(clock::now() - t_prefill).count();
 
         int next = pick(sampler, logits, history);
@@ -268,7 +362,7 @@ public:
         // --------------------------------------------------------- decode
         const auto   t_decode = clock::now();
         FinishReason reason   = FinishReason::Stop;
-        size_t       past     = prompt_ids.size();
+        past                  = prompt_ids.size();
 
         while (true) {
             if (is_eos(next)) break;
@@ -301,6 +395,57 @@ public:
     }
 
 private:
+    // Chunked prefill (§3.2). Verified byte-identical to a single call at chunk
+    // sizes 32/64/128 on the artifact, which is what makes it safe to use by
+    // default rather than only for prompts that would otherwise not fit.
+    ov::Tensor prefill(const std::vector<int>& tokens, size_t past, size_t snapshot_at) {
+        ov::Tensor   logits;
+        const size_t chunk =
+            prefill_chunk_ > 0 ? static_cast<size_t>(prefill_chunk_) : tokens.size();
+
+        while (past < tokens.size()) {
+            size_t take = std::min(std::max<size_t>(chunk, 1), tokens.size() - past);
+
+            // Stop exactly on the snapshot boundary so the checkpoint lands on a
+            // block edge instead of wherever the chunking happened to land.
+            if (snapshot_at > past && snapshot_at < past + take) take = snapshot_at - past;
+
+            logits = forward({tokens.begin() + static_cast<long>(past),
+                              tokens.begin() + static_cast<long>(past + take)},
+                             past);
+            past += take;
+
+            if (prefix_cache_ != nullptr && past == snapshot_at) {
+                prefix_cache_->insert(tokens, past, snapshot());
+            }
+        }
+        return logits;
+    }
+
+    PrefixCache::StateBlob snapshot() {
+        PrefixCache::StateBlob out;
+        for (ov::VariableState& v : lm_req_.query_state()) {
+            out.push_back(serialise_state(v.get_state()));
+        }
+        return out;
+    }
+
+    bool restore(const PrefixCache::StateBlob& blob) {
+        std::vector<ov::VariableState> states = lm_req_.query_state();
+        if (states.size() != blob.size()) return false;
+        try {
+            for (size_t i = 0; i < states.size(); ++i) {
+                states[i].set_state(deserialise_state(blob[i]));
+            }
+        } catch (const std::exception& e) {
+            log::warn("cache", "state restore failed, falling back to a cold prefill: %s",
+                      e.what());
+            lm_req_.reset_state();
+            return false;
+        }
+        return true;
+    }
+
     // One real forward pass. This is what turns a latent import fault into a
     // startup failure instead of a run of 500s.
     void warmup() {
@@ -359,7 +504,19 @@ private:
 
         embed_req_.set_input_tensor(id_tensor);
         embed_req_.infer();
-        const ov::Tensor embeds = embed_req_.get_output_tensor(0);
+
+        // Copy the embeddings out instead of handing the language model the
+        // embeddings request's own output buffer. Sharing it made chunked
+        // prefill diverge from unchunked: two requests aliasing one tensor is
+        // not something either plugin promises to serialise, and the
+        // equivalence suite caught it as a byte difference rather than a crash.
+        const ov::Tensor src = embed_req_.get_output_tensor(0);
+        if (!embeds_ || embeds_.get_shape() != src.get_shape() ||
+            embeds_.get_element_type() != src.get_element_type()) {
+            embeds_ = ov::Tensor(src.get_element_type(), src.get_shape());
+        }
+        std::memcpy(embeds_.data(), src.data(), src.get_byte_size());
+        const ov::Tensor& embeds = embeds_;
 
         ov::Tensor mask(ov::element::i64, ov::Shape{1, total});
         std::fill_n(mask.data<int64_t>(), total, int64_t{1});
@@ -428,15 +585,16 @@ private:
     ModelStatus                    status_;
     std::mutex                     mutex_;
     std::vector<float>             logit_scratch_;
+    ov::Tensor                     embeds_;
+    int                            prefill_chunk_ = 512;
+    std::unique_ptr<PrefixCache>   prefix_cache_;
     mutable size_t                 position_sections_ = 0;
 };
 
 }  // namespace
 
-std::unique_ptr<Backend> make_ov_backend(const Artifact& artifact, Quant quant, int n_ctx,
-                                         const std::string& device,
-                                         const std::string& cache_dir) {
-    return std::make_unique<OvBackend>(artifact, quant, n_ctx, device, cache_dir);
+std::unique_ptr<Backend> make_ov_backend(const Artifact& artifact, const Config& cfg, int n_ctx) {
+    return std::make_unique<OvBackend>(artifact, cfg, n_ctx);
 }
 
 }  // namespace lgc

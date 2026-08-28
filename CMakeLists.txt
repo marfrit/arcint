@@ -52,6 +52,7 @@ add_library(ligence_core STATIC
   src/util/text.cpp
   src/core/artifact.cpp
   src/core/model_registry.cpp
+  src/core/prefix_cache.cpp
   src/core/sampler.cpp
   src/core/sampling.cpp
   src/core/stop.cpp
@@ -97,6 +98,7 @@ if(LIGENCE_TESTS)
     tests/test_chat.cpp
     tests/test_text.cpp
     tests/test_config.cpp
+    tests/test_prefix_cache.cpp
     tests/test_provenance.cpp
     tests/test_sha256.cpp
   )

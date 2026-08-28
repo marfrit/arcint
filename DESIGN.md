@@ -124,6 +124,22 @@ exactly the handle the GDN ledger and its block-aligned checkpoints need, and
 `ov::pass::SDPAToPagedAttention` is available for the attention side. The
 three entry points below describe M2's shape, not M1's:
 
+**Chunked prefill is not bit-exact on this backend.** Measured 2026-08-28 with
+a pure-Python driver over the same graph, so this is the backend's property and
+not ligence's: splitting a 224-token prefill changes the last-row logits by up
+to ~2.8 in absolute value — kernel-path differences, not rounding noise — and
+at chunk 7 that flips a generated token 25 steps in. Chunk sizes 1, 7 and 64
+all differ from the unchunked run.
+
+§3.4's rule applies to ligence's own configuration first: a path that cannot
+meet the equality gate is configured out, not papered over. So `--prefill-chunk`
+defaults to **0 (unchunked)**, which is the configuration that satisfies the
+gate, and chunking stays available for prompts whose activations would not
+otherwise fit — with a warning at startup and a measured note here. The
+equivalence suite reports the chunking delta rather than gating on it, because
+gating on something the backend cannot deliver would only produce a permanently
+red test.
+
 1. **prefill graph** — chunked, variable token count, writes KV pages and GDN
    states.
 2. **decode graph** — fixed small shapes (1..k tokens per sequence for MTP
@@ -174,6 +190,26 @@ cost of trusting it is every answer.
   degrading to sparser checkpoints *with mandatory recompute of the gap* —
   never to approximate resume.
 
+**What the paged transformation actually offers.** OpenVINO 2026.4's
+`paged_attention_transformation` turns this model's four inputs into 91, and it
+does more than the attention side: alongside `key_cache.0..9` / `value_cache.0..9`
+and the usual `past_lens` / `subsequence_begins` / `block_indices` family, it
+exposes `conv_state_table.0..29` and `gated_delta_state_table.0..29` driven by a
+*separate* linear-attention block table — `la.block_indices`,
+`la.block_indices_begins`, `la.past_lens`, and `la.cache_interval`. That last
+one is precisely the knob this document argues about: upstream sizes the GDN
+checkpoint interval for memory, and §3.3's position is that it should equal the
+KV block size.
+
+Two facts about it, measured: the GPU plugin picks its own quantised KV layout
+(`key_cache [?,2,256,12] u8`, `value_cache [?,2,16,132] u8` — its q8 default,
+one of the two dtypes §3.3 allows), and prefill through this interface
+reproduces the stateful path's first token exactly. The *decode*-side slot
+convention for the `la.*` tables is undocumented and was not reverse-engineered
+here: every convention tried produced correct prefill and degenerate decode. So
+the paged path is understood and reachable but not yet adopted, and the M1/M2
+executor keeps running the graph as exported.
+
 ### 3.4 Prefix caching
 
 - Hash chain over token blocks (content hash, not pointer identity), one entry
@@ -184,6 +220,14 @@ cost of trusting it is every answer.
   checkpoint at the same block boundary. Both or neither — a prefix hit that
   cannot be satisfied for the GDN side falls back to recompute from the
   longest boundary where both exist.
+- **As implemented on the stateful graph, "both or neither" is free.** A
+  checkpoint is every one of the graph's 80 variables — the KV of the 10
+  attention layers and the conv/ssm pairs of the 30 GDN layers — captured
+  through `ov::VariableState`, so there is no way to restore one side without
+  the other. Measured on the b5 artifact: 80 tensors, ~75 MiB for a 282-token
+  prompt (the GDN half is fixed-size and dominates at short context), 0.08 s to
+  snapshot and 0.07 s to restore. Restoring after deliberately poisoning the
+  state with unrelated text reproduces the original continuation exactly.
 - **Invariant (tested in CI, not aspirational):** for any prompt and any cache
   state, greedy output is byte-identical to a cold run. This is the
   anti-CVS-162891 stance: the equivalence test is the *gate*, and a change
@@ -337,9 +381,15 @@ One line per event, greppable, no colors by default, `-v` raises verbosity
   quality under the reference's decoding regime, and the "10/10 greedy" wording
   should be read as "10/10 at the artifact's sampling defaults" until someone
   produces a genuinely greedy 10/10 on this artifact.
-- **Equivalence suite**: cold vs warm prefix cache, cached vs uncached, MTP on
-  vs off (greedy MTP must be output-invariant), chunked vs unchunked prefill —
-  all byte-exact under greedy, all in CI, none skippable.
+- **Equivalence suite**: `tests/equivalence/run.sh`, run where the card is.
+  Green on the b5 coder as of 2026-08-28: two greedy runs byte-identical, warm
+  prefix cache byte-identical to cold, cache hits reported on the console, and
+  a continuation of a cached prompt hitting too. MTP on vs off joins it at M4.
+
+  One line of the original list has been demoted from gate to measurement:
+  chunked vs unchunked prefill, which this backend cannot deliver (see §3.2).
+  It is reported with numbers on every run rather than asserted, and the
+  shipped default is the unchunked configuration that does satisfy equality.
 - **Determinism**: two identical greedy runs produce identical bytes (verified
   on the A770/Vulkan agent baseline as achievable on this hardware class).
 - **In CI today (M0)**: 96 unit cases plus a 48-check curl round-trip, both
@@ -394,8 +444,8 @@ and owns the state.
 |---|---|---|---|
 | M0 | skeleton: HTTP server, /health, /props, console format | curl round-trip | **done** (`e55e33b`) |
 | M1 | single-sequence inference, greedy, 27B coder q4 on B60 | Prüfstand 10/10, ≥ 45 t/s | **done** — 51.4 t/s, 10/10 at artifact sampling defaults (§5) |
-| M2 | paged KV + GDN ledger, chunked prefill | equivalence suite green, 256k context loads | |
-| M3 | prefix caching (block-aligned checkpoints) | warm/cold byte-equality, hit-rate stats on console | |
+| M2 | paged KV + GDN ledger, chunked prefill | equivalence suite green, 256k context loads | partly — suite green, chunking in (not bit-exact, off by default); paged path mapped but not adopted; 256k unproven |
+| M3 | prefix caching (block-aligned checkpoints) | warm/cold byte-equality, hit-rate stats on console | **done** — warm/cold byte-identical, hit stats on console |
 | M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance | |
 | M5 | 35B MoE q4 on A770 (16 GB fit), q8 variants on B60 | all three models pass their gates | |
 
