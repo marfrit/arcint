@@ -1113,6 +1113,31 @@ a fifth of its bandwidth roofline while the dense model sits near 60% of its
 own, so the headroom is on the MoE side — and only the MoE has an external
 baseline on the identical artifact.
 
+#### 7.0.0a The same comparison at depth: 32k context inverts it
+
+The short-prompt A/B above favours GenAI's pipeline by ~10%. At 31930 tokens of
+prompt ("Write a CSV parser in Lua", filler ahead of it, greedy, 120-token
+answers, prefill and decode measured separately — decode via t(240)−t(120) for
+openarc because its prefix cache reuses the prefill and breaks a naive
+subtraction):
+
+| 32k context | prefill | decode |
+|---|---|---|
+| openarc production (B60, GenAI CB) | 867 t/s (36.8 s to first token) | 21.3 t/s |
+| ligence (B60, stateful) | **2444 t/s (13.1 s)** | **32.3 t/s** |
+| ligence (A770, chunk 512) | 901 t/s | 13.4 t/s |
+| openarc / GenAI (A770) | **cannot load this model at all** (§7.0.2a) | — |
+
+At depth the stateful engine beats the production pipeline 2.8× on prefill and
+1.5× on decode — the opposite of the short-prompt result. So "GenAI's pipeline
+is ~10% ahead" is a shallow-context statement only; its scheduler gives back
+far more than 10% at depth. Both engines feel the depth collapse (§5): ligence
+52 → 32.3 t/s from 256 to 32k of context, openarc 51 → 21.3.
+
+Small open lead from the same run: ligence's emit accounting rose to 0.43 s for
+120 tokens at 32k (3.6 ms/token, ~12% of decode) where it is ~0.2 ms/token at
+short context. The graph still dominates; worth a look, not a fire.
+
 ### 7.0.1 The bus was not the explanation — retracted
 
 An earlier version of this section explained the A770's behaviour, and part of
