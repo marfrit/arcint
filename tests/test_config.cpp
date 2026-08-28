@@ -94,7 +94,7 @@ TEST(config_validates_ranges) {
     CHECK(rejected({"--stub", "--parallel", "0"}));
     CHECK(rejected({"--stub", "--n-ctx", "-1"}));
     CHECK(rejected({"--stub", "--kv-block-size", "24"}));
-    CHECK(rejected({"--stub", "--kv-dtype", "fp32"}));
+    CHECK(rejected({"--stub", "--kv-dtype", "bf16"}));  // fp32 is now a valid choice
     CHECK(rejected({"--stub", "--mtp", "maybe"}));
     CHECK(rejected({"--stub", "--quant", "q2"}));
 }
@@ -104,7 +104,7 @@ TEST(config_accepts_the_documented_choices) {
         Config cfg;
         CHECK(run({"--stub", "--kv-block-size", bs}, cfg).ok);
     }
-    for (const char* dt : {"fp16", "q8"}) {
+    for (const char* dt : {"fp16", "q8", "fp32"}) {
         Config cfg;
         CHECK(run({"--stub", "--kv-dtype", dt}, cfg).ok);
     }

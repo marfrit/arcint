@@ -59,7 +59,8 @@ std::string usage_text() {
         "  --prefix-cache-mib N      prefix-cache budget in MiB (default: 0, off)\n"
         "  --no-logits-slice         compute logits for every prompt token (slower,\n"
         "                            and runs out of memory past a few thousand)\n"
-        "  --kv-dtype fp16|q8        KV cache element type (default: fp16)\n"
+        "  --kv-dtype fp16|q8|fp32   stored KV element type (default: fp16;\n"
+        "                            fp32 is what the artifact exports)\n"
         "  --gdn-checkpoint-budget N GDN checkpoint budget in MiB (default: 512)\n"
         "  --mtp on|off|auto         speculative decoding (default: auto)\n"
         "\n"
@@ -212,8 +213,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.kv_block_size != 16 && cfg.kv_block_size != 32) {
         return fail("--kv-block-size must be 16 or 32");
     }
-    if (cfg.kv_dtype != "fp16" && cfg.kv_dtype != "q8") {
-        return fail("--kv-dtype must be fp16 or q8");
+    if (cfg.kv_dtype != "fp16" && cfg.kv_dtype != "q8" && cfg.kv_dtype != "fp32") {
+        return fail("--kv-dtype must be fp16, q8 or fp32");
     }
     if (cfg.prefill_chunk < 0) return fail("--prefill-chunk must be >= 0");
     if (cfg.prefix_cache_mib < 0) return fail("--prefix-cache-mib must be >= 0");

@@ -217,6 +217,23 @@ cost of trusting it is every answer.
 
 ### 3.3 Memory: paged KV + GDN ledger
 
+- **KV storage type is now real, and it is what makes long context fit.** The
+  artifact exports its key/value state as fp32, which at 262144 tokens is
+  ~10.7 GiB against 12.8 GiB of weights — more than a 22.7 GiB card holds.
+  OpenVINO's `KV_CACHE_PRECISION` property is *accepted* on the GPU but has no
+  effect on this stateful graph (measured 2026-08-28: state stayed fp32 and
+  greedy output was byte-identical for both `f16` and `u8`); it governs only the
+  paged path. So `store_kv_state_as` changes the stored type directly —
+  `Convert` on each key/value variable's initialiser, read and assign, then the
+  Variable is relabelled. Compute stays fp32; only storage shrinks, and the GDN
+  conv/ssm variables are untouched because they are fixed-size and are not what
+  grows.
+
+  Measured on the coder: KV **12.9 → 6.0 MiB** at 306 tokens, greedy output
+  **byte-identical** to fp32, about 10% slower from the extra Converts.
+  Extrapolated to 262144 tokens that is 10.7 → 5.4 GiB, putting the coder at
+  ~19.2 GiB on a 22.7 GiB card. `--kv-dtype` defaults to `fp16`; `fp32` gives
+  back what the artifact exports.
 - **KV pages**: fixed block size (16 or 32 tokens, benchmark decides), fp16 or
   q8 per config, pool sized at startup from free VRAM after weights. Standard
   vLLM-style block tables, no eviction in v1 (a full pool rejects admission).

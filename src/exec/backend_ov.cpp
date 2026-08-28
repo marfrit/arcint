@@ -23,6 +23,9 @@
 #include <openvino/openvino.hpp>
 #include <openvino/op/constant.hpp>
 #include <openvino/op/matmul.hpp>
+#include <openvino/op/assign.hpp>
+#include <openvino/op/convert.hpp>
+#include <openvino/op/read_value.hpp>
 #include <openvino/op/slice.hpp>
 
 #include <minja/chat-template.hpp>
@@ -254,6 +257,72 @@ bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model) {
     return true;
 }
 
+// The attention KV is the only part of the state that grows with context: at
+// 262144 tokens it is ~10.7 GiB in fp32 against 12.8 GiB of weights, which does
+// not fit a 22.7 GiB card. The GDN conv/ssm variables are fixed-size and are
+// left alone.
+//
+// OpenVINO's KV_CACHE_PRECISION property is accepted on the GPU but has no
+// effect on this stateful graph (measured: state stays fp32, output unchanged) —
+// it only governs the paged path. So the storage type is changed directly:
+// Convert on each key/value variable's initialiser, on its read, and on its
+// assign, then the Variable itself is relabelled. Compute stays fp32; only what
+// is *stored* shrinks.
+//
+// Measured on the coder: KV 12.9 -> 6.0 MiB at 306 tokens, greedy output
+// byte-identical to fp32, about 10% slower from the extra Converts.
+size_t store_kv_state_as(const std::shared_ptr<ov::Model>& model, const ov::element::Type& type) {
+    auto is_kv = [](const std::string& id) {
+        return id.find(".key.") != std::string::npos || id.find(".value.") != std::string::npos;
+    };
+
+    std::vector<std::shared_ptr<ov::Node>> reads, assigns;
+    for (const auto& node : model->get_ordered_ops()) {
+        const std::string t = node->get_type_name();
+        if (t != "ReadValue" && t != "Assign") continue;
+
+        std::string id;
+        if (auto rv = ov::as_type_ptr<ov::op::v6::ReadValue>(node)) {
+            id = rv->get_variable_id();
+        } else if (auto as = ov::as_type_ptr<ov::op::v6::Assign>(node)) {
+            id = as->get_variable_id();
+        } else {
+            continue;
+        }
+        if (!is_kv(id)) continue;
+        (t == "ReadValue" ? reads : assigns).push_back(node);
+    }
+    if (reads.empty() || reads.size() != assigns.size()) return 0;
+
+    for (const auto& rv : reads) {
+        if (rv->get_input_size() > 0) {
+            auto to_store = std::make_shared<ov::op::v0::Convert>(rv->input_value(0), type);
+            rv->input(0).replace_source_output(to_store->output(0));
+        }
+        // Snapshot the consumers before inserting, or the new Convert rewires
+        // itself onto its own input.
+        auto out       = rv->output(0);
+        auto consumers = out.get_target_inputs();
+        auto back      = std::make_shared<ov::op::v0::Convert>(out, ov::element::f32);
+        for (auto& inp : consumers) inp.replace_source_output(back->output(0));
+    }
+    for (const auto& as : assigns) {
+        auto to_store = std::make_shared<ov::op::v0::Convert>(as->input_value(0), type);
+        as->input(0).replace_source_output(to_store->output(0));
+    }
+
+    size_t relabelled = 0;
+    for (const auto& v : model->get_variables()) {
+        auto info = v->get_info();
+        if (!is_kv(info.variable_id)) continue;
+        info.data_type = type;
+        v->update(info);
+        ++relabelled;
+    }
+    model->validate_nodes_and_infer_types();
+    return relabelled;
+}
+
 // -------------------------------------------------------------------- backend
 class OvBackend final : public Backend {
 public:
@@ -279,6 +348,25 @@ public:
         embed_req_ = embeddings_.create_infer_request();
 
         std::shared_ptr<ov::Model> model = core_.read_model(artifact.language_model_xml);
+
+        if (cfg.kv_dtype != "fp32") {
+            const ov::element::Type kv = cfg.kv_dtype == "q8" ? ov::element::i8 : ov::element::f16;
+            try {
+                const size_t n = store_kv_state_as(model, kv);
+                if (n > 0) {
+                    log::info("load", "attention KV stored as %s (%zu variables); the GDN state "
+                                      "is fixed-size and stays fp32",
+                              cfg.kv_dtype.c_str(), n);
+                } else {
+                    log::warn("load", "%s", "could not retype the KV state; it stays fp32");
+                }
+            } catch (const std::exception& e) {
+                log::warn("load", "KV retype to %s failed, staying fp32: %s", cfg.kv_dtype.c_str(),
+                          e.what());
+                model = core_.read_model(artifact.language_model_xml);
+            }
+        }
+
         if (cfg.slice_logits) {
             if (slice_logits_to_last_token(model)) {
                 log::info("load", "%s", "logits sliced to the last token: prefill computes one "
