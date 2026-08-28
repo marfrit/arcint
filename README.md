@@ -50,9 +50,14 @@ run against a model yet — there is no OpenVINO in the build until M1.
   answer is treated as a bug, not a documented quirk.
 - **[planned]** **Paged KV cache** for the attention layers; block-aligned GDN state
   checkpoints for the linear-attention layers.
-- **[planned]** **MTP speculative decoding** using the models' native multi-token-prediction
-  heads where the checkpoint ships one (Qwen3.8), with a hook for external
-  drafters.
+- **[M4]** **Speculative decoding** with a hard greedy-invariance guarantee: a
+  drafted token is accepted only when it equals what the sampler would have
+  picked anyway, so the answer is byte-identical to non-speculative greedy.
+  Ships with a prompt-lookup drafter (`--draft N`, off by default) through the
+  external-drafter hook; the native MTP head needs an export that keeps it.
+  Measured: 88.6 % acceptance on a copy-the-input prompt — and a **net loss**
+  on the A3B MoE checkpoints, because rolling back 69.9 MiB of mostly-GDN
+  recurrent state costs ~90 ms against a 19 ms decode step. See DESIGN §3.5.1.
 - **[planned]** **Flash-attention-style fused SDPA** on the full-attention layers, where the
   OpenVINO kernel library provides it for the target Xe generation.
 - **[M0]** **Tool-call parsing**: native Qwen tool-call output is returned as structured
@@ -98,8 +103,15 @@ Serving the real models on Intel Arc. Measured on a B60 with the 27B coder q4:
 | M1 executor, greedy, 27B coder on B60 | done — 51.4 t/s, 10/10 |
 | M2 chunked prefill, cache ledger, long context | done — **257,167 tokens loaded** |
 | M3 prefix caching | done — warm/cold byte-identical, hit stats on console |
-| M4 MTP | sampling done; MTP needs an export that keeps the head |
+| M4 MTP | machinery done and measured; MTP itself needs an export that keeps the head |
 | M5 all three models | done — all three serve and reach 10/10; the 35B does not fit the A770 |
+
+M4's machinery is done and measured, and the measurement is the result: greedy
+speculation is byte-identical to plain greedy, reaches 88.6 % acceptance where a
+lookup drafter can work at all, and is still slower than not speculating on the
+MoE checkpoints. It stays off by default. The two things that would change that
+— the paged path, and a dense export with its MTP head — are the same two §3.5
+named before any of it was built.
 
 M2 is done and measured: slicing logits to the last token removed a wall at
 ~8k tokens, storing the attention KV as fp16 took 262144 context from 10.0 GiB
@@ -108,7 +120,7 @@ the artifact's maximum — in 8.1 minutes. What remains is OpenVINO's
 paged-attention path, whose decode-side block-table convention is undocumented;
 it is an optimisation now, not a blocker.
 
-Verification: 133 unit cases, a 48-check curl round-trip, and an equivalence
+Verification: 142 unit cases, a 48-check curl round-trip, and an equivalence
 suite that runs where the card is. Clean under ASan and UBSan on x86_64.
 
 See [DESIGN.md](DESIGN.md) for the architecture and milestones,

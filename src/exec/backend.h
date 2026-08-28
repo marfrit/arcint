@@ -69,6 +69,13 @@ struct GenerationStats {
     int    prompt_tokens     = 0;
     int    completion_tokens = 0;
     int    cache_hit_tokens  = 0;
+    int    draft_proposed    = 0;
+    int    draft_accepted    = 0;
+    // Wall time spent copying the whole model state so a rejected draft can be
+    // rolled back. On the stateful path this is the price of speculation.
+    double draft_rollback_seconds = 0.0;
+    double draft_verify_seconds   = 0.0;   // the one pass that checks all drafts
+    double draft_reforward_seconds = 0.0;  // re-running the accepted prefix after a reject
     double prefill_seconds   = 0.0;
     double decode_seconds    = 0.0;
 

@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -32,6 +33,7 @@
 
 #include "config.h"
 #include "core/artifact.h"
+#include "core/drafter.h"
 #include "core/prefix_cache.h"
 #include "core/sampler.h"
 #include "exec/backend.h"
@@ -214,7 +216,13 @@ ov::Tensor deserialise_state(const std::vector<uint8_t>& blob) {
 // at 2247 t/s and 27444 tok at 732 t/s, greedy output byte-identical to the
 // unsliced graph. It is faster than chunking *and* keeps the equality gate
 // chunking had to give up.
-bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model) {
+// `keep_rows` is 1 for plain decoding. Speculative decoding needs the model's
+// own prediction *at every draft position* to verify a draft, so it asks for
+// the last 1 + draft_tokens rows. That keeps all of the memory win -- the wall
+// was one row per prompt token (8.1 GiB at 8k), not nine rows (5.4 MiB) -- and
+// the last row still means what it meant before, so greedy output is unchanged.
+bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model,
+                                int64_t keep_rows) {
     const auto& results = model->get_results();
     if (results.empty()) return false;
 
@@ -245,7 +253,7 @@ bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model) {
     const int64_t axis = ps.rank().get_length() - 2;  // [..., tokens, hidden]
 
     using ov::op::v0::Constant;
-    const auto start = Constant::create(ov::element::i64, {1}, {int64_t{-1}});
+    const auto start = Constant::create(ov::element::i64, {1}, {-keep_rows});
     const auto stop  = Constant::create(ov::element::i64, {1},
                                        {std::numeric_limits<int64_t>::max()});
     const auto step  = Constant::create(ov::element::i64, {1}, {int64_t{1}});
@@ -330,6 +338,11 @@ public:
         : artifact_(artifact), prefill_chunk_(cfg.prefill_chunk) {
         const std::string& device    = cfg.device;
         const std::string& cache_dir = cfg.cache_dir;
+        if (cfg.draft_tokens > 0) {
+            drafter_     = std::make_unique<NgramDrafter>(static_cast<size_t>(cfg.draft_ngram),
+                                                          static_cast<size_t>(cfg.draft_tokens));
+            draft_tokens_ = static_cast<size_t>(cfg.draft_tokens);
+        }
         if (cfg.prefix_cache_mib > 0) {
             prefix_cache_ = std::make_unique<PrefixCache>(
                 static_cast<size_t>(cfg.prefix_cache_mib) * 1024 * 1024, cfg.kv_block_size,
@@ -368,9 +381,11 @@ public:
         }
 
         if (cfg.slice_logits) {
-            if (slice_logits_to_last_token(model)) {
-                log::info("load", "%s", "logits sliced to the last token: prefill computes one "
-                                        "row instead of one per prompt token");
+            const int64_t keep = static_cast<int64_t>(1 + draft_tokens_);
+            if (slice_logits_to_last_token(model, keep)) {
+                log::info("load", "logits sliced to the last %lld token(s): prefill computes "
+                                  "%lld row(s) instead of one per prompt token",
+                          static_cast<long long>(keep), static_cast<long long>(keep));
             } else {
                 log::warn("load", "%s",
                           "could not find the LM head to slice; prefill will materialise logits "
@@ -494,6 +509,12 @@ public:
         // the two scopes apart and maintains its counts incrementally.
         sampler.set_prompt(prompt_ids);
 
+        // The drafter needs the token sequence itself, not the sampler's counts
+        // — and it needs the prompt in it, because a prompt is exactly where a
+        // lookup drafter finds its matches.
+        std::vector<int> history;
+        if (drafter_ != nullptr) history = prompt_ids;
+
         // -------------------------------------------------------- prefill
         const auto t_prefill = clock::now();
 
@@ -536,29 +557,158 @@ public:
         FinishReason reason   = FinishReason::Stop;
         past                  = prompt_ids.size();
 
+        // Emits one committed token; returns false when the caller wants to stop.
+        auto commit = [&](int tok, Control& out) {
+            ++stats.completion_tokens;
+            out = on_piece(tokenizer_->decode_one(tok), tok);
+            sampler.observe(tok);
+            if (drafter_ != nullptr) history.push_back(tok);
+            return out == Control::Continue;
+        };
+
         while (true) {
             if (is_eos(next)) break;
             if (in.sampler.max_tokens >= 0 && stats.completion_tokens >= in.sampler.max_tokens) {
                 reason = FinishReason::Length;
                 break;
             }
-            if (status_.n_ctx > 0 &&
-                static_cast<int>(past) + 1 >= status_.n_ctx) {
+            if (status_.n_ctx > 0 && static_cast<int>(past) + 1 >= status_.n_ctx) {
                 reason = FinishReason::Length;
                 break;
             }
 
-            ++stats.completion_tokens;
-            const Control c = on_piece(tokenizer_->decode_one(next), next);
-            if (c == Control::Stop) break;
-            if (c == Control::Cancel) {
-                reason = FinishReason::Abort;
+            Control c = Control::Continue;
+            if (!commit(next, c)) {
+                reason = c == Control::Cancel ? FinishReason::Abort : reason;
                 break;
             }
 
-            sampler.observe(next);
-            logits = forward({next}, past);
-            ++past;
+            // ------------------------------------------------ speculative step
+            //
+            // Only under greedy: acceptance is "the token the sampler would
+            // have picked here equals the guess", which makes the output
+            // identical to non-speculative greedy by construction. Under
+            // sampling the same test would change the distribution, so drafting
+            // stays off there rather than being approximately right.
+            //
+            // "The sampler would have picked" is not the raw argmax: penalties
+            // are applied before greedy chooses, so repetition_penalty (1.05 by
+            // default) can move the answer. Verifying on a raw argmax silently
+            // diverged from non-speculative greedy at draft 8.
+            std::vector<int> drafts;
+            if (drafter_ != nullptr && in.sampler.greedy()) {
+                drafts = drafter_->draft(history, draft_tokens_);
+            }
+
+            if (drafts.empty()) {
+                logits = forward({next}, past);
+                ++past;
+                next = pick(sampler, logits);
+                continue;
+            }
+
+            // Verify all drafts in ONE forward pass: rows 0..k predict the
+            // tokens after next, d1, ... dk respectively.
+            //
+            // The snapshot is taken *before* the verify pass and checked here,
+            // because once the pass has run the state has absorbed every draft
+            // and there is no honest way back without it. Recovering after the
+            // fact would mean decoding from a state that holds tokens the model
+            // never committed to -- so if the snapshot fails, do not speculate.
+            const auto t_snap       = clock::now();
+            const bool rollbackable = snapshot_tensors(rollback_);
+            stats.draft_rollback_seconds +=
+                std::chrono::duration<double>(clock::now() - t_snap).count();
+
+            if (!rollbackable) {
+                log::warn("draft", "%s", "cannot snapshot the state, so a rejected draft could "
+                                         "not be rolled back; disabling speculation");
+                drafter_.reset();
+                logits = forward({next}, past);
+                ++past;
+                next = pick(sampler, logits);
+                continue;
+            }
+
+            std::vector<int> seq;
+            seq.reserve(1 + drafts.size());
+            seq.push_back(next);
+            seq.insert(seq.end(), drafts.begin(), drafts.end());
+
+            const auto t_verify = clock::now();
+            logits              = forward(seq, past);
+            stats.draft_verify_seconds +=
+                std::chrono::duration<double>(clock::now() - t_verify).count();
+            stats.draft_proposed += static_cast<int>(drafts.size());
+
+            // Verification needs one logits row per drafted position. If the
+            // graph gives fewer, every draft would be rejected forever and the
+            // only symptom would be a slow 0% -- so say so and stop drafting.
+            const size_t rows = logits.get_size() / logits.get_shape().back();
+            if (rows < seq.size()) {
+                log::warn("draft",
+                          "the graph returned %zu logits row(s) for %zu tokens; drafts cannot "
+                          "be verified, disabling speculation",
+                          rows, seq.size());
+                drafter_.reset();
+                restore_tensors(rollback_);
+                logits = forward({next}, past);
+                ++past;
+                next = pick(sampler, logits);
+                continue;
+            }
+
+            // Accept and commit in one pass, in the same order the plain path
+            // uses. Committing as we go is what makes the penalty state correct
+            // for the next verification: draft i+1 must be judged against a
+            // sampler that has already seen draft i.
+            size_t accepted = 0;
+            bool   stop     = false;
+            for (size_t i = 0; i < drafts.size(); ++i) {
+                if (pick_row(sampler, logits, i) != drafts[i]) break;
+                ++accepted;
+
+                // A drafted token clears the same gates, in the same order, as
+                // one the loop head picked normally -- otherwise speculation
+                // emits past EOS or past max_tokens and the answer differs.
+                if (is_eos(drafts[i])) { stop = true; break; }
+                if (in.sampler.max_tokens >= 0 &&
+                    stats.completion_tokens >= in.sampler.max_tokens) {
+                    reason = FinishReason::Length;
+                    stop   = true;
+                    break;
+                }
+                if (status_.n_ctx > 0 &&
+                    static_cast<int>(past + i) + 1 >= status_.n_ctx) {
+                    reason = FinishReason::Length;
+                    stop   = true;
+                    break;
+                }
+                if (!commit(drafts[i], c)) {
+                    reason = c == Control::Cancel ? FinishReason::Abort : reason;
+                    stop   = true;
+                    break;
+                }
+            }
+            stats.draft_accepted += static_cast<int>(accepted);
+            if (stop) break;
+
+            if (accepted < drafts.size()) {
+                // Over-advanced by the rejected tail. Roll the state back and
+                // re-run only what was accepted; without this the cache would
+                // hold tokens the model never committed to.
+                const auto t_restore = clock::now();
+                restore_tensors(rollback_);
+                stats.draft_rollback_seconds +=
+                    std::chrono::duration<double>(clock::now() - t_restore).count();
+                std::vector<int> keep(seq.begin(), seq.begin() + static_cast<long>(1 + accepted));
+                const auto t_re = clock::now();
+                logits          = forward(keep, past);
+                stats.draft_reforward_seconds +=
+                    std::chrono::duration<double>(clock::now() - t_re).count();
+            }
+
+            past += 1 + accepted;
             next = pick(sampler, logits);
         }
 
@@ -598,6 +748,55 @@ private:
             }
         }
         return logits;
+    }
+
+    // Rollback needs a copy of the state, not a *serialised* copy of it: the
+    // prefix cache's blob format exists so an entry can be validated against a
+    // shape it no longer knows, which a buffer that lives for one decode step
+    // never needs. Skipping the header and the second memcpy makes speculation
+    // pay only for the device read.
+    bool snapshot_tensors(std::vector<ov::Tensor>& out) {
+        try {
+            std::vector<ov::VariableState> states = lm_req_.query_state();
+            out.resize(states.size());
+            for (size_t i = 0; i < states.size(); ++i) {
+                const ov::Tensor src = states[i].get_state();
+                if (!out[i] || out[i].get_element_type() != src.get_element_type() ||
+                    out[i].get_shape() != src.get_shape()) {
+                    out[i] = ov::Tensor(src.get_element_type(), src.get_shape());
+                }
+                src.copy_to(out[i]);
+            }
+            if (!logged_rollback_size_) {
+                logged_rollback_size_ = true;
+                size_t bytes = 0;
+                for (const ov::Tensor& t : out) bytes += t.get_byte_size();
+                log::info("draft", "speculation rolls back %.1f MiB of state per decode step "
+                                   "across %zu variables",
+                          static_cast<double>(bytes) / (1024.0 * 1024.0), out.size());
+            }
+            return true;
+        } catch (const std::exception& e) {
+            log::warn("draft", "state snapshot failed, speculation disabled: %s", e.what());
+            out.clear();
+            return false;
+        }
+    }
+
+    bool restore_tensors(const std::vector<ov::Tensor>& in) {
+        std::vector<ov::VariableState> states = lm_req_.query_state();
+        if (states.size() != in.size()) return false;
+        try {
+            for (size_t i = 0; i < states.size(); ++i) {
+                // set_state() copies into the request's own buffer, so the
+                // scratch tensor stays ours to overwrite next round.
+                states[i].set_state(in[i]);
+            }
+            return true;
+        } catch (const std::exception& e) {
+            log::warn("draft", "state restore failed: %s", e.what());
+            return false;
+        }
     }
 
     // Mirrors restore()'s contract: a failure degrades to "no caching", never
@@ -648,6 +847,32 @@ private:
     // startup failure instead of a run of 500s.
     void warmup() {
         forward({0}, 0);
+        lm_req_.reset_state();
+        if (std::getenv("LIGENCE_BENCH_FORWARD") != nullptr) bench_forward();
+    }
+
+    // Speculative decoding only pays when a k-token forward costs about what a
+    // 1-token forward costs. On a hybrid GDN model that is an open question --
+    // 30 of 40 layers are a recurrent scan -- so measure it rather than assume
+    // it. Prints ms per forward and the cost relative to a single token.
+    void bench_forward() {
+        const size_t past = 512;
+        std::vector<int> warm(past, 0);
+        double one = 0.0;
+        for (size_t k : {size_t{1}, size_t{2}, size_t{3}, size_t{5}, size_t{9},
+                         size_t{17}, size_t{33}, size_t{65}}) {
+            lm_req_.reset_state();
+            forward(warm, 0);
+            std::vector<int> ids(k, 0);
+            const auto t0 = std::chrono::steady_clock::now();
+            const int reps = 5;
+            for (int r = 0; r < reps; ++r) forward(ids, past + k * static_cast<size_t>(r));
+            const double ms = 1000.0 * seconds_since(t0) / reps;
+            if (k == 1) one = ms;
+            log::info("bench", "forward(%2zu tok) %7.2f ms  = %5.2fx one token  "
+                               "(%6.2f ms/token)",
+                      k, ms, one > 0.0 ? ms / one : 1.0, ms / static_cast<double>(k));
+        }
         lm_req_.reset_state();
     }
 
@@ -761,14 +986,25 @@ private:
     // Copies the last logit row out of the graph's output tensor and hands it
     // to the sampler. The copy is deliberate: the sampler mutates the row for
     // penalties, and the tensor belongs to the InferRequest.
-    int pick(Sampler& sampler, const ov::Tensor& logits) {
-        const ov::Shape& shape = logits.get_shape();
-        const size_t     vocab = shape.back();
-        const size_t     rows  = logits.get_size() / vocab;
-        const float*     row   = logits.data<const float>() + (rows - 1) * vocab;
+    // The sampler's decision for one row of a [tokens, 1, vocab] logits tensor.
+    // Verification and normal picking go through the same call so that they can
+    // never drift apart.
+    int pick_row(Sampler& sampler, const ov::Tensor& logits, size_t row) {
+        const size_t vocab = logits.get_shape().back();
+        const size_t rows  = logits.get_size() / vocab;
+        // Out of range is a graph/plumbing bug, not a draft miss. Returning -1
+        // guarantees rejection (token ids are non-negative) so output stays
+        // correct, and the caller reports it instead of silently accepting 0%.
+        if (row >= rows) return -1;
 
-        logit_scratch_.assign(row, row + vocab);
+        const float* p = logits.data<const float>() + row * vocab;
+        logit_scratch_.assign(p, p + vocab);
         return sampler.sample(logit_scratch_.data(), vocab);
+    }
+
+    int pick(Sampler& sampler, const ov::Tensor& logits) {
+        const size_t vocab = logits.get_shape().back();
+        return pick_row(sampler, logits, logits.get_size() / vocab - 1);
     }
 
     Artifact                       artifact_;
@@ -787,6 +1023,10 @@ private:
     int                            prefill_chunk_ = 512;
     size_t                         state_bytes_   = 0;
     std::unique_ptr<PrefixCache>   prefix_cache_;
+    std::vector<ov::Tensor>        rollback_;   // reused speculation scratch
+    bool                           logged_rollback_size_ = false;
+    std::unique_ptr<Drafter>       drafter_;
+    size_t                         draft_tokens_ = 0;
     mutable size_t                 position_sections_ = 0;
 };
 

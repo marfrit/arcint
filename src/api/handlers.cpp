@@ -80,8 +80,16 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
     }
     log_slot_line(slot, "prefill", stats.prompt_tokens, stats.prefill_seconds,
                   stats.prefill_rate(), prefill_suffix);
+    std::string decode_suffix;
+    if (stats.draft_proposed > 0) {
+        decode_suffix = log::format(
+            " | draft accept %.1f%% (%d/%d), verify %.2f s, re-forward %.2f s, rollback %.2f s",
+            100.0 * stats.draft_accepted / stats.draft_proposed, stats.draft_accepted,
+            stats.draft_proposed, stats.draft_verify_seconds, stats.draft_reforward_seconds,
+            stats.draft_rollback_seconds);
+    }
     log_slot_line(slot, "decode", stats.completion_tokens, stats.decode_seconds,
-                  stats.decode_rate());
+                  stats.decode_rate(), decode_suffix);
     if (reason == FinishReason::Abort) {
         log::info(log::format("slot %d", slot), "%s", "aborted: client gone");
     }

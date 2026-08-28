@@ -58,6 +58,13 @@ struct Config {
     int         gdn_checkpoint_budget_mib = 512;     // §3.3
     std::string mtp                       = "auto";  // on | off | auto
 
+    // Speculative decoding through the external-drafter hook (DESIGN.md §3.5).
+    // 0 disables it. No export currently carries an MTP head, so the drafter is
+    // weightless n-gram lookup; swapping in a head later changes only the
+    // source of the guesses.
+    int draft_tokens = 0;
+    int draft_ngram  = 3;
+
     // Stub-only: milliseconds of artificial latency per emitted token. Exists
     // so the cancellation path (§3.7) can be demonstrated against a backend
     // that would otherwise finish before a client could disconnect.

@@ -58,6 +58,7 @@ add_library(ligence_core STATIC
   src/core/stop.cpp
   src/core/toolcall.cpp
   src/core/chat.cpp
+  src/core/drafter.cpp
   src/exec/backend_stub.cpp
   src/api/error.cpp
   src/api/handlers.cpp
@@ -96,6 +97,7 @@ if(LIGENCE_TESTS)
     tests/test_stop.cpp
     tests/test_registry.cpp
     tests/test_chat.cpp
+    tests/test_drafter.cpp
     tests/test_text.cpp
     tests/test_config.cpp
     tests/test_prefix_cache.cpp

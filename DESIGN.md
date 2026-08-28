@@ -382,6 +382,118 @@ The plan below stands unchanged for the day both arrive:
 - MTP interacts with the caches trivially by design: draft tokens live in
   scratch pages and are promoted only on acceptance.
 
+#### 3.5.1 The machinery, built and measured against a drafter that needs no head
+
+The paragraphs above were arithmetic. The external-drafter hook makes them
+measurable, because a prompt-lookup (n-gram) drafter needs no weights at all:
+it proposes the continuation that followed the last time the current suffix
+appeared. `--draft N --draft-ngram K` turns it on; it is **off by default**.
+
+Speculation runs only under greedy, and acceptance is defined as *the token the
+sampler would have picked here equals the guess* — which makes the output
+identical to non-speculative greedy by construction. Two details make that true
+rather than merely intended, and both were bugs first:
+
+- **Acceptance is the sampler's decision, not a raw argmax.** Penalties are
+  applied before greedy chooses (§3.6), and `repetition_penalty` defaults to
+  1.05, so the raw argmax is a *different predicate*. Verifying on it diverged
+  from non-speculative greedy at draft 8 while passing at 2 and 4 — a wrong
+  answer that only appears at some draft widths.
+- **A drafted token clears the same gates, in the same order, as a normally
+  picked one** (EOS, `max_tokens`, `n_ctx`). Committing accepted drafts without
+  them emitted 283 tokens where the plain path emitted 281.
+
+Verification also needs one logits row *per drafted position*, which collided
+with §3.2's logits slice: that slice kept exactly one row, and the verifier's
+row lookup clamped out-of-range indices onto it, so every draft was compared
+against the prediction after the *last* draft token. Nothing ever matched. The
+slice now keeps the last `1 + draft_tokens` rows — 5.4 MiB against the 8.1 GiB
+the slice exists to avoid, so the memory win is untouched — and an out-of-range
+row returns −1 (guaranteed rejection) and is reported rather than clamped.
+
+**Measured on the B60, 27B coder q4, greedy, a prompt whose answer is a verbatim
+copy of its input** (a best case for lookup drafting; all four runs produced a
+byte-identical answer):
+
+| | decode | accept | verify | re-forward | rollback |
+|---|---|---|---|---|---|
+| no drafting | **52.1 t/s** | — | — | — | — |
+| `--draft 2` | 19.3 t/s | 88.6 % | 4.06 s | 1.32 s | 8.99 s |
+| `--draft 4` | 19.8 t/s | 69.6 % | 4.05 s | 2.25 s | 7.77 s |
+| `--draft 8` | 24.4 t/s | 57.8 % | 3.40 s | 2.23 s | 5.72 s |
+
+On free-form prose the same drafter accepts 0.0 % — a lookup drafter has
+nothing to look up — which is why the equivalence suite gates acceptance on a
+copy-the-input prompt as well as gating byte-identity.
+
+**The prediction above was right, and the reason is sharper than expected.**
+Rollback is 51–62 % of decode time. It is a copy of 69.9 MiB across 80
+variables per decode step, and since fp16 KV at this length is only ~14 MiB,
+*most of it is the fixed-size GDN recurrent state* — so the cost does not shrink
+with context, it is ~90 ms every step against a 19 ms decode step. Replacing the
+prefix cache's serialised blob with a straight reused-tensor copy moved it by
+1 % (9.15 s → 9.03 s), which locates the cost inside OpenVINO's
+`VariableState::get_state()`/`set_state()` rather than in anything this
+repository can restructure.
+
+Netting rollback out entirely, verify + re-forward is 5.40 / 6.04 / 5.41 s
+against a 5.40 s baseline: **even with free rollback, speculation is only
+break-even here.** The second reason is that a batched verify is not nearly
+free on this model — `forward(9)` costs 2.2–3.4× `forward(1)` — so the pass
+that is supposed to be amortised is not.
+
+That second reason is where the dense model differs, and it is why MTP is a
+Qwen3.8 feature rather than a general one: on an A3B MoE, the tokens in a verify
+pass route to *different experts*, so a k-token pass reads several times the
+expert weight volume of a 1-token pass. A dense FFN serves every token in the
+pass from the same weights, so the verify pass amortises the way speculation
+assumes. Measured `forward(k) / forward(1)` at past = 512:
+
+| k | 1 | 2 | 3 | 5 | 9 | 17 | 33 | 65 |
+|---|---|---|---|---|---|---|---|---|
+| MoE coder (184 experts) | 1.00× | 1.44× | 1.31× | 1.37× | 2.16× | 2.46× | 2.59× | 4.31× |
+| dense Qwen3.8-27B | 1.00× | **1.14×** | **1.05×** | **1.08×** | **1.43×** | 1.45× | 1.84× | 1.92× |
+
+A 5-token verify pass costs 1.08× a single step on the dense model against
+1.37× on the MoE, and a 9-token pass 1.43× against 2.16×. Verifying a draft of
+four is very nearly free on the dense checkpoint and is not on the MoE. This is
+the mechanical reason MTP is a Qwen3.8 feature here rather than a general one,
+and it agrees with where the head actually ships.
+
+Running the same measurement against the dense checkpoint confirms it, and
+turns the conclusion around. Same prompt, same drafter, B60:
+
+| dense Qwen3.8-27B | decode | accept | verify | re-forward | rollback |
+|---|---|---|---|---|---|
+| no drafting | 19.9 t/s | — | — | — | — |
+| `--draft 4` | 11.4 t/s | 69.6 % | 5.23 s | 2.78 s | 16.37 s |
+| `--draft 8` | 14.9 t/s | 57.8 % | 4.18 s | 2.62 s | 11.89 s |
+
+Net of rollback, verify + re-forward is 8.01 s and 6.80 s against a 14.10 s
+baseline — **1.76× and 2.07× faster.** On the MoE the same subtraction gave
+break-even. So speculation on the dense model is worth a genuine 2×, and the
+*only* thing standing between the engine and it is the state rollback — which
+is larger here, not smaller: **171.3 MiB across 128 variables** against the
+MoE's 69.9 MiB across 80, because the dense checkpoint has 64 layers (48 of
+them GDN) at n_embd 5120. Rollback is 63–67 % of decode time and turns a 2×
+win into a 1.3–1.7× loss.
+
+So the conclusion is bounded, and it reprioritises the paged path:
+
+- **On the A3B MoE checkpoints, speculation cannot pay on the stateful path**
+  regardless of rollback — the verify pass does not amortise (`forward(9)` is
+  2.2× `forward(1)`) because the tokens in a pass route to different experts.
+- **On the dense checkpoint it pays 2×**, and is lost entirely to rollback.
+- Therefore the paged decode convention (§3.3, currently listed as an
+  optimisation) is not an optimisation for M4 — it is the precondition, and it
+  is worth about 2× decode on Qwen3.8. That is a sharper reason to finish it
+  than "real q8 KV with scales".
+
+Both of M4's blockers are the ones §3.5 named before any of this was built: the
+paged path, and an export that keeps the head. What is new is that they are now
+measured rather than estimated, the machinery is in place behind them, and the
+invariant they have to preserve is gated in CI.
+
 ### 3.6 Sampling
 
 Greedy, temperature, top-k, top-p, repetition penalty, presence and frequency

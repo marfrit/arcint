@@ -63,6 +63,8 @@ std::string usage_text() {
         "                            fp32 is what the artifact exports)\n"
         "  --gdn-checkpoint-budget N GDN checkpoint budget in MiB (default: 512)\n"
         "  --mtp on|off|auto         speculative decoding (default: auto)\n"
+        "  --draft N                 speculative draft length, 0 = off\n"
+        "  --draft-ngram K           drafter match length (default: 3)\n"
         "\n"
         "misc\n"
         "  -v, -vv                   raise console verbosity\n"
@@ -156,6 +158,14 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.gdn_checkpoint_budget_mib)) {
                 return fail("--gdn-checkpoint-budget needs an integer");
             }
+        } else if (arg == "--draft") {
+            if (!value(v) || !parse_int(v, cfg.draft_tokens)) {
+                return fail("--draft needs an integer");
+            }
+        } else if (arg == "--draft-ngram") {
+            if (!value(v) || !parse_int(v, cfg.draft_ngram)) {
+                return fail("--draft-ngram needs an integer");
+            }
         } else if (arg == "--mtp") {
             if (!value(v)) return fail("--mtp needs a value");
             cfg.mtp = std::string(v);
@@ -227,6 +237,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         return fail("--kv-dtype must be fp16 or fp32");
     }
     if (cfg.prefill_chunk < 0) return fail("--prefill-chunk must be >= 0");
+    if (cfg.draft_tokens < 0) return fail("--draft must be >= 0");
+    if (cfg.draft_ngram < 1) return fail("--draft-ngram must be >= 1");
     if (cfg.prefix_cache_mib < 0) return fail("--prefix-cache-mib must be >= 0");
     if (cfg.gdn_checkpoint_budget_mib < 0) {
         return fail("--gdn-checkpoint-budget must be >= 0");

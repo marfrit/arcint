@@ -10,7 +10,7 @@
 
 ## Status
 
-M0-M3 done, M5's gates done, M4 partial. Serving the real models on Intel Arc
+M0-M3 done, M5's gates done, M4's machinery done and measured. Serving the real models on Intel Arc
 via OpenVINO: 51.4 t/s decode and up to 2247 t/s prefill on a B60 with the 27B
 coder q4; all three target models reach 10/10 on the fleet harness.
 
@@ -18,7 +18,7 @@ coder q4; all three target models reach 10/10 on the fleet harness.
   M1 executor, greedy, coder/B60  done - 51.4 t/s, 10/10
   M2 chunked prefill, ledger      done bar the paged path
   M3 prefix caching               done - warm/cold byte-identical
-  M4 MTP                          sampling done; MTP needs an export with the head
+  M4 MTP                          machinery done + measured; head needs an export
   M5 all three models             gates done; 35B does not fit the A770
 
 Two M2 walls came down. Slicing logits to the last token before the LM head
@@ -30,15 +30,17 @@ weights. Neither changes greedy output.
 
 What is left is OpenVINO's paged-attention path. Its decode-side block-table
 convention is undocumented and not yet reverse-engineered; prefill through it
-reproduces the stateful path exactly, decode does not. It is now an
-optimisation (speed, and real q8 KV with scales) rather than a blocker.
+reproduces the stateful path exactly, decode does not. M4's measurements
+promoted it: it is the precondition for speculative decoding paying at all
+(rollback becomes block-table arithmetic instead of a 171 MiB state copy),
+worth ~2x decode on the dense model, on top of speed and real q8 KV.
 
 Known open, all outside the engine: an export that keeps the Qwen3.8 MTP head
 (the weights exist at /models/gptq/qwen38-gptq-mtp, 15 tensors, unquantised);
 expert offload for the 35B on a 16 GB card, which OpenVINO's fused MoE op does
 not expose; and q8 KV, which needs per-block scales.
 
-Verification: 133 unit cases, a 48-check curl round-trip, an equivalence suite
+Verification: 142 unit cases, a 48-check curl round-trip, an equivalence suite
 that runs where the card is. Clean under ASan and UBSan on x86_64.
 
 ## Contracts
@@ -79,9 +81,21 @@ above are authoritative and the allowlist follows them.
 - GDN state checkpoints are block-aligned with KV pages so prefix-cache hits
   restore both sides exactly; no approximate resume, ever.
 - Prefix index: keyed 128-bit block hashes with token verification on hit.
-- MTP: native head for Qwen3.8 (draft n, verify in one decode call);
-  external-drafter hook later. Draft tokens in scratch pages, promoted on
-  acceptance.
+- Speculative decoding is implemented and gated on greedy-invariance: a draft
+  is accepted only if it equals what the sampler would have picked, so output
+  is byte-identical to plain greedy. Prompt-lookup drafter ships (--draft N,
+  off by default); the native Qwen3.8 MTP head needs an export that keeps it.
+  Measured a net loss as shipped, for two separable reasons. (1) Rollback:
+  copying the graph state per decode step costs 51-67% of decode time - 69.9
+  MiB/80 vars on the MoE, 171.3 MiB/128 vars on the dense model, mostly the
+  fixed-size GDN recurrent state, so it does not shrink with context. It is
+  inside OV's VariableState get_state/set_state; bypassing the prefix cache's
+  serialiser moved it 1%. (2) Amortisation: a k-token verify pass is nearly
+  free on dense (forward(5) = 1.08x forward(1)) but not on MoE (1.37x), because
+  MoE tokens route to different experts. Net of rollback, dense speculation is
+  1.76-2.07x faster and MoE is break-even. So the paged path is not an
+  optimisation for M4, it is the precondition, worth ~2x on Qwen3.8.
+  DESIGN 3.5.1.
 - Compiled-blob disk cache in weightless mode with absolute weight paths
   (avoids openvino#37607 embedded-weights import bug).
 - Quant: q4/q8 weights, fp16/q8 KV. Single GPU, single process, Xe KMD only.

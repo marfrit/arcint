@@ -100,6 +100,52 @@ for chunk in 1 7 64; do
   fi
 done
 
+# ------------------------------ speculative decoding is output-invariant (§3.5)
+#
+# The exit criterion for M4 is "greedy-invariance with MTP on, measured
+# acceptance". Acceptance here is "the model's own argmax equals the guess", so
+# the output must be bit-identical to a non-speculative greedy run. If it is
+# not, the accept test is wrong and the speedup is a lie.
+for draft in 2 4 8; do
+  start_server "$WORK/d$draft.log" --draft "$draft" --draft-ngram 3 || exit 1
+  ask "$WORK/draft$draft.txt" "$PROMPT"
+  cmp -s "$WORK/base.txt" "$WORK/draft$draft.txt" \
+    && pass "draft $draft is byte-identical to non-speculative greedy" \
+    || fail "draft $draft is byte-identical to non-speculative greedy"
+  acc=$(grep -o 'draft accept [0-9.]*%' "$WORK/d$draft.log" | tail -1)
+  [[ -n "$acc" ]] && echo "     draft $draft: ${acc}" \
+                  || echo "     draft $draft: the drafter never fired on this prompt"
+done
+
+# Byte-identity alone is not enough: a verifier that rejects *everything* also
+# passes it, silently, at 0% acceptance. That is exactly what a too-narrow
+# logits slice did -- the graph returned one row, every draft was compared
+# against the same row, and nothing ever matched. So gate on a prompt whose
+# answer is a copy of its input, where a lookup drafter must hit, and require
+# both byte-identity and a non-zero acceptance rate.
+REPEAT_PROMPT="Repeat the following Python code back to me character for \
+character. Output nothing else, no commentary, no fences.\n\ndef step_one(state, \
+payload):\n    state.counter += 1\n    return payload.transform(state)\n\ndef \
+step_two(state, payload):\n    state.counter += 2\n    return \
+payload.transform(state)\n"
+
+start_server "$WORK/rbase.log" || exit 1
+ask "$WORK/rbase.txt" "$REPEAT_PROMPT"
+start_server "$WORK/rdraft.log" --draft 4 --draft-ngram 3 || exit 1
+ask "$WORK/rdraft.txt" "$REPEAT_PROMPT"
+
+cmp -s "$WORK/rbase.txt" "$WORK/rdraft.txt" \
+  && pass "a copy-the-input prompt is byte-identical with draft 4" \
+  || fail "a copy-the-input prompt is byte-identical with draft 4"
+
+racc=$(grep -o 'draft accept \([0-9.]*\)%' "$WORK/rdraft.log" | tail -1 \
+       | grep -o '[0-9.]*')
+if [[ -n "$racc" ]] && awk "BEGIN{exit !(${racc:-0} > 10)}"; then
+  pass "the drafter is actually accepting (${racc}% where a copy is expected)"
+else
+  fail "the drafter is actually accepting (got ${racc:-no}% -- verification is inert)"
+fi
+
 # ------------------------------------------------- cold vs warm cache (§3.4)
 #
 # This is the invariant the design actually states: for any prompt and any
