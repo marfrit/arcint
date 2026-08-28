@@ -43,6 +43,16 @@ Caution: PERF_COUNT inflates wall clock (53.6 ms for a step whose node sum is
 19.01 ms) and reports the LAST inference. A depth-64 first-step profile said the
 two paths were identical; they are not.
 
+tools/paged_driver.py is the prototype and the oracle for the C++ port: la.*
+convention, device-resident state tensors (host tensors are re-uploaded every
+infer and silently reset the recurrent state), absolute-grid prefill, and a
+startup reservation in which every term is measured (weights+graph via
+GPU_MEMORY_STATISTICS, activation peak by running one chunk - linear in chunk
+size - GDN slab, KV at 20 KiB/token, stated margin). Admission is refused with
+the numbers, never discovered at runtime as CL_OUT_OF_RESOURCES. Result on the
+A770, where GenAI refuses the coder outright: ctx 49152 at chunk 512 serves at
+586 t/s prefill / 37.1 t/s decode, 15.09 of 15.11 GiB accounted.
+
 PCIe bandwidth does NOT govern decode of a resident model - an earlier claim
 here, retracted by measurement. Node time (19.01 ms) equals the serving step
 (19.2 ms/token), host work is 2%, and the only per-step link traffic is the

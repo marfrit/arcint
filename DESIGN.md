@@ -1147,6 +1147,52 @@ serialisation, which is the same copy paid once per prompt, and expert-offload
 streaming (§7.1). Those are host round-trips of tens to hundreds of MiB. Plain
 decode of a resident model is not.
 
+### 7.0.2a Admission by measured reservation — the paged driver on the card GenAI refuses
+
+GenAI's `ContinuousBatchingPipeline` will not start the coder on the A770 at
+all: it refuses at startup even at `num_kv_blocks = 256` — 80 MiB of KV —
+because its budget check prices in its own worst-case assumptions (batched
+prefill activations, a minimum block pool, and a checkpoint pool of ~33 MiB
+LA rows sized by its adaptive multiplier), and those exceed the 1.81 GiB left
+beside 13.30 GiB of weights. Its error carries no numbers.
+
+The prototype paged driver (`tools/paged_driver.py`) initially cleared that
+wall by *not doing the arithmetic*, which is not a capability — a driver with
+no admission check meets the same 15.1 GiB at runtime as
+`CL_OUT_OF_RESOURCES` mid-request, strictly worse than refusing at startup.
+The fix is a startup reservation in which every term is **measured**:
+
+| term | source | A770, coder |
+|---|---|---|
+| weights + graph | `GPU_MEMORY_STATISTICS` after compile | **13.30 GiB** |
+| activation peak | run one prefill chunk, read the delta | 2.28 / 1.14 / **0.57** / 0.28 GiB at chunk 2048 / 1024 / 512 / 256 |
+| GDN state slab | one row across all state tables | 32 MiB |
+| KV | ctx × 20 KiB/token | 0.94 GiB at ctx 49152 |
+| margin | stated, not hidden | 0.25 GiB |
+
+The activation peak is **linear in the chunk size**, so the chunk is the knob
+that buys context, and the admission table falls out of the sweep: chunk 2048
+is inadmissible on this card outright (the earlier "it ran anyway" was the
+plugin silently spilling 1.89 GiB to host), chunk 1024 admits ctx ≤ 20320,
+chunk 512 admits ctx ≤ 50480, chunk 256 admits ctx ≤ 65344.
+
+So the sentence this section exists for, with the numbers in it: **GenAI
+refuses the coder on the A770 outright under its assumptions; the paged driver
+serves ctx 49152 at chunk 512 because its measured peak is
+13.30 + 0.57 + 0.03 + 0.94 + 0.25 = 15.09 of 15.11 GiB** — prefill 586 t/s,
+decode 37.1 t/s at depth 4096, device at 14.33 GiB with the difference being
+buffers the plugin keeps host-side by its own choice. The same physical residue
+admits a working configuration because the arithmetic is tighter — sliced
+logits, a single slot, multiplier-1 checkpoints, a measured peak — not because
+the arithmetic was skipped. An inadmissible request is refused at startup with
+those terms spelled out, the same shape as the context-overflow 400.
+
+Two measurement traps, recorded so they are not rediscovered:
+`GPU_MEMORY_STATISTICS` lumps `usm_host` in with device memory if summed
+blindly (that made the first reservation conclude the model could not fit at
+all), and the plugin spills some prefill buffers host-side by choice, which
+must not be counted against the card.
+
 ### 7.0.2 The two cards do not run the same kernels
 
 Same graph, same artifact, same depth 256, steady-state step:
