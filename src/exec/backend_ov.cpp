@@ -16,6 +16,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+
+#include <dirent.h>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -561,6 +563,18 @@ public:
             if (offload_ratio_ > 0) cfg["OFFLOAD_RATIO"] = offload_ratio_;
             if (std::getenv("LIGENCE_PROFILE") != nullptr) cfg[ov::enable_profiling.name()] = true;
 
+            // Was there anything to import, or is this the run that writes the
+            // blob? Both take this branch, and reporting them the same way makes
+            // a cold start read like a successful import.
+            bool had_blob = false;
+            if (DIR* d = ::opendir(cache_dir.c_str())) {
+                while (dirent* e = ::readdir(d)) {
+                    const std::string n(e->d_name);
+                    if (n != "." && n != "..") { had_blob = true; break; }
+                }
+                ::closedir(d);
+            }
+
             auto t_cached = std::chrono::steady_clock::now();
             try {
                 language_    = core_.compile_model(model, device, cfg);
@@ -568,7 +582,11 @@ public:
                 lm_req_      = language_.create_infer_request();
                 warmup();
                 ready = true;
-                log::info("load", "language model ready in %.1f s (blob cache, warmup passed)",
+                log::info("load", had_blob
+                                      ? "language model ready in %.1f s (blob cache imported, "
+                                        "warmup passed)"
+                                      : "language model ready in %.1f s (compiled, blob cache "
+                                        "written)",
                           seconds_since(t_cached));
             } catch (const std::exception& e) {
                 log::warn("load", "blob cache produced an unusable graph, discarding it: %s",

@@ -259,6 +259,15 @@ provider not initialized", openvino#37607); the weightless mode with absolute
 weight paths was expected to make imports safe (63 s warm vs 156 s cold on the
 A770).
 
+**Retested 2026-08-28 on OpenVINO 2026.4.0-22849, and it still bites.** A cold
+run writes the blob and serves; the next run imports it and fails the warmup
+with `Check '_weight_provider' failed at moe_3gemm_swiglu_opt.cpp:2539: expert
+weight provider not initialized`, and the guard discards it. An outside review
+reported that OV *HEAD* now recreates the provider on import, which is plausible
+and does not help: this is the shipped 2026.4 release. **Keep the
+prove-and-discard guard until a build is measured green**, and retest rather
+than retire it on a changelog.
+
 **Measured 2026-08-28 on the B60 with the b5 coder artifact: it does not.**
 Weightless mode still produced a poisoned blob, and the failure is worse than a
 slow start — the import succeeds, so the server comes up healthy and then
