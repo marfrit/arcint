@@ -504,6 +504,52 @@ One line per event, greppable, no colors by default, `-v` raises verbosity
 - Perf regression tracking against the campaign numbers: B60 ≥ 60 t/s decode
   for the 27B coder q4 (the OpenVINO baseline it must beat to justify its
   existence), A770 ≥ 17 t/s for the dense 3.8.
+- **Per-operation profile of a decode step** (`PERF_COUNT`, coder q4, B60,
+  2026-08-28). Two findings, one solid and one alarming.
+
+  *Which kernels run.* OpenVINO picks implementations by fixed priority with no
+  benchmarking, so a reference kernel on a hot path means every faster candidate
+  rejected our shapes. At ctx 512, by share of counted decode time:
+
+  | op | share | implementation |
+  |---|---|---|
+  | FullyConnectedCompressed | 47% | `jit:gemm:any__i8` (oneDNN JIT) |
+  | Transpose | 18% | **`permute_ref__f16` — reference** |
+  | GatedDeltaNet | 8% | **`ocl::gated_delta_net::ref___` — reference** |
+  | DynamicQuantize | 7% | `dynamic_quantize_gpu_opt` |
+  | MOECompressed | 6% | `ocl::moe::moe_3gemm_swiglu_opt` |
+  | StridedSlice / Concat / Gather / Range | ~7% | **`*_cpu_impl` — on the host** |
+
+  The plugin's registry confirms this is not misconfiguration: it contains
+  `PagedGatedDeltaNetOptImpl` and `PagedGatedDeltaNetRefImpl` but only
+  `GatedDeltaNetRefImpl` — **there is no optimised GatedDeltaNet kernel for the
+  non-paged path at all**, and that path is 30 of our 40 layers. Roughly a
+  third of decode time is in reference or host-side implementations.
+
+  *What scales.* Growing context 512 → 4096 (×8) should leave a one-token decode
+  step almost unchanged, except attention, which reads a KV cache that grows
+  linearly. Measured instead:
+
+  | op | ×512→4096 | expected | note |
+  |---|---|---|---|
+  | IndirectSDPA | ×14.6 | ×8 | superlinear |
+  | MOECompressed | ×5.8 | ×1 | **context-free by construction** |
+  | Transpose | ×4.8 | ×1 | context-free |
+  | DynamicQuantize | ×4.3 | ×1 | context-free |
+  | GatedDeltaNet | ×3.8 | ×1 | state is fixed-size |
+  | RMS | ×3.5 | ×1 | context-free |
+  | FullyConnectedCompressed | ×1.7 | ×1 | context-free |
+
+  A mixture-of-experts layer's cost has no dependence on sequence length — it
+  sees one token. It cannot legitimately grow 5.8×. Whatever the mechanism,
+  **the decode step is doing work proportional to the whole context**, which is
+  what the fitted curve in §5 says from the outside: a linear term of 47.5 µs
+  per context token and a quadratic term of 28.2 ns per token², crossing over at
+  L ≈ 1688. The two independent observations agree.
+
+  Not yet pinned to a node. The next step is `get_runtime_model()` at two depths
+  and a diff of per-node `execTimeMcs`, looking for an output shaped `[…, L, L]`
+  and for `_cpu_impl` on anything in the attention path.
 - **Prefill, measured through ligence on the B60** (coder q4, chunked at 512):
   781–1723 t/s across 1.2k–18k tokens, e.g. 9615 tok in 8.28 s (1161 t/s) and
   18308 tok in 21.1 s (867 t/s). That is one to two orders above the 58 t/s
