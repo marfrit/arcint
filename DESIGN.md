@@ -660,6 +660,63 @@ obstacle is not the drafter, the head, the kernel or the hardware. It is
 `VariableState::get_state()`/`set_state()` copying 171 MiB of mostly-GDN
 recurrent state every step, and the paged path is what removes it.
 
+#### 3.5.3 Speculative decoding on the paged path — built and measured (prototype)
+
+`tools/paged_spec.py` implements the reconstructed GenAI speculative convention
+on the dense model, MTP head drafting, and it closes the loop this section has
+been circling since M4: **rollback costs zero state bytes.**
+
+The convention, each clause established by a bitwise probe before building:
+
+- `la.cache_interval = [1]`, `la.block_indices = [c, s0..sk-1]` — the pass
+  checkpoints the state after every token into successive scratch rows.
+- The spec pass computes **bitwise identical logits** to a plain pass over the
+  same tokens; the last checkpoint **bitwise equals** the in-place state; the
+  committed row is **never written** (m=0 is a strict no-op). Promotion is
+  "use the checkpoint row's index next step" — no copy exists to get wrong.
+- Attention KV rolls back by `past_lens` arithmetic alone.
+- Fresh rows **must be zeroed**: the kernels read the committed row even at
+  `past_lens = 0`. A dirty row corrupts the prefill itself — found as
+  nondeterminism across runs, cause isolated to reused rows, and this is why
+  GenAI zeroes fresh rows.
+- What is *not* deliverable, here as on the stateful path: bitwise equality
+  against a no-spec baseline. A k-token pass computes bitwise-different state
+  than k single-token passes (all 48 GDN tables differ; §3.2). The achievable
+  strong gates are mechanism invariance (above), bitwise determinism across
+  runs, and warm-restore equality — and all of them hold.
+
+**Measured** (Python driver — orchestration overhead included, so the C++ port
+should only improve on this; 120 new tokens; acceptance is on a degenerate
+continuation of a random-token prompt, so read the rates, not the 96.7%, which
+sits above the 77.8–93.3% natural-prompt band):
+
+| dense Qwen3.8, greedy | depth 512 | depth 4096 | gates |
+|---|---|---|---|
+| B60, paged, MTP off | 24.0 t/s | 23.6 t/s | all green |
+| B60, paged, **MTP on** | **36.1 t/s** (96.7% acc) | **32.1 t/s** | all green |
+| B60, stateful engine (baseline) | 19.9 t/s | — | |
+| A770, paged, MTP off | 18.1 t/s | 17.7 t/s | all green |
+| A770, paged, MTP on | **refused by reservation**: base 13.59 + embeddings 0.97 + head 1.66 = 15.25 of 15.11 GiB | | |
+
+**1.81× over the stateful baseline at depth 512, 1.61× at 4096** — the kickoff
+expectation was 35–40 t/s on the B60 and the measurement landed at 36.1/32.1.
+The 512→4096 slowdown is fully accounted, not narrated: +0.23 s in the base
+verify passes (paged attention over more keys, matching MTP-off's proportional
+drift) and +0.18 s in the head itself (its own attention over an 8× longer
+primed KV). The warm-restore gate doubles as the paged prefix-cache primitive:
+restore the committed row, reuse the untouched prompt KV blocks, re-prime the
+head — tokens *and* final state bitwise-equal a cold run, with speculation on.
+
+On the A770 the head does not fit beside the dense model with these artifacts,
+and the reservation says so with numbers instead of `CL_OUT_OF_RESOURCES`
+mid-request. Two A770 lessons for the port: compile the big model *first* (its
+compile-time peak on top of a resident embeddings model OOMs where the reverse
+order fits), and the embeddings gather does not need the card at all.
+
+What the C++ port inherits from the prototype as requirements: zeroed rows,
+device-resident tables set once, compile ordering, the reservation, the
+three-row rotation, and the head fed committed tokens only.
+
 ### 3.6 Sampling
 
 Greedy, temperature, top-k, top-p, repetition penalty, presence and frequency
