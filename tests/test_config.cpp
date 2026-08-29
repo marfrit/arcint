@@ -217,3 +217,26 @@ TEST(config_queue_timeout_is_a_finite_number_of_seconds) {
     CHECK(rejected({"--stub", "--queue-timeout", "1e9"}));
     CHECK(rejected({"--stub", "--queue-timeout", "abc"}));
 }
+
+TEST(config_served_model_name_is_presentation_only) {
+    Config cfg;
+    CHECK(run({"--stub", "--served-model-name", "qwen3.6-coder"}, cfg).ok);
+    CHECK_EQ(cfg.served_model_name, std::string("qwen3.6-coder"));
+    // It does not touch which artifact is asserted: --model-id is still the
+    // allowlist name, and still defaulted for the stub.
+    CHECK_EQ(cfg.model_id, std::string("qwen3.6-27b-a3b-coder"));
+
+    Config def;
+    CHECK(run({"--stub"}, def).ok);
+    CHECK(def.served_model_name.empty());
+
+    // A name that is empty or blank would land on /v1/models and be discovered
+    // by a roster; both are refused rather than folded into "not given".
+    CHECK(rejected({"--stub", "--served-model-name", ""}));
+    CHECK(rejected({"--stub", "--served-model-name", "   "}));
+    CHECK(rejected({"--stub", "--served-model-name"}));
+
+    // And it is not a way past the allowlist.
+    CHECK(rejected({"--stub", "--model-id", "qwen3.6-coder",
+                    "--served-model-name", "qwen3.6-coder"}));
+}

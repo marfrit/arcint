@@ -151,6 +151,18 @@ under ASan and UBSan on x86_64.
 - HTTP: POST /v1/chat/completions, POST /v1/completions (OpenAI-compatible,
   SSE streaming), GET /health, GET /props, GET /v1/models. No UI. /health and
   /props publish the lanes and the reservation terms; a refusal quotes them.
+- The served NAME and the served CONTEXT are contracts with a discovering proxy
+  (DESIGN 4.2). A proxy republishes whatever id it finds in /v1/models, so that
+  id is settable: --served-model-name NAME changes what /v1/models and /props
+  report and what a completion echoes back, and changes nothing else.
+  --model-id remains the allowlist assertion about which artifact is accepted
+  and still refuses anything outside it; the two are different questions.
+  model.canonical_id is always published beside model.id, model.answers_to
+  lists both recognised names, model.enforces_model_field is false. The same
+  proxy takes the context from the /v1/models entry and asks /props only for
+  template capabilities, so the model object carries n_ctx (what this process
+  is RUNNING with) and n_ctx_train (the artifact's ceiling) as separate fields,
+  plus quant, lanes and canonical_id.
 - Console: llama.cpp-style one-line state/timing prints on stderr
   (load, mem map, per-slot prefill/decode rates, cache hits, MTP acceptance).
 - Model input: OpenVINO IR (offline export), validated against a built-in

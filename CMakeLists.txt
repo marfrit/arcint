@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 0.2.1 LANGUAGES CXX)
+project(arcint VERSION 0.2.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -152,6 +152,13 @@ install(FILES models/allowlist-raw.json
         DESTINATION "${CMAKE_INSTALL_DATADIR}/arcint")
 install(PROGRAMS tools/export_mtp.py
         DESTINATION "${CMAKE_INSTALL_DATADIR}/arcint/tools")
+# The unit ships as a template rather than being installed into a user's
+# systemd directory: arcint runs as a *user* unit, and on the fleet that
+# directory is a git repo owned by the unit manager. Installed from here so the
+# package and a `cmake --install` agree on one file instead of the packaging
+# copying it separately and drifting.
+install(FILES packaging/arcint.service
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/arcint")
 
 # --------------------------------------------------------------------- tests
 if(ARCINT_TESTS)

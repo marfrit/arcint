@@ -313,7 +313,7 @@ std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out)
 json health(const Context& ctx) {
     const ModelStatus& st = ctx.backend->status();
     return json{{"status", st.loaded ? "ok" : "loading"},
-                {"model", st.id},
+                {"model", st.served_id},
                 {"loaded", st.loaded},
                 {"stub", st.stub},
                 {"slots_free", ctx.slots->free()},
@@ -329,11 +329,27 @@ json props(const Context& ctx) {
     const Config&         cfg = *ctx.cfg;
     const SamplerDefaults sd  = st.sampler_defaults;
 
-    json model = {{"id", st.id},
+    // `id` is what this endpoint is called; `canonical_id` is which artifact is
+    // behind it. They differ only under --served-model-name, and both are
+    // always present so a rename never costs identity.
+    json model = {{"id", st.served_id},
+                  {"canonical_id", st.id},
+                  {"served_model_name", cfg.served_model_name.empty()
+                                            ? json(nullptr)
+                                            : json(cfg.served_model_name)},
                   {"quant", quant_name(st.quant)},
                   {"loaded", st.loaded},
                   {"stub", st.stub},
                   {"n_ctx", st.n_ctx}};
+
+    // Which names a request may put in its `model` field. Both of these are
+    // recognised; anything else is served anyway and noted at -v, because one
+    // process serves exactly one model and there is nothing else it could mean.
+    // Said out loud rather than left to be inferred from the list.
+    json answers_to = json::array({st.served_id});
+    if (st.id != st.served_id) answers_to.push_back(st.id);
+    model["answers_to"]             = std::move(answers_to);
+    model["enforces_model_field"]   = false;
 
     // Zero means "not pinned in the allowlist and not reported by the artifact"
     // — null says that; 0 would be a lie.
@@ -343,6 +359,8 @@ json props(const Context& ctx) {
     model["n_attn_layer"]  = maybe_int(st.n_attn_layer);
     model["weights_bytes"] = st.weights_bytes > 0 ? json(st.weights_bytes) : json(nullptr);
 
+    // Keyed by the canonical id on purpose: the served name is presentation and
+    // is not in the registry at all.
     const ModelEntry* entry = find_model(st.id);
     if (entry != nullptr) {
         auto maybe_hash = [](const std::string& h) { return h.empty() ? json(nullptr) : json(h); };
@@ -426,10 +444,10 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
         return HttpResult{400, invalid_request(*err)};
     }
 
-    const std::string& served = ctx.backend->status().id;
-    if (!req.model.empty() && req.model != served) {
+    const ModelStatus& st = ctx.backend->status();
+    if (!req.model.empty() && req.model != st.served_id && req.model != st.id) {
         log::verbose("req", "request names model '%s'; this process serves '%s'",
-                     req.model.c_str(), served.c_str());
+                     req.model.c_str(), st.served_id.c_str());
     }
 
     PreparedChat prep;
@@ -513,7 +531,7 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     json body = {{"id", prep.id},
                  {"object", "chat.completion"},
                  {"created", prep.created},
-                 {"model", ctx.backend->status().id},
+                 {"model", ctx.backend->status().served_id},
                  {"choices", json::array({{{"index", 0},
                                            {"message", std::move(message)},
                                            {"finish_reason", finish}}})},
@@ -534,7 +552,7 @@ HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, in
     json body = {{"id", prep.id},
                  {"object", "text_completion"},
                  {"created", prep.created},
-                 {"model", ctx.backend->status().id},
+                 {"model", ctx.backend->status().served_id},
                  {"choices", json::array({{{"index", 0},
                                            {"text", text},
                                            {"logprobs", nullptr},
@@ -546,7 +564,7 @@ HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, in
 // ----------------------------------------------------------------- streaming
 void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
                  const SseWriter& write) {
-    const std::string& model = ctx.backend->status().id;
+    const std::string& model = ctx.backend->status().served_id;
     auto               chunk = [&](json choices, json extra = json::object()) {
         json c = {{"id", prep.id},
                                 {"object", "chat.completion.chunk"},
@@ -666,7 +684,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
 
 void stream_completion(const Context& ctx, const PreparedCompletion& prep, int slot,
                        const SseWriter& write) {
-    const std::string& model = ctx.backend->status().id;
+    const std::string& model = ctx.backend->status().served_id;
     auto               chunk = [&](json choices, json extra = json::object()) {
         json c = {{"id", prep.id},
                                 {"object", "text_completion"},

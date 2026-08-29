@@ -545,10 +545,13 @@ public:
                                                                artifact.bos_token,
                                                                artifact.eos_token);
             status_.id               = artifact.id;
+            status_.served_id        = cfg.served_model_name.empty() ? artifact.id
+                                                                     : cfg.served_model_name;
             status_.quant            = cfg.quant;
             status_.loaded           = true;
             status_.stub             = false;
             status_.n_ctx            = paged_n_ctx_;
+            status_.n_ctx_train      = artifact.n_ctx_train;
             status_.n_layer          = artifact.n_layer;
             status_.n_gdn_layer      = artifact.n_gdn_layer;
             status_.n_attn_layer     = artifact.n_attn_layer;
@@ -742,10 +745,13 @@ public:
                                                            artifact.bos_token, artifact.eos_token);
 
         status_.id               = artifact.id;
+        status_.served_id        = cfg.served_model_name.empty() ? artifact.id
+                                                                 : cfg.served_model_name;
         status_.quant            = cfg.quant;
         status_.loaded           = true;
         status_.stub             = false;
         status_.n_ctx            = n_ctx > 0 ? n_ctx : artifact.n_ctx_train;
+        status_.n_ctx_train      = artifact.n_ctx_train;
         status_.n_layer          = artifact.n_layer;
         status_.n_gdn_layer      = artifact.n_gdn_layer;
         status_.n_attn_layer     = artifact.n_attn_layer;

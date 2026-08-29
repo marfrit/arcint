@@ -1,11 +1,25 @@
-# arcint, as a systemd *user* unit on the dev host, matching how
-# openarc-coder and llama-agent already run there.
+# arcint as a systemd *user* unit.
 #
 # Install:
-#   cmake --install build-ov --prefix ~/.local
-#   cp packaging/arcint.service ~/.config/systemd/user/
-#   cp packaging/arcint.env     ~/.config/systemd/user/
+#   cp /usr/share/arcint/arcint.service ~/.config/systemd/user/
+#   $EDITOR ~/.config/systemd/user/arcint.service     # model, card, port, name
 #   systemctl --user daemon-reload && systemctl --user enable --now arcint
+#
+# If a unit manager owns ~/.config/systemd/user on your host, hand it this file
+# rather than installing it by hand.
+#
+# Two things about the shape of this file, both learned by installing it:
+#
+#  1. ExecStart is /usr/bin/arcint, where the .deb puts the binary. It used to
+#     read %h/.local/bin/arcint, which is where `cmake --install --prefix
+#     ~/.local` puts it — so the shipped unit did not start on a host that only
+#     had the package. If you built from source into ~/.local, change this one
+#     line back.
+#
+#  2. The flags are literal, not ${ARCINT_PORT} out of an EnvironmentFile.
+#     A unit manager reads the port, the served name and the context out of
+#     ExecStart: behind an env-file indirection none of that is visible to it,
+#     and neither is it greppable in a journal. One file, self-describing.
 #
 # The binary resolves its own OpenVINO libraries via RPATH, so there is no
 # LD_LIBRARY_PATH here on purpose. If you see "libopenvino.so not found", the
@@ -14,19 +28,49 @@
 [Unit]
 Description=arcint — LLM inference for Intel Arc
 Documentation=https://github.com/marfrit/arcint
-After=graphical-session.target
+# default.target, not graphical-session.target: a headless container has no
+# graphical session, and a unit ordered after one that never arrives is a unit
+# that looks fine and never runs.
+After=default.target
+# One card, one resident model: anything else holding this GPU must not run at
+# the same time. Name the neighbours that actually collide on this host.
+#Conflicts=openarc-coder.service
 
 [Service]
 Type=simple
-EnvironmentFile=%h/.config/systemd/user/arcint.env
-ExecStart=%h/.local/bin/arcint \
-    --model ${ARCINT_MODEL} \
-    --device ${ARCINT_DEVICE} \
-    --host ${ARCINT_HOST} \
-    --port ${ARCINT_PORT} \
-    --n-ctx ${ARCINT_N_CTX} \
-    --prefix-cache-mib ${ARCINT_PREFIX_CACHE_MIB} \
-    $ARCINT_EXTRA_ARGS
+ExecStart=/usr/bin/arcint \
+    --model /models/ov/qwen36-coder-b5-ov \
+    --model-id qwen3.6-27b-a3b-coder \
+    --served-model-name qwen3.6-coder \
+    --device GPU.0 \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --n-ctx 262144 \
+    --prefix-cache-mib 8192 \
+    --cache-dir %h/.cache/arcint \
+    --queue-timeout 30
+
+# --model-id and --served-model-name are two different questions and both are
+# worth spelling out. --model-id is the allowlist assertion: which artifact this
+# process will accept, and it refuses to start on the wrong one.
+# --served-model-name is what /v1/models reports, which is what a discovering
+# proxy pins its roster to and therefore what clients must send. Renaming the
+# endpoint is a one-flag edit; it never weakens the assertion.
+#
+# --queue-timeout 30 is deliberate for a *service* endpoint. The engine default
+# is 0 — refuse a request that finds no free lane, with the reservation numbers
+# — because a lane is a memory claim and an unbounded queue is indistinguishable
+# from a hang. But an OpenAI-compatible client generally does not retry a 503,
+# so on a shared endpoint the older, kinder behaviour is the right one.
+#
+# Other flags worth knowing, none of them enabled here:
+#   --parallel 2          two client sessions at once (DESIGN §4.1). A memory
+#                         claim as much as a flag: the reservation must hold two
+#                         lanes at --n-ctx or the service refuses to start, with
+#                         the arithmetic. At 262144 context it will refuse.
+#   --mtp on              the Qwen3.8 MTP head, where the export carries one
+#   --draft 4             prompt-lookup drafting
+#   --custom-kernels ...  hand-written OpenCL (measurement switch)
 
 # The card holds the model's VRAM for the process lifetime, so a restart is a
 # full reload (minutes). Restart on failure, but do not thrash.

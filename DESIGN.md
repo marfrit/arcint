@@ -884,6 +884,7 @@ to do it well.
 | `POST /v1/completions` | raw completion, same sampler surface |
 | `GET /health` | 200 + JSON: model, loaded, slots free/total, queue depth |
 | `GET /props` | model metadata: context length, quant, block size, KV dtype, GDN checkpoint config, MTP on/off, build info, sampler defaults |
+| `GET /v1/models` | the one served model, with the context it is **running with** (§4.2) |
 
 Console output (stderr), llama.cpp tradition. This is what M0 actually prints
 (copied from a run on a clean tree; a dirty tree appends `-dirty` to the sha):
@@ -981,7 +982,55 @@ doing would make a warm run diverge from a cold one for reasons no one could
 reproduce. The stall bound is therefore a property of `--prefill-chunk`, which
 is the honest place for the operator to trade it.
 
-### 4.2 Admission: a lane is a memory reservation
+### 4.2 The name, and the context, are contracts with a proxy
+
+Two facts about how this endpoint is consumed, both learned by breaking them.
+
+**The name.** A discovering proxy reads model names from the backend's
+`/v1/models` and republishes them, so whatever id appears there is what every
+client downstream must send. Pinning that id to the allowlist's canonical name
+therefore makes the allowlist a client-visible API: swapping one engine for
+another on the same card and the same artifact renamed the endpoint, and every
+caller sending the old name got nothing. So the presented name is its own knob:
+
+- `--served-model-name NAME` sets what `/v1/models` (`data[].id`) and `/props`
+  (`model.id`) report, and what a completion echoes back in its `model` field.
+  Presentation only.
+- `--model-id` is untouched by it. That flag is the *artifact* assertion — which
+  checkpoint this process will accept — and it keeps refusing anything outside
+  the allowlist whatever the endpoint is called. The two answer different
+  questions and must not be one flag, which is what abusing `--model-id` as an
+  alias source made them.
+- Absent the flag, the canonical id is served exactly as before.
+- Both names are recognised in a request's `model` field, and neither is
+  enforced: one process serves one model, so there is nothing else a request
+  could mean. `/props` says so rather than leaving it to be inferred —
+  `model.answers_to` lists them and `model.enforces_model_field` is `false`.
+- `model.canonical_id` is always published beside `model.id`, so a rename never
+  costs artifact identity. The model registry stays keyed by the canonical id;
+  a renamed model keeps its allowlist metadata.
+
+**The context.** The same proxy takes the context length from the `/v1/models`
+entry — trying `max_model_len`, `context_length`, `ctx`, `n_ctx`,
+`max_context_length` — and asks `/props` only for template capabilities. A
+context published on `/props` alone therefore reaches no client at all: they
+fall back to their own defaults against a server configured for 262144. So the
+model object carries it:
+
+```json
+{"id": "qwen3.6-coder", "object": "model", "owned_by": "arcint",
+ "n_ctx": 262144, "n_ctx_train": 262144, "quant": "q4", "lanes": 1,
+ "canonical_id": "qwen3.6-27b-a3b-coder"}
+```
+
+`n_ctx` is what this process is **running with**, which is the number a client
+needs; `n_ctx_train` is the artifact's ceiling. They are different fields
+because they are different facts — a server at `--n-ctx 40960` on a 262144
+artifact must not report the ceiling — and a caller that wants to know the
+headroom can see both. `quant` and `lanes` ride along because the proxy keeps
+the whole object and they cost nothing.
+
+### 4.3 Admission: a lane is a memory reservation
 
 `--parallel N` is not a queue depth, it is a claim about memory: the startup
 arithmetic of §7.0.2a reserves activations, GDN checkpoint rows and KV for N
@@ -1000,9 +1049,9 @@ The default is a **behaviour change** and is worth stating as one: before M6 a
 second concurrent request queued, and now it is refused unless a timeout says
 otherwise. That is right for the engine — the number is a memory claim — and
 wrong for a service endpoint whose callers are OpenAI-compatible clients, most
-of which do not retry a 503. So `packaging/arcint.env` sets
-`--queue-timeout 30` for the shipped unit, and the two decisions stay separate:
-the engine tells the truth, the deployment chooses the manners.
+of which do not retry a 503. So `packaging/arcint.service` passes
+`--queue-timeout 30`, and the two decisions stay separate: the engine tells the
+truth, the deployment chooses the manners.
 
 KV pages are the other half. The pool is refcounted (`src/core/block_pool.h`):
 a page is handed out with one reference, gains one for every sequence or cache

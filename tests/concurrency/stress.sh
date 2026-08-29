@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Slot accounting under load, against the stub backend — no card needed, which
-# is the point: this is the part of §4.1/§4.2 that can run under ASan+UBSan in
+# is the point: this is the part of §4.1/§4.3 that can run under ASan+UBSan in
 # CI, where a use-after-free in the lease or the queue shows up as a report
 # rather than as a rare hang on the GPU box.
 #

@@ -71,7 +71,8 @@ int main(int argc, char** argv) {
             n_ctx        = entry->n_ctx_train > 0 ? entry->n_ctx_train : kStubDefaultNCtx;
             n_ctx_source = entry->n_ctx_train > 0 ? "allowlist" : "stub fallback";
         }
-        backend = lgc::make_stub_backend(*entry, cfg.quant, n_ctx, cfg.stub_delay_ms);
+        backend = lgc::make_stub_backend(*entry, cfg.quant, n_ctx, cfg.stub_delay_ms,
+                                         cfg.served_model_name);
 
         lgc::log::warn("boot", "%s",
                        "stub backend: no model, no OpenVINO, synthetic output. "
@@ -192,6 +193,12 @@ int main(int argc, char** argv) {
         lgc::log::info("mem", "%s", "kv pool and GDN ledger are not allocated before M2");
     }
 
+    if (!cfg.served_model_name.empty()) {
+        lgc::log::info("load", "served as '%s' (--served-model-name); the artifact is '%s' and "
+                               "the allowlist assertion is unchanged",
+                       backend->status().served_id.c_str(), backend->status().id.c_str());
+    }
+
     lgc::api::SlotPool slots(cfg.parallel);
     lgc::api::Context  ctx{&cfg, backend.get(), &slots};
 
@@ -201,8 +208,13 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, on_signal);
     std::signal(SIGPIPE, SIG_IGN);
 
-    lgc::log::info("http", "listening on %s:%d | %d slot%s", cfg.host.c_str(), cfg.port,
-                   slots.total(), slots.total() == 1 ? "" : "s");
+    // The endpoint-identity line: address, lanes, and the name this process
+    // answers to. A journal that does not say which name is served is no help
+    // when a roster discovered one from /v1/models and a client is using
+    // another.
+    lgc::log::info("http", "listening on %s:%d | %d slot%s | serving '%s'", cfg.host.c_str(),
+                   cfg.port, slots.total(), slots.total() == 1 ? "" : "s",
+                   backend->status().served_id.c_str());
 
     if (!server.listen()) {
         lgc::log::error("http", "could not bind %s:%d", cfg.host.c_str(), cfg.port);

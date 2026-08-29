@@ -47,11 +47,20 @@ struct Reservation {
 };
 
 struct ModelStatus {
+    // Two names, and the distinction matters at every boundary. `id` is the
+    // allowlist's canonical name: it is artifact identity, it is what the model
+    // registry is keyed by, and it never moves. `served_id` is what the outside
+    // world is told — the same thing unless --served-model-name says otherwise
+    // (DESIGN.md §4.2). A roster or proxy that discovers names from /v1/models
+    // pins itself to whatever it finds there, so that name has to be settable
+    // without touching which artifact is asserted.
     std::string id;
+    std::string served_id;
     Quant       quant        = Quant::Q4;
     bool        loaded       = false;
     bool        stub         = false;
-    int         n_ctx        = 0;
+    int         n_ctx        = 0;   // what this server is running with
+    int         n_ctx_train  = 0;   // what the artifact was trained for
     int         n_layer      = 0;
     int         n_gdn_layer  = 0;
     int         n_attn_layer = 0;
@@ -160,7 +169,8 @@ public:
 // `delay_ms` inserts artificial per-token latency so that cancellation and
 // streaming can be observed; zero for the fastest possible round-trip.
 std::unique_ptr<Backend> make_stub_backend(const ModelEntry& entry, Quant quant, int n_ctx,
-                                           int delay_ms = 0);
+                                           int delay_ms = 0,
+                                           const std::string& served_name = {});
 
 #ifdef ARCINT_OPENVINO
 struct Artifact;

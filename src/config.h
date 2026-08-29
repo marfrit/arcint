@@ -12,6 +12,12 @@ struct Config {
     bool        stub = false;
 
     std::string model_id;  // allowlist entry; defaults to the coder under --stub
+
+    // The name this endpoint answers to on /v1/models and /props. Empty means
+    // the allowlist's canonical id. Presentation only: it does not weaken
+    // --model-id, which is about artifact identity and keeps refusing a wrong
+    // artifact either way (DESIGN.md §4.2).
+    std::string served_model_name;
     Quant       quant = Quant::Q4;
 
     // OpenVINO device string. GPU.0 is the B60 and GPU.1 the A770 on the dev host;
@@ -28,7 +34,7 @@ struct Config {
     int parallel = 1;  // lanes (DESIGN.md §4 /health reports free/total)
 
     // How long a request waits for a lane before it is refused with the
-    // reservation numbers (DESIGN.md §4.2). Zero refuses immediately, which is
+    // reservation numbers (DESIGN.md §4.3). Zero refuses immediately, which is
     // the default because a lane count is a *memory* reservation: with N lanes
     // reserved, an N+1st concurrent sequence has nowhere to live, and a client
     // that waits behind a 30k-context session cannot tell a queue from a hang.

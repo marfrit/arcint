@@ -67,6 +67,11 @@ std::string usage_text() {
         "server\n"
         "  --host ADDR               bind address (default: 127.0.0.1)\n"
         "  --port N                  bind port (default: 8090)\n"
+        "  --served-model-name NAME  the name this endpoint reports on\n"
+        "                            /v1/models and /props (default: the\n"
+        "                            artifact's allowlist id). Presentation\n"
+        "                            only: --model-id still decides which\n"
+        "                            artifact is accepted\n"
         "  --parallel N              number of lanes (default: 1)\n"
         "  --queue-timeout S         seconds a request waits for a lane before a\n"
         "                            503 with the reservation numbers (default: 0)\n"
@@ -153,6 +158,15 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.parallel)) {
                 return fail("--parallel needs an integer");
             }
+        } else if (arg == "--served-model-name") {
+            // An empty value is refused rather than folded into "not given":
+            // `--served-model-name ""` asks for a name, and silently serving the
+            // canonical one instead is how a roster ends up pinned to a name
+            // nobody chose.
+            if (!value(v) || v.empty()) {
+                return fail("--served-model-name needs a non-empty name");
+            }
+            cfg.served_model_name = std::string(v);
         } else if (arg == "--queue-timeout") {
             if (!value(v) || !parse_double(v, cfg.queue_timeout_s)) {
                 return fail("--queue-timeout needs a number of seconds");
@@ -259,6 +273,12 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     }
 
     if (cfg.port < 1 || cfg.port > 65535) return fail("--port must be in [1, 65535]");
+    // A served name that is empty or blank would put an unusable id on
+    // /v1/models, and a roster discovering names from there would take it.
+    if (!cfg.served_model_name.empty() &&
+        cfg.served_model_name.find_first_not_of(" \t\r\n") == std::string::npos) {
+        return fail("--served-model-name cannot be blank");
+    }
     if (cfg.parallel < 1) return fail("--parallel must be >= 1");
     if (!(cfg.queue_timeout_s >= 0.0 && cfg.queue_timeout_s <= 3600.0)) {
         return fail("--queue-timeout must be between 0 and 3600 seconds");

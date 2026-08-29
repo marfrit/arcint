@@ -90,12 +90,28 @@ void HttpServer::Impl::route() {
     svr.Get("/v1/models", [this](const httplib::Request&, httplib::Response& res) {
         // One process serves one model (§2). The list has exactly one entry so
         // that OpenAI clients which probe this endpoint keep working.
+        //
+        // It carries the context length because this is the only place a
+        // discovering proxy looks: it reads n_ctx (among a few spellings) from
+        // the model object here and asks /props for nothing but the template
+        // capabilities. A context published on /props alone reaches no client,
+        // and a client with no context falls back to its own default against a
+        // server configured for 262144. `n_ctx` is what this process is
+        // actually running with; `n_ctx_train` is the artifact's ceiling, so a
+        // caller can see both and tell them apart.
         const ModelStatus& st = ctx.backend->status();
-        send_json(res, 200,
-                  json{{"object", "list"},
-                       {"data", json::array({{{"id", st.id},
-                                              {"object", "model"},
-                                              {"owned_by", "arcint"}}})}});
+        auto maybe_int = [](int v) { return v > 0 ? json(v) : json(nullptr); };
+        json entry{{"id", st.served_id},
+                   {"object", "model"},
+                   {"owned_by", "arcint"},
+                   {"n_ctx", maybe_int(st.n_ctx)},
+                   {"n_ctx_train", maybe_int(st.n_ctx_train)},
+                   {"quant", quant_name(st.quant)},
+                   {"lanes", ctx.slots->total()}};
+        // The artifact this endpoint actually serves, which --served-model-name
+        // may have renamed. Always present, so a rename never hides identity.
+        entry["canonical_id"] = st.id;
+        send_json(res, 200, json{{"object", "list"}, {"data", json::array({std::move(entry)})}});
     });
 
     svr.Post("/v1/chat/completions", [this](const httplib::Request& req, httplib::Response& res) {

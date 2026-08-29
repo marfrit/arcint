@@ -85,9 +85,12 @@ private:
 // ------------------------------------------------------------------ backend
 class StubBackend final : public Backend {
 public:
-    StubBackend(const ModelEntry& entry, Quant quant, int n_ctx, int delay_ms)
+    StubBackend(const ModelEntry& entry, Quant quant, int n_ctx, int delay_ms,
+                const std::string& served_name)
         : delay_ms_(delay_ms) {
         status_.id               = entry.id;
+        status_.served_id        = served_name.empty() ? entry.id : served_name;
+        status_.n_ctx_train      = entry.n_ctx_train;
         status_.quant            = quant;
         status_.loaded           = true;
         status_.stub             = true;
@@ -180,7 +183,7 @@ private:
         std::string out = log::format(
             "arcint stub backend \xc2\xb7 no model loaded \xc2\xb7 %s %s\n"
             "prompt %d tokens, sampler %s. Gr\xc3\xbc\xc3\x9f""e aus der Werkstatt.",
-            status_.id.c_str(), quant_name(status_.quant), prompt_tokens,
+            status_.served_id.c_str(), quant_name(status_.quant), prompt_tokens,
             in.sampler.greedy() ? "greedy"
                                 : log::format("temp %.2f", in.sampler.temperature).c_str());
 
@@ -216,8 +219,8 @@ const char* finish_reason_name(FinishReason r) {
 }
 
 std::unique_ptr<Backend> make_stub_backend(const ModelEntry& entry, Quant quant, int n_ctx,
-                                           int delay_ms) {
-    return std::make_unique<StubBackend>(entry, quant, n_ctx, delay_ms);
+                                           int delay_ms, const std::string& served_name) {
+    return std::make_unique<StubBackend>(entry, quant, n_ctx, delay_ms, served_name);
 }
 
 }  // namespace lgc

@@ -215,12 +215,22 @@ GDN checkpoint rows and KV for two concurrent sequences at the configured
 them. If a deployment would rather queue than be refused at request time, set
 `--queue-timeout S`.
 
-`packaging/arcint.service` and `packaging/arcint.env` are a systemd **user**
-unit and its configuration. Every arcint setting is a command line flag, so the
-env file holds the flags and the unit itself never has to be edited.
+`packaging/arcint.service` is a systemd **user** unit. Its flags are literal
+rather than `${ARCINT_PORT}` out of an environment file, and that is not
+laziness: the fleet's unit manager reads the port, the served name and the
+context out of `ExecStart`, so an env-file indirection hides all three from the
+port board and from an automated edit. `ExecStart` points at `/usr/bin/arcint`,
+which is where the package puts the binary — building into `~/.local` instead
+means changing that one line.
 `-DARCINT_GIT_SHA` is worth passing whenever the build tree has no `.git` —
 otherwise `--version` and `/props` report `unknown`, and a running binary cannot
 say what it is.
+
+The name the endpoint answers to is `--served-model-name`, and it is separate
+from `--model-id` on purpose: the first is what `/v1/models` reports and what a
+discovering proxy therefore pins its roster to, the second is the allowlist
+assertion about which artifact this process will accept. Renaming an endpoint is
+a one-flag edit and never weakens the assertion.
 
 One process holds its model's VRAM for its whole lifetime. Whatever else was
 serving that card has to stop first: arcint replaces an endpoint, it does not

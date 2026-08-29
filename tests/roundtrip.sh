@@ -22,7 +22,7 @@ LOG="${WORK}/server.log"
 
 cleanup() {
   local pid
-  for pid in "${SRV_PID:-}" "${CANCEL_PID:-}"; do
+  for pid in "${SRV_PID:-}" "${CANCEL_PID:-}" "${ALIAS_PID:-}"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null
       wait "$pid" 2>/dev/null
@@ -94,6 +94,15 @@ check "/props carries build info" $?
 curl -sS "${BASE}/v1/models" -o "${WORK}/models.json"
 jassert "${WORK}/models.json" 'len(d["data"])==1 and d["data"][0]["id"]=="qwen3.6-27b-a3b-coder"'
 check "/v1/models lists exactly the served model" $?
+# The context has to be here and nowhere else: a discovering proxy reads it from
+# this object and asks /props for nothing but template capabilities, so a
+# context published only on /props reaches no client at all.
+jassert "${WORK}/models.json" 'd["data"][0]["n_ctx"]==256'
+check "/v1/models carries the context the server is running with" $?
+jassert "${WORK}/models.json" 'd["data"][0]["n_ctx_train"]==262144 and d["data"][0]["n_ctx"]!=d["data"][0]["n_ctx_train"]'
+check "/v1/models tells the served context from the trained one" $?
+jassert "${WORK}/models.json" 'd["data"][0]["quant"]=="q4" and d["data"][0]["lanes"]==1 and d["data"][0]["canonical_id"]=="qwen3.6-27b-a3b-coder"'
+check "/v1/models carries quant, lanes and the canonical id" $?
 
 # ------------------------------------------------------- chat, non-streaming
 curl -sS "${BASE}/v1/chat/completions" -H 'Content-Type: application/json' \
@@ -341,6 +350,67 @@ check "the aborted request released its slot" $?
 
 kill -TERM "$CANCEL_PID" 2>/dev/null
 wait "$CANCEL_PID" 2>/dev/null
+
+# --------------------------------------------------------- --served-model-name
+#
+# A second server, because the name is fixed at startup. What is being gated is
+# that the presented name moves and artifact identity does not: a roster that
+# discovers names from /v1/models pins itself to whatever it finds, so renaming
+# has to be possible without touching which artifact the allowlist accepts.
+ALIAS_PORT=$((PORT + 3))
+ALIAS_LOG="${WORK}/alias.log"
+"$BIN" --stub --host 127.0.0.1 --port "$ALIAS_PORT" --n-ctx 40960 \
+       --served-model-name qwen3.6-coder >"$ALIAS_LOG" 2>&1 &
+ALIAS_PID=$!
+ALIAS_BASE="http://127.0.0.1:${ALIAS_PORT}"
+for _ in $(seq 1 100); do
+  curl -fsS "${ALIAS_BASE}/health" -o /dev/null 2>/dev/null && break
+  kill -0 "$ALIAS_PID" 2>/dev/null || { echo "alias server died:"; tail -20 "$ALIAS_LOG"; break; }
+  sleep 0.1
+done
+
+curl -sS "${ALIAS_BASE}/v1/models" -o "${WORK}/alias-models.json"
+jassert "${WORK}/alias-models.json" 'd["data"][0]["id"]=="qwen3.6-coder"'
+check "--served-model-name renames the id on /v1/models" $?
+jassert "${WORK}/alias-models.json" 'd["data"][0]["canonical_id"]=="qwen3.6-27b-a3b-coder"'
+check "the artifact behind the name is still visible" $?
+jassert "${WORK}/alias-models.json" 'd["data"][0]["n_ctx"]==40960'
+check "the renamed entry carries the served context, not the trained one" $?
+
+curl -sS "${ALIAS_BASE}/props" -o "${WORK}/alias-props.json"
+jassert "${WORK}/alias-props.json" 'd["model"]["id"]=="qwen3.6-coder" and d["model"]["canonical_id"]=="qwen3.6-27b-a3b-coder"'
+check "/props agrees with /v1/models about the name" $?
+jassert "${WORK}/alias-props.json" 'set(d["model"]["answers_to"])=={"qwen3.6-coder","qwen3.6-27b-a3b-coder"} and d["model"]["enforces_model_field"] is False'
+check "/props says which names a request may use" $?
+# The registry lookup is keyed by the canonical id, so a rename must not cost
+# the artifact metadata that /props enriches from it.
+jassert "${WORK}/alias-props.json" 'd["model"]["arch_hash"] and d["model"]["n_expert"]==184'
+check "a renamed model keeps its allowlist metadata" $?
+
+curl -sS "${ALIAS_BASE}/v1/chat/completions" -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.6-coder","messages":[{"role":"user","content":"hallo"}],"temperature":0}' \
+  -o "${WORK}/alias-chat.json"
+jassert "${WORK}/alias-chat.json" 'd["choices"][0]["message"]["content"] and d["model"]=="qwen3.6-coder"'
+check "a request naming the served name is served, and echoes it back" $?
+
+grep -q "serving 'qwen3.6-coder'" "$ALIAS_LOG"
+check "the console says which name is served" $?
+
+kill -TERM "$ALIAS_PID" 2>/dev/null; wait "$ALIAS_PID" 2>/dev/null; ALIAS_PID=""
+
+# The allowlist assertion is a separate knob and must not have moved: a wrong
+# artifact is still refused, whatever the endpoint is called.
+if "$BIN" --stub --model-id qwen3.6-coder --port "$ALIAS_PORT" >"${WORK}/refuse.log" 2>&1; then
+  fail "--model-id outside the allowlist is still refused"
+else
+  grep -q 'is not in the allowlist' "${WORK}/refuse.log"
+  check "--model-id outside the allowlist is still refused" $?
+fi
+if "$BIN" --stub --served-model-name "" --port "$ALIAS_PORT" >"${WORK}/blank.log" 2>&1; then
+  fail "--served-model-name refuses a blank name"
+else
+  pass "--served-model-name refuses a blank name"
+fi
 
 # ------------------------------------------------------------ console output
 grep -q '^lgc  slot 0: prefill' "$LOG"
