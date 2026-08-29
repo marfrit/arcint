@@ -85,7 +85,6 @@ ArtifactInfo Artifact::to_info(Quant quant) const {
 }
 
 std::optional<std::string> load_artifact(const std::string& dir, Artifact& out) {
-    const std::string dir_c = dir;
     Artifact          a;
     a.dir            = dir;
     a.directory_name = basename_of(dir);

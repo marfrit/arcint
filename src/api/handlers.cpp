@@ -95,7 +95,7 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
             stats.decode_sample_seconds, stats.decode_emit_seconds, other);
     }
     if (stats.draft_proposed > 0) {
-        decode_suffix = log::format(
+        decode_suffix += log::format(
             " | draft accept %.1f%% (%d/%d), verify %.2f s, re-forward %.2f s, rollback %.2f s",
             100.0 * stats.draft_accepted / stats.draft_proposed, stats.draft_accepted,
             stats.draft_proposed, stats.draft_verify_seconds, stats.draft_reforward_seconds,

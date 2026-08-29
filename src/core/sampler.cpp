@@ -101,8 +101,7 @@ int Sampler::sample(float* logits, size_t vocab) {
 
     for (int attempt = 0; attempt < 2; ++attempt) {
         const bool   probing = attempt == 0 && params_.top_k <= 0 && kCandidateProbe < vocab;
-        const size_t n       = probing ? collect_candidates(logits, vocab)
-                                       : collect_candidates(logits, vocab);
+        const size_t n       = collect_candidates(logits, vocab);
         if (n == 0) return argmax(logits, vocab);
 
         const float temp = params_.temperature > 0.0f ? params_.temperature : 1.0f;
