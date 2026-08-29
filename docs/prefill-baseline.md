@@ -680,3 +680,74 @@ A770 a control group here. A second card is a contrast only if measured on the
 same stack.
 
 `PagedCausalConv1D` at 6.3% of both phases resumes as the top item.
+
+
+---
+
+# The answer: micro SDPA, with dpas, in both precisions
+
+The plugin binary could not say, and a plugin rebuild was not the cheapest
+instrument — a figure of "hours" for that build was asserted without anyone
+timing it, and is withdrawn.
+
+**The installed IGC carries its own debug keys** — `ShaderDumpEnable`,
+`DumpToCustomDir`, `ShaderDumpEnableAll`, `ShaderDumpPidDisable`. So
+`IGC_ShaderDumpEnable=1 IGC_DumpToCustomDir=<path>` on the serving process dumps
+every compiled kernel with its generated assembly: one restart, one prefill
+request, one grep. No plugin rebuild, no `ENABLE_DEBUG_CAPS`, no onetrace.
+
+**Set up before running, because a cheap run is only cheap if it is aimed:**
+the dump went to the 2.6 TB pool, not the container root, which was at 97% with
+3.1 GB free; 43–47 MB and ~1500 files per configuration; deleted afterwards.
+
+**Readings fixed in advance**, all four:
+
+| observation | reading |
+|---|---|
+| `dpas` in the attention kernel's asm | micro/XMX path — conjecture dead |
+| attention kernel present, no `dpas` | OCL fallback — conjecture alive, lever real |
+| no attention kernel in the dump at all | likely the micro path (oneDNN microkernels go through ngen, not IGC's OpenCL front end) — *not* a failed run |
+| no kernels at all | the run failed; none of the above applies |
+
+**Result — the first reading, in both precisions:**
+
+```
+sdpa_micro__prefill_10432584610579984572__sa      u8,  asm contains dpas
+sdpa_micro__prefill_3448044640564163734__sa       u8,  asm contains dpas
+sdpa_micro__prefill_10332065829643378056__sa      f16, asm contains dpas
+sdpa_micro__prefill_7506610878414805460__sa       f16, asm contains dpas
+```
+
+Control held: five `.asm` files carried `dpas`, so the marker was detectable, and
+the two identifiable by entry name are the attention kernels. The last unchecked
+gate — `query_microkernels_supported` — therefore returned true, completing a
+checklist on which every other condition was already known to pass.
+
+**Attention prefill runs on the matrix path. The SIMD-peak conjecture is dead.**
+
+## What survives the conjecture
+
+The observation that motivated it does not go away with it: the depth curve's
+quadratic coefficient still implies ~12 TFLOPS effective against a matrix peak an
+order of magnitude higher. The mechanism is refuted; **the number is now
+unexplained**, and is kept as an open item rather than deleted along with the
+theory. Candidates, none measured: the FLOP arithmetic behind the coefficient is
+wrong; the quadratic term contains more than attention; or prefill attention is
+bandwidth-bound on KV reads, which a matrix unit does not help.
+
+## Limits of this instrument, and a near-miss
+
+The dump proves **compilation and ISA, not per-invocation dispatch**. For
+dispatch the debug-caps trace or PTI is still the tool — but the gate is what
+was in question, and the gate is answered.
+
+The compiled attention set differs between precisions: the u8 build also carries
+`paged_attention_opt__multi_tokens`, the f16 one does not. Recorded, not
+interpreted.
+
+And a near-miss worth the same treatment as `SDPAScaleFusion`: the first probe
+searched **filenames** for attention names and returned zero. IGC names dumps by
+hash, so it measured nothing — but "no attention-named files" maps exactly onto
+pre-registered outcome three, whose reading was "likely the micro path". A broken
+probe would have produced the right conclusion for the wrong reason. The control
+is what caught it.

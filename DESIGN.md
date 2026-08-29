@@ -1643,9 +1643,9 @@ Two things that are **not** established and are recorded as such:
   The b5 coder ships none, so none of it runs on the artifact these numbers come
   from. It is a lead for the 3.8, not for the coder.
 - "Attention prefill runs at f16 SIMD peak rather than the matrix engines" is
-  **a conjecture** — tested 2026-08-30 and still a conjecture, because the
-  instrument cannot name the ISA path (§7.0.2b) — inferred from the depth
-  curve's quadratic coefficient
+  **refuted 2026-08-30** (§7.0.2b: the prefill attention kernel is
+  `sdpa_micro__prefill` and its assembly carries `dpas`, in both KV precisions).
+  It had been inferred from the depth curve's quadratic coefficient
   (~12 TFLOPS effective against a ~90 TFLOPS XMX f16 peak). A coefficient is
   evidence, not a mechanism, and §7.0.2b already says `exec_type` cannot settle
   it. It stays labelled until instruction-level tracing does.
@@ -1708,11 +1708,55 @@ is a different implementation family (`ocl::` cldnn) from the one those
 microkernels serve (`jit:gemm`, oneDNN). Four apparent "SDPA + dpas" hits are
 false positives: `ov::pass::SDPAScaleFusion` contains the letters.
 
-So: **outcome three.** The SIMD-peak line stays a conjecture in §7.0.2c rather
-than hardening into a fact, and the bounded next step is now specific rather
-than "instruction-level tracing" in the abstract — either a plugin build with
-`ENABLE_DEBUG_CAPS=ON`, or onetrace / Level-Zero PTI. The first is cheaper and
-answers exactly this question.
+So: **outcome three from the plugin binary** — and then a cheaper instrument
+answered it outright, without a plugin rebuild, `ENABLE_DEBUG_CAPS` or onetrace.
+**The installed IGC carries its own debug keys** (`ShaderDumpEnable`,
+`DumpToCustomDir`, `ShaderDumpEnableAll`, `ShaderDumpPidDisable`), so
+`IGC_ShaderDumpEnable=1 IGC_DumpToCustomDir=<path>` on the serving process dumps
+every kernel it compiles, with generated assembly. `dpas` is then either in the
+attention kernel's asm or it is not.
+
+**Measured 2026-08-30, 24 GB card, coder artifact, one prefill request per
+configuration. The answer is outcome one:**
+
+```
+sdpa_micro__prefill_10432584610579984572__sa      <- u8,  asm contains dpas
+sdpa_micro__prefill_3448044640564163734__sa       <- u8,  asm contains dpas
+sdpa_micro__prefill_10332065829643378056__sa      <- f16, asm contains dpas
+sdpa_micro__prefill_7506610878414805460__sa       <- f16, asm contains dpas
+```
+
+Micro SDPA is compiled for prefill and its generated assembly carries `dpas`, in
+**both** the KV precision the conjecture was formed on (u8) and the deployed one
+(f16). The dump's control held: five `.asm` files contained `dpas`, so the marker
+was detectable, and the two identified by entry name are the attention ones.
+
+That settles the last unchecked gate — `query_microkernels_supported` returned
+true — and with it the whole checklist. **Attention prefill runs on the matrix
+path. The SIMD-peak conjecture is dead**, and §7.0.2c is corrected accordingly.
+
+**What does not follow, and must not be quietly dropped.** The observation that
+produced the conjecture stands: the depth curve's quadratic coefficient implies
+~12 TFLOPS effective against a matrix-engine peak an order of magnitude higher.
+The *mechanism* offered for it is now refuted; the *number* is unexplained.
+Candidates, none measured: the FLOP arithmetic behind the coefficient is wrong;
+the quadratic term contains more than attention; or attention prefill is
+bandwidth-bound on KV reads rather than compute-bound, which a matrix unit does
+not help. It is recorded as an open number rather than deleted along with the
+theory it motivated.
+
+**Two limits of this instrument, stated so it is not over-read.** The dump proves
+*compilation and ISA*, not per-invocation dispatch — for that the debug-caps
+trace or PTI remains the tool. And the compiled attention set differs between
+precisions (the u8 build also carries `paged_attention_opt__multi_tokens`, the
+f16 one does not), which is recorded as an observation and not interpreted.
+
+**A near-miss of my own, recorded like the others.** The first probe listed
+*filenames* for attention names and returned zero — IGC names dumps by hash, so
+that measured nothing. Zero attention-named files maps exactly onto the
+pre-registered outcome three, whose reading was "likely the micro path". A broken
+probe would have produced the right conclusion for the wrong reason, and the only
+thing that caught it was the control.
 
 **Reading the gate narrows it to one unchecked condition.** The full micro-SDPA
 gate is `paged_attention_opt.cpp:1396ff`: `supports_immad`, arch ≥ `xe_hpg`, not
