@@ -195,6 +195,26 @@ Note: DESIGN.md section 4's original console sketch said "41 GDN + 7 attn
 layers | weights 15.9 GiB". That was illustrative and is wrong; the artifacts
 above are authoritative and the allowlist follows them.
 
+## Divergence policy (DESIGN 1.1)
+
+A fork of OpenVINO is not wanted: it erodes the compiler/kernels-vs-everything-
+else boundary, turns the packaged runtime from a repacked upstream wheel into
+our build, puts a rebase on the calendar every nightly, and makes every
+measurement one against our tree rather than a version anyone can obtain --
+which is the property that makes this repository's numbers checkable. But
+nobody optimises these operators for Intel, because almost nobody serves GDN
+hybrids on Arc, so waiting for upstream to want what only we need is not a plan.
+The rule is SMALLEST SUFFICIENT DIVERGENCE, in order: (1) upstream PR, written
+to their conventions from the first line so it can leave this tree; (2) a
+numbered patch series applied at build time in the packaging repo, each patch
+PR-shaped and named against its upstream discussion -- a fork only technically,
+rebased by re-applying; (3) a maintained fork, last resort, requiring a stated
+reason AND an exit condition. Whatever is carried is published, because a
+performance number depending on a patch nobody else has is an anecdote. Note the
+supply chain changes shape: the runtime package currently repacks wheels in
+seconds, while a patched build is a real x86_64 compile with no CI runner for
+that target.
+
 ## Key design points
 
 - All target models are hybrids: GatedDeltaNet (linear attention, fixed-size

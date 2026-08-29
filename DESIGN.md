@@ -22,6 +22,56 @@ makes choices arcint cannot live with (see §6).
 
 So: **OpenVINO as compiler and kernel library, arcint as everything else.**
 
+### 1.1 When a kernel has to change: smallest sufficient divergence
+
+The line above is load-bearing, and the first working kernel patch is what will
+test it. Say the position plainly now rather than discover it then.
+
+**A fork is not wanted.** It erodes exactly the boundary this section draws; it
+turns the packaged runtime from a repack of an upstream wheel into *our* build;
+it puts a rebase on the calendar every time the nightly moves; and it makes every
+future measurement a measurement against our tree rather than against a version
+anyone else can obtain. That last one matters most here, because the numbers in
+this document are its argument, and a number nobody can reproduce is not one.
+
+**And it happens anyway if that is what the work needs.** Almost nobody serves
+GDN hybrids on Arc, so nobody optimises these operators for it — `PagedCausalConv1D`
+has only a reference implementation, and the shared-expert gate falls to a
+reference GEMM at prefill shapes (both §7.0.2c). Waiting for upstream to want
+what only we need is not a plan. So the rule is not "no fork" but **smallest
+sufficient divergence**, in this order:
+
+1. **Upstream PR.** Written to their conventions from the first line — the impl
+   class beside the ref one, the selector condition where selectors live, tests
+   in their layout — so it can leave this tree without being rewritten. A merged
+   kernel costs nothing to maintain and benefits every Xe user, and this project
+   already has standing upstream (issues #4367 and #37607).
+2. **A patch series against the pinned version.** If a PR is slow or refused,
+   carry it as a numbered patch set applied at build time in the packaging
+   repository (`debian/marfrit-openvino`), **not** as a divergent checkout. Each
+   patch stays PR-shaped so it can be re-offered; the recipe gains a `patches/`
+   directory and the changelog names the upstream discussion each belongs to.
+   That is a fork only in the technical sense, and it rebases by re-applying
+   rather than by merging.
+3. **A maintained fork.** Last resort. It requires a stated reason here *and an
+   exit condition* — what would have to become true for us to drop it.
+
+The ordering is not politeness. An upstreamed patch is the cheapest form of the
+same code and the only form that does not still need us next year.
+
+**Two consequences to plan for rather than discover.**
+
+- *The supply chain changes shape.* The packaged runtime currently repacks two
+  upstream wheels against pinned checksums and builds in seconds. A patched build
+  is a real compile, x86_64, and there is no CI runner for that target — the same
+  gap that already forces the engine's own package to be built by hand. A patched
+  plugin turns that from temporary into structural, and the honest fix is a
+  runner, not more hand-building.
+- *Whatever we carry, we publish.* Patches live in the packaging repository where
+  anyone can read them, and this document names them and says why. A performance
+  number that depends on a patch nobody else has is not a result, it is an
+  anecdote.
+
 ## 2. Target constraints (facts, not choices)
 
 - All three models are **hybrid GDN/attention** transformers. The majority of
@@ -1654,7 +1704,9 @@ architecture record:
      only kernel string is `paged_causal_conv1d_ref`. No `Opt`. This is
      therefore *not* the shared-expert-gate situation, where a fast kernel
      existed and was not chosen; the lever here is writing a kernel behind the
-     `--custom-kernels` seam, or filing upstream. Both are real work.
+     `--custom-kernels` seam, or filing upstream. Both are real work, and §1.1
+     fixes the order to try them in and what a patch may not be allowed to
+     become.
    - **It is a decode lever, not a prefill one.** "6.3% of both phases"
      overstates the prefill side by exactly the past-0 error that has now bitten
      three times: the conv is depth-independent, so over a real prefill its cost
