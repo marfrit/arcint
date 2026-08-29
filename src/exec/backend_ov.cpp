@@ -2553,7 +2553,11 @@ private:
             // one. Convert to wall time before deciding a share is worth fixing.
             log::info("profile", "%s", "  (past 0: shares here overstate a real "
                                        "prefill's -- size against wall time)");
-            for (size_t i = 0; i < rows.size() && i < 20; ++i) {
+            // Every pair, not the top 20. A truncated table cannot answer
+            // "is this op still in the graph at all", which is exactly the
+            // question that arose about the transposes the paged transformation
+            // was supposed to have removed.
+            for (size_t i = 0; i < rows.size(); ++i) {
                 log::info("profile", "  %8.1f us %5d  %5.1f%%  %s", rows[i].second.us,
                           rows[i].second.n, 100.0 * rows[i].second.us / total,
                           rows[i].first.c_str());
