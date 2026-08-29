@@ -1334,12 +1334,16 @@ private:
             }
 
             if (drafts.empty()) {
+                const auto t_emb = clock::now();
+                const ov::Tensor emb1 = embed_paged({next});
+                stats.decode_embed_seconds += seconds_since_tp(t_emb);
                 const auto t_fwd = clock::now();
-                logits = paged_forward(embed_paged({next}), past,
-                                       {static_cast<int32_t>(c)}, 0);
+                logits = paged_forward(emb1, past, {static_cast<int32_t>(c)}, 0);
                 stats.decode_forward_seconds += seconds_since_tp(t_fwd);
                 ++past;
+                const auto t_smp = clock::now();
                 next = pick(sampler, logits);
+                stats.decode_sample_seconds += seconds_since_tp(t_smp);
                 if (mtp_ready_) {
                     mtp_set_pending(paged_req_.get_tensor("hidden_states"), 0);
                 }
@@ -1425,9 +1429,6 @@ private:
         }
 
         stats.decode_seconds = std::chrono::duration<double>(clock::now() - t_decode).count();
-        stats.decode_forward_seconds =
-            stats.decode_seconds - stats.decode_embed_seconds - stats.decode_sample_seconds -
-            stats.decode_emit_seconds;
         return reason;
     }
 
@@ -1501,7 +1502,17 @@ private:
 
         offload_ratio_ = cfg.offload_ratio;
         ov::AnyMap props;
-        props["KV_CACHE_PRECISION"] = ov::element::f16;
+        // u8 KV is the default, by §7.0.3's protocol run to completion on the
+        // C++ endpoint (2026-08-29): 10/10 on the harness at base depth AND at
+        // the ~30k depth probe, base answer bitwise identical to f16, never
+        // slower (71.3 vs 68.6 t/s), and half the KV memory. LIGENCE_PAGED_KV
+        // stays as the measurement switch to pin f16 for A/B runs.
+        ov::element::Type kv_prec = ov::element::u8;
+        if (const char* env = std::getenv("LIGENCE_PAGED_KV")) {
+            if (std::string(env) == "f16") kv_prec = ov::element::f16;
+            log::info("load", "paged KV precision override: %s", env);
+        }
+        props["KV_CACHE_PRECISION"] = kv_prec;
         if (offload_ratio_ > 0) {
             props["OFFLOAD_RATIO"]        = offload_ratio_;
             props[ov::weights_path.name()] = artifact_.language_model_bin;
@@ -1561,6 +1572,7 @@ private:
                     sh.push_back(static_cast<size_t>(ps[static_cast<int64_t>(i)].get_length()));
                 }
                 kv_pool_names_.push_back(name);
+                kv_pool_types_.push_back(port.get_element_type());
                 kv_pool_shapes_.push_back(sh);
                 size_t block_elems = 1;
                 for (size_t i = 1; i < sh.size(); ++i) block_elems *= sh[i];
@@ -1588,37 +1600,86 @@ private:
         }
 
         // ---- reservation: measure the activation peak with a probe pool ------
-        const size_t chunk = prefill_chunk_ > 0 ? static_cast<size_t>(prefill_chunk_) : 512;
-        const size_t probe_blocks = (chunk + kv_block_tokens_ - 1) / kv_block_tokens_ + 1;
-        alloc_kv_pools(rctx, probe_blocks);
-        zero_paged_rows();
-        {
-            std::vector<int> zeros(chunk, 0);
-            paged_forward(embed_paged(zeros), 0, {0, 0}, 0);
-        }
-        const size_t resident_peak = device_resident_bytes(device);
-        const size_t total = core_.get_property(device, ov::intel_gpu::device_total_mem_size);
-        const size_t slab  = la_row_bytes_ * paged_rows_;
-        const size_t probe_kv = probe_blocks * kv_block_bytes;
-        const long long activation =
-            static_cast<long long>(resident_peak) - static_cast<long long>(resident_base) -
-            static_cast<long long>(slab) - static_cast<long long>(probe_kv);
+        //
+        // The chunk size is the knob that buys context (§7.0.2a: the peak is
+        // linear in the chunk), so when the requested n_ctx does not fit at the
+        // configured chunk, the engine halves the chunk and RE-MEASURES rather
+        // than refusing outright. Refusal is what remains when the floor is hit.
+        const size_t total  = core_.get_property(device, ov::intel_gpu::device_total_mem_size);
+        const size_t slab   = la_row_bytes_ * paged_rows_;
         const size_t margin = 256ull << 20;
+        const int    wanted = req_n_ctx > 0 ? req_n_ctx : artifact_.n_ctx_train;
+
+        // Probe SMALL first -- a probe at the configured chunk can itself OOM on
+        // a tight card (observed on the A770: sometimes the driver spills,
+        // sometimes CL_OUT_OF_RESOURCES kills the process). The peak is linear
+        // in the chunk (§7.0.2a), so a 128-token probe fixes the slope, the
+        // largest admissible chunk is computed, and one guarded probe verifies
+        // it, stepping down on failure instead of dying.
+        auto probe = [&](size_t chunk_tokens) -> long long {
+            const size_t probe_blocks =
+                (chunk_tokens + kv_block_tokens_ - 1) / kv_block_tokens_ + 1;
+            alloc_kv_pools(rctx, probe_blocks);
+            zero_paged_rows();
+            std::vector<int> zeros(chunk_tokens, 0);
+            paged_forward(embed_paged(zeros), 0, {0, 0}, 0);
+            return static_cast<long long>(device_resident_bytes(device)) -
+                   static_cast<long long>(resident_base) - static_cast<long long>(slab) -
+                   static_cast<long long>(probe_blocks * kv_block_bytes);
+        };
+        const long long act128 = probe(128);
+        const double    slope  = static_cast<double>(std::max<long long>(act128, 1)) / 128.0;
+
+        // A configured chunk wins whenever it is admissible -- including one
+        // smaller than the 128-token probe (the cache grid may demand it). Only
+        // an INADMISSIBLE configuration is shrunk, never a valid one changed.
+        const size_t configured = prefill_chunk_ > 0 ? static_cast<size_t>(prefill_chunk_) : 512;
+        const size_t floor_c    = std::min<size_t>(configured, 128);
+        size_t       chunk      = floor_c;
+        for (size_t c = configured; c >= floor_c; c = c > floor_c ? std::max(c / 2, floor_c)
+                                                                  : floor_c - 1) {
+            const long long need = static_cast<long long>(resident_base) +
+                                   static_cast<long long>(slab) +
+                                   static_cast<long long>(margin) +
+                                   static_cast<long long>(slope * static_cast<double>(c)) +
+                                   static_cast<long long>(wanted) *
+                                       static_cast<long long>(kv_bytes_token_);
+            if (need <= static_cast<long long>(total)) { chunk = c; break; }
+            if (c == floor_c) break;
+        }
+        long long activation = act128;
+        while (chunk > 128) {
+            try {
+                activation = probe(chunk);
+                break;
+            } catch (const std::exception& e) {
+                log::warn("load", "probe at chunk %zu failed (%s); stepping down", chunk,
+                          e.what());
+                paged_req_ = paged_model_.create_infer_request();
+                for (size_t i = 0; i < la_state_names_.size(); ++i) {
+                    paged_req_.set_tensor(la_state_names_[i], la_state_tensors_[i]);
+                }
+                chunk /= 2;
+            }
+        }
+        if (chunk == 128) activation = act128;
         const long long budget = static_cast<long long>(total) -
-                                 static_cast<long long>(resident_peak - probe_kv) -
-                                 static_cast<long long>(margin) + 0;
+                                 static_cast<long long>(resident_base) -
+                                 static_cast<long long>(slab) - activation -
+                                 static_cast<long long>(margin);
         long long max_ctx = budget > 0 ? budget / static_cast<long long>(kv_bytes_token_) : 0;
         max_ctx = (max_ctx / static_cast<long long>(kv_block_tokens_)) *
                   static_cast<long long>(kv_block_tokens_);
         log::info("load",
-                  "reservation: weights+graph %.2f GiB, activation peak %.2f GiB at chunk %zu, "
-                  "LA slab %.1f MiB, KV %.1f KiB/token, margin 0.25 GiB -> max ctx %lld",
+                  "reservation: weights+graph %.2f GiB, activation peak %.2f GiB at chunk %zu "
+                  "(slope from a 128-token probe), LA slab %.1f MiB, KV %.1f KiB/token, margin "
+                  "0.25 GiB -> max ctx %lld",
                   static_cast<double>(resident_base) / (1u << 30),
                   static_cast<double>(activation) / (1u << 30), chunk,
                   static_cast<double>(slab) / (1u << 20),
                   static_cast<double>(kv_bytes_token_) / 1024.0, max_ctx);
+        prefill_chunk_ = static_cast<int>(chunk);
 
-        const int wanted = req_n_ctx > 0 ? req_n_ctx : artifact_.n_ctx_train;
         if (static_cast<long long>(wanted) > max_ctx) {
             if (req_n_ctx > 0) {
                 throw std::runtime_error(log::format(
@@ -1649,7 +1710,7 @@ private:
         for (size_t i = 0; i < kv_pool_names_.size(); ++i) {
             ov::Shape sh = kv_pool_shapes_[i];
             sh[0]        = blocks;
-            ov::RemoteTensor t = rctx.create_tensor(ov::element::f16, sh);
+            ov::RemoteTensor t = rctx.create_tensor(kv_pool_types_[i], sh);
             paged_req_.set_tensor(kv_pool_names_[i], t);
             kv_pool_tensors_.push_back(t);
         }
@@ -2260,6 +2321,7 @@ private:
     std::vector<ov::Shape>         la_state_shapes_;  // with the rows dim filled in
     std::vector<ov::RemoteTensor>  la_state_tensors_;
     std::vector<std::string>       kv_pool_names_;
+    std::vector<ov::element::Type> kv_pool_types_;
     std::vector<ov::Shape>         kv_pool_shapes_;   // with the blocks dim filled in
     std::vector<ov::RemoteTensor>  kv_pool_tensors_;
     size_t                         paged_rows_       = 4;

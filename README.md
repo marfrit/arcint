@@ -98,9 +98,14 @@ backend; **[M1]**–**[M5]** mean it runs against the real models on a real card
 
 ## Status
 
-Serving the real models on Intel Arc. Measured on a B60 with the 27B coder q4:
-**51.4 t/s decode, up to 2247 t/s prefill**, and all three target models reach
-**10/10** on the fleet's code-generation harness.
+Serving the real models on Intel Arc **on the paged executor** — ligence-owned
+block tables, measured-reservation admission, speculative decoding whose
+rollback moves zero bytes. Measured on a B60 with the 27B coder q4: **68.6 t/s
+decode (70.1 at 30k context — the depth collapse is gone), ~1970 t/s prefill,
+10/10 on the fleet harness at both depths**, u8 KV by default at half the
+memory. The dense Qwen3.8 serves with its MTP head at **36.2 t/s, 10/10
+greedy**. The stateful executor stays behind `--no-paged` as the reference
+implementation the equivalence suite compares against.
 
 | milestone | state |
 |---|---|
@@ -108,7 +113,7 @@ Serving the real models on Intel Arc. Measured on a B60 with the 27B coder q4:
 | M1 executor, greedy, 27B coder on B60 | done — 51.4 t/s, 10/10 |
 | M2 chunked prefill, cache ledger, long context | done — **257,167 tokens loaded** |
 | M3 prefix caching | done — warm/cold byte-identical, hit stats on console |
-| M4 MTP | acceptance done — **93.3%** on Qwen3.8, verification exact. *Not* byte-identical to plain greedy; no speculative scheme can be on this backend (§3.2) |
+| M4 MTP | **done and served**: paged executor, rollback = checkpoint-row promotion (0.00 s on the console), 36.2 t/s at 93.2% acceptance, 10/10 greedy |
 | M5 all three models | done — all three serve; the 35B now fits the A770 too, via `--offload-ratio` |
 
 M4 is done, and the measurement is the result. The Qwen3.8 MTP head — which no

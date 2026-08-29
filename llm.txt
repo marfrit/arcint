@@ -10,7 +10,16 @@
 
 ## Status
 
-M0-M5 all meet their exit criteria. Serving the real models on Intel Arc
+M0-M5 all meet their exit criteria, and the paged executor is the SERVED path
+(2026-08-29): coder B60 68.6 t/s decode (70.1 at 30k depth - no depth collapse),
+~1970 t/s prefill, 10/10 harness at base and 30k depth, u8 KV default (10/10
+both depths, base answer bitwise identical to f16, half the memory); dense B60
+36.2 t/s with MTP at 93.2% acceptance, 10/10 GREEDY (registry updated from the
+old 8/10). Admission by measured reservation; when a requested n_ctx does not
+fit at the configured chunk the engine halves the chunk and re-measures (the
+peak is linear in the chunk) before refusing with the numbers. Speculative
+rollback and re-forward print 0.00 s because neither exists on this path. The
+stateful executor remains behind --no-paged as the reference oracle. Serving the real models on Intel Arc
 via OpenVINO: 51.4 t/s decode and up to 2247 t/s prefill on a B60 with the 27B
 coder q4; all three target models reach 10/10 on the fleet harness.
 

@@ -730,6 +730,60 @@ What the C++ port inherits from the prototype as requirements: zeroed rows,
 device-resident tables set once, compile ordering, the reservation, the
 three-row rotation, and the head fed committed tokens only.
 
+#### 3.5.4 The C++ port: the measured path is the served path (2026-08-29)
+
+The paged executor is the default serving path; `--no-paged` keeps the stateful
+executor as the reference implementation the suite compares against. Everything
+the prototype proved rides along as an invariant: zeroed rows, device-resident
+tables set once, big-model-first compile ordering, `--emb-device`/`--mtp-device`
+for parking the gather and the head on the other card, measured-reservation
+admission with the refusal carrying the numbers, and rollback as checkpoint-row
+promotion — the console prints `re-forward 0.00 s, rollback 0.00 s` because
+neither exists here.
+
+Two behaviours were added beyond the prototype, both forced by the A770:
+
+- **The reservation probes small and extrapolates.** A probe at the configured
+  chunk can itself OOM (observed: sometimes the driver spills, sometimes
+  `CL_OUT_OF_RESOURCES` kills the process — the same borderline nondeterminism
+  §7.1 met). The peak is linear in the chunk, so a 128-token probe fixes the
+  slope, the largest chunk that admits the requested n_ctx is computed, and one
+  guarded probe verifies it, stepping down on failure.
+- **The chunk shrinks itself before the engine refuses.** The chunk is the knob
+  that buys context; refusal is what remains at the floor.
+
+The paged prefix-cache blob is one LA row plus the head's variables, cursor and
+pending row — no KV copy. A pool-epoch tag makes that honest with one slot: a
+cold prefill rewrites the pool and bumps the epoch, so an entry from an older
+lineage is a miss instead of a wrong answer. Block-refcount multi-entry caching
+is M6's business.
+
+**Gates**: the full suite is green on the coder (B60 and A770) and the dense
+model (B60), under the served default. Stateful-vs-paged is compared and
+recorded per run (coder B60: byte-identical; dense: differs — near-tie class).
+The dense-on-A770 suite is inadmissible at the suite's fixed `--n-ctx 8192`
+(64 KiB/token of KV beside 13.59 GiB of weights admits ctx 6512), which is the
+reservation stating a fact about the card, not a failure.
+
+**Bars, measured against their stated values:**
+
+| bar | stated | measured |
+|---|---|---|
+| B60 coder decode | ≥ 64.5 t/s (the Python driver) | **68.6 t/s** (71.3 under u8) — the founding 60 t/s bar falls with it |
+| B60 coder at ~30k depth | — | **70.1 t/s**: the depth collapse is gone from the served path |
+| A770 dense + MTP (head on B60) | ≥ 26.6 t/s | 24.9 t/s at 86.2% acceptance — **per-pass cost 74.2 ms vs the oracle's 74.0**; the delta is acceptance (the bar was set on a 96.7%-acceptance degenerate prompt), not machinery |
+| prefill | ≥ 586–901 t/s band | 1969 t/s (B60, 30k prompt), 625 t/s (A770 dense chunk 512) |
+| dense B60 + MTP | — | 36.2 t/s at 93.2% acceptance |
+
+**Harness verdicts through the served endpoint** (the quality half this port
+unblocks): coder **10/10** at base depth and **10/10 at the ~30k depth probe**;
+u8 KV **10/10 at both depths** with the base answer *bitwise identical* to f16
+and never slower — so **u8 is the paged default** per §7.0.3's protocol, halving
+KV memory, with `LIGENCE_PAGED_KV=f16` as the pin for A/B runs. The dense model
+re-measured **10/10 greedy** through paged+MTP (36.2 t/s), superseding the
+registry's stateful-era 8/10 — greedy is deterministic per configuration, so
+both numbers are real; the paged path's near-tie landings score better here.
+
 ### 3.6 Sampling
 
 Greedy, temperature, top-k, top-p, repetition penalty, presence and frequency
