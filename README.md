@@ -86,8 +86,8 @@ backend; **[M1]**–**[M5]** mean it runs against the real models on a real card
   gives each lane its own `InferRequest`s (language model, embeddings, both MTP
   requests), its own GDN checkpoint rows and its own KV block table out of a
   shared, refcounted page pool. Gated: two prompts interleaved are
-  **byte-identical** to their solo runs in both start orders, and the Prüfstand
-  scores **10/10 on each lane while both run it at once**. The measured cost of
+  **byte-identical** to their solo runs in both start orders, and the acceptance
+  task scores **10/10 on each lane while both run it at once**. The measured cost of
   sharing: an agent session at 30k context and a subagent burst get 32.5 and
   31.2 t/s against 68.7 t/s alone, with the session's inter-token stall at
   **p95 17 ms**. Sequences are never batched into one graph call, which is what
@@ -116,62 +116,69 @@ backend; **[M1]**–**[M5]** mean it runs against the real models on a real card
 - No training, no LoRA, no quantization tooling (artifacts are produced offline).
 - No Windows.
 
+## Measured
+
+One task, one model, four engines. The acceptance task is a Lua CSV parser to
+RFC 4180: ten named cases (CRLF and bare LF, a missing final terminator, quoted
+fields, an embedded comma, a doubled quote, an embedded newline, empty and
+empty-quoted fields, no trimming). The candidate code is **executed**, not read;
+one point per case. Greedy where the model tolerates it, otherwise the model
+card's own sampling defaults.
+
+Same artifact, same card, only the serving pipeline changes:
+
+| engine | card | weights | decode | task |
+|---|---|---|---|---|
+| OpenVINO GenAI, stateful pipeline | B60 | int4 AWQ (expert-pruned 184/256) | ≈43 t/s | 10/10 |
+| arcint, stateful executor (`--no-paged`) | B60 | same IR | 51.4 t/s | 10/10 |
+| **arcint, paged executor, u8 KV** | B60 | same IR | **71.3 t/s** (68.6 at f16 KV) | 10/10 |
+| arcint, paged, at ~30k context | B60 | same IR | 70.1 t/s | 10/10 |
+
+For scale, the same model on the other card and the other engine — a different
+quantisation and a different card, so read it as a rough bound, not as a row of
+the series above:
+
+| engine | card | weights | decode | task |
+|---|---|---|---|---|
+| llama.cpp, SYCL | A770 | GGUF Q4_K_M | 14.4 t/s | 10/10 |
+
+Two facts the table does not show. The depth column is where the difference
+actually lives: 70.1 t/s at ~30k against 71.3 at short context means the usual
+collapse with depth is gone from the served path, which is a property of the
+paged block tables rather than of raw throughput. And every arcint row above is
+gated by byte-equality tests, not just by a score: warm cache against cold, one
+lane against two, paged against stateful.
+
+The dense Qwen3.8 serves with its reconstructed MTP head at **36.2 t/s** and
+93.2% acceptance, 10/10 greedy. Prefill on the coder reaches ~1970 t/s.
+
 ## Status
 
-Serving the real models on Intel Arc **on the paged executor** — arcint-owned
+Serving all three models on both cards, on the paged executor: arcint-owned
 block tables, measured-reservation admission, speculative decoding whose
-rollback moves zero bytes. Measured on a B60 with the 27B coder q4: **68.6 t/s
-decode (70.1 at 30k context — the depth collapse is gone), ~1970 t/s prefill,
-10/10 on the fleet harness at both depths**, u8 KV by default at half the
-memory. The dense Qwen3.8 serves with its MTP head at **36.2 t/s, 10/10
-greedy**. The stateful executor stays behind `--no-paged` as the reference
-implementation the equivalence suite compares against.
+rollback moves zero bytes. u8 KV is the default, at half the memory and
+bit-identical output. The stateful executor stays behind `--no-paged` as the
+reference implementation the equivalence suite compares against.
 
 | milestone | state |
 |---|---|
 | M0 skeleton | done |
 | M1 executor, greedy, 27B coder on B60 | done — 51.4 t/s, 10/10 |
-| M2 chunked prefill, cache ledger, long context | done — **257,167 tokens loaded** |
+| M2 chunked prefill, cache ledger, long context | done — 257,167 tokens loaded |
 | M3 prefix caching | done — warm/cold byte-identical, hit stats on console |
-| M4 MTP | **done and served**: paged executor, rollback = checkpoint-row promotion (0.00 s on the console), 36.2 t/s at 93.2% acceptance, 10/10 greedy |
-| M5 all three models | done — all three serve; the 35B now fits the A770 too, via `--offload-ratio` |
-| M6 two lanes per service | done — byte-identical under interleaving on both cards, 10/10 on each lane concurrently, decode 67.6–69.9 vs 68.8 t/s single-stream |
-
-M4 is done, and the measurement is the result. The Qwen3.8 MTP head — which no
-public implementation can export, and which `tools/export_mtp.py` reconstructs
-from the raw weights — reaches **93.3% acceptance**, and drafted tokens are
-never taken on faith. It is *not* byte-identical to plain greedy, and the reason
-turned out to govern chunked prefill too: on this backend, advancing the state
-by two tokens in one call is not the same computation as advancing it twice by
-one (§3.2). It is still
-slower than not speculating, and by now the reason is precisely located:
-rolling back 171 MiB of mostly-GDN recurrent state costs 66% of decode time,
-inside OpenVINO's `VariableState` API. Net of that, MTP is 1.35× faster. So the
-paged decode path is no longer an optimisation — it is the precondition, and it
-is worth about 2× on Qwen3.8.
-
-M2 is done and measured: slicing logits to the last token removed a wall at
-~8k tokens, storing the attention KV as fp16 took 262144 context from 10.0 GiB
-to 5.0 GiB, and with both in place arcint loaded **257,167 tokens** — 98% of
-the artifact's maximum — in 8.1 minutes. What remains is OpenVINO's
-paged-attention path, whose decode-side block-table convention is undocumented;
-it is an optimisation now, not a blocker.
-
-M6 is done, and it is one process rather than two. `--parallel 2` runs two
-sequences with no shared mutable state and no lock on the decode loop; what
-orders them is a FIFO turnstile around graph executions, which is what bounds
-the stall (a decode step waits for at most one execution of the other lane) and
-what makes each lane's output safe to read — the GPU plugin pools intermediate
-buffers per compiled *model*, not per request, which is also why the second lane
-costs **0.00 GiB** of activations. See DESIGN §4.1 and §7.2.
+| M4 MTP | done and served — 36.2 t/s at 93.2% acceptance, 10/10 greedy |
+| M5 all three models | done — the 35B fits the A770 too, via `--offload-ratio` |
+| M6 two lanes per service | done — byte-identical under interleaving on both cards, 10/10 on each lane concurrently |
 
 Verification: 155 unit cases, a 48-check curl round-trip, a lane-accounting
 stress (200 requests, 24-way, 8 lanes, queueing and refusing), an equivalence
 suite and a concurrency suite that run where the card is. Clean under ASan and
 UBSan on x86_64.
 
-See [DESIGN.md](DESIGN.md) for the architecture and milestones,
-[llm.txt](llm.txt) for a machine-readable summary.
+Why these numbers look the way they do — including the ones that came out
+negative, and the explanations that were retracted after a measurement
+contradicted them — is in [DESIGN.md](DESIGN.md).
+[llm.txt](llm.txt) is the machine-readable summary.
 
 ## Building
 
@@ -194,9 +201,8 @@ in. `-DARCINT_WERROR=ON` for the warning-clean build CI should use.
 
 The installed binary is self-contained: it resolves the OpenVINO runtime and
 the tokenizers extension through RPATH, both found at configure time, so a unit
-file carries flags and not a library search path. Verified on dirac — with
-`LD_LIBRARY_PATH` unset there are no unresolved objects, and it serves `/health`
-under `env -i`.
+file carries flags and not a library search path. With `LD_LIBRARY_PATH` unset
+there are no unresolved objects, and it serves `/health` under `env -i`.
 
     cmake -S . -B build-ov -DARCINT_OPENVINO=ON -DCMAKE_BUILD_TYPE=Release \
           -DARCINT_GIT_SHA=$(git rev-parse --short=12 HEAD)
@@ -210,20 +216,15 @@ them. If a deployment would rather queue than be refused at request time, set
 `--queue-timeout S`.
 
 `packaging/arcint.service` and `packaging/arcint.env` are a systemd **user**
-unit and its configuration, matching how the fleet already runs its inference
-services. Every arcint setting is a command line flag, so the env file holds
-the flags and the unit itself never has to be edited. `-DARCINT_GIT_SHA` is
-worth passing whenever the build tree has no `.git` — otherwise `--version` and
-`/props` report `unknown`, and a running binary cannot say what it is.
+unit and its configuration. Every arcint setting is a command line flag, so the
+env file holds the flags and the unit itself never has to be edited.
+`-DARCINT_GIT_SHA` is worth passing whenever the build tree has no `.git` —
+otherwise `--version` and `/props` report `unknown`, and a running binary cannot
+say what it is.
 
-On dirac specifically, unit changes go through the Roundhouse MCP rather than
-hand-edited systemctl: a hand edit without a commit in `~/.config/systemd/user`
-crashes roundhouse. The file is the content to hand it, not permission to
-install it by hand.
-
-Note the port: arcint and the fleet's existing coder endpoint both want the
-same card, and the B60 holds a model's VRAM for the process lifetime. Running
-arcint there means replacing that endpoint, not sitting beside it.
+One process holds its model's VRAM for its whole lifetime. Whatever else was
+serving that card has to stop first: arcint replaces an endpoint, it does not
+sit beside one.
 
 ## Why not just use …
 
