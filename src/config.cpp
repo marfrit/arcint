@@ -1,6 +1,7 @@
 #include "config.h"
 
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -29,6 +30,24 @@ bool parse_int(std::string_view s, int& out) {
     return true;
 }
 
+bool parse_double(std::string_view s, double& out) {
+    if (s.empty()) return false;
+
+    const std::string text(s);
+    char*             end = nullptr;
+    errno                 = 0;
+    const double      value = std::strtod(text.c_str(), &end);
+
+    if (end == text.c_str() || end == nullptr || *end != '\0') return false;
+    // NaN and infinity both have to go: an infinite duration handed to
+    // condition_variable::wait_for is undefined, and in practice saturates into
+    // the past, which would silently turn "wait forever" into "do not wait" —
+    // the exact ambiguity the bounded admission exists to remove.
+    if (errno == ERANGE || !std::isfinite(value)) return false;
+    out = value;
+    return true;
+}
+
 }  // namespace
 
 std::string usage_text() {
@@ -48,7 +67,9 @@ std::string usage_text() {
         "server\n"
         "  --host ADDR               bind address (default: 127.0.0.1)\n"
         "  --port N                  bind port (default: 8090)\n"
-        "  --parallel N              number of slots (default: 1)\n"
+        "  --parallel N              number of lanes (default: 1)\n"
+        "  --queue-timeout S         seconds a request waits for a lane before a\n"
+        "                            503 with the reservation numbers (default: 0)\n"
         "  --http-threads N          HTTP worker threads (default: library default)\n"
         "\n"
         "memory\n"
@@ -131,6 +152,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--parallel") {
             if (!value(v) || !parse_int(v, cfg.parallel)) {
                 return fail("--parallel needs an integer");
+            }
+        } else if (arg == "--queue-timeout") {
+            if (!value(v) || !parse_double(v, cfg.queue_timeout_s)) {
+                return fail("--queue-timeout needs a number of seconds");
             }
         } else if (arg == "--stub-delay-ms") {
             if (!value(v) || !parse_int(v, cfg.stub_delay_ms)) {
@@ -235,6 +260,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
 
     if (cfg.port < 1 || cfg.port > 65535) return fail("--port must be in [1, 65535]");
     if (cfg.parallel < 1) return fail("--parallel must be >= 1");
+    if (!(cfg.queue_timeout_s >= 0.0 && cfg.queue_timeout_s <= 3600.0)) {
+        return fail("--queue-timeout must be between 0 and 3600 seconds");
+    }
     if (cfg.http_threads < 0) return fail("--http-threads must be >= 0");
     if (cfg.stub_delay_ms < 0) return fail("--stub-delay-ms must be >= 0");
     if (cfg.device.empty()) return fail("--device must not be empty");

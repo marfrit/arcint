@@ -125,13 +125,13 @@ int main(int argc, char** argv) {
                        artifact.sampler.provenance.c_str(), artifact.sampler.temperature,
                        artifact.sampler.top_p, artifact.sampler.top_k);
 
-        if (cfg.parallel > 1) {
-            // Each sequence needs its own copy of the graph's 80 state
-            // variables, and the attention KV alone is gigabytes at long
-            // context. Real concurrency waits for the paged pool at M2.
-            lgc::log::warn("boot", "--parallel %d ignored: the M1 executor serves one sequence "
-                                   "at a time (paged KV lands at M2)", cfg.parallel);
-            cfg.parallel = 1;
+        if (cfg.parallel > 1 && !cfg.paged) {
+            // The stateful graph has one internal state, so a second sequence
+            // would overwrite the first's. The paged path is what made lanes
+            // possible (M6): its state lives in arcint's own rows and pages.
+            lgc::log::warn("boot", "--parallel %d with --no-paged: the stateful reference "
+                                   "executor serves one sequence at a time and the other "
+                                   "lane(s) will wait", cfg.parallel);
         }
 
         const int n_ctx = cfg.n_ctx > 0 ? cfg.n_ctx : artifact.n_ctx_train;
@@ -141,10 +141,20 @@ int main(int argc, char** argv) {
             lgc::log::error("load", "could not bring up the OpenVINO executor: %s", e.what());
             return 1;
         }
-        lgc::log::info("load", "n_ctx %d | device %s | prefill %s", n_ctx, cfg.device.c_str(),
-                       cfg.prefill_chunk > 0
-                           ? lgc::log::format("chunked at %d tok", cfg.prefill_chunk).c_str()
-                           : "unchunked");
+        // What the engine actually settled on, not what was asked for: the
+        // reservation may have clamped n_ctx and halved the chunk to make the
+        // configuration fit (§7.0.2a), and a line that repeats the request
+        // instead of the outcome is how a clamped run gets read as the one that
+        // was configured.
+        const lgc::Reservation& res = backend->status().reservation;
+        const int eff_ctx   = backend->status().n_ctx > 0 ? backend->status().n_ctx : n_ctx;
+        const int eff_chunk = res.measured ? res.prefill_chunk : cfg.prefill_chunk;
+        lgc::log::info("load", "n_ctx %d | device %s | prefill %s | %d lane%s", eff_ctx,
+                       cfg.device.c_str(),
+                       eff_chunk > 0
+                           ? lgc::log::format("chunked at %d tok", eff_chunk).c_str()
+                           : "unchunked",
+                       cfg.parallel, cfg.parallel == 1 ? "" : "s");
         if (cfg.prefill_chunk > 0) {
             lgc::log::verbose("load",
                               "prompts over %d tokens are prefilled in chunks; chunk boundaries "

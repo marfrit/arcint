@@ -327,9 +327,20 @@ cost of trusting it is every answer.
   gets them from the plugin, which is another reason to finish it. The 35B and
   the dense 3.8 need q8 to reach 262144 on this card (5.0 and 8.0 GiB of fp16
   KV respectively against tighter weight budgets), so they wait on it.
-- **KV pages**: fixed block size (16 or 32 tokens, benchmark decides), fp16 or
-  q8 per config, pool sized at startup from free VRAM after weights. Standard
-  vLLM-style block tables, no eviction in v1 (a full pool rejects admission).
+- **KV pages**: fixed block size, fp16 or q8 per config, pool sized at startup
+  from free VRAM after weights. Standard vLLM-style block tables.
+
+  Two things became concrete at M6. The page size is the **plugin's**, not
+  `--kv-block-size`: the transformed graph's `key_cache`/`value_cache` ports are
+  laid out in 16-token pages and all the byte arithmetic divides by that.
+  `--kv-block-size` governs the *prefix cache's* reuse granularity, which is a
+  multiple of it and therefore compatible. And the pool is **refcounted**
+  (`src/core/block_pool.h`), because with two lanes a page can be live in one
+  sequence, held by a cache entry, and mapped by the other lane at the same
+  time; only a reference count can say when it is free. Eviction exists in
+  exactly one form: **cached** prefixes are dropped when a live sequence needs
+  pages. A live sequence's pages are never taken, and a pool that cannot be
+  freed enough ends the request cleanly instead of failing on the card.
 - **GDN ledger**: per-sequence fixed-size state slabs, plus **block-aligned
   checkpoints** for prefix caching. A checkpoint is written exactly at every
   KV-block boundary — not at a memory-tuned interval. This is the direct
@@ -379,11 +390,28 @@ executor keeps running the graph as exported.
   prompt (the GDN half is fixed-size and dominates at short context), 0.08 s to
   snapshot and 0.07 s to restore. Restoring after deliberately poisoning the
   state with unrelated text reproduces the original continuation exactly.
+- **On the paged path the two halves live in different places, each for a
+  measured reason (M6).** The GDN checkpoint is a fixed-size host blob (~32 MiB
+  per row) and travels inside the cache entry. The KV is large and already on
+  the card, so it is *not* copied: the entry holds references to the pages
+  themselves, and a hit maps them. That is what replaced the single-slot
+  pool-epoch tag the C++ port shipped with — an epoch is only a way of noticing
+  that the one sequence has overwritten the pool, and with two lanes there is no
+  "the one sequence".
+
+  Sharing pages needs no copy-on-write machinery, and the reason is structural
+  rather than optimistic: a hit lands on a block boundary by construction, so
+  every page it maps is **complete**, and a complete page is never written
+  again — the page a sequence writes into is always one it allocated itself,
+  with a refcount of one. The backend asserts the alignment rather than assuming
+  it; a hit that is not block-aligned falls back to a cold prefill instead of
+  writing into someone else's page.
 - **Invariant (tested in CI, not aspirational):** for any prompt and any cache
   state, greedy output is byte-identical to a cold run. This is the
   anti-CVS-162891 stance: the equivalence test is the *gate*, and a change
   that breaks it does not merge. Failing kernels or fused paths that cannot
-  meet it are configured out, not papered over.
+  meet it are configured out, not papered over. M6 adds the second half of the
+  same claim: it holds **per lane, with the other lane active**.
 
 ### 3.5 Speculative decoding (MTP)
 
@@ -888,6 +916,102 @@ lgc  slot 0: decode    592 tok in  9.86 s ( 60.0 t/s) | mtp accept 61.2%
 One line per event, greppable, no colors by default, `-v` raises verbosity
 (`-v` adds one `http:` line per request, `-vv` is debug).
 
+### 4.1 Two lanes (M6)
+
+The use case that defines this: an agent session is mid-decode on a 30k
+context, a subagent fires one request at the same model, and neither queues
+behind the other or changes the other's bytes. `--parallel 2` is the product.
+N stays configurable, everything below is gated at 2.
+
+**A lane is one sequence's worth of mutable state, and nothing in it is
+shared.** Per lane: an `InferRequest` for the language model, one for the
+embeddings gather, two for the MTP head, its own GDN checkpoint rows, its own
+KV block table, its own logits buffer. What is shared is either immutable or
+refcounted: the compiled models, and the KV page pool. That split is what makes
+a second lane affordable — **weights are shared between `InferRequest`s of one
+`CompiledModel`, and only between those**: two *compiles* of one graph cost
+0.791 → 1.582 GiB (§7.0.2), two *requests* cost the activations, and on this
+plugin not even those (below).
+
+**Sequences are never mixed inside one graph execution.** Each lane steps its
+own request over its own rows and pages; there is no batching of two sequences
+into one call. That is the rule all three reference engines agree on for hybrid
+GDN models, and it is also the only shape under which the equivalence
+invariants of §3.4 can survive, since a batched call changes the arithmetic of
+every sequence in it.
+
+**The scheduler is a ticket lock, and it is a correctness mechanism before it
+is a fairness one.** `Turnstile` (src/core/turnstile.h) orders graph
+executions: whoever asks first runs first. Three things follow.
+
+1. *Bounded stall.* A decode step waits for at most one other execution, so the
+   worst inter-token stall on the busy lane is one prefill chunk, not an
+   unbounded run of them. Left to the plugin's own unordered lock no bound can
+   be stated at all.
+2. *Correctness.* The GPU plugin pools intermediate buffers **per compiled
+   model, not per request** (measured: a second `InferRequest` adds 0.00 GiB,
+   §7.2). Two concurrent executions would therefore write over each other's
+   intermediates. The turnstile is what makes that impossible, and the same
+   measurement is why each lane copies its logits and hidden state out of the
+   request *inside* its turn — a request's own output tensor is only valid
+   until the next execution on that model, by anyone. That applies to **every**
+   shared compiled model, not just the big one: the embeddings gather and the
+   MTP head are shared too, and their output is read the same way, so they take
+   turns as well.
+3. *Measurement.* The wait is timed where it happens, so the console reports
+   what the other lane actually cost this one, as a p95 over decode steps
+   rather than a mean: one long stall inside many short steps is exactly what a
+   mean hides.
+
+```
+lgc  slot 1: prefill   309 tok in  0.42 s (734.5 t/s)
+lgc  slot 0: decode    400 tok in 12.29 s ( 32.5 t/s) | graph 6.39 s, embed 0.05 s, sample 0.05 s, emit 0.09 s, wait 5.72 s, other 0.00 s | stall p95 17 ms max 516 ms (246 steps, 5.72 s total)
+```
+
+Waiting is its own term on that line, not folded into whichever phase happened
+to block: a step that spent 10 ms queueing did not spend 10 ms gathering
+embeddings, and a breakdown that says it did sends the next person profiling the
+wrong kernel.
+
+**The prefill grid is configuration, never a scheduling variable.** It would be
+easy to shrink a prefilling lane's chunk under contention to cut the other
+lane's stall. It is also forbidden: chunk boundaries are not bit-exact on this
+backend (§3.2), so a grid that depended on what the other lane happened to be
+doing would make a warm run diverge from a cold one for reasons no one could
+reproduce. The stall bound is therefore a property of `--prefill-chunk`, which
+is the honest place for the operator to trade it.
+
+### 4.2 Admission: a lane is a memory reservation
+
+`--parallel N` is not a queue depth, it is a claim about memory: the startup
+arithmetic of §7.0.2a reserves activations, GDN checkpoint rows and KV for N
+concurrent sequences at the requested `n_ctx`. An N+1st sequence has nowhere to
+live, so it is **refused with those numbers** — HTTP 503 carrying the same
+terms `/props` publishes — rather than queued behind a session that may decode
+for minutes, which a client cannot tell from a hang. `--queue-timeout S` (0 by
+default) restores waiting for deployments that prefer it; `/health` reports the
+queue depth either way.
+
+The refusal happens before a single response byte is committed, which is the
+only place a status code can still be chosen: once an SSE body has started, a
+failure can only be a message inside a 200.
+
+The default is a **behaviour change** and is worth stating as one: before M6 a
+second concurrent request queued, and now it is refused unless a timeout says
+otherwise. That is right for the engine — the number is a memory claim — and
+wrong for a service endpoint whose callers are OpenAI-compatible clients, most
+of which do not retry a 503. So `packaging/arcint.env` sets
+`--queue-timeout 30` for the shipped unit, and the two decisions stay separate:
+the engine tells the truth, the deployment chooses the manners.
+
+KV pages are the other half. The pool is refcounted (`src/core/block_pool.h`):
+a page is handed out with one reference, gains one for every sequence or cache
+entry that maps it, and returns to the free list when the last one goes. When a
+lane needs a page and the pool is dry, **cached prefixes are dropped first** —
+a cached page is reclaimable, a live sequence's is not — and only if that is
+not enough does the request end, cleanly, rather than as an allocation failure
+on the card.
+
 ## 5. Testing and acceptance
 
 - **Prüfstand gate**: the fleet's 10-point code-generation harness runs against
@@ -922,6 +1046,10 @@ One line per event, greppable, no colors by default, `-v` raises verbosity
   should be read as "10/10 at the artifact's sampling defaults" until someone
   produces a genuinely greedy 10/10 on this artifact.
 - **Equivalence suite**: `tests/equivalence/run.sh`, run where the card is.
+  `ARCINT_EXTRA_ARGS="--parallel 2"` runs the whole of it on a two-lane engine,
+  which is where M6 had to leave it green: every equality claim here is about
+  one sequence, and they have to keep holding on an engine that can run two.
+  Verified 2026-08-29, all checks passed.
   Green on the b5 coder as of 2026-08-28: two greedy runs byte-identical, warm
   prefix cache byte-identical to cold, cache hits reported on the console, and
   a continuation of a cached prompt hitting too. MTP on vs off joins it at M4.
@@ -930,9 +1058,29 @@ One line per event, greppable, no colors by default, `-v` raises verbosity
   chunked vs unchunked prefill, which this backend cannot deliver (see §3.2).
   It is reported with numbers on every run rather than asserted, and the
   shipped default is the unchunked configuration that does satisfy equality.
+- **Concurrency suite** (M6): `tests/concurrency/run.py`, run where the card is,
+  green on **both cards** 2026-08-29. What it gates:
+
+  | check | why it is a gate and not a print |
+  |---|---|
+  | no cross-slot bleed | two prompts interleaved are byte-identical to their solo runs, **in both start orders**. A lane reading another lane's pages, GDN rows or logits buffer answers something plausible and different, which is the whole failure class this engine exists to refuse |
+  | both lanes were used | equality proves nothing if everything ran on slot 0 — the console must show slot 1 working |
+  | cold/warm per lane | §3.4's invariant, held while the other lane is busy, with the hit reported |
+  | the cache holds pages | a hit that shared no KV page is not the thing being claimed |
+  | cancellation | one client disappearing leaves the other's bytes alone and gives back both the lane and its pages |
+  | admission | a third concurrent request is a 503 carrying the reservation numbers, and `CL_OUT_OF_RESOURCES` appears nowhere in the log |
+  | the stall is reported | a bound nobody prints is a claim, not a measurement |
+
+  **Verified red before green**, as §5 requires. A build in which both lanes
+  index lane 0 — one line — fails exactly the four bleed checks and the
+  cancellation check, and passes "both lanes were used" (the console still says
+  slot 1), which is the point of having that check separate. The driver noticed
+  too: `dmesg` recorded `Engine reset: engine_class=ccs/bcs` and
+  `Fault response: Unsuccessful` on the B60 during the red run.
 - **Determinism**: two identical greedy runs produce identical bytes (verified
   on the A770/Vulkan agent baseline as achievable on this hardware class).
-- **In CI today (M0)**: 96 unit cases plus a 48-check curl round-trip, both
+- **In CI today**: 155 unit cases, a 48-check curl round-trip and the
+  lane-accounting stress (`tests/concurrency/stress.sh`, stub-only), all three
   under `ctest`. They cover the parts of the contract that need no GPU and are
   therefore already gateable — the overflow 400 and its numbers, tool-call
   parsing in both wire forms, the UTF-8 and stop-sequence hold-backs, the
@@ -1096,7 +1244,7 @@ and owns the state.
 | M2 | paged KV + GDN ledger, chunked prefill | equivalence suite green, 256k context loads | **done** — suite green, **257,167 tokens loaded** (§5); paged path mapped but not adopted |
 | M3 | prefix caching (block-aligned checkpoints) | warm/cold byte-equality, hit-rate stats on console | **done** — warm/cold byte-identical, hit stats on console |
 | M4 | MTP for Qwen3.8, sampling beyond greedy | greedy-invariance with MTP on, measured acceptance | **acceptance done** — 93.3% on the dense model, verification exact (§3.5.2). Greedy-invariance is **not achievable on this backend** and the criterion was wrong to assume it was: a multi-token verify pass and a single-token plain pass differ (§3.2), so any speculative scheme can flip a near-tie. Also a net slowdown until the paged path lands. |
-| M6 | per-slot InferRequest scheduler | N slots = N InferRequests (embeddings and MTP twins included); admission bounded by the measured reservation curve (§7.0.2a terms, per slot); the 200-request 24-way concurrency stress passes; single-stream latency regresses < 5% with the suite green. Any regression beyond that gets a profile naming the contended resource before any tuning. | **open** — §3's SlotPool serialises on one mutex today; OV's stateful API already isolates state per request, so the mechanism is known (§3) |
+| M6 | per-slot InferRequest scheduler | N slots = N InferRequests (embeddings and MTP twins included); admission bounded by the measured reservation curve (§7.0.2a terms, per slot); the 200-request 24-way concurrency stress passes; single-stream latency regresses < 5% with the suite green. Any regression beyond that gets a profile naming the contended resource before any tuning. | **done** (§7.2) — two lanes on both cards, cross-slot bleed gated byte-identical in both orders, Prüfstand 10/10 on each lane *concurrently*, stress green under ASan+UBSan, single-stream decode 67.6–69.9 vs 68.8 t/s |
 | M5 | 35B MoE q4 on A770 (16 GB fit), q8 variants on B60 | all three models pass their gates | **done**, and the 16 GB fit now works too: `--offload-ratio 20` serves the 35B on the A770 at 1.8 t/s where it previously refused to load (§7). The q8 half still waits on an export. |
 
 M0 went past its exit criterion on purpose: everything that does not need a
@@ -1342,8 +1490,10 @@ The fix is a startup reservation in which every term is **measured**:
 | KV | ctx × 20 KiB/token | 0.94 GiB at ctx 49152 |
 | margin | stated, not hidden | 0.25 GiB |
 
-The activation peak is **linear in the chunk size**, so the chunk is the knob
-that buys context, and the admission table falls out of the sweep: chunk 2048
+The activation peak is **linear in the chunk size** over this range, so the
+chunk is the knob that buys context, and the admission table falls out of the
+sweep (M6 refined the shape: it is affine rather than linear from the origin,
+and the probe has to climb rather than jump — §7.2): chunk 2048
 is inadmissible on this card outright (the earlier "it ran anyway" was the
 plugin silently spilling 1.89 GiB to host), chunk 1024 admits ctx ≤ 20320,
 chunk 512 admits ctx ≤ 50480, chunk 256 admits ctx ≤ 65344.
@@ -1483,6 +1633,133 @@ attempts *in the same process*. The first sweep reported every ratio failing
 because ratio 0 was tried first and ran the device out of memory. Each ratio
 needs its own process, and the control (no offload, clean process) is what makes
 the result mean anything.
+
+### 7.2 Two lanes, measured (M6, 2026-08-29)
+
+The use case this milestone was scoped to: a long-running agent session
+mid-decode, a subagent firing one request at the same model, neither queued
+behind the other and neither changing the other's bytes. All of the below is
+the b5 coder at u8 KV, `--parallel 2`, measured on dirac.
+
+**The second lane is free, and that is a measurement, not a hope.** Weights are
+shared between `InferRequest`s of one `CompiledModel` (two *compiles* cost
+0.791 → 1.582 GiB, §7.0.2). Activations turn out to be shared too: at a
+128-token probe lane 0 costs **0.617 GiB** and the second lane **0.001–0.003
+GiB**, because the GPU plugin pools intermediate buffers per compiled model
+rather than per request. Pricing an imaginary second peak would have halved the
+admissible prefill chunk on both cards; the reservation therefore probes each
+lane and uses what it finds.
+
+That same fact has a correctness edge, and it cost a debugging session to
+notice: if intermediates are pooled per model, a request's **output** tensor is
+only valid until the next execution on that model *by anyone*. Two lanes
+reading their logits after the turn had passed would read each other's. Hence
+the turnstile (§4.1) and the copy-out inside the turn.
+
+**What the reservation admits, per card:**
+
+| card | lanes | requested n_ctx | served chunk | weights+graph | activations, all lanes | GDN rows/lane | max ctx/lane |
+|---|---|---|---|---|---|---|---|
+| B60 22.71 GiB | 2 | 40960 | 2048 | 12.83 | 3.11 | 95.6 MiB | 293376 |
+| A770 15.11 GiB | 2 | 8192 | 256 | 12.83 | 0.88 | 95.6 MiB | 44608 |
+| A770 15.11 GiB | 2 | 40960 | 128 | 12.83 | 0.62 | 95.6 MiB | 57040 |
+| A770 15.11 GiB | 2 | 65536 | — | — | — | — | **refused at startup** |
+
+The refusal carries every term, as §7.0.2a requires:
+
+```
+could not bring up the OpenVINO executor: requested n_ctx 65536 on 2 lanes needs
+1.42 GiB of KV but the reservation admits 57040 per lane (weights 12.83 +
+activations 0.62 + margin 0.25 + 2 x state 0.093 of 15.11 GiB). Lower --n-ctx,
+lower --parallel, or lower --prefill-chunk.
+```
+
+**The chunk has to be probed upward, and the reason is a property of the
+plugin.** Its intermediate pool grows to the largest shape it has ever seen and
+never shrinks, so an over-large probe is a permanent tax that no later, smaller
+probe can undo. Predicting straight to chunk 1024 on the A770 left 1.87 GiB
+resident and a budget of **zero** — a card that could serve nothing because of
+a measurement. The peak is affine rather than linear-from-zero (0.62 GiB at 128
+tokens, 0.77 at 256: most of it is fixed), so the engine now climbs by doubling,
+takes a step only when the running fit says it fits with 25% headroom, and
+re-fits from the two most recent points as it goes. Each card lands where its
+own memory says: B60 2048, A770 256 at 8k and 128 at 40k.
+
+**Single-stream regression, alternating A/B against the pre-M6 build** (28906-token
+prompt, 200 tokens, steady state of three runs each):
+
+| build | chunk | prefill | decode |
+|---|---|---|---|
+| pre-M6 (`fb99912`) | 1024 | 1644.5 t/s | **68.8 t/s** |
+| M6, `--parallel 1` | 1024 | 1635.1 t/s | **68.6 t/s** |
+| M6, `--parallel 2` | 1024 | 1631.8 t/s | **67.6 t/s** |
+| M6, `--parallel 2` | 2048 (now admissible) | **1883.0 t/s** | 67.6–69.9 t/s |
+
+Decode regresses **1.7%** at two lanes against a bar of 5%, and prefill is at
+parity chunk-for-chunk. The last row is the shipped default and is faster than
+the old one for a reason worth stating plainly: pre-M6 the from-zero slope
+silently shrank a configured 2048 to 1024, which broke the engine's own rule
+that only an *inadmissible* configuration is changed.
+
+A sweep confirms the chunk is a prefill knob and nothing else — 512 / 1024 /
+2048 give 1338.6 / 1639.0 / 1883.0 t/s prefill at **67.6 t/s decode
+throughout**.
+
+**One regression found and fixed en route, worth recording because the cause is
+not where anyone would look.** Copying each prefill chunk's logits out of the
+request cost **165 ms per chunk** — prefill 1644 → 1290 t/s at 30k depth, with
+decode untouched. Reading that output back is expensive on this plugin, and
+nothing sampled the intermediate chunks: only the last chunk's logits are ever
+picked from. So the copy happens exactly where the value is consumed, which is
+also the only place it needs protecting from the other lane.
+
+**The agent+subagent scenario, end to end** (B60, one 28906-token session
+decoding 400 tokens, five bursts of a 309-token / 48-token request beside it):
+
+| | tokens/s | TTFT | prefill |
+|---|---|---|---|
+| the session, alone on the card | 68.7 | 15.34 s (1884.6 t/s) | — |
+| the session, subagent active | **32.5** | — | — |
+| each subagent burst | **31.1–31.3** | **0.42 s** | 734 t/s |
+| both together | 63.7 | | |
+
+Two lanes cost **7% of aggregate throughput** and split the card almost evenly.
+The number the milestone asked for, measured rather than invented: the session's
+**inter-token stall is p95 17 ms, max 516 ms**, over 246 stalled steps totalling
+5.72 s of 12.29 s decoding. Its inter-token gap goes from 14.6 ms p50 with the
+card to itself to 30.8 ms p50 / 34.8 ms p95 with a subagent on it.
+
+The stall is a per-*token* figure, not a per-execution one: a decode step runs
+two or three shared graphs (the embeddings gather, the model, and the head when
+MTP is on), each takes its own turn, and what a reader feels is the sum. The
+console breaks the waiting out rather than letting it hide inside whichever
+phase happened to block —
+
+```
+slot 0: decode 400 tok in 12.29 s (32.5 t/s) | graph 6.39 s, embed 0.05 s, sample 0.05 s, emit 0.09 s, wait 5.72 s, other 0.00 s | stall p95 17 ms max 516 ms (246 steps, 5.72 s total)
+```
+
+**The bound behind those numbers is structural, not empirical.** A decode step
+waits for at most *one* execution of the other lane, because the turnstile is
+FIFO. So the p95 is one decode step of the other lane (~16 ms) and the max is
+one prefill chunk (here a 309-token prompt in a single chunk, 0.42–0.51 s; at
+the full 2048-token chunk it would be ~1.1 s at 1885 t/s). `--prefill-chunk` is
+therefore the operator's latency knob, and §4.1 explains why it must not become
+a scheduling variable instead.
+
+**Quality, which is the part that would make all the above worthless if it
+failed.** The Prüfstand harness against a two-lane server: **10/10 solo, and
+10/10 on each lane when both run the task at the same time** — all three
+answers byte-identical to each other. 479 tokens in 7.3 s alone, 13.9–14.2 s
+each when sharing.
+
+**One operating lesson, recorded because it cost an hour.** Two `arcint`
+processes on one card under the `xe` KMD produce GPU faults, not just slow
+sharing: `dmesg` showed `Check job timeout … not started`, an `Xe device
+coredump`, and `reset done` naming both processes. That happened because a
+measurement run was started while a previous server still held the card's
+memory. The engine's own rule already covers it (§5: stop the resident services
+before a depth run); it applies to arcint's own instances too.
 
 ## 8. Open questions and deliberate deferrals
 

@@ -82,8 +82,24 @@ backend; **[M1]**–**[M5]** mean it runs against the real models on a real card
 - **[M0]** **Streaming that does not corrupt anything**: a multi-byte code
   point is never split across two SSE chunks, a stop sequence never leaks out
   one fragment at a time, and tool-call syntax never reaches a content delta.
+- **[M6]** **Two client sessions per service**, in one process: `--parallel 2`
+  gives each lane its own `InferRequest`s (language model, embeddings, both MTP
+  requests), its own GDN checkpoint rows and its own KV block table out of a
+  shared, refcounted page pool. Gated: two prompts interleaved are
+  **byte-identical** to their solo runs in both start orders, and the Prüfstand
+  scores **10/10 on each lane while both run it at once**. The measured cost of
+  sharing: an agent session at 30k context and a subagent burst get 32.5 and
+  31.2 t/s against 68.7 t/s alone, with the session's inter-token stall at
+  **p95 17 ms**. Sequences are never batched into one graph call, which is what
+  keeps the equivalence invariants intact.
+- **[M6]** **Admission with the numbers**: a lane is a memory reservation, so a
+  request beyond the reserved lanes is a **503 carrying the arithmetic** rather
+  than an unbounded wait (`--queue-timeout S` restores queueing). A context that
+  does not fit is refused at startup the same way — on the A770 two lanes of
+  40960 serve, two of 65536 are refused with every term spelled out.
 - **[M0]** **Cancellation**: a dropped client aborts the request at the next
-  scheduler boundary and frees its slot.
+  scheduler boundary and frees its slot — and with it the lane and its KV
+  pages, without touching the other lane's stream.
 - **[M0]** **Console state output** in the llama.cpp tradition: per-request timing lines
   (prefill/decode token counts and rates), slot states, memory-map printouts at
   startup, cache hit statistics. stderr is the dashboard.
@@ -92,7 +108,11 @@ backend; **[M1]**–**[M5]** mean it runs against the real models on a real card
 
 - No web UI, no GUI, no gradio, no metrics dashboard. Console and HTTP JSON only.
 - No model zoo. A checkpoint outside the table above is rejected at load time.
-- No multi-GPU, no pipeline or tensor parallelism. One process, one card.
+- No multi-GPU, no pipeline or tensor parallelism. One process, one card
+  (several *sequences* per process is M6; several *cards* is not on the list).
+- No batching of two sequences into one graph call. Lanes interleave at
+  execution granularity instead; batching is an optimisation with its own
+  equivalence burden, and it has not been paid.
 - No training, no LoRA, no quantization tooling (artifacts are produced offline).
 - No Windows.
 
@@ -115,6 +135,7 @@ implementation the equivalence suite compares against.
 | M3 prefix caching | done — warm/cold byte-identical, hit stats on console |
 | M4 MTP | **done and served**: paged executor, rollback = checkpoint-row promotion (0.00 s on the console), 36.2 t/s at 93.2% acceptance, 10/10 greedy |
 | M5 all three models | done — all three serve; the 35B now fits the A770 too, via `--offload-ratio` |
+| M6 two lanes per service | done — byte-identical under interleaving on both cards, 10/10 on each lane concurrently, decode 67.6–69.9 vs 68.8 t/s single-stream |
 
 M4 is done, and the measurement is the result. The Qwen3.8 MTP head — which no
 public implementation can export, and which `tools/export_mtp.py` reconstructs
@@ -136,8 +157,18 @@ the artifact's maximum — in 8.1 minutes. What remains is OpenVINO's
 paged-attention path, whose decode-side block-table convention is undocumented;
 it is an optimisation now, not a blocker.
 
-Verification: 142 unit cases, a 48-check curl round-trip, and an equivalence
-suite that runs where the card is. Clean under ASan and UBSan on x86_64.
+M6 is done, and it is one process rather than two. `--parallel 2` runs two
+sequences with no shared mutable state and no lock on the decode loop; what
+orders them is a FIFO turnstile around graph executions, which is what bounds
+the stall (a decode step waits for at most one execution of the other lane) and
+what makes each lane's output safe to read — the GPU plugin pools intermediate
+buffers per compiled *model*, not per request, which is also why the second lane
+costs **0.00 GiB** of activations. See DESIGN §4.1 and §7.2.
+
+Verification: 155 unit cases, a 48-check curl round-trip, a lane-accounting
+stress (200 requests, 24-way, 8 lanes, queueing and refusing), an equivalence
+suite and a concurrency suite that run where the card is. Clean under ASan and
+UBSan on x86_64.
 
 See [DESIGN.md](DESIGN.md) for the architecture and milestones,
 [llm.txt](llm.txt) for a machine-readable summary.
@@ -171,6 +202,12 @@ under `env -i`.
           -DARCINT_GIT_SHA=$(git rev-parse --short=12 HEAD)
     cmake --build build-ov -j"$(nproc)"
     cmake --install build-ov --prefix ~/.local
+
+Two lanes are a flag and a memory claim: `--parallel 2` reserves activations,
+GDN checkpoint rows and KV for two concurrent sequences at the configured
+`--n-ctx`, and refuses at startup with the arithmetic if the card cannot hold
+them. If a deployment would rather queue than be refused at request time, set
+`--queue-timeout S`.
 
 `packaging/arcint.service` and `packaging/arcint.env` are a systemd **user**
 unit and its configuration, matching how the fleet already runs its inference

@@ -44,10 +44,18 @@ TEST(config_model_and_stub_are_exclusive) {
 }
 
 TEST(config_model_needs_an_openvino_build) {
-    // This test binary is built without the OV backend, so --model must refuse
-    // rather than start something that cannot run.
+    // Without the OV backend --model must refuse rather than start something
+    // that cannot run; with it, the same arguments must be accepted. The build
+    // that runs on the card has ARCINT_OPENVINO, and asserting only the first
+    // half made this case fail there for reasons that had nothing to do with it.
+#ifdef ARCINT_OPENVINO
+    Config cfg;
+    CHECK(run({"--model", "/models/ov/x", "--model-id", "qwen3.8-27b"}, cfg).ok);
+    CHECK_EQ(cfg.model_path, std::string("/models/ov/x"));
+#else
     CHECK(rejected({"--model", "/models/ov/x", "--model-id", "qwen3.8-27b"}));
     CHECK(rejected({"--model", "/models/ov/x"}));
+#endif
 }
 
 TEST(config_device_and_cache_dir) {
@@ -185,4 +193,27 @@ TEST(config_prefix_cache_requires_an_aligned_prefill_grid) {
     // above would carry --prefix-cache-mib into this case.
     Config nocache;
     CHECK(run({"--stub", "--prefill-chunk", "0"}, nocache).ok);
+}
+
+TEST(config_queue_timeout_is_a_finite_number_of_seconds) {
+    Config cfg;
+    CHECK(run({"--stub", "--queue-timeout", "30"}, cfg).ok);
+    CHECK_NEAR(cfg.queue_timeout_s, 30.0, 1e-9);
+
+    CHECK(run({"--stub", "--queue-timeout", "0"}, cfg).ok);
+    CHECK_NEAR(cfg.queue_timeout_s, 0.0, 1e-9);
+
+    // The default is "do not wait": a lane is a memory reservation, and a
+    // client cannot tell an unbounded queue from a hang.
+    Config def;
+    CHECK(run({"--stub"}, def).ok);
+    CHECK_NEAR(def.queue_timeout_s, 0.0, 1e-9);
+
+    CHECK(rejected({"--stub", "--queue-timeout", "-1"}));
+    CHECK(rejected({"--stub", "--queue-timeout", "nan"}));
+    // Infinity would reach condition_variable::wait_for as UB and silently
+    // behave as no wait at all, which is the opposite of what it asks for.
+    CHECK(rejected({"--stub", "--queue-timeout", "inf"}));
+    CHECK(rejected({"--stub", "--queue-timeout", "1e9"}));
+    CHECK(rejected({"--stub", "--queue-timeout", "abc"}));
 }

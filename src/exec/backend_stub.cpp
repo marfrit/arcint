@@ -107,8 +107,13 @@ public:
         return render_chatml_stub(req);
     }
 
-    FinishReason generate(const GenerationInput& in, const TokenCallback& on_piece,
+    // The lane index is real here too: the stub has no per-lane state to index
+    // with it, but it does have to prove the plumbing — the concurrency gates
+    // (two lanes, cancellation of one, admission of a third) run against this
+    // backend in CI, where there is no card.
+    FinishReason generate(const GenerationInput& in, int slot, const TokenCallback& on_piece,
                           GenerationStats& stats) override {
+        (void)slot;
         using clock = std::chrono::steady_clock;
 
         const auto prefill_start = clock::now();

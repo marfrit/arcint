@@ -26,6 +26,26 @@ public:
     virtual int              eos_id() const                       = 0;
 };
 
+// The startup reservation (DESIGN.md §7.0.2a), every term measured rather than
+// assumed. It is carried on the status so that /props can print it and an
+// admission refusal can quote it: a refusal without numbers is the failure mode
+// this engine exists to avoid, and with two lanes the arithmetic is the whole
+// argument for why there are exactly two.
+struct Reservation {
+    bool     measured           = false;
+    uint64_t device_total_bytes = 0;
+    uint64_t weights_bytes      = 0;   // weights + graph, device-resident after compile
+    uint64_t activation_bytes   = 0;   // per lane, at the chunk actually served
+    uint64_t la_slab_bytes      = 0;   // per lane: its GDN checkpoint rows
+    uint64_t kv_bytes_per_token = 0;
+    uint64_t margin_bytes       = 0;
+    uint64_t pool_blocks        = 0;   // the shared KV page pool
+    int      kv_block_tokens    = 0;
+    int      lanes              = 1;
+    int      prefill_chunk      = 0;
+    int      n_ctx              = 0;
+};
+
 struct ModelStatus {
     std::string id;
     Quant       quant        = Quant::Q4;
@@ -38,6 +58,7 @@ struct ModelStatus {
     bool        mtp_enabled  = false;
     uint64_t    weights_bytes = 0;
 
+    Reservation     reservation;
     SamplerDefaults sampler_defaults;
 };
 
@@ -83,11 +104,23 @@ struct GenerationStats {
     double decode_embed_seconds   = 0.0;   // the embeddings model, once per token
     double decode_sample_seconds  = 0.0;   // logits copy + penalties + argmax
     double decode_emit_seconds    = 0.0;   // detokenize, stop scan, stream out
+    // Waiting for the device while the other lane had it. Broken out because it
+    // otherwise hides inside whichever phase happened to block, and a decode
+    // step that spent 10 ms queueing did not spend 10 ms gathering embeddings.
+    double decode_wait_seconds    = 0.0;
     double draft_rollback_seconds = 0.0;
     double draft_verify_seconds   = 0.0;   // the one pass that checks all drafts
     double draft_reforward_seconds = 0.0;  // re-running the accepted prefix after a reject
     double prefill_seconds   = 0.0;
     double decode_seconds    = 0.0;
+    // What the other lane cost this one: graph executions that had to wait for
+    // their turn, and how long they waited (DESIGN.md §4.1). Zero on an idle
+    // server, which is how a contended run is told from a solo one. The p95 is
+    // over decode steps, because that is the stall a reader feels.
+    int    stalled_steps       = 0;
+    double stall_total_seconds = 0.0;
+    double stall_p95_seconds   = 0.0;
+    double stall_max_seconds   = 0.0;
 
     double prefill_rate() const {
         return prefill_seconds > 0.0 ? prompt_tokens / prefill_seconds : 0.0;
@@ -110,8 +143,17 @@ public:
     // weights. The stub answers with ChatML because it has no artifact.
     virtual std::string render_chat(const ChatRequest& req) const = 0;
 
-    virtual FinishReason generate(const GenerationInput& in, const TokenCallback& on_piece,
-                                  GenerationStats& stats) = 0;
+    // `slot` is the lane this request owns for its whole life (DESIGN.md §4.1).
+    // Every piece of mutable execution state — InferRequests, GDN checkpoint
+    // rows, the KV block table, the MTP head's own KV — is indexed by it, which
+    // is what makes two concurrent sequences independent rather than merely
+    // interleaved.
+    virtual FinishReason generate(const GenerationInput& in, int slot,
+                                  const TokenCallback& on_piece, GenerationStats& stats) = 0;
+
+    // KV pages not currently held by a sequence or by the prefix cache. Live,
+    // so /health can show the pool draining and a refusal can quote it.
+    virtual uint64_t free_blocks() const { return 0; }
 };
 
 // M0: no OpenVINO, no weights, deterministic synthetic output.

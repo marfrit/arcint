@@ -42,7 +42,22 @@ void PrefixCache::chain_block(uint64_t key, uint64_t& hi, uint64_t& lo, const in
 PrefixCache::PrefixCache(size_t budget_bytes, int block_size, uint64_t key)
     : budget_(budget_bytes), block_size_(std::max(1, block_size)), key_(key) {}
 
+PrefixCache::~PrefixCache() { clear(); }
+
+// The pages go back to the pool when the *last* holder lets go, not when the
+// cache drops the entry: a lane that hit this prefix a moment ago may still be
+// mapping it. Tying that to the shared_ptr rather than to the list makes the
+// two impossible to get out of step.
+PrefixCache::EntryPtr PrefixCache::make_entry() const {
+    ReleaseFn fn = release_;
+    return EntryPtr(new Entry(), [fn](Entry* e) {
+        if (fn && !e->blocks.empty()) fn(e->blocks);
+        delete e;
+    });
+}
+
 PrefixCache::Hit PrefixCache::lookup(const std::vector<int>& tokens) {
+    std::lock_guard<std::mutex> guard(mutex_);
     ++stats_.lookups;
     Hit hit;
     if (entries_.empty() || tokens.size() <= static_cast<size_t>(block_size_)) return hit;
@@ -60,8 +75,8 @@ PrefixCache::Hit PrefixCache::lookup(const std::vector<int>& tokens) {
         hash_block(key_, hi, lo, tokens.data() + end - static_cast<size_t>(block_size_),
                    static_cast<size_t>(block_size_));
 
-        auto it = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& e) {
-            return e.hi == hi && e.lo == lo;
+        auto it = std::find_if(entries_.begin(), entries_.end(), [&](const EntryPtr& e) {
+            return e->hi == hi && e->lo == lo;
         });
         // A depth with no entry is ordinary — nothing says every boundary was
         // ever stored — so keep chaining rather than giving up here.
@@ -69,8 +84,8 @@ PrefixCache::Hit PrefixCache::lookup(const std::vector<int>& tokens) {
 
         // Verify the tokens. A hash hit that disagrees on tokens is a collision,
         // and reusing it would silently answer a different prompt.
-        if (it->tokens.size() != end ||
-            !std::equal(it->tokens.begin(), it->tokens.end(), tokens.begin())) {
+        if ((*it)->tokens.size() != end ||
+            !std::equal((*it)->tokens.begin(), (*it)->tokens.end(), tokens.begin())) {
             ++stats_.collisions;
             continue;
         }
@@ -82,17 +97,27 @@ PrefixCache::Hit PrefixCache::lookup(const std::vector<int>& tokens) {
 
     entries_.splice(entries_.begin(), entries_, best);  // most recently used
     hit.matched_tokens = best_len;
-    hit.state          = &entries_.front().state;
+    hit.keep           = entries_.front();
+    hit.state          = &entries_.front()->state;
+    hit.blocks         = &entries_.front()->blocks;
 
     ++stats_.hits;
     stats_.hit_tokens += best_len;
     return hit;
 }
 
-void PrefixCache::insert(const std::vector<int>& tokens, size_t prefix_len, StateBlob state) {
-    if (budget_ == 0 || prefix_len == 0) return;
-    if (prefix_len % static_cast<size_t>(block_size_) != 0) return;
-    if (prefix_len > tokens.size()) return;
+void PrefixCache::insert(const std::vector<int>& tokens, size_t prefix_len, StateBlob state,
+                         std::vector<int32_t> blocks) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    // The caller took a reference for the cache before calling; every path out
+    // of here has to hand it back, or the pages leak and the pool shrinks by a
+    // prefix on every rejected insert.
+    auto give_back = [&] {
+        if (release_ && !blocks.empty()) release_(blocks);
+    };
+    if (budget_ == 0 || prefix_len == 0) { give_back(); return; }
+    if (prefix_len % static_cast<size_t>(block_size_) != 0) { give_back(); return; }
+    if (prefix_len > tokens.size()) { give_back(); return; }
 
     uint64_t hi = 0, lo = 0;
     for (size_t end = static_cast<size_t>(block_size_); end <= prefix_len;
@@ -101,31 +126,40 @@ void PrefixCache::insert(const std::vector<int>& tokens, size_t prefix_len, Stat
                    static_cast<size_t>(block_size_));
     }
 
-    for (const Entry& e : entries_) {
-        if (e.hi != hi || e.lo != lo) continue;
+    for (const EntryPtr& e : entries_) {
+        if (e->hi != hi || e->lo != lo) continue;
         // Same rule as lookup: a hash match is not identity. Without the token
         // check a collision would silently discard a genuinely different prefix
         // and never be counted.
-        if (e.tokens.size() == prefix_len &&
-            std::equal(e.tokens.begin(), e.tokens.end(), tokens.begin())) {
-            return;  // already held
+        if (e->tokens.size() == prefix_len &&
+            std::equal(e->tokens.begin(), e->tokens.end(), tokens.begin())) {
+            // Already held, so the caller's reference for the cache is one
+            // reference too many; hand it straight back.
+            give_back();
+            return;
         }
         ++stats_.collisions;
     }
 
-    Entry entry;
-    entry.hi     = hi;
-    entry.lo     = lo;
-    entry.tokens.assign(tokens.begin(), tokens.begin() + static_cast<long>(prefix_len));
-    entry.bytes  = blob_bytes(state);
-    entry.state  = std::move(state);
-
+    const size_t bytes = blob_bytes(state);
     // A single snapshot larger than the whole budget is not cacheable; storing
     // it would evict everything and then itself.
-    if (entry.bytes > budget_) return;
+    if (bytes > budget_) {
+        give_back();
+        return;
+    }
 
-    evict_to_fit(entry.bytes);
-    bytes_ += entry.bytes;
+    EntryPtr entry = make_entry();
+    entry->hi      = hi;
+    entry->lo      = lo;
+    entry->tokens.assign(tokens.begin(), tokens.begin() + static_cast<long>(prefix_len));
+    entry->bytes   = bytes;
+    entry->state   = std::move(state);
+    entry->blocks  = std::move(blocks);
+
+    evict_to_fit(bytes);
+    bytes_ += bytes;
+    stats_.blocks_held += entry->blocks.size();
     entries_.push_front(std::move(entry));
 
     ++stats_.inserts;
@@ -135,7 +169,8 @@ void PrefixCache::insert(const std::vector<int>& tokens, size_t prefix_len, Stat
 
 void PrefixCache::evict_to_fit(size_t incoming) {
     while (!entries_.empty() && bytes_ + incoming > budget_) {
-        bytes_ -= entries_.back().bytes;
+        bytes_ -= entries_.back()->bytes;
+        stats_.blocks_held -= entries_.back()->blocks.size();
         entries_.pop_back();
         ++stats_.evictions;
     }
@@ -143,11 +178,34 @@ void PrefixCache::evict_to_fit(size_t incoming) {
     stats_.entries        = entries_.size();
 }
 
+bool PrefixCache::evict_oldest() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (entries_.empty()) return false;
+    bytes_ -= entries_.back()->bytes;
+    stats_.blocks_held -= entries_.back()->blocks.size();
+    entries_.pop_back();
+    ++stats_.evictions;
+    stats_.bytes_resident = bytes_;
+    stats_.entries        = entries_.size();
+    return true;
+}
+
+bool PrefixCache::may_accept(size_t bytes) const {
+    return budget_ > 0 && bytes > 0 && bytes <= budget_;
+}
+
 void PrefixCache::clear() {
+    std::lock_guard<std::mutex> guard(mutex_);
     entries_.clear();
     bytes_                = 0;
     stats_.bytes_resident = 0;
     stats_.entries        = 0;
+    stats_.blocks_held    = 0;
+}
+
+PrefixCacheStats PrefixCache::stats() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return stats_;
 }
 
 }  // namespace lgc

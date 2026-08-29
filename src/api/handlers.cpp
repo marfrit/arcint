@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <ctime>
 #include <set>
 
@@ -88,11 +89,13 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
     if (stats.decode_seconds > 0.0) {
         const double other = stats.decode_seconds - stats.decode_forward_seconds -
                              stats.decode_embed_seconds - stats.decode_sample_seconds -
-                             stats.decode_emit_seconds;
+                             stats.decode_emit_seconds - stats.decode_wait_seconds;
         decode_suffix = log::format(
-            " | graph %.2f s, embed %.2f s, sample %.2f s, emit %.2f s, other %.2f s",
+            " | graph %.2f s, embed %.2f s, sample %.2f s, emit %.2f s, wait %.2f s, "
+            "other %.2f s",
             stats.decode_forward_seconds, stats.decode_embed_seconds,
-            stats.decode_sample_seconds, stats.decode_emit_seconds, other);
+            stats.decode_sample_seconds, stats.decode_emit_seconds,
+            stats.decode_wait_seconds, other);
     }
     if (stats.draft_proposed > 0) {
         decode_suffix += log::format(
@@ -100,6 +103,17 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
             100.0 * stats.draft_accepted / stats.draft_proposed, stats.draft_accepted,
             stats.draft_proposed, stats.draft_verify_seconds, stats.draft_reforward_seconds,
             stats.draft_rollback_seconds);
+    }
+    // What the other lane cost this one. Printed only when it happened, so a
+    // single-stream run's line is the line it always was, and a p95 rather than
+    // a mean because one long stall inside many short steps is exactly what a
+    // mean hides (DESIGN.md §4.1).
+    if (stats.stalled_steps > 0) {
+        decode_suffix += log::format(" | stall p95 %.0f ms max %.0f ms (%d step%s, %.2f s total)",
+                                     1000.0 * stats.stall_p95_seconds,
+                                     1000.0 * stats.stall_max_seconds, stats.stalled_steps,
+                                     stats.stalled_steps == 1 ? "" : "s",
+                                     stats.stall_total_seconds);
     }
     log_slot_line(slot, "decode", stats.completion_tokens, stats.decode_seconds,
                   stats.decode_rate(), decode_suffix);
@@ -117,14 +131,14 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
 // (the piece is already appended). Returning false means the client is gone.
 using EmitFn = std::function<bool(std::string_view piece, const std::string& accumulated)>;
 
-FinishReason drive(Backend& backend, const GenerationInput& in, const EmitFn& emit,
+FinishReason drive(Backend& backend, const GenerationInput& in, int slot, const EmitFn& emit,
                    GenerationStats& stats, std::string& raw) {
     StopMatcher   stop(in.sampler.stop);
     std::set<int> stop_ids(in.sampler.stop_token_ids.begin(), in.sampler.stop_token_ids.end());
     bool          cancelled = false;
 
     const FinishReason reason = backend.generate(
-        in,
+        in, slot,
         [&](std::string_view piece, int token_id) -> Control {
             const StopMatcher::Step step = stop.push(piece);
             if (!step.emit.empty()) {
@@ -172,13 +186,19 @@ SlotPool::Lease::~Lease() {
     if (pool_ != nullptr && index_ >= 0) pool_->release(index_);
 }
 
-SlotPool::Lease SlotPool::acquire() {
+SlotPool::Lease SlotPool::acquire_for(double timeout_seconds) {
     std::unique_lock<std::mutex> lock(mutex_);
-    ++waiting_;
-    cv_.wait(lock, [this] {
+    auto some_free = [this] {
         return std::find(busy_.begin(), busy_.end(), false) != busy_.end();
-    });
-    --waiting_;
+    };
+    if (!some_free()) {
+        if (timeout_seconds <= 0.0) return Lease();
+        ++waiting_;
+        const bool got = cv_.wait_for(
+            lock, std::chrono::duration<double>(timeout_seconds), some_free);
+        --waiting_;
+        if (!got) return Lease();
+    }
 
     const auto it    = std::find(busy_.begin(), busy_.end(), false);
     const int  index = static_cast<int>(it - busy_.begin());
@@ -211,6 +231,84 @@ int SlotPool::queue_depth() const {
     return waiting_;
 }
 
+// ------------------------------------------------------------- admission
+namespace {
+
+// The startup arithmetic, in the shape a client can read. Every term is
+// measured (§7.0.2a); `null` when the backend has no card under it.
+json reservation_json(const Reservation& r) {
+    if (!r.measured) return json(nullptr);
+    auto gib = [](uint64_t b) { return static_cast<double>(b) / static_cast<double>(1ull << 30); };
+    const uint64_t kv_per_lane = r.kv_bytes_per_token * static_cast<uint64_t>(r.n_ctx);
+    // Activations are a single figure for the whole compiled model: the GPU
+    // plugin pools intermediate buffers per model, so a second lane adds none
+    // (measured, DESIGN.md §7.2). Everything else really is per lane.
+    return json{{"lanes", r.lanes},
+                {"n_ctx", r.n_ctx},
+                {"prefill_chunk", r.prefill_chunk},
+                {"device_total_gib", gib(r.device_total_bytes)},
+                {"weights_gib", gib(r.weights_bytes)},
+                {"activation_all_lanes_gib", gib(r.activation_bytes)},
+                {"gdn_slab_per_lane_gib", gib(r.la_slab_bytes)},
+                {"kv_per_lane_gib", gib(kv_per_lane)},
+                {"kv_bytes_per_token", r.kv_bytes_per_token},
+                {"kv_block_tokens", r.kv_block_tokens},
+                {"pool_blocks", r.pool_blocks},
+                {"margin_gib", gib(r.margin_bytes)},
+                {"total_gib", gib(r.weights_bytes + r.margin_bytes + r.activation_bytes +
+                                  static_cast<uint64_t>(r.lanes) *
+                                      (r.la_slab_bytes + kv_per_lane))}};
+}
+
+}  // namespace
+
+std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out) {
+    const double timeout = ctx.cfg != nullptr ? ctx.cfg->queue_timeout_s : 0.0;
+    out = ctx.slots->acquire_for(timeout);
+    if (out.index() >= 0) return std::nullopt;
+
+    // Not "server busy": the numbers that say why there are exactly this many
+    // lanes. An engine that refuses at startup with its arithmetic (§7.0.2a)
+    // owes the same courtesy at request time.
+    const ModelStatus& st = ctx.backend->status();
+    const Reservation& r  = st.reservation;
+    std::string        why =
+        log::format("all %d lane%s are busy", ctx.slots->total(),
+                    ctx.slots->total() == 1 ? "" : "s");
+    if (r.measured) {
+        const double gib = 1.0 / static_cast<double>(1ull << 30);
+        why += log::format(
+            "; %d lane%s of n_ctx %d %s what was reserved: weights+graph %.2f + activations "
+            "%.2f + margin %.2f + %d x (GDN rows %.3f + KV %.2f) = %.2f GiB of %.2f",
+            r.lanes, r.lanes == 1 ? "" : "s", r.n_ctx, r.lanes == 1 ? "is" : "are",
+            static_cast<double>(r.weights_bytes) * gib,
+            static_cast<double>(r.activation_bytes) * gib,
+            static_cast<double>(r.margin_bytes) * gib, r.lanes,
+            static_cast<double>(r.la_slab_bytes) * gib,
+            static_cast<double>(r.kv_bytes_per_token) * static_cast<double>(r.n_ctx) * gib,
+            static_cast<double>(r.weights_bytes + r.margin_bytes + r.activation_bytes +
+                                static_cast<uint64_t>(r.lanes) *
+                                    (r.la_slab_bytes +
+                                     r.kv_bytes_per_token * static_cast<uint64_t>(r.n_ctx))) *
+                gib,
+            static_cast<double>(r.device_total_bytes) * gib);
+    }
+    why += timeout > 0.0
+               ? log::format("; waited %.1f s. Retry, or raise --parallel with the memory to "
+                             "back it.", timeout)
+               : "; no lane came free. Retry, raise --queue-timeout to wait, or raise "
+                 "--parallel with the memory to back it.";
+
+    json body = error_body(why, "server_error", "no_slot_available");
+    body["slots"] = {{"total", ctx.slots->total()},
+                     {"free", ctx.slots->free()},
+                     {"queue_depth", ctx.slots->queue_depth()},
+                     {"queue_timeout_s", timeout}};
+    body["reservation"]        = reservation_json(r);
+    body["kv_blocks_free"]     = ctx.backend->free_blocks();
+    return HttpResult{503, std::move(body)};
+}
+
 // ----------------------------------------------------------------- /health
 json health(const Context& ctx) {
     const ModelStatus& st = ctx.backend->status();
@@ -220,7 +318,9 @@ json health(const Context& ctx) {
                 {"stub", st.stub},
                 {"slots_free", ctx.slots->free()},
                 {"slots_total", ctx.slots->total()},
-                {"queue_depth", ctx.slots->queue_depth()}};
+                {"queue_depth", ctx.slots->queue_depth()},
+                {"kv_blocks_free", ctx.backend->free_blocks()},
+                {"kv_blocks_total", st.reservation.pool_blocks}};
 }
 
 // ------------------------------------------------------------------ /props
@@ -280,7 +380,10 @@ json props(const Context& ctx) {
           {"repetition_penalty", sd.repetition_penalty},
           {"presence_penalty", sd.presence_penalty},
           {"provenance", sd.provenance}}},
-        {"slots", {{"total", ctx.slots->total()}}},
+        {"slots",
+         {{"total", ctx.slots->total()},
+          {"queue_timeout_s", cfg.queue_timeout_s}}},
+        {"reservation", reservation_json(st.reservation)},
         {"build",
          {{"version", ARCINT_VERSION},
           {"git", ARCINT_GIT_SHA},
@@ -377,15 +480,13 @@ std::optional<HttpResult> prepare_completion(const Context& ctx, const json& bod
 }
 
 // ------------------------------------------------------------- non-streaming
-HttpResult run_chat(const Context& ctx, const PreparedChat& prep) {
-    SlotPool::Lease lease = ctx.slots->acquire();
-
+HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     GenerationStats stats;
     std::string     raw;
     const FinishReason reason =
-        drive(*ctx.backend, prep.input, [](std::string_view, const std::string&) { return true; },
-              stats, raw);
-    log_stats(lease.index(), stats, reason);
+        drive(*ctx.backend, prep.input, slot,
+              [](std::string_view, const std::string&) { return true; }, stats, raw);
+    log_stats(slot, stats, reason);
 
     std::string           content = raw;
     std::vector<ToolCall> calls;
@@ -420,15 +521,13 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep) {
     return HttpResult{200, std::move(body)};
 }
 
-HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep) {
-    SlotPool::Lease lease = ctx.slots->acquire();
-
+HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, int slot) {
     GenerationStats stats;
     std::string     raw;
     const FinishReason reason =
-        drive(*ctx.backend, prep.input, [](std::string_view, const std::string&) { return true; },
-              stats, raw);
-    log_stats(lease.index(), stats, reason);
+        drive(*ctx.backend, prep.input, slot,
+              [](std::string_view, const std::string&) { return true; }, stats, raw);
+    log_stats(slot, stats, reason);
 
     const std::string text = prep.req.echo ? prep.req.prompt + raw : raw;
 
@@ -445,9 +544,8 @@ HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep) {
 }
 
 // ----------------------------------------------------------------- streaming
-void stream_chat(const Context& ctx, const PreparedChat& prep, const SseWriter& write) {
-    SlotPool::Lease lease = ctx.slots->acquire();
-
+void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
+                 const SseWriter& write) {
     const std::string& model = ctx.backend->status().id;
     auto               chunk = [&](json choices, json extra = json::object()) {
         json c = {{"id", prep.id},
@@ -481,7 +579,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, const SseWriter& 
 
     GenerationStats stats;
     const FinishReason reason = drive(
-        *ctx.backend, prep.input,
+        *ctx.backend, prep.input, slot,
         [&](std::string_view piece, const std::string& accumulated) -> bool {
             if (!prep.parse_tool_calls) {
                 if (!emit_content(piece)) {
@@ -519,7 +617,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, const SseWriter& 
         },
         stats, raw);
 
-    log_stats(lease.index(), stats, reason);
+    log_stats(slot, stats, reason);
     if (gone) return;
 
     std::vector<ToolCall> calls;
@@ -566,10 +664,8 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, const SseWriter& 
     write("data: [DONE]\n\n");
 }
 
-void stream_completion(const Context& ctx, const PreparedCompletion& prep,
+void stream_completion(const Context& ctx, const PreparedCompletion& prep, int slot,
                        const SseWriter& write) {
-    SlotPool::Lease lease = ctx.slots->acquire();
-
     const std::string& model = ctx.backend->status().id;
     auto               chunk = [&](json choices, json extra = json::object()) {
         json c = {{"id", prep.id},
@@ -596,7 +692,7 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep,
     GenerationStats stats;
     std::string     raw;
     const FinishReason reason = drive(
-        *ctx.backend, prep.input,
+        *ctx.backend, prep.input, slot,
         [&](std::string_view piece, const std::string&) -> bool {
             const std::string safe = utf8_stream.push(piece);
             if (safe.empty()) return true;
@@ -611,7 +707,7 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep,
         },
         stats, raw);
 
-    log_stats(lease.index(), stats, reason);
+    log_stats(slot, stats, reason);
     if (gone) return;
 
     const std::string tail = utf8_stream.flush();

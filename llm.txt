@@ -10,14 +10,15 @@
 
 ## Status
 
-M0-M5 all meet their exit criteria, and the paged executor is the SERVED path
+M0-M6 all meet their exit criteria, and the paged executor is the SERVED path
 (2026-08-29): coder B60 68.6 t/s decode (70.1 at 30k depth - no depth collapse),
 ~1970 t/s prefill, 10/10 harness at base and 30k depth, u8 KV default (10/10
 both depths, base answer bitwise identical to f16, half the memory); dense B60
 36.2 t/s with MTP at 93.2% acceptance, 10/10 GREEDY (registry updated from the
-old 8/10). Admission by measured reservation; when a requested n_ctx does not
-fit at the configured chunk the engine halves the chunk and re-measures (the
-peak is linear in the chunk) before refusing with the numbers. Speculative
+old 8/10). Admission by measured reservation; the activation term is probed
+upward chunk by chunk (the peak is affine, not linear from zero, and the
+plugin's buffer pool never shrinks, so an over-large probe is permanent) and
+what does not fit is refused with the numbers. Speculative
 rollback and re-forward print 0.00 s because neither exists on this path. The
 stateful executor remains behind --no-paged as the reference oracle. Serving the real models on Intel Arc
 via OpenVINO: 51.4 t/s decode and up to 2247 t/s prefill on a B60 with the 27B
@@ -29,6 +30,7 @@ coder q4; all three target models reach 10/10 on the fleet harness.
   M3 prefix caching               done - warm/cold byte-identical
   M4 MTP                          done - 93.3% acceptance (not byte-identical)
   M5 all three models             done; 35B fits the A770 via --offload-ratio
+  M6 two lanes per service        done - one process, byte-identical, 10/10 each
 
 Two M2 walls came down. Slicing logits to the last token before the LM head
 removed an out-of-memory wall at ~8k tokens (the graph computed logits for
@@ -108,13 +110,47 @@ GPU-plugin property (OFFLOAD_RATIO), not something the fused MoE op withholds:
 --offload-ratio 20 serves the 35B on the A770 at 1.8 t/s where it previously
 refused to load, against 52.2 t/s on the B60.
 
-Verification: 142 unit cases, a 48-check curl round-trip, an equivalence suite
-that runs where the card is. Clean under ASan and UBSan on x86_64.
+M6: two client sessions per service, in ONE process (--parallel 2). Per-lane
+InferRequests (language model, embeddings, both MTP requests), per-lane GDN
+checkpoint rows, per-lane KV block tables out of a shared refcounted page pool
+which retired M3's single-slot pool-epoch tag. No lock on the decode loop; what
+orders the lanes is a FIFO turnstile around graph executions. That turnstile is
+a correctness mechanism first: the GPU plugin pools intermediate buffers per
+compiled MODEL, not per request (measured - a second InferRequest adds 0.00 GiB
+of activations), so two concurrent executions would overwrite each other and a
+request's output tensor is only valid until the next execution by anyone. Hence
+also the copy-out of logits/hidden inside the turn - but only where the value is
+consumed: copying every prefill chunk's logits cost 165 ms per chunk, prefill
+1644 -> 1290 t/s.
+
+Measured on the B60, coder, u8 KV, n_ctx 40960, two lanes: single-stream decode
+67.6-69.9 t/s against a pre-M6 68.8 (bar was <5%), prefill 1883 t/s at the
+chunk 2048 the new admission arithmetic makes admissible (pre-M6 silently
+shrank it to 1024). The agent+subagent scenario: a 28906-token session decoding
+beside bursts of a 309-token request gets 32.5 t/s while each burst gets
+31.1-31.3 t/s and 0.42 s TTFT - 63.7 t/s aggregate against 68.7 solo, with the
+session's inter-token stall at p95 17 ms, max 516 ms (one prefill chunk; the
+bound is structural, the turnstile is FIFO). Pruefstand: 10/10 solo AND 10/10 on
+each lane run concurrently, all three answers byte-identical.
+
+Admission: a lane is a memory reservation, and the activation term is probed
+UPWARD because the plugin's intermediate pool never shrinks - an over-large
+probe is a permanent tax (predicting straight to chunk 1024 on the A770 left a
+budget of zero). Each card lands where its memory says: B60 chunk 2048, A770
+256 at 8k and 128 at 40k ctx. Two A770 lanes of 40960 serve; two of 65536 are
+refused at startup with every term. At request time, a third concurrent request
+is a 503 carrying the same arithmetic (--queue-timeout S restores queueing).
+
+Verification: 155 unit cases, a 48-check curl round-trip, a lane-accounting
+stress (200 requests, 24-way, 8 lanes, both queueing and refusing), an
+equivalence suite and a concurrency suite that run where the card is. Clean
+under ASan and UBSan on x86_64.
 
 ## Contracts
 
 - HTTP: POST /v1/chat/completions, POST /v1/completions (OpenAI-compatible,
-  SSE streaming), GET /health, GET /props, GET /v1/models. No UI.
+  SSE streaming), GET /health, GET /props, GET /v1/models. No UI. /health and
+  /props publish the lanes and the reservation terms; a refusal quotes them.
 - Console: llama.cpp-style one-line state/timing prints on stderr
   (load, mem map, per-slot prefill/decode rates, cache hits, MTP acceptance).
 - Model input: OpenVINO IR (offline export), validated against a built-in
@@ -203,11 +239,13 @@ above are authoritative and the allowlist follows them.
 - CLAUDE.md: session rules, dev hardware (dirac), measurement discipline.
 - models/allowlist-raw.json: raw IR metadata, the allowlist's provenance.
 - src/: config, util/ (log, utf8, text), core/ (model_registry, sampling,
-  stop, toolcall, chat), exec/ (backend interface + stub), api/ (error,
-  handlers), http/ (cpp-httplib wiring).
-- tests/: 133 unit cases (hand-rolled harness, no framework), roundtrip.sh
-  (48 curl checks, both wired into ctest), and equivalence/run.sh which needs
-  a real card.
+  stop, toolcall, chat, prefix_cache, block_pool, turnstile), exec/ (backend
+  interface, stub, backend_ov), api/ (error, handlers), http/ (cpp-httplib
+  wiring).
+- tests/: 155 unit cases (hand-rolled harness, no framework), roundtrip.sh
+  (48 curl checks, both wired into ctest), concurrency/stress.sh (lane
+  accounting, stub-only, also in ctest), and equivalence/run.sh plus
+  concurrency/run.py, which need a real card.
 - third_party/: cpp-httplib 0.18.3, nlohmann/json 3.11.3, single headers.
 
 ## Build

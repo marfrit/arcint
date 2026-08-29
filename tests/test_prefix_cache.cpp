@@ -168,3 +168,88 @@ TEST(prefix_cache_clear_releases_everything) {
     CHECK_EQ(c.stats().bytes_resident, 0u);
     CHECK_EQ(c.lookup(seq(64)).matched_tokens, 0u);
 }
+
+// ------------------------------------------------------------ KV page ownership
+//
+// M6: an entry holds references to the KV pages of its prefix, so the pages of a
+// cached prefix outlive the request that produced them and are shared with
+// whichever lane hits it next. Every path out of the cache has to hand those
+// references back exactly once — a leak here shrinks the pool by a prefix per
+// rejected insert, which shows up much later as a lane that cannot get pages.
+
+namespace {
+
+// Records what the cache hands back, standing in for the block pool.
+struct Released {
+    std::vector<int32_t> ids;
+    void operator()(const std::vector<int32_t>& b) { ids.insert(ids.end(), b.begin(), b.end()); }
+};
+
+}  // namespace
+
+TEST(prefix_cache_returns_pages_when_it_refuses_an_entry) {
+    Released    freed;
+    PrefixCache c(kMiB, 16, 3);
+    c.set_release([&](const std::vector<int32_t>& b) { freed(b); });
+
+    // Not on a block boundary: refused, and the pages must come straight back.
+    c.insert(seq(64), 20, blob(64, 1), {10, 11});
+    CHECK_EQ(freed.ids, (std::vector<int32_t>{10, 11}));
+    CHECK_EQ(c.stats().inserts, 0u);
+
+    // A prefix longer than the token list: same.
+    c.insert(seq(32), 64, blob(64, 1), {12});
+    CHECK_EQ(freed.ids.size(), 3u);
+
+    // A blob larger than the whole budget: same again.
+    PrefixCache tiny(64, 16, 3);
+    Released    tiny_freed;
+    tiny.set_release([&](const std::vector<int32_t>& b) { tiny_freed(b); });
+    tiny.insert(seq(64), 32, blob(4096, 1), {20, 21});
+    CHECK_EQ(tiny_freed.ids, (std::vector<int32_t>{20, 21}));
+
+    // And an insert of something already held returns the surplus reference
+    // rather than double-holding the pages.
+    c.insert(seq(64), 32, blob(64, 1), {30, 31});
+    CHECK_EQ(c.stats().inserts, 1u);
+    const size_t before = freed.ids.size();
+    c.insert(seq(64), 32, blob(64, 1), {32, 33});
+    CHECK_EQ(c.stats().inserts, 1u);
+    CHECK_EQ(freed.ids.size(), before + 2);
+}
+
+TEST(prefix_cache_holds_pages_until_the_last_user_lets_go) {
+    Released    freed;
+    PrefixCache c(kMiB, 16, 3);
+    c.set_release([&](const std::vector<int32_t>& b) { freed(b); });
+
+    c.insert(seq(128), 64, blob(64, 1), {1, 2, 3, 4});
+    CHECK_EQ(c.stats().blocks_held, 4u);
+
+    // A lane is holding the entry. Evicting it must not free the pages out from
+    // under that lane — the hit keeps them alive.
+    PrefixCache::Hit hit = c.lookup(seq(128));
+    CHECK_EQ(hit.matched_tokens, 64u);
+    CHECK(hit.blocks != nullptr);
+    CHECK_EQ(*hit.blocks, (std::vector<int32_t>{1, 2, 3, 4}));
+
+    CHECK(c.evict_oldest());
+    CHECK_EQ(freed.ids.size(), 0u);   // still mapped by the hit
+
+    hit = PrefixCache::Hit{};         // the lane is done
+    CHECK_EQ(freed.ids, (std::vector<int32_t>{1, 2, 3, 4}));
+}
+
+TEST(prefix_cache_returns_pages_when_it_is_cleared) {
+    Released    freed;
+    PrefixCache c(kMiB, 16, 3);
+    c.set_release([&](const std::vector<int32_t>& b) { freed(b); });
+
+    c.insert(seq(128), 32, blob(64, 1), {7});
+    c.insert(seq(128), 64, blob(64, 2), {8});
+    CHECK_EQ(c.stats().blocks_held, 2u);
+
+    c.clear();
+    CHECK_EQ(freed.ids.size(), 2u);
+    CHECK_EQ(c.stats().blocks_held, 0u);
+}
