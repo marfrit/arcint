@@ -240,3 +240,20 @@ TEST(config_served_model_name_is_presentation_only) {
     CHECK(rejected({"--stub", "--model-id", "qwen3.6-coder",
                     "--served-model-name", "qwen3.6-coder"}));
 }
+
+TEST(config_paged_kv_is_a_documented_choice) {
+    Config def;
+    CHECK(run({"--stub"}, def).ok);
+    // u8 by default, and the reason is the reservation rather than the
+    // throughput: it is what lets two lanes reach depth and the A770 reach
+    // depth at all (DESIGN §7.0.3). It costs prefill up to 22% at 115k.
+    CHECK_EQ(def.paged_kv, std::string("u8"));
+
+    Config cfg;
+    CHECK(run({"--stub", "--paged-kv", "f16"}, cfg).ok);
+    CHECK_EQ(cfg.paged_kv, std::string("f16"));
+
+    CHECK(rejected({"--stub", "--paged-kv", "q8"}));
+    CHECK(rejected({"--stub", "--paged-kv", "fp16"}));
+    CHECK(rejected({"--stub", "--paged-kv"}));
+}

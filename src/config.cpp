@@ -82,6 +82,10 @@ std::string usage_text() {
         "  --kv-block-size 16|32     KV page size in tokens (default: 32)\n"
         "  --prefill-chunk N         prefill chunk in tokens, 0 = unchunked\n"
         "                            (default: 2048; bounds activation memory)\n"
+        "  --paged-kv u8|f16         KV precision on the paged path (default: u8).\n"
+        "                            u8 halves KV to 11.3 KiB/token, which is what\n"
+        "                            makes two lanes at depth fit; f16 is up to 22%\n"
+        "                            faster at prefill on a deep single-lane endpoint\n"
         "  --prefix-cache-mib N      prefix-cache budget in MiB (default: 0, off)\n"
         "  --no-logits-slice         compute logits for every prompt token (slower,\n"
         "                            and runs out of memory past a few thousand)\n"
@@ -158,6 +162,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.parallel)) {
                 return fail("--parallel needs an integer");
             }
+        } else if (arg == "--paged-kv") {
+            if (!value(v)) return fail("--paged-kv needs u8 or f16");
+            cfg.paged_kv = std::string(v);
         } else if (arg == "--served-model-name") {
             // An empty value is refused rather than folded into "not given":
             // `--served-model-name ""` asks for a name, and silently serving the
@@ -300,6 +307,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         // paged path already gets them from the plugin (DESIGN.md §3.3).
         return fail("--kv-dtype q8 is not implemented: a plain cast to int8 has no scales and "
                     "silently degrades the answer. Use fp16, or the paged path once it lands.");
+    }
+    if (cfg.paged_kv != "u8" && cfg.paged_kv != "f16") {
+        return fail(log::format("--paged-kv must be u8 or f16, not '%s'", cfg.paged_kv.c_str()));
     }
     if (cfg.kv_dtype != "fp16" && cfg.kv_dtype != "fp32") {
         return fail("--kv-dtype must be fp16 or fp32");

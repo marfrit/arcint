@@ -121,6 +121,16 @@ struct GenerationStats {
     double draft_verify_seconds   = 0.0;   // the one pass that checks all drafts
     double draft_reforward_seconds = 0.0;  // re-running the accepted prefix after a reject
     double prefill_seconds   = 0.0;
+    // Where prefill goes, mirroring the decode breakdown. It existed for decode
+    // and not for prefill, which is why a 2026-08-29 profile could account for
+    // ~100 us/token of node time against ~445 us/token served and nobody could
+    // say where the rest was. Each is net of the turnstile wait, which is its
+    // own term.
+    double prefill_embed_seconds   = 0.0;   // the embeddings gather, incl. its copy
+    double prefill_forward_seconds = 0.0;   // the language model
+    double prefill_blocks_seconds  = 0.0;   // KV page allocation
+    double prefill_restore_seconds = 0.0;   // cache lookup, restore, row zeroing
+    double prefill_wait_seconds    = 0.0;   // waiting for the device
     double decode_seconds    = 0.0;
     // What the other lane cost this one: graph executions that had to wait for
     // their turn, and how long they waited (DESIGN.md §4.1). Zero on an idle

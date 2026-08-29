@@ -1594,6 +1594,43 @@ differently per generation (Xe2 has no SIMD8, and the plugin's own permute
 kernel says so), so a kernel-level conclusion drawn on one card does not
 transfer to the other. Host-side work is 2% on both.
 
+#### 7.0.2c Prefill, measured at last (2026-08-29)
+
+Full baseline in `prefill-baseline.md`; the three things that belong in the
+architecture record:
+
+1. **Served prefill is 99.2–99.8% graph time.** The per-phase breakdown
+   (embeddings, page allocation, cache restore, device wait, remainder) accounts
+   for under 1%. There is no host-side prefill overhead to find, so a share of
+   the graph is a share of prefill.
+2. **Forty `FullyConnectedCompressed` nodes run on a reference kernel during a
+   2048-token chunk and take a third of it.** Named, not inferred:
+   `layers.N.mlp.shared_expert_gate/ov_ext::linear/MatMul`, one per layer,
+   layers 0–39. They cost 51.1 ms — 1.28 ms each — against 30.1 ms for the other
+   331 FC nodes together. `shared_expert_gate` is `[1, 2048]`: one scalar per
+   token, 4.2 MMAC at M=2048, arithmetically the cheapest FullyConnected in the
+   layer. The reference kernel's cost is not proportional to its arithmetic.
+   The trigger is **not** simply M>1 — measured, M=1 and M=2 both put all 371 FC
+   nodes on `jit:gemm:any__i8` and only M=2048 falls back — so it is a threshold
+   between 2 and 2048, and which one is untested. The open question, one A/B
+   away: N=1 output shape, or u4 group-64 decompression? Rewriting those nodes
+   to an uncompressed f16 MatMul before compile answers it.
+3. **`PagedCausalConv1D` is on a reference kernel in both phases** (6.3%, 30
+   nodes, one per GDN layer). The paged transformation gave GDN an optimised
+   kernel and left the causal conv behind.
+
+Two things that are **not** established and are recorded as such:
+
+- The MTP prefill machinery — a per-chunk 16 MB hidden read-back and an O(L)
+  mask rebuild — is real for **the dense Qwen3.8, which carries an MTP head**.
+  The b5 coder ships none, so none of it runs on the artifact these numbers come
+  from. It is a lead for the 3.8, not for the coder.
+- "Attention prefill runs at f16 SIMD peak rather than the matrix engines" is
+  **a conjecture** inferred from the depth curve's quadratic coefficient
+  (~12 TFLOPS effective against a ~90 TFLOPS XMX f16 peak). A coefficient is
+  evidence, not a mechanism, and §7.0.2b already says `exec_type` cannot settle
+  it. It stays labelled until instruction-level tracing does.
+
 #### 7.0.2b The XMX question cannot be decided from the profile
 
 The proposed five-minute check — grep a `ARCINT_PROFILE` for `dpas`/systolic
@@ -1629,6 +1666,36 @@ is 5 GiB → 2.5 GiB on the coder. **u4 quarters the memory and costs 6% at
 while every other kernel line is identical to the tenth of a millisecond — the
 u4 dequant path costs far more than the 4× bandwidth it saves. So u4 is a
 capacity lever only, priced; u8 is the default candidate.
+
+**The prefill half of this decision was missing, and it is not small
+(measured 2026-08-29, B60, b5 coder, one lane, chunk 2048, matched token
+counts).** u8 was chosen above on decode evidence — never slower, +2.5% at 32k
+— and nobody ran a prefill. Against f16 on the same graph:
+
+| prompt tokens | paged u8 | paged f16 | u8 vs f16 |
+|---|---|---|---|
+| 14450 | 2245.6 t/s | 2178.0 t/s | **+3.1%** |
+| 57792 | 1337.3 t/s | 1601.5 t/s | **−16.5%** |
+| 115564 | 850.5 t/s | 1092.0 t/s | **−22.1%** |
+
+u8 is neutral-to-better at shallow depth and costs up to 22% of prefill at
+115k, growing with depth — the opposite shape to its decode behaviour.
+
+**The default stays u8, chosen from the reservation arithmetic rather than from
+the throughput number.** u8 is 11.3 KiB/token against f16's 20; at 262144 that
+is 2.83 GiB against 5.00. What that buys is capability, not speed:
+
+| configuration | u8 | f16 |
+|---|---|---|
+| B60, 1 lane, 262144 | 18.99 of 22.71 GiB | 21.16 of 22.71 GiB — fits |
+| B60, 2 lanes, 262144 | 22.04 of 22.71 GiB — just fits | 26.4 GiB — **refused** |
+| A770, deep context | max ctx 109056 | roughly half of that |
+
+An engine's default has to be the setting that does not refuse. So: **u8 by
+default; `--paged-kv f16` is for a one-lane deep-context endpoint on a card
+with room**, which is exactly what the fleet's coder unit is, and there it is
+worth up to 22% of prefill. `ARCINT_PAGED_KV` remains as the A/B override so a
+running deployment can be measured without a config edit.
 
 What is measured about quality so far: greedy token streams under u8/u4
 diverge from f16 within the first tokens (first divergence at token 4–37

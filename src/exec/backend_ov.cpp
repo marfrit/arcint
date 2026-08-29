@@ -1333,6 +1333,7 @@ private:
 
         // ------------------------------------------------------------ prefill
         const auto t_prefill = clock::now();
+        const auto t_restore = t_prefill;
         size_t&    c    = lane.committed_row;      // the committed LA row, lane-relative
         c               = 0;
         size_t     past = 0;
@@ -1367,6 +1368,8 @@ private:
             zero_paged_rows(lane);
             mtp_reset(lane);
         }
+        stats.prefill_restore_seconds = std::chrono::duration<double>(clock::now() - t_restore)
+                                            .count();
 
         const size_t grid = prefill_chunk_ > 0 ? static_cast<size_t>(prefill_chunk_) : 0;
         const size_t snap_at =
@@ -1382,7 +1385,10 @@ private:
                 const size_t edge = ((past / grid) + 1) * grid;
                 take = std::min(edge, prompt_ids.size()) - past;
             }
-            if (!ensure_blocks(lane, past + take)) {
+            const auto t_blocks = clock::now();
+            const bool got      = ensure_blocks(lane, past + take);
+            stats.prefill_blocks_seconds += seconds_since_tp(t_blocks);
+            if (!got) {
                 log::warn("slot", "KV pool exhausted at %zu tokens; %llu page(s) free",
                           past + take, static_cast<unsigned long long>(pool_->free_blocks()));
                 stats.prefill_seconds =
@@ -1391,10 +1397,20 @@ private:
             }
             const std::vector<int> chunk(prompt_ids.begin() + static_cast<long>(past),
                                          prompt_ids.begin() + static_cast<long>(past + take));
+            // Each phase net of what it spent queueing, so the terms add up to
+            // work and the waiting is reported as waiting.
+            double     waited = lane.stall_accum;
+            const auto t_emb  = clock::now();
             const ov::Tensor emb  = embed_paged(lane, chunk);
+            stats.prefill_embed_seconds +=
+                seconds_since_tp(t_emb) - (lane.stall_accum - waited);
+            waited                = lane.stall_accum;
+            const auto t_fwd      = clock::now();
             const bool       last = past + take == prompt_ids.size();
             const ov::Tensor out =
                 paged_forward(lane, emb, past, {static_cast<int32_t>(c)}, 0, last);
+            stats.prefill_forward_seconds +=
+                seconds_since_tp(t_fwd) - (lane.stall_accum - waited);
             if (last) logits = out;
             if (mtp_ready_) {
                 mtp_prime_paged(lane, lane.hidden, emb, take);
@@ -1422,6 +1438,7 @@ private:
             }
         }
         stats.prefill_seconds = std::chrono::duration<double>(clock::now() - t_prefill).count();
+        stats.prefill_wait_seconds = lane.stall_accum;
 
         int next = pick(lane, sampler, logits);
 
@@ -1677,12 +1694,30 @@ private:
         // the ~30k depth probe, base answer bitwise identical to f16, never
         // slower (71.3 vs 68.6 t/s), and half the KV memory. ARCINT_PAGED_KV
         // stays as the measurement switch to pin f16 for A/B runs.
-        ov::element::Type kv_prec = ov::element::u8;
+        // --paged-kv decides it; ARCINT_PAGED_KV still overrides, because an A/B
+        // over a running deployment should not need a config edit.
+        ov::element::Type kv_prec = cfg.paged_kv == "f16" ? ov::element::f16 : ov::element::u8;
+        std::string       kv_src  = "--paged-kv";
         if (const char* env = std::getenv("ARCINT_PAGED_KV")) {
-            if (std::string(env) == "f16") kv_prec = ov::element::f16;
-            log::info("load", "paged KV precision override: %s", env);
+            kv_prec = std::string(env) == "f16" ? ov::element::f16 : ov::element::u8;
+            kv_src  = "ARCINT_PAGED_KV";
         }
+        // Said out loud at load, because it is a throughput decision now and not
+        // only a memory one: u8 halves KV and costs up to 22% of prefill at
+        // depth (§7.0.3 chose it on decode evidence, which did not see that).
+        log::info("load", "paged KV precision %s (%s): %s",
+                  kv_prec == ov::element::f16 ? "f16" : "u8", kv_src.c_str(),
+                  kv_prec == ov::element::f16
+                      ? "20 KiB/token, faster prefill at depth"
+                      : "11.3 KiB/token, what makes two lanes at depth fit");
         props["KV_CACHE_PRECISION"] = kv_prec;
+        // The served path could not be profiled at all until now: enable_profiling
+        // was wired on the stateful reference path only, so every per-kernel number
+        // in this document describes a graph the fleet does not run. ARCINT_PROFILE
+        // turns it on here too. It is opt-in because PERF_COUNT inflates wall clock
+        // (§7.0: 53.6 ms for a step whose node sum is 19.01 ms), so a profiled run
+        // is for shares, never for rates.
+        if (std::getenv("ARCINT_PROFILE") != nullptr) props[ov::enable_profiling.name()] = true;
         if (offload_ratio_ > 0) {
             props["OFFLOAD_RATIO"]        = offload_ratio_;
             props[ov::weights_path.name()] = artifact_.language_model_bin;
@@ -2033,6 +2068,8 @@ private:
         status_.reservation.lanes              = lanes;
         status_.reservation.prefill_chunk      = prefill_chunk_;
         status_.reservation.n_ctx              = paged_n_ctx_;
+
+        if (std::getenv("ARCINT_PROFILE") != nullptr) profile_paged(*lanes_[0]);
     }
 
     // The KV pool is one allocation shared by every lane: pages are handed out
@@ -2461,6 +2498,94 @@ private:
         lm_req_.reset_state();
         if (std::getenv("ARCINT_BENCH_FORWARD") != nullptr) bench_forward();
         if (std::getenv("ARCINT_PROFILE") != nullptr) profile_step();
+    }
+
+    // Per-kernel breakdown of the paged graph, for one prefill chunk and one
+    // decode step. Prefill has never been profiled on any path: every kernel
+    // table in DESIGN describes a decode step, which is how the reference
+    // Transpose and GDN kernels were found, and prefill was simply never looked
+    // at. The two phases run the same graph with a different token count, so
+    // they can and do select different kernels.
+    //
+    // Read the shares, not the wall clock: PERF_COUNT inflates the latter, and
+    // get_profiling_info() reports the LAST inference, which is why each phase
+    // is run immediately before its table is dumped.
+    void profile_paged(Lane& lane) {
+        size_t      depth = static_cast<size_t>(std::max(1, prefill_chunk_));
+        const char* env   = std::getenv("ARCINT_PROFILE");
+        if (env != nullptr && env[0] >= '1' && env[0] <= '9') {
+            depth = static_cast<size_t>(std::strtoul(env, nullptr, 10));
+        }
+
+        auto dump = [&](const char* what, size_t tokens) {
+            struct Agg { double us = 0.0; int n = 0; };
+            std::map<std::string, Agg> by_kernel;
+            // A node identified by "nothing else is this size" is a conjecture.
+            // Reference-kernel rows get their node names printed so the thing
+            // can be named rather than inferred.
+            std::map<std::string, std::vector<std::string>> ref_names;
+            double                     total = 0.0;
+            for (const ov::ProfilingInfo& p : lane.req.get_profiling_info()) {
+                const double us = static_cast<double>(p.real_time.count());
+                if (us <= 0.0) continue;
+                const std::string key = p.node_type + "  " + p.exec_type;
+                Agg& a = by_kernel[key];
+                a.us += us;
+                a.n += 1;
+                total += us;
+                if (p.exec_type.find("ref") != std::string::npos) {
+                    ref_names[key].push_back(p.node_name);
+                }
+            }
+            std::vector<std::pair<std::string, Agg>> rows(by_kernel.begin(), by_kernel.end());
+            std::sort(rows.begin(), rows.end(),
+                      [](const auto& a, const auto& b) { return a.second.us > b.second.us; });
+            log::info("profile", "%s: %zu token(s), node total %.2f ms across %zu (op, kernel) "
+                                 "pairs, %.1f us/token",
+                      what, tokens, total / 1000.0, rows.size(),
+                      tokens > 0 ? total / static_cast<double>(tokens) : 0.0);
+            for (size_t i = 0; i < rows.size() && i < 20; ++i) {
+                log::info("profile", "  %8.1f us %5d  %5.1f%%  %s", rows[i].second.us,
+                          rows[i].second.n, 100.0 * rows[i].second.us / total,
+                          rows[i].first.c_str());
+            }
+            // Only the FullyConnected fallbacks, and only a few names: the
+            // question is which projection, and forty lines of the same answer
+            // do not make it truer.
+            for (const auto& [key, names] : ref_names) {
+                if (key.find("FullyConnected") == std::string::npos) continue;
+                for (size_t i = 0; i < names.size() && i < 4; ++i) {
+                    log::info("profile", "    ref node: %s", names[i].c_str());
+                }
+                log::info("profile", "    (%zu node(s) on %s)", names.size(), key.c_str());
+            }
+        };
+
+        if (!ensure_blocks(lane, depth + 2)) {
+            log::warn("profile", "%s", "not enough KV pages to profile");
+            return;
+        }
+
+        // A sweep over the token count, not a single chunk, because the open
+        // question is what changes between one token and many. Kernel selection
+        // for a dynamic-shape node happens per runtime shape, so M=1, M=2 and
+        // M=depth are three different questions asked of the same graph.
+        for (size_t m : {size_t{1}, size_t{2}, depth}) {
+            zero_paged_rows(lane);
+            std::vector<int> chunk(m, 0);
+            paged_forward(lane, embed_paged(lane, chunk), 0, {0}, 0);
+            dump(log::format("prefill M=%zu", m).c_str(), m);
+        }
+
+        // Then one decode step at depth, which is a 1-token forward with a past
+        // rather than without one.
+        zero_paged_rows(lane);
+        paged_forward(lane, embed_paged(lane, std::vector<int>(depth, 0)), 0, {0}, 0);
+        paged_forward(lane, embed_paged(lane, {0}), depth, {0}, 0);
+        dump("decode step", 1);
+
+        release_lane(lane);
+        zero_paged_rows(lane);
     }
 
     // Per-kernel breakdown of one decode step. Aggregated by (op, kernel) so

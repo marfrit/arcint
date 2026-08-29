@@ -1,6 +1,6 @@
-# arcint as a systemd *user* unit.
+# arcint as a systemd *user* unit, matching the package this file ships in.
 #
-# Install:
+# Install (package host, which is the normal case):
 #   cp /usr/share/arcint/arcint.service ~/.config/systemd/user/
 #   $EDITOR ~/.config/systemd/user/arcint.service     # model, card, port, name
 #   systemctl --user daemon-reload && systemctl --user enable --now arcint

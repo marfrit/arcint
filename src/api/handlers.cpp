@@ -82,6 +82,20 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
     if (stats.snapshot_seconds > 0.0) {
         prefill_suffix += log::format(" | cache snapshot %.2f s", stats.snapshot_seconds);
     }
+    // Where prefill went, on the same footing as the decode line. Printed only
+    // when the backend fills it in, so the stub's line is the line it was.
+    if (stats.prefill_forward_seconds > 0.0 || stats.prefill_embed_seconds > 0.0) {
+        const double other = stats.prefill_seconds - stats.prefill_forward_seconds -
+                             stats.prefill_embed_seconds - stats.prefill_blocks_seconds -
+                             stats.prefill_restore_seconds - stats.prefill_wait_seconds -
+                             stats.snapshot_seconds;
+        prefill_suffix += log::format(
+            " | graph %.2f s, embed %.2f s, pages %.2f s, restore %.2f s, wait %.2f s, "
+            "other %.2f s",
+            stats.prefill_forward_seconds, stats.prefill_embed_seconds,
+            stats.prefill_blocks_seconds, stats.prefill_restore_seconds,
+            stats.prefill_wait_seconds, other);
+    }
     log_slot_line(slot, "prefill", stats.prompt_tokens, stats.prefill_seconds,
                   stats.prefill_rate(), prefill_suffix);
 

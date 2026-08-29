@@ -91,7 +91,16 @@ struct Config {
     std::string mtp_device;
 
     int         kv_block_size             = 32;      // 16 or 32 — §8 benchmarks this
-    std::string kv_dtype                  = "fp16";  // fp16 | q8
+    std::string kv_dtype                  = "fp16";  // fp16 | q8 — the STATEFUL path
+
+    // KV precision on the paged (served) path, where the plugin manages the
+    // scales and q8 is real quantisation rather than a cast (DESIGN §7.0.3).
+    // Default u8, and the reason is capability rather than speed: it halves KV
+    // to 11.3 KiB/token, which is what lets two lanes reach agent depth on the
+    // B60 and what lets the A770 reach depth at all. It is NOT free — measured
+    // 2026-08-29, it costs up to 22% of prefill at 115k (§4.4) — so a one-lane
+    // deep-context endpoint on a card with room should say f16.
+    std::string paged_kv                  = "u8";    // u8 | f16
     int         gdn_checkpoint_budget_mib = 512;     // §3.3
     std::string mtp                       = "auto";  // on | off | auto
 
