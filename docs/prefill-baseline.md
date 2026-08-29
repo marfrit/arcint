@@ -503,8 +503,9 @@ runs f16 now, so both load lines exist:
 | u8 | 37918 | 16386 | 21532 (~344k tokens) |
 | f16 | 21477 | 16386 | **5091** (~81k tokens) |
 
-The pool is sized in **bytes**, so at the same 6.55 GiB an f16 page costs twice
-as much and the count halves. Live pages are a fixed count (n_ctx / 16), so the
+The pool is sized in **bytes**; at the same 6.55 GiB an f16 page costs 1.77x a
+u8 page (20.0 KiB/token against 11.3 — u8 carries per-block scales, so it is
+0.565x and not a clean half) and the count falls 37918 → 21477. Live pages are a fixed count (n_ctx / 16), so the
 entire halving comes out of the cached-prefix reserve: **4.2x less**. The
 context ceiling (606688 → 343632) was documented; this was not, and for an agent
 workload it is the term that can eat the win. Now in DESIGN §7.0.3.
@@ -531,3 +532,48 @@ profile:   (past 0: shares here overstate a real prefill's -- size against wall 
 `--paged-kv f16` is live on the coder endpoint, committed in the unit repo, the
 acceptance task scores 10/10 after the switch, and the revert is one flag. The
 deployment runs what its own documentation points at.
+
+
+## The mechanism behind the reserve, and how it scales
+
+Added after the deployment side asked why the whole halving landed on the
+reserve. Three facts compose, and they check to the page:
+
+1. the pool is sized in **bytes** — whatever is left after weights, activations,
+   GDN rows and margin — so the page count depends on what a page costs;
+2. live pages are a fixed **count**, `n_ctx / 16 + 2` per lane, independent of
+   precision;
+3. the reserve is the difference.
+
+`37918 − 16386 = 21532` and `21477 − 16386 = 5091`, with `262144 / 16 + 2 =
+16386` in both. Everything that costs bytes therefore comes out of the reserve,
+because the live side is a count and cannot absorb it.
+
+The corollary is the part a deployer needs: **the context ceiling is not a
+separate limit, it is the depth at which the reserve reaches zero.**
+`606688 / 16 + 2 = 37920` against 37918 affordable pages; `343632 / 16 + 2 =
+21479` against 21477. Raising `--n-ctx` spends the prefix cache first and
+reaches the ceiling only when there is none left.
+
+## The crossover: not requested
+
+The disagreement was between a 32k measurement (u8 +2.5%) and a 53.5k one
+(f16 +7.8%), and locating the crossover between them belongs to the instrument
+that produced it. Asked whether the answer would change anything written here:
+**no**, and the reason is worth recording so the question is not reopened.
+
+- It does not move the default. That is chosen on what refuses.
+- It does not change the deployment guidance, which is already depth-shaped:
+  above ~50k both prefill and decode favour f16; below ~32k decode favours u8
+  while prefill favours f16 from ~25k. A deployer who knows their workload depth
+  can act on that today. Pinning the boundary to 38k or 44k changes a number in
+  a sentence, not the shape of the advice.
+- The band where the two axes disagree is already named as a band.
+
+What *would* be worth the downtime is the ladder's **anchors**, not its middle:
+32k and 53.5k reproducing the two existing numbers, three runs each. That is six
+runs, and it tests something the crossover does not — whether the two
+measurements, taken on different instruments weeks apart, agree when repeated.
+If an anchor failed to reproduce, one of them is wrong and the curve between
+them is not worth locating anyway. Worth folding into some other downtime;
+not worth creating downtime for.

@@ -1677,7 +1677,10 @@ tokens, one process per cell):
 | A770 f16 / u8 / u4 (512) | 43.4 / 43.5 / 43.2 | 42.4 / 42.9 / — | |
 
 **u8 is never slower over the depths in that table, is +2.5% at 32k, and halves
-KV memory** — at 262k that is 5 GiB → 2.5 GiB on the coder.
+KV memory** — at 262k that is 5.00 GiB → **2.83 GiB** on the coder. (2.5 GiB
+was the prediction from a clean halving; the plugin's u8 layout carries
+per-block scales, so the measured cost is 11.3 KiB/token against f16's 20.0 —
+0.565x. The saving is 43%, not 50%.)
 
 **The qualifier is load-bearing and was missing (added 2026-08-29 from a
 deployment-side measurement, B60, coder, one lane, 262144, warm prefix so the
@@ -1723,27 +1726,62 @@ is 2.83 GiB against 5.00. What that buys is capability, not speed:
 
 An engine's default has to be the setting that does not refuse. So: **u8 by
 default; `--paged-kv f16` is for a one-lane deep-context endpoint on a card
-with room**, which is exactly what the fleet's coder unit is, and there it is
-worth up to 22% of prefill. `ARCINT_PAGED_KV` remains as the A/B override so a
+with room**, and there it is worth up to 22% of prefill.
+
+> **A default chosen on what refuses, rather than on what benchmarks, survives
+> losing every performance leg.** u8 has now lost both — prefill at depth and,
+> since the 53.5k decode measurement, decode at depth as well — and the default
+> does not move, because none of that was ever the argument for it. A default
+> picked because it was fastest today would have had to be revisited twice by
+> now. This is the rule to apply to the next one. `ARCINT_PAGED_KV` remains as the A/B override so a
 running deployment can be measured without a config edit.
 
 **The second number a deployer needs, and the documentation only gave the
 first.** The context ceiling per lane falls 606688 → 343632 under f16 and that
-is stated above. What is not is what happens to the *prefix cache*: the pool is
-sized in bytes, so at the same 6.55 GiB an f16 page costs twice as much and the
-page count halves. Measured on the coder endpoint (B60, one lane, 262144):
+is stated above. What is not is what happens to the *prefix cache*. Measured on
+the coder artifact, 24 GB card, one lane, n_ctx 262144:
 
 | | pool pages | live per lane | spare for cached prefixes |
 |---|---|---|---|
 | u8 | 37918 | 16386 | **21532** — ~344k tokens of reserve |
 | f16 | 21477 | 16386 | **5091** — ~81k tokens of reserve |
 
-Live pages are a fixed count (n_ctx / 16), so the whole halving comes out of the
-reserve: a **4.2x** reduction. For an agent or coder workload that is the term
-that can eat the win — every cold prefill gets 16–34% cheaper while fewer
-prefixes stay resident that would have needed no prefill at all. Which way it
-nets out depends on reuse, so this is not an argument against f16; it is the
-second half of the choice, and a deployer was being shown only the first.
+**The mechanism, because it also says how the term scales.** Three facts
+compose:
+
+1. the pool is sized in **bytes** — whatever VRAM is left after weights,
+   activations, the GDN rows and the margin — so the page *count* it buys
+   depends on what a page costs;
+2. live pages are a fixed **count**, `n_ctx / kv_block_tokens + 2` per lane,
+   independent of precision;
+3. the reserve is simply the difference.
+
+Checked against both configurations to the page: 37918 − 16386 = 21532 and
+21477 − 16386 = 5091, with `262144 / 16 + 2 = 16386` in each. So **everything
+that costs bytes comes out of the reserve, because the live side is a count and
+cannot absorb it.** Raising `--n-ctx` does the same thing from the other
+direction — live grows linearly while the affordable total does not move — and
+that yields the useful corollary:
+
+> **The context ceiling is not a separate limit. It is the depth at which the
+> reserve reaches zero.** `606688 / 16 + 2 = 37920` against 37918 affordable
+> pages, and `343632 / 16 + 2 = 21479` against 21477 — the reported ceilings, to
+> two pages of block rounding. A deployer raising `--n-ctx` spends the prefix
+> cache first and hits the ceiling only when there is none left.
+
+**Two numbers corrected while checking this.** u8 does not halve KV: the
+plugin's u8 layout carries per-block scales, so it is 11.3 KiB/token against
+f16's 20.0 — **0.565x, not 0.5**. At 262144 that is 5.00 GiB → **2.83 GiB**, not
+the 2.5 GiB predicted above before it was measured. For the same reason an f16
+page does not cost twice a u8 page and the count does not halve: 37918 → 21477
+is **1.77x**, and the reserve falls 4.2x only because the fixed live count is
+subtracted from both.
+
+For an agent or coder workload the reserve is the term that can eat the win —
+every cold prefill gets 16–34% cheaper while fewer prefixes stay resident that
+would have needed no prefill at all. Which way it nets out depends on reuse, so
+this is not an argument against f16; it is the second half of the choice, and a
+deployer was being shown only the first.
 
 What is measured about quality so far: greedy token streams under u8/u4
 diverge from f16 within the first tokens (first divergence at token 4–37
