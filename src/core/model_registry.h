@@ -25,7 +25,7 @@
 // the flag is now pinned to what the exports actually contain, and
 // `mtp_in_checkpoint` records that a re-export is what would unblock M4.
 //
-// Had that flag stayed a load-refusing error, ligence would now refuse to load
+// Had that flag stayed a load-refusing error, arcint would now refuse to load
 // qwen3.8 entirely on the strength of a sentence.
 //
 // Provenance is part of the contract: the campaign showed scale-estimation

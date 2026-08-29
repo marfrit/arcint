@@ -95,7 +95,7 @@ void HttpServer::Impl::route() {
                   json{{"object", "list"},
                        {"data", json::array({{{"id", st.id},
                                               {"object", "model"},
-                                              {"owned_by", "ligence"}}})}});
+                                              {"owned_by", "arcint"}}})}});
     });
 
     svr.Post("/v1/chat/completions", [this](const httplib::Request& req, httplib::Response& res) {

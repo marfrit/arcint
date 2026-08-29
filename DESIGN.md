@@ -1,4 +1,4 @@
-# ligence — Design
+# arcint — Design
 
 Status: **M0 implemented** (serving skeleton on a stub backend, no OpenVINO
 linked, no weights loaded); M1 next. Performance numbers cited below come from
@@ -18,9 +18,9 @@ OpenVINO's graph compiler and kernel library emit good Xe code (measured:
 3.4× llama.cpp-SYCL, 7.6× llama.cpp-Vulkan on Battlemage for the same
 checkpoint). What is *not* won is the layer above — scheduling, cache
 management, hybrid-state handling, sampling, serving — where OpenVINO GenAI
-makes choices ligence cannot live with (see §6).
+makes choices arcint cannot live with (see §6).
 
-So: **OpenVINO as compiler and kernel library, ligence as everything else.**
+So: **OpenVINO as compiler and kernel library, arcint as everything else.**
 
 ## 2. Target constraints (facts, not choices)
 
@@ -101,7 +101,7 @@ deep context the KV dominates and binds the slot count hard: two sequences at
 ### 3.1 Model artifacts
 
 Input format is **OpenVINO IR** produced offline (optimum-intel export, int4
-AWQ or int8), one directory per model. ligence validates the IR against a
+AWQ or int8), one directory per model. arcint validates the IR against a
 built-in allowlist (architecture hash + tensor inventory) and refuses anything
 else. Calibration lessons are encoded in the allowlist: the campaign showed
 that scale-estimation (SE) calibration degenerates greedy decoding on the
@@ -124,7 +124,7 @@ yet a measured property of any artifact.
 
 The transformer stack is compiled as **stateless graphs with explicit cache
 I/O**: attention layers take KV page tensors in and out, GDN layers take their
-recurrent state in and out. ligence owns every byte of cache; OV owns the
+recurrent state in and out. arcint owns every byte of cache; OV owns the
 math. Three compiled entry points:
 
 **What the artifact actually exports.** The IR is a *stateful* graph, not the
@@ -136,7 +136,7 @@ is a VLM (`Qwen3_5MoeForConditionalGeneration`), so token ids go through a
 separate text-embeddings graph first; v1 never compiles the vision graphs.
 
 M1 therefore runs the stateful graph as exported, one sequence per
-`InferRequest`. That is not a retreat from ligence owning the cache: the state
+`InferRequest`. That is not a retreat from arcint owning the cache: the state
 is reachable through `ov::VariableState::get_state()`/`set_state()`, which is
 exactly the handle the GDN ledger and its block-aligned checkpoints need, and
 `ov::pass::SDPAToPagedAttention` is available for the attention side. The
@@ -160,7 +160,7 @@ So it is not batching per se, and it is not the position: it is that advancing
 the state by two tokens in one call is a different computation from advancing it
 twice by one. The GDN layers are the obvious suspect — a recurrent scan over k
 tokens is a different kernel path from k scans of one — and that is a property
-of `ocl::gated_delta_net::ref`, not of ligence.
+of `ocl::gated_delta_net::ref`, not of arcint.
 
 **This one fact governs three features.** Anything that changes how a token
 sequence is divided into forward passes can move a near-tie: chunked prefill
@@ -365,7 +365,7 @@ executor keeps running the graph as exported.
 
 - Hash chain over token blocks (content hash, not pointer identity), one entry
   per (block hash, position). Collision handling is a first-class test case —
-  OV GenAI shipped a collision bug (their #3489); ligence hashes with a keyed
+  OV GenAI shipped a collision bug (their #3489); arcint hashes with a keyed
   128-bit hash and verifies token identity on hit before reuse.
 - A hit restores: KV pages by reference (copy-on-write) *and* the GDN
   checkpoint at the same block boundary. Both or neither — a prefix hit that
@@ -779,7 +779,7 @@ reservation stating a fact about the card, not a failure.
 unblocks): coder **10/10** at base depth and **10/10 at the ~30k depth probe**;
 u8 KV **10/10 at both depths** with the base answer *bitwise identical* to f16
 and never slower — so **u8 is the paged default** per §7.0.3's protocol, halving
-KV memory, with `LIGENCE_PAGED_KV=f16` as the pin for A/B runs. The dense model
+KV memory, with `ARCINT_PAGED_KV=f16` as the pin for A/B runs. The dense model
 re-measured **10/10 greedy** through paged+MTP (36.2 t/s), superseding the
 registry's stateful-era 8/10 — greedy is deterministic per configuration, so
 both numbers are real; the paged path's near-tie landings score better here.
@@ -809,7 +809,7 @@ explicit fields always win; `/props` shows both.
 
 - **Tokenizer and chat template ship inside the model artifact** (the OV IR
   directory already carries `openvino_tokenizers` and the jinja template).
-  ligence never substitutes its own copy — template drift between exporter
+  arcint never substitutes its own copy — template drift between exporter
   and server is a measured source of silent quality loss, so the artifact is
   the single source of truth and its template hash is part of the allowlist.
 - **Incremental detokenization** for streaming: UTF-8 code points are never
@@ -820,7 +820,7 @@ explicit fields always win; `/props` shows both.
   responses carry it in the final chunk.
 - **Tool-call parsing**: the models' native tool-call format (Qwen XML-style)
   is parsed server-side and returned as structured `tool_calls` with
-  `finish_reason: "tool_calls"`, OpenAI-compatible. ligence parses, never
+  `finish_reason: "tool_calls"`, OpenAI-compatible. arcint parses, never
   executes. Requests that declare no `tools` get raw text untouched — the
   fleet's proxy learned that a parser that eats tags on tool-less requests
   makes the content silently vanish.
@@ -861,7 +861,7 @@ Console output (stderr), llama.cpp tradition. This is what M0 actually prints
 (copied from a run on a clean tree; a dirty tree appends `-dirty` to the sha):
 
 ```
-lgc  boot: ligence 0.0.1 (b0ebc5c1ffcb) Release, GNU 14.2.0
+lgc  boot: arcint 0.0.1 (b0ebc5c1ffcb) Release, GNU 14.2.0
 lgc  boot: stub backend: no model, no OpenVINO, synthetic output. Nothing measured here is a model result.
 lgc  load: qwen3.6-27b-a3b-coder q4 | 30 GDN + 10 attn layers | n_ctx 262144 (allowlist)
 lgc  mem:  kv pool and GDN ledger are not allocated before M2
@@ -896,13 +896,13 @@ One line per event, greppable, no colors by default, `-v` raises verbosity
   artifact must match its GGUF reference before shipping q4.
 
   **Measured 2026-08-28, b5 coder on the B60.** The bar is written down as
-  "10/10 greedy". Under greedy ligence scores **8/10**, deterministically. That
-  is not a ligence defect, and the evidence says the bar was never greedy:
+  "10/10 greedy". Under greedy arcint scores **8/10**, deterministically. That
+  is not a arcint defect, and the evidence says the bar was never greedy:
 
   | run | decoding | score |
   |---|---|---|
-  | ligence | greedy (temperature 0) | 8/10, byte-identical across repeats |
-  | ligence | artifact defaults, seeds 1/2/3 | 10/10, 10/10, 8/10 |
+  | arcint | greedy (temperature 0) | 8/10, byte-identical across repeats |
+  | arcint | artifact defaults, seeds 1/2/3 | 10/10, 10/10, 8/10 |
   | OpenArc, same day, same task | its defaults (no temperature field) | 10/10 |
 
   OpenArc cannot be asked for temperature 0 — `frage.py` records that a temp-0
@@ -910,14 +910,14 @@ One line per event, greppable, no colors by default, `-v` raises verbosity
   reference run went through the artifact's sampling defaults (temperature 1.0,
   top_p 0.95, top_k 20, straight out of `generation_config.json`). The stored
   `antwort-b5-greedy.lua` carries no `<think>` block and its first ten lines are
-  identical to ligence's greedy answer, which is consistent with the same model
+  identical to arcint's greedy answer, which is consistent with the same model
   and the same prompt diverging only where sampling would.
 
-  Three checks say the divergence is the decoder's regime and not ligence's
+  Three checks say the divergence is the decoder's regime and not arcint's
   arithmetic: the rendered prompt is **byte-identical to reference jinja2** in
   both thinking modes; greedy output is **byte-identical across repeated runs**;
   and greedy output is **byte-identical to an independent implementation** of
-  the same graph over the same prompt. So ligence reproduces the reference
+  the same graph over the same prompt. So arcint reproduces the reference
   quality under the reference's decoding regime, and the "10/10 greedy" wording
   should be read as "10/10 at the artifact's sampling defaults" until someone
   produces a genuinely greedy 10/10 on this artifact.
@@ -1034,7 +1034,7 @@ One line per event, greppable, no colors by default, `-v` raises verbosity
   GDN `Transpose` nodes grow ×5.4 though the GDN state is fixed-size. Something
   sizes work by context where context does not enter the mathematics.
 - **256k context loads — measured, not extrapolated.** With fp16 KV storage,
-  chunked prefill at 2048 and the logits slice, ligence loaded **257,167
+  chunked prefill at 2048 and the logits slice, arcint loaded **257,167
   tokens** on the B60 in 8.1 minutes (528 t/s prefill), which is 98% of the
   artifact's 262,144 maximum. The rungs below it:
 
@@ -1052,7 +1052,7 @@ One line per event, greppable, no colors by default, `-v` raises verbosity
   only state that grows. Scaling is still superlinear — exponent 1.88 overall,
   against 2.11–2.50 before these changes — so the O(L²) term in §5 is reduced
   but not gone, and the paged path remains the way to remove it.
-- **Prefill, measured through ligence on the B60** (coder q4, chunked at 512):
+- **Prefill, measured through arcint on the B60** (coder q4, chunked at 512):
   781–1723 t/s across 1.2k–18k tokens, e.g. 9615 tok in 8.28 s (1161 t/s) and
   18308 tok in 21.1 s (867 t/s). That is one to two orders above the 58 t/s
   llama.cpp-Vulkan figure below, which was the measured pain this project was
@@ -1064,7 +1064,7 @@ One line per event, greppable, no colors by default, `-v` raises verbosity
   measured ~58 t/s prefill on the A770 (six minutes to first token at 21k
   context) while decode quality held (9/10 at 21k depth, failure was an
   ordinary logic slip, not degeneration). Deep-context agent turns die on
-  prefill, not decode. ligence tracks prefill t/s per card as a first-class
+  prefill, not decode. arcint tracks prefill t/s per card as a first-class
   regression metric; the OV-compiled prefill graph baseline is measured at M1
   and becomes the floor.
 
@@ -1084,7 +1084,7 @@ One line per event, greppable, no colors by default, `-v` raises verbosity
   upstream.
 
 None of this is a reason to abandon OV's kernels — they are the fastest
-correct compute on this hardware. It is the reason ligence keeps the compiler
+correct compute on this hardware. It is the reason arcint keeps the compiler
 and owns the state.
 
 ## 7. Milestones
@@ -1108,7 +1108,7 @@ in the code and must not survive M1: the stub tokenizer is a reversible
 splitter and not a BPE, and `render_chatml_stub` is not the model's chat
 template — §3.7 keeps that in the artifact, and M1 takes both from the IR.
 
-**All three models, measured through ligence on the B60, 2026-08-28** (the
+**All three models, measured through arcint on the B60, 2026-08-28** (the
 Prüfstand task, `enable_thinking` off):
 
 | model | weights | greedy | at the artifact's sampling defaults |
@@ -1184,14 +1184,14 @@ measurement available and it had not been taken.
 `openarc-coder` on the fleet serves **the same IR file** (`qwen36-coder-b5-ov`)
 on the same card through **the same OpenVINO compiler**, but drives it with
 GenAI's `ContinuousBatchingPipeline` — that is, the paged path. So openarc
-against ligence holds the kernels and the graph constant and varies only the
+against arcint holds the kernels and the graph constant and varies only the
 pipeline. Measured 2026-08-28 on the B60, identical prompt, five runs each with
 the first discarded as warm-up, wall clock including prefill:
 
 | | median | runs |
 |---|---|---|
 | openarc, GenAI continuous batching (paged) | **53.8 t/s** | 51.6, 57.8, 51.7, 55.9 |
-| ligence, stateful | **46.6 t/s** | 46.0, 46.0, 47.8, 47.1 |
+| arcint, stateful | **46.6 t/s** | 46.0, 46.0, 47.8, 47.1 |
 
 **13.4%** end to end. But that number measures openarc's *whole pipeline*, and
 taking it as the size of the prize was wrong — the graph and the pipeline had to
@@ -1221,9 +1221,9 @@ visible at this shallow depth and grows as L^1.46.
 
 **So the prize is 1.68× on the graph, not 13.4% end to end.** The difference
 between those two numbers is GenAI's own pipeline: it reaches 51.0 t/s wall on a
-graph that should allow far more, while ligence's serving loop measures at
+graph that should allow far more, while arcint's serving loop measures at
 **2%** of a decode step (graph 2.77 s of 2.82 s over 144 tokens; embed 0.4%,
-sample 0.7%, emit 0.7%). Neither combination exists today. ligence keeping its
+sample 0.7%, emit 0.7%). Neither combination exists today. arcint keeping its
 loop and running the paged graph projects to **≈87 t/s** on the coder against
 51.1 measured — and that projection, not 13.4%, is what the work is worth.
 
@@ -1249,17 +1249,17 @@ subtraction):
 | 32k context | prefill | decode |
 |---|---|---|
 | openarc production (B60, GenAI CB) | 867 t/s (36.8 s to first token) | 21.3 t/s |
-| ligence (B60, stateful) | **2444 t/s (13.1 s)** | **32.3 t/s** |
-| ligence (A770, chunk 512) | 901 t/s | 13.4 t/s |
+| arcint (B60, stateful) | **2444 t/s (13.1 s)** | **32.3 t/s** |
+| arcint (A770, chunk 512) | 901 t/s | 13.4 t/s |
 | openarc / GenAI CB path (A770) | **refuses at startup** (§7.0.2a; GenAI's *stateful* path did serve here) | — |
 
 At depth the stateful engine beats the production pipeline 2.8× on prefill and
 1.5× on decode — the opposite of the short-prompt result. So "GenAI's pipeline
 is ~10% ahead" is a shallow-context statement only; its scheduler gives back
-far more than 10% at depth. Both engines feel the depth collapse (§5): ligence
+far more than 10% at depth. Both engines feel the depth collapse (§5): arcint
 52 → 32.3 t/s from 256 to 32k of context, openarc 51 → 21.3.
 
-Small open lead from the same run: ligence's emit accounting rose to 0.43 s for
+Small open lead from the same run: arcint's emit accounting rose to 0.43 s for
 120 tokens at 32k (3.6 ms/token, ~12% of decode) where it is ~0.2 ms/token at
 short context. The graph still dominates; worth a look, not a fire.
 
@@ -1301,7 +1301,7 @@ the measured link rate and see whether the product fills the difference.
 |---|---|
 | node-time sum, B60, depth 256 | **19.01 ms** |
 | serving decode, same conditions | **19.2 ms/token** |
-| ligence's host-side work (embed + sample + emit) | **2%** |
+| arcint's host-side work (embed + sample + emit) | **2%** |
 | bytes over the link per step: sliced logits 248320 × 4 B | **993 KB** |
 | plus the embeddings hop | ~8 KB |
 | that traffic at x8 Gen4 / x4 Gen3 | **0.06 / 0.32 ms** |
@@ -1397,7 +1397,7 @@ transfer to the other. Host-side work is 2% on both.
 
 #### 7.0.2b The XMX question cannot be decided from the profile
 
-The proposed five-minute check — grep a `LIGENCE_PROFILE` for `dpas`/systolic
+The proposed five-minute check — grep a `ARCINT_PROFILE` for `dpas`/systolic
 markers in the GEMM kernel names — was run on both cards and is **inconclusive
 at this observability level**: the distinct GEMM `exec_type` strings are
 identical on the A770 and the B60 (`jit:gemm:any__i8`, `gemm_tiled_opt__f32`,
@@ -1517,7 +1517,7 @@ stays as an off-by-default measurement switch.
 - Exact KV block size (16 vs 32) and q8-KV numerics on Xe — benchmark at M2.
 - Whether OV's fused SDPA is exposed cleanly enough for the decode graph, or
   whether the attention layers are better served by the PagedAttention op with
-  ligence-owned page tables from day one.
+  arcint-owned page tables from day one.
 - MoE expert placement on the 16 GB card: full-resident q4 vs a small
   host-spill tier for the 35B (the fleet's `-ncmoe`-style split, measured
   workable under llama.cpp, unproven under OV stateless graphs).

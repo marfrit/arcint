@@ -1,11 +1,11 @@
-# ligence, as a systemd *user* unit on dirac (mfritsche), matching how
+# arcint, as a systemd *user* unit on dirac (mfritsche), matching how
 # openarc-coder and llama-agent already run there.
 #
 # Install:
 #   cmake --install build-ov --prefix ~/.local
-#   cp packaging/ligence.service ~/.config/systemd/user/
-#   cp packaging/ligence.env     ~/.config/systemd/user/
-#   systemctl --user daemon-reload && systemctl --user enable --now ligence
+#   cp packaging/arcint.service ~/.config/systemd/user/
+#   cp packaging/arcint.env     ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now arcint
 #
 # On dirac, unit changes go through the Roundhouse MCP (switch_preview /
 # edit_rollout), not hand-edited systemctl: a hand edit without a commit in
@@ -17,21 +17,21 @@
 # build was configured without OpenVINO's location or was moved after install.
 
 [Unit]
-Description=ligence — LLM inference for Intel Arc
-Documentation=https://git.reauktion.de/marfrit/ligence
+Description=arcint — LLM inference for Intel Arc
+Documentation=https://git.reauktion.de/marfrit/arcint
 After=graphical-session.target
 
 [Service]
 Type=simple
-EnvironmentFile=%h/.config/systemd/user/ligence.env
-ExecStart=%h/.local/bin/ligence \
-    --model ${LIGENCE_MODEL} \
-    --device ${LIGENCE_DEVICE} \
-    --host ${LIGENCE_HOST} \
-    --port ${LIGENCE_PORT} \
-    --n-ctx ${LIGENCE_N_CTX} \
-    --prefix-cache-mib ${LIGENCE_PREFIX_CACHE_MIB} \
-    $LIGENCE_EXTRA_ARGS
+EnvironmentFile=%h/.config/systemd/user/arcint.env
+ExecStart=%h/.local/bin/arcint \
+    --model ${ARCINT_MODEL} \
+    --device ${ARCINT_DEVICE} \
+    --host ${ARCINT_HOST} \
+    --port ${ARCINT_PORT} \
+    --n-ctx ${ARCINT_N_CTX} \
+    --prefix-cache-mib ${ARCINT_PREFIX_CACHE_MIB} \
+    $ARCINT_EXTRA_ARGS
 
 # The card holds the model's VRAM for the process lifetime, so a restart is a
 # full reload (minutes). Restart on failure, but do not thrash.
@@ -51,7 +51,7 @@ StandardError=journal
 NoNewPrivileges=true
 PrivateTmp=false
 ProtectHome=read-only
-ReadWritePaths=%h/.cache/ligence
+ReadWritePaths=%h/.cache/arcint
 
 [Install]
 WantedBy=default.target

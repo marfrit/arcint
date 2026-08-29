@@ -33,7 +33,7 @@ bool parse_int(std::string_view s, int& out) {
 
 std::string usage_text() {
     return
-        "usage: ligence [options]\n"
+        "usage: arcint [options]\n"
         "\n"
         "model\n"
         "  --model PATH              OpenVINO IR directory to serve\n"
@@ -204,9 +204,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (!cfg.model_path.empty() && cfg.stub) {
         return fail("--model and --stub are mutually exclusive");
     }
-#ifndef LIGENCE_OPENVINO
+#ifndef ARCINT_OPENVINO
     if (!cfg.model_path.empty()) {
-        return fail("this build has no OpenVINO backend (configure with -DLIGENCE_OPENVINO=ON)");
+        return fail("this build has no OpenVINO backend (configure with -DARCINT_OPENVINO=ON)");
     }
 #endif
 

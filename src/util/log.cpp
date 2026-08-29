@@ -69,7 +69,7 @@ void vlinef(Level lvl, std::string_view tag, const char* fmt, va_list ap) {
     line(lvl, tag, vformat(fmt, ap));
 }
 
-#define LIGENCE_LOG_FN(name, lvl)                          \
+#define ARCINT_LOG_FN(name, lvl)                          \
     void name(std::string_view tag, const char* fmt, ...) { \
         if (!enabled(lvl)) return;                          \
         va_list ap;                                         \
@@ -78,12 +78,12 @@ void vlinef(Level lvl, std::string_view tag, const char* fmt, va_list ap) {
         va_end(ap);                                         \
     }
 
-LIGENCE_LOG_FN(error, Level::Error)
-LIGENCE_LOG_FN(warn, Level::Warn)
-LIGENCE_LOG_FN(info, Level::Info)
-LIGENCE_LOG_FN(verbose, Level::Verbose)
-LIGENCE_LOG_FN(debug, Level::Debug)
+ARCINT_LOG_FN(error, Level::Error)
+ARCINT_LOG_FN(warn, Level::Warn)
+ARCINT_LOG_FN(info, Level::Info)
+ARCINT_LOG_FN(verbose, Level::Verbose)
+ARCINT_LOG_FN(debug, Level::Debug)
 
-#undef LIGENCE_LOG_FN
+#undef ARCINT_LOG_FN
 
 }  // namespace lgc::log

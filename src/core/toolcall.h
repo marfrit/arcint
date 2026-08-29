@@ -6,7 +6,7 @@
 #include <vector>
 
 // DESIGN.md §3.7: the models' native tool-call output is parsed server-side
-// into OpenAI-shaped `tool_calls`. ligence parses, never executes.
+// into OpenAI-shaped `tool_calls`. arcint parses, never executes.
 //
 // Two wire forms are handled, because the target set spans both:
 //

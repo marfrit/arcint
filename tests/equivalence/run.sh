@@ -8,11 +8,11 @@
 #   one chunk size    vs another
 #
 # It needs a real model, so it runs where the card is. Usage:
-#   run.sh /path/to/ligence /models/ov/<artifact> [device]
+#   run.sh /path/to/arcint /models/ov/<artifact> [device]
 set -uo pipefail
 
-BIN="${1:?usage: run.sh <ligence> <model-dir> [device]}"
-MODEL="${2:?usage: run.sh <ligence> <model-dir> [device]}"
+BIN="${1:?usage: run.sh <arcint> <model-dir> [device]}"
+MODEL="${2:?usage: run.sh <arcint> <model-dir> [device]}"
 DEV="${3:-GPU.0}"
 
 command -v python3 >/dev/null || { echo "python3 required" >&2; exit 2; }
@@ -62,7 +62,7 @@ PROMPT="Explain, in exactly one paragraph and without bullet points, why a recur
 linear-attention state cannot be truncated the way an attention KV cache can be. \
 Be precise about what information is irrecoverably mixed together. $(python3 -c 'print("Context filler. " * 60)')"
 
-echo "== ligence equivalence suite on $DEV"
+echo "== arcint equivalence suite on $DEV"
 
 # ---------------------------------------------------- greedy determinism (§5)
 start_server "$WORK/a.log" || exit 1   # shipped defaults: this IS the baseline
@@ -100,7 +100,7 @@ cmp -s "$WORK/base.txt" "$WORK/noslice.txt" \
 # --------------------------------- chunked vs unchunked: MEASURED, not gated
 #
 # Chunked prefill is not bit-exact on the OpenVINO GPU backend. That is a
-# property of the backend, not of ligence: a pure-Python driver over the same
+# property of the backend, not of arcint: a pure-Python driver over the same
 # graph shows last-row logits differing by up to ~2.8 between chunk sizes.
 # So the default configuration is unchunked (the one that satisfies the gate),
 # and this block reports what chunking costs instead of pretending it is free.

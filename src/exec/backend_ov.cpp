@@ -1,4 +1,4 @@
-// The M1 executor: OpenVINO owns the math, ligence owns everything else
+// The M1 executor: OpenVINO owns the math, arcint owns everything else
 // (DESIGN.md §1).
 //
 // The exported IR is a *stateful* graph — 80 internal variables carry the KV of
@@ -64,7 +64,7 @@ constexpr const char* kBeamIdx       = "beam_idx";
 // Fixed process-wide key for the prefix hash chain. It is not a secret — the
 // point is that a hash is never trusted on its own; every hit re-verifies the
 // tokens before the state is reused.
-constexpr uint64_t kPrefixCacheKey = 0x6c6967656e636531ull;  // "ligence1"
+constexpr uint64_t kPrefixCacheKey = 0x617263696e743031ull;  // "arcint01"
 
 // The block hashes are keyed, and the key has to name the thing the cached state
 // belongs to. Today the cache lives inside one process serving one artifact, so a
@@ -86,8 +86,8 @@ std::string tokenizers_extension_path() {
     // whatever CMake found at configure time, so an installed binary starts
     // without a wrapper that knows where a virtualenv lives; otherwise let the
     // loader search.
-    if (const char* env = std::getenv("LIGENCE_TOKENIZERS_SO")) return env;
-    if (std::strlen(LIGENCE_TOKENIZERS_SO_DEFAULT) > 0) return LIGENCE_TOKENIZERS_SO_DEFAULT;
+    if (const char* env = std::getenv("ARCINT_TOKENIZERS_SO")) return env;
+    if (std::strlen(ARCINT_TOKENIZERS_SO_DEFAULT) > 0) return ARCINT_TOKENIZERS_SO_DEFAULT;
     return "libopenvino_tokenizers.so";
 }
 
@@ -585,7 +585,7 @@ public:
             cfg[ov::cache_mode.name()]   = ov::CacheMode::OPTIMIZE_SIZE;
             cfg[ov::weights_path.name()] = artifact.language_model_bin;
             if (offload_ratio_ > 0) cfg["OFFLOAD_RATIO"] = offload_ratio_;
-            if (std::getenv("LIGENCE_PROFILE") != nullptr) cfg[ov::enable_profiling.name()] = true;
+            if (std::getenv("ARCINT_PROFILE") != nullptr) cfg[ov::enable_profiling.name()] = true;
 
             // Was there anything to import, or is this the run that writes the
             // blob? Both take this branch, and reporting them the same way makes
@@ -624,7 +624,7 @@ public:
             core_.set_property(ov::cache_dir(""));
             auto t_cold  = std::chrono::steady_clock::now();
             ov::AnyMap props;
-            if (std::getenv("LIGENCE_PROFILE") != nullptr) props[ov::enable_profiling.name()] = true;
+            if (std::getenv("ARCINT_PROFILE") != nullptr) props[ov::enable_profiling.name()] = true;
             if (offload_ratio_ > 0) {
                 // Expert offload needs the weights on disk to stream from: the
                 // plugin loads them on demand rather than keeping them resident.
@@ -805,7 +805,7 @@ public:
         past                  = prompt_ids.size();
 
         // Emits one committed token; returns false when the caller wants to stop.
-        const bool trace = std::getenv("LIGENCE_TRACE_TOKENS") != nullptr;
+        const bool trace = std::getenv("ARCINT_TRACE_TOKENS") != nullptr;
         auto commit = [&](int tok, Control& out) {
             if (trace) log::info("trace", "commit pos=%zu tok=%d", past, tok);
             ++stats.completion_tokens;
@@ -1251,7 +1251,7 @@ private:
                 ? ((prompt_ids.size() - 1) / grid) * grid
                 : 0;
 
-        const bool trace = std::getenv("LIGENCE_TRACE_TOKENS") != nullptr;
+        const bool trace = std::getenv("ARCINT_TRACE_TOKENS") != nullptr;
         ov::Tensor logits;
         while (past < prompt_ids.size()) {
             size_t take = prompt_ids.size() - past;
@@ -1505,10 +1505,10 @@ private:
         // u8 KV is the default, by §7.0.3's protocol run to completion on the
         // C++ endpoint (2026-08-29): 10/10 on the harness at base depth AND at
         // the ~30k depth probe, base answer bitwise identical to f16, never
-        // slower (71.3 vs 68.6 t/s), and half the KV memory. LIGENCE_PAGED_KV
+        // slower (71.3 vs 68.6 t/s), and half the KV memory. ARCINT_PAGED_KV
         // stays as the measurement switch to pin f16 for A/B runs.
         ov::element::Type kv_prec = ov::element::u8;
-        if (const char* env = std::getenv("LIGENCE_PAGED_KV")) {
+        if (const char* env = std::getenv("ARCINT_PAGED_KV")) {
             if (std::string(env) == "f16") kv_prec = ov::element::f16;
             log::info("load", "paged KV precision override: %s", env);
         }
@@ -1967,18 +1967,18 @@ private:
     void warmup() {
         forward({0}, 0);
         lm_req_.reset_state();
-        if (std::getenv("LIGENCE_BENCH_FORWARD") != nullptr) bench_forward();
-        if (std::getenv("LIGENCE_PROFILE") != nullptr) profile_step();
+        if (std::getenv("ARCINT_BENCH_FORWARD") != nullptr) bench_forward();
+        if (std::getenv("ARCINT_PROFILE") != nullptr) profile_step();
     }
 
     // Per-kernel breakdown of one decode step. Aggregated by (op, kernel) so
     // the reference-kernel fallbacks stand out, which is what the numbers are
-    // usually for. Needs PERF_COUNT at compile time (LIGENCE_PROFILE sets it).
+    // usually for. Needs PERF_COUNT at compile time (ARCINT_PROFILE sets it).
     void profile_step() {
         // Depth matters: a profile at 64 tokens of context is not the step a
-        // real request takes. LIGENCE_PROFILE=<n> sets the prefix length.
+        // real request takes. ARCINT_PROFILE=<n> sets the prefix length.
         size_t      depth = 64;
-        const char* env   = std::getenv("LIGENCE_PROFILE");
+        const char* env   = std::getenv("ARCINT_PROFILE");
         if (env != nullptr && env[0] >= '1' && env[0] <= '9') {
             depth = static_cast<size_t>(std::strtoul(env, nullptr, 10));
         }
@@ -2313,7 +2313,7 @@ private:
     size_t                         mtp_len_ = 0;    // positions in the head's KV
     size_t                         mtp_pos_ = 0;    // true position, for rope
     int                            offload_ratio_ = 0;
-    // --- paged path (§3.5.3, §7.0): ligence-owned block tables + LA rows ---
+    // --- paged path (§3.5.3, §7.0): arcint-owned block tables + LA rows ---
     bool                           paged_ = false;
     ov::CompiledModel              paged_model_;
     ov::InferRequest               paged_req_;

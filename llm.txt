@@ -1,4 +1,4 @@
-# ligence
+# arcint
 
 > Narrow LLM inference engine for Intel Arc GPUs (A770 16GB, B60 24GB).
 > Serves exactly three hybrid GDN/attention Qwen models (Qwen3.6-35B-A3B,
@@ -38,13 +38,13 @@ bytes per context token - which fits the B60's 22.7 GiB alongside 12.8 GiB of
 weights. Neither changes greedy output.
 
 How much the paged path is worth is measured, and the graph must be separated
-from the pipeline. End to end GenAI's ContinuousBatchingPipeline beats ligence
+from the pipeline. End to end GenAI's ContinuousBatchingPipeline beats arcint
 by ~10-13% on the same IR and card. But profiled directly - same card, depth
 256, steady state - the paged GRAPH costs 11.3 ms per decode step against the
 stateful graph's 19.01 ms: 1.68x. Nearly half of that is 90 Transpose nodes
 (3207 us) disappearing; the optimized paged GDN kernel is 0.64 ms more, and
 PagedAttention replaces IndirectSDPA for free. GenAI gives most of the win back
-in its own scheduler; ligence's serving loop is 2% of a decode step. ligence on
+in its own scheduler; arcint's serving loop is 2% of a decode step. arcint on
 the paged graph therefore projects to ~87 t/s on the coder against 51.1 today,
 and that projection is what the work is worth.
 
@@ -214,11 +214,11 @@ above are authoritative and the allowlist follows them.
 
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ctest --test-dir build --output-on-failure
-./build/ligence --stub --port 8090 -v
+./build/arcint --stub --port 8090 -v
 
--DLIGENCE_OPENVINO=ON is reserved for the executor and refuses to configure
+-DARCINT_OPENVINO=ON is reserved for the executor and refuses to configure
 until M1; --model is refused at startup meanwhile, so --stub is the only way
-in. -DLIGENCE_WERROR=ON is warning-clean. Clean under ASan+UBSan with
+in. -DARCINT_WERROR=ON is warning-clean. Clean under ASan+UBSan with
 -fno-sanitize-recover, but ASan must run on x86_64 (dirac): it aborts at
 startup on aarch64 containers.
 

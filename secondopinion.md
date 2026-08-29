@@ -25,7 +25,7 @@ only one I would stop the line for.
 Three artifacts disagree:
 
 - `tests/equivalence/run.sh` (§ chunked): "not bit-exact on the OpenVINO GPU
-  backend … a property of the backend, not of ligence", chunks 1/7/64
+  backend … a property of the backend, not of arcint", chunks 1/7/64
   *reported, not gated*, "default is unchunked".
 - DESIGN §3.2: same claim, `--prefill-chunk` "defaults to 0".
 - `backend_ov.cpp` `prefill()`: "Verified byte-identical to a single call at
@@ -33,7 +33,7 @@ Three artifacts disagree:
   **default 2048**.
 
 The resolution is visible in `forward()`: the divergence had a root cause, and
-it was ligence's — the language model was handed the embeddings request's own
+it was arcint's — the language model was handed the embeddings request's own
 output buffer, two InferRequests aliasing one tensor. Since that fix the C++
 path is byte-identical at 32/64/128. Which means:
 
@@ -159,7 +159,7 @@ The fleet record says A770/XMX: locked out on every path tried; ceiling is the
 card. Xe2 (BMG) added instructions and reworked the EU ISA. What matters here
 is not the datasheet but one observable: **whether oneDNN/OCL kernels on the
 B60 engage the systolic path where the A770 could not**. Your
-`LIGENCE_PROFILE` already prints `exec_type` per kernel — grep a B60 profile
+`ARCINT_PROFILE` already prints `exec_type` per kernel — grep a B60 profile
 against an A770 profile of the same model for `dpas`/`systolic`/`xmx` markers
 in the GEMM kernels (`jit:gemm:*`). If the B60 engages XMX:
 

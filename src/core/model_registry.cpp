@@ -109,7 +109,7 @@ std::vector<ModelEntry> build_registry() {
         e.template_hash           = "c3cf9e34abf4f9e3";
         e.tokenizer_hash          = "87a7830d63fcf43b";
         e.weights_bytes           = 14405167394ull;
-        // Measured through ligence's paged executor with the MTP head drafting
+        // Measured through arcint's paged executor with the MTP head drafting
         // (2026-08-29): 10/10 under greedy at 36.2 t/s on the B60, 93.2% draft
         // acceptance. The earlier stateful measurement was 8/10 greedy; greedy
         // is deterministic per configuration, so both numbers are real -- the

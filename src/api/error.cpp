@@ -27,7 +27,7 @@ nlohmann::json context_overflow(int prompt_tokens, int n_ctx) {
     const int overflow = prompt_tokens - n_ctx;
 
     nlohmann::json body = error_body(
-        log::format("prompt is %d tokens, context is %d: %d over. ligence does not truncate or "
+        log::format("prompt is %d tokens, context is %d: %d over. arcint does not truncate or "
                     "shift context; compact the history client-side and retry.",
                     prompt_tokens, n_ctx, overflow),
         "invalid_request_error", "context_length_exceeded", "messages");

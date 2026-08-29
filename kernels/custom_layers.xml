@@ -1,4 +1,4 @@
-<!-- Binds a ligence OpenCL kernel into OpenVINO's GPU plugin.
+<!-- Binds a arcint OpenCL kernel into OpenVINO's GPU plugin.
 
      Verified working on this hardware: the plugin matches CustomLayer/@name
      against an op's type name, so rewriting a graph node to "LgcPermute" makes

@@ -7,7 +7,7 @@ set -uo pipefail
 
 BIN="${1:-}"
 if [[ -z "$BIN" || ! -x "$BIN" ]]; then
-  echo "usage: roundtrip.sh /path/to/ligence" >&2
+  echo "usage: roundtrip.sh /path/to/arcint" >&2
   exit 2
 fi
 
@@ -60,7 +60,7 @@ for _ in $(seq 1 100); do
   sleep 0.1
 done
 
-echo "== ligence M0 round-trip on ${BASE}"
+echo "== arcint M0 round-trip on ${BASE}"
 
 # ------------------------------------------------------------------ /health
 code=$(curl -sS -o "${WORK}/health.json" -w '%{http_code}' "${BASE}/health")

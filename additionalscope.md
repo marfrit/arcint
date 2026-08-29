@@ -20,7 +20,7 @@ instantiate the second model and read `GPU_MEMORY_STATISTICS`.
 
 ## B. Xe2 XMX engagement check (five minutes, decides an ISA question)
 
-Grep one B60 `LIGENCE_PROFILE` decode+prefill profile for `dpas` / systolic
+Grep one B60 `ARCINT_PROFILE` decode+prefill profile for `dpas` / systolic
 markers in the GEMM kernels (`jit:gemm:*`), against the same profile on the
 A770 (where the fleet record says XMX never engaged). Outcome either way is a
 DESIGN fact:

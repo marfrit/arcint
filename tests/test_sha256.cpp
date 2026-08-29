@@ -4,7 +4,7 @@
 using namespace lgc;
 
 // NIST/RFC test vectors. Without these the hash could be self-consistently
-// wrong, and the allowlist would be validating against ligence's own bug.
+// wrong, and the allowlist would be validating against arcint's own bug.
 TEST(sha256_known_vectors) {
     CHECK_EQ(sha256_hex(""),
              std::string("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));

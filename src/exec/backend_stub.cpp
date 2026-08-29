@@ -173,7 +173,7 @@ private:
 
     std::string synthesise(const GenerationInput& in, int prompt_tokens) const {
         std::string out = log::format(
-            "ligence stub backend \xc2\xb7 no model loaded \xc2\xb7 %s %s\n"
+            "arcint stub backend \xc2\xb7 no model loaded \xc2\xb7 %s %s\n"
             "prompt %d tokens, sampler %s. Gr\xc3\xbc\xc3\x9f""e aus der Werkstatt.",
             status_.id.c_str(), quant_name(status_.quant), prompt_tokens,
             in.sampler.greedy() ? "greedy"

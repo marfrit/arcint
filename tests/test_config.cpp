@@ -10,7 +10,7 @@ namespace {
 
 ArgParse run(std::vector<const char*> args, Config& cfg) {
     std::vector<char*> argv;
-    argv.push_back(const_cast<char*>("ligence"));
+    argv.push_back(const_cast<char*>("arcint"));
     for (const char* a : args) argv.push_back(const_cast<char*>(a));
     return parse_args(static_cast<int>(argv.size()), argv.data(), cfg);
 }

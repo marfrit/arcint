@@ -1,6 +1,6 @@
-# Third opinion — ligence review against design, the four reference engines, and the two cards
+# Third opinion — arcint review against design, the four reference engines, and the two cards
 
-Reviewed: `noether:/home/mfritsche/src/ligence` at HEAD `f96d49e` **plus the dirty
+Reviewed: `noether:/home/mfritsche/src/arcint` at HEAD `f96d49e` **plus the dirty
 worktree** (86 insertions: the session's response to secondopinion findings 2 and 5 —
 verified by reading the diff, not assumed). Nothing was touched.
 
@@ -11,8 +11,8 @@ Reference material cloned and read for this review:
   existence; read docs + hot source.
 - **OpenVINO** (`openvinotoolkit/openvino` @ `a8354dc`, GPU plugin) and
   **OpenVINO GenAI** (`openvinotoolkit/openvino.genai` @ `468c261`, continuous
-  batching) — the stack ligence runs on. GenAI's scheduler/model-runner is the oracle
-  for the paged-hybrid interface ligence could not reverse-engineer (§3.1 below).
+  batching) — the stack arcint runs on. GenAI's scheduler/model-runner is the oracle
+  for the paged-hybrid interface arcint could not reverse-engineer (§3.1 below).
 - **vLLM** (`vllm-project/vllm` v1 core) — hybrid KV cache manager, mamba/GDN paging,
   spec-decode bookkeeping.
 - **llama.cpp** (`ggml-org/llama.cpp` @ `f5e85d4`) — qwen3_next support, MoE CPU
@@ -83,7 +83,7 @@ sentence each:
    (`model_registry.cpp:99`), which is correct at HEAD (the head ships beside the
    artifact after `tools/export_mtp.py`). Update the paragraph.
 3. **qwen3.8-27b still carries `status = "provisional, 7/10"`** in the registry
-   though §7 measured 10/10 greedy through ligence. DESIGN itself flags this as
+   though §7 measured 10/10 greedy through arcint. DESIGN itself flags this as
    deserving re-measurement; `/props` reports the stale number until then.
 4. **The §3 architecture diagram promises a scheduler with continuous batching.**
    What exists is a SlotPool that does admission accounting and a backend mutex that
@@ -124,7 +124,7 @@ vector engines are SIMD16-only; the OV plugin literally encodes that
 (`permute_kernel_f_y_axes.cpp:67`: "Xe2+ lacks SIMD8"), so kernel selection differs
 between the two cards even for identical graphs.
 
-What the numbers say about ligence's workload:
+What the numbers say about arcint's workload:
 
 - **Decode is bandwidth-bound, not TOPS-bound.** The A770 has *more* INT8 TOPS
   (262 vs 197) yet decodes the coder at 29.4 t/s against the B60's 51.4. Roofline
@@ -146,17 +146,17 @@ What the numbers say about ligence's workload:
   is consistent with INT8 TOPS not showing up in decode: nothing about these
   decode profiles is matrix-engine-limited. Don't chase TOPS; chase bytes.
 
-## 3. The Kniffe — what the four engines say about ligence's open problems
+## 3. The Kniffe — what the four engines say about arcint's open problems
 
 Ranked by payoff. Code pointers are to the local clones listed above.
 
 ### 3.1 THE paged path: the `la.*` decode convention is reconstructed — stop reverse-engineering it
 
-GenAI's continuous-batching pipeline drives exactly the 91-input interface ligence
+GenAI's continuous-batching pipeline drives exactly the 91-input interface arcint
 mapped (`ov::pass::paged_attention_transformation`). Its scheduler is the oracle,
 and it is small:
 
-**Non-speculative mode (plain prefill and decode — what ligence needs first)**
+**Non-speculative mode (plain prefill and decode — what arcint needs first)**
 (`openvino-genai/src/cpp/src/continuous_batching/scheduler.hpp:1126-1135`,
 filled in `model_runner.hpp:1809-1896`):
 
@@ -201,11 +201,11 @@ commit/promote `pipeline_impl.cpp:447-476`, `block_manager.hpp:1058-1104`):
   upstream.
 
 **Prefix mode — what upstream does with `cache_interval`, and the vindication of
-ligence's §3.3 stance** (`scheduler.hpp:1158-1201`,
+arcint's §3.3 stance** (`scheduler.hpp:1158-1201`,
 `cache_orchestrator.hpp:759-828`): `cache_interval = kv_block_size × multiplier`
 with default multiplier **8** and an adaptive `ceil(la_block_bytes/kv_block_bytes)`
 clamped to [8, 256] — i.e. upstream really does size GDN checkpoints for memory,
-exactly the design choice DESIGN §3.3 argues against. ligence's block-aligned
+exactly the design choice DESIGN §3.3 argues against. arcint's block-aligned
 (multiplier 1) position remains the correctness-first one; now it is also clear
 *how* to express it through this interface.
 
@@ -245,7 +245,7 @@ options now, in order of effort:
    from the weightless `.bin` (`impls/ocl_v2/moe/expert_weight_providers.hpp`;
    partial upload at compile time `plugin/ops/moe_offload_constant.cpp:45-82`).
    This is HETERO-by-memory-pressure done natively, inside the fused MoE op that
-   DESIGN §7 says exposes nothing. It wants `ov::weights_path` (which ligence
+   DESIGN §7 says exposes nothing. It wants `ov::weights_path` (which arcint
    already uses for the blob-cache workaround). **Measure this before anything
    else** — on the A770's x4 Gen3 the question is whether the LRU working set of
    hot experts stays resident; the fleet's imatrix statistics (which experts are
@@ -261,7 +261,7 @@ options now, in order of effort:
    means subgraph-splitting the fused MoE op — which it resists; hence option 1
    first.
 3. The fleet's proven fallback stays as the floor: llama.cpp `-ncmoe 30` on the
-   A770 serves the 35B today (262k context, q8 KV). Whatever ligence builds must
+   A770 serves the 35B today (262k context, q8 KV). Whatever arcint builds must
    beat or match that, not merely exist.
 
 Note for honesty's sake: option 1's provider lives in the very file carrying the
@@ -300,7 +300,7 @@ proves C=8 lanes with 2.2–5.7× aggregate decode on exactly these models.
   f32 accumulators (`ggml-cpu/ops.cpp:8553-8560`; Vulkan int8-dot FA variant
   `ggml-vulkan.cpp:4533-4541`). On Arc that is the DPAS/integer-dot path.
 - OV's paged plugin does the storage side natively (u8 default with 4-bit weights,
-  padded/packed layouts `transformations_pipeline.cpp:878-916`) — ligence does not
+  padded/packed layouts `transformations_pipeline.cpp:878-916`) — arcint does not
   need to write this codec, only to reach the paged path.
 - NInfer goes further: INT8 **group-64** scales with a fused 256-wide Hadamard
   pre-rotation, or FP8 E4M3 row-scaled, encode fused into append, decode fused
@@ -334,33 +334,33 @@ All three reference engines refuse to copy full recurrent state on rejection:
   bitwise against a no-spec baseline** — output plausibility cannot catch state
   drift.
 
-For ligence this is not a menu: on the stateful graph all three are unreachable
+For arcint this is not a menu: on the stateful graph all three are unreachable
 (the state is inside `VariableState`), and on the paged path GenAI's scheme is
 already built for this exact interface. Adopt 3.1's speculative mode; keep
 ReplaySSM's validation doctrine as the gate.
 
-### 3.6 Prefix caching — ligence is right, two refinements available
+### 3.6 Prefix caching — arcint is right, two refinements available
 
 - vLLM's structural answer to "restore KV and recurrent state at the same
   boundary" is one shared block-hash namespace across layer groups with a
-  fixed-point hit intersection (`kv_cache_coordinator.py:757-880`) — ligence's
+  fixed-point hit intersection (`kv_cache_coordinator.py:757-880`) — arcint's
   "both or neither" blob is the same invariant expressed more bluntly, and on the
   stateful graph it is the *only* honest expression. On the paged path it would
   relax into per-group pages + shared hashes (vLLM's form).
 - vLLM keeps state snapshots only at **proven reuse points** (prompt end, shared
   prefix junctions — `reachable_block_mask`,
-  `single_type_kv_cache_manager.py:1378-1433`); ligence's single
+  `single_type_kv_cache_manager.py:1378-1433`); arcint's single
   snapshot-at-last-grid-edge is already that policy. No change needed; the
   refinement comes free with paging.
 - NInfer's tier is the depth upgrade for later: immutable checkpoints at stable
   frontiers (turn closure / response opener), device-slot residency with priced
   host demotion, completeness rule (full state + all KV planes + exact identity,
   or no hit) (`ninfer/docs/maintainer/resource-scheduling-and-context-cache.md`).
-  ligence's completeness rule already matches; the retention classes and the
+  arcint's completeness rule already matches; the retention classes and the
   machine-cost model are the steal if the cache budget ever grows.
 - One concrete addition, cheap: put the **allowlist architecture hash into the
   block-hash key** (vLLM's "extra keys" — LoRA/model revision ride there,
-  `kv_cache_utils.py:582-617`). Today ligence's process-wide key is constant and
+  `kv_cache_utils.py:582-617`). Today arcint's process-wide key is constant and
   single-model, so it is fine; the day a process reloads a different artifact or
   MTP export changes, a stale hit would be silent. Key it to the artifact hash
   now while the change is one line.
@@ -384,11 +384,11 @@ qwen3_next (`src/models/qwen3next.cpp:404`) and splits batches accordingly
 (`llama-batch.cpp:510`, note `n_keep_tail` so the GDN snapshot tail lands in one
 ubatch). Chunk ends are where state gets written, so chunks end at cacheable
 boundaries (`_mamba_block_aligned_split`, vLLM `scheduler.py:385-470` — the same
-shape as ligence's absolute grid, generalized to "boundaries worth checkpointing").
+shape as arcint's absolute grid, generalized to "boundaries worth checkpointing").
 
 ### 3.8 Audit methodology — steal NInfer's honesty package wholesale
 
-ligence already does revision-pinned measurement better than anyone cited here
+arcint already does revision-pinned measurement better than anyone cited here
 (the DESIGN tables *are* the method). What NInfer adds (`ninfer/docs/
 performance.md`):
 
@@ -407,7 +407,7 @@ performance.md`):
 The 200-prompt nightly sweep the second opinion recommended is exactly item one;
 pure scripting, do it.
 
-## 4. What ligence should NOT do (confirmed by the reading)
+## 4. What arcint should NOT do (confirmed by the reading)
 
 - **No custom kernels via the CustomLayer path.** The fusion-barrier measurement
   in kernels/README.md is now independently corroborated: the plugin's own
@@ -417,7 +417,7 @@ pure scripting, do it.
 - **No context shift, ever** — llama.cpp does allow shift on hybrid models
   (`llama-memory-hybrid.cpp:133-136`: shift the attention KV, leave recurrent
   state alone), and even documents the semantic scar: attention sees a hole, GDN
-  sees everything. ligence's §3.8 refusal is the defensible position; llama.cpp
+  sees everything. arcint's §3.8 refusal is the defensible position; llama.cpp
   confirms the alternative is an approximation, not a feature.
 - **No fp8 chase** (§3.4).
 - **No second compiled model for static decode** (§3.3).
@@ -442,7 +442,7 @@ pure scripting, do it.
    three doc drifts listed in §1; the M4 row is the one actively misinforming.
 6. **NInfer acceptance-rate comparison**: NInfer publishes 67–69% MTP acceptance
    on the Qwen3.6 pair and ~46–49% on Qwen3.8 (nvfp4, counting all positions);
-   ligence's 93.3% is primed-over-prompt, generated-positions-only. Not the same
+   arcint's 93.3% is primed-over-prompt, generated-positions-only. Not the same
    metric — do not let the two meet in a slide without the footnote.
 
 ## 6. Priority recommendation
@@ -467,7 +467,7 @@ Ordered:
 7. Nightly 200-prompt sha256 sweep + bitwise spec-state validation (§3.8).
 8. Artifact-hash-keyed prefix cache key (one line, §3.6).
 
-The engine's founding bet — OpenVINO owns the math, ligence owns the state —
+The engine's founding bet — OpenVINO owns the math, arcint owns the state —
 survives this review intact. Every open problem that remains is one the paged
 interface was built to answer, and for the first time the interface has a written
 oracle. The measurement culture here is already better than any of the four

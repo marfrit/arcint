@@ -39,7 +39,7 @@ int main(int argc, char** argv) {
     const lgc::ArgParse parsed = lgc::parse_args(argc, argv, cfg);
 
     if (!parsed.ok) {
-        std::fprintf(stderr, "ligence: %s\n", parsed.error.c_str());
+        std::fprintf(stderr, "arcint: %s\n", parsed.error.c_str());
         return 2;
     }
     if (cfg.show_help) {
@@ -47,14 +47,14 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (cfg.show_version) {
-        std::printf("ligence %s (%s) %s, %s\n", LIGENCE_VERSION, LIGENCE_GIT_SHA,
-                    LIGENCE_BUILD_TYPE, LIGENCE_COMPILER);
+        std::printf("arcint %s (%s) %s, %s\n", ARCINT_VERSION, ARCINT_GIT_SHA,
+                    ARCINT_BUILD_TYPE, ARCINT_COMPILER);
         return 0;
     }
 
     lgc::log::set_level(level_for(cfg.verbosity));
-    lgc::log::info("boot", "ligence %s (%s) %s, %s", LIGENCE_VERSION, LIGENCE_GIT_SHA,
-                   LIGENCE_BUILD_TYPE, LIGENCE_COMPILER);
+    lgc::log::info("boot", "arcint %s (%s) %s, %s", ARCINT_VERSION, ARCINT_GIT_SHA,
+                   ARCINT_BUILD_TYPE, ARCINT_COMPILER);
 
     const lgc::ModelEntry* entry = nullptr;
 
@@ -85,7 +85,7 @@ int main(int argc, char** argv) {
                            : "layer split not pinned",
                        n_ctx, n_ctx_source);
     } else {
-#ifdef LIGENCE_OPENVINO
+#ifdef ARCINT_OPENVINO
         lgc::Artifact artifact;
         if (auto err = lgc::load_artifact(cfg.model_path, artifact)) {
             lgc::log::error("load", "%s", err->c_str());

@@ -1,13 +1,13 @@
-# ligence
+# arcint
 
 A deliberately narrow LLM inference engine for Intel Arc GPUs.
 
-ligence runs exactly three model families on exactly two cards, and tries to do
+arcint runs exactly three model families on exactly two cards, and tries to do
 that better than the general-purpose engines do. The inspiration is
 [NInfer](https://github.com/Neroued/ninfer) — a from-scratch engine that
 supports two checkpoints on one GPU and beats every generalist on that pair —
 translated to Intel: instead of hand-written CUDA, the kernel work is delegated
-to OpenVINO's compiler stack, which already emits good Xe code. What ligence
+to OpenVINO's compiler stack, which already emits good Xe code. What arcint
 owns is everything around the compute graph: the serving loop, the scheduler,
 the KV and recurrent-state memory, prefix caching, and speculative decoding.
 
@@ -98,7 +98,7 @@ backend; **[M1]**–**[M5]** mean it runs against the real models on a real card
 
 ## Status
 
-Serving the real models on Intel Arc **on the paged executor** — ligence-owned
+Serving the real models on Intel Arc **on the paged executor** — arcint-owned
 block tables, measured-reservation admission, speculative decoding whose
 rollback moves zero bytes. Measured on a B60 with the 27B coder q4: **68.6 t/s
 decode (70.1 at 30k context — the depth collapse is gone), ~1970 t/s prefill,
@@ -131,7 +131,7 @@ is worth about 2× on Qwen3.8.
 
 M2 is done and measured: slicing logits to the last token removed a wall at
 ~8k tokens, storing the attention KV as fp16 took 262144 context from 10.0 GiB
-to 5.0 GiB, and with both in place ligence loaded **257,167 tokens** — 98% of
+to 5.0 GiB, and with both in place arcint loaded **257,167 tokens** — 98% of
 the artifact's maximum — in 8.1 minutes. What remains is OpenVINO's
 paged-attention path, whose decode-side block-table convention is undocumented;
 it is an optimisation now, not a blocker.
@@ -152,12 +152,12 @@ holds the IR metadata the allowlist is pinned against.
     cmake --build build
     ctest --test-dir build --output-on-failure
 
-    ./build/ligence --stub --port 8090 -v
+    ./build/arcint --stub --port 8090 -v
 
-`-DLIGENCE_OPENVINO=ON` is reserved for the executor backend and refuses to
+`-DARCINT_OPENVINO=ON` is reserved for the executor backend and refuses to
 configure until M1 lands it; meanwhile `--model` is refused at startup rather
 than silently starting something that cannot run, and `--stub` is the only way
-in. `-DLIGENCE_WERROR=ON` for the warning-clean build CI should use.
+in. `-DARCINT_WERROR=ON` for the warning-clean build CI should use.
 
 ## Deploying it
 
@@ -167,15 +167,15 @@ file carries flags and not a library search path. Verified on dirac — with
 `LD_LIBRARY_PATH` unset there are no unresolved objects, and it serves `/health`
 under `env -i`.
 
-    cmake -S . -B build-ov -DLIGENCE_OPENVINO=ON -DCMAKE_BUILD_TYPE=Release \
-          -DLIGENCE_GIT_SHA=$(git rev-parse --short=12 HEAD)
+    cmake -S . -B build-ov -DARCINT_OPENVINO=ON -DCMAKE_BUILD_TYPE=Release \
+          -DARCINT_GIT_SHA=$(git rev-parse --short=12 HEAD)
     cmake --build build-ov -j"$(nproc)"
     cmake --install build-ov --prefix ~/.local
 
-`packaging/ligence.service` and `packaging/ligence.env` are a systemd **user**
+`packaging/arcint.service` and `packaging/arcint.env` are a systemd **user**
 unit and its configuration, matching how the fleet already runs its inference
-services. Every ligence setting is a command line flag, so the env file holds
-the flags and the unit itself never has to be edited. `-DLIGENCE_GIT_SHA` is
+services. Every arcint setting is a command line flag, so the env file holds
+the flags and the unit itself never has to be edited. `-DARCINT_GIT_SHA` is
 worth passing whenever the build tree has no `.git` — otherwise `--version` and
 `/props` report `unknown`, and a running binary cannot say what it is.
 
@@ -184,9 +184,9 @@ hand-edited systemctl: a hand edit without a commit in `~/.config/systemd/user`
 crashes roundhouse. The file is the content to hand it, not permission to
 install it by hand.
 
-Note the port: ligence and the fleet's existing coder endpoint both want the
+Note the port: arcint and the fleet's existing coder endpoint both want the
 same card, and the B60 holds a model's VRAM for the process lifetime. Running
-ligence there means replacing that endpoint, not sitting beside it.
+arcint there means replacing that endpoint, not sitting beside it.
 
 ## Why not just use …
 
@@ -194,11 +194,11 @@ ligence there means replacing that endpoint, not sitting beside it.
   caching) produces measurably different greedy output than its stateful path,
   the equivalence test in its own CI has been skipped since 2025-02, and hybrid
   state is checkpointed at coarse intervals sized for memory rather than
-  correctness. ligence keeps the OV *compiler* and replaces the pipeline layer.
+  correctness. arcint keeps the OV *compiler* and replaces the pipeline layer.
 - **vLLM**: no usable Intel path for these hybrids (the XPU build lags, and
   Arc is not a first-class target). The paged-KV and prefix-cache ideas are
   taken; the engine is not.
 - **llama.cpp**: excellent console ergonomics and a sane server, but Vulkan on
   Battlemage is unoptimized (measured 7.9 tok/s dense where OpenVINO does 60)
   and SYCL is broken under the xe KMD. The ergonomics are taken; the backend
-  situation is why ligence exists.
+  situation is why arcint exists.

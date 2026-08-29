@@ -1,4 +1,4 @@
-# ligence — session rules
+# arcint — session rules
 
 Source of truth: README.md (scope), DESIGN.md (architecture, invariants,
 milestones), llm.txt (machine summary). Read DESIGN.md before touching
@@ -24,7 +24,7 @@ anything; the invariants in §3.4/§3.8 and the gates in §5 are not negotiable.
     `systemctl --user stop llama-agent`, restore after.
   - **The cards are FULL while their services run.** Both units hold their
     model VRAM permanently (B60 ~16 GiB coder IR, A770 the agent model).
-    Any ligence process that wants a card must **stop the resident service
+    Any arcint process that wants a card must **stop the resident service
     first** — loading next to it fails with allocation errors at best, host
     OOM at worst. Test-window ritual (both cards):
 
@@ -51,7 +51,7 @@ Host `data` (and with it dirac and both GPUs) is **shut down nightly at 03:00
 by a hertz cron** (`shutdown-data.sh`) unless a lock says otherwise. For any
 session that needs the cards past 03:00:
 
-    ssh hertz 'sudo /opt/herding/bin/hold-data.sh <hours> "ligence dev"'
+    ssh hertz 'sudo /opt/herding/bin/hold-data.sh <hours> "arcint dev"'
     ssh hertz 'sudo /opt/herding/bin/hold-data.sh status'   # remaining time
     ssh hertz 'sudo /opt/herding/bin/hold-data.sh frei'     # release
 

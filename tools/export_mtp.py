@@ -3,7 +3,7 @@
 
 No public implementation consumes these weights (checked against transformers
 5.16.1 and optimum-intel), so the forward pass here is reconstructed from the
-tensor shapes and config.  It does not need a reference to be safe: ligence
+tensor shapes and config.  It does not need a reference to be safe: arcint
 accepts a drafted token only when it equals what the sampler would have picked
 anyway, so a wrong head cannot change the answer -- it can only lower draft
 acceptance.  Acceptance is therefore the oracle.  ~0% means this file is wrong;

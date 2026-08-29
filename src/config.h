@@ -63,7 +63,7 @@ struct Config {
     // does not fit a card run on it at all; it is not free (§7).
     int offload_ratio = 0;
 
-    // The paged execution path (DESIGN §3.5.3, §7.0): ligence-owned block
+    // The paged execution path (DESIGN §3.5.3, §7.0): arcint-owned block
     // tables and LA state rows, speculative rollback as row promotion,
     // reservation-based admission. Default on; --no-paged selects the stateful
     // reference implementation the equivalence suite compares against.

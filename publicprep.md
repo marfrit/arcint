@@ -1,4 +1,4 @@
-# publicprep — checklist for taking ligence public on GitHub
+# publicprep — checklist for taking arcint public on GitHub
 
 Trigger state reached: speculative paged mode measured on the A770 —
 MTP on 26.6 t/s @512 / 22.4 @4096 vs 18.1/17.7 paged-plain vs 17.3 stateful
@@ -39,7 +39,7 @@ HF that the allowlist references). Target: GitHub, public.
       minja (MIT) — keep their headers, add a THIRD_PARTY.md with versions.
 - [ ] `tools/export_mtp.py`: one README sentence — the tool is repo-licensed,
       the IRs it emits derive from Qwen weights and inherit the Qwen
-      Community License; ligence ships no weights.
+      Community License; arcint ships no weights.
 
 ## 3. Expectation management (README additions)
 
@@ -76,7 +76,7 @@ HF that the allowlist references). Target: GitHub, public.
 - [ ] Fresh-clone build on a machine that is not the dev box: cmake, ctest,
       roundtrip.sh, equivalence run documented with expected skips when no
       card is present.
-- [ ] `-DLIGENCE_WERROR=ON` clean; ASan/UBSan run recorded (x86_64 note kept).
+- [ ] `-DARCINT_WERROR=ON` clean; ASan/UBSan run recorded (x86_64 note kept).
 - [ ] Doc drift zeroed: README status table, llm.txt, DESIGN §3.5/§7 rows
       agree with each other and with the registry (the M4 row and the
       "provisional 7/10" entry were the known liars).

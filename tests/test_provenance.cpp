@@ -15,7 +15,7 @@ namespace {
 using nlohmann::json;
 
 json load_raw() {
-    const std::string path = std::string(LIGENCE_SOURCE_DIR) + "/models/allowlist-raw.json";
+    const std::string path = std::string(ARCINT_SOURCE_DIR) + "/models/allowlist-raw.json";
     std::ifstream     in(path);
     if (!in.good()) return json();
     json raw;

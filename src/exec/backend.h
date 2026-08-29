@@ -10,7 +10,7 @@
 #include "core/model_registry.h"
 #include "core/sampling.h"
 
-// The seam between "ligence owns the state" and "OV owns the math"
+// The seam between "arcint owns the state" and "OV owns the math"
 // (DESIGN.md §1). Everything above this interface — HTTP, scheduling, stop
 // handling, tool-call parsing, usage accounting — is backend-agnostic and
 // testable on a machine with no GPU in it.
@@ -120,7 +120,7 @@ public:
 std::unique_ptr<Backend> make_stub_backend(const ModelEntry& entry, Quant quant, int n_ctx,
                                            int delay_ms = 0);
 
-#ifdef LIGENCE_OPENVINO
+#ifdef ARCINT_OPENVINO
 struct Artifact;
 
 // M1: the OpenVINO executor. Throws std::runtime_error with a readable message
