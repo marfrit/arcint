@@ -577,3 +577,60 @@ measurements, taken on different instruments weeks apart, agree when repeated.
 If an anchor failed to reproduce, one of them is wrong and the curve between
 them is not worth locating anyway. Worth folding into some other downtime;
 not worth creating downtime for.
+
+
+---
+
+# The XMX check: the instrument cannot tell, and why that is the useful part
+
+Taken first, ahead of `PagedCausalConv1D`, because it is minutes against an
+order-of-magnitude question and a 6.3% grind should not start while that is
+open. Rule for the check: **a marker, not a rate.** The ~150 int8-TOPS figure
+and the depth curve's quadratic coefficient are both inferences from throughput,
+and two inferences pointing the same way are still not an observation.
+
+The question was already half-answered: 331 JIT nodes at ~150 int8-TOPS is not
+reachable without a matrix unit, so the int8 GEMM path is very probably XMX-fed.
+What was open is the **f16 attention** path.
+
+**No card was taken. Three findings, all from stored profiles and the installed
+plugin binary:**
+
+1. **No `exec_type` carries an ISA marker**, for any kernel in any stored
+   profile. The complete set is kernel-family-plus-dtype:
+   `ocl::paged_attention::opt__f16`, `ocl::paged_gated_delta_net::opt___f16`,
+   `jit:gemm:any__i8`, `ocl:ref:any__i8`, and so on. No `dpas`, `xmx`,
+   `systolic`, `dp4a`, `mmad` anywhere.
+2. **The plugin cannot be asked.** The GPU debug capabilities are compiled out
+   of this build: zero occurrences of `OV_GPU_Verbose`, `DumpSources` or
+   `ENABLE_DEBUG_CAPS`, against exactly two `OV_GPU_*` knobs present. There is
+   no kernel-selection log to enable.
+3. **The sources are not in the binary to grep.** No OpenCL source survives
+   string extraction, so the XMX intrinsic cannot be searched for in the
+   attention kernel.
+
+**What the binary contains, as fact rather than as an answer.** DPAS material is
+there — `__builtin_IB_sub_group_idpas_s8_s8_8_1` (int8), a `dpas.bf.bf` vISA
+fragment, `CM_HAS_DPAS` — and it is oneDNN/CM microkernel infrastructure. That
+is *consistent with* the int8 GEMM being matrix-fed and says **nothing either
+way** about the f16 attention kernel, which is a different implementation family
+(`ocl::` cldnn) from the one those microkernels serve. Recording the distinction
+rather than the conclusion, because the conclusion would be a third inference.
+
+Four apparent "SDPA + dpas" matches were false positives: `ov::pass::
+SDPAScaleFusion` contains the letters D-P-A-S.
+
+**Outcome three, and a next step that is now specific.** "Attention prefill runs
+at SIMD peak" stays labelled a conjecture. What would settle it is no longer
+"instruction-level tracing" in the abstract but a choice of two: a plugin build
+with `ENABLE_DEBUG_CAPS=ON`, which makes `OV_GPU_Verbose` name the selected
+implementation, or onetrace / Level-Zero PTI. The first is cheaper and answers
+exactly this question.
+
+**Correction carried in.** The standing note that the A770 never uses XMX is
+about llama.cpp/Vulkan — ggml gates coopmat on `INTEL_XE2`, Alchemist fails the
+check, DP4A is the path. It says nothing about OpenVINO and does not make the
+A770 a control group here. A second card is a contrast only if measured on the
+same stack.
+
+`PagedCausalConv1D` at 6.3% of both phases resumes as the top item.

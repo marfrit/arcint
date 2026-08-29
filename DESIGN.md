@@ -1643,7 +1643,9 @@ Two things that are **not** established and are recorded as such:
   The b5 coder ships none, so none of it runs on the artifact these numbers come
   from. It is a lead for the 3.8, not for the coder.
 - "Attention prefill runs at f16 SIMD peak rather than the matrix engines" is
-  **a conjecture** inferred from the depth curve's quadratic coefficient
+  **a conjecture** — tested 2026-08-30 and still a conjecture, because the
+  instrument cannot name the ISA path (§7.0.2b) — inferred from the depth
+  curve's quadratic coefficient
   (~12 TFLOPS effective against a ~90 TFLOPS XMX f16 peak). A coefficient is
   evidence, not a mechanism, and §7.0.2b already says `exec_type` cannot settle
   it. It stays labelled until instruction-level tracing does.
@@ -1661,6 +1663,56 @@ but answering it needs instruction-level tracing (onetrace / Level-Zero PTI),
 not `PERF_COUNT`. Recorded so the grep is not proposed again. What decode
 numbers say regardless: nothing in the decode profiles is matrix-engine-shaped
 — chase bytes, not TOPS.
+
+**Re-asked 2026-08-30 for the f16 attention path, and the answer is that the
+instrument cannot tell — with a reason that is more useful than the answer.**
+The open question was narrower than "does XMX engage": the int8 GEMM path is
+very probably matrix-fed already (331 JIT nodes at ~150 int8-TOPS is not
+reachable otherwise), so what was open was the f16 attention kernel, where the
+depth curve's quadratic coefficient suggested SIMD peak. That is an inference
+from a rate, and two inferences pointing the same way are still not an
+observation, so the check had to be a **marker**: the kernel identity, not a
+throughput.
+
+Three things were established without taking a card:
+
+1. **No `exec_type` in any stored profile carries an ISA marker** — not for the
+   GEMMs (already known) and not for attention. Every string names a kernel
+   family and a dtype: `ocl::paged_attention::opt__f16`,
+   `ocl::paged_gated_delta_net::opt___f16`, `jit:gemm:any__i8`. Nothing about
+   `dpas`, `xmx` or `systolic`.
+2. **The plugin cannot be asked.** This build has the GPU debug capabilities
+   compiled out — zero occurrences of `OV_GPU_Verbose`, `DumpSources` or
+   `ENABLE_DEBUG_CAPS` in the binary, against exactly two `OV_GPU_*` knobs
+   present. There is no verbose kernel-selection log to turn on, so the
+   implementation the plugin chose cannot be named at runtime.
+3. **The kernel sources are not recoverable from the binary either** — no
+   OpenCL source survives string extraction, so the `intel_sub_group_matrix_
+   multiply_accumulate` intrinsic cannot be looked for in the attention kernel
+   the way it can in a source tree.
+
+What the binary *does* contain, stated as fact and not as an answer: DPAS
+material exists, and it is oneDNN/CM microkernel infrastructure — an int8
+builtin (`__builtin_IB_sub_group_idpas_s8_s8_8_1`), a bf16 vISA fragment, a
+`CM_HAS_DPAS` assertion. That is consistent with the int8 GEMM path being
+matrix-fed and says **nothing either way** about the f16 attention kernel, which
+is a different implementation family (`ocl::` cldnn) from the one those
+microkernels serve (`jit:gemm`, oneDNN). Four apparent "SDPA + dpas" hits are
+false positives: `ov::pass::SDPAScaleFusion` contains the letters.
+
+So: **outcome three.** The SIMD-peak line stays a conjecture in §7.0.2c rather
+than hardening into a fact, and the bounded next step is now specific rather
+than "instruction-level tracing" in the abstract — either a plugin build with
+`ENABLE_DEBUG_CAPS=ON`, which makes `OV_GPU_Verbose` name the selected
+implementation, or onetrace / Level-Zero PTI. The first is cheaper and answers
+exactly this question.
+
+**A correction carried in from the deployment side, because the note is easy to
+misapply.** The standing observation that "the A770 never uses XMX" is about
+**llama.cpp/Vulkan**: ggml gates coopmat on `INTEL_XE2`, Alchemist fails the
+check, and DP4A is the path. It says nothing about OpenVINO, and it does not
+make the A770 a control group for this question. A second card is only a
+contrast if it is measured on the same stack.
 
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
