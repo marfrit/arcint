@@ -63,6 +63,18 @@ struct Config {
     // does not fit a card run on it at all; it is not free (§7).
     int offload_ratio = 0;
 
+    // The paged execution path (DESIGN §3.5.3, §7.0): ligence-owned block
+    // tables and LA state rows, speculative rollback as row promotion,
+    // reservation-based admission. Default on; --no-paged selects the stateful
+    // reference implementation the equivalence suite compares against.
+    bool paged = true;
+
+    // Where the embeddings gather and the MTP head run. Empty = same card as
+    // --device. On a tight card the measured configuration parks both on the
+    // other card: ~20 KB of activations cross per step, weights stay put.
+    std::string emb_device;
+    std::string mtp_device;
+
     int         kv_block_size             = 32;      // 16 or 32 — §8 benchmarks this
     std::string kv_dtype                  = "fp16";  // fp16 | q8
     int         gdn_checkpoint_budget_mib = 512;     // §3.3

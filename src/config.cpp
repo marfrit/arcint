@@ -67,6 +67,9 @@ std::string usage_text() {
         "  --draft-ngram K           drafter match length (default: 3)\n"
         "  --custom-kernels FILE     OpenVINO custom-layer XML (hand-written OpenCL)\n"
         "  --offload-ratio N         %% of MoE expert weights to stream, 0 = all resident\n"
+        "  --no-paged                stateful reference path instead of the paged executor\n"
+        "  --emb-device DEV          run the embeddings gather elsewhere (default: --device)\n"
+        "  --mtp-device DEV          run the MTP head elsewhere (default: --device)\n"
         "\n"
         "misc\n"
         "  -v, -vv                   raise console verbosity\n"
@@ -171,6 +174,14 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--custom-kernels") {
             if (!value(v)) return fail("--custom-kernels needs a path");
             cfg.custom_kernels = std::string(v);
+        } else if (arg == "--no-paged") {
+            cfg.paged = false;
+        } else if (arg == "--emb-device") {
+            if (!value(v)) return fail("--emb-device needs a device");
+            cfg.emb_device = std::string(v);
+        } else if (arg == "--mtp-device") {
+            if (!value(v)) return fail("--mtp-device needs a device");
+            cfg.mtp_device = std::string(v);
         } else if (arg == "--offload-ratio") {
             if (!value(v) || !parse_int(v, cfg.offload_ratio)) {
                 return fail("--offload-ratio needs an integer");

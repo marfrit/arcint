@@ -35,6 +35,11 @@
 #include <openvino/op/slice.hpp>
 #include <openvino/op/transpose.hpp>
 #include <openvino/core/graph_util.hpp>
+#include <openvino/pass/manager.hpp>
+#include <openvino/pass/sdpa_to_paged_attention.hpp>
+#include <openvino/runtime/intel_gpu/properties.hpp>
+#include <openvino/runtime/remote_context.hpp>
+#include <openvino/runtime/remote_tensor.hpp>
 
 #include <minja/chat-template.hpp>
 
@@ -471,6 +476,25 @@ public:
 
         tokenizer_ = std::make_unique<OvTokenizer>(core_, artifact, artifact.eos_ids);
 
+        if (cfg.paged) {
+            load_paged(cfg, n_ctx);
+            template_ = std::make_unique<minja::chat_template>(artifact.chat_template,
+                                                               artifact.bos_token,
+                                                               artifact.eos_token);
+            status_.id               = artifact.id;
+            status_.quant            = cfg.quant;
+            status_.loaded           = true;
+            status_.stub             = false;
+            status_.n_ctx            = paged_n_ctx_;
+            status_.n_layer          = artifact.n_layer;
+            status_.n_gdn_layer      = artifact.n_gdn_layer;
+            status_.n_attn_layer     = artifact.n_attn_layer;
+            status_.mtp_enabled      = mtp_ready_;
+            status_.weights_bytes    = artifact.weights_bytes;
+            status_.sampler_defaults = artifact.sampler;
+            return;
+        }
+
         log::info("load", "compiling embeddings graph on %s", device.c_str());
         auto t0    = std::chrono::steady_clock::now();
         embeddings_ = core_.compile_model(artifact.text_embeddings_xml, device);
@@ -681,6 +705,7 @@ public:
     FinishReason generate(const GenerationInput& in, const TokenCallback& on_piece,
                           GenerationStats& stats) override {
         std::lock_guard<std::mutex> guard(mutex_);
+        if (paged_) return generate_paged(in, on_piece, stats);
         using clock = std::chrono::steady_clock;
 
         const std::vector<int> prompt_ids = tokenizer_->encode(in.prompt);
@@ -1094,6 +1119,692 @@ private:
         } catch (const std::exception& e) {
             log::warn("draft", "state restore failed: %s", e.what());
             return false;
+        }
+    }
+
+    size_t estimated_paged_state_bytes() {
+        size_t n = 8 + la_row_bytes_ + 64 * la_state_names_.size();
+        if (mtp_ready_) {
+            try {
+                for (ov::VariableState& v : mtp_req_.query_state()) {
+                    n += v.get_state().get_byte_size() + 64;
+                }
+            } catch (const std::exception&) {}
+            n += 256 + static_cast<size_t>(artifact_.n_embd) * 4;
+        }
+        return n;
+    }
+
+    // The paged cache blob: [pool epoch][one row of every LA table][the head's
+    // variables, cursor and pending row]. KV blocks are NOT copied: with a
+    // single slot the prompt's blocks are only overwritten by the next COLD
+    // prefill, so the epoch tag is what makes a stale hit a miss instead of a
+    // wrong answer. Block-refcount caching (true multi-entry) arrives with M6.
+    bool snapshot_paged(size_t row, PrefixCache::StateBlob& out) {
+        try {
+            out.clear();
+            std::vector<uint8_t> ep(8);
+            std::memcpy(ep.data(), &pool_epoch_, 8);
+            out.push_back(std::move(ep));
+            for (auto& b : read_paged_row(row)) out.push_back(std::move(b));
+            if (mtp_ready_) {
+                for (ov::VariableState& v : mtp_req_.query_state()) {
+                    out.push_back(serialise_state(v.get_state()));
+                }
+                ov::Tensor cursor(ov::element::i64, ov::Shape{3});
+                cursor.data<int64_t>()[0] = static_cast<int64_t>(mtp_len_);
+                cursor.data<int64_t>()[1] = static_cast<int64_t>(mtp_pos_);
+                cursor.data<int64_t>()[2] = mtp_has_pending_ ? 1 : 0;
+                out.push_back(serialise_state(cursor));
+                out.push_back(serialise_state(
+                    mtp_has_pending_ ? mtp_pending_
+                                     : ov::Tensor(ov::element::f32, ov::Shape{1, 1, 1})));
+            }
+            return true;
+        } catch (const std::exception& e) {
+            log::warn("cache", "paged snapshot failed, continuing without caching: %s", e.what());
+            out.clear();
+            return false;
+        }
+    }
+
+    bool restore_paged(size_t row, const PrefixCache::StateBlob& blob) {
+        const size_t tables = la_state_names_.size();
+        size_t want = 1 + tables;
+        std::vector<ov::VariableState> mtp_states;
+        if (mtp_ready_) {
+            mtp_states = mtp_req_.query_state();
+            want += mtp_states.size() + 2;
+        }
+        if (blob.size() != want || blob[0].size() != 8) return false;
+        uint64_t epoch = 0;
+        std::memcpy(&epoch, blob[0].data(), 8);
+        if (epoch != pool_epoch_) return false;   // the pool has been rewritten since
+        try {
+            std::vector<std::vector<uint8_t>> rows(blob.begin() + 1,
+                                                   blob.begin() + 1 + static_cast<long>(tables));
+            write_paged_row(row, rows);
+            if (mtp_ready_) {
+                for (size_t i = 0; i < mtp_states.size(); ++i) {
+                    mtp_states[i].set_state(deserialise_state(blob[1 + tables + i]));
+                }
+                const ov::Tensor cursor = deserialise_state(blob[blob.size() - 2]);
+                mtp_len_         = static_cast<size_t>(cursor.data<const int64_t>()[0]);
+                mtp_pos_         = static_cast<size_t>(cursor.data<const int64_t>()[1]);
+                mtp_has_pending_ = cursor.data<const int64_t>()[2] != 0;
+                if (mtp_has_pending_) mtp_pending_ = deserialise_state(blob.back());
+            }
+            return true;
+        } catch (const std::exception& e) {
+            log::warn("cache", "paged restore failed, falling back to a cold prefill: %s",
+                      e.what());
+            return false;
+        }
+    }
+
+    FinishReason generate_paged(const GenerationInput& in, const TokenCallback& on_piece,
+                                GenerationStats& stats) {
+        using clock = std::chrono::steady_clock;
+
+        const std::vector<int> prompt_ids = tokenizer_->encode(in.prompt);
+        stats.prompt_tokens               = static_cast<int>(prompt_ids.size());
+        if (prompt_ids.empty()) return FinishReason::Stop;
+
+        uint64_t seed = in.sampler.seed;
+        if (!in.sampler.seeded) {
+            std::random_device rd;
+            seed = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+        }
+        Sampler sampler(in.sampler, seed);
+        if (!in.sampler.greedy()) {
+            log::info("sample", "temp %.2f top_p %.2f top_k %d seed %llu",
+                      static_cast<double>(in.sampler.temperature),
+                      static_cast<double>(in.sampler.top_p), in.sampler.top_k,
+                      static_cast<unsigned long long>(seed));
+        }
+        sampler.set_prompt(prompt_ids);
+        std::vector<int> history;
+        if (drafter_ != nullptr) history = prompt_ids;
+
+        // ------------------------------------------------------------ prefill
+        const auto t_prefill = clock::now();
+        size_t     c    = 0;                       // the committed LA row
+        size_t     past = 0;
+        bool       warm = false;
+        if (prefix_cache_ != nullptr) {
+            const PrefixCache::Hit hit = prefix_cache_->lookup(prompt_ids);
+            if (hit.matched_tokens > 0 && restore_paged(c, *hit.state)) {
+                past                   = hit.matched_tokens;
+                stats.cache_hit_tokens = static_cast<int>(past);
+                warm                   = true;
+            }
+        }
+        if (!warm) {
+            ++pool_epoch_;                        // a cold prefill rewrites the pool
+            zero_paged_rows();
+            mtp_reset();
+        }
+
+        const size_t grid = prefill_chunk_ > 0 ? static_cast<size_t>(prefill_chunk_) : 0;
+        const size_t snap_at =
+            prefix_cache_ != nullptr && grid > 0 && prompt_ids.size() > grid
+                ? ((prompt_ids.size() - 1) / grid) * grid
+                : 0;
+
+        const bool trace = std::getenv("LIGENCE_TRACE_TOKENS") != nullptr;
+        ov::Tensor logits;
+        while (past < prompt_ids.size()) {
+            size_t take = prompt_ids.size() - past;
+            if (grid > 0) {
+                const size_t edge = ((past / grid) + 1) * grid;
+                take = std::min(edge, prompt_ids.size()) - past;
+            }
+            const std::vector<int> chunk(prompt_ids.begin() + static_cast<long>(past),
+                                         prompt_ids.begin() + static_cast<long>(past + take));
+            const ov::Tensor emb = embed_paged(chunk);
+            logits = paged_forward(emb, past, {static_cast<int32_t>(c)}, 0);
+            if (mtp_ready_) {
+                mtp_prime_paged(paged_req_.get_tensor("hidden_states"), emb, take);
+            }
+            past += take;
+
+            if (prefix_cache_ != nullptr && past == snap_at &&
+                prefix_cache_->may_accept(estimated_paged_state_bytes())) {
+                const auto             t_snap = clock::now();
+                PrefixCache::StateBlob blob;
+                const bool             took = snapshot_paged(c, blob);
+                stats.snapshot_seconds += std::chrono::duration<double>(clock::now() - t_snap)
+                                              .count();
+                if (took) prefix_cache_->insert(prompt_ids, past, std::move(blob));
+            }
+        }
+        stats.prefill_seconds = std::chrono::duration<double>(clock::now() - t_prefill).count();
+
+        int next = pick(sampler, logits);
+
+        const std::vector<int>& eos = tokenizer_->eos_ids();
+        auto is_eos = [&](int id) {
+            return !in.sampler.ignore_eos &&
+                   std::find(eos.begin(), eos.end(), id) != eos.end();
+        };
+
+        // ------------------------------------------------------------- decode
+        stats.decode_forward_seconds = 0.0;
+        stats.decode_embed_seconds   = 0.0;
+        stats.decode_sample_seconds  = 0.0;
+        stats.decode_emit_seconds    = 0.0;
+        const auto   t_decode = clock::now();
+        FinishReason reason   = FinishReason::Stop;
+        past                  = prompt_ids.size();
+
+        auto commit = [&](int tok, Control& out) {
+            if (trace) log::info("trace", "commit pos=%zu tok=%d", past, tok);
+            ++stats.completion_tokens;
+            const auto t_emit = clock::now();
+            out = on_piece(tokenizer_->decode_one(tok), tok);
+            stats.decode_emit_seconds += seconds_since_tp(t_emit);
+            sampler.observe(tok);
+            if (drafter_ != nullptr) history.push_back(tok);
+            return out == Control::Continue;
+        };
+
+        while (true) {
+            if (is_eos(next)) break;
+            if (in.sampler.max_tokens >= 0 && stats.completion_tokens >= in.sampler.max_tokens) {
+                reason = FinishReason::Length;
+                break;
+            }
+            if (status_.n_ctx > 0 && static_cast<int>(past) + 1 >= status_.n_ctx) {
+                reason = FinishReason::Length;
+                break;
+            }
+            Control c_ctl = Control::Continue;
+            if (!commit(next, c_ctl)) {
+                reason = c_ctl == Control::Cancel ? FinishReason::Abort : reason;
+                break;
+            }
+
+            std::vector<int> drafts;
+            if (mtp_ready_ && in.sampler.greedy()) {
+                const int d = mtp_feed(next, true);
+                if (d >= 0) drafts.push_back(d);
+            } else if (drafter_ != nullptr && in.sampler.greedy()) {
+                drafts = drafter_->draft(history, draft_tokens_);
+                if (drafts.size() > drafts_max_) drafts.resize(drafts_max_);
+            }
+
+            if (drafts.empty()) {
+                const auto t_fwd = clock::now();
+                logits = paged_forward(embed_paged({next}), past,
+                                       {static_cast<int32_t>(c)}, 0);
+                stats.decode_forward_seconds += seconds_since_tp(t_fwd);
+                ++past;
+                next = pick(sampler, logits);
+                if (mtp_ready_) {
+                    mtp_set_pending(paged_req_.get_tensor("hidden_states"), 0);
+                }
+                continue;
+            }
+
+            // Verify with per-token checkpoints: rows [c, s0..sk], interval 1.
+            // Rollback is deciding which checkpoint row is the new committed
+            // row -- no state bytes move, no re-forward runs.
+            std::vector<int> seq;
+            seq.reserve(1 + drafts.size());
+            seq.push_back(next);
+            seq.insert(seq.end(), drafts.begin(), drafts.end());
+            std::vector<int32_t> la_rows{static_cast<int32_t>(c)};
+            for (size_t rrow = 0; la_rows.size() < seq.size() + 1; ++rrow) {
+                if (rrow != c) la_rows.push_back(static_cast<int32_t>(rrow));
+            }
+
+            const auto t_verify = clock::now();
+            logits              = paged_forward(embed_paged(seq), past, la_rows, 1);
+            stats.draft_verify_seconds += seconds_since_tp(t_verify);
+            stats.draft_proposed += static_cast<int>(drafts.size());
+
+            const size_t rows = logits.get_size() / logits.get_shape().back();
+            if (rows < seq.size()) {
+                log::warn("draft", "the graph returned %zu logits row(s) for %zu tokens; "
+                                   "disabling speculation", rows, seq.size());
+                drafter_.reset();
+                mtp_ready_ = false;
+                // the pass advanced the state; its last checkpoint is the truth
+                c = static_cast<size_t>(la_rows.back());
+                past += seq.size();
+                next = pick(sampler, logits);
+                continue;
+            }
+
+            size_t accepted = 0;
+            bool   stop     = false;
+            for (size_t i = 0; i < drafts.size(); ++i) {
+                const int want = pick_row(sampler, logits, i);
+                if (trace) {
+                    log::info("trace", "verify i=%zu next=%d draft=%d want=%d %s", i, next,
+                              drafts[i], want, want == drafts[i] ? "ACCEPT" : "reject");
+                }
+                if (want != drafts[i]) break;
+                ++accepted;
+                if (is_eos(drafts[i])) { stop = true; break; }
+                if (in.sampler.max_tokens >= 0 &&
+                    stats.completion_tokens >= in.sampler.max_tokens) {
+                    reason = FinishReason::Length;
+                    stop   = true;
+                    break;
+                }
+                if (status_.n_ctx > 0 && static_cast<int>(past + i) + 2 >= status_.n_ctx) {
+                    reason = FinishReason::Length;
+                    stop   = true;
+                    break;
+                }
+                if (!commit(drafts[i], c_ctl)) {
+                    reason = c_ctl == Control::Cancel ? FinishReason::Abort : reason;
+                    stop   = true;
+                    break;
+                }
+            }
+            stats.draft_accepted += static_cast<int>(accepted);
+            if (stop) {
+                c = static_cast<size_t>(la_rows[1 + accepted]);
+                break;
+            }
+
+            if (mtp_ready_) {
+                const ov::Tensor hid = paged_req_.get_tensor("hidden_states");
+                for (size_t i = 0; i < accepted; ++i) {
+                    mtp_set_pending(hid, i);
+                    mtp_feed(drafts[i], false);
+                }
+                mtp_set_pending(hid, accepted);
+            }
+
+            c = static_cast<size_t>(la_rows[1 + accepted]);   // promotion
+            past += 1 + accepted;
+            next = pick_row(sampler, logits, accepted);
+        }
+
+        stats.decode_seconds = std::chrono::duration<double>(clock::now() - t_decode).count();
+        stats.decode_forward_seconds =
+            stats.decode_seconds - stats.decode_embed_seconds - stats.decode_sample_seconds -
+            stats.decode_emit_seconds;
+        return reason;
+    }
+
+    static double seconds_since_tp(std::chrono::steady_clock::time_point t0) {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+
+    // =================================================================== paged
+    //
+    // The measured path (tools/paged_spec.py is the oracle). Requirements it
+    // proved, ported as invariants: state rows zeroed before first use (the
+    // kernels read the committed row even at past_lens 0), tables allocated as
+    // device-resident remote tensors set once, the big model compiled before
+    // the embeddings (compile-time peak), speculative rollback as checkpoint-
+    // row promotion with zero state bytes moved, admission by a reservation in
+    // which every term is measured.
+
+    size_t device_resident_bytes(const std::string& device) {
+        size_t out = 0;
+        for (const auto& [k, v] : core_.get_property(device, ov::intel_gpu::memory_statistics)) {
+            if (k == "usm_device" || k == "cl_mem") out += v;
+        }
+        return out;
+    }
+
+    void load_paged(const Config& cfg, int req_n_ctx) {
+        paged_ = true;
+        const std::string& device  = cfg.device;
+        const std::string  emb_dev = cfg.emb_device.empty() ? device : cfg.emb_device;
+        const std::string  mtp_dev = cfg.mtp_device.empty() ? device : cfg.mtp_device;
+
+        std::shared_ptr<ov::Model> model = core_.read_model(artifact_.language_model_xml);
+
+        // The LA state geometry is read off the *stateful* graph's variables,
+        // where it is static; the transformed ports leave some dims dynamic.
+        std::vector<ov::Shape> conv_proto, gdn_proto;
+        for (const auto& var : model->get_variables()) {
+            const ov::PartialShape& ps = var->get_info().data_shape;
+            if (ps.rank().is_dynamic()) continue;
+            const int64_t rank = ps.rank().get_length();
+            bool tail_static = true;
+            for (int64_t i = 1; i < rank; ++i) tail_static &= ps[i].is_static();
+            if (!tail_static) continue;                    // attention KV: dynamic seq dim
+            ov::Shape sh;
+            sh.push_back(1);
+            for (int64_t i = 1; i < rank; ++i) sh.push_back(ps[i].get_length());
+            if (rank == 3) conv_proto.push_back(sh);
+            if (rank == 4) gdn_proto.push_back(sh);
+        }
+
+        {
+            ov::pass::Manager pm;
+            pm.register_pass<ov::pass::SDPAToPagedAttention>();
+            pm.run_passes(model);
+        }
+
+        want_mtp_ = cfg.mtp != "off" && artifact_.has_mtp_head;
+        if (want_mtp_ && !expose_hidden_state(model)) {
+            log::warn("mtp", "%s", "could not expose the hidden state; MTP disabled");
+            want_mtp_ = false;
+        }
+        drafts_max_ = std::max<size_t>(draft_tokens_, want_mtp_ ? 1 : 0);
+        paged_rows_ = drafts_max_ + 3;
+        if (cfg.slice_logits) {
+            const int64_t keep = static_cast<int64_t>(1 + drafts_max_);
+            if (slice_logits_to_last_token(model, keep)) {
+                log::info("load", "logits sliced to the last %lld row(s)",
+                          static_cast<long long>(keep));
+            }
+        }
+
+        offload_ratio_ = cfg.offload_ratio;
+        ov::AnyMap props;
+        props["KV_CACHE_PRECISION"] = ov::element::f16;
+        if (offload_ratio_ > 0) {
+            props["OFFLOAD_RATIO"]        = offload_ratio_;
+            props[ov::weights_path.name()] = artifact_.language_model_bin;
+        }
+        // The blob cache is off for the paged graph: its import path is
+        // unproven and the #37607 class is exactly the kind of thing it would
+        // hide. Revisit once the paged path is the only path.
+        core_.set_property(ov::cache_dir(""));
+
+        log::info("load", "compiling PAGED language model on %s (big model first by design)",
+                  device.c_str());
+        auto t0      = std::chrono::steady_clock::now();
+        paged_model_ = core_.compile_model(model, device, props);
+        paged_req_   = paged_model_.create_infer_request();
+        const size_t resident_base = device_resident_bytes(device);
+        log::info("load", "paged model ready in %.1f s; device-resident %.2f GiB",
+                  seconds_since(t0), static_cast<double>(resident_base) / (1u << 30));
+
+        embeddings_ = core_.compile_model(artifact_.text_embeddings_xml, emb_dev);
+        embed_req_  = embeddings_.create_infer_request();
+        log::info("load", "embeddings on %s", emb_dev.c_str());
+
+        if (want_mtp_) {
+            try {
+                mtp_layer_    = core_.compile_model(artifact_.mtp_layer_xml, mtp_dev);
+                mtp_head_     = core_.compile_model(artifact_.mtp_lm_head_xml, mtp_dev);
+                mtp_req_      = mtp_layer_.create_infer_request();
+                mtp_head_req_ = mtp_head_.create_infer_request();
+                mtp_ready_    = true;
+                log::info("mtp", "head on %s, drafting one token per step", mtp_dev.c_str());
+            } catch (const std::exception& e) {
+                log::warn("mtp", "could not load the MTP head, continuing without it: %s",
+                          e.what());
+                mtp_ready_ = false;
+            }
+        } else if (cfg.mtp == "on") {
+            log::warn("mtp", "%s", "--mtp on, but this export carries no MTP head");
+        }
+
+        // ---- ports: state tables and KV pools --------------------------------
+        size_t conv_i = 0, gdn_i = 0, kv_block_bytes = 0;
+        for (const auto& port : paged_model_.inputs()) {
+            const std::string  name = port.get_any_name();
+            const ov::PartialShape& ps = port.get_partial_shape();
+            if (name.rfind("conv_state_table.", 0) == 0) {
+                if (conv_i >= conv_proto.size()) throw std::runtime_error("conv table mismatch");
+                la_state_names_.push_back(name);
+                la_state_shapes_.push_back(conv_proto[conv_i++ % conv_proto.size()]);
+            } else if (name.rfind("gated_delta_state_table.", 0) == 0) {
+                if (gdn_i >= gdn_proto.size()) throw std::runtime_error("gdn table mismatch");
+                la_state_names_.push_back(name);
+                la_state_shapes_.push_back(gdn_proto[gdn_i++ % gdn_proto.size()]);
+            } else if (name.rfind("key_cache.", 0) == 0 || name.rfind("value_cache.", 0) == 0) {
+                ov::Shape sh;
+                sh.push_back(1);  // blocks dim, filled at allocation
+                for (size_t i = 1; i < static_cast<size_t>(ps.rank().get_length()); ++i) {
+                    sh.push_back(static_cast<size_t>(ps[static_cast<int64_t>(i)].get_length()));
+                }
+                kv_pool_names_.push_back(name);
+                kv_pool_shapes_.push_back(sh);
+                size_t block_elems = 1;
+                for (size_t i = 1; i < sh.size(); ++i) block_elems *= sh[i];
+                kv_block_bytes += block_elems * port.get_element_type().size();
+            } else if (name == kPositionIds) {
+                paged_sections_ = static_cast<size_t>(ps[0].get_length());
+            }
+        }
+        kv_bytes_token_ = kv_block_bytes / kv_block_tokens_;
+        la_row_bytes_   = 0;
+        for (const ov::Shape& sh : la_state_shapes_) {
+            size_t n = 2;  // f16
+            for (size_t i = 1; i < sh.size(); ++i) n *= sh[i];
+            la_row_bytes_ += n;
+        }
+
+        // ---- allocate the state tables (rows) --------------------------------
+        ov::RemoteContext rctx = core_.get_default_context(device);
+        for (size_t i = 0; i < la_state_names_.size(); ++i) {
+            ov::Shape sh = la_state_shapes_[i];
+            sh[0]        = paged_rows_;
+            ov::RemoteTensor t = rctx.create_tensor(ov::element::f16, sh);
+            paged_req_.set_tensor(la_state_names_[i], t);
+            la_state_tensors_.push_back(t);
+        }
+
+        // ---- reservation: measure the activation peak with a probe pool ------
+        const size_t chunk = prefill_chunk_ > 0 ? static_cast<size_t>(prefill_chunk_) : 512;
+        const size_t probe_blocks = (chunk + kv_block_tokens_ - 1) / kv_block_tokens_ + 1;
+        alloc_kv_pools(rctx, probe_blocks);
+        zero_paged_rows();
+        {
+            std::vector<int> zeros(chunk, 0);
+            paged_forward(embed_paged(zeros), 0, {0, 0}, 0);
+        }
+        const size_t resident_peak = device_resident_bytes(device);
+        const size_t total = core_.get_property(device, ov::intel_gpu::device_total_mem_size);
+        const size_t slab  = la_row_bytes_ * paged_rows_;
+        const size_t probe_kv = probe_blocks * kv_block_bytes;
+        const long long activation =
+            static_cast<long long>(resident_peak) - static_cast<long long>(resident_base) -
+            static_cast<long long>(slab) - static_cast<long long>(probe_kv);
+        const size_t margin = 256ull << 20;
+        const long long budget = static_cast<long long>(total) -
+                                 static_cast<long long>(resident_peak - probe_kv) -
+                                 static_cast<long long>(margin) + 0;
+        long long max_ctx = budget > 0 ? budget / static_cast<long long>(kv_bytes_token_) : 0;
+        max_ctx = (max_ctx / static_cast<long long>(kv_block_tokens_)) *
+                  static_cast<long long>(kv_block_tokens_);
+        log::info("load",
+                  "reservation: weights+graph %.2f GiB, activation peak %.2f GiB at chunk %zu, "
+                  "LA slab %.1f MiB, KV %.1f KiB/token, margin 0.25 GiB -> max ctx %lld",
+                  static_cast<double>(resident_base) / (1u << 30),
+                  static_cast<double>(activation) / (1u << 30), chunk,
+                  static_cast<double>(slab) / (1u << 20),
+                  static_cast<double>(kv_bytes_token_) / 1024.0, max_ctx);
+
+        const int wanted = req_n_ctx > 0 ? req_n_ctx : artifact_.n_ctx_train;
+        if (static_cast<long long>(wanted) > max_ctx) {
+            if (req_n_ctx > 0) {
+                throw std::runtime_error(log::format(
+                    "requested n_ctx %d needs %.2f GiB of KV but the reservation admits %lld "
+                    "(weights %.2f + activations %.2f + state %.3f + margin 0.25 of %.2f GiB)",
+                    wanted, static_cast<double>(wanted) * kv_bytes_token_ / (1u << 30), max_ctx,
+                    static_cast<double>(resident_base) / (1u << 30),
+                    static_cast<double>(activation) / (1u << 30),
+                    static_cast<double>(slab) / (1u << 30),
+                    static_cast<double>(total) / (1u << 30)));
+            }
+            log::info("load", "n_ctx clamped to the admissible %lld (train maximum %d)", max_ctx,
+                      wanted);
+        }
+        paged_n_ctx_ = static_cast<int>(std::min<long long>(wanted, max_ctx));
+
+        const size_t blocks =
+            (static_cast<size_t>(paged_n_ctx_) + drafts_max_ + kv_block_tokens_ - 1) /
+                kv_block_tokens_ + 2;
+        alloc_kv_pools(rctx, blocks);
+        log::info("load", "paged pools: %zu blocks x %zu tokens (%.2f GiB KV), %zu LA rows",
+                  blocks, kv_block_tokens_,
+                  static_cast<double>(blocks * kv_block_bytes) / (1u << 30), paged_rows_);
+    }
+
+    void alloc_kv_pools(ov::RemoteContext& rctx, size_t blocks) {
+        kv_pool_tensors_.clear();
+        for (size_t i = 0; i < kv_pool_names_.size(); ++i) {
+            ov::Shape sh = kv_pool_shapes_[i];
+            sh[0]        = blocks;
+            ov::RemoteTensor t = rctx.create_tensor(ov::element::f16, sh);
+            paged_req_.set_tensor(kv_pool_names_[i], t);
+            kv_pool_tensors_.push_back(t);
+        }
+    }
+
+    void zero_paged_rows() {
+        for (size_t i = 0; i < la_state_tensors_.size(); ++i) {
+            ov::Shape sh = la_state_shapes_[i];
+            sh[0]        = paged_rows_;
+            ov::Tensor z(ov::element::f16, sh);
+            std::memset(z.data(), 0, z.get_byte_size());
+            z.copy_to(la_state_tensors_[i]);
+        }
+    }
+
+    std::vector<std::vector<uint8_t>> read_paged_row(size_t row) {
+        std::vector<std::vector<uint8_t>> out;
+        for (size_t i = 0; i < la_state_tensors_.size(); ++i) {
+            ov::Shape full = la_state_shapes_[i];
+            full[0]        = paged_rows_;
+            ov::Tensor host(ov::element::f16, full);
+            la_state_tensors_[i].copy_to(host);
+            const size_t row_bytes = host.get_byte_size() / paged_rows_;
+            const uint8_t* base = static_cast<const uint8_t*>(host.data()) + row * row_bytes;
+            out.emplace_back(base, base + row_bytes);
+        }
+        return out;
+    }
+
+    void write_paged_row(size_t row, const std::vector<std::vector<uint8_t>>& blobs) {
+        for (size_t i = 0; i < la_state_tensors_.size(); ++i) {
+            ov::Shape full = la_state_shapes_[i];
+            full[0]        = paged_rows_;
+            ov::Tensor host(ov::element::f16, full);
+            std::memset(host.data(), 0, host.get_byte_size());
+            const size_t row_bytes = host.get_byte_size() / paged_rows_;
+            if (blobs[i].size() != row_bytes) throw std::runtime_error("row blob size mismatch");
+            std::memcpy(static_cast<uint8_t*>(host.data()) + row * row_bytes, blobs[i].data(),
+                        row_bytes);
+            host.copy_to(la_state_tensors_[i]);
+        }
+    }
+
+    // Embeddings as a host [n, hidden] f32 tensor (the paged graph's input
+    // layout, and the head's food -- it crosses host memory either way).
+    ov::Tensor embed_paged(const std::vector<int>& ids) {
+        const size_t n = ids.size();
+        ov::Tensor id_tensor(ov::element::i64, ov::Shape{1, n});
+        int64_t*   idp = id_tensor.data<int64_t>();
+        for (size_t i = 0; i < n; ++i) idp[i] = ids[i];
+        embed_req_.set_input_tensor(id_tensor);
+        embed_req_.infer();
+        const ov::Tensor src   = embed_req_.get_output_tensor(0);
+        const size_t     width = src.get_shape().back();
+        ov::Tensor out(ov::element::f32, ov::Shape{n, width});
+        std::memcpy(out.data(), src.data(), src.get_byte_size());
+        return out;
+    }
+
+    // One pass over the paged graph. `la_rows` is [committed] for in-place
+    // (interval 0, duplicated to two entries) or [committed, s0..sk] with
+    // interval 1 for a checkpointing verify pass.
+    ov::Tensor paged_forward(const ov::Tensor& embeds, size_t past,
+                             std::vector<int32_t> la_rows, int interval) {
+        const size_t n   = embeds.get_shape()[0];
+        const size_t tot = past + n;
+        const size_t nblk = (tot + kv_block_tokens_ - 1) / kv_block_tokens_;
+
+        auto i32 = [](std::vector<int32_t> v) {
+            ov::Tensor t(ov::element::i32, ov::Shape{v.size()});
+            std::memcpy(t.data(), v.data(), v.size() * 4);
+            return t;
+        };
+        if (la_rows.size() == 1) la_rows.push_back(la_rows[0]);
+
+        ov::Tensor pos(ov::element::i64, ov::Shape{paged_sections_, n});
+        int64_t*   pp = pos.data<int64_t>();
+        for (size_t sct = 0; sct < paged_sections_; ++sct) {
+            for (size_t i = 0; i < n; ++i) pp[sct * n + i] = static_cast<int64_t>(past + i);
+        }
+        std::vector<int32_t> blocks(nblk);
+        for (size_t i = 0; i < nblk; ++i) blocks[i] = static_cast<int32_t>(i);
+
+        paged_req_.set_tensor(kInputsEmbeds, embeds);
+        paged_req_.set_tensor(kPositionIds, pos);
+        paged_req_.set_tensor("past_lens", i32({static_cast<int32_t>(past)}));
+        paged_req_.set_tensor("subsequence_begins", i32({0, static_cast<int32_t>(n)}));
+        paged_req_.set_tensor("block_indices", i32(blocks));
+        paged_req_.set_tensor("block_indices_begins", i32({0, static_cast<int32_t>(nblk)}));
+        ov::Tensor mcl(ov::element::i32, ov::Shape{});
+        *mcl.data<int32_t>() = static_cast<int32_t>(tot);
+        paged_req_.set_tensor("max_context_len", mcl);
+        paged_req_.set_tensor("la.block_indices", i32(la_rows));
+        paged_req_.set_tensor("la.block_indices_begins",
+                              i32({0, static_cast<int32_t>(la_rows.size())}));
+        paged_req_.set_tensor("la.past_lens", i32({static_cast<int32_t>(past)}));
+        paged_req_.set_tensor("la.cache_interval", i32({interval}));
+        paged_req_.infer();
+        return paged_req_.get_tensor("logits");
+    }
+
+    // Batched head priming over one prefill chunk: pairs (h_t, x_{t+1}) within
+    // the chunk, the chunk-boundary pair carried through mtp_pending_.
+    void mtp_prime_paged(const ov::Tensor& hidden, const ov::Tensor& embeds, size_t take) {
+        if (!mtp_ready_ || take == 0) return;
+        try {
+            const size_t width  = hidden.get_shape().back();
+            const bool   carry  = mtp_has_pending_;
+            const size_t pairs  = (take - 1) + (carry ? 1 : 0);
+            if (pairs == 0) { mtp_set_pending(hidden, take - 1); return; }
+
+            ov::Tensor h(ov::element::f32, ov::Shape{1, pairs, width});
+            ov::Tensor e(ov::element::f32, ov::Shape{1, pairs, width});
+            float* hp = h.data<float>();
+            float* ep = e.data<float>();
+            const float* hv = hidden.data<const float>();
+            const float* ev = embeds.data<const float>();
+            size_t r = 0;
+            if (carry) {
+                std::memcpy(hp, mtp_pending_.data(), width * 4);
+                std::memcpy(ep, ev, width * 4);
+                ++r;
+            }
+            for (size_t i = 0; i + 1 < take; ++i, ++r) {
+                std::memcpy(hp + r * width, hv + i * width, width * 4);
+                std::memcpy(ep + r * width, ev + (i + 1) * width, width * 4);
+            }
+
+            ov::Tensor pos(ov::element::f32, ov::Shape{1, pairs});
+            for (size_t i = 0; i < pairs; ++i) {
+                pos.data<float>()[i] = static_cast<float>(mtp_pos_ + i);
+            }
+            ov::Tensor mask(ov::element::f32, ov::Shape{1, 1, pairs, mtp_len_ + pairs});
+            float* mp = mask.data<float>();
+            std::fill_n(mp, pairs * (mtp_len_ + pairs), 0.0f);
+            for (size_t i = 0; i < pairs; ++i) {
+                for (size_t j = mtp_len_ + i + 1; j < mtp_len_ + pairs; ++j) {
+                    mp[i * (mtp_len_ + pairs) + j] = -std::numeric_limits<float>::infinity();
+                }
+            }
+            ov::Tensor beam(ov::element::i32, ov::Shape{1});
+            beam.data<int32_t>()[0] = 0;
+            mtp_req_.set_tensor("hidden_states", h);
+            mtp_req_.set_tensor("input_embeds", e);
+            mtp_req_.set_tensor("position_ids", pos);
+            mtp_req_.set_tensor("attention_mask", mask);
+            mtp_req_.set_tensor("beam_idx", beam);
+            mtp_req_.infer();
+            mtp_len_ += pairs;
+            mtp_pos_ += pairs;
+            mtp_has_pending_ = false;
+            mtp_set_pending(hidden, take - 1);
+        } catch (const std::exception& e) {
+            log::warn("mtp", "head priming failed, disabling it: %s", e.what());
+            mtp_ready_ = false;
         }
     }
 
@@ -1541,6 +2252,24 @@ private:
     size_t                         mtp_len_ = 0;    // positions in the head's KV
     size_t                         mtp_pos_ = 0;    // true position, for rope
     int                            offload_ratio_ = 0;
+    // --- paged path (§3.5.3, §7.0): ligence-owned block tables + LA rows ---
+    bool                           paged_ = false;
+    ov::CompiledModel              paged_model_;
+    ov::InferRequest               paged_req_;
+    std::vector<std::string>       la_state_names_;   // conv + gdn table port names
+    std::vector<ov::Shape>         la_state_shapes_;  // with the rows dim filled in
+    std::vector<ov::RemoteTensor>  la_state_tensors_;
+    std::vector<std::string>       kv_pool_names_;
+    std::vector<ov::Shape>         kv_pool_shapes_;   // with the blocks dim filled in
+    std::vector<ov::RemoteTensor>  kv_pool_tensors_;
+    size_t                         paged_rows_       = 4;
+    size_t                         kv_block_tokens_  = 16;
+    size_t                         kv_bytes_token_   = 0;
+    size_t                         la_row_bytes_     = 0;
+    int                            paged_n_ctx_      = 0;
+    size_t                         paged_sections_   = 4;    // position_ids dim 0
+    uint64_t                       pool_epoch_       = 0;    // KV pool lineage (§ paged cache)
+    size_t                         drafts_max_       = 0;
     std::vector<ov::Tensor>        rollback_;   // reused speculation scratch
     bool                           logged_rollback_size_ = false;
     std::unique_ptr<Drafter>       drafter_;

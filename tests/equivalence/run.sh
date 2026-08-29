@@ -73,6 +73,19 @@ cmp -s "$WORK/det1.txt" "$WORK/det2.txt" && pass "two greedy runs are byte-ident
 
 cp "$WORK/det1.txt" "$WORK/base.txt"
 
+# ---------------------------------- stateful vs paged: compared and recorded
+#
+# Two different executors over the same compiler. We do not assume they agree,
+# we measure whether they do: kernel paths differ, so a near-tie may land the
+# other way (the §3.2 class). Reported, not gated.
+start_server "$WORK/stateful.log" --no-paged || exit 1
+ask "$WORK/stateful.txt" "$PROMPT"
+if cmp -s "$WORK/base.txt" "$WORK/stateful.txt"; then
+  echo "  -- stateful vs paged: byte-identical on this prompt"
+else
+  echo "  -- stateful vs paged: DIFFER (near-tie class, recorded not gated)"
+fi
+
 # ------------------------------- the logits slice must not change the answer
 #
 # Slicing the hidden state to its last row before the LM head is what lets a
