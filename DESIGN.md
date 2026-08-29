@@ -1611,13 +1611,23 @@ architecture record:
    token, 4.2 MMAC at M=2048, arithmetically the cheapest FullyConnected in the
    layer. The reference kernel's cost is not proportional to its arithmetic.
    The trigger is **not** simply M>1: bisected in one load over eleven token
-   counts, the fallback is absent through M=64 and present from M=128, and its
-   cost is **nearly flat in M** — 32.3 ms at 128 against 41.4 ms at 2048, a 28%
-   rise for 16x the tokens. A degenerate N=1 GEMM would still scale with M. A
-   fixed per-invocation cost — a u4 group-64 weight decompression redone per
-   call — would not. That points at decompression, and is **an inference from
-   the scaling, not an isolated mechanism**: the two variables have not been
-   separated. `prefill-baseline.md` records the two single-variable arms and
+   counts, the fallback is absent through M=64 and present from M=128.
+
+   **The scaling argument built on that sweep is withdrawn (2026-08-30).** It
+   read the gate's 32.3 ms at M=128 against 41.4 ms at M=2048 — a 28% rise for
+   16x the tokens — as "nearly flat", and concluded a fixed per-invocation cost
+   such as a decompression redone per call. Re-reading the *same* sweep for the
+   other ops kills that: `PagedCausalConv1D` and `PagedGatedDeltaNet`, which do
+   genuine O(M) work, are **U-shaped** across it — 8417 → 4234 → 6390 us and
+   20461 → 10628 → 15638 us, falling to a minimum at M=256 before rising. Time
+   that *falls* while the work grows 128x is warm-up decay, not scaling: an
+   ascending single-pass sweep superimposes a decaying first-touch bias on
+   whatever it measures. Over M=128→2048 those two rise 45% and 44% against the
+   gate's 28%, so at these sizes every op in the sweep is dominated by something
+   other than its arithmetic, and "flatter than its neighbours" is all that can
+   be said. Decompression is no longer indicated by this measurement; it remains
+   one of two candidates, separable only by the single-variable arms already
+   recorded. The profiler now runs each capture twice and dumps the second. `prefill-baseline.md` records the two single-variable arms and
    what each must show.
 
    **Sized before being fixed, and deliberately not fixed.** These nodes are
@@ -1635,6 +1645,22 @@ architecture record:
 3. **`PagedCausalConv1D` is on a reference kernel in both phases** (6.3%, 30
    nodes, one per GDN layer). The paged transformation gave GDN an optimised
    kernel and left the causal conv behind.
+
+   **Sized and re-framed 2026-08-30, before starting on it.** Two facts change
+   what this item is:
+
+   - **There is no optimised implementation to select.** The plugin registers
+     `PagedCausalConv1DRefImpl` and a `PagedCausalConv1DRefGenerator`, and the
+     only kernel string is `paged_causal_conv1d_ref`. No `Opt`. This is
+     therefore *not* the shared-expert-gate situation, where a fast kernel
+     existed and was not chosen; the lever here is writing a kernel behind the
+     `--custom-kernels` seam, or filing upstream. Both are real work.
+   - **It is a decode lever, not a prefill one.** "6.3% of both phases"
+     overstates the prefill side by exactly the past-0 error that has now bitten
+     three times: the conv is depth-independent, so over a real prefill its cost
+     is `(N/C) x per-chunk`, which is **under 1% of prefill wall**. On decode,
+     where every step pays it and nothing grows with depth, 6.3% of the step is
+     6.3% of the rate — about 4 t/s of 68.
 
 Two things that are **not** established and are recorded as such:
 

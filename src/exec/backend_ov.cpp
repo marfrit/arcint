@@ -2595,12 +2595,42 @@ private:
                 pos = comma + 1;
             }
         }
+        // ARCINT_PROFILE_PAST=<n> profiles the chunk after prefilling to depth n,
+        // which is the only way to see the quadratic term: every capture at
+        // past 0 is a chunk that attends to nothing, and the depth dimension was
+        // simply not being sampled.
+        size_t past = 0;
+        if (const char* pv = std::getenv("ARCINT_PROFILE_PAST")) {
+            past = static_cast<size_t>(std::strtoul(pv, nullptr, 10));
+        }
+
         for (size_t m : sweep) {
             if (m == 0) continue;
+            if (!ensure_blocks(lane, past + m + 2)) {
+                log::warn("profile", "not enough KV pages for M=%zu at past %zu", m, past);
+                continue;
+            }
             zero_paged_rows(lane);
             std::vector<int> chunk(m, 0);
-            paged_forward(lane, embed_paged(lane, chunk), 0, {0}, 0);
-            dump(log::format("prefill M=%zu", m).c_str(), m);
+            // Walk to `past` in chunks the served grid would use, so the state
+            // and the block table are what a real prefill would present.
+            size_t at = 0;
+            while (at < past) {
+                const size_t take = std::min<size_t>(past - at, static_cast<size_t>(
+                    std::max(1, prefill_chunk_)));
+                paged_forward(lane, embed_paged(lane, std::vector<int>(take, 0)), at, {0}, 0,
+                              false);
+                at += take;
+            }
+            // Twice, and the second one is dumped. The first pass of any shape
+            // carries kernel warm-up, and an ascending sweep turns that into a
+            // decaying bias that reads as a U-shape in every op -- measured
+            // 2026-08-30, and it is why an ascending single-pass sweep cannot be
+            // used to argue about scaling.
+            paged_forward(lane, embed_paged(lane, chunk), at, {0}, 0);
+            paged_forward(lane, embed_paged(lane, chunk), at, {0}, 0);
+            dump(log::format("prefill M=%zu past=%zu", m, past).c_str(), m);
+            release_lane(lane);
         }
 
         // Then one decode step at depth, which is a 1-token forward with a past

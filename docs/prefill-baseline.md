@@ -751,3 +751,88 @@ hash, so it measured nothing — but "no attention-named files" maps exactly ont
 pre-registered outcome three, whose reading was "likely the micro path". A broken
 probe would have produced the right conclusion for the wrong reason. The control
 is what caught it.
+
+
+---
+
+# Round five: what the re-analysis found, and one rule worth keeping
+
+## A methodological rule, from a pre-registration that was wrong
+
+The pre-registered outcome three — "no attention kernel in the dump → likely the
+micro path" — assigned a conclusion to an *absence of evidence*, and justified it
+with a mechanism the run then refuted: micro SDPA **does** go through IGC, and
+its dumps are named `sdpa_micro__prefill_*__sa`. So a null result was never
+evidence for that reading; it was indistinguishable from a broken probe, which
+is exactly what the first filename-based probe was.
+
+> **Never pre-register a reading for a null result unless the instrument carries
+> a positive control.** The five `dpas`-bearing `.asm` files were that control,
+> and they caught the error.
+
+## Candidate (c) is dead, from data already on the table
+
+"Prefill attention is bandwidth-bound on KV reads, where a matrix unit does not
+help" predicts that halving the KV bytes speeds prefill up. It does the opposite,
+measured twice by two instruments: u8 costs **−16.5%** and **−22.1%** at 57792
+and 115564 tokens, and the deployment ladder agrees from the other side at
+**+27.4%** and **+34.5%** for f16 at 103242 and 206393. Half the bytes, slower
+prefill — the dequantisation work outweighs the traffic it saves. Whatever binds
+prefill attention, it is not the number of KV bytes read.
+
+That also removes the reading that would have reconciled "on the matrix path"
+with "far below matrix peak" comfortably. Two candidates remain: the FLOP
+arithmetic behind the coefficient is wrong, or the quadratic term lives outside
+attention.
+
+## The re-analysis cannot be done from stored captures
+
+Separating those two needs the attention nodes' own time fitted at **two
+depths**. Every stored prefill capture is at **past 0** — the profiler swept
+chunk size, never depth — so the quadratic term is absent from all of them by
+construction.
+
+The decode captures at past 1 and past 2048 cannot substitute, and the IGC dump
+is what says so: **prefill and decode use different attention kernels**
+(`sdpa_micro__prefill` against `paged_attention_opt__*single_token`). The decode
+kernel's per-key cost is not the prefill kernel's.
+
+So the sequencing reverses as agreed. `ARCINT_PROFILE_PAST=<n>` now exists, so
+the next profiling run on a card collects the two-depth data for free; the
+coefficient waits for a capture that happens anyway.
+
+## The sweep that produced "flat in M" was contaminated
+
+Re-reading the same bisect capture for the other ops:
+
+| M | PagedCausalConv1D | PagedGatedDeltaNet |
+|---|---|---|
+| 2 | 8417 us | 20461 us |
+| 256 | **4234 us** | **10628 us** |
+| 2048 | 6390 us | 15638 us |
+
+Both do genuine O(M) work and both *fall* to a minimum at M=256 while the work
+grows 128x. That is warm-up decay: an ascending single-pass sweep lays a decaying
+first-touch bias over whatever it measures. Over M=128→2048 they rise 45% and
+44% against the gate's 28%, so at these sizes every op is dominated by something
+other than its arithmetic and "flatter than its neighbours" is the most that can
+be said. **The inference "flat in M ⇒ per-call decompression" is withdrawn**;
+decompression is back to being one of two candidates, separable only by the
+single-variable arms. The profiler now runs each capture twice and dumps the
+second.
+
+## PagedCausalConv1D, sized before starting
+
+- **No optimised implementation exists to select.** The plugin registers only
+  `PagedCausalConv1DRefImpl` / `RefGenerator`, and the only kernel string is
+  `paged_causal_conv1d_ref`. Unlike the shared-expert gate, there is no fast
+  kernel being passed over — the lever is writing one behind `--custom-kernels`,
+  or filing upstream.
+- **It is a decode lever, not a prefill one.** The conv is depth-independent, so
+  over a real prefill it is `(N/C) x per-chunk` — **under 1% of prefill wall**.
+  On decode, where every step pays it and nothing grows with depth, 6.3% of the
+  step is 6.3% of the rate: roughly 4 t/s of 68.
+
+"6.3% of both phases" was the past-0 error a third time. The item is smaller than
+advertised on the side it was being chased for, and larger on the side nobody
+was framing it as.
