@@ -1,0 +1,233 @@
+# arcint
+
+> Narrow LLM inference engine for Intel Arc GPUs (A770 16GB, B60 24GB).
+> Serves exactly three hybrid GDN/attention Qwen models (Qwen3.6-35B-A3B,
+> Qwen3.6-27B-A3B-Coder, Qwen3.8-27B) in q4/q8. Uses OpenVINO as compiler
+> and kernel library; owns scheduling, paged KV cache, GDN recurrent-state
+> ledger, prefix caching, MTP speculative decoding, sampling, and HTTP
+> serving. NInfer philosophy (specialize, then be honest about numbers),
+> Intel substrate.
+
+## Status
+
+M0-M5 all meet their exit criteria, and the paged executor is the SERVED path
+(2026-08-29): coder B60 68.6 t/s decode (70.1 at 30k depth - no depth collapse),
+~1970 t/s prefill, 10/10 harness at base and 30k depth, u8 KV default (10/10
+both depths, base answer bitwise identical to f16, half the memory); dense B60
+36.2 t/s with MTP at 93.2% acceptance, 10/10 GREEDY (registry updated from the
+old 8/10). Admission by measured reservation; when a requested n_ctx does not
+fit at the configured chunk the engine halves the chunk and re-measures (the
+peak is linear in the chunk) before refusing with the numbers. Speculative
+rollback and re-forward print 0.00 s because neither exists on this path. The
+stateful executor remains behind --no-paged as the reference oracle. Serving the real models on Intel Arc
+via OpenVINO: 51.4 t/s decode and up to 2247 t/s prefill on a B60 with the 27B
+coder q4; all three target models reach 10/10 on the fleet harness.
+
+  M0 skeleton                     done
+  M1 executor, greedy, coder/B60  done - 51.4 t/s, 10/10
+  M2 chunked prefill, ledger      done bar the paged path
+  M3 prefix caching               done - warm/cold byte-identical
+  M4 MTP                          done - 93.3% acceptance (not byte-identical)
+  M5 all three models             done; 35B fits the A770 via --offload-ratio
+
+Two M2 walls came down. Slicing logits to the last token before the LM head
+removed an out-of-memory wall at ~8k tokens (the graph computed logits for
+every prompt token: 8.1 GiB at 8k). Storing the attention KV as fp16 by graph
+surgery takes 262144 context from 10.00 to 5.00 GiB - measured 20480 vs 40960
+bytes per context token - which fits the B60's 22.7 GiB alongside 12.8 GiB of
+weights. Neither changes greedy output.
+
+How much the paged path is worth is measured, and the graph must be separated
+from the pipeline. End to end GenAI's ContinuousBatchingPipeline beats arcint
+by ~10-13% on the same IR and card. But profiled directly - same card, depth
+256, steady state - the paged GRAPH costs 11.3 ms per decode step against the
+stateful graph's 19.01 ms: 1.68x. Nearly half of that is 90 Transpose nodes
+(3207 us) disappearing; the optimized paged GDN kernel is 0.64 ms more, and
+PagedAttention replaces IndirectSDPA for free. GenAI gives most of the win back
+in its own scheduler; arcint's serving loop is 2% of a decode step. arcint on
+the paged graph therefore projects to ~87 t/s on the coder against 51.1 today,
+and that projection is what the work is worth.
+
+Caution: PERF_COUNT inflates wall clock (53.6 ms for a step whose node sum is
+19.01 ms) and reports the LAST inference. A depth-64 first-step profile said the
+two paths were identical; they are not.
+
+KV precision on the paged path, measured (7.0.3): u8 is never slower, +2.5%
+at 32k depth, and halves KV memory - the default candidate pending the quality
+harness. u4 quarters memory but costs 6% at 32k; mechanism profiled, not
+narrated: PagedAttentionExtension goes 58.6 -> 95.4 ms (+63%) under u4 while
+every other kernel is unchanged. Also measured: device weights are NOT shared
+between compiled models (0.791 -> 1.582 GiB for two compiles of one graph),
+and kernel exec_type strings carry no ISA marker on either card, so the XMX
+question needs Level-Zero tracing, not PERF_COUNT.
+
+tools/paged_spec.py adds speculative decoding on the paged path (dense model,
+MTP head drafting): rollback is row promotion, zero state bytes move on
+rejection. Measured on the B60: 36.1 t/s at depth 512 and 32.1 at 4096 against
+the 19.9 t/s stateful baseline (1.81x / 1.61x), 96.7% acceptance, with bitwise
+determinism and bitwise warm-restore equality as gates. On the A770 alone the head
+does not fit beside the dense model (15.25 of 15.11 GiB, refused by
+reservation) -- but with the head and embeddings hosted on the B60 (fits beside
+coder production; only ~20 KB of activations cross per step) the A770 serves
+dense MTP at 26.6 t/s (512) / 22.4 (4096) vs 17.3 stateful: 1.54x. Paged
+without MTP runs there at 18.1 t/s.
+Found and fixed en route: state rows MUST be zeroed before first use - the
+kernels read the committed row even at past_lens 0.
+
+tools/paged_driver.py is the prototype and the oracle for the C++ port: la.*
+convention, device-resident state tensors (host tensors are re-uploaded every
+infer and silently reset the recurrent state), absolute-grid prefill, and a
+startup reservation in which every term is measured (weights+graph via
+GPU_MEMORY_STATISTICS, activation peak by running one chunk - linear in chunk
+size - GDN slab, KV at 20 KiB/token, stated margin). Admission is refused with
+the numbers, never discovered at runtime as CL_OUT_OF_RESOURCES. Result on the
+A770, where GenAI's continuous-batching path refuses the coder at startup (its
+stateful VLMPipeline served this model on this card in production before the
+B60 arrived; the refusal is the CB admission check, not the card or GenAI):
+ctx 49152 at chunk 512 serves at
+586 t/s prefill / 37.1 t/s decode, 15.09 of 15.11 GiB accounted.
+
+PCIe bandwidth does NOT govern decode of a resident model - an earlier claim
+here, retracted by measurement. Node time (19.01 ms) equals the serving step
+(19.2 ms/token), host work is 2%, and the only per-step link traffic is the
+993 KB sliced-logits readback plus an 8 KB embeddings hop = 0.06-0.32 ms, under
+2%. The bus IS the explanation for state snapshots/rollback (51-67% of decode,
+69.9-171.3 MiB per step), prefix-cache serialisation, and expert offload.
+
+What is left is OpenVINO's paged-attention path. Its decode-side block-table
+convention is undocumented and not yet reverse-engineered; prefill through it
+reproduces the stateful path exactly, decode does not. M4's measurements
+promoted it: it is the precondition for speculative decoding paying at all
+(rollback becomes block-table arithmetic instead of a 171 MiB state copy),
+worth ~2x decode on the dense model, on top of speed and real q8 KV.
+
+Known open: q8 KV, which needs per-block scales and is only reachable on the
+paged path. Two former entries are closed - tools/export_mtp.py builds the MTP
+head, and expert offload for the 35B on a 16 GB card turned out to be a native
+GPU-plugin property (OFFLOAD_RATIO), not something the fused MoE op withholds:
+--offload-ratio 20 serves the 35B on the A770 at 1.8 t/s where it previously
+refused to load, against 52.2 t/s on the B60.
+
+Verification: 142 unit cases, a 48-check curl round-trip, an equivalence suite
+that runs where the card is. Clean under ASan and UBSan on x86_64.
+
+## Contracts
+
+- HTTP: POST /v1/chat/completions, POST /v1/completions (OpenAI-compatible,
+  SSE streaming), GET /health, GET /props, GET /v1/models. No UI.
+- Console: llama.cpp-style one-line state/timing prints on stderr
+  (load, mem map, per-slot prefill/decode rates, cache hits, MTP acceptance).
+- Model input: OpenVINO IR (offline export), validated against a built-in
+  allowlist; anything else is rejected at load.
+- Hard invariant: greedy output is byte-identical across cold/warm prefix cache
+  (gated in CI). NOT across chunked/unchunked prefill or speculation on/off:
+  measured 2026-08-28, advancing the state by two tokens in one forward differs
+  from advancing it twice by one (last-row logits up to 0.013 apart, GDN scan
+  kernel), so any change to how a sequence is split can flip a near-tie. Those
+  comparisons are reported, not gated; determinism at a fixed configuration and
+  non-zero draft acceptance are gated instead.
+
+## Target models (measured, models/allowlist-raw.json, the dev host 2026-08-28)
+
+All three: full_attention_interval 4 (one layer in four is full attention),
+ctx 262144, tokenizer sha 87a7830d63fcf43b (shared), VLM-capable exports
+(*ForConditionalGeneration).
+
+- qwen3.6-27b-a3b-coder / qwen36-coder-b5-ov: qwen3_5_moe, 40 layers
+  (30 GDN + 10 attn), n_embd 2048, 184 experts (pruned from 256),
+  12.8 GiB, production, 10/10 on the Pruefstand.
+- qwen3.6-35b-a3b / qwen36-35b-a3b-int4-ov: qwen3_5_moe, 40 layers
+  (30 GDN + 10 attn), n_embd 2048, 256 experts, 17.4 GiB, unmeasured
+  against the current harness.
+- qwen3.8-27b / qwen38-b7c1-ov: qwen3_5 dense, 64 layers (48 GDN + 16 attn),
+  n_embd 5120, 13.4 GiB, provisional 7/10 (AWQ-only; SE calibration
+  degenerates greedy - do not re-add SE).
+
+Note: DESIGN.md section 4's original console sketch said "41 GDN + 7 attn
+layers | weights 15.9 GiB". That was illustrative and is wrong; the artifacts
+above are authoritative and the allowlist follows them.
+
+## Key design points
+
+- All target models are hybrids: GatedDeltaNet (linear attention, fixed-size
+  recurrent state) on most layers + full attention (paged KV) on few.
+- GDN state checkpoints are block-aligned with KV pages so prefix-cache hits
+  restore both sides exactly; no approximate resume, ever.
+- Prefix index: keyed 128-bit block hashes with token verification on hit.
+- Speculative decoding is implemented and gated on greedy-invariance: a draft
+  is accepted only if it equals what the sampler would have picked for that
+  logits row, so a draft is never taken on faith. Output is NOT byte-identical
+  to plain greedy - see the invariant note above. Two drafters, both off by
+  default: the
+  native Qwen3.8 MTP head (--mtp on, 93.3% acceptance) and a prompt-lookup
+  drafter (--draft N). optimum-intel drops the MTP head on export, so
+  tools/export_mtp.py reconstructs it from the checkpoint's mtp.* tensors; the
+  forward pass was recovered by measurement (zero-centred (1+w) norms,
+  per-head-interleaved q/gate, sigmoid gate) using acceptance as the oracle,
+  which is only sound because a wrong draft cannot change the output.
+  Measured a net loss as shipped, for two separable reasons. (1) Rollback:
+  copying the graph state per decode step costs 51-67% of decode time - 69.9
+  MiB/80 vars on the MoE, 171.3 MiB/128 vars on the dense model, mostly the
+  fixed-size GDN recurrent state, so it does not shrink with context. It is
+  inside OV's VariableState get_state/set_state; bypassing the prefix cache's
+  serialiser moved it 1%. (2) Amortisation: a k-token verify pass is nearly
+  free on dense (forward(5) = 1.08x forward(1)) but not on MoE (1.37x), because
+  MoE tokens route to different experts. Net of rollback, dense speculation is
+  1.76-2.07x faster and MoE is break-even. So the paged path is not an
+  optimisation for M4, it is the precondition, worth ~2x on Qwen3.8.
+  DESIGN 3.5.1.
+- Compiled-blob disk cache in weightless mode with absolute weight paths
+  (avoids openvino#37607 embedded-weights import bug).
+- Quant: q4/q8 weights, fp16/q8 KV. Single GPU, single process, Xe KMD only.
+- Tokenizer + chat template ship in the model artifact (template hash in the
+  allowlist); incremental UTF-8-safe detokenization for streaming.
+- Tool calls parsed server-side into OpenAI tool_calls; both Qwen wire forms
+  (JSON body, and the coder's <function=>/<parameter=> XML with schema-driven
+  type coercion); deterministic call ids; never executed; no tools declared =
+  parser never runs, raw text untouched.
+- Model-aware sampling defaults per allowlist entry; request fields override.
+  Still marked "provisional": allowlist-raw.json carries no sampler settings,
+  so the values are inherited from the Qwen3 family card, and /props says so.
+- Context overflow = HTTP 400 with prompt_tokens/n_ctx/overflow. No
+  truncation, no context shift (GDN recurrent state cannot un-see tokens).
+- Client disconnect aborts GPU work at next scheduler boundary.
+- Prefill throughput is a first-class regression metric per card (measured
+  pain: 58 t/s prefill on A770/Vulkan = 6 min TTFT at 21k context).
+
+## Layout
+
+- README.md: scope, features, non-goals, status, building, why-not-X.
+- DESIGN.md: architecture (§3), caching (§3.3–3.4), MTP (§3.5), serving (§4),
+  test gates (§5), evidence against upstream pipeline layer (§6),
+  milestones M0–M5 (§7), open questions (§8).
+- CLAUDE.md: session rules, dev hardware (the dev host), measurement discipline.
+- models/allowlist-raw.json: raw IR metadata, the allowlist's provenance.
+- src/: config, util/ (log, utf8, text), core/ (model_registry, sampling,
+  stop, toolcall, chat), exec/ (backend interface + stub), api/ (error,
+  handlers), http/ (cpp-httplib wiring).
+- tests/: 133 unit cases (hand-rolled harness, no framework), roundtrip.sh
+  (48 curl checks, both wired into ctest), and equivalence/run.sh which needs
+  a real card.
+- third_party/: cpp-httplib 0.18.3, nlohmann/json 3.11.3, single headers.
+
+## Build
+
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
+ctest --test-dir build --output-on-failure
+./build/arcint --stub --port 8090 -v
+
+-DARCINT_OPENVINO=ON is reserved for the executor and refuses to configure
+until M1; --model is refused at startup meanwhile, so --stub is the only way
+in. -DARCINT_WERROR=ON is warning-clean. Clean under ASan+UBSan with
+-fno-sanitize-recover, but ASan must run on x86_64 (the dev host): it aborts at
+startup on aarch64 containers.
+
+## Provenance
+
+Design grounded in 2026-08 fleet measurement campaigns (ARCstory B5–B14):
+OpenVINO 60 t/s vs Vulkan 7.9 t/s on B60 for the same checkpoint; SE
+calibration degenerates greedy on dense Qwen3.8; OV GenAI CB path diverges
+from stateful under greedy (upstream issue 4367, CI equality test skipped
+since 2025-02); OV model-cache import bug and workaround (upstream issue
+37607). Performance bar: beat 60 t/s (27B q4, B60) while holding the
+equivalence invariants.

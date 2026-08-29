@@ -1,0 +1,52 @@
+# arcint, as a systemd *user* unit on the dev host, matching how
+# openarc-coder and llama-agent already run there.
+#
+# Install:
+#   cmake --install build-ov --prefix ~/.local
+#   cp packaging/arcint.service ~/.config/systemd/user/
+#   cp packaging/arcint.env     ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now arcint
+#
+# The binary resolves its own OpenVINO libraries via RPATH, so there is no
+# LD_LIBRARY_PATH here on purpose. If you see "libopenvino.so not found", the
+# build was configured without OpenVINO's location or was moved after install.
+
+[Unit]
+Description=arcint — LLM inference for Intel Arc
+Documentation=https://github.com/marfrit/arcint
+After=graphical-session.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/systemd/user/arcint.env
+ExecStart=%h/.local/bin/arcint \
+    --model ${ARCINT_MODEL} \
+    --device ${ARCINT_DEVICE} \
+    --host ${ARCINT_HOST} \
+    --port ${ARCINT_PORT} \
+    --n-ctx ${ARCINT_N_CTX} \
+    --prefix-cache-mib ${ARCINT_PREFIX_CACHE_MIB} \
+    $ARCINT_EXTRA_ARGS
+
+# The card holds the model's VRAM for the process lifetime, so a restart is a
+# full reload (minutes). Restart on failure, but do not thrash.
+Restart=on-failure
+RestartSec=30s
+
+# Loading a 13 GiB model and compiling the graph takes minutes on a cold blob
+# cache. systemd must not call that a hung start.
+TimeoutStartSec=20min
+TimeoutStopSec=60s
+
+# stderr is the dashboard (llama.cpp-style state lines); let journald have it.
+StandardOutput=journal
+StandardError=journal
+
+# It reads model artifacts and writes only its blob cache.
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectHome=read-only
+ReadWritePaths=%h/.cache/arcint
+
+[Install]
+WantedBy=default.target
