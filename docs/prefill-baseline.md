@@ -620,6 +620,52 @@ rather than the conclusion, because the conclusion would be a third inference.
 Four apparent "SDPA + dpas" matches were false positives: `ov::pass::
 SDPAScaleFusion` contains the letters D-P-A-S.
 
+## The selector, read where the binary could not answer
+
+A correction and an upgrade, from reading `paged_attention_opt.cpp` rather than
+the shipped `.so`.
+
+**Finding 1 above is structural, not a profiler gap.** That file *is* the
+implementation; micro SDPA is selected **inside** it
+(`rt_params->use_micro_sdpa = can_use_micro_sdpa_for(...)`), so `exec_type`
+reads `ocl::paged_attention::opt__f16` on either branch. The name can never
+distinguish them. That is a stronger statement than "the instrument is blunt",
+and it closes the grep permanently rather than until someone feels lucky.
+
+**The gate, as a checklist** (`paged_attention_opt.cpp:1396ff`):
+`supports_immad`, arch ≥ `xe_hpg`, not `xe3p`, `k_head_size == v_head_size`,
+head size within the ceiling, no scores output, no score aggregation, no alibi,
+`valid_micro_stage` admitting `PREFILL` and `MIXED`. Every condition checkable
+from the model side **passes**, and the plugin carries the path (`micro_sdpa`
+×6, `sdpa_micro` ×1 in the binary, so `ENABLE_ONEDNN_FOR_GPU` was on).
+
+**So the expectation inverts: micro SDPA is probably already running, and the
+SIMD-peak conjecture is probably wrong.** A *reading*, not a measurement — three
+stacked inferences, which is the standard this document refuses elsewhere, so it
+changes the label on nothing.
+
+**Two near-misses, recorded like `SDPAScaleFusion`** because both were tidy and
+both were wrong:
+
+- *chunked prefill excluded from micro SDPA* — PR #29137's text says it lacks
+  "partial prefill calculation", but the gate at the pinned commit reads
+  `!desc->has_token_type_ids || stage == PREFILL`. `token_type_ids` is a Gemma
+  input; this family has none, so `MIXED` was already admitted.
+- *the head-size ceiling excludes us* — raised 256 → 512 on 2026-08-27, and the
+  test is `> 256`. This model's head size is **exactly 256**: it passed even
+  before the raise, **with zero margin**. A wider model falls off this path
+  silently.
+
+**One target left**, and the instrument prints it: only the runtime
+`query_microkernels_supported(engine, config)` is unchecked, and
+`can_use_micro_sdpa_for` carries a `GPU_DEBUG_TRACE_DETAIL` line ending
+`"can_use_micro_sdpa = " << can_use_micro_sdpa`. Expect 1; a 0 can then only be
+that query.
+
+**A closed door:** the three micro-SDPA PRs of 26–27 August are the Gemma
+`token_type_ids` fix, the head-size raise, and an `xe3p` workaround. None touches
+this configuration, so bumping the pinned runtime is risk without a lever.
+
 **Outcome three, and a next step that is now specific.** "Attention prefill runs
 at SIMD peak" stays labelled a conjecture. What would settle it is no longer
 "instruction-level tracing" in the abstract but a choice of two: a plugin build

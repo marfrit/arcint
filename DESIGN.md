@@ -1681,6 +1681,14 @@ Three things were established without taking a card:
    family and a dtype: `ocl::paged_attention::opt__f16`,
    `ocl::paged_gated_delta_net::opt___f16`, `jit:gemm:any__i8`. Nothing about
    `dpas`, `xmx` or `systolic`.
+
+   **And for attention this is structural, not a gap in the profiler** (read off
+   the selector, 2026-08-30). `paged_attention_opt.cpp` *is* the implementation;
+   micro SDPA is chosen **inside** it —
+   `rt_params->use_micro_sdpa = can_use_micro_sdpa_for(...)` — so `exec_type`
+   reads `ocl::paged_attention::opt__f16` whichever branch runs. No amount of
+   profile-name reading can ever separate the two. Written down so the grep is
+   not re-run in the hope of a different day.
 2. **The plugin cannot be asked.** This build has the GPU debug capabilities
    compiled out — zero occurrences of `OV_GPU_Verbose`, `DumpSources` or
    `ENABLE_DEBUG_CAPS` in the binary, against exactly two `OV_GPU_*` knobs
@@ -1703,9 +1711,50 @@ false positives: `ov::pass::SDPAScaleFusion` contains the letters.
 So: **outcome three.** The SIMD-peak line stays a conjecture in §7.0.2c rather
 than hardening into a fact, and the bounded next step is now specific rather
 than "instruction-level tracing" in the abstract — either a plugin build with
-`ENABLE_DEBUG_CAPS=ON`, which makes `OV_GPU_Verbose` name the selected
-implementation, or onetrace / Level-Zero PTI. The first is cheaper and answers
-exactly this question.
+`ENABLE_DEBUG_CAPS=ON`, or onetrace / Level-Zero PTI. The first is cheaper and
+answers exactly this question.
+
+**Reading the gate narrows it to one unchecked condition.** The full micro-SDPA
+gate is `paged_attention_opt.cpp:1396ff`: `supports_immad`, arch ≥ `xe_hpg`, not
+`xe3p`, `k_head_size == v_head_size`, head size within the ceiling, no scores
+output, no score aggregation, no alibi, and `valid_micro_stage` admitting
+`PREFILL` and `MIXED`. **Every condition checkable from the model side passes.**
+The installed plugin also carries the path — `micro_sdpa` appears six times in
+the plugin binary and `sdpa_micro` once — so `ENABLE_ONEDNN_FOR_GPU` was on at
+build time.
+
+That inverts the expectation: **micro SDPA is probably already running on our
+prefill, and the SIMD-peak conjecture is probably wrong.** Labelled as *a
+reading, not a measurement* — it stacks three inferences (a source gate, string
+presence, an architecture assumption), which is exactly the standard this
+section refuses elsewhere.
+
+What it earns is a target of one: the only gate not checked is the runtime
+`query_microkernels_supported(engine, config)`. And the instrument prints the
+answer directly — `can_use_micro_sdpa_for` carries
+`GPU_DEBUG_TRACE_DETAIL << … << "can_use_micro_sdpa = " << can_use_micro_sdpa`,
+which is one line from a build with debug capabilities on. **Expect 1. If it
+prints 0, the cause is `query_microkernels_supported` and nothing else**, because
+every other condition is checked and passes.
+
+**Two near-misses on the way, recorded for the same reason `SDPAScaleFusion`
+was.** Both were tidy and both were wrong:
+
+- *"Chunked prefill is excluded from micro SDPA."* PR #29137's own text says it
+  does not support "partial prefill calculation". At the pinned commit the gate
+  actually reads `!desc->has_token_type_ids || stage == PagedAttentionStage::
+  PREFILL`; `token_type_ids` is a Gemma input, this family has none, so `MIXED`
+  was already admitted.
+- *"The head-size ceiling excludes us."* It was raised 256 → 512 on 2026-08-27,
+  and the test is `> 256`. This model's head size is **exactly 256**, so it
+  passed even before the raise — **with zero margin**. A model one step wider
+  would fall off this path silently, which is worth knowing before anyone
+  chooses a fourth artifact.
+
+**A door that is closed, so nobody chases the changelog.** The three micro-SDPA
+PRs merged 26–27 August are the Gemma `token_type_ids` `MIXED` fix, the head-size
+raise to 512, and an `xe3p` workaround. **None of them touches this
+configuration.** Bumping the pinned runtime is not a lever here, only risk.
 
 **A correction carried in from the deployment side, because the note is easy to
 misapply.** The standing observation that "the A770 never uses XMX" is about
