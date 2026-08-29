@@ -2544,6 +2544,15 @@ private:
                                  "pairs, %.1f us/token",
                       what, tokens, total / 1000.0, rows.size(),
                       tokens > 0 ? total / static_cast<double>(tokens) : 0.0);
+            // Said every time, because it has already cost two retracted
+            // headlines: these chunks run at past 0, and chunk k of a real
+            // prefill attends to everything before it. A past-0 chunk is the
+            // cheapest chunk in any run, so every share below is an upper bound
+            // on that node's share of real prefill -- for anything that does not
+            // grow with depth, by the ratio between this chunk and the average
+            // one. Convert to wall time before deciding a share is worth fixing.
+            log::info("profile", "%s", "  (past 0: shares here overstate a real "
+                                       "prefill's -- size against wall time)");
             for (size_t i = 0; i < rows.size() && i < 20; ++i) {
                 log::info("profile", "  %8.1f us %5d  %5.1f%%  %s", rows[i].second.us,
                           rows[i].second.n, 100.0 * rows[i].second.us / total,
@@ -2570,7 +2579,24 @@ private:
         // question is what changes between one token and many. Kernel selection
         // for a dynamic-shape node happens per runtime shape, so M=1, M=2 and
         // M=depth are three different questions asked of the same graph.
-        for (size_t m : {size_t{1}, size_t{2}, depth}) {
+        // ARCINT_PROFILE_SWEEP=2,4,8,... bisects the token count at which kernel
+        // selection changes, in ONE load: each M is a forward, not a compile,
+        // so the whole search costs what one server start costs.
+        std::vector<size_t> sweep{1, 2, depth};
+        if (const char* list = std::getenv("ARCINT_PROFILE_SWEEP")) {
+            sweep.clear();
+            const std::string spec(list);
+            size_t pos = 0;
+            while (pos < spec.size()) {
+                const size_t comma = spec.find(',', pos);
+                const std::string tok = spec.substr(pos, comma - pos);
+                if (!tok.empty()) sweep.push_back(std::strtoul(tok.c_str(), nullptr, 10));
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+        }
+        for (size_t m : sweep) {
+            if (m == 0) continue;
             zero_paged_rows(lane);
             std::vector<int> chunk(m, 0);
             paged_forward(lane, embed_paged(lane, chunk), 0, {0}, 0);

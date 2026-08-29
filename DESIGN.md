@@ -1610,11 +1610,28 @@ architecture record:
    331 FC nodes together. `shared_expert_gate` is `[1, 2048]`: one scalar per
    token, 4.2 MMAC at M=2048, arithmetically the cheapest FullyConnected in the
    layer. The reference kernel's cost is not proportional to its arithmetic.
-   The trigger is **not** simply M>1 — measured, M=1 and M=2 both put all 371 FC
-   nodes on `jit:gemm:any__i8` and only M=2048 falls back — so it is a threshold
-   between 2 and 2048, and which one is untested. The open question, one A/B
-   away: N=1 output shape, or u4 group-64 decompression? Rewriting those nodes
-   to an uncompressed f16 MatMul before compile answers it.
+   The trigger is **not** simply M>1: bisected in one load over eleven token
+   counts, the fallback is absent through M=64 and present from M=128, and its
+   cost is **nearly flat in M** — 32.3 ms at 128 against 41.4 ms at 2048, a 28%
+   rise for 16x the tokens. A degenerate N=1 GEMM would still scale with M. A
+   fixed per-invocation cost — a u4 group-64 weight decompression redone per
+   call — would not. That points at decompression, and is **an inference from
+   the scaling, not an isolated mechanism**: the two variables have not been
+   separated. `prefill-baseline.md` records the two single-variable arms and
+   what each must show.
+
+   **Sized before being fixed, and deliberately not fixed.** These nodes are
+   depth-independent and nearly chunk-size-independent, so their cost over a
+   prefill is `(N/C) x ~40 ms`: 4.6% of prefill wall at 14450 tokens, 2.7% at
+   57792, 1.7% at 115564. The 33–39% figure is a share of a *past-0 chunk's node
+   time*, and a past-0 chunk is the cheapest one in any real prefill. Both arms
+   require the same pre-compile graph surgery that the fix does, so measuring
+   costs what fixing costs — and against 1.7–4.6%, `PagedCausalConv1D` at 6.3%
+   of *both* phases is the larger prize and the next candidate.
+
+   A small chunk does not dodge it: chunk 64 avoids the fallback, but the chunk
+   sweep measured what small chunks cost (1339 t/s at 512 against 1878 at 2048).
+   The fallback is cheaper than the cure.
 3. **`PagedCausalConv1D` is on a reference kernel in both phases** (6.3%, 30
    nodes, one per GDN layer). The paged transformation gave GDN an optimised
    kernel and left the causal conv behind.
@@ -1659,8 +1676,21 @@ tokens, one process per cell):
 | B60 u4 | 65.2 | 65.4 | **52.0** |
 | A770 f16 / u8 / u4 (512) | 43.4 / 43.5 / 43.2 | 42.4 / 42.9 / — | |
 
-**u8 is never slower, is +2.5% at 32k, and halves KV memory** — at 262k that
-is 5 GiB → 2.5 GiB on the coder. **u4 quarters the memory and costs 6% at
+**u8 is never slower over the depths in that table, is +2.5% at 32k, and halves
+KV memory** — at 262k that is 5 GiB → 2.5 GiB on the coder.
+
+**The qualifier is load-bearing and was missing (added 2026-08-29 from a
+deployment-side measurement, B60, coder, one lane, 262144, warm prefix so the
+number is decode and not a mixture).** At **53.5k** prompt tokens the ordering
+reverses: u8 49.41 t/s against f16 53.25 t/s over three runs each, spreads 0.24%
+and 1.3% — **f16 7.8% faster**, an order of magnitude outside either spread.
+
+So the table above and that measurement are both true and describe different
+points on a curve: **u8 leads at 32768 by 2.5%, f16 leads at 53.5k by 7.8%, and
+the crossover lies between them.** It has not been located, and locating it is
+three depths of a decode sweep. What must not survive is the sentence "u8 is
+never slower", which reads as a property of the precision when it is a property
+of a point. **u4 quarters the memory and costs 6% at
 32k**, and the mechanism is named, not narrated: the profiled 32k step puts
 `PagedAttentionExtension` at 58.6 ms under f16 and **95.4 ms under u4 (+63%)**
 while every other kernel line is identical to the tenth of a millisecond — the
@@ -1696,6 +1726,24 @@ default; `--paged-kv f16` is for a one-lane deep-context endpoint on a card
 with room**, which is exactly what the fleet's coder unit is, and there it is
 worth up to 22% of prefill. `ARCINT_PAGED_KV` remains as the A/B override so a
 running deployment can be measured without a config edit.
+
+**The second number a deployer needs, and the documentation only gave the
+first.** The context ceiling per lane falls 606688 → 343632 under f16 and that
+is stated above. What is not is what happens to the *prefix cache*: the pool is
+sized in bytes, so at the same 6.55 GiB an f16 page costs twice as much and the
+page count halves. Measured on the coder endpoint (B60, one lane, 262144):
+
+| | pool pages | live per lane | spare for cached prefixes |
+|---|---|---|---|
+| u8 | 37918 | 16386 | **21532** — ~344k tokens of reserve |
+| f16 | 21477 | 16386 | **5091** — ~81k tokens of reserve |
+
+Live pages are a fixed count (n_ctx / 16), so the whole halving comes out of the
+reserve: a **4.2x** reduction. For an agent or coder workload that is the term
+that can eat the win — every cold prefill gets 16–34% cheaper while fewer
+prefixes stay resident that would have needed no prefill at all. Which way it
+nets out depends on reuse, so this is not an argument against f16; it is the
+second half of the choice, and a deployer was being shown only the first.
 
 What is measured about quality so far: greedy token streams under u8/u4
 diverge from f16 within the first tokens (first divergence at token 4–37
