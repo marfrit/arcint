@@ -109,28 +109,6 @@ def rope(x, cos, sin, rotary_dim, heads):
     return op.concat([out, passthru], axis=-1)
 
 
-def _unused_rope_half(x, cos, sin, rotary_dim):
-    half = rotary_dim // 2
-    rot = op.slice(x, op.constant(np.array([0], dtype=np.int32)),
-                   op.constant(np.array([rotary_dim], dtype=np.int32)),
-                   op.constant(np.array([1], dtype=np.int32)),
-                   op.constant(np.array([-1], dtype=np.int32)))
-    passthru = op.slice(x, op.constant(np.array([rotary_dim], dtype=np.int32)),
-                        op.constant(np.array([2 ** 31 - 1], dtype=np.int32)),
-                        op.constant(np.array([1], dtype=np.int32)),
-                        op.constant(np.array([-1], dtype=np.int32)))
-    x1 = op.slice(rot, op.constant(np.array([0], dtype=np.int32)),
-                  op.constant(np.array([half], dtype=np.int32)),
-                  op.constant(np.array([1], dtype=np.int32)),
-                  op.constant(np.array([-1], dtype=np.int32)))
-    x2 = op.slice(rot, op.constant(np.array([half], dtype=np.int32)),
-                  op.constant(np.array([rotary_dim], dtype=np.int32)),
-                  op.constant(np.array([1], dtype=np.int32)),
-                  op.constant(np.array([-1], dtype=np.int32)))
-    rotated = op.concat([op.negative(x2), x1], axis=-1)
-    out = op.add(op.multiply(rot, cos), op.multiply(rotated, sin))
-    return op.concat([out, passthru], axis=-1)
-
 
 def build_mtp_layer(w, eps, theta, rotary_dim):
     """hidden_states + input_embeds -> the MTP layer's normed hidden state."""

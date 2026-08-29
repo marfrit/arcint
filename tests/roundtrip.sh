@@ -21,10 +21,13 @@ WORK=$(mktemp -d)
 LOG="${WORK}/server.log"
 
 cleanup() {
-  if [[ -n "${SRV_PID:-}" ]] && kill -0 "$SRV_PID" 2>/dev/null; then
-    kill "$SRV_PID" 2>/dev/null
-    wait "$SRV_PID" 2>/dev/null
-  fi
+  local pid
+  for pid in "${SRV_PID:-}" "${CANCEL_PID:-}"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+    fi
+  done
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -305,6 +308,10 @@ CANCEL_LOG="${WORK}/cancel.log"
 CANCEL_PID=$!
 for _ in $(seq 1 100); do
   curl -fsS "http://127.0.0.1:${CANCEL_PORT}/health" -o /dev/null 2>/dev/null && break
+  if ! kill -0 "$CANCEL_PID" 2>/dev/null; then
+    echo "cancel stub exited during boot:"; cat "$CANCEL_LOG"
+    exit 1
+  fi
   sleep 0.1
 done
 
