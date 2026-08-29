@@ -63,10 +63,20 @@ same code and the only form that does not still need us next year.
 
 - *The supply chain changes shape.* The packaged runtime currently repacks two
   upstream wheels against pinned checksums and builds in seconds. A patched build
-  is a real compile, x86_64, and there is no CI runner for that target — the same
-  gap that already forces the engine's own package to be built by hand. A patched
-  plugin turns that from temporary into structural, and the honest fix is a
-  runner, not more hand-building.
+  is a real compile, on x86_64, and **the CI has no capability for that target** —
+  the same gap that already forces the engine's own package to be built by hand.
+  A patched plugin turns that from temporary into structural.
+
+  Stated precisely, because "no runner" would be wrong and would point at the
+  wrong fix: an x86_64 runner exists and is registered, but with the single label
+  `linux-amd64:host` — host execution on a musl userland, with no container
+  runtime installed — so it cannot produce a glibc binary for the target
+  distribution, and no job in the packaging workflow targets that label in any
+  case (23 jobs on `arch-aarch64`, 5 on `debian-aarch64`, none on
+  `linux-amd64`). The gap is therefore a **runner-configuration** one — a
+  container runtime and a `debian-amd64` label, or a second container — not
+  missing hardware. That is a much smaller thing to fix than it looked, and it
+  unblocks both the engine's own package and any patched runtime.
 - *Whatever we carry, we publish.* Patches live in the packaging repository where
   anyone can read them, and this document names them and says why. A performance
   number that depends on a patch nobody else has is not a result, it is an
