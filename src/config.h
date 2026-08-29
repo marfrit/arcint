@@ -25,7 +25,16 @@ struct Config {
     int         port = 8090;
 
     int n_ctx    = 0;  // 0: take the model's trained context
-    int parallel = 1;  // slots (DESIGN.md §4 /health reports free/total)
+    int parallel = 1;  // lanes (DESIGN.md §4 /health reports free/total)
+
+    // How long a request waits for a lane before it is refused with the
+    // reservation numbers (DESIGN.md §4.2). Zero refuses immediately, which is
+    // the default because a lane count is a *memory* reservation: with N lanes
+    // reserved, an N+1st concurrent sequence has nowhere to live, and a client
+    // that waits behind a 30k-context session cannot tell a queue from a hang.
+    // A non-zero value restores queueing for deployments that prefer it, and
+    // /health reports the queue depth either way.
+    double queue_timeout_s = 0.0;
 
     // Prefill chunk in tokens, 0 = one call for the whole prompt.
     //

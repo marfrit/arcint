@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 0.1.0 LANGUAGES CXX)
+project(arcint VERSION 0.2.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -53,7 +53,6 @@ if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
   endif()
 endif()
 endif()
-configure_file(cmake/build_info.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/build_info.h" @ONLY)
 
 # ------------------------------------------------------------------- vendored
 add_library(arcint_vendor INTERFACE)
@@ -67,6 +66,7 @@ add_library(arcint_core STATIC
   src/util/utf8.cpp
   src/util/text.cpp
   src/core/artifact.cpp
+  src/core/block_pool.cpp
   src/core/model_registry.cpp
   src/core/prefix_cache.cpp
   src/core/sampler.cpp
@@ -75,6 +75,7 @@ add_library(arcint_core STATIC
   src/core/toolcall.cpp
   src/core/chat.cpp
   src/core/drafter.cpp
+  src/core/turnstile.cpp
   src/exec/backend_stub.cpp
   src/api/error.cpp
   src/api/handlers.cpp
@@ -123,6 +124,12 @@ if(ARCINT_OPENVINO)
   endif()
 endif()
 
+# Generated last on purpose: it bakes in the tokenizers path discovered above,
+# and a configure_file that runs before the discovery writes an empty one (which
+# is a binary that cannot start without a wrapper -- exactly what the baked path
+# exists to avoid).
+configure_file(cmake/build_info.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/build_info.h" @ONLY)
+
 # ----------------------------------------------------------------------- exe
 add_executable(arcint src/main.cpp)
 target_link_libraries(arcint PRIVATE arcint_core)
@@ -162,6 +169,8 @@ if(ARCINT_TESTS)
     tests/test_text.cpp
     tests/test_config.cpp
     tests/test_prefix_cache.cpp
+    tests/test_block_pool.cpp
+    tests/test_turnstile.cpp
     tests/test_provenance.cpp
     tests/test_sha256.cpp
   )
@@ -176,4 +185,13 @@ if(ARCINT_TESTS)
   add_test(NAME roundtrip
            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/roundtrip.sh" "$<TARGET_FILE:arcint>")
   set_tests_properties(roundtrip PROPERTIES TIMEOUT 120)
+
+  # Lane accounting under load. Stub-only on purpose: it is the half of §4.1
+  # that needs no card and therefore can run in CI and under the sanitizers,
+  # where a use-after-free in the lease shows up as a report rather than as a
+  # rare hang on the GPU box. The card-side gates live in tests/concurrency/run.py.
+  add_test(NAME stress
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/stress.sh"
+                   "$<TARGET_FILE:arcint>" 60 12 4)
+  set_tests_properties(stress PROPERTIES TIMEOUT 300)
 endif()

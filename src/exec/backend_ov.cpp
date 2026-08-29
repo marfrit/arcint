@@ -11,8 +11,19 @@
 // The export is a VLM: the language model consumes `inputs_embeds`, not token
 // ids, so the text-embeddings graph runs first. v1 is text-only and the vision
 // graphs are never compiled.
+//
+// M6 adds the second lane. A lane is one sequence's worth of mutable execution
+// state — its own InferRequest for the language model, the embeddings gather
+// and the MTP head, its own GDN checkpoint rows, its own KV block table — and
+// nothing in it is shared with the other lane. What *is* shared is immutable or
+// refcounted: the compiled models (weights are shared between InferRequests of
+// one CompiledModel, which is what makes a second lane cost activations rather
+// than another 12.8 GiB), and the KV page pool, from which each lane draws its
+// own pages. Two sequences therefore never meet inside one graph execution,
+// which is the rule all three reference engines agree on for hybrid models.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -45,9 +56,11 @@
 
 #include "config.h"
 #include "core/artifact.h"
+#include "core/block_pool.h"
 #include "core/drafter.h"
 #include "core/prefix_cache.h"
 #include "core/sampler.h"
+#include "core/turnstile.h"
 #include "exec/backend.h"
 #include "util/log.h"
 
@@ -457,14 +470,64 @@ size_t store_kv_state_as(const std::shared_ptr<ov::Model>& model, const ov::elem
 // -------------------------------------------------------------------- backend
 class OvBackend final : public Backend {
 public:
+    // One lane (DESIGN.md §4.1). Everything a running sequence writes to lives
+    // here, indexed by the slot the HTTP layer leased; nothing here is touched
+    // by another lane, so the decode loop needs no lock of its own.
+    struct Lane {
+        int              index = 0;
+        ov::InferRequest req;        // the paged language model; unused on --no-paged
+        ov::InferRequest embed;      // the embeddings gather
+        // The MTP head carries its own attention KV over the prefix, so it
+        // needs its own request per lane as well: a shared head would let one
+        // sequence draft from the other's prefix, which is cross-slot bleed in
+        // its most confusing form (the drafts are verified, so the output would
+        // stay correct and only the acceptance rate would quietly collapse).
+        ov::InferRequest mtp_layer;
+        ov::InferRequest mtp_head;
+        ov::Tensor       mtp_pending;      // h_t, awaiting x_{t+1}
+        bool             mtp_has_pending = false;
+        size_t           mtp_len = 0;      // positions in the head's KV
+        size_t           mtp_pos = 0;      // true position, for rope
+
+        // The GDN checkpoint rows this lane owns (its own device tensors, not a
+        // window into a shared table: a row write copies the whole tensor back,
+        // and sharing one would let a snapshot in one lane zero the other's
+        // rows), and the KV pages of the sequence it is running.
+        std::vector<ov::RemoteTensor> la_tensors;
+        size_t                        committed_row = 0;
+        std::vector<int32_t>          blocks;
+        PrefixCache::EntryRef         hit_keep;   // pages mapped from the cache
+
+        // The graph's outputs, copied out of the request while the lane still
+        // holds the device. Measured 2026-08-29: a second InferRequest of the
+        // same CompiledModel adds 0.00 GiB of activations, i.e. the GPU plugin
+        // pools intermediate buffers per compiled model, not per request. The
+        // consequence is that a request's own output tensor is only valid until
+        // the next execution on that model — by anyone — so reading it after
+        // the turn has passed to the other lane would read the other lane's
+        // numbers. Copying is ~1 MB per step against an 11 ms step.
+        ov::Tensor         logits;
+        ov::Tensor         hidden;
+        std::vector<float> logit_scratch;
+        GenerationStats*   stats = nullptr;
+        // Waits are accumulated per graph execution and flushed once per
+        // emitted token, because the number a reader feels is the gap between
+        // tokens, not the wait before one of the two or three executions that
+        // produced it.
+        double              stall_accum = 0.0;
+        std::vector<double> stalls;
+    };
+
     OvBackend(const Artifact& artifact, const Config& cfg, int n_ctx)
         : artifact_(artifact), prefill_chunk_(cfg.prefill_chunk) {
         const std::string& device    = cfg.device;
         std::string cache_dir = cfg.cache_dir;
+        lane_count_           = std::max(1, cfg.parallel);
         if (cfg.draft_tokens > 0) {
             drafter_     = std::make_unique<NgramDrafter>(static_cast<size_t>(cfg.draft_ngram),
                                                           static_cast<size_t>(cfg.draft_tokens));
             draft_tokens_ = static_cast<size_t>(cfg.draft_tokens);
+            drafting_     = true;
         }
         if (cfg.prefix_cache_mib > 0) {
             prefix_cache_ = std::make_unique<PrefixCache>(
@@ -500,7 +563,17 @@ public:
         embeddings_ = core_.compile_model(artifact.text_embeddings_xml, device);
         log::info("load", "embeddings ready in %.1f s", seconds_since(t0));
 
-        embed_req_ = embeddings_.create_infer_request();
+        // One lane: the stateful graph has a single internal state, so this
+        // path serves one sequence at a time whatever --parallel says. It stays
+        // as the reference oracle the equivalence suite compares against.
+        lanes_.push_back(std::make_unique<Lane>());
+        lanes_.back()->index = 0;
+        lanes_.back()->embed = embeddings_.create_infer_request();
+        if (lane_count_ > 1) {
+            log::warn("load", "--no-paged serves one sequence at a time; the other %d lane(s) "
+                              "will wait rather than run",
+                      lane_count_ - 1);
+        }
 
         std::shared_ptr<ov::Model> model = core_.read_model(artifact.language_model_xml);
 
@@ -650,9 +723,9 @@ public:
                 const auto t0 = std::chrono::steady_clock::now();
                 mtp_layer_    = core_.compile_model(artifact.mtp_layer_xml, device);
                 mtp_head_     = core_.compile_model(artifact.mtp_lm_head_xml, device);
-                mtp_req_      = mtp_layer_.create_infer_request();
-                mtp_head_req_ = mtp_head_.create_infer_request();
-                mtp_ready_    = true;
+                lanes_[0]->mtp_layer = mtp_layer_.create_infer_request();
+                lanes_[0]->mtp_head  = mtp_head_.create_infer_request();
+                mtp_ready_           = true;
                 log::info("mtp", "head ready in %.1f s; drafting one token per step",
                           seconds_since(t0));
             } catch (const std::exception& e) {
@@ -681,8 +754,24 @@ public:
         status_.sampler_defaults = artifact.sampler;
     }
 
+    // Explicit, because member destruction order alone would get this wrong:
+    // a cache entry hands its KV pages back to the pool as it dies, and the
+    // pool is declared after the cache, so it would be gone by then. Releasing
+    // into a destroyed BlockPool is undefined behaviour that happens to look
+    // like a clean shutdown most of the time.
+    ~OvBackend() override {
+        for (auto& lane : lanes_) {
+            if (lane != nullptr) release_lane(*lane);
+        }
+        if (prefix_cache_ != nullptr) prefix_cache_->clear();
+    }
+
     const ModelStatus& status() const override { return status_; }
     Tokenizer&         tokenizer() override { return *tokenizer_; }
+
+    uint64_t free_blocks() const override {
+        return pool_ != nullptr ? static_cast<uint64_t>(pool_->free_blocks()) : 0;
+    }
 
     std::string render_chat(const ChatRequest& req) const override {
         minja::chat_template_inputs inputs;
@@ -702,10 +791,20 @@ public:
         return template_->apply(inputs, opts);
     }
 
-    FinishReason generate(const GenerationInput& in, const TokenCallback& on_piece,
+    FinishReason generate(const GenerationInput& in, int slot, const TokenCallback& on_piece,
                           GenerationStats& stats) override {
+        if (paged_) {
+            // No lock: the lane is the HTTP layer's lease, its state is its own,
+            // and the only thing two lanes contend for is the device — which the
+            // turnstile orders (§4.1).
+            Lane& lane = *lanes_[static_cast<size_t>(
+                std::min<int>(std::max(slot, 0), lane_count_ - 1))];
+            return generate_paged(lane, in, on_piece, stats);
+        }
+        // The stateful reference path has one graph state, so it serves one
+        // sequence at a time and says so at load.
         std::lock_guard<std::mutex> guard(mutex_);
-        if (paged_) return generate_paged(in, on_piece, stats);
+        Lane&       lane  = *lanes_[0];
         using clock = std::chrono::steady_clock;
 
         const std::vector<int> prompt_ids = tokenizer_->encode(in.prompt);
@@ -738,7 +837,7 @@ public:
         // — and it needs the prompt in it, because a prompt is exactly where a
         // lookup drafter finds its matches.
         std::vector<int> history;
-        if (drafter_ != nullptr) history = prompt_ids;
+        if (drafting_.load()) history = prompt_ids;
 
         // -------------------------------------------------------- prefill
         const auto t_prefill = clock::now();
@@ -746,7 +845,7 @@ public:
         size_t past = 0;
         if (prefix_cache_ != nullptr) {
             const PrefixCache::Hit hit = prefix_cache_->lookup(prompt_ids);
-            if (hit.matched_tokens > 0 && restore(*hit.state)) {
+            if (hit.matched_tokens > 0 && restore(lane, *hit.state)) {
                 past                   = hit.matched_tokens;
                 stats.cache_hit_tokens = static_cast<int>(past);
             } else {
@@ -761,8 +860,8 @@ public:
         // along with everything else (see snapshot), so only a cold start needs
         // the cursor moved by hand.
         if (stats.cache_hit_tokens == 0) {
-            mtp_reset();
-            mtp_seek(past);
+            mtp_reset(lane);
+            mtp_seek(lane, past);
         }
 
         // The boundary worth remembering is the last block edge strictly inside
@@ -780,11 +879,11 @@ public:
 
         snapshot_seconds_ = &stats.snapshot_seconds;
         step_stats_       = &stats;
-        ov::Tensor logits = prefill(prompt_ids, past, snap_at);
+        ov::Tensor logits = prefill(lane, prompt_ids, past, snap_at);
         snapshot_seconds_ = nullptr;
         stats.prefill_seconds = std::chrono::duration<double>(clock::now() - t_prefill).count();
 
-        int next = pick(sampler, logits);
+        int next = pick(lane, sampler, logits);
 
         const std::vector<int>& eos = tokenizer_->eos_ids();
         auto is_eos = [&](int id) {
@@ -813,7 +912,7 @@ public:
             out = on_piece(tokenizer_->decode_one(tok), tok);
             stats.decode_emit_seconds += seconds_since(t_emit);
             sampler.observe(tok);
-            if (drafter_ != nullptr) history.push_back(tok);
+            if (drafting_.load()) history.push_back(tok);
             return out == Control::Continue;
         };
 
@@ -851,17 +950,17 @@ public:
                 // The head is one position behind: feeding it x_P turns its
                 // pending h_{P-1} into a prediction of x_{P+1}, which is exactly
                 // the token the verify pass is about to check.
-                const int d = mtp_feed(next, true);
+                const int d = mtp_feed(lane, next, true);
                 if (d >= 0) drafts.push_back(d);
-            } else if (drafter_ != nullptr && in.sampler.greedy()) {
+            } else if (drafting_.load() && in.sampler.greedy()) {
                 drafts = drafter_->draft(history, draft_tokens_);
             }
 
             if (drafts.empty()) {
-                logits = forward({next}, past);
+                logits = forward(lane, {next}, past);
                 ++past;
-                next = pick(sampler, logits);
-                if (mtp_ready_) mtp_set_pending(last_hidden_, 0);
+                next = pick(lane, sampler, logits);
+                if (mtp_ready_) mtp_set_pending(lane, last_hidden_, 0);
                 continue;
             }
 
@@ -881,11 +980,11 @@ public:
             if (!rollbackable) {
                 log::warn("draft", "%s", "cannot snapshot the state, so a rejected draft could "
                                          "not be rolled back; disabling speculation");
-                drafter_.reset();
+                drafting_  = false;
                 mtp_ready_ = false;
-                logits = forward({next}, past);
+                logits = forward(lane, {next}, past);
                 ++past;
-                next = pick(sampler, logits);
+                next = pick(lane, sampler, logits);
                 continue;
             }
 
@@ -895,7 +994,7 @@ public:
             seq.insert(seq.end(), drafts.begin(), drafts.end());
 
             const auto t_verify = clock::now();
-            logits              = forward(seq, past);
+            logits              = forward(lane, seq, past);
             stats.draft_verify_seconds +=
                 std::chrono::duration<double>(clock::now() - t_verify).count();
             stats.draft_proposed += static_cast<int>(drafts.size());
@@ -909,12 +1008,12 @@ public:
                           "the graph returned %zu logits row(s) for %zu tokens; drafts cannot "
                           "be verified, disabling speculation",
                           rows, seq.size());
-                drafter_.reset();
+                drafting_  = false;
                 mtp_ready_ = false;
                 restore_tensors(rollback_);
-                logits = forward({next}, past);
+                logits = forward(lane, {next}, past);
                 ++past;
-                next = pick(sampler, logits);
+                next = pick(lane, sampler, logits);
                 continue;
             }
 
@@ -925,7 +1024,7 @@ public:
             size_t accepted = 0;
             bool   stop     = false;
             for (size_t i = 0; i < drafts.size(); ++i) {
-                const int want = pick_row(sampler, logits, i);
+                const int want = pick_row(lane, sampler, logits, i);
                 if (trace) {
                     log::info("trace", "verify i=%zu next=%d draft=%d want=%d rows=%zu %s", i,
                               next, drafts[i], want, rows,
@@ -978,7 +1077,7 @@ public:
                     std::chrono::duration<double>(clock::now() - t_restore).count();
                 std::vector<int> keep(seq.begin(), seq.begin() + static_cast<long>(1 + accepted));
                 const auto t_re = clock::now();
-                logits          = forward(keep, past);
+                logits          = forward(lane, keep, past);
                 stats.draft_reforward_seconds +=
                     std::chrono::duration<double>(clock::now() - t_re).count();
             }
@@ -989,17 +1088,17 @@ public:
             // predicted, which is how a drafted token got inserted into an
             // otherwise identical answer.
             past += 1 + accepted;
-            next = pick(sampler, logits);
+            next = pick(lane, sampler, logits);
 
             if (mtp_ready_) {
                 // hidden here covers the positions actually committed: row 0 is
                 // position `past`, row i is position `past + i`. It is a copy
                 // (see forward), so feeding the head cannot disturb it.
                 for (size_t i = 0; i < accepted; ++i) {
-                    mtp_set_pending(last_hidden_, i);
-                    mtp_feed(drafts[i], false);
+                    mtp_set_pending(lane, last_hidden_, i);
+                    mtp_feed(lane, drafts[i], false);
                 }
-                mtp_set_pending(last_hidden_, accepted);
+                mtp_set_pending(lane, last_hidden_, accepted);
             }
         }
 
@@ -1019,7 +1118,8 @@ private:
     double*          snapshot_seconds_ = nullptr;
     GenerationStats* step_stats_        = nullptr;
 
-    ov::Tensor prefill(const std::vector<int>& tokens, size_t past, size_t snapshot_at) {
+    ov::Tensor prefill(Lane& lane, const std::vector<int>& tokens, size_t past,
+                       size_t snapshot_at) {
         ov::Tensor   logits;
         const size_t grid = prefill_chunk_ > 0 ? static_cast<size_t>(prefill_chunk_) : 0;
 
@@ -1043,7 +1143,7 @@ private:
             }
 
             const size_t start = past;
-            logits = forward({tokens.begin() + static_cast<long>(past),
+            logits = forward(lane, {tokens.begin() + static_cast<long>(past),
                               tokens.begin() + static_cast<long>(past + take)},
                              past);
             past += take;
@@ -1052,8 +1152,8 @@ private:
             // known, which inside a chunk it always is.
             if (mtp_ready_) {
                 for (size_t i = 0; i < take; ++i) {
-                    if (mtp_has_pending_) mtp_feed(tokens[start + i], false);
-                    mtp_set_pending(last_hidden_, i);
+                    if (lane.mtp_has_pending) mtp_feed(lane, tokens[start + i], false);
+                    mtp_set_pending(lane, last_hidden_, i);
                 }
             }
 
@@ -1061,10 +1161,10 @@ private:
                 // Serialising the whole graph state is expensive and the KV half
                 // grows with the prefix, so ask first whether it could be kept
                 // at all rather than copying hundreds of MiB to have it dropped.
-                if (prefix_cache_->may_accept(estimated_state_bytes())) {
+                if (prefix_cache_->may_accept(estimated_state_bytes(lane))) {
                     const auto             t_snap = std::chrono::steady_clock::now();
                     PrefixCache::StateBlob blob;
-                    const bool             took = snapshot(blob);
+                    const bool             took = snapshot(lane, blob);
                     if (snapshot_seconds_ != nullptr) *snapshot_seconds_ += seconds_since(t_snap);
                     if (took) prefix_cache_->insert(tokens, past, std::move(blob));
                 }
@@ -1122,11 +1222,11 @@ private:
         }
     }
 
-    size_t estimated_paged_state_bytes() {
-        size_t n = 8 + la_row_bytes_ + 64 * la_state_names_.size();
+    size_t estimated_paged_state_bytes(Lane& lane) {
+        size_t n = la_row_bytes_ + 64 * la_state_names_.size();
         if (mtp_ready_) {
             try {
-                for (ov::VariableState& v : mtp_req_.query_state()) {
+                for (ov::VariableState& v : lane.mtp_layer.query_state()) {
                     n += v.get_state().get_byte_size() + 64;
                 }
             } catch (const std::exception&) {}
@@ -1135,29 +1235,27 @@ private:
         return n;
     }
 
-    // The paged cache blob: [pool epoch][one row of every LA table][the head's
-    // variables, cursor and pending row]. KV blocks are NOT copied: with a
-    // single slot the prompt's blocks are only overwritten by the next COLD
-    // prefill, so the epoch tag is what makes a stale hit a miss instead of a
-    // wrong answer. Block-refcount caching (true multi-entry) arrives with M6.
-    bool snapshot_paged(size_t row, PrefixCache::StateBlob& out) {
+    // The paged cache blob: [one row of every LA table][the head's variables,
+    // cursor and pending row]. The KV is not in it and is not copied — the
+    // entry holds references to the pages themselves (§3.4), which is what
+    // replaced the single-slot pool-epoch tag at M6. The GDN half travels
+    // host-side because it is fixed-size and small; the KV half stays on the
+    // card because it is neither.
+    bool snapshot_paged(Lane& lane, size_t row, PrefixCache::StateBlob& out) {
         try {
             out.clear();
-            std::vector<uint8_t> ep(8);
-            std::memcpy(ep.data(), &pool_epoch_, 8);
-            out.push_back(std::move(ep));
-            for (auto& b : read_paged_row(row)) out.push_back(std::move(b));
+            for (auto& b : read_paged_row(lane, row)) out.push_back(std::move(b));
             if (mtp_ready_) {
-                for (ov::VariableState& v : mtp_req_.query_state()) {
+                for (ov::VariableState& v : lane.mtp_layer.query_state()) {
                     out.push_back(serialise_state(v.get_state()));
                 }
                 ov::Tensor cursor(ov::element::i64, ov::Shape{3});
-                cursor.data<int64_t>()[0] = static_cast<int64_t>(mtp_len_);
-                cursor.data<int64_t>()[1] = static_cast<int64_t>(mtp_pos_);
-                cursor.data<int64_t>()[2] = mtp_has_pending_ ? 1 : 0;
+                cursor.data<int64_t>()[0] = static_cast<int64_t>(lane.mtp_len);
+                cursor.data<int64_t>()[1] = static_cast<int64_t>(lane.mtp_pos);
+                cursor.data<int64_t>()[2] = lane.mtp_has_pending ? 1 : 0;
                 out.push_back(serialise_state(cursor));
                 out.push_back(serialise_state(
-                    mtp_has_pending_ ? mtp_pending_
+                    lane.mtp_has_pending ? lane.mtp_pending
                                      : ov::Tensor(ov::element::f32, ov::Shape{1, 1, 1})));
             }
             return true;
@@ -1168,31 +1266,28 @@ private:
         }
     }
 
-    bool restore_paged(size_t row, const PrefixCache::StateBlob& blob) {
+    bool restore_paged(Lane& lane, size_t row, const PrefixCache::StateBlob& blob) {
         const size_t tables = la_state_names_.size();
-        size_t want = 1 + tables;
+        size_t want = tables;
         std::vector<ov::VariableState> mtp_states;
         if (mtp_ready_) {
-            mtp_states = mtp_req_.query_state();
+            mtp_states = lane.mtp_layer.query_state();
             want += mtp_states.size() + 2;
         }
-        if (blob.size() != want || blob[0].size() != 8) return false;
-        uint64_t epoch = 0;
-        std::memcpy(&epoch, blob[0].data(), 8);
-        if (epoch != pool_epoch_) return false;   // the pool has been rewritten since
+        if (blob.size() != want) return false;
         try {
-            std::vector<std::vector<uint8_t>> rows(blob.begin() + 1,
-                                                   blob.begin() + 1 + static_cast<long>(tables));
-            write_paged_row(row, rows);
+            std::vector<std::vector<uint8_t>> rows(blob.begin(),
+                                                   blob.begin() + static_cast<long>(tables));
+            write_paged_row(lane, row, rows);
             if (mtp_ready_) {
                 for (size_t i = 0; i < mtp_states.size(); ++i) {
-                    mtp_states[i].set_state(deserialise_state(blob[1 + tables + i]));
+                    mtp_states[i].set_state(deserialise_state(blob[tables + i]));
                 }
                 const ov::Tensor cursor = deserialise_state(blob[blob.size() - 2]);
-                mtp_len_         = static_cast<size_t>(cursor.data<const int64_t>()[0]);
-                mtp_pos_         = static_cast<size_t>(cursor.data<const int64_t>()[1]);
-                mtp_has_pending_ = cursor.data<const int64_t>()[2] != 0;
-                if (mtp_has_pending_) mtp_pending_ = deserialise_state(blob.back());
+                lane.mtp_len         = static_cast<size_t>(cursor.data<const int64_t>()[0]);
+                lane.mtp_pos         = static_cast<size_t>(cursor.data<const int64_t>()[1]);
+                lane.mtp_has_pending = cursor.data<const int64_t>()[2] != 0;
+                if (lane.mtp_has_pending) lane.mtp_pending = deserialise_state(blob.back());
             }
             return true;
         } catch (const std::exception& e) {
@@ -1202,8 +1297,8 @@ private:
         }
     }
 
-    FinishReason generate_paged(const GenerationInput& in, const TokenCallback& on_piece,
-                                GenerationStats& stats) {
+    FinishReason generate_paged(Lane& lane, const GenerationInput& in,
+                                const TokenCallback& on_piece, GenerationStats& stats) {
         using clock = std::chrono::steady_clock;
 
         const std::vector<int> prompt_ids = tokenizer_->encode(in.prompt);
@@ -1224,25 +1319,47 @@ private:
         }
         sampler.set_prompt(prompt_ids);
         std::vector<int> history;
-        if (drafter_ != nullptr) history = prompt_ids;
+        if (drafting_.load()) history = prompt_ids;
+
+        // The lane's pages go back to the pool however this request ends —
+        // finished, stopped, cancelled or thrown out of.
+        LaneReset reset(*this, lane, stats);
 
         // ------------------------------------------------------------ prefill
         const auto t_prefill = clock::now();
-        size_t     c    = 0;                       // the committed LA row
+        size_t&    c    = lane.committed_row;      // the committed LA row, lane-relative
+        c               = 0;
         size_t     past = 0;
         bool       warm = false;
         if (prefix_cache_ != nullptr) {
-            const PrefixCache::Hit hit = prefix_cache_->lookup(prompt_ids);
-            if (hit.matched_tokens > 0 && restore_paged(c, *hit.state)) {
-                past                   = hit.matched_tokens;
-                stats.cache_hit_tokens = static_cast<int>(past);
-                warm                   = true;
+            PrefixCache::Hit hit = prefix_cache_->lookup(prompt_ids);
+            // Every page of a hit is a complete page, and a complete page is
+            // never written again, so mapping one needs no copy — only a
+            // reference, taken before the entry can be evicted (§3.3).
+            // Exactly the pages of the matched prefix, no more: a longer list
+            // would hand this lane a shared page *past* the prefix, which it
+            // would then write into — and "a complete page is never written
+            // again" is the invariant that makes sharing safe without copying.
+            if (hit.matched_tokens > 0 && hit.blocks != nullptr &&
+                hit.matched_tokens % kv_block_tokens_ == 0 &&
+                hit.blocks->size() == hit.matched_tokens / kv_block_tokens_) {
+                pool_->ref(*hit.blocks);
+                lane.blocks   = *hit.blocks;
+                lane.hit_keep = hit.keep;
+                if (restore_paged(lane, c, *hit.state)) {
+                    past                   = hit.matched_tokens;
+                    stats.cache_hit_tokens = static_cast<int>(past);
+                    warm                   = true;
+                } else {
+                    pool_->release(lane.blocks);
+                    lane.blocks.clear();
+                    lane.hit_keep.reset();
+                }
             }
         }
         if (!warm) {
-            ++pool_epoch_;                        // a cold prefill rewrites the pool
-            zero_paged_rows();
-            mtp_reset();
+            zero_paged_rows(lane);
+            mtp_reset(lane);
         }
 
         const size_t grid = prefill_chunk_ > 0 ? static_cast<size_t>(prefill_chunk_) : 0;
@@ -1259,28 +1376,48 @@ private:
                 const size_t edge = ((past / grid) + 1) * grid;
                 take = std::min(edge, prompt_ids.size()) - past;
             }
+            if (!ensure_blocks(lane, past + take)) {
+                log::warn("slot", "KV pool exhausted at %zu tokens; %llu page(s) free",
+                          past + take, static_cast<unsigned long long>(pool_->free_blocks()));
+                stats.prefill_seconds =
+                    std::chrono::duration<double>(clock::now() - t_prefill).count();
+                return FinishReason::Length;
+            }
             const std::vector<int> chunk(prompt_ids.begin() + static_cast<long>(past),
                                          prompt_ids.begin() + static_cast<long>(past + take));
-            const ov::Tensor emb = embed_paged(chunk);
-            logits = paged_forward(emb, past, {static_cast<int32_t>(c)}, 0);
+            const ov::Tensor emb  = embed_paged(lane, chunk);
+            const bool       last = past + take == prompt_ids.size();
+            const ov::Tensor out =
+                paged_forward(lane, emb, past, {static_cast<int32_t>(c)}, 0, last);
+            if (last) logits = out;
             if (mtp_ready_) {
-                mtp_prime_paged(paged_req_.get_tensor("hidden_states"), emb, take);
+                mtp_prime_paged(lane, lane.hidden, emb, take);
             }
             past += take;
 
             if (prefix_cache_ != nullptr && past == snap_at &&
-                prefix_cache_->may_accept(estimated_paged_state_bytes())) {
+                prefix_cache_->may_accept(estimated_paged_state_bytes(lane))) {
                 const auto             t_snap = clock::now();
                 PrefixCache::StateBlob blob;
-                const bool             took = snapshot_paged(c, blob);
+                const bool             took = snapshot_paged(lane, c, blob);
                 stats.snapshot_seconds += std::chrono::duration<double>(clock::now() - t_snap)
                                               .count();
-                if (took) prefix_cache_->insert(prompt_ids, past, std::move(blob));
+                if (took) {
+                    // The pages of the prefix travel with the entry, and the
+                    // cache holds its own reference to them: this lane may
+                    // finish and free its table while the other is still using
+                    // the entry.
+                    std::vector<int32_t> kept(
+                        lane.blocks.begin(),
+                        lane.blocks.begin() + static_cast<long>(past / kv_block_tokens_));
+                    pool_->ref(kept);
+                    prefix_cache_->insert(prompt_ids, past, std::move(blob), std::move(kept));
+                }
             }
         }
         stats.prefill_seconds = std::chrono::duration<double>(clock::now() - t_prefill).count();
 
-        int next = pick(sampler, logits);
+        int next = pick(lane, sampler, logits);
 
         const std::vector<int>& eos = tokenizer_->eos_ids();
         auto is_eos = [&](int id) {
@@ -1289,6 +1426,10 @@ private:
         };
 
         // ------------------------------------------------------------- decode
+        //
+        // Prefill did its own waiting, and that is TTFT rather than a stall
+        // between tokens; the accumulator starts clean here.
+        lane.stall_accum             = 0.0;
         stats.decode_forward_seconds = 0.0;
         stats.decode_embed_seconds   = 0.0;
         stats.decode_sample_seconds  = 0.0;
@@ -1299,12 +1440,19 @@ private:
 
         auto commit = [&](int tok, Control& out) {
             if (trace) log::info("trace", "commit pos=%zu tok=%d", past, tok);
+            // One sample per token: the gap a reader feels is the sum of the
+            // waits of every execution that produced this token, not the wait
+            // before one of them.
+            if (lane.stall_accum > 0.0) {
+                lane.stalls.push_back(lane.stall_accum);
+                lane.stall_accum = 0.0;
+            }
             ++stats.completion_tokens;
             const auto t_emit = clock::now();
             out = on_piece(tokenizer_->decode_one(tok), tok);
             stats.decode_emit_seconds += seconds_since_tp(t_emit);
             sampler.observe(tok);
-            if (drafter_ != nullptr) history.push_back(tok);
+            if (drafting_.load()) history.push_back(tok);
             return out == Control::Continue;
         };
 
@@ -1326,26 +1474,42 @@ private:
 
             std::vector<int> drafts;
             if (mtp_ready_ && in.sampler.greedy()) {
-                const int d = mtp_feed(next, true);
+                const int d = mtp_feed(lane, next, true);
                 if (d >= 0) drafts.push_back(d);
-            } else if (drafter_ != nullptr && in.sampler.greedy()) {
+            } else if (drafting_.load() && in.sampler.greedy()) {
                 drafts = drafter_->draft(history, draft_tokens_);
                 if (drafts.size() > drafts_max_) drafts.resize(drafts_max_);
             }
 
+            // One page every kv_block_tokens_ tokens, so the pool lock is
+            // touched once per 16 or 32 decode steps rather than per step.
+            if (!ensure_blocks(lane, past + 1 + drafts_max_)) {
+                log::warn("slot", "KV pool exhausted at %zu tokens; ending the stream",
+                          past);
+                reason = FinishReason::Length;
+                break;
+            }
+
             if (drafts.empty()) {
-                const auto t_emb = clock::now();
-                const ov::Tensor emb1 = embed_paged({next});
-                stats.decode_embed_seconds += seconds_since_tp(t_emb);
+                // Each phase is timed net of what it spent queueing for the
+                // device, so the breakdown adds up to work and the waiting is
+                // reported as waiting.
+                double     waited = lane.stall_accum;
+                const auto t_emb  = clock::now();
+                const ov::Tensor emb1 = embed_paged(lane, {next});
+                stats.decode_embed_seconds +=
+                    seconds_since_tp(t_emb) - (lane.stall_accum - waited);
+                waited           = lane.stall_accum;
                 const auto t_fwd = clock::now();
-                logits = paged_forward(emb1, past, {static_cast<int32_t>(c)}, 0);
-                stats.decode_forward_seconds += seconds_since_tp(t_fwd);
+                logits = paged_forward(lane, emb1, past, {static_cast<int32_t>(c)}, 0);
+                stats.decode_forward_seconds +=
+                    seconds_since_tp(t_fwd) - (lane.stall_accum - waited);
                 ++past;
                 const auto t_smp = clock::now();
-                next = pick(sampler, logits);
+                next = pick(lane, sampler, logits);
                 stats.decode_sample_seconds += seconds_since_tp(t_smp);
                 if (mtp_ready_) {
-                    mtp_set_pending(paged_req_.get_tensor("hidden_states"), 0);
+                    mtp_set_pending(lane, lane.hidden, 0);
                 }
                 continue;
             }
@@ -1363,7 +1527,7 @@ private:
             }
 
             const auto t_verify = clock::now();
-            logits              = paged_forward(embed_paged(seq), past, la_rows, 1);
+            logits = paged_forward(lane, embed_paged(lane, seq), past, la_rows, 1);
             stats.draft_verify_seconds += seconds_since_tp(t_verify);
             stats.draft_proposed += static_cast<int>(drafts.size());
 
@@ -1371,19 +1535,19 @@ private:
             if (rows < seq.size()) {
                 log::warn("draft", "the graph returned %zu logits row(s) for %zu tokens; "
                                    "disabling speculation", rows, seq.size());
-                drafter_.reset();
+                drafting_  = false;
                 mtp_ready_ = false;
                 // the pass advanced the state; its last checkpoint is the truth
                 c = static_cast<size_t>(la_rows.back());
                 past += seq.size();
-                next = pick(sampler, logits);
+                next = pick(lane, sampler, logits);
                 continue;
             }
 
             size_t accepted = 0;
             bool   stop     = false;
             for (size_t i = 0; i < drafts.size(); ++i) {
-                const int want = pick_row(sampler, logits, i);
+                const int want = pick_row(lane, sampler, logits, i);
                 if (trace) {
                     log::info("trace", "verify i=%zu next=%d draft=%d want=%d %s", i, next,
                               drafts[i], want, want == drafts[i] ? "ACCEPT" : "reject");
@@ -1415,17 +1579,17 @@ private:
             }
 
             if (mtp_ready_) {
-                const ov::Tensor hid = paged_req_.get_tensor("hidden_states");
+                const ov::Tensor hid = lane.hidden;
                 for (size_t i = 0; i < accepted; ++i) {
-                    mtp_set_pending(hid, i);
-                    mtp_feed(drafts[i], false);
+                    mtp_set_pending(lane, hid, i);
+                    mtp_feed(lane, drafts[i], false);
                 }
-                mtp_set_pending(hid, accepted);
+                mtp_set_pending(lane, hid, accepted);
             }
 
             c = static_cast<size_t>(la_rows[1 + accepted]);   // promotion
             past += 1 + accepted;
-            next = pick_row(sampler, logits, accepted);
+            next = pick_row(lane, sampler, logits, accepted);
         }
 
         stats.decode_seconds = std::chrono::duration<double>(clock::now() - t_decode).count();
@@ -1491,7 +1655,7 @@ private:
             want_mtp_ = false;
         }
         drafts_max_ = std::max<size_t>(draft_tokens_, want_mtp_ ? 1 : 0);
-        paged_rows_ = drafts_max_ + 3;
+        rows_per_lane_ = drafts_max_ + 3;
         if (cfg.slice_logits) {
             const int64_t keep = static_cast<int64_t>(1 + drafts_max_);
             if (slice_logits_to_last_token(model, keep)) {
@@ -1526,22 +1690,33 @@ private:
                   device.c_str());
         auto t0      = std::chrono::steady_clock::now();
         paged_model_ = core_.compile_model(model, device, props);
-        paged_req_   = paged_model_.create_infer_request();
         const size_t resident_base = device_resident_bytes(device);
         log::info("load", "paged model ready in %.1f s; device-resident %.2f GiB",
                   seconds_since(t0), static_cast<double>(resident_base) / (1u << 30));
 
+        // One InferRequest per lane, all from the one CompiledModel. Weights are
+        // NOT duplicated by this (measured 2026-08-29: a second request adds
+        // activations, a second *compile* adds 0.791 GiB of weights, §7.0.2),
+        // which is the whole reason a second lane is affordable at all.
+        for (int i = 0; i < lane_count_; ++i) {
+            lanes_.push_back(std::make_unique<Lane>());
+            lanes_.back()->index = i;
+            lanes_.back()->req   = paged_model_.create_infer_request();
+        }
+
         embeddings_ = core_.compile_model(artifact_.text_embeddings_xml, emb_dev);
-        embed_req_  = embeddings_.create_infer_request();
+        for (auto& lane : lanes_) lane->embed = embeddings_.create_infer_request();
         log::info("load", "embeddings on %s", emb_dev.c_str());
 
         if (want_mtp_) {
             try {
-                mtp_layer_    = core_.compile_model(artifact_.mtp_layer_xml, mtp_dev);
-                mtp_head_     = core_.compile_model(artifact_.mtp_lm_head_xml, mtp_dev);
-                mtp_req_      = mtp_layer_.create_infer_request();
-                mtp_head_req_ = mtp_head_.create_infer_request();
-                mtp_ready_    = true;
+                mtp_layer_ = core_.compile_model(artifact_.mtp_layer_xml, mtp_dev);
+                mtp_head_  = core_.compile_model(artifact_.mtp_lm_head_xml, mtp_dev);
+                for (auto& lane : lanes_) {
+                    lane->mtp_layer = mtp_layer_.create_infer_request();
+                    lane->mtp_head  = mtp_head_.create_infer_request();
+                }
+                mtp_ready_ = true;
                 log::info("mtp", "head on %s, drafting one token per step", mtp_dev.c_str());
             } catch (const std::exception& e) {
                 log::warn("mtp", "could not load the MTP head, continuing without it: %s",
@@ -1589,15 +1764,9 @@ private:
             la_row_bytes_ += n;
         }
 
-        // ---- allocate the state tables (rows) --------------------------------
+        // ---- allocate the state tables (rows), per lane ----------------------
         ov::RemoteContext rctx = core_.get_default_context(device);
-        for (size_t i = 0; i < la_state_names_.size(); ++i) {
-            ov::Shape sh = la_state_shapes_[i];
-            sh[0]        = paged_rows_;
-            ov::RemoteTensor t = rctx.create_tensor(ov::element::f16, sh);
-            paged_req_.set_tensor(la_state_names_[i], t);
-            la_state_tensors_.push_back(t);
-        }
+        for (auto& lane : lanes_) alloc_la_rows(rctx, *lane);
 
         // ---- reservation: measure the activation peak with a probe pool ------
         //
@@ -1605,10 +1774,19 @@ private:
         // linear in the chunk), so when the requested n_ctx does not fit at the
         // configured chunk, the engine halves the chunk and RE-MEASURES rather
         // than refusing outright. Refusal is what remains when the floor is hit.
+        //
+        // With N lanes every per-sequence term is paid N times: activations,
+        // GDN checkpoint rows and KV. The weights are paid once, because the
+        // lanes share one CompiledModel. Nothing here assumes the factor is N —
+        // each lane's request is probed in turn and its own increment measured,
+        // which is the only way to find out whether the plugin's per-request
+        // buffers really do cost what a first lane cost.
+        Lane&        lane0  = *lanes_[0];
         const size_t total  = core_.get_property(device, ov::intel_gpu::device_total_mem_size);
-        const size_t slab   = la_row_bytes_ * paged_rows_;
+        const size_t slab   = la_row_bytes_ * rows_per_lane_;   // per lane
         const size_t margin = 256ull << 20;
         const int    wanted = req_n_ctx > 0 ? req_n_ctx : artifact_.n_ctx_train;
+        const int    lanes  = lane_count_;
 
         // Probe SMALL first -- a probe at the configured chunk can itself OOM on
         // a tight card (observed on the A770: sometimes the driver spills,
@@ -1616,78 +1794,183 @@ private:
         // in the chunk (§7.0.2a), so a 128-token probe fixes the slope, the
         // largest admissible chunk is computed, and one guarded probe verifies
         // it, stepping down on failure instead of dying.
-        auto probe = [&](size_t chunk_tokens) -> long long {
+        size_t probe_pool_blocks = 0;
+        auto probe = [&](Lane& lane, size_t chunk_tokens) -> long long {
             const size_t probe_blocks =
                 (chunk_tokens + kv_block_tokens_ - 1) / kv_block_tokens_ + 1;
-            alloc_kv_pools(rctx, probe_blocks);
-            zero_paged_rows();
+            if (probe_blocks != probe_pool_blocks) {
+                alloc_kv_pools(rctx, probe_blocks);
+                probe_pool_blocks = probe_blocks;
+            }
+            lane.blocks.resize(probe_blocks);
+            for (size_t i = 0; i < probe_blocks; ++i) lane.blocks[i] = static_cast<int32_t>(i);
+            zero_paged_rows(lane);
             std::vector<int> zeros(chunk_tokens, 0);
-            paged_forward(embed_paged(zeros), 0, {0, 0}, 0);
-            return static_cast<long long>(device_resident_bytes(device)) -
-                   static_cast<long long>(resident_base) - static_cast<long long>(slab) -
+            const long long before = static_cast<long long>(device_resident_bytes(device));
+            paged_forward(lane, embed_paged(lane, zeros), 0, {0, 0}, 0);
+            const long long after = static_cast<long long>(device_resident_bytes(device));
+            lane.blocks.clear();
+            (void)before;
+            return after - static_cast<long long>(resident_base) -
+                   static_cast<long long>(slab) * lanes -
                    static_cast<long long>(probe_blocks * kv_block_bytes);
         };
-        const long long act128 = probe(128);
-        const double    slope  = static_cast<double>(std::max<long long>(act128, 1)) / 128.0;
-
-        // A configured chunk wins whenever it is admissible -- including one
-        // smaller than the 128-token probe (the cache grid may demand it). Only
-        // an INADMISSIBLE configuration is shrunk, never a valid one changed.
+        // The peak is affine in the chunk, not linear from the origin: measured
+        // on the A770, 0.62 GiB at 128 tokens and 0.77 at 256, so most of it is
+        // a fixed cost that a single probe smears into a slope and then charges
+        // again for every token.
+        //
+        // Probing UPWARD matters, and the reason is a property of the plugin
+        // rather than a preference: its intermediate pool grows to the largest
+        // shape it has ever seen and never shrinks, so an over-large probe is a
+        // permanent tax that no later, smaller probe can undo. Measured the hard
+        // way on the A770, 2026-08-29: predicting straight to chunk 1024 left
+        // 1.87 GiB resident and a budget of zero, i.e. a card that could serve
+        // nothing because of a measurement. So each step up is taken only when
+        // the fit says it fits WITH headroom, and the fit is re-made from the
+        // two most recent measurements as it climbs.
         const size_t configured = prefill_chunk_ > 0 ? static_cast<size_t>(prefill_chunk_) : 512;
         const size_t floor_c    = std::min<size_t>(configured, 128);
-        size_t       chunk      = floor_c;
-        for (size_t c = configured; c >= floor_c; c = c > floor_c ? std::max(c / 2, floor_c)
-                                                                  : floor_c - 1) {
-            const long long need = static_cast<long long>(resident_base) +
-                                   static_cast<long long>(slab) +
-                                   static_cast<long long>(margin) +
-                                   static_cast<long long>(slope * static_cast<double>(c)) +
-                                   static_cast<long long>(wanted) *
-                                       static_cast<long long>(kv_bytes_token_);
-            if (need <= static_cast<long long>(total)) { chunk = c; break; }
-            if (c == floor_c) break;
-        }
-        long long activation = act128;
-        while (chunk > 128) {
-            try {
-                activation = probe(chunk);
-                break;
-            } catch (const std::exception& e) {
-                log::warn("load", "probe at chunk %zu failed (%s); stepping down", chunk,
-                          e.what());
-                paged_req_ = paged_model_.create_infer_request();
-                for (size_t i = 0; i < la_state_names_.size(); ++i) {
-                    paged_req_.set_tensor(la_state_names_[i], la_state_tensors_[i]);
-                }
-                chunk /= 2;
+
+        long long act128 = 0;
+        long long extra128 = 0;
+        double    slope_extra = 0.0;
+        {
+            act128 = probe(lane0, floor_c);
+            // What a SECOND lane costs, measured rather than assumed to be
+            // another full peak. On the B60 with the coder it costs nothing:
+            // the plugin pools intermediates per compiled model, not per
+            // request. Pricing an imaginary second peak would halve the chunk
+            // and with it prefill throughput.
+            for (size_t i = 1; i < lanes_.size(); ++i) {
+                const long long before = static_cast<long long>(device_resident_bytes(device));
+                probe(*lanes_[i], floor_c);
+                const long long added =
+                    static_cast<long long>(device_resident_bytes(device)) - before;
+                extra128 += std::max<long long>(added, 0);
+            }
+            slope_extra = static_cast<double>(extra128) / static_cast<double>(floor_c);
+            if (lanes > 1) {
+                log::info("load",
+                          "lane activations at a %zu-token probe: lane 0 %.3f GiB, the other %d "
+                          "lane(s) %.3f GiB together (the plugin pools intermediates per compiled "
+                          "model, so this is measured rather than multiplied)",
+                          floor_c, static_cast<double>(act128) / (1u << 30), lanes - 1,
+                          static_cast<double>(extra128) / (1u << 30));
             }
         }
-        if (chunk == 128) activation = act128;
+
+        // Everything that is not activations, and does not move with the chunk.
+        const long long fixed = static_cast<long long>(resident_base) +
+                                static_cast<long long>(margin) +
+                                static_cast<long long>(lanes) *
+                                    (static_cast<long long>(slab) +
+                                     static_cast<long long>(wanted) *
+                                         static_cast<long long>(kv_bytes_token_));
+        // A prediction that lands 11% low was measured; a quarter of headroom
+        // buys the step back without giving up the climb.
+        const double kHeadroom = 1.25;
+
+        size_t    chunk      = floor_c;
+        long long activation = act128;
+        double    slope      = static_cast<double>(std::max<long long>(act128, 1)) /
+                          static_cast<double>(floor_c);
+        double    intercept  = 0.0;
+
+        while (chunk * 2 <= configured) {
+            const size_t next      = chunk * 2;
+            const double predicted = intercept + (slope + slope_extra) *
+                                                     static_cast<double>(next);
+            if (fixed + static_cast<long long>(predicted * kHeadroom) >
+                static_cast<long long>(total)) {
+                break;
+            }
+            long long measured = 0;
+            try {
+                measured = probe(lane0, next);
+            } catch (const std::exception& e) {
+                log::warn("load", "probe at chunk %zu failed (%s); staying at %zu", next,
+                          e.what(), chunk);
+                reset_lane_request(lane0);
+                break;
+            }
+            if (fixed + measured > static_cast<long long>(total)) {
+                // Overshot despite the headroom. The pool has already grown, so
+                // this is reported rather than hidden: the budget below uses the
+                // measurement, and n_ctx is clamped or refused with it.
+                log::warn("load",
+                          "chunk %zu measured %.2f GiB of activations, more than the fit "
+                          "predicted (%.2f); the plugin's pool does not shrink, so this is what "
+                          "the reservation must now live with",
+                          next, static_cast<double>(measured) / (1u << 30),
+                          predicted / static_cast<double>(1u << 30));
+                chunk      = next;
+                activation = measured;
+                break;
+            }
+            // Re-fit from the two most recent points: the line gets truer the
+            // closer it is to where it is being used.
+            if (measured > activation) {
+                slope     = static_cast<double>(measured - activation) /
+                        static_cast<double>(next - chunk);
+                intercept = static_cast<double>(measured) - slope * static_cast<double>(next);
+            }
+            chunk      = next;
+            activation = measured;
+        }
+        log::info("load", "activation fit: %.3f GiB fixed + %.1f KiB per chunk token; served "
+                          "chunk %zu measured %.2f GiB",
+                  intercept / static_cast<double>(1u << 30), slope / 1024.0, chunk,
+                  static_cast<double>(activation) / (1u << 30));
+
+        // The other lanes again, now at the chunk that will actually be served:
+        // whatever they add on top of lane 0's peak is what the budget below
+        // pays for.
+        long long activation_total = activation;
+        for (size_t i = 1; i < lanes_.size(); ++i) {
+            const long long before = static_cast<long long>(device_resident_bytes(device));
+            probe(*lanes_[i], chunk);
+            const long long added = static_cast<long long>(device_resident_bytes(device)) - before;
+            activation_total += std::max<long long>(added, 0);
+            log::info("load", "lane %zu adds %.2f GiB of activations at chunk %zu (lane 0 "
+                              "measured %.2f)",
+                      i, static_cast<double>(added) / (1u << 30), chunk,
+                      static_cast<double>(activation) / (1u << 30));
+        }
+
         const long long budget = static_cast<long long>(total) -
                                  static_cast<long long>(resident_base) -
-                                 static_cast<long long>(slab) - activation -
+                                 static_cast<long long>(slab) * lanes - activation_total -
                                  static_cast<long long>(margin);
-        long long max_ctx = budget > 0 ? budget / static_cast<long long>(kv_bytes_token_) : 0;
+        // Per lane: the pool is shared, but every lane must be able to reach
+        // n_ctx at the same time, which is what "two lanes of 30k" means.
+        long long max_ctx = budget > 0 ? budget / static_cast<long long>(kv_bytes_token_) / lanes
+                                       : 0;
         max_ctx = (max_ctx / static_cast<long long>(kv_block_tokens_)) *
                   static_cast<long long>(kv_block_tokens_);
         log::info("load",
-                  "reservation: weights+graph %.2f GiB, activation peak %.2f GiB at chunk %zu "
-                  "(slope from a 128-token probe), LA slab %.1f MiB, KV %.1f KiB/token, margin "
-                  "0.25 GiB -> max ctx %lld",
+                  "reservation: weights+graph %.2f GiB + activations %.2f (all %d lane%s, chunk "
+                  "%zu) + margin 0.25 + %d x (GDN rows %.1f MiB + KV %.1f KiB/token) of %.2f "
+                  "GiB -> max ctx %lld per lane",
                   static_cast<double>(resident_base) / (1u << 30),
-                  static_cast<double>(activation) / (1u << 30), chunk,
+                  static_cast<double>(activation_total) / (1u << 30), lanes,
+                  lanes == 1 ? "" : "s", chunk, lanes,
                   static_cast<double>(slab) / (1u << 20),
-                  static_cast<double>(kv_bytes_token_) / 1024.0, max_ctx);
+                  static_cast<double>(kv_bytes_token_) / 1024.0,
+                  static_cast<double>(total) / (1u << 30), max_ctx);
         prefill_chunk_ = static_cast<int>(chunk);
 
         if (static_cast<long long>(wanted) > max_ctx) {
             if (req_n_ctx > 0) {
                 throw std::runtime_error(log::format(
-                    "requested n_ctx %d needs %.2f GiB of KV but the reservation admits %lld "
-                    "(weights %.2f + activations %.2f + state %.3f + margin 0.25 of %.2f GiB)",
-                    wanted, static_cast<double>(wanted) * kv_bytes_token_ / (1u << 30), max_ctx,
+                    "requested n_ctx %d on %d lane%s needs %.2f GiB of KV but the reservation "
+                    "admits %lld per lane (weights %.2f + activations %.2f + margin 0.25 + %d x "
+                    "state %.3f of %.2f GiB). Lower --n-ctx, lower --parallel, or lower "
+                    "--prefill-chunk.",
+                    wanted, lanes, lanes == 1 ? "" : "s",
+                    static_cast<double>(wanted) * kv_bytes_token_ * lanes / (1u << 30), max_ctx,
                     static_cast<double>(resident_base) / (1u << 30),
-                    static_cast<double>(activation) / (1u << 30),
+                    static_cast<double>(activation_total) / (1u << 30), lanes,
                     static_cast<double>(slab) / (1u << 30),
                     static_cast<double>(total) / (1u << 30)));
             }
@@ -1696,85 +1979,253 @@ private:
         }
         paged_n_ctx_ = static_cast<int>(std::min<long long>(wanted, max_ctx));
 
-        const size_t blocks =
+        // lanes x n_ctx of live pages, plus headroom for cached prefixes — but
+        // only as much headroom as the prefix cache could ever hold references
+        // to. Its host-side budget bounds how many entries exist, each entry
+        // maps at most one lane's worth of pages, and pages nothing can point at
+        // are just VRAM taken off the card for nothing.
+        const size_t per_lane_blocks =
             (static_cast<size_t>(paged_n_ctx_) + drafts_max_ + kv_block_tokens_ - 1) /
                 kv_block_tokens_ + 2;
+        const size_t live_blocks = per_lane_blocks * static_cast<size_t>(lanes);
+        size_t       blocks      = live_blocks;
+        if (budget > 0 && prefix_cache_ != nullptr) {
+            const size_t affordable = static_cast<size_t>(budget) / kv_block_bytes;
+            const size_t entries =
+                std::max<size_t>(1, prefix_cache_->budget_bytes() /
+                                        std::max<size_t>(la_row_bytes_, 1));
+            const size_t wanted_spare = entries * per_lane_blocks;
+            const size_t spare_room   = affordable > live_blocks ? affordable - live_blocks : 0;
+            blocks += std::min(spare_room, wanted_spare);
+        }
         alloc_kv_pools(rctx, blocks);
-        log::info("load", "paged pools: %zu blocks x %zu tokens (%.2f GiB KV), %zu LA rows",
+        pool_ = std::make_unique<BlockPool>(blocks);
+        if (prefix_cache_ != nullptr) {
+            BlockPool* pool = pool_.get();
+            prefix_cache_->set_release(
+                [pool](const std::vector<int32_t>& b) { pool->release(b); });
+        }
+        log::info("load",
+                  "paged pool: %zu pages x %zu tokens (%.2f GiB KV) = %zu per lane x %d lane%s "
+                  "+ %zu spare for cached prefixes | %zu GDN rows per lane",
                   blocks, kv_block_tokens_,
-                  static_cast<double>(blocks * kv_block_bytes) / (1u << 30), paged_rows_);
+                  static_cast<double>(blocks * kv_block_bytes) / (1u << 30), per_lane_blocks,
+                  lanes, lanes == 1 ? "" : "s", blocks - live_blocks, rows_per_lane_);
+
+        status_.reservation.measured           = true;
+        status_.reservation.device_total_bytes = total;
+        status_.reservation.weights_bytes      = resident_base;
+        // Reported as the total for all lanes, because that is what it is: the
+        // plugin's intermediate pool is per compiled model. Dividing it by the
+        // lane count would invent a per-lane cost that nobody pays.
+        status_.reservation.activation_bytes = static_cast<uint64_t>(activation_total);
+        status_.reservation.la_slab_bytes      = slab;
+        status_.reservation.kv_bytes_per_token = kv_bytes_token_;
+        status_.reservation.margin_bytes       = margin;
+        status_.reservation.pool_blocks        = blocks;
+        status_.reservation.kv_block_tokens    = static_cast<int>(kv_block_tokens_);
+        status_.reservation.lanes              = lanes;
+        status_.reservation.prefill_chunk      = prefill_chunk_;
+        status_.reservation.n_ctx              = paged_n_ctx_;
     }
 
+    // The KV pool is one allocation shared by every lane: pages are handed out
+    // by the block pool, and each lane's block table says which are its own.
+    // Every lane's request is bound to the same tensors, which is exactly what
+    // makes a prefix hit across lanes free.
     void alloc_kv_pools(ov::RemoteContext& rctx, size_t blocks) {
         kv_pool_tensors_.clear();
         for (size_t i = 0; i < kv_pool_names_.size(); ++i) {
             ov::Shape sh = kv_pool_shapes_[i];
             sh[0]        = blocks;
             ov::RemoteTensor t = rctx.create_tensor(kv_pool_types_[i], sh);
-            paged_req_.set_tensor(kv_pool_names_[i], t);
             kv_pool_tensors_.push_back(t);
         }
+        for (auto& lane : lanes_) bind_kv_pools(*lane);
     }
 
-    void zero_paged_rows() {
-        for (size_t i = 0; i < la_state_tensors_.size(); ++i) {
-            ov::Shape sh = la_state_shapes_[i];
-            sh[0]        = paged_rows_;
-            ov::Tensor z(ov::element::f16, sh);
-            std::memset(z.data(), 0, z.get_byte_size());
-            z.copy_to(la_state_tensors_[i]);
+    // A probe that hit the card's limit leaves its request in an unknown state;
+    // a fresh one, rebound to this lane's own tensors, is the cheapest way back.
+    void reset_lane_request(Lane& lane) {
+        // The scratch block table of a probe that threw would otherwise survive
+        // into the first real request, naming pages the BlockPool (created
+        // later) still believes are free — two sequences on one KV page.
+        lane.blocks.clear();
+        lane.req = paged_model_.create_infer_request();
+        for (size_t i = 0; i < la_state_names_.size(); ++i) {
+            lane.req.set_tensor(la_state_names_[i], lane.la_tensors[i]);
+        }
+        bind_kv_pools(lane);
+    }
+
+    void bind_kv_pools(Lane& lane) {
+        for (size_t i = 0; i < kv_pool_names_.size(); ++i) {
+            lane.req.set_tensor(kv_pool_names_[i], kv_pool_tensors_[i]);
         }
     }
 
-    std::vector<std::vector<uint8_t>> read_paged_row(size_t row) {
+    // The GDN checkpoint rows are per lane rather than a window into one shared
+    // table, and the reason is right below: a row write stages the whole tensor
+    // host-side and copies it back, so two lanes sharing one tensor would zero
+    // each other's rows on every prefix-cache restore.
+    void alloc_la_rows(ov::RemoteContext& rctx, Lane& lane) {
+        lane.la_tensors.clear();
+        for (size_t i = 0; i < la_state_names_.size(); ++i) {
+            ov::Shape sh = la_state_shapes_[i];
+            sh[0]        = rows_per_lane_;
+            ov::RemoteTensor t = rctx.create_tensor(ov::element::f16, sh);
+            lane.req.set_tensor(la_state_names_[i], t);
+            lane.la_tensors.push_back(t);
+        }
+    }
+
+    void zero_paged_rows(Lane& lane) {
+        for (size_t i = 0; i < lane.la_tensors.size(); ++i) {
+            ov::Shape sh = la_state_shapes_[i];
+            sh[0]        = rows_per_lane_;
+            ov::Tensor z(ov::element::f16, sh);
+            std::memset(z.data(), 0, z.get_byte_size());
+            z.copy_to(lane.la_tensors[i]);
+        }
+    }
+
+    std::vector<std::vector<uint8_t>> read_paged_row(Lane& lane, size_t row) {
         std::vector<std::vector<uint8_t>> out;
-        for (size_t i = 0; i < la_state_tensors_.size(); ++i) {
+        for (size_t i = 0; i < lane.la_tensors.size(); ++i) {
             ov::Shape full = la_state_shapes_[i];
-            full[0]        = paged_rows_;
+            full[0]        = rows_per_lane_;
             ov::Tensor host(ov::element::f16, full);
-            la_state_tensors_[i].copy_to(host);
-            const size_t row_bytes = host.get_byte_size() / paged_rows_;
+            lane.la_tensors[i].copy_to(host);
+            const size_t row_bytes = host.get_byte_size() / rows_per_lane_;
             const uint8_t* base = static_cast<const uint8_t*>(host.data()) + row * row_bytes;
             out.emplace_back(base, base + row_bytes);
         }
         return out;
     }
 
-    void write_paged_row(size_t row, const std::vector<std::vector<uint8_t>>& blobs) {
-        for (size_t i = 0; i < la_state_tensors_.size(); ++i) {
+    void write_paged_row(Lane& lane, size_t row, const std::vector<std::vector<uint8_t>>& blobs) {
+        for (size_t i = 0; i < lane.la_tensors.size(); ++i) {
             ov::Shape full = la_state_shapes_[i];
-            full[0]        = paged_rows_;
+            full[0]        = rows_per_lane_;
             ov::Tensor host(ov::element::f16, full);
             std::memset(host.data(), 0, host.get_byte_size());
-            const size_t row_bytes = host.get_byte_size() / paged_rows_;
+            const size_t row_bytes = host.get_byte_size() / rows_per_lane_;
             if (blobs[i].size() != row_bytes) throw std::runtime_error("row blob size mismatch");
             std::memcpy(static_cast<uint8_t*>(host.data()) + row * row_bytes, blobs[i].data(),
                         row_bytes);
-            host.copy_to(la_state_tensors_[i]);
+            host.copy_to(lane.la_tensors[i]);
         }
     }
 
+    // --------------------------------------------------------- KV page table
+    //
+    // Grows the lane's block table so it covers `tokens`. Pages come from the
+    // shared pool; when it is dry, cached prefixes are dropped first, because a
+    // cached page is reclaimable and a live sequence's is not (§3.3). Only when
+    // even that is not enough does this fail, and it fails as a clean end of
+    // stream rather than as an allocation error on the card.
+    bool ensure_blocks(Lane& lane, size_t tokens) {
+        const size_t want = (tokens + kv_block_tokens_ - 1) / kv_block_tokens_ + 1;
+        if (lane.blocks.size() >= want) return true;
+        const size_t need = want - lane.blocks.size();
+
+        std::vector<int32_t> fresh = pool_->allocate(need);
+        while (fresh.empty() && prefix_cache_ != nullptr && prefix_cache_->evict_oldest()) {
+            fresh = pool_->allocate(need);
+        }
+        if (fresh.empty()) return false;
+        lane.blocks.insert(lane.blocks.end(), fresh.begin(), fresh.end());
+        return true;
+    }
+
+    void release_lane(Lane& lane) {
+        // pool_ can still be null here: a probe that threw during load leaves a
+        // lane holding its scratch block table, and the destructor runs anyway.
+        if (pool_ != nullptr && !lane.blocks.empty()) pool_->release(lane.blocks);
+        lane.blocks.clear();
+        lane.hit_keep.reset();
+    }
+
+    // The lane's pages and its stall record belong to one request. This puts
+    // both back however the request leaves — return, stop sequence, client
+    // disconnect, or an exception out of the graph.
+    struct LaneReset {
+        LaneReset(OvBackend& backend, Lane& lane, GenerationStats& stats)
+            : backend_(backend), lane_(lane), stats_(stats) {
+            lane_.blocks.clear();   // nothing survives from a previous request
+            lane_.stalls.clear();
+            lane_.stall_accum = 0.0;
+            lane_.stats       = &stats;
+        }
+        ~LaneReset() {
+            backend_.release_lane(lane_);
+            std::vector<double>& w = lane_.stalls;
+            if (!w.empty()) {
+                std::sort(w.begin(), w.end());
+                stats_.stalled_steps = static_cast<int>(w.size());
+                stats_.stall_max_seconds = w.back();
+                stats_.stall_p95_seconds =
+                    w[std::min(w.size() - 1, static_cast<size_t>(0.95 * w.size()))];
+                double total = 0.0;
+                for (double x : w) total += x;
+                stats_.stall_total_seconds = total;
+                stats_.decode_wait_seconds = total;
+            }
+            lane_.stats = nullptr;
+            w.clear();
+        }
+        LaneReset(const LaneReset&)            = delete;
+        LaneReset& operator=(const LaneReset&) = delete;
+
+        OvBackend&       backend_;
+        Lane&            lane_;
+        GenerationStats& stats_;
+    };
+
     // Embeddings as a host [n, hidden] f32 tensor (the paged graph's input
     // layout, and the head's food -- it crosses host memory either way).
-    ov::Tensor embed_paged(const std::vector<int>& ids) {
+    ov::Tensor embed_paged(Lane& lane, const std::vector<int>& ids) {
         const size_t n = ids.size();
         ov::Tensor id_tensor(ov::element::i64, ov::Shape{1, n});
         int64_t*   idp = id_tensor.data<int64_t>();
         for (size_t i = 0; i < n; ++i) idp[i] = ids[i];
-        embed_req_.set_input_tensor(id_tensor);
-        embed_req_.infer();
-        const ov::Tensor src   = embed_req_.get_output_tensor(0);
+        lane.embed.set_input_tensor(id_tensor);
+        return with_turn(lane, [&] { return embed_take(lane, n); });
+    }
+
+    ov::Tensor embed_take(Lane& lane, size_t n) {
+        lane.embed.infer();
+        const ov::Tensor src   = lane.embed.get_output_tensor(0);
         const size_t     width = src.get_shape().back();
         ov::Tensor out(ov::element::f32, ov::Shape{n, width});
         std::memcpy(out.data(), src.data(), src.get_byte_size());
         return out;
     }
 
-    // One pass over the paged graph. `la_rows` is [committed] for in-place
-    // (interval 0, duplicated to two entries) or [committed, s0..sk] with
-    // interval 1 for a checkpointing verify pass.
-    ov::Tensor paged_forward(const ov::Tensor& embeds, size_t past,
-                             std::vector<int32_t> la_rows, int interval) {
+    // One pass over the paged graph, for one lane. `la_rows` is [committed] for
+    // in-place (interval 0, duplicated to two entries) or [committed, s0..sk]
+    // with interval 1 for a checkpointing verify pass; both are lane-relative
+    // and are translated to the lane's own rows here, so nothing above this
+    // line has to know that another lane exists.
+    //
+    // The KV block table comes from the lane too: physical pages, in logical
+    // order, from the shared pool. Before M6 it was the identity map 0..n,
+    // which is the one thing that made two sequences impossible.
+    //
+    // The device runs one execution at a time whatever the host does, so the
+    // turnstile does not serialise anything that was parallel — it decides the
+    // *order*, and measures what the other lane cost this one (§4.1).
+    //
+    // `want_logits` says whether the caller is going to read the logits at all.
+    // A prefill chunk that is not the last one is never sampled from, and
+    // reading that output back costs ~165 ms per chunk on this plugin (measured
+    // 2026-08-29: prefill 1644 -> 1290 t/s at 30k depth when every chunk was
+    // read, decode unchanged). So the copy happens exactly where the value is
+    // consumed, which is also the only place it needs protecting from the
+    // other lane.
+    ov::Tensor paged_forward(Lane& lane, const ov::Tensor& embeds, size_t past,
+                             std::vector<int32_t> la_rows, int interval,
+                             bool want_logits = true) {
         const size_t n   = embeds.get_shape()[0];
         const size_t tot = past + n;
         const size_t nblk = (tot + kv_block_tokens_ - 1) / kv_block_tokens_;
@@ -1791,36 +2242,70 @@ private:
         for (size_t sct = 0; sct < paged_sections_; ++sct) {
             for (size_t i = 0; i < n; ++i) pp[sct * n + i] = static_cast<int64_t>(past + i);
         }
-        std::vector<int32_t> blocks(nblk);
-        for (size_t i = 0; i < nblk; ++i) blocks[i] = static_cast<int32_t>(i);
+        if (lane.blocks.size() < nblk) {
+            throw std::runtime_error(log::format(
+                "lane %d has %zu KV page(s) for %zu token(s)", lane.index, lane.blocks.size(),
+                tot));
+        }
+        std::vector<int32_t> blocks(lane.blocks.begin(),
+                                    lane.blocks.begin() + static_cast<long>(nblk));
 
-        paged_req_.set_tensor(kInputsEmbeds, embeds);
-        paged_req_.set_tensor(kPositionIds, pos);
-        paged_req_.set_tensor("past_lens", i32({static_cast<int32_t>(past)}));
-        paged_req_.set_tensor("subsequence_begins", i32({0, static_cast<int32_t>(n)}));
-        paged_req_.set_tensor("block_indices", i32(blocks));
-        paged_req_.set_tensor("block_indices_begins", i32({0, static_cast<int32_t>(nblk)}));
+        lane.req.set_tensor(kInputsEmbeds, embeds);
+        lane.req.set_tensor(kPositionIds, pos);
+        lane.req.set_tensor("past_lens", i32({static_cast<int32_t>(past)}));
+        lane.req.set_tensor("subsequence_begins", i32({0, static_cast<int32_t>(n)}));
+        lane.req.set_tensor("block_indices", i32(blocks));
+        lane.req.set_tensor("block_indices_begins", i32({0, static_cast<int32_t>(nblk)}));
         ov::Tensor mcl(ov::element::i32, ov::Shape{});
         *mcl.data<int32_t>() = static_cast<int32_t>(tot);
-        paged_req_.set_tensor("max_context_len", mcl);
-        paged_req_.set_tensor("la.block_indices", i32(la_rows));
-        paged_req_.set_tensor("la.block_indices_begins",
-                              i32({0, static_cast<int32_t>(la_rows.size())}));
-        paged_req_.set_tensor("la.past_lens", i32({static_cast<int32_t>(past)}));
-        paged_req_.set_tensor("la.cache_interval", i32({interval}));
-        paged_req_.infer();
-        return paged_req_.get_tensor("logits");
+        lane.req.set_tensor("max_context_len", mcl);
+        lane.req.set_tensor("la.block_indices", i32(la_rows));
+        lane.req.set_tensor("la.block_indices_begins",
+                            i32({0, static_cast<int32_t>(la_rows.size())}));
+        lane.req.set_tensor("la.past_lens", i32({static_cast<int32_t>(past)}));
+        lane.req.set_tensor("la.cache_interval", i32({interval}));
+        with_turn(lane, [&] {
+            lane.req.infer();
+            if (want_logits) copy_out(lane.req.get_tensor("logits"), lane.logits);
+            if (mtp_ready_) copy_out(lane.req.get_tensor("hidden_states"), lane.hidden);
+        });
+        return lane.logits;
+    }
+
+    // Every execution of a shared CompiledModel goes through here, and so does
+    // every read of its output. The plugin pools intermediate buffers per
+    // compiled model rather than per request (§7.2), so an output tensor is only
+    // valid until the next execution on that model *by anyone* — which makes
+    // this the boundary of correctness, not just of fairness. It applies to the
+    // embeddings gather and the MTP head as much as to the language model: they
+    // are shared compiled models too.
+    template <typename F>
+    auto with_turn(Lane& lane, F&& body) -> decltype(body()) {
+        Turnstile::Turn turn = gate_.take();
+        lane.stall_accum += turn.waited_seconds();
+        return body();
+    }
+
+    // Into a tensor the lane owns, reshaping only when the graph's dynamic
+    // output changes shape (one row for a decode step, 1+k for a verify pass).
+    static void copy_out(const ov::Tensor& src, ov::Tensor& dst) {
+        if (!dst || dst.get_shape() != src.get_shape() ||
+            dst.get_element_type() != src.get_element_type()) {
+            dst = ov::Tensor(src.get_element_type(), src.get_shape());
+        }
+        std::memcpy(dst.data(), src.data(), src.get_byte_size());
     }
 
     // Batched head priming over one prefill chunk: pairs (h_t, x_{t+1}) within
-    // the chunk, the chunk-boundary pair carried through mtp_pending_.
-    void mtp_prime_paged(const ov::Tensor& hidden, const ov::Tensor& embeds, size_t take) {
+    // the chunk, the chunk-boundary pair carried through the lane's pending row.
+    void mtp_prime_paged(Lane& lane, const ov::Tensor& hidden, const ov::Tensor& embeds,
+                         size_t take) {
         if (!mtp_ready_ || take == 0) return;
         try {
             const size_t width  = hidden.get_shape().back();
-            const bool   carry  = mtp_has_pending_;
+            const bool   carry  = lane.mtp_has_pending;
             const size_t pairs  = (take - 1) + (carry ? 1 : 0);
-            if (pairs == 0) { mtp_set_pending(hidden, take - 1); return; }
+            if (pairs == 0) { mtp_set_pending(lane, hidden, take - 1); return; }
 
             ov::Tensor h(ov::element::f32, ov::Shape{1, pairs, width});
             ov::Tensor e(ov::element::f32, ov::Shape{1, pairs, width});
@@ -1830,7 +2315,7 @@ private:
             const float* ev = embeds.data<const float>();
             size_t r = 0;
             if (carry) {
-                std::memcpy(hp, mtp_pending_.data(), width * 4);
+                std::memcpy(hp, lane.mtp_pending.data(), width * 4);
                 std::memcpy(ep, ev, width * 4);
                 ++r;
             }
@@ -1841,28 +2326,28 @@ private:
 
             ov::Tensor pos(ov::element::f32, ov::Shape{1, pairs});
             for (size_t i = 0; i < pairs; ++i) {
-                pos.data<float>()[i] = static_cast<float>(mtp_pos_ + i);
+                pos.data<float>()[i] = static_cast<float>(lane.mtp_pos + i);
             }
-            ov::Tensor mask(ov::element::f32, ov::Shape{1, 1, pairs, mtp_len_ + pairs});
+            ov::Tensor mask(ov::element::f32, ov::Shape{1, 1, pairs, lane.mtp_len + pairs});
             float* mp = mask.data<float>();
-            std::fill_n(mp, pairs * (mtp_len_ + pairs), 0.0f);
+            std::fill_n(mp, pairs * (lane.mtp_len + pairs), 0.0f);
             for (size_t i = 0; i < pairs; ++i) {
-                for (size_t j = mtp_len_ + i + 1; j < mtp_len_ + pairs; ++j) {
-                    mp[i * (mtp_len_ + pairs) + j] = -std::numeric_limits<float>::infinity();
+                for (size_t j = lane.mtp_len + i + 1; j < lane.mtp_len + pairs; ++j) {
+                    mp[i * (lane.mtp_len + pairs) + j] = -std::numeric_limits<float>::infinity();
                 }
             }
             ov::Tensor beam(ov::element::i32, ov::Shape{1});
             beam.data<int32_t>()[0] = 0;
-            mtp_req_.set_tensor("hidden_states", h);
-            mtp_req_.set_tensor("input_embeds", e);
-            mtp_req_.set_tensor("position_ids", pos);
-            mtp_req_.set_tensor("attention_mask", mask);
-            mtp_req_.set_tensor("beam_idx", beam);
-            mtp_req_.infer();
-            mtp_len_ += pairs;
-            mtp_pos_ += pairs;
-            mtp_has_pending_ = false;
-            mtp_set_pending(hidden, take - 1);
+            lane.mtp_layer.set_tensor("hidden_states", h);
+            lane.mtp_layer.set_tensor("input_embeds", e);
+            lane.mtp_layer.set_tensor("position_ids", pos);
+            lane.mtp_layer.set_tensor("attention_mask", mask);
+            lane.mtp_layer.set_tensor("beam_idx", beam);
+            with_turn(lane, [&] { lane.mtp_layer.infer(); });
+            lane.mtp_len += pairs;
+            lane.mtp_pos += pairs;
+            lane.mtp_has_pending = false;
+            mtp_set_pending(lane, hidden, take - 1);
         } catch (const std::exception& e) {
             log::warn("mtp", "head priming failed, disabling it: %s", e.what());
             mtp_ready_ = false;
@@ -1871,7 +2356,7 @@ private:
 
     // Mirrors restore()'s contract: a failure degrades to "no caching", never
     // to a 500 on an otherwise healthy request.
-    bool snapshot(PrefixCache::StateBlob& out) {
+    bool snapshot(Lane& lane, PrefixCache::StateBlob& out) {
         try {
             out.clear();
             for (ov::VariableState& v : lm_req_.query_state()) {
@@ -1884,20 +2369,20 @@ private:
             // Its cursor goes in as well: the head lags the base model by a
             // position, and that offset cannot be recovered from the tensors.
             if (mtp_ready_) {
-                for (ov::VariableState& v : mtp_req_.query_state()) {
+                for (ov::VariableState& v : lane.mtp_layer.query_state()) {
                     out.push_back(serialise_state(v.get_state()));
                 }
                 ov::Tensor cursor(ov::element::i64, ov::Shape{3});
-                cursor.data<int64_t>()[0] = static_cast<int64_t>(mtp_len_);
-                cursor.data<int64_t>()[1] = static_cast<int64_t>(mtp_pos_);
-                cursor.data<int64_t>()[2] = mtp_has_pending_ ? 1 : 0;
+                cursor.data<int64_t>()[0] = static_cast<int64_t>(lane.mtp_len);
+                cursor.data<int64_t>()[1] = static_cast<int64_t>(lane.mtp_pos);
+                cursor.data<int64_t>()[2] = lane.mtp_has_pending ? 1 : 0;
                 out.push_back(serialise_state(cursor));
                 // ...and the row it is holding. The head consumes (h_t, x_{t+1}),
                 // so at a checkpoint it always has one hidden row waiting for a
                 // token that has not arrived yet. Dropping it would leave the
                 // head a position behind after a restore.
                 out.push_back(serialise_state(
-                    mtp_has_pending_ ? mtp_pending_
+                    lane.mtp_has_pending ? lane.mtp_pending
                                      : ov::Tensor(ov::element::f32, ov::Shape{1, 1, 1})));
             }
             return true;
@@ -1908,20 +2393,20 @@ private:
         }
     }
 
-    size_t estimated_state_bytes() {
+    size_t estimated_state_bytes(Lane& lane) {
         if (state_bytes_ != 0) return state_bytes_;
         try {
             for (ov::VariableState& v : lm_req_.query_state()) {
                 state_bytes_ += v.get_state().get_byte_size() + 64;
             }
             if (mtp_ready_) {
-                for (ov::VariableState& v : mtp_req_.query_state()) {
+                for (ov::VariableState& v : lane.mtp_layer.query_state()) {
                     state_bytes_ += v.get_state().get_byte_size() + 64;
                 }
                 // The cursor plus the pending hidden row. Derived, not a baked
                 // n_embd: this has to follow whatever model is loaded.
                 state_bytes_ += 128;
-                if (mtp_pending_) state_bytes_ += mtp_pending_.get_byte_size() + 64;
+                if (lane.mtp_pending) state_bytes_ += lane.mtp_pending.get_byte_size() + 64;
                 else state_bytes_ += static_cast<size_t>(artifact_.n_embd) * 4 + 64;
             }
         } catch (const std::exception&) {
@@ -1930,12 +2415,12 @@ private:
         return state_bytes_;
     }
 
-    bool restore(const PrefixCache::StateBlob& blob) {
+    bool restore(Lane& lane, const PrefixCache::StateBlob& blob) {
         std::vector<ov::VariableState> states = lm_req_.query_state();
         std::vector<ov::VariableState> mtp_states;
         size_t                         want = states.size();
         if (mtp_ready_) {
-            mtp_states = mtp_req_.query_state();
+            mtp_states = lane.mtp_layer.query_state();
             want += mtp_states.size() + 2;  // + the cursor and the pending row
         }
         if (want != blob.size()) return false;
@@ -1948,10 +2433,10 @@ private:
             }
             if (mtp_ready_) {
                 const ov::Tensor cursor = deserialise_state(blob[blob.size() - 2]);
-                mtp_len_         = static_cast<size_t>(cursor.data<const int64_t>()[0]);
-                mtp_pos_         = static_cast<size_t>(cursor.data<const int64_t>()[1]);
-                mtp_has_pending_ = cursor.data<const int64_t>()[2] != 0;
-                if (mtp_has_pending_) mtp_pending_ = deserialise_state(blob.back());
+                lane.mtp_len         = static_cast<size_t>(cursor.data<const int64_t>()[0]);
+                lane.mtp_pos         = static_cast<size_t>(cursor.data<const int64_t>()[1]);
+                lane.mtp_has_pending = cursor.data<const int64_t>()[2] != 0;
+                if (lane.mtp_has_pending) lane.mtp_pending = deserialise_state(blob.back());
             }
         } catch (const std::exception& e) {
             log::warn("cache", "state restore failed, falling back to a cold prefill: %s",
@@ -1965,7 +2450,8 @@ private:
     // One real forward pass. This is what turns a latent import fault into a
     // startup failure instead of a run of 500s.
     void warmup() {
-        forward({0}, 0);
+        Lane& lane = *lanes_[0];
+        forward(lane, {0}, 0);
         lm_req_.reset_state();
         if (std::getenv("ARCINT_BENCH_FORWARD") != nullptr) bench_forward();
         if (std::getenv("ARCINT_PROFILE") != nullptr) profile_step();
@@ -1975,6 +2461,7 @@ private:
     // the reference-kernel fallbacks stand out, which is what the numbers are
     // usually for. Needs PERF_COUNT at compile time (ARCINT_PROFILE sets it).
     void profile_step() {
+        Lane& lane = *lanes_[0];
         // Depth matters: a profile at 64 tokens of context is not the step a
         // real request takes. ARCINT_PROFILE=<n> sets the prefix length.
         size_t      depth = 64;
@@ -1984,13 +2471,13 @@ private:
         }
         lm_req_.reset_state();
         std::vector<int> warm(depth, 0);
-        forward(warm, 0);
+        forward(lane, warm, 0);
 
         // Wall clock for the same step, so the node total can be compared
         // against what the step actually costs.
         const auto t0 = std::chrono::steady_clock::now();
         const int  reps = 10;
-        for (int i = 0; i < reps; ++i) forward({0}, depth + static_cast<size_t>(i));
+        for (int i = 0; i < reps; ++i) forward(lane, {0}, depth + static_cast<size_t>(i));
         const double wall_ms = 1000.0 * seconds_since(t0) / reps;
         log::info("profile", "decode step wall clock %.2f ms at depth %zu", wall_ms, depth);
 
@@ -2024,17 +2511,18 @@ private:
     // 30 of 40 layers are a recurrent scan -- so measure it rather than assume
     // it. Prints ms per forward and the cost relative to a single token.
     void bench_forward() {
+        Lane& lane = *lanes_[0];
         const size_t past = 512;
         std::vector<int> warm(past, 0);
         double one = 0.0;
         for (size_t k : {size_t{1}, size_t{2}, size_t{3}, size_t{5}, size_t{9},
                          size_t{17}, size_t{33}, size_t{65}}) {
             lm_req_.reset_state();
-            forward(warm, 0);
+            forward(lane, warm, 0);
             std::vector<int> ids(k, 0);
             const auto t0 = std::chrono::steady_clock::now();
             const int reps = 5;
-            for (int r = 0; r < reps; ++r) forward(ids, past + k * static_cast<size_t>(r));
+            for (int r = 0; r < reps; ++r) forward(lane, ids, past + k * static_cast<size_t>(r));
             const double ms = 1000.0 * seconds_since(t0) / reps;
             if (k == 1) one = ms;
             log::info("bench", "forward(%2zu tok) %7.2f ms  = %5.2fx one token  "
@@ -2085,7 +2573,7 @@ private:
 
     // Runs the embeddings graph then the language model for `ids`, with `past`
     // tokens already in the graph's state.
-    ov::Tensor forward(const std::vector<int>& ids, size_t past) {
+    ov::Tensor forward(Lane& lane, const std::vector<int>& ids, size_t past) {
         const size_t n     = ids.size();
         const size_t total = past + n;
 
@@ -2094,8 +2582,8 @@ private:
         for (size_t i = 0; i < n; ++i) idp[i] = ids[i];
 
         const auto t_embed = std::chrono::steady_clock::now();
-        embed_req_.set_input_tensor(id_tensor);
-        embed_req_.infer();
+        lane.embed.set_input_tensor(id_tensor);
+        lane.embed.infer();
         if (step_stats_ != nullptr) step_stats_->decode_embed_seconds += seconds_since(t_embed);
 
         // Copy the embeddings out instead of handing the language model the
@@ -2103,7 +2591,7 @@ private:
         // prefill diverge from unchunked: two requests aliasing one tensor is
         // not something either plugin promises to serialise, and the
         // equivalence suite caught it as a byte difference rather than a crash.
-        const ov::Tensor src = embed_req_.get_output_tensor(0);
+        const ov::Tensor src = lane.embed.get_output_tensor(0);
         if (!embeds_ || embeds_.get_shape() != src.get_shape() ||
             embeds_.get_element_type() != src.get_element_type()) {
             embeds_ = ov::Tensor(src.get_element_type(), src.get_shape());
@@ -2160,77 +2648,84 @@ private:
     // model and is fed one position per committed token. Its own attention KV
     // therefore never needs rolling back: every input it has consumed is a
     // token the model committed to.
-    void mtp_reset() {
+    void mtp_reset(Lane& lane) {
         if (!mtp_ready_) return;
-        mtp_req_.reset_state();
-        mtp_len_         = 0;
-        mtp_pos_         = 0;
-        mtp_has_pending_ = false;
+        lane.mtp_layer.reset_state();
+        lane.mtp_len         = 0;
+        lane.mtp_pos         = 0;
+        lane.mtp_has_pending = false;
     }
 
     // A prefix-cache hit skips the prompt the head would have been primed on.
     // Its rope positions must still be the true ones, so the two counters part
     // company: the head attends to a shorter prefix than it is positioned in.
-    void mtp_seek(size_t position) {
+    void mtp_seek(Lane& lane, size_t position) {
         if (!mtp_ready_) return;
-        mtp_pos_ = position;
+        lane.mtp_pos = position;
     }
 
-    void mtp_set_pending(const ov::Tensor& hidden, size_t row) {
+    void mtp_set_pending(Lane& lane, const ov::Tensor& hidden, size_t row) {
         if (!mtp_ready_) return;
         const ov::Shape& shape = hidden.get_shape();
         const size_t     width = shape.back();
         const size_t     rows  = hidden.get_size() / width;
         if (row >= rows) return;
-        if (!mtp_pending_ || mtp_pending_.get_shape() != ov::Shape{1, 1, width} ||
-            mtp_pending_.get_element_type() != hidden.get_element_type()) {
-            mtp_pending_ = ov::Tensor(hidden.get_element_type(), ov::Shape{1, 1, width});
+        if (!lane.mtp_pending || lane.mtp_pending.get_shape() != ov::Shape{1, 1, width} ||
+            lane.mtp_pending.get_element_type() != hidden.get_element_type()) {
+            lane.mtp_pending = ov::Tensor(hidden.get_element_type(), ov::Shape{1, 1, width});
         }
-        std::memcpy(mtp_pending_.data(),
+        std::memcpy(lane.mtp_pending.data(),
                     static_cast<const uint8_t*>(hidden.data()) +
                         row * width * hidden.get_element_type().size(),
                     width * hidden.get_element_type().size());
-        mtp_has_pending_ = true;
+        lane.mtp_has_pending = true;
     }
 
     // Feeds (pending, embedding of `next`) at the head's current position.
     // Returns the drafted token when one is wanted, or -1.
-    int mtp_feed(int next, bool want_draft) {
-        if (!mtp_ready_ || !mtp_has_pending_) return -1;
+    int mtp_feed(Lane& lane, int next, bool want_draft) {
+        if (!mtp_ready_ || !lane.mtp_has_pending) return -1;
+        // One turn for the whole head step: it runs three shared compiled models
+        // back to back and reads each one's output, so splitting it would leave
+        // exactly the windows §7.2 says are unsafe.
+        return with_turn(lane, [&] { return mtp_feed_locked(lane, next, want_draft); });
+    }
+
+    int mtp_feed_locked(Lane& lane, int next, bool want_draft) {
         try {
             ov::Tensor ids(ov::element::i64, ov::Shape{1, 1});
             ids.data<int64_t>()[0] = next;
-            embed_req_.set_input_tensor(ids);
-            embed_req_.infer();
-            const ov::Tensor src = embed_req_.get_output_tensor(0);
+            lane.embed.set_input_tensor(ids);
+            lane.embed.infer();
+            const ov::Tensor src = lane.embed.get_output_tensor(0);
             ov::Tensor       emb(src.get_element_type(), src.get_shape());
             std::memcpy(emb.data(), src.data(), src.get_byte_size());
 
             ov::Tensor pos(ov::element::f32, ov::Shape{1, 1});
-            pos.data<float>()[0] = static_cast<float>(mtp_pos_);
+            pos.data<float>()[0] = static_cast<float>(lane.mtp_pos);
 
             // Nothing is masked: the head attends to its whole committed prefix.
-            ov::Tensor mask(ov::element::f32, ov::Shape{1, 1, 1, mtp_len_ + 1});
-            std::fill_n(mask.data<float>(), mtp_len_ + 1, 0.0f);
+            ov::Tensor mask(ov::element::f32, ov::Shape{1, 1, 1, lane.mtp_len + 1});
+            std::fill_n(mask.data<float>(), lane.mtp_len + 1, 0.0f);
 
             ov::Tensor beam(ov::element::i32, ov::Shape{1});
             beam.data<int32_t>()[0] = 0;
 
-            mtp_req_.set_tensor("hidden_states", mtp_pending_);
-            mtp_req_.set_tensor("input_embeds", emb);
-            mtp_req_.set_tensor("position_ids", pos);
-            mtp_req_.set_tensor("attention_mask", mask);
-            mtp_req_.set_tensor("beam_idx", beam);
-            mtp_req_.infer();
+            lane.mtp_layer.set_tensor("hidden_states", lane.mtp_pending);
+            lane.mtp_layer.set_tensor("input_embeds", emb);
+            lane.mtp_layer.set_tensor("position_ids", pos);
+            lane.mtp_layer.set_tensor("attention_mask", mask);
+            lane.mtp_layer.set_tensor("beam_idx", beam);
+            lane.mtp_layer.infer();
 
-            ++mtp_len_;
-            ++mtp_pos_;
-            mtp_has_pending_ = false;
+            ++lane.mtp_len;
+            ++lane.mtp_pos;
+            lane.mtp_has_pending = false;
             if (!want_draft) return -1;
 
-            mtp_head_req_.set_input_tensor(mtp_req_.get_output_tensor(0));
-            mtp_head_req_.infer();
-            const ov::Tensor lg = mtp_head_req_.get_output_tensor(0);
+            lane.mtp_head.set_input_tensor(lane.mtp_layer.get_output_tensor(0));
+            lane.mtp_head.infer();
+            const ov::Tensor lg = lane.mtp_head.get_output_tensor(0);
             const size_t     v  = lg.get_shape().back();
             return Sampler::argmax(lg.data<const float>() + (lg.get_size() / v - 1) * v, v);
         } catch (const std::exception& e) {
@@ -2262,7 +2757,7 @@ private:
     // The sampler's decision for one row of a [tokens, 1, vocab] logits tensor.
     // Verification and normal picking go through the same call so that they can
     // never drift apart.
-    int pick_row(Sampler& sampler, const ov::Tensor& logits, size_t row) {
+    int pick_row(Lane& lane, Sampler& sampler, const ov::Tensor& logits, size_t row) {
         const size_t vocab = logits.get_shape().back();
         const size_t rows  = logits.get_size() / vocab;
         // Out of range is a graph/plumbing bug, not a draft miss. Returning -1
@@ -2271,14 +2766,14 @@ private:
         if (row >= rows) return -1;
 
         const float* p = logits.data<const float>() + row * vocab;
-        logit_scratch_.assign(p, p + vocab);
-        return sampler.sample(logit_scratch_.data(), vocab);
+        lane.logit_scratch.assign(p, p + vocab);
+        return sampler.sample(lane.logit_scratch.data(), vocab);
     }
 
-    int pick(Sampler& sampler, const ov::Tensor& logits) {
+    int pick(Lane& lane, Sampler& sampler, const ov::Tensor& logits) {
         const size_t vocab = logits.get_shape().back();
         const auto   t0    = std::chrono::steady_clock::now();
-        const int    tok   = pick_row(sampler, logits, logits.get_size() / vocab - 1);
+        const int    tok   = pick_row(lane, sampler, logits, logits.get_size() / vocab - 1);
         if (step_stats_ != nullptr) step_stats_->decode_sample_seconds += seconds_since(t0);
         return tok;
     }
@@ -2287,54 +2782,61 @@ private:
     ov::Core                       core_;
     ov::CompiledModel              embeddings_;
     ov::CompiledModel              language_;
-    ov::InferRequest               embed_req_;
     ov::InferRequest               lm_req_;
     ov::Output<const ov::Node>     logits_port_;
     std::unique_ptr<OvTokenizer>   tokenizer_;
     std::unique_ptr<minja::chat_template> template_;
     ModelStatus                    status_;
     std::mutex                     mutex_;
-    std::vector<float>             logit_scratch_;
     ov::Tensor                     embeds_;
     int                            prefill_chunk_ = 512;
     size_t                         state_bytes_   = 0;
     std::unique_ptr<PrefixCache>   prefix_cache_;
     // --- MTP head (§3.5). Drafts exactly one token per decode step.
     bool                           want_mtp_ = false;
-    bool                           mtp_ready_ = false;
+    // Written by whichever lane sees the head fail, read by both on every step.
+    std::atomic<bool>              mtp_ready_{false};
     ov::CompiledModel              mtp_layer_;
     ov::CompiledModel              mtp_head_;
-    ov::InferRequest               mtp_req_;
-    ov::InferRequest               mtp_head_req_;
     ov::Tensor                     last_hidden_;    // the base model's, this step
     ov::Tensor                     hidden_copy_;    // owned; last_hidden_ points here
-    ov::Tensor                     mtp_pending_;    // h_t, awaiting x_{t+1}
-    bool                           mtp_has_pending_ = false;
-    size_t                         mtp_len_ = 0;    // positions in the head's KV
-    size_t                         mtp_pos_ = 0;    // true position, for rope
     int                            offload_ratio_ = 0;
+    // --- lanes (§4.1). One per --parallel slot; the stateful reference path
+    // uses lane 0 for its embeddings and MTP requests and serialises on
+    // mutex_, because it has one graph state and cannot do better.
+    std::vector<std::unique_ptr<Lane>> lanes_;
+    int                            lane_count_ = 1;
+    size_t                         rows_per_lane_ = 4;
+    std::unique_ptr<BlockPool>     pool_;
+    Turnstile                      gate_;
     // --- paged path (§3.5.3, §7.0): arcint-owned block tables + LA rows ---
     bool                           paged_ = false;
     ov::CompiledModel              paged_model_;
     ov::InferRequest               paged_req_;
     std::vector<std::string>       la_state_names_;   // conv + gdn table port names
-    std::vector<ov::Shape>         la_state_shapes_;  // with the rows dim filled in
-    std::vector<ov::RemoteTensor>  la_state_tensors_;
+    std::vector<ov::Shape>         la_state_shapes_;  // one row; the rows dim is filled in
     std::vector<std::string>       kv_pool_names_;
     std::vector<ov::element::Type> kv_pool_types_;
     std::vector<ov::Shape>         kv_pool_shapes_;   // with the blocks dim filled in
     std::vector<ov::RemoteTensor>  kv_pool_tensors_;
-    size_t                         paged_rows_       = 4;
+    // The plugin's own KV page size, not --kv-block-size: the paged graph's
+    // key_cache/value_cache ports are laid out in 16-token pages and the byte
+    // arithmetic below divides by it. --kv-block-size governs the prefix cache's
+    // reuse granularity, which is a multiple of this and therefore compatible.
     size_t                         kv_block_tokens_  = 16;
     size_t                         kv_bytes_token_   = 0;
     size_t                         la_row_bytes_     = 0;
     int                            paged_n_ctx_      = 0;
     size_t                         paged_sections_   = 4;    // position_ids dim 0
-    uint64_t                       pool_epoch_       = 0;    // KV pool lineage (§ paged cache)
     size_t                         drafts_max_       = 0;
     std::vector<ov::Tensor>        rollback_;   // reused speculation scratch
     bool                           logged_rollback_size_ = false;
+    // Kept alive for the life of the process and gated by a flag rather than
+    // destroyed when speculation turns itself off: with two lanes, one lane's
+    // `drafter_.reset()` would free the object the other lane is inside
+    // (NgramDrafter::draft only reads, so sharing it is otherwise fine).
     std::unique_ptr<Drafter>       drafter_;
+    std::atomic<bool>              drafting_{false};
     size_t                         draft_tokens_ = 0;
     mutable size_t                 position_sections_ = 0;
 };

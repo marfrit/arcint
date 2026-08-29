@@ -108,17 +108,29 @@ void HttpServer::Impl::route() {
             return;
         }
 
+        // The lane is taken here, before a single response byte is committed —
+        // a 503 has to be a status code, and once the SSE body has started it
+        // can only be a message inside a 200.
+        auto lease = std::make_shared<api::SlotPool::Lease>();
+        if (auto err = api::acquire_slot(ctx, *lease)) {
+            send_json(res, err->status, err->body);
+            return;
+        }
+        const int slot = lease->index();
+
         if (!prep->req.stream) {
-            const api::HttpResult r = api::run_chat(ctx, *prep);
+            const api::HttpResult r = api::run_chat(ctx, *prep, slot);
             send_json(res, r.status, r.body);
             return;
         }
 
         res.set_header("Cache-Control", "no-cache");
+        // The lease rides in the provider so the lane is held for exactly as
+        // long as the stream lives, and freed when it ends however it ends.
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, prep](size_t, httplib::DataSink& sink) {
-                api::stream_chat(ctx, *prep, [&sink](std::string_view data) {
+            [this, prep, lease, slot](size_t, httplib::DataSink& sink) {
+                api::stream_chat(ctx, *prep, slot, [&sink](std::string_view data) {
                     return sink.write(data.data(), data.size());
                 });
                 sink.done();
@@ -139,8 +151,15 @@ void HttpServer::Impl::route() {
             return;
         }
 
+        auto lease = std::make_shared<api::SlotPool::Lease>();
+        if (auto err = api::acquire_slot(ctx, *lease)) {
+            send_json(res, err->status, err->body);
+            return;
+        }
+        const int slot = lease->index();
+
         if (!prep->req.stream) {
-            const api::HttpResult r = api::run_completion(ctx, *prep);
+            const api::HttpResult r = api::run_completion(ctx, *prep, slot);
             send_json(res, r.status, r.body);
             return;
         }
@@ -148,8 +167,8 @@ void HttpServer::Impl::route() {
         res.set_header("Cache-Control", "no-cache");
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, prep](size_t, httplib::DataSink& sink) {
-                api::stream_completion(ctx, *prep, [&sink](std::string_view data) {
+            [this, prep, lease, slot](size_t, httplib::DataSink& sink) {
+                api::stream_completion(ctx, *prep, slot, [&sink](std::string_view data) {
                     return sink.write(data.data(), data.size());
                 });
                 sink.done();

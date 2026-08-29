@@ -18,7 +18,7 @@ TEST(registry_rejects_everything_else) {
 }
 
 TEST(registry_matches_the_measured_ir_metadata) {
-    // Transcribed from models/allowlist-raw.json (the dev host's /models/ov/, 2026-08-28).
+    // Transcribed from models/allowlist-raw.json (/models/ov/, 2026-08-28).
     // Note this contradicts the console sketch in DESIGN.md §4 ("41 GDN + 7
     // attn"): the artifacts say 40 layers with one in four full attention.
     const ModelEntry* coder = find_model("qwen3.6-27b-a3b-coder");

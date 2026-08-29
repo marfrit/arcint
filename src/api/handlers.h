@@ -15,9 +15,13 @@
 
 namespace lgc::api {
 
-// A fixed set of slots (DESIGN.md §4: /health reports free/total and queue
-// depth). Admission blocks rather than rejecting: a client that is willing to
-// wait gets served, and the queue depth is visible on /health meanwhile.
+// A fixed set of lanes (DESIGN.md §4: /health reports free/total and queue
+// depth). A lane is a memory reservation, not a queue position: N lanes means
+// the startup arithmetic (§7.0.2a) reserved activations, GDN checkpoint rows
+// and KV for N concurrent sequences, so an N+1st has nowhere to live. It is
+// therefore refused with those numbers rather than queued behind a session
+// that may decode for minutes — unless --queue-timeout says how long the
+// caller may wait, in which case it waits that long first.
 class SlotPool {
 public:
     explicit SlotPool(int count);
@@ -39,7 +43,11 @@ public:
         int       index_ = -1;
     };
 
-    Lease acquire();
+    // Waits at most `timeout_seconds` (0 = do not wait at all) for a free lane.
+    // A lease with index() < 0 means none came free. There is deliberately no
+    // unbounded variant: an admission that can wait forever is the failure this
+    // milestone replaced with a numbered refusal.
+    Lease acquire_for(double timeout_seconds);
     void  release(int index);
 
     int total() const;
@@ -63,6 +71,10 @@ struct HttpResult {
     int            status = 200;
     nlohmann::json body;
 };
+
+// Takes a lane for one request, or returns the 503 that says why not — with
+// the reservation arithmetic in it, so "busy" is a number and not a mood.
+std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out);
 
 nlohmann::json health(const Context& ctx);
 nlohmann::json props(const Context& ctx);
@@ -96,11 +108,12 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const nlohmann::json&
 std::optional<HttpResult> prepare_completion(const Context& ctx, const nlohmann::json& body,
                                              PreparedCompletion& out);
 
-HttpResult run_chat(const Context& ctx, const PreparedChat& prep);
-HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep);
+HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot);
+HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, int slot);
 
-void stream_chat(const Context& ctx, const PreparedChat& prep, const SseWriter& write);
-void stream_completion(const Context& ctx, const PreparedCompletion& prep,
+void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
+                 const SseWriter& write);
+void stream_completion(const Context& ctx, const PreparedCompletion& prep, int slot,
                        const SseWriter& write);
 
 }  // namespace lgc::api

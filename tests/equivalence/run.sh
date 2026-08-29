@@ -9,6 +9,10 @@
 #
 # It needs a real model, so it runs where the card is. Usage:
 #   run.sh /path/to/arcint /models/ov/<artifact> [device]
+#
+# ARCINT_EXTRA_ARGS is appended to every server start, which is how the same
+# suite is run at --parallel 2: the equality claims here are about one sequence,
+# and they have to keep holding on an engine that can run two.
 set -uo pipefail
 
 BIN="${1:?usage: run.sh <arcint> <model-dir> [device]}"
@@ -29,8 +33,9 @@ start_server() {  # start_server <log> <extra args...>
   local log="$1"; shift
   stop_server
   PORT=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1]);s.close()")
+  # shellcheck disable=SC2086 -- word splitting is what ARCINT_EXTRA_ARGS is for
   "$BIN" --model "$MODEL" --device "$DEV" --host 127.0.0.1 --port "$PORT" --n-ctx 8192 \
-         "$@" > "$log" 2>&1 &
+         ${ARCINT_EXTRA_ARGS:-} "$@" > "$log" 2>&1 &
   SRV=$!
   # Generous: a cold compile of the dense model plus the MTP head is minutes,
   # and a suite that times out looks like a failing gate when it is not.
@@ -62,7 +67,7 @@ PROMPT="Explain, in exactly one paragraph and without bullet points, why a recur
 linear-attention state cannot be truncated the way an attention KV cache can be. \
 Be precise about what information is irrecoverably mixed together. $(python3 -c 'print("Context filler. " * 60)')"
 
-echo "== arcint equivalence suite on $DEV"
+echo "== arcint equivalence suite on $DEV ${ARCINT_EXTRA_ARGS:+(${ARCINT_EXTRA_ARGS})}"
 
 # ---------------------------------------------------- greedy determinism (§5)
 start_server "$WORK/a.log" || exit 1   # shipped defaults: this IS the baseline
