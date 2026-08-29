@@ -53,14 +53,18 @@ with `f == y` — the same bytes in the same order. The honest fix is recognisin
 the degenerate case, which is a small and upstreamable change to a bail
 condition rather than a kernel.
 
-**Caveat that has to be settled first: the node may no longer exist.** The paged
-transformation removed 90 `Transpose` nodes when the served path moved to it, and
-no `Permute` row appears in any stored paged profile. But the profiler printed
-only the top 20 of 28–29 `(op, kernel)` pairs, so up to nine rows were never
-shown and a permute could be among them. The cap is now removed — every pair
-prints — and the next capture answers it. **Until then, the premise of the
-permute work is unverified**, and it is a premise about existence, not about
-mechanism.
+**Settled, and it voids the item: the node does not exist on the served path.**
+With the row cap removed, a capture prints all **29** `(op, kernel)` pairs of a
+2048-token prefill chunk, and a case-insensitive search of the whole capture —
+prefill and decode tables both — returns **zero** occurrences of `permute` or
+`transpose`. The paged transformation removed the transposes when the served path
+moved to it, and `permute_ref__f16`, the 18%-of-decode finding of §5 and the
+target of `kernels/permute.cl`, is simply not in the graph any more.
+
+So the analysis above is correct and inapplicable. It is kept because the
+mechanism is real and will apply the moment an f↔y permute reappears — and
+because "the fast kernel bails on a sequence length of 1" is a shape this
+architecture will meet again.
 
 ## paged_causal_conv1d_ref — there is nothing else
 
@@ -101,3 +105,58 @@ ladder exists to make explicit.
 primitive it created, with shapes, for every dispatch — so the exact rejected
 shape and the chosen implementation can be read from a normal run. That is the
 next measurement for this row, and it is cheaper than the one already running.
+
+
+## The complete kernel inventory of a served prefill chunk
+
+With the cap removed, all 29 pairs, 2048-token chunk at past 0, f16 KV. Reference
+implementations marked:
+
+| share | nodes | op | kernel | ref? |
+|---|---|---|---|---|
+| 30.2% | 40 | FullyConnectedCompressed | `ocl:ref:any__i8` | **ref** (oneDNN's) |
+| 19.4% | 331 | FullyConnectedCompressed | `jit:gemm:any__i8` | |
+| 15.9% | 30 | PagedGatedDeltaNet | `paged_gated_delta_net::opt` | |
+| 8.3% | 40 | MOECompressed | `moe_3gemm_swiglu_opt` | |
+| 6.5% | 30 | PagedCausalConv1D | `paged_causal_conv1d::ref` | **ref** |
+| 4.8% | 104 | Add | `generic_eltwise_ref` | **ref** |
+| 3.2% | 60 | Swish | `activation_ref` | **ref** |
+| 2.7% | 161 | DynamicQuantize | `dynamic_quantize_gpu_opt` | |
+| 2.2% | 131 | RMS | `rms_gpu_bfyx_opt` | |
+| 1.8% | 10 | PagedAttentionExtension | `paged_attention::opt` | |
+| 1.3% | 41 | StridedSlice | `strided_slice_ref` | **ref** |
+| 0.9% | 40 | Multiply | `generic_eltwise_ref` | **ref** |
+| 0.7% | 10 | Crop | `generic_eltwise_ref` | **ref** |
+| 0.7% | 10 | VariadicSplit | `generic_eltwise_ref` | **ref** |
+| 0.6% | 40 | MoERouterFused | `moe_router_fused_opt` | |
+| 0.4% | 20 | Concat | `concatenation_gpu_simple_ref` | **ref** |
+| 0.1% | 20 | RoPE | `rope::opt` | |
+| rest | 17 | Gemm, ScatterNDUpdate, SoftPlus, Reshape, Convert, Gather, Cos, Sin | mixed | mostly ref |
+
+**No `Permute`. No `Transpose`.** Reference implementations account for roughly
+**49%** of the chunk's node time, of which the single largest is the oneDNN gate
+fallback at 30.2%.
+
+## A fourth row, started: `Add` on `generic_eltwise_ref` (104 nodes, 4.8%)
+
+Fast eltwise kernels exist — `vload8`, `blocked_opt`, `fs_b_yx_fsv32`,
+`mixed_byxf_and_fs_b_yx_fsv32`. `EltwiseKernel_vload8::Validate` requires
+`(count % 8) == 0` and, in `bCheckSizes`, that **every input be identical in
+shape to the others and to the output**, unless it is a true scalar
+(`PhysicalSize() == 1`):
+
+```cpp
+if (ewParams.inputs[i].PitchesDifferFromLogicalDims() ||
+    ((ewParams.inputs[0] != ewParams.inputs[i] || ewParams.inputs[i] != ewParams.outputs[0]) &&
+     ewParams.inputs[i].PhysicalSize() != 1))
+    bCheckSizes = false;
+```
+
+So a **broadcast** operand that is not a scalar disqualifies the vectorised path.
+That is the shape of a bias or per-channel add against `[1, seq, hidden]`, and it
+is the likely reason 104 `Add` nodes are on the reference kernel. Not yet
+confirmed against the actual operand shapes — that is the next selector read, and
+`ONEDNN_VERBOSE` does not help here because this one is OpenVINO's own decision.
+
+Unlike the permute row, this is not a one-line bail relaxation: supporting a
+broadcast operand in a vectorised kernel is a kernel change.
