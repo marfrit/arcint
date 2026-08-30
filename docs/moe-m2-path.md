@@ -195,3 +195,34 @@ The levers, re-ranked with the plugin's enqueue as the cost:
 - the head layer's 5.05 ms of host per draft is the second (for 118 launches
   it should be under 1 ms at the body's rate);
 - the int4 head buys device time, which is not what is being paid for.
+
+### Where in the enqueue (same afternoon): the PagedAttention MIXED stage, by elimination
+
+The plugin's verbose trace of one plain step against one verify forward
+(`OV_VERBOSE=4`, one infer block each) walks the same primitives with the same
+kernels — 371 `jit:gemm:any`, 40 MoE, 284 eltwise, 44 strided slices in both —
+with one difference: the ten PagedAttention layers. At M=1 they run the
+single-token stage; at M=2 the plugin classifies the forward as MIXED
+(`past_lens != 0` with a multi-token query), selects the `sdpa_micro` stage,
+and **rebuilds the primitive's implementation on every infer** (`update_impl:
+… impl update: was: ocl::paged_attention::opt now: …`, ten per verify, none
+per plain step).
+
+The MIXED stage also reads `past_lens`, `subsequence_begins` and
+`max_context_len` on the host in every stage of every layer; on a device
+buffer each read is a blocking `clEnqueueMapBuffer` that waits for the
+in-order queue. The OpenCL API table counted 105 of them per verify forward
+against 3 per plain step. That mechanism was tested and is **not the cost**:
+with the index inputs in USM host memory (`ARCINT_PA_HOST_INPUTS=1`, the
+plugin dereferences instead of mapping) the maps vanish from the API table
+entirely, the output stays byte-identical, and the verify enqueue moves from
+27.4 to 26.3 ms. The plain step does not benefit either (its enqueue read
+14.2 against 12.6, within the run-to-run spread but not better), so the flag
+stays an experiment, default off.
+
+What remains is ~14 ms per two-token forward inside the plugin's enqueue,
+localised to the PA MIXED path by elimination and not yet measured to the
+function; the per-infer impl rebuild is the suspect. No `perf` in the
+container and the plugin's per-stage dump aborts with the head loaded when
+profiling is enabled; the next instrument is that dump without profiling, or
+a timer around `update_impl` in the debug plugin build.

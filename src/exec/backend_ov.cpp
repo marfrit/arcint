@@ -38,6 +38,8 @@
 
 #include "build_info.h"
 
+#include <optional>
+#include <unordered_map>
 #include <openvino/openvino.hpp>
 #include <openvino/op/constant.hpp>
 #include <openvino/op/matmul.hpp>
@@ -52,6 +54,7 @@
 #include <openvino/pass/manager.hpp>
 #include <openvino/pass/sdpa_to_paged_attention.hpp>
 #include <openvino/runtime/intel_gpu/properties.hpp>
+#include <openvino/runtime/intel_gpu/remote_properties.hpp>
 #include <openvino/runtime/remote_context.hpp>
 #include <openvino/runtime/remote_tensor.hpp>
 
@@ -638,6 +641,10 @@ public:
         size_t                        committed_row = 0;
         std::vector<int32_t>          blocks;
         PrefixCache::EntryRef         hit_keep;   // pages mapped from the cache
+        // The paged graph's small index inputs as USM-host tensors, keyed by
+        // name and length: the plugin dereferences these instead of mapping a
+        // device buffer (ARCINT_PA_HOST_INPUTS, 7.0.2p).
+        std::unordered_map<std::string, std::pair<ov::RemoteTensor, void*>> host_idx;
 
         // The graph's outputs, copied out of the request while the lane still
         // holds the device. Measured 2026-08-29: a second InferRequest of the
@@ -2024,6 +2031,11 @@ private:
         // ---- allocate the state tables (rows), per lane ----------------------
         ov::RemoteContext rctx = core_.get_default_context(device);
         for (auto& lane : lanes_) alloc_la_rows(rctx, *lane);
+        if (std::getenv("ARCINT_PA_HOST_INPUTS") != nullptr) {
+            usm_ctx_        = rctx;
+            pa_host_inputs_ = true;
+            log::info("load", "paged index inputs in USM host memory (ARCINT_PA_HOST_INPUTS)");
+        }
 
         // ---- reservation: measure the activation peak with a probe pool ------
         //
@@ -2653,20 +2665,47 @@ private:
         std::vector<int32_t> blocks(lane.blocks.begin(),
                                     lane.blocks.begin() + static_cast<long>(nblk));
 
+        // The index inputs. The plugin's PagedAttention reads past_lens,
+        // subsequence_begins and max_context_len on the host in every stage of
+        // every layer once M > 1; on a device buffer each read is a blocking
+        // map that drains the queue, ~105 per two-token forward (7.0.2p). In
+        // USM host memory the read is a dereference.
+        auto set_i32 = [&](const char* name, const std::vector<int32_t>& v, bool scalar = false) {
+            if (!pa_host_inputs_) {
+                if (scalar) {
+                    ov::Tensor t(ov::element::i32, ov::Shape{});
+                    *t.data<int32_t>() = v[0];
+                    lane.req.set_tensor(name, t);
+                } else {
+                    lane.req.set_tensor(name, i32(v));
+                }
+                return;
+            }
+            const std::string key = std::string(name) + '#' + std::to_string(v.size());
+            auto it = lane.host_idx.find(key);
+            if (it == lane.host_idx.end()) {
+                const ov::Shape sh = scalar ? ov::Shape{} : ov::Shape{v.size()};
+                ov::RemoteTensor t = usm_ctx_.create_tensor(
+                    ov::element::i32, sh,
+                    {{ov::intel_gpu::shared_mem_type.name(),
+                      ov::intel_gpu::SharedMemType::USM_HOST_BUFFER}});
+                void* ptr = t.get_params().at(ov::intel_gpu::mem_handle.name()).as<void*>();
+                it = lane.host_idx.emplace(key, std::make_pair(t, ptr)).first;
+            }
+            std::memcpy(it->second.second, v.data(), v.size() * sizeof(int32_t));
+            lane.req.set_tensor(name, it->second.first);
+        };
         lane.req.set_tensor(kInputsEmbeds, embeds);
         lane.req.set_tensor(kPositionIds, pos);
-        lane.req.set_tensor("past_lens", i32({static_cast<int32_t>(past)}));
-        lane.req.set_tensor("subsequence_begins", i32({0, static_cast<int32_t>(n)}));
-        lane.req.set_tensor("block_indices", i32(blocks));
-        lane.req.set_tensor("block_indices_begins", i32({0, static_cast<int32_t>(nblk)}));
-        ov::Tensor mcl(ov::element::i32, ov::Shape{});
-        *mcl.data<int32_t>() = static_cast<int32_t>(tot);
-        lane.req.set_tensor("max_context_len", mcl);
-        lane.req.set_tensor("la.block_indices", i32(la_rows));
-        lane.req.set_tensor("la.block_indices_begins",
-                            i32({0, static_cast<int32_t>(la_rows.size())}));
-        lane.req.set_tensor("la.past_lens", i32({static_cast<int32_t>(past)}));
-        lane.req.set_tensor("la.cache_interval", i32({interval}));
+        set_i32("past_lens", {static_cast<int32_t>(past)});
+        set_i32("subsequence_begins", {0, static_cast<int32_t>(n)});
+        set_i32("block_indices", blocks);
+        set_i32("block_indices_begins", {0, static_cast<int32_t>(nblk)});
+        set_i32("max_context_len", {static_cast<int32_t>(tot)}, true);
+        set_i32("la.block_indices", la_rows);
+        set_i32("la.block_indices_begins", {0, static_cast<int32_t>(la_rows.size())});
+        set_i32("la.past_lens", {static_cast<int32_t>(past)});
+        set_i32("la.cache_interval", {interval});
         with_turn(lane, [&] {
             lane.req.infer();
             if (want_logits) copy_out(lane.req.get_tensor("logits"), lane.logits);
@@ -3511,6 +3550,8 @@ private:
     size_t                         la_row_bytes_     = 0;
     size_t                         logits_keep_rows_ = 0;  // 0: unsliced
     size_t                         cache_grid_       = 0;  // paged snapshot grid; 0: the chunk
+    ov::RemoteContext              usm_ctx_;              // for USM-host index inputs
+    bool                           pa_host_inputs_   = false;  // ARCINT_PA_HOST_INPUTS
     // The MTP layer's input contract, read from the compiled graph: the
     // reconstructed layer takes input_embeds, an f32 4-D additive mask and f32
     // positions; optimum-intel's export takes inputs_embeds, an i64 2-D
