@@ -2439,15 +2439,15 @@ tokens was faster than verifying predictions — reproduced with numbers:
 | the head's draft | (6.03 − 4.18) s / 165 = **11.2 ms** | 0.8× |
 
 Per accepted pair that is ~36.5 ms for ~1.9 tokens, 19 ms a token against 14
-plain. Two causes, both measured against the dense 3.8 where the same pass
-costs 1.1× a step: the MoE's M=2 forward is not the decode path — it is the
-prefill path (`grouped_micro_gemm`, the `moe_gather_ref`/`moe_scatter`
-kernels) rather than the single-token MoE kernels, so two tokens cost nearly
-two steps — and the head reads 1.69 GB of f16 expert weights per draft,
-which an int4, top-k-gathered head would cut to a few percent of that.
-Fixing the head alone brings the pair to ~27 ms, 14 ms a token: break-even.
-**The blocker is the M=2 MoE path in the plugin**, an upstream item; until
-it exists, speculation on the 35B does not pay on this card, and the agent
+plain. The head reads 1.69 GB of f16 expert weights per draft, which an int4,
+top-k-gathered head would cut to a few percent of that; fixing the head alone
+brings the pair to ~27 ms, 14 ms a token: break-even. **The sentence that
+stood here — that the M=2 forward runs the prefill path — was an inference
+from the 1.8x and is retracted the same evening**: the pinned plugin already
+routes token counts up to 32 through a batched-GEMV decode path written for
+exactly this case (`docs/moe-m2-path.md`). The 1.8x is real and its cause is
+the open item; the trace of a two-token verify is the instrument. Until it is
+attributed, speculation on the 35B does not pay on this card, and the agent
 unit stays as it is.
 
 Greedy answers with and without the head differ at one near-tie token late
