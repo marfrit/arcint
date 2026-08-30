@@ -73,5 +73,15 @@ ToolSchemas tool_schemas(const std::vector<ToolSpec>& tools);
 // deterministic rendering to count tokens against, and ChatML is the family's
 // shape. Never let this run against a real model.
 std::string render_chatml_stub(const ChatRequest& req);
+// The wire format carries a tool call's arguments as a JSON *string* (OpenAI
+// does, and so does every client that follows it). Some templates iterate the
+// arguments as a mapping -- Qwen3.6's does `tool_call.arguments|items` -- and
+// fail on a string with "Can only get item pairs from a mapping". Handing the
+// template what its contract asks for is input normalisation, not a polyfill:
+// when the template requires an object and the string parses as one, the
+// object goes in; anything else stays the string it was.
+nlohmann::json tool_call_arguments_for_template(const std::string& arguments,
+                                                bool template_wants_object);
+
 
 }  // namespace lgc

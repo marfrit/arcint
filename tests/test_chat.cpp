@@ -287,3 +287,18 @@ TEST(completion_rejects_batches_and_token_prompts) {
     CHECK(parse_completion_request(json{{"prompt", json::array({1, 2, 3})}}, req).has_value());
     CHECK(parse_completion_request(json::object(), req).has_value());
 }
+
+TEST(chat_tool_call_arguments_follow_the_template_contract) {
+    // The wire format is a string; Qwen3.6's template iterates a mapping.
+    const nlohmann::json obj = tool_call_arguments_for_template("{\"path\": \"invoice.txt\"}", true);
+    CHECK(obj.is_object());
+    CHECK_EQ(obj["path"].get<std::string>(), std::string("invoice.txt"));
+    // A template that wants the string keeps the string, byte for byte.
+    const nlohmann::json str = tool_call_arguments_for_template("{\"path\": \"invoice.txt\"}", false);
+    CHECK(str.is_string());
+    CHECK_EQ(str.get<std::string>(), std::string("{\"path\": \"invoice.txt\"}"));
+    // Arguments that are not a JSON object stay a string even when an object is wanted:
+    // rendering something is better than refusing, and the template's own error names it.
+    CHECK(tool_call_arguments_for_template("not json", true).is_string());
+    CHECK(tool_call_arguments_for_template("[1,2]", true).is_string());
+}

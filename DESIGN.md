@@ -2197,6 +2197,23 @@ the link in ~0.12 s against ~35 s of prefill), a design item. The
 `--cache-reuse` question is closed on paper: no observed miss is a
 near-front mismatch.
 
+#### 7.0.2k Tool calls 500'd on the agent endpoint: the arguments contract (2026-08-30)
+
+The first tool-using turn after the agents moved onto arcint failed with
+*"Can only get item pairs from a mapping"* from the Qwen3.6 template's
+`tool_call.arguments|items`. The wire format carries a tool call's arguments
+as a JSON string (OpenAI's does, and every client following it); this
+template iterates them as a mapping. minja detects that
+(`requires_object_arguments`) and would convert — but arcint switches
+`apply_polyfills` off under §3.7 so that minja never rewrites what the
+template renders, and that switch also disabled the conversion. Handing the
+template the type its contract asks for is input normalisation, not a
+polyfill: `tool_call_arguments_for_template` now passes the parsed object
+when the template's own capability flag says it wants one and the string
+parses as an object, and leaves the string otherwise. Red on the live
+endpoint, green on the source build with the real template, unit-tested,
+shipped as 0.2.7.
+
 #### 7.0.2b The XMX question cannot be decided from the profile
 
 The proposed five-minute check — grep a `ARCINT_PROFILE` for `dpas`/systolic

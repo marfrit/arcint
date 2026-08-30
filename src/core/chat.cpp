@@ -366,6 +366,13 @@ ToolSchemas tool_schemas(const std::vector<ToolSpec>& tools) {
     return schemas;
 }
 
+json tool_call_arguments_for_template(const std::string& arguments, bool template_wants_object) {
+    if (!template_wants_object) return json(arguments);
+    json parsed = json::parse(arguments, nullptr, /*allow_exceptions=*/false);
+    if (parsed.is_object()) return parsed;
+    return json(arguments);
+}
+
 std::string render_chatml_stub(const ChatRequest& req) {
     std::string out;
 

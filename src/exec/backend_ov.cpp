@@ -922,7 +922,7 @@ public:
 
     std::string render_chat(const ChatRequest& req) const override {
         minja::chat_template_inputs inputs;
-        inputs.messages            = messages_json(req);
+        inputs.messages            = messages_json(req, template_->original_caps().requires_object_arguments);
         inputs.tools               = tools_json(req);
         inputs.add_generation_prompt = true;
         if (req.has_enable_thinking) {
@@ -2988,7 +2988,7 @@ private:
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }
 
-    static json messages_json(const ChatRequest& req) {
+    static json messages_json(const ChatRequest& req, bool object_arguments) {
         json out = json::array();
         for (const ChatMessage& m : req.messages) {
             json msg{{"role", m.role}, {"content", m.content}};
@@ -3000,7 +3000,9 @@ private:
                     calls.push_back({{"id", c.id},
                                      {"type", "function"},
                                      {"function",
-                                      {{"name", c.name}, {"arguments", c.arguments}}}});
+                                      {{"name", c.name},
+                                       {"arguments", tool_call_arguments_for_template(
+                                                         c.arguments, object_arguments)}}}});
                 }
                 msg["tool_calls"] = std::move(calls);
                 if (m.content.empty()) msg["content"] = nullptr;
