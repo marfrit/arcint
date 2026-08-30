@@ -87,7 +87,7 @@
     "tokenizer_sha": "87a7830d63fcf43b",
     "lm_xml_sha": "21fe4d57d6d016f5",
     "lm_bin_bytes": 18646558274,
-    "status": "head pairs (93.9% code / 75.4% prose draft acceptance, B60, 2026-08-30); --mtp on 48-53 t/s vs 71.5 t/s off — the M=2 MoE forward runs the prefill path and the f16 dense-all-experts head costs 11 ms a draft; not for production",
+    "status": "head pairs (93.9% code / 75.4% prose draft acceptance, B60, 2026-08-30); --mtp on 48-53 t/s vs 71.5 t/s off — the serving loop is host-bound (36.5 ms of wall for 16.7 ms of device per accepted pair) and the f16 dense-expert head is 6.7 ms of device a draft, a wash on device time; not for production",
     "mtp_num_hidden_layers": 1,
     "mtp_head_exported": true
   }

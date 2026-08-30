@@ -95,3 +95,49 @@ the honest sentence for the 35B card is not "when the plugin has a small-M
 MoE path" but: *the speculation loop is host-bound on Arc today, 36.5 ms of
 wall for 16.7 ms of device per accepted pair; the device budget alone would
 be +59%, and the work is in the serving loop, not the kernels.*
+
+## Graph read (next morning): the router is there; the dense read is ours
+
+The reply to the table above asked the right first question: does the
+exported head still contain its top-k router, or did `tools/export_mtp.py`
+flatten the MoE into a dense read? Read from the XML, no build:
+
+- `openvino_mtp_layer.xml` (3.6-35B head): `TopK` 1, `ScatterElementsUpdate`
+  1, `Gather` 6, `MatMul` 12. The router is present — softmax, top-8,
+  renormalise, scatter the eight weights into a zero row over 256 experts.
+- The base IR's own MoE layer (`layers.0.mlp`): `SoftMax`/`TopK`/`ReduceSum`/
+  `Divide`/`ScatterElementsUpdate` plus `Tile`/`Broadcast`/`Transpose` and
+  per-expert `MatMul`s over experts stored as `u4 [256, out, groups, 64]` with
+  `f16` scales and `u4` zero points — HuggingFace's per-expert loop, which
+  the plugin's `fuse_moe_experts` pass matches (NonZero/Split/Gather/Slice/
+  Broadcast/ScatterElementsUpdate around each expert) and lowers to the
+  `moe_3gemm_fused_compressed` primitive behind the batched-GEMV kernels of
+  the table above.
+
+So nothing was lost on export. The 1.69 GB is read because the exporter's
+`moe_block` *chose* a dense lowering — every expert computed for every
+token, the non-selected ones weighted by exactly zero — to keep a
+data-dependent loop out of the graph. That formulation matches no plugin
+pattern, so it runs as it is written: two batched f16 MatMuls over all 256
+experts, 6.7 ms of device per draft. The plugin's decode kernels for this
+exact MoE exist and are in use 40 times per step in the body; the head does
+not reach them because its graph is not the shape the fusion pass looks for.
+
+Options, in the order of least new mechanism:
+
+1. **Emit the base's pattern.** Export the head's MoE as the same per-expert
+   subgraph the base IR carries, with the experts in the base's `u4
+   [E, out, groups, 64]` layout, so `fuse_moe_experts` lowers it to the same
+   primitive. At M=1 that is a top-8 gather at int4: ~13 MB of expert traffic
+   against 1.69 GB, and the priming forward at M=128 gets the grouped-GEMM
+   prefill path for free. The cleanest way to get the pattern exactly right is
+   to clone the base IR's `layers.0.mlp` subgraph and swap its constants for
+   the head's.
+2. **A gather lowering of our own** (`Gather` the eight experts' weights, then
+   two MatMuls): correct at M=1, and still an unfused graph with u4
+   decompression in front of every MatMul.
+3. **The int4 dense head** as it is: the same 256-expert read at a quarter of
+   the bytes, ~2 ms of device — the smallest change and the smallest win.
+
+(1) is the one that makes the head sparse like the body; (3) is being
+measured meanwhile because it costs nothing but a compression run.
