@@ -1825,6 +1825,52 @@ Two things that are **not** established and are recorded as such:
   evidence, not a mechanism, and §7.0.2b already says `exec_type` cannot settle
   it. It stays labelled until instruction-level tracing does.
 
+#### 7.0.2d The attribution gap, settled by an instrument that can see gaps (2026-08-30)
+
+The profiler sums parts; a gap has no node to attribute it to. So the 70% of
+prefill graph time no node accounted for was measured with an OpenCL device
+timeline (kernel enqueue / start / end per command), which counts occupancy on
+the device rather than node totals — a different counting principle from the
+apparatus that found the gap. Full record, controls and pre-registration in
+`docs/attribution-gap.md`.
+
+**The pre-registered prediction was wrong, and the question was framed wrong.**
+It asked one binary — card idle, or profiler blind — as though prefill and
+decode had a shared answer. They do not:
+
+- **Prefill is device-bound: 95.1% busy** (4.980 s of a 5.235 s span, reproduced
+  to 0.05% across two clusters). The profiler was blind, not the card idle.
+- **Decode is host-bound: ~43% busy**, so roughly half of a decode step is spent
+  with the card idle. Corrected for tracer overhead, which is +0.9% on prefill
+  and **+42% on decode** — a per-call interceptor lands on exactly the path that
+  limits a host-bound phase. Uncorrected it would have read 77% idle.
+
+The lesson for the next binary: **ask per phase.** One number for "the model"
+hides the phase whose answer is the opposite.
+
+**Why no node share ever converted.** Same run, same chunk, two ops with a clean
+1:1 between nodes and launches: PERF_COUNT reported 14.97 ms where the device
+spent 27.23 ms on the conv, and 36.78 against 67.19 ms on GDN — **1.82x and
+1.83x**. It reports about 55% of a kernel's own device time, sees no transfer
+at all, and does not enumerate sub-kernels (13342 device commands against
+~7150 node executions). The profiler's tables now say so at the point of
+printing, with the capture they are a share of, because six implicit
+denominators produced three retracted headlines.
+
+**What prefill is made of, as shares of its own wall time** (12916 tokens, f16
+KV, chunk 2048): `clEnqueueMemcpyINTEL` 17.6% — six device-to-host copies of
+142.74 ms, one per chunk, no node; `grouped_micro_gemm` 17.4%;
+`sdpa_micro` 10.9%; **`ref_matmul` 10.1%** (the shared-expert gate — larger
+than every node-share estimate of it); `gemm_kernel` 8.9%; GDN 8.0%; MoE
+scatter 6.7%; `generic_eltwise_ref` 3.5%; conv **3.3%**; idle 4.9%.
+
+**Item 3 above is retired.** `PagedCausalConv1D` was a decode lever or nothing,
+and on the device it is 0.9 ms of a 190 ms untraced decode step: **0.47%**, not
+the 6.3% its case rested on — that figure was a PERF_COUNT node share of a
+past-0 capture, twice removed from wall time. A perfect conv kernel buys well
+under 1 t/s. Nobody should re-derive the 6.3% from the older tables in this
+section; they measure what the counter reports, not what the card does.
+
 #### 7.0.2b The XMX question cannot be decided from the profile
 
 The proposed five-minute check — grep a `ARCINT_PROFILE` for `dpas`/systolic

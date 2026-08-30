@@ -386,7 +386,24 @@ bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model,
     const ov::Output<ov::Node> hidden = node->input_value(0);
     const ov::PartialShape&    ps     = hidden.get_partial_shape();
     if (ps.rank().is_dynamic() || ps.rank().get_length() < 2) return false;
-    const int64_t axis = ps.rank().get_length() - 2;  // [..., tokens, hidden]
+    // The token axis is not at a fixed position. The dense export is
+    // [1, tokens, hidden]; the paged export is [tokens, 1, hidden]. Assuming
+    // rank-2 sliced the singleton batch axis of the paged graph -- "last 1 of
+    // 1", a no-op that returned true -- and every prefill chunk went on
+    // computing and copying [M, vocab] f32 logits to the host: 1.9 GiB per
+    // 2048-token chunk at the link's full rate, 17.6% of prefill wall, found
+    // by an OpenCL timeline on 2026-08-30. So: the token axis is the leading
+    // axis that can hold more than one row. Exactly one such axis, or bail.
+    int64_t axis = -1;
+    for (int64_t i = 0; i < ps.rank().get_length() - 1; ++i) {
+        const ov::Dimension& d = ps[i];
+        const bool can_exceed_one = d.is_dynamic() ? (d.get_max_length() > 1)
+                                                   : (d.get_length() > 1);
+        if (!can_exceed_one) continue;
+        if (axis >= 0) return false;  // two candidates: do not guess
+        axis = i;
+    }
+    if (axis < 0) return false;
 
     using ov::op::v0::Constant;
     const auto start = Constant::create(ov::element::i64, {1}, {-keep_rows});
@@ -1684,7 +1701,22 @@ private:
             if (slice_logits_to_last_token(model, keep)) {
                 log::info("load", "logits sliced to the last %lld row(s)",
                           static_cast<long long>(keep));
+            } else {
+                log::warn("load", "%s", "logits NOT sliced: every prefill chunk will "
+                                        "compute and copy [M, vocab] logits");
             }
+        }
+        // What the graph will actually hand back per execution. A 2 GiB
+        // device-to-host copy per prefill chunk (2026-08-30) turned out to be
+        // the full [M, vocab] logits leaving the card while this log claimed
+        // they were sliced to one row -- so the claim is now checked against
+        // the model's own output ports rather than against the rewrite's
+        // return value.
+        for (const auto& port : model->outputs()) {
+            std::ostringstream os;
+            os << port.get_partial_shape();
+            log::info("load", "paged output '%s' %s %s", port.get_any_name().c_str(),
+                      port.get_element_type().get_type_name().c_str(), os.str().c_str());
         }
 
         offload_ratio_ = cfg.offload_ratio;
@@ -2674,6 +2706,13 @@ private:
             // used to argue about scaling.
             paged_forward(lane, embed_paged(lane, chunk), at, {0}, 0);
             paged_forward(lane, embed_paged(lane, chunk), at, {0}, 0);
+            {
+                const ov::Tensor lg = lane.req.get_tensor("logits");
+                std::ostringstream os;
+                os << lg.get_shape();
+                log::info("profile", "logits tensor after M=%zu: %s, %.1f MiB", m,
+                          os.str().c_str(), lg.get_byte_size() / (1024.0 * 1024.0));
+            }
             dump(log::format("prefill M=%zu past=%zu", m, past).c_str(), m);
             release_lane(lane);
         }
