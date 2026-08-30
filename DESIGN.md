@@ -2034,6 +2034,19 @@ condition can be met, which is read next. The split variant is kept as the
 implementation (fewer primitives than the slice, sigmoid still fused); the
 flag stays off by default with the same break-even.
 
+**Why the crop is not a view — read, not confirmed.** `prepare_buffer_fusing`
+lets a dynamic crop through at build time on the simple-format check alone (no
+padding exists yet) and defers the in-place decision to runtime, where a crop
+along the feature axis gives its output a *dynamic* padding on that axis
+(`update_in_place_crop_padding_along_feature` sets `_dynamic_dims_mask`). The
+consumer here is a broadcasting `Multiply`, `[M,1]` against `[M,2048]`. None of
+the explicit refusals in the pass match (gemm user, lstm/lora/mvn user,
+non-constant split inputs, constant node), so the likely refusal is whether
+that eltwise implementation accepts a dynamically padded broadcast operand.
+That is a hypothesis; confirming it is a plugin-side read with a plugin-side
+fix, and the payoff is ~0.85 ms of a decode step that vanishes anyway once
+decode is no longer launch-bound. Parked at that price.
+
 #### 7.0.2h The decode primitive histogram: a handful of classes, not a long tail
 
 One decode step, every node the plugin walks, by name (`ARCINT_PROFILE_NODES`):
