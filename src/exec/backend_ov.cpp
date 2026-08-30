@@ -358,7 +358,7 @@ size_t route_head_swap_permutes(const std::shared_ptr<ov::Model>& model) {
 }
 
 bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model,
-                                int64_t keep_rows) {
+                                int64_t keep_rows, int64_t token_axis) {
     const auto& results = model->get_results();
     if (results.empty()) return false;
 
@@ -386,24 +386,18 @@ bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model,
     const ov::Output<ov::Node> hidden = node->input_value(0);
     const ov::PartialShape&    ps     = hidden.get_partial_shape();
     if (ps.rank().is_dynamic() || ps.rank().get_length() < 2) return false;
-    // The token axis is not at a fixed position. The dense export is
-    // [1, tokens, hidden]; the paged export is [tokens, 1, hidden]. Assuming
+    // The token axis is not at a fixed position, and it cannot be found from
+    // the shape: the dense export is [1, tokens, hidden] and the paged export
+    // is [tokens, 1, hidden], but the paged graph declares both leading axes
+    // dynamic, so "the one that can exceed one row" matches both. Assuming
     // rank-2 sliced the singleton batch axis of the paged graph -- "last 1 of
     // 1", a no-op that returned true -- and every prefill chunk went on
     // computing and copying [M, vocab] f32 logits to the host: 1.9 GiB per
     // 2048-token chunk at the link's full rate, 17.6% of prefill wall, found
-    // by an OpenCL timeline on 2026-08-30. So: the token axis is the leading
-    // axis that can hold more than one row. Exactly one such axis, or bail.
-    int64_t axis = -1;
-    for (int64_t i = 0; i < ps.rank().get_length() - 1; ++i) {
-        const ov::Dimension& d = ps[i];
-        const bool can_exceed_one = d.is_dynamic() ? (d.get_max_length() > 1)
-                                                   : (d.get_length() > 1);
-        if (!can_exceed_one) continue;
-        if (axis >= 0) return false;  // two candidates: do not guess
-        axis = i;
-    }
-    if (axis < 0) return false;
+    // by an OpenCL timeline on 2026-08-30. So the caller states the layout,
+    // and the reservation probe checks the claim against a real forward.
+    const int64_t axis = token_axis >= 0 ? token_axis : ps.rank().get_length() - 2;
+    if (axis >= ps.rank().get_length() - 1) return false;
 
     using ov::op::v0::Constant;
     const auto start = Constant::create(ov::element::i64, {1}, {-keep_rows});
@@ -635,7 +629,7 @@ public:
             // has to be at least two rows wide whenever the head is loaded.
             const size_t  drafts_max = std::max<size_t>(draft_tokens_, want_mtp_ ? 1 : 0);
             const int64_t keep       = static_cast<int64_t>(1 + drafts_max);
-            if (slice_logits_to_last_token(model, keep)) {
+            if (slice_logits_to_last_token(model, keep, -1)) {
                 log::info("load", "logits sliced to the last %lld token(s): prefill computes "
                                   "%lld row(s) instead of one per prompt token",
                           static_cast<long long>(keep), static_cast<long long>(keep));
@@ -1698,7 +1692,10 @@ private:
         rows_per_lane_ = drafts_max_ + 3;
         if (cfg.slice_logits) {
             const int64_t keep = static_cast<int64_t>(1 + drafts_max_);
-            if (slice_logits_to_last_token(model, keep)) {
+            // Token axis 0: the paged export's hidden state is [tokens, 1, hidden].
+            // Stated here, verified below by the probe's first forward.
+            if (slice_logits_to_last_token(model, keep, 0)) {
+                logits_keep_rows_ = static_cast<size_t>(keep);
                 log::info("load", "logits sliced to the last %lld row(s)",
                           static_cast<long long>(keep));
             } else {
@@ -1910,6 +1907,23 @@ private:
         double    slope_extra = 0.0;
         {
             act128 = probe(lane0, floor_c);
+            // The slice's layout claim, checked against what the graph returned
+            // for this forward rather than against the rewrite's return value.
+            if (logits_keep_rows_ > 0) {
+                const ov::Tensor lg    = lane0.req.get_tensor("logits");
+                const size_t     vocab = lg.get_shape().back();
+                const size_t     rows  = vocab > 0 ? lg.get_size() / vocab : 0;
+                if (rows != logits_keep_rows_) {
+                    std::ostringstream os;
+                    os << lg.get_shape();
+                    throw std::runtime_error(log::format(
+                        "logits slice did not take: %zu row(s) for a %zu-token forward, "
+                        "shape %s -- the token axis is not where the slice assumed",
+                        rows, floor_c, os.str().c_str()));
+                }
+                log::info("load", "logits slice verified: %zu row(s) for a %zu-token forward",
+                          rows, floor_c);
+            }
             // What a SECOND lane costs, measured rather than assumed to be
             // another full peak. On the B60 with the coder it costs nothing:
             // the plugin pools intermediates per compiled model, not per
@@ -3109,6 +3123,7 @@ private:
     size_t                         kv_block_tokens_  = 16;
     size_t                         kv_bytes_token_   = 0;
     size_t                         la_row_bytes_     = 0;
+    size_t                         logits_keep_rows_ = 0;  // 0: unsliced
     int                            paged_n_ctx_      = 0;
     size_t                         paged_sections_   = 4;    // position_ids dim 0
     size_t                         drafts_max_       = 0;

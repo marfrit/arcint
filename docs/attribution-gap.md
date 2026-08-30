@@ -188,3 +188,17 @@ wall shares by any single factor, because the missing mass is not distributed
 proportionally — transfers and sub-kernels attach to particular ops. The
 profiler tables now say so at the point of printing, alongside the chunk
 denominator.
+
+---
+
+# Follow-up: the 142.74 ms copy (same day)
+
+Priced first because it was the largest identified item, lived in our code and
+was constant enough to diagnose in minutes. It was: transfer tracking put it at
+2,034,237,440 bytes — 993,280 per token, 248,320 x 4, the full f32 logits — at
+14.25 GB/s, full link rate. Not a path problem. The logits slice had cut the
+paged graph's singleton batch axis instead of its token axis and reported
+success. Fixed by stating the axis per layout and verifying it against the
+probe's first forward. Prefill 5.02 -> 3.97 s at 12448 tokens (+27%),
+transfers 17.6% -> 0.5% of wall, activation reservation at chunk 2048
+2.99 -> 0.90 GiB, greedy output byte-identical. DESIGN 7.0.2e has the table.

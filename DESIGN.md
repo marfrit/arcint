@@ -1871,6 +1871,58 @@ past-0 capture, twice removed from wall time. A perfect conv kernel buys well
 under 1 t/s. Nobody should re-derive the 6.3% from the older tables in this
 section; they measure what the counter reports, not what the card does.
 
+#### 7.0.2e The 142.74 ms copy was the logits, and the slice had missed (2026-08-30)
+
+The largest single item the timeline priced was a device-to-host copy of
+142.74 ms per prefill chunk — six per prefill, 17.6% of prefill wall, no node.
+Three checks, none of them a kernel:
+
+1. **Size.** Transfer tracking in the tracer: **2,034,237,440 bytes** per copy,
+   which at 142.74 ms is **14.25 GB/s** — the link at full DMA rate, the same
+   rate the 16 MiB embeddings copies run at. So a volume problem, not a path
+   problem, and the pinned-versus-pageable question was dead before it was
+   asked. Across the reservation probe the copies went 127 -> 254 -> 508 ->
+   1017 -> 2034 MB for M = 128 ... 2048, and 444,989,440 bytes for the final
+   448-token chunk: **993,280 bytes per token, exactly 248,320 x 4**. The
+   artifact's vocabulary is 248,320. It was the full f32 logits, one row per
+   prompt token.
+2. **Why, when the log said "logits sliced to the last 1 row(s)".** The slice
+   walks to the LM head and cuts axis `rank - 2` of its input. The dense export
+   is `[1, tokens, hidden]`, where that is the token axis. The paged export is
+   `[tokens, 1, hidden]`, where it is the singleton batch axis: "last 1 of 1",
+   a no-op that returned true. Every chunk went on computing and copying
+   `[M, 248320]` logits that only the last chunk's last row ever read. The
+   graph declares both leading axes dynamic, so the layout cannot be read from
+   the shape: an attempt to detect "the one axis that can exceed one row"
+   found two and bailed, leaving the model unsliced — and produced an A/B
+   whose before and after were identical to the millisecond, which is how that
+   attempt was caught. The caller now states the token axis (0 on the paged
+   path, `rank - 2` on the dense one) and **the reservation probe verifies the
+   claim against a real forward**: `logits slice verified: 1 row(s) for a
+   128-token forward`, or refuse to start.
+3. **Needed at all?** No. Elided, not accelerated.
+
+**Measured, same prompt, same card, f16 KV, chunk 2048, 12448 tokens:**
+
+| | before | after |
+|---|---|---|
+| prefill wall | 5.02 s (2479 t/s) | **3.97 s (3137 t/s)** — **-21% / +27%** |
+| device-to-host copies > 5 ms per prefill | 6 x 142.7 ms | **none** |
+| transfers, share of prefill wall | 17.6% | 0.5% |
+| device busy | 4.980 s | 3.935 s |
+| activation reservation, chunk 2048 | 2.99 GiB (1283.9 KiB/token) | **0.90 GiB** (216.9 KiB/token) |
+| greedy output, 96 tokens | — | **byte-identical** |
+
+The reservation line is the second win: 2.09 GiB of the activation budget was
+logits nobody read, and it comes back as context or chunk. The LM-head GEMM
+over the discarded rows went with the copy (`gemm_kernel` 468 -> 403 ms per
+prefill). Decode is unchanged, as it should be: it always ran one row.
+
+What remains of prefill on the device, as shares of wall (4.30 s): MoE expert
+GEMM 20.9%, **`ref_matmul` 12.2%** (the gate; grown again with the
+denominator), attention 12.0%, GDN 9.5%, `gemm_kernel` 9.4%, MoE scatter
+7.9%, `generic_eltwise_ref` 4.2%, conv 3.9%, idle 8.4%.
+
 #### 7.0.2b The XMX question cannot be decided from the profile
 
 The proposed five-minute check — grep a `ARCINT_PROFILE` for `dpas`/systolic
