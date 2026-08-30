@@ -102,6 +102,7 @@ struct Config {
     // deep-context endpoint on a card with room should say f16.
     std::string paged_kv                  = "u8";    // u8 | f16
     int         gate_pad                  = 0;       // 0 = off; 16 = the measured setting
+    int         cache_grid                = 128;     // prefix-cache snapshot grid in tokens; 0 = the prefill chunk
     int         gdn_checkpoint_budget_mib = 512;     // §3.3
     std::string mtp                       = "auto";  // on | off | auto
 

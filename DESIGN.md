@@ -1121,6 +1121,60 @@ a cached page is reclaimable, a live sequence's is not — and only if that is
 not enough does the request end, cleanly, rather than as an allocation failure
 on the card.
 
+
+### 4.4 A host tier for evicted prefixes — design (2026-08-30, not yet implemented)
+
+**Why.** The replay of real sessions (§7.0.2j) puts 37% of the agent's prefill
+work into re-prefilling sessions the pool could not hold: 82 misses averaging
+107k tokens, ~35 s each at 3000 t/s, because the operator interleaves long
+sessions and the 377k-token pool holds two of them, not three. The pool total
+is fixed by the card; the n_ctx/spare split does not change it. Host RAM is
+48 GB on the dev host and the link moves 14.25 GB/s measured (§7.0.2e): a
+150k-token prefix is 1.7 GB of u8 KV and comes back in ~0.12 s.
+
+**What.** An evicted entry is *demoted*, not dropped: its KV pages are copied
+to a host buffer, its page references released, and the entry stays in the LRU
+list marked tiered, with its GDN row (already host-resident) untouched. A hit
+on a tiered entry *promotes* it: pages are allocated (evicting — demoting —
+further LRU entries if needed), the host buffer is copied back into them, and
+the ordinary restore follows. If pages cannot be found even after that, the
+hit degrades to a cold prefill, which is what happens today.
+
+**Invariant.** Pages come back byte-exact, so a promoted entry is
+indistinguishable from one that was never evicted, and §3.4's warm-equals-cold
+gate holds by construction. The gate for the feature is the same gate under a
+pool small enough to force demotion and promotion between the two requests.
+
+**Budget.** `--cache-host-mib N`, 0 = off (the default until measured). The
+byte budget counts the host KV buffers; LRU order is shared with the resident
+entries, so a tiered entry ages out of the host tier the same way it aged out
+of the pool.
+
+**Copy path, read against the pinned runtime.** `ov::RemoteTensor` offers
+whole-tensor `copy_to`/`copy_from` only; the ROI constructor exists on
+`ov::Tensor`. A page is 16 tokens across 20 pool tensors (10 attention layers,
+K and V) — ~9 KiB per tensor per page at u8, 181 KiB per page in all. Copying
+page by page would be ~187k calls for a 150k-token prefix and the call cost,
+not the bytes, would dominate. So the unit of copy is a **run** of pages
+contiguous in the pool: the allocator hands out ascending free ids, so a
+prefix filled in one prefill is mostly a few long runs; after churn it
+fragments, and the design accepts that as a measured cost before reaching for
+a gather kernel through the `--custom-kernels` seam (one launch per tensor
+into a staging buffer, then one copy — the fallback if fragmentation makes run
+copies slow).
+
+**Interaction with copy-on-write.** Demotion releases only the entry's own
+references; pages still shared with the live lane or with a resident ancestor
+stay resident, and promotion first tries to re-share those rather than copy
+them back. The first implementation copies everything and measures; sharing
+on promotion is an optimisation with a number attached later.
+
+**What it costs to try.** ~300 lines: a `HostKv` per entry, demote in
+`ensure_blocks` ahead of `evict_oldest`, promote in the hit path ahead of
+`restore_paged`, the run-coalescing copy, the budget, two `/health` fields and
+the hit line saying `from host tier, 0.12 s`. The measurement is the replay's
+82 misses turned into promotions: the number to beat is 35 s per miss.
+
 ## 5. Testing and acceptance
 
 - **Prüfstand gate**: the fleet's 10-point code-generation harness runs against

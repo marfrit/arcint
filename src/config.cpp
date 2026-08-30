@@ -83,6 +83,10 @@ std::string usage_text() {
         "  --prefill-chunk N         prefill chunk in tokens, 0 = unchunked\n"
         "                            (default: 2048; bounds activation memory)\n"
         "  --paged-kv u8|f16         KV precision on the paged path (default: u8).\n"
+        "  --cache-grid N            prefix-cache snapshot grid in tokens (default: 128; 0 = the\n"
+        "                            prefill chunk). A snapshot lands on the last multiple of N\n"
+        "                            below the prompt length; a coarser grid re-prefills the\n"
+        "                            remainder on every continuation. DESIGN 7.0.2j.\n"
         "  --gate-pad N              widen the shared-expert gate to N columns (default: 0,\n"
         "                            off). 16 is the measured setting: -13% prefill wall,\n"
         "                            -5% decode; pays off below ~500 answer tokens per 12k\n"
@@ -171,6 +175,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.parallel)) {
                 return fail("--parallel needs an integer");
             }
+        } else if (arg == "--cache-grid") {
+            if (!value(v) || !parse_int(v, cfg.cache_grid)) return fail("--cache-grid needs an integer");
         } else if (arg == "--gate-pad") {
             if (!value(v) || !parse_int(v, cfg.gate_pad)) return fail("--gate-pad needs an integer");
         } else if (arg == "--paged-kv") {
@@ -318,6 +324,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         // paged path already gets them from the plugin (DESIGN.md §3.3).
         return fail("--kv-dtype q8 is not implemented: a plain cast to int8 has no scales and "
                     "silently degrades the answer. Use fp16, or the paged path once it lands.");
+    }
+    if (cfg.cache_grid < 0 || cfg.cache_grid > 65536) {
+        return fail(log::format("--cache-grid must be 0 (the chunk) or 1..65536, not %d", cfg.cache_grid));
     }
     if (cfg.gate_pad < 0 || cfg.gate_pad == 1 || cfg.gate_pad > 4096) {
         return fail(log::format("--gate-pad must be 0 (off) or 2..4096, not %d", cfg.gate_pad));

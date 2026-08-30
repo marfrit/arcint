@@ -1513,9 +1513,16 @@ private:
                                             .count();
 
         const size_t grid = prefill_chunk_ > 0 ? static_cast<size_t>(prefill_chunk_) : 0;
+        // The snapshot grid is finer than the chunk grid (--cache-grid): the
+        // chunk that contains the snapshot point is cut there, so the state at
+        // snap_at exists to be captured. That cut is the one place the warm
+        // continuation's forward boundaries can differ from a cold run's, and
+        // whether the paged kernels are exact across it is gated, not assumed
+        // (DESIGN 7.0.2j; --cache-grid 0 restores the chunk grid).
+        const size_t sgrid = cache_grid_ > 0 ? cache_grid_ : grid;
         const size_t snap_at =
-            prefix_cache_ != nullptr && grid > 0 && prompt_ids.size() > grid
-                ? ((prompt_ids.size() - 1) / grid) * grid
+            prefix_cache_ != nullptr && sgrid > 0 && prompt_ids.size() > sgrid
+                ? ((prompt_ids.size() - 1) / sgrid) * sgrid
                 : 0;
 
         const bool trace = std::getenv("ARCINT_TRACE_TOKENS") != nullptr;
@@ -1526,6 +1533,7 @@ private:
                 const size_t edge = ((past / grid) + 1) * grid;
                 take = std::min(edge, prompt_ids.size()) - past;
             }
+            if (snap_at > past && snap_at < past + take) take = snap_at - past;
             const auto t_blocks = clock::now();
             const bool got      = ensure_blocks(lane, past + take);
             stats.prefill_blocks_seconds += seconds_since_tp(t_blocks);
@@ -2183,6 +2191,23 @@ private:
                   static_cast<double>(kv_bytes_token_) / 1024.0,
                   static_cast<double>(total) / (1u << 30), max_ctx);
         prefill_chunk_ = static_cast<int>(chunk);
+        // The snapshot grid. Tied to the chunk until 2026-08-30, which on the
+        // agent re-prefilled ~1900 tokens per continuation where 128 would
+        // re-prefill ~970 (replay of real sessions, DESIGN 7.0.2j). It must
+        // divide a page, because an entry keeps whole pages, and be a multiple
+        // of the cache's hash block; it cannot exceed the chunk.
+        cache_grid_ = 0;
+        if (cfg.cache_grid > 0 && prefill_chunk_ > 0) {
+            const size_t unit = std::max<size_t>(kv_block_tokens_, 32);
+            size_t g = (static_cast<size_t>(cfg.cache_grid) + unit - 1) / unit * unit;
+            g = std::min<size_t>(g, static_cast<size_t>(prefill_chunk_));
+            if (g != static_cast<size_t>(cfg.cache_grid)) {
+                log::info("load", "--cache-grid %d rounded to %zu (page %zu, hash block 32, chunk %d)",
+                          cfg.cache_grid, g, kv_block_tokens_, prefill_chunk_);
+            }
+            cache_grid_ = g;
+        }
+        log::info("load", "prefix-cache snapshot grid %zu tok", cache_grid_ > 0 ? cache_grid_ : static_cast<size_t>(prefill_chunk_));
 
         if (static_cast<long long>(wanted) > max_ctx) {
             if (req_n_ctx > 0) {
@@ -3281,6 +3306,7 @@ private:
     size_t                         kv_bytes_token_   = 0;
     size_t                         la_row_bytes_     = 0;
     size_t                         logits_keep_rows_ = 0;  // 0: unsliced
+    size_t                         cache_grid_       = 0;  // paged snapshot grid; 0: the chunk
     int                            paged_n_ctx_      = 0;
     size_t                         paged_sections_   = 4;    // position_ids dim 0
     size_t                         drafts_max_       = 0;
