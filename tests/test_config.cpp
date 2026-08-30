@@ -132,7 +132,13 @@ TEST(config_mtp_on_requires_an_mtp_head) {
     Config cfg;
     CHECK(run({"--stub", "--model-id", "qwen3.8-27b", "--mtp", "on"}, cfg).ok);
     for (const std::string& id : model_ids()) {
-        if (id == "qwen3.8-27b") continue;
+        // Every entry that carries a head accepts the switch; every other
+        // entry refuses it. Intel's 3.8 export is the second one with a head.
+        if (find_model(id)->has_mtp_head) {
+            Config c;
+            CHECK(run({"--stub", "--model-id", id.c_str(), "--mtp", "on"}, c).ok);
+            continue;
+        }
         CHECK(rejected({"--stub", "--model-id", id.c_str(), "--mtp", "on"}));
     }
 }

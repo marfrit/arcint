@@ -1,5 +1,5 @@
 {
-  "_comment": "Raw IR metadata pulled from the dev host's /models/ov/ on 2026-08-28 (pre-M0 handover). sha256 prefixes, 16 hex chars. All three share tokenizer 87a7830d63fcf43b. full_attention_interval 4 = 1 in 4 layers full attention, rest GDN. Coder is expert-PRUNED: 184 of 256. 2026-08-28: mtp fields added after inspecting the IRs \u2014 all three checkpoints declare mtp_num_hidden_layers 1, and NONE of the exports contain an MTP graph (only 'logits'), so no MTP head is servable from these artifacts. 2026-08-28 (later): qwen38-b7c1-ov now DOES carry a servable MTP head. optimum-intel still drops it, so tools/export_mtp.py reconstructs it from the unquantised mtp.* tensors in /models/gptq/qwen38-gptq-mtp and writes openvino_mtp_layer.xml and openvino_mtp_lm_head.xml beside the model; measured 66% draft acceptance. The other two exports are unchanged.",
+  "_comment": "Raw IR metadata pulled from the dev host's /models/ov/ on 2026-08-28 (pre-M0 handover). sha256 prefixes, 16 hex chars. All three share tokenizer 87a7830d63fcf43b. full_attention_interval 4 = 1 in 4 layers full attention, rest GDN. Coder is expert-PRUNED: 184 of 256. 2026-08-28: mtp fields added after inspecting the IRs — all three checkpoints declare mtp_num_hidden_layers 1, and NONE of the exports contain an MTP graph (only 'logits'), so no MTP head is servable from these artifacts. 2026-08-28 (later): qwen38-b7c1-ov now DOES carry a servable MTP head. optimum-intel still drops it, so tools/export_mtp.py reconstructs it from the unquantised mtp.* tensors in /models/gptq/qwen38-gptq-mtp and writes openvino_mtp_layer.xml and openvino_mtp_lm_head.xml beside the model; measured 66% draft acceptance. The other two exports are unchanged.",
   "qwen36-coder-b5-ov": {
     "arch": [
       "Qwen3_5MoeForConditionalGeneration"
@@ -53,5 +53,24 @@
     "status": "provisional, 7/10 (AWQ-only; SE calibration degenerates greedy - do not re-add SE)",
     "mtp_num_hidden_layers": 1,
     "mtp_head_exported": true
+  },
+  "qwen38-intel-int4-ov": {
+    "arch": [
+      "Qwen3_5ForConditionalGeneration"
+    ],
+    "model_type": "qwen3_5",
+    "hidden": 5120,
+    "layers": 64,
+    "experts": null,
+    "ctx": 262144,
+    "full_attention_interval": 4,
+    "template_sha": "c3cf9e34abf4f9e3",
+    "tokenizer_sha": "87a7830d63fcf43b",
+    "lm_xml_sha": "ab94a08ce150de6a",
+    "lm_bin_bytes": 13929177378,
+    "status": "unmeasured against the current harness (Intel's public int4 export, OpenVINO/Qwen3.8-27B-int4-ov, 2026-08-30; the reconstructed MTP head copied beside it)",
+    "mtp_num_hidden_layers": 1,
+    "mtp_head_exported": true,
+    "_note": "Intel's export also ships openvino_mtp_model.{xml,bin} of its own (263 MB int4, one MTP layer, no lm_head, same interface as our openvino_mtp_layer). arcint keys the head on openvino_mtp_layer + openvino_mtp_lm_head, which are the reconstructed ones."
   }
 }

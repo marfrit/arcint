@@ -3,12 +3,15 @@
 
 using namespace lgc;
 
-TEST(registry_holds_exactly_the_three_target_models) {
+TEST(registry_holds_exactly_the_target_models) {
+    // Three checkpoints, four artifacts: Intel's public export of the 3.8 is its
+    // own entry with its own status, never an alias of our AWQ export.
     const auto ids = model_ids();
-    CHECK_EQ(ids.size(), 3u);
+    CHECK_EQ(ids.size(), 4u);
     CHECK(find_model("qwen3.6-27b-a3b-coder") != nullptr);
     CHECK(find_model("qwen3.6-35b-a3b") != nullptr);
     CHECK(find_model("qwen3.8-27b") != nullptr);
+    CHECK(find_model("qwen3.8-27b-intel-int4") != nullptr);
 }
 
 TEST(registry_rejects_everything_else) {
@@ -68,6 +71,8 @@ TEST(registry_all_three_share_one_tokenizer) {
 TEST(registry_maps_artifact_directory_names) {
     CHECK(find_by_artifact("qwen36-coder-b5-ov") == find_model("qwen3.6-27b-a3b-coder"));
     CHECK(find_by_artifact("qwen38-b7c1-ov") == find_model("qwen3.8-27b"));
+    CHECK(find_by_artifact("qwen38-intel-int4-ov") == find_model("qwen3.8-27b-intel-int4"));
+    CHECK(find_by_artifact("qwen38-intel-int4-ov") != find_by_artifact("qwen38-b7c1-ov"));
     CHECK(find_by_artifact("some-random-export") == nullptr);
 }
 

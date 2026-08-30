@@ -77,7 +77,12 @@ std::vector<ModelEntry> build_registry() {
         e.template_hash           = "c3f7038f278583e1";
         e.tokenizer_hash          = "87a7830d63fcf43b";
         e.weights_bytes           = 18646558274ull;
-        e.status                  = "unmeasured against the current harness";
+        // Measured 2026-08-30 as the fleet's agent endpoint (arcint-agent.service,
+        // GPU.0 = B60, 262144 context, the reservation admitting 377552): 10/10
+        // greedy on the acceptance task, 3/3 on the tool probe, clean German with
+        // enable_thinking:false, 62.7 t/s decode at 53.5k and 1584 t/s prefill.
+        e.status                  = "10/10 greedy, 3/3 tool probe (B60, 262144, 2026-08-30); "
+                                    "62.7 t/s decode at 53.5k, 1584 t/s prefill";
         e.sampler                 = qwen_card_defaults();
         split_layers(e);
         r.push_back(std::move(e));
@@ -116,6 +121,42 @@ std::vector<ModelEntry> build_registry() {
         // paged path's near-tie landings simply score better on this task.
         e.status = "10/10 greedy (paged+MTP, B60); AWQ-only - SE calibration degenerates "
                    "greedy, do not re-add SE";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+    {
+        // Intel's public export of the same checkpoint -- OpenVINO/Qwen3.8-27B-
+        // int4-ov -- as its own entry, not an alias of qwen38-b7c1-ov: that entry
+        // carries a measured status for our AWQ-only export, and an alias would
+        // make the allowlist assert a result nobody obtained for this file.
+        // Same geometry (hidden 5120, 64 layers, 24/4 heads, vocab 248320, one
+        // MTP layer, untied embeddings), same chat template and tokenizer,
+        // different quantisation of the body. The reconstructed MTP head from
+        // tools/export_mtp.py is placed beside it; whether it pairs is what the
+        // draft-acceptance measurement decides (DESIGN 7.0.2n).
+        ModelEntry e;
+        e.id                      = "qwen3.8-27b-intel-int4";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-intel-int4-ov"};
+        e.ov_arch                 = "Qwen3_5ForConditionalGeneration";
+        e.model_type              = "qwen3_5";
+        e.moe                     = false;
+        e.has_mtp_head            = true;   // the reconstructed head, copied beside it
+        e.mtp_head_pinned         = true;
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 5120;
+        e.n_expert                = 0;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 64;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.arch_hash               = "ab94a08ce150de6a";
+        e.template_hash           = "c3cf9e34abf4f9e3";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 13929177378ull;
+        e.status                  = "unmeasured against the current harness (Intel's public "
+                                    "int4 export with the reconstructed MTP head beside it)";
         e.sampler = qwen_card_defaults();
         split_layers(e);
         r.push_back(std::move(e));
