@@ -1723,8 +1723,15 @@ architecture record:
 
    **Steerability, asked before committing to the long loop.** Not by an
    environment knob (`ONEDNN_GROUPED_GEMM_USED` is the only related string in the
-   shipped plugin, and is unrelated); not by un-fusing the sigmoid or changing
-   the destination dtype, since both feed a filter that never executes. Possibly
+   shipped plugin, and is unrelated); and **not by un-fusing the sigmoid — measured, not
+   argued**. The debug build carries `GPU_DISABLE_POST_OPS_FUSIONS`, and the two
+   arms are unambiguous: control reproduces production exactly (52
+   `attr-post-ops:eltwise_logistic` descriptors, 6 catalog misses), and with
+   fusion off the post-op count falls to **0** while the misses stay at **6**.
+   The flag's own effect is the positive control, so the null is readable. The
+   destination dtype is the same argument one step further out and is *not*
+   tested — it feeds the filter that never executes, which is an inference.
+   Possibly steerable
    by **changing N**, because the catalog matches on shape: padding the gate's
    output width to a catalogued N is a pre-compile graph rewrite we own outright
    — rung zero of §1.1, no OpenVINO change and no oneDNN change. So §1.1's first
