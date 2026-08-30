@@ -37,3 +37,26 @@ equals what the sampler would have picked anyway, so a wrong head cannot
 change the answer — it can only make speculation useless.
 
 License follows the base model (Apache-2.0).
+
+
+---
+
+# Qwen3.6-35B-A3B MTP head for OpenVINO — reconstructed (draft model card)
+
+The same reconstruction for the MoE model: `openvino_mtp_layer` (the MTP
+layer with its 256-expert MLP, 1.69 GB f16) and `openvino_mtp_lm_head` (the
+base IR's int8 lm_head, 509 MB). Built by `tools/export_mtp.py` from the
+checkpoint's own `mtp.*` tensors; pairs with `OpenVINO/Qwen3.6-35B-A3B-int4-ov`.
+
+| body | draft acceptance (greedy, B60) | decode, `--mtp on` vs `off` |
+|---|---|---|
+| Intel's public int4 IR | 93.9% code / 75.4% prose | **48–53 t/s vs 71.5 t/s** |
+
+**Read the second column before using it.** The head is correct, and on an
+Arc card today speculation with it is *slower* than plain decoding: the
+OpenVINO GPU plugin runs a two-token forward of this mixture of experts on
+its prefill path, at 1.8× the cost of a one-token step, and the head as
+exported reads its full expert weights per draft. It is published as the
+reference head — the weights and the graph nobody else has assembled for
+OpenVINO — not as a speed-up. It becomes one when the plugin has a small-M
+MoE decode path; the numbers above are the measurement to repeat then.

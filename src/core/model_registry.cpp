@@ -112,8 +112,9 @@ std::vector<ModelEntry> build_registry() {
         e.template_hash           = "c3f7038f278583e1";
         e.tokenizer_hash          = "87a7830d63fcf43b";
         e.weights_bytes           = 18646558274ull;
-        e.status                  = "unmeasured against the current harness (the 35B with the "
-                                    "reconstructed MoE MTP head; acceptance is the oracle)";
+        e.status                  = "head pairs: 93.9% / 75.4% draft acceptance (code / prose, B60, "
+                                    "2026-08-30) but --mtp on decodes at 48-53 t/s against 71.5 off: "
+                                    "the M=2 MoE forward is the prefill path; not for production";
         e.sampler = qwen_card_defaults();
         split_layers(e);
         r.push_back(std::move(e));

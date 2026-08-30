@@ -2410,6 +2410,50 @@ the serving path**, and the open question is whether Intel's own MTP layer
 paired with our lm_head graph reaches the same acceptance — a one-load
 measurement, not done tonight.
 
+#### 7.0.2o The Qwen3.6 MTP head: right first time, and speculation loses on the MoE (2026-08-30)
+
+The 3.6 checkpoints carry the head — 19 `mtp.*` tensors — but its MLP is a
+mixture of experts (256 experts, top-8, fused `gate_up_proj [E, 2I, H]` and
+`down_proj [E, H, I]`, a sigmoid-gated shared expert), where the 3.8's is a
+dense SwiGLU. `tools/export_mtp.py` now takes its geometry from the config
+and builds the MoE block as every expert computed for every token with the
+non-selected weights exactly zero; the lm_head half is the base IR's own,
+cloned int8 (509 MB); the layer is 1.69 GB f16. Served from a directory of
+symlinks plus the head, as `qwen3.6-35b-a3b-mtp`, so the agent's production
+directory never acquires a head that `--mtp auto` would switch on unmeasured.
+
+**The head is right.** B60, greedy, thinking off, 320 tokens, twice: draft
+acceptance **93.9% (155/165)** on code and **75.4% (138/183)** on prose — the
+same band as the 3.8's head — with no ablation needed; the zero-centred norms,
+the per-head q/gate interleave and the top-k renormalisation all carried over
+from the 3.8 reconstruction as they were.
+
+**And it loses, by 30%.** `--mtp off` decodes at **71.5 t/s**; `--mtp on` at
+**48–53 t/s**. The operator's earlier finding on this model — generating
+tokens was faster than verifying predictions — reproduced with numbers:
+
+| | per call | against a plain step |
+|---|---|---|
+| plain decode step (M=1) | 14.0 ms | 1.0× |
+| verify forward (M=2) | 4.18 s / 165 = **25.3 ms** | **1.8×** |
+| the head's draft | (6.03 − 4.18) s / 165 = **11.2 ms** | 0.8× |
+
+Per accepted pair that is ~36.5 ms for ~1.9 tokens, 19 ms a token against 14
+plain. Two causes, both measured against the dense 3.8 where the same pass
+costs 1.1× a step: the MoE's M=2 forward is not the decode path — it is the
+prefill path (`grouped_micro_gemm`, the `moe_gather_ref`/`moe_scatter`
+kernels) rather than the single-token MoE kernels, so two tokens cost nearly
+two steps — and the head reads 1.69 GB of f16 expert weights per draft,
+which an int4, top-k-gathered head would cut to a few percent of that.
+Fixing the head alone brings the pair to ~27 ms, 14 ms a token: break-even.
+**The blocker is the M=2 MoE path in the plugin**, an upstream item; until
+it exists, speculation on the 35B does not pay on this card, and the agent
+unit stays as it is.
+
+Greedy answers with and without the head differ at one near-tie token late
+in each answer (chars 621 and 1182 of ~1400 and ~1830; equivalent phrasing),
+the verify-pass property already recorded for the 3.8.
+
 #### 7.0.2b The XMX question cannot be decided from the profile
 
 The proposed five-minute check — grep a `ARCINT_PROFILE` for `dpas`/systolic

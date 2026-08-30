@@ -87,7 +87,7 @@
     "tokenizer_sha": "87a7830d63fcf43b",
     "lm_xml_sha": "21fe4d57d6d016f5",
     "lm_bin_bytes": 18646558274,
-    "status": "unmeasured against the current harness (2026-08-30: the 35B artifact as symlinks plus the reconstructed MoE MTP head from tools/export_mtp.py)",
+    "status": "head pairs (93.9% code / 75.4% prose draft acceptance, B60, 2026-08-30); --mtp on 48-53 t/s vs 71.5 t/s off — the M=2 MoE forward runs the prefill path and the f16 dense-all-experts head costs 11 ms a draft; not for production",
     "mtp_num_hidden_layers": 1,
     "mtp_head_exported": true
   }
