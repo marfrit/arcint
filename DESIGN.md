@@ -2325,6 +2325,20 @@ streaming sends `reasoning_content` deltas first. Verified on the real
 template: reasoning and content separated, `enable_thinking:false` gives plain
 content and no reasoning field, no `</think>` leaks. Shipped as 0.2.8.
 
+**Where the operator's thinking knob breaks, read end to end.** pi shows the
+knob only for models flagged `reasoning: true`; its discovery package flags
+that from a registry's `supported_parameters`, which a local endpoint has
+none of, so the `[local]` entries come up without it and the knob never
+appears. Once flagged, pi's `openai-completions` provider sends the level as
+`reasoning_effort` by default, or — with `compat.thinkingFormat:
+"qwen-chat-template"` — as `chat_template_kwargs.enable_thinking: !!level`,
+which is the fleet-standard switch this server already honours. `reasoning_effort`
+is now accepted too (an effort level is on, `none` is off; the precise switch
+wins when both arrive). What no switch can express: Qwen3.6's template knows
+on and off, so "medium" can only mean a **server-side reasoning budget** — a
+cap on think-block tokens after which the server closes the block itself —
+and that is a feature with a number to choose, not a flag.
+
 #### 7.0.2b The XMX question cannot be decided from the profile
 
 The proposed five-minute check — grep a `ARCINT_PROFILE` for `dpas`/systolic

@@ -298,6 +298,17 @@ std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out
     if (auto e = read_stream(body, req.stream, req.stream_include_usage)) return e;
     if (auto e = read_sampler(body, req.sampler)) return e;
 
+    // OpenAI's own switch. Qwen3.6's template knows on/off and nothing in
+    // between, so an effort level is "on" and "none" is "off"; a client that
+    // also sends chat_template_kwargs.enable_thinking has said it more
+    // precisely and wins below.
+    if (body.contains("reasoning_effort") && !body["reasoning_effort"].is_null()) {
+        const json& e = body["reasoning_effort"];
+        if (!e.is_string()) return "reasoning_effort must be a string";
+        const std::string level = e.get<std::string>();
+        req.has_enable_thinking = true;
+        req.enable_thinking     = level != "none" && level != "off" && level != "minimal";
+    }
     if (body.contains("chat_template_kwargs") && !body["chat_template_kwargs"].is_null()) {
         const json& kw = body["chat_template_kwargs"];
         if (!kw.is_object()) return "chat_template_kwargs must be an object";

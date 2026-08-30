@@ -302,3 +302,18 @@ TEST(chat_tool_call_arguments_follow_the_template_contract) {
     CHECK(tool_call_arguments_for_template("not json", true).is_string());
     CHECK(tool_call_arguments_for_template("[1,2]", true).is_string());
 }
+
+TEST(chat_reasoning_effort_maps_onto_the_template_switch) {
+    ChatRequest req;
+    CHECK(!parse_chat_request(nlohmann::json::parse(R"({"messages":[{"role":"user","content":"x"}],"reasoning_effort":"medium"})"), req));
+    CHECK(req.has_enable_thinking && req.enable_thinking);
+    ChatRequest off;
+    CHECK(!parse_chat_request(nlohmann::json::parse(R"({"messages":[{"role":"user","content":"x"}],"reasoning_effort":"none"})"), off));
+    CHECK(off.has_enable_thinking && !off.enable_thinking);
+    // The precise switch wins over the coarse one.
+    ChatRequest both;
+    CHECK(!parse_chat_request(nlohmann::json::parse(R"({"messages":[{"role":"user","content":"x"}],"reasoning_effort":"high","chat_template_kwargs":{"enable_thinking":false,"preserve_thinking":true}})"), both));
+    CHECK(both.has_enable_thinking && !both.enable_thinking);
+    ChatRequest bad;
+    CHECK(parse_chat_request(nlohmann::json::parse(R"({"messages":[{"role":"user","content":"x"}],"reasoning_effort":3})"), bad).has_value());
+}
