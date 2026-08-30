@@ -9,6 +9,7 @@
 #include "api/error.h"
 #include "build_info.h"
 #include "core/stop.h"
+#include "core/reasoning.h"
 #include "core/toolcall.h"
 #include "util/log.h"
 #include "util/text.h"
@@ -494,6 +495,9 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     for (const ToolSpec& t : prep.req.tools) prep.input.tool_names.push_back(t.name);
 
     const std::string prompt = ctx.backend->render_chat(prep.req);
+    // The template decides whether the answer starts inside a think block; the
+    // split of reasoning from content below follows that, not a guess.
+    prep.think_open = prompt.ends_with("<think>\n");
     // The rendered prompt is the one thing that decides what the model saw.
     // When an answer differs from a reference run this is the first question,
     // and reconstructing it after the fact is guesswork (§3.7).
@@ -539,10 +543,11 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
               [](std::string_view, const std::string&) { return true; }, stats, raw);
     log_stats(slot, stats, reason);
 
-    std::string           content = raw;
+    const ReasoningSplit  split   = split_reasoning(raw, prep.think_open);
+    std::string           content = split.content;
     std::vector<ToolCall> calls;
     if (prep.parse_tool_calls) {
-        ToolCallParse parsed = parse_qwen_tool_calls(raw, &prep.schemas);
+        ToolCallParse parsed = parse_qwen_tool_calls(split.content, &prep.schemas);
         if (parsed.truncated) {
             log::warn("tools", "%s", "unterminated <tool_call> block; returned as raw content");
         }
@@ -551,6 +556,7 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     }
 
     json message = {{"role", "assistant"}};
+    if (!split.reasoning.empty()) message["reasoning_content"] = split.reasoning;
     if (calls.empty()) {
         message["content"] = content;
     } else {
@@ -619,6 +625,17 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     size_t              streamed = 0;  // bytes of tool-free content already sent
     bool                gone     = false;
     static const std::string kToolOpen = "<tool_call>";
+    // Reasoning goes out as reasoning_content deltas until the think block
+    // closes; from there `content` accumulates the answer and the tool-call
+    // logic below sees only that.
+    ReasoningStreamer   reasoning(prep.think_open);
+    std::string         content;       // the answer part of the output so far
+    auto emit_reasoning = [&](std::string_view bytes) {
+        if (bytes.empty()) return true;
+        return sse_send(write, chunk(json::array({{{"index", 0},
+                                                   {"delta", {{"reasoning_content", std::string(bytes)}}},
+                                                   {"finish_reason", nullptr}}})));
+    };
 
     auto emit_content = [&](std::string_view bytes) {
         const std::string safe = utf8_stream.push(bytes);
@@ -631,9 +648,17 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     GenerationStats stats;
     const FinishReason reason = drive(
         *ctx.backend, prep.input, slot,
-        [&](std::string_view piece, const std::string& accumulated) -> bool {
+        [&](std::string_view piece, const std::string&) -> bool {
+            const ReasoningStreamer::Step step = reasoning.push(piece);
+            if (!emit_reasoning(step.reasoning)) {
+                gone = true;
+                return false;
+            }
+            if (step.content.empty()) return true;
+            content += step.content;
+            const std::string& accumulated = content;
             if (!prep.parse_tool_calls) {
-                if (!emit_content(piece)) {
+                if (!emit_content(step.content)) {
                     gone = true;
                     return false;
                 }
@@ -670,10 +695,18 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
 
     log_stats(slot, stats, reason);
     if (gone) return;
+    {
+        const ReasoningStreamer::Step last = reasoning.flush();
+        if (!emit_reasoning(last.reasoning)) return;
+        if (!last.content.empty()) {
+            content += last.content;
+            if (!prep.parse_tool_calls && !emit_content(last.content)) return;
+        }
+    }
 
     std::vector<ToolCall> calls;
     if (prep.parse_tool_calls) {
-        ToolCallParse parsed = parse_qwen_tool_calls(raw, &prep.schemas);
+        ToolCallParse parsed = parse_qwen_tool_calls(content, &prep.schemas);
         if (parsed.truncated) {
             log::warn("tools", "%s", "unterminated <tool_call> block; returned as raw content");
         }

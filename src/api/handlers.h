@@ -88,6 +88,7 @@ struct PreparedChat {
     GenerationInput input;
     ToolSchemas     schemas;
     bool            parse_tool_calls = false;
+    bool            think_open       = false;  // the prompt ended inside a think block
     std::string     id;
     int64_t         created       = 0;
     int             prompt_tokens = 0;

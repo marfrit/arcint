@@ -2308,6 +2308,23 @@ Until then the default stays the chunk; the flag is there for the
 measurement. One more thing the sweep showed: the 21k-token prompt's snapshot
 never hit on the next request, unexplained.
 
+#### 7.0.2m The think block was arcint's to close, not the model's (2026-08-30)
+
+An agent transcript showed the model's reasoning arriving inside `content`,
+ending in a bare `</think>` — "qwen cannot not think". It can; the template
+opens the block *in the prompt* (the generation prompt ends with
+`<|im_start|>assistant\n<think>\n` unless `enable_thinking` is explicitly
+false), so the answer begins inside it, and only the server knows that. vLLM
+and llama.cpp split everything before the first `</think>` into
+`reasoning_content`; arcint returned the lot as content, which the Prüfstand
+harness had been quietly stripping for a week. `split_reasoning` and
+`ReasoningStreamer` (core, unit-tested including a close tag straddling two
+pieces) now do the split in both emit paths, keyed on whether the rendered
+prompt ended inside a block; tool-call parsing sees the content part only;
+streaming sends `reasoning_content` deltas first. Verified on the real
+template: reasoning and content separated, `enable_thinking:false` gives plain
+content and no reasoning field, no `</think>` leaks. Shipped as 0.2.8.
+
 #### 7.0.2b The XMX question cannot be decided from the profile
 
 The proposed five-minute check — grep a `ARCINT_PROFILE` for `dpas`/systolic

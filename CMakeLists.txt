@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 0.2.7 LANGUAGES CXX)
+project(arcint VERSION 0.2.8 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -69,6 +69,7 @@ add_library(arcint_core STATIC
   src/core/block_pool.cpp
   src/core/model_registry.cpp
   src/core/prefix_cache.cpp
+  src/core/reasoning.cpp
   src/core/sampler.cpp
   src/core/sampling.cpp
   src/core/stop.cpp
@@ -176,6 +177,7 @@ if(ARCINT_TESTS)
     tests/test_text.cpp
     tests/test_config.cpp
     tests/test_prefix_cache.cpp
+    tests/test_reasoning.cpp
     tests/test_block_pool.cpp
     tests/test_turnstile.cpp
     tests/test_provenance.cpp
