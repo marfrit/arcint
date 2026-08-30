@@ -21,6 +21,13 @@ vocab 248320 and untied embeddings. Measured to pair with:
 | arcint's AWQ export (`qwen38-b7c1-ov`) | 93.2% |
 | `OpenVINO/Qwen3.8-27B-int4-ov` (Intel's public int4) | 90.8% on the acceptance task (10/10), 96.3% code / 77.3% prose |
 
+**Intel's own MTP layer works with this lm_head.** `OpenVINO/Qwen3.8-27B-int4-ov`
+ships `openvino_mtp_model` (the layer, int4, no lm_head). Served through
+arcint's `--mtp-layer exported` with the `openvino_mtp_lm_head` from this
+card: 93.9% acceptance on code, 76.4% on prose, 37.7–38.1 t/s against 25.0
+t/s without speculation on the B60. If you have Intel's IR, the lm_head is the
+only file you are missing.
+
 **How to use.** Place the four files beside `openvino_language_model.xml` and
 serve with `arcint --mtp on`. Acceptance is printed on every decode line
 (`draft accept 96.3% (157/163)`); a head that does not belong shows ~0%.

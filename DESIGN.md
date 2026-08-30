@@ -2363,6 +2363,40 @@ re-quantised body underneath it should not matter, and did not.
 accept 90.8% (296/326)** — the same class as our own export's 93.2%. The entry's
 status carries it.
 
+**The net effect, measured the way the last such measurement was not.** The
+operator's caveat: a previous speculation measurement ended unfavourable
+because plain decoding beat drafting-plus-verifying. So three arms on Intel's
+body, same two prompts, greedy, thinking off, 320 tokens, each arm run twice
+(within-arm outputs identical):
+
+| arm | code prompt | prose prompt |
+|---|---|---|
+| `--mtp off` | **25.0 t/s** | **24.9 t/s** |
+| `--mtp on`, reconstructed layer | 36.9–37.3 t/s, accept 96.3% | 33.8–34.0 t/s, accept 77.3% |
+| `--mtp on`, Intel's exported layer + our lm_head | **37.7–38.1 t/s**, accept 93.9% | **34.3–34.9 t/s**, accept 76.4% |
+
+Speculation wins here: **+48% on code, +36% on prose** over plain decoding,
+with the verify pass at ~7.1–7.9 s of the 8.4–9.5 s step total. Intel's own
+layer, fed through the contract it declares (`inputs_embeds`, an i64 2-D
+ones-mask, i64 positions — `--mtp-layer exported`), pairs with our lm_head
+at two to three points lower acceptance and two to three percent higher
+speed, its layer being int4 against our f16 reconstruction. So the lm_head
+half is the whole of what the public IR lacks.
+
+**Greedy outputs are not byte-identical between `--mtp off` and `--mtp on`**,
+and it is the same divergence the paged+MTP path already carries in its status
+line ("greedy is deterministic per configuration"): the answers agree for
+1102 of 1717 characters on the prose prompt and then take a different but
+equivalent phrasing at one near-tie token ("using a quadratic function to
+determine the next offset" against "checking slots at increasing quadratic
+distances"); on the code prompt the reconstructed layer's answer is identical
+to plain decoding and Intel's layer's inserts one comment line. Both layers
+diverge at the *same* point with the *same* alternative on the prose prompt,
+which places the cause in the verify pass — the main model's M=2 forward
+landing a near-tie differently from its M=1 step — and not in either head.
+Acceptance stays the oracle for the head; the off/on comparison is a
+different question and is recorded as such.
+
 **And the premise of the handover has moved.** Intel's export directory
 carries `openvino_mtp_model.{xml,bin}` of its own — 263 MB int4, one MTP
 layer, the same input interface as our reconstructed layer (`hidden_states`,
