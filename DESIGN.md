@@ -2178,6 +2178,25 @@ there is no recorded list to replay and every kernel is still appended by the
 host per step. It would not touch the 76% of decode spent outside any runtime
 call in any case. Not a lever in this plugin as written.
 
+#### 7.0.2j The prefix cache in production: replayed, and two levers priced (2026-08-30)
+
+No production traffic had ever reached an arcint unit (both journals hold
+only benchmarks), so the operator's real pi session trees were replayed
+offline against arcint's exact policy (`tools/cachesim.py`;
+`docs/prefix-cache-production.md` has the tables and the pre-registration).
+Hits on 97% of turns and 96% of prompt tokens from cache on the agent's
+configuration; rewinds negligible under LRU; no rewritten-front misses in
+the corpus. What remains is two things, both ours: **the snapshot grid** —
+taken at the last prefill-chunk multiple, it re-prefills ~1900 tokens per
+append turn on the agent where a 128-token grid would re-prefill ~970,
+−28% of the agent's total prefill for one extra sub-chunk forward per
+request — and **pool capacity**: 37% of the agent's prefill is re-prefilling
+sessions evicted under pool pressure because the operator interleaves long
+sessions, which points at a host tier for evicted pages (1.7 GB back over
+the link in ~0.12 s against ~35 s of prefill), a design item. The
+`--cache-reuse` question is closed on paper: no observed miss is a
+near-front mismatch.
+
 #### 7.0.2b The XMX question cannot be decided from the profile
 
 The proposed five-minute check — grep a `ARCINT_PROFILE` for `dpas`/systolic

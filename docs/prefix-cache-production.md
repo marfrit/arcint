@@ -123,3 +123,86 @@ replayed in order against the endpoints, which yields the hit rate, the
 divergence positions and the branch behaviour under the real pool sizes, and
 does so in an afternoon rather than after a month of use. The infra question
 of where such records live is out to the infrastructure agent.
+
+---
+
+# Replay of real transcripts (same day, tools/cachesim.py)
+
+The operator's pi sessions exist as trees — every event carries a `parentId`,
+so rewinds are explicit branches, assistant turns record the prompt length
+the backend saw (`usage.input`), and compactions are events. 80 sessions,
+8093 assistant turns, prompts to 595k tokens, 28 compactions, 6 branch
+points. `tools/cachesim.py` reconstructs each turn's prompt as the tree path,
+estimates tokens per message from characters with a per-session least-squares
+fit against `usage.input` (19 sessions carry enough of it to fit: **2.63
+chars/token, 13.6k tokens of system prompt and tool schema**; the rest take
+those medians), and replays arcint's policy exactly as read — grid snapshot,
+deepest-prefix lookup, LRU, entry budget, pool as the union of pinned tokens.
+The corpus is agent-shaped traffic that ran on other backends; the coder's
+one-shot traffic is not in it, so the coder row below is "the coder's
+configuration under agent traffic", which is the branch case the work order
+asked about, not the coder's real load.
+
+## Hit rate and where the prefill goes
+
+| | coder config (A770, grid 128, 21 entries, 133k pool, 98304) | agent config (B60, grid 2048, 85 entries, 377k pool, 262144) |
+|---|---|---|
+| turns servable / over n_ctx | 4900 / **3193** | 7133 / **960** |
+| hits, by request | 95.5% | **97.3%** |
+| prompt tokens served from cache | 94.6% | **96.0%** |
+| prefilled per request p50 / p90 / p99 | 386 / 2863 / 67955 | **1583** / 3455 / 71776 |
+| total prefilled | 12.6M | 24.0M |
+| — normal append turns | 4.1M (33%) | **13.4M (56%)** |
+| — front miss, session's entries **evicted by pool pressure** | 6.7M (53%), 110 requests | **8.8M (37%), 82 requests** |
+| — first turn of a session | 1.1M | 1.1M |
+| — front miss after compaction | 0.55M, 30 | 0.44M, 27 |
+| — front changed (rewritten early message) | 0 | 0 |
+| — mid (rewind to a branch) | 3 requests, 466 tokens | 2 requests, 1969 tokens |
+
+**Scoring the pre-registrations.** Both were right about the rate — hits on
+nearly every request, over 95% of prompt tokens from cache — and **both were
+wrong about capacity in the same direction**: the work order expected the
+coder capacity-bound and the agent fine; I expected neither bound. In the
+replay the agent is bound. Its 82 pool-eviction misses average 107k tokens
+each and are 37% of all its prefill work: the operator interleaves sessions,
+two or three long ones do not fit a 377k-token pool together, and switching
+back to an evicted one re-prefills it whole (~35 s at 3000 t/s). The rewrite
+causes the order named — a timestamp in the system block, an early message
+edited — do not occur in this corpus at all (front-changed = 0), with one
+caveat: the simulation's system block is a constant per session, so a
+timestamp that pi inserts at request time would be invisible here and would
+show up in the real journal as a hit rate near zero. The six real hits on
+record (99.4%, repeated prompts) say the block was stable in those runs.
+Rewinds are negligible under LRU, as predicted in (3).
+
+## Two levers, both ours, priced by the replay
+
+1. **The snapshot grid.** A snapshot is taken at the last multiple of the
+   prefill chunk, so on the agent every append turn re-prefills up to 2047
+   tokens it already had: **1933 tokens per append turn against 974 at a
+   128-token grid**. Snapshotting at 128 (splitting the last chunk's forward at
+   the grid boundary: one extra sub-chunk forward per request) takes the
+   agent's total prefill from **24.0M to 17.3M tokens, −28%**, p50 per request
+   1583 → 403. Rung zero, small, and the cost side — one extra small forward
+   per request — is a measurement before it ships.
+2. **Pool capacity for evicted sessions.** 37% of the agent's prefill is
+   re-prefilling sessions the pool could not hold. The pool total is fixed by
+   the card (17.38 GiB of weights leave 4.08 GiB of KV on the B60); changing
+   the n_ctx/spare split does not change the total, and 960 turns already
+   exceed 262144. The lever that fits the numbers is a **host tier**: an
+   evicted entry's pages copied to host RAM (11.3 KiB/token; 150k tokens is
+   1.7 GB, ~0.12 s back over the link at the measured 14 GB/s) instead of
+   dropped, against ~35 s of re-prefill. A design item, not a flag.
+
+**Not levers:** a frontier-only entry policy (drop superseded ancestors)
+changes no hit rate — the 85-entry budget never bound — and only shrinks the
+GDN-row budget from 8 GiB to ~1.5 GiB of host RAM (15 live entries at most);
+worth taking for the RAM, not for speed. And (4), resume-after-mismatch:
+no observed miss class is a near-front mismatch, so it is a solution to a
+problem this traffic does not have, and it stays on paper.
+
+## Caveats
+Token counts are character-calibrated on 19 sessions; prompt sizes above the
+endpoints' context reflect the cloud backends these sessions actually ran on;
+the coder row is agent traffic on the coder's configuration. The first week
+of real journal lines replaces all of it.
