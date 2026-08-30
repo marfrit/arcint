@@ -926,6 +926,25 @@ public:
         return pool_ != nullptr ? static_cast<uint64_t>(pool_->free_blocks()) : 0;
     }
 
+    json template_caps() const override {
+        if (template_ == nullptr) return json::object();
+        const minja::chat_template_caps& c = template_->original_caps();
+        // "preserve reasoning" is llama.cpp's name for a template that puts an
+        // assistant turn's reasoning_content back into the prompt. Qwen3.6's
+        // does; the source text says so, and no rendering probe is needed.
+        const bool preserves_reasoning =
+            artifact_.chat_template.find("reasoning_content") != std::string::npos;
+        return json{{"supports_tools", c.supports_tools},
+                    {"supports_tool_calls", c.supports_tool_calls},
+                    {"supports_tool_responses", c.supports_tool_responses},
+                    {"supports_system_role", c.supports_system_role},
+                    {"supports_parallel_tool_calls", c.supports_parallel_tool_calls},
+                    {"supports_object_arguments", c.requires_object_arguments},
+                    {"supports_string_content", !c.requires_typed_content},
+                    {"supports_typed_content", c.requires_typed_content},
+                    {"supports_preserve_reasoning", preserves_reasoning}};
+    }
+
     std::string render_chat(const ChatRequest& req) const override {
         minja::chat_template_inputs inputs;
         inputs.messages            = messages_json(req, template_->original_caps().requires_object_arguments);

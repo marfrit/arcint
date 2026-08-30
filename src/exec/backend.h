@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "core/prefix_cache.h"
+#include <nlohmann/json.hpp>
 #include "core/chat.h"
 #include "core/model_registry.h"
 #include "core/sampling.h"
@@ -163,6 +164,12 @@ public:
     // is the backend's job: only it knows which template shipped with the
     // weights. The stub answers with ChatML because it has no artifact.
     virtual std::string render_chat(const ChatRequest& req) const = 0;
+    // What the artifact's template can do, in llama.cpp's /props vocabulary:
+    // a proxy reads `supports_preserve_reasoning` there to mark a model as
+    // reasoning, and a discovering client shows its thinking knob only then.
+    // Until 2026-08-30 arcint published nothing here and the fleet's local
+    // models came up "non-reasoning" in every client.
+    virtual nlohmann::json template_caps() const { return nlohmann::json::object(); }
 
     // `slot` is the lane this request owns for its whole life (DESIGN.md §4.1).
     // Every piece of mutable execution state — InferRequests, GDN checkpoint

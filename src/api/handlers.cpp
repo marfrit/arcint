@@ -419,6 +419,7 @@ json props(const Context& ctx) {
 
     return json{
         {"model", std::move(model)},
+        {"chat_template_caps", ctx.backend->template_caps()},
         {"cache",
          {{"kv_block_size", cfg.kv_block_size},
           {"kv_dtype", cfg.kv_dtype},
