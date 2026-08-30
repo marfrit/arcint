@@ -1,0 +1,45 @@
+# arcint-qwen38-mtp — Qwen3.8-27B (Intel's public int4 IR) with speculative
+# decoding from the MTP head. An example unit, not one the dev fleet runs.
+#
+# Intel's IR ships the MTP layer (openvino_mtp_model) but not the lm_head the
+# draft is decoded with; that file comes from tools/export_mtp.py and sits
+# beside the model as openvino_mtp_lm_head.xml/.bin. Measured 2026-08-30 on a
+# 24 GB card, greedy: 37.7-38.1 t/s with Intel's layer (--mtp-layer exported)
+# and 36.9-37.3 with the reconstructed one, against 25.0 t/s with --mtp off;
+# draft acceptance 94-96% on code, 76-77% on prose; acceptance task 10/10.
+# DESIGN 7.0.2n.
+
+[Unit]
+Description=arcint — Qwen3.8-27B on OpenVINO with MTP speculation, GPU.0, :8088
+Documentation=https://github.com/marfrit/arcint
+After=default.target
+#Conflicts=arcint-agent.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/arcint \
+    --model /models/ov/qwen38-intel-int4-ov \
+    --model-id qwen3.8-27b-intel-int4 \
+    --served-model-name qwen3.8 \
+    --device GPU.0 \
+    --host 0.0.0.0 \
+    --port 8088 \
+    --n-ctx 131072 \
+    --prefix-cache-mib 4096 \
+    --cache-dir %h/.cache/arcint-qwen38 \
+    --queue-timeout 30 \
+    --mtp on \
+    --mtp-layer exported
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=20min
+TimeoutStopSec=60s
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectHome=read-only
+ReadWritePaths=%h/.cache/arcint-qwen38
+
+[Install]
+WantedBy=default.target

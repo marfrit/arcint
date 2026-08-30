@@ -1,0 +1,58 @@
+# arcint-coder — the Qwen3.6-27B-A3B coder export on the 16 GB card.
+#
+# Deviations from the package template /usr/share/arcint/arcint.service, each
+# with a reason:
+#  1. ExecStart=/usr/bin/arcint: the .deb installs there; the template's
+#     %h/.local/bin path describes a source build and does not start on a
+#     package-only host.
+#  2. No EnvironmentFile indirection: a unit manager reads port, alias and
+#     context out of ExecStart, and ${ARCINT_PORT} would be invisible to it.
+#  3. --model-id names the allowlist entry the process asserts; the served
+#     name is what clients send. The two are different questions.
+#  4. After=default.target: a headless container has no graphical session.
+#
+# On this card --n-ctx 262144 serves 98304 with the prefill chunk clamped to
+# 128: the coder's activations cost 4075 KiB per chunk token here against
+# 1284 on the 24 GB card. A card property, printed at boot, not a setting.
+# Memory measured after the first start: 7.80 GiB peak in the unit's cgroup
+# at n_ctx 262144, 51.8 s to load. Card memory is enforced by Conflicts=, not
+# by any host-RAM accounting.
+
+[Unit]
+Description=arcint-coder — Qwen3.6-27B-A3B coder on OpenVINO, GPU.1 (Arc A770), :8080
+Documentation=https://github.com/marfrit/arcint
+After=default.target
+# The other units that want GPU.1, retired ones included: starting one of
+# them stops this one instead of colliding with it.
+#Conflicts=llama-agent.service llama-coder.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/arcint \
+    --model /models/ov/qwen36-coder-b5-ov \
+    --model-id qwen3.6-27b-a3b-coder \
+    --served-model-name qwen3.6-coder \
+    --device GPU.1 \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --n-ctx 98304 \
+    --prefix-cache-mib 2048 \
+    --cache-dir %h/.cache/arcint \
+    --queue-timeout 30 \
+    --paged-kv u8
+# The card holds the weights for the process lifetime; a restart is a full
+# reload (minutes). Restart on failure, but do not thrash.
+Restart=on-failure
+RestartSec=30
+# A cold blob cache means minutes of graph compile before the port answers.
+TimeoutStartSec=20min
+TimeoutStopSec=60s
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectHome=read-only
+ReadWritePaths=%h/.cache/arcint
+
+[Install]
+WantedBy=default.target
