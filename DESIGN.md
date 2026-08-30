@@ -1122,7 +1122,7 @@ not enough does the request end, cleanly, rather than as an allocation failure
 on the card.
 
 
-### 4.4 A host tier for evicted prefixes — design (2026-08-30, not yet implemented)
+### 4.4 A host tier for evicted prefixes (2026-08-30: designed, implemented, gated)
 
 **Why.** The replay of real sessions (§7.0.2j) puts 37% of the agent's prefill
 work into re-prefilling sessions the pool could not hold: 82 misses averaging
@@ -1169,11 +1169,24 @@ stay resident, and promotion first tries to re-share those rather than copy
 them back. The first implementation copies everything and measures; sharing
 on promotion is an optimisation with a number attached later.
 
-**What it costs to try.** ~300 lines: a `HostKv` per entry, demote in
-`ensure_blocks` ahead of `evict_oldest`, promote in the hit path ahead of
-`restore_paged`, the run-coalescing copy, the budget, two `/health` fields and
-the hit line saying `from host tier, 0.12 s`. The measurement is the replay's
-82 misses turned into promotions: the number to beat is 35 s per miss.
+**Implemented the same day, and gated.** `--cache-host-mib N` (0 = off).
+Demotion copies an entry's pages to host buffers by page runs through
+`RemoteTensor` ROI views and releases them; promotion allocates, copies back
+and records the pages; one LRU order across tiers; `/health` carries
+`cache.{entries,tiered_entries,host_mib,hits,demotions,promotions}`; the hit
+line prints `from host tier in X s`. `--kv-pool-pages N` caps the pool so a
+test can force eviction at a small context. The gate, on the B60 with the
+coder artifact, three distinct ~5.8k-token prompts into a 514-page pool:
+
+| | tier on (4096 MiB) | tier off |
+|---|---|---|
+| after A, B, C | 3 entries, 2 tiered, 90 MiB on host, 2 demotions | 1 entry each time |
+| A again | **hit 4096 tok from host tier in 0.02 s**, 0.66 s total | cold, 1.79 s |
+| A again vs A cold | **byte-identical** | byte-identical (both cold) |
+
+The number to beat in production is the replay's 35 s per pool miss on the
+agent; 45 MiB came back in 0.02 s here, and the 1.7 GB case is the next
+measurement, on the agent endpoint with its real pool.
 
 ## 5. Testing and acceptance
 
@@ -2267,6 +2280,33 @@ when the template's own capability flag says it wants one and the string
 parses as an object, and leaves the string otherwise. Red on the live
 endpoint, green on the source build with the real template, unit-tested,
 shipped as 0.2.7.
+
+#### 7.0.2l The finer snapshot grid: exact, and not yet cheap (2026-08-30)
+
+`--cache-grid N` snapshots at the last multiple of N by cutting the chunk that
+contains the snapshot point. The gate, B60, coder artifact, three prompt
+lengths so the cut lands at three different offsets inside a 2048 chunk:
+**warm equals cold byte for byte at every cut**, the chunk grid too, and the
+u8-vs-f16 pair proved the comparison can fail (it differed at the longest
+prompt). So the paged kernels are exact across a split, and §3.2's
+absolute-grid rule — measured on the dense model — does not bind the paged
+path. The hits land where the design says (6912, 11904; 92.6% and 96.1% of
+the continuation against 82% on the chunk grid).
+
+**And the arm lost on time.** Prefill after a fine-grid hit runs at 741–1409
+t/s for ~1500 new tokens and 400–630 t/s for ~300, against 2059–2515 after a
+chunk-aligned hit. A sweep over eleven hit offsets fits **~0.45 s fixed per
+continuation plus ~new/1800**; the offset within the chunk does not matter.
+The first hypothesis — the plugin creating oneDNN primitives for every
+never-seen M — was tested with the wrong instrument: `ONEDNN_VERBOSE=1`
+prints executions only, so its zero creations refute nothing. The same
+continuation run again hits its own newer snapshot and cannot repeat the
+forward. The mechanism is open: two candidates are the cut itself (two
+forwards where one was) and a forward starting at a non-aligned past, and the
+instrument that separates them is the plugin's host-time profile per request.
+Until then the default stays the chunk; the flag is there for the
+measurement. One more thing the sweep showed: the 21k-token prompt's snapshot
+never hit on the next request, unexplained.
 
 #### 7.0.2b The XMX question cannot be decided from the profile
 

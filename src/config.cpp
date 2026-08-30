@@ -90,6 +90,8 @@ std::string usage_text() {
         "  --cache-host-mib N        host tier for evicted prefixes: an entry evicted for its\n"
         "                            KV pages parks them in host RAM instead and comes back\n"
         "                            over the link on a hit (default: 0, off). DESIGN 4.4.\n"
+        "  --kv-pool-pages N         cap the KV pool at N pages (default: 0, sized by memory).\n"
+        "                            A test knob: the way to make the cache evict on demand.\n"
         "  --gate-pad N              widen the shared-expert gate to N columns (default: 0,\n"
         "                            off). 16 is the measured setting: -13% prefill wall,\n"
         "                            -5% decode; pays off below ~500 answer tokens per 12k\n"
@@ -182,6 +184,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.cache_grid)) return fail("--cache-grid needs an integer");
         } else if (arg == "--cache-host-mib") {
             if (!value(v) || !parse_int(v, cfg.cache_host_mib)) return fail("--cache-host-mib needs an integer");
+        } else if (arg == "--kv-pool-pages") {
+            if (!value(v) || !parse_int(v, cfg.kv_pool_pages)) return fail("--kv-pool-pages needs an integer");
         } else if (arg == "--gate-pad") {
             if (!value(v) || !parse_int(v, cfg.gate_pad)) return fail("--gate-pad needs an integer");
         } else if (arg == "--paged-kv") {
@@ -331,6 +335,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
                     "silently degrades the answer. Use fp16, or the paged path once it lands.");
     }
     if (cfg.cache_host_mib < 0) return fail("--cache-host-mib must be >= 0");
+    if (cfg.kv_pool_pages < 0) return fail("--kv-pool-pages must be >= 0");
     if (cfg.cache_grid < 0 || cfg.cache_grid > 65536) {
         return fail(log::format("--cache-grid must be 0 (the chunk) or 1..65536, not %d", cfg.cache_grid));
     }

@@ -2266,6 +2266,16 @@ private:
             const size_t spare_room   = affordable > live_blocks ? affordable - live_blocks : 0;
             blocks += std::min(spare_room, wanted_spare);
         }
+        // A cap for tests: the only way to make the cache evict on demand at a
+        // small context. Never below what the lanes themselves need.
+        if (cfg.kv_pool_pages > 0) {
+            const size_t cap = std::max<size_t>(static_cast<size_t>(cfg.kv_pool_pages), live_blocks);
+            if (cap < blocks) {
+                log::info("load", "--kv-pool-pages: pool capped at %zu pages (would have been %zu)",
+                          cap, blocks);
+                blocks = cap;
+            }
+        }
         alloc_kv_pools(rctx, blocks);
         pool_ = std::make_unique<BlockPool>(blocks);
         if (prefix_cache_ != nullptr) {

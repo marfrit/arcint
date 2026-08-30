@@ -104,6 +104,7 @@ struct Config {
     int         gate_pad                  = 0;       // 0 = off; 16 = the measured setting
     int         cache_grid                = 0;       // prefix-cache snapshot grid; 0 = the prefill chunk (see DESIGN 7.0.2j)
     int         cache_host_mib            = 0;       // host tier for evicted prefixes, MiB; 0 = off
+    int         kv_pool_pages             = 0;       // cap the KV pool (tests: force eviction); 0 = sized by memory
     int         gdn_checkpoint_budget_mib = 512;     // §3.3
     std::string mtp                       = "auto";  // on | off | auto
 

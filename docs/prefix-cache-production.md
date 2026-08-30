@@ -206,3 +206,19 @@ Token counts are character-calibrated on 19 sessions; prompt sizes above the
 endpoints' context reflect the cloud backends these sessions actually ran on;
 the coder row is agent traffic on the coder's configuration. The first week
 of real journal lines replaces all of it.
+
+---
+
+# Follow-up: both levers built and gated (same day)
+
+**Host tier:** implemented (`--cache-host-mib`), gated with a capped pool —
+three prompts, the first evicted to the host and promoted back in 0.02 s for
+45 MiB, answer byte-identical to its cold one; with the tier off the same
+request prefills cold. DESIGN §4.4 has the table. Next: the 1.7 GB case on
+the agent's real pool.
+
+**Snapshot grid:** `--cache-grid 128` is byte-exact across cuts inside a chunk
+(the absolute-grid rule was the dense model's, not the paged path's), but a
+continuation from a fine-grid hit carries ~0.45 s of fixed cost whose
+mechanism is open; the arm lost on wall time. Default stays the chunk.
+DESIGN 7.0.2l.
