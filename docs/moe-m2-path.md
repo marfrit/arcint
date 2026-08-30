@@ -141,3 +141,57 @@ Options, in the order of least new mechanism:
 
 (1) is the one that makes the head sparse like the body; (3) is being
 measured meanwhile because it costs nothing but a compression run.
+
+## Measured (same morning): the excess is inside the plugin's enqueue, not in waits
+
+Instrument: the GPU plugin's own host-time profile at level 2
+(`OV_GPU_HOST_TIME_PROFILING=2`, debug-enabled plugin build), which splits
+every `infer()` into input processing, enqueue, wait and output processing,
+averaged per compiled graph. The average includes the load-time probes and
+the prefill, so each arm was run at two lengths (300 and 1400 generated
+tokens, same prompt, EOS not reached) and the per-forward figures below are
+the **differences**, in which everything but the decode forwards cancels
+exactly. Card: B60, u8 KV, 8192 context, the 35B with the reconstructed MoE
+head; 1100 plain steps against 622 verify passes.
+
+| per forward | inputs | **enqueue** | wait | outputs | host total | untraced wall |
+|---|---|---|---|---|---|---|
+| plain step, M=1 (`--mtp off`) | 0.37 | **12.6** | 1.15 | 0.12 | 14.3 ms | 14.1 ms |
+| verify forward, M=2 (`--mtp on`) | 0.47 | **27.4** | 1.13 | 0.17 | 29.2 ms | 29.8 ms |
+| head layer draft (1400 infers) | 0.08 | **3.8** | 1.17 | 0.02 | 5.05 ms | — |
+| head lm_head (787 infers) | 0.01 | 0.05 | 1.14 | 0.09 | 1.29 ms | — |
+
+Three things this settles:
+
+1. **The ~15 ms the verify forward costs over a plain step is enqueue time
+   in the plugin** — 27.4 ms against 12.6 for a graph with 16% more launches
+   (1334 against 1145) — and not synchronous waits: the wait is 1.1 ms in
+   every graph, the fixed tail between the last enqueue and the last
+   kernel's completion. The reply's expectation ("in waits, not in enqueue")
+   is wrong, and so is the per-launch rate model that both sides used: host
+   cost per walked primitive is 5.4 µs at M=1 and 10.9 µs at M=2 on the same
+   graph. Something the plugin does per primitive per infer costs twice as
+   much at two rows as at one. Which thing is the next measurement, not a
+   narrative.
+2. **arcint's own loop is not where the time is.** Per generated token at
+   1400 tokens: 23.4 ms of wall = verify 16.8 (29.8 × 788/1400) + head layer
+   5.05 + lm_head 0.73 + embeddings 0.23 + emit 0.39 + ~0.2 of sampling and
+   acceptance. Everything outside the plugin's `infer()` calls is under a
+   millisecond per token. The "~10 ms unattributed in the serving loop" of
+   the section above is retracted: it was the plugin's enqueue at M=2.
+3. **The head's device time is smaller than the traced 6.7 ms.** Its
+   `infer()` returns 5.05 ms after it starts, 1.17 of that waiting; the
+   device cannot have been busy longer than ~5 ms per draft in this run. The
+   tracer's per-kernel profiling inflates short kernels; the 6.7 ms stands
+   only as an upper bound. The head's host side is 3.8 ms of enqueue for 118
+   launches (32 µs per launch, six times the body's rate at M=1).
+
+Per generated token the arithmetic is now closed: plain 14.1 ms = 12.6
+enqueue + 1.15 tail + 0.4 arcint; speculative 23.4 ms = the numbers above.
+The levers, re-ranked with the plugin's enqueue as the cost:
+
+- the M=2 enqueue at 27.4 ms is the lever (a verify at the M=1 enqueue rate
+  would be ~13.5 ms, and the pair 8.0 ms per token: +76% over plain);
+- the head layer's 5.05 ms of host per draft is the second (for 118 launches
+  it should be under 1 ms at the body's rate);
+- the int4 head buys device time, which is not what is being paid for.
