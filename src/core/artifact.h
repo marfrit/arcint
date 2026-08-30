@@ -61,7 +61,8 @@ struct Artifact {
 
     bool has_mtp_head = false;
     // Written by tools/export_mtp.py beside the model; empty when absent.
-    std::string mtp_layer_xml;
+    std::string mtp_layer_xml;           // the reconstructed layer (tools/export_mtp.py)
+    std::string mtp_exported_layer_xml;  // optimum-intel's own export of the layer, when present
     std::string mtp_lm_head_xml;
 
     ArtifactInfo to_info(Quant quant) const;

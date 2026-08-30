@@ -868,7 +868,9 @@ public:
                 // and the LM head is a 248320 x 5120 MatMul.
                 if (!cfg.cache_dir.empty()) core_.set_property(ov::cache_dir(cfg.cache_dir));
                 const auto t0 = std::chrono::steady_clock::now();
-                mtp_layer_    = core_.compile_model(artifact.mtp_layer_xml, device);
+                const std::string layer_xml = choose_mtp_layer(artifact, cfg.mtp_layer);
+                mtp_layer_    = core_.compile_model(layer_xml, device);
+                read_mtp_contract(mtp_layer_, layer_xml);
                 mtp_head_     = core_.compile_model(artifact.mtp_lm_head_xml, device);
                 lanes_[0]->mtp_layer = mtp_layer_.create_infer_request();
                 lanes_[0]->mtp_head  = mtp_head_.create_infer_request();
@@ -1963,7 +1965,9 @@ private:
 
         if (want_mtp_) {
             try {
-                mtp_layer_ = core_.compile_model(artifact_.mtp_layer_xml, mtp_dev);
+                const std::string layer_xml = choose_mtp_layer(artifact_, cfg.mtp_layer);
+                mtp_layer_ = core_.compile_model(layer_xml, mtp_dev);
+                read_mtp_contract(mtp_layer_, layer_xml);
                 mtp_head_  = core_.compile_model(artifact_.mtp_lm_head_xml, mtp_dev);
                 for (auto& lane : lanes_) {
                     lane->mtp_layer = mtp_layer_.create_infer_request();
@@ -2695,6 +2699,60 @@ private:
         std::memcpy(dst.data(), src.data(), src.get_byte_size());
     }
 
+    // Which layer graph drafts, and what it wants fed (see the members above).
+    std::string choose_mtp_layer(const Artifact& a, const std::string& which) const {
+        if (which == "exported") return a.mtp_exported_layer_xml;
+        if (which == "reconstructed") return a.mtp_layer_xml;
+        return !a.mtp_layer_xml.empty() ? a.mtp_layer_xml : a.mtp_exported_layer_xml;
+    }
+    void read_mtp_contract(const ov::CompiledModel& layer, const std::string& path) {
+        mtp_embeds_name_ = "input_embeds";
+        mtp_mask_2d_     = false;
+        for (const auto& port : layer.inputs()) {
+            const std::string name = port.get_any_name();
+            if (name == "inputs_embeds") mtp_embeds_name_ = name;
+            if (name == "attention_mask") {
+                mtp_mask_2d_   = port.get_partial_shape().rank().get_length() == 2;
+                mtp_mask_type_ = port.get_element_type();
+            }
+            if (name == "position_ids") mtp_pos_type_ = port.get_element_type();
+        }
+        log::info("mtp", "layer %s: %s, %s mask, %s positions",
+                  path.find("openvino_mtp_model") != std::string::npos ? "(optimum-intel export)"
+                                                                        : "(reconstructed)",
+                  mtp_embeds_name_.c_str(), mtp_mask_2d_ ? "2-D ones" : "4-D additive",
+                  mtp_pos_type_.get_type_name().c_str());
+    }
+    ov::Tensor mtp_positions(size_t start, size_t n) const {
+        ov::Tensor t(mtp_pos_type_, ov::Shape{1, n});
+        for (size_t i = 0; i < n; ++i) {
+            if (mtp_pos_type_ == ov::element::i64) t.data<int64_t>()[i] = static_cast<int64_t>(start + i);
+            else t.data<float>()[i] = static_cast<float>(start + i);
+        }
+        return t;
+    }
+    // `kv_before` tokens are already in the layer's cache; `n` new ones arrive.
+    // The 4-D form is additive and causal across the new tokens; the 2-D form
+    // is HF's ones-over-everything and the graph builds causality itself.
+    ov::Tensor mtp_mask(size_t kv_before, size_t n) const {
+        const size_t total = kv_before + n;
+        if (mtp_mask_2d_) {
+            ov::Tensor m(mtp_mask_type_, ov::Shape{1, total});
+            if (mtp_mask_type_ == ov::element::i64) std::fill_n(m.data<int64_t>(), total, int64_t{1});
+            else std::fill_n(m.data<float>(), total, 1.0f);
+            return m;
+        }
+        ov::Tensor m(ov::element::f32, ov::Shape{1, 1, n, total});
+        float*     mp = m.data<float>();
+        std::fill_n(mp, n * total, 0.0f);
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = kv_before + i + 1; j < total; ++j) {
+                mp[i * total + j] = -std::numeric_limits<float>::infinity();
+            }
+        }
+        return m;
+    }
+
     // Batched head priming over one prefill chunk: pairs (h_t, x_{t+1}) within
     // the chunk, the chunk-boundary pair carried through the lane's pending row.
     void mtp_prime_paged(Lane& lane, const ov::Tensor& hidden, const ov::Tensor& embeds,
@@ -2723,22 +2781,12 @@ private:
                 std::memcpy(ep + r * width, ev + (i + 1) * width, width * 4);
             }
 
-            ov::Tensor pos(ov::element::f32, ov::Shape{1, pairs});
-            for (size_t i = 0; i < pairs; ++i) {
-                pos.data<float>()[i] = static_cast<float>(lane.mtp_pos + i);
-            }
-            ov::Tensor mask(ov::element::f32, ov::Shape{1, 1, pairs, lane.mtp_len + pairs});
-            float* mp = mask.data<float>();
-            std::fill_n(mp, pairs * (lane.mtp_len + pairs), 0.0f);
-            for (size_t i = 0; i < pairs; ++i) {
-                for (size_t j = lane.mtp_len + i + 1; j < lane.mtp_len + pairs; ++j) {
-                    mp[i * (lane.mtp_len + pairs) + j] = -std::numeric_limits<float>::infinity();
-                }
-            }
+            const ov::Tensor pos  = mtp_positions(lane.mtp_pos, pairs);
+            const ov::Tensor mask = mtp_mask(lane.mtp_len, pairs);
             ov::Tensor beam(ov::element::i32, ov::Shape{1});
             beam.data<int32_t>()[0] = 0;
             lane.mtp_layer.set_tensor("hidden_states", h);
-            lane.mtp_layer.set_tensor("input_embeds", e);
+            lane.mtp_layer.set_tensor(mtp_embeds_name_, e);
             lane.mtp_layer.set_tensor("position_ids", pos);
             lane.mtp_layer.set_tensor("attention_mask", mask);
             lane.mtp_layer.set_tensor("beam_idx", beam);
@@ -3328,18 +3376,15 @@ private:
             ov::Tensor       emb(src.get_element_type(), src.get_shape());
             std::memcpy(emb.data(), src.data(), src.get_byte_size());
 
-            ov::Tensor pos(ov::element::f32, ov::Shape{1, 1});
-            pos.data<float>()[0] = static_cast<float>(lane.mtp_pos);
-
+            const ov::Tensor pos  = mtp_positions(lane.mtp_pos, 1);
             // Nothing is masked: the head attends to its whole committed prefix.
-            ov::Tensor mask(ov::element::f32, ov::Shape{1, 1, 1, lane.mtp_len + 1});
-            std::fill_n(mask.data<float>(), lane.mtp_len + 1, 0.0f);
+            const ov::Tensor mask = mtp_mask(lane.mtp_len, 1);
 
             ov::Tensor beam(ov::element::i32, ov::Shape{1});
             beam.data<int32_t>()[0] = 0;
 
             lane.mtp_layer.set_tensor("hidden_states", lane.mtp_pending);
-            lane.mtp_layer.set_tensor("input_embeds", emb);
+            lane.mtp_layer.set_tensor(mtp_embeds_name_, emb);
             lane.mtp_layer.set_tensor("position_ids", pos);
             lane.mtp_layer.set_tensor("attention_mask", mask);
             lane.mtp_layer.set_tensor("beam_idx", beam);
@@ -3455,6 +3500,14 @@ private:
     size_t                         la_row_bytes_     = 0;
     size_t                         logits_keep_rows_ = 0;  // 0: unsliced
     size_t                         cache_grid_       = 0;  // paged snapshot grid; 0: the chunk
+    // The MTP layer's input contract, read from the compiled graph: the
+    // reconstructed layer takes input_embeds, an f32 4-D additive mask and f32
+    // positions; optimum-intel's export takes inputs_embeds, an i64 2-D
+    // ones-mask and i64 positions. Same hidden in, same hidden out.
+    std::string                    mtp_embeds_name_  = "input_embeds";
+    bool                           mtp_mask_2d_      = false;
+    ov::element::Type              mtp_mask_type_    = ov::element::f32;
+    ov::element::Type              mtp_pos_type_     = ov::element::f32;
     int                            paged_n_ctx_      = 0;
     size_t                         paged_sections_   = 4;    // position_ids dim 0
     size_t                         drafts_max_       = 0;

@@ -211,11 +211,20 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out) 
     // DESIGN.md §3.5.
     // Both halves are needed: the head's own layer, and the LM head extracted
     // from the base model so the draft can be turned into a token.
-    a.mtp_layer_xml   = dir + "/openvino_mtp_layer.xml";
-    a.mtp_lm_head_xml = dir + "/openvino_mtp_lm_head.xml";
-    a.has_mtp_head    = file_exists(a.mtp_layer_xml) && file_exists(a.mtp_lm_head_xml);
+    // Two layers can serve: the reconstructed one, and -- since optimum-intel's
+    // development branch started exporting it (seen 2026-08-30 in Intel's
+    // public Qwen3.8 IR) -- the exporter's own openvino_mtp_model. Neither
+    // carries the lm_head the draft is decoded with; that is always ours.
+    a.mtp_layer_xml          = dir + "/openvino_mtp_layer.xml";
+    a.mtp_exported_layer_xml = dir + "/openvino_mtp_model.xml";
+    a.mtp_lm_head_xml        = dir + "/openvino_mtp_lm_head.xml";
+    if (!file_exists(a.mtp_layer_xml)) a.mtp_layer_xml.clear();
+    if (!file_exists(a.mtp_exported_layer_xml)) a.mtp_exported_layer_xml.clear();
+    a.has_mtp_head = (!a.mtp_layer_xml.empty() || !a.mtp_exported_layer_xml.empty()) &&
+                     file_exists(a.mtp_lm_head_xml);
     if (!a.has_mtp_head) {
         a.mtp_layer_xml.clear();
+        a.mtp_exported_layer_xml.clear();
         a.mtp_lm_head_xml.clear();
     }
 

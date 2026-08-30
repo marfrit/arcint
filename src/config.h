@@ -107,6 +107,7 @@ struct Config {
     int         kv_pool_pages             = 0;       // cap the KV pool (tests: force eviction); 0 = sized by memory
     int         gdn_checkpoint_budget_mib = 512;     // §3.3
     std::string mtp                       = "auto";  // on | off | auto
+    std::string mtp_layer                 = "auto";  // auto | reconstructed | exported
 
     // Speculative decoding through the external-drafter hook (DESIGN.md §3.5).
     // 0 disables it. No export currently carries an MTP head, so the drafter is

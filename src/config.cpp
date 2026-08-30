@@ -118,6 +118,9 @@ std::string usage_text() {
         "  --no-paged                stateful reference path instead of the paged executor\n"
         "  --emb-device DEV          run the embeddings gather elsewhere (default: --device)\n"
         "  --mtp-device DEV          run the MTP head elsewhere (default: --device)\n"
+        "  --mtp-layer WHICH         auto | reconstructed | exported: which MTP layer graph to\n"
+        "                            draft with when the artifact carries both (default: auto,\n"
+        "                            the reconstructed one when present)\n"
         "\n"
         "misc\n"
         "  -v, -vv                   raise console verbosity\n"
@@ -251,6 +254,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--emb-device") {
             if (!value(v)) return fail("--emb-device needs a device");
             cfg.emb_device = std::string(v);
+        } else if (arg == "--mtp-layer") {
+            if (!value(v)) return fail("--mtp-layer needs auto, reconstructed or exported");
+            cfg.mtp_layer = std::string(v);
         } else if (arg == "--mtp-device") {
             if (!value(v)) return fail("--mtp-device needs a device");
             cfg.mtp_device = std::string(v);
@@ -379,6 +385,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     }
     if (cfg.mtp != "on" && cfg.mtp != "off" && cfg.mtp != "auto") {
         return fail("--mtp must be on, off, or auto");
+    }
+    if (cfg.mtp_layer != "auto" && cfg.mtp_layer != "reconstructed" && cfg.mtp_layer != "exported") {
+        return fail("--mtp-layer must be auto, reconstructed or exported");
     }
     if (cfg.mtp == "on" && entry != nullptr && !entry->has_mtp_head) {
         return fail(log::format("--mtp on: %s ships no MTP head", cfg.model_id.c_str()));

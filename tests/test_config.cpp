@@ -263,3 +263,12 @@ TEST(config_paged_kv_is_a_documented_choice) {
     CHECK(rejected({"--stub", "--paged-kv", "fp16"}));
     CHECK(rejected({"--stub", "--paged-kv"}));
 }
+
+TEST(config_mtp_layer_choice) {
+    for (const char* w : {"auto", "reconstructed", "exported"}) {
+        Config cfg;
+        CHECK(run({"--stub", "--mtp-layer", w}, cfg).ok);
+        CHECK_EQ(cfg.mtp_layer, std::string(w));
+    }
+    CHECK(rejected({"--stub", "--mtp-layer", "intel"}));
+}
