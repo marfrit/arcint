@@ -2005,6 +2005,35 @@ capture reports the stock gate at 36.5 ms across its 40 nodes — 912 us each on
 for that node, it is not device time and it moves opposite to the wall. Decode
 is read from the timeline and from wall, never from PERF_COUNT per node.
 
+#### 7.0.2i The gate padding's decode price is the extraction, whatever the op (2026-08-30)
+
+The forty `StridedSlice`s that cost `--gate-pad 16` its 5% of decode were
+replaced by a `VariadicSplit` placed *after* the sigmoid — so the sigmoid stays
+an FC post-op, and the split is the op the plugin lowers to a crop, which at
+offset 0 is the case its in-place optimisation accepts. It took four attempts
+to build, all of them the order in which a modified subgraph must be
+re-inferred (a Reshape re-inferred before its input throws; a model-wide pass
+before the consumer is rewired throws on the Multiply; the DFS reversed is the
+bottom-up order). Then, same session, f16, 32768:
+
+| | stock | pad16, StridedSlice | pad16, VariadicSplit after sigmoid |
+|---|---|---|---|
+| walked / launched | 2315 / 1171 | 2365 / 1219 | 2355 / **1212** |
+| the 40 extraction nodes | — | `strided_slice_ref`, launched | `generic_eltwise_ref`, **launched** |
+| decode, 512 tok | 71.6 t/s | (−5%) | **67.1 t/s (−6%)** |
+| prefill 12448 | 3.97 s | 3.45 s | **3.45 s** |
+| greedy 96 | ref | identical | **identical** |
+
+The crop did not become a view; it launched as an eltwise copy, and the decode
+price is the same. Two conclusions. The extraction costs ~20 us per layer in
+host time however it is spelled, because a launched shape-changing primitive
+on a dynamic graph is what costs, not the kernel name; and the padding's
+decode price is therefore not removable from arcint's side — it goes away when
+decode's launch count is cut (§7.0.2f), or if the plugin's crop-as-view
+condition can be met, which is read next. The split variant is kept as the
+implementation (fewer primitives than the slice, sigmoid still fused); the
+flag stays off by default with the same break-even.
+
 #### 7.0.2h The decode primitive histogram: a handful of classes, not a long tail
 
 One decode step, every node the plugin walks, by name (`ARCINT_PROFILE_NODES`):

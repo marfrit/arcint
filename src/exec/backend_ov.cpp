@@ -47,6 +47,8 @@
 #include <openvino/op/slice.hpp>
 #include <openvino/op/transpose.hpp>
 #include <openvino/core/graph_util.hpp>
+#include <openvino/op/sigmoid.hpp>
+#include <openvino/op/variadic_split.hpp>
 #include <openvino/pass/manager.hpp>
 #include <openvino/pass/sdpa_to_paged_attention.hpp>
 #include <openvino/runtime/intel_gpu/properties.hpp>
@@ -392,6 +394,7 @@ size_t pad_gate_matmuls(const std::shared_ptr<ov::Model>& model, size_t npad) {
         std::vector<std::shared_ptr<ov::Node>>  stack{mm->input_value(1).get_node_shared_ptr()};
         std::set<const ov::Node*>               seen;
         std::vector<std::shared_ptr<Constant>>  consts;
+        std::vector<std::shared_ptr<ov::Node>>  chain;   // the decompression subgraph
         bool                                    ok = true;
         while (!stack.empty() && ok) {
             const std::shared_ptr<ov::Node> n = stack.back();
@@ -406,6 +409,7 @@ size_t pad_gate_matmuls(const std::shared_ptr<ov::Model>& model, size_t npad) {
                 ok = false;
                 break;
             }
+            chain.push_back(n);
             for (size_t i = 0; i < n->get_input_size(); ++i) {
                 stack.push_back(n->input_value(i).get_node_shared_ptr());
             }
@@ -443,15 +447,40 @@ size_t pad_gate_matmuls(const std::shared_ptr<ov::Model>& model, size_t npad) {
             pr.second->set_friendly_name(pr.first->get_friendly_name());
             ov::replace_node(pr.first, pr.second);
         }
-        // Column 0 back out, so the sigmoid and everything after it see [M, 1].
-        const auto targets = mm->output(0).get_target_inputs();
-        const auto start   = Constant::create(ov::element::i64, {1}, {int64_t{0}});
-        const auto stop    = Constant::create(ov::element::i64, {1}, {int64_t{1}});
-        const auto step    = Constant::create(ov::element::i64, {1}, {int64_t{1}});
-        const auto ax      = Constant::create(ov::element::i64, {1}, {last});
-        const auto slice   = std::make_shared<ov::op::v8::Slice>(mm->output(0), start, stop, step, ax);
-        slice->set_friendly_name(mm->get_friendly_name() + "/gate_pad_slice");
-        for (auto t : targets) t.replace_source_output(slice->output(0));
+        // Column 0 back out. Two choices here were measured (DESIGN 7.0.2g/i):
+        // a Slice between the MatMul and the sigmoid becomes a launched
+        // strided_slice kernel at ~20 us of host time each, forty per step, and
+        // it un-fuses the sigmoid from the FC. So the cut goes AFTER the sigmoid
+        // -- which then stays an FC post-op -- and is a VariadicSplit, which the
+        // plugin lowers to a crop; a crop at offset 0 is the case its in-place
+        // optimisation accepts, so at best it is a view and not a kernel at all.
+        // The [M, npad-1] remainder has no consumer and is dropped at compile.
+        // The constants changed a few nodes below the MatMul, and every node in
+        // between still carries its old shape until re-inferred; the split
+        // validates against the sigmoid's shape at construction. Re-infer the
+        // decompression chain only -- a model-wide pass here would push the
+        // widened shape into the sigmoid's consumers before they are rewired
+        // and fail on the Multiply. Bottom-up, because a Reshape re-inferred
+        // before its input throws on the spot rather than waiting for a later
+        // pass; the walk above was a depth-first descent from the MatMul, so
+        // its reverse is exactly the bottom-up order.
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it) (*it)->revalidate_and_infer_types();
+        mm->revalidate_and_infer_types();
+        ov::Output<ov::Node> cut_from = mm->output(0);
+        if (const auto ts = mm->output(0).get_target_inputs(); ts.size() == 1) {
+            const auto user = ts.begin()->get_node()->shared_from_this();
+            if (ov::as_type_ptr<ov::op::v0::Sigmoid>(user) != nullptr) {
+                user->revalidate_and_infer_types();
+                cut_from = user->output(0);
+            }
+        }
+        const auto targets = cut_from.get_target_inputs();
+        const auto ax      = Constant::create(ov::element::i64, {}, {last});
+        const auto lens    = Constant::create(ov::element::i64, {2},
+                                              {int64_t{1}, static_cast<int64_t>(npad) - 1});
+        const auto split   = std::make_shared<ov::op::v1::VariadicSplit>(cut_from, ax, lens);
+        split->set_friendly_name(mm->get_friendly_name() + "/gate_pad_split");
+        for (auto t : targets) t.replace_source_output(split->output(0));
         ++done;
     }
     if (done > 0) model->validate_nodes_and_infer_types();
