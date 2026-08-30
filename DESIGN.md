@@ -2459,6 +2459,37 @@ Greedy answers with and without the head differ at one near-tie token late
 in each answer (chars 621 and 1182 of ~1400 and ~1830; equivalent phrasing),
 the verify-pass property already recorded for the 3.8.
 
+#### 7.0.2p The M=2 loss found: 20,480 subbuffer creations per verify forward (2026-08-30)
+
+The follow-up to 7.0.2o inverted twice under measurement. The "+59%" device
+budget was measured against the wrong baseline (on device time the head is a
+wash, 8.6 ms a token against 8.7 plain), and the "~10 ms unattributed in the
+serving loop" was not in the loop: the plugin's own host-time profile at
+level 2, differenced over two run lengths so probes and prefill cancel,
+put the verify forward at 27.4 ms of *enqueue* and 1.1 ms of wait against a
+plain step's 12.6 + 1.15 — everything arcint does outside `infer()` is under
+a millisecond per token. Two mechanisms were then falsified by direct test
+(105 blocking `clEnqueueMapBuffer` reads per verify: removing all of them
+with USM-host index inputs bought 1.1 ms; the per-infer PagedAttention impl
+rebuild: ~0.1 ms), and per-stage timers in the debug plugin found the real
+one: at `token_num > 1` the MoE implementation rebuilds its per-expert mask
+subbuffers on every infer — 512 `create_subbuffer` calls per layer, 20,480
+per two-token forward, ~9 ms — for a prefill fallback that the batched-GEMV
+path it takes never reads. At one token the block is skipped, which is why
+no plain step ever showed it.
+
+patches/0003 skips the masks below the GEMV threshold and creates them
+lazily in the fallback. Byte-identical outputs both arms; the verify
+forward drops 27.3 → 18.1 ms and `--mtp on` goes 44-46 → 60.5-61.2 t/s on
+prose (80.7% acceptance) against 61.7-62.3 plain — a wash. With the int4
+head (NNCF INT4_ASYM g64, 1.69 GB → 455 MB) the code prompt runs 72.9 t/s
+at 84.0% acceptance, +17% over plain: the first configuration in which the
+35B's speculation wins. Acceptance under int4 moves both ways by prompt
+(71.4% on prose); Prüfstand before any card changes. None of this is in
+production until the plugin fix ships. The head's remaining cost is host:
+5.05 ms per draft, half of it shape inference over 123 primitives. Full
+readings: docs/moe-m2-path.md.
+
 #### 7.0.2b The XMX question cannot be decided from the profile
 
 The proposed five-minute check — grep a `ARCINT_PROFILE` for `dpas`/systolic

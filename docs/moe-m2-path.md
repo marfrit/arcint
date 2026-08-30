@@ -226,3 +226,70 @@ function; the per-infer impl rebuild is the suspect. No `perf` in the
 container and the plugin's per-stage dump aborts with the head loaded when
 profiling is enabled; the next instrument is that dump without profiling, or
 a timer around `update_impl` in the debug plugin build.
+
+## Found (same evening): 20,480 subbuffer creations per verify forward
+
+The per-stage accumulators (a timer in the debug plugin around each pipeline
+stage of `primitive_inst`, summed per infer, printed per network at
+host-time profiling level 3) split the verify's 27.4 ms of enqueue by stage
+and then by implementation:
+
+| per LM forward, median | plain M=1 | verify M=2 |
+|---|---|---|
+| shape inference | 1.78 | 1.87 |
+| impl update | 0.01 | 0.02 |
+| realloc | 0.19 | 0.58 |
+| prepare (total) | 5.25 | 6.92 |
+| execute | 7.60 | **17.49** |
+| — of which `ocl::moe::moe_3gemm_swiglu_opt_` | 0.69 | **9.04** |
+
+The MoE implementation's host-side execute costs 226 µs per layer at two
+tokens against 18 µs at one. The mechanism is in
+`prepare_internal_buffers`: at `token_num > 1` it rebuilds the per-expert
+mask subbuffers — `create_subbuffer` twice per expert, 512 calls per layer,
+**20,480 per two-token forward** — on every infer. The batched-GEMV path a
+two-token verify actually takes never reads those masks; they exist for the
+per-expert prefill fallback. At one token the block is skipped, which is why
+the plain step never showed it.
+
+The fix (patches/0003, applied to the local plugin build): skip the mask
+creation at `token_num <= batched_gemv_threshold`, create the masks lazily
+in the prefill fallback, and cache them against (token_num, buffer) for the
+prefill path proper. Measured on the B60, u8 KV, 300 tokens, temperature 0,
+outputs **byte-identical** to the unpatched plugin in both arms:
+
+| | unpatched | patched |
+|---|---|---|
+| `--mtp off` | 62.3 t/s | 61.7-62.3 t/s |
+| `--mtp on`, prose (80.7% accept) | 44-46 t/s | **60.5-61.2 t/s** |
+| verify forward wall | 27.3 ms | **18.1 ms** |
+| MoE host execute per verify | 8.91 ms | 0.74 ms |
+
+The speculative path is now a wash with plain decode on prose. What remains
+of the verify's extra host time is ~3 ms (PagedAttention MIXED stage 0.85,
+realloc +0.4, prepare +1.2) — and the head itself, whose 5.05 ms of host per
+draft (2.6 of it shape inference over 123 primitives) is now the largest
+speculation-only cost. The USM-host index-input experiment and the two
+falsified mechanisms (blocking maps, impl rebuild) are recorded above; the
+serving loop's "~10 ms unattributed" of 7.0.2o stays retracted.
+
+### The int4 head, measured after the fix (item 3 of the order)
+
+NNCF INT4_ASYM, group 64, all layers, on the exported f16 head: layer
+1.69 GB → 455 MB, lm_head int8 kept. Same card, same prompts, 300 tokens,
+temperature 0, patched plugin:
+
+| head | prose accept | prose t/s | code accept | code t/s |
+|---|---|---|---|---|
+| f16 | 80.7% (134/166) | 60.8-61.2 | 78.1% (132/169) | 63.1 |
+| int4 | 71.4% (125/175) | 68.4 | **84.0% (137/163)** | **72.9** |
+
+Acceptance moves both ways with quantisation — down 9 points on the prose
+prompt, up 6 on the code prompt; single prompts, near-tie tokens flip, and
+the draft stays greedy-verified either way, so this is a speed knob, not a
+correctness one. The int4 head's smaller read makes `--mtp on` a clear win
+on the code prompt: 72.9 t/s against ~62 plain (+17%) — the first
+configuration in which the 35B's speculation beats plain decode. Both
+numbers want the Prüfstand harness (10/10 acceptance task) before the model
+card changes; and none of this reaches production until the plugin fix
+ships (the packaged plugin still pays the 9 ms per verify).

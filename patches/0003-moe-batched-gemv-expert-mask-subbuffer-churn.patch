@@ -1,0 +1,78 @@
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+index 383a64d0..e4bd4a47 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -620,6 +620,8 @@ public:
+     } moe_fusion_weights;
+ 
+     struct scratch_buffers {
++        size_t expert_masks_token_num = 0;
++        void* expert_masks_base = nullptr;
+         // softmax+topk
+         memory::ptr topk_id;
+         memory::ptr topk_weights;
+@@ -1371,6 +1373,24 @@ public:
+             scratch.gate = intermediates_memories[MOE_INTERNAL_BUFFER_GATE_OUTPUT];
+             const auto& config = instance.get_typed_desc<moe_3gemm_fused_compressed>()->_config;
+             int expert_num = static_cast<int>(config.num_expert);
++            // The per-expert mask subbuffers are only read by the per-expert prefill
++            // fallback, and they depend only on token_num and the two mask buffers.
++            // Recreating 2*expert_num subbuffers per layer per infer costs ~9 ms of
++            // host time per two-token forward; cache them instead.
++            void* mask_base = intermediates_memories[MOE_INTERNAL_BUFFER_EXPERT_MASK_BATCH]->buffer_ptr();
++            if (token_num <= batched_gemv_threshold) {
++                // The batched-GEMV path never reads the per-expert masks; skip
++                // creating 2*expert_num subbuffers per layer per infer.
++                prepare_weight_pointers(instance, scratch);
++                return;
++            }
++            if (static_cast<int>(scratch.expert_masks.size()) == expert_num &&
++                scratch.expert_masks_token_num == token_num && scratch.expert_masks_base == mask_base) {
++                prepare_weight_pointers(instance, scratch);
++                return;
++            }
++            scratch.expert_masks_token_num = token_num;
++            scratch.expert_masks_base = mask_base;
+             scratch.expert_masks.resize(expert_num);
+             for (int i = 0; i < expert_num; i++) {
+                 auto mask_layout = cldnn::layout({static_cast<int>(token_num)}, cldnn::data_types::i32, cldnn::format::get_default_format(1));
+@@ -2156,10 +2176,39 @@ public:
+     //     scratch.y = MLP(scratch.x, .gate/up/down) * scratch.routing_weights
+     //     scatter(final_hidden, scratch.y, expert_mask.batch)
+     //
++    
++    void ensure_expert_masks(typed_primitive_inst<moe_3gemm_fused_compressed>& instance, scratch_buffers& scratch) {
++        const auto& intermediates_memories = instance.get_intermediates_memories();
++        auto& engine = instance.get_network().get_engine();
++        const auto& config = instance.get_typed_desc<moe_3gemm_fused_compressed>()->_config;
++        int expert_num = static_cast<int>(config.num_expert);
++        auto in_layout = instance.get_impl_params()->input_layouts[0];
++        size_t token_num = get_seq_len(in_layout);
++        void* mask_base = intermediates_memories[MOE_INTERNAL_BUFFER_EXPERT_MASK_BATCH]->buffer_ptr();
++        if (static_cast<int>(scratch.expert_masks.size()) == expert_num &&
++            scratch.expert_masks_token_num == token_num && scratch.expert_masks_base == mask_base)
++            return;
++        scratch.expert_masks_token_num = token_num;
++        scratch.expert_masks_base = mask_base;
++        scratch.expert_masks.resize(expert_num);
++        for (int i = 0; i < expert_num; i++) {
++            auto mask_layout = cldnn::layout({static_cast<int>(token_num)}, cldnn::data_types::i32, cldnn::format::get_default_format(1));
++            scratch.expert_masks[i].batch =
++                engine.create_subbuffer(*intermediates_memories[MOE_INTERNAL_BUFFER_EXPERT_MASK_BATCH], mask_layout, i * token_num * sizeof(int32_t));
++            scratch.expert_masks[i].topk =
++                engine.create_subbuffer(*intermediates_memories[MOE_INTERNAL_BUFFER_EXPERT_MASK_TOPK], mask_layout, i * token_num * sizeof(int32_t));
++        }
++    }
++
+     cldnn::event::ptr exec_prefill_onednn(const std::vector<cldnn::event::ptr>& events,
+                                           cldnn::stream& stream,
+                                           typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
+                                           scratch_buffers& scratch) {
++        // The expert-mask subbuffers are created lazily: prepare_internal_buffers
++        // skips them below the batched-GEMV threshold, where only the OTD
++        // fallback can reach this path.
++        ensure_expert_masks(instance, scratch);
++
+         auto cur_moe = instance.get_typed_desc<moe_3gemm_fused_compressed>();
+         const auto& config = cur_moe->_config;
+         auto& dnn_stream = stream.get_onednn_stream();
