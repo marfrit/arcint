@@ -2029,6 +2029,32 @@ that lost their names to transformations — 161 DynamicQuantize, 235 Reshape,
 91 Parameters (the 91 state and cache inputs), 80 Add, the routers, the paged
 GDN and attention nodes.
 
+**The walked-versus-launched split, solved from two extra configurations
+(2026-08-30).** Three decode configurations that move the two counts
+differently, host enqueue time from the plugin's own profiler solved across
+512/128-token pairs, and wall as the cross-check:
+
+| config | walked | launched | host/step | step wall |
+|---|---|---|---|---|
+| stock | 2315 | 1171 | 14.0 ms | 16.8 ms |
+| post-op fusion off (`GPU_DISABLE_POST_OPS_FUSIONS=1`) | 2315 | **1435** | 15.1 ms | 17.6 ms |
+| gate padded to 16 | 2365 | 1219 | 15.7 ms | 17.8 ms |
+
+Un-fusing the post-ops is the clean axis — +264 launches, not one more
+primitive walked — and gives **3.3–4.1 us per launch** on top of the walk.
+The budget then fixes the walk: 14.0 = 2315·a + 1171·b puts **a at 4.0–4.4 us
+per walked primitive**. A primitive the plugin walks without launching costs
+about half of one it launches, so the 2315 is the denominator and the 582
+`Reshape`s are ~2.4 ms — 17% of the host budget, the size of the entire GDN
+small-op target. They rank.
+
+The padded configuration does not fit the two-cost model: 50 walked + 48
+launched predicts ~0.4 ms and the measurement is 1.0–1.6 ms. The forty
+`StridedSlice`s cost ~20 us each, five times a typical primitive — the
+per-primitive cost depends on the op, and the padding's decode price is that
+op specifically, which makes it fixable by a cheaper column extraction rather
+than only by waiting for fusion.
+
 **So fusion is three changes, not twenty**, and two of them may already exist
 in the plugin: (1) the five `linear_attn` FCs of a GDN layer consume one input
 and the plugin has a horizontal-FC fusion pass (`disable_horizontal_fc_fusion`
@@ -2039,6 +2065,46 @@ that is the −50% the device bound needs (§7.0.2f: under ~545 launches or unde
 5.75 us each). Adding a fused primitive changes graph structure, so it needs its
 own before/after on node inventory — the null-implementation control does not
 cover it.
+
+**The horizontal-FC fusion, tried (2026-08-30): it fires, it is wrong, and as
+implemented it buys nothing.** The pass is general below its bound — every
+later use is `fc_nodes.size()` — so the experiment was the one line
+`max_num_fcs_to_fuse = 3 -> 8`, A = the pristine debug plugin, B = the patched
+one, same arcint, u8, 32768. Node inventory before and after, as required for
+a graph-structure change:
+
+| | A (bound 3) | B (bound 8) |
+|---|---|---|
+| walked / launched | 2315 / 1173 | 2385 / **1198** |
+| FC launched (in `linear_attn`) | 371 (150) | **161** (60) |
+| nodes named `*_fused_*` | 10 (the attention q/k/v) | 80 |
+| `Crop` launched | 0 | **110** |
+| `Multiply` / `Add` launched | 40 / 104 | 80 / 134 |
+| host enqueue per decode step | 12.7 ms | **14.4 ms** |
+| decode, 512 tokens | 66.4 t/s | 66.1 t/s |
+| prefill 12448 | 4.28 s | 4.03 s |
+| greedy 96 | reference | **DIFFERENT — broken text** |
+
+Three findings, each of which the inventory shows and the step time alone
+would have hidden. (1) The fusion fired on 70 sets, not 30: the 40 MLP blocks
+have four FCs on the post-attention norm too (shared-expert gate/up, the
+scalar gate, one more), so FC launches fell by 210. (2) **Nothing was gained**:
+the fused output's split materialised as 110 launched `Crop` kernels instead of
+views, and the FCs' fused post-ops (40 `Multiply`, 30 `Add`) came back out as
+kernels — net +25 launches, +70 walked, host time up 1.7 ms. The step is the
+same to within noise. (3) **The output is wrong.** Byte-equality failed with
+garbage text, so by the standing rule this is a different model and nothing
+about it ships. Which of the two set-shapes breaks it is being bisected (GDN
+sets only, MLP excluded).
+
+Why the crops are not views is readable: `prepare_buffer_fusing` optimises a
+crop in place only when its offsets and the remaining padding are aligned for
+every user (`is_optimizable_padding_for_crop`), never when a user is a `gemm`
+that would then see padding, and in the dynamic case only through
+`can_crop_be_optimized_simple_data_format`. The GDN split is 8192 / 4096 / 32 /
+32 and the MLP one carries a width-1 column; the 32-wide and 1-wide pieces at
+odd offsets are the likely failures, and it means a correct fusion still
+needs a second change before it moves decode at all.
 
 **Level-Zero, read before anyone plans on it.** The pinned plugin carries a
 complete L0 runtime (`runtime/ze/`: engine, stream, kernel, memory, events;

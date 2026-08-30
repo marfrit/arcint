@@ -83,6 +83,10 @@ std::string usage_text() {
         "  --prefill-chunk N         prefill chunk in tokens, 0 = unchunked\n"
         "                            (default: 2048; bounds activation memory)\n"
         "  --paged-kv u8|f16         KV precision on the paged path (default: u8).\n"
+        "  --gate-pad N              widen the shared-expert gate to N columns (default: 0,\n"
+        "                            off). 16 is the measured setting: -13% prefill wall,\n"
+        "                            -5% decode; pays off below ~500 answer tokens per 12k\n"
+        "                            prompt tokens. See DESIGN 7.0.2g.\n"
         "                            u8 is 11.3 KiB/token against f16's 20.0, which\n"
         "                            is what makes two lanes at depth fit. It is the\n"
         "                            default because it is the setting that does not\n"
@@ -167,6 +171,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.parallel)) {
                 return fail("--parallel needs an integer");
             }
+        } else if (arg == "--gate-pad") {
+            if (!value(v) || !parse_int(v, cfg.gate_pad)) return fail("--gate-pad needs an integer");
         } else if (arg == "--paged-kv") {
             if (!value(v)) return fail("--paged-kv needs u8 or f16");
             cfg.paged_kv = std::string(v);
@@ -312,6 +318,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         // paged path already gets them from the plugin (DESIGN.md §3.3).
         return fail("--kv-dtype q8 is not implemented: a plain cast to int8 has no scales and "
                     "silently degrades the answer. Use fp16, or the paged path once it lands.");
+    }
+    if (cfg.gate_pad < 0 || cfg.gate_pad == 1 || cfg.gate_pad > 4096) {
+        return fail(log::format("--gate-pad must be 0 (off) or 2..4096, not %d", cfg.gate_pad));
     }
     if (cfg.paged_kv != "u8" && cfg.paged_kv != "f16") {
         return fail(log::format("--paged-kv must be u8 or f16, not '%s'", cfg.paged_kv.c_str()));

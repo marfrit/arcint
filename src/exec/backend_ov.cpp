@@ -1760,12 +1760,12 @@ private:
         const std::string  mtp_dev = cfg.mtp_device.empty() ? device : cfg.mtp_device;
 
         std::shared_ptr<ov::Model> model = core_.read_model(artifact_.language_model_xml);
-        // ARCINT_GATE_PAD=<n>: widen the shared-expert gate (see pad_gate_matmuls).
-        // An experiment switch until the win is measured against wall time.
-        if (const char* gp = std::getenv("ARCINT_GATE_PAD")) {
-            const size_t npad = static_cast<size_t>(std::strtoul(gp, nullptr, 10));
-            const size_t n    = pad_gate_matmuls(model, npad);
-            log::info("load", "shared-expert gate padded to N=%zu on %zu MatMul(s)", npad, n);
+        // --gate-pad N: widen the shared-expert gate (see pad_gate_matmuls). A
+        // deployment choice with a known price, like --paged-kv: DESIGN 7.0.2g
+        // has the break-even. Off by default for this fleet's answer lengths.
+        if (cfg.gate_pad > 0) {
+            const size_t n = pad_gate_matmuls(model, static_cast<size_t>(cfg.gate_pad));
+            log::info("load", "shared-expert gate padded to N=%d on %zu MatMul(s)", cfg.gate_pad, n);
         }
 
         // The LA state geometry is read off the *stateful* graph's variables,
@@ -2731,6 +2731,15 @@ private:
             // time. Shares below are shares of what this counter reports.
             log::info("profile", "%s", "  numerator: PERF_COUNT under-reports device time "
                                        "~1.8x and omits transfers entirely");
+            // The canonical reason to distrust it needs no domain knowledge: at
+            // M=1 it once reported 36.5 ms for forty gate nodes inside a step
+            // whose wall was 22 ms. A component cannot exceed the container it
+            // is measured in. A figure that fails that test is rejected without
+            // further argument -- and the per-node decode numbers do.
+            if (std::strcmp(what, "decode step") == 0) {
+                log::info("profile", "%s", "  decode per-node figures are not device time: a "
+                                           "component here has exceeded its own step's wall");
+            }
             // Every pair, not the top 20. A truncated table cannot answer
             // "is this op still in the graph at all", which is exactly the
             // question that arose about the transposes the paged transformation

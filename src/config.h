@@ -101,6 +101,7 @@ struct Config {
     // 2026-08-29, it costs up to 22% of prefill at 115k (§4.4) — so a one-lane
     // deep-context endpoint on a card with room should say f16.
     std::string paged_kv                  = "u8";    // u8 | f16
+    int         gate_pad                  = 0;       // 0 = off; 16 = the measured setting
     int         gdn_checkpoint_budget_mib = 512;     // §3.3
     std::string mtp                       = "auto";  // on | off | auto
 
