@@ -43,6 +43,17 @@ the tokenizer and detokenizer IRs, `config.json` and the chat template. A GGUF
 will not load. Neither will GPTQ or NVFP4 safetensors — those are llama.cpp and
 vLLM formats, and OpenVINO does not read them.
 
+**One of the three is published, and it is the one the numbers were measured
+on.** [marfrit/Qwen3.6-27B-A3B-Coder-int4-awq-se-ov](https://huggingface.co/marfrit/Qwen3.6-27B-A3B-Coder-int4-awq-se-ov)
+(Apache-2.0) is the coder artifact used everywhere in the *Measured* section —
+byte-identical to the one the endpoint serves, already in the allowlist, so it
+needs no registration. Its model card carries the calibration triangle below,
+the runtime warnings, and one limitation worth reading before you deploy it: the
+calibration corpus was code and English, and German prose degrades. If you only
+want to run arcint rather than build an artifact, download that and stop reading
+here; the rest of this section is for the other two models and for anyone who
+wants a different calibration.
+
 **There is no shortcut from GGUF.** llama.cpp gained an OpenVINO backend in
 early 2026, and it was built and tested against these models: the production
 GDN hybrid aborts during scheduling because the recurrent DeltaNet states are
