@@ -1913,6 +1913,12 @@ Three checks, none of them a kernel:
 | activation reservation, chunk 2048 | 2.99 GiB (1283.9 KiB/token) | **0.90 GiB** (216.9 KiB/token) |
 | greedy output, 96 tokens | — | **byte-identical** |
 
+**Gate: Prüfstand 10/10** on the fixed build in the service's own configuration
+(GPU.0, u8 KV default, 262144 context, prefix cache; `logits slice verified:
+1 row(s) for a 128-token forward` in the boot log), 5222 tokens generated at
+63.2 t/s, scored by executing the candidate. The bar is met; the package is not
+yet cut.
+
 The reservation line is the second win: 2.09 GiB of the activation budget was
 logits nobody read, and it comes back as context or chunk. The LM-head GEMM
 over the discarded rows went with the copy (`gemm_kernel` 468 -> 403 ms per
