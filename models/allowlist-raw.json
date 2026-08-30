@@ -68,7 +68,7 @@
     "tokenizer_sha": "87a7830d63fcf43b",
     "lm_xml_sha": "ab94a08ce150de6a",
     "lm_bin_bytes": 13929177378,
-    "status": "unmeasured against the current harness (Intel's public int4 export, OpenVINO/Qwen3.8-27B-int4-ov, 2026-08-30; the reconstructed MTP head copied beside it)",
+    "status": "MTP head pairs: 96.3% / 77.3% draft acceptance (code / prose, B60, 2026-08-30); Intel's public int4 export with the reconstructed head beside it",
     "mtp_num_hidden_layers": 1,
     "mtp_head_exported": true,
     "_note": "Intel's export also ships openvino_mtp_model.{xml,bin} of its own (263 MB int4, one MTP layer, no lm_head, same interface as our openvino_mtp_layer). arcint keys the head on openvino_mtp_layer + openvino_mtp_lm_head, which are the reconstructed ones."

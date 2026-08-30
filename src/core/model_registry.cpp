@@ -155,8 +155,13 @@ std::vector<ModelEntry> build_registry() {
         e.template_hash           = "c3cf9e34abf4f9e3";
         e.tokenizer_hash          = "87a7830d63fcf43b";
         e.weights_bytes           = 13929177378ull;
-        e.status                  = "unmeasured against the current harness (Intel's public "
-                                    "int4 export with the reconstructed MTP head beside it)";
+        // The reconstructed head pairs with this export (2026-08-30, B60, greedy,
+        // thinking off): draft acceptance 96.3% (157/163) on a code prompt and
+        // 77.3% (140/181) on prose, 34.6-37.4 t/s -- next to the 93.2% the same
+        // head measures on our own export. A wrong head cannot raise acceptance,
+        // only depress it, so the number is the oracle (tools/export_mtp.py).
+        e.status                  = "MTP head pairs: 96.3% / 77.3% draft acceptance (code / prose, "
+                                    "B60, 2026-08-30); acceptance task: see DESIGN 7.0.2n";
         e.sampler = qwen_card_defaults();
         split_layers(e);
         r.push_back(std::move(e));

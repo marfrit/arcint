@@ -2339,6 +2339,38 @@ on and off, so "medium" can only mean a **server-side reasoning budget** — a
 cap on think-block tokens after which the server closes the block itself —
 and that is a feature with a number to choose, not a flag.
 
+#### 7.0.2n The reconstructed MTP head pairs with Intel's public Qwen3.8 IR (2026-08-30)
+
+`OpenVINO/Qwen3.8-27B-int4-ov` — Intel's own export of the same checkpoint,
+same geometry, same chat template and tokenizer (hashes identical to our
+entry's), a different quantisation of the body — is allowlisted as its own
+entry, `qwen3.8-27b-intel-int4`, never as an alias of `qwen38-b7c1-ov`: that
+entry's status was measured on our AWQ export and an alias would assert it
+for a file nobody measured. The head from `tools/export_mtp.py` was copied
+beside Intel's IR (the loader keys `has_mtp_head` on the two files, nothing
+pairs them), and the oracle is the one the exporter's docstring states: a
+wrong head cannot change the answer, only depress acceptance.
+
+**It pairs.** Intel's IR with the reconstructed head, `--mtp on`, B60, greedy,
+thinking off: **draft accept 96.3% (157/163)** on a code prompt, **77.3%
+(140/181)** on prose, 34.6–37.4 t/s decode — against ~0% for a head that does
+not belong and 93.2% for the same head on our own export. The head consumes
+the final hidden state and carries its own lm_head, which is exactly why a
+re-quantised body underneath it should not matter, and did not.
+
+**And the premise of the handover has moved.** Intel's export directory
+carries `openvino_mtp_model.{xml,bin}` of its own — 263 MB int4, one MTP
+layer, the same input interface as our reconstructed layer (`hidden_states`,
+`inputs_embeds`, `attention_mask`, `position_ids`, `beam_idx` → hidden), and
+**no lm_head**. optimum-intel's development branch exports the head now; what
+it does not export is the lm_head the draft needs to become a token, and
+arcint's speculative path keys on `openvino_mtp_layer` + `openvino_mtp_lm_head`
+rather than on Intel's file. So the standalone contribution is smaller and
+more precise than "the head nobody publishes": it is the **lm_head half plus
+the serving path**, and the open question is whether Intel's own MTP layer
+paired with our lm_head graph reaches the same acceptance — a one-load
+measurement, not done tonight.
+
 #### 7.0.2b The XMX question cannot be decided from the profile
 
 The proposed five-minute check — grep a `ARCINT_PROFILE` for `dpas`/systolic
