@@ -2094,8 +2094,29 @@ views, and the FCs' fused post-ops (40 `Multiply`, 30 `Add`) came back out as
 kernels — net +25 launches, +70 walked, host time up 1.7 ms. The step is the
 same to within noise. (3) **The output is wrong.** Byte-equality failed with
 garbage text, so by the standing rule this is a different model and nothing
-about it ships. Which of the two set-shapes breaks it is being bisected (GDN
-sets only, MLP excluded).
+about it ships.
+
+**Bisected the same morning: the GDN sets are correct, the MLP sets are the
+bug.** With the raised bound restricted to non-MLP sets: 40 fused nodes, FC
+launches 371 -> **281** (the −90 originally sized), **greedy 96 byte-identical
+to A**. So the wrong output comes from fusing the MLP quartet, whose fourth
+member is the width-1 `shared_expert_gate` — a shape the pass never meets at
+bound 3 and evidently does not handle. And the correct GDN fusion is still
+worth nothing: `Crop` 70 launched (two of the four pieces per layer — the
+32-wide b and a projections at offsets 12288 and 12320, whose consumer is the
+paged GDN primitive — materialise; the 8192- and 4096-wide pieces are views),
+`Add` +30 (one per layer falls out of its FC post-op because its input is now
+a crop rather than the FC), net launched 1173 -> 1198, decode 66.6 against
+66.4 t/s. Patch recorded as `patches/0002-fc-horizontal-fusion-bound.patch`
+and not carried; the plugin tree is back at the pinned commit.
+
+**What that does to the fusion item.** Horizontal FC fusion on the GDN block is
+worth at most ~−60 net launches even if the crop-as-view and post-op problems
+were both solved, about 3% of a decode step — not the 10% it was sized at,
+because the split and the lost post-op consume two thirds of the saving. The
+decode launch count has to come from the classes that do not need a split:
+`DynamicQuantize` into its producer (−160), the walked `Reshape`s (582, ~17% of
+the host budget), and the GDN small ops. None of those is a one-line bound.
 
 Why the crops are not views is readable: `prepare_buffer_fusing` optimises a
 crop in place only when its offsets and the remaining padding are aligned for

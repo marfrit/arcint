@@ -1,0 +1,41 @@
+# Horizontal-FC fusion bound raised 3 -> 8 (diagnostic; not carried, not upstreamed)
+#
+# FullyConnectedHorizontalFusion fuses exactly three compressed FCs on one
+# input (written for q/k/v). A GatedDeltaNet block feeds four (qkv, z, b, a)
+# and the pass is general in the count below its bound, so this raises it.
+# The second hunk is the bisect: skip sets whose FCs are in an MLP block.
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29.
+#
+# Result (DESIGN 7.0.2h, 2026-08-30): with the bound alone the pass also fires
+# on the 40 MLP sets, whose fourth FC is the width-1 shared_expert_gate, and
+# the output is WRONG (garbage text). GDN sets only: byte-identical, FC launches
+# 371 -> 281, but the split materialises as 70 launched Crops and 30 Adds fall
+# out of their FC post-ops, so launches go 1173 -> 1198 and decode does not
+# move. Correct and worthless as implemented; the crop-as-view condition in
+# prepare_buffer_fusing is the item that would make it worth anything.
+
+diff --git a/src/plugins/intel_gpu/src/plugin/transformations/fc_horizontal_fusion.cpp b/src/plugins/intel_gpu/src/plugin/transformations/fc_horizontal_fusion.cpp
+index bf69824b..74ed6d9d 100644
+--- a/src/plugins/intel_gpu/src/plugin/transformations/fc_horizontal_fusion.cpp
++++ b/src/plugins/intel_gpu/src/plugin/transformations/fc_horizontal_fusion.cpp
+@@ -40,7 +40,9 @@ FullyConnectedHorizontalFusion::FullyConnectedHorizontalFusion(bool fuse_mlp_swi
+     if (fuse_mlp_swiglu)
+         min_num_fcs_to_fuse = 2;
+     auto is_target_pattern = [min_num_fcs_to_fuse](const Output<Node>& output) {
+-        const int max_num_fcs_to_fuse = 3;
++        // arcint: was 3, written for QKV. A GatedDeltaNet block feeds four FCs
++        // (qkv, z, b, a) from one input; everything below is general in the count.
++        const int max_num_fcs_to_fuse = 8;
+         // Currently this pass targets only compressed FCs (QKV) on dynamic generative models
+         // inputs: input, weight, bias, scale, [zp]
+         // Bias/scale/zp are constant or none
+@@ -68,6 +70,9 @@ FullyConnectedHorizontalFusion::FullyConnectedHorizontalFusion(bool fuse_mlp_swi
+             const auto& fc_user = ov::as_type_ptr<op::FullyConnectedCompressed>(u);
+             if (!fc_user)
+                 continue;
++            // arcint bisect (diagnostic): the raised bound only for non-MLP sets.
++            if (fc_user->get_friendly_name().find("mlp") != std::string::npos)
++                return false;
+ 
+             // Skip horizontal fusion when the weight is not a constant. The fused-weight Concat
+             // created during fusion relies on constant-folding at compile time; with a non-constant
