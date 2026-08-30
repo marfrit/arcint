@@ -35,6 +35,83 @@ All three target models are hybrids: most layers use linear attention
 (GatedDeltaNet), a minority use full attention. That single fact drives most of
 the design — see [DESIGN.md](DESIGN.md).
 
+## Where the artifacts come from
+
+**arcint loads an OpenVINO IR directory, and nothing else.** Concretely:
+`openvino_language_model.{xml,bin}`, `openvino_text_embeddings_model.{xml,bin}`,
+the tokenizer and detokenizer IRs, `config.json` and the chat template. A GGUF
+will not load. Neither will GPTQ or NVFP4 safetensors — those are llama.cpp and
+vLLM formats, and OpenVINO does not read them.
+
+**There is no shortcut from GGUF.** llama.cpp gained an OpenVINO backend in
+early 2026, and it was built and tested against these models: the production
+GDN hybrid aborts during scheduling because the recurrent DeltaNet states are
+not mapped in the GGML frontend (`pre-allocated tensor (cache_r_l0) in buffer
+(OPENVINO0) that cannot run CPY`), and a classic MoE falls to a CPU path and
+asserts in `get_rows`. Its validation list is dense models only. So the path
+starts at the Hugging Face checkpoint, not at a quantised file you already have.
+
+    pip install "optimum[openvino]" nncf accelerate pillow "huggingface_hub[cli]"
+    pip install "transformers==5.2.0" "openvino==2026.3.0" torchvision
+
+    optimum-cli export openvino --model <checkpoint> \
+      --task image-text-to-text --weight-format int4 --group-size 64 \
+      --awq --scale-estimation --dataset <corpus> --num-samples 32 out/
+
+### The calibration is a decision, not a default
+
+This is the part that decides whether the artifact is usable, and it cannot be
+inferred — it has to be measured against the task you actually serve. Same
+model, same bit width, only the calibration changing, scored on the acceptance
+task (greedy, and three sampled runs at the model card's own settings):
+
+| export | greedy | sampled |
+|---|---|---|
+| naive int4, group 64, data-free | 0/10 | 8, 8, 8 |
+| AWQ + scale estimation, image dataset | 7/10 | 10, 7, 0 |
+| AWQ + scale estimation, code corpus | **10/10** | 10, 8, 8 |
+
+Two findings from that series are worth more than the recipe:
+
+- **Scale estimation is model-class dependent. Never set it blanket.** It is
+  part of the 10/10 recipe for the MoE coder and it *destroys* the greedy path
+  of the dense 27B — 0/10 with two entirely different corpora, degenerating into
+  repetition loops, while AWQ-only on the same model is a healthy 7/10. Measure
+  AWQ+SE against AWQ-only per model before believing either.
+- **Calibration cuts both ways.** The code-and-English corpus that bought 10/10
+  on code produced token salad in German prose (invented compounds, CJK
+  characters mid-word) where the GGUF baseline was clean. What is not in the
+  corpus is what you lose. Pick the corpus to match the distribution the
+  endpoint will actually see, and say so on the artifact.
+
+### Traps that cost a day each
+
+- **`--task text-generation` does not export this architecture.** `qwen3_5_moe`
+  exports only as `image-text-to-text`, the same shape Intel's own IRs use.
+- **`--ratio` must stay 1.0.** Mixed precision makes group sizes non-uniform and
+  the GPU's MoE fusion refuses to load the result. That is why every published
+  Intel IR for these models is ratio 1.0.
+- **Export on a stable OpenVINO, not a nightly.** An IR produced by a nightly
+  segfaults on a stable runtime; a stable IR runs fine on a newer runtime.
+- **Scale estimation with code samples is memory-hungry** in a way image
+  datasets do not prepare you for: it OOM'd on a 121 GB machine, thrashed on
+  247 GB (RSS 244 GB, 99.7% iowait), and completed on 494 GB with a ~152 GB
+  peak. `TMPDIR` needs ~110 GB — the fp16 intermediate and the final save both
+  land there, and running out produces `basic_ios::clear: iostream error` after
+  the entire compression has already finished.
+- **Do not use `ov::cache_dir` with these MoE IRs.** The first run writes the
+  blob, the second imports it without expert weights and fails at inference
+  ("expert weight provider not initialized"). Tracked upstream as
+  openvinotoolkit/openvino#37607.
+
+### Registering it
+
+arcint refuses artifacts outside its allowlist at load time, so a new export
+needs an entry in [models/allowlist-raw.json](models/allowlist-raw.json):
+geometry, quantisation, and the tokenizer and chat-template hashes. That is the
+mechanism behind "no model zoo" in the non-goals — the allowlist is the
+assertion that the process is serving what it claims to serve.
+
 ## Features
 
 Marked with the milestone that delivered them, and **[planned]** where the
