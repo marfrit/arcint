@@ -2551,15 +2551,23 @@ private:
                                  "pairs, %.1f us/token",
                       what, tokens, total / 1000.0, rows.size(),
                       tokens > 0 ? total / static_cast<double>(tokens) : 0.0);
-            // Said every time, because it has already cost two retracted
-            // headlines: these chunks run at past 0, and chunk k of a real
-            // prefill attends to everything before it. A past-0 chunk is the
-            // cheapest chunk in any run, so every share below is an upper bound
-            // on that node's share of real prefill -- for anything that does not
-            // grow with depth, by the ratio between this chunk and the average
-            // one. Convert to wall time before deciding a share is worth fixing.
-            log::info("profile", "%s", "  (past 0: shares here overstate a real "
-                                       "prefill's -- size against wall time)");
+            // Six denominator errors, three retracted headlines. A share whose
+            // denominator is implicit is a share that will be wrong again, so
+            // the denominator is named on the same line as the shares it
+            // governs, every time, and so is what the numerator is not.
+            log::info("profile", "  denominator: THIS capture only (%s, %zu token(s), "
+                                 "%.2f ms) -- not prefill wall, not a served chunk",
+                      what, tokens, total / 1000.0);
+            log::info("profile", "%s", "  a past-0 capture is the cheapest chunk in any "
+                                       "run; depth-independent rows overstate here");
+            // Measured 2026-08-30 against an OpenCL device timeline on the same
+            // run: PERF_COUNT reported 14.97 ms where the device spent 27.23 ms
+            // on the same 30 conv executions, and 36.78 against 67.19 ms on the
+            // same 30 GDN executions -- 1.82x and 1.83x. It also cannot see
+            // memory transfers, which were 18.5% of a served prefill's device
+            // time. Shares below are shares of what this counter reports.
+            log::info("profile", "%s", "  numerator: PERF_COUNT under-reports device time "
+                                       "~1.8x and omits transfers entirely");
             // Every pair, not the top 20. A truncated table cannot answer
             // "is this op still in the graph at all", which is exactly the
             // question that arose about the transposes the paged transformation
