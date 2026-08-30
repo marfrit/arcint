@@ -279,6 +279,197 @@ This was **not** a truncation artefact — node totals were always summed over a
 pairs, only the printing was capped. It is the past-0 denominator again, for the
 sixth time. Every share in the inventory table carries this caveat.
 
+### The corollary written here earlier tonight was wrong — retracted
+
+An earlier version of this section argued that 910 ms of mean chunk against
+179 ms at past 0 put "80% of a mean chunk in the depth-dependent term", making
+every kernel row a share of the other 20%. **That is withdrawn.** It compared a
+profiled node-time sum against a served wall time, and those two instruments do
+not agree well enough to be divided by one another.
+
+The depth sweep that was supposed to confirm it refutes it. A 2048-token chunk,
+f16 KV, profiled at three depths:
+
+| past | node total | us/token |
+|---|---|---|
+| 0 | 229.1 ms | 111.9 |
+| 4096 | 273.1 ms | 133.3 |
+| 12288 | 353.7 ms | 172.7 |
+
+Growth is **linear in past** at ~0.0101 ms per past-token, which is the shape
+attention has for a fixed chunk (cost ∝ M x past) and becomes the familiar
+quadratic only once summed over chunks. Between past 0 and past 12288 the chunk
+grows by 54%, not by the 5x the retracted corollary needed.
+
+## The attribution gap: node times account for roughly a third of graph wall
+
+Summing that sweep over a real 13930-token prefill — chunks at past 0, 2048,
+... 12288, the last one partial — predicts about **1.97 s** of node time. The
+same prefill, served and measured at the endpoint, takes **6.40 s wall of which
+6.36 s is graph** (and 5.80 s / 5.76 s on a second, warmer run). Node times
+account for roughly **31%** of graph wall.
+
+The direction matters: PERF_COUNT adds per-primitive event overhead, so the
+per-node numbers are an *upper* bound on true kernel time. The gap is therefore
+real rather than an artefact of the profiler being cheap. But the obvious
+explanation does not survive arithmetic either — a chunk executes on the order
+of 1135 nodes, and ~590 ms of unattributed time per chunk would be ~520 us per
+node, one to two orders above any plausible dispatch overhead.
+
+**So the instrument disagrees with itself and the disagreement is unexplained.**
+Until it is closed, a node share cannot be converted into a share of served
+time, and every figure of the form "this row is X% of prefill wall" in this
+document and in DESIGN — including the 6.0% and 2.2% computed for the gate
+earlier tonight — rests on that conversion and is suspect. The *relative* shares
+within a single capture are unaffected; what is not established is what they are
+shares of.
+
+This is the same class of error as the past-0 denominator, one level further
+out, and it is the seventh time a denominator has been the problem. It also
+means the earlier work-order item "at least 90% of served prefill wall time
+attributed" was answered too easily: the phase breakdown puts 99.4% of prefill
+in "graph", but that only says the time is *inside* the graph call. Opening the
+graph accounts for about a third of it.
+
+### A second denominator, quantified: the synthetic input is not neutral
+
+The profiler fed every capture a chunk of identical token ids (`chunk(m, 0)`).
+In a mixture of experts that is not a neutral input: every token routes to the
+same experts, so the MoE moves a fraction of the weight a real chunk moves.
+`ARCINT_PROFILE_TOKENS=random` fills with deterministic pseudo-random ids
+instead, and at past 12288 the two arms are:
+
+| arm | chunk node total | MOECompressed | share |
+|---|---|---|---|
+| all zero | 353.8 ms | 25970 us | 7.3% |
+| pseudo-random | 361.5 ms | 33415 us | 9.2% |
+
+The MoE row is **28.7% larger** under a realistic token distribution, and
+`MoERouterFused` is unchanged (1849 vs 1842 us) as it should be — the router
+does the same work either way, only the experts it selects differ. So the effect
+is real and it is where it was predicted to be. It is also small in absolute
+terms: 7.4 ms against a ~590 ms gap, so it explains none of the attribution
+problem above. Both readings are kept; `random` is the honest default for any
+future share, and the flag exists so the old captures stay comparable.
+
+**Known limitation found on the way:** `ARCINT_PROFILE=1` and serving cannot be
+combined. `profile_paged` releases lane 0 on the way out and the executor then
+fails to come up with "lane 0 has 0 KV page(s) for 1 token(s)". This is
+pre-existing, it is why the profiler's overhead could not be measured in the
+same process as a served request, and it should be fixed before the attribution
+gap is investigated, because closing that gap needs exactly that comparison.
+
+## The null-implementation control — is the mechanism itself free?
+
+Before attributing anything to a *kernel*, the question is whether registering
+and selecting a second implementation costs anything by itself. If it does,
+every later measurement through that mechanism is confounded. So: register a
+second implementation manager for an op that already has exactly one, and make
+it do precisely what the existing path does.
+
+`PagedCausalConv1DNull` inherits `create_impl` and `validate_impl` from
+`PagedCausalConv1DRef`, so it builds the same primitive from the same generator
+and compiles the same kernel. Only the manager identity differs. The patch is
+`patches/0001-null-implementation-control.patch`; it is a diagnostic and is not
+carried.
+
+Three arms, against the pinned runtime with debug caps:
+
+| arm | registry | total node time | conv row | conv nodes | kernel string |
+|---|---|---|---|---|---|
+| stock | Ref only | 128.87 ms | 7237 us | 30 | `ocl::paged_causal_conv1d::ref___f16` |
+| null_first | Null, then Ref | 128.95 ms | 7227 us | 30 | identical |
+| null_only | Null only | 129.59 ms | 7287 us | 30 | identical |
+
+**The noise floor was measured, not assumed.** An earlier pass of this
+experiment had a path bug that left all three arms running the *same* stock
+plugin, which turned it into three repetitions of one condition: 128.57 / 128.62
+/ 128.66 ms total (+/-0.07%) and 7210 / 7221 / 7212 us on the conv row
+(+/-0.15%). That accident is the instrument's repeatability, and it is what the
+arms above are read against. It also showed the `(op, kernel)` **pair count is
+not a stable metric** at M=1 — it wobbled between 27 and 28 across identical
+runs — so the inventory claim here rests on the per-op node counts and kernel
+strings, which did not move.
+
+**Reading.** Node inventory is unchanged in every arm: 30 `PagedCausalConv1D`
+nodes on `ocl::paged_causal_conv1d::ref___f16`. Step time moves by at most
+**0.7%** (null_only against stock), against a within-build floor of 0.15%; the
+excess is plausibly the cold kernel cache that run had just refilled, so 0.7% is
+an upper bound rather than an effect. **The mechanism is free**, and a later
+real second implementation can be attributed to its kernel.
+
+Two honest limits. The impl name reported by the profiler comes from
+`primitive_inst::get_implementation_name()`, which returns the *kernel* name,
+not the manager's — so in `null_first` there is no way to tell from the profile
+which of the two managers served. That is why `null_only` exists: it proves the
+null manager is a real, selectable implementation that serves the op on its own
+with the same inventory and the same time. And on its first attempt `null_only`
+did not finish inside a 900 s window, because a changed manager identity misses
+the kernel cache and recompiles; it completed normally on the retry. Neither
+limit affects the reading.
+
+**Operationally the most useful number here is the build time.** The full
+debug-caps configure-and-build is **30 min 55 s** measured (23:29:49 -> 00:00:44),
+and an incremental rebuild of the GPU plugin after touching an implementation
+header and its registry is **11 seconds**. The "hours" figure asserted earlier
+in this work was never measured and was withdrawn; the real cost of iterating on
+a plugin implementation is a quarter of a minute per attempt once the tree is
+built.
+
+## The complete kernel inventory of a served prefill chunk
+
+With the cap removed, all 29 pairs, 2048-token chunk at past 0, f16 KV. Reference
+implementations marked:
+
+| share | nodes | op | kernel | ref? |
+|---|---|---|---|---|
+| 30.2% | 40 | FullyConnectedCompressed | `ocl:ref:any__i8` | **ref** (oneDNN's) |
+| 19.4% | 331 | FullyConnectedCompressed | `jit:gemm:any__i8` | |
+| 15.9% | 30 | PagedGatedDeltaNet | `paged_gated_delta_net::opt` | |
+| 8.3% | 40 | MOECompressed | `moe_3gemm_swiglu_opt` | |
+| 6.5% | 30 | PagedCausalConv1D | `paged_causal_conv1d::ref` | **ref** |
+| 4.8% | 104 | Add | `generic_eltwise_ref` | **ref** |
+| 3.2% | 60 | Swish | `activation_ref` | **ref** |
+| 2.7% | 161 | DynamicQuantize | `dynamic_quantize_gpu_opt` | |
+| 2.2% | 131 | RMS | `rms_gpu_bfyx_opt` | |
+| 1.8% | 10 | PagedAttentionExtension | `paged_attention::opt` | |
+| 1.3% | 41 | StridedSlice | `strided_slice_ref` | **ref** |
+| 0.9% | 40 | Multiply | `generic_eltwise_ref` | **ref** |
+| 0.7% | 10 | Crop | `generic_eltwise_ref` | **ref** |
+| 0.7% | 10 | VariadicSplit | `generic_eltwise_ref` | **ref** |
+| 0.6% | 40 | MoERouterFused | `moe_router_fused_opt` | |
+| 0.4% | 20 | Concat | `concatenation_gpu_simple_ref` | **ref** |
+| 0.1% | 20 | RoPE | `rope::opt` | |
+| rest | 17 | Gemm, ScatterNDUpdate, SoftPlus, Reshape, Convert, Gather, Cos, Sin | mixed | mostly ref |
+
+**No `Permute`. No `Transpose`.** Reference implementations account for roughly
+**49%** of the chunk's node time, of which the single largest is the oneDNN gate
+fallback at 30.2%.
+
+## What those percentages are percentages *of* — the sixth past-0 correction
+
+The table above is one 2048-token chunk **at past 0**, and that denominator is
+not the served one. Both figures below are correct; they answer different
+questions, and the gap between them is the whole reason to write this down.
+
+| quantity | value |
+|---|---|
+| node total, 2048-token chunk at past 0 | 179 ms |
+| ref-FC (40 nodes) in that chunk | 54 ms = **30.2%** |
+| chunks in a 14450-token prefill | 7.06 |
+| measured prefill wall, 14450 tokens | 6420 ms |
+| **mean chunk wall at that depth** | **910 ms** |
+| ratio, mean chunk / past-0 chunk | **5.1x** |
+
+ref-FC costs ~54 ms per chunk regardless of depth, so across that prefill it is
+7.06 x 54 = 382 ms of 6420 ms = **6.0% of prefill wall**, falling to roughly
+**2.2%** at 115k tokens and to **zero in decode** (all 371 FC nodes dispatch on
+`jit:gemm` at M=1). The 30.2% is the share of the *cheapest possible* chunk.
+
+This was **not** a truncation artefact — node totals were always summed over all
+pairs, only the printing was capped. It is the past-0 denominator again, for the
+sixth time. Every share in the inventory table carries this caveat.
+
 ### The corollary is larger than any row in the table
 
 910 ms mean chunk minus 179 ms at past 0 leaves **731 ms, or 80% of a mean

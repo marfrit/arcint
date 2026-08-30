@@ -1748,15 +1748,42 @@ architecture record:
    **5.1x** denominator difference. Nothing was truncated; totals were always
    summed over all pairs. Sixth instance of the past-0 error.
 
-   **The corollary is larger than the row.** 910 ms mean chunk against 179 ms at
-   past 0 puts **80% of a mean chunk in the depth-dependent term**, and every
-   share in a chunk inventory is a share of the other 20%. All reference
-   implementations together (49% of a past-0 chunk) are about **10% of prefill
-   wall** at 14450 tokens and less deeper. The kernel rows are single-digit
-   items; whatever grows with depth is most of served prefill. The only
-   quadratic term in the graph is attention, at 1.8% at past 0 — but that is an
-   inference, and the two-depth capture is the measurement that settles it. It
-   should run before any kernel item is chosen.
+   **The corollary written here on 2026-08-30 is withdrawn the same night.**
+   It read 910 ms of mean chunk against 179 ms at past 0 as putting 80% of a
+   mean chunk in the depth-dependent term, making every kernel row a share of
+   the other 20%. That divided a profiled node-time sum by a served wall time,
+   and the two instruments do not agree well enough to be divided. The depth
+   sweep meant to confirm it refutes it: a 2048-token chunk profiles at 229.1 ms
+   (past 0), 273.1 ms (4096) and 353.7 ms (12288) — **linear in past** at
+   ~0.0101 ms per past-token, growing 54% across that range rather than the 5x
+   the corollary required.
+
+   **What it uncovered instead is an attribution gap, and it is the larger
+   finding.** Summing that sweep over a real 13930-token prefill predicts ~1.97 s
+   of node time; the same prefill served and measured at the endpoint takes
+   6.40 s wall, 6.36 s of it graph. **Node times account for roughly a third of
+   graph wall.** PERF_COUNT only inflates per-node numbers, so the gap is real
+   rather than an artefact, and dispatch overhead does not explain it either —
+   ~590 ms unattributed across ~1135 node executions would be ~520 us each. The
+   disagreement is unexplained, and until it is closed **no node share can be
+   converted into a share of served time**: every "X% of prefill wall" in this
+   record, including the 6.0% and 2.2% written for the gate a few paragraphs
+   above, depends on that conversion. Relative shares within one capture are
+   unaffected. `docs/kernel-selectors.md` carries the numbers.
+
+   It also retires an item that was marked closed: "at least 90% of served
+   prefill wall attributed" was answered with the phase breakdown, but 99.4% in
+   "graph" only says the time is *inside* the graph call. Opening the graph
+   reaches about a third of it.
+
+   **And the profiler's synthetic input is not neutral.** Captures fed a chunk
+   of identical token ids, which in a mixture of experts routes every token to
+   the same experts. `ARCINT_PROFILE_TOKENS=random` is the other arm: at past
+   12288 the MoE row is **28.7% larger** under pseudo-random ids (25970 ->
+   33415 us) while `MoERouterFused` is unchanged (1849 vs 1842 us), which is
+   exactly where the effect should and should not appear. Small against the
+   attribution gap (7.4 ms of ~590 ms), but it means MoE shares in every earlier
+   capture are understated.
 
    A small chunk does not dodge it: chunk 64 avoids the fallback, but the chunk
    sweep measured what small chunks cost (1339 t/s at 512 against 1878 at 2048).

@@ -2608,6 +2608,32 @@ private:
             past = static_cast<size_t>(std::strtoul(pv, nullptr, 10));
         }
 
+        // The synthetic input is not neutral in a mixture of experts. A chunk of
+        // identical token ids routes every token to the same experts, so the MoE
+        // moves a fraction of the weight a real chunk moves, and every share in
+        // the resulting table is a share of the wrong denominator.
+        // ARCINT_PROFILE_TOKENS=random fills with deterministic pseudo-random ids
+        // instead. It is an arm, not a new default: the two must be compared, and
+        // the old behaviour has to stay reachable to compare against.
+        const bool rnd_tokens = [] {
+            const char* v = std::getenv("ARCINT_PROFILE_TOKENS");
+            return v != nullptr && std::string(v) == "random";
+        }();
+        uint64_t rng = 88172645463325252ull;
+        auto make_tokens = [&](size_t n) {
+            std::vector<int> t(n, 0);
+            if (rnd_tokens) {
+                for (size_t i = 0; i < n; ++i) {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    t[i] = static_cast<int>(rng % 100000U) + 1;
+                }
+            }
+            return t;
+        };
+        log::info("profile", "synthetic tokens: %s", rnd_tokens ? "pseudo-random" : "all zero");
+
         for (size_t m : sweep) {
             if (m == 0) continue;
             if (!ensure_blocks(lane, past + m + 2)) {
@@ -2615,14 +2641,14 @@ private:
                 continue;
             }
             zero_paged_rows(lane);
-            std::vector<int> chunk(m, 0);
+            std::vector<int> chunk = make_tokens(m);
             // Walk to `past` in chunks the served grid would use, so the state
             // and the block table are what a real prefill would present.
             size_t at = 0;
             while (at < past) {
                 const size_t take = std::min<size_t>(past - at, static_cast<size_t>(
                     std::max(1, prefill_chunk_)));
-                paged_forward(lane, embed_paged(lane, std::vector<int>(take, 0)), at, {0}, 0,
+                paged_forward(lane, embed_paged(lane, make_tokens(take)), at, {0}, 0,
                               false);
                 at += take;
             }
@@ -2640,7 +2666,7 @@ private:
         // Then one decode step at depth, which is a 1-token forward with a past
         // rather than without one.
         zero_paged_rows(lane);
-        paged_forward(lane, embed_paged(lane, std::vector<int>(depth, 0)), 0, {0}, 0);
+        paged_forward(lane, embed_paged(lane, make_tokens(depth)), 0, {0}, 0);
         paged_forward(lane, embed_paged(lane, {0}), depth, {0}, 0);
         dump("decode step", 1);
 
