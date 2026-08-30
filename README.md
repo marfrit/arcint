@@ -43,16 +43,40 @@ the tokenizer and detokenizer IRs, `config.json` and the chat template. A GGUF
 will not load. Neither will GPTQ or NVFP4 safetensors — those are llama.cpp and
 vLLM formats, and OpenVINO does not read them.
 
-**One of the three is published, and it is the one the numbers were measured
-on.** [marfrit/Qwen3.6-27B-A3B-Coder-int4-awq-se-ov](https://huggingface.co/marfrit/Qwen3.6-27B-A3B-Coder-int4-awq-se-ov)
-(Apache-2.0) is the coder artifact used everywhere in the *Measured* section —
-byte-identical to the one the endpoint serves, already in the allowlist, so it
-needs no registration. Its model card carries the calibration triangle below,
-the runtime warnings, and one limitation worth reading before you deploy it: the
-calibration corpus was code and English, and German prose degrades. If you only
-want to run arcint rather than build an artifact, download that and stop reading
-here; the rest of this section is for the other two models and for anyone who
-wants a different calibration.
+**All three are downloadable, and every number in the *Measured* section was
+taken on the published copy.** Two of them are Intel's own exports and need no
+work at all; only the coder had to be built, because its checkpoint is a
+community fine-tune with no official IR.
+
+| model | where to get it | note |
+|---|---|---|
+| Qwen3.6-35B-A3B | [`OpenVINO/Qwen3.6-35B-A3B-int4-ov`](https://huggingface.co/OpenVINO/Qwen3.6-35B-A3B-int4-ov) | Intel's export, used as-is. Verified byte-identical to the copy these measurements ran on. |
+| Qwen3.6-27B-A3B-Coder | [`marfrit/Qwen3.6-27B-A3B-Coder-int4-awq-se-ov`](https://huggingface.co/marfrit/Qwen3.6-27B-A3B-Coder-int4-awq-se-ov) | Apache-2.0. No official IR exists for this checkpoint; see the calibration section below for what it cost. |
+| Qwen3.8-27B | [`OpenVINO/Qwen3.8-27B-int4-ov`](https://huggingface.co/OpenVINO/Qwen3.8-27B-int4-ov) | Intel's export. **The MTP head is not in it** — reconstruct it with `tools/export_mtp.py`, or run without `--mtp`. |
+
+All three are already in [models/allowlist-raw.json](models/allowlist-raw.json),
+so a downloaded copy needs no registration. If arcint refuses one at load time,
+the artifact differs from the one these numbers were measured on — that is the
+assertion doing its job, not a bug to work around.
+
+Two things learned the expensive way and worth stating, because they decide
+whether you need the rest of this section at all:
+
+- **Try the official IR before exporting anything.** The 35B above sat unused
+  for weeks on the assumption that a stock export would not clear the quality
+  bar. When it was finally measured it scored 10/10 on the acceptance task
+  greedy, 3/3 on tool calls, clean German, at 62.7 t/s — better than the
+  artifact it was being compared against. A custom export is what you do when
+  there is no official one, not a default step.
+- **The dense model's MTP head is the one piece nobody publishes.** optimum-intel
+  drops it on export, so neither Intel's IR nor yours will have it;
+  `tools/export_mtp.py` reconstructs it from the checkpoint's own weights. That
+  is worth 1.35× on the dense model and is the only reason to touch the
+  export pipeline for it at all.
+
+If you only want to run arcint rather than build an artifact, take the table and
+stop reading here. The rest of this section is for anyone who needs a different
+calibration than the published ones provide.
 
 **There is no shortcut from GGUF.** llama.cpp gained an OpenVINO backend in
 early 2026, and it was built and tested against these models: the production
