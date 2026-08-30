@@ -52,11 +52,26 @@ checkpoint's own `mtp.*` tensors; pairs with `OpenVINO/Qwen3.6-35B-A3B-int4-ov`.
 |---|---|---|
 | Intel's public int4 IR | 93.9% code / 75.4% prose | **48–53 t/s vs 71.5 t/s** |
 
-**Read the second column before using it.** The kernels are not the reason:
-the plugin routes a two-token forward through its batched-GEMV decode path,
-where it costs the device 1.15× a one-token step. Two other things cost. The
-serving loop spends 36.5 ms of wall for 16.7 ms of device per accepted pair.
-And the head itself is 6.7 ms of that device, three quarters of a full
-64-layer body step, to draft a single token, because its 256-expert MLP is
-read densely in f16. On device time alone the head is therefore a wash
-today, 8.6 ms per token against 8.7 plain.
+**Read the second column before using it.** The head is correct, and on a
+stock OpenVINO build speculation with it is *slower* than plain decoding on an
+Arc card. The kernels are not the reason: a two-token forward takes the
+plugin's batched-GEMV decode path and costs the device 1.15× a one-token step.
+The cost has been found, and it is host-side churn. At `token_num > 1` the MoE
+implementation's `prepare_internal_buffers` rebuilds its per-expert mask
+subbuffers on **every** inference — 20,480 `create_subbuffer` calls per
+two-token forward — for a per-expert prefill fallback that the batched-GEMV
+path never reads. At one token the block is skipped, which is why plain
+decoding never showed it. A plugin patch that skips the masks below the
+batched-GEMV threshold takes the verify forward from 27.3 ms to 18.1 ms with
+**byte-identical** output.
+
+Separately, the head reads its 256-expert MLP densely in f16, 1.69 GB per
+draft: the router *is* present in the exported graph, but its lowering does not
+match the pattern the plugin's MoE fusion looks for, so every expert is
+computed for every token and the unselected ones are weighted by zero.
+
+With a patched plugin **and** an int4 head, the 35B's speculation does win —
+72.9 t/s against ~62 plain on a code prompt, B60. That figure is single-prompt,
+has not yet been through the acceptance harness, and needs a plugin you build
+yourself; treat it as a direction, not a result. The second column is what the
+published stack gives you today.
