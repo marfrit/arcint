@@ -160,8 +160,8 @@ std::vector<ModelEntry> build_registry() {
         // 77.3% (140/181) on prose, 34.6-37.4 t/s -- next to the 93.2% the same
         // head measures on our own export. A wrong head cannot raise acceptance,
         // only depress it, so the number is the oracle (tools/export_mtp.py).
-        e.status                  = "MTP head pairs: 96.3% / 77.3% draft acceptance (code / prose, "
-                                    "B60, 2026-08-30); acceptance task: see DESIGN 7.0.2n";
+        e.status                  = "10/10 greedy (paged+MTP, B60, 2026-08-30), 36.3 t/s, 90.8% draft "
+                                    "acceptance; Intel's public int4 export with the reconstructed head";
         e.sampler = qwen_card_defaults();
         split_layers(e);
         r.push_back(std::move(e));

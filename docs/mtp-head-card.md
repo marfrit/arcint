@@ -19,7 +19,7 @@ vocab 248320 and untied embeddings. Measured to pair with:
 | body | draft acceptance (greedy, B60) |
 |---|---|
 | arcint's AWQ export (`qwen38-b7c1-ov`) | 93.2% |
-| `OpenVINO/Qwen3.8-27B-int4-ov` (Intel's public int4) | 96.3% code / 77.3% prose |
+| `OpenVINO/Qwen3.8-27B-int4-ov` (Intel's public int4) | 90.8% on the acceptance task (10/10), 96.3% code / 77.3% prose |
 
 **How to use.** Place the four files beside `openvino_language_model.xml` and
 serve with `arcint --mtp on`. Acceptance is printed on every decode line

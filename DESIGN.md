@@ -2358,6 +2358,11 @@ not belong and 93.2% for the same head on our own export. The head consumes
 the final hidden state and carries its own lm_head, which is exactly why a
 re-quantised body underneath it should not matter, and did not.
 
+**And it passes the bar.** The acceptance task on Intel's IR with the head,
+`--mtp on`, greedy, thinking off: **10/10**, 622 tokens at 36.3 t/s, **draft
+accept 90.8% (296/326)** — the same class as our own export's 93.2%. The entry's
+status carries it.
+
 **And the premise of the handover has moved.** Intel's export directory
 carries `openvino_mtp_model.{xml,bin}` of its own — 263 MB int4, one MTP
 layer, the same input interface as our reconstructed layer (`hidden_states`,
