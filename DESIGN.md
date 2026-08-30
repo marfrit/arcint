@@ -1929,6 +1929,45 @@ GEMM 20.9%, **`ref_matmul` 12.2%** (the gate; grown again with the
 denominator), attention 12.0%, GDN 9.5%, `gemm_kernel` 9.4%, MoE scatter
 7.9%, `generic_eltwise_ref` 4.2%, conv 3.9%, idle 8.4%.
 
+#### 7.0.2f Decode's host-side half, named (2026-08-30)
+
+The timeline left decode ~57% host-side and unattributed. Two instruments,
+chosen so that one has no overhead worth speaking of:
+
+1. **The GPU plugin's own `host_time_profiling`** (debug build; the option
+   measures host time from the start of `infer()` until the plugin is ready to
+   block on the final `clFinish`). It costs nothing measurable — 65.0 t/s under
+   it against 63.2 on the gate run — but prints only an average over every
+   infer of the process, so two runs of different length were solved for the
+   decode step: 517 infers averaging 17.66 ms with 512 decode tokens, 133
+   averaging 29.78 ms with 128. The five non-decode infers (reservation probe
+   and prefill) cost 2238 ms in both; **a decode step costs 13.46 ms of host
+   enqueue time, of a 14.9–15.3 ms step: 90%.**
+2. **The tracer's call log**, which is heavy on this phase (28.9 t/s under it,
+   +125%) and is therefore read for its shape only: on the inferring thread,
+   **76% of the decode window is outside any OpenCL call**; the API itself is
+   ~1130 `clEnqueueNDRangeKernel` per step at ~5 us each plus ~10,800
+   `clSetKernelArg*` per step at ~0.1 us. The tracer inflates the inside-call
+   bucket; "outside" is the clean one, and it is the large one.
+
+**So decode is launch-bound in the plugin's per-node execution path.** Each
+step walks ~1130 primitives, does per-node shape inference and argument update
+on the host (the graph is dynamic-shape), and enqueues; the device, at ~6.5 ms
+of work per step, runs behind the host and idles between launches. The wait
+after the last enqueue is ~1.5 ms, which is exactly the tail of the device
+finishing what was enqueued last. The mechanism is host throughput, ~12 us per
+primitive all-in, not any kernel and not anything in arcint: arcint's own share
+of a step (embed, sample, emit) is ~3%.
+
+**What this prices.** No kernel row buys decode anything: the device is not the
+limit. A decode lever is one of (a) fewer primitives per step — fusion in the
+plugin — or (b) a cheaper per-primitive host path, which is what a static-shape
+or shape-agnostic compile exists for, or (c) removing the host from the loop
+between steps. All three are OpenVINO-plugin work, §1.1 applies, and none is
+started here. The realistic ceiling if the host went to zero is the device's
+own ~6.5 ms per step, i.e. roughly 2x decode; a fusion pass that halved the
+primitive count would be worth ~1.4x.
+
 #### 7.0.2b The XMX question cannot be decided from the profile
 
 The proposed five-minute check — grep a `ARCINT_PROFILE` for `dpas`/systolic

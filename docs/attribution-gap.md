@@ -202,3 +202,16 @@ success. Fixed by stating the axis per layout and verifying it against the
 probe's first forward. Prefill 5.02 -> 3.97 s at 12448 tokens (+27%),
 transfers 17.6% -> 0.5% of wall, activation reservation at chunk 2048
 2.99 -> 0.90 GiB, greedy output byte-identical. DESIGN 7.0.2e has the table.
+
+---
+
+# Follow-up: decode's host-side half, named (same day)
+
+Plugin `host_time_profiling` (no measurable overhead) solved across two runs:
+13.46 ms of host enqueue per decode step of 14.9-15.3 ms, 90%. Tracer call log
+(heavy, +125%, read for shape only): 76% of the window outside any OpenCL call,
+~1130 kernel launches and ~10,800 argument sets per step. Decode is launch-bound
+in the plugin's per-primitive host path; the device does ~6.5 ms of work per
+step behind it. arcint's own share is ~3%. No kernel buys decode anything; the
+levers are plugin-side (fewer primitives, cheaper per-primitive path, or no host
+in the loop). DESIGN 7.0.2f.
