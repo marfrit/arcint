@@ -53,10 +53,11 @@ checkpoint's own `mtp.*` tensors; pairs with `OpenVINO/Qwen3.6-35B-A3B-int4-ov`.
 | Intel's public int4 IR | 93.9% code / 75.4% prose | **48–53 t/s vs 71.5 t/s** |
 
 **Read the second column before using it.** The head is correct, and on an
-Arc card today speculation with it is *slower* than plain decoding: the
-OpenVINO GPU plugin runs a two-token forward of this mixture of experts on
-its prefill path, at 1.8× the cost of a one-token step, and the head as
-exported reads its full expert weights per draft. It is published as the
-reference head — the weights and the graph nobody else has assembled for
-OpenVINO — not as a speed-up. It becomes one when the plugin has a small-M
-MoE decode path; the numbers above are the measurement to repeat then.
+Arc card today speculation with it is *slower* than plain decoding — not
+because of the kernels: a two-token verify costs the device 1.15× a plain
+step, but the serving loop around it (readbacks, acceptance, the draft's
+own dispatch) makes each accepted pair 36.5 ms of wall for 16.7 ms of device.
+Device-bound, the same pair would be +59%. It is published as the reference
+head — the weights and the graph nobody else has assembled for OpenVINO —
+and becomes a speed-up when the serving loop is cut to its device budget;
+the numbers above are the measurement to repeat then.

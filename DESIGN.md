@@ -2445,10 +2445,15 @@ brings the pair to ~27 ms, 14 ms a token: break-even. **The sentence that
 stood here — that the M=2 forward runs the prefill path — was an inference
 from the 1.8x and is retracted the same evening**: the pinned plugin already
 routes token counts up to 32 through a batched-GEMV decode path written for
-exactly this case (`docs/moe-m2-path.md`). The 1.8x is real and its cause is
-the open item; the trace of a two-token verify is the instrument. Until it is
-attributed, speculation on the 35B does not pay on this card, and the agent
-unit stays as it is.
+exactly this case, and the trace of an actual two-token verify shows it in
+use: **the verify costs the device 10.0 ms against a plain step's 8.7 —
+1.15x** — while its wall is 25.3 against 14.0. The 1.8x is host and
+synchronisation in the speculation loop, 15.3 ms of it per verify against
+5.3 per plain step, plus a draft that is 6.7 ms of device and 4.5 of host.
+Per accepted pair 36.5 ms of wall for 16.7 ms of device; device-bound it
+would be 8.8 ms a token, +59%. The levers are arcint's verify loop and the
+head's host side first, the int4 head third (`docs/moe-m2-path.md`). The
+agent unit stays as it is until the loop is attributed and cut.
 
 Greedy answers with and without the head differ at one near-tie token late
 in each answer (chars 621 and 1182 of ~1400 and ~1830; equivalent phrasing),
