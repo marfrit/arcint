@@ -54,10 +54,26 @@ community fine-tune with no official IR.
 | Qwen3.6-27B-A3B-Coder | [`marfrit/Qwen3.6-27B-A3B-Coder-int4-awq-se-ov`](https://huggingface.co/marfrit/Qwen3.6-27B-A3B-Coder-int4-awq-se-ov) | Apache-2.0. No official IR exists for this checkpoint; see the calibration section below for what it cost. |
 | Qwen3.8-27B | [`OpenVINO/Qwen3.8-27B-int4-ov`](https://huggingface.co/OpenVINO/Qwen3.8-27B-int4-ov) | Intel's export. **The MTP head is not in it** — reconstruct it with `tools/export_mtp.py`, or run without `--mtp`. |
 
-All three are already in [models/allowlist-raw.json](models/allowlist-raw.json),
-so a downloaded copy needs no registration. If arcint refuses one at load time,
-the artifact differs from the one these numbers were measured on — that is the
-assertion doing its job, not a bug to work around.
+**The allowlist keys on the artifact's directory name**, so a download has to
+land in the directory the entry names — `qwen36-35b-a3b-int4-ov`,
+`qwen36-coder-b5-ov`, `qwen38-b7c1-ov` respectively:
+
+    hf download OpenVINO/Qwen3.6-35B-A3B-int4-ov \
+        --local-dir /models/ov/qwen36-35b-a3b-int4-ov
+
+That is deliberate rather than convenient: an entry asserts geometry,
+quantisation and a measured status for *one* artifact, and a directory name is
+the handle it is asserted through. A refusal at load time means the artifact is
+not the one the entry describes — the assertion doing its job, not a bug to work
+around.
+
+One consequence worth stating plainly: **`OpenVINO/Qwen3.8-27B-int4-ov` is not
+allowlisted.** The dense entry describes this project's own AWQ-only export,
+whose greedy behaviour was measured; Intel's export is a different artifact with
+a different calibration and no measurement behind it, and aliasing it onto an
+entry that claims 10/10 would make the allowlist assert something nobody
+checked. Serving it needs its own entry with its own status — which means
+measuring it first.
 
 Two things learned the expensive way and worth stating, because they decide
 whether you need the rest of this section at all:
