@@ -52,12 +52,11 @@ checkpoint's own `mtp.*` tensors; pairs with `OpenVINO/Qwen3.6-35B-A3B-int4-ov`.
 |---|---|---|
 | Intel's public int4 IR | 93.9% code / 75.4% prose | **48–53 t/s vs 71.5 t/s** |
 
-**Read the second column before using it.** The head is correct, and on an
-Arc card today speculation with it is *slower* than plain decoding — not
-because of the kernels: a two-token verify costs the device 1.15× a plain
-step, but the serving loop around it (readbacks, acceptance, the draft's
-own dispatch) makes each accepted pair 36.5 ms of wall for 16.7 ms of device.
-Device-bound, the same pair would be +59%. It is published as the reference
-head — the weights and the graph nobody else has assembled for OpenVINO —
-and becomes a speed-up when the serving loop is cut to its device budget;
-the numbers above are the measurement to repeat then.
+**Read the second column before using it.** The kernels are not the reason:
+the plugin routes a two-token forward through its batched-GEMV decode path,
+where it costs the device 1.15× a one-token step. Two other things cost. The
+serving loop spends 36.5 ms of wall for 16.7 ms of device per accepted pair.
+And the head itself is 6.7 ms of that device, three quarters of a full
+64-layer body step, to draft a single token, because its 256-expert MLP is
+read densely in f16. On device time alone the head is therefore a wash
+today, 8.6 ms per token against 8.7 plain.
