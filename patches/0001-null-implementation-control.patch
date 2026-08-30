@@ -1,0 +1,51 @@
+# Null-implementation control (diagnostic; not carried, not upstreamed)
+#
+# Registers a second implementation manager for PagedCausalConv1D, an op that
+# already has exactly one. It inherits create_impl and validate_impl from the
+# stock manager, so it builds the same primitive, the same generator and the
+# same kernel; only the manager identity differs. Applied against the pinned
+# runtime, build 2026.4.0-22849-71640275d29.
+#
+# Purpose: separate the cost of the mechanism (registering and selecting a
+# second manager) from the effect of a kernel, so that a later real second
+# implementation is measured against a known-free baseline. See
+# docs/kernel-selectors.md.
+#
+# The registry arm is a one-line edit of the impls vector in
+# src/plugins/intel_gpu/src/graph/registry/paged_causal_conv1d_impls.cpp:
+#   stock       OV_GPU_CREATE_INSTANCE_OCL(ocl::PagedCausalConv1DRef,  shape_types::any)
+#   null_first  OV_GPU_CREATE_INSTANCE_OCL(ocl::PagedCausalConv1DNull, shape_types::any)
+#               OV_GPU_CREATE_INSTANCE_OCL(ocl::PagedCausalConv1DRef,  shape_types::any)
+#   null_only   OV_GPU_CREATE_INSTANCE_OCL(ocl::PagedCausalConv1DNull, shape_types::any)
+# (the CREATE_INSTANCE macro supplies its own trailing comma; adding one is a
+#  compile error.)
+
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.hpp
+index 486e7064..db156510 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.hpp
+@@ -51,4 +51,24 @@ struct PagedCausalConv1DRef : public ImplementationManager {
+     }
+ };
+ 
++
++// --- arcint null-implementation control (diagnostic, not for upstream) -------
++//
++// A second implementation manager for an op that already has exactly one. It
++// does nothing of its own: it inherits create_impl and validate_impl from
++// PagedCausalConv1DRef, so the primitive it builds, the generator it uses and
++// the kernel it compiles are the same objects the stock path builds. Only the
++// manager identity differs.
++//
++// The point is to separate two things that a real second implementation would
++// confound: the cost of the *mechanism* (registering and selecting a second
++// manager) from the effect of the *kernel*. If the node inventory and the step
++// time move when this is registered, the mechanism is not free and every later
++// measurement through it is suspect.
++struct PagedCausalConv1DNull : public PagedCausalConv1DRef {
++    OV_GPU_PRIMITIVE_IMPL("ocl::paged_causal_conv1d::null")
++    explicit PagedCausalConv1DNull(shape_types shape_type, ValidateFunc vf = nullptr)
++        : PagedCausalConv1DRef(shape_type, std::move(vf)) {}
++};
++
+ }  // namespace ov::intel_gpu::ocl

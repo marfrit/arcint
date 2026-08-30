@@ -167,6 +167,64 @@ The earlier conclusion — "the fix is in oneDNN, a different upstream, a longer
 loop" — is therefore **premature rather than wrong**: it remains the fallback if
 padding does not pay, but it is no longer the first thing to try.
 
+
+## The null-implementation control — is the mechanism itself free?
+
+Before attributing anything to a *kernel*, the question is whether registering
+and selecting a second implementation costs anything by itself. If it does,
+every later measurement through that mechanism is confounded. So: register a
+second implementation manager for an op that already has exactly one, and make
+it do precisely what the existing path does.
+
+`PagedCausalConv1DNull` inherits `create_impl` and `validate_impl` from
+`PagedCausalConv1DRef`, so it builds the same primitive from the same generator
+and compiles the same kernel. Only the manager identity differs. The patch is
+`patches/0001-null-implementation-control.patch`; it is a diagnostic and is not
+carried.
+
+Three arms, against the pinned runtime with debug caps:
+
+| arm | registry | total node time | conv row | conv nodes | kernel string |
+|---|---|---|---|---|---|
+| stock | Ref only | 128.87 ms | 7237 us | 30 | `ocl::paged_causal_conv1d::ref___f16` |
+| null_first | Null, then Ref | 128.95 ms | 7227 us | 30 | identical |
+| null_only | Null only | 129.59 ms | 7287 us | 30 | identical |
+
+**The noise floor was measured, not assumed.** An earlier pass of this
+experiment had a path bug that left all three arms running the *same* stock
+plugin, which turned it into three repetitions of one condition: 128.57 / 128.62
+/ 128.66 ms total (+/-0.07%) and 7210 / 7221 / 7212 us on the conv row
+(+/-0.15%). That accident is the instrument's repeatability, and it is what the
+arms above are read against. It also showed the `(op, kernel)` **pair count is
+not a stable metric** at M=1 — it wobbled between 27 and 28 across identical
+runs — so the inventory claim here rests on the per-op node counts and kernel
+strings, which did not move.
+
+**Reading.** Node inventory is unchanged in every arm: 30 `PagedCausalConv1D`
+nodes on `ocl::paged_causal_conv1d::ref___f16`. Step time moves by at most
+**0.7%** (null_only against stock), against a within-build floor of 0.15%; the
+excess is plausibly the cold kernel cache that run had just refilled, so 0.7% is
+an upper bound rather than an effect. **The mechanism is free**, and a later
+real second implementation can be attributed to its kernel.
+
+Two honest limits. The impl name reported by the profiler comes from
+`primitive_inst::get_implementation_name()`, which returns the *kernel* name,
+not the manager's — so in `null_first` there is no way to tell from the profile
+which of the two managers served. That is why `null_only` exists: it proves the
+null manager is a real, selectable implementation that serves the op on its own
+with the same inventory and the same time. And on its first attempt `null_only`
+did not finish inside a 900 s window, because a changed manager identity misses
+the kernel cache and recompiles; it completed normally on the retry. Neither
+limit affects the reading.
+
+**Operationally the most useful number here is the build time.** The full
+debug-caps configure-and-build is **30 min 55 s** measured (23:29:49 -> 00:00:44),
+and an incremental rebuild of the GPU plugin after touching an implementation
+header and its registry is **11 seconds**. The "hours" figure asserted earlier
+in this work was never measured and was withdrawn; the real cost of iterating on
+a plugin implementation is a quarter of a minute per attempt once the tree is
+built.
+
 ## The complete kernel inventory of a served prefill chunk
 
 With the cap removed, all 29 pairs, 2048-token chunk at past 0, f16 KV. Reference
