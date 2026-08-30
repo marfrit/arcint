@@ -35,8 +35,12 @@ struct PrefixCacheStats {
     uint64_t inserts        = 0;
     uint64_t evictions      = 0;
     uint64_t collisions     = 0;  // hash matched, tokens did not
+    uint64_t demotions      = 0;  // entries whose pages went to the host tier
+    uint64_t promotions     = 0;  // tiered entries whose pages came back
     size_t   bytes_resident = 0;
     size_t   entries        = 0;
+    size_t   tiered_entries = 0;  // entries holding host buffers instead of pages
+    size_t   host_bytes     = 0;  // KV bytes parked in host memory
     size_t   blocks_held    = 0;  // KV pages this cache is keeping alive
 };
 
@@ -51,13 +55,23 @@ public:
     // `block_size` is the granularity of a reusable prefix, in tokens; it is
     // deliberately the KV block size, so a checkpoint always lands on a page
     // boundary and reuse is exact by construction rather than by interpolation.
-    PrefixCache(size_t budget_bytes, int block_size, uint64_t key);
+    PrefixCache(size_t budget_bytes, int block_size, uint64_t key, size_t host_budget_bytes = 0);
     ~PrefixCache();
 
     // The pages of an entry go back to the pool through this. Set once, before
     // the cache is used; without it the cache is host-side only, which is what
     // the stateful reference path wants.
     void set_release(ReleaseFn fn) { release_ = std::move(fn); }
+
+    // The host tier (DESIGN §4.4). An entry evicted for its pages is demoted
+    // rather than dropped: the callback copies the pages into the entry's host
+    // buffers and releases them, and the entry stays hittable. A hit on such an
+    // entry is promoted by the backend -- pages allocated, buffers copied back
+    // -- and then `promote()` records the new pages. The callback runs with the
+    // cache locked; lookups wait for the copy, which is the point of it.
+    struct Entry;
+    using DemoteFn = std::function<bool(Entry&)>;
+    void set_demote(DemoteFn fn) { demote_ = std::move(fn); }
 
     struct Entry {
         uint64_t             hi = 0;
@@ -66,6 +80,11 @@ public:
         StateBlob            state;
         std::vector<int32_t> blocks;  // the KV pages of this prefix, refcounted
         size_t               bytes = 0;
+        // Host tier: one buffer per KV pool tensor, pages in `blocks` order as
+        // they were when demoted. Empty while the entry is resident.
+        std::vector<std::vector<uint8_t>> host_kv;
+        size_t                            host_bytes = 0;
+        bool                              tiered     = false;
     };
     using EntryRef = std::shared_ptr<const Entry>;
 
@@ -78,7 +97,11 @@ public:
         // window between lookup and use would otherwise hand its pages to the
         // other lane while this one was still reading them.
         EntryRef                    keep;
+        bool                        tiered         = false;  // pages live on the host; promote first
     };
+    // Records the pages a promoted entry now owns; the backend copied its host
+    // buffers into them first. False if the entry is gone.
+    bool promote(const EntryRef& entry, std::vector<int32_t> blocks);
 
     // Longest cached prefix of `tokens` that ends on a block boundary. Never
     // returns the whole sequence: at least one token must remain to be run, or
@@ -116,7 +139,9 @@ private:
     EntryPtr make_entry() const;
     void     evict_to_fit(size_t incoming);   // caller holds the lock
 
+    void     drop_back();                     // caller holds the lock
     size_t   budget_;
+    size_t   host_budget_;
     int      block_size_;
     uint64_t key_;
     size_t   bytes_ = 0;
@@ -125,6 +150,8 @@ private:
     // request, against a per-token decode loop that never touches this.
     mutable std::mutex mutex_;
     ReleaseFn          release_;
+    DemoteFn           demote_;
+    size_t             host_bytes_ = 0;
 
     // Front is most recently used.
     std::list<EntryPtr> entries_;

@@ -39,8 +39,9 @@ void PrefixCache::chain_block(uint64_t key, uint64_t& hi, uint64_t& lo, const in
     hash_block(key, hi, lo, tokens, count);
 }
 
-PrefixCache::PrefixCache(size_t budget_bytes, int block_size, uint64_t key)
-    : budget_(budget_bytes), block_size_(std::max(1, block_size)), key_(key) {}
+PrefixCache::PrefixCache(size_t budget_bytes, int block_size, uint64_t key, size_t host_budget_bytes)
+    : budget_(budget_bytes), host_budget_(host_budget_bytes), block_size_(std::max(1, block_size)),
+      key_(key) {}
 
 PrefixCache::~PrefixCache() { clear(); }
 
@@ -100,6 +101,7 @@ PrefixCache::Hit PrefixCache::lookup(const std::vector<int>& tokens) {
     hit.keep           = entries_.front();
     hit.state          = &entries_.front()->state;
     hit.blocks         = &entries_.front()->blocks;
+    hit.tiered         = entries_.front()->tiered;
 
     ++stats_.hits;
     stats_.hit_tokens += best_len;
@@ -169,25 +171,87 @@ void PrefixCache::insert(const std::vector<int>& tokens, size_t prefix_len, Stat
 
 void PrefixCache::evict_to_fit(size_t incoming) {
     while (!entries_.empty() && bytes_ + incoming > budget_) {
-        bytes_ -= entries_.back()->bytes;
-        stats_.blocks_held -= entries_.back()->blocks.size();
-        entries_.pop_back();
+        drop_back();
         ++stats_.evictions;
     }
     stats_.bytes_resident = bytes_;
+    stats_.host_bytes     = host_bytes_;
     stats_.entries        = entries_.size();
+    stats_.tiered_entries = static_cast<size_t>(std::count_if(
+        entries_.begin(), entries_.end(), [](const EntryPtr& p) { return p->tiered; }));
+}
+
+void PrefixCache::drop_back() {
+    bytes_ -= entries_.back()->bytes;
+    host_bytes_ -= entries_.back()->host_bytes;
+    stats_.blocks_held -= entries_.back()->blocks.size();
+    entries_.pop_back();
 }
 
 bool PrefixCache::evict_oldest() {
     std::lock_guard<std::mutex> guard(mutex_);
-    if (entries_.empty()) return false;
-    bytes_ -= entries_.back()->bytes;
-    stats_.blocks_held -= entries_.back()->blocks.size();
-    entries_.pop_back();
-    ++stats_.evictions;
+    // Called for pages. Find the least recently used entry that still holds
+    // any: a tiered entry has none to give, and the entry budget's own
+    // eviction is evict_to_fit, not this.
+    auto victim = entries_.end();
+    for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
+        if (!(*it)->tiered) { victim = std::prev(it.base()); break; }
+    }
+    if (victim == entries_.end()) return false;
+    Entry& e = **victim;
+    if (host_budget_ > 0 && demote_ && !e.blocks.empty() && demote_(e)) {
+        // Pages are on the host now and released; the entry stays hittable.
+        stats_.blocks_held -= e.blocks.size();
+        e.blocks.clear();
+        e.tiered = true;
+        host_bytes_ += e.host_bytes;
+        ++stats_.demotions;
+        ++stats_.evictions;
+        // The host tier has its own budget; the least recently used tiered
+        // entries go first, which may be this one if it alone is too large.
+        while (host_bytes_ > host_budget_) {
+            auto old = entries_.end();
+            for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
+                if ((*it)->tiered) { old = std::prev(it.base()); break; }
+            }
+            if (old == entries_.end()) break;
+            bytes_ -= (*old)->bytes;
+            host_bytes_ -= (*old)->host_bytes;
+            entries_.erase(old);
+        }
+    } else {
+        bytes_ -= e.bytes;
+        stats_.blocks_held -= e.blocks.size();
+        entries_.erase(victim);
+        ++stats_.evictions;
+    }
     stats_.bytes_resident = bytes_;
+    stats_.host_bytes     = host_bytes_;
     stats_.entries        = entries_.size();
+    stats_.tiered_entries = static_cast<size_t>(std::count_if(
+        entries_.begin(), entries_.end(), [](const EntryPtr& p) { return p->tiered; }));
     return true;
+}
+
+bool PrefixCache::promote(const EntryRef& entry, std::vector<int32_t> blocks) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    for (EntryPtr& p : entries_) {
+        if (p.get() != entry.get()) continue;
+        if (!p->tiered) return false;
+        host_bytes_ -= p->host_bytes;
+        p->host_bytes = 0;
+        p->host_kv.clear();
+        p->host_kv.shrink_to_fit();
+        p->blocks = std::move(blocks);
+        p->tiered = false;
+        stats_.blocks_held += p->blocks.size();
+        ++stats_.promotions;
+        stats_.host_bytes     = host_bytes_;
+        stats_.tiered_entries = static_cast<size_t>(std::count_if(
+            entries_.begin(), entries_.end(), [](const EntryPtr& q) { return q->tiered; }));
+        return true;
+    }
+    return false;
 }
 
 bool PrefixCache::may_accept(size_t bytes) const {
@@ -198,8 +262,11 @@ void PrefixCache::clear() {
     std::lock_guard<std::mutex> guard(mutex_);
     entries_.clear();
     bytes_                = 0;
+    host_bytes_           = 0;
     stats_.bytes_resident = 0;
+    stats_.host_bytes     = 0;
     stats_.entries        = 0;
+    stats_.tiered_entries = 0;
     stats_.blocks_held    = 0;
 }
 

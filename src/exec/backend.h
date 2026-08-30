@@ -6,6 +6,7 @@
 #include <string_view>
 #include <vector>
 
+#include "core/prefix_cache.h"
 #include "core/chat.h"
 #include "core/model_registry.h"
 #include "core/sampling.h"
@@ -130,6 +131,7 @@ struct GenerationStats {
     double prefill_forward_seconds = 0.0;   // the language model
     double prefill_blocks_seconds  = 0.0;   // KV page allocation
     double prefill_restore_seconds = 0.0;   // cache lookup, restore, row zeroing
+    double cache_promote_seconds   = 0.0;   // host tier -> pages, when the hit was tiered
     double prefill_wait_seconds    = 0.0;   // waiting for the device
     double decode_seconds    = 0.0;
     // What the other lane cost this one: graph executions that had to wait for
@@ -173,6 +175,8 @@ public:
     // KV pages not currently held by a sequence or by the prefix cache. Live,
     // so /health can show the pool draining and a refusal can quote it.
     virtual uint64_t free_blocks() const { return 0; }
+    // The prefix cache's counters, for /health; empty when there is no cache.
+    virtual PrefixCacheStats cache_stats() const { return {}; }
 };
 
 // M0: no OpenVINO, no weights, deterministic synthetic output.

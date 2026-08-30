@@ -78,6 +78,9 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
     if (stats.cache_hit_tokens > 0 && stats.prompt_tokens > 0) {
         prefill_suffix = log::format(" | cache hit %d tok (%.1f%%)", stats.cache_hit_tokens,
                                      100.0 * stats.cache_hit_tokens / stats.prompt_tokens);
+        if (stats.cache_promote_seconds > 0.0) {
+            prefill_suffix += log::format(" from host tier in %.2f s", stats.cache_promote_seconds);
+        }
     }
     if (stats.snapshot_seconds > 0.0) {
         prefill_suffix += log::format(" | cache snapshot %.2f s", stats.snapshot_seconds);
@@ -323,6 +326,21 @@ std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out)
     return HttpResult{503, std::move(body)};
 }
 
+// The prefix cache as the operator sees it: how many prefixes it holds, how
+// many of those are parked on the host, and what it has served. Tokens from
+// cache against tokens looked up is the number DESIGN 7.0.2j had no value for.
+json cache_json(const PrefixCacheStats& c) {
+    return json{{"entries", c.entries},
+                {"tiered_entries", c.tiered_entries},
+                {"host_mib", c.host_bytes / (1024 * 1024)},
+                {"kv_pages_held", c.blocks_held},
+                {"lookups", c.lookups},
+                {"hits", c.hits},
+                {"hit_tokens", c.hit_tokens},
+                {"demotions", c.demotions},
+                {"promotions", c.promotions}};
+}
+
 // ----------------------------------------------------------------- /health
 json health(const Context& ctx) {
     const ModelStatus& st = ctx.backend->status();
@@ -334,7 +352,8 @@ json health(const Context& ctx) {
                 {"slots_total", ctx.slots->total()},
                 {"queue_depth", ctx.slots->queue_depth()},
                 {"kv_blocks_free", ctx.backend->free_blocks()},
-                {"kv_blocks_total", st.reservation.pool_blocks}};
+                {"kv_blocks_total", st.reservation.pool_blocks},
+                {"cache", cache_json(ctx.backend->cache_stats())}};
 }
 
 // ------------------------------------------------------------------ /props

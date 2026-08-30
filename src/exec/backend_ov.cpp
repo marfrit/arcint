@@ -673,7 +673,10 @@ public:
         if (cfg.prefix_cache_mib > 0) {
             prefix_cache_ = std::make_unique<PrefixCache>(
                 static_cast<size_t>(cfg.prefix_cache_mib) * 1024 * 1024, cfg.kv_block_size,
-                prefix_cache_key(artifact));
+                prefix_cache_key(artifact), static_cast<size_t>(cfg.cache_host_mib) * 1024 * 1024);
+            if (cfg.cache_host_mib > 0) {
+                prefix_cache_->set_demote([this](PrefixCache::Entry& e) { return demote_entry(e); });
+            }
         }
         core_.add_extension(tokenizers_extension_path());
         if (!cache_dir.empty()) core_.set_property(ov::cache_dir(cache_dir));
@@ -916,6 +919,9 @@ public:
     const ModelStatus& status() const override { return status_; }
     Tokenizer&         tokenizer() override { return *tokenizer_; }
 
+    PrefixCacheStats cache_stats() const override {
+        return prefix_cache_ != nullptr ? prefix_cache_->stats() : PrefixCacheStats{};
+    }
     uint64_t free_blocks() const override {
         return pool_ != nullptr ? static_cast<uint64_t>(pool_->free_blocks()) : 0;
     }
@@ -1488,6 +1494,19 @@ private:
             // would hand this lane a shared page *past* the prefix, which it
             // would then write into — and "a complete page is never written
             // again" is the invariant that makes sharing safe without copying.
+            // A tiered hit has its pages on the host (DESIGN §4.4): allocate,
+            // copy them back, and only then does the entry hold pages again.
+            if (hit.matched_tokens > 0 && hit.tiered && hit.matched_tokens % kv_block_tokens_ == 0) {
+                const auto t_promote = clock::now();
+                if (promote_entry(hit)) {
+                    stats.cache_promote_seconds =
+                        std::chrono::duration<double>(clock::now() - t_promote).count();
+                } else {
+                    log::warn("cache", "host-tier entry of %zu tok could not be promoted; cold prefill",
+                              hit.matched_tokens);
+                    hit = PrefixCache::Hit{};
+                }
+            }
             if (hit.matched_tokens > 0 && hit.blocks != nullptr &&
                 hit.matched_tokens % kv_block_tokens_ == 0 &&
                 hit.blocks->size() == hit.matched_tokens / kv_block_tokens_) {
@@ -2375,6 +2394,106 @@ private:
     // cached page is reclaimable and a live sequence's is not (§3.3). Only when
     // even that is not enough does this fail, and it fails as a clean end of
     // stream rather than as an allocation error on the card.
+    // ------------------------------------------------------- host tier (§4.4)
+    //
+    // A page is a contiguous slab in each KV pool tensor (shape [pages, ...]),
+    // so a run of consecutive page ids is one ROI copy per tensor. The
+    // allocator hands ids out in descending order from its free list, so a
+    // prefix filled in one prefill is a few long runs; after churn it
+    // fragments and the copy count grows. Measured, not assumed: the hit line
+    // prints the promotion time.
+    struct PageRun { int32_t first; size_t count; size_t at; };  // `at`: page index in the entry's order
+    static std::vector<PageRun> page_runs(const std::vector<int32_t>& blocks) {
+        std::vector<PageRun> runs;
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            if (!runs.empty() && runs.back().first + static_cast<int32_t>(runs.back().count) == blocks[i]) {
+                ++runs.back().count;
+            } else if (!runs.empty() && runs.back().first - 1 == blocks[i] && runs.back().count == 1) {
+                // descending pair: start a run going down is not a slab; keep it separate
+                runs.push_back({blocks[i], 1, i});
+            } else {
+                runs.push_back({blocks[i], 1, i});
+            }
+        }
+        return runs;
+    }
+    size_t pool_page_bytes(size_t i) const {
+        size_t elems = 1;
+        for (size_t d = 1; d < kv_pool_shapes_[i].size(); ++d) elems *= kv_pool_shapes_[i][d];
+        return elems * kv_pool_types_[i].size();
+    }
+    // Copy the entry's pages out to host buffers and release them. Runs under
+    // the cache lock; the copies are the cost this feature trades for prefill.
+    bool demote_entry(PrefixCache::Entry& e) {
+        if (e.blocks.empty() || kv_pool_tensors_.empty()) return false;
+        try {
+            const std::vector<PageRun> runs = page_runs(e.blocks);
+            e.host_kv.assign(kv_pool_tensors_.size(), {});
+            e.host_bytes = 0;
+            for (size_t i = 0; i < kv_pool_tensors_.size(); ++i) {
+                const size_t pb = pool_page_bytes(i);
+                std::vector<uint8_t>& buf = e.host_kv[i];
+                buf.resize(pb * e.blocks.size());
+                ov::Shape sh = kv_pool_shapes_[i];
+                for (const PageRun& r : runs) {
+                    ov::Coordinate begin(sh.size(), 0), end(sh.begin(), sh.end());
+                    begin[0] = static_cast<size_t>(r.first);
+                    end[0]   = static_cast<size_t>(r.first) + r.count;
+                    sh[0]    = r.count;
+                    ov::Tensor host(kv_pool_types_[i], sh, buf.data() + r.at * pb);
+                    // A ROI of a remote tensor is still remote; the plugin's
+                    // offset copy is reached through the RemoteTensor view.
+                    ov::Tensor(kv_pool_tensors_[i], begin, end).as<ov::RemoteTensor>().copy_to(host);
+                }
+                e.host_bytes += buf.size();
+            }
+            pool_->release(e.blocks);
+            return true;
+        } catch (const std::exception& ex) {
+            log::warn("cache", "demotion failed (%s); dropping the entry instead", ex.what());
+            e.host_kv.clear();
+            e.host_bytes = 0;
+            return false;
+        }
+    }
+    // Allocate pages for a tiered hit, copy its host buffers back, and record
+    // the pages on the entry. On failure the entry stays tiered and the caller
+    // prefills cold.
+    bool promote_entry(PrefixCache::Hit& hit) {
+        const size_t need = hit.matched_tokens / kv_block_tokens_;
+        std::vector<int32_t> pages = pool_->allocate(need);
+        while (pages.empty() && prefix_cache_->evict_oldest()) pages = pool_->allocate(need);
+        if (pages.empty()) return false;
+        const PrefixCache::Entry& e = *hit.keep;
+        if (e.host_kv.size() != kv_pool_tensors_.size()) { pool_->release(pages); return false; }
+        try {
+            const std::vector<PageRun> runs = page_runs(pages);
+            for (size_t i = 0; i < kv_pool_tensors_.size(); ++i) {
+                const size_t pb = pool_page_bytes(i);
+                if (e.host_kv[i].size() != pb * need) throw std::runtime_error("host buffer size mismatch");
+                ov::Shape sh = kv_pool_shapes_[i];
+                for (const PageRun& r : runs) {
+                    ov::Coordinate begin(sh.size(), 0), end(sh.begin(), sh.end());
+                    begin[0] = static_cast<size_t>(r.first);
+                    end[0]   = static_cast<size_t>(r.first) + r.count;
+                    sh[0]    = r.count;
+                    const ov::Tensor host(kv_pool_types_[i], sh,
+                                          const_cast<uint8_t*>(e.host_kv[i].data()) + r.at * pb);
+                    ov::RemoteTensor dst = ov::Tensor(kv_pool_tensors_[i], begin, end).as<ov::RemoteTensor>();
+                    dst.copy_from(host);
+                }
+            }
+        } catch (const std::exception& ex) {
+            log::warn("cache", "promotion failed (%s)", ex.what());
+            pool_->release(pages);
+            return false;
+        }
+        if (!prefix_cache_->promote(hit.keep, pages)) { pool_->release(pages); return false; }
+        hit.blocks = &e.blocks;   // now the promoted pages
+        hit.tiered = false;
+        return true;
+    }
+
     bool ensure_blocks(Lane& lane, size_t tokens) {
         const size_t want = (tokens + kv_block_tokens_ - 1) / kv_block_tokens_ + 1;
         if (lane.blocks.size() >= want) return true;

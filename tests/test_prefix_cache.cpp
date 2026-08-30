@@ -253,3 +253,70 @@ TEST(prefix_cache_returns_pages_when_it_is_cleared) {
     CHECK_EQ(freed.ids.size(), 2u);
     CHECK_EQ(c.stats().blocks_held, 0u);
 }
+
+// ---------------------------------------------------------------- host tier
+
+TEST(prefix_cache_demotes_instead_of_dropping_when_the_host_tier_is_on) {
+    PrefixCache c(1 << 20, 32, 7, /*host_budget*/ 1 << 20);
+    std::vector<int32_t> seen;
+    c.set_demote([&](PrefixCache::Entry& e) {
+        seen = e.blocks;
+        e.host_kv.assign(2, std::vector<uint8_t>(64, 0xAB));
+        e.host_bytes = 128;
+        return true;
+    });
+    const std::vector<int> tokens = seq(64);
+    c.insert(tokens, 32, blob(8, 1), {4, 5});
+
+    CHECK(c.evict_oldest());                        // "give me pages" -> demoted, not dropped
+    CHECK_EQ(seen.size(), size_t{2});
+    CHECK_EQ(c.stats().tiered_entries, size_t{1});
+    CHECK_EQ(c.stats().blocks_held, size_t{0});
+    CHECK_EQ(c.stats().host_bytes, size_t{128});
+
+    const auto hit = c.lookup(tokens);              // still hittable, and it says so
+    CHECK_EQ(hit.matched_tokens, size_t{32});
+    CHECK(hit.tiered);
+    CHECK(hit.blocks != nullptr && hit.blocks->empty());
+
+    CHECK(c.promote(hit.keep, {9, 10}));            // pages back, buffers gone
+    const auto again = c.lookup(tokens);
+    CHECK(!again.tiered);
+    CHECK_EQ(again.blocks->size(), size_t{2});
+    CHECK_EQ(c.stats().host_bytes, size_t{0});
+    CHECK_EQ(c.stats().promotions, uint64_t{1});
+}
+
+TEST(prefix_cache_host_tier_off_drops_as_before) {
+    PrefixCache c(1 << 20, 32, 7);                 // host budget 0
+    bool called = false;
+    c.set_demote([&](PrefixCache::Entry&) { called = true; return true; });
+    c.insert(seq(64), 32, blob(8, 1), {1});
+    CHECK(c.evict_oldest());
+    CHECK(!called);
+    CHECK_EQ(c.stats().entries, size_t{0});
+}
+
+TEST(prefix_cache_host_budget_drops_the_oldest_tiered_entry) {
+    PrefixCache c(1 << 20, 32, 7, /*host_budget*/ 150);
+    c.set_demote([&](PrefixCache::Entry& e) { e.host_bytes = 100; return true; });
+    const std::vector<int> a = seq(64), b = seq(96);
+    c.insert(a, 32, blob(8, 1), {1});
+    c.insert(b, 64, blob(8, 2), {2, 3});
+    CHECK(c.evict_oldest());                        // a demoted: host 100
+    CHECK(c.evict_oldest());                        // b demoted: host 200 > 150 -> a dropped
+    CHECK_EQ(c.stats().tiered_entries, size_t{1});
+    CHECK_EQ(c.stats().host_bytes, size_t{100});
+    CHECK_EQ(c.lookup(a).matched_tokens, size_t{0});
+    CHECK_EQ(c.lookup(b).matched_tokens, size_t{64});
+    CHECK(!c.evict_oldest());                       // nothing left that holds pages
+}
+
+TEST(prefix_cache_failed_demotion_drops_the_entry) {
+    PrefixCache c(1 << 20, 32, 7, /*host_budget*/ 1 << 20);
+    c.set_demote([&](PrefixCache::Entry&) { return false; });
+    c.insert(seq(64), 32, blob(8, 1), {1});
+    CHECK(c.evict_oldest());
+    CHECK_EQ(c.stats().entries, size_t{0});
+    CHECK_EQ(c.stats().host_bytes, size_t{0});
+}
