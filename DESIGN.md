@@ -1696,8 +1696,60 @@ architecture record:
    57792, 1.7% at 115564. The 33–39% figure is a share of a *past-0 chunk's node
    time*, and a past-0 chunk is the cheapest one in any real prefill. Both arms
    require the same pre-compile graph surgery that the fix does, so measuring
-   costs what fixing costs — and against 1.7–4.6%, `PagedCausalConv1D` at 6.3%
-   of *both* phases is the larger prize and the next candidate.
+   costs what fixing costs. (The sentence that stood here named
+   `PagedCausalConv1D` at "6.3% of both phases" as the larger prize; item 3
+   below withdraws that figure for prefill, so it named the wrong candidate.
+   The current sizing is in the two paragraphs that follow.)
+
+   **The dispatch was read, not inferred (2026-08-30).** `ONEDNN_VERBOSE=dispatch`
+   reports the decision from a normal run — no debug build was needed. For the
+   gate's problem, `M x 2048 : 2048 x 1` with s8 activations, u4 group-quantised
+   weights, an f16 destination and a **fused `eltwise_logistic` post-op**,
+   `jit:gemm:any` is rejected with *"matching kernel not found in catalog"* at
+   M = 128, 256, 416, 512, 1024 and 2048 — and **not at M = 1**, which is why
+   decode never pays it. The M>=128 boundary bisected earlier is confirmed from
+   the dispatcher's own log.
+
+   The mechanism read out of the source — that the k-parallel candidates are
+   filtered by `po_valid`, which our non-scale post-op and f16 destination both
+   fail — is **falsified**. At `debuginfo=5` the same loop prints a skip reason
+   per candidate; **no skip line appears for any of the six shapes, and zero
+   `consider` records fall inside those six problems**. `select_kernel()`
+   returned an empty list and the filter never ran. The null is load-bearing
+   only because the instrument carries a positive control at the same verbosity
+   gate: `info,gpu,gemm,consider` is guarded by the same `debuginfo >= 5`, and
+   2198 of those records are in the same log. It is a **shape gap in the kernel
+   catalog**, not a policy rejection.
+
+   **Steerability, asked before committing to the long loop.** Not by an
+   environment knob (`ONEDNN_GROUPED_GEMM_USED` is the only related string in the
+   shipped plugin, and is unrelated); not by un-fusing the sigmoid or changing
+   the destination dtype, since both feed a filter that never executes. Possibly
+   by **changing N**, because the catalog matches on shape: padding the gate's
+   output width to a catalogued N is a pre-compile graph rewrite we own outright
+   — rung zero of §1.1, no OpenVINO change and no oneDNN change. So §1.1's first
+   rung for this row is *not* a oneDNN PR after all; that stays the fallback if
+   padding does not pay.
+
+   **The share, refined by the corrected profiler.** With the profiler running
+   each capture twice and dumping the second, the gate's forty nodes cost 54 ms
+   per chunk, not ~40 ms, so the depth-independent arithmetic gives **6.0% of
+   prefill wall at 14450 tokens** and ~2.2% at 115564 — superseding the 4.6% /
+   1.7% above, which came from the single-pass capture. The 30.2% seen in a
+   chunk inventory and these single-digit figures are both correct: a past-0
+   chunk's node total is 179 ms while a mean chunk at 14450 tokens is 910 ms, a
+   **5.1x** denominator difference. Nothing was truncated; totals were always
+   summed over all pairs. Sixth instance of the past-0 error.
+
+   **The corollary is larger than the row.** 910 ms mean chunk against 179 ms at
+   past 0 puts **80% of a mean chunk in the depth-dependent term**, and every
+   share in a chunk inventory is a share of the other 20%. All reference
+   implementations together (49% of a past-0 chunk) are about **10% of prefill
+   wall** at 14450 tokens and less deeper. The kernel rows are single-digit
+   items; whatever grows with depth is most of served prefill. The only
+   quadratic term in the graph is attention, at 1.8% at past 0 — but that is an
+   inference, and the two-depth capture is the measurement that settles it. It
+   should run before any kernel item is chosen.
 
    A small chunk does not dodge it: chunk 64 avoids the fallback, but the chunk
    sweep measured what small chunks cost (1339 t/s at 512 against 1878 at 2048).
