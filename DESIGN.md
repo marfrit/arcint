@@ -1968,6 +1968,87 @@ started here. The realistic ceiling if the host went to zero is the device's
 own ~6.5 ms per step, i.e. roughly 2x decode; a fusion pass that halved the
 primitive count would be worth ~1.4x.
 
+#### 7.0.2g Padding N on the gate: measured, and it has a decode price (2026-08-30)
+
+`pad_gate_matmuls` widens the shared-expert gate from `[2048, 1]` to
+`[2048, N]` on the ov::Model before compile: the u4 weight, zero points and
+scales get zero rows (a zero scale makes the dequantised row exactly zero
+whatever the nibbles hold), the group-flattening Reshape learns the new width,
+and a Slice takes column 0 back out before the sigmoid. Rung zero of §1.1. It
+is behind `ARCINT_GATE_PAD=<n>` and **off by default**, for the reason below.
+
+Same session, same card, f16 KV, chunk 2048, 12448 tokens, all against wall:
+
+| N | oneDNN impl for the M=2048 gate | prefill wall | decode | greedy 96 |
+|---|---|---|---|---|
+| 1 (stock) | `ocl:ref` (catalog miss) | 3.97 s (3133 t/s) | 45.2–45.9 t/s | reference |
+| 16 | `jit:gemm` | **3.45 s (3608 t/s)** | 43.0–43.6 t/s | identical |
+| 32 | `jit:gemm` | 3.45 s | 43.0–43.5 | identical |
+| 64 | `jit:gemm` | 3.45 s | 43.4–43.6 | identical |
+
+**Prefill −13% wall (+15% throughput), N=16 is enough, output byte-identical.
+Decode −5%, consistently** — six padded readings all below both stock ones.
+The decode cost is the launch count, as §7.0.2f predicts: the node dump shows
++50 primitives walked per step (40 `StridedSlice`, 6 `Reshape`, 4 `Transpose`)
+and +48 launched, at ~12 us each ≈ 0.6 ms of a 22 ms step. So the trade is
+prefill-heavy workloads win and long answers lose, with break-even near a
+500-token answer on a 12k prompt — not a default until the extra launch is
+removed or decode's launch count has been cut (after which 48 launches cost
+device time, ~0.1 ms, and the trade disappears). A version without the Slice
+— replicated gate rows and a reshape on the consumer side — trades one launched
+primitive for three walked ones and is untested.
+
+**And a profiler note that belongs next to it.** PERF_COUNT's decode-step
+capture reports the stock gate at 36.5 ms across its 40 nodes — 912 us each on
+`jit:gemm:any` at M=1 — in a step whose wall is 22 ms and whose device time is
+~6.5 ms; with padding it reports 241 us. Whatever that counter measures at M=1
+for that node, it is not device time and it moves opposite to the wall. Decode
+is read from the timeline and from wall, never from PERF_COUNT per node.
+
+#### 7.0.2h The decode primitive histogram: a handful of classes, not a long tail
+
+One decode step, every node the plugin walks, by name (`ARCINT_PROFILE_NODES`):
+**2315 primitives walked, 1171 launched** (the timeline's ~1130 kernel launches
+plus copies). The other 1144 are walked on the host with no kernel: 582
+`Reshape`, 120 `Multiply`, 91 `Parameter`, 80 `Sigmoid`, 80 `Crop`, 46 `Add`,
+40 `VariadicSplit`, 40 `Swish` — the eltwise ones are post-ops already fused
+into an FC. What a walked-but-unlaunched primitive costs on the host against a
+launched one is **not measured**; 13.46 ms over 2315 walked is 5.8 us each,
+over 1171 launched 11.5 us each, and the truth is a mix. That split is the next
+number this needs, because it decides whether the 582 Reshapes are a target.
+
+Launched, by class: `FullyConnectedCompressed` **371** (32%), `DynamicQuantize`
+**161** (14% — one per distinct FC input, the s8 activation quantisation), `RMS`
+131, `Add` ~104, `Swish` ~60, `MoE` 40+40, `GDN` 30, `conv` 30, `Multiply` ~40,
+`StridedSlice` 48. Six classes are ~75% of launches. Per layer: a GDN layer
+walks 38.9 primitives (19 in `linear_attn`: 5 FC, 5 Reshape, 2 Multiply, 2
+Swish, 2 Crop, RMS, conv, Add, Sigmoid, SoftPlus, VariadicSplit, Concat,
+ShapeOf; 14 in `mlp`: 5 FC, MoE, 2 Multiply, 2 Reshape, Swish, Add, Sigmoid,
+Concat), an attention layer 43.2. The 716 "outside layers" are per-layer nodes
+that lost their names to transformations — 161 DynamicQuantize, 235 Reshape,
+91 Parameters (the 91 state and cache inputs), 80 Add, the routers, the paged
+GDN and attention nodes.
+
+**So fusion is three changes, not twenty**, and two of them may already exist
+in the plugin: (1) the five `linear_attn` FCs of a GDN layer consume one input
+and the plugin has a horizontal-FC fusion pass (`disable_horizontal_fc_fusion`
+is a debug option) — why it does not fire here is a selector read, Phase-A
+style, before any new code; (2) `DynamicQuantize` into its producer, −161; (3)
+the GDN block's small ops around its FCs, ~10 launches per layer, −300. Together
+that is the −50% the device bound needs (§7.0.2f: under ~545 launches or under
+5.75 us each). Adding a fused primitive changes graph structure, so it needs its
+own before/after on node inventory — the null-implementation control does not
+cover it.
+
+**Level-Zero, read before anyone plans on it.** The pinned plugin carries a
+complete L0 runtime (`runtime/ze/`: engine, stream, kernel, memory, events;
+`GPU_RT_TYPE=ZE` is an accepted build value; the package and the debug build
+are `OCL`). But `ze_stream` creates **immediate** command lists only —
+`zeCommandListCreateImmediate`, "submits commands immediately, no flush" — so
+there is no recorded list to replay and every kernel is still appended by the
+host per step. It would not touch the 76% of decode spent outside any runtime
+call in any case. Not a lever in this plugin as written.
+
 #### 7.0.2b The XMX question cannot be decided from the profile
 
 The proposed five-minute check — grep a `ARCINT_PROFILE` for `dpas`/systolic

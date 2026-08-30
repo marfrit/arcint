@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 
 #include <dirent.h>
 #include <limits>
@@ -355,6 +356,106 @@ size_t route_head_swap_permutes(const std::shared_ptr<ov::Model>& model) {
     }
     if (n > 0) model->validate_nodes_and_infer_types();
     return n;
+}
+
+// Pads the shared-expert gate's output width from 1 to `npad`.
+//
+// The gate is a [M, 2048] x [2048, 1] MatMul with a fused sigmoid. oneDNN has
+// no catalogued GEMM for that shape at M >= 128 -- read from its own dispatch
+// log on 2026-08-30: "matching kernel not found in catalog", with zero
+// candidates considered, not a rejected one -- so every prefill chunk runs it
+// on ocl:ref, 40 nodes per chunk at 12.2% of prefill wall on the device
+// timeline. The catalog is matched on shape, so this widens the shape: the u4
+// weight, its zero points and its scales are padded along the output axis with
+// rows whose scale is zero (so the dequantised rows are exactly zero), the
+// Reshape that flattens the groups is told the new width, and a Slice takes
+// column 0 back out before the sigmoid. Rung zero of DESIGN §1.1: our graph,
+// no plugin change, no upstream loop. Whether the widened shape lands on a
+// JIT kernel and what that costs is measured, not assumed.
+size_t pad_gate_matmuls(const std::shared_ptr<ov::Model>& model, size_t npad) {
+    using ov::op::v0::Constant;
+    if (npad < 2) return 0;
+    size_t done = 0;
+    for (const auto& node : model->get_ordered_ops()) {
+        const auto mm = ov::as_type_ptr<ov::op::v0::MatMul>(node);
+        if (mm == nullptr || !mm->get_transpose_b()) continue;
+        if (mm->get_friendly_name().find("shared_expert_gate") == std::string::npos) continue;
+        const ov::PartialShape out_ps = mm->get_output_partial_shape(0);
+        if (out_ps.rank().is_dynamic()) continue;
+        const int64_t last = out_ps.rank().get_length() - 1;
+        if (!out_ps[last].is_static() || out_ps[last].get_length() != 1) continue;
+
+        // Everything upstream of the weight input must be the decompression
+        // subgraph -- Convert / Reshape / Multiply / Subtract over constants.
+        // Anything else and this gate is not the shape we understand: skip it
+        // rather than guess.
+        std::vector<std::shared_ptr<ov::Node>>  stack{mm->input_value(1).get_node_shared_ptr()};
+        std::set<const ov::Node*>               seen;
+        std::vector<std::shared_ptr<Constant>>  consts;
+        bool                                    ok = true;
+        while (!stack.empty() && ok) {
+            const std::shared_ptr<ov::Node> n = stack.back();
+            stack.pop_back();
+            if (!seen.insert(n.get()).second) continue;
+            if (auto c = ov::as_type_ptr<Constant>(n)) {
+                consts.push_back(c);
+                continue;
+            }
+            const std::string t = n->get_type_name();
+            if (t != "Convert" && t != "Reshape" && t != "Multiply" && t != "Subtract") {
+                ok = false;
+                break;
+            }
+            for (size_t i = 0; i < n->get_input_size(); ++i) {
+                stack.push_back(n->input_value(i).get_node_shared_ptr());
+            }
+        }
+        if (!ok) continue;
+
+        std::vector<std::pair<std::shared_ptr<Constant>, std::shared_ptr<Constant>>> repl;
+        for (const auto& c : consts) {
+            const ov::Shape sh = c->get_shape();
+            if (sh.size() == 1 && c->get_element_type() == ov::element::i64) {
+                // The Reshape target: [1, 2048] -> [npad, 2048].
+                std::vector<int64_t> v = c->cast_vector<int64_t>();
+                if (v.empty() || v[0] != 1) { ok = false; break; }
+                v[0] = static_cast<int64_t>(npad);
+                repl.emplace_back(c, Constant::create(ov::element::i64, sh, v));
+            } else if (sh.size() >= 2 && sh[0] == 1) {
+                // Weight [1, groups, gs], zero point and scale [1, groups, 1]:
+                // the whole constant is one output row, so the padded tensor is
+                // that row followed by zero rows. For the scale, zero rows make
+                // the dequantised weight exactly zero whatever the nibbles say.
+                ov::Shape nsh = sh;
+                nsh[0]        = npad;
+                const size_t row_bytes = c->get_byte_size();
+                std::vector<uint8_t> buf(row_bytes * npad, 0);
+                std::memcpy(buf.data(), c->get_data_ptr(), row_bytes);
+                repl.emplace_back(c, std::make_shared<Constant>(c->get_element_type(), nsh,
+                                                                buf.data()));
+            } else {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok || repl.empty()) continue;
+        for (auto& pr : repl) {
+            pr.second->set_friendly_name(pr.first->get_friendly_name());
+            ov::replace_node(pr.first, pr.second);
+        }
+        // Column 0 back out, so the sigmoid and everything after it see [M, 1].
+        const auto targets = mm->output(0).get_target_inputs();
+        const auto start   = Constant::create(ov::element::i64, {1}, {int64_t{0}});
+        const auto stop    = Constant::create(ov::element::i64, {1}, {int64_t{1}});
+        const auto step    = Constant::create(ov::element::i64, {1}, {int64_t{1}});
+        const auto ax      = Constant::create(ov::element::i64, {1}, {last});
+        const auto slice   = std::make_shared<ov::op::v8::Slice>(mm->output(0), start, stop, step, ax);
+        slice->set_friendly_name(mm->get_friendly_name() + "/gate_pad_slice");
+        for (auto t : targets) t.replace_source_output(slice->output(0));
+        ++done;
+    }
+    if (done > 0) model->validate_nodes_and_infer_types();
+    return done;
 }
 
 bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model,
@@ -1659,6 +1760,13 @@ private:
         const std::string  mtp_dev = cfg.mtp_device.empty() ? device : cfg.mtp_device;
 
         std::shared_ptr<ov::Model> model = core_.read_model(artifact_.language_model_xml);
+        // ARCINT_GATE_PAD=<n>: widen the shared-expert gate (see pad_gate_matmuls).
+        // An experiment switch until the win is measured against wall time.
+        if (const char* gp = std::getenv("ARCINT_GATE_PAD")) {
+            const size_t npad = static_cast<size_t>(std::strtoul(gp, nullptr, 10));
+            const size_t n    = pad_gate_matmuls(model, npad);
+            log::info("load", "shared-expert gate padded to N=%zu on %zu MatMul(s)", npad, n);
+        }
 
         // The LA state geometry is read off the *stateful* graph's variables,
         // where it is static; the transformed ports leave some dims dynamic.
@@ -2578,8 +2686,17 @@ private:
             // can be named rather than inferred.
             std::map<std::string, std::vector<std::string>> ref_names;
             double                     total = 0.0;
+            // ARCINT_PROFILE_NODES=1: every node of the decode step by name, so the
+            // primitive count -- which is what binds decode -- can be bucketed by
+            // layer and block rather than guessed from kernel families.
+            const bool dump_nodes = std::getenv("ARCINT_PROFILE_NODES") != nullptr &&
+                                    std::strcmp(what, "decode step") == 0;
             for (const ov::ProfilingInfo& p : lane.req.get_profiling_info()) {
                 const double us = static_cast<double>(p.real_time.count());
+                if (dump_nodes) {
+                    log::info("nodes", "%s\t%s\t%s\t%.0f", p.node_name.c_str(),
+                              p.node_type.c_str(), p.exec_type.c_str(), us);
+                }
                 if (us <= 0.0) continue;
                 const std::string key = p.node_type + "  " + p.exec_type;
                 Agg& a = by_kernel[key];
