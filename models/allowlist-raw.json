@@ -72,5 +72,23 @@
     "mtp_num_hidden_layers": 1,
     "mtp_head_exported": true,
     "_note": "Intel's export also ships openvino_mtp_model.{xml,bin} of its own (263 MB int4, one MTP layer, no lm_head, same interface as our openvino_mtp_layer). arcint keys the head on openvino_mtp_layer + openvino_mtp_lm_head, which are the reconstructed ones."
+  },
+  "qwen36-35b-a3b-mtp-ov": {
+    "arch": [
+      "Qwen3_5MoeForConditionalGeneration"
+    ],
+    "model_type": "qwen3_5_moe",
+    "hidden": 2048,
+    "layers": 40,
+    "experts": 256,
+    "ctx": 262144,
+    "full_attention_interval": 4,
+    "template_sha": "c3f7038f278583e1",
+    "tokenizer_sha": "87a7830d63fcf43b",
+    "lm_xml_sha": "21fe4d57d6d016f5",
+    "lm_bin_bytes": 18646558274,
+    "status": "unmeasured against the current harness (2026-08-30: the 35B artifact as symlinks plus the reconstructed MoE MTP head from tools/export_mtp.py)",
+    "mtp_num_hidden_layers": 1,
+    "mtp_head_exported": true
   }
 }

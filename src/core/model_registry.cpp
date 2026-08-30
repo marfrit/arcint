@@ -88,6 +88,37 @@ std::vector<ModelEntry> build_registry() {
         r.push_back(std::move(e));
     }
     {
+        // The same 35B artifact with the reconstructed MTP head beside it, as a
+        // separate directory of symlinks, so the production agent's directory is
+        // never touched: --mtp auto turns drafting on the moment a head exists,
+        // and a head goes into production only after it is measured.
+        ModelEntry e;
+        e.id                      = "qwen3.6-35b-a3b-mtp";
+        e.family                  = "qwen3.6";
+        e.artifact_aliases        = {"qwen36-35b-a3b-mtp-ov"};
+        e.ov_arch                 = "Qwen3_5MoeForConditionalGeneration";
+        e.model_type              = "qwen3_5_moe";
+        e.moe                     = true;
+        e.has_mtp_head            = true;   // the reconstructed head (tools/export_mtp.py, MoE)
+        e.mtp_head_pinned         = true;
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2048;
+        e.n_expert                = 256;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 40;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.arch_hash               = "21fe4d57d6d016f5";
+        e.template_hash           = "c3f7038f278583e1";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 18646558274ull;
+        e.status                  = "unmeasured against the current harness (the 35B with the "
+                                    "reconstructed MoE MTP head; acceptance is the oracle)";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+    {
         ModelEntry e;
         e.id                      = "qwen3.8-27b";
         e.family                  = "qwen3.8";

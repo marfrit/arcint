@@ -2781,18 +2781,29 @@ private:
                 std::memcpy(ep + r * width, ev + (i + 1) * width, width * 4);
             }
 
-            const ov::Tensor pos  = mtp_positions(lane.mtp_pos, pairs);
-            const ov::Tensor mask = mtp_mask(lane.mtp_len, pairs);
-            ov::Tensor beam(ov::element::i32, ov::Shape{1});
-            beam.data<int32_t>()[0] = 0;
-            lane.mtp_layer.set_tensor("hidden_states", h);
-            lane.mtp_layer.set_tensor(mtp_embeds_name_, e);
-            lane.mtp_layer.set_tensor("position_ids", pos);
-            lane.mtp_layer.set_tensor("attention_mask", mask);
-            lane.mtp_layer.set_tensor("beam_idx", beam);
-            with_turn(lane, [&] { lane.mtp_layer.infer(); });
-            lane.mtp_len += pairs;
-            lane.mtp_pos += pairs;
+            // In slices: an MoE head (Qwen3.6) computes every expert for every
+            // token and holds an [experts, tokens, 2*intermediate] intermediate,
+            // 2 GB at a full 2048-pair chunk. 128 pairs keeps it at ~130 MB, and
+            // sequential slices are exactly one batch: the head's KV grows the
+            // same way and the mask is causal within each slice.
+            constexpr size_t kPrimeSlice = 128;
+            for (size_t at = 0; at < pairs; at += kPrimeSlice) {
+                const size_t n = std::min(kPrimeSlice, pairs - at);
+                ov::Tensor hs(ov::element::f32, ov::Shape{1, n, width}, hp + at * width);
+                ov::Tensor es(ov::element::f32, ov::Shape{1, n, width}, ep + at * width);
+                const ov::Tensor pos  = mtp_positions(lane.mtp_pos, n);
+                const ov::Tensor mask = mtp_mask(lane.mtp_len, n);
+                ov::Tensor beam(ov::element::i32, ov::Shape{1});
+                beam.data<int32_t>()[0] = 0;
+                lane.mtp_layer.set_tensor("hidden_states", hs);
+                lane.mtp_layer.set_tensor(mtp_embeds_name_, es);
+                lane.mtp_layer.set_tensor("position_ids", pos);
+                lane.mtp_layer.set_tensor("attention_mask", mask);
+                lane.mtp_layer.set_tensor("beam_idx", beam);
+                with_turn(lane, [&] { lane.mtp_layer.infer(); });
+                lane.mtp_len += n;
+                lane.mtp_pos += n;
+            }
             lane.mtp_has_pending = false;
             mtp_set_pending(lane, hidden, take - 1);
         } catch (const std::exception& e) {

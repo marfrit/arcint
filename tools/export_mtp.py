@@ -25,6 +25,9 @@ import openvino as ov
 from openvino import opset13 as op
 from safetensors import safe_open
 
+# Geometry comes from the checkpoint's config (set in main); these are the
+# Qwen3.8-27B values the head was first reconstructed against, kept as the
+# defaults so the file reads the same as before.
 HEADS, KV_HEADS, HEAD_DIM = 24, 4, 256
 HIDDEN = 5120
 
@@ -110,6 +113,70 @@ def rope(x, cos, sin, rotary_dim, heads):
 
 
 
+MOE_TOPK = 8
+MOE_NORM_TOPK = True   # renormalise the top-k routing weights; a switch the oracle decides
+
+def moe_block(y, w, p, topk, norm_topk):
+    """The Qwen3.6 MTP layer's MLP: a router over E experts, the top-k of them
+    applied and summed, plus a sigmoid-gated shared expert.
+
+    Every expert is computed for every token and the non-selected ones are
+    weighted by exactly zero. That is the same arithmetic as a gather over the
+    selected experts, without a data-dependent loop in the graph; at one token
+    per step it reads the expert weights once (~0.4 GB int4, ~1 ms), and at
+    prefill the caller keeps the batch small enough for the [E, M, 2I]
+    intermediate. Tensor layouts as stored: gate_up_proj [E, 2I, H] with the
+    gate half first, down_proj [E, H, I], gate.weight [E, H] (torch [out, in]).
+    """
+    gu = w[p + "mlp.experts.gate_up_proj"]          # [E, 2I, H]
+    dn = w[p + "mlp.experts.down_proj"]             # [E, H, I]
+    E, two_i, H = gu.shape
+    I = two_i // 2
+
+    # router: softmax over all experts, keep the top-k, optionally renormalise
+    logits = linear(y, w[p + "mlp.gate.weight"], "router")            # [B,S,E]
+    probs = op.softmax(logits, axis=-1)
+    tk = op.topk(probs, op.constant(np.array(topk, dtype=np.int32)), axis=-1,
+                 mode="max", sort="value", index_element_type="i32")
+    vals, idx = tk.output(0), tk.output(1)                            # [B,S,k]
+    if norm_topk:
+        vals = op.divide(vals, op.reduce_sum(vals, op.constant(np.array([-1], dtype=np.int32)),
+                                             keep_dims=True))
+    zeros = op.multiply(probs, op.constant(np.array([0.0], dtype=np.float32)))
+    weights = op.scatter_elements_update(zeros, idx, vals,
+                                         op.constant(np.array(-1, dtype=np.int32)))  # [B,S,E]
+
+    # all experts, batched over E: y as [1, M, H] against W^T as [E, H, 2I]
+    m_h = op.reshape(y, op.constant(np.array([1, -1, H], dtype=np.int32)), special_zero=False)
+    gu_c = op.constant(np.ascontiguousarray(gu, dtype=np.float32))
+    gu_c.friendly_name = "experts_gate_up"
+    h2 = op.matmul(m_h, gu_c, transpose_a=False, transpose_b=True)     # [E, M, 2I]
+    split = op.split(h2, op.constant(np.array(-1, dtype=np.int32)), 2)
+    g, u = split.output(0), split.output(1)                            # [E, M, I]
+    act = op.multiply(op.multiply(g, op.sigmoid(g)), u)
+    dn_c = op.constant(np.ascontiguousarray(dn, dtype=np.float32))
+    dn_c.friendly_name = "experts_down"
+    outs = op.matmul(act, dn_c, transpose_a=False, transpose_b=True)   # [E, M, H]
+
+    # weights [B,S,E] -> [E, M, 1]
+    w_m = op.reshape(weights, op.constant(np.array([-1, E], dtype=np.int32)), special_zero=False)
+    w_e = op.unsqueeze(op.transpose(w_m, op.constant(np.array([1, 0], dtype=np.int32))),
+                       op.constant(np.array([-1], dtype=np.int32)))
+    mixed = op.reduce_sum(op.multiply(outs, w_e), op.constant(np.array([0], dtype=np.int32)),
+                          keep_dims=False)                              # [M, H]
+    mixed = op.reshape(mixed, op.concat([shape_part(y, 0, 2),
+                                         op.constant(np.array([H], dtype=np.int32))], axis=0),
+                       special_zero=False)
+
+    # shared expert, gated by a scalar sigmoid per token
+    sg = linear(y, w[p + "mlp.shared_expert.gate_proj.weight"], "shared_gate_proj")
+    su = linear(y, w[p + "mlp.shared_expert.up_proj.weight"], "shared_up_proj")
+    shared = linear(op.multiply(op.multiply(sg, op.sigmoid(sg)), su),
+                    w[p + "mlp.shared_expert.down_proj.weight"], "shared_down_proj")
+    shared = op.multiply(shared, op.sigmoid(linear(y, w[p + "mlp.shared_expert_gate.weight"],
+                                                   "shared_expert_gate")))
+    return op.add(mixed, shared)
+
 def build_mtp_layer(w, eps, theta, rotary_dim):
     """hidden_states + input_embeds -> the MTP layer's normed hidden state."""
     dyn = ov.PartialShape([-1, -1, HIDDEN])
@@ -192,12 +259,15 @@ def build_mtp_layer(w, eps, theta, rotary_dim):
     a = op.multiply(a, op.sigmoid(gate))
     x = op.add(x, linear(a, w[p + "self_attn.o_proj.weight"], "o_proj"))
 
-    # --- SwiGLU ---------------------------------------------------------------
+    # --- MLP: dense SwiGLU (Qwen3.8) or MoE (Qwen3.6, 256 experts, top-8) ------
     y = rms_norm(x, w[p + "post_attention_layernorm.weight"], eps, "post_ln")
-    g = linear(y, w[p + "mlp.gate_proj.weight"], "gate_proj")
-    u = linear(y, w[p + "mlp.up_proj.weight"], "up_proj")
-    x = op.add(x, linear(op.multiply(op.multiply(g, op.sigmoid(g)), u),
-                         w[p + "mlp.down_proj.weight"], "down_proj"))
+    if (p + "mlp.experts.gate_up_proj") in w:
+        x = op.add(x, moe_block(y, w, p, MOE_TOPK, MOE_NORM_TOPK))
+    else:
+        g = linear(y, w[p + "mlp.gate_proj.weight"], "gate_proj")
+        u = linear(y, w[p + "mlp.up_proj.weight"], "up_proj")
+        x = op.add(x, linear(op.multiply(op.multiply(g, op.sigmoid(g)), u),
+                             w[p + "mlp.down_proj.weight"], "down_proj"))
 
     out = rms_norm(x, w["mtp.norm.weight"], eps, "final_norm")
     res = op.result(out)
@@ -257,17 +327,31 @@ def main():
     ap.add_argument("--weights", required=True, help="checkpoint holding the mtp.* tensors")
     ap.add_argument("--base", required=True, help="the base openvino_language_model.xml")
     ap.add_argument("--out", required=True, help="directory to write the MTP IRs into")
+    ap.add_argument("--norm-topk", dest="norm_topk", type=lambda v: v.lower() in ("1", "true", "yes"),
+                    default=None, help="MoE heads: renormalise the top-k routing weights "
+                    "(default: the config's norm_topk_prob, else true)")
     a = ap.parse_args()
 
     cfg = json.load(open(os.path.join(a.weights, "config.json")))
     t = cfg.get("text_config", cfg)
+    global HEADS, KV_HEADS, HEAD_DIM, HIDDEN, MOE_TOPK, MOE_NORM_TOPK
+    HEADS    = int(t.get("num_attention_heads", HEADS))
+    KV_HEADS = int(t.get("num_key_value_heads", KV_HEADS))
+    HEAD_DIM = int(t.get("head_dim", HEAD_DIM))
+    HIDDEN   = int(t.get("hidden_size", HIDDEN))
+    MOE_TOPK = int(t.get("num_experts_per_tok", MOE_TOPK))
+    if a.norm_topk is not None:
+        MOE_NORM_TOPK = a.norm_topk
+    elif t.get("norm_topk_prob") is not None:
+        MOE_NORM_TOPK = bool(t["norm_topk_prob"])
     eps = float(t.get("rms_norm_eps", 1e-6))
     theta = float(t.get("rope_parameters", {}).get("rope_theta", t.get("rope_theta", 1e7)))
     rotary = int(HEAD_DIM * float(t.get("partial_rotary_factor", 0.25)))
     if t.get("mtp_num_hidden_layers", 1) != 1:
         raise SystemExit("this exporter builds a single-layer MTP head")
 
-    print(f"eps {eps}  theta {theta:g}  rotary_dim {rotary}  heads {HEADS}/{KV_HEADS}x{HEAD_DIM}")
+    print(f"eps {eps}  theta {theta:g}  rotary_dim {rotary}  heads {HEADS}/{KV_HEADS}x{HEAD_DIM}  "
+          f"hidden {HIDDEN}  moe top-{MOE_TOPK} norm_topk={MOE_NORM_TOPK}")
     w = load_mtp_tensors(a.weights)
     print(f"loaded {len(w)} mtp tensors")
 
