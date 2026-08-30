@@ -1759,12 +1759,13 @@ architecture record:
    the corollary required.
 
    **What it uncovered instead is an attribution gap, and it is the larger
-   finding.** Summing that sweep over a real 13930-token prefill predicts ~1.97 s
-   of node time; the same prefill served and measured at the endpoint takes
-   6.40 s wall, 6.36 s of it graph. **Node times account for roughly a third of
-   graph wall.** PERF_COUNT only inflates per-node numbers, so the gap is real
-   rather than an artefact, and dispatch overhead does not explain it either —
-   ~590 ms unattributed across ~1135 node executions would be ~520 us each. The
+   finding.** Summing that sweep over a 13410-token prefill predicts **1.88 s**
+   of node time; the same prefill, served from **the same process**, spends
+   **6.20 s in the graph**. **Node times account for 30% of graph wall.** The
+   profiler is not the explanation: with profiling on that prefill takes 6.20 s
+   of graph and with it off 5.76 s, **+7.6%**, and the comparison above has it
+   on for both sides. Dispatch overhead is not the explanation either — ~590 ms
+   unattributed across ~1135 node executions would be ~520 us each. The
    disagreement is unexplained, and until it is closed **no node share can be
    converted into a share of served time**: every "X% of prefill wall" in this
    record, including the 6.0% and 2.2% written for the gate a few paragraphs

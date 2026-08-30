@@ -303,18 +303,21 @@ grows by 54%, not by the 5x the retracted corollary needed.
 
 ## The attribution gap: node times account for roughly a third of graph wall
 
-Summing that sweep over a real 13930-token prefill — chunks at past 0, 2048,
-... 12288, the last one partial — predicts about **1.97 s** of node time. The
-same prefill, served and measured at the endpoint, takes **6.40 s wall of which
-6.36 s is graph** (and 5.80 s / 5.76 s on a second, warmer run). Node times
-account for roughly **31%** of graph wall.
+Summing that sweep over a 13410-token prefill — chunks at past 0, 2048, ...
+12288, the last one partial — predicts **1.88 s** of node time. The same prefill,
+served from **the same process**, spends **6.20 s in the graph**. Node times
+account for **30%** of graph wall.
 
-The direction matters: PERF_COUNT adds per-primitive event overhead, so the
-per-node numbers are an *upper* bound on true kernel time. The gap is therefore
-real rather than an artefact of the profiler being cheap. But the obvious
-explanation does not survive arithmetic either — a chunk executes on the order
-of 1135 nodes, and ~590 ms of unattributed time per chunk would be ~520 us per
-node, one to two orders above any plausible dispatch overhead.
+Same-process matters, and it took fixing a bug to get it (below). The obvious
+objection is that PERF_COUNT slows the run it measures, so the comparison would
+be unfair — but with both sides profiled that objection is controlled, and the
+overhead is small anyway: the identical prefill takes **6.20 s of graph with
+profiling on and 5.76 s with it off, +7.6%**. Profiling overhead accounts for
+almost none of the gap.
+
+Nor does dispatch overhead. A chunk executes on the order of 1135 nodes, and the
+~590 ms unattributed per chunk would be ~520 us per node — one to two orders
+above any plausible launch cost.
 
 **So the instrument disagrees with itself and the disagreement is unexplained.**
 Until it is closed, a node share cannot be converted into a share of served
@@ -352,12 +355,16 @@ terms: 7.4 ms against a ~590 ms gap, so it explains none of the attribution
 problem above. Both readings are kept; `random` is the honest default for any
 future share, and the flag exists so the old captures stay comparable.
 
-**Known limitation found on the way:** `ARCINT_PROFILE=1` and serving cannot be
-combined. `profile_paged` releases lane 0 on the way out and the executor then
-fails to come up with "lane 0 has 0 KV page(s) for 1 token(s)". This is
-pre-existing, it is why the profiler's overhead could not be measured in the
-same process as a served request, and it should be fixed before the attribution
-gap is investigated, because closing that gap needs exactly that comparison.
+**A bug found on the way, and fixed, because the measurement above needed it.**
+`ARCINT_PROFILE=1` and serving could not be combined: bring-up died with "lane 0
+has 0 KV page(s) for 1 token(s)". `profile_paged` borrows lane 0 and releases it
+on every path, `warmup()` runs afterwards and calls `forward()` directly without
+an `ensure_blocks` of its own, and the profiler's own decode-step block had the
+same omission — it ran on whatever pages the sweep loop happened to leave
+behind. Both now acquire their pages explicitly. The first attempt at the fix
+snapshotted the page count on entry and restored it, which did nothing, because
+lane 0 holds **no** pages when the profiler is entered; the restore had to be
+unconditional. The red case is the run above that printed "STILL DOWN".
 
 ## The null-implementation control — is the mechanism itself free?
 

@@ -2511,6 +2511,13 @@ private:
     // get_profiling_info() reports the LAST inference, which is why each phase
     // is run immediately before its table is dumped.
     void profile_paged(Lane& lane) {
+        // The profiler borrows lane 0 and hands its pages back on every path.
+        // warmup() runs after this and calls forward() directly, without an
+        // ensure_blocks of its own, so it relies on lane 0 still holding the
+        // pages the reservation gave it. Leaving the lane empty made
+        // ARCINT_PROFILE and serving mutually exclusive: bring-up died with
+        // "lane 0 has 0 KV page(s) for 1 token(s)". Restore what we borrowed.
+        const size_t pages_on_entry = lane.blocks.size();
         size_t      depth = static_cast<size_t>(std::max(1, prefill_chunk_));
         const char* env   = std::getenv("ARCINT_PROFILE");
         if (env != nullptr && env[0] >= '1' && env[0] <= '9') {
@@ -2664,14 +2671,26 @@ private:
         }
 
         // Then one decode step at depth, which is a 1-token forward with a past
-        // rather than without one.
+        // rather than without one. The sweep above released the lane, so this
+        // needs its own pages rather than inheriting whatever the loop left.
         zero_paged_rows(lane);
+        if (!ensure_blocks(lane, depth + 2)) {
+            log::warn("profile", "not enough KV pages for the decode step at depth %zu", depth);
+            return;
+        }
         paged_forward(lane, embed_paged(lane, make_tokens(depth)), 0, {0}, 0);
         paged_forward(lane, embed_paged(lane, {0}), depth, {0}, 0);
         dump("decode step", 1);
 
         release_lane(lane);
         zero_paged_rows(lane);
+        // Unconditionally, not restoring a snapshot: lane 0 holds no pages when
+        // the profiler is entered, so there is nothing to snapshot, and warmup()
+        // still needs one page for its single-token forward.
+        const size_t want = std::max<size_t>(pages_on_entry * kv_block_tokens_, 2);
+        if (!ensure_blocks(lane, want)) {
+            log::warn("profile", "could not restore lane %d after profiling", lane.index);
+        }
     }
 
     // Per-kernel breakdown of one decode step. Aggregated by (op, kernel) so
