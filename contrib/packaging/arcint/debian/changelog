@@ -1,3 +1,34 @@
+arcint (0.2.10-3) trixie; urgency=medium
+
+  * The tree now says 0.2.10 itself: v0.2.10 was retagged onto the version
+    bump, so the boot line no longer reports 0.2.9 for 0.2.10 code. -2
+    shipped the right code under the wrong self-reported version.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Tue, 01 Sep 2026 01:15:00 +0200
+
+arcint (0.2.10-2) trixie; urgency=medium
+
+  * Rebuild against marfrit-openvino 2026.4.0~dev20260821+p1-1: the strict
+    dependency now names the source-built runtime whose GPU plugin carries
+    patches/0003 (the MoE per-infer subbuffer churn fix). 0.2.10-1 pinned the
+    pre-patch repack and was uninstallable on a +p1 host.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Tue, 01 Sep 2026 00:45:00 +0200
+
+arcint (0.2.10-1) trixie; urgency=medium
+
+  * Second-model review fixes: the USM-host index-tensor map is pruned per
+    request (slow host-memory pin under ARCINT_PA_HOST_INPUTS), embed_take
+    verifies the embeddings output byte-for-byte, the MTP head argmax guards
+    an empty output, and a load-time tripwire refuses an export whose
+    value_cache pages are not the assumed 16 tokens.
+  * ARCINT_PA_HOST_INPUTS (experiment, default off): paged index inputs as
+    USM-host tensors; the measured control for the M=2 host-cost attribution.
+  * patches/0003 documents the GPU plugin's per-infer MoE subbuffer churn at
+    token_num > 1 (the --mtp on loss; fix is plugin-side, not in this package).
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 31 Aug 2026 12:00:00 +0200
+
 arcint (0.2.9-1) trixie; urgency=medium
 
   * /props publishes chat_template_caps in llama.cpp's vocabulary, including
@@ -104,9 +135,9 @@ arcint (0.2.2-1) trixie; urgency=medium
 
 arcint (0.2.1-2) trixie; urgency=medium
 
-  * Rebuild. 0.2.1-1 was built from a a forge-generated archive of the v0.2.1 tag that was
+  * Rebuild. 0.2.1-1 was built from a gitea archive of the v0.2.1 tag that was
     still the pre-tag content: the binary had no --served-model-name and the
-    shipped unit still pointed at %h/.local/bin/arcint. The forge caches generated
+    shipped unit still pointed at %h/.local/bin/arcint. Gitea caches generated
     archives per ref, and the tag had just been moved onto the commit that
     carries 0.2.1's work, so the fetch returned the stale one.
   * A version already published is never reissued with different content, hence
@@ -120,7 +151,7 @@ arcint (0.2.1-1) trixie; urgency=medium
   * --served-model-name NAME: the id this endpoint reports on /v1/models and
     /props. A discovering proxy republishes whatever id it finds there, so
     pinning it to the allowlist name made the allowlist a client-visible API —
-    the swap onto the coder endpoint renamed the endpoint and every caller sending the
+    the swap onto dirac:8080 renamed the endpoint and every caller sending the
     old name got nothing. Presentation only: --model-id remains the artifact
     assertion and still refuses anything outside the allowlist.
   * /v1/models carries the context: n_ctx (what the process is RUNNING with)
@@ -149,6 +180,6 @@ arcint (0.2.0-1) trixie; urgency=medium
     because the runtime is a nightly: a different nightly is a different ABI,
     not an upgrade.
   * The unit ships as a template, not installed: arcint runs as a systemd user
-    unit, and on the GPU host that directory is a git repo owned by roundhouse.
+    unit, and on dirac that directory is a git repo owned by roundhouse.
 
  -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 29 Aug 2026 16:00:00 +0200
