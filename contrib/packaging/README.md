@@ -9,6 +9,11 @@ They are not a supported product. No `.deb` is published anywhere — the built
 packages live in a private fleet repository. What is here is everything needed
 to build the same thing.
 
+Kept in step by hand: every tagged release updates `arcint/build-deb.sh`
+(PKGVER, PKGREL, tarball sha256, the marfrit-openvino pin) and the changelog
+here in the same breath as the fleet copy — a stale recipe is a broken
+instruction, which is the one thing this directory exists to prevent.
+
 ## What is in here
 
     arcint/
