@@ -410,7 +410,7 @@ json props(const Context& ctx) {
         model["arch_hash"]               = maybe_hash(entry->arch_hash);
         model["template_hash"]           = maybe_hash(entry->template_hash);
         model["tokenizer_hash"]          = maybe_hash(entry->tokenizer_hash);
-        // What the Pruefstand says about this artifact (DESIGN.md §3.1: the
+        // What the Prüfstand says about this artifact (DESIGN.md §3.1: the
         // calibration lesson is part of the contract, not folklore).
         model["status"] = entry->status;
         model["weights_bytes_expected"] =

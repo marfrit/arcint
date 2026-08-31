@@ -51,7 +51,7 @@ std::vector<ModelEntry> build_registry() {
         e.template_hash           = "e84f32a23fdda276";
         e.tokenizer_hash          = "87a7830d63fcf43b";
         e.weights_bytes           = 13760293946ull;
-        e.status                  = "production, 10/10 on the Pruefstand (b5 artifact)";
+        e.status                  = "production, 10/10 on the Prüfstand (b5 artifact)";
         e.sampler                 = qwen_card_defaults();
         split_layers(e);
         r.push_back(std::move(e));

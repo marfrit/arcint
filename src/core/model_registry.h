@@ -10,8 +10,9 @@
 // at load time — that is the whole point of the "no model zoo" non-goal.
 //
 // The pinned numbers below are transcribed from models/allowlist-raw.json,
-// which was read off the actual IR directories under /models/ov/ on
-// 2026-08-28, and a test holds the two together. Where the artifacts and the
+// which is read off the actual IR directories under /models/ov/ (first on
+// 2026-08-28, extended as artifacts landed), and a test holds the two
+// together. Where the artifacts and the
 // prose disagree the artifacts win: the console sketch in DESIGN.md §4 quotes
 // "41 GDN + 7 attn layers", and the IRs say 40 layers with one in four full
 // attention.

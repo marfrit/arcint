@@ -11,6 +11,9 @@ __kernel void lgc_permute(__global const INPUT0_TYPE* src, __global OUTPUT0_TYPE
     // out = in.transpose(0,2,1,3)  ->  OUT dims are (IB, IY, IF, IX)
     const uint OF = IY, OY = IF, OX = IX;
 
+    // Indices are named after OUTPUT coordinates: y walks OY (= input F),
+    // f walks OF (= input Y). The in_off below reads in[b][y][f][x], i.e.
+    // input dims (B, F=y, Y=f, X) -- that inversion IS the transpose.
     const uint x  = (uint)get_global_id(0);
     const uint y  = (uint)get_global_id(1);
     const uint bf = (uint)get_global_id(2);

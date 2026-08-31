@@ -2020,6 +2020,27 @@ private:
                 paged_sections_ = static_cast<size_t>(ps[0].get_length());
             }
         }
+        // Tripwire for re-exports: the byte arithmetic below assumes the
+        // plugin's 16-token KV page. The value_cache ports carry that page
+        // count as a bare dimension in every layout we serve (f16, and u8
+        // where only the head dim is padded with scale/zeropoint bytes);
+        // key_cache under u8 pads the token dim itself (16 -> 20), so it is
+        // not checked. A re-export laid out in 32-token pages would carry no
+        // bare 16 here, and dividing by the wrong page size fails confusingly
+        // at decode time rather than loudly at load.
+        for (size_t i = 0; i < kv_pool_shapes_.size(); ++i) {
+            if (kv_pool_names_[i].rfind("value_cache.", 0) != 0) continue;
+            const ov::Shape& sh = kv_pool_shapes_[i];
+            if (std::find(sh.begin() + 1, sh.end(), kv_block_tokens_) == sh.end()) {
+                std::string dims;
+                for (size_t d = 1; d < sh.size(); ++d)
+                    dims += (d > 1 ? "x" : "") + std::to_string(sh[d]);
+                throw std::runtime_error(log::format(
+                    "%s [%s] has no %zu-token page dimension; re-derive kv_block_tokens_ "
+                    "for this export before serving it",
+                    kv_pool_names_[i].c_str(), dims.c_str(), kv_block_tokens_));
+            }
+        }
         kv_bytes_token_ = kv_block_bytes / kv_block_tokens_;
         la_row_bytes_   = 0;
         for (const ov::Shape& sh : la_state_shapes_) {
@@ -2443,8 +2464,8 @@ private:
     //
     // A page is a contiguous slab in each KV pool tensor (shape [pages, ...]),
     // so a run of consecutive page ids is one ROI copy per tensor. The
-    // allocator hands ids out in descending order from its free list, so a
-    // prefix filled in one prefill is a few long runs; after churn it
+    // allocator hands ids out low-id-first, so a prefix filled in one
+    // prefill is a few long ascending runs; after churn it
     // fragments and the copy count grows. Measured, not assumed: the hit line
     // prints the promotion time.
     struct PageRun { int32_t first; size_t count; size_t at; };  // `at`: page index in the entry's order
@@ -2588,6 +2609,10 @@ private:
             }
             lane_.stats = nullptr;
             w.clear();
+            // The USM-host index tensors are keyed by (name, length); lengths
+            // grow with context, so without this the map is a slow monotonic
+            // pin of host memory (one tiny tensor per distinct block count).
+            lane_.host_idx.clear();
         }
         LaneReset(const LaneReset&)            = delete;
         LaneReset& operator=(const LaneReset&) = delete;
@@ -2613,6 +2638,12 @@ private:
         const ov::Tensor src   = lane.embed.get_output_tensor(0);
         const size_t     width = src.get_shape().back();
         ov::Tensor out(ov::element::f32, ov::Shape{n, width});
+        if (src.get_byte_size() != out.get_byte_size()) {
+            throw std::runtime_error(log::format(
+                "embeddings output is %s %zu bytes for %zu tokens, expected f32 %zu",
+                src.get_element_type().get_type_name().c_str(), src.get_byte_size(),
+                n, out.get_byte_size()));
+        }
         std::memcpy(out.data(), src.data(), src.get_byte_size());
         return out;
     }
@@ -3447,9 +3478,11 @@ private:
 
             lane.mtp_head.set_input_tensor(lane.mtp_layer.get_output_tensor(0));
             lane.mtp_head.infer();
-            const ov::Tensor lg = lane.mtp_head.get_output_tensor(0);
-            const size_t     v  = lg.get_shape().back();
-            return Sampler::argmax(lg.data<const float>() + (lg.get_size() / v - 1) * v, v);
+            const ov::Tensor lg   = lane.mtp_head.get_output_tensor(0);
+            const size_t     v    = lg.get_shape().back();
+            const size_t     rows = v ? lg.get_size() / v : 0;
+            if (rows == 0) return -1;
+            return Sampler::argmax(lg.data<const float>() + (rows - 1) * v, v);
         } catch (const std::exception& e) {
             log::warn("mtp", "head failed, disabling it for this process: %s", e.what());
             mtp_ready_ = false;
