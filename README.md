@@ -180,20 +180,32 @@ backend; **[M1]**–**[M5]** mean it runs against the real models on a real card
   layers, so a cache hit restores both halves of the hybrid state exactly.
   **[planned]** the paged KV cache for the attention layers — see the status
   note below, it is now the highest-value thing left.
-- **[M4]** **Speculative decoding** with a hard greedy-invariance guarantee: a
-  drafted token is accepted only when it equals what the sampler would have
-  picked anyway, so the answer is byte-identical to non-speculative greedy.
+- **[M4]** **Speculative decoding.** Verification is exact — a drafted token is
+  accepted only when it equals what the sampler would have picked anyway — but
+  **that does not make the answer identical to plain greedy**, and the
+  distinction matters more than it sounds. A multi-token verify pass and a
+  single-token pass differ by up to 0.013 in the logits on this backend, which
+  can flip a near-tie; measured at about one token in 64. When such a flip lands
+  early, everything after it is a different draw rather than a rewording. On one
+  of three probe tasks the speculative answer was a different and *worse*
+  program (3/8 against 5/8 on an executed harness). Gate it on your own task, and
+  serve without a drafter if you need bit-exact reproducibility.
+
   Two drafters: the **native MTP head** for Qwen3.8 (`--mtp on`, **93.3%
   acceptance**) and a prompt-lookup drafter (`--draft N`) through the
   external-drafter hook. optimum-intel drops the MTP head on export, so
   `tools/export_mtp.py` reconstructs it from the checkpoint's own weights.
-  Both are **off by default and both are currently a net loss**, for one
-  reason: rolling the graph state back costs 66% of decode time. Net of it,
-  MTP is 1.35× faster. Speculative output is *not* guaranteed identical to
-  plain greedy — verification is exact, but a multi-token verify pass and a
-  single-token plain pass differ by up to 0.013 in the logits on this backend,
-  which can flip a near-tie (measured: one token in 64). See DESIGN §3.2 and
-  §3.5.1–3.5.2.
+
+  Both are off by default. On a **stock** OpenVINO build they are a net loss,
+  and the reason turned out not to be the state rollback that was blamed here
+  earlier: at `token_num > 1` the plugin's MoE implementation rebuilt its
+  per-expert mask subbuffers on every inference — 20,480 `create_subbuffer`
+  calls per two-token forward — for a prefill fallback that the batched-GEMV
+  path never reads. `patches/0003` skips them; the verify forward drops from
+  27.3 ms to 18.1 ms with byte-identical output. With that patch **and** an
+  int4 head, the 35B measured 72.9 t/s against ~62 plain on a code prompt.
+  Single-prompt and not yet through the acceptance harness — treat it as a
+  direction. See DESIGN §3.2 and §3.5.1–3.5.2.
 - **[M1]** **Fused SDPA** on the full-attention layers: OpenVINO selects
   `ocl::sdpa::opt` for them on both cards (confirmed in a decode profile).
 - **[M0]** **Tool-call parsing**: native Qwen tool-call output is returned as structured
@@ -320,10 +332,16 @@ holds the IR metadata the allowlist is pinned against.
 
     ./build/arcint --stub --port 8090 -v
 
-`-DARCINT_OPENVINO=ON` is reserved for the executor backend and refuses to
-configure until M1 lands it; meanwhile `--model` is refused at startup rather
-than silently starting something that cannot run, and `--stub` is the only way
-in. `-DARCINT_WERROR=ON` for the warning-clean build CI should use.
+The commands above build the **stub**, which serves the HTTP surface without a
+model and is what the test suite runs against. That is deliberate: `--model` is
+refused at startup rather than silently starting something that cannot run.
+
+**For a build that actually serves a model you want `-DARCINT_OPENVINO=ON`** —
+see *Deploying it* below, which is the configuration in production here. (An
+earlier version of this section said that flag refuses to configure "until M1
+lands it". M1 landed; the sentence did not, and it made the build look broken
+to anyone who followed this section and stopped.) `-DARCINT_WERROR=ON` for the
+warning-clean build CI should use.
 
 ## Deploying it
 
