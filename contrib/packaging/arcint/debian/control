@@ -1,0 +1,24 @@
+Source: arcint
+Section: misc
+Priority: optional
+Maintainer: Markus Fritsche <mfritsche@reauktion.de>
+Build-Depends: cmake (>= 3.20), g++ (>= 13), marfrit-openvino
+Standards-Version: 4.6.2
+Homepage: https://github.com/marfrit/arcint
+
+Package: arcint
+Architecture: amd64
+Depends: ${misc:Depends}, libc6 (>= 2.34), libstdc++6 (>= 13), marfrit-openvino
+Recommends: intel-opencl-icd
+Description: Narrow LLM inference engine for Intel Arc GPUs
+ arcint serves exactly three Qwen models on exactly two Intel Arc cards over an
+ OpenAI-compatible HTTP surface. It owns its scheduler, paged KV cache, GDN
+ ledger, exact prefix cache, speculation and sampling; OpenVINO supplies the
+ compiler and kernels.
+ .
+ LAN use only: no authentication, permissive CORS — the same warning class
+ llama-server prints.
+ .
+ The systemd user unit and its environment file ship as templates in
+ /usr/share/arcint/; copy them to ~/.config/systemd/user/ (on roundhouse hosts,
+ through roundhouse, and commit them).

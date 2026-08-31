@@ -1,0 +1,37 @@
+marfrit-openvino (2026.4.0~dev20260821+p1-1) bookworm trixie; urgency=medium
+
+  * No longer a pure repack: the OpenVINO libraries are now built from source
+    at the same upstream commit the pinned nightly was cut from (71640275,
+    reported by the wheel as 2026.4.0-22849-71640275d29), with the patch series
+    in patches/ applied. The wheels still supply the directory layout, the CMake
+    package, the headers and libopenvino_tokenizers.so.
+  * patches/0003-moe-batched-gemv-expert-mask-subbuffer-churn.patch: the GPU
+    plugin's MoE implementation rebuilt its per-expert mask subbuffers on every
+    inference at token_num > 1 -- 20,480 create_subbuffer calls per two-token
+    forward -- for a prefill fallback the batched-GEMV path never reads. Skipping
+    them below the threshold takes a two-token verify forward from 27.3 ms to
+    18.1 ms with byte-identical output. Not yet offered upstream; patches/README.md
+    carries the measurements and names the two patches deliberately NOT applied.
+  * The runtime reports 2026.4.0-22849-71640275d29-marfrit-p1, so a version
+    string in a log distinguishes this build from the stock nightly. The build
+    number field stays numeric because ov_parse_ci_build_number rejects anything
+    else; the patch level rides in the free-form tail.
+  * Built by hand on x86_64. The packaging CI still cannot produce this target:
+    its only amd64 runner is host execution on musl with no container runtime.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 30 Aug 2026 21:00:00 +0200
+
+marfrit-openvino (2026.4.0~dev20260821-1) bookworm trixie; urgency=medium
+
+  * Initial package. Repacks the upstream OpenVINO nightly wheels
+    (openvino 2026.4.0.dev20260821, openvino-tokenizers 2026.4.0.0.dev20260821,
+    both manylinux_2_28 x86_64) into /usr/lib/marfrit-openvino.
+  * This is the pin arcint's DEVELOPMENT.md asks for. Nightly indexes prune old
+    builds, so a version that only exists as an instruction expires; as a .deb
+    it does not.
+  * Layout is the wheel's own, verbatim: OpenVINOTargets-release.cmake resolves
+    libraries as ${_IMPORT_PREFIX}/openvino/libs/<soname>, so flattening the
+    tree would let find_package succeed and the link fail.
+  * Python bindings are stripped — the fleet consumer is a C++ binary.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 29 Aug 2026 16:00:00 +0200

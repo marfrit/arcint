@@ -1,0 +1,154 @@
+arcint (0.2.9-1) trixie; urgency=medium
+
+  * /props publishes chat_template_caps in llama.cpp's vocabulary, including
+    supports_preserve_reasoning, so a proxy marks arcint-served models as
+    reasoning and discovering clients show their thinking knob.
+  * reasoning_effort is accepted as the template's on/off switch; an explicit
+    chat_template_kwargs.enable_thinking wins when both arrive.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 30 Aug 2026 16:45:00 +0200
+
+arcint (0.2.8-1) trixie; urgency=high
+
+  * reasoning_content. Qwen3.6's template opens the think block in the prompt,
+    so the model's output begins with its reasoning and a bare </think>;
+    arcint returned all of it as content. Everything before the first close
+    now goes to reasoning_content (deltas when streaming), content is the
+    answer, tool-call parsing sees only the answer. enable_thinking:false is
+    unchanged.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 30 Aug 2026 16:10:00 +0200
+
+arcint (0.2.7-1) trixie; urgency=high
+
+  * Tool-using turns 500'd on the agent endpoint ("Can only get item pairs
+    from a mapping"): Qwen3.6's template iterates tool_call.arguments as a
+    mapping, the wire format carries a JSON string, and the conversion between
+    them had been switched off with the polyfills. Arguments now reach the
+    template as the type its own capability flag asks for. Unit-tested,
+    verified against the real template.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 30 Aug 2026 14:20:00 +0200
+
+arcint (0.2.6-1) trixie; urgency=medium
+
+  * --gate-pad N: widen the shared-expert gate so oneDNN dispatches it to a JIT
+    GEMM instead of a reference kernel. -13% prefill wall (3.97 -> 3.45 s at
+    12448 tokens), -5..6% decode from one launched crop per layer on a
+    launch-bound phase, greedy output byte-identical. Off by default; pays off
+    below roughly a 500-token answer per 12k prompt tokens, so a prefill-heavy
+    endpoint (retrieval, tool-call agents) turns it on and never notices the
+    decode price. DESIGN 7.0.2g/i carry the numbers.
+  * The default path is 0.2.5's, unchanged, gated at Prüfstand 10/10.
+  * Profiler: every table now names the capture it is a share of and the
+    counter's failure (under-reports device time ~1.8x, sees no transfers, and
+    at M=1 reported a component larger than its own step). ARCINT_PROFILE_NODES
+    dumps every walked primitive of a decode step.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 30 Aug 2026 12:30:00 +0200
+
+arcint (0.2.5-1) trixie; urgency=medium
+
+  * The logits slice fix. slice_logits_to_last_token cut axis rank-2, which is
+    the token axis on the dense export and a singleton batch axis on the paged
+    one — so on the served path it reported success and did nothing. Every
+    chunk computed and shipped [M, 248320] f32 logits over the bus for rows
+    only the last one ever read.
+  * +27% prefill (5.02 -> 3.97 s at 12448 tokens, 2479 -> 3137 t/s), six
+    142.7 ms device-to-host copies per prefill gone, transfers down from 17.6%
+    to 0.5% of wall, and 2.09 GiB of activation reservation returned.
+  * Prüfstand 10/10 in the service configuration, greedy output byte-identical.
+    Decode unchanged, as it should be.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 30 Aug 2026 09:30:00 +0200
+
+arcint (0.2.4-1) trixie; urgency=medium
+
+  * The reference-FC fallback threshold bisected to (64, 128], its cost sized at
+    1.7-4.6% of prefill, and the fix declined: both diagnostic arms need the
+    same graph surgery the fix needs, and PagedCausalConv1D at 6.3% of both
+    phases is the larger prize.
+  * u8-vs-f16 KV corrected from the deployment side: u8 is not "never slower" on
+    decode at every depth (49.4 against 53.3 t/s at 53.5k), and f16 costs the
+    paged pool's spare prefix-cache pages, which the documentation did not name.
+  * Upstream is now the public repository itself rather than a sanitised export
+    of a private tree; the source URL and pin are unchanged.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 29 Aug 2026 22:50:00 +0200
+
+arcint (0.2.3-1) trixie; urgency=medium
+
+  * --paged-kv u8|f16: KV precision is a deployment choice now, with its price
+    on the record. u8 stays the default because it is the setting that does not
+    refuse — 11.3 KiB/token against 20 is what lets two lanes reach 262144 on a
+    24 GB card. It costs prefill up to 22% at depth, which nobody had measured
+    when it was chosen on decode evidence.
+  * Two hypotheses died against pre-registered criteria and the retractions stay
+    in DESIGN.md: the "invisible two thirds of prefill" was a comparison error,
+    and the reference-FC node is shared_expert_gate, not shared_expert.down_proj.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 29 Aug 2026 20:15:00 +0200
+
+arcint (0.2.2-1) trixie; urgency=medium
+
+  * --served-model-name: the endpoint's advertised id is now presentation, not
+    the allowlist's canonical name. Learned by breaking it — replacing a running
+    endpoint renamed it under a discovering proxy, and every client sending the
+    old name got nothing.
+  * /props carries the context length, which is what a proxy can read when the
+    OpenAI-shaped /v1/models entry has nowhere to put it.
+  * The unit template now installs from CMake; the separate env file is gone.
+    The recipe asserts both rather than copying the file a second time.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 29 Aug 2026 18:30:00 +0200
+
+arcint (0.2.1-2) trixie; urgency=medium
+
+  * Rebuild. 0.2.1-1 was built from a a forge-generated archive of the v0.2.1 tag that was
+    still the pre-tag content: the binary had no --served-model-name and the
+    shipped unit still pointed at %h/.local/bin/arcint. The forge caches generated
+    archives per ref, and the tag had just been moved onto the commit that
+    carries 0.2.1's work, so the fetch returned the stale one.
+  * A version already published is never reissued with different content, hence
+    -2 rather than a re-include of -1.
+  * No source change: same upstream commit c7f84e6, same marfrit-openvino pin.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 29 Aug 2026 18:20:00 +0200
+
+arcint (0.2.1-1) trixie; urgency=medium
+
+  * --served-model-name NAME: the id this endpoint reports on /v1/models and
+    /props. A discovering proxy republishes whatever id it finds there, so
+    pinning it to the allowlist name made the allowlist a client-visible API —
+    the swap onto the coder endpoint renamed the endpoint and every caller sending the
+    old name got nothing. Presentation only: --model-id remains the artifact
+    assertion and still refuses anything outside the allowlist.
+  * /v1/models carries the context: n_ctx (what the process is RUNNING with)
+    and n_ctx_train (the artifact ceiling) as separate fields, plus quant,
+    lanes and canonical_id. The proxy reads the context from this object and
+    asks /props only for template capabilities, so a context published on
+    /props alone reached no client at all.
+  * The shipped unit now starts on a package-only host: ExecStart is
+    /usr/bin/arcint, where this package installs it, not %h/.local/bin/arcint,
+    which is where a source build lands.
+  * The unit carries literal flags and arcint.env is gone with the package.
+    Roundhouse reads port, served name and context out of ExecStart; behind
+    ${ARCINT_PORT} the port board cannot see the port and edit_rollout cannot
+    edit the flags. Also After=default.target: graphical-session.target does
+    not exist in a headless container.
+  * Same marfrit-openvino pin as 0.2.0-1; no runtime rebuild.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 29 Aug 2026 18:40:00 +0200
+
+arcint (0.2.0-1) trixie; urgency=medium
+
+  * amd64 only, and that is not an oversight: the target is Intel Arc via
+    OpenVINO's OpenCL path. Bookworm is not listed either — the binary is built
+    on and for trixie.
+  * Links marfrit-openvino at a pinned version. The dependency is strict (=)
+    because the runtime is a nightly: a different nightly is a different ABI,
+    not an upgrade.
+  * The unit ships as a template, not installed: arcint runs as a systemd user
+    unit, and on the GPU host that directory is a git repo owned by roundhouse.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 29 Aug 2026 16:00:00 +0200

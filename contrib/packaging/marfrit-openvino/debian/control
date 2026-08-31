@@ -1,0 +1,22 @@
+Source: marfrit-openvino
+Section: libs
+Priority: optional
+Maintainer: Markus Fritsche <mfritsche@reauktion.de>
+Standards-Version: 4.6.2
+Homepage: https://github.com/openvinotoolkit/openvino
+
+Package: marfrit-openvino
+Architecture: amd64
+Depends: ${misc:Depends}, libc6 (>= 2.28), libstdc++6, ocl-icd-libopencl1 | libopencl1
+Recommends: intel-opencl-icd
+Description: OpenVINO 2026.4 dev runtime, repacked for the marfrit fleet
+ The exact OpenVINO nightly that arcint is built and measured against,
+ repacked from the upstream wheels into /usr/lib/marfrit-openvino.
+ .
+ Not registered with the dynamic linker on purpose: consumers find these
+ libraries through their own RPATH, so a nightly runtime never shadows a
+ system library for unrelated software.
+ .
+ Ships the CMake package and headers as well, so it is also the build
+ dependency for arcint. The wheel's directory layout is preserved verbatim
+ because the CMake targets resolve libraries relative to it.

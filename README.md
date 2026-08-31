@@ -343,6 +343,12 @@ lands it". M1 landed; the sentence did not, and it made the build look broken
 to anyone who followed this section and stopped.) `-DARCINT_WERROR=ON` for the
 warning-clean build CI should use.
 
+**Packaging.** `contrib/packaging/` holds the Debian recipes this project is
+actually deployed with — including `build-openvino.sh`, which builds the pinned
+OpenVINO with the patch series the measurements above depend on. No `.deb` is
+published anywhere; what is there is everything needed to build the same thing.
+If you only want to reproduce a number, that directory is the shortest path.
+
 ## Deploying it
 
 The installed binary is self-contained: it resolves the OpenVINO runtime and
