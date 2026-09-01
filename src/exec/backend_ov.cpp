@@ -40,7 +40,13 @@
 
 #include <optional>
 #include <unordered_map>
+#include <fstream>
+#include <queue>
+#include <sstream>
+
+#include <nlohmann/json.hpp>
 #include <openvino/openvino.hpp>
+#include <openvino/op/concat.hpp>
 #include <openvino/op/constant.hpp>
 #include <openvino/op/matmul.hpp>
 #include <openvino/op/assign.hpp>
@@ -284,6 +290,49 @@ bool expose_hidden_state(const std::shared_ptr<ov::Model>& model) {
 
     const auto res = std::make_shared<ov::op::v0::Result>(node->input_value(0));
     res->get_output_tensor(0).set_names({"hidden_states"});
+    model->add_results({res});
+    model->validate_nodes_and_infer_types();
+    return true;
+}
+
+// The DFlash2 drafter conditions on the residual stream after target layers
+// {ids}: HF's hidden_states[id+1], which is the value entering layer id+1's
+// input_layernorm. Tap each, concatenate on the hidden axis, expose as one
+// output. Before the logits slice, for the same reason as hidden_states.
+static std::string dflash_read_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.good()) throw std::runtime_error("cannot read " + path);
+    std::ostringstream os;
+    os << in.rdbuf();
+    return os.str();
+}
+
+bool expose_dflash_feats(const std::shared_ptr<ov::Model>& model,
+                         const std::vector<int64_t>& layer_ids) {
+    ov::OutputVector taps;
+    for (int64_t id : layer_ids) {
+        const std::string key =
+            "language_model.layers." + std::to_string(id + 1) + ".input_layernorm";
+        std::shared_ptr<ov::Node> found;
+        for (const auto& op : model->get_ops()) {
+            if (op->get_friendly_name().find(key) == std::string::npos) continue;
+            std::shared_ptr<ov::Node> src = op;
+            for (int hop = 0; hop < 8 && src->get_input_size() > 0 &&
+                              src->get_friendly_name().find(key) != std::string::npos;
+                 ++hop) {
+                src = src->input_value(0).get_node_shared_ptr();
+            }
+            if (src->get_friendly_name().find(key) == std::string::npos) {
+                found = src;
+                break;
+            }
+        }
+        if (!found) return false;
+        taps.push_back(found->output(0));
+    }
+    const auto cat = std::make_shared<ov::op::v0::Concat>(taps, -1);
+    const auto res = std::make_shared<ov::op::v0::Result>(cat);
+    res->get_output_tensor(0).set_names({"dflash_feats"});
     model->add_results({res});
     model->validate_nodes_and_infer_types();
     return true;
@@ -632,6 +681,17 @@ public:
         bool             mtp_has_pending = false;
         size_t           mtp_len = 0;      // positions in the head's KV
         size_t           mtp_pos = 0;      // true position, for rope
+
+        // DFlash2 (docs/dflash-pairing-probe.md). The draft's context KV lives
+        // in dflash_req's graph state and only ever receives ACCEPTED
+        // positions, so it needs no rollback. `dflash_pending` holds accepted
+        // rows' target features not yet fed; `dfeats` is the last forward's
+        // feature output, copied out like `hidden`.
+        ov::InferRequest   dflash_req;
+        ov::InferRequest   dflash_head;
+        ov::Tensor         dfeats;
+        std::vector<float> dflash_pending;
+        size_t             dflash_base = SIZE_MAX;   // abs pos of pending[0]
 
         // The GDN checkpoint rows this lane owns (its own device tensors, not a
         // window into a shared table: a row write copies the whole tensor back,
@@ -1552,6 +1612,7 @@ private:
                 }
             }
         }
+        dflash_reset(lane);
         if (!warm) {
             zero_paged_rows(lane);
             mtp_reset(lane);
@@ -1603,13 +1664,22 @@ private:
             waited                = lane.stall_accum;
             const auto t_fwd      = clock::now();
             const bool       last = past + take == prompt_ids.size();
+            const bool wfeats =
+                dflash_ready_ && past + take + kDflashWindow >= prompt_ids.size();
             const ov::Tensor out =
-                paged_forward(lane, emb, past, {static_cast<int32_t>(c)}, 0, last);
+                paged_forward(lane, emb, past, {static_cast<int32_t>(c)}, 0, last, wfeats);
             stats.prefill_forward_seconds +=
                 seconds_since_tp(t_fwd) - (lane.stall_accum - waited);
             if (last) logits = out;
             if (mtp_ready_) {
                 mtp_prime_paged(lane, lane.hidden, emb, take);
+            }
+            if (dflash_ready_ && wfeats) {
+                const size_t from = prompt_ids.size() > kDflashWindow &&
+                                            past < prompt_ids.size() - kDflashWindow
+                                        ? prompt_ids.size() - kDflashWindow - past
+                                        : 0;
+                dflash_append(lane, from, take - from, past + from);
             }
             past += take;
 
@@ -1692,7 +1762,9 @@ private:
             }
 
             std::vector<int> drafts;
-            if (mtp_ready_ && in.sampler.greedy()) {
+            if (dflash_ready_ && in.sampler.greedy()) {
+                drafts = dflash_draft(lane, next, past);
+            } else if (mtp_ready_ && in.sampler.greedy()) {
                 const int d = mtp_feed(lane, next, true);
                 if (d >= 0) drafts.push_back(d);
             } else if (drafting_.load() && in.sampler.greedy()) {
@@ -1805,6 +1877,9 @@ private:
                 }
                 mtp_set_pending(lane, hid, accepted);
             }
+            // The accepted rows (anchor + accepted drafts) are now context; only
+            // they enter the drafter's state, so there is nothing to roll back.
+            if (dflash_ready_) dflash_append(lane, 0, accepted + 1, past);
 
             c = static_cast<size_t>(la_rows[1 + accepted]);   // promotion
             past += 1 + accepted;
@@ -1875,12 +1950,34 @@ private:
             pm.run_passes(model);
         }
 
-        want_mtp_ = cfg.mtp != "off" && artifact_.has_mtp_head;
+        want_dflash_ = !cfg.dflash.empty();
+        // One drafter per verify loop: an explicit --mtp on + --dflash is a
+        // config error; mtp auto yields to the requested drafter.
+        want_mtp_ = cfg.mtp != "off" && artifact_.has_mtp_head && !want_dflash_;
         if (want_mtp_ && !expose_hidden_state(model)) {
             log::warn("mtp", "%s", "could not expose the hidden state; MTP disabled");
             want_mtp_ = false;
         }
+        if (want_dflash_) {
+            try {
+                const nlohmann::json dcfg =
+                    nlohmann::json::parse(dflash_read_file(cfg.dflash + "/config.json"))
+                        .at("dflash_config");
+                dflash_block_      = dcfg.at("block_size").get<size_t>();
+                dflash_mask_token_ = dcfg.at("mask_token_id").get<int>();
+                dflash_topk_       = dcfg.at("selector_top_k").get<size_t>();
+                std::vector<int64_t> ids = dcfg.at("target_layer_ids").get<std::vector<int64_t>>();
+                if (!expose_dflash_feats(model, ids)) {
+                    throw std::runtime_error("no tap for one of the target layers");
+                }
+            } catch (const std::exception& e) {
+                log::warn("dflash", "cannot wire the drafter, continuing without it: %s",
+                          e.what());
+                want_dflash_ = false;
+            }
+        }
         drafts_max_ = std::max<size_t>(draft_tokens_, want_mtp_ ? 1 : 0);
+        if (want_dflash_) drafts_max_ = std::max(drafts_max_, dflash_block_ - 1);
         rows_per_lane_ = drafts_max_ + 3;
         if (cfg.slice_logits) {
             const int64_t keep = static_cast<int64_t>(1 + drafts_max_);
@@ -1989,6 +2086,48 @@ private:
             }
         } else if (cfg.mtp == "on") {
             log::warn("mtp", "%s", "--mtp on, but this export carries no MTP head");
+        }
+
+        if (want_dflash_) {
+            try {
+                const std::string ddev =
+                    cfg.dflash_device.empty() ? device : cfg.dflash_device;
+                // Plain f16 execution: the export carries the residual-stream
+                // range fixes (a 1/4 fold into the writers and per-norm
+                // pre-scales with eps*pre^2 -- exact rms identities), because
+                // the raw head peaks at ~128k and f16 tops out at 65504. The
+                // GPU-f16 parity gate is cycle-exact with CPU (2026-09-01).
+                dflash_model_ = core_.compile_model(
+                    cfg.dflash + "/openvino_dflash_draft_stateful.xml", ddev);
+                if (artifact_.mtp_lm_head_xml.empty()) {
+                    throw std::runtime_error(
+                        "the drafter scores through the target lm_head and this artifact "
+                        "carries no extracted openvino_mtp_lm_head.xml");
+                }
+                dflash_head_model_ = core_.compile_model(artifact_.mtp_lm_head_xml, ddev);
+                load_dflash_selector(cfg.dflash);
+                for (auto& lane : lanes_) {
+                    lane->dflash_req  = dflash_model_.create_infer_request();
+                    lane->dflash_head = dflash_head_model_.create_infer_request();
+                }
+                // the mask token's embedding, once
+                {
+                    ov::Tensor ids(ov::element::i64, ov::Shape{1, 1});
+                    ids.data<int64_t>()[0] = dflash_mask_token_;
+                    lanes_[0]->embed.set_input_tensor(ids);
+                    lanes_[0]->embed.infer();
+                    const ov::Tensor src = lanes_[0]->embed.get_output_tensor(0);
+                    dflash_mask_embed_ = ov::Tensor(src.get_element_type(), src.get_shape());
+                    std::memcpy(dflash_mask_embed_.data(), src.data(), src.get_byte_size());
+                }
+                dflash_ready_ = true;
+                log::info("dflash", "block-%zu drafter on %s (%zu drafts per verify pass)",
+                          dflash_block_, ddev.c_str(), dflash_block_ - 1);
+            } catch (const std::exception& e) {
+                log::warn("dflash", "could not load the drafter, continuing without it: %s",
+                          e.what());
+                dflash_ready_ = false;
+            }
         }
 
         // ---- ports: state tables and KV pools --------------------------------
@@ -2671,7 +2810,7 @@ private:
     // other lane.
     ov::Tensor paged_forward(Lane& lane, const ov::Tensor& embeds, size_t past,
                              std::vector<int32_t> la_rows, int interval,
-                             bool want_logits = true) {
+                             bool want_logits = true, bool want_feats = true) {
         const size_t n   = embeds.get_shape()[0];
         const size_t tot = past + n;
         const size_t nblk = (tot + kv_block_tokens_ - 1) / kv_block_tokens_;
@@ -2741,6 +2880,9 @@ private:
             lane.req.infer();
             if (want_logits) copy_out(lane.req.get_tensor("logits"), lane.logits);
             if (mtp_ready_) copy_out(lane.req.get_tensor("hidden_states"), lane.hidden);
+            if (dflash_ready_ && want_feats) {
+                copy_out(lane.req.get_tensor("dflash_feats"), lane.dfeats);
+            }
         });
         return lane.logits;
     }
@@ -3490,6 +3632,207 @@ private:
         }
     }
 
+    // ---------------------------------------------------------------- DFlash2
+    //
+    // The drafter's context KV lives in its graph state and only ever receives
+    // accepted positions, so there is nothing to roll back: a rejected block's
+    // K/V never entered the state (the graph computes them per call and the
+    // state append holds context rows only). docs/dflash-pairing-probe.md.
+    void dflash_reset(Lane& lane) {
+        if (!dflash_ready_) return;
+        lane.dflash_req.reset_state();
+        lane.dflash_pending.clear();
+        lane.dflash_base = SIZE_MAX;
+    }
+
+    // Rows [row_from, row_from+rows) of the last forward's feature output
+    // belong to absolute positions [pos, pos+rows) and are now committed
+    // context. A discontinuity means the bookkeeping is wrong, and the honest
+    // reaction is to stop drafting, not to draft from misaligned context.
+    void dflash_append(Lane& lane, size_t row_from, size_t rows, size_t pos) {
+        if (!dflash_ready_ || rows == 0) return;
+        const size_t width = dflash_feat_width_;
+        const size_t have  = lane.dfeats.get_size() / width;
+        if (row_from + rows > have) {
+            log::warn("dflash", "feature output has %zu row(s), needed %zu; disabling",
+                      have, row_from + rows);
+            dflash_ready_ = false;
+            return;
+        }
+        const size_t pend = lane.dflash_pending.size() / width;
+        if (lane.dflash_base == SIZE_MAX) {
+            lane.dflash_base = pos;
+        } else if (lane.dflash_base + pend != pos) {
+            log::warn("dflash", "feature gap: pending ends at %zu, append at %zu; disabling",
+                      lane.dflash_base + pend, pos);
+            dflash_ready_ = false;
+            return;
+        }
+        const float* src = lane.dfeats.data<const float>();
+        lane.dflash_pending.insert(lane.dflash_pending.end(), src + row_from * width,
+                                   src + (row_from + rows) * width);
+        const size_t total = lane.dflash_pending.size() / width;
+        if (total > kDflashWindow) {
+            const size_t drop = total - kDflashWindow;
+            lane.dflash_pending.erase(lane.dflash_pending.begin(),
+                                      lane.dflash_pending.begin() +
+                                          static_cast<long>(drop * width));
+            lane.dflash_base += drop;
+        }
+    }
+
+    // One verification cycle's draft: feed the pending accepted features, run
+    // the block over [anchor, mask x (block-1)], score the draft rows through
+    // the target lm_head, and trace one path with the selector. One turn for
+    // the whole step: three shared compiled models run back to back.
+    std::vector<int> dflash_draft(Lane& lane, int anchor, size_t past) {
+        if (!dflash_ready_) return {};
+        try {
+            const size_t width = dflash_feat_width_;
+            const size_t pend  = lane.dflash_pending.size() / width;
+            if (pend == 0 || lane.dflash_base + pend != past) {
+                log::warn("dflash", "pending context ends at %zu but the anchor sits at %zu; "
+                                    "disabling",
+                          lane.dflash_base == SIZE_MAX ? 0 : lane.dflash_base + pend, past);
+                dflash_ready_ = false;
+                return {};
+            }
+            const size_t q = dflash_block_;
+            const size_t h = dflash_mask_embed_.get_shape().back();
+
+            return with_turn(lane, [&]() -> std::vector<int> {
+                ov::Tensor ids(ov::element::i64, ov::Shape{1, 1});
+                ids.data<int64_t>()[0] = anchor;
+                lane.embed.set_input_tensor(ids);
+                lane.embed.infer();
+                const ov::Tensor ae = lane.embed.get_output_tensor(0);
+
+                ov::Tensor noise(ov::element::f32, ov::Shape{1, q, h});
+                float*     np = noise.data<float>();
+                std::memcpy(np, ae.data(), h * 4);
+                const float* me = dflash_mask_embed_.data<const float>();
+                for (size_t i = 1; i < q; ++i) std::memcpy(np + i * h, me, h * 4);
+
+                ov::Tensor feats(ov::element::f32, ov::Shape{1, pend, width},
+                                 lane.dflash_pending.data());
+                ov::Tensor pos(ov::element::i64, ov::Shape{pend + q});
+                int64_t*   pp = pos.data<int64_t>();
+                for (size_t i = 0; i < pend; ++i) {
+                    pp[i] = static_cast<int64_t>(lane.dflash_base + i);
+                }
+                for (size_t i = 0; i < q; ++i) {
+                    pp[pend + i] = static_cast<int64_t>(past + i);
+                }
+
+                lane.dflash_req.set_tensor("new_feats", feats);
+                lane.dflash_req.set_tensor("noise", noise);
+                lane.dflash_req.set_tensor("positions", pos);
+                lane.dflash_req.infer();
+                const ov::Tensor out = lane.dflash_req.get_output_tensor(0);   // [1,q,h]
+
+                ov::Tensor rows(ov::element::f32, ov::Shape{1, q - 1, h});
+                std::memcpy(rows.data(), out.data<const float>() + h, (q - 1) * h * 4);
+                lane.dflash_head.set_input_tensor(rows);
+                lane.dflash_head.infer();
+                const ov::Tensor lg = lane.dflash_head.get_output_tensor(0);
+
+                std::vector<int> drafts = dflash_select(
+                    rows.data<const float>(), lg.data<const float>(), q - 1, h, anchor);
+                lane.dflash_pending.clear();
+                lane.dflash_base = past;
+                return drafts;
+            });
+        } catch (const std::exception& e) {
+            log::warn("dflash", "draft failed, disabling the drafter: %s", e.what());
+            dflash_ready_ = false;
+            return {};
+        }
+    }
+
+    // The candidate-path selector: top-k tokens per position, one coherent
+    // path traced greedily with the predecessor/successor codebooks.
+    std::vector<int> dflash_select(const float* hid, const float* logits, size_t rows,
+                                   size_t width, int anchor) {
+        const size_t k = dflash_topk_, r = dflash_rank_, vocab = dflash_vocab_;
+        std::vector<int>   path;
+        std::vector<float> hp(r), t(r), unary(k);
+        std::vector<int>   cand(k);
+        int pred = anchor;
+        path.reserve(rows);
+        for (size_t row = 0; row < rows; ++row) {
+            const float* lg = logits + row * vocab;
+            // top-k: min-heap of size k over the vocab
+            using P = std::pair<float, int>;
+            std::priority_queue<P, std::vector<P>, std::greater<P>> heap;
+            for (size_t v = 0; v < vocab; ++v) {
+                if (heap.size() < k) {
+                    heap.emplace(lg[v], static_cast<int>(v));
+                } else if (lg[v] > heap.top().first) {
+                    heap.pop();
+                    heap.emplace(lg[v], static_cast<int>(v));
+                }
+            }
+            for (size_t j = k; j-- > 0;) {
+                unary[j] = heap.top().first;
+                cand[j]  = heap.top().second;
+                heap.pop();
+            }
+            const float* hrow = hid + row * width;
+            for (size_t d = 0; d < r; ++d) {
+                const float* pr  = dflash_proj_.data() + d * width;
+                float        acc = 0.0f;
+                for (size_t x = 0; x < width; ++x) acc += pr[x] * hrow[x];
+                hp[d] = acc;
+            }
+            const ov::float16* pc = dflash_pred_cb_.data() + static_cast<size_t>(pred) * r;
+            for (size_t d = 0; d < r; ++d) t[d] = static_cast<float>(pc[d]) * hp[d];
+            float best  = -std::numeric_limits<float>::infinity();
+            int   bidx  = cand[0];
+            for (size_t j = 0; j < k; ++j) {
+                const ov::float16* sc = dflash_succ_cb_.data() +
+                                        static_cast<size_t>(cand[j]) * r;
+                float score = unary[j];
+                for (size_t d = 0; d < r; ++d) score += t[d] * static_cast<float>(sc[d]);
+                if (score > best) {
+                    best = score;
+                    bidx = cand[j];
+                }
+            }
+            pred = bidx;
+            path.push_back(pred);
+        }
+        return path;
+    }
+
+    void load_dflash_selector(const std::string& dir) {
+        auto read_all = [](const std::string& path) {
+            std::ifstream in(path, std::ios::binary | std::ios::ate);
+            if (!in.good()) throw std::runtime_error("cannot read " + path);
+            const std::streamsize n = in.tellg();
+            in.seekg(0);
+            std::vector<char> buf(static_cast<size_t>(n));
+            in.read(buf.data(), n);
+            return buf;
+        };
+        dflash_feat_width_ = static_cast<size_t>(
+            dflash_model_.input("new_feats").get_partial_shape()[2].get_length());
+        const size_t hidden = dflash_feat_width_ / 5;
+        const auto proj = read_all(dir + "/dflash_hidden_projection.f32.bin");
+        dflash_rank_ = proj.size() / (4 * hidden);
+        dflash_proj_.resize(proj.size() / 4);
+        std::memcpy(dflash_proj_.data(), proj.data(), proj.size());
+        const auto pred = read_all(dir + "/dflash_predecessor_codebook.f16.bin");
+        const auto succ = read_all(dir + "/dflash_successor_codebook.f16.bin");
+        if (pred.size() != succ.size() || pred.size() % (2 * dflash_rank_) != 0) {
+            throw std::runtime_error("selector codebooks disagree about their shape");
+        }
+        dflash_vocab_ = pred.size() / (2 * dflash_rank_);
+        dflash_pred_cb_.resize(pred.size() / 2);
+        dflash_succ_cb_.resize(succ.size() / 2);
+        std::memcpy(dflash_pred_cb_.data(), pred.data(), pred.size());
+        std::memcpy(dflash_succ_cb_.data(), succ.data(), succ.size());
+    }
+
     size_t position_sections() const {
         if (position_sections_ != 0) return position_sections_;
         for (const auto& port : language_.inputs()) {
@@ -3602,6 +3945,23 @@ private:
     // destroyed when speculation turns itself off: with two lanes, one lane's
     // `drafter_.reset()` would free the object the other lane is inside
     // (NgramDrafter::draft only reads, so sharing it is otherwise fine).
+    // ---- DFlash2 drafter state (docs/dflash-pairing-probe.md) ----
+    ov::CompiledModel        dflash_model_;
+    ov::CompiledModel        dflash_head_model_;
+    bool                     want_dflash_      = false;
+    bool                     dflash_ready_     = false;
+    size_t                   dflash_block_     = 8;
+    int                      dflash_mask_token_ = 0;
+    size_t                   dflash_topk_      = 16;
+    size_t                   dflash_rank_      = 0;
+    size_t                   dflash_vocab_     = 0;
+    size_t                   dflash_feat_width_ = 0;
+    static constexpr size_t  kDflashWindow     = 2048;   // the head's sliding window
+    std::vector<float>       dflash_proj_;               // [rank, hidden] f32
+    std::vector<ov::float16> dflash_pred_cb_;            // [vocab, rank]
+    std::vector<ov::float16> dflash_succ_cb_;
+    ov::Tensor               dflash_mask_embed_;
+
     std::unique_ptr<Drafter>       drafter_;
     std::atomic<bool>              drafting_{false};
     size_t                         draft_tokens_ = 0;

@@ -131,6 +131,13 @@ struct Config {
     std::string mtp                       = "auto";  // on | off | auto
     std::string mtp_layer                 = "auto";  // auto | reconstructed | exported
 
+    // DFlash2 block-diffusion drafter (docs/dflash-pairing-probe.md): a
+    // directory holding openvino_dflash_draft_stateful.xml, the selector
+    // sidecars and config.json. Empty = off. Mutually exclusive with an
+    // explicit --mtp on and with --draft N: one drafter per server.
+    std::string dflash;
+    std::string dflash_device;                       // empty = --device
+
     // Speculative decoding through the external-drafter hook (DESIGN.md §3.5).
     // 0 disables it. No export currently carries an MTP head, so the drafter is
     // weightless n-gram lookup; swapping in a head later changes only the

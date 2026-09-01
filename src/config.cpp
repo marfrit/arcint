@@ -134,6 +134,11 @@ std::string usage_text() {
         "  --no-paged                stateful reference path instead of the paged executor\n"
         "  --emb-device DEV          run the embeddings gather elsewhere (default: --device)\n"
         "  --mtp-device DEV          run the MTP head elsewhere (default: --device)\n"
+        "  --dflash DIR              DFlash2 block drafter directory (7 drafts per\n"
+        "                            verify pass; greedy only, like --mtp). One\n"
+        "                            drafter per server: conflicts with --mtp on\n"
+        "                            and --draft N\n"
+        "  --dflash-device DEV       run the drafter elsewhere (default: --device)\n"
         "  --mtp-layer WHICH         auto | reconstructed | exported: which MTP layer graph to\n"
         "                            draft with when the artifact carries both (default: auto,\n"
         "                            the reconstructed one when present)\n"
@@ -308,6 +313,12 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--emb-device") {
             if (!value(v)) return fail("--emb-device needs a device");
             cfg.emb_device = std::string(v);
+        } else if (arg == "--dflash") {
+            if (!value(v)) return fail("--dflash needs a draft-model directory");
+            cfg.dflash = std::string(v);
+        } else if (arg == "--dflash-device") {
+            if (!value(v)) return fail("--dflash-device needs a device");
+            cfg.dflash_device = std::string(v);
         } else if (arg == "--mtp-layer") {
             if (!value(v)) return fail("--mtp-layer needs auto, reconstructed or exported");
             cfg.mtp_layer = std::string(v);
@@ -404,6 +415,12 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     }
     if (cfg.paged_kv != "u8" && cfg.paged_kv != "f16") {
         return fail(log::format("--paged-kv must be u8 or f16, not '%s'", cfg.paged_kv.c_str()));
+    }
+    if (!cfg.dflash.empty() && cfg.mtp == "on") {
+        return fail("--dflash and --mtp on are two drafters for one verify loop; pick one");
+    }
+    if (!cfg.dflash.empty() && cfg.draft_tokens > 0) {
+        return fail("--dflash and --draft are two drafters for one verify loop; pick one");
     }
     if (cfg.kv_dtype != "fp16" && cfg.kv_dtype != "fp32") {
         return fail("--kv-dtype must be fp16 or fp32");

@@ -2490,6 +2490,23 @@ production until the plugin fix ships. The head's remaining cost is host:
 5.05 ms per draft, half of it shape inference over 123 primitives. Full
 readings: docs/moe-m2-path.md.
 
+#### 7.0.2r DFlash2: the external-drafter hook gets a real drafter (2026-09-01)
+
+The public block-diffusion head for the 3.8 went from HF checkpoint to a
+served drafter in one day because every stage had a gate: offline pairing
+probe (3.39/3.76 per cycle against our int4 target, shuffled-features null
+at ~1.1), OV export cycle-exact with the torch reimplementation, GPU-f16
+cycle-exact with CPU after the residual-range fixes (the head peaks at ~128k
+and f16 ends at 65504; exact rms identities — a 1/4 writer fold and per-norm
+pre-scales with eps·pre² — fixed what input scaling and a naive 1/64 fold
+measurably broke), and a serving grid: **44.8 t/s against 24.0 plain and
+33.0 with the MTP head** on the B60 at 3.13 accepted per verify cycle,
+byte-identical across draft placement (same card vs A770; the A770 arm
+trades 5 t/s for 35k tokens of context headroom — 171,904 vs 136,640 with
+the draft resident, 199,712 plain). `--dflash DIR`, one drafter per server,
+greedy-only like the MTP head. Details and the open items:
+docs/dflash-pairing-probe.md.
+
 #### 7.0.2q Serving defaults: the operator layer (2026-09-01)
 
 The MTP drafter engages only under greedy (accept-only-if-equal), so a third

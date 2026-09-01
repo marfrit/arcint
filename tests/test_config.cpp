@@ -317,3 +317,18 @@ TEST(config_chat_template_kwarg_rejects_unknown_keys) {
     CHECK(rejected({"--stub", "--chat-template-kwarg", "enable_thinking=maybe"}));
     CHECK(rejected({"--stub", "--chat-template-kwarg", "enable_thinking"}));
 }
+
+TEST(config_dflash_flags) {
+    Config cfg;
+    CHECK(run({"--stub", "--dflash", "/models/draft", "--dflash-device", "GPU.1"}, cfg).ok);
+    CHECK_EQ(cfg.dflash, std::string("/models/draft"));
+    CHECK_EQ(cfg.dflash_device, std::string("GPU.1"));
+}
+
+TEST(config_one_drafter_per_server) {
+    CHECK(rejected({"--stub", "--dflash", "/d", "--mtp", "on"}));
+    CHECK(rejected({"--stub", "--dflash", "/d", "--draft", "4"}));
+    // mtp auto yields to the requested drafter rather than conflicting
+    Config cfg;
+    CHECK(run({"--stub", "--dflash", "/d"}, cfg).ok);
+}

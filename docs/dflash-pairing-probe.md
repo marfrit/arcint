@@ -62,3 +62,53 @@ acceptance-rule change and explicitly not on the table.
 
 Weights: `dirac:/models/gptq/qwen38-dflash2/` (sha-checked download of the
 HF repo). Probe artifacts: `dirac:/tmp/dflash-{code,prose}.npz`.
+
+## From probe to serving (2026-09-01, same day)
+
+The build: `tools/export_dflash.py` exports the head to OpenVINO twice — a
+stateless graph (the parity instrument) and a stateful one for serving, whose
+per-layer context K/V live in graph state and only ever receive **accepted**
+positions, so the drafter needs no rollback at all. The selector runs on the
+host from raw sidecars; logits go through the artifact's own extracted
+lm_head. arcint wires it as `--dflash DIR` (`--dflash-device` to park it on
+the other card): five residual taps on the paged graph (`dflash_feats`,
+layers 5/19/33/47/61 concatenated), a feature window of 2048 positions, and
+the existing checkpoint-row verify at depth 7.
+
+**The f16 lesson, measured stage by stage:** the head's residual stream
+peaks at ~128k — past f16's 65504 — while its input starts at 0.05, and on
+GPU-f16 the drafter emitted one constant junk token ("$", 0/2800 accepted)
+while CPU (f32) was fine. Input pre-scaling does nothing (the norms
+renormalise it away), and a plain 1/64 fold broke the *first* norm instead
+(the noise embeddings' squares sank below eps: acceptance 3.39 → 2.02 on
+both devices). What works is exact arithmetic, not clamping: fold 1/4 into
+the residual writers (stream peak → 32k, fits f16) and give each norm an
+input pre-scale with eps·pre² — `rms(c·x, c²·eps) ≡ rms(x)` identically —
+×64 for the tiny layer-0 input, ×1/256 for the big stream norms. After
+that, **GPU-f16 is cycle-exact with CPU** (3.28 code / 3.62 prose; the ~3%
+against the torch probe's 3.39/3.76 is f16 re-rounding of folded weights
+flipping near-tie cycles).
+
+## Serving measurements (B60, `qwen38-b7c1-ov` int4, u8 KV, 400 tokens,
+greedy, `--repetition-penalty 1.0`, 32768 ctx unless stated)
+
+| arm | t/s | accept | max ctx (from the reservation) |
+|---|---|---|---|
+| plain (`--mtp off`) | 24.0 | — | 199,712 |
+| MTP head (`--mtp on`) | 33.0 | 76.7% (1 draft/pass) | 155,680 |
+| **DFlash2 int4, same card** | **44.8** | 3.13/cycle (273/896) | **136,640** |
+| DFlash2 int4, draft on A770 | 39.8 | 3.13/cycle | 171,904 |
+
+**+87% over plain and +36% over the MTP head on one card**; the draft costs
+~63k tokens of context headroom there (int4 draft 1.2 GB + feats buffer +
+draft state). Parking the draft on the A770 buys 35k of that back at −5 t/s
+of PCIe round-trips per cycle — and its output is **byte-identical** to the
+same-card arm, so placement is a pure capacity/speed trade. Speculative
+output differs from plain greedy at the documented M>1 near-tie level (the
+same property the MTP head has always had; README's caveat applies
+unchanged — serve without a drafter for bit-exact reproducibility).
+
+Open items, honestly: acceptance under the production thinking template and
+prefix-cache hits (a warm hit starts the drafter with no features for the
+cached prefix) are unmeasured; the drafter is greedy-only by the acceptance
+rule; and the Prüfstand has not scored the dflash arm yet.
