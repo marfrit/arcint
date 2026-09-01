@@ -3017,6 +3017,11 @@ stays as an off-by-default measurement switch.
 - External drafter (dflash-style) for the 3.6 pair: NInfer ships DFlash with
   draft windows up to 15 for exactly this model — evidence the payoff is
   real. Pulled forward to an M4/M5 decision rather than "someday".
+  2026-09-01: for the **3.8**, the pairing is now measured, not hoped —
+  the public DFlash2 head accepts 3.4–3.8 tokens per cycle against our int4
+  artifact in a teacher-forced offline probe with a shuffled-features null
+  control at ~1.1 (docs/dflash-pairing-probe.md). What remains is the build,
+  not the question.
 - KV codec beyond u8/i4: NInfer's int8 group-64 codec with a fused 256-wide
   Hadamard pre-rotation (encode fused into append, decode fused into
   attention), with published AIME/GPQA quality deltas. Recorded as the known
