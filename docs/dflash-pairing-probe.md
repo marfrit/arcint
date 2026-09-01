@@ -112,3 +112,29 @@ Open items, honestly: acceptance under the production thinking template and
 prefix-cache hits (a warm hit starts the drafter with no features for the
 cached prefix) are unmeasured; the drafter is greedy-only by the acceptance
 rule; and the Prüfstand has not scored the dflash arm yet.
+
+## Coexistence on the A770: loads, drafts, and wedges under load (2026-09-01)
+
+Question: coder at 48k context on the A770 with the agent's draft beside it.
+The arithmetic said no (coder at 48k leaves ~0.9 GiB of the card's 15.11;
+the draft package wants ~2.3 — 0.90 GiB int4 draft + 1.27 GiB target
+lm_head + state). The measurement said something more useful, in two parts:
+
+1. **Light traffic works.** Both processes loaded — the reservation
+   arithmetic was pessimistic about what the allocator actually found — and
+   the agent drafted at 39.6 t/s (4.06 accepted/cycle on an easy prompt)
+   while the coder answered beside it.
+2. **Concurrent load wedges both.** A 35k-token coder prefill fired
+   alongside drafted agent generation: neither process ever logged a
+   request line, both curls ran to their 800 s timeouts, and the kernel
+   logged no GPU hang or reset. Both test processes then **ignored
+   SIGTERM** (stuck in driver waits); one kept holding the A770 and took
+   the production coder down with it — its replacement wedged the same way
+   until the zombie was SIGKILLed, after which everything recovered clean.
+
+Verdict: two arcint processes sharing the A770 is load-ordering roulette
+with no failure signal from the kernel, and a hang that outlives SIGTERM.
+The one-process-per-card rule stays; the supported cross-card layout is the
+one measured earlier — draft on a card that is otherwise idle. The int4
+draft's lm_head (1.27 GiB) is the largest movable piece if a shared-card
+variant is ever wanted; it is not wanted now.
