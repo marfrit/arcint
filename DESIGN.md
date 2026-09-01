@@ -2490,6 +2490,32 @@ production until the plugin fix ships. The head's remaining cost is host:
 5.05 ms per draft, half of it shape inference over 123 primitives. Full
 readings: docs/moe-m2-path.md.
 
+#### 7.0.2s Expert offload measured: a fit lever, not a context dial (2026-09-01)
+
+The economic idea is sound — rarely-routed experts do not earn their VRAM,
+and at u8 KV every GiB freed is ~92k tokens of context — and the plugin's
+mechanism for it exists (`OFFLOAD_RATIO`: % of experts on disk, GPU-resident
+LRU slots for the rest, semantics confirmed in `ops/moe.cpp`). The sweep on
+the coder (A770, ratios 0/10/25/50) says the implementation does not deliver
+the trade:
+
+- Any nonzero ratio reports ~1.20 GiB device-resident at load regardless of
+  the ratio, because the OTD slot buffers commit physical memory lazily. The
+  reservation then promises max ctx 1,172,016 — a number that would OOM as
+  the slots fill. arcint now warns at load; set `--n-ctx` explicitly.
+- Decode collapses from ~66 to 1.9–2.3 t/s at every ratio. The runtime's own
+  counters (`MOE_OTD_PERF_LOG=1`, 16-token probe at ratio 10): gpu_hit_rate
+  74% where ~90% capacity should give far more, and the wall time is not
+  disk (27 µs avg, 1.2 s total) but **synchronous host-to-device slot
+  uploads: 309 µs per tensor, 13.1 s of gpu_copy for 16 tokens**.
+
+So `--offload-ratio` today is what M5 used it as — the way a model that does
+not fit runs at all — and not a context-for-VRAM dial. The idea stays on the
+table as plugin work: the upload path wants batching/async prefetch (the
+same pattern Qwen3.8-Flash-Next uses for its host-resident n-gram table) and
+an LRU that actually retains the hot set. Until then, context on a full card
+comes from KV precision and lane budgets, not from expert eviction.
+
 #### 7.0.2r DFlash2: the external-drafter hook gets a real drafter (2026-09-01)
 
 The public block-diffusion head for the 3.8 went from HF checkpoint to a

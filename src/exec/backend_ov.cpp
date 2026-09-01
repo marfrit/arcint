@@ -816,6 +816,16 @@ public:
             log::info("load", "expert offload at %d%%: the plugin keeps that share of the MoE "
                               "expert weights off the card and streams them",
                       offload_ratio_);
+            // Measured 2026-09-01 (DESIGN 7.0.2s): the OTD slot buffers commit
+            // physical memory lazily, so the residency this reservation reads
+            // at load excludes them, and the max-ctx it derives is optimistic
+            // by roughly the resident expert share. And the streaming path
+            // costs ~30x decode on this plugin build. A fit-the-model lever,
+            // not a context-for-VRAM dial.
+            log::warn("load", "%s",
+                      "offload active: the reservation under-counts the expert slot "
+                      "memory (it commits lazily), so the printed max ctx is optimistic "
+                      "-- set --n-ctx explicitly rather than trusting the automatic cap");
         }
         want_mtp_ = cfg.mtp != "off" && artifact.has_mtp_head;
         if (want_mtp_ && !expose_hidden_state(model)) {
