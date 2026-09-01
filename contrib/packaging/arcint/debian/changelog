@@ -1,3 +1,18 @@
+arcint (0.2.12-1) trixie; urgency=medium
+
+  * DFlash2 block-diffusion drafter: --dflash DIR serves the public
+    Qwen3.8-27B draft head through the checkpoint-row verify, seven drafts
+    per pass. Measured on the B60: 44.8 t/s against 24.0 plain and 33.0 with
+    the MTP head; --dflash-device parks the draft on the other card with
+    byte-identical output (39.8 t/s, 35k tokens more context headroom).
+    Greedy-only, one drafter per server. tools/export_dflash.py exports the
+    head with the f16 residual-range identities (the raw head peaks at ~128k,
+    past f16's 65504); the pairing probe and parity instruments ship in
+    tools/.
+  * README reordered: build and measurements first; the DFlash2 grid added.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Mon, 01 Sep 2026 16:00:00 +0200
+
 arcint (0.2.11-1) trixie; urgency=medium
 
   * The operator serving-defaults layer: --temp, --top-p, --top-k,
