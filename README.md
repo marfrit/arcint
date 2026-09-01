@@ -59,7 +59,8 @@ and empty-quoted fields, no trimming). The candidate code is **executed**, not
 read; one point per case. Greedy where the model tolerates it, otherwise the
 model card's own sampling defaults.
 
-Same artifact, same card, only the serving pipeline changes:
+Same artifact (the Qwen3.6-27B-A3B-Coder), same card, only the serving
+pipeline changes:
 
 | engine | card | weights | decode | task |
 |---|---|---|---|---|
