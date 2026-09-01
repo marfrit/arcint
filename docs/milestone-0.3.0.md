@@ -1,4 +1,4 @@
-# 0.3.0 — the extension series (M7–M13)
+# 0.3.0 — the extension series (M7–M14)
 
 0.2.x closed the correctness line: M0–M6 are done, the engine serves two cards,
 the gates in DESIGN §5 hold, and every number in DESIGN §7 names its card and
@@ -51,6 +51,7 @@ patch.
 | `--cpu-moe`, tensor overrides, hybrid offload strategy | M9 |
 | SOTA sub-4-bit quants (IQ_K, trellis), custom quant mixes | M10 |
 | ngram/suffix self-speculation, DFlash, MTP | M11 (MTP/DFlash already served in 0.2.x) |
+| iqk AVX2/AVX-512 GEMM kernels (150–350% CPU prompt speedup vs upstream) | M14 |
 | fused MoE FFN (`-fmoe`) | M12 (exporter lowering so `fuse_moe_experts` fires) |
 | — (llama.cpp: `--no-mmproj-offload`) | M13 |
 | MLA/FlashMLA, Bitnet, tensor parallel, sampler zoo | deliberately excluded (below) |
@@ -66,10 +67,13 @@ patch.
 | M11 | **Drafting II: trees from marginals** — a Weaver-class conditional re-ranker (~57M adapter, top-K-restricted, trained per the TfM recipe) over the served DFlash2 head; upstream PA tree-mask (2026.2) for the attention layers; a GDN tree-verify (masked triangular solve over the ancestor partial order) as a plugin patch — **the state is never speculatively written; the accepted path is replayed at commit**, which is the invariant our chain integration already holds; an ngram/suffix table drafter for the drafter-less endpoints | Chain re-rank first: tokens/verify-cycle > the measured 3.13 (B60, int4, block 8) at byte-exact greedy equivalence; tree path after: τ and t/s vs chain on the same card, or a documented negative with the profile. Also closes the 0.2.x leftovers: acceptance under the thinking template and under prefix-cache hits, and a Prüfstand run with the drafter on |
 | M12 | **Host-loop and exporter** — pin the dispatch thread; lower the exporter's MoE to the per-expert pattern upstream `fuse_moe_experts` matches, so the fused path (and upstream's batched-MoE decode work) applies to our IRs | `fuse_moe_experts` proven to fire on an exported IR (graph dump); M=2 verify host cost re-measured against DESIGN §7.0.2p's numbers; per-cycle host ms delta named |
 | M13 | **Vision projector disabled** — load the `*ForConditionalGeneration` IRs with the vision tower and projector excluded (they are in every checkpoint we serve); reserve `--vision` for later; pay zero VRAM for the modality we don't serve | Multimodal IR loads with vision excluded; text path byte-identical to the text-only export; VRAM delta of the excluded tower measured; request parser still rejects image parts explicitly |
+| M14 | **CPU compute tier** — kernels vendored from a license-compatible high-performance CPU engine (candidate of record: ik_llama.cpp's iqk GEMM/GEMV kernels, MIT — compatible with this repository's Apache-2.0 under the `THIRD_PARTY.md` convention), tuned for the Zen 3 host class (Ryzen 7 5700X: 8C/16T, AVX2+FMA3, **no** AVX-512 and no AVX-VNNI, so the int8 path is the `maddubs` AVX2 one, not `HAVE_FANCY_SIMD`; 32 MiB L3; dual-channel DDR4 ≈ 50 GB/s ceiling). Primary use: **offloaded expert FFNs computed in place on the host** — the `--n-cpu-moe` analog — so M9's spill class stops crossing the bus at all; secondary: a full-CPU fallback engine for drafter-less and card-down operation. Ties into M10: the iqk kernels natively compute the K-quant/IQ_K sub-4-bit formats a mixed artifact would store | Expert-FFN-on-host beats M9's upload path on the same 35B ratio-20 config (per-token expert compute vs measured 309 µs/tensor uploads, profile recorded); full-CPU Prüfstand 10/10 on one model with t/s reported against the DDR4 bandwidth ceiling, not against GPU numbers; vendored files land in `third_party/` with license and version pinned in `THIRD_PARTY.md` |
 
 Ordering intent, not a promise: M7 and M12 first (they make every later
 measurement honest and cheaper), M8/M9 next (memory levers), M10/M11 after
-(they consume the levers), M13 whenever an export forces the question.
+(they consume the levers), M14 alongside M9/M10 (it is the other half of the
+expert-placement question and shares M10's quant formats), M13 whenever an
+export forces the question.
 
 ## Deliberate exclusions
 
@@ -90,4 +94,8 @@ making it a context dial after all), the enqueue-bound follow-ups (M12), the
 DFlash serving leftovers and the Trees-from-Marginals result (M11,
 arXiv:2607.06763), and the fit/deferred-commit/replay, asymmetric-KV,
 FFN-offload, projector-disable and LRU techniques surveyed from the
-llama.cpp/ollama fitting work and ik_llama.cpp (M7–M9, M13).
+llama.cpp/ollama fitting work and ik_llama.cpp (M7–M9, M13). M14 vendors
+rather than reinvents: the donor must be license-compatible (MIT and
+Apache-2.0 both qualify; ik_llama.cpp is MIT, copyright ggml/llama.cpp/
+ik_llama.cpp authors), carried under the existing `THIRD_PARTY.md` rules with
+licenses unchanged.

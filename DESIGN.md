@@ -1413,10 +1413,10 @@ and owns the state.
 
 ## 7. Milestones
 
-The 0.3.0 extension series (M7–M13: auto-fit, asymmetric KV, expert-offload
+The 0.3.0 extension series (M7–M14: auto-fit, asymmetric KV, expert-offload
 v2, sub-4-bit experts, tree drafting, exporter lowering, projector-off
-loading) is planned in `docs/milestone-0.3.0.md`; milestones join this table
-as they close.
+loading, a vendored CPU compute tier) is planned in
+`docs/milestone-0.3.0.md`; milestones join this table as they close.
 
 | # | milestone | exit criterion | state |
 |---|---|---|---|
