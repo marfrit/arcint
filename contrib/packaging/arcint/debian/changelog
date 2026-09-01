@@ -1,3 +1,20 @@
+arcint (0.2.11-1) trixie; urgency=medium
+
+  * The operator serving-defaults layer: --temp, --top-p, --top-k,
+    --repetition-penalty, --presence-penalty and
+    --chat-template-kwarg enable_thinking=BOOL. Precedence request > flags >
+    artifact > family card, each layer overriding only what it sets; any
+    sampler flag turns /props' sampler_defaults.provenance to "operator".
+    Validation is shared with the request path, so a bad flag refuses at boot
+    with the wording a client would get at 400.
+  * The performance regime is visible per response:
+    usage.completion_tokens_details carries accepted/rejected_prediction_tokens,
+    so a caller can see whether speculation engaged instead of reading the log.
+  * presence_penalty is now read from the artifact's generation_config.json
+    (implemented and request-settable, but silently dropped on load).
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Mon, 01 Sep 2026 08:30:00 +0200
+
 arcint (0.2.10-3) trixie; urgency=medium
 
   * The tree now says 0.2.10 itself: v0.2.10 was retagged onto the version
