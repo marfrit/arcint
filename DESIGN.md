@@ -3061,3 +3061,20 @@ stays as an off-by-default measurement switch.
   host RAM for longer-lived prefix reuse): NInfer does device/host state
   retention; on our PCIe x4 A770 the win is unproven. Measure before
   building.
+- **The hybrid-state transfer contract** (noted 2026-09-01, from the
+  GLM-5.3-Flash release): the industry has converged on this repo's model
+  class and its problem set. GLM-5.3-Flash is a 320B-A18B MoE with the same
+  1-in-4 hybrid layout (34 of 45 layers linear attention, KDA — the same
+  delta-rule family as GDN), an MTP draft layer in the checkpoint, and a
+  community DFlash2 drafter (block 8, 7 drafts, 74.1% acceptance, 2.15x over
+  MTP-4) — our 3.8 result reproduced independently on a different model.
+  Z.ai serves it behind a separated Encode–Prefill–Decode architecture, and
+  both SGLang and vLLM disaggregate prefill from decode by transferring the
+  *pair* — paged KV plus the KDA recurrent state — between pools; vLLM makes
+  the state-layout compatibility an explicit pinned contract
+  (`VLLM_SSM_CONV_STATE_LAYOUT`, `VLLM_KV_CACHE_LAYOUT`) checked on both
+  sides. Multi-GPU disaggregation stays a non-goal here, but our prefix
+  cache's snapshot blob is the same pair in miniature: if that state ever
+  crosses a process boundary (host-tier sharing, a warm handover), the
+  layout-pinning assertion is the piece to copy — a declared, checkable
+  contract rather than an assumed byte layout.
