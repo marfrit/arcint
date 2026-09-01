@@ -50,6 +50,12 @@ struct SamplerOverrides {
 
 SamplerParams sampler_from_defaults(const SamplerDefaults& d);
 
+// The operator layer (config flags): overrides only the fields it sets and
+// marks the defaults' provenance "operator". Same validation as a request,
+// so an out-of-range flag fails at boot with the same message a client would
+// get at 400.
+std::optional<std::string> sampler_defaults_apply(SamplerDefaults& d, const SamplerOverrides& o);
+
 // Applies the overrides in place. Returns an error message when a field is out
 // of range, in which case `p` is left untouched.
 std::optional<std::string> sampler_apply(SamplerParams& p, const SamplerOverrides& o);

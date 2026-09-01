@@ -184,6 +184,10 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out) 
             a.generation["repetition_penalty"].is_number()) {
             a.sampler.repetition_penalty = a.generation["repetition_penalty"].get<float>();
         }
+        if (a.generation.contains("presence_penalty") &&
+            a.generation["presence_penalty"].is_number()) {
+            a.sampler.presence_penalty = a.generation["presence_penalty"].get<float>();
+        }
         a.sampler.provenance = "artifact";
     }
     if (a.eos_ids.empty()) collect_eos(tc, a.eos_ids);

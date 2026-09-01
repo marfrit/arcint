@@ -1,5 +1,7 @@
 #include "config.h"
 
+#include "core/sampling.h"
+
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -92,6 +94,20 @@ std::string usage_text() {
         "                            over the link on a hit (default: 0, off). DESIGN 4.4.\n"
         "  --kv-pool-pages N         cap the KV pool at N pages (default: 0, sized by memory).\n"
         "                            A test knob: the way to make the cache evict on demand.\n"
+        "\n"
+        "serving defaults (the operator layer: request > these > artifact > family card;\n"
+        "any of them flips the served sampler provenance to 'operator')\n"
+        "  --temp X                  default temperature (0 = greedy, which is also what\n"
+        "                            lets the MTP drafter engage)\n"
+        "  --top-p X                 default nucleus mass\n"
+        "  --top-k N                 default top-k (0 disables)\n"
+        "  --repetition-penalty X    default repetition penalty\n"
+        "  --presence-penalty X      default presence penalty\n"
+        "  --chat-template-kwarg enable_thinking=BOOL\n"
+        "                            template default when the request sends neither\n"
+        "                            chat_template_kwargs.enable_thinking nor\n"
+        "                            reasoning_effort; only enable_thinking exists\n"
+        "\n"
         "  --gate-pad N              widen the shared-expert gate to N columns (default: 0,\n"
         "                            off). 16 is the measured setting: -13% prefill wall,\n"
         "                            -5% decode; pays off below ~500 answer tokens per 12k\n"
@@ -189,6 +205,44 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.cache_host_mib)) return fail("--cache-host-mib needs an integer");
         } else if (arg == "--kv-pool-pages") {
             if (!value(v) || !parse_int(v, cfg.kv_pool_pages)) return fail("--kv-pool-pages needs an integer");
+        } else if (arg == "--temp") {
+            double d = 0.0;
+            if (!value(v) || !parse_double(v, d)) return fail("--temp needs a number");
+            cfg.temp = static_cast<float>(d);
+        } else if (arg == "--top-p") {
+            double d = 0.0;
+            if (!value(v) || !parse_double(v, d)) return fail("--top-p needs a number");
+            cfg.top_p = static_cast<float>(d);
+        } else if (arg == "--top-k") {
+            int k = 0;
+            if (!value(v) || !parse_int(v, k)) return fail("--top-k needs an integer");
+            cfg.top_k = k;
+        } else if (arg == "--repetition-penalty") {
+            double d = 0.0;
+            if (!value(v) || !parse_double(v, d)) return fail("--repetition-penalty needs a number");
+            cfg.repetition_penalty = static_cast<float>(d);
+        } else if (arg == "--presence-penalty") {
+            double d = 0.0;
+            if (!value(v) || !parse_double(v, d)) return fail("--presence-penalty needs a number");
+            cfg.presence_penalty = static_cast<float>(d);
+        } else if (arg == "--chat-template-kwarg") {
+            if (!value(v)) return fail("--chat-template-kwarg needs key=value");
+            const std::string_view kv = v;
+            const size_t           eq = kv.find('=');
+            if (eq == std::string_view::npos) return fail("--chat-template-kwarg needs key=value");
+            const std::string_view key = kv.substr(0, eq);
+            const std::string_view val = kv.substr(eq + 1);
+            if (key != "enable_thinking") {
+                return fail("--chat-template-kwarg understands only enable_thinking; an "
+                            "accepted-but-ignored key would be a lie");
+            }
+            if (val == "true" || val == "1") {
+                cfg.think_default = true;
+            } else if (val == "false" || val == "0") {
+                cfg.think_default = false;
+            } else {
+                return fail("--chat-template-kwarg enable_thinking needs true or false");
+            }
         } else if (arg == "--gate-pad") {
             if (!value(v) || !parse_int(v, cfg.gate_pad)) return fail("--gate-pad needs an integer");
         } else if (arg == "--paged-kv") {
@@ -394,6 +448,16 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     }
 
     return {};
+}
+
+std::optional<std::string> apply_operator_defaults(const Config& cfg, SamplerDefaults& d) {
+    SamplerOverrides o;
+    o.temperature        = cfg.temp;
+    o.top_p              = cfg.top_p;
+    o.top_k              = cfg.top_k;
+    o.repetition_penalty = cfg.repetition_penalty;
+    o.presence_penalty   = cfg.presence_penalty;
+    return sampler_defaults_apply(d, o);
 }
 
 }  // namespace lgc

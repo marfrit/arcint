@@ -35,9 +35,17 @@ std::string next_id(const char* prefix) {
 int64_t now_seconds() { return static_cast<int64_t>(std::time(nullptr)); }
 
 json usage_json(const GenerationStats& s) {
+    // The draft counters say which performance regime this request actually
+    // got: speculation engages only under greedy, and without these numbers
+    // the only signal is a line in the server log the caller cannot see
+    // (sampler-defaults order, 2026-09-01). OpenAI's own field names, so SDKs
+    // that model completion_tokens_details keep parsing.
     return json{{"prompt_tokens", s.prompt_tokens},
                 {"completion_tokens", s.completion_tokens},
-                {"total_tokens", s.prompt_tokens + s.completion_tokens}};
+                {"total_tokens", s.prompt_tokens + s.completion_tokens},
+                {"completion_tokens_details",
+                 {{"accepted_prediction_tokens", s.draft_accepted},
+                  {"rejected_prediction_tokens", s.draft_proposed - s.draft_accepted}}}};
 }
 
 // `with_index` adds the per-call index. A streaming delta requires it (the
@@ -487,6 +495,14 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
 
     PreparedChat prep;
     prep.req = std::move(req);
+
+    // The operator's template default. Applied only when the request said
+    // nothing itself (neither chat_template_kwargs.enable_thinking nor
+    // reasoning_effort), so a request always wins.
+    if (!prep.req.has_enable_thinking && ctx.cfg->think_default) {
+        prep.req.enable_thinking     = *ctx.cfg->think_default;
+        prep.req.has_enable_thinking = true;
+    }
 
     // §3.7: only parse tool-call syntax when the request actually declared
     // tools. Otherwise the raw text goes back untouched.

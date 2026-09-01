@@ -22,7 +22,7 @@ LOG="${WORK}/server.log"
 
 cleanup() {
   local pid
-  for pid in "${SRV_PID:-}" "${CANCEL_PID:-}" "${ALIAS_PID:-}"; do
+  for pid in "${SRV_PID:-}" "${CANCEL_PID:-}" "${ALIAS_PID:-}" "${OP_PID:-}"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null
       wait "$pid" 2>/dev/null
@@ -397,6 +397,36 @@ grep -q "serving 'qwen3.6-coder'" "$ALIAS_LOG"
 check "the console says which name is served" $?
 
 kill -TERM "$ALIAS_PID" 2>/dev/null; wait "$ALIAS_PID" 2>/dev/null; ALIAS_PID=""
+
+# ------------------------------------------------- operator serving defaults
+# A third server, because the operator layer is fixed at startup. What is
+# being gated: the flags override only what they set, /props says the regime
+# came from the operator, and the usage block carries the draft counters that
+# tell a caller which performance regime its request actually got.
+OP_PORT=$((PORT + 4))
+OP_LOG="${WORK}/op.log"
+"$BIN" --stub --host 127.0.0.1 --port "$OP_PORT" --n-ctx 4096 \
+       --temp 0 --chat-template-kwarg enable_thinking=false >"$OP_LOG" 2>&1 &
+OP_PID=$!
+OP_BASE="http://127.0.0.1:${OP_PORT}"
+for _ in $(seq 1 100); do
+  curl -fsS "${OP_BASE}/health" -o /dev/null 2>/dev/null && break
+  kill -0 "$OP_PID" 2>/dev/null || { echo "operator server died:"; tail -20 "$OP_LOG"; break; }
+  sleep 0.1
+done
+
+curl -sS "${OP_BASE}/props" -o "${WORK}/op-props.json"
+jassert "${WORK}/op-props.json" 'd["sampler_defaults"]["temperature"]==0 and d["sampler_defaults"]["provenance"]=="operator"'
+check "--temp 0 flips the served default and its provenance to operator" $?
+jassert "${WORK}/op-props.json" 'd["sampler_defaults"]["top_k"]==20'
+check "flags override only what they set" $?
+
+curl -sS "${OP_BASE}/v1/chat/completions" -H 'Content-Type: application/json' \
+     -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":8}' -o "${WORK}/op-chat.json"
+jassert "${WORK}/op-chat.json" '"accepted_prediction_tokens" in d["usage"]["completion_tokens_details"] and "rejected_prediction_tokens" in d["usage"]["completion_tokens_details"]'
+check "usage says which regime the request got (draft counters present)" $?
+
+kill -TERM "$OP_PID" 2>/dev/null; wait "$OP_PID" 2>/dev/null; OP_PID=""
 
 # The allowlist assertion is a separate knob and must not have moved: a wrong
 # artifact is still refused, whatever the endpoint is called.

@@ -272,3 +272,48 @@ TEST(config_mtp_layer_choice) {
     }
     CHECK(rejected({"--stub", "--mtp-layer", "intel"}));
 }
+
+TEST(config_operator_sampler_flags) {
+    Config cfg;
+    CHECK(run({"--stub", "--temp", "0", "--top-p", "0.9", "--top-k", "40",
+               "--repetition-penalty", "1.0", "--presence-penalty", "1.5"}, cfg).ok);
+    CHECK(cfg.temp && *cfg.temp == 0.0f);
+    CHECK(cfg.top_p && *cfg.top_p == 0.9f);
+    CHECK(cfg.top_k && *cfg.top_k == 40);
+    CHECK(cfg.repetition_penalty && *cfg.repetition_penalty == 1.0f);
+    CHECK(cfg.presence_penalty && *cfg.presence_penalty == 1.5f);
+}
+
+TEST(config_operator_flags_default_unset) {
+    Config cfg;
+    CHECK(run({"--stub"}, cfg).ok);
+    CHECK(!cfg.temp);
+    CHECK(!cfg.top_p);
+    CHECK(!cfg.top_k);
+    CHECK(!cfg.repetition_penalty);
+    CHECK(!cfg.presence_penalty);
+    CHECK(!cfg.think_default);
+}
+
+TEST(config_operator_flags_reject_garbage) {
+    CHECK(rejected({"--stub", "--temp", "warm"}));
+    CHECK(rejected({"--stub", "--top-k", "many"}));
+    CHECK(rejected({"--stub", "--temp"}));
+}
+
+TEST(config_chat_template_kwarg) {
+    Config cfg;
+    CHECK(run({"--stub", "--chat-template-kwarg", "enable_thinking=false"}, cfg).ok);
+    CHECK(cfg.think_default && *cfg.think_default == false);
+    Config cfg2;
+    CHECK(run({"--stub", "--chat-template-kwarg", "enable_thinking=true"}, cfg2).ok);
+    CHECK(cfg2.think_default && *cfg2.think_default == true);
+}
+
+TEST(config_chat_template_kwarg_rejects_unknown_keys) {
+    // Only enable_thinking exists in the render path; accepting another key
+    // and ignoring it would be a lie.
+    CHECK(rejected({"--stub", "--chat-template-kwarg", "add_generation_prompt=false"}));
+    CHECK(rejected({"--stub", "--chat-template-kwarg", "enable_thinking=maybe"}));
+    CHECK(rejected({"--stub", "--chat-template-kwarg", "enable_thinking"}));
+}

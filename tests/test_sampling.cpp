@@ -107,3 +107,34 @@ TEST(sampling_overrides_any) {
     o.top_k = 5;
     CHECK(o.any());
 }
+
+TEST(sampling_operator_layer_overrides_only_what_it_sets) {
+    SamplerDefaults d;  // family-card values, provenance "provisional"
+    d.temperature = 0.7f;
+    d.top_p       = 0.8f;
+    d.top_k       = 20;
+    d.provenance  = "artifact";
+
+    SamplerOverrides o;
+    o.temperature = 0.0f;
+    CHECK(!sampler_defaults_apply(d, o));
+    CHECK_NEAR(d.temperature, 0.0, 1e-6);
+    CHECK_NEAR(d.top_p, 0.8, 1e-6);  // untouched
+    CHECK_EQ(d.top_k, 20);           // untouched
+    CHECK_EQ(d.provenance, std::string("operator"));
+}
+
+TEST(sampling_operator_layer_without_flags_changes_nothing) {
+    SamplerDefaults d;
+    d.provenance = "artifact";
+    SamplerOverrides o;  // no flags set
+    CHECK(!sampler_defaults_apply(d, o));
+    CHECK_EQ(d.provenance, std::string("artifact"));
+}
+
+TEST(sampling_operator_layer_validates_like_a_request) {
+    SamplerDefaults  d;
+    SamplerOverrides o;
+    o.temperature = 3.0f;  // out of [0, 2], same rule a request gets
+    CHECK(sampler_defaults_apply(d, o).has_value());
+}

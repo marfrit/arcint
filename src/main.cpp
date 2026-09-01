@@ -71,7 +71,12 @@ int main(int argc, char** argv) {
             n_ctx        = entry->n_ctx_train > 0 ? entry->n_ctx_train : kStubDefaultNCtx;
             n_ctx_source = entry->n_ctx_train > 0 ? "allowlist" : "stub fallback";
         }
-        backend = lgc::make_stub_backend(*entry, cfg.quant, n_ctx, cfg.stub_delay_ms,
+        lgc::ModelEntry stub_entry = *entry;
+        if (auto err = lgc::apply_operator_defaults(cfg, stub_entry.sampler)) {
+            lgc::log::error("boot", "%s", err->c_str());
+            return 2;
+        }
+        backend = lgc::make_stub_backend(stub_entry, cfg.quant, n_ctx, cfg.stub_delay_ms,
                                          cfg.served_model_name);
 
         lgc::log::warn("boot", "%s",
@@ -122,6 +127,10 @@ int main(int argc, char** argv) {
                        artifact.n_attn_layer,
                        lgc::text::human_bytes(artifact.weights_bytes).c_str(),
                        entry->status.c_str());
+        if (auto err = lgc::apply_operator_defaults(cfg, artifact.sampler)) {
+            lgc::log::error("boot", "%s", err->c_str());
+            return 2;
+        }
         lgc::log::info("load", "sampler defaults from %s: temp %.2f top_p %.2f top_k %d",
                        artifact.sampler.provenance.c_str(), artifact.sampler.temperature,
                        artifact.sampler.top_p, artifact.sampler.top_k);

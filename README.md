@@ -203,7 +203,9 @@ backend; **[M1]**–**[M5]** mean it runs against the real models on a real card
   calls per two-token forward — for a prefill fallback that the batched-GEMV
   path never reads. `patches/0003` skips them; the verify forward drops from
   27.3 ms to 18.1 ms with byte-identical output. With that patch **and** an
-  int4 head, the 35B measured 72.9 t/s against ~62 plain on a code prompt.
+  int4 head, the 35B measured 72.9 t/s greedy against ~62 plain on a code prompt
+  (speculation only engages under greedy: a drafted token is accepted only if
+  it equals the sampler's pick, so a sampled request runs at the plain rate).
   Single-prompt and not yet through the acceptance harness — treat it as a
   direction. See DESIGN §3.2 and §3.5.1–3.5.2.
 - **[M1]** **Fused SDPA** on the full-attention layers: OpenVINO selects

@@ -2490,6 +2490,35 @@ production until the plugin fix ships. The head's remaining cost is host:
 5.05 ms per draft, half of it shape inference over 123 primitives. Full
 readings: docs/moe-m2-path.md.
 
+#### 7.0.2q Serving defaults: the operator layer (2026-09-01)
+
+The MTP drafter engages only under greedy (accept-only-if-equal), so a third
+of the throughput on a speculating endpoint depended on whether the caller
+happened to send `temperature: 0` — measured 36.2 against 24.2 t/s on the
+same server, same prompt. The chain had three layers (family card → artifact
+→ request) and the missing one was the operator: the workaround in the field
+was editing an allowlisted artifact's `generation_config.json`, which flips
+the served provenance to "artifact" for what is an operator preference.
+
+Resolution: flags, not a file — `--temp`, `--top-p`, `--top-k`,
+`--repetition-penalty`, `--presence-penalty`, and
+`--chat-template-kwarg enable_thinking=BOOL`. Precedence request > flags >
+artifact > family card, each layer overriding only what it sets; any sampler
+flag turns `/props`' `sampler_defaults.provenance` to `"operator"`;
+validation is shared with the request path, so an out-of-range flag refuses
+at boot with the wording a client would get at 400. No `--min-p`, because the
+sampler does not implement `min_p` and a flag for an unimplemented knob would
+be a lie; `--chat-template-kwarg` rejects every key but `enable_thinking` for
+the same reason. `presence_penalty` is now also read from the artifact's
+`generation_config.json` (it was implemented, request-settable, and silently
+dropped on load — an oversight, mirrored in).
+
+The regime is also visible per response now: `usage.completion_tokens_details`
+carries `accepted_prediction_tokens` / `rejected_prediction_tokens` (OpenAI's
+own field names), so a caller paying 24 t/s on a 36 t/s server can see the
+zeros instead of inferring them from a log line it cannot read. The MTP
+acceptance rule itself is untouched.
+
 #### 7.0.2b The XMX question cannot be decided from the profile
 
 The proposed five-minute check — grep a `ARCINT_PROFILE` for `dpas`/systolic

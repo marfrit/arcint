@@ -19,9 +19,11 @@ SamplerParams sampler_from_defaults(const SamplerDefaults& d) {
     return p;
 }
 
-std::optional<std::string> sampler_apply(SamplerParams& p, const SamplerOverrides& o) {
-    // Validate everything before mutating, so a rejected request cannot leave a
-    // half-applied sampler behind.
+namespace {
+
+// Shared between the request path and the operator-flag path: one source of
+// range truth, one wording for the refusal.
+std::optional<std::string> sampler_validate(const SamplerOverrides& o) {
     if (o.temperature && (*o.temperature < 0.0f || *o.temperature > 2.0f)) {
         return log::format("temperature must be in [0, 2], got %g", *o.temperature);
     }
@@ -43,6 +45,15 @@ std::optional<std::string> sampler_apply(SamplerParams& p, const SamplerOverride
     if (o.max_tokens && *o.max_tokens < 1) {
         return log::format("max_tokens must be >= 1, got %d", *o.max_tokens);
     }
+    return std::nullopt;
+}
+
+}  // namespace
+
+std::optional<std::string> sampler_apply(SamplerParams& p, const SamplerOverrides& o) {
+    // Validate everything before mutating, so a rejected request cannot leave a
+    // half-applied sampler behind.
+    if (auto err = sampler_validate(o)) return err;
 
     if (o.temperature)        p.temperature        = *o.temperature;
     if (o.top_p)              p.top_p              = *o.top_p;
@@ -59,6 +70,20 @@ std::optional<std::string> sampler_apply(SamplerParams& p, const SamplerOverride
         p.seeded = true;
     }
 
+    return std::nullopt;
+}
+
+std::optional<std::string> sampler_defaults_apply(SamplerDefaults& d, const SamplerOverrides& o) {
+    if (auto err = sampler_validate(o)) return err;
+
+    if (o.temperature)        d.temperature        = *o.temperature;
+    if (o.top_p)              d.top_p              = *o.top_p;
+    if (o.top_k)              d.top_k              = *o.top_k;
+    if (o.repetition_penalty) d.repetition_penalty = *o.repetition_penalty;
+    if (o.presence_penalty)   d.presence_penalty   = *o.presence_penalty;
+    if (o.temperature || o.top_p || o.top_k || o.repetition_penalty || o.presence_penalty) {
+        d.provenance = "operator";
+    }
     return std::nullopt;
 }
 

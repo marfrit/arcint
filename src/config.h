@@ -1,10 +1,13 @@
 #pragma once
 
 #include <string>
+#include <optional>
 
 #include "core/model_registry.h"
 
 namespace lgc {
+
+struct SamplerDefaults;  // core/model_registry.h
 
 struct Config {
     // Exactly one of these selects what gets served.
@@ -90,6 +93,25 @@ struct Config {
     std::string emb_device;
     std::string mtp_device;
 
+    // Operator serving defaults — the layer between the artifact and the
+    // request (sampler-defaults order, 2026-09-01). Each flag overrides only
+    // its own field of the artifact's sampler defaults; a request field still
+    // wins over everything. Setting any of them turns the served provenance
+    // string to "operator", so /props keeps telling the truth about where the
+    // regime came from. Unset means "the artifact decides", exactly as before.
+    std::optional<float> temp;
+    std::optional<float> top_p;
+    std::optional<int>   top_k;
+    std::optional<float> repetition_penalty;
+    std::optional<float> presence_penalty;
+
+    // --chat-template-kwarg enable_thinking=BOOL: the default a request gets
+    // when it sends neither chat_template_kwargs.enable_thinking nor
+    // reasoning_effort. Only enable_thinking is accepted, because it is the
+    // only kwarg the render path implements — an accepted-but-ignored key
+    // would be a lie.
+    std::optional<bool> think_default;
+
     int         kv_block_size             = 32;      // 16 or 32 — §8 benchmarks this
     std::string kv_dtype                  = "fp16";  // fp16 | q8 — the STATEFUL path
 
@@ -135,5 +157,11 @@ struct ArgParse {
 
 ArgParse    parse_args(int argc, char** argv, Config& cfg);
 std::string usage_text();
+
+// The operator serving-defaults layer: applies the --temp/--top-p/--top-k/
+// --repetition-penalty/--presence-penalty flags (only those that were set) to
+// the artifact's sampler defaults and marks their provenance "operator".
+// Returns the same refusal a request would get for an out-of-range value.
+std::optional<std::string> apply_operator_defaults(const Config& cfg, SamplerDefaults& d);
 
 }  // namespace lgc
