@@ -168,9 +168,10 @@ Two findings decide whether you need the rest of this section at all:
   bar. When it was measured it scored 10/10 on the acceptance task greedy, 3/3
   on tool calls, clean German, at 62.7 t/s — better than the artifact it was
   being compared against. Export only when no official IR exists.
-- **The dense model's MTP head is the one piece nobody publishes.**
-  optimum-intel drops it on export, so neither Intel's IR nor yours will have
-  it. `tools/export_mtp.py` reconstructs it from the checkpoint's own weights;
+- **The dense model's MTP head is in every checkpoint and in no published
+  IR.** optimum-intel drops it on export, so neither Intel's IR nor yours
+  will have it (llama.cpp's GGUFs keep it, as block 64).
+  `tools/export_mtp.py` reconstructs it from the checkpoint's own weights;
   it is worth 1.35× on the dense model and is the only reason to touch the
   export pipeline for that model.
 

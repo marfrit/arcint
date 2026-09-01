@@ -91,13 +91,27 @@ def linear(x, weight, name):
     return op.matmul(x, const(weight, name), transpose_a=False, transpose_b=True)
 
 
+ROPE_STYLE = "interleaved"   # --rope: interleaved (even,odd pairs) | half (rotate_half)
+
 def rope(x, cos, sin, rotary_dim, heads):
-    """Rotate the first `rotary_dim` channels as interleaved (even, odd) pairs
-    and pass the rest through."""
+    """Rotate the first `rotary_dim` channels and pass the rest through.
+
+    Two pairings exist in the wild for the same weights: interleaved
+    (even, odd) pairs -- what this exporter measured its acceptance with --
+    and HF/llama.cpp's rotate_half (first half, second half). The checkpoint
+    trained with exactly one of them; --rope selects, acceptance decides
+    (2026-09-01: the GGUF/llama.cpp reference uses half-split on byte-identical
+    weights, so the two conventions are A/B'd rather than assumed)."""
     half = rotary_dim // 2
     i32 = lambda v: op.constant(np.array([v], dtype=np.int32))
     rot = op.slice(x, i32(0), i32(rotary_dim), i32(1), i32(-1))
     passthru = op.slice(x, i32(rotary_dim), i32(2 ** 31 - 1), i32(1), i32(-1))
+    if ROPE_STYLE == "half":
+        x1 = op.slice(rot, i32(0), i32(half), i32(1), i32(-1))
+        x2 = op.slice(rot, i32(half), i32(2 ** 31 - 1), i32(1), i32(-1))
+        lo = op.subtract(op.multiply(x1, cos), op.multiply(x2, sin))
+        hi = op.add(op.multiply(x2, cos), op.multiply(x1, sin))
+        return op.concat([lo, hi, passthru], axis=-1)
     pairs = op.reshape(rot, op.constant(np.array([0, 0, heads, half, 2], dtype=np.int32)),
                        special_zero=True)
     ax = op.constant(np.array(4, dtype=np.int32))
@@ -330,6 +344,8 @@ def main():
     ap.add_argument("--norm-topk", dest="norm_topk", type=lambda v: v.lower() in ("1", "true", "yes"),
                     default=None, help="MoE heads: renormalise the top-k routing weights "
                     "(default: the config's norm_topk_prob, else true)")
+    ap.add_argument("--rope", choices=("interleaved", "half"), default="interleaved",
+                    help="rotary pairing: interleaved (even,odd) or rotate_half (default: interleaved)")
     a = ap.parse_args()
 
     cfg = json.load(open(os.path.join(a.weights, "config.json")))
@@ -344,6 +360,8 @@ def main():
         MOE_NORM_TOPK = a.norm_topk
     elif t.get("norm_topk_prob") is not None:
         MOE_NORM_TOPK = bool(t["norm_topk_prob"])
+    global ROPE_STYLE
+    ROPE_STYLE = a.rope
     eps = float(t.get("rms_norm_eps", 1e-6))
     theta = float(t.get("rope_parameters", {}).get("rope_theta", t.get("rope_theta", 1e7)))
     rotary = int(HEAD_DIM * float(t.get("partial_rotary_factor", 0.25)))
