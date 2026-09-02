@@ -1,0 +1,233 @@
+# MoE OTD perf counters: evictions, acquisitions, slot tiers, staging bytes
+#
+# Extends the existing [OTD_PERF] runtime counters (MOE_OTD_PERF_LOG=1) with
+# what M9's later patches (0005-0007) need to be measured, and moves the
+# counter struct into its own header (moe_otd_perf.hpp) so compile-time code
+# in a different CMake target can update it without pulling in
+# moe_otd_runtime.hpp's cldnn graph/runtime prelude. Applied against the
+# pinned runtime, build 2026.4.0-22849-71640275d29, on top of patches/0003.
+#
+# Review-round fix: OtdPerfCounters::dump() printed through GPU_DEBUG_INFO,
+# which is gated on ExecutionConfig::get_verbose() >= LogLevel::INFO (1);
+# MOE_OTD_PERF_LOG=1 defaults verbose to 0, so the counters collected but the
+# line never printed in any of our runs. Switched to GPU_DEBUG_COUT
+# (LogLevel::DISABLED = 0), the same get_verbose_stream() channel with the
+# verbose check trivially satisfied (get_verbose() >= 0 always), so the env
+# var alone is the opt-in, as it was meant to be. dump() runs from a
+# std::atexit handler registered inside get_perf_counters() (this plugin's
+# .so, not the host binary); that is only safe if the .so is still mapped
+# when the handler fires, which holds under our serving pattern — arcint
+# loads the GPU plugin once per process and keeps it loaded for the process's
+# whole life, so it is never dlclose()'d ahead of exit for the handler to
+# outlive. A plugin that could be unloaded mid-run would need a different
+# mechanism.
+#
+# New counters, all in OtdPerfCounters (printed by [OTD_PERF] at process
+# exit) unless noted:
+#   evictions          - LRUCache evictions, all offloaded MoE layers combined
+#                         (lru_cache.cpp:evict_one_unlocked). This is the red-
+#                         first observable docs/design-m9-offload-v2.md §1's
+#                         P3 paragraph is decided on: at ratio 10 it should
+#                         read close to 0 [to measure] since a miss there is
+#                         almost certainly compulsory, not a capacity miss.
+#   acquisitions       - LRUCache::get_lru_item calls (hits + misses), kept
+#                         independent of gpu_hits/gpu_misses so the two
+#                         accounting paths can be cross-checked.
+#   device_slot_buffers,
+#   host_slot_buffers,
+#   alloc_fallbacks    - declared here, populated by patches/0005 (P1) at
+#                         compile time in try_prepare_partial_upload. Zero on
+#                         this patch alone; wiring them here rather than
+#                         there keeps 0005's diff to the allocation decision.
+#   staging_bytes      - declared here, populated by patches/0006 (P2)'s
+#                         staging ring.
+#
+# The partial-upload compile-stage log (PartialUploadLogState::log,
+# src/plugin/ops/moe_offload_constant.cpp/.hpp) gains an alloc= field; it
+# prints "usm_host" for every constant until patches/0005 gives it something
+# else to print. `grep alloc=usm_device` on that log is the build check
+# patches/0005 uses to tell a patched binary from an unpatched one. That log
+# line still goes through GPU_DEBUG_INFO, unlike dump() above - it is a
+# compile-stage message, not a MOE_OTD_PERF_LOG=1 runtime print, and was not
+# reported as silent in the on-GPU pass, so it is left alone here.
+#
+# Measurement discipline: this patch adds instrumentation only, no behaviour
+# change on any code path. Per the design's own gate ("any t/s delta - an
+# instrument that costs is not an instrument"), that claim is owed a same-
+# seed decode comparison against an unpatched build; not run here — this
+# patch was built (CPU-only, ninja) but never loaded onto a GPU device, per
+# this task's rules. The orchestrator's on-GPU pass is what discharges it.
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
+@@ -0,0 +1,62 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++
++// arcint M9 (patches/0004): split out of moe_otd_runtime.hpp so that
++// compile-time code (src/plugin/ops/moe_offload_constant.cpp, which decides
++// the per-constant allocation tier and has no reason to see cldnn graph/
++// runtime execution types) can update the shared counters without pulling in
++// moe_otd_runtime.hpp's heavier prelude requirement (see the comment on that
++// include in expert_weight_providers.cpp). This header has no dependency
++// beyond <atomic>/<cstdint> and is safe to include from any layer.
++namespace ov::intel_gpu::ocl::moe_otd {
++
++// Lightweight perf counters for OTD profiling.
++// Enabled by setting MOE_OTD_PERF_LOG=1 environment variable.
++// Counters are printed to stderr on process exit.
++struct OtdPerfCounters {
++    std::atomic<uint64_t> gpu_hits{0};
++    std::atomic<uint64_t> gpu_misses{0};
++    std::atomic<uint64_t> disk_io_ns{0};
++    std::atomic<uint64_t> transpose_ns{0};
++    std::atomic<uint64_t> gpu_copy_ns{0};
++    std::atomic<uint64_t> tensor_load_count{0};
++    std::atomic<uint64_t> batched_fallbacks{0};
++    std::atomic<uint64_t> grouped_fallbacks{0};
++    std::atomic<uint64_t> created_onednn_kernels{0};
++
++    // arcint M9 (patches/0004, P0 counters).
++    // LRU evictions across all OTD-offloaded MoE layers in this process.
++    std::atomic<uint64_t> evictions{0};
++    // Slot resolutions (hits + misses) returned by LRUCache::get_lru_item;
++    // recorded independently of gpu_hits/gpu_misses so the two accounting
++    // paths (per-slot vs per-acquire-call) can be cross-checked.
++    std::atomic<uint64_t> acquisitions{0};
++
++    // arcint M9 (patches/0005, P1 two-tier device pool). Populated in
++    // try_prepare_partial_upload (src/plugin/ops/moe_offload_constant.cpp) at
++    // compile time, one increment per routed-expert constant compiled under
++    // otd_ratio: which tier its slot buffer landed in, and how many times the
++    // usm_device attempt threw and fell back to the usm_host lockable path.
++    std::atomic<uint64_t> device_slot_buffers{0};
++    std::atomic<uint64_t> host_slot_buffers{0};
++    std::atomic<uint64_t> alloc_fallbacks{0};
++
++    // arcint M9 (patches/0006, P2 async batched uploads). Current footprint
++    // of the provider-owned usm_host staging ring, in bytes: sum of each
++    // ring slot's live capacity. Grows only on a ring-slot resize, so it
++    // should plateau after warm-up; a value that keeps climbing across
++    // infers is the async path leaking staging capacity, not amortizing it.
++    std::atomic<uint64_t> staging_bytes{0};
++
++    void dump() const;
++};
++
++OtdPerfCounters* get_perf_counters();
++
++}  // namespace ov::intel_gpu::ocl::moe_otd
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp
+@@ -14,29 +14,11 @@
+ #include "intel_gpu/primitives/moe_3gemm_fused_compressed.hpp"
+ #include "intel_gpu/runtime/stream.hpp"
+ #include "lru_cache.hpp"
++#include "moe_otd_perf.hpp"
+ #include "openvino/util/parallel_io.hpp"
+ 
+ namespace ov::intel_gpu::ocl::moe_otd {
+ 
+-// Lightweight perf counters for OTD profiling.
+-// Enabled by setting MOE_OTD_PERF_LOG=1 environment variable.
+-// Counters are printed to stderr on process exit.
+-struct OtdPerfCounters {
+-    std::atomic<uint64_t> gpu_hits{0};
+-    std::atomic<uint64_t> gpu_misses{0};
+-    std::atomic<uint64_t> disk_io_ns{0};
+-    std::atomic<uint64_t> transpose_ns{0};
+-    std::atomic<uint64_t> gpu_copy_ns{0};
+-    std::atomic<uint64_t> tensor_load_count{0};
+-    std::atomic<uint64_t> batched_fallbacks{0};
+-    std::atomic<uint64_t> grouped_fallbacks{0};
+-    std::atomic<uint64_t> created_onednn_kernels{0};
+-
+-    void dump() const;
+-};
+-
+-OtdPerfCounters* get_perf_counters();
+-
+ class ParallelWeightReader {
+ public:
+     explicit ParallelWeightReader(const std::filesystem::path& weights_path) : _weights_path(weights_path) {}
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+@@ -19,7 +19,7 @@
+     const auto misses = gpu_misses.load(std::memory_order_relaxed);
+     const auto total = hits + misses;
+     const auto loads = tensor_load_count.load(std::memory_order_relaxed);
+-    GPU_DEBUG_INFO << "[OTD_PERF] gpu_hits=" << hits << ", gpu_misses=" << misses << ", gpu_hit_rate=" << (total > 0 ? 100.0 * hits / total : 0.0) << "%"
++    GPU_DEBUG_COUT << "[OTD_PERF] gpu_hits=" << hits << ", gpu_misses=" << misses << ", gpu_hit_rate=" << (total > 0 ? 100.0 * hits / total : 0.0) << "%"
+                    << ", tensor_loads=" << loads << ", avg_disk_io_us=" << (loads > 0 ? disk_io_ns.load(std::memory_order_relaxed) / 1000 / loads : 0)
+                    << ", avg_transpose_us=" << (loads > 0 ? transpose_ns.load(std::memory_order_relaxed) / 1000 / loads : 0)
+                    << ", avg_gpu_copy_us=" << (loads > 0 ? gpu_copy_ns.load(std::memory_order_relaxed) / 1000 / loads : 0)
+@@ -27,7 +27,16 @@
+                    << ", total_gpu_copy_ms=" << gpu_copy_ns.load(std::memory_order_relaxed) / 1000000
+                    << ", batched_fallbacks=" << batched_fallbacks.load(std::memory_order_relaxed)
+                    << ", grouped_fallbacks=" << grouped_fallbacks.load(std::memory_order_relaxed)
+-                   << ", created_onednn_kernels=" << created_onednn_kernels.load(std::memory_order_relaxed) << std::endl;
++                   << ", created_onednn_kernels=" << created_onednn_kernels.load(std::memory_order_relaxed)
++                   // arcint M9 (patches/0004-0006): eviction/acquisition accounting, the
++                   // compile-time device/host slot-tier split and its fallback count, and
++                   // the async-upload staging footprint. See moe_otd_perf.hpp.
++                   << ", evictions=" << evictions.load(std::memory_order_relaxed)
++                   << ", acquisitions=" << acquisitions.load(std::memory_order_relaxed)
++                   << ", device_slot_buffers=" << device_slot_buffers.load(std::memory_order_relaxed)
++                   << ", host_slot_buffers=" << host_slot_buffers.load(std::memory_order_relaxed)
++                   << ", alloc_fallbacks=" << alloc_fallbacks.load(std::memory_order_relaxed)
++                   << ", staging_bytes=" << staging_bytes.load(std::memory_order_relaxed) << std::endl;
+ }
+ 
+ OtdPerfCounters* get_perf_counters() {
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.cpp
+@@ -4,6 +4,10 @@
+ 
+ #include "lru_cache.hpp"
+ 
++// arcint M9 (patches/0004, P0 counters). Self-contained (no cldnn graph/
++// runtime deps), safe to include from this header-light file.
++#include "moe_otd_perf.hpp"
++
+ namespace ov::intel_gpu::ocl::moe {
+ 
+ LRUCache::LRUCache(size_t max_total_experts) : m_max_total_experts(max_total_experts), m_total_experts(0), m_to_filled_lru_expert_no(0) {
+@@ -28,6 +32,14 @@
+     m_map.erase(key);
+     m_list.pop_front();
+     --m_total_experts;
++
++    // arcint M9 (patches/0004, P0 counters). The red-first observable P3
++    // (hot-set pinning) is decided on: at ratio 10 this should read ~0
++    // ([to measure], docs/design-m9-offload-v2.md §1's P3 paragraph), since a
++    // miss there is almost certainly
++    // compulsory, not a capacity miss.
++    if (auto* perf = moe_otd::get_perf_counters())
++        perf->evictions.fetch_add(1, std::memory_order_relaxed);
+ }
+ 
+ void LRUCache::evict_one() {
+@@ -38,6 +50,13 @@
+ std::pair<size_t, bool> LRUCache::get_lru_item(size_t expert) {
+     std::lock_guard<std::mutex> lock(m_mutex);
+ 
++    // arcint M9 (patches/0004, P0 counters). Every call resolves one expert
++    // to one slot, hit or miss; recorded independently of gpu_hits/gpu_misses
++    // (OffloadExpertWeightProvider) so the two can be cross-checked (they
++    // should always sum equal).
++    if (auto* perf = moe_otd::get_perf_counters())
++        perf->acquisitions.fetch_add(1, std::memory_order_relaxed);
++
+     Key key{expert};
+     auto it = m_map.find(key);
+     if (it == m_map.end()) {

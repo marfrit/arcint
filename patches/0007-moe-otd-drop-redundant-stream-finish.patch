@@ -1,0 +1,58 @@
+# MoE OTD: drop the unconditional stream.finish() before on_before_batched_gemv's topk read
+#
+# on_before_batched_gemv (src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp,
+# offloaded path) opened with an unconditional stream.finish() - a full queue
+# drain, once per MoE layer, once per token (x40 layers). The read it
+# protects is the very next line, a blocking scratch.topk_id->copy_to(...,
+# blocking=true), which reads back the routing kernel's output enqueued a few
+# lines earlier on the same stream. On an in_order queue that blocking
+# copy_to already waits for every kernel enqueued before it in program order
+# - the routing kernel included - so the drain was redundant there and only
+# cost time; the design named it worth measuring only after patches/0005 (P1)
+# landed, since P1 is what removes the per-token PCIe stream that otherwise
+# dominates and would have hidden this. Gated the same way patches/0006 (P2)
+# gates its own async path: stream.get_queue_type() == QueueTypes::in_order
+# skips the drain (relying on the copy_to's own blocking wait for
+# correctness); any other queue type keeps the original unconditional
+# stream.finish(), since program order gives no such guarantee there and this
+# patch does not try to prove out-of-order correctness. Applied against the
+# pinned runtime, build 2026.4.0-22849-71640275d29, on top of patches/0003-
+# 0006.
+#
+# Scope: only the site the design names (moe_3gemm_swiglu_opt.cpp:736, inside
+# on_before_batched_gemv). Two other stream.finish() calls nearby
+# (exec_prefill_grouped_gemm's "ensure routing kernel has written topk_ids"
+# drain, and on_after_exec_sync/on_before_grouped_gather's drains) are left
+# untouched - they were not what the design's A/B names, and each guards a
+# different read with its own reasoning that this patch has not re-derived.
+#
+# Its own A/B per docs/design-m9-offload-v2.md §1's P2b line
+# ("worth [to measure] only after P1"): not run here - no GPU access from
+# this task. The expected observable
+# is per-token host time falling by the removed drains, unchanged output
+# otherwise; a regression there (wrong output, or no measurable change) sends
+# this patch back per the design's own gate.
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -733,7 +733,19 @@
+             needs_fallback = false;
+             return;
+         }
+-        stream.finish();
++        // arcint M9 (patches/0007, P2b). This used to be an unconditional
++        // stream.finish() — a full queue drain every MoE layer, every token.
++        // The read it protects is the blocking copy_to right below, which
++        // reads scratch.topk_id back from the routing kernel that produced
++        // it a few lines earlier on this same stream. On an in_order queue
++        // that copy_to(..., blocking=true) already waits for every kernel
++        // enqueued before it in program order, topk_id's producer included,
++        // so the drain is redundant there and only costs time. Kept as a
++        // fallback for an out_of_order queue (never exercised on our cards:
++        // execution_config.cpp:344 forces in_order whenever use_onednn is
++        // set, true for both), where program order gives no such guarantee.
++        if (stream.get_queue_type() != cldnn::QueueTypes::in_order)
++            stream.finish();
+ 
+         std::vector<uint32_t> expert_ids(topk_count);
+         scratch.topk_id->copy_to(stream, expert_ids.data(), 0, 0, topk_count * sizeof(uint32_t), true);

@@ -1,0 +1,356 @@
+# MoE OTD two-tier device-resident slot pool
+#
+# try_prepare_partial_upload (src/plugin/ops/moe_offload_constant.cpp:65,
+# pre-patch) always called the two-arg allocate_memory(upload_layout, false),
+# which resolves to get_lockable_preferred_memory_allocation_type
+# (runtime/engine.cpp:110): supports_allocation returns false for usm_shared
+# unconditionally (engine.cpp:97-101), so on every card this ran on the
+# branch was not "shared, else host" - it was always usm_host, i.e. GTT, no
+# matter how much VRAM was free. This patch charges each MoE expert slot
+# buffer's bytes against a new per-compile device budget in program order
+# (earlier MoE layers land in VRAM, the rest on the existing host path once
+# the budget is spent - the granularity is forced by the data model: one
+# constant is one memory object, so a tensor cannot be half device) and
+# allocates usm_device while there is room. Applied against the pinned
+# runtime, build 2026.4.0-22849-71640275d29, on top of patches/0003-0004.
+#
+# New plugin config property: MOE_OTD_DEVICE_POOL_BYTES
+# (ov::intel_gpu::moe_otd_device_pool_bytes, size_t, RW). Device-resident
+# budget in bytes for MoE OTD expert slot buffers under offload_ratio.
+# Default 0 - every slot stays on the pre-existing usm_host path, i.e. no
+# behaviour change until a caller sets it. Wired the same way offload_ratio
+# is: options.inl (storage/getter), openvino/runtime/intel_gpu/properties.hpp
+# (public Property<> declaration), plugin.cpp (supported RW property),
+# compiled_model.cpp (RO on the compiled model). Deriving a value for it from
+# a fit computation (arcint's `--expert-device-slots-mib auto`,
+# docs/design-m9-offload-v2.md §3) is out of scope for this patch - out of
+# scope for src/ this task at all.
+#
+# Allocation failure is a per-buffer fallback to the pre-existing usm_host
+# path, counted in alloc_fallbacks (patches/0004), never fatal: an
+# allocate_memory throw at compile time would otherwise kill the whole model
+# load, which would make offload unusable on exactly the card M9's exit
+# criterion names (16 GiB, where the pool does not fit uncapped).
+#
+# Lock-site audit (owed by docs/design-m9-offload-v2.md §1 before this patch,
+# since a stray lock
+# on a usm_device buffer does not throw - gpu_usm::lock, ocl_memory.cpp:521,
+# allocates a host buffer sized to the *full* constant layout, because the
+# slot memory is a reinterpret_buffer of a smaller physical allocation onto
+# that full layout, and blocking-memcpys into it; today that is a cheap
+# pointer return, under this patch it becomes a multi-GiB host allocation
+# plus a device read past the actual allocation - silent, not a crash).
+# Enumerated every mem_lock<>/.lock()/buffer_ptr() reachable from a data
+# node's (constant's) attached memory, by grepping every file that touches
+# data_node::get_attached_memory plus a plain mem_lock<> sweep of
+# src/graph and src/plugin, then reading each site's call-context to check
+# whether MoE routed-expert weight/scale/zp constants can reach it:
+#
+#   - src/plugin/ops/constant.cpp:132 (create_data). Already guarded by
+#     `!partial_upload.enabled` before this patch (unrelated to it).
+#   - src/graph/data.cpp:28-29 (attach_or_copy_data, called from every
+#     data_inst ctor - the one production-reachable site). Short-circuits via
+#     `mem->is_allocated_by(engine)` in the ordinary case (compile-time and
+#     network-construction-time engine are the same instance), but nothing
+#     proves that always holds (weight sharing / model-cache import across a
+#     different engine context). This is the site the new otd_device_slot
+#     guard (below) actually protects.
+#   - src/graph/mutable_data.cpp:25-26 (same attach_or_copy_data pattern, for
+#     mutable_data nodes). Unreachable: MoE routed-expert weights are `data`
+#     nodes, never `mutable_data`.
+#   - src/graph/graph_optimizer/prepare_primitive_fusing.cpp:392-407
+#     (recalculate_biases). Gated to eltwise-Add constants shaped like a
+#     per-channel conv/FC bias next to a fusable eltwise; MoE weight/scale/zp
+#     constants feed MOECompressed's dedicated inputs directly, never a
+#     generic bias-eltwise pattern. Unreachable.
+#   - src/graph/graph_optimizer/pre_replace_deconv.cpp:220-290 (weight/bias
+#     repack). Gated to Deconvolution inputs. Unreachable.
+#   - src/graph/graph_optimizer/prepare_quantization.cpp:385-495 (threshold
+#     merge). Gated to `quantize` (FakeQuantize) node dependencies 1-4.
+#     Unreachable: MoE weight/scale/zp constants are never `quantize` inputs.
+#   - src/graph/graph_optimizer/concat_input_order.cpp:69-70
+#     (shuffle_weights). Gated to a `fully_connected` node's weight constant
+#     feeding a Concat, dtype bitwidth >= 8. Unreachable: MoE weights feed
+#     the fused moe_3gemm_fused_compressed primitive, never a plain
+#     fully_connected node.
+#   - src/graph/graph_optimizer/propagate_constants.cpp (const folding). No
+#     mem_lock/.lock() call in the file at all - it does not lock memory to
+#     do its job. Safe.
+#   - src/graph/impls/ocl_v2/slice_scatter.cpp:42, src/graph/impls/ocl/
+#     slice.cpp:20, src/graph/impls/ocl/non_max_suppression.cpp:170-185,
+#     src/graph/loop.cpp:122/875/878/957/960, src/graph/impls/onednn/
+#     utils.cpp:53-54/779, src/graph/primitive_inst.cpp:1377/1691,
+#     src/graph/program_node.cpp:1333 (post-op-fusion inplace update, guarded
+#     `!= usm_device` already, falls to a copy_to/copy_from round-trip on
+#     usm_device instead of locking). All execution-time locks on inputs/
+#     outputs of specific primitive types (Loop, NMS, Slice, SliceScatter,
+#     zero-point conversion for an onednn conv, shape_info, a Gather index,
+#     post-op-fusion scratch). None of these primitive types ever consumes a
+#     MoE routed-expert weight/scale/zp constant - by construction the only
+#     consumer is MOECompressed (moe_offload_constant.cpp's own role
+#     classification). Unreachable.
+#
+# The guard: `memory::otd_device_slot` (include/intel_gpu/runtime/memory.hpp,
+# next to the existing `from_memory_pool` flag, same pattern), set on the
+# reinterpret_buffer result when try_prepare_partial_upload picks usm_device.
+# gpu_usm::lock's usm_device branch now asserts !otd_device_slot before doing
+# the bounce-copy. Deviation from the design's literal wording ("a debug-build
+# guard"): implemented as an unconditional OPENVINO_ASSERT rather than one
+# compiled only under a debug macro, matching the house convention already at
+# the line this patch touches next to (moe_offload_constant.cpp:74's
+# OPENVINO_ASSERT on the same code path) rather than introducing a second
+# convention; the check is a single bool read, not a measurable cost, and a
+# guard that silently compiles out in the release build customers actually
+# run is the exact failure mode docs/design-m9-offload-v2.md §1's P1 bullet
+# on lock() risk warns about.
+#
+# Fusion-impact obligation (0.3.0 ground rule 2, DESIGN §8): this patch
+# changes the allocation *type* of constants feeding MOECompressed, which the
+# ground rule flags as exactly the class of change that can flip a graph-
+# optimiser decision about whether a node is treated as a lockable constant.
+# DISCHARGED, not merely owed: DESIGN §7.0.2v records the compiled-graph
+# check on real hardware under this patched plugin - the base model still
+# fuses x40 (graph dump) - so the allocation-type change did not flip the
+# fusion decision. That measurement was taken by the orchestrator's on-GPU
+# pass, not by this task (no GPU device access, no compile_model, from this
+# host); this patch itself was only built (CPU-only, ninja), never loaded.
+diff --git a/src/plugins/intel_gpu/include/intel_gpu/runtime/memory.hpp b/src/plugins/intel_gpu/include/intel_gpu/runtime/memory.hpp
+--- a/src/plugins/intel_gpu/include/intel_gpu/runtime/memory.hpp
++++ b/src/plugins/intel_gpu/include/intel_gpu/runtime/memory.hpp
+@@ -136,6 +136,18 @@
+     std::shared_ptr<MemoryTracker> get_mem_tracker() const { return m_mem_tracker; }
+     bool from_memory_pool = false;
+ 
++    // arcint M9 (patches/0005, P1 two-tier device pool). Set on a constant's
++    // memory object when try_prepare_partial_upload (src/plugin/ops/
++    // moe_offload_constant.cpp) allocates it as usm_device: the slot buffer
++    // is a reinterpret_buffer of a smaller physical allocation onto the full
++    // constant layout, so gpu_usm::lock's device-USM branch would silently
++    // bounce-allocate a host copy sized to the full constant on any stray
++    // caller (a mem_lock<>, or attach_or_copy_data seeing a different engine
++    // at network-construction time) rather than throwing. This flag lets
++    // lock() fail loudly there instead; every non-OTD memory object leaves
++    // it false and pays nothing. See the lock-site audit in that patch.
++    bool otd_device_slot = false;
++
+ protected:
+     engine* _engine;
+     const layout _layout;
+diff --git a/src/plugins/intel_gpu/src/runtime/ocl/ocl_memory.cpp b/src/plugins/intel_gpu/src/runtime/ocl/ocl_memory.cpp
+--- a/src/plugins/intel_gpu/src/runtime/ocl/ocl_memory.cpp
++++ b/src/plugins/intel_gpu/src/runtime/ocl/ocl_memory.cpp
+@@ -523,6 +523,19 @@
+     if (0 == _lock_count) {
+         const auto& cl_stream = downcast<const ocl_stream>(stream);
+         if (get_allocation_type() == allocation_type::usm_device) {
++            // arcint M9 (patches/0005, P1). A device-resident MoE expert
++            // slot buffer is a reinterpret_buffer of a smaller physical
++            // allocation onto the full constant layout, so _bytes_count here
++            // is the full constant size; the bounce-copy below would
++            // silently allocate a host buffer of that size and read past
++            // the physical allocation rather than fail. otd_device_slot
++            // marks exactly those buffers (see memory.hpp) so a caller that
++            // should never lock one fails loudly instead.
++            OPENVINO_ASSERT(!otd_device_slot,
++                            "[GPU] Attempted to lock a device-resident MoE OTD expert slot buffer. "
++                            "This buffer is device-only by design (patches/0005); locking it would "
++                            "silently allocate a host copy sized to the full constant layout and read "
++                            "past the actual (smaller) physical allocation.");
+             GPU_DEBUG_LOG << "Copy usm_device buffer to host buffer." << std::endl;
+             _host_buffer.allocateHost(_bytes_count);
+             // Always copy device data to host buffer (treat write as read_write internally).
+diff --git a/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.hpp b/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.hpp
+--- a/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.hpp
++++ b/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.hpp
+@@ -39,16 +39,22 @@
+              size_t uploaded_experts,
+              size_t total_experts,
+              size_t upload_bytes,
+-             size_t target_bytes) {
++             size_t target_bytes,
++             const char* alloc_type) {
+         total_upload_bytes.fetch_add(static_cast<uint64_t>(upload_bytes), std::memory_order_relaxed);
+         total_target_bytes.fetch_add(static_cast<uint64_t>(target_bytes), std::memory_order_relaxed);
+ 
+         const size_t total = total_count.fetch_add(1, std::memory_order_relaxed) + 1;
+         if (total <= max_detailed_logs) {
++            // arcint M9 (patches/0005, P1). alloc=usm_device|usm_host names the
++            // tier try_prepare_partial_upload chose for this constant; per the
++            // patch's build check, `grep alloc=usm_device` on this log is how a
++            // patched build is told apart from an unpatched one
++            // (docs/design-m9-offload-v2.md §5.1).
+             GPU_DEBUG_INFO << "MOE OTD partial constant allocation at compile stage: "
+                            << node_name << ", experts=" << uploaded_experts
+                            << "/" << total_experts << ", upload_bytes=" << upload_bytes
+-                           << ", target_bytes=" << target_bytes << std::endl;
++                           << ", target_bytes=" << target_bytes << ", alloc=" << alloc_type << std::endl;
+         } else if (total == max_detailed_logs + 1) {
+             GPU_DEBUG_INFO << "MOE OTD partial constant allocation: suppressing further per-constant logs, "
+                            << "final summary will be printed at process exit" << std::endl;
+diff --git a/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.cpp b/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.cpp
+--- a/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.cpp
++++ b/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.cpp
+@@ -4,6 +4,15 @@
+ 
+ #include "moe_offload_constant.hpp"
+ 
++// arcint M9 (patches/0005, P1). moe_otd_perf.hpp is self-contained (no cldnn
++// graph/runtime deps beyond <atomic>/<cstdint>) precisely so that compile-time
++// code here, in a different CMake target (openvino_intel_gpu_plugin) from the
++// one that owns the MoE runtime (openvino_intel_gpu_graph), can update the
++// shared OTD counters without pulling in moe_otd_runtime.hpp's heavier
++// prelude requirement. Reachable because openvino_intel_gpu_graph exports
++// src/graph and src/graph/impls as PUBLIC include roots (src/graph/CMakeLists.txt).
++#include "impls/ocl_v2/moe/moe_otd_perf.hpp"
++
+ namespace ov::intel_gpu {
+ 
+ // Input indices 3..11 are routed expert weights/scales/zps (WEIGHT_0..ZP_2).
+@@ -62,7 +71,54 @@
+     desc.upload_shape[0] = std::min<size_t>(const_shape[0], resident_expert_num);
+ 
+     auto upload_layout = cldnn::layout(desc.upload_shape, out_dtype, const_format);
+-    auto upload_mem = p.get_engine().allocate_memory(upload_layout, false);
++
++    // arcint M9 (patches/0005, P1 two-tier device pool). Charge this buffer's
++    // bytes against a running per-compile device budget (GPU_MOE_OTD_DEVICE_
++    // POOL_BYTES, 0 by default = today's behaviour unchanged): usm_device
++    // while there is room, the pre-M9 lockable path (get_lockable_preferred_
++    // memory_allocation_type, which supports_allocation makes usm_host on
++    // every card we run on — engine.cpp:97-101/110) once the budget is spent.
++    // moe_device_pool_remaining_bytes lives on ProgramBuilder, not a process
++    // global, so two models compiled in the same process (or two MoE layers
++    // in the same model) share one running total scoped to this compile, in
++    // the program order try_prepare_partial_upload is called in — the
++    // granularity forced by the data model (one constant is one memory
++    // object, so a tensor cannot be half device;
++    // docs/design-m9-offload-v2.md §3).
++    if (p.moe_device_pool_remaining_bytes < 0) {
++        p.moe_device_pool_remaining_bytes = static_cast<int64_t>(p.get_config().get_moe_otd_device_pool_bytes());
++    }
++
++    cldnn::memory::ptr upload_mem;
++    bool used_device = false;
++    const int64_t need = static_cast<int64_t>(upload_layout.bytes_count());
++    if (p.moe_device_pool_remaining_bytes >= need) {
++        try {
++            upload_mem = p.get_engine().allocate_memory(upload_layout, cldnn::allocation_type::usm_device, false);
++            p.moe_device_pool_remaining_bytes -= need;
++            used_device = true;
++        } catch (const std::exception&) {
++            // Allocation failure at compile time would otherwise kill the whole
++            // load with a cl error; that would make offload unusable on exactly
++            // the card the exit criterion names (docs/design-m9-offload-v2.md §1,
++            // P1's allocation-failure bullet). Per-buffer
++            // fallback instead, counted, never fatal.
++            upload_mem = nullptr;
++            if (auto* perf = ocl::moe_otd::get_perf_counters())
++                perf->alloc_fallbacks.fetch_add(1, std::memory_order_relaxed);
++        }
++    }
++    if (!upload_mem) {
++        upload_mem = p.get_engine().allocate_memory(upload_layout, false);
++    }
++
++    if (auto* perf = ocl::moe_otd::get_perf_counters()) {
++        if (used_device)
++            perf->device_slot_buffers.fetch_add(1, std::memory_order_relaxed);
++        else
++            perf->host_slot_buffers.fetch_add(1, std::memory_order_relaxed);
++    }
++
+     // Reinterpret the smaller physical allocation as the full constant layout so the
+     // graph sees the expected shape/layout. This is safe because:
+     // 1. constant.cpp marks this data node with skip_device_transfer=true (partial_upload.enabled),
+@@ -75,13 +131,18 @@
+                     "Partial upload layout (", upload_layout.bytes_count(),
+                     " bytes) exceeds full constant layout (", const_layout.bytes_count(), " bytes)");
+     desc.memory = p.get_engine().reinterpret_buffer(*upload_mem, const_layout);
++    // Marks this buffer so a stray mem_lock/lock() fails loudly instead of
++    // silently bounce-allocating a full-constant-sized host copy (memory.hpp,
++    // gpu_usm::lock in ocl_memory.cpp). A no-op when used_device is false.
++    desc.memory->otd_device_slot = used_device;
+     desc.upload_bytes = upload_layout.bytes_count();
+ 
+     get_partial_upload_log_state().log(op->get_friendly_name(),
+                                        desc.upload_shape[0],
+                                        const_shape[0],
+                                        desc.upload_bytes,
+-                                       const_layout.bytes_count());
++                                       const_layout.bytes_count(),
++                                       used_device ? "usm_device" : "usm_host");
+     return desc;
+ }
+ 
+diff --git a/src/plugins/intel_gpu/include/intel_gpu/plugin/program_builder.hpp b/src/plugins/intel_gpu/include/intel_gpu/plugin/program_builder.hpp
+--- a/src/plugins/intel_gpu/include/intel_gpu/plugin/program_builder.hpp
++++ b/src/plugins/intel_gpu/include/intel_gpu/plugin/program_builder.hpp
+@@ -100,6 +100,14 @@
+     using BlobCacheKey = std::tuple<const char*, ov::Shape, ov::element::Type>;
+     std::map<BlobCacheKey, cldnn::primitive_id> blobMemCache;
+ 
++    // arcint M9 (patches/0005, P1 two-tier device pool). Running budget for
++    // MoE expert slot buffers charged usm_device, in bytes; -1 means "not
++    // yet initialized from MOE_OTD_DEVICE_POOL_BYTES" (see
++    // try_prepare_partial_upload in src/plugin/ops/moe_offload_constant.cpp).
++    // Scoped to this ProgramBuilder (one compile), not a process global, so
++    // it cannot leak across models compiled in the same process.
++    int64_t moe_device_pool_remaining_bytes = -1;
++
+     std::shared_ptr<cldnn::program> get_compiled_program() const;
+     std::shared_ptr<cldnn::topology> get_topology() const { return m_topology; }
+ 
+diff --git a/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl b/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl
+--- a/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl
++++ b/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl
+@@ -55,6 +55,7 @@
+ OV_CONFIG_RELEASE_OPTION(ov::internal, value_cache_quant_mode, ov::internal::CacheQuantMode::BY_TOKEN, "AUTO or BY_CHANNEL or BY_TOKEN")
+ OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, mem_pool_util_threshold, 0.5, "Minimum utilization threshold (0.0~1.0) for reusable memory in the pool")
+ OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, offload_ratio, 0, "Percentage (0-100) of model weights to offload to disk. Currently supported for MoE experts only.", [](size_t v) { return v <= 100; })
++OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, moe_otd_device_pool_bytes, 0, "Device-resident (usm_device) budget in bytes for MoE OTD expert slot buffers under offload_ratio. Buffers are charged against this budget in program order; once spent, later buffers use the pre-existing lockable (usm_host) path. 0 (default) keeps every slot on the usm_host path, unchanged from before this option existed.")
+ OV_CONFIG_RELEASE_OPTION(ov, enable_weightless, false, "Enable/Disable weightless blob")
+ 
+ OV_CONFIG_RELEASE_INTERNAL_OPTION(ov::intel_gpu, enable_zero_copy_cache_load, false, "Enable/Disable zero-copy mode for model cache blob load")
+diff --git a/src/inference/include/openvino/runtime/intel_gpu/properties.hpp b/src/inference/include/openvino/runtime/intel_gpu/properties.hpp
+--- a/src/inference/include/openvino/runtime/intel_gpu/properties.hpp
++++ b/src/inference/include/openvino/runtime/intel_gpu/properties.hpp
+@@ -186,6 +186,17 @@
+ static constexpr Property<size_t, PropertyMutability::RW> offload_ratio{"OFFLOAD_RATIO"};
+ 
+ /**
++ * @brief Device-resident (usm_device) budget in bytes for MoE OTD expert slot
++ * buffers allocated under offload_ratio. Buffers are charged against this
++ * budget in program order (earlier MoE layers land in VRAM, the rest on the
++ * pre-existing usm_host lockable path once the budget is spent). 0 (default)
++ * keeps every slot on the usm_host path, i.e. no behaviour change from before
++ * this property existed.
++ * @ingroup ov_runtime_ocl_gpu_prop_cpp_api
++ */
++static constexpr Property<size_t, PropertyMutability::RW> moe_otd_device_pool_bytes{"MOE_OTD_DEVICE_POOL_BYTES"};
++
++/**
+  * @brief These keys instruct the GPU plugin to use surface/buffer memory type.
+  */
+ namespace memory_type {
+diff --git a/src/plugins/intel_gpu/src/plugin/plugin.cpp b/src/plugins/intel_gpu/src/plugin/plugin.cpp
+--- a/src/plugins/intel_gpu/src/plugin/plugin.cpp
++++ b/src/plugins/intel_gpu/src/plugin/plugin.cpp
+@@ -810,6 +810,7 @@
+         ov::PropertyName{ov::hint::kv_cache_precision.name(), PropertyMutability::RW},
+         ov::PropertyName{ov::hint::model.name(), PropertyMutability::WO},
+         ov::PropertyName{ov::intel_gpu::offload_ratio.name(), PropertyMutability::RW},
++        ov::PropertyName{ov::intel_gpu::moe_otd_device_pool_bytes.name(), PropertyMutability::RW},
+         ov::PropertyName{ov::intel_gpu::config_file.name(), PropertyMutability::RW},
+     };
+ 
+diff --git a/src/plugins/intel_gpu/src/plugin/compiled_model.cpp b/src/plugins/intel_gpu/src/plugin/compiled_model.cpp
+--- a/src/plugins/intel_gpu/src/plugin/compiled_model.cpp
++++ b/src/plugins/intel_gpu/src/plugin/compiled_model.cpp
+@@ -339,6 +339,7 @@
+             ov::PropertyName{ov::hint::activations_scale_factor.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::hint::kv_cache_precision.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::intel_gpu::offload_ratio.name(), PropertyMutability::RO},
++            ov::PropertyName{ov::intel_gpu::moe_otd_device_pool_bytes.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::device::id.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::execution_devices.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::runtime_requirements.name(), PropertyMutability::RO},
