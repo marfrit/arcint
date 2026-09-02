@@ -177,6 +177,7 @@ if(ARCINT_TESTS)
     tests/test_drafter.cpp
     tests/test_text.cpp
     tests/test_config.cpp
+    tests/test_artifact.cpp
     tests/test_prefix_cache.cpp
     tests/test_reasoning.cpp
     tests/test_block_pool.cpp

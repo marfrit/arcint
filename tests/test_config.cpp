@@ -604,6 +604,29 @@ TEST(config_n_ctx_explicit_defaults_false) {
     CHECK_EQ(cfg.n_ctx, 0);
 }
 
+// M13 (docs/milestone-0.3.0.md): --vision is reserved, not served. The
+// artifacts arcint loads are VLM exports whose vision tower and projector
+// IRs are never read (src/core/artifact.cpp, src/exec/backend_ov.cpp), so
+// the flag must refuse loudly -- both bare and with a value -- rather than
+// silently doing nothing, which is how a mistyped invocation could look
+// multimodal. No Config field backs it: see config.cpp's --vision arm.
+TEST(config_vision_flag_is_reserved_and_refused) {
+    Config     cfg;
+    const ArgParse r = run({"--stub", "--vision"}, cfg);
+    CHECK(!r.ok);
+    CHECK(r.error.find("reserved") != std::string::npos);
+}
+
+TEST(config_vision_flag_with_a_value_is_still_refused) {
+    // A generic "unknown option" catch-all would already reject this, so
+    // assert the reserved-flag message specifically -- otherwise this case
+    // would pass without --vision's own handling ever running.
+    Config     cfg;
+    const ArgParse r = run({"--stub", "--vision", "true"}, cfg);
+    CHECK(!r.ok);
+    CHECK(r.error.find("reserved") != std::string::npos);
+}
+
 TEST(config_n_ctx_explicit_true_when_passed) {
     Config cfg;
     CHECK(run({"--stub", "--n-ctx", "8192"}, cfg).ok);

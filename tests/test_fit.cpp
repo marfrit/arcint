@@ -2,6 +2,7 @@
 #include "harness.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 using namespace lgc;
@@ -67,6 +68,31 @@ constexpr int      kMoeLayers     = 48;
 // ever sees the device figure. kDeviceSlotPool below mirrors the probe
 // figure at this fixture's scale.
 constexpr uint64_t kDeviceSlotPool = 118111601;  // ~0.11 GiB, round(0.11 * 2^30)
+
+// §7.0.2w quality gate: for the same VRAM budget and the same model shape,
+// switching --paged-kv precision must widen the admitted context by the
+// amount the cost model (kv_block_bytes_from_bits) predicts. The port
+// geometry below is round numbers, not a specific artifact's shape (same
+// convention as kNumExpert/kPerExpertBytes/kMoeLayers above): kKvPortLayers
+// layers, two ports (key_cache, value_cache) per layer, kKvPortElems
+// elements per port per kv_block_tokens-token page -- the same (bitwidth,
+// count) shape backend_ov.cpp's port walk feeds kv_block_bytes_from_bits,
+// reproduced here device-free. kKvPortElems is even (and a multiple of 4)
+// so halving under i4 stays exact -- no ceiling noise to separate from the
+// precision effect under test.
+constexpr int      kKvPortLayers = 48;
+constexpr uint64_t kKvPortElems  = 1920;
+
+uint64_t kv_bytes_token_for_precision(int key_bits, int value_bits) {
+    std::vector<std::pair<uint64_t, uint64_t>> ports;
+    ports.reserve(2 * static_cast<size_t>(kKvPortLayers));
+    for (int layer = 0; layer < kKvPortLayers; ++layer) {
+        ports.emplace_back(static_cast<uint64_t>(key_bits), kKvPortElems);
+        ports.emplace_back(static_cast<uint64_t>(value_bits), kKvPortElems);
+    }
+    // Mirrors backend_ov.cpp: kv_bytes_token_ = kv_block_bytes / kv_block_tokens_.
+    return kv_block_bytes_from_bits(ports) / static_cast<uint64_t>(kKvBlockTokens);
+}
 
 }  // namespace
 
@@ -175,6 +201,82 @@ TEST(fit_context_below_floor_is_inadmissible) {
     const FitResult r = fit_context(t);
     CHECK(r.max_ctx > 0);      // it did fit something...
     CHECK(!r.admissible);      // ...just not enough to be worth serving
+}
+
+// The claim the next card window will measure (§7.0.2w): at least 15% more
+// context at --paged-kv u8:i4 than at u8, and strictly more again at u4 than
+// at u8:i4, for the identical VRAM budget and model shape -- driven only by
+// the cost model's per-token byte figure, never by touching the budget
+// terms. Written RED first: feeding the fit pass the u8 cost for all three
+// "precisions" (as if --paged-kv never reached the cost model) fails both
+// CHECKs below (the >= 115% one and the u4 > u8:i4 one) -- exactly the "no
+// precision effect" defect this test exists to catch. Note what the 15%
+// threshold does and does not verify: the fixture's u8/u8:i4 byte ratio is
+// 4/3 by construction (the layer and element counts cancel), so any bar
+// under 33% passes here; the bar is the milestone row's figure, and it is
+// the ratio test below, not this threshold, that checks scaling.
+TEST(fit_context_kv_precision_widens_admitted_ctx_per_cost_model) {
+    const uint64_t kv_u8   = kv_bytes_token_for_precision(8, 8);
+    const uint64_t kv_u8i4 = kv_bytes_token_for_precision(8, 4);
+    const uint64_t kv_u4   = kv_bytes_token_for_precision(4, 4);
+
+    FitTerms t   = base_terms();
+    t.slot_pool  = kDeviceSlotPool;  // the honest device ledger, as elsewhere in this file
+
+    t.kv_bytes_token       = kv_u8;
+    const FitResult r_u8   = fit_context(t);
+    t.kv_bytes_token       = kv_u8i4;
+    const FitResult r_u8i4 = fit_context(t);
+    t.kv_bytes_token       = kv_u4;
+    const FitResult r_u4   = fit_context(t);
+
+    // Page multiples: fit_context's own floor rule, checked explicitly for
+    // all three precisions, not just assumed from the u8 fixtures above.
+    CHECK_EQ(r_u8.max_ctx % kKvBlockTokens, 0LL);
+    CHECK_EQ(r_u8i4.max_ctx % kKvBlockTokens, 0LL);
+    CHECK_EQ(r_u4.max_ctx % kKvBlockTokens, 0LL);
+
+    CHECK(r_u8i4.max_ctx * 100 >= r_u8.max_ctx * 115);
+    CHECK(r_u4.max_ctx > r_u8i4.max_ctx);
+}
+
+// Cross-check via an independent computation: budget is identical across the
+// three runs above (only kv_bytes_token changes), so the *unfloored*
+// division scales exactly with the cost model's byte ratio; flooring both
+// sides to a page can only move the adopted figure by less than one page
+// from that prediction. Written RED first with the same u8-for-everything
+// bug as above (kv_u8i4 and kv_u4 both fed the (8, 8) cost): the guard
+// `CHECK(kv_u4 < kv_u8i4)` caught it immediately, since the cost model's own
+// ladder collapses to a tie before fit_context is even asked. The cross-check
+// reuses fit.h's budget expression, so it is independent of the code under
+// test only in the ratio step, not in the budget term.
+TEST(fit_context_kv_precision_ratio_matches_cost_model_byte_ratio) {
+    const uint64_t kv_u8i4 = kv_bytes_token_for_precision(8, 4);
+    const uint64_t kv_u4   = kv_bytes_token_for_precision(4, 4);
+    CHECK(kv_u4 < kv_u8i4);  // the cost model's own ladder must be strict
+
+    FitTerms t  = base_terms();
+    t.slot_pool = kDeviceSlotPool;
+
+    const long long fixed =
+        static_cast<long long>(t.weights) + static_cast<long long>(t.drafters) +
+        static_cast<long long>(t.slot_pool) + static_cast<long long>(t.activations) +
+        static_cast<long long>(t.margin) +
+        static_cast<long long>(t.lanes) * static_cast<long long>(t.slab_per_lane);
+    const long long budget = static_cast<long long>(t.total) - fixed;
+
+    t.kv_bytes_token         = kv_u8i4;
+    const FitResult r_u8i4   = fit_context(t);
+    t.kv_bytes_token         = kv_u4;
+    const FitResult r_u4     = fit_context(t);
+    CHECK_EQ(r_u8i4.max_ctx % kKvBlockTokens, 0LL);
+    CHECK_EQ(r_u4.max_ctx % kKvBlockTokens, 0LL);
+
+    const long long raw_u8i4 = budget / static_cast<long long>(kv_u8i4);
+    const long long predicted_u4 =
+        ((raw_u8i4 * static_cast<long long>(kv_u8i4) / static_cast<long long>(kv_u4)) /
+         kKvBlockTokens) * kKvBlockTokens;
+    CHECK(std::llabs(predicted_u4 - r_u4.max_ctx) <= kKvBlockTokens);
 }
 
 // -------------------------------------------------------------- expert_slot_bytes

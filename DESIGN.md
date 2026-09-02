@@ -2854,6 +2854,84 @@ Production still serves `+p1` and does not carry these patches; deployment
 is a separate decision, and the Prüfstand on the served coder artifact is
 the gate it waits on.
 
+#### 7.0.2y Context by the flag, not the format; the vision IRs never loaded (2026-09-02)
+
+One row closed in one window, one owed gate discharged, and a third row
+re-measured before it is re-scoped.
+
+**M13.** The served checkpoints are VLM exports; every artifact directory
+carries three vision IRs beside the language model (merger 443–458 MB,
+tower and positional encoder a few MB). The loader has never resolved
+them — artifact resolution names only the language model and the text
+embeddings — so "pay zero VRAM for the modality we don't serve" was true by
+construction and unrecorded. What landed is the record and the guard:
+`--vision` is reserved and refused (a mistyped invocation cannot look
+multimodal), the artifact scan reports the present-but-unloaded IRs at load
+time. A process-level check was tried and is not evidence: after compile
+the process holds neither a mapping nor a descriptor on the language-model
+file either, so a vision count of zero cannot discriminate; the claim rests
+on the loader's code path and the inventory line, not on that check. The scan's first version under-counted (2 files, 1.7
+MiB against a 457 MB merger on disk): it abbreviated two base names, and the
+test fixture mirrored the constant, so the test passed. The runtime line
+caught it on the first load; names are now spelled from a listing and the
+test uses the literal export names (coder: 6 files, 428.3 MiB). Not run:
+byte-identity against a separate text-only export — it needs a second
+export of a served checkpoint, and the language-model IR *is* the text path
+of the VLM export. Flagged as a scope call rather than dropped.
+
+**The context claim, measured on the served configurations** (patched plugin
+0001–0012, one lane, `--n-ctx` omitted so the fit pass adopts the maximum
+admissible depth; the device-free red case in `tests/test_fit.cpp` failed
+first with every precision fed the u8 cost and passed once the cost model's
+own port widths were used):
+
+| card, model, served extras | u8 | u8:i4 | gain |
+|---|---|---|---|
+| 24 GB, 27B dense agent, MTP on, prefix cache 8 GiB | 155,376 | 199,424 | +28.3% |
+| 16 GiB, 27B-A3B coder, no offload, prefix cache 2 GiB | 133,456 | 171,312 | +28.4% |
+
+M7's audit number for the first row was 155,488; the fit pass reproduces it
+to within one overshoot correction. The second row's u8 figure is 35,152
+tokens above the hand-set 98,304 the coder serves today. The gain matches
+the cost model's 11.3 → 8.8 KiB/token to within 0.1 pp. Greedy text is
+byte-identical u8 vs u8:i4 at 16 tokens on both cards, and the coder's
+acceptance task at u8:i4 scores 10/10 without offload and 10/10 twice with
+the offload path live (ratio 20, 8 GiB device pool; the two offloaded
+answers identical, the non-offloaded one differing from them at line 10 —
+the runs prefilled at different chunk sizes, 128 against 2,048, and chunk
+boundaries are not bit-exact on this backend, §3.2). That is the acceptance
+gate the patched series owed on the served coder artifact; the M8 row's
+other owed items stay owed, and deployment stays a separate decision.
+
+**M10, before any re-scope.** The row's gate is "≥ 15% more max context than
+pure int4 on the same card" through sub-4-bit expert weights. The design
+study (session note, not in the repository) found that the fused MoE op
+stacks each layer's experts into one tensor with one element type and one
+group size, that the decode kernel's packing is keyed to two elements per
+byte, and that of NNCF 3.3.0's modes only INT3_SYM/INT2_SYM are sub-4-bit in
+bytes (every 4-bit codebook mode is ≥ 4.25 bpw) — a 3-bit expert type would
+be an 800–1,500-line kernel divergence (HYPOTHESIS) with a decode
+regression of known sign (§7.0.3's u4-KV precedent). The table above is the
+measured half of the argument: the same 1.676 GiB of KV on the 24 GB card,
+and the coder's budget on the 16 GiB card, both buy 28% by a flag that
+already serves. A recorded survey (session note) finds no published Intel or
+OpenVINO IR below int4 for any Qwen3-MoE-class model and nothing below
+W4A16 for MoE on vLLM's Intel roadmap, while ik_llama.cpp's recipes and
+QuantMoE-Bench show that routed experts *can* go to 2–3 bits with measured
+loss and that routing-frequency-aware allocation beats uniform at matched
+budget (QuantMoE-Bench's controlled comparison is against random
+allocation). One caveat on the record: the installed NNCF lists INT3_SYM
+and INT2_SYM in its mode enum while its public documentation does not, so
+they count as undocumented until a compression call with them succeeds.
+The re-scope — keep the sub-4-bit question, reassign the context claim to
+the levers that earned it — is proposed to the operator with these numbers,
+not decided here. Built in the same window because every candidate route
+and two older rows want it: a per-expert routing histogram in the plugin
+(patches/0013), counted at the acquire seam before the hit/miss split, cost
+below a decode probe's resolution, and validated on the coder at ratio 20:
+40 layers, 60,740 routings per layer for the same token stream, 25 of
+7,360 experts never routed by the acceptance prompt.
+
 #### 7.0.2r DFlash2: the external-drafter hook gets a real drafter (2026-09-01)
 
 The public block-diffusion head for the 3.8 went from HF checkpoint to a

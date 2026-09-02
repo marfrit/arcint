@@ -1,5 +1,6 @@
 #include "core/artifact.h"
 
+#include <array>
 #include <cctype>
 #include <cstdio>
 #include <dirent.h>
@@ -32,6 +33,37 @@ std::string read_file(const std::string& p) {
     std::ostringstream ss;
     ss << in.rdbuf();
     return ss.str();
+}
+
+// The vision tower and projector of a `*ForConditionalGeneration` export
+// (M13): every checkpoint arcint serves ships these, but the loader below
+// resolves only the language model and text embeddings, and backend_ov.cpp
+// compiles only those two -- so these three are always present-and-unread on
+// the artifacts this repository actually loads. Each name is checked with
+// both extensions independently: a checkpoint can ship the graph (.xml)
+// without its weights (.bin) mid-export, and the inventory should say exactly
+// what is on disk, not assume a pair. The base names are spelled out from an
+// artifact listing, not abbreviated: a first version dropped the "embeddings_"
+// infix from the pos/merger names and the load-time line reported "2 files,
+// 1.7 MiB" against a 457 MB merger on disk -- the runtime line caught what a
+// test mirroring the constant could not.
+constexpr std::array<const char*, 3> kUnloadedVisionIrBaseNames = {
+    "openvino_vision_embeddings_model",
+    "openvino_vision_embeddings_pos_model",
+    "openvino_vision_embeddings_merger_model",
+};
+
+std::vector<UnloadedIr> scan_unloaded_vision_irs(const std::string& dir) {
+    std::vector<UnloadedIr> out;
+    for (const char* base : kUnloadedVisionIrBaseNames) {
+        for (const char* ext : {".xml", ".bin"}) {
+            const std::string path = dir + "/" + base + ext;
+            if (file_exists(path)) {
+                out.push_back(UnloadedIr{base + std::string(ext), file_size(path)});
+            }
+        }
+    }
+    return out;
 }
 
 std::string basename_of(const std::string& path) {
@@ -102,6 +134,8 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out) 
     a.text_embeddings_xml = dir + "/openvino_text_embeddings_model.xml";
     a.tokenizer_xml       = dir + "/openvino_tokenizer.xml";
     a.detokenizer_xml     = dir + "/openvino_detokenizer.xml";
+
+    a.unloaded_vision_irs = scan_unloaded_vision_irs(dir);
 
     const std::string config_path     = dir + "/config.json";
     const std::string generation_path = dir + "/generation_config.json";

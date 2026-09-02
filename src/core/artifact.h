@@ -15,6 +15,16 @@
 // what was read is allowed, not to supply it.
 namespace lgc {
 
+// An IR file that sits in the artifact directory but is never read by the
+// loader -- the vision tower and projector of a `*ForConditionalGeneration`
+// export (M13, docs/milestone-0.3.0.md). Reported so the load-time log can
+// say what disk space (not VRAM: it is never compiled) is going unused for
+// the modality v1 does not serve, without pretending vision is loaded.
+struct UnloadedIr {
+    std::string name;         // basename, e.g. "openvino_vision_embeddings_merger_model.bin"
+    uint64_t    bytes = 0;
+};
+
 struct Artifact {
     std::string dir;
     std::string directory_name;  // basename, matched against the allowlist aliases
@@ -34,6 +44,10 @@ struct Artifact {
     std::string text_embeddings_xml;
     std::string tokenizer_xml;
     std::string detokenizer_xml;
+
+    // Present on disk (stat'd, not opened) but never loaded: a VLM export's
+    // vision tower and projector (M13). Empty for a text-only export.
+    std::vector<UnloadedIr> unloaded_vision_irs;
 
     // Geometry, from config.json (text_config when the export is a VLM).
     std::string model_type;

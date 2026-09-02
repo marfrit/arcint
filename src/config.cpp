@@ -199,6 +199,9 @@ std::string usage_text() {
         "  --quant q4|q8             weight format (default: q4)\n"
         "  --device DEV              OpenVINO device (default: GPU.0)\n"
         "  --cache-dir PATH          compiled-blob cache directory\n"
+        "  --vision                  (reserved; refused) v1 is text-only; the vision\n"
+        "                            tower and projector IRs a VLM checkpoint ships are\n"
+        "                            never loaded\n"
         "\n"
         "server\n"
         "  --host ADDR               bind address (default: 127.0.0.1)\n"
@@ -353,6 +356,19 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--cache-dir") {
             if (!value(v)) return fail("--cache-dir needs a path");
             cfg.cache_dir = std::string(v);
+        } else if (arg == "--vision") {
+            // Reserved, not implemented (M13, docs/milestone-0.3.0.md): the
+            // served artifacts are `*ForConditionalGeneration` VLM exports
+            // whose vision tower and projector IRs (openvino_vision_embeddings_model,
+            // _pos_model, _merger_model) sit on disk beside the language model but
+            // are never read by the loader (src/core/artifact.cpp) or compiled by
+            // the backend (src/exec/backend_ov.cpp). Refusing loudly here -- for
+            // both a bare flag and one given a value -- means a mistyped
+            // invocation cannot look multimodal; there is no Config field for it,
+            // because a refusal needs no state that could later be flipped
+            // without a test.
+            return fail("--vision is reserved and refused: v1 is text-only, and the "
+                        "vision IRs are never loaded");
         } else if (arg == "--host") {
             if (!value(v)) return fail("--host needs a value");
             cfg.host = std::string(v);

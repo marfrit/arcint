@@ -844,6 +844,19 @@ public:
 
         tokenizer_ = std::make_unique<OvTokenizer>(core_, artifact, artifact.eos_ids);
 
+        // M13: a VLM export's vision tower and projector IRs sit on disk
+        // beside the language model but are never compiled -- --vision is
+        // reserved (config.cpp), not served. Named and sized here so a "why
+        // is this artifact bigger than the served weights" question has an
+        // answer in the log rather than requiring a directory listing.
+        if (!artifact.unloaded_vision_irs.empty()) {
+            uint64_t vision_bytes = 0;
+            for (const auto& ir : artifact.unloaded_vision_irs) vision_bytes += ir.bytes;
+            log::info("load", "vision IRs present and not loaded: %zu files, %.1f MiB on disk",
+                      artifact.unloaded_vision_irs.size(),
+                      static_cast<double>(vision_bytes) / (1024.0 * 1024.0));
+        }
+
         if (cfg.paged) {
             load_paged(cfg, n_ctx);
             template_ = std::make_unique<minja::chat_template>(artifact.chat_template,
