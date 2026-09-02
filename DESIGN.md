@@ -2508,6 +2508,8 @@ the trade:
   the ratio, because the OTD slot buffers commit physical memory lazily. The
   reservation then promises max ctx 1,172,016 — a number that would OOM as
   the slots fill. arcint now warns at load; set `--n-ctx` explicitly.
+  *(Superseded 2026-09-02: the warning became a measured reservation, and the
+  1.20 GiB was only the VRAM half of the story — §7.0.2t.)*
 - Decode collapses from ~66 to 1.9–2.3 t/s at every ratio. The runtime's own
   counters (`MOE_OTD_PERF_LOG=1`, 16-token probe at ratio 10): gpu_hit_rate
   74% where ~90% capacity should give far more, and the wall time is not
@@ -2520,6 +2522,108 @@ table as plugin work: the upload path wants batching/async prefetch (the
 same pattern Qwen3.8-Flash-Next uses for its host-resident n-gram table) and
 an LRU that actually retains the hot set. Until then, context on a full card
 comes from KV precision and lane budgets, not from expert eviction.
+
+#### 7.0.2t The honest reservation, and where the slot pool actually lives (2026-09-02)
+
+M7 of the 0.3.0 series (`docs/milestone-0.3.0.md`), implemented and measured
+on both cards. The load path now prices every term it used to imply: a
+second residency read after the drafter compiles (0.47 GiB on the 35B/A770
+configuration; 3.16 GiB on the B60 where the MTP head and DFlash drafter
+share the card), an expert-slot term under offload, an activation term
+clamped at zero, and an allocate–audit–replay loop that shrinks `n_ctx` by
+the measured overshoot instead of guessing.
+
+The activation term earned a correction of its own. The first measured runs
+showed it *negative* (−0.09 GiB on the 16 GiB card, −0.27 on the 24 GiB
+card), and the first explanation written down — LRU eviction noise in the
+residency delta — was wrong: the pre-commit review found the probe's
+baseline had moved past the GDN-slab allocation while an explicit
+`− slab × lanes` survived in the probe's return, a double subtraction the
+two readings corroborate to two decimals (0.093 and 0.296 GiB are the
+slabs). The narrative is retracted per §7.0.1; the arithmetic is fixed; the
+clamp stays as a guard that now logs an accounting error instead of
+inventing a mechanism. With the term honest, the B60 activation reads
++0.03 GiB.
+
+Three measurements set the shape of the final arithmetic:
+
+- **The slot pool is host memory, not VRAM.** The plateau probe read
+  0.11–0.14 GiB of device-side slot residency where the config-derived
+  estimate said 12.01; the first implementation distrusted the probe and
+  charged 12.01 GiB to the device budget (printed max ctx 99,696 — 35B q4,
+  A770, u8 KV, one lane, ratio 20). The discriminator run — slot term forced
+  to the probe figure, `--n-ctx 400000` — **served**, decoding at 2.0 t/s,
+  with `drm-total-vram0` at 6.69 GiB against a promised 6.81 (0.8% of
+  device total, inside the ≤2% acceptance bar) while `drm-total-gtt` held
+  13.17 GiB. The probe was right; the reservation now keeps two ledgers
+  (device = LRU working set, host = the pool, reported but not charged), and
+  the §7.0.2s decode collapse reads differently: resident experts stream
+  from host-mapped memory across PCIe on every token, so the M9 lever is
+  pinning the hot set into VRAM, not only making uploads asynchronous.
+- **Auto-adopt converges on the hand-tuned number.** With `--n-ctx` omitted
+  on the B60 (b7c1, u8 KV, one lane), the fit clamps the artifact's 262,144
+  to the admissible cap, allocates, audits, and corrects. Before the
+  activation fix the estimate was 156,512 and the audit caught a real
+  overshoot ("22.50 GiB resident against a 22.46 ceiling, pass 1/4"); after
+  it, the estimate itself lands at 155,680 — within 0.02% of the 155,648
+  the operator had found by hand — and one audit pass still trims to a
+  served 155,488. Both runs end at the same number by measurement, which is
+  the point: the audit corrects whatever the estimate got wrong. An
+  explicit `--n-ctx` is never lowered; the fit then runs verify-only and
+  refuses with the itemized terms.
+- **Deferred commit is now audited, not assumed.** Every offload load logs
+  the committed-vs-requested comparison ("the driver reports 5.06 GiB of the
+  5.34 requested — deferred commit; the reservation keeps the analytic
+  figure"); under-commit is never read as free memory.
+
+`--fit-margin-mib` (default 256, the old constant) is the only new flag;
+`ARCINT_FIT_SLOT_BYTES` forces the slot term for experiments and skips the
+probe. The pure arithmetic lives in `src/exec/fit.h` with the red case
+pinned to the measured defect: zero-slot arithmetic must reproduce exactly
+1,172,016, and a test proves that charging the host ledger to the device
+budget would collapse an honest 1,159,024 to 710,992.
+
+#### 7.0.2u Dispatch pinning is a null on a quiet host; the fusion contract, read off the card (2026-09-02)
+
+Two answers from the enqueue-bound thread (§7.0.2f), both measured on the
+B60 with b7c1 int4, u8 KV, one lane, n_ctx 131,072, host otherwise idle
+(loadavg ≤ 0.8):
+
+- **`--pin-dispatch` moves nothing here.** Per-infer stage-acc medians,
+  base vs pinned to the same idle core: host-side sum 1,153 vs 1,066 µs
+  (MTP-on, 98 infers) and 9,659 vs 9,109 µs (plain, 65 infers); wall 25.6
+  vs 25.7 and 22.4 vs 22.7 t/s. The flag stays as the opt-in instrument for
+  the contended-host arm, which remains untested by choice. A caution that
+  cost two wrong readings elsewhere: `OV_GPU_HOST_TIME_PROFILING=3` itself
+  triples plain decode (22.4 t/s instrumented vs 71.5 without), so
+  instrumented and uninstrumented columns never mix.
+- **The MoE fusion entry is the tiled block, and the card proves it.** The
+  pass that production actually exercises is
+  `ConvertTiledMoeBlockToGatherMatmuls` (gated on XMX/oneDNN; weight types
+  u4/i4/i8/u8), whose source pattern is the optimum-intel export shape:
+  `Reshape→Tile→Reshape`, three bias-free per-stack GEMMs over rank-4
+  grouped-quant weights with an explicit rank-4→3 `Reshape` after the
+  dequant chain, and a `ScatterElementsUpdate→Transpose→Reshape` router —
+  no OneHot, no per-expert `NonZero` (the unrolled `FuseMOE` pattern is a
+  different pass the GPU pipeline does not run). Positive control: the
+  served 35B's compiled graph on the A770 carries `MOECompressed`,
+  `moe_3gemm_fused_compressed` and `moe_router_fused`, forty of each — one
+  per MoE layer. The exporter now emits this tiled form on request
+  (`--moe-lowering tiled`, batched default unchanged), and an op-level diff
+  against the fusing artifact fixed what a first replica got wrong — the
+  router must run on the same rank-2 flattened tensor the Tile entry
+  consumes (a rank-3 router crashed the pass's own rewrite on GPU), the
+  quantization is genuinely grouped (group 64) behind the literal
+  two-Convert f16 decompress chain, and the mixing step goes rank-4 before
+  the reduce. The real 35B MTP head exports tiled in 5 s at 946 MB u8
+  against the batched form's 1.69 GB f16 and compiles clean at production
+  dimensions — but no fused MOE node appears when that head is compiled
+  standalone through the nightly runtime. Fusion has so far been
+  demonstrated only inside the engine's own compile of the base model
+  (packaged plugin, paged pipeline context), so the head's fused serving —
+  the fix for §7.0.2o's dense read — stays open behind one named
+  discriminator: compile the head through the packaged plugin inside the
+  engine's pipeline rather than the tooling runtime.
 
 #### 7.0.2r DFlash2: the external-drafter hook gets a real drafter (2026-09-01)
 
