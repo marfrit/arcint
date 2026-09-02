@@ -2383,7 +2383,7 @@ private:
                 la_state_shapes_.push_back(gdn_proto[gdn_i++ % gdn_proto.size()]);
             } else if (name.rfind("key_cache.", 0) == 0 || name.rfind("value_cache.", 0) == 0) {
                 const bool is_value = name.rfind("value_cache.", 0) == 0;
-                const ov::element::Type actual = port.get_element_type();
+                const ov::element::Type  actual         = port.get_element_type();
                 const std::string        actual_name    = actual.get_type_name();
                 const std::string&       requested_name = is_value ? pk_value : pk_key;
                 // Port audit (docs/design-m8-asymmetric-kv.md §3 item 11 / §4b, the red case in the
@@ -2400,8 +2400,14 @@ private:
                 // 2026-09-02, an unpatched plugin compiles a u8 request as
                 // i8 storage -- same 8 bits, its own signedness choice, not
                 // a downgrade -- and an exact-type check refused every
-                // symmetric u8 load over exactly that. A different bitwidth
-                // (a request silently kept at the old width) still refuses.
+                // symmetric u8 load over exactly that. Amended the same day:
+                // this plugin generation types paged KV ports at 8 bits
+                // ALWAYS, even for a 4-bit (u4/i4) request -- an honest
+                // 4-bit-typed port breaks the plugin's own compile -- so a
+                // 4-bit request landing on an 8-bit port also passes now
+                // (logged below, not silently). A different bitwidth outside
+                // that one known shape (a request silently kept at the old
+                // width) still refuses.
                 if (!kv_precision_bitwidth_matches(requested_name, actual_name)) {
                     throw std::runtime_error(log::format(
                         "paged KV port '%s' compiled as %s but --paged-kv '%s' requested "
@@ -2413,11 +2419,21 @@ private:
                 if (actual_name != requested_name) {
                     bool& logged = is_value ? logged_value_alias : logged_key_alias;
                     if (!logged) {
-                        log::info("load",
-                                  "paged KV %s cache compiled as %s for requested %s (same "
-                                  "bitwidth -- the plugin's own storage choice, not a downgrade)",
-                                  is_value ? "value" : "key", actual_name.c_str(),
-                                  requested_name.c_str());
+                        if (kv_precision_is_packed_four_bit(requested_name, actual_name)) {
+                            log::info("load",
+                                      "%s cache requested %s: stored in 8-bit-typed ports on "
+                                      "this plugin generation (packing is config-side and not "
+                                      "visible at port level; verify sub-byte packing by "
+                                      "measurement, not by this audit)",
+                                      is_value ? "value" : "key", requested_name.c_str());
+                        } else {
+                            log::info("load",
+                                      "paged KV %s cache compiled as %s for requested %s (same "
+                                      "bitwidth -- the plugin's own storage choice, not a "
+                                      "downgrade)",
+                                      is_value ? "value" : "key", actual_name.c_str(),
+                                      requested_name.c_str());
+                        }
                         logged = true;
                     }
                 }
@@ -2431,6 +2447,49 @@ private:
                 kv_pool_shapes_.push_back(sh);
                 size_t block_elems = 1;
                 for (size_t i = 1; i < sh.size(); ++i) block_elems *= sh[i];
+                // Cost model: the compiled port's own bitwidth x element
+                // count, unconditionally -- no requested-precision override.
+                //
+                // RETRACTED (measurement discipline, DESIGN §7.0.1: a
+                // mechanism that is narrated and not measured gets retracted
+                // on the record rather than edited away). Two on-card
+                // rounds tried a requested-precision override here and both
+                // were wrong:
+                //   (1) first version: override to the requested bitwidth
+                //       whenever the request was 4-bit, regardless of the
+                //       actual port width -- wrongly charged 4 bits to
+                //       genuinely 16/32-bit scale/auxiliary pool ports too.
+                //   (2) narrowed version: override only when actual was
+                //       8-bit (the known 4-in-8 TYPE-level packing shape).
+                //       Window N measured --paged-kv u4 STILL printing 3.2
+                //       KiB/token after this narrowing -- the number did not
+                //       move. Solving KV_pure/4 + fixed = 3.2 against
+                //       KV_pure + fixed = 11.3 (the u8 baseline) gives
+                //       KV_pure ~= 10.8 KiB/token, fixed ~= 0.5; WITHOUT any
+                //       override the predicted figure is KV_pure/2 + fixed
+                //       ~= 5.9, inside the expected ~5.65-5.9 band. So this
+                //       plugin generation encodes 4-bit packing in the port
+                //       SHAPE (element count already halved for a 4-bit
+                //       request), not only the type -- type x shape
+                //       accounting (this line, unmodified) was already
+                //       correct, and the override was double-halving.
+                //       Corroborated separately (Window L): an honest
+                //       i4-TYPED port attempt showed arcint's own tensor
+                //       sized exactly 2x the plugin's -- direct evidence of
+                //       shape-level packing.
+                // The AUDIT above (kv_precision_bitwidth_matches /
+                // kv_precision_is_packed_four_bit) is unaffected and stays:
+                // TYPE-level 4-in-8 aliasing is real and still has to pass
+                // without refusing a legitimate request. Only the COST
+                // model's separate override was wrong, and is gone.
+                //
+                // Port classification (unchanged): this line only runs for
+                // ports whose name starts with "key_cache." or
+                // "value_cache." (the `else if` above) -- the same
+                // classification kv_pool_names_/kv_pool_types_ use just
+                // below. conv_state_table./gated_delta_state_table./
+                // position_ids ports are handled in separate branches and
+                // never reach kv_port_bits at all.
                 kv_port_bits.emplace_back(actual.bitwidth(), block_elems);
             } else if (name == kPositionIds) {
                 paged_sections_ = static_cast<size_t>(ps[0].get_length());

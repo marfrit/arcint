@@ -121,6 +121,41 @@ inline uint64_t kv_block_bytes_from_bits(
     return bytes;
 }
 
+// RETRACTED: kv_cost_bitwidth, a requested-precision override for the KV
+// cost model (measurement discipline, DESIGN §7.0.1: a mechanism that is
+// narrated and not measured gets retracted on the record rather than
+// edited away). Two on-card rounds, both wrong:
+//
+//   (1) First version: override the per-port bitwidth to the REQUESTED
+//       precision whenever it was 4-bit (u4/i4), reasoning that this
+//       plugin generation always types paged KV ports at 8 bits regardless
+//       of packing. Wrong scope: it fired for every port on a 4-bit
+//       request, including scale/auxiliary pool ports genuinely typed at
+//       16 or 32 bits, charging them 4 bits too.
+//   (2) Narrowed version: fire only when the actual port was also 8-bit
+//       (the known 4-in-8 TYPE-level shape). --paged-kv u4 still printed
+//       3.2 KiB/token after this narrowing -- the number did not move.
+//       Solving KV_pure/4 + fixed = 3.2 against KV_pure + fixed = 11.3 (the
+//       u8 baseline) gives KV_pure ~= 10.8 KiB/token, fixed ~= 0.5; WITHOUT
+//       any override the predicted figure is KV_pure/2 + fixed ~= 5.9,
+//       inside the expected ~5.65-5.9 band. This plugin generation encodes
+//       4-bit packing in the port SHAPE (element count already halved for
+//       a 4-bit request), not only the type -- so kv_block_bytes_from_bits
+//       fed the compiled port's own (bitwidth, count) directly, with no
+//       separate override, was already correct, and every override tried
+//       here was double-halving. Corroborated separately (a prior window):
+//       an honest i4-TYPED port attempt showed arcint's own tensor sized
+//       exactly 2x the plugin's -- direct evidence of shape-level packing.
+//
+// The port AUDIT (config.h's kv_precision_bitwidth_matches /
+// kv_precision_is_packed_four_bit) is unaffected by this retraction and
+// stays as amended: TYPE-level 4-in-8 aliasing is real, measured, and must
+// still pass rather than refuse a legitimate 4-bit request. Only the COST
+// model's separate bitwidth override was wrong. backend_ov.cpp's port walk
+// now feeds kv_block_bytes_from_bits the compiled port's own bitwidth
+// unconditionally -- see the comment at that call site for the full
+// history.
+
 // The replay loop's correction (design §1 "The replay loop"): given the
 // driver reported `overshoot` bytes more than the budget allowed, shrink
 // n_ctx by the tokens needed to free that many bytes across every lane, then

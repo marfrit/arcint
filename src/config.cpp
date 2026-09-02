@@ -86,6 +86,14 @@ bool is_paged_kv_value(std::string_view s) {
     return paged_kv_bits(s, bits);
 }
 
+// The one known packed-4-bit shape (on-card finding, 2026-09-02): a 4-bit
+// request stored in an 8-bit-typed port. Int-only so both
+// kv_precision_bitwidth_matches and kv_precision_is_packed_four_bit share
+// one definition of "known packing" rather than two that could drift.
+bool kv_precision_is_packed_four_bit_bits(int requested_bits, int actual_bits) {
+    return requested_bits == 4 && actual_bits == 8;
+}
+
 }  // namespace
 
 bool parse_paged_kv(const std::string& spec, std::string& key, std::string& value) {
@@ -113,15 +121,47 @@ bool parse_paged_kv(const std::string& spec, std::string& key, std::string& valu
 // for a u8 request). The actual hazard the audit exists to catch is a side
 // that kept the OLD bitwidth when a DIFFERENT one was requested -- an
 // asymmetric u8:i4 request silently served as u8:u8, say -- so the
-// comparison is BITWIDTH only. `requested` and `actual` are each one of
-// --paged-kv's five values; anything outside that alphabet counts as a
-// mismatch rather than passing by default.
+// comparison is BITWIDTH only.
+//
+// Amended (on-card finding, 2026-09-02): this GPU plugin generation stores
+// paged KV in 8-bit-TYPED ports always -- an honest 4-bit-typed port breaks
+// the plugin's own compile, and the working §7.0.3 u4 deployment ran
+// 8-bit-typed ports throughout. A 4-bit precision (u4/i4) is therefore
+// config-side packing that is INVISIBLE at the port level: a 4-bit request
+// landing on an 8-bit port is the expected shape on this plugin generation,
+// not a downgrade, so it passes too (the caller logs it, see backend_ov.cpp).
+//
+// Consequence, stated honestly: for a 4-bit request this audit can no
+// longer catch a silently-unpacked world (an i4 request served as plain u8
+// data in an 8-bit container would look identical to correctly packed i4 at
+// this port-type level). The plugin-side config-level guard (patches/0009
+// v3) covers the asymmetric-corruption case instead, and symmetric packing
+// is verified by measured KV footprint (kv_bytes_token_ / the cost model
+// below), not by this audit.
+//
+// `requested` and `actual` are each one of --paged-kv's five values;
+// anything outside that alphabet counts as a mismatch rather than passing
+// by default.
 bool kv_precision_bitwidth_matches(const std::string& requested, const std::string& actual) {
     int requested_bits = 0, actual_bits = 0;
     if (!paged_kv_bits(requested, requested_bits) || !paged_kv_bits(actual, actual_bits)) {
         return false;
     }
-    return requested_bits == actual_bits;
+    if (requested_bits == actual_bits) return true;
+    return kv_precision_is_packed_four_bit_bits(requested_bits, actual_bits);
+}
+
+// True exactly for the known packed-4-bit shape above: a 4-bit request
+// (u4/i4) landing on this plugin generation's 8-bit-typed port. Split out
+// from kv_precision_bitwidth_matches so the caller can pick the right log
+// message (the "packed 4-bit" wording vs. the generic same-bitwidth-alias
+// wording) without re-deriving the bit widths itself.
+bool kv_precision_is_packed_four_bit(const std::string& requested, const std::string& actual) {
+    int requested_bits = 0, actual_bits = 0;
+    if (!paged_kv_bits(requested, requested_bits) || !paged_kv_bits(actual, actual_bits)) {
+        return false;
+    }
+    return kv_precision_is_packed_four_bit_bits(requested_bits, actual_bits);
 }
 
 bool parse_u64_strict(const std::string& s, uint64_t& out) {

@@ -266,6 +266,51 @@ TEST(kv_block_bytes_from_bits_empty_is_zero) {
     CHECK_EQ(kv_block_bytes_from_bits({}), 0ull);
 }
 
+// ---------------------------------------------- kv_cost_bitwidth (RETRACTED)
+
+// kv_cost_bitwidth -- a requested-precision override for the cost model --
+// is deleted (see the retraction note in fit.h, next to
+// kv_block_bytes_from_bits, for the full two-round history). A third
+// on-card measurement found the SECOND version still wrong: --paged-kv u4
+// kept printing 3.2 KiB/token even after the override was narrowed to fire
+// only on an actual 8-bit-typed port. The arithmetic that found why: solve
+// KV_pure/4 + fixed = 3.2 against KV_pure + fixed = 11.3 (the u8 baseline)
+// -> KV_pure ~= 10.8 KiB/token, fixed ~= 0.5; WITHOUT any override the
+// predicted figure is KV_pure/2 + fixed ~= 5.9, inside the expected
+// ~5.65-5.9 band. This plugin generation packs a 4-bit request into the
+// port's SHAPE (the element count is already halved), not only its type --
+// so kv_block_bytes_from_bits, fed the compiled port's own (bitwidth,
+// count) with no override at all, was correct from the start. The two test
+// cases below replace the deleted kv_cost_bitwidth_* tests: the case that
+// used to assert the packed-4-in-8 port charges 4 bits now asserts it
+// charges 8 (its own type, unconditionally); the separate "does not
+// override a 16/32-bit port" cases are now moot -- there is no override
+// left to exempt them from -- and fold into the same "no override, ever"
+// point.
+TEST(kv_block_bytes_from_bits_charges_the_ports_own_type_for_a_packed_four_bit_request) {
+    // The exact scenario the retracted override targeted: a 4-bit (u4/i4)
+    // request that this plugin generation packs into an 8-bit-TYPED port by
+    // halving the port's own element count. `kPackedCount` stands in for
+    // that already-halved shape. Correct: kPackedCount bytes (the port's
+    // real 8-bit type, unconditionally) -- NOT kPackedCount/2, which is what
+    // the retracted override would have additionally charged, double-
+    // halving what the shape already halved once.
+    constexpr uint64_t kPackedCount = 100;
+    const uint64_t      bytes        = kv_block_bytes_from_bits({{8, kPackedCount}});
+    CHECK_EQ(bytes, kPackedCount);        // 100: the port's own type, no override
+    CHECK(bytes != kPackedCount / 2);     // != 50: the retracted double-halving bug
+}
+
+TEST(kv_block_bytes_from_bits_charges_the_ports_own_type_unconditionally) {
+    // No requested-precision input exists anywhere in this function's
+    // signature any more -- every port, whatever precision it happens to
+    // hold, is charged by its own compiled (bitwidth, count) alone.
+    CHECK_EQ(kv_block_bytes_from_bits({{8, 100}}), 100ull);
+    CHECK_EQ(kv_block_bytes_from_bits({{16, 100}}), 200ull);
+    CHECK_EQ(kv_block_bytes_from_bits({{32, 100}}), 400ull);
+    CHECK_EQ(kv_block_bytes_from_bits({{4, 100}}), 50ull);  // an honest 4-bit port, if one ever exists
+}
+
 // ------------------------------------------------------------------- shrink_n_ctx
 
 TEST(shrink_n_ctx_strictly_decreases_and_terminates) {

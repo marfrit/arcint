@@ -351,21 +351,56 @@ TEST(kv_precision_bitwidth_matches_same_width_aliases_pass) {
     CHECK(kv_precision_bitwidth_matches("f16", "f16"));
 }
 
+// Amended (on-card finding, 2026-09-02, docs/design-m8-asymmetric-kv.md
+// review): this GPU plugin generation stores paged KV in 8-bit-TYPED ports
+// always -- an honest 4-bit-typed port breaks the plugin's own compile, and
+// the working §7.0.3 u4 deployment ran 8-bit-typed ports throughout. A
+// 4-bit request (u4/i4) landing on an 8-bit port is therefore the EXPECTED
+// shape on this plugin generation, not a downgrade. This is the exact red
+// case the review found: before this amendment, (u4 requested, u8 actual)
+// FAILED the audit and broke every legitimate 4-bit request.
+TEST(kv_precision_bitwidth_matches_accepts_four_bit_packed_in_eight_bit_port) {
+    CHECK(kv_precision_bitwidth_matches("u4", "u8"));  // the exact red case
+    CHECK(kv_precision_bitwidth_matches("i4", "i8"));
+    // Sign does not matter either, same as the 8-bit alias case above.
+    CHECK(kv_precision_bitwidth_matches("i4", "u8"));
+    CHECK(kv_precision_bitwidth_matches("u4", "i8"));
+}
+
 TEST(kv_precision_bitwidth_matches_refuses_a_real_width_change) {
-    // The red case: a request for 4 bits actually served at 8 must still
-    // refuse -- this is the quiet-downgrade class the audit exists to catch
-    // (an asymmetric u8:i4 request silently served as u8:u8, say).
-    CHECK(!kv_precision_bitwidth_matches("u4", "u8"));
-    CHECK(!kv_precision_bitwidth_matches("i4", "i8"));
-    CHECK(!kv_precision_bitwidth_matches("u8", "i4"));
-    CHECK(!kv_precision_bitwidth_matches("f16", "u8"));
-    CHECK(!kv_precision_bitwidth_matches("u8", "f16"));
+    // The strict rule still applies outside the one known 4-in-8 packing
+    // shape: an 8/16-bit request must still land on a same-width port.
+    CHECK(!kv_precision_bitwidth_matches("u8", "i4"));   // wrong direction: 8 requested, 4 got
+    CHECK(!kv_precision_bitwidth_matches("f16", "u8"));  // must still refuse
+    CHECK(!kv_precision_bitwidth_matches("u8", "f16"));  // must still refuse
+    CHECK(!kv_precision_bitwidth_matches("u4", "f16"));  // 4-bit request, but NOT the 8-bit shape
+    CHECK(!kv_precision_bitwidth_matches("f16", "i4"));
 }
 
 TEST(kv_precision_bitwidth_matches_rejects_unknown_values) {
     CHECK(!kv_precision_bitwidth_matches("garbage", "u8"));
     CHECK(!kv_precision_bitwidth_matches("u8", "garbage"));
     CHECK(!kv_precision_bitwidth_matches("", ""));
+}
+
+// kv_precision_is_packed_four_bit tells the caller (backend_ov.cpp's port
+// audit) which log message to print: this is true ONLY for the specific
+// 4-in-8 packing shape, not for a generic same-bitwidth alias (u8<->i8) or
+// for any other passing/failing combination.
+TEST(kv_precision_is_packed_four_bit_identifies_the_known_shape) {
+    CHECK(kv_precision_is_packed_four_bit("u4", "u8"));
+    CHECK(kv_precision_is_packed_four_bit("i4", "i8"));
+    CHECK(kv_precision_is_packed_four_bit("i4", "u8"));
+    CHECK(kv_precision_is_packed_four_bit("u4", "i8"));
+}
+
+TEST(kv_precision_is_packed_four_bit_false_for_everything_else) {
+    CHECK(!kv_precision_is_packed_four_bit("u8", "u8"));   // exact match, not this shape
+    CHECK(!kv_precision_is_packed_four_bit("u8", "i8"));   // the OTHER alias shape
+    CHECK(!kv_precision_is_packed_four_bit("u4", "u4"));   // an honest 4-bit port, if one existed
+    CHECK(!kv_precision_is_packed_four_bit("u8", "u4"));   // wrong direction
+    CHECK(!kv_precision_is_packed_four_bit("u4", "f16"));  // not 8-bit
+    CHECK(!kv_precision_is_packed_four_bit("garbage", "u8"));
 }
 
 // F3 (review 2026-09-02): ARCINT_MOE_DEVICE_POOL_BYTES used to go into the

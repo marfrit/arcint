@@ -214,10 +214,23 @@ bool parse_paged_kv(const std::string& spec, std::string& key, std::string& valu
 // in BITWIDTH, not in exact element type -- a plugin that stores a u8
 // request as i8 (or a u4 request as i4) is making its own signedness
 // choice, not downgrading precision, and a mismatched bitwidth (a request
-// silently kept at the old width) is the actual hazard. `requested` and
-// `actual` are each one of --paged-kv's five values (parse_paged_kv's
-// alphabet); anything outside that set counts as a mismatch.
+// silently kept at the old width) is the actual hazard. Amended (on-card
+// finding, 2026-09-02): this plugin generation always types paged KV ports
+// at 8 bits, even for a 4-bit (u4/i4) request -- the packing is config-side
+// and invisible at the port level -- so a 4-bit request landing on an
+// 8-bit port also passes; see kv_precision_is_packed_four_bit below for
+// telling that case apart from a same-bitwidth signedness alias.
+// `requested` and `actual` are each one of --paged-kv's five values
+// (parse_paged_kv's alphabet); anything outside that set counts as a
+// mismatch.
 bool kv_precision_bitwidth_matches(const std::string& requested, const std::string& actual);
+
+// True exactly when `requested` is 4-bit (u4/i4) and `actual` is 8-bit --
+// the one shape kv_precision_bitwidth_matches now passes despite a bitwidth
+// difference. The caller (backend_ov.cpp's port audit) uses this to choose
+// its log wording: this is a known plugin-generation packing quirk, worth
+// naming explicitly, not a generic signedness alias.
+bool kv_precision_is_packed_four_bit(const std::string& requested, const std::string& actual);
 
 // Strict base-10 uint64 parse: refuses empty input and trailing garbage
 // (strtoull alone happily parses "8e9" as 8 and ignores "e9"), and refuses
