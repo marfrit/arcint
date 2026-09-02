@@ -76,6 +76,58 @@
 # exact-vs-P1-only-build and stage-acc-median checks the design requires of
 # this patch (docs/design-m9-offload-v2.md §4's P2 row) are owed to the
 # orchestrator's on-GPU pass, not claimed here.
+#
+# REGRESSION, measured on-card after this patch and 0007 shipped together:
+# u8-KV serving produces deterministic garbage under the patched plugin
+# (vanilla plugin coherent, same everything else; reproduces at pool cap 0,
+# so patches/0005 is not implicated); u4-KV through the same patched plugin
+# is coherent. The expert-upload path this patch changes is identical across
+# KV precisions, so the leading theory is a timing-exposed race: u8 and u4
+# PagedAttention kernels run at different speeds, and that shifts which
+# interleaving of async work this patch's wait sees. This invalidates the
+# cycle-2 sweep numbers taken under this patch until resolved (fast wrong
+# compute) - flagged on the campaign record, not just here.
+#
+# Kill-switch for on-card isolation: MOE_OTD_FORCE_SYNC_UPLOAD=1 forces
+# async_ok false unconditionally in fill_weights_memory, routing every call
+# (both try_acquire_simultaneous's batch and acquire_one's single-expert
+# path, since both funnel through this one function) down the pre-0006
+# synchronous per-tensor branch that already exists for out_of_order queues
+# - i.e. this build behaves as if only patches/0003-0005 were applied to the
+# upload path. Read once, the same way MOE_OTD_PERF_LOG is read; default
+# off, unchanged from patches/0006 as landed. Paired with 0007's
+# MOE_OTD_FORCE_FINISH=1 (independent switch, same env-var pattern), the two
+# can be toggled in the 2x2 the regression grid needs: sync+finish (should
+# match pre-0006/0007 behaviour, the control), sync+no-finish, async+finish,
+# async+no-finish (patches/0006+0007 as landed, the arm that is currently
+# suspect).
+#
+# Re-audit, with the race lens: this patch's own correctness argument (wait
+# inside fill_weights_memory before it returns, ahead of set_otd_weight_
+# pointers) still looks sound on paper - the wait is on the real completion
+# event of each enqueued USM copy (traced through ocl_memory.cpp's
+# create_event/gpu_usm::copy_from: a fresh cl::Event per call, no pooling or
+# reuse that could let a wait be satisfied by the wrong command), and every
+# copy plus the GEMV kernel that reads its result go through the one
+# cl::CommandQueue a cldnn::stream owns (ocl_stream.hpp/ocl_common.hpp:
+# ocl_queue_type is cl::CommandQueue, one per stream, no separate copy vs
+# compute queue) - so in-order execution should serialize them regardless of
+# blocking vs non-blocking submission. What this argument does NOT cover,
+# and where confidence has to drop given the measurement: it reasons about
+# THIS call's own events, not about whether the *previous* iteration's GEMV
+# kernel — which reads the same slot buffer this call's copy is about to
+# overwrite — is provably ordered before this call's enqueues in every
+# calling context, including whatever host-side interleaving arcint's
+# serving loop actually does across tokens (single-token decode was assumed
+# strictly sequential host-side; that assumption was not verified against
+# the live serving loop, only against the code in this file). The batch-
+# internal slot-reuse case (two misses in one call landing on the same LRU
+# slot) was checked and is capacity-bounded safe. Net: nothing here is
+# retracted, because nothing here is independently confirmed broken - but
+# the confidence this header stated before the measurement was too high,
+# and the actual fault most likely sits in 0007's argument instead (see that
+# patch's header) or in an interaction between the two that neither header
+# analyzed on its own.
 diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp
 --- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp
 +++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp
@@ -195,7 +247,7 @@ diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cp
      struct tensor_fill_plan {
          size_t per_expert_size = 0;
          size_t src_offset = 0;
-@@ -198,6 +225,25 @@
+@@ -198,6 +225,33 @@
  
      const size_t weight_file_size = weight_reader.file_size();
  
@@ -206,7 +258,15 @@ diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cp
 +    // a non-blocking copy here could still be in flight when a later kernel
 +    // reads the slot, so this falls back to the pre-M9 synchronous path
 +    // rather than trying to prove out-of-order correctness here.
-+    const bool async_ok = exec_stream.get_queue_type() == cldnn::QueueTypes::in_order;
++    //
++    // arcint M9 review round: MOE_OTD_FORCE_SYNC_UPLOAD=1 forces the
++    // synchronous branch below unconditionally, regardless of queue type -
++    // a diagnostic kill-switch to isolate a measured u8-KV correctness
++    // regression against 0007's stream.finish() removal (see that patch's
++    // header). Read once, the same way MOE_OTD_PERF_LOG is read. Default
++    // off: behaviour is unchanged from patches/0006 as landed.
++    static const bool force_sync_upload = std::getenv("MOE_OTD_FORCE_SYNC_UPLOAD") != nullptr;
++    const bool async_ok = !force_sync_upload && exec_stream.get_queue_type() == cldnn::QueueTypes::in_order;
 +    std::vector<cldnn::event::ptr> pending_events;
 +    cldnn::engine* engine = nullptr;
 +    if (async_ok) {
@@ -221,7 +281,7 @@ diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cp
      size_t index = 0;
      for (uint32_t expert : experts_list) {
          auto make_tensor_fill_plan = [&](size_t base_offset, cldnn::memory_ptr mem, size_t expert_no, size_t lru_expert_no, const char* tensor_name) {
-@@ -247,26 +293,64 @@
+@@ -247,26 +301,64 @@
              // Transpose + GPU copy
              auto mem = tensors_by_offset[offset_pos];
              if (mem && plan.per_expert_size != 0) {
