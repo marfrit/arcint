@@ -170,10 +170,58 @@
 # now takes the micro-SDPA path and serves coherent output. No GPU device
 # was touched by this task; the micro-SDPA decline's control flow is read-
 # verified and incrementally rebuilt, not exercised against a compiled model.
+#
+#
+# --- Round 5 (fable-review follow-up, F4, same overall follow-up task as patches/0008's Round 6/7
+#     and patches/0010's write-kernel split - repo DESIGN §7.0.1's "narrated, not measured, gets
+#     retracted on the record rather than edited away" rule) ---
+#
+# Status note: this patch's title ("PARTIAL - micro-SDPA decline...") and its "Net position"
+# paragraph ("does NOT yet serve u8:i4 correctly - unchanged from the original BLOCKED verdict")
+# were both true when written, against the decode fast path as it existed at the time. They are
+# SUPERSEDED, not wrong: patches/0010 (applied after this one) splits the decode opt kernel's JIT
+# constants per-side and DOES serve u8-K/i4-V correctly on decode - see patches/0010's own header.
+# This patch's own scope (the supports_micro_sdpa() decline) is UNCHANGED by that - it still
+# governs prefill only, and still declines u8:i4 there, exactly as designed - see point 2 below
+# for why that decline is now load-bearing rather than a no-op.
+#
+# Two claims from "Round 4" above are RETRACTED, not deleted - kept above verbatim as the record
+# of what was believed at the time, corrected here:
+#
+# 1. "That fallback path itself serves deterministically corrupt decode output at 8-bit on this
+#    build" - RETRACTED. Every cell behind that kill-switch-matrix claim carried Bug A
+#    (execution_config.cpp's value-cache-precision mirror resolving the value port to u8 over
+#    physically-signed-i8 storage, patches/0008's own "Round 3" - see that patch's header). It was
+#    a config-layer bug corrupting decode on EVERY path that touched the value cache, not a defect
+#    in this OCL fallback path specifically - the fallback path just happened to be what the
+#    matrix's cells were routed onto at the time. Since the Bug-A fix (patches/0008 Round 6/7) plus
+#    an independent kernel-side signed-read fix (paged_attention_opt.cl, Bug A2), this fallback
+#    path has NOT been observed to corrupt plain 8-bit decode. patches/0010 in fact routes u8:i4
+#    PREFILL onto exactly this path deliberately (this guard's own decline routes it there - see
+#    below) and measures it coherent, not corrupt. The 0.4-2.3 t/s slowness measurement in the same
+#    paragraph is unaffected by this retraction and stands - this fallback is still the slow path
+#    relative to micro-SDPA, just never was shown to be a correctness one once Bug A is accounted
+#    for.
+#
+# 2. "This guard is therefore currently a no-op safety net rather than an active gate" -
+#    RETRACTED, and now the opposite of true. That conclusion followed from Round 4's own
+#    reasoning that "once the config-level guard has passed, is_i4_u4(key) always equals
+#    is_i4_u4(value) already" - true when this patch was written, against patches/0008's ORIGINAL
+#    finalize-time guard, which refused EVERY key/value bitwidth mismatch. patches/0010 narrows
+#    that config-level guard to admit exactly the case this reasoning assumed couldn't reach here:
+#    a non-4-bit key with a 4-bit value (u8-K/i4-V), where is_i4_u4(key)=false != is_i4_u4(value)=
+#    true. For that pairing, THIS guard's decline is what actually fires and routes prefill onto
+#    the OCL fallback instead of micro-SDPA - not a defense-in-depth backstop for an unreachable
+#    case, but the live, load-bearing gate keeping u8:i4 prefill off an unproven micro-SDPA
+#    configuration. The new asymmetric decode test (paged_attention_gpu_test.cpp's
+#    decode_serves_u8_key_i4_value, patches/0010) asserts sdpa_micro is absent from the dispatched
+#    kernel list specifically because this decline is active for that request, not because the
+#    assertion is vacuously true.
+#
 diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
 --- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
 +++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
-@@ -1435,7 +1435,38 @@
+@@ -1435,7 +1435,53 @@ public:
  
          // Disable micro SDPA for INT4 BY_TOKEN due to accuracy issues
          const auto kv_cache_dt = params.get_program().get_config().get_kv_cache_precision();
@@ -194,16 +242,31 @@ diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_o
 +        // request legitimately resolves to key=i8/value=u8 (the pre-existing, harmless 8-bit
 +        // signedness alias every other path in this codebase already treats as compatible) -
 +        // and the raw-equality guard declined micro-SDPA for that healthy, common case too,
-+        // silently routing it onto the non-micro OCL paged_attention_opt fallback path. That
-+        // fallback path itself serves deterministically corrupt decode output at 8-bit on this
-+        // build (confirmed via a kill-switch matrix that isolated it from the upload/finish
-+        // patches, 0006/0007 - a control cell with those reverted served the identical
-+        // garbage) and crawls at 0.4-2.3 t/s versus the healthy micro-SDPA path. This guard's
-+        // own correctness fix is scoped to no longer routing healthy (same-packing-class)
-+        // configs onto that fallback; the fallback path's own correctness at plain 8-bit
-+        // precision is a separate, pre-existing, NOT-fixed-here defect - it still serves
-+        // whatever precision genuinely needs it (the sub-8-bit-vs-not case execution_config.
-+        // cpp's finalize_impl already refuses before compilation reaches this code at all).
++        // silently routing it onto the non-micro OCL paged_attention_opt fallback path.
++        //
++        // RETRACTED (docs/design-m8-asymmetric-kv.md, fable-review follow-up, F4 - repo DESIGN
++        // §7.0.1's "narrated, not measured, gets retracted on the record" rule): this comment
++        // used to claim that fallback path "serves deterministically corrupt decode output at
++        // 8-bit on this build," citing a kill-switch matrix. That claim does not hold up. Every
++        // cell behind it carried Bug A (execution_config.cpp's value-cache-precision mirror
++        // resolving the value port to u8 over physically-signed-i8 storage, patches/0008 Round
++        // 3 - see that patch's own header) - a config-layer bug, not a defect in this OCL
++        // fallback path itself. Since the Bug-A fix (patches/0008 Round 6/7) plus the
++        // independent kernel-side signed-read fix (paged_attention_opt.cl, Bug A2), this
++        // fallback path has NOT been observed to corrupt plain 8-bit decode, and patches/0010
++        // routes u8:i4 prefill onto exactly this path deliberately (see below) and measures it
++        // coherent, not corrupt. The 0.4-2.3 t/s slowness measurement is unaffected by this
++        // retraction and stands - this fallback is still the slow path relative to micro-SDPA,
++        // just not a correctness one.
++        //
++        // What was, and remains, true: this guard's packing-class decline is not a "no-op
++        // safety net" for a case that can't happen - it is the ACTIVE gate keeping u8:i4
++        // PREFILL off micro-SDPA today (is_i4_u4(u8)=false != is_i4_u4(i4)=true, so this decline
++        // fires for exactly that pairing) while patches/0010's DECODE-only opt-kernel split
++        // serves u8:i4 correctly on the decode path. The new asymmetric numeric test
++        // (paged_attention_gpu_test.cpp's decode_serves_u8_key_i4_value) asserts sdpa_micro is
++        // absent from the dispatched kernel list specifically because this decline is live and
++        // load-bearing, not because the case is unreachable.
 +        const auto value_cache_dt = params.get_program().get_config().get_value_cache_precision();
 +        if (data_type_traits::is_i4_u4(kv_cache_dt) != data_type_traits::is_i4_u4(value_cache_dt)) {
 +            return false;

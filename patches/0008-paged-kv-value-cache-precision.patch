@@ -347,22 +347,121 @@
 # re-run of the on-card port/config audit against this exact build (this
 # task built and incrementally rebuilt the .so only, no compile_model, no
 # GPU device touched at any point in this task).
-diff --git a/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl b/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl
---- a/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl
-+++ b/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl
-@@ -45,6 +45,7 @@
- OV_CONFIG_RELEASE_OPTION(ov::hint, dynamic_quantization_group_size, 0, "Dynamic quantization group size")
- OV_CONFIG_RELEASE_OPTION(ov::intel_gpu::hint, dynamic_quantization_group_size_max, UINT64_MAX, "Maximum dynamic quantization group size. When group_size is set as a higher value than this number, dynamic quantization will be turned off")
- OV_CONFIG_RELEASE_OPTION(ov::hint, kv_cache_precision, ov::element::dynamic, "")
-+OV_CONFIG_RELEASE_OPTION(ov, value_cache_precision, ov::element::dynamic, "Value-cache precision override for the paged-attention KV cache (the existing public ov::value_cache_precision property, unwired on GPU until now). dynamic (default) mirrors KV_CACHE_PRECISION; set explicitly for an asymmetric key/value cache.")
- OV_CONFIG_RELEASE_OPTION(ov::intel_gpu::hint, enable_kernels_reuse, false, "Enables kernel reuse across implementations to reduce memory footprint.")
- OV_CONFIG_RELEASE_OPTION(ov, weights_path, "", "Path to the model weights file used for weightless caching")
- OV_CONFIG_RELEASE_OPTION(ov::hint, activations_scale_factor, -1.0f, "Scalar floating point value that is used for runtime activation tensor scaling with fp16 inference precision")
-
+#
+# --- Round 6 (M8 follow-up task, root-caused independently of Round 5's cache-blob
+#     hypothesis): the actual root cause of Round 3's regression - a signed/unsigned
+#     mismatch, not a cache-blob schema issue ---
+#
+# Round 5 offered the cache-blob positional-misalignment mechanism as a "strong,
+# fully-reasoned hypothesis rather than a measured certainty" for why plain `--paged-kv u8`
+# served garbage under this patch. A later task, working from a fresh on-card diagnosis binder
+# (BINDING DIAGNOSIS in that task's own words), found the constraint Round 5 could not explain:
+# the garbage reproduces COLD, with `ov::cache_dir("")` - the schema guard's own visit_attributes
+# never runs without a model cache in use (its own comment says so, and it is called only from
+# Graph save/load), so the positional-misalignment mechanism cannot fire for arcint's cache-off
+# runs. Round 5's fix (the schema guard) is a real, kept hardening fix for the cache-blob case it
+# does explain, but it was never the mechanism behind the cold, cache-off garbage this round
+# fixes.
+#
+# The real mechanism, traced in source: this patch's Round 3 mirror captured kv_cache_precision
+# BEFORE the key-side u8->i8 swap (`kv_cache_precision_before_swap`) and mirrored THAT raw value
+# for the dynamic/unset case - so a plain `--paged-kv u8` request left the value cache PORT
+# u8-typed while the key port normalized to i8-typed, on the theory that "something downstream
+# reads value data's signedness from the port type" and that matching the value port to i8 was
+# itself what caused Round 3's own regression. That theory had the direction backwards. Traced
+# end to end:
+#
+#   1. Physical value storage is UNCONDITIONALLY SIGNED i8 in the non-4-bit case, regardless of
+#      port type: pa_kv_cache_update_ref.cl's quantize_and_save_per_token (shared, via
+#      out_data_pitch, by both the key and the value write call sites) computes a signed
+#      zero-point (`zp = -min*scale + CHAR_MIN`) and stores through `convert_char_rte`, range
+#      [-128, 127] - the same quantize function, same signed convention, for both operands.
+#   2. The read side (paged_attention_opt.cl) dequantizes the KEY through code that is immune to
+#      the key port's declared signedness (the key port is ALSO unconditionally normalized to i8
+#      by this same finalize_impl, so INPUT1_TYPE for key is always `char`, never `uchar`) - but
+#      the VALUE dequant, before this round, tracked the VALUE PORT's declared type directly
+#      (`convert_half(value_packed)`, no signed cast), so a u8-typed value port over signed-i8
+#      physical bytes silently reinterprets every negative byte (e.g. 0xFB = -5) as its unsigned
+#      value (251), dequantized with a signed zero-point - off by ~256*scale on every element.
+#   3. Round 3's fix put the value port at u8 for exactly the plain/default request this
+#      mechanism corrupts, because it mirrored the pre-swap (u8) key value instead of the
+#      post-swap (i8) one.
+#
+# Fix (this round), two parts:
+#
+#   A1 (this file, execution_config.cpp): drop the before-swap carve-out entirely. The
+#      dynamic/unset mirror now reads get_kv_cache_precision() AFTER the swap - i.e. the same
+#      value the key side itself resolves to - so a plain u8 request makes
+#      get_value_cache_precision() == i8, byte-identical to get_kv_cache_precision(). This
+#      restores the pre-0008 port outcome (value port = i8 = key) that Round 3 broke, but for the
+#      right reason this time: not because "the value port should match the key port" as an
+#      empirical rule, but because the value port SHOULD be i8 whenever the underlying storage is
+#      signed i8, unconditionally, the same as key.
+#   A2 (paged_attention_opt.cl, patches/0010): an explicit `(char)` reinterpretation added to the
+#      non-4-bit value dequant, matching the key dequant's own implicit signed-port invariant, so
+#      the read is correct independent of the value port's declared type - not merely correct
+#      because the config layer currently keeps that port at i8. Two independent fixes for one
+#      invariant (value storage is signed i8, full stop), each catching what the other one alone
+#      would miss if it regressed on its own.
+#
+# Device-free confirmation: a new ExecutionConfig gtest
+# (execution_config_test.kv_cache_u8_value_mirrors_key_precision) asserts, for a plain u8
+# request with VALUE_CACHE_PRECISION left unset, that get_value_cache_precision() ==
+# get_kv_cache_precision() (both i8) - RED on the pre-this-round tree (get_value_cache_precision()
+# resolved u8), GREEN after. A new numeric case,
+# paged_attention_symmetric_u8_kv_test.decode_serves_u8_key_u8_value (patches/0010, alongside
+# this round's other new test), gives the on-card half: the same decode-step configuration as the
+# asymmetric u8-K/i4-V case, but plain symmetric u8/u8 - the exact request Round 3 regressed.
+#
+#
+# --- Round 7 (same follow-up task, same session as Round 6 - found on-card, immediately after
+#     Round 6 landed): the mirror read the wrong side of a getter that shadows itself mid-
+#     finalize, not a logic bug in the mirror condition itself ---
+#
+# Round 6's own new device-free gtest (execution_config_test.kv_cache_u8_value_mirrors_key_
+# precision) FAILED on-card immediately after Round 6 was built and staged: for a plain u8
+# request, get_value_cache_precision() was NOT resolving to i8 as Round 6 intended - even though
+# get_kv_cache_precision() correctly resolved i8 in the same test. Both the numeric on-card tests
+# (decode_serves_u8_key_i4_value, and Round 6's own decode_serves_u8_key_u8_value) passed and
+# arcint served coherent text for both u8 and u8:i4 regardless - because Bug A2 (paged_attention_
+# opt.cl's explicit signed (char) read) already makes decode correctness independent of what the
+# value cache PORT is declared as, so this specific config-layer regression had no observable
+# effect on served output. It still needed fixing at the config layer, since "the port precision
+# happens not to matter because of a second, independent fix" is not the same claim as "the
+# config resolves correctly," and this gtest exists specifically to hold the config layer to its
+# own claim.
+#
+# Root cause, traced through OV_CONFIG_DECLARE_OPTION (src/inference/dev_api/openvino/runtime/
+# plugin_config.hpp): each option's generated get_<name>() is NOT a simple accessor for the
+# internal member - before ExecutionConfig::finalize() completes (m_is_finalized stays false for
+# the entire duration of finalize_impl, including every line Round 6 touches), the getter prefers
+# the RAW value sitting in m_user_properties over the internal m_<name>.value member, whenever the
+# caller explicitly set that property. Round 6's mirror line
+# (`m_value_cache_precision = get_kv_cache_precision();`) called that same smart getter to read
+# the KEY side's SWAPPED value - but for a caller that set KV_CACHE_PRECISION explicitly (u8, the
+# exact case Round 6's own test - and arcint's own `--paged-kv u8` - both exercise),
+# get_kv_cache_precision() still answers the RAW pre-swap m_user_properties entry (u8) at that
+# point in finalize_impl, even though the swap block three lines above had already written i8 into
+# m_kv_cache_precision.value moments earlier. The member write is real and correct - it is only
+# invisible to the SMART GETTER until m_is_finalized flips true at the very end of finalize()
+# (confirmed: this is exactly why the pre-existing kv_cache_u8_normalized_to_i8 test, which reads
+# get_kv_cache_precision() only AFTER finalize() fully returns, has always passed - the getter's
+# preference for m_user_properties is invisible from outside finalize_impl, only observable to
+# code that - like Round 6's mirror - reads a sibling property's "already resolved" value WHILE
+# still inside the same finalize pass that is doing the resolving).
+#
+# Fix: read the raw member m_kv_cache_precision.value directly in the mirror, bypassing the smart
+# getter's m_user_properties shadow entirely - it is a private member of this same class
+# (ExecutionConfig::finalize_impl is a member function), and reading it directly is exactly what
+# the getter itself will answer once finalize() completes and the shadow stops applying. No
+# reordering was needed - the swap block already ran first, in the right order - only reading the
+# swap's actual output instead of asking a getter that, mid-finalize, still prefers what the
+# caller originally typed.
+#
 diff --git a/src/plugins/intel_gpu/include/intel_gpu/runtime/execution_config.hpp b/src/plugins/intel_gpu/include/intel_gpu/runtime/execution_config.hpp
 --- a/src/plugins/intel_gpu/include/intel_gpu/runtime/execution_config.hpp
 +++ b/src/plugins/intel_gpu/include/intel_gpu/runtime/execution_config.hpp
-@@ -35,6 +35,13 @@
+@@ -35,6 +35,13 @@ struct ExecutionConfig : public ov::PluginConfig {
  
      const ov::AnyMap& get_user_properties() const { return m_user_properties; }
  
@@ -376,11 +475,128 @@ diff --git a/src/plugins/intel_gpu/include/intel_gpu/runtime/execution_config.hp
  protected:
      void finalize_impl(const IRemoteContext* context) override;
      void apply_model_specific_options(const IRemoteContext* context, const ov::Model& model) override;
-
+diff --git a/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl b/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl
+--- a/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl
++++ b/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl
+@@ -45,6 +45,7 @@ OV_CONFIG_RELEASE_OPTION(ov, cache_encryption_callbacks, ov::EncryptionCallbacks
+ OV_CONFIG_RELEASE_OPTION(ov::hint, dynamic_quantization_group_size, 0, "Dynamic quantization group size")
+ OV_CONFIG_RELEASE_OPTION(ov::intel_gpu::hint, dynamic_quantization_group_size_max, UINT64_MAX, "Maximum dynamic quantization group size. When group_size is set as a higher value than this number, dynamic quantization will be turned off")
+ OV_CONFIG_RELEASE_OPTION(ov::hint, kv_cache_precision, ov::element::dynamic, "")
++OV_CONFIG_RELEASE_OPTION(ov, value_cache_precision, ov::element::dynamic, "Value-cache precision override for the paged-attention KV cache (the existing public ov::value_cache_precision property, unwired on GPU until now). dynamic (default) mirrors KV_CACHE_PRECISION; set explicitly for an asymmetric key/value cache.")
+ OV_CONFIG_RELEASE_OPTION(ov::intel_gpu::hint, enable_kernels_reuse, false, "Enables kernel reuse across implementations to reduce memory footprint.")
+ OV_CONFIG_RELEASE_OPTION(ov, weights_path, "", "Path to the model weights file used for weightless caching")
+ OV_CONFIG_RELEASE_OPTION(ov::hint, activations_scale_factor, -1.0f, "Scalar floating point value that is used for runtime activation tensor scaling with fp16 inference precision")
+diff --git a/src/plugins/intel_gpu/src/plugin/compiled_model.cpp b/src/plugins/intel_gpu/src/plugin/compiled_model.cpp
+--- a/src/plugins/intel_gpu/src/plugin/compiled_model.cpp
++++ b/src/plugins/intel_gpu/src/plugin/compiled_model.cpp
+@@ -338,6 +338,7 @@ ov::Any CompiledModel::get_property(const std::string& name) const {
+             ov::PropertyName{ov::hint::dynamic_quantization_group_size.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::hint::activations_scale_factor.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::hint::kv_cache_precision.name(), PropertyMutability::RO},
++            ov::PropertyName{ov::value_cache_precision.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::intel_gpu::offload_ratio.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::intel_gpu::moe_otd_device_pool_bytes.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::device::id.name(), PropertyMutability::RO},
+diff --git a/src/plugins/intel_gpu/src/plugin/plugin.cpp b/src/plugins/intel_gpu/src/plugin/plugin.cpp
+--- a/src/plugins/intel_gpu/src/plugin/plugin.cpp
++++ b/src/plugins/intel_gpu/src/plugin/plugin.cpp
+@@ -808,6 +808,7 @@ std::vector<ov::PropertyName> Plugin::get_supported_properties() const {
+         ov::PropertyName{ov::weights_path.name(), PropertyMutability::RW},
+         ov::PropertyName{ov::cache_encryption_callbacks.name(), PropertyMutability::WO},
+         ov::PropertyName{ov::hint::kv_cache_precision.name(), PropertyMutability::RW},
++        ov::PropertyName{ov::value_cache_precision.name(), PropertyMutability::RW},
+         ov::PropertyName{ov::hint::model.name(), PropertyMutability::WO},
+         ov::PropertyName{ov::intel_gpu::offload_ratio.name(), PropertyMutability::RW},
+         ov::PropertyName{ov::intel_gpu::moe_otd_device_pool_bytes.name(), PropertyMutability::RW},
+diff --git a/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp b/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
+--- a/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
++++ b/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
+@@ -852,7 +852,13 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
+                 kv_cache_precision = ov::element::i8;
+             }
+             kv_cache_config.keyCachePrecision = kv_cache_precision;
+-            kv_cache_config.valueCachePrecision = kv_cache_precision;
++            // ov::value_cache_precision (docs/design-m8-asymmetric-kv.md §1): already
++            // normalized by execution_config.cpp's finalize_impl to mirror kv_cache_precision
++            // when the caller left it dynamic, or to the caller's explicit value otherwise
++            // (with the same u8->i8 / i4->u4 storage normalization applied to that value).
++            // No ternary needed here as a result; reading it directly preserves today's
++            // collapsed behaviour byte-for-byte in the default (dynamic) case.
++            kv_cache_config.valueCachePrecision = config.get_value_cache_precision();
+             kv_cache_config.inferencePrecision = infer_precision;
+             if (use_xattention) {
+                 kv_cache_config.keyCacheBlockSize = cldnn::paged_attention::block_size_xattn;
+@@ -873,6 +879,44 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
+             kv_cache_config.valueCacheQuantBychannel = false;
+             kv_cache_config.valueCacheGroupSize = 0;
+ 
++            // docs/design-m8-asymmetric-kv.md, patches/0008/0009 follow-up (on-card, both
++            // rounds): this registration's third argument coerces the resolved cache precision
++            // to an 8-bit-typed port even when it is genuinely i4/u4 - this GPU generation's
++            // paged-attention ports cannot express a sub-8-bit element type at all (confirmed
++            // on-card: an 0008-v2 attempt that dropped this argument entirely made i4/u4 reach
++            // the port directly, and ProgramBuilder's dynamic-case shadow allocation then sized
++            // itself off the 4-bit port against arcint's 8-bit user tensor and failed at infer -
++            // "input device tensor expected >= user tensor" - not a RemoteTensor-only concern as
++            // first assumed; it is this generation's storage convention, full stop). The real
++            // packing lives at the CONFIG level (KV_CACHE_PRECISION/VALUE_CACHE_PRECISION,
++            // already independently resolved above and read directly by every kernel/allocation
++            // site - pa_kv_reorder.cpp's own comment says exactly this), never at the port.
++            //
++            // The lambda below is the SAME argument, restored, with two fixes over the original:
++            //   1. Per-side-correct by construction: the original read config.get_kv_cache_
++            //      precision() - the KEY side - for BOTH the key_cache_precision and value_
++            //      cache_precision calls (this is what silently discarded an asymmetric
++            //      VALUE_CACHE_PRECISION request). This version coerces off `precision` itself -
++            //      the exact local value being processed at each of the two calls (key_cache_
++            //      precision, then value_cache_precision; format_cache_precision() is an
++            //      identity function for i4/u4, so `precision` already equals that side's own
++            //      resolved get_kv_cache_precision()/get_value_cache_precision() at the point
++            //      this runs). Operating on the value in hand instead of a shared, indirect
++            //      config read is correct for the key call, correct for the value call, and -
++            //      unlike either config getter - also correct for the two callers that are
++            //      neither key nor value (conv_cache_precision, gated_delta_cache_precision;
++            //      see this same lambda's other call sites in convert_pagedattn_inputs.cpp),
++            //      which have no key/value config getter to read from in the first place.
++            //   2. Its ternary's dead branch is fixed: the original compared
++            //      config.get_kv_cache_precision() against i4, which can never be true -
++            //      execution_config.cpp's finalize_impl (the u8->i8/i4->u4 swap, immediately
++            //      above) always runs before this pipeline code does, so an i4 request already
++            //      reads back as u4 by the time any config getter could see it. The result was
++            //      that the ternary forced u8 unconditionally for every i4/u4 request, silently
++            //      dropping the key side's own i4 spelling too. Checking `precision` directly
++            //      (i4 vs u4) makes both arms of the alias genuinely reachable, and - because it
++            //      no longer depends on any upstream swap having already run - the key side's i4
++            //      spelling can no longer skip coercion under any ordering.
+             manager.register_pass<ov::pass::ConvertPagedAttnInputs>(kv_cache_config,
+                 [&infer_precision](const ov::element::Type& precision,
+                 const bool bychannel,
+@@ -903,11 +947,16 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
+                         }
+                     }
+                 },
+-                [&] (ov::element::Type& precision) {
+-                    // Use u8/i8 for cache even if the inference precision is i4/u4,
+-                    // to avoid issue that u4-type cache is called by ov::RemoteTensor in genai.
+-                    if (precision == ov::element::i4 || precision == ov::element::u4) {
+-                        precision = (config.get_kv_cache_precision() == ov::element::i4) ? ov::element::i8 : ov::element::u8;
++                [] (ov::element::Type& precision) {
++                    // Use i8/u8 for cache storage even when the resolved precision is i4/u4 -
++                    // this GPU generation's paged-attention ports cannot express sub-8-bit
++                    // element types; packing lives at the config level (see the header above).
++                    // Alias by sign, preserved across the bitwidth change: i4 (signed 4-bit) -> i8,
++                    // u4 (unsigned 4-bit) -> u8.
++                    if (precision == ov::element::i4) {
++                        precision = ov::element::i8;
++                    } else if (precision == ov::element::u4) {
++                        precision = ov::element::u8;
+                     }
+                 });
+         }
 diff --git a/src/plugins/intel_gpu/src/runtime/execution_config.cpp b/src/plugins/intel_gpu/src/runtime/execution_config.cpp
 --- a/src/plugins/intel_gpu/src/runtime/execution_config.cpp
 +++ b/src/plugins/intel_gpu/src/runtime/execution_config.cpp
-@@ -161,6 +161,59 @@
+@@ -161,6 +161,59 @@ void ExecutionConfig::finalize(cldnn::engine& engine) {
      PluginConfig::finalize(ctx.get(), nullptr);
  }
  
@@ -440,40 +656,64 @@ diff --git a/src/plugins/intel_gpu/src/runtime/execution_config.cpp b/src/plugin
  void ExecutionConfig::apply_rt_info(const IRemoteContext* context, const ov::RTMap& rt_info, bool is_llm, bool is_paged_attention_model, bool has_lora) {
      const auto* remote_context = dynamic_cast<const RemoteContextImpl*>(context);
      OPENVINO_ASSERT(remote_context != nullptr, "Expected GPU RemoteContextImpl in ExecutionConfig::apply_rt_info");
-@@ -357,6 +410,12 @@
-         m_optimize_data = true;
-     }
- 
-+    // docs/design-m8-asymmetric-kv.md, patches/0008 "Round 3": captured BEFORE the key-side
-+    // u8->i8/i4->u4 swap below, so the value-side mirror a few lines down can reproduce the
-+    // pre-patch port outcome for the plain, symmetric/mirrored case instead of the swapped one.
-+    // See that mirror's own comment for why this capture exists.
-+    const auto kv_cache_precision_before_swap = get_kv_cache_precision();
-+
-     // Replace UINT8 KV-cache compression data type with INT8, as plugin is supposed to work with INT8 internally
-     if (get_kv_cache_precision() == ov::element::u8) {
-         m_kv_cache_precision = ov::element::i8;
-@@ -366,6 +425,53 @@
+@@ -366,6 +419,90 @@ void ExecutionConfig::finalize_impl(const IRemoteContext* context) {
          m_kv_cache_precision = ov::element::u4;
      }
  
-+    // ov::value_cache_precision (docs/design-m8-asymmetric-kv.md, "Round 3" regression fix):
-+    // dynamic (unset) mirrors the RAW, pre-swap key request (captured above as kv_cache_
-+    // precision_before_swap), not the already-swapped i8 value - and applies ONLY the i4->u4
-+    // half of the key-side normalization to that mirror, never u8->i8. This reproduces the
-+    // pre-patch port outcome for the plain/symmetric case exactly: --paged-kv u8 (nothing set
-+    // for VALUE_CACHE_PRECISION) must compile the value port u8-typed while the key port stays
-+    // i8-typed, because on-card measurement (Round 3) found something downstream reads value
-+    // data's signedness from the port type - mirroring the swapped i8 for value made a plain u8
-+    // request serve garbage decode text even though u4/i4 (which still coerce through the same
-+    // 4-bit->8-bit-typed lambda in transformations_pipeline.cpp either way) stayed coherent.
++    // ov::value_cache_precision (docs/design-m8-asymmetric-kv.md; "Round 6" fix, replacing the
++    // "Round 3" logic below that this comment used to describe - kept only as history, not as
++    // the live rule):
++    //
++    // dynamic (unset) mirrors the SWAPPED key value, i.e. get_kv_cache_precision() taken AFTER
++    // the u8->i8/i4->u4 normalization immediately above - full stop, no before-swap carve-out.
++    // A plain `--paged-kv u8` request therefore resolves get_value_cache_precision() == i8,
++    // identical to get_kv_cache_precision().
++    //
++    // "Round 3" (patches/0008) had this mirror the RAW, pre-swap key request instead - i.e. a
++    // plain u8 request left the value side at u8 while the key side normalized to i8 - on the
++    // theory that "something downstream reads value data's signedness from the port type" and
++    // that a matching i8 value port was what caused u8 symmetric decode to go to garbage on-card.
++    // That theory had the direction backwards. The physical value cache is unconditionally
++    // SIGNED i8 storage in the non-4-bit case: pa_kv_cache_update_ref.cl's quantize_and_save_
++    // per_token (shared by both key and value writes, INT8 arm) computes a signed zero-point
++    // (`zp = -min*scale + CHAR_MIN`) and stores via `convert_char_rte`, range [-128, 127],
++    // regardless of which side (key or value) is being written - out_data_pitch distinguishes
++    // the layout, not the signedness. The READ side confirms the same convention asymmetrically:
++    // paged_attention_opt.cl's key dequant (the by-channel/by-token unpack arms feeding qk_vals)
++    // force-casts through `(char)` before widening, making key reads immune to the key port's
++    // declared signedness, while the pre-this-round value dequant
++    // (`value_val = (convert_half(value_packed) - comp_zp) * comp_scale`) had no such cast, so
++    // value signedness tracked the value PORT's declared type instead of the physically-signed
++    // bytes underneath it. Round 3's fix (value port = u8 for a plain u8 request) therefore
++    // reintroduced exactly the u8-port-over-signed-bytes mismatch it was trying to route around:
++    // an i8 byte like 0xFB (-5) read back as unsigned 251, dequantized with a signed zero-point,
++    // off by ~256*scale on every value element. Mirroring the SWAPPED (i8) key value restores
++    // value port = i8 = key, byte-identical to the pre-0008 world, which is what this round
++    // measured as correct at the config layer (see the new ExecutionConfig gtest alongside this
++    // patch). This round is paired with a second, independent fix - an explicit signed cast
++    // added to the value dequant in paged_attention_opt.cl, matching the key path's own `(char)`
++    // cast - so a plain u8 request is correct whether or not a future change ever makes the value
++    // port's declared type diverge from i8 again.
++    //
 +    // When the caller sets VALUE_CACHE_PRECISION explicitly, the full u8->i8/i4->u4 normalization
-+    // still applies below - matching the key side's own storage convention is what an explicit,
-+    // same-value request should mean, and this is not the accidental-default path Round 3 broke.
++    // still applies below - an explicit, same-storage-convention request behaves exactly as the
++    // key side's own u8/i4 request would.
 +    if (get_value_cache_precision() == ov::element::dynamic) {
-+        m_value_cache_precision = (kv_cache_precision_before_swap == ov::element::i4)
-+                                       ? ov::element::u4
-+                                       : kv_cache_precision_before_swap;
++        // Read the raw member (m_kv_cache_precision.value) directly here, NOT the smart getter
++        // get_kv_cache_precision(). OV_CONFIG_DECLARE_OPTION's generated getter (plugin_config.
++        // hpp): before finalize() completes (m_is_finalized is still false for the whole
++        // duration of finalize_impl, this function), the getter prefers the RAW, pre-swap value
++        // from m_user_properties over m_kv_cache_precision.value whenever the caller explicitly
++        // set KV_CACHE_PRECISION - so a caller that requested u8 explicitly (e.g. arcint's
++        // --paged-kv u8) would see get_kv_cache_precision() still answer u8 here, even though
++        // the swap block immediately above already wrote i8 into m_kv_cache_precision.value.
++        // Mirroring THAT stale answer reintroduces exactly the bug this fix closes - measured on
++        // a device-free ExecutionConfig gtest that explicitly sets KV_CACHE_PRECISION(u8) before
++        // calling finalize(), the same shape as arcint's own call. Reading the member directly
++        // bypasses the user-properties shadow entirely and sees the value the swap block just
++        // wrote, matching what get_kv_cache_precision() itself will answer once finalize()
++        // completes and m_is_finalized flips true.
++        m_value_cache_precision = m_kv_cache_precision.value;
 +    } else if (get_value_cache_precision() == ov::element::u8) {
 +        m_value_cache_precision = ov::element::i8;
 +    } else if (get_value_cache_precision() == ov::element::i4) {
@@ -507,113 +747,3 @@ diff --git a/src/plugins/intel_gpu/src/runtime/execution_config.cpp b/src/plugin
  #ifdef ENABLE_DEBUG_CAPS
      // For now we apply config file only for build with debug caps, but it can be updated in the future to allow
      // reading release options for any build type
-
-diff --git a/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp b/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
---- a/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
-+++ b/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
-@@ -852,7 +852,13 @@
-                 kv_cache_precision = ov::element::i8;
-             }
-             kv_cache_config.keyCachePrecision = kv_cache_precision;
--            kv_cache_config.valueCachePrecision = kv_cache_precision;
-+            // ov::value_cache_precision (docs/design-m8-asymmetric-kv.md §1): already
-+            // normalized by execution_config.cpp's finalize_impl to mirror kv_cache_precision
-+            // when the caller left it dynamic, or to the caller's explicit value otherwise
-+            // (with the same u8->i8 / i4->u4 storage normalization applied to that value).
-+            // No ternary needed here as a result; reading it directly preserves today's
-+            // collapsed behaviour byte-for-byte in the default (dynamic) case.
-+            kv_cache_config.valueCachePrecision = config.get_value_cache_precision();
-             kv_cache_config.inferencePrecision = infer_precision;
-             if (use_xattention) {
-                 kv_cache_config.keyCacheBlockSize = cldnn::paged_attention::block_size_xattn;
-@@ -873,6 +879,44 @@
-             kv_cache_config.valueCacheQuantBychannel = false;
-             kv_cache_config.valueCacheGroupSize = 0;
- 
-+            // docs/design-m8-asymmetric-kv.md, patches/0008/0009 follow-up (on-card, both
-+            // rounds): this registration's third argument coerces the resolved cache precision
-+            // to an 8-bit-typed port even when it is genuinely i4/u4 - this GPU generation's
-+            // paged-attention ports cannot express a sub-8-bit element type at all (confirmed
-+            // on-card: an 0008-v2 attempt that dropped this argument entirely made i4/u4 reach
-+            // the port directly, and ProgramBuilder's dynamic-case shadow allocation then sized
-+            // itself off the 4-bit port against arcint's 8-bit user tensor and failed at infer -
-+            // "input device tensor expected >= user tensor" - not a RemoteTensor-only concern as
-+            // first assumed; it is this generation's storage convention, full stop). The real
-+            // packing lives at the CONFIG level (KV_CACHE_PRECISION/VALUE_CACHE_PRECISION,
-+            // already independently resolved above and read directly by every kernel/allocation
-+            // site - pa_kv_reorder.cpp's own comment says exactly this), never at the port.
-+            //
-+            // The lambda below is the SAME argument, restored, with two fixes over the original:
-+            //   1. Per-side-correct by construction: the original read config.get_kv_cache_
-+            //      precision() - the KEY side - for BOTH the key_cache_precision and value_
-+            //      cache_precision calls (this is what silently discarded an asymmetric
-+            //      VALUE_CACHE_PRECISION request). This version coerces off `precision` itself -
-+            //      the exact local value being processed at each of the two calls (key_cache_
-+            //      precision, then value_cache_precision; format_cache_precision() is an
-+            //      identity function for i4/u4, so `precision` already equals that side's own
-+            //      resolved get_kv_cache_precision()/get_value_cache_precision() at the point
-+            //      this runs). Operating on the value in hand instead of a shared, indirect
-+            //      config read is correct for the key call, correct for the value call, and -
-+            //      unlike either config getter - also correct for the two callers that are
-+            //      neither key nor value (conv_cache_precision, gated_delta_cache_precision;
-+            //      see this same lambda's other call sites in convert_pagedattn_inputs.cpp),
-+            //      which have no key/value config getter to read from in the first place.
-+            //   2. Its ternary's dead branch is fixed: the original compared
-+            //      config.get_kv_cache_precision() against i4, which can never be true -
-+            //      execution_config.cpp's finalize_impl (the u8->i8/i4->u4 swap, immediately
-+            //      above) always runs before this pipeline code does, so an i4 request already
-+            //      reads back as u4 by the time any config getter could see it. The result was
-+            //      that the ternary forced u8 unconditionally for every i4/u4 request, silently
-+            //      dropping the key side's own i4 spelling too. Checking `precision` directly
-+            //      (i4 vs u4) makes both arms of the alias genuinely reachable, and - because it
-+            //      no longer depends on any upstream swap having already run - the key side's i4
-+            //      spelling can no longer skip coercion under any ordering.
-             manager.register_pass<ov::pass::ConvertPagedAttnInputs>(kv_cache_config,
-                 [&infer_precision](const ov::element::Type& precision,
-                 const bool bychannel,
-@@ -903,11 +947,16 @@
-                         }
-                     }
-                 },
--                [&] (ov::element::Type& precision) {
--                    // Use u8/i8 for cache even if the inference precision is i4/u4,
--                    // to avoid issue that u4-type cache is called by ov::RemoteTensor in genai.
--                    if (precision == ov::element::i4 || precision == ov::element::u4) {
--                        precision = (config.get_kv_cache_precision() == ov::element::i4) ? ov::element::i8 : ov::element::u8;
-+                [] (ov::element::Type& precision) {
-+                    // Use i8/u8 for cache storage even when the resolved precision is i4/u4 -
-+                    // this GPU generation's paged-attention ports cannot express sub-8-bit
-+                    // element types; packing lives at the config level (see the header above).
-+                    // Alias by sign, preserved across the bitwidth change: i4 (signed 4-bit) -> i8,
-+                    // u4 (unsigned 4-bit) -> u8.
-+                    if (precision == ov::element::i4) {
-+                        precision = ov::element::i8;
-+                    } else if (precision == ov::element::u4) {
-+                        precision = ov::element::u8;
-                     }
-                 });
-         }
-
-diff --git a/src/plugins/intel_gpu/src/plugin/plugin.cpp b/src/plugins/intel_gpu/src/plugin/plugin.cpp
---- a/src/plugins/intel_gpu/src/plugin/plugin.cpp
-+++ b/src/plugins/intel_gpu/src/plugin/plugin.cpp
-@@ -808,6 +808,7 @@
-         ov::PropertyName{ov::weights_path.name(), PropertyMutability::RW},
-         ov::PropertyName{ov::cache_encryption_callbacks.name(), PropertyMutability::WO},
-         ov::PropertyName{ov::hint::kv_cache_precision.name(), PropertyMutability::RW},
-+        ov::PropertyName{ov::value_cache_precision.name(), PropertyMutability::RW},
-         ov::PropertyName{ov::hint::model.name(), PropertyMutability::WO},
-         ov::PropertyName{ov::intel_gpu::offload_ratio.name(), PropertyMutability::RW},
-         ov::PropertyName{ov::intel_gpu::moe_otd_device_pool_bytes.name(), PropertyMutability::RW},
-
-diff --git a/src/plugins/intel_gpu/src/plugin/compiled_model.cpp b/src/plugins/intel_gpu/src/plugin/compiled_model.cpp
---- a/src/plugins/intel_gpu/src/plugin/compiled_model.cpp
-+++ b/src/plugins/intel_gpu/src/plugin/compiled_model.cpp
-@@ -338,6 +338,7 @@
-             ov::PropertyName{ov::hint::dynamic_quantization_group_size.name(), PropertyMutability::RO},
-             ov::PropertyName{ov::hint::activations_scale_factor.name(), PropertyMutability::RO},
-             ov::PropertyName{ov::hint::kv_cache_precision.name(), PropertyMutability::RO},
-+            ov::PropertyName{ov::value_cache_precision.name(), PropertyMutability::RO},
-             ov::PropertyName{ov::intel_gpu::offload_ratio.name(), PropertyMutability::RO},
-             ov::PropertyName{ov::intel_gpu::moe_otd_device_pool_bytes.name(), PropertyMutability::RO},
-             ov::PropertyName{ov::device::id.name(), PropertyMutability::RO},

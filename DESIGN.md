@@ -2696,50 +2696,68 @@ matcher. The walk has a blind spot the matcher does not; the named next
 instrument is matcher logging on a debug build, and until it speaks, the
 head serves unfused.
 
-#### 7.0.2w Asymmetric KV: the ladder that refuses, and a plugin bug that ended the dig (2026-09-02)
+#### 7.0.2w Asymmetric KV serves: u8 keys, i4 values, and two bugs that were never a wall (2026-09-02)
 
-M8's premise was u8 keys / i4 values to cut KV per token at near-u8 quality.
-Two facts, both measured, reshaped it into a smaller thing than the row asked
-for.
+M8's premise — u8 keys / i4 values to cut KV per token — is met: `--paged-kv
+u8:i4` serves coherent output on the 35B at **8.8 KiB/token against u8's 11.3,
+a 22% cut**, CPU-reference-verified. Getting there required retracting two
+wrong calls this section made when it first parked the work, both worth the
+record.
 
-**The decode kernels cannot do it.** On this plugin generation every
-paged-attention JIT constant that selects packing derives from one
-`is_i4_u4(kv_cache_precision)` boolean shared by both operands, in the source
-and the generated OpenCL alike; expressing K-unpacked / V-packed needs a
-kernel-source rewrite, named in `patches/0009`'s header. So the reachable
-deliverable is not asymmetric *serving* but asymmetric *refusal* — and that
-landed and is proven on-card: `--paged-kv u8:i4` fails at
-`ExecutionConfig::finalize()` with a message naming both precisions and the
-reason, before any compile, rather than silently serving symmetric u8. The
-arcint side is the durable win of this increment: `--paged-kv KEY[:VALUE]`
+**"The decode kernels cannot do it" was wrong.** The claim rested on one
+`is_i4_u4(kv_cache_precision)` boolean gating both operands — but that is a
+shared JIT *symbol*, not shared tiling. The `.cl` already reads K via
+`INPUT1_TYPE` and V via `INPUT2_TYPE`, the unpack blocks are already separate,
+and the workgroup dispatch is V-side-driven, so there is no symmetric-head
+assumption to break. The read-side split is ~8 macro renames (`IS_INT4_K` /
+`IS_INT4_V`); for u8-K/i4-V the entire V path is byte-identical to i4/i4 and
+only K flips to its existing unpacked arm. Writing plugin patches is in scope
+for this series, so the kernel got written, not deferred.
+
+**"A layout-sensitive miscompile" was wrong — it was two real source bugs.**
+The u8-serves-garbage symptom that parked `0008` reproduced on a *cold*
+from-scratch clone, killing the build-artifact theory. Root-caused to file
+lines, both matching a CPU-reference test:
+
+- *Bug A (symmetric u8 garbage).* The value cache is physically stored **signed
+  i8** (the write does `convert_char_rte`), but the value *read* does
+  `convert_half` with no forced signed cast — unlike the key read, which
+  hardcodes `(char)` — so its signedness follows the declared port type.
+  `0008` flipped the value port from i8 to u8 for a symmetric request, so
+  `0xFB (−5)` read as `251`, dequant off by ~256·scale → salad. Two-part fix:
+  the finalize value-mirror reads the *swapped* key member directly
+  (`m_kv_cache_precision.value`, not the getter, which shadows the member
+  through `m_user_properties` until finalize completes — the subtlety that
+  had defeated rounds 3–5), **and** the value read gets an explicit `(char)`
+  cast so it is correct regardless of the port's declared type.
+- *Bug B (u8:i4 −nan).* The read kernel split per-side but the **write** kernel
+  did not — `KVCacheUpdateGenerator` gated packing on the key precision alone,
+  so V was written unpacked while the read expected packed u4 nibbles →
+  misaligned scale/zp → NaN at the first element. Fix: split the write path
+  (`KVCacheUpdateGenerator` + `pa_kv_cache_update_ref.cl`, all three write
+  stages) per operand, mirroring the read.
+
+Verified before promotion: 210 `paged_attention` unit tests pass — including
+the pre-existing u4/u8 cases through the split kernels and new symmetric-u8,
+symmetric-u4 and u8-K/i4-V CPU-reference cases — and both u8 and u8:i4 serve
+coherent text at multi-chunk-prefill depth. An adversarial review before
+promotion caught a matrix hole (`f16:i4` and other f16-mixed pairs now refuse
+loudly at finalize, not slip through), a latent unsplit reorder kernel
+(unreachable in this engine, now guarded), and two narrated-not-measured
+header claims (retracted per §7.0.1); the patches (`0008`/`0009`/`0010`) then
+promoted from `parked/` into the applied series.
+
+The durable arcint-side surface stands as before: `--paged-kv KEY[:VALUE]`
 over `{f16,u8,i8,u4,i4}`, a per-side bitwidth audit that treats the plugin's
-u8-stored-as-i8 and 4-bit-in-8-bit-typed-port conventions as measured aliases
-while refusing a real width change, and a KV cost model that reads the packed
-width (a retracted over-broad first cut is on the record in `fit.h`, per
-§7.0.1). Symmetric `u4` serves and prices as expected — 6.3 KiB/token against
-u8's 11.3 on the 35B, coherent output.
-
-**The plugin patches are parked, not shipped.** Building the OpenVINO GPU
-plugin with `patches/0008` (the `VALUE_CACHE_PRECISION` plumbing) present made
-plain `--paged-kv u8` serve deterministic garbage. A four-way plugin bisect
-cleared the M9 series (`0004`–`0007` serve coherently; their §7.0.2v numbers
-stand) and localised the corruption to `0008`'s mere presence — not its
-resolved values (a version whose value resolved byte-identical to the key
-corrupted too), not the model cache (inactive on every failing run), not the
-`0009` kernel guard. Then the tell: a build of `0008` carrying an unused
-env-gated debug method — a change to a widely-included header — served
-*coherently*. A result that moves when instrumentation is added and nothing
-else is a layout-sensitive miscompile: latent undefined behaviour in the tree
-that `0008` perturbs, or an incremental-build staleness artifact across the
-scratch clones (the one cold-from-scratch build in the set was coherent).
-Distinguishing those is two more cold full-plugin builds and another card
-window; against a feature that can only refuse anyway, that dig was stopped
-here deliberately. `patches/0008`/`0009` are retained as the analysis and the
-fail-loud contract, marked measurement-blocked and **not applied to the
-production plugin**, which serves `+p1` (§`project-ovsrc-plugin-modified`) and
-never carried them — production was never exposed. The next step, if the
-kernel rewrite is ever wanted, starts with one cold-build A/B to settle
-miscompile-vs-artifact before touching source.
+u8-stored-as-i8 and 4-bit-in-8-bit-typed-port conventions as measured aliases,
+and a KV cost model reading the packed width (a retracted over-broad first cut
+is on the record in `fit.h`). Symmetric `u4` also serves and prices at 6.3
+KiB/token. Still owed, named not chased: the u8:i4 **prefill** throughput
+price (micro-SDPA declines for the packing-class mismatch, so prefill takes
+the opt path, unpriced against §7.0.3's depth curve) and cold-vs-warm
+prefix-cache byte-exactness at u8:i4. Production still serves `+p1`
+(§`project-ovsrc-plugin-modified`) and does not yet carry these — deployment
+is a separate decision.
 
 #### 7.0.2r DFlash2: the external-drafter hook gets a real drafter (2026-09-01)
 
