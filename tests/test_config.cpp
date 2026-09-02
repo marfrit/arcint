@@ -541,6 +541,41 @@ TEST(config_pin_dispatch_rejects_garbage) {
     CHECK(rejected({"--stub", "--pin-dispatch", "not-a-core"}));
 }
 
+TEST(config_moe_cpu_tier_defaults_off) {
+    Config cfg;
+    CHECK(run({"--stub"}, cfg).ok);
+    CHECK(!cfg.moe_cpu_tier);
+    CHECK_EQ(cfg.moe_cpu_tier_threads, 0);
+}
+
+TEST(config_moe_cpu_tier_accepts_with_offload_ratio) {
+    Config cfg;
+    CHECK(run({"--stub", "--offload-ratio", "20", "--moe-cpu-tier"}, cfg).ok);
+    CHECK(cfg.moe_cpu_tier);
+
+    Config cfg2;
+    CHECK(run({"--stub", "--offload-ratio", "20", "--moe-cpu-tier",
+               "--moe-cpu-tier-threads", "7"}, cfg2).ok);
+    CHECK_EQ(cfg2.moe_cpu_tier_threads, 7);
+}
+
+TEST(config_moe_cpu_tier_needs_offload_ratio) {
+    CHECK(rejected({"--stub", "--moe-cpu-tier"}));
+}
+
+TEST(config_moe_cpu_tier_threads_needs_tier) {
+    // A thread count without the tier would be accepted and silently ignored
+    // (found in review); refuse it so a mistyped invocation cannot look tuned.
+    CHECK(rejected({"--stub", "--offload-ratio", "20", "--moe-cpu-tier-threads", "7"}));
+}
+
+TEST(config_moe_cpu_tier_rejects_garbage) {
+    CHECK(rejected({"--stub", "--offload-ratio", "20", "--moe-cpu-tier",
+                    "--moe-cpu-tier-threads", "-1"}));
+    CHECK(rejected({"--stub", "--offload-ratio", "20", "--moe-cpu-tier",
+                    "--moe-cpu-tier-threads", "lots"}));
+}
+
 TEST(config_fit_margin_mib_defaults_256) {
     Config cfg;
     CHECK(run({"--stub"}, cfg).ok);

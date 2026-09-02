@@ -1,0 +1,1410 @@
+# MoE host CPU compute tier: decode-path redirect and kernel sentinel skip
+#
+# M14 (0.3.0). Companion to patches/0011 (the CPU kernel itself, no runtime
+# wiring - MOE_CPU_TIER exists as a property and does nothing with only 0011
+# applied). This patch is the wiring: which (token,expert) pairs get redirected
+# to the host tier (LRU probe, capacity-miss policy), how the GEMV kernels are
+# told to skip them, and how the host excursion overlaps the GPU work and
+# joins before mlp_reduce.
+#
+# Correction to the predecessor design (docs/design-m9-offload-v2.md §2) and
+# to the task brief: the OTD weight tensors are NOT host-addressable today.
+# fill_weights_memory (moe_otd_runtime.cpp) reads each tensor with
+# ParallelWeightReader::read() -> positional_read() on a plain file handle,
+# into a loop-local std::vector<uint8_t> payload; there is no mmap and no
+# usm_host mirror of the expert weights (the usm_host buffers that exist are
+# the staging ring and the device/host-tier slot buffers, both destinations,
+# never sources). Reusing payload for the CPU tier would cost a 1.6 MiB pread
+# plus memcpy per expert per token on the decode critical path. Patch 0011
+# adds ParallelWeightReader::mapped(offset, size): a lazily-created, read-only
+# mmap of the same weight file, so a run that never enables the tier never
+# creates the mapping, and the CPU tier reads the exact bytes the GPU upload
+# path would have read, at the cost of a page-cache reference instead of a
+# copy.
+#
+# Weight nibble order (the fact patch 0011's kernel and this patch's redirect
+# both depend on, reproduced here because a reader who only looks at the
+# GEMV's lane pairing will conclude the wrong thing). For a 4-bit weight
+# column, byte j holds element 2j in the low nibble and element 2j+1 in the
+# high nibble - standard packing. The GEMV's lane pairing
+# (moe_3gemm_swiglu_mlp.cl, the ELEMS_PER_LANE inner loops, e.g. the ==4
+# branch) *looks* half-block interleaved, but that is a staging-buffer
+# artifact, not the stored layout: the x2 SLM staging de-interleaves x first
+# (for each FAKE_GROUP block, px2[j] = px[2j] and
+# px2[j + FAKE_GROUP_SIZE/2] = px[2j+1]). Substituting that staging map back
+# through lane L's read (a.s0 = x2[gk*FG + L], a.s2 = x2[gk*FG + FG/2 + L],
+# paired with DEQUANT_4BIT_LO(b.s0) / DEQUANT_4BIT_HI(b.s0)) yields LO -> x[gk*FG
+# + 2L], HI -> x[gk*FG + 2L + 1] - i.e. the ordinary 2j/2j+1 packing, with the
+# apparent interleave coming entirely from x2, not from the weight bytes. The
+# same substitution holds in the ELEMS_PER_LANE==2 and ==8 branches. Scale/zp
+# axes: file layout is the transpose of the device layout
+# (maybe_transpose_scale_zp maps src[o*group_count+g] -> dst[g*oc+o] on
+# upload), so the CPU reads scale/zp as [oc][group] and must NOT transpose -
+# doing so produces an O(1) error whenever oc != group_count, true for every
+# served shape, which is why patches/0011's T1 red case 2 exists.
+#
+# Policy decision (§2.4 of the binding spec; do not re-open without new
+# measurement). Chosen: a capacity miss - one that would evict a resident
+# expert from the device LRU pool - is redirected to the CPU tier with no LRU
+# insertion and no async promotion. A miss taken while the pool still has a
+# never-claimed free slot still uploads (warm-up, identical to the pre-M14
+# path); once the pool is full, the partition between "first-touch resident"
+# and "CPU tier" is static for the rest of the run.
+#
+#   Rejected A - insert without filling: a later probe() would report the
+#   expert resident and hand the GEMV an unfilled slot. Silent garbage, not a
+#   correctness bug you can find by inspection.
+#
+#   Rejected B - insert and upload asynchronously off the critical path: pays
+#   the exact PCIe cost M14 exists to remove, and pays it for the cold tail
+#   (the set the LRU has already ranked below everything resident). Under a
+#   decode stream that keeps missing, async uploads queue behind each other on
+#   the in-order queue and re-enter the critical path through the staging
+#   ring's acquire() wait; it also re-introduces evictions of the hot set that
+#   patch 0004's counters were built to show were absent.
+#
+#   Rejected C - frequency-based admission with promotion after K hits: the
+#   right answer if the closing measurement shows the first-touch resident set
+#   is a poor approximation of the hot set. Not the right answer to guess at -
+#   nothing measured says the hot set drifts. Parked; the gpu_hit_rate T4
+#   reports is the number that would argue for it.
+#
+# Kernel skip mechanism, five-point correctness argument (quote-verified
+# against the tree this patch applies to):
+#   1. scratch.up rows of a skipped pair are left stale by mlp_gate_up.
+#      mlp_down skips exactly the same pairs (same expert_list, same flat_id
+#      decomposition in both kernels), so no stale scratch.up value is ever
+#      read - no NaN can propagate from an unwritten row.
+#   2. scratch.y rows of a skipped pair are left stale by mlp_down and are
+#      unconditionally overwritten by the host DMA in cpu_tier_join(), enqueued
+#      before mlp_reduce.
+#   3. The shared expert (expert_slot == MAX_TOPK) never takes the sentinel
+#      branch: it has no LRU slot and cannot be a capacity miss.
+#   4. Barrier legality: local size in dimension 0 is 1 for both the gate_up
+#      and down stages (exec_batched_gemv's execute_stage calls,
+#      moe_3gemm_swiglu_opt.cpp - the workgroup dispatch that predates this
+#      patch and that this patch does not change), so flat_id and expert_id
+#      are uniform across every work-item of a workgroup. A workgroup that
+#      returns before its barrier does so as a whole; no work-item of it ever
+#      reaches the barrier. This is the same uniformity the pre-existing
+#      dispatch already relies on (one workgroup, one (token,expert) pair).
+#   5. With MOE_CPU_TIER off, MOE_CPU_TIER_ENABLE is not jitted
+#      (add_common_consts checks config.get_moe_cpu_tier() and only defines it
+#      when true), the preprocessor removes both #ifdef MOE_CPU_TIER_ENABLE
+#      blocks in moe_3gemm_swiglu_mlp.cl entirely, and the kernel source fed to
+#      the compiler is byte-for-byte the pre-patch source. Not independently
+#      verified by diffing compiled binaries (no card in this environment);
+#      verification is the preprocessor argument above plus grep of the
+#      generated kernel sources directory in the build log for the sentinel
+#      symbol, owed to the T4 window.
+#
+# Event ordering (why cpu_tier_join's placement between `down` and `reduce` is
+# sufficient, not merely convenient). Correctness needs exactly one thing: the
+# host DMA must land after `down` and before `reduce`. Both hold by program
+# order on the in-order queue (execution_config.cpp forces in_order whenever
+# use_onednn is set, true for both cards this milestone targets) - the same
+# guarantee patches 0006/0007 already lean on. It does not need to land after
+# gate_up/down for *conflict* reasons: with the sentinel skip those kernels
+# never write the miss rows, so there is no write-write race to order against;
+# the requirement is purely read-after-write against mlp_reduce, which reads
+# every EXPERTS_PER_TOKEN row unconditionally (untouched by this patch on
+# purpose - the host, not the kernel, supplies the missing ones).
+#
+# The CPU is not bit-equal to the GPU, and that is intentional (rounding,
+# patches/0011 §5.4, restated here because it is the source of G1b's
+# tolerance, not a defect this patch owes a fix for): the GPU accumulates
+# within-fake-group partial products in `half` before scaling to float
+# (moe_3gemm_swiglu_mlp.cl's ELEMS_PER_LANE inner loops); the CPU kernel
+# accumulates in f32 throughout and rounds to f16 only at the three stage
+# boundaries the GPU itself stores at (up/gate SwiGLU intermediate, down
+# output). Patches/0011's T1c predicts the resulting divergence host-only, by
+# emulating the GPU's half accumulation at (SUBGROUP_SIZE, ELEMS_PER_LANE) for
+# both served cards; T4 compares the measured max-abs logit diff against that
+# prediction. A measured diff far above the prediction is a layout bug this
+# patch's kernel skip or the redirect above got wrong, not float noise -
+# not this patch's job to have found, since T4 is on-card and this
+# environment has no card.
+#
+# Deviation from the binding spec, stated rather than hidden: §5.6's two-phase
+# per-expert column split (gate/up+SwiGLU as one wave, down as a second,
+# CHUNK-sized wave, so a single expert's down-stage columns can be spread
+# across pool threads without recomputing gate/up) is not implemented.
+# moe_cpu_expert.hpp's public API (patches/0011) exposes only whole-pipeline
+# calls (moe_cpu_expert[_ref|_avx2](desc, jobs, n_jobs, col_begin, col_end) -
+# gate/up/SwiGLU computed in full for every call, only the down stage's
+# columns are split) with no separate entry point for the intermediate `h`
+# buffer between gate/up and down, so intra-expert splitting is not reachable
+# from this file without changing that header, which is patches/0011's file.
+# dispatch_cpu_tier() instead issues one CpuTierPool task per missed expert
+# (col_begin=0, col_end=hidden), parallelising across experts rather than
+# within one. Correct, and sufficient parallelism at the served topk (up to 8
+# missing experts per token); a token with very few misses gets less thread
+# utilisation than the spec's design would have given it. Left as a follow-up,
+# not implemented here, because closing it means extending patches/0011's
+# public header, which belongs to that patch.
+#
+# Fusion-impact obligation (0.3.0 ground rule 2): OWED to the T4 window, not
+# discharged here. This patch changes a jit constant, a host-side branch in
+# on_before_batched_gemv/exec_batched_gemv, and two early-return lines in the
+# .cl source; it does not touch the fusion matcher, the primitive's declared
+# inputs, or any constant's allocation type, so the expectation is that the
+# base model still fuses x40 with the tier on - but that expectation is
+# unverified without a compiled-graph dump on real hardware, which this
+# environment cannot produce. T4 Step "Fusion-impact obligation" must record
+# that dump before this obligation is considered discharged.
+#
+# Ground rule 3's survey obligation (ik_llama.cpp -ncmoe/--cpu-moe,
+# llama.cpp's hybrid offload on comparable silicon) is likewise not
+# discharged by this patch; M14 does not close until that survey is recorded
+# alongside T4's numbers.
+#
+# T2 (tests/unit/test_cases/moe_3gemm_gpu_test.cpp,
+# moe_3gemm_cpu_tier.sentinel_skip_leaves_rows_untouched), red-first, device-
+# required, NOT run in this environment (no GPU device here; the orchestrator
+# runs it in the end window) - see that test's comment block for the full
+# argument. Summary: it isolates the kernel sentinel skip from both the
+# redirect policy (§2, untested by T2 - a RESIDENT provider is used, so
+# OffloadExpertWeightProvider::set_cpu_tier() is never called) and the CPU
+# compute tier (§4/§5 - _cpu_tier stays false for a non-offloaded provider, so
+# dispatch_cpu_tier/cpu_tier_join never run). MOE_CPU_TIER_ENABLE still gets
+# jitted, because add_common_consts reads the raw property off the program
+# config rather than the impl's _cpu_tier flag. TOPK_INDICES is fed as a plain
+# input_layout (not routed through MoERouterFused), so the sentinel value
+# (0xFFFFFFFF, read back as int -1) can be placed at an arbitrary flat
+# position without an LRU pool. scratch.y has no public pre-fill hook, so the
+# test runs the same network twice on the same hidden_states/topk_weights,
+# changing only topk_indices, and diffs get_intermediates_memories()'s
+# MOE_INTERNAL_BUFFER_DOWN_OUTPUT slot (index 1, moe_3gemm_base.hpp, mirrored
+# as a literal since that header is off this test target's include path) byte
+# for byte between the two runs. Red argument (cannot be executed here, stated
+# for the reviewer instead): without the `if (expert_id ==
+# MOE_CPU_TIER_SENTINEL) return;` lines, expert_id == -1 at the sentineled
+# positions is used as `gate_weight_addr + (-1) * expert_wei_size` - an
+# out-of-bounds __global pointer dereferenced by every lane of the workgroup -
+# which on the target hardware is a GPU page fault or kernel-launch failure,
+# not silently-wrong-but-passing data; the binding spec accepts a crash as a
+# valid red outcome for exactly this reason.
+#
+# Integration notes (orchestrator, after the implementer's hand-off):
+#  - Three of the pre-registered counters (cpu_compute_ns, cpu_x_readback_ns,
+#    cpu_y_writeback_ns) were declared and reported but never incremented.
+#    Wired: compute = wall time from dispatch() to the end of wait() (so it
+#    includes whatever the GPU-side `down` stage left the join to hide);
+#    x = the two blocking copy_to() readbacks; y = the host-side memcpy into
+#    the staging ring plus the enqueue of the device writeback. All measured
+#    with steady_clock on the thread that runs the primitive.
+#  - The one-line "cpu_tier on:" configuration report used GPU_DEBUG_COUT,
+#    dead in a non-debug-caps build (see 0011); it now goes to std::cerr,
+#    gated on the MOE_OTD_PERF_LOG opt-in like the counter dump.
+#  - moe_3gemm_swiglu_opt_impl::clone() uses make_deep_copy, which default-
+#    constructs the clone and copies an explicit field list, and the clone
+#    is the impl the network runs. Without the M14 members in that list the
+#    tier was configured on the program's impl and dormant on the executing
+#    one. Measured before the fix: tier ON gave cpu_tier_pairs=0 against
+#    evictions=20294 and acquisitions identical to tier OFF, which the
+#    probe()+get_lru_item() double count rules out for a tier branch that
+#    ran even once. The members are now copied in clone(), with a fresh
+#    StagingRing per clone (its entries track in-flight copies on this
+#    impl's stream and cannot be shared).
+#  - The x and routing-weight readbacks are enqueued non-blocking and joined
+#    with one wait_for_events. Measured avg_cpu_x_us 350 -> 283 per layer;
+#    the remaining cost is the queue round trip of the first readback, not
+#    the bytes (x is token_num*hidden*2, the routing weights a few dozen).
+#  - The task lambda in dispatch_cpu_tier() stamps the two worker-side
+#    counters declared in 0011 (task lag, task duration).
+#  - T2 red was run on a card at the end of the closing window, not only
+#    argued: with both `if (expert_id == MOE_CPU_TIER_SENTINEL) return;`
+#    lines removed from the kernel, sentinel_skip_leaves_rows_untouched
+#    FAILED; restored, it passes, and the rebuilt plugin is byte-identical
+#    to the one the window measured.
+#
+# Closing notes (orchestrator, after the measurement windows; DESIGN §7.0.2x
+# is the durable record):
+#  - "T4 compares the measured max-abs logit diff against that prediction"
+#    above could not be done: the engine's endpoint exposes no logprobs.
+#    The gate ran as byte-identity of 64 greedy tokens OFF vs ON at two
+#    cells (ratio 50 / 8 GiB and ratio 75 / 5 GiB) plus the acceptance task
+#    at 10/10 with the tier on. T1c's prediction stands recorded, uncompared.
+#  - The compiled-graph dump the fusion-impact obligation asked for is not
+#    producible on a plugin built without DEBUG_CAPS (the dump path is
+#    inert; 0 files). Discharged by construction instead: the "cpu_tier on:"
+#    line prints once per moe_3gemm_fused_compressed impl at program build,
+#    and both tier-ON logs carry exactly forty of them. An unfused MoE would
+#    print none.
+#  - Ground rule 3's llama.cpp / ik_llama.cpp hybrid-offload survey was
+#    dropped by the user's decision that CPU llama.cpp is not M14's bar
+#    (docs/milestone-0.3.0.md, M14 row); it is not recorded and not owed.
+#  - Point 5's grep of the generated kernel sources for the sentinel symbol
+#    with the property off was NOT run; still owed. What was measured: with
+#    the property off the host side never dispatched (cpu_tier_pairs=0 with
+#    no "cpu_tier on" line) and the text is byte-identical to the tier-ON
+#    text, which does not by itself prove the jit define absent.
+#  - The T2 red outcome was measured, not only argued: with both sentinel
+#    early-returns removed, sentinel_skip_leaves_rows_untouched FAILED on an
+#    assertion (the rows differed) - the out-of-bounds read did NOT fault on
+#    the test's card. So the red case is a wrong-data case there, and the
+#    "GPU page fault" prediction above is retracted per §7.0.1; the test
+#    catches it either way.
+#  - The 8-bit weight path, f16/f32 zero points and non-f16 scales are now
+#    refused at construction (found in review: the 8-bit scalar path has no
+#    T1 fixture; a wide zero point was read as bytes). The AVX2 kernel is
+#    used only for group sizes that are whole 64-element chunks or smaller
+#    than one chunk; other group sizes take the scalar reference.
+#  - "The binding spec", "the design note", "the task brief" and "this
+#    patch's report" cited above are session documents that are not in the
+#    repository; the design's durable form is DESIGN §7.0.2x and this
+#    header. Point numbering in 0011's header is the implementer's and has
+#    gaps.
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_provider.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_provider.hpp
+index 687cfa5e..ecbc13c7 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_provider.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_provider.hpp
+@@ -6,6 +6,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <limits>
+ #include <optional>
+ #include <vector>
+ 
+@@ -15,6 +16,23 @@
+ 
+ namespace ov::intel_gpu::ocl::moe {
+ 
++// arcint M14. Slot value that means "this (token,expert) pair is computed on the
++// host tier this step; the GEMV kernels must not write its scratch.up / scratch.y
++// rows". Narrowed to 0xFFFFFFFF by the existing uint32_t cast at
++// moe_3gemm_swiglu_opt.cpp (on_before_batched_gemv, slots_u32 build) and read back
++// as int -1 by the kernels (moe_3gemm_swiglu_mlp.cl, patches/0012).
++static constexpr size_t kCpuTierSentinelSlot = std::numeric_limits<size_t>::max();
++
++// arcint M14. One expert routed to the host tier, with the flat positions in the
++// caller's `experts` vector that selected it. Position i decodes to
++// token = i / MAX_TOPK, expert_slot = i % MAX_TOPK, and the routing weight is
++// routing_weights[i] (the compact [token_num * MAX_TOPK] buffer the down kernel
++// indexes the same way, moe_3gemm_swiglu_mlp.cl).
++struct CpuTierMiss {
++    uint32_t expert = 0;
++    std::vector<size_t> positions;
++};
++
+ /// Slot indices produced by a simultaneous acquisition (parallel to the input experts vector).
+ using ExpertSlotLease = std::vector<size_t>;
+ 
+@@ -60,7 +78,16 @@ public:
+     // Returns nullopt if the number of unique experts exceeds resident_capacity()
+     // (the caller should fall back to per-expert streaming).
+     // The returned lease's slots vector is parallel to the input experts vector.
+-    virtual std::optional<ExpertSlotLease> try_acquire_simultaneous(const std::vector<uint32_t>& experts, cldnn::stream& stream) = 0;
++    //
++    // arcint M14. cpu_tier_misses == nullptr (the default, and what every caller
++    // outside exec_batched_gemv's hook passes) reproduces the pre-M14 behaviour
++    // exactly: every miss is uploaded. Non-null AND the provider configured with
++    // the CPU tier on => a *capacity* miss (one that would evict a resident expert)
++    // is appended there and given kCpuTierSentinelSlot instead of being uploaded.
++    virtual std::optional<ExpertSlotLease> try_acquire_simultaneous(
++        const std::vector<uint32_t>& experts,
++        cldnn::stream& stream,
++        std::vector<CpuTierMiss>* cpu_tier_misses = nullptr) = 0;
+ 
+     // Acquires a single expert slot. Always succeeds (evicts LRU if needed).
+     virtual size_t acquire_one(uint32_t expert, cldnn::stream& stream) = 0;
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+index 333fdbd6..654136e2 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+@@ -15,8 +15,14 @@
+ 
+ namespace ov::intel_gpu::ocl::moe {
+ 
+-std::optional<ExpertSlotLease> ResidentExpertWeightProvider::try_acquire_simultaneous(const std::vector<uint32_t>& experts, cldnn::stream& /*stream*/) {
+-    // Resident: identity mapping, always succeeds.
++std::optional<ExpertSlotLease> ResidentExpertWeightProvider::try_acquire_simultaneous(const std::vector<uint32_t>& experts,
++                                                                                       cldnn::stream& /*stream*/,
++                                                                                       std::vector<CpuTierMiss>* cpu_tier_misses) {
++    // Resident: identity mapping, always succeeds. No slot pool, so no expert is
++    // ever a capacity miss - a wiring mistake that reaches here with a non-empty
++    // output vector is loud rather than silently ignored.
++    OPENVINO_ASSERT(cpu_tier_misses == nullptr || cpu_tier_misses->empty(),
++                    "ResidentExpertWeightProvider: cpu_tier_misses must be empty on entry (the resident path has no misses)");
+     return std::vector<size_t>(experts.begin(), experts.end());
+ }
+ 
+@@ -57,7 +63,9 @@ void OffloadExpertWeightProvider::fill_routed_weight_views(cldnn::moe_weights& /
+     views.zp[2] = _resident->down_z;
+ }
+ 
+-std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultaneous(const std::vector<uint32_t>& experts, cldnn::stream& stream) {
++std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultaneous(const std::vector<uint32_t>& experts,
++                                                                                      cldnn::stream& stream,
++                                                                                      std::vector<CpuTierMiss>* cpu_tier_misses) {
+     // Deduplicate to check capacity
+     std::unordered_map<uint32_t, size_t> expert_to_slot;
+     expert_to_slot.reserve(experts.size());
+@@ -73,36 +81,109 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
+     std::vector<uint32_t> missed_experts;
+     std::vector<size_t> missed_slots;
+ 
++    // arcint M14. Active only when the caller passed a destination for CPU-tier
++    // misses AND this provider was told the tier is on (set_cpu_tier(true), wired
++    // from the impl constructor - moe_3gemm_swiglu_opt.cpp). With either false,
++    // the loop below takes the pre-M14 branch verbatim, so the tier-off path is
++    // provably the same code that ran before this patch.
++    const bool cpu_tier_active = _cpu_tier && cpu_tier_misses != nullptr;
++    std::unordered_map<uint32_t, size_t> cpu_miss_index;  // expert -> index in *cpu_tier_misses
++    size_t slot_taking_experts = 0;
++
+     for (size_t i = 0; i < experts.size(); i++) {
+         const uint32_t expert = experts[i];
+         auto it = expert_to_slot.find(expert);
+         if (it != expert_to_slot.end()) {
+             slots[i] = it->second;
++            if (cpu_tier_active && it->second == kCpuTierSentinelSlot)
++                (*cpu_tier_misses)[cpu_miss_index[expert]].positions.push_back(i);
+             continue;
+         }
+ 
+-        // Check if we would exceed capacity
+-        if (expert_to_slot.size() >= _capacity) {
+-            return std::nullopt;
+-        }
+-
+-        const auto item = _cache->get_lru_item(expert);
+-        const auto slot = item.first;
+-
+-        if (item.second) {
+-            if (perf)
+-                perf->gpu_hits.fetch_add(1, std::memory_order_relaxed);
++        if (!cpu_tier_active) {
++            // ---- pre-M14 body, unchanged, including the capacity check ----
++            // Check if we would exceed capacity
++            if (expert_to_slot.size() >= _capacity) {
++                return std::nullopt;
++            }
++
++            const auto item = _cache->get_lru_item(expert);
++            const auto slot = item.first;
++
++            if (item.second) {
++                if (perf)
++                    perf->gpu_hits.fetch_add(1, std::memory_order_relaxed);
++            } else {
++                if (perf)
++                    perf->gpu_misses.fetch_add(1, std::memory_order_relaxed);
++                missed_experts.push_back(expert);
++                missed_slots.push_back(slot);
++            }
++
++            expert_to_slot.emplace(expert, slot);
++            slots[i] = slot;
+         } else {
++            auto [slot, filled] = _cache->probe(expert);
++            if (filled) {
++                if (perf)
++                    perf->gpu_hits.fetch_add(1, std::memory_order_relaxed);
++                expert_to_slot.emplace(expert, slot);
++                slots[i] = slot;
++                ++slot_taking_experts;
++                continue;
++            }
+             if (perf)
+                 perf->gpu_misses.fetch_add(1, std::memory_order_relaxed);
+-            missed_experts.push_back(expert);
+-            missed_slots.push_back(slot);
++            if (_cache->has_free_slot() && slot_taking_experts < _capacity) {
++                // Warm-up: the pool still has a slot nobody owns. Uploading here
++                // costs no eviction and is what fills the device tier in the first
++                // place; taking these to the CPU instead would leave the pool empty
++                // forever and route 100% of experts to the host.
++                const auto item = _cache->get_lru_item(expert);
++                missed_experts.push_back(expert);
++                missed_slots.push_back(item.first);
++                expert_to_slot.emplace(expert, item.first);
++                slots[i] = item.first;
++                ++slot_taking_experts;
++            } else {
++                // Capacity miss: serving it on the device means evicting a resident
++                // expert and paying 1.6 MiB over PCIe for a cold-tail expert the LRU
++                // has already decided not to keep. Route it to the host tier.
++                auto& m = cpu_tier_misses->emplace_back();
++                m.expert = expert;
++                m.positions.push_back(i);
++                cpu_miss_index[expert] = cpu_tier_misses->size() - 1;
++                expert_to_slot.emplace(expert, kCpuTierSentinelSlot);
++                slots[i] = kCpuTierSentinelSlot;
++                if (perf) {
++                    perf->cpu_tier_experts.fetch_add(1, std::memory_order_relaxed);
++                    perf->cpu_tier_pairs.fetch_add(1, std::memory_order_relaxed);
++                }
++            }
+         }
++    }
+ 
+-        expert_to_slot.emplace(expert, slot);
+-        slots[i] = slot;
++    // arcint M14. A position that reused an already-registered CPU-tier expert
++    // (the dedup branch above) also counts against cpu_tier_pairs - only the
++    // first occurrence goes through the `else` arm above, so account for repeats
++    // here rather than duplicating the increment at both call sites.
++    if (cpu_tier_active && perf && cpu_tier_misses != nullptr) {
++        for (const auto& m : *cpu_tier_misses) {
++            if (m.positions.size() > 1)
++                perf->cpu_tier_pairs.fetch_add(m.positions.size() - 1, std::memory_order_relaxed);
++        }
+     }
+ 
++    // arcint M14. The pre-M14 capacity check (`expert_to_slot.size() >= _capacity`,
++    // sentinels included) forced the exec_prefill_onednn fallback whenever the
++    // batch's unique-expert count exceeded the pool, even for experts the CPU
++    // tier would happily take. Under the tier, `slot_taking_experts` (device-slot
++    // consumers only) is the right predicate - a batch can now exceed unique-expert
++    // count without falling back, as long as the CPU tier absorbs the overflow.
++    // Real improvement, but not exercised by the closing measurement: decode with
++    // token_num <= 32 and topk 8 gives at most 256 unique experts against a pool
++    // of hundreds, so this branch of the capacity relaxation is untested there.
++
+     if (!missed_experts.empty()) {
+         OPENVINO_ASSERT(_resident != nullptr, "OffloadExpertWeightProvider: resident buffers not bound");
+         moe_otd::fill_weights_memory(stream, _config, _weight_bin_offsets, _weight_reader, *_resident, missed_experts, missed_slots, _staging);
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+index 93c6e7b2..bfb1e93a 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+@@ -45,7 +45,9 @@ public:
+         views.zp[2] = weights.down_z;
+     }
+ 
+-    std::optional<ExpertSlotLease> try_acquire_simultaneous(const std::vector<uint32_t>& experts, cldnn::stream& stream) override;
++    std::optional<ExpertSlotLease> try_acquire_simultaneous(const std::vector<uint32_t>& experts,
++                                                             cldnn::stream& stream,
++                                                             std::vector<CpuTierMiss>* cpu_tier_misses = nullptr) override;
+     size_t acquire_one(uint32_t expert, cldnn::stream& stream) override;
+ };
+ 
+@@ -78,7 +80,9 @@ public:
+         return _bound;
+     }
+     void fill_routed_weight_views(cldnn::moe_weights& weights, RoutedWeightViews& views) override;
+-    std::optional<ExpertSlotLease> try_acquire_simultaneous(const std::vector<uint32_t>& experts, cldnn::stream& stream) override;
++    std::optional<ExpertSlotLease> try_acquire_simultaneous(const std::vector<uint32_t>& experts,
++                                                             cldnn::stream& stream,
++                                                             std::vector<CpuTierMiss>* cpu_tier_misses = nullptr) override;
+     size_t acquire_one(uint32_t expert, cldnn::stream& stream) override;
+ 
+     LRUCache& cache() {
+@@ -89,6 +93,26 @@ public:
+         return _weight_reader;
+     }
+ 
++    // arcint M14. Read by moe_3gemm_swiglu_opt.cpp's build_cpu_expert_desc() to
++    // resolve a CPU-tier expert's file offsets the same way fill_weights_memory
++    // resolves them for a device upload (moe_otd::expert_tensor_span takes the
++    // same config + weight_bin_offsets pair either way).
++    const cldnn::MOECompressed::Config& config() const {
++        return _config;
++    }
++    const std::vector<size_t>& weight_bin_offsets() const {
++        return _weight_bin_offsets;
++    }
++
++    // arcint M14. Set once from the impl constructor (moe_3gemm_swiglu_opt.cpp)
++    // when MOE_CPU_TIER is on and this provider is offloaded. Gate for the
++    // redirect in try_acquire_simultaneous: with this false, that method's
++    // cpu_tier_misses output parameter is never populated even if the caller
++    // passes a non-null pointer, so an unwired provider is provably inert.
++    void set_cpu_tier(bool on) {
++        _cpu_tier = on;
++    }
++
+ private:
+     size_t _capacity = 0;
+     cldnn::MOECompressed::Config _config{};
+@@ -98,6 +122,8 @@ private:
+     moe_otd::ParallelWeightReader _weight_reader;
+     cldnn::moe_weights* _resident = nullptr;
+     bool _bound = false;
++    // arcint M14. See set_cpu_tier().
++    bool _cpu_tier = false;
+     // arcint M9 (patches/0006, P2). Provider-owned so each MoE layer's staging
+     // buffers are independent (no cross-layer contention on the ring), and so
+     // the ring's usm_host allocations amortize across infers instead of being
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.cpp
+index 33ab0523..0de8bb84 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.cpp
+@@ -47,6 +47,27 @@ void LRUCache::evict_one() {
+     evict_one_unlocked();
+ }
+ 
++// arcint M14. `probe`'s has_free_slot -> get_lru_item sequence (in the caller,
++// OffloadExpertWeightProvider::try_acquire_simultaneous) is not atomic across the
++// two calls. That is safe and is stated here rather than fixed: a provider is
++// driven by exactly one stream (the assumption StagingRing already documents,
++// moe_otd_runtime.hpp), so there is no concurrent caller to race against.
++std::pair<size_t, bool> LRUCache::probe(size_t expert) {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    if (auto* perf = moe_otd::get_perf_counters())
++        perf->acquisitions.fetch_add(1, std::memory_order_relaxed);
++    auto it = m_map.find(Key{expert});
++    if (it == m_map.end())
++        return {kProbeMiss, false};
++    move_to_end(it->second);
++    const size_t slot = it->second->lru_expert_no;
++    // Present-but-unfilled cannot happen on the paths that exist today (every
++    // insert is followed by set_filled before the lease is returned), but it is
++    // reported as a miss rather than trusted, because handing an unfilled slot to
++    // the GEMV is silent garbage, not a crash.
++    return {slot, m_filled_list[slot]};
++}
++
+ std::pair<size_t, bool> LRUCache::get_lru_item(size_t expert) {
+     std::lock_guard<std::mutex> lock(m_mutex);
+ 
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.hpp
+index 55495474..8a76014a 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.hpp
+@@ -3,6 +3,7 @@
+ //
+ 
+ #pragma once
++#include <limits>
+ #include <list>
+ #include <mutex>
+ #include <unordered_map>
+@@ -17,6 +18,22 @@ public:
+ 
+     std::pair<size_t, bool> get_lru_item(size_t expert);
+ 
++    // arcint M14. Non-inserting probe. On a resident+filled expert it behaves like
++    // get_lru_item (recency touch, acquisitions counter) and returns {slot, true};
++    // otherwise it returns {kProbeMiss, false} WITHOUT allocating a slot and
++    // WITHOUT evicting, which is what lets the CPU tier take a capacity miss
++    // instead of paying an eviction plus an upload for it.
++    static constexpr size_t kProbeMiss = std::numeric_limits<size_t>::max();
++    std::pair<size_t, bool> probe(size_t expert);
++
++    // arcint M14. True while the pool still holds a slot no expert has claimed.
++    // Drives the warm-up rule in OffloadExpertWeightProvider (see that comment):
++    // a miss taken while this is true still uploads, exactly as before M14.
++    bool has_free_slot() const {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        return m_total_experts < m_max_total_experts;
++    }
++
+     void evict_one();
+ 
+     size_t size() const {
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+index c7d0e802..4c1fb498 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -2,6 +2,8 @@
+ // SPDX-License-Identifier: Apache-2.0
+ //
+ 
++#include <chrono>
++#include <iostream>
+ #include <cstdlib>
+ 
+ // clang-format off
+@@ -11,10 +13,22 @@
+ #include "openvino/runtime/shared_buffer.hpp"
+ #include "lru_cache.hpp"
+ #include "expert_weight_providers.hpp"
++// arcint M14 (patches/0011). Host CPU compute tier: ExpertDesc/ExpertJob/
++// CpuTierPool/moe_cpu_expert(). No cldnn/OpenVINO deps of its own (see that
++// header's comment), so including it unconditionally here is harmless.
++#include "moe_cpu_expert.hpp"
++
++#include <cstring>  // std::memcpy in cpu_tier_join
+ // clang-format on
+ 
++using ov::intel_gpu::ocl::moe::CpuTierMiss;
++using ov::intel_gpu::ocl::moe::CpuTierPool;
++using ov::intel_gpu::ocl::moe::ExpertDesc;
++using ov::intel_gpu::ocl::moe::ExpertJob;
++using ov::intel_gpu::ocl::moe::GateAct;
+ using ov::intel_gpu::ocl::moe::IExpertWeightProvider;
+ using ov::intel_gpu::ocl::moe::OffloadExpertWeightProvider;
++using ov::intel_gpu::ocl::moe::QuantMatrix;
+ using ov::intel_gpu::ocl::moe::ResidentExpertWeightProvider;
+ 
+ #define DEBUG_MOE_LOG 0
+@@ -23,6 +37,7 @@ using ov::intel_gpu::ocl::moe::ResidentExpertWeightProvider;
+ #    include <algorithm>
+ #    include <chrono>
+ #    include <cstdint>
++#    include <cstring>  // (also included unconditionally below)
+ #    include <fstream>
+ #    include <initializer_list>
+ #    include <iostream>
+@@ -55,6 +70,23 @@ namespace {
+ 
+ using namespace ov::intel_gpu::ocl;
+ 
++// arcint M14. One process-wide CpuTierPool, sized from MOE_CPU_TIER_THREADS on
++// first use (Meyers singleton - same pattern as moe_otd::get_perf_counters(),
++// moe_otd_runtime.cpp). 40 layers x 15 threads would be 600 threads if this
++// were per-impl-instance; layers execute strictly one at a time on a single
++// decode stream, so one shared pool has no contention. Two concurrent
++// dispatchers (two networks on two streams) are tolerated, not optimised:
++// the FIFO never drops a batch and wait() returns only when every dispatched
++// task is done, so each dispatcher may over-wait for the other's tasks but
++// never hangs (see CpuTierPool in moe_cpu_expert.hpp; the earlier form did
++// hang, found in review). The first MoE layer to reach dispatch_cpu_tier() at
++// runtime wins the thread-count argument; every layer is constructed from the
++// same process-wide property, so in practice they agree.
++CpuTierPool& cpu_tier_pool(size_t threads) {
++    static CpuTierPool pool(threads);
++    return pool;
++}
++
+ // Bring shared onednn matmul wrappers into this anonymous namespace so existing call sites
+ // that reference `onednn_matmul`, `onednn_linear`, etc. unqualified continue to compile after
+ // the definitions moved to impls/onednn/grouped_matmul_helper.hpp.
+@@ -445,6 +477,13 @@ static void add_common_consts(const RuntimeParams& params, JitConstants& jit) {
+         jit.make("MOE_SCALE_DT", "half");  // not use
+         jit.make("MOE_ZP_DT", "half");     // not use
+     }
++
++    // arcint M14 (patches/0012). Only defined when the tier is on, so the off path
++    // compiles the pre-patch kernel byte-for-byte (this patch's header,
++    // correctness pt 5: MOE_CPU_TIER_ENABLE undefined -> both sentinel #ifdef
++    // blocks in moe_3gemm_swiglu_mlp.cl are preprocessed out entirely).
++    if (params.get_program().get_config().get_moe_cpu_tier())
++        jit.make("MOE_CPU_TIER_ENABLE", 1);
+ }
+ 
+ class MoE3GemmSwigluMLPGateUp : public KernelGenerator {
+@@ -656,6 +695,46 @@ public:
+     int _down_group_size;
+     std::shared_ptr<IExpertWeightProvider> _weight_provider;
+ 
++    // arcint M14 (patches/0012). Host CPU compute tier state. The kernel
++    // (moe_cpu_expert/CpuTierPool) is patches/0011; everything here is the
++    // wiring that decides when it fires and moves data to/from it.
++    bool _cpu_tier = false;
++    size_t _cpu_tier_threads = 0;
++    // Cleared and repopulated once per on_before_batched_gemv call; read by
++    // dispatch_cpu_tier() and cpu_tier_join() within the same exec_batched_gemv.
++    std::vector<CpuTierMiss> _cpu_tier_misses;
++    // f16 bit patterns read back from device memory: the token(s)' hidden
++    // states and the compact routing-weight buffer (§4.1 of the binding spec).
++    std::vector<uint16_t> _cpu_x_host;
++    std::vector<uint16_t> _cpu_rw_host;
++    // CPU-computed output rows, one HIDDEN_SIZE f16 row per (miss, position),
++    // in the same iteration order dispatch_cpu_tier() and cpu_tier_join() both
++    // walk (_cpu_tier_misses, then positions) - that shared order is what lets
++    // cpu_tier_join() recover which row belongs to which flat scratch.y index
++    // without storing the mapping twice.
++    std::vector<uint16_t> _cpu_out_rows;
++    std::vector<ExpertJob> _cpu_jobs;
++    std::vector<ExpertDesc> _cpu_descs;
++    // Wall clock at dispatch_cpu_tier(); cpu_tier_join() charges wait-end minus
++    // this to cpu_compute_ns (moe_otd_perf.hpp's definition of that counter).
++    std::chrono::steady_clock::time_point _cpu_dispatch_t0{};
++    // arcint M9 (patches/0006, P2 pattern reused). Provider-owned staging ring
++    // for the CPU tier's y-row DMAs, sized to 2x max_topk at construction
++    // (§4.4): at topk 8 a single decode token can produce up to 8 miss rows,
++    // and the x2 headroom keeps an acquire() from stalling on its own
++    // previous copy within the same layer.
++    moe_otd::StagingRing _cpu_y_staging;
++    size_t _max_topk = 0;
++    size_t _experts_per_token = 0;
++    // Per-expert-invariant QuantMatrix metadata, resolved once at construction
++    // (see the ctor wiring) from the same runtime facts add_common_consts()
++    // jits into the kernel, so build_cpu_expert_desc() only fills in the
++    // per-expert file offsets on the decode critical path.
++    int _cpu_weight_bits = 4;
++    bool _cpu_weight_signed = false;
++    bool _cpu_zp_is_u8 = false;
++    GateAct _cpu_gate_act = GateAct::Silu;
++
+     // --- OTD helper methods (used when _weight_provider->is_offloaded()) ---
+ 
+     void set_otd_weight_pointers(typed_primitive_inst<moe_3gemm_fused_compressed>& instance, scratch_buffers& scratch) {
+@@ -726,9 +805,202 @@ public:
+         }
+     }
+ 
++    // arcint M14 (patches/0012). Builds one ExpertDesc for `expert` from the
++    // weight file's mapping. The CPU reads the FILE layout: weights as stored,
++    // scales [oc][group] and u4 zero points as stored. The upload path
++    // transposes scales/zp to the device's [group][oc] form
++    // (maybe_transpose_scale_zp, moe_otd_runtime.cpp) - the host kernels do
++    // not want that form and never see it. (An earlier version of this
++    // comment claimed file layout == device layout; the code was right and
++    // the comment was not - fixed in review.)
++    ExpertDesc build_cpu_expert_desc(uint32_t expert,
++                                     typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
++                                     OffloadExpertWeightProvider& otd) {
++        ExpertDesc d;
++        d.act = _cpu_gate_act;
++        const auto& config = otd.config();
++        const auto& offsets = otd.weight_bin_offsets();
++        auto& reader = otd.weight_reader();
++
++        auto fill = [&](QuantMatrix& qm,
++                       size_t w_pos,
++                       size_t s_pos,
++                       size_t z_pos,
++                       const memory::ptr& w_tensor,
++                       const memory::ptr& s_tensor,
++                       const memory::ptr& z_tensor,
++                       int oc,
++                       int ic,
++                       int group_size) {
++            auto w_span = moe_otd::expert_tensor_span(config, offsets, w_tensor, w_pos, expert);
++            auto s_span = moe_otd::expert_tensor_span(config, offsets, s_tensor, s_pos, expert);
++            qm.w = reader.mapped(w_span.file_offset, w_span.bytes);
++            qm.s = reinterpret_cast<const uint16_t*>(reader.mapped(s_span.file_offset, s_span.bytes));
++            if (config.has_zp) {
++                auto z_span = moe_otd::expert_tensor_span(config, offsets, z_tensor, z_pos, expert);
++                qm.z = reader.mapped(z_span.file_offset, z_span.bytes);
++            }
++            qm.oc = oc;
++            qm.ic = ic;
++            qm.group_size = group_size;
++            qm.weight_bits = _cpu_weight_bits;
++            qm.weight_signed = _cpu_weight_signed;
++            qm.has_zp = config.has_zp;
++            qm.zp_is_u8 = _cpu_zp_is_u8;
++        };
++
++        // offset_pos 0-2 gate/up/down weight, 3-5 scale, 6-8 zp (moe_otd
++        // tensor index order, expert_weight_providers.cpp / moe_otd_runtime.cpp
++        // fill_weights_memory). gate/up: oc=inter, ic=hidden. down: oc=hidden,
++        // ic=inter. _gate_up_group_size/_down_group_size already fold the
++        // config's SIZE_MAX (= per-channel, group_size == ic) case (init()).
++        fill(d.gate,
++            0,
++            3,
++            6,
++            instance._weights.gate_w,
++            instance._weights.gate_s,
++            instance._weights.gate_z,
++            _intermediate_size,
++            _hidden_size,
++            _gate_up_group_size);
++        fill(d.up,
++            1,
++            4,
++            7,
++            instance._weights.up_w,
++            instance._weights.up_s,
++            instance._weights.up_z,
++            _intermediate_size,
++            _hidden_size,
++            _gate_up_group_size);
++        fill(d.down,
++            2,
++            5,
++            8,
++            instance._weights.down_w,
++            instance._weights.down_s,
++            instance._weights.down_z,
++            _hidden_size,
++            _intermediate_size,
++            _down_group_size);
++        return d;
++    }
++
++    // arcint M14 (patches/0012, §4.1/§5.6). One CpuTierPool task per missed
++    // expert (parallelism is across experts, not within one expert's down-
++    // stage column range): moe_cpu_expert's public API (patches/0011) computes
++    // gate+up+SwiGLU+down as one call per job, with no separate entry point
++    // for the intermediate `h` buffer, so splitting one expert's columns
++    // across threads would recompute gate/up per split. Not implemented here;
++    // noted as a deviation from the binding spec's ideal two-phase split in
++    // this patch's header. Must be called after _cpu_x_host/_cpu_rw_host are
++    // populated and before cpu_tier_join()'s wait().
++    void dispatch_cpu_tier(typed_primitive_inst<moe_3gemm_fused_compressed>& instance) {
++        auto* otd = static_cast<OffloadExpertWeightProvider*>(_weight_provider.get());
++
++        size_t total_positions = 0;
++        for (const auto& m : _cpu_tier_misses)
++            total_positions += m.positions.size();
++        _cpu_out_rows.assign(total_positions * static_cast<size_t>(_hidden_size), uint16_t{0});
++        _cpu_jobs.clear();
++        _cpu_jobs.reserve(total_positions);
++        _cpu_descs.clear();
++        _cpu_descs.reserve(_cpu_tier_misses.size());
++
++        std::vector<CpuTierPool::Task> tasks;
++        tasks.reserve(_cpu_tier_misses.size());
++        size_t row = 0;
++        const int hidden = _hidden_size;
++        for (const auto& m : _cpu_tier_misses) {
++            _cpu_descs.push_back(build_cpu_expert_desc(m.expert, instance, *otd));
++            const size_t job_begin = _cpu_jobs.size();
++            for (size_t pos : m.positions) {
++                ExpertJob job;
++                job.x = _cpu_x_host.data() + (pos / _max_topk) * static_cast<size_t>(hidden);
++                job.w_route = _cpu_rw_host[pos];
++                job.y = _cpu_out_rows.data() + row * static_cast<size_t>(hidden);
++                _cpu_jobs.push_back(job);
++                ++row;
++            }
++            const size_t job_end = _cpu_jobs.size();
++            // desc_ptr is stable: _cpu_descs was reserved to its final size
++            // above, so no push_back in this loop reallocates it.
++            const ExpertDesc* desc_ptr = &_cpu_descs.back();
++            tasks.emplace_back([this, desc_ptr, job_begin, job_end, hidden]() {
++                const auto ts = std::chrono::steady_clock::now();
++                ov::intel_gpu::ocl::moe::moe_cpu_expert(*desc_ptr,
++                                                        _cpu_jobs.data() + job_begin,
++                                                        job_end - job_begin,
++                                                        0,
++                                                        hidden);
++                if (auto* perf = moe_otd::get_perf_counters()) {
++                    const auto te = std::chrono::steady_clock::now();
++                    auto ns = [](auto a, auto b) {
++                        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
++                    };
++                    perf->cpu_task_lag_ns.fetch_add(ns(_cpu_dispatch_t0, ts), std::memory_order_relaxed);
++                    perf->cpu_task_ns.fetch_add(ns(ts, te), std::memory_order_relaxed);
++                }
++            });
++        }
++        _cpu_dispatch_t0 = std::chrono::steady_clock::now();
++        cpu_tier_pool(_cpu_tier_threads).dispatch(std::move(tasks));
++    }
++
++    // arcint M14 (patches/0012, §4.4). Blocks on the CPU pool, then DMAs each
++    // miss row into scratch.y at the same flat_id the GPU kernels use
++    // (§4.2's row math), before mlp_reduce runs. Correctness needs only that
++    // this DMA lands after `down` and before `reduce`; both hold by program
++    // order on the in-order queue (the same guarantee patches 0006/0007 lean
++    // on) - see this patch's header for the full event-ordering argument.
++    void cpu_tier_join(cldnn::stream& stream,
++                       scratch_buffers& scratch,
++                       typed_primitive_inst<moe_3gemm_fused_compressed>& instance) {
++        if (_cpu_tier_misses.empty())
++            return;
++        auto* perf = moe_otd::get_perf_counters();
++        const auto t0 = std::chrono::steady_clock::now();
++        cpu_tier_pool(_cpu_tier_threads).wait();
++        const auto t1 = std::chrono::steady_clock::now();
++        auto& engine = instance.get_network().get_engine();
++        const size_t row_bytes = static_cast<size_t>(_hidden_size) * sizeof(uint16_t);
++        size_t row = 0;
++        for (const auto& m : _cpu_tier_misses) {
++            for (size_t pos : m.positions) {
++                const size_t token = pos / _max_topk;
++                const size_t expert_slot = pos % _max_topk;
++                const size_t flat_id = token * _experts_per_token + expert_slot;
++                auto slot = _cpu_y_staging.acquire(engine, row_bytes);
++                std::memcpy(slot.host_ptr, _cpu_out_rows.data() + row * static_cast<size_t>(_hidden_size), row_bytes);
++                auto ev = scratch.y->copy_from(stream, slot.host_ptr, 0, flat_id * row_bytes, row_bytes, false);
++                _cpu_y_staging.retire(slot.index, ev);
++                ++row;
++            }
++        }
++        if (perf) {
++            // Host-side cost of the y writeback: staging memcpy + enqueue of the
++            // non-blocking DMAs (not their completion, which the in-order queue
++            // hides behind mlp_reduce).
++            const auto t2 = std::chrono::steady_clock::now();
++            auto ns = [](auto a, auto b) {
++                return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
++            };
++            perf->cpu_join_wait_ns.fetch_add(ns(t0, t1), std::memory_order_relaxed);
++            perf->cpu_compute_ns.fetch_add(ns(_cpu_dispatch_t0, t1), std::memory_order_relaxed);
++            perf->cpu_y_writeback_ns.fetch_add(ns(t1, t2), std::memory_order_relaxed);
++            perf->cpu_tier_layers.fetch_add(1, std::memory_order_relaxed);
++        }
++        // No wait here: the in-order queue orders these copies before the
++        // reduce enqueued next (patches/0006's wait-placement argument,
++        // inverted - that wait existed to recycle staging; StagingRing::
++        // acquire already does that).
++    }
++
+     void on_before_batched_gemv(cldnn::stream& stream,
+                                 typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
+                                 scratch_buffers& scratch,
++                                size_t token_num,
+                                 size_t topk_count,
+                                 bool& needs_fallback) {
+         if (!_weight_provider->is_offloaded()) {
+@@ -765,7 +1037,13 @@ public:
+         std::vector<uint32_t> expert_ids(topk_count);
+         scratch.topk_id->copy_to(stream, expert_ids.data(), 0, 0, topk_count * sizeof(uint32_t), true);
+ 
+-        auto lease = _weight_provider->try_acquire_simultaneous(expert_ids, stream);
++        // arcint M14 (patches/0012). Cleared here (not just on_before_batched_
++        // gemv's caller) so a fallback return below never leaves a stale miss
++        // list for a later call to read; only the exec_batched_gemv path passes
++        // a non-null destination (on_before_prefill and build_grouped_mask_otd
++        // keep passing nullptr, §1's "prefill is untouched").
++        _cpu_tier_misses.clear();
++        auto lease = _weight_provider->try_acquire_simultaneous(expert_ids, stream, _cpu_tier ? &_cpu_tier_misses : nullptr);
+         if (!lease) {
+             if (auto* perf = moe_otd::get_perf_counters())
+                 perf->batched_fallbacks.fetch_add(1, std::memory_order_relaxed);
+@@ -785,6 +1063,37 @@ public:
+             slots_u32[i] = static_cast<uint32_t>((*lease)[i]);
+         scratch._expert_index_buffer->copy_from(stream, slots_u32.data(), 0, 0, topk_bytes, true);
+ 
++        // arcint M14 (patches/0012, §4.1). In steady state (pool full, no
++        // free slot) nothing was enqueued between the blocking topk_id
++        // readback above and here, so these two copies are DMAs, not waits.
++        // During warm-up, misses that found a free slot were uploaded by
++        // fill_weights_memory inside try_acquire_simultaneous, and the wait
++        // below covers those uploads too (in-order queue); cpu_x_readback_ns
++        // then includes them. They are enqueued non-blocking and
++        // joined with one wait: the cost of a host readback at this size
++        // (x is token_num*hidden*2 bytes, the routing weights a few dozen)
++        // is the queue round trip, not the bytes, and two blocking copies
++        // paid it twice (measured avg_cpu_x_us ~350 per layer).
++        if (!_cpu_tier_misses.empty()) {
++            auto hs_mem = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
++            const size_t x_bytes = token_num * static_cast<size_t>(_hidden_size) * sizeof(uint16_t);
++            const size_t rw_bytes = topk_count * sizeof(uint16_t);
++            _cpu_x_host.resize(x_bytes / sizeof(uint16_t));
++            _cpu_rw_host.resize(topk_count);
++            const auto tx0 = std::chrono::steady_clock::now();
++            auto ev_x = hs_mem->copy_to(stream, _cpu_x_host.data(), 0, 0, x_bytes, false);
++            auto ev_rw = scratch.topk_weights->copy_to(stream, _cpu_rw_host.data(), 0, 0, rw_bytes, false);
++            stream.wait_for_events({ev_x, ev_rw});
++            if (auto* perf = moe_otd::get_perf_counters()) {
++                perf->cpu_x_readback_ns.fetch_add(
++                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                              std::chrono::steady_clock::now() - tx0)
++                                              .count()),
++                    std::memory_order_relaxed);
++            }
++            dispatch_cpu_tier(instance);
++        }
++
+         set_otd_weight_pointers(instance, scratch);
+         needs_fallback = false;
+     }
+@@ -1035,6 +1344,74 @@ public:
+             _weight_provider = std::make_shared<ResidentExpertWeightProvider>();
+         }
+ 
++        // arcint M14 (patches/0012, §7.2). MOE_CPU_TIER only ever changes
++        // anything when the provider is offloaded - a resident network has no
++        // slot pool and therefore no capacity misses to redirect. Off by
++        // default (config.get_moe_cpu_tier() defaults false), so an unpatched
++        // load, or a load that never set the property, is provably unaffected.
++        _cpu_tier = config.get_moe_cpu_tier();
++        if (_cpu_tier && _weight_provider->is_offloaded()) {
++            static_cast<OffloadExpertWeightProvider*>(_weight_provider.get())->set_cpu_tier(true);
++            _cpu_tier_threads = config.get_moe_cpu_tier_threads();
++            _max_topk = cur_moe->_config.top_k;
++            _experts_per_token = cur_moe->_config.top_k + (cur_moe->_config.num_shared_expert > 0 ? 1 : 0);
++            // §4.4: raise the ring above StagingRing::default_slot_count (8) so
++            // an 8-miss token at topk 8 never stalls acquire() on its own
++            // previous copy within the same layer.
++            _cpu_y_staging = moe_otd::StagingRing(_max_topk * 2);
++
++            // Fail loud rather than serve a silently different numeric path
++            // (the M8 fail-loud ladder, DESIGN §7.0.2w).
++            OPENVINO_ASSERT(params.get_input_layout(0).data_type == ov::element::f16,
++                            "MOE_CPU_TIER supports f16 activations only (MOE_DTYPE=half); got ",
++                            params.get_input_layout(0).data_type);
++            const auto wdt = params.get_input_layout(static_cast<size_t>(MOE3GemmInputIndex::WEIGHT_0)).data_type;
++            // 4-bit only. The host kernels carry an 8-bit scalar path, but no
++            // T1 fixture exercises it (found in review); until one does, an
++            // 8-bit artifact is refused here rather than served on an
++            // untested numeric path.
++            OPENVINO_ASSERT(wdt == ov::element::u4 || wdt == ov::element::i4,
++                            "MOE_CPU_TIER supports 4-bit compressed expert weights only (u4/i4); got ",
++                            wdt);
++            _cpu_weight_bits = 4;
++            _cpu_weight_signed = (wdt == ov::element::i4);
++            const auto sdt = params.get_input_layout(static_cast<size_t>(MOE3GemmInputIndex::SCALE_0)).data_type;
++            OPENVINO_ASSERT(sdt == ov::element::f16,
++                            "MOE_CPU_TIER supports f16 expert scales only; got ", sdt);
++            if (cur_moe->_config.has_zp) {
++                const auto zdt = params.get_input_layout(static_cast<size_t>(MOE3GemmInputIndex::ZP_0)).data_type;
++                OPENVINO_ASSERT(zdt == ov::element::u4 || zdt == ov::element::u8,
++                                "MOE_CPU_TIER supports u4/u8 expert zero points only; got ", zdt);
++                _cpu_zp_is_u8 = (zdt == ov::element::u8);
++            } else {
++                _cpu_zp_is_u8 = false;
++            }
++            switch (_activation_type) {
++            case ov::op::internal::MOE::Activation_type::GEGLU_TANH:
++                _cpu_gate_act = GateAct::GeluTanh;
++                break;
++            case ov::op::internal::MOE::Activation_type::GEGLU_ERF:
++                _cpu_gate_act = GateAct::GeluErf;
++                break;
++            default:
++                _cpu_gate_act = GateAct::Silu;
++                break;
++            }
++
++            // Discharges §10 R1 on the first load of the window: the config
++            // values the kernel actually sees, read once here rather than
++            // assumed from the IR.
++            if (moe_otd::get_perf_counters())
++                std::cerr << "[OTD_PERF] cpu_tier on: hidden=" << cur_moe->_config.hidden_size
++                           << " inter=" << cur_moe->_config.inter_size << " group=" << cur_moe->_config.group_size
++                           << " topk=" << cur_moe->_config.top_k << " experts=" << cur_moe->_config.num_expert
++                           << " wdt=" << wdt << " has_zp=" << cur_moe->_config.has_zp
++                           << " shared=" << cur_moe->_config.num_shared_expert
++                           << " slots=" << resident_slot_count() << std::endl;
++        } else {
++            _cpu_tier = false;
++        }
++
+         // Don't change the order of stages
+         add_stage(gather, params);
+         add_stage(scatter, params);
+@@ -1318,6 +1695,25 @@ public:
+         cur_moe->use_grouped_gemm_prefill = use_grouped_gemm_prefill;
+         cur_moe->batched_gemv_threshold = batched_gemv_threshold;
+         cur_moe->_activation_type = _activation_type;
++        // arcint M14 (patches/0012, orchestrator fix after the first on-card
++        // window). make_deep_copy default-constructs the clone and copies only
++        // the fields listed here, and the clone is the impl the network runs -
++        // so without these lines the tier is configured on the program's impl
++        // and dormant on the one that executes (measured: tier ON gave
++        // cpu_tier_pairs=0 against evictions=20294, and acquisitions identical
++        // to tier OFF, which the probe()+get_lru_item() double count rules out
++        // for a tier branch that ran even once). The staging ring is per clone,
++        // not shared: its entries track in-flight copies on this impl's stream.
++        cur_moe->_cpu_tier = _cpu_tier;
++        cur_moe->_cpu_tier_threads = _cpu_tier_threads;
++        cur_moe->_max_topk = _max_topk;
++        cur_moe->_experts_per_token = _experts_per_token;
++        cur_moe->_cpu_weight_bits = _cpu_weight_bits;
++        cur_moe->_cpu_weight_signed = _cpu_weight_signed;
++        cur_moe->_cpu_zp_is_u8 = _cpu_zp_is_u8;
++        cur_moe->_cpu_gate_act = _cpu_gate_act;
++        if (_cpu_tier)
++            cur_moe->_cpu_y_staging = moe_otd::StagingRing(_max_topk * 2);
+         return cur_moe;
+     }
+ 
+@@ -1579,7 +1975,7 @@ public:
+         {
+             const size_t topk_count = token_num * static_cast<size_t>(max_topk);
+             bool needs_fallback = false;
+-            on_before_batched_gemv(stream, instance, scratch, topk_count, needs_fallback);
++            on_before_batched_gemv(stream, instance, scratch, token_num, topk_count, needs_fallback);
+             if (needs_fallback) {
+                 // Cannot fit all experts simultaneously → fall back to per-expert onednn loop
+                 instance.output_memory_ptr(0)->fill(stream, 0u);
+@@ -1667,6 +2063,14 @@ public:
+                                       {token_num * compute_experts, subgroup_size, static_cast<size_t>(_hidden_size / N_BLOCK)},
+                                       {1, subgroup_size, SUBGROUP_NUM});
+ 
++            // arcint M14 (patches/0012, §4.4). Between `down` and `reduce`: the
++            // sentinel skip (moe_3gemm_swiglu_mlp.cl) left the CPU-tier rows of
++            // scratch.y stale after `down`; this fills them in before `reduce`
++            // sums all EXPERTS_PER_TOKEN rows. No-op (returns immediately) when
++            // _cpu_tier_misses is empty, which is every step until a capacity
++            // miss actually occurs.
++            cpu_tier_join(stream, scratch, instance);
++
+             // Per-token reduction: final[t] = sum(scratch.y[t * REDUCE_COUNT .. (t+1) * REDUCE_COUNT - 1])
+             ret = execute_stage({ret_event},
+                                 instance,
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_3gemm_swiglu_mlp.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_3gemm_swiglu_mlp.cl
+index e65d26b2..378bcf63 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_3gemm_swiglu_mlp.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_3gemm_swiglu_mlp.cl
+@@ -41,6 +41,16 @@
+ #define EXPERTS_PER_TOKEN MAX_TOPK
+ #endif
+ 
++// arcint M14 (patches/0012). Slot index written by the OTD hook for a (token,expert)
++// pair that the host CPU tier computes this step. Both GEMV stages return without
++// writing anything for such a pair; the host DMAs the finished scratch.y row in
++// after this kernel and before mlp_reduce (in-order queue, program order).
++// Present only when MOE_CPU_TIER_ENABLE is jitted in, so a build with the tier off
++// compiles the byte-identical kernel it compiled before this patch.
++#ifdef MOE_CPU_TIER_ENABLE
++#    define MOE_CPU_TIER_SENTINEL (-1)
++#endif
++
+ // Gate activation: SwiGLU (Swish, default), GeGLU-Tanh, or GeGLU-ERF.
+ // GATE_ACT_GELU_ERF takes precedence over GATE_ACT_GELU_TANH when both are set.
+ #ifdef GATE_ACT_GELU_ERF
+@@ -493,6 +503,15 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_gate_up)(
+ 
+     if (!is_shared) {
+         expert_id = expert_list[token_idx * MAX_TOPK + expert_slot];
++#ifdef MOE_CPU_TIER_ENABLE
++        // Uniform across the workgroup: local size in dim 0 is 1
++        // (moe_3gemm_swiglu_opt.cpp, exec_batched_gemv's lws for this stage), so
++        // every work-item here shares one flat_id and one expert_id. Returning
++        // before the barrier below is therefore legal - no work-item of this
++        // workgroup reaches it.
++        if (expert_id == MOE_CPU_TIER_SENTINEL)
++            return;
++#endif
+         // gate, [HIDDEN_SIZE, INTERMEDIATE_SIZE]
+         gate_weight = (__global MOE_WEI_DT*)(gate_weight_addr + expert_id * expert_wei_size);
+         gate_scale = (__global MOE_SCALE_DT*)(gate_scale_addr + expert_id * expert_scale_size);
+@@ -1014,6 +1033,12 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_down)(const
+ 
+     if (!is_shared) {
+         expert_id = expert_list[token_idx * MAX_TOPK + expert_slot];
++#ifdef MOE_CPU_TIER_ENABLE
++        // Same barrier-uniformity argument as mlp_gate_up (this stage's lws dim 0
++        // is also 1); no work-item of this workgroup reaches the barrier below.
++        if (expert_id == MOE_CPU_TIER_SENTINEL)
++            return;
++#endif
+         // down, [INTERMEDIATE_SIZE, HIDDEN_SIZE]
+         weight = (__global MOE_WEI_DT*)(down_weight_addr + expert_id * expert_wei_size);
+         scales = (__global MOE_SCALE_DT*)(down_scale_addr + expert_id * expert_scale_size);
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
+index 93d89509..1e647d8f 100644
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
+@@ -18,6 +18,11 @@
+ #include "../../common/random_generator.hpp"
+ #include "../test_utils/test_utils.h"
+ #include "moe_3gemm_test_data.h"
++// arcint M14 (patches/0012, T2). network::get_primitive() returns a
++// std::shared_ptr<primitive_inst> (the base class); get_intermediates_
++// memories() needs its complete type, which the primitive-specific *_inst.h
++// headers used elsewhere in this file do not pull in on their own.
++#include "primitive_inst.h"
+ 
+ using namespace cldnn;
+ using namespace ::tests;
+@@ -1541,6 +1546,236 @@ void build_expert_mask_cpu(const int32_t* topk_id_buf, int max_tokens, int max_t
+ }
+ }  // namespace
+ 
++// arcint M14 (patches/0012, §8 T2). The kernel sentinel skip, tested in
++// isolation from the redirect policy (§2) and the CPU compute tier (§4/§5):
++// no OTD/LRU provider is involved here at all. The provider is RESIDENT
++// (is_offloaded() == false), so OffloadExpertWeightProvider::set_cpu_tier()
++// is never called and _cpu_tier stays false on the impl (moe_3gemm_swiglu_
++// opt.cpp ctor: `if (_cpu_tier && _weight_provider->is_offloaded())` takes
++// the else branch) - dispatch_cpu_tier()/cpu_tier_join() never run, so this
++// test cannot pass or fail on patches/0011's CPU kernel correctness, only on
++// the .cl sentinel skip (§3.2).
++//
++// The MOE_CPU_TIER_ENABLE jit constant is independent of that: add_common_
++// consts() (moe_3gemm_swiglu_opt.cpp) reads the raw MOE_CPU_TIER property off
++// the program config, not the impl's _cpu_tier flag, so setting the property
++// on a RESIDENT network still compiles the sentinel branch into the kernel.
++//
++// TOPK_INDICES is fed as a plain input_layout, not produced by MoERouterFused,
++// so this test can put the sentinel value (0xFFFFFFFF, read back as int -1 by
++// the kernel) at an arbitrary flat position without needing a redirect policy
++// or an LRU pool to produce one: on_before_batched_gemv() returns immediately
++// for a non-offloaded provider (`if (!_weight_provider->is_offloaded()) {
++// needs_fallback = false; return; }`) without touching
++// scratch._expert_index_buffer, so exec_batched_gemv's batch_mem_ptr stays
++// scratch.topk_id - this test's raw input - unmodified.
++//
++// scratch.y (MOE_INTERNAL_BUFFER_DOWN_OUTPUT, moe_3gemm_base.hpp) has no
++// public pre-fill hook, so the "recognisable pattern" the binding spec
++// describes is obtained instead by running the SAME network twice on the SAME
++// hidden_states/topk_weights, changing only topk_indices between runs: run A
++// (all four positions real experts) leaves a real, non-zero value in every
++// row; run B (positions 1 and 3 replaced by the sentinel) must leave rows 1
++// and 3 byte-identical to what run A left there, because nothing in run B
++// writes them. Without the kernel's sentinel `return` (§3.2), expert_id == -1
++// at those positions is used as `gate_weight_addr + (-1) * expert_wei_size`
++// (mlp.cl) - an out-of-bounds global-memory pointer read on every lane of the
++// workgroup - which is not a controlled outcome: on the servers this patch
++// targets that is a GPU page fault / kernel launch failure (a crash, which
++// the binding spec accepts as "red" too), not silently-wrong-but-passing
++// data. Rows 0 and 2 (still real experts, same inputs in both runs) must
++// match between A and B: this is the check that the `#ifdef
++// MOE_CPU_TIER_ENABLE` branch does not perturb the non-sentinel path.
++TEST(moe_3gemm_cpu_tier, sentinel_skip_leaves_rows_untouched) {
++    auto& engine = get_test_engine();
++    if (!engine.get_device_info().supports_immad) {
++        GTEST_SKIP() << "No immad support";
++    }
++
++    tests::random_generator rg(GET_SUITE_NAME);
++    Moe3GemmConfig config;
++    config.batch_size = 1;
++    config.seq_len = 1;
++    config.hidden_size = 128;
++    config.inter_size = 256;
++    config.num_experts = 2;  // ids 0 and 1; MAX_TOPK=4 never selects a third
++    config.top_k = 4;        // == MAX_TOPK; no shared expert -> EXPERTS_PER_TOKEN == 4
++    config.group_size = 128;
++    config.is_u4 = true;
++
++    Moe3GemmReference ref(config, rg);
++
++    auto hidden_states = rg.generate_random_1d<ov::float16>(config.hidden_size, -1.0f, 1.0f, 2000);
++    // Distinct, non-degenerate routing weights per flat position so a row that
++    // silently picked up another position's value would still be caught.
++    std::vector<ov::float16> topk_weights_data = {ov::float16(0.7f), ov::float16(0.3f), ov::float16(0.6f), ov::float16(0.4f)};
++
++    auto w0_data = rg.generate_random_1d<float>(config.num_experts * config.hidden_size * config.inter_size, -1.0f, 0.0f, 2000);
++    auto w1_data = rg.generate_random_1d<float>(config.num_experts * config.hidden_size * config.inter_size, -1.0f, 0.0f, 2000);
++    auto w2_data = rg.generate_random_1d<float>(config.num_experts * config.inter_size * config.hidden_size, -1.0f, 0.0f, 2000);
++    for (size_t i = 0; i < config.num_experts * config.hidden_size * config.inter_size; ++i) {
++        w0_data[i] /= 7.0f;
++        w1_data[i] /= 11.0f;
++        w2_data[i] /= 7.0f;
++    }
++    auto [w0_q, w0_scale, w0_zp] = ref.quantize(w0_data, config.num_experts, config.hidden_size, config.inter_size, config.group_size);
++    auto [w1_q, w1_scale, w1_zp] = ref.quantize(w1_data, config.num_experts, config.hidden_size, config.inter_size, config.group_size);
++    auto [w2_q, w2_scale, w2_zp] = ref.quantize(w2_data, config.num_experts, config.inter_size, config.hidden_size, config.group_size);
++    auto w0_q_packed = ref.pack(w0_q);
++    auto w0_zp_packed = ref.pack(w0_zp);
++    auto w1_q_packed = ref.pack(w1_q);
++    auto w1_zp_packed = ref.pack(w1_zp);
++    auto w2_q_packed = ref.pack(w2_q);
++    auto w2_zp_packed = ref.pack(w2_zp);
++
++    auto create_weight_tensor = [&](const std::vector<uint8_t>& values, int64_t b, int64_t f, int64_t y, int64_t x) {
++        auto mem = engine.allocate_memory({data_types::u4, format::bfyx, {b, f, y, x}});
++        set_values(mem, values);
++        get_test_stream().finish();
++        return mem;
++    };
++    auto create_f16_tensor_3d = [&](const std::vector<ov::float16>& values, int64_t d0, int64_t d1, int64_t d2) {
++        auto mem = engine.allocate_memory(layout{ov::PartialShape{d0, d1, d2}, data_types::f16, format::bfyx});
++        set_values(mem, values);
++        get_test_stream().finish();
++        return mem;
++    };
++    auto make_scale = [&](const std::vector<ov::float16>& v, int64_t E, int64_t ofm, int64_t G) {
++        auto fmt = G > 1 ? format::byfx : format::bfyx;
++        auto shape = G > 1 ? ov::PartialShape{E, ofm, G, 1} : ov::PartialShape{E, ofm, 1};
++        auto mem = engine.allocate_memory(layout{shape, data_types::f16, fmt});
++        set_values(mem, v);
++        get_test_stream().finish();
++        return mem;
++    };
++    auto make_zp = [&](const std::vector<uint8_t>& v, int64_t E, int64_t ofm, int64_t G) {
++        auto fmt = G > 1 ? format::byfx : format::bfyx;
++        auto shape = G > 1 ? ov::PartialShape{E, ofm, G, 1} : ov::PartialShape{E, ofm, 1};
++        auto mem = engine.allocate_memory(layout{shape, data_types::u4, fmt});
++        set_values(mem, v);
++        get_test_stream().finish();
++        return mem;
++    };
++
++    size_t group_num = config.hidden_size / config.group_size;
++    size_t group_num2 = config.inter_size / config.group_size;
++
++    auto hidden_states_mem = create_f16_tensor_3d(hidden_states, 1, 1, config.hidden_size);
++    auto topk_weights_mem = create_f16_tensor_3d(topk_weights_data, 1, 1, config.top_k);
++
++    auto w0_weight_mem = create_weight_tensor(w0_q_packed, config.num_experts, config.inter_size, config.group_size, group_num);
++    auto w0_scale_mem = make_scale(w0_scale, config.num_experts, config.inter_size, group_num);
++    auto w0_zp_mem = make_zp(w0_zp_packed, config.num_experts, config.inter_size, group_num);
++    auto w1_weight_mem = create_weight_tensor(w1_q_packed, config.num_experts, config.inter_size, config.group_size, group_num);
++    auto w1_scale_mem = make_scale(w1_scale, config.num_experts, config.inter_size, group_num);
++    auto w1_zp_mem = make_zp(w1_zp_packed, config.num_experts, config.inter_size, group_num);
++    auto w2_weight_mem = create_weight_tensor(w2_q_packed, config.num_experts, config.hidden_size, config.group_size, group_num2);
++    auto w2_scale_mem = make_scale(w2_scale, config.num_experts, config.hidden_size, group_num2);
++    auto w2_zp_mem = make_zp(w2_zp_packed, config.num_experts, config.hidden_size, group_num2);
++
++    topology topology;
++    topology.add(input_layout("hidden_states", hidden_states_mem->get_layout()));
++    topology.add(input_layout("topk_weights", topk_weights_mem->get_layout()));
++    topology.add(input_layout("topk_indices", layout{ov::PartialShape{1, 1, static_cast<int64_t>(config.top_k)}, data_types::u32, format::bfyx}));
++    topology.add(data("w0_weight", w0_weight_mem));
++    topology.add(data("w0_scale", w0_scale_mem));
++    topology.add(data("w0_zp", w0_zp_mem));
++    topology.add(data("w1_weight", w1_weight_mem));
++    topology.add(data("w1_scale", w1_scale_mem));
++    topology.add(data("w1_zp", w1_zp_mem));
++    topology.add(data("w2_weight", w2_weight_mem));
++    topology.add(data("w2_scale", w2_scale_mem));
++    topology.add(data("w2_zp", w2_zp_mem));
++
++    cldnn::MOECompressed::Config moe_config;
++    moe_config.hidden_size = config.hidden_size;
++    moe_config.inter_size = config.inter_size;
++    moe_config.num_expert = config.num_experts;
++    moe_config.top_k = config.top_k;
++    moe_config.group_size = config.group_size;
++    moe_config.out_type = data_types::f16;
++    moe_config.has_zp = true;
++
++    std::vector<input_info> moe_inputs{input_info("hidden_states"),
++                                       input_info("topk_weights"),
++                                       input_info("topk_indices"),
++                                       input_info("w0_weight"),
++                                       input_info("w0_scale"),
++                                       input_info("w0_zp"),
++                                       input_info("w1_weight"),
++                                       input_info("w1_scale"),
++                                       input_info("w1_zp"),
++                                       input_info("w2_weight"),
++                                       input_info("w2_scale"),
++                                       input_info("w2_zp")};
++    topology.add(moe_3gemm_fused_compressed("moe_3gemm_fused_compressed", moe_inputs, moe_config));
++
++    auto net_config = get_test_default_config(engine);
++    net_config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
++    // arcint M14. Independent of OTD: add_common_consts() reads this straight
++    // off the program config, not off any provider state (§3.4).
++    net_config.set_property(ov::intel_gpu::moe_cpu_tier(true));
++    network network(engine, topology, net_config);
++
++    // MOE_INTERNAL_BUFFER_DOWN_OUTPUT == 1 (moe_3gemm_base.hpp); not included
++    // here since it lives under src/graph/impls, off this test target's
++    // include path (CMakeLists.txt) - mirrored as a literal with a size/dtype
++    // guard below instead of trusting the index blind.
++    constexpr size_t kDownOutputBufferIndex = 1;
++    constexpr uint32_t kSentinel = 0xFFFFFFFFu;
++
++    // Out-parameter, not a return value: ASSERT_* expands to a bare `return;`
++    // on failure, which requires the enclosing function to return void.
++    const size_t expected_elems = config.top_k * config.hidden_size;  // EXPERTS_PER_TOKEN == MAX_TOPK here (no shared expert)
++    auto run_and_snapshot = [&](const std::vector<uint32_t>& expert_ids, std::vector<ov::float16>& snapshot) {
++        auto topk_indices_mem = engine.allocate_memory(
++            layout{ov::PartialShape{1, 1, static_cast<int64_t>(config.top_k)}, data_types::u32, format::bfyx});
++        set_values(topk_indices_mem, expert_ids);
++        get_test_stream().finish();
++
++        network.set_input_data("hidden_states", hidden_states_mem);
++        network.set_input_data("topk_weights", topk_weights_mem);
++        network.set_input_data("topk_indices", topk_indices_mem);
++        auto outputs = network.execute();
++        get_test_stream().finish();
++
++        auto prim_inst = network.get_primitive("moe_3gemm_fused_compressed");
++        const auto& intermediates = prim_inst->get_intermediates_memories();
++        ASSERT_GT(intermediates.size(), kDownOutputBufferIndex);
++        auto scratch_y = intermediates[kDownOutputBufferIndex];
++        ASSERT_EQ(scratch_y->get_layout().data_type, data_types::f16);
++        ASSERT_GE(scratch_y->count(), expected_elems);
++
++        snapshot.resize(expected_elems);
++        cldnn::mem_lock<ov::float16, mem_lock_type::read> y_ptr(scratch_y, get_test_stream());
++        std::copy_n(y_ptr.data(), expected_elems, snapshot.begin());
++    };
++
++    // Run A: all four flat positions are real experts (0,1,0,1) - every row
++    // of scratch.y gets a real, recognisable value.
++    std::vector<ov::float16> snapshot_a;
++    run_and_snapshot({0, 1, 0, 1}, snapshot_a);
++    ASSERT_EQ(snapshot_a.size(), expected_elems);
++    // Run B: positions 1 and 3 replaced by the sentinel; positions 0 and 2
++    // keep the same expert id and the same hidden_states/topk_weights as A.
++    std::vector<ov::float16> snapshot_b;
++    run_and_snapshot({0, kSentinel, 0, kSentinel}, snapshot_b);
++    ASSERT_EQ(snapshot_b.size(), expected_elems);
++
++    const size_t hs = config.hidden_size;
++    for (size_t j = 0; j < hs; ++j) {
++        // Sentineled rows: byte-identical to whatever run A left there -
++        // proof the kernel wrote nothing (not "wrote the same thing again").
++        EXPECT_EQ(snapshot_b[1 * hs + j].to_bits(), snapshot_a[1 * hs + j].to_bits()) << "row 1 (sentinel) elem " << j;
++        EXPECT_EQ(snapshot_b[3 * hs + j].to_bits(), snapshot_a[3 * hs + j].to_bits()) << "row 3 (sentinel) elem " << j;
++        // Non-sentineled rows: same expert, same inputs in both runs -> same
++        // result, proving the #ifdef MOE_CPU_TIER_ENABLE branch is inert on
++        // the path it does not take.
++        EXPECT_EQ(snapshot_b[0 * hs + j].to_bits(), snapshot_a[0 * hs + j].to_bits()) << "row 0 (resident) elem " << j;
++        EXPECT_EQ(snapshot_b[2 * hs + j].to_bits(), snapshot_a[2 * hs + j].to_bits()) << "row 2 (resident) elem " << j;
++    }
++}
++
+ TEST(moe_3gemm_expert_mask, shape_predictor_overflow_regression) {
+     // Simulates Gemma4-26b MoE: 128 experts, top_k=8, 274 tokens in prefill
+     constexpr int num_experts = 128;

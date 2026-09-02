@@ -2759,6 +2759,101 @@ prefix-cache byte-exactness at u8:i4. Production still serves `+p1`
 (§`project-ovsrc-plugin-modified`) and does not yet carry these — deployment
 is a separate decision.
 
+#### 7.0.2x The host compute tier: the cold tail stops crossing the bus (2026-09-02)
+
+M14 was scoped (docs/milestone-0.3.0.md) as a hybrid decode split inside the
+plugin: the fused MoE GEMV keeps every expert that hits the device slot LRU,
+and the misses that would have to *evict* a slot are computed on the host
+instead of uploaded, at the seam that already knows the hit/miss partition
+(`try_acquire_simultaneous`, patches `0011`/`0012`). Two decisions on the
+record before any number: the CPU kernels are written for the plugin's actual
+grouped-int4 layout, no repack; and llama.cpp on CPU is not the bar. The
+gates were equivalence and an honestly reported decode number against M9's
+device-tier upload path, win or lose.
+
+The closing window (35B int4, the 16 GiB card, u8 KV, one lane, n_ctx
+65,536, an 897-token prompt, 64 greedy tokens, two probes run1 / run2 with
+the last-16 rate in parentheses):
+
+| cell (device pool, LRU slots per layer) | tier OFF | tier ON |
+|---|---|---|
+| ratio 50, 8 GiB, 128 slots (P\*) | 10.4 / 10.6 (12.8 / 12.7) | **15.0 / 15.5** (15.7 / 15.8) |
+| ratio 75, 5 GiB, 64 slots | 7.4 / 7.5 (7.6 / 7.5) | **14.1 / 14.8** (15.0 / 15.0) |
+
+The window was pre-registered at the milestone row's ratio 20 and ran at
+ratio 50: on this card ratio 20 spills resident experts into GTT (2.1 t/s
+measured OFF), so the pre-registered P\* rule — the largest evicting pool at
+the fastest OFF ratio — chose ratio 50. P\* is that reference: the largest
+pool that still evicts (at
+ratio 50 the pool budget only decides how many of the 360 slot buffers live
+in VRAM rather than GTT; the slot *count* is fixed by the ratio, so
+eviction rate is 26.7% of acquisitions regardless of pool, and 8 GiB is the
+fastest OFF cell). The tier wins 45% there and doubles the ratio-75 cell,
+where fewer slots make the cold tail bigger. Counters (per-layer averages;
+the ratio-50 process ran one probe, the ratio-75 process two), tier ON: ratio 50 routes 3.21 experts per MoE layer to the host (LRU hit rate
+47.9%, eviction count 7,132 against 10,147 per probe OFF), ratio 75 routes
+5.51 (hit 29.0%). Per host expert on its worker thread 270 / 305 µs; per
+layer dispatch-to-join 307 / 396 µs, of which the GPU hides ~30; the x and
+routing-weight readback 283 / 286 µs; the y writeback 29 / 40; pool wake
+5 / 8. The tier layer costs ≈ 620 µs at P\*, and the largest single term is
+now the host readback of a 4 KiB `hidden_states`, ahead of the compute it
+feeds. It is not the bytes; merging its two blocking copies into one wait
+took only ~60 µs off it, and what the remaining ~280 µs is made of is
+unmeasured. That is the next instrument, named and not chased: decompose
+the readback, then test whether a host-visible residency for the decode
+input removes it.
+
+Equivalence held on every axis the endpoint exposes: the 64-token greedy
+text is byte-identical OFF vs ON at both cells with the tier firing on
+40–69% of the loads (the f32-accumulating host kernel against the f16 GPU
+path never flipped an argmax); the acceptance task with the tier ON at P\*
+scores 10/10 (468 tokens, 100.8 s); the fused primitive exists ×40 with the
+tier on (its per-impl configuration line prints exactly forty times per
+process); the host kernels match a double-precision oracle within bound at
+the served shape (T1 ×5); and the kernel-skip red case was *run* on a card,
+not argued — with the sentinel early-return removed from the OpenCL kernel
+the T2 test fails, restored it passes, and the rebuilt plugin is
+byte-identical to the one the table measured.
+
+Three defects stood between the first tier-ON cell and that table, each
+found by a counter and fixed with a measurement, per §7.0.1:
+
+1. **Dormant by construction.** The first tier-ON run reproduced the OFF
+   counters exactly (`cpu_tier_pairs 0`, `acquisitions 75,973` both ways).
+   The tier branch double-counts a miss, so identical totals mean it never
+   ran once: the impl's `clone()` goes through `make_deep_copy`, which
+   default-constructs the copy and carries an explicit field list, and the
+   clone is what the network executes. The M14 members were configured on
+   the program's impl and defaulted on the running one; they are now in the
+   list. Every tier-ON number before that fix is void and is recorded as
+   such in the ledger.
+2. **Compiled at -Os.** With the tier alive, the host kernel measured
+   2,542 µs per expert in situ against 198 in an isolated RAM-bound bench.
+   Two worker-side counters (wake lag 6 µs, task 2,542 µs) put the gap in
+   the kernel itself, and the plugin's own flag line explained it: the
+   graph library's Release options append `-Os` after the global `-O3`, so
+   the one CPU hot path in the plugin was a size-optimised build. The same
+   bench at the plugin's flag order gave 2,404 µs. A per-source `-O3`,
+   emitted after the target's options, brought the in-situ task to 270 µs.
+   The interim verdict — the tier ties or loses at P\* and wins only at
+   ratio 75 — was measured on that -Os kernel and is superseded, not
+   retracted: the measurement was right, the build was wrong.
+3. **The envelope's bandwidth.** The design's 50 µs/expert assumed one
+   expert gets the socket's full 50 GB/s; a single thread streams about
+   8.5 GB/s, and the rewritten kernel (activations de-interleaved once per
+   stage, a byte-spread via shuffle, four accumulators per column, the
+   horizontal sum deferred, one column per pass so nothing spills) sits at
+   198 µs from RAM against the original's 520. Bench caution for the record:
+   a one-expert loop lives in L3 and reports the same 189 µs for either
+   regime; only a rotating set larger than L3 measures the served case.
+
+The property is opt-in (`MOE_CPU_TIER`, arcint `--moe-cpu-tier`, off by
+default, refused without `--offload-ratio`); an unpatched plugin rejects it
+loudly rather than serving the upload path under a "tier on" label.
+Production still serves `+p1` and does not carry these patches; deployment
+is a separate decision, and the Prüfstand on the served coder artifact is
+the gate it waits on.
+
 #### 7.0.2r DFlash2: the external-drafter hook gets a real drafter (2026-09-01)
 
 The public block-diffusion head for the 3.8 went from HF checkpoint to a

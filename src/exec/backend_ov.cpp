@@ -823,6 +823,8 @@ public:
         std::string cache_dir = cfg.cache_dir;
         lane_count_           = std::max(1, cfg.parallel);
         pin_dispatch_         = cfg.pin_dispatch;
+        moe_cpu_tier_         = cfg.moe_cpu_tier;
+        moe_cpu_tier_threads_ = cfg.moe_cpu_tier_threads;
         if (cfg.draft_tokens > 0) {
             drafter_     = std::make_unique<NgramDrafter>(static_cast<size_t>(cfg.draft_ngram),
                                                           static_cast<size_t>(cfg.draft_tokens));
@@ -2236,6 +2238,18 @@ private:
                 log::info("load", "expert slot device pool budget forced to %llu bytes "
                           "(ARCINT_MOE_DEVICE_POOL_BYTES)",
                           static_cast<unsigned long long>(bytes));
+            }
+            // arcint M14. Same contract as MOE_OTD_DEVICE_POOL_BYTES above: an
+            // unpatched plugin rejects the property and the load fails loudly
+            // rather than silently serving the device-upload path while the run
+            // is labelled "cpu tier on". A flag, not an env var, because this
+            // changes what is served, not what is logged.
+            if (moe_cpu_tier_) {
+                props["MOE_CPU_TIER"] = true;
+                if (moe_cpu_tier_threads_ > 0)
+                    props["MOE_CPU_TIER_THREADS"] = static_cast<size_t>(moe_cpu_tier_threads_);
+                log::info("load", "MoE host compute tier enabled (threads=%s)",
+                          moe_cpu_tier_threads_ > 0 ? std::to_string(moe_cpu_tier_threads_).c_str() : "auto");
             }
         }
         // The blob cache is off for the paged graph: its import path is
@@ -4680,6 +4694,8 @@ private:
     ov::Tensor                     hidden_copy_;    // owned; last_hidden_ points here
     int                            offload_ratio_ = 0;
     int                            pin_dispatch_ = -1;  // --pin-dispatch; -1 = off
+    bool                           moe_cpu_tier_ = false;         // --moe-cpu-tier
+    int                            moe_cpu_tier_threads_ = 0;     // --moe-cpu-tier-threads
     // --- lanes (§4.1). One per --parallel slot; the stateful reference path
     // uses lane 0 for its embeddings and MTP requests and serialises on
     // mutex_, because it has one graph state and cannot do better.

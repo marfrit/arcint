@@ -185,6 +185,12 @@ struct Config {
     // unpin.
     int pin_dispatch = -1;
 
+    // Compute MoE experts that would evict a resident device slot on the host
+    // CPU instead of uploading them (needs --offload-ratio > 0: with every
+    // expert resident there is nothing for the host tier to compute).
+    bool moe_cpu_tier = false;   // --moe-cpu-tier
+    int  moe_cpu_tier_threads = 0;  // --moe-cpu-tier-threads; 0 = plugin default
+
     bool show_help    = false;
     bool show_version = false;
 };

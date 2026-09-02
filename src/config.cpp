@@ -216,6 +216,9 @@ std::string usage_text() {
         "                            (default: -1, off). Linux only. The pin persists on\n"
         "                            the pooled OS thread, not the request -- it is never\n"
         "                            undone once set\n"
+        "  --moe-cpu-tier            compute expert FFNs that would evict a device\n"
+        "                            slot on the host CPU instead (needs --offload-ratio)\n"
+        "  --moe-cpu-tier-threads N  worker threads for that tier (0 = auto)\n"
         "\n"
         "memory\n"
         "  --n-ctx N                 context length. Omitted: adopts whatever the\n"
@@ -499,6 +502,12 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.pin_dispatch)) {
                 return fail("--pin-dispatch needs an integer");
             }
+        } else if (arg == "--moe-cpu-tier") {
+            cfg.moe_cpu_tier = true;
+        } else if (arg == "--moe-cpu-tier-threads") {
+            if (!value(v) || !parse_int(v, cfg.moe_cpu_tier_threads)) {
+                return fail("--moe-cpu-tier-threads needs an integer");
+            }
         } else {
             return fail(log::format("unknown option '%s' (try --help)",
                                     std::string(arg).c_str()));
@@ -603,6 +612,17 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     }
     if (cfg.pin_dispatch < -1 || cfg.pin_dispatch > 1023) {
         return fail("--pin-dispatch must be -1 (off) or a core number in [0, 1023]");
+    }
+    if (cfg.moe_cpu_tier_threads < 0 || cfg.moe_cpu_tier_threads > 1023) {
+        return fail("--moe-cpu-tier-threads must be 0 (auto) or in [1, 1023]");
+    }
+    if (!cfg.moe_cpu_tier && cfg.moe_cpu_tier_threads != 0) {
+        return fail("--moe-cpu-tier-threads needs --moe-cpu-tier: without the tier "
+                    "there is no pool to size");
+    }
+    if (cfg.moe_cpu_tier && cfg.offload_ratio == 0) {
+        return fail("--moe-cpu-tier needs --offload-ratio > 0: with every expert "
+                    "resident there is nothing for the host tier to compute");
     }
     if (cfg.prefill_chunk < 0) return fail("--prefill-chunk must be >= 0");
 
