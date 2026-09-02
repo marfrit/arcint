@@ -65,6 +65,7 @@ add_library(arcint_core STATIC
   src/util/sha256.cpp
   src/util/utf8.cpp
   src/util/text.cpp
+  src/core/affinity.cpp
   src/core/artifact.cpp
   src/core/block_pool.cpp
   src/core/model_registry.cpp
@@ -182,6 +183,8 @@ if(ARCINT_TESTS)
     tests/test_turnstile.cpp
     tests/test_provenance.cpp
     tests/test_sha256.cpp
+    tests/test_affinity.cpp
+    tests/test_fit.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")

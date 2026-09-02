@@ -78,9 +78,21 @@ std::string usage_text() {
         "  --queue-timeout S         seconds a request waits for a lane before a\n"
         "                            503 with the reservation numbers (default: 0)\n"
         "  --http-threads N          HTTP worker threads (default: library default)\n"
+        "  --pin-dispatch N          pin each lane's dispatch thread to N+lane_index\n"
+        "                            (default: -1, off). Linux only. The pin persists on\n"
+        "                            the pooled OS thread, not the request -- it is never\n"
+        "                            undone once set\n"
         "\n"
         "memory\n"
-        "  --n-ctx N                 context length (default: the model's own)\n"
+        "  --n-ctx N                 context length. Omitted: adopts whatever the\n"
+        "                            paged path's auto-fit computes (M7) -- that\n"
+        "                            adoption IS the fit, and it can come out below\n"
+        "                            the model's own maximum. --n-ctx 0 (typed) is\n"
+        "                            NOT the same as omitting the flag: it asks\n"
+        "                            explicitly for the model's own maximum, checked\n"
+        "                            against the fit like any other explicit value --\n"
+        "                            it can refuse where omission would have adopted\n"
+        "                            a smaller number instead\n"
         "  --kv-block-size 16|32     KV page size in tokens (default: 32)\n"
         "  --prefill-chunk N         prefill chunk in tokens, 0 = unchunked\n"
         "                            (default: 2048; bounds activation memory)\n"
@@ -121,6 +133,9 @@ std::string usage_text() {
         "                            bytes and live pages are a fixed count, so the\n"
         "                            whole difference lands there\n"
         "  --prefix-cache-mib N      prefix-cache budget in MiB (default: 0, off)\n"
+        "  --fit-margin-mib N        headroom the paged-path auto-fit budget leaves\n"
+        "                            unclaimed (default: 256). The only policy term in\n"
+        "                            the reservation; every other term is measured\n"
         "  --no-logits-slice         compute logits for every prompt token (slower,\n"
         "                            and runs out of memory past a few thousand)\n"
         "  --kv-dtype fp16|fp32      stored KV element type (default: fp16;\n"
@@ -276,6 +291,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             }
         } else if (arg == "--n-ctx") {
             if (!value(v) || !parse_int(v, cfg.n_ctx)) return fail("--n-ctx needs an integer");
+            // Distinguishes "the operator asked for this" from "nothing was
+            // asked, take the model's own context" -- M7's auto-fit adopts
+            // its computed max only in the second case.
+            cfg.n_ctx_explicit = true;
         } else if (arg == "--prefill-chunk") {
             if (!value(v) || !parse_int(v, cfg.prefill_chunk)) {
                 return fail("--prefill-chunk needs an integer");
@@ -283,6 +302,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--prefix-cache-mib") {
             if (!value(v) || !parse_int(v, cfg.prefix_cache_mib)) {
                 return fail("--prefix-cache-mib needs an integer");
+            }
+        } else if (arg == "--fit-margin-mib") {
+            if (!value(v) || !parse_int(v, cfg.fit_margin_mib)) {
+                return fail("--fit-margin-mib needs an integer");
             }
         } else if (arg == "--no-logits-slice") {
             cfg.slice_logits = false;
@@ -332,6 +355,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--mtp") {
             if (!value(v)) return fail("--mtp needs a value");
             cfg.mtp = std::string(v);
+        } else if (arg == "--pin-dispatch") {
+            if (!value(v) || !parse_int(v, cfg.pin_dispatch)) {
+                return fail("--pin-dispatch needs an integer");
+            }
         } else {
             return fail(log::format("unknown option '%s' (try --help)",
                                     std::string(arg).c_str()));
@@ -428,6 +455,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.offload_ratio < 0 || cfg.offload_ratio > 100) {
         return fail("--offload-ratio must be a percentage in [0, 100]");
     }
+    if (cfg.pin_dispatch < -1 || cfg.pin_dispatch > 1023) {
+        return fail("--pin-dispatch must be -1 (off) or a core number in [0, 1023]");
+    }
     if (cfg.prefill_chunk < 0) return fail("--prefill-chunk must be >= 0");
 
     // The prefill grid and the cache grid have to be the same grid. A cache hit
@@ -451,6 +481,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.draft_tokens < 0) return fail("--draft must be >= 0");
     if (cfg.draft_ngram < 1) return fail("--draft-ngram must be >= 1");
     if (cfg.prefix_cache_mib < 0) return fail("--prefix-cache-mib must be >= 0");
+    if (cfg.fit_margin_mib < 0) return fail("--fit-margin-mib must be >= 0");
     if (cfg.gdn_checkpoint_budget_mib < 0) {
         return fail("--gdn-checkpoint-budget must be >= 0");
     }

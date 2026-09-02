@@ -46,6 +46,27 @@ struct Reservation {
     int      lanes              = 1;
     int      prefill_chunk      = 0;
     int      n_ctx              = 0;
+
+    // M7 (the auto-fit design, §2/§4): the terms the pre-M7 budget did not
+    // charge for. `drafter_bytes` is the resident delta from compiling
+    // embeddings/MTP/DFlash after the main model (previously folded into
+    // activation_bytes, attributed to the wrong line).
+    //
+    // The expert slot pool is two ledgers, not one (measured on the card,
+    // see backend_ov.cpp Phase B): `expert_slot_bytes` is the DEVICE (VRAM)
+    // charge -- the OTD LRU working set --offload-ratio > 0 actually keeps
+    // resident, and the only one counted in the device budget below.
+    // `expert_slot_host_bytes` is the HOST (GTT) estimate -- everything the
+    // ratio makes eligible to be paged in -- informational only, never
+    // subtracted from device_total_bytes. Both are zero when offload is
+    // off. `slot_source` says how the DEVICE figure was priced: "forced"
+    // (ARCINT_FIT_SLOT_BYTES) or "probe" (the plateau probe); empty when
+    // offload is off or the probe failed with an explicit --n-ctx to fall
+    // back on.
+    uint64_t    expert_slot_bytes      = 0;
+    uint64_t    expert_slot_host_bytes = 0;
+    uint64_t    drafter_bytes          = 0;
+    std::string slot_source;
 };
 
 struct ModelStatus {

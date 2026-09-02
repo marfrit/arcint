@@ -332,3 +332,68 @@ TEST(config_one_drafter_per_server) {
     Config cfg;
     CHECK(run({"--stub", "--dflash", "/d"}, cfg).ok);
 }
+
+TEST(config_pin_dispatch_defaults_off) {
+    Config cfg;
+    CHECK(run({"--stub"}, cfg).ok);
+    CHECK_EQ(cfg.pin_dispatch, -1);
+}
+
+TEST(config_pin_dispatch_accepts_a_core) {
+    Config cfg;
+    CHECK(run({"--stub", "--pin-dispatch", "0"}, cfg).ok);
+    CHECK_EQ(cfg.pin_dispatch, 0);
+
+    Config cfg2;
+    CHECK(run({"--stub", "--pin-dispatch", "7"}, cfg2).ok);
+    CHECK_EQ(cfg2.pin_dispatch, 7);
+}
+
+TEST(config_pin_dispatch_rejects_garbage) {
+    CHECK(rejected({"--stub", "--pin-dispatch", "-2"}));
+    CHECK(rejected({"--stub", "--pin-dispatch", "1024"}));
+    CHECK(rejected({"--stub", "--pin-dispatch", "not-a-core"}));
+}
+
+TEST(config_fit_margin_mib_defaults_256) {
+    Config cfg;
+    CHECK(run({"--stub"}, cfg).ok);
+    CHECK_EQ(cfg.fit_margin_mib, 256);
+}
+
+TEST(config_fit_margin_mib_accepts_a_value) {
+    Config cfg;
+    CHECK(run({"--stub", "--fit-margin-mib", "512"}, cfg).ok);
+    CHECK_EQ(cfg.fit_margin_mib, 512);
+
+    Config cfg2;
+    CHECK(run({"--stub", "--fit-margin-mib", "0"}, cfg2).ok);
+    CHECK_EQ(cfg2.fit_margin_mib, 0);
+}
+
+TEST(config_fit_margin_mib_rejects_garbage) {
+    CHECK(rejected({"--stub", "--fit-margin-mib", "-1"}));
+    CHECK(rejected({"--stub", "--fit-margin-mib", "not-a-number"}));
+}
+
+TEST(config_n_ctx_explicit_defaults_false) {
+    Config cfg;
+    CHECK(run({"--stub"}, cfg).ok);
+    CHECK(!cfg.n_ctx_explicit);
+    CHECK_EQ(cfg.n_ctx, 0);
+}
+
+TEST(config_n_ctx_explicit_true_when_passed) {
+    Config cfg;
+    CHECK(run({"--stub", "--n-ctx", "8192"}, cfg).ok);
+    CHECK(cfg.n_ctx_explicit);
+    CHECK_EQ(cfg.n_ctx, 8192);
+
+    // Even an explicit 0 counts as explicit -- the flag was typed, so it is
+    // not "nothing was asked", however unlikely a real operator is to pass
+    // it.
+    Config cfg2;
+    CHECK(run({"--stub", "--n-ctx", "0"}, cfg2).ok);
+    CHECK(cfg2.n_ctx_explicit);
+    CHECK_EQ(cfg2.n_ctx, 0);
+}

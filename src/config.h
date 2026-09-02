@@ -33,7 +33,14 @@ struct Config {
     std::string host = "127.0.0.1";
     int         port = 8090;
 
-    int n_ctx    = 0;  // 0: take the model's trained context
+    int  n_ctx          = 0;      // 0: take the model's trained context
+    // True only when --n-ctx was actually passed (any value, including 0),
+    // never when n_ctx fell back to the artifact's own training context.
+    // The auto-fit (M7) needs this distinction: an omitted --n-ctx adopts
+    // whatever context the reservation computes -- that adoption IS the
+    // fit -- while an operator-explicit value is verify-only and refuses
+    // rather than being silently lowered.
+    bool n_ctx_explicit = false;
     int parallel = 1;  // lanes (DESIGN.md §4 /health reports free/total)
 
     // How long a request waits for a lane before it is refused with the
@@ -63,6 +70,13 @@ struct Config {
     // this architecture's state is tens of MiB (the GDN half is fixed-size), so
     // this is a real budget, not a formality (§3.3).
     int prefix_cache_mib = 0;
+
+    // Headroom the auto-fit budget leaves unclaimed on the paged path
+    // (M7, DESIGN §7.0.2s / the M7 design's §2-3). The only genuinely
+    // *policy* term in the reservation -- every other term is measured, and a
+    // flag for a measured term would be a way to lie to the arithmetic.
+    // Replaces what used to be a hardcoded 256 MiB constant in load_paged.
+    int fit_margin_mib = 256;
 
     // Slice the hidden state to its last row before the LM head, so prefill
     // computes one logit row rather than one per prompt token. On by default:
@@ -152,6 +166,17 @@ struct Config {
 
     int http_threads = 0;  // 0: httplib default
     int verbosity    = 0;  // -v, -vv
+
+    // Pin each lane's dispatch thread to <core>+lane_index (core/affinity.h).
+    // -1 = off. Testing knob for the measured hypothesis that plain decode is
+    // enqueue-bound: infer() is synchronous, so the thread that calls it is
+    // the HTTP request's own generation loop, and an idle core it never
+    // migrates off of is what a pinned run measures against. Linux only.
+    // The pin persists on the OS thread, not the request: a pooled HTTP
+    // worker that picks up a different lane on its next request stays
+    // pinned to this lane's core until the process exits -- there is no
+    // unpin.
+    int pin_dispatch = -1;
 
     bool show_help    = false;
     bool show_version = false;

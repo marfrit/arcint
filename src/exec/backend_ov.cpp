@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -67,6 +68,8 @@
 #include <minja/chat-template.hpp>
 
 #include "config.h"
+#include "core/affinity.h"
+#include "exec/fit.h"
 #include "core/artifact.h"
 #include "core/block_pool.h"
 #include "core/drafter.h"
@@ -539,6 +542,78 @@ size_t pad_gate_matmuls(const std::shared_ptr<ov::Model>& model, size_t npad) {
     return done;
 }
 
+// M7 §2 Phase B, analytic route (the M7 design, "Auto-fit and the honest
+// reservation"): sizes the expert slot pool from the `read_model` the load
+// path already holds, without materialising any weight data -- a weightless
+// IR (ov::weights_path) still carries every constant's shape and element
+// type in the XML.
+//
+// A MoE op is identified by its OpenVINO type name carrying "moe" (matching
+// how tools/verify_moe_lowering.py's own fusion_check finds them in a
+// compiled runtime graph); its expert-weight inputs are the Constant
+// operands (or a Constant behind one Convert, for compressed weights) whose
+// leading dimension equals `num_expert` -- the expert axis is dim 0, so
+// gate/up/down and any packed scale/zero-point tensors are all picked up the
+// same way, by shape rather than by name. Every guard the M7 design names
+// (op type unrecognised, a weight input that is not a plain constant, zero
+// bytes, n_expert == 0) drops out of the sum rather than being special-cased,
+// so an unmatched graph simply returns nullopt and the caller falls back to
+// the plateau probe -- this function never guesses.
+struct SlotPoolIr {
+    uint64_t total_bytes      = 0;  // summed over every matched MoE layer
+    uint64_t per_expert_bytes = 0;  // from the first matched layer, for the load-time log line
+    int      slots            = 0;  // per layer, from the first matched layer
+    int      moe_layers       = 0;
+};
+
+std::optional<SlotPoolIr> slot_pool_from_ir(const std::shared_ptr<ov::Model>& model,
+                                            int num_expert, int ratio_pct) {
+    if (num_expert <= 0) return std::nullopt;
+    SlotPoolIr out;
+    for (const auto& node : model->get_ordered_ops()) {
+        std::string tname = node->get_type_name();
+        std::transform(tname.begin(), tname.end(), tname.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (tname.find("moe") == std::string::npos) continue;
+
+        uint64_t per_expert_bytes = 0;
+        for (size_t i = 0; i < node->get_input_size(); ++i) {
+            std::shared_ptr<ov::Node> src = node->input_value(i).get_node_shared_ptr();
+            // Compressed weights sometimes ride through one Convert (u4/u8 ->
+            // f16/f32) before the op that consumes them; the Constant
+            // underneath still carries the real (compressed) shape and
+            // element size, which is the byte count that is actually
+            // resident once a slot is loaded.
+            if (const auto conv = ov::as_type_ptr<ov::op::v0::Convert>(src)) {
+                src = conv->input_value(0).get_node_shared_ptr();
+            }
+            const auto konst = ov::as_type_ptr<ov::op::v0::Constant>(src);
+            if (konst == nullptr) continue;  // not a weight input we can size
+            const ov::Shape& sh = konst->get_shape();
+            if (sh.empty() || sh[0] != static_cast<size_t>(num_expert)) continue;
+            uint64_t elems = 1;
+            for (size_t d = 1; d < sh.size(); ++d) elems *= sh[d];
+            per_expert_bytes += elems * konst->get_element_type().size();
+        }
+        if (per_expert_bytes == 0) continue;  // not weight-bearing, or shapes we can't read
+
+        if (out.moe_layers == 0) {
+            out.per_expert_bytes = per_expert_bytes;
+            // Mirrors expert_slot_bytes' ceiling (exec/fit.h): the plugin's
+            // own rounding lives in ops/moe.cpp, out of this repository's
+            // tree (patches/0003 here only touches expert-mask subbuffer
+            // caching and does not carry that expression), so this
+            // over-reserves rather than under-reserves, pending an on-card
+            // audit against MOE_OTD_PERF_LOG.
+            out.slots = static_cast<int>(expert_slot_bytes(num_expert, ratio_pct, 1, 1));
+        }
+        out.total_bytes += expert_slot_bytes(num_expert, ratio_pct, per_expert_bytes, 1);
+        ++out.moe_layers;
+    }
+    if (out.moe_layers == 0) return std::nullopt;
+    return out;
+}
+
 bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model,
                                 int64_t keep_rows, int64_t token_axis) {
     const auto& results = model->get_results();
@@ -731,6 +806,7 @@ public:
         const std::string& device    = cfg.device;
         std::string cache_dir = cfg.cache_dir;
         lane_count_           = std::max(1, cfg.parallel);
+        pin_dispatch_         = cfg.pin_dispatch;
         if (cfg.draft_tokens > 0) {
             drafter_     = std::make_unique<NgramDrafter>(static_cast<size_t>(cfg.draft_ngram),
                                                           static_cast<size_t>(cfg.draft_tokens));
@@ -822,10 +898,19 @@ public:
             // by roughly the resident expert share. And the streaming path
             // costs ~30x decode on this plugin build. A fit-the-model lever,
             // not a context-for-VRAM dial.
+            //
+            // Stateful-path only, and stated as fact rather than advice
+            // (F4, review): M7's auto-fit (Phase A-E, exec/fit.h) lives on
+            // the paged path and is not reachable from here -- this
+            // executor's own reservation has no slot-pool term at all, so
+            // "set --n-ctx" would be routing around the one real check that
+            // exists on the path that has one, not fixing this one.
             log::warn("load", "%s",
-                      "offload active: the reservation under-counts the expert slot "
-                      "memory (it commits lazily), so the printed max ctx is optimistic "
-                      "-- set --n-ctx explicitly rather than trusting the automatic cap");
+                      "offload active on the stateful (--no-paged) reference executor: it has "
+                      "no auto-fit (M7 is paged-only) and its reservation does not account for "
+                      "the expert slot pool, which commits lazily, so the printed max ctx here "
+                      "is optimistic. The paged path (the default) sizes and refuses on this "
+                      "term; this one does not.");
         }
         want_mtp_ = cfg.mtp != "off" && artifact.has_mtp_head;
         if (want_mtp_ && !expose_hidden_state(model)) {
@@ -1044,6 +1129,30 @@ public:
 
     FinishReason generate(const GenerationInput& in, int slot, const TokenCallback& on_piece,
                           GenerationStats& stats) override {
+        // §M12b: this thread — whichever HTTP worker owns `slot` — is also the
+        // one that calls every synchronous infer() below for the rest of the
+        // request, so pinning it here covers the whole generation loop (paged
+        // and stateful alike) from one spot. Opt-in and a no-op by default.
+        //
+        // The pin outlives this call (F6, review): pthread_setaffinity_np sets
+        // the thread's affinity mask, not a per-request scope, so a pooled
+        // HTTP worker that served slot 0 here and is later handed slot 1 by
+        // the pool stays pinned to slot 0's core until it is told otherwise
+        // -- there is no unpin. --pin-dispatch is a testing knob for a
+        // measured hypothesis, not a production affinity policy, and this is
+        // the price of the one-call, whole-request-covering placement.
+        if (pin_dispatch_ >= 0) {
+            const int core = pin_dispatch_ + slot;
+            if (pin_current_thread(core)) {
+                log::debug(log::format("slot %d", slot), "dispatch pinned to core %d", core);
+            } else {
+                // Core offline, cpuset-vetoed, or a non-Linux build: silent
+                // before this fix, which reads as "pinned" in a log full of
+                // debug lines from the successful case right beside it.
+                log::warn(log::format("slot %d", slot),
+                          "dispatch pin to core %d failed; running unpinned this request", core);
+            }
+        }
         if (paged_) {
             // No lock: the lane is the HTTP layer's lease, its state is its own,
             // and the only thing two lanes contend for is the device — which the
@@ -2140,6 +2249,22 @@ private:
             }
         }
 
+        // M7 §1 Phase A (the M7 design, "Auto-fit and the honest
+        // reservation"): embeddings, the MTP head and the DFlash drafter all
+        // compile after `resident_base` above, on this device by default, so
+        // their weights were being charged to the activation probe further
+        // down instead of to their own line -- not lost, just attributed to
+        // the wrong one, and it inflated the slope that picks the chunk. A
+        // second residency read isolates them into their own term.
+        const size_t resident_with_drafters = device_resident_bytes(device);
+        const size_t drafter_bytes = resident_with_drafters > resident_base
+                                         ? resident_with_drafters - resident_base
+                                         : 0;
+        if (drafter_bytes > 0) {
+            log::info("load", "drafters (embeddings/MTP/DFlash) resident: %.2f GiB",
+                      static_cast<double>(drafter_bytes) / (1u << 30));
+        }
+
         // ---- ports: state tables and KV pools --------------------------------
         size_t conv_i = 0, gdn_i = 0, kv_block_bytes = 0;
         for (const auto& port : paged_model_.inputs()) {
@@ -2223,9 +2348,232 @@ private:
         Lane&        lane0  = *lanes_[0];
         const size_t total  = core_.get_property(device, ov::intel_gpu::device_total_mem_size);
         const size_t slab   = la_row_bytes_ * rows_per_lane_;   // per lane
-        const size_t margin = 256ull << 20;
+        const size_t margin = static_cast<size_t>(cfg.fit_margin_mib) << 20;
         const int    wanted = req_n_ctx > 0 ? req_n_ctx : artifact_.n_ctx_train;
         const int    lanes  = lane_count_;
+
+        // Chunk floor, hoisted here (out of the climb below) because Phase B
+        // needs it too: the plateau probe fallback saturates the expert pool
+        // at the SAME floor_c the activation climb starts from, and must run
+        // first (§1 "B must precede C").
+        const size_t configured = prefill_chunk_ > 0 ? static_cast<size_t>(prefill_chunk_) : 512;
+        const size_t floor_c    = std::min<size_t>(configured, 128);
+        size_t       probe_pool_blocks = 0;
+
+        // ---- Phase B: expert slot pool (M7 §1/§2, reworked after on-card
+        // measurement) ------------------------------------------------------
+        //
+        // Two ledgers, not one. Measured on the card (35B q4, 16 GiB, u8 KV,
+        // 1 lane, --offload-ratio 20): device VRAM after load was 6.69 GiB
+        // against a 6.81 GiB promise (0.8% off) while a ~12 GiB expert pool
+        // sat in GTT -- host RAM mapped for the GPU, confirmed via
+        // /proc/<pid>/fdinfo (drm-total-gtt=13.17 GiB vs drm-total-vram0=
+        // 6.69 GiB). So the plateau probe's small figure IS the correct
+        // DEVICE charge (the LRU working set actually resident in VRAM), and
+        // the (100-ratio)% ceiling estimate -- from the IR walk or from
+        // config.json -- prices the HOST-side pool, not the device one.
+        // Charging the device budget with the ceiling estimate is exactly
+        // the failure this rework removes: it is the same shape of mistake
+        // M7 itself was written to fix, just moved one term over.
+        //
+        // Only when offload is on; otherwise neither ledger has anything to
+        // reserve and both stay exactly zero, not an estimate of zero.
+        uint64_t    slot_pool         = 0;  // device (VRAM) charge -- goes into the budget
+        std::string slot_source;            // "forced" | "probe"
+        uint64_t    slot_host_bytes   = 0;  // host (GTT) estimate -- informational only
+        std::string slot_host_source;       // "ir" | "config"
+        if (offload_ratio_ > 0) {
+            // §4 "the on-card red case": forces the DEVICE term for an A/B
+            // against the exact bug M7 removes. Checked first and, when
+            // valid, short-circuits the rest of Phase B entirely -- no
+            // probe, no analytic walk, no host-side estimate -- because a
+            // forced figure is a deliberate override, not something a
+            // multi-minute probe should still be spent measuring around.
+            // ARCINT_FIT_SLOT_BYTES=0 on an --offload-ratio run reproduces
+            // the pre-M7 arithmetic on today's binary, so a green full-depth
+            // run at the real figure and an OOM (or a refusal) at the forced
+            // 0 are the same binary proving the fix does something. An env
+            // var and not a flag, like ARCINT_PAGED_KV: an experiment knob,
+            // not something an operator sets in production.
+            bool forced = false;
+            if (const char* env = std::getenv("ARCINT_FIT_SLOT_BYTES")) {
+                char*                    end = nullptr;
+                const unsigned long long v   = std::strtoull(env, &end, 10);
+                if (end != env && *end == '\0') {
+                    slot_pool   = v;
+                    slot_source = "forced";
+                    forced      = true;
+                    log::info("load",
+                              "expert slot pool forced to %.2f GiB by ARCINT_FIT_SLOT_BYTES "
+                              "(source: forced) -- Phase B probe and analytic walk skipped",
+                              static_cast<double>(v) / (1u << 30));
+                } else {
+                    log::warn("load", "ARCINT_FIT_SLOT_BYTES='%s' is not a valid integer; ignored",
+                              env);
+                }
+            }
+
+            if (!forced) {
+                // Device term: the plateau probe only. The analytic IR walk
+                // (slot_pool_from_ir) is not used to charge the device
+                // budget -- measured on the card, its ceiling formula lands
+                // on the HOST figure, not what the driver actually keeps in
+                // VRAM -- so it stays a future source (§2) pending a formula
+                // for the true device-resident LRU set, and is used below
+                // only for the host-side ledger.
+                bool probe_ok = true;
+                try {
+                    const size_t probe_blocks =
+                        (floor_c + kv_block_tokens_ - 1) / kv_block_tokens_ + 1;
+                    if (probe_blocks != probe_pool_blocks) {
+                        alloc_kv_pools(rctx, probe_blocks);
+                        probe_pool_blocks = probe_blocks;
+                    }
+                    lane0.blocks.resize(probe_blocks);
+                    for (size_t i = 0; i < probe_blocks; ++i) {
+                        lane0.blocks[i] = static_cast<int32_t>(i);
+                    }
+
+                    long long high_water = 0;
+                    long long prev       = 0;
+                    int       plateaued  = 0;
+                    // A 128-token prefill routes min(num_expert, 128*top_k)
+                    // experts per layer (§2), so saturation takes few chunks;
+                    // 8 distinct-token probes is headroom over that, not a
+                    // tuning knob -- there is deliberately no flag for this
+                    // count (§3, "no probe-tuning flag: termination is a
+                    // plateau, not a count").
+                    for (int iter = 0; iter < 8 && plateaued < 2; ++iter) {
+                        zero_paged_rows(lane0);
+                        std::vector<int> ids(floor_c);
+                        // Distinct ids, so routing actually varies -- the
+                        // all-zero activation probe below would hit the same
+                        // handful of experts every time and never saturate
+                        // the pool. Kept well under any real tokenizer's
+                        // vocabulary so this never indexes past the
+                        // embedding table.
+                        for (size_t i = 0; i < floor_c; ++i) {
+                            ids[i] = static_cast<int>(
+                                (static_cast<size_t>(iter) * floor_c + i) % 1000);
+                        }
+                        paged_forward(lane0, embed_paged(lane0, ids), 0, {0, 0}, 0);
+                        const long long now = static_cast<long long>(
+                                                  device_resident_bytes(device)) -
+                                              static_cast<long long>(resident_with_drafters);
+                        plateaued = now <= prev ? plateaued + 1 : 0;
+                        prev       = now;
+                        high_water = std::max(high_water, now);
+                    }
+                    lane0.blocks.clear();
+                    slot_pool = static_cast<uint64_t>(std::max<long long>(high_water, 0));
+                } catch (const std::exception& e) {
+                    log::warn("load", "expert slot pool plateau probe failed: %s", e.what());
+                    reset_lane_request(lane0);
+                    probe_ok = false;
+                }
+                if (probe_ok) {
+                    slot_source = "probe";
+                    log::info("load",
+                              "expert slots: plateau probe settled at %.2f GiB after "
+                              "distinct-token chunks (source: probe)",
+                              static_cast<double>(slot_pool) / (1u << 30));
+                } else if (!cfg.n_ctx_explicit) {
+                    throw std::runtime_error(
+                        "--offload-ratio > 0: the engine could not size the expert slot pool "
+                        "with a plateau probe, and no --n-ctx was given to hold it to "
+                        "explicitly. Pass --n-ctx, or drop --offload-ratio.");
+                } else {
+                    log::warn("load", "%s",
+                              "expert slot pool unpriced; proceeding on the explicit --n-ctx "
+                              "alone (the fit below is verify-only and cannot promise this "
+                              "term is honest)");
+                }
+
+                // Host-side ledger (GTT): informational, never charged
+                // against the device budget. The analytic IR walk gives the
+                // real per-expert weight bytes when it can find the MoE ops;
+                // otherwise 3 x hidden x moe_intermediate x bytes-per-weight
+                // per expert from config.json, at the same ceiling slot
+                // count. Neither is a second source of truth for the device
+                // term -- this cross-check informs the host line only.
+                if (const auto ir = slot_pool_from_ir(model, artifact_.n_expert, offload_ratio_)) {
+                    slot_host_bytes  = ir->total_bytes;
+                    slot_host_source = "ir";
+                    log::info("load",
+                              "expert slots host-side: %.2f GiB (GTT, source: ir, %d per MoE "
+                              "layer x %d layers x %.2f MiB)",
+                              static_cast<double>(slot_host_bytes) / (1u << 30), ir->slots,
+                              ir->moe_layers, static_cast<double>(ir->per_expert_bytes) / (1u << 20));
+                } else {
+                    const json& tc = artifact_.config.contains("text_config") &&
+                                             artifact_.config["text_config"].is_object()
+                                         ? artifact_.config["text_config"]
+                                         : artifact_.config;
+                    const size_t hidden = static_cast<size_t>(artifact_.n_embd);
+                    size_t       moe_intermediate = 0;
+                    if (tc.contains("moe_intermediate_size") &&
+                        tc["moe_intermediate_size"].is_number_integer()) {
+                        moe_intermediate = tc["moe_intermediate_size"].get<size_t>();
+                    }
+                    if (hidden > 0 && moe_intermediate > 0 && artifact_.n_expert > 0 &&
+                        artifact_.n_layer > 0) {
+                        const double bytes_per_weight = cfg.quant == Quant::Q8 ? 1.0 : 0.5;
+                        const uint64_t per_expert_config = static_cast<uint64_t>(
+                            3.0 * static_cast<double>(hidden) *
+                            static_cast<double>(moe_intermediate) * bytes_per_weight);
+                        slot_host_bytes = expert_slot_bytes(artifact_.n_expert, offload_ratio_,
+                                                            per_expert_config, artifact_.n_layer);
+                        slot_host_source = "config";
+                        log::info("load",
+                                  "expert slots host-side: %.2f GiB (GTT, source: config)",
+                                  static_cast<double>(slot_host_bytes) / (1u << 30));
+                    }
+                }
+
+                // §4 sanity note (replaces the old "under half -> override"
+                // rule, which assumed both figures priced the same memory).
+                // They do not: the device probe and the host estimate are
+                // two different pools now, so a probe far below the host
+                // estimate is the EXPECTED shape -- the LRU working set is a
+                // small fraction of everything that could be paged in --
+                // and is logged rather than corrected.
+                if (slot_host_bytes > 0 && slot_pool < slot_host_bytes / 20) {
+                    log::info("load",
+                              "expert slot pool: device figure %.2f GiB (%s) is under 5%% of "
+                              "the host-side estimate %.2f GiB -- expected (the device term is "
+                              "the LRU working set; the host term is what could be paged in); "
+                              "keeping the device figure for the budget",
+                              static_cast<double>(slot_pool) / (1u << 30),
+                              slot_source.empty() ? "unpriced" : slot_source.c_str(),
+                              static_cast<double>(slot_host_bytes) / (1u << 30));
+                }
+            }
+        }
+
+        // The baseline every activation probe below measures against:
+        // resident_base plus everything Phase A and B have already
+        // committed to the device (drafters always; the GDN slab rows via
+        // alloc_la_rows above; the device slot pool too, whenever the
+        // plateau probe -- not a forced value, which touches nothing --
+        // priced it).
+        // Using the ORIGINAL resident_base here would charge those bytes to
+        // the first activation probe's delta instead of to their own
+        // term -- exactly the M7 §0 under-count, reproduced for a second
+        // term if this read were skipped.
+        //
+        // `baseline_probe_pool_blocks` is a second, narrower snapshot: how
+        // large the KV probe pool already was at the instant
+        // resident_committed was read (Phase B's floor_c pool when the
+        // plateau probe ran; 0 otherwise). The pool's own bytes are already
+        // inside resident_committed and inside every later `after` reading,
+        // so a probe call must cancel only the CHANGE in pool size since the
+        // baseline, not the pool's whole current size -- see the review
+        // finding this replaces (F1): the previous code subtracted the full
+        // probe_blocks*kv_block_bytes every call, which double-subtracted a
+        // pool that a prior Phase B probe (or an earlier climb step) had
+        // already folded into the baseline.
+        const size_t resident_committed        = device_resident_bytes(device);
+        const size_t baseline_probe_pool_blocks = probe_pool_blocks;
 
         // Probe SMALL first -- a probe at the configured chunk can itself OOM on
         // a tight card (observed on the A770: sometimes the driver spills,
@@ -2233,7 +2581,15 @@ private:
         // in the chunk (§7.0.2a), so a 128-token probe fixes the slope, the
         // largest admissible chunk is computed, and one guarded probe verifies
         // it, stepping down on failure instead of dying.
-        size_t probe_pool_blocks = 0;
+        //
+        // The slab is NOT subtracted here (F1 fix): alloc_la_rows above
+        // already committed every lane's GDN checkpoint rows before
+        // resident_committed was read, so the slab is already inside the
+        // baseline. Subtracting it a second time is what produced the
+        // measured negative activation deltas (-0.27 GiB at slab 0.296 on a
+        // 24 GB card, -0.09 at GDN 0.093 on a 16 GB card) that an earlier
+        // pass here wrongly attributed to LRU eviction noise -- there is no
+        // eviction in this code path; it was a baseline accounting error.
         auto probe = [&](Lane& lane, size_t chunk_tokens) -> long long {
             const size_t probe_blocks =
                 (chunk_tokens + kv_block_tokens_ - 1) / kv_block_tokens_ + 1;
@@ -2250,9 +2606,15 @@ private:
             const long long after = static_cast<long long>(device_resident_bytes(device));
             lane.blocks.clear();
             (void)before;
-            return after - static_cast<long long>(resident_base) -
-                   static_cast<long long>(slab) * lanes -
-                   static_cast<long long>(probe_blocks * kv_block_bytes);
+            // Cancel only the KV probe pool's CHANGE since the baseline
+            // (current size minus what was already resident when
+            // resident_committed was read), not its whole current size --
+            // the difference is nonzero only when this call, or an earlier
+            // one in this same climb, actually grew the pool past what
+            // Phase B (or nothing) had already committed.
+            return after - static_cast<long long>(resident_committed) -
+                   static_cast<long long>(probe_blocks * kv_block_bytes) +
+                   static_cast<long long>(baseline_probe_pool_blocks * kv_block_bytes);
         };
         // The peak is affine in the chunk, not linear from the origin: measured
         // on the A770, 0.62 GiB at 128 tokens and 0.77 at 256, so most of it is
@@ -2268,8 +2630,6 @@ private:
         // nothing because of a measurement. So each step up is taken only when
         // the fit says it fits WITH headroom, and the fit is re-made from the
         // two most recent measurements as it climbs.
-        const size_t configured = prefill_chunk_ > 0 ? static_cast<size_t>(prefill_chunk_) : 512;
-        const size_t floor_c    = std::min<size_t>(configured, 128);
 
         long long act128 = 0;
         long long extra128 = 0;
@@ -2317,7 +2677,11 @@ private:
         }
 
         // Everything that is not activations, and does not move with the chunk.
+        // M7 §2: drafters and the expert slot pool are their own terms now,
+        // not folded into resident_base or into the activation delta.
         const long long fixed = static_cast<long long>(resident_base) +
+                                static_cast<long long>(drafter_bytes) +
+                                static_cast<long long>(slot_pool) +
                                 static_cast<long long>(margin) +
                                 static_cast<long long>(lanes) *
                                     (static_cast<long long>(slab) +
@@ -2393,24 +2757,61 @@ private:
                       i, static_cast<double>(added) / (1u << 30), chunk,
                       static_cast<double>(activation) / (1u << 30));
         }
+        // A residency delta measuring negative here is retracted as "LRU
+        // eviction noise" (that explanation was narrated, not measured, and
+        // is now disproven -- F1: the actual cause was the probe's own
+        // baseline double-subtracting the GDN slab and, when Phase B had
+        // already committed one, the KV probe pool). With that arithmetic
+        // fixed this should not fire in the ordinary case; it stays as a
+        // guard because a negative value here would both under-report the
+        // reservation and, cast to the Reservation's uint64_t field below,
+        // wrap around into a number in the exabytes -- and if it ever does
+        // fire again, the honest statement is that the baseline accounting
+        // is wrong somewhere, not that anything evicted anything.
+        if (activation_total < 0) {
+            log::warn("load",
+                      "activation delta measured negative (%.3f GiB) -- a baseline accounting "
+                      "error would be the cause; clamped to 0 and logged",
+                      static_cast<double>(activation_total) / (1u << 30));
+            activation_total = 0;
+        }
 
-        const long long budget = static_cast<long long>(total) -
-                                 static_cast<long long>(resident_base) -
-                                 static_cast<long long>(slab) * lanes - activation_total -
-                                 static_cast<long long>(margin);
         // Per lane: the pool is shared, but every lane must be able to reach
         // n_ctx at the same time, which is what "two lanes of 30k" means.
-        long long max_ctx = budget > 0 ? budget / static_cast<long long>(kv_bytes_token_) / lanes
-                                       : 0;
-        max_ctx = (max_ctx / static_cast<long long>(kv_block_tokens_)) *
-                  static_cast<long long>(kv_block_tokens_);
+        // M7 §2/§4 (exec/fit.h, unit-tested there against no card at all):
+        // budget = total - weights - drafters - slot_pool - activations -
+        // lanes*slab - margin, floored to a KV page.
+        const long long budget = static_cast<long long>(total) -
+                                 static_cast<long long>(resident_base) -
+                                 static_cast<long long>(drafter_bytes) -
+                                 static_cast<long long>(slot_pool) -
+                                 static_cast<long long>(slab) * lanes - activation_total -
+                                 static_cast<long long>(margin);
+        FitTerms fterms;
+        fterms.total          = total;
+        fterms.weights        = resident_base;
+        fterms.drafters       = drafter_bytes;
+        fterms.slot_pool      = slot_pool;
+        fterms.activations    = static_cast<uint64_t>(std::max<long long>(activation_total, 0));
+        fterms.slab_per_lane  = slab;
+        fterms.kv_bytes_token = kv_bytes_token_;
+        fterms.margin         = margin;
+        fterms.lanes           = lanes;
+        fterms.kv_block_tokens = static_cast<int>(kv_block_tokens_);
+        fterms.n_ctx_floor     = static_cast<int>(
+            std::max<size_t>(kv_block_tokens_ * static_cast<size_t>(lanes), 4096));
+        FitResult fit    = fit_context(fterms);
+        long long max_ctx = fit.max_ctx;
         log::info("load",
-                  "reservation: weights+graph %.2f GiB + activations %.2f (all %d lane%s, chunk "
-                  "%zu) + margin 0.25 + %d x (GDN rows %.1f MiB + KV %.1f KiB/token) of %.2f "
-                  "GiB -> max ctx %lld per lane",
+                  "reservation: weights+graph %.2f GiB + drafters %.2f + expert slots %.2f (%s) "
+                  "+ activations %.2f (all %d lane%s, chunk %zu) + margin %.2f + %d x (GDN rows "
+                  "%.1f MiB + KV %.1f KiB/token) of %.2f GiB -> max ctx %lld per lane",
                   static_cast<double>(resident_base) / (1u << 30),
+                  static_cast<double>(drafter_bytes) / (1u << 30),
+                  static_cast<double>(slot_pool) / (1u << 30),
+                  slot_source.empty() ? "off" : slot_source.c_str(),
                   static_cast<double>(activation_total) / (1u << 30), lanes,
-                  lanes == 1 ? "" : "s", chunk, lanes,
+                  lanes == 1 ? "" : "s", chunk, static_cast<double>(margin) / (1u << 30), lanes,
                   static_cast<double>(slab) / (1u << 20),
                   static_cast<double>(kv_bytes_token_) / 1024.0,
                   static_cast<double>(total) / (1u << 30), max_ctx);
@@ -2433,55 +2834,218 @@ private:
         }
         log::info("load", "prefix-cache snapshot grid %zu tok", cache_grid_ > 0 ? cache_grid_ : static_cast<size_t>(prefill_chunk_));
 
+        // M7 §1 "Explicit --n-ctx": explicit always wins in that it is never
+        // silently lowered, but the fit still runs verify-only -- an explicit
+        // n_ctx above what the reservation admits refuses at load, here and
+        // again below if the allocation-time audit disagrees with the fit.
+        //
+        // Defect fix: `req_n_ctx` is what main.cpp resolved BEFORE calling
+        // this constructor (0 -> artifact.n_ctx_train), so it is always
+        // positive here whether or not the operator typed --n-ctx -- using
+        // `req_n_ctx > 0` as the "explicit" signal made every omitted
+        // --n-ctx look operator-requested, which turned the honest (smaller)
+        // M7 max ctx into a load refusal instead of the adopted default.
+        // `cfg.n_ctx_explicit` is set only when --n-ctx was actually parsed
+        // (config.cpp), so it is the real signal.
+        const bool explicit_n_ctx = cfg.n_ctx_explicit;
+        auto itemized_terms = [&](int n_ctx_for_message) {
+            return log::format(
+                "weights %.2f + drafters %.2f + expert slots %.2f (%s) + activations %.2f + "
+                "margin %.2f + %d x state %.3f of %.2f GiB (n_ctx %d)",
+                static_cast<double>(resident_base) / (1u << 30),
+                static_cast<double>(drafter_bytes) / (1u << 30),
+                static_cast<double>(slot_pool) / (1u << 30),
+                slot_source.empty() ? "off" : slot_source.c_str(),
+                static_cast<double>(activation_total) / (1u << 30),
+                static_cast<double>(margin) / (1u << 30), lanes,
+                static_cast<double>(slab) / (1u << 30), static_cast<double>(total) / (1u << 30),
+                n_ctx_for_message);
+        };
+        // F2 (review finding): adopt mode (no explicit --n-ctx) must not
+        // silently clamp to an inadmissible max_ctx. fit.admissible was
+        // computed and never read -- with status_.n_ctx left at 0 the
+        // handlers.cpp admission guard (`n_ctx > 0 && ...`) is disabled, and
+        // requests would die at runtime instead of the load refusing
+        // cleanly. Checked unconditionally here (not nested under "wanted >
+        // max_ctx"), because the failure is "there is nothing to adopt",
+        // independent of what the artifact's own default happened to be.
+        if (!explicit_n_ctx && !fit.admissible) {
+            throw std::runtime_error(log::format(
+                "auto-fit found no usable context on %d lane%s (%s); --n-ctx was not given, "
+                "so there is no request to lower further -- this is the largest number the "
+                "fit could compute and it is still not enough. Lower --parallel, lower "
+                "--prefill-chunk, or free memory on the card.",
+                lanes, lanes == 1 ? "" : "s",
+                itemized_terms(static_cast<int>(max_ctx)).c_str()));
+        }
         if (static_cast<long long>(wanted) > max_ctx) {
-            if (req_n_ctx > 0) {
+            if (explicit_n_ctx) {
                 throw std::runtime_error(log::format(
                     "requested n_ctx %d on %d lane%s needs %.2f GiB of KV but the reservation "
-                    "admits %lld per lane (weights %.2f + activations %.2f + margin 0.25 + %d x "
-                    "state %.3f of %.2f GiB). Lower --n-ctx, lower --parallel, or lower "
+                    "admits %lld per lane (%s). Lower --n-ctx, lower --parallel, or lower "
                     "--prefill-chunk.",
                     wanted, lanes, lanes == 1 ? "" : "s",
                     static_cast<double>(wanted) * kv_bytes_token_ * lanes / (1u << 30), max_ctx,
-                    static_cast<double>(resident_base) / (1u << 30),
-                    static_cast<double>(activation_total) / (1u << 30), lanes,
-                    static_cast<double>(slab) / (1u << 30),
-                    static_cast<double>(total) / (1u << 30)));
+                    itemized_terms(wanted).c_str()));
             }
             log::info("load", "n_ctx clamped to the admissible %lld (train maximum %d)", max_ctx,
                       wanted);
         }
         paged_n_ctx_ = static_cast<int>(std::min<long long>(wanted, max_ctx));
 
-        // lanes x n_ctx of live pages, plus headroom for cached prefixes — but
-        // only as much headroom as the prefix cache could ever hold references
-        // to. Its host-side budget bounds how many entries exist, each entry
-        // maps at most one lane's worth of pages, and pages nothing can point at
-        // are just VRAM taken off the card for nothing.
-        const size_t per_lane_blocks =
-            (static_cast<size_t>(paged_n_ctx_) + drafts_max_ + kv_block_tokens_ - 1) /
-                kv_block_tokens_ + 2;
-        const size_t live_blocks = per_lane_blocks * static_cast<size_t>(lanes);
-        size_t       blocks      = live_blocks;
-        if (budget > 0 && prefix_cache_ != nullptr) {
-            const size_t affordable = static_cast<size_t>(budget) / kv_block_bytes;
-            const size_t entries =
-                std::max<size_t>(1, prefix_cache_->budget_bytes() /
-                                        std::max<size_t>(la_row_bytes_, 1));
-            const size_t wanted_spare = entries * per_lane_blocks;
-            const size_t spare_room   = affordable > live_blocks ? affordable - live_blocks : 0;
-            blocks += std::min(spare_room, wanted_spare);
-        }
-        // A cap for tests: the only way to make the cache evict on demand at a
-        // small context. Never below what the lanes themselves need.
-        if (cfg.kv_pool_pages > 0) {
-            const size_t cap = std::max<size_t>(static_cast<size_t>(cfg.kv_pool_pages), live_blocks);
-            if (cap < blocks) {
-                log::info("load", "--kv-pool-pages: pool capped at %zu pages (would have been %zu)",
-                          cap, blocks);
-                blocks = cap;
+        // ---- Phase E: allocate, audit, replay (M7 §1) -------------------------
+        //
+        // A driver allocation promises address space, not pages (§1 "Deferred
+        // commit") -- the slot pool proved that once already, so the audit
+        // below is what stops a second term from making the same promise
+        // unverified. Explicit --n-ctx is verify-only here too: a replay pass
+        // on an explicit request refuses instead of shrinking, because
+        // --n-ctx is never lowered silently.
+        size_t   per_lane_blocks   = 0;
+        size_t   live_blocks       = 0;
+        size_t   blocks            = 0;
+        bool     accepted          = false;
+        // F3 (review finding): `budget` is constant across passes, but
+        // `live_blocks` shrinks every time paged_n_ctx_ is corrected below --
+        // so, unchanged, `affordable - live_blocks` (the spare-cache room)
+        // GROWS by exactly what live_blocks lost, and `blocks` (live + spare)
+        // reassembles to the same total every pass. Four passes then burn
+        // into the terminal refusal re-allocating the identical oversized
+        // pool that overshot in the first place, when a smaller pool would
+        // have fit. Fixed by deducting what replay has already learned this
+        // reservation overshot by from the spare-room ceiling, so spare room
+        // shrinks in step with the live pool instead of silently reclaiming
+        // the space live_blocks gave up.
+        uint64_t overshoot_accum   = 0;
+        for (int pass = 0; pass < 4 && !accepted; ++pass) {
+            // lanes x n_ctx of live pages, plus headroom for cached prefixes
+            // -- but only as much headroom as the prefix cache could ever
+            // hold references to. Its host-side budget bounds how many
+            // entries exist, each entry maps at most one lane's worth of
+            // pages, and pages nothing can point at are just VRAM taken off
+            // the card for nothing.
+            per_lane_blocks =
+                (static_cast<size_t>(paged_n_ctx_) + drafts_max_ + kv_block_tokens_ - 1) /
+                    kv_block_tokens_ + 2;
+            live_blocks = per_lane_blocks * static_cast<size_t>(lanes);
+            blocks      = live_blocks;
+            const long long budget_remaining =
+                static_cast<long long>(budget) - static_cast<long long>(overshoot_accum);
+            if (budget_remaining > 0 && prefix_cache_ != nullptr) {
+                const size_t affordable = static_cast<size_t>(budget_remaining) / kv_block_bytes;
+                const size_t entries =
+                    std::max<size_t>(1, prefix_cache_->budget_bytes() /
+                                            std::max<size_t>(la_row_bytes_, 1));
+                const size_t wanted_spare = entries * per_lane_blocks;
+                const size_t spare_room = affordable > live_blocks ? affordable - live_blocks : 0;
+                blocks += std::min(spare_room, wanted_spare);
             }
+            // A cap for tests: the only way to make the cache evict on demand
+            // at a small context. Never below what the lanes themselves need.
+            if (cfg.kv_pool_pages > 0) {
+                const size_t cap =
+                    std::max<size_t>(static_cast<size_t>(cfg.kv_pool_pages), live_blocks);
+                if (cap < blocks) {
+                    log::info("load",
+                              "--kv-pool-pages: pool capped at %zu pages (would have been %zu)",
+                              cap, blocks);
+                    blocks = cap;
+                }
+            }
+
+            bool     failed = false;
+            uint64_t over   = 0;
+            try {
+                alloc_kv_pools(rctx, blocks);
+            } catch (const std::exception& e) {
+                // Design §5 "Fragmentation": the sums count bytes requested,
+                // not address space consumed, so a real allocation can fail
+                // at a budget that said it fits. Deliberately a different
+                // sentence from the overshoot below -- the two causes have to
+                // stay distinguishable on the record.
+                log::warn("load",
+                          "allocation failed at a budget that said it fits -- fragmentation, "
+                          "not arithmetic (pass %d/4, n_ctx %d): %s",
+                          pass + 1, paged_n_ctx_, e.what());
+                failed = true;
+            }
+            if (!failed) {
+                const size_t   observed = device_resident_bytes(device);
+                const size_t   ceiling  = total > margin ? total - margin : 0;
+                const uint64_t predicted_total =
+                    static_cast<uint64_t>(resident_base) + drafter_bytes + slot_pool +
+                    static_cast<uint64_t>(std::max<long long>(activation_total, 0)) + margin +
+                    static_cast<uint64_t>(lanes) *
+                        (static_cast<uint64_t>(slab) +
+                         static_cast<uint64_t>(paged_n_ctx_) *
+                             static_cast<uint64_t>(kv_bytes_token_));
+                if (observed > ceiling) {
+                    over = observed - ceiling;
+                    log::warn("load",
+                              "reservation overshoot: %.2f GiB resident against a %.2f GiB "
+                              "ceiling after allocating n_ctx %d (pass %d/4) -- correcting",
+                              static_cast<double>(observed) / (1u << 30),
+                              static_cast<double>(ceiling) / (1u << 30), paged_n_ctx_, pass + 1);
+                    failed = true;
+                } else if (static_cast<uint64_t>(observed) < predicted_total) {
+                    // Design §1 Phase E: residency BELOW prediction is a
+                    // deferred commit, not free memory -- the general form of
+                    // the slot-pool bug this milestone exists to fix, so it
+                    // must never read as headroom. Accept, but say so.
+                    log::info("load",
+                              "the driver reports %.2f GiB of the %.2f GiB requested -- "
+                              "deferred commit; the reservation keeps the analytic figure",
+                              static_cast<double>(observed) / (1u << 30),
+                              static_cast<double>(predicted_total) / (1u << 30));
+                    accepted = true;
+                } else {
+                    accepted = true;
+                }
+            }
+            if (accepted) break;
+
+            if (explicit_n_ctx) {
+                throw std::runtime_error(log::format(
+                    "--n-ctx %d could not be honoured at allocation time on %d lane%s (%s); "
+                    "--n-ctx is verify-only and is never lowered automatically. Lower --n-ctx, "
+                    "lower --parallel, or lower --prefill-chunk.",
+                    paged_n_ctx_, lanes, lanes == 1 ? "" : "s",
+                    itemized_terms(paged_n_ctx_).c_str()));
+            }
+
+            if (over == 0) {
+                // A raw allocation failure with no useful residency delta
+                // (the fragmentation case): there is no measured `over` to
+                // correct with, so retreat by a fixed fraction to guarantee
+                // forward progress instead of retrying the same request.
+                over = static_cast<uint64_t>(kv_bytes_token_) * static_cast<uint64_t>(lanes) *
+                       static_cast<uint64_t>(
+                           std::max<long long>(paged_n_ctx_ / 8, kv_block_tokens_));
+            }
+            // F3: feeds the spare-room ceiling above on the next pass, so it
+            // shrinks with the live pool instead of silently reabsorbing the
+            // space live_blocks just gave up.
+            overshoot_accum += over;
+            const long long shrunk = shrink_n_ctx(paged_n_ctx_, over, kv_bytes_token_, lanes,
+                                                  static_cast<int>(kv_block_tokens_));
+            if (shrunk < fterms.n_ctx_floor) {
+                throw std::runtime_error(log::format(
+                    "the reservation cannot be honoured even at the floor (%d tokens) on %d "
+                    "lane%s (%s). Lower --parallel, lower --prefill-chunk, or free memory on "
+                    "the card.",
+                    fterms.n_ctx_floor, lanes, lanes == 1 ? "" : "s",
+                    itemized_terms(paged_n_ctx_).c_str()));
+            }
+            paged_n_ctx_ = static_cast<int>(shrunk);
         }
-        alloc_kv_pools(rctx, blocks);
+        if (!accepted) {
+            throw std::runtime_error(log::format(
+                "reservation replay exhausted 4 passes without a stable allocation on %d "
+                "lane%s at n_ctx %d; the card is contended or the arithmetic above is wrong -- "
+                "see the log lines above for which.",
+                lanes, lanes == 1 ? "" : "s", paged_n_ctx_));
+        }
+
         pool_ = std::make_unique<BlockPool>(blocks);
         if (prefix_cache_ != nullptr) {
             BlockPool* pool = pool_.get();
@@ -2498,6 +3062,10 @@ private:
         status_.reservation.measured           = true;
         status_.reservation.device_total_bytes = total;
         status_.reservation.weights_bytes      = resident_base;
+        status_.reservation.drafter_bytes          = drafter_bytes;
+        status_.reservation.expert_slot_bytes      = slot_pool;
+        status_.reservation.expert_slot_host_bytes = slot_host_bytes;
+        status_.reservation.slot_source            = slot_source;
         // Reported as the total for all lanes, because that is what it is: the
         // plugin's intermediate pool is per compiled model. Dividing it by the
         // lane count would invent a per-lane cost that nobody pays.
@@ -3909,6 +4477,7 @@ private:
     ov::Tensor                     last_hidden_;    // the base model's, this step
     ov::Tensor                     hidden_copy_;    // owned; last_hidden_ points here
     int                            offload_ratio_ = 0;
+    int                            pin_dispatch_ = -1;  // --pin-dispatch; -1 = off
     // --- lanes (§4.1). One per --parallel slot; the stateful reference path
     // uses lane 0 for its embeddings and MTP requests and serialises on
     // mutex_, because it has one graph state and cannot do better.

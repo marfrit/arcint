@@ -274,6 +274,14 @@ json reservation_json(const Reservation& r) {
                 {"prefill_chunk", r.prefill_chunk},
                 {"device_total_gib", gib(r.device_total_bytes)},
                 {"weights_gib", gib(r.weights_bytes)},
+                {"drafters_gib", gib(r.drafter_bytes)},
+                {"expert_slot_pool_gib", gib(r.expert_slot_bytes)},
+                {"expert_slot_source", r.slot_source},
+                // M7 defect fix: the config/IR-derived figure prices the
+                // HOST (GTT) pool, not device VRAM -- see backend_ov.cpp
+                // Phase B. Informational: NOT part of total_gib below, and
+                // never subtracted from device_total_gib.
+                {"expert_slot_host_gib", gib(r.expert_slot_host_bytes)},
                 {"activation_all_lanes_gib", gib(r.activation_bytes)},
                 {"gdn_slab_per_lane_gib", gib(r.la_slab_bytes)},
                 {"kv_per_lane_gib", gib(kv_per_lane)},
@@ -281,7 +289,8 @@ json reservation_json(const Reservation& r) {
                 {"kv_block_tokens", r.kv_block_tokens},
                 {"pool_blocks", r.pool_blocks},
                 {"margin_gib", gib(r.margin_bytes)},
-                {"total_gib", gib(r.weights_bytes + r.margin_bytes + r.activation_bytes +
+                {"total_gib", gib(r.weights_bytes + r.drafter_bytes + r.expert_slot_bytes +
+                                  r.margin_bytes + r.activation_bytes +
                                   static_cast<uint64_t>(r.lanes) *
                                       (r.la_slab_bytes + kv_per_lane))}};
 }
@@ -303,16 +312,25 @@ std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out)
                     ctx.slots->total() == 1 ? "" : "s");
     if (r.measured) {
         const double gib = 1.0 / static_cast<double>(1ull << 30);
+        // M7: drafters and the expert slot pool are their own terms now
+        // rather than folded into activations (the pre-M7 under-count,
+        // DESIGN §7.0.2s) -- itemized here too, so a 503 quotes the same
+        // arithmetic the load-time reservation and /props print.
         why += log::format(
-            "; %d lane%s of n_ctx %d %s what was reserved: weights+graph %.2f + activations "
-            "%.2f + margin %.2f + %d x (GDN rows %.3f + KV %.2f) = %.2f GiB of %.2f",
+            "; %d lane%s of n_ctx %d %s what was reserved: weights+graph %.2f + drafters %.2f + "
+            "expert slots %.2f (%s) + activations %.2f + margin %.2f + %d x (GDN rows %.3f + KV "
+            "%.2f) = %.2f GiB of %.2f",
             r.lanes, r.lanes == 1 ? "" : "s", r.n_ctx, r.lanes == 1 ? "is" : "are",
             static_cast<double>(r.weights_bytes) * gib,
+            static_cast<double>(r.drafter_bytes) * gib,
+            static_cast<double>(r.expert_slot_bytes) * gib,
+            r.slot_source.empty() ? "off" : r.slot_source.c_str(),
             static_cast<double>(r.activation_bytes) * gib,
             static_cast<double>(r.margin_bytes) * gib, r.lanes,
             static_cast<double>(r.la_slab_bytes) * gib,
             static_cast<double>(r.kv_bytes_per_token) * static_cast<double>(r.n_ctx) * gib,
-            static_cast<double>(r.weights_bytes + r.margin_bytes + r.activation_bytes +
+            static_cast<double>(r.weights_bytes + r.drafter_bytes + r.expert_slot_bytes +
+                                r.margin_bytes + r.activation_bytes +
                                 static_cast<uint64_t>(r.lanes) *
                                     (r.la_slab_bytes +
                                      r.kv_bytes_per_token * static_cast<uint64_t>(r.n_ctx))) *
