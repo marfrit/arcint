@@ -2658,6 +2658,14 @@ drops to 0.36 GiB. The fusion-impact obligation is discharged: the base
 model still fuses ×40 under the patched plugin (graph dump). The property is
 opt-in, default 0 — behavior without it is byte-for-byte the pre-patch path.
 
+*(Flagged 2026-09-02, same day: a later four-cell grid found the then-live
+plugin serving deterministic garbage under u8 KV, putting this table under
+suspicion. Resolved the same day by a four-way plugin bisect: the build
+carrying only 0004–0007 — the patches measured here — serves coherently;
+the corruption enters with the later asymmetric-KV patches (0008/0009,
+§7.0.2w). The numbers above were measured on a healthy path and stand. The
+owed equivalence gates fired early and did their job either way.)*
+
 The counters told the rest once their print path was fixed (it was gated on
 the plugin's verbosity level, not on the collection flag — found in review,
 routed through an always-on channel). One ratio-25 capped run: `gpu_hits
@@ -2687,6 +2695,51 @@ constraint a source-level walk can express — is still rejected by the
 matcher. The walk has a blind spot the matcher does not; the named next
 instrument is matcher logging on a debug build, and until it speaks, the
 head serves unfused.
+
+#### 7.0.2w Asymmetric KV: the ladder that refuses, and a plugin bug that ended the dig (2026-09-02)
+
+M8's premise was u8 keys / i4 values to cut KV per token at near-u8 quality.
+Two facts, both measured, reshaped it into a smaller thing than the row asked
+for.
+
+**The decode kernels cannot do it.** On this plugin generation every
+paged-attention JIT constant that selects packing derives from one
+`is_i4_u4(kv_cache_precision)` boolean shared by both operands, in the source
+and the generated OpenCL alike; expressing K-unpacked / V-packed needs a
+kernel-source rewrite, named in `patches/0009`'s header. So the reachable
+deliverable is not asymmetric *serving* but asymmetric *refusal* — and that
+landed and is proven on-card: `--paged-kv u8:i4` fails at
+`ExecutionConfig::finalize()` with a message naming both precisions and the
+reason, before any compile, rather than silently serving symmetric u8. The
+arcint side is the durable win of this increment: `--paged-kv KEY[:VALUE]`
+over `{f16,u8,i8,u4,i4}`, a per-side bitwidth audit that treats the plugin's
+u8-stored-as-i8 and 4-bit-in-8-bit-typed-port conventions as measured aliases
+while refusing a real width change, and a KV cost model that reads the packed
+width (a retracted over-broad first cut is on the record in `fit.h`, per
+§7.0.1). Symmetric `u4` serves and prices as expected — 6.3 KiB/token against
+u8's 11.3 on the 35B, coherent output.
+
+**The plugin patches are parked, not shipped.** Building the OpenVINO GPU
+plugin with `patches/0008` (the `VALUE_CACHE_PRECISION` plumbing) present made
+plain `--paged-kv u8` serve deterministic garbage. A four-way plugin bisect
+cleared the M9 series (`0004`–`0007` serve coherently; their §7.0.2v numbers
+stand) and localised the corruption to `0008`'s mere presence — not its
+resolved values (a version whose value resolved byte-identical to the key
+corrupted too), not the model cache (inactive on every failing run), not the
+`0009` kernel guard. Then the tell: a build of `0008` carrying an unused
+env-gated debug method — a change to a widely-included header — served
+*coherently*. A result that moves when instrumentation is added and nothing
+else is a layout-sensitive miscompile: latent undefined behaviour in the tree
+that `0008` perturbs, or an incremental-build staleness artifact across the
+scratch clones (the one cold-from-scratch build in the set was coherent).
+Distinguishing those is two more cold full-plugin builds and another card
+window; against a feature that can only refuse anyway, that dig was stopped
+here deliberately. `patches/0008`/`0009` are retained as the analysis and the
+fail-loud contract, marked measurement-blocked and **not applied to the
+production plugin**, which serves `+p1` (§`project-ovsrc-plugin-modified`) and
+never carried them — production was never exposed. The next step, if the
+kernel rewrite is ever wanted, starts with one cold-build A/B to settle
+miscompile-vs-artifact before touching source.
 
 #### 7.0.2r DFlash2: the external-drafter hook gets a real drafter (2026-09-01)
 
