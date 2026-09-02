@@ -1,0 +1,215 @@
+# Paged KV asymmetric kernel plan: PARTIAL - micro-SDPA decline for
+# same-bitwidth-class precision mismatches; the genuine sub-8-bit-vs-not
+# case is now refused earlier, at config level (patches/0008)
+#
+# docs/design-m8-asymmetric-kv.md item 2, §6 fallback ladder. Kernel-side
+# verdict for u8-K / i4-V (or any key_dt != value_dt request now that
+# patches/0008 lets the two differ at the config level): BLOCKED for the
+# decode fast path (paged_attention_opt.cpp / paged_attention_opt.cl) per
+# the design's own ladder item (d) - "the OCL kernel hard-codes one KV
+# quant type across both operands ... a kernel-source rewrite is over the
+# smallest-sufficient-divergence bar for a memory lever." Applied against
+# the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0001-0008.
+#
+# The blocking analysis, so it doesn't have to be re-derived:
+#
+# paged_attention_opt.cpp's decode-stage JIT-constant generators
+# (make_uint4_kv_cache_jit_constants at ~line 245, and the two
+# PagedAttentionGeneratorBase::get_jit_constants bodies at ~lines 300 and
+# ~970 for the single-token and generate stages) each read exactly one
+# `kv_cache_dt = params.get_program().get_config().get_kv_cache_precision()`
+# and gate *every* packing constant for *both* operands off one boolean,
+# `data_type_traits::is_i4_u4(kv_cache_dt)`: IS_INT4_COMPRESSED,
+# PACKED_K_HEAD_SIZE, PACKED_V_HEAD_SIZE, PACKED_ADJUSTED_K_HEAD_SIZE,
+# PACKED_ADJUSTED_V_HEAD_SIZE, ADJUSTED_K_HEAD_SIZE and ADJUSTED_V_HEAD_SIZE
+# are all set from the *same* is_i4_u4(kv_cache_dt) branch - there is no
+# per-side variant of any of them today. Passing key_cache_dt/value_cache_dt
+# in separately (available since patches/0008) is not sufficient by itself:
+# K unpacked (u8, 1 elem/byte, the ADJUSTED_* branch) and V packed (i4, 2
+# elem/byte, the PACKED_* branch) would need to be true *simultaneously* in
+# one compiled kernel, and every JIT-constant call site here only knows how
+# to emit one branch or the other for the whole kernel instance.
+#
+# The generated OCL kernel (paged_attention_opt.cl) confirms this is not a
+# C++-only fix: IS_INT4_COMPRESSED and IS_KV_COMPRESSED are single
+# preprocessor macros consumed by *both* the key-cache read/unpack path
+# (lines ~150-432: phys_k_head_size and phys_v_head_size are declared side
+# by side under the same `#if IS_INT4_COMPRESSED` block at lines 150-157,
+# and the K unpack loop at 276-432 branches on
+# `IS_KV_COMPRESSED && IS_INT4_COMPRESSED`) and the value-cache read/unpack
+# path (lines ~688-862, same macro combination, e.g. 696, 719, 738, 828,
+# 848). Expressing K-unpacked/V-packed would mean splitting every one of
+# those sites into independent IS_K_INT4_COMPRESSED / IS_V_INT4_COMPRESSED
+# macros and reworking both unpack loops (and the WG-dispatch math at
+# ~line 12 and ~302-330 that derives SUBGROUPS_PER_WG and SG_SCALE_FACTOR
+# from PACKED_V_HEAD_SIZE, which would also need to stop assuming K and V
+# share one packing convention) - a kernel-source rewrite, which is exactly
+# what design ladder item (d) says to stop short of for a memory lever.
+# Confirmed by grep: every read of kv_cache_dt in this file (decode path)
+# is a single, whole-kernel value; none of the ~14 call sites already carry
+# a per-side split to build on.
+#
+# What this patch ships, because it's exactly the "first cut" the design's
+# ladder item (b) calls for and doesn't require any of the above:
+# paged_attention_opt.cpp's supports_micro_sdpa() (~line 1429, the actual
+# selector predicate gating the prefill micro-SDPA path - not sdpa_gen_
+# micro.cpp itself, which only builds the GEMM problem once this predicate
+# has already said yes) declines whenever
+# get_kv_cache_precision() != get_value_cache_precision(), in addition to
+# its existing INT4-BY_TOKEN decline. A request with a differing
+# VALUE_CACHE_PRECISION declines the micro-SDPA path and falls back toward
+# paged_attention_opt.cpp's OCL path for prefill.
+#
+# --- Where the corruption risk this decline used to be the only guard
+#     against actually got closed (patches/0008, config-level) ---
+#
+# An earlier version of this patch also added a port-level hard refusal
+# here, in paged_attention.cpp's calc_output_layouts, for exactly the
+# dangerous subset of mismatches: one side sub-8-bit, the other not (the
+# case that would make the opt-path kernel read a packed buffer at an
+# unpacked stride - real corruption, not a missing optimization). On-card,
+# that check fired correctly but its named message was swallowed by
+# ProgramBuilder's generic "build failed" wrapper before reaching the
+# operator. It has been REMOVED from this patch and replaced by an
+# equivalent, earlier check in execution_config.cpp's finalize_impl
+# (patches/0008): it runs at ExecutionConfig::finalize() time, before any
+# model transformation or ProgramBuilder work begins, so its named message
+# (which precisions were requested, key vs value) reaches the operator
+# directly. See patches/0008's header, "Round 2", for the full account.
+#
+# That means the micro-SDPA decline this patch ships is no longer the
+# correctness backstop for the genuinely dangerous case (bitwidth
+# mismatch) - patches/0008's finalize()-time guard now refuses that
+# combination before compilation gets anywhere near kernel selection. What
+# this decline still guards, on its own, is the narrower, lower-risk case
+# that guard deliberately leaves alone: two sides that are both >=8-bit but
+# not identically typed (e.g. u8 key / i8 value, or any future symmetric-
+# bitwidth pairing that differs some other way) - a signedness/format
+# difference the micro-SDPA GEMM problem setup (sdpa_gen_micro.cpp) has not
+# been shown to handle correctly across two operands either, per the same
+# "cannot be proven to express" reasoning as the original write-up. For
+# that narrower class, prefill still falls back to the OCL opt path rather
+# than risking an unproven micro-SDPA configuration.
+#
+# Net position: `--paged-kv u8:i4` (or any sub-8-bit-vs-not pairing) now
+# fails loud at ExecutionConfig::finalize() time, with a message naming
+# both configured precisions, before this file's code ever runs. It does
+# NOT yet serve u8:i4 correctly - unchanged from the original BLOCKED
+# verdict above - serving it requires the kernel-source rewrite named
+# above (fallback ladder item (d)), out of scope for this task.
+#
+# Note for a later attempt at the decode fast path: a narrower opening than
+# the full per-side JIT rewrite might be the BY_CHANNEL key layout, which
+# already keeps K's packed head_size and block_size independent of V's (see
+# the is_key_by_channel branches already present in both jit-constant
+# generators) - worth a second look before reaching for the general case,
+# but out of scope here since design item 2's target case (K BY_TOKEN u8 /
+# V i4) does not go through that branch.
+#
+# --- Round 4 (next on-card window): the decline guard's own comparison was
+#     wrong - it declined healthy configs, not just dangerous ones ---
+#
+# A kill-switch matrix isolated the garbage-decode symptom reported against
+# patches/0008's v3/v4 fix from the upload/finish patches (0006/0007): even
+# the sync+finish control cell (pre-0006/0007 behaviour) served the
+# identical garbage, exonerating those patches. The actual mechanism, fitting
+# every observation in the matrix: since patches/0008's v3/v4, the plain,
+# default `--paged-kv u8` request legitimately resolves to key=i8/value=u8
+# (the harmless 8-bit signedness alias this codebase already treats as
+# compatible everywhere else - see patches/0008's own "u8-compiled-as-i8"
+# precedent). This file's decline guard, as first written, compared
+# `kv_cache_dt != value_cache_dt` - RAW TYPE inequality, i8 vs u8 counting as
+# "different" - so the plain u8 default declined micro-SDPA too, silently
+# routing a perfectly healthy, common configuration onto the non-micro OCL
+# paged_attention_opt fallback path. That fallback path itself serves
+# deterministically corrupt decode output at 8-bit on this build (confirmed
+# by the kill-switch matrix) and crawls at 0.4-2.3 t/s against the healthy
+# micro-SDPA path's throughput - matching two more matrix cells: Window K
+# under an earlier round (both sides i8, no mismatch under the old guard)
+# served coherently with 80% draft acceptance; u4 symmetric (u4==u4, no
+# decline under either version of the guard) stayed coherent throughout. The
+# garbage appeared exactly when patches/0008's value mirror stopped matching
+# the key's post-swap raw type - i.e. exactly when this guard's raw-equality
+# comparison started mattering for the default case.
+#
+# Fix: compare PACKING CLASS, not raw type - `is_i4_u4(key) != is_i4_u4
+# (value)`, the same semantics as execution_config.cpp's config-level guard
+# (patches/0008). An i8-vs-u8 or u8-vs-u8 pair no longer declines; only a
+# genuine sub-8-bit-vs-not mismatch does - and that case is now caught even
+# earlier, at ExecutionConfig::finalize() time (patches/0008), before
+# compilation reaches this code at all, so this guard's remaining scope is
+# narrower than either earlier version assumed: same-bitwidth-class pairs
+# that differ some other way (there is currently no such case reachable,
+# since the only two config-level outcomes for a resolved pair are "both
+# non-4-bit" or "both 4-bit" - by construction, once the config-level guard
+# has passed, is_i4_u4(key) always equals is_i4_u4(value) already). This
+# guard is therefore currently a no-op safety net rather than an active
+# gate, kept for defense in depth and because it is the correct statement of
+# intent if a future config path ever produces same-bitwidth-class pairs
+# that are not already identical booleans by construction.
+#
+# What this round does NOT fix, and is explicitly out of scope here: the OCL
+# paged_attention_opt fallback path's own correctness at plain 8-bit
+# precision. It is a separate, pre-existing defect on this build, uncovered
+# only because the decline guard's bug was routing configs onto it that
+# should never have been declined in the first place. Once genuinely
+# unhealthy (sub-8-bit-vs-not) requests are refused at the config level
+# before reaching this code (patches/0008) and healthy requests are no
+# longer wrongly declined (this patch), nothing in this series still routes
+# a well-formed request onto that fallback's 8-bit path - but if a future
+# change ever does, its correctness there has not been verified and should
+# not be assumed.
+#
+# Gates owed, not measured by this task (docs/design-m8-asymmetric-kv.md §4,
+# §5, same list as patches/0008): Prüfstand at u8:i4, decode A/B within 5% at
+# 32k (moot until the blocked kernel-source rewrite above lands - u8:i4
+# refuses to compile rather than running, so there is no decode number to
+# take yet), the KLD probe, the fusion-impact profile, and a re-run of the
+# kill-switch matrix against this exact build to confirm the plain-u8 case
+# now takes the micro-SDPA path and serves coherent output. No GPU device
+# was touched by this task; the micro-SDPA decline's control flow is read-
+# verified and incrementally rebuilt, not exercised against a compiled model.
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
+@@ -1435,7 +1435,38 @@
+ 
+         // Disable micro SDPA for INT4 BY_TOKEN due to accuracy issues
+         const auto kv_cache_dt = params.get_program().get_config().get_kv_cache_precision();
+-        return !data_type_traits::is_i4_u4(kv_cache_dt) || desc->is_key_by_channel;
++        if (data_type_traits::is_i4_u4(kv_cache_dt) && !desc->is_key_by_channel) {
++            return false;
++        }
++
++        // docs/design-m8-asymmetric-kv.md §2, §6(b): the micro-SDPA GEMM problem setup
++        // (sdpa_gen_micro.cpp) cannot be proven to express key/value precisions that differ
++        // across the packed/unpacked (i4-vs-i8) boundary without a rewrite of its own - see
++        // patches/0009's header for the analysis. Decline here only when the two sides
++        // disagree on PACKING CLASS (one sub-8-bit, the other not) - the same semantics as
++        // execution_config.cpp's config-level guard (patches/0008) - not on raw type equality.
++        //
++        // Incident, measured on-card: an earlier version of this guard compared kv_cache_dt
++        // != value_cache_dt directly. Since patches/0008's v3/v4 fix, the plain, default u8
++        // request legitimately resolves to key=i8/value=u8 (the pre-existing, harmless 8-bit
++        // signedness alias every other path in this codebase already treats as compatible) -
++        // and the raw-equality guard declined micro-SDPA for that healthy, common case too,
++        // silently routing it onto the non-micro OCL paged_attention_opt fallback path. That
++        // fallback path itself serves deterministically corrupt decode output at 8-bit on this
++        // build (confirmed via a kill-switch matrix that isolated it from the upload/finish
++        // patches, 0006/0007 - a control cell with those reverted served the identical
++        // garbage) and crawls at 0.4-2.3 t/s versus the healthy micro-SDPA path. This guard's
++        // own correctness fix is scoped to no longer routing healthy (same-packing-class)
++        // configs onto that fallback; the fallback path's own correctness at plain 8-bit
++        // precision is a separate, pre-existing, NOT-fixed-here defect - it still serves
++        // whatever precision genuinely needs it (the sub-8-bit-vs-not case execution_config.
++        // cpp's finalize_impl already refuses before compilation reaches this code at all).
++        const auto value_cache_dt = params.get_program().get_config().get_value_cache_precision();
++        if (data_type_traits::is_i4_u4(kv_cache_dt) != data_type_traits::is_i4_u4(value_cache_dt)) {
++            return false;
++        }
++
++        return true;
+     }
+ 
+     static size_t get_micro_tile_qsize(KernelData& kernel_data) {
