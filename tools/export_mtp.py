@@ -129,6 +129,7 @@ def rope(x, cos, sin, rotary_dim, heads):
 
 MOE_TOPK = 8
 MOE_NORM_TOPK = True   # renormalise the top-k routing weights; a switch the oracle decides
+MOE_LOWERING = "batched"   # --moe-lowering: batched (default, current behaviour) | unrolled
 
 def moe_block(y, w, p, topk, norm_topk):
     """The Qwen3.6 MTP layer's MLP: a router over E experts, the top-k of them
@@ -190,6 +191,349 @@ def moe_block(y, w, p, topk, norm_topk):
     shared = op.multiply(shared, op.sigmoid(linear(y, w[p + "mlp.shared_expert_gate.weight"],
                                                    "shared_expert_gate")))
     return op.add(mixed, shared)
+
+def moe_block_unrolled(y, w, p, topk, norm_topk):
+    """The same MoE MLP as moe_block(), lowered so OpenVINO's FuseMOE pass
+    (ov::pass::FuseMOE, fuse_moe_experts.cpp) recognises it and rewrites it
+    into the internal MOECompressed op the GPU plugin's moe_3gemm_swiglu
+    primitives consume. moe_block() is a re-expression of the identical
+    arithmetic as one batched [E,M,*] matmul pair, which is cheap to write but
+    invisible to that pass -- it reads every expert for every token instead of
+    gathering the selected ones (measured: 1.69 GB/forward). This form does a
+    data-dependent per-expert gather instead, at the cost of an E-way unrolled
+    graph (one subgraph per expert, so this is expensive to *build* for a
+    256-expert checkpoint, though not to *run*).
+
+    Router: Softmax -> TopK -> OneHot(indices, depth=E, axis=2) ->
+    Transpose([2,1,0]), giving an [E,k,M] mask FuseMOE's matcher expects.
+    Per expert: Gather(mask, i, axis=0) -> Squeeze -> NonZero -> Split(2) ->
+    Convert -> Gather selects that expert's tokens out of the flattened
+    hidden state; three plain GEMMs (mlp3: gate, up, down -- no batched-over-E
+    matmul) replace the SwiGLU; ScatterElementsUpdate(..., reduction="sum")
+    accumulates each expert's weighted output back into a zero tensor shaped
+    like the flattened hidden state, chained expert to expert.
+
+    gate_up_proj is stored as one fused [E, 2I, H] tensor (gate half first);
+    the pass wants gate_proj and up_proj as separate rank-2 Constants, so the
+    split happens here, at export time, on the numpy array -- not in the
+    graph.
+    """
+    gu = w[p + "mlp.experts.gate_up_proj"]          # [E, 2I, H]
+    dn = w[p + "mlp.experts.down_proj"]              # [E, H, I]
+    E, two_i, H = gu.shape
+    I = two_i // 2
+    gate_np, up_np = gu[:, :I, :], gu[:, I:, :]
+
+    i32 = lambda v: op.constant(np.array(v, dtype=np.int32))
+    i32v = lambda v: op.constant(np.array([v], dtype=np.int32))
+
+    # router: softmax -> top-k -> one-hot mask, transposed to [E, k, M]
+    logits = linear(y, w[p + "mlp.gate.weight"], "router")             # [B,S,E]
+    probs = op.softmax(logits, axis=-1)
+    tk = op.topk(probs, i32(topk), axis=-1, mode="max", sort="value",
+                index_element_type="i32")
+    vals, idx = tk.output(0), tk.output(1)                              # [B,S,k]
+    if norm_topk:
+        vals = op.divide(vals, op.reduce_sum(vals, i32v(-1), keep_dims=True))
+
+    idx_m = op.reshape(idx, op.constant(np.array([-1, topk], dtype=np.int32)),
+                       special_zero=False)                               # [M,k]
+    vals_m = op.reshape(vals, op.constant(np.array([-1, topk], dtype=np.int32)),
+                        special_zero=False)                              # [M,k]
+    onehot = op.one_hot(idx_m, i32(E), op.constant(1.0, dtype=np.float32),
+                        op.constant(0.0, dtype=np.float32), axis=2)      # [M,k,E]
+    transposed = op.transpose(onehot, op.constant(np.array([2, 1, 0], dtype=np.int32)))  # [E,k,M]
+    vals_km = op.transpose(vals_m, op.constant(np.array([1, 0], dtype=np.int32)))        # [k,M]
+
+    # the flattened hidden state every expert gathers its tokens from
+    m_h3 = op.reshape(y, op.constant(np.array([1, -1, H], dtype=np.int32)),
+                      special_zero=False)                                # [1,M,H]
+    m_h2 = op.squeeze(m_h3, i32v(0))                                     # [M,H]
+    acc = op.broadcast(op.constant(np.array(0.0, dtype=np.float32)),
+                       op.shape_of(m_h2, output_type="i32"))             # [M,H]
+
+    for e in range(E):
+        sel = op.gather(transposed, i32v(e), i32(0))                     # [1,k,M]
+        sel = op.squeeze(sel, i32v(0))                                   # [k,M]
+        nz = op.non_zero(sel, output_type="i64")                         # [2,count]
+        spl = op.split(nz, i32(0), 2)
+        tok_idx = op.squeeze(op.convert(spl.output(1), "i32"), i32v(0))  # [count]
+
+        tokens = op.gather(m_h3, tok_idx, i32(1))                        # [1,count,H]
+        tokens = op.squeeze(tokens, i32v(0))                             # [count,H]
+
+        gate_c = const(gate_np[e], f"expert{e}_gate_proj")
+        up_c = const(up_np[e], f"expert{e}_up_proj")
+        down_c = const(dn[e], f"expert{e}_down_proj")
+
+        g = op.swish(op.matmul(tokens, gate_c, transpose_a=False, transpose_b=True))
+        u = op.matmul(tokens, up_c, transpose_a=False, transpose_b=True)
+        out = op.matmul(op.multiply(g, u), down_c, transpose_a=False, transpose_b=True)  # [count,H]
+
+        # this expert's routing weight per selected token, gathered from the
+        # top-k values via the same one-hot mask used to pick the tokens
+        tok_w = op.reduce_sum(op.multiply(sel, vals_km), i32v(0), keep_dims=False)  # [M]
+        tok_w = op.unsqueeze(op.gather(tok_w, tok_idx, i32(0)), i32v(-1))            # [count,1]
+        weighted = op.multiply(out, tok_w)                                          # [count,H]
+
+        idx_bcast = op.broadcast(op.unsqueeze(tok_idx, i32v(-1)),
+                                 op.shape_of(weighted, output_type="i32"))
+        acc = op.scatter_elements_update(acc, idx_bcast, weighted, i32(0), reduction="sum")
+
+    mixed = op.reshape(acc, op.concat([shape_part(y, 0, 2),
+                                       op.constant(np.array([H], dtype=np.int32))], axis=0),
+                       special_zero=False)                               # [B,S,H]
+
+    # shared expert, gated by a scalar sigmoid per token -- identical to moe_block()
+    sg = linear(y, w[p + "mlp.shared_expert.gate_proj.weight"], "shared_gate_proj")
+    su = linear(y, w[p + "mlp.shared_expert.up_proj.weight"], "shared_up_proj")
+    shared = linear(op.multiply(op.multiply(sg, op.sigmoid(sg)), su),
+                    w[p + "mlp.shared_expert.down_proj.weight"], "shared_down_proj")
+    shared = op.multiply(shared, op.sigmoid(linear(y, w[p + "mlp.shared_expert_gate.weight"],
+                                                   "shared_expert_gate")))
+    return op.add(mixed, shared)
+
+
+def pick_group_size(in_dim, preferred=(64, 32, 16, 8, 4, 2)):
+    """The largest candidate group size that (a) is strictly smaller than
+    `in_dim` -- so the grouped-quantization Constant has more than one group
+    -- and (b) divides `in_dim` evenly. 64 is the group size measured in the
+    one IR on record that provably fuses (both its gate/up weights, grouped
+    over H=2048, and its down weight, grouped over I=512, use group_size=64
+    -- a fixed hyperparameter, not derived from the tensor's own shape), so
+    it is preferred; this exporter's reconstructed geometry does not always
+    divide by 64 (the tiny synthetic weights in test_moe_lowering.py do
+    not), hence the smaller fallbacks. Falls back to `in_dim` itself
+    (groups=1, degenerate) only if nothing smaller divides evenly -- e.g.
+    in_dim is prime and small -- which earlier was this exporter's only
+    option and is suspected of being part of why the first rank-4 fix still
+    crashed on GPU (see moe_block_tiled_flat_rank3 in test_moe_lowering.py:
+    a degenerate single-group Constant may not exercise the same code path
+    in ConvertTiledMoeBlockToGatherMatmuls' rewrite as a genuinely grouped
+    one)."""
+    for g in preferred:
+        if g < in_dim and in_dim % g == 0:
+            return g
+    return in_dim
+
+
+def quantize_u8_grouped(arr3d, group_size):
+    """Symmetric u8 quantization of a rank-3 [E, out, in] weight, grouped
+    over `in` into `in / group_size` groups -- one scale/zero_point per
+    (E, out, group), zero_point fixed at 128 as instructed by the on-card
+    measurement this mode imitates. This is the real grouping axis and
+    granularity measured in the ground-truth IR (see pick_group_size):
+    earlier this exporter used one scale per (E, out) row with no groups at
+    all (group_size == in, degenerate). Returns (q_u8, scale_f32), both
+    shaped [E, out, groups, group_size] and [E, out, groups, 1]."""
+    E, out, in_ = arr3d.shape
+    assert in_ % group_size == 0, f"in_dim {in_} not divisible by group_size {group_size}"
+    groups = in_ // group_size
+    grouped = arr3d.reshape(E, out, groups, group_size)
+    amax = np.abs(grouped).max(axis=-1, keepdims=True)             # [E,out,groups,1]
+    scale = np.where(amax == 0, 1.0, amax / 127.0).astype(np.float32)
+    q = np.clip(np.round(grouped / scale) + 128.0, 0, 255).astype(np.uint8)
+    return q, scale
+
+
+def compressed_weight(arr3d, name, group_size=None):
+    """A u8-quantized expert weight with the exact decompression chain and
+    op count measured in the ground-truth IR (the 35B-A3B export, layer 0's
+    mlp.experts.down_proj, byte offsets read directly out of its .bin):
+
+        Constant(u4|u8, [E,out,groups,group_size]) -> Convert(f16)
+        Constant(zero_point, u4|u8, [E,out,groups,1])  -> Convert(f16)
+        Subtract(weight, zero_point)                                -> f16
+        Constant(scale, f16, [E,out,groups,1])
+        Multiply(Subtract, scale)                    ("fq_weights_1") -> f16
+        Reshape(rank 4 -> rank 3, [E,out,in])                        -> f16
+        Convert(f32)                                                 -> f32
+        -> MatMul
+
+    Two earlier versions of this function were tried and both compiled fine
+    on CPU but crashed a real GPU compile inside
+    ConvertTiledMoeBlockToGatherMatmuls' own rewrite (a MatMul batch-dim
+    merge failure invisible to CPU/generic shape inference, since that pass
+    never runs there): the first skipped the groups dimension and the
+    Reshape entirely (flat rank 3, no Reshape at all -- see
+    moe_block_tiled_flat_rank3 in test_moe_lowering.py); the second added
+    the Reshape but used a degenerate single group (group_size == in,
+    groups=1) and did the whole dequant chain, plus the u8->f32 upcast, in a
+    single Convert with zero_point stored directly as f32 -- collapsing
+    three of the ground truth's Converts into one and skipping the grouped
+    quantization the fusing pass's rewrite evidently does math specific to.
+    This version imitates the measured op count and grouping literally:
+    pick_group_size() chooses a real (>1) number of groups whenever `in`
+    allows it, and every Convert the ground-truth chain has is reproduced,
+    including keeping the dequant arithmetic in f16 and upcasting to f32
+    only after the reshape."""
+    E, out, in_ = arr3d.shape
+    if group_size is None:
+        group_size = pick_group_size(in_)
+    q4, scale4 = quantize_u8_grouped(arr3d, group_size)         # [E,out,groups,g] u8, [E,out,groups,1] f32
+    zp4 = np.full(scale4.shape, 128, dtype=np.uint8)             # zero_point stored low-precision too, like the weight
+
+    q_c = op.constant(np.ascontiguousarray(q4))
+    q_c.friendly_name = name
+    q16 = op.convert(q_c, "f16")
+
+    zp_c = op.constant(zp4)
+    zp_c.friendly_name = name + "/zero_point"
+    zp16 = op.convert(zp_c, "f16")
+
+    sub16 = op.subtract(q16, zp16)                               # f16, [E,out,groups,g]
+
+    sc = op.constant(scale4.astype(np.float16))
+    sc.friendly_name = name + "/scale"
+
+    deq4 = op.multiply(sub16, sc)                                # f16, [E,out,groups,g] ("fq_weights_1")
+    deq4.friendly_name = name + "/fq_weights_1"
+
+    deq3_f16 = op.reshape(deq4, op.constant(np.array([E, out, in_], dtype=np.int32)),
+                          special_zero=False)                    # f16, rank 4 -> rank 3
+    deq3_f16.friendly_name = name + "/fq_weights_1/reshape"
+
+    deq = op.convert(deq3_f16, "f32")                            # the final upcast, right before MatMul
+    deq.friendly_name = name + "/fq_weights_1/convert"
+    return deq
+
+
+def moe_block_tiled(y, w, p, topk, norm_topk):
+    """The same MoE MLP again, lowered to the form actually measured fusing
+    on the card: OpenVINO's GPU-plugin pipeline does not go through
+    ov::pass::FuseMOE's per-expert-gather rewrite (moe_block_unrolled()'s
+    target) -- it fuses through ConvertTiledMoeBlockToGatherMatmuls, whose
+    input pattern this function reproduces, extracted from the one IR on
+    record that provably fuses (a 35B-A3B checkpoint's own export, layer 0's
+    mlp.experts subgraph, walked node by node from its shared upstream
+    flatten through the router's final ReduceSum):
+
+        Reshape(hidden [B,S,H] -> [M,H])                     (shared flatten)
+        -> Tile(repeats=[E,1]) -> Reshape -> [E,M,H]                  (entry)
+        three per-expert-stacked GEMMs, transpose_b=true, no bias:
+            gate = BMM([E,M,H], gate_w[E,I,H]^T) -> Swish
+            up   = BMM([E,M,H], up_w[E,I,H]^T)
+            down = BMM(gate*up, down_w[E,H,I]^T)                 -> [E,M,H]
+        router, over the SAME [M,H] flatten as the entry (rank 2 the whole
+        way, not rank 3 [B,S,*] -- see below):
+            Softmax -> TopK -> ReduceSum/Divide (renorm) ->
+            ScatterElementsUpdate(zeros[M,E], idx, vals, axis=-1) ->
+            Transpose -> Reshape -> Unsqueeze -> Multiply(with expert
+            outputs) -> ReduceSum
+
+    No OneHot, no per-expert NonZero loop -- unlike moe_block_unrolled(),
+    every expert is still computed for every token here (same batched-BMM
+    cost as moe_block()); what changes is only the shape of the graph the
+    GPU-plugin pass is looking for.
+
+    An earlier version of this function computed the router on the
+    UNFLATTENED [B,S,H]/[B,S,E] activation (moe_block()'s own convention),
+    only flattening to [M,E] after the ScatterElementsUpdate. Diffing this
+    function's full op sequence against the ground-truth IR's, node by node
+    with every attribute and partial shape, found that ground truth's router
+    runs on the exact same rank-2 [M,H] flatten the Tile entry consumes
+    (both read the one shared Reshape) and stays at rank 2 all the way
+    through Softmax/TopK/ScatterElementsUpdate/Transpose -- it only expands
+    back to [E,B,S] after the Transpose. Whether that rank mismatch upstream
+    of the expert GEMMs is what the fusing pass's matcher was actually
+    tripping on (as opposed to the grouped-quantization gap fixed in
+    compressed_weight()) is not confirmed without a GPU re-run; it is
+    reproduced here because it is a real, measured divergence and costs
+    nothing to fix.
+
+    Two things measured but deliberately NOT changed here, noted for
+    whoever GPU-verifies next: ground truth reshapes the down-projection's
+    [E,M,H] output to rank-4 [E,B,S,H] (splitting M back into B and S)
+    BEFORE the router-weight Multiply/ReduceSum, where this function keeps
+    the mixing stage flat at [E,M,H] and reshapes back to [B,S,H] only once,
+    at the very end -- mathematically equivalent (the reshape and the
+    all-but-axis-0 ReduceSum commute), so left as is, but it is a shape
+    difference the pass's matcher could still care about. And ground truth
+    keeps the group-quantization dequant math in f16 with a final Convert to
+    f32 only after the collapsing Reshape (matched literally in
+    compressed_weight() now); this exporter still cannot reproduce
+    production's own group_size (no quantized checkpoint to read it from),
+    only the grouping *shape* the pass evidently expects.
+    """
+    gu = w[p + "mlp.experts.gate_up_proj"]          # [E, 2I, H]
+    dn = w[p + "mlp.experts.down_proj"]              # [E, H, I]
+    E, two_i, H = gu.shape
+    I = two_i // 2
+    gate_np, up_np = gu[:, :I, :], gu[:, I:, :]
+
+    i32 = lambda v: op.constant(np.array(v, dtype=np.int32))
+    i32v = lambda v: op.constant(np.array([v], dtype=np.int32))
+
+    # the shared flatten -- ground truth's Reshape284, consumed by BOTH the
+    # router matmul and the Tile entry below. Rank 2 [M,H] throughout.
+    y_flat = op.reshape(y, op.constant(np.array([-1, H], dtype=np.int32)),
+                        special_zero=False)                              # [M,H]
+
+    # router, entirely at rank 2 [M,*] -- same arithmetic as moe_block()'s
+    # (dense per-token weights via a single ScatterElementsUpdate
+    # (reduction="none"), no OneHot), just on the flattened activation.
+    router_w = const(w[p + "mlp.gate.weight"], "router")
+    logits = op.matmul(y_flat, router_w, transpose_a=False, transpose_b=True)  # [M,E]
+    probs = op.softmax(logits, axis=-1)
+    tk = op.topk(probs, i32(topk), axis=-1, mode="max", sort="value",
+                index_element_type="i32")
+    vals, idx = tk.output(0), tk.output(1)                              # [M,k]
+    if norm_topk:
+        vals = op.divide(vals, op.reduce_sum(vals, i32v(-1), keep_dims=True))
+    # a full-range Slice on `vals` right before the scatter -- a no-op
+    # numerically (begin=(0,0), end=shape_of(vals), step=(1,1)) but ground
+    # truth has it (Slice411, between its Divide and its
+    # ScatterElementsUpdate) and window-D fusion checking flagged it as
+    # missing here, so it is reproduced literally rather than assumed
+    # irrelevant.
+    vals = op.slice(vals, op.constant(np.array([0, 0], dtype=np.int32)),
+                    op.shape_of(vals, output_type="i32"),
+                    op.constant(np.array([1, 1], dtype=np.int32)),
+                    op.constant(np.array([0, 1], dtype=np.int32)))
+    zeros = op.multiply(probs, op.constant(np.array([0.0], dtype=np.float32)))
+    weights = op.scatter_elements_update(zeros, idx, vals, i32(-1))    # [M,E]
+
+    # entry: Tile -> Reshape, the shape the fusing pass matches on
+    tiled = op.tile(y_flat, op.constant(np.array([E, 1], dtype=np.int32)))  # [E*M,H]
+    m_h3 = op.reshape(tiled, op.constant(np.array([E, -1, H], dtype=np.int32)),
+                      special_zero=False)                                # [E,M,H]
+
+    gate_w = compressed_weight(gate_np, "experts_gate_proj")             # [E,I,H]
+    up_w = compressed_weight(up_np, "experts_up_proj")                   # [E,I,H]
+    down_w = compressed_weight(dn, "experts_down_proj")                  # [E,H,I]
+
+    g = op.swish(op.matmul(m_h3, gate_w, transpose_a=False, transpose_b=True))
+    u = op.matmul(m_h3, up_w, transpose_a=False, transpose_b=True)
+    outs = op.matmul(op.multiply(g, u), down_w, transpose_a=False, transpose_b=True)  # [E,M,H]
+
+    # weighted sum over experts: Transpose -> Reshape -> Unsqueeze -> Multiply -> ReduceSum.
+    # Ground truth splits M back into [B,S] on BOTH operands before the
+    # Multiply (its Reshape383 takes the down-output to rank 4 [E,B,S,H],
+    # its Reshape418/Unsqueeze419 take the router weights to rank 4
+    # [E,B,S,1]) -- this function used to stay flat at [E,M,H] and reshape
+    # back to [B,S,H] once, at the very end, after the ReduceSum. The two
+    # are mathematically equivalent (the reshape and the axis-0 ReduceSum
+    # commute), but window-D fusion checking flagged the flat form as a
+    # remaining divergence, so it is now reshaped to rank 4 before the
+    # Multiply/ReduceSum, matching literally; the ReduceSum(axis=0) then
+    # lands directly on [B,S,H], with no separate reshape-back needed.
+    outs4 = op.reshape(outs, op.concat([i32v(E), shape_part(y, 0, 2), i32v(H)], axis=0),
+                       special_zero=False)                                # [E,B,S,H]
+    w_t = op.transpose(weights, op.constant(np.array([1, 0], dtype=np.int32)))  # [E,M]
+    w_r = op.reshape(w_t, op.concat([i32v(E), shape_part(y, 0, 2)], axis=0),
+                     special_zero=False)                                  # [E,B,S]
+    w_u = op.unsqueeze(w_r, i32v(-1))                                     # [E,B,S,1]
+    mixed = op.reduce_sum(op.multiply(outs4, w_u), i32v(0), keep_dims=False)  # [B,S,H]
+
+    # shared expert, gated by a scalar sigmoid per token -- identical to moe_block()
+    sg = linear(y, w[p + "mlp.shared_expert.gate_proj.weight"], "shared_gate_proj")
+    su = linear(y, w[p + "mlp.shared_expert.up_proj.weight"], "shared_up_proj")
+    shared = linear(op.multiply(op.multiply(sg, op.sigmoid(sg)), su),
+                    w[p + "mlp.shared_expert.down_proj.weight"], "shared_down_proj")
+    shared = op.multiply(shared, op.sigmoid(linear(y, w[p + "mlp.shared_expert_gate.weight"],
+                                                   "shared_expert_gate")))
+    return op.add(mixed, shared)
+
 
 def build_mtp_layer(w, eps, theta, rotary_dim):
     """hidden_states + input_embeds -> the MTP layer's normed hidden state."""
@@ -276,7 +620,9 @@ def build_mtp_layer(w, eps, theta, rotary_dim):
     # --- MLP: dense SwiGLU (Qwen3.8) or MoE (Qwen3.6, 256 experts, top-8) ------
     y = rms_norm(x, w[p + "post_attention_layernorm.weight"], eps, "post_ln")
     if (p + "mlp.experts.gate_up_proj") in w:
-        x = op.add(x, moe_block(y, w, p, MOE_TOPK, MOE_NORM_TOPK))
+        moe_fn = {"batched": moe_block, "unrolled": moe_block_unrolled,
+                 "tiled": moe_block_tiled}[MOE_LOWERING]
+        x = op.add(x, moe_fn(y, w, p, MOE_TOPK, MOE_NORM_TOPK))
     else:
         g = linear(y, w[p + "mlp.gate_proj.weight"], "gate_proj")
         u = linear(y, w[p + "mlp.up_proj.weight"], "up_proj")
@@ -346,6 +692,13 @@ def main():
                     "(default: the config's norm_topk_prob, else true)")
     ap.add_argument("--rope", choices=("interleaved", "half"), default="interleaved",
                     help="rotary pairing: interleaved (even,odd) or rotate_half (default: interleaved)")
+    ap.add_argument("--moe-lowering", dest="moe_lowering",
+                    choices=("batched", "unrolled", "tiled"),
+                    default="batched", help="MoE emission: batched (default, current behaviour); "
+                    "unrolled (per-expert gather/scatter graph OpenVINO's FuseMOE pass can match "
+                    "onto its internal MOECompressed op); tiled (Reshape/Tile/Reshape entry with "
+                    "rank-3 compressed-weight GEMMs, the form measured actually fusing on the GPU "
+                    "plugin via ConvertTiledMoeBlockToGatherMatmuls)")
     a = ap.parse_args()
 
     cfg = json.load(open(os.path.join(a.weights, "config.json")))
@@ -362,6 +715,8 @@ def main():
         MOE_NORM_TOPK = bool(t["norm_topk_prob"])
     global ROPE_STYLE
     ROPE_STYLE = a.rope
+    global MOE_LOWERING
+    MOE_LOWERING = a.moe_lowering
     eps = float(t.get("rms_norm_eps", 1e-6))
     theta = float(t.get("rope_parameters", {}).get("rope_theta", t.get("rope_theta", 1e7)))
     rotary = int(HEAD_DIM * float(t.get("partial_rotary_factor", 0.25)))
@@ -369,7 +724,7 @@ def main():
         raise SystemExit("this exporter builds a single-layer MTP head")
 
     print(f"eps {eps}  theta {theta:g}  rotary_dim {rotary}  heads {HEADS}/{KV_HEADS}x{HEAD_DIM}  "
-          f"hidden {HIDDEN}  moe top-{MOE_TOPK} norm_topk={MOE_NORM_TOPK}")
+          f"hidden {HIDDEN}  moe top-{MOE_TOPK} norm_topk={MOE_NORM_TOPK} lowering={MOE_LOWERING}")
     w = load_mtp_tensors(a.weights)
     print(f"loaded {len(w)} mtp tensors")
 
