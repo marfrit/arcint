@@ -2,6 +2,7 @@
 
 #include "core/sampling.h"
 
+#include <array>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -50,7 +51,100 @@ bool parse_double(std::string_view s, double& out) {
     return true;
 }
 
+// Bit width per --paged-kv value, per docs/design-m8-asymmetric-kv.md §3:
+// the same five element types the plugin's own KV_CACHE_PRECISION
+// validation accepts. This is the
+// single source of truth for both "is this a legal value at all"
+// (is_paged_kv_value, parse_paged_kv) and "does an actual compiled port
+// match what was requested" (kv_precision_bitwidth_matches, the M8 port
+// audit in backend_ov.cpp) -- one table, so the two rules cannot quietly
+// drift onto different alphabets.
+struct PagedKvValue {
+    const char* name;
+    int         bits;
+};
+constexpr std::array<PagedKvValue, 5> kPagedKvValues = {{
+    {"f16", 16},
+    {"u8", 8},
+    {"i8", 8},
+    {"u4", 4},
+    {"i4", 4},
+}};
+
+bool paged_kv_bits(std::string_view value, int& bits) {
+    for (const auto& v : kPagedKvValues) {
+        if (value == v.name) {
+            bits = v.bits;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_paged_kv_value(std::string_view s) {
+    int bits = 0;
+    return paged_kv_bits(s, bits);
+}
+
 }  // namespace
+
+bool parse_paged_kv(const std::string& spec, std::string& key, std::string& value) {
+    const size_t colon = spec.find(':');
+    if (colon == std::string::npos) {
+        if (!is_paged_kv_value(spec)) return false;
+        key = value = spec;
+        return true;
+    }
+    // At most one colon: "u8:i4:x" is not a two-sided spec, it is garbage.
+    if (spec.find(':', colon + 1) != std::string::npos) return false;
+    const std::string k = spec.substr(0, colon);
+    const std::string v = spec.substr(colon + 1);
+    if (!is_paged_kv_value(k) || !is_paged_kv_value(v)) return false;
+    key   = k;
+    value = v;
+    return true;
+}
+
+// M8 port audit rule (docs/design-m8-asymmetric-kv.md §4b; red case found
+// on the card 2026-09-02): a plugin is free to store a u8 request as i8 (or
+// a u4 request as i4) -- that is its own signedness choice, not a precision
+// downgrade, and comparing exact element types refused every symmetric u8
+// load over exactly this (the plugin compiled key_cache/value_cache as i8
+// for a u8 request). The actual hazard the audit exists to catch is a side
+// that kept the OLD bitwidth when a DIFFERENT one was requested -- an
+// asymmetric u8:i4 request silently served as u8:u8, say -- so the
+// comparison is BITWIDTH only. `requested` and `actual` are each one of
+// --paged-kv's five values; anything outside that alphabet counts as a
+// mismatch rather than passing by default.
+bool kv_precision_bitwidth_matches(const std::string& requested, const std::string& actual) {
+    int requested_bits = 0, actual_bits = 0;
+    if (!paged_kv_bits(requested, requested_bits) || !paged_kv_bits(actual, actual_bits)) {
+        return false;
+    }
+    return requested_bits == actual_bits;
+}
+
+bool parse_u64_strict(const std::string& s, uint64_t& out) {
+    if (s.empty()) return false;
+
+    char*                    end = nullptr;
+    errno                        = 0;
+    const unsigned long long v   = std::strtoull(s.c_str(), &end, 10);
+
+    // Full consumption: refuses trailing garbage ("8e9" parses 8 and leaves
+    // "e9" unconsumed) and empty input (end == s.c_str()).
+    if (end != s.c_str() + s.size()) return false;
+    if (errno == ERANGE) return false;
+    // Round-trip: refuses anything that would not print back as itself --
+    // a leading '-' (strtoull wraps it to a huge unsigned value rather than
+    // rejecting it), a leading '+', or leading zeros. This is what actually
+    // catches the '-' case, not a sign check, because strtoull's own
+    // consumption of a leading '-' already satisfies the check above.
+    if (std::to_string(v) != s) return false;
+
+    out = static_cast<uint64_t>(v);
+    return true;
+}
 
 std::string usage_text() {
     return
@@ -96,7 +190,13 @@ std::string usage_text() {
         "  --kv-block-size 16|32     KV page size in tokens (default: 32)\n"
         "  --prefill-chunk N         prefill chunk in tokens, 0 = unchunked\n"
         "                            (default: 2048; bounds activation memory)\n"
-        "  --paged-kv u8|f16         KV precision on the paged path (default: u8).\n"
+        "  --paged-kv KEY[:VALUE]    KV precision on the paged path (default: u8). KEY and\n"
+        "                            VALUE each one of f16, u8, i8, u4, i4; omitting :VALUE\n"
+        "                            applies KEY to both the key and value cache (\"u8\" and\n"
+        "                            \"f16\" mean exactly what they always did). A colon pair\n"
+        "                            asks for asymmetric precision (M8) and is refused unless\n"
+        "                            the compiled paged model actually carries the requested\n"
+        "                            widths per side.\n"
         "  --cache-grid N            prefix-cache snapshot grid in tokens (default: 0 = the\n"
         "                            prefill chunk). A snapshot lands on the last multiple of N\n"
         "                            below the prompt length; a coarser grid re-prefills the\n"
@@ -266,7 +366,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--gate-pad") {
             if (!value(v) || !parse_int(v, cfg.gate_pad)) return fail("--gate-pad needs an integer");
         } else if (arg == "--paged-kv") {
-            if (!value(v)) return fail("--paged-kv needs u8 or f16");
+            if (!value(v)) return fail("--paged-kv needs KEY[:VALUE]");
             cfg.paged_kv = std::string(v);
         } else if (arg == "--served-model-name") {
             // An empty value is refused rather than folded into "not given":
@@ -440,8 +540,14 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.gate_pad < 0 || cfg.gate_pad == 1 || cfg.gate_pad > 4096) {
         return fail(log::format("--gate-pad must be 0 (off) or 2..4096, not %d", cfg.gate_pad));
     }
-    if (cfg.paged_kv != "u8" && cfg.paged_kv != "f16") {
-        return fail(log::format("--paged-kv must be u8 or f16, not '%s'", cfg.paged_kv.c_str()));
+    {
+        std::string pk_key, pk_value;
+        if (!parse_paged_kv(cfg.paged_kv, pk_key, pk_value)) {
+            return fail(log::format(
+                "--paged-kv must be KEY[:VALUE] with each side one of f16, u8, i8, u4, i4, "
+                "not '%s'",
+                cfg.paged_kv.c_str()));
+        }
     }
     if (!cfg.dflash.empty() && cfg.mtp == "on") {
         return fail("--dflash and --mtp on are two drafters for one verify loop; pick one");

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <optional>
 
@@ -136,7 +137,13 @@ struct Config {
     // B60 and what lets the A770 reach depth at all. It is NOT free — measured
     // 2026-08-29, it costs up to 22% of prefill at 115k (§4.4) — so a one-lane
     // deep-context endpoint on a card with room should say f16.
-    std::string paged_kv                  = "u8";    // u8 | f16
+    //
+    // Grammar (M8, docs/design-m8-asymmetric-kv.md §3): KEY[:VALUE], each
+    // side one of f16, u8, i8, u4, i4. No colon applies KEY to both sides, so
+    // a bare "u8" or "f16" means exactly what it always did. Kept as one
+    // string rather than two fields -- the pair is parsed where it is needed
+    // (parse_paged_kv below), not stored twice.
+    std::string paged_kv                  = "u8";    // KEY[:VALUE], see parse_paged_kv
     int         gate_pad                  = 0;       // 0 = off; 16 = the measured setting
     int         cache_grid                = 0;       // prefix-cache snapshot grid; 0 = the prefill chunk (see DESIGN 7.0.2j)
     int         cache_host_mib            = 0;       // host tier for evicted prefixes, MiB; 0 = off
@@ -189,6 +196,41 @@ struct ArgParse {
 
 ArgParse    parse_args(int argc, char** argv, Config& cfg);
 std::string usage_text();
+
+// --paged-kv's grammar: "<key>[:<value>]", each side one of f16, u8, i8, u4,
+// i4. No colon means both sides take the same value -- "u8" and "f16" mean
+// exactly what they meant before the pair syntax existed. On success `key`
+// and `value` are set (equal, when `spec` had no colon) and the function
+// returns true; on a spec that does not parse it returns false and leaves
+// `key`/`value` untouched. Used by --paged-kv's own validation and by the
+// ARCINT_PAGED_KV env override in backend_ov.cpp, so an unrecognised value
+// is refused in exactly one place instead of the two drifting apart (the
+// bug this milestone found: the env override used to map anything it did
+// not recognise to u8, silently).
+bool parse_paged_kv(const std::string& spec, std::string& key, std::string& value);
+
+// The M8 port audit's comparison rule (backend_ov.cpp, load_paged): a
+// compiled key_cache/value_cache port only has to match what was requested
+// in BITWIDTH, not in exact element type -- a plugin that stores a u8
+// request as i8 (or a u4 request as i4) is making its own signedness
+// choice, not downgrading precision, and a mismatched bitwidth (a request
+// silently kept at the old width) is the actual hazard. `requested` and
+// `actual` are each one of --paged-kv's five values (parse_paged_kv's
+// alphabet); anything outside that set counts as a mismatch.
+bool kv_precision_bitwidth_matches(const std::string& requested, const std::string& actual);
+
+// Strict base-10 uint64 parse: refuses empty input and trailing garbage
+// (strtoull alone happily parses "8e9" as 8 and ignores "e9"), and refuses
+// any value that does not round-trip through decimal formatting -- which
+// also catches a leading '-' without special-casing it, since strtoull
+// silently two's-complements a negative sign into a huge unsigned value
+// ("-1" reads back as ULLONG_MAX) and that reads back as "18446744073709551615",
+// not "-1". Used wherever an env var hands a byte count straight into a
+// plugin property (docs/design-m8-asymmetric-kv.md review, F3:
+// ARCINT_MOE_DEVICE_POOL_BYTES="8e9" used to silently become 8 bytes), so a
+// typo refuses the load instead of changing what got requested by orders of
+// magnitude.
+bool parse_u64_strict(const std::string& s, uint64_t& out);
 
 // The operator serving-defaults layer: applies the --temp/--top-p/--top-k/
 // --repetition-penalty/--presence-penalty flags (only those that were set) to

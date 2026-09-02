@@ -216,6 +216,56 @@ TEST(expert_slot_bytes_exact_division_stays_exact) {
     CHECK_EQ(expert_slot_bytes(kNumExpert, kRatioPct, kPerExpertBytes, kMoeLayers), want);
 }
 
+// --------------------------------------------------------- kv_block_bytes_from_bits
+
+// M8 bug 1: the pre-fix arithmetic summed `Type::size()` (bytes, ceiled) per
+// port, so an i4 port -- 4 bits/element -- counted as a full byte, same as
+// u8. A u8/u8 pool and a u8/i4 pool with identical element counts must NOT
+// land on the same byte figure once the value side is i4; this is the red
+// case the pre-fix code could not pass (it summed `size()` = 1 byte for
+// every u8 AND every i4 port alike).
+TEST(kv_block_bytes_from_bits_i4_port_halves_against_u8) {
+    constexpr uint64_t kElems = 128;  // an even count, as any real KV layout is
+    const uint64_t u8_u8 = kv_block_bytes_from_bits({{8, kElems}, {8, kElems}});
+    const uint64_t u8_i4 = kv_block_bytes_from_bits({{8, kElems}, {4, kElems}});
+    // u8 side unchanged, i4 side exactly half of what a u8 side of the same
+    // element count would have cost.
+    CHECK_EQ(u8_u8, 2 * kElems);
+    CHECK_EQ(u8_i4, kElems + kElems / 2);
+    CHECK(u8_i4 < u8_u8);
+}
+
+TEST(kv_block_bytes_from_bits_matches_type_size_for_byte_aligned_types) {
+    // f16 (16 bits) and u8 (8 bits) are already byte-aligned, so bitwidth
+    // arithmetic must reproduce plain `Type::size()` summation exactly --
+    // this milestone changes nothing for the types that were never wrong.
+    constexpr uint64_t kElems = 64;
+    CHECK_EQ(kv_block_bytes_from_bits({{16, kElems}}), 2 * kElems);
+    CHECK_EQ(kv_block_bytes_from_bits({{8, kElems}}), kElems);
+}
+
+// F7 (review 2026-09-02): each port is a physically separate device
+// allocation, so it must be ceiled on its OWN bit total, not summed into one
+// aggregate and floored once -- the first version of this fix did exactly
+// that, and could let one port's leftover bits complete another port's byte
+// in the aggregate, undercounting the real allocation. Red case: a single
+// i4 port with an odd element count (4 bits x 3 = 12 bits) needs 2 bytes on
+// its own; the pre-fix arithmetic (floor(12/8)) landed on 1.
+TEST(kv_block_bytes_from_bits_ceils_per_port_odd_i4_count) {
+    CHECK_EQ(kv_block_bytes_from_bits({{4, 3}}), 2ull);  // ceil(12/8) = 2, not floor(12/8) = 1
+}
+
+// Two odd-by-themselves i4 ports must each ceil independently: 2 + 1 = 3,
+// not the pre-fix aggregate answer ((12 + 4) bits / 8 = 2) that let the
+// second port's leftover 4 bits complete the first port's byte in the sum.
+TEST(kv_block_bytes_from_bits_does_not_let_ports_borrow_bits_from_each_other) {
+    CHECK_EQ(kv_block_bytes_from_bits({{4, 3}, {4, 1}}), 3ull);
+}
+
+TEST(kv_block_bytes_from_bits_empty_is_zero) {
+    CHECK_EQ(kv_block_bytes_from_bits({}), 0ull);
+}
+
 // ------------------------------------------------------------------- shrink_n_ctx
 
 TEST(shrink_n_ctx_strictly_decreases_and_terminates) {

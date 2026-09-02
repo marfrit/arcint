@@ -264,6 +264,157 @@ TEST(config_paged_kv_is_a_documented_choice) {
     CHECK(rejected({"--stub", "--paged-kv"}));
 }
 
+// M8: --paged-kv KEY[:VALUE], asymmetric precision for the paged path
+// (docs/design-m8-asymmetric-kv.md §3). Red first: before this milestone
+// "u8:i4" was refused by the plain u8/f16 check above -- these cases prove
+// the wider grammar without loosening what a bare value still means.
+TEST(config_paged_kv_accepts_an_asymmetric_pair) {
+    Config cfg;
+    CHECK(run({"--stub", "--paged-kv", "u8:i4"}, cfg).ok);
+    CHECK_EQ(cfg.paged_kv, std::string("u8:i4"));
+
+    // Every documented side value, symmetric and mixed.
+    for (const char* side : {"f16", "u8", "i8", "u4", "i4"}) {
+        Config c;
+        CHECK(run({"--stub", "--paged-kv", side}, c).ok);
+    }
+    Config c2;
+    CHECK(run({"--stub", "--paged-kv", "i8:u4"}, c2).ok);
+}
+
+TEST(config_paged_kv_rejects_a_junk_pair) {
+    CHECK(rejected({"--stub", "--paged-kv", "u8:q8"}));   // right side not in the set
+    CHECK(rejected({"--stub", "--paged-kv", "q8:u8"}));   // left side not in the set
+    CHECK(rejected({"--stub", "--paged-kv", "u8:i4:f16"}));  // more than one colon
+    CHECK(rejected({"--stub", "--paged-kv", "u8:"}));     // empty side
+    CHECK(rejected({"--stub", "--paged-kv", ":i4"}));     // empty side
+}
+
+// parse_paged_kv is the shared parser --paged-kv's validation and
+// backend_ov.cpp's ARCINT_PAGED_KV override both call, so a value's meaning
+// cannot drift between the two call sites (that drift was the u4/i4 bug this
+// milestone found: the env override silently mapped anything unrecognised to
+// u8). Exercised directly here rather than only through argv parsing.
+TEST(parse_paged_kv_single_value_mirrors_to_both_sides) {
+    std::string key, value;
+    CHECK(parse_paged_kv("u8", key, value));
+    CHECK_EQ(key, std::string("u8"));
+    CHECK_EQ(value, std::string("u8"));
+
+    CHECK(parse_paged_kv("f16", key, value));
+    CHECK_EQ(key, std::string("f16"));
+    CHECK_EQ(value, std::string("f16"));
+}
+
+TEST(parse_paged_kv_pair_splits_key_and_value) {
+    std::string key, value;
+    CHECK(parse_paged_kv("u8:i4", key, value));
+    CHECK_EQ(key, std::string("u8"));
+    CHECK_EQ(value, std::string("i4"));
+}
+
+TEST(parse_paged_kv_refuses_garbage) {
+    std::string key, value;
+    // The exact silent-u8 bug this milestone found: an unrecognised value
+    // must be refused, never quietly accepted as u8.
+    CHECK(!parse_paged_kv("garbage", key, value));
+    CHECK(!parse_paged_kv("i4garbage", key, value));
+    CHECK(!parse_paged_kv("", key, value));
+    CHECK(!parse_paged_kv("u8:garbage", key, value));
+    CHECK(!parse_paged_kv("garbage:u8", key, value));
+    CHECK(!parse_paged_kv("u8:i4:u8", key, value));
+}
+
+TEST(parse_paged_kv_accepts_the_full_documented_set) {
+    std::string key, value;
+    for (const char* side : {"f16", "u8", "i8", "u4", "i4"}) {
+        CHECK(parse_paged_kv(side, key, value));
+        CHECK_EQ(key, std::string(side));
+        CHECK_EQ(value, std::string(side));
+    }
+}
+
+// M8 port audit rule, found on the card 2026-09-02: an unpatched plugin
+// compiled a plain --paged-kv u8 request's KV cache ports as i8 -- same 8
+// bits, its own signedness choice -- and an exact-element-type audit refused
+// every symmetric u8 load over exactly that false positive. The audit must
+// compare bitwidth, not exact type: same-bitwidth aliasing (u8<->i8,
+// u4<->i4) passes, a genuinely different bitwidth still refuses.
+TEST(kv_precision_bitwidth_matches_same_width_aliases_pass) {
+    // The exact false positive measured on the card.
+    CHECK(kv_precision_bitwidth_matches("u8", "i8"));
+    CHECK(kv_precision_bitwidth_matches("i8", "u8"));
+    CHECK(kv_precision_bitwidth_matches("u4", "i4"));
+    CHECK(kv_precision_bitwidth_matches("i4", "u4"));
+    // Exact match is of course still fine.
+    CHECK(kv_precision_bitwidth_matches("u8", "u8"));
+    CHECK(kv_precision_bitwidth_matches("f16", "f16"));
+}
+
+TEST(kv_precision_bitwidth_matches_refuses_a_real_width_change) {
+    // The red case: a request for 4 bits actually served at 8 must still
+    // refuse -- this is the quiet-downgrade class the audit exists to catch
+    // (an asymmetric u8:i4 request silently served as u8:u8, say).
+    CHECK(!kv_precision_bitwidth_matches("u4", "u8"));
+    CHECK(!kv_precision_bitwidth_matches("i4", "i8"));
+    CHECK(!kv_precision_bitwidth_matches("u8", "i4"));
+    CHECK(!kv_precision_bitwidth_matches("f16", "u8"));
+    CHECK(!kv_precision_bitwidth_matches("u8", "f16"));
+}
+
+TEST(kv_precision_bitwidth_matches_rejects_unknown_values) {
+    CHECK(!kv_precision_bitwidth_matches("garbage", "u8"));
+    CHECK(!kv_precision_bitwidth_matches("u8", "garbage"));
+    CHECK(!kv_precision_bitwidth_matches("", ""));
+}
+
+// F3 (review 2026-09-02): ARCINT_MOE_DEVICE_POOL_BYTES used to go into the
+// plugin's AnyMap as a raw string, and the plugin's own stoull() has no
+// full-consumption check -- "8e9" silently became 8 bytes ('e9' unconsumed
+// and ignored), and a leading '-' silently wrapped through strtoull's
+// two's-complement rule to a huge unsigned value. parse_u64_strict is the
+// arcint-side refusal: red case first, since this milestone's whole premise
+// is that a typo must refuse rather than quietly change the request.
+TEST(parse_u64_strict_refuses_scientific_notation) {
+    uint64_t out = 0;
+    // The exact false-negative measured on the card: "8e9" must be refused,
+    // never silently truncated to the "8" strtoull alone would parse.
+    CHECK(!parse_u64_strict("8e9", out));
+}
+
+TEST(parse_u64_strict_accepts_a_plain_decimal) {
+    uint64_t out = 0;
+    CHECK(parse_u64_strict("8589934592", out));  // 8 GiB, in bytes
+    CHECK_EQ(out, 8589934592ull);
+}
+
+TEST(parse_u64_strict_refuses_a_negative_wraparound) {
+    uint64_t out = 0;
+    // strtoull("-1", ...) alone returns ULLONG_MAX with no error -- the
+    // round-trip check is what catches it (ULLONG_MAX prints back as
+    // "18446744073709551615", not "-1").
+    CHECK(!parse_u64_strict("-1", out));
+}
+
+TEST(parse_u64_strict_refuses_trailing_garbage_and_empty) {
+    uint64_t out = 0;
+    CHECK(!parse_u64_strict("123abc", out));
+    CHECK(!parse_u64_strict("", out));
+    // strtoull itself skips leading whitespace (fully consumes " 123"), so
+    // this one is refused by the round-trip check, not the end pointer.
+    CHECK(!parse_u64_strict(" 123", out));
+    CHECK(!parse_u64_strict("+123", out));   // round-trip: "+123" != "123"
+    CHECK(!parse_u64_strict("007", out));    // round-trip: "007" != "7"
+}
+
+TEST(parse_u64_strict_accepts_zero_and_a_large_value) {
+    uint64_t out = 0;
+    CHECK(parse_u64_strict("0", out));
+    CHECK_EQ(out, 0ull);
+    CHECK(parse_u64_strict("18446744073709551615", out));  // UINT64_MAX
+    CHECK_EQ(out, 18446744073709551615ull);
+}
+
 TEST(config_mtp_layer_choice) {
     for (const char* w : {"auto", "reconstructed", "exported"}) {
         Config cfg;

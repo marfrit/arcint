@@ -108,6 +108,22 @@ uint64_t prefix_cache_key(const Artifact& a) {
     return k;
 }
 
+// M8 (docs/design-m8-asymmetric-kv.md §3): the five element types
+// --paged-kv / ARCINT_PAGED_KV accept on either side of the colon, mapped to
+// the OpenVINO type the plugin's own KV_CACHE_PRECISION / VALUE_CACHE_PRECISION
+// properties want. config.h's parse_paged_kv() has already refused anything
+// outside this set by the time this runs, so the fallback below is dead code
+// reached only if the two tables ever drift -- rather than let that drift
+// resolve to a silent default, it refuses too.
+ov::element::Type paged_kv_element(const std::string& s) {
+    if (s == "f16") return ov::element::f16;
+    if (s == "u8") return ov::element::u8;
+    if (s == "i8") return ov::element::i8;
+    if (s == "u4") return ov::element::u4;
+    if (s == "i4") return ov::element::i4;
+    throw std::runtime_error(log::format("paged_kv_element: unrecognised '%s'", s.c_str()));
+}
+
 std::string tokenizers_extension_path() {
     // Shipped alongside the OpenVINO wheel rather than with the runtime, so the
     // path is deployment configuration. The environment wins; otherwise use
@@ -2133,21 +2149,59 @@ private:
         // stays as the measurement switch to pin f16 for A/B runs.
         // --paged-kv decides it; ARCINT_PAGED_KV still overrides, because an A/B
         // over a running deployment should not need a config edit.
-        ov::element::Type kv_prec = cfg.paged_kv == "f16" ? ov::element::f16 : ov::element::u8;
-        std::string       kv_src  = "--paged-kv";
-        if (const char* env = std::getenv("ARCINT_PAGED_KV")) {
-            kv_prec = std::string(env) == "f16" ? ov::element::f16 : ov::element::u8;
-            kv_src  = "ARCINT_PAGED_KV";
+        //
+        // M8 (docs/design-m8-asymmetric-kv.md §3): --paged-kv now takes
+        // KEY[:VALUE], and both the flag's own value and the env override go
+        // through the identical parser (config.h's parse_paged_kv). The
+        // env override used to map anything it did not recognise straight to
+        // u8 -- ARCINT_PAGED_KV=i4 silently served u8 -- which is exactly the
+        // quiet-downgrade class this engine exists to refuse; it now refuses
+        // to load instead.
+        std::string pk_key, pk_value;
+        if (!parse_paged_kv(cfg.paged_kv, pk_key, pk_value)) {
+            // Belt and braces: config.cpp's validate() already refuses this
+            // before load_paged is ever reached.
+            throw std::runtime_error(
+                log::format("--paged-kv '%s' does not parse", cfg.paged_kv.c_str()));
         }
+        std::string kv_src = "--paged-kv";
+        if (const char* env = std::getenv("ARCINT_PAGED_KV")) {
+            if (!parse_paged_kv(env, pk_key, pk_value)) {
+                throw std::runtime_error(log::format(
+                    "ARCINT_PAGED_KV='%s' does not parse: each side must be one of f16, u8, "
+                    "i8, u4, i4 (KEY[:VALUE])",
+                    env));
+            }
+            kv_src = "ARCINT_PAGED_KV";
+        }
+        const ov::element::Type kv_prec    = paged_kv_element(pk_key);
+        const ov::element::Type value_prec = paged_kv_element(pk_value);
+        const bool               asym_kv   = pk_key != pk_value;
+        // The spec that actually won: cfg.paged_kv is the flag's own value,
+        // but ARCINT_PAGED_KV may have overridden it above, and pk_key/
+        // pk_value already reflect whichever source won. Diagnostics below
+        // name THIS, not the flag (docs/design-m8-asymmetric-kv.md review,
+        // F4) -- an env override used to print the flag's value in the load
+        // line and in both refusal messages, misnaming what was actually
+        // requested.
+        const std::string effective_paged_kv = asym_kv ? (pk_key + ":" + pk_value) : pk_key;
         // Said out loud at load, because it is a throughput decision now and not
         // only a memory one: u8 halves KV and costs up to 22% of prefill at
         // depth (§7.0.3 chose it on decode evidence, which did not see that).
-        log::info("load", "paged KV precision %s (%s): %s",
-                  kv_prec == ov::element::f16 ? "f16" : "u8", kv_src.c_str(),
-                  kv_prec == ov::element::f16
-                      ? "20 KiB/token, faster prefill at depth"
-                      : "11.3 KiB/token, what makes two lanes at depth fit");
+        log::info("load", "paged KV precision %s (%s)%s", effective_paged_kv.c_str(),
+                  kv_src.c_str(),
+                  asym_kv ? ": asymmetric, VALUE_CACHE_PRECISION requested" : "");
         props["KV_CACHE_PRECISION"] = kv_prec;
+        if (asym_kv) {
+            // VALUE_CACHE_PRECISION does not exist on an unpatched plugin
+            // (M8 patches/0004, not carried in this repository yet). Setting
+            // it is still the right thing to attempt: the compile_model guard
+            // below catches a plugin that rejects it outright, and the port
+            // audit after compile catches the more dangerous case -- a
+            // plugin that silently ignores the unknown property and mirrors
+            // KV_CACHE_PRECISION onto both sides anyway.
+            props["VALUE_CACHE_PRECISION"] = value_prec;
+        }
         // The served path could not be profiled at all until now: enable_profiling
         // was wired on the stateful reference path only, so every per-kernel number
         // in this document describes a graph the fleet does not run. ARCINT_PROFILE
@@ -2158,6 +2212,31 @@ private:
         if (offload_ratio_ > 0) {
             props["OFFLOAD_RATIO"]        = offload_ratio_;
             props[ov::weights_path.name()] = artifact_.language_model_bin;
+            // Experiment knob, ARCINT_FIT_SLOT_BYTES-style: forwards a device
+            // pool budget to a plugin that understands it (patches/0005);
+            // an unpatched plugin rejects the property and the load fails
+            // loudly rather than silently measuring the wrong world.
+            //
+            // The env string used to go into the AnyMap as-is and the
+            // plugin's own stoull() has no full-consumption check, so a typo
+            // silently changed the request by orders of magnitude rather
+            // than refusing (docs/design-m8-asymmetric-kv.md review, F3:
+            // "8e9" became 8 bytes, "-1" wrapped to ULLONG_MAX). Parsed and
+            // refused here instead, with a numeric size_t handed to the
+            // plugin rather than a string for it to mis-parse a second way.
+            if (const char* dp = std::getenv("ARCINT_MOE_DEVICE_POOL_BYTES")) {
+                uint64_t bytes = 0;
+                if (!parse_u64_strict(dp, bytes)) {
+                    throw std::runtime_error(log::format(
+                        "ARCINT_MOE_DEVICE_POOL_BYTES='%s' does not parse as a byte count "
+                        "(need a plain base-10 integer: no sign, no trailing text)",
+                        dp));
+                }
+                props["MOE_OTD_DEVICE_POOL_BYTES"] = static_cast<size_t>(bytes);
+                log::info("load", "expert slot device pool budget forced to %llu bytes "
+                          "(ARCINT_MOE_DEVICE_POOL_BYTES)",
+                          static_cast<unsigned long long>(bytes));
+            }
         }
         // The blob cache is off for the paged graph: its import path is
         // unproven and the #37607 class is exactly the kind of thing it would
@@ -2166,8 +2245,23 @@ private:
 
         log::info("load", "compiling PAGED language model on %s (big model first by design)",
                   device.c_str());
-        auto t0      = std::chrono::steady_clock::now();
-        paged_model_ = core_.compile_model(model, device, props);
+        auto t0 = std::chrono::steady_clock::now();
+        try {
+            paged_model_ = core_.compile_model(model, device, props);
+        } catch (const std::exception& e) {
+            if (asym_kv) {
+                // Red-first layer 1 (docs/design-m8-asymmetric-kv.md §4b): a
+                // plugin that rejects an unknown VALUE_CACHE_PRECISION
+                // outright must fail the load, never fall back to compiling
+                // without it and quietly serving symmetric KV.
+                throw std::runtime_error(log::format(
+                    "asymmetric paged KV %s requested (VALUE_CACHE_PRECISION set), but "
+                    "compiling the paged model failed: %s -- refusing rather than silently "
+                    "falling back to symmetric %s KV",
+                    effective_paged_kv.c_str(), e.what(), pk_key.c_str()));
+            }
+            throw;
+        }
         const size_t resident_base = device_resident_bytes(device);
         log::info("load", "paged model ready in %.1f s; device-resident %.2f GiB",
                   seconds_since(t0), static_cast<double>(resident_base) / (1u << 30));
@@ -2266,7 +2360,16 @@ private:
         }
 
         // ---- ports: state tables and KV pools --------------------------------
-        size_t conv_i = 0, gdn_i = 0, kv_block_bytes = 0;
+        size_t conv_i = 0, gdn_i = 0;
+        // (bitwidth, element_count) per key_cache/value_cache port -- fed to
+        // kv_block_bytes_from_bits (fit.h) below rather than summing
+        // Type::size() per port, which ceils a sub-byte width to a whole byte
+        // and would over-count an i4 side 2x (docs/design-m8-asymmetric-kv.md §3 bug 1).
+        std::vector<std::pair<uint64_t, uint64_t>> kv_port_bits;
+        // Port audit alias logging (below): once per side, not once per
+        // layer -- a 40-layer model would otherwise print the same "i8 for a
+        // u8 request" line 40 times.
+        bool logged_key_alias = false, logged_value_alias = false;
         for (const auto& port : paged_model_.inputs()) {
             const std::string  name = port.get_any_name();
             const ov::PartialShape& ps = port.get_partial_shape();
@@ -2279,17 +2382,56 @@ private:
                 la_state_names_.push_back(name);
                 la_state_shapes_.push_back(gdn_proto[gdn_i++ % gdn_proto.size()]);
             } else if (name.rfind("key_cache.", 0) == 0 || name.rfind("value_cache.", 0) == 0) {
+                const bool is_value = name.rfind("value_cache.", 0) == 0;
+                const ov::element::Type actual = port.get_element_type();
+                const std::string        actual_name    = actual.get_type_name();
+                const std::string&       requested_name = is_value ? pk_value : pk_key;
+                // Port audit (docs/design-m8-asymmetric-kv.md §3 item 11 / §4b, the red case in the
+                // unpatched world): VALUE_CACHE_PRECISION is a hint the
+                // plugin may not know or may silently ignore, mirroring
+                // KV_CACHE_PRECISION onto both ports instead of honouring the
+                // asymmetric request. That is the quiet-downgrade class this
+                // engine exists to refuse, so the compiled model's own port
+                // types are checked against what was requested rather than
+                // trusted on the strength of the property having been set.
+                //
+                // The check is BITWIDTH, not exact element type (config.h's
+                // kv_precision_bitwidth_matches): measured on the card
+                // 2026-09-02, an unpatched plugin compiles a u8 request as
+                // i8 storage -- same 8 bits, its own signedness choice, not
+                // a downgrade -- and an exact-type check refused every
+                // symmetric u8 load over exactly that. A different bitwidth
+                // (a request silently kept at the old width) still refuses.
+                if (!kv_precision_bitwidth_matches(requested_name, actual_name)) {
+                    throw std::runtime_error(log::format(
+                        "paged KV port '%s' compiled as %s but --paged-kv '%s' requested "
+                        "%s=%s; refusing to serve a KV precision the plugin did not actually "
+                        "give us (likely: this plugin does not support asymmetric paged KV)",
+                        name.c_str(), actual_name.c_str(), effective_paged_kv.c_str(),
+                        is_value ? "value" : "key", requested_name.c_str()));
+                }
+                if (actual_name != requested_name) {
+                    bool& logged = is_value ? logged_value_alias : logged_key_alias;
+                    if (!logged) {
+                        log::info("load",
+                                  "paged KV %s cache compiled as %s for requested %s (same "
+                                  "bitwidth -- the plugin's own storage choice, not a downgrade)",
+                                  is_value ? "value" : "key", actual_name.c_str(),
+                                  requested_name.c_str());
+                        logged = true;
+                    }
+                }
                 ov::Shape sh;
                 sh.push_back(1);  // blocks dim, filled at allocation
                 for (size_t i = 1; i < static_cast<size_t>(ps.rank().get_length()); ++i) {
                     sh.push_back(static_cast<size_t>(ps[static_cast<int64_t>(i)].get_length()));
                 }
                 kv_pool_names_.push_back(name);
-                kv_pool_types_.push_back(port.get_element_type());
+                kv_pool_types_.push_back(actual);
                 kv_pool_shapes_.push_back(sh);
                 size_t block_elems = 1;
                 for (size_t i = 1; i < sh.size(); ++i) block_elems *= sh[i];
-                kv_block_bytes += block_elems * port.get_element_type().size();
+                kv_port_bits.emplace_back(actual.bitwidth(), block_elems);
             } else if (name == kPositionIds) {
                 paged_sections_ = static_cast<size_t>(ps[0].get_length());
             }
@@ -2315,6 +2457,7 @@ private:
                     kv_pool_names_[i].c_str(), dims.c_str(), kv_block_tokens_));
             }
         }
+        const size_t kv_block_bytes = static_cast<size_t>(kv_block_bytes_from_bits(kv_port_bits));
         kv_bytes_token_ = kv_block_bytes / kv_block_tokens_;
         la_row_bytes_   = 0;
         for (const ov::Shape& sh : la_state_shapes_) {

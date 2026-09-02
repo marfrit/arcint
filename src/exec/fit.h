@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <utility>
+#include <vector>
 
 // M7 — auto-fit and the honest reservation (design: "M7 — Auto-fit and the
 // honest reservation", 2026-09-01, §1/§2/§4). Pure arithmetic, no OpenVINO
@@ -87,6 +89,36 @@ inline uint64_t expert_slot_bytes(int num_expert, int ratio_pct, uint64_t per_ex
     const uint64_t n = static_cast<uint64_t>(num_expert);
     const uint64_t slots = (n * static_cast<uint64_t>(100 - pct) + 99) / 100;  // ceil
     return slots * per_expert_bytes * static_cast<uint64_t>(moe_layers);
+}
+
+// M8 bug 1 (docs/design-m8-asymmetric-kv.md §3, first pickup check):
+// backend_ov.cpp used to sum `ov::element::Type::size()` per KV pool port,
+// and `size()` ceils a sub-byte width to a whole byte -- an i4 port reads
+// back as 1 byte, the same as u8, so a KV pool with an i4 side was
+// over-counted 2x.
+//
+// Each port is a physically separate device allocation, so each one's own
+// byte size must ceil independently -- summing every port's bits into one
+// total and dividing by 8 once (the first version of this fix, review
+// 2026-09-02, F7) got that backwards: it can let one port's leftover bits
+// complete another port's byte in the AGGREGATE, floors the whole sum, and
+// silently undercounts the real allocation whenever any single port's own
+// bit total is not itself byte-aligned (an i4 port with an odd element
+// count, say) -- anti-conservative for the fit, the wrong direction to be
+// wrong in. Each port is ceiled on its own instead: `(bitwidth * count + 7)
+// / 8` still fixes the original over-count for the byte-aligned f16/u8/i8
+// cases and for any i4/u4 port with an even element count (unchanged from
+// before), and now also gets the odd-count case right instead of merely
+// getting it right by accident.
+//
+// `ports` is (bitwidth, element_count) per key_cache/value_cache port --
+// pure arithmetic, no OpenVINO types, so backend_ov.cpp's actual port walk
+// can be tested here without a card.
+inline uint64_t kv_block_bytes_from_bits(
+    const std::vector<std::pair<uint64_t, uint64_t>>& ports) {
+    uint64_t bytes = 0;
+    for (const auto& [bitwidth, count] : ports) bytes += (bitwidth * count + 7) / 8;
+    return bytes;
 }
 
 // The replay loop's correction (design §1 "The replay loop"): given the
