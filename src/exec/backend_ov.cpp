@@ -3127,12 +3127,16 @@ private:
         // A driver allocation promises address space, not pages (§1 "Deferred
         // commit") -- the slot pool proved that once already, so the audit
         // below is what stops a second term from making the same promise
-        // unverified. Explicit --n-ctx is verify-only here too: a replay pass
-        // on an explicit request refuses instead of shrinking, because
-        // --n-ctx is never lowered silently.
+        // unverified. Explicit --n-ctx is verify-only here too, but a replay
+        // pass on an explicit request does not simply refuse: it retries by
+        // trimming the reserve pages held for the prefix cache first (see
+        // pool_sizing/explicit_overshoot_must_refuse in fit.h), and refuses
+        // only once that reserve is exhausted -- --n-ctx itself is never
+        // lowered, silently or otherwise.
         size_t   per_lane_blocks   = 0;
         size_t   live_blocks       = 0;
         size_t   blocks            = 0;
+        size_t   spare_blocks      = 0;
         bool     accepted          = false;
         // F3 (review finding): `budget` is constant across passes, but
         // `live_blocks` shrinks every time paged_n_ctx_ is corrected below --
@@ -3146,7 +3150,38 @@ private:
         // shrinks in step with the live pool instead of silently reclaiming
         // the space live_blocks gave up.
         uint64_t overshoot_accum   = 0;
+        // F1 (review finding): a bound the explicit-n_ctx retry narrows on
+        // its own, in pages, independent of overshoot_accum's byte-level
+        // budget shrink -- std::min against SIZE_MAX below is a no-op until
+        // the retry branch sets it, so the auto-fit path (which never
+        // enters that branch) never sees this cap.
+        size_t explicit_spare_cap = static_cast<size_t>(-1);
+        // release_kv_pools() (below) reports how much residency left the
+        // plugin's statistics when the lanes dropped their requests. Measured
+        // on both cards (2026-09-03): 1.0 to 5.5 GiB per pass -- that is the
+        // previous KV pool itself, which the request bindings kept alive,
+        // plus whatever per-request buffers the plugin held; the two cannot
+        // be separated by this reading. An earlier version added the delta
+        // back into `observed` to stay conservative about the request
+        // buffers and double-counted the pool: every cell then refused at
+        // the 4096-token floor. The delta is logged and NOT added back; the
+        // request buffers that return on the first real forward are inside
+        // the reservation margin and remain unmeasured on the record.
+        size_t   released_total = 0;
+        uint64_t last_over      = 0;
+        constexpr int kLastPass = 3;  // the loop below runs passes 0..3
         for (int pass = 0; pass < 4 && !accepted; ++pass) {
+            // F3 (review finding): release the previous pass's pool from
+            // every lane before asking the driver for a new one -- a fresh
+            // InferRequest drops the old KV pool binding immediately,
+            // instead of the retry requesting a second full pool on top of
+            // a resident one. Shared by both the explicit and auto-fit
+            // retries (this call site is common to both), and a no-op on
+            // pass 0 for the pool itself (nothing bound by THIS loop yet --
+            // finding 9: the plateau probe's own pool, if any, is still
+            // resident on pass 0, a pre-existing, small instance of the
+            // same on-top-of-a-resident-pool case).
+            if (pass > 0) released_total += release_kv_pools(device);
             // lanes x n_ctx of live pages, plus headroom for cached prefixes
             // -- but only as much headroom as the prefix cache could ever
             // hold references to. Its host-side budget bounds how many
@@ -3157,20 +3192,51 @@ private:
                 (static_cast<size_t>(paged_n_ctx_) + drafts_max_ + kv_block_tokens_ - 1) /
                     kv_block_tokens_ + 2;
             live_blocks = per_lane_blocks * static_cast<size_t>(lanes);
-            blocks      = live_blocks;
             const long long budget_remaining =
                 static_cast<long long>(budget) - static_cast<long long>(overshoot_accum);
-            if (budget_remaining > 0 && prefix_cache_ != nullptr) {
-                const size_t affordable = static_cast<size_t>(budget_remaining) / kv_block_bytes;
+            // M7 defect fix (measured 2026-09-03: an explicit --n-ctx well
+            // under the admissible max refused at allocation time -- "22.53
+            // GiB resident against a 22.46 GiB ceiling" at n_ctx 32768 --
+            // while omitting --n-ctx served at the same ~22.5 GiB residency
+            // regardless of the token count). `pool_sizing` (fit.h, tested
+            // device-free in test_fit.cpp) is the extracted form of this
+            // block count: the pool is sized in BYTES from whatever the
+            // live request does not use, so `spare_blocks` can dwarf
+            // `live_blocks` whenever the prefix cache's own host budget
+            // wants more entries than the remaining device budget can give
+            // -- exactly what made the pool balloon to near the auto-fit
+            // maximum no matter how small the explicit request was, and
+            // exactly what the overshoot handling below must now trim
+            // before it ever refuses an admissible request.
+            size_t wanted_spare = 0;
+            if (prefix_cache_ != nullptr) {
                 const size_t entries =
                     std::max<size_t>(1, prefix_cache_->budget_bytes() /
                                             std::max<size_t>(la_row_bytes_, 1));
-                const size_t wanted_spare = entries * per_lane_blocks;
-                const size_t spare_room = affordable > live_blocks ? affordable - live_blocks : 0;
-                blocks += std::min(spare_room, wanted_spare);
+                wanted_spare = entries * per_lane_blocks;
             }
+            // F1: once the explicit-n_ctx retry has learned a spare cap
+            // from a prior pass, it bounds every subsequent pass's spare
+            // request too -- otherwise a shrinking cache budget could
+            // still race a stale, larger cap.
+            wanted_spare = std::min(wanted_spare, explicit_spare_cap);
+            const PoolSizing sizing =
+                pool_sizing(live_blocks, wanted_spare, budget_remaining, kv_block_bytes);
+            blocks       = sizing.blocks;
+            spare_blocks = sizing.spare_blocks;
             // A cap for tests: the only way to make the cache evict on demand
             // at a small context. Never below what the lanes themselves need.
+            // Round-3 review, finding 7: this override is test-only (real
+            // loads never set --kv-pool-pages) and does not read
+            // explicit_spare_cap at all -- it resets `blocks` to a FIXED
+            // `cap` independent of whatever the explicit retry above just
+            // narrowed the spare bound to, so under this flag a retry can
+            // re-request the identical capped pool pass after pass until
+            // pool_sizing's own (uncapped) result eventually drops below
+            // `cfg.kv_pool_pages` on its own. Kept as-is rather than made
+            // to interact with explicit_spare_cap -- the flag exists to
+            // force small pools for cache-eviction tests, not to exercise
+            // the retry's own narrowing.
             if (cfg.kv_pool_pages > 0) {
                 const size_t cap =
                     std::max<size_t>(static_cast<size_t>(cfg.kv_pool_pages), live_blocks);
@@ -3178,7 +3244,8 @@ private:
                     log::info("load",
                               "--kv-pool-pages: pool capped at %zu pages (would have been %zu)",
                               cap, blocks);
-                    blocks = cap;
+                    blocks       = cap;
+                    spare_blocks = blocks - live_blocks;
                 }
             }
 
@@ -3231,15 +3298,91 @@ private:
                     accepted = true;
                 }
             }
+            last_over = over;  // finding 3: for the itemized "replay exhausted" throw below
             if (accepted) break;
 
             if (explicit_n_ctx) {
-                throw std::runtime_error(log::format(
-                    "--n-ctx %d could not be honoured at allocation time on %d lane%s (%s); "
-                    "--n-ctx is verify-only and is never lowered automatically. Lower --n-ctx, "
-                    "lower --parallel, or lower --prefill-chunk.",
-                    paged_n_ctx_, lanes, lanes == 1 ? "" : "s",
-                    itemized_terms(paged_n_ctx_).c_str()));
+                // M7 defect fix (round 1) + F1/F4 (round 2) + finding 3/4
+                // (round 3): explicit_retry_decision (fit.h, tested
+                // device-free -- the extracted form of this whole branch)
+                // decides refuse-or-retry AND, when retrying, the spare
+                // cap for the NEXT pass, in one call that agrees with
+                // explicit_overshoot_must_refuse on every input by
+                // construction. `over > 0` only when this pass's failure
+                // was the residency-vs-ceiling reading above; `over == 0`
+                // means a raw allocation exception (fragmentation) with no
+                // residency delta to measure. Passing `pass` (this pass,
+                // 0-indexed) and `kLastPass` lets the function both force
+                // the LAST pass live-only (finding 3: the one direct test
+                // of whether --n-ctx itself is honourable, tried before
+                // the loop can run out on a pool never reduced to just the
+                // request) and refuse immediately if THIS was already the
+                // last pass -- there is no pass 5 to retry into, so
+                // finding 6's "don't print retrying (pass 4/4)" follows
+                // structurally: that log line is only reached when
+                // `decision.refuse` is false, which cannot happen on
+                // `pass == kLastPass`. `decision.n_ctx_unchanged` is
+                // pinned `true` by the function's own signature (it does
+                // not take `paged_n_ctx_` or `live_blocks` at all) --
+                // nothing below reads or writes paged_n_ctx_ either way.
+                const ExplicitRetryDecision decision = explicit_retry_decision(
+                    /*measured_overshoot=*/over > 0, over, spare_blocks, kv_block_bytes, pass,
+                    kLastPass);
+                if (decision.refuse) {
+                    // F6: itemize the pool's own terms in pages, not just
+                    // the fit's byte terms -- a genuine overshoot (over >
+                    // the whole spare) and a reserve-caused one both reach
+                    // this throw, and only the pool terms tell them apart.
+                    // `spare_blocks` here is the ACTUAL value this pass
+                    // saw (0 whenever refusal came from exhaustion or from
+                    // the last-pass forcing; finding 3 -- the last pass
+                    // failing is exactly the reserve-exhausted case, not a
+                    // separate one).
+                    const size_t over_pages =
+                        kv_block_bytes > 0
+                            ? static_cast<size_t>((over + kv_block_bytes - 1) / kv_block_bytes)
+                            : 0;
+                    throw std::runtime_error(log::format(
+                        "--n-ctx %d could not be honoured at allocation time on %d lane%s (%s); "
+                        "the reservation had %zu live page%s and %zu spare page%s left to trim "
+                        "(%zu page%s over) -- --n-ctx is verify-only and is never lowered "
+                        "automatically. Lower --n-ctx, lower --parallel, or lower "
+                        "--prefill-chunk.",
+                        paged_n_ctx_, lanes, lanes == 1 ? "" : "s",
+                        itemized_terms(paged_n_ctx_).c_str(), live_blocks,
+                        live_blocks == 1 ? "" : "s", spare_blocks, spare_blocks == 1 ? "" : "s",
+                        over_pages, over_pages == 1 ? "" : "s"));
+                }
+                // Finding 7: "capping" rather than "trimming N of M" --
+                // the realized spare on the next pass can come out even
+                // lower than `decision.next_spare_cap` if that pass's own
+                // `budget_remaining` is <= 0 (pool_sizing snaps spare to 0
+                // in that case, independent of this cap), so this cap is a
+                // bound this retry is asking for, not a delta guaranteed
+                // to land exactly.
+                if (over > 0) {
+                    log::info("load",
+                              "reservation overshoot on an explicit --n-ctx came from spare pages "
+                              "reserved for the prefix cache (%zu of %zu pages), not the %d-token "
+                              "request -- capping spare at %zu page%s for pass %d/4",
+                              spare_blocks, blocks, paged_n_ctx_, decision.next_spare_cap,
+                              decision.next_spare_cap == 1 ? "" : "s", pass + 2);
+                } else {
+                    // F4: fragmentation, not an arithmetic overshoot -- but
+                    // spare_blocks > 0 here (decision.refuse already
+                    // handled spare_blocks == 0), so retry with a
+                    // synthesized retreat instead of refusing outright,
+                    // same as the auto-fit branch's own `over == 0` guard.
+                    log::info("load",
+                              "allocation failed at a budget that said it fits, with %zu spare "
+                              "pages still reserved for the prefix cache -- no residency reading "
+                              "to size a trim from, so capping spare at %zu page%s for pass %d/4",
+                              spare_blocks, decision.next_spare_cap,
+                              decision.next_spare_cap == 1 ? "" : "s", pass + 2);
+                }
+                explicit_spare_cap = decision.next_spare_cap;
+                overshoot_accum += over;
+                continue;
             }
 
             if (over == 0) {
@@ -3268,11 +3411,28 @@ private:
             paged_n_ctx_ = static_cast<int>(shrunk);
         }
         if (!accepted) {
+            // Finding 3: itemized the same way as the explicit "could not
+            // be honoured" throw above -- live/spare/over pages plus the
+            // fit terms. For the explicit path this line is defensive: the
+            // last pass (forced live-only, see explicit_retry_decision)
+            // always either accepts or throws the itemized "could not be
+            // honoured" message from inside the loop, so it never falls
+            // through to here. The auto-fit path has no such forcing and
+            // can still exhaust all 4 passes without reaching its own
+            // floor, which is what this throw is for.
+            const size_t over_pages =
+                kv_block_bytes > 0
+                    ? static_cast<size_t>((last_over + kv_block_bytes - 1) / kv_block_bytes)
+                    : 0;
             throw std::runtime_error(log::format(
                 "reservation replay exhausted 4 passes without a stable allocation on %d "
-                "lane%s at n_ctx %d; the card is contended or the arithmetic above is wrong -- "
-                "see the log lines above for which.",
-                lanes, lanes == 1 ? "" : "s", paged_n_ctx_));
+                "lane%s at n_ctx %d (%s); the reservation had %zu live page%s and %zu spare "
+                "page%s left to trim (%zu page%s over on the last pass) -- the card is "
+                "contended or the arithmetic above is wrong -- see the log lines above for "
+                "which.",
+                lanes, lanes == 1 ? "" : "s", paged_n_ctx_, itemized_terms(paged_n_ctx_).c_str(),
+                live_blocks, live_blocks == 1 ? "" : "s", spare_blocks,
+                spare_blocks == 1 ? "" : "s", over_pages, over_pages == 1 ? "" : "s"));
         }
 
         pool_ = std::make_unique<BlockPool>(blocks);
@@ -3287,6 +3447,17 @@ private:
                   blocks, kv_block_tokens_,
                   static_cast<double>(blocks * kv_block_bytes) / (1u << 30), per_lane_blocks,
                   lanes, lanes == 1 ? "" : "s", blocks - live_blocks, rows_per_lane_);
+        // F5 (review finding): zero spare is a legal accepted configuration
+        // (the live request alone fit, no room left over), but with a
+        // prefix cache configured it silently means every cached prefix
+        // now competes with the live lanes and evicts on demand -- worth a
+        // warn, not just the pool line above.
+        if (spare_blocks == 0 && prefix_cache_ != nullptr) {
+            log::warn("load",
+                      "accepted pool has 0 spare pages for cached prefixes -- "
+                      "--prefix-cache-mib is configured but every cached prefix will now "
+                      "compete with the live lanes and evict on demand");
+        }
 
         status_.reservation.measured           = true;
         status_.reservation.device_total_bytes = total;
@@ -3309,6 +3480,54 @@ private:
         status_.reservation.n_ctx              = paged_n_ctx_;
 
         if (std::getenv("ARCINT_PROFILE") != nullptr) profile_paged(*lanes_[0]);
+    }
+
+    // F3 (review finding): before the replay loop re-allocates the pool on
+    // a retry, drop the previous pass's binding first. `kv_pool_tensors_.
+    // clear()` in alloc_kv_pools below only drops arcint's own handles --
+    // every lane's InferRequest keeps its pass-N tensors bound until
+    // bind_kv_pools runs again after create_tensor, so without this a
+    // retry requests a whole second pool on top of a resident one instead
+    // of replacing it. A fresh InferRequest per lane is the same remedy
+    // reset_lane_request already uses for a probe that threw, just without
+    // its final bind_kv_pools call -- there is no pool to bind to yet.
+    //
+    // Round-3 review, finding 2: the departing request is not only the KV
+    // pool binding -- on the FIRST call, it is also the plateau probe's
+    // request, still holding the plugin's per-request device buffers
+    // (`inputs_embeds`, `position_ids`, the probe's own output buffer at
+    // its largest probed chunk). Those are real, measured residency (the
+    // probe's `activation_total` was fitted while they were resident), and
+    // dropping the request frees them immediately -- they do not come back
+    // until the first real forward re-allocates them, which happens after
+    // this whole reservation completes. Read device_resident_bytes()
+    // before and after so the caller can charge the freed amount back to
+    // `observed` on every remaining pass (conservative: still owed, not
+    // headroom) instead of it silently reading as freed VRAM.
+    //
+    // Finding 9: `lane->req = {};` first, THEN create the new request --
+    // `lane->req = paged_model_.create_infer_request()` alone evaluates
+    // the RHS (allocating the new request) before the assignment destroys
+    // the old one, so for one instant both are live: a transient second
+    // request per lane, unwanted on a card that is already full.
+    size_t release_kv_pools(const std::string& device) {
+        const size_t before = device_resident_bytes(device);
+        for (auto& lane : lanes_) {
+            lane->blocks.clear();
+            lane->req = {};
+            lane->req = paged_model_.create_infer_request();
+            for (size_t i = 0; i < la_state_names_.size(); ++i) {
+                lane->req.set_tensor(la_state_names_[i], lane->la_tensors[i]);
+            }
+        }
+        kv_pool_tensors_.clear();
+        const size_t after = device_resident_bytes(device);
+        const size_t freed = after < before ? before - after : 0;
+        if (freed > 0) {
+            log::info("load", "released the previous pool and request buffers: %.2f MiB",
+                      static_cast<double>(freed) / (1u << 20));
+        }
+        return freed;
     }
 
     // The KV pool is one allocation shared by every lane: pages are handed out

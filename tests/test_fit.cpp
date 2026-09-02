@@ -453,6 +453,326 @@ TEST(shrink_n_ctx_never_goes_negative) {
     CHECK(r < 32);
 }
 
+// ------------------------------------------------------------- pool_sizing
+
+// The M7 defect, reproduced device-free (measured 2026-09-03, B60/24 GiB
+// card -- 22.71 GiB usable, qwen38 27B dense int4, u8 paged KV at ~36.2
+// KiB/token / ~579.6 KiB per 16-token page, --prefix-cache-mib 8192, one
+// lane, explicit --n-ctx 32768: pass 1 residency 22.53 GiB against a 22.46
+// GiB ceiling). `kBudgetRemainingM7Defect` is NOT read off the card -- like
+// kTotal above, it is engineered so that feeding it through pool_sizing
+// reproduces the measured pass-1 pool to the page.
+//
+// Round-3 review, finding 5 -- a correction to round 2's own record: the
+// retry log line prints `(%zu of %zu pages)` = (spare, blocks), and round
+// 2's fixture (8426 blocks / 6375 spare, a one-page trim) had that right
+// as arithmetic but wrong as a reproduction -- the real cell needed a much
+// deeper trim than one page. Cell f1b (this run): pass 1 was 6,503 of
+// 8,554 pages, trimmed 129 to the accepted 6,374 of 8,425. Cell f2b (same
+// request, DFlash resident): pass 1 was 4,700 of 6,751, trimmed 129 to
+// 4,571 of 6,622. This fixture pins f1b's PASS-1 split, 8,554 blocks /
+// 6,503 spare -- not DESIGN §7.0.2t's itemization, that section carries no
+// such numbers; this is tonight's own measurement.
+// `kWantedSpareUnbounded` stands in for the prefix cache's own entries
+// count (host budget / la_row_bytes_) whenever --prefix-cache-mib is
+// configured at all: it scales with the HOST budget, never the device one,
+// so it is essentially always larger than whatever room the device budget
+// has left over -- as it was here.
+constexpr uint64_t kKvBlockBytesM7Defect      = 593920;      // ~579.6 KiB/block, order of 36.2 KiB/token * 16
+// backend_ov.cpp's per_lane_blocks formula: (n_ctx + drafts_max + kv_block_tokens - 1)
+// / kv_block_tokens + 2, one lane -- 32768 + 3 (drafts_max_) + 15, /16, +2 = 2051.
+constexpr size_t   kLiveBlocksM7Defect        = 2051;
+constexpr long long kBudgetRemainingM7Defect  = 5080391680;  // ~4.73 GiB, engineered so pool_sizing reproduces f1b's measured pass-1 split (8554 pages, 6503 spare) to the page
+constexpr size_t   kWantedSpareUnbounded      = 100000;      // "the prefix cache always wants more"
+// The measured order of f1b's pass-1 overshoot (22.53 GiB resident against
+// a 22.46 GiB ceiling, ~0.07 GiB): the smallest value whose ceil-to-a-page
+// is the record's own 129-page trim (128 full pages is one byte short of
+// it), so pool_sizing + explicit_retry_spare_cap reproduce the record's
+// accepted 8,425 / 6,374 exactly -- see
+// explicit_retry_spare_cap_reproduces_the_f1b_trim below.
+constexpr uint64_t kF1bOvershootBytes         = 76300000;
+
+// The root cause, stated as arithmetic: the pool this configuration would
+// allocate is NOT sized to the 2051 blocks the 32768-token request needs --
+// it is sized to 8554 blocks, with the spare component alone (6503 blocks)
+// dwarfing the live one. This is why residency did not track the explicit
+// request: with --n-ctx omitted, auto-fit runs the same night adopted
+// 155,568 (corrected to 155,376, 0 spare) and, on a second run, 171,488
+// (corrected to 171,312, also 0 spare) -- the explicit request's pool was
+// never actually being sized from the request either way.
+TEST(pool_sizing_2026_09_03_defect_balloons_to_near_the_full_budget) {
+    const PoolSizing sizing = pool_sizing(kLiveBlocksM7Defect, kWantedSpareUnbounded,
+                                          kBudgetRemainingM7Defect, kKvBlockBytesM7Defect);
+    CHECK_EQ(sizing.spare_blocks, 6503ull);
+    CHECK_EQ(sizing.blocks, 8554ull);
+    CHECK(sizing.spare_blocks > sizing.blocks - sizing.spare_blocks);  // spare dwarfs live
+}
+
+// The RED case (task deliverable 2): given that split, the load must NOT
+// refuse -- the overshoot has 6503 blocks of spare capacity to give up
+// before the live 2051-block request is ever touched, and fit_context (via
+// the `wanted > max_ctx` check that runs before this pool is ever sized)
+// already proved the live request alone is admissible.
+//
+// Honestly stated (round-1 review, finding F2): production's rule in this
+// branch was unconditional -- the code simply threw every time this pass
+// was not accepted, reading neither `over` nor any live/spare split (there
+// was no `measured_overshoot` parameter for it to read in the first
+// place; "return measured_overshoot" was never production's rule --
+// "return true" unconditionally is the honest characterization).
+//
+// Round-3 review, finding 1 -- a correction to round 2's own record: rerun
+// against round 2's file (39 tests) and that characterization, TWO tests
+// go red, not one -- this one, and `explicit_overshoot_unmeasured_failure_
+// with_spare_must_not_refuse` below (added in round 2; it asserts the same
+// `!refuse(spare > 0)` shape against a different `measured_overshoot`
+// value, so it fails the same way). Round 2's claim of exactly one was
+// true when written -- the second test did not exist in round 1's file --
+// and was carried forward without being re-checked once round 2 added it.
+// Rerun again against round 3's OWN file (43 tests, after this round's
+// additions), a THIRD test also goes red --
+// `explicit_retry_decision_refuse_agrees_with_explicit_overshoot_must_
+// refuse` below -- for a different, expected reason (see fit.h's comment
+// on explicit_overshoot_must_refuse for why). See the round-3 report for
+// the verbatim `39 cases run, 2 failed` and `43 cases run, 3 failed`
+// output.
+TEST(explicit_overshoot_2026_09_03_defect_must_not_refuse_when_spare_can_absorb_it) {
+    const PoolSizing sizing = pool_sizing(kLiveBlocksM7Defect, kWantedSpareUnbounded,
+                                          kBudgetRemainingM7Defect, kKvBlockBytesM7Defect);
+    CHECK(sizing.spare_blocks > 0);
+    CHECK(!explicit_overshoot_must_refuse(sizing.spare_blocks));
+}
+
+// F1 (HIGH, red-first): a residual overshoot smaller than one KV page must
+// still trim at least one page per retry pass. Round 1's retry shrank only
+// `budget_remaining` (by `overshoot_accum += over;`) and re-ran pool_sizing
+// with the SAME unbounded wanted_spare -- `affordable = budget_remaining /
+// kv_block_bytes` is a floor division, so a one-byte overshoot leaves
+// `budget_remaining` inside the same page bucket and `blocks` comes out
+// byte-identical. Fails against that: `pass2_round1_retry` below asserts
+// the defect (no trim at all) is real, then `explicit_retry_spare_cap`
+// (this fix) is shown to trim exactly the guaranteed minimum of one page.
+TEST(explicit_retry_must_trim_one_page_when_residual_overshoot_is_smaller_than_a_page) {
+    constexpr size_t   live         = 100;
+    constexpr uint64_t block        = 1000;     // a round KV block size for this fixture
+    constexpr long long budget_pass1 = 105600;  // affordable = 105, spare = 5, blocks = 105
+    const PoolSizing pass1 =
+        pool_sizing(live, /*wanted_spare_blocks=*/10000, budget_pass1, block);
+    CHECK_EQ(pass1.blocks, 105ull);
+    CHECK_EQ(pass1.spare_blocks, 5ull);
+
+    constexpr uint64_t over = 1;  // smaller than one KV page (block = 1000)
+    const long long budget_pass2 = budget_pass1 - static_cast<long long>(over);
+
+    // The defect, reproduced: round 1's retry (pool_sizing alone, budget
+    // shrunk by `over`, wanted_spare unchanged) does not trim anything.
+    const PoolSizing pass2_round1_retry =
+        pool_sizing(live, /*wanted_spare_blocks=*/10000, budget_pass2, block);
+    CHECK_EQ(pass2_round1_retry.blocks, pass1.blocks);  // no trim at all -- the defect
+
+    // The fix: cap wanted_spare with explicit_retry_spare_cap first,
+    // guaranteeing >= 1 page trimmed regardless of how small `over` is.
+    const size_t cap = explicit_retry_spare_cap(pass1.spare_blocks, over, block);
+    const PoolSizing pass2_fixed = pool_sizing(live, cap, budget_pass2, block);
+    CHECK(pass2_fixed.blocks < pass1.blocks);
+    CHECK_EQ(pass1.blocks - pass2_fixed.blocks, 1ull);  // exactly the minimum guarantee
+}
+
+// Ties the fixture to the actual record: f1b's real overshoot (~0.07 GiB,
+// kF1bOvershootBytes) trims exactly 129 pages off the pass-1 split
+// (8,554 / 6,503), landing on the record's own accepted pool -- 8,425
+// blocks / 6,374 spare, live unchanged at 2,051.
+TEST(explicit_retry_spare_cap_reproduces_the_f1b_trim) {
+    const PoolSizing pass1 = pool_sizing(kLiveBlocksM7Defect, kWantedSpareUnbounded,
+                                         kBudgetRemainingM7Defect, kKvBlockBytesM7Defect);
+    CHECK_EQ(pass1.blocks, 8554ull);
+    CHECK_EQ(pass1.spare_blocks, 6503ull);
+
+    const size_t cap =
+        explicit_retry_spare_cap(pass1.spare_blocks, kF1bOvershootBytes, kKvBlockBytesM7Defect);
+    CHECK_EQ(pass1.spare_blocks - cap, 129ull);  // the record's own trim count
+
+    const PoolSizing accepted =
+        pool_sizing(kLiveBlocksM7Defect, cap, kBudgetRemainingM7Defect, kKvBlockBytesM7Defect);
+    CHECK_EQ(accepted.blocks, 8425ull);
+    CHECK_EQ(accepted.spare_blocks, 6374ull);
+}
+
+// Round-3 review, finding 4: replaces `explicit_retry_trims_spare_not_the_
+// live_request`, which could not fail for any implementation --
+// `blocks - spare_blocks == live` is an identity of pool_sizing for any
+// input, `live` was a constant the test itself supplied, and the
+// `shrink_n_ctx` comparison tested `shrink_n_ctx`, not the retry. A
+// backend that called `shrink_n_ctx` in the explicit branch would have
+// stayed green against it.
+//
+// The real invariant -- the explicit retry's decision never depends on
+// n_ctx or live_blocks -- is now checked against explicit_retry_decision
+// (fit.h), the actual per-pass decision backend_ov.cpp calls, not a
+// restatement of pool_sizing's arithmetic. What this group does NOT prove:
+// that backend_ov.cpp's call site wires this decision's output to
+// paged_n_ctx_ correctly (i.e. that nothing downstream re-applies
+// shrink_n_ctx on top of it). That is pinned by the on-card log lines --
+// the retry logs print the SAME n_ctx pass to pass, and the accepted pool
+// line prints the n_ctx the request asked for -- and by reading the call
+// site itself, not by a device-free test: a pure function's signature can
+// guarantee it cannot compute a new n_ctx, it cannot guarantee the caller
+// ignores that guarantee and computes one anyway.
+TEST(explicit_retry_decision_never_depends_on_n_ctx_or_live_blocks) {
+    // Two different n_ctx-derived live values (2,051 for --n-ctx 32768,
+    // one lane; 4,098 for --n-ctx 65536, one lane) with budgets tuned so
+    // BOTH land on the same spare_blocks, 6503 -- then explicit_retry_
+    // decision, fed that shared spare_blocks, must produce an identical
+    // result either way, because live/n_ctx are not among its parameters.
+    constexpr size_t live_32k = 2051;
+    constexpr size_t live_64k = 4098;
+    const long long budget_32k =
+        (static_cast<long long>(live_32k) + 6503) * static_cast<long long>(kKvBlockBytesM7Defect);
+    const long long budget_64k =
+        (static_cast<long long>(live_64k) + 6503) * static_cast<long long>(kKvBlockBytesM7Defect);
+    const PoolSizing sizing_32k =
+        pool_sizing(live_32k, kWantedSpareUnbounded, budget_32k, kKvBlockBytesM7Defect);
+    const PoolSizing sizing_64k =
+        pool_sizing(live_64k, kWantedSpareUnbounded, budget_64k, kKvBlockBytesM7Defect);
+    CHECK_EQ(sizing_32k.spare_blocks, 6503ull);
+    CHECK_EQ(sizing_64k.spare_blocks, 6503ull);
+    CHECK(sizing_32k.blocks != sizing_64k.blocks);  // the pools themselves are NOT identical
+
+    const ExplicitRetryDecision d_32k = explicit_retry_decision(
+        /*measured_overshoot=*/true, kF1bOvershootBytes, sizing_32k.spare_blocks,
+        kKvBlockBytesM7Defect, /*pass=*/0, /*last_pass=*/3);
+    const ExplicitRetryDecision d_64k = explicit_retry_decision(
+        /*measured_overshoot=*/true, kF1bOvershootBytes, sizing_64k.spare_blocks,
+        kKvBlockBytesM7Defect, /*pass=*/0, /*last_pass=*/3);
+    CHECK_EQ(d_32k.next_spare_cap, d_64k.next_spare_cap);  // identical despite different live/n_ctx
+    CHECK(d_32k.n_ctx_unchanged);
+    CHECK(d_64k.n_ctx_unchanged);
+}
+
+TEST(explicit_retry_decision_forces_the_last_pass_live_only) {
+    // Finding 3: the cap computed for the pass AFTER pass 2 (0-indexed) --
+    // i.e. for pass 3, the last one -- is always 0, regardless of
+    // over/spare_blocks/measured: the one direct test of whether --n-ctx
+    // itself is honourable must be tried before the loop can run out.
+    const ExplicitRetryDecision d = explicit_retry_decision(
+        /*measured_overshoot=*/true, /*over=*/1, /*spare_blocks=*/6503, kKvBlockBytesM7Defect,
+        /*pass=*/2, /*last_pass=*/3);
+    CHECK(!d.refuse);
+    CHECK_EQ(d.next_spare_cap, 0ull);
+    CHECK(d.n_ctx_unchanged);
+}
+
+TEST(explicit_retry_decision_refuses_when_the_last_pass_itself_fails) {
+    // The last pass failing IS the exhausted-reserve case (DESIGN's
+    // corollary): there is no pass 5 to retry into, so this refuses even
+    // with spare_blocks > 0 here (a pathological --kv-pool-pages scenario,
+    // finding 7, where the test-only cap can leave spare nonzero on any
+    // pass) -- there is nowhere left for a computed cap to be used.
+    const ExplicitRetryDecision d = explicit_retry_decision(
+        /*measured_overshoot=*/true, /*over=*/1, /*spare_blocks=*/6503, kKvBlockBytesM7Defect,
+        /*pass=*/3, /*last_pass=*/3);
+    CHECK(d.refuse);
+    CHECK_EQ(d.next_spare_cap, 0ull);
+}
+
+TEST(explicit_retry_decision_refuse_agrees_with_explicit_overshoot_must_refuse) {
+    CHECK_EQ(explicit_retry_decision(true, 1, 0, kKvBlockBytesM7Defect, 0, 3).refuse,
+             explicit_overshoot_must_refuse(0));
+    CHECK_EQ(explicit_retry_decision(true, 1, 6503, kKvBlockBytesM7Defect, 0, 3).refuse,
+             explicit_overshoot_must_refuse(6503));
+}
+
+// A genuine overshoot (task deliverable 3): once prior replay passes have
+// accumulated enough measured overshoot that the remaining budget covers
+// only the live request -- spare_room is 0 before wanted_spare is even
+// consulted -- the pool_sizing split has nothing left to trim, and refusal
+// must still fire. This is the case that must NEVER be silently lowered.
+TEST(pool_sizing_budget_exhausted_leaves_no_spare) {
+    const long long budget_remaining_exhausted =
+        static_cast<long long>(kLiveBlocksM7Defect) * static_cast<long long>(kKvBlockBytesM7Defect);
+    const PoolSizing sizing = pool_sizing(kLiveBlocksM7Defect, kWantedSpareUnbounded,
+                                          budget_remaining_exhausted, kKvBlockBytesM7Defect);
+    CHECK_EQ(sizing.spare_blocks, 0ull);
+    CHECK_EQ(sizing.blocks, kLiveBlocksM7Defect);
+}
+
+TEST(explicit_overshoot_genuine_when_spare_already_zero_must_refuse) {
+    CHECK(explicit_overshoot_must_refuse(/*spare_blocks=*/0));
+}
+
+// F4 (MEDIUM, red-first, rule change): a raw allocation exception
+// (fragmentation, no residency reading -- `measured_overshoot` false in
+// round 1's rule) used to refuse immediately regardless of spare_blocks.
+// Round 1's own comment at this call site called that "matching
+// backend_ov.cpp's `over == 0` guard" -- backwards: that guard RETRIES on
+// an unmeasured failure with a synthesized retreat, it does not refuse;
+// only the explicit-n_ctx branch refused outright. Fails against round 1's
+// rule (`!measured_overshoot || spare_blocks == 0`, unconditionally true
+// whenever measured_overshoot is false) -- run red before the fix lands;
+// see the round-2 report for the verbatim red output. `6503` is f1b's own
+// measured pass-1 spare (round-3 review, finding 8: round 2 used an
+// invented 4691 here, flagged as not a measurement).
+TEST(explicit_overshoot_unmeasured_failure_with_spare_must_not_refuse) {
+    CHECK(!explicit_overshoot_must_refuse(/*spare_blocks=*/6503));
+}
+
+// The refuse rule now reads spare_blocks alone: an unmeasured failure with
+// spare already at zero still refuses, same as a measured one -- there is
+// nothing left to retreat to either way.
+TEST(explicit_overshoot_unmeasured_failure_with_zero_spare_must_refuse) {
+    CHECK(explicit_overshoot_must_refuse(/*spare_blocks=*/0));
+}
+
+// synthesize_spare_retreat (F4): the retry's retreat when there is no
+// residency reading to size a trim from -- halve spare, minimum one page
+// trimmed, mirroring explicit_retry_spare_cap's >= 1 page guarantee and the
+// auto-fit branch's own `over == 0` synthesis.
+TEST(synthesize_spare_retreat_halves_and_strictly_decreases) {
+    CHECK_EQ(synthesize_spare_retreat(100), 50ull);
+    CHECK_EQ(synthesize_spare_retreat(2), 1ull);   // trim max(1, 1) = 1
+    CHECK_EQ(synthesize_spare_retreat(1), 0ull);   // trim max(1, 0) = 1
+    CHECK_EQ(synthesize_spare_retreat(0), 0ull);   // nothing to retreat from
+}
+
+TEST(synthesize_spare_retreat_reaches_zero_and_terminates) {
+    size_t spare      = 6503;
+    int    iterations = 0;
+    while (spare > 0 && iterations < 32) {
+        const size_t next = synthesize_spare_retreat(spare);
+        CHECK(next < spare);  // strict decrease every call
+        spare = next;
+        ++iterations;
+    }
+    CHECK_EQ(spare, 0ull);  // reaches the refuse condition in finite steps
+}
+
+// A small prefix-cache budget (a small wanted_spare) is capped by what it
+// asks for, not by the whole remaining device budget -- the mechanism only
+// balloons the pool when the cache genuinely wants more than the budget can
+// spare (as it usually does, per the defect above).
+TEST(pool_sizing_caps_spare_at_what_the_cache_actually_wants) {
+    const PoolSizing sizing =
+        pool_sizing(kLiveBlocksM7Defect, /*wanted_spare_blocks=*/10, kBudgetRemainingM7Defect,
+                   kKvBlockBytesM7Defect);
+    CHECK_EQ(sizing.spare_blocks, 10ull);
+    CHECK_EQ(sizing.blocks, kLiveBlocksM7Defect + 10);
+}
+
+TEST(pool_sizing_no_prefix_cache_is_live_only) {
+    const PoolSizing sizing = pool_sizing(kLiveBlocksM7Defect, /*wanted_spare_blocks=*/0,
+                                          kBudgetRemainingM7Defect, kKvBlockBytesM7Defect);
+    CHECK_EQ(sizing.spare_blocks, 0ull);
+    CHECK_EQ(sizing.blocks, kLiveBlocksM7Defect);
+}
+
+TEST(pool_sizing_non_positive_budget_is_live_only) {
+    const PoolSizing sizing =
+        pool_sizing(kLiveBlocksM7Defect, kWantedSpareUnbounded, /*budget_remaining_bytes=*/0,
+                   kKvBlockBytesM7Defect);
+    CHECK_EQ(sizing.spare_blocks, 0ull);
+    CHECK_EQ(sizing.blocks, kLiveBlocksM7Defect);
+}
+
 TEST(shrink_n_ctx_reduction_scales_with_lanes) {
     // The same overshoot is freed by a smaller per-lane token reduction when
     // more lanes each give some up (design's replay: "n_ctx = floor_to_page(

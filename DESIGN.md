@@ -2571,8 +2571,12 @@ Three measurements set the shape of the final arithmetic:
   the operator had found by hand — and one audit pass still trims to a
   served 155,488. Both runs end at the same number by measurement, which is
   the point: the audit corrects whatever the estimate got wrong. An
-  explicit `--n-ctx` is never lowered; the fit then runs verify-only and
-  refuses with the itemized terms.
+  explicit `--n-ctx` is never lowered; the fit then runs verify-only,
+  trimming the reserve pages held for the prefix cache first, and refuses
+  with the itemized terms only once that reserve is at zero — the last of
+  four replay passes is forced to a live-only request (zero reserve)
+  expressly to test that directly, rather than left to a trim sequence
+  that a small overshoot need not drive to zero within the pass budget.
 - **Deferred commit is now audited, not assumed.** Every offload load logs
   the committed-vs-requested comparison ("the driver reports 5.06 GiB of the
   5.34 requested — deferred commit; the reservation keeps the analytic
@@ -3228,6 +3232,20 @@ compose:
 2. live pages are a fixed **count**, `n_ctx / kv_block_tokens + 2` per lane,
    independent of precision;
 3. the reserve is simply the difference.
+
+**The corollary for an explicit `--n-ctx` that overshoots at allocation
+time.** The replay loop's explicit retry (§7.0.2t; `fit.h`'s `pool_sizing`
+and `explicit_retry_decision`) uses exactly this split: the reserve absorbs
+the overshoot first, one KV page at a time at minimum, and the retry
+refuses only once the reserve is at zero. That is checked directly rather
+than assumed: of the four replay passes, the last is forced to a live-only
+request regardless of how much a trim sequence would otherwise have left
+standing, so "the reserve is exhausted" is a fact about that pass's own
+`spare_blocks`, not an inference from having run out of passes. It is the
+same "everything that costs bytes comes out of the reserve" rule as the
+ceiling corollary below, applied per retry pass instead of per `--n-ctx`
+value — the request itself is a fixed count and, same as live pages above,
+cannot absorb it.
 
 Checked against both configurations to the page: 37918 − 16386 = 21532 and
 21477 − 16386 = 5091, with `262144 / 16 + 2 = 16386` in each. So **everything
