@@ -2522,6 +2522,8 @@ table as plugin work: the upload path wants batching/async prefetch (the
 same pattern Qwen3.8-Flash-Next uses for its host-resident n-gram table) and
 an LRU that actually retains the hot set. Until then, context on a full card
 comes from KV precision and lane budgets, not from expert eviction.
+*(Superseded 2026-09-02, second half: with the slot pool placed device-side
+and the upload path made asynchronous, the dial works — §7.0.2v.)*
 
 #### 7.0.2t The honest reservation, and where the slot pool actually lives (2026-09-02)
 
@@ -2624,6 +2626,67 @@ B60 with b7c1 int4, u8 KV, one lane, n_ctx 131,072, host otherwise idle
   the fix for §7.0.2o's dense read — stays open behind one named
   discriminator: compile the head through the packaged plugin inside the
   engine's pipeline rather than the tooling runtime.
+
+#### 7.0.2v The offload dial works after all: device-tier slots, measured (2026-09-02)
+
+§7.0.2s closed with "a fit lever, not a context dial." That verdict is
+overturned by four plugin patches (`patches/0004`–`0007`: perf counters, a
+device-resident two-tier slot pool behind a per-compile byte budget, async
+batched miss-uploads through a provider-owned staging ring, and the removal
+of an unconditional per-MoE-layer `stream.finish()` on in-order queues) plus
+the §7.0.2t root cause: the slot pool sat in host memory *by construction* —
+the allocator's lockable-preferred path returns `usm_host`, with no OTD
+special case, so every resident expert streamed across PCIe on every token.
+
+The sweep (35B q4, the 16 GiB card, u8 KV, one lane, n_ctx 65,536, 16-token
+probe, `MOE_OTD_DEVICE_POOL_BYTES` = 8 GiB where capped):
+
+| configuration | decode | VRAM / GTT (fdinfo) |
+|---|---|---|
+| ratio 25, unpatched plugin | 0.4 t/s | 2.8 / 12.2 GiB |
+| ratio 25, patched, pool 0 | 2.5 t/s | 2.8 / 12.3 GiB |
+| ratio 10, 8 GiB pool | 4.2 t/s | 10.8 / 6.8 GiB |
+| ratio 25, 8 GiB pool | 4.9 t/s | 10.8 / 4.3 GiB |
+| ratio 50, 8 GiB pool | **9.1 t/s** | 10.8 / **0.36** GiB |
+
+The async/finish patches alone are 6× on the host path; the device tier
+takes the 35B on this card from 0.4 to 9.1 t/s — 23× — with the fdinfo
+VRAM/GTT split flipping exactly as the pool budget dictates (the designed
+red-first observable: an unpatched or misconfigured world cannot show the
+flip). At ratio 50 the whole remaining pool fits the device tier and GTT
+drops to 0.36 GiB. The fusion-impact obligation is discharged: the base
+model still fuses ×40 under the patched plugin (graph dump). The property is
+opt-in, default 0 — behavior without it is byte-for-byte the pre-patch path.
+
+The counters told the rest once their print path was fixed (it was gated on
+the plugin's verbosity level, not on the collection flag — found in review,
+routed through an always-on channel). One ratio-25 capped run: `gpu_hits
+11,695 / misses 5,286` (68.9%, consistent with §7.0.2s's 74%),
+`tensor_loads 47,574 = misses × 9` — nine constants per missed expert,
+three GEMMs times weight/scale/zero-point — which resolves §7.0.2s's
+reconciliation flag without a retraction: 42.4k was tensors, ~12k was
+experts, the multiplier is 9. `avg_gpu_copy_us = 5` against the old 309
+µs/tensor; `device_slot_buffers 241 / host 119` under the 8 GiB cap;
+`alloc_fallbacks 0`; and `evictions = 0`, which by the design's own
+decision rule (pin only if evictions exceed 5% of acquisitions) defers the
+hot-set pin with a measurement rather than a hunch. Still owed: the
+equivalence/Prüfstand gates for the patched paths before any production
+rollout.
+
+The same window also proved the M8 groundwork's fail-loud ladder on real
+hardware: an unpatched plugin answers `--paged-kv u8:i4` with "Option not
+found: VALUE_CACHE_PRECISION … refusing rather than silently falling back",
+and the per-port audit caught a genuine surprise on the way — the plugin
+compiles a u8 KV request as i8 storage ports (same width, its own
+signedness), which the audit now accepts as an alias while still refusing
+any actual bitwidth change. And a boundary for the head-fusion question
+(§7.0.2u): the tooling runtime *does* fuse the base model when compiled from
+Python with the offload properties (forty layers, positive control), while
+the exported head — structurally identical to the fusing block under every
+constraint a source-level walk can express — is still rejected by the
+matcher. The walk has a blind spot the matcher does not; the named next
+instrument is matcher logging on a debug build, and until it speaks, the
+head serves unfused.
 
 #### 7.0.2r DFlash2: the external-drafter hook gets a real drafter (2026-09-01)
 
