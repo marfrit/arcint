@@ -508,20 +508,32 @@ def moe_block_tiled(y, w, p, topk, norm_topk):
 
     # weighted sum over experts: Transpose -> Reshape -> Unsqueeze -> Multiply -> ReduceSum.
     # Ground truth splits M back into [B,S] on BOTH operands before the
-    # Multiply (its Reshape383 takes the down-output to rank 4 [E,B,S,H],
-    # its Reshape418/Unsqueeze419 take the router weights to rank 4
-    # [E,B,S,1]) -- this function used to stay flat at [E,M,H] and reshape
-    # back to [B,S,H] once, at the very end, after the ReduceSum. The two
-    # are mathematically equivalent (the reshape and the axis-0 ReduceSum
-    # commute), but window-D fusion checking flagged the flat form as a
-    # remaining divergence, so it is now reshaped to rank 4 before the
-    # Multiply/ReduceSum, matching literally; the ReduceSum(axis=0) then
-    # lands directly on [B,S,H], with no separate reshape-back needed.
-    outs4 = op.reshape(outs, op.concat([i32v(E), shape_part(y, 0, 2), i32v(H)], axis=0),
-                       special_zero=False)                                # [E,B,S,H]
+    # Multiply. The FIRST attempt at this (extracting both B and S
+    # explicitly via shape_part(y,0,2), with no wildcard dim in either
+    # Reshape's target) matched byte-for-byte against ground truth's node
+    # types, but check_tiled_pattern.py's constraint walk against the real
+    # exported head found it FAILING at E1 (end_reshape.type observed
+    # MatMul, expected Reshape): OpenVINO 2026.4.0's own shape-inference/
+    # simplification during validate_nodes_and_infer_types() /
+    # ov.save_model() silently ELIMINATES that Reshape (and the matching
+    # router-weight one), because it can prove -- with every target
+    # dimension supplied as an explicit, already-known value -- that the
+    # rank-4 reshape carries no information a rank-3 [E,M,H]/[E,M,1] tensor
+    # didn't already have, and folds it back to rank 3 before the fusing
+    # pass ever runs (reproduced locally on OpenVINO 2026.4.0 with a tiny
+    # synthetic layer; 2026.3.1 here does not do this, which is why the
+    # earlier local suite never caught it). Ground truth's own Reshape383
+    # survives on the SAME 2026.4.0 build (confirmed: the positive-control
+    # base model matches 40/40 in check_tiled_pattern.py) -- the difference
+    # is that ground truth supplies only ONE dim (B, via a Gather) and
+    # leaves the other (S) as a literal -1 wildcard, forcing a genuine
+    # runtime division the optimizer cannot fold away. Reproduced here: B is
+    # extracted explicitly, S is left as -1.
+    outs4 = op.reshape(outs, op.concat([i32v(E), shape_part(y, 0, 1), i32v(-1), i32v(H)], axis=0),
+                       special_zero=False)                                # [E,B,-1(S),H]
     w_t = op.transpose(weights, op.constant(np.array([1, 0], dtype=np.int32)))  # [E,M]
-    w_r = op.reshape(w_t, op.concat([i32v(E), shape_part(y, 0, 2)], axis=0),
-                     special_zero=False)                                  # [E,B,S]
+    w_r = op.reshape(w_t, op.concat([i32v(E), shape_part(y, 0, 1), i32v(-1)], axis=0),
+                     special_zero=False)                                  # [E,B,-1(S)]
     w_u = op.unsqueeze(w_r, i32v(-1))                                     # [E,B,S,1]
     mixed = op.reduce_sum(op.multiply(outs4, w_u), i32v(0), keep_dims=False)  # [B,S,H]
 
