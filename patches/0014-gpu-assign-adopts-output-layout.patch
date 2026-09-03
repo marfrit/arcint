@@ -45,8 +45,10 @@
 # int4 head had failed - two variables changed there, graph and weight
 # precision, and which one moved that edge was not isolated; the SERVED
 # int4 head on the unpatched plugin disables at 2,155 and 2,230; with this patch the SERVED head drafts at
-# 2,481 and 3,251 (1.88 accepted per cycle over 64 tokens). The served
-# head at 2,155 / 2,230 under this patch is an open red case until run.
+# 2,481 and 3,251 (1.88 accepted per cycle over 64 tokens), and, run
+# afterwards with the memory guard in place, at 1,966 / 2,155 / 2,266 /
+# 2,481 / 3,251 (3.76 / 2.13 / 2.67 / 1.83 / 1.88) - the served head's own
+# failing prompts pass under this patch.
 # Longer prompts and a 3,000-token decode are in the record below; the
 # decode grows the state a few rows per step and does not enter this
 # branch, so it is not evidence about the patch.
