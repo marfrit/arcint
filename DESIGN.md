@@ -3386,15 +3386,38 @@ single-execute harness, absent at u8 which allocates no such buffer,
 and the fix that turned the 56k cell green — and a second reading has the plugin sizing those buffers from the
 previous forward's partition count, so that the first chunk into a new
 partition writes one partition past the buffer; a build carrying only
-the fresh sizing passes 384 and 466 partitions on that card too. Two
-single changes each clear the crash, so either both defects are real or
-one fix merely shifts the other's reallocation pattern; a build carrying
-only the rebind is the discriminator that decides which, and patch 0016
-(the fresh sizing) is written and waiting on it. The 16 GiB card's failure at the
+the fresh sizing passes 384 and 466 partitions on that card too. Two builds that only alter the finalization kernel — one forcing its
+global-memory arm, one doubling its register capacity — pass the cell
+as well. So every perturbation tried clears it, host-side or kernel-side,
+while the untouched plugin had crashed in every run at 384 partitions
+and beyond that day (a reading superseded a few hours later, below):
+the profile of a fault whose window closes under any change of timing, which leaves the
+rebind as the one candidate that carries a mechanism rather than a
+perturbation; a build carrying only the rebind passes the cell as well — and then an
+untouched control, run back to back, passed too. So the seam is not
+sharp and the day's matrix is a tally, not a proof: the untouched
+plugin crashed in five of six runs past 98k tokens on that card, every
+changed build passed in seven of seven runs (the fresh sizing and the
+full patch twice each, the three others once), single samples each; suggestive of
+the rebind, decided by nothing yet; patch 0016 (the fresh sizing)
+corrects a real stale count regardless and ships as hardening, with its
+header saying exactly this much and no more. The signature itself is
+not ours alone: the xe driver's "Engine memory CAT error" is the GuC's
+catastrophic-error notification, which the driver treats as an engine
+reset without decoding the hardware's fault type, and the same
+notification under sustained LLM inference on Battlemage is an open
+issue in the driver's tracker (drm/xe/kernel work item 8390, 2026),
+where the reporters found the compute runtime's USM pool manager
+implicated and its debug switch (`NEOReadDebugKeys=1
+UseUsmPoolManager=0`) a mitigation; Alchemist lacks the recoverable
+page-fault path that turns such an access into a report, which is
+consistent with the 16 GiB card's silence. The switch is on this
+record's list as a discriminator. The 16 GiB card's failure at the
 bound with the 165,680-token pool is a different animal: the same 119k
-cell crashed three times and passed twice the same evening, so on that
-card the fault is not deterministic and the bound's own path is not
-what faults; the exact boundary
+cell crashed three times and passed four times the same evening, and a
+variant that retires the previous intermediate buffers only after the
+stream has finished passed twice of twice, so on that card the fault is
+not deterministic and the bound's own path is not what faults; the exact boundary
 between 131k and 165k tokens is the open question (no constant of 8,192
 or 131,072 exists on this path in the plugin, the patches or the engine,
 and the device's single-allocation limits are far away); the binding fix stays in the patch as a real defect fixed,

@@ -519,13 +519,46 @@ different nightly is a different ABI.
   micro-SDPA path and allocates no such buffers. The 16 GiB card serves
   the same cells; it has no GPU fault reporting, and why the fault does
   not surface there is not measured. The plugin's own
-  single-execute harness passes at 170,000 tokens. Two plugin-side
-  changes each clear it on the card: patch 0015's forced
-  kernel-argument rebind after an intermediate-buffer reallocation, and
-  a one-hunk fresh sizing of those buffers (patch 0016, written, not in
-  any package); which one is the writer is under measurement. Until a
-  plugin level carrying either ships, treat `--paged-kv u8:i4` prompts
-  beyond about 98k tokens as unsafe on cards that report GPU faults.
+  single-execute harness passes at 170,000 tokens.
+
+  CORRECTED tally (a repeated untouched-control run changed the read;
+  kept on the record rather than silently edited, per DESIGN §7.0.1): at
+  this 384-partition cell, on the 24 GB card, past 98k tokens, that day
+  -- the untouched plugin crashed in FIVE of six runs (98,147 tokens
+  once, 100k once, 119k twice with a 131,072-token pool, 119k once with
+  a 165,680-token pool) and PASSED once (98,147 tokens, 865 s) -- the
+  seam is not deterministic. Every changed build tried -- a fresh sizing
+  of the intermediate buffers (patch 0016), a forced global finalization
+  arm, a doubled register-arm capacity, patch 0015's argument rebind
+  taken alone, and the full patch 0015 at its unbounded setting --
+  passed in seven of seven runs, but each is a single sample against a
+  baseline that itself passes 1 run in 6, so this is SUGGESTIVE of the
+  argument rebind (the only one of the changes with a mechanism behind
+  it, read from the plugin source) and decided by nothing yet; patch
+  0016's fresh sizing still ships as hardening, not as a proven fix.
+  Next instruments, both written and running: a trace build that logs
+  the memory handle bound at each enqueue against the handles freed at
+  each reallocation, and a multi-execute harness test that grows the
+  past chunk by chunk.
+
+  Context found in the driver's own tracker, kept attributed rather than
+  asserted as this repository's own finding: the kernel-log signature
+  ("Engine memory CAT error", class `ccs`, then an engine reset) is the
+  GPU firmware's (GuC's) catastrophic-error notification, which the
+  driver treats as a bare engine reset without decoding the underlying
+  fault type. The same notification under sustained LLM inference on
+  this card's generation (Battlemage) is an OPEN upstream item (a
+  `drm/xe` kernel work item, #8390, opened 2026), where the compute
+  runtime's USM pool manager was implicated and
+  `NEOReadDebugKeys=1 UseUsmPoolManager=0` mitigated it in that report;
+  that environment switch is on this record's own discriminator list,
+  not yet run here. The 16 GiB card's silence is consistent with -- not
+  proven by -- its generation (Alchemist) lacking the recoverable
+  page-fault path Battlemage has.
+
+  Until a plugin level carrying the argument rebind ships, treat
+  `--paged-kv u8:i4` prompts beyond about 98k tokens as unsafe on cards
+  that report GPU faults.
 
 - Drafting II measured (M11, `DESIGN.md` §7.0.2z): four host-side levers on
   the DFlash2 chain, all free of training. Viterbi over the selector's
