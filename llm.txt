@@ -147,7 +147,7 @@ budget of zero). Each card lands where its memory says: B60 chunk 2048, A770
 refused at startup with every term. At request time, a third concurrent request
 is a 503 carrying the same arithmetic (--queue-timeout S restores queueing).
 
-Verification: 287 unit cases, a 61-check curl round-trip, a lane-accounting
+Verification: 306 unit cases, a 61-check curl round-trip, a lane-accounting
 stress (200 requests, 24-way, 8 lanes, both queueing and refusing), an
 equivalence suite and a concurrency suite that run where the card is. Clean
 under ASan and UBSan on x86_64.
@@ -294,7 +294,7 @@ decode-path redirect, 0013 per-expert routing histogram.
   generated from the binary's --help (src/config.cpp usage_text) at release
   time; the source is authoritative when the two disagree.
 
-## Command-line options (arcint --help, 0.2.13)
+## Command-line options (arcint --help)
 
 ```
 usage: arcint [options]
@@ -423,6 +423,19 @@ any of them flips the served sampler provenance to 'operator')
                             drafter per server: conflicts with --mtp on
                             and --draft N
   --dflash-device DEV       run the drafter elsewhere (default: --device)
+  --dflash-block N          override the block size the drafter's config.json
+                            declares, N in [2, 32] (default: 0, take the json).
+                            Needs --dflash
+  --dflash-select MODE      greedy | viterbi: selector strategy over the DFlash
+                            lattice (default: greedy, today's behaviour). viterbi
+                            finds the exact maximum-score path instead of
+                            committing row by row
+  --dflash-lambda X         weight on the bilinear codebook term of the selector's
+                            score, unary + X*bilinear (default: 1.0). 0 scores on
+                            the target lm_head logit alone
+  --dflash-topk K           override the selector's top-k the drafter's config.json
+                            declares, K in [1, 64] (default: 0, take the json).
+                            Needs --dflash
   --mtp-layer WHICH         auto | reconstructed | exported: which MTP layer graph to
                             draft with when the artifact carries both (default: auto,
                             the reconstructed one when present)
@@ -445,7 +458,7 @@ misc
   stop, toolcall, chat, prefix_cache, block_pool, turnstile), exec/ (backend
   interface, stub, backend_ov), api/ (error, handlers), http/ (cpp-httplib
   wiring).
-- tests/: 287 unit cases (hand-rolled harness, no framework), roundtrip.sh
+- tests/: 306 unit cases (hand-rolled harness, no framework), roundtrip.sh
   (48 curl checks, both wired into ctest), concurrency/stress.sh (lane
   accounting, stub-only, also in ctest), and equivalence/run.sh plus
   concurrency/run.py, which need a real card.

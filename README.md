@@ -398,11 +398,12 @@ reference implementation the equivalence suite compares against.
 | M7 fit pass | done — two-ledger reservation measured; an explicit `--n-ctx` is verify-only, never lowered, and its refusal trims the prefix-cache reserve first |
 | M8 asymmetric KV (`--paged-kv u8:i4`) | done — serves, 10/10; +28% context (8.8 vs 11.3 KiB/token); owed: prefill price, prefix byte-exactness |
 | M9 device-tier expert slot pool | done — 35B on the 16 GiB card 0.4 t/s (ratio 25, unpatched) → 9.1 (ratio 50 / 8 GiB pool, 16-token probe) and 10.4 (64-token probe) |
+| M11 drafting II | measured — free levers on the DFlash chain: Viterbi negative, blocks 12/16 trade throughput for tokens per cycle, ngram below plain decode; the oracle floors the re-rank headroom at +0.74 per cycle; adapter is a decision, tree not pursued |
 | M12 dispatch pin, tiled exporter | done — `--pin-dispatch` measured null on a quiet host, opt-in; exporter `--moe-lowering tiled` |
 | M13 vision reserved | done — `--vision` refused; vision IRs reported at load and never loaded (coder: 6 files, 428.3 MiB on disk) |
 | M14 host compute tier (`--moe-cpu-tier`) | done — 35B on the 16 GiB card 15.0/15.5 t/s vs 10.4/10.6 at ratio 50 / 8 GiB; 14.1/14.8 vs 7.4/7.5 at ratio 75 / 5 GiB; text byte-identical, 10/10 |
 
-Verification: 287 unit cases, a 61-check curl round-trip, a lane-accounting
+Verification: 306 unit cases, a 61-check curl round-trip, a lane-accounting
 stress (200 requests, 24-way, 8 lanes, queueing and refusing), an equivalence
 suite and a concurrency suite that run where the card is. Clean under ASan and
 UBSan on x86_64.

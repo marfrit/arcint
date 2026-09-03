@@ -76,6 +76,7 @@ add_library(arcint_core STATIC
   src/core/stop.cpp
   src/core/toolcall.cpp
   src/core/chat.cpp
+  src/core/dflash_select.cpp
   src/core/drafter.cpp
   src/core/turnstile.cpp
   src/exec/backend_stub.cpp
@@ -174,6 +175,7 @@ if(ARCINT_TESTS)
     tests/test_stop.cpp
     tests/test_registry.cpp
     tests/test_chat.cpp
+    tests/test_dflash_select.cpp
     tests/test_drafter.cpp
     tests/test_text.cpp
     tests/test_config.cpp

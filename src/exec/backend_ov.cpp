@@ -72,6 +72,7 @@
 #include "exec/fit.h"
 #include "core/artifact.h"
 #include "core/block_pool.h"
+#include "core/dflash_select.h"
 #include "core/drafter.h"
 #include "core/prefix_cache.h"
 #include "core/sampler.h"
@@ -784,6 +785,13 @@ public:
         std::vector<float> dflash_pending;
         size_t             dflash_base = SIZE_MAX;   // abs pos of pending[0]
 
+        // M11 dump instrument (the M11 design note (not in the repository) O): the lattice
+        // dflash_select built for the cycle currently in flight, stashed here
+        // because the drafts/accepted/realized half of the dump line is only
+        // known later, back in the decode loop's verify step. Only populated
+        // when ARCINT_DFLASH_DUMP is set.
+        nlohmann::json     dflash_dump_lattice;
+
         // The GDN checkpoint rows this lane owns (its own device tensors, not a
         // window into a shared table: a row write copies the whole tensor back,
         // and sharing one would let a snapshot in one lane zero the other's
@@ -839,6 +847,36 @@ public:
                 prefix_cache_->set_demote([this](PrefixCache::Entry& e) { return demote_entry(e); });
             }
         }
+        // M11 dump instrument (the M11 design note (not in the repository) O): opt-in, read once. One
+        // JSON line per verify cycle that actually drafted through DFlash;
+        // dflash_select stashes the lattice for that cycle on the lane, and
+        // the decode loop appends the drafts/accepted/realized-tokens half
+        // once the verify forward's logits are in hand.
+        //
+        // Critical-path cost when set (review follow-up): inside
+        // dflash_draft's with_turn (holding the device turn),
+        // dflash_dump_build_lattice computes the K x K x r transition matrix
+        // per row -- the same FLOP count as a second Viterbi pass -- and
+        // serialises it plus drafts_proposed/realized to JSON; the decode
+        // loop's realized-token pass adds `drafts.size()` extra pick_row
+        // calls, each copying the whole vocab row into logit_scratch.
+        // Estimated 1-2 ms against a ~70 ms verify cycle (K=16, r=128, block
+        // 8) -- worth stating in the cell whenever a dump is on, not just
+        // measuring. When unset the cost is one atomic bool load per cycle
+        // and nothing else; the file is opened once here, not once per
+        // cycle, and dflash_dump_write only ever appends to it under
+        // dflash_dump_mutex_.
+        if (const char* env = std::getenv("ARCINT_DFLASH_DUMP")) {
+            dflash_dump_path_ = env;
+            dflash_dump_file_.open(dflash_dump_path_, std::ios::app);
+            if (dflash_dump_file_.good()) {
+                dflash_dump_enabled_.store(true, std::memory_order_release);
+            } else {
+                log::warn("dflash", "cannot open %s for the dump; disabling it",
+                          dflash_dump_path_.c_str());
+            }
+        }
+
         core_.add_extension(tokenizers_extension_path());
         if (!cache_dir.empty()) core_.set_property(ov::cache_dir(cache_dir));
 
@@ -931,7 +969,7 @@ public:
             // not a context-for-VRAM dial.
             //
             // Stateful-path only, and stated as fact rather than advice
-            // (F4, review): M7's auto-fit (Phase A-E, exec/fit.h) lives on
+            // (review): M7's auto-fit (Phase A-E, exec/fit.h) lives on
             // the paged path and is not reachable from here -- this
             // executor's own reservation has no slot-pool term at all, so
             // "set --n-ctx" would be routing around the one real check that
@@ -1165,7 +1203,7 @@ public:
         // request, so pinning it here covers the whole generation loop (paged
         // and stateful alike) from one spot. Opt-in and a no-op by default.
         //
-        // The pin outlives this call (F6, review): pthread_setaffinity_np sets
+        // The pin outlives this call (review): pthread_setaffinity_np sets
         // the thread's affinity mask, not a per-request scope, so a pooled
         // HTTP worker that served slot 0 here and is later handed slot 1 by
         // the pool stays pinned to slot 0's core until it is told otherwise
@@ -1692,6 +1730,11 @@ private:
                                 const TokenCallback& on_piece, GenerationStats& stats) {
         using clock = std::chrono::steady_clock;
 
+        // Review follow-up: one id per call, so the dump instrument can
+        // tell which cycles belong to the same request (a lane is reused
+        // across requests, so lane id alone is not enough to chain cycles).
+        const uint64_t request_id = next_request_id_.fetch_add(1);
+
         const std::vector<int> prompt_ids = tokenizer_->encode(in.prompt);
         stats.prompt_tokens               = static_cast<int>(prompt_ids.size());
         if (prompt_ids.empty()) return FinishReason::Stop;
@@ -1912,8 +1955,13 @@ private:
             }
 
             std::vector<int> drafts;
+            // M11 dump instrument (the M11 design note (not in the repository) O): only the DFlash
+            // branch has a lattice to dump; ngram and MTP proposals carry no
+            // candidate set for the offline oracle to bound.
+            bool used_dflash = false;
             if (dflash_ready_ && in.sampler.greedy()) {
-                drafts = dflash_draft(lane, next, past);
+                drafts      = dflash_draft(lane, next, past);
+                used_dflash = true;
             } else if (mtp_ready_ && in.sampler.greedy()) {
                 const int d = mtp_feed(lane, next, true);
                 if (d >= 0) drafts.push_back(d);
@@ -1985,6 +2033,36 @@ private:
                 continue;
             }
 
+            // M11 dump instrument (the M11 design note (not in the repository) O): the target's
+            // realized token for every verify row, PLUS one extra row at
+            // index drafts.size() (review follow-up) -- `rows >=
+            // seq.size() == 1+drafts.size()` was already checked above, so
+            // row index drafts.size() is always in bounds. That extra row is
+            // what `next = pick_row(lane, sampler, logits, accepted)` reads
+            // further down whenever accepted==drafts.size() (every draft
+            // accepted, nothing rejected): realized[accepted] is ALWAYS the
+            // genuine next-anchor token this way, not only when a rejection
+            // happened to produce a spare row to read it from. This is what
+            // lets the oracle chain cycles of one request (realized[acc] is
+            // exactly cycle c+1's anchor) instead of stopping at whichever
+            // cycle first saw a full accept.
+            //
+            // Computed now -- before the accept loop below calls commit()
+            // (and so sampler.observe(), which updates the
+            // repetition/presence-penalty history) -- so a non-default
+            // penalty cannot skew a row's realized token by the rows
+            // accepted ahead of it. Standard measurement cells run
+            // `--repetition-penalty 1.0` (apply_penalties is then a no-op),
+            // where this ordering makes no difference; it matters once a
+            // penalty is in play (the oracle script's own caveat comment).
+            std::vector<int> dflash_dump_realized;
+            if (used_dflash && dflash_dump_enabled_.load(std::memory_order_relaxed)) {
+                dflash_dump_realized.resize(drafts.size() + 1);
+                for (size_t i = 0; i <= drafts.size(); ++i) {
+                    dflash_dump_realized[i] = pick_row(lane, sampler, logits, i);
+                }
+            }
+
             size_t accepted = 0;
             bool   stop     = false;
             for (size_t i = 0; i < drafts.size(); ++i) {
@@ -2014,6 +2092,42 @@ private:
                 }
             }
             stats.draft_accepted += static_cast<int>(accepted);
+
+            // M11 dump instrument: dflash_dump_realized (computed above,
+            // before any commit() in this cycle) already covers every draft
+            // row, not only the accepted prefix -- exactly what the offline
+            // oracle needs (tools/dflash_oracle.py), which chains cycles of
+            // one request using `lane`/`request_id`/`past` (
+            // ) rather than trusting realized[] past the
+            // rejection row of THIS cycle in isolation. `past` here is the
+            // anchor's own position -- still unadvanced by this cycle's `past
+            // += 1 + accepted` below -- so the oracle can assert
+            // past_{c+1} == past_c + 1 + accepted_c across consecutive
+            // records of the same (lane, request_id) and flag a gap
+            // (a non-drafted decode step, or a dropped/reordered dump line)
+            // instead of silently chaining through one. `accepted` on this
+            // record is the true served count for THIS cycle; only the
+            // LAST cycle of a request can have it cut short by max_tokens,
+            // n_ctx or an EOS draft (the `stop` cases below) rather than by
+            // rejection -- the oracle should not read a short final count as
+            // evidence the drafter did worse than it did .
+            if (used_dflash && dflash_dump_enabled_.load(std::memory_order_relaxed)) {
+                nlohmann::json rec     = std::move(lane.dflash_dump_lattice);
+                rec["lane"]            = lane.index;
+                rec["request_id"]      = request_id;
+                rec["past"]            = past;
+                rec["arm"]             = {
+                    {"mode", dflash_select_mode_ == DflashSelectMode::kViterbi ? "viterbi" : "greedy"},
+                    {"lambda", dflash_lambda_},
+                    {"topk", dflash_topk_},
+                    {"block", dflash_block_},
+                };
+                rec["drafts_proposed"] = drafts;
+                rec["accepted"]        = accepted;
+                rec["realized"]        = dflash_dump_realized;
+                dflash_dump_write(std::move(rec));
+            }
+
             if (stop) {
                 c = static_cast<size_t>(la_rows[1 + accepted]);
                 break;
@@ -2101,6 +2215,12 @@ private:
         }
 
         want_dflash_ = !cfg.dflash.empty();
+        // --dflash-select / --dflash-lambda: inert unless want_dflash_, but
+        // cheap and config-only, so set unconditionally rather than only
+        // inside the try block below.
+        dflash_select_mode_ =
+            cfg.dflash_select == "viterbi" ? DflashSelectMode::kViterbi : DflashSelectMode::kGreedy;
+        dflash_lambda_ = cfg.dflash_lambda;
         // One drafter per verify loop: an explicit --mtp on + --dflash is a
         // config error; mtp auto yields to the requested drafter.
         want_mtp_ = cfg.mtp != "off" && artifact_.has_mtp_head && !want_dflash_;
@@ -2114,8 +2234,25 @@ private:
                     nlohmann::json::parse(dflash_read_file(cfg.dflash + "/config.json"))
                         .at("dflash_config");
                 dflash_block_      = dcfg.at("block_size").get<size_t>();
+                // M11 (the M11 design note (not in the repository) Q): --dflash-block overrides the
+                // json's block size. `noise` is dynamic in the exported graph
+                // (tools/export_dflash.py), so nothing else here needs to
+                // change -- drafts_max_ and the reservation's drafter term
+                // below already read dflash_block_ after this point.
+                if (cfg.dflash_block_set) {
+                    log::info("dflash", "block size overridden by --dflash-block: %d "
+                                        "(config.json said %zu)",
+                              cfg.dflash_block, dflash_block_);
+                    dflash_block_ = static_cast<size_t>(cfg.dflash_block);
+                }
                 dflash_mask_token_ = dcfg.at("mask_token_id").get<int>();
                 dflash_topk_       = dcfg.at("selector_top_k").get<size_t>();
+                if (cfg.dflash_topk_set) {
+                    log::info("dflash", "selector top-k overridden by --dflash-topk: %d "
+                                        "(config.json said %zu)",
+                              cfg.dflash_topk, dflash_topk_);
+                    dflash_topk_ = static_cast<size_t>(cfg.dflash_topk);
+                }
                 std::vector<int64_t> ids = dcfg.at("target_layer_ids").get<std::vector<int64_t>>();
                 if (!expose_dflash_feats(model, ids)) {
                     throw std::runtime_error("no tap for one of the target layers");
@@ -2196,7 +2333,7 @@ private:
         // but ARCINT_PAGED_KV may have overridden it above, and pk_key/
         // pk_value already reflect whichever source won. Diagnostics below
         // name THIS, not the flag (docs/design-m8-asymmetric-kv.md review,
-        // F4) -- an env override used to print the flag's value in the load
+        // ) -- an env override used to print the flag's value in the load
         // line and in both refusal messages, misnaming what was actually
         // requested.
         const std::string effective_paged_kv = asym_kv ? (pk_key + ":" + pk_value) : pk_key;
@@ -2235,7 +2372,7 @@ private:
             // The env string used to go into the AnyMap as-is and the
             // plugin's own stoull() has no full-consumption check, so a typo
             // silently changed the request by orders of magnitude rather
-            // than refusing (docs/design-m8-asymmetric-kv.md review, F3:
+            // than refusing (docs/design-m8-asymmetric-kv.md review,:
             // "8e9" became 8 bytes, "-1" wrapped to ULLONG_MAX). Parsed and
             // refused here instead, with a numeric size_t handed to the
             // plugin rather than a string for it to mis-parse a second way.
@@ -2797,7 +2934,7 @@ private:
         // inside resident_committed and inside every later `after` reading,
         // so a probe call must cancel only the CHANGE in pool size since the
         // baseline, not the pool's whole current size -- see the review
-        // finding this replaces (F1): the previous code subtracted the full
+        // finding this replaces : the previous code subtracted the full
         // probe_blocks*kv_block_bytes every call, which double-subtracted a
         // pool that a prior Phase B probe (or an earlier climb step) had
         // already folded into the baseline.
@@ -2811,7 +2948,7 @@ private:
         // largest admissible chunk is computed, and one guarded probe verifies
         // it, stepping down on failure instead of dying.
         //
-        // The slab is NOT subtracted here (F1 fix): alloc_la_rows above
+        // The slab is NOT subtracted here (fix): alloc_la_rows above
         // already committed every lane's GDN checkpoint rows before
         // resident_committed was read, so the slab is already inside the
         // baseline. Subtracting it a second time is what produced the
@@ -2988,7 +3125,7 @@ private:
         }
         // A residency delta measuring negative here is retracted as "LRU
         // eviction noise" (that explanation was narrated, not measured, and
-        // is now disproven -- F1: the actual cause was the probe's own
+        // is now disproven --: the actual cause was the probe's own
         // baseline double-subtracting the GDN slab and, when Phase B had
         // already committed one, the KV probe pool). With that arithmetic
         // fixed this should not fire in the ordinary case; it stays as a
@@ -3168,7 +3305,7 @@ private:
             max_ctx          = reserve.adopted_n_ctx;
         }
 
-        // F2 (review finding): adopt mode (no explicit --n-ctx) must not
+        // (review finding): adopt mode (no explicit --n-ctx) must not
         // silently clamp to an inadmissible max_ctx. fit.admissible was
         // computed and never read -- with status_.n_ctx left at 0 the
         // handlers.cpp admission guard (`n_ctx > 0 && ...`) is disabled, and
@@ -3253,7 +3390,7 @@ private:
         size_t   blocks            = 0;
         size_t   spare_blocks      = 0;
         bool     accepted          = false;
-        // F3 (review finding): `budget` is constant across passes, but
+        // (review finding): `budget` is constant across passes, but
         // `live_blocks` shrinks every time paged_n_ctx_ is corrected below --
         // so, unchanged, `affordable - live_blocks` (the spare-cache room)
         // GROWS by exactly what live_blocks lost, and `blocks` (live + spare)
@@ -3265,7 +3402,7 @@ private:
         // shrinks in step with the live pool instead of silently reclaiming
         // the space live_blocks gave up.
         uint64_t overshoot_accum   = 0;
-        // F1 (review finding): a bound the retry narrows on its own, in
+        // (review finding): a bound the retry narrows on its own, in
         // pages, independent of overshoot_accum's byte-level budget shrink
         // -- std::min against SIZE_MAX below is a no-op until a retry sets
         // it. Round-3 (defect 1): shared by BOTH the explicit-n_ctx retry
@@ -3330,7 +3467,7 @@ private:
         }
 
         for (int pass = 0; pass < 4 && !accepted; ++pass) {
-            // F3 (review finding): release the previous pass's pool from
+            // (review finding): release the previous pass's pool from
             // every lane before asking the driver for a new one -- a fresh
             // InferRequest drops the old KV pool binding immediately,
             // instead of the retry requesting a second full pool on top of
@@ -3374,7 +3511,7 @@ private:
                                             std::max<size_t>(la_row_bytes_, 1));
                 wanted_spare = entries * per_lane_blocks;
             }
-            // F1: once a retry (explicit or, since round 3, auto-fit) has
+            //: once a retry (explicit or, since round 3, auto-fit) has
             // learned a spare cap from a prior pass, it bounds every
             // subsequent pass's spare request too -- otherwise a shrinking
             // cache budget could still race a stale, larger cap.
@@ -3471,7 +3608,7 @@ private:
             if (accepted) break;
 
             if (explicit_n_ctx) {
-                // M7 defect fix (round 1) + F1/F4 (round 2) + finding 3/4
+                // M7 defect fix (round 1) + /(round 2) + finding 3/4
                 // (round 3): explicit_retry_decision (fit.h, tested
                 // device-free -- the extracted form of this whole branch)
                 // decides refuse-or-retry AND, when retrying, the spare
@@ -3498,7 +3635,7 @@ private:
                     /*measured_overshoot=*/over > 0, over, spare_blocks, kv_block_bytes, pass,
                     kLastPass);
                 if (decision.refuse) {
-                    // F6: itemize the pool's own terms in pages, not just
+                    //: itemize the pool's own terms in pages, not just
                     // the fit's byte terms -- a genuine overshoot (over >
                     // the whole spare) and a reserve-caused one both reach
                     // this throw, and only the pool terms tell them apart.
@@ -3537,7 +3674,7 @@ private:
                               spare_blocks, blocks, paged_n_ctx_, decision.next_spare_cap,
                               decision.next_spare_cap == 1 ? "" : "s", pass + 2);
                 } else {
-                    // F4: fragmentation, not an arithmetic overshoot -- but
+                    //: fragmentation, not an arithmetic overshoot -- but
                     // spare_blocks > 0 here (decision.refuse already
                     // handled spare_blocks == 0), so retry with a
                     // synthesized retreat instead of refusing outright,
@@ -3563,7 +3700,7 @@ private:
                        static_cast<uint64_t>(
                            std::max<long long>(paged_n_ctx_ / 8, kv_block_tokens_));
             }
-            // F3: feeds the spare-room ceiling above on the next pass, so it
+            //: feeds the spare-room ceiling above on the next pass, so it
             // shrinks with the live pool instead of silently reabsorbing the
             // space live_blocks just gave up.
             overshoot_accum += over;
@@ -3661,7 +3798,7 @@ private:
                   blocks, kv_block_tokens_,
                   static_cast<double>(blocks * kv_block_bytes) / (1u << 30), per_lane_blocks,
                   lanes, lanes == 1 ? "" : "s", blocks - live_blocks, rows_per_lane_);
-        // F5 (review finding): zero spare is a legal accepted configuration
+        // (review finding): zero spare is a legal accepted configuration
         // (the live request alone fit, no room left over), but with a
         // prefix cache configured it silently means every cached prefix
         // now competes with the live lanes and evicts on demand -- worth a
@@ -3743,7 +3880,7 @@ private:
         if (std::getenv("ARCINT_PROFILE") != nullptr) profile_paged(*lanes_[0]);
     }
 
-    // F3 (review finding): before the replay loop re-allocates the pool on
+    // (review finding): before the replay loop re-allocates the pool on
     // a retry, drop the previous pass's binding first. `kv_pool_tensors_.
     // clear()` in alloc_kv_pools below only drops arcint's own handles --
     // every lane's InferRequest keeps its pass-N tensors bound until
@@ -5024,7 +5161,7 @@ private:
                 const ov::Tensor lg = lane.dflash_head.get_output_tensor(0);
 
                 std::vector<int> drafts = dflash_select(
-                    rows.data<const float>(), lg.data<const float>(), q - 1, h, anchor);
+                    lane, rows.data<const float>(), lg.data<const float>(), q - 1, h, anchor);
                 lane.dflash_pending.clear();
                 lane.dflash_base = past;
                 return drafts;
@@ -5036,19 +5173,39 @@ private:
         }
     }
 
-    // The candidate-path selector: top-k tokens per position, one coherent
-    // path traced greedily with the predecessor/successor codebooks.
-    std::vector<int> dflash_select(const float* hid, const float* logits, size_t rows,
+    // The candidate-path selector: top-k tokens per position, one path
+    // traced through the lattice with the configured strategy
+    // (--dflash-select; src/core/dflash_select.h has the pure DP). The score
+    // this builds, per row and candidate j, given the token `prev` chosen for
+    // the row before it (or the anchor at row 0), is
+    //
+    //     unary[j] + lambda * pred_cb[prev] . ((P.hidden_row) elementwise* succ_cb[token[j]])
+    //
+    // -- a trilinear term in (pred_cb[prev], P.hidden_row, succ_cb[cand]).
+    // Before M11 this was computed strictly greedily; the Lattice this
+    // function builds carries both the ingredients that reproduce the legacy
+    // association order bit-for-bit at the default (kGreedy, lambda=1) --
+    // `hp` and `succ_key` kept separate, per dflash_select.h's note in
+    // 
+    // row), which kViterbi needs because it scores every row's candidates
+    // against EVERY predecessor candidate, not just the one greedy already
+    // committed to, and has no legacy order to match.
+    std::vector<int> dflash_select(Lane& lane, const float* hid, const float* logits, size_t rows,
                                    size_t width, int anchor) {
         const size_t k = dflash_topk_, r = dflash_rank_, vocab = dflash_vocab_;
-        std::vector<int>   path;
-        std::vector<float> hp(r), t(r), unary(k);
-        std::vector<int>   cand(k);
-        int pred = anchor;
-        path.reserve(rows);
+
+        Lattice lattice;
+        lattice.anchor_key.resize(r);
+        {
+            const ov::float16* ak = dflash_pred_cb_.data() + static_cast<size_t>(anchor) * r;
+            for (size_t d = 0; d < r; ++d) lattice.anchor_key[d] = static_cast<float>(ak[d]);
+        }
+        lattice.rows.resize(rows);
+
         for (size_t row = 0; row < rows; ++row) {
             const float* lg = logits + row * vocab;
-            // top-k: min-heap of size k over the vocab
+            // top-k: min-heap of size k over the vocab (unchanged from the
+            // pre-M11 selector).
             using P = std::pair<float, int>;
             std::priority_queue<P, std::vector<P>, std::greater<P>> heap;
             for (size_t v = 0; v < vocab; ++v) {
@@ -5059,36 +5216,111 @@ private:
                     heap.emplace(lg[v], static_cast<int>(v));
                 }
             }
+            LatticeRow& lr = lattice.rows[row];
+            lr.token.resize(k);
+            lr.unary.resize(k);
             for (size_t j = k; j-- > 0;) {
-                unary[j] = heap.top().first;
-                cand[j]  = heap.top().second;
+                lr.unary[j] = heap.top().first;
+                lr.token[j] = heap.top().second;
                 heap.pop();
             }
+
             const float* hrow = hid + row * width;
+            lr.hp.resize(r);
             for (size_t d = 0; d < r; ++d) {
                 const float* pr  = dflash_proj_.data() + d * width;
                 float        acc = 0.0f;
                 for (size_t x = 0; x < width; ++x) acc += pr[x] * hrow[x];
-                hp[d] = acc;
+                lr.hp[d] = acc;
             }
-            const ov::float16* pc = dflash_pred_cb_.data() + static_cast<size_t>(pred) * r;
-            for (size_t d = 0; d < r; ++d) t[d] = static_cast<float>(pc[d]) * hp[d];
-            float best  = -std::numeric_limits<float>::infinity();
-            int   bidx  = cand[0];
+
+            lr.pred_key.assign(k, std::vector<float>(r));
+            lr.succ_key.assign(k, std::vector<float>(r));
+            lr.row_key.assign(k, std::vector<float>(r));
             for (size_t j = 0; j < k; ++j) {
-                const ov::float16* sc = dflash_succ_cb_.data() +
-                                        static_cast<size_t>(cand[j]) * r;
-                float score = unary[j];
-                for (size_t d = 0; d < r; ++d) score += t[d] * static_cast<float>(sc[d]);
-                if (score > best) {
-                    best = score;
-                    bidx = cand[j];
+                const size_t       tok = static_cast<size_t>(lr.token[j]);
+                const ov::float16* pc  = dflash_pred_cb_.data() + tok * r;
+                const ov::float16* sc  = dflash_succ_cb_.data() + tok * r;
+                for (size_t d = 0; d < r; ++d) {
+                    lr.pred_key[j][d] = static_cast<float>(pc[d]);
+                    lr.succ_key[j][d] = static_cast<float>(sc[d]);
+                    lr.row_key[j][d]  = lr.hp[d] * lr.succ_key[j][d];
                 }
             }
-            pred = bidx;
-            path.push_back(pred);
         }
-        return path;
+
+        if (dflash_dump_enabled_.load(std::memory_order_relaxed)) dflash_dump_build_lattice(lane, lattice, anchor);
+
+        return dflash_select_path(lattice, dflash_select_mode_, dflash_lambda_);
+    }
+
+    // M11 dump instrument (the M11 design note (not in the repository) O): stashes `lattice` as JSON
+    // on the lane for the decode loop to append to once it knows the drafts,
+    // the accepted count and the target's realized tokens (all only known
+    // after the separate verify forward that follows this draft). Per row:
+    // candidate token ids, their unary scores, and the FULL transition score
+    // (bilinear term only, lambda not applied) from every reachable
+    // predecessor -- the anchor for row 0, the previous row's own candidates
+    // after. Compact since K <= 64, and it lets tools/dflash_oracle.py
+    // recompute any selector's reachable path without knowing the codebooks
+    // or the rank r.
+    void dflash_dump_build_lattice(Lane& lane, const Lattice& lattice, int anchor) {
+        nlohmann::json rec;
+        rec["anchor"] = anchor;
+        nlohmann::json rows = nlohmann::json::array();
+        for (size_t ridx = 0; ridx < lattice.rows.size(); ++ridx) {
+            const LatticeRow& row = lattice.rows[ridx];
+            nlohmann::json    jrow;
+            jrow["tokens"] = row.token;
+            jrow["unary"]  = row.unary;
+            nlohmann::json trans = nlohmann::json::array();
+            if (ridx == 0) {
+                // One score per candidate: the transition from the anchor.
+                for (size_t j = 0; j < row.token.size(); ++j) {
+                    float d = 0.0f;
+                    const size_t n = std::min(lattice.anchor_key.size(), row.row_key[j].size());
+                    for (size_t x = 0; x < n; ++x) d += lattice.anchor_key[x] * row.row_key[j][x];
+                    trans.push_back(d);
+                }
+            } else {
+                // [K_prev][K]: one row per previous-row candidate.
+                const LatticeRow& prevr = lattice.rows[ridx - 1];
+                for (size_t p = 0; p < prevr.token.size(); ++p) {
+                    nlohmann::json prow = nlohmann::json::array();
+                    for (size_t j = 0; j < row.token.size(); ++j) {
+                        float        d = 0.0f;
+                        const size_t n =
+                            std::min(prevr.pred_key[p].size(), row.row_key[j].size());
+                        for (size_t x = 0; x < n; ++x) d += prevr.pred_key[p][x] * row.row_key[j][x];
+                        prow.push_back(d);
+                    }
+                    trans.push_back(prow);
+                }
+            }
+            jrow["transition"] = trans;
+            rows.push_back(jrow);
+        }
+        rec["lattice_rows"] = rows;
+        lane.dflash_dump_lattice = std::move(rec);
+    }
+
+    // M11 dump instrument: appends one JSON line to the already-open
+    // dflash_dump_file_ (opened once at construction, not per cycle).
+    // Mutex-protected because lanes draft concurrently and an interleaved
+    // write would corrupt the file's line-per-record contract; the same lock
+    // also guards the disable-on-failure store, so there is no window where
+    // another thread can observe dflash_dump_enabled_ true while the stream
+    // it is about to write to is already known bad.
+    void dflash_dump_write(nlohmann::json rec) {
+        rec["cycle"] = dflash_dump_cycle_.fetch_add(1);
+        std::lock_guard<std::mutex> lock(dflash_dump_mutex_);
+        if (!dflash_dump_enabled_.load(std::memory_order_relaxed)) return;
+        dflash_dump_file_ << rec.dump() << "\n";
+        if (!dflash_dump_file_.good()) {
+            log::warn("dflash", "write to %s failed; disabling the dump",
+                      dflash_dump_path_.c_str());
+            dflash_dump_enabled_.store(false, std::memory_order_release);
+        }
     }
 
     void load_dflash_selector(const std::string& dir) {
@@ -5251,6 +5483,37 @@ private:
     std::vector<ov::float16> dflash_pred_cb_;            // [vocab, rank]
     std::vector<ov::float16> dflash_succ_cb_;
     ov::Tensor               dflash_mask_embed_;
+
+    // M11 selector options (the M11 design note (not in the repository) V/K/lambda; the pure scoring
+    // function lives in src/core/dflash_select.h so it can be unit-tested
+    // without OpenVINO).
+    DflashSelectMode         dflash_select_mode_ = DflashSelectMode::kGreedy;
+    float                    dflash_lambda_       = 1.0f;
+
+    // M11 dump instrument (the M11 design note (not in the repository) O): ARCINT_DFLASH_DUMP, read
+    // once at construction, file opened once then (
+    // "open the file once per process, not per cycle" -- simple here, since
+    // the process never needs to change dump destinations mid-run). Every
+    // check of "is the dump on" reads dflash_dump_enabled_ (an atomic bool)
+    // rather than dflash_dump_path_.empty() -- the earlier version mutated
+    // the string under dflash_dump_mutex_ on an open/write failure while
+    // dflash_select and the decode loop read .empty() unlocked, a data race
+    // (UB) on that path; dflash_dump_path_ is now write-once at construction
+    // (kept only so the failure log line can name the file) and every
+    // runtime check/disable goes through the atomic instead.
+    // dflash_dump_cycle_ is a process-wide monotonic counter (lanes draft
+    // concurrently) and dflash_dump_mutex_ serializes the actual file writes
+    // so concurrent lanes cannot interleave two JSON lines into garbage.
+    std::string              dflash_dump_path_;
+    std::ofstream            dflash_dump_file_;
+    std::atomic<bool>        dflash_dump_enabled_{false};
+    std::atomic<uint64_t>    dflash_dump_cycle_{0};
+    std::mutex               dflash_dump_mutex_;
+    // Review follow-up: a per-request id the dump chains cycles
+    // against (tools/dflash_oracle.py groups by lane+request, since two
+    // requests on the same lane at different times are unrelated streams).
+    // Process-wide and monotonic; assigned once per generate_paged call.
+    std::atomic<uint64_t>    next_request_id_{0};
 
     std::unique_ptr<Drafter>       drafter_;
     std::atomic<bool>              drafting_{false};

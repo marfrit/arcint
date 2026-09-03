@@ -403,7 +403,7 @@ TEST(kv_precision_is_packed_four_bit_false_for_everything_else) {
     CHECK(!kv_precision_is_packed_four_bit("garbage", "u8"));
 }
 
-// F3 (review 2026-09-02): ARCINT_MOE_DEVICE_POOL_BYTES used to go into the
+// (review 2026-09-02): ARCINT_MOE_DEVICE_POOL_BYTES used to go into the
 // plugin's AnyMap as a raw string, and the plugin's own stoull() has no
 // full-consumption check -- "8e9" silently became 8 bytes ('e9' unconsumed
 // and ignored), and a leading '-' silently wrapped through strtoull's
@@ -693,4 +693,114 @@ TEST(config_prefix_cache_reserve_rejects_explicit_n_ctx) {
     CHECK(!r.ok);
     CHECK(r.error.find("explicit") != std::string::npos ||
           r.error.find("--n-ctx") != std::string::npos);
+}
+
+// M11 (the M11 design note (not in the repository) Q): --dflash-block overrides the block size read
+// from the drafter's config.json. RED first: before this flag existed there
+// was no way to ask for a different block, so the acceptance case below would
+// have failed on "unknown option".
+TEST(config_dflash_block_flag) {
+    Config cfg;
+    CHECK(run({"--stub", "--dflash", "/d", "--dflash-block", "12"}, cfg).ok);
+    CHECK_EQ(cfg.dflash_block, 12);
+
+    Config def;
+    CHECK(run({"--stub", "--dflash", "/d"}, def).ok);
+    CHECK_EQ(def.dflash_block, 0);   // 0 = take the head's own json
+}
+
+// The override means nothing without a drafter to apply it to.
+TEST(config_dflash_block_needs_dflash) {
+    CHECK(rejected({"--stub", "--dflash-block", "8"}));
+}
+
+TEST(config_dflash_block_rejects_out_of_range) {
+    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-block", "1"}));
+    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-block", "33"}));
+    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-block", "not-a-number"}));
+
+    // The boundaries themselves are legal.
+    Config lo;
+    CHECK(run({"--stub", "--dflash", "/d", "--dflash-block", "2"}, lo).ok);
+    CHECK_EQ(lo.dflash_block, 2);
+    Config hi;
+    CHECK(run({"--stub", "--dflash", "/d", "--dflash-block", "32"}, hi).ok);
+    CHECK_EQ(hi.dflash_block, 32);
+}
+
+// M11 (the M11 design note (not in the repository) V/K/lambda): the selector's strategy, top-k and
+// bilinear weight.
+TEST(config_dflash_select_flags_default) {
+    Config cfg;
+    CHECK(run({"--stub"}, cfg).ok);
+    CHECK_EQ(cfg.dflash_select, std::string("greedy"));
+    CHECK_NEAR(static_cast<double>(cfg.dflash_lambda), 1.0, 1e-9);
+    CHECK_EQ(cfg.dflash_topk, 0);
+}
+
+TEST(config_dflash_select_accepts_the_documented_choices) {
+    for (const char* mode : {"greedy", "viterbi"}) {
+        Config cfg;
+        CHECK(run({"--stub", "--dflash", "/d", "--dflash-select", mode}, cfg).ok);
+        CHECK_EQ(cfg.dflash_select, std::string(mode));
+    }
+    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-select", "beam"}));
+    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-select"}));
+}
+
+// Review follow-up: --dflash-select and --dflash-lambda are as inert
+// without --dflash as --dflash-block/--dflash-topk are, and must refuse the
+// same way rather than being silently accepted and ignored.
+TEST(config_dflash_select_needs_dflash) {
+    CHECK(rejected({"--stub", "--dflash-select", "viterbi"}));
+    // Even the value that equals the default is still refused: the flag was
+    // typed, so "not given" is not what happened.
+    CHECK(rejected({"--stub", "--dflash-select", "greedy"}));
+}
+
+TEST(config_dflash_lambda_needs_dflash) {
+    CHECK(rejected({"--stub", "--dflash-lambda", "0.5"}));
+    CHECK(rejected({"--stub", "--dflash-lambda", "1"}));   // equals the default; still refused
+}
+
+TEST(config_dflash_lambda_accepts_any_finite_weight) {
+    Config zero;
+    CHECK(run({"--stub", "--dflash", "/d", "--dflash-lambda", "0"}, zero).ok);
+    CHECK_NEAR(static_cast<double>(zero.dflash_lambda), 0.0, 1e-9);
+
+    Config two;
+    CHECK(run({"--stub", "--dflash", "/d", "--dflash-lambda", "2"}, two).ok);
+    CHECK_NEAR(static_cast<double>(two.dflash_lambda), 2.0, 1e-9);
+
+    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-lambda", "nan"}));
+    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-lambda", "inf"}));
+    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-lambda", "warm"}));
+    //: a double that parses as finite but overflows on the narrowing cast
+    // to float -- parse_double's own isfinite check does not catch this
+    // (1e39 IS finite as a double), so this is what actually exercises
+    // config.cpp's separate `!std::isfinite(cfg.dflash_lambda)` check.
+    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-lambda", "1e39"}));
+}
+
+TEST(config_dflash_topk_flag) {
+    Config cfg;
+    CHECK(run({"--stub", "--dflash", "/d", "--dflash-topk", "32"}, cfg).ok);
+    CHECK_EQ(cfg.dflash_topk, 32);
+}
+
+TEST(config_dflash_topk_needs_dflash) {
+    CHECK(rejected({"--stub", "--dflash-topk", "8"}));
+}
+
+TEST(config_dflash_topk_rejects_out_of_range) {
+    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-topk", "0"}));
+    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-topk", "-1"}));
+    CHECK(rejected({"--stub", "--dflash", "/d", "--dflash-topk", "65"}));
+
+    Config lo;
+    CHECK(run({"--stub", "--dflash", "/d", "--dflash-topk", "1"}, lo).ok);
+    CHECK_EQ(lo.dflash_topk, 1);
+    Config hi;
+    CHECK(run({"--stub", "--dflash", "/d", "--dflash-topk", "64"}, hi).ok);
+    CHECK_EQ(hi.dflash_topk, 64);
 }

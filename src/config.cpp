@@ -314,6 +314,19 @@ std::string usage_text() {
         "                            drafter per server: conflicts with --mtp on\n"
         "                            and --draft N\n"
         "  --dflash-device DEV       run the drafter elsewhere (default: --device)\n"
+        "  --dflash-block N          override the block size the drafter's config.json\n"
+        "                            declares, N in [2, 32] (default: 0, take the json).\n"
+        "                            Needs --dflash\n"
+        "  --dflash-select MODE      greedy | viterbi: selector strategy over the DFlash\n"
+        "                            lattice (default: greedy, today's behaviour). viterbi\n"
+        "                            finds the exact maximum-score path instead of\n"
+        "                            committing row by row\n"
+        "  --dflash-lambda X         weight on the bilinear codebook term of the selector's\n"
+        "                            score, unary + X*bilinear (default: 1.0). 0 scores on\n"
+        "                            the target lm_head logit alone\n"
+        "  --dflash-topk K           override the selector's top-k the drafter's config.json\n"
+        "                            declares, K in [1, 64] (default: 0, take the json).\n"
+        "                            Needs --dflash\n"
         "  --mtp-layer WHICH         auto | reconstructed | exported: which MTP layer graph to\n"
         "                            draft with when the artifact carries both (default: auto,\n"
         "                            the reconstructed one when present)\n"
@@ -519,6 +532,25 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--dflash-device") {
             if (!value(v)) return fail("--dflash-device needs a device");
             cfg.dflash_device = std::string(v);
+        } else if (arg == "--dflash-block") {
+            if (!value(v) || !parse_int(v, cfg.dflash_block)) {
+                return fail("--dflash-block needs an integer");
+            }
+            cfg.dflash_block_set = true;
+        } else if (arg == "--dflash-select") {
+            if (!value(v)) return fail("--dflash-select needs greedy or viterbi");
+            cfg.dflash_select     = std::string(v);
+            cfg.dflash_select_set = true;
+        } else if (arg == "--dflash-lambda") {
+            double d = 0.0;
+            if (!value(v) || !parse_double(v, d)) return fail("--dflash-lambda needs a number");
+            cfg.dflash_lambda     = static_cast<float>(d);
+            cfg.dflash_lambda_set = true;
+        } else if (arg == "--dflash-topk") {
+            if (!value(v) || !parse_int(v, cfg.dflash_topk)) {
+                return fail("--dflash-topk needs an integer");
+            }
+            cfg.dflash_topk_set = true;
         } else if (arg == "--mtp-layer") {
             if (!value(v)) return fail("--mtp-layer needs auto, reconstructed or exported");
             cfg.mtp_layer = std::string(v);
@@ -637,6 +669,38 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     }
     if (!cfg.dflash.empty() && cfg.draft_tokens > 0) {
         return fail("--dflash and --draft are two drafters for one verify loop; pick one");
+    }
+    if (cfg.dflash_block_set && cfg.dflash.empty()) {
+        return fail("--dflash-block needs --dflash: there is no block size to override");
+    }
+    if (cfg.dflash_block_set && (cfg.dflash_block < 2 || cfg.dflash_block > 32)) {
+        return fail(log::format("--dflash-block must be in [2, 32], not %d", cfg.dflash_block));
+    }
+    // Review follow-up: --dflash-select and --dflash-lambda are as
+    // inert without --dflash as --dflash-block/--dflash-topk are, so they
+    // are refused the same way rather than silently accepted and ignored.
+    if (cfg.dflash_select_set && cfg.dflash.empty()) {
+        return fail("--dflash-select needs --dflash: there is no selector to configure");
+    }
+    if (cfg.dflash_select != "greedy" && cfg.dflash_select != "viterbi") {
+        return fail("--dflash-select must be greedy or viterbi");
+    }
+    if (cfg.dflash_lambda_set && cfg.dflash.empty()) {
+        return fail("--dflash-lambda needs --dflash: there is no selector to configure");
+    }
+    // parse_double already refuses nan/inf at the argument-parsing stage
+    // (config.cpp's parse_double calls std::isfinite before this is ever
+    // reached); this check is what catches the one case that survives that
+    // stage: a double that parses as finite but overflows to +-inf on the
+    // narrowing cast to float (e.g. --dflash-lambda 1e39, the review red case).
+    if (!std::isfinite(cfg.dflash_lambda)) {
+        return fail("--dflash-lambda must be a finite number");
+    }
+    if (cfg.dflash_topk_set && cfg.dflash.empty()) {
+        return fail("--dflash-topk needs --dflash: there is no selector to override");
+    }
+    if (cfg.dflash_topk_set && (cfg.dflash_topk < 1 || cfg.dflash_topk > 64)) {
+        return fail(log::format("--dflash-topk must be in [1, 64], not %d", cfg.dflash_topk));
     }
     if (cfg.kv_dtype != "fp16" && cfg.kv_dtype != "fp32") {
         return fail("--kv-dtype must be fp16 or fp32");

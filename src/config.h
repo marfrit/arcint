@@ -171,6 +171,45 @@ struct Config {
     std::string dflash;
     std::string dflash_device;                       // empty = --device
 
+    // Overrides the block size the drafter's config.json declares (M11,
+    // the M11 design note (not in the repository) Q). dflash_block_set distinguishes "the flag was
+    // typed" from "0 happens to be the value" the way n_ctx_explicit does for
+    // --n-ctx elsewhere -- an explicit --dflash-block 0 is still out of range
+    // and must refuse, not silently mean "take the json". When set, checked
+    // against [2, 32] and refused without --dflash -- the block size means
+    // nothing without a drafter to apply it to. `noise` in the exported graph
+    // is dynamic (tools/export_dflash.py), so this needs no re-export;
+    // drafts_max_ and the reservation's drafter term already read
+    // dflash_block_ after it is set (backend_ov.cpp, load_paged).
+    int  dflash_block     = 0;
+    bool dflash_block_set = false;
+
+    // Selector strategy over the DFlash lattice (M11, the M11 design note (not in the repository) V):
+    // "greedy" commits row-by-row and never reconsiders (today's production
+    // behaviour); "viterbi" finds the exact maximum-score path over the whole
+    // lattice under the same additive score. Pure function:
+    // src/core/dflash_select.h. Same "was it typed" distinction as
+    // dflash_block_set (review follow-up): the default value
+    // ("greedy") is indistinguishable from "not given" on its own, and this
+    // flag is as inert without --dflash as --dflash-block/--dflash-topk are,
+    // so it is refused the same way rather than silently accepted and
+    // ignored.
+    std::string dflash_select     = "greedy";
+    bool        dflash_select_set = false;
+
+    // Weight on the bilinear (codebook) term of the selector's score:
+    // unary + lambda * bilinear. 1.0 reproduces today's scoring; 0.0 ignores
+    // the codebooks entirely and scores on the target lm_head logit alone.
+    // dflash_lambda_set: same reasoning as dflash_select_set above.
+    float dflash_lambda     = 1.0f;
+    bool  dflash_lambda_set = false;
+
+    // Overrides the selector's top-k the drafter's config.json declares
+    // (selector_top_k). Same "was it typed" distinction as dflash_block_set
+    // above; when set, checked against [1, 64] and refused without --dflash.
+    int  dflash_topk     = 0;
+    bool dflash_topk_set = false;
+
     // Speculative decoding through the external-drafter hook (DESIGN.md §3.5).
     // 0 disables it. No export currently carries an MTP head, so the drafter is
     // weightless n-gram lookup; swapping in a head later changes only the
@@ -257,7 +296,7 @@ bool kv_precision_is_packed_four_bit(const std::string& requested, const std::st
 // silently two's-complements a negative sign into a huge unsigned value
 // ("-1" reads back as ULLONG_MAX) and that reads back as "18446744073709551615",
 // not "-1". Used wherever an env var hands a byte count straight into a
-// plugin property (docs/design-m8-asymmetric-kv.md review, F3:
+// plugin property (docs/design-m8-asymmetric-kv.md review,:
 // ARCINT_MOE_DEVICE_POOL_BYTES="8e9" used to silently become 8 bytes), so a
 // typo refuses the load instead of changing what got requested by orders of
 // magnitude.

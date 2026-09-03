@@ -2936,6 +2936,101 @@ below a decode probe's resolution, and validated on the coder at ratio 20:
 40 layers, 60,740 routings per layer for the same token stream, 25 of
 7,360 experts never routed by the acceptance prompt.
 
+#### 7.0.2z Drafting II, measured: the free levers, the oracle, and what they close (2026-09-03)
+
+M11's row asks for a chain re-ranker first (tokens per verify cycle above
+the measured 3.13 at byte-exact greedy), a tree path after, and an ngram
+drafter for drafter-less endpoints. The design step (session note) found
+that the verify runs on the paged graph, which has no mask input, so a
+tree needs a new paged-attention input and kernel; that the re-ranker's
+usual input, the target's logits at draft positions, exists only after
+the verify; and that the one unexploited signal is the lattice itself.
+Four host-side levers cost nothing to try, so they went first, with an
+offline oracle bound to price the rest.
+
+**Baseline, reproduced.** 24 GB card, dense 27B int4, u8 KV, auto-fit
+136,368, one lane, the DFlash2 int4 head on the same card, greedy,
+repetition penalty 1.0. Prose 400 tokens: 3.28 / 3.12 tokens per cycle at
+44.6 / 45.0 t/s (the record's 3.13 / 44.8). The acceptance task with the
+drafter on scores 10/10 at 4.46 tokens per cycle; the thinking template
+drafts worse, 2.02 per cycle; a warm prefix-cache hit keeps the drafter
+(4.36 per cycle, text identical) — the design's prediction that the first
+warm hit would disable it process-wide is refuted for a full-prompt hit.
+
+**The levers, one window, every arm with the cycle dump on** (its cost is
+in every number alike; against the pre-M11 run of the same probes the
+prose wall time is unchanged, 10.4 against 10.5 s, and the code probe is
+0.5 s longer over 234 cycles, about 2 ms per cycle). The t/s here are
+client wall including the cold prefill, not the server's decode figure.
+Tokens per cycle and t/s for prose / code / thinking (the thinking probe
+is capped at 2,048 tokens, the 2.02 above ran to 10,240):
+
+| arm | prose | code | thinking | text vs baseline |
+|---|---|---|---|---|
+| greedy, λ=1, k=16, block 8 (baseline) | 3.28 · 38.5 | 4.46 · 60.6 | 2.98 · 41.2 | — |
+| the same, re-run | 3.28 · 38.6 | 4.46 · 60.8 | 2.98 · 41.4 | identical |
+| Viterbi, λ=1 | 2.63 · 32.5 | 3.40 · 46.8 | 2.17 · 30.4 | identical |
+| Viterbi, λ=0 | 3.05 · 37.2 | 4.35 · 59.2 | 2.68 · 37.3 | prose differs |
+| Viterbi, λ=0.5 | 2.94 · 35.3 | 3.97 · 54.7 | 2.76 · 38.4 | code differs |
+| Viterbi, λ=2 | 1.99 · 25.5 | 2.35 · 32.8 | 1.80 · 25.1 | prose, code differ |
+| Viterbi, k=32 | 2.61 · 31.0 | 3.38 · 45.2 | 2.17 · 29.3 | identical |
+| greedy, block 10 | 3.42 · 36.0 | 4.59 · 54.3 | 2.90 · 34.6 | prose differs |
+| greedy, block 12 | 3.28 · 32.7 | 4.78 · 54.2 | 3.05 · 35.2 | identical |
+| greedy, block 16 | 3.25 · 30.4 | 4.83 · 49.7 | 3.22 · 34.0 | identical |
+| ngram drafter, no DFlash | 1.04 · 21.3 | 1.24 · 24.9 | — | acceptance answer identical |
+
+Three negatives, each measured. Exact MAP over the lattice under the
+selector's own score accepts fewer tokens than the greedy commit on every
+probe, and at λ=2 by 40%: a score that ranks candidates well per row does
+not select the most acceptable chain when maximised over paths. The
+unary-only path (λ=0) sits 0.1 to 0.3 tokens per cycle below the baseline,
+which is what the codebook term is worth. Longer blocks move tokens per
+cycle by −3% to +8% on code and thinking and lose 6 to 21% of throughput
+on every probe: the longer verify costs more than the extra accepted
+tokens return. The ngram drafter's prose probe (21.3 t/s client wall)
+falls below the documented plain decode (24.0 t/s, server figure) while
+the acceptance task stays at 10/10 with the same answer as the DFlash
+arm; block 16, the arm with the most tokens per cycle on code, also scores
+10/10 with the same answer. Four arms changed the served text — λ=0 on
+prose, λ=0.5 on code, λ=2 on both, block 10 on prose — at one position
+each, the §3.2 near-tie class; the design's gate reports that count
+rather than hiding it, and the byte-identical rows are the ones the row's
+"same equivalence" admits.
+
+**The oracle prices the rest, as a floor.** Replaying the baseline's
+1,046 dumped cycles offline, on the accepted-drafts-per-cycle scale: 2.339
+served, and the longest prefix any selector could have chosen from the
+same top-16 candidate sets is at least 3.083 — the tool knows the true
+token only up to each cycle's rejection row, so +0.744 accepted per cycle
+is a lower bound on the re-rank headroom, not a ceiling. A realizable
+tree of width 2, 3 or 4 by unary rank would reach at least 2.489, 2.663 or
+2.772 (+0.15 to +0.43) before the mandatory re-forward a tree verify
+carries; ranked by the transition score the true token is rarely inside
+the top few at all (0.29 to 0.69). The design's pre-registered rule for
+the adapter (headroom above 0.3 with the free levers taking less than
+half of it) is therefore met, not refuted: the free levers took none of
+it. The adapter track — a re-fit of the selector's sidecars against this
+int4 target, five to eight days, CPU-only training — is a decision for
+the operator with that floor in hand, not a closure by measurement; the
+tree path is not pursued, since its realizable bound sits below the
+re-forward it would carry and it needs a new paged-attention input.
+
+The harness can fail: with the accept test's equality inverted (a deliberate
+one-line red, rebuilt and run on the same card), the prose probe diverges
+from the baseline at its second character and acceptance collapses to 1.36
+tokens per cycle at 18.6 t/s; the red ran after the window rather than
+before it, and the line was restored and the tree rebuilt before the
+record was closed.
+
+What lands: the block override, the selector options (greedy stays the
+default and scores in the legacy association order; against the pre-M11
+run it reproduces the accepted-per-cycle counts exactly on prose, 278 of
+122 cycles, and on code, 809 of 234), the cycle dump and the oracle tool,
+and the window above as the record. The row's first gate — more than 3.13
+tokens per cycle at the same equivalence — is met by blocks 12 and 16 on
+code and thinking, at a throughput loss, and by nothing else; the served
+chain is near what this head and this selector give without new weights.
+
 #### 7.0.2r DFlash2: the external-drafter hook gets a real drafter (2026-09-01)
 
 The public block-diffusion head for the 3.8 went from HF checkpoint to a
