@@ -17,6 +17,18 @@ different nightly is a different ABI.
 
 ## Unreleased
 
+### Known defects in 0.2.13, found by the long-context window (2026-09-03)
+- `--paged-kv u8:i4`: every request with a prompt longer than about 2,048
+  tokens fails with a GPU out-of-resources error during prefill (HTTP 500);
+  u8 is unaffected. The +28% auto-fit context at u8:i4 is therefore not
+  usable beyond that depth until the prefill path is fixed. Do not deploy
+  u8:i4.
+- `--dflash`: the exported draft head carries a state variable fixed at
+  2,048 rows; the first draft after a prompt longer than that fails and the
+  drafter disables itself for the process (decode continues without
+  drafts). Every DFlash number on the record was taken with prompts under
+  2,048 tokens.
+
 - Drafting II measured (M11, `DESIGN.md` §7.0.2z): four host-side levers on
   the DFlash2 chain, all free of training. Viterbi over the selector's
   lattice accepts fewer drafts than the greedy commit on every probe;

@@ -100,8 +100,10 @@ exported with `tools/export_dflash.py` and drafting seven tokens per verify
 pass through the same checkpoint-row verify the MTP head uses. On one card it
 costs ~63k tokens of context headroom; parking the draft on the A770
 (`--dflash-device`) buys 35k of that back for 5 t/s of PCIe round-trips, with
-output byte-identical to the same-card run. The DFlash2 rows have not been
-through the acceptance harness yet. At production context (155648) the MTP
+output byte-identical to the same-card run. The DFlash2 rows were taken with prompts under 2,048 tokens: the exported
+head's state variable is fixed at 2,048 rows and the drafter disables itself
+on longer prompts (known defect, 2026-09-03; the drafter-on acceptance task
+scores 10/10 at that depth). At production context (155648) the MTP
 head serves at 36.2 t/s and 93.2% acceptance, 10/10 greedy. Prefill on the
 coder reaches ~1970 t/s.
 
@@ -119,7 +121,7 @@ Text output byte-identical over 64 greedy tokens between the two paths at both r
 task 10/10 at ratio 50 / 8 GiB (the ratio-75 cell has the text identity, no
 acceptance run).
 
-**Context by KV precision.** `--paged-kv u8:i4` (asymmetric key/value
+**Context by KV precision.** (Known defect, 2026-09-03: u8:i4 fails during prefill for prompts longer than about 2,048 tokens; the numbers stand, the setting is not deployable until the prefill path is fixed.) `--paged-kv u8:i4` (asymmetric key/value
 precision) against the `u8` default, same artifact, same card:
 
 | model | card | u8 auto-fit | u8:i4 auto-fit | gain |
