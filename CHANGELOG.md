@@ -310,7 +310,33 @@ different nightly is a different ABI.
   chunk bigger than any chunk activations were ever actually probed at
   (an under-reservation risk); it now re-seeds from the last chunk
   actually probed, bounding the result by construction rather than by a
-  post-hoc clamp.
+  post-hoc clamp. (4) A FOURTH round on this same switch, found only
+  once the first three were fixed and the switch could finally reach a
+  real card: `ARCINT_PREFILL_CHUNK_CAP=off --n-ctx 101824
+  --prefill-chunk 128` was still REFUSED -- "prefill scratch charged
+  1200.2 MiB at chunk 128 ... admits 32256" -- the switch correctly
+  bypassed the belt and the measured cap, but `fit_context_packed_
+  values`/`_at_depth` still charged a real, depth-scaled term at whatever
+  chunk that left, and the charge alone was enough to refuse the load
+  before the plugin's own kernel ever ran a prefill at that chunk. A
+  switch whose purpose is reproducing the plugin's OWN fault line cannot
+  do that if this repository's own budget math refuses the load first.
+  `belt_enabled=false` (both fit.h primitives) is now a FULL bypass: no
+  belt, no cap, AND no scratch term (charged 0) -- `chunk` still pins at
+  the requested one (so the load still serves what the operator asked
+  for, unclamped), but nothing is subtracted from the budget for it, so
+  whatever admits or refuses past this point is Phase E's own real,
+  on-card allocation.
+
+  Also fixed, same round: the "prefill scratch charged ... for n_ctx N"
+  detail log printed `min(wanted, max_ctx)` for its depth field, which
+  reads fine when a request is admitted but collapses to a misleading
+  "n_ctx 0" in the refuse case -- the SAME card trace above showed
+  "for n_ctx 0" on a load refusing a 101,824-token request, which reads
+  as "serving an empty context," not "refusing this request." Prints
+  the REQUESTED depth (`wanted`) and what the reservation ADMITS
+  (`max_ctx`) separately now: "for requested n_ctx 101824 (admits 0)"
+  says plainly that the request is being refused.
 - `--prefill-chunk` under 4-bit paged VALUES: an engine-side belt
   (`exec/fit.h`'s `prefill_chunk_cap_for_packed_values`) now lowers the
   served chunk from the SERVED pool depth (after --n-ctx clamping,

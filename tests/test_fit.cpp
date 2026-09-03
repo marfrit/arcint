@@ -1955,14 +1955,22 @@ TEST(fit_context_packed_values_settles_on_the_chunk_the_belt_agrees_with) {
     CHECK(term.iterations >= 1);
 }
 
-// ARCINT_PREFILL_CHUNK_CAP=off (backend_ov.cpp's measurement switch, reused
-// here as `belt_enabled = false`): the belt itself is disabled, so the
-// served chunk is the REQUESTED one, uncapped, for the whole load -- the
-// term must price exactly that (a single pass, no ladder), which charges
-// MORE than the belt-enabled climb (a larger, un-shrunk chunk) and so
-// lands on an equal-or-SMALLER max_ctx -- conservative in the same
-// direction as every other over-charge in this file.
-TEST(fit_context_packed_values_belt_disabled_prices_the_uncapped_chunk) {
+// Round-15 review (Opus, REAL defect, RETRACTS this test's own original
+// premise -- kept on the record, per DESIGN §7.0.1): `belt_enabled =
+// false` used to still PRICE the uncapped chunk (a real, and often
+// large, charge) -- measured on the card, that charge alone was enough
+// to refuse a load `ARCINT_PREFILL_CHUNK_CAP=off` was supposed to let
+// through so the plugin's own kernel could be the thing that faults, not
+// this repository's own budget estimate. `belt_enabled=false` is now a
+// FULL measurement bypass: no belt, no cap, no scratch term at all --
+// `chunk` stays pinned at the REQUESTED one (still uncapped, still what
+// the load actually serves), but the fit runs exactly as if this term
+// did not exist, so `belt_off.fit.max_ctx` must equal a PLAIN
+// `fit_context(base)` (no packed-values term folded in at all) --
+// strictly MORE than the belt-enabled climb's own max_ctx, not
+// equal-or-less the way charging a real (if uncapped) term used to make
+// it.
+TEST(fit_context_packed_values_belt_disabled_charges_nothing) {
     const FitTerms base = m9_base_terms();
     const PackedValuesFitTerm belt_off =
         fit_context_packed_values(base, kM9RequestedChunk, kCoderHeads, kCoderHeadSize,
@@ -1970,27 +1978,25 @@ TEST(fit_context_packed_values_belt_disabled_prices_the_uncapped_chunk) {
     const PackedValuesFitTerm belt_on =
         fit_context_packed_values(base, kM9RequestedChunk, kCoderHeads, kCoderHeadSize,
                                   kScratchBudget, kM9KvBlockTokens, /*belt_enabled=*/true);
-    CHECK_EQ(belt_off.chunk, kM9RequestedChunk);  // pinned, never shrunk
+    const FitResult plain = fit_context(base);
+    CHECK_EQ(belt_off.chunk, kM9RequestedChunk);  // pinned, unclamped -- still what is served
     CHECK_EQ(belt_off.iterations, 1);
-    CHECK(belt_off.fit.max_ctx <= belt_on.fit.max_ctx);
-    // 695,328: the belt-on climb's own first-round figure (x1.5 overlap
-    // bound, plus round-6 review finding 4's exp_sums/max_logits pair;
-    // the retracted 2x multiplier gave 584,896 here, and the pre-finding-4
-    // figure -- tmp_out alone -- was 697,408; both are red against the
-    // current formula).
-    CHECK_EQ(belt_off.fit.max_ctx, 695328);
+    CHECK_EQ(belt_off.per_token_bytes, 0ull);
+    CHECK_EQ(belt_off.fixed_bytes, 0ull);
+    CHECK_EQ(belt_off.fit.max_ctx, plain.max_ctx);  // exactly the term-free fit, no term at all
+    CHECK(belt_off.fit.max_ctx > belt_on.fit.max_ctx);  // strictly more room than charging
+                                                        // ANY term, capped or not, would leave
 }
 
-// Round-12 review (Opus), finding 1: `ARCINT_PREFILL_CHUNK_CAP=off`
-// (`belt_enabled=false` here) must disable BOTH limits the belt would
-// otherwise apply -- the 512 MiB budget-driven ladder AND the
-// `kMaxMeasuredPackedValuesChunk` = 128-token ceiling -- not just the
-// first. `kM9RequestedChunk` (128, the test above) sits exactly AT the
-// measured cap, too small to prove the cap itself is bypassed; 2048 (the
-// operator's own --prefill-chunk default) is well past it, so this is
-// the test that would have caught backend_ov.cpp's own round-11/round-12
-// regressions (the ceiling and the `prefill_chunk_` seed both
-// unconditionally re-applying the 128 cap even with the switch set).
+// Round-12 review (Opus), finding 1 (retained under the round-15 full-
+// bypass redesign, above -- the measured cap must stay bypassed too, not
+// just the budget ladder, and `kM9RequestedChunk` (128, the test above)
+// sits exactly AT the cap, too small to prove it on its own): 2048 (the
+// operator's own --prefill-chunk default) is well past the 128-token
+// ceiling, so a served chunk of exactly 2048 here proves BOTH that the
+// cap did not fire AND that the belt did not run at all -- a capped-but-
+// still-priced result would also show `chunk <= 2048`, but not a term of
+// exactly zero.
 TEST(fit_context_packed_values_belt_disabled_bypasses_the_measured_cap_too) {
     const FitTerms base = m9_base_terms();
     const PackedValuesFitTerm belt_off =
@@ -1998,6 +2004,8 @@ TEST(fit_context_packed_values_belt_disabled_bypasses_the_measured_cap_too) {
                                   kScratchBudget, kM9KvBlockTokens, /*belt_enabled=*/false);
     CHECK_EQ(belt_off.chunk, 2048);  // pinned, uncapped by budget OR the measured ceiling
     CHECK_EQ(belt_off.iterations, 1);
+    CHECK_EQ(belt_off.per_token_bytes, 0ull);
+    CHECK_EQ(belt_off.fixed_bytes, 0ull);
 }
 
 // u8/f16 values: backend_ov.cpp never calls this function on that path (it
@@ -2608,22 +2616,36 @@ TEST(explicit_n_ctx_new_order_evaluate_at_depth_admits_the_requested_depth) {
 }
 
 // Round-14 review (Opus), finding 1: `ARCINT_PREFILL_CHUNK_CAP=off` on
-// the EXPLICIT --n-ctx path -- `belt_enabled=false` now prices the
-// requested chunk (2048, the operator's own default, well past both the
-// 512 MiB budget and the 128-token measured cap at this depth) UNCHANGED
-// -- no ladder, no cap -- exactly the "no belt, no cap, term priced at
-// that chunk" the switch promises, and exactly what the auto-fit search
-// already does via its own `belt_enabled` (this is the SAME real
-// function backend_ov.cpp's explicit call site now threads `cap_off`
-// into, not a second implementation of the switch).
-TEST(explicit_n_ctx_at_depth_belt_disabled_prices_the_uncapped_configured_chunk) {
+// the EXPLICIT --n-ctx path -- `belt_enabled=false` -- exactly what the
+// auto-fit search already does via its own `belt_enabled` (this is the
+// SAME real function backend_ov.cpp's explicit call site threads
+// `cap_off` into, not a second implementation of the switch).
+//
+// Round-15 review (Opus, REAL defect, RETRACTS this test's own original
+// premise -- kept on the record, per DESIGN §7.0.1): a card measurement
+// with `ARCINT_PREFILL_CHUNK_CAP=off --n-ctx 101824 --prefill-chunk 128`
+// showed the load REFUSED (1,200.2 MiB still charged at chunk 128, only
+// 32,256 admitted) even with the belt and cap both bypassed -- the
+// depth-scaled term alone, still priced at the uncapped chunk, was
+// enough. `belt_enabled=false` now charges NOTHING here too (see
+// `fit_context_packed_values_at_depth`'s own retraction comment): the
+// requested chunk (2048) is still what gets served, but the fit runs as
+// if the packed-values term did not exist, so a plain `fit_context(base)`
+// is what admits or refuses -- not this file's own estimate of a buffer
+// whose fault line is the whole reason the switch exists.
+TEST(explicit_n_ctx_at_depth_belt_disabled_charges_nothing) {
     const FitTerms base = r8_terms(kR8ActivationCorrect);
     const PackedValuesFitTerm at_depth = fit_context_packed_values_at_depth(
         base, /*requested_chunk=*/2048, kCoderHeads, kCoderHeadSize, kScratchBudget,
         kR8KvBlockTokens, /*depth=*/102384, /*max_partitions=*/0, /*element_bytes=*/4,
         /*belt_enabled=*/false);
-    CHECK_EQ(at_depth.chunk, 2048);  // pinned, uncapped by budget OR the measured ceiling
+    const FitResult plain = fit_context(base);
+    CHECK_EQ(at_depth.chunk, 2048);  // pinned, uncapped by budget OR the measured ceiling --
+                                     // still what the load actually serves
     CHECK_EQ(at_depth.iterations, 1);
+    CHECK_EQ(at_depth.fixed_bytes, 0ull);
+    CHECK_EQ(at_depth.per_token_bytes, 0ull);
+    CHECK_EQ(at_depth.fit.max_ctx, plain.max_ctx);  // exactly the term-free fit
 }
 
 // Round-10 review, finding 1 (REAL defect, retracts round-9's own claim

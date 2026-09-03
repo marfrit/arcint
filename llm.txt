@@ -381,10 +381,20 @@ memory
                             An explicit --prefill-chunk is capped the same
                             way, never raised; ARCINT_PREFILL_CHUNK_CAP=off in
                             the environment keeps the requested chunk for
-                            measuring the fault line -- NO belt, NO cap, the
-                            term priced at the full requested/default chunk
-                            unchanged, on BOTH the auto-fit and the explicit
-                            --n-ctx path (logged, never a default). A
+                            measuring the fault line -- a FULL bypass: NO
+                            belt, NO cap, AND NO scratch-buffer reservation
+                            term (charged 0, not merely priced at the
+                            uncapped chunk -- an earlier version of this
+                            switch still charged a real, depth-scaled term
+                            there, which on its own was enough to refuse a
+                            card load the switch was supposed to let
+                            through; see the RETRACTED history below), on
+                            BOTH the auto-fit and the explicit --n-ctx path
+                            (logged loudly, never a default -- a long
+                            prefill run this way may fault or OOM with no
+                            reservation left to catch it first, which is the
+                            point: the plugin's own kernel is what faults,
+                            not this repository's own budget estimate). A
                             SEPARATE, hard ceiling
                             (kMaxMeasuredPackedValuesChunk, fit.h) applies
                             after the budget-based shrink, WHEN the belt is
@@ -435,7 +445,20 @@ memory
                             activations were ever actually probed at
                             (under-reservation risk); it now re-seeds from
                             the last chunk actually probed, bounding the
-                            result by construction. Measured cost (16 GiB-class
+                            result by construction. A FOURTH retraction on
+                            this same switch: even after belt and cap were
+                            both correctly bypassed on both paths (the two
+                            fixes above), a card run
+                            (ARCINT_PREFILL_CHUNK_CAP=off, --n-ctx 101824,
+                            --prefill-chunk 128) was still REFUSED --
+                            "prefill scratch charged 1200.2 MiB at chunk 128
+                            ... admits 32256" -- the scratch term was still
+                            being priced (just at the uncapped chunk instead
+                            of the belt-shrunk one), and that alone was
+                            enough to refuse the load before the plugin's
+                            own kernel ever ran a prefill at that chunk. The
+                            switch now charges NOTHING (see above) rather
+                            than a smaller-but-still-real term. Measured cost (16 GiB-class
                             card, coder, u8:i4, n_ctx 131,072, 8,417-token
                             prompt): 495 t/s prefill at chunk 128, 437 at 64
                             (-12%), 440 at 32. Chunk 128 only fits the

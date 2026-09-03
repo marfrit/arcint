@@ -3768,33 +3768,55 @@ private:
             // went on to adopt a train maximum orders of magnitude
             // smaller). `paged_n_ctx_` itself is not computed until after
             // Phase E (min(wanted, max_ctx), further down, and possibly
-            // trimmed again after that) so it is not yet known here;
-            // `std::min(wanted, max_ctx)` is the same clamp one step
-            // early, before any Phase E trim -- close enough for this
-            // line's purpose (explaining the scratch charge just struck),
-            // and never overstates the served depth the way the raw
-            // ceiling did.
+            // trimmed again after that) so it is not yet known here; a
+            // follow-up fix printed `std::min(wanted, max_ctx)` instead,
+            // one step early, before any Phase E trim.
+            //
+            // RETRACTED (a later, card-measured defect this repository's
+            // own record keeps rather than silently editing away, per
+            // DESIGN §7.0.1): `min(wanted, max_ctx)` reads fine when the
+            // request is admitted, but collapses to a misleading "n_ctx
+            // 0" in the REFUSE case -- measured on the card,
+            // `ARCINT_PREFILL_CHUNK_CAP=off` with `--n-ctx 101824` and no
+            // `--prefill-chunk` priced the term at the full, unbelted
+            // chunk 2048 (19,203.5 MiB), leaving no budget at all
+            // (`max_ctx` 0 after the slack subtraction above), and the
+            // load correctly went on to refuse -- but the log printed
+            // "for n_ctx 0", which reads as "this load is about to serve
+            // an empty context," not "this load is about to refuse a
+            // 101,824-token request." `min()` conflates two different
+            // numbers (what was asked for, and what the budget admits)
+            // into one that is only informative when they happen to
+            // agree. Printed separately now: the REQUESTED depth
+            // (`wanted` -- this file's own name for it everywhere else,
+            // including the refusal message itself) and what the
+            // reservation ADMITS (`max_ctx`, already the slack-adjusted
+            // figure the admissibility check just below uses) -- "for
+            // requested n_ctx 101824 (admits 0)" says plainly that the
+            // request is being refused, not served at depth 0.
+            //
             // Round-10 review (Opus), finding 7: `packed_values_log_per_
             // token_bytes` is INFORMATIONAL only -- the marginal rate the
             // term would grow at, one token further, at the served chunk.
             // It does NOT reconstruct the printed MiB figure by simple
-            // multiplication against `served_n_ctx_for_log`: the charged
-            // MiB is priced at the BUDGET ceiling `max_ctx` (this line's
-            // own `term_total_bytes`, shared with the summary line and
-            // Phase E's ceiling check above), while the rate is quoted at
-            // whichever chunk was actually served, and the bounded arm
-            // (`max_partitions > 0`) charges a flat amount with no
-            // per-token slope at all (the rate there describes what an
-            // UNBOUNDED reservation would have cost per token, for
-            // comparison, not a component of the bounded charge itself).
-            // Labelled "rate" rather than "per token" so the line does not
-            // read as a component that should sum to the total above it.
-            const long long served_n_ctx_for_log = std::min<long long>(wanted, max_ctx);
+            // multiplication against either depth printed here: the
+            // charged MiB is priced at the BUDGET ceiling `max_ctx` (this
+            // line's own `term_total_bytes`, shared with the summary line
+            // and Phase E's ceiling check above), while the rate is
+            // quoted at whichever chunk was actually served, and the
+            // bounded arm (`max_partitions > 0`) charges a flat amount
+            // with no per-token slope at all (the rate there describes
+            // what an UNBOUNDED reservation would have cost per token,
+            // for comparison, not a component of the bounded charge
+            // itself). Labelled "rate" rather than "per token" so the
+            // line does not read as a component that should sum to the
+            // total above it.
             log::info("load",
-                      "4-bit values: prefill scratch charged %.1f MiB at chunk %d for n_ctx %lld "
-                      "(informational rate %.1f KiB/token + KV %.1f KiB/token)",
+                      "4-bit values: prefill scratch charged %.1f MiB at chunk %d for requested "
+                      "n_ctx %d (admits %lld) (informational rate %.1f KiB/token + KV %.1f "
+                      "KiB/token)",
                       static_cast<double>(term_total_bytes) / (1u << 20), packed_values_chunk,
-                      served_n_ctx_for_log,
+                      wanted, max_ctx,
                       static_cast<double>(packed_values_log_per_token_bytes) / 1024.0,
                       static_cast<double>(kv_bytes_token_) / 1024.0);
             // 0015 engine side: the plugin-support disclosure, separate
@@ -4645,10 +4667,31 @@ private:
         // `cap_off` and `packed_geom` were already resolved once, before the
         // climb above (the fit-side term needs the same two facts) -- reused
         // here rather than re-read/re-parsed a second time.
+        //
+        // Round-15 review (Opus, REAL defect, RETRACTS this warning's own
+        // original wording -- kept on the record, per DESIGN §7.0.1): the
+        // switch used to disable only the belt (chunk-shrinking) and the
+        // measured cap -- the fit.h fixed-point (`fit_context_packed_
+        // values`/`_at_depth`, both above) still charged a real,
+        // depth-scaled scratch term at whatever chunk that left, and a
+        // card measurement showed that charge ALONE refusing a load
+        // (`--n-ctx 101824 --prefill-chunk 128`: 1,200.2 MiB charged,
+        // only 32,256 admitted) the switch was supposed to let through.
+        // A switch whose purpose is reproducing the plugin's OWN fault
+        // line cannot do that if this repository's own budget math
+        // refuses the load first -- the fault lives in the very pool the
+        // term forbade. Both fit.h primitives now treat `belt_enabled =
+        // false` as a FULL bypass (no belt, no cap, no term -- see their
+        // own retraction comments), so the warning is corrected to say
+        // that plainly rather than naming only two of the three things
+        // it actually does.
         if (packed_values && cap_off) {
             log::warn("load", "%s",
-                      "ARCINT_PREFILL_CHUNK_CAP=off: the 4-bit-values prefill-chunk belt is "
-                      "disabled for this load (measurement only) -- a long prefill may fault");
+                      "ARCINT_PREFILL_CHUNK_CAP=off: the 4-bit-values prefill-chunk belt, its "
+                      "measured cap, AND its scratch-buffer reservation term are all disabled "
+                      "for this load (charged 0) -- measurement only, so the plugin's own "
+                      "kernel is what faults, not this repository's own budget estimate; a "
+                      "long prefill may fault or OOM with no reservation to catch it first");
         }
         if (packed_values && !cap_off) {
             const std::optional<PackedValuesScratchGeometry>& geometry = packed_geom;

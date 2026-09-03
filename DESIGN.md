@@ -3360,7 +3360,13 @@ context length — are identical at any pool size, so the defect sits in
 the asymmetric packed-value path this series added in patches 0008 to
 0010, reached only when the pool is deep and the prompt reaches into it;
 the patched plugin at the bound serves the same 119k prompt from a
-131,072-token pool, so the bounded path itself holds; the exact boundary
+131,072-token pool on the 16 GiB card, so the bounded path itself
+holds; on the 24 GB card, whose GPU reports faults, even the unpatched
+plugin crashes at a 131,072-token pool with that prompt, so the
+consequence of the bad access depends on the card and on what lies
+beyond the buffer, and the plugin's own paged-attention harness, which
+runs one primitive once, passes at 170,000 tokens of past in every
+configuration tried — the defect needs the served path's structure; the exact boundary
 between 131k and 165k tokens is the open question (no constant of 8,192
 or 131,072 exists on this path in the plugin, the patches or the engine,
 and the device's single-allocation limits are far away); the binding fix stays in the patch as a real defect fixed,

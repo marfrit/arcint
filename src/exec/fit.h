@@ -1345,16 +1345,42 @@ inline PackedValuesFitTerm fit_context_packed_values(const FitTerms& base, int r
         return r;
     }
 
+    // Round-15 review (Opus, REAL defect, RETRACTS the paragraph this
+    // replaces -- kept on the record rather than silently edited away,
+    // per DESIGN §7.0.1): `belt_enabled = false` used to still price the
+    // FULL term at the uncapped `requested_chunk` -- one pass, no ladder,
+    // but still a real (and, at a large requested chunk, large) charge
+    // subtracted from the budget. Measured on the card:
+    // `ARCINT_PREFILL_CHUNK_CAP=off` with `--n-ctx 101824 --prefill-chunk
+    // 128` still charged 1,200.2 MiB at chunk 128 and the load was
+    // REFUSED (admits 32,256, far short of 101,824) -- the switch bypassed
+    // the belt and the measured cap, exactly as designed, but the
+    // depth-scaled term it still charged was enough on its own to refuse
+    // the load before the plugin's own kernel ever ran a prefill at that
+    // chunk. A switch whose whole purpose is reproducing the plugin's
+    // OWN fault line cannot do that if THIS repository's own budget math
+    // refuses the load first -- the fault this switch exists to find
+    // lives in the pool the term forbids. `belt_enabled = false` is now a
+    // FULL measurement bypass: no belt, no cap, AND no scratch term --
+    // the reservation proceeds exactly as if this load were not under
+    // 4-bit paged VALUES at all, `chunk` stays pinned at `requested_chunk`
+    // (so the actual served prefill chunk is still the operator's own
+    // request, unclamped), and whatever admits or refuses is Phase E's
+    // real, on-card allocation -- not this file's own conservative
+    // estimate of one buffer it cannot see the plugin's own true size
+    // for.
+    if (!belt_enabled) {
+        r.fit   = fit_context(base);
+        r.chunk = requested_chunk;
+        r.per_token_bytes = 0;
+        r.fixed_bytes      = 0;
+        r.iterations       = 1;
+        return r;
+    }
+
     int chunk      = requested_chunk;
     int prev_chunk = 0;
-    // ARCINT_PREFILL_CHUNK_CAP=off (the measurement switch at the belt call
-    // site in backend_ov.cpp) disables the belt's own chunk-shrinking, so
-    // the served chunk is `requested_chunk` unconditionally -- charging the
-    // term at anything else would understate what that load actually
-    // allocates. `belt_enabled = false` prices exactly that: one pass, no
-    // ladder, `chunk` pinned at `requested_chunk`.
-    const int rounds = belt_enabled ? 32 : 1;
-    for (int i = 0; i < rounds && chunk != prev_chunk; ++i) {
+    for (int i = 0; i < 32 && chunk != prev_chunk; ++i) {
         prev_chunk = chunk;
         FitTerms t = base;
         uint64_t per_token = 0;
@@ -1396,7 +1422,9 @@ inline PackedValuesFitTerm fit_context_packed_values(const FitTerms& base, int r
         r.per_token_bytes = per_token;
         r.fixed_bytes      = fixed;
         r.iterations       = i + 1;
-        if (belt_enabled) {
+        // `belt_enabled` is always true past the early return above --
+        // this loop no longer runs at all when it is false.
+        {
             // The belt's own proxy must price the SAME buffer this term
             // just charged -- partitions bounded the same way, the same
             // element size -- or it halves the chunk for a buffer that no
@@ -1536,11 +1564,23 @@ inline int belt_requested_chunk(int prefill_chunk, int priced_chunk) {
 // --n-ctx path -- an operator running `--n-ctx 102384
 // ARCINT_PREFILL_CHUNK_CAP=off` still had the belt (and the measured-cap
 // ceiling on top of it) applied unconditionally, while the load's own
-// log claimed the belt was disabled. Mirrors `fit_context_packed_values`
-// exactly: `belt_enabled=false` prices `requested_chunk` unchanged, no
-// ladder, no cap -- the caller's `configured` chunk, uncapped, is what
-// gets charged, so the fault line this switch exists to reproduce is
-// reachable on the explicit path too, not only auto-fit's.
+// log claimed the belt was disabled.
+//
+// Round-15 review (Opus, REAL defect, RETRACTS this paragraph's own
+// original claim -- kept on the record rather than silently edited away,
+// per DESIGN §7.0.1): `belt_enabled=false` used to still price
+// `requested_chunk` unchanged -- no ladder, no cap, but still a real
+// term. Measured on the card (see `fit_context_packed_values`'s own
+// retraction, above, for the full account): a depth-scaled term charged
+// at the uncapped chunk was, on its own, enough to refuse the load
+// before the plugin's own kernel ever ran a prefill -- the switch bypassed
+// the belt and the cap exactly as designed, but not the thing that
+// actually stood between the load and the fault line it exists to find.
+// `belt_enabled=false` is now a FULL bypass here too, matching
+// `fit_context_packed_values` exactly: no belt, no cap, no scratch term
+// (`fixed_bytes` and `per_token_bytes` both 0) -- `chunk` still pins at
+// `requested_chunk` (the served chunk is still the operator's own
+// request, unclamped), but nothing is subtracted from the budget for it.
 inline PackedValuesFitTerm fit_context_packed_values_at_depth(
     const FitTerms& base, int requested_chunk, int heads, int head_size,
     uint64_t scratch_budget_bytes, int block_size, long long depth, int max_partitions,
@@ -1552,12 +1592,18 @@ inline PackedValuesFitTerm fit_context_packed_values_at_depth(
         r.chunk = requested_chunk;
         return r;
     }
+    if (!belt_enabled) {
+        r.fit   = fit_context(base);
+        r.chunk = requested_chunk;
+        r.fixed_bytes      = 0;
+        r.per_token_bytes = 0;
+        r.iterations       = 1;
+        return r;
+    }
     const long long partitions = packed_values_bounded_partitions(depth, max_partitions);
-    const int       chunk      = belt_enabled
-                                     ? prefill_chunk_cap_for_packed_values_ex(
-                                           requested_chunk, partitions, heads, head_size,
-                                           element_bytes, scratch_budget_bytes, block_size)
-                                     : requested_chunk;
+    const int       chunk      = prefill_chunk_cap_for_packed_values_ex(
+        requested_chunk, partitions, heads, head_size, element_bytes, scratch_budget_bytes,
+        block_size);
     const uint64_t single_lane =
         packed_values_prefill_scratch_bytes_ex(chunk, partitions, heads, head_size,
                                                element_bytes) +
