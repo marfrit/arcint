@@ -28,9 +28,15 @@ coder q4; all three target models reach 10/10 on the fleet harness.
   M1 executor, greedy, coder/B60  done - 51.4 t/s, 10/10
   M2 chunked prefill, ledger      done bar the paged path
   M3 prefix caching               done - warm/cold byte-identical
-  M4 MTP                          done - 93.3% acceptance (not byte-identical)
+  M4 MTP                          done - 93.2% acceptance (not byte-identical)
   M5 all three models             done; 35B fits the A770 via --offload-ratio
   M6 two lanes per service        done - one process, byte-identical, 10/10 each
+  M7 fit pass                     done - two-ledger reservation measured; explicit --n-ctx verify-only, never lowered
+  M8 asymmetric KV --paged-kv u8:i4  done - serves, 10/10, +28% ctx (8.8 vs 11.3 KiB/token); owes prefill price, prefix byte-exactness
+  M9 device-tier expert slot pool done - 35B/16 GiB card 0.4 t/s (ratio 25, unpatched) -> 9.1 (ratio 50 / 8 GiB pool, 16-token probe) and 10.4 (64-token probe)
+  M12 dispatch pin, tiled exporter done - --pin-dispatch measured null on a quiet host, opt-in; exporter --moe-lowering tiled
+  M13 vision reserved             done - --vision refused; vision IRs reported at load, never loaded (coder: 6 files, 428.3 MiB)
+  M14 host compute tier --moe-cpu-tier done - 35B/16 GiB card 15.0/15.5 vs 10.4/10.6 t/s at ratio 50/8 GiB; 14.1/14.8 vs 7.4/7.5 at ratio 75/5 GiB; byte-identical, 10/10
 
 Two M2 walls came down. Slicing logits to the last token before the LM head
 removed an out-of-memory wall at ~8k tokens (the graph computed logits for
@@ -141,7 +147,7 @@ budget of zero). Each card lands where its memory says: B60 chunk 2048, A770
 refused at startup with every term. At request time, a third concurrent request
 is a 503 carrying the same arithmetic (--queue-timeout S restores queueing).
 
-Verification: 155 unit cases, a 48-check curl round-trip, a lane-accounting
+Verification: 287 unit cases, a 61-check curl round-trip, a lane-accounting
 stress (200 requests, 24-way, 8 lanes, both queueing and refusing), an
 equivalence suite and a concurrency suite that run where the card is. Clean
 under ASan and UBSan on x86_64.
@@ -215,6 +221,16 @@ supply chain changes shape: the runtime package currently repacks wheels in
 seconds, while a patched build is a real x86_64 compile with no CI runner for
 that target.
 
+Patch series to date (contrib/packaging/marfrit-openvino/patches/): 0001-0002
+measured and NOT carried (an instrument, and a fusion bound that produced
+wrong output); 0003-0013 applied on top of the same pinned upstream commit --
+0003 MoE per-infer expert-mask subbuffer churn, 0004 OTD perf counters, 0005
+device-resident MoE slot pool, 0006 async batched slot uploads, 0007 drop the
+redundant per-MoE-layer stream finish, 0008 VALUE_CACHE_PRECISION config
+option, 0009 asymmetric KV kernel plan, 0010 asymmetric decode kernel (u8
+keys, i4 values), 0011 MoE host compute tier kernel, 0012 MoE host tier
+decode-path redirect, 0013 per-expert routing histogram.
+
 ## Key design points
 
 - All target models are hybrids: GatedDeltaNet (linear attention, fixed-size
@@ -227,7 +243,7 @@ that target.
   logits row, so a draft is never taken on faith. Output is NOT byte-identical
   to plain greedy - see the invariant note above. Two drafters, both off by
   default: the
-  native Qwen3.8 MTP head (--mtp on, 93.3% acceptance) and a prompt-lookup
+  native Qwen3.8 MTP head (--mtp on, 93.2% acceptance) and a prompt-lookup
   drafter (--draft N). optimum-intel drops the MTP head on export, so
   tools/export_mtp.py reconstructs it from the checkpoint's mtp.* tensors; the
   forward pass was recovered by measurement (zero-centred (1+w) norms,
@@ -261,6 +277,161 @@ that target.
 - Client disconnect aborts GPU work at next scheduler boundary.
 - Prefill throughput is a first-class regression metric per card (measured
   pain: 58 t/s prefill on A770/Vulkan = 6 min TTFT at 21k context).
+- M7 fit pass: the paged path auto-fits --n-ctx to the measured admissible
+  depth when the flag is omitted; given explicitly it is verify-only, never
+  lowered, and a refusal trims the prefix-cache reserve pages first.
+- M8 asymmetric KV, --paged-kv KEY[:VALUE]: u8:i4 costs 8.8 KiB/token against
+  u8's 11.3 and auto-fits +28% more context; 10/10 on the acceptance task.
+  Owed: the prefill price, and prefix byte-exactness.
+- M9/M14 MoE expert offload on the host tier: --moe-cpu-tier computes
+  capacity-miss experts on the CPU instead of a PCIe upload, ahead of the
+  device-resident slot pool and async batched uploads underneath it.
+- M12: --pin-dispatch pins a lane's dispatch thread (measured null on a quiet
+  host, opt-in); the exporter's --moe-lowering tiled.
+- M13: --vision is reserved and refused; a VLM checkpoint's vision tower and
+  projector IRs are reported at load and never loaded.
+- The complete flag list is the section "Command-line options" below,
+  generated from the binary's --help (src/config.cpp usage_text) at release
+  time; the source is authoritative when the two disagree.
+
+## Command-line options (arcint --help, 0.2.13)
+
+```
+usage: arcint [options]
+
+model
+  --model PATH              OpenVINO IR directory to serve
+  --stub                    serve the M0 stub backend (no model, no GPU)
+  --stub-delay-ms N         stub only: artificial latency per token
+  --model-id ID             allowlist entry to assert (default: from the
+                            artifact directory name)
+  --quant q4|q8             weight format (default: q4)
+  --device DEV              OpenVINO device (default: GPU.0)
+  --cache-dir PATH          compiled-blob cache directory
+  --vision                  (reserved; refused) v1 is text-only; the vision
+                            tower and projector IRs a VLM checkpoint ships are
+                            never loaded
+
+server
+  --host ADDR               bind address (default: 127.0.0.1)
+  --port N                  bind port (default: 8090)
+  --served-model-name NAME  the name this endpoint reports on
+                            /v1/models and /props (default: the
+                            artifact's allowlist id). Presentation
+                            only: --model-id still decides which
+                            artifact is accepted
+  --parallel N              number of lanes (default: 1)
+  --queue-timeout S         seconds a request waits for a lane before a
+                            503 with the reservation numbers (default: 0)
+  --http-threads N          HTTP worker threads (default: library default)
+  --pin-dispatch N          pin each lane's dispatch thread to N+lane_index
+                            (default: -1, off). Linux only. The pin persists on
+                            the pooled OS thread, not the request -- it is never
+                            undone once set
+  --moe-cpu-tier            compute expert FFNs that would evict a device
+                            slot on the host CPU instead (needs --offload-ratio)
+  --moe-cpu-tier-threads N  worker threads for that tier (0 = auto)
+
+memory
+  --n-ctx N                 context length. Omitted: adopts whatever the
+                            paged path's auto-fit computes (M7) -- that
+                            adoption IS the fit, and it can come out below
+                            the model's own maximum. --n-ctx 0 (typed) is
+                            NOT the same as omitting the flag: it asks
+                            explicitly for the model's own maximum, checked
+                            against the fit like any other explicit value --
+                            it can refuse where omission would have adopted
+                            a smaller number instead
+  --kv-block-size 16|32     KV page size in tokens (default: 32)
+  --prefill-chunk N         prefill chunk in tokens, 0 = unchunked
+                            (default: 2048; bounds activation memory)
+  --paged-kv KEY[:VALUE]    KV precision on the paged path (default: u8). KEY and
+                            VALUE each one of f16, u8, i8, u4, i4; omitting :VALUE
+                            applies KEY to both the key and value cache ("u8" and
+                            "f16" mean exactly what they always did). A colon pair
+                            asks for asymmetric precision (M8) and is refused unless
+                            the compiled paged model actually carries the requested
+                            widths per side.
+                            u8 is 11.3 KiB/token against f16's 20.0, which
+                            is what makes two lanes at depth fit. It is the
+                            default because it is the setting that does not
+                            refuse, not because it is faster -- f16 wins on
+                            prefill and, past ~50k, on decode too. f16 also
+                            costs prefix-cache reserve: the pool is sized in
+                            bytes and live pages are a fixed count, so the
+                            whole difference lands there
+  --cache-grid N            prefix-cache snapshot grid in tokens (default: 0 = the
+                            prefill chunk). A snapshot lands on the last multiple of N
+                            below the prompt length; a coarser grid re-prefills the
+                            remainder on every continuation. DESIGN 7.0.2j.
+  --cache-host-mib N        host tier for evicted prefixes: an entry evicted for its
+                            KV pages parks them in host RAM instead and comes back
+                            over the link on a hit (default: 0, off). DESIGN 4.4.
+  --kv-pool-pages N         cap the KV pool at N pages (default: 0, sized by memory).
+                            A test knob: the way to make the cache evict on demand.
+  --prefix-cache-reserve PCT
+                            auto-fit only (--n-ctx omitted): hold back PCT percent of
+                            the PER-LANE budget-affordable pages as spare for cached
+                            prefixes, so the adopted depth is reduced instead of eating
+                            the whole budget (default: 0, off -- today's behaviour, and
+                            what the "0 spare pages" warning names). PCT applies per
+                            lane; the pool actually allocated is lane-wide (--parallel
+                            lanes' worth), net of a small per-lane guard-page overhead --
+                            the load log names both the per-lane reserve and the pool-
+                            wide pages actually held. Integer 0..90; needs
+                            --prefix-cache-mib > 0 (nothing to reserve pages for
+                            otherwise) and refuses with an explicit --n-ctx -- an
+                            explicit depth already defines the reserve as whatever
+                            remains after the request.
+
+serving defaults (the operator layer: request > these > artifact > family card;
+any of them flips the served sampler provenance to 'operator')
+  --temp X                  default temperature (0 = greedy, which is also what
+                            lets the MTP drafter engage)
+  --top-p X                 default nucleus mass
+  --top-k N                 default top-k (0 disables)
+  --repetition-penalty X    default repetition penalty
+  --presence-penalty X      default presence penalty
+  --chat-template-kwarg enable_thinking=BOOL
+                            template default when the request sends neither
+                            chat_template_kwargs.enable_thinking nor
+                            reasoning_effort; only enable_thinking exists
+
+  --gate-pad N              widen the shared-expert gate to N columns (default: 0,
+                            off). 16 is the measured setting: -13% prefill wall,
+                            -5% decode; pays off below ~500 answer tokens per 12k
+                            prompt tokens. See DESIGN 7.0.2g.
+  --prefix-cache-mib N      prefix-cache budget in MiB (default: 0, off)
+  --fit-margin-mib N        headroom the paged-path auto-fit budget leaves
+                            unclaimed (default: 256). The only policy term in
+                            the reservation; every other term is measured
+  --no-logits-slice         compute logits for every prompt token (slower,
+                            and runs out of memory past a few thousand)
+  --kv-dtype fp16|fp32      stored KV element type (default: fp16;
+                            fp32 is what the artifact exports)
+  --gdn-checkpoint-budget N GDN checkpoint budget in MiB (default: 512)
+  --mtp on|off|auto         speculative decoding (default: auto)
+  --draft N                 speculative draft length, 0 = off
+  --draft-ngram K           drafter match length (default: 3)
+  --custom-kernels FILE     OpenVINO custom-layer XML (hand-written OpenCL)
+  --offload-ratio N         % of MoE expert weights to stream, 0 = all resident
+  --no-paged                stateful reference path instead of the paged executor
+  --emb-device DEV          run the embeddings gather elsewhere (default: --device)
+  --mtp-device DEV          run the MTP head elsewhere (default: --device)
+  --dflash DIR              DFlash2 block drafter directory (7 drafts per
+                            verify pass; greedy only, like --mtp). One
+                            drafter per server: conflicts with --mtp on
+                            and --draft N
+  --dflash-device DEV       run the drafter elsewhere (default: --device)
+  --mtp-layer WHICH         auto | reconstructed | exported: which MTP layer graph to
+                            draft with when the artifact carries both (default: auto,
+                            the reconstructed one when present)
+
+misc
+  -v, -vv                   raise console verbosity
+  --version                 print version and exit
+  -h, --help                print this help and exit
+```
 
 ## Layout
 
@@ -274,7 +445,7 @@ that target.
   stop, toolcall, chat, prefix_cache, block_pool, turnstile), exec/ (backend
   interface, stub, backend_ov), api/ (error, handlers), http/ (cpp-httplib
   wiring).
-- tests/: 155 unit cases (hand-rolled harness, no framework), roundtrip.sh
+- tests/: 287 unit cases (hand-rolled harness, no framework), roundtrip.sh
   (48 curl checks, both wired into ctest), concurrency/stress.sh (lane
   accounting, stub-only, also in ctest), and equivalence/run.sh plus
   concurrency/run.py, which need a real card.

@@ -1,0 +1,1733 @@
+# Paged KV: the per-side decode-READ kernel, PLUS (fable-review follow-up, same task,
+# see the later addenda below) the write-kernel split and guard/test hardening it needed
+# (u8 keys / i4 values)
+#
+# docs/design-m8-asymmetric-kv.md, the design this task's own binding spec named. Ships the
+# kernel-source half the design's scope verdict called "a bounded macro de-coupling, not a
+# tiling rewrite" for exactly one direction - key>=8bit / value 4bit (u8-K/i4-V) - on the DECODE
+# fast path only (paged_attention_opt.cpp/.cl's SINGLE_TOKEN stage). Applied against the pinned
+# runtime, build 2026.4.0-22849-71640275d29, on top of patches/0001-0009 (0008 = VALUE_CACHE_
+# PRECISION config plumbing this kernel reads; 0009 = the micro-SDPA decline, whose own logic is
+# UNCHANGED by this patch - see "prefill" below).
+#
+# Scope note (fable-review follow-up, added later in the same task, see the numbered addenda
+# below): "DECODE ONLY" above describes this patch's ORIGINAL scope - the READ-side kernel
+# split (§1/§2). It stopped being the whole truth once the write-kernel split (§7) landed in
+# the same patch: pa_kv_cache_update_ref.cl is ONE compiled program reachable from every write
+# stage (decode/2nd-token AND both prefill stages), so its IS_INT4_K/IS_INT4_V split had to be,
+# and is, consistent across all three - not decode-only. The dual-nibble dispatch fix in §1 also
+# touches the MULTI_TOKENS stage's DispatchDataFunc, not just SINGLE_TOKEN's, though it is
+# "fixed for consistency, not exercised" there per §1's own text. What IS still decode-only is
+# what actually SERVES asymmetric precision end-to-end: prefill still declines to the OCL
+# fallback (§3, patches/0009's guard, unchanged) rather than serving u8:i4 on micro-SDPA or the
+# opt kernel's own MULTI_TOKENS stage - so "decode serves, prefill still falls back" (§3's own
+# phrase) remains the accurate summary of what a caller observes, even though the write-side fix
+# is not decode-scoped internally.
+#
+# ---- 1. THE JIT SPLIT (paged_attention_opt.cpp) ----
+#
+# make_uint4_kv_cache_jit_constants() and PagedAttentionGeneratorBase::get_jit_constants() used
+# to derive every packing constant from one shared `kv_cache_dt = get_kv_cache_precision()`
+# (key-side only), so a compiled kernel instance was always either "both operands packed" or
+# "both unpacked" - never split. IS_INT4_COMPRESSED is retired; IS_INT4_K = is_i4_u4(get_kv_
+# cache_precision()) and IS_INT4_V = is_i4_u4(get_value_cache_precision()) now gate their own
+# operand independently: PACKED_K_HEAD_SIZE / PACKED_ADJUSTED_K_HEAD_SIZE / PACKED_K_BLOCK_SIZE
+# emit iff IS_INT4_K; PACKED_V_HEAD_SIZE / PACKED_ADJUSTED_V_HEAD_SIZE iff IS_INT4_V.
+# ADJUSTED_K_HEAD_SIZE / ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE / IS_KEY_BY_CHANNEL now select on
+# IS_INT4_K (u8-K takes the same unpacked "+scale_zp" arm i8-K always took - the formula was
+# already int4-agnostic there); ADJUSTED_V_HEAD_SIZE never distinguished i4 from i8 to begin
+# with (it counts adjusted *elements*, not bytes - PACKED_V_HEAD_SIZE carries the bitwidth), so
+# it only needed its own scale/zp size (from the VALUE port, not the KEY port SCALE_ZP_SIZE_PER_
+# TOKEN was reading before). USE_DUAL_NIBBLE_V_OPT already keyed on value-side packing once
+# nested inside `if (is_int4_v)` - unchanged in effect, per the design's own read. IS_KV_
+# COMPRESSED (key-layout, both-sides-quantised flag) stays as-is, per design §1.
+#
+# One thing NOT in the design doc, found while implementing it: can_use_dual_nibble_v() - which
+# decides whether the SG_SCALE_FACTOR / workgroup-dispatch math treats V as packed - was called
+# at all four of its call sites (the base get_jit_constants, and the SingleToken/GQASingleToken/
+# MultiTokens DispatchDataFunc lambdas) with kv_cache_dt (the KEY precision), even though dual-
+# nibble is entirely a VALUE-side read optimization. This was silently correct only because K and
+# V were always mirrored pre-0008; for u8-K/i4-V it would have sized the dispatch for an
+# UNPACKED V (using full v_head_size) while the kernel body - correctly, after the JIT split
+# above - expects PACKED_V_HEAD_SIZE. That is a workgroup-size mismatch, not a missing
+# optimization, and it would not have shown up as a compile error. Fixed at all four sites to key
+# on get_value_cache_precision() instead. This is why the design's "no dispatch change" claim
+# holds for the shipped direction: it holds once this conflation is fixed, not before.
+#
+# ---- 2. THE .cl DIVERGENCE (paged_attention_opt.cl) ----
+#
+# Renamed the K-only occurrences of the old shared gate (the by-channel branch and the K-unpack
+# i4-nibble-vs-i8-BLOCK_READN split - 2 conditional sites, plus their matching #else/#endif
+# comments) to IS_INT4_K, and the V-only occurrences (the per-token scale-pointer branch and the
+# two V-unpack nibble paths - 5 conditional sites, plus comments) to IS_INT4_V. The one site that
+# mixed both operands in one #if/#else (the phys_adjusted_k/v_head_size and phys_k/v_head_size
+# locals) was split into two independent #if/#else blocks, one per operand (1 IS_INT4_K + 1
+# IS_INT4_V), rather than renamed in place - 9 conditional gate sites total. For u8-K/i4-V specifically,
+# every V code path (dual-nibble dispatch, PACKED_V_*, the two V-unpack arms) is now BYTE-
+# IDENTICAL to the i4:i4 case - untouched by this patch; only K flips from the packed nibble-
+# unpack arm to the pre-existing i8 BLOCK_READN arm. No new loops, no dispatch-math edits beyond
+# the can_use_dual_nibble_v() fix in §1.
+#
+# ---- 3. PREFILL: UNCHANGED, STILL DECLINED ----
+#
+# patches/0009's supports_micro_sdpa() decline (is_i4_u4(key) != is_i4_u4(value) -> false) is not
+# touched by this patch and needs no change: it already declines micro-SDPA for u8-K/i4-V
+# correctly, because is_i4_u4(u8)=false != is_i4_u4(i4)=true. Prefill therefore still falls back
+# off micro exactly as it did before this patch - this patch does not make prefill serve u8:i4,
+# and does not attempt to. The other prefill path this generation carries, PagedAttentionSDPAOpt
+# GeneratorMultiToken ("sdpa_opt" kernel, sdpa_base.cpp/sdpa_gen_opt.hpp) - a SEPARATE kernel
+# from paged_attention_opt.cl, not touched by this patch - was read (not fixed): it hard-codes
+# IS_KV_COMPRESSED=0 for its own paged multi-token stage regardless of config, so it already
+# cannot express KV compression at all on this path, pre-existing and orthogonal to this patch.
+# design §3's own instruction stands: "do not silently send u8-K/i4-V onto the sdpa_opt multi-
+# token path unaudited" - it is unaudited, and this patch does not route anything onto it that
+# was not already reachable before.
+#
+# ---- 4. THE CONFIG-LEVEL GUARD (execution_config.cpp, relaxing patches/0008's finalize check) ----
+#
+# patches/0008/0009 refused EVERY key/value bitwidth mismatch at ExecutionConfig::finalize()
+# time: `(key.bitwidth()==4) == (value.bitwidth()==4)` had to hold, full stop. That assert is
+# narrowed to `!(key.bitwidth()==4 && value.bitwidth()!=4)` - i.e. only a 4-bit KEY paired with a
+# non-4-bit VALUE (i4-K/u8-V, the harder direction design §2 declined to attempt - it would move
+# V off the dual-nibble dispatch, which does touch workgroup sizing) is still refused.
+#
+# SERVED vs REFUSED, after this patch (key : value, both already through the u8->i8/i4->u4
+# storage-convention swap in finalize_impl):
+#   i8:i8, u8:u8         SERVED  (unchanged, symmetric, pre-existing)
+#   i4:i4 (u4:u4)         SERVED  (unchanged, symmetric, pre-existing)
+#   i8:i4 / u8:i4 (u4)    SERVED  (NEW - this patch, DECODE ONLY; prefill still declines to the
+#                                  fallback per §3, unaudited/unpriced by this task)
+#   i4:i8 / i4:u8 (etc.)  REFUSED (unchanged - "genuinely harder", design §2, not attempted)
+#
+# ---- 5. THE UNIT TEST (device-free half) ----
+#
+# tests/unit/test_cases/paged_attention_gpu_test.{h,cpp}: added `value_cache_precision` to
+# paged_attention_test_params and to PagedAttentionManager (dynamic default mirrors kv_cache_
+# precision, same convention ExecutionConfig::finalize_impl already uses), a new is_int4_value_
+# cache() alongside the existing key-only is_int4_kv_cache(), and wired both into get_value_
+# cache_memory() (which was silently using the KEY precision to decide the VALUE cache's own
+# byte layout - harmless while the two were always mirrored, and the exact same class of bug the
+# kernel-side split fixes) and into run_gpu_inference()'s VALUE_CACHE_PRECISION config-property
+# setter and its tolerance selection (widened to the existing 75e-3 band when EITHER side is
+# 4-bit, not just the key). New case: regression_paged_attention_asymmetric /
+# paged_attention_asymmetric_kv_test.decode_serves_u8_key_i4_value - a single decode step
+# ({{1, 35}} = 1 new token, 35 cached), kv=u8, value=u4, key layout BY_CHANNEL, per the design's
+# named case.
+#
+# One correction against the design's own §5 assumption: PagedAttentionReference::get_reference()
+# does not dequantize anything - it computes the float-precision reference directly from the
+# unquantized query/key/value data, and every kv_cache_compression case in this file already
+# absorbs quantization error via a widened tolerance band (see run_gpu_inference above), not via
+# a "per-side dequant" step in the reference generator. There was nothing to plumb there; the
+# real gap was get_value_cache_memory() reading the wrong (key-side) precision, fixed above.
+#
+# RED-first, argued not measured (no GPU device was touched by this task): on the pre-0010 tree
+# this exact params tuple throws OPENVINO_ASSERT at ExecutionConfig::finalize() (patches/0008/9's
+# unrelaxed guard) before a kernel ever compiles - a hard, loud failure, not a silent pass. Had
+# the guard alone been relaxed without the kernel split (hypothetical, not a real intermediate
+# state in this series), the single shared IS_INT4_COMPRESSED boolean would resolve false for
+# kv_cache_dt=u8 and route V through the K-shaped unpacked arm, reading the (actually i4-packed,
+# per the harness fix above) value cache at the wrong stride - nibble-granular data read as whole
+# bytes - which the widest tolerance this file uses (75e-3) does not absorb.
+#
+# ---- GATES OWED (measured by neither this task nor any prior one in this series) ----
+#
+# - The §7.0.2w cold-build A/B (0008-presence miscompile vs scratch-build staleness) is a
+#   prerequisite this task did not run and does not resolve - per the design's own §4, "that
+#   gate is a prerequisite, not part of this kernel diff." This patch's correctness on real
+#   hardware is contingent on that A/B clearing 0008 first.
+# - The KV-cache WRITE kernel item below is RESOLVED, not owed - see §7 (fable-review follow-up,
+#   same task, added later): [SUPERSEDED, kept for the historical record of what this patch
+#   shipped FIRST, before §7 landed] The KV-cache WRITE kernel (KVCacheUpdateGenerator in this
+#   same paged_attention_opt.cpp file, compiling pa_kv_cache_update_ref.cl - plus a separate
+#   pa_kv_cache_update_ref.cm CM implementation) has the IDENTICAL single-kv_cache_dt gating
+#   this patch fixes on the READ side, and is NOT touched by this patch: its .cl carries ~22
+#   IS_INT4_COMPRESSED sites versus this decode read kernel's ~13, past the "bounded macro
+#   de-coupling" scope design §0/§4 bound this task to. Left as-is, it keeps writing the value
+#   cache UNPACKED for u8-K/i4-V (since is_i4_u4(kv_cache_dt=u8) is false) every decode step,
+#   while the now-fixed READ kernel expects PACKED value bytes - a stride mismatch on the value
+#   cache, not a missing optimization. See the matching comment in execution_config.cpp. This
+#   was the actual, load-bearing reason u8-K/i4-V was not yet safe to serve end-to-end despite
+#   this patch's config guard permitting it - until §7 closed it, same patch, same task.
+# - All of design §6's on-card measurements (Prüfstand 10/10, the KV-byte-drop number, the decode
+#   A/B against i4:i4, the KLD probe, byte-exact invariants, the isolated profile) are unrun -
+#   no GPU device was touched by this task, per its own isolation rule.
+#
+# Smallest sufficient divergence, AS ORIGINALLY SHIPPED (READ-side split only, before the
+# fable-review follow-up addenda below): paged_attention_opt.cpp (the two JIT-constant generation
+# functions split end-to-end, plus the can_use_dual_nibble_v() fix at its 4 call sites),
+# paged_attention_opt.cl (9 conditional gate sites: 1 split block, 2 K-only, 6 V-only),
+# execution_config.cpp (one assert narrowed), and the device-free unit test. No change to
+# sdpa_base.cpp, sdpa_gen_opt.hpp, pa_kv_cache_update_ref.{cpp,cl,cm}, or patches/0009's own
+# supports_micro_sdpa() logic.
+#
+# UPDATED divergence, this patch as it now ships (fable-review follow-up folded the write-kernel
+# split and hardening into this same patch rather than a new one - see the numbered addenda
+# below): adds KVCacheUpdateGenerator's own JIT-constant split (paged_attention_opt.cpp, §7),
+# pa_kv_cache_update_ref.cl's ~22-site IS_INT4_K/IS_INT4_V split including the
+# quantize_and_save_per_token_k/_v function duplication (§7 - this file is NOT unchanged, contrary
+# to the line directly above, which is left in place as the historical record of the original
+# scope claim), pa_kv_reorder.cpp's packing-class-mismatch guard (§10, a new file for this patch),
+# the f16-pairing refusal in execution_config.cpp's guard (§9), and two more device-free/on-card
+# unit tests (§9/§10's own text, and the u4:u4-symmetric case, §11). sdpa_base.cpp, sdpa_gen_opt.hpp,
+# and pa_kv_cache_reorder_ref.{cl,cm} remain unchanged - the reorder kernel gets a guard, not a
+# split, per §9's own proportionality note.
+#
+# ---- 6. BUG A2: EXPLICIT SIGNED VALUE READ (paged_attention_opt.cl, M8 follow-up task) ----
+#
+# Independent of, and in addition to, patches/0008's Round 6 config-layer fix (execution_config.
+# cpp - see that patch's own header): the non-4-bit value dequant in this same kernel
+# (PagedAttentionGeneratorSingleToken's SINGLE_TOKEN body, both the main per-partition V loop and
+# the trailing "leftovers" loop) read the value cache PORT type directly
+# (`convert_half(value_packed)`, no signed cast) where the KEY dequant, on the same stage, is
+# immune to its own port's declared signedness because the key port is unconditionally normalized
+# to i8 upstream. The value cache is unconditionally SIGNED i8 storage in the non-4-bit case
+# (pa_kv_cache_update_ref.cl's quantize_and_save_per_token, INT8 arm - signed zero-point,
+# convert_char_rte), independent of what the value port happens to be declared as. An explicit
+# `(char)` reinterpretation, added at both sites, makes this read correct regardless of the
+# port's declared type - config-layer correctness (0008's Round 6) already keeps that port at i8
+# today, but this closes the same invariant on the kernel side too, so a future config regression
+# in this specific spot would not silently reopen the bug this round's own diagnosis found.
+#
+# ---- 7. BUG B: THE WRITE KERNEL SPLIT (pa_kv_cache_update_ref.cl + paged_attention_opt.cpp,
+#          M8 follow-up task - RESOLVES the "KV-cache WRITE kernel" item in GATES OWED above) ----
+#
+# The GATES OWED item above ("The KV-cache WRITE kernel ... is NOT touched by this patch") is
+# CLOSED by this task. Root cause, measured -nan at output[0] on
+# paged_attention_asymmetric_kv_test.decode_serves_u8_key_i4_value (§5's own new test, until this
+# fix): KVCacheUpdateGenerator::get_jit_constants (paged_attention_opt.cpp) derived every packing
+# constant - INCLUDING whether make_uint4_kv_cache_jit_constants() (the function that emits
+# IS_INT4_V/PACKED_V_HEAD_SIZE/PACKED_ADJUSTED_V_HEAD_SIZE/USE_DUAL_NIBBLE_V_OPT) is even called
+# at all - from kv_cache_dt (the KEY-side config value) alone. For u8-K/i4-V,
+# is_i4_u4(kv_cache_dt=i8/u8) is false, so that function was never called: IS_INT4_V stayed
+# undefined for the WRITE kernel's compilation (OpenCL's preprocessor treats an undefined macro
+# as 0 in #if, so this compiled silently rather than failing), and the write kernel kept writing
+# the value cache UNPACKED every decode step regardless of what VALUE_CACHE_PRECISION actually
+# resolved to - while the already-fixed READ kernel (§1/§2 above) expected PACKED value bytes
+# whenever IS_INT4_V is true. A stride mismatch on the value cache, not a missing optimization -
+# exactly what GATES OWED named as "the actual, load-bearing reason u8-K/i4-V is not yet safe to
+# serve end-to-end."
+#
+# Fix: split KVCacheUpdateGenerator::get_jit_constants and pa_kv_cache_update_ref.cl's ~22
+# IS_INT4_COMPRESSED sites into independent IS_INT4_K / IS_INT4_V gates, exactly mirroring §1/§2's
+# read-side split:
+#   - paged_attention_opt.cpp: KVCacheUpdateGenerator now computes is_int4_k/is_int4_v
+#     independently (get_kv_cache_precision()/get_value_cache_precision()), calls
+#     make_uint4_kv_cache_jit_constants() whenever EITHER side is 4-bit (that function already
+#     gates its own K/V halves independently, per §1), and derives K's ADJUSTED_K_HEAD_SIZE/
+#     ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE/NUM_K_HEAD_SIZE_PARTITIONS from is_int4_k only. One
+#     latent bug fixed as a side effect: ADJUSTED_V_HEAD_SIZE previously added the KEY's own
+#     scales_zp_size unconditionally (harmless only while K and V were always mirrored); it now
+#     uses V's own scales_zp_size, independent of K's port type.
+#   - pa_kv_cache_update_ref.cl: the shared write helper quantize_and_save_per_token - previously
+#     ONE function body, called from both the key call site (out_data_pitch = block size,
+#     head-major) and the value call site (out_data_pitch = 1, token-major) under one
+#     IS_INT4_COMPRESSED - cannot express two different compile-time behaviors for the same
+#     compiled program from a single shared body, so it is now two instantiations:
+#     quantize_and_save_per_token_k (gated IS_INT4_K, called only from key sites) and
+#     quantize_and_save_per_token_v (gated IS_INT4_V, called only from value sites), bodies
+#     otherwise identical. Every other IS_INT4_COMPRESSED site in this file - the BY_CHANNEL-only
+#     helpers (COMP_K_OFFSET, quantize_and_save_by_channel_block_with_requantize[_int4],
+#     quantize_and_save_by_channel_prefill, all key-only by construction - BY_CHANNEL is never a
+#     value-side layout), the kernel's top-of-function phys_*_head_size block (split into two
+#     independent #if blocks, one per operand, mirroring §1's read-side fix to the same kind of
+#     site), and the three write stages this kernel body inlines (decode/2nd-token, prefill
+#     block-full, prefill block-partial - all THREE, not just decode: unlike the read side, this
+#     is one compiled kernel body reachable from every stage, so a K/V split has to be consistent
+#     across all of them for physical cache layout to stay self-consistent between a block written
+#     during prefill and the same block read during decode) - now reads IS_INT4_K where it writes
+#     the key cache and IS_INT4_V where it writes the value cache. Two "block is full" / "block
+#     partial" BY_CHANNEL sections that used to pick a combined "both int4" or "both int8" branch
+#     as a single unit are restructured into independently-gated K-write-selection followed by
+#     independently-gated V-per-token-loop, rather than merely renamed in place - the combined
+#     form cannot express K unpacked / V packed at all, renaming alone would not have fixed it.
+#
+# Device-free confirmation: none available as an isolated JIT-constant unit test - KVCacheUpdate
+# Generator lives in an anonymous namespace inside paged_attention_opt.cpp with no exposed test
+# seam, and (checked) this codebase has no existing precedent anywhere in tests/unit for
+# constructing a kernel_impl_params reachable to a KernelGenerator's get_jit_constants() without
+# going through ProgramBuilder's compile_model path - which this task's own isolation rule
+# (no compile_model, no GPU) forbids touching. This is a structural fact about the codebase, not
+# a shortcut: §1/§2's own read-side split above has the identical limitation and relied on the
+# same on-card numeric test for its confirmation, not a live JIT-inspection harness. The
+# confirmation here is therefore the same as for the read side: source-level correctness argued
+# from the diff (this section), plus this task's own on-card orchestrator run of
+# decode_serves_u8_key_i4_value, RED (-nan) before this fix, GREEN after.
+#
+# ---- 8. THE SECOND UNIT TEST (device-free half, M8 follow-up task) ----
+#
+# tests/unit/test_cases/paged_attention_gpu_test.cpp: a second numeric case,
+# regression_paged_attention_symmetric_u8 / paged_attention_symmetric_u8_kv_test.
+# decode_serves_u8_key_u8_value - same decode-step shape as §5's asymmetric case, but plain
+# symmetric kv_cache_precision=u8, value_cache_precision=u8 (the ordinary, most common request,
+# with NO asymmetry at all). This is the case patches/0008's own Round 3 regressed and this task's
+# Round 6 (see patches/0008) fixes; it exists here, alongside the asymmetric case, because both
+# share this file's test infrastructure and both are part of the same on-card orchestrator run.
+# Uses the file's normal 25e-3 tolerance (not the widened 75e-3 band §5 uses for 4-bit cases) -
+# deliberately: a port-signedness bug is a systematic bias (every negative byte off by the same
+# ~256*scale), not the kind of noise a wider INT4 tolerance band is there to absorb, so the normal
+# INT8 band is the right one to catch it with.
+#
+# tests/unit/module_tests/execution_config_test.cpp: the config-layer half of the same check,
+# kv_cache_u8_value_mirrors_key_precision - device-free, exercises ExecutionConfig::finalize_impl
+# directly, no kernel involved. It targets patches/0008's Round 6 fix (execution_config.cpp's
+# value-mirror logic - see that patch's own header for the full argument) but ships as part of
+# this patch alongside the kernel-level test above, since both were designed and added together
+# in the same task and both depend on 0008 already being applied.
+#
+# ---- 9. THE f16-PAIRING GUARD FIX (execution_config.cpp, fable-review follow-up F2) ----
+#
+# The guard narrowed in §4 above - `!(key.bitwidth()==4 && value.bitwidth()!=4)` - checks
+# bitwidth() alone, so it silently ADMITTED f16:i4, f16:u8, and u8:f16, none of which this
+# generation can serve: get_kv_compressed() (paged_attention_opt.cpp) decides whether the
+# paged-attention path treats the cache as compressed at all from the KEY port alone; the value
+# pool's physical shape is sized for an INT precision (packed-u4 or plain-int8) on both sides; and
+# the write kernel (§7 above) writes a fixed INT stride into whatever pool got allocated. An f16
+# side paired with any INT side is a shape mismatch this generation has no code path for, not a
+# missing optimization - the same class of real corruption hole the bitwidth()==4 check already
+# guards against for 4-bit mismatches, just an f16-shaped instance of it the original check didn't
+# cover (f16's bitwidth is 16, never 4, so the "key is 4-bit" arm never fires for any f16 side,
+# healthy or not). Fixed by refusing whenever exactly one side resolves to f16 - a 4-bit value
+# still requires an 8-bit-INT key (unchanged), and an f16 side now requires f16 on BOTH sides.
+# Loud finalize-time refusal, same style and message shape as the existing guard, naming both
+# resolved precisions.
+#
+# SERVED vs REFUSED, updated (adds the f16 rows §4's table didn't have):
+#   i8:i8, u8:u8, f16:f16   SERVED  (unchanged, symmetric)
+#   i4:i4 (u4:u4)            SERVED  (unchanged, symmetric)
+#   i8:i4 / u8:i4 (u4)       SERVED  (decode only, §1/§2; prefill still falls back, §3)
+#   i4:i8 / i4:u8 (etc.)     REFUSED (unchanged - "genuinely harder", design §2, not attempted)
+#   f16:i4, f16:u8, u8:f16,
+#   i4:f16, i8:f16 (etc.)    REFUSED (NEW here, F2 - an f16 side requires f16 on both sides;
+#                                     this generation has no INT/f16-mixed cache code path)
+#
+# ---- 10. THE PA_KV_REORDER GUARD (pa_kv_reorder.cpp, fable-review follow-up F3) ----
+#
+# pa_kv_reorder.cpp (ocl_v2)'s PaKVReorderGenerator::get_jit_constants and its kernel,
+# pa_kv_cache_reorder_ref.cl, gate VALUE-cache row moves on the SAME collapsed
+# IS_INT4_COMPRESSED derived from desc->cache_dt (the KEY side) alone that §7 above had to split
+# in the write-update kernel - Bug B's mechanism, in a THIRD kernel this task had not looked at.
+# UNREACHABLE in arcint today: no PaKVReorder nodes are ever constructed in the pipeline arcint
+# runs (cache-block rotation / reorder fusion is not part of that pipeline), so this is not a live
+# serving bug, and it does not contradict anything this patch actually SERVES. It does contradict
+# this patch's own "read and write agree on layout for every pairing this guard permits" claim
+# (§7 above) taken as a whole-plugin statement rather than a paged_attention_opt-kernel-scoped one
+# - worth naming precisely rather than leaving implied. Fix, proportionate to a code path nothing
+# reaches (NOT the full IS_INT4_K/IS_INT4_V split §7 did for the write-update kernel - that would
+# not be proportionate here): PaKVReorderGenerator::get_jit_constants now reads
+# VALUE_CACHE_PRECISION independently and asserts is_i4_u4(key) == is_i4_u4(value), refusing loud
+# at JIT-constant-generation time rather than silently moving value rows at the wrong (key-shaped)
+# stride if this generator is ever reached with a mismatched pair. pa_kv_cache_reorder_ref.cl
+# itself (and its pa_kv_cache_reorder_ref.cm CM counterpart) are UNCHANGED - the guard is added at
+# the one call site that can see both precisions, upstream of kernel compilation.
+#
+# ---- 11. THE THIRD UNIT TEST (fable-review follow-up F7) ----
+#
+# tests/unit/test_cases/paged_attention_gpu_test.cpp: a third numeric case,
+# regression_paged_attention_symmetric_u4 / paged_attention_symmetric_u4_kv_test.
+# decode_serves_u4_key_u4_value - same decode-step shape as §5/§8's cases, but symmetric
+# kv_cache_precision=u4, value_cache_precision=u4. §7's write-kernel split was argued correct for
+# the both-4-bit path by construction (IS_INT4_K and IS_INT4_V resolve identically - both true -
+# whenever the request is symmetric, so both operands take the same arm they always took
+# pre-split) but that argument had never been closed with a measurement of the split write kernel
+# actually exercising this path; this closes it. Key layout BY_CHANNEL, matching the existing
+# paged_attention_u4_swa_tail_test's u4-symmetric prefill/tail coverage - this test adds the
+# decode-step companion for the split write kernel specifically, not new territory for u4 itself.
+#
+# A mixed/multi-chunk prefill case at u8:i4 was considered and deliberately NOT added here - it
+# needs harness work beyond a single-decode-step params tuple (multiple prefill chunks feeding the
+# same block across calls) that this task's existing PagedAttentionTest<> plumbing does not yet
+# support cheaply; left for a deeper on-card serving cell instead of a rushed unit test.
+#
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
+@@ -242,16 +242,29 @@ PagedAttentionStage get_paged_attention_stage(const kernel_impl_params& impl_par
+     return PagedAttentionStage::UNKNOWN;
+ }
+ 
++// docs/design-m8-asymmetric-kv.md item 1 (patches/0010): K and V used to derive every packing
++// constant from one shared `kv_cache_dt = get_kv_cache_precision()`, so the two sides could
++// never disagree on whether they were nibble-packed. Split into independent per-side booleans -
++// IS_INT4_K from get_kv_cache_precision(), IS_INT4_V from get_value_cache_precision() (plumbed
++// by patches/0008) - and emit PACKED_K_*/ADJUSTED_K_HEAD_SIZE only when IS_INT4_K, PACKED_V_*/
++// ADJUSTED_V_HEAD_SIZE only when IS_INT4_V. IS_INT4_COMPRESSED is retired, not aliased: every
++// .cl call site now names the operand it actually gates (paged_attention_opt.cl, this patch).
+ JitConstants make_uint4_kv_cache_jit_constants(const kernel_impl_params& params) {
+     ov::intel_gpu::JitConstants jit;
+     const auto desc = params.typed_desc<paged_attention>();
+-    const auto kv_cache_dt = params.get_program().get_config().get_kv_cache_precision();
+-    const auto& kv_dt = params.input_layouts[PagedAttentionInputIdx::KEY].data_type;
+-
+-    if (data_type_traits::is_i4_u4(kv_cache_dt)) {
+-        const auto scales_zp_size = get_element_size(kv_dt) * 2;  // fp16 scale + fp16 zp = 4 bytes
++    const auto key_cache_dt = params.get_program().get_config().get_kv_cache_precision();
++    const auto value_cache_dt = params.get_program().get_config().get_value_cache_precision();
++    const auto& key_dt = params.input_layouts[PagedAttentionInputIdx::KEY].data_type;
++    const auto& value_dt = params.input_layouts[PagedAttentionInputIdx::VALUE].data_type;
++
++    const bool is_int4_k = data_type_traits::is_i4_u4(key_cache_dt);
++    const bool is_int4_v = data_type_traits::is_i4_u4(value_cache_dt);
++    jit.make("IS_INT4_K", is_int4_k);
++    jit.make("IS_INT4_V", is_int4_v);
++
++    if (is_int4_k) {
++        const auto scales_zp_size_k = get_element_size(key_dt) * 2;  // fp16 scale + fp16 zp = 4 bytes
+         const auto is_key_by_channel = desc->is_key_by_channel;
+-        jit.make("IS_INT4_COMPRESSED", true);
+         if (is_key_by_channel) {
+             // K BY_CHANNEL: head_size is NOT packed (outer dim), block_size IS packed (inner dim)
+             jit.make("PACKED_K_HEAD_SIZE", desc->k_head_size);
+@@ -261,20 +274,24 @@ JitConstants make_uint4_kv_cache_jit_constants(const kernel_impl_params& params)
+             // K BY_TOKEN: head_size IS packed (inner dim), block_size is NOT packed
+             const auto packed_k_head_size = kernel_selector::Align(desc->k_head_size / u4_elems_per_byte, subgroup_size);
+             jit.make("PACKED_K_HEAD_SIZE", packed_k_head_size);
+-            jit.make("PACKED_ADJUSTED_K_HEAD_SIZE", packed_k_head_size + scales_zp_size);
++            jit.make("PACKED_ADJUSTED_K_HEAD_SIZE", packed_k_head_size + scales_zp_size_k);
+             jit.make("PACKED_K_BLOCK_SIZE", paged_attention_block_size);
+         }
++    }
++
++    if (is_int4_v) {
++        const auto scales_zp_size_v = get_element_size(value_dt) * 2;  // fp16 scale + fp16 zp = 4 bytes
+         // V per-token: head_size IS packed (inner dim)
+-        jit.make("PACKED_V_HEAD_SIZE", (kernel_selector::Align(desc->v_head_size / u4_elems_per_byte, subgroup_size)));
+-        jit.make("PACKED_ADJUSTED_V_HEAD_SIZE", (kernel_selector::Align(desc->v_head_size / u4_elems_per_byte, subgroup_size)) + scales_zp_size);
++        const auto packed_v_head_size = kernel_selector::Align(desc->v_head_size / u4_elems_per_byte, subgroup_size);
++        jit.make("PACKED_V_HEAD_SIZE", packed_v_head_size);
++        jit.make("PACKED_ADJUSTED_V_HEAD_SIZE", packed_v_head_size + scales_zp_size_v);
+ 
+         // Dual-nibble V-cache optimization: each lane reads 1 packed byte (2 nibbles) via BLOCK_READN
+         // Only applicable when PACKED_V_HEAD_SIZE is divisible by SUBGROUP_SIZE (no padding lanes needed)
++        // can_use_dual_nibble_v() already keys on the value side alone (design §1) - unchanged.
+         if (is_v_head_aligned_for_dual_nibble(desc->v_head_size)) {
+             jit.make("USE_DUAL_NIBBLE_V_OPT", 1);
+         }
+-    } else {
+-        jit.make("IS_INT4_COMPRESSED", false);
+     }
+ 
+     return jit;
+@@ -300,46 +317,66 @@ public:
+         jit.make("SWA_BLOCK_SKIP_ENABLED", desc->sliding_window > 0 && !desc->has_scores_output());
+ 
+         const auto kv_cache_dt = params.get_program().get_config().get_kv_cache_precision();
++        // docs/design-m8-asymmetric-kv.md item 1 (patches/0010): value_cache_dt is the second,
++        // independent config knob patches/0008 plumbed; is_int4_k/is_int4_v are the per-side
++        // booleans every packing constant below now derives from, in place of one shared
++        // is_i4_u4(kv_cache_dt).
++        const auto value_cache_dt = params.get_program().get_config().get_value_cache_precision();
++        const bool is_int4_k = data_type_traits::is_i4_u4(kv_cache_dt);
++        const bool is_int4_v = data_type_traits::is_i4_u4(value_cache_dt);
+         const bool is_kv_compressed = get_kv_compressed(params);
+         jit.make("IS_KV_COMPRESSED", is_kv_compressed);
+         jit.make("XE2_QK_MULTIPLICATION", params.get_device_info().arch == gpu_arch::xe2);
+ 
+-        // For dual-nibble V opt, use PACKED_V_HEAD_SIZE for SG_SCALE_FACTOR calculation to match WG dispatch
+-        const bool dual_nibble_v = can_use_dual_nibble_v(is_kv_compressed, kv_cache_dt, desc->v_head_size);
++        // For dual-nibble V opt, use PACKED_V_HEAD_SIZE for SG_SCALE_FACTOR calculation to match
++        // WG dispatch. Dual-nibble is a V-side read optimization - key on value_cache_dt, not
++        // kv_cache_dt (the two could conflate silently pre-0008/0010 because both sides were
++        // always identical; see the matching fix in each stage's DispatchDataFunc below).
++        const bool dual_nibble_v = can_use_dual_nibble_v(is_kv_compressed, value_cache_dt, desc->v_head_size);
+         const size_t effective_head_size = dual_nibble_v ? desc->v_head_size / u4_elems_per_byte : desc->v_head_size;
+         jit.make("SG_SCALE_FACTOR", get_pa_sg_number_scale_factor(params.get_device_info(), effective_head_size, SDPAStage::SINGLE_TOKEN, is_kv_compressed));
+ 
+         const auto is_key_by_channel = desc->is_key_by_channel;
+         if (is_kv_compressed) {
+-            const auto& kv_dt = params.input_layouts[PagedAttentionInputIdx::KEY].data_type;
+-            auto scales_zp_size = get_element_size(kv_dt) * 2;  // scale + zp
+-            if (data_type_traits::is_i4_u4(kv_cache_dt)) {
+-                jit.make("SCALE_ZP_SIZE_PER_TOKEN", scales_zp_size);
++            const auto& key_dt = params.input_layouts[PagedAttentionInputIdx::KEY].data_type;
++            const auto& value_dt = params.input_layouts[PagedAttentionInputIdx::VALUE].data_type;
++            const auto scales_zp_size_k = get_element_size(key_dt) * 2;    // scale + zp, K's own port type
++            const auto scales_zp_size_v = get_element_size(value_dt) * 2;  // scale + zp, V's own port type
++            if (is_int4_k) {
++                jit.make("SCALE_ZP_SIZE_PER_TOKEN_K", scales_zp_size_k);
++            }
++            if (is_int4_v) {
++                jit.make("SCALE_ZP_SIZE_PER_TOKEN_V", scales_zp_size_v);
++            }
++            if (is_int4_k || is_int4_v) {
+                 jit.add(make_uint4_kv_cache_jit_constants(params));
+             }
+ 
+-            if (data_type_traits::is_i4_u4(kv_cache_dt)) {
++            if (is_int4_k) {
+                 if (is_key_by_channel) {
+                     // INT4 BY_CHANNEL: K dim order {0,1,3,2}, block_size packed in innermost dim
+                     jit.make("IS_KEY_BY_CHANNEL", 1);
+                     jit.make("ADJUSTED_K_HEAD_SIZE", desc->k_head_size);
+-                    jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", paged_attention_block_size / u4_elems_per_byte + scales_zp_size);
++                    jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", paged_attention_block_size / u4_elems_per_byte + scales_zp_size_k);
+                 } else {
+                     // INT4 BY_TOKEN: K dim order {0,1,2,3}, head_size packed
+-                    jit.make("ADJUSTED_K_HEAD_SIZE", desc->k_head_size + scales_zp_size);
++                    jit.make("ADJUSTED_K_HEAD_SIZE", desc->k_head_size + scales_zp_size_k);
+                     jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", paged_attention_block_size);
+                 }
+-                jit.make("ADJUSTED_V_HEAD_SIZE", desc->v_head_size + scales_zp_size);
+             } else if (is_key_by_channel) {
+                 jit.make("IS_KEY_BY_CHANNEL", 1);
+                 jit.make("ADJUSTED_K_HEAD_SIZE", desc->k_head_size);
+-                jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", paged_attention_block_size + scales_zp_size);
+-                jit.make("ADJUSTED_V_HEAD_SIZE", desc->v_head_size + scales_zp_size);
++                jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", paged_attention_block_size + scales_zp_size_k);
+             } else {
+-                jit.make("ADJUSTED_K_HEAD_SIZE", desc->k_head_size + scales_zp_size);
++                // Covers both u8-K/u8-V (symmetric, pre-existing) and u8-K/i4-V (asymmetric,
++                // patches/0010): K is unpacked either way, so its adjustment is identical.
++                jit.make("ADJUSTED_K_HEAD_SIZE", desc->k_head_size + scales_zp_size_k);
+                 jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", paged_attention_block_size);
+-                jit.make("ADJUSTED_V_HEAD_SIZE", desc->v_head_size + scales_zp_size);
+             }
++            // ADJUSTED_V_HEAD_SIZE has never distinguished i4 from i8 (it counts adjusted
++            // *elements*, not bytes - the bitwidth difference lives in PACKED_V_HEAD_SIZE
++            // instead); it only needs V's own scale/zp size, which scales_zp_size_v now is.
++            jit.make("ADJUSTED_V_HEAD_SIZE", desc->v_head_size + scales_zp_size_v);
+         } else {
+             jit.make("ADJUSTED_K_HEAD_SIZE", desc->k_head_size);
+             jit.make("ADJUSTED_V_HEAD_SIZE", desc->v_head_size);
+@@ -493,8 +530,13 @@ public:
+             const size_t total_tokens = params.input_layouts[0].get_partial_shape()[0].get_length();
+             const size_t heads_num = desc->heads_num;
+             const size_t v_head_size = desc->v_head_size;
+-            const auto kv_cache_dt = params.get_program().get_config().get_kv_cache_precision();
+-            const bool dual_nibble_v = can_use_dual_nibble_v(get_kv_compressed(params), kv_cache_dt, v_head_size);
++            // docs/design-m8-asymmetric-kv.md item 1 (patches/0010): dual-nibble is a V-side read
++            // optimization - it must be gated on VALUE_CACHE_PRECISION, not KV_CACHE_PRECISION.
++            // Passing the key-side dt here was silently correct only because both sides were
++            // forced identical pre-0008; with per-side precision it would size this dispatch for
++            // an unpacked V (wrong local/global work size) whenever K and V diverge.
++            const auto value_cache_dt = params.get_program().get_config().get_value_cache_precision();
++            const bool dual_nibble_v = can_use_dual_nibble_v(get_kv_compressed(params), value_cache_dt, v_head_size);
+             const size_t head_size = dual_nibble_v ? v_head_size / u4_elems_per_byte : v_head_size;
+ 
+             auto sg_scale = get_pa_sg_number_scale_factor(params.get_device_info(), head_size, SDPAStage::SINGLE_TOKEN, get_kv_compressed(params));
+@@ -535,8 +577,10 @@ public:
+             const size_t heads_num = desc->heads_num;
+             const size_t v_head_size = desc->v_head_size;
+             const size_t kv_group_size = desc->heads_num / desc->kv_heads_num;
+-            const auto kv_cache_dt = params.get_program().get_config().get_kv_cache_precision();
+-            const bool dual_nibble_v = can_use_dual_nibble_v(get_kv_compressed(params), kv_cache_dt, v_head_size);
++            // See PagedAttentionGeneratorSingleToken's dispatch func above: dual-nibble keys on
++            // VALUE_CACHE_PRECISION, not KV_CACHE_PRECISION (docs/design-m8-asymmetric-kv.md item 1).
++            const auto value_cache_dt = params.get_program().get_config().get_value_cache_precision();
++            const bool dual_nibble_v = can_use_dual_nibble_v(get_kv_compressed(params), value_cache_dt, v_head_size);
+             const size_t head_size = dual_nibble_v ? v_head_size / u4_elems_per_byte : v_head_size;
+             auto sg_scale = get_pa_sg_number_scale_factor(params.get_device_info(), head_size, SDPAStage::SINGLE_TOKEN, get_kv_compressed(params));
+             // GQA
+@@ -703,8 +747,12 @@ public:
+             const size_t total_tokens = params.input_layouts[0].get_partial_shape()[0].get_length();
+             const size_t heads_num = desc->heads_num;
+             const size_t v_head_size = desc->v_head_size;
+-            const auto kv_cache_dt = params.get_program().get_config().get_kv_cache_precision();
+-            const bool dual_nibble_v = can_use_dual_nibble_v(get_kv_compressed(params), kv_cache_dt, v_head_size);
++            // See PagedAttentionGeneratorSingleToken's dispatch func: dual-nibble keys on
++            // VALUE_CACHE_PRECISION, not KV_CACHE_PRECISION (docs/design-m8-asymmetric-kv.md
++            // item 1). This MULTI_TOKENS stage is not the decode path this patch targets, but
++            // the same conflation bug applies here too - fixed for consistency, not exercised.
++            const auto value_cache_dt = params.get_program().get_config().get_value_cache_precision();
++            const bool dual_nibble_v = can_use_dual_nibble_v(get_kv_compressed(params), value_cache_dt, v_head_size);
+             const size_t head_size = dual_nibble_v ? v_head_size / u4_elems_per_byte : v_head_size;
+ 
+             auto sg_scale = get_pa_sg_number_scale_factor(params.get_device_info(), head_size, SDPAStage::MULTI_TOKENS, get_kv_compressed(params));
+@@ -968,6 +1016,24 @@ protected:
+ 
+         const auto desc = params.typed_desc<paged_attention>();
+         const auto kv_cache_dt = params.get_program().get_config().get_kv_cache_precision();
++        // docs/design-m8-asymmetric-kv.md, Bug B fix (patches/0010's own "OWED" note, closed
++        // here): this generator used to derive every packing constant - including whether the
++        // VALUE side gets packed at all - from kv_cache_dt (the KEY-side config value) alone.
++        // For u8-K/i4-V that meant is_i4_u4(kv_cache_dt) was false, so make_uint4_kv_cache_jit_
++        // constants() (which is what actually emits IS_INT4_V/PACKED_V_HEAD_SIZE/PACKED_ADJUSTED_
++        // V_HEAD_SIZE/USE_DUAL_NIBBLE_V_OPT) was never even called - IS_INT4_V stayed undefined
++        // (OpenCL's preprocessor treats an undefined macro as 0 in #if, so this compiled silently
++        // instead of failing), and the write kernel kept writing V UNPACKED regardless of what
++        // VALUE_CACHE_PRECISION actually resolved to. The now-split READ kernel (patches/0010)
++        // expects PACKED value bytes whenever IS_INT4_V is true - measured as -nan output on the
++        // decode_serves_u8_key_i4_value case, a stride mismatch on the value cache. Split into
++        // independent per-side booleans - is_int4_k from get_kv_cache_precision(), is_int4_v from
++        // get_value_cache_precision() (plumbed by patches/0008) - exactly mirroring the READ
++        // side's own split (paged_attention_opt.cpp's PagedAttentionGeneratorBase::get_jit_
++        // constants and make_uint4_kv_cache_jit_constants itself, both already patches/0010).
++        const auto value_cache_dt = params.get_program().get_config().get_value_cache_precision();
++        const bool is_int4_k = data_type_traits::is_i4_u4(kv_cache_dt);
++        const bool is_int4_v = data_type_traits::is_i4_u4(value_cache_dt);
+         const auto is_key_by_channel = desc->is_key_by_channel;
+         OPENVINO_ASSERT(is_key_by_channel == (params.get_program().get_config().get_key_cache_quant_mode() == ov::internal::CacheQuantMode::BY_CHANNEL),
+                         "[GPU] Paged Attention key cache quantization mode mismatch: prim.key_cache_by_channel : ",
+@@ -989,35 +1055,46 @@ protected:
+         const bool is_kv_compressed = get_kv_compressed(params);
+         jit.make("IS_KV_COMPRESSED", is_kv_compressed ? 1 : 0);
+         if (is_kv_compressed) {
+-            auto data_type = params.input_layouts[PagedAttentionInputIdx::KEY].data_type;  // key tensor data size
+-            auto scales_zp_size = get_element_size(data_type) * 2;                         // scale + zp
+-            if (data_type_traits::is_i4_u4(kv_cache_dt)) {
+-                jit.make("SCALE_ZP_SIZE_PER_TOKEN", scales_zp_size);
++            const auto& key_dt = params.input_layouts[PagedAttentionInputIdx::KEY].data_type;
++            const auto& value_dt = params.input_layouts[PagedAttentionInputIdx::VALUE].data_type;
++            const auto scales_zp_size_k = get_element_size(key_dt) * 2;    // scale + zp, K's own port type
++            const auto scales_zp_size_v = get_element_size(value_dt) * 2;  // scale + zp, V's own port type
++            if (is_int4_k) {
++                // SCALE_ZP_SIZE_PER_TOKEN is not referenced anywhere in pa_kv_cache_update_ref.cl
++                // (grepped - dead in this kernel), kept only so a build-time reference elsewhere
++                // (e.g. the .cm implementation) does not regress; computed off K's own size as
++                // it always was, since it was never V-aware to begin with.
++                jit.make("SCALE_ZP_SIZE_PER_TOKEN", scales_zp_size_k);
++            }
++            if (is_int4_k || is_int4_v) {
+                 jit.add(make_uint4_kv_cache_jit_constants(params));
+             }
+ 
+-            if (data_type_traits::is_i4_u4(kv_cache_dt)) {
++            if (is_int4_k) {
+                 if (is_key_by_channel) {
+                     // INT4 BY_CHANNEL: K dim order {0,1,3,2}, block_size packed in innermost dim
+                     jit.make("IS_KEY_BY_CHANNEL", 1);
+                     jit.make("ADJUSTED_K_HEAD_SIZE", desc->k_head_size);
+-                    jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", paged_attention_block_size / u4_elems_per_byte + scales_zp_size);
++                    jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", paged_attention_block_size / u4_elems_per_byte + scales_zp_size_k);
+                 } else {
+                     // INT4 BY_TOKEN: K dim order {0,1,2,3}, head_size packed
+-                    jit.make("ADJUSTED_K_HEAD_SIZE", desc->k_head_size + scales_zp_size);
++                    jit.make("ADJUSTED_K_HEAD_SIZE", desc->k_head_size + scales_zp_size_k);
+                     jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", paged_attention_block_size);
+                 }
+                 jit.make("NUM_K_HEAD_SIZE_PARTITIONS", get_num_k_head_size_partitions(desc->is_key_by_channel, desc->k_head_size));
+             } else if (is_key_by_channel) {
+                 jit.make("IS_KEY_BY_CHANNEL", 1);
+                 jit.make("ADJUSTED_K_HEAD_SIZE", desc->k_head_size);
+-                jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", paged_attention_block_size + scales_zp_size);
++                jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", paged_attention_block_size + scales_zp_size_k);
+                 jit.make("NUM_K_HEAD_SIZE_PARTITIONS", get_num_k_head_size_partitions(desc->is_key_by_channel, desc->k_head_size));
+             } else {
+-                jit.make("ADJUSTED_K_HEAD_SIZE", desc->k_head_size + scales_zp_size);
++                jit.make("ADJUSTED_K_HEAD_SIZE", desc->k_head_size + scales_zp_size_k);
+                 jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", paged_attention_block_size);
+             }
+-            jit.make("ADJUSTED_V_HEAD_SIZE", desc->v_head_size + scales_zp_size);
++            // ADJUSTED_V_HEAD_SIZE used to add the KEY's own scales_zp_size unconditionally, even
++            // though it sizes the VALUE side - harmless only while the two were always mirrored;
++            // uses V's own scales_zp_size_v now, independent of K's precision/port type.
++            jit.make("ADJUSTED_V_HEAD_SIZE", desc->v_head_size + scales_zp_size_v);
+         } else {
+             jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", paged_attention_block_size);
+             jit.make("ADJUSTED_K_HEAD_SIZE", desc->k_head_size);
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_attention_opt.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_attention_opt.cl
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_attention_opt.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_attention_opt.cl
+@@ -147,15 +147,24 @@ KERNEL(pa_sdpa_opt)(
+     const uint packed_byte_idx = lid % PACKED_V_HEAD_SIZE;
+ #endif
+ 
+-#if IS_INT4_COMPRESSED
++// docs/design-m8-asymmetric-kv.md §2 (patches/0010): K and V used to share one
++// IS_INT4_COMPRESSED gate here, forcing both operands packed or both unpacked together. Split
++// into independent per-operand gates - IS_INT4_K takes the packed arm only when the key side is
++// actually nibble-packed, IS_INT4_V likewise for value - so u8-K/i4-V compiles K through the
++// unpacked (K_HEAD_SIZE) arm while V still takes the packed (PACKED_V_HEAD_SIZE) arm.
++#if IS_INT4_K
+     const uint phys_adjusted_k_head_size = PACKED_ADJUSTED_K_HEAD_SIZE;
+-    const uint phys_adjusted_v_head_size = PACKED_ADJUSTED_V_HEAD_SIZE;
+     const uint phys_k_head_size = PACKED_K_HEAD_SIZE;
+-    const uint phys_v_head_size = PACKED_V_HEAD_SIZE;
+ #else
+     const uint phys_adjusted_k_head_size = ADJUSTED_K_HEAD_SIZE;
+-    const uint phys_adjusted_v_head_size = ADJUSTED_V_HEAD_SIZE;
+     const uint phys_k_head_size = K_HEAD_SIZE;
++#endif
++
++#if IS_INT4_V
++    const uint phys_adjusted_v_head_size = PACKED_ADJUSTED_V_HEAD_SIZE;
++    const uint phys_v_head_size = PACKED_V_HEAD_SIZE;
++#else
++    const uint phys_adjusted_v_head_size = ADJUSTED_V_HEAD_SIZE;
+     const uint phys_v_head_size = V_HEAD_SIZE;
+ #endif
+ 
+@@ -293,7 +302,7 @@ KERNEL(pa_sdpa_opt)(
+ #endif
+ 
+             // Loop for qk_index
+-#if IS_KV_COMPRESSED && IS_INT4_COMPRESSED && defined(IS_KEY_BY_CHANNEL)
++#if IS_KV_COMPRESSED && IS_INT4_K && defined(IS_KEY_BY_CHANNEL)
+             // INT4 BY_CHANNEL: dim order {0,1,3,2}: [blocks, heads, head_size, packed_block+scales]
+             // Each column (head dim) = COMP_K_OFFSET packed bytes + 4 bytes scale/zp.
+             // Token sglid's u4 value is at packed byte sglid/2, nibble sglid%2.
+@@ -348,7 +357,7 @@ KERNEL(pa_sdpa_opt)(
+                 }
+             #endif
+ 
+-#else  // !(IS_KV_COMPRESSED && IS_INT4_COMPRESSED && defined(IS_KEY_BY_CHANNEL))
++#else  // !(IS_KV_COMPRESSED && IS_INT4_K && defined(IS_KEY_BY_CHANNEL))
+             #define KEY_BLOCK_UNCOMPRESSED MAKE_VECTOR_TYPE(INPUT0_TYPE, KEY_VEC_SIZE)
+ #ifdef DISABLE_QK_LOOP_UNROLL
+             for (uint qk_idx = 0; qk_idx < K_HEAD_SIZE / KEY_VEC_SIZE; qk_idx++) {
+@@ -357,7 +366,7 @@ KERNEL(pa_sdpa_opt)(
+ #endif
+ 
+ #if IS_KV_COMPRESSED
+-    #if IS_INT4_COMPRESSED
++    #if IS_INT4_K
+                 // INT4 BY_TOKEN head-major: [blocks, heads, packed_head_size * block_size, scales, zps]
+                 // Each byte packs 2 adjacent head dims (lo nibble, hi nibble)
+                 // Use scalar reads (not BLOCK_READN) to avoid subgroup block read issues with byte types
+@@ -388,7 +397,7 @@ KERNEL(pa_sdpa_opt)(
+                     k_vals[i] = (k_vals[i] - comp_zp) * comp_scale;
+                 #endif
+                 }
+-    #endif  // IS_INT4_COMPRESSED
++    #endif  // IS_INT4_K
+ #else  //  !IS_KV_COMPRESSED
+                 KEY_BLOCK k_vals = 0;
+                 unroll_for (uint i = 0; i < KEY_VEC_SIZE; i++) {
+@@ -429,7 +438,7 @@ KERNEL(pa_sdpa_opt)(
+                 }
+ #endif // XE2_QK_MULTIPLICATION
+             }
+-#endif  // !(IS_KV_COMPRESSED && IS_INT4_COMPRESSED)
++#endif  // !(IS_KV_COMPRESSED && IS_INT4_K)
+ 
+             const uint token_idx = swa_start_token + partition_idx * SEQ_LEN_PARTITION_SIZE + block_num * SUBGROUPS_PER_WG * SUBGROUP_SIZE + sgid * SUBGROUP_SIZE + sglid;
+ 
+@@ -693,7 +702,7 @@ KERNEL(pa_sdpa_opt)(
+ #if IS_KV_COMPRESSED
+             const uint packed_block_offset = block_indices[start_block_idx + block_num] * KV_HEADS_NUM * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE
+                                                 + head_idx * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE;
+-#if IS_INT4_COMPRESSED
++#if IS_INT4_V
+             // INT4: per-token embedded scales at end of each token's row
+             INPUT0_TYPE* my_token_comp_ptr = (INPUT0_TYPE*)(value_cache + packed_block_offset + sglid * phys_adjusted_v_head_size + phys_v_head_size);
+             INPUT0_TYPE comp_scale = my_token_comp_ptr[0];
+@@ -735,7 +744,7 @@ KERNEL(pa_sdpa_opt)(
+                 }
+             }
+ 
+-#elif IS_KV_COMPRESSED && IS_INT4_COMPRESSED
++#elif IS_KV_COMPRESSED && IS_INT4_V
+             // INT4 adjacent packing: V layout [blocks, heads, block_size, packed_head+scales]
+             // packed_byte = head_size_idx/2, nibble = head_size_idx%2
+             // Token stride = phys_adjusted_v_head_size
+@@ -763,7 +772,7 @@ KERNEL(pa_sdpa_opt)(
+                 }
+             }
+ 
+-#else  // !(IS_KV_COMPRESSED && IS_INT4_COMPRESSED) and !USE_DUAL_NIBBLE_V_OPT
++#else  // !(IS_KV_COMPRESSED && IS_INT4_V) and !USE_DUAL_NIBBLE_V_OPT
+             VALUE_BLOCK v_vals_packed;
+             unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
+                 v_vals_packed[i] = BLOCK_READN(INPUT2_TYPE, 1, value_cache, value_offset + i * V_HEAD_SIZE);
+@@ -772,7 +781,16 @@ KERNEL(pa_sdpa_opt)(
+ #if IS_KV_COMPRESSED
+             VALUE_BLOCK_UNCOMPRESSED value_vals;
+             unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
+-                value_vals[i] = (TO_VALUE_UNCOMPRESSED_TYPE(v_vals_packed[i]) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
++                // docs/design-m8-asymmetric-kv.md, Bug A fix A2: the non-4-bit value cache is
++                // ALWAYS physically signed i8 (pa_kv_cache_update_ref.cl's quantize_and_save_
++                // per_token INT8 arm: signed zero-point, convert_char_rte), regardless of what
++                // the value cache PORT (INPUT2_TYPE) happens to be declared as. An explicit
++                // (char) reinterpretation, matching the key dequant's own signed-storage
++                // invariant, makes this read correct independent of the port's declared
++                // signedness - config-level correctness (execution_config.cpp's value-mirror
++                // fix, A1) should already make the port i8, but this is the kernel-side belt to
++                // that config-side suspenders.
++                value_vals[i] = (TO_VALUE_UNCOMPRESSED_TYPE((char)v_vals_packed[i]) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
+             }
+ #else
+             VALUE_BLOCK value_vals = v_vals_packed;
+@@ -825,7 +843,7 @@ KERNEL(pa_sdpa_opt)(
+ 
+ #else  // !USE_DUAL_NIBBLE_V_OPT
+ 
+-#if IS_KV_COMPRESSED && IS_INT4_COMPRESSED
++#if IS_KV_COMPRESSED && IS_INT4_V
+             const uint packed_block_offset = block_indices[last_block_idx] * KV_HEADS_NUM * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE
+                                                 + head_idx * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE;
+ 
+@@ -833,7 +851,7 @@ KERNEL(pa_sdpa_opt)(
+             INPUT0_TYPE* my_token_comp_ptr = (INPUT0_TYPE*)(value_cache + packed_block_offset + sglid * phys_adjusted_v_head_size + phys_v_head_size);
+             INPUT0_TYPE comp_scale = my_token_comp_ptr[0];
+             INPUT0_TYPE comp_zp = my_token_comp_ptr[1];
+-#elif IS_KV_COMPRESSED && !IS_INT4_COMPRESSED
++#elif IS_KV_COMPRESSED && !IS_INT4_V
+             const uint value_comp_offset = block_offset + V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
+             INPUT0_TYPE* value_comp_ptr = value_cache + value_comp_offset;
+             INPUT0_TYPE comp_scale = value_comp_ptr[0 + sglid];
+@@ -845,7 +863,7 @@ KERNEL(pa_sdpa_opt)(
+                 GET_VECTOR_ELEMENT(qk_val, q_idx) = slm_qk_vals[q_idx * SEQ_LEN_PARTITION_SIZE + blocks_num_per_partition * PAGED_ATTENTION_BLOCK_SIZE + sglid];
+             }
+             for (uint i = 0; i < leftovers; i++) {
+-#if IS_KV_COMPRESSED && IS_INT4_COMPRESSED
++#if IS_KV_COMPRESSED && IS_INT4_V
+                 // INT4 adjacent packing: scalar read of packed byte + nibble selection
+                 const uint packed_byte_idx = head_size_idx / 2;
+                 const uint nibble_sel = head_size_idx & 1;
+@@ -854,15 +872,21 @@ KERNEL(pa_sdpa_opt)(
+                 MAKE_VECTOR_TYPE(char, U4_ELEMS_PER_BYTE) buff = unpack_to_char(*(uint4x2_t *)&packed_value);
+                 INPUT2_TYPE value_packed = (nibble_sel == 0) ? buff.s0 : buff.s1;
+ 
+-#else  // !(IS_KV_COMPRESSED && IS_INT4_COMPRESSED)
++#else  // !(IS_KV_COMPRESSED && IS_INT4_V)
+                 INPUT2_TYPE value_packed = BLOCK_READN(INPUT2_TYPE, 1, value_cache, value_offset + i * V_HEAD_SIZE);
+ 
+-#endif  // !(IS_KV_COMPRESSED && IS_INT4_COMPRESSED)
++#endif  // !(IS_KV_COMPRESSED && IS_INT4_V)
+ 
+ #if IS_KV_COMPRESSED
+                 #define VALUE_UNCOMPRESSED INPUT0_TYPE
+                 #define TO_VALUE_UNCOMPRESSED_TYPE(val) CAT(convert_, VALUE_UNCOMPRESSED)(val)
+-                VALUE_UNCOMPRESSED value_val = (TO_VALUE_UNCOMPRESSED_TYPE(value_packed) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
++                // docs/design-m8-asymmetric-kv.md, Bug A fix A2 (see the matching comment at this
++                // kernel's main per-partition V loop above): explicit (char) reinterpretation so
++                // this non-4-bit V read is correct regardless of the value port's declared
++                // signedness. Safe for the IS_INT4_V arm too - value_packed there is a nibble in
++                // [0, 15], identical under signed or unsigned interpretation - so this one cast
++                // covers both arms without special-casing which one set value_packed.
++                VALUE_UNCOMPRESSED value_val = (TO_VALUE_UNCOMPRESSED_TYPE((char)value_packed) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
+ #else
+                 VALUE_UNCOMPRESSED value_val = value_packed;
+ #endif
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/pa_kv_cache_update_ref.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/pa_kv_cache_update_ref.cl
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/pa_kv_cache_update_ref.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/pa_kv_cache_update_ref.cl
+@@ -8,7 +8,23 @@
+ 
+ #define UINT4_RANGE 15
+ 
+-inline void FUNC(quantize_and_save_per_token)(__global const INPUT0_TYPE* in_data,
++// docs/design-m8-asymmetric-kv.md, Bug B fix (patches/0010's own "OWED" note, closed here):
++// this write helper used to be ONE function, shared by both the key call site (out_data_pitch =
++// PAGED_ATTENTION_BLOCK_SIZE, head-major) and the value call site (out_data_pitch = 1,
++// token-major), with its INT4-vs-INT8 packing chosen by the single, collapsed IS_INT4_COMPRESSED
++// macro. Because .cl jit constants are fixed for the WHOLE compiled kernel program (there is no
++// way for the same function body to pack differently depending on which call site invoked it
++// within one compilation), a single shared body cannot express "pack the key call as int8 while
++// packing the value call as int4" - exactly the u8-K/i4-V case this task targets. Split into two
++// instantiations, each gated on its own side's precision macro (IS_INT4_K / IS_INT4_V, the same
++// macros patches/0010 already introduced on the READ side, paged_attention_opt.cpp/.cl):
++// quantize_and_save_per_token_k (called only from key call sites, gated IS_INT4_K) and
++// quantize_and_save_per_token_v (called only from value call sites, gated IS_INT4_V). Bodies are
++// otherwise identical to the pre-split function - the out_data_pitch runtime branch inside the
++// INT4 arm (head-major vs token-major scale/zp placement) is kept in both copies unchanged, even
++// though each copy is now only ever called with one fixed pitch, so neither copy diverges from
++// the original logic beyond the macro it reads.
++inline void FUNC(quantize_and_save_per_token_k)(__global const INPUT0_TYPE* in_data,
+                                     const uint in_data_offset,
+                                     __global OUTPUT_TYPE* out_data,
+                                     const uint out_data_offset,
+@@ -35,7 +51,7 @@ inline void FUNC(quantize_and_save_per_token)(__global const INPUT0_TYPE* in_dat
+     #define ACCUMULATOR_TYPE float
+     ACCUMULATOR_TYPE diff_value = max_value == min_value ? (grp_max) : (max_value - min_value);
+ 
+-    #if IS_INT4_COMPRESSED
++    #if IS_INT4_K
+     ACCUMULATOR_TYPE scale_tmp = (ACCUMULATOR_TYPE)((UINT4_RANGE) / diff_value);
+     ACCUMULATOR_TYPE zp_tmp = (ACCUMULATOR_TYPE)(-min_value * scale_tmp);
+     #else
+@@ -47,7 +63,7 @@ inline void FUNC(quantize_and_save_per_token)(__global const INPUT0_TYPE* in_dat
+ 
+     #undef ACCUMULATOR_TYPE
+ 
+-    #if IS_INT4_COMPRESSED
++    #if IS_INT4_K
+         // Quantize all groups first (clamp to [0, UINT4_RANGE] before packing)
+         char quant_data[(K_HEAD_SIZE+V_HEAD_SIZE) / SUBGROUP_SIZE];
+         unroll_for (uint i = 0; i < num_groups; i++) {
+@@ -92,7 +108,7 @@ inline void FUNC(quantize_and_save_per_token)(__global const INPUT0_TYPE* in_dat
+                 comp_ptr[1] = zp;
+             }
+         }
+-    #else  // !IS_INT4_COMPRESSED
++    #else  // !IS_INT4_K
+         unroll_for (uint i = 0; i < num_groups; i++) {
+             OUTPUT_TYPE res = convert_char_rte(input_data[i] * scale + zp);
+ 
+@@ -105,11 +121,115 @@ inline void FUNC(quantize_and_save_per_token)(__global const INPUT0_TYPE* in_dat
+             comp_ptr[token_pos_in_block] = 1.0 / scale;
+             comp_ptr[PAGED_ATTENTION_BLOCK_SIZE + token_pos_in_block] = zp;
+         }
+-    #endif  // !IS_INT4_COMPRESSED
++    #endif  // !IS_INT4_K
++}
++
++inline void FUNC(quantize_and_save_per_token_v)(__global const INPUT0_TYPE* in_data,
++                                    const uint in_data_offset,
++                                    __global OUTPUT_TYPE* out_data,
++                                    const uint out_data_offset,
++                                    const uint out_data_pitch,
++                                    const uint comp_offset,
++                                    const uint token_pos_in_block,
++                                    const uint sglid,
++                                    const uint num_groups,
++                                    INPUT0_TYPE* input_data) {
++    INPUT0_TYPE grp_max = 0.004;
++    INPUT0_TYPE max_value = INPUT0_VAL_MIN;
++    INPUT0_TYPE min_value = INPUT0_VAL_MAX;
++
++    unroll_for (uint i = 0; i < num_groups; i++) {
++        input_data[i] = BLOCK_READN(INPUT0_TYPE, 1, in_data, in_data_offset + i * SUBGROUP_SIZE);
++        max_value = fmax(max_value, input_data[i]);
++        min_value = fmin(min_value, input_data[i]);
++    }
++
++    min_value = sub_group_reduce_min(min_value);
++    max_value = sub_group_reduce_max(max_value);
++
++    // If the range of input data is zero, it is adjusted to the minimum value(0.004).
++    #define ACCUMULATOR_TYPE float
++    ACCUMULATOR_TYPE diff_value = max_value == min_value ? (grp_max) : (max_value - min_value);
++
++    #if IS_INT4_V
++    ACCUMULATOR_TYPE scale_tmp = (ACCUMULATOR_TYPE)((UINT4_RANGE) / diff_value);
++    ACCUMULATOR_TYPE zp_tmp = (ACCUMULATOR_TYPE)(-min_value * scale_tmp);
++    #else
++    ACCUMULATOR_TYPE scale_tmp = (ACCUMULATOR_TYPE)((CHAR_MAX - CHAR_MIN) / diff_value);
++    ACCUMULATOR_TYPE zp_tmp = (ACCUMULATOR_TYPE)(-min_value * scale_tmp) + CHAR_MIN;
++    #endif
++    INPUT0_TYPE scale = (INPUT1_TYPE)(scale_tmp);
++    INPUT0_TYPE zp = (INPUT1_TYPE)(zp_tmp);
++
++    #undef ACCUMULATOR_TYPE
++
++    #if IS_INT4_V
++        // Quantize all groups first (clamp to [0, UINT4_RANGE] before packing)
++        char quant_data[(K_HEAD_SIZE+V_HEAD_SIZE) / SUBGROUP_SIZE];
++        unroll_for (uint i = 0; i < num_groups; i++) {
++            quant_data[i] = (char)clamp(convert_int_rte((float)(input_data[i] * scale + zp)), 0, UINT4_RANGE);
++        }
++        // Adjacent packing: packed byte n = pack(head[2n], head[2n+1])
++        // Each packed group of 16 bytes covers 2 input groups (32 head elements)
++        // Use out_data_pitch: key (pitch=block_size) → head-major, value (pitch=1) → token-major
++        unroll_for (uint pp = 0; pp < num_groups / U4_ELEMS_PER_BYTE; pp++) {
++            uint src_lane = (sglid % 8) * 2;
++            char lo_even = intel_sub_group_shuffle(quant_data[2 * pp], src_lane);
++            char hi_even = intel_sub_group_shuffle(quant_data[2 * pp], src_lane + 1);
++            char lo_odd  = intel_sub_group_shuffle(quant_data[2 * pp + 1], src_lane);
++            char hi_odd  = intel_sub_group_shuffle(quant_data[2 * pp + 1], src_lane + 1);
++            char2 res_vec;
++            res_vec.s0 = (sglid < 8) ? lo_even : lo_odd;
++            res_vec.s1 = (sglid < 8) ? hi_even : hi_odd;
++            out_data[out_data_offset + (pp * SUBGROUP_SIZE + sglid) * out_data_pitch] = cvt_int8x2_to_uint4x2(res_vec);
++        }
++        // Handle remaining group when num_groups is odd (e.g., head_size=80 → 5 groups)
++        if (num_groups % U4_ELEMS_PER_BYTE != 0) {
++            uint last_grp = num_groups - 1;
++            uint pp = num_groups / U4_ELEMS_PER_BYTE;
++            uint src_lane = (sglid % 8) * 2;
++            char lo = intel_sub_group_shuffle(quant_data[last_grp], src_lane);
++            char hi = intel_sub_group_shuffle(quant_data[last_grp], src_lane + 1);
++            char2 res_vec = {lo, hi};
++            if (sglid < 8) {
++                out_data[out_data_offset + (pp * SUBGROUP_SIZE + sglid) * out_data_pitch] = cvt_int8x2_to_uint4x2(res_vec);
++            }
++        }
++        // Scale/zp storage depends on layout:
++        // head-major (pitch>1, key BY_TOKEN): per-token indexed at block end, like INT8
++        // token-major (pitch=1, value): embedded per-token at comp_offset
++        INPUT0_TYPE* comp_ptr = (INPUT0_TYPE*)(out_data + comp_offset);
++        if (sglid == 0) {
++            if (out_data_pitch > 1) {
++                comp_ptr[token_pos_in_block] = 1.0 / scale;
++                comp_ptr[PAGED_ATTENTION_BLOCK_SIZE + token_pos_in_block] = zp;
++            } else {
++                comp_ptr[0] = 1.0 / scale;
++                comp_ptr[1] = zp;
++            }
++        }
++    #else  // !IS_INT4_V
++        unroll_for (uint i = 0; i < num_groups; i++) {
++            OUTPUT_TYPE res = convert_char_rte(input_data[i] * scale + zp);
++
++            uint offset = out_data_offset + (i * SUBGROUP_SIZE + sglid) * out_data_pitch;
++            out_data[offset] = res;
++        }
++
++        INPUT0_TYPE* comp_ptr = out_data + comp_offset;
++        if (sglid == 0) {
++            comp_ptr[token_pos_in_block] = 1.0 / scale;
++            comp_ptr[PAGED_ATTENTION_BLOCK_SIZE + token_pos_in_block] = zp;
++        }
++    #endif  // !IS_INT4_V
+ }
+ 
+ #ifdef IS_KEY_BY_CHANNEL
+-#if IS_INT4_COMPRESSED
++// docs/design-m8-asymmetric-kv.md, Bug B fix: BY_CHANNEL is a KEY-only cache layout (value is
++// always per-token/BY_TOKEN), so every gate in this key-only section - COMP_K_OFFSET and both
++// quantize_and_save_by_channel_* helpers below - reads IS_INT4_K, never the collapsed
++// IS_INT4_COMPRESSED.
++#if IS_INT4_K
+ // INT4 BY_CHANNEL: packed_block_size = block_size / 2 = 8 bytes of packed u4 data per column
+ #define COMP_K_OFFSET (PAGED_ATTENTION_BLOCK_SIZE / U4_ELEMS_PER_BYTE)
+ #else
+@@ -298,7 +418,7 @@ inline void FUNC(quantize_and_save_by_channel_prefill)(__global const INPUT0_TYP
+         // When the range is very small, expand the range to avoid zp overflow
+         range += (range <= min_range ? fmax(1.0f, min_range) : 0.0f);
+ 
+-        #if IS_INT4_COMPRESSED
++        #if IS_INT4_K
+             ACCUMULATOR_TYPE scale_tmp = (ACCUMULATOR_TYPE)((UINT4_RANGE) / range);
+             ACCUMULATOR_TYPE zp_tmp = (ACCUMULATOR_TYPE)(-min_value * scale_tmp);
+         #else
+@@ -314,7 +434,7 @@ inline void FUNC(quantize_and_save_by_channel_prefill)(__global const INPUT0_TYP
+         // store comp_data
+         INPUT0_TYPE* comp_ptr = (INPUT0_TYPE*) (&out_data[out_offset_per_wi + COMP_K_OFFSET]);
+ 
+-        #if IS_INT4_COMPRESSED
++        #if IS_INT4_K
+             // Token-axis packing: one scale/zp per column (head dim)
+             comp_ptr[0] = 1.0 / scale;
+             comp_ptr[1] = zp;
+@@ -366,17 +486,24 @@ KERNEL(pa_kv_cache_update)(
+     const int k_hidden_stride = ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE;
+     #endif
+ 
+-#if IS_INT4_COMPRESSED
++// docs/design-m8-asymmetric-kv.md, Bug B fix: independently gated per operand, mirroring the
++// read kernel's split (paged_attention_opt.cl) - was one IS_INT4_COMPRESSED block picking both
++// operands' physical sizes together, which cannot express u8-K/i4-V (K unpacked, V packed).
++#if IS_INT4_K
+     // INT4 BY_CHANNEL K: head_size is outer dim (not packed), block is inner (packed)
+     const uint phys_adjusted_k_head_size = PACKED_ADJUSTED_K_HEAD_SIZE;  // = K_HEAD_SIZE for BY_CHANNEL
+     const uint phys_k_head_size = PACKED_K_HEAD_SIZE;                    // = K_HEAD_SIZE for BY_CHANNEL
++#else
++    const uint phys_adjusted_k_head_size = ADJUSTED_K_HEAD_SIZE;
++    const uint phys_k_head_size = K_HEAD_SIZE;
++#endif
++
++#if IS_INT4_V
+     // INT4 V: per-token, head_size is inner dim (packed)
+     const uint phys_adjusted_v_head_size = PACKED_ADJUSTED_V_HEAD_SIZE;
+     const uint phys_v_head_size = PACKED_V_HEAD_SIZE;
+ #else
+-    const uint phys_adjusted_k_head_size = ADJUSTED_K_HEAD_SIZE;
+     const uint phys_adjusted_v_head_size = ADJUSTED_V_HEAD_SIZE;
+-    const uint phys_k_head_size = K_HEAD_SIZE;
+     const uint phys_v_head_size = V_HEAD_SIZE;
+ #endif
+ 
+@@ -402,7 +529,7 @@ KERNEL(pa_kv_cache_update)(
+         uint block_v_base_offset = block_idx * KV_HEADS_NUM * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE + head_idx * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE;
+         // Key: head-major for both INT4 and INT8 BY_TOKEN (token pos = offset within stride)
+         uint key_out_offset = block_k_base_offset + current_token_pos_in_block;
+-#if IS_INT4_COMPRESSED
++#if IS_INT4_V
+         uint value_out_offset = block_v_base_offset + current_token_pos_in_block * phys_adjusted_v_head_size;
+ #else
+         uint value_out_offset = block_v_base_offset + current_token_pos_in_block * phys_v_head_size;
+@@ -446,7 +573,7 @@ KERNEL(pa_kv_cache_update)(
+         #ifdef IS_KEY_BY_CHANNEL
+         // key by channel
+         {
+-            #if IS_INT4_COMPRESSED
++            #if IS_INT4_K
+                 // INT4 BY_CHANNEL K: requantize existing block with new token
+                 FUNC_CALL(quantize_and_save_by_channel_block_with_requantize_int4)(key_data,
+                                                                             key_in_offset,
+@@ -474,13 +601,13 @@ KERNEL(pa_kv_cache_update)(
+ 
+         // value per token
+         if (get_group_id(2) == 0) {
+-        #if IS_INT4_COMPRESSED
++        #if IS_INT4_V
+             const uint comp_v_offset = value_out_offset + phys_v_head_size;
+         #else
+             const uint comp_v_offset = block_v_base_offset + phys_v_head_size * PAGED_ATTENTION_BLOCK_SIZE;
+         #endif
+             INPUT0_TYPE input_data[V_HEAD_SIZE / SUBGROUP_SIZE];
+-            FUNC_CALL(quantize_and_save_per_token)(value_data, value_in_offset, value_cache_data, value_out_offset, 1, comp_v_offset,
++            FUNC_CALL(quantize_and_save_per_token_v)(value_data, value_in_offset, value_cache_data, value_out_offset, 1, comp_v_offset,
+                 current_token_pos_in_block, sglid, V_HEAD_SIZE / SUBGROUP_SIZE, &input_data[0]);
+         }
+         #else
+@@ -489,16 +616,16 @@ KERNEL(pa_kv_cache_update)(
+             const uint comp_k_offset = block_k_base_offset + phys_k_head_size * PAGED_ATTENTION_BLOCK_SIZE;
+             // key processing
+             INPUT0_TYPE input_k_data[K_HEAD_SIZE / SUBGROUP_SIZE];
+-            FUNC_CALL(quantize_and_save_per_token)(key_data, key_in_offset, key_cache_data, key_out_offset, PAGED_ATTENTION_BLOCK_SIZE, comp_k_offset,
++            FUNC_CALL(quantize_and_save_per_token_k)(key_data, key_in_offset, key_cache_data, key_out_offset, PAGED_ATTENTION_BLOCK_SIZE, comp_k_offset,
+                 current_token_pos_in_block, sglid, K_HEAD_SIZE / SUBGROUP_SIZE, &input_k_data[0]);
+ 
+-#if IS_INT4_COMPRESSED
++#if IS_INT4_V
+             const uint comp_v_offset = value_out_offset + phys_v_head_size;
+ #else
+             const uint comp_v_offset = block_v_base_offset + phys_v_head_size * PAGED_ATTENTION_BLOCK_SIZE;
+ #endif
+             INPUT0_TYPE input_v_data[V_HEAD_SIZE / SUBGROUP_SIZE];
+-            FUNC_CALL(quantize_and_save_per_token)(value_data, value_in_offset, value_cache_data, value_out_offset, 1, comp_v_offset,
++            FUNC_CALL(quantize_and_save_per_token_v)(value_data, value_in_offset, value_cache_data, value_out_offset, 1, comp_v_offset,
+                 current_token_pos_in_block, sglid, V_HEAD_SIZE / SUBGROUP_SIZE, &input_v_data[0]);
+         }
+         #endif
+@@ -541,7 +668,7 @@ KERNEL(pa_kv_cache_update)(
+ 
+         uint block_v_base_offset = block_indices[block_offset] * KV_HEADS_NUM * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE +
+                                  head_idx * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE;
+-#if IS_INT4_COMPRESSED
++#if IS_INT4_V
+         uint value_out_offset = block_v_base_offset;
+         value_out_offset += token_start_pos_val * phys_adjusted_v_head_size;
+         const uint comp_v_offset = value_out_offset + phys_v_head_size;
+@@ -554,7 +681,11 @@ KERNEL(pa_kv_cache_update)(
+         if (tokens_num == PAGED_ATTENTION_BLOCK_SIZE) {
+         // block is full
+         #if defined(IS_KV_COMPRESSED) && defined(IS_KEY_BY_CHANNEL)
+-            #if IS_INT4_COMPRESSED
++            // docs/design-m8-asymmetric-kv.md, Bug B fix: key write and value write, split into
++            // two independently-gated regions (IS_INT4_K / IS_INT4_V) instead of the one
++            // IS_INT4_COMPRESSED selection that used to choose an "both int4" or "both int8"
++            // block as a single unit - the same restructuring 0010 already did on the read side.
++            #if IS_INT4_K
+             // INT4 BY_CHANNEL: use by-channel prefill or requantize (same as INT8 BY_CHANNEL)
+             {
+                 if (token_start_pos_key != 0) {
+@@ -579,15 +710,6 @@ KERNEL(pa_kv_cache_update)(
+                                                                     sglid);
+                 }
+             }
+-            // Value per token
+-            for (uint token_num = 0; token_num < tokens_num; token_num++) {
+-                INPUT0_TYPE input_data[V_HEAD_SIZE / SUBGROUP_SIZE];
+-                const uint comp_v = value_out_offset + phys_v_head_size;
+-                FUNC_CALL(quantize_and_save_per_token)(value_data, value_in_offset, value_cache_data, value_out_offset, 1,
+-                    comp_v, token_start_pos_val + token_num, sglid, V_HEAD_SIZE / SUBGROUP_SIZE, &input_data[0]);
+-                value_in_offset += (KV_HEADS_NUM * V_HEAD_SIZE + INPUT1_PAD_AFTER_FEATURE_NUM + INPUT1_PAD_BEFORE_FEATURE_NUM);
+-                value_out_offset += phys_adjusted_v_head_size;
+-            }
+             #else
+             // Key by channel
+             if (token_start_pos_key != 0) {
+@@ -611,15 +733,28 @@ KERNEL(pa_kv_cache_update)(
+                                                                 tokens_num,
+                                                                 sglid);
+             }
++            #endif // IS_INT4_K
++
++            #if IS_INT4_V
++            // Value per token
++            for (uint token_num = 0; token_num < tokens_num; token_num++) {
++                INPUT0_TYPE input_data[V_HEAD_SIZE / SUBGROUP_SIZE];
++                const uint comp_v = value_out_offset + phys_v_head_size;
++                FUNC_CALL(quantize_and_save_per_token_v)(value_data, value_in_offset, value_cache_data, value_out_offset, 1,
++                    comp_v, token_start_pos_val + token_num, sglid, V_HEAD_SIZE / SUBGROUP_SIZE, &input_data[0]);
++                value_in_offset += (KV_HEADS_NUM * V_HEAD_SIZE + INPUT1_PAD_AFTER_FEATURE_NUM + INPUT1_PAD_BEFORE_FEATURE_NUM);
++                value_out_offset += phys_adjusted_v_head_size;
++            }
++            #else
+             // Value per token
+             unroll_for (uint token_num = 0; token_num < tokens_num; token_num++) {
+                 INPUT0_TYPE input_data[V_HEAD_SIZE / SUBGROUP_SIZE];
+-                FUNC_CALL(quantize_and_save_per_token)(value_data, value_in_offset, value_cache_data, value_out_offset, 1,
++                FUNC_CALL(quantize_and_save_per_token_v)(value_data, value_in_offset, value_cache_data, value_out_offset, 1,
+                     comp_v_offset, token_num, sglid, V_HEAD_SIZE / SUBGROUP_SIZE, &input_data[0]);
+                 value_in_offset += (KV_HEADS_NUM * V_HEAD_SIZE + INPUT1_PAD_AFTER_FEATURE_NUM + INPUT1_PAD_BEFORE_FEATURE_NUM);
+                 value_out_offset += phys_v_head_size;
+             }
+-            #endif
++            #endif // IS_INT4_V
+         #else // !(defined(IS_KV_COMPRESSED) && defined(IS_KEY_BY_CHANNEL))
+             unroll_for (uint token_num = 0; token_num < PAGED_ATTENTION_BLOCK_SIZE; token_num++) {
+             #if !IS_KV_COMPRESSED
+@@ -739,17 +874,17 @@ KERNEL(pa_kv_cache_update)(
+             {
+                 // Key per token
+                 INPUT0_TYPE input_k_data[K_HEAD_SIZE / SUBGROUP_SIZE];
+-                FUNC_CALL(quantize_and_save_per_token)(key_data, key_in_offset, key_cache_data, key_out_offset, PAGED_ATTENTION_BLOCK_SIZE,
++                FUNC_CALL(quantize_and_save_per_token_k)(key_data, key_in_offset, key_cache_data, key_out_offset, PAGED_ATTENTION_BLOCK_SIZE,
+                     comp_k_offset, token_num, sglid, K_HEAD_SIZE / SUBGROUP_SIZE, &input_k_data[0]);
+ 
+                 // Value per token
+                 INPUT0_TYPE input_v_data[V_HEAD_SIZE / SUBGROUP_SIZE];
+-#if IS_INT4_COMPRESSED
++#if IS_INT4_V
+                 const uint cur_comp_v = value_out_offset + phys_v_head_size;
+-                FUNC_CALL(quantize_and_save_per_token)(value_data, value_in_offset, value_cache_data, value_out_offset, 1,
++                FUNC_CALL(quantize_and_save_per_token_v)(value_data, value_in_offset, value_cache_data, value_out_offset, 1,
+                     cur_comp_v, token_num, sglid, V_HEAD_SIZE / SUBGROUP_SIZE, &input_v_data[0]);
+ #else
+-                FUNC_CALL(quantize_and_save_per_token)(value_data, value_in_offset, value_cache_data, value_out_offset, 1,
++                FUNC_CALL(quantize_and_save_per_token_v)(value_data, value_in_offset, value_cache_data, value_out_offset, 1,
+                     comp_v_offset, token_num, sglid, V_HEAD_SIZE / SUBGROUP_SIZE, &input_v_data[0]);
+ #endif
+             }
+@@ -757,7 +892,7 @@ KERNEL(pa_kv_cache_update)(
+                 key_in_offset += (KV_HEADS_NUM * K_HEAD_SIZE + INPUT0_PAD_AFTER_FEATURE_NUM + INPUT0_PAD_BEFORE_FEATURE_NUM);
+                 key_out_offset += 1;
+                 value_in_offset += (KV_HEADS_NUM * V_HEAD_SIZE + INPUT1_PAD_AFTER_FEATURE_NUM + INPUT1_PAD_BEFORE_FEATURE_NUM);
+-#if IS_INT4_COMPRESSED
++#if IS_INT4_V
+                 value_out_offset += phys_adjusted_v_head_size;
+ #else
+                 value_out_offset += phys_v_head_size;
+@@ -766,7 +901,9 @@ KERNEL(pa_kv_cache_update)(
+         #endif // !(defined(IS_KV_COMPRESSED) && defined(IS_KEY_BY_CHANNEL))
+         } else {
+         #if defined(IS_KV_COMPRESSED) && defined(IS_KEY_BY_CHANNEL)
+-            #if IS_INT4_COMPRESSED
++            // docs/design-m8-asymmetric-kv.md, Bug B fix: same independent K/V split as the
++            // "block is full" branch above.
++            #if IS_INT4_K
+             // INT4 BY_CHANNEL: use by-channel requantize (same as INT8 BY_CHANNEL path)
+             {
+                 if (token_start_pos_key != 0) {
+@@ -790,16 +927,6 @@ KERNEL(pa_kv_cache_update)(
+                                                                     sglid);
+                 }
+             }
+-
+-            // value processing per token
+-            for (uint token_num = 0; token_num < tokens_num; token_num++) {
+-                INPUT0_TYPE input_data[V_HEAD_SIZE / SUBGROUP_SIZE];
+-                const uint comp_v = value_out_offset + phys_v_head_size;
+-                FUNC_CALL(quantize_and_save_per_token)(value_data, value_in_offset, value_cache_data, value_out_offset, 1,
+-                    comp_v, token_start_pos_val + token_num, sglid, V_HEAD_SIZE / SUBGROUP_SIZE, &input_data[0]);
+-                value_in_offset += (KV_HEADS_NUM * V_HEAD_SIZE + INPUT1_PAD_AFTER_FEATURE_NUM + INPUT1_PAD_BEFORE_FEATURE_NUM);
+-                value_out_offset += phys_adjusted_v_head_size;
+-            }
+             #else
+             // key processing by channel
+             if (token_start_pos_key != 0) {
+@@ -823,16 +950,28 @@ KERNEL(pa_kv_cache_update)(
+                                                                 tokens_num,
+                                                                 sglid);
+             }
++            #endif // IS_INT4_K
+ 
++            #if IS_INT4_V
+             // value processing per token
+             for (uint token_num = 0; token_num < tokens_num; token_num++) {
+                 INPUT0_TYPE input_data[V_HEAD_SIZE / SUBGROUP_SIZE];
+-                FUNC_CALL(quantize_and_save_per_token)(value_data, value_in_offset, value_cache_data, value_out_offset, 1,
++                const uint comp_v = value_out_offset + phys_v_head_size;
++                FUNC_CALL(quantize_and_save_per_token_v)(value_data, value_in_offset, value_cache_data, value_out_offset, 1,
++                    comp_v, token_start_pos_val + token_num, sglid, V_HEAD_SIZE / SUBGROUP_SIZE, &input_data[0]);
++                value_in_offset += (KV_HEADS_NUM * V_HEAD_SIZE + INPUT1_PAD_AFTER_FEATURE_NUM + INPUT1_PAD_BEFORE_FEATURE_NUM);
++                value_out_offset += phys_adjusted_v_head_size;
++            }
++            #else
++            // value processing per token
++            for (uint token_num = 0; token_num < tokens_num; token_num++) {
++                INPUT0_TYPE input_data[V_HEAD_SIZE / SUBGROUP_SIZE];
++                FUNC_CALL(quantize_and_save_per_token_v)(value_data, value_in_offset, value_cache_data, value_out_offset, 1,
+                     comp_v_offset, token_start_pos_val + token_num, sglid, V_HEAD_SIZE / SUBGROUP_SIZE, &input_data[0]);
+                 value_in_offset += (KV_HEADS_NUM * V_HEAD_SIZE + INPUT1_PAD_AFTER_FEATURE_NUM + INPUT1_PAD_BEFORE_FEATURE_NUM);
+                 value_out_offset += phys_v_head_size;
+             }
+-            #endif
++            #endif // IS_INT4_V
+         #else // defined(IS_KV_COMPRESSED) && defined(IS_KEY_BY_CHANNEL)
+             for (uint token_num = 0; token_num < tokens_num; token_num++) {
+                 uint head_idx_index = 0;
+@@ -863,17 +1002,17 @@ KERNEL(pa_kv_cache_update)(
+                 {
+                     // key processing
+                     INPUT0_TYPE input_k_data[K_HEAD_SIZE / SUBGROUP_SIZE];
+-                    FUNC_CALL(quantize_and_save_per_token)(key_data, key_in_offset, key_cache_data, key_out_offset, PAGED_ATTENTION_BLOCK_SIZE,
++                    FUNC_CALL(quantize_and_save_per_token_k)(key_data, key_in_offset, key_cache_data, key_out_offset, PAGED_ATTENTION_BLOCK_SIZE,
+                         comp_k_offset, token_start_pos_key + token_num, sglid, K_HEAD_SIZE / SUBGROUP_SIZE, &input_k_data[0]);
+ 
+                     // value processing
+                     INPUT0_TYPE input_v_data[V_HEAD_SIZE / SUBGROUP_SIZE];
+-#if IS_INT4_COMPRESSED
++#if IS_INT4_V
+                     const uint cur_comp_v = value_out_offset + phys_v_head_size;
+-                    FUNC_CALL(quantize_and_save_per_token)(value_data, value_in_offset, value_cache_data, value_out_offset, 1,
++                    FUNC_CALL(quantize_and_save_per_token_v)(value_data, value_in_offset, value_cache_data, value_out_offset, 1,
+                         cur_comp_v, token_start_pos_val + token_num, sglid, V_HEAD_SIZE / SUBGROUP_SIZE, &input_v_data[0]);
+ #else
+-                    FUNC_CALL(quantize_and_save_per_token)(value_data, value_in_offset, value_cache_data, value_out_offset, 1,
++                    FUNC_CALL(quantize_and_save_per_token_v)(value_data, value_in_offset, value_cache_data, value_out_offset, 1,
+                         comp_v_offset, token_start_pos_val + token_num, sglid, V_HEAD_SIZE / SUBGROUP_SIZE, &input_v_data[0]);
+ #endif
+                 }
+@@ -881,7 +1020,7 @@ KERNEL(pa_kv_cache_update)(
+                 key_in_offset += (KV_HEADS_NUM * K_HEAD_SIZE + INPUT0_PAD_AFTER_FEATURE_NUM + INPUT0_PAD_BEFORE_FEATURE_NUM);
+                 key_out_offset += 1;
+                 value_in_offset += (KV_HEADS_NUM * V_HEAD_SIZE + INPUT1_PAD_AFTER_FEATURE_NUM + INPUT1_PAD_BEFORE_FEATURE_NUM);
+-#if IS_INT4_COMPRESSED
++#if IS_INT4_V
+                 value_out_offset += phys_adjusted_v_head_size;
+ #else
+                 value_out_offset += phys_v_head_size;
+diff --git a/src/plugins/intel_gpu/src/runtime/execution_config.cpp b/src/plugins/intel_gpu/src/runtime/execution_config.cpp
+--- a/src/plugins/intel_gpu/src/runtime/execution_config.cpp
++++ b/src/plugins/intel_gpu/src/runtime/execution_config.cpp
+@@ -479,29 +479,67 @@ void ExecutionConfig::finalize_impl(const IRemoteContext* context) {
+         m_value_cache_precision = ov::element::u4;
+     }
+ 
+-    // docs/design-m8-asymmetric-kv.md, patches/0009: the paged-attention opt/ref kernels
+-    // (paged_attention_opt.cpp's JIT-constant generators) derive BOTH operands' packing
+-    // from this single, key-side get_kv_cache_precision() value - there is no per-side
+-    // variant today (patches/0009's header has the full analysis, .cl source included).
+-    // A request where the two sides disagree on sub-byte packing is therefore guaranteed
+-    // corruption, not a missing optimization. Refuse here, at ExecutionConfig::finalize()
+-    // time - before any model transformation or ProgramBuilder work begins - so the named
+-    // message reaches the operator directly. A first attempt placed the equivalent check
+-    // inside paged_attention.cpp's calc_output_layouts (per-primitive, deep in ProgramBuilder):
+-    // it threw loud, but ProgramBuilder's generic "build failed" wrapper swallowed the
+-    // specific text on the operator-visible line - confirmed on-card. This checks bitwidth()
+-    // (4 vs not-4), not is_i4_u4, deliberately: both sides already went through the swaps
+-    // just above (u8->i8, i4->u4), so a mismatch here can only mean one side is genuinely
+-    // 4-bit and the other is not - the exact case the kernels cannot yet express.
+-    OPENVINO_ASSERT((ov::element::Type(get_kv_cache_precision()).bitwidth() == 4) ==
+-                    (ov::element::Type(get_value_cache_precision()).bitwidth() == 4),
++    // docs/design-m8-asymmetric-kv.md, patches/0009 (original) / patches/0010 (this relaxation):
++    // patches/0009 refused every key/value bitwidth mismatch here, because at that point the
++    // paged-attention opt kernel's JIT-constant generators (paged_attention_opt.cpp) derived
++    // BOTH operands' packing from one shared, key-side get_kv_cache_precision() value - no
++    // per-side variant existed. patches/0010 splits that generator into independent IS_INT4_K /
++    // IS_INT4_V paths (paged_attention_opt.cpp + .cl), so the DECODE opt kernel can now serve the
++    // key>=8bit / value-4bit direction (u8-K/i4-V) correctly. The reverse direction (i4-K/u8-V)
++    // was not attempted - design §2 calls it "genuinely harder" because it moves V off the
++    // dual-nibble dispatch math - so it stays refused here, same as any other pairing where the
++    // KEY side alone is 4-bit and the value side is not.
++    //
++    // This checks bitwidth() (4 vs not-4), not is_i4_u4, deliberately: both sides already went
++    // through the swaps just above (u8->i8, i4->u4), so a 4-bit/not-4-bit split here can only
++    // come from a genuine key/value bitwidth mismatch request.
++    //
++    // OWED note from patches/0010, RESOLVED here: patches/0010 split the READ kernel
++    // (paged_attention_opt.cpp/.cl) into independent IS_INT4_K / IS_INT4_V gates but left the
++    // KV-cache WRITE kernel (KVCacheUpdateGenerator in paged_attention_opt.cpp, kernel
++    // pa_kv_cache_update_ref.cl) on the single, key-side-only kv_cache_dt gate - so for u8-K/
++    // i4-V the write kernel kept writing the value cache UNPACKED (is_i4_u4(kv_cache_dt=u8) is
++    // false) every decode step, while the already-fixed read kernel expected value bytes PACKED
++    // (IS_INT4_V true): a stride mismatch on the value cache, not a missing optimization -
++    // measured as -nan at output[0] on the decode_serves_u8_key_i4_value unit case. THIS patch
++    // (the follow-up task closing that OWED note) splits the write kernel the same way: its ~22
++    // IS_INT4_COMPRESSED sites (pa_kv_cache_update_ref.cl, all three stages - decode/2nd-token,
++    // prefill block-full, prefill block-partial - and both BY_CHANNEL and BY_TOKEN key layouts,
++    // since the write kernel is one compiled program and its jit constants are fixed for every
++    // stage/layout in that one compilation, not just the decode path) are now IS_INT4_K where the
++    // code writes the key cache and IS_INT4_V where it writes the value cache, independently
++    // resolved, exactly mirroring the read side. The shared write helper
++    // quantize_and_save_per_token - previously ONE function body called for both operands under
++    // one IS_INT4_COMPRESSED, which cannot express two different compile-time behaviors for the
++    // same compiled kernel - is now two instantiations, quantize_and_save_per_token_k (gated
++    // IS_INT4_K, called only from key call sites) and quantize_and_save_per_token_v (gated
++    // IS_INT4_V, called only from value call sites). Read and write now agree on layout for every
++    // pairing this guard permits.
++    // docs/design-m8-asymmetric-kv.md, fable-review follow-up (F2): the bitwidth()==4 check
++    // alone admits pairings this generation cannot serve either - f16:i4, f16:u8, u8:f16 all pass
++    // it (f16's bitwidth is 16, never 4, so the "key is 4-bit" arm never fires for any f16 side),
++    // but none of them are servable: get_kv_compressed() (paged_attention_opt.cpp) keys
++    // compression on-or-off from the KEY port alone, the value pool's physical shape assumes an
++    // INT precision on both sides (packed-u4 or plain-int8), and the update kernel writes a
++    // fixed INT stride into whatever pool got allocated - an f16 side paired with any INT side is
++    // a shape mismatch, not a missing optimization, exactly like the 4-bit-vs-not-4-bit case this
++    // guard already refuses. A 4-bit value requires an 8-bit-INT key (the existing check); an f16
++    // side requires f16 on BOTH sides - refuse whenever exactly one side is f16.
++    const auto guard_key_precision = get_kv_cache_precision();
++    const auto guard_value_precision = get_value_cache_precision();
++    const bool guard_key_is_f16 = guard_key_precision == ov::element::f16;
++    const bool guard_value_is_f16 = guard_value_precision == ov::element::f16;
++    OPENVINO_ASSERT(!(ov::element::Type(guard_key_precision).bitwidth() == 4 &&
++                       ov::element::Type(guard_value_precision).bitwidth() != 4) &&
++                     !(guard_key_is_f16 != guard_value_is_f16),
+                     "[GPU] KV_CACHE_PRECISION/VALUE_CACHE_PRECISION mismatch: key resolves to ",
+-                    get_kv_cache_precision(), ", value resolves to ", get_value_cache_precision(),
+-                    " - the paged-attention kernels on this generation derive both operands' packing "
+-                    "from one config value and cannot yet serve a request where only one side is "
+-                    "sub-8-bit (docs/design-m8-asymmetric-kv.md, patches/0009). Pairings where both "
+-                    "sides are >=8-bit (e.g. u8 key / i8 value) are fine; a mix of a sub-8-bit and a "
+-                    ">=8-bit side is not.");
++                    guard_key_precision, ", value resolves to ", guard_value_precision,
++                    " - the paged-attention kernels on this generation cannot serve a 4-bit key "
++                    "with a non-4-bit value, or an f16 side paired with a non-f16 side "
++                    "(docs/design-m8-asymmetric-kv.md, patches/0009/0010). A non-4-bit INT key "
++                    "with a 4-bit value (e.g. u8 key / i4 value) is served by the decode opt "
++                    "kernel (patches/0010); pairings where both sides are >=8-bit INT, both are "
++                    "4-bit, or both are f16, remain fine as before.");
+ 
+ #ifdef ENABLE_DEBUG_CAPS
+     // For now we apply config file only for build with debug caps, but it can be updated in the future to allow
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/pa_kv_reorder.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/pa_kv_reorder.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/pa_kv_reorder.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/pa_kv_reorder.cpp
+@@ -59,6 +59,29 @@ protected:
+         const auto key_cache_dt = desc->cache_dt;
+         const bool is_kv_compressed = desc->is_kv_compressed;
+         const bool is_int4_compressed = data_type_traits::is_i4_u4(key_cache_dt);
++        // docs/design-m8-asymmetric-kv.md, fable-review follow-up (F3): this generator packs
++        // the VALUE-cache row move at the same IS_INT4_COMPRESSED gate as the key, derived from
++        // desc->cache_dt (the KEY side) alone - the identical single-precision-gates-both-
++        // operands mechanism that paged_attention_opt.cpp's read AND write kernels both had to
++        // be split to fix for asymmetric key/value precision. UNREACHABLE in arcint today: no
++        // PaKVReorder nodes are ever constructed in the pipeline arcint runs (block rotation /
++        // fusion is not part of that pipeline) - this is not a live serving bug. Left un-split
++        // deliberately, matching the design's own scope bound - a full IS_INT4_K/IS_INT4_V
++        // divergence here (mirroring the ~130-line pa_kv_cache_update_ref.cl rewrite) is not
++        // proportionate to a code path nothing reaches. Guarded instead: refuse loud if a
++        // packing-class mismatch ever DOES reach this generator, rather than silently moving
++        // VALUE rows at the wrong (key-shaped) stride the way the pre-split write kernel did.
++        if (is_kv_compressed) {
++            const auto value_cache_dt = params.get_program().get_config().get_value_cache_precision();
++            OPENVINO_ASSERT(is_int4_compressed == data_type_traits::is_i4_u4(value_cache_dt),
++                            "[GPU] pa_kv_reorder: key/value packing-class mismatch (key cache_dt=",
++                            key_cache_dt,
++                            ", VALUE_CACHE_PRECISION=",
++                            value_cache_dt,
++                            ") - this generator derives both operands' row-move layout from the "
++                            "key side alone and cannot express an asymmetric packing class; refusing "
++                            "rather than moving value rows at the wrong stride.");
++        }
+         jit.make("IS_KV_COMPRESSED", is_kv_compressed ? 1 : 0);
+         jit.make("IS_INT4_COMPRESSED", is_int4_compressed ? 1 : 0);
+         jit.make("U4_ELEMS_PER_BYTE", u4_elems_per_byte);
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.h b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.h
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.h
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.h
+@@ -90,6 +90,12 @@ struct PagedAttentionManager {
+     bool kv_cache_compression;
+     ov::internal::CacheQuantMode key_cache_quant_mode;
+     ov::element::Type kv_cache_precision = ov::element::dynamic;
++    // docs/design-m8-asymmetric-kv.md item 4 (patches/0010): independent value-side precision,
++    // mirroring the plugin's own VALUE_CACHE_PRECISION config knob (patches/0008). Dynamic
++    // (default) means "same as kv_cache_precision" - matching ExecutionConfig::finalize_impl's
++    // own dynamic-mirrors-key convention - so every pre-existing call site that only ever set
++    // kv_cache_precision keeps building a symmetric cache exactly as before.
++    ov::element::Type value_cache_precision = ov::element::dynamic;
+     bool has_score_aggregation;
+     CacheRotationDescriptor rotation_config;
+     std::vector<SubsequenceDescriptor> subsequence_descs;
+@@ -152,7 +158,8 @@ struct PagedAttentionManager {
+                           bool has_score_aggregation,
+                           bool has_xattention,
+                           CacheRotationDescriptor rotation_config,
+-                          ov::element::Type kv_cache_precision = ov::element::dynamic)
++                          ov::element::Type kv_cache_precision = ov::element::dynamic,
++                          ov::element::Type value_cache_precision = ov::element::dynamic)
+         : num_heads(num_heads),
+           num_kv_heads(num_kv_heads),
+           k_head_size(k_head_size),
+@@ -162,6 +169,10 @@ struct PagedAttentionManager {
+           kv_cache_compression(kv_cache_compression),
+           key_cache_quant_mode(key_cache_quant_mode),
+           kv_cache_precision(kv_cache_precision),
++          // dynamic mirrors kv_cache_precision, same convention as ExecutionConfig::finalize_impl
++          // (patches/0008) - existing callers that never mention value_cache_precision keep
++          // building a symmetric cache exactly as they did before this field existed.
++          value_cache_precision(value_cache_precision == ov::element::dynamic ? kv_cache_precision : value_cache_precision),
+           has_score_aggregation(has_score_aggregation),
+           rotation_config(rotation_config),
+           subsequence_descs(subsequence_descs),
+@@ -368,6 +379,16 @@ struct PagedAttentionManager {
+         return kv_cache_precision == ov::element::u4 || kv_cache_precision == ov::element::i4;
+     }
+ 
++    // docs/design-m8-asymmetric-kv.md item 4 (patches/0010): value's OWN packing decision,
++    // independent of is_int4_kv_cache() (which is key-side only, per its name). Before this
++    // patch get_value_cache_memory() packed/unpacked value data by reading is_int4_kv_cache()
++    // (the key precision) - harmless while the two were always mirrored, wrong once they can
++    // differ (u8-K/i4-V would have built an UNPACKED value cache, silently exercising nothing
++    // asymmetric at all).
++    bool is_int4_value_cache() const {
++        return value_cache_precision == ov::element::u4 || value_cache_precision == ov::element::i4;
++    }
++
+     cldnn::memory::ptr get_key_cache_memory() {
+         auto key_cache_dt = cldnn::data_types::f16;
+         auto adjusted_head_size = k_head_size;
+@@ -584,13 +605,16 @@ struct PagedAttentionManager {
+         const int head_size = v_head_size;
+         int scale_zp_bytes = 0;
+         if (kv_cache_compression) {
+-            value_cache_dt = is_int4_kv_cache() ? cldnn::data_types::u8 : cldnn::data_types::i8;
++            // docs/design-m8-asymmetric-kv.md item 4 (patches/0010): this cache's own layout
++            // depends on VALUE's precision, not key's - is_int4_value_cache() in place of
++            // is_int4_kv_cache() (was silently correct only while the two were always mirrored).
++            value_cache_dt = is_int4_value_cache() ? cldnn::data_types::u8 : cldnn::data_types::i8;
+             scale_zp_bytes = 4;  // 2 fp16 values (scale + zp) = 4 bytes
+         }
+ 
+         // For u4 (INT4), values are packed 2 per byte; the physical head size is halved.
+         // PACKED_ADJUSTED_V_HEAD_SIZE = v_head_size/2 + scales_zp_size = 32 + 4 = 36.
+-        const int adjusted_head_size = is_int4_kv_cache() ? (head_size / 2 + scale_zp_bytes) : (head_size + scale_zp_bytes);
++        const int adjusted_head_size = is_int4_value_cache() ? (head_size / 2 + scale_zp_bytes) : (head_size + scale_zp_bytes);
+ 
+         const auto num_blocks = block_indices.back() + 1;
+         auto value_cache_shape = ov::PartialShape{static_cast<int64_t>(num_blocks),
+@@ -624,7 +648,7 @@ struct PagedAttentionManager {
+                                                 (static_cast<size_t>(head_idx) * static_cast<size_t>(block_size) * static_cast<size_t>(head_size));
+                             const size_t off = base + static_cast<size_t>(token_idx) * static_cast<size_t>(head_size);
+                             set_values(test_stream, memory, src_ptr, head_size, off);
+-                        } else if (is_int4_kv_cache()) {
++                        } else if (is_int4_value_cache()) {
+                             // INT4 (u4) BY_TOKEN value cache: inline per-token comp layout.
+                             // [num_blocks, kv_heads, block_size, PACKED_ADJUSTED_V_HEAD_SIZE] u8
+                             // PACKED_ADJUSTED_V_HEAD_SIZE = v_head_size/2 + 4 = 36 (for v_head_size=64).
+@@ -1800,7 +1824,8 @@ public:
+                     p.scores_mode == ScoresMode::SNAPKV,
+                     p.has_xattention,
+                     p.rotation_config,
+-                    p.kv_cache_precision);
++                    p.kv_cache_precision,
++                    p.value_cache_precision);
+ 
+         if (p.zero_key_data) {
+             for (auto& sequence_key_data : pam->key_data) {
+@@ -1871,6 +1896,9 @@ public:
+         gpu_outputs result;
+ 
+         ov::element::Type kv_cache_precision = p.kv_cache_precision;
++        // docs/design-m8-asymmetric-kv.md item 4 (patches/0010): value's own resolved precision,
++        // for the tolerance/config-property decisions below that must not assume it mirrors key.
++        ov::element::Type value_cache_precision = p.value_cache_precision;
+ 
+         if (p.has_xattention) {
+             pam.xattention_block_size.clear();
+@@ -1926,8 +1954,14 @@ public:
+         }
+ 
+         if (p.kv_cache_compression) {
+-            // INT4 quantization has larger error than INT8 (~17x larger step size)
+-            tolerance = (kv_cache_precision == ov::element::u4 || kv_cache_precision == ov::element::i4) ? 75e-3 : 25e-3;
++            // INT4 quantization has larger error than INT8 (~17x larger step size). Widen for
++            // EITHER side being 4-bit (docs/design-m8-asymmetric-kv.md item 4, patches/0010):
++            // output error is dominated by whichever operand quantizes coarsest, so u8-K/i4-V
++            // needs the same 75e-3 band as i4:i4, not the tighter 25e-3 an u8-only check would
++            // wrongly pick.
++            const bool key_is_int4 = kv_cache_precision == ov::element::u4 || kv_cache_precision == ov::element::i4;
++            const bool value_is_int4 = value_cache_precision == ov::element::u4 || value_cache_precision == ov::element::i4;
++            tolerance = (key_is_int4 || value_is_int4) ? 75e-3 : 25e-3;
+         }
+ 
+         auto query_mem = pam.get_query_memory();
+@@ -2177,6 +2211,14 @@ public:
+         if (kv_cache_precision != ov::element::dynamic) {
+             config.set_property(ov::hint::kv_cache_precision(kv_cache_precision));
+         }
++        // docs/design-m8-asymmetric-kv.md item 4 (patches/0010): the independent VALUE_CACHE_
++        // PRECISION property patches/0008 plumbed but this harness never set. Same dynamic-means-
++        // "don't override" convention as the key-side property above; ExecutionConfig::
++        // finalize_impl's own dynamic-mirrors-key default (patches/0008) still applies for every
++        // existing call site that never sets this.
++        if (value_cache_precision != ov::element::dynamic) {
++            config.set_property(ov::value_cache_precision(value_cache_precision));
++        }
+         cldnn::network::ptr network = tests::get_network(tests::get_test_engine(), topology, config, tests::get_test_stream_ptr(), false);
+         network->set_input_data("query", query_mem);
+         network->set_input_data("key", key_mem);
+@@ -2998,6 +3040,14 @@ struct paged_attention_test_params {
+ 
+     // Replaces generated Key inputs with zeros and validates BY_CHANNEL cache scales.
+     bool zero_key_data = false;
++
++    // docs/design-m8-asymmetric-kv.md item 4 (patches/0010): independent value-side cache
++    // precision. dynamic (default) mirrors kv_cache_precision - see PagedAttentionManager's own
++    // constructor - so this field is opt-in and every existing positional-init test case above
++    // (none of which mentions it) keeps building the symmetric cache it always did. Set it
++    // explicitly (e.g. kv_cache_precision=u8, value_cache_precision=u4) to exercise the
++    // asymmetric decode path patches/0010 adds.
++    ov::element::Type value_cache_precision = ov::element::dynamic;
+ };
+ 
+ const auto ENABLE_CACHE_COMPRESSION = true;
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
+@@ -102,6 +102,165 @@ INSTANTIATE_TEST_SUITE_P(
+     paged_attention_u4_swa_tail_test,
+     ::testing::Values(paged_attention_test_params{{{1, 35}}, 8, 2, 128, 128, 16, 16, ENABLE_CACHE_COMPRESSION, ov::internal::CacheQuantMode::BY_CHANNEL, DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2, false, 0, {}, false, {}, {}, ov::element::u4}));
+ 
++// docs/design-m8-asymmetric-kv.md item 4 (patches/0010): device-free-reference half of the
++// u8-K/i4-V decode kernel test. This exercises the real GPU compile+dispatch (on-card orchestrator
++// half) against PagedAttentionReference::get_reference() (the CPU/device-free oracle - float truth,
++// no quantization simulated in the reference itself; the tolerance band below is what absorbs
++// each side's quantization error, same convention as every other kv_cache_compression case in
++// this file).
++//
++// RED-first, stated precisely (no GPU device was touched by this task; this is the read-and-trace
++// argument the design's §5 asks for, not a measured run): before patches/0010, this exact
++// configuration (KV_CACHE_PRECISION=u8, VALUE_CACHE_PRECISION=u4) is refused outright at
++// ExecutionConfig::finalize() time by patches/0008/0009's guard - `--paged-kv u8:i4` throws
++// OPENVINO_ASSERT before a single kernel compiles. That guard's relaxation IS part of patches/0010
++// (execution_config.cpp), so this test cannot even construct a network on the pre-0010 tree - it
++// fails loud, not silently. Had the guard instead been bypassed against the pre-0010 KERNEL (i.e.
++// only the config-level fix landed, not the JIT/OCL split), the single shared IS_INT4_COMPRESSED
++// boolean would have picked ONE side's packing for both operands: since kv_cache_dt=u8 resolves
++// is_i4_u4()=false, the K-unpack arm would also have been selected for V, reading the (actually
++// i4-packed, per get_value_cache_memory()'s is_int4_value_cache() fix) value cache at the wrong
++// stride (unpacked head_size instead of packed head_size/2) - nibble-granular data reinterpreted
++// as whole bytes, which the tolerance band below (75e-3, already the widest this file uses) is not
++// large enough to absorb. Either failure mode - a thrown OPENVINO_ASSERT or a tolerance failure -
++// is a hard stop, not a quiet pass; a green run only becomes possible once BOTH the config guard
++// (execution_config.cpp) and the per-side kernel split (paged_attention_opt.cpp/.cl) are present.
++class paged_attention_asymmetric_kv_test : public PagedAttentionTest<paged_attention_test_params> {};
++
++TEST_P(paged_attention_asymmetric_kv_test, decode_serves_u8_key_i4_value) {
++    auto p = GetParam();
++    ASSERT_TRUE(this->pam.has_value());
++    auto& pam = *this->pam;
++
++    auto result = run_gpu_inference(pam, p);
++
++    // Confirm this decode step actually compiled and dispatched the per-side-split opt kernel
++    // (paged_attention_opt.cpp's PagedAttentionGeneratorSingleToken, entry point
++    // "paged_attention_opt" + "_" + "_single_token" + "_<hash>") rather than silently falling
++    // back to some other path. Also confirm micro-SDPA (the prefill/multi-token path patches/0009
++    // still correctly declines for a packing-class mismatch, per design §3 "decode serves, prefill
++    // declined") was NOT used - this is a single-token decode step, and if it somehow *did* route
++    // through micro-SDPA that would mean this case stopped exercising the kernel this patch fixes.
++    auto pa_inst = result.network->get_primitive("paged_attention");
++    ASSERT_NE(pa_inst, nullptr);
++    auto* impl = pa_inst->get_impl();
++    ASSERT_NE(impl, nullptr);
++    const auto dump_info = impl->get_kernels_dump_info(*pa_inst->get_impl_params());
++    ASSERT_NE(dump_info.get_entries().find("paged_attention_opt__single_token"), std::string::npos)
++        << "Expected the decode opt kernel (paged_attention_opt, single-token stage) to run: "
++        << dump_info.get_entries();
++    ASSERT_EQ(dump_info.get_entries().find("sdpa_micro"), std::string::npos)
++        << "micro-SDPA should stay declined for a key/value packing-class mismatch (patches/0009): "
++        << dump_info.get_entries();
++
++    const auto reference = PagedAttentionReference(pam).get_reference(result.key_cache_mem);
++    compare(result.outputs.at("output_data").get_memory(), nullptr, nullptr, reference);
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    regression_paged_attention_asymmetric,
++    paged_attention_asymmetric_kv_test,
++    ::testing::Values(paged_attention_test_params{
++        {{1, 35}},                                    // subsequences: 1 new token, 35 already cached (decode step)
++        8, 2, 128, 128, 16, 0,                         // num_heads, num_kv_heads, k_head_size, v_head_size, block_size, sliding_window
++        ENABLE_CACHE_COMPRESSION,
++        ov::internal::CacheQuantMode::BY_CHANNEL,      // key layout, per design's cited case
++        DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++        false, 0, {},                                  // has_adaptive_rkv, start_size, evictable_sizes
++        false, {}, {},                                  // has_xattention, xattention_threshold, xattention_block_size
++        ov::element::u8,                                // kv_cache_precision (key)
++        false, {}, true,                                // has_qq_bias, qq_bias_config, run_reference
++        std::nullopt, false, std::nullopt, false, false, // token_type_ids, has_sink_input, sink_values, force_flashattn_v2, zero_key_data
++        ov::element::u4                                 // value_cache_precision - the asymmetric half
++    }));
++
++// docs/design-m8-asymmetric-kv.md, Bug A fix: symmetric-u8 numeric case, mirroring
++// decode_serves_u8_key_i4_value above but kv_cache_precision=u8, value_cache_precision=u8 (no
++// asymmetry at all - the plain, default request every other symmetric-u8 caller makes). This is
++// the exact configuration patches/0008's "Round 3" mirror regressed: it made the value cache
++// PORT stay u8-typed for a plain u8 request while the physical value bytes are unconditionally
++// signed i8 (pa_kv_cache_update_ref.cl's quantize_and_save_per_token_v INT8 arm - signed
++// zero-point, convert_char_rte), so an i8 byte like 0xFB (-5) read back as unsigned 251 and
++// dequantized with a signed zero-point - off by ~256*scale on every value element, byte-salad
++// decode. RED-first: on the pre-fix tree, get_value_cache_precision() resolves u8 (not i8) for
++// this exact request (see execution_config_test.cpp's kv_cache_u8_value_mirrors_key_precision for
++// the config-layer half of this same check), so the value cache PORT compiles u8-typed over
++// signed-i8 physical bytes - a real, on-card-reachable mismatch this CPU-reference compare is
++// built to catch (the tolerance band is the normal 25e-3 INT8 band, not a widened one - a port-
++// signedness bug is not something a wider tolerance would mask, it's a systematic bias, not
++// noise).
++class paged_attention_symmetric_u8_kv_test : public PagedAttentionTest<paged_attention_test_params> {};
++
++TEST_P(paged_attention_symmetric_u8_kv_test, decode_serves_u8_key_u8_value) {
++    auto p = GetParam();
++    ASSERT_TRUE(this->pam.has_value());
++    auto& pam = *this->pam;
++
++    auto result = run_gpu_inference(pam, p);
++
++    const auto reference = PagedAttentionReference(pam).get_reference(result.key_cache_mem);
++    compare(result.outputs.at("output_data").get_memory(), nullptr, nullptr, reference);
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    regression_paged_attention_symmetric_u8,
++    paged_attention_symmetric_u8_kv_test,
++    ::testing::Values(paged_attention_test_params{
++        {{1, 35}},                                    // subsequences: 1 new token, 35 already cached (decode step)
++        8, 2, 128, 128, 16, 0,                         // num_heads, num_kv_heads, k_head_size, v_head_size, block_size, sliding_window
++        ENABLE_CACHE_COMPRESSION,
++        ov::internal::CacheQuantMode::BY_CHANNEL,      // key layout, same as the asymmetric case above
++        DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++        false, 0, {},                                  // has_adaptive_rkv, start_size, evictable_sizes
++        false, {}, {},                                  // has_xattention, xattention_threshold, xattention_block_size
++        ov::element::u8,                                // kv_cache_precision (key)
++        false, {}, true,                                // has_qq_bias, qq_bias_config, run_reference
++        std::nullopt, false, std::nullopt, false, false, // token_type_ids, has_sink_input, sink_values, force_flashattn_v2, zero_key_data
++        ov::element::u8                                 // value_cache_precision - explicitly symmetric, the regressed case
++    }));
++
++// docs/design-m8-asymmetric-kv.md, fable-review follow-up (F7): u4:u4-symmetric numeric case,
++// mirroring paged_attention_symmetric_u8_kv_test.decode_serves_u8_key_u8_value above but
++// kv_cache_precision=u4, value_cache_precision=u4. Bug B's write-kernel split
++// (pa_kv_cache_update_ref.cl's quantize_and_save_per_token_k/_v, gated IS_INT4_K/IS_INT4_V
++// independently) was argued correct for the both-4-bit path by construction - both operands take
++// the SAME arm they always took pre-split, since IS_INT4_K and IS_INT4_V now resolve identically
++// (both true) whenever the request is symmetric - but that argument was never closed with a
++// measurement of the split write kernel actually exercising this path. This does that: a decode
++// step with both sides packed nibble-u4, key layout BY_CHANNEL (same layout the existing
++// paged_attention_u4_swa_tail_test already exercises for u4 symmetric, so this is a decode-shape
++// companion to that prefill/tail case, not new territory for u4 itself - only new for the split
++// write kernel specifically).
++class paged_attention_symmetric_u4_kv_test : public PagedAttentionTest<paged_attention_test_params> {};
++
++TEST_P(paged_attention_symmetric_u4_kv_test, decode_serves_u4_key_u4_value) {
++    auto p = GetParam();
++    ASSERT_TRUE(this->pam.has_value());
++    auto& pam = *this->pam;
++
++    auto result = run_gpu_inference(pam, p);
++
++    const auto reference = PagedAttentionReference(pam).get_reference(result.key_cache_mem);
++    compare(result.outputs.at("output_data").get_memory(), nullptr, nullptr, reference);
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    regression_paged_attention_symmetric_u4,
++    paged_attention_symmetric_u4_kv_test,
++    ::testing::Values(paged_attention_test_params{
++        {{1, 35}},                                    // subsequences: 1 new token, 35 already cached (decode step)
++        8, 2, 128, 128, 16, 0,                         // num_heads, num_kv_heads, k_head_size, v_head_size, block_size, sliding_window
++        ENABLE_CACHE_COMPRESSION,
++        ov::internal::CacheQuantMode::BY_CHANNEL,      // key layout, same as the u8 and asymmetric cases above
++        DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++        false, 0, {},                                  // has_adaptive_rkv, start_size, evictable_sizes
++        false, {}, {},                                  // has_xattention, xattention_threshold, xattention_block_size
++        ov::element::u4,                                // kv_cache_precision (key)
++        false, {}, true,                                // has_qq_bias, qq_bias_config, run_reference
++        std::nullopt, false, std::nullopt, false, false, // token_type_ids, has_sink_input, sink_values, force_flashattn_v2, zero_key_data
++        ov::element::u4                                 // value_cache_precision - symmetric both-4-bit
++    }));
++
+ class paged_attention_swa_partition_finalization_test : public PagedAttentionTest<paged_attention_test_params> {};
+ 
+ TEST_P(paged_attention_swa_partition_finalization_test, ignores_inactive_partition) {
+diff --git a/src/plugins/intel_gpu/tests/unit/module_tests/execution_config_test.cpp b/src/plugins/intel_gpu/tests/unit/module_tests/execution_config_test.cpp
+--- a/src/plugins/intel_gpu/tests/unit/module_tests/execution_config_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/module_tests/execution_config_test.cpp
+@@ -233,6 +233,31 @@ TEST(execution_config, kv_cache_u8_normalized_to_i8) {
+     ASSERT_EQ(config.get_kv_cache_precision(), ov::element::i8);
+ }
+ 
++// docs/design-m8-asymmetric-kv.md, Bug A fix A1: a plain u8 request with VALUE_CACHE_PRECISION
++// left unset (dynamic) must mirror the SWAPPED key precision - get_value_cache_precision() ==
++// get_kv_cache_precision(), both i8 - not the pre-swap raw u8 request. RED on the pre-fix tree:
++// patches/0008's "Round 3" mirror captured kv_cache_precision_before_swap and mirrored THAT for
++// the dynamic case, so get_value_cache_precision() stayed u8 while get_kv_cache_precision()
++// resolved i8 - this assertion fails on that tree and passes once the mirror is fixed to read
++// the swapped value. Device-free: this is a config-layer check, no GPU/kernel involved, so it
++// cannot see Bug A's actual on-card symptom (signed-i8 value bytes read through a u8-typed port)
++// - it exists to catch the config-layer root cause directly, as the diagnosis's "minimal fix"
++// names it.
++TEST(execution_config, kv_cache_u8_value_mirrors_key_precision) {
++    auto& engine = get_test_engine();
++    auto ctx = std::make_shared<RemoteContextImpl>("GPU", std::vector<cldnn::device::ptr>{engine.get_device()});
++    auto model = make_pa_matmul_model(ov::element::f32);
++
++    ExecutionConfig config;
++    config.set_user_property(ov::hint::kv_cache_precision(ov::element::u8));
++    // VALUE_CACHE_PRECISION intentionally left unset (dynamic) - the mirrored/default case.
++    config.finalize(ctx.get(), model.get());
++
++    ASSERT_EQ(config.get_kv_cache_precision(), ov::element::i8);
++    ASSERT_EQ(config.get_value_cache_precision(), ov::element::i8);
++    ASSERT_EQ(config.get_value_cache_precision(), config.get_kv_cache_precision());
++}
++
+ TEST(execution_config, kv_cache_4bit_by_token_throws) {
+     auto& engine = get_test_engine();
+     auto ctx = std::make_shared<RemoteContextImpl>("GPU", std::vector<cldnn::device::ptr>{engine.get_device()});

@@ -60,8 +60,8 @@ Greedy-only under our accept-only-if-equal rule, like the MTP head — the
 upstream head also supports lossless *sampled* speculation, but that is an
 acceptance-rule change and explicitly not on the table.
 
-Weights: `dirac:/models/gptq/qwen38-dflash2/` (sha-checked download of the
-HF repo). Probe artifacts: `dirac:/tmp/dflash-{code,prose}.npz`.
+Weights: `the dev host:/models/gptq/qwen38-dflash2/` (sha-checked download of the
+HF repo). Probe artifacts: `the dev host:/tmp/dflash-{code,prose}.npz`.
 
 ## From probe to serving (2026-09-01, same day)
 

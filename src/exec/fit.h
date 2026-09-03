@@ -241,6 +241,72 @@ inline PoolSizing pool_sizing(size_t live_blocks, size_t wanted_spare_blocks,
     return r;
 }
 
+// Round-3 review, defect 1: a driver allocation granule wider than one KV
+// page (measured: coder/16 GiB, --prefix-cache-reserve 25 -- pass 1
+// overshoot 14.86 GiB against a 14.86 GiB ceiling at n_ctx 100224, then
+// 100080/100064/100048 with residency UNCHANGED at 14.86 GiB, exhausted;
+// and the 35B/24 GB card's plain auto-fit cell, same shape at 262,144 ->
+// 260080/260064/260048) means a trim sized only from the measured `over`
+// can come out smaller than what it takes to move the driver's own
+// rounding -- the accepted bytes stay pinned at the same rounded value
+// and the replay loop never converges within its four passes. Both
+// spare-trimming call sites (the explicit retry's `explicit_retry_spare_
+// cap` below and the auto-fit branch's `auto_fit_trim`, further down)
+// need a trim that grows on its own when the analytic figure is not
+// enough -- `pool_pages_to_trim` is that shared floor.
+//
+// `pass` is the index (0-based) of the pass that just failed.
+// `auto_fit_backoff_pages` escalates geometrically, base 4 STARTING AT 4
+// (not 1): pass 0 floors at 4 pages, pass 1 at 16, pass 2 at 64, pass 3
+// at 256.
+//
+// Round-4 review correction: an earlier version of this schedule started
+// at 1 (pass 0 floors at 1, pass 1 at 4, pass 2 at 16, pass 3 at 64) and
+// its own comment claimed convergence "up to 32 pages" -- false. The
+// replay loop (backend_ov.cpp's Phase E, mirrored exactly by
+// converge_passes in test_fit.cpp) checks convergence at the START of
+// each pass, against whatever the PREVIOUS pass's trim already applied;
+// the trim computed on the pass that fails the fourth and final check is
+// never allocated or re-checked, so only the trims from the first THREE
+// failed passes ever land. With the pass-0 schedule that is pass 0 + pass
+// 1 + pass 2's floors -- 1 + 4 + 16 = 21 pages -- not the 64-page pass-3
+// floor the old comment (wrongly) treated as the guarantee. 21 pages
+// cannot guarantee crossing an arbitrary 32-page driver rounding
+// boundary; the round-3 test's own "up to 32" result held only because
+// its particular fixture's boundary happened to sit 16 pages below the
+// starting pool, not because the schedule guaranteed it for any
+// alignment.
+//
+// The corrected schedule floors this same three-trim, pre-last-pass
+// total at 4 + 16 + 64 = 84 pages -- CONVERGES for any driver rounding
+// granule up to and including 84 pool pages, for any alignment, provided the
+// first pass's overshoot is itself below one granule (a pure rounding
+// artifact; an overshoot of a granule plus a page spends pass 0 on the
+// analytic excess and the guarantee drops to 81); a larger
+// granule genuinely cannot be guaranteed within four passes and refuses
+// loudly instead (the pre-existing "replay exhausted" throw, itemized --
+// see the throw's own comment, round-4). A genuine analytic trim larger
+// than the floor (the 129-page f1b case, an actual measured overshoot,
+// not a rounding artifact) is left alone either way: this only RAISES a
+// trim that would otherwise come out smaller than the driver's own
+// granule, it never lowers one that is already big enough -- and the
+// measured zero-spare auto-fit cells (analytic 11- and 12-page trims on
+// pass 0) are untouched too, since 11 and 12 both exceed the new pass-0
+// floor of 4.
+inline size_t auto_fit_backoff_pages(int pass) {
+    size_t trim = 4;
+    for (int i = 0; i < pass && i < 8; ++i) trim *= 4;
+    return trim;
+}
+
+inline size_t pool_pages_to_trim(uint64_t over, uint64_t kv_block_bytes, int pass) {
+    const size_t analytic = kv_block_bytes > 0
+        ? std::max<size_t>(static_cast<size_t>(1),
+                           static_cast<size_t>((over + kv_block_bytes - 1) / kv_block_bytes))
+        : static_cast<size_t>(1);
+    return std::max(analytic, auto_fit_backoff_pages(pass));
+}
+
 // F1 (review finding, HIGH): the explicit-n_ctx retry must shrink the
 // spare pool by at least one KV page every pass, the same guarantee
 // shrink_n_ctx already gives the auto-fit path. Feeding `budget_remaining
@@ -257,12 +323,16 @@ inline PoolSizing pool_sizing(size_t live_blocks, size_t wanted_spare_blocks,
 // explicit-n_ctx retry as the wanted-spare bound for the NEXT pass (capped
 // against whatever the prefix cache already wanted, so a shrinking cache
 // budget is still respected).
+//
+// `pass` (round-3 review, defect 1): the trim now floors at
+// `pool_pages_to_trim`'s geometric backoff, not just the analytic
+// ceil(over/kv_block_bytes) -- the f1b record (129-page trim on pass 0)
+// is unaffected: `auto_fit_backoff_pages(0) == 4`, strictly smaller than
+// 129, so `max(129, 4) == 129` reproduces the same trim exactly (kept
+// test: explicit_retry_spare_cap_reproduces_the_f1b_trim).
 inline size_t explicit_retry_spare_cap(size_t spare_blocks, uint64_t over,
-                                       uint64_t kv_block_bytes) {
-    const size_t trim = kv_block_bytes > 0
-        ? std::max<size_t>(static_cast<size_t>(1),
-                           static_cast<size_t>((over + kv_block_bytes - 1) / kv_block_bytes))
-        : static_cast<size_t>(1);
+                                       uint64_t kv_block_bytes, int pass) {
+    const size_t trim = pool_pages_to_trim(over, kv_block_bytes, pass);
     return spare_blocks > trim ? spare_blocks - trim : 0;
 }
 
@@ -381,10 +451,262 @@ inline ExplicitRetryDecision explicit_retry_decision(bool measured_overshoot, ui
         d.next_spare_cap = 0;  // finding 3: force the LAST pass live-only
     } else {
         d.next_spare_cap = measured_overshoot
-            ? explicit_retry_spare_cap(spare_blocks, over, kv_block_bytes)
+            ? explicit_retry_spare_cap(spare_blocks, over, kv_block_bytes, pass)
             : synthesize_spare_retreat(spare_blocks);
     }
     return d;
+}
+
+// Round-3 review, defect 1: the auto-fit branch's own per-pass retry
+// decision, mirroring explicit_retry_decision's role for the explicit
+// branch. THE DEFECT, pinned: the pre-fix auto-fit correction shrank
+// ONLY `paged_n_ctx_` (via shrink_n_ctx) and never capped `wanted_spare`
+// -- so whenever spare_blocks > 0, pool_sizing's own spare_room
+// (`affordable - live_blocks`, pool_sizing above) grew by exactly what
+// live_blocks just lost, `blocks` (live + spare, the number that
+// actually governs what the driver allocates) reassembled to the SAME
+// total every pass, and a sub-page overshoot (a driver allocation
+// granule wider than one KV page) never converged -- measured on both
+// the reserve case (coder/16 GiB, --prefix-cache-reserve 25) and the
+// no-reserve case (35B/24 GB card, plain auto-fit, spare from the train
+// maximum capping live below what the budget affords). Fixed the same
+// way the explicit branch already fixes it for spare alone: the CALLER
+// (backend_ov.cpp) carries a persistent spare cap across passes and
+// applies it to `wanted_spare` before every `pool_sizing` call --
+// `next_spare_cap` here is that cap, pinned at (or below) the pool's
+// OWN currently realized spare_blocks every pass, which by construction
+// stops pool_sizing's room-growth from ever re-inflating it even when
+// this pass's cut went entirely to `next_n_ctx` instead.
+//
+// The live/spare split: `protect_spare` is `reserve_applied` at the call
+// site -- true only when an explicit --prefix-cache-reserve was
+// honoured for this load. When true, LIVE is cut first (via
+// `next_n_ctx`) and the spare cap is left exactly where it was (pinned,
+// not reduced) for as long as live has room to give -- the operator
+// explicitly asked to keep that headroom. Spare only gives once live has
+// nothing left before the floor (`live_room < this pass's trim budget`);
+// the shortfall that leaves, if any, is what the existing post-hoc
+// `prefix_cache_reserve_shortfall` warning reports, not this function.
+// When false (no explicit reserve -- either no --prefix-cache-reserve at
+// all, or spare arose only because the train maximum capped live below
+// what the budget affords), SPARE is cut first instead: nobody asked to
+// keep it, cutting it is invisible to the operator, and cutting live
+// changes the served context length, so it is the last resort.
+//
+// `n_ctx_floor`, `kv_block_tokens` and `lanes` mirror shrink_n_ctx's own
+// parameters; `spare_blocks` is a POOL-WIDE page count (pool_sizing's own
+// units, i.e. summed over lanes). Live's own room to give is derived from
+// `n_ctx` and `n_ctx_floor` alone (see `live_room` below) rather than
+// taking the caller's `live_blocks` as a separate parameter -- the two
+// are equivalent to first order (live_blocks is itself a function of
+// n_ctx via the caller's per_lane_blocks formula, and the fixed per-lane
+// guard overhead that formula adds cancels out of a DIFFERENCE between
+// the current and floor page counts), and deriving it here means this
+// function does not need to know that formula's shape at all. A
+// pool-wide page cut is translated back to a PER-LANE token reduction
+// for `next_n_ctx` (rounding the per-lane share of the cut UP, so the
+// per-lane page count strictly decreases even when the cut does not
+// divide `lanes` evenly, the same guarantee shrink_n_ctx gives).
+struct AutoFitTrim {
+    bool      refuse         = false;  // floor reached with nothing left to cut
+    long long next_n_ctx     = 0;      // n_ctx (tokens, per lane) for the next pass
+    size_t    next_spare_cap = 0;      // spare_blocks cap (pool-wide pages) for the next pass
+};
+
+inline AutoFitTrim auto_fit_trim(long long n_ctx, size_t spare_blocks, uint64_t over,
+                                 uint64_t kv_block_bytes, int lanes, int kv_block_tokens,
+                                 int n_ctx_floor, int pass,
+                                 bool protect_spare) {
+    AutoFitTrim d;
+    const int  lanes_c = std::max(1, lanes);
+    const int  block    = std::max(1, kv_block_tokens);
+    const long long floor_ll = static_cast<long long>(n_ctx_floor);
+
+    const size_t budget = pool_pages_to_trim(over, kv_block_bytes, pass);
+
+    // How many pool-wide pages n_ctx could still give up before the
+    // floor -- a lower-bound estimate (integer division, ignoring the
+    // caller's own per-lane guard overhead, which is a fixed additive
+    // term on both the current and floor page counts and cancels out of
+    // a difference like this to first order); conservative in the safe
+    // direction, since it can only make this function ask for LESS room
+    // than technically exists, never more.
+    const long long room_tokens = n_ctx > floor_ll ? n_ctx - floor_ll : 0;
+    const size_t    live_room =
+        (static_cast<size_t>(room_tokens) / static_cast<size_t>(block)) *
+        static_cast<size_t>(lanes_c);
+
+    size_t live_cut = 0, spare_cut = 0;
+    if (protect_spare) {
+        live_cut  = std::min(budget, live_room);
+        spare_cut = std::min(budget - live_cut, spare_blocks);
+    } else {
+        spare_cut = std::min(budget, spare_blocks);
+        live_cut  = std::min(budget - spare_cut, live_room);
+    }
+
+    if (live_cut == 0 && spare_cut == 0) {
+        d.refuse = true;
+        return d;
+    }
+
+    long long next_n_ctx = n_ctx;
+    if (live_cut > 0) {
+        // live_cut is pool-wide (summed over lanes); the per-lane share
+        // rounds UP so per_lane_blocks strictly decreases even when
+        // live_cut does not divide lanes_c evenly.
+        const size_t per_lane_cut =
+            (live_cut + static_cast<size_t>(lanes_c) - 1) / static_cast<size_t>(lanes_c);
+        const long long tokens_cut =
+            static_cast<long long>(per_lane_cut) * static_cast<long long>(block);
+        next_n_ctx = n_ctx - tokens_cut;
+        next_n_ctx = (next_n_ctx / block) * block;              // floor to a page multiple
+        if (next_n_ctx >= n_ctx) next_n_ctx = n_ctx - block;     // guarantee a strict decrease
+        if (next_n_ctx < floor_ll) next_n_ctx = floor_ll;        // never below the floor
+    }
+    d.next_n_ctx     = next_n_ctx;
+    d.next_spare_cap = spare_blocks > spare_cut ? spare_blocks - spare_cut : 0;
+    return d;
+}
+
+// --prefix-cache-reserve PCT (M9): an option under auto-fit that holds back
+// PCT percent of the pool's own budget-affordable pages as spare for cached
+// prefixes, instead of auto-fit adopting the whole budget as live pages
+// (PCT 0, today's behaviour) and leaving the prefix cache zero reserve --
+// the case the "accepted pool has 0 spare pages" warning above exists to
+// name. Verify-only for an explicit --n-ctx: config.cpp refuses that
+// combination outright (an explicit depth already defines the reserve as
+// whatever budget remains), so this function is only ever called from the
+// auto-fit path, before the pool is sized.
+//
+// `affordable_pages` is fit_context's own max_ctx, in pages: fit_context
+// already floors max_ctx to a kv_block_tokens multiple, so `max_ctx /
+// kv_block_tokens` is exact, and affordable_pages IS "what the budget
+// affords" -- PCT 0's live_pages == affordable_pages reproduces fit_context's
+// unreserved max_ctx exactly, term for term.
+//
+// live_pages = floor(affordable_pages * (100 - PCT) / 100) -- integer
+// arithmetic, so the result is exact and reproducible pass to pass, which is
+// what the caller's own "the correction passes keep the reserve" depends on.
+//
+// Round-4 correction: this comment used to describe the correction as
+// calling shrink_n_ctx "on the live portion only, never touching
+// spare_blocks or wanted_spare" -- true of the ORIGINAL (defective)
+// implementation, not of auto_fit_trim (fit.h, above), which replaced it
+// in round 3 specifically because that description was the bug: with
+// spare_blocks > 0, a live-only correction left pool_sizing's own
+// spare_room (`affordable - live_blocks`) growing right back to absorb
+// the cut, and the pool total never moved. What actually protects the
+// reserve now: backend_ov.cpp passes `protect_spare = reserve_applied`
+// into auto_fit_trim, which cuts LIVE first (`next_n_ctx`) and pins the
+// spare cap exactly where it was for as long as `live_room >= this
+// pass's trim budget` (`budget = pool_pages_to_trim(...)`, at most
+// max(the analytic trim, 256 pages -- the last pass's backoff floor) --
+// so spare stays untouched while `n_ctx` is more than roughly
+// `budget * kv_block_tokens / lanes` tokens above the floor, and only
+// gives once it is closer than that, or the analytic trim from a
+// genuinely large `over` exceeds live's remaining room outright).
+//
+// One consequence worth stating plainly: because live shrinks pass to
+// pass while a protected spare cap stays FLAT, the REALIZED reserve
+// fraction (spare_blocks / pool total) drifts UP as the correction
+// proceeds -- this function's own PCT is honoured at adoption time, not
+// held constant through every retry; a load that needed several
+// correction passes ends up with a somewhat MORE generous spare share
+// than PCT asked for, never less, until live hits the floor and spare
+// itself has to start giving (reported by the post-hoc
+// `prefix_cache_reserve_shortfall` warning when it does).
+//
+// Flooring live DOWN (rather than rounding) is what guarantees
+// spare_pages = affordable_pages - live_pages is never less than PCT
+// percent of affordable_pages: live_pages <= affordable_pages * (100-PCT) /
+// 100 as a real number, so spare_pages >= affordable_pages * PCT / 100
+// follows directly, for any PCT in (0, 100).
+//
+// `admissible` mirrors FitResult::admissible's own rule (max_ctx > 0 and >=
+// n_ctx_floor) applied to the RESERVED adopted_n_ctx rather than the
+// unreserved one -- DESIGN's "never silently lowered" stance extends here:
+// a PCT that would push the adopted depth below the floor refuses (the
+// caller's admissible check), it does not silently float the reserve back
+// up to fit inside the floor.
+struct PrefixCacheReserve {
+    long long live_pages    = 0;  // affordable_pages * (100-PCT) / 100, floored
+    long long spare_pages   = 0;  // affordable_pages - live_pages (>= PCT% by construction)
+    long long adopted_n_ctx = 0;  // live_pages * kv_block_tokens -- already page-aligned
+    bool      admissible    = false;  // adopted_n_ctx > 0 and >= n_ctx_floor
+};
+
+inline PrefixCacheReserve prefix_cache_reserve(long long affordable_pages, int reserve_pct,
+                                               int kv_block_tokens, int n_ctx_floor) {
+    PrefixCacheReserve r;
+    if (affordable_pages < 0) affordable_pages = 0;
+    const int pct   = std::clamp(reserve_pct, 0, 90);
+    const int block = std::max(1, kv_block_tokens);
+
+    r.live_pages  = affordable_pages * (100 - pct) / 100;
+    r.spare_pages = affordable_pages - r.live_pages;
+    r.adopted_n_ctx = r.live_pages * static_cast<long long>(block);
+    r.admissible    = r.adopted_n_ctx > 0 && r.adopted_n_ctx >= static_cast<long long>(n_ctx_floor);
+    return r;
+}
+
+// Round-3 review, defect 2 (units): `PrefixCacheReserve::spare_pages` is
+// PER-LANE, pure-KV pages -- it comes from fit_context's own max_ctx,
+// which fit_context's comment states is already "per lane". The pool's
+// own `spare_blocks` (pool_sizing, Phase E in backend_ov.cpp) is
+// POOL-WIDE (summed over lanes) and, on the LIVE side, ALSO carries the
+// per-lane guard overhead `per_lane_blocks` bakes in -- 2 lookahead/
+// rollback pages plus ceil(drafts_max/kv_block_tokens) drafter pages,
+// per lane -- overhead the reserve arithmetic never priced in, so it
+// eats into what would otherwise be spare. Comparing `spare_pages`
+// directly against `spare_blocks` (the round-2 H2 fix's own call site)
+// was wrong on both axes: units (per-lane vs pool-wide -- under-detects
+// a real shortfall by a factor of `lanes` on more than one lane) and
+// scale (missing the guard subtraction -- a false alarm even on ONE
+// lane: measured 18,313 asked vs 18,311 accepted with nothing actually
+// short).
+//
+// `reserve_ask_pool_pages` converts `spare_pages` into the SAME units
+// `spare_blocks` is in -- pool-wide pages, net of the per-lane guard
+// overhead the adopted live pages already spend -- so the two are
+// finally comparable. Clamped at 0: the guard overhead can exceed a very
+// small reserve, and a negative ask is not meaningful.
+inline long long reserve_ask_pool_pages(long long reserve_spare_pages, int lanes, int drafts_max,
+                                        int kv_block_tokens) {
+    const long long lanes_c = std::max(1, lanes);
+    const long long block    = std::max(1, kv_block_tokens);
+    const long long drafts   = std::max(0, drafts_max);
+    const long long guard_per_lane = 2 + (drafts + block - 1) / block;
+
+    const long long ask = reserve_spare_pages * lanes_c - guard_per_lane * lanes_c;
+    return ask > 0 ? ask : 0;
+}
+
+// H2 (round-2 release review, HIGH; units corrected round-3, defect 2 --
+// see reserve_ask_pool_pages above) `prefix_cache_reserve`'s own
+// `spare_pages` is provably > 0 for any reserve_pct in [1, 90] with a
+// nonzero affordable_pages (see the comment above -- it is a strict
+// inequality on the BUDGET split, not a promise about what actually got
+// allocated), so a caller that gated a warning on "spare_pages > 0" was
+// gating on something that can never be false whenever the reserve was
+// requested at all -- the warning went silent unconditionally, including
+// the case it exists to catch: the allocation-time replay loop (Phase E in
+// backend_ov.cpp) coming back with LESS spare than the reserve asked for,
+// under real memory pressure or a --kv-pool-pages test cap.
+//
+// The real question is comparative: does the pool actually accepted at
+// allocation time (`accepted_spare_blocks`, POOL-WIDE pages) fall short of
+// what the reserve computed it should hold back (`reserve_spare_pages` --
+// the caller must pass `reserve_ask_pool_pages`'s output here, NOT
+// `PrefixCacheReserve::spare_pages` directly; the two are in different
+// units, see above)? True exactly when there is a shortfall worth naming;
+// false both when nothing was reserved (`reserve_spare_pages <= 0` -- the
+// no-reserve case the caller's own pre-existing zero-spare warning already
+// covers) and when the accepted pool met or exceeded the ask.
+inline bool prefix_cache_reserve_shortfall(size_t accepted_spare_blocks,
+                                           long long reserve_spare_pages) {
+    return reserve_spare_pages > 0 &&
+           static_cast<long long>(accepted_spare_blocks) < reserve_spare_pages;
 }
 
 }  // namespace lgc

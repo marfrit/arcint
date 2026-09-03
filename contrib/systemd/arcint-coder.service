@@ -11,12 +11,21 @@
 #     name is what clients send. The two are different questions.
 #  4. After=default.target: a headless container has no graphical session.
 #
-# On this card --n-ctx 262144 serves 98304 with the prefill chunk clamped to
-# 128: the coder's activations cost 4075 KiB per chunk token here against
-# 1284 on the 24 GB card. A card property, printed at boot, not a setting.
+# On this card the 0.2.13 fit pass adopts 133,456 tokens at u8 with the
+# prefill chunk at 128 (the coder's activations cost more per chunk token
+# here than on the 24 GB card; a card property, printed at boot, not a
+# setting); 131072 below is the multiple of 4096 under that.
 # Memory measured after the first start: 7.80 GiB peak in the unit's cgroup
 # at n_ctx 262144, 51.8 s to load. Card memory is enforced by Conflicts=, not
 # by any host-RAM accounting.
+#
+# --n-ctx (0.2.13, M7 fit pass): coder, u8 KV, this 2048 MiB prefix cache, on
+# this 16 GiB card, no offload -- auto-fit admits 133,456 tokens; shipped as
+# the next multiple of 4096 below that, 131072.
+# --paged-kv u8:i4 (M8, not the default here) auto-fits 171,312 on this same
+# card and configuration -- 167,936 as a multiple of 4096 -- and scored 10/10
+# on the acceptance task. Owed before it becomes the default: the prefill
+# price, and prefix byte-exactness.
 
 [Unit]
 Description=arcint-coder — Qwen3.6-27B-A3B coder on OpenVINO, GPU.1 (Arc A770), :8080
@@ -35,7 +44,7 @@ ExecStart=/usr/bin/arcint \
     --device GPU.1 \
     --host 0.0.0.0 \
     --port 8080 \
-    --n-ctx 98304 \
+    --n-ctx 131072 \
     --prefix-cache-mib 2048 \
     --cache-dir %h/.cache/arcint \
     --queue-timeout 30 \

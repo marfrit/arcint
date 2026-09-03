@@ -1,0 +1,880 @@
+# MoE OTD per-expert routing histogram (M10 Deliverable B(i))
+#
+# Adds a per-expert ROUTING histogram to OffloadExpertWeightProvider: how many
+# times each expert id was routed to try_acquire_simultaneous, counted BEFORE
+# any hit/miss or capacity-dedup logic runs, one increment per (call, expert
+# id occurrence) - a repeat within one `experts` vector counts once per
+# repeat, matching a real decode step routing the same expert to more than
+# one token. Companion to patches/0004's evictions/acquisitions counters and
+# to the M14 cpu_tier_* counters (patches/0011/0012): those all count slot
+# resolutions or capacity outcomes, never plain routing, and the design has a
+# named trap for anyone who tries to reconstruct routing from them after the
+# fact (see below).
+#
+# Where the seam is (all three touched files are existing ones - see
+# 0013.files - no new source file was added, so no CMake GLOB re-registration
+# question arises for either the plugin target or ov_gpu_unit_tests):
+#   - expert_weight_providers.hpp: OffloadExpertWeightProvider grows a
+#     `~OffloadExpertWeightProvider() override` declaration, two public const
+#     accessors (`routing_histogram()`, `layer_seq_id()`), and three private
+#     members (`_routing_hist`, `_routing_hist_enabled`, `_layer_seq_id`).
+#     ResidentExpertWeightProvider is untouched: MOE_OTD_ROUTING_HIST, like
+#     MOE_OTD_PERF_LOG before it, is scoped to the offload (OTD) path, which
+#     is the only one that has a cldnn::MOECompressed::Config (hence a
+#     num_expert) at construction and the only one this milestone's counters
+#     (moe_otd_perf.hpp) ever touch.
+#   - expert_weight_providers.cpp:
+#     - An anonymous namespace holds the process-wide sequence-id counter
+#       (std::atomic<size_t>), the registry (mutex + vector<OffloadExpert-
+#       WeightProvider*>, raw pointers per the task brief - not weak_ptr,
+#       because providers are constructed as plain objects/stack objects in
+#       existing tests and held via shared_ptr in production
+#       (moe_3gemm_swiglu_opt.cpp:1339, one make_shared<...> per impl, shared
+#       across clones at :1692 - never re-wrapped in a second shared_ptr a
+#       weak_ptr could observe), and the dump function.
+#     - OffloadExpertWeightProvider's constructor sizes `_routing_hist` to
+#       `config.num_expert`, reads MOE_OTD_ROUTING_HIST once for this
+#       provider (`_routing_hist_enabled`), takes the next id from the atomic
+#       counter, and unconditionally registers `this` (registration is an id
+#       + a vector push under a mutex - cheap regardless of whether counting
+#       is on, see the "two different once" note below). The destructor
+#       unregisters.
+#     - The counting loop is the first thing try_acquire_simultaneous does,
+#       above the dedup map (`expert_to_slot`) that everything else in that
+#       function is built around.
+#
+# The "before the hit/miss split" argument, anchored in the tree this patch
+# applies to (src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/
+# expert_weight_providers.cpp, OffloadExpertWeightProvider::
+# try_acquire_simultaneous, pre-existing code untouched by this patch except
+# for the new loop above it):
+#   The existing gpu_hits/gpu_misses counters (moe_otd_perf.hpp, wired in
+#   both the pre-M14 and M14 branches of that function) are incremented once
+#   per *slot resolution*: a repeat of the same expert within one call is
+#   short-circuited by the `expert_to_slot.find(expert)` dedup check at the
+#   top of the per-position loop and never reaches either counter a second
+#   time, and an expert that stays resident across many calls is a hit every
+#   time, so the miss counter (and evictions, patches/0004) undercounts it to
+#   at most one compulsory miss no matter how often it is actually routed
+#   afterward. A histogram built by post-processing those counters (or by
+#   counting only inside the `else` "miss" arm, the naive place to add a
+#   counter to this function) would therefore answer "which experts miss the
+#   resident set", not "which experts does the router pick" - and the two
+#   diverge most for exactly the popular experts the pool is big enough to
+#   keep resident, which is the case this instrument exists to make visible.
+#   Counting the raw `experts` vector before any of that logic runs is the
+#   only version immune to it: every position counts exactly once, hit or
+#   miss, resident or not.
+#
+# "Every caller" (decode batched, grouped, prefill) is not three separate
+# counting sites: all three route through the same virtual
+# try_acquire_simultaneous override (moe_3gemm_swiglu_opt.cpp:1046 decode
+# batched with cpu_tier_misses, :1115 grouped, :1199 prefill's raw_topk_ids),
+# so one counting loop at the top of the OffloadExpertWeightProvider override
+# covers all three without touching any call site.
+#
+# Concurrency: plain (non-atomic) uint32_t increments. Anchor: lru_cache.cpp,
+# the comment directly above LRUCache::probe() (arcint M14) - "a provider is
+# driven by exactly one stream ... so there is no concurrent caller to race
+# against" - the same invariant that already lets probe()'s own
+# has_free_slot -> get_lru_item sequence be non-atomic across the two calls.
+# try_acquire_simultaneous's own pre-existing state (the `expert_to_slot`
+# unordered_map, `missed_experts`/`missed_slots` vectors, `_bound`/`_cpu_tier`
+# member reads) already relies on the same single-stream-per-provider
+# invariant without any lock; this patch counts the same way.
+#
+# Layer identity and the registry's two different "once"s (worth stating
+# explicitly since they are easy to conflate): sequence-id assignment and
+# registry registration are unconditional and read nothing from the
+# environment beyond a single getenv() at construction
+# (`_routing_hist_enabled`, decided per-provider, gates only the per-expert
+# counting loop's cost). The *dump* condition (whether MOE_OTD_ROUTING_HIST
+# is set) is instead read fresh, once, at the one point it is ever checked -
+# inside the atexit handler, at real process exit - rather than cached
+# process-wide the way get_perf_counters()'s `static bool enabled`
+# (moe_otd_runtime.cpp) is. This is a deliberate departure from that
+# precedent, not an inconsistency with it: get_perf_counters()'s cache has to
+# be process-wide because its bool gates a counter increment checked on every
+# acquire call across every provider, so caching once per process is the
+# whole point of that cache. The dump condition here is checked exactly once
+# per process (there is only one exit), so there is nothing to cache, and
+# reading fresh means whether a real run's dump fires depends only on the
+# environment at exit - never on which layer happened to be constructed
+# first, or (in a test binary running many independent TEST bodies in one
+# process) on some earlier test's provider having been built before this
+# one's setenv() call. A process-wide cached bool here would have made the
+# red-first unit tests below flaky by construction-order accident; reading
+# fresh does not.
+#
+# Cost: config.num_expert (256 on the served shape) x 4 B = 1 KiB per layer;
+# ~40 layers in a served model => ~40 KiB total. One increment per routed id
+# when enabled; when MOE_OTD_ROUTING_HIST was unset at this provider's
+# construction, try_acquire_simultaneous pays exactly one branch
+# (`if (_routing_hist_enabled)`) per call and the loop body never runs -
+# zero per-expert cost, no allocation on the hot path (the vector is sized
+# once, at construction, from config.num_expert and never reallocated).
+#
+# Dump: opt-in via env MOE_OTD_ROUTING_HIST=<path>, same channel as
+# MOE_OTD_PERF_LOG. At real process exit (atexit, registered once, same
+# pattern as get_perf_counters()) writes a CSV to <path>: header
+# "layer,expert,count", one row per (layer, expert) with a nonzero count, in
+# layer-sequence order (the registry snapshot is sorted by layer_seq_id()
+# before writing, defensively, rather than trusted to already be in that
+# order), then a trailing "# total,<T>" comment line. Also prints
+# "[OTD_PERF] routing_hist: layers=N experts=E total=T path=<path>" to
+# stderr so a window log records that the dump fired (or, if the file could
+# not be opened, a "failed to open <path> for writing" line instead, with no
+# CSV written).
+#
+# Red-first (host-only; run against the built ov_gpu_unit_tests, no GPU
+# engine, no systemd unit touched, no arcint process started):
+#
+#   $ ov_gpu_unit_tests --gtest_filter=\
+#     "moe_expert_weight_provider.offload_routing_histogram_counts_before_hit_miss_split:\
+#      moe_expert_weight_provider.offload_routing_histogram_disabled_by_default:\
+#      moe_expert_weight_provider.offload_layer_seq_id_increments_across_providers"
+#
+#   (before implementation, compiling the three new tests against the
+#   pre-patch header/cpp)
+#
+#   .../moe_offload_weight_provider_test.cpp: In member function 'virtual void
+#   moe_expert_weight_provider_offload_routing_histogram_counts_before_hit_miss_split_Test::TestBody()':
+#   .../moe_offload_weight_provider_test.cpp:171:33: error: 'class
+#   ov::intel_gpu::ocl::moe::OffloadExpertWeightProvider' has no member named
+#   'routing_histogram'
+#     171 |     const auto& hist = provider.routing_histogram();
+#         |                                 ^~~~~~~~~~~~~~~~~
+#   .../moe_offload_weight_provider_test.cpp: In member function 'virtual void
+#   moe_expert_weight_provider_offload_routing_histogram_disabled_by_default_Test::TestBody()':
+#   .../moe_offload_weight_provider_test.cpp:201:33: error: 'class
+#   ov::intel_gpu::ocl::moe::OffloadExpertWeightProvider' has no member named
+#   'routing_histogram'
+#     201 |     const auto& hist = provider.routing_histogram();
+#         |                                 ^~~~~~~~~~~~~~~~~
+#   .../moe_offload_weight_provider_test.cpp: In member function 'virtual void
+#   moe_expert_weight_provider_offload_layer_seq_id_increments_across_providers_Test::TestBody()':
+#   .../moe_offload_weight_provider_test.cpp:214:22: error: 'class
+#   ov::intel_gpu::ocl::moe::OffloadExpertWeightProvider' has no member named
+#   'layer_seq_id'
+#     214 |     ASSERT_EQ(second.layer_seq_id(), first.layer_seq_id() + 1);
+#         |                      ^~~~~~~~~~~~
+#   .../moe_offload_weight_provider_test.cpp:214:44: error: 'class
+#   ov::intel_gpu::ocl::moe::OffloadExpertWeightProvider' has no member named
+#   'layer_seq_id'
+#     214 |     ASSERT_EQ(second.layer_seq_id(), first.layer_seq_id() + 1);
+#         |                                            ^~~~~~~~~~~~
+#   ninja: build stopped: subcommand failed.
+#
+#   Build log (dev-host session record, red build): rc=1, 4 "error:" lines,
+#   all four accounted for above - a compile failure for the right reason,
+#   not a wiring accident: every failing line names the exact accessor this
+#   patch adds.)
+#
+# Green (after implementation):
+#
+#   [ RUN      ] moe_expert_weight_provider.offload_routing_histogram_counts_before_hit_miss_split
+#   [       OK ] moe_expert_weight_provider.offload_routing_histogram_counts_before_hit_miss_split (1 ms)
+#   [ RUN      ] moe_expert_weight_provider.offload_routing_histogram_disabled_by_default
+#   [       OK ] moe_expert_weight_provider.offload_routing_histogram_disabled_by_default (0 ms)
+#   [ RUN      ] moe_expert_weight_provider.offload_layer_seq_id_increments_across_providers
+#   [       OK ] moe_expert_weight_provider.offload_layer_seq_id_increments_across_providers (0 ms)
+#   [==========] 3 tests from 1 test suite ran. (1 ms total)
+#   [  PASSED  ] 3 tests.
+#
+#   Build log (dev-host session record, green build): rc=0, 0 "error:" lines,
+#   0 "warning:" lines).
+#
+# Full requested regression filter, "*moe_cpu_expert*:*OffloadExpertWeight
+# Provider*:*lru*:*Lru*" verbatim: 26 tests, 3 suites (lru_cache x3,
+# moe_cpu_expert x5, moe_lru_cache x18), all green - "*OffloadExpertWeight
+# Provider*" (the C++ class name, capitalised) matches nothing, because the
+# actual gtest suite these tests register under is `moe_expert_weight_
+# provider` (lowercase, the TEST(moe_expert_weight_provider, ...) macro
+# argument in the test file, not the class under test) - stated here rather
+# than silently substituted. Re-run with that suite named explicitly
+# (`moe_expert_weight_provider.*` appended to the same filter) to also cover
+# it: 37 tests, 4 suites, all green - the 8 pre-existing provider tests plus
+# this patch's 3 new ones, comfortably past the 28+ bar the task set.
+#
+# What is NOT covered here, by design (orchestrator's job, not this task's):
+#   - The bpw-map policy: which experts should route where is untouched;
+#     this patch only observes what already routes where it already does.
+#   - The on-card cost probe: this patch was built and unit-tested CPU-only
+#     (ninja + ov_gpu_unit_tests, no GPU engine touched, no systemd unit
+#     stopped or started, no arcint process run), per this task's rules. Per
+#     this repository's measurement discipline (CLAUDE.md), the "any t/s
+#     delta" claim a hot-path branch always owes is NOT discharged here - a
+#     same-seed decode comparison against an unpatched build is the
+#     orchestrator's on-GPU pass to run, not asserted or narrated in this
+#     patch. The change this patch makes to the *disabled* hot path is one
+#     extra `if (_routing_hist_enabled)` branch per try_acquire_simultaneous
+#     call (a per-provider member already resident in cache, read once at
+#     the top of a function that goes on to do far more memory-cache-cold
+#     work below it) - a specific, small, and named claim, not a broad one.
+#
+# Integration notes (orchestrator, after the first on-card run):
+#  - The dump as first written iterated the live registry at atexit, and on
+#    a graceful exit the network is torn down first, so every provider had
+#    already unregistered: the run printed "routing_hist: layers=0
+#    experts=0 total=0" and a header-only CSV against a process that had
+#    routed hundreds of thousands of ids (coder, ratio 20, 8 GiB device
+#    pool, two 64-token probes plus the acceptance prompt). The destructor
+#    now retires a non-empty histogram into a process-wide map keyed by
+#    layer sequence id, and the dump merges live and retired entries under
+#    the registry mutex. The unit tests could not see this: they read the
+#    accessor on a live provider.
+#  - Cost probe on the same cell, env unset vs set: 8.65 / 8.81 t/s
+#    against 8.64 / 8.79 (64 greedy tokens, run 1 / run 2; last-16 9.05 /
+#    9.04 vs 9.05 / 9.01), text byte-identical. Below the probe's
+#    resolution, as the header's cost note predicted.
+#  - Second defect from the same on-card run, after the retired map landed:
+#    the dump reported layers=40 but a total of 21,981,597,412 routings
+#    for a process that saw ~1,800 tokens; layers 0-35 summed to exactly
+#    60,740 each, layers 36-39 carried a few counts near 2^32. Static
+#    destruction runs in reverse construction order interleaved with
+#    atexit handlers, and the retired map's first construction was in a
+#    destructor - after the atexit registration - so it was destroyed
+#    before the dump ran and the dump read reused heap. The registration
+#    lambda now constructs the map, the registry and the mutex before
+#    calling std::atexit. The unit tests cannot see either defect: they
+#    read a live provider's accessor and never reach process exit.
+#  - Review follow-ups (pre-commit adversarial review): (1) the sequence id
+#    is not a layer index - impls are built through the program's task
+#    executor in parallel, so ids are handed out in scheduling order; the
+#    dump now keys and orders rows by the layer's first weight-file offset
+#    (unique per layer, export order) and prints that key as a column, with
+#    `layer` as its rank; two runs of the same artifact and token stream
+#    must therefore produce identical CSVs, which is the check the closing
+#    run makes. (2) The host-side tests gained the two paths the seam has
+#    besides all-hit - capacity overflow (nullopt) and the M14 tier
+#    redirect - and a mutation red: with the counting loop moved into the
+#    miss arm the all-hit test fails on the observed counts, which is the
+#    trap the instrument exists to prevent. (3) The unit tests run on the
+#    test engine's real OpenCL device; "host-only" above means no model,
+#    no unit and no engine process beyond the test binary. (4) A fourth
+#    caller, acquire_one (the per-expert prefill fallback), is reached only
+#    after a counted nullopt under the default grouped-GEMM prefill; with
+#    that option off on a card without the micro GEMM, prefill ids are not
+#    counted - a config dependency of the instrument, stated. (5) The
+#    one-stream-per-provider invariant the plain increments rely on is
+#    enforced by the engine (one stream, lane executions serialised), not
+#    by the plugin; a multi-stream client shares the provider across
+#    clones and breaks the LRU sequencing before a torn counter matters.
+#    (6) A provider owned by a static constructed before the first
+#    provider would outlive the registry; not the engine's case. (7) An
+#    empty MOE_OTD_ROUTING_HIST counts as unset on both sides now. (8) The
+#    served coder has 184 experts per layer, the 35B 256; "256" above is
+#    the 35B shape. (9) Only the offload provider counts, so any routing-
+#    mass measurement must run with an offload ratio above zero even where
+#    production serves without offload; routing does not depend on
+#    residency, so the numbers carry.
+#  - Mutation red, run: with the counting loop moved below the dedup
+#    `continue` (i.e. into the miss arm), three tests fail on observed
+#    counts - the all-hit test (hist[1] expected 2, got 1), the capacity-
+#    overflow test (hist[0] expected 2, got 1) and the tier-redirect test
+#    (hist[2] expected 2, got 1); the provider file was restored byte-for-
+#    byte (md5 checked) and the suite is 15/15, the wider moe/provider/
+#    lru/cpu-tier set 42/42.
+#  - Round-two review follow-ups: the CSV consumer contract is
+#    `layer,weight_offset,expert,count` ordered by weight_offset, `layer`
+#    its 0-based rank, `#` lines to be skipped - any earlier sentence in
+#    this header describing a layer-sequence order or a three-column
+#    schema is superseded. Every provider retires its histogram, all-zero
+#    or not, so a dump of retired providers and a dump of live ones rank
+#    layers identically; two providers with one key (one IR compiled twice
+#    in a process) are summed and reported as key_collisions=N on the
+#    stderr line. The mutation that was run moved the loop below the
+#    dedup `continue` (counts once per distinct id per call), which is the
+#    "expected 2, got 1" pattern reported; the miss-arm mutant named as
+#    the naive trap was not run separately - the same three tests would
+#    fail on it with 0 instead of 1. An empty env value is now covered by
+#    a test. Measured dump after the fixes (coder, 16 GiB card, u8:i4,
+#    ratio 20, 8 GiB device pool, one 64-token probe plus the acceptance
+#    prompt): 40 layers, 7,335 (layer,expert) rows, total 2,429,600 =
+#    40 x 60,740, and 60,740 = 6,074 routed positions x top-k 10; 25 of
+#    7,360 pairs never routed. The cost probe above was on the same cell
+#    (16 GiB card, u8:i4).
+#  - Closing check, run: two processes, same artifact (coder), same cell
+#    (16 GiB card, u8:i4, ratio 20, 8 GiB device pool, n_ctx 65,536) and
+#    the same 64-token greedy probe, produced byte-identical CSVs (40
+#    layers, 7,195 rows, total 2,125,200 = 40 x 53,130 = 5,313 routed
+#    positions x top-k 10, key_collisions=0) and byte-identical text. The
+#    layer keys are deterministic across runs, which the sequence ids
+#    were not guaranteed to be.
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+index 654136e2..e3e0c6ab 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+@@ -4,6 +4,13 @@
+ 
+ #include "expert_weight_providers.hpp"
+ 
++#include <algorithm>
++#include <atomic>
++#include <cstdlib>
++#include <fstream>
++#include <iostream>
++#include <map>
++#include <mutex>
+ #include <unordered_map>
+ #include <utility>
+ 
+@@ -15,6 +22,144 @@
+ 
+ namespace ov::intel_gpu::ocl::moe {
+ 
++namespace {
++
++// arcint M10 (patches/0013). Process-wide sequence-id counter and dump
++// registry for OffloadExpertWeightProvider's routing histograms. Kept local
++// to this translation unit (raw pointers into live providers, never exposed)
++// rather than split into their own header/pair the way OtdPerfCounters was
++// (patches/0004): unlike that split, nothing outside this .cpp needs to touch
++// either the counter or the registry, so a second header would only add a
++// file with no independent reader.
++
++std::atomic<size_t>& otd_layer_seq_counter() {
++    static std::atomic<size_t> counter{0};
++    return counter;
++}
++
++std::mutex& otd_registry_mutex() {
++    static std::mutex m;
++    return m;
++}
++
++std::vector<OffloadExpertWeightProvider*>& otd_registry() {
++    static std::vector<OffloadExpertWeightProvider*> providers;
++    return providers;
++}
++
++void otd_register_provider(OffloadExpertWeightProvider* provider) {
++    std::lock_guard<std::mutex> lock(otd_registry_mutex());
++    otd_registry().push_back(provider);
++}
++
++// Histograms of providers that have already been destroyed, keyed by layer
++// sequence id. Measured need (orchestrator, first on-card run of this patch):
++// a graceful exit tears the network down before atexit runs, so every
++// provider had unregistered and the dump wrote "layers=0 total=0" against
++// a process that had routed hundreds of thousands of expert ids. The
++// destructor now retires its histogram here and the dump merges live and
++// retired entries.
++size_t& otd_key_collisions() {
++    static size_t n = 0;
++    return n;
++}
++
++std::map<size_t, std::vector<uint32_t>>& otd_retired_hists() {
++    static std::map<size_t, std::vector<uint32_t>> retired;
++    return retired;
++}
++
++void otd_unregister_provider(OffloadExpertWeightProvider* provider) {
++    std::lock_guard<std::mutex> lock(otd_registry_mutex());
++    auto& reg = otd_registry();
++    reg.erase(std::remove(reg.begin(), reg.end(), provider), reg.end());
++    // Retire unconditionally (an all-zero layer still takes its rank in the
++    // dump, so a dump of retired providers and a dump of live ones number
++    // layers identically). A key already present means two providers of one
++    // IR in one process; their counts are summed and the dump says so.
++    const auto& hist = provider->routing_histogram();
++    auto& slot = otd_retired_hists()[provider->layer_key()];
++    if (slot.empty()) {
++        slot = hist;
++    } else {
++        otd_key_collisions()++;
++        for (size_t i = 0; i < hist.size() && i < slot.size(); ++i)
++            slot[i] += hist[i];
++    }
++}
++
++// arcint M10 (patches/0013). MOE_OTD_ROUTING_HIST is read here, at real
++// process exit, fresh - never cached - unlike get_perf_counters()'s
++// process-wide-cached `static bool enabled` (moe_otd_runtime.cpp). That is a
++// deliberate difference, not an inconsistency with the "read once" channel
++// convention: get_perf_counters()'s cache has to be process-wide because it
++// gates a hot-path counter increment checked on every call, so caching once
++// per process is the whole point. This dump's condition is checked exactly
++// once - here, at exit - so there is nothing to cache, and reading fresh
++// means whether the dump fires depends only on the environment at exit, never
++// on which provider happened to be constructed first while some earlier
++// test (or, in production, some earlier reconfiguration) had the var unset.
++// Per-provider *counting* is still a one-time, per-provider decision (see
++// OffloadExpertWeightProvider's constructor below) so the hot path still
++// costs only the one cached-bool branch the header promises.
++void otd_dump_routing_hist() {
++    const char* path = std::getenv("MOE_OTD_ROUTING_HIST");
++    if (path == nullptr || path[0] == '\0')
++        return;
++
++    // Merge live providers and retired histograms into one seq-id-ordered map
++    // (a copy, taken under the mutex, so a provider destroyed while the file
++    // is being written cannot pull the vector out from under the loop).
++    std::map<size_t, std::vector<uint32_t>> merged;
++    {
++        std::lock_guard<std::mutex> lock(otd_registry_mutex());
++        merged = otd_retired_hists();
++        for (const auto* provider : otd_registry()) {
++            auto& slot = merged[provider->layer_key()];
++            const auto& hist = provider->routing_histogram();
++            if (slot.empty()) {
++                slot = hist;
++            } else {
++                otd_key_collisions()++;
++                for (size_t i = 0; i < hist.size() && i < slot.size(); ++i)
++                    slot[i] += hist[i];
++            }
++        }
++    }
++
++    std::ofstream out(path, std::ios::out | std::ios::trunc);
++    if (!out.is_open()) {
++        std::cerr << "[OTD_PERF] routing_hist: failed to open " << path << " for writing" << std::endl;
++        return;
++    }
++
++    // `layer` is the rank of the layer's weight-file offset among all layers
++    // seen by this process (0-based, export order); `weight_offset` is the
++    // key itself, so two runs of the same artifact can be joined on it.
++    out << "layer,weight_offset,expert,count\n";
++    uint64_t total = 0;
++    size_t experts_written = 0;
++    size_t layer = 0;
++    for (const auto& [key, hist] : merged) {
++        for (size_t expert = 0; expert < hist.size(); ++expert) {
++            if (hist[expert] == 0)
++                continue;
++            out << layer << "," << key << "," << expert << "," << hist[expert] << "\n";
++            total += hist[expert];
++            ++experts_written;
++        }
++        ++layer;
++    }
++    out << "# total," << total << "\n";
++    out.close();
++
++    std::cerr << "[OTD_PERF] routing_hist: layers=" << merged.size() << " experts=" << experts_written
++               << " key_collisions=" << otd_key_collisions()
++               << " total=" << total << " path=" << path << std::endl;
++}
++
++}  // namespace
++
+ std::optional<ExpertSlotLease> ResidentExpertWeightProvider::try_acquire_simultaneous(const std::vector<uint32_t>& experts,
+                                                                                        cldnn::stream& /*stream*/,
+                                                                                        std::vector<CpuTierMiss>* cpu_tier_misses) {
+@@ -39,7 +184,49 @@ OffloadExpertWeightProvider::OffloadExpertWeightProvider(size_t capacity,
+       _weight_bin_offsets(std::move(weight_bin_offsets)),
+       _weights_path(std::move(weights_path)),
+       _cache(std::make_shared<LRUCache>(capacity)),
+-      _weight_reader(_weights_path) {}
++      _weight_reader(_weights_path),
++      _routing_hist(config.num_expert, 0),
++      // arcint M10 (patches/0013). Read once here, at this provider's (this
++      // MoE layer's) construction, NOT via a process-wide cached function:
++      // each provider gets its own answer from the environment as it stood
++      // when it was built. Production providers are all built during graph
++      // compilation, after the process's env is already fixed for the run,
++      // so every layer agrees in practice; the per-provider read exists so a
++      // unit test can setenv() before constructing the one provider under
++      // test without a previous test's provider (built with the var unset)
++      // poisoning a process-wide cache for the rest of the binary.
++      // An empty value counts as unset, matching the dump's own test.
++      _routing_hist_enabled(std::getenv("MOE_OTD_ROUTING_HIST") != nullptr &&
++                            std::getenv("MOE_OTD_ROUTING_HIST")[0] != '\0'),
++      _layer_seq_id(otd_layer_seq_counter().fetch_add(1, std::memory_order_relaxed)) {
++    // Registration is unconditional and cheap (an id already assigned above,
++    // one vector push under a mutex) regardless of _routing_hist_enabled:
++    // otd_dump_routing_hist() reads MOE_OTD_ROUTING_HIST fresh at exit, so a
++    // provider built with the var unset still needs to be in the registry in
++    // case some other layer - or a later reconfiguration - has it set by the
++    // time the process actually exits.
++    otd_register_provider(this);
++    static bool atexit_registered = [] {
++        // Static destruction runs in reverse construction order, interleaved
++        // with atexit handlers: anything constructed AFTER this registration
++        // is destroyed BEFORE the dump runs. The retired map's first use is
++        // in a destructor, i.e. after this point, so it must be constructed
++        // here first or the dump reads a destroyed map (measured: layers
++        // 36-39 carried counts near 2^32 from reused heap; the rest were
++        // intact). The registry and its mutex are already alive.
++        (void)otd_retired_hists();
++        (void)otd_key_collisions();
++        (void)otd_registry();
++        (void)otd_registry_mutex();
++        std::atexit(&otd_dump_routing_hist);
++        return true;
++    }();
++    (void)atexit_registered;
++}
++
++OffloadExpertWeightProvider::~OffloadExpertWeightProvider() {
++    otd_unregister_provider(this);
++}
+ 
+ void OffloadExpertWeightProvider::bind(cldnn::moe_weights& resident) {
+     _resident = &resident;
+@@ -66,6 +253,33 @@ void OffloadExpertWeightProvider::fill_routed_weight_views(cldnn::moe_weights& /
+ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultaneous(const std::vector<uint32_t>& experts,
+                                                                                       cldnn::stream& stream,
+                                                                                       std::vector<CpuTierMiss>* cpu_tier_misses) {
++    // arcint M10 (patches/0013). Routing histogram: counted here, before any
++    // dedup/hit/miss logic below, and once per (call, expert-id occurrence) -
++    // a repeated id within one `experts` vector is incremented once per
++    // repeat, the same as a real decode step routing the same expert to more
++    // than one token. Counting after the dedup/hit-miss split below (as the
++    // gpu_hits/gpu_misses counters do, by necessity - they count slot
++    // resolutions, not routing) would answer a different question: which
++    // experts miss the resident LRU set, not which experts the router
++    // actually picked. The two agree only for an expert that never becomes
++    // resident; for anything the pool is big enough to hold, the miss-only
++    // count silently drops to (at most) 1 - the compulsory first miss - no
++    // matter how often decode keeps routing to it afterward. That gap is why
++    // this loop is unconditional on hit vs. miss and sits above the dedup map
++    // built just below, not inside either branch of it.
++    //
++    // Non-atomic plain increments: try_acquire_simultaneous is driven by
++    // exactly one stream per provider, the same invariant LRUCache::probe()
++    // already relies on for its own non-atomic-across-calls sequencing (see
++    // the comment on that function, lru_cache.cpp) - a provider has no
++    // concurrent caller to race this loop against.
++    if (_routing_hist_enabled) {
++        for (const uint32_t expert : experts) {
++            if (expert < _routing_hist.size())
++                ++_routing_hist[expert];
++        }
++    }
++
+     // Deduplicate to check capacity
+     std::unordered_map<uint32_t, size_t> expert_to_slot;
+     expert_to_slot.reserve(experts.size());
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+index bfb1e93a..d4b6587d 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+@@ -66,6 +66,12 @@ public:
+                                 const cldnn::MOECompressed::Config& config,
+                                 std::vector<size_t> weight_bin_offsets,
+                                 std::filesystem::path weights_path);
++    // arcint M10 (patches/0013). Unregisters this provider from the
++    // process-wide routing-histogram registry (see the .cpp) so a provider
++    // that does not outlive the process - every unit test provider, and any
++    // production network reconfiguration - cannot leave the registry holding
++    // a dangling pointer for a dump that runs after it.
++    ~OffloadExpertWeightProvider() override;
+ 
+     size_t resident_capacity() const override {
+         return _capacity;
+@@ -113,6 +119,36 @@ public:
+         _cpu_tier = on;
+     }
+ 
++    // arcint M10 (patches/0013). Per-expert routing histogram: one counter per
++    // expert id in [0, config.num_expert), incremented once per (call,
++    // occurrence) in try_acquire_simultaneous BEFORE the hit/miss split (see
++    // the .cpp for why "before" is the only version that measures routing
++    // rather than LRU pool pressure - counting only misses would undercount
++    // exactly the experts the pool is big enough to keep resident, which are
++    // the popular ones). Counting is opt-in per provider, decided once at
++    // construction from MOE_OTD_ROUTING_HIST; when it was unset the vector
++    // stays all-zero at the cost of one branch per try_acquire_simultaneous
++    // call, no per-expert cost at all.
++    const std::vector<uint32_t>& routing_histogram() const {
++        return _routing_hist;
++    }
++
++    // arcint M10 (patches/0013). Process-wide construction-order sequence id:
++    // A process-wide sequence number, kept for traceability only; it is NOT
++    // a layer index (see layer_key() below).
++    // Structural per-layer key for the histogram dump: the layer's first
++    // weight-tensor offset in the OTD weight file, unique per layer and
++    // ordered as the export wrote the layers. The sequence id below is NOT
++    // a layer index - impls are built through the program's task executor
++    // (compile_graph.cpp, run_and_wait), so sequence ids are handed out in
++    // worker-scheduling order, a run-to-run permutation (found in review).
++    size_t layer_key() const {
++        return _weight_bin_offsets.empty() ? 0 : _weight_bin_offsets[0];
++    }
++    size_t layer_seq_id() const {
++        return _layer_seq_id;
++    }
++
+ private:
+     size_t _capacity = 0;
+     cldnn::MOECompressed::Config _config{};
+@@ -129,6 +165,15 @@ private:
+     // the ring's usm_host allocations amortize across infers instead of being
+     // rebuilt per call.
+     moe_otd::StagingRing _staging;
++
++    // arcint M10 (patches/0013). See routing_histogram()/layer_seq_id() above;
++    // populated and registered in the .cpp. Cost: config.num_expert (256 on
++    // the served shape) x 4 B = 1 KiB per layer; ~40 layers in a served model
++    // => ~40 KiB total, one increment per routed id, sized once at
++    // construction (no reallocation on the hot path).
++    std::vector<uint32_t> _routing_hist;
++    bool _routing_hist_enabled = false;
++    size_t _layer_seq_id = 0;
+ };
+ 
+ }  // namespace ov::intel_gpu::ocl::moe
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_offload_weight_provider_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/moe_offload_weight_provider_test.cpp
+index 9765de1b..668859ec 100644
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_offload_weight_provider_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_offload_weight_provider_test.cpp
+@@ -2,6 +2,8 @@
+ // SPDX-License-Identifier: Apache-2.0
+ //
+ 
++#include <cstdlib>
++
+ #include "test_utils/test_utils.h"
+ #include "ocl_v2/moe/expert_weight_providers.hpp"
+ 
+@@ -9,6 +11,8 @@ using namespace cldnn;
+ using namespace tests;
+ using ov::intel_gpu::ocl::moe::OffloadExpertWeightProvider;
+ using ov::intel_gpu::ocl::moe::ResidentExpertWeightProvider;
++using ov::intel_gpu::ocl::moe::CpuTierMiss;
++using ov::intel_gpu::ocl::moe::kCpuTierSentinelSlot;
+ 
+ TEST(moe_expert_weight_provider, resident_is_identity) {
+     ResidentExpertWeightProvider provider;
+@@ -130,3 +134,236 @@ TEST(moe_expert_weight_provider, offload_acquire_one_basic) {
+     auto slot = provider.acquire_one(5, get_test_stream());
+     ASSERT_EQ(slot, slot0);
+ }
++
++// arcint M10 (patches/0013). Routing histogram: try_acquire_simultaneous must
++// count every routed expert id BEFORE the hit/miss split - i.e. hits count
++// exactly like misses, and a repeated id within one call counts once per
++// occurrence, not once per unique id. Counting is opt-in per provider,
++// decided once at construction from MOE_OTD_ROUTING_HIST (see the .cpp);
++// setting/unsetting the env here only has to bracket construction, not the
++// acquire calls, because the provider caches its own decision.
++//
++// Every expert referenced below is pre-filled into the LRU before the acquire
++// calls (the same pattern the capacity/within_capacity tests above use) so
++// this stays host-only: an actual miss would send try_acquire_simultaneous
++// into fill_weights_memory, which opens the (nonexistent) weights file.
++// An empty MOE_OTD_ROUTING_HIST counts as unset on the counting side, matching
++// the dump's own test of the value (review follow-up (7)).
++TEST(moe_expert_weight_provider, offload_routing_histogram_empty_env_counts_nothing) {
++    ::setenv("MOE_OTD_ROUTING_HIST", "", 1);
++    MOECompressed::Config config{};
++    config.num_expert = 4;
++    OffloadExpertWeightProvider provider(/*capacity=*/4, config, {0, 100, 200, 300, 400, 500, 600, 700, 800}, "/nonexistent");
++    ::unsetenv("MOE_OTD_ROUTING_HIST");
++
++    cldnn::moe_weights resident{};
++    provider.bind(resident);
++    auto& cache = provider.cache();
++    for (uint32_t e : {0u, 1u, 2u, 3u}) {
++        cache.get_lru_item(e);
++        cache.set_filled(e);
++    }
++    auto lease = provider.try_acquire_simultaneous({0, 1, 1, 2}, get_test_stream());
++    ASSERT_TRUE(lease.has_value());
++    for (auto c : provider.routing_histogram())
++        ASSERT_EQ(c, 0U);
++}
++
++TEST(moe_expert_weight_provider, offload_routing_histogram_counts_before_hit_miss_split) {
++    ::setenv("MOE_OTD_ROUTING_HIST", "/tmp/arcint-0013-does-not-need-to-exist.csv", 1);
++    MOECompressed::Config config{};
++    config.num_expert = 6;
++    OffloadExpertWeightProvider provider(/*capacity=*/4, config, {0, 100, 200, 300, 400, 500, 600, 700, 800}, "/nonexistent");
++    ::unsetenv("MOE_OTD_ROUTING_HIST");
++
++    cldnn::moe_weights resident{};
++    provider.bind(resident);
++
++    auto& cache = provider.cache();
++    for (uint32_t e : {0u, 1u, 2u, 3u}) {
++        cache.get_lru_item(e);
++        cache.set_filled(e);
++    }
++
++    // Call 1: expert 1 occurs twice in the same call.
++    auto lease1 = provider.try_acquire_simultaneous({0, 1, 1, 2}, get_test_stream());
++    ASSERT_TRUE(lease1.has_value());
++    // Call 2: expert 2 recurs across calls, expert 3 is new.
++    auto lease2 = provider.try_acquire_simultaneous({2, 3}, get_test_stream());
++    ASSERT_TRUE(lease2.has_value());
++
++    const auto& hist = provider.routing_histogram();
++    ASSERT_EQ(hist.size(), 6U);
++    ASSERT_EQ(hist[0], 1U);  // call 1, once
++    ASSERT_EQ(hist[1], 2U);  // call 1, twice in the same call
++    ASSERT_EQ(hist[2], 2U);  // once in call 1, once in call 2
++    ASSERT_EQ(hist[3], 1U);  // call 2, once
++    ASSERT_EQ(hist[4], 0U);  // never routed
++    ASSERT_EQ(hist[5], 0U);  // never routed
++}
++
++// Default (env unset at construction): the histogram stays all-zero even
++// though experts were routed - the branch is taken, the loop body is not.
++TEST(moe_expert_weight_provider, offload_routing_histogram_disabled_by_default) {
++    ::unsetenv("MOE_OTD_ROUTING_HIST");
++    MOECompressed::Config config{};
++    config.num_expert = 4;
++    OffloadExpertWeightProvider provider(/*capacity=*/4, config, {0, 100, 200, 300, 400}, "/nonexistent");
++
++    cldnn::moe_weights resident{};
++    provider.bind(resident);
++
++    auto& cache = provider.cache();
++    for (uint32_t e : {0u, 1u, 2u, 3u}) {
++        cache.get_lru_item(e);
++        cache.set_filled(e);
++    }
++
++    auto lease = provider.try_acquire_simultaneous({0, 1, 2, 3}, get_test_stream());
++    ASSERT_TRUE(lease.has_value());
++
++    const auto& hist = provider.routing_histogram();
++    ASSERT_EQ(hist.size(), 4U);
++    for (auto count : hist)
++        ASSERT_EQ(count, 0U);
++}
++
++// The sequence id is a process-wide counter kept for traceability (it is not
++// a layer index: impls are built in parallel, see layer_key()); the sequence
++// id a routing-histogram dump groups by must reflect that order.
++TEST(moe_expert_weight_provider, offload_layer_seq_id_increments_across_providers) {
++    MOECompressed::Config config{};
++    config.num_expert = 2;
++    OffloadExpertWeightProvider first(/*capacity=*/2, config, {0, 100, 200}, "/nonexistent");
++    OffloadExpertWeightProvider second(/*capacity=*/2, config, {0, 100, 200}, "/nonexistent");
++    ASSERT_EQ(second.layer_seq_id(), first.layer_seq_id() + 1);
++}
++
++// arcint M10 (patches/0013). Capacity overflow (nullopt) must not short the
++// histogram: the counting loop sits above the dedup/capacity logic, so a call
++// that ultimately fails to acquire slots has still recorded every requested
++// occurrence, repeats included. If the count moved below the capacity check
++// (or into the per-expert loop after the early `return std::nullopt`), an
++// overflowing call would silently undercount every expert it touched.
++TEST(moe_expert_weight_provider, offload_routing_histogram_counts_on_capacity_overflow) {
++    ::setenv("MOE_OTD_ROUTING_HIST", "/tmp/arcint-0013-does-not-need-to-exist.csv", 1);
++    MOECompressed::Config config{};
++    config.num_expert = 4;
++    OffloadExpertWeightProvider provider(/*capacity=*/2, config, {0, 100, 200, 300}, "/nonexistent");
++    ::unsetenv("MOE_OTD_ROUTING_HIST");
++
++    cldnn::moe_weights resident{};
++    provider.bind(resident);
++
++    // Pre-populate the LRU cache so experts 0,1 are hits (no disk I/O needed);
++    // expert 2 is a genuine third unique id, which is what forces the overflow.
++    auto& cache = provider.cache();
++    cache.get_lru_item(0);
++    cache.set_filled(0);
++    cache.get_lru_item(1);
++    cache.set_filled(1);
++
++    // 3 unique experts (0, 1, 2) exceeds capacity=2 -> nullopt, with 0 and 1
++    // each repeated once.
++    std::vector<uint32_t> experts = {0, 1, 2, 0, 1};
++    auto lease = provider.try_acquire_simultaneous(experts, get_test_stream());
++    ASSERT_FALSE(lease.has_value());
++
++    const auto& hist = provider.routing_histogram();
++    ASSERT_EQ(hist.size(), 4U);
++    ASSERT_EQ(hist[0], 2U);  // occurs at position 0 and 3
++    ASSERT_EQ(hist[1], 2U);  // occurs at position 1 and 4
++    ASSERT_EQ(hist[2], 1U);  // occurs at position 2 (the expert that overflows capacity)
++    ASSERT_EQ(hist[3], 0U);  // never routed
++}
++
++// arcint M14. With the CPU tier on and the resident pool already full (no
++// free slot), a never-resident expert redirects to the sentinel slot instead
++// of failing the whole batch: try_acquire_simultaneous still returns a lease,
++// cpu_tier_misses names the redirected expert (with every flat position that
++// selected it, dedup repeats included), and the M10 routing histogram - which
++// counts above the hit/miss/tier split - still counts the redirected id for
++// every occurrence, exactly like a GPU hit or miss would be counted.
++TEST(moe_expert_weight_provider, offload_cpu_tier_redirect_lease_succeeds_and_histogram_counts_redirect) {
++    ::setenv("MOE_OTD_ROUTING_HIST", "/tmp/arcint-0013-does-not-need-to-exist.csv", 1);
++    MOECompressed::Config config{};
++    config.num_expert = 4;
++    OffloadExpertWeightProvider provider(/*capacity=*/2, config, {0, 100, 200, 300}, "/nonexistent");
++    ::unsetenv("MOE_OTD_ROUTING_HIST");
++
++    cldnn::moe_weights resident{};
++    provider.bind(resident);
++
++    // Fill the pool to capacity with experts 0 and 1: has_free_slot() is now
++    // false, which is what routes a subsequent miss to the CPU tier instead of
++    // the pre-M14 warm-up upload path.
++    auto& cache = provider.cache();
++    cache.get_lru_item(0);
++    cache.set_filled(0);
++    cache.get_lru_item(1);
++    cache.set_filled(1);
++    ASSERT_FALSE(cache.has_free_slot());
++
++    provider.set_cpu_tier(true);
++
++    // Expert 2 is never resident and the pool is full -> CPU-tier capacity
++    // miss. It recurs at position 3 (after the dedup map already holds it),
++    // so cpu_tier_misses must gain both positions under one entry.
++    std::vector<uint32_t> experts = {0, 2, 1, 2};
++    std::vector<CpuTierMiss> cpu_tier_misses;
++    auto lease = provider.try_acquire_simultaneous(experts, get_test_stream(), &cpu_tier_misses);
++
++    ASSERT_TRUE(lease.has_value());
++    ASSERT_EQ(lease->size(), 4U);
++    ASSERT_EQ((*lease)[1], kCpuTierSentinelSlot);
++    ASSERT_EQ((*lease)[3], kCpuTierSentinelSlot);
++    ASSERT_NE((*lease)[0], kCpuTierSentinelSlot);
++    ASSERT_NE((*lease)[2], kCpuTierSentinelSlot);
++
++    ASSERT_EQ(cpu_tier_misses.size(), 1U);
++    EXPECT_EQ(cpu_tier_misses[0].expert, 2U);
++    ASSERT_EQ(cpu_tier_misses[0].positions, (std::vector<size_t>{1, 3}));
++
++    const auto& hist = provider.routing_histogram();
++    ASSERT_EQ(hist.size(), 4U);
++    ASSERT_EQ(hist[0], 1U);
++    ASSERT_EQ(hist[1], 1U);
++    ASSERT_EQ(hist[2], 2U);  // the redirected id, counted for both occurrences
++    ASSERT_EQ(hist[3], 0U);
++}
++
++// arcint M10 (patches/0013). The sequence-id counter is a process-wide
++// monotonic atomic, never re-derived from the live registry: destroying a
++// provider retires its histogram (otd_unregister_provider) but must not free
++// up its id for reuse. A registry-index-based id would give C == A + 1 here
++// (B's slot back-filled); the atomic counter gives C == A + 2.
++TEST(moe_expert_weight_provider, offload_layer_seq_id_keeps_counting_across_destruction) {
++    MOECompressed::Config config{};
++    config.num_expert = 2;
++
++    OffloadExpertWeightProvider a(/*capacity=*/2, config, {0, 100, 200}, "/nonexistent");
++    const size_t id_a = a.layer_seq_id();
++    {
++        OffloadExpertWeightProvider b(/*capacity=*/2, config, {0, 100, 200}, "/nonexistent");
++        ASSERT_EQ(b.layer_seq_id(), id_a + 1);
++    }  // b destroyed here; otd_unregister_provider retires it.
++    OffloadExpertWeightProvider c(/*capacity=*/2, config, {0, 100, 200}, "/nonexistent");
++    ASSERT_EQ(c.layer_seq_id(), id_a + 2);
++}
++
++// arcint M10 (patches/0013). layer_key() is the structural per-layer key the
++// routing-histogram dump groups and joins runs by: the layer's first
++// weight-file offset, NOT the (run-to-run-permuted) construction-order
++// sequence id. An empty offsets vector - not exercised by any production
++// provider, but reachable by a misconfigured one - reports 0 rather than
++// reading past the end.
++TEST(moe_expert_weight_provider, offload_layer_key_is_first_weight_bin_offset) {
++    MOECompressed::Config config{};
++    std::vector<size_t> offsets = {4096, 8192, 12288};
++    OffloadExpertWeightProvider provider(/*capacity=*/2, config, offsets, "/nonexistent");
++    ASSERT_EQ(provider.layer_key(), 4096U);
++    ASSERT_EQ(provider.weight_bin_offsets()[0], provider.layer_key());
++
++    OffloadExpertWeightProvider empty_provider(/*capacity=*/2, config, {}, "/nonexistent");
++    ASSERT_EQ(empty_provider.layer_key(), 0U);
++}

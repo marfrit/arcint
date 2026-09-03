@@ -1,0 +1,428 @@
+# MoE OTD async batched miss-uploads (staging ring, non-blocking copies)
+#
+# fill_weights_memory (src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp) read
+# each missed expert's tensor from disk into a loop-local std::vector<uint8_t>
+# payload, transposed it in place, and copy_from(..., blocking=true)'d it to
+# the device slot - one blocking GPU copy per (expert, tensor) pair, and
+# OffloadExpertWeightProvider::try_acquire_simultaneous
+# (expert_weight_providers.cpp) called it once per individual miss inside its
+# loop rather than once for the whole batch. This patch batches the misses of
+# one try_acquire_simultaneous call into one fill_weights_memory call (that
+# function already took experts_list/lru_experts as vectors; the batching is
+# in the caller, not a new code path), and inside it replaces the per-tensor
+# blocking copy with a non-blocking one out of a provider-owned usm_host
+# staging ring, waiting on the whole batch's events once. Applied against the
+# pinned runtime, build 2026.4.0-22849-71640275d29, on top of patches/0003-
+# 0005; rebased onto 0003 rather than reintroducing the per-infer expert-mask
+# subbuffer churn that patch removed (moe_3gemm_swiglu_opt.cpp's scratch_
+# buffers / on_before_batched_gemv / on_before_prefill region, which 0003 and
+# this patch both touch, do not conflict: 0003 caches expert-mask subbuffers,
+# this patch only changes what happens to a *miss* inside try_acquire_
+# simultaneous).
+#
+# Payload lifetime, not the blocking flag, is what a naive change here would
+# get wrong: payload is freed at the end of each loop iteration, and a non-
+# blocking enqueue_memcpy started from it could still be reading when the
+# caller returns - use-after-free. StagingRing (moe_otd_runtime.hpp/.cpp) is
+# the fix: a small ring of usm_host buffers, provider-owned (one per
+# OffloadExpertWeightProvider, so MoE layers do not contend on one ring and
+# usm_host allocations amortize across infers rather than being rebuilt per
+# call). StagingRing takes no lock: it is single-stream-only by assumption
+# (see the comment at the class), true today because it is one-per-provider
+# and each provider is only ever driven from its own network's exec stream.
+# acquire() waits on a slot's previous copy before handing it back for
+# reuse (the only wait cost this patch can impose independent of the queue-
+# type gate below); maybe_transpose_scale_zp still writes into the existing
+# loop-local payload vector (kept as-is, not touched, to keep this diff to
+# the upload path) and a plain host-to-host memcpy stages it into the ring
+# slot, which is what the non-blocking device copy then reads from.
+#
+# Where the wait happens: a single wait over the whole batch's collected
+# events, inside fill_weights_memory, right before it returns - which is
+# also right before try_acquire_simultaneous's caller (on_before_batched_gemv
+# / on_before_prefill / exec_prefill_grouped_gemm,
+# moe_3gemm_swiglu_opt.cpp:727-800/840-914) calls set_otd_weight_pointers,
+# the last point before the impl enqueues the GEMMs (docs/design-m9-offload-
+# v2.md §1, P2's wait-placement bullet). Gated on
+# stream.get_queue_type() == QueueTypes::in_order (execution_config.cpp:344
+# forces in_order whenever use_onednn is set, true for both cards this ran
+# on); on an out_of_order queue fill_weights_memory falls back to the
+# pre-patch synchronous per-tensor path unchanged, rather than trying to
+# prove out-of-order correctness here. On the in_order queue this wait is not
+# what makes the GEMM kernels read correct data - program order already does
+# that once the copy is enqueued before them - it exists solely to make the
+# ring's slots safe to reuse on the next miss batch.
+#
+# StagingRing's slot count (8, a placeholder) is not a correctness parameter;
+# docs/design-m9-offload-v2.md §4 names it [to measure]. New counter
+# (patches/0004): staging_bytes - current ring footprint in bytes, expected
+# to plateau after warm-up per the design's own P2 validation row
+# ("staging_bytes bounded and constant across infers").
+#
+# gpu_copy_ns quietly changes meaning on the async path: it used to be one
+# blocking copy_from's wall time, summed per tensor; now, when async_ok, it
+# is the single batch-end wait's wall time instead (the individual enqueues
+# are not timed - they are non-blocking, so there is nothing to time at the
+# enqueue site), still summed across batches. Same counter name, same units,
+# a different thing being measured; avg_gpu_copy_us derived from it in
+# dump() divides by tensor_load_count as before, which now reads as an
+# average amortized over a whole batch's wait rather than a true per-tensor
+# cost. Left as one counter rather than split in two, since the two
+# situations do not coexist in one build's steady state (a build either
+# takes the async path throughout or does not) and splitting would grow
+# OtdPerfCounters for a distinction the async/sync gate already makes.
+#
+# Measurement discipline: not run on a GPU (this task's rules); the byte-
+# exact-vs-P1-only-build and stage-acc-median checks the design requires of
+# this patch (docs/design-m9-offload-v2.md §4's P2 row) are owed to the
+# orchestrator's on-GPU pass, not claimed here.
+#
+# REGRESSION, measured on-card after this patch and 0007 shipped together:
+# u8-KV serving produces deterministic garbage under the patched plugin
+# (vanilla plugin coherent, same everything else; reproduces at pool cap 0,
+# so patches/0005 is not implicated); u4-KV through the same patched plugin
+# is coherent. The expert-upload path this patch changes is identical across
+# KV precisions, so the leading theory is a timing-exposed race: u8 and u4
+# PagedAttention kernels run at different speeds, and that shifts which
+# interleaving of async work this patch's wait sees. This invalidates the
+# cycle-2 sweep numbers taken under this patch until resolved (fast wrong
+# compute) - flagged on the campaign record, not just here.
+#
+# Kill-switch for on-card isolation: MOE_OTD_FORCE_SYNC_UPLOAD=1 forces
+# async_ok false unconditionally in fill_weights_memory, routing every call
+# (both try_acquire_simultaneous's batch and acquire_one's single-expert
+# path, since both funnel through this one function) down the pre-0006
+# synchronous per-tensor branch that already exists for out_of_order queues
+# - i.e. this build behaves as if only patches/0003-0005 were applied to the
+# upload path. Read once, the same way MOE_OTD_PERF_LOG is read; default
+# off, unchanged from patches/0006 as landed. Paired with 0007's
+# MOE_OTD_FORCE_FINISH=1 (independent switch, same env-var pattern), the two
+# can be toggled in the 2x2 the regression grid needs: sync+finish (should
+# match pre-0006/0007 behaviour, the control), sync+no-finish, async+finish,
+# async+no-finish (patches/0006+0007 as landed, the arm that is currently
+# suspect).
+#
+# Re-audit, with the race lens: this patch's own correctness argument (wait
+# inside fill_weights_memory before it returns, ahead of set_otd_weight_
+# pointers) still looks sound on paper - the wait is on the real completion
+# event of each enqueued USM copy (traced through ocl_memory.cpp's
+# create_event/gpu_usm::copy_from: a fresh cl::Event per call, no pooling or
+# reuse that could let a wait be satisfied by the wrong command), and every
+# copy plus the GEMV kernel that reads its result go through the one
+# cl::CommandQueue a cldnn::stream owns (ocl_stream.hpp/ocl_common.hpp:
+# ocl_queue_type is cl::CommandQueue, one per stream, no separate copy vs
+# compute queue) - so in-order execution should serialize them regardless of
+# blocking vs non-blocking submission. What this argument does NOT cover,
+# and where confidence has to drop given the measurement: it reasons about
+# THIS call's own events, not about whether the *previous* iteration's GEMV
+# kernel — which reads the same slot buffer this call's copy is about to
+# overwrite — is provably ordered before this call's enqueues in every
+# calling context, including whatever host-side interleaving arcint's
+# serving loop actually does across tokens (single-token decode was assumed
+# strictly sequential host-side; that assumption was not verified against
+# the live serving loop, only against the code in this file). The batch-
+# internal slot-reuse case (two misses in one call landing on the same LRU
+# slot) was checked and is capacity-bounded safe. Net: nothing here is
+# retracted, because nothing here is independently confirmed broken - but
+# the confidence this header stated before the measurement was too high,
+# and the actual fault most likely sits in 0007's argument instead (see that
+# patch's header) or in an interaction between the two that neither header
+# analyzed on its own.
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp
+@@ -12,6 +12,7 @@
+ #include <vector>
+ 
+ #include "intel_gpu/primitives/moe_3gemm_fused_compressed.hpp"
++#include "intel_gpu/runtime/engine.hpp"
+ #include "intel_gpu/runtime/stream.hpp"
+ #include "lru_cache.hpp"
+ #include "moe_otd_perf.hpp"
+@@ -70,12 +71,59 @@
+                               std::vector<uint8_t>& payload,
+                               size_t per_expert_size);
+ 
++// arcint M9 (patches/0006, P2). Provider-owned pool of usm_host staging
++// buffers for non-blocking miss uploads. A ring rather than one buffer per
++// call: fill_weights_memory enqueues copy_from(..., blocking=false) out of a
++// slot's host pointer, so that pointer must stay valid until its event
++// completes — a loop-local std::vector does not survive that
++// (docs/design-m9-offload-v2.md §1, P2's payload-lifetime bullet).
++// acquire() waits on the slot it is about to hand back if that slot's
++// previous copy has not finished, which bounds ring memory at the cost of a
++// stall only when a batch reuses a slot faster than its DMA drains; retire()
++// records the event the caller must let the ring wait on before the next
++// acquire of that slot. Slot count is a placeholder, tuned by measurement
++// (docs/design-m9-offload-v2.md §4 [to measure]), not a correctness
++// parameter. Single-stream-only by assumption: acquire()/retire() take no
++// lock, so one StagingRing must not be driven from more than one stream or
++// thread concurrently — true today, since it is one-per-provider and each
++// provider is only ever called from its network's own exec stream.
++class StagingRing {
++public:
++    static constexpr size_t default_slot_count = 8;
++
++    explicit StagingRing(size_t slot_count = default_slot_count) : _entries(slot_count) {}
++
++    struct Slot {
++        size_t index;
++        void* host_ptr;
++    };
++
++    Slot acquire(cldnn::engine& engine, size_t bytes);
++    void retire(size_t index, cldnn::event::ptr ev);
++
++private:
++    struct Entry {
++        cldnn::memory::ptr mem;
++        cldnn::event::ptr pending;
++        size_t capacity = 0;
++    };
++
++    std::vector<Entry> _entries;
++    size_t _next = 0;
++};
++
++// blocking=true (the pre-M9 behaviour) when queue_type is not in_order, since
++// only an in-order queue lets the eventual GEMM kernels rely on program order
++// for correctness while the wait below exists solely to recycle staging
++// (moe_3gemm_swiglu_opt.cpp callers still see one call, one function).
++// staging is only touched on the async (in_order) path.
+ void fill_weights_memory(cldnn::stream& exec_stream,
+                          const cldnn::MOECompressed::Config& config,
+                          const std::vector<size_t>& weight_bin_offsets,
+                          ParallelWeightReader& weight_reader,
+                          cldnn::moe_weights& wei_mem,
+                          const std::vector<uint32_t>& experts_list,
+-                         const std::vector<size_t>& lru_experts);
++                         const std::vector<size_t>& lru_experts,
++                         StagingRing& staging);
+ 
+-}  // namespace ov::intel_gpu::ocl::moe_otd
+\ No newline at end of file
++}  // namespace ov::intel_gpu::ocl::moe_otd
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+@@ -172,13 +172,40 @@
+     payload.swap(repacked);
+ }
+ 
++StagingRing::Slot StagingRing::acquire(cldnn::engine& engine, size_t bytes) {
++    const size_t idx = _next;
++    _next = (_next + 1) % _entries.size();
++    auto& e = _entries[idx];
++    if (e.pending) {
++        // The slot's previous non-blocking copy may still be reading out of
++        // e.mem's host pointer; wait for it before this call overwrites that
++        // memory with a new payload (docs/design-m9-offload-v2.md §1, P2's
++        // payload-lifetime bullet).
++        e.pending->wait();
++        e.pending.reset();
++    }
++    if (!e.mem || e.capacity < bytes) {
++        auto layout = cldnn::layout({1, 1, 1, static_cast<ov::Dimension::value_type>(bytes)}, cldnn::data_types::u8, cldnn::format::bfyx);
++        e.mem = engine.allocate_memory(layout, cldnn::allocation_type::usm_host, false);
++        if (auto* perf = get_perf_counters())
++            perf->staging_bytes.fetch_add(bytes - e.capacity, std::memory_order_relaxed);
++        e.capacity = bytes;
++    }
++    return {idx, e.mem->buffer_ptr()};
++}
++
++void StagingRing::retire(size_t index, cldnn::event::ptr ev) {
++    _entries[index].pending = std::move(ev);
++}
++
+ void fill_weights_memory(cldnn::stream& exec_stream,
+                          const cldnn::MOECompressed::Config& config,
+                          const std::vector<size_t>& weight_bin_offsets,
+                          ParallelWeightReader& weight_reader,
+                          cldnn::moe_weights& wei_mem,
+                          const std::vector<uint32_t>& experts_list,
+-                         const std::vector<size_t>& lru_experts) {
++                         const std::vector<size_t>& lru_experts,
++                         StagingRing& staging) {
+     struct tensor_fill_plan {
+         size_t per_expert_size = 0;
+         size_t src_offset = 0;
+@@ -198,6 +225,33 @@
+ 
+     const size_t weight_file_size = weight_reader.file_size();
+ 
++    // arcint M9 (patches/0006, P2). Only an in_order queue lets the GEMM
++    // kernels enqueued after this call rely on program order for
++    // correctness (execution_config.cpp:344 forces in_order whenever
++    // use_onednn is set, true for both our cards); on an out_of_order queue
++    // a non-blocking copy here could still be in flight when a later kernel
++    // reads the slot, so this falls back to the pre-M9 synchronous path
++    // rather than trying to prove out-of-order correctness here.
++    //
++    // arcint M9 review round: MOE_OTD_FORCE_SYNC_UPLOAD=1 forces the
++    // synchronous branch below unconditionally, regardless of queue type -
++    // a diagnostic kill-switch to isolate a measured u8-KV correctness
++    // regression against 0007's stream.finish() removal (see that patch's
++    // header). Read once, the same way MOE_OTD_PERF_LOG is read. Default
++    // off: behaviour is unchanged from patches/0006 as landed.
++    static const bool force_sync_upload = std::getenv("MOE_OTD_FORCE_SYNC_UPLOAD") != nullptr;
++    const bool async_ok = !force_sync_upload && exec_stream.get_queue_type() == cldnn::QueueTypes::in_order;
++    std::vector<cldnn::event::ptr> pending_events;
++    cldnn::engine* engine = nullptr;
++    if (async_ok) {
++        for (auto m : {wei_mem.gate_w, wei_mem.up_w, wei_mem.down_w}) {
++            if (m) {
++                engine = m->get_engine();
++                break;
++            }
++        }
++    }
++
+     size_t index = 0;
+     for (uint32_t expert : experts_list) {
+         auto make_tensor_fill_plan = [&](size_t base_offset, cldnn::memory_ptr mem, size_t expert_no, size_t lru_expert_no, const char* tensor_name) {
+@@ -247,26 +301,64 @@
+             // Transpose + GPU copy
+             auto mem = tensors_by_offset[offset_pos];
+             if (mem && plan.per_expert_size != 0) {
++                std::chrono::steady_clock::time_point t0, t1;
++                if (perf)
++                    t0 = std::chrono::steady_clock::now();
++                maybe_transpose_scale_zp(config, offset_pos, mem->get_layout(), payload, plan.per_expert_size);
+                 if (perf) {
+-                    auto t0 = std::chrono::steady_clock::now();
+-                    maybe_transpose_scale_zp(config, offset_pos, mem->get_layout(), payload, plan.per_expert_size);
+-                    auto t1 = std::chrono::steady_clock::now();
+-                    mem->copy_from(exec_stream, payload.data(), 0, plan.dst_offset, plan.per_expert_size, true);
+-                    auto t2 = std::chrono::steady_clock::now();
++                    t1 = std::chrono::steady_clock::now();
+                     perf->transpose_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()),
+                                                  std::memory_order_relaxed);
+-                    perf->gpu_copy_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count()),
+-                                                std::memory_order_relaxed);
+-                    perf->tensor_load_count.fetch_add(1, std::memory_order_relaxed);
++                }
++
++                if (async_ok && engine) {
++                    // arcint M9 (patches/0006, P2). payload is loop-local and would be
++                    // freed before a non-blocking copy_from could finish reading it
++                    // (docs/design-m9-offload-v2.md §1, P2's payload-lifetime bullet),
++                    // so it is staged into a provider-owned usm_host
++                    // ring slot first: a plain host-to-host memcpy, then the enqueue
++                    // reads out of the ring slot, which outlives this iteration.
++                    auto slot = staging.acquire(*engine, plan.per_expert_size);
++                    std::memcpy(slot.host_ptr, payload.data(), plan.per_expert_size);
++                    auto ev = mem->copy_from(exec_stream, slot.host_ptr, 0, plan.dst_offset, plan.per_expert_size, false);
++                    staging.retire(slot.index, ev);
++                    pending_events.push_back(std::move(ev));
+                 } else {
+-                    maybe_transpose_scale_zp(config, offset_pos, mem->get_layout(), payload, plan.per_expert_size);
+                     mem->copy_from(exec_stream, payload.data(), 0, plan.dst_offset, plan.per_expert_size, true);
++                    if (perf) {
++                        auto t2 = std::chrono::steady_clock::now();
++                        perf->gpu_copy_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count()),
++                                                    std::memory_order_relaxed);
++                    }
+                 }
++                if (perf)
++                    perf->tensor_load_count.fetch_add(1, std::memory_order_relaxed);
+             }
+         }
+ 
+         index++;
+     }
++
++    if (!pending_events.empty()) {
++        // arcint M9 (patches/0006, P2). Single wait for the whole batch, right
++        // before the caller (try_acquire_simultaneous) returns and its caller
++        // calls set_otd_weight_pointers — the last point before the impl
++        // enqueues the GEMMs (docs/design-m9-offload-v2.md §1, P2's wait-placement
++        // bullet). On our in_order queue this wait
++        // is not what makes the GEMM kernels correct (program order already
++        // does that); it exists so the staging ring's slots are safe to reuse
++        // on the next miss batch.
++        std::chrono::steady_clock::time_point t0, t1;
++        if (perf)
++            t0 = std::chrono::steady_clock::now();
++        for (auto& ev : pending_events)
++            ev->wait();
++        if (perf) {
++            t1 = std::chrono::steady_clock::now();
++            perf->gpu_copy_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()),
++                                        std::memory_order_relaxed);
++        }
++    }
+ }
+ 
+ }  // namespace ov::intel_gpu::ocl::moe_otd
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+@@ -98,6 +98,11 @@
+     moe_otd::ParallelWeightReader _weight_reader;
+     cldnn::moe_weights* _resident = nullptr;
+     bool _bound = false;
++    // arcint M9 (patches/0006, P2). Provider-owned so each MoE layer's staging
++    // buffers are independent (no cross-layer contention on the ring), and so
++    // the ring's usm_host allocations amortize across infers instead of being
++    // rebuilt per call.
++    moe_otd::StagingRing _staging;
+ };
+ 
+ }  // namespace ov::intel_gpu::ocl::moe
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+@@ -65,6 +65,14 @@
+     std::vector<size_t> slots(experts.size());
+     auto* perf = moe_otd::get_perf_counters();
+ 
++    // arcint M9 (patches/0006, P2). Misses are collected across the whole
++    // batch and streamed with one fill_weights_memory call below, instead of
++    // one call per miss as before: that is what lets fill_weights_memory
++    // enqueue the batch's copies non-blocking and wait on them once, rather
++    // than once per expert per tensor.
++    std::vector<uint32_t> missed_experts;
++    std::vector<size_t> missed_slots;
++
+     for (size_t i = 0; i < experts.size(); i++) {
+         const uint32_t expert = experts[i];
+         auto it = expert_to_slot.find(expert);
+@@ -87,15 +95,21 @@
+         } else {
+             if (perf)
+                 perf->gpu_misses.fetch_add(1, std::memory_order_relaxed);
+-            OPENVINO_ASSERT(_resident != nullptr, "OffloadExpertWeightProvider: resident buffers not bound");
+-            moe_otd::fill_weights_memory(stream, _config, _weight_bin_offsets, _weight_reader, *_resident, {expert}, {slot});
+-            _cache->set_filled(slot);
++            missed_experts.push_back(expert);
++            missed_slots.push_back(slot);
+         }
+ 
+         expert_to_slot.emplace(expert, slot);
+         slots[i] = slot;
+     }
+ 
++    if (!missed_experts.empty()) {
++        OPENVINO_ASSERT(_resident != nullptr, "OffloadExpertWeightProvider: resident buffers not bound");
++        moe_otd::fill_weights_memory(stream, _config, _weight_bin_offsets, _weight_reader, *_resident, missed_experts, missed_slots, _staging);
++        for (const auto slot : missed_slots)
++            _cache->set_filled(slot);
++    }
++
+     return slots;
+ }
+ 
+@@ -112,7 +126,11 @@
+         if (perf)
+             perf->gpu_misses.fetch_add(1, std::memory_order_relaxed);
+         OPENVINO_ASSERT(_resident != nullptr, "OffloadExpertWeightProvider: resident buffers not bound");
+-        moe_otd::fill_weights_memory(stream, _config, _weight_bin_offsets, _weight_reader, *_resident, {expert}, {slot});
++        // Single-expert path (the exec_prefill_onednn per-expert loop); not
++        // P2's batching target, but fill_weights_memory takes the same
++        // staging ring either way and a batch of one is still non-blocking
++        // on the in_order queue.
++        moe_otd::fill_weights_memory(stream, _config, _weight_bin_offsets, _weight_reader, *_resident, {expert}, {slot}, _staging);
+         _cache->set_filled(slot);
+     }
+ 

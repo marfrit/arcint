@@ -19,7 +19,7 @@
 set -euo pipefail
 
 PIN=71640275
-PATCHLEVEL=marfrit-p1         # appended to the version string, so a loaded
+PATCHLEVEL=marfrit-p2         # appended to the version string, so a loaded
                               # runtime says out loud that it is patched.
                               # The build-number FIELD must stay numeric:
                               # ov_parse_ci_build_number wants -([0-9]+)- and

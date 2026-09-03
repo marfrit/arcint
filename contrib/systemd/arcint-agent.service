@@ -7,6 +7,16 @@
 # export of the checkpoint. The model fits the card whole: weights+graph
 # 17.38 GiB of 22.71, the reservation admitting 377552 tokens against a
 # trained maximum of 262144. No offload, no streaming, no CPU experts.
+#
+# --n-ctx (0.2.13, M7 fit pass): the fit pass now verifies an explicit depth
+# against a measured reservation at start and refuses loudly, itemized, if the
+# card cannot hold it; the prefix cache's reserve pages are trimmed before any
+# refusal, the request itself is never lowered. Ship the depth as a multiple of
+# 4096 at or below what the log reports as admissible for THIS model on THIS
+# card. Verified under the 0.2.13 ledger (2026-09-03, u8, 8 GiB prefix
+# cache, one lane): the explicit 262144 below comes up with 16,386 live pages
+# and 6,816 spare pages for cached prefixes after the reserve trim -- the
+# trained maximum, the depth this unit has always shipped.
 
 [Unit]
 Description=arcint-agent — Qwen3.6-35B-A3B on OpenVINO, GPU.0 (Arc Pro B60), :8087

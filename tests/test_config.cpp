@@ -641,3 +641,56 @@ TEST(config_n_ctx_explicit_true_when_passed) {
     CHECK(cfg2.n_ctx_explicit);
     CHECK_EQ(cfg2.n_ctx, 0);
 }
+
+// M9: --prefix-cache-reserve PCT -- an option under auto-fit, default 0
+// (today's behaviour, no reserve).
+TEST(config_prefix_cache_reserve_defaults_zero) {
+    Config cfg;
+    CHECK(run({"--stub"}, cfg).ok);
+    CHECK_EQ(cfg.prefix_cache_reserve_pct, 0);
+}
+
+TEST(config_prefix_cache_reserve_accepts_the_full_range) {
+    Config lo;
+    CHECK(run({"--stub", "--prefix-cache-mib", "512", "--prefix-cache-reserve", "0"}, lo).ok);
+    CHECK_EQ(lo.prefix_cache_reserve_pct, 0);
+
+    Config mid;
+    CHECK(run({"--stub", "--prefix-cache-mib", "512", "--prefix-cache-reserve", "25"}, mid).ok);
+    CHECK_EQ(mid.prefix_cache_reserve_pct, 25);
+
+    Config hi;
+    CHECK(run({"--stub", "--prefix-cache-mib", "512", "--prefix-cache-reserve", "90"}, hi).ok);
+    CHECK_EQ(hi.prefix_cache_reserve_pct, 90);
+}
+
+// Refusal 1: PCT outside 0..90.
+TEST(config_prefix_cache_reserve_rejects_out_of_range_pct) {
+    CHECK(rejected({"--stub", "--prefix-cache-mib", "512", "--prefix-cache-reserve", "91"}));
+    CHECK(rejected({"--stub", "--prefix-cache-mib", "512", "--prefix-cache-reserve", "-1"}));
+    CHECK(rejected({"--stub", "--prefix-cache-mib", "512", "--prefix-cache-reserve", "100"}));
+}
+
+// Refusal 2: the flag without --prefix-cache-mib > 0 -- nothing to reserve
+// pages for.
+TEST(config_prefix_cache_reserve_needs_a_prefix_cache_budget) {
+    CHECK(rejected({"--stub", "--prefix-cache-reserve", "25"}));
+    CHECK(rejected({"--stub", "--prefix-cache-mib", "0", "--prefix-cache-reserve", "25"}));
+    // PCT 0 is a no-op, so it does not need the budget either -- it is
+    // indistinguishable from the flag never having been passed.
+    Config cfg;
+    CHECK(run({"--stub", "--prefix-cache-reserve", "0"}, cfg).ok);
+}
+
+// Refusal 3: the flag together with an explicit --n-ctx -- an explicit
+// depth already defines the reserve as whatever remains.
+TEST(config_prefix_cache_reserve_rejects_explicit_n_ctx) {
+    CHECK(rejected({"--stub", "--prefix-cache-mib", "512", "--prefix-cache-reserve", "25",
+                    "--n-ctx", "8192"}));
+    Config cfg;
+    const ArgParse r = run({"--stub", "--prefix-cache-mib", "512", "--prefix-cache-reserve", "25",
+                            "--n-ctx", "8192"}, cfg);
+    CHECK(!r.ok);
+    CHECK(r.error.find("explicit") != std::string::npos ||
+          r.error.find("--n-ctx") != std::string::npos);
+}

@@ -20,5 +20,5 @@ Description: Narrow LLM inference engine for Intel Arc GPUs
  llama-server prints.
  .
  The systemd user unit and its environment file ship as templates in
- /usr/share/arcint/; copy them to ~/.config/systemd/user/ (on roundhouse hosts,
- through roundhouse, and commit them).
+ /usr/share/arcint/; copy them to ~/.config/systemd/user/ (on a host with the fleet's unit managers,
+ through that manager, and commit them).

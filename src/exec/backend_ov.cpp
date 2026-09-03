@@ -3090,6 +3090,84 @@ private:
                 static_cast<double>(slab) / (1u << 30), static_cast<double>(total) / (1u << 30),
                 n_ctx_for_message);
         };
+
+        // M9 "--prefix-cache-reserve PCT": an option under auto-fit that
+        // holds back PCT percent of the pool's own budget-affordable pages
+        // as spare for cached prefixes, instead of auto-fit adopting the
+        // whole budget as live pages (PCT 0, today's behaviour) and leaving
+        // the prefix cache the "0 spare pages" case the warning near the
+        // end of this function names. Applied to `max_ctx` HERE, before the
+        // "wanted > max_ctx" check and the `paged_n_ctx_ = min(wanted,
+        // max_ctx)` adoption below -- so the adopted depth still floors to
+        // a page multiple (prefix_cache_reserve floors live_pages down,
+        // fit.h), still respects the train maximum (the min() below still
+        // runs against the RESERVED max_ctx, so an artifact whose own
+        // default is smaller than the reserved budget still wins), and
+        // still respects the 4096 floor (`reserve.admissible`, mirroring
+        // fit.admissible's own rule -- a PCT that would push the adopted
+        // depth below the floor refuses below rather than silently landing
+        // on the floor itself). config.cpp already refuses this flag
+        // together with an explicit --n-ctx (an explicit depth already
+        // defines the reserve as whatever remains after the request), so
+        // `explicit_n_ctx` is always false whenever `reserve_applied` is
+        // true -- asserted explicitly at the top of Phase E below (L6,
+        // round-2 review), since this comment is not itself a guarantee a
+        // future edit here has to respect.
+        //
+        // L5 (round-2 review): gated on `fit.admissible` too -- when the
+        // PLAIN (unreserved) fit already found nothing usable, applying a
+        // reserve on top and then blaming the reserve in the refusal
+        // message below would misattribute a failure the reserve did not
+        // cause. `!fit.admissible` falls through unreserved to the
+        // pre-existing "auto-fit found no usable context" throw further
+        // down, with its original (non-reserve) wording.
+        //
+        // What keeps the reserve through the replay loop below (Phase E):
+        // round-4 correction -- an earlier version of this comment said
+        // the auto-fit overshoot-correction branch "calls shrink_n_ctx on
+        // paged_n_ctx_ directly and never touches spare_blocks or
+        // wanted_spare", which was true of the ORIGINAL (defective)
+        // correction, not of `auto_fit_trim` (fit.h), which replaced it in
+        // round 3 precisely because a live-only correction left
+        // pool_sizing's own spare_room growing back to absorb the cut and
+        // the pool total never moved (see auto_fit_trim's own comment for
+        // the measured cells). The correction now DOES read and write
+        // spare, via `spare_cap` -- what actually protects the reserve is
+        // the `protect_spare = reserve_applied` argument passed to
+        // auto_fit_trim below: with it set, live is cut FIRST and the
+        // spare cap is pinned (never enlarged, never reduced) for as long
+        // as live still has room before the floor; spare only starts
+        // giving once live's remaining room is smaller than the pass's
+        // own trim budget (at most 256 pages, the last pass's backoff
+        // floor, unless a genuinely large measured `over` asks for more)
+        // -- reported, if it happens, by the post-hoc `prefix_cache_
+        // reserve_shortfall` warning near the end of this function. One
+        // consequence worth stating: because live shrinks while a
+        // protected spare cap stays flat, the REALIZED spare fraction
+        // drifts UP across correction passes, never down, until live
+        // bottoms out at the floor. The explicit-n_ctx retry
+        // (`explicit_retry_decision`) remains structurally unreachable in
+        // this configuration, since it only runs when `explicit_n_ctx` is
+        // true and this branch requires `!explicit_n_ctx`.
+        //
+        // L4 (round-2 review): the "prefix-cache reserve: ..." log line
+        // used to print here, before `paged_n_ctx_ = min(wanted, max_ctx)`
+        // ever ran -- so it could name an "adopted n_ctx" the artifact's
+        // own train maximum then immediately overrode (when `wanted <
+        // max_ctx`). Only the reserve arithmetic happens here now; the log
+        // line moved to just after that min(), where `paged_n_ctx_` is the
+        // number actually adopted.
+        bool               reserve_applied = false;
+        PrefixCacheReserve reserve;
+        if (!explicit_n_ctx && cfg.prefix_cache_reserve_pct > 0 && max_ctx > 0 &&
+            fit.admissible) {
+            const long long affordable_pages = max_ctx / static_cast<long long>(kv_block_tokens_);
+            reserve = prefix_cache_reserve(affordable_pages, cfg.prefix_cache_reserve_pct,
+                                           static_cast<int>(kv_block_tokens_), fterms.n_ctx_floor);
+            reserve_applied = true;
+            max_ctx          = reserve.adopted_n_ctx;
+        }
+
         // F2 (review finding): adopt mode (no explicit --n-ctx) must not
         // silently clamp to an inadmissible max_ctx. fit.admissible was
         // computed and never read -- with status_.n_ctx left at 0 the
@@ -3098,7 +3176,20 @@ private:
         // cleanly. Checked unconditionally here (not nested under "wanted >
         // max_ctx"), because the failure is "there is nothing to adopt",
         // independent of what the artifact's own default happened to be.
-        if (!explicit_n_ctx && !fit.admissible) {
+        // M9: when the reserve was applied, `reserve.admissible` replaces
+        // `fit.admissible` -- the question is now whether the RESERVED
+        // depth is usable, not the unreserved one.
+        const bool auto_fit_admissible = reserve_applied ? reserve.admissible : fit.admissible;
+        if (!explicit_n_ctx && !auto_fit_admissible) {
+            if (reserve_applied) {
+                throw std::runtime_error(log::format(
+                    "auto-fit found no usable context on %d lane%s after holding back a %d%% "
+                    "prefix-cache reserve (%s); --n-ctx was not given, so there is no request "
+                    "to lower further. Lower --prefix-cache-reserve, lower --parallel, lower "
+                    "--prefill-chunk, or free memory on the card.",
+                    lanes, lanes == 1 ? "" : "s", cfg.prefix_cache_reserve_pct,
+                    itemized_terms(static_cast<int>(max_ctx)).c_str()));
+            }
             throw std::runtime_error(log::format(
                 "auto-fit found no usable context on %d lane%s (%s); --n-ctx was not given, "
                 "so there is no request to lower further -- this is the largest number the "
@@ -3121,6 +3212,30 @@ private:
                       wanted);
         }
         paged_n_ctx_ = static_cast<int>(std::min<long long>(wanted, max_ctx));
+
+        // L4 (round-2 review): logged AFTER adoption, from `paged_n_ctx_`
+        // itself, not from `max_ctx` -- the reserve arithmetic above ran
+        // against the BUDGET-derived max_ctx, but `wanted` (the artifact's
+        // own train maximum, or an operator's smaller default) can still
+        // win the min() just above, and the "adopted n_ctx" this line
+        // reports has to be the number that actually won.
+        if (reserve_applied) {
+            // Round-3 review, defect 2 (units): explicit about "per lane"
+            // here -- `reserve.spare_pages` is per-lane, pure-KV pages
+            // (see reserve_ask_pool_pages in fit.h), not the pool-wide page
+            // count Phase E's own "paged pool: ... + N spare" line prints
+            // further down. Naming both would need the allocation-time
+            // pool to already exist, which it does not yet at this point
+            // in the load -- the pool-wide "N pool page(s)" wording lives
+            // on the shortfall warning below instead, once Phase E has run.
+            log::info("load",
+                      "prefix-cache reserve: %d%% = %lld page%s per lane (%lld tokens per "
+                      "lane) held spare; adopted n_ctx %d",
+                      cfg.prefix_cache_reserve_pct, reserve.spare_pages,
+                      reserve.spare_pages == 1 ? "" : "s",
+                      reserve.spare_pages * static_cast<long long>(kv_block_tokens_),
+                      paged_n_ctx_);
+        }
 
         // ---- Phase E: allocate, audit, replay (M7 §1) -------------------------
         //
@@ -3150,12 +3265,21 @@ private:
         // shrinks in step with the live pool instead of silently reclaiming
         // the space live_blocks gave up.
         uint64_t overshoot_accum   = 0;
-        // F1 (review finding): a bound the explicit-n_ctx retry narrows on
-        // its own, in pages, independent of overshoot_accum's byte-level
-        // budget shrink -- std::min against SIZE_MAX below is a no-op until
-        // the retry branch sets it, so the auto-fit path (which never
-        // enters that branch) never sees this cap.
-        size_t explicit_spare_cap = static_cast<size_t>(-1);
+        // F1 (review finding): a bound the retry narrows on its own, in
+        // pages, independent of overshoot_accum's byte-level budget shrink
+        // -- std::min against SIZE_MAX below is a no-op until a retry sets
+        // it. Round-3 (defect 1): shared by BOTH the explicit-n_ctx retry
+        // (explicit_retry_decision) and the auto-fit correction (auto_fit_
+        // trim) now -- exactly one of the two branches ever runs for a
+        // given load (explicit_n_ctx is constant for the whole call), so
+        // one persistent cap is enough. Before round 3, only the explicit
+        // branch narrowed this; the auto-fit branch left it untouched
+        // forever, which is exactly why auto-fit's correction could shrink
+        // `paged_n_ctx_` pass after pass while `wanted_spare` below grew
+        // right back to absorb the cut (pool_sizing's own spare_room =
+        // affordable - live_blocks) and the POOL TOTAL never moved -- see
+        // auto_fit_trim's own comment in fit.h for the measured cells.
+        size_t spare_cap = static_cast<size_t>(-1);
         // release_kv_pools() (below) reports how much residency left the
         // plugin's statistics when the lanes dropped their requests. Measured
         // on both cards (2026-09-03): 1.0 to 5.5 GiB per pass -- that is the
@@ -3170,6 +3294,41 @@ private:
         size_t   released_total = 0;
         uint64_t last_over      = 0;
         constexpr int kLastPass = 3;  // the loop below runs passes 0..3
+
+        // Round-4 review: the "replay exhausted" throw below used to name
+        // `paged_n_ctx_` AFTER the loop's last iteration had already
+        // overwritten it with `trim.next_n_ctx` -- a depth computed FOR a
+        // fifth pass that never runs (the loop condition is `pass < 4`),
+        // so the throw named a number that was never actually attempted
+        // or allocated. `last_attempted_n_ctx` and `attempt_history` are
+        // captured once per pass, right after `blocks` is finalized for
+        // that pass (the value actually handed to alloc_kv_pools), so the
+        // throw can name the last depth genuinely tried and itemize every
+        // pass's own (n_ctx, pool pages) instead.
+        int last_attempted_n_ctx = paged_n_ctx_;
+        std::vector<std::pair<int, size_t>> attempt_history;  // (n_ctx, pool pages) per pass
+
+        // L6 (round-2 review): the reserve and an explicit --n-ctx must
+        // never both be live going into this replay loop -- the spare-
+        // trimming explicit_n_ctx retry below assumes it owns the whole
+        // spare budget, and reserve_applied assumes nothing downstream
+        // trims the headroom it just carved out of max_ctx; the two
+        // assumptions conflict; config.cpp refuses the combination at
+        // parse time and the guard just above (`fit.admissible` gated
+        // `reserve_applied`, which itself required `!explicit_n_ctx`)
+        // never sets both, but a loud check here catches a future edit
+        // that loosens either guard before it can silently produce an
+        // undersized or oversized pool instead of a clean refusal. Not an
+        // `assert()`: this build has no OPENVINO-free way to guarantee
+        // NDEBUG is unset, and a reservation-loop invariant is exactly the
+        // kind of thing this file fails loud on rather than compiling out.
+        if (reserve_applied && explicit_n_ctx) {
+            throw std::runtime_error(
+                "internal: prefix-cache reserve applied together with an explicit --n-ctx -- "
+                "config.cpp should have refused this combination before the reservation "
+                "loop ever ran");
+        }
+
         for (int pass = 0; pass < 4 && !accepted; ++pass) {
             // F3 (review finding): release the previous pass's pool from
             // every lane before asking the driver for a new one -- a fresh
@@ -3215,28 +3374,29 @@ private:
                                             std::max<size_t>(la_row_bytes_, 1));
                 wanted_spare = entries * per_lane_blocks;
             }
-            // F1: once the explicit-n_ctx retry has learned a spare cap
-            // from a prior pass, it bounds every subsequent pass's spare
-            // request too -- otherwise a shrinking cache budget could
-            // still race a stale, larger cap.
-            wanted_spare = std::min(wanted_spare, explicit_spare_cap);
+            // F1: once a retry (explicit or, since round 3, auto-fit) has
+            // learned a spare cap from a prior pass, it bounds every
+            // subsequent pass's spare request too -- otherwise a shrinking
+            // cache budget could still race a stale, larger cap.
+            wanted_spare = std::min(wanted_spare, spare_cap);
             const PoolSizing sizing =
                 pool_sizing(live_blocks, wanted_spare, budget_remaining, kv_block_bytes);
             blocks       = sizing.blocks;
             spare_blocks = sizing.spare_blocks;
             // A cap for tests: the only way to make the cache evict on demand
             // at a small context. Never below what the lanes themselves need.
-            // Round-3 review, finding 7: this override is test-only (real
-            // loads never set --kv-pool-pages) and does not read
-            // explicit_spare_cap at all -- it resets `blocks` to a FIXED
-            // `cap` independent of whatever the explicit retry above just
-            // narrowed the spare bound to, so under this flag a retry can
-            // re-request the identical capped pool pass after pass until
-            // pool_sizing's own (uncapped) result eventually drops below
-            // `cfg.kv_pool_pages` on its own. Kept as-is rather than made
-            // to interact with explicit_spare_cap -- the flag exists to
-            // force small pools for cache-eviction tests, not to exercise
-            // the retry's own narrowing.
+            // Round-3 review, finding 7 (the M7 fit review, not this
+            // milestone's round 3): this override is test-only (real loads
+            // never set --kv-pool-pages) and does not read `spare_cap` at
+            // all -- it resets `blocks` to a FIXED `cap` independent of
+            // whatever a retry above just narrowed the spare bound to, so
+            // under this flag a retry can re-request the identical capped
+            // pool pass after pass until pool_sizing's own (uncapped)
+            // result eventually drops below `cfg.kv_pool_pages` on its
+            // own. Kept as-is rather than made to interact with
+            // `spare_cap` -- the flag exists to force small pools for
+            // cache-eviction tests, not to exercise a retry's own
+            // narrowing.
             if (cfg.kv_pool_pages > 0) {
                 const size_t cap =
                     std::max<size_t>(static_cast<size_t>(cfg.kv_pool_pages), live_blocks);
@@ -3248,6 +3408,15 @@ private:
                     spare_blocks = blocks - live_blocks;
                 }
             }
+
+            // Round-4 review: record what this pass actually attempts
+            // (`blocks`, finalized above) before trying to allocate it --
+            // `last_attempted_n_ctx` is read by the "replay exhausted"
+            // throw below instead of the post-loop `paged_n_ctx_`, which
+            // by then may already hold a depth computed for a pass that
+            // never ran.
+            last_attempted_n_ctx = paged_n_ctx_;
+            attempt_history.emplace_back(paged_n_ctx_, blocks);
 
             bool     failed = false;
             uint64_t over   = 0;
@@ -3380,7 +3549,7 @@ private:
                               spare_blocks, decision.next_spare_cap,
                               decision.next_spare_cap == 1 ? "" : "s", pass + 2);
                 }
-                explicit_spare_cap = decision.next_spare_cap;
+                spare_cap = decision.next_spare_cap;
                 overshoot_accum += over;
                 continue;
             }
@@ -3398,9 +3567,37 @@ private:
             // shrinks with the live pool instead of silently reabsorbing the
             // space live_blocks just gave up.
             overshoot_accum += over;
-            const long long shrunk = shrink_n_ctx(paged_n_ctx_, over, kv_bytes_token_, lanes,
-                                                  static_cast<int>(kv_block_tokens_));
-            if (shrunk < fterms.n_ctx_floor) {
+
+            // Round-3 (defect 1): auto_fit_trim (fit.h) replaces a plain
+            // shrink_n_ctx call here -- shrink_n_ctx alone only ever
+            // touched `paged_n_ctx_` (live pages), and left `wanted_spare`
+            // uncapped, so whenever spare_blocks > 0 pool_sizing's own
+            // spare_room = affordable - live_blocks grew back by exactly
+            // what live_blocks lost and the POOL TOTAL never moved --
+            // measured: coder/16 GiB with --prefix-cache-reserve 25 (pass
+            // 1 "14.86 GiB resident against a 14.86 GiB ceiling at n_ctx
+            // 100224", then 100080/100064/100048 with residency
+            // UNCHANGED, exhausted) and the 35B/24 GB card's plain
+            // auto-fit cell (262,144 -> 260080/260064/260048, same
+            // shape). auto_fit_trim shrinks the POOL TOTAL instead,
+            // splitting the cut between live (`next_n_ctx`) and spare
+            // (`next_spare_cap`, applied via `spare_cap` above, the same
+            // variable the explicit branch narrows) according to
+            // `reserve_applied`: with an explicit --prefix-cache-reserve
+            // honoured, live gives first and spare is protected until
+            // live has nothing left (any shortfall that leaves is what
+            // the post-hoc `prefix_cache_reserve_shortfall` warning
+            // below reports); without one, spare gives first since
+            // nobody asked to keep it and cutting live changes the
+            // served context length. Either way the cap it hands back
+            // for `spare_cap` never exceeds the CURRENT pass's own
+            // spare_blocks, which is what stops pool_sizing's room
+            // growth from re-inflating it next pass.
+            const AutoFitTrim trim =
+                auto_fit_trim(paged_n_ctx_, spare_blocks, over, kv_block_bytes, lanes,
+                             static_cast<int>(kv_block_tokens_), fterms.n_ctx_floor, pass,
+                             /*protect_spare=*/reserve_applied);
+            if (trim.refuse) {
                 throw std::runtime_error(log::format(
                     "the reservation cannot be honoured even at the floor (%d tokens) on %d "
                     "lane%s (%s). Lower --parallel, lower --prefill-chunk, or free memory on "
@@ -3408,7 +3605,8 @@ private:
                     fterms.n_ctx_floor, lanes, lanes == 1 ? "" : "s",
                     itemized_terms(paged_n_ctx_).c_str()));
             }
-            paged_n_ctx_ = static_cast<int>(shrunk);
+            paged_n_ctx_ = static_cast<int>(trim.next_n_ctx);
+            spare_cap    = trim.next_spare_cap;
         }
         if (!accepted) {
             // Finding 3: itemized the same way as the explicit "could not
@@ -3420,19 +3618,35 @@ private:
             // through to here. The auto-fit path has no such forcing and
             // can still exhaust all 4 passes without reaching its own
             // floor, which is what this throw is for.
+            //
+            // Round-4 review: named from `last_attempted_n_ctx` (the depth
+            // the LAST pass actually asked alloc_kv_pools for), not
+            // `paged_n_ctx_` -- by this point `paged_n_ctx_` already holds
+            // `trim.next_n_ctx` from the loop's final iteration, a depth
+            // computed for a fifth pass that never runs and was never
+            // tried. `attempt_history` lists every pass's own (n_ctx, pool
+            // pages) so the whole trimmed-pages record survives past the
+            // log lines above, which the message otherwise only points at.
             const size_t over_pages =
                 kv_block_bytes > 0
                     ? static_cast<size_t>((last_over + kv_block_bytes - 1) / kv_block_bytes)
                     : 0;
+            std::string history;
+            for (size_t i = 0; i < attempt_history.size(); ++i) {
+                history += log::format("%spass %zu: n_ctx %d (%zu pages)", i == 0 ? "" : ", ",
+                                       i + 1, attempt_history[i].first,
+                                       attempt_history[i].second);
+            }
             throw std::runtime_error(log::format(
                 "reservation replay exhausted 4 passes without a stable allocation on %d "
-                "lane%s at n_ctx %d (%s); the reservation had %zu live page%s and %zu spare "
-                "page%s left to trim (%zu page%s over on the last pass) -- the card is "
-                "contended or the arithmetic above is wrong -- see the log lines above for "
-                "which.",
-                lanes, lanes == 1 ? "" : "s", paged_n_ctx_, itemized_terms(paged_n_ctx_).c_str(),
-                live_blocks, live_blocks == 1 ? "" : "s", spare_blocks,
-                spare_blocks == 1 ? "" : "s", over_pages, over_pages == 1 ? "" : "s"));
+                "lane%s -- last attempted n_ctx %d (%s); that pass had %zu live page%s and "
+                "%zu spare page%s left to trim (%zu page%s over) -- the card is contended or "
+                "the arithmetic above is wrong -- see the log lines above for which. "
+                "Attempts: %s.",
+                lanes, lanes == 1 ? "" : "s", last_attempted_n_ctx,
+                itemized_terms(last_attempted_n_ctx).c_str(), live_blocks,
+                live_blocks == 1 ? "" : "s", spare_blocks, spare_blocks == 1 ? "" : "s",
+                over_pages, over_pages == 1 ? "" : "s", history.c_str()));
         }
 
         pool_ = std::make_unique<BlockPool>(blocks);
@@ -3452,7 +3666,54 @@ private:
         // prefix cache configured it silently means every cached prefix
         // now competes with the live lanes and evicts on demand -- worth a
         // warn, not just the pool line above.
-        if (spare_blocks == 0 && prefix_cache_ != nullptr) {
+        //
+        // H2 (round-2 review, HIGH -- corrects the M9 round): the first cut
+        // here gated this warning's suppression on `reserve.spare_pages >
+        // 0`, reasoning that a reserve which asked for headroom at all
+        // should silence the generic zero-spare warning. But
+        // `prefix_cache_reserve` PROVES `spare_pages > 0` for any PCT in
+        // [1, 90] with a nonzero affordable-page count (fit.h's own
+        // comment on that function) -- so that gate could never be false
+        // whenever the reserve was requested, and the warning went silent
+        // unconditionally instead of only when the reserve was actually
+        // honoured. It never fired the one case it existed to catch: the
+        // allocation-time replay loop above coming back with LESS spare
+        // than the reserve computed (real memory pressure, or a
+        // --kv-pool-pages test cap trimming it after the fact).
+        //
+        // Split into the two cases that were being conflated:
+        //   - no reserve requested (`!reserve_applied`): the pre-existing
+        //     generic warning, unchanged.
+        //   - reserve requested: `prefix_cache_reserve_shortfall` (fit.h,
+        //     tested device-free) compares what was ASKED against what
+        //     was ACCEPTED (spare_blocks) and names both numbers -- the
+        //     true alarm, and the only one of the two branches that can
+        //     actually fire.
+        //
+        // Round-3 review, defect 2 (units): `reserve.spare_pages` is
+        // PER-LANE, pure-KV pages (fit_context's own max_ctx, which its
+        // comment states is already "per lane"); `spare_blocks` is
+        // POOL-WIDE and also nets out the per-lane guard overhead
+        // (lookahead/rollback + drafter pages) `per_lane_blocks` bakes
+        // into the live side. Comparing them directly (the round-2 H2
+        // fix's own call site) was wrong on both axes -- under-detected a
+        // real shortfall by a factor of `lanes` on more than one lane,
+        // and false-alarmed by the guard overhead even on one (measured:
+        // 18,313 asked vs 18,311 accepted with nothing actually short).
+        // `reserve_ask_pool_pages` (fit.h) converts the ask into
+        // `spare_blocks`'s own units first.
+        if (reserve_applied) {
+            const long long ask_pool_pages = reserve_ask_pool_pages(
+                reserve.spare_pages, lanes, static_cast<int>(drafts_max_),
+                static_cast<int>(kv_block_tokens_));
+            if (prefix_cache_reserve_shortfall(spare_blocks, ask_pool_pages)) {
+                log::warn("load",
+                          "prefix-cache reserve asked %lld pool page%s, the accepted pool "
+                          "holds %zu page%s",
+                          ask_pool_pages, ask_pool_pages == 1 ? "" : "s", spare_blocks,
+                          spare_blocks == 1 ? "" : "s");
+            }
+        } else if (spare_blocks == 0 && prefix_cache_ != nullptr) {
             log::warn("load",
                       "accepted pool has 0 spare pages for cached prefixes -- "
                       "--prefix-cache-mib is configured but every cached prefix will now "

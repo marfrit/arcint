@@ -1,3 +1,36 @@
+arcint (0.2.13-1) trixie; urgency=medium
+
+  * M7 fit pass: measured two-ledger reservation; auto-fit of --n-ctx. An
+    explicit --n-ctx is verify-only, never lowered, and its refusal now
+    trims the prefix-cache reserve pages first. Ship note: the honest
+    ledger admits 155,568 tokens (measured with --mtp on) for the dense 27B agent at u8 on the
+    24 GB card with an 8 GiB prefix cache, so unit files that hand-set
+    155,648 must lower it.
+  * --prefix-cache-reserve PCT: under auto-fit, hold PCT percent of the
+    affordable KV pages spare for cached prefixes (default 0 = all live
+    pages, as before); refused with an explicit --n-ctx, whose reserve is
+    whatever remains. Measured: the dense agent at 25% adopts 116,528 with
+    2,428 pages spare against 155,376 with none.
+  * M8 asymmetric KV, --paged-kv u8:i4 (8.8 vs 11.3 KiB/token; auto-fit
+    171,312 vs 133,456 on the coder on the 16 GiB card, 199,424 vs
+    155,376 on the agent on the 24 GB card, +28%; acceptance task 10/10
+    at u8:i4). Owed: the prefill price, prefix byte-exactness.
+  * M9 device-tier expert slot pool plus async uploads: the 35B on the
+    16 GiB card goes from 0.4 t/s (ratio 25, unpatched) to 9.1 (ratio 50 /
+    8 GiB pool, 16-token probe) and 10.4 (64-token probe).
+  * M14 host compute tier, --moe-cpu-tier: the 35B on the 16 GiB card at
+    15.0/15.5 t/s against 10.4/10.6 at ratio 50 / 8 GiB, 14.1/14.8
+    against 7.4/7.5 at ratio 75 / 5 GiB, text byte-identical, 10/10.
+  * M12 --pin-dispatch (measured null on a quiet host, opt-in) and the
+    exporter's --moe-lowering tiled.
+  * M13 --vision stays reserved and refused; vision IRs are reported at
+    load and never loaded (coder: 6 files, 428.3 MiB on disk).
+  * Per-expert routing histogram, env MOE_OTD_ROUTING_HIST (plugin patch
+    0013).
+  * Requires marfrit-openvino +p2.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Thu, 03 Sep 2026 10:00:00 +0200
+
 arcint (0.2.12-1) trixie; urgency=medium
 
   * DFlash2 block-diffusion drafter: --dflash DIR serves the public
@@ -183,7 +216,7 @@ arcint (0.2.1-1) trixie; urgency=medium
   * --served-model-name NAME: the id this endpoint reports on /v1/models and
     /props. A discovering proxy republishes whatever id it finds there, so
     pinning it to the allowlist name made the allowlist a client-visible API —
-    the swap onto dirac:8080 renamed the endpoint and every caller sending the
+    the swap onto the dev host's :8080 renamed the endpoint and every caller sending the
     old name got nothing. Presentation only: --model-id remains the artifact
     assertion and still refuses anything outside the allowlist.
   * /v1/models carries the context: n_ctx (what the process is RUNNING with)
@@ -212,6 +245,6 @@ arcint (0.2.0-1) trixie; urgency=medium
     because the runtime is a nightly: a different nightly is a different ABI,
     not an upgrade.
   * The unit ships as a template, not installed: arcint runs as a systemd user
-    unit, and on dirac that directory is a git repo owned by roundhouse.
+    unit, and on the dev host that directory is a git repo owned by the fleet's unit managouse.
 
  -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 29 Aug 2026 16:00:00 +0200

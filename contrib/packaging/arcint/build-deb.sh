@@ -11,7 +11,7 @@
 # It carries the CMake package, the headers and the runtime that arcint links.
 set -euo pipefail
 
-PKGVER=0.2.12
+PKGVER=0.2.13
 UPSTREAM_TAG=v${PKGVER}
 PKGREL=1
 # The public repository, not the fleet one. The fleet repo (still named
@@ -19,9 +19,10 @@ PKGREL=1
 # and carries operator-local notes; the published tree is the same code without
 # them, so the package is built from what anyone can check.
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-681b1edb610ac91635c4abf173c3c2f6e6e3423f4d7336e91a0a3484f4e78a59}
+# filled after the v0.2.13 tag is pushed (filled in the follow-up commit once the tag exists)
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-}
 OV_PREFIX=/usr/lib/marfrit-openvino
-OV_DEP_VERSION="2026.4.0~dev20260821+p1-1"
+OV_DEP_VERSION="2026.4.0~dev20260821+p2-1"
 HERE=$(dirname "$(readlink -f "$0")")
 
 export SOURCE_DATE_EPOCH=1787990400

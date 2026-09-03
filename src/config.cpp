@@ -243,6 +243,14 @@ std::string usage_text() {
         "                            asks for asymmetric precision (M8) and is refused unless\n"
         "                            the compiled paged model actually carries the requested\n"
         "                            widths per side.\n"
+        "                            u8 is 11.3 KiB/token against f16's 20.0, which\n"
+        "                            is what makes two lanes at depth fit. It is the\n"
+        "                            default because it is the setting that does not\n"
+        "                            refuse, not because it is faster -- f16 wins on\n"
+        "                            prefill and, past ~50k, on decode too. f16 also\n"
+        "                            costs prefix-cache reserve: the pool is sized in\n"
+        "                            bytes and live pages are a fixed count, so the\n"
+        "                            whole difference lands there\n"
         "  --cache-grid N            prefix-cache snapshot grid in tokens (default: 0 = the\n"
         "                            prefill chunk). A snapshot lands on the last multiple of N\n"
         "                            below the prompt length; a coarser grid re-prefills the\n"
@@ -252,6 +260,20 @@ std::string usage_text() {
         "                            over the link on a hit (default: 0, off). DESIGN 4.4.\n"
         "  --kv-pool-pages N         cap the KV pool at N pages (default: 0, sized by memory).\n"
         "                            A test knob: the way to make the cache evict on demand.\n"
+        "  --prefix-cache-reserve PCT\n"
+        "                            auto-fit only (--n-ctx omitted): hold back PCT percent of\n"
+        "                            the PER-LANE budget-affordable pages as spare for cached\n"
+        "                            prefixes, so the adopted depth is reduced instead of eating\n"
+        "                            the whole budget (default: 0, off -- today's behaviour, and\n"
+        "                            what the \"0 spare pages\" warning names). PCT applies per\n"
+        "                            lane; the pool actually allocated is lane-wide (--parallel\n"
+        "                            lanes' worth), net of a small per-lane guard-page overhead --\n"
+        "                            the load log names both the per-lane reserve and the pool-\n"
+        "                            wide pages actually held. Integer 0..90; needs\n"
+        "                            --prefix-cache-mib > 0 (nothing to reserve pages for\n"
+        "                            otherwise) and refuses with an explicit --n-ctx -- an\n"
+        "                            explicit depth already defines the reserve as whatever\n"
+        "                            remains after the request.\n"
         "\n"
         "serving defaults (the operator layer: request > these > artifact > family card;\n"
         "any of them flips the served sampler provenance to 'operator')\n"
@@ -270,14 +292,6 @@ std::string usage_text() {
         "                            off). 16 is the measured setting: -13% prefill wall,\n"
         "                            -5% decode; pays off below ~500 answer tokens per 12k\n"
         "                            prompt tokens. See DESIGN 7.0.2g.\n"
-        "                            u8 is 11.3 KiB/token against f16's 20.0, which\n"
-        "                            is what makes two lanes at depth fit. It is the\n"
-        "                            default because it is the setting that does not\n"
-        "                            refuse, not because it is faster -- f16 wins on\n"
-        "                            prefill and, past ~50k, on decode too. f16 also\n"
-        "                            costs prefix-cache reserve: the pool is sized in\n"
-        "                            bytes and live pages are a fixed count, so the\n"
-        "                            whole difference lands there\n"
         "  --prefix-cache-mib N      prefix-cache budget in MiB (default: 0, off)\n"
         "  --fit-margin-mib N        headroom the paged-path auto-fit budget leaves\n"
         "                            unclaimed (default: 256). The only policy term in\n"
@@ -291,7 +305,7 @@ std::string usage_text() {
         "  --draft N                 speculative draft length, 0 = off\n"
         "  --draft-ngram K           drafter match length (default: 3)\n"
         "  --custom-kernels FILE     OpenVINO custom-layer XML (hand-written OpenCL)\n"
-        "  --offload-ratio N         %% of MoE expert weights to stream, 0 = all resident\n"
+        "  --offload-ratio N         % of MoE expert weights to stream, 0 = all resident\n"
         "  --no-paged                stateful reference path instead of the paged executor\n"
         "  --emb-device DEV          run the embeddings gather elsewhere (default: --device)\n"
         "  --mtp-device DEV          run the MTP head elsewhere (default: --device)\n"
@@ -461,6 +475,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--prefix-cache-mib") {
             if (!value(v) || !parse_int(v, cfg.prefix_cache_mib)) {
                 return fail("--prefix-cache-mib needs an integer");
+            }
+        } else if (arg == "--prefix-cache-reserve") {
+            if (!value(v) || !parse_int(v, cfg.prefix_cache_reserve_pct)) {
+                return fail("--prefix-cache-reserve needs an integer percent");
             }
         } else if (arg == "--fit-margin-mib") {
             if (!value(v) || !parse_int(v, cfg.fit_margin_mib)) {
@@ -663,6 +681,25 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.draft_tokens < 0) return fail("--draft must be >= 0");
     if (cfg.draft_ngram < 1) return fail("--draft-ngram must be >= 1");
     if (cfg.prefix_cache_mib < 0) return fail("--prefix-cache-mib must be >= 0");
+    // M9: --prefix-cache-reserve PCT is an option under auto-fit, not a
+    // standalone knob -- PCT 0 is a no-op indistinguishable from the flag
+    // never having been passed, so only a nonzero PCT is "the flag" for the
+    // three refusals below.
+    if (cfg.prefix_cache_reserve_pct != 0) {
+        if (cfg.prefix_cache_reserve_pct < 0 || cfg.prefix_cache_reserve_pct > 90) {
+            return fail(log::format("--prefix-cache-reserve must be 0..90, not %d",
+                                    cfg.prefix_cache_reserve_pct));
+        }
+        if (cfg.prefix_cache_mib <= 0) {
+            return fail("--prefix-cache-reserve needs --prefix-cache-mib > 0: "
+                        "there is nothing to reserve pages for otherwise");
+        }
+        if (cfg.n_ctx_explicit) {
+            return fail("--prefix-cache-reserve only applies under auto-fit: an explicit "
+                        "--n-ctx already defines the reserve as whatever remains after "
+                        "the request");
+        }
+    }
     if (cfg.fit_margin_mib < 0) return fail("--fit-margin-mib must be >= 0");
     if (cfg.gdn_checkpoint_budget_mib < 0) {
         return fail("--gdn-checkpoint-budget must be >= 0");

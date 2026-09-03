@@ -1,3 +1,33 @@
+marfrit-openvino (2026.4.0~dev20260821+p2-1) bookworm trixie; urgency=medium
+
+  * Ten more patches applied on top of +p1, same upstream commit
+    (71640275), same smallest-sufficient-divergence numbering:
+    - patches/0004: MoE OTD perf counters (evictions, acquisitions, slot
+      tiers, staging bytes).
+    - patches/0005: device-resident two-tier MoE expert slot pool behind
+      a per-compile byte budget.
+    - patches/0006: async batched slot uploads through a staging ring.
+    - patches/0007: drop the unconditional per-MoE-layer stream finish.
+    - patches/0008: an independent VALUE_CACHE_PRECISION option.
+    - patches/0009: the asymmetric KV kernel plan.
+    - patches/0010: the asymmetric decode kernel (u8 keys, i4 values).
+    - patches/0011: MoE host compute tier kernels (AVX2 and scalar for
+      the plugin's grouped-int4 layout, a thread pool, an mmap weight
+      accessor, counters, the MOE_CPU_TIER property; per-source -O3
+      because the graph library itself builds at -Os).
+    - patches/0012: MoE host compute tier decode-path redirect of LRU
+      capacity misses, the OpenCL kernel sentinel skip, the host
+      excursion.
+    - patches/0013: per-expert routing histogram, env
+      MOE_OTD_ROUTING_HIST.
+    patches/README.md carries what each one is for and the measured
+    numbers behind it.
+  * The runtime reports itself as 2026.4.0-22849-71640275d29-marfrit-p2,
+    so a version string in a log distinguishes this build from +p1 and
+    from the stock nightly.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Thu, 03 Sep 2026 10:00:00 +0200
+
 marfrit-openvino (2026.4.0~dev20260821+p1-1) bookworm trixie; urgency=medium
 
   * No longer a pure repack: the OpenVINO libraries are now built from source

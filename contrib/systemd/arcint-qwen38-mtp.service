@@ -8,6 +8,13 @@
 # and 36.9-37.3 with the reconstructed one, against 25.0 t/s with --mtp off;
 # draft acceptance 94-96% on code, 76-77% on prose; acceptance task 10/10.
 # DESIGN 7.0.2n.
+#
+# --n-ctx (0.2.13, M7 fit pass): 131072 is already a multiple of 4096, so it
+# is left as shipped. For reference, the measured admissible depth for this
+# model at u8 KV with MTP on is 155,568 tokens at an 8192 MiB prefix cache --
+# the admissible depth does not depend on the cache budget (only the spare
+# pages do), so 155,568 is this unit's ceiling at u8 with MTP on as well;
+# 131072 below stays a multiple of 4096 under it.
 
 [Unit]
 Description=arcint — Qwen3.8-27B on OpenVINO with MTP speculation, GPU.0, :8088

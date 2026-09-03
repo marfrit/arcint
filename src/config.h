@@ -72,6 +72,18 @@ struct Config {
     // this is a real budget, not a formality (§3.3).
     int prefix_cache_mib = 0;
 
+    // Percent of the auto-fit pool's own budget-affordable pages to hold
+    // back as spare for cached prefixes (M9, exec/fit.h's
+    // prefix_cache_reserve). 0 (default) is today's behaviour: auto-fit
+    // adopts the whole budget as live pages and the prefix cache gets
+    // whatever spare the allocation-time replay loop happens to leave,
+    // which with --n-ctx omitted is usually zero (the "0 spare pages"
+    // warning in backend_ov.cpp). Auto-fit only: an explicit --n-ctx
+    // already defines the reserve as whatever remains after the request,
+    // and needs --prefix-cache-mib > 0 -- there is nothing to reserve pages
+    // for otherwise. Range [0, 90]; validated in config.cpp.
+    int prefix_cache_reserve_pct = 0;
+
     // Headroom the auto-fit budget leaves unclaimed on the paged path
     // (M7, DESIGN §7.0.2s / the M7 design's §2-3). The only genuinely
     // *policy* term in the reservation -- every other term is measured, and a

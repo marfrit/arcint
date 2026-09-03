@@ -571,11 +571,18 @@ TEST(explicit_retry_must_trim_one_page_when_residual_overshoot_is_smaller_than_a
     CHECK_EQ(pass2_round1_retry.blocks, pass1.blocks);  // no trim at all -- the defect
 
     // The fix: cap wanted_spare with explicit_retry_spare_cap first,
-    // guaranteeing >= 1 page trimmed regardless of how small `over` is.
-    const size_t cap = explicit_retry_spare_cap(pass1.spare_blocks, over, block);
+    // guaranteeing a real (not just >= 1 page) trim regardless of how
+    // small `over` is. pass=0: this is the retry computed for the FIRST
+    // failed pass, same as every other call site in this file. Round-4
+    // review: the backoff floor's own baseline moved from 1 to 4 pages at
+    // pass 0 (auto_fit_backoff_pages(0) == 4 now, was 1 in round 3) --
+    // this fixture's analytic trim here (1 page, from `over` = 1 against
+    // block = 1000) is smaller than that floor, so the floor is what
+    // actually binds, and the guaranteed trim is 4 pages, not 1.
+    const size_t cap = explicit_retry_spare_cap(pass1.spare_blocks, over, block, /*pass=*/0);
     const PoolSizing pass2_fixed = pool_sizing(live, cap, budget_pass2, block);
     CHECK(pass2_fixed.blocks < pass1.blocks);
-    CHECK_EQ(pass1.blocks - pass2_fixed.blocks, 1ull);  // exactly the minimum guarantee
+    CHECK_EQ(pass1.blocks - pass2_fixed.blocks, 4ull);  // the pass-0 backoff floor, not 1
 }
 
 // Ties the fixture to the actual record: f1b's real overshoot (~0.07 GiB,
@@ -588,8 +595,13 @@ TEST(explicit_retry_spare_cap_reproduces_the_f1b_trim) {
     CHECK_EQ(pass1.blocks, 8554ull);
     CHECK_EQ(pass1.spare_blocks, 6503ull);
 
-    const size_t cap =
-        explicit_retry_spare_cap(pass1.spare_blocks, kF1bOvershootBytes, kKvBlockBytesM7Defect);
+    // pass=0: kept exactly as before -- auto_fit_backoff_pages(0)
+    // == 4 is smaller than the 129-page analytic trim this overshoot
+    // produces, so the floor never binds and the record's own 129-page
+    // trim is unchanged (round-3 review: "its 129-page case must still
+    // trim exactly 129 pages on pass 1").
+    const size_t cap = explicit_retry_spare_cap(pass1.spare_blocks, kF1bOvershootBytes,
+                                                kKvBlockBytesM7Defect, /*pass=*/0);
     CHECK_EQ(pass1.spare_blocks - cap, 129ull);  // the record's own trim count
 
     const PoolSizing accepted =
@@ -784,4 +796,436 @@ TEST(shrink_n_ctx_reduction_scales_with_lanes) {
     CHECK(two_lanes >= one_lane);  // two lanes need to give up fewer tokens each
     CHECK(two_lanes < n_ctx);
     CHECK(one_lane < n_ctx);
+}
+
+// M9: --prefix-cache-reserve PCT, an option under auto-fit. Reuses the
+// section's own defect-reproduction fixture (base_terms() / kDefectiveMaxCtx
+// = 1,172,016, kKvBlockTokens = 16) as "what the budget affords" -- the
+// fixture's own self-check above already proves fit_context lands there, so
+// affordable_pages = kDefectiveMaxCtx / kKvBlockTokens is exact (1,172,016
+// is a kKvBlockTokens multiple by construction: fit_context floors to one).
+constexpr long long kAffordablePages = kDefectiveMaxCtx / kKvBlockTokens;  // 73,251
+
+// PCT 0 must reproduce fit_context's own unreserved adoption exactly --
+// today's behaviour, unchanged.
+TEST(prefix_cache_reserve_pct_zero_reproduces_current_adoption_exactly) {
+    const FitResult          fit = fit_context(base_terms());
+    const PrefixCacheReserve r =
+        prefix_cache_reserve(fit.max_ctx / kKvBlockTokens, /*reserve_pct=*/0, kKvBlockTokens,
+                             /*n_ctx_floor=*/4096);
+    CHECK_EQ(r.adopted_n_ctx, fit.max_ctx);
+    CHECK_EQ(r.spare_pages, 0ll);
+    CHECK(r.admissible);
+}
+
+// PCT 25 yields a smaller adopted depth, with spare >= 25% of the total
+// affordable pages -- "at least PCT percent... remain spare", not exactly.
+TEST(prefix_cache_reserve_pct_25_yields_smaller_depth_with_at_least_25_pct_spare) {
+    const PrefixCacheReserve r =
+        prefix_cache_reserve(kAffordablePages, /*reserve_pct=*/25, kKvBlockTokens,
+                             /*n_ctx_floor=*/4096);
+    CHECK(r.adopted_n_ctx < kDefectiveMaxCtx);
+    CHECK(r.admissible);
+    // spare_pages * 100 >= 25 * affordable_pages, avoiding floating point.
+    CHECK(r.spare_pages * 100 >= 25 * kAffordablePages);
+    CHECK_EQ(r.live_pages + r.spare_pages, kAffordablePages);
+}
+
+// The adopted n_ctx is live_pages * kv_block_tokens by construction, so it
+// floors to a page multiple for any PCT in range -- checked at a PCT that
+// does not divide the affordable-page count evenly (73,251 * 63 / 100 is
+// not an integer).
+TEST(prefix_cache_reserve_adopted_n_ctx_floors_to_a_page_multiple) {
+    for (const int pct : {1, 7, 25, 50, 63, 89, 90}) {
+        const PrefixCacheReserve r =
+            prefix_cache_reserve(kAffordablePages, pct, kKvBlockTokens, /*n_ctx_floor=*/4096);
+        CHECK_EQ(r.adopted_n_ctx % kKvBlockTokens, 0ll);
+    }
+}
+
+// PCT 90 at this fixture's scale still clears the 4096 floor -- the reserve
+// does not refuse just because it is large, only when it pushes the
+// adopted depth below the floor (the next test).
+TEST(prefix_cache_reserve_pct_90_clears_the_floor_at_this_scale) {
+    const PrefixCacheReserve r =
+        prefix_cache_reserve(kAffordablePages, /*reserve_pct=*/90, kKvBlockTokens,
+                             /*n_ctx_floor=*/4096);
+    CHECK(r.admissible);
+    CHECK(r.adopted_n_ctx >= 4096);
+    CHECK(r.adopted_n_ctx < kDefectiveMaxCtx);
+}
+
+// The floor rule, stated and tested: a PCT that would push the adopted
+// depth below n_ctx_floor REFUSES (admissible = false) rather than
+// silently floating the adopted depth back up to the floor -- consistent
+// with fit_context's own admissible rule and with DESIGN's "never silently
+// lowered/raised" stance. 500 affordable pages at 16 tok/page = 8,000
+// tokens; PCT 90 leaves floor(500 * 10 / 100) = 50 pages = 800 tokens,
+// below the 4096 floor.
+TEST(prefix_cache_reserve_pct_90_below_the_floor_refuses) {
+    const PrefixCacheReserve r =
+        prefix_cache_reserve(/*affordable_pages=*/500, /*reserve_pct=*/90, kKvBlockTokens,
+                             /*n_ctx_floor=*/4096);
+    CHECK_EQ(r.adopted_n_ctx, 800ll);
+    CHECK(!r.admissible);
+}
+
+// reserve_pct is clamped to [0, 90] inside the pure function too (defence
+// in depth -- config.cpp already refuses out-of-range PCT before this ever
+// runs), so a value above 90 cannot silently reserve more than the
+// documented maximum.
+TEST(prefix_cache_reserve_pct_clamps_above_90) {
+    const PrefixCacheReserve at_90 =
+        prefix_cache_reserve(kAffordablePages, 90, kKvBlockTokens, 4096);
+    const PrefixCacheReserve above_90 =
+        prefix_cache_reserve(kAffordablePages, 200, kKvBlockTokens, 4096);
+    CHECK_EQ(at_90.adopted_n_ctx, above_90.adopted_n_ctx);
+}
+
+// H2 (round-2 review, HIGH): reserve.spare_pages is always > 0 for any
+// PCT in [1, 90] with affordable_pages > 0 (proved above), so gating a
+// warning on "spare_pages > 0" can never fire -- the real question is
+// whether the pool actually ACCEPTED at allocation time fell short of
+// what the reserve asked it to hold back.
+TEST(prefix_cache_reserve_shortfall_is_never_gated_by_spare_pages_alone) {
+    // spare_pages > 0 always holds for this fixture (25% of 73,251 pages);
+    // demonstrating the bug the old `!reserve_honoured` gate had: it is
+    // NOT a usable proxy for "did the accepted pool meet the ask".
+    const PrefixCacheReserve r =
+        prefix_cache_reserve(kAffordablePages, /*reserve_pct=*/25, kKvBlockTokens, 4096);
+    CHECK(r.spare_pages > 0);
+}
+
+// True: the accepted pool holds fewer spare pages than the reserve asked
+// for -- the real alarm (a memory-pressure retry, or --kv-pool-pages,
+// trimmed the reserve after it was computed).
+TEST(prefix_cache_reserve_shortfall_true_when_accepted_spare_is_below_the_ask) {
+    CHECK(prefix_cache_reserve_shortfall(/*accepted_spare_blocks=*/10, /*reserve_spare_pages=*/18313));
+    CHECK(prefix_cache_reserve_shortfall(/*accepted_spare_blocks=*/0, /*reserve_spare_pages=*/1));
+}
+
+// False: the accepted pool met or exceeded the ask -- the reserve was
+// actually honoured, nothing to warn about.
+TEST(prefix_cache_reserve_shortfall_false_when_accepted_spare_meets_or_exceeds_the_ask) {
+    CHECK(!prefix_cache_reserve_shortfall(/*accepted_spare_blocks=*/18313,
+                                          /*reserve_spare_pages=*/18313));
+    CHECK(!prefix_cache_reserve_shortfall(/*accepted_spare_blocks=*/20000,
+                                          /*reserve_spare_pages=*/18313));
+}
+
+// False: no reserve was ever requested (reserve_spare_pages <= 0) -- the
+// pre-existing zero-spare warning (gated on `prefix_cache_ != nullptr`
+// alone in backend_ov.cpp, not on this function) covers that case
+// instead, so this function must stay quiet rather than double-warn.
+TEST(prefix_cache_reserve_shortfall_false_when_nothing_was_reserved) {
+    CHECK(!prefix_cache_reserve_shortfall(/*accepted_spare_blocks=*/0, /*reserve_spare_pages=*/0));
+    CHECK(!prefix_cache_reserve_shortfall(/*accepted_spare_blocks=*/5, /*reserve_spare_pages=*/0));
+}
+
+// ------------------------------------------------------------------
+// Round 3, defect 2: reserve_ask_pool_pages -- unit conversion between
+// PrefixCacheReserve::spare_pages (per-lane) and spare_blocks (pool-wide,
+// net of the per-lane guard overhead).
+// ------------------------------------------------------------------
+
+// The review finding's own numbers, RED before reserve_ask_pool_pages
+// exists: 1 lane, drafts_max 0 (guard = 2 + ceil(0/16) = 2 pages), a
+// reserve that asked 18,313 per-lane KV pages. Compared directly (the
+// round-2 H2 call site), 18,313 vs an accepted 18,311 reads as a
+// 2-page shortfall on every load -- a false alarm. Converted to pool
+// units first, the ask is 18,313 - 2 = 18,311, matching the accepted
+// figure exactly: no shortfall.
+TEST(reserve_ask_pool_pages_removes_the_per_lane_guard_overhead) {
+    const long long ask = reserve_ask_pool_pages(/*reserve_spare_pages=*/18313, /*lanes=*/1,
+                                                 /*drafts_max=*/0, /*kv_block_tokens=*/16);
+    CHECK_EQ(ask, 18311ll);
+    CHECK(!prefix_cache_reserve_shortfall(/*accepted_spare_blocks=*/18311, ask));
+    // The pre-fix comparison (raw spare_pages, no conversion) would have
+    // flagged this as a shortfall -- demonstrating why the conversion is
+    // load-bearing, not cosmetic.
+    CHECK(prefix_cache_reserve_shortfall(/*accepted_spare_blocks=*/18311,
+                                         /*reserve_spare_pages=*/18313));
+}
+
+// Two lanes: the per-lane ask must scale by `lanes` to become pool-wide,
+// net of `lanes` lanes' worth of guard pages -- the round-2 fix's own
+// bug on more than one lane (it under-detected a real shortfall by a
+// factor of `lanes`, since it never multiplied by lanes at all).
+TEST(reserve_ask_pool_pages_scales_with_lanes) {
+    // guard_per_lane = 2 + ceil(3/16) = 2 + 1 = 3; ask = 1000*2 - 3*2 = 1994.
+    const long long ask = reserve_ask_pool_pages(/*reserve_spare_pages=*/1000, /*lanes=*/2,
+                                                 /*drafts_max=*/3, /*kv_block_tokens=*/16);
+    CHECK_EQ(ask, 1994ll);
+}
+
+// A very small reserve can be entirely consumed by the guard overhead --
+// clamped at 0 rather than going negative (a negative "ask" is not
+// meaningful, and prefix_cache_reserve_shortfall's own `> 0` guard would
+// otherwise need to special-case it).
+TEST(reserve_ask_pool_pages_clamps_at_zero) {
+    // guard_per_lane = 2 + ceil(100/16) = 2 + 7 = 9; 1 - 9 would be -8.
+    const long long ask = reserve_ask_pool_pages(/*reserve_spare_pages=*/1, /*lanes=*/1,
+                                                 /*drafts_max=*/100, /*kv_block_tokens=*/16);
+    CHECK_EQ(ask, 0ll);
+    CHECK(!prefix_cache_reserve_shortfall(/*accepted_spare_blocks=*/0, ask));
+}
+
+// ------------------------------------------------------------------
+// Round 3, defect 1: the auto-fit correction must shrink the POOL
+// TOTAL, not just live pages, or a driver allocation granule wider than
+// one KV page never converges within the replay loop's four passes.
+// ------------------------------------------------------------------
+
+// Simulates the driver rounding a requested pool (in pages) up to the
+// next multiple of `granule` -- standing in for the measured defect: the
+// driver's own allocation granule can be wider than one KV page, so a
+// pool that shrinks by less than one granule between passes reports the
+// SAME residency every time.
+size_t simulate_driver_pages(size_t pool_pages, size_t granule) {
+    if (granule <= 1) return pool_pages;
+    return ((pool_pages + granule - 1) / granule) * granule;
+}
+
+constexpr size_t kConvergeWantedSpare     = 1000000000;  // "the cache always wants more"
+constexpr size_t kConvergePoolMultiplier  = 2000;         // pool0 = kConvergePoolMultiplier * granule
+
+// Drives the SAME sequence backend_ov.cpp's Phase E loop runs (pool_
+// sizing, then auto_fit_trim on overshoot), purely in pool-page units:
+// lanes = 1 and kv_block_tokens = 1 so tokens, per-lane pages and
+// pool-wide pages all coincide -- the token<->page conversion is
+// auto_fit_trim's own concern (exercised for real by backend_ov.cpp),
+// this isolates the live/spare split and the backoff floor. `budget_
+// remaining` shrinks pass to pass by the accumulated measured overshoot,
+// mirroring backend_ov.cpp's own `overshoot_accum` -- this is what makes
+// pool_sizing's spare_room GROW as live shrinks (the actual mechanism
+// the pre-fix defect exploited: affordable moves toward live only
+// slightly, live moves down more, so spare_room = affordable - live
+// grows by roughly what live lost).
+//
+// Round-4 review correction: the round-3 version of this fixture used a
+// FIXED pool0 (110000) for every granule, which is an exact multiple of
+// some tested granules and not others -- for granule 32 specifically,
+// 110000 is NOT a multiple of 32, so the fixture's starting pool
+// happened to sit only 16 pages above a rounding boundary rather than at
+// the worst-case 32 pages, and convergence at pass 3 (21 cumulative
+// pages trimmed: the OLD schedule's 1+4+16) looked like it proved "up to
+// 32 pages" when it had only exercised a much easier case. The TRUE
+// worst case for a driver that rounds up to the next multiple of
+// `granule` is a pool that starts EXACTLY AT a granule boundary: from
+// there, no reduction smaller than a full `granule` pages can move the
+// rounded value AT ALL (ceil((k*G - d)/G)*G stays k*G for every 0 < d <
+// G), so the ceiling must be crossed by one clean granule-wide step.
+// `pool0 = kConvergePoolMultiplier * granule` is an exact multiple of
+// `granule` BY CONSTRUCTION, for every granule tested -- this is that
+// worst case, not a fixture that happens to converge.
+int converge_passes(size_t granule, bool protect_spare) {
+    const size_t     g     = std::max<size_t>(1, granule);
+    const size_t     pool0 = kConvergePoolMultiplier * g;
+    const size_t     live0 = pool0 / 2;  // the other half is realized as spare via pool_sizing below
+    long long        n_ctx = static_cast<long long>(live0);
+    size_t           spare_cap = static_cast<size_t>(-1);
+    long long        overshoot_accum = 0;
+    const long long  budget = static_cast<long long>(pool0);
+    // pool0 is an exact multiple of g, so simulate_driver_pages(pool0, g)
+    // == pool0 -- ceiling is one page short of that, the worst-case bound
+    // derived above.
+    const size_t ceiling = simulate_driver_pages(pool0, g) - 1;
+
+    for (int pass = 0; pass < 4; ++pass) {
+        const size_t     live_blocks  = static_cast<size_t>(n_ctx);
+        const size_t     capped_spare = std::min(kConvergeWantedSpare, spare_cap);
+        const long long  budget_remaining = budget - overshoot_accum;
+        const PoolSizing sizing =
+            pool_sizing(live_blocks, capped_spare, budget_remaining, /*kv_block_bytes=*/1);
+        const size_t observed = simulate_driver_pages(sizing.blocks, g);
+        if (observed <= ceiling) return pass;
+
+        const uint64_t over = observed - ceiling;
+        overshoot_accum += static_cast<long long>(over);
+        const AutoFitTrim trim =
+            auto_fit_trim(n_ctx, sizing.spare_blocks, over, /*kv_block_bytes=*/1, /*lanes=*/1,
+                         /*kv_block_tokens=*/1, /*n_ctx_floor=*/1, pass, protect_spare);
+        if (trim.refuse) return -1;
+        n_ctx     = trim.next_n_ctx;
+        spare_cap = trim.next_spare_cap;
+    }
+    return -1;
+}
+
+// RED before auto_fit_trim exists (compile error). Once implemented: the
+// HONEST bound (round-4 review correction of the round-3 claim) is that
+// this loop's four passes can only ever apply the backoff floors from
+// the first THREE failed passes before the fourth (last) check runs --
+// the trim computed on the pass that fails that fourth check is never
+// allocated or re-checked. With the corrected schedule (4, 16, 64, 256
+// for passes 0..3), that is 4 + 16 + 64 = 84 pool pages, cumulative,
+// available by the time the last check runs -- so a driver rounding
+// granule up to and including 84 KV pages converges within the existing
+// four-pass budget (checked here at the worst-case alignment for every
+// value in the sweep, not merely at some particular pool size that
+// happens to work); a granule of 85 or more genuinely cannot be
+// guaranteed and refuses loudly instead (also checked here), which is
+// the honest, not the false, half of the round-3 claim.
+TEST(auto_fit_converges_within_four_passes_for_granules_up_to_84_and_refuses_beyond) {
+    for (size_t granule : {size_t(1), size_t(2), size_t(4), size_t(8), size_t(16), size_t(32),
+                           size_t(64), size_t(84)}) {
+        const int no_reserve = converge_passes(granule, /*protect_spare=*/false);
+        CHECK(no_reserve >= 0);
+        const int with_reserve = converge_passes(granule, /*protect_spare=*/true);
+        CHECK(with_reserve >= 0);
+    }
+    // Beyond the guaranteed bound: refuses loudly (does not converge
+    // within four passes) rather than silently claiming a guarantee it
+    // cannot back up, for either split rule.
+    CHECK_EQ(converge_passes(/*granule=*/85, /*protect_spare=*/false), -1);
+    CHECK_EQ(converge_passes(/*granule=*/85, /*protect_spare=*/true), -1);
+}
+
+// The mechanism the fix relies on, stated as its own invariant: the
+// spare cap auto_fit_trim hands back for the next pass never exceeds
+// what the pool actually realized as spare THIS pass -- if it could,
+// pool_sizing's own room growth (affordable - live_blocks widening as
+// live shrinks) would re-inflate spare right back, which is the whole
+// defect. True regardless of protect_spare, since both branches compute
+// `next_spare_cap = spare_blocks - spare_cut` with `spare_cut >= 0`.
+TEST(auto_fit_trim_spare_cap_never_exceeds_current_spare_blocks) {
+    for (bool protect_spare : {false, true}) {
+        const AutoFitTrim trim =
+            auto_fit_trim(/*n_ctx=*/100000, /*spare_blocks=*/10000,
+                         /*over=*/1, /*kv_block_bytes=*/1, /*lanes=*/1, /*kv_block_tokens=*/1,
+                         /*n_ctx_floor=*/1, /*pass=*/0, protect_spare);
+        CHECK(trim.next_spare_cap <= 10000ull);
+    }
+}
+
+// protect_spare = true never touches spare while live still has room:
+// the reserve's own headroom must be the LAST thing to give, not the
+// first.
+TEST(auto_fit_trim_protects_spare_while_live_has_room) {
+    const AutoFitTrim trim =
+        auto_fit_trim(/*n_ctx=*/100000, /*spare_blocks=*/10000,
+                     /*over=*/1, /*kv_block_bytes=*/1, /*lanes=*/1, /*kv_block_tokens=*/1,
+                     /*n_ctx_floor=*/1, /*pass=*/0, /*protect_spare=*/true);
+    CHECK_EQ(trim.next_spare_cap, 10000ull);  // unchanged -- spare untouched
+    CHECK(trim.next_n_ctx < 100000);          // live gave up the trim instead
+}
+
+// protect_spare = false is the mirror image: spare gives first, live is
+// untouched as long as spare alone can cover the trim.
+TEST(auto_fit_trim_spends_spare_first_without_a_reserve) {
+    const AutoFitTrim trim =
+        auto_fit_trim(/*n_ctx=*/100000, /*spare_blocks=*/10000,
+                     /*over=*/1, /*kv_block_bytes=*/1, /*lanes=*/1, /*kv_block_tokens=*/1,
+                     /*n_ctx_floor=*/1, /*pass=*/0, /*protect_spare=*/false);
+    CHECK_EQ(trim.next_n_ctx, 100000ll);      // unchanged -- live untouched
+    CHECK(trim.next_spare_cap < 10000ull);    // spare gave up the trim instead
+}
+
+// The floor is never crossed: once live has no more room and spare is
+// also exhausted, auto_fit_trim refuses rather than lowering n_ctx below
+// n_ctx_floor.
+TEST(auto_fit_trim_refuses_at_the_floor_with_nothing_left) {
+    const AutoFitTrim trim =
+        auto_fit_trim(/*n_ctx=*/4096, /*spare_blocks=*/0,
+                     /*over=*/1'000'000, /*kv_block_bytes=*/1, /*lanes=*/1,
+                     /*kv_block_tokens=*/16, /*n_ctx_floor=*/4096, /*pass=*/3,
+                     /*protect_spare=*/false);
+    CHECK(trim.refuse);
+}
+
+// ------------------------------------------------------------------
+// Round 4 review, defect 2: the round-3 granule fixture above used
+// kv_block_bytes = 1 and an `over` of a WHOLE page, so even the ORIGINAL
+// (pre-round-3, shrink-only) correction already reduced the pool total
+// there -- it never modelled the actual measured defect. The real
+// measured cells overshot by a fraction of one KV page: kv_block_bytes
+// is thousands of bytes (36.2 KiB/token-class numbers elsewhere in this
+// file), and the driver's residency reading can land only a few bytes
+// past the ceiling. With kv_block_bytes = 4096 and over = 1 BYTE,
+// overshoot_accum stays inside the SAME `affordable = budget_remaining /
+// kv_block_bytes` bucket every pass (1 byte a pass, 4096 bytes wide) --
+// so `affordable` never moves, and a shrink-only correction's own
+// textbook behaviour is exactly what DESIGN's own defect diagnosis
+// named: live -1 page (shrink_n_ctx's guaranteed minimum), spare +1 page
+// (pool_sizing's spare_room = affordable - live_blocks grows by exactly
+// what live lost), pool TOTAL flat.
+// ------------------------------------------------------------------
+
+constexpr uint64_t kSubPageBlockBytes = 4096;  // kv_block_bytes for this fixture
+constexpr uint64_t kSubPageOverBytes  = 1;     // over, in BYTES -- far below one page
+constexpr size_t   kSubPageLive0      = 100000;
+// `+ kSubPageBlockBytes / 2` is deliberate slack WITHIN the current
+// `affordable = budget_remaining / kv_block_bytes` bucket: an exact
+// multiple of kv_block_bytes sits ON a bucket boundary, so subtracting
+// even 1 byte from an exact multiple drops `affordable` by a whole page
+// immediately -- the opposite of the sub-page scenario this fixture
+// means to model, where the budget stays inside the SAME bucket across
+// all four passes (cumulative overshoot_accum here is at most 4 bytes,
+// far under the 2048-byte slack).
+constexpr long long kSubPageBudget =
+    static_cast<long long>(kSubPageLive0 + 2000) * static_cast<long long>(kSubPageBlockBytes) +
+    static_cast<long long>(kSubPageBlockBytes) / 2;
+
+// A stub of the ORIGINAL (pre-round-3) auto-fit correction: shrink_n_ctx
+// on n_ctx directly, spare cap left untouched forever (SIZE_MAX, i.e.
+// never narrowed) -- exactly backend_ov.cpp's own logic before round 3
+// introduced auto_fit_trim and a shared spare_cap. Kept ONLY in this test
+// file for the red-first comparison below; production no longer has this
+// code path (backend_ov.cpp's Phase E calls auto_fit_trim now).
+std::vector<size_t> sub_page_blocks_history(bool use_fix) {
+    long long  n_ctx           = static_cast<long long>(kSubPageLive0);
+    size_t     spare_cap       = static_cast<size_t>(-1);
+    long long  overshoot_accum = 0;
+    std::vector<size_t> history;
+    for (int pass = 0; pass < 4; ++pass) {
+        const size_t     live_blocks      = static_cast<size_t>(n_ctx);
+        const size_t     capped_spare     = std::min<size_t>(1000000000, spare_cap);
+        const long long  budget_remaining = kSubPageBudget - overshoot_accum;
+        const PoolSizing sizing =
+            pool_sizing(live_blocks, capped_spare, budget_remaining, kSubPageBlockBytes);
+        history.push_back(sizing.blocks);
+
+        overshoot_accum += static_cast<long long>(kSubPageOverBytes);
+        if (use_fix) {
+            const AutoFitTrim trim =
+                auto_fit_trim(n_ctx, sizing.spare_blocks, kSubPageOverBytes, kSubPageBlockBytes,
+                             /*lanes=*/1, /*kv_block_tokens=*/1, /*n_ctx_floor=*/1, pass,
+                             /*protect_spare=*/false);
+            n_ctx     = trim.next_n_ctx;
+            spare_cap = trim.next_spare_cap;
+        } else {
+            // The old, defective correction: live shrinks by shrink_n_ctx's
+            // own guaranteed minimum (>= 1 page); spare_cap is simply
+            // never touched -- the defect this whole round exists to fix.
+            n_ctx = shrink_n_ctx(n_ctx, kSubPageOverBytes, kSubPageBlockBytes, /*lanes=*/1,
+                                 /*kv_block_tokens=*/1);
+        }
+    }
+    return history;
+}
+
+// RED (round-4 report, verbatim): wired to the OLD stub (use_fix=false),
+// this fails at the very first comparison -- pass 1's pool total equals
+// pass 0's exactly, not less, because spare absorbs live's entire cut.
+// Wired to auto_fit_trim (use_fix=true, the assertion actually shipped
+// here), it passes: every pass's pool total is strictly smaller than the
+// one before it.
+TEST(sub_page_overshoot_pool_total_strictly_decreases_every_pass) {
+    const std::vector<size_t> history = sub_page_blocks_history(/*use_fix=*/true);
+    CHECK_EQ(history.size(), 4ull);
+    for (size_t i = 1; i < history.size(); ++i) {
+        CHECK(history[i] < history[i - 1]);  // strictly decreasing, every pass
+    }
+}
+
+// The defect, reproduced explicitly and by construction: the OLD stub's
+// sequence is not merely "not guaranteed to decrease" but perfectly
+// FLAT -- live -1 page each pass is exactly cancelled by spare +1 page,
+// so the pool total does not move at all across all four passes.
+TEST(sub_page_overshoot_old_shrink_only_logic_leaves_pool_total_flat) {
+    const std::vector<size_t> history = sub_page_blocks_history(/*use_fix=*/false);
+    CHECK_EQ(history.size(), 4ull);
+    for (size_t i = 1; i < history.size(); ++i) {
+        CHECK_EQ(history[i], history[0]);  // flat, the defect
+    }
 }

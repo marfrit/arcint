@@ -105,6 +105,32 @@ through the acceptance harness yet. At production context (155648) the MTP
 head serves at 36.2 t/s and 93.2% acceptance, 10/10 greedy. Prefill on the
 coder reaches ~1970 t/s.
 
+**Expert offload and the host tier on the 16 GiB card** (35B int4, u8 KV,
+one lane, n_ctx 65,536, 64 greedy tokens). The host compute tier
+(`--moe-cpu-tier`) computes capacity-miss experts on the CPU instead of
+uploading them over PCIe:
+
+| device pool | upload path | host tier |
+|---|---|---|
+| ratio 50 / 8 GiB | 10.4/10.6 t/s | **15.0/15.5 t/s** |
+| ratio 75 / 5 GiB | 7.4/7.5 t/s | **14.1/14.8 t/s** |
+
+Text output byte-identical over 64 greedy tokens between the two paths at both ratios; acceptance
+task 10/10 at ratio 50 / 8 GiB (the ratio-75 cell has the text identity, no
+acceptance run).
+
+**Context by KV precision.** `--paged-kv u8:i4` (asymmetric key/value
+precision) against the `u8` default, same artifact, same card:
+
+| model | card | u8 auto-fit | u8:i4 auto-fit | gain |
+|---|---|---|---|---|
+| coder | 16 GiB card | 133,456 | 171,312 | +28% |
+| dense 27B agent, MTP on | 24 GB card | 155,376 | 199,424 | +28% |
+
+u8:i4 costs 8.8 KiB/token against u8's 11.3, and scores 10/10 on the
+acceptance task. Owed before it becomes the default: the prefill price, and
+prefix byte-exactness.
+
 ## Scope
 
 **Models** (these, and nothing else). Geometry read off the IRs on 2026-08-28
@@ -369,8 +395,14 @@ reference implementation the equivalence suite compares against.
 | M4 MTP | done and served — 36.2 t/s at 93.2% acceptance, 10/10 greedy |
 | M5 all three models | done — the 35B fits the A770 too, via `--offload-ratio` |
 | M6 two lanes per service | done — byte-identical under interleaving on both cards, 10/10 on each lane concurrently |
+| M7 fit pass | done — two-ledger reservation measured; an explicit `--n-ctx` is verify-only, never lowered, and its refusal trims the prefix-cache reserve first |
+| M8 asymmetric KV (`--paged-kv u8:i4`) | done — serves, 10/10; +28% context (8.8 vs 11.3 KiB/token); owed: prefill price, prefix byte-exactness |
+| M9 device-tier expert slot pool | done — 35B on the 16 GiB card 0.4 t/s (ratio 25, unpatched) → 9.1 (ratio 50 / 8 GiB pool, 16-token probe) and 10.4 (64-token probe) |
+| M12 dispatch pin, tiled exporter | done — `--pin-dispatch` measured null on a quiet host, opt-in; exporter `--moe-lowering tiled` |
+| M13 vision reserved | done — `--vision` refused; vision IRs reported at load and never loaded (coder: 6 files, 428.3 MiB on disk) |
+| M14 host compute tier (`--moe-cpu-tier`) | done — 35B on the 16 GiB card 15.0/15.5 t/s vs 10.4/10.6 at ratio 50 / 8 GiB; 14.1/14.8 vs 7.4/7.5 at ratio 75 / 5 GiB; text byte-identical, 10/10 |
 
-Verification: 182 unit cases, a 61-check curl round-trip, a lane-accounting
+Verification: 287 unit cases, a 61-check curl round-trip, a lane-accounting
 stress (200 requests, 24-way, 8 lanes, queueing and refusing), an equivalence
 suite and a concurrency suite that run where the card is. Clean under ASan and
 UBSan on x86_64.
@@ -391,6 +423,19 @@ GDN checkpoint rows and KV for two concurrent sequences at the configured
 `--n-ctx`, and refuses at startup with the arithmetic if the card cannot hold
 them. If a deployment would rather queue than be refused at request time, set
 `--queue-timeout S`.
+
+`--n-ctx` decides who owns the prefix-cache reserve pages. Omitted, the M7
+fit pass adopts the maximum admissible depth itself, and the prefix cache
+gets no reserve pages of its own unless
+`--prefix-cache-reserve PCT` holds that share of the affordable pages spare
+(the dense agent at 25%: 116,528 adopted with 2,428 pages spare, against
+155,376 with none). Given explicitly, it is verify-only —
+never lowered on its own — and a refusal at that depth first trims the
+prefix-cache reserve before it is itemized; the pool is sized in bytes, and
+`--paged-kv u8:i4` (asymmetric key/value precision, +28% context on the
+measurements above) changes what fits in it. Ship a unit's `--n-ctx` as a
+multiple of 4096 below the admissible depth actually measured for its card,
+precision and prefix-cache budget, not the model's own trained maximum.
 
 `packaging/arcint.service` is a systemd **user** unit. Its flags are literal
 rather than `${ARCINT_PORT}` out of an environment file: the fleet's unit

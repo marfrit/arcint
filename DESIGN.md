@@ -3247,6 +3247,29 @@ ceiling corollary below, applied per retry pass instead of per `--n-ctx`
 value — the request itself is a fixed count and, same as live pages above,
 cannot absorb it.
 
+With `--n-ctx` omitted the split runs the other way: the fit pass adopts the
+maximum admissible depth, the pool is all live pages, and the reserve for
+cached prefixes is nil — the load says so in a warning (measured on both
+served configurations, 2026-09-03: 0 spare pages at 155,376 and at 171,312).
+`--prefix-cache-reserve PCT` (0.2.13) holds PCT of the affordable pages
+spare under auto-fit and adopts the correspondingly lower depth; it is
+refused with an explicit `--n-ctx`, whose reserve is whatever remains by
+construction, and below the 4096-token floor.
+
+The correction pass itself had a blind spot that only a pool with spare
+pages could show (measured 2026-09-03: the coder at a 25% reserve and the
+35B at auto-fit on the 24 GB card each sat at the ceiling for four passes,
+at 100,224/100,080/100,064/100,048 and 262,144/260,080/260,064/260,048):
+a sub-page overshoot trimmed one live page, the spare absorbed it, and the
+pool total — what the driver actually rounds — never moved. The correction
+now trims the pool total, spare first unless a reserve was asked for, with
+a per-pass floor of 4/16/64/256 pages, which converges for any allocation
+granule up to 84 pages when the first overshoot is itself below one granule
+(the rounding case measured here) and refuses loudly, with the attempt
+history, above that. Both cells come up: 100,080 with 2,086 pages spare and 262,144 with
+6,816. The zero-spare cells cut 11–12 pages analytically on their first
+pass, above the floor, and adopt the same 155,376 and 171,312 as before.
+
 Checked against both configurations to the page: 37918 − 16386 = 21532 and
 21477 − 16386 = 5091, with `262144 / 16 + 2 = 16386` in each. So **everything
 that costs bytes comes out of the reserve, because the live side is a count and
