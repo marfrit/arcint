@@ -511,6 +511,21 @@ different nightly is a different ABI.
   drafter disables itself for the process (decode continues without
   drafts). Every DFlash number on the record was taken with prompts under
   2,048 tokens.
+- `--paged-kv u8:i4` (unpatched plugin -- the level in this tree before
+  patch 0015): a prefill crashes with a GPU engine reset on the 24 GB
+  card once the prompt reaches 98,304 tokens (384 attention partitions of
+  256), with a 131,072-token pool -- 97,847 tokens pass, 98,147 tokens
+  crash, and so does 119k. Plain u8 is unaffected: it takes the
+  micro-SDPA path and allocates no such buffers. The 16 GiB card serves
+  the same cells; it has no GPU fault reporting, and why the fault does
+  not surface there is not measured. The plugin's own
+  single-execute harness passes at 170,000 tokens. Two plugin-side
+  changes each clear it on the card: patch 0015's forced
+  kernel-argument rebind after an intermediate-buffer reallocation, and
+  a one-hunk fresh sizing of those buffers (patch 0016, written, not in
+  any package); which one is the writer is under measurement. Until a
+  plugin level carrying either ships, treat `--paged-kv u8:i4` prompts
+  beyond about 98k tokens as unsafe on cards that report GPU faults.
 
 - Drafting II measured (M11, `DESIGN.md` §7.0.2z): four host-side levers on
   the DFlash2 chain, all free of training. Viterbi over the selector's

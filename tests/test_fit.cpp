@@ -1453,6 +1453,35 @@ TEST(prefill_chunk_cap_packed_values_171312_caps_to_32) {
     CHECK_EQ(capped, 32);
 }
 
+// n_ctx 165,680 (10,355 pages of 16 -- --kv-block-size 16, not this file's
+// usual 32, so `block_size` is passed explicitly rather than via
+// `kCoderKvBlockSize`): the depth the card's own auto-fit adopts under the
+// PATCHED plugin with --paged-attention-max-partitions 32 (CHANGELOG's own
+// MEASURED entry). This is the UNBOUNDED-arm reading of that same depth --
+// what the term would cost with the bound key absent (element 4 B, the
+// unpatched-plugin shape) -- ceil(165680/256) = 648 partitions: chunk 128
+// is 1,296 MiB, chunk 64 is 648 MiB, chunk 32 is 324 MiB -- the first to
+// land under the 512 MiB budget, so the belt shrinks two steps, not one.
+TEST(prefill_chunk_cap_packed_values_165680_unbounded_shrinks_128_to_32) {
+    const int capped = prefill_chunk_cap_for_packed_values(
+        128, 165680, kCoderHeads, kCoderHeadSize, kScratchBudget, /*block_size=*/16);
+    CHECK_EQ(capped, 32);
+}
+
+// The term itself at the chunk the belt above settled on: the per-token
+// rate at chunk 32 is a property of the chunk alone (3,072 B = 3 KiB,
+// the same figure packed_values_prefill_scratch_bytes_per_token_chunk32_
+// is_3_kib already establishes independent of depth) and the EXACT total
+// at this specific depth (165,680) is 509,607,936 B = 486.0 MiB (chunk 32
+// x 16 query heads x 256 head_dim x 4 B x 648 partitions x1.5 margin,
+// exact -- (3 x 339,738,624 + 1) / 2 with no remainder).
+TEST(packed_values_prefill_scratch_bytes_at_165680_chunk32) {
+    CHECK_EQ(packed_values_prefill_scratch_bytes_per_token(32, kCoderHeads, kCoderHeadSize),
+             3072ull);
+    CHECK_EQ(packed_values_prefill_scratch_bytes(32, 165680, kCoderHeads, kCoderHeadSize),
+             509607936ull);
+}
+
 // n_ctx 8,192: a shallow served pool. Chunk 128 is 128 x 16 KiB x 32
 // partitions (ceil(8192/256) = 32) = 64 MiB -- comfortably under the
 // 512 MiB budget -- so the request already satisfies it and comes back
@@ -2646,6 +2675,82 @@ TEST(explicit_n_ctx_at_depth_belt_disabled_charges_nothing) {
     CHECK_EQ(at_depth.fixed_bytes, 0ull);
     CHECK_EQ(at_depth.per_token_bytes, 0ull);
     CHECK_EQ(at_depth.fit.max_ctx, plain.max_ctx);  // exactly the term-free fit
+}
+
+// n_ctx 165,680 (10,355 pages of 16), the BOUNDED-arm reading: the depth
+// the card's own auto-fit adopted under the patched plugin with
+// --paged-attention-max-partitions 32 (CHANGELOG's own MEASURED entry:
+// "auto-fit lands at n_ctx 165,680 with chunk 128, 48.5 MiB of scratch
+// charged"). `r8_terms()` cannot be reused as-is here -- it fixes
+// `kv_block_tokens` at 32 (`kR8KvBlockTokens`), and 165,680 is not a
+// multiple of 32 (165,680 / 32 = 5,177.5; it IS a multiple of 16, the
+// card's own --kv-block-size for this measurement) -- so the fixture is
+// built inline with the SAME weights/total/margin/KV-bytes-per-token the
+// rest of this file calls "the card constants," `kv_block_tokens = 16`.
+// The bound caps partitions at 32 regardless of depth once
+// ceil(n_ctx/256) exceeds it (ceil(165680/256) = 648 > 32), so the proxy
+// the belt checks is chunk x 16 heads x 256 head_dim x 2 B x 32
+// partitions = 32 MiB -- comfortably under the 512 MiB budget -- and the
+// belt leaves chunk 128 untouched (no shrink needed at all, unlike the
+// unbounded reading of this same depth two tests above, which shrinks to
+// 32). The charged term is tmp_out (margined, 2-byte elements) 48.0 MiB
+// + exp_sums/max_logits (always 4-byte, unaffected by the element width)
+// 0.5 MiB = 48.5 MiB exactly -- the same figure the card logged.
+namespace {
+FitTerms r8_terms_kv16(uint64_t activation) {
+    FitTerms t     = r8_terms(activation);
+    t.kv_block_tokens = 16;
+    return t;
+}
+}  // namespace
+
+TEST(explicit_n_ctx_at_165680_bounded_n32_admits_with_the_card_constants) {
+    const FitTerms base = r8_terms_kv16(kR8ActivationCorrect);
+    const PackedValuesFitTerm at_depth = fit_context_packed_values_at_depth(
+        base, /*requested_chunk=*/128, kCoderHeads, kCoderHeadSize, kScratchBudget,
+        /*block_size=*/16, /*depth=*/165680, /*max_partitions=*/32, /*element_bytes=*/2);
+    CHECK_EQ(at_depth.chunk, 128);              // the bound proxy (32 MiB) never needed to shrink
+    CHECK_EQ(at_depth.fixed_bytes, 50855936ull);  // 48.0 MiB tmp_out + 0.5 MiB exp/max = 48.5 MiB,
+                                                  // the exact figure the card logged
+    CHECK_EQ(at_depth.fit.max_ctx, 312496);
+    CHECK(at_depth.fit.max_ctx >= 165680);  // admits the depth the card actually adopted
+    CHECK(at_depth.fit.admissible);
+}
+
+// The explicit round trip at 165,680, bounded arm: NOT two calls to the
+// same function (F3's own standing objection to a trivial round trip) --
+// a REAL SEARCH (`fit_context_packed_values`, seeded from the operator's
+// own default chunk 2048, NOT 128, so the belt has to do real work to
+// arrive there) at an activation level engineered so the search's own
+// fixed point settles EXACTLY at max_ctx 165,680, compared against
+// `fit_context_packed_values_at_depth` evaluated directly at that SAME
+// depth -- the two independent primitives (search vs. exact-at-a-known-
+// depth) must agree on both the served chunk and the charged term, the
+// same "search vs. at_depth" contract every other round-trip test in
+// this file drives through the real functions.
+TEST(auto_fit_search_at_165680_bounded_agrees_with_the_explicit_round_trip) {
+    // Engineered activation (~1,517.7 MiB) chosen so the bounded search's
+    // flat 48.5 MiB term (unaffected by depth, once partitions hit the
+    // N=32 bound) leaves a budget that divides out to exactly 165,680 at
+    // this fixture's KV bytes/token (9,011) and 16-token KV page.
+    constexpr uint64_t kActivationFor165680 = 1591455623ull;
+    const FitTerms      base                = r8_terms_kv16(kActivationFor165680);
+
+    const PackedValuesFitTerm search = fit_context_packed_values(
+        base, /*requested_chunk=*/2048, kCoderHeads, kCoderHeadSize, kScratchBudget,
+        /*block_size=*/16, /*belt_enabled=*/true, /*max_partitions=*/32, /*element_bytes=*/2);
+    CHECK_EQ(search.chunk, 128);
+    CHECK_EQ(search.fit.max_ctx, 165680);
+    CHECK_EQ(search.fixed_bytes, 50855936ull);
+
+    const PackedValuesFitTerm resubmitted = fit_context_packed_values_at_depth(
+        base, /*requested_chunk=*/2048, kCoderHeads, kCoderHeadSize, kScratchBudget,
+        /*block_size=*/16, /*depth=*/search.fit.max_ctx, /*max_partitions=*/32,
+        /*element_bytes=*/2);
+    CHECK_EQ(resubmitted.chunk, search.chunk);           // served == priced
+    CHECK_EQ(resubmitted.fit.max_ctx, search.fit.max_ctx);  // the round trip reproduces itself
+    CHECK_EQ(resubmitted.fixed_bytes, search.fixed_bytes);
+    CHECK(resubmitted.fit.admissible);
 }
 
 // Round-10 review, finding 1 (REAL defect, retracts round-9's own claim

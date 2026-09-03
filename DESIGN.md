@@ -3366,7 +3366,35 @@ plugin crashes at a 131,072-token pool with that prompt, so the
 consequence of the bad access depends on the card and on what lies
 beyond the buffer, and the plugin's own paged-attention harness, which
 runs one primitive once, passes at 170,000 tokens of past in every
-configuration tried — the defect needs the served path's structure; the exact boundary
+configuration tried — the defect needs the served path's structure. On the 24 GB card with the
+unpatched plugin, the same 131,072-token pool and chunk 128, a
+97,727-token prompt (382 partitions of 256) prefills and a prompt of
+about 100,000 tokens (391 partitions) crashes with an engine reset, as
+does 119k: a tight bracket puts the threshold at 384 partitions (383 passes, 384
+crashes), one short of where the finalization kernel would leave its
+register path, so that switch is not it; a larger intermediate buffer at chunk 256 (203 partitions, 812 MiB)
+passes, so the buffer's size is not it either — the count of 256-token
+partitions is, at 384 exactly, one inside the register arm's capacity;
+and then the patched plugin at its unbounded setting passed that very
+cell, and the 119k one, where the unpatched one crashes. What the patch changes at
+that setting is the f16 sizing of the intermediate output and the
+argument rebind after a reallocation; the rebind explains every
+observation at once — the unpatched kernels keep running on a handle
+the framework has freed after each growth reallocation, harmless while
+that memory stays mapped and fatal where it does not, invisible to a
+single-execute harness, absent at u8 which allocates no such buffer,
+and the fix that turned the 56k cell green — and a second reading has the plugin sizing those buffers from the
+previous forward's partition count, so that the first chunk into a new
+partition writes one partition past the buffer; a build carrying only
+the fresh sizing passes 384 and 466 partitions on that card too. Two
+single changes each clear the crash, so either both defects are real or
+one fix merely shifts the other's reallocation pattern; a build carrying
+only the rebind is the discriminator that decides which, and patch 0016
+(the fresh sizing) is written and waiting on it. The 16 GiB card's failure at the
+bound with the 165,680-token pool is a different animal: the same 119k
+cell crashed three times and passed twice the same evening, so on that
+card the fault is not deterministic and the bound's own path is not
+what faults; the exact boundary
 between 131k and 165k tokens is the open question (no constant of 8,192
 or 131,072 exists on this path in the plugin, the patches or the engine,
 and the device's single-allocation limits are far away); the binding fix stays in the patch as a real defect fixed,
