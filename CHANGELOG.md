@@ -80,7 +80,12 @@ different nightly is a different ABI.
   the per-node profile at that depth over-counts the step about 35x and is
   flat across one, two and four tokens, so it cannot see this;
   `ARCINT_PROFILE_MWALL` (new) times the forward per token count at depth
-  instead. Serve deep contexts with `--mtp off` until it is explained.
+  instead: at 76k a 1-token forward takes 104 ms and 2, 4 or 8 tokens all
+  take about 209 ms (at depth 1: 80 vs 86-88 ms), so every verify forward
+  costs two plain steps at depth -- the drafter tax that puts DFlash at
+  half plain with 0% acceptance -- and the MTP-serving forward's 763 ms
+  against the plain graph's 211 ms for the same two tokens is not yet
+  explained. Serve deep contexts with `--mtp off` until it is.
 - `--paged-kv u8:i4`: a 141,902-token prefill on the coder (16 GiB card,
   auto-fit 171,312) failed with a GPU out-of-resources error and every
   later request in that process failed with it; prompts up to 8,909

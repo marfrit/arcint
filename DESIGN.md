@@ -3174,8 +3174,36 @@ at 76,000 the node totals come to 3.4–3.7 s per capture for a step whose
 wall is under 0.1 s, the engine's own caveat line fires, and the table is
 flat across one, two and four tokens (paged attention 2.23, 2.37 and
 2.41 s in counter terms). A wall clock of the forward per token count at
-depth is the measurement that can see it; the hook is in and its numbers
-follow in this section.
+depth is the measurement that can see it. `ARCINT_PROFILE_MWALL` times
+the paged forward per token count at a depth, ten repetitions each, the
+past walked in served chunks (the hook's first run timed depth 1 by
+reading the wrong variable, and its second forwarded the whole past in
+one chunk and was refused by the card; both are in the record). The
+dense 27B agent on the 24 GB card, u8, pseudo-random tokens, wall clock
+per step:
+
+| tokens per forward | at depth 1 | at 76,000 |
+|---|---|---|
+| 1 | 79.8 ms | 103.6 ms |
+| 2 | 88.2 ms | 211.1 ms |
+| 4 | 85.8 ms | 208.4 ms |
+| 8 | 87.4 ms | 208.8 ms |
+
+At depth a two-token forward costs twice a one-token forward, and four
+or eight tokens cost the same as two: the plugin runs a different
+attention stage once the query has more than one token, and at 76k that
+stage costs about 208 ms whatever the token count, against 104 ms for
+the single-token stage. Near depth 0 the same switch costs 10%. That is
+the drafter tax at depth, measured: every verify forward pays two plain
+steps, so a drafter breaks even only when it lands one accepted token
+per cycle on average, and at 0% acceptance it runs at half plain — which
+is where DFlash sits at 76k (5.3 t/s against a 209 ms cycle's 4.8, with
+plain at 16.3 on the served path). The MTP arm is worse than that
+accounts for: its served verify forward of two tokens takes 763 ms
+where the plain two-token forward takes 211 ms, and the 550 ms between
+the plain graph and the MTP-serving path is not measured; the same sweep
+with `--mtp on` is the next discriminator, not run. What the sweep does
+not say is why either drafter accepts nothing at 76k.
 
 #### 7.0.2r DFlash2: the external-drafter hook gets a real drafter (2026-09-01)
 

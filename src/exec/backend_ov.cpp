@@ -4901,8 +4901,13 @@ private:
         // paged path, because this is the path production serves
         // (--paged-kv); profile_step's stateful path gets the same sweep too,
         // for whichever build has --no-paged instead.
+        // The sweep's depth is ARCINT_PROFILE_PAST when set (the first run of
+        // this hook timed M=1..8 "at depth 1" because it read the capture
+        // depth, which ARCINT_PROFILE=1 sets to one token), else ARCINT_PROFILE.
+        const size_t mwall_depth = past > 0 ? past : depth;
         for (size_t m : profile_mwall_list()) {
             if (m == 0) continue;
+            const size_t depth = mwall_depth;
             release_lane(lane);
             zero_paged_rows(lane);
             int reps = 10;
@@ -4922,7 +4927,15 @@ private:
             // Same reset-and-prefill the sweep above does per M, so every M
             // starts from the same depth instead of compounding on the last
             // M's growth.
-            paged_forward(lane, embed_paged(lane, make_tokens(depth)), 0, {0}, 0, false);
+            // Walk to `depth` in served-grid chunks, as the capture sweep does:
+            // one forward of the whole past is a 76k-token chunk, which the
+            // card refuses (measured: CL_OUT_OF_RESOURCES on the first run).
+            for (size_t at = 0; at < depth;) {
+                const size_t take = std::min<size_t>(
+                    depth - at, static_cast<size_t>(std::max(1, prefill_chunk_)));
+                paged_forward(lane, embed_paged(lane, make_tokens(take)), at, {0}, 0, false);
+                at += take;
+            }
             const auto t_m0 = std::chrono::steady_clock::now();
             for (int i = 0; i < reps; ++i) {
                 paged_forward(lane, embed_paged(lane, make_tokens(m)),
