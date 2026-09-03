@@ -121,7 +121,7 @@ Text output byte-identical over 64 greedy tokens between the two paths at both r
 task 10/10 at ratio 50 / 8 GiB (the ratio-75 cell has the text identity, no
 acceptance run).
 
-**Context by KV precision.** (Known defect, 2026-09-03: u8:i4 fails during prefill for prompts longer than about 2,048 tokens; the numbers stand, the setting is not deployable until the prefill path is fixed.) `--paged-kv u8:i4` (asymmetric key/value
+**Context by KV precision.** (Known defect, 2026-09-03: a 141,902-token prefill at u8:i4 on the 16 GiB card ran the GPU out of resources; prompts to 8,909 tokens prefill at every depth setting tried, the failing depth between the two is being bracketed; an earlier "over 2,048 tokens" statement here was a window-design artifact and is retracted.) `--paged-kv u8:i4` (asymmetric key/value
 precision) against the `u8` default, same artifact, same card:
 
 | model | card | u8 auto-fit | u8:i4 auto-fit | gain |

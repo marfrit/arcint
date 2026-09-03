@@ -17,12 +17,26 @@ different nightly is a different ABI.
 
 ## Unreleased
 
+### Fixed since 0.2.13 (unreleased)
+- The DFlash2 drafter past 2,048 tokens: plugin patch 0014 lets an Assign
+  adopt a same-type, same-rank output layout instead of asserting (the
+  served head now drafts at 17k-token prompts and through 3,000-token
+  decodes); the export's state trim takes a runtime slice start and the
+  export tool gained `--compress int4` with the recipe verified
+  byte-identical against the served head; the engine's drafter disable is
+  per lane and re-armed on the next request, with a feed cap one row below
+  the window for plugins without 0014.
+
 ### Known defects in 0.2.13, found by the long-context window (2026-09-03)
-- `--paged-kv u8:i4`: every request with a prompt longer than about 2,048
-  tokens fails with a GPU out-of-resources error during prefill (HTTP 500);
-  u8 is unaffected. The +28% auto-fit context at u8:i4 is therefore not
-  usable beyond that depth until the prefill path is fixed. Do not deploy
-  u8:i4.
+- `--paged-kv u8:i4`: a 141,902-token prefill on the coder (16 GiB card,
+  auto-fit 171,312) failed with a GPU out-of-resources error and every
+  later request in that process failed with it; prompts up to 8,909
+  tokens succeed at every depth setting tried. The failing depth lies
+  between those two numbers and is being bracketed; an earlier version of
+  this entry said "every prompt over about 2,048 tokens", which was an
+  artifact of running the depths deepest-first in one process and is
+  retracted. Until the threshold is known, do not deploy u8:i4 for
+  contexts beyond what has been measured to prefill.
 - `--dflash`: the exported draft head carries a state variable fixed at
   2,048 rows; the first draft after a prompt longer than that fails and the
   drafter disables itself for the process (decode continues without
