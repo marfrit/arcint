@@ -350,14 +350,91 @@ memory
                             measured; logged when it fires) -- see
                             exec/fit.h's prefill_chunk_cap_for_packed_values.
                             An explicit --prefill-chunk is capped the same
-                            way, never raised. Measured cost (16 GiB-class
+                            way, never raised; ARCINT_PREFILL_CHUNK_CAP=off in
+                            the environment keeps the requested chunk for
+                            measuring the fault line (logged, never a
+                            default). Measured cost (16 GiB-class
                             card, coder, u8:i4, n_ctx 131,072, 8,417-token
                             prompt): 495 t/s prefill at chunk 128, 437 at 64
                             (-12%), 440 at 32. Chunk 128 only fits the
                             512 MiB proxy budget up to n_ctx 65,536 (the
                             proxy scales with pool depth, not prompt
                             length), so every deeper u8:i4 pool pays this
-                            price even on short prompts.
+                            price even on short prompts. The auto-fit
+                            reservation itself now charges this same buffer
+                            (exec/fit.h's packed_values_prefill_scratch_bytes /
+                            fit_context_packed_values) as a per-token term,
+                            priced at whatever chunk the belt above would pick
+                            for each candidate depth -- consistent with (16
+                            GiB card, coder, u8:i4; the sampler measured
+                            aggregate free VRAM against a proxy formula, not a
+                            direct trace of this one buffer) a 171,312-token
+                            auto-fit pool running free VRAM to 0 MiB during a
+                            119,074-token prefill (xe "VM worker error: -12",
+                            "exec queue reset detected", CL_OUT_OF_RESOURCES)
+                            because the pre-fix reservation never priced a
+                            buffer that does not exist at the past-0 point the
+                            activation probe measures; a 131,072-token pool
+                            passed the same prompt with 492 MiB free.
+                            12 KiB/token at chunk 128 on the coder's
+                            16-query-head/256-head_dim shape (more than the
+                            8.8 KiB/token u8:i4 KV itself; 6 KiB/token at
+                            chunk 64, the belt's own choice at the measured
+                            auto-fit depth below), x1.5 for the measured
+                            overlap bound (the same sampler: the buffer held
+                            for ~0.9x of the whole prefill, rounded up to
+                            1.0x; at the resize the free-VRAM trace 60 -> 562
+                            -> 56 MiB is a release then a reallocate, not two
+                            buffers held at once, so the resize's own peak
+                            stays at or below that same ~1.0x -- 1.5x is
+                            margin above that peak), plus a one-partition
+                            fixed margin; charged only under 4-bit values, at
+                            whatever chunk the belt would pick for each
+                            candidate depth, clamped at the belt's own call
+                            site (after Phase E) to the chunk the term was
+                            actually priced at -- the belt is non-increasing
+                            in depth, and every path to the served depth only
+                            ever lowers it, so a trim crossing one of the
+                            belt's own step boundaries could otherwise hand
+                            back a chunk larger than the one priced. Logged at
+                            load ("4-bit values: prefill scratch charged ...
+                            at chunk ... for n_ctx ... (per token ... +
+                            KV ...)") and folded into the one-line reservation
+                            summary ("+ prefill scratch N GiB (4-bit values,
+                            chunk C)"); deliberately excluded from the
+                            allocation-time audit's predicted_total, since the
+                            buffer is not yet resident the instant the KV pool
+                            is allocated (it grows once the first real prefill
+                            runs past this point), and including it there made
+                            the "deferred commit" log fire on every 4-bit-
+                            values load unconditionally. Phase E's own
+                            acceptance ceiling is now total - margin - scratch
+                            term, re-derived every pass at that pass's own
+                            served depth (not a bare total - margin) -- so a
+                            4-bit-values load can now log "reservation
+                            overshoot ... correcting" and trim n_ctx, or an
+                            explicit --n-ctx can be refused, where the
+                            previous binary served silently and left the
+                            scratch buffer's own later allocation to find
+                            whatever was left over; the deferred-commit
+                            comparison above still excludes the term (a
+                            different question -- "is it resident yet", not
+                            "will there be room"). MEASURED (2026-09-03,
+                            16 GiB card, coder, u8:i4, auto-fit, BEFORE the
+                            ceiling narrowed for the scratch term above): the
+                            fit lands at n_ctx 101,984 with the belt at
+                            chunk 64 -- below that card's own u8 auto-fit of
+                            133,456 (M8), i.e. u8:i4 no longer widens auto-fit
+                            context over plain u8 for this shape once the
+                            scratch is honestly charged. The ceiling fix can
+                            only pull the adopted n_ctx down further (or
+                            refuse where it used to adopt), never up, so
+                            101,984 is an upper bound, not the current number.
+                            Re-measured with the narrowed ceiling: the
+                            overshoot correction fires once at load, the
+                            served depth is 101,824, and the 97,727-token
+                            prompt prefills in 442 s (221 t/s) with a
+                            free-VRAM floor of 814 MiB, no driver fault.
   --paged-kv KEY[:VALUE]    KV precision on the paged path (default: u8). KEY and
                             VALUE each one of f16, u8, i8, u4, i4; omitting :VALUE
                             applies KEY to both the key and value cache ("u8" and

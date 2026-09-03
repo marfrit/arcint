@@ -49,6 +49,90 @@ different nightly is a different ABI.
   budget up to n_ctx 65,536 (the proxy scales with pool depth, not prompt
   length), so every deeper u8:i4 pool pays this price even on short
   prompts.
+  `ARCINT_PREFILL_CHUNK_CAP=off` keeps the requested chunk for
+  measuring the fault line (logged loudly; measurement only).
+- The reservation itself now charges the packed-4-bit-values prefill
+  scratch buffer the belt above only caps -- consistent with (16 GiB card,
+  coder, u8:i4, host-side VRAM allocator sampled every 2 s) the same
+  mixed-stage attention buffer the belt targets (the sampler measured
+  aggregate free VRAM against a proxy formula, not a direct trace of that
+  one buffer): it does not exist at past 0, where the activation probe
+  runs, so the pre-fix reservation never charged it, and a 171,312-token
+  auto-fit pool ran free VRAM to 0 MiB during a 119,074-token prefill
+  (`xe: VM worker error: -12`, `exec queue reset detected`,
+  `CL_OUT_OF_RESOURCES`) while a 131,072-token pool passed the same prompt
+  with 492 MiB to spare. `exec/fit.h`'s `packed_values_prefill_scratch_
+  bytes` prices the buffer at the SERVED chunk and depth, x1.5 for the
+  measured overlap bound -- the same VRAM sampler shows the buffer held for
+  ~0.9x of the whole 119,074-token prefill (round up to 1.0x); at the
+  resize itself free VRAM traced 60 -> 562 -> 56 MiB, a RELEASE then a
+  REALLOCATE (the old-size buffer dropped, then the new, larger one
+  committed), not two buffers held at once, so the resize's own peak stays
+  at or below that same ~1.0x rather than adding to it; 1.5x is margin
+  ABOVE that observed <=1.0x peak. An earlier version of this term charged
+  an unmeasured 2x (a full second copy) before the sampler data was read,
+  and is retracted to 1.5x here -- and `fit_context_packed_values` folds it
+  into the auto-fit climb as a per-token term (12 KiB/token at chunk 128
+  for the coder's 16 query-head/256-head_dim shape, more than the
+  8.8 KiB/token u8:i4 KV itself; 6 KiB/token at chunk 64, the belt's own
+  choice at this depth) plus a one-partition fixed margin -- charged only
+  when the requested paged-KV value precision is 4-bit, at whatever chunk
+  the belt (`prefill_chunk_cap_for_packed_values`) would pick for each
+  candidate depth tried, so the term and the belt never disagree about
+  which chunk is being priced -- clamped to the chunk the term was
+  actually priced at at the belt's OWN call site after Phase E (round-2
+  review, F1: every path to the served depth only ever lowers it, and the
+  belt is non-increasing in depth, so a trim crossing one of the belt's own
+  step boundaries could otherwise hand back a chunk larger than the one
+  priced -- measured shape: max_ctx 131,104 prices chunk 32, Phase E trims
+  one page to 131,072, and the belt asked fresh from the unclamped
+  requested chunk would pick 64, a ~383 MiB shortfall against the charged
+  term). `ARCINT_PREFILL_CHUNK_CAP=off` prices the uncapped requested chunk
+  instead, matching the belt's own disablement for that switch. Logged at
+  load ("4-bit values: prefill scratch charged ... at chunk ... for
+  n_ctx ... (per token ... + KV ...)") and folded into the one-line
+  reservation summary ("+ prefill scratch N GiB (4-bit values, chunk C)").
+  Deliberately EXCLUDED from the allocation-time audit's `predicted_total`
+  (round-2 review, F4): that figure is what should already be resident the
+  instant the KV pool is allocated, and the scratch buffer is not -- it
+  grows later, once the first real prefill runs past this point in the
+  load -- so including it there made the "deferred commit" log fire on
+  every single 4-bit-values load, unconditionally, calling a buffer that
+  had not been allocated yet a deferred commit of something that should
+  already be there. Phase E's own acceptance ceiling (round-3 review,
+  finding 2) is now `total - margin - scratch term`, the scratch term
+  re-derived every pass at that pass's own served depth -- so a 4-bit-
+  values load can now log "reservation overshoot ... correcting" and trim
+  n_ctx, or an explicit --n-ctx can be refused, in a case where the
+  PREVIOUS binary (ceiling = `total - margin` alone, not holding the term
+  back at all) served silently and left the scratch buffer's own later
+  allocation to find whatever was left over. The deferred-commit
+  comparison (`observed < predicted_total`, just above) still excludes the
+  term -- that check is unchanged and asks a different question ("is it
+  resident yet", not "will there be room").
+
+  MEASURED (2026-09-03, 16 GiB card, coder, u8:i4, auto-fit -- this
+  milestone's own binary, BEFORE the Phase E ceiling narrowed for the
+  scratch term above): the fit lands at n_ctx 101,984 with the belt at
+  chunk 64, `"prefill scratch charged 599.1 MiB at chunk 64 for n_ctx
+  101984 (per token 6.0 KiB + KV 8.8 KiB)"` -- BELOW the same card's own u8
+  auto-fit of 133,456 (M8, §7.0.2 table). u8:i4 no longer widens the
+  auto-fit context over plain u8 for this shape once the scratch buffer is
+  honestly charged; it still wins on KV bytes/token in isolation, but
+  auto-fit is what an operator without an explicit --n-ctx actually gets.
+  (An earlier estimate in this entry, before the term's chunk-clamp fix
+  above landed and before this card run, said 127,680 tokens at chunk 32 --
+  wrong on both counts: 127,680 is not even a fixed point of the belt
+  (128 -> 72,320 -> belt 64 -> 6 KiB/token -> ~101,728 -> belt 64 again),
+  and the measured figure supersedes it.) Verified at that depth with the
+  host's VRAM allocator sampled every two seconds: a 97,727-token prompt
+  prefills (443 s, 220 t/s) with a free-VRAM floor of 818 MiB, where the
+  uncharged 171,312 pool reached 0 MiB and faulted -- MEASURED BEFORE THE
+  CEILING NARROWED; the ceiling fix above can only pull the adopted n_ctx
+  down further (or refuse where it used to adopt), never up, so 101,984
+  and everything verified against it here are an upper bound, not the
+  current number. Re-measured below.
+  Re-measured with the narrowed ceiling (same card, same prompt): the overshoot correction fires once at load and the served depth is n_ctx 101,824 (10 pages fewer); the 97,727-token prompt prefills in 442 s (221 t/s) with a free-VRAM floor of 814 MiB, no driver fault.
 - The DFlash2 drafter past 2,048 tokens: plugin patch 0014 lets an Assign
   adopt a same-type, same-rank output layout instead of asserting (the
   served head now drafts at 17k-token prompts and through 3,000-token

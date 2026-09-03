@@ -3140,7 +3140,72 @@ allocates its intermediate output as tokens × *query* heads × head size ×
 and the past-0 prefill stage allocates none of it, which is why the first
 chunk never faults; micro-SDPA selection is per device and precision, not
 per chunk, so it does not explain the chunk-512 cell. Why 1,104 MiB
-passes where 932 MiB faults is open.
+passes where 932 MiB faults was open until the host kernel log and a
+VRAM sampler were read the same afternoon.
+
+**The fault, measured to its root.** The host kernel log carries, at the
+time of every u8:i4 fault on the 16 GiB card, the pair `xe: VM worker
+error: -12` followed by `exec queue reset detected` — no GPU page fault,
+no coredump (a genuinely different failure, a single 76k-token forward on
+the 24 GB card, produced 308 page faults and a coredump instead). The
+`-12` is ENOMEM in the xe driver's rebind worker for compute-mode VMs
+(`xe_vm.c`, `preempt_rebind_work_func`), whose page-table objects are
+created VRAM-only and non-evictable on discrete cards (`xe_pt.c`,
+`xe_pt_create`, `XE_BO_FLAG_VRAM_IF_DGFX | XE_BO_FLAG_NO_RESV_EVICT`), so a
+full card fails a rebind on its own page tables even when the user
+buffers were placed. The card's allocator, sampled every two seconds on
+the host (`vram_mm` in the driver's debugfs) during the 119,074-token
+prompt at chunk 128: with the 131,072-token pool free VRAM falls
+monotonically from 1,319 MiB to a minimum of 492 MiB at the end of the
+prefill and the prompt passes; with the 171,312-token auto-fit pool
+(1.44 GiB of KV against 1.10, the belt switched off with
+`ARCINT_PREFILL_CHUNK_CAP=off`) free VRAM reaches 0 MiB, swings 60 → 562
+→ 56 MiB as the plugin re-sizes its ≈500 MiB buffer, the driver logs the
+`-12`, and the runtime reports `CL_OUT_OF_RESOURCES`. So the fault is a
+budget the engine did not charge: the mixed-stage attention buffers grow
+with the past (they do not exist at past 0, where the activation probe
+runs) to about 0.9 GiB at 119k tokens and chunk 128, and the reservation
+had left no room for them. The fix is a reservation term — per token of
+context, 1.5 × chunk × query heads × head size × 4 B ÷ 256 (the buffer
+plus margin above the resize peak the sampler saw), i.e. 12 KiB charged
+at chunk 128 against the 8.8 KiB the u8:i4 KV itself costs, 3 KiB at
+chunk 32 — charged only under 4-bit values; the belt stays because it is what keeps the term small. Charged
+honestly, the coder's u8:i4 auto-fit on the 16 GiB card lands at 101,984
+tokens with the belt at 64 (599 MiB of scratch charged, 6.0 KiB per
+token against 8.8 of KV), below the same card's u8 auto-fit of 133,456:
+verified there with a 97,727-token prompt that prefills at 220 t/s with a
+free-VRAM floor of 818 MiB where the uncharged pool reached zero (with
+the acceptance ceiling narrowed by the same term the load trims once
+more, to 101,824, and the floor is 814 MiB). The
+4-bit values save 2.5 KiB per token and the prefill path spends 4
+to 6 of it again, so on this card u8:i4 is a decode-side saving only
+until the plugin stops sizing that buffer by depth. The candidates,
+weighed on 2026-09-03: a bounded partition count (a fixed split of the
+past instead of one partition per 256 tokens makes the buffer depth-
+independent, no extra launches, the reduction runs over the fixed
+slices — the patch to write); f16 partial outputs with f32 softmax
+statistics (halves it, precision to be checked against the ladder);
+pre-sizing once (removes the churn, not the size); an unpack shim onto
+micro-SDPA (the 16-entry dequant table is free, the u8 staging copy of
+the whole past per chunk is not); chunk 16 under 4-bit values (an
+engine lever that buys a sliver, cost unmeasured); native 4-bit values
+in micro-SDPA (upstream). Why
+chunk 512 passed at 35k is now plain: 138 partitions of a 512-token
+buffer at a shallow past against a pool with headroom is not the same
+budget as 466 partitions at 119k; the proxy compared buffers, not
+headroom. Two prior readings on this record — "the tmp_out threshold" in
+§7.0.2aa and "not a threshold at all" above — were both narrated from
+the buffer alone; the measurement is the free-VRAM floor.
+
+Prior art found on the way (2026-09-03): an OpenVINO report of VRAM
+growth to `CL_OUT_OF_RESOURCES` under xe that is stable under i915 on
+the same kernel (issue 32665, 2025-11), a compute-runtime USM pool
+regression that fails with free VRAM (issue 916, 2026-04; the host runs
+26.27, after the fix window), and Intel-community reports of xe engine
+resets under sustained LLM inference on the B-series that were closed
+without a cause. Upstream xe is adding structured reporting of exactly
+these rebind faults (a v6 series on the intel-xe list dated 2026-09-03);
+on the host's kernel the bare warning is all there is.
 
 **The belt.** The engine now caps the prefill chunk under 4-bit values
 from the served pool depth, with the proxy above as the yardstick and a
@@ -3199,11 +3264,28 @@ steps, so a drafter breaks even only when it lands one accepted token
 per cycle on average, and at 0% acceptance it runs at half plain — which
 is where DFlash sits at 76k (5.3 t/s against a 209 ms cycle's 4.8, with
 plain at 16.3 on the served path). The MTP arm is worse than that
-accounts for: its served verify forward of two tokens takes 763 ms
-where the plain two-token forward takes 211 ms, and the 550 ms between
-the plain graph and the MTP-serving path is not measured; the same sweep
-with `--mtp on` is the next discriminator, not run. What the sweep does
-not say is why either drafter accepts nothing at 76k.
+accounts for. Its served verify forward of two tokens took 763 ms per
+cycle in one run (64 tokens) and 451 ms in another (128 tokens), against
+211 ms for the isolated two-token forward at the same depth; the
+run-to-run difference is unexplained. What the served forward spends it
+on was split with a measurement switch (`ARCINT_FORWARD_SPLIT`): the
+graph itself runs 430 ms, the logits readback 0.2 ms, the hidden-state
+readback nothing, and the MTP layer and head between forwards about
+20 ms per cycle. The sweep was then run with the served path's inputs
+one at a time — the MTP graphs loaded, the per-token checkpoint rows and
+interval — and stayed at 105 / 210 / 208 ms for one, two and four
+tokens each time, so neither explains the doubled graph time. The same
+forward repeated inside the served process with identical inputs runs
+340 ms (`ARCINT_FORWARD_SPLIT=2`), and running the served process alone
+on the host changes nothing (445.2 ms with and without a window on the
+other card), so about 100 ms of the served cost is state the first run
+carries and the rest separates the served forward from the sweep's in a
+way not yet identified; the driver's counters show the 24 GB card
+taking about 17,000 recoverable GPU page faults per second during the
+prefill and none during decode, so those are not it either. Open.
+For the decision in §8 the served number is the one that counts: at 76k
+a verify cycle costs four plain steps on this path, not two. What none
+of this says is why either drafter accepts nothing at 76k.
 
 #### 7.0.2r DFlash2: the external-drafter hook gets a real drafter (2026-09-01)
 
@@ -3801,6 +3883,30 @@ stays as an off-by-default measurement switch.
   the engine. The 1.37× verify-amortisation figure was measured on the
   *stateful* kernels and must be re-measured on the paged ones before any
   verdict is reused.
+- **Drafting at depth: a decision, not yet an option** (noted 2026-09-03,
+  from §7.0.2ab). Measured on the 24 GB card at 76k tokens: a one-token
+  forward costs 104 ms and any isolated forward of two to eight tokens
+  costs about 209 ms, while the served verify forward of two tokens runs
+  430 ms, so a verify cycle pays two to four plain steps at depth and a
+  drafter breaks even only at one to three accepted tokens per cycle on
+  average; near depth 0 the same switch costs 10%. The record's advice is to serve deep
+  contexts without a drafter. A future version could make that a runtime
+  decision instead of an operator setting: switch the drafter off per lane
+  once the served depth crosses the point where the measured acceptance no
+  longer pays for the multi-token step (the cross-over is per model and per
+  card and must be measured, not assumed), and back on when the context is
+  reset. Deferred until the cause of the zero acceptance at depth is known,
+  because a drafter that accepts nothing at 76k is a different defect from
+  one that merely costs more there. The plugin-side alternative -- a
+  small-batch attention stage that does not pay the full multi-token cost
+  at depth -- is a kernel question for the plugin series.
+- **Native 4-bit values in micro-SDPA** (backlog, 2026-09-03): the
+  upstream fix for the u8:i4 prefill path — the microkernel path declines
+  packed 4-bit values and the fallback sizes its scratch by depth
+  (§7.0.2ab). Deferred behind the plugin-side patch that bounds the
+  partition count and stores f16 partial outputs; the operator's decision
+  was to take those two first and carry the upstream change in the patch
+  series backlog.
 - **Multimodal** (image/video): confirmed — all three IRs export as
   `*ForConditionalGeneration` (`Qwen3_5MoeForConditionalGeneration`,
   `Qwen3_5ForConditionalGeneration`), so the door is open. v1 is text-only to

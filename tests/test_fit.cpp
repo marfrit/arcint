@@ -1552,3 +1552,528 @@ TEST(prefill_chunk_cap_packed_values_unset_geometry_is_a_no_op) {
                                                  kScratchBudget, /*block_size=*/0),
              128);
 }
+
+// Round-2 review, F1 (real defect, not yet re-measured on a card): the belt
+// is non-increasing in DEPTH, but backend_ov.cpp's call site (after Phase E)
+// always asks it starting from the UNCLAMPED `prefill_chunk_` -- not the
+// chunk the fit's own climb already priced the term at
+// (`packed_values_scratch_chunk_`). Every path to the served depth only
+// ever LOWERS it from the climb's own settled max_ctx (min(wanted, max_ctx),
+// the prefix-cache reserve, Phase E's trims), so a trim that crosses one of
+// the belt's own halving-ladder step boundaries can hand back a chunk
+// LARGER than the one the reservation priced, even though the served depth
+// only went down: at max_ctx 131,104 the belt (started from 128) settles at
+// chunk 32 (this is prefill_chunk_cap_packed_values_171312_caps_to_32's own
+// neighbourhood -- one page short of the 131,072-token cliff below); Phase E
+// trimming one KV page to 131,072 crosses that cliff, and the belt, asked
+// AGAIN from the unclamped 128 at the new, slightly SMALLER depth, climbs
+// back up to 64 (prefill_chunk_cap_packed_values_131072_shrinks_128_to_64,
+// above) -- a served buffer bigger than what was charged.
+TEST(prefill_chunk_cap_packed_values_at_131104_settles_chunk_32) {
+    // Establishes the priced chunk for the fixture below: this is what
+    // fit_context_packed_values's own fixed point would have settled on
+    // had the climb's own settled max_ctx landed here.
+    CHECK_EQ(prefill_chunk_cap_for_packed_values(128, 131104, kCoderHeads, kCoderHeadSize,
+                                                 kScratchBudget, kCoderKvBlockSize),
+             32);
+}
+
+// RED: the OLD call site's own shape -- prefill_chunk_ (128, unclamped) fed
+// straight to the belt at the POST-TRIM depth (131,072) -- reproduces the
+// defect exactly: a chunk (64) LARGER than the one the reservation priced
+// (32) at the pre-trim depth (131,104) just above.
+TEST(prefill_chunk_cap_packed_values_old_call_site_shape_grows_past_the_priced_chunk) {
+    const int served_at_old_call_site = prefill_chunk_cap_for_packed_values(
+        /*prefill_chunk_ (unclamped)=*/128, /*paged_n_ctx_ (post-trim)=*/131072, kCoderHeads,
+        kCoderHeadSize, kScratchBudget, kCoderKvBlockSize);
+    CHECK_EQ(served_at_old_call_site, 64);
+    CHECK(served_at_old_call_site > 32);  // > the chunk the term above priced -- the defect
+}
+
+// Round-3 review, finding 3: the two tests above (and an earlier version
+// of the "GREEN" test below) exercised `prefill_chunk_cap_for_packed_
+// values` directly with a HAND-COMPUTED `std::min` standing in for the
+// call site's own choice -- correct arithmetic, but a second, independent
+// copy of it: if backend_ov.cpp's belt call site regressed back to the
+// unclamped `prefill_chunk_` alone (the defect the test above documents),
+// nothing here would notice, because the test never calls the code the
+// call site actually calls. `lgc::belt_requested_chunk` (fit.h) is that
+// choice, extracted into one named, exported function; backend_ov.cpp's
+// belt call site now calls it directly (no local reimplementation), and
+// the tests below call the SAME function, not a copy of its arithmetic.
+//
+// RED, captured verbatim (belt_requested_chunk's body temporarily reverted
+// to `return prefill_chunk;` -- the pre-F1 choice, ignoring priced_chunk --
+// rebuilt, and re-run filtered to this test's own name; restored right
+// after):
+//   FAIL <file>:<line>
+//            belt_requested_chunk(128, 32) == 32
+//            left:  128
+//            right: 32
+//   FAIL belt_requested_chunk_bounds_prefill_chunk_by_the_priced_chunk
+//   1 case run, 1 failed
+TEST(belt_requested_chunk_bounds_prefill_chunk_by_the_priced_chunk) {
+    // The ordinary case: the priced chunk is smaller than the unclamped
+    // prefill chunk, so it wins.
+    CHECK_EQ(belt_requested_chunk(128, 32), 32);
+    // The priced chunk can never be LARGER than the prefill chunk it was
+    // derived from (fit_context_packed_values only ever shrinks, never
+    // grows, its own starting chunk) -- but the function is defensive
+    // about it anyway: still the smaller of the two either way.
+    CHECK_EQ(belt_requested_chunk(32, 128), 32);
+    // 0 or negative priced_chunk: nothing was priced this load (not a
+    // 4-bit-values load, or geometry was unavailable) -- passes
+    // prefill_chunk through unchanged, the same "nothing to price"
+    // convention prefill_chunk_cap_for_packed_values's own guards use.
+    CHECK_EQ(belt_requested_chunk(128, 0), 128);
+    CHECK_EQ(belt_requested_chunk(128, -5), 128);
+}
+
+// GREEN: the fix -- backend_ov.cpp's belt call site now passes
+// `lgc::belt_requested_chunk(prefill_chunk_, packed_values_scratch_chunk_)`
+// as the belt's own requested chunk, reproduced here by calling that exact
+// function (not a reimplementation of it). The belt only ever shrinks its
+// input (never raises it, per its own doc comment), so bounding the INPUT
+// to the priced chunk (32) bounds the OUTPUT the same way, at the identical
+// post-trim depth (131,072) the red case above used.
+TEST(prefill_chunk_cap_packed_values_clamped_call_site_shape_stays_at_the_priced_chunk) {
+    const int prefill_chunk              = 128;  // unclamped, activation-probe chunk
+    const int packed_values_priced_chunk = 32;  // the term's own fixed point, at max_ctx 131,104
+    const int requested_chunk_for_belt =
+        belt_requested_chunk(prefill_chunk, packed_values_priced_chunk);
+    CHECK_EQ(requested_chunk_for_belt, 32);
+
+    const int served_at_fixed_call_site = prefill_chunk_cap_for_packed_values(
+        requested_chunk_for_belt, /*paged_n_ctx_ (post-trim)=*/131072, kCoderHeads,
+        kCoderHeadSize, kScratchBudget, kCoderKvBlockSize);
+    CHECK_EQ(served_at_fixed_call_site, 32);
+    CHECK(served_at_fixed_call_site <= packed_values_priced_chunk);  // never exceeds the priced chunk
+}
+
+// --------------------------- packed_values_prefill_scratch_bytes (M9 fit term)
+
+// CONSISTENT WITH THE MEASURED FAULT (2026-09-03, 16 GiB card, coder,
+// --paged-kv u8:i4, host-side VRAM allocator sampled every 2 s -- the
+// sampler measured AGGREGATE free VRAM against a proxy formula, not a
+// direct trace of the plugin's own buffer, so "consistent with" rather
+// than "root cause": round-3 review, finding 1): the belt above caps the
+// prefill chunk from the same buffer this term prices, but capping the
+// chunk after the fact does not RESERVE anything -- a pool sized without
+// this term can still run free VRAM to 0 during the prefill that grows the
+// buffer (171,312-token auto-fit pool: free VRAM 0 MiB, xe "VM worker
+// error: -12", "exec queue reset detected", CL_OUT_OF_RESOURCES; the same
+// prompt on a 131,072-token pool passed with 492 MiB free). This section
+// prices the buffer so the FIT itself charges for it, at the SERVED chunk
+// and depth, x1.5 for the measured overlap bound (see packed_values_
+// prefill_scratch_bytes's own comment: the sampler held the buffer for
+// ~0.9x of the whole prefill, rounded up to 1.0x, plus a ~0.55x swing at a
+// resize -- 1.5x covers both with margin, superseding the earlier,
+// unmeasured 2x).
+//
+// Both hand-worked cases below reuse the coder shape already established
+// above (kCoderHeads = 16 QUERY heads, kCoderHeadSize = 256 head_dim) and
+// are independently corroborated by DESIGN.md's own arithmetic for the
+// belt at these exact points ("chunk 32 is 335 MiB" at n_ctx 171,312;
+// "8 KiB at chunk 128 ... 2 KiB at chunk 32" for the per-token, un-scaled
+// rate) -- this section adds the x1.5 this file's belt tests do not need,
+// and the fit-side wiring those tests do not exercise.
+TEST(packed_values_prefill_scratch_bytes_chunk128_n_ctx131072_is_1024_mib_x1_5_to_1536) {
+    // ceil(131072/256) = 512 partitions exactly (131072/256 = 512.0).
+    // single buffer = 128 x 16 x 256 x 4 x 512
+    //               = 128 x 16,384 (bytes/partition/head... folded) x 512
+    // worked as the function does it: chunk(128) * heads(16) * head_size(256)
+    // * 4 * partitions(512) = 128*16=2048; *256=524,288; *4=2,097,152;
+    // *512=1,073,741,824 bytes = 1,024 MiB exactly (2^30). x1.5 for the
+    // measured overlap bound: 1,610,612,736 bytes = 1,536 MiB exactly
+    // (1,024 * 1.5). (The retracted 2x figure was 2,147,483,648 bytes,
+    // 2,048 MiB -- this assertion is red against that multiplier.)
+    const uint64_t bytes =
+        packed_values_prefill_scratch_bytes(128, 131072, kCoderHeads, kCoderHeadSize);
+    CHECK_EQ(bytes, 1610612736ull);
+    CHECK_EQ(bytes, 3ull * (1024ull * kMiB) / 2ull);
+}
+
+TEST(packed_values_prefill_scratch_bytes_chunk32_n_ctx171312_is_335_mib_x1_5_to_502_5) {
+    // ceil(171312/256): 171312 / 256 = 669.1875 -> 670 partitions.
+    // single buffer = 32*16=512; *256=131,072; *4=524,288; *670=351,272,960
+    // bytes. 351,272,960 / 1,048,576 = 335.0 exactly (1,048,576 * 335 =
+    // 351,272,960) -- 335 MiB, matching this file's own belt-side comment
+    // ("chunk 32 is 335 MiB") for the identical (chunk, n_ctx) pair.
+    // x1.5 for the measured overlap bound: 526,909,440 bytes -- 502.5 MiB
+    // exactly (335 * 1.5), not a whole MiB count but an exact byte value.
+    // (The retracted 2x figure was 702,545,920 bytes, 670 MiB -- this
+    // assertion is red against that multiplier.)
+    const uint64_t bytes =
+        packed_values_prefill_scratch_bytes(32, 171312, kCoderHeads, kCoderHeadSize);
+    CHECK_EQ(bytes, 526909440ull);
+    CHECK_EQ(bytes, 3ull * (335ull * kMiB) / 2ull);
+}
+
+// Any missing input (chunk, n_ctx, heads, head_size <= 0) is "nothing to
+// price" and returns 0 -- the caller's job is to skip the term, not to
+// invent a buffer from nothing (same convention prefill_chunk_cap_for_
+// packed_values's own guards use).
+TEST(packed_values_prefill_scratch_bytes_zero_guards) {
+    CHECK_EQ(packed_values_prefill_scratch_bytes(0, 131072, kCoderHeads, kCoderHeadSize), 0ull);
+    CHECK_EQ(packed_values_prefill_scratch_bytes(128, 0, kCoderHeads, kCoderHeadSize), 0ull);
+    CHECK_EQ(packed_values_prefill_scratch_bytes(128, 131072, 0, kCoderHeadSize), 0ull);
+    CHECK_EQ(packed_values_prefill_scratch_bytes(128, 131072, kCoderHeads, 0), 0ull);
+}
+
+// The per-token slope the climb below folds into kv_bytes_token: chunk x
+// 8 KiB / 256, x1.5 for the measured overlap bound (chunk 128 -> 12
+// KiB/token, chunk 32 -> 3 KiB/token; this file's own belt comment states
+// the un-scaled 8 KiB/2 KiB figures) -- still more than the 8.8 KiB/token
+// the u8:i4 KV itself costs (DESIGN.md) at chunk 128, which is why this
+// term moves the auto-fit depth measurably rather than being noise against
+// it. (The retracted 2x multiplier gave 16 KiB/4 KiB -- these assertions
+// are red against that multiplier.)
+TEST(packed_values_prefill_scratch_bytes_per_token_chunk128_is_12_kib) {
+    CHECK_EQ(packed_values_prefill_scratch_bytes_per_token(128, kCoderHeads, kCoderHeadSize),
+             12288ull);
+}
+
+TEST(packed_values_prefill_scratch_bytes_per_token_chunk32_is_3_kib) {
+    CHECK_EQ(packed_values_prefill_scratch_bytes_per_token(32, kCoderHeads, kCoderHeadSize),
+             3072ull);
+}
+
+TEST(packed_values_prefill_scratch_bytes_per_token_zero_guards) {
+    CHECK_EQ(packed_values_prefill_scratch_bytes_per_token(0, kCoderHeads, kCoderHeadSize), 0ull);
+    CHECK_EQ(packed_values_prefill_scratch_bytes_per_token(128, 0, kCoderHeadSize), 0ull);
+    CHECK_EQ(packed_values_prefill_scratch_bytes_per_token(128, kCoderHeads, 0), 0ull);
+}
+
+// The conservativeness proof packed_values_prefill_scratch_bytes_per_
+// token's own comment states algebraically, checked here at n_ctx values
+// that do NOT fall on a 256-token partition boundary (where the linear
+// charge and the exact ceil()-based total diverge the most): the closed-form
+// charge (`per_token * n_ctx + fixed`, what fit_context_packed_values below
+// actually charges) must never be LESS than the exact total a real load at
+// that depth would need.
+TEST(packed_values_prefill_scratch_linear_charge_never_undercounts_the_exact_total) {
+    for (const int chunk : {32, 64, 128}) {
+        for (const long long n_ctx : {1LL, 100LL, 255LL, 257LL, 769LL, 131072LL, 171312LL,
+                                      171313LL}) {
+            const uint64_t exact =
+                packed_values_prefill_scratch_bytes(chunk, n_ctx, kCoderHeads, kCoderHeadSize);
+            const uint64_t per_token =
+                packed_values_prefill_scratch_bytes_per_token(chunk, kCoderHeads, kCoderHeadSize);
+            const uint64_t fixed =
+                packed_values_prefill_scratch_bytes(chunk, 1, kCoderHeads, kCoderHeadSize);
+            const uint64_t charged = per_token * static_cast<uint64_t>(n_ctx) + fixed;
+            CHECK(charged >= exact);
+        }
+    }
+}
+
+// ------------------------------------------- fit_context_packed_values
+
+// The fixture DESIGN.md's own §7.0.2 measurement window used, reconstructed
+// here as an M7-style engineered fixture (the file's established
+// convention -- see kTotal's own comment at the top): a 16 GiB-class card,
+// coder shape, --paged-kv u8:i4 (~8.8 KiB/token, DESIGN.md), one lane,
+// --kv-block-size 32, requested --prefill-chunk 128. Round numbers for the
+// fixed terms (weights/activation/margin/slab reuse the file's own top-of-
+// file constants), because only the KV-vs-term arithmetic is under test.
+namespace {
+constexpr uint64_t kM9Total          = 16ull * kGiB;
+constexpr uint64_t kM9KvBytesToken   = 9011;  // ~8.8 KiB/token, u8:i4 (DESIGN.md)
+constexpr int       kM9KvBlockTokens = 32;     // matches kCoderKvBlockSize
+constexpr int       kM9RequestedChunk = 128;
+
+FitTerms m9_base_terms() {
+    FitTerms t;
+    t.total          = kM9Total;
+    t.weights        = kWeights;
+    t.drafters       = 0;
+    t.slot_pool      = 0;
+    t.activations    = kActivation;
+    t.slab_per_lane  = kSlab;
+    t.kv_bytes_token = kM9KvBytesToken;
+    t.margin         = kMargin;
+    t.lanes           = 1;
+    t.kv_block_tokens = kM9KvBlockTokens;
+    t.n_ctx_floor     = 4096;
+    return t;
+}
+}  // namespace
+
+// RED FIRST: `fit_context_packed_values` and `packed_values_prefill_
+// scratch_bytes`/`_per_token` do not exist before this change -- reverting
+// this milestone's diff against this test file does not merely fail an
+// assertion, it fails to COMPILE, the same convention this file already
+// uses for a function introduced alongside its own first test (e.g.
+// auto_fit_converges_within_four_passes_for_granules_up_to_84_and_refuses_
+// beyond, above: "RED before auto_fit_trim exists (compile error)").
+//
+// With the term ABSENT (today's production call, `fit_context(fterms)`
+// alone -- literally the call site this milestone's backend_ov.cpp diff
+// replaces for the 4-bit-values case): budget = total - fixed, divided by
+// the bare KV rate. fixed = weights(kWeights) + activation(kActivation) +
+// margin(kMargin) + lanes(1)*slab(kSlab) = 1,288,490,189 + 697,932,186 +
+// 268,435,456 + 67,108,864 = 2,321,966,695. budget = 17,179,869,184 -
+// 2,321,966,695 = 14,857,902,489. old_max_ctx = 14,857,902,489 / 9,011 /
+// 1 = 1,648,935 tokens, floored to a 32-token page: 1,648,832.
+//
+// With the term CHARGED (fit_context_packed_values, this milestone, x1.5
+// overlap bound): the climb settles at chunk 32 after one belt correction
+// (128 -> 32, the same shrink prefill_chunk_cap_packed_values_171312_caps_
+// to_32 above measures at this exact shape) and lands on max_ctx 1,229,568
+// -- strictly LOWER than the term-absent figure, and the reservation this
+// fit computed (fit.reserved_total) still fits under kM9Total, so the
+// depth it landed on is genuinely admissible, not merely smaller. (The
+// retracted 2x multiplier landed on 1,133,504 here -- this assertion is
+// red against that multiplier.)
+TEST(fit_context_packed_values_drops_the_auto_fit_depth_versus_the_term_absent_fit) {
+    const FitTerms  base          = m9_base_terms();
+    const FitResult old_fit       = fit_context(base);  // today's call, term absent
+    CHECK_EQ(old_fit.max_ctx, 1648832);
+
+    const PackedValuesFitTerm term = fit_context_packed_values(
+        base, kM9RequestedChunk, kCoderHeads, kCoderHeadSize, kScratchBudget, kM9KvBlockTokens);
+
+    CHECK(term.fit.max_ctx < old_fit.max_ctx);   // the depth the term must move
+    CHECK(term.fit.max_ctx >= base.n_ctx_floor);  // still usable, not refused into the floor
+    CHECK(term.fit.admissible);
+    CHECK(term.fit.reserved_total <= kM9Total);   // the charge this fit made actually fits
+    CHECK_EQ(term.fit.max_ctx, 1229568);
+    CHECK_EQ(term.chunk, 32);
+}
+
+// Self-consistency (the whole point of iterating inside the climb instead
+// of pricing the requested chunk once): the belt, asked directly for the
+// chunk it would pick at the SETTLED depth, must agree with the chunk the
+// climb actually priced the term at -- otherwise the reservation and the
+// belt would be charging for two different buffers.
+TEST(fit_context_packed_values_settles_on_the_chunk_the_belt_agrees_with) {
+    const FitTerms           base = m9_base_terms();
+    const PackedValuesFitTerm term = fit_context_packed_values(
+        base, kM9RequestedChunk, kCoderHeads, kCoderHeadSize, kScratchBudget, kM9KvBlockTokens);
+    const int belt_chunk_at_settled_depth = prefill_chunk_cap_for_packed_values(
+        kM9RequestedChunk, term.fit.max_ctx, kCoderHeads, kCoderHeadSize, kScratchBudget,
+        kM9KvBlockTokens);
+    CHECK_EQ(term.chunk, belt_chunk_at_settled_depth);
+    CHECK(term.iterations >= 1);
+}
+
+// ARCINT_PREFILL_CHUNK_CAP=off (backend_ov.cpp's measurement switch, reused
+// here as `belt_enabled = false`): the belt itself is disabled, so the
+// served chunk is the REQUESTED one, uncapped, for the whole load -- the
+// term must price exactly that (a single pass, no ladder), which charges
+// MORE than the belt-enabled climb (a larger, un-shrunk chunk) and so
+// lands on an equal-or-SMALLER max_ctx -- conservative in the same
+// direction as every other over-charge in this file.
+TEST(fit_context_packed_values_belt_disabled_prices_the_uncapped_chunk) {
+    const FitTerms base = m9_base_terms();
+    const PackedValuesFitTerm belt_off =
+        fit_context_packed_values(base, kM9RequestedChunk, kCoderHeads, kCoderHeadSize,
+                                  kScratchBudget, kM9KvBlockTokens, /*belt_enabled=*/false);
+    const PackedValuesFitTerm belt_on =
+        fit_context_packed_values(base, kM9RequestedChunk, kCoderHeads, kCoderHeadSize,
+                                  kScratchBudget, kM9KvBlockTokens, /*belt_enabled=*/true);
+    CHECK_EQ(belt_off.chunk, kM9RequestedChunk);  // pinned, never shrunk
+    CHECK_EQ(belt_off.iterations, 1);
+    CHECK(belt_off.fit.max_ctx <= belt_on.fit.max_ctx);
+    // 697,408: the belt-on climb's own first-round figure (x1.5 overlap
+    // bound; the retracted 2x multiplier gave 584,896 here -- this
+    // assertion is red against that multiplier).
+    CHECK_EQ(belt_off.fit.max_ctx, 697408);
+}
+
+// u8/f16 values: backend_ov.cpp never calls this function on that path (it
+// is gated on the requested paged-KV value precision being 4-bit, at the
+// FitTerms/fit_context call site -- see backend_ov.cpp's `packed_values`
+// local). Exercised here the same way this file already exercises the
+// belt's own no-op guard, above: geometry the caller could not price
+// (heads/head_size 0, as if config.json carried neither) is a pure
+// passthrough to `fit_context(base)` -- no term, `chunk` unchanged -- not a
+// second, silently-different code path.
+TEST(fit_context_packed_values_unset_geometry_matches_plain_fit_context) {
+    const FitTerms base = m9_base_terms();
+    const FitResult plain = fit_context(base);
+
+    const PackedValuesFitTerm no_heads = fit_context_packed_values(
+        base, kM9RequestedChunk, /*heads=*/0, kCoderHeadSize, kScratchBudget, kM9KvBlockTokens);
+    CHECK_EQ(no_heads.fit.max_ctx, plain.max_ctx);
+    CHECK_EQ(no_heads.per_token_bytes, 0ull);
+    CHECK_EQ(no_heads.fixed_bytes, 0ull);
+    CHECK_EQ(no_heads.chunk, kM9RequestedChunk);
+
+    const PackedValuesFitTerm no_head_size = fit_context_packed_values(
+        base, kM9RequestedChunk, kCoderHeads, /*head_size=*/0, kScratchBudget, kM9KvBlockTokens);
+    CHECK_EQ(no_head_size.fit.max_ctx, plain.max_ctx);
+
+    const PackedValuesFitTerm no_chunk = fit_context_packed_values(
+        base, /*requested_chunk=*/0, kCoderHeads, kCoderHeadSize, kScratchBudget, kM9KvBlockTokens);
+    CHECK_EQ(no_chunk.fit.max_ctx, plain.max_ctx);
+}
+
+// The Phase E replay/backoff guarantee (auto_fit_converges_within_four_
+// passes_for_granules_up_to_84_and_refuses_beyond, above) is parameterized
+// entirely by the driver's rounding granule -- nothing about it reads how
+// the STARTING n_ctx for that loop was chosen. This is the direct check
+// that plugging the term-adjusted depth in as that starting point changes
+// nothing about the guarantee: the same auto_fit_trim/pool_sizing loop,
+// seeded from fit_context_packed_values's own settled max_ctx instead of
+// the term-absent one, still converges within the existing four-pass
+// budget for a representative driver granule (kM9KvBlockTokens itself,
+// 32 -- comfortably under the proven 84-page bound).
+TEST(fit_context_packed_values_output_still_converges_through_the_auto_fit_backoff) {
+    const FitTerms            base = m9_base_terms();
+    const PackedValuesFitTerm term = fit_context_packed_values(
+        base, kM9RequestedChunk, kCoderHeads, kCoderHeadSize, kScratchBudget, kM9KvBlockTokens);
+
+    long long   n_ctx           = term.fit.max_ctx;
+    size_t      spare_cap       = static_cast<size_t>(-1);
+    long long   overshoot_accum = 0;
+    const long long budget      = static_cast<long long>(term.fit.reserved_total);
+    const size_t    granule     = static_cast<size_t>(kM9KvBlockTokens);
+    // A synthetic driver-rounding ceiling one granule below the accepted
+    // pool -- the same worst-case construction converge_passes (above)
+    // uses, so pass 0 always needs at least one correction.
+    const size_t ceiling = simulate_driver_pages(static_cast<size_t>(budget), granule) - 1;
+
+    int converged_at = -1;
+    for (int pass = 0; pass < 4; ++pass) {
+        const size_t     live_blocks  = static_cast<size_t>(n_ctx);
+        // Round-3 review, finding 5: `std::min<size_t>(0, spare_cap)` was
+        // dead -- it is 0 for every `spare_cap` (a size_t, always >= 0),
+        // so the whole call could have been written `capped_spare = 0`
+        // directly. A real wanted-spare, the same "the cache always wants
+        // more" constant converge_passes and sub_page_overshoot's own loop
+        // use above (kConvergeWantedSpare / 1000000000), exercises
+        // pool_sizing's spare arithmetic instead of trivially bypassing it.
+        const size_t     capped_spare = std::min(kConvergeWantedSpare, spare_cap);
+        const long long  budget_remaining = budget - overshoot_accum;
+        const PoolSizing sizing =
+            pool_sizing(live_blocks, capped_spare, budget_remaining, /*kv_block_bytes=*/1);
+        const size_t observed = simulate_driver_pages(sizing.blocks, granule);
+        if (observed <= ceiling) {
+            converged_at = pass;
+            break;
+        }
+        const uint64_t over = observed - ceiling;
+        overshoot_accum += static_cast<long long>(over);
+        const AutoFitTrim trim =
+            auto_fit_trim(n_ctx, sizing.spare_blocks, over, /*kv_block_bytes=*/1, /*lanes=*/1,
+                         /*kv_block_tokens=*/1, /*n_ctx_floor=*/1, pass, /*protect_spare=*/false);
+        if (trim.refuse) break;
+        n_ctx     = trim.next_n_ctx;
+        spare_cap = trim.next_spare_cap;
+    }
+    CHECK(converged_at >= 0);
+}
+
+// ------------------------ packed_values_scratch_reservation_bytes / phase_e_ceiling_bytes
+
+// Round-3 review, finding 2 (REAL defect): round-2 review's own F4 comment
+// claimed the ceiling check "already reflects" the packed-values term
+// because "total itself was sized net of the term back at the climb" --
+// false. `total` (backend_ov.cpp's `device_total_mem_size`) is a constant
+// read once at load and never adjusted for anything the climb charges (the
+// climb shrinks `max_ctx`, not `total`), so a bare `ceiling = total -
+// margin` never held the term back at all -- an observed residency landing
+// just under THAT ceiling was accepted, the pool kept every byte, and the
+// scratch buffer (not yet allocated at this point) still had to fit in
+// whatever was left once the first real prefill grew it: the original
+// fault this whole term exists to prevent, reintroduced silently.
+//
+// Round numbers, not a card reading -- only the ceiling arithmetic is
+// under test here. `packed_values_scratch_reservation_bytes` is exercised
+// first on its own (also closes round-3 review, finding 4's regression:
+// an earlier version of backend_ov.cpp's own summary log line multiplied
+// the per-token part by `max_ctx` alone, omitting `lanes` -- this shared
+// formula cannot omit it, since every caller, log line included, now
+// routes through the same function).
+namespace {
+constexpr uint64_t kF2Total       = 1000000000ull;  // 1 GB
+constexpr uint64_t kF2Margin      = 100000000ull;    // 100 MB
+constexpr uint64_t kF2Fixed       = 10000000ull;     // 10 MB, the one-partition margin
+constexpr uint64_t kF2PerToken    = 1000ull;         // 1,000 B/token
+constexpr long long kF2PagedNCtx  = 50000;           // the FINAL served depth this pass
+// scratch_term = fixed + lanes * n_ctx * per_token = 10,000,000 +
+// 1 * 50,000 * 1,000 = 60,000,000 (one lane).
+constexpr uint64_t kF2ScratchTermOneLane = 60000000ull;
+// old_ceiling = total - margin = 900,000,000; new_ceiling = old_ceiling -
+// scratch_term = 840,000,000. `kF2Observed` sits strictly BETWEEN the two
+// -- inside the term's own size (60,000,000) below the old ceiling --
+// which is exactly the band the old ceiling accepted and the new one must
+// not.
+constexpr uint64_t kF2Observed = 860000000ull;
+}  // namespace
+
+TEST(packed_values_scratch_reservation_bytes_multiplies_the_per_token_part_by_lanes) {
+    CHECK_EQ(packed_values_scratch_reservation_bytes(kF2Fixed, kF2PerToken, /*lanes=*/1,
+                                                     kF2PagedNCtx),
+             kF2ScratchTermOneLane);
+    // Round-3 review, finding 4's own regression, reproduced directly: two
+    // lanes must double the per-token contribution, not leave it as if
+    // there were still one.
+    CHECK_EQ(packed_values_scratch_reservation_bytes(kF2Fixed, kF2PerToken, /*lanes=*/2,
+                                                     kF2PagedNCtx),
+             kF2Fixed + 2ull * static_cast<uint64_t>(kF2PagedNCtx) * kF2PerToken);
+    // Zero/negative n_ctx or lanes: no per-token contribution, just the
+    // fixed margin (mirrors fit_context's own std::max(1, lanes) floor and
+    // shrink_n_ctx's "never negative" convention elsewhere in this file).
+    CHECK_EQ(packed_values_scratch_reservation_bytes(kF2Fixed, kF2PerToken, /*lanes=*/1,
+                                                     /*n_ctx=*/0),
+             kF2Fixed);
+    CHECK_EQ(packed_values_scratch_reservation_bytes(kF2Fixed, kF2PerToken, /*lanes=*/0,
+                                                     kF2PagedNCtx),
+             kF2ScratchTermOneLane);  // lanes floors to 1, same as one lane
+}
+
+// RED (documentation, not a compile-time or runtime failure against THIS
+// file's own `phase_e_ceiling_bytes` -- against the OLD, pre-fix ceiling
+// formula backend_ov.cpp used to compute inline, `total - margin`): the
+// old ceiling does not even see the scratch term, so an observed residency
+// well inside the term's own size still reads as "fits."
+TEST(phase_e_ceiling_old_formula_accepts_an_observed_inside_the_scratch_term) {
+    const uint64_t old_ceiling = kF2Total > kF2Margin ? kF2Total - kF2Margin : 0;
+    CHECK_EQ(old_ceiling, 900000000ull);
+    CHECK(kF2Observed <= old_ceiling);  // the old logic: NOT an overshoot
+}
+
+// GREEN: `phase_e_ceiling_bytes` (fit.h) subtracts the scratch term (priced
+// at the FINAL served depth, via packed_values_scratch_reservation_bytes)
+// from the ceiling -- the SAME `kF2Observed` that passed the old formula
+// above now correctly overshoots the new, narrower one.
+TEST(phase_e_ceiling_bytes_subtracts_the_scratch_term_and_catches_the_overshoot) {
+    const uint64_t scratch_term =
+        packed_values_scratch_reservation_bytes(kF2Fixed, kF2PerToken, /*lanes=*/1, kF2PagedNCtx);
+    CHECK_EQ(scratch_term, kF2ScratchTermOneLane);
+
+    const uint64_t new_ceiling = phase_e_ceiling_bytes(kF2Total, kF2Margin, scratch_term);
+    CHECK_EQ(new_ceiling, 840000000ull);
+    CHECK(new_ceiling < (kF2Total > kF2Margin ? kF2Total - kF2Margin : 0));  // strictly narrower
+
+    CHECK(kF2Observed > new_ceiling);  // now correctly flagged as overshoot
+}
+
+// u8/f16 (or any load where the climb never charged the term): both
+// scratch members default to 0, so the shared formula returns 0 and the
+// ceiling is untouched -- `phase_e_ceiling_bytes` with a 0 scratch term
+// reproduces the bare `total - margin` exactly, byte for byte.
+TEST(phase_e_ceiling_bytes_zero_scratch_term_matches_the_bare_total_minus_margin) {
+    CHECK_EQ(phase_e_ceiling_bytes(kF2Total, kF2Margin, /*scratch_term_bytes=*/0),
+             kF2Total - kF2Margin);
+}
+
+// Round-4 review, finding 3: the floor. `margin + scratch_term_bytes >=
+// total` means there is no room left for anything else at all -- a scratch
+// term big enough (a very deep pool, or a chunk the belt could not shrink
+// far enough) can genuinely exceed what `margin` alone left over. Must
+// floor at 0, not underflow a `uint64_t` subtraction into a number in the
+// exabytes (the same failure mode fit_context's own budget-underflow guard
+// and shrink_n_ctx's floor exist to avoid elsewhere in this file).
+TEST(phase_e_ceiling_bytes_floors_at_zero_when_margin_plus_term_reaches_total) {
+    // Exactly at the boundary: margin + term == total.
+    CHECK_EQ(phase_e_ceiling_bytes(kF2Total, kF2Margin, kF2Total - kF2Margin), 0ull);
+    // Past the boundary: margin + term > total.
+    CHECK_EQ(phase_e_ceiling_bytes(kF2Total, kF2Margin, kF2Total), 0ull);
+    CHECK_EQ(phase_e_ceiling_bytes(kF2Total, kF2Margin, kF2Total * 2), 0ull);
+    // One byte short of the boundary: still strictly positive, not
+    // over-eagerly floored.
+    CHECK_EQ(phase_e_ceiling_bytes(kF2Total, kF2Margin, kF2Total - kF2Margin - 1), 1ull);
+}

@@ -3186,21 +3186,94 @@ private:
         fterms.kv_block_tokens = static_cast<int>(kv_block_tokens_);
         fterms.n_ctx_floor     = static_cast<int>(
             std::max<size_t>(kv_block_tokens_ * static_cast<size_t>(lanes), 4096));
-        FitResult fit    = fit_context(fterms);
+
+        // M9 fit-side charge for the packed-4-bit-values prefill scratch
+        // buffer (packed_values_prefill_scratch_bytes, exec/fit.h --
+        // consistent with the measured fault, see that function's own
+        // comment for why "consistent with" rather than "root cause"):
+        // folded into the climb HERE, before fit_context ever runs, because it
+        // changes max_ctx itself and cannot be applied as an after-the-fact
+        // correction the way the belt below is. `cap_off` mirrors the belt
+        // call site's own ARCINT_PREFILL_CHUNK_CAP=off measurement switch,
+        // read once here and reused there: with the belt disabled, the
+        // served chunk is `chunk` unconditionally (no ladder), and the term
+        // must price exactly that, not a shrink that will not happen.
+        const char* cap_env      = std::getenv("ARCINT_PREFILL_CHUNK_CAP");
+        const bool  cap_off      = cap_env != nullptr && std::string(cap_env) == "off";
+        const bool  packed_values = value_prec.bitwidth() == 4;
+        std::optional<PackedValuesScratchGeometry> packed_geom;
+        if (packed_values) packed_geom = packed_values_scratch_geometry(artifact_.config);
+
+        FitResult fit;
+        int       packed_values_chunk = static_cast<int>(chunk);
+        if (packed_values && packed_geom) {
+            const PackedValuesFitTerm term = fit_context_packed_values(
+                fterms, static_cast<int>(chunk), packed_geom->heads, packed_geom->head_size,
+                kPrefillScratchBudgetBytesPackedValues, cfg.kv_block_size, !cap_off);
+            fit                                    = term.fit;
+            packed_values_chunk                    = term.chunk;
+            packed_values_scratch_per_token_bytes_ = term.per_token_bytes;
+            packed_values_scratch_fixed_bytes_     = term.fixed_bytes;
+            packed_values_scratch_chunk_           = term.chunk;
+        } else {
+            fit = fit_context(fterms);
+        }
         long long max_ctx = fit.max_ctx;
+        // Round-2 review, F5: the packed-values term (when charged) is
+        // folded into THIS summary line too, not only the detail line
+        // below -- a one-line reservation is what an operator scanning the
+        // log actually reads, and the total this line prints must be the
+        // one the fit actually solved (weights+drafters+slots+activations+
+        // margin+slab+KV+scratch), not everything except the newest term.
+        // `term_total_bytes` and `packed_values_clause` are computed once,
+        // here, and reused by the detail line further down so the two
+        // never disagree about the number.
+        //
+        // Round-3 review, finding 4: the fit charges the per-token part of
+        // this term PER LANE -- fit_context_packed_values folds it into
+        // `kv_bytes_token`, which fit_context itself multiplies by both
+        // `lanes` and `max_ctx` -- but this line's own earlier version
+        // multiplied by `max_ctx` alone, so the log under-reported the
+        // term by a factor of `lanes` on more than one lane and the
+        // line's own terms did not sum to the printed total any more.
+        // `packed_values_scratch_reservation_bytes` (fit.h) is the shared
+        // formula fit_context_packed_values, Phase E's ceiling check
+        // (below), and this line all now read from -- one implementation
+        // of "lanes * n_ctx * per_token + fixed", not three.
+        const uint64_t term_total_bytes =
+            (packed_values && packed_geom)
+                ? packed_values_scratch_reservation_bytes(packed_values_scratch_fixed_bytes_,
+                                                          packed_values_scratch_per_token_bytes_,
+                                                          lanes, max_ctx)
+                : 0;
+        const std::string packed_values_clause =
+            (packed_values && packed_geom)
+                ? log::format(" + prefill scratch %.2f GiB (4-bit values, chunk %d)",
+                              static_cast<double>(term_total_bytes) / (1u << 30),
+                              packed_values_chunk)
+                : std::string();
         log::info("load",
                   "reservation: weights+graph %.2f GiB + drafters %.2f + expert slots %.2f (%s) "
-                  "+ activations %.2f (all %d lane%s, chunk %zu) + margin %.2f + %d x (GDN rows "
-                  "%.1f MiB + KV %.1f KiB/token) of %.2f GiB -> max ctx %lld per lane",
+                  "+ activations %.2f (all %d lane%s, chunk %zu)%s + margin %.2f + %d x (GDN "
+                  "rows %.1f MiB + KV %.1f KiB/token) of %.2f GiB -> max ctx %lld per lane",
                   static_cast<double>(resident_base) / (1u << 30),
                   static_cast<double>(drafter_bytes) / (1u << 30),
                   static_cast<double>(slot_pool) / (1u << 30),
                   slot_source.empty() ? "off" : slot_source.c_str(),
                   static_cast<double>(activation_total) / (1u << 30), lanes,
-                  lanes == 1 ? "" : "s", chunk, static_cast<double>(margin) / (1u << 30), lanes,
+                  lanes == 1 ? "" : "s", chunk, packed_values_clause.c_str(),
+                  static_cast<double>(margin) / (1u << 30), lanes,
                   static_cast<double>(slab) / (1u << 20),
                   static_cast<double>(kv_bytes_token_) / 1024.0,
                   static_cast<double>(total) / (1u << 30), max_ctx);
+        if (packed_values && packed_geom) {
+            log::info("load",
+                      "4-bit values: prefill scratch charged %.1f MiB at chunk %d for n_ctx %lld "
+                      "(per token %.1f KiB + KV %.1f KiB)",
+                      static_cast<double>(term_total_bytes) / (1u << 20), packed_values_chunk,
+                      max_ctx, static_cast<double>(packed_values_scratch_per_token_bytes_) / 1024.0,
+                      static_cast<double>(kv_bytes_token_) / 1024.0);
+        }
         prefill_chunk_ = static_cast<int>(chunk);
         // The M9 4-bit-values prefill-chunk belt (exec/fit.h's
         // prefill_chunk_cap_for_packed_values) and the snapshot grid it
@@ -3583,14 +3656,64 @@ private:
             }
             if (!failed) {
                 const size_t   observed = device_resident_bytes(device);
-                const size_t   ceiling  = total > margin ? total - margin : 0;
+                // Round-3 review, finding 2 (REAL defect, corrects round-2
+                // review's own F4 comment): that comment claimed `total`
+                // "was sized net of the term back at the climb, so
+                // `ceiling = total - margin` already reflects it" -- false.
+                // `total` is `device_total_mem_size`, a constant read once
+                // at load and never adjusted for anything the climb
+                // charges (the climb shrinks `max_ctx`, not `total`), so a
+                // bare `total - margin` never held the scratch term back at
+                // all. An observed residency landing just under THAT
+                // ceiling was accepted, the pool kept every one of those
+                // bytes, and the scratch buffer -- not yet allocated at
+                // this point in the load -- still had to fit in whatever
+                // was left once the first real prefill grew it: the
+                // ORIGINAL fault this whole term exists to prevent,
+                // reintroduced silently by the one check that was supposed
+                // to be the last line of defence against it.
+                //
+                // The fix: the pool may only be ACCEPTED up to `total -
+                // margin - scratch_term_bytes`, where `scratch_term_bytes`
+                // (packed_values_scratch_reservation_bytes, fit.h) is
+                // priced at THIS pass's own `paged_n_ctx_` -- the same
+                // per-pass depth `predicted_total` below already reads --
+                // so the ceiling tightens and loosens in step with the
+                // very n_ctx the replay loop is trying. 0 on every load
+                // that is not under 4-bit values (both scratch members
+                // default to 0), so this only ever narrows the ceiling on
+                // the loads that need it, never on any other.
+                const uint64_t scratch_term_bytes = packed_values_scratch_reservation_bytes(
+                    packed_values_scratch_fixed_bytes_, packed_values_scratch_per_token_bytes_,
+                    lanes, static_cast<long long>(paged_n_ctx_));
+                const size_t ceiling = phase_e_ceiling_bytes(total, margin, scratch_term_bytes);
+                // `predicted_total` is what should already be RESIDENT the
+                // instant `alloc_kv_pools` above returns -- weights,
+                // drafters, the slot pool, the probed activations, and the
+                // KV pool this pass just requested. The scratch term is
+                // deliberately NOT folded in here (round-2 review, F4,
+                // unchanged by this round): it is not part of what
+                // `alloc_kv_pools` commits -- it does not exist at past 0
+                // (exec/fit.h's own M9 comment) and only grows once the
+                // first real prefill runs PAST this point in the load.
+                // Folding it in here would make `observed < predicted_
+                // total` true on every 4-bit-values load unconditionally
+                // (the buffer is never resident yet at this instant),
+                // turning the "deferred commit" branch below into a line
+                // that always fires and calls a buffer that has not been
+                // allocated yet a deferred commit of something that should
+                // already be there. `ceiling` (above) is the ONLY place
+                // this pass holds room back for the term -- a stricter,
+                // narrower check than `predicted_total`'s "is it resident
+                // yet", which is the right asymmetry: the ceiling asks
+                // "will there be room later", predicted_total asks "is it
+                // here already".
                 const uint64_t predicted_total =
                     static_cast<uint64_t>(resident_base) + drafter_bytes + slot_pool +
                     static_cast<uint64_t>(std::max<long long>(activation_total, 0)) + margin +
                     static_cast<uint64_t>(lanes) *
                         (static_cast<uint64_t>(slab) +
-                         static_cast<uint64_t>(paged_n_ctx_) *
-                             static_cast<uint64_t>(kv_bytes_token_));
+                         static_cast<uint64_t>(paged_n_ctx_) * static_cast<uint64_t>(kv_bytes_token_));
                 if (observed > ceiling) {
                     over = observed - ceiling;
                     log::warn("load",
@@ -3901,12 +4024,47 @@ private:
         // both fields side by side (`activation_bytes` at the pre-cap
         // chunk, `prefill_chunk` post-cap) rather than silently reconciling
         // them, so the mismatch is legible instead of hidden.
-        if (value_prec.bitwidth() == 4) {
-            const std::optional<PackedValuesScratchGeometry> geometry =
-                packed_values_scratch_geometry(artifact_.config);
+        // ARCINT_PREFILL_CHUNK_CAP=off is the measurement switch: it keeps the
+        // requested chunk so the fault line itself can be reproduced on a card
+        // (the belt would otherwise hide it); logged loudly, never a default.
+        // `cap_off` and `packed_geom` were already resolved once, before the
+        // climb above (the fit-side term needs the same two facts) -- reused
+        // here rather than re-read/re-parsed a second time.
+        if (packed_values && cap_off) {
+            log::warn("load", "%s",
+                      "ARCINT_PREFILL_CHUNK_CAP=off: the 4-bit-values prefill-chunk belt is "
+                      "disabled for this load (measurement only) -- a long prefill may fault");
+        }
+        if (packed_values && !cap_off) {
+            const std::optional<PackedValuesScratchGeometry>& geometry = packed_geom;
             if (geometry) {
+                // Round-2 review, F1: the belt is non-increasing in depth,
+                // and every path to `paged_n_ctx_` (min(wanted, max_ctx),
+                // the prefix-cache reserve, Phase E's own trims) only ever
+                // LOWERS the served depth from the climb's own settled
+                // max_ctx -- so a trim that crosses one of the belt's own
+                // step boundaries can hand back a LARGER chunk here than
+                // `packed_values_scratch_chunk_` (the chunk the reservation
+                // above actually priced the term at), even though the
+                // served depth only went down (measured shape: max_ctx
+                // 131,104 -> term priced at chunk 32; Phase E trims one
+                // page to 131,072 -> the belt, asked fresh from the
+                // unclamped `prefill_chunk_`, would pick 64 -- a real
+                // shortfall against the charged term, see the member's own
+                // comment). `lgc::belt_requested_chunk` (fit.h -- extracted
+                // round-3 review, finding 3, so a test exercises this exact
+                // implementation rather than a second copy of the choice)
+                // caps the belt's OWN requested chunk to
+                // `min(prefill_chunk_, packed_values_scratch_chunk_)`,
+                // keeping its answer bounded by the priced chunk no matter
+                // what depth it is asked about: the belt only ever shrinks
+                // its input, never grows it, so the served chunk can never
+                // exceed the smaller of the two -- and with served n_ctx
+                // <= the priced max_ctx too, the charged term stays >= what
+                // is actually served, unconditionally.
                 const int capped = prefill_chunk_cap_for_packed_values(
-                    prefill_chunk_, paged_n_ctx_, geometry->heads, geometry->head_size,
+                    belt_requested_chunk(prefill_chunk_, packed_values_scratch_chunk_),
+                    paged_n_ctx_, geometry->heads, geometry->head_size,
                     kPrefillScratchBudgetBytesPackedValues, cfg.kv_block_size);
                 if (capped < prefill_chunk_) {
                     log::info("load",
@@ -4405,12 +4563,72 @@ private:
         set_i32("la.block_indices_begins", {0, static_cast<int32_t>(la_rows.size())});
         set_i32("la.past_lens", {static_cast<int32_t>(past)});
         set_i32("la.cache_interval", {interval});
+        // ARCINT_FORWARD_SPLIT=1: wall clock of the three parts of a paged
+        // forward, averaged over 64 forwards and logged, so a served step's
+        // cost can be attributed to the graph, the logits readback or the
+        // hidden-state readback instead of guessed. Measurement switch only.
+        static const char* split_env    = std::getenv("ARCINT_FORWARD_SPLIT");
+        static const bool  split_log    = split_env != nullptr;
+        // ARCINT_FORWARD_SPLIT=2: also measurement only. Re-runs the just-
+        // completed forward a second time, immediately after the hidden-
+        // state copy, with the same inputs already set on lane.req (nothing
+        // here changes them) -- the repeat re-writes the same KV rows the
+        // first infer just wrote, which is harmless for a measurement run
+        // (identical inputs, so an idempotent write). This isolates whether
+        // the served forward's cost at depth (measured 2026-09-03, 76k: the
+        // MTP verify step at 430 ms against 211 ms for an isolated plain
+        // forward) is STATEFUL/queue-related (a repeat on an already-warm
+        // request should land near the isolated 211 ms) or INPUT-related (a
+        // repeat should still cost close to 430 ms).
+        static const bool split_repeat = split_log && std::string(split_env) == "2";
         with_turn(lane, [&] {
+            // Four steady_clock::now() reads every served forward (t0..t3),
+            // whether or not ARCINT_FORWARD_SPLIT is set: on this host
+            // std::chrono::steady_clock::now() costs tens of nanoseconds,
+            // negligible against a forward measured in milliseconds -- an
+            // always-on read here is not a measurable tax.
+            const auto t0 = std::chrono::steady_clock::now();
             lane.req.infer();
+            const auto t1 = std::chrono::steady_clock::now();
             if (want_logits) copy_out(lane.req.get_tensor("logits"), lane.logits);
+            const auto t2 = std::chrono::steady_clock::now();
             if (mtp_ready_) copy_out(lane.req.get_tensor("hidden_states"), lane.hidden);
+            const auto t3 = std::chrono::steady_clock::now();
+            // The repeat's own two reads are gated on split_repeat, not
+            // unconditional like t0..t3 above: they exist only to time a
+            // forward that itself only happens under ARCINT_FORWARD_SPLIT=2.
+            double repeat_ms = 0.0;
+            if (split_repeat) {
+                const auto tr0 = std::chrono::steady_clock::now();
+                lane.req.infer();
+                const auto tr1 = std::chrono::steady_clock::now();
+                repeat_ms = std::chrono::duration<double, std::milli>(tr1 - tr0).count();
+            }
             if (dflash_active(lane) && want_feats) {
                 copy_out(lane.req.get_tensor("dflash_feats"), lane.dfeats);
+            }
+            if (split_log) {
+                static double a_inf = 0, a_log = 0, a_hid = 0, a_rep = 0;
+                static int    a_n   = 0;
+                static size_t a_tok = 0;
+                a_inf += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                a_log += std::chrono::duration<double, std::milli>(t2 - t1).count();
+                a_hid += std::chrono::duration<double, std::milli>(t3 - t2).count();
+                if (split_repeat) a_rep += repeat_ms;
+                a_tok += n;
+                if (++a_n == 64) {
+                    const std::string repeat_suffix =
+                        split_repeat ? log::format(", repeat infer %.1f ms", a_rep / a_n)
+                                     : std::string();
+                    log::info("profile",
+                              "paged forward split over %d forwards (%zu tokens, past now %zu): "
+                              "infer %.1f ms, logits %.1f ms, hidden %.1f ms per forward%s",
+                              a_n, a_tok, past, a_inf / a_n, a_log / a_n, a_hid / a_n,
+                              repeat_suffix.c_str());
+                    a_inf = a_log = a_hid = a_rep = 0;
+                    a_n   = 0;
+                    a_tok = 0;
+                }
             }
         });
         return lane.logits;
@@ -4905,8 +5123,25 @@ private:
         // this hook timed M=1..8 "at depth 1" because it read the capture
         // depth, which ARCINT_PROFILE=1 sets to one token), else ARCINT_PROFILE.
         const size_t mwall_depth = past > 0 ? past : depth;
+        // ARCINT_PROFILE_MWALL_LA=1: the checkpoint-rows arm below needs
+        // rows [0..M] -- M+1 rows -- from the lane's own checkpoint table.
+        // Read once, before the sweep, so the skip check below and the row
+        // list built further down agree on the same flag.
+        static const bool la_arm = std::getenv("ARCINT_PROFILE_MWALL_LA") != nullptr;
         for (size_t m : profile_mwall_list()) {
             if (m == 0) continue;
+            // Measured 2026-09-03 (24 GB card): M=8 against a 4-row lane
+            // silently truncated the checkpoint list to 4 rows instead of
+            // the 9 the served verify graph actually addresses -- GPU page
+            // faults and a device coredump, not merely a wrong number.
+            // Skip the M outright rather than pass a short list.
+            if (la_arm && m + 1 > rows_per_lane_) {
+                log::warn("profile",
+                          "M-wall LA arm: M=%zu needs %zu checkpoint rows, lane has %zu -- "
+                          "skipped",
+                          m, m + 1, rows_per_lane_);
+                continue;
+            }
             const size_t depth = mwall_depth;
             release_lane(lane);
             zero_paged_rows(lane);
@@ -4936,16 +5171,34 @@ private:
                 paged_forward(lane, embed_paged(lane, make_tokens(take)), at, {0}, 0, false);
                 at += take;
             }
+            // ARCINT_PROFILE_MWALL_LA=1: pass the served verify's checkpoint
+            // inputs (rows [0..M], interval 1, one GDN-state row written per
+            // token) instead of the plain step's ({0}, 0). Measured 2026-09-03
+            // at 76k: the served 2-token verify graph ran 430 ms against 211 ms
+            // for the plain 2-token forward; this arm isolates those inputs.
+            // `la_arm` itself is read once above the sweep, alongside the
+            // skip guard that keeps this loop from ever reaching here with
+            // fewer than m+1 rows available.
+            std::vector<int32_t> la_rows{0};
+            int                  la_interval = 0;
+            if (la_arm) {
+                la_rows.clear();
+                for (size_t r = 0; r <= m && r < rows_per_lane_; ++r) {
+                    la_rows.push_back(static_cast<int32_t>(r));
+                }
+                la_interval = 1;
+            }
             const auto t_m0 = std::chrono::steady_clock::now();
             for (int i = 0; i < reps; ++i) {
                 paged_forward(lane, embed_paged(lane, make_tokens(m)),
-                              depth + static_cast<size_t>(i) * m, {0}, 0);
+                              depth + static_cast<size_t>(i) * m, la_rows, la_interval);
             }
             const double m_wall_ms = 1000.0 * seconds_since(t_m0) / reps;
             log::info("profile",
                       "forward wall clock M=%zu at depth %zu: %.2f ms/step, %.2f ms/token "
-                      "(%d reps)",
-                      m, depth, m_wall_ms, m_wall_ms / static_cast<double>(m), reps);
+                      "(%d reps%s)",
+                      m, depth, m_wall_ms, m_wall_ms / static_cast<double>(m), reps,
+                      la_arm ? ", checkpoint rows + interval 1" : "");
         }
 
         release_lane(lane);
@@ -5756,6 +6009,35 @@ private:
     // reuse granularity, which is a multiple of this and therefore compatible.
     size_t                         kv_block_tokens_  = 16;
     size_t                         kv_bytes_token_   = 0;
+    // M9 (2026-09-03, 16 GiB card, coder, --paged-kv u8:i4, host-side VRAM
+    // sampled every 2 s): the packed-4-bit-values prefill scratch term
+    // (exec/fit.h's packed_values_prefill_scratch_bytes) charged into the
+    // fit's climb -- see the FitTerms/fit_context_packed_values call site
+    // below. Zero except on a load where value_prec is 4-bit; carried as
+    // members (not locals) so the belt call site after Phase E (below) and
+    // the summary log line can read what the climb already priced instead
+    // of recomputing it.
+    uint64_t                       packed_values_scratch_per_token_bytes_ = 0;
+    uint64_t                       packed_values_scratch_fixed_bytes_     = 0;
+    // Round-2 review, F1: the chunk fit_context_packed_values's own fixed
+    // point actually priced the term at (PackedValuesFitTerm::chunk) --
+    // NOT `prefill_chunk_`, which the belt call site below re-derives from
+    // scratch at the SERVED depth after Phase E may have trimmed it. Every
+    // path to that served depth only ever lowers it (min(wanted, max_ctx),
+    // the prefix-cache reserve, Phase E's own trims), and the belt is
+    // non-increasing in depth (a smaller depth can only ever pick an
+    // EQUAL-OR-LARGER chunk) -- so a trim that crosses one of the belt's
+    // own step boundaries can hand back a chunk LARGER than the one this
+    // term was priced at, even though the served depth only went down.
+    // Measured shape (16 GiB card, coder, u8:i4): max_ctx settles at
+    // 131,104 with the term priced at chunk 32 (~385 MiB); Phase E trims
+    // one page to 131,072, and the belt, asked fresh with the unclamped
+    // `prefill_chunk_` at that new depth, picks 64 (~768 MiB) -- a ~383
+    // MiB shortfall against the charged term, bigger than the 256 MiB
+    // margin. The belt call site clamps its OWN requested chunk to
+    // `min(prefill_chunk_, packed_values_scratch_chunk_)` so the served
+    // chunk can never exceed the priced one.
+    int                            packed_values_scratch_chunk_ = 0;
     size_t                         la_row_bytes_     = 0;
     size_t                         logits_keep_rows_ = 0;  // 0: unsliced
     size_t                         cache_grid_       = 0;  // paged snapshot grid; 0: the chunk
