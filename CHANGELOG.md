@@ -1,0 +1,150 @@
+# Changelog
+
+The human record of what each release changed and what it depends on. The
+package record lives in `contrib/packaging/arcint/debian/changelog` (one
+entry per built package) and the plugin patch record in
+`contrib/packaging/marfrit-openvino/patches/README.md`; this file names the
+same releases by tag and adds what a reader upgrading needs first: the
+runtime dependency. Every number here was measured; the measurement
+protocol and the retractions are in `DESIGN.md` §7.
+
+Runtime dependency throughout: `marfrit-openvino`, a source build of
+OpenVINO at the pinned upstream commit `71640275` (the 2026.4.0 nightly of
+2026-08-21) with the patch series in `patches/` applied. The patch level
+is part of the package version (`+p1`, `+p2`) and a release names the level
+it was built and measured against; the dependency is strict because a
+different nightly is a different ABI.
+
+## Unreleased
+
+- Drafting II measured (M11, `DESIGN.md` §7.0.2z): four host-side levers on
+  the DFlash2 chain, all free of training. Viterbi over the selector's
+  lattice accepts fewer drafts than the greedy commit on every probe;
+  blocks of 12 and 16 gain a few percent of tokens per verify cycle and
+  lose 6 to 21% of throughput; the ngram drafter falls below plain decoding
+  on the dense 27B. The offline oracle puts a floor of +0.74 accepted
+  drafts per cycle under any re-ranker restricted to the same candidates.
+- New flags: `--dflash-block N`, `--dflash-select greedy|viterbi` (greedy
+  stays the default and byte-for-byte the previous selector),
+  `--dflash-lambda X`, `--dflash-topk K`; the `ARCINT_DFLASH_DUMP` cycle
+  dump and `tools/dflash_oracle.py`.
+
+## 0.2.13 — 2026-09-03
+
+Requires `marfrit-openvino 2026.4.0~dev20260821+p2` (patches 0003–0013).
+
+### Added
+- Measured reservation (M7): the fit pass adopts the maximum admissible
+  `--n-ctx` when the flag is omitted and prints the ledger it used; an
+  explicit `--n-ctx` is verify-only and never lowered. On the 24 GB card
+  the dense 27B agent at u8 with an 8 GiB prefix cache admits 155,568
+  tokens; a unit hand-set above that is refused by design.
+- `--paged-kv KEY[:VALUE]` (M8): asymmetric KV, u8 keys with i4 values, at
+  8.8 KiB per token against u8's 11.3. Auto-fit context on the coder
+  (16 GiB card) 133,456 → 171,312, on the dense agent (24 GB card) 155,376
+  → 199,424; acceptance task 10/10 on the coder at u8:i4. Still owed:
+  the u8:i4 prefill price and prefix byte-exactness.
+- `--offload-ratio` device-tier expert slot pool with asynchronous uploads
+  (M9, plugin patches 0004–0007): the 35B on the 16 GiB card from 0.4 t/s
+  (ratio 25, unpatched) to 9.1 (ratio 50, 8 GiB pool, 16-token probe) and
+  10.4 (64-token probe).
+- `--moe-cpu-tier` and `--moe-cpu-tier-threads` (M14, plugin patches
+  0011–0012): experts that would evict a device slot are computed on the
+  host instead. 35B on the 16 GiB card: 15.0 / 15.5 t/s against 10.4 / 10.6
+  at ratio 50 with an 8 GiB pool, 14.1 / 14.8 against 7.4 / 7.5 at ratio
+  75 with 5 GiB; greedy text byte-identical over 64 tokens; 10/10.
+- `--prefix-cache-reserve PCT`: under auto-fit, hold that share of the
+  affordable KV pages spare for cached prefixes (default 0, the previous
+  behaviour: all pages live). The dense agent at 25% adopts 116,528 with
+  2,428 pages spare.
+- `--pin-dispatch` (M12, measured null on a quiet host, opt-in) and the
+  exporter's `--moe-lowering tiled` form.
+- `--vision`: reserved and refused (M13). The vision IRs a VLM export ships
+  are reported at load and never read (coder: 6 files, 428.3 MiB on disk).
+- Per-expert routing histogram in the plugin (patch 0013, env
+  `MOE_OTD_ROUTING_HIST=<path>`), the input for any expert placement or
+  bit-width policy.
+- `llm.txt` carries the complete `--help`.
+
+### Fixed
+- An explicit `--n-ctx` below the admissible maximum was refused whenever a
+  prefix cache was configured: the cache's reserve pages were sized from
+  the whole budget and the overshoot was blamed on the request. The
+  reserve is trimmed first now, the request never; the refusal is itemized
+  in pages.
+- The auto-fit correction could not converge when the pool held spare
+  pages: a sub-page overshoot moved live pages into spare and the pool
+  total never changed. It trims the pool total with a 4/16/64/256-page
+  floor and refuses loudly, with the attempt history, above an allocation
+  granule of 84 pages.
+- Two help-text defects (a literal `%%`, a paragraph under the wrong flag).
+
+### Dependencies
+- `marfrit-openvino +p2`: ten new plugin patches (0004–0013) on the same
+  upstream commit; the runtime reports `...-marfrit-p2`. Patches 0001 and
+  0002 remain deliberately unapplied.
+- Unit files ship `--n-ctx` as a multiple of 4096 below the admissible
+  number the fit pass prints: coder 131072 (u8), agent 262144 (the 35B's
+  trained maximum, verified), the dense 27B with MTP 131072.
+
+## 0.2.12 — 2026-09-01
+- DFlash2 block-diffusion drafter: `--dflash DIR` serves the public
+  Qwen3.8-27B draft head, seven drafts per verify pass; 44.8 t/s on the
+  24 GB card against 24.0 plain and 33.0 with the MTP head;
+  `--dflash-device` parks the draft on the other card with byte-identical
+  output. `tools/export_dflash.py` and the pairing-probe instruments.
+
+## 0.2.11 — 2026-09-01
+- Operator serving defaults: `--temp`, `--top-p`, `--top-k`,
+  `--repetition-penalty`, `--presence-penalty`, `--chat-template-kwarg`;
+  precedence request > flags > artifact > family card.
+- `usage.completion_tokens_details` reports accepted and rejected
+  prediction tokens per response.
+
+## 0.2.10 — 2026-09-01
+- Review fixes on the paged path (index-tensor map pruning, embeddings
+  byte check, MTP argmax guard, a 16-token page tripwire);
+  `ARCINT_PA_HOST_INPUTS` experiment. Requires `marfrit-openvino +p1`
+  (patch 0003: the MoE subbuffer churn at token_num > 1). The -3 package
+  corrected the self-reported version.
+
+## 0.2.9 — 2026-08-30
+- `/props` publishes `chat_template_caps`; `reasoning_effort` accepted as
+  the template's on/off switch.
+
+## 0.2.8 — 2026-08-30
+- `reasoning_content` split from `content` for templates that open the
+  think block in the prompt.
+
+## 0.2.7 — 2026-08-30
+- Tool-call arguments reach the template as the type its capability flag
+  asks for (the 500 on tool-using turns).
+
+## 0.2.6 — 2026-08-30
+- `--gate-pad N` (shared-expert gate widened for a JIT GEMM: −13% prefill
+  wall, −5..6% decode, off by default); profiler tables name their capture.
+
+## 0.2.5 — 2026-08-30
+- The logits slice fix: +27% prefill, six device-to-host copies per
+  prefill gone, 2.09 GiB of activation reservation returned.
+
+## 0.2.4 — 2026-08-29
+- The public repository becomes the upstream (no sanitised export);
+  u8-vs-f16 KV corrected at depth (f16 7.8% faster at 53.5k tokens).
+
+## 0.2.3 — 2026-08-29
+- `--paged-kv u8|f16`; u8 default with its prefill price on the record;
+  two retractions kept in `DESIGN.md`.
+
+## 0.2.2 — 2026-08-29
+- `--served-model-name`; `/props` carries the context length; the unit
+  template installs from CMake.
+
+## 0.2.1 — 2026-08-29
+- `/v1/models` carries `n_ctx`, `n_ctx_train`, quant, lanes; the shipped
+  unit starts on a package-only host. The -2 package was a rebuild of a
+  stale archive.
+
+## 0.2.0 — 2026-08-29
+- First packaged release: amd64, trixie, strict dependency on
+  `marfrit-openvino` at the pinned nightly.

@@ -228,7 +228,7 @@ arcint (0.2.1-1) trixie; urgency=medium
     /usr/bin/arcint, where this package installs it, not %h/.local/bin/arcint,
     which is where a source build lands.
   * The unit carries literal flags and arcint.env is gone with the package.
-    Roundhouse reads port, served name and context out of ExecStart; behind
+    The fleet's unit manager reads port, served name and context out of ExecStart; behind
     ${ARCINT_PORT} the port board cannot see the port and edit_rollout cannot
     edit the flags. Also After=default.target: graphical-session.target does
     not exist in a headless container.
@@ -245,6 +245,6 @@ arcint (0.2.0-1) trixie; urgency=medium
     because the runtime is a nightly: a different nightly is a different ABI,
     not an upgrade.
   * The unit ships as a template, not installed: arcint runs as a systemd user
-    unit, and on the dev host that directory is a git repo owned by the fleet's unit managouse.
+    unit, and on the dev host that directory is a git repo owned by the fleet's unit manager.
 
  -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 29 Aug 2026 16:00:00 +0200

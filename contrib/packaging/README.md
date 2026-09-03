@@ -9,6 +9,9 @@ They are not a supported product. No `.deb` is published anywhere — the built
 packages live in a private fleet repository. What is here is everything needed
 to build the same thing.
 
+The top-level `CHANGELOG.md` is the human record per release; the Debian
+changelogs here are the package record.
+
 Kept in step by hand: every tagged release updates `arcint/build-deb.sh`
 (PKGVER, PKGREL, tarball sha256, the marfrit-openvino pin) and the changelog
 here in the same breath as the fleet copy — a stale recipe is a broken

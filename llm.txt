@@ -448,6 +448,10 @@ misc
 
 ## Layout
 
+- CHANGELOG.md: per-release changes and the runtime dependency (patch level)
+  each release was built against; the Debian changelogs under contrib/ are the
+  package record.
+
 - README.md: scope, features, non-goals, status, building, why-not-X.
 - DESIGN.md: architecture (§3), caching (§3.3–3.4), MTP (§3.5), serving (§4),
   test gates (§5), evidence against upstream pipeline layer (§6),

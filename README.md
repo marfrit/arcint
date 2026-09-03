@@ -408,7 +408,8 @@ stress (200 requests, 24-way, 8 lanes, queueing and refusing), an equivalence
 suite and a concurrency suite that run where the card is. Clean under ASan and
 UBSan on x86_64.
 
-[DESIGN.md](DESIGN.md) records how these numbers were taken, including the
+[CHANGELOG.md](CHANGELOG.md) lists what each release changed and the
+runtime it depends on. [DESIGN.md](DESIGN.md) records how these numbers were taken, including the
 negative results and the explanations that were retracted when a measurement
 contradicted them.
 
