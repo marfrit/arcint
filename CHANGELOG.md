@@ -18,6 +18,37 @@ different nightly is a different ABI.
 ## Unreleased
 
 ### Fixed since 0.2.13 (unreleased)
+- `--prefill-chunk` under 4-bit paged VALUES: an engine-side belt
+  (`exec/fit.h`'s `prefill_chunk_cap_for_packed_values`) now lowers the
+  served chunk from the SERVED pool depth (after --n-ctx clamping,
+  --prefix-cache-reserve and the auto-fit replay/trim all run) whenever the
+  requested paged-KV value precision is 4-bit -- the class of load the
+  "Known defects" `--paged-kv u8:i4` entry below describes. Empirical, not
+  a derived mechanism: a proxy formula (chunk x query heads x head_dim x
+  4 bytes x ceil(depth/256), a 512 MiB budget) is chosen so that the
+  budget yields the chunk measured to pass at the deepest fault (64 at
+  119,074 tokens, where 128 faults; 128 passes at 71,689 and 512 at
+  35,227, so the proxy is a yardstick, not a threshold); query heads come from the artifact's own
+  `num_attention_heads` (GQA-correct -- an earlier version of this fix read
+  `num_key_value_heads` first, which undercounts the plugin's own
+  query-head-sized buffer 8x on this family and never actually fired the
+  cap). Never raises the chunk, never touches u8/f16, floors to
+  `--kv-block-size`. Measured on the card (16 GiB-class, coder, u8:i4, the
+  171,312-token auto-fit): the belt lowers the chunk 128 -> 32 and the
+  119,074-token prompt that faulted at chunk 128 prefills in 705 s
+  (169 t/s) and decodes; the root cause in the plugin stays open, so the
+  "Known defects" entry below stays as a disclosure of the fault line. Known
+  residual: the activation reservation is probed at the PRE-cap chunk (the
+  auto-fit climb runs before this belt does), so when the belt fires the
+  reservation over-charges activations for a chunk larger than what is
+  actually served -- conservative, never unsafe; `/status` reports
+  `activation_bytes` (pre-cap) and `prefill_chunk` (post-cap) side by side
+  rather than reconciling them. Measured cost (16 GiB-class card, coder,
+  u8:i4, n_ctx 131,072, 8,417-token prompt): 495 t/s prefill at chunk 128,
+  437 at 64 (-12%), 440 at 32 -- chunk 128 only fits the 512 MiB proxy
+  budget up to n_ctx 65,536 (the proxy scales with pool depth, not prompt
+  length), so every deeper u8:i4 pool pays this price even on short
+  prompts.
 - The DFlash2 drafter past 2,048 tokens: plugin patch 0014 lets an Assign
   adopt a same-type, same-rank output layout instead of asserting (the
   served head now drafts at 17k-token prompts and through 3,000-token
@@ -43,8 +74,13 @@ different nightly is a different ABI.
   16.3 at 76k, and its prefill runs 13% slower than plain there and at
   half plain's rate at 143k; the cause
   is not yet measured (by code reading the reconstructed MTP layer keeps an
-  unpaged state and a dense mask over the whole context). Serve deep
-  contexts with `--mtp off` until it is.
+  unpaged state and a dense mask over the whole context). Timed at 76k
+  (64 greedy tokens, one process per arm): the verify forward of the main
+  graph takes 763 ms per step against 97 ms for a plain decode step, and
+  the per-node profile at that depth over-counts the step about 35x and is
+  flat across one, two and four tokens, so it cannot see this;
+  `ARCINT_PROFILE_MWALL` (new) times the forward per token count at depth
+  instead. Serve deep contexts with `--mtp off` until it is explained.
 - `--paged-kv u8:i4`: a 141,902-token prefill on the coder (16 GiB card,
   auto-fit 171,312) failed with a GPU out-of-resources error and every
   later request in that process failed with it; prompts up to 8,909
@@ -55,8 +91,13 @@ different nightly is a different ABI.
   u8:i4 prefill path. An earlier
   version of this entry said "every prompt over about 2,048 tokens", which
   was an artifact of running the depths deepest-first in one process and
-  is retracted. Until the cause is found, do not deploy u8:i4 for prompts
-  beyond about 70k tokens on the 16 GiB card.
+  is retracted. The fault moves with the prefill chunk (one process per
+  cell, the same 131,072-token pool): 128 faults and 64 passes at
+  119,074 tokens, 256 faults and 128 passes at about 72k, and 512 passes
+  at 35,227 -- so the chunk belt in "Fixed" above keeps the card serving,
+  while the plugin-side cause (a mixed-stage intermediate buffer sized by
+  query heads is the reading; a larger one passes where a smaller faults,
+  so it is not a threshold) stays open.
 - `--dflash`: the exported draft head carries a state variable fixed at
   2,048 rows; the first draft after a prompt longer than that fails and the
   drafter disables itself for the process (decode continues without

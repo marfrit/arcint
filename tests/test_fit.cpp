@@ -1229,3 +1229,326 @@ TEST(sub_page_overshoot_old_shrink_only_logic_leaves_pool_total_flat) {
         CHECK_EQ(history[i], history[0]);  // flat, the defect
     }
 }
+
+// ------------------------------------- packed_values_scratch_geometry
+
+namespace {
+// The coder's own GQA shape (verified on the artifact, round-2 review,
+// CRITICAL finding): 16 query heads, 2 KV heads, head_dim 256. text_config
+// wrapped, the export shape backend_ov.cpp actually reads.
+nlohmann::json coder_text_config_fixture() {
+    return nlohmann::json{{"text_config",
+                          {{"num_attention_heads", 16},
+                           {"num_key_value_heads", 2},
+                           {"head_dim", 256}}}};
+}
+
+// Today's (pre-fix) reading order, reproduced as a stub for the red-first
+// comparison below: prefers num_key_value_heads over num_attention_heads --
+// exactly the CRITICAL finding (the call site fed KV heads first, so the
+// cap priced 2 heads instead of the 16 the plugin's MIXED-stage buffer is
+// actually sized by -- an 8x undercount that meant the cap effectively
+// never fired: 128 MiB priced at n_ctx 131,072 instead of the true 1 GiB).
+std::optional<PackedValuesScratchGeometry> packed_values_scratch_geometry_stub_kv_heads_first(
+    const nlohmann::json& config) {
+    const nlohmann::json& tc =
+        config.contains("text_config") && config["text_config"].is_object()
+            ? config["text_config"]
+            : config;
+    PackedValuesScratchGeometry g;
+    if (tc.contains("num_key_value_heads") && tc["num_key_value_heads"].is_number_integer()) {
+        g.heads = tc["num_key_value_heads"].get<int>();
+    } else if (tc.contains("num_attention_heads") &&
+               tc["num_attention_heads"].is_number_integer()) {
+        g.heads = tc["num_attention_heads"].get<int>();
+    }
+    if (tc.contains("head_dim") && tc["head_dim"].is_number_integer()) {
+        g.head_size = tc["head_dim"].get<int>();
+    }
+    if (g.heads <= 0 || g.head_size <= 0) return std::nullopt;
+    return g;
+}
+}  // namespace
+
+// The defect, reproduced explicitly and by construction: on the coder's
+// own GQA shape, the old KV-heads-first stub above returns heads 2, not
+// 16 -- swapped into packed_values_scratch_geometry_coder_gqa_reads_query_
+// heads below in place of packed_values_scratch_geometry (mechanically:
+// replace the callee, nothing else), it fails --
+//   FAIL <file>:<line>
+//            g->heads == 16
+//            left:  2
+//            right: 16
+//   FAIL packed_values_scratch_geometry_coder_gqa_reads_query_heads
+//   1 case run, 1 failed
+// -- captured verbatim from that swap this round (exact line numbers are
+// this comment's own line count and drift with every edit here, so only
+// the file:line SHAPE is kept; the round's own report has the literal
+// numbers from the run that produced this). Kept here as a standing
+// assertion of the defect itself, the same convention this file already
+// uses for prefill_chunk_stub_no_cap below.
+TEST(packed_values_scratch_geometry_old_kv_heads_first_stub_undercounts) {
+    const auto g = packed_values_scratch_geometry_stub_kv_heads_first(coder_text_config_fixture());
+    CHECK(g.has_value());
+    CHECK_EQ(g->heads, 2);   // the bug, reproduced: KV heads, not query heads
+    CHECK_EQ(g->head_size, 256);
+}
+
+// CRITICAL (round-2 review): the plugin's MIXED-stage intermediate buffer
+// (get_internal_buffer_descs, paged_attention_opt.cpp, read directly) is
+// sized by QUERY heads (`heads_num`), not KV heads -- on this GQA artifact
+// the two differ 8x (16 vs 2), and feeding KV heads undercounts the buffer
+// 8x, which is why the cap effectively never fired in production before
+// this fix.
+TEST(packed_values_scratch_geometry_coder_gqa_reads_query_heads) {
+    const auto g = packed_values_scratch_geometry(coder_text_config_fixture());
+    CHECK(g.has_value());
+    CHECK_EQ(g->heads, 16);   // query heads, NOT the 2 KV heads
+    CHECK_EQ(g->head_size, 256);
+}
+
+TEST(packed_values_scratch_geometry_flat_config_without_text_config_wrapper) {
+    const nlohmann::json flat = {
+        {"num_attention_heads", 16}, {"num_key_value_heads", 2}, {"head_dim", 256}};
+    const auto g = packed_values_scratch_geometry(flat);
+    CHECK(g.has_value());
+    CHECK_EQ(g->heads, 16);
+    CHECK_EQ(g->head_size, 256);
+}
+
+TEST(packed_values_scratch_geometry_missing_heads_is_nullopt) {
+    const nlohmann::json cfg = {{"text_config", {{"head_dim", 256}}}};
+    CHECK(!packed_values_scratch_geometry(cfg).has_value());
+}
+
+TEST(packed_values_scratch_geometry_missing_head_dim_is_nullopt) {
+    const nlohmann::json cfg = {{"text_config", {{"num_attention_heads", 16}}}};
+    CHECK(!packed_values_scratch_geometry(cfg).has_value());
+}
+
+// No fallback: hidden_size / num_attention_heads happens to equal head_dim
+// here (4096 / 16 = 256) but this function must not compute it -- an
+// explicit head_dim is required (round-2 review, finding 1: that identity
+// is not safe for every architecture in this family, so its absence means
+// "cannot price the cap," not "guess from hidden_size").
+TEST(packed_values_scratch_geometry_no_hidden_size_fallback) {
+    const nlohmann::json cfg = {
+        {"text_config", {{"num_attention_heads", 16}, {"hidden_size", 4096}}}};
+    CHECK(!packed_values_scratch_geometry(cfg).has_value());
+}
+
+// ------------------------------------ prefill_chunk_cap_for_packed_values
+
+// Coder shape (verified on the artifact, --paged-kv u8:i4): 16 QUERY heads,
+// 256 head_dim -- packed_values_scratch_geometry_coder_gqa_reads_query_heads
+// above is what actually resolves this from config.json in production; the
+// tests below take heads/head_size as given, the way the pure cap function
+// itself does. kCoderKvBlockSize mirrors config.h's --kv-block-size default
+// (config.cpp:637 admits 16 or 32 only). kScratchBudget mirrors
+// production's own constant rather than a fixture-local number, so a
+// change to the constant is felt here too.
+namespace {
+constexpr int      kCoderHeads       = 16;
+constexpr int      kCoderHeadSize    = 256;
+constexpr int      kCoderKvBlockSize = 32;
+constexpr uint64_t kScratchBudget    = kPrefillScratchBudgetBytesPackedValues;  // 512 MiB
+
+// Today's production behaviour on the 4-bit-value prefill path, reproduced
+// as a stub: the chunk the auto-fit climb decided is served as-is, never
+// revisited for the plugin's opt-path scratch. Kept ONLY in this test file
+// for the red-first comparison below -- production calls
+// lgc::prefill_chunk_cap_for_packed_values instead (backend_ov.cpp, after
+// Phase E, where the served pool depth is final).
+int prefill_chunk_stub_no_cap(int requested_chunk, long long /*max_ctx_tokens*/, int /*heads*/,
+                              int /*head_size*/, uint64_t /*scratch_budget_bytes*/,
+                              int /*block_size*/) {
+    return requested_chunk;
+}
+}  // namespace
+
+// The defect, reproduced explicitly and by construction, not merely
+// described: prefill_chunk_stub_no_cap above IS today's production
+// behaviour on the packed-4-bit-value prefill path -- the chunk the climb
+// decided is served as-is. Swapped into the two production tests below in
+// place of prefill_chunk_cap_for_packed_values (mechanically: replace the
+// callee, nothing else), each fails on its own --
+//   FAIL <file>:<line>
+//            capped == 64
+//            left:  128
+//            right: 64
+//   FAIL prefill_chunk_cap_packed_values_131072_shrinks_128_to_64
+//   1 case run, 1 failed
+//
+//   FAIL <file>:<line>
+//            expected: capped <= 64
+//   FAIL <file>:<line>
+//            capped == 64
+//            left:  128
+//            right: 64
+//   FAIL prefill_chunk_cap_packed_values_119074_caps_to_64
+//   1 case run, 1 failed
+// -- captured verbatim from that swap this round (each test run filtered on
+// its own name; exact line numbers drift with every edit to this comment,
+// so only the file:line SHAPE is kept here -- the round's own report has
+// the literal numbers from the run that produced this). Kept here as a
+// standing
+// assertion of the defect itself (the stub never shrinks anything, for any
+// input), the same convention
+// sub_page_overshoot_old_shrink_only_logic_leaves_pool_total_flat uses
+// above for the auto-fit spare-cap defect.
+TEST(prefill_chunk_cap_packed_values_old_no_cap_stub_never_shrinks) {
+    CHECK_EQ(prefill_chunk_stub_no_cap(128, 131072, kCoderHeads, kCoderHeadSize, kScratchBudget,
+                                       kCoderKvBlockSize),
+             128);
+    CHECK_EQ(prefill_chunk_stub_no_cap(128, 119074, kCoderHeads, kCoderHeadSize, kScratchBudget,
+                                       kCoderKvBlockSize),
+             128);
+}
+
+// n_ctx 131,072: the SERVED pool depth from the round-2 review's own
+// measurement window (all cells shared this one pool). ceil(131072/256) =
+// 512 partitions exactly (131072/256 = 512.0). Chunk 128 is 128 x 16 KiB x
+// 512 = 1 GiB, chunk 64 is exactly 512 MiB -- AT the budget, not under it
+// with margin: kPrefillScratchBudgetBytesPackedValues (fit.h) was chosen
+// specifically to land here, at the deepest served pool and the shallowest
+// chunk ever measured to fault (128, at 119,074 past within this same
+// pool).
+TEST(prefill_chunk_cap_packed_values_131072_shrinks_128_to_64) {
+    const int capped = prefill_chunk_cap_for_packed_values(
+        128, 131072, kCoderHeads, kCoderHeadSize, kScratchBudget, kCoderKvBlockSize);
+    CHECK_EQ(capped, 64);
+}
+
+// max_ctx 119,074: the measured FAULT cell (CL_OUT_OF_RESOURCES at chunk
+// 128; passed at chunk 64, 605 s, 197 t/s) within the 131,072-deep pool
+// above. Evaluated at its own past_len instead of the pool depth, chunk 128
+// is 932 MiB of tmp_out (466 partitions, ceil(119074/256) = 466), chunk 64
+// is 466 MiB -- under budget -- so the proxy lands on exactly the chunk
+// that was measured to pass here too, not merely somewhere at or below it.
+TEST(prefill_chunk_cap_packed_values_119074_caps_to_64) {
+    const int capped = prefill_chunk_cap_for_packed_values(
+        128, 119074, kCoderHeads, kCoderHeadSize, kScratchBudget, kCoderKvBlockSize);
+    CHECK(capped <= 64);   // the bound the mitigation task asked for
+    CHECK_EQ(capped, 64);  // and, checked exactly: it is not merely bounded
+}
+
+// max_ctx 171,312 (the u8:i4 auto-fit depth from fit.h's own M7 comment
+// history, §"171,488 -- corrected to 171,312"), evaluated as a served pool
+// depth in its own right. ceil(171312/256) = 670 partitions. Chunk 128 is
+// 1.31 GiB, chunk 64 is 670 MiB (over budget), chunk 32 is 335 MiB -- under.
+TEST(prefill_chunk_cap_packed_values_171312_caps_to_32) {
+    const int capped = prefill_chunk_cap_for_packed_values(
+        128, 171312, kCoderHeads, kCoderHeadSize, kScratchBudget, kCoderKvBlockSize);
+    CHECK_EQ(capped, 32);
+}
+
+// n_ctx 8,192: a shallow served pool. Chunk 128 is 128 x 16 KiB x 32
+// partitions (ceil(8192/256) = 32) = 64 MiB -- comfortably under the
+// 512 MiB budget -- so the request already satisfies it and comes back
+// unchanged, same as if the cap had never been applied.
+TEST(prefill_chunk_cap_packed_values_8192_leaves_128_unchanged) {
+    const int capped = prefill_chunk_cap_for_packed_values(
+        128, 8192, kCoderHeads, kCoderHeadSize, kScratchBudget, kCoderKvBlockSize);
+    CHECK_EQ(capped, 128);
+}
+
+// max_ctx 71,689: the measured PASSING cell at chunk 128 (see fit.h's own
+// comment: faults are observed only at ~119k past for chunk 128, not at
+// 71,689). ceil(71689/256) = 281 partitions -- 128 x 16 KiB x 281 = 562 MiB,
+// above the 512 MiB budget despite this exact cell having passed on the
+// card. The belt is conservative BY DESIGN (fit.h's own comment): 512 MiB
+// was chosen to reproduce chunk 64 at the deepest measured pool, not to
+// price every individual passing cell exactly, so a cell that happened to
+// pass at 128 can still be trimmed.
+TEST(prefill_chunk_cap_packed_values_71689_shrinks_128_to_64) {
+    const int capped = prefill_chunk_cap_for_packed_values(
+        128, 71689, kCoderHeads, kCoderHeadSize, kScratchBudget, kCoderKvBlockSize);
+    CHECK_EQ(capped, 64);
+}
+
+// Round-2 review residual 2: the function returns the first HALVING LADDER
+// step that fits, not the largest block_size multiple that fits -- these
+// differ here. 96 is a multiple of kCoderKvBlockSize (96 / 32 = 3) and
+// 96 x 16 KiB x 281 partitions = 441,974,784 bytes, UNDER the 512 MiB
+// (536,870,912-byte) budget -- 96 fits, and 96 > 64. But halving from 128
+// visits 64 directly (128 / 2 = 64 exactly) and stops there because 64
+// already fits; 96 sits between 64 and 128 and is never visited. This is
+// by design (fit.h's own comment on prefill_chunk_cap_for_packed_values):
+// the ladder only ever returns chunks the belt's own measurements were
+// taken at.
+TEST(prefill_chunk_cap_packed_values_71689_skips_a_larger_fitting_multiple) {
+    constexpr uint64_t kPartitions71689 = 281;  // ceil(71689 / 256)
+    constexpr uint64_t kPerChunkTokenBytes =
+        static_cast<uint64_t>(kCoderHeads) * kCoderHeadSize * 4ull * kPartitions71689;
+    constexpr int kLargerMultiple = 96;
+    CHECK(kLargerMultiple % kCoderKvBlockSize == 0);          // a legal block_size multiple
+    CHECK(kLargerMultiple * kPerChunkTokenBytes <= kScratchBudget);  // and it fits
+    CHECK(kLargerMultiple > 64);                               // strictly larger than what we get
+
+    const int capped = prefill_chunk_cap_for_packed_values(
+        128, 71689, kCoderHeads, kCoderHeadSize, kScratchBudget, kCoderKvBlockSize);
+    CHECK_EQ(capped, 64);  // not 96, even though 96 also fits and is larger
+}
+
+// Floor case (round-2 review residual 2): when NOTHING on the ladder fits
+// -- not even block_size itself -- the function still returns block_size
+// rather than refusing or returning 0. Geometry is deliberately absurd
+// (1000 heads x 1000 head_size, one partition) against a 1-byte budget so
+// every ladder step, including the floor, is manifestly over budget:
+// block_size (32) x 1000 x 1000 x 4 = 128,000,000 bytes, nowhere near
+// fitting a 1-byte budget.
+TEST(prefill_chunk_cap_packed_values_floor_case_returns_block_size_when_nothing_fits) {
+    const int capped = prefill_chunk_cap_for_packed_values(
+        128, /*max_ctx_tokens=*/256, /*heads=*/1000, /*head_size=*/1000,
+        /*scratch_budget_bytes=*/1, kCoderKvBlockSize);
+    CHECK_EQ(capped, kCoderKvBlockSize);  // the floor, not a refusal -- see the function's own comment
+}
+
+// The chunk is never RAISED, even when the budget has room to spare -- a
+// request already below what the budget would admit comes back exactly as
+// requested.
+TEST(prefill_chunk_cap_packed_values_never_raises_the_chunk) {
+    const int capped = prefill_chunk_cap_for_packed_values(
+        64, 8192, kCoderHeads, kCoderHeadSize, kScratchBudget, kCoderKvBlockSize);
+    CHECK_EQ(capped, 64);
+}
+
+// Granule (round-2 review, finding 5): the result must stay a multiple of
+// the KV block size config.cpp:738 already enforces --prefill-chunk against
+// -- requested 96 with block_size 32 must land on 64, not 48. 96 / 2 = 48
+// FLOORS to 32 (one block below the true half) but CEILS to 64 (one block
+// at or above it); the mitigation rounds up, so a request that fails at 96
+// tries 64 next, not a smaller value that was never actually measured to
+// help. Geometry is deliberately trivial (heads 1, head_size 1, one
+// partition) so only the rounding direction is under test: 96 x 4 = 384
+// bytes fails a 300-byte budget, 64 x 4 = 256 passes, and 48 is never
+// tried.
+TEST(prefill_chunk_cap_packed_values_rounds_up_to_the_block_granule) {
+    const int capped =
+        prefill_chunk_cap_for_packed_values(96, /*max_ctx_tokens=*/256, /*heads=*/1,
+                                            /*head_size=*/1, /*scratch_budget_bytes=*/300,
+                                            /*block_size=*/32);
+    CHECK_EQ(capped, 64);
+}
+
+// u8 (symmetric, no 4-bit value side) is unaffected because backend_ov.cpp
+// never calls this function on that path -- there is no 4-bit signal to
+// gate it on, so there is nothing to unit-test about u8 here directly.
+// Exercised instead as the function's own no-op guard: geometry the caller
+// could not price (heads/head_size/depth/block_size 0, as if the caller
+// had nothing to price) passes the request through unchanged rather than
+// inventing a cap from nothing.
+TEST(prefill_chunk_cap_packed_values_unset_geometry_is_a_no_op) {
+    CHECK_EQ(prefill_chunk_cap_for_packed_values(128, 119074, /*heads=*/0, kCoderHeadSize,
+                                                 kScratchBudget, kCoderKvBlockSize),
+             128);
+    CHECK_EQ(prefill_chunk_cap_for_packed_values(128, 119074, kCoderHeads, /*head_size=*/0,
+                                                 kScratchBudget, kCoderKvBlockSize),
+             128);
+    CHECK_EQ(prefill_chunk_cap_for_packed_values(128, /*max_ctx_tokens=*/0, kCoderHeads,
+                                                 kCoderHeadSize, kScratchBudget, kCoderKvBlockSize),
+             128);
+    CHECK_EQ(prefill_chunk_cap_for_packed_values(128, 119074, kCoderHeads, kCoderHeadSize,
+                                                 kScratchBudget, /*block_size=*/0),
+             128);
+}

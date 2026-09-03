@@ -3114,6 +3114,69 @@ that carries a plugin without 0014; the export's trim takes a runtime slice
 start and the tool reproduces the served int4 head byte for byte. Those
 are in the changelog's unreleased section with their numbers.
 
+#### 7.0.2ab The u8:i4 edge bracketed by chunk, the belt, and the profile that cannot see depth (2026-09-03)
+
+The chunk-size discriminator owed by §7.0.2aa ran the same afternoon, one
+process per cell, the coder on the 16 GiB card at `--paged-kv u8:i4` with
+the same pool in every cell (n_ctx 131,072, 8,194 pages, 1.10 GiB of KV),
+the prompt length being what varied:
+
+| prefill chunk | prompt tokens | proxy (chunk × 16 KiB × ⌈past ÷ 256⌉) | result |
+|---|---|---|---|
+| 128 | 119,074 | 932 MiB | driver out-of-resources |
+| 64 | 119,074 | 466 MiB | prefills in 605 s (197 t/s), decodes |
+| 128 | 71,689 | 562 MiB | passes |
+| 256 | ≈72,000 | 1,128 MiB | driver out-of-resources |
+| 512 | 35,227 | 1,104 MiB | prefills in 233 s (151 t/s), decodes |
+
+Halving the chunk clears the 119k prompt, and doubling it breaks the 72k
+one, so the fault does move with the chunk. But the chunk-512 cell passes
+with a larger proxy than the chunk-128 cell that faults, so the
+§7.0.2aa reading — that this one scratch buffer is the price and the
+fault — is not a threshold and is retracted as a mechanism. What the
+plugin source says (read, not measured): the mixed-stage paged attention
+allocates its intermediate output as tokens × *query* heads × head size ×
+4 bytes × partitions, 16 query heads on the coder against its 2 KV heads,
+and the past-0 prefill stage allocates none of it, which is why the first
+chunk never faults; micro-SDPA selection is per device and precision, not
+per chunk, so it does not explain the chunk-512 cell. Why 1,104 MiB
+passes where 932 MiB faults is open.
+
+**The belt.** The engine now caps the prefill chunk under 4-bit values
+from the served pool depth, with the proxy above as the yardstick and a
+512 MiB budget chosen so that the measured passing chunk is what the
+budget yields: 64 at n_ctx 131,072, 32 at the 171,312-token auto-fit,
+128 unchanged up to 65,536; it halves and rounds up to the KV block
+granule, never raises, caps an explicit `--prefill-chunk` the same way
+and logs the geometry it used. It runs after the pool depth is final, so
+an explicit shallow `--n-ctx` is not capped for the auto-fit depth, and
+the activation reservation stays the one probed at the pre-cap chunk
+(over-charged, never unsafe). The first version fed the 2 KV heads and
+would never have fired on the coder; the review caught it and the
+geometry helper is now tested with the coder's own configuration. Its
+price on short prompts, same card and pool, an 8,417-token prompt: 495 t/s
+prefill at chunk 128, 437 at 64 and 440 at 32 — about 12%, and 32 costs
+nothing over 64. Decode is unchanged. Verified on the card: at the
+171,312-token auto-fit the belt lowers the chunk from 128 to 32 and the
+119,074-token prompt that faulted at chunk 128 prefills in 705 s
+(169 t/s) and decodes its 400 tokens.
+
+**The MTP step at depth, timed.** The 27B agent on the 24 GB card at u8,
+a 76,403-token prompt, 64 greedy tokens, one process per arm: with the MTP
+head the 64 tokens take 58.7 s (1.1 t/s), of which the verify forward is
+48.8 s — 763 ms per step against 97 ms for the plain step (6.3 s for the
+same 64 tokens, 10.1 t/s) — and a further 130 ms per step is inside
+"other" and unattributed. The verify timer wraps the main graph's forward
+of the verify batch, not the MTP layer; the MTP layer and head run without
+profiling and with a dense mask over the committed prefix. The per-node
+profile at that depth does not measure this: with `ARCINT_PROFILE_PAST`
+at 76,000 the node totals come to 3.4–3.7 s per capture for a step whose
+wall is under 0.1 s, the engine's own caveat line fires, and the table is
+flat across one, two and four tokens (paged attention 2.23, 2.37 and
+2.41 s in counter terms). A wall clock of the forward per token count at
+depth is the measurement that can see it; the hook is in and its numbers
+follow in this section.
+
 #### 7.0.2r DFlash2: the external-drafter hook gets a real drafter (2026-09-01)
 
 The public block-diffusion head for the 3.8 went from HF checkpoint to a

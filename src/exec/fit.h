@@ -2,14 +2,21 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <utility>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 // M7 — auto-fit and the honest reservation (design: "M7 — Auto-fit and the
 // honest reservation", 2026-09-01, §1/§2/§4). Pure arithmetic, no OpenVINO
 // types, so it builds and runs on any host: the load path in backend_ov.cpp
 // measures every term on the card and hands them here; this file only adds
-// them up and floors the result to a page.
+// them up and floors the result to a page. `packed_values_scratch_geometry`
+// below is the one exception to "pure arithmetic": it reads an artifact's
+// config.json (nlohmann::json, already a build dependency of this
+// repository's core, not an OpenVINO type) so the query-heads/head_dim
+// lookup it replaces in backend_ov.cpp is testable without a card too.
 //
 // The defect this removes: with --offload-ratio > 0 the expert slot pool
 // commits physical memory at first touch (a deferred allocation, not a lie
@@ -707,6 +714,189 @@ inline bool prefix_cache_reserve_shortfall(size_t accepted_spare_blocks,
                                            long long reserve_spare_pages) {
     return reserve_spare_pages > 0 &&
            static_cast<long long>(accepted_spare_blocks) < reserve_spare_pages;
+}
+
+// M9 engine-side belt for packed 4-bit paged VALUES -- EMPIRICAL, not a
+// derived mechanism (round-2 review, finding 3: the first version of this
+// comment asserted a single scratch-byte threshold, and a later measurement
+// contradicts that reading directly -- chunk 512 at a 35,227-token prompt
+// PASSES, at ~1,104 MiB of the very buffer named below, while chunk 128 at a
+// 119,074-token prompt FAULTS at ~932 MiB: the larger buffer is the one that
+// worked, so "total scratch bytes <= threshold" is not what actually decides
+// pass/fail, and this comment no longer claims it is).
+//
+// What IS measured (16 GiB-class card, coder artifact, `--paged-kv u8:i4`,
+// one process per cell, pool n_ctx 131,072 unless noted): faults observed
+// only at past >= ~72k for chunk 256 and past >= ~119k for chunk 128; never
+// at chunk 64 in any cell tried, up to a 119,074-token prompt (605 s,
+// 197 t/s); the same chunk 128 with plain `--paged-kv u8` (no 4-bit value
+// side) prefills a 119,074-token prompt without incident, so the fault is
+// specific to 4-bit-packed values, not chunk size alone. Read-only recon of
+// the plugin (record, not something this repository derives or verifies):
+// under i4-packed values, prefill routes through an "opt" paged-attention
+// path with a MIXED-stage (past > 0) intermediate buffer sized
+//   chunk x query_heads x head_size x 4 bytes x ceil(past / 256)
+// -- query heads (`heads_num` in the plugin's own buffer-size call), not KV
+// heads; on this GQA artifact (16 query heads, 2 KV heads) the two differ by
+// 8x, which is exactly what an earlier version of the call site got wrong
+// (fed KV heads, undercounted the buffer 8x, and the cap never fired). This
+// formula is used here as a PROXY the empirical bound is expressed in --
+// convenient because it is monotonic in chunk and in depth, matching the
+// "smaller chunk, or shallower pool, is safer" shape the measurements show
+// -- not as a claim that it is the plugin's exact allocation arithmetic
+// (the contradiction above rules that out as a complete account).
+//
+// kPrefillScratchBudgetBytesPackedValues is chosen, not derived: 512 MiB is
+// the figure that makes this proxy formula land on chunk 64 -- the largest
+// chunk measured to pass at every depth tried, including the deepest
+// (119,074 past) -- when evaluated at pool depth 131,072 (the served n_ctx
+// during measurement): 64 x 16 x 256 x 4 x ceil(131072/256) = 64 x 16 KiB x
+// 512 = exactly 512 MiB. The margin at the passing 71,689-token cell (562
+// MiB at chunk 128, per the proxy) is incidental to this choice, not a
+// second data point it was fit to.
+constexpr uint64_t kPrefillScratchBudgetBytesPackedValues = 512ull << 20;  // 512 MiB
+
+// The two numbers the proxy formula above needs from the artifact's own
+// geometry: QUERY heads (`num_attention_heads` -- the plugin's MIXED-stage
+// buffer is sized by query heads, not KV heads; see the round-2 review
+// finding this fixes, quoted above) and `head_dim`. text_config-aware, the
+// same convention backend_ov.cpp's own inline JSON reads use elsewhere
+// (moe_intermediate_size, geometry fields) -- when `config` carries a
+// `text_config` object, that is read instead of the top level.
+//
+// Deliberately narrow: no `num_key_value_heads` fallback for heads (that IS
+// the bug this function exists to fix -- KV heads undercount the query-head
+// buffer on any GQA artifact), and no `hidden_size / num_attention_heads`
+// fallback for `head_size` (not a safe identity for every architecture in
+// this family; the config's own explicit `head_dim`, when absent, means
+// "this function cannot price the cap," not "guess"). Either field missing
+// returns nullopt -- the caller's job is to warn and skip the cap, not to
+// invent geometry.
+struct PackedValuesScratchGeometry {
+    int heads     = 0;  // query heads (num_attention_heads)
+    int head_size = 0;  // head_dim
+};
+
+inline std::optional<PackedValuesScratchGeometry> packed_values_scratch_geometry(
+    const nlohmann::json& config) {
+    const nlohmann::json& tc =
+        config.contains("text_config") && config["text_config"].is_object()
+            ? config["text_config"]
+            : config;
+    PackedValuesScratchGeometry g;
+    if (tc.contains("num_attention_heads") && tc["num_attention_heads"].is_number_integer()) {
+        g.heads = tc["num_attention_heads"].get<int>();
+    }
+    if (tc.contains("head_dim") && tc["head_dim"].is_number_integer()) {
+        g.head_size = tc["head_dim"].get<int>();
+    }
+    if (g.heads <= 0 || g.head_size <= 0) return std::nullopt;
+    return g;
+}
+
+// Returns the chunk the HALVING LADDER lands on: starting from
+// `requested_chunk`, repeatedly halve and round UP to the next multiple of
+// `block_size` (the KV page granularity config.cpp:738 already requires
+// --prefill-chunk to divide) until a candidate satisfies
+//   chunk * heads * head_size * 4 * ceil(max_ctx_tokens / 256) <= scratch_budget_bytes
+// (the proxy above), or `requested_chunk` unchanged when it already
+// satisfies that bound. This is the FIRST ladder step that fits, never
+// below `block_size` -- NOT the largest block-size multiple that fits, by
+// design (round-2 review residual 2): the ladder only ever visits values
+// derived from `requested_chunk` by repeated halving (128, 64, 32, ... --
+// the chunks this belt's own measurements were actually taken at), so an
+// intermediate multiple the halving step skips over can satisfy the bound
+// and still not be returned. Concretely, at the coder's own shape (16
+// heads, 256 head_size, 512 MiB budget) and depth 71,689: 96 is a multiple
+// of block_size 32, and 96 x 16 KiB x 281 partitions = 442 MiB fits under
+// budget -- but halving from 128 goes straight to 64 and stops there
+// (64 fits too), so 96 is never tried and never returned (see
+// prefill_chunk_cap_packed_values_71689_skips_a_larger_fitting_multiple in
+// tests/test_fit.cpp). Deliberate: halving keeps the served chunk on the
+// values that were measured to pass or fault (128, 64, 32...), never on an
+// arbitrary intermediate multiple nothing on the card ever actually ran at.
+// Never raises the chunk: halving only ever starts from the request and
+// stops the moment a candidate fits. `max_ctx_tokens` is the SERVED pool
+// depth this load actually committed to -- backend_ov.cpp's final
+// `paged_n_ctx_`, after --n-ctx clamping, --prefix-cache-reserve, and
+// Phase E's replay/trim have all run -- not the pre-trim auto-fit `max_ctx`
+// and not an individual request's prompt length (round-2 review, finding 4:
+// an explicit --n-ctx well under a deep auto-fit ceiling must not be capped
+// for a depth it will never reach). Any missing/non-positive input (heads,
+// head_size, max_ctx_tokens, requested_chunk, scratch_budget_bytes,
+// block_size) is "nothing to reason about" and passes `requested_chunk`
+// through unchanged, same as the caller not calling this at all -- this
+// function never widens a refusal into a silent no-op cap, it only ever
+// narrows.
+//
+// Halving rounds UP to the next `block_size` multiple, not down (round-2
+// review, finding 5): requested 96 with block_size 32 must land on 64, not
+// 48 -- 96/2 = 48 floors to 32 (one block below the true half) but ceils to
+// 64 (one block at or above it), and 64 is what a card that faulted at 96
+// but never at 64 actually needs tried next, not a value smaller again.
+//
+// No guard against the rounded-up `next` reaching or passing `chunk` is
+// needed (round-2 review residual 2: an earlier version carried one,
+// `if (next >= chunk) next = chunk - block_size;`, and it was DEAD --
+// removed rather than kept unreachable). Proof: the loop body only runs
+// when `chunk > block_size`, i.e. `chunk >= block_size + 1`. Let
+// `raw = chunk / 2` (integer division, so `raw <= (chunk - 1) / 2` when
+// `chunk` is odd and `raw = chunk / 2` when even; either way
+// `2 * raw <= chunk - (chunk mod 2) <= chunk`) and `next = ceil(raw /
+// block_size) * block_size <= raw + block_size - 1`. Substituting,
+// `next <= chunk / 2 + block_size - 1`, and this is `< chunk` exactly when
+// `block_size - 1 < chunk / 2`, i.e. `chunk > 2 * block_size - 2` --
+// which `chunk >= block_size + 1` satisfies for every `block_size >= 1`
+// (the two bounds cross only below block_size 1, which `block_size <= 0`
+// already refuses above). Checked exhaustively for block_size 1..2000 at
+// the tightest case `chunk = block_size + 1` (this file's own test suite
+// does not re-derive real numbers from this proof; it is recorded here so
+// a future change to the rounding has something to re-check against).
+//
+// A byte-exact ladder (DESIGN's measurement-discipline gate) that crosses
+// this cap between two runs served a DIFFERENT chunk in each -- chunk
+// boundaries change where the graph slices logits/samples, so equivalence
+// across a change here must record the EFFECTIVE chunk
+// (status_.reservation.prefill_chunk, post-cap) alongside the run, not
+// assume the requested one. The activation reservation itself is NOT
+// re-measured at the post-cap chunk (backend_ov.cpp's own comment at the
+// call site): it stays probed at the pre-cap chunk, which over-charges
+// activations when the belt fires -- conservative, never unsafe.
+inline int prefill_chunk_cap_for_packed_values(int requested_chunk, long long max_ctx_tokens,
+                                               int heads, int head_size,
+                                               uint64_t scratch_budget_bytes, int block_size) {
+    if (requested_chunk <= 0 || max_ctx_tokens <= 0 || heads <= 0 || head_size <= 0 ||
+        scratch_budget_bytes == 0 || block_size <= 0) {
+        return requested_chunk;
+    }
+    // ceil(max_ctx_tokens / 256), the plugin's own partition width (recon,
+    // above) -- not this repository's KV page size (kv_block_tokens_) or
+    // `block_size` (the --prefill-chunk granule this function floors to).
+    const uint64_t partitions = (static_cast<uint64_t>(max_ctx_tokens) + 255) / 256;
+    const uint64_t per_chunk_token_bytes =
+        static_cast<uint64_t>(heads) * static_cast<uint64_t>(head_size) * 4ull * partitions;
+    if (per_chunk_token_bytes == 0) return requested_chunk;  // heads/head_size too small to price
+
+    auto fits = [&](int chunk) {
+        return static_cast<uint64_t>(chunk) * per_chunk_token_bytes <= scratch_budget_bytes;
+    };
+
+    int chunk = requested_chunk;
+    while (!fits(chunk) && chunk > block_size) {
+        int next = chunk / 2;
+        next     = ((next + block_size - 1) / block_size) * block_size;  // round UP to a block
+        // `next` is always `< chunk` here -- see the no-guard-needed proof
+        // above (round-2 review residual 2 removed the guard that used to
+        // sit on this line). `next < block_size` is kept as a defensive
+        // floor even though the same proof shows `raw >= 1` whenever the
+        // loop runs (so `next >= block_size` already): it costs one
+        // comparison and does not depend on `block_size` staying far from
+        // overflowing `next + block_size - 1` above, which the removed
+        // guard's sibling did not protect against either.
+        if (next < block_size) next = block_size;
+        chunk = next;
+    }
+    return chunk;  // block_size is returned even if it does not fit -- the floor, not a refusal
 }
 
 }  // namespace lgc

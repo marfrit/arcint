@@ -3202,23 +3202,13 @@ private:
                   static_cast<double>(kv_bytes_token_) / 1024.0,
                   static_cast<double>(total) / (1u << 30), max_ctx);
         prefill_chunk_ = static_cast<int>(chunk);
-        // The snapshot grid. Tied to the chunk until 2026-08-30, which on the
-        // agent re-prefilled ~1900 tokens per continuation where 128 would
-        // re-prefill ~970 (replay of real sessions, DESIGN 7.0.2j). It must
-        // divide a page, because an entry keeps whole pages, and be a multiple
-        // of the cache's hash block; it cannot exceed the chunk.
-        cache_grid_ = 0;
-        if (cfg.cache_grid > 0 && prefill_chunk_ > 0) {
-            const size_t unit = std::max<size_t>(kv_block_tokens_, 32);
-            size_t g = (static_cast<size_t>(cfg.cache_grid) + unit - 1) / unit * unit;
-            g = std::min<size_t>(g, static_cast<size_t>(prefill_chunk_));
-            if (g != static_cast<size_t>(cfg.cache_grid)) {
-                log::info("load", "--cache-grid %d rounded to %zu (page %zu, hash block 32, chunk %d)",
-                          cfg.cache_grid, g, kv_block_tokens_, prefill_chunk_);
-            }
-            cache_grid_ = g;
-        }
-        log::info("load", "prefix-cache snapshot grid %zu tok", cache_grid_ > 0 ? cache_grid_ : static_cast<size_t>(prefill_chunk_));
+        // The M9 4-bit-values prefill-chunk belt (exec/fit.h's
+        // prefill_chunk_cap_for_packed_values) and the snapshot grid it
+        // feeds (cache_grid_, tied to the chunk) both need the SERVED pool
+        // depth, not this raw auto-fit `chunk`/`max_ctx` pair -- --n-ctx
+        // clamping, --prefix-cache-reserve and Phase E's replay/trim all
+        // still run between here and that final depth. Both are computed
+        // once, together, after Phase E below (round-2 review, finding 4).
 
         // M7 §1 "Explicit --n-ctx": explicit always wins in that it is never
         // silently lowered, but the fit still runs verify-only -- an explicit
@@ -3877,6 +3867,88 @@ private:
                       "compete with the live lanes and evict on demand");
         }
 
+        // M9 engine-side belt for 4-bit paged VALUES, empirical (fit.h's
+        // prefill_chunk_cap_for_packed_values / kPrefillScratchBudgetBytesPackedValues
+        // carry the measurement and the "proxy, not a mechanism" caveat).
+        // Runs HERE, after Phase E, so `paged_n_ctx_` is the SERVED depth --
+        // --n-ctx clamping, --prefix-cache-reserve and every replay/trim
+        // pass have already run (round-2 review, finding 4: applying this
+        // at the pre-trim auto-fit `max_ctx` capped an explicit --n-ctx well
+        // under a deep auto-fit ceiling for a depth it would never reach).
+        // Gated on `value_prec` (what was REQUESTED), not the compiled
+        // port's own type: this plugin generation always compiles paged KV
+        // ports at 8 bits, even for a packed 4-bit request (the port audit
+        // above), so the compiled type alone cannot tell a packed-4-bit
+        // value side apart from a plain 8-bit one -- only the request can.
+        // u8/f16 values never reach this branch, and the cap only ever
+        // lowers `prefill_chunk_`, never raises it -- an explicit
+        // --prefill-chunk is capped the same way, logged rather than
+        // silently. A byte-exact ladder must record the EFFECTIVE chunk
+        // (status_.reservation.prefill_chunk, set below, after this) rather
+        // than assume the requested one: chunk boundaries move where the
+        // graph slices logits.
+        //
+        // Round-2 review residual 3: the activation reservation above
+        // (`activation_total`, `status_.reservation.activation_bytes`) was
+        // already probed and fitted at the PRE-cap `chunk` -- the belt runs
+        // after Phase E, well after that probe climb. When it fires, the
+        // reservation is left over-charging activations for a chunk larger
+        // than what is actually served -- conservative (a real budget term
+        // this load will not spend), never unsafe. Not corrected by a
+        // second probe here: re-probing at the capped chunk would cost
+        // another forward pass on every load that hits this branch, for a
+        // number that can only move the reservation DOWN. /status reports
+        // both fields side by side (`activation_bytes` at the pre-cap
+        // chunk, `prefill_chunk` post-cap) rather than silently reconciling
+        // them, so the mismatch is legible instead of hidden.
+        if (value_prec.bitwidth() == 4) {
+            const std::optional<PackedValuesScratchGeometry> geometry =
+                packed_values_scratch_geometry(artifact_.config);
+            if (geometry) {
+                const int capped = prefill_chunk_cap_for_packed_values(
+                    prefill_chunk_, paged_n_ctx_, geometry->heads, geometry->head_size,
+                    kPrefillScratchBudgetBytesPackedValues, cfg.kv_block_size);
+                if (capped < prefill_chunk_) {
+                    log::info("load",
+                              "prefill chunk %d -> %d for 4-bit values (query heads %d, head "
+                              "size %d, n_ctx %d): empirical belt, measured -- not a derived "
+                              "scratch formula (see exec/fit.h)",
+                              prefill_chunk_, capped, geometry->heads, geometry->head_size,
+                              paged_n_ctx_);
+                    prefill_chunk_ = capped;
+                }
+            } else {
+                log::warn("load", "%s",
+                          "4-bit paged KV values requested, but this artifact's config.json "
+                          "does not carry num_attention_heads and head_dim -- the "
+                          "prefill-chunk scratch belt cannot be sized and is skipped; the "
+                          "plugin's opt paged-attention path may still fault at depth on a "
+                          "tight card");
+            }
+        }
+        // The snapshot grid. Tied to the chunk until 2026-08-30, which on the
+        // agent re-prefilled ~1900 tokens per continuation where 128 would
+        // re-prefill ~970 (replay of real sessions, DESIGN 7.0.2j). It must
+        // divide a page, because an entry keeps whole pages, and be a multiple
+        // of the cache's hash block; it cannot exceed the chunk. Computed
+        // here (not right after the auto-fit climb decided `chunk`) so it
+        // reflects the belt above, when the belt fired -- nothing between
+        // the auto-fit climb and here reads `cache_grid_` (grepped: its only
+        // other reader is the runtime prefill() path, long after load
+        // returns), so deriving it this late is safe.
+        cache_grid_ = 0;
+        if (cfg.cache_grid > 0 && prefill_chunk_ > 0) {
+            const size_t unit = std::max<size_t>(kv_block_tokens_, 32);
+            size_t g = (static_cast<size_t>(cfg.cache_grid) + unit - 1) / unit * unit;
+            g = std::min<size_t>(g, static_cast<size_t>(prefill_chunk_));
+            if (g != static_cast<size_t>(cfg.cache_grid)) {
+                log::info("load", "--cache-grid %d rounded to %zu (page %zu, hash block 32, chunk %d)",
+                          cfg.cache_grid, g, kv_block_tokens_, prefill_chunk_);
+            }
+            cache_grid_ = g;
+        }
+        log::info("load", "prefix-cache snapshot grid %zu tok", cache_grid_ > 0 ? cache_grid_ : static_cast<size_t>(prefill_chunk_));
+
         status_.reservation.measured           = true;
         status_.reservation.device_total_bytes = total;
         status_.reservation.weights_bytes      = resident_base;
@@ -3887,6 +3959,12 @@ private:
         // Reported as the total for all lanes, because that is what it is: the
         // plugin's intermediate pool is per compiled model. Dividing it by the
         // lane count would invent a per-lane cost that nobody pays.
+        //
+        // Round-2 review residual 3: on a 4-bit-values load where the belt
+        // above fired, this is the PRE-cap chunk's own probed figure --
+        // `prefill_chunk` a few lines down is post-cap. The two are
+        // deliberately not reconciled (see the belt's own comment above);
+        // reading them together is how an operator sees the over-charge.
         status_.reservation.activation_bytes = static_cast<uint64_t>(activation_total);
         status_.reservation.la_slab_bytes      = slab;
         status_.reservation.kv_bytes_per_token = kv_bytes_token_;
@@ -4578,6 +4656,27 @@ private:
         if (std::getenv("ARCINT_PROFILE") != nullptr) profile_step();
     }
 
+    // ARCINT_PROFILE_MWALL=<comma list> overrides the token counts the M-wall
+    // sweep times in both profile_step (stateful) and profile_paged (paged);
+    // default {1, 2, 4, 8}. Shared so the two paths answer the same question
+    // with the same M values unless a caller asks otherwise.
+    static std::vector<size_t> profile_mwall_list() {
+        std::vector<size_t> mwall{1, 2, 4, 8};
+        if (const char* list = std::getenv("ARCINT_PROFILE_MWALL")) {
+            mwall.clear();
+            const std::string spec(list);
+            size_t pos = 0;
+            while (pos < spec.size()) {
+                const size_t comma = spec.find(',', pos);
+                const std::string tok = spec.substr(pos, comma - pos);
+                if (!tok.empty()) mwall.push_back(std::strtoul(tok.c_str(), nullptr, 10));
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+        }
+        return mwall;
+    }
+
     // Per-kernel breakdown of the paged graph, for one prefill chunk and one
     // decode step. Prefill has never been profiled on any path: every kernel
     // table in DESIGN describes a decode step, which is how the reference
@@ -4793,6 +4892,49 @@ private:
         paged_forward(lane, embed_paged(lane, {0}), depth, {0}, 0);
         dump("decode step", 1);
 
+        // M-wall sweep: the served MTP verify step forwards M>1 tokens per
+        // step (measured 2026-09-03 on the 24 GB card at 76k depth, u8: the
+        // MTP verify forward took ~763 ms/step against ~97 ms for a plain
+        // 1-token decode step -- a step timing, not yet a per-M wall clock), and the per-node PERF_COUNT table
+        // just dumped exceeds either wall by ~35x and is flat across M -- it
+        // cannot see this scaling. Time M-token forwards directly, on this
+        // paged path, because this is the path production serves
+        // (--paged-kv); profile_step's stateful path gets the same sweep too,
+        // for whichever build has --no-paged instead.
+        for (size_t m : profile_mwall_list()) {
+            if (m == 0) continue;
+            release_lane(lane);
+            zero_paged_rows(lane);
+            int reps = 10;
+            while (reps > 0 && !ensure_blocks(lane, depth + static_cast<size_t>(reps) * m)) {
+                --reps;
+            }
+            if (reps <= 0) {
+                log::warn("profile", "not enough KV pages for M-wall M=%zu at depth %zu", m,
+                          depth);
+                continue;
+            }
+            if (reps < 10) {
+                log::warn("profile",
+                          "M-wall M=%zu at depth %zu: reduced to %d rep(s) for KV pages", m,
+                          depth, reps);
+            }
+            // Same reset-and-prefill the sweep above does per M, so every M
+            // starts from the same depth instead of compounding on the last
+            // M's growth.
+            paged_forward(lane, embed_paged(lane, make_tokens(depth)), 0, {0}, 0, false);
+            const auto t_m0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < reps; ++i) {
+                paged_forward(lane, embed_paged(lane, make_tokens(m)),
+                              depth + static_cast<size_t>(i) * m, {0}, 0);
+            }
+            const double m_wall_ms = 1000.0 * seconds_since(t_m0) / reps;
+            log::info("profile",
+                      "forward wall clock M=%zu at depth %zu: %.2f ms/step, %.2f ms/token "
+                      "(%d reps)",
+                      m, depth, m_wall_ms, m_wall_ms / static_cast<double>(m), reps);
+        }
+
         release_lane(lane);
         zero_paged_rows(lane);
         // Unconditionally, not restoring a snapshot: lane 0 holds no pages when
@@ -4850,6 +4992,55 @@ private:
             log::info("profile", "%8.1f us %5d  %5.1f%%  %s", rows[i].second.us, rows[i].second.n,
                       100.0 * rows[i].second.us / total, rows[i].first.c_str());
         }
+
+        // M-wall sweep: the served MTP verify step forwards M>1 tokens per
+        // step (measured 2026-09-03 on the 24 GB card at 76k depth, u8: the
+        // MTP verify forward took ~763 ms/step against ~97 ms for a plain
+        // 1-token decode step -- a step timing, not yet a per-M wall clock), and the PERF_COUNT node total above
+        // exceeds either wall by ~35x and is flat across M -- it cannot see
+        // this scaling. This times M-token forwards directly instead.
+        // ARCINT_PROFILE_TOKENS=random uses pseudo-random ids, the same knob
+        // profile_paged's sweep honours; make_tokens there is a lambda local
+        // to that function, so this is its own small xorshift rather than a
+        // shared one.
+        const bool rnd_tokens = [] {
+            const char* v = std::getenv("ARCINT_PROFILE_TOKENS");
+            return v != nullptr && std::string(v) == "random";
+        }();
+        uint64_t mwall_rng = 88172645463325252ull;
+        auto     mwall_tokens = [&](size_t n) {
+            std::vector<int> t(n, 0);
+            if (rnd_tokens) {
+                for (size_t i = 0; i < n; ++i) {
+                    mwall_rng ^= mwall_rng << 13;
+                    mwall_rng ^= mwall_rng >> 7;
+                    mwall_rng ^= mwall_rng << 17;
+                    t[i] = static_cast<int>(mwall_rng % 100000U) + 1;
+                }
+            }
+            return t;
+        };
+        // The stateful graph carries its KV in internal variables, not a
+        // page pool -- there is nothing here to guard the way profile_paged
+        // guards lane.blocks against pool_, so none is added.
+        for (size_t m : profile_mwall_list()) {
+            if (m == 0) continue;
+            // Same reset-and-prefill this function does above, so every M
+            // starts from the same depth instead of compounding on the last
+            // sweep's growth.
+            lm_req_.reset_state();
+            forward(lane, warm, 0);
+            const auto t_m0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < reps; ++i) {
+                forward(lane, mwall_tokens(m), depth + static_cast<size_t>(i) * m);
+            }
+            const double m_wall_ms = 1000.0 * seconds_since(t_m0) / reps;
+            log::info("profile",
+                      "forward wall clock M=%zu at depth %zu: %.2f ms/step, %.2f ms/token "
+                      "(%d reps)",
+                      m, depth, m_wall_ms, m_wall_ms / static_cast<double>(m), reps);
+        }
+
         lm_req_.reset_state();
     }
 

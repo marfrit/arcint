@@ -344,7 +344,20 @@ memory
                             a smaller number instead
   --kv-block-size 16|32     KV page size in tokens (default: 32)
   --prefill-chunk N         prefill chunk in tokens, 0 = unchunked
-                            (default: 2048; bounds activation memory)
+                            (default: 2048; bounds activation memory).
+                            Under 4-bit paged VALUES the served chunk is
+                            capped from the pool depth (empirical belt,
+                            measured; logged when it fires) -- see
+                            exec/fit.h's prefill_chunk_cap_for_packed_values.
+                            An explicit --prefill-chunk is capped the same
+                            way, never raised. Measured cost (16 GiB-class
+                            card, coder, u8:i4, n_ctx 131,072, 8,417-token
+                            prompt): 495 t/s prefill at chunk 128, 437 at 64
+                            (-12%), 440 at 32. Chunk 128 only fits the
+                            512 MiB proxy budget up to n_ctx 65,536 (the
+                            proxy scales with pool depth, not prompt
+                            length), so every deeper u8:i4 pool pays this
+                            price even on short prompts.
   --paged-kv KEY[:VALUE]    KV precision on the paged path (default: u8). KEY and
                             VALUE each one of f16, u8, i8, u4, i4; omitting :VALUE
                             applies KEY to both the key and value cache ("u8" and
