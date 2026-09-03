@@ -156,6 +156,19 @@ struct Config {
     // string rather than two fields -- the pair is parsed where it is needed
     // (parse_paged_kv below), not stored twice.
     std::string paged_kv                  = "u8";    // KEY[:VALUE], see parse_paged_kv
+
+    // 0015 (design note o-0015-design.md, section C): the patched GPU
+    // plugin's own RW config key PAGED_ATTENTION_MAX_PARTITIONS bounds how
+    // many 256-token partitions the mixed-stage paged-attention kernel
+    // covers per work-group -- past that bound, the buffer this repository's
+    // M9 term prices (exec/fit.h) stops growing with depth. 0 (default) =
+    // unbounded, today's behaviour, and asks the plugin for nothing --
+    // omitting the key from the compile-time AnyMap is indistinguishable
+    // from asking for 0 as far as VRAM goes, but the engine only claims the
+    // bound (and the plugin's f16-corrected buffer sizing that ships with
+    // it) when the plugin actually accepted the key; see backend_ov.cpp's
+    // load path for the probe-and-fall-back.
+    int         paged_attention_max_partitions = 0;
     int         gate_pad                  = 0;       // 0 = off; 16 = the measured setting
     int         cache_grid                = 0;       // prefix-cache snapshot grid; 0 = the prefill chunk (see DESIGN 7.0.2j)
     int         cache_host_mib            = 0;       // host tier for evicted prefixes, MiB; 0 = off

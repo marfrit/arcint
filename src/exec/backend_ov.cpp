@@ -2374,6 +2374,90 @@ private:
             // KV_CACHE_PRECISION onto both sides anyway.
             props["VALUE_CACHE_PRECISION"] = value_prec;
         }
+        // 0015 engine side (design note o-0015-design.md, scratchpad,
+        // section C): PAGED_ATTENTION_MAX_PARTITIONS is a patched plugin's
+        // own RW config key bounding the mixed-stage paged-attention
+        // kernel's partition count, default 0 = unbounded = today's
+        // behaviour. Gated on `value_prec.bitwidth() == 4` -- this
+        // repository's fit only ever charges the scratch term the bound
+        // would shrink for packed-4-bit paged VALUES (packed_values_
+        // prefill_scratch_bytes, exec/fit.h); there is nothing for a u8/f16
+        // load to do with it here.
+        //
+        // Detection is a READ, not a set-and-let-compile-fail: unlike
+        // VALUE_CACHE_PRECISION above (where a plugin that rejects the
+        // property must fail the whole load -- an asymmetric KV request
+        // silently downgraded to symmetric is a correctness bug, not a
+        // missed optimisation), a plugin that cannot carry this bound must
+        // NOT refuse the load -- --paged-attention-max-partitions defaults
+        // to 0, so most loads never ask for a bound at all, and the honest
+        // fallback is the depth-scaled term this file already charges.
+        //
+        // Round-6 review, finding 2 (comment correction): an earlier
+        // version of this comment called `core_.get_property(device, ...)`
+        // throwing on an unrecognised key "the same technique" as
+        // device_resident_bytes's own read (above) and the total-memory
+        // read in this function's own reservation (further down) --
+        // overstated. Those two read KNOWN, TYPED OpenVINO GPU properties
+        // (`ov::intel_gpu::memory_statistics`, `ov::intel_gpu::device_
+        // total_mem_size`) that every GPU plugin instance supports, so
+        // that call essentially never throws in practice; it is the same
+        // FUNCTION, `core_.get_property`, but not the same situation --
+        // this probe is a plain STRING key for a property that legitimately
+        // does not exist on any plugin in this fleet today (no plugin
+        // implementing this patch exists in this tree yet), so throwing is
+        // the ORDINARY case here, not a rare failure mode. A typed
+        // `ov::Property` object is not available for the same reason: this
+        // repository carries no OpenVINO header declaring one for a plugin
+        // patch that has not shipped.
+        //
+        // Probed and, if accepted, SET unconditionally -- even when
+        // `cfg.paged_attention_max_partitions` is 0 (no bound requested):
+        // the key's mere acceptance is how the patched plugin is detected.
+        // `paged_attention_bound_accepted_` (a member, read again much
+        // later at the fit-term climb and the belt call site, both well
+        // after compile) is the one fact that call carries forward.
+        //
+        // Round-7 review (reverting round-6 review finding 2): a separate
+        // read-only PAGED_ATTENTION_PARTIALS_ELEMENT_BYTES key was tried
+        // here, to confirm the f16 host-sizing fix independently of the
+        // bound key's own acceptance. Retracted: the plugin implementer
+        // keeps 0015 as one unit and will not carry a second key for this.
+        // DETECTION CONTRACT, stated plainly because nothing enforces it
+        // in code: a plugin exposing PAGED_ATTENTION_MAX_PARTITIONS
+        // carries the f16 host-sizing fix -- both ship together in patch
+        // 0015, unconditionally. A plugin that exposed the bound key
+        // without the sizing fix would be under-charged by half (4-byte
+        // elements priced as 2-byte); no such plugin exists in this
+        // series, so `element_bytes = 2` follows directly from
+        // `paged_attention_bound_accepted_` below, with no second probe.
+        paged_attention_bound_accepted_ = false;
+        if (value_prec.bitwidth() == 4) {
+            try {
+                (void)core_.get_property(device, "PAGED_ATTENTION_MAX_PARTITIONS");
+                paged_attention_bound_accepted_ = true;
+            } catch (const std::exception&) {
+                paged_attention_bound_accepted_ = false;
+            }
+            if (paged_attention_bound_accepted_) {
+                // The plugin declares this key as Property<size_t, RW>;
+                // `cfg.paged_attention_max_partitions` is `int` (config.h,
+                // parsed and range-checked as a plain CLI integer). Cast
+                // explicitly rather than let ov::Any hold the `int` --
+                // this plugin's read-back is typed, and an `int` payload
+                // can fail that typed read even where the same bit
+                // pattern read back as `size_t` would succeed. The card
+                // run that accepted this property did so before the cast
+                // was made explicit; do not take that as proof an `int`
+                // payload is safe on a future plugin build.
+                props["PAGED_ATTENTION_MAX_PARTITIONS"] =
+                    static_cast<size_t>(std::max(0, cfg.paged_attention_max_partitions));
+            } else {
+                log::info("load", "%s",
+                          "4-bit values: plugin does not carry the bound; scratch term stays "
+                          "depth-scaled");
+            }
+        }
         // The served path could not be profiled at all until now: enable_profiling
         // was wired on the stateful reference path only, so every per-kernel number
         // in this document describes a graph the fleet does not run. ARCINT_PROFILE
@@ -2433,6 +2517,26 @@ private:
         try {
             paged_model_ = core_.compile_model(model, device, props);
         } catch (const std::exception& e) {
+            // Round-6 review, finding 3: the pre-0015 version of this catch
+            // only ever named VALUE_CACHE_PRECISION -- correct while that
+            // was the only speculative property this load could have set,
+            // wrong once PAGED_ATTENTION_MAX_PARTITIONS joined it: a
+            // plugin that reads the key back fine (the probe above
+            // succeeded, so it went into `props`) but rejects it at
+            // compile is a real, distinct failure this catch used to
+            // misattribute to VALUE_CACHE_PRECISION whenever `asym_kv` was
+            // also true, or report with no key named at all otherwise
+            // (a bare `throw;`). Named explicitly now, and the compound
+            // case (both properties speculatively set) says so rather than
+            // guessing which one the plugin actually rejected.
+            if (asym_kv && paged_attention_bound_accepted_) {
+                throw std::runtime_error(log::format(
+                    "asymmetric paged KV %s requested (VALUE_CACHE_PRECISION set) and "
+                    "PAGED_ATTENTION_MAX_PARTITIONS was also set (this plugin's own read-back "
+                    "probe accepted it), but compiling the paged model failed: %s -- refusing "
+                    "rather than guessing which property the plugin actually rejected",
+                    effective_paged_kv.c_str(), e.what()));
+            }
             if (asym_kv) {
                 // Red-first layer 1 (docs/design-m8-asymmetric-kv.md §4b): a
                 // plugin that rejects an unknown VALUE_CACHE_PRECISION
@@ -2443,6 +2547,14 @@ private:
                     "compiling the paged model failed: %s -- refusing rather than silently "
                     "falling back to symmetric %s KV",
                     effective_paged_kv.c_str(), e.what(), pk_key.c_str()));
+            }
+            if (paged_attention_bound_accepted_) {
+                throw std::runtime_error(log::format(
+                    "PAGED_ATTENTION_MAX_PARTITIONS was accepted by this plugin's read-back "
+                    "probe and set to %d, but compiling the paged model failed: %s -- refusing "
+                    "rather than silently falling back to the unbounded, depth-scaled scratch "
+                    "term",
+                    cfg.paged_attention_max_partitions, e.what()));
             }
             throw;
         }
@@ -2744,6 +2856,115 @@ private:
         // first (§1 "B must precede C").
         const size_t configured = prefill_chunk_ > 0 ? static_cast<size_t>(prefill_chunk_) : 512;
         const size_t floor_c    = std::min<size_t>(configured, 128);
+
+        // Round-8 review (Opus): moved EARLY, before any activation
+        // probing -- the served chunk must be known before the one real
+        // probe runs (see the activation climb's own comment, below, for
+        // why). `cap_off` mirrors the belt call site's own
+        // ARCINT_PREFILL_CHUNK_CAP=off measurement switch. `element_bytes`
+        // follows the RW bound key's own acceptance directly (the
+        // detection contract stated at the probe site above: a plugin
+        // exposing PAGED_ATTENTION_MAX_PARTITIONS carries the f16 host
+        // sizing too, both ship together in patch 0015) -- read from the
+        // plugin source once that patch exists in this tree, not a second
+        // probe.
+        const char* cap_env       = std::getenv("ARCINT_PREFILL_CHUNK_CAP");
+        const bool  cap_off       = cap_env != nullptr && std::string(cap_env) == "off";
+        const bool  packed_values = value_prec.bitwidth() == 4;
+        std::optional<PackedValuesScratchGeometry> packed_geom;
+        if (packed_values) packed_geom = packed_values_scratch_geometry(artifact_.config);
+        const int paged_attention_element_bytes =
+            paged_attention_bound_accepted_ ? 2 : 4;
+        const int paged_attention_max_partitions_effective =
+            paged_attention_bound_accepted_ ? cfg.paged_attention_max_partitions : 0;
+
+        // Round-9 review (Opus), finding 2: computed HERE, before the
+        // floor probe below (`act128`) ever runs -- not merely before the
+        // activation-doubling climb, which is what round-8's own version
+        // of this comment claimed but did not do (the floor probe itself
+        // still ran first, so "the one probe runs at the served chunk" was
+        // false whenever the served chunk turned out smaller than the
+        // floor). Round-9 also retracts round-8's own auto-fit ANALYTIC
+        // PRE-PASS SEARCH (fit_context_packed_values_chunk_ceiling,
+        // fit.h) -- it failed open on the card's own constants and, even
+        // fixed, could not be made to land near the real answer (see that
+        // function's own retraction comment for the full account).
+        //
+        // Round-10 review (Opus), finding 1 (REAL defect, retracts round-
+        // 9's own claim just below this line in earlier revisions of this
+        // comment, that "BOTH paths call fit_context_packed_values_at_
+        // depth at wanted, the literal same call for both"): `wanted` is
+        // the artifact's train MAXIMUM, not auto-fit's served depth --
+        // evaluating the belt there gives the smallest, most conservative
+        // chunk (measured: chunk 32 at wanted 262,144), while the depth
+        // auto-fit actually goes on to adopt can be far shallower and
+        // genuinely afford a bigger, cheaper chunk (measured: chunk 64 at
+        // the adopted 103,040) -- an explicit request for that SAME
+        // adopted depth priced the bigger chunk correctly, so auto-fit
+        // was charging a different, more expensive reservation than an
+        // identical explicit request would for the identical served
+        // depth. `chunk_ceiling` computed here is still exactly this:
+        // belt-at-wanted, the smallest safe starting point -- but it is
+        // now used ONLY as the ceiling the one real activation probe
+        // below must not explore past (this repository has no cheap way
+        // to probe activations more than once per chunk before compile),
+        // never as the packed-values term's own final priced chunk. The
+        // auto-fit branch below (`fit_context_packed_values`, the belt's
+        // own chunk-driven fixed-point SEARCH, seeded from `configured`)
+        // finds the real served chunk c*, which is always >= this ceiling
+        // (D* <= wanted, and the belt is non-increasing in depth for a
+        // fixed requested_chunk) -- and re-probes activations UPWARD when
+        // c* turns out bigger than what was measured here (valid: the
+        // plugin's intermediate pool only ever grows to the largest shape
+        // it has seen, so a probe at a bigger chunk than before is a real
+        // measurement, not the round-7 defect, which probed downward into
+        // a stale reading). See that branch's own comment, further down,
+        // for the full loop.
+        // Round-12 review (Opus), finding 1 (HIGH, REAL defect):
+        // `ARCINT_PREFILL_CHUNK_CAP=off` is the measurement switch that
+        // exists so an operator can reproduce the plugin's own fault line
+        // at the FULL requested chunk, belt disabled entirely (see the
+        // Phase E belt call site's own `cap_off` gate, further down) --
+        // but this ceiling used to apply the belt UNCONDITIONALLY,
+        // regardless of `cap_off`, so the one real activation probe below
+        // (and Phase B's plateau probe, which shares this same ceiling)
+        // never got to explore past whatever the belt picked at `wanted`
+        // even with the switch set. Measured: `--prefill-chunk 2048` with
+        // the switch on logged "the belt is disabled for this load" and
+        // then still served chunk 128 -- the switch was a no-op. Gated on
+        // `!cap_off` now; `chunk_ceiling` keeps its already-initialized
+        // `configured` value (no ceiling narrower than the full requested
+        // chunk) whenever the switch is set.
+        size_t chunk_ceiling = configured;
+        if (packed_values && packed_geom && !cap_off) {
+            const long long partitions_at_wanted = packed_values_bounded_partitions(
+                wanted, paged_attention_max_partitions_effective);
+            const int chunk_at_wanted = prefill_chunk_cap_for_packed_values_ex(
+                static_cast<int>(configured), partitions_at_wanted, packed_geom->heads,
+                packed_geom->head_size, paged_attention_element_bytes,
+                kPrefillScratchBudgetBytesPackedValues, cfg.kv_block_size);
+            chunk_ceiling = static_cast<size_t>(std::max(chunk_at_wanted, 1));
+            log::info("load",
+                      "4-bit values: served-chunk ceiling %zu (belt evaluated at n_ctx %d), "
+                      "the activation probe below will not explore past it",
+                      chunk_ceiling, wanted);
+        }
+
+        // Round-10 review (Opus), finding 4: bounded by `chunk_ceiling`
+        // too, not just `configured` -- this is what BOTH Phase B's
+        // plateau probe (immediately below, `--offload-ratio > 0` only)
+        // and the activation climb's own floor probe (further down) run
+        // at, so a 4-bit-values load whose belt ceiling is smaller than
+        // 128 tokens gets ONE consistent floor across both probes, not
+        // Phase B measuring at a bigger, unbounded floor_c while the
+        // activation climb measures at the capped one. An earlier version
+        // of this comment (round-9) said "floor_c itself is left alone,
+        // Phase B's own plateau-probe fallback is not part of this
+        // review" -- that was the actual defect this finding fixes: Phase
+        // B's probe could itself already exceed the served chunk (the
+        // same failure mode the floor probe below was already fixed for).
+        const size_t probe_floor_c = std::min(floor_c, chunk_ceiling);
+
         size_t       probe_pool_blocks = 0;
 
         // ---- Phase B: expert slot pool (M7 §1/§2, reworked after on-card
@@ -2810,7 +3031,7 @@ private:
                 bool probe_ok = true;
                 try {
                     const size_t probe_blocks =
-                        (floor_c + kv_block_tokens_ - 1) / kv_block_tokens_ + 1;
+                        (probe_floor_c + kv_block_tokens_ - 1) / kv_block_tokens_ + 1;
                     if (probe_blocks != probe_pool_blocks) {
                         alloc_kv_pools(rctx, probe_blocks);
                         probe_pool_blocks = probe_blocks;
@@ -2831,16 +3052,16 @@ private:
                     // plateau, not a count").
                     for (int iter = 0; iter < 8 && plateaued < 2; ++iter) {
                         zero_paged_rows(lane0);
-                        std::vector<int> ids(floor_c);
+                        std::vector<int> ids(probe_floor_c);
                         // Distinct ids, so routing actually varies -- the
                         // all-zero activation probe below would hit the same
                         // handful of experts every time and never saturate
                         // the pool. Kept well under any real tokenizer's
                         // vocabulary so this never indexes past the
                         // embedding table.
-                        for (size_t i = 0; i < floor_c; ++i) {
+                        for (size_t i = 0; i < probe_floor_c; ++i) {
                             ids[i] = static_cast<int>(
-                                (static_cast<size_t>(iter) * floor_c + i) % 1000);
+                                (static_cast<size_t>(iter) * probe_floor_c + i) % 1000);
                         }
                         paged_forward(lane0, embed_paged(lane0, ids), 0, {0, 0}, 0);
                         const long long now = static_cast<long long>(
@@ -2949,7 +3170,7 @@ private:
         //
         // `baseline_probe_pool_blocks` is a second, narrower snapshot: how
         // large the KV probe pool already was at the instant
-        // resident_committed was read (Phase B's floor_c pool when the
+        // resident_committed was read (Phase B's probe_floor_c pool when the
         // plateau probe ran; 0 otherwise). The pool's own bytes are already
         // inside resident_committed and inside every later `after` reading,
         // so a probe call must cancel only the CHANGE in pool size since the
@@ -3017,11 +3238,22 @@ private:
         // the fit says it fits WITH headroom, and the fit is re-made from the
         // two most recent measurements as it climbs.
 
+        // Round-9 review (Opus), finding 2: this activation-probe climb's
+        // OWN floor is capped at `chunk_ceiling` too (not just the
+        // doubling climb below it) -- otherwise the floor probe itself,
+        // taken at up to 128 tokens, can already exceed a smaller served
+        // chunk (measured: ceiling 64), and the claim "the one probe runs
+        // at the served chunk" stays false for the floor probe even
+        // though the doubling climb above it is correctly bounded.
+        // `probe_floor_c` itself is computed once, well above (right
+        // after `chunk_ceiling`), and shared with Phase B's own
+        // plateau-probe fallback (round-10 review, finding 4) -- not
+        // redeclared here.
         long long act128 = 0;
         long long extra128 = 0;
         double    slope_extra = 0.0;
         {
-            act128 = probe(lane0, floor_c);
+            act128 = probe(lane0, probe_floor_c);
             // The slice's layout claim, checked against what the graph returned
             // for this forward rather than against the rewrite's return value.
             if (logits_keep_rows_ > 0) {
@@ -3034,10 +3266,10 @@ private:
                     throw std::runtime_error(log::format(
                         "logits slice did not take: %zu row(s) for a %zu-token forward, "
                         "shape %s -- the token axis is not where the slice assumed",
-                        rows, floor_c, os.str().c_str()));
+                        rows, probe_floor_c, os.str().c_str()));
                 }
                 log::info("load", "logits slice verified: %zu row(s) for a %zu-token forward",
-                          rows, floor_c);
+                          rows, probe_floor_c);
             }
             // What a SECOND lane costs, measured rather than assumed to be
             // another full peak. On the B60 with the coder it costs nothing:
@@ -3046,18 +3278,18 @@ private:
             // and with it prefill throughput.
             for (size_t i = 1; i < lanes_.size(); ++i) {
                 const long long before = static_cast<long long>(device_resident_bytes(device));
-                probe(*lanes_[i], floor_c);
+                probe(*lanes_[i], probe_floor_c);
                 const long long added =
                     static_cast<long long>(device_resident_bytes(device)) - before;
                 extra128 += std::max<long long>(added, 0);
             }
-            slope_extra = static_cast<double>(extra128) / static_cast<double>(floor_c);
+            slope_extra = static_cast<double>(extra128) / static_cast<double>(probe_floor_c);
             if (lanes > 1) {
                 log::info("load",
                           "lane activations at a %zu-token probe: lane 0 %.3f GiB, the other %d "
                           "lane(s) %.3f GiB together (the plugin pools intermediates per compiled "
                           "model, so this is measured rather than multiplied)",
-                          floor_c, static_cast<double>(act128) / (1u << 30), lanes - 1,
+                          probe_floor_c, static_cast<double>(act128) / (1u << 30), lanes - 1,
                           static_cast<double>(extra128) / (1u << 30));
             }
         }
@@ -3077,13 +3309,13 @@ private:
         // buys the step back without giving up the climb.
         const double kHeadroom = 1.25;
 
-        size_t    chunk      = floor_c;
+        size_t    chunk      = probe_floor_c;
         long long activation = act128;
         double    slope      = static_cast<double>(std::max<long long>(act128, 1)) /
-                          static_cast<double>(floor_c);
+                          static_cast<double>(probe_floor_c);
         double    intercept  = 0.0;
 
-        while (chunk * 2 <= configured) {
+        while (chunk * 2 <= configured && chunk * 2 <= chunk_ceiling) {
             const size_t next      = chunk * 2;
             const double predicted = intercept + (slope + slope_extra) *
                                                      static_cast<double>(next);
@@ -3187,38 +3419,292 @@ private:
         fterms.n_ctx_floor     = static_cast<int>(
             std::max<size_t>(kv_block_tokens_ * static_cast<size_t>(lanes), 4096));
 
-        // M9 fit-side charge for the packed-4-bit-values prefill scratch
-        // buffer (packed_values_prefill_scratch_bytes, exec/fit.h --
-        // consistent with the measured fault, see that function's own
-        // comment for why "consistent with" rather than "root cause"):
-        // folded into the climb HERE, before fit_context ever runs, because it
-        // changes max_ctx itself and cannot be applied as an after-the-fact
-        // correction the way the belt below is. `cap_off` mirrors the belt
-        // call site's own ARCINT_PREFILL_CHUNK_CAP=off measurement switch,
-        // read once here and reused there: with the belt disabled, the
-        // served chunk is `chunk` unconditionally (no ladder), and the term
-        // must price exactly that, not a shrink that will not happen.
-        const char* cap_env      = std::getenv("ARCINT_PREFILL_CHUNK_CAP");
-        const bool  cap_off      = cap_env != nullptr && std::string(cap_env) == "off";
-        const bool  packed_values = value_prec.bitwidth() == 4;
-        std::optional<PackedValuesScratchGeometry> packed_geom;
-        if (packed_values) packed_geom = packed_values_scratch_geometry(artifact_.config);
-
+        // M9/0015 fit-side charge for the packed-4-bit-values prefill
+        // scratch buffer: folded HERE, before fit_context ever runs,
+        // because it changes max_ctx itself. Round-8 review (Opus):
+        // `cap_off`, `packed_values`, `packed_geom` and the
+        // `paged_attention_*` detection facts are now resolved EARLY
+        // (before the activation probe climb, above -- see that block's
+        // own comment), because the served chunk itself must be known
+        // before the one real activation probe runs; reused here rather
+        // than re-read a second time.
         FitResult fit;
         int       packed_values_chunk = static_cast<int>(chunk);
+        // Round-9 review (Opus), finding 4: the informational per-token
+        // rate for the summary/detail log lines below -- computed
+        // separately from the FIT arithmetic. `fit_context_packed_values_
+        // at_depth` never sets a per-token slope (there is no linear
+        // approximation left when the term is priced exactly at a known
+        // depth), so the log used to read a member that was always 0 on
+        // the explicit path ("per token 0.0 KiB") -- the RATE the term
+        // grows at, AT the served chunk, is what the log means to show,
+        // and that is well defined regardless of which primitive priced
+        // the term.
+        uint64_t packed_values_log_per_token_bytes = 0;
         if (packed_values && packed_geom) {
-            const PackedValuesFitTerm term = fit_context_packed_values(
-                fterms, static_cast<int>(chunk), packed_geom->heads, packed_geom->head_size,
-                kPrefillScratchBudgetBytesPackedValues, cfg.kv_block_size, !cap_off);
+            // Round-8 review (Opus): no re-probing here any more --
+            // round-7's own fix could not work (this file's own record is
+            // that the plugin's intermediate pool grows to the largest
+            // shape it has ever seen and never shrinks, so a probe taken
+            // after a bigger one is a stale no-op; see fit.h's
+            // fit_context_packed_values_at_depth for the full account).
+            // `chunk` (the activation climb's own served chunk, above) was
+            // already capped at `chunk_ceiling` BEFORE that climb ran, so
+            // the real, final `activation_total` was measured at the
+            // right place from the start -- what remains here is the
+            // final admissibility arithmetic, using the primitive both
+            // paths share.
+            //
+            // Round-10 review (Opus, REAL defect -- retracts round-9's own
+            // "both paths evaluate at wanted" claim): `wanted` is NOT the
+            // served depth for auto-fit -- it is the artifact's train
+            // maximum, an UPPER BOUND to search from, and evaluating the
+            // belt there (`chunk_ceiling`, above) is the SMALLEST,
+            // most-conservative chunk possible -- correct as the activation
+            // climb's own safety ceiling, wrong as the packed-values term's
+            // FINAL chunk. Measured: with `wanted` = 262,144 the belt gives
+            // chunk 32; the depth auto-fit actually adopts (103,040) only
+            // needs chunk 64 -- an explicit request for that SAME 103,040
+            // evaluated the honest way (this file's own `at_depth`, below)
+            // priced chunk 64, and auto-fit -- pricing 32 the whole time --
+            // served a different, more expensive reservation for the
+            // identical depth.
+            //
+            // Required design (Opus, round-10): (1) `chunk_ceiling` above
+            // is step 1 -- the conservative starting probe bound. (2) run
+            // the packed-values SEARCH (`fit_context_packed_values`, its
+            // own chunk-driven fixed point, unchanged) seeded from
+            // `configured` (the operator's own default/requested chunk,
+            // NOT the ceiling-capped activation climb's `chunk`) to find
+            // the adopted depth D* and ITS OWN served chunk c*. (3) c* is
+            // >= `chunk_ceiling` by construction (D* <= wanted, belt is
+            // non-increasing in depth). (4) if c* is bigger than the chunk
+            // activations were actually probed at, RE-PROBE upward at c*
+            // (valid -- the plugin's pool only ever grows, so a probe at a
+            // BIGGER chunk than before is a real, honest measurement, not
+            // the round-7 defect, which probed downward into a stale
+            // reading) and re-run the search with the corrected figure;
+            // repeat. `term.chunk` only grows and is bounded above by
+            // `configured`, off the belt's own finite halving ladder, so
+            // this terminates in at most as many rounds as the ladder has
+            // rungs (bounded defensively at 8 anyway).
+            PackedValuesFitTerm term;
+            if (cfg.n_ctx_explicit) {
+                // (5): `wanted` IS the requested depth here, so
+                // `chunk_ceiling` (belt at wanted = D) is already the
+                // right answer -- no search, single evaluation.
+                //
+                // Round-14 review (Opus), finding 1 (REAL defect, third
+                // instance of this class -- round-12's ceiling and
+                // round-11's `prefill_chunk_` seed were the first two):
+                // `fit_context_packed_values_at_depth` had no
+                // `belt_enabled` of its own, so `ARCINT_PREFILL_CHUNK_
+                // CAP=off` was silently ignored on this (explicit
+                // --n-ctx) path -- the switch's own warn log claimed the
+                // belt was disabled while the belt (and the measured cap
+                // on top of it) still ran. Threaded through now: under
+                // `cap_off`, `configured` (the operator's own requested
+                // chunk, NOT `chunk` -- the activation climb's own
+                // served chunk, which can stop short of `configured` for
+                // reasons that have nothing to do with the belt, e.g. an
+                // activation-budget prediction or a failed probe, so it
+                // is not a safe stand-in for "the full requested chunk,
+                // uncapped") is priced with `belt_enabled=false`,
+                // matching the auto-fit search's own `!cap_off` gate
+                // exactly.
+                term = fit_context_packed_values_at_depth(
+                    fterms, cap_off ? static_cast<int>(configured) : static_cast<int>(chunk),
+                    packed_geom->heads, packed_geom->head_size,
+                    kPrefillScratchBudgetBytesPackedValues, cfg.kv_block_size, wanted,
+                    paged_attention_max_partitions_effective, paged_attention_element_bytes,
+                    /*belt_enabled=*/!cap_off);
+            } else {
+                int  last_probed_chunk = static_cast<int>(chunk);
+                bool converged         = false;
+                for (int round = 0; round < 8; ++round) {
+                    term = fit_context_packed_values(
+                        fterms, static_cast<int>(configured), packed_geom->heads,
+                        packed_geom->head_size, kPrefillScratchBudgetBytesPackedValues,
+                        cfg.kv_block_size, !cap_off, paged_attention_max_partitions_effective,
+                        paged_attention_element_bytes);
+                    if (term.chunk <= last_probed_chunk) {
+                        // c* did not grow past what is already measured --
+                        // `term` is CONSISTENT with the activations it was
+                        // just priced against (this round read `fterms.
+                        // activations` and never re-probed), done.
+                        converged = true;
+                        break;
+                    }
+                    const size_t served_chunk = static_cast<size_t>(term.chunk);
+                    long long    reprobed      = probe(lane0, served_chunk);
+                    for (size_t i = 1; i < lanes_.size(); ++i) {
+                        const long long before =
+                            static_cast<long long>(device_resident_bytes(device));
+                        probe(*lanes_[i], served_chunk);
+                        const long long added =
+                            static_cast<long long>(device_resident_bytes(device)) - before;
+                        reprobed += std::max<long long>(added, 0);
+                    }
+                    if (reprobed < 0) reprobed = 0;
+                    log::info("load",
+                              "4-bit values: search wants chunk %zu (was priced at %d) -- "
+                              "re-probed activations upward: %.2f GiB, was %.2f GiB",
+                              served_chunk, last_probed_chunk,
+                              static_cast<double>(reprobed) / (1u << 30),
+                              static_cast<double>(activation_total) / (1u << 30));
+                    activation_total   = reprobed;
+                    fterms.activations = static_cast<uint64_t>(reprobed);
+                    last_probed_chunk  = term.chunk;
+                }
+                if (!converged) {
+                    // Round-11 review (Opus), finding 5: on exhaustion (8
+                    // rounds without the chunk settling), the loop above
+                    // exits right after re-probing at THIS round's own
+                    // `term.chunk` and updating `fterms.activations` to
+                    // match -- but `term` itself is still the STALE result
+                    // computed one round earlier, from the activation
+                    // figure BEFORE that last re-probe. Adopting it would
+                    // serve a (chunk, depth, activation) triple that
+                    // disagrees with the activation figure this file is
+                    // about to charge the reservation with. One more
+                    // evaluation, against the now-current (fully
+                    // re-probed) `fterms`, makes `term` consistent with
+                    // what was actually measured, at the cost of one more
+                    // CPU-only fixed-point pass (no further GPU probe).
+                    //
+                    // Round-12 review (Opus), finding 3 (REAL defect,
+                    // under-reservation risk): that one more evaluation
+                    // used to re-seed from `configured` -- the operator's
+                    // own full requested chunk -- not from `last_probed_
+                    // chunk`, so the search was free to climb PAST the
+                    // chunk activations were actually last measured at.
+                    // Serving a chunk bigger than any chunk this load
+                    // ever probed is exactly the risk the whole upward-
+                    // re-probe design exists to avoid (a bigger chunk can
+                    // legitimately need more resident activation memory
+                    // than a smaller one measured). Re-seeded from
+                    // `last_probed_chunk` instead: the belt never raises
+                    // its output past its own input, so this evaluation's
+                    // `term.chunk` is now bounded above by `last_probed_
+                    // chunk` BY CONSTRUCTION, not by a post-hoc clamp on
+                    // an already-priced (and possibly larger, and now
+                    // wrong) term.
+                    log::warn("load",
+                              "4-bit values: search did not settle within 8 rounds -- adopting "
+                              "the last activation-consistent chunk, clamped to the last "
+                              "actually-probed chunk (%d), rather than one more round of "
+                              "re-probing",
+                              last_probed_chunk);
+                    term = fit_context_packed_values(
+                        fterms, last_probed_chunk, packed_geom->heads,
+                        packed_geom->head_size, kPrefillScratchBudgetBytesPackedValues,
+                        cfg.kv_block_size, !cap_off, paged_attention_max_partitions_effective,
+                        paged_attention_element_bytes);
+                }
+            }
             fit                                    = term.fit;
             packed_values_chunk                    = term.chunk;
             packed_values_scratch_per_token_bytes_ = term.per_token_bytes;
             packed_values_scratch_fixed_bytes_     = term.fixed_bytes;
             packed_values_scratch_chunk_           = term.chunk;
+            packed_values_log_per_token_bytes =
+                packed_values_prefill_scratch_bytes_per_token_ex(
+                    term.chunk, packed_geom->heads, packed_geom->head_size,
+                    paged_attention_element_bytes) +
+                packed_values_partials_exp_max_bytes_per_token(term.chunk, packed_geom->heads);
+            // Round-12 review (Opus), finding 2 (REAL defect): the
+            // reduction log used to sit at the Phase E belt call site
+            // (further down), naming which of three limits ("budget",
+            // "bound", "measured cap") shrank the chunk -- but by the
+            // time that site runs, `prefill_chunk_` (round-11 review) IS
+            // already the fixed point `term.chunk` computed right here,
+            // and `belt_requested_chunk` caps the belt's own input at
+            // that SAME value there, so that log was UNREACHABLE: the
+            // belt never raises its output past its input, and every
+            // path to the FINAL served depth only ever LOWERS it from
+            // the depth this term was priced at (the belt is
+            // non-increasing in depth), so a shallower re-evaluation can
+            // only ever re-derive the same chunk, never a smaller one.
+            // Moved here, to where the chunk is actually decided --
+            // `configured` (the operator's own requested/default chunk)
+            // versus `term.chunk` (what the search or `at_depth` just
+            // settled on), classified with the SAME three names, at the
+            // depth this term was actually priced at (the search's own
+            // converged `term.fit.max_ctx` for auto-fit, `wanted` for an
+            // explicit request). Skipped entirely under `cap_off` (the
+            // belt is off by design there -- see the ceiling and Phase E
+            // call sites' own comments) and whenever nothing shrank at
+            // all.
+            if (!cap_off && term.chunk < static_cast<int>(configured)) {
+                const long long depth_for_reason =
+                    cfg.n_ctx_explicit ? static_cast<long long>(wanted) : term.fit.max_ctx;
+                const long long partitions_for_reason = packed_values_bounded_partitions(
+                    depth_for_reason, paged_attention_max_partitions_effective);
+                const int budget_only = prefill_chunk_cap_for_packed_values_budget_only_ex(
+                    static_cast<int>(configured), partitions_for_reason, packed_geom->heads,
+                    packed_geom->head_size, paged_attention_element_bytes,
+                    kPrefillScratchBudgetBytesPackedValues, cfg.kv_block_size);
+                const char* limit = "budget";
+                if (term.chunk != budget_only) {
+                    limit = "measured cap";
+                } else if (budget_only == cfg.kv_block_size &&
+                           !packed_values_scratch_fits_budget(
+                               budget_only, partitions_for_reason, packed_geom->heads,
+                               packed_geom->head_size, paged_attention_element_bytes,
+                               kPrefillScratchBudgetBytesPackedValues)) {
+                    limit = "bound";
+                }
+                log::info("load",
+                          "prefill chunk %zu -> %d for 4-bit values (query heads %d, head size "
+                          "%d, n_ctx %lld): empirical belt, measured -- not a derived scratch "
+                          "formula (see exec/fit.h) -- limit: %s",
+                          configured, term.chunk, packed_geom->heads, packed_geom->head_size,
+                          depth_for_reason, limit);
+            }
         } else {
             fit = fit_context(fterms);
         }
         long long max_ctx = fit.max_ctx;
+        // Round-9 review (Opus), finding 3 (measured on card, a third
+        // time): the FIT-LEVEL admissibility check below (`wanted vs
+        // max_ctx`) is necessary but not sufficient for the packed-values
+        // case -- Phase E's own allocation-time replay can still overshoot
+        // by a small, real amount past what this analytic division
+        // predicts (measured: a 10 MiB, 0.07% shortfall at the ceiling for
+        // an explicit --n-ctx equal to what auto-fit itself adopted after
+        // ITS OWN Phase E trim gave it exactly this margin for free).
+        // Explicit --n-ctx has no such margin unless one is built in
+        // here: one KV page (`kv_block_tokens_`) of slack, subtracted from
+        // `max_ctx` before the admissibility check below, so BOTH paths
+        // (explicit's refusal test, and auto-fit's own `min(wanted,
+        // max_ctx)` adoption) use the identical, already-slack-adjusted
+        // ceiling -- the auto-fit depth this produces is then, by
+        // construction, admissible again if resubmitted as an explicit
+        // request for the same depth (see the round-9 test making exactly
+        // that round trip).
+        if (packed_values && packed_geom) {
+            max_ctx -= static_cast<long long>(kv_block_tokens_);
+            if (max_ctx < 0) max_ctx = 0;
+            // Round-10 review (Opus), finding 5: `fit.admissible` was
+            // computed by `fit_context`/`fit_context_packed_values[_at_
+            // depth]` from the PRE-slack `fit.max_ctx` -- the subtraction
+            // two lines up only ever touched the local `max_ctx` copy, so
+            // a fit landing EXACTLY at `n_ctx_floor` (admissible = true,
+            // by the closed-form rule `max_ctx >= n_ctx_floor`) could
+            // still adopt a slack-adjusted depth BELOW the floor a few
+            // lines later (`paged_n_ctx_ = min(wanted, max_ctx)`, further
+            // down) while `auto_fit_admissible` (which reads `fit.
+            // admissible` directly) kept reporting the load as usable.
+            // Recomputed here, against the SAME slack-adjusted `max_ctx`
+            // every later check in this function reads (the reserve gate,
+            // the "no usable context" refusal, and `paged_n_ctx_` itself),
+            // so `fit.admissible` never again disagrees with the floor
+            // rule applied to the depth this file actually adopts. `fit.
+            // max_ctx` itself is left untouched -- nothing downstream
+            // reads it again (only the local, slack-adjusted `max_ctx`
+            // is), so there is nothing there to keep in sync.
+            fit.admissible = max_ctx > 0 && max_ctx >= static_cast<long long>(fterms.n_ctx_floor);
+        }
         // Round-2 review, F5: the packed-values term (when charged) is
         // folded into THIS summary line too, not only the detail line
         // below -- a one-line reservation is what an operator scanning the
@@ -3267,14 +3753,125 @@ private:
                   static_cast<double>(kv_bytes_token_) / 1024.0,
                   static_cast<double>(total) / (1u << 30), max_ctx);
         if (packed_values && packed_geom) {
+            // Round-9 review (Opus), finding 4: `packed_values_log_per_
+            // token_bytes` (computed above, right after the term itself
+            // was priced) -- NOT `packed_values_scratch_per_token_bytes_`,
+            // which `fit_context_packed_values_at_depth` always leaves 0
+            // (an exact-at-one-depth evaluation has no per-token slope to
+            // report) and which printed a misleading "per token 0.0 KiB"
+            // on every explicit-n_ctx 4-bit-values load.
+            //
+            // Earlier review (bounded-path budget/log message): this line
+            // used to print the raw, unclamped `max_ctx` -- the BUDGET
+            // ceiling, not what the load actually serves -- as "for n_ctx"
+            // (a 24 GB-card trace showed "n_ctx 929456" on a load that
+            // went on to adopt a train maximum orders of magnitude
+            // smaller). `paged_n_ctx_` itself is not computed until after
+            // Phase E (min(wanted, max_ctx), further down, and possibly
+            // trimmed again after that) so it is not yet known here;
+            // `std::min(wanted, max_ctx)` is the same clamp one step
+            // early, before any Phase E trim -- close enough for this
+            // line's purpose (explaining the scratch charge just struck),
+            // and never overstates the served depth the way the raw
+            // ceiling did.
+            // Round-10 review (Opus), finding 7: `packed_values_log_per_
+            // token_bytes` is INFORMATIONAL only -- the marginal rate the
+            // term would grow at, one token further, at the served chunk.
+            // It does NOT reconstruct the printed MiB figure by simple
+            // multiplication against `served_n_ctx_for_log`: the charged
+            // MiB is priced at the BUDGET ceiling `max_ctx` (this line's
+            // own `term_total_bytes`, shared with the summary line and
+            // Phase E's ceiling check above), while the rate is quoted at
+            // whichever chunk was actually served, and the bounded arm
+            // (`max_partitions > 0`) charges a flat amount with no
+            // per-token slope at all (the rate there describes what an
+            // UNBOUNDED reservation would have cost per token, for
+            // comparison, not a component of the bounded charge itself).
+            // Labelled "rate" rather than "per token" so the line does not
+            // read as a component that should sum to the total above it.
+            const long long served_n_ctx_for_log = std::min<long long>(wanted, max_ctx);
             log::info("load",
                       "4-bit values: prefill scratch charged %.1f MiB at chunk %d for n_ctx %lld "
-                      "(per token %.1f KiB + KV %.1f KiB)",
+                      "(informational rate %.1f KiB/token + KV %.1f KiB/token)",
                       static_cast<double>(term_total_bytes) / (1u << 20), packed_values_chunk,
-                      max_ctx, static_cast<double>(packed_values_scratch_per_token_bytes_) / 1024.0,
+                      served_n_ctx_for_log,
+                      static_cast<double>(packed_values_log_per_token_bytes) / 1024.0,
                       static_cast<double>(kv_bytes_token_) / 1024.0);
+            // 0015 engine side: the plugin-support disclosure, separate
+            // from the arithmetic line above -- an operator reading the log
+            // should be able to tell WHY the scratch term above is small
+            // (or not) without cross-referencing whether the plugin is
+            // patched at all. Round-6 review, finding 6: N = 0 means the
+            // plugin carries the bound key but the operator asked for no
+            // bound at all -- "bounds attention partials at 0" reads as a
+            // refusal (zero partitions), not what actually happened, so
+            // that case gets its own wording. "(f16 partials)" follows the
+            // detection contract stated at the probe site (a plugin that
+            // carries the bound key carries the f16 host sizing too, both
+            // ship in patch 0015) -- unconditional whenever the key was
+            // accepted, not a separate confirmation.
+            if (paged_attention_bound_accepted_) {
+                if (cfg.paged_attention_max_partitions > 0) {
+                    log::info("load",
+                              "4-bit values: plugin bounds attention partials at %d (f16 "
+                              "partials); scratch term %.1f MiB at chunk %d",
+                              cfg.paged_attention_max_partitions,
+                              static_cast<double>(term_total_bytes) / (1u << 20),
+                              packed_values_chunk);
+                } else {
+                    log::info("load",
+                              "4-bit values: plugin carries the bound key; N = 0 leaves "
+                              "partials unbounded (f16 partials); scratch term %.1f MiB at "
+                              "chunk %d",
+                              static_cast<double>(term_total_bytes) / (1u << 20),
+                              packed_values_chunk);
+                }
+            }
         }
-        prefill_chunk_ = static_cast<int>(chunk);
+        // Round-11 review (Opus), finding 1 (REAL defect, HIGH): this used
+        // to seed unconditionally from `chunk` -- the activation climb's
+        // own served chunk, bounded above by `chunk_ceiling` (belt at
+        // `wanted`, the conservative starting probe bound) -- never from
+        // the packed-values SEARCH's own converged c* (`packed_values_
+        // scratch_chunk_`, set above, the chunk the reservation was
+        // actually priced at). Since `chunk <= chunk_ceiling <= c*`
+        // always (the F1 design's own step 3), Phase E's belt call site
+        // below (`belt_requested_chunk(prefill_chunk_, packed_values_
+        // scratch_chunk_)`) then took `min(prefill_chunk_, packed_values_
+        // scratch_chunk_)` == `prefill_chunk_` == the SMALLER
+        // ceiling-bound chunk, unconditionally -- so whatever bigger
+        // chunk the search (and the upward re-probe loop that pays for
+        // it in real GPU round-trips) legitimately found was priced into
+        // the reservation and then silently discarded at serve time:
+        // worse than not looping at all, since the extra probes bought
+        // nothing served. Seeded from `packed_values_scratch_chunk_`
+        // instead whenever a 4-bit-values load actually priced one --
+        // defensively re-clamped to `configured` and `kMaxMeasured
+        // PackedValuesChunk` (the search's own belt already enforces
+        // both; this is a second, explicit guard at the seam between the
+        // climb and Phase E, not a new bound) -- so the belt call site's
+        // own `min()` becomes the no-op it was designed to be, and only
+        // actually shrinks the served chunk when a LATER depth trim
+        // genuinely requires it.
+        //
+        // Round-12 review (Opus), finding 1 (HIGH, REAL defect): this
+        // defensive re-clamp used to apply UNCONDITIONALLY, including
+        // `kMaxMeasuredPackedValuesChunk` -- so `ARCINT_PREFILL_CHUNK_
+        // CAP=off` (which correctly makes the search price `configured`
+        // uncapped, via `belt_enabled=false`, so `packed_values_scratch_
+        // chunk_` already legitimately EQUALS `configured` when the
+        // switch is set) got silently re-capped to 128 right here anyway,
+        // a second no-op bug stacked on the ceiling one above. Under
+        // `cap_off`, seed from `packed_values_scratch_chunk_` directly --
+        // it already IS what the term was priced at, uncapped by
+        // construction -- and skip the defensive clamp entirely.
+        prefill_chunk_ =
+            (packed_values && packed_geom)
+                ? (cap_off ? static_cast<int>(packed_values_scratch_chunk_)
+                           : static_cast<int>(std::min<size_t>(
+                                 {static_cast<size_t>(packed_values_scratch_chunk_), configured,
+                                  static_cast<size_t>(kMaxMeasuredPackedValuesChunk)})))
+                : static_cast<int>(chunk);
         // The M9 4-bit-values prefill-chunk belt (exec/fit.h's
         // prefill_chunk_cap_for_packed_values) and the snapshot grid it
         // feeds (cache_grid_, tied to the chunk) both need the SERVED pool
@@ -3677,12 +4274,30 @@ private:
                 // margin - scratch_term_bytes`, where `scratch_term_bytes`
                 // (packed_values_scratch_reservation_bytes, fit.h) is
                 // priced at THIS pass's own `paged_n_ctx_` -- the same
-                // per-pass depth `predicted_total` below already reads --
-                // so the ceiling tightens and loosens in step with the
-                // very n_ctx the replay loop is trying. 0 on every load
-                // that is not under 4-bit values (both scratch members
-                // default to 0), so this only ever narrows the ceiling on
-                // the loads that need it, never on any other.
+                // per-pass depth `predicted_total` below already reads. 0
+                // on every load that is not under 4-bit values (both
+                // scratch members default to 0), so this only ever
+                // narrows the ceiling on the loads that need it, never on
+                // any other.
+                //
+                // Round-10 review (Opus), finding 6 (stale comment
+                // correction): an earlier version of this comment said the
+                // ceiling "tightens and loosens in step with" `paged_n_
+                // ctx_` unconditionally -- true only when `packed_values_
+                // scratch_per_token_bytes_` is nonzero, which is the
+                // unbounded auto-fit arm's own linear approximation
+                // (fit_context_packed_values, the search). Both the
+                // explicit path (fit_context_packed_values_at_depth, an
+                // exact evaluation at one known depth, per_token_bytes
+                // always 0) and the bounded arm (max_partitions > 0, a
+                // flat lane-multiplied charge folded into `fixed_bytes_`,
+                // per_token_bytes also always 0) price a CONSTANT
+                // scratch_term_bytes across every pass of this loop --
+                // `paged_n_ctx_` moves, the ceiling does not. Still
+                // correct arithmetic (the formula is `fixed + per_token *
+                // lanes * n_ctx`, and 0 * anything is 0), just not the
+                // "moves together" behaviour this comment used to claim
+                // for every load under 4-bit values.
                 const uint64_t scratch_term_bytes = packed_values_scratch_reservation_bytes(
                     packed_values_scratch_fixed_bytes_, packed_values_scratch_per_token_bytes_,
                     lanes, static_cast<long long>(paged_n_ctx_));
@@ -4062,17 +4677,51 @@ private:
                 // exceed the smaller of the two -- and with served n_ctx
                 // <= the priced max_ctx too, the charged term stays >= what
                 // is actually served, unconditionally.
-                const int capped = prefill_chunk_cap_for_packed_values(
-                    belt_requested_chunk(prefill_chunk_, packed_values_scratch_chunk_),
-                    paged_n_ctx_, geometry->heads, geometry->head_size,
-                    kPrefillScratchBudgetBytesPackedValues, cfg.kv_block_size);
-                if (capped < prefill_chunk_) {
-                    log::info("load",
-                              "prefill chunk %d -> %d for 4-bit values (query heads %d, head "
-                              "size %d, n_ctx %d): empirical belt, measured -- not a derived "
-                              "scratch formula (see exec/fit.h)",
-                              prefill_chunk_, capped, geometry->heads, geometry->head_size,
-                              paged_n_ctx_);
+                //
+                // 0015 engine side: the belt's own proxy must price the
+                // SAME buffer the term above charged -- the same bounded
+                // partitions, the same element size -- or it halves the
+                // chunk for a buffer that no longer exists at that size
+                // (design note o-0015-design.md §C). `paged_attention_
+                // element_bytes` / `_max_partitions_effective` were already
+                // resolved once, at the climb above (reused here rather
+                // than re-read a second time, same convention `cap_off` and
+                // `packed_geom` already follow); `packed_values_bounded_
+                // partitions` (fit.h) applies the SAME bound this pass's
+                // own SERVED depth (`paged_n_ctx_`) that fit_context_
+                // packed_values applied to its own candidate depths during
+                // the climb.
+                const long long belt_partitions = packed_values_bounded_partitions(
+                    static_cast<long long>(paged_n_ctx_), paged_attention_max_partitions_effective);
+                const int belt_input = belt_requested_chunk(prefill_chunk_, packed_values_scratch_chunk_);
+                const int capped = prefill_chunk_cap_for_packed_values_ex(
+                    belt_input, belt_partitions, geometry->heads, geometry->head_size,
+                    paged_attention_element_bytes, kPrefillScratchBudgetBytesPackedValues,
+                    cfg.kv_block_size);
+                // Round-12 review (Opus), finding 2 (REAL defect): this
+                // used to log a "prefill chunk X -> Y" reduction with its
+                // own limit name whenever `capped < prefill_chunk_` --
+                // but `belt_input` above is ALREADY `prefill_chunk_`
+                // itself (round-11 review made `prefill_chunk_` the
+                // search/at_depth fixed point c*, and `belt_requested_
+                // chunk` caps the belt's own input at that same value),
+                // and the belt never raises its output past its input,
+                // so `capped <= belt_input == prefill_chunk_` always --
+                // and since every path to `paged_n_ctx_` only ever
+                // LOWERS the served depth from the depth the term was
+                // priced at, and the belt is non-increasing in depth, a
+                // shallower re-evaluation here can only re-derive the
+                // SAME chunk, never a smaller one: `capped ==
+                // prefill_chunk_`, always, in practice. This branch was
+                // UNREACHABLE; the reduction log (and its limit naming)
+                // moved to where the chunk is actually decided -- the
+                // search/at_depth call site above, comparing against
+                // `configured`. The assignment below stays as a
+                // defensive no-op: the one thing that would make `capped
+                // != prefill_chunk_` is a future change to the
+                // depth-only-shrinks invariant this comment states but
+                // does not enforce in code.
+                if (capped != prefill_chunk_) {
                     prefill_chunk_ = capped;
                 }
             } else {
@@ -6038,6 +6687,18 @@ private:
     // `min(prefill_chunk_, packed_values_scratch_chunk_)` so the served
     // chunk can never exceed the priced one.
     int                            packed_values_scratch_chunk_ = 0;
+    // 0015 engine side: whether the compiled plugin accepted
+    // PAGED_ATTENTION_MAX_PARTITIONS (probed once, before compile, well
+    // before this -- see the compile-time props block's own comment). Set
+    // only on a 4-bit-values load; false on every other load and on any
+    // 4-bit-values load against an unpatched plugin. Read again at the
+    // fit-term climb and the belt call site to decide `max_partitions`
+    // (cfg.paged_attention_max_partitions when accepted, 0/unbounded
+    // otherwise) and `element_bytes` (2 when accepted -- the detection
+    // contract stated at the probe site: a plugin exposing this key
+    // carries the f16 host sizing too, both ship together in patch 0015 --
+    // 4 otherwise).
+    bool                           paged_attention_bound_accepted_ = false;
     size_t                         la_row_bytes_     = 0;
     size_t                         logits_keep_rows_ = 0;  // 0: unsliced
     size_t                         cache_grid_       = 0;  // paged snapshot grid; 0: the chunk

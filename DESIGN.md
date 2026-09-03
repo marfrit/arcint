@@ -3123,7 +3123,7 @@ the prompt length being what varied:
 
 | prefill chunk | prompt tokens | proxy (chunk × 16 KiB × ⌈past ÷ 256⌉) | result |
 |---|---|---|---|
-| 128 | 119,074 | 932 MiB | driver out-of-resources |
+| 128 | 119,074 | 932 MiB | driver out-of-resources (171,312-token pool; passes with a 131,072-token pool, see below) |
 | 64 | 119,074 | 466 MiB | prefills in 605 s (197 t/s), decodes |
 | 128 | 71,689 | 562 MiB | passes |
 | 256 | ≈72,000 | 1,128 MiB | driver out-of-resources |
@@ -3286,6 +3286,91 @@ prefill and none during decode, so those are not it either. Open.
 For the decision in §8 the served number is the one that counts: at 76k
 a verify cycle costs four plain steps on this path, not two. What none
 of this says is why either drafter accepts nothing at 76k.
+
+#### 7.0.2ac Patch 0015: the attention scratch bounded, and the crash it uncovered (2026-09-03)
+
+The operator chose the plugin-side fix over the engine's honest but
+costly reservation: bound the number of partial results the mixed-stage
+paged attention keeps per query token, and store them at their real
+width. Reading the plugin for the design found the second half already
+half true: the kernels declare that intermediate output as the model's
+f16 output type, and the host had been sizing it with a hard-coded four
+bytes per element — allocating twice what the kernels address. Patch
+0015 therefore has three parts: the host sizes that buffer by the output
+element size (byte-exact by construction); a read-write plugin key,
+`PAGED_ATTENTION_MAX_PARTITIONS` (default 0, today's behaviour), that the
+engine sets from `--paged-attention-max-partitions`; and, under the
+bound, each work-group folds S consecutive 256-token partitions with an
+online softmax merge into one partial, so the buffer is chunk × query
+heads × head size × 2 B × the bound, whatever the depth. The merge folds
+its rescale into the existing normalisation multiply in f32 with one
+f16 store per fold — at fifteen folds about 0.7% worst-case and 0.1%
+typical on a convex combination of dequantised values — so byte
+exactness across the bounded arm is not claimed at depth; at the
+unbounded setting a `p == 0` branch keeps the original divide and the
+plugin is bit-identical to the unpatched one.
+
+**What the card says.** With the patched plugin and the bound at 32 on
+the 16 GiB card, the coder's u8:i4 auto-fit lands at 165,680 tokens at
+chunk 128 with 48.5 MiB of scratch charged (against 101,824 at chunk 64
+unbounded), and the belt stays silent. The plugin's 220 paged-attention
+unit tests pass, including new cases with two subgroups per work-group
+(the compressed-KV configuration this patch exists for), the dual-nibble
+value kernel, the single-token path, a bound of one, and 40k- and
+120k-token pasts. On the 24 GB card, same chunk 32, bound 0 against 32:
+the 64-token greedy output and the acceptance answer are byte-identical
+and the task scores 10/10 on both. At the unbounded setting the patched
+plugin is byte-identical to the unpatched one on both cards.
+
+**The crash.** The first served run at the bound died at 56k tokens and
+beyond with a bus error: a jump to an unmapped address inside the
+plugin's infer, on both cards, with nothing in the kernel log, while a
+50k prompt passed and the plugin's own tests at 120k passed. Under gdb
+with glibc's heap checking the same 119k run completed; with only the
+free-fill perturbation it crashed again — a use-after-free whose victim
+moves with the heap layout. The mechanism, read from the plugin and
+stated as such: `primitive_inst::realloc_intermediates` replaces an
+intermediate buffer's identity without raising the flags that rebind the
+kernel arguments (those track outputs only), so after a genuine
+reallocation the kernel keeps the freed handle. Nothing had exposed it
+before because the buffer only ever grew; under the bound it plateaus
+and takes the reuse path on every chunk of a long prefill. The patch
+carries the local fix — the paged-attention implementation records the
+identity of every intermediate its arguments were bound to and forces
+the rebind when any changes — and the framework-wide fix is a backlog
+item of its own (§8). With it the 56k cell that had crashed twice passed three times, but the
+119k cell crashed again, two variants that kept the intermediate buffers
+alive (a private never-freed set; a two-deep ring retired after a stream
+finish) crashed the same way, and then the decisive cell: the UNPATCHED
+plugin, at the unbounded setting, with an explicit 165,680-token pool
+and the 119k prompt on the 24 GB card, crashed too. The deep-prompt
+crash is therefore not this patch's: it needs a deep pool together with
+a deep prompt, and the coder had never served such a pool at u8:i4
+before because the VRAM fault (§7.0.2ab) came first. On the 24 GB card
+every one of these crashes coincides with the kernel log's "Engine
+memory CAT error, class=ccs" and an engine reset — a GPU-side
+out-of-bounds access — while the 16 GiB card, which has no fault
+reporting, logs nothing and the host process simply dies. The same
+119k prompt passes with pools of 101,824 and 131,072 tokens at u8 and
+u8:i4, and the dense agent serves 262,144-token pools with 143k prompts
+at u8. The unpatched plugin at plain u8 with a 262,144-token pool and the
+same 119k prompt passes on the 24 GB card, and the engine's per-forward
+inputs — past lengths, subsequence bounds, ascending block ids, the
+context length — are identical at any pool size, so the defect sits in
+the asymmetric packed-value path this series added in patches 0008 to
+0010, reached only when the pool is deep and the prompt reaches into it;
+the patched plugin at the bound serves the same 119k prompt from a
+131,072-token pool, so the bounded path itself holds; the exact boundary
+between 131k and 165k tokens is the open question (no constant of 8,192
+or 131,072 exists on this path in the plugin, the patches or the engine,
+and the device's single-allocation limits are far away); the binding fix stays in the patch as a real defect fixed,
+and the prefill ladder against the unpatched plugin follows when the
+served path holds. Two operating
+notes: the option inserted into the plugin's configuration shifts the
+model-cache blob's positional schema, so the GPU model cache must be
+cleared when upgrading to the plugin level that carries 0015; and the
+engine prices the bounded scratch at 2 bytes and the bound only when the
+plugin accepts the key — a contract, since both ship in one patch.
 
 #### 7.0.2r DFlash2: the external-drafter hook gets a real drafter (2026-09-01)
 
@@ -3907,6 +3992,17 @@ stays as an off-by-default measurement switch.
   partition count and stores f16 partial outputs; the operator's decision
   was to take those two first and carry the upstream change in the patch
   series backlog.
+- **Plugin framework gap: intermediates reallocated without an argument
+  rebind** (found 2026-09-03 while chasing a served-path crash under patch
+  0015). In the GPU plugin, `primitive_inst::realloc_intermediates` replaces
+  an intermediate buffer's identity — a real reallocation or a reinterpreted
+  wrapper — without raising the flags that make the kernel arguments rebind
+  (those track outputs only), so a kernel can keep running on the previous
+  handle after its allocation was freed. Patch 0015 exposed it because its
+  bounded partials make the intermediate plateau and take the reuse path on
+  every chunk of a long prefill; the patch carries the local fix (the paged
+  attention implementation forces the rebind when its intermediates change).
+  The framework-wide fix belongs upstream and in a patch of its own.
 - **Multimodal** (image/video): confirmed — all three IRs export as
   `*ForConditionalGeneration` (`Qwen3_5MoeForConditionalGeneration`,
   `Qwen3_5ForConditionalGeneration`), so the door is open. v1 is text-only to

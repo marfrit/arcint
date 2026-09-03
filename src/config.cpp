@@ -296,6 +296,12 @@ std::string usage_text() {
         "  --fit-margin-mib N        headroom the paged-path auto-fit budget leaves\n"
         "                            unclaimed (default: 256). The only policy term in\n"
         "                            the reservation; every other term is measured\n"
+        "  --paged-attention-max-partitions N\n"
+        "                            bound the GPU plugin's mixed-stage paged-attention\n"
+        "                            partition count (default: 0, unbounded). Passed to\n"
+        "                            a patched plugin as PAGED_ATTENTION_MAX_PARTITIONS;\n"
+        "                            ignored, with a log line, on a plugin that does not\n"
+        "                            carry the key (0015)\n"
         "  --no-logits-slice         compute logits for every prompt token (slower,\n"
         "                            and runs out of memory past a few thousand)\n"
         "  --kv-dtype fp16|fp32      stored KV element type (default: fp16;\n"
@@ -496,6 +502,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--fit-margin-mib") {
             if (!value(v) || !parse_int(v, cfg.fit_margin_mib)) {
                 return fail("--fit-margin-mib needs an integer");
+            }
+        } else if (arg == "--paged-attention-max-partitions") {
+            if (!value(v) || !parse_int(v, cfg.paged_attention_max_partitions)) {
+                return fail("--paged-attention-max-partitions needs an integer");
             }
         } else if (arg == "--no-logits-slice") {
             cfg.slice_logits = false;
@@ -765,6 +775,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         }
     }
     if (cfg.fit_margin_mib < 0) return fail("--fit-margin-mib must be >= 0");
+    if (cfg.paged_attention_max_partitions < 0) {
+        return fail("--paged-attention-max-partitions must be >= 0");
+    }
     if (cfg.gdn_checkpoint_budget_mib < 0) {
         return fail("--gdn-checkpoint-budget must be >= 0");
     }

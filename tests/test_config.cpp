@@ -597,6 +597,35 @@ TEST(config_fit_margin_mib_rejects_garbage) {
     CHECK(rejected({"--stub", "--fit-margin-mib", "not-a-number"}));
 }
 
+// Round-6 review, finding 7: 0015 engine side. Same three-shape coverage
+// as --fit-margin-mib above (default, accept, reject) -- the flag exists
+// only to be threaded to backend_ov.cpp's plugin-key probe, which is not
+// unit-testable without a card, so this file's job is the parsing/
+// validation contract alone.
+TEST(config_paged_attention_max_partitions_defaults_0) {
+    Config cfg;
+    CHECK(run({"--stub"}, cfg).ok);
+    CHECK_EQ(cfg.paged_attention_max_partitions, 0);
+}
+
+TEST(config_paged_attention_max_partitions_accepts_a_value) {
+    Config cfg;
+    CHECK(run({"--stub", "--paged-attention-max-partitions", "32"}, cfg).ok);
+    CHECK_EQ(cfg.paged_attention_max_partitions, 32);
+
+    // 0 is a valid, meaningful value here (not just the default) --
+    // "the plugin carries the bound key; N = 0 leaves partials unbounded"
+    // is a real, distinct state backend_ov.cpp's own load-time log names.
+    Config cfg2;
+    CHECK(run({"--stub", "--paged-attention-max-partitions", "0"}, cfg2).ok);
+    CHECK_EQ(cfg2.paged_attention_max_partitions, 0);
+}
+
+TEST(config_paged_attention_max_partitions_rejects_garbage) {
+    CHECK(rejected({"--stub", "--paged-attention-max-partitions", "-1"}));
+    CHECK(rejected({"--stub", "--paged-attention-max-partitions", "not-a-number"}));
+}
+
 TEST(config_n_ctx_explicit_defaults_false) {
     Config cfg;
     CHECK(run({"--stub"}, cfg).ok);

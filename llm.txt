@@ -341,7 +341,36 @@ memory
                             explicitly for the model's own maximum, checked
                             against the fit like any other explicit value --
                             it can refuse where omission would have adopted
-                            a smaller number instead
+                            a smaller number instead. Under 4-bit paged
+                            VALUES, an explicit --n-ctx equal to the depth
+                            auto-fit itself would adopt is admitted with the
+                            same served chunk and the same charges. NOT the
+                            same call for both paths (an earlier design
+                            claimed it was; retracted -- the artifact's own
+                            train maximum is not auto-fit's served depth,
+                            and evaluating the belt there alone gives an
+                            over-conservative chunk): the explicit path
+                            evaluates the belt directly at the requested
+                            depth (pure geometry, no search, no activation
+                            dependence); auto-fit instead runs the belt's
+                            own chunk-driven fixed-point SEARCH seeded from
+                            the requested/default chunk to find its own
+                            served depth, re-probing activations upward and
+                            repeating whenever the search's served chunk
+                            grows past what was already measured (valid --
+                            the plugin's pool only ever grows). Both paths
+                            price the term at their own served chunk this
+                            way, and resubmitting auto-fit's own adopted
+                            depth as an explicit request reproduces the
+                            same chunk and the same admission by
+                            construction. One KV page of slack is
+                            subtracted from the admissible ceiling before
+                            either path's check, so an explicit request
+                            equal to what auto-fit itself adopts (already
+                            inside that same margin) is admitted, not
+                            refused at Phase E's own allocation-time
+                            rounding
+
   --kv-block-size 16|32     KV page size in tokens (default: 32)
   --prefill-chunk N         prefill chunk in tokens, 0 = unchunked
                             (default: 2048; bounds activation memory).
@@ -352,8 +381,61 @@ memory
                             An explicit --prefill-chunk is capped the same
                             way, never raised; ARCINT_PREFILL_CHUNK_CAP=off in
                             the environment keeps the requested chunk for
-                            measuring the fault line (logged, never a
-                            default). Measured cost (16 GiB-class
+                            measuring the fault line -- NO belt, NO cap, the
+                            term priced at the full requested/default chunk
+                            unchanged, on BOTH the auto-fit and the explicit
+                            --n-ctx path (logged, never a default). A
+                            SEPARATE, hard ceiling
+                            (kMaxMeasuredPackedValuesChunk, fit.h) applies
+                            after the budget-based shrink, WHEN the belt is
+                            not disabled by the switch above: 128 tokens, the
+                            largest chunk this repository has a passing card
+                            measurement for -- an explicit --prefill-chunk
+                            above 128 under 4-bit paged VALUES is reduced at
+                            least to 128, even at a served depth shallow
+                            enough that the budget check alone would leave a
+                            bigger chunk unchanged (2048, the default, has
+                            never been validated on any plugin for this
+                            scratch path at all) -- UNLESS the measurement
+                            switch is set, in which case neither this cap
+                            nor the budget check runs at all. The load-time
+                            log, at the point the chunk is actually decided
+                            (the search's own converged chunk, or the
+                            explicit path's single evaluation -- NOT the
+                            Phase E belt call site further down, which can
+                            only ever reproduce that same value and so never
+                            has anything new to report), names which of
+                            three limits fired -- budget (the 512 MiB proxy
+                            shrank it to something that fits), bound (the
+                            halving ladder ran to the KV block floor and
+                            still does not fit -- served anyway, not a
+                            refusal), or measured cap (this 128-token
+                            ceiling).
+
+                            RETRACTED history, kept rather than silently
+                            corrected (this file's own convention): the
+                            measurement switch was, for a time, a NO-OP on
+                            the auto-fit path -- the served-chunk ceiling
+                            used to compute below applied the belt
+                            unconditionally regardless of the switch, and
+                            the served-chunk seed re-applied the 128-token
+                            cap unconditionally too, so a load run with the
+                            switch set logged "belt disabled" and then
+                            served chunk 128 anyway. Fixed by gating both on
+                            the switch. The explicit --n-ctx path had the
+                            SAME class of bug a third time (the at-depth
+                            evaluation that path uses had no way to disable
+                            the belt at all) -- fixed by giving it the same
+                            belt-disable parameter the auto-fit search
+                            already had. Separately: the search's own
+                            exhaustion fallback (8 rounds without settling)
+                            used to re-seed its final evaluation from the
+                            operator's full requested chunk, which could
+                            converge to a chunk bigger than any chunk
+                            activations were ever actually probed at
+                            (under-reservation risk); it now re-seeds from
+                            the last chunk actually probed, bounding the
+                            result by construction. Measured cost (16 GiB-class
                             card, coder, u8:i4, n_ctx 131,072, 8,417-token
                             prompt): 495 t/s prefill at chunk 128, 437 at 64
                             (-12%), 440 at 32. Chunk 128 only fits the
@@ -495,6 +577,78 @@ any of them flips the served sampler provenance to 'operator')
   --fit-margin-mib N        headroom the paged-path auto-fit budget leaves
                             unclaimed (default: 256). The only policy term in
                             the reservation; every other term is measured
+  --paged-attention-max-partitions N
+                            bound the GPU plugin's mixed-stage paged-attention
+                            partition count (default: 0, unbounded). Engine
+                            side of plugin patch 0015
+                            (patches/0015-paged-attention-bounded-partials.patch,
+                            written and under device test -- in no built
+                            package yet, so the bound is inert on every
+                            released plugin): passed to a patched plugin
+                            as its own RW config key
+                            PAGED_ATTENTION_MAX_PARTITIONS on a 4-bit-values
+                            load, detected by reading the key back before
+                            compile -- an unrecognised-key throw is the
+                            ORDINARY case on every released plugin today,
+                            not the rare failure a known, typed GPU property
+                            read would be;
+                            logged ("plugin does not carry the bound; scratch
+                            term stays depth-scaled") and N is ignored, the
+                            load proceeds exactly as today. A compile failure
+                            with the key accepted names
+                            PAGED_ATTENTION_MAX_PARTITIONS explicitly (and
+                            both properties, if VALUE_CACHE_PRECISION was also
+                            set) rather than misattributing the failure.
+                            DETECTION CONTRACT: element_bytes follows the
+                            bound key's own acceptance directly, not a
+                            separate probe -- a plugin exposing the key
+                            carries the f16 host-sizing fix too, both ship
+                            together in patch 0015; a plugin with the key but
+                            without the sizing fix would be under-charged by
+                            half, and no such plugin exists in this series.
+                            When accepted: the packed-4-bit-values prefill
+                            scratch term (exec/fit.h) partitions =
+                            min(ceil(n_ctx/256), N) when N > 0 else unbounded,
+                            plus a second additive term (exp_sums +
+                            max_logits, 2 x chunk x heads x 4 B x partitions,
+                            not scaled by the 1.5x margin -- that margin
+                            covers tmp_out's own measured resize alone),
+                            charged in both the bounded and unbounded arms.
+                            2-byte elements apply to tmp_out per the
+                            detection contract above. Past N * 256 tokens the
+                            whole bounded charge stops growing with depth
+                            entirely -- charged as one flat amount, not a
+                            per-token slope, and multiplied by lanes
+                            explicitly (the buffer is per infer request, not
+                            per compiled model). Nothing here is "exact" to
+                            the byte -- the reservation always charges the
+                            1.5x margin over tmp_out's own true size; what
+                            the bound changes is that the MARGINED value
+                            stops climbing. The belt
+                            (prefill_chunk_cap_for_packed_values) prices the
+                            same bounded buffer at both call sites, or it
+                            would shrink the chunk for a buffer that no
+                            longer exists. Logged when accepted: "4-bit
+                            values: plugin bounds attention partials at N
+                            (f16 partials); scratch term X MiB at chunk C"
+                            when N > 0, "...plugin carries the bound key;
+                            N = 0 leaves partials unbounded (f16
+                            partials)..." when N = 0. Key absent: byte-for-
+                            byte identical to the pre-0015 path (verified
+                            against the engine's own arithmetic -- the bound
+                            is inert on every RELEASED plugin, since patch
+                            0015 is in no built package yet; MEASURED on the
+                            patched plugin under device test, N = 32: auto-fit
+                            lands at n_ctx 165,680, chunk 128, 48.5 MiB
+                            scratch, against 101,824/chunk 64 unbounded on
+                            the same card -- see CHANGELOG.md for the full
+                            record, including that a longer-prompt run is
+                            still under investigation). The design note's
+                            own recon that the
+                            plugin's mixed-stage buffer is already f16 in the
+                            kernel (only the host-side sizing hardcodes
+                            4-byte elements) is read from the plugin source,
+                            not measured
   --no-logits-slice         compute logits for every prompt token (slower,
                             and runs out of memory past a few thousand)
   --kv-dtype fp16|fp32      stored KV element type (default: fp16;
