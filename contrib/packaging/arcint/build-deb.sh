@@ -19,8 +19,7 @@ PKGREL=1
 # and carries operator-local notes; the published tree is the same code without
 # them, so the package is built from what anyone can check.
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
-# filled after the v0.2.13 tag is pushed (filled in the follow-up commit once the tag exists)
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-}
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-5a5fd4e355a701c851425ff16bf900aa91bc5770e2f8c7e8f8d8c8d6d193077f}
 OV_PREFIX=/usr/lib/marfrit-openvino
 OV_DEP_VERSION="2026.4.0~dev20260821+p2-1"
 HERE=$(dirname "$(readlink -f "$0")")
