@@ -32,11 +32,12 @@ different nightly is a different ABI.
   auto-fit 171,312) failed with a GPU out-of-resources error and every
   later request in that process failed with it; prompts up to 8,909
   tokens succeed at every depth setting tried. The failing depth lies
-  between those two numbers and is being bracketed; an earlier version of
-  this entry said "every prompt over about 2,048 tokens", which was an
-  artifact of running the depths deepest-first in one process and is
-  retracted. Until the threshold is known, do not deploy u8:i4 for
-  contexts beyond what has been measured to prefill.
+  between those two numbers; bracketed one process per depth: 35,227 and
+  71,689 tokens prefill and decode, about 107k tokens fails. An earlier
+  version of this entry said "every prompt over about 2,048 tokens", which
+  was an artifact of running the depths deepest-first in one process and
+  is retracted. Until the cause is found, do not deploy u8:i4 for prompts
+  beyond about 70k tokens on the 16 GiB card.
 - `--dflash`: the exported draft head carries a state variable fixed at
   2,048 rows; the first draft after a prompt longer than that fails and the
   drafter disables itself for the process (decode continues without
