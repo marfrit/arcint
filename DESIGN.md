@@ -3031,6 +3031,89 @@ tokens per cycle at the same equivalence — is met by blocks 12 and 16 on
 code and thinking, at a throughput loss, and by nothing else; the served
 chain is near what this head and this selector give without new weights.
 
+#### 7.0.2aa Long context against the naive benchmark: what depth does to every number (2026-09-03)
+
+Every drafter and KV number on the record came from prompts under 900
+tokens, and the 262k-token cells of the paged path were memory and gate
+measurements, not throughput at depth. The operator asked how the naive
+benchmark relates to long context. Two windows answered it, and each
+defect the first one hit was disclosed the same day and fixed or bounded
+before the second ran.
+
+**Protocol.** A real document (this repository's design and docs, later a
+non-repeating 230k-token corpus of the same) truncated to the target depth,
+followed by a one-line summarisation request; 400 greedy tokens; the
+prefix cache off so no shallower cell hits a deeper one's pages; one server
+process per arm with the depths run shallowest first, and one process per
+depth for the u8:i4 fault bracket — the first pass ran its depths
+deepest-first inside one process, and a GPU fault at the deepest cell
+made every later cell fail, which was published as "u8:i4 fails past
+2,048 tokens" and retracted within hours. Rates are the server's own
+prefill and decode lines; "tokens per cycle" is completion tokens over
+verify cycles (the accepted drafts per cycle are one less).
+
+**The dense 27B agent on the 24 GB card, u8 KV, auto-fit depth** (prefill
+t/s · decode t/s · tokens per cycle):
+
+| arm | 8.9k tokens | 37.7k | 76.4k | 143.1k |
+|---|---|---|---|---|
+| plain | 935 · 22.3 | 600 · 19.9 | 402 · 16.3 | 257 · 12.9 |
+| MTP head | 876 · 25.7 · 1.89 | 541 · 12.6 · 1.79 | 349 · 1.0 · 1.00 | 117 · 0.3 · 1.00 |
+| DFlash2 int4 | · 19.8 · 1.69 | · 11.0 · 1.43 | · 5.3 · 1.00 | refused (over the 136,368 auto-fit) |
+
+Plain decode loses a quarter of its rate between 9k and 76k tokens
+(22.3 to 16.3, then 12.9 at 143k) and prefill throughput falls from 935
+to 257 tokens per second, under the auto-fit prefill chunk of 128. DFlash
+is below plain at every depth here and the MTP head from 37.7k: at 8.9k
+DFlash decodes at 19.8 against plain's 22.3 while accepting 0.69 drafts
+per cycle (the MTP head is still ahead there, 25.7); at 37.7k
+the MTP head accepts 79% of its drafts and still decodes slower than plain
+(12.6 against 19.9); at 76k both accept nothing and the draft and verify
+cost leaves them at 1.0 and 5.3 t/s. The MTP arm also prefills slower
+than plain, by 6% at 8.9k and 13% at 76k and by half at 143k (117 against
+257 t/s), and its verify takes 0.84 s per step at 76k and 3.1 s at 143k. By
+code reading the reconstructed MTP layer keeps its own unpaged state and
+is given a dense mask over the whole context each step; that reading does
+not account for the per-step cost or the zero acceptance, and a profile
+of one MTP step at depth is owed. Why DFlash accepts nothing at 76k is not
+established either. Serve deep contexts without a drafter until both are.
+
+**The coder on the 16 GiB card, no offload** (server prefill t/s · decode
+t/s):
+
+| KV | 8.9k | 37.7k | 71.7k |
+|---|---|---|---|
+| u8 | 525 · 45.1 | 462 · 44.5 | 403 · 40.3 |
+| u8:i4 | 491 · 47.4 | 369 · 43.3 | 234 · 39.2 |
+
+Decode is at parity; the u8:i4 prefill price — the M8 item owed since
+§7.0.2w — is +7%, +25% and +72% of prefill time at those depths. By code
+reading (§7.0.2w, the plugin's paged-attention selection), micro-SDPA
+declines the i4-against-u8 packing, so the u8:i4 prefill takes the opt
+kernel, whose per-chunk scratch is chunk × heads × head size × 4 bytes ×
+⌈past ÷ 256⌉ and is reallocated on most chunks of a long prefill — about
+930 MiB at 119k tokens; that this scratch is the price and the fault is
+the best-supported reading, not a measurement. What is measured: the same
+119,074-token prompt prefills at u8 and fails at u8:i4 with a driver
+out-of-resources error, while 71,689 tokens pass at both (u8:i4 in a
+fresh process, u8 inside its pass-2 arm); the edge for u8:i4 lies between
+those two depths. A chunk-size
+discriminator and the fix candidates (pre-sizing the partition buffers
+once per request, or an unpack shim onto the micro-SDPA path) follow in
+the record.
+
+**What the pass fixed on the way.** The DFlash2 drafter disabled itself
+for the whole process on any prompt over about 2,048 tokens: the head's
+2,048-row state window, an Assign whose variable layout the plugin left at
+zero rows exactly when the concatenation landed on the window, and a
+permanent disable in the engine. Plugin patch 0014 lets the Assign adopt a
+same-type, same-rank output layout (the served head then drafts at 17k
+tokens and through 3,000-token decodes); the engine's disable is per lane
+and re-armed on the next request, with a feed cap one row below the window
+that carries a plugin without 0014; the export's trim takes a runtime slice
+start and the tool reproduces the served int4 head byte for byte. Those
+are in the changelog's unreleased section with their numbers.
+
 #### 7.0.2r DFlash2: the external-drafter hook gets a real drafter (2026-09-01)
 
 The public block-diffusion head for the 3.8 went from HF checkpoint to a

@@ -28,20 +28,30 @@ different nightly is a different ABI.
   the window for plugins without 0014.
 
 ### Known defects in 0.2.13, found by the long-context window (2026-09-03)
+- `--dflash` at depth: on the same card and model the DFlash2 drafter
+  reaches 1.69 / 1.43 / 1.00 tokens per cycle at 8.9k / 37.7k / 76k tokens
+  and decodes below plain at each (19.8 vs 22.3, 11.0 vs 19.9, 5.3 vs 16.3
+  t/s); the zero acceptance at 76k is not yet explained. Serve deep
+  contexts without a drafter.
+- `--paged-kv u8:i4` prefill price (the M8 item owed since 0.2.13): +7% /
+  +25% / +72% of prefill time at 8.9k / 37.7k / 71.7k tokens on the coder,
+  decode at parity; by code reading it is the opt attention path u8:i4 is
+  forced onto, not yet measured as such.
 - `--mtp on` at depth: on the 24 GB card the dense 27B agent's MTP verify
   accepts 78% of drafts at 37.7k tokens (12.6 t/s) but 0% at 76k and 143k
   tokens, where decode falls to 1.0 and 0.3 t/s against plain decoding's
-  16.3 at 76k; the reconstructed MTP layer attends over the whole context
-  with a dense 4-D mask, so its per-step cost grows with depth. Serve deep
-  contexts with `--mtp off` until the layer is paged.
+  16.3 at 76k, and its prefill runs at half plain's rate there; the cause
+  is not yet measured (by code reading the reconstructed MTP layer keeps an
+  unpaged state and a dense mask over the whole context). Serve deep
+  contexts with `--mtp off` until it is.
 - `--paged-kv u8:i4`: a 141,902-token prefill on the coder (16 GiB card,
   auto-fit 171,312) failed with a GPU out-of-resources error and every
   later request in that process failed with it; prompts up to 8,909
   tokens succeed at every depth setting tried. The failing depth lies
   between those two numbers; bracketed one process per depth: 35,227 and
-  71,689 tokens prefill and decode, about 107k tokens fails, while u8
-  prefills 119,074 tokens on the same card, so the fault is specific to
-  the u8:i4 prefill path. An earlier
+  71,689 tokens prefill and decode, and the same 119,074-token prompt that
+  u8 prefills on this card fails at u8:i4, so the fault is specific to the
+  u8:i4 prefill path. An earlier
   version of this entry said "every prompt over about 2,048 tokens", which
   was an artifact of running the depths deepest-first in one process and
   is retracted. Until the cause is found, do not deploy u8:i4 for prompts
