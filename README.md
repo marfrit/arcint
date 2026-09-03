@@ -102,8 +102,9 @@ costs ~63k tokens of context headroom; parking the draft on the A770
 (`--dflash-device`) buys 35k of that back for 5 t/s of PCIe round-trips, with
 output byte-identical to the same-card run. The DFlash2 rows were taken with prompts under 2,048 tokens: the exported
 head's state variable is fixed at 2,048 rows and the drafter disables itself
-on longer prompts (known defect, 2026-09-03; the drafter-on acceptance task
-scores 10/10 at that depth). At production context (155648) the MTP
+on longer prompts (known defect, 2026-09-03, fixed in the unreleased tree
+by plugin patch 0014 and a capped, recoverable drafter; the drafter-on
+acceptance task scores 10/10 at that depth). At production context (155648) the MTP
 head serves at 36.2 t/s and 93.2% acceptance, 10/10 greedy, on short
 prompts; with prompts of 76k tokens and more its acceptance falls to zero and
 decode to 1 t/s (known defect, 2026-09-03; the cause is not yet measured —
@@ -113,13 +114,13 @@ coder reaches ~1970 t/s.
 
 **Long context against the short-prompt numbers** (2026-09-03, `DESIGN.md`
 §7.0.2aa; a real document truncated to depth, 400 greedy tokens, prefix cache
-off, one process per depth). Dense 27B agent on the 24 GB card, u8, decode
+off, one process per arm, shallowest first). Dense 27B agent on the 24 GB card, u8, decode
 t/s: plain 22.3 / 19.9 / 16.3 at 8.9k / 37.7k / 76.4k tokens; MTP 25.7 /
 12.6 / 1.0 (acceptance 89% / 79% / 0%); DFlash2 19.8 / 11.0 / 5.3 (1.69 /
 1.43 / 1.00 tokens per cycle, measured on the unreleased build that carries
-plugin patch 0014 and the capped, recoverable drafter). Both drafters are
-below plain decoding at every one of these depths and accept nothing at
-76k; the short-prompt rows above are short-prompt rows. Coder on the 16 GiB
+plugin patch 0014 and the capped, recoverable drafter). DFlash is below
+plain decoding at every one of these depths, the MTP head from 37.7k, and
+both accept nothing at 76k; the short-prompt rows above are short-prompt rows. Coder on the 16 GiB
 card: u8 and u8:i4 decode at parity to 72k tokens (40.3 vs 39.2 t/s) while
 the u8:i4 prefill costs +7% / +25% / +72% at 8.9k / 37.7k / 71.7k.
 

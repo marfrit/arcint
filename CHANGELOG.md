@@ -38,9 +38,10 @@ different nightly is a different ABI.
   decode at parity; by code reading it is the opt attention path u8:i4 is
   forced onto, not yet measured as such.
 - `--mtp on` at depth: on the 24 GB card the dense 27B agent's MTP verify
-  accepts 78% of drafts at 37.7k tokens (12.6 t/s) but 0% at 76k and 143k
+  accepts 79% of drafts at 37.7k tokens (12.6 t/s) but 0% at 76k and 143k
   tokens, where decode falls to 1.0 and 0.3 t/s against plain decoding's
-  16.3 at 76k, and its prefill runs at half plain's rate there; the cause
+  16.3 at 76k, and its prefill runs 13% slower than plain there and at
+  half plain's rate at 143k; the cause
   is not yet measured (by code reading the reconstructed MTP layer keeps an
   unpaged state and a dense mask over the whole context). Serve deep
   contexts with `--mtp off` until it is.
