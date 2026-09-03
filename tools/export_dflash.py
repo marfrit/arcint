@@ -18,6 +18,22 @@ go to a sidecar (dflash_selector.npz). The reference is z-lab/dflash
 dflash/model.py; unlike the 3.6 MTP reconstruction this checkpoint is a
 standard HF Qwen3 layout: plain RMSNorm (weight applied directly) and
 rotate_half rope (half-split, NOT interleaved).
+
+--compress int4 (default: none, i.e. plain f16 output): after the stateful
+IR is saved, reload it (with mmap disabled -- see compress_int4()) and
+apply data-free NNCF RTN weight compression (INT4_ASYM, group_size=64,
+ratio=1.0, all_layers=True, dataset=None) to all 56 MatMul weights, then
+replace the f16 stateful IR with the int4 one via a temp file + rename in
+the same directory (never an in-place overwrite of the file still being
+read). This is the recipe recovered from the previously served int4
+head by tracing its graph constants; the reproduction was verified
+byte-identical against that served head with nncf==3.3.0 (2026-09-03).
+The output directory (--out) is unchanged by this flag either way: it ends up holding exactly
+the stateful IR plus the four sidecar files, which is the layout the
+serving flag `--dflash DIR` expects -- so the same --out directory is
+usable directly as a --dflash argument, f16 or int4, without any copying
+step. The stateless graph (openvino_dflash_draft.xml, the parity
+instrument) is never compressed.
 """
 import argparse
 import json
@@ -117,7 +133,47 @@ def expand_kv(t):
 
 
 def kv_state(t, layer, kind, window):
-    """Append [1,KV,P,128] to per-layer state, trim to the last `window`."""
+    """Append [1,KV,P,128] to per-layer state, trim to the last `window` rows.
+
+    The trim's start index is computed at runtime from ShapeOf(cat) --
+    start = max(0, len(cat) - window) -- rather than the constant -window
+    used before. Semantics are unchanged: both forms keep the last `window`
+    rows of `cat` (or fewer, while the state is still filling) --
+    max(0, len-window) is the same start index -window resolves to once
+    len >= window, and 0 once len < window (where a negative literal start
+    would instead have been clamped from the other end by the input length
+    itself). Verified bit-exact against the old (literal-start) export on
+    CPU, for lengths below, at, and above the window.
+
+    This is a defensive change, not a fix for the GPU drafter failure it was
+    written against -- retracted here because the record does not support
+    the earlier claim. An earlier version of this docstring said: a
+    constant negative start lets OpenVINO's shape inference collapse the
+    slice's output PartialShape to a STATIC [1, KV_HEADS, window, HEAD_DIM]
+    once it can prove len(cat) >= window, the GPU plugin then refuses to
+    op.assign that static layout into the variable's permanently-dynamic
+    [1, KV_HEADS, -1, HEAD_DIM] declaration ("Layout mismatch"), and
+    computing the start at runtime is the fix. Measured otherwise
+    (2026-09-03, see patches/0014-gpu-assign-adopts-output-layout.patch's
+    own record): the f16 re-export (this runtime-start version) drafted at
+    2,155 prompt tokens where the served int4 head had failed there --
+    but two variables changed between those two runs (the slice
+    computation AND the weight precision, f16 vs int4), and whether the
+    slice change or the weight precision moved that edge was not isolated.
+    What is isolated: the re-export does NOT clear the exact-window case
+    either way -- 3,251- and 17,126-token prompts still fail on the
+    unpatched GPU plugin. The actual fix is plugin-side:
+    patches/0014-gpu-assign-adopts-output-layout.patch makes the GPU
+    `Assign` adopt the output layout instead of asserting when the
+    variable's layout has fallen behind the assign's; the root cause of why
+    the layout update is skipped exactly at the window boundary was not
+    traced (0014 closes the consequence, not the cause, and says so). This
+    runtime-computed start stays in the export because it removes one
+    plausible contributor and cannot hurt -- it keeps the slice's output
+    shape symbolically dynamic for every length instead of collapsing to
+    static once len(cat) >= window -- but by itself it does not clear the
+    GPU failure; 0014 does.
+    """
     shape = ov.PartialShape([1, KV_HEADS, -1, HEAD_DIM])
     init = op.broadcast(const(np.array([0.0])),
                         op.constant(np.array([1, KV_HEADS, 0, HEAD_DIM], dtype=np.int32)))
@@ -129,7 +185,9 @@ def kv_state(t, layer, kind, window):
     past = op.read_value(init, var)
     cat = op.concat([past, t], axis=2)
     i64c = lambda v: op.constant(np.array([v], dtype=np.int64))
-    trimmed = op.slice(cat, i64c(-window), i64c(2**31 - 1), i64c(1), i64c(2))
+    cat_len = op.gather(op.shape_of(cat, ov.Type.i64), i64c(2), i64c(0))
+    start = op.maximum(op.subtract(cat_len, i64c(window)), i64c(0))
+    trimmed = op.slice(cat, start, i64c(2**31 - 1), i64c(1), i64c(2))
     sink = op.assign(trimmed, var)
     return trimmed, sink
 
@@ -331,10 +389,78 @@ def build(w):
     return ov.Model(results, [ctx_in, noise, positions], "qwen38_dflash2_draft")
 
 
+def compress_int4(stateful_xml_path):
+    """Reload a saved stateful IR and apply the data-free NNCF RTN recipe
+    recovered from the served int4 head (byte-identical reproduction,
+    verified 2026-09-03 against nncf==3.3.0 -- see
+    docs/dflash-pairing-probe.md), then replace the f16 IR with the int4
+    one. nncf is imported here, lazily, so the default f16 export path
+    keeps working on a venv without nncf installed.
+
+    Two things matter for correctness here, both the fix for a defect that
+    made the in-place path unrunnable (2026-09-03 review): read_model()
+    memory-maps the just-saved .bin by default, and a naive
+    `ov.save_model(compressed, stateful_xml_path)` serializes to that SAME
+    path -- Serialize truncates the .bin before it finishes walking the
+    graph's constants, so any constant not yet copied out of the mapping
+    (a norm weight, a rope table -- anything NNCF's RTN pass left
+    untouched and therefore never read+rewrote) reads a truncated mapping
+    through a file that has moved out from under it: SIGBUS at best, silent
+    corruption at worst. The fix is two independent steps: (1) disable
+    mmap on the read so every constant is a private in-memory copy before
+    compression starts, decoupling it from the .bin's lifetime; (2) never
+    serialize onto the path still open for reading -- write to a temporary
+    name in the same directory and rename over the f16 files only once the
+    new .xml/.bin pair is complete on disk."""
+    import nncf
+
+    core = ov.Core()
+    core.set_property({"ENABLE_MMAP": False})
+    model = core.read_model(stateful_xml_path)
+    print("compressing weights: mode=INT4_ASYM group_size=64 ratio=1.0 "
+          "all_layers=True dataset=None (data-free RTN)")
+    compressed = nncf.compress_weights(
+        model,
+        mode=nncf.CompressWeightsMode.INT4_ASYM,
+        ratio=1.0,
+        group_size=64,
+        all_layers=True,
+        dataset=None,
+    )
+
+    directory = os.path.dirname(stateful_xml_path)
+    stem = os.path.splitext(os.path.basename(stateful_xml_path))[0]
+    tmp_xml = os.path.join(directory, f".{stem}.int4.tmp.xml")
+    tmp_bin = os.path.join(directory, f".{stem}.int4.tmp.bin")
+    try:
+        ov.save_model(compressed, tmp_xml)  # writes tmp_xml + the matching tmp_bin
+    except Exception:
+        for p in (tmp_xml, tmp_bin):
+            if os.path.exists(p):
+                os.remove(p)
+        raise
+    final_bin = os.path.join(directory, stem + ".bin")
+    # Two renames, not one -- os.replace() is atomic per file (POSIX rename(2))
+    # but there is no atomic "replace this xml+bin pair together" primitive, so
+    # a crash or SIGKILL between the two os.replace() calls below can leave the
+    # directory with a new .xml paired against the OLD .bin (or vice versa if
+    # the process dies before the second call). Narrower than the in-place
+    # truncate-then-read-mapped-garbage failure this replaced -- the old file
+    # is never open for reading while these run -- but not a transaction.
+    os.replace(tmp_xml, stateful_xml_path)
+    os.replace(tmp_bin, final_bin)
+    print("replaced with int4 stateful IR (temp file + rename, not in-place "
+          "overwrite):", stateful_xml_path)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", default="/models/gptq/qwen38-dflash2")
     ap.add_argument("--out", default="/models/gptq/qwen38-dflash2")
+    ap.add_argument("--compress", choices=["none", "int4"], default="none",
+                     help="apply data-free NNCF weight compression to the "
+                          "saved stateful IR after export (default: none, "
+                          "today's f16 output)")
     args = ap.parse_args()
 
     import torch  # bf16 tensors: numpy has no bfloat16, torch casts them
@@ -349,8 +475,10 @@ def main():
     ov.save_model(model, os.path.join(args.out, "openvino_dflash_draft.xml"),
                   compress_to_fp16=True)
     stateful = build_stateful(w, window=2048)
-    ov.save_model(stateful, os.path.join(args.out, "openvino_dflash_draft_stateful.xml"),
-                  compress_to_fp16=True)
+    stateful_path = os.path.join(args.out, "openvino_dflash_draft_stateful.xml")
+    ov.save_model(stateful, stateful_path, compress_to_fp16=True)
+    if args.compress == "int4":
+        compress_int4(stateful_path)
 
     # raw sidecars for the C++ selector
     w["candidate_selector.hidden_projection.weight"].astype(np.float32).tofile(

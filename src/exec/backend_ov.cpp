@@ -73,6 +73,7 @@
 #include "core/artifact.h"
 #include "core/block_pool.h"
 #include "core/dflash_select.h"
+#include "core/dflash_window.h"
 #include "core/drafter.h"
 #include "core/prefix_cache.h"
 #include "core/sampler.h"
@@ -784,6 +785,17 @@ public:
         ov::Tensor         dfeats;
         std::vector<float> dflash_pending;
         size_t             dflash_base = SIZE_MAX;   // abs pos of pending[0]
+        // Per-lane recoverable disable (measured 2026-09-03): a draft
+        // failure on this lane's sequence turns its drafter off until the
+        // next dflash_reset (a fresh request re-arms it) instead of the old
+        // process-wide `dflash_ready_ = false`, which left every other
+        // lane's drafter permanently off for the rest of the process after
+        // one bad request. dflash_fail_count is cumulative across resets
+        // (not cleared by dflash_reset) so a persistently failing lane stays
+        // visible in the request-end log/stats rather than quietly resetting
+        // to zero every time it re-arms.
+        bool               dflash_off        = false;
+        uint64_t           dflash_fail_count = 0;
 
         // M11 dump instrument (the M11 design note (not in the repository) O): the lattice
         // dflash_select built for the cycle currently in flight, stashed here
@@ -1858,7 +1870,7 @@ private:
             const auto t_fwd      = clock::now();
             const bool       last = past + take == prompt_ids.size();
             const bool wfeats =
-                dflash_ready_ && past + take + kDflashWindow >= prompt_ids.size();
+                dflash_active(lane) && past + take + kDflashWindow >= prompt_ids.size();
             const ov::Tensor out =
                 paged_forward(lane, emb, past, {static_cast<int32_t>(c)}, 0, last, wfeats);
             stats.prefill_forward_seconds +=
@@ -1867,7 +1879,7 @@ private:
             if (mtp_ready_) {
                 mtp_prime_paged(lane, lane.hidden, emb, take);
             }
-            if (dflash_ready_ && wfeats) {
+            if (dflash_active(lane) && wfeats) {
                 const size_t from = prompt_ids.size() > kDflashWindow &&
                                             past < prompt_ids.size() - kDflashWindow
                                         ? prompt_ids.size() - kDflashWindow - past
@@ -1959,9 +1971,17 @@ private:
             // branch has a lattice to dump; ngram and MTP proposals carry no
             // candidate set for the offline oracle to bound.
             bool used_dflash = false;
-            if (dflash_ready_ && in.sampler.greedy()) {
-                drafts      = dflash_draft(lane, next, past);
-                used_dflash = true;
+            if (dflash_active(lane) && in.sampler.greedy()) {
+                drafts = dflash_draft(lane, next, past);
+                // Set AFTER the call, not before: a failed draft can disable
+                // this lane from inside dflash_draft (dflash_lane_fail), and
+                // the dump code below reads lane.dflash_dump_lattice, which
+                // a failed call never repopulated -- it could still hold
+                // whatever a PRIOR successful cycle left in it (possibly
+                // already moved out of by that cycle's own dump write). A
+                // lane still active after the call means dflash_select ran
+                // and the lattice is this cycle's own.
+                used_dflash = dflash_active(lane);
             } else if (mtp_ready_ && in.sampler.greedy()) {
                 const int d = mtp_feed(lane, next, true);
                 if (d >= 0) drafts.push_back(d);
@@ -2143,7 +2163,7 @@ private:
             }
             // The accepted rows (anchor + accepted drafts) are now context; only
             // they enter the drafter's state, so there is nothing to roll back.
-            if (dflash_ready_) dflash_append(lane, 0, accepted + 1, past);
+            if (dflash_active(lane)) dflash_append(lane, 0, accepted + 1, past);
 
             c = static_cast<size_t>(la_rows[1 + accepted]);   // promotion
             past += 1 + accepted;
@@ -4158,6 +4178,13 @@ private:
         }
         ~LaneReset() {
             backend_.release_lane(lane_);
+            // Every exit path -- normal return, an early `return
+            // FinishReason::Length` out of the prefill loop when the KV pool
+            // is exhausted, or an exception unwinding out of the graph --
+            // passes through here, which is why this (not a line before one
+            // particular `return`) is where the lane's cumulative dflash
+            // failure count gets into this request's stats.
+            stats_.dflash_lane_failures = static_cast<int>(lane_.dflash_fail_count);
             std::vector<double>& w = lane_.stalls;
             if (!w.empty()) {
                 std::sort(w.begin(), w.end());
@@ -4304,7 +4331,7 @@ private:
             lane.req.infer();
             if (want_logits) copy_out(lane.req.get_tensor("logits"), lane.logits);
             if (mtp_ready_) copy_out(lane.req.get_tensor("hidden_states"), lane.hidden);
-            if (dflash_ready_ && want_feats) {
+            if (dflash_active(lane) && want_feats) {
                 copy_out(lane.req.get_tensor("dflash_feats"), lane.dfeats);
             }
         });
@@ -5062,42 +5089,90 @@ private:
     // accepted positions, so there is nothing to roll back: a rejected block's
     // K/V never entered the state (the graph computes them per call and the
     // state append holds context rows only). docs/dflash-pairing-probe.md.
+
+    // The check every dflash_* call site wants: the drafter loaded at all
+    // (process-wide, set once at startup) AND this lane's own drafter has
+    // not been disabled by a runtime failure since its last reset. Kept as
+    // one call so no site can accidentally check only the process-wide half
+    // and draft on a lane a failure meant to keep off until its reset.
+    bool dflash_active(const Lane& lane) const {
+        return dflash_ready_.load(std::memory_order_relaxed) && !lane.dflash_off;
+    }
+
+    // A draft failure disables only the failing lane's drafter, until its
+    // next dflash_reset (a fresh request re-arms it) -- a corrupted feature
+    // buffer or a misaligned append on one sequence says nothing about the
+    // head's correctness for another lane's sequence, and the pre-fix
+    // process-wide `dflash_ready_ = false` left the drafter permanently off
+    // for the rest of the process after one bad request (measured
+    // 2026-09-03, one lane: after a long prompt's failure, a later 763-token
+    // request in the same process decoded 3,000 tokens with zero accepted
+    // drafts; that every other lane would have been off as well is what the
+    // old code did by reading, not a measurement). Per-lane recovery is the
+    // whole point, so nothing in here disables the drafter process-wide any
+    // more -- kDflashWarnThreshold consecutive failures with no successful
+    // draft landing in between, across however many lanes and requests, log
+    // a warning on that failure and on every further one until a draft
+    // succeeds; see the member declaration for why even that stopped short
+    // of a disable.
+    void dflash_lane_fail(Lane& lane, const std::string& why) {
+        lane.dflash_off = true;
+        ++lane.dflash_fail_count;
+        lane.dflash_pending.clear();
+        lane.dflash_base = SIZE_MAX;
+        log::warn("dflash", "lane %d: draft failed, disabling this lane's drafter until its "
+                            "next reset: %s",
+                  lane.index, why.c_str());
+        const int consec = dflash_consec_failures_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (consec >= kDflashWarnThreshold) {
+            log::warn("dflash", "%d consecutive dflash failures with no successful draft "
+                                "landing in between; every lane still recovers on its own "
+                                "next reset, but this many in a row is worth a look",
+                      kDflashWarnThreshold);
+        }
+    }
+
     void dflash_reset(Lane& lane) {
         if (!dflash_ready_) return;
         lane.dflash_req.reset_state();
         lane.dflash_pending.clear();
         lane.dflash_base = SIZE_MAX;
+        lane.dflash_off  = false;   // a new request re-arms this lane's drafter
     }
 
     // Rows [row_from, row_from+rows) of the last forward's feature output
     // belong to absolute positions [pos, pos+rows) and are now committed
     // context. A discontinuity means the bookkeeping is wrong, and the honest
-    // reaction is to stop drafting, not to draft from misaligned context.
+    // reaction is to stop drafting this lane, not to draft from misaligned
+    // context.
     void dflash_append(Lane& lane, size_t row_from, size_t rows, size_t pos) {
-        if (!dflash_ready_ || rows == 0) return;
+        if (!dflash_active(lane) || rows == 0) return;
         const size_t width = dflash_feat_width_;
         const size_t have  = lane.dfeats.get_size() / width;
         if (row_from + rows > have) {
-            log::warn("dflash", "feature output has %zu row(s), needed %zu; disabling",
-                      have, row_from + rows);
-            dflash_ready_ = false;
+            dflash_lane_fail(lane, log::format("feature output has %zu row(s), needed %zu",
+                                               have, row_from + rows));
             return;
         }
         const size_t pend = lane.dflash_pending.size() / width;
         if (lane.dflash_base == SIZE_MAX) {
             lane.dflash_base = pos;
         } else if (lane.dflash_base + pend != pos) {
-            log::warn("dflash", "feature gap: pending ends at %zu, append at %zu; disabling",
-                      lane.dflash_base + pend, pos);
-            dflash_ready_ = false;
+            dflash_lane_fail(lane, log::format("feature gap: pending ends at %zu, append at %zu",
+                                               lane.dflash_base + pend, pos));
             return;
         }
         const float* src = lane.dfeats.data<const float>();
         lane.dflash_pending.insert(lane.dflash_pending.end(), src + row_from * width,
                                    src + (row_from + rows) * width);
+        // src/core/dflash_window.h: `keep` is the same "most recent
+        // kDflashWindow rows" trim this always applied; `new_rows` is 0 here
+        // because the rows just inserted above are already reflected in the
+        // buffer's current size.
         const size_t total = lane.dflash_pending.size() / width;
-        if (total > kDflashWindow) {
-            const size_t drop = total - kDflashWindow;
+        const auto   plan  = dflash_window_plan(total, 0, kDflashWindow);
+        if (plan.keep < total) {
+            const size_t drop = total - plan.keep;
             lane.dflash_pending.erase(lane.dflash_pending.begin(),
                                       lane.dflash_pending.begin() +
                                           static_cast<long>(drop * width));
@@ -5109,16 +5184,32 @@ private:
     // the block over [anchor, mask x (block-1)], score the draft rows through
     // the target lm_head, and trace one path with the selector. One turn for
     // the whole step: three shared compiled models run back to back.
+    //
+    // The loop below feeds `pend` rows to the drafter's state in the exact
+    // sequence src/core/dflash_window.h's feed_steps() returns -- that
+    // function, not this loop, is what tests/test_dflash_window.cpp pins,
+    // so the loop under test is the loop that runs. See the header for what
+    // is actually measured about why this cap exists (feeds >= kDflashWindow
+    // observed to fail on GPU plugins without patch 0014; a narrower and now
+    // retracted claim about exactly kDflashWindow was falsified by a later
+    // 1,615-row failure). Every step before the last is a priming feed whose
+    // output is discarded (only new_feats ever becomes persistent state);
+    // the last step also carries the actual draft block and is the one
+    // scored. Below the cap (every prompt under the window) feed_steps
+    // returns a single element equal to `pend`, so the loop runs its one
+    // iteration exactly as the pre-fix code always did, and the
+    // accepted-per-cycle counts of a record taken under the window do not
+    // move.
     std::vector<int> dflash_draft(Lane& lane, int anchor, size_t past) {
-        if (!dflash_ready_) return {};
+        if (!dflash_active(lane)) return {};
         try {
             const size_t width = dflash_feat_width_;
             const size_t pend  = lane.dflash_pending.size() / width;
             if (pend == 0 || lane.dflash_base + pend != past) {
-                log::warn("dflash", "pending context ends at %zu but the anchor sits at %zu; "
-                                    "disabling",
-                          lane.dflash_base == SIZE_MAX ? 0 : lane.dflash_base + pend, past);
-                dflash_ready_ = false;
+                dflash_lane_fail(
+                    lane,
+                    log::format("pending context ends at %zu but the anchor sits at %zu",
+                                lane.dflash_base == SIZE_MAX ? 0 : lane.dflash_base + pend, past));
                 return {};
             }
             const size_t q = dflash_block_;
@@ -5137,38 +5228,54 @@ private:
                 const float* me = dflash_mask_embed_.data<const float>();
                 for (size_t i = 1; i < q; ++i) std::memcpy(np + i * h, me, h * 4);
 
-                ov::Tensor feats(ov::element::f32, ov::Shape{1, pend, width},
-                                 lane.dflash_pending.data());
-                ov::Tensor pos(ov::element::i64, ov::Shape{pend + q});
-                int64_t*   pp = pos.data<int64_t>();
-                for (size_t i = 0; i < pend; ++i) {
-                    pp[i] = static_cast<int64_t>(lane.dflash_base + i);
+                const std::vector<size_t> steps = feed_steps(pend, kDflashWindow);
+                size_t                    off   = 0;
+                std::vector<int>          drafts;
+                for (size_t s = 0; s < steps.size(); ++s) {
+                    const size_t feed       = steps[s];
+                    const bool   final_step = s + 1 == steps.size();
+
+                    ov::Tensor feats(ov::element::f32, ov::Shape{1, feed, width},
+                                     lane.dflash_pending.data() + off * width);
+                    ov::Tensor pos(ov::element::i64, ov::Shape{feed + q});
+                    int64_t*   pp = pos.data<int64_t>();
+                    for (size_t i = 0; i < feed; ++i) {
+                        pp[i] = static_cast<int64_t>(lane.dflash_base + off + i);
+                    }
+                    for (size_t i = 0; i < q; ++i) {
+                        pp[feed + i] = static_cast<int64_t>(past + i);
+                    }
+
+                    lane.dflash_req.set_tensor("new_feats", feats);
+                    lane.dflash_req.set_tensor("noise", noise);
+                    lane.dflash_req.set_tensor("positions", pos);
+                    lane.dflash_req.infer();
+
+                    off += feed;
+                    if (!final_step) continue;   // priming step: output unused
+
+                    const ov::Tensor out = lane.dflash_req.get_output_tensor(0);   // [1,q,h]
+                    ov::Tensor rows(ov::element::f32, ov::Shape{1, q - 1, h});
+                    std::memcpy(rows.data(), out.data<const float>() + h, (q - 1) * h * 4);
+                    lane.dflash_head.set_input_tensor(rows);
+                    lane.dflash_head.infer();
+                    const ov::Tensor lg = lane.dflash_head.get_output_tensor(0);
+
+                    drafts = dflash_select(lane, rows.data<const float>(), lg.data<const float>(),
+                                           q - 1, h, anchor);
                 }
-                for (size_t i = 0; i < q; ++i) {
-                    pp[pend + i] = static_cast<int64_t>(past + i);
-                }
-
-                lane.dflash_req.set_tensor("new_feats", feats);
-                lane.dflash_req.set_tensor("noise", noise);
-                lane.dflash_req.set_tensor("positions", pos);
-                lane.dflash_req.infer();
-                const ov::Tensor out = lane.dflash_req.get_output_tensor(0);   // [1,q,h]
-
-                ov::Tensor rows(ov::element::f32, ov::Shape{1, q - 1, h});
-                std::memcpy(rows.data(), out.data<const float>() + h, (q - 1) * h * 4);
-                lane.dflash_head.set_input_tensor(rows);
-                lane.dflash_head.infer();
-                const ov::Tensor lg = lane.dflash_head.get_output_tensor(0);
-
-                std::vector<int> drafts = dflash_select(
-                    lane, rows.data<const float>(), lg.data<const float>(), q - 1, h, anchor);
                 lane.dflash_pending.clear();
                 lane.dflash_base = past;
+                // A draft call that reaches here completed without throwing
+                // and without a bookkeeping failure -- exactly the "nothing
+                // in between" the breaker's consecutive count tracks; reset
+                // it so an old, unrelated lane's failures do not carry
+                // forward into a run that is working.
+                dflash_consec_failures_.store(0, std::memory_order_relaxed);
                 return drafts;
             });
         } catch (const std::exception& e) {
-            log::warn("dflash", "draft failed, disabling the drafter: %s", e.what());
-            dflash_ready_ = false;
+            dflash_lane_fail(lane, e.what());
             return {};
         }
     }
@@ -5471,7 +5578,15 @@ private:
     ov::CompiledModel        dflash_model_;
     ov::CompiledModel        dflash_head_model_;
     bool                     want_dflash_      = false;
-    bool                     dflash_ready_     = false;
+    // Whether the drafter loaded at all -- written once at startup (single-
+    // threaded, before any request is served) and never on the request
+    // path; std::atomic<bool> because it is read from every lane's thread on
+    // every dflash call site (dflash_active() below) and a plain bool with
+    // even an occasional cross-thread writer is a data race, not merely a
+    // stale read. NOT the per-lane runtime disable, which lives on
+    // Lane::dflash_off; dflash_active() below is the combination call sites
+    // actually want.
+    std::atomic<bool>       dflash_ready_{false};
     size_t                   dflash_block_     = 8;
     int                      dflash_mask_token_ = 0;
     size_t                   dflash_topk_      = 16;
@@ -5479,6 +5594,18 @@ private:
     size_t                   dflash_vocab_     = 0;
     size_t                   dflash_feat_width_ = 0;
     static constexpr size_t  kDflashWindow     = 2048;   // the head's sliding window
+    // A lane failing on its own request is ordinary (a corrupted feature
+    // buffer on one sequence, recoverable at the next reset -- see
+    // Lane::dflash_off) and never disables anything beyond that lane.
+    // kDflashWarnThreshold (8, roughly a handful of bad requests -- one bad
+    // prompt can plausibly fail more than one lane in flight, so this
+    // requires several before it is worth a look) logs a warning on the
+    // failure that reaches it and on every further one until a draft
+    // succeeds; nothing disables the drafter process-wide, and every lane
+    // still recovers on its own next dflash_reset regardless of how high
+    // this count climbs.
+    static constexpr int     kDflashWarnThreshold = 8;
+    std::atomic<int>         dflash_consec_failures_{0};
     std::vector<float>       dflash_proj_;               // [rank, hidden] f32
     std::vector<ov::float16> dflash_pred_cb_;            // [vocab, rank]
     std::vector<ov::float16> dflash_succ_cb_;

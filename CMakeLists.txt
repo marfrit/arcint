@@ -176,6 +176,7 @@ if(ARCINT_TESTS)
     tests/test_registry.cpp
     tests/test_chat.cpp
     tests/test_dflash_select.cpp
+    tests/test_dflash_window.cpp
     tests/test_drafter.cpp
     tests/test_text.cpp
     tests/test_config.cpp

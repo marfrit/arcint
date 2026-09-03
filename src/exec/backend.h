@@ -165,6 +165,14 @@ struct GenerationStats {
     double stall_p95_seconds   = 0.0;
     double stall_max_seconds   = 0.0;
 
+    // Cumulative DFlash2 failures on the lane this request ran on, counted
+    // since the lane last loaded (not reset per request): a lane whose
+    // drafter keeps disabling itself request after request is a persistently
+    // failing head, and that trend is only visible if the counter survives
+    // the per-lane re-arm at the next dflash_reset. Zero on a backend with no
+    // drafter, or a lane that has never failed.
+    int dflash_lane_failures = 0;
+
     double prefill_rate() const {
         return prefill_seconds > 0.0 ? prompt_tokens / prefill_seconds : 0.0;
     }

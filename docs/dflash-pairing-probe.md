@@ -73,7 +73,12 @@ host from raw sidecars; logits go through the artifact's own extracted
 lm_head. arcint wires it as `--dflash DIR` (`--dflash-device` to park it on
 the other card): five residual taps on the paged graph (`dflash_feats`,
 layers 5/19/33/47/61 concatenated), a feature window of 2048 positions, and
-the existing checkpoint-row verify at depth 7.
+the existing checkpoint-row verify at depth 7. Pass `--compress int4` to
+`tools/export_dflash.py` to get an int4 draft head directly (data-free NNCF
+RTN, INT4_ASYM, group_size=64, ratio=1.0, all_layers=True) instead of the
+default f16 output; this recipe was verified byte-identical (all 56 MatMul
+weight/scale/zero-point constants, nncf==3.3.0) against the previously
+served int4 head (2026-09-03).
 
 **The f16 lesson, measured stage by stage:** the head's residual stream
 peaks at ~128k — past f16's 65504 — while its input starts at 0.05, and on
@@ -112,6 +117,57 @@ Open items, honestly: acceptance under the production thinking template and
 prefix-cache hits (a warm hit starts the drafter with no features for the
 cached prefix) are unmeasured; the drafter is greedy-only by the acceptance
 rule; and the Prüfstand has not scored the dflash arm yet.
+
+**Export defect (2026-09-03): the state trim's constant negative start was
+suspected to break the drafter above 2,048 tokens -- retracted below,
+measured otherwise.** `tools/export_dflash.py`'s `kv_state()` trimmed the
+per-layer K/V state with a literal `op.slice(cat, -window, INF, ...)`; the
+served int4 head disabled on the GPU plugin's `op.assign` at 2,155 and
+2,230 prompt tokens with "Layout mismatch" (the variable stuck at its
+initial 0-row layout, the assign output at the window's shape). The
+suspected mechanism: once the concatenated length reached `window`,
+OpenVINO's shape inference could collapse the slice's output PartialShape
+to *static* `[1, KV_HEADS, window, HEAD_DIM]`, and a static assign into the
+variable's permanently dynamic `[1, KV_HEADS, -1, HEAD_DIM]` declaration
+would then be refused.
+
+Defensive change made on that suspicion, not a fix: compute the slice
+start at runtime from `ShapeOf(cat)` -- `max(0, len(cat) - window)` -- via
+`ShapeOf`/`Gather`/`Subtract`/`Maximum` instead of the constant, keeping
+the output shape symbolically dynamic for every length instead of
+collapsing to static once `len(cat) >= window`. Semantics are identical to
+the literal-start form for every length; CPU inference (which does not
+reproduce the GPU refusal) confirms the change is bit-exact against the
+un-fixed export at matched weight precision, for lengths below, at, and
+above the window.
+
+**An earlier version of this note called that runtime-computed start "the
+fix". Measured otherwise** (2026-09-03, recorded in full in
+`patches/0014-gpu-assign-adopts-output-layout.patch`): the f16 re-export
+drafted at 2,155 prompt tokens where the served int4 head had failed
+there -- but two variables changed between those two runs (the slice
+computation and the weight precision, f16 vs int4), and whether the slice
+change or the weight precision moved that edge was not isolated. What is
+isolated: the re-export does not clear the exact-window case either way --
+3,251- and 17,126-token prompts still fail on the unpatched GPU plugin.
+The actual fix is plugin-side:
+`patches/0014-gpu-assign-adopts-output-layout.patch` makes the GPU
+`Assign` adopt the output layout instead of asserting when the variable's
+layout has fallen behind the assign's (the root cause of *why* the layout
+update is skipped exactly at the window boundary was not traced -- the
+patch closes the consequence, not the cause, and says so in its own
+commit message). With 0014 applied, the served int4 head drafts at 2,481
+and 3,251 prompt tokens (1.88 accepted/cycle over 64 tokens) and at 17,126
+(1.39 accepted/cycle); see the patch file for the full window record.
+
+Package deployments (the plugin as shipped, without 0014) are not left
+broken in the meantime: `src/core/dflash_window.h` adds an engine-side
+belt -- capping the fed rows one below the window and priming the state
+with a separate pass so the concatenation inside the plugin never lands
+exactly on the window -- measured on the packaged (unpatched) plugin at
+1.94 / 2.06 / 1.39 accepted per cycle for 2,481 / 3,251 / 17,126 prompt
+tokens. 0014 is the plugin-side fix; the engine-side cap is the belt that
+keeps package deployments serving until a plugin carrying 0014 ships.
 
 ## Coexistence on the A770: loads, drafts, and wedges under load (2026-09-01)
 

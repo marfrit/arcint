@@ -130,6 +130,14 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
             stats.draft_proposed, stats.draft_verify_seconds, stats.draft_reforward_seconds,
             stats.draft_rollback_seconds);
     }
+    // Visible even on a request that drafted nothing at all: a lane whose
+    // drafter is currently off (disabled by an earlier failure, re-armed only
+    // at the next request) proposes zero drafts and would otherwise vanish
+    // from this line entirely.
+    if (stats.dflash_lane_failures > 0) {
+        decode_suffix +=
+            log::format(" | dflash lane failures %d (cumulative)", stats.dflash_lane_failures);
+    }
     // What the other lane cost this one. Printed only when it happened, so a
     // single-stream run's line is the line it always was, and a p95 rather than
     // a mean because one long stall inside many short steps is exactly what a
