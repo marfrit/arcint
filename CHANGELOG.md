@@ -511,54 +511,43 @@ different nightly is a different ABI.
   drafter disables itself for the process (decode continues without
   drafts). Every DFlash number on the record was taken with prompts under
   2,048 tokens.
-- `--paged-kv u8:i4` (unpatched plugin -- the level in this tree before
-  patch 0015): a prefill crashes with a GPU engine reset on the 24 GB
-  card once the prompt reaches 98,304 tokens (384 attention partitions of
-  256), with a 131,072-token pool -- 97,847 tokens pass, 98,147 tokens
-  crash, and so does 119k. Plain u8 is unaffected: it takes the
-  micro-SDPA path and allocates no such buffers. The 16 GiB card serves
-  the same cells; it has no GPU fault reporting, and why the fault does
-  not surface there is not measured. The plugin's own
-  single-execute harness passes at 170,000 tokens.
-
-  CORRECTED tally (a repeated untouched-control run changed the read;
-  kept on the record rather than silently edited, per DESIGN §7.0.1): at
-  this 384-partition cell, on the 24 GB card, past 98k tokens, that day
-  -- the untouched plugin crashed in FIVE of six runs (98,147 tokens
-  once, 100k once, 119k twice with a 131,072-token pool, 119k once with
-  a 165,680-token pool) and PASSED once (98,147 tokens, 865 s) -- the
-  seam is not deterministic. Every changed build tried -- a fresh sizing
-  of the intermediate buffers (patch 0016), a forced global finalization
-  arm, a doubled register-arm capacity, patch 0015's argument rebind
-  taken alone, and the full patch 0015 at its unbounded setting --
-  passed in seven of seven runs, but each is a single sample against a
-  baseline that itself passes 1 run in 6, so this is SUGGESTIVE of the
-  argument rebind (the only one of the changes with a mechanism behind
-  it, read from the plugin source) and decided by nothing yet; patch
-  0016's fresh sizing still ships as hardening, not as a proven fix.
-  Next instruments, both written and running: a trace build that logs
-  the memory handle bound at each enqueue against the handles freed at
-  each reallocation, and a multi-execute harness test that grows the
-  past chunk by chunk.
-
-  Context found in the driver's own tracker, kept attributed rather than
-  asserted as this repository's own finding: the kernel-log signature
-  ("Engine memory CAT error", class `ccs`, then an engine reset) is the
-  GPU firmware's (GuC's) catastrophic-error notification, which the
-  driver treats as a bare engine reset without decoding the underlying
-  fault type. The same notification under sustained LLM inference on
-  this card's generation (Battlemage) is an OPEN upstream item (a
-  `drm/xe` kernel work item, #8390, opened 2026), where the compute
-  runtime's USM pool manager was implicated and
-  `NEOReadDebugKeys=1 UseUsmPoolManager=0` mitigated it in that report;
-  that environment switch is on this record's own discriminator list,
-  not yet run here. The 16 GiB card's silence is consistent with -- not
-  proven by -- its generation (Alchemist) lacking the recoverable
-  page-fault path Battlemage has.
-
-  Until a plugin level carrying the argument rebind ships, treat
-  `--paged-kv u8:i4` prompts beyond about 98k tokens as unsafe on cards
-  that report GPU faults.
+- `--paged-kv u8:i4`, a deep-prompt crash on the 24 GB card: CLOSED as a
+  diagnosed driver/runtime interaction, not a plugin defect (full
+  mechanism, evidence and the upstream match: `DESIGN.md` §7.0.2ad).
+  RETRACTED (§7.0.1): every earlier note here framed this as
+  depth-triggered ("past 98k tokens", "384 partitions") -- wrong. The
+  trigger is one fixed 98,147-token prompt; the crash depth within its
+  prefill is random (traced at about 3.6k, 12k and 40k tokens on three
+  separate crashes), and the actual trigger is VRAM headroom together
+  with concurrent host or other-card load, not depth. Mechanism: every
+  crash is a GPU page-fault storm at the OpenCL runtime's own
+  direct-submission semaphore buffer (one fixed GPU virtual address,
+  identified in the runtime's own allocation log), evicted as an
+  ordinary user BO under VRAM pressure and never revalidated before its
+  next wait; the plugin's paged-attention kernels are exonerated (0
+  stale bindings over 5,867 traced dispatches, on a fixed prompt whose
+  crash depth still varies). Every crash on the 24 GB card on this
+  record was produced under the `ARCINT_PREFILL_CHUNK_CAP=off`
+  diagnostic bypass; with `ARCINT_PREFILL_CHUNK_CAP` at its default
+  (the only default in this cell -- the bound was set explicitly,
+  `--paged-attention-max-partitions 32`; the stock default, bound 0,
+  with the term active is unmeasured at this cell), the fit's scratch
+  term active on the 24 GB card, u8:i4, `--n-ctx 131072`, passed 2 of 2
+  runs at the same cell. `NEOReadDebugKeys=1 EnableDirectSubmission=0`
+  is documented as a fallback if the bound is ever violated (3/3 on the
+  patched build, 2/2 untouched, 5/5 on the 16 GiB card at +1.4% wall)
+  -- but its control also passes on a quiet host, so that evidence is
+  mechanism-derived, not a rate result. Matches an open upstream
+  `drm/xe` tracker item (#8390) reporting the same runtime heap region
+  on this card's generation, plus a second candidate mechanism for the
+  SAME fault, not yet separated (a stable-branch ring-ordering fix
+  present in `linux-7.1.y`, absent from the dev host's kernel) -- an
+  operator decision on the host kernel, not made. `--paged-kv u8:i4`
+  beyond about 98k tokens under the bypass stays unsafe on
+  fault-reporting cards; at bound 32 with the 165,680-token pool the
+  16 GiB card passed 5 of 5 runs on a quiet host and 4 of 7 earlier
+  that evening while the host was also building plugin variants (host
+  load not recorded).
 
 - Drafting II measured (M11, `DESIGN.md` §7.0.2z): four host-side levers on
   the DFlash2 chain, all free of training. Viterbi over the selector's

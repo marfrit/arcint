@@ -4,10 +4,10 @@
 # docs/design-m8-asymmetric-kv.md's follow-up, §7.0.2ab (2026-09-03): on
 # the card measured there, the u8:i4 auto-fit lands at 101,984 tokens
 # instead of u8's 133,456 because the GENERATE/MIXED-stage mixed attention
-# scratch buffer grows with context depth (measured: 932 MiB at 119k
-# tokens/chunk 128, the `CL_OUT_OF_RESOURCES` fault §7.0.2ab root-caused to
-# the xe driver's rebind worker failing on a full card, "-12" in the
-# kernel log). Applied against the pinned runtime, build
+# scratch buffer grows with context depth (measured: 932 MiB at 98k
+# (331,500 chars = 98,147 tokens)/chunk 128, the `CL_OUT_OF_RESOURCES` fault
+# §7.0.2ab root-caused to the xe driver's rebind worker failing on a full
+# card, "-12" in the kernel log). Applied against the pinned runtime, build
 # 2026.4.0-22849-71640275d29, on top of patches/0001-0014.
 #
 # (B) THE RECON CORRECTION, STATED AS A CORRECTION (§7.0.2ab left this
@@ -17,11 +17,18 @@
 # resolves from the IR's real output dtype - f16 on every model this repo
 # serves. Only the HOST sizing was wrong:
 # `paged_attention_opt.cpp::get_internal_buffer_descs` hardcoded
-# `element_size = 4` and applied it to buffer 7 (tmp_out) unconditionally,
-# while buffers 5/6 (exp_sums/max_logits) are correctly 4 B - they are
-# genuinely f32 (softmax_accumulator_type). The mixed stage allocated
-# exactly twice the bytes its kernels address. Fixed by sizing buffer 7
-# with `get_element_size(output_layouts[0].data_type)` instead - no kernel
+# `element_size = 4` and applied it to tmp_out unconditionally, while
+# exp_sums/max_logits are correctly 4 B - they are genuinely f32
+# (softmax_accumulator_type). (Named by role, not number, throughout this
+# header: get_internal_buffer_descs()'s descs are packed densely and
+# has_scores_output() shifts every index from exp_sums onward by two, so
+# there is no single fixed number for any of these - in the no-scores
+# MIXED-stage indexing arcint serves it is exp_sums=3, max_logits=4,
+# tmp_out=5, and index 6 is the gws->subsequence mapping; the construction
+# sites size each correctly regardless of which index it lands at.) The
+# mixed stage allocated exactly twice the bytes its kernels address.
+# Fixed by sizing tmp_out with
+# `get_element_size(output_layouts[0].data_type)` instead - no kernel
 # line changes, same addresses written and read, half the term. Byte-exact
 # by construction; not gated on precision (a 2x over-allocation on u8 was
 # not worth preserving as a divergent path).
@@ -87,7 +94,7 @@
 #     the fine-grained raw partition index, a separate feature this patch
 #     does not rework and would overrun if folded). `rt_params->
 #     num_of_partitions` becomes P directly (every exp_sums/tmp_out stride
-#     already reads it, so buffer 7's and buffers 5/6's element counts
+#     already reads it, so tmp_out's and exp_sums/max_logits's element counts
 #     shrink for free); a new `rt_params->partitions_per_wg` carries
 #     S = ceil(raw_partitions / P), default 1.
 #   - `partitions_per_wg` reaches both the stage-0 kernel (a new trailing
@@ -243,14 +250,14 @@
 #   needed, 0.1% as the expected typical deviation.
 #
 #   (3) get_element_size(ov::element::dynamic) returns 0, not a thrown
-#   error; a still-unresolved output type at buffer-7 sizing time would
+#   error; a still-unresolved output type at tmp_out sizing time would
 #   have silently allocated a 0-byte buffer instead of failing loud.
 #   Asserted non-zero in get_internal_buffer_descs (this task did not
 #   observe the output type unresolved at that point - shape can stay
 #   dynamic, the element type is not expected to - so this is a defensive
 #   assert on an invariant, not a fix for an observed failure). The
 #   PREFILL-stage dummy buffer (unused, see above) is now commented as
-#   halved relative to before this patch, for the same reason buffer 7
+#   halved relative to before this patch, for the same reason tmp_out
 #   itself is - harmless, since PREFILL never addresses it.
 #
 #   (4) The exp_sums/max_logits write predicate now uses the same
@@ -331,7 +338,7 @@
 # change to the primitive's OUTPUT memory, `has_mutable_input()`,
 # `is_output()`, dynamic dependencies, or a full impl swap - never a pure
 # intermediate-buffer identity change. Before this patch, paged
-# attention's tmp_out buffer (buffer 7) grew every MIXED-stage chunk of a
+# attention's tmp_out buffer grew every MIXED-stage chunk of a
 # long prefill without bound, so its identity changed on effectively every
 # call regardless; this patch is what makes tmp_out's required size
 # plateau once PAGED_ATTENTION_MAX_PARTITIONS bounds it, so a genuine
@@ -380,7 +387,7 @@
 # reference drops and its destructor can free it). `prepare_internal_
 # buffers`'s `mem_lock` on `past_lens` for the MIXED-stage path provides
 # an incidental synchronisation point for THAT buffer, not a deliberate
-# guarantee for buffers 5/6/7 specifically; the GENERATE-without-scores
+# guarantee for exp_sums/max_logits/tmp_out specifically; the GENERATE-without-scores
 # path takes an early return in that same function and has no such
 # barrier at all. This is not fixed by fix A and is recorded here as a
 # residual for item B - properly closing it likely needs the framework's
@@ -434,7 +441,7 @@
 #
 #   - MITIGATION 2 (a separate staged variant, m15b - built on top of fix
 #     A, not a replacement for it, and explicitly NOT necessarily what
-#     ships): removes the identity churn at its source for buffers 5/6/7
+#     ships): removes the identity churn at its source for exp_sums/max_logits/tmp_out
 #     by giving `PagedAttentionOptImpl` its own private, non-pool-shared
 #     allocation for each, sized generously for `PAGED_ATTENTION_MAX_
 #     PARTITIONS`'s bound the first time it is needed and then kept -
@@ -449,9 +456,11 @@
 #     stable objects into the SAME positions a rebuilt `args.intermediates`
 #     would otherwise hold from the framework's own (still independently
 #     allocated, still churning) copy. Deliberately does NOT remove or
-#     resize the framework's own buffer-5/6/7 slots in
-#     `get_internal_buffer_descs()` - doing so would shift buffers 8/9's
-#     positions and risk a far worse, silent argument-index bug for a
+#     resize the framework's own exp_sums/max_logits/tmp_out slots in
+#     `get_internal_buffer_descs()` - doing so would shift the gws->subsequence
+#     mapping buffer and any adaptive-RKV buffers that follow it (there is no
+#     buffer 8 or 9 on the served no-scores path - named by role here for
+#     exactly that reason) and risk a far worse, silent argument-index bug for a
 #     saving that was not the point of this probe. The explicit,
 #     deliberate trade-off, stated rather than hidden: this roughly
 #     DOUBLES scratch memory for these three buffers relative to fix-A-only
@@ -2093,7 +2102,7 @@ index 154ad1c..7f43849 100644
      if (num_of_partitions <= 1) {
          /* Short path, no need any actions for currently processing sequence */
 diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
-index 6ea9722..9a7d5b1 100644
+index 6ea9722..f0db814 100644
 --- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
 +++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
 @@ -12,6 +12,7 @@
@@ -2104,7 +2113,7 @@ index 6ea9722..9a7d5b1 100644
  #include <utility>
  
  #include "../primitive_ocl_base.hpp"
-@@ -516,6 +517,10 @@ public:
+@@ -516,6 +517,10 @@
  
          args.push_back({ArgumentDescriptor::Types::OUTPUT, 0});
          add_intermediate_inputs(args, has_scores_output, false, desc->has_score_aggregation);
@@ -2115,7 +2124,7 @@ index 6ea9722..9a7d5b1 100644
  
          return args;
      }
-@@ -524,6 +529,8 @@ public:
+@@ -524,6 +529,8 @@
          return DispatchDataFunc{[](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {
              assert(!params.is_dynamic());
              auto& wgs = kd.params.workGroups;
@@ -2124,7 +2133,7 @@ index 6ea9722..9a7d5b1 100644
              const auto desc = params.typed_desc<paged_attention>();
              auto* rtp = static_cast<PagedAttentionRuntimeParams*>(rt_params);
  
-@@ -542,6 +549,9 @@ public:
+@@ -542,6 +549,9 @@
              auto sg_scale = get_pa_sg_number_scale_factor(params.get_device_info(), head_size, SDPAStage::SINGLE_TOKEN, get_kv_compressed(params));
              wgs.global = {total_tokens, heads_num, head_size * rtp->num_of_partitions * sg_scale};
              wgs.local = {1, 1, head_size * sg_scale};
@@ -2134,7 +2143,7 @@ index 6ea9722..9a7d5b1 100644
          }};
      }
  };
-@@ -570,6 +580,8 @@ public:
+@@ -570,6 +580,8 @@
          return DispatchDataFunc{[](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {
              assert(!params.is_dynamic());
              auto& wgs = kd.params.workGroups;
@@ -2143,7 +2152,7 @@ index 6ea9722..9a7d5b1 100644
              const auto desc = params.typed_desc<paged_attention>();
              auto* rtp = static_cast<PagedAttentionRuntimeParams*>(rt_params);
  
-@@ -588,6 +600,10 @@ public:
+@@ -588,6 +600,10 @@
              auto gqa_heads_num = kv_groups * ceil_div(kv_group_size, get_heads_per_wi(kv_group_size));
              wgs.global = {total_tokens, gqa_heads_num, head_size * rtp->num_of_partitions * sg_scale};
              wgs.local = {1, 1, head_size * sg_scale};
@@ -2154,7 +2163,7 @@ index 6ea9722..9a7d5b1 100644
          }};
      }
  };
-@@ -620,6 +636,9 @@ public:
+@@ -620,6 +636,9 @@
          add_intermediate_inputs(args, has_scores_output, false, desc->has_score_aggregation);
  
          args.push_back({ArgumentDescriptor::Types::SCALAR, 0});  // total_partitions_num
@@ -2164,7 +2173,7 @@ index 6ea9722..9a7d5b1 100644
  
          return args;
      }
-@@ -629,7 +648,7 @@ public:
+@@ -629,7 +648,7 @@
              assert(!params.is_dynamic());
              auto& wgs = kd.params.workGroups;
              auto& scalars = kd.params.scalars;
@@ -2173,7 +2182,7 @@ index 6ea9722..9a7d5b1 100644
  
              const auto desc = params.typed_desc<paged_attention>();
              auto* rtp = static_cast<PagedAttentionRuntimeParams*>(rt_params);
-@@ -643,6 +662,8 @@ public:
+@@ -643,6 +662,8 @@
  
              scalars[0].t = ScalarDescriptor::Types::UINT32;
              scalars[0].v.u32 = static_cast<uint32_t>(rtp->num_of_partitions);
@@ -2182,7 +2191,7 @@ index 6ea9722..9a7d5b1 100644
          }};
      }
  };
-@@ -735,6 +756,8 @@ public:
+@@ -735,6 +756,8 @@
          }
          args.push_back({ArgumentDescriptor::Types::OUTPUT, 0});
          add_intermediate_inputs(args, has_scores_output, true, desc->has_score_aggregation);
@@ -2191,7 +2200,7 @@ index 6ea9722..9a7d5b1 100644
          return args;
      }
  
-@@ -742,6 +765,8 @@ public:
+@@ -742,6 +765,8 @@
          return DispatchDataFunc{[](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {
              assert(!params.is_dynamic());
              auto& wgs = kd.params.workGroups;
@@ -2200,7 +2209,7 @@ index 6ea9722..9a7d5b1 100644
              const auto desc = params.typed_desc<paged_attention>();
              auto* rtp = static_cast<PagedAttentionRuntimeParams*>(rt_params);
              const size_t total_tokens = params.input_layouts[0].get_partial_shape()[0].get_length();
-@@ -758,6 +783,9 @@ public:
+@@ -758,6 +783,9 @@
              auto sg_scale = get_pa_sg_number_scale_factor(params.get_device_info(), head_size, SDPAStage::MULTI_TOKENS, get_kv_compressed(params));
              wgs.global = {total_tokens, heads_num, head_size * rtp->num_of_partitions * sg_scale};
              wgs.local = {1, 1, head_size * sg_scale};
@@ -2210,7 +2219,7 @@ index 6ea9722..9a7d5b1 100644
          }};
      }
  };
-@@ -793,6 +821,9 @@ public:
+@@ -793,6 +821,9 @@
          add_intermediate_inputs(args, has_scores_output, true, desc->has_score_aggregation);
  
          args.push_back({ArgumentDescriptor::Types::SCALAR, 0});  // total_partitions_num
@@ -2220,7 +2229,7 @@ index 6ea9722..9a7d5b1 100644
  
          return args;
      }
-@@ -802,7 +833,7 @@ public:
+@@ -802,7 +833,7 @@
              assert(!params.is_dynamic());
              auto& wgs = kd.params.workGroups;
              auto& scalars = kd.params.scalars;
@@ -2229,7 +2238,7 @@ index 6ea9722..9a7d5b1 100644
  
              const auto desc = params.typed_desc<paged_attention>();
              auto* rtp = static_cast<PagedAttentionRuntimeParams*>(rt_params);
-@@ -816,6 +847,8 @@ public:
+@@ -816,6 +847,8 @@
  
              scalars[0].t = ScalarDescriptor::Types::UINT32;
              scalars[0].v.u32 = static_cast<uint32_t>(rtp->num_of_partitions);
@@ -2238,7 +2247,7 @@ index 6ea9722..9a7d5b1 100644
          }};
      }
  };
-@@ -1414,6 +1447,13 @@ public:
+@@ -1414,6 +1447,13 @@
      Stage::Ptr pa_sdpa_micro_mixed = make_stage<SDPAMicroGenerator>(false);
  #endif
  
@@ -2252,7 +2261,7 @@ index 6ea9722..9a7d5b1 100644
      PagedAttentionOptImpl() : SDPAImplBase(PagedAttentionOpt::get_type_info_static()) {}
      explicit PagedAttentionOptImpl(const kernel_impl_params& params) : PagedAttentionOptImpl() {
          const auto desc = params.typed_desc<paged_attention>();
-@@ -1611,6 +1651,44 @@ public:
+@@ -1611,6 +1651,44 @@
          }
          rt_params->num_of_partitions = ceil_div(effective_context_len, rt_params->partition_size);
  
@@ -2297,7 +2306,7 @@ index 6ea9722..9a7d5b1 100644
          if ((rt_params->stage == PagedAttentionStage::PREFILL || rt_params->stage == PagedAttentionStage::MIXED) && !params.is_dynamic())
              rt_params->paged_attention_aligned_seq_len = static_cast<size_t>(get_aligned_seq_len(params, rt_params->stage));
  
-@@ -1649,6 +1727,33 @@ public:
+@@ -1649,6 +1727,33 @@
          }
      }
  
@@ -2331,7 +2340,7 @@ index 6ea9722..9a7d5b1 100644
      // update impl_parameter and rt_parameter
      void update(primitive_inst& inst, const kernel_impl_params& impl_params) override {
          SDPAImplBase::update(inst, impl_params);
-@@ -1663,6 +1768,53 @@ public:
+@@ -1663,6 +1768,53 @@
          const bool has_adaptive_rkv = desc->has_adaptive_rkv;
  
          update_stages_flags(instance);
@@ -2385,25 +2394,28 @@ index 6ea9722..9a7d5b1 100644
          kernel_dump_info.clear_entries();
          auto* rt_params = static_cast<PagedAttentionRuntimeParams*>(m_rt_params.get());
          assert(rt_params != nullptr);
-@@ -1787,6 +1939,17 @@ public:
+@@ -1787,6 +1939,20 @@
          const auto desc = params.typed_desc<paged_attention>();
          const auto indexes_dt = ov::element::u8;
          const auto element_size = 4;  // 4 bytes
-+        // arcint (patches/0015), recon corrected against source rather than guessed: buffer 7
-+        // (tmp_out, the mixed-stage intermediate softmax*V output) is declared OUTPUT_TYPE by
-+        // both kernels that touch it (paged_attention_opt.cl:98, 1037 - `__global OUTPUT_TYPE*
-+        // tmp_out`), which make_layout_jit_constants("OUTPUT", output_layouts[0], ...) resolves
-+        // from the IR's real output element type (f16 on every model this repo serves), not the
-+        // hardcoded 4-byte element_size above that buffers 0-6 correctly share (those are
-+        // genuinely 4-byte index/counter buffers and f32 softmax accumulator buffers - see the
-+        // comment at their allocation sites below). Sizing buffer 7 with element_size double-
-+        // allocates a buffer whose bytes are never addressed at that width: no kernel line
-+        // changes, same addresses written and read, half the bytes reserved.
++        // arcint (patches/0015), recon corrected against source rather than guessed: tmp_out
++        // (the mixed-stage intermediate softmax*V output - named by role, not number: these
++        // descs are packed densely and has_scores_output() shifts every index from exp_sums
++        // onward by two, so there is no single fixed index for it; in the no-scores MIXED-stage
++        // indexing arcint serves it is index 5) is declared OUTPUT_TYPE by both kernels that
++        // touch it (paged_attention_opt.cl:98, 1037 - `__global OUTPUT_TYPE* tmp_out`), which
++        // make_layout_jit_constants("OUTPUT", output_layouts[0], ...) resolves from the IR's
++        // real output element type (f16 on every model this repo serves), not the hardcoded
++        // 4-byte element_size above that the other index/counter and softmax-accumulator
++        // buffers correctly share (see the comment at their allocation sites below). Sizing
++        // tmp_out with element_size double-allocates a buffer whose bytes are never addressed
++        // at that width: no kernel line changes, same addresses written and read, half the
++        // bytes reserved.
 +        const auto tmp_out_element_size = get_element_size(params.output_layouts[0].data_type);
          const int64_t target_seq_len_block_size = 16;
  
          auto stage = PagedAttentionStage::UNKNOWN;
-@@ -1802,6 +1965,18 @@ public:
+@@ -1802,6 +1968,18 @@
              partition_size = get_partitioning_size(params, desc->v_head_size, stage);
              const auto max_context_len = get_max_context_len(params);
              num_of_partitions = ceil_div(max_context_len, partition_size);
@@ -2422,7 +2434,7 @@ index 6ea9722..9a7d5b1 100644
          }
          bool can_use_micro_sdpa = false;
  #ifdef ENABLE_ONEDNN_FOR_GPU
-@@ -1879,15 +2054,36 @@ public:
+@@ -1879,15 +2057,36 @@
  
                  // Intermediate tmp output buffer is not used for PREFILL stage
                  tmp_out_elements_count = get_element_size(softmax_accumulator_type);

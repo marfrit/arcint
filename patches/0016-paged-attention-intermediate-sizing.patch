@@ -1,0 +1,1116 @@
+# GPU plugin: size the paged-attention intermediate buffers from the current call, not the last one
+#
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0001-0015. Applied to the staging build used for the byte-identity ladder below and for
+# the unit tests; not applied to production and not to any packaged level. CHANGELOG.md and
+# contrib/packaging/marfrit-openvino updates are deferred to the next release, same as
+# patches/0015.
+#
+# Status: a correct hardening of a real stale count. The deep-prompt crash this patch was once
+# tested against is diagnosed elsewhere (DESIGN.md 7.0.2ad) as a driver/runtime fault outside
+# this plugin - a page-fault storm at a fixed GPU virtual address that the OpenCL runtime's own
+# allocation log identifies as its direct-submission semaphore buffer, evicted under VRAM
+# pressure and never re-validated before the next wait - and this patch neither causes nor closes
+# it.
+#
+# This patch's own evidence is the unit tests below (two red-first review tests, the asymmetric
+# deep-pool regression and the repeated-execute growth regression) and the byte-identity ladder
+# at 8,418 tokens (u8:i4, chunk 128, unbounded, a 16 GiB card). Both measured on a clean build of
+# the shipped stack (the pinned baseline + patches 0001-0016, nothing else): all 19 tests in the
+# combined filter pass on the 24 GB card, and 0015+0016 is 6 of 6 runs byte-equal to the
+# untouched plugin's output (the untouched plugin itself shows about one outlier run in
+# fourteen, the stack's own run-to-run noise, which this patch does not add to). An earlier
+# staging build that also carried an unrelated experimental change was 5 of 6 on the same
+# ladder and 18 of 19 on the tests, the one failure being the sliding-window test's own fixture
+# (an unsized cache), since repaired.
+#
+# Harness fact, for the record: a single paged-attention primitive, one network, executed
+# repeatedly like a served prefill (u8:i4, MIXED chunks of 128 or 256 tokens, past 0 up to
+# 100,352 tokens, PAGED_ATTENTION_MAX_PARTITIONS 0 or 32) passes 4/4 in the unit-test harness -
+# and this IS the repeated-execute case (m_rt_params non-null after the first call, intermediates
+# reallocating on the growth chunks, exactly the branch this investigation is about), unlike every
+# single-shot test elsewhere in this file (one network, one execute() call, m_rt_params always
+# null on that first and only call). It does not, and structurally could not, exercise the fault
+# diagnosed above: that fault needs real VRAM pressure and concurrent host/device load a small,
+# isolated unit-test dispatch does not create.
+#
+# get_internal_buffer_descs() (paged_attention_opt.cpp) sizes internal buffers exp_sums,
+# max_logits, tmp_out - the ones the SDPA_STAGE_0 kernel writes per-partition softmax state into
+# and the finalization kernel (SDPA_STAGE_1) reduces (named by role, not number: the descs are
+# packed densely and has_scores_output() shifts every index from exp_sums onward by two, so
+# there is no single fixed number for any of these - in the no-scores MIXED-stage indexing
+# arcint serves it is exp_sums=3, max_logits=4, tmp_out=5, and index 6 is the gws->subsequence
+# mapping; the construction sites size each correctly regardless of which index it lands at,
+# which is why this patch's own read and fix are unaffected by getting the number wrong) - once
+# per call, from whichever of two sources looked available:
+#
+#   if (rt_params != nullptr && rt_params->num_of_partitions != 0) {
+#       num_of_partitions = rt_params->num_of_partitions;      // "already computed, reuse it"
+#   } else {
+#       ... num_of_partitions = ceil_div(max_context_len, partition_size);  // compute fresh
+#   }
+#
+# Read (not measured) call order, from primitive_inst.cpp: primitive_inst::execute() calls
+# realloc_if_needed() -> realloc_intermediates(), which calls get_internal_buffer_descs() to
+# decide whether exp_sums/max_logits/tmp_out need to grow, BEFORE _impl->execute() runs - and it is
+# _impl->execute() that calls update_rt_params(), the only place that assigns
+# rt_params->num_of_partitions for the call about to be dispatched. m_rt_params is a member the
+# implementation keeps across calls; update_rt_params() overwrites its fields in place and
+# nothing resets num_of_partitions to 0 between calls. So on every call after the first, the
+# "already computed" branch above is taken - but what it reuses is the PREVIOUS call's
+# num_of_partitions, not the one the kernels about to run will use. exp_sums/max_logits/tmp_out
+# sizing is structurally one call behind the dispatch that writes into them.
+#
+# realloc_intermediates()'s own reuse logic (buffer kept if the new request's byte count fits
+# within _max_intermediates_memory_sizes[i], the historical high-water mark) means this does not
+# corrupt every call - once some earlier call's FRESH sizing (the else branch, run before any
+# rt_params exists, or a call where rt_params was for some other reason zero) has pushed a
+# buffer to a given size, later calls whose stale reuse asks for less than that keep the larger
+# buffer untouched. The gap only opens on the specific call that reaches a partition count no
+# earlier call's fresh sizing ever reserved for - which, in a chunked server where
+# num_of_partitions only ever grows, is every call that is itself a new high-water mark, since
+# the branch above never lets the fresh computation run again once rt_params exists. On that
+# call, exp_sums/max_logits/tmp_out stay sized for last call's (smaller) partition count while
+# SDPA_STAGE_0 - whose own num_of_partitions comes from update_rt_params(), computed fresh every
+# call and never stale - writes at strides keyed to the larger, current count.
+#
+# The change: compute the fresh (this-call) estimate unconditionally - the SAME two steps
+# update_rt_params itself uses to turn max_context_len into rt_params->num_of_partitions, mirrored
+# exactly rather than approximated: (1) the SWA block-skip shrink (desc->sliding_window > 0 &&
+# stage == GENERATE && !has_scores_output()) that update_rt_params applies before dividing by
+# partition_size - review finding 1: the first version of this patch skipped it, which made fresh
+# strictly greater than stale on every decode step of any SWA model, not a rare high-water-mark
+# case, silently breaking the "byte-identical on the common path" intent below; and (2) the
+# PAGED_ATTENTION_MAX_PARTITIONS bound (patches/0015), now gated on rt_params->stage (the stage
+# the STALE value was actually bounded under) whenever rt_params exists, rather than on
+# fresh_stage - review finding 2: gating on fresh_stage let a PREFILL-stage call skip bounding
+# for fresh while combining with a stale value from a different, non-PREFILL sequence the same
+# impl handled earlier, so an unbounded fresh count could win the max() and lock in as the
+# high-water mark past the configured bound. Then take num_of_partitions = max(fresh, rt_params's
+# stale value) whenever rt_params exists, instead of trusting the stale value alone. Every call
+# where fresh <= stale (the common case, since the buffer already grew past what this call needs)
+# is byte-identical to before; only a call that is a new high-water mark changes, and only by
+# sizing for what it is actually about to write. stage and partition_size selection are unchanged
+# - still taken from rt_params when available, fresh otherwise - only num_of_partitions itself is
+# touched. This also changes the rt_params-null path itself (the first call, or any call where
+# rt_params was for some other reason zero): its else branch now takes fresh_num_of_partitions,
+# which carries the SWA shrink the old branch never applied, so a sliding-window model's first
+# GENERATE-stage call is sized SMALLER than before this patch - not a regression, since that
+# smaller size is exactly what update_rt_params itself would compute for that same call; the old,
+# unshrunk sizing on that path was the part that did not match production. Nothing else in
+# get_internal_buffer_descs() changes.
+#
+# buf_elements_count, tmp_out_elements_count and the scores-output buffer (further down in this
+# function, unchanged by this patch) are each monotone in num_of_partitions alone - a simple
+# product with total_tokens/heads_num/v_head_size, none of which depend on whether stage and
+# partition_size came from the same operand as num_of_partitions - so pairing a fresh
+# num_of_partitions with a stale stage/partition_size can only over-allocate relative to what a
+# fully-fresh recompute would have asked for, never under-allocate. get_max_context_len(), a
+# mem_lock read of a device buffer, previously ran only on the first call (the pre-existing
+# fallback branch) or when rt_params was otherwise unpopulated; it now runs unconditionally, every
+# call, to produce the fresh estimate - a real per-call cost this patch adds, not hidden in the
+# byte-identical claim above. get_max_context_len() itself does `memory_deps.at(MAX_CONTEXT_LEN)`,
+# which throws rather than degrades if that dependency is absent - now reached on every call
+# instead of only the pre-existing branch's calls.
+#
+# Noted for the record, not addressed by this patch: at PAGED_ATTENTION_MAX_PARTITIONS > 0, the
+# fresh estimate clamps to that bound and stops growing once the raw partition count first
+# exceeds it - so past that point this patch's max(fresh, stale) is constant, and cannot be the
+# mechanism behind a bound-configuration failure that is still timing-sensitive past the point
+# where the count has stopped changing. That failure stays open.
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
+index f0db814..8f1c6f0 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
+@@ -9,6 +9,7 @@
+ // clang-format on
+ #include "paged_attention_opt.hpp"
+ 
++#include <algorithm>
+ #include <array>
+ #include <cstdint>
+ #include <memory>
+@@ -1959,27 +1960,61 @@
+         size_t partition_size = 256;
+         size_t num_of_partitions = 1;
+         auto* rt_params = static_cast<PagedAttentionRuntimeParams*>(m_rt_params.get());
++        // arcint (patches/0016): this function runs from realloc_intermediates(), BEFORE
++        // update_rt_params() computes THIS call's num_of_partitions - m_rt_params is a
++        // persistent member that update_rt_params() overwrites in place, so whenever it is
++        // non-null its num_of_partitions field still holds the PREVIOUS call's value at this
++        // point, not the one about to be dispatched. Always compute the fresh (this-call)
++        // estimate the same way update_rt_params computes rt_params->num_of_partitions itself
++        // (the SWA shrink below, and the PAGED_ATTENTION_MAX_PARTITIONS bound further down,
++        // patches/0015, both mirrored exactly - same condition, same value, not just the same
++        // shape), and never size smaller than either estimate.
++        const auto fresh_stage = get_paged_attention_stage(params);
++        const auto fresh_partition_size = get_partitioning_size(params, desc->v_head_size, fresh_stage);
++        const auto max_context_len = get_max_context_len(params);
++        // arcint (patches/0016, review finding 1): update_rt_params (~1668-1677) does not feed
++        // max_context_len straight into ceil_div - it first shrinks it to effective_context_len
++        // whenever desc->sliding_window > 0 && stage == GENERATE && !has_scores_output(), the
++        // SWA block-skip window. Skipping that shrink here made fresh strictly greater than
++        // stale on every decode step of any SWA model, not just on a high-water-mark call,
++        // silently defeating max(fresh, stale)'s intent to change nothing on the common path.
++        // Mirrored exactly, condition and arithmetic both, against fresh_stage (the stage this
++        // shrink would actually apply under for THIS call).
++        auto fresh_effective_context_len = max_context_len;
++        if (desc->sliding_window > 0 && fresh_stage == PagedAttentionStage::GENERATE && !desc->has_scores_output()) {
++            auto total_blocks = ceil_div(max_context_len, paged_attention_block_size);
++            auto swa_start_block = max_context_len > desc->sliding_window ? (max_context_len - desc->sliding_window) / paged_attention_block_size : 0;
++            auto effective_blocks = total_blocks - swa_start_block;
++            fresh_effective_context_len = effective_blocks * paged_attention_block_size;
++        }
++        size_t fresh_num_of_partitions = ceil_div(fresh_effective_context_len, fresh_partition_size);
++        // arcint (patches/0015, corrected by review finding 2): mirror update_rt_params'
++        // PAGED_ATTENTION_MAX_PARTITIONS bound here too, so a buffer-size query issued before
++        // rt_params exists reserves the same, bounded amount the bounded dispatch will actually
++        // address, rather than the raw (potentially much larger) partition count - see the
++        // matching comment in update_rt_params. Also excluded: has_scores_output() - see the
++        // matching comment there. Gated on rt_params->stage (the stage the STALE value was
++        // itself bounded under) whenever rt_params exists, not fresh_stage: gating on fresh_stage
++        // let a PREFILL-stage call skip bounding for fresh while combining with a stale value
++        // from a DIFFERENT, non-PREFILL sequence this same impl handled earlier - an unbounded
++        // fresh count could then win the max() and lock in as the high-water mark forever
++        // (realloc_intermediates() never shrinks). Using the stage that governs the value fresh
++        // is about to be compared against keeps both operands under one rule.
++        const auto bound_governing_stage = (rt_params != nullptr && rt_params->num_of_partitions != 0) ? rt_params->stage : fresh_stage;
++        if (bound_governing_stage != PagedAttentionStage::PREFILL && !desc->has_scores_output()) {
++            const auto max_partitions = params.get_program().get_config().get_paged_attention_max_partitions();
++            if (max_partitions > 0 && fresh_num_of_partitions > max_partitions) {
++                fresh_num_of_partitions = max_partitions;
++            }
++        }
+         if (rt_params != nullptr && rt_params->num_of_partitions != 0) {
+             stage = rt_params->stage;
+             partition_size = rt_params->partition_size;
+-            num_of_partitions = rt_params->num_of_partitions;
++            num_of_partitions = std::max(fresh_num_of_partitions, rt_params->num_of_partitions);
+         } else {
+-            stage = get_paged_attention_stage(params);
+-            partition_size = get_partitioning_size(params, desc->v_head_size, stage);
+-            const auto max_context_len = get_max_context_len(params);
+-            num_of_partitions = ceil_div(max_context_len, partition_size);
+-            // arcint (patches/0015): mirror update_rt_params' PAGED_ATTENTION_MAX_PARTITIONS
+-            // bound here too, so a buffer-size query issued before rt_params exists (this
+-            // branch) reserves the same, bounded amount that the bounded dispatch will actually
+-            // address, rather than the raw (potentially much larger) partition count - see the
+-            // matching comment in update_rt_params. Also excluded: has_scores_output() - see the
+-            // matching comment there.
+-            if (stage != PagedAttentionStage::PREFILL && !desc->has_scores_output()) {
+-                const auto max_partitions = params.get_program().get_config().get_paged_attention_max_partitions();
+-                if (max_partitions > 0 && num_of_partitions > max_partitions) {
+-                    num_of_partitions = max_partitions;
+-                }
+-            }
++            stage = fresh_stage;
++            partition_size = fresh_partition_size;
++            num_of_partitions = fresh_num_of_partitions;
+         }
+         bool can_use_micro_sdpa = false;
+ #ifdef ENABLE_ONEDNN_FOR_GPU
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
+index 7aa31ab..233e0e8 100644
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
+@@ -756,6 +756,878 @@
+         ov::element::u8
+     }));
+ 
++// arcint defect hunt (patches/0008-0010 host-side sizing audit, requested alongside patches/0015):
++// reproduces the on-card GPU CAT-error crash directly in the harness rather than through the
++// full model - u8-K/i4-V (patches/0010's asymmetric decode kernel), a pool sized for >=10,600
++// blocks (>=169,600 tokens at block_size=16) and a past of >=170,000 tokens, at both
++// PAGED_ATTENTION_MAX_PARTITIONS=0 (unbounded, patches/0015's control arm) and =32 (the bound
++// arcint actually serves under). This does NOT depend on the sdpa_opt.cl PREFILL-only
++// IS_KV_COMPRESSED=0 hard-code documented above (paged_attention_asymmetric_kv_pure_prefill_test):
++// every case here has past_len > 0, so it stays on PagedAttentionStage::MIXED/GENERATE, routed to
++// paged_attention_opt.cl's "opt" kernel (PagedAttentionGeneratorMultiTokens /
++// SingleToken) - the correctly IS_INT4_K/IS_INT4_V-split path per that same comment. If a crash
++// reproduces here, the defect is in that opt-kernel path or its host-side sizing at this specific
++// depth, not the already-known PREFILL gap.
++//
++// run_reference is left true for everything EXCEPT the two deepest (past=170,000) cases: this
++// harness's CPU reference has no partial-row / row-limit mode (checked -
++// PagedAttentionReference::get_reference() always walks every query row against the full past),
++// so "compute only a few query rows" has no existing hook to ask for. Turning run_reference off
++// for just those two is the honest substitute - it disables the correctness compare and keeps the
++// dispatch (the actual thing being reproduced: does the kernel crash, not is its output correct).
++class paged_attention_asymmetric_kv_deep_pool_test : public PagedAttentionTest<paged_attention_test_params> {};
++
++TEST_P(paged_attention_asymmetric_kv_deep_pool_test, matches_cpu_reference_or_survives) {
++    auto p = GetParam();
++    ASSERT_TRUE(this->pam.has_value());
++    auto& pam = *this->pam;
++
++    auto result = run_gpu_inference(pam, p);
++
++    if (p.run_reference) {
++        const auto reference = PagedAttentionReference(pam).get_reference(result.key_cache_mem);
++        compare(result.outputs.at("output_data").get_memory(), nullptr, nullptr, reference);
++    }
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    regression_paged_attention_asymmetric_deep_pool,
++    paged_attention_asymmetric_kv_deep_pool_test,
++    ::testing::Values(
++        // MIXED stage, 128-token query chunk (arcint's own chunk size) against a 169,984-token
++        // past (169,984 / 16 = 10,624 blocks) - P_MAX = 0 (unbounded), the control arm.
++        paged_attention_test_params{
++            {{128, 169984}},
++            8, 2, 256, 256, 16, 0,
++            ENABLE_CACHE_COMPRESSION,
++            ov::internal::CacheQuantMode::BY_TOKEN,
++            DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++            false, 0, {},
++            false, {}, {},
++            ov::element::u8,
++            false, {}, false,
++            std::nullopt, false, std::nullopt, false, false,
++            ov::element::u4,
++            0
++        },
++        // Same MIXED shape, P_MAX = 32 - the bound arcint actually serves under.
++        paged_attention_test_params{
++            {{128, 169984}},
++            8, 2, 256, 256, 16, 0,
++            ENABLE_CACHE_COMPRESSION,
++            ov::internal::CacheQuantMode::BY_TOKEN,
++            DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++            false, 0, {},
++            false, {}, {},
++            ov::element::u8,
++            false, {}, false,
++            std::nullopt, false, std::nullopt, false, false,
++            ov::element::u4,
++            32
++        },
++        // GENERATE stage (single new token), past = 170,000 (170,000 / 16 = 10,625 blocks) -
++        // P_MAX = 0, the control arm.
++        paged_attention_test_params{
++            {{1, 170000}},
++            8, 2, 256, 256, 16, 0,
++            ENABLE_CACHE_COMPRESSION,
++            ov::internal::CacheQuantMode::BY_TOKEN,
++            DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++            false, 0, {},
++            false, {}, {},
++            ov::element::u8,
++            false, {}, false,
++            std::nullopt, false, std::nullopt, false, false,
++            ov::element::u4,
++            0
++        },
++        // Same GENERATE shape, P_MAX = 32.
++        paged_attention_test_params{
++            {{1, 170000}},
++            8, 2, 256, 256, 16, 0,
++            ENABLE_CACHE_COMPRESSION,
++            ov::internal::CacheQuantMode::BY_TOKEN,
++            DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++            false, 0, {},
++            false, {}, {},
++            ov::element::u8,
++            false, {}, false,
++            std::nullopt, false, std::nullopt, false, false,
++            ov::element::u4,
++            32
++        }));
++
++// arcint (multi-execute growth test, requested alongside patches/0016): every paged-attention
++// test above this line is single-shot - one network, one execute() call, then compare or crash.
++// Real serving re-executes the SAME network/primitive_inst repeatedly as a sequence's past grows
++// (continuous batching, chunked prefill) - and it is specifically THAT repeated-execution path
++// (primitive_inst::realloc_intermediates() -> get_internal_buffer_descs() using a persistent,
++// possibly-stale m_rt_params from the PREVIOUS call, see patches/0016) that a single-shot test
++// structurally cannot reach: on a single-shot test's one and only call, m_rt_params is always
++// null, so the "already computed, reuse it" branch this whole investigation is about never
++// executes at all. This fixture closes that gap: it builds ONE network for a single growing
++// subsequence and calls network->execute() repeatedly - MIXED chunks of `growth_chunk_size`
++// tokens appended from past 0 up to `growth_final_total_tokens` - so the partition count grows
++// through every threshold (384, 466, ...) the way a served prefill actually would, with
++// intermediates reallocating on the growth chunks exactly as they do in production. Deliberately
++// reference-free (a CPU reference at 100k+ tokens, recomputed after every chunk, is not
++// affordable in a unit test): the only assertion is that every execute() call completes, plus a
++// cheap sanity check (every element of the last chunk's finalization output is finite) that
++// would catch a silently-wrong (not just a crashing) result without paying for a full reference.
++//
++// Reuses PagedAttentionManager's existing memory-builder getters (get_query_memory(),
++// get_past_lens_memory(), etc.) rather than hand-rolling tensor construction: they already read
++// pam's own subsequence_descs/past_lens/subsequence_begins/block_indices/block_indices_begins/
++// max_context_len member vectors, so mutating those members per chunk and calling the existing
++// getters again is sufficient to get a correctly-shaped, correctly-offset tensor for that chunk -
++// no new tensor-building logic to get wrong. key_cache/value_cache are sized ONCE, up front, for
++// growth_final_total_tokens (matching how a real served pool is pre-allocated for its max
++// capacity rather than resized per request) and never re-set after the first set_input_data -
++// the KV_CACHE_UPDATE stage writes into them in place on every subsequent execute(), same as
++// production.
++class paged_attention_growth_test : public PagedAttentionTest<paged_attention_test_params> {};
++
++TEST_P(paged_attention_growth_test, survives_repeated_execute_with_growing_context) {
++    auto p = GetParam();
++    ASSERT_TRUE(this->pam.has_value());
++    auto& pam = *this->pam;
++
++    ASSERT_GT(p.growth_chunk_size, 0);
++    ASSERT_GT(p.growth_final_total_tokens, 0);
++    ASSERT_EQ(p.growth_final_total_tokens % p.growth_chunk_size, 0)
++        << "growth_final_total_tokens must be an exact multiple of growth_chunk_size so the "
++        << "loop below lands exactly on it without a short last chunk changing the shape the "
++        << "finiteness check reads.";
++
++    // Sized once, for the full range: SetUp() already constructed pam from a single
++    // {growth_final_total_tokens, 0} descriptor (see INSTANTIATE_TEST_SUITE_P below), so
++    // block_indices/key_data/value_data/query_data already cover [0, growth_final_total_tokens).
++    auto key_cache_mem = pam.get_key_cache_memory();
++    auto value_cache_mem = pam.get_value_cache_memory();
++    auto scale_mem = pam.get_scale_memory();
++    auto sliding_window_mem = pam.get_sliding_window_memory();
++    auto alibi_mem = pam.get_alibi_memory();
++    auto score_aggregation_mem = pam.get_score_aggregation();
++    auto rotated_block_indices_mem = pam.get_rotated_block_indices_memory();
++    auto rotation_deltas_mem = pam.get_rotation_deltas_memory();
++    auto rotation_trig_lut_mem = pam.get_rotation_trig_lut_memory();
++    auto xattention_threshold_mem = pam.get_xattention_threshold_memory();
++    auto xattention_block_size_mem = pam.get_xattention_block_size_memory();
++    auto xattention_stride_mem = pam.get_xattention_stride_memory();
++    auto sinks_mem = pam.get_sinks_memory();
++    auto adaptive_rkv_start_size_mem = pam.get_adaptive_rkv_start_size_memory();
++    auto adaptive_rkv_evictable_sizes_mem = pam.get_adaptive_rkv_evictable_sizes_memory();
++    auto adaptive_rkv_diversity_block_set_indices_mem = pam.get_adaptive_rkv_diversity_block_set_indices_memory();
++    auto adaptive_rkv_diversity_block_set_indices_begins_mem = pam.get_adaptive_rkv_diversity_block_set_indices_begins_memory();
++    auto token_type_ids_mem = pam.get_token_type_ids_memory();
++    auto qq_bias_mem = pam.get_qq_bias_memory();
++    auto qq_bias_begins_mem = pam.get_qq_bias_begins_memory();
++
++    // First chunk (past = 0) to get correctly-shaped, dynamic-capable layouts for the fields
++    // that vary per call.
++    const int block_size = p.block_size;
++    pam.subsequence_descs = {SubsequenceDescriptor{p.growth_chunk_size, 0}};
++    pam.subsequence_begins = {0, p.growth_chunk_size};
++    pam.past_lens = {0};
++    const int first_blocks_needed = cldnn::ceil_div(p.growth_chunk_size, block_size);
++    pam.block_indices.assign(first_blocks_needed, 0);
++    for (int b = 0; b < first_blocks_needed; b++)
++        pam.block_indices[b] = b;
++    pam.block_indices_begins = {0, first_blocks_needed};
++    pam.max_context_len = {p.growth_chunk_size};
++
++    auto query_mem = pam.get_query_memory();
++    auto key_mem = pam.get_key_memory();
++    auto value_mem = pam.get_value_memory();
++    auto past_lens_mem = pam.get_past_lens_memory();
++    auto subsequence_begins_mem = pam.get_subsequence_begins_memory();
++    auto block_indices_mem = pam.get_block_indices_memory();
++    auto block_indices_begins_mem = pam.get_block_indices_begins_memory();
++    auto max_context_len_mem = pam.get_max_context_len_memory();
++
++    auto query_layout = query_mem->get_layout();
++    auto key_layout = key_mem->get_layout();
++    auto value_layout = value_mem->get_layout();
++    auto key_cache_layout = key_cache_mem->get_layout();
++    auto value_cache_layout = value_cache_mem->get_layout();
++    auto past_lens_layout = past_lens_mem->get_layout();
++    auto subsequence_begins_layout = subsequence_begins_mem->get_layout();
++    auto block_indices_layout = block_indices_mem->get_layout();
++    auto block_indices_begins_layout = block_indices_begins_mem->get_layout();
++    auto scale_layout = scale_mem->get_layout();
++    auto sliding_window_layout = sliding_window_mem->get_layout();
++    auto alibi_layout = alibi_mem->get_layout();
++    auto max_context_len_layout = max_context_len_mem->get_layout();
++    auto score_aggregation_window_layout = score_aggregation_mem->get_layout();
++    auto rotated_block_indices_layout = rotated_block_indices_mem->get_layout();
++    auto rotation_deltas_layout = rotation_deltas_mem->get_layout();
++    auto rotation_trig_lut_layout = rotation_trig_lut_mem->get_layout();
++    auto xattention_threshold_layout = xattention_threshold_mem->get_layout();
++    auto xattention_block_size_layout = xattention_block_size_mem->get_layout();
++    auto xattention_stride_layout = xattention_stride_mem->get_layout();
++    auto sinks_layout = sinks_mem->get_layout();
++    auto adaptive_rkv_start_size_layout = adaptive_rkv_start_size_mem->get_layout();
++    auto adaptive_rkv_evictable_sizes_layout = adaptive_rkv_evictable_sizes_mem->get_layout();
++    auto adaptive_rkv_diversity_block_set_indices_layout = adaptive_rkv_diversity_block_set_indices_mem->get_layout();
++    auto adaptive_rkv_diversity_block_set_indices_begins_layout = adaptive_rkv_diversity_block_set_indices_begins_mem->get_layout();
++    auto token_type_ids_layout = token_type_ids_mem->get_layout();
++    auto qq_bias_layout = qq_bias_mem->get_layout();
++    auto qq_bias_begins_layout = qq_bias_begins_mem->get_layout();
++
++    // Dynamic where the shape actually changes call to call - same fields, same treatment as
++    // run_gpu_inference's own dynamic-shape block above in this file. key_cache/value_cache stay
++    // static: sized once for growth_final_total_tokens and never resized, matching a real
++    // pre-allocated served pool.
++    query_layout.set_partial_shape(ov::PartialShape{-1, p.num_heads * p.k_head_size});
++    key_layout.set_partial_shape(ov::PartialShape{-1, p.num_kv_heads * p.k_head_size});
++    value_layout.set_partial_shape(ov::PartialShape{-1, p.num_kv_heads * p.v_head_size});
++    past_lens_layout.set_partial_shape(ov::PartialShape{-1});
++    subsequence_begins_layout.set_partial_shape(ov::PartialShape{-1});
++    block_indices_layout.set_partial_shape(ov::PartialShape{-1});
++    block_indices_begins_layout.set_partial_shape(ov::PartialShape{-1});
++
++    std::vector<cldnn::input_info> pa_inputs = {cldnn::input_info("query"),
++                                                cldnn::input_info("key"),
++                                                cldnn::input_info("value"),
++                                                cldnn::input_info("key_cache"),
++                                                cldnn::input_info("value_cache"),
++                                                cldnn::input_info("past_lens"),
++                                                cldnn::input_info("subsequence_begins"),
++                                                cldnn::input_info("block_indices"),
++                                                cldnn::input_info("block_indices_begins"),
++                                                cldnn::input_info("scale"),
++                                                cldnn::input_info("sliding_window"),
++                                                cldnn::input_info("alibi"),
++                                                cldnn::input_info("max_context_len"),
++                                                cldnn::input_info("score_aggregation_window"),
++                                                cldnn::input_info("rotated_block_indices"),
++                                                cldnn::input_info("rotation_deltas"),
++                                                cldnn::input_info("rotation_trig_lut_modified"),
++                                                cldnn::input_info("xattention_threshold"),
++                                                cldnn::input_info("xattention_block_size"),
++                                                cldnn::input_info("xattention_stride"),
++                                                cldnn::input_info("sinks"),
++                                                cldnn::input_info("adaptive_rkv_start_size"),
++                                                cldnn::input_info("adaptive_rkv_evictable_sizes"),
++                                                cldnn::input_info("adaptive_rkv_diversity_block_set_indices"),
++                                                cldnn::input_info("adaptive_rkv_diversity_block_set_indices_begins"),
++                                                cldnn::input_info("token_type_ids"),
++                                                cldnn::input_info("qq_bias"),
++                                                cldnn::input_info("qq_bias_begins")};
++
++    auto pa_prim = cldnn::paged_attention("paged_attention", pa_inputs);
++    pa_prim.k_head_size = p.k_head_size;
++    pa_prim.v_head_size = p.v_head_size;
++    pa_prim.kv_heads_num = p.num_kv_heads;
++    pa_prim.heads_num = p.num_heads;
++    pa_prim.scale_val = pam.get_default_scale();
++    pa_prim.has_alibi = false;
++    pa_prim.has_token_type_ids = false;
++    pa_prim.has_sink_input = false;
++    pa_prim.num_outputs = 1;
++    pa_prim.has_rotated_blocks = false;
++    pa_prim.has_score_aggregation = false;
++    pa_prim.has_adaptive_rkv = false;
++    pa_prim.sliding_window = p.sliding_window_size;
++    pa_prim.is_key_by_channel = (p.key_cache_quant_mode == ov::internal::CacheQuantMode::BY_CHANNEL);
++
++    cldnn::topology topology;
++    topology.add(cldnn::input_layout("query", query_layout),
++                 cldnn::input_layout("key", key_layout),
++                 cldnn::input_layout("value", value_layout),
++                 cldnn::input_layout("key_cache", key_cache_layout),
++                 cldnn::input_layout("value_cache", value_cache_layout),
++                 cldnn::input_layout("past_lens", past_lens_layout),
++                 cldnn::input_layout("subsequence_begins", subsequence_begins_layout),
++                 cldnn::input_layout("block_indices", block_indices_layout),
++                 cldnn::input_layout("block_indices_begins", block_indices_begins_layout),
++                 cldnn::input_layout("scale", scale_layout),
++                 cldnn::input_layout("sliding_window", sliding_window_layout),
++                 cldnn::input_layout("alibi", alibi_layout),
++                 cldnn::input_layout("max_context_len", max_context_len_layout),
++                 cldnn::input_layout("score_aggregation_window", score_aggregation_window_layout),
++                 pa_prim,
++                 cldnn::reorder("output_data", cldnn::input_info("paged_attention", 0), cldnn::format::bfyx, cldnn::data_types::f16));
++
++    topology.add(cldnn::input_layout("rotated_block_indices", rotated_block_indices_layout));
++    topology.add(cldnn::input_layout("rotation_deltas", rotation_deltas_layout));
++    topology.add(cldnn::input_layout("rotation_trig_lut", rotation_trig_lut_layout));
++    topology.add(cldnn::activation("rotation_trig_lut_modified", cldnn::input_info("rotation_trig_lut"), cldnn::activation_func::none));
++    topology.add(cldnn::input_layout("xattention_threshold", xattention_threshold_layout));
++    topology.add(cldnn::input_layout("xattention_block_size", xattention_block_size_layout));
++    topology.add(cldnn::input_layout("xattention_stride", xattention_stride_layout));
++    topology.add(cldnn::input_layout("sinks", sinks_layout));
++    topology.add(cldnn::input_layout("adaptive_rkv_start_size", adaptive_rkv_start_size_layout));
++    topology.add(cldnn::input_layout("adaptive_rkv_evictable_sizes", adaptive_rkv_evictable_sizes_layout));
++    topology.add(cldnn::input_layout("adaptive_rkv_diversity_block_set_indices", adaptive_rkv_diversity_block_set_indices_layout));
++    topology.add(cldnn::input_layout("adaptive_rkv_diversity_block_set_indices_begins", adaptive_rkv_diversity_block_set_indices_begins_layout));
++    topology.add(cldnn::input_layout("token_type_ids", token_type_ids_layout));
++    topology.add(cldnn::input_layout("qq_bias", qq_bias_layout));
++    topology.add(cldnn::input_layout("qq_bias_begins", qq_bias_begins_layout));
++
++    ov::intel_gpu::ExecutionConfig config = tests::get_test_default_config(tests::get_test_engine());
++    config.set_property(ov::intel_gpu::optimize_data(true));
++    config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
++    config.set_property(ov::intel_gpu::could_use_flashattn_v2(p.disable_flashattn_v2));
++    config.set_property(ov::internal::key_cache_quant_mode(p.key_cache_quant_mode));
++    if (p.kv_cache_precision != ov::element::dynamic)
++        config.set_property(ov::hint::kv_cache_precision(p.kv_cache_precision));
++    if (p.value_cache_precision != ov::element::dynamic)
++        config.set_property(ov::value_cache_precision(p.value_cache_precision));
++    config.set_property(ov::intel_gpu::paged_attention_max_partitions(p.paged_attention_max_partitions));
++
++    cldnn::network::ptr network = tests::get_network(tests::get_test_engine(), topology, config, tests::get_test_stream_ptr(), false);
++
++    // Set once: everything that does not change call to call.
++    network->set_input_data("key_cache", key_cache_mem);
++    network->set_input_data("value_cache", value_cache_mem);
++    network->set_input_data("scale", scale_mem);
++    network->set_input_data("sliding_window", sliding_window_mem);
++    network->set_input_data("alibi", alibi_mem);
++    network->set_input_data("score_aggregation_window", score_aggregation_mem);
++    network->set_input_data("rotated_block_indices", rotated_block_indices_mem);
++    network->set_input_data("rotation_deltas", rotation_deltas_mem);
++    network->set_input_data("rotation_trig_lut", rotation_trig_lut_mem);
++    network->set_input_data("xattention_threshold", xattention_threshold_mem);
++    network->set_input_data("xattention_block_size", xattention_block_size_mem);
++    network->set_input_data("xattention_stride", xattention_stride_mem);
++    network->set_input_data("sinks", sinks_mem);
++    network->set_input_data("adaptive_rkv_start_size", adaptive_rkv_start_size_mem);
++    network->set_input_data("adaptive_rkv_evictable_sizes", adaptive_rkv_evictable_sizes_mem);
++    network->set_input_data("adaptive_rkv_diversity_block_set_indices", adaptive_rkv_diversity_block_set_indices_mem);
++    network->set_input_data("adaptive_rkv_diversity_block_set_indices_begins", adaptive_rkv_diversity_block_set_indices_begins_mem);
++    network->set_input_data("token_type_ids", token_type_ids_mem);
++    network->set_input_data("qq_bias", qq_bias_mem);
++    network->set_input_data("qq_bias_begins", qq_bias_begins_mem);
++
++    // The repeated-execute loop: this is the capability under test. Every iteration mutates
++    // pam's own subsequence_descs/past_lens/subsequence_begins/block_indices/
++    // block_indices_begins/max_context_len member vectors for THIS chunk and re-derives the
++    // per-call tensors from pam's existing getters - the same functions every single-shot test
++    // in this file already relies on, just called more than once against the same pam/network.
++    int64_t past_so_far = 0;
++    while (past_so_far < p.growth_final_total_tokens) {
++        const int chunk = p.growth_chunk_size;
++        pam.subsequence_descs = {SubsequenceDescriptor{chunk, static_cast<int>(past_so_far)}};
++        pam.subsequence_begins = {0, chunk};
++        pam.past_lens = {static_cast<int>(past_so_far)};
++        const int blocks_needed = cldnn::ceil_div(static_cast<int>(past_so_far) + chunk, block_size);
++        pam.block_indices.assign(blocks_needed, 0);
++        for (int b = 0; b < blocks_needed; b++)
++            pam.block_indices[b] = b;
++        pam.block_indices_begins = {0, blocks_needed};
++        pam.max_context_len = {static_cast<int>(past_so_far) + chunk};
++
++        network->set_input_data("query", pam.get_query_memory());
++        network->set_input_data("key", pam.get_key_memory());
++        network->set_input_data("value", pam.get_value_memory());
++        network->set_input_data("past_lens", pam.get_past_lens_memory());
++        network->set_input_data("subsequence_begins", pam.get_subsequence_begins_memory());
++        network->set_input_data("block_indices", pam.get_block_indices_memory());
++        network->set_input_data("block_indices_begins", pam.get_block_indices_begins_memory());
++        network->set_input_data("max_context_len", pam.get_max_context_len_memory());
++
++        auto outputs = network->execute();
++        auto output_mem = outputs.at("output_data").get_memory();
++        ASSERT_NE(output_mem, nullptr)
++            << "execute() did not complete at past=" << past_so_far << ", chunk=" << chunk
++            << ", partitions~=" << cldnn::ceil_div(static_cast<int>(past_so_far) + chunk, 256);
++
++        past_so_far += chunk;
++
++        if (past_so_far >= p.growth_final_total_tokens) {
++            // Cheap sanity on the last chunk only: every element finite. Not a correctness
++            // check (reference-free by design, see the class comment) - just enough to catch a
++            // silently-wrong result (e.g. reading stale/garbage memory) without paying for a
++            // full CPU reference at this depth.
++            cldnn::mem_lock<ov::float16> out_lock(output_mem, tests::get_test_stream());
++            for (size_t i = 0; i < out_lock.size(); i++) {
++                ASSERT_TRUE(std::isfinite(static_cast<float>(out_lock[i])))
++                    << "non-finite output element " << i << " in the last chunk's finalization output";
++            }
++        }
++    }
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    regression_paged_attention_growth,
++    paged_attention_growth_test,
++    ::testing::Values(
++        // chunk=128, P_MAX=0 (unbounded) - the control arm.
++        paged_attention_test_params{
++            {{100352, 0}},  // subsequences: sizing-only, see growth_chunk_size/growth_final_total_tokens comment
++            8, 2, 128, 128, 16, 0,
++            ENABLE_CACHE_COMPRESSION,
++            ov::internal::CacheQuantMode::BY_TOKEN,
++            DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++            false, 0, {},
++            false, {}, {},
++            ov::element::u8,
++            false, {}, false,
++            std::nullopt, false, std::nullopt, false, false,
++            ov::element::u4,
++            0,
++            128, 100352
++        },
++        // chunk=128, P_MAX=32 - the bound arcint actually serves under.
++        paged_attention_test_params{
++            {{100352, 0}},
++            8, 2, 128, 128, 16, 0,
++            ENABLE_CACHE_COMPRESSION,
++            ov::internal::CacheQuantMode::BY_TOKEN,
++            DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++            false, 0, {},
++            false, {}, {},
++            ov::element::u8,
++            false, {}, false,
++            std::nullopt, false, std::nullopt, false, false,
++            ov::element::u4,
++            32,
++            128, 100352
++        },
++        // chunk=256, P_MAX=0.
++        paged_attention_test_params{
++            {{100352, 0}},
++            8, 2, 128, 128, 16, 0,
++            ENABLE_CACHE_COMPRESSION,
++            ov::internal::CacheQuantMode::BY_TOKEN,
++            DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++            false, 0, {},
++            false, {}, {},
++            ov::element::u8,
++            false, {}, false,
++            std::nullopt, false, std::nullopt, false, false,
++            ov::element::u4,
++            0,
++            256, 100352
++        },
++        // chunk=256, P_MAX=32.
++        paged_attention_test_params{
++            {{100352, 0}},
++            8, 2, 128, 128, 16, 0,
++            ENABLE_CACHE_COMPRESSION,
++            ov::internal::CacheQuantMode::BY_TOKEN,
++            DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++            false, 0, {},
++            false, {}, {},
++            ov::element::u8,
++            false, {}, false,
++            std::nullopt, false, std::nullopt, false, false,
++            ov::element::u4,
++            32,
++            256, 100352
++        }));
++
++// arcint (patches/0016, Opus review, red-first for findings 1 and 2): both tests below reuse
++// the growth test's topology-construction pattern (one network, one paged_attention primitive,
++// re-executed with set_input_data between calls) or, where a single call suffices, the
++// established run_gpu_inference() single-shot harness.
++//
++// Finding 1 (SWA mirror), recast after a design flaw was caught in review: the original test
++// checked that the reported buffer size stayed CONSTANT ("plateaued") across two GENERATE steps
++// both past the sliding window. That is not actually a property of correct SWA sizing - the
++// SWA-shrunk effective_context_len rounds to whole blocks (block_size=16), so effective_blocks
++// can itself flip between two adjacent values one token apart (e.g. around a window/block
++// boundary the correctly-shrunk partition count is not even constant step to step), making
++// "plateau" pass or fail depending on exactly which two steps are sampled, on BOTH correct and
++// buggy code. Recast to something that is actually diagnostic: a single GENERATE call, past
++// 1,999 tokens, sliding_window 256 (>> the window, no boundary-adjacency risk), max_context_len
++// exactly 2,000 - chosen so the two quantities below are unambiguously different (2 vs 1
++// order of magnitude apart, not off-by-one-block): the unshrunk (raw) partition count is
++// ceil_div(2000, 256) = 8; the correctly SWA-shrunk count is ceil_div(256, 256) = 1
++// (total_blocks=ceil_div(2000,16)=125, swa_start_block=(2000-256)/16=109, effective_blocks=16,
++// effective_context_len=256). The test asserts that get_internal_buffer_descs()'s reported
++// exp_sums size, read AFTER this call completes (so rt_params is non-null and its own
++// if-branch is what runs, in every world below - the same call's rt_params, not a stale one),
++// equals total_tokens*heads_num*element_size*num_of_partitions where num_of_partitions is the
++// ACTUAL value update_rt_params computed for this exact dispatch (read via
++// get_kernels_dump_info()'s "arcint_0015_diag:num_of_partitions=" entry, patches/0015) - i.e.
++// that the buffer the plugin sized for this call and the partition count the plugin actually
++// dispatched with agree, rather than checking either number against a hand-computed constant.
++//
++// Which world this is red in, reasoned through rather than assumed: under 0015 alone (no 0016 at
++// all), get_internal_buffer_descs()'s if-branch is `num_of_partitions = rt_params->
++// num_of_partitions` - reading the SAME field the diag string reports, so they trivially agree
++// - GREEN. Under the first (pre-review) draft of 0016 - the one finding 1 itself describes,
++// where the always-computed "fresh" estimate did not mirror the SWA shrink - the if-branch
++// becomes `max(fresh_UNSHRUNK=8, rt_params->num_of_partitions_SHRUNK=1) = 8`, disagreeing with
++// the diag's actual dispatched value of 1 - RED. Under 0016-final (finding 1 fixed, this file's
++// own hunk), fresh is shrunk the same way rt_params is, so the if-branch is
++// `max(fresh_SHRUNK=1, rt_params->num_of_partitions_SHRUNK=1) = 1`, matching the diag - GREEN.
++class paged_attention_review_swa_mirror_test : public PagedAttentionTest<paged_attention_test_params> {};
++
++TEST_P(paged_attention_review_swa_mirror_test, exp_sums_size_matches_the_actual_dispatched_partition_count) {
++    auto p = GetParam();
++    ASSERT_TRUE(this->pam.has_value());
++    auto& pam = *this->pam;
++
++    ASSERT_GT(p.sliding_window_size, 0);
++
++    auto result = run_gpu_inference(pam, p);
++
++    auto pa_inst = result.network->get_primitive("paged_attention");
++    ASSERT_NE(pa_inst, nullptr);
++    auto* impl = pa_inst->get_impl();
++    ASSERT_NE(impl, nullptr);
++
++    // The diag string: the ACTUAL num_of_partitions update_rt_params computed and dispatched
++    // with, for this exact call - the ground truth this test checks buffer sizing against.
++    const auto dump_info = impl->get_kernels_dump_info(*pa_inst->get_impl_params());
++    const auto& entries = dump_info.get_entries();
++    const auto diag_pos = entries.find("arcint_0015_diag:");
++    ASSERT_NE(diag_pos, std::string::npos)
++        << "Expected the arcint_0015_diag entry (paged_attention_opt.cpp's "
++        << "PagedAttentionOptImpl::get_kernels_dump_info override) - got: " << entries;
++    const auto diag = entries.substr(diag_pos);
++    const auto key_pos = diag.find("num_of_partitions=");
++    ASSERT_NE(key_pos, std::string::npos) << "Expected a num_of_partitions= field: " << diag;
++    const auto value_start = key_pos + std::string("num_of_partitions=").size();
++    const auto value_end = diag.find(';', value_start);
++    ASSERT_NE(value_end, std::string::npos) << "num_of_partitions= field not terminated: " << diag;
++    const size_t actual_num_of_partitions = std::stoull(diag.substr(value_start, value_end - value_start));
++
++    // The reported size: get_internal_buffer_descs(), a host-side call - not the real GPU
++    // allocation - reflecting the SAME call's now-non-null rt_params (this is called AFTER
++    // run_gpu_inference()'s own execute() already ran, so realloc_intermediates() already ran
++    // too and rt_params already holds THIS call's values, not a stale previous one - matching
++    // what the plugin's own internal re-query would see if called again right now).
++    const auto descs = impl->get_internal_buffer_descs(*pa_inst->get_impl_params());
++    ASSERT_GT(descs.size(), 3u);
++    const size_t exp_sums_bytes = descs[3].m_layout.count();  // descs report BYTES, not elements
++    const size_t heads_num = static_cast<size_t>(p.num_heads);
++    constexpr size_t softmax_accumulator_element_size = 4;  // f32
++    const int64_t total_tokens = result.network->get_primitive("paged_attention")->get_impl_params()->input_layouts[0].get_partial_shape()[0].get_length();
++    const size_t expected_bytes =
++        static_cast<size_t>(total_tokens) * heads_num * actual_num_of_partitions * softmax_accumulator_element_size;
++
++    ASSERT_EQ(exp_sums_bytes, expected_bytes)
++        << "exp_sums sized for " << exp_sums_bytes << " bytes but the actual dispatch used "
++        << actual_num_of_partitions << " partitions (" << expected_bytes << " bytes expected) - "
++        << "the SWA shrink is not mirrored into the fresh sizing estimate";
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    regression_paged_attention_review_swa_mirror,
++    paged_attention_review_swa_mirror_test,
++    ::testing::Values(paged_attention_test_params{
++        {{1, 1999}},
++        8, 2, 128, 128, 16, 256,
++        DISABLE_CACHE_COMPRESSION,
++        ov::internal::CacheQuantMode::BY_TOKEN,
++        DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++        false, 0, {},
++        false, {}, {},
++        ov::element::dynamic,
++        false, {}, false,
++        std::nullopt, false, std::nullopt, false, false,
++        ov::element::dynamic,
++        0
++    }));
++
++class paged_attention_review_bound_governing_stage_test : public PagedAttentionTest<paged_attention_test_params> {};
++
++TEST_P(paged_attention_review_bound_governing_stage_test, fresh_bound_survives_a_prefill_after_mixed) {
++    auto p = GetParam();
++    ASSERT_TRUE(this->pam.has_value());
++    auto& pam = *this->pam;
++
++    ASSERT_GT(p.paged_attention_max_partitions, 0u);
++    const size_t max_partitions = p.paged_attention_max_partitions;
++    const int block_size = p.block_size;
++
++    // Sized for the second (long-prompt) call up front.
++    const int long_prompt_tokens = 8192;
++    pam.subsequence_descs = {SubsequenceDescriptor{long_prompt_tokens, 0}};
++    pam.subsequence_begins = {0, long_prompt_tokens};
++    pam.past_lens = {0};
++    const int max_blocks_needed = cldnn::ceil_div(long_prompt_tokens, block_size);
++    pam.block_indices.assign(max_blocks_needed, 0);
++    for (int b = 0; b < max_blocks_needed; b++)
++        pam.block_indices[b] = b;
++    pam.block_indices_begins = {0, max_blocks_needed};
++    pam.max_context_len = {long_prompt_tokens};
++
++    auto key_cache_mem = pam.get_key_cache_memory();
++    auto value_cache_mem = pam.get_value_cache_memory();
++    auto scale_mem = pam.get_scale_memory();
++    auto sliding_window_mem = pam.get_sliding_window_memory();
++    auto alibi_mem = pam.get_alibi_memory();
++    auto score_aggregation_mem = pam.get_score_aggregation();
++    auto rotated_block_indices_mem = pam.get_rotated_block_indices_memory();
++    auto rotation_deltas_mem = pam.get_rotation_deltas_memory();
++    auto rotation_trig_lut_mem = pam.get_rotation_trig_lut_memory();
++    auto xattention_threshold_mem = pam.get_xattention_threshold_memory();
++    auto xattention_block_size_mem = pam.get_xattention_block_size_memory();
++    auto xattention_stride_mem = pam.get_xattention_stride_memory();
++    auto sinks_mem = pam.get_sinks_memory();
++    auto adaptive_rkv_start_size_mem = pam.get_adaptive_rkv_start_size_memory();
++    auto adaptive_rkv_evictable_sizes_mem = pam.get_adaptive_rkv_evictable_sizes_memory();
++    auto adaptive_rkv_diversity_block_set_indices_mem = pam.get_adaptive_rkv_diversity_block_set_indices_memory();
++    auto adaptive_rkv_diversity_block_set_indices_begins_mem = pam.get_adaptive_rkv_diversity_block_set_indices_begins_memory();
++    auto token_type_ids_mem = pam.get_token_type_ids_memory();
++    auto qq_bias_mem = pam.get_qq_bias_memory();
++    auto qq_bias_begins_mem = pam.get_qq_bias_begins_memory();
++
++    // First-call (MIXED) shapes for the layouts.
++    pam.subsequence_descs = {SubsequenceDescriptor{8, 500}};
++    pam.subsequence_begins = {0, 8};
++    pam.past_lens = {500};
++    const int first_blocks_needed = cldnn::ceil_div(508, block_size);
++    pam.block_indices.assign(first_blocks_needed, 0);
++    for (int b = 0; b < first_blocks_needed; b++)
++        pam.block_indices[b] = b;
++    pam.block_indices_begins = {0, first_blocks_needed};
++    pam.max_context_len = {508};
++
++    auto query_mem = pam.get_query_memory();
++    auto key_mem = pam.get_key_memory();
++    auto value_mem = pam.get_value_memory();
++    auto past_lens_mem = pam.get_past_lens_memory();
++    auto subsequence_begins_mem = pam.get_subsequence_begins_memory();
++    auto block_indices_mem = pam.get_block_indices_memory();
++    auto block_indices_begins_mem = pam.get_block_indices_begins_memory();
++    auto max_context_len_mem = pam.get_max_context_len_memory();
++
++    auto query_layout = query_mem->get_layout();
++    auto key_layout = key_mem->get_layout();
++    auto value_layout = value_mem->get_layout();
++    auto key_cache_layout = key_cache_mem->get_layout();
++    auto value_cache_layout = value_cache_mem->get_layout();
++    auto past_lens_layout = past_lens_mem->get_layout();
++    auto subsequence_begins_layout = subsequence_begins_mem->get_layout();
++    auto block_indices_layout = block_indices_mem->get_layout();
++    auto block_indices_begins_layout = block_indices_begins_mem->get_layout();
++    auto scale_layout = scale_mem->get_layout();
++    auto sliding_window_layout = sliding_window_mem->get_layout();
++    auto alibi_layout = alibi_mem->get_layout();
++    auto max_context_len_layout = max_context_len_mem->get_layout();
++    auto score_aggregation_window_layout = score_aggregation_mem->get_layout();
++    auto rotated_block_indices_layout = rotated_block_indices_mem->get_layout();
++    auto rotation_deltas_layout = rotation_deltas_mem->get_layout();
++    auto rotation_trig_lut_layout = rotation_trig_lut_mem->get_layout();
++    auto xattention_threshold_layout = xattention_threshold_mem->get_layout();
++    auto xattention_block_size_layout = xattention_block_size_mem->get_layout();
++    auto xattention_stride_layout = xattention_stride_mem->get_layout();
++    auto sinks_layout = sinks_mem->get_layout();
++    auto adaptive_rkv_start_size_layout = adaptive_rkv_start_size_mem->get_layout();
++    auto adaptive_rkv_evictable_sizes_layout = adaptive_rkv_evictable_sizes_mem->get_layout();
++    auto adaptive_rkv_diversity_block_set_indices_layout = adaptive_rkv_diversity_block_set_indices_mem->get_layout();
++    auto adaptive_rkv_diversity_block_set_indices_begins_layout = adaptive_rkv_diversity_block_set_indices_begins_mem->get_layout();
++    auto token_type_ids_layout = token_type_ids_mem->get_layout();
++    auto qq_bias_layout = qq_bias_mem->get_layout();
++    auto qq_bias_begins_layout = qq_bias_begins_mem->get_layout();
++
++    query_layout.set_partial_shape(ov::PartialShape{-1, p.num_heads * p.k_head_size});
++    key_layout.set_partial_shape(ov::PartialShape{-1, p.num_kv_heads * p.k_head_size});
++    value_layout.set_partial_shape(ov::PartialShape{-1, p.num_kv_heads * p.v_head_size});
++    past_lens_layout.set_partial_shape(ov::PartialShape{-1});
++    subsequence_begins_layout.set_partial_shape(ov::PartialShape{-1});
++    block_indices_layout.set_partial_shape(ov::PartialShape{-1});
++    block_indices_begins_layout.set_partial_shape(ov::PartialShape{-1});
++
++    std::vector<cldnn::input_info> pa_inputs = {cldnn::input_info("query"),
++                                                cldnn::input_info("key"),
++                                                cldnn::input_info("value"),
++                                                cldnn::input_info("key_cache"),
++                                                cldnn::input_info("value_cache"),
++                                                cldnn::input_info("past_lens"),
++                                                cldnn::input_info("subsequence_begins"),
++                                                cldnn::input_info("block_indices"),
++                                                cldnn::input_info("block_indices_begins"),
++                                                cldnn::input_info("scale"),
++                                                cldnn::input_info("sliding_window"),
++                                                cldnn::input_info("alibi"),
++                                                cldnn::input_info("max_context_len"),
++                                                cldnn::input_info("score_aggregation_window"),
++                                                cldnn::input_info("rotated_block_indices"),
++                                                cldnn::input_info("rotation_deltas"),
++                                                cldnn::input_info("rotation_trig_lut_modified"),
++                                                cldnn::input_info("xattention_threshold"),
++                                                cldnn::input_info("xattention_block_size"),
++                                                cldnn::input_info("xattention_stride"),
++                                                cldnn::input_info("sinks"),
++                                                cldnn::input_info("adaptive_rkv_start_size"),
++                                                cldnn::input_info("adaptive_rkv_evictable_sizes"),
++                                                cldnn::input_info("adaptive_rkv_diversity_block_set_indices"),
++                                                cldnn::input_info("adaptive_rkv_diversity_block_set_indices_begins"),
++                                                cldnn::input_info("token_type_ids"),
++                                                cldnn::input_info("qq_bias"),
++                                                cldnn::input_info("qq_bias_begins")};
++
++    auto pa_prim = cldnn::paged_attention("paged_attention", pa_inputs);
++    pa_prim.k_head_size = p.k_head_size;
++    pa_prim.v_head_size = p.v_head_size;
++    pa_prim.kv_heads_num = p.num_kv_heads;
++    pa_prim.heads_num = p.num_heads;
++    pa_prim.scale_val = pam.get_default_scale();
++    pa_prim.has_alibi = false;
++    pa_prim.has_token_type_ids = false;
++    pa_prim.has_sink_input = false;
++    pa_prim.num_outputs = 1;
++    pa_prim.has_rotated_blocks = false;
++    pa_prim.has_score_aggregation = false;
++    pa_prim.has_adaptive_rkv = false;
++    pa_prim.sliding_window = p.sliding_window_size;
++    pa_prim.is_key_by_channel = (p.key_cache_quant_mode == ov::internal::CacheQuantMode::BY_CHANNEL);
++
++    cldnn::topology topology;
++    topology.add(cldnn::input_layout("query", query_layout),
++                 cldnn::input_layout("key", key_layout),
++                 cldnn::input_layout("value", value_layout),
++                 cldnn::input_layout("key_cache", key_cache_layout),
++                 cldnn::input_layout("value_cache", value_cache_layout),
++                 cldnn::input_layout("past_lens", past_lens_layout),
++                 cldnn::input_layout("subsequence_begins", subsequence_begins_layout),
++                 cldnn::input_layout("block_indices", block_indices_layout),
++                 cldnn::input_layout("block_indices_begins", block_indices_begins_layout),
++                 cldnn::input_layout("scale", scale_layout),
++                 cldnn::input_layout("sliding_window", sliding_window_layout),
++                 cldnn::input_layout("alibi", alibi_layout),
++                 cldnn::input_layout("max_context_len", max_context_len_layout),
++                 cldnn::input_layout("score_aggregation_window", score_aggregation_window_layout),
++                 pa_prim,
++                 cldnn::reorder("output_data", cldnn::input_info("paged_attention", 0), cldnn::format::bfyx, cldnn::data_types::f16));
++
++    topology.add(cldnn::input_layout("rotated_block_indices", rotated_block_indices_layout));
++    topology.add(cldnn::input_layout("rotation_deltas", rotation_deltas_layout));
++    topology.add(cldnn::input_layout("rotation_trig_lut", rotation_trig_lut_layout));
++    topology.add(cldnn::activation("rotation_trig_lut_modified", cldnn::input_info("rotation_trig_lut"), cldnn::activation_func::none));
++    topology.add(cldnn::input_layout("xattention_threshold", xattention_threshold_layout));
++    topology.add(cldnn::input_layout("xattention_block_size", xattention_block_size_layout));
++    topology.add(cldnn::input_layout("xattention_stride", xattention_stride_layout));
++    topology.add(cldnn::input_layout("sinks", sinks_layout));
++    topology.add(cldnn::input_layout("adaptive_rkv_start_size", adaptive_rkv_start_size_layout));
++    topology.add(cldnn::input_layout("adaptive_rkv_evictable_sizes", adaptive_rkv_evictable_sizes_layout));
++    topology.add(cldnn::input_layout("adaptive_rkv_diversity_block_set_indices", adaptive_rkv_diversity_block_set_indices_layout));
++    topology.add(cldnn::input_layout("adaptive_rkv_diversity_block_set_indices_begins", adaptive_rkv_diversity_block_set_indices_begins_layout));
++    topology.add(cldnn::input_layout("token_type_ids", token_type_ids_layout));
++    topology.add(cldnn::input_layout("qq_bias", qq_bias_layout));
++    topology.add(cldnn::input_layout("qq_bias_begins", qq_bias_begins_layout));
++
++    ov::intel_gpu::ExecutionConfig config = tests::get_test_default_config(tests::get_test_engine());
++    config.set_property(ov::intel_gpu::optimize_data(true));
++    config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
++    config.set_property(ov::intel_gpu::could_use_flashattn_v2(p.disable_flashattn_v2));
++    config.set_property(ov::internal::key_cache_quant_mode(p.key_cache_quant_mode));
++    if (p.kv_cache_precision != ov::element::dynamic)
++        config.set_property(ov::hint::kv_cache_precision(p.kv_cache_precision));
++    if (p.value_cache_precision != ov::element::dynamic)
++        config.set_property(ov::value_cache_precision(p.value_cache_precision));
++    config.set_property(ov::intel_gpu::paged_attention_max_partitions(p.paged_attention_max_partitions));
++
++    cldnn::network::ptr network = tests::get_network(tests::get_test_engine(), topology, config, tests::get_test_stream_ptr(), false);
++
++    network->set_input_data("key_cache", key_cache_mem);
++    network->set_input_data("value_cache", value_cache_mem);
++    network->set_input_data("scale", scale_mem);
++    network->set_input_data("sliding_window", sliding_window_mem);
++    network->set_input_data("alibi", alibi_mem);
++    network->set_input_data("score_aggregation_window", score_aggregation_mem);
++    network->set_input_data("rotated_block_indices", rotated_block_indices_mem);
++    network->set_input_data("rotation_deltas", rotation_deltas_mem);
++    network->set_input_data("rotation_trig_lut", rotation_trig_lut_mem);
++    network->set_input_data("xattention_threshold", xattention_threshold_mem);
++    network->set_input_data("xattention_block_size", xattention_block_size_mem);
++    network->set_input_data("xattention_stride", xattention_stride_mem);
++    network->set_input_data("sinks", sinks_mem);
++    network->set_input_data("adaptive_rkv_start_size", adaptive_rkv_start_size_mem);
++    network->set_input_data("adaptive_rkv_evictable_sizes", adaptive_rkv_evictable_sizes_mem);
++    network->set_input_data("adaptive_rkv_diversity_block_set_indices", adaptive_rkv_diversity_block_set_indices_mem);
++    network->set_input_data("adaptive_rkv_diversity_block_set_indices_begins", adaptive_rkv_diversity_block_set_indices_begins_mem);
++    network->set_input_data("token_type_ids", token_type_ids_mem);
++    network->set_input_data("qq_bias", qq_bias_mem);
++    network->set_input_data("qq_bias_begins", qq_bias_begins_mem);
++
++    auto pa_inst = network->get_primitive("paged_attention");
++    ASSERT_NE(pa_inst, nullptr);
++
++    // Call 1: MIXED (past=500, 8 new tokens) - populates rt_params->stage = MIXED, bounded
++    // correctly to <= max_partitions.
++    network->set_input_data("query", pam.get_query_memory());
++    network->set_input_data("key", pam.get_key_memory());
++    network->set_input_data("value", pam.get_value_memory());
++    network->set_input_data("past_lens", pam.get_past_lens_memory());
++    network->set_input_data("subsequence_begins", pam.get_subsequence_begins_memory());
++    network->set_input_data("block_indices", pam.get_block_indices_memory());
++    network->set_input_data("block_indices_begins", pam.get_block_indices_begins_memory());
++    network->set_input_data("max_context_len", pam.get_max_context_len_memory());
++    {
++        auto outputs = network->execute();
++        ASSERT_NE(outputs.at("output_data").get_memory(), nullptr) << "call 1 (MIXED) did not complete";
++    }
++
++    // Call 2: a fresh sequence, past=0, a long prompt - PREFILL on its own fresh_stage, on the
++    // SAME impl whose rt_params still reflects call 1's MIXED state.
++    pam.subsequence_descs = {SubsequenceDescriptor{long_prompt_tokens, 0}};
++    pam.subsequence_begins = {0, long_prompt_tokens};
++    pam.past_lens = {0};
++    pam.block_indices.assign(max_blocks_needed, 0);
++    for (int b = 0; b < max_blocks_needed; b++)
++        pam.block_indices[b] = b;
++    pam.block_indices_begins = {0, max_blocks_needed};
++    pam.max_context_len = {long_prompt_tokens};
++
++    network->set_input_data("query", pam.get_query_memory());
++    network->set_input_data("key", pam.get_key_memory());
++    network->set_input_data("value", pam.get_value_memory());
++    network->set_input_data("past_lens", pam.get_past_lens_memory());
++    network->set_input_data("subsequence_begins", pam.get_subsequence_begins_memory());
++    network->set_input_data("block_indices", pam.get_block_indices_memory());
++    network->set_input_data("block_indices_begins", pam.get_block_indices_begins_memory());
++    network->set_input_data("max_context_len", pam.get_max_context_len_memory());
++    {
++        auto outputs = network->execute();
++        ASSERT_NE(outputs.at("output_data").get_memory(), nullptr) << "call 2 (PREFILL, long prompt) did not complete";
++    }
++
++    // arcint (patches/0016, review re-check, fixes A/B/C): host-side report, not the real GPU
++    // allocation. In the unbounded red case this discriminator can construct (a PREFILL-stage
++    // fresh estimate escaping the bound entirely), tmp_out would be sized for the raw,
++    // unbounded partition count at long_prompt_tokens=8192 - on the order of gigabytes - and a
++    // real allocation could abort before this assertion ever ran. get_internal_buffer_descs() is
++    // read instead, matching the SWA-mirror test below. Index 3 = exp_sums on this no-scores-
++    // output path (exp_sums=3, max_logits=4, tmp_out=5, 6=gws->subsequence mapping - scores
++    // output would shift these by two) - exp_sums, not tmp_out, deliberately: tmp_out's byte
++    // count carries an extra v_head_size factor exp_sums does not
++    // (total_tokens*heads_num*v_head_size*partitions*element_size vs exp_sums'
++    // total_tokens*heads_num*partitions*element_size), and mixing tmp_out's real size against
++    // exp_sums' formula was exactly the bug this fixes.
++    auto* impl = pa_inst->get_impl();
++    ASSERT_NE(impl, nullptr);
++    const auto descs = impl->get_internal_buffer_descs(*pa_inst->get_impl_params());
++    ASSERT_GT(descs.size(), 3u);
++    // The descs report BYTES, not elements (exp_sums/max_logits are sized as a byte count over
++    // a 1-byte element type internally) - the softmax accumulator itself is f32, 4 bytes.
++    const size_t exp_sums_bytes = descs[3].m_layout.count();
++    const size_t heads_num = static_cast<size_t>(p.num_heads);
++    constexpr size_t softmax_accumulator_element_size = 4;  // f32
++    const size_t max_allowed_bytes =
++        static_cast<size_t>(long_prompt_tokens) * heads_num * max_partitions * softmax_accumulator_element_size;
++    ASSERT_LE(exp_sums_bytes, max_allowed_bytes)
++        << "exp_sums sized for more than " << max_partitions << " partitions (" << exp_sums_bytes
++        << " bytes reported, " << max_allowed_bytes << " bytes allowed at the bound) after a "
++        << "PREFILL call following an earlier MIXED call on the same impl - the bound was gated "
++        << "on the wrong stage";
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    regression_paged_attention_review_bound_governing_stage,
++    paged_attention_review_bound_governing_stage_test,
++    ::testing::Values(paged_attention_test_params{
++        {{8, 500}},
++        8, 2, 128, 128, 16, 0,
++        DISABLE_CACHE_COMPRESSION,
++        ov::internal::CacheQuantMode::BY_TOKEN,
++        DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++        false, 0, {},
++        false, {}, {},
++        ov::element::dynamic,
++        false, {}, false,
++        std::nullopt, false, std::nullopt, false, false,
++        ov::element::dynamic,
++        4
++    }));
++
+ class paged_attention_swa_partition_finalization_test : public PagedAttentionTest<paged_attention_test_params> {};
+ 
+ TEST_P(paged_attention_swa_partition_finalization_test, ignores_inactive_partition) {
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.h b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.h
+index 344f6b4..2f6d03c 100644
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.h
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.h
+@@ -3059,6 +3059,17 @@
+     // option existed. Set explicitly (e.g. 2) to force several raw partitions to fold into one
+     // work-group via the online-merge path.
+     size_t paged_attention_max_partitions = 0;
++
++    // arcint (multi-execute growth test, requested alongside patches/0016): both 0 (default,
++    // inert) for every existing test case above. When growth_chunk_size > 0,
++    // paged_attention_growth_test ignores `subsequences` for its own per-chunk shape and
++    // instead re-executes ONE network repeatedly - `subsequences` is still used once, at
++    // fixture SetUp() time, to size the PagedAttentionManager for growth_final_total_tokens
++    // (see the test body: `p.subsequences` is set to a single {growth_final_total_tokens, 0}
++    // descriptor by the INSTANTIATE_TEST_SUITE_P call below, matching every other sizing-only
++    // use of `subsequences` already in this file).
++    int growth_chunk_size = 0;
++    int64_t growth_final_total_tokens = 0;
+ };
+ 
+ const auto ENABLE_CACHE_COMPRESSION = true;

@@ -3388,46 +3388,179 @@ previous forward's partition count, so that the first chunk into a new
 partition writes one partition past the buffer; a build carrying only
 the fresh sizing passes 384 and 466 partitions on that card too. Two builds that only alter the finalization kernel — one forcing its
 global-memory arm, one doubling its register capacity — pass the cell
-as well. So every perturbation tried clears it, host-side or kernel-side,
-while the untouched plugin had crashed in every run at 384 partitions
-and beyond that day (a reading superseded a few hours later, below):
-the profile of a fault whose window closes under any change of timing, which leaves the
-rebind as the one candidate that carries a mechanism rather than a
-perturbation; a build carrying only the rebind passes the cell as well — and then an
-untouched control, run back to back, passed too. So the seam is not
-sharp and the day's matrix is a tally, not a proof: the untouched
-plugin crashed in five of six runs past 98k tokens on that card, every
-changed build passed in seven of seven runs (the fresh sizing and the
-full patch twice each, the three others once), single samples each; suggestive of
-the rebind, decided by nothing yet; patch 0016 (the fresh sizing)
-corrects a real stale count regardless and ships as hardening, with its
-header saying exactly this much and no more. The signature itself is
-not ours alone: the xe driver's "Engine memory CAT error" is the GuC's
-catastrophic-error notification, which the driver treats as an engine
-reset without decoding the hardware's fault type, and the same
-notification under sustained LLM inference on Battlemage is an open
-issue in the driver's tracker (drm/xe/kernel work item 8390, 2026),
-where the reporters found the compute runtime's USM pool manager
-implicated and its debug switch (`NEOReadDebugKeys=1
-UseUsmPoolManager=0`) a mitigation; Alchemist lacks the recoverable
-page-fault path that turns such an access into a report, which is
-consistent with the 16 GiB card's silence. The switch is on this
-record's list as a discriminator. The 16 GiB card's failure at the
-bound with the 165,680-token pool is a different animal: the same 119k
-cell crashed three times and passed four times the same evening, and a
-variant that retires the previous intermediate buffers only after the
-stream has finished passed twice of twice, so on that card the fault is
-not deterministic and the bound's own path is not what faults; the exact boundary
-between 131k and 165k tokens is the open question (no constant of 8,192
-or 131,072 exists on this path in the plugin, the patches or the engine,
-and the device's single-allocation limits are far away); the binding fix stays in the patch as a real defect fixed,
-and the prefill ladder against the unpatched plugin follows when the
-served path holds. Two operating
-notes: the option inserted into the plugin's configuration shifts the
-model-cache blob's positional schema, so the GPU model cache must be
-cleared when upgrading to the plugin level that carries 0015; and the
-engine prices the bounded scratch at 2 bytes and the bound only when the
-plugin accepts the key — a contract, since both ship in one patch.
+as well, and so does a build carrying only the rebind, and so,
+eventually, does an untouched control run back to back with a crashing
+one. Every single-change perturbation tried clears the cell at least
+once, host-side or kernel-side — a pattern that does not name a kernel
+defect, and does not name the rebind as the writer either. What it
+names is the GPU firmware's own catastrophic-error notification
+tripping over something entirely outside these kernels: closed as a
+diagnosis in §7.0.2ad, which supersedes this section's own read of the
+crash (the rebind hypothesis, the finalization-kernel builds, and every
+number this section quoted about which build passes how often).
+
+Two operating notes survive that closure unchanged: the option inserted
+into the plugin's configuration shifts the model-cache blob's
+positional schema, so the GPU model cache must be cleared when
+upgrading to a plugin level that carries 0015; and the engine prices
+the bounded scratch at 2 bytes and the bound only when the plugin
+accepts the key — a contract, since both ship in one patch.
+
+#### 7.0.2ad The deep-prompt crash closed: a runtime semaphore, not a plugin kernel (2026-09-04)
+
+RETRACTED (DESIGN §7.0.1, kept on the record rather than silently
+corrected): every earlier note here and in CHANGELOG.md framed this
+crash as depth-triggered — "past 98k tokens", "384 partitions" —
+including §7.0.2ac's own tally. That framing was wrong. The prompt
+that triggers it is one fixed 98,147-token prompt (331,500 characters;
+an earlier note's "119k" for the same text was itself a miscount of a
+separate, 400,000-character prompt). The crash depth within that one
+prompt's prefill is random — traced at about 3,600, 12,000 and 40,000
+tokens into the same 98k run on three separately crashing processes —
+so no partition count or chunk size this record ever bracketed is a
+threshold. The trigger is VRAM headroom together with concurrent host
+or other-card load, not depth.
+
+**The mechanism, in three legs.**
+1. Every crash on the 24 GB card is a GPU page-fault storm at one
+   fixed GPU virtual address, the same address across processes and
+   builds: `0x0000d556aa670000` on the compute engine (483 fault lines
+   over 9 crash events) and `0x0000d556aa740000` on the copy engine (8
+   lines) — FaultType 0 (not present), AccessType 0 (read), FaultLevel
+   4, "Fault response: Unsuccessful", hundreds of "Engine memory CAT
+   error" lines and engine resets at the same instant as the faults,
+   never a separate event; no "Timedout job" line accompanies any
+   arcint crash.
+2. The OpenCL runtime's own allocation log identifies that address: it
+   is the exact start of a `SEMAPHORE_BUFFER` in local memory — a 64
+   KiB semaphore buffer carved from a 17 × 64 KiB command-buffer
+   region the runtime allocates at initialisation next to its 320 KiB
+   ring-buffer allocations for the compute and copy engines — the
+   runtime's own direct-submission ring and semaphore. No model
+   buffer, KV page, or plugin intermediate sits at that address.
+3. Read from the runtime source and the kernel driver's own
+   documentation, not independently measured the way legs 1 and 2
+   are: the runtime binds those buffers once, as ordinary user BOs,
+   and never re-validates them; the kernel driver's own
+   documentation states that user BOs are evictable. Under VRAM
+   pressure with concurrent host or other-card activity, the
+   driver's eviction traffic can reclaim the semaphore buffer;
+   direct submission never issues the exec that would rebind it;
+   the next semaphore wait reads a non-present page; the GuC
+   reports the CAT error and the engine resets. A second candidate
+   mechanism, not yet separated from this one, is read from the
+   kernel driver's own tracker — see Upstream, below.
+
+This is a diagnosed driver/runtime interaction, not a plugin defect,
+and the plugin's own paged-attention kernels are exonerated on their
+own evidence, not merely by elimination: a trace build logging every
+intermediate buffer bound at every dispatch against every reallocation
+recorded 0 stale bindings over 5,867 dispatches; the crash depth varies
+within one fixed prompt, which a kernel-side threshold cannot explain;
+and the untouched, unpatched plugin passes the identical configuration
+on a quiet host (other card idle, no concurrent host load): 2 passes in
+2 (845 s and 802 s), the pair's direct-submission-off partners also
+passing (820 s and 840 s).
+
+**Two knobs, measured.**
+
+| knob | config | result |
+|---|---|---|
+| headroom — the fit's own scratch term active, `ARCINT_PREFILL_CHUNK_CAP` at its DEFAULT (not the diagnostic bypass) | 24 GB card, u8:i4, bound 32, `--n-ctx 131072` (belt settles at chunk 128, 48.5 MiB of scratch charged) | 2 pass in 2 (830.7 s) |
+| direct submission off, `NEOReadDebugKeys=1 EnableDirectSubmission=0` | 24 GB card, u8:i4, the `ARCINT_PREFILL_CHUNK_CAP=off` bypass, the 98,147-token prompt | patched (0015) build: 3 pass in 3; untouched build: 2 pass in 2 (820 s, 840 s) |
+| direct submission off, same switch | 16 GiB card, u8:i4, bound 32, 165,680-token pool, the same prompt | 5 pass in 5 (638 s, +1.4% wall against a 630 s control) |
+
+At bound 32 with the 165,680-token pool the 16 GiB card's own earlier
+tally, restored here: three crashes and four passes the same evening,
+while the host was also building plugin variants (host load not recorded); the 630 s quiet-host
+control above (5 pass in 5) is the later, separating result.
+
+*KV format.* The fault was observed only with `--paged-kv u8:i4`; the
+mechanism above is format-agnostic. A symmetric-u8 pool driven to the
+same edge was not exercised and stays untested by decision.
+
+State plainly what the first row means: every crash on the 24 GB card
+on this record was produced with `ARCINT_PREFILL_CHUNK_CAP=off` — the
+belt, the measured cap and the scratch-term reservation all disabled,
+a diagnostic bypass this repository built specifically to reproduce
+the plugin's own fault line (§7.0.2ab). arcint's default is the belt
+on; with the reservation active at the bound (the first row above),
+the identical 98k-token cell passed both times it was run. `ARCINT_PREFILL_CHUNK_CAP`
+is the only default in that cell: the bound was set explicitly
+(`--paged-attention-max-partitions 32`; the config default is 0), and
+bound 0 with the term active is unmeasured here.
+
+State plainly what the second and third rows do not yet prove: the
+untouched-build control at this knob also passes on a quiet host, the
+same condition that already makes the untouched plugin pass without
+the knob at all (the exoneration above). `EnableDirectSubmission=0`
+disables the exact mechanism leg 3 names, so its evidence is
+mechanism-derived, not a rate result — the samples that exist (3/3 and
+2/2 on the 24 GB card, 5/5 on the 16 GiB card) are consistent with it
+working and are not, on their own, a discriminator against a quiet
+host that already passes without it. Documented here as the fallback
+for an operator who ever needs to run past the bound, not as the
+primary defence — the primary defence is the default reservation in
+the first row.
+
+**Upstream.** The driver's own tracker carries the same signature:
+`drm/xe` issue 8390 (open) reports "Timedout job" and engine resets
+under sustained decode on four LLM stacks on this card's
+generation, with one quoted page fault at `0x0000d556aa3b1000` on the
+copy engine — the same runtime heap region this record's own fault
+addresses sit in, "recurring across separate incidents and separate
+process PIDs" in the reporters' own words. Two candidate mechanisms,
+not yet separated (the fact-finding record's own wording, kept as
+such): leg 3 above (the semaphore BO evicted, never re-validated), and
+a second one read from the same tracker — a `drm/tip` commit, "drm/xe:
+Order ring writes before ring tail updates" (Cc stable), fixing a
+missing write-ordering barrier between a ring buffer and its tail
+pointer for kernel-submitted jobs. Its own commit message states the
+symptom as "command stream corruption, which typically manifests as a
+hang or a spurious pagefault" — a peer candidate for the SAME fault
+this record shows, not a distinct kernel-submitted-path story. That
+commit closed two related upstream reports; one of them, an
+eviction-test regression, is recorded as this card's generation, the
+other report's card is not recorded. The fix is in the `linux-7.1.y`
+stable branch and is not in `linux-7.0.y`; the dev host runs a 7.0.14
+kernel with no 7.1 package offered by its distribution. Whether to move
+the host to a kernel carrying that fix is an operator decision, not
+made here. A report to the compute-runtime and `drm/xe` trackers,
+naming this record's own address match, is being drafted.
+
+**Non-determinism, a separate finding.** Repeated runs at a shallow
+depth (16 GiB card, u8:i4, an 8,418-token prompt, chunk 128, unbounded
+partitions) are not byte-identical run to run: untouched 13 of 14 runs
+byte-equal to each other (one outlier), patch 0015 12 of 13 (one
+outlier), 0015+0016 6 of 6 on the clean build of the shipped patch
+stack (an earlier staging build that also carried an unrelated
+experimental change was 5 of 6), and the bounded-32 arm 3 of 3
+byte-equal to each other and reproducibly DIFFERENT from the unbounded
+arms (the expected fold from the bound's own online-softmax merge,
+above). Each outlier is consistent with a single-token divergence; the
+rate — about one run in fourteen — is the same across every build
+tried, so it is a property of the stack as already shipped, not
+something 0015 or 0016 introduced.
+
+**Patch status.** 0015 is committed; this round corrected its own prose
+(buffer roles and indices; no code change; the index line below is
+re-derived, not asserted). 0016 (the fresh intermediate sizing) was
+reviewed: two real hunk findings were fixed (the sliding-window term
+now mirrors the served formula; the bound is applied under the same
+stale-count stage the served path uses), two red-first unit tests were
+added, and the patch carries the deep-pool and growth regressions as
+well. Gate on a clean build of the shipped stack (baseline + 0001-0016,
+nothing else): all 19 tests in the combined filter pass on the 24 GB
+card, and the 8,418-token ladder is 6 of 6 byte-equal (above). An
+earlier staging build that also carried an unrelated experimental
+change was 18 of 19, the one failure being the sliding-window test's
+own fixture (an unsized cache), since repaired. 0016 remains a
+correct hardening of a real stale-count defect in its own right — it
+does not touch the crash this section closes. Buffer-index correction
+for the record: on the served path (the MIXED stage, no scores
+output), there are seven intermediates — `exp_sums` = 3, `max_logits` =
+4, `tmp_out` = 5, 6 = the global-work-size-to-subsequence mapping; a
+graph with a scores output shifts every one of these indices by two.
 
 #### 7.0.2r DFlash2: the external-drafter hook gets a real drafter (2026-09-01)
 

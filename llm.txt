@@ -555,42 +555,51 @@ memory
                             costs prefix-cache reserve: the pool is sized in
                             bytes and live pages are a fixed count, so the
                             whole difference lands there.
-                            u8:i4 on an UNPATCHED plugin (before patch 0015):
-                            measured GPU engine reset on a prefill at 98,304
-                            tokens (384 partitions of 256) on a card that
-                            reports GPU faults -- 97,847 passes, 98,147
-                            crashed once and passed once, 119k crashed twice;
-                            plain u8 is unaffected. CORRECTED
-                            tally: past 98k tokens that day the untouched
-                            plugin crashed in 5 of 6 runs and PASSED once
-                            (98,147 tokens, 865 s) -- not deterministic.
-                            Every changed build tried (0016's fresh buffer
-                            sizing, a forced global finalization arm, a
-                            doubled register-arm capacity, 0015's argument
-                            rebind alone, full 0015 unbounded) passed in 7 of
-                            7 runs (the first and the last twice), single
-                            samples each against a baseline
-                            that itself passes 1/6 -- SUGGESTIVE of the
-                            argument rebind (the only change with a mechanism
-                            behind it) and decided by nothing yet; 0016 still
-                            ships as hardening, not a proven fix. Next: a
-                            trace build logging the memory handle bound at
-                            each enqueue against handles freed at each
-                            reallocation, and a multi-execute harness growing
-                            the past chunk by chunk (both written, running).
-                            The kernel-log signature is the GPU firmware's generic
-                            catastrophic-error notification (undecoded fault
-                            type); the same notification under sustained LLM
-                            inference on this card's generation is an open
-                            upstream drm/xe item implicating the compute
-                            runtime's USM pool manager, with
-                            NEOReadDebugKeys=1 UseUsmPoolManager=0 reported to
-                            mitigate it there (queued here, not yet run); the
-                            16 GiB card's silence is consistent with (not
-                            proven by) its generation lacking the recoverable
-                            page-fault path. Treat u8:i4 beyond ~98k tokens as
-                            unsafe until a plugin level carrying the rebind
-                            ships (CHANGELOG "Known defects").
+                            u8:i4, deep-prompt crash on a fault-reporting
+                            card: CLOSED as a diagnosed driver/runtime
+                            interaction, not a plugin defect (DESIGN
+                            §7.0.2ad). RETRACTED: earlier notes framed this as
+                            depth-triggered ("past 98k tokens") -- wrong; the
+                            trigger is one fixed 98,147-token prompt, crash
+                            depth within its prefill is random (~3.6k/12k/40k
+                            tokens on three crashes), and the actual trigger
+                            is VRAM headroom plus concurrent host/other-card
+                            load, not depth. Mechanism: every crash is a
+                            page-fault storm at the OpenCL runtime's own
+                            direct-submission semaphore buffer (one fixed GPU
+                            address, identified in the runtime's allocation
+                            log), evicted as an ordinary user BO under VRAM
+                            pressure and never revalidated before its next
+                            wait; the plugin's kernels are exonerated (0
+                            stale bindings over 5,867 traced dispatches).
+                            Every crash on the 24 GB card on record used
+                            the ARCINT_PREFILL_CHUNK_CAP=off diagnostic
+                            bypass; with ARCINT_PREFILL_CHUNK_CAP at its
+                            default (the only default here -- the bound was
+                            set explicitly, --paged-attention-max-partitions
+                            32; the stock default, bound 0, with the term
+                            active is unmeasured at this cell), the scratch
+                            term active on the 24 GB card passed 2/2 at the
+                            same cell. NEOReadDebugKeys=1
+                            EnableDirectSubmission=0 is a documented fallback
+                            if the bound is ever violated (3/3 patched, 2/2
+                            untouched, 5/5 on the 16 GiB card at +1.4% wall)
+                            -- but its control also passes on a quiet host,
+                            so that evidence is mechanism-derived, not a rate
+                            result. Matches open upstream drm/xe item 8390
+                            (same runtime heap region, this card's
+                            generation) plus a second candidate mechanism for
+                            the SAME fault, not yet separated (a
+                            stable-branch ring-ordering fix in linux-7.1.y,
+                            absent from the dev host's kernel) -- an operator
+                            decision on the host kernel, not made. u8:i4
+                            beyond ~98k tokens under the bypass stays unsafe
+                            on fault-reporting cards; at bound 32 with the
+                            165,680-token pool the 16 GiB card passed 5/5 on
+                            a quiet host and 4/7 earlier that evening while
+                            the host was also building plugin variants (host
+                            load not recorded)
+                            (CHANGELOG "Known defects").
   --cache-grid N            prefix-cache snapshot grid in tokens (default: 0 = the
                             prefill chunk). A snapshot lands on the last multiple of N
                             below the prompt length; a coarser grid re-prefills the
