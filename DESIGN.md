@@ -3525,8 +3525,11 @@ other report's card is not recorded. The fix is in the `linux-7.1.y`
 stable branch and is not in `linux-7.0.y`; the dev host runs a 7.0.14
 kernel with no 7.1 package offered by its distribution. Whether to move
 the host to a kernel carrying that fix is an operator decision, not
-made here. A report to the compute-runtime and `drm/xe` trackers,
-naming this record's own address match, is being drafted.
+made here. Cross-reported upstream: a comment on intel/compute-runtime
+issue 948 (the same fault class on this card's generation; our comment
+adds the allocation-log identification of the faulting buffer, the two
+knobs, and the fact that the fault occurs on GuC 70.65.0), and `drm/xe`
+tracker item 9141, linking 8390, 8651 and 7810.
 
 **Non-determinism, a separate finding.** Repeated runs at a shallow
 depth (16 GiB card, u8:i4, an 8,418-token prompt, chunk 128, unbounded

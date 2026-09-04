@@ -656,9 +656,9 @@ any of them flips the served sampler provenance to 'operator')
                             partition count (default: 0, unbounded). Engine
                             side of plugin patch 0015
                             (patches/0015-paged-attention-bounded-partials.patch,
-                            written and under device test -- in no built
-                            package yet, so the bound is inert on every
-                            released plugin): passed to a patched plugin
+                            carried by marfrit-openvino +p3 (built
+                            2026-09-04, not yet deployed), so the bound is
+                            inert on every plugin level before +p3): passed to a patched plugin
                             as its own RW config key
                             PAGED_ATTENTION_MAX_PARTITIONS on a 4-bit-values
                             load, detected by reading the key back before
@@ -710,8 +710,8 @@ any of them flips the served sampler provenance to 'operator')
                             partials)..." when N = 0. Key absent: byte-for-
                             byte identical to the pre-0015 path (verified
                             against the engine's own arithmetic -- the bound
-                            is inert on every RELEASED plugin, since patch
-                            0015 is in no built package yet; MEASURED on the
+                            is inert on every plugin level before +p3, which
+                            carries patch 0015; MEASURED on the
                             patched plugin under device test, N = 32: auto-fit
                             lands at n_ctx 165,680, chunk 128, 48.5 MiB
                             scratch, against 101,824/chunk 64 unbounded on

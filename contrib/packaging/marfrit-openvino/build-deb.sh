@@ -40,7 +40,7 @@ PKGREL=1
 # bin/ rather than from its install prefix: upstream does not install the JAX
 # frontend in this configuration, and shipping fewer libraries than the previous
 # package did would be a silent capability change.
-OV_BUILD_DIR=${OV_BUILD_DIR:-$HOME/ovbuild}
+OV_BUILD_DIR=${OV_BUILD_DIR:-${OV_SRC:-$HOME/ovsrc-pkg}}   # OpenVINO writes bin/intel64/Release under the SOURCE tree, whatever the build dir
 OV_BIN=$OV_BUILD_DIR/bin/intel64/Release
 OV_TBB=${OV_BUILD_PREFIX:-$HOME/ovinstall}/runtime/3rdparty/tbb/lib
 PATCHLEVEL=marfrit-p3

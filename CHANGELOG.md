@@ -22,9 +22,9 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p3` (patches 0003–0016).
 ### Added since 0.2.13 (unreleased)
 - `--paged-attention-max-partitions N` (default 0, unbounded): engine side
   of plugin patch 0015. The plugin side is patch 0015
-  (`patches/0015-paged-attention-bounded-partials.patch`), written and
-  under device test; it is in no built package yet, so the bound is inert
-  on every released plugin. Passed to the GPU plugin as its own
+  (`patches/0015-paged-attention-bounded-partials.patch`), carried by
+  `marfrit-openvino +p3` (built 2026-09-04, not yet deployed), so the bound
+  is inert on every plugin level before +p3. Passed to the GPU plugin as its own
   RW config key `PAGED_ATTENTION_MAX_PARTITIONS` when a 4-bit-values load's
   compiled plugin accepts it -- detected by reading the key back before
   compile (an unrecognised-key throw is the ORDINARY case on every
@@ -107,8 +107,8 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p3` (patches 0003–0016).
   partials)..."` when N = 0 (an earlier version read "bounds attention
   partials at 0," which is not what N = 0 means). Key absent: verified
   byte-for-byte identical to the pre-0015 unbounded path (the engine's own
-  arithmetic -- the bound is inert on every RELEASED plugin, since patch
-  0015 is in no built package yet). The design note's own §B recon -- the
+  arithmetic -- the bound is inert on every plugin level before
+  `marfrit-openvino +p3`, which carries patch 0015). The design note's own §B recon -- the
   plugin's mixed-stage buffer is already f16 in the kernel, only the
   host-side sizing hardcodes 4-byte elements -- is read from the plugin
   source, not measured; nothing in this engine-side change measures it
