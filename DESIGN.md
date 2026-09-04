@@ -286,9 +286,9 @@ being blunt about that, because the first version of this section was: an
 unchunked prefill still holds activations for every prompt token at once, so
 "deep context" bought that way scales with host RAM. Serving 262144 tokens by
 owning enough memory to hold 262144 tokens of activations is not a design, it
-is a bigger machine — and it is what took `data` down on 2026-08-28.
+is a bigger machine — and it is what took the dev host down on 2026-08-28.
 
-**The reference on this fleet already answers this.** `llama-agent.service`
+**The reference on this fleet already answers this.** The serving unit
 serves 262144 context with the *35B* on a *16 GB* A770:
 
     -c 262144  -fa on  -ctk q8_0 -ctv q8_0  -ncmoe 30  --parallel 1
@@ -1078,7 +1078,7 @@ fall back to their own defaults against a server configured for 262144. So the
 model object carries it:
 
 ```json
-{"id": "qwen3.6-coder", "object": "model", "owned_by": "arcint",
+{"id": "coder-b5", "object": "model", "owned_by": "arcint",
  "n_ctx": 262144, "n_ctx_train": 262144, "quant": "q4", "lanes": 1,
  "canonical_id": "qwen3.6-27b-a3b-coder"}
 ```
@@ -1267,14 +1267,15 @@ measurement, on the agent endpoint with its real pool.
   under `-Wall -Wextra -Wpedantic -Werror`.
 - **Host memory is part of the measurement, not a footnote.** Deep-context runs
   are bounded by the *host*, not only by VRAM, and on this fleet the binding
-  constraint is ZFS: `zfs_arc_max` is 40 GiB of the 62 GiB on `data`, ARC
+  constraint is ZFS: `zfs_arc_max` is 40 GiB of the 62 GiB on the dev
+  host, ARC
   refills to ~24 GiB within minutes of boot because every compile reads a
   12.8 GiB weights file through it, and `MemAvailable` does not count ARC as
   reclaimable. ARC does shrink under pressure, but not fast enough to cover a
   large sudden allocation.
 
   Measured the hard way on 2026-08-28: a 64k unchunked prefill run alongside a
-  resident `openarc-coder` (~26 GiB) and a full 21 GiB **zram** swap — which is
+  resident instance of the retired unit (~26 GiB) and a full 21 GiB **zram** swap — which is
   compressed swap living in RAM, so filling it makes the squeeze worse rather
   than relieving it — produced three global OOMs, killed the engine, and left a
   zombie holding ~41 GiB of shmem that never came back. The same depth run with
@@ -1391,6 +1392,27 @@ measurement, on the agent endpoint with its real pool.
   prefill, not decode. arcint tracks prefill t/s per card as a first-class
   regression metric; the OV-compiled prefill graph baseline is measured at M1
   and becomes the floor.
+
+### 5.1 The test ladder: what runs when
+
+Measured practice of this campaign, not a new policy: three classes, by
+cadence and card time.
+
+| class | cadence | card time | members |
+|---|---|---|---|
+| Unit tests | every commit, every milestone | seconds to minutes | `arcint-test` via `ctest` in the stub build — among them config parsing and the refusal ladder (`tests/test_config.cpp`), the fit arithmetic (`tests/test_fit.cpp`), decode accounting and the cycle-profile line (`tests/test_decode_stats.cpp`, `tests/test_profile_cycle.cpp`), a 48-check curl round-trip (ctest's `roundtrip`) and the lane-accounting stress test (ctest's `stress`, `tests/concurrency/stress.sh`, stub-only). Plus the plugin unit tests each patch carries (`ov_gpu_unit_tests` filters: `patches_0015_paged_attention_*`, `regression_paged_attention_*` and 0016's own review suites, `moe_otd_perf_counters.*` from 0017) — these need a card but run in minutes, red-first wherever the test reports a found defect (construction locks say so), and run whenever their own patch changes |
+| Milestone gates | once per milestone increment | one card window, minutes | `tests/equivalence/run.sh` and `tests/concurrency/run.py` on the configuration the milestone changes (M9: the two offload configurations; M11: drafter on/off at the depth in question), plus the milestone's own measurement cell (M14's reference cell, M11's step profile), one process per configuration, numbers into §7 |
+| Acceptance | once per release, before the tag | hours | the Prüfstand at 10/10 on the production coder artifact through the deployed package; the equivalence and concurrency suites on every production configuration (the coder paged, the 35B offload, the agent with MTP); the depth ladder on both cards (the 98,147-token prefill at u8 and u8:i4); the packaging build with its version-stamp check; the post-deploy smoke |
+
+The long prefills are acceptance work: they are not repeated per
+milestone unless the milestone itself touches depth (M8 was the
+exception, by its own fault, not by rule). Within one arm, repeated
+decode samples reuse the prefix cache rather than re-prefill — a
+restored continuation is byte-identical to a cold run by §3.4, so
+sampling decode repeatedly against one warm prefix measures decode,
+not prefill, without re-paying it — except with `--moe-cpu-tier`,
+where §7.0.2ae measured the restore forking; there each sample is
+cold, or the tier's history is stated.
 
 ## 6. Why the pipeline layer is rewritten (evidence)
 
@@ -1510,7 +1532,7 @@ exist only there, `IndirectSDPA` cannot express the depth curve, rollback would
 become block-table arithmetic. All true, all inference. There is a direct
 measurement available and it had not been taken.
 
-`openarc-coder` on the fleet serves **the same IR file** (`qwen36-coder-b5-ov`)
+The retired unit, on the fleet, serves **the same IR file** (`qwen36-coder-b5-ov`)
 on the same card through **the same OpenVINO compiler**, but drives it with
 GenAI's `ContinuousBatchingPipeline` — that is, the paged path. So openarc
 against arcint holds the kernels and the graph constant and varies only the
@@ -2819,6 +2841,11 @@ not argued — with the sentinel early-return removed from the OpenCL kernel
 the T2 test fails, restored it passes, and the rebuilt plugin is
 byte-identical to the one the table measured.
 
+That held on every axis this window tested; it did not test a
+continuation restored from the prefix cache across the process's own
+request history, and that axis does not hold — see §7.0.2ae
+(2026-09-04).
+
 Three defects stood between the first tier-ON cell and that table, each
 found by a counter and fixed with a measurement, per §7.0.1:
 
@@ -3564,6 +3591,259 @@ for the record: on the served path (the MIXED stage, no scores
 output), there are seven intermediates — `exp_sums` = 3, `max_logits` =
 4, `tmp_out` = 5, 6 = the global-work-size-to-subsequence mapping; a
 graph with a scores output shifts every one of these indices by two.
+
+#### 7.0.2ae M9 equivalence gates on the offloaded path; the tier's residency-dependent arithmetic (2026-09-04)
+
+The M9 equivalence gates this milestone's own row has owed since
+§7.0.2y ran on the 24 GB card, `marfrit-openvino +p3`, source arcint at
+HEAD. Two configurations: the coder at `--offload-ratio 20 --paged-kv
+u8:i4` (8 GiB device pool) passes every check in `tests/equivalence/
+run.sh` and every check in `tests/concurrency/run.py` (the drafter
+never fires at this cell, and there is no MTP head to engage). The
+35B (`qwen36-35b-a3b-int4`, u8 KV) at `--offload-ratio 50
+--moe-cpu-tier` (8 GiB pool) passes concurrency (draft acceptance
+~33%) and passes every equivalence check but one: two greedy runs are
+identical, a warm-cache run is identical to cold, drafts are
+identical — and the continuation check FAILS, deterministically, 3 of
+3, with the same fork every time: a continuation restored from the
+prefix cache diverges from the cold run at character 141 (390 against
+388 bytes total), "compressed, rank-deficient summary" against
+"compressed, global summary".
+
+**Ruling out a split explanation.** The gate's kept work files show
+PROMPT 235 tokens, CONT 245, cache hit 192 tokens — 192 = 3×64, the
+prefix-cache snapshot grid equals the prefill chunk grid at this
+cell's default (`--cache-grid 0`) — so both arms compute the identical
+53-token tail chunk `[192, 245)` at decode entry; the restored arm's
+warm boundaries are a suffix of the cold arm's own chunk boundaries,
+not a different split. `batched_gemv_threshold` is 32, and both the
+53-token tail chunk and the cold run's own 64-token chunks are above
+it, so every prefill token in both arms takes the grouped, device-only
+path — no host expert runs during prefill in either arm. Only the 64
+decode tokens are tier-eligible at all: at `token_num` 1, each decode
+step routes through the batched GEMV path, and per MoE layer (×40)
+each of the 8 routed experts is resident-and-filled (device fused
+GEMV) or pool-full (a host expert kernel) independently.
+
+**Diagnosis** (the investigating design note's own reading, marked as
+such and confirmed by E1/E2 below). The expert slot LRU pool is
+process-global — it is not part of the prefix-cache entry and is never
+reset per request. With the tier off, residency only ever decides
+*where* an expert's bytes sit; with the tier on, residency **selects
+the arithmetic**: a resident expert runs the device kernel (f16,
+partial-accumulate GEMV), an evicted one runs the host kernel (f32),
+and the two are documented as not bit-equal (patch 0011 §5). The cold
+and restored arms enter decode with differently-shaped request
+histories behind them (245 prefill tokens from an empty pool, against
+235 prefill + 64 decode + a cache hit + 43 prefill + 64 decode + the
+same 53-token tail) and so hold different resident sets; a few hundred
+rows per decode token rounding differently is a sub-margin logit
+perturbation that first flips an argmax at a near-tie — exactly a
+fluent early agreement followed by a one-token fork, which is what
+both logs show. Two mechanisms the note ruled out on measurement, not
+assumption: the host kernel's own accumulation is per-job, independent
+f32, with no cross-token or cross-expert term, and the reduction that
+combines host and device output writes each row at a `flat_id` fixed
+by `token × EXPERTS_PER_TOKEN + expert_slot` regardless of which side
+produced it — **the reduction order is already residency- and
+batch-shape-independent, so an order-only fix is a null.** A sentinel
+defect was also ruled out (it would leave gross garbage from decode
+token 1, not two fluent texts diverging at token ~27) and VRAM
+pressure (moving slot buffers between VRAM and GTT is timing, not
+bytes).
+
+§3.4:469 is unconditional: byte-identical greedy output "for any prompt
+and any cache state." This measurement shows output depending on a
+variable that sentence does not admit — the process's own request
+history, through LRU residency — which **is a violation of §3.4 as
+written, not a property to file beside it.** The nearest weaker
+candidate wording, "byte-exact only within one batch shape," does not
+fit either: batch shape is identical in both arms (the same 53-token
+tail chunk, `token_num` 1 at decode); the accurate qualifier is *within
+one process history*.
+
+**E1 measured:** the identical suite with the tier off
+(`--offload-ratio 50` alone) passes every check, the continuation
+included — the tier is the discriminator. **E2 measured:** with the
+tier on and the prefix cache off, one process asked PROMPT, PROMPT,
+CONT gives the same answer to PROMPT twice and a THIRD distinct
+continuation for CONT — equal neither to the cold nor to the restored
+text — so the tier is history-sensitive in general; the cache and the
+restored state are exonerated, and the reading above stands as
+measured.
+
+**Ship decision.** F0 ships today, arcint-side, red-first (two cases in
+`tests/test_config.cpp`): `--moe-cpu-tier` refuses `--prefix-cache-mib
+> 0` at startup, in the same fail-loud ladder as the M8 asymmetric-KV
+refusal (§7.0.2w) — a path that cannot meet the invariant is configured
+out rather than papered over. The fix of record is **F1**: promote
+patch 0011's `moe_cpu_expert_ref_gpu_emul` — already built as the
+divergence *oracle* that predicts this exact fork — from oracle to the
+*served* host kernel, F16C-vectorised, as plugin patch 0018 (0011's own
+kernel files, not patch 0017's readback path, so a fresh patch number
+is correct); the partition then becomes numerically invisible whatever
+the history. Its cost is not yet measured — the deferred horizontal sum
+changes shape — and the P\* decode cell is re-measured once it lands,
+win or lose. Two alternatives were weighed and are not the plan of
+record: a structural fix that fixes residency as a pure function of
+expert id (cheaper, but gives up the measured 47.9% LRU hit rate at
+P\*, so it owes its own decode number first) and snapshotting residency
+into the cache entry (rejected — it couples an arcint cache entry to a
+plugin-side pool and still leaves two differently-warmed *cold*
+processes disagreeing with each other).
+
+Recorded for the axis this closes: with `--moe-cpu-tier`, greedy output
+is byte-exact for a repeated prompt *in the same process* (measured:
+two greedy runs identical, a warm-cache run identical to cold at 235
+tokens, drafts identical) and is **not** byte-exact against a
+differently-warmed process. The OFF-vs-ON byte identity §7.0.2x
+measured was one process history, not a claim about any history. F0
+removes only the cross-restore axis; §3.4 stays violated with the
+tier on until F1 (patch 0018).
+
+#### 7.0.2af M14: the readback decomposed — the 283 µs was queue backlog, not transfer (2026-09-04)
+
+The design note owed by §7.0.2x's own "next instrument, named and not
+chased" landed as patch 0017 (counters only — the four new spans
+`cpu_topk_id_ns`/`cpu_x_enq_ns`/`cpu_x_wait_ns`/`cpu_x_drain_ns`, a
+warm/steady split so warm-up uploads stop biasing the steady-state
+average, `usm_host` destinations for the x/routing-weight readback in
+place of pageable `std::vector` buffers, and the topk_id read hoisted
+into the same non-blocking wait as x and the routing weights, issued
+before the provider's `try_acquire_simultaneous` call; an env-gated
+`MOE_OTD_READBACK_PROBE` drain probe). First measured: 16 GiB card,
+35B int4, ratio 50, 8 GiB device pool, 128 slots, u8 KV, one lane,
+n_ctx 65,536, a 1,198-token prompt, 64 greedy tokens, two runs per
+process, four processes, the `+p3` base with the staged plugin,
+production units running.
+
+RETRACTED (§7.0.1, kept on the record rather than silently corrected):
+this window originally read the page cache as COLD, from `fincore`
+showing 3.0 of the artifact's 18.3 GiB resident. That reading is
+withdrawn — the container's root lives on ZFS, whose own file data
+lives in the ARC, not in the page cache `fincore` reports (mmapped
+pages only), so a low `fincore` figure does not establish a cold cache
+one way or the other. What the window's own counters still carry,
+unretracted: `avg_disk_io` read 52 µs over 265k tensor loads, 13.8 s
+of disk time per 128 tokens.
+
+**Decode rates, and why the first window's numbers do not replace the
+record on their own.** Tier OFF 2.4/2.6 t/s; pre-0017 tier ON 4.6/4.8;
+0017 tier ON 5.0/5.0; 0017 with the drain probe armed 4.8/4.9 — all
+about three times below the §7.0.2x record (10.4/10.6 OFF, 15.0/15.5
+ON), which was taken with the expert files already resident in RAM.
+These four numbers were stated plainly as NOT comparable to that
+record, and their own relative order among each other confounded by
+cache warming across the four processes run back to back that window,
+not a clean measurement of the patch.
+
+A clean rerun replaces the comparison, though not the gap to the
+record: quiet host, both production units stopped, the same cell, six
+processes in one fixed order — pre-0017 tier ON, 0017 tier ON,
+pre-0017 tier ON again, 0017 tier ON with `MOE_OTD_READBACK_NOHOIST`,
+0017 tier ON with the drain probe, 0017 tier OFF. Decode: tier OFF
+2.6/2.6 t/s; pre-0017 ON 4.7/4.7 and 4.7/4.7 (its own two separate
+samples agree with each other); 0017 ON 4.8/5.0; NOHOIST 4.9/5.0; the
+drain probe 4.7/4.9. 0017 is about +4% over pre-0017; hoisted against
+not-hoisted is a null, 5.0 against 5.0. All six arms are byte-identical
+to each other over the 64 tokens, tier OFF included — this sample's
+own residency history happened not to fork, unlike the M9 continuation
+cell (§7.0.2ae); that is not evidence the mechanism there does not
+apply here, only that it did not fire on this particular history.
+
+**The counters, which are the actual point of this window.**
+Pre-0017: `avg_cpu_x_us` 292 µs (reproducing the 283 µs on record),
+`avg_cpu_compute_us` 740, `avg_cpu_join_wait_us` 701, 18,040 host
+pairs over 5,076 tier layers (3.55 per layer — this cell's own
+absolute values, not P\*'s). With 0017: `avg_cpu_x_us` 3,644 µs =
+`avg_cpu_x_enq_us` 183 + `avg_cpu_x_wait_us` 3,460; `cpu_tier_calls`
+5,120 (= 40 layers × 128 decode tokens, two 64-token runs per
+process); every one of those 5,120 calls landed in the steady-state
+bucket, none in warm (`cpu_x_warm_layers` 0). The merged wait does not
+shrink the cost — it makes visible a queue backlog that patch 0012's
+own blocking `topk_id` read used to absorb uncounted, one round trip
+at a time. The decisive discriminator, the drain probe: a
+`stream.finish()` timed immediately before `tx0` costs 3,578 µs on its
+own, and the read that follows the drain then waits only 107 µs —
+essentially all of the "readback" time is the drain itself, not the
+4 KiB transfer after it.
+
+A defect found in review of the first 0017 build is on the record
+rather than silently fixed: `tx0` was stamped before the drain probe
+instead of after it, which double-counts the drain into the probe
+arm's own enqueue and topk_id spans; fixed in the rebuilt patch. The
+probe arm's own `avg_cpu_x_enq_us` figure from that build, 3,685 µs,
+is read as inflated by this defect and not used above — the
+independently-timed `cpu_x_drain_ns` (3,578 µs) and the post-drain
+wait (107 µs) are unaffected by the stamp's placement and are what the
+conclusion below rests on.
+
+**Conclusion, marked as measured, not as arithmetic.** The per-layer
+"readback" cost is the host tier waiting for the GPU to reach this
+layer's own router — a queue-backlog wait — not the 4 KiB transfer
+that follows it. §7.0.2x's own candidate next lever, host-visible
+residency for the decode input (design note §2, phase B), cannot
+remove an event wait it was never going to touch, and is retired
+before being built rather than measured into a loss. The tier's cost
+is the serial dependence on the GPU's own layer work; if there is a
+further lever it is overlap across that dependence, not memory
+placement.
+
+The in-build discriminator this section owed, `MOE_OTD_READBACK_NOHOIST`
+(the topk_id hoist disabled, isolating it from the `usm_host`
+destination change), confirms this directly rather than by inference:
+run in the same six-process clean window above (5,120 tier-on calls
+per build = 40 layers × 128 tokens, 5,074 of them with a host miss,
+3.54 pairs per layer, hit rate 44.4%). Pre-0017's `avg_cpu_x_us`
+reproduces again, 291 µs then 289 µs across its two samples. With the
+hoist off, the blocking `topk_id` read is now counted on its own —
+3,620 µs, the same GPU queue backlog the pre-0017 code paid but never
+counted — and the x/routing-weight readback that follows it, now
+landing in `usm_host` memory instead of a pageable `std::vector`,
+costs only 53 µs (enq 13 + wait 40). Hoisted (0017 as shipped), the
+merged wait is 3,651 µs (enq 184 + wait 3,467); the drain probe shows
+drain 3,511 µs then the reads themselves 214 µs (enq 108 + wait 106;
+the dump's own rounded avg reads 215). So the old 283 µs "readback"
+was the x read landing in pageable memory *after* the topk read had
+already drained the queue; the `usm_host` destination change alone
+cuts that to 53 µs, which is the whole of
+0017's own +4%; the hoist moves where the wait is counted, it does
+not remove it — a null, as predicted. The 3.5–3.6 ms of per-layer
+wait is the tier waiting for the GPU to reach that layer's own
+router, inherent to the serial dependence: the conclusion above is no
+longer an inference from one drain probe, it is measured in one
+build. Host compute per expert across this window: pre-0017 683 µs
+then 430 µs (its own two separate processes), 0017 421, NOHOIST 446,
+the drain probe 557.
+
+**The open discrepancy, stated plainly.** At this cell tier-OFF is
+2.6 t/s and tier-ON 5.0, against §7.0.2x's own 10.4/10.6 and
+15.0/15.5, measured 2026-09-02. Not explained by host load (this
+window's own host was quiet), CPU clocks (3.7 GHz, the performance
+governor), or the PCIe link (the 16 GiB card sits behind a PCIe 3.0 x4
+link in both boots, the earlier and this one). The two cells also
+differ in prompt length — 897 tokens for §7.0.2x's own record, 1,198
+here — named as a difference between the two cells, not tested as an
+explanation. The expert-fetch counters dominate the token at this
+cell — `total_disk_io` ≈ 9.3 s and `total_gpu_copy` ≈ 9 s per 128
+tokens, 265k tensor loads at 34–35 µs each — and §7.0.2x's own record
+does not carry those two totals to compare against. Left open; the
+next tier window must record them alongside the decode rate, not
+after it.
+
+**Equivalence.** Tier OFF, 0017 tier ON and 0017 with the drain probe
+are byte-identical to each other over the 64 greedy tokens in the
+first window. Pre-0017 tier ON differs from all three there (18,040
+against 17,972 host pairs — a different residency history, the
+§7.0.2ae mechanism, not a 0017 regression), so no tier build is held
+to byte-identity against another build until F1 (§7.0.2ae) lands and
+makes the partition numerically invisible. In the clean rerun above,
+by contrast, all six arms — pre-0017 included, both its samples — are
+byte-identical to each other: two real windows, two different
+residency histories, one that forked and one that did not, both
+consistent with §7.0.2ae's own reading (history-dependent, not
+always-forking). Every tier-on log across both windows carries
+exactly forty `cpu_tier on:` lines (fusion unchanged).
 
 #### 7.0.2r DFlash2: the external-drafter hook gets a real drafter (2026-09-01)
 

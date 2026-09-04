@@ -20,6 +20,21 @@ nightly is a different ABI.
 Requires `marfrit-openvino 2026.4.0~dev20260821+p3` (patches 0003–0016).
 
 ### Added since 0.2.13 (unreleased)
+- Plugin patch 0017 (`patches/0017-moe-cpu-tier-readback-decomposition.patch`,
+  not in any built package yet): the CPU tier's per-layer readback decomposed
+  into counters (topk_id, enqueue, wait, drain, warm/steady split), its
+  x/routing-weight destinations moved from pageable memory to `usm_host`, the
+  three reads merged into one wait, and two switches
+  (`MOE_OTD_READBACK_PROBE`, `MOE_OTD_READBACK_NOHOIST`). MEASURED on the 16
+  GiB card at the M14 tier cell (DESIGN §7.0.2af; a 1,198-token prompt, not
+  §7.0.2x's 897): the 283 µs on record was the x read into pageable memory
+  after the queue had drained on the blocking topk_id read; `usm_host` cuts it
+  to 53 µs (about +4% decode); the hoist is a null; the 3.5 ms per layer is
+  the tier waiting for the GPU to reach that layer's router, so host-visible
+  residency for the decode input (the candidate the M14 design named) is
+  retired unbuilt. The cell itself runs at a third of the 2026-09-02 record on
+  a quiet host, unexplained; the expert-fetch totals are the next thing to
+  compare.
 - `ARCINT_PROFILE_CYCLE=1`: one line per served drafting cycle on the paged
   path naming every segment (propose with its MTP embed/mask/layer/head
   split, verify embed, the forward's index/infer/logits/hidden split, the
@@ -146,10 +161,11 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p3` (patches 0003–0016).
   140 characters in. Diagnosis (DESIGN §7.0.2ae): the host tier's expert LRU
   residency is process-global and selects device-f16 versus host-f32
   arithmetic, which are not bit-equal, so greedy output depends on the
-  process's request history -- a violation of §3.4 as written. Until the
-  host kernel is made bit-equal to the device GEMV (plugin patch 0018, in
-  work), the combination fails loud. Two red-first tests in
-  `tests/test_config.cpp`.
+  process's request history -- a violation of §3.4 as written. This
+  refusal removes only the cross-restore axis; §3.4 stays violated with
+  the tier on until the host kernel is made bit-equal to the device GEMV
+  (plugin patch 0018, in work), the combination fails loud. Two red-first
+  tests in `tests/test_config.cpp`.
 - Activations charged at the wrong chunk could refuse an explicit --n-ctx
   that auto-fit itself would adopt for the identical request. MEASURED
   (unpatched plugin, coder, u8:i4): --n-ctx omitted adopts 101,824 at belt
