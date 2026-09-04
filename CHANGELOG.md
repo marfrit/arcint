@@ -17,7 +17,12 @@ nightly is a different ABI.
 
 ## Unreleased
 
-Requires `marfrit-openvino 2026.4.0~dev20260821+p3` (patches 0003–0016).
+Requires `marfrit-openvino 2026.4.0~dev20260821+p3` (patches 0003–0016) for
+everything below except patches 0017 and 0018 themselves. Those two are new
+in this section and not yet in any built package (`+p4`, carrying both, is
+owed); the measurements attributed to them below were run against a plugin
+built locally from this tree's `patches/` on the dev host, not against an
+installed package.
 
 ### Added since 0.2.13 (unreleased)
 - Plugin patch 0017 (`patches/0017-moe-cpu-tier-readback-decomposition.patch`,
@@ -32,9 +37,17 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p3` (patches 0003–0016).
   to 53 µs (about +4% decode); the hoist is a null; the 3.5 ms per layer is
   the tier waiting for the GPU to reach that layer's router, so host-visible
   residency for the decode input (the candidate the M14 design named) is
-  retired unbuilt. The cell itself runs at a third of the 2026-09-02 record on
-  a quiet host, unexplained; the expert-fetch totals are the next thing to
-  compare.
+  retired unbuilt. RETRACTED: the cell's own decode rate (a third of the
+  2026-09-02 record) was void -- every process that window ran the plugin's
+  own default device pool, not the intended 8 GiB one, because
+  `ARCINT_MOE_DEVICE_POOL_BYTES` (renamed at M7) was never exported; the
+  expert slots lived in host memory throughout, the same GTT-spill regime the
+  2026-09-02 record already prices. The in-build comparisons above are
+  unaffected (every arm shared the same wrong pool). REPRODUCED at the true
+  pool (solo run, both production units stopped, files pre-read): tier OFF
+  9.2/9.4 t/s, tier ON 11.0/15.3, byte-identical to each other -- within the
+  run-to-run spread of the 2026-09-02 record (10.4/10.6 / 15.0/15.5); the
+  discrepancy is closed.
 - `ARCINT_PROFILE_CYCLE=1`: one line per served drafting cycle on the paged
   path naming every segment (propose with its MTP embed/mask/layer/head
   split, verify embed, the forward's index/infer/logits/hidden split, the
@@ -151,9 +164,30 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p3` (patches 0003–0016).
   report it as measured-so-far, not as a cleared ceiling.
 
 ### Fixed since 0.2.13 (unreleased)
-- `--moe-cpu-tier` now refuses `--prefix-cache-mib > 0` (loud, in the
-  refusal ladder). The M9 equivalence gates on the offloaded path (24 GB
-  card, `marfrit-openvino +p3`): the coder at `--offload-ratio 20
+- Drafters at depth (DESIGN §7.0.2ag). Two defects, both measured on the
+  dense 27B agent artifact on the 24 GB card. (1) Zero acceptance past
+  65,504 tokens for MTP and DFlash alike: both drafter graphs compute their
+  rotary in-graph from the position parameter and ran under the plugin's
+  default f16 precision, where the absolute position overflows; the base's
+  own rotary survives because its position chain is ShapeOf-derived and stays
+  f32. Fixed by marking each drafter's rotary subgraph to stay f32 after
+  read_model (16 nodes in the MTP layer, 6 in DFlash; `ARCINT_DRAFT_ROPE_F16=1`
+  disables it for the A/B; `ARCINT_DRAFT_F32=1` compiles the whole drafter
+  f32 as the coarse discriminator). MEASURED: 60k → 70k tokens was 78% → 0%
+  accepted before; with the fix 80.5% (MTP) and 27.5% (DFlash) at 70k, 90.8%
+  and 40.6% at 76k, output byte-identical to plain decoding. (2) The MTP
+  layer's own unpaged KV state (8 KiB per token) was not charged by the
+  reservation, so the MTP arm sat at the card's ceiling at depth and its
+  verify was bimodal (441–1,754 ms); charged now as a per-token term next to
+  the drafters' weights on the reservation line (n_ctx admitted 155,488 →
+  127,536 on that card), verify 157–298 ms. Decision input: DFlash decodes at
+  18.8 t/s at 76k against plain 15.3 and 6.0 at 8.9k; MTP never beats plain on
+  this artifact (7.3 at 8.9k, 4.9 at 76k with every draft accepted) — the §8
+  depth-gated drafter decision now has its numbers.
+- `--moe-cpu-tier` refuses `--prefix-cache-mib > 0` at load (loud, in the
+  refusal ladder) unless the plugin reports a static residency partition
+  (patch 0018, `MOE_CPU_TIER_STATIC_PARTITION`). The M9 equivalence gates on
+  the offloaded path (24 GB card, `marfrit-openvino +p3`): the coder at `--offload-ratio 20
   --paged-kv u8:i4` passes every equivalence and concurrency check; the 35B
   at `--offload-ratio 50 --moe-cpu-tier` passes concurrency and every
   equivalence check but one, deterministically (3 of 3): a continuation
@@ -162,10 +196,38 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p3` (patches 0003–0016).
   residency is process-global and selects device-f16 versus host-f32
   arithmetic, which are not bit-equal, so greedy output depends on the
   process's request history -- a violation of §3.4 as written. This
-  refusal removes only the cross-restore axis; §3.4 stays violated with
-  the tier on until the host kernel is made bit-equal to the device GEMV
-  (plugin patch 0018, in work), the combination fails loud. Two red-first
-  tests in `tests/test_config.cpp`.
+  refusal removes only the cross-restore axis; §3.4 stays violated with the
+  tier on until the plugin's served host/device split is actually the
+  static, history-independent partition patch 0018 defines -- which is now
+  checkable at load instead of assumed, the combination fails loud. Five
+  red-first tests in `tests/test_config.cpp`: one parse-level test
+  confirming `--moe-cpu-tier`/`--prefix-cache-mib` are accepted together at
+  parse time (the refusal moved to load time, where the static-partition
+  fact is actually knowable), plus `tier_prefix_cache_decision`'s own four
+  corners (tier off; no cache; tier and cache without a static partition;
+  tier and cache with one).
+  Patch 0018 now exists (13 files; F1, a bit-equal host kernel, was
+  retired by review as impractical, see DESIGN §7.0.2ae's update for the
+  mechanism reason). Three load-time bugs surfaced and were fixed before the
+  allow branch could be trusted, none a numerics problem: the device-pool
+  sizing probe and the prefill per-expert fallback path both assumed a slot
+  could always be evicted or acquired, which the static partition's 100%-pinned
+  pool makes false; the refusal gate itself queried
+  `MOE_CPU_TIER_STATIC_PARTITION` on the wrong object (`core_`, before
+  compile, which always throws for this key) instead of the compiled model
+  (after compile, where the plugin actually answers it); and the property
+  itself, found in review after the first passing gate run, never checked
+  whether the tier was even on, so it reported the F2 rule "in effect" for
+  every load regardless -- full detail in DESIGN §7.0.2ae's update and the
+  patch's own header. With all four fixed, `tests/equivalence/run.sh`
+  was run for real against `--moe-cpu-tier --prefix-cache-mib 4096
+  --kv-block-size 32` on the 24 GB card: **the continuation-restore check
+  passes.** The allow branch is verified on real hardware, not asserted.
+  One unrelated check in the same run flaked (`speculative decoding is
+  deterministic across runs`, an n-gram drafter with no MoE routing
+  involved) -- passed in an earlier clean run of the same suite, failed in
+  this one; open, separate, not yet characterised.
+
 - Activations charged at the wrong chunk could refuse an explicit --n-ctx
   that auto-fit itself would adopt for the identical request. MEASURED
   (unpatched plugin, coder, u8:i4): --n-ctx omitted adopts 101,824 at belt

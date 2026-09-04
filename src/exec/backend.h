@@ -60,9 +60,13 @@ struct Reservation {
     // ratio makes eligible to be paged in -- informational only, never
     // subtracted from device_total_bytes. Both are zero when offload is
     // off. `slot_source` says how the DEVICE figure was priced: "forced"
-    // (ARCINT_FIT_SLOT_BYTES) or "probe" (the plateau probe); empty when
-    // offload is off or the probe failed with an explicit --n-ctx to fall
-    // back on.
+    // (ARCINT_FIT_SLOT_BYTES), "probe" (the plateau probe), or "static"
+    // (patch 0018's MOE_CPU_TIER_STATIC_PARTITION reported true -- the
+    // probe is skipped, since every slot is pinned and never evicted, and
+    // the device figure is computed exactly instead, with the same
+    // formula/source -- "ir" or "config" -- the host-side ledger used);
+    // empty when offload is off or the probe failed with an explicit
+    // --n-ctx to fall back on.
     uint64_t    expert_slot_bytes      = 0;
     uint64_t    expert_slot_host_bytes = 0;
     uint64_t    drafter_bytes          = 0;
@@ -204,6 +208,39 @@ std::string format_profile_cycle_line(size_t past, size_t n, size_t accepted, do
                                       double verify_infer_ms, double verify_logits_ms,
                                       double verify_hidden_ms, double accept_ms, double wait_ms,
                                       double cycle_ms, int frag);
+
+// M11 §2 (DESIGN §7.0.2ag): ARCINT_DRAFT_F32, the discriminator for the
+// zero-acceptance-at-depth hypothesis -- neither drafter graph (MTP
+// layer/head, DFlash) is compiled with a precision hint, so both run the
+// GPU plugin's default INFERENCE_PRECISION_HINT=f16, and DFlash's own
+// exporter states the problem outright: the residual stream "peaks at
+// ~128k and f16 tops out at 65504" (export_dflash.py), fixed there by a
+// pre-scale fold that export_mtp.py carries no equivalent of. Setting this
+// (presence-armed, env value ignored, same idiom as ARCINT_PROFILE_CYCLE
+// above) makes backend_ov.cpp compile both drafter graphs with
+// ov::hint::inference_precision(f32) instead. No default change: absent,
+// both compiles are exactly what they were before this switch existed.
+// Declared here / defined in backend_stub.cpp for the same reason
+// profile_cycle_enabled is: the env-to-decision mapping is the only part
+// of this switch that is pure enough to unit-test without a card or an
+// OpenVINO build, and it needs to be tested that way regardless of which
+// build compiled backend_ov.cpp.
+bool draft_f32_enabled();
+
+// M11 §2, RoPE follow-up (DESIGN §7.0.2ag): with ARCINT_DRAFT_F32 as the
+// discriminator confirming the f16-overflow hypothesis, this is the
+// production, per-node fix -- src/exec/rope_precision.h's
+// mark_rope_no_fp16_compression walks each drafter graph (MTP layer,
+// DFlash) right after read_model() and marks its rotary subgraph to stay
+// in f32 through the plugin's ConvertPrecision pass, instead of forcing
+// the WHOLE drafter graph to f32 the way ARCINT_DRAFT_F32 does. Applied by
+// DEFAULT (unlike every other switch in this file); ARCINT_DRAFT_ROPE_F16
+// (presence-armed, env value ignored) is the A/B lever that turns it back
+// OFF -- named after the state it restores (RoPE running in the plugin's
+// default f16), not after the fix. Declared here / defined in
+// backend_stub.cpp for the same reason draft_f32_enabled is: testable
+// without a card or an OpenVINO build.
+bool draft_rope_f16_enabled();
 
 class Backend {
 public:

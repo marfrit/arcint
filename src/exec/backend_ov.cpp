@@ -79,6 +79,7 @@
 #include "core/sampler.h"
 #include "core/turnstile.h"
 #include "exec/backend.h"
+#include "exec/rope_precision.h"
 #include "util/log.h"
 
 namespace lgc {
@@ -1128,14 +1129,36 @@ public:
                 if (!cfg.cache_dir.empty()) core_.set_property(ov::cache_dir(cfg.cache_dir));
                 const auto t0 = std::chrono::steady_clock::now();
                 const std::string layer_xml = choose_mtp_layer(artifact, cfg.mtp_layer);
-                mtp_layer_    = core_.compile_model(layer_xml, device);
+                // M11 §2 (DESIGN §7.0.2ag, rope_precision.h): the same
+                // rotary f32-precision fix the paged path applies to its own
+                // MTP/DFlash compiles further down this file -- read_model()
+                // first (not a direct path compile) so the RoPE marker below
+                // has a graph to walk before the plugin's own ConvertPrecision
+                // pass runs inside compile_model(); see the paged path's own
+                // comment for ARCINT_DRAFT_F32 / ARCINT_DRAFT_ROPE_F16.
+                const bool draft_f32 = draft_f32_enabled();
+                ov::AnyMap draft_precision_props;
+                if (draft_f32) {
+                    draft_precision_props[ov::hint::inference_precision.name()] = ov::element::f32;
+                }
+                const bool apply_rope_fix = !draft_rope_f16_enabled();
+                auto         mtp_layer_model = core_.read_model(layer_xml);
+                const size_t mtp_rope_marked =
+                    apply_rope_fix ? mark_rope_no_fp16_compression(mtp_layer_model) : 0;
+                mtp_layer_    = core_.compile_model(mtp_layer_model, device, draft_precision_props);
                 read_mtp_contract(mtp_layer_, layer_xml);
-                mtp_head_     = core_.compile_model(artifact.mtp_lm_head_xml, device);
+                mtp_head_     = core_.compile_model(artifact.mtp_lm_head_xml, device,
+                                                     draft_precision_props);
                 lanes_[0]->mtp_layer = mtp_layer_.create_infer_request();
                 lanes_[0]->mtp_head  = mtp_head_.create_infer_request();
                 mtp_ready_           = true;
-                log::info("mtp", "head ready in %.1f s; drafting one token per step",
-                          seconds_since(t0));
+                log::info("mtp",
+                          "head ready in %.1f s; drafting one token per step%s; rope kept f32 on "
+                          "%zu node(s)%s",
+                          seconds_since(t0),
+                          draft_f32 ? " (ARCINT_DRAFT_F32: f32 inference precision)" : "",
+                          mtp_rope_marked,
+                          apply_rope_fix ? "" : " (ARCINT_DRAFT_ROPE_F16: fix disabled)");
             } catch (const std::exception& e) {
                 log::warn("mtp", "could not load the MTP head, continuing without it: %s",
                           e.what());
@@ -2619,6 +2642,48 @@ private:
             // is labelled "cpu tier on". A flag, not an env var, because this
             // changes what is served, not what is logged.
             if (moe_cpu_tier_) {
+                // DESIGN §7.0.2ae's F0 used to refuse --moe-cpu-tier with
+                // --prefix-cache-mib > 0 unconditionally, at config parse
+                // time (config.cpp). F1 (a bit-equal host kernel) was
+                // retired by review -- the device's per-lane scale/zp and
+                // subgroup-tree reduction order make a faithful host match
+                // unattainable at reasonable cost. Patch 0018 ships as F2
+                // instead, and makes the refusal conditional a different
+                // way: it turns the host/device split itself into a pure
+                // function of the served configuration (a static
+                // per-(layer, expert) partition) rather than
+                // history-dependent LRU residency, and exposes a READ-ONLY
+                // GPU-plugin property, MOE_CPU_TIER_STATIC_PARTITION, that
+                // reports whether the tier actually serving this load is
+                // that static partition (false when
+                // MOE_CPU_TIER_PARTITION=lru selects the old,
+                // history-dependent one; the property is simply absent on a
+                // plugin without 0018).
+                //
+                // MEASURED (24 GB card, m18 plugin, clean equivalence gate
+                // run, 2026-09-04): this fact is NOT answerable here, unlike
+                // PAGED_ATTENTION_MAX_PARTITIONS (which the comment this one
+                // replaced analogised to). Patch 0018 registers
+                // MOE_CPU_TIER_STATIC_PARTITION only on CompiledModel
+                // (compiled_model.cpp's property list; an ExecutionConfig
+                // option, not a Plugin-level one) -- there is no such key on
+                // `core_`/`device` at all, pre-compile.
+                // `core_.get_property(device, "MOE_CPU_TIER_STATIC_PARTITION")`
+                // always throws for this key, so the refusal that used to
+                // live here always fired -- confirmed on real hardware: the
+                // equivalence suite's own prefix-cache server refused to
+                // load with "the plugin does not report a static residency
+                // partition" even though the exact same m18 plugin, loaded
+                // moments earlier without --prefix-cache-mib, correctly
+                // logged "plugin reports a static residency partition" from
+                // the OTHER call site below, which reads `paged_model_`
+                // (the just-compiled model) instead of `core_`. The refusal
+                // is applied there now, after compilation, the only point
+                // this plugin fact is actually knowable -- see
+                // "static_partition_reported" a few hundred lines down,
+                // right after the plateau-probe-skip comment that first
+                // diagnosed this exact mismatch without anyone circling
+                // back to fix the earlier call it named.
                 props["MOE_CPU_TIER"] = true;
                 if (moe_cpu_tier_threads_ > 0)
                     props["MOE_CPU_TIER_THREADS"] = static_cast<size_t>(moe_cpu_tier_threads_);
@@ -2696,18 +2761,50 @@ private:
         for (auto& lane : lanes_) lane->embed = embeddings_.create_infer_request();
         log::info("load", "embeddings on %s", emb_dev.c_str());
 
+        // M11 §2 (DESIGN §7.0.2ag): ARCINT_DRAFT_F32, read once here and
+        // handed to both drafter compiles below -- presence-armed, like
+        // every other ARCINT_* switch in this file; the decision itself
+        // lives in draft_f32_enabled() (backend_stub.cpp), so it is testable
+        // without a card or an OpenVINO build. No default change: props
+        // stays empty unless the switch is set.
+        const bool draft_f32 = draft_f32_enabled();
+        ov::AnyMap draft_precision_props;
+        if (draft_f32) {
+            draft_precision_props[ov::hint::inference_precision.name()] = ov::element::f32;
+        }
+
+        // M11 §2 RoPE follow-up (DESIGN §7.0.2ag, rope_precision.h):
+        // applied by DEFAULT, unlike every other switch in this file --
+        // ARCINT_DRAFT_ROPE_F16 (presence-armed) is the A/B lever back to
+        // the pre-fix state (rotary subgraph left in the plugin's default
+        // f16), named for the state it restores rather than for the fix.
+        const bool apply_rope_fix = !draft_rope_f16_enabled();
+
         if (want_mtp_) {
             try {
                 const std::string layer_xml = choose_mtp_layer(artifact_, cfg.mtp_layer);
-                mtp_layer_ = core_.compile_model(layer_xml, mtp_dev);
+                // read_model() first (not a direct path compile) so the RoPE
+                // marker below has a graph to walk before the plugin's own
+                // ConvertPrecision pass runs inside compile_model().
+                auto           mtp_layer_model = core_.read_model(layer_xml);
+                const size_t   mtp_rope_marked =
+                    apply_rope_fix ? mark_rope_no_fp16_compression(mtp_layer_model) : 0;
+                mtp_layer_ = core_.compile_model(mtp_layer_model, mtp_dev, draft_precision_props);
                 read_mtp_contract(mtp_layer_, layer_xml);
-                mtp_head_  = core_.compile_model(artifact_.mtp_lm_head_xml, mtp_dev);
+                mtp_head_  = core_.compile_model(artifact_.mtp_lm_head_xml, mtp_dev,
+                                                 draft_precision_props);
                 for (auto& lane : lanes_) {
                     lane->mtp_layer = mtp_layer_.create_infer_request();
                     lane->mtp_head  = mtp_head_.create_infer_request();
                 }
                 mtp_ready_ = true;
-                log::info("mtp", "head on %s, drafting one token per step", mtp_dev.c_str());
+                log::info("mtp",
+                          "head on %s, drafting one token per step%s; rope kept f32 on %zu "
+                          "node(s)%s",
+                          mtp_dev.c_str(),
+                          draft_f32 ? " (ARCINT_DRAFT_F32: f32 inference precision)" : "",
+                          mtp_rope_marked,
+                          apply_rope_fix ? "" : " (ARCINT_DRAFT_ROPE_F16: fix disabled)");
             } catch (const std::exception& e) {
                 log::warn("mtp", "could not load the MTP head, continuing without it: %s",
                           e.what());
@@ -2726,14 +2823,25 @@ private:
                 // pre-scales with eps*pre^2 -- exact rms identities), because
                 // the raw head peaks at ~128k and f16 tops out at 65504. The
                 // GPU-f16 parity gate is cycle-exact with CPU (2026-09-01).
-                dflash_model_ = core_.compile_model(
-                    cfg.dflash + "/openvino_dflash_draft_stateful.xml", ddev);
+                // M11 §2: ARCINT_DRAFT_F32 (draft_precision_props, above)
+                // overrides this to f32 when set -- no default change. The
+                // rotary subgraph is marked separately, unconditionally
+                // (apply_rope_fix, above) -- see the MTP branch's own
+                // comment for why read_model() runs first.
+                const std::string dflash_xml =
+                    cfg.dflash + "/openvino_dflash_draft_stateful.xml";
+                auto         dflash_ir_model = core_.read_model(dflash_xml);
+                const size_t dflash_rope_marked =
+                    apply_rope_fix ? mark_rope_no_fp16_compression(dflash_ir_model) : 0;
+                dflash_model_ =
+                    core_.compile_model(dflash_ir_model, ddev, draft_precision_props);
                 if (artifact_.mtp_lm_head_xml.empty()) {
                     throw std::runtime_error(
                         "the drafter scores through the target lm_head and this artifact "
                         "carries no extracted openvino_mtp_lm_head.xml");
                 }
-                dflash_head_model_ = core_.compile_model(artifact_.mtp_lm_head_xml, ddev);
+                dflash_head_model_ =
+                    core_.compile_model(artifact_.mtp_lm_head_xml, ddev, draft_precision_props);
                 load_dflash_selector(cfg.dflash);
                 for (auto& lane : lanes_) {
                     lane->dflash_req  = dflash_model_.create_infer_request();
@@ -2750,8 +2858,13 @@ private:
                     std::memcpy(dflash_mask_embed_.data(), src.data(), src.get_byte_size());
                 }
                 dflash_ready_ = true;
-                log::info("dflash", "block-%zu drafter on %s (%zu drafts per verify pass)",
-                          dflash_block_, ddev.c_str(), dflash_block_ - 1);
+                log::info("dflash",
+                          "block-%zu drafter on %s (%zu drafts per verify pass)%s; rope kept "
+                          "f32 on %zu node(s)%s",
+                          dflash_block_, ddev.c_str(), dflash_block_ - 1,
+                          draft_f32 ? " (ARCINT_DRAFT_F32: f32 inference precision)" : "",
+                          dflash_rope_marked,
+                          apply_rope_fix ? "" : " (ARCINT_DRAFT_ROPE_F16: fix disabled)");
             } catch (const std::exception& e) {
                 log::warn("dflash", "could not load the drafter, continuing without it: %s",
                           e.what());
@@ -2774,6 +2887,30 @@ private:
             log::info("load", "drafters (embeddings/MTP/DFlash) resident: %.2f GiB",
                       static_cast<double>(drafter_bytes) / (1u << 30));
         }
+
+        // M11 §1.3 (DESIGN §7.0.2ag): `resident_with_drafters` above is
+        // read right after the drafter graphs COMPILE -- weights only, no
+        // priming has run yet -- so it never charges for the MTP layer's
+        // own stateful KV pair (KV_HEADS 4 x HEAD_DIM 256, K+V, f32, primed
+        // over the WHOLE prompt by mtp_prime_paged), which grows with n_ctx
+        // exactly like the paged KV pool itself and, uncharged, let a
+        // served MTP arm overcommit the card ("resident 22.47 GiB against a
+        // 22.46 GiB ceiling" at n_ctx 155,488). DFlash's own state is
+        // windowed to kDflashWindow (2,048 rows) and stays a small,
+        // depth-independent figure regardless of n_ctx, so it gets no term
+        // here -- see fit.h's mtp_state_bytes for the full account of why
+        // only the MTP layer needs one. Folded into the fit's own per-token
+        // rate below (never into `kv_bytes_token_` itself, which Phase E's
+        // allocation math still needs at the true KV-pool byte size).
+        //
+        // Gated on `mtp_dev == device`, not on `mtp_ready_` alone: --mtp-
+        // device can place the MTP layer's compiled graph -- and therefore
+        // its KV pair -- on a different device than the one this budget
+        // pass is sizing. Charging every device's budget for state that
+        // physically lives on only one of them double-counts it on every
+        // OTHER device and can refuse a load that would actually fit.
+        const uint64_t mtp_state_bytes_token =
+            (mtp_ready_ && mtp_dev == device) ? lgc::kMtpStateBytesPerToken : 0;
 
         // ---- ports: state tables and KV pools --------------------------------
         size_t conv_i = 0, gdn_i = 0;
@@ -3140,80 +3277,155 @@ private:
                 }
             }
 
-            if (!forced) {
-                // Device term: the plateau probe only. The analytic IR walk
-                // (slot_pool_from_ir) is not used to charge the device
-                // budget -- measured on the card, its ceiling formula lands
-                // on the HOST figure, not what the driver actually keeps in
-                // VRAM -- so it stays a future source (§2) pending a formula
-                // for the true device-resident LRU set, and is used below
-                // only for the host-side ledger.
-                bool probe_ok = true;
+            // Patch 0018 (MOE_CPU_TIER_STATIC_PARTITION, DESIGN
+            // §7.0.2ae "F2"): the plateau probe below saturates the
+            // device pool by observing EVICTION -- it relies on the
+            // driver evicting a cold slot to make room for a new one,
+            // and reads the resulting high-water mark. The static
+            // partition pins the entire device slot pool at bind time
+            // (patches/0018-moe-cpu-tier-static-partition.patch: no
+            // slot is ever evicted -- that is the whole point, it is
+            // what makes output history-independent), so under that
+            // partition every probe chunk would drive `evict_one` into
+            // its own "no evictable (unpinned) slot" throw and the load
+            // would die before this file gets a chance to run it.
+            // Detected the same READ-ONLY property key the
+            // --prefix-cache-mib refusal (below, moved here 2026-09-04)
+            // needs, but NOT the same call: patch 0018 registers
+            // MOE_CPU_TIER_STATIC_PARTITION on CompiledModel (compiled_
+            // model.cpp's own property list, ov::intel_gpu::moe_cpu_
+            // tier_static_partition is an ExecutionConfig option, not a
+            // Plugin-level one) -- there is no such key on `core_`/
+            // `device` at all, pre-compile. `core_.get_property(device,
+            // ...)` -- what the --prefix-cache-mib gate used to call,
+            // before this fix -- always throws for this key, so that
+            // refusal always fired regardless of the plugin (measured
+            // on the 24 GB card, a clean equivalence-suite run,
+            // 2026-09-04: refused with "the plugin does not report a
+            // static residency partition" even though this exact m18
+            // plugin, loaded moments earlier without
+            // --prefix-cache-mib, correctly reported it true right
+            // here). `paged_model_` -- the model this function has just
+            // finished compiling, a few lines above -- is what actually
+            // answers it, so the refusal moved to read it from this
+            // point instead.
+            //
+            // This block sits OUTSIDE `if (!forced)` on purpose: the §3.4
+            // refusal is a safety gate on the loaded plugin/config pair,
+            // not part of the sizing strategy ARCINT_FIT_SLOT_BYTES
+            // bypasses. Nesting it under `!forced` used to mean a forced
+            // slot-pool figure could load `--moe-cpu-tier
+            // --prefix-cache-mib` against a non-static (LRU) plugin with no
+            // refusal at all -- fail-open on the exact check this section
+            // exists to guarantee. `static_partition_reported` is still
+            // needed unconditionally below, forced or not, to decide
+            // whether the device-term guard a few lines down applies.
+            bool static_partition_reported = false;
+            if (moe_cpu_tier_) {
                 try {
-                    const size_t probe_blocks =
-                        (probe_floor_c + kv_block_tokens_ - 1) / kv_block_tokens_ + 1;
-                    if (probe_blocks != probe_pool_blocks) {
-                        alloc_kv_pools(rctx, probe_blocks);
-                        probe_pool_blocks = probe_blocks;
-                    }
-                    lane0.blocks.resize(probe_blocks);
-                    for (size_t i = 0; i < probe_blocks; ++i) {
-                        lane0.blocks[i] = static_cast<int32_t>(i);
-                    }
-
-                    long long high_water = 0;
-                    long long prev       = 0;
-                    int       plateaued  = 0;
-                    // A 128-token prefill routes min(num_expert, 128*top_k)
-                    // experts per layer (§2), so saturation takes few chunks;
-                    // 8 distinct-token probes is headroom over that, not a
-                    // tuning knob -- there is deliberately no flag for this
-                    // count (§3, "no probe-tuning flag: termination is a
-                    // plateau, not a count").
-                    for (int iter = 0; iter < 8 && plateaued < 2; ++iter) {
-                        zero_paged_rows(lane0);
-                        std::vector<int> ids(probe_floor_c);
-                        // Distinct ids, so routing actually varies -- the
-                        // all-zero activation probe below would hit the same
-                        // handful of experts every time and never saturate
-                        // the pool. Kept well under any real tokenizer's
-                        // vocabulary so this never indexes past the
-                        // embedding table.
-                        for (size_t i = 0; i < probe_floor_c; ++i) {
-                            ids[i] = static_cast<int>(
-                                (static_cast<size_t>(iter) * probe_floor_c + i) % 1000);
-                        }
-                        paged_forward(lane0, embed_paged(lane0, ids), 0, {0, 0}, 0);
-                        const long long now = static_cast<long long>(
-                                                  device_resident_bytes(device)) -
-                                              static_cast<long long>(resident_with_drafters);
-                        plateaued = now <= prev ? plateaued + 1 : 0;
-                        prev       = now;
-                        high_water = std::max(high_water, now);
-                    }
-                    lane0.blocks.clear();
-                    slot_pool = static_cast<uint64_t>(std::max<long long>(high_water, 0));
-                } catch (const std::exception& e) {
-                    log::warn("load", "expert slot pool plateau probe failed: %s", e.what());
-                    reset_lane_request(lane0);
-                    probe_ok = false;
+                    static_partition_reported =
+                        paged_model_.get_property("MOE_CPU_TIER_STATIC_PARTITION").as<bool>();
+                } catch (const std::exception&) {
+                    static_partition_reported = false;
                 }
-                if (probe_ok) {
-                    slot_source = "probe";
-                    log::info("load",
-                              "expert slots: plateau probe settled at %.2f GiB after "
-                              "distinct-token chunks (source: probe)",
-                              static_cast<double>(slot_pool) / (1u << 30));
-                } else if (!cfg.n_ctx_explicit) {
-                    throw std::runtime_error(
-                        "--offload-ratio > 0: the engine could not size the expert slot pool "
-                        "with a plateau probe, and no --n-ctx was given to hold it to "
-                        "explicitly. Pass --n-ctx, or drop --offload-ratio.");
+                if (cfg.prefix_cache_mib > 0) {
+                    if (const auto refusal = tier_prefix_cache_decision(
+                            static_partition_reported, moe_cpu_tier_, cfg.prefix_cache_mib)) {
+                        throw std::runtime_error(*refusal);
+                    }
+                    log::info("load", "%s",
+                              "host tier: plugin reports a static residency partition; "
+                              "the prefix cache is allowed");
+                }
+            }
+
+            if (!forced) {
+                if (!static_partition_reported) {
+                    // Device term: the plateau probe only. The analytic IR walk
+                    // (slot_pool_from_ir) is not used to charge the device
+                    // budget -- measured on the card, its ceiling formula lands
+                    // on the HOST figure, not what the driver actually keeps in
+                    // VRAM -- so it stays a future source (§2) pending a formula
+                    // for the true device-resident LRU set, and is used below
+                    // only for the host-side ledger.
+                    bool probe_ok = true;
+                    try {
+                        const size_t probe_blocks =
+                            (probe_floor_c + kv_block_tokens_ - 1) / kv_block_tokens_ + 1;
+                        if (probe_blocks != probe_pool_blocks) {
+                            alloc_kv_pools(rctx, probe_blocks);
+                            probe_pool_blocks = probe_blocks;
+                        }
+                        lane0.blocks.resize(probe_blocks);
+                        for (size_t i = 0; i < probe_blocks; ++i) {
+                            lane0.blocks[i] = static_cast<int32_t>(i);
+                        }
+
+                        long long high_water = 0;
+                        long long prev       = 0;
+                        int       plateaued  = 0;
+                        // A 128-token prefill routes min(num_expert, 128*top_k)
+                        // experts per layer (§2), so saturation takes few chunks;
+                        // 8 distinct-token probes is headroom over that, not a
+                        // tuning knob -- there is deliberately no flag for this
+                        // count (§3, "no probe-tuning flag: termination is a
+                        // plateau, not a count").
+                        for (int iter = 0; iter < 8 && plateaued < 2; ++iter) {
+                            zero_paged_rows(lane0);
+                            std::vector<int> ids(probe_floor_c);
+                            // Distinct ids, so routing actually varies -- the
+                            // all-zero activation probe below would hit the same
+                            // handful of experts every time and never saturate
+                            // the pool. Kept well under any real tokenizer's
+                            // vocabulary so this never indexes past the
+                            // embedding table.
+                            for (size_t i = 0; i < probe_floor_c; ++i) {
+                                ids[i] = static_cast<int>(
+                                    (static_cast<size_t>(iter) * probe_floor_c + i) % 1000);
+                            }
+                            paged_forward(lane0, embed_paged(lane0, ids), 0, {0, 0}, 0);
+                            const long long now = static_cast<long long>(
+                                                      device_resident_bytes(device)) -
+                                                  static_cast<long long>(resident_with_drafters);
+                            plateaued = now <= prev ? plateaued + 1 : 0;
+                            prev       = now;
+                            high_water = std::max(high_water, now);
+                        }
+                        lane0.blocks.clear();
+                        slot_pool = static_cast<uint64_t>(std::max<long long>(high_water, 0));
+                    } catch (const std::exception& e) {
+                        log::warn("load", "expert slot pool plateau probe failed: %s", e.what());
+                        reset_lane_request(lane0);
+                        probe_ok = false;
+                    }
+                    if (probe_ok) {
+                        slot_source = "probe";
+                        log::info("load",
+                                  "expert slots: plateau probe settled at %.2f GiB after "
+                                  "distinct-token chunks (source: probe)",
+                                  static_cast<double>(slot_pool) / (1u << 30));
+                    } else if (!cfg.n_ctx_explicit) {
+                        throw std::runtime_error(
+                            "--offload-ratio > 0: the engine could not size the expert slot pool "
+                            "with a plateau probe, and no --n-ctx was given to hold it to "
+                            "explicitly. Pass --n-ctx, or drop --offload-ratio.");
+                    } else {
+                        log::warn("load", "%s",
+                                  "expert slot pool unpriced; proceeding on the explicit --n-ctx "
+                                  "alone (the fit below is verify-only and cannot promise this "
+                                  "term is honest)");
+                    }
                 } else {
-                    log::warn("load", "%s",
-                              "expert slot pool unpriced; proceeding on the explicit --n-ctx "
-                              "alone (the fit below is verify-only and cannot promise this "
-                              "term is honest)");
+                    // Static partition confirmed: skip the eviction-based
+                    // probe entirely (it cannot terminate -- see the
+                    // comment above `static_partition_reported`) and price
+                    // the device term exactly, below, once the per-expert
+                    // byte count the host-side ledger computes next is
+                    // known.
+                    log::info("load", "%s",
+                              "expert slot pool: plugin reports a static residency partition; "
+                              "the plateau probe is skipped (device figure computed exactly, "
+                              "source: static)");
                 }
 
                 // Host-side ledger (GTT): informational, never charged
@@ -3231,6 +3443,20 @@ private:
                               "layer x %d layers x %.2f MiB)",
                               static_cast<double>(slot_host_bytes) / (1u << 30), ir->slots,
                               ir->moe_layers, static_cast<double>(ir->per_expert_bytes) / (1u << 20));
+                    if (static_partition_reported) {
+                        // Same total this ledger just priced as a host-side
+                        // ceiling (ir->total_bytes is itself built from
+                        // repeated expert_slot_bytes calls, one per matched
+                        // MoE layer) -- under the static partition that
+                        // ceiling IS the device-resident figure, so it is
+                        // reused verbatim rather than re-derived.
+                        slot_pool   = ir->total_bytes;
+                        slot_source = "static";
+                        log::info("load",
+                                  "expert slot pool: device figure %.2f GiB (static, exact, "
+                                  "source: ir)",
+                                  static_cast<double>(slot_pool) / (1u << 30));
+                    }
                 } else {
                     const json& tc = artifact_.config.contains("text_config") &&
                                              artifact_.config["text_config"].is_object()
@@ -3254,6 +3480,22 @@ private:
                         log::info("load",
                                   "expert slots host-side: %.2f GiB (GTT, source: config)",
                                   static_cast<double>(slot_host_bytes) / (1u << 30));
+                        if (static_partition_reported) {
+                            // Patch 0018 fix (this call site): under the
+                            // static partition the device-resident figure is
+                            // this SAME formula -- expert_slot_bytes_static
+                            // is expert_slot_bytes verbatim, named separately
+                            // only so this call site and its own test read
+                            // as pricing the device term, not the host
+                            // ceiling the line above prices.
+                            slot_pool = expert_slot_bytes_static(artifact_.n_expert, offload_ratio_,
+                                                                 per_expert_config, artifact_.n_layer);
+                            slot_source = "static";
+                            log::info("load",
+                                      "expert slot pool: device figure %.2f GiB (static, exact, "
+                                      "source: config)",
+                                      static_cast<double>(slot_pool) / (1u << 30));
+                        }
                     }
                 }
 
@@ -3273,6 +3515,27 @@ private:
                               static_cast<double>(slot_pool) / (1u << 30),
                               slot_source.empty() ? "unpriced" : slot_source.c_str(),
                               static_cast<double>(slot_host_bytes) / (1u << 30));
+                }
+
+                // A static partition pins the device slot pool by
+                // definition -- once any expert has routed even once, the
+                // plugin holds it in VRAM for good (that is what makes the
+                // output history-independent; see the comment above
+                // `static_partition_reported`). slot_pool == 0 here means
+                // this ledger's own arithmetic (the IR walk or the
+                // config-derived formula, above) could not price it -- not
+                // that the plugin has nothing pinned. Charging the device
+                // budget 0 bytes for a pool the plugin is actually filling
+                // is exactly the M7 under-count this section exists to
+                // remove, so this is a hard refusal, not a warning.
+                if (static_partition_reported && slot_pool == 0) {
+                    throw std::runtime_error(
+                        "--moe-cpu-tier: the plugin reports a static residency "
+                        "partition but this ledger could not price the device slot "
+                        "pool (neither the IR walk nor the config-derived formula "
+                        "found the model's MoE shape) -- refusing to load with an "
+                        "unpriced, but non-zero, pinned device allocation. Pass "
+                        "ARCINT_FIT_SLOT_BYTES to override with a known figure.");
                 }
             }
         }
@@ -3532,7 +3795,12 @@ private:
         fterms.slot_pool      = slot_pool;
         fterms.activations    = static_cast<uint64_t>(std::max<long long>(activation_total, 0));
         fterms.slab_per_lane  = slab;
-        fterms.kv_bytes_token = kv_bytes_token_;
+        // M11 §1.3: the real per-token KV-pool byte size, PLUS the MTP
+        // layer's own per-token state term when the MTP head is loaded --
+        // `kv_bytes_token_` itself is left untouched (Phase E's own
+        // allocation-overshoot math, further down, still needs the true
+        // KV-pool rate, not this fit-only inflation).
+        fterms.kv_bytes_token = kv_bytes_token_ + mtp_state_bytes_token;
         fterms.margin         = margin;
         fterms.lanes           = lanes;
         fterms.kv_block_tokens = static_cast<int>(kv_block_tokens_);
@@ -3858,12 +4126,28 @@ private:
                               static_cast<double>(term_total_bytes) / (1u << 30),
                               packed_values_chunk)
                 : std::string();
+        // M11 §1.3: reported next to "drafters" -- the same term folded into
+        // fterms.kv_bytes_token above, evaluated at the final `lanes *
+        // max_ctx` this line is about to print, via fit.h's own
+        // mtp_state_bytes (one formula, not a second copy of the
+        // arithmetic).
+        const uint64_t mtp_state_total_bytes =
+            mtp_state_bytes_token > 0
+                ? static_cast<uint64_t>(lanes) * lgc::mtp_state_bytes(max_ctx)
+                : 0;
+        const std::string mtp_state_clause =
+            mtp_state_bytes_token > 0
+                ? log::format(" + MTP state %.2f GiB (%.1f KiB/token)",
+                              static_cast<double>(mtp_state_total_bytes) / (1u << 30),
+                              static_cast<double>(mtp_state_bytes_token) / 1024.0)
+                : std::string();
         log::info("load",
-                  "reservation: weights+graph %.2f GiB + drafters %.2f + expert slots %.2f (%s) "
+                  "reservation: weights+graph %.2f GiB + drafters %.2f%s + expert slots %.2f (%s) "
                   "+ activations %.2f (all %d lane%s, chunk %zu)%s + margin %.2f + %d x (GDN "
                   "rows %.1f MiB + KV %.1f KiB/token) of %.2f GiB -> max ctx %lld per lane",
                   static_cast<double>(resident_base) / (1u << 30),
                   static_cast<double>(drafter_bytes) / (1u << 30),
+                  mtp_state_clause.c_str(),
                   static_cast<double>(slot_pool) / (1u << 30),
                   slot_source.empty() ? "off" : slot_source.c_str(),
                   static_cast<double>(activation_total) / (1u << 30), lanes,

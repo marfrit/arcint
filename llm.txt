@@ -339,7 +339,8 @@ server
                             undone once set
   --moe-cpu-tier            compute expert FFNs that would evict a device
                             slot on the host CPU instead (needs --offload-ratio;
-                            refuses --prefix-cache-mib > 0, DESIGN §3.4)
+                            --prefix-cache-mib > 0 is refused at load unless the
+                            plugin reports a static residency partition, DESIGN §3.4)
   --moe-cpu-tier-threads N  worker threads for that tier (0 = auto)
 
 memory

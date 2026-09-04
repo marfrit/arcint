@@ -98,6 +98,67 @@ inline uint64_t expert_slot_bytes(int num_expert, int ratio_pct, uint64_t per_ex
     return slots * per_expert_bytes * static_cast<uint64_t>(moe_layers);
 }
 
+// Patch 0018 / MOE_CPU_TIER_STATIC_PARTITION (DESIGN §7.0.2ae "F2"): under
+// the plugin's static residency partition, each expert's host-or-device
+// placement is a pure function of expert id, layer and pool configuration,
+// fixed for the life of the process. Under the LRU-mode plateau probe
+// (backend_ov.cpp Phase B), this same arithmetic -- `expert_slot_bytes`,
+// unchanged -- only ever prices a CEILING for the host-side ledger, because
+// device residency there is history-dependent and only a probe can measure
+// what is actually resident. Under the static partition that history
+// dependence is gone, so the identical count is the EXACT device-resident
+// figure, not an estimate. Named separately from `expert_slot_bytes` only so
+// the load-time call site and this function's own test read as "the static-
+// mode device figure" rather than "the LRU-mode host ceiling that happens to
+// share arithmetic" -- the formula is deliberately the same one. The
+// signature carries no probe/eviction/history state (there is nothing to
+// carry): num_expert, ratio_pct, per_expert_bytes and moe_layers are the
+// whole input, so this is a pure function of configuration alone, same as
+// `expert_slot_bytes` itself.
+inline uint64_t expert_slot_bytes_static(int num_expert, int ratio_pct, uint64_t per_expert_bytes,
+                                         int moe_layers) {
+    return expert_slot_bytes(num_expert, ratio_pct, per_expert_bytes, moe_layers);
+}
+
+// M11 §1.3 (DESIGN §7.0.2ag, "the fix design: MTP's verify cost and zero
+// acceptance at depth"): the MTP layer's own state -- `mtp_layer`, driven by
+// mtp_prime_paged in backend_ov.cpp -- is a STATEFUL paged KV pair,
+// KV_HEADS 4 x HEAD_DIM 256 (tools/export_mtp.py:31), K+V, f32, and it is
+// primed over the WHOLE prompt, not a bounded window: 4 * 256 * 2 * 4 bytes
+// = 8 KiB per token, per lane. Pre-fix, `drafter_bytes` in backend_ov.cpp
+// (the resident delta taken right after the drafters COMPILE) charged only
+// the drafter graphs' WEIGHTS -- priming had not run yet at that point, so
+// this per-token growth was charged nowhere, and a served MTP arm could
+// overcommit the card (measured: "resident 22.47 GiB against a 22.46 GiB
+// ceiling" at the admitted n_ctx 155,488, DESIGN's own §1.3 finding 3).
+//
+// DFlash's own drafter state is deliberately NOT priced by this function:
+// it is windowed to kDflashWindow (2,048 rows, backend_ov.cpp / see
+// tests/test_dflash_window.cpp) and so stays a small, DEPTH-INDEPENDENT
+// ~84 MiB regardless of n_ctx -- unlike the MTP layer, it never needs a
+// per-token term at all, which is exactly why this fix touches only one of
+// the two drafters.
+//
+// `mtp_state_bytes_per_token` is folded into the FIT'S OWN per-token rate
+// at the backend_ov.cpp call site (added to a local copy of
+// FitTerms::kv_bytes_token, never to the real `kv_bytes_token_` member
+// Phase E's allocation math still needs at the true KV-pool byte size) --
+// the same "per lane, per token" shape kv_bytes_token already has, so
+// fit_context's existing `budget / kv_bytes_token / lanes` division prices
+// it exactly where the design's §3 Fix A asks: subtracted before max_ctx is
+// derived, not after.
+constexpr uint64_t kMtpStateBytesPerToken = 8192;  // 4 heads * 256 head_dim * 2 (K+V) * 4B (f32)
+
+// Pure arithmetic mirror of the term above, for tests and for the
+// reservation log line (backend_ov.cpp reports this next to "drafters"):
+// bytes for `n_ctx` tokens of ONE lane's MTP state. `n_ctx <= 0` is "nothing
+// primed yet" and returns 0, matching every other term in this file that
+// treats a non-positive extent as absent rather than as an error.
+inline uint64_t mtp_state_bytes(long long n_ctx) {
+    if (n_ctx <= 0) return 0;
+    return static_cast<uint64_t>(n_ctx) * kMtpStateBytesPerToken;
+}
+
 // M8 bug 1 (docs/design-m8-asymmetric-kv.md §3, first pickup check):
 // backend_ov.cpp used to sum `ov::element::Type::size()` per KV pool port,
 // and `size()` ceils a sub-byte width to a whole byte -- an i4 port reads

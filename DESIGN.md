@@ -3314,6 +3314,15 @@ For the decision in §8 the served number is the one that counts: at 76k
 a verify cycle costs four plain steps on this path, not two. What none
 of this says is why either drafter accepts nothing at 76k.
 
+RETRACTED (§7.0.1): the 445 ms vs 209 ms comparison above compared two
+different compiled graphs (the served MTP arm's own graph against a
+separate profiling harness), one of them under a PERF_COUNT-inflated
+wall clock — not like-for-like, and the "open" gap it left is not a
+question about this depth's own cost. See §7.0.2ag for the corrected,
+clean-instrumentation measurement (the plain arm decodes at 15.3 t/s
+at both 8.9k and 76k) and the mechanism this section could not yet
+name.
+
 #### 7.0.2ac Patch 0015: the attention scratch bounded, and the crash it uncovered (2026-09-03)
 
 The operator chose the plugin-side fix over the engine's honest but
@@ -3701,6 +3710,132 @@ measured was one process history, not a claim about any history. F0
 removes only the cross-restore axis; §3.4 stays violated with the
 tier on until F1 (patch 0018).
 
+**Update (2026-09-04): F1 retired on review; patch 0018 ships as F2
+instead.** A code review found F1 as described above — promoting patch
+0011's `moe_cpu_expert_ref_gpu_emul` oracle to a served, bit-equal host
+kernel — not attainable at reasonable cost: the device GPU kernel
+applies scale and zero-point per lane inside its own reduction loop,
+and the cross-lane and cross-group reduction that follows runs in an
+order the plugin does not document as fixed — a tree, not a serial
+left-to-right accumulation — so a host reference cannot be made to
+match it bit-for-bit without reproducing that same undocumented tree.
+This is the review's finding, stated here as such and **not** an
+independently re-measured fact in this repository; nothing in this
+section's own E1/E2 measurements bears on it, and no build attempting
+the bit-equal kernel has been benchmarked or rejected on cost grounds
+in this tree. It supersedes only the "fix of record" framing above,
+not the diagnosis (the LRU-residency mechanism and the E1/E2 exoneration
+of the cache and the restore path stand).
+
+Patch 0018 ships as **F2** instead: not a bit-equal kernel, but a
+*static residency partition* — each expert's host-or-device placement
+becomes a pure function of expert id, layer, and pool configuration,
+fixed for the life of the process, so it never depends on request
+history and the arithmetic split it feeds cannot vary within one
+configuration. The detection contract follows the same shape as patch
+0015's `PAGED_ATTENTION_MAX_PARTITIONS` key (§7.0.2ac): a read-only
+GPU-plugin property, `MOE_CPU_TIER_STATIC_PARTITION`, that the plugin
+reports `true` if and only if the served tier's host/device split is
+that static partition, and reports `false` or omits the property
+otherwise. arcint queries this property at load and lifts the
+`--prefix-cache-mib` refusal for `--moe-cpu-tier` only when it reads
+`true`; the property's absence, or a `false` reading, keeps the
+refusal — fail closed, the same ladder F0 shipped in.
+
+**Update (2026-09-04): written, and the allow branch is now verified —
+after fixing three more load-time bugs the property alone did not
+predict.** Patch 0018 exists (`patches/0018-moe-cpu-tier-static-partition.patch`,
+13 files); the equivalence suite's own reach for it, plus a review pass
+after the first passing run, exposed three further defects before the
+mechanism could be trusted, none a numerics problem, all load-time
+sequencing or reporting bugs distinct from the LRU-residency diagnosis
+this section opened with:
+
+- **The plateau probe crashes under a 100%-pinned pool.** arcint's
+  device-pool sizing probe (used when no forced size is given) saturates
+  the pool by observing eviction; the static partition pins every slot at
+  bind time and evicts nothing, so the probe's first chunk always hit
+  `LRUCache::evict_one`'s "no evictable (unpinned) slot" throw and the
+  load died before this section's own detection logic ever ran. Fixed by
+  skipping the probe when `MOE_CPU_TIER_STATIC_PARTITION` reads `true`
+  and pricing the device figure instead from arcint's own host-side
+  ledger — the same IR-walk (`slot_pool_from_ir`) or config-derived
+  per-expert-bytes formula the host (GTT) estimate already computes,
+  reused verbatim as the device charge under a static partition, since
+  that ceiling IS what the pinned pool holds (`backend_ov.cpp`, logged as
+  `source: static`). Nothing here calls the plugin's own
+  `resident_slot_count()` — that count lives inside patch 0018's C++
+  (`static_partition.hpp`/the OTD_PERF log line) and stays there; arcint's
+  figure is an independent formula over the same model shape, not a read
+  of the plugin's own number, and nothing today cross-checks the two
+  agree.
+- **The prefill fallback path has the identical crash, one call site
+  over.** `OffloadExpertWeightProvider::acquire_one` — the per-expert path
+  `exec_prefill_onednn` falls back to — had no static-partition awareness
+  at all and unconditionally called the ordinary LRU insert-or-evict path,
+  hitting the same all-pinned throw the plateau probe did. Fixed in the
+  plugin: `acquire_one` (the abstract interface and both concrete
+  providers) now returns `std::optional<size_t>`; a non-resident expert
+  reaching this path returns `nullopt` and the caller falls back to
+  `moe_cpu_expert()` inline per token instead of assuming a device slot is
+  always obtainable.
+- **The refusal gate itself queried the wrong object.** The paragraph
+  above, as first written, read `MOE_CPU_TIER_STATIC_PARTITION` via
+  `core_.get_property(device, ...)` — a device-level call made before any
+  model is compiled. Patch 0018 registers that property only on
+  `CompiledModel` (an `OV_CONFIG_RELEASE_OPTION`, not a Plugin-level
+  entry — unlike `PAGED_ATTENTION_MAX_PARTITIONS`, which genuinely is
+  dual-registered at both levels, the analogy this section drew on
+  originally). The device-level call always throws for this key, folds to
+  `false`, and the refusal fired unconditionally regardless of whether
+  0018 was present — measured directly: the equivalence suite's own
+  prefix-cache server refused to load with "the plugin does not report a
+  static residency partition" in the same process class that, moments
+  earlier without `--prefix-cache-mib`, correctly logged the property as
+  `true` from the plateau-probe-skip's own (already-correct) query of
+  `paged_model_` after compilation. Fixed by moving the refusal to that
+  same post-compile call site, reusing the value it already computes
+  correctly, rather than adding a second query.
+- **The property itself never checked whether the tier was even on.**
+  `MOE_CPU_TIER_STATIC_PARTITION`'s own default (`options.inl`) is a
+  context-free lambda, evaluated once per `ExecutionConfig` construction
+  with no way to see whether this exact compile turns `MOE_CPU_TIER` on,
+  so it reported `true` (the F2 rule "in effect") for every load, tier on
+  or off, contradicting its own doc comment and every "if and only if"
+  reading of it in this document. Found in a review pass after the first
+  passing gate run, before commit. Fixed in the plugin's
+  `ExecutionConfig::finalize_impl` (`execution_config.cpp`), where
+  `get_moe_cpu_tier()` already answers correctly for this compile:
+  `if (!get_moe_cpu_tier()) { m_moe_cpu_tier_static_partition = false; }`.
+  Red-first: a new device-free gtest confirmed red against the unfixed
+  tree (`Expected: false` / `Actual: true`) and green after — see the
+  patch header for the full write-up, including two things this same
+  review pass looked at and found were NOT bugs (a routing-weight layout
+  question in the prefill fallback, and a blocking-copy synchronization
+  question), plus one it found but left unfixed as out of reach in any
+  configuration arcint actually drives today.
+
+With all four fixed, `tests/equivalence/run.sh` was run for real against
+the 35B cpu-tier configuration with `--moe-cpu-tier --prefix-cache-mib
+4096 --kv-block-size 32` on the 24 GB card, m18 plugin, in a clean,
+uncontaminated run:
+
+    ok   warm cache output is byte-identical to cold
+    ok   the console reports a cache hit (cache hit 192 tok (81.7%))
+    ok   a continuation of a cached prompt also hits
+    ok   a continuation restored from cache matches a cold run
+
+**Pass.** This is the check this section exists to fix; the allow branch
+is verified on real hardware, not asserted. Everything else in that run
+passed as well except one check unrelated to this mechanism —
+`speculative decoding is deterministic across runs` (an n-gram lookup
+drafter, `--draft 4 --draft-ngram 3`, no MoE routing involved) — which
+passed in an earlier clean run of the same suite and failed in this one;
+recorded as an open, separate item (§7.0.1: a flake between two
+otherwise-identical runs, not touched by anything in this section, not
+yet re-run enough times to characterise). Production was confirmed
+restored and health-checked after every load in this sequence.
+
 #### 7.0.2af M14: the readback decomposed — the 283 µs was queue backlog, not transfer (2026-09-04)
 
 The design note owed by §7.0.2x's own "next instrument, named and not
@@ -3726,6 +3861,40 @@ pages only), so a low `fincore` figure does not establish a cold cache
 one way or the other. What the window's own counters still carry,
 unretracted: `avg_disk_io` read 52 µs over 265k tensor loads, 13.8 s
 of disk time per 128 tokens.
+
+RETRACTED, second and larger finding (§7.0.1, kept on the record
+rather than silently corrected): every decode-RATE number in this
+section — the four in the first window, the six in the clean rerun,
+and the 2.6/5.0 t/s pair below — is void as a P\* number. arcint has
+read the expert device-pool budget from `ARCINT_MOE_DEVICE_POOL_BYTES`
+since the M7 auto-fit commit (parsed strictly and handed to the plugin
+as the numeric property `MOE_OTD_DEVICE_POOL_BYTES`; the M8 review
+removed the old behaviour of forwarding the raw env string, because
+the plugin's own `stoull` silently mis-parsed typos). Every tier
+window this section records exported the OLD, no-longer-forwarded
+variable, so the plugin ran with its own default device pool for all
+of it and the expert slots lived in host memory throughout: arcint's
+own load line said so ("expert slots host-side: 7.50 GiB (GTT, source:
+config)", "expert slot pool: device figure 0.12 GiB (probe)"), and the
+runtime's own allocation log confirmed it (`BUFFER_HOST_MEMORY`
+10.0 GiB in 533 allocations against `BUFFER` `LocalMemory` 3.2 GiB;
+the kernel's own accounting: 2.05 GB VRAM used, 8.87 GB GTT). §7.0.2x's
+own record predates this rename and ran with the real 8 GiB device
+pool; this section's own cells are §7.0.2x's own GTT-spill regime
+("ratio 20 spills into GTT, 2.1 t/s") under a different model and
+ratio, not the reference cell, and every decode rate this section
+quotes is retracted as a P\* number for that reason. The in-build
+comparisons stand unretracted: the `usm_host` destination cutting
+289 µs to 53 µs, the hoist being a null, the 3.5 ms per-layer queue
+backlog, the counters' own internal identities, and the byte-identity
+across all arms — every arm in this section shared the same wrong
+pool, so the comparisons BETWEEN arms are unaffected by which pool
+that was. A solo run with the correct variable, both units stopped,
+files pre-read, reproduces the record within its own run-to-run
+spread (see the reproduction paragraph below) and replaces the
+rates above. Lesson for the record, one sentence: every tier
+measurement window must export `ARCINT_MOE_DEVICE_POOL_BYTES`, not
+the retired raw variable.
 
 **Decode rates, and why the first window's numbers do not replace the
 record on their own.** Tier OFF 2.4/2.6 t/s; pre-0017 tier ON 4.6/4.8;
@@ -3816,20 +3985,39 @@ build. Host compute per expert across this window: pre-0017 683 µs
 then 430 µs (its own two separate processes), 0017 421, NOHOIST 446,
 the drain probe 557.
 
-**The open discrepancy, stated plainly.** At this cell tier-OFF is
-2.6 t/s and tier-ON 5.0, against §7.0.2x's own 10.4/10.6 and
-15.0/15.5, measured 2026-09-02. Not explained by host load (this
-window's own host was quiet), CPU clocks (3.7 GHz, the performance
-governor), or the PCIe link (the 16 GiB card sits behind a PCIe 3.0 x4
-link in both boots, the earlier and this one). The two cells also
-differ in prompt length — 897 tokens for §7.0.2x's own record, 1,198
-here — named as a difference between the two cells, not tested as an
-explanation. The expert-fetch counters dominate the token at this
-cell — `total_disk_io` ≈ 9.3 s and `total_gpu_copy` ≈ 9 s per 128
-tokens, 265k tensor loads at 34–35 µs each — and §7.0.2x's own record
-does not carry those two totals to compare against. Left open; the
-next tier window must record them alongside the decode rate, not
-after it.
+**The discrepancy, explained.** At this cell tier-OFF read 2.6 t/s
+and tier-ON 5.0, against §7.0.2x's own 10.4/10.6 and 15.0/15.5,
+measured 2026-09-02 — not a regression and not an open question: the
+retraction above names the cause. Every process in this section ran
+with the plugin's own default device pool, not the intended 8 GiB
+one, because `ARCINT_MOE_DEVICE_POOL_BYTES` (the env var arcint has
+used to set it since the M7 auto-fit commit) was never exported this
+window; the expert slots therefore lived in host memory (GTT)
+throughout, the same GTT-spill regime §7.0.2x's own record already
+describes and prices ("ratio 20 spills into GTT, 2.1 t/s"). Host
+load, CPU clocks and the PCIe link were checked against this cell and
+are withdrawn from the record as candidates — not the cause, and no
+longer needed now the cause is named. The prompt-length difference
+between the two cells (897 tokens for §7.0.2x's own record, 1,198
+here) stays named as a difference, not an explanation — it was never
+ruled in or out, and the pool finding above does not depend on it
+either way.
+
+**Reproduction at the true pool, measured.** A solo run with
+`ARCINT_MOE_DEVICE_POOL_BYTES` set to the intended 8 GiB budget, both
+production units stopped, the 35B's own files read once before the
+run (page cache warm by construction, not inferred from `fincore`):
+16 GiB card, ratio 50, u8 KV, n_ctx 65,536, the 1,198-token prompt, 64
+greedy tokens twice per process, the 0017 plugin. Loads in 25 s (not
+the 5–9 minutes the earlier, wrong-pool windows took). Tier OFF
+9.2/9.4 t/s; tier ON 11.0/15.3 t/s; the two arms byte-identical to
+each other. OTD counters: hit rate 59.5% OFF against 44.4% ON, 17,972
+host pairs, average host compute 687 µs; ZFS ARC misses flat for the
+whole run. Against §7.0.2x's own record — 10.4/10.6 OFF, 15.0/15.5 ON
+— this reproduces within the run-to-run spread: the discrepancy this
+section opened is closed. The 0017 in-build comparisons above stand
+exactly as recorded; their own absolute rates were taken at the wrong
+pool and are labelled so throughout this section, not restated here.
 
 **Equivalence.** Tier OFF, 0017 tier ON and 0017 with the drain probe
 are byte-identical to each other over the 64 greedy tokens in the
@@ -3844,6 +4032,165 @@ residency histories, one that forked and one that did not, both
 consistent with §7.0.2ae's own reading (history-dependent, not
 always-forking). Every tier-on log across both windows carries
 exactly forty `cpu_tier on:` lines (fusion unchanged).
+
+#### 7.0.2ag M11: the step profile at depth — the drafter's own state at the ceiling, and an f16 position overflow at 65,504 (2026-09-04)
+
+The step profile owed since §7.0.2aa left the 76k verify cost
+unexplained and both drafters at zero acceptance. New instrumentation,
+`ARCINT_PROFILE_CYCLE` (one log line per decode cycle: propose and
+verify terms, accepted count, cycle wall) plus the served decode
+line's own propose/verify terms, committed `fe4d3df`. Measured: the
+dense 27B agent artifact, 24 GB card, u8 KV, one lane, auto-fit depth,
+prefix cache off, a chat request, 400 greedy tokens, one process per
+arm and depth.
+
+**8.9k tokens.** Plain 15.3 t/s (forward ≈ 62 ms). MTP 7.3 t/s, 115
+cycles, `n` = 2, 0.85 accepted per cycle (85%), propose 27 ms (layer
+18, head 7), verify infer 206 ms, cycle 253 ms. DFlash 6.0 t/s, 123
+cycles, `n` = 8, 0.73 accepted per cycle, propose 68 ms, verify infer
+215 ms, cycle 287 ms.
+
+**76k (77,134 prompt tokens).** Plain 15.3 t/s (forward ≈ 65 ms) — the
+same rate as 8.9k; depth costs the base graph nothing at this shape.
+MTP 1.1 t/s, 372 cycles, 0 of 372 accepted, propose 140 ms (layer 98,
+head 23), verify infer 761 ms and bimodal (min 441, median 552, p75
+923, p95 1,622, max 1,754 — the spikes come in pairs every 10–12
+tokens and move with the MTP layer's own infer time, correlation 0.84
+at 76k against 0.29 at 8.9k), cycle 902 ms. DFlash 5.1 t/s, 0 of 2,604
+accepted, propose 20 ms, verify infer 176 ms and FLAT (171–176 across
+the run — cheaper than its own 8.9k figure), cycle 198 ms. Greedy
+output is byte-identical across all three arms at both depths — the
+M11 equivalence gate holds at depth, so what follows is a cost and
+acceptance problem, not a correctness one.
+
+**Mechanism: the MTP state at the ceiling** (the investigating design
+note's own reading, marked as such until the verification window
+below lands). The MTP layer's own KV state is stateful and unpaged —
+4 heads × 256 × (K+V) × f32 = 8 KiB per token — primed over the whole
+prompt: 0.59 GiB at 77,134 tokens, 1.19 GiB at the 155,488 tokens this
+arm's own auto-fit admits. The reservation's drafter term is a
+weights-only residency delta, blind to this per-token growth, so the
+arm logs `resident 22.47 GiB against a 22.46 GiB ceiling` — over its
+own stated budget by construction, not by drift. The periodic spikes
+in the verify-infer distribution are read as the eviction cost of
+carrying that overcommitted state past the ceiling. DFlash's own state
+is a fixed `kDflashWindow` = 2,048-row window (~84 MiB) and does not
+grow with depth, which is why its own verify is flat and, at 76k,
+cheaper than at 8.9k. At 8.9k the MTP state is 71 MiB and fits inside
+the margin — the same mechanism, just not yet over the edge, which is
+consistent with the 8.9k arm being merely expensive (3.2× plain)
+rather than broken.
+
+**Mechanism: zero acceptance, an f16 position overflow.** Both
+drafters compute their own rotary embedding in-graph from the absolute
+position parameter, with `inv_freq[0] = 1.0`, and neither is compiled
+with a precision hint — both run under the GPU plugin's default
+`INFERENCE_PRECISION_HINT=f16`, which overflows at 65,504. The base
+model's own rotary survives at the same depth because its position
+chain is `ShapeOf`-derived and the plugin's own mixed-precision
+marking keeps that subgraph at f32; the drafters, with no such
+marking, do not get it. Bisected (MTP arm, one process per cell): at
+60,333 tokens, 78% accepted (89 of 114), 3.5 t/s; at 70,403 tokens, 0
+of 148 accepted, 1.5 t/s — a cliff between the two, not a decay,
+consistent with a hard value boundary rather than a trained-range
+falloff. Falsified on the way, each checked rather than assumed: rope
+tables sized for an unextended max position (no such tables exist —
+the angle is computed in-graph, not read from a materialised table);
+a `rope_scaling` asymmetry between the base and either drafter
+(neither declares one); a 16-bit index somewhere on the host-side
+position or block-table path (none — the relevant fields are `size_t`
+or `int32_t` throughout); an exporter-side `rt_info` marking meant to
+carry the base's own f32 rotary hint into the drafter graphs (does not
+survive `save_model` in this OpenVINO build, and the base itself
+carries no such marking to copy in the first place).
+
+**Correcting the record (§7.0.1): the "445 vs 209 ms" comparison in
+§7.0.2aa was not like-for-like.** The 445 ms figure was the served
+MTP arm's own compiled graph (which adds a `hidden_states` Result and
+a wider logits slice the plain arm does not carry); the 209 ms figure
+came from a separate profiling harness under `ARCINT_PROFILE`, which
+also enables `ov::enable_profiling` — and PERF_COUNT inflates wall
+clock, a caveat this file already states elsewhere and had not applied
+here. Different graphs, one of them under an instrumentation tax: the
+comparison is retracted, not the underlying cost. This window's own
+clean measurement supersedes it: the plain arm decodes at 15.3 t/s at
+both 8.9k and 76k — the served forward itself does not slow with
+depth at this shape; every cost this section attributes to depth is
+in the drafters, not the base graph.
+
+**The gate, restated.** MTP with one draft per step can accept at most
+2 tokens per cycle, so the 3.13-tokens-per-cycle criterion on the M11
+row is DFlash's own break-even (198/63.3 ms) and must not be applied
+to MTP unchanged; MTP's own break-even is a cycle wall under roughly
+130 ms at 76k — a bar the state-term fix below has not yet been
+measured against.
+
+**Fixes implemented, arcint side, this repository.** The MTP-state
+reservation term: 8 KiB per token folded into the per-token KV term at
+the drafter's own reservation line, so the admitted context now
+subtracts it before max-ctx is derived — computed by hand at this
+section's own fixture constants, max_ctx falls from 1,172,016 to
+686,192 with the term applied, the arm's true, bounded ceiling, not the
+unbounded one the weights-only delta used to report. The unit test
+(`tests/test_fit.cpp`,
+`mtp_reservation_term_shrinks_admitted_ctx_by_at_least_the_derivative`)
+does not assert this exact pair of numbers; it asserts the general
+property they are one instance of — the reduction in max_ctx is at
+least the per-token term's own derivative bound at the depth actually
+admitted — and a companion test
+(`a_fixed_weights_only_charge_fails_the_derivative_bound`) proves the
+old, wrong shape (a fixed weights-only delta) fails that same bound.
+`ARCINT_DRAFT_F32=1`: the
+whole drafter compiled at f32, the coarse discriminator for the
+overflow mechanism above. The rotary marking: the rotary subgraph of
+each drafter graph (16 nodes in the MTP layer, 6 in DFlash — the angle
+chain through `cos`/`sin`) marked with `ov::disable_conversion` after
+`read_model`, on by default; `ARCINT_DRAFT_ROPE_F16=1` disables it for
+comparison. None of these three change default behaviour beyond the
+reservation term itself, which is a refusal (a smaller admitted
+context), not a new code path.
+
+**Verification window, measured.** Same cell as above; the build
+carries all three fixes, rotary marking on by default.
+
+At 70,403 tokens: MTP with the rotary fix disabled
+(`ARCINT_DRAFT_ROPE_F16=1`) — 0 of 148 accepted, 5.1 t/s, verify
+157 ms per cycle; the eviction spikes are gone (the MTP-state
+reservation term alone took the verify cost from 581 to 157 ms) but
+acceptance stays zero, isolating the two mechanisms from each other.
+MTP default (rotary kept f32, 16 nodes marked) — 80.5% accepted (66
+of 82), 7.9 t/s, output byte-identical to plain. MTP with
+`ARCINT_DRAFT_F32=1` (the whole drafter compiled f32) — acceptance
+returns (1 accepted per cycle over the 29 cycles run) at a
+prohibitive 6.3 s per cycle (propose 520 ms, verify infer 5.8 s — the
+f32 state doubles to 16 KiB per token and re-crosses the ceiling the
+MTP-state term was built to catch), stopped after 29 cycles as
+sufficient evidence rather than run to completion. DFlash default (6
+nodes marked) — 27.5% accepted (98 of 357), 15.5 t/s against plain's
+15.3, byte-identical.
+
+At 77,134 tokens, with the MTP-state term now charged: `n_ctx` clamps
+to the admissible 127,536 (was 155,488 unclamped; the reservation
+line reads "MTP state 0.97 GiB (8.0 KiB/token)", no ceiling overshoot
+this time). MTP default — 90.8% accepted (177 of 195), 4.9 t/s
+(verify 58.2 s over 195 cycles ≈ 298 ms, propose ≈ 54 ms per cycle,
+cycle ≈ 390 ms against MTP's own ~130 ms break-even) — MTP still
+loses to plain's 15.3 t/s at this depth even with every draft
+accepted, because its own two-token ceiling cannot outrun a 390 ms
+cycle. DFlash default — 40.6% accepted (276 of 679), 18.8 t/s, above
+plain, about 4.4 tokens per verify cycle: the M11 gate (> 3.13
+tokens per verify cycle on the 24 GB card, byte-exact drafter on vs
+off) PASSES at 76k with DFlash. Both arms are byte-identical to plain
+(sha equal) at both depths.
+
+**The decision input, stated plainly, as a recommendation and not a
+change made.** On this artifact MTP never beats plain decoding at any
+depth measured — 7.3 against 15.3 t/s at 8.9k, 3.5 t/s at 60k before
+the fixes, 4.9 t/s at 76k with every fix landed — while DFlash loses
+at 8.9k (6.0 t/s) and wins at 76k (18.8 t/s). The §8 "depth-gated
+drafter" item can now be decided from data rather than deferred:
+DFlash with a depth gate (or plain below the crossover), MTP off for
+this artifact.
 
 #### 7.0.2r DFlash2: the external-drafter hook gets a real drafter (2026-09-01)
 

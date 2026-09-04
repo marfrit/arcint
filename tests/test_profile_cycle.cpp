@@ -5,6 +5,8 @@
 
 #include "harness.h"
 
+using lgc::draft_f32_enabled;
+using lgc::draft_rope_f16_enabled;
 using lgc::format_profile_cycle_line;
 using lgc::profile_cycle_enabled;
 
@@ -18,6 +20,52 @@ TEST(profile_cycle_on_when_set) {
     CHECK(profile_cycle_enabled());
     unsetenv("ARCINT_PROFILE_CYCLE");   // leave no trace for the next case
     CHECK(!profile_cycle_enabled());
+}
+
+// M11 §2 (DESIGN §7.0.2ag): ARCINT_DRAFT_F32 is presence-armed, the same
+// idiom as ARCINT_PROFILE_CYCLE above -- the env VALUE is never read, only
+// whether the variable is set. This is the pure half of the switch
+// (draft_f32_enabled(), backend_stub.cpp); what backend_ov.cpp does with a
+// `true` result (fold ov::hint::inference_precision(f32) into both drafter
+// compiles' ov::AnyMap) needs an OpenVINO build and a card, and is not
+// under test here -- see the design's own "test the helper that maps the
+// env to the property set, not the compile."
+TEST(draft_f32_off_by_default) {
+    unsetenv("ARCINT_DRAFT_F32");
+    CHECK(!draft_f32_enabled());
+}
+
+TEST(draft_f32_on_when_set) {
+    setenv("ARCINT_DRAFT_F32", "1", 1);
+    CHECK(draft_f32_enabled());
+    unsetenv("ARCINT_DRAFT_F32");   // leave no trace for the next case
+    CHECK(!draft_f32_enabled());
+}
+
+TEST(draft_f32_armed_regardless_of_value) {
+    // Presence-armed: an empty value still counts as set (POSIX setenv with
+    // an empty string still creates the variable, distinct from unset).
+    setenv("ARCINT_DRAFT_F32", "", 1);
+    CHECK(draft_f32_enabled());
+    unsetenv("ARCINT_DRAFT_F32");
+    CHECK(!draft_f32_enabled());
+}
+
+// M11 §2 RoPE follow-up (DESIGN §7.0.2ag): ARCINT_DRAFT_ROPE_F16 is also
+// presence-armed, like every switch above -- but unlike them it is the
+// lever back to the PRE-fix state (the RoPE marker is applied by default;
+// setting this switch turns that back off for the A/B), which is why its
+// own name names the state it restores rather than the fix itself.
+TEST(draft_rope_f16_off_by_default) {
+    unsetenv("ARCINT_DRAFT_ROPE_F16");
+    CHECK(!draft_rope_f16_enabled());
+}
+
+TEST(draft_rope_f16_on_when_set) {
+    setenv("ARCINT_DRAFT_ROPE_F16", "1", 1);
+    CHECK(draft_rope_f16_enabled());
+    unsetenv("ARCINT_DRAFT_ROPE_F16");
+    CHECK(!draft_rope_f16_enabled());
 }
 
 TEST(profile_cycle_line_names_every_segment) {

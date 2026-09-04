@@ -221,6 +221,10 @@ const char* finish_reason_name(FinishReason r) {
 
 bool profile_cycle_enabled() { return std::getenv("ARCINT_PROFILE_CYCLE") != nullptr; }
 
+bool draft_f32_enabled() { return std::getenv("ARCINT_DRAFT_F32") != nullptr; }
+
+bool draft_rope_f16_enabled() { return std::getenv("ARCINT_DRAFT_ROPE_F16") != nullptr; }
+
 std::string format_profile_cycle_line(size_t past, size_t n, size_t accepted, double propose_ms,
                                       double propose_embed_ms, double propose_mask_ms,
                                       double propose_layer_ms, double propose_head_ms,

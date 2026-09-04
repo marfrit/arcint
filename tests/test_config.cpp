@@ -580,11 +580,21 @@ TEST(config_moe_cpu_tier_rejects_garbage) {
 // depends on the process's request history -- the expert LRU residency
 // selects device f16 vs host f32 arithmetic, and the two are not bit-equal --
 // so a continuation restored from the prefix cache is not byte-identical to
-// a cold run. That is a measured DESIGN §3.4 violation, so the combination
-// must fail loud until the host kernel is made bit-equal to the device GEMV.
-TEST(config_moe_cpu_tier_rejects_prefix_cache) {
-    CHECK(rejected({"--stub", "--offload-ratio", "20", "--moe-cpu-tier",
-                    "--prefix-cache-mib", "512"}));
+// a cold run. That USED to be a config-parse-time refusal (DESIGN §3.4,
+// §7.0.2ae's F0). Since plugin patch 0018 the answer depends on a
+// GPU-plugin property (MOE_CPU_TIER_STATIC_PARTITION) that only exists once
+// the backend's executor is up: config parsing cannot query it, so it now
+// accepts the combination unconditionally, and backend_ov.cpp's load path
+// (tier_prefix_cache_decision, tested below) makes the call instead. (F1, a
+// bit-equal host kernel, was retired by review -- see the design note this
+// repository's DESIGN.md §7.0.2ae records; 0018 ships as F2, a static
+// residency partition, instead.)
+TEST(config_moe_cpu_tier_accepts_prefix_cache_at_parse) {
+    Config cfg;
+    CHECK(run({"--stub", "--offload-ratio", "20", "--moe-cpu-tier",
+               "--prefix-cache-mib", "512"}, cfg).ok);
+    CHECK(cfg.moe_cpu_tier);
+    CHECK_EQ(cfg.prefix_cache_mib, 512);
 }
 
 TEST(config_moe_cpu_tier_accepts_prefix_cache_at_zero) {
@@ -593,6 +603,40 @@ TEST(config_moe_cpu_tier_accepts_prefix_cache_at_zero) {
                "--prefix-cache-mib", "0"}, cfg).ok);
     CHECK(cfg.moe_cpu_tier);
     CHECK_EQ(cfg.prefix_cache_mib, 0);
+}
+
+// tier_prefix_cache_decision's own four corners (DESIGN §7.0.2ae, plugin
+// patch 0018): this is the pure function backend_ov.cpp's load path now
+// calls where config.cpp's old refusal used to sit. It refuses exactly one
+// corner -- the tier on, a prefix cache actually requested, and the plugin
+// NOT reporting a static (history-independent) residency partition -- and
+// allows every other corner, including a false static-partition report when
+// there is nothing to guard (tier off, or no cache requested).
+TEST(tier_prefix_cache_decision_tier_off_allows_regardless_of_static_partition) {
+    CHECK(!tier_prefix_cache_decision(/*static_partition_reported=*/false, /*tier_on=*/false,
+                                       /*prefix_cache_mib=*/512)
+               .has_value());
+}
+
+TEST(tier_prefix_cache_decision_no_cache_allows_regardless_of_static_partition) {
+    CHECK(!tier_prefix_cache_decision(/*static_partition_reported=*/false, /*tier_on=*/true,
+                                       /*prefix_cache_mib=*/0)
+               .has_value());
+}
+
+TEST(tier_prefix_cache_decision_tier_and_cache_without_static_partition_refuses) {
+    const auto reason =
+        tier_prefix_cache_decision(/*static_partition_reported=*/false, /*tier_on=*/true,
+                                    /*prefix_cache_mib=*/512);
+    CHECK(reason.has_value());
+    CHECK(reason->find("§3.4") != std::string::npos);
+    CHECK(reason->find("static residency partition") != std::string::npos);
+}
+
+TEST(tier_prefix_cache_decision_tier_and_cache_with_static_partition_allows) {
+    CHECK(!tier_prefix_cache_decision(/*static_partition_reported=*/true, /*tier_on=*/true,
+                                       /*prefix_cache_mib=*/512)
+               .has_value());
 }
 
 TEST(config_fit_margin_mib_defaults_256) {

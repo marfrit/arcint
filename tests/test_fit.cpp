@@ -318,6 +318,51 @@ TEST(expert_slot_bytes_exact_division_stays_exact) {
     CHECK_EQ(expert_slot_bytes(kNumExpert, kRatioPct, kPerExpertBytes, kMoeLayers), want);
 }
 
+// ------------------------------------------------- expert_slot_bytes_static (patch 0018)
+
+// backend_ov.cpp's load-time bug (this milestone's fix): with
+// --moe-cpu-tier and the plugin's static residency partition active
+// (MOE_CPU_TIER_STATIC_PARTITION reads true), the plateau probe cannot run
+// -- every device slot is pinned at bind time, so the probe's own
+// eviction-observing approach drives the plugin's LRUCache::evict_one into
+// "no evictable (unpinned) slot" and the load dies before this file gets a
+// chance to size anything. Under that partition the device-resident slot
+// count is not measured, it is a KNOWN quantity -- the same
+// resident_slot_count() x per-expert-bytes ceiling expert_slot_bytes
+// already computes for the host-side ledger, reused verbatim because
+// residency is a pure function of configuration, not history, once the
+// partition is static. expert_slot_bytes_static is that reuse, named
+// separately so the load-time call site (and this test) read as pricing
+// the device figure, not the LRU-mode host ceiling that happens to share
+// arithmetic.
+TEST(expert_slot_bytes_static_matches_expert_slot_bytes) {
+    // A couple of distinct configs, not just kNumExpert/kRatioPct/
+    // kPerExpertBytes/kMoeLayers -- the identity must hold generally, not
+    // only at this file's one fixture scale.
+    CHECK_EQ(expert_slot_bytes_static(kNumExpert, kRatioPct, kPerExpertBytes, kMoeLayers),
+             expert_slot_bytes(kNumExpert, kRatioPct, kPerExpertBytes, kMoeLayers));
+    CHECK_EQ(expert_slot_bytes_static(10, 95, 1024, 1), expert_slot_bytes(10, 95, 1024, 1));
+    CHECK_EQ(expert_slot_bytes_static(256, 50, 2 * kMiB, 24),
+             expert_slot_bytes(256, 50, 2 * kMiB, 24));
+}
+
+TEST(expert_slot_bytes_static_ceiling_rounds_up) {
+    // Mirrors expert_slot_bytes_ceiling_rounds_up: 10 experts, ratio 95 ->
+    // 10*5/100 = 0.5 experts kept as slots -> ceiling 1, not 0. The static
+    // partition reuses the same ceiling rule -- it does not change the
+    // arithmetic, only what the result is allowed to mean (exact instead
+    // of an upper bound).
+    CHECK_EQ(expert_slot_bytes_static(10, 95, 1024, 1), 1024ull);
+}
+
+TEST(expert_slot_bytes_static_guards) {
+    // Same guards as expert_slot_bytes: no experts, no per-expert bytes, no
+    // layers all price to zero rather than crash or wrap.
+    CHECK_EQ(expert_slot_bytes_static(0, kRatioPct, kPerExpertBytes, kMoeLayers), 0ull);
+    CHECK_EQ(expert_slot_bytes_static(kNumExpert, kRatioPct, 0, kMoeLayers), 0ull);
+    CHECK_EQ(expert_slot_bytes_static(kNumExpert, kRatioPct, kPerExpertBytes, 0), 0ull);
+}
+
 // --------------------------------------------------------- kv_block_bytes_from_bits
 
 // M8 bug 1: the pre-fix arithmetic summed `Type::size()` (bytes, ceiled) per
@@ -2865,5 +2910,74 @@ TEST(auto_fit_adopted_depth_with_slack_is_admissible_as_an_explicit_request) {
     const long long resubmitted_max_ctx_slack =
         std::max<long long>(0, resubmitted.fit.max_ctx - kSlack);
     CHECK(d_auto <= resubmitted_max_ctx_slack);  // admitted -- the round trip holds
+}
+
+// M11 §1.3 (DESIGN §7.0.2ag): mtp_state_bytes's own arithmetic -- 4 heads
+// * 256 head_dim * 2 (K+V) * 4 bytes (f32) = 8 KiB/token, per lane. The two
+// depths named in the design's own record: 77,134 tokens (the prompt the
+// arm was primed over) -> 0.59 GiB, and the admitted n_ctx 155,488 that
+// arm went on to serve -> 1.19 GiB.
+TEST(mtp_state_bytes_is_8kib_per_token) {
+    CHECK_EQ(mtp_state_bytes(0), static_cast<uint64_t>(0));
+    CHECK_EQ(mtp_state_bytes(-5), static_cast<uint64_t>(0));
+    CHECK_EQ(mtp_state_bytes(1), static_cast<uint64_t>(8192));
+    CHECK_EQ(kMtpStateBytesPerToken, static_cast<uint64_t>(8192));
+    CHECK_EQ(mtp_state_bytes(1000), static_cast<uint64_t>(8192000));
+
+    const double gib_77134 = static_cast<double>(mtp_state_bytes(77134)) / static_cast<double>(kGiB);
+    CHECK(gib_77134 > 0.58 && gib_77134 < 0.60);
+    const double gib_155488 =
+        static_cast<double>(mtp_state_bytes(155488)) / static_cast<double>(kGiB);
+    CHECK(gib_155488 > 1.18 && gib_155488 < 1.20);
+}
+
+// M11 §3 Fix A, red-first (DESIGN §7.0.2ag): "a reservation unit
+// asserting the MTP arm's admitted n_ctx is below the plain arm's by at
+// least mtp_state_bytes(n_ctx)/kv_bytes_per_token -- written against the
+// DERIVATIVE, since it passes today for the wrong reason (drafter
+// weights)." Folding kMtpStateBytesPerToken into a local copy of
+// FitTerms::kv_bytes_token (backend_ov.cpp's own wiring; this test mirrors
+// it directly on FitTerms rather than re-deriving it) must shrink max_ctx
+// by at least as much as the per-token term costs AT the depth the MTP arm
+// actually admits.
+TEST(mtp_reservation_term_shrinks_admitted_ctx_by_at_least_the_derivative) {
+    const FitTerms plain = base_terms();
+    const FitResult plain_fit = fit_context(plain);
+    CHECK(plain_fit.admissible);
+
+    FitTerms mtp = plain;
+    mtp.kv_bytes_token = plain.kv_bytes_token + kMtpStateBytesPerToken;
+    const FitResult mtp_fit = fit_context(mtp);
+    CHECK(mtp_fit.admissible);
+
+    CHECK(mtp_fit.max_ctx < plain_fit.max_ctx);  // the served line's own headline: fewer tokens
+
+    const long long reduction = plain_fit.max_ctx - mtp_fit.max_ctx;
+    const long long derivative_bound =
+        static_cast<long long>(mtp_state_bytes(mtp_fit.max_ctx) / plain.kv_bytes_token);
+    CHECK(reduction >= derivative_bound);
+}
+
+// The wrong-reason failure mode the test above is written against: charging
+// the MTP state as a FIXED weights-only delta (today's pre-fix
+// `drafter_bytes` shape -- a residency read taken right after the drafters
+// compile, before any priming) also shrinks max_ctx, by a constant number
+// of tokens independent of depth. The derivative bound scales WITH the
+// admitted depth (mtp_state_bytes grows linearly in n_ctx); a fixed charge
+// cannot keep up with it once max_ctx is large, so this must fail the same
+// bound the real per-token term passes above -- the discriminator the
+// design's own red-first language names.
+TEST(a_fixed_weights_only_charge_fails_the_derivative_bound) {
+    const FitTerms plain = base_terms();
+    const FitResult plain_fit = fit_context(plain);
+
+    FitTerms fixed_only = plain;
+    fixed_only.drafters += 32 * kMiB;  // a stand-in "drafter weights" charge
+    const FitResult fixed_fit = fit_context(fixed_only);
+
+    const long long reduction = plain_fit.max_ctx - fixed_fit.max_ctx;
+    const long long derivative_bound =
+        static_cast<long long>(mtp_state_bytes(fixed_fit.max_ctx) / plain.kv_bytes_token);
+    CHECK(reduction < derivative_bound);
 }
 

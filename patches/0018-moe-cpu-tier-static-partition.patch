@@ -1,0 +1,1431 @@
+# MoE host CPU compute tier: F2 static partition, replacing history-dependent LRU residency
+
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0001-0017. Mechanism (DESIGN Section 7.0.2ae): the M9 equivalence gate's
+# continuation check fails because the tier's expert-slot LRU is process-global and
+# selects device-f16 vs host-f32 arithmetic by residency, so which experts are
+# resident -- and therefore what a greedy decode step outputs -- depends on the
+# request history in front of it, not just on the request itself. F2 replaces that
+# LRU residency decision with a static partition: for each MoE layer, the resident
+# set is the `slots` experts (the tier's own already-derived resident_slot_count())
+# with the smallest splitmix64(seed, layer, expert) rank, fixed once at bind() time
+# and independent of every subsequent request, dedup order, and pool-bytes budget.
+#
+# The earlier 0018 draft (F1: promote patch 0011's divergence oracle to a bit-equal
+# host kernel, matching device f16 arithmetic exactly) was retired by review -- its
+# file is not in this tree. F2 does not make host and device arithmetic agree; it
+# makes the *set* of experts each arithmetic runs on a pure function of (seed,
+# layer, expert, slots), so the mismatch F1 tried to erase no longer has an
+# opportunity to depend on history at all.
+#
+# The rule (src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/static_partition.hpp,
+# new file). splitmix64 (not std::hash, which is not guaranteed stable across STL
+# versions or processes) mixes (seed, layer_key, expert) into a 64-bit rank key;
+# static_partition_resident_experts(seed, layer_key, num_expert, capacity) ranks
+# every expert in the layer and returns the `capacity` smallest, sorted by expert
+# id -- ties broken by expert id, so the result is not std::sort-implementation-
+# defined. layer_key is the layer's first OTD weight-file offset (the same
+# structural per-layer key patches/0013's routing histogram already uses), not the
+# process-order construction sequence, which is a run-to-run permutation (found in
+# review for that patch). The vector's index for each expert IS its fixed device
+# slot -- a pure function of the same four inputs, not of arrival order.
+#
+# The hook (expert_weight_providers.hpp/.cpp). OffloadExpertWeightProvider::bind()
+# reserves the resident set into its LRUCache once, via a new reserve_pinned(expert,
+# slot) that inserts at a caller-chosen slot number and marks it pinned -- before any
+# real request reaches the provider. try_acquire_simultaneous() gains a third branch,
+# static_partition_active (alongside the untouched cpu_tier_active LRU branch and the
+# untouched tier-off branch): a resident expert resolves via LRUCache::probe() alone
+# (present or not, no insertion, no eviction) to its fixed slot, filled on first use
+# and never re-decided; a non-resident expert always takes the host tier and never
+# enqueues an upload -- there is no warm-up/capacity-miss distinction, because
+# occupancy was decided at bind(), not by arrival order. LRUCache gained a pinned bit
+# per slot (m_pinned) that evict_one_unlocked() skips when choosing an eviction
+# candidate, so prefill's ordinary (non-tier) acquisitions on the same shared pool
+# can never evict a pinned slot; a pool where every slot is pinned throws loud rather
+# than silently evicting a pin. patches/0017's readback path
+# (on_before_batched_gemv's topk_id/x/rw hoist) is untouched by this patch.
+#
+# Bug #2, found and fixed in this tree: the prefill per-expert fallback path had no
+# static-partition awareness. moe_3gemm_swiglu_opt.cpp's exec_prefill_onednn() calls
+# on_load_expert_weights() once per expert in its own (non-batched, non-simultaneous)
+# loop, which called IExpertWeightProvider::acquire_one() -- a second, independent
+# entry point into the same shared LRUCache, untouched by the try_acquire_simultaneous
+# rework above. Under the static partition every device slot is permanently pinned at
+# bind() time (reserve_pinned(), all of it, none held back for ordinary LRU traffic),
+# so evict_one_unlocked() has nothing left to reclaim: acquire_one()'s old
+# unconditional get_lru_item() call threw at the first expert this loop met that was
+# not in the resident set (LRUCache::evict_one: no evictable (unpinned) slot) --
+# identical in kind to the decode-path bug F2 exists to fix, just reached from
+# prefill instead of decode, and via a call site try_acquire_simultaneous's new
+# static_partition_active branch never touches. Fixed by changing acquire_one's
+# return type from a plain size_t to std::optional<size_t>, in the abstract interface
+# (expert_weight_provider.hpp, singular -- IExpertWeightProvider) and both concrete
+# providers (expert_weight_providers.hpp/.cpp, plural): ResidentExpertWeightProvider
+# (device-only, no tier -- wraps its always-succeeds return in optional unchanged);
+# OffloadExpertWeightProvider (the tier-aware one, expert_weight_providers.cpp) gains
+# a static-partition branch mirroring try_acquire_simultaneous's probe()-only logic --
+# a resident expert resolves to its fixed pinned slot (filling it on first use if
+# bind()'s reservation pass has not already done so), a non-resident expert returns
+# std::nullopt without touching the cache. The caller, on_load_expert_weights()
+# (moe_3gemm_swiglu_opt.cpp, ~line 1358), now checks the optional and returns false
+# instead of dereferencing a value that was never produced; exec_prefill_onednn()
+# (~line 2924) reads that return as `resident` and only reads _dnnl_weights[expert_no]
+# / runs the device oneDNN up/gate/down kernels when it is true. When false, the
+# expert is not resident under the static partition and the loop takes a new host
+# path in the same iteration -- not a skip, not a silent zero contribution: it reads
+# back that expert's already-gathered scratch.x/scratch.routing_weights rows (the
+# same f16-bit-pattern layout dispatch_cpu_tier's own hoisted readback already
+# assumes), runs the existing moe_cpu_expert() host kernel (moe_3gemm_swiglu_opt.cpp's
+# own decode-time CPU-tier capacity-miss path already calls the same function) per
+# token for that expert, and copies the result back into scratch.y so index_add below
+# treats it identically to a device-computed expert's contribution. cpu_tier_experts /
+# cpu_tier_pairs perf counters are incremented for this fallback the same way the
+# decode-time path already counts a host-tier expert. try_acquire_simultaneous()
+# itself gained one more static-partition-aware branch alongside static_partition_
+# active: calls that ask for grouped/batched acquisition but did not pass a
+# cpu_tier_misses destination (on_before_prefill / build_grouped_mask_otd, neither
+# wired for host-tier routing) now probe the partition and return std::nullopt on a
+# capacity/non-residency miss -- the existing nullopt-lease contract both call sites
+# already handle by falling back to exec_prefill_onednn's per-expert loop, which is
+# what this bug fix makes safe to fall back into.
+#
+# This bug was not caught by review or by the unit tests below -- all four of this
+# patch's own unit tests exercise LRUCache::reserve_pinned/probe/evict_one_unlocked
+# with pinned_count < max_total (room left to evict from), not the 100%-pinned pool
+# this bug needs to reproduce (the tier's real slot pool is entirely reserved by
+# bind()'s pass, by construction -- resident_slot_count() experts pinned into a pool
+# sized to exactly resident_slot_count()). It was found by attempting a real load
+# under the intended production configuration (--offload-ratio 50 --moe-cpu-tier,
+# 35B, GPU.1, u8 paged KV) and reading the crash it produced against this bug's own
+# description above -- not by a unit test that was red before the fix and is green
+# after it. That gap is recorded here rather than closed by a unit test that does not
+# exist yet: a fifth moe_3gemm_static_partition case reproducing a 100%-pinned pool
+# and exercising acquire_one() (not just probe()/get_lru_item()) directly is owed
+# before this patch should be considered to have proportionate unit coverage for bug
+# #2, on top of the live-hardware coverage below.
+#
+# The property and env. MOE_CPU_TIER_STATIC_PARTITION (properties.hpp, options.inl):
+# a read-only bool property, true by default, reporting whether the F2 rule is in
+# effect. Its default is computed once per ExecutionConfig construction from
+# MOE_CPU_TIER_PARTITION (the same per-instance env-read idiom patches/0013 already
+# established for MOE_OTD_ROUTING_HIST): MOE_CPU_TIER_PARTITION=lru sets the default
+# false, restoring the pre-F2 LRU path byte-for-byte (cpu_tier_active branch,
+# unedited). moe_3gemm_swiglu_opt.cpp's constructor re-reads the same env var
+# directly as a second, redundant guard (in case a config object was built before the
+# var was set) and wires OffloadExpertWeightProvider::set_static_partition(). Not
+# added to plugin.cpp's settable-property list -- registered like moe_cpu_tier and
+# moe_cpu_tier_threads, but genuinely read-only, never user-set. The `cpu_tier on:`
+# OTD_PERF log line gains static_partition=0|1, seed=0x<kStaticPartitionSeed>, and
+# resident_checksum=0x<FNV-1a of the resident set> (0 when the LRU path is in
+# effect), so two runs' logs can be diffed for residency agreement without dumping
+# the whole set.
+#
+# Bug #1, found this session, fixed in arcint (backend_ov.cpp, not this patch's own
+# files): the expert-slot device-pool sizing logic (Phase B of arcint's own fit
+# ledger) sizes the pool by a plateau probe that saturates it by observing EVICTION
+# -- it feeds distinct-token chunks until the device-resident byte count stops
+# growing, which relies on the driver evicting a cold slot to make room for a new
+# one. Under a 100%-pinned static partition no slot is ever evictable by
+# construction (that is the whole point: it is what makes output history-
+# independent), so every probe chunk drove LRUCache::evict_one_unlocked() into its
+# "no evictable (unpinned) slot" throw and the load died before reaching the rest of
+# Phase B. Fixed by reading the same MOE_CPU_TIER_STATIC_PARTITION property (below)
+# once the model is compiled and skipping the probe entirely when it is true,
+# pricing the device term analytically instead (the same per-expert-bytes formula
+# the host-side ledger already computes, reused verbatim under a static partition
+# since the pinned pool's size IS that ceiling, not an estimate of it).
+#
+# Bug #3, found by this session's first gate run, fixed in arcint (backend_ov.cpp,
+# not this patch's own files): the plugin-side fix above (bug #2) is real and
+# measured -- a clean load under --offload-ratio 50 --moe-cpu-tier (no
+# --prefix-cache-mib) serves a real completion, and the 4 unit tests below pass --
+# but the M9 equivalence gate's actual target scenario, patch 0018's own reason to
+# exist, is --moe-cpu-tier together with --prefix-cache-mib > 0, and that
+# combination refused at load on the first attempt, never reaching decode, let alone
+# the continuation-restored-from-cache check DESIGN Section 7.0.2ae exists to
+# re-measure. Root cause, measured (backend_ov.cpp ~line 2678, not this patch's own
+# files): arcint's --prefix-cache-mib refusal gate read the property with
+# `core_.get_property(device, "MOE_CPU_TIER_STATIC_PARTITION")` -- a pre-compile,
+# Core/device-level query, the same shape as the working PAGED_ATTENTION_MAX_
+# PARTITIONS probe it was modelled on (backend_ov.cpp's own comment said so). That
+# probe works because paged_attention_max_partitions is registered in plugin.cpp's
+# device-level property list (confirmed: `ov::PropertyName{...paged_attention_max_
+# partitions..., PropertyMutability::RW}`, plugin.cpp:817) in addition to compiled_
+# model.cpp's per-compiled-model list. moe_cpu_tier_static_partition (this patch's
+# compiled_model.cpp hunk, unchanged from the original 0018 draft) is registered
+# ONLY in CompiledModel::get_property() -- never added to plugin.cpp's device-level
+# list, exactly as this header already documented ("not added to plugin.cpp's
+# settable-property list... genuinely read-only"), but that same omission means
+# `core_.get_property(device, ...)` has nothing to find before a model is compiled:
+# it threw, the catch folded that to `static_partition_reported = false`, and
+# tier_prefix_cache_decision (config.cpp) kept the F0 refusal exactly as if this
+# patch did not exist. Measured server log, this session, GPU.1, this exact m18
+# build, first attempt: "could not bring up the OpenVINO executor: --moe-cpu-tier
+# with --prefix-cache-mib > 0 violates DESIGN Section 3.4: ... the plugin does not
+# report a static residency partition". Fixed by moving the refusal's property read
+# from `core_` (pre-compile) to `paged_model_` (the just-compiled model, the only
+# point this plugin fact is actually knowable) -- the same read Bug #1's probe-skip
+# logic above already needed and already gets right; the two now share one
+# `static_partition_reported` local instead of the working call site and the broken
+# one disagreeing. A later review pass (2026-09-04, before commit) found this
+# refusal was reachable only from inside `if (!forced)` -- ARCINT_FIT_SLOT_BYTES
+# (an experiment-only env override of the device-pool sizing, arcint-side) could
+# skip Bug #1's and Bug #3's fixed code path entirely and load
+# `--moe-cpu-tier --prefix-cache-mib > 0` against a non-static (LRU) plugin with no
+# refusal at all -- fixed by hoisting the property read and the refusal out of that
+# branch, arcint-side, so it always runs whenever --moe-cpu-tier is on regardless of
+# how the slot pool ends up sized. The same review pass added a refusal for the
+# companion gap: a static partition that priced the device term at 0 bytes (an
+# unfound MoE shape, not an actually-empty pool) used to load silently; it now
+# refuses loudly instead of charging the budget nothing for a pool the plugin is
+# demonstrably filling.
+#
+# Bug #5 (B-5 in review), found in that same later review pass, fixed in this
+# tree: MOE_CPU_TIER_STATIC_PARTITION's own default (options.inl, above) is a
+# context-free lambda -- []() { return !(getenv("MOE_CPU_TIER_PARTITION") ==
+# "lru"); }() -- with no access to `this`, so it cannot see whether MOE_CPU_TIER
+# is even on for the compile it is answering. Measured: it reported true (the F2
+# rule "in effect") on every load, tier on or off, contradicting its own doc
+# comment ("whether the MoE host compute tier's resident set is chosen by...")
+# and every "if and only if" reading of it arcint's DESIGN.md makes. Fixed in
+# ExecutionConfig::finalize_impl (execution_config.cpp): `if (!get_moe_cpu_tier())
+# { m_moe_cpu_tier_static_partition = false; }`, placed where get_moe_cpu_tier()
+# already answers correctly for this exact compile (m_is_finalized is still false
+# for the whole duration of finalize_impl, so the non-finalized getter path sees
+# the caller's own MOE_CPU_TIER property, not a stale or absent one -- the same
+# reasoning this file's KV/value-cache-precision block, just above the insertion
+# point, already documents for an analogous case). Red-first: two new
+# device-free gtests (execution_config_test.cpp,
+# moe_cpu_tier_static_partition_false_when_tier_off /
+# _true_when_tier_on) -- the first was confirmed red against the unfixed tree
+# (`Value of: config.get_moe_cpu_tier_static_partition() / Actual: true /
+# Expected: false`) and green after the fix, both rebuilt and run via
+# ov_gpu_unit_tests; the second guards against the fix over-correcting (tier on
+# must still answer true, MOE_CPU_TIER_PARTITION unset). Two files added to this
+# patch for this fix: src/plugins/intel_gpu/src/runtime/execution_config.cpp and
+# src/plugins/intel_gpu/tests/unit/module_tests/execution_config_test.cpp -- 13
+# files total, not 11.
+#
+# Not fixed here, found in the same investigation and reported instead of
+# guessed at, per this repository's own measurement rule:
+#   - The prefill per-expert fallback this bug #2 fix added
+#     (exec_prefill_onednn, moe_3gemm_swiglu_opt.cpp) reads routing weights
+#     correctly regardless of max_topk -- verified against the gather kernel's
+#     own source (moe_3gemm_swiglu_fuse.cl, `dst_rweight[k] =
+#     src_rweight[top_idx]`, one weight per gathered row by construction) and
+#     against the fallback's own read (`rw_host` sized exactly n_token,
+#     `jobs[t].w_route = rw_host[t]`) -- the two agree. A separate, PRE-EXISTING
+#     line a few lines above in the resident (device) branch of the same loop,
+#     `routing_weights_size = n_token * max_topk`, declares a larger oneDNN
+#     memory shape than the gather kernel ever writes for this fused-prefill
+#     path; unchanged by this patch (present verbatim in ovsrc-m17b) and not
+#     reached by anything this patch touches, but worth a dedicated look on its
+#     own -- not attempted here.
+#   - `on_load_expert_weights`'s false return is genuinely overloaded (OTD off
+#     entirely vs. not-resident under this patch's static partition) and its
+#     one caller (exec_prefill_onednn, the fix above) does not distinguish
+#     them -- on a NON-offloaded (resident-only) load reaching that caller, it
+#     would `static_cast<OffloadExpertWeightProvider*>(_weight_provider.get())`
+#     on a `ResidentExpertWeightProvider*`, undefined behaviour. Traced every
+#     path that can reach exec_prefill_onednn (on_before_batched_gemv,
+#     on_before_prefill, build_grouped_mask_otd's own fallback, and the
+#     top-level dispatch's plain else) -- the first three all explicitly check
+#     `_weight_provider->is_offloaded()` before ever calling it, so the
+#     dangerous case is reachable only through the top-level else, which is
+#     reachable only when MOE_USE_GROUPED_GEMM_PREFILL is forced off (default
+#     true, arcint never touches it) -- dormant in every configuration arcint
+#     actually drives today, not exercised, not fixed.
+#   - The blocking `scratch.x`/`scratch.routing_weights` `copy_to` calls in the
+#     same fallback have no explicit wait on the gather kernel's own event, but
+#     both the gather (via execute_stage) and the copy_to share one stream
+#     (`instance.get_network().get_stream()`), and that stream is forced
+#     in-order whenever oneDNN is in use (execution_config.cpp: `if
+#     (get_use_onednn()) { m_queue_type = QueueTypes::in_order; }`, and this
+#     whole impl requires oneDNN) -- a blocking read on an in-order queue
+#     already waits for every command enqueued before it, the same guarantee
+#     on_before_batched_gemv's own comment already relies on for an analogous
+#     read. Not a bug.
+#
+# Measured this session, in full (supersedes the "Measurement recipe" this header
+# used to carry as owed-but-not-run):
+#   1. This patch's own 4 unit tests (--gtest_filter=moe_3gemm_static_partition.*,
+#      /tmp/o3o-so/m18/ov_gpu_unit_tests): 4/4 PASSED, host-only, no GPU load.
+#   2. A clean load and a served completion, --offload-ratio 50 --moe-cpu-tier, no
+#      --prefix-cache-mib, GPU.1, 35B, u8 paged KV: measured clean (bug #2's own
+#      verification, this session; log lines "listening on ..." and a real "slot 0:
+#      decode ... tok" with HTTP 200 on /v1/completions).
+#   3. tests/equivalence/run.sh, first attempt, same cell, ARCINT_EXTRA_ARGS=
+#      "--offload-ratio 50 --moe-cpu-tier": the checks that do not combine the tier
+#      with a nonzero --prefix-cache-mib passed (two greedy runs byte-identical;
+#      logit-slicing identity; speculative decoding deterministic across runs;
+#      copy-prompt byte-identical at draft 4; drafter actually accepting). The
+#      suite's cold-vs-warm-cache section (--prefix-cache-mib 4096, the section
+#      containing the continuation check) hit bug #3 above and the server refused
+#      to start -- FAILED, load-time refusal, not a byte-mismatch. Gate script
+#      exit 1.
+#   4. With bugs #1 and #3 fixed, tests/equivalence/run.sh re-run in full against
+#      --moe-cpu-tier --prefix-cache-mib 4096 --kv-block-size 32, 24 GB card: "ok
+#      warm cache output is byte-identical to cold", "ok the console reports a cache
+#      hit", "ok a continuation of a cached prompt also hits", and -- the check this
+#      whole section exists to fix -- "ok a continuation restored from cache matches
+#      a cold run". **Pass.** The allow branch is verified on real hardware, not
+#      asserted; full detail and the verbatim gate output are in DESIGN Section
+#      7.0.2ae's own update. One unrelated check flaked between the two runs
+#      (speculative decoding determinism, an n-gram drafter with no MoE routing
+#      involved) -- recorded there as its own open item, not touched by anything in
+#      this patch.
+#   5. E2 (one process PROMPT/PROMPT/CONT vs a fresh process's CONT) and the P*
+#      decode cost cell: not re-run after bugs #1/#3 landed; still owed.
+#   6. Bug #5 (B-5) fixed and the plugin rebuilt; `tests/equivalence/run.sh`
+#      re-run in full a second time, same cell and args as (4): "equivalence:
+#      all checks passed", gate script exit 0, the continuation-restore check
+#      included, on the rebuilt plugin. This run measured genuinely slower
+#      than (4) throughout, not just at the cold/warm-cache section -- a first
+#      attempt hit the suite's own 2400s ceiling (exit 124) partway through,
+#      timing alone (the log up to the kill point is identical in content and
+#      order to the passing re-run, nothing hung or diverged); a second
+#      attempt at 3300s completed clean. Read as host load from same-machine
+#      rebuild activity earlier in this session, not a regression from any fix
+#      landed here -- B-5's own change is a single boolean write inside
+#      finalize_impl with no synchronization or threading footprint. Also
+#      confirmed positively: ARCINT_FIT_SLOT_BYTES set (forcing the device
+#      pool, skipping Phase B's probe) together with MOE_CPU_TIER_PARTITION=lru
+#      (the plugin's own non-static path) and --prefix-cache-mib > 0 -- the
+#      exact combination B-1's fix exists to close -- now refuses at load
+#      ("the plugin does not report a static residency partition", exit 1)
+#      where before B-1 it would have loaded silently. Production
+#      independently re-verified healthy (active, health 200, correct PIDs)
+#      after every load in this sequence.
+# DESIGN Section 7.0.2ae's own "Update" paragraph said this run had to happen, and be
+# recorded here, before the allow branch could be trusted. It has now happened, and
+# it passed.
+#
+# m18 path (dev host, not committed): /tmp/o3o-bugfix/ovsrc-m18, built from a fresh
+# copy of the pinned ovsrc-m17b baseline (the retired F1 draft's ovsrc-m18/build-m18
+# were deleted first, per task). Bug #2 (acquire_one, above) was found and fixed in
+# this same ovsrc-m18 tree after the first build of the F2-only source produced the
+# evict_one crash on a real load; the source and the staged build at /tmp/o3o-so/m18
+# were rebuilt afterward and re-verified to carry the fix (`grep -rn acquire_one` on
+# expert_weight_provider.hpp/expert_weight_providers.{hpp,cpp}/moe_3gemm_swiglu_opt.cpp
+# shows std::optional<size_t> throughout, not the original plain size_t). Bugs #1 and
+# #3 were both found on this same build and fixed arcint-side, not in this tree --
+# this patch's own plugin source is unchanged by either fix.
+#
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/static_partition.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/static_partition.hpp
+new file mode 100644
+index 0000000..f934a90
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/static_partition.hpp
+@@ -0,0 +1,103 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <utility>
++#include <vector>
++
++namespace ov::intel_gpu::ocl::moe {
++
++// arcint F2 (patch 0018, DESIGN Section 7.0.2ae). splitmix64: a small, fast,
++// well-distributed 64-bit mix, used here (not std::hash, which is
++// implementation-defined and not guaranteed stable across STL versions or
++// even across processes of the same binary for integer keys on some
++// standard libraries) so the resident set is bit-reproducible: the same
++// (seed, layer, expert) triple ranks the same way on every process, every
++// build, every day. That reproducibility is the entire property F2 exists
++// to buy back after F1 (a bit-equal host kernel) was retired by review --
++// F2 does not make host and device arithmetic agree; it makes the *set* of
++// experts that take each arithmetic a pure function of (seed, layer,
++// expert, slots), so a greedy decode no longer depends on the LRU's request
++// history (DESIGN Section 7.0.2ae: the M9 continuation-check fork).
++inline uint64_t splitmix64(uint64_t x) {
++    x += 0x9E3779B97F4A7C15ULL;
++    uint64_t z = x;
++    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
++    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
++    return z ^ (z >> 31);
++}
++
++// arcint F2. Rank key for one (seed, layer, expert) triple. Pure function of
++// its three arguments -- no cache, no LRU, no request history, no fill
++// state anywhere in its call graph, and no pool-bytes budget: two providers
++// that agree on (seed, layer_key, expert) agree on this key regardless of
++// device_pool_bytes, offload_ratio, or how many bytes are actually resident.
++inline uint64_t static_partition_rank_key(uint64_t seed, size_t layer_key, uint32_t expert) {
++    uint64_t h = splitmix64(seed ^ (static_cast<uint64_t>(layer_key) * 0xD6E8FEB86659FD93ULL));
++    h = splitmix64(h ^ static_cast<uint64_t>(expert));
++    return h;
++}
++
++// arcint F2. The static-partition resident set for one MoE layer: the
++// min(capacity, num_expert) experts with the smallest rank key, returned
++// sorted by expert id. A pure function of (seed, layer_key, num_expert,
++// capacity) -- the same 4-tuple always produces the same set regardless of
++// what requests (if any) preceded the call, and regardless of pool-bytes
++// budget (not one of the four arguments). Ties on the 64-bit key
++// (astronomically unlikely, never observed, but not assumed away) are
++// broken by expert id, so the sort has a total order and the result is not
++// std::sort-implementation-defined.
++inline std::vector<uint32_t> static_partition_resident_experts(uint64_t seed,
++                                                                size_t layer_key,
++                                                                size_t num_expert,
++                                                                size_t capacity) {
++    const size_t n = std::min(capacity, num_expert);
++    std::vector<std::pair<uint64_t, uint32_t>> ranked;
++    ranked.reserve(num_expert);
++    for (uint32_t e = 0; e < static_cast<uint32_t>(num_expert); ++e)
++        ranked.emplace_back(static_partition_rank_key(seed, layer_key, e), e);
++    std::sort(ranked.begin(), ranked.end(), [](const std::pair<uint64_t, uint32_t>& a,
++                                                const std::pair<uint64_t, uint32_t>& b) {
++        if (a.first != b.first)
++            return a.first < b.first;
++        return a.second < b.second;
++    });
++    std::vector<uint32_t> resident;
++    resident.reserve(n);
++    for (size_t i = 0; i < n; ++i)
++        resident.push_back(ranked[i].second);
++    std::sort(resident.begin(), resident.end());
++    return resident;
++}
++
++// arcint F2. Fixed device slot for one resident expert: its index within the
++// sorted-by-expert-id resident_experts() vector. Deterministic given the
++// same (seed, layer_key, num_expert, capacity) that produced the vector --
++// NOT the rank order (which is seed-dependent and not useful as a stable
++// slot number across a debugging session), so the same resident expert
++// keeps the same slot for as long as the layer's config is unchanged.
++inline size_t static_partition_slot_of(const std::vector<uint32_t>& resident_experts_sorted, uint32_t expert) {
++    auto it = std::lower_bound(resident_experts_sorted.begin(), resident_experts_sorted.end(), expert);
++    return (it != resident_experts_sorted.end() && *it == expert)
++               ? static_cast<size_t>(it - resident_experts_sorted.begin())
++               : resident_experts_sorted.size();  // not found: caller's bug, not a valid slot
++}
++
++// arcint F2. FNV-1a checksum of a resident set, logged on the `cpu_tier on:`
++// line (moe_3gemm_swiglu_opt.cpp) so two runs' logs can be diffed for
++// residency agreement without dumping the whole set.
++inline uint64_t static_partition_checksum(const std::vector<uint32_t>& resident_experts_sorted) {
++    uint64_t h = 0xCBF29CE484222325ULL;
++    for (uint32_t e : resident_experts_sorted) {
++        h ^= static_cast<uint64_t>(e);
++        h *= 0x100000001B3ULL;
++    }
++    return h;
++}
++
++}  // namespace ov::intel_gpu::ocl::moe
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.hpp
+index 8a76014..06bc50a 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.hpp
+@@ -56,6 +56,24 @@ public:
+         m_initialized = true;
+     }
+ 
++    // arcint F2 (patch 0018). Reserves `expert` at a caller-chosen slot
++    // number, pinned against evict_one(). Must be called before any
++    // ordinary (non-pinned) traffic reaches this cache: ordinary growth
++    // (get_lru_item's miss branch) assigns slot numbers sequentially from
++    // m_total_experts, so pinned slots must occupy the low end first, or a
++    // later ordinary insertion could collide with a slot this call already
++    // claimed. The static partition's own caller (OffloadExpertWeightProvider
++    // ::bind()) satisfies this: reservation happens once, at bind() time,
++    // strictly before the network's first real acquisition.
++    void reserve_pinned(size_t expert, size_t slot);
++
++    // arcint F2. True for a slot reserved via reserve_pinned(). Read by
++    // evict_one_unlocked() to skip pinned nodes.
++    bool is_pinned(size_t slot) const {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        return slot < m_pinned.size() && m_pinned[slot];
++    }
++
+ private:
+     bool m_initialized = false;
+     struct Key {
+@@ -82,6 +100,9 @@ private:
+ 
+     std::list<Node> m_list;
+     std::vector<bool> m_filled_list;
++    // arcint F2 (patch 0018). Parallel to m_filled_list, indexed by slot
++    // (lru_expert_no). See reserve_pinned()/is_pinned() above.
++    std::vector<bool> m_pinned;
+     std::unordered_map<Key, std::list<Node>::iterator, KeyHash> m_map;
+     mutable std::mutex m_mutex;
+ 
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.cpp
+index 0de8bb8..c521036 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.cpp
+@@ -7,11 +7,31 @@
+ // arcint M9 (patches/0004, P0 counters). Self-contained (no cldnn graph/
+ // runtime deps), safe to include from this header-light file.
+ #include "moe_otd_perf.hpp"
++// arcint F2 (patch 0018). OPENVINO_THROW in evict_one_unlocked()'s
++// all-pinned guard below.
++#include "openvino/core/except.hpp"
+ 
+ namespace ov::intel_gpu::ocl::moe {
+ 
+ LRUCache::LRUCache(size_t max_total_experts) : m_max_total_experts(max_total_experts), m_total_experts(0), m_to_filled_lru_expert_no(0) {
+     m_filled_list.resize(max_total_experts, false);
++    m_pinned.resize(max_total_experts, false);
++}
++
++// arcint F2 (patch 0018). See the header comment: caller (bind()) is
++// required to reserve every pinned slot before any ordinary traffic, so a
++// slot collision here is a caller bug, asserted loud rather than silently
++// overwriting an existing entry.
++void LRUCache::reserve_pinned(size_t expert, size_t slot) {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    OPENVINO_ASSERT(slot < m_max_total_experts, "LRUCache::reserve_pinned: slot ", slot, " out of range [0, ", m_max_total_experts, ")");
++    OPENVINO_ASSERT(!m_pinned[slot], "LRUCache::reserve_pinned: slot ", slot, " already pinned");
++    OPENVINO_ASSERT(m_map.find(Key{expert}) == m_map.end(), "LRUCache::reserve_pinned: expert ", expert, " already present in the cache");
++    m_list.push_back(Node{expert, slot});
++    auto new_it = std::prev(m_list.end());
++    m_map[Key{expert}] = new_it;
++    m_pinned[slot] = true;
++    ++m_total_experts;
+ }
+ 
+ void LRUCache::move_to_end(std::list<Node>::iterator it) {
+@@ -24,13 +44,28 @@ void LRUCache::evict_one_unlocked() {
+     if (m_list.empty())
+         return;
+ 
+-    auto& oldest = m_list.front();
++    // arcint F2 (patch 0018). Scan from the front (LRU order) for the first
++    // non-pinned node instead of assuming the front is always evictable.
++    // Pinned (static-partition resident) nodes are inserted once, at bind()
++    // time, before any ordinary traffic -- so in the tier-off/LRU-only case
++    // (m_pinned all-false) this loop always stops on its first iteration,
++    // same cost as before this patch.
++    auto it = m_list.begin();
++    while (it != m_list.end() && m_pinned[it->lru_expert_no])
++        ++it;
++    if (it == m_list.end()) {
++        // Every resident slot is pinned: the static partition has reserved
++        // the whole pool and there is nothing left for prefill's ordinary
++        // path to evict. A sizing bug in the tier's own slot count, not a
++        // runtime condition this cache can repair by evicting a pin.
++        OPENVINO_THROW("LRUCache::evict_one: no evictable (unpinned) slot -- the static partition has pinned the entire pool");
++    }
+ 
+-    m_filled_list[oldest.lru_expert_no] = false;
+-    m_to_filled_lru_expert_no = oldest.lru_expert_no;
+-    Key key{oldest.expert};
++    m_filled_list[it->lru_expert_no] = false;
++    m_to_filled_lru_expert_no = it->lru_expert_no;
++    Key key{it->expert};
+     m_map.erase(key);
+-    m_list.pop_front();
++    m_list.erase(it);
+     --m_total_experts;
+ 
+     // arcint M9 (patches/0004, P0 counters). The red-first observable P3
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_provider.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_provider.hpp
+index 4f3cac9..7b6f9ae 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_provider.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_provider.hpp
+@@ -102,8 +102,26 @@ public:
+         std::vector<CpuTierMiss>* cpu_tier_misses = nullptr,
+         bool* uploads_enqueued = nullptr) = 0;
+ 
+-    // Acquires a single expert slot. Always succeeds (evicts LRU if needed).
+-    virtual size_t acquire_one(uint32_t expert, cldnn::stream& stream) = 0;
++    // Acquires a single expert slot for the per-expert oneDNN-on-device
++    // fallback path (moe_3gemm_swiglu_opt.cpp's exec_prefill_onednn).
++    //
++    // Under the plain LRU residency rule (no static partition), always
++    // succeeds -- evicts the LRU slot if needed -- exactly as before F2.
++    //
++    // arcint F2 (patch 0018, bug #2 fix). Under the static partition
++    // (OffloadExpertWeightProvider::static_partition_active()), every device
++    // slot is permanently pinned at bind() time and evict_one() has nothing
++    // to reclaim, so an unconditional get_lru_item() throws
++    // (LRUCache::evict_one: no evictable (unpinned) slot). This method is
++    // therefore static-partition-aware: a resident expert resolves to its
++    // fixed pinned slot (no eviction, ever needed); a non-resident expert
++    // returns std::nullopt instead of throwing, and the caller
++    // (exec_prefill_onednn) must route that expert's compute through the
++    // host CPU tier kernel (moe_cpu_expert(), the same one
++    // dispatch_cpu_tier() uses for the batched-GEMV path) rather than the
++    // device oneDNN kernels, which need a device-resident weight slot that
++    // does not exist for that expert under this partition.
++    virtual std::optional<size_t> acquire_one(uint32_t expert, cldnn::stream& stream) = 0;
+ 
+     // Binds device-resident weight buffers. Called once on first execution.
+     virtual void bind(cldnn::moe_weights& resident) = 0;
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+index 5426dd9..5fe1050 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+@@ -49,7 +49,7 @@ public:
+                                                              cldnn::stream& stream,
+                                                              std::vector<CpuTierMiss>* cpu_tier_misses = nullptr,
+                                                              bool* uploads_enqueued = nullptr) override;
+-    size_t acquire_one(uint32_t expert, cldnn::stream& stream) override;
++    std::optional<size_t> acquire_one(uint32_t expert, cldnn::stream& stream) override;
+ };
+ 
+ // Offload (OTD) provider: expert weights live on disk and are streamed on demand
+@@ -91,7 +91,7 @@ public:
+                                                              cldnn::stream& stream,
+                                                              std::vector<CpuTierMiss>* cpu_tier_misses = nullptr,
+                                                              bool* uploads_enqueued = nullptr) override;
+-    size_t acquire_one(uint32_t expert, cldnn::stream& stream) override;
++    std::optional<size_t> acquire_one(uint32_t expert, cldnn::stream& stream) override;
+ 
+     LRUCache& cache() {
+         return *_cache;
+@@ -121,6 +121,26 @@ public:
+         _cpu_tier = on;
+     }
+ 
++    // arcint F2 (patch 0018). Set once from the impl constructor, alongside
++    // set_cpu_tier(), when MOE_CPU_TIER_STATIC_PARTITION is in effect
++    // (config default true, unless MOE_CPU_TIER_PARTITION=lru). `seed` is
++    // logged verbatim on the `cpu_tier on:` line so two runs can be checked
++    // for agreement without re-deriving it. Reservation itself happens
++    // lazily, once, inside bind() (see the .cpp) -- not here, because
++    // capacity/config are already known at construction but the shared
++    // LRUCache this reserves into is not created confused with resident
++    // buffer binding until bind() runs.
++    void set_static_partition(bool on, uint64_t seed) {
++        _static_partition = on;
++        _static_seed = seed;
++    }
++    bool static_partition_active() const {
++        return _static_partition;
++    }
++    uint64_t static_partition_seed() const {
++        return _static_seed;
++    }
++
+     // arcint M10 (patches/0013). Per-expert routing histogram: one counter per
+     // expert id in [0, config.num_expert), incremented once per (call,
+     // occurrence) in try_acquire_simultaneous BEFORE the hit/miss split (see
+@@ -162,6 +182,13 @@ private:
+     bool _bound = false;
+     // arcint M14. See set_cpu_tier().
+     bool _cpu_tier = false;
++    // arcint F2 (patch 0018). See set_static_partition().
++    bool _static_partition = false;
++    uint64_t _static_seed = 0;
++    // arcint F2. Guards bind()'s one-time reserve_pinned() pass; bind() is
++    // documented ("called once on first execution") but this makes the
++    // reservation idempotent-safe rather than trusting that unconditionally.
++    bool _static_partition_reserved = false;
+     // arcint M9 (patches/0006, P2). Provider-owned so each MoE layer's staging
+     // buffers are independent (no cross-layer contention on the ring), and so
+     // the ring's usm_host allocations amortize across infers instead of being
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+index 1043ae3..c643d8e 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+@@ -4,6 +4,9 @@
+ 
+ #include "expert_weight_providers.hpp"
+ 
++// arcint F2 (patch 0018).
++#include "static_partition.hpp"
++
+ #include <algorithm>
+ #include <atomic>
+ #include <cstdlib>
+@@ -179,7 +182,7 @@ std::optional<ExpertSlotLease> ResidentExpertWeightProvider::try_acquire_simulta
+     return std::vector<size_t>(experts.begin(), experts.end());
+ }
+ 
+-size_t ResidentExpertWeightProvider::acquire_one(uint32_t expert, cldnn::stream& /*stream*/) {
++std::optional<size_t> ResidentExpertWeightProvider::acquire_one(uint32_t expert, cldnn::stream& /*stream*/) {
+     return expert;
+ }
+ 
+@@ -240,6 +243,20 @@ void OffloadExpertWeightProvider::bind(cldnn::moe_weights& resident) {
+     _resident = &resident;
+     _cache->set_initialized();
+     _bound = true;
++
++    // arcint F2 (patch 0018). One-time reservation of the static partition's
++    // resident set, pinned in the shared LRU pool so prefill's ordinary
++    // (non-tier) acquisitions can never evict them (DESIGN Section 7.0.2ae).
++    // Runs before this provider serves its first real request: bind() is
++    // called once on first execution, strictly before try_acquire_
++    // simultaneous/acquire_one see live traffic.
++    if (_static_partition && !_static_partition_reserved) {
++        const auto resident_experts =
++            static_partition_resident_experts(_static_seed, layer_key(), _config.num_expert, _capacity);
++        for (size_t slot = 0; slot < resident_experts.size(); ++slot)
++            _cache->reserve_pinned(resident_experts[slot], slot);
++        _static_partition_reserved = true;
++    }
+     GPU_DEBUG_TRACE << "MOE OTD bind: resident_slots=" << _capacity << " total_experts=" << _config.num_expert
+                     << " shared_expert=" << (_config.num_shared_expert > 0 ? 1 : 0) << std::endl;
+ }
+@@ -319,7 +336,16 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
+     // from the impl constructor - moe_3gemm_swiglu_opt.cpp). With either false,
+     // the loop below takes the pre-M14 branch verbatim, so the tier-off path is
+     // provably the same code that ran before this patch.
+-    const bool cpu_tier_active = _cpu_tier && cpu_tier_misses != nullptr;
++    // arcint F2 (patch 0018). Split what M14 called cpu_tier_active into
++    // "wants the CPU tier at all" and "which of the two residency rules
++    // decides the split" -- static_partition_active takes over the CPU-tier
++    // dedup/miss bookkeeping below when the tier is on and the LRU path has
++    // not been restored via MOE_CPU_TIER_PARTITION=lru; cpu_tier_active keeps
++    // its pre-existing meaning (the LRU rule) so that branch's body is
++    // untouched, still exactly the M14 code.
++    const bool cpu_tier_wants = _cpu_tier && cpu_tier_misses != nullptr;
++    const bool static_partition_active = cpu_tier_wants && _static_partition;
++    const bool cpu_tier_active = cpu_tier_wants && !_static_partition;
+     std::unordered_map<uint32_t, size_t> cpu_miss_index;  // expert -> index in *cpu_tier_misses
+     size_t slot_taking_experts = 0;
+ 
+@@ -328,11 +354,104 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
+         auto it = expert_to_slot.find(expert);
+         if (it != expert_to_slot.end()) {
+             slots[i] = it->second;
+-            if (cpu_tier_active && it->second == kCpuTierSentinelSlot)
++            if (cpu_tier_wants && it->second == kCpuTierSentinelSlot)
+                 (*cpu_tier_misses)[cpu_miss_index[expert]].positions.push_back(i);
+             continue;
+         }
+ 
++        if (static_partition_active) {
++            // arcint F2 (patch 0018). Membership and slot are decided
++            // entirely by reserve_pinned() at bind() time: probe() here
++            // neither inserts nor evicts, so a non-resident expert never
++            // touches the cache at all, and a resident expert always
++            // resolves to the same slot regardless of what has been
++            // requested before (DESIGN Section 7.0.2ae) -- the fix for a
++            // history-dependent resident set is a resident set with no
++            // history input. There is no warm-up/capacity-miss distinction
++            // here: the LRU path's "free slot -> upload, full pool -> host"
++            // branch does not exist under the static partition, because
++            // slot occupancy was decided at bind(), not by arrival order.
++            auto probed = _cache->probe(expert);
++            const size_t slot = probed.first;
++            const bool filled = probed.second;
++            if (slot != LRUCache::kProbeMiss) {
++                if (filled) {
++                    if (perf)
++                        perf->gpu_hits.fetch_add(1, std::memory_order_relaxed);
++                } else {
++                    if (perf)
++                        perf->gpu_misses.fetch_add(1, std::memory_order_relaxed);
++                    missed_experts.push_back(expert);
++                    missed_slots.push_back(slot);
++                }
++                expert_to_slot.emplace(expert, slot);
++                slots[i] = slot;
++                ++slot_taking_experts;
++                continue;
++            }
++            // Non-resident: always the host tier, never an upload, never a
++            // cache insertion.
++            if (perf)
++                perf->gpu_misses.fetch_add(1, std::memory_order_relaxed);
++            auto& m = cpu_tier_misses->emplace_back();
++            m.expert = expert;
++            m.positions.push_back(i);
++            cpu_miss_index[expert] = cpu_tier_misses->size() - 1;
++            expert_to_slot.emplace(expert, kCpuTierSentinelSlot);
++            slots[i] = kCpuTierSentinelSlot;
++            if (perf) {
++                perf->cpu_tier_experts.fetch_add(1, std::memory_order_relaxed);
++                perf->cpu_tier_pairs.fetch_add(1, std::memory_order_relaxed);
++            }
++            continue;
++        }
++
++        // arcint F2 (patch 0018, bug #2 fix). Reached when the static
++        // partition is on (_static_partition) but this call did not ask for
++        // CPU-tier routing (cpu_tier_wants false -- the caller passed no
++        // cpu_tier_misses destination, e.g. on_before_prefill /
++        // build_grouped_mask_otd, the micro-gemm and grouped-gemm prefill
++        // paths in moe_3gemm_swiglu_opt.cpp: neither is wired for host-tier
++        // routing, and probably should not need to be, since the fallback
++        // below already exists for exactly this). Falling through to the
++        // legacy get_lru_item() body just below would be the bug this patch
++        // fixes: with the pool 100% pinned by bind()'s reserve_pinned()
++        // pass, the very first NON-resident expert this call is asked to
++        // place forces an insertion that needs an eviction
++        // evict_one_unlocked() cannot satisfy (nothing left unpinned to
++        // reclaim), and it throws -- unconditionally, even though this
++        // call's own local `expert_to_slot.size() >= _capacity` guard below
++        // (a per-call unique-expert counter) never trips, because the
++        // shared cache was already saturated before this call started.
++        // probe() mirrors the static_partition_active branch above: a
++        // resident expert resolves to its fixed pinned slot with no
++        // eviction ever attempted; a non-resident expert reports
++        // capacity-exceeded via the SAME nullopt contract the legacy
++        // capacity check below already used for "too many unique experts
++        // this call" -- both existing callers already handle a nullopt
++        // lease by falling back to exec_prefill_onednn's per-expert loop,
++        // itself made static-partition-safe by this same patch (see
++        // acquire_one()).
++        if (_static_partition) {
++            auto probed = _cache->probe(expert);
++            const size_t slot = probed.first;
++            if (slot == LRUCache::kProbeMiss)
++                return std::nullopt;
++            const bool filled = probed.second;
++            if (filled) {
++                if (perf)
++                    perf->gpu_hits.fetch_add(1, std::memory_order_relaxed);
++            } else {
++                if (perf)
++                    perf->gpu_misses.fetch_add(1, std::memory_order_relaxed);
++                missed_experts.push_back(expert);
++                missed_slots.push_back(slot);
++            }
++            expert_to_slot.emplace(expert, slot);
++            slots[i] = slot;
++            continue;
++        }
++
+         if (!cpu_tier_active) {
+             // ---- pre-M14 body, unchanged, including the capacity check ----
+             // Check if we would exceed capacity
+@@ -400,7 +519,12 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
+     // (the dedup branch above) also counts against cpu_tier_pairs - only the
+     // first occurrence goes through the `else` arm above, so account for repeats
+     // here rather than duplicating the increment at both call sites.
+-    if (cpu_tier_active && perf && cpu_tier_misses != nullptr) {
++    // arcint F2 (patch 0018). Repeat accounting applies to both residency
++    // rules alike -- cpu_tier_wants covers static_partition_active and
++    // cpu_tier_active (was cpu_tier_active alone pre-0018; the LRU-only
++    // predicate would silently stop counting repeats under the static
++    // partition).
++    if (cpu_tier_wants && perf && cpu_tier_misses != nullptr) {
+         for (const auto& m : *cpu_tier_misses) {
+             if (m.positions.size() > 1)
+                 perf->cpu_tier_pairs.fetch_add(m.positions.size() - 1, std::memory_order_relaxed);
+@@ -435,9 +559,44 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
+     return slots;
+ }
+ 
+-size_t OffloadExpertWeightProvider::acquire_one(uint32_t expert, cldnn::stream& stream) {
++std::optional<size_t> OffloadExpertWeightProvider::acquire_one(uint32_t expert, cldnn::stream& stream) {
+     auto* perf = moe_otd::get_perf_counters();
+ 
++    // arcint F2 (patch 0018, bug #2 fix). Under the static partition every
++    // device slot is pinned at bind() time (reserve_pinned(), see bind()
++    // below) and evict_one() has nothing left to reclaim -- an unconditional
++    // get_lru_item() below would throw for the first non-resident expert
++    // this is asked to acquire (LRUCache::evict_one: no evictable (unpinned)
++    // slot). probe() mirrors the read-only membership check
++    // try_acquire_simultaneous's static_partition_active branch already
++    // uses: a resident expert always resolves to its fixed pinned slot (no
++    // eviction ever needed, and normally already filled by bind()'s
++    // reservation pass -- the fill below only fires if it somehow is not),
++    // and a non-resident expert reports nullopt instead of touching the
++    // cache at all, so the caller (exec_prefill_onednn) can route it to the
++    // host CPU tier kernel instead.
++    if (_static_partition) {
++        const auto probed = _cache->probe(expert);
++        const size_t slot = probed.first;
++        const bool filled = probed.second;
++        if (slot == LRUCache::kProbeMiss) {
++            if (perf)
++                perf->gpu_misses.fetch_add(1, std::memory_order_relaxed);
++            return std::nullopt;
++        }
++        if (filled) {
++            if (perf)
++                perf->gpu_hits.fetch_add(1, std::memory_order_relaxed);
++        } else {
++            if (perf)
++                perf->gpu_misses.fetch_add(1, std::memory_order_relaxed);
++            OPENVINO_ASSERT(_resident != nullptr, "OffloadExpertWeightProvider: resident buffers not bound");
++            moe_otd::fill_weights_memory(stream, _config, _weight_bin_offsets, _weight_reader, *_resident, {expert}, {slot}, _staging);
++            _cache->set_filled(slot);
++        }
++        return slot;
++    }
++
+     const auto item = _cache->get_lru_item(expert);
+     const auto slot = item.first;
+ 
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+index 5c2329b..66b6a01 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -5,6 +5,7 @@
+ #include <chrono>
+ #include <iostream>
+ #include <cstdlib>
++#include <cstring>
+ 
+ // clang-format off
+ #include "moe_3gemm_gen_micro.hpp"
+@@ -13,6 +14,7 @@
+ #include "openvino/runtime/shared_buffer.hpp"
+ #include "lru_cache.hpp"
+ #include "expert_weight_providers.hpp"
++#include "static_partition.hpp"
+ // arcint M14 (patches/0011). Host CPU compute tier: ExpertDesc/ExpertJob/
+ // CpuTierPool/moe_cpu_expert(). No cldnn/OpenVINO deps of its own (see that
+ // header's comment), so including it unconditionally here is harmless.
+@@ -30,6 +32,8 @@ using ov::intel_gpu::ocl::moe::IExpertWeightProvider;
+ using ov::intel_gpu::ocl::moe::OffloadExpertWeightProvider;
+ using ov::intel_gpu::ocl::moe::QuantMatrix;
+ using ov::intel_gpu::ocl::moe::ResidentExpertWeightProvider;
++using ov::intel_gpu::ocl::moe::static_partition_checksum;
++using ov::intel_gpu::ocl::moe::static_partition_resident_experts;
+ 
+ #define DEBUG_MOE_LOG 0
+ 
+@@ -1336,6 +1340,13 @@ public:
+         needs_fallback = false;
+     }
+ 
++    // arcint F2 (patch 0018, bug #2 fix). Returns true when `expert_no`'s
++    // weights are resident on the device after this call (the caller,
++    // exec_prefill_onednn, may then use the device oneDNN kernels via
++    // _dnnl_weights[expert_no]) and false when they are not and never will
++    // be for this call (the static partition has not pinned this expert;
++    // acquire_one() returned nullopt rather than evicting a pinned slot).
++    // False is also returned, as before, when OTD is off entirely.
+     bool on_load_expert_weights(size_t expert_no, typed_primitive_inst<moe_3gemm_fused_compressed>& instance, dnnl::stream& dnn_stream) {
+         if (!_weight_provider->is_offloaded())
+             return false;
+@@ -1344,7 +1355,10 @@ public:
+ 
+         auto& stream = instance.get_network().get_stream();
+         auto& dnnl_weights = _dnnl_weights[expert_no];
+-        auto lru_expert_no = static_cast<int64_t>(_weight_provider->acquire_one(static_cast<uint32_t>(expert_no), stream));
++        auto acquired = _weight_provider->acquire_one(static_cast<uint32_t>(expert_no), stream);
++        if (!acquired)
++            return false;
++        auto lru_expert_no = static_cast<int64_t>(*acquired);
+         auto& params = instance._weights;
+ 
+ #    define CONVERT_DNNL_OTD(name, i)                                                                                                                  \
+@@ -1553,6 +1567,21 @@ public:
+         _cpu_tier = config.get_moe_cpu_tier();
+         if (_cpu_tier && _weight_provider->is_offloaded()) {
+             static_cast<OffloadExpertWeightProvider*>(_weight_provider.get())->set_cpu_tier(true);
++            // arcint F2 (patch 0018). config.get_moe_cpu_tier_static_partition()
++            // already folds MOE_CPU_TIER_PARTITION=lru into its default (see
++            // options.inl); re-read the same variable directly here as a
++            // second, redundant guard, matching _routing_hist_enabled's own
++            // per-provider-construction env re-read (patches/0013) rather
++            // than trusting a config object that could have been built
++            // before the variable was set.
++            bool static_partition = config.get_moe_cpu_tier_static_partition();
++            if (const char* partition_env = std::getenv("MOE_CPU_TIER_PARTITION")) {
++                if (std::strcmp(partition_env, "lru") == 0)
++                    static_partition = false;
++            }
++            static constexpr uint64_t kStaticPartitionSeed = 0xF2A17C0DE5EEDULL;
++            static_cast<OffloadExpertWeightProvider*>(_weight_provider.get())
++                ->set_static_partition(static_partition, kStaticPartitionSeed);
+             _cpu_tier_threads = config.get_moe_cpu_tier_threads();
+             _max_topk = cur_moe->_config.top_k;
+             _experts_per_token = cur_moe->_config.top_k + (cur_moe->_config.num_shared_expert > 0 ? 1 : 0);
+@@ -1602,13 +1631,29 @@ public:
+             // Discharges §10 R1 on the first load of the window: the config
+             // values the kernel actually sees, read once here rather than
+             // assumed from the IR.
+-            if (moe_otd::get_perf_counters())
++            if (moe_otd::get_perf_counters()) {
++                // arcint F2 (patch 0018). Logged so two runs' logs can be
++                // diffed for residency agreement without dumping the whole
++                // set; 0 when the LRU path is in effect (no static set to
++                // checksum).
++                const uint64_t resident_checksum =
++                    static_partition
++                        ? static_partition_checksum(static_partition_resident_experts(
++                              kStaticPartitionSeed,
++                              cur_moe->_otd.weight_bin_offsets.empty() ? 0 : cur_moe->_otd.weight_bin_offsets[0],
++                              cur_moe->_config.num_expert,
++                              resident_slot_count()))
++                        : 0;
+                 std::cerr << "[OTD_PERF] cpu_tier on: hidden=" << cur_moe->_config.hidden_size
+                            << " inter=" << cur_moe->_config.inter_size << " group=" << cur_moe->_config.group_size
+                            << " topk=" << cur_moe->_config.top_k << " experts=" << cur_moe->_config.num_expert
+                            << " wdt=" << wdt << " has_zp=" << cur_moe->_config.has_zp
+                            << " shared=" << cur_moe->_config.num_shared_expert
+-                           << " slots=" << resident_slot_count() << std::endl;
++                           << " slots=" << resident_slot_count()
++                           << " static_partition=" << (static_partition ? 1 : 0) << " seed=0x" << std::hex
++                           << kStaticPartitionSeed << " resident_checksum=0x" << resident_checksum << std::dec
++                           << std::endl;
++            }
+         } else {
+             _cpu_tier = false;
+         }
+@@ -2879,8 +2924,15 @@ public:
+                 continue;
+             }
+ 
+-            on_load_expert_weights(expert_no, instance, dnn_stream);
+-            auto& dnnl_weights = _dnnl_weights[expert_no];
++            // arcint F2 (patch 0018, bug #2 fix). `resident` is false when
++            // this expert is not in the static partition's pinned set (or,
++            // as before this fix, always true when OTD is off or the LRU
++            // rule is in effect -- see on_load_expert_weights()/
++            // acquire_one()). Only a resident expert has a device slot to
++            // read _dnnl_weights[expert_no] from, so get_kernel() and the
++            // oneDNN device forward() calls below only run in that branch;
++            // dnnl_weights is only valid to read when resident is true.
++            const bool resident = on_load_expert_weights(expert_no, instance, dnn_stream);
+ 
+             // expert_mask
+             expert_mask_gpu& expert_mask_mem = scratch.expert_masks[expert_no];
+@@ -2892,10 +2944,9 @@ public:
+             if (n_token > std::numeric_limits<int64_t>::max() / max_topk)
+                 OPENVINO_THROW("n_token * max_topk overflow detected, n_token=", n_token, " max_topk=", max_topk);
+ 
+-            int64_t routing_weights_size = static_cast<int64_t>(n_token * max_topk);
+-            onednn_kernel& kernel = get_kernel(n_token, static_cast<int>(expert_no), instance);
+-
+-            // gather
++            // gather. Common to both branches below: it only depends on the
++            // token/topk index masks, not on where the up/gate/down math
++            // subsequently runs.
+             result_event = execute_stage({result_event},
+                                          instance,
+                                          *gather,
+@@ -2905,24 +2956,68 @@ public:
+                                          {1, lws_size},
+                                          instance.needs_completion_event());
+ 
+-            // up
+-            kernel.up.forward(dnn_stream,
+-                              n_token,
+-                              convert2dnnl(scratch.x, {static_cast<int64_t>(n_token), dnnl_weights[1].ic}, dnnl::memory::format_tag::ab),
+-                              convert2dnnl(scratch.up, {static_cast<int64_t>(n_token), _intermediate_size}, dnnl::memory::format_tag::ab),
+-                              dnnl::memory());
+-            // gate
+-            kernel.gate.forward(dnn_stream,
+-                                n_token,
+-                                convert2dnnl(scratch.x, {static_cast<int64_t>(n_token), dnnl_weights[0].ic}, dnnl::memory::format_tag::ab),
+-                                convert2dnnl(scratch.gate, {static_cast<int64_t>(n_token), _intermediate_size}, dnnl::memory::format_tag::ab),
+-                                convert2dnnl(scratch.up, {static_cast<int64_t>(n_token), _intermediate_size}, dnnl::memory::format_tag::ab));
+-            // down
+-            kernel.down.forward(dnn_stream,
+-                                n_token,
+-                                convert2dnnl(scratch.gate, {static_cast<int64_t>(n_token), _intermediate_size}, dnnl::memory::format_tag::ab),
+-                                convert2dnnl(scratch.y, {static_cast<int64_t>(n_token), _hidden_size}, dnnl::memory::format_tag::ab),
+-                                convert2dnnl(scratch.routing_weights, {static_cast<int64_t>(routing_weights_size)}, dnnl::memory::format_tag::a));
++            if (resident) {
++                auto& dnnl_weights = _dnnl_weights[expert_no];
++                int64_t routing_weights_size = static_cast<int64_t>(n_token * max_topk);
++                onednn_kernel& kernel = get_kernel(n_token, static_cast<int>(expert_no), instance);
++
++                // up
++                kernel.up.forward(dnn_stream,
++                                  n_token,
++                                  convert2dnnl(scratch.x, {static_cast<int64_t>(n_token), dnnl_weights[1].ic}, dnnl::memory::format_tag::ab),
++                                  convert2dnnl(scratch.up, {static_cast<int64_t>(n_token), _intermediate_size}, dnnl::memory::format_tag::ab),
++                                  dnnl::memory());
++                // gate
++                kernel.gate.forward(dnn_stream,
++                                    n_token,
++                                    convert2dnnl(scratch.x, {static_cast<int64_t>(n_token), dnnl_weights[0].ic}, dnnl::memory::format_tag::ab),
++                                    convert2dnnl(scratch.gate, {static_cast<int64_t>(n_token), _intermediate_size}, dnnl::memory::format_tag::ab),
++                                    convert2dnnl(scratch.up, {static_cast<int64_t>(n_token), _intermediate_size}, dnnl::memory::format_tag::ab));
++                // down
++                kernel.down.forward(dnn_stream,
++                                    n_token,
++                                    convert2dnnl(scratch.gate, {static_cast<int64_t>(n_token), _intermediate_size}, dnnl::memory::format_tag::ab),
++                                    convert2dnnl(scratch.y, {static_cast<int64_t>(n_token), _hidden_size}, dnnl::memory::format_tag::ab),
++                                    convert2dnnl(scratch.routing_weights, {static_cast<int64_t>(routing_weights_size)}, dnnl::memory::format_tag::a));
++            } else {
++                // arcint F2 (patch 0018, bug #2 fix). expert_no is not in the
++                // static partition's resident set: there is no device slot
++                // to run the oneDNN kernels against. gather() above already
++                // produced this expert's n_token rows of scratch.x /
++                // scratch.routing_weights in the same f16-bit-pattern layout
++                // moe_cpu_expert.hpp's ExpertJob expects (dispatch_cpu_tier
++                // reads the identical layout from its own hoisted readback,
++                // moe_3gemm_swiglu_opt.cpp), so the same host CPU tier
++                // kernel that path already uses for a decode-time capacity
++                // miss applies here unchanged -- only the readback is
++                // per-expert and blocking instead of batched and hoisted,
++                // since this fallback loop is already the slow path.
++                if (auto* perf = moe_otd::get_perf_counters()) {
++                    perf->cpu_tier_experts.fetch_add(1, std::memory_order_relaxed);
++                    perf->cpu_tier_pairs.fetch_add(static_cast<uint64_t>(n_token), std::memory_order_relaxed);
++                }
++
++                const size_t hidden = static_cast<size_t>(_hidden_size);
++                const size_t n_token_sz = static_cast<size_t>(n_token);
++                std::vector<uint16_t> x_host(n_token_sz * hidden);
++                std::vector<uint16_t> rw_host(n_token_sz);
++                std::vector<uint16_t> y_host(n_token_sz * hidden);
++                scratch.x->copy_to(stream, x_host.data(), 0, 0, x_host.size() * sizeof(uint16_t), true);
++                scratch.routing_weights->copy_to(stream, rw_host.data(), 0, 0, rw_host.size() * sizeof(uint16_t), true);
++
++                auto* otd = static_cast<OffloadExpertWeightProvider*>(_weight_provider.get());
++                ExpertDesc desc = build_cpu_expert_desc(static_cast<uint32_t>(expert_no), instance, *otd);
++                std::vector<ExpertJob> jobs(n_token_sz);
++                for (size_t t = 0; t < n_token_sz; ++t) {
++                    jobs[t].x = x_host.data() + t * hidden;
++                    jobs[t].w_route = rw_host[t];
++                    jobs[t].y = y_host.data() + t * hidden;
++                }
++                moe_cpu_expert(desc, jobs.data(), jobs.size(), 0, _hidden_size);
++
++                scratch.y->copy_from(stream, y_host.data(), 0, 0, y_host.size() * sizeof(uint16_t), true);
++            }
++
+             // index_add
+             result_event = execute_stage({result_event},
+                                          instance,
+diff --git a/src/inference/include/openvino/runtime/intel_gpu/properties.hpp b/src/inference/include/openvino/runtime/intel_gpu/properties.hpp
+index 1767be9..3110718 100644
+--- a/src/inference/include/openvino/runtime/intel_gpu/properties.hpp
++++ b/src/inference/include/openvino/runtime/intel_gpu/properties.hpp
+@@ -213,6 +213,20 @@ static constexpr Property<bool, PropertyMutability::RW> moe_cpu_tier{"MOE_CPU_TI
+  */
+ static constexpr Property<size_t, PropertyMutability::RW> moe_cpu_tier_threads{"MOE_CPU_TIER_THREADS"};
+ 
++/**
++ * @brief Read-only report of whether the MoE host compute tier's resident
++ * set is chosen by the F2 static partition rule (a splitmix64 rank over
++ * (seed, layer, expert), independent of request history and of the
++ * per-layer pool-bytes budget) rather than the pre-F2 process-global LRU.
++ * true (default) whenever moe_cpu_tier is on and the MOE_CPU_TIER_PARTITION
++ * environment variable is not set to "lru"; false otherwise (including
++ * whenever moe_cpu_tier itself is off). Not user-settable: set
++ * MOE_CPU_TIER_PARTITION=lru in the process environment to opt back into
++ * the LRU path. See DESIGN Section 7.0.2ae.
++ * @ingroup ov_runtime_ocl_gpu_prop_cpp_api
++ */
++static constexpr Property<bool, PropertyMutability::RO> moe_cpu_tier_static_partition{"MOE_CPU_TIER_STATIC_PARTITION"};
++
+ /**
+  * @brief Upper bound on the number of 256-token partitions the GENERATE/MIXED
+  * paged-attention stage-0 kernel launches per sequence. Above the bound,
+diff --git a/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl b/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl
+index 469ef60..04a4c8e 100644
+--- a/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl
++++ b/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl
+@@ -2,6 +2,14 @@
+ // SPDX-License-Identifier: Apache-2.0
+ //
+ 
++// arcint F2 (patch 0018). getenv()/strcmp() for the moe_cpu_tier_static_
++// partition default below -- this .inl is textually included inside
++// ExecutionConfig's class body (execution_config.hpp), whose own includes
++// are not guaranteed to pull in <cstdlib>/<cstring>, so both are included
++// here explicitly rather than assumed transitive.
++#include <cstdlib>
++#include <cstring>
++
+ // OV_CONFIG_RELEASE_OPTION:
+ //      Options exposed via the public API in all build types.
+ //      Must be properly documented and aligned with OpenVINO Runtime stakeholders.
+@@ -59,6 +67,20 @@ OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, offload_ratio, 0, "Percentage (0-100) of
+ OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, moe_otd_device_pool_bytes, 0, "Device-resident (usm_device) budget in bytes for MoE OTD expert slot buffers under offload_ratio. Buffers are charged against this budget in program order; once spent, later buffers use the pre-existing lockable (usm_host) path. 0 (default) keeps every slot on the usm_host path, unchanged from before this option existed.")
+ OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, moe_cpu_tier, false, "Compute MoE experts that would evict a resident device slot on the host CPU instead of uploading them, during the batched-GEMV decode path only. false (default) is the pre-M14 behaviour, byte for byte.")
+ OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, moe_cpu_tier_threads, 0, "Worker threads for the MoE host compute tier. 0 (default) means hardware_concurrency()-1, leaving one core for the dispatch thread. Ignored when moe_cpu_tier is false.")
++// arcint F2 (patch 0018). Default computed from the environment ONCE per
++// ExecutionConfig construction (the same idiom patches/0013 already
++// established for MOE_OTD_ROUTING_HIST, per-instance rather than a
++// process-wide cached function, so a unit test can setenv() before building
++// the one config under test without a previous test's config poisoning a
++// process-wide cache). moe_3gemm_swiglu_opt.cpp's constructor re-checks the
++// same environment variable directly as a second, redundant guard so a
++// config object built before the variable was set still gets the override.
++OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, moe_cpu_tier_static_partition,
++                          []() {
++                              const char* v = std::getenv("MOE_CPU_TIER_PARTITION");
++                              return !(v != nullptr && std::strcmp(v, "lru") == 0);
++                          }(),
++                          "Read-only report of whether the MoE host compute tier's resident set is chosen by the F2 static partition rule (true, default) or the pre-F2 LRU (false, when MOE_CPU_TIER_PARTITION=lru). See DESIGN Section 7.0.2ae.")
+ OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, paged_attention_max_partitions, 0, "Upper bound on the number of 256-token partitions the GENERATE/MIXED paged-attention stage-0 kernel launches per sequence; above the bound, several consecutive 256-token partitions are folded into one work-group via an online softmax merge instead of each getting its own work-group and exp_sums/max_logits/tmp_out slot. 0 (default) is unbounded - one work-group per 256-token partition, byte-identical to the pre-existing behaviour. Bounds the tmp_out/exp_sums/max_logits scratch allocation at a fixed depth instead of growing it with context length; does not change PREFILL-stage partitioning.")
+ OV_CONFIG_RELEASE_OPTION(ov, enable_weightless, false, "Enable/Disable weightless blob")
+ 
+diff --git a/src/plugins/intel_gpu/src/plugin/compiled_model.cpp b/src/plugins/intel_gpu/src/plugin/compiled_model.cpp
+index 2bc2933..ba0f8f5 100644
+--- a/src/plugins/intel_gpu/src/plugin/compiled_model.cpp
++++ b/src/plugins/intel_gpu/src/plugin/compiled_model.cpp
+@@ -343,6 +343,7 @@ ov::Any CompiledModel::get_property(const std::string& name) const {
+             ov::PropertyName{ov::intel_gpu::moe_otd_device_pool_bytes.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::intel_gpu::moe_cpu_tier.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::intel_gpu::moe_cpu_tier_threads.name(), PropertyMutability::RO},
++            ov::PropertyName{ov::intel_gpu::moe_cpu_tier_static_partition.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::intel_gpu::paged_attention_max_partitions.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::device::id.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::execution_devices.name(), PropertyMutability::RO},
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
+index 101eaf9..7da3d4e 100644
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
+@@ -26,6 +26,11 @@
+ // cldnn graph/runtime dependency (see that header's file comment), so this
+ // include needs nothing else added here.
+ #include "ocl_v2/moe/moe_otd_perf.hpp"
++// arcint F2 (patch 0018). Host-only: LRUCache and static_partition.hpp are
++// pure C++ (no cldnn engine/stream), same basis as the moe_otd_perf.hpp
++// include above.
++#include "ocl_v2/moe/lru_cache.hpp"
++#include "ocl_v2/moe/static_partition.hpp"
+ // arcint M14 (patches/0012, T2). network::get_primitive() returns a
+ // std::shared_ptr<primitive_inst> (the base class); get_intermediates_
+ // memories() needs its complete type, which the primitive-specific *_inst.h
+@@ -1930,3 +1935,169 @@ TEST(moe_3gemm_expert_mask, shape_predictor_overflow_regression) {
+         total += static_cast<int>(result.batch[e].size());
+     ASSERT_EQ(total, actual_tokens * top_k);
+ }
++
++
++// =============================================================================
++// arcint F2 (patch 0018, DESIGN Section 7.0.2ae). Static partition red-first
++// tests. All four are host-only (LRUCache and the static_partition.hpp free
++// functions have no cldnn engine/stream/GPU dependency) -- consistent with
++// this environment's own rule that nothing here runs on the GPU; the
++// orchestrator's on-card window is what actually executes these.
++// =============================================================================
++
++using ov::intel_gpu::ocl::moe::LRUCache;
++using ov::intel_gpu::ocl::moe::static_partition_checksum;
++using ov::intel_gpu::ocl::moe::static_partition_rank_key;
++using ov::intel_gpu::ocl::moe::static_partition_resident_experts;
++
++// Red 1 (provider level: history independence). OffloadExpertWeightProvider::
++// bind() reserves the static partition's resident set into its LRUCache via
++// reserve_pinned(), once, before any real request; try_acquire_simultaneous's
++// static-partition branch resolves a resident expert purely through
++// LRUCache::probe(), which neither inserts nor evicts. This test drives that
++// exact sequence -- reserve the same resident set into two independent
++// caches, then push two DIFFERENT simulated request histories of ordinary
++// (non-resident) traffic through each before ever probing a resident expert
++// -- and asserts every resident expert resolves to the identical slot on
++// both caches regardless of which history preceded it. Pre-0018 (no
++// reserve_pinned, no probe/pin-aware eviction), this does not compile: red
++// by construction, not by assertion.
++TEST(moe_3gemm_static_partition, history_independence_at_provider_level) {
++    constexpr uint64_t seed = 0xF2A17C0DE5EEDULL;
++    constexpr size_t layer_key = 12345;
++    constexpr size_t num_expert = 32;
++    constexpr size_t capacity = 8;
++
++    const auto resident = static_partition_resident_experts(seed, layer_key, num_expert, capacity);
++    ASSERT_EQ(resident.size(), capacity);
++
++    // arcint F2 review: LRUCache holds a std::mutex member and is neither
++    // copyable nor movable, so it cannot be returned by value (NRVO is an
++    // optimization, not a language guarantee that a copy/move constructor
++    // need not exist) -- drive each cache in place via a reference instead.
++    auto drive = [&](LRUCache& cache, const std::vector<uint32_t>& ordinary_history) {
++        for (size_t slot = 0; slot < resident.size(); ++slot)
++            cache.reserve_pinned(resident[slot], slot);
++        // Ordinary (non-resident) traffic, in whatever order this call was
++        // given -- resident experts are never in `resident_experts()`'s
++        // complement by construction (both come from the same num_expert
++        // range), so pick ids from outside [0, num_expert) to guarantee no
++        // accidental overlap with the reserved set.
++        for (uint32_t e : ordinary_history)
++            cache.get_lru_item(e);
++    };
++
++    // Two orderings of the same 6 ordinary ids, reversed against each other,
++    // plus a repeat in one but not the other -- different enough that an
++    // LRU-driven slot assignment would disagree between them.
++    LRUCache cache_a(/*max_total_experts=*/32);
++    LRUCache cache_b(/*max_total_experts=*/32);
++    drive(cache_a, {1000, 1001, 1002, 1003, 1004, 1005});
++    drive(cache_b, {1005, 1005, 1004, 1003, 1002, 1001, 1000});
++
++    for (size_t slot = 0; slot < resident.size(); ++slot) {
++        const auto probe_a = cache_a.probe(resident[slot]);
++        const auto probe_b = cache_b.probe(resident[slot]);
++        ASSERT_NE(probe_a.first, LRUCache::kProbeMiss) << "expert " << resident[slot] << " missing from cache_a";
++        ASSERT_NE(probe_b.first, LRUCache::kProbeMiss) << "expert " << resident[slot] << " missing from cache_b";
++        EXPECT_EQ(probe_a.first, slot) << "expert " << resident[slot] << " drifted off its reserved slot in cache_a";
++        EXPECT_EQ(probe_b.first, slot) << "expert " << resident[slot] << " drifted off its reserved slot in cache_b";
++        EXPECT_EQ(probe_a.first, probe_b.first)
++            << "expert " << resident[slot] << " resolved to different slots under different request histories";
++    }
++}
++
++// Red 2 (resident set is a function of (layer, expert, slots) only,
++// including pool-bytes invariance). static_partition_resident_experts()'s
++// signature is (seed, layer_key, num_expert, capacity) -- there is no
++// pool-bytes/device_pool_bytes parameter anywhere in its call graph
++// (static_partition.hpp), so two calls that agree on those four values agree
++// on the result regardless of anything about the pool's byte budget; the
++// absence of the parameter is the invariance proof, not a runtime check. This
++// test pins that signature (a caller that tried to pass a fifth "pool bytes"
++// argument would fail to compile) and additionally checks the two directions
++// a rank-based partition must satisfy: identical inputs give an identical,
++// deterministic, and capacity-sized set; and each of the three documented
++// inputs it DOES depend on (layer, expert range via num_expert, slots)
++// changes the set when varied, so the function is not a constant that would
++// trivially pass the "same in, same out" half alone.
++TEST(moe_3gemm_static_partition, resident_set_is_pure_function_of_layer_expert_slots) {
++    constexpr uint64_t seed = 0xF2A17C0DE5EEDULL;
++
++    const auto a1 = static_partition_resident_experts(seed, /*layer_key=*/7, /*num_expert=*/64, /*capacity=*/16);
++    const auto a2 = static_partition_resident_experts(seed, /*layer_key=*/7, /*num_expert=*/64, /*capacity=*/16);
++    EXPECT_EQ(a1, a2) << "identical (seed, layer, num_expert, capacity) produced different resident sets";
++    EXPECT_EQ(a1.size(), 16u);
++    EXPECT_TRUE(std::is_sorted(a1.begin(), a1.end()));
++    for (uint32_t e : a1)
++        EXPECT_LT(e, 64u);
++
++    const auto different_layer = static_partition_resident_experts(seed, /*layer_key=*/8, /*num_expert=*/64, /*capacity=*/16);
++    EXPECT_NE(a1, different_layer) << "layer_key had no effect on the resident set";
++
++    const auto different_slots = static_partition_resident_experts(seed, /*layer_key=*/7, /*num_expert=*/64, /*capacity=*/24);
++    EXPECT_NE(a1.size(), different_slots.size());
++    for (uint32_t e : a1)
++        EXPECT_TRUE(std::find(different_slots.begin(), different_slots.end(), e) != different_slots.end())
++            << "raising capacity dropped expert " << e << " that a smaller capacity kept resident";
++}
++
++// Red 3 (the side is independent of fill state). A pinned-but-not-yet-filled
++// slot is still a resident (device-tier) expert -- LRUCache::probe() must
++// report the same slot before and after the first fill, with only the
++// `filled` half of the pair changing. This is the invariant that lets the
++// static-partition branch in try_acquire_simultaneous decide "resident vs.
++// host" (the side) once, at bind() time, and decide "already uploaded or
++// needs an upload" (fill state) separately and later, without the two ever
++// disagreeing about which side an expert is on.
++TEST(moe_3gemm_static_partition, side_is_independent_of_fill_state) {
++    LRUCache cache(/*max_total_experts=*/4);
++    cache.reserve_pinned(/*expert=*/42, /*slot=*/0);
++
++    const auto before = cache.probe(42);
++    EXPECT_EQ(before.first, 0u);
++    EXPECT_FALSE(before.second) << "a freshly reserved slot must not report filled before any fill";
++
++    cache.set_filled(0);
++
++    const auto after = cache.probe(42);
++    EXPECT_EQ(after.first, 0u);
++    EXPECT_EQ(after.first, before.first) << "fill state changed which slot (which side) the expert resolved to";
++    EXPECT_TRUE(after.second);
++}
++
++// Red 4 (prefill cannot evict a pinned slot). Reserves a pinned set, then
++// drives far more ordinary get_lru_item() traffic than the pool's unpinned
++// capacity -- the shape of prefill's own device-path pressure on this same
++// shared cache (DESIGN Section 7.0.2ae: "the expert slot LRU pool is
++// process-global") -- and asserts every pinned expert survives every one of
++// those evictions. Also checks the pool still functions for ordinary
++// (unpinned) entries: without the pin-aware skip in evict_one_unlocked(),
++// this test either loses a pinned expert (a resident expert silently
++// evicted and rerouted or reloaded elsewhere -- an F2 violation) or, if the
++// naive "front of the list" eviction is what runs, evicts the SAME pinned
++// front-of-list node every time and never frees an unpinned slot for the
++// ordinary traffic, which the final capacity check below would also catch.
++TEST(moe_3gemm_static_partition, prefill_cannot_evict_pinned_slot) {
++    constexpr size_t max_total = 8;
++    constexpr size_t pinned_count = 3;
++    LRUCache cache(max_total);
++    for (size_t slot = 0; slot < pinned_count; ++slot)
++        cache.reserve_pinned(/*expert=*/static_cast<uint32_t>(1000 + slot), slot);
++
++    // Far more distinct ordinary experts than the (max_total - pinned_count)
++    // unpinned slots available, forcing repeated evictions.
++    for (uint32_t e = 0; e < 50; ++e)
++        cache.get_lru_item(e);
++
++    for (size_t slot = 0; slot < pinned_count; ++slot) {
++        const auto probe = cache.probe(static_cast<uint32_t>(1000 + slot));
++        ASSERT_NE(probe.first, LRUCache::kProbeMiss)
++            << "pinned expert " << (1000 + slot) << " was evicted by ordinary prefill-shaped traffic";
++        EXPECT_EQ(probe.first, slot) << "pinned expert " << (1000 + slot) << " changed slot after eviction pressure";
++    }
++    // The pool never exceeds its declared capacity even under sustained
++    // pressure: pinned_count reserved + at most (max_total - pinned_count)
++    // unpinned residents at any time.
++    EXPECT_LE(cache.size(), max_total);
++}
+diff --git a/src/plugins/intel_gpu/src/runtime/execution_config.cpp b/src/plugins/intel_gpu/src/runtime/execution_config.cpp
+index 3990f92..30461c8 100644
+--- a/src/plugins/intel_gpu/src/runtime/execution_config.cpp
++++ b/src/plugins/intel_gpu/src/runtime/execution_config.cpp
+@@ -541,6 +541,30 @@ void ExecutionConfig::finalize_impl(const IRemoteContext* context) {
+                     "kernel (patches/0010); pairings where both sides are >=8-bit INT, both are "
+                     "4-bit, or both are f16, remain fine as before.");
+ 
++    // arcint F2 fix (patch 0018, B-5, found in review after the first gate
++    // pass): MOE_CPU_TIER_STATIC_PARTITION's options.inl default is a
++    // context-free lambda -- []() { return !(getenv("MOE_CPU_TIER_PARTITION")
++    // == "lru"); }() -- evaluated once per ExecutionConfig construction with
++    // no access to `this`, so it cannot see whether THIS compile actually
++    // turns MOE_CPU_TIER on. Before this fix it reported true (the F2 rule
++    // in effect) for every load, tier on or off, contradicting the
++    // property's own doc comment ("whether the MoE host compute tier's
++    // resident set is chosen by...") and every "if and only if" reading of
++    // it in arcint's DESIGN.md. Gated here instead, in finalize_impl, where
++    // get_moe_cpu_tier() already answers correctly for this exact compile
++    // (m_is_finalized is still false for the whole duration of this
++    // function -- see the KV/value-cache-precision block above's own note
++    // on that -- so the non-finalized getter path, which checks
++    // m_user_properties first, sees arcint's MOE_CPU_TIER=true/false
++    // property for THIS load, not a stale or absent one). This property is
++    // never user-settable (RO, not in plugin.cpp's settable-property
++    // list), so nothing here can ever be shadowed by a m_user_properties
++    // entry of its own -- the direct member write is safe unconditionally,
++    // not just for callers who left it at default.
++    if (!get_moe_cpu_tier()) {
++        m_moe_cpu_tier_static_partition = false;
++    }
++
+ #ifdef ENABLE_DEBUG_CAPS
+     // For now we apply config file only for build with debug caps, but it can be updated in the future to allow
+     // reading release options for any build type
+diff --git a/src/plugins/intel_gpu/tests/unit/module_tests/execution_config_test.cpp b/src/plugins/intel_gpu/tests/unit/module_tests/execution_config_test.cpp
+index 252a186..3e0e14a 100644
+--- a/src/plugins/intel_gpu/tests/unit/module_tests/execution_config_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/module_tests/execution_config_test.cpp
+@@ -151,6 +151,44 @@ static std::shared_ptr<ov::Model> make_pa_matmul_model(ov::element::Type weight_
+                             pa_token_type_ids, pa_qq_bias, pa_qq_bias_begins});
+ }
+ 
++// arcint F2 fix (patch 0018, B-5, red-first): MOE_CPU_TIER_STATIC_PARTITION
++// must report false whenever MOE_CPU_TIER itself is off, regardless of
++// MOE_CPU_TIER_PARTITION -- before this fix the options.inl default lambda
++// answered only from the environment, with no way to see this compile's own
++// MOE_CPU_TIER property, so it reported true (the F2 rule "in effect") for
++// every load, tier on or off. Device-free: finalize_impl's moe_cpu_tier_
++// static_partition gate does not touch engine capabilities, unlike the
++// kv-cache-precision tests below it still needs a real ctx/model to reach
++// finalize() at all, so this reuses the same fixture, not because the
++// assertion itself is device-dependent.
++TEST(execution_config, moe_cpu_tier_static_partition_false_when_tier_off) {
++    auto& engine = get_test_engine();
++    auto ctx = std::make_shared<RemoteContextImpl>("GPU", std::vector<cldnn::device::ptr>{engine.get_device()});
++    auto model = make_pa_matmul_model(ov::element::f32);
++
++    ExecutionConfig config;
++    // MOE_CPU_TIER left at its own default (false) -- the exact case the
++    // bug got wrong.
++    config.finalize(ctx.get(), model.get());
++
++    ASSERT_FALSE(config.get_moe_cpu_tier_static_partition());
++}
++
++// The tier-on side of the same gate: once MOE_CPU_TIER is actually set,
++// the property must still answer the F2-vs-LRU default the way it always
++// did (true, MOE_CPU_TIER_PARTITION unset) -- this fix must not flip that.
++TEST(execution_config, moe_cpu_tier_static_partition_true_when_tier_on) {
++    auto& engine = get_test_engine();
++    auto ctx = std::make_shared<RemoteContextImpl>("GPU", std::vector<cldnn::device::ptr>{engine.get_device()});
++    auto model = make_pa_matmul_model(ov::element::f32);
++
++    ExecutionConfig config;
++    config.set_user_property(ov::intel_gpu::moe_cpu_tier(true));
++    config.finalize(ctx.get(), model.get());
++
++    ASSERT_TRUE(config.get_moe_cpu_tier_static_partition());
++}
++
+ TEST(execution_config, kv_cache_u4_weights_auto_detect_u4) {
+     auto& engine = get_test_engine();
+     auto ctx = std::make_shared<RemoteContextImpl>("GPU", std::vector<cldnn::device::ptr>{engine.get_device()});

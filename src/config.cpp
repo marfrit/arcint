@@ -164,6 +164,23 @@ bool kv_precision_is_packed_four_bit(const std::string& requested, const std::st
     return kv_precision_is_packed_four_bit_bits(requested_bits, actual_bits);
 }
 
+// See config.h for the full account of what changed and why (patch 0018,
+// DESIGN §7.0.2ae). The refusal condition itself: refuse exactly when the
+// tier is on, a prefix cache is actually requested, and the plugin does not
+// report a static (history-independent) residency partition -- any other
+// corner has nothing to guard (tier off, or no cache) or is already safe
+// (a static-partition report).
+std::optional<std::string> tier_prefix_cache_decision(bool static_partition_reported, bool tier_on,
+                                                       int prefix_cache_mib) {
+    if (!tier_on || prefix_cache_mib <= 0) return std::nullopt;
+    if (static_partition_reported) return std::nullopt;
+    return "--moe-cpu-tier with --prefix-cache-mib > 0 violates DESIGN §3.4: "
+           "the host tier's arithmetic depends on expert LRU residency, so a "
+           "continuation restored from the prefix cache is not byte-identical "
+           "to a cold run -- drop --prefix-cache-mib or run without the tier; "
+           "the plugin does not report a static residency partition";
+}
+
 bool parse_u64_strict(const std::string& s, uint64_t& out) {
     if (s.empty()) return false;
 
@@ -221,7 +238,8 @@ std::string usage_text() {
         "                            undone once set\n"
         "  --moe-cpu-tier            compute expert FFNs that would evict a device\n"
         "                            slot on the host CPU instead (needs --offload-ratio;\n"
-        "                            refuses --prefix-cache-mib > 0, DESIGN §3.4)\n"
+        "                            --prefix-cache-mib > 0 is refused at load unless the\n"
+        "                            plugin reports a static residency partition, DESIGN §3.4)\n"
         "  --moe-cpu-tier-threads N  worker threads for that tier (0 = auto)\n"
         "\n"
         "memory\n"
@@ -733,12 +751,12 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         return fail("--moe-cpu-tier needs --offload-ratio > 0: with every expert "
                     "resident there is nothing for the host tier to compute");
     }
-    if (cfg.moe_cpu_tier && cfg.prefix_cache_mib > 0) {
-        return fail("--moe-cpu-tier with --prefix-cache-mib > 0 violates DESIGN §3.4: "
-                    "the host tier's arithmetic depends on expert LRU residency, so a "
-                    "continuation restored from the prefix cache is not byte-identical "
-                    "to a cold run -- drop --prefix-cache-mib or run without the tier");
-    }
+    // The --moe-cpu-tier / --prefix-cache-mib refusal USED to live here
+    // (DESIGN §7.0.2ae's F0). Since plugin patch 0018 the answer depends on
+    // a GPU-plugin property (MOE_CPU_TIER_STATIC_PARTITION) that only exists
+    // once the backend's executor is up, so config parsing can no longer
+    // decide it: this combination now parses, and backend_ov.cpp's load
+    // path (tier_prefix_cache_decision, config.h) makes the call instead.
     if (cfg.prefill_chunk < 0) return fail("--prefill-chunk must be >= 0");
 
     // The prefill grid and the cache grid have to be the same grid. A cache hit

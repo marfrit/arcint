@@ -251,9 +251,16 @@ struct Config {
 
     // Compute MoE experts that would evict a resident device slot on the host
     // CPU instead of uploading them (needs --offload-ratio > 0: with every
-    // expert resident there is nothing for the host tier to compute). Refuses
-    // --prefix-cache-mib > 0: residency-dependent host/device arithmetic makes
-    // a warm continuation non-byte-identical to a cold run (DESIGN §3.4).
+    // expert resident there is nothing for the host tier to compute).
+    // --prefix-cache-mib > 0 together with this flag USED to be refused
+    // unconditionally at config parse time (DESIGN §3.4/§7.0.2ae:
+    // residency-dependent host/device arithmetic makes a warm continuation
+    // non-byte-identical to a cold run). Since plugin patch 0018 that is no
+    // longer decidable here: whether the combination is safe depends on the
+    // read-only GPU-plugin property MOE_CPU_TIER_STATIC_PARTITION, which
+    // only exists once the backend's executor is up. Config parsing now accepts
+    // the combination unconditionally; backend_ov.cpp's
+    // tier_prefix_cache_decision (below) makes the load-time call.
     bool moe_cpu_tier = false;   // --moe-cpu-tier
     int  moe_cpu_tier_threads = 0;  // --moe-cpu-tier-threads; 0 = plugin default
 
@@ -303,6 +310,39 @@ bool kv_precision_bitwidth_matches(const std::string& requested, const std::stri
 // its log wording: this is a known plugin-generation packing quirk, worth
 // naming explicitly, not a generic signedness alias.
 bool kv_precision_is_packed_four_bit(const std::string& requested, const std::string& actual);
+
+// Load-time decision for the --moe-cpu-tier / --prefix-cache-mib
+// interaction (DESIGN §7.0.2ae, plugin patch 0018). This USED to be a
+// config-parse-time refusal (§7.0.2ae's F0), unconditional on
+// --moe-cpu-tier && --prefix-cache-mib > 0: the host tier's arithmetic
+// depends on expert LRU residency, which selects device-f16 vs host-f32
+// arithmetic that are not bit-equal, so a continuation restored from the
+// prefix cache is not byte-identical to a cold run -- a violation of §3.4.
+// F1 (a bit-equal host kernel) was retired by review: the device applies
+// scale/zp per lane and reduces across a subgroup tree of
+// implementation-defined order, so a faithful host match is not attainable
+// at reasonable cost. Patch 0018 ships as F2 instead: not bit-equal, but
+// the host/device split itself becomes a pure function of the served
+// configuration (a static per-(layer, expert) partition, independent of
+// request order and process history) rather than history-dependent LRU
+// residency -- which is what §3.4 actually needs (byte-identical for any
+// prompt and any cache state, at fixed configuration), not bit-equality
+// with the device. The plugin exposes this as a read-only property,
+// MOE_CPU_TIER_STATIC_PARTITION, true when the served tier is that static
+// partition (false when MOE_CPU_TIER_PARTITION=lru restores the
+// history-dependent one, or the property is simply absent on a plugin
+// without 0018). That fact only exists once the backend's executor is up --
+// config parsing cannot query a GPU plugin property -- so the refusal moved
+// from config.cpp to backend_ov.cpp's load path, which probes the property
+// (mirroring the PAGED_ATTENTION_MAX_PARTITIONS probe's style) and calls
+// this pure function to decide. `static_partition_reported` is what that
+// probe found (already folded to false for "absent" and for a `false`
+// reading alike); `tier_on`/`prefix_cache_mib` are the same Config fields
+// the old refusal read. Returns std::nullopt to allow, or the refusal
+// message (the original §3.4 sentence, extended by the plugin's own
+// report) to refuse.
+std::optional<std::string> tier_prefix_cache_decision(bool static_partition_reported, bool tier_on,
+                                                       int prefix_cache_mib);
 
 // Strict base-10 uint64 parse: refuses empty input and trailing garbage
 // (strtoull alone happily parses "8e9" as 8 and ignores "e9"), and refuses
