@@ -239,6 +239,72 @@ neither causes nor closes it.
 
 Upstream: not yet filed.
 
+### 0017-moe-cpu-tier-readback-decomposition.patch
+
+Decomposes the MoE host CPU tier's per-layer readback (patches/0011-0012)
+into named counters — `cpu_topk_id_ns`/`cpu_x_enq_ns`/`cpu_x_wait_ns`/
+`cpu_x_drain_ns`, a warm/steady split, and an env-gated queue-drain probe
+(`MOE_OTD_READBACK_PROBE`) — instead of one folded `avg_cpu_x_us`. Moves
+the x (hidden_states) and routing-weight readback destinations from
+pageable `std::vector` buffers to `usm_host`, and hoists that readback
+into the existing topk_id round trip so a tier-on layer pays one combined
+wait instead of two (`MOE_OTD_READBACK_NOHOIST=1` restores the old,
+separate order for isolating the hoist's own effect). No numeric
+behaviour change on any path: tier OFF is byte-for-byte the pre-patch
+code, tier ON runs the exact same `moe_cpu_expert` kernel over the same
+bytes, sourced from `usm_host` instead of `std::vector`. MEASURED on the
+16 GiB card at the M14 tier cell: the 283 µs readback attributed in an
+earlier record was mostly the x read landing on pageable memory after the
+queue had already drained on the topk_id read — `usm_host` cuts it to
+53 µs; the hoist alone is a null. Full derivation and the retraction of
+the cell's own decode-rate record (a device-pool env var was silently
+unset for that window) are in the arcint repository's `CHANGELOG.md`
+under "Unreleased" and `DESIGN.md` §7.0.2af.
+
+Upstream: not yet filed.
+
+### 0018-moe-cpu-tier-static-partition.patch
+
+Replaces the MoE host CPU tier's process-global LRU expert residency (F0,
+patches/0011-0013) with a static partition (F2): for each MoE layer, the
+resident set is the `slots` experts with the smallest
+`splitmix64(seed, layer_key, expert)` rank, fixed once at `bind()` and
+independent of every subsequent request, history, or arrival order. This
+closes a real DESIGN §3.4 violation — the LRU tier picked device-f16 vs.
+host-f32 arithmetic by residency, so greedy output depended on the
+process's request history, not just the request itself; a continuation
+restored from the prefix cache could fork from the same continuation
+served cold. An earlier draft (F1, a bit-equal host kernel matching
+device arithmetic exactly) was retired by review as impractical — F2 does
+not make host and device arithmetic agree, it makes the *set* of experts
+each one runs on independent of history, so the mismatch has no
+opportunity to depend on it.
+
+Five load-time bugs surfaced getting the allow branch to actually pass,
+not just compile — three fixed on the arcint side (the device-pool
+plateau probe and the prefill fallback both assumed an
+evictable/acquirable slot always exists, false under a 100%-pinned pool;
+`ARCINT_FIT_SLOT_BYTES` could bypass the `--prefix-cache-mib` refusal
+entirely) and two fixed here in the plugin: the refusal gate queried the
+static-partition property on the wrong (pre-compile) object, and the
+property's own default never checked whether the tier was even on,
+reporting the partition active on every load regardless. Full account,
+file:line, in this patch's own header and in the arcint repository's
+`DESIGN.md` §7.0.2ae. MEASURED, `tests/equivalence/run.sh` against
+`--moe-cpu-tier --prefix-cache-mib 4096 --kv-block-size 32` on the 24 GB
+card, twice (once per plugin rebuild fixing the two plugin-side bugs):
+**all checks pass**, continuation-restore included — the check this
+patch exists to fix.
+
+Not fixed, investigated and reported instead of guessed at: a false
+return from `on_load_expert_weights` is genuinely overloaded (OTD off
+vs. not resident under this partition) and its one caller does not
+distinguish them, but the ambiguous path is reachable only when
+`MOE_USE_GROUPED_GEMM_PREFILL` is forced off, which arcint never does —
+dormant in every configuration this repository drives today.
+
+Upstream: not yet filed.
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.

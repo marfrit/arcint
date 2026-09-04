@@ -1,3 +1,35 @@
+marfrit-openvino (2026.4.0~dev20260821+p4-1) bookworm trixie; urgency=medium
+
+  * Two more patches applied on top of +p3, same upstream commit
+    (71640275), same smallest-sufficient-divergence numbering:
+    - patches/0017: decomposes the MoE host CPU tier's per-layer readback
+      into named counters (topk_id/enqueue/wait/drain, warm-vs-steady),
+      moves the x (hidden_states) and routing-weight readback to
+      usm_host, and hoists it into the existing topk_id round trip. No
+      numeric behaviour change on any path; MEASURED cutting the readback
+      this section's own record named from 283 to 53 us on the 16 GiB
+      card.
+    - patches/0018: replaces the MoE host CPU tier's process-global LRU
+      expert residency with a static partition (F2) — a pure function of
+      a fixed seed, independent of request history — closing a real
+      DESIGN.md §3.4 violation where a continuation restored from the
+      prefix cache could fork from the same continuation served cold.
+      Two plugin-side load-time bugs fixed getting the allow branch to
+      actually pass: the --prefix-cache-mib refusal queried the
+      static-partition property on the wrong (pre-compile) object, and
+      the property's own default never checked whether the tier was even
+      on. MEASURED, tests/equivalence/run.sh against --moe-cpu-tier
+      --prefix-cache-mib on the 24 GB card: all checks pass, including
+      the continuation-restore check this patch exists to fix.
+    patches/README.md carries what each one is for and the measured
+    numbers behind it; arcint's own DESIGN.md §7.0.2ae/§7.0.2af carry the
+    full derivation.
+  * The runtime reports itself as 2026.4.0-22849-71640275d29-marfrit-p4,
+    so a version string in a log distinguishes this build from +p3 and
+    from the stock nightly.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Fri, 04 Sep 2026 20:47:50 +0200
+
 marfrit-openvino (2026.4.0~dev20260821+p3-1) bookworm trixie; urgency=medium
 
   * Three more patches applied on top of +p2, same upstream commit

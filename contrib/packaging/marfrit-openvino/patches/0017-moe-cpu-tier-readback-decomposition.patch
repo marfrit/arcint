@@ -1,0 +1,1148 @@
+# MoE host CPU compute tier: decompose the 283 us readback, usm_host destinations, one round trip
+
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0001-0016. Implements an unpublished design note's ("design-m14-readback",
+# not committed under docs/ -- a working note handed to the implementer, not part of
+# this repository's documentation tree) M14 follow-on scope ONLY: the instrumentation
+# that decomposes patches/0012's avg_cpu_x_us into an enqueue span, a wait span, an
+# env-gated queue-drain probe, and a topk_id-side counter; usm_host destinations for
+# the x (hidden_states) and routing-weight readback in place of pageable std::vector
+# buffers (§A1); and the hoist of that readback into the existing topk_id round trip,
+# so a tier-on layer pays one combined wait instead of two separate ones (§A2). The
+# design's phase B (host-visible residency for the MoE node's hidden_states input) is
+# deliberately NOT here -- that is 0018, and this patch does not touch HIDDEN_STATES'
+# allocation type, the fused-graph residency decision, or anything under
+# get_lockable_preferred_memory_allocation_type(). No numeric behaviour change on any
+# path: tier OFF is byte-for-byte the code patches/0012 landed (see "Tier-off
+# equivalence" below); tier ON computes the exact same host-visible bytes through the
+# exact same moe_cpu_expert kernel, only sourced from a usm_host buffer instead of a
+# std::vector one and read back in a different order relative to
+# try_acquire_simultaneous.
+#
+# Review round (P17-HOLD, addressed in full before this version):
+#   1. tx0 was stamped before the MOE_OTD_READBACK_PROBE drain block and outside
+#      `if (_cpu_tier)`. An armed probe run therefore folded its own stream.finish()
+#      cost into cpu_topk_id_ns/cpu_x_enq_ns/cpu_x_readback_ns -- exactly the
+#      contamination the probe exists to keep separate from the steady measurement.
+#      Fixed: tx0 (declared at outer scope, default-constructed) is now stamped
+#      inside `if (_cpu_tier)`, after the probe block.
+#   2. Added MOE_OTD_READBACK_NOHOIST=1, restoring patches/0012's order (topk_id
+#      blocking read, then try_acquire_simultaneous, then a miss-gated x/rw wait) so
+#      the hoist's win and the topk_id round trip in isolation are both measurable
+#      from one build, by flag, instead of by comparing across patch revisions. With
+#      it set, cpu_topk_id_ns measures the blocking topk_id read alone, as the design
+#      asked; cpu_x_enq_ns/cpu_x_wait_ns/the retained cpu_x_readback_ns measure the
+#      separate, still miss-gated, x/rw wait. moe_otd_perf.hpp's single combined
+#      timing function was split into record_cpu_topk_id_timing() and a narrower
+#      record_cpu_x_timing() so each leg is recorded independently in both modes,
+#      without either function needing to know which mode it is being called from.
+#   3. Test changes: the telescoping-identity test's header no longer calls itself
+#      red-first -- it is a construction lock (given this patch's actual code there is
+#      no reachable call site that violates the invariant; the test locks that fact
+#      against a future edit, it does not report a found defect) and now says so. A
+#      new host-only test, red against patches/0012's own dump() divisor, is added
+#      (see "Unit tests" below). The measurement recipe's step 2 gained two
+#      assertions: cpu_tier_calls == 40 (layers) x decode tokens at P*, and
+#      cpu_tier_calls > cpu_tier_layers (not every tier-on call has a miss).
+#   4. dispatch_cpu_tier() now asserts _cpu_x_host_mem && _cpu_rw_host_mem on entry
+#      (OPENVINO_ASSERT, loud rather than a silent null-pointer read if the miss-gating
+#      above it ever drifts out of sync with x/rw population). ensure_cpu_host_scratch()
+#      gained one sentence on why no pending-wait is needed on regrowth (the previous
+#      call's DMAs and CPU workers were already joined by the time this runs again for
+#      the next call) and that bytes beyond the current call's request are left
+#      uninitialised by design (nothing ever reads past them).
+#   5. Header fixes: build-location names removed (this file names no tree or staging
+#      directory -- those live in the task's own tracking, not in a patch that ships
+#      publicly); the design citation qualified as an unpublished note, not a docs/
+#      file; expert_weight_provider.hpp added to "Deviations" below (the
+#      uploads_enqueued contract); MOE_OTD_READBACK_PROBE and MOE_OTD_READBACK_NOHOIST
+#      both noted as arming on the env var's presence, not on a particular value.
+#
+# Reference cell P* (design note, reproduced here since every number below is
+# meaningless without it): 35B int4, 16 GiB card, otd_ratio 50, 8 GiB device
+# pool, 128 slots, u8 KV, one lane, n_ctx 65,536, an 897-token prompt, 64
+# greedy decode tokens. Recorded pre-0017: tier ON 15.0-15.5 t/s vs tier OFF
+# 10.4-10.6 t/s; per tier-layer decomposition dispatch-to-join 307/396 us +
+# x/routing readback 283/286 us + y writeback 29/40 us + pool wake 5/8 us,
+# 3.21 host experts per layer.
+#
+# What changed and why (moe/moe_3gemm_swiglu_opt.cpp,
+# on_before_batched_gemv):
+#
+#   Before (patches/0001-0012). Per MoE layer, in program order: (1) a
+#   BLOCKING copy_to() reads scratch.topk_id back to host, uncounted by any
+#   perf counter; (2) try_acquire_simultaneous() resolves each expert to a
+#   device slot or a CPU-tier sentinel, redirecting capacity misses to
+#   _cpu_tier_misses; (3) a BLOCKING copy_from() uploads the remapped slot
+#   ids; (4) IF there were any misses, hidden_states and the routing weights
+#   are read back into two std::vector<uint16_t> buffers via non-blocking
+#   copy_to() calls joined by one wait_for_events -- this span is
+#   cpu_x_readback_ns, averaging 283 us at P*, an amount patches/0012's own
+#   header called "anomalous...not explicable by transfer" for 4 KiB.
+#
+#   After (patches/0017, default -- MOE_OTD_READBACK_NOHOIST unset). Step (1)'s
+#   topk_id read and step (4)'s x/routing-weight read are merged: when the CPU
+#   tier is configured on, all three copy_to() calls (topk_id, hidden_states,
+#   routing weights) are enqueued non-blocking together and joined with ONE
+#   wait_for_events, run SPECULATIVELY -- before this layer is known to have
+#   any capacity miss at all, trading a ~4 KiB DMA on every tier-on layer
+#   (well under 1 us of PCIe transfer at this size per the design's own
+#   arithmetic) for skipping what used to be a second, separate round trip on
+#   every layer that did miss. Steps (2) and (3) are otherwise unchanged. x
+#   and the routing weights now land in usm_host (GTT) engine memory
+#   (allocation_type::usm_host, the same pattern moe_otd_runtime.cpp's
+#   StagingRing already uses for its DMA staging slots) instead of
+#   std::vector, removing the pageable-destination pin/bounce hypothesis
+#   (design's H1) as a candidate for the cost. topk_id's own destination
+#   stays a plain std::vector<uint32_t>: A1 is scoped to the x/routing-weight
+#   bundle only (the design's own wording), and try_acquire_simultaneous's
+#   interface takes a std::vector<uint32_t> either way.
+#
+#   MOE_OTD_READBACK_NOHOIST=1 restores steps (1) and (4) to their pre-0017
+#   order and gating (topk_id alone and blocking; x/rw miss-gated, after the
+#   slot-index upload, exactly where 0012 had them) while keeping A1's
+#   usm_host destinations -- the flag reorders the reads, it does not revert
+#   their memory type. This lets the same build isolate the topk_id round
+#   trip's own cost (cpu_topk_id_ns under this flag) and separately confirm
+#   the hoist's saving (compare cpu_x_readback_ns with the flag set vs unset).
+#
+#   Tier OFF: none of the above runs. topk_id's copy_to() is the exact
+#   pre-existing blocking call, unedited, in an `else` branch parallel to the
+#   tier-on block -- not a flag-gated variant of new code, the literal
+#   patches/0012 line. This is the equivalence baseline's structural
+#   guarantee, not merely an intended one: a diff of this function's tier-off
+#   path against patches/0012 is empty.
+#
+#   Consequence, stated rather than hidden (moe_otd_perf.hpp's comments on
+#   record_cpu_topk_id_timing/record_cpu_x_timing say the same thing):
+#   hoisted, cpu_topk_id_ns and the retained cpu_x_readback_ns measure the
+#   same merged span -- but by the CALLER's choice to pass both functions the
+#   same (tx0, t_wait_done) pair, not by anything internal to either
+#   function; under MOE_OTD_READBACK_NOHOIST the caller passes them genuinely
+#   different spans and the two counters diverge, which is the whole point of
+#   the flag.
+#
+# New counters (OtdPerfCounters, moe_otd_perf.hpp; all read 0 with the tier
+# off, and read 0 with the tier on until MOE_OTD_PERF_LOG=1 is set the same
+# way every existing OTD counter does):
+#   cpu_tier_calls      - every tier-on on_before_batched_gemv call (not just
+#                          the ones with a miss: the readback is speculative
+#                          by default). Divides avg_cpu_topk_id_us/
+#                          avg_cpu_x_enq_us/avg_cpu_x_wait_us/avg_cpu_x_us
+#                          together with cpu_x_warm_layers (see below) -- NOT
+#                          cpu_tier_layers (patches/0011's miss-only counter,
+#                          unchanged and still the divisor for
+#                          avg_cpu_compute_us/avg_cpu_join_wait_us/
+#                          avg_cpu_y_us, none of which this patch touches).
+#   cpu_topk_id_ns       - the topk_id leg's span (default: merged with x/rw,
+#                          tx0 to the combined wait's return; under
+#                          MOE_OTD_READBACK_NOHOIST: tx0 to the blocking
+#                          topk_id read's own return), steady-state calls
+#                          only. us: avg_cpu_topk_id_us.
+#   cpu_x_enq_ns         - tx0 (of the x/rw leg) to the last relevant
+#                          copy_to() call returning: driver submission time,
+#                          steady-state calls only. us: avg_cpu_x_enq_us.
+#   cpu_x_wait_ns        - the x/rw leg's wait_for_events call alone, steady-
+#                          state calls only. us: avg_cpu_x_wait_us.
+#                          cpu_x_enq_ns + cpu_x_wait_ns == the retained
+#                          cpu_x_readback_ns, enforced by construction
+#                          (record_cpu_x_timing computes all three from the
+#                          same three timestamps) and checked by this patch's
+#                          unit test.
+#   cpu_x_drain_ns       - env-gated (MOE_OTD_READBACK_PROBE=1 -- arms on the
+#                          variable's presence, any value, not a particular
+#                          one, same convention as MOE_OTD_FORCE_FINISH/
+#                          MOE_OTD_READBACK_NOHOIST): a stream.finish() timed
+#                          immediately before tx0. us: avg_cpu_x_drain_us,
+#                          divided by cpu_tier_calls (the probe runs on every
+#                          tier-on call, warm and steady alike, when armed).
+#   cpu_x_warm_ns,
+#   cpu_x_warm_layers    - the topk_id (and, if fetched this call, x/rw) span(s),
+#                          but for a call whose own try_acquire_simultaneous
+#                          invocation enqueued a fill_weights_memory upload (a
+#                          new bool* uploads_enqueued out-parameter on
+#                          try_acquire_simultaneous, expert_weight_
+#                          provider.hpp/expert_weight_providers.{hpp,cpp}) --
+#                          i.e. a warm-up call, the only kind that ever
+#                          uploads once patches/0012's pool-full policy makes
+#                          the resident/CPU-tier partition static. us:
+#                          avg_cpu_x_warm_us. Kept out of the steady-state
+#                          counters above so warm-up's queued-upload cost
+#                          (design's H2 hypothesis) does not bias the average
+#                          the P* pass bar is judged against.
+#   avg_cpu_x_us         - EXISTING counter (cpu_x_readback_ns), divisor
+#                          changed from cpu_tier_layers to cpu_tier_calls -
+#                          cpu_x_warm_layers ("cpu_steady_layers" in
+#                          moe_otd_runtime.cpp): the population it sums over
+#                          changed (every steady tier-on call by default, not
+#                          just the ones with a miss), so the old divisor
+#                          would silently under-count and inflate the
+#                          average. Stated here because a silent divisor
+#                          change is exactly the kind of thing this
+#                          repository's measurement-discipline rule exists to
+#                          catch, and re-verified by this patch's dump()-
+#                          divisor unit test (see "Unit tests" below).
+#
+# Env switches (both follow MOE_OTD_FORCE_FINISH/MOE_OTD_PERF_LOG's existing
+# convention: a static const bool from std::getenv(...) != nullptr, so the
+# switch arms on the variable being PRESENT in the environment at all, any
+# value including an empty one -- MOE_OTD_READBACK_PROBE= or =0 still arms
+# it):
+#   MOE_OTD_READBACK_PROBE=1    - arms the cpu_x_drain_ns probe above. Costs a
+#                                  real stream.finish() every tier-on call;
+#                                  never set in the steady P* measurement,
+#                                  only in the dedicated discriminator run
+#                                  below.
+#   MOE_OTD_READBACK_NOHOIST=1  - restores patches/0012's read order (see
+#                                  "What changed and why" above) so the
+#                                  hoist's win and the topk_id leg alone are
+#                                  both measurable from one build.
+#   MOE_OTD_PERF_LOG=1          - unchanged (patches/0004); the existing
+#                                  opt-in that makes get_perf_counters()
+#                                  return non-null and prints the one
+#                                  [OTD_PERF] line at exit.
+#
+# Measurement recipe (design note §3), for the orchestrator's GPU window, not
+# run here:
+#   1. Tier-off vacuity: P* with --moe-cpu-tier absent, MOE_OTD_PERF_LOG=1.
+#      Every counter this patch adds must read 0 in the [OTD_PERF] line.
+#   2. Steady-state decomposition: P* with --moe-cpu-tier, MOE_OTD_PERF_LOG=1,
+#      neither MOE_OTD_READBACK_PROBE nor MOE_OTD_READBACK_NOHOIST set. Read
+#      avg_cpu_x_us (compare to the 283 us on record), avg_cpu_topk_id_us,
+#      avg_cpu_x_enq_us, avg_cpu_x_wait_us, avg_cpu_x_warm_us,
+#      cpu_x_warm_layers, avg_cpu_compute_us, avg_cpu_y_us,
+#      avg_cpu_pairs_per_layer, gpu_hit_rate, end-to-end t/s. Assert
+#      avg_cpu_x_enq_us + avg_cpu_x_wait_us == avg_cpu_x_us (the per-call
+#      arithmetic identity, so it must hold on the averages within
+#      rounding); cpu_tier_calls == 40 (layers) x 64 (P*'s decode tokens) =
+#      2560 (every tier-on call is counted, not just the miss ones); and
+#      cpu_tier_calls > cpu_tier_layers (a run where every call misses would
+#      make the two equal, which P*'s ratio-50 pool is not expected to do).
+#   3. Nohoist comparison: same cell, same flags as step 2, plus
+#      MOE_OTD_READBACK_NOHOIST=1. Read avg_cpu_topk_id_us (now the blocking
+#      topk_id round trip alone) and avg_cpu_x_us (now the separate,
+#      miss-gated x/rw wait alone). avg_cpu_topk_id_us(nohoist) +
+#      avg_cpu_x_us(nohoist) vs avg_cpu_x_us(step 2, hoisted) is the hoist's
+#      measured saving.
+#   4. Drain discriminator: same cell, same flags as step 2, plus
+#      MOE_OTD_READBACK_PROBE=1. Read avg_cpu_x_drain_us. Close to the
+#      pre-existing 283 us baseline means the cost was queue backlog (H2),
+#      not the readback itself, and 0018's residency change is misaimed --
+#      the design's own "decisive discriminator."
+#   5. Fresh process per configuration (this repository's depth-sweep rule):
+#      runs 1-4 are four separate processes, not four flag toggles in one.
+#
+# Measured (orchestrator's GPU window, host quiet -- both card-owning units
+# stopped for the window). Cell, named in full because it is NOT P* above
+# (P*'s prompt is 897 tokens; this run's is 1,198 -- every number below
+# belongs to THIS cell, stated once here rather than re-qualified per line):
+# 16 GiB card, 35B int4, otd_ratio 50, 8 GiB device pool, 128 slots, u8 KV,
+# one lane, n_ctx 65,536, a 1,198-token prompt, 64 greedy decode tokens, two
+# runs per process, one process per arm (so cpu_tier_calls' expected 40 x 128
+# below is 40 layers x 128 decode tokens, two 64-token runs in one process).
+#   1. Tier-off vacuity: holds -- every counter this patch adds reads 0.
+#      2.6 t/s.
+#   2. Steady-state decomposition: avg_cpu_x_us 3,651 = avg_cpu_x_enq_us 184
+#      + avg_cpu_x_wait_us 3,467 (the enq+wait==readback identity holds).
+#      cpu_tier_calls 5,120 = 40 x 128 (first recipe assertion holds);
+#      cpu_steady_layers 5,120, cpu_x_warm_layers 0; cpu_tier_calls (5,120)
+#      > cpu_tier_layers (5,074) (second recipe assertion holds). 4.8/5.0
+#      t/s against the pre-0017 baseline's 4.7/4.7 on this cell.
+#   3. Drain discriminator: avg_cpu_x_drain_us 3,511; in this same
+#      drain-probe run, once the drain itself is excluded, the merged
+#      topk_id+x+rw wait measures only avg_cpu_x_enq_us 108 +
+#      avg_cpu_x_wait_us 106 = 214 us total -- against the drain's 3,511 us
+#      and step 2's undrained 3,651 us, essentially the whole cost is queue
+#      backlog (H2), not the readback itself; the 0018 residency change is
+#      misaimed on this evidence.
+#   4. Nohoist comparison: avg_cpu_topk_id_us 3,620 for the blocking topk_id
+#      read alone; the separate, miss-gated x/routing-weight readback that
+#      follows is 53 us (avg_cpu_x_enq_us 13 + avg_cpu_x_wait_us 40, still
+#      summing correctly). Reading: patches/0012's original 283-291 us was
+#      never mostly an x transfer cost -- it was already queue drain
+#      (matching H2/step 3), left over from a topk_id read that pays the
+#      same ~3,500-3,700 us regardless of whether x/rw ride along with it
+#      (step 2) or wait until after try_acquire and the slot upload (this
+#      step). usm_host destinations (A1) account for essentially the whole
+#      throughput gain over pre-0017: the pair 4.8/5.0 (step 2's two runs)
+#      against pre-0017's pair 4.7/4.7 is about +4%; citing the single
+#      numbers alone (5.0 vs 4.7) would read +6%, overstating it. The hoist
+#      (A2) measures as a null on top of A1 (5.0 t/s hoisted vs 5.0 t/s
+#      nohoist, both with usm_host destinations) -- on this cell A2 bought
+#      nothing A1 had not already bought.
+#   5. Fresh process per arm: as specified.
+#   Byte-identity: all six arms (tier off, pre-0017 tier ON x2, this patch's
+#   tier ON, nohoist, drain probe) byte-identical over the 64 greedy tokens;
+#   exactly forty `cpu_tier on:` lines in every tier-on log. The acceptance
+#   task's 10/10 gate was not part of this window and is still open.
+#
+# Open discrepancy, unexplained by this window: this cell ran at 2.6 t/s
+# (tier off) / 5.0 t/s (tier on) against the 10.4 / 15.0 t/s on record for
+# P* -- not host load, clocks, or the PCIe link (this window
+# ruled those out) -- with the expert-fetch totals (total_disk_io ~= 9.3 s,
+# total_gpu_copy ~= 9 s, both per 128 decode tokens) named as the next thing
+# to compare, not yet done.
+#
+# Still open, not superseded by the Measured block above (which already
+# covers arm (a) -- tier off vs tier on, same cell -- and the forty-line
+# count, both measured there): this patch's tier-ON text against the
+# recorded pre-0017 tier-ON text at P* itself (P*, not the measured cell
+# above, whose 1,198-token prompt differs from P*'s 897); and the
+# acceptance task 10/10 with the tier on at P*. This patch changes no
+# arithmetic anywhere in moe_cpu_expert.hpp's kernel or the GEMV kernels'
+# sentinel skip -- only where three existing reads sit relative to each
+# other and what memory type two of them land in -- so the claim is that
+# these two remaining gates hold for the same reason patches/0012's did,
+# not new reasoning; the orchestrator's job is to run them, not re-derive
+# them.
+#
+# Unit tests, host-only (tests/unit/test_cases/moe_3gemm_gpu_test.cpp, suite
+# moe_otd_perf_counters): both construct an OtdPerfCounters directly -- no
+# engine, no stream, no GPU device, so both run in any world this
+# environment can reach, this one included, and neither was run on a card
+# here (this task's rule; the orchestrator's window runs them alongside
+# T2/T4 the way it always has).
+#   enq_plus_wait_equals_readback: calls record_cpu_topk_id_timing()/
+#     record_cpu_x_timing() (moe_otd_perf.hpp) with three synthetic
+#     std::chrono::steady_clock time points. A construction lock, not a
+#     red-first test: given this patch's actual on_before_batched_gemv there
+#     is no reachable call site that could violate the asserted invariants
+#     (the hoisted path always feeds both functions the same span; enq+wait
+#     is two halves of one interval by record_cpu_x_timing's own body) --
+#     run today, every assertion is green, which is proof of the
+#     construction holding, not evidence a defect was found. What it locks
+#     against, reasoned rather than found: a future edit computing
+#     cpu_x_wait_ns from the wrong pair of timestamps, e.g. ns(tx0,
+#     t_wait_done) instead of ns(t_enq_done, t_wait_done). Against the
+#     test's synthetic 50/233/283 us split that specific bug sums to
+#     333000 ns instead of 283000 ns, tripping the first EXPECT_EQ.
+#   dump_avg_cpu_x_us_uses_steady_layer_divisor: sets cpu_tier_calls=40,
+#     cpu_x_warm_layers=8, cpu_tier_layers=12, cpu_x_readback_ns=32*283000 ns
+#     on a fresh OtdPerfCounters, captures dump()'s stderr line (std::cerr
+#     rdbuf swap), and asserts it contains "avg_cpu_x_us=283". Red against
+#     patches/0012's own divisor by construction, not hypothetically: with
+#     0012's cpu_tier_layers-based divisor the same inputs print
+#     avg_cpu_x_us=754 (9056/12, integer division) -- this test would have
+#     failed against that code, and the second EXPECT_EQ checks the string
+#     "avg_cpu_x_us=754" is absent from the line this patch's dump()
+#     produces.
+#
+# Deviations from the design note, stated rather than hidden:
+#   - §2 A2's text names only "the x copy" next to topk_id ("enqueue the x
+#     copy non-blocking with the topk_id copy and join both in one
+#     wait_for_events"). This patch folds the routing-weight copy into the
+#     same wait too. "x" is used as shorthand for the x+routing-weight
+#     bundle throughout §1 (cpu_x_readback_ns/avg_cpu_x_us already reported
+#     both DMAs as one number before this patch, since patches/0012 joined
+#     them); leaving routing weights stranded at the old step 4 would have
+#     reintroduced exactly the second round trip A2 exists to remove, for a
+#     payload of a few dozen bytes. §4's "Touch" list confirms A2 is in
+#     0017's scope; this patch reads the bundling as inherited from the
+#     status quo it was written against, not as a narrower instruction.
+#   - clone()'s explicit field list (moe_3gemm_swiglu_opt_impl::clone(),
+#     flagged by §4 as "0012's dormant-tier defect lives exactly there") is
+#     reviewed, not extended: the two new member pairs
+#     (_cpu_x_host_mem/_cpu_x_host_capacity, _cpu_rw_host_mem/
+#     _cpu_rw_host_capacity) are lazily-allocated scratch, default-null and
+#     zero-capacity on a fresh clone exactly like the std::vector members
+#     they replace, and exactly like _cpu_out_rows/_cpu_jobs/_cpu_descs
+#     (already scratch, already absent from that list). Unlike _cpu_tier and
+#     its sibling configuration flags -- the actual 0012 defect, where an
+#     unlisted field left the tier configured on the program's impl and
+#     dormant on the one that executed -- nothing new here is configuration.
+#   - expert_weight_provider.hpp's uploads_enqueued out-parameter: the design
+#     specifies the out-flag but not its behaviour on an early return. This
+#     patch's choice (both implementations, review round): write false on
+#     entry, before any possible early exit including a capacity-exceeded
+#     nullopt return, then overwrite with the real answer on every path that
+#     resolves a lease -- never left untouched on some return path and set
+#     only on others, so a caller's local bool need not be pre-initialized to
+#     get a well-defined value regardless of which path returns.
+#
+# Packaging (CHANGELOG.md, contrib/packaging/marfrit-openvino) deferred to
+# the next release level, same as patches/0015-0016.
+#
+# Do NOT touch, unchanged by this patch: the kernel sentinel skip in
+# moe_3gemm_swiglu_mlp.cl; the admission policy in try_acquire_simultaneous
+# (0012 §2.4's rejected A/B/C stay rejected); the CPU kernels themselves
+# (moe_cpu_expert.hpp, patches/0011); mlp_reduce; the prefill path
+# (on_before_prefill/build_grouped_mask_otd keep passing nullptr for both
+# try_acquire_simultaneous out-parameters, unaffected by either new
+# parameter's default); the LRU and eviction policy; paged-KV (patches
+# 0008-0010); the residency/host-visible-hidden_states change (0018).
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_provider.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_provider.hpp
+index ecbc13c..4f3cac9 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_provider.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_provider.hpp
+@@ -84,10 +84,23 @@ public:
+     // exactly: every miss is uploaded. Non-null AND the provider configured with
+     // the CPU tier on => a *capacity* miss (one that would evict a resident expert)
+     // is appended there and given kCpuTierSentinelSlot instead of being uploaded.
++    //
++    // arcint M14 (patches/0017). uploads_enqueued == nullptr (the default)
++    // reproduces the pre-0017 behaviour exactly: nothing is written. Non-null
++    // gets written on entry (both implementations write false before any
++    // possible early return, including a capacity-exceeded nullopt) and then
++    // set to whether THIS call enqueued at least one fill_weights_memory
++    // upload (a warm-up free-slot fill in the CPU-tier branch, or any upload
++    // at all in the pre-M14 branch) on every path that resolves a lease --
++    // never left untouched on some return path and set only on others, so a
++    // caller's local bool need not be pre-initialized. moe_3gemm_swiglu_
++    // opt.cpp uses it to keep warm-up's readback timing out of the
++    // steady-state average.
+     virtual std::optional<ExpertSlotLease> try_acquire_simultaneous(
+         const std::vector<uint32_t>& experts,
+         cldnn::stream& stream,
+-        std::vector<CpuTierMiss>* cpu_tier_misses = nullptr) = 0;
++        std::vector<CpuTierMiss>* cpu_tier_misses = nullptr,
++        bool* uploads_enqueued = nullptr) = 0;
+ 
+     // Acquires a single expert slot. Always succeeds (evicts LRU if needed).
+     virtual size_t acquire_one(uint32_t expert, cldnn::stream& stream) = 0;
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+index d4b6587..5426dd9 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+@@ -47,7 +47,8 @@ public:
+ 
+     std::optional<ExpertSlotLease> try_acquire_simultaneous(const std::vector<uint32_t>& experts,
+                                                              cldnn::stream& stream,
+-                                                             std::vector<CpuTierMiss>* cpu_tier_misses = nullptr) override;
++                                                             std::vector<CpuTierMiss>* cpu_tier_misses = nullptr,
++                                                             bool* uploads_enqueued = nullptr) override;
+     size_t acquire_one(uint32_t expert, cldnn::stream& stream) override;
+ };
+ 
+@@ -88,7 +89,8 @@ public:
+     void fill_routed_weight_views(cldnn::moe_weights& weights, RoutedWeightViews& views) override;
+     std::optional<ExpertSlotLease> try_acquire_simultaneous(const std::vector<uint32_t>& experts,
+                                                              cldnn::stream& stream,
+-                                                             std::vector<CpuTierMiss>* cpu_tier_misses = nullptr) override;
++                                                             std::vector<CpuTierMiss>* cpu_tier_misses = nullptr,
++                                                             bool* uploads_enqueued = nullptr) override;
+     size_t acquire_one(uint32_t expert, cldnn::stream& stream) override;
+ 
+     LRUCache& cache() {
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+index e3e0c6a..1043ae3 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+@@ -162,7 +162,15 @@ void otd_dump_routing_hist() {
+ 
+ std::optional<ExpertSlotLease> ResidentExpertWeightProvider::try_acquire_simultaneous(const std::vector<uint32_t>& experts,
+                                                                                        cldnn::stream& /*stream*/,
+-                                                                                       std::vector<CpuTierMiss>* cpu_tier_misses) {
++                                                                                       std::vector<CpuTierMiss>* cpu_tier_misses,
++                                                                                       bool* uploads_enqueued) {
++    // arcint M14 (patches/0017, review). Written on entry, before any
++    // possible early exit, not left untouched on some return path and set
++    // only on others: a caller's local bool need not be pre-initialized to
++    // get a well-defined value regardless of which path returns. Resident
++    // has no weight file to stream from, so it never enqueues an upload.
++    if (uploads_enqueued)
++        *uploads_enqueued = false;
+     // Resident: identity mapping, always succeeds. No slot pool, so no expert is
+     // ever a capacity miss - a wiring mistake that reaches here with a non-empty
+     // output vector is loud rather than silently ignored.
+@@ -252,7 +260,18 @@ void OffloadExpertWeightProvider::fill_routed_weight_views(cldnn::moe_weights& /
+ 
+ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultaneous(const std::vector<uint32_t>& experts,
+                                                                                       cldnn::stream& stream,
+-                                                                                      std::vector<CpuTierMiss>* cpu_tier_misses) {
++                                                                                      std::vector<CpuTierMiss>* cpu_tier_misses,
++                                                                                      bool* uploads_enqueued) {
++    // arcint M14 (patches/0017, review). Written on entry, before any
++    // possible early exit (including the capacity-exceeded nullopt return
++    // below), not left untouched on some return path and set only on
++    // others: a caller's local bool need not be pre-initialized to get a
++    // well-defined value regardless of which path returns. Overwritten
++    // below, at the end, with the real answer on every path that reaches
++    // there.
++    if (uploads_enqueued)
++        *uploads_enqueued = false;
++
+     // arcint M10 (patches/0013). Routing histogram: counted here, before any
+     // dedup/hit/miss logic below, and once per (call, expert-id occurrence) -
+     // a repeated id within one `experts` vector is incremented once per
+@@ -405,6 +424,14 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
+             _cache->set_filled(slot);
+     }
+ 
++    // arcint M14 (patches/0017). True exactly when this call issued at least
++    // one fill_weights_memory upload -- the warm-up free-slot fills of the
++    // cpu_tier_active branch, or any upload at all pre-M14/tier-off. Read by
++    // moe_3gemm_swiglu_opt.cpp to keep a warm-up call's speculative
++    // topk_id/x/rw readback timing out of the steady-state average.
++    if (uploads_enqueued)
++        *uploads_enqueued = !missed_experts.empty();
++
+     return slots;
+ }
+ 
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
+index f6c0cf5..5b9cc07 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <chrono>
+ #include <cstdint>
+ 
+ // arcint M9 (patches/0004): split out of moe_otd_runtime.hpp so that
+@@ -13,7 +14,7 @@
+ // runtime execution types) can update the shared counters without pulling in
+ // moe_otd_runtime.hpp's heavier prelude requirement (see the comment on that
+ // include in expert_weight_providers.cpp). This header has no dependency
+-// beyond <atomic>/<cstdint> and is safe to include from any layer.
++// beyond <atomic>/<chrono>/<cstdint> and is safe to include from any layer.
+ namespace ov::intel_gpu::ocl::moe_otd {
+ 
+ // Lightweight perf counters for OTD profiling.
+@@ -80,9 +81,111 @@ struct OtdPerfCounters {
+     std::atomic<uint64_t> cpu_task_lag_ns{0};
+     std::atomic<uint64_t> cpu_task_ns{0};
+ 
++    // arcint M14 (patches/0017, decomposing the 283 us cpu_x_readback_ns).
++    // moe_3gemm_swiglu_opt.cpp's on_before_batched_gemv now enqueues the
++    // topk_id readback together with the x (hidden_states) and routing-
++    // weight readbacks and joins all three with one wait_for_events (design
++    // doc §2 A2), *speculatively* -- before this layer is known to have any
++    // capacity miss -- so cpu_tier_calls (below) counts every tier-on call,
++    // not just the ones with a miss (contrast cpu_tier_layers above, which
++    // stays miss-only and unchanged: it still gates cpu_compute_ns/
++    // cpu_join_wait_ns/cpu_y_writeback_ns, none of which this patch touches).
++    // cpu_x_enq_ns is the span from the first enqueue to the last copy_to()
++    // call returning (driver submission, including any pinning of a
++    // pageable destination -- moot after this patch's usm_host destinations,
++    // §A1); cpu_x_wait_ns is the wait_for_events call alone. cpu_x_enq_ns +
++    // cpu_x_wait_ns must equal the retained cpu_x_readback_ns to within a few
++    // us (see tests/unit/test_cases/moe_3gemm_gpu_test.cpp,
++    // moe_otd_perf_counters.enq_plus_wait_equals_readback -- the host-only
++    // construction lock). cpu_topk_id_ns times
++    // the same merged span from the topk_id side; after this patch's hoist
++    // the two are the same number by construction (both start at the same
++    // tx0 and both end when the one combined wait returns) -- kept as its
++    // own counter because the design asked for it and because a later
++    // un-merge would make them diverge again without any further change
++    // here.
++    std::atomic<uint64_t> cpu_tier_calls{0};
++    std::atomic<uint64_t> cpu_topk_id_ns{0};
++    std::atomic<uint64_t> cpu_x_enq_ns{0};
++    std::atomic<uint64_t> cpu_x_wait_ns{0};
++    // Env-gated (MOE_OTD_READBACK_PROBE=1): a stream.finish() timed
++    // immediately before the topk_id/x/rw enqueue above, i.e. what a full
++    // queue drain would have cost right there. Close to cpu_x_readback_ns
++    // means the cost is queue backlog (H2), not the readback itself, and the
++    // 0018 residency change is misaimed -- the decisive discriminator (design
++    // doc §1). Reads 0 unless the probe is armed: it costs a real drain, so
++    // it must never run in the steady measurement.
++    std::atomic<uint64_t> cpu_x_drain_ns{0};
++    // The same topk_id+x+rw span, but for a call whose own
++    // try_acquire_simultaneous invocation enqueued a fill_weights_memory
++    // upload (the OffloadExpertWeightProvider::try_acquire_simultaneous
++    // uploads_enqueued out-flag) -- i.e. a warm-up call, per patches/0012's
++    // policy the only kind that ever uploads once the pool is full.
++    // cpu_x_warm_layers is a subset of cpu_tier_calls; steady-state calls are
++    // cpu_tier_calls - cpu_x_warm_layers (dump() computes it, no separate
++    // counter). Credited here instead of cpu_topk_id_ns/cpu_x_*_ns/
++    // cpu_x_readback_ns so warm-up's queued upload cost (design doc's H2)
++    // does not pollute the steady-state average the P* measurement is judged
++    // on.
++    std::atomic<uint64_t> cpu_x_warm_ns{0};
++    std::atomic<uint64_t> cpu_x_warm_layers{0};
++
+     void dump() const;
+ };
+ 
+ OtdPerfCounters* get_perf_counters();
+ 
++// arcint M14 (patches/0017, review round). Records one topk_id leg's span
++// (tx0 to t_done) into cpu_topk_id_ns alone. Split out from what used to be
++// one combined function so MOE_OTD_READBACK_NOHOIST=1
++// (moe_3gemm_swiglu_opt.cpp) can time topk_id's own blocking round trip
++// in isolation, as the design asked, without also touching cpu_x_enq_ns/
++// cpu_x_wait_ns/cpu_x_readback_ns -- those belong to a genuinely separate
++// span under that flag (patches/0012's order: topk_id blocking, then
++// try_acquire, then a miss-gated x/rw wait). In the default (hoisted) path
++// the caller passes the SAME (tx0, t_wait_done) pair to this function and to
++// record_cpu_x_timing below, which is what keeps cpu_topk_id_ns and the
++// retained cpu_x_readback_ns equal by construction post-hoist (see that
++// counter's comment above) -- the equality is a property of how the two
++// functions are called together, not of either function alone. Free
++// function, not inlined at the call site, so it is unit-testable without a
++// stream/engine -- see tests/unit/test_cases/moe_3gemm_gpu_test.cpp,
++// moe_otd_perf_counters.enq_plus_wait_equals_readback (which calls this
++// function and record_cpu_x_timing together, the same way the hoisted call
++// site does). Never called on the warm-up branch (cpu_x_warm_ns's comment)
++// or when the tier is off.
++template <typename TimePoint>
++inline void record_cpu_topk_id_timing(OtdPerfCounters& perf, TimePoint tx0, TimePoint t_done) {
++    perf.cpu_topk_id_ns.fetch_add(
++        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t_done - tx0).count()),
++        std::memory_order_relaxed);
++}
++
++// arcint M14 (patches/0017). Records the enq/wait decomposition of one x
++// (hidden_states) + routing-weight readback span into cpu_x_enq_ns/
++// cpu_x_wait_ns/the retained cpu_x_readback_ns, from three timestamps: the
++// span starts at tx0, the last non-blocking copy_to() call returns at
++// t_enq_done, and the wait_for_events covering both DMAs returns at
++// t_wait_done. A free function, not inlined at the call site, precisely so
++// the "enq + wait == readback" invariant is enforced by construction (one
++// place computes all three sums, so a future edit cannot update one without
++// the others) and so it is unit-testable without a stream/engine -- see
++// tests/unit/test_cases/moe_3gemm_gpu_test.cpp,
++// moe_otd_perf_counters.enq_plus_wait_equals_readback. Does NOT touch
++// cpu_topk_id_ns (see record_cpu_topk_id_timing above); the default
++// (hoisted) caller calls both functions with matching arguments, which is
++// what makes the two counters equal post-hoist, not anything internal to
++// either function. Never called on the warm-up branch or when the tier is
++// off; under MOE_OTD_READBACK_NOHOIST=1, called only for a call that had at
++// least one capacity miss (patches/0012's original gating).
++template <typename TimePoint>
++inline void record_cpu_x_timing(OtdPerfCounters& perf, TimePoint tx0, TimePoint t_enq_done, TimePoint t_wait_done) {
++    auto ns = [](TimePoint a, TimePoint b) {
++        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
++    };
++    perf.cpu_x_enq_ns.fetch_add(ns(tx0, t_enq_done), std::memory_order_relaxed);
++    perf.cpu_x_wait_ns.fetch_add(ns(t_enq_done, t_wait_done), std::memory_order_relaxed);
++    perf.cpu_x_readback_ns.fetch_add(ns(tx0, t_wait_done), std::memory_order_relaxed);
++}
++
+ }  // namespace ov::intel_gpu::ocl::moe_otd
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+index 9397366..a621660 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+@@ -30,6 +30,18 @@ void OtdPerfCounters::dump() const {
+     const auto cpu_pairs = cpu_tier_pairs.load(std::memory_order_relaxed);
+     const auto cpu_experts = cpu_tier_experts.load(std::memory_order_relaxed);
+     const auto cpu_layers = cpu_tier_layers.load(std::memory_order_relaxed);
++    // arcint M14 (patches/0017). cpu_tier_calls counts every tier-on
++    // on_before_batched_gemv call (the topk_id/x/rw read is speculative, so
++    // it runs on miss-free calls too); cpu_x_warm_layers is the subset of
++    // those that were still in the warm-up window (see moe_otd_perf.hpp).
++    // The steady-state calls -- the population cpu_topk_id_ns/cpu_x_enq_ns/
++    // cpu_x_wait_ns/cpu_x_readback_ns are actually summed over -- are the
++    // remainder; NOT cpu_tier_layers (miss-only), which is why this line
++    // does not reuse cpu_layers as their divisor the way the pre-0017 code
++    // did.
++    const auto cpu_calls = cpu_tier_calls.load(std::memory_order_relaxed);
++    const auto cpu_warm_layers = cpu_x_warm_layers.load(std::memory_order_relaxed);
++    const auto cpu_steady_layers = cpu_calls > cpu_warm_layers ? cpu_calls - cpu_warm_layers : 0;
+     // MOE_OTD_PERF_LOG is an explicit opt-in, so the dump goes to stderr
+     // unconditionally: GPU_DEBUG_COUT compiles to `if (0)` in a build without
+     // ENABLE_DEBUG_CAPS, which is every packaged plugin, and a counter line
+@@ -57,10 +69,28 @@ void OtdPerfCounters::dump() const {
+                    << ", avg_cpu_pairs_per_layer=" << (cpu_layers ? 1.0 * cpu_pairs / cpu_layers : 0.0)
+                    << ", avg_cpu_compute_us=" << (cpu_layers ? cpu_compute_ns.load(std::memory_order_relaxed) / 1000 / cpu_layers : 0)
+                    << ", avg_cpu_join_wait_us=" << (cpu_layers ? cpu_join_wait_ns.load(std::memory_order_relaxed) / 1000 / cpu_layers : 0)
+-                   << ", avg_cpu_x_us=" << (cpu_layers ? cpu_x_readback_ns.load(std::memory_order_relaxed) / 1000 / cpu_layers : 0)
++                   // arcint M14 (patches/0017). avg_cpu_x_us's divisor changed from
++                   // cpu_layers (miss-only) to cpu_steady_layers: the x/rw readback this
++                   // counter times is now speculative (§A2 hoist) and runs on every
++                   // steady-state tier-on call, miss or not -- see moe_otd_perf.hpp.
++                   << ", avg_cpu_x_us=" << (cpu_steady_layers ? cpu_x_readback_ns.load(std::memory_order_relaxed) / 1000 / cpu_steady_layers : 0)
+                    << ", avg_cpu_y_us=" << (cpu_layers ? cpu_y_writeback_ns.load(std::memory_order_relaxed) / 1000 / cpu_layers : 0)
+                    << ", avg_cpu_task_lag_us=" << (cpu_experts ? cpu_task_lag_ns.load(std::memory_order_relaxed) / 1000 / cpu_experts : 0)
+                    << ", avg_cpu_task_us=" << (cpu_experts ? cpu_task_ns.load(std::memory_order_relaxed) / 1000 / cpu_experts : 0)
++                   // arcint M14 (patches/0017). Readback decomposition: see
++                   // moe_otd_perf.hpp for what each counter means and the
++                   // enq+wait==readback invariant. avg_cpu_x_drain_us reads 0 unless
++                   // MOE_OTD_READBACK_PROBE=1 armed the probe for this run.
++                   << ", cpu_tier_calls=" << cpu_calls << ", cpu_steady_layers=" << cpu_steady_layers
++                   << ", cpu_x_warm_layers=" << cpu_warm_layers
++                   << ", avg_cpu_topk_id_us=" << (cpu_steady_layers ? cpu_topk_id_ns.load(std::memory_order_relaxed) / 1000 / cpu_steady_layers : 0)
++                   << ", avg_cpu_x_enq_us=" << (cpu_steady_layers ? cpu_x_enq_ns.load(std::memory_order_relaxed) / 1000 / cpu_steady_layers : 0)
++                   << ", avg_cpu_x_wait_us=" << (cpu_steady_layers ? cpu_x_wait_ns.load(std::memory_order_relaxed) / 1000 / cpu_steady_layers : 0)
++                   // cpu_x_drain_ns's probe runs on every tier-on call (warm and
++                   // steady alike, when armed), so its divisor is cpu_calls, not
++                   // cpu_steady_layers.
++                   << ", avg_cpu_x_drain_us=" << (cpu_calls ? cpu_x_drain_ns.load(std::memory_order_relaxed) / 1000 / cpu_calls : 0)
++                   << ", avg_cpu_x_warm_us=" << (cpu_warm_layers ? cpu_x_warm_ns.load(std::memory_order_relaxed) / 1000 / cpu_warm_layers : 0)
+                    << std::endl;
+ }
+ 
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+index 4c1fb49..5c2329b 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -704,9 +704,22 @@ public:
+     // dispatch_cpu_tier() and cpu_tier_join() within the same exec_batched_gemv.
+     std::vector<CpuTierMiss> _cpu_tier_misses;
+     // f16 bit patterns read back from device memory: the token(s)' hidden
+-    // states and the compact routing-weight buffer (§4.1 of the binding spec).
+-    std::vector<uint16_t> _cpu_x_host;
+-    std::vector<uint16_t> _cpu_rw_host;
++    // states and the compact routing-weight buffer (§4.1 of the binding
++    // spec). arcint M14 (patches/0017, §A1): usm_host (GTT) engine memory
++    // rather than std::vector, so the destination the driver DMAs into is
++    // host-visible without a per-call pin/bounce of a pageable buffer
++    // (design doc's H1) - same allocation_type::usm_host pattern
++    // StagingRing::acquire uses (moe_otd_runtime.cpp), and the same "no
++    // map()/lock() call, ordering is the event wait alone" USM contract.
++    // Lazily (re)allocated by ensure_cpu_host_scratch() below; default-null
++    // and capacity 0, exactly like the std::vector members they replace, so
++    // make_deep_copy's clone() needs no new entry for them (reviewed against
++    // 0012's dormant-tier defect: these are scratch, not configuration - see
++    // clone() below for what *does* need an entry).
++    cldnn::memory::ptr _cpu_x_host_mem;
++    size_t _cpu_x_host_capacity = 0;
++    cldnn::memory::ptr _cpu_rw_host_mem;
++    size_t _cpu_rw_host_capacity = 0;
+     // CPU-computed output rows, one HIDDEN_SIZE f16 row per (miss, position),
+     // in the same iteration order dispatch_cpu_tier() and cpu_tier_join() both
+     // walk (_cpu_tier_misses, then positions) - that shared order is what lets
+@@ -805,6 +818,32 @@ public:
+         }
+     }
+ 
++    // arcint M14 (patches/0017, §A1). Lazily grows a persistent usm_host
++    // scratch buffer to at least `bytes`, mirroring StagingRing::acquire's
++    // allocation pattern (moe_otd_runtime.cpp) so it can be reused call over
++    // call instead of round-tripping through the allocator every layer. No
++    // lock()/map() is made or needed: the caller orders every read/write of
++    // the returned pointer against the copy's completion event itself (the
++    // same USM contract StagingRing already relies on). On regrowth the old
++    // allocation is simply replaced, with no wait on it first: by the time
++    // this runs again for the next call, the previous call's DMAs into it
++    // were already joined (wait_for_events, in the caller) and any CPU
++    // worker reading from it was already joined too (cpu_tier_join's
++    // pool.wait(), before exec_batched_gemv returns) -- nothing is still in
++    // flight against the old buffer. Bytes beyond the current call's
++    // `bytes` (capacity margin left over from a larger past call) are
++    // uninitialised by design: every reader indexes strictly within
++    // [0, bytes) for the call that requested it (dispatch_cpu_tier bounds
++    // job.x by that call's token_num), so the unused tail is never read.
++    void* ensure_cpu_host_scratch(cldnn::engine& engine, cldnn::memory::ptr& mem, size_t& capacity, size_t bytes) {
++        if (!mem || capacity < bytes) {
++            auto layout = cldnn::layout({1, 1, 1, static_cast<ov::Dimension::value_type>(bytes)}, cldnn::data_types::u8, cldnn::format::bfyx);
++            mem = engine.allocate_memory(layout, cldnn::allocation_type::usm_host, false);
++            capacity = bytes;
++        }
++        return mem->buffer_ptr();
++    }
++
+     // arcint M14 (patches/0012). Builds one ExpertDesc for `expert` from the
+     // weight file's mapping. The CPU reads the FILE layout: weights as stored,
+     // scales [oc][group] and u4 zero points as stored. The upload path
+@@ -897,6 +936,16 @@ public:
+     // this patch's header. Must be called after _cpu_x_host/_cpu_rw_host are
+     // populated and before cpu_tier_join()'s wait().
+     void dispatch_cpu_tier(typed_primitive_inst<moe_3gemm_fused_compressed>& instance) {
++        // arcint M14 (patches/0017, review). Only ever called with
++        // _cpu_tier_misses non-empty, and on_before_batched_gemv fetches x/rw
++        // (populating these two buffers) exactly when that condition holds,
++        // in both the default hoisted path (always, whenever _cpu_tier) and
++        // under MOE_OTD_READBACK_NOHOIST=1 (miss-gated, same condition this
++        // function is called under) -- so a null buffer here is a caller
++        // wiring bug, not a reachable runtime state, and is loud rather than
++        // a silent null-pointer read inside the job loop below.
++        OPENVINO_ASSERT(_cpu_x_host_mem && _cpu_rw_host_mem,
++                        "dispatch_cpu_tier: x/routing-weight usm_host buffers not populated");
+         auto* otd = static_cast<OffloadExpertWeightProvider*>(_weight_provider.get());
+ 
+         size_t total_positions = 0;
+@@ -912,13 +961,20 @@ public:
+         tasks.reserve(_cpu_tier_misses.size());
+         size_t row = 0;
+         const int hidden = _hidden_size;
++        // arcint M14 (patches/0017, §A1). usm_host memory, not a
++        // std::vector: see the member declarations above and
++        // ensure_cpu_host_scratch(). Both buffers were already sized and
++        // filled by on_before_batched_gemv's hoisted readback before this
++        // function is called (see that function's header comment).
++        auto* x_host = static_cast<const uint16_t*>(_cpu_x_host_mem->buffer_ptr());
++        auto* rw_host = static_cast<const uint16_t*>(_cpu_rw_host_mem->buffer_ptr());
+         for (const auto& m : _cpu_tier_misses) {
+             _cpu_descs.push_back(build_cpu_expert_desc(m.expert, instance, *otd));
+             const size_t job_begin = _cpu_jobs.size();
+             for (size_t pos : m.positions) {
+                 ExpertJob job;
+-                job.x = _cpu_x_host.data() + (pos / _max_topk) * static_cast<size_t>(hidden);
+-                job.w_route = _cpu_rw_host[pos];
++                job.x = x_host + (pos / _max_topk) * static_cast<size_t>(hidden);
++                job.w_route = rw_host[pos];
+                 job.y = _cpu_out_rows.data() + row * static_cast<size_t>(hidden);
+                 _cpu_jobs.push_back(job);
+                 ++row;
+@@ -1034,8 +1090,113 @@ public:
+         if (force_finish || stream.get_queue_type() != cldnn::QueueTypes::in_order)
+             stream.finish();
+ 
++        // arcint M14 (patches/0017, §A2 hoist; design doc §1/§2). Tier off:
++        // this block is exactly patches/0012's single blocking topk_id
++        // round trip, untouched -- byte-identical control flow, so the
++        // tier-off equivalence baseline cannot move. Tier on (default,
++        // MOE_OTD_READBACK_NOHOIST unset): topk_id, x (hidden_states) and
++        // the routing weights are enqueued together, *speculatively*
++        // (before this layer is known to have any capacity miss at all),
++        // and joined with one wait_for_events, ahead of
++        // try_acquire_simultaneous and the slot-index upload below. "x" here
++        // is shorthand for the x+routing-weight bundle exactly as
++        // avg_cpu_x_us already reported it pre-0017 (the two were always
++        // joined in one wait since patches/0012); the design's §2 A2 text
++        // names only "the x copy" next to topk_id because that bundling was
++        // already the status quo it was written against.
++        //
++        // MOE_OTD_READBACK_NOHOIST=1 (static const bool, MOE_OTD_FORCE_
++        // FINISH/MOE_OTD_PERF_LOG style -- arms on the variable's presence,
++        // any value including an empty one, not on a particular value)
++        // restores patches/0012's order instead: topk_id read blocking and
++        // alone, then try_acquire_simultaneous, then (after the slot-index
++        // upload, exactly where 0012 had it) x/rw read only if this call had
++        // a miss. One build can then measure both the hoist's win and the
++        // topk_id round trip in isolation, by flag, instead of by comparing
++        // across patch revisions.
++        //
++        // Consequence, stated rather than hidden: hoisted, cpu_topk_id_ns
++        // and the retained cpu_x_readback_ns measure the same merged span by
++        // construction (both start at tx0, both end when the one combined
++        // wait returns) -- there is no way, hoisted, to isolate what the
++        // topk_id-only round trip would have cost alone; that separation
++        // only exists under MOE_OTD_READBACK_NOHOIST=1 (or in the
++        // patches/0001-0016 code this patch changes). See moe_otd_perf.hpp's
++        // record_cpu_topk_id_timing/record_cpu_x_timing for how the two
++        // counters are kept independently correct in both modes.
+         std::vector<uint32_t> expert_ids(topk_count);
+-        scratch.topk_id->copy_to(stream, expert_ids.data(), 0, 0, topk_count * sizeof(uint32_t), true);
++        std::chrono::steady_clock::time_point tx0{};
++        std::chrono::steady_clock::time_point t_topk_done{};
++        std::chrono::steady_clock::time_point tx0_xrw{};
++        std::chrono::steady_clock::time_point t_enq_done{};
++        std::chrono::steady_clock::time_point t_wait_done{};
++        bool have_xrw_timing = false;
++        static const bool nohoist = std::getenv("MOE_OTD_READBACK_NOHOIST") != nullptr;
++        if (_cpu_tier) {
++            // arcint M14 (patches/0017). Decisive discriminator for H2
++            // (design doc §1): a full queue drain timed immediately before
++            // the speculative reads below, opt-in only via
++            // MOE_OTD_READBACK_PROBE=1 (arms on presence, same convention as
++            // MOE_OTD_READBACK_NOHOIST above) because it costs a real drain
++            // and must never run in the steady measurement. A value close to
++            // the retained cpu_x_readback_ns means the cost was queue
++            // backlog, not the readback itself, and the 0018 residency
++            // change would buy nothing.
++            static const bool readback_probe = std::getenv("MOE_OTD_READBACK_PROBE") != nullptr;
++            if (readback_probe) {
++                const auto td0 = std::chrono::steady_clock::now();
++                stream.finish();
++                if (auto* perf = moe_otd::get_perf_counters()) {
++                    perf->cpu_x_drain_ns.fetch_add(
++                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                                  std::chrono::steady_clock::now() - td0)
++                                                  .count()),
++                        std::memory_order_relaxed);
++                }
++            }
++
++            // arcint M14 (patches/0017, review fix). Stamped HERE, after the
++            // probe above, not before it: tx0 above the probe would fold an
++            // armed drain's own stream.finish() cost into cpu_topk_id_ns/
++            // cpu_x_enq_ns/cpu_x_readback_ns, contaminating exactly the
++            // measurement MOE_OTD_READBACK_PROBE exists to keep separate
++            // from the steady one.
++            tx0 = std::chrono::steady_clock::now();
++
++            if (!nohoist) {
++                auto& engine = instance.get_network().get_engine();
++                auto hs_mem = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
++                const size_t x_bytes = token_num * static_cast<size_t>(_hidden_size) * sizeof(uint16_t);
++                const size_t rw_bytes = topk_count * sizeof(uint16_t);
++                // arcint M14 (patches/0017, §A1). usm_host destinations --
++                // see ensure_cpu_host_scratch() and the member declarations
++                // above. In effect regardless of MOE_OTD_READBACK_NOHOIST:
++                // that flag only reorders these reads, it does not revert
++                // their destination memory type.
++                auto* x_dst = ensure_cpu_host_scratch(engine, _cpu_x_host_mem, _cpu_x_host_capacity, x_bytes);
++                auto* rw_dst = ensure_cpu_host_scratch(engine, _cpu_rw_host_mem, _cpu_rw_host_capacity, rw_bytes);
++
++                auto ev_topk = scratch.topk_id->copy_to(stream, expert_ids.data(), 0, 0, topk_count * sizeof(uint32_t), false);
++                auto ev_x = hs_mem->copy_to(stream, x_dst, 0, 0, x_bytes, false);
++                auto ev_rw = scratch.topk_weights->copy_to(stream, rw_dst, 0, 0, rw_bytes, false);
++                t_enq_done = std::chrono::steady_clock::now();
++                stream.wait_for_events({ev_topk, ev_x, ev_rw});
++                t_wait_done = std::chrono::steady_clock::now();
++                t_topk_done = t_wait_done;
++                tx0_xrw = tx0;
++                have_xrw_timing = true;
++            } else {
++                // MOE_OTD_READBACK_NOHOIST: patches/0012 order -- topk_id
++                // alone, blocking. x/rw (if this call turns out to have a
++                // miss) are read further below, after the slot-index upload,
++                // in the same position 0012 had them.
++                scratch.topk_id->copy_to(stream, expert_ids.data(), 0, 0, topk_count * sizeof(uint32_t), true);
++                t_topk_done = std::chrono::steady_clock::now();
++            }
++        } else {
++            // Pre-M14 code, unchanged: one blocking round trip, uncounted.
++            scratch.topk_id->copy_to(stream, expert_ids.data(), 0, 0, topk_count * sizeof(uint32_t), true);
++        }
+ 
+         // arcint M14 (patches/0012). Cleared here (not just on_before_batched_
+         // gemv's caller) so a fallback return below never leaves a stale miss
+@@ -1043,7 +1204,9 @@ public:
+         // a non-null destination (on_before_prefill and build_grouped_mask_otd
+         // keep passing nullptr, §1's "prefill is untouched").
+         _cpu_tier_misses.clear();
+-        auto lease = _weight_provider->try_acquire_simultaneous(expert_ids, stream, _cpu_tier ? &_cpu_tier_misses : nullptr);
++        bool uploads_enqueued = false;
++        auto lease = _weight_provider->try_acquire_simultaneous(
++            expert_ids, stream, _cpu_tier ? &_cpu_tier_misses : nullptr, _cpu_tier ? &uploads_enqueued : nullptr);
+         if (!lease) {
+             if (auto* perf = moe_otd::get_perf_counters())
+                 perf->batched_fallbacks.fetch_add(1, std::memory_order_relaxed);
+@@ -1063,37 +1226,75 @@ public:
+             slots_u32[i] = static_cast<uint32_t>((*lease)[i]);
+         scratch._expert_index_buffer->copy_from(stream, slots_u32.data(), 0, 0, topk_bytes, true);
+ 
+-        // arcint M14 (patches/0012, §4.1). In steady state (pool full, no
+-        // free slot) nothing was enqueued between the blocking topk_id
+-        // readback above and here, so these two copies are DMAs, not waits.
+-        // During warm-up, misses that found a free slot were uploaded by
+-        // fill_weights_memory inside try_acquire_simultaneous, and the wait
+-        // below covers those uploads too (in-order queue); cpu_x_readback_ns
+-        // then includes them. They are enqueued non-blocking and
+-        // joined with one wait: the cost of a host readback at this size
+-        // (x is token_num*hidden*2 bytes, the routing weights a few dozen)
+-        // is the queue round trip, not the bytes, and two blocking copies
+-        // paid it twice (measured avg_cpu_x_us ~350 per layer).
+-        if (!_cpu_tier_misses.empty()) {
++        // arcint M14 (patches/0017). MOE_OTD_READBACK_NOHOIST-only: x/rw,
++        // miss-gated, in the exact position patches/0012 had them -- after
++        // the slot-index upload, before dispatch_cpu_tier(). Hoisted, x/rw
++        // were already fetched above (have_xrw_timing already true).
++        if (_cpu_tier && nohoist && !_cpu_tier_misses.empty()) {
+             auto hs_mem = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
+             const size_t x_bytes = token_num * static_cast<size_t>(_hidden_size) * sizeof(uint16_t);
+             const size_t rw_bytes = topk_count * sizeof(uint16_t);
+-            _cpu_x_host.resize(x_bytes / sizeof(uint16_t));
+-            _cpu_rw_host.resize(topk_count);
+-            const auto tx0 = std::chrono::steady_clock::now();
+-            auto ev_x = hs_mem->copy_to(stream, _cpu_x_host.data(), 0, 0, x_bytes, false);
+-            auto ev_rw = scratch.topk_weights->copy_to(stream, _cpu_rw_host.data(), 0, 0, rw_bytes, false);
++            auto* x_dst = ensure_cpu_host_scratch(engine, _cpu_x_host_mem, _cpu_x_host_capacity, x_bytes);
++            auto* rw_dst = ensure_cpu_host_scratch(engine, _cpu_rw_host_mem, _cpu_rw_host_capacity, rw_bytes);
++            tx0_xrw = std::chrono::steady_clock::now();
++            auto ev_x = hs_mem->copy_to(stream, x_dst, 0, 0, x_bytes, false);
++            auto ev_rw = scratch.topk_weights->copy_to(stream, rw_dst, 0, 0, rw_bytes, false);
++            t_enq_done = std::chrono::steady_clock::now();
+             stream.wait_for_events({ev_x, ev_rw});
++            t_wait_done = std::chrono::steady_clock::now();
++            have_xrw_timing = true;
++        }
++
++        // arcint M14 (patches/0017). Credits the topk_id (and, if fetched,
++        // x/rw) span(s) computed above to the warm-up bucket when this
++        // call's own try_acquire_simultaneous enqueued a fill_weights_memory
++        // upload (uploads_enqueued), else to the steady-state counters.
++        // Policy (patches/0012's header, §2.4): once the pool is full, no
++        // call ever uploads again, so uploads_enqueued is a deterministic
++        // warm-up flag, not a heuristic -- every call of a run is either
++        // "warm" or "steady" and, once it turns steady, stays that way for
++        // the rest of the run. Without this split, warm-up's queued-upload
++        // cost (design doc's H2) would land in the steady-state average the
++        // P* measurement is judged on.
++        if (_cpu_tier) {
+             if (auto* perf = moe_otd::get_perf_counters()) {
+-                perf->cpu_x_readback_ns.fetch_add(
+-                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+-                                              std::chrono::steady_clock::now() - tx0)
+-                                              .count()),
+-                    std::memory_order_relaxed);
++                perf->cpu_tier_calls.fetch_add(1, std::memory_order_relaxed);
++                if (uploads_enqueued) {
++                    auto ns = [](auto a, auto b) {
++                        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
++                    };
++                    // Hoisted, the topk_id leg and the x/rw leg are the same
++                    // wait (tx0 == tx0_xrw, t_topk_done == t_wait_done):
++                    // credit that one span once, not twice. Under
++                    // MOE_OTD_READBACK_NOHOIST the two legs are genuinely
++                    // separate (or the x/rw leg never ran at all, for a
++                    // warm-but-miss-free call) and are summed.
++                    uint64_t warm_span = ns(tx0, t_topk_done);
++                    if (have_xrw_timing) {
++                        if (nohoist)
++                            warm_span += ns(tx0_xrw, t_wait_done);
++                        else
++                            warm_span = ns(tx0_xrw, t_wait_done);  // same span as the topk leg; replace, don't double
++                    }
++                    perf->cpu_x_warm_ns.fetch_add(warm_span, std::memory_order_relaxed);
++                    perf->cpu_x_warm_layers.fetch_add(1, std::memory_order_relaxed);
++                } else {
++                    // arcint M14 (patches/0017). record_cpu_topk_id_timing
++                    // and record_cpu_x_timing are shared with the host-only
++                    // tests (moe_otd_perf.hpp's comments on both) so the
++                    // enq+wait==readback invariant, and the topk_id/x_
++                    // readback split, are enforced by construction rather
++                    // than re-derived at each call site.
++                    moe_otd::record_cpu_topk_id_timing(*perf, tx0, t_topk_done);
++                    if (have_xrw_timing)
++                        moe_otd::record_cpu_x_timing(*perf, tx0_xrw, t_enq_done, t_wait_done);
++                }
+             }
+-            dispatch_cpu_tier(instance);
+         }
+ 
++        if (!_cpu_tier_misses.empty())
++            dispatch_cpu_tier(instance);
++
+         set_otd_weight_pointers(instance, scratch);
+         needs_fallback = false;
+     }
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
+index 1e647d8..101eaf9 100644
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
+@@ -3,6 +3,7 @@
+ //
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
+ #include <intel_gpu/primitives/data.hpp>
+ #include <intel_gpu/primitives/fully_connected.hpp>
+@@ -14,10 +15,17 @@
+ #include <intel_gpu/runtime/memory.hpp>
+ #include <iostream>
+ #include <numeric>
++#include <sstream>
++#include <string>
+ 
+ #include "../../common/random_generator.hpp"
+ #include "../test_utils/test_utils.h"
+ #include "moe_3gemm_test_data.h"
++// arcint M14 (patches/0017). Host-only: OtdPerfCounters,
++// record_cpu_topk_id_timing()/record_cpu_x_timing(), and dump() have no
++// cldnn graph/runtime dependency (see that header's file comment), so this
++// include needs nothing else added here.
++#include "ocl_v2/moe/moe_otd_perf.hpp"
+ // arcint M14 (patches/0012, T2). network::get_primitive() returns a
+ // std::shared_ptr<primitive_inst> (the base class); get_intermediates_
+ // memories() needs its complete type, which the primitive-specific *_inst.h
+@@ -1776,6 +1784,122 @@ TEST(moe_3gemm_cpu_tier, sentinel_skip_leaves_rows_untouched) {
+     }
+ }
+ 
++// arcint M14 (patches/0017). Host-only: no engine, no stream, no GPU device
++// -- record_cpu_topk_id_timing()/record_cpu_x_timing() and OtdPerfCounters
++// are pure host C++ (moe_otd_perf.hpp's file comment: "no dependency beyond
++// <atomic>/<chrono>/<cstdint>"), so this test runs in every world this
++// environment can reach, including one with no card at all. It is NOT run
++// on a card in this environment either (task rule: nothing runs on the GPU
++// here); the orchestrator's on-card window runs it alongside the T2/T4
++// suite the same way it always has.
++//
++// This is a construction lock, not a red-first test: given this patch's
++// actual on_before_batched_gemv, there is no code path that could call
++// these two functions with timestamps that violate the invariants below --
++// the hoisted path always passes them the same (tx0, t_wait_done) pair, and
++// record_cpu_x_timing's own body computes cpu_x_enq_ns + cpu_x_wait_ns as
++// two halves of the same interval by construction. What it locks against is
++// a future edit that breaks that construction -- e.g. record_cpu_x_timing
++// computing cpu_x_wait_ns from the wrong pair of timestamps, ns(tx0,
++// t_wait_done) instead of ns(t_enq_done, t_wait_done) (duplicating the enq
++// span instead of measuring the remainder). With the three synthetic
++// timestamps below (tx0=0, t_enq_done=50000, t_wait_done=283000), the
++// correct decomposition is enq=50000 wait=233000 sum=283000; that specific
++// bug would instead sum to 50000+283000=333000, tripping the first
++// EXPECT_EQ below. Run today against this patch's actual code, every
++// assertion here is green -- proof of the construction, not evidence a
++// defect was found.
++TEST(moe_otd_perf_counters, enq_plus_wait_equals_readback) {
++    using ov::intel_gpu::ocl::moe_otd::OtdPerfCounters;
++    using ov::intel_gpu::ocl::moe_otd::record_cpu_topk_id_timing;
++    using ov::intel_gpu::ocl::moe_otd::record_cpu_x_timing;
++    using clock = std::chrono::steady_clock;
++
++    OtdPerfCounters perf;
++    // Every patches/0017 counter starts at 0 -- the struct's own {0} member
++    // initializers, exercised directly (the "tier off" vacuity a real run
++    // is judged on is the same fact, reached by not calling either function
++    // at all rather than by asserting on a fresh struct).
++    ASSERT_EQ(perf.cpu_topk_id_ns.load(), 0U);
++    ASSERT_EQ(perf.cpu_x_enq_ns.load(), 0U);
++    ASSERT_EQ(perf.cpu_x_wait_ns.load(), 0U);
++    ASSERT_EQ(perf.cpu_x_readback_ns.load(), 0U);
++    ASSERT_EQ(perf.cpu_x_drain_ns.load(), 0U);
++    ASSERT_EQ(perf.cpu_x_warm_ns.load(), 0U);
++    ASSERT_EQ(perf.cpu_x_warm_layers.load(), 0U);
++    ASSERT_EQ(perf.cpu_tier_calls.load(), 0U);
++
++    const clock::time_point tx0{};
++    const clock::time_point t_enq_done = tx0 + std::chrono::microseconds(50);
++    const clock::time_point t_wait_done = tx0 + std::chrono::microseconds(283);
++    // The hoisted call site passes both functions the SAME (tx0,
++    // t_wait_done) pair -- reproduced here rather than asserted as an
++    // internal property of either function, since it is a fact about the
++    // caller, not about record_cpu_topk_id_timing/record_cpu_x_timing
++    // individually.
++    record_cpu_topk_id_timing(perf, tx0, t_wait_done);
++    record_cpu_x_timing(perf, tx0, t_enq_done, t_wait_done);
++
++    const auto enq = perf.cpu_x_enq_ns.load();
++    const auto wait = perf.cpu_x_wait_ns.load();
++    const auto readback = perf.cpu_x_readback_ns.load();
++    const auto topk = perf.cpu_topk_id_ns.load();
++    EXPECT_EQ(enq, 50000U);
++    EXPECT_EQ(wait, 233000U);
++    EXPECT_EQ(enq + wait, readback) << "enq (" << enq << ") + wait (" << wait << ") != retained readback (" << readback << ")";
++    EXPECT_EQ(readback, 283000U);
++    // Post-hoist consequence stated in moe_otd_perf.hpp: the two are equal
++    // because the caller fed both functions the same span, not because of
++    // anything internal to either function.
++    EXPECT_EQ(topk, readback);
++
++    // A second (distinct) call accumulates rather than overwrites -- the
++    // fetch_add semantics dump()'s avg_cpu_*_us math (total / layer count)
++    // depends on.
++    const clock::time_point tx0_b = tx0 + std::chrono::microseconds(1000);
++    const clock::time_point t_enq_done_b = tx0_b + std::chrono::microseconds(40);
++    const clock::time_point t_wait_done_b = tx0_b + std::chrono::microseconds(300);
++    record_cpu_topk_id_timing(perf, tx0_b, t_wait_done_b);
++    record_cpu_x_timing(perf, tx0_b, t_enq_done_b, t_wait_done_b);
++    EXPECT_EQ(perf.cpu_x_enq_ns.load(), enq + 40000U);
++    EXPECT_EQ(perf.cpu_x_wait_ns.load(), wait + 260000U);
++    EXPECT_EQ(perf.cpu_x_readback_ns.load(), readback + 300000U);
++    EXPECT_EQ(perf.cpu_x_enq_ns.load() + perf.cpu_x_wait_ns.load(), perf.cpu_x_readback_ns.load());
++}
++
++// arcint M14 (patches/0017, review). Host-only, red against patches/0012:
++// dump()'s avg_cpu_x_us divisor changed from cpu_tier_layers (miss-only) to
++// cpu_steady_layers = cpu_tier_calls - cpu_x_warm_layers
++// (moe_otd_runtime.cpp), because the x/rw readback it times is now
++// speculative and runs on every steady tier-on call, not just the ones with
++// a miss. Constructs an OtdPerfCounters directly, sets the four counters
++// dump()'s avg_cpu_x_us line depends on, and captures the stderr line
++// dump() writes -- no engine/stream/device. Red against patches/0012: with
++// cpu_tier_calls=40, cpu_x_warm_layers=8 (cpu_steady_layers=32),
++// cpu_tier_layers=12, and cpu_x_readback_ns=32*283000 ns (this patch's
++// reading: 283 us/call over 32 steady calls), the correct line reads
++// avg_cpu_x_us=283; patches/0012's cpu_tier_layers-based divisor would
++// print 9056/12=754 (integer division) instead, which the second EXPECT
++// below would catch as present in the line.
++TEST(moe_otd_perf_counters, dump_avg_cpu_x_us_uses_steady_layer_divisor) {
++    using ov::intel_gpu::ocl::moe_otd::OtdPerfCounters;
++
++    OtdPerfCounters perf;
++    perf.cpu_tier_calls.store(40);
++    perf.cpu_x_warm_layers.store(8);
++    perf.cpu_tier_layers.store(12);
++    perf.cpu_x_readback_ns.store(32ULL * 283000ULL);
++
++    std::ostringstream captured;
++    std::streambuf* old_cerr_buf = std::cerr.rdbuf(captured.rdbuf());
++    perf.dump();
++    std::cerr.rdbuf(old_cerr_buf);
++
++    const std::string line = captured.str();
++    EXPECT_NE(line.find("avg_cpu_x_us=283"), std::string::npos) << "dump() line: " << line;
++    EXPECT_EQ(line.find("avg_cpu_x_us=754"), std::string::npos) << "dump() line: " << line;
++}
++
+ TEST(moe_3gemm_expert_mask, shape_predictor_overflow_regression) {
+     // Simulates Gemma4-26b MoE: 128 experts, top_k=8, 274 tokens in prefill
+     constexpr int num_experts = 128;
