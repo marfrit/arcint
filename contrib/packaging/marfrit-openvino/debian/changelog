@@ -1,3 +1,36 @@
+marfrit-openvino (2026.4.0~dev20260821+p3-1) bookworm trixie; urgency=medium
+
+  * Three more patches applied on top of +p2, same upstream commit
+    (71640275), same smallest-sufficient-divergence numbering:
+    - patches/0014: the GPU plugin's Assign adopts a same-type,
+      same-rank output layout instead of asserting, closing the
+      DFlash2 draft head's disable at prompts whose first draft
+      concatenates exactly the state window's row count.
+    - patches/0015: paged attention bounded partials — an f16 host
+      sizing fix for the mixed-stage tmp_out buffer (it was allocating
+      at 4 bytes/element for an already-f16 kernel output), a new
+      read-write plugin property, PAGED_ATTENTION_MAX_PARTITIONS,
+      bounding the online-merge partition count so the scratch term
+      stops scaling with n_ctx past a fixed point, and the argument
+      rebind fix: the implementation now records the identity of every
+      intermediate its kernel arguments were bound to and forces a
+      rebind when any changes, closing a use-after-free that only
+      appears once the bound above makes the buffer's size plateau.
+      Upgrade note: this option lands in the GPU model-cache blob's
+      positionally serialised property schema — clear the GPU model
+      cache (--cache-dir, if set) when upgrading to this level.
+    - patches/0016: sizes the paged-attention intermediate buffers
+      (exp_sums/max_logits/tmp_out) from the current call's partition
+      count instead of reusing the previous call's, a stale-count
+      hardening on top of 0015's corrected buffers.
+    patches/README.md carries what each one is for and the measured
+    numbers behind it.
+  * The runtime reports itself as 2026.4.0-22849-71640275d29-marfrit-p3,
+    so a version string in a log distinguishes this build from +p2 and
+    from the stock nightly.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Fri, 04 Sep 2026 09:00:00 +0200
+
 marfrit-openvino (2026.4.0~dev20260821+p2-1) bookworm trixie; urgency=medium
 
   * Ten more patches applied on top of +p1, same upstream commit

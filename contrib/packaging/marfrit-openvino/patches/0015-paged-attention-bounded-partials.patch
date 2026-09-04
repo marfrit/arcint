@@ -1,0 +1,3068 @@
+# GPU plugin: paged attention bounded partials - f16 host sizing plus an
+# online-merge partition cap
+#
+# docs/design-m8-asymmetric-kv.md's follow-up, §7.0.2ab (2026-09-03): on
+# the card measured there, the u8:i4 auto-fit lands at 101,984 tokens
+# instead of u8's 133,456 because the GENERATE/MIXED-stage mixed attention
+# scratch buffer grows with context depth (measured: 932 MiB at 98k
+# (331,500 chars = 98,147 tokens)/chunk 128, the `CL_OUT_OF_RESOURCES` fault
+# §7.0.2ab root-caused to the xe driver's rebind worker failing on a full
+# card, "-12" in the kernel log). Applied against the pinned runtime, build
+# 2026.4.0-22849-71640275d29, on top of patches/0001-0014.
+#
+# (B) THE RECON CORRECTION, STATED AS A CORRECTION (§7.0.2ab left this
+# question open; the source answers it): `tmp_out` is ALREADY f16. Both
+# stage-0 and finalization kernels declare it `OUTPUT_TYPE`
+# (paged_attention_opt.cl:98, 1037), which `make_layout_jit_constants`
+# resolves from the IR's real output dtype - f16 on every model this repo
+# serves. Only the HOST sizing was wrong:
+# `paged_attention_opt.cpp::get_internal_buffer_descs` hardcoded
+# `element_size = 4` and applied it to tmp_out unconditionally, while
+# exp_sums/max_logits are correctly 4 B - they are genuinely f32
+# (softmax_accumulator_type). (Named by role, not number, throughout this
+# header: get_internal_buffer_descs()'s descs are packed densely and
+# has_scores_output() shifts every index from exp_sums onward by two, so
+# there is no single fixed number for any of these - in the no-scores
+# MIXED-stage indexing arcint serves it is exp_sums=3, max_logits=4,
+# tmp_out=5, and index 6 is the gws->subsequence mapping; the construction
+# sites size each correctly regardless of which index it lands at.) The
+# mixed stage allocated exactly twice the bytes its kernels address.
+# Fixed by sizing tmp_out with
+# `get_element_size(output_layouts[0].data_type)` instead - no kernel
+# line changes, same addresses written and read, half the term. Byte-exact
+# by construction; not gated on precision (a 2x over-allocation on u8 was
+# not worth preserving as a divergent path).
+#
+# The f16-range question §7.0.2ab left open is answered by source, not
+# inferred: the per-partition softmax divides `slm_qk_vals` by that
+# partition's `exp_sum` (paged_attention_opt.cl, pre-patch line 584)
+# *before* the V accumulation, so `tmp_out` holds NORMALISED partials - a
+# convex combination of dequantised V, O(max|V|) - never an unnormalised
+# partial sum. There is no range hazard on this path.
+#
+# (C) THE ENGINE CONTRACT: one RW config option, wired the way patches/0008
+# wired VALUE_CACHE_PRECISION -
+#   - `include/intel_gpu/runtime/options.inl`:
+#     `OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, paged_attention_max_partitions,
+#     0, ...)` - registers the property, generates
+#     get_paged_attention_max_partitions()/m_paged_attention_max_partitions
+#     the same way every other option in this file does.
+#   - `openvino/runtime/intel_gpu/properties.hpp`:
+#     `ov::intel_gpu::paged_attention_max_partitions`, string
+#     "PAGED_ATTENTION_MAX_PARTITIONS", `Property<size_t, PropertyMutability::RW>`
+#     - a genuinely new property (unlike 0008's VALUE_CACHE_PRECISION, no
+#     existing public property already covers this).
+#   - `plugin.cpp`'s `get_supported_properties()`: added to the RW list next
+#     to `moe_cpu_tier_threads`.
+#   - `compiled_model.cpp`'s `get_property()`: added to the RO list next to
+#     `moe_cpu_tier_threads` (queryable after compile, the way every other
+#     property in that list already is).
+# 0 (default) is unbounded - every existing caller, byte-identical to
+# before this patch existed. The engine detects support by reading the
+# property back after compile_model (`core_.get_property(device,
+# ov::intel_gpu::paged_attention_max_partitions)`); an unpatched plugin
+# throws on the unknown key, and the engine falls back to today's
+# depth-scaled reservation term without ever setting the key - the
+# fit-term change on the arcint side is out of scope for this task and is
+# not part of this patch.
+#
+# OPERATIONAL NOTE, for the CHANGELOG: this options.inl insertion adds a
+# new name to the sorted option set that ov::PluginConfig::visit_attributes
+# (de)serializes POSITIONALLY into a GPU model-cache blob - the exact
+# mechanism patches/0008's own ExecutionConfig::visit_attributes schema
+# guard (execution_config.cpp, "Round 5") exists to catch: a stale-schema
+# blob written before this patch fails the guard's signature check and is
+# rejected outright (the caller recompiles), not silently misread. That
+# guard was built and is expected to do its job here - but the clean,
+# quiet way to upgrade to this plugin level is still to clear the GPU
+# model cache directory once, exactly as 0008's own header already advises
+# for any plugin build that changes this option schema, this one included.
+#
+# (A) BOUNDED PARTIALS. `seq_len_partition_size` (256) cannot be raised -
+# SLM is sized by it and `PAGED_ATTENTION_BLOCKS_PER_PARTITION` derives
+# from it, with `SUBGROUP_SIZE == PAGED_ATTENTION_BLOCK_SIZE` enforced by
+# `#error`. The bound instead comes from one work-group covering S
+# consecutive 256-token partitions:
+#
+#   - Host (`paged_attention_opt.cpp::update_rt_params`, mirrored in
+#     `get_internal_buffer_descs`'s pre-rt_params fallback branch): P = min
+#     (raw_partitions, PAGED_ATTENTION_MAX_PARTITIONS) when the option is
+#     set and the stage is GENERATE/MIXED (not PREFILL - PREFILL's
+#     partition_size is head-size-derived, a different scheme untouched
+#     here - and not when has_scores_output() - that path's softmax_
+#     results buffer is strided by total_partitions_num but addressed by
+#     the fine-grained raw partition index, a separate feature this patch
+#     does not rework and would overrun if folded). `rt_params->
+#     num_of_partitions` becomes P directly (every exp_sums/tmp_out stride
+#     already reads it, so tmp_out's and exp_sums/max_logits's element counts
+#     shrink for free); a new `rt_params->partitions_per_wg` carries
+#     S = ceil(raw_partitions / P), default 1.
+#   - `partitions_per_wg` reaches both the stage-0 kernel (a new trailing
+#     scalar argument - it is NOT a JIT constant: unlike
+#     PAGED_ATTENTION_MAX_PARTITIONS, which is fixed for a compiled
+#     model's lifetime, S varies with context length exactly the way
+#     num_of_partitions already does) and both finalization kernels (a
+#     second scalar, alongside the pre-existing total_partitions_num).
+#   - Kernel, stage 0 (paged_attention_opt.cl): the query load is hoisted
+#     above a new `for (uint p = 0; p < partitions_per_wg; ++p)` loop (it
+#     does not depend on partition_idx); `wg_partition_idx =
+#     get_group_id(2)` is the coarse (0..P-1) index that now addresses
+#     exp_sums/max_logits/tmp_out, while the loop's own `partition_idx =
+#     wg_partition_idx * partitions_per_wg + p` keeps its original,
+#     fine-grained meaning for K/V block addressing. The pre-loop early
+#     `return` (unchanged, for wg_partition_idx's own first partition)
+#     becomes a `break` inside the loop for a later p that runs out of
+#     data - the design's own account of this hazard, and the reason the
+#     write is deferred to after the loop rather than done per iteration.
+#   - Online merge, folded into the SAME normalisation step that already
+#     divides `slm_qk_vals` by `exp_sum` (paged_attention_opt.cl, pre-patch
+#     line 584): per q_idx, `m' = max(m, qk_max_p)`, `alpha = s *
+#     exp(m - m')`, `beta = exp_sum_p * exp(qk_max_p - m')`; the running V
+#     accumulator (`acc` / `acc_lo`+`acc_hi`) is scaled by `alpha /
+#     (alpha + beta)` and the normalisation divide is replaced by a
+#     multiply by `beta / ((alpha + beta) * exp_sum_p)`; `s = alpha + beta`,
+#     `m = m'`.
+#   - BIT-EXACTNESS AT PAGED_ATTENTION_MAX_PARTITIONS == 0, BY
+#     CONSTRUCTION, NOT BY ALGEBRAIC REDUCTION: partitions_per_wg == 1
+#     makes the loop always take p == 0, and p == 0 is a runtime branch
+#     to the ORIGINAL, unmerged arithmetic (a straight divide by exp_sum,
+#     no accumulator scaling) rather than the general merge formula
+#     evaluated at its algebraic identity. This distinction is load-
+#     bearing: IEEE 754 division and a multiply by a separately-computed
+#     reciprocal-like factor do not round identically even where they are
+#     algebraically equal, so the general formula's p == 0 case, however
+#     it simplifies on paper, would NOT reproduce the pre-patch kernel bit
+#     for bit. acc_scale is declared at loop-body scope (not inside the
+#     softmax block where it is computed) because the QK*V block that
+#     reads it is a sibling scope, not a child - an ocloc build (below)
+#     caught this as an "undeclared identifier" on the first pass, fixed
+#     by hoisting the declaration rather than by widening scope
+#     informally.
+#   - Finalization (both kernels): `num_of_partitions =
+#     min(ceil(ceil(effective_seq_len / SEQ_LEN_PARTITION_SIZE) /
+#     partitions_per_wg), total_partitions_num)`, replacing the pre-patch
+#     `min(ceil(effective_seq_len / SEQ_LEN_PARTITION_SIZE),
+#     total_partitions_num)`. partitions_per_wg == 1 makes this identical
+#     to the pre-patch formula (integer ceiling division has no rounding-
+#     mode ambiguity, unlike the stage-0 merge above) - no runtime branch
+#     needed here for the default-off case.
+#   - THE HAZARD THE DESIGN NAMES, closed: stage 0's "write tmp_out or
+#     write output" predicate and the finalization's num_of_partitions
+#     must agree on how many (coarse) partitions a given sequence needs,
+#     or a short sequence sharing a mixed-batch dispatch with a longer one
+#     can have total_partitions_num > 1 globally while needing only ONE
+#     work-group itself, writes tmp_out under the old effective_seq_len >
+#     SEQ_LEN_PARTITION_SIZE check, and the finalization's own <= 1 early
+#     return never produces `output`. Both sides now compute the same
+#     bounded quantity - `seq_bounded_partitions` in stage 0, the
+#     restated `num_of_partitions` in the finalization - from the same
+#     formula.
+#
+# PAGED_ATTENTION_MAX_PARTITIONS = 32 and the occupancy/register-pressure
+# reasoning behind it are the design's, not verified on this task (no GPU
+# device was touched at any point, on P_MAX > 0 OR P_MAX == 0 - nothing in
+# this patch, at any bound, has been exercised against the real model).
+# Byte-exactness ACROSS this patch's bounded arm is NOT expected and NOT
+# claimed - the merge order changes (S partitions merged online per
+# work-group, P merged in the finalization, instead of every raw partition
+# merged in the finalization), one rounding is folded into the
+# normalisation multiply, and (per the review below) up to
+# partitions_per_wg - 1 further f16 roundings of the running V accumulator
+# itself happen along the merge chain; within an arm the existing ladder
+# (cold vs warm, one lane vs two, paged vs stateful) is unaffected by this
+# patch and must still hold byte-exact. This "byte-identical when
+# unbounded" claim is per-DISPATCH (PAGED_ATTENTION_MAX_PARTITIONS == 0,
+# or every sequence in the batch individually needing only 1 partition),
+# not per-sequence: partitions_per_wg (S) is computed once per dispatch
+# from the batch's OWN longest sequence (update_rt_params reads
+# max_context_len across the whole primitive instance), so a short
+# sequence sharing a MIXED-stage dispatch with a much longer one that
+# triggers folding is folded too, by the same S, even though its own raw
+# partition count alone would not have crossed P_MAX - correct (both
+# sequences' outputs still merge to the true softmax within tolerance),
+# not bit-identical to running that short sequence alone or unbounded.
+#
+# WHAT THIS PATCH DOES NOT COVER: has_scores_output() sequences (excluded
+# from bounding entirely, see above); PREFILL-stage partitioning (a
+# different scheme); native 4-bit values in micro-SDPA (backlog, per
+# §7.0.2ab); the arcint-side fit-term change in fit.h/backend_ov.cpp that
+# would let the engine actually charge 2 bytes and detect this option (out
+# of scope for this task, which is the plugin side only); CHANGELOG.md and
+# contrib/packaging/marfrit-openvino updates - see the report for why
+# those were left alone rather than guessed at.
+#
+# REVIEW ROUND (Opus, against the post-patch sources, no GPU): found one
+# real bug and several documentation/precision gaps, all closed here.
+#
+#   (1) THE BLOCKER, CONFIRMED BY TRACING THE MATH, NOT JUST TRUSTING THE
+#   REVIEW: with SG_SCALE_FACTOR > 1 (get_pa_sg_number_scale_factor returns
+#   2 exactly when the KV cache is compressed - u8, u8:i4, the
+#   configurations this patch exists for, at 128/256-wide heads), the
+#   cross-subgroup reduction that folds the upper half's V-accumulator into
+#   the lower half's ran INSIDE the p loop once per iteration but never
+#   cleared the upper half's own copy, while the (this patch's own) acc-
+#   scale-by-acc_scale step applied unconditionally to both halves by sgid.
+#   Consequence, worked through explicitly: at iteration p's end, lower's
+#   acc correctly holds the full running total (previous total, scaled,
+#   plus this iteration's true partition sum); upper's acc still holds
+#   iteration p's own partial (already folded into lower). At iteration
+#   p+1's start, BOTH halves get scaled by acc_scale - lower correctly
+#   (it is the running total), but upper's now-scaled, already-consumed
+#   partial then gets ADDED to lower again by the same reduction at
+#   iteration p+1's end. Every folded partition after the first
+#   double-counts (and, from p+2 onward, triple- and quadruple-counts) the
+#   upper half's own share, compounding with each iteration. Fixed: the
+#   upper half resets to zero every iteration instead of scaling (harmless
+#   at p == 0, where it already holds zero); this is now also where the
+#   rescale multiply moved to SOFTMAX_ACCUMULATOR_TYPE precision (below).
+#   Not caught by this task's own first-round test
+#   (patches_0015_paged_attention_bounded_partials) because it sets
+#   kv_cache_compression = false, which makes SG_SCALE_FACTOR == 1
+#   unconditionally (paged_attention_opt.cpp:55-63) - the bug was
+#   unreachable by construction, not merely unobserved. Four new cases
+#   (patches_0015_paged_attention_sg_scale_2) close that gap: compressed
+#   u8:i4 (the blocker case itself) at P_MAX=2 with a 2000-token past,
+#   symmetric u4/dual-nibble V at the same bound, the GENERATE
+#   (pure-decode, SingleToken dispatch) stage rather than MIXED, and
+#   P_MAX=1 (every raw partition folds into the single work-group launched,
+#   bypassing the finalization kernel's cross-work-group merge entirely).
+#
+#   (2) Precision: the rescale multiply now computes in
+#   SOFTMAX_ACCUMULATOR_TYPE (float) and stores the result into acc's own
+#   OUTPUT_TYPE (f16) - one rounding per iteration, same as before -
+#   instead of first casting acc_scale down to f16 and multiplying in f16
+#   (two roundings per iteration: the cast, then the product). Does not
+#   make the bounded arm byte-exact - up to partitions_per_wg - 1 f16
+#   roundings of the accumulator remain along the merge chain at deep
+#   contexts (e.g. 14 at 119k tokens, P_MAX=32) - named here explicitly as
+#   a tolerance source for the cross-arm comparison in the design's
+#   measurement plan, not eliminated. Given a number, on review: f16's
+#   unit roundoff is 2^-11 (11 bits of precision, 1 implicit + 10
+#   explicit mantissa bits); acc is a convex combination at every step
+#   (the merge weights alpha/(alpha+beta) and beta/(alpha+beta) sum to 1),
+#   so each of the up-to-(partitions_per_wg - 1) roundings contributes at
+#   most one unit-roundoff-sized relative error to the result. At S=15
+#   (119k tokens, P_MAX=32), that is <=14 roundings: worst-case bound (the
+#   roundings all pushing the same direction, additive) ~= 14 * 2^-11 ~=
+#   0.7%; treating them as independent, zero-mean rounding errors instead
+#   (the more realistic case) gives an RMS estimate ~= sqrt(14) * 2^-11 ~=
+#   0.1%. Use 0.7% as the cross-arm tolerance where a hard bound is
+#   needed, 0.1% as the expected typical deviation.
+#
+#   (3) get_element_size(ov::element::dynamic) returns 0, not a thrown
+#   error; a still-unresolved output type at tmp_out sizing time would
+#   have silently allocated a 0-byte buffer instead of failing loud.
+#   Asserted non-zero in get_internal_buffer_descs (this task did not
+#   observe the output type unresolved at that point - shape can stay
+#   dynamic, the element type is not expected to - so this is a defensive
+#   assert on an invariant, not a fix for an observed failure). The
+#   PREFILL-stage dummy buffer (unused, see above) is now commented as
+#   halved relative to before this patch, for the same reason tmp_out
+#   itself is - harmless, since PREFILL never addresses it.
+#
+#   (4) The exp_sums/max_logits write predicate now uses the same
+#   seq_bounded_partitions (derived from effective_seq_len, SWA-adjusted)
+#   as the tmp_out/output predicate. Before this patch the two predicates
+#   already used DIFFERENT quantities under SWA (exp_sums on raw seq_len,
+#   tmp_out/output on effective_seq_len) - this patch's unification is a
+#   deliberate correction (the two gates must agree or the finalization can
+#   read one buffer written and the other not), stated here rather than
+#   left implicit, and can only change behaviour for SWA sequences whose
+#   full length crosses a partition boundary that their trimmed length does
+#   not - exactly the sequences where the two gates already disagreed.
+#
+# ITEM (1)'S STATUS, UPDATED WITH MEASUREMENT - still short of a clean
+# confirm-or-retract, stated exactly that plainly rather than rounded up:
+#
+#   - An early on-card run of the UNFIXED kernel against all four
+#     patches_0015_paged_attention_sg_scale_2 cases came back ALL PASSING,
+#     contradicting the hand-traced double-count mechanism. Two device-free
+#     tools were built specifically to settle that contradiction with
+#     evidence - a diagnostic (PagedAttentionOptImpl::get_kernels_dump_info,
+#     a permanent, low-risk addition to this patch, not a throwaway) that
+#     asserts the blocker case's own stated precondition (SG_SCALE_FACTOR ==
+#     2, fold width > 1, stage == MIXED) actually held, and a SABOTAGED
+#     build (unfixed kernel, the rescale removed entirely) to check whether
+#     these tests have any power to detect an accumulator error at all.
+#     Both were built and staged; NEITHER's result was separately reported
+#     back before this task's attention moved to, and resolved, a SEPARATE,
+#     measured, real crash (below) - so item (1) specifically is still
+#     exactly where it was: traced, not measured, not retracted.
+#
+#   - What HAS since been measured, WITH this patch's fix for item (1) left
+#     in place (it was never reverted): the full paged-attention unit suite
+#     is 220/220 on the fixed build, including
+#     patches_0015_paged_attention_sg_scale_2_diag and the sabotage-adjacent
+#     cases in patches_0015_paged_attention_sg_scale_2 itself. This is a
+#     genuine, positive, on-card result - it is NOT the same claim as "the
+#     double-count mechanism is confirmed real and the fix matters" (that
+#     still needs the diagnostic assertion and the sabotage build's own
+#     result, specifically, neither of which has been reported back), and
+#     it is not being represented as that claim here. It IS evidence that
+#     the fix does not regress anything the suite covers.
+#
+# The fix from the original review round is KEPT in this patch - not
+# because it is confirmed, but because it is not DISCONFIRMED either, and
+# it remains independently justifiable on structural grounds alone,
+# GPU-result-free: the upper SG_SCALE_FACTOR half's accumulator register is
+# left holding a value after each iteration's reduction that nothing
+# downstream ever reads again except a later iteration's own scale step -
+# resetting it to zero is what a value with no further reader should get,
+# regardless of whether any specific test's data makes the un-reset path's
+# error large enough to matter. Whoever next reads the diagnostic
+# assertion's own pass/fail and the sabotage build's result should update
+# this section with THAT specific finding, rather than inferring it from
+# the unit suite's aggregate pass.
+#
+# A SEPARATE, LATER-FOUND DEFECT (SIGBUS), ROOT-CAUSED AND FIXED - measured,
+# not narrated: an on-card run of the served model (coder, u8:i4,
+# PAGED_ATTENTION_MAX_PARTITIONS=32, chunk 128) crashed with SIGBUS during
+# prefill of long prompts, reproduced on two different cards, 3/3, at
+# depths corresponding to S >= 6-9 (raw partition count in the hundreds);
+# 35k tokens (S=5) did not crash, 40k/120k-token device tests (S=5, S=15)
+# did not crash either - only the served path, at depth, crashed. Running
+# the identical failing case under MALLOC_CHECK_=3 MALLOC_PERTURB_=165
+# made the crash disappear (prefill completed, decode ran normally) - the
+# textbook signature of a use-after-free (or read of freed/uninitialised
+# memory) whose victim depends on heap layout, not of an index-arithmetic
+# bug (which perturbing free'd memory would not fix).
+#
+# Root cause, traced to source: `primitive_inst::realloc_intermediates()`
+# (primitive_inst.cpp, generic framework code shared by every primitive
+# with intermediate/scratch buffers - not part of this patch) reallocates
+# or reinterprets each intermediate buffer's underlying memory object
+# without ever setting `ExecutionFlags::MEMORY_CHANGED` or
+# `ARG_UPDATE_REQUIRED`. The only thing that makes `execute_stage()`
+# rebind a kernel's arguments (`primitive_ocl_base.hpp`'s
+# `stage.kd.need_args_update`, gated on exactly those two flags) is a
+# change to the primitive's OUTPUT memory, `has_mutable_input()`,
+# `is_output()`, dynamic dependencies, or a full impl swap - never a pure
+# intermediate-buffer identity change. Before this patch, paged
+# attention's tmp_out buffer grew every MIXED-stage chunk of a
+# long prefill without bound, so its identity changed on effectively every
+# call regardless; this patch is what makes tmp_out's required size
+# plateau once PAGED_ATTENTION_MAX_PARTITIONS bounds it, so a genuine
+# reallocation (a real new USM allocation, not `engine.reinterpret_buffer`'s
+# same-handle new wrapper) can now occur at some later, size-crossing point
+# deep into a long prefill with nothing else on that same call happening
+# to also touch outputs/mutable-inputs/impl - the one existing path that
+# would have forced a rebind. Once that reallocation's old memory object's
+# last reference drops and its destructor frees the old allocation, a
+# kernel still bound (via a stale OpenCL argument binding never refreshed)
+# to that now-freed handle is a genuine use-after-free - matching the
+# MALLOC_CHECK_/PERTURB_ result exactly. This task could not establish
+# from static reading alone why the effect is sharpest around S=6-9
+# specifically rather than at the first plateau (L=8,193) - that depends
+# on real allocator/heap-layout behaviour not visible from source; the
+# mechanism itself is verified from source, not guessed from the symptom.
+#
+# FIX A (in this patch, paged-attention-local): `PagedAttentionOptImpl`
+# now tracks the identity (raw pointer) of every intermediate memory
+# object its kernel arguments were last bound against
+# (`m_last_seen_intermediates`). At the top of `execute()` - which, in the
+# caller (`primitive_inst::execute()`), always runs AFTER
+# `realloc_if_needed()`/`realloc_intermediates()` for this call, so
+# `instance.get_intermediates_memories()` at this point already reflects
+# whatever reallocation just happened - it compares the current
+# intermediates against that record; on any difference, it forces
+# `need_args_update = true` on every registered stage (cheap: a pointer
+# comparison per intermediate on the common no-change path, no allocation)
+# before any stage is dispatched. This placement matters: doing the same
+# check inside `update()` (the MIXED-stage-only hook `requires_update()`
+# gates) would not work - `update()` runs BEFORE `realloc_if_needed()` in
+# the caller, so it would only ever see the PRE-reallocation identity, one
+# call too early to detect what the reallocation that follows is about to
+# change. Deliberately does not try to distinguish `reinterpret_buffer`'s
+# same-handle case (very likely already harmless - it explicitly reuses
+# the old handle and shares its mem_tracker) from a genuine reallocation
+# (the actually dangerous one) - telling them apart cheaply from inside
+# this primitive risks getting the direction wrong; comparing raw identity
+# is simple, cheap, and conservative in the safe direction for both.
+#
+# RESIDUAL, STATED ON REVIEW AND SINCE CONFIRMED BY MEASUREMENT (not
+# speculative any more - see below): fix A repairs the BINDING (which
+# memory object a future kernel dispatch is bound to), not the LIFETIME
+# (whether an already-in-flight GPU kernel enqueued against the OLD
+# memory object is guaranteed to have completed before that object's last
+# reference drops and its destructor can free it). `prepare_internal_
+# buffers`'s `mem_lock` on `past_lens` for the MIXED-stage path provides
+# an incidental synchronisation point for THAT buffer, not a deliberate
+# guarantee for exp_sums/max_logits/tmp_out specifically; the GENERATE-without-scores
+# path takes an early return in that same function and has no such
+# barrier at all. This is not fixed by fix A and is recorded here as a
+# residual for item B - properly closing it likely needs the framework's
+# own memory-pool/dependency-tracking (event completion, not just identity
+# bookkeeping) to extend an "old" intermediate's lifetime until whatever
+# last referenced it has signalled done, which is squarely framework
+# scope, not something to improvise locally.
+#
+# ITEM B, RECORDED, NOT FIXED HERE - DESIGN BACKLOG: the gap in
+# `primitive_inst::realloc_intermediates()` itself (never setting
+# MEMORY_CHANGED/ARG_UPDATE_REQUIRED on ANY intermediate-buffer identity
+# change, for ANY primitive) is a pre-existing defect in shared framework
+# code that this patch is the first to expose in practice, by being the
+# first code path in this specific primitive whose intermediate buffer
+# size profile plateaus after growing rather than growing forever. It is
+# NOT fixed in this patch - fixing it at the framework level would change
+# behaviour for every primitive with intermediate buffers in this
+# codebase, not just paged attention, and deserves its own dedicated
+# review rather than riding in bundled with a paged-attention-specific
+# patch. Candidate framework-level fix (not implemented, not built): have
+# `realloc_intermediates()` set `ExecutionFlags::MEMORY_CHANGED` (or
+# `ARG_UPDATE_REQUIRED` directly) whenever it actually replaces an
+# intermediate buffer's identity, in either branch (reuse-via-reinterpret
+# or genuine reallocation). Upstream-worthy on its own.
+#
+# FIX A MEASURED INSUFFICIENT ON ITS OWN - the residual above is not
+# theoretical. A follow-up on-card round found: the 56,348-token cell
+# passed once with fix A, but the 119,074-token cell (P_MAX=32, chunk 128,
+# on a card with a smaller VRAM budget) crashed again with a bus error;
+# separately, on a different, larger-VRAM card at chunk 2048, a 37k-token
+# prompt crashed after an
+# 8.4k-token prompt had passed - within roughly a dozen forward calls, far
+# fewer than the several hundred this task's own S=6-9 threshold estimate
+# (at chunk 128) implied were needed for the effect to appear. That last
+# point matters on its own: it weighs against "accumulates over many
+# repeated calls" as the primary mechanism and toward something tied to a
+# specific transition or boundary instead - consistent with, though not
+# proof of, the lifetime residual just above (an unlucky race can happen
+# on the very first post-plateau reallocation, not only after many).
+#
+# TWO PARALLEL, DEVICE-FREE RESPONSES TO THAT RESULT:
+#
+#   - An AddressSanitizer build of the plugin (separate build directory,
+#     separate flock, RelWithDebInfo with -fsanitize=address
+#     -fno-omit-frame-pointer -g on both the plugin and everything it
+#     links) - not part of this patch, a diagnostic build only. See the
+#     report for the exact LD_PRELOAD/ASAN_OPTIONS line and staging path.
+#     This is the tool that can actually confirm or refute the UAF/
+#     lifetime theory directly, rather than by inference from crash
+#     timing.
+#
+#   - MITIGATION 2 (a separate staged variant, m15b - built on top of fix
+#     A, not a replacement for it, and explicitly NOT necessarily what
+#     ships): removes the identity churn at its source for exp_sums/max_logits/tmp_out
+#     by giving `PagedAttentionOptImpl` its own private, non-pool-shared
+#     allocation for each, sized generously for `PAGED_ATTENTION_MAX_
+#     PARTITIONS`'s bound the first time it is needed and then kept -
+#     never reallocated, reinterpreted, or replaced - for the rest of the
+#     primitive instance's lifetime as long as it still fits.
+#     `get_internal_buffer_descs()` records each buffer's vector position
+#     the same call that sizes it (`m_stable_exp_sums_idx` etc. -
+#     `mutable`, following this same base class's existing convention for
+#     `kernel_dump_info`); `ensure_stable_intermediates()` (called from
+#     `execute()`, before any stage dispatch) allocates lazily and only
+#     grows, never shrinks; a `get_arguments()` override substitutes these
+#     stable objects into the SAME positions a rebuilt `args.intermediates`
+#     would otherwise hold from the framework's own (still independently
+#     allocated, still churning) copy. Deliberately does NOT remove or
+#     resize the framework's own exp_sums/max_logits/tmp_out slots in
+#     `get_internal_buffer_descs()` - doing so would shift the gws->subsequence
+#     mapping buffer and any adaptive-RKV buffers that follow it (there is no
+#     buffer 8 or 9 on the served no-scores path - named by role here for
+#     exactly that reason) and risk a far worse, silent argument-index bug for a
+#     saving that was not the point of this probe. The explicit,
+#     deliberate trade-off, stated rather than hidden: this roughly
+#     DOUBLES scratch memory for these three buffers relative to fix-A-only
+#     (the framework's own copy is still allocated, just unused) - partly
+#     undoing patches/0015's own memory-reduction goal, for exactly as
+#     long as this mitigation is in place. This task could not find a way
+#     to stop `primitive_inst::realloc_intermediates()`'s own parallel
+#     allocation without editing that shared, generic function (item B).
+#
+# MEASURED, ON-CARD, WITH THE FIXED BUILD - this task did not run any of
+# these itself (no GPU device was touched by this task at any point; the
+# orchestrator ran all of the below on hardware this task has no access
+# to), recorded here because a header that still said "nothing exercised
+# against the real model" after this evidence came back would itself be a
+# defect, not caution:
+#
+#   - The served coder model (u8:i4, PAGED_ATTENTION_MAX_PARTITIONS=32,
+#     chunk 128), one of the two cards this task's on-card rounds used:
+#     the 56,348-token cell, which crashed with
+#     SIGBUS 2/2 before fix A, now prefills at 223 t/s and decodes 400
+#     tokens cleanly with fix A in place.
+#   - The full paged-attention unit suite (`ov_gpu_unit_tests`), fixed
+#     build: 220/220.
+#   - Same card, chunk 32, PAGED_ATTENTION_MAX_PARTITIONS=0 vs 32: the
+#     64-token greedy output and the acceptance-task answer are
+#     BYTE-IDENTICAL between the two arms; the acceptance task itself
+#     scores 10/10 on both.
+#   - CONFIRMED with a 131,072-token pool: PAGED_ATTENTION_MAX_PARTITIONS=32
+#     at the 119,074-token depth on the served path, chunk 128, on the
+#     16 GiB-class card, prefills and decodes 400 tokens (the cell that
+#     originally faulted with the driver's out-of-resources error under
+#     the unbounded buffer, §7.0.2ab). With the 165,680-token pool the
+#     same prompt still crashes - and so does the UNPATCHED plugin at the
+#     unbounded setting with an explicit 165,680-token pool, while plain
+#     u8 with a 262,144-token pool passes: that crash is a pre-existing
+#     defect of the asymmetric packed-value path (patches 0008-0010) that
+#     needs a deep pool together with a deep prompt, reachable only now
+#     because this patch removed the fault that used to come first. It is
+#     tracked separately (DESIGN §7.0.2ac); it is not this patch's.
+#
+# BEYOND THE ON-CARD RESULTS: the full plugin target
+# (`openvino_intel_gpu_plugin`) and the paged-attention unit test target
+# (`ov_gpu_unit_tests`) both built clean (exit 0, zero warnings) with the
+# bug live (for the red build/staging) and again after each fix. The
+# kernel edits
+# were independently checked with `ocloc` (Intel's offline, device-free
+# GPU kernel compiler - no device opened, no kernel executed) against a
+# hand-reconstructed JIT constant set covering GENERATE (HEADS_PER_WI 1
+# and 2/GQA), MIXED, SG_SCALE_FACTOR 2 (both before and after the review
+# fix - ocloc catches syntax and type errors, not the logic bug itself;
+# the fixed kernel's SG_SCALE_FACTOR=2 configurations were re-checked
+# after the fix and still build clean), IS_KV_COMPRESSED (u8),
+# IS_INT4_K/IS_INT4_V (the u8:i4 case this patch targets),
+# USE_DUAL_NIBBLE_V_OPT, and both finalization kernel variants - all built
+# successfully against a real Xe2 target (`bmg`). One address-space
+# diagnostic appeared under the IS_KV_COMPRESSED configurations without
+# `-cl-std=CL2.0`; it was traced to pre-existing, unmodified code
+# (`INPUT0_TYPE* value_comp_ptr = value_cache + value_comp_offset;`,
+# present verbatim before this patch) and confirmed to be a harness
+# artifact, not a defect, by rebuilding the same configurations with
+# `-cl-std=CL2.0`, which is clean. Not exercised by this harness:
+# HAS_SINK_INPUT, HAS_ALIBI, HAS_QQ_BIAS, IS_KEY_BY_CHANNEL,
+# PAGED_ATTENTION_SCORES_OUTPUT=1 (the last is structurally excluded from
+# the new code path anyway - see above). None of this is a substitute for
+# an on-card run against real KV data; it is a much stronger structural
+# check than "the C++ compiled" alone, and it is what a device-free task
+# can do.
+#
+# Tests added, both against the existing device-free float reference
+# (PagedAttentionReference):
+#
+#   `patches_0015_paged_attention_bounded_partials` (paged_attention_test):
+#   a MIXED-stage sequence (4 new tokens over a 2000-token past, raw
+#   partitions = ceil(2000/256) = 8), kv_cache_compression = false
+#   (SG_SCALE_FACTOR == 1 unconditionally here - this instantiation cannot
+#   see the blocker below, by construction), instantiated at
+#   PAGED_ATTENTION_MAX_PARTITIONS = 2 (forcing S = 4) and at 0 (the
+#   unbounded control arm) - L = 2000 > 256 * P_MAX = 512, the condition
+#   this task's first round was asked to cover.
+#
+#   `patches_0015_paged_attention_sg_scale_2` (paged_attention_test,
+#   added on review): four cases, all kv_cache_compression = true
+#   (SG_SCALE_FACTOR == 2 at this head size), covering exactly what the
+#   review named - see item (1) above for the case list and the blocker
+#   mechanism. RED-first, stated precisely (no GPU device was touched by
+#   this task): the fix commit reverted is a single hunk in
+#   paged_attention_opt.cl (the acc-scale-or-reset step at the top of the
+#   QK*V calculation block, immediately before the main V-accumulation
+#   loop) - see the report for the exact diff and the two-stage
+#   build/staging plan (an unfixed test binary staged for the orchestrator
+#   to run first, then this patch's own fixed build).
+#
+# The orchestrator runs both suites on-card; see the report for the exact
+# gtest filters.
+#
+# NOTE ON THIS DIFF'S BASELINE: patches/0001-0014 are applied to this tree
+# as uncommitted working-tree changes (HEAD stays the pinned upstream
+# commit, 71640275) - there is no commit boundary to diff against. A first
+# attempt at this file used plain `git diff` against HEAD and picked up
+# patches/0001-0014's own hunks in every file this patch also touches
+# (confirmed materially wrong: paged_attention_opt.cpp read as +296 lines
+# instead of the actual +106, paged_attention_gpu_test.cpp as +519 instead
+# of +428). This version, and the review-round update to it, were produced
+# instead by reconstructing a true pre-0015 baseline each time - a
+# disposable worktree at HEAD with patches/0001-0014 applied fresh from
+# their own patch files, never committed - and diffing that baseline
+# against the post-0015 tree file by file (`git diff --no-index`, no
+# commit made anywhere). Sanity-checked against files this patch does not
+# touch (byte-identical between the reconstructed baseline and the live
+# tree) before trusting the result, both times.
+diff --git a/src/inference/include/openvino/runtime/intel_gpu/properties.hpp b/src/inference/include/openvino/runtime/intel_gpu/properties.hpp
+index d2d79b5..1767be9 100644
+--- a/src/inference/include/openvino/runtime/intel_gpu/properties.hpp
++++ b/src/inference/include/openvino/runtime/intel_gpu/properties.hpp
+@@ -213,6 +213,22 @@ static constexpr Property<bool, PropertyMutability::RW> moe_cpu_tier{"MOE_CPU_TI
+  */
+ static constexpr Property<size_t, PropertyMutability::RW> moe_cpu_tier_threads{"MOE_CPU_TIER_THREADS"};
+ 
++/**
++ * @brief Upper bound on the number of 256-token partitions the GENERATE/MIXED
++ * paged-attention stage-0 kernel launches per sequence. Above the bound,
++ * several consecutive 256-token partitions are folded into one work-group
++ * (an online softmax merge across them) instead of each partition getting
++ * its own work-group and its own exp_sums/max_logits/tmp_out slot, so the
++ * intermediate-output scratch buffer stops growing with context length past
++ * this bound. 0 (default) is unbounded - one work-group per 256-token
++ * partition, byte-identical to the pre-existing behaviour. Read this
++ * property back after compile_model to detect whether a given plugin build
++ * supports it (throws on an unpatched plugin); does not affect PREFILL-stage
++ * partitioning.
++ * @ingroup ov_runtime_ocl_gpu_prop_cpp_api
++ */
++static constexpr Property<size_t, PropertyMutability::RW> paged_attention_max_partitions{"PAGED_ATTENTION_MAX_PARTITIONS"};
++
+ /**
+  * @brief These keys instruct the GPU plugin to use surface/buffer memory type.
+  */
+diff --git a/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl b/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl
+index 4609975..469ef60 100644
+--- a/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl
++++ b/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl
+@@ -59,6 +59,7 @@ OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, offload_ratio, 0, "Percentage (0-100) of
+ OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, moe_otd_device_pool_bytes, 0, "Device-resident (usm_device) budget in bytes for MoE OTD expert slot buffers under offload_ratio. Buffers are charged against this budget in program order; once spent, later buffers use the pre-existing lockable (usm_host) path. 0 (default) keeps every slot on the usm_host path, unchanged from before this option existed.")
+ OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, moe_cpu_tier, false, "Compute MoE experts that would evict a resident device slot on the host CPU instead of uploading them, during the batched-GEMV decode path only. false (default) is the pre-M14 behaviour, byte for byte.")
+ OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, moe_cpu_tier_threads, 0, "Worker threads for the MoE host compute tier. 0 (default) means hardware_concurrency()-1, leaving one core for the dispatch thread. Ignored when moe_cpu_tier is false.")
++OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, paged_attention_max_partitions, 0, "Upper bound on the number of 256-token partitions the GENERATE/MIXED paged-attention stage-0 kernel launches per sequence; above the bound, several consecutive 256-token partitions are folded into one work-group via an online softmax merge instead of each getting its own work-group and exp_sums/max_logits/tmp_out slot. 0 (default) is unbounded - one work-group per 256-token partition, byte-identical to the pre-existing behaviour. Bounds the tmp_out/exp_sums/max_logits scratch allocation at a fixed depth instead of growing it with context length; does not change PREFILL-stage partitioning.")
+ OV_CONFIG_RELEASE_OPTION(ov, enable_weightless, false, "Enable/Disable weightless blob")
+ 
+ OV_CONFIG_RELEASE_INTERNAL_OPTION(ov::intel_gpu, enable_zero_copy_cache_load, false, "Enable/Disable zero-copy mode for model cache blob load")
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_attention_opt.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_attention_opt.cl
+index 154ad1c..7f43849 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_attention_opt.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_attention_opt.cl
+@@ -99,6 +99,10 @@ KERNEL(pa_sdpa_opt)(
+ #if MULTI_TOKENS_PROCESSING
+     , __global const int* gws_subseq_mapping
+ #endif
++    // arcint (patches/0015): runtime, not a JIT constant - it varies with context length the
++    // same way num_of_partitions (the dispatch dimension) already does. 1 (default, every
++    // pre-existing caller) means no folding.
++    , const uint partitions_per_wg
+ ) {
+     // Input shapes:
+     // query: [sequences_num, HEADS_NUM * K_HEAD_SIZE]
+@@ -186,7 +190,18 @@ KERNEL(pa_sdpa_opt)(
+     const uint seq_len = past_lens[seq_idx] + 1;
+ #endif
+ 
+-    const uint partition_idx = get_group_id(2);
++    // arcint (patches/0015): partitions_per_wg (S) folds S consecutive 256-token partitions
++    // into one work-group when PAGED_ATTENTION_MAX_PARTITIONS bounds the raw partition count;
++    // wg_partition_idx (0..P-1, P = get_num_groups(2)) is this work-group's COARSE index and is
++    // what addresses exp_sums/max_logits/tmp_out below (those buffers are sized P-wide, not
++    // raw-partitions-wide - see paged_attention_opt.cpp's get_internal_buffer_descs), while
++    // partition_idx keeps its original, fine-grained meaning (which 256-token slice of the K/V
++    // cache this iteration reads) and now varies across the loop below instead of being fixed
++    // for the whole work-item. partitions_per_wg == 1 (PAGED_ATTENTION_MAX_PARTITIONS == 0,
++    // every pre-existing caller) makes wg_partition_idx and partition_idx coincide exactly as
++    // before this patch.
++    const uint wg_partition_idx = get_group_id(2);
++    uint partition_idx = wg_partition_idx * partitions_per_wg;
+ 
+     const uint total_blocks_num = CEIL_DIV(seq_len, PAGED_ATTENTION_BLOCK_SIZE);
+ 
+@@ -216,401 +231,462 @@ KERNEL(pa_sdpa_opt)(
+     __local SOFTMAX_ACCUMULATOR_TYPE slm_qk_max_vals[SUBGROUPS_PER_WG * QUERIES_PER_WI];
+     __local SOFTMAX_ACCUMULATOR_TYPE slm_exp_sum_vals[SUBGROUPS_PER_WG * QUERIES_PER_WI];
+ 
+-    SOFTMAX_ACCUMULATOR_VEC_TYPE qk_max = SOFTMAX_ACCUMULATOR_VAL_MIN;
+-
+-    {
++    // arcint (patches/0015): hoisted out of the per-partition body below - the query load does
++    // not depend on partition_idx, so with partitions_per_wg > 1 it now runs once for the whole
++    // fold instead of once per (formerly one-to-one) partition. Internals unchanged from the
++    // pre-patch kernel.
+ #if STORE_QUERY_TO_SLM
+-        for (uint i = sgid * SUBGROUP_SIZE; i < HEADS_PER_WI * K_HEAD_SIZE; i += SUBGROUPS_PER_WG*SUBGROUP_SIZE) {
+-            const uint query_idx_local = i % K_HEAD_SIZE + sglid;
+-            const uint head_idx = i / K_HEAD_SIZE;
++    for (uint i = sgid * SUBGROUP_SIZE; i < HEADS_PER_WI * K_HEAD_SIZE; i += SUBGROUPS_PER_WG*SUBGROUP_SIZE) {
++        const uint query_idx_local = i % K_HEAD_SIZE + sglid;
++        const uint head_idx = i / K_HEAD_SIZE;
+ 
+ #if HEADS_LEFTOVERS_NUM > 0
+-            if (head_idx >= iter_heads_num)
+-                break;
++        if (head_idx >= iter_heads_num)
++            break;
+ #endif
+ 
+-            const uint query_idx = INPUT0_OFFSET +
+-                                   seq_idx * (K_HEAD_SIZE * HEADS_NUM + INPUT0_PAD_BEFORE_FEATURE_NUM + INPUT0_PAD_AFTER_FEATURE_NUM) +
+-                                   (head_num_idx + head_idx) * K_HEAD_SIZE +
+-                                   query_idx_local;
++        const uint query_idx = INPUT0_OFFSET +
++                               seq_idx * (K_HEAD_SIZE * HEADS_NUM + INPUT0_PAD_BEFORE_FEATURE_NUM + INPUT0_PAD_AFTER_FEATURE_NUM) +
++                               (head_num_idx + head_idx) * K_HEAD_SIZE +
++                               query_idx_local;
+ 
+-            INPUT0_TYPE q_val = BLOCK_READN(INPUT0_TYPE, 1, query, query_idx);
++        INPUT0_TYPE q_val = BLOCK_READN(INPUT0_TYPE, 1, query, query_idx);
+ 
+-            // Apply scale value directly to the query input to improve accuracy in case of a high range of input data
++        // Apply scale value directly to the query input to improve accuracy in case of a high range of input data
+ #ifdef SCALE_VAL
+-            q_val = TO_INPUT0_TYPE(SCALE_VAL) * q_val;
++        q_val = TO_INPUT0_TYPE(SCALE_VAL) * q_val;
+ #else
+-            q_val = *scale * q_val;
++        q_val = *scale * q_val;
+ #endif
+ 
+-            slm_query[head_idx * K_HEAD_SIZE + query_idx_local] = q_val;
+-        }
++        slm_query[head_idx * K_HEAD_SIZE + query_idx_local] = q_val;
++    }
+ 
+-        barrier(CLK_LOCAL_MEM_FENCE);
++    barrier(CLK_LOCAL_MEM_FENCE);
+ #else // !STORE_QUERY_TO_SLM
+ 
+-        INPUT0_TYPE q_val[K_HEAD_SIZE / SUBGROUP_SIZE];
+-        unroll_for (uint i = 0; i < K_HEAD_SIZE / SUBGROUP_SIZE; i++) {
+-            const uint query_idx = INPUT0_OFFSET +
+-                                   seq_idx * (K_HEAD_SIZE * HEADS_NUM + INPUT0_PAD_BEFORE_FEATURE_NUM + INPUT0_PAD_AFTER_FEATURE_NUM) +
+-                                   head_num_idx * K_HEAD_SIZE +
+-                                   i * SUBGROUP_SIZE;
+-            q_val[i] = BLOCK_READN(INPUT0_TYPE, 1, query, query_idx);
++    INPUT0_TYPE q_val[K_HEAD_SIZE / SUBGROUP_SIZE];
++    unroll_for (uint i = 0; i < K_HEAD_SIZE / SUBGROUP_SIZE; i++) {
++        const uint query_idx = INPUT0_OFFSET +
++                               seq_idx * (K_HEAD_SIZE * HEADS_NUM + INPUT0_PAD_BEFORE_FEATURE_NUM + INPUT0_PAD_AFTER_FEATURE_NUM) +
++                               head_num_idx * K_HEAD_SIZE +
++                               i * SUBGROUP_SIZE;
++        q_val[i] = BLOCK_READN(INPUT0_TYPE, 1, query, query_idx);
+ 
+-            // Apply scale value directly to the query input to improve accuracy in case of a high range of input data
++        // Apply scale value directly to the query input to improve accuracy in case of a high range of input data
+ #ifdef SCALE_VAL
+-            q_val[i] = TO_INPUT0_TYPE(SCALE_VAL) * q_val[i];
++        q_val[i] = TO_INPUT0_TYPE(SCALE_VAL) * q_val[i];
+ #else
+-            q_val[i] = *scale * q_val[i];
++        q_val[i] = *scale * q_val[i];
+ #endif
+-        }
++    }
+ #endif // STORE_QUERY_TO_SLM
+ 
+-        const uint blocks_num_per_partition = min(effective_blocks_num - partition_idx * PAGED_ATTENTION_BLOCKS_PER_PARTITION, (uint)PAGED_ATTENTION_BLOCKS_PER_PARTITION);
++    // arcint (patches/0015): running online-softmax state folded across the partitions_per_wg
++    // raw 256-token partitions this work-group covers (design: fold beta/((alpha+beta)*exp_sum_p)
++    // into the existing per-partition normalisation multiply at the slm_qk_vals divide below;
++    // scale the running V accumulator by alpha/(alpha+beta)). The first iteration (p == 0) is
++    // special-cased below to the ORIGINAL, unmerged arithmetic - a straight divide by exp_sum,
++    // no acc scaling - so that partitions_per_wg == 1 (PAGED_ATTENTION_MAX_PARTITIONS == 0,
++    // every pre-existing caller) reproduces the pre-patch kernel bit for bit: IEEE 754 division
++    // and a multiply by a separately-computed reciprocal-like factor do not round identically
++    // even where they are algebraically equal.
++    SOFTMAX_ACCUMULATOR_VEC_TYPE running_max = SOFTMAX_ACCUMULATOR_VAL_MIN;
++    SOFTMAX_ACCUMULATOR_VEC_TYPE running_sum = SOFTMAX_ACCUMULATOR_VAL_ZERO;
++#ifdef USE_DUAL_NIBBLE_V_OPT
++    MAKE_VECTOR_TYPE(OUTPUT_TYPE, QUERIES_PER_WI) acc_lo = OUTPUT_VAL_ZERO;
++    MAKE_VECTOR_TYPE(OUTPUT_TYPE, QUERIES_PER_WI) acc_hi = OUTPUT_VAL_ZERO;
++#else
++    MAKE_VECTOR_TYPE(OUTPUT_TYPE, QUERIES_PER_WI) acc = OUTPUT_VAL_ZERO;
++#endif
++
++    for (uint p = 0; p < partitions_per_wg; ++p) {
++        partition_idx = wg_partition_idx * partitions_per_wg + p;
++        if (partition_idx * SEQ_LEN_PARTITION_SIZE >= effective_blocks_num * PAGED_ATTENTION_BLOCK_SIZE) {
++            // arcint (patches/0015): this used to be the whole work-item's early `return` (see
++            // above) when only one partition per work-group existed; folded, a later partition
++            // in this work-group's range can legitimately run out of data first (this sequence
++            // is shorter than another sequence sharing the same dispatch dimension), so later
++            // iterations stop contributing but the merged state accumulated so far must still be
++            // written after the loop.
++            break;
++        }
++
++        SOFTMAX_ACCUMULATOR_VEC_TYPE qk_max = SOFTMAX_ACCUMULATOR_VAL_MIN;
++        // arcint (patches/0015): declared at this (loop-body) scope, not inside the softmax
++        // block below where it is computed, because block-3 (QK*V calculation) - a sibling
++        // scope, not a child of the softmax block - reads it to scale the running accumulator.
++        SOFTMAX_ACCUMULATOR_VEC_TYPE acc_scale = SOFTMAX_ACCUMULATOR_VAL_ZERO;
++
++        {
++            const uint blocks_num_per_partition = min(effective_blocks_num - partition_idx * PAGED_ATTENTION_BLOCKS_PER_PARTITION, (uint)PAGED_ATTENTION_BLOCKS_PER_PARTITION);
+ 
+-        uint blocks_num = blocks_num_per_partition / SUBGROUPS_PER_WG;
+-        if (sgid < blocks_num_per_partition % SUBGROUPS_PER_WG)
+-            blocks_num++;
++            uint blocks_num = blocks_num_per_partition / SUBGROUPS_PER_WG;
++            if (sgid < blocks_num_per_partition % SUBGROUPS_PER_WG)
++                blocks_num++;
+ 
+-        const uint start_block_idx = block_indices_begins[subsequence_idx] + swa_start_block + partition_idx * PAGED_ATTENTION_BLOCKS_PER_PARTITION + sgid;
+-        for (uint block_num = 0; block_num < blocks_num; block_num++) {
+-            const uint head_idx = head_num_idx / KV_HEADS_GROUP_SIZE;
+-            const uint block_indice = block_indices[start_block_idx + block_num * SUBGROUPS_PER_WG];
++            const uint start_block_idx = block_indices_begins[subsequence_idx] + swa_start_block + partition_idx * PAGED_ATTENTION_BLOCKS_PER_PARTITION + sgid;
++            for (uint block_num = 0; block_num < blocks_num; block_num++) {
++                const uint head_idx = head_num_idx / KV_HEADS_GROUP_SIZE;
++                const uint block_indice = block_indices[start_block_idx + block_num * SUBGROUPS_PER_WG];
+ 
+ 
+-            SOFTMAX_ACCUMULATOR_VEC_TYPE qk_acc = SOFTMAX_ACCUMULATOR_VAL_ZERO;
++                SOFTMAX_ACCUMULATOR_VEC_TYPE qk_acc = SOFTMAX_ACCUMULATOR_VAL_ZERO;
+ 
+-            #define KEY_VEC_SIZE SUBGROUP_SIZE
+-            #define KEY_BLOCK MAKE_VECTOR_TYPE(INPUT1_TYPE, KEY_VEC_SIZE)
++                #define KEY_VEC_SIZE SUBGROUP_SIZE
++                #define KEY_BLOCK MAKE_VECTOR_TYPE(INPUT1_TYPE, KEY_VEC_SIZE)
+ #if IS_KV_COMPRESSED
+     #ifdef IS_KEY_BY_CHANNEL
+-            const uint head_stride = phys_adjusted_k_head_size * ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE;
+-            const uint block_stride = KV_HEADS_NUM * head_stride;
+-            const uint key_block_offset = block_indice * block_stride + head_idx * head_stride;
+-            const uint hidden_stride = ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE;
++                const uint head_stride = phys_adjusted_k_head_size * ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE;
++                const uint block_stride = KV_HEADS_NUM * head_stride;
++                const uint key_block_offset = block_indice * block_stride + head_idx * head_stride;
++                const uint hidden_stride = ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE;
+     #else
+-            const uint block_offset = block_indice * phys_adjusted_k_head_size * KV_HEADS_NUM * SUBGROUP_SIZE + head_idx * phys_adjusted_k_head_size * SUBGROUP_SIZE;
+-            const uint key_block_offset = block_offset;
+-            const uint hidden_stride = SUBGROUP_SIZE;
+-            const uint key_comp_offset = key_block_offset + phys_k_head_size * PAGED_ATTENTION_BLOCK_SIZE;
+-            INPUT0_TYPE* key_comp_ptr = key_cache + key_comp_offset;
+-            INPUT0_TYPE comp_scale = key_comp_ptr[0 + sglid];
+-            INPUT0_TYPE comp_zp = key_comp_ptr[PAGED_ATTENTION_BLOCK_SIZE + sglid];
++                const uint block_offset = block_indice * phys_adjusted_k_head_size * KV_HEADS_NUM * SUBGROUP_SIZE + head_idx * phys_adjusted_k_head_size * SUBGROUP_SIZE;
++                const uint key_block_offset = block_offset;
++                const uint hidden_stride = SUBGROUP_SIZE;
++                const uint key_comp_offset = key_block_offset + phys_k_head_size * PAGED_ATTENTION_BLOCK_SIZE;
++                INPUT0_TYPE* key_comp_ptr = key_cache + key_comp_offset;
++                INPUT0_TYPE comp_scale = key_comp_ptr[0 + sglid];
++                INPUT0_TYPE comp_zp = key_comp_ptr[PAGED_ATTENTION_BLOCK_SIZE + sglid];
+     #endif
+ #else
+-            const uint block_offset = block_indice * ADJUSTED_K_HEAD_SIZE * KV_HEADS_NUM * SUBGROUP_SIZE + head_idx * ADJUSTED_K_HEAD_SIZE * SUBGROUP_SIZE;
++                const uint block_offset = block_indice * ADJUSTED_K_HEAD_SIZE * KV_HEADS_NUM * SUBGROUP_SIZE + head_idx * ADJUSTED_K_HEAD_SIZE * SUBGROUP_SIZE;
+ #endif
+ 
+-            // Loop for qk_index
++                // Loop for qk_index
+ #if IS_KV_COMPRESSED && IS_INT4_K && defined(IS_KEY_BY_CHANNEL)
+-            // INT4 BY_CHANNEL: dim order {0,1,3,2}: [blocks, heads, head_size, packed_block+scales]
+-            // Each column (head dim) = COMP_K_OFFSET packed bytes + 4 bytes scale/zp.
+-            // Token sglid's u4 value is at packed byte sglid/2, nibble sglid%2.
+-            // Lane sglid represents token sglid, reads its nibble from each column.
+-            MAKE_VECTOR_TYPE(INPUT0_TYPE, KEY_VEC_SIZE) k_vals[K_HEAD_SIZE / KEY_VEC_SIZE];
+-            {
+-                unroll_for (uint qk_idx = 0; qk_idx < K_HEAD_SIZE / KEY_VEC_SIZE; qk_idx++) {
+-                    // Pre-read scale/zp: lane sglid reads scale for head dim (qk_idx*16 + sglid)
+-                    const uint comp_head_dim = qk_idx * KEY_VEC_SIZE + sglid;
+-                    const uint comp_col_base = key_block_offset + comp_head_dim * hidden_stride;
+-                    INPUT0_TYPE* comp_ptr = (INPUT0_TYPE*)(key_cache + comp_col_base + PACKED_K_BLOCK_SIZE);
+-                    INPUT0_TYPE comp_scale = comp_ptr[0];
+-                    INPUT0_TYPE comp_zp = comp_ptr[1];
+-
+-                    // Optimized: process 2 adjacent head dims per iteration to halve memory reads
+-                    // and eliminate redundant unpack + branch operations.
+-                    const uint sglid_byte_offset = sglid / U4_ELEMS_PER_BYTE;
+-                    const uint is_odd_lane = sglid % U4_ELEMS_PER_BYTE;
+-                    unroll_for (uint i = 0; i < KEY_VEC_SIZE; i += 2) {
+-                        const uint head_dim0 = qk_idx * KEY_VEC_SIZE + i;
+-                        const uint head_dim1 = head_dim0 + 1;
+-
+-                        const uint col_base0 = key_block_offset + head_dim0 * hidden_stride;
+-                        const uint col_base1 = key_block_offset + head_dim1 * hidden_stride;
+-                        char packed0 = key_cache[col_base0 + sglid_byte_offset];
+-                        char packed1 = key_cache[col_base1 + sglid_byte_offset];
+-                        char u4_val0 = is_odd_lane ? ((uchar)packed0 >> 4) : (packed0 & 0x0F);
+-                        char u4_val1 = is_odd_lane ? ((uchar)packed1 >> 4) : (packed1 & 0x0F);
+-
+-                        k_vals[qk_idx][i]     = ((INPUT0_TYPE)u4_val0 - _sub_group_shuffle(comp_zp, i))     * _sub_group_shuffle(comp_scale, i);
+-                        k_vals[qk_idx][i + 1] = ((INPUT0_TYPE)u4_val1 - _sub_group_shuffle(comp_zp, i + 1)) * _sub_group_shuffle(comp_scale, i + 1);
++                // INT4 BY_CHANNEL: dim order {0,1,3,2}: [blocks, heads, head_size, packed_block+scales]
++                // Each column (head dim) = COMP_K_OFFSET packed bytes + 4 bytes scale/zp.
++                // Token sglid's u4 value is at packed byte sglid/2, nibble sglid%2.
++                // Lane sglid represents token sglid, reads its nibble from each column.
++                MAKE_VECTOR_TYPE(INPUT0_TYPE, KEY_VEC_SIZE) k_vals[K_HEAD_SIZE / KEY_VEC_SIZE];
++                {
++                    unroll_for (uint qk_idx = 0; qk_idx < K_HEAD_SIZE / KEY_VEC_SIZE; qk_idx++) {
++                        // Pre-read scale/zp: lane sglid reads scale for head dim (qk_idx*16 + sglid)
++                        const uint comp_head_dim = qk_idx * KEY_VEC_SIZE + sglid;
++                        const uint comp_col_base = key_block_offset + comp_head_dim * hidden_stride;
++                        INPUT0_TYPE* comp_ptr = (INPUT0_TYPE*)(key_cache + comp_col_base + PACKED_K_BLOCK_SIZE);
++                        INPUT0_TYPE comp_scale = comp_ptr[0];
++                        INPUT0_TYPE comp_zp = comp_ptr[1];
++
++                        // Optimized: process 2 adjacent head dims per iteration to halve memory reads
++                        // and eliminate redundant unpack + branch operations.
++                        const uint sglid_byte_offset = sglid / U4_ELEMS_PER_BYTE;
++                        const uint is_odd_lane = sglid % U4_ELEMS_PER_BYTE;
++                        unroll_for (uint i = 0; i < KEY_VEC_SIZE; i += 2) {
++                            const uint head_dim0 = qk_idx * KEY_VEC_SIZE + i;
++                            const uint head_dim1 = head_dim0 + 1;
++
++                            const uint col_base0 = key_block_offset + head_dim0 * hidden_stride;
++                            const uint col_base1 = key_block_offset + head_dim1 * hidden_stride;
++                            char packed0 = key_cache[col_base0 + sglid_byte_offset];
++                            char packed1 = key_cache[col_base1 + sglid_byte_offset];
++                            char u4_val0 = is_odd_lane ? ((uchar)packed0 >> 4) : (packed0 & 0x0F);
++                            char u4_val1 = is_odd_lane ? ((uchar)packed1 >> 4) : (packed1 & 0x0F);
++
++                            k_vals[qk_idx][i]     = ((INPUT0_TYPE)u4_val0 - _sub_group_shuffle(comp_zp, i))     * _sub_group_shuffle(comp_scale, i);
++                            k_vals[qk_idx][i + 1] = ((INPUT0_TYPE)u4_val1 - _sub_group_shuffle(comp_zp, i + 1)) * _sub_group_shuffle(comp_scale, i + 1);
++                        }
+                     }
+                 }
+-            }
+ 
+-            #if STORE_QUERY_TO_SLM
+-                unroll_for (uint qk_idx = 0; qk_idx < K_HEAD_SIZE / KEY_VEC_SIZE; qk_idx++) {
+-                    unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-                        SOFTMAX_ACCUMULATOR_TYPE q_val = slm_query[q_idx * K_HEAD_SIZE + qk_idx * KEY_VEC_SIZE + sglid];
+-                        unroll_for (uint i = 0; i < KEY_VEC_SIZE; i++) {
+-                            GET_VECTOR_ELEMENT(qk_acc, q_idx) = mad(sub_group_broadcast(q_val, i), TO_SOFTMAX_ACCUMULATOR_TYPE(k_vals[qk_idx][i]), GET_VECTOR_ELEMENT(qk_acc, q_idx));
++                #if STORE_QUERY_TO_SLM
++                    unroll_for (uint qk_idx = 0; qk_idx < K_HEAD_SIZE / KEY_VEC_SIZE; qk_idx++) {
++                        unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                            SOFTMAX_ACCUMULATOR_TYPE q_val = slm_query[q_idx * K_HEAD_SIZE + qk_idx * KEY_VEC_SIZE + sglid];
++                            unroll_for (uint i = 0; i < KEY_VEC_SIZE; i++) {
++                                GET_VECTOR_ELEMENT(qk_acc, q_idx) = mad(sub_group_broadcast(q_val, i), TO_SOFTMAX_ACCUMULATOR_TYPE(k_vals[qk_idx][i]), GET_VECTOR_ELEMENT(qk_acc, q_idx));
++                            }
+                         }
+                     }
+-                }
+-            #else
+-                unroll_for (uint qk_idx = 0; qk_idx < K_HEAD_SIZE / KEY_VEC_SIZE; qk_idx++) {
+-                    unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-                        unroll_for (uint i = 0; i < KEY_VEC_SIZE; i++) {
+-                            qk_acc = mad(TO_SOFTMAX_ACCUMULATOR_TYPE(sub_group_broadcast(q_val[qk_idx], i)), TO_SOFTMAX_ACCUMULATOR_TYPE(k_vals[qk_idx][i]), qk_acc);
++                #else
++                    unroll_for (uint qk_idx = 0; qk_idx < K_HEAD_SIZE / KEY_VEC_SIZE; qk_idx++) {
++                        unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                            unroll_for (uint i = 0; i < KEY_VEC_SIZE; i++) {
++                                qk_acc = mad(TO_SOFTMAX_ACCUMULATOR_TYPE(sub_group_broadcast(q_val[qk_idx], i)), TO_SOFTMAX_ACCUMULATOR_TYPE(k_vals[qk_idx][i]), qk_acc);
++                            }
+                         }
+                     }
+-                }
+-            #endif
++                #endif
+ 
+ #else  // !(IS_KV_COMPRESSED && IS_INT4_K && defined(IS_KEY_BY_CHANNEL))
+-            #define KEY_BLOCK_UNCOMPRESSED MAKE_VECTOR_TYPE(INPUT0_TYPE, KEY_VEC_SIZE)
++                #define KEY_BLOCK_UNCOMPRESSED MAKE_VECTOR_TYPE(INPUT0_TYPE, KEY_VEC_SIZE)
+ #ifdef DISABLE_QK_LOOP_UNROLL
+-            for (uint qk_idx = 0; qk_idx < K_HEAD_SIZE / KEY_VEC_SIZE; qk_idx++) {
++                for (uint qk_idx = 0; qk_idx < K_HEAD_SIZE / KEY_VEC_SIZE; qk_idx++) {
+ #else
+-            unroll_for (uint qk_idx = 0; qk_idx < K_HEAD_SIZE / KEY_VEC_SIZE; qk_idx++) {
++                unroll_for (uint qk_idx = 0; qk_idx < K_HEAD_SIZE / KEY_VEC_SIZE; qk_idx++) {
+ #endif
+ 
+ #if IS_KV_COMPRESSED
+     #if IS_INT4_K
+-                // INT4 BY_TOKEN head-major: [blocks, heads, packed_head_size * block_size, scales, zps]
+-                // Each byte packs 2 adjacent head dims (lo nibble, hi nibble)
+-                // Use scalar reads (not BLOCK_READN) to avoid subgroup block read issues with byte types
+-                KEY_BLOCK_UNCOMPRESSED k_vals;
+-                unroll_for (uint i = 0; i < KEY_VEC_SIZE / 2; i++) {
+-                    uint packed_h = qk_idx * (KEY_VEC_SIZE / 2) + i;
+-                    INPUT1_TYPE packed_byte = key_cache[key_block_offset + packed_h * hidden_stride + sglid];
+-                    MAKE_VECTOR_TYPE(char, U4_ELEMS_PER_BYTE) buff = unpack_to_char(*(uint4x2_t *)&packed_byte);
+-                    k_vals[2 * i]     = ((INPUT0_TYPE)(char)buff.s0 - comp_zp) * comp_scale;
+-                    k_vals[2 * i + 1] = ((INPUT0_TYPE)(char)buff.s1 - comp_zp) * comp_scale;
+-                }
++                    // INT4 BY_TOKEN head-major: [blocks, heads, packed_head_size * block_size, scales, zps]
++                    // Each byte packs 2 adjacent head dims (lo nibble, hi nibble)
++                    // Use scalar reads (not BLOCK_READN) to avoid subgroup block read issues with byte types
++                    KEY_BLOCK_UNCOMPRESSED k_vals;
++                    unroll_for (uint i = 0; i < KEY_VEC_SIZE / 2; i++) {
++                        uint packed_h = qk_idx * (KEY_VEC_SIZE / 2) + i;
++                        INPUT1_TYPE packed_byte = key_cache[key_block_offset + packed_h * hidden_stride + sglid];
++                        MAKE_VECTOR_TYPE(char, U4_ELEMS_PER_BYTE) buff = unpack_to_char(*(uint4x2_t *)&packed_byte);
++                        k_vals[2 * i]     = ((INPUT0_TYPE)(char)buff.s0 - comp_zp) * comp_scale;
++                        k_vals[2 * i + 1] = ((INPUT0_TYPE)(char)buff.s1 - comp_zp) * comp_scale;
++                    }
+     #else
+-                KEY_BLOCK_UNCOMPRESSED k_vals;
+-                uint init_index = key_block_offset + 0 * hidden_stride * KEY_VEC_SIZE;
++                    KEY_BLOCK_UNCOMPRESSED k_vals;
++                    uint init_index = key_block_offset + 0 * hidden_stride * KEY_VEC_SIZE;
+         #ifdef IS_KEY_BY_CHANNEL
+-                // Per-channel scale/zp for i8 BY_CHANNEL: each column has PAGED_ATTENTION_BLOCK_SIZE data bytes + scale(fp16) + zp(fp16)
+-                const uint comp_head_dim = qk_idx * KEY_VEC_SIZE + sglid;
+-                const uint comp_col_base = key_block_offset + comp_head_dim * hidden_stride;
+-                INPUT0_TYPE* comp_ptr = (INPUT0_TYPE*)(key_cache + comp_col_base + PAGED_ATTENTION_BLOCK_SIZE);
+-                INPUT0_TYPE comp_scale = comp_ptr[0];
+-                INPUT0_TYPE comp_zp = comp_ptr[1];
++                    // Per-channel scale/zp for i8 BY_CHANNEL: each column has PAGED_ATTENTION_BLOCK_SIZE data bytes + scale(fp16) + zp(fp16)
++                    const uint comp_head_dim = qk_idx * KEY_VEC_SIZE + sglid;
++                    const uint comp_col_base = key_block_offset + comp_head_dim * hidden_stride;
++                    INPUT0_TYPE* comp_ptr = (INPUT0_TYPE*)(key_cache + comp_col_base + PAGED_ATTENTION_BLOCK_SIZE);
++                    INPUT0_TYPE comp_scale = comp_ptr[0];
++                    INPUT0_TYPE comp_zp = comp_ptr[1];
+         #endif
+-                unroll_for (uint i = 0; i < KEY_VEC_SIZE; i++) {
+-                    k_vals[i] = BLOCK_READN(INPUT1_TYPE, 1, key_cache, key_block_offset + qk_idx * hidden_stride * KEY_VEC_SIZE + i * hidden_stride);
++                    unroll_for (uint i = 0; i < KEY_VEC_SIZE; i++) {
++                        k_vals[i] = BLOCK_READN(INPUT1_TYPE, 1, key_cache, key_block_offset + qk_idx * hidden_stride * KEY_VEC_SIZE + i * hidden_stride);
+                 #ifdef IS_KEY_BY_CHANNEL
+-                    k_vals[i] = ((INPUT0_TYPE)k_vals[i] - _sub_group_shuffle(comp_zp, i)) * _sub_group_shuffle(comp_scale, i);
++                        k_vals[i] = ((INPUT0_TYPE)k_vals[i] - _sub_group_shuffle(comp_zp, i)) * _sub_group_shuffle(comp_scale, i);
+                 #else
+-                    k_vals[i] = (k_vals[i] - comp_zp) * comp_scale;
++                        k_vals[i] = (k_vals[i] - comp_zp) * comp_scale;
+                 #endif
+-                }
++                    }
+     #endif  // IS_INT4_K
+ #else  //  !IS_KV_COMPRESSED
+-                KEY_BLOCK k_vals = 0;
+-                unroll_for (uint i = 0; i < KEY_VEC_SIZE; i++) {
+-                    k_vals[i] = BLOCK_READN(INPUT1_TYPE, 1, key_cache, block_offset + qk_idx * SUBGROUP_SIZE * KEY_VEC_SIZE + i * SUBGROUP_SIZE);
+-                }
++                    KEY_BLOCK k_vals = 0;
++                    unroll_for (uint i = 0; i < KEY_VEC_SIZE; i++) {
++                        k_vals[i] = BLOCK_READN(INPUT1_TYPE, 1, key_cache, block_offset + qk_idx * SUBGROUP_SIZE * KEY_VEC_SIZE + i * SUBGROUP_SIZE);
++                    }
+ #endif  // !IS_KV_COMPRESSED
+ 
+ #if XE2_QK_MULTIPLICATION
+ #if STORE_QUERY_TO_SLM
+-                MAKE_VECTOR_TYPE(INPUT0_TYPE, QUERIES_PER_WI) q_val;
+-                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-                    GET_VECTOR_ELEMENT(q_val, q_idx) = slm_query[q_idx * K_HEAD_SIZE + qk_idx * KEY_VEC_SIZE + sglid];
+-                }
++                    MAKE_VECTOR_TYPE(INPUT0_TYPE, QUERIES_PER_WI) q_val;
++                    unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                        GET_VECTOR_ELEMENT(q_val, q_idx) = slm_query[q_idx * K_HEAD_SIZE + qk_idx * KEY_VEC_SIZE + sglid];
++                    }
+ #endif
+ 
+-                unroll_for (uint i = 0; i < KEY_VEC_SIZE; i++) {
++                    unroll_for (uint i = 0; i < KEY_VEC_SIZE; i++) {
+ #if STORE_QUERY_TO_SLM
+-                    qk_acc = mad(TO_SOFTMAX_ACCUMULATOR_VEC_TYPE(sub_group_broadcast(q_val, i)), TO_SOFTMAX_ACCUMULATOR_TYPE(k_vals[i]), qk_acc);
++                        qk_acc = mad(TO_SOFTMAX_ACCUMULATOR_VEC_TYPE(sub_group_broadcast(q_val, i)), TO_SOFTMAX_ACCUMULATOR_TYPE(k_vals[i]), qk_acc);
+ #else
+-                    qk_acc = mad(TO_SOFTMAX_ACCUMULATOR_TYPE(sub_group_broadcast(q_val[qk_idx], i)), TO_SOFTMAX_ACCUMULATOR_TYPE(k_vals[i]), qk_acc);
++                        qk_acc = mad(TO_SOFTMAX_ACCUMULATOR_TYPE(sub_group_broadcast(q_val[qk_idx], i)), TO_SOFTMAX_ACCUMULATOR_TYPE(k_vals[i]), qk_acc);
+ #endif
+-                }
++                    }
+ #else // !XE2_QK_MULTIPLICATION
+-                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                    unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+ #if STORE_QUERY_TO_SLM
+-                    SOFTMAX_ACCUMULATOR_TYPE q_val = slm_query[q_idx * K_HEAD_SIZE + qk_idx * KEY_VEC_SIZE + sglid];
++                        SOFTMAX_ACCUMULATOR_TYPE q_val = slm_query[q_idx * K_HEAD_SIZE + qk_idx * KEY_VEC_SIZE + sglid];
+ #else
+-                    // Cache to a scalar to avoid GRF indirect addressing when qk_idx is a runtime variable.
+-                    const INPUT0_TYPE q_val_cur = q_val[qk_idx];
++                        // Cache to a scalar to avoid GRF indirect addressing when qk_idx is a runtime variable.
++                        const INPUT0_TYPE q_val_cur = q_val[qk_idx];
+ #endif
+-                    unroll_for (uint i = 0; i < KEY_VEC_SIZE; i++) {
++                        unroll_for (uint i = 0; i < KEY_VEC_SIZE; i++) {
+ #if STORE_QUERY_TO_SLM
+-                        GET_VECTOR_ELEMENT(qk_acc, q_idx) = mad(sub_group_broadcast(q_val, i), TO_SOFTMAX_ACCUMULATOR_TYPE(k_vals[i]), GET_VECTOR_ELEMENT(qk_acc, q_idx));
++                            GET_VECTOR_ELEMENT(qk_acc, q_idx) = mad(sub_group_broadcast(q_val, i), TO_SOFTMAX_ACCUMULATOR_TYPE(k_vals[i]), GET_VECTOR_ELEMENT(qk_acc, q_idx));
+ #else
+-                        qk_acc = mad(TO_SOFTMAX_ACCUMULATOR_TYPE(sub_group_broadcast(q_val_cur, i)), TO_SOFTMAX_ACCUMULATOR_TYPE(k_vals[i]), qk_acc);
++                            qk_acc = mad(TO_SOFTMAX_ACCUMULATOR_TYPE(sub_group_broadcast(q_val_cur, i)), TO_SOFTMAX_ACCUMULATOR_TYPE(k_vals[i]), qk_acc);
+ #endif
++                        }
+                     }
+-                }
+ #endif // XE2_QK_MULTIPLICATION
+-            }
++                }
+ #endif  // !(IS_KV_COMPRESSED && IS_INT4_K)
+ 
+-            const uint token_idx = swa_start_token + partition_idx * SEQ_LEN_PARTITION_SIZE + block_num * SUBGROUPS_PER_WG * SUBGROUP_SIZE + sgid * SUBGROUP_SIZE + sglid;
++                const uint token_idx = swa_start_token + partition_idx * SEQ_LEN_PARTITION_SIZE + block_num * SUBGROUPS_PER_WG * SUBGROUP_SIZE + sgid * SUBGROUP_SIZE + sglid;
+ 
+ #ifdef HAS_ALIBI
+-            const int alibi_val = (1 - seq_len) + token_idx;
+-            unroll_for (uint q_idx = 0; q_idx < HEADS_PER_WI; q_idx++) {
+-                GET_VECTOR_ELEMENT(qk_acc, q_idx) += alibi_slopes[head_num_idx + q_idx] * alibi_val;
+-            }
++                const int alibi_val = (1 - seq_len) + token_idx;
++                unroll_for (uint q_idx = 0; q_idx < HEADS_PER_WI; q_idx++) {
++                    GET_VECTOR_ELEMENT(qk_acc, q_idx) += alibi_slopes[head_num_idx + q_idx] * alibi_val;
++                }
+ #endif
+ 
+ #if SLIDING_WINDOW_SIZE != 0
+-            if (token_idx >= seq_len || (seq_len > SLIDING_WINDOW_SIZE && token_idx < (seq_len - SLIDING_WINDOW_SIZE)))
++                if (token_idx >= seq_len || (seq_len > SLIDING_WINDOW_SIZE && token_idx < (seq_len - SLIDING_WINDOW_SIZE)))
+ #else
+-            if (token_idx >= seq_len)
++                if (token_idx >= seq_len)
+ #endif
+-                qk_acc = SOFTMAX_ACCUMULATOR_VAL_MIN;
++                    qk_acc = SOFTMAX_ACCUMULATOR_VAL_MIN;
+ 
+ #if HAS_QQ_BIAS && MULTI_TOKENS_PROCESSING
+-            // token_idx < seq_len, speculative tree mask
+-            if (qq_bias_num > 0 && token_idx >= past_len && token_idx < seq_len) {
+-                const uint spec_offset = token_idx - past_len;
+-                if (spec_offset < qq_bias_spec_num) {
+-                    const uint qq_bias_base = cumulated_qq_bias_num + (seq_idx - subsequence_begin) * qq_bias_spec_num;
+-                    const uint qq_bias_offset = qq_bias_base + spec_offset;
+-                    if (qq_bias[qq_bias_offset] == 0) {
+-                        qk_acc = SOFTMAX_ACCUMULATOR_VAL_MIN;
++                // token_idx < seq_len, speculative tree mask
++                if (qq_bias_num > 0 && token_idx >= past_len && token_idx < seq_len) {
++                    const uint spec_offset = token_idx - past_len;
++                    if (spec_offset < qq_bias_spec_num) {
++                        const uint qq_bias_base = cumulated_qq_bias_num + (seq_idx - subsequence_begin) * qq_bias_spec_num;
++                        const uint qq_bias_offset = qq_bias_base + spec_offset;
++                        if (qq_bias[qq_bias_offset] == 0) {
++                            qk_acc = SOFTMAX_ACCUMULATOR_VAL_MIN;
++                        }
+                     }
+                 }
+-            }
+ #endif
+ 
+-            qk_max = SOFTMAX_ACCUMULATOR_MAX_FUNC(qk_max, TO_SOFTMAX_ACCUMULATOR_VEC_TYPE(qk_acc));
++                qk_max = SOFTMAX_ACCUMULATOR_MAX_FUNC(qk_max, TO_SOFTMAX_ACCUMULATOR_VEC_TYPE(qk_acc));
+ 
+-            unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-                slm_qk_vals[q_idx * SEQ_LEN_PARTITION_SIZE + block_num * SUBGROUPS_PER_WG * SUBGROUP_SIZE + sgid * SUBGROUP_SIZE + sglid] = GET_VECTOR_ELEMENT(qk_acc, q_idx);
++                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                    slm_qk_vals[q_idx * SEQ_LEN_PARTITION_SIZE + block_num * SUBGROUPS_PER_WG * SUBGROUP_SIZE + sgid * SUBGROUP_SIZE + sglid] = GET_VECTOR_ELEMENT(qk_acc, q_idx);
++                }
+             }
+-        }
+ 
+-        unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-            GET_VECTOR_ELEMENT(qk_max, q_idx) = sub_group_reduce_max(GET_VECTOR_ELEMENT(qk_max, q_idx));
++            unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                GET_VECTOR_ELEMENT(qk_max, q_idx) = sub_group_reduce_max(GET_VECTOR_ELEMENT(qk_max, q_idx));
++            }
+         }
+-    }
+ 
+-    {
+-        // SoftMax calculation
+-        if (sglid < QUERIES_PER_WI) {
+-            const uint head_idx = GET_MULTIPLE_HEAD_IDX_OR_FIXED_VAL(sglid, 0);
+-            slm_qk_max_vals[head_idx * SUBGROUPS_PER_WG + sgid] = GET_VECTOR_ELEMENT(qk_max, head_idx);
+-        }
++        {
++            // SoftMax calculation
++            if (sglid < QUERIES_PER_WI) {
++                const uint head_idx = GET_MULTIPLE_HEAD_IDX_OR_FIXED_VAL(sglid, 0);
++                slm_qk_max_vals[head_idx * SUBGROUPS_PER_WG + sgid] = GET_VECTOR_ELEMENT(qk_max, head_idx);
++            }
+ 
+-        barrier(CLK_LOCAL_MEM_FENCE);
++            barrier(CLK_LOCAL_MEM_FENCE);
+ 
+-        qk_max = SOFTMAX_ACCUMULATOR_VAL_MIN;
+-        if (sglid < SUBGROUPS_PER_WG) {
+-            unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-                GET_VECTOR_ELEMENT(qk_max, q_idx) = slm_qk_max_vals[q_idx * SUBGROUPS_PER_WG + sglid];
++            qk_max = SOFTMAX_ACCUMULATOR_VAL_MIN;
++            if (sglid < SUBGROUPS_PER_WG) {
++                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                    GET_VECTOR_ELEMENT(qk_max, q_idx) = slm_qk_max_vals[q_idx * SUBGROUPS_PER_WG + sglid];
++                }
+             }
+-        }
+ 
+-        // Final max value after reduction across of all SG and WI
+-        unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-            #ifdef HAS_SINK_INPUT
+-            const SOFTMAX_ACCUMULATOR_TYPE qk_max_tmp = sub_group_reduce_max(GET_VECTOR_ELEMENT(qk_max, q_idx));
+-            // Include sink in softmax only for partition 0, because each partition independently
+-            // computes its own local softmax (max + exp_sum). The finalization kernel later merges
+-            // all partitions by rescaling each partition's exp_sum with exp(local_max - global_max).
+-            // If sink were included in every partition, the finalization would count the sink
+-            // contribution P times (once per partition) instead of once.
+-            if (partition_idx == 0) {
+-                const uint head_idx = get_global_id(1);
+-                GET_VECTOR_ELEMENT(qk_max, q_idx) = qk_max_tmp > sink_ptr[head_idx] ? qk_max_tmp : sink_ptr[head_idx];
+-            } else {
+-                GET_VECTOR_ELEMENT(qk_max, q_idx) = qk_max_tmp;
++            // Final max value after reduction across of all SG and WI
++            unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                #ifdef HAS_SINK_INPUT
++                const SOFTMAX_ACCUMULATOR_TYPE qk_max_tmp = sub_group_reduce_max(GET_VECTOR_ELEMENT(qk_max, q_idx));
++                // Include sink in softmax only for the sequence's true first partition
++                // (partition_idx == 0, unaffected by folding - see the header), because each
++                // partition independently computes its own local softmax (max + exp_sum). The
++                // online merge below (and the finalization kernel, across work-groups) rescales
++                // and folds every later partition's exp_sum against this one, so the sink
++                // contribution is counted exactly once either way.
++                if (partition_idx == 0) {
++                    const uint head_idx = get_global_id(1);
++                    GET_VECTOR_ELEMENT(qk_max, q_idx) = qk_max_tmp > sink_ptr[head_idx] ? qk_max_tmp : sink_ptr[head_idx];
++                } else {
++                    GET_VECTOR_ELEMENT(qk_max, q_idx) = qk_max_tmp;
++                }
++                #else
++                GET_VECTOR_ELEMENT(qk_max, q_idx) = sub_group_reduce_max(GET_VECTOR_ELEMENT(qk_max, q_idx));
++                #endif
+             }
+-            #else
+-            GET_VECTOR_ELEMENT(qk_max, q_idx) = sub_group_reduce_max(GET_VECTOR_ELEMENT(qk_max, q_idx));
+-            #endif
+-        }
+ 
+-        SOFTMAX_ACCUMULATOR_VEC_TYPE exp_sum = SOFTMAX_ACCUMULATOR_VAL_ZERO;
++            SOFTMAX_ACCUMULATOR_VEC_TYPE exp_sum = SOFTMAX_ACCUMULATOR_VAL_ZERO;
+ 
+-        const uint qk_iters_num = CEIL_DIV(SEQ_LEN_PARTITION_SIZE, SUBGROUPS_PER_WG * SUBGROUP_SIZE);
+-        for (uint qk_idx = 0; qk_idx < qk_iters_num; qk_idx++) {
+-            const uint local_data_idx = qk_idx * (SUBGROUPS_PER_WG * SUBGROUP_SIZE) + sgid * SUBGROUP_SIZE + sglid;
+-            // TODO: const uint global_data_idx = swa_start_token + partition_idx * SEQ_LEN_PARTITION_SIZE + local_data_idx
+-            const uint global_data_idx = swa_start_token + partition_idx * SEQ_LEN_PARTITION_SIZE + qk_idx * (SUBGROUPS_PER_WG * SUBGROUP_SIZE) + sgid * SUBGROUP_SIZE + sglid;
++            const uint qk_iters_num = CEIL_DIV(SEQ_LEN_PARTITION_SIZE, SUBGROUPS_PER_WG * SUBGROUP_SIZE);
++            for (uint qk_idx = 0; qk_idx < qk_iters_num; qk_idx++) {
++                const uint local_data_idx = qk_idx * (SUBGROUPS_PER_WG * SUBGROUP_SIZE) + sgid * SUBGROUP_SIZE + sglid;
++                const uint global_data_idx = swa_start_token + partition_idx * SEQ_LEN_PARTITION_SIZE + qk_idx * (SUBGROUPS_PER_WG * SUBGROUP_SIZE) + sgid * SUBGROUP_SIZE + sglid;
+ 
+ #if (SEQ_LEN_PARTITION_SIZE % (SUBGROUPS_PER_WG * SUBGROUP_SIZE)) == 0
+-            if (global_data_idx < seq_len) {
++                if (global_data_idx < seq_len) {
+ #else
+-            if (global_data_idx < seq_len && local_data_idx < SEQ_LEN_PARTITION_SIZE) {
++                if (global_data_idx < seq_len && local_data_idx < SEQ_LEN_PARTITION_SIZE) {
+ #endif
+-                unroll_for(uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-                    const uint slm_idx = q_idx * SEQ_LEN_PARTITION_SIZE + local_data_idx;
+-                    SOFTMAX_ACCUMULATOR_TYPE qk_new = native_exp(TO_SOFTMAX_ACCUMULATOR_TYPE(slm_qk_vals[slm_idx]) - GET_VECTOR_ELEMENT(qk_max, q_idx));
+-                    slm_qk_vals[slm_idx] = qk_new;
+-                    GET_VECTOR_ELEMENT(exp_sum, q_idx) += qk_new;
++                    unroll_for(uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                        const uint slm_idx = q_idx * SEQ_LEN_PARTITION_SIZE + local_data_idx;
++                        SOFTMAX_ACCUMULATOR_TYPE qk_new = native_exp(TO_SOFTMAX_ACCUMULATOR_TYPE(slm_qk_vals[slm_idx]) - GET_VECTOR_ELEMENT(qk_max, q_idx));
++                        slm_qk_vals[slm_idx] = qk_new;
++                        GET_VECTOR_ELEMENT(exp_sum, q_idx) += qk_new;
++                    }
+                 }
+             }
+-        }
+ 
+-        unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-            GET_VECTOR_ELEMENT(exp_sum, q_idx) = sub_group_reduce_add(GET_VECTOR_ELEMENT(exp_sum, q_idx));
+-        }
++            unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                GET_VECTOR_ELEMENT(exp_sum, q_idx) = sub_group_reduce_add(GET_VECTOR_ELEMENT(exp_sum, q_idx));
++            }
+ 
+-        if (sglid < QUERIES_PER_WI) {
+-            const uint head_idx = GET_MULTIPLE_HEAD_IDX_OR_FIXED_VAL(sglid, 0);
+-            slm_exp_sum_vals[head_idx * SUBGROUPS_PER_WG + sgid] = GET_VECTOR_ELEMENT(exp_sum, head_idx);
+-        }
++            if (sglid < QUERIES_PER_WI) {
++                const uint head_idx = GET_MULTIPLE_HEAD_IDX_OR_FIXED_VAL(sglid, 0);
++                slm_exp_sum_vals[head_idx * SUBGROUPS_PER_WG + sgid] = GET_VECTOR_ELEMENT(exp_sum, head_idx);
++            }
+ 
+-        barrier(CLK_LOCAL_MEM_FENCE);
++            barrier(CLK_LOCAL_MEM_FENCE);
+ 
+-        exp_sum = SOFTMAX_ACCUMULATOR_VAL_ZERO;
++            exp_sum = SOFTMAX_ACCUMULATOR_VAL_ZERO;
+ 
+-        if (sglid < SUBGROUPS_PER_WG) {
+-            unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-               GET_VECTOR_ELEMENT(exp_sum, q_idx) = slm_exp_sum_vals[q_idx * SUBGROUPS_PER_WG + sglid];
++            if (sglid < SUBGROUPS_PER_WG) {
++                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                   GET_VECTOR_ELEMENT(exp_sum, q_idx) = slm_exp_sum_vals[q_idx * SUBGROUPS_PER_WG + sglid];
++                }
+             }
+-        }
+ 
+-        // Final sum of all exp_sum values
+-        unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-            GET_VECTOR_ELEMENT(exp_sum, q_idx) = sub_group_reduce_add(GET_VECTOR_ELEMENT(exp_sum, q_idx));
+-            #ifdef HAS_SINK_INPUT
+-            if (partition_idx == 0) {
+-                const uint head_idx = get_global_id(1);
+-                GET_VECTOR_ELEMENT(exp_sum, q_idx) += (native_exp(TO_SOFTMAX_ACCUMULATOR_TYPE(sink_ptr[head_idx]) - GET_VECTOR_ELEMENT(qk_max, q_idx)));
++            // Final sum of all exp_sum values
++            unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                GET_VECTOR_ELEMENT(exp_sum, q_idx) = sub_group_reduce_add(GET_VECTOR_ELEMENT(exp_sum, q_idx));
++                #ifdef HAS_SINK_INPUT
++                if (partition_idx == 0) {
++                    const uint head_idx = get_global_id(1);
++                    GET_VECTOR_ELEMENT(exp_sum, q_idx) += (native_exp(TO_SOFTMAX_ACCUMULATOR_TYPE(sink_ptr[head_idx]) - GET_VECTOR_ELEMENT(qk_max, q_idx)));
++                }
++                #endif
+             }
+-            #endif
+-        }
+-
+-        for (uint qk_idx = 0; qk_idx < qk_iters_num; qk_idx++) {
+-            const uint local_data_idx = qk_idx * (SUBGROUPS_PER_WG * SUBGROUP_SIZE) + sgid * SUBGROUP_SIZE + sglid;
+-            const uint global_data_idx = swa_start_token + partition_idx * SEQ_LEN_PARTITION_SIZE + qk_idx * (SUBGROUPS_PER_WG * SUBGROUP_SIZE) + sgid * SUBGROUP_SIZE + sglid;
+ 
+-#if (SEQ_LEN_PARTITION_SIZE % (SUBGROUPS_PER_WG * SUBGROUP_SIZE)) == 0
+-            if (global_data_idx < seq_len) {
+-#else
+-            if (global_data_idx < seq_len && local_data_idx < SEQ_LEN_PARTITION_SIZE) {
+-#endif
++            // arcint (patches/0015): the online merge of this iteration's (partition_idx's)
++            // local softmax stats into the running (running_max, running_sum) state, and the
++            // per-q_idx multiplier this folds into the normalisation step just below. p == 0 is
++            // handled separately (norm_mul left unused, the divide below takes the original,
++            // unmerged path) to keep that first iteration bit-exact with the pre-patch kernel -
++            // see the header above.
++            // acc_scale itself is declared at loop-body scope (see above) - block-3, a sibling
++            // scope below, reads it. It is freshly re-initialised to SOFTMAX_ACCUMULATOR_VAL_ZERO
++            // every iteration by that outer declaration, so leaving it untouched in the p == 0
++            // arm below already gives the correct "no scaling" value.
++            SOFTMAX_ACCUMULATOR_VEC_TYPE norm_mul = SOFTMAX_ACCUMULATOR_VAL_ZERO;
++            if (p == 0) {
+                 unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-                    const uint slm_idx = q_idx * SEQ_LEN_PARTITION_SIZE + local_data_idx;
+-                    SOFTMAX_ACCUMULATOR_TYPE qk_new = TO_SOFTMAX_ACCUMULATOR_TYPE(slm_qk_vals[slm_idx]) / GET_VECTOR_ELEMENT(exp_sum, q_idx);
+-                    slm_qk_vals[slm_idx] = qk_new;
++                    GET_VECTOR_ELEMENT(running_max, q_idx) = GET_VECTOR_ELEMENT(qk_max, q_idx);
++                    GET_VECTOR_ELEMENT(running_sum, q_idx) = GET_VECTOR_ELEMENT(exp_sum, q_idx);
+                 }
+-            } else if (local_data_idx < SEQ_LEN_PARTITION_SIZE) {
++            } else {
+                 unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-                    slm_qk_vals[q_idx * SEQ_LEN_PARTITION_SIZE + local_data_idx] = 0;
++                    const SOFTMAX_ACCUMULATOR_TYPE new_max = SOFTMAX_ACCUMULATOR_MAX_FUNC(GET_VECTOR_ELEMENT(running_max, q_idx), GET_VECTOR_ELEMENT(qk_max, q_idx));
++                    const SOFTMAX_ACCUMULATOR_TYPE alpha = GET_VECTOR_ELEMENT(running_sum, q_idx) * native_exp(GET_VECTOR_ELEMENT(running_max, q_idx) - new_max);
++                    const SOFTMAX_ACCUMULATOR_TYPE beta = GET_VECTOR_ELEMENT(exp_sum, q_idx) * native_exp(GET_VECTOR_ELEMENT(qk_max, q_idx) - new_max);
++                    const SOFTMAX_ACCUMULATOR_TYPE denom = alpha + beta;
++                    GET_VECTOR_ELEMENT(acc_scale, q_idx) = alpha / denom;
++                    GET_VECTOR_ELEMENT(norm_mul, q_idx) = beta / (denom * GET_VECTOR_ELEMENT(exp_sum, q_idx));
++                    GET_VECTOR_ELEMENT(running_sum, q_idx) = denom;
++                    GET_VECTOR_ELEMENT(running_max, q_idx) = new_max;
+                 }
+             }
+-        }
+ 
+-        barrier(CLK_LOCAL_MEM_FENCE);
++            for (uint qk_idx = 0; qk_idx < qk_iters_num; qk_idx++) {
++                const uint local_data_idx = qk_idx * (SUBGROUPS_PER_WG * SUBGROUP_SIZE) + sgid * SUBGROUP_SIZE + sglid;
++                const uint global_data_idx = swa_start_token + partition_idx * SEQ_LEN_PARTITION_SIZE + qk_idx * (SUBGROUPS_PER_WG * SUBGROUP_SIZE) + sgid * SUBGROUP_SIZE + sglid;
+ 
+-        {
+-            // Save temporary exm_sums and max_logits values for each partition_num
+-#if HEADS_PER_WI > 1 && HEADS_LEFTOVERS_NUM > 0
+-            if (seq_len > SEQ_LEN_PARTITION_SIZE && sgid < HEADS_PER_WI && sgid < iter_heads_num) {
++#if (SEQ_LEN_PARTITION_SIZE % (SUBGROUPS_PER_WG * SUBGROUP_SIZE)) == 0
++                if (global_data_idx < seq_len) {
+ #else
+-            if (seq_len > SEQ_LEN_PARTITION_SIZE && sgid < HEADS_PER_WI) {
++                if (global_data_idx < seq_len && local_data_idx < SEQ_LEN_PARTITION_SIZE) {
+ #endif
+-                const uint head_idx = GET_MULTIPLE_HEAD_IDX_OR_FIXED_VAL(sgid, 0);
+-                const uint exp_sums_offset = seq_idx * HEADS_NUM * total_partitions_num +
+-                                             (head_num_idx + head_idx) * total_partitions_num +
+-                                             partition_idx;
+-                exp_sums[exp_sums_offset] = GET_VECTOR_ELEMENT(exp_sum, head_idx);
+-
+-                const uint max_logits_offset = exp_sums_offset;
+-                max_logits[max_logits_offset] = GET_VECTOR_ELEMENT(qk_max, head_idx);
++                    unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                        const uint slm_idx = q_idx * SEQ_LEN_PARTITION_SIZE + local_data_idx;
++                        SOFTMAX_ACCUMULATOR_TYPE qk_new;
++                        if (p == 0) {
++                            qk_new = TO_SOFTMAX_ACCUMULATOR_TYPE(slm_qk_vals[slm_idx]) / GET_VECTOR_ELEMENT(exp_sum, q_idx);
++                        } else {
++                            qk_new = TO_SOFTMAX_ACCUMULATOR_TYPE(slm_qk_vals[slm_idx]) * GET_VECTOR_ELEMENT(norm_mul, q_idx);
++                        }
++                        slm_qk_vals[slm_idx] = qk_new;
++                    }
++                } else if (local_data_idx < SEQ_LEN_PARTITION_SIZE) {
++                    unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                        slm_qk_vals[q_idx * SEQ_LEN_PARTITION_SIZE + local_data_idx] = 0;
++                    }
++                }
+             }
+ 
++            barrier(CLK_LOCAL_MEM_FENCE);
++
+ #if PAGED_ATTENTION_SCORES_OUTPUT
++            // arcint (patches/0015): scores_output is a separate feature (SnapKV / attention
++            // introspection) whose buffer is addressed and strided by the RAW partition count,
++            // not the bounded one - update_rt_params/get_internal_buffer_descs therefore never
++            // apply PAGED_ATTENTION_MAX_PARTITIONS when desc->has_scores_output() is set
++            // (partitions_per_wg == 1 unconditionally there), so this block always runs with
++            // p == 0 only and partition_idx == wg_partition_idx; unchanged otherwise.
+ #if MULTI_TOKENS_PROCESSING
+             const uint subsequence_idx = gws_subseq_mapping[seq_idx];
+             const uint subsequence_start_pos = subsequence_begins[subsequence_idx];
+@@ -656,354 +732,463 @@ KERNEL(pa_sdpa_opt)(
+             }
+ #endif // PAGED_ATTENTION_SCORES_OUTPUT
+         }
+-    }
+-
+-    {
+-        // QK*V calculation
+-#ifdef USE_DUAL_NIBBLE_V_OPT
+-        MAKE_VECTOR_TYPE(OUTPUT_TYPE, QUERIES_PER_WI) acc_lo = OUTPUT_VAL_ZERO;
+-        MAKE_VECTOR_TYPE(OUTPUT_TYPE, QUERIES_PER_WI) acc_hi = OUTPUT_VAL_ZERO;
+-#else
+-        MAKE_VECTOR_TYPE(OUTPUT_TYPE, QUERIES_PER_WI) acc = OUTPUT_VAL_ZERO;
+-#endif
+ 
++        {
++            // QK*V calculation - accumulates this partition's contribution into the
++            // outside-the-loop acc (or acc_lo/acc_hi). slm_qk_vals was already weighted by
++            // norm_mul (or left as a plain 1/exp_sum normalisation at p == 0) above, so the
++            // mad() accumulation below needs no further change.
+ #if SWA_BLOCK_SKIP_ENABLED && !MULTI_TOKENS_PROCESSING
+-        const uint effective_seq_len = seq_len - swa_start_token;
++            const uint effective_seq_len = seq_len - swa_start_token;
+ #else
+-        const uint effective_seq_len = seq_len;
++            const uint effective_seq_len = seq_len;
+ #endif
+-        const uint partition_seq_len = min(effective_seq_len - partition_idx * SEQ_LEN_PARTITION_SIZE, (uint)SEQ_LEN_PARTITION_SIZE);
++            const uint partition_seq_len = min(effective_seq_len - partition_idx * SEQ_LEN_PARTITION_SIZE, (uint)SEQ_LEN_PARTITION_SIZE);
+ 
+ #if SG_SCALE_FACTOR > 1
+-        const uint block_start_idx = (sgid / (SUBGROUPS_PER_WG / SG_SCALE_FACTOR)) * (SEQ_LEN_PARTITION_SIZE / SG_SCALE_FACTOR / SUBGROUP_SIZE);
+-        const uint block_end_idx = min(block_start_idx + (SEQ_LEN_PARTITION_SIZE / SG_SCALE_FACTOR / SUBGROUP_SIZE), partition_seq_len / SUBGROUP_SIZE);
++            const uint block_start_idx = (sgid / (SUBGROUPS_PER_WG / SG_SCALE_FACTOR)) * (SEQ_LEN_PARTITION_SIZE / SG_SCALE_FACTOR / SUBGROUP_SIZE);
++            const uint block_end_idx = min(block_start_idx + (SEQ_LEN_PARTITION_SIZE / SG_SCALE_FACTOR / SUBGROUP_SIZE), partition_seq_len / SUBGROUP_SIZE);
+ #else
+-        const uint block_start_idx = 0;
+-        const uint block_end_idx = partition_seq_len / SUBGROUP_SIZE;
++            const uint block_start_idx = 0;
++            const uint block_end_idx = partition_seq_len / SUBGROUP_SIZE;
+ #endif
+ 
+-        uint blocks_num_per_partition = min(effective_blocks_num - partition_idx * PAGED_ATTENTION_BLOCKS_PER_PARTITION, (uint)PAGED_ATTENTION_BLOCKS_PER_PARTITION);
++            uint blocks_num_per_partition = min(effective_blocks_num - partition_idx * PAGED_ATTENTION_BLOCKS_PER_PARTITION, (uint)PAGED_ATTENTION_BLOCKS_PER_PARTITION);
+ 
+-        uint leftovers = blocks_num_per_partition * PAGED_ATTENTION_BLOCK_SIZE - partition_seq_len;
+-        if (leftovers != 0) {
+-            leftovers = PAGED_ATTENTION_BLOCK_SIZE - leftovers;
+-            blocks_num_per_partition = blocks_num_per_partition - 1;
+-        }
++            uint leftovers = blocks_num_per_partition * PAGED_ATTENTION_BLOCK_SIZE - partition_seq_len;
++            if (leftovers != 0) {
++                leftovers = PAGED_ATTENTION_BLOCK_SIZE - leftovers;
++                blocks_num_per_partition = blocks_num_per_partition - 1;
++            }
+ 
+-        const uint start_block_idx = block_indices_begins[subsequence_idx] + swa_start_block + partition_idx * PAGED_ATTENTION_BLOCKS_PER_PARTITION;
++            const uint start_block_idx = block_indices_begins[subsequence_idx] + swa_start_block + partition_idx * PAGED_ATTENTION_BLOCKS_PER_PARTITION;
++
++            // arcint (patches/0015, fixed on review): this step runs before the V-loop below
++            // adds this iteration's fresh contribution to acc/acc_lo/acc_hi, and on
++            // SG_SCALE_FACTOR > 1 configurations (get_pa_sg_number_scale_factor returns 2
++            // exactly when the KV cache is compressed - u8, u8:i4 - the configurations this
++            // patch exists for) it must NOT be the same "scale by acc_scale, unconditionally by
++            // sgid" step for both halves. The cross-subgroup reduction a few dozen lines below
++            // folds the upper half's acc into the lower half's exactly once per iteration
++            // (`if (sgid >= SUBGROUPS_PER_WG / SG_SCALE_FACTOR) { write to SLM } ... if (sgid <
++            // ...) { += from SLM }`) but never clears the upper half's own copy - left alone, an
++            // unconditional per-sgid scale-by-acc_scale compounds the upper half's
++            // already-folded-in value forward every later iteration (p=1 re-adds a scaled
++            // copy of iteration 0's upper-half partial on top of what iteration 0's own
++            // reduction already added; p=2 re-adds iteration 1's on top of that, and so on).
++            // Caught on review, not on this task's own testing - the red case
++            // (patches_0015_paged_attention_sg_scale_2, added alongside this fix) forces
++            // SG_SCALE_FACTOR = 2 as the earlier bounded-partials test (kv_cache_compression =
++            // false) never did. Fix: the upper half resets to zero every iteration instead of
++            // scaling (harmless at p == 0, where it already holds zero, since the reduction
++            // below only ever adds a fresh, this-iteration contribution to the lower half); the
++            // lower half (or the whole work-group when SG_SCALE_FACTOR == 1, i.e. no split at
++            // all) keeps the original scale-by-acc_scale step, still skipped at p == 0 for the
++            // same bit-exactness reason as the normalisation branch above.
++            //
++            // The multiply itself is also done in SOFTMAX_ACCUMULATOR_TYPE (float) rather than
++            // OUTPUT_TYPE (f16), per review: casting acc_scale down to f16 before multiplying
++            // rounds it twice (once for the cast, once for the product); computing the product
++            // in float and rounding only the final store to acc's own f16 type rounds once.
++            // This does not make the bounded arm byte-exact against the reference - up to
++            // partitions_per_wg - 1 f16 roundings of the accumulator itself still happen along
++            // the merge chain (one per iteration after the first) - it just removes the
++            // avoidable half of the error. Named explicitly as a tolerance source, not
++            // eliminated - see the header.
++#if SG_SCALE_FACTOR > 1
++            if (sgid >= SUBGROUPS_PER_WG / SG_SCALE_FACTOR) {
++#ifdef USE_DUAL_NIBBLE_V_OPT
++                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                    GET_VECTOR_ELEMENT(acc_lo, q_idx) = OUTPUT_VAL_ZERO;
++                    GET_VECTOR_ELEMENT(acc_hi, q_idx) = OUTPUT_VAL_ZERO;
++                }
++#else
++                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                    GET_VECTOR_ELEMENT(acc, q_idx) = OUTPUT_VAL_ZERO;
++                }
++#endif
++            } else
++#endif
++            if (p != 0) {
++#ifdef USE_DUAL_NIBBLE_V_OPT
++                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                    GET_VECTOR_ELEMENT(acc_lo, q_idx) =
++                        (OUTPUT_TYPE)((SOFTMAX_ACCUMULATOR_TYPE)GET_VECTOR_ELEMENT(acc_lo, q_idx) * GET_VECTOR_ELEMENT(acc_scale, q_idx));
++                    GET_VECTOR_ELEMENT(acc_hi, q_idx) =
++                        (OUTPUT_TYPE)((SOFTMAX_ACCUMULATOR_TYPE)GET_VECTOR_ELEMENT(acc_hi, q_idx) * GET_VECTOR_ELEMENT(acc_scale, q_idx));
++                }
++#else
++                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                    GET_VECTOR_ELEMENT(acc, q_idx) =
++                        (OUTPUT_TYPE)((SOFTMAX_ACCUMULATOR_TYPE)GET_VECTOR_ELEMENT(acc, q_idx) * GET_VECTOR_ELEMENT(acc_scale, q_idx));
++                }
++#endif
++            }
+ 
+-        for (uint block_num = block_start_idx; block_num < block_end_idx; block_num++) {
+-            const uint head_idx = head_num_idx / KV_HEADS_GROUP_SIZE;
+-            const uint block_offset = block_indices[start_block_idx + block_num] * KV_HEADS_NUM * ADJUSTED_V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE + head_idx * ADJUSTED_V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
++            for (uint block_num = block_start_idx; block_num < block_end_idx; block_num++) {
++                const uint head_idx = head_num_idx / KV_HEADS_GROUP_SIZE;
++                const uint block_offset = block_indices[start_block_idx + block_num] * KV_HEADS_NUM * ADJUSTED_V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE + head_idx * ADJUSTED_V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
+ 
+-            const uint value_offset = block_offset + head_size_idx;
++                const uint value_offset = block_offset + head_size_idx;
+ 
+ 
+ #if IS_KV_COMPRESSED
+-            const uint packed_block_offset = block_indices[start_block_idx + block_num] * KV_HEADS_NUM * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE
+-                                                + head_idx * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE;
++                const uint packed_block_offset = block_indices[start_block_idx + block_num] * KV_HEADS_NUM * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE
++                                                    + head_idx * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE;
+ #if IS_INT4_V
+-            // INT4: per-token embedded scales at end of each token's row
+-            INPUT0_TYPE* my_token_comp_ptr = (INPUT0_TYPE*)(value_cache + packed_block_offset + sglid * phys_adjusted_v_head_size + phys_v_head_size);
+-            INPUT0_TYPE comp_scale = my_token_comp_ptr[0];
+-            INPUT0_TYPE comp_zp = my_token_comp_ptr[1];
++                // INT4: per-token embedded scales at end of each token's row
++                INPUT0_TYPE* my_token_comp_ptr = (INPUT0_TYPE*)(value_cache + packed_block_offset + sglid * phys_adjusted_v_head_size + phys_v_head_size);
++                INPUT0_TYPE comp_scale = my_token_comp_ptr[0];
++                INPUT0_TYPE comp_zp = my_token_comp_ptr[1];
+ #else
+-            const uint value_comp_offset = packed_block_offset + phys_v_head_size * PAGED_ATTENTION_BLOCK_SIZE;
+-            INPUT0_TYPE* value_comp_ptr = value_cache + value_comp_offset;
+-            INPUT0_TYPE comp_scale = value_comp_ptr[0 + sglid];
+-            INPUT0_TYPE comp_zp = value_comp_ptr[PAGED_ATTENTION_BLOCK_SIZE + sglid];
++                const uint value_comp_offset = packed_block_offset + phys_v_head_size * PAGED_ATTENTION_BLOCK_SIZE;
++                INPUT0_TYPE* value_comp_ptr = value_cache + value_comp_offset;
++                INPUT0_TYPE comp_scale = value_comp_ptr[0 + sglid];
++                INPUT0_TYPE comp_zp = value_comp_ptr[PAGED_ATTENTION_BLOCK_SIZE + sglid];
+ #endif
+ 
+ #endif
+ 
+-            #define VALUE_VEC_SIZE SUBGROUP_SIZE
+-            #define VALUE_UNCOMPRESSED INPUT0_TYPE
+-            #define VALUE_BLOCK MAKE_VECTOR_TYPE(INPUT2_TYPE, VALUE_VEC_SIZE)
+-            #define VALUE_BLOCK_UNCOMPRESSED MAKE_VECTOR_TYPE(INPUT0_TYPE, VALUE_VEC_SIZE)
+-            #define TO_VALUE_UNCOMPRESSED_TYPE(val) CAT(convert_, VALUE_UNCOMPRESSED)(val)
++                #define VALUE_VEC_SIZE SUBGROUP_SIZE
++                #define VALUE_UNCOMPRESSED INPUT0_TYPE
++                #define VALUE_BLOCK MAKE_VECTOR_TYPE(INPUT2_TYPE, VALUE_VEC_SIZE)
++                #define VALUE_BLOCK_UNCOMPRESSED MAKE_VECTOR_TYPE(INPUT0_TYPE, VALUE_VEC_SIZE)
++                #define TO_VALUE_UNCOMPRESSED_TYPE(val) CAT(convert_, VALUE_UNCOMPRESSED)(val)
+ 
+ 
+ #ifdef USE_DUAL_NIBBLE_V_OPT
+-            // Dual-nibble: BLOCK_READN reads 1 packed byte per lane (16 contiguous bytes per subgroup)
+-            // Then unpack both nibbles → 2 dequantized values per lane
+-            VALUE_BLOCK_UNCOMPRESSED value_vals_lo;
+-            VALUE_BLOCK_UNCOMPRESSED value_vals_hi;
+-            unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
+-                INPUT2_TYPE packed_byte = BLOCK_READN(INPUT2_TYPE, 1, value_cache, packed_block_offset + i * phys_adjusted_v_head_size + packed_byte_idx);
+-                MAKE_VECTOR_TYPE(char, U4_ELEMS_PER_BYTE) buff = unpack_to_char(*(uint4x2_t *)&packed_byte);
+-                value_vals_lo[i] = (TO_VALUE_UNCOMPRESSED_TYPE(buff.s0) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
+-                value_vals_hi[i] = (TO_VALUE_UNCOMPRESSED_TYPE(buff.s1) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
+-            }
++                // Dual-nibble: BLOCK_READN reads 1 packed byte per lane (16 contiguous bytes per subgroup)
++                // Then unpack both nibbles → 2 dequantized values per lane
++                VALUE_BLOCK_UNCOMPRESSED value_vals_lo;
++                VALUE_BLOCK_UNCOMPRESSED value_vals_hi;
++                unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
++                    INPUT2_TYPE packed_byte = BLOCK_READN(INPUT2_TYPE, 1, value_cache, packed_block_offset + i * phys_adjusted_v_head_size + packed_byte_idx);
++                    MAKE_VECTOR_TYPE(char, U4_ELEMS_PER_BYTE) buff = unpack_to_char(*(uint4x2_t *)&packed_byte);
++                    value_vals_lo[i] = (TO_VALUE_UNCOMPRESSED_TYPE(buff.s0) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
++                    value_vals_hi[i] = (TO_VALUE_UNCOMPRESSED_TYPE(buff.s1) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
++                }
+ 
+-            unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-                OUTPUT_TYPE qk_val = slm_qk_vals[q_idx * SEQ_LEN_PARTITION_SIZE + block_num * PAGED_ATTENTION_BLOCK_SIZE + sglid];
++                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                    OUTPUT_TYPE qk_val = slm_qk_vals[q_idx * SEQ_LEN_PARTITION_SIZE + block_num * PAGED_ATTENTION_BLOCK_SIZE + sglid];
+ 
+-                unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
+-                    GET_VECTOR_ELEMENT(acc_lo, q_idx) = mad(sub_group_broadcast(qk_val, i), value_vals_lo[i], GET_VECTOR_ELEMENT(acc_lo, q_idx));
+-                    GET_VECTOR_ELEMENT(acc_hi, q_idx) = mad(sub_group_broadcast(qk_val, i), value_vals_hi[i], GET_VECTOR_ELEMENT(acc_hi, q_idx));
++                    unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
++                        GET_VECTOR_ELEMENT(acc_lo, q_idx) = mad(sub_group_broadcast(qk_val, i), value_vals_lo[i], GET_VECTOR_ELEMENT(acc_lo, q_idx));
++                        GET_VECTOR_ELEMENT(acc_hi, q_idx) = mad(sub_group_broadcast(qk_val, i), value_vals_hi[i], GET_VECTOR_ELEMENT(acc_hi, q_idx));
++                    }
+                 }
+-            }
+ 
+ #elif IS_KV_COMPRESSED && IS_INT4_V
+-            // INT4 adjacent packing: V layout [blocks, heads, block_size, packed_head+scales]
+-            // packed_byte = head_size_idx/2, nibble = head_size_idx%2
+-            // Token stride = phys_adjusted_v_head_size
+-            const uint packed_byte_idx = head_size_idx / 2;
+-            const uint nibble_sel = head_size_idx & 1;
+-            VALUE_BLOCK v_vals_packed;
+-
+-            unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
+-                uint token_offset = packed_block_offset + i * phys_adjusted_v_head_size + packed_byte_idx;
+-                char packed_val = value_cache[token_offset];
+-                MAKE_VECTOR_TYPE(char, U4_ELEMS_PER_BYTE) buff = unpack_to_char(*(uint4x2_t *)&packed_val);
+-                v_vals_packed[i] = (nibble_sel == 0) ? buff.s0 : buff.s1;
+-            }
+-
+-            VALUE_BLOCK_UNCOMPRESSED value_vals;
+-            unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
+-                value_vals[i] = (TO_VALUE_UNCOMPRESSED_TYPE(v_vals_packed[i]) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
+-            }
++                // INT4 adjacent packing: V layout [blocks, heads, block_size, packed_head+scales]
++                // packed_byte = head_size_idx/2, nibble = head_size_idx%2
++                // Token stride = phys_adjusted_v_head_size
++                const uint packed_byte_idx = head_size_idx / 2;
++                const uint nibble_sel = head_size_idx & 1;
++                VALUE_BLOCK v_vals_packed;
+ 
+-            unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-                OUTPUT_TYPE qk_val = slm_qk_vals[q_idx * SEQ_LEN_PARTITION_SIZE + block_num * PAGED_ATTENTION_BLOCK_SIZE + sglid];
++                unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
++                    uint token_offset = packed_block_offset + i * phys_adjusted_v_head_size + packed_byte_idx;
++                    char packed_val = value_cache[token_offset];
++                    MAKE_VECTOR_TYPE(char, U4_ELEMS_PER_BYTE) buff = unpack_to_char(*(uint4x2_t *)&packed_val);
++                    v_vals_packed[i] = (nibble_sel == 0) ? buff.s0 : buff.s1;
++                }
+ 
++                VALUE_BLOCK_UNCOMPRESSED value_vals;
+                 unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
+-                    GET_VECTOR_ELEMENT(acc, q_idx) = mad(sub_group_broadcast(qk_val, i), value_vals[i], GET_VECTOR_ELEMENT(acc, q_idx));
++                    value_vals[i] = (TO_VALUE_UNCOMPRESSED_TYPE(v_vals_packed[i]) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
++                }
++
++                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                    OUTPUT_TYPE qk_val = slm_qk_vals[q_idx * SEQ_LEN_PARTITION_SIZE + block_num * PAGED_ATTENTION_BLOCK_SIZE + sglid];
++
++                    unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
++                        GET_VECTOR_ELEMENT(acc, q_idx) = mad(sub_group_broadcast(qk_val, i), value_vals[i], GET_VECTOR_ELEMENT(acc, q_idx));
++                    }
+                 }
+-            }
+ 
+ #else  // !(IS_KV_COMPRESSED && IS_INT4_V) and !USE_DUAL_NIBBLE_V_OPT
+-            VALUE_BLOCK v_vals_packed;
+-            unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
+-                v_vals_packed[i] = BLOCK_READN(INPUT2_TYPE, 1, value_cache, value_offset + i * V_HEAD_SIZE);
+-            }
++                VALUE_BLOCK v_vals_packed;
++                unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
++                    v_vals_packed[i] = BLOCK_READN(INPUT2_TYPE, 1, value_cache, value_offset + i * V_HEAD_SIZE);
++                }
+ 
+ #if IS_KV_COMPRESSED
+-            VALUE_BLOCK_UNCOMPRESSED value_vals;
+-            unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
+-                // docs/design-m8-asymmetric-kv.md, Bug A fix A2: the non-4-bit value cache is
+-                // ALWAYS physically signed i8 (pa_kv_cache_update_ref.cl's quantize_and_save_
+-                // per_token INT8 arm: signed zero-point, convert_char_rte), regardless of what
+-                // the value cache PORT (INPUT2_TYPE) happens to be declared as. An explicit
+-                // (char) reinterpretation, matching the key dequant's own signed-storage
+-                // invariant, makes this read correct independent of the port's declared
+-                // signedness - config-level correctness (execution_config.cpp's value-mirror
+-                // fix, A1) should already make the port i8, but this is the kernel-side belt to
+-                // that config-side suspenders.
+-                value_vals[i] = (TO_VALUE_UNCOMPRESSED_TYPE((char)v_vals_packed[i]) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
+-            }
++                VALUE_BLOCK_UNCOMPRESSED value_vals;
++                unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
++                    // docs/design-m8-asymmetric-kv.md, Bug A fix A2: the non-4-bit value cache is
++                    // ALWAYS physically signed i8 (pa_kv_cache_update_ref.cl's quantize_and_save_
++                    // per_token INT8 arm: signed zero-point, convert_char_rte), regardless of what
++                    // the value cache PORT (INPUT2_TYPE) happens to be declared as. An explicit
++                    // (char) reinterpretation, matching the key dequant's own signed-storage
++                    // invariant, makes this read correct independent of the port's declared
++                    // signedness - config-level correctness (execution_config.cpp's value-mirror
++                    // fix, A1) should already make the port i8, but this is the kernel-side belt to
++                    // that config-side suspenders.
++                    value_vals[i] = (TO_VALUE_UNCOMPRESSED_TYPE((char)v_vals_packed[i]) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
++                }
+ #else
+-            VALUE_BLOCK value_vals = v_vals_packed;
++                VALUE_BLOCK value_vals = v_vals_packed;
+ #endif
+ 
+-            unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-                OUTPUT_TYPE qk_val = slm_qk_vals[q_idx * SEQ_LEN_PARTITION_SIZE + block_num * PAGED_ATTENTION_BLOCK_SIZE + sglid];
++                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                    OUTPUT_TYPE qk_val = slm_qk_vals[q_idx * SEQ_LEN_PARTITION_SIZE + block_num * PAGED_ATTENTION_BLOCK_SIZE + sglid];
+ 
+-                unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
+-                    GET_VECTOR_ELEMENT(acc, q_idx) = mad(sub_group_broadcast(qk_val, i), value_vals[i], GET_VECTOR_ELEMENT(acc, q_idx));
++                    unroll_for (uint i = 0; i < VALUE_VEC_SIZE; i++) {
++                        GET_VECTOR_ELEMENT(acc, q_idx) = mad(sub_group_broadcast(qk_val, i), value_vals[i], GET_VECTOR_ELEMENT(acc, q_idx));
++                    }
+                 }
+-            }
+ #endif
+-        }
++            }
+ 
+ #if SG_SCALE_FACTOR > 1
+-        if (sgid >= SUBGROUPS_PER_WG / SG_SCALE_FACTOR) {
++            if (sgid >= SUBGROUPS_PER_WG / SG_SCALE_FACTOR) {
+ #endif
+-        if (leftovers != 0) {
+-            const uint head_idx = head_num_idx / KV_HEADS_GROUP_SIZE;
+-            const uint last_block_idx = start_block_idx + blocks_num_per_partition;
+-            const uint block_offset = block_indices[last_block_idx] * KV_HEADS_NUM * ADJUSTED_V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE + head_idx * ADJUSTED_V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
+-            const uint value_offset = block_offset + head_size_idx;
++            if (leftovers != 0) {
++                const uint head_idx = head_num_idx / KV_HEADS_GROUP_SIZE;
++                const uint last_block_idx = start_block_idx + blocks_num_per_partition;
++                const uint block_offset = block_indices[last_block_idx] * KV_HEADS_NUM * ADJUSTED_V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE + head_idx * ADJUSTED_V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
++                const uint value_offset = block_offset + head_size_idx;
+ 
+ #ifdef USE_DUAL_NIBBLE_V_OPT
+-            const uint packed_block_offset = block_indices[last_block_idx] * KV_HEADS_NUM * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE
+-                                                + head_idx * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE;
++                const uint packed_block_offset = block_indices[last_block_idx] * KV_HEADS_NUM * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE
++                                                    + head_idx * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE;
+ 
+-            // INT4: per-token embedded scales
+-            INPUT0_TYPE* my_token_comp_ptr = (INPUT0_TYPE*)(value_cache + packed_block_offset + sglid * phys_adjusted_v_head_size + phys_v_head_size);
+-            INPUT0_TYPE comp_scale = my_token_comp_ptr[0];
+-            INPUT0_TYPE comp_zp = my_token_comp_ptr[1];
+-
+-            MAKE_VECTOR_TYPE(OUTPUT_TYPE, QUERIES_PER_WI) qk_val;
+-            unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-                GET_VECTOR_ELEMENT(qk_val, q_idx) = slm_qk_vals[q_idx * SEQ_LEN_PARTITION_SIZE + blocks_num_per_partition * PAGED_ATTENTION_BLOCK_SIZE + sglid];
+-            }
+-            for (uint i = 0; i < leftovers; i++) {
+-                // Dual-nibble: BLOCK_READN reads 1 packed byte per lane
+-                INPUT2_TYPE packed_val = BLOCK_READN(INPUT2_TYPE, 1, value_cache, packed_block_offset + i * phys_adjusted_v_head_size + packed_byte_idx);
+-                MAKE_VECTOR_TYPE(char, U4_ELEMS_PER_BYTE) buff = unpack_to_char(*(uint4x2_t *)&packed_val);
+-                INPUT0_TYPE val_lo = (CAT(convert_, INPUT0_TYPE)(buff.s0) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
+-                INPUT0_TYPE val_hi = (CAT(convert_, INPUT0_TYPE)(buff.s1) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
++                // INT4: per-token embedded scales
++                INPUT0_TYPE* my_token_comp_ptr = (INPUT0_TYPE*)(value_cache + packed_block_offset + sglid * phys_adjusted_v_head_size + phys_v_head_size);
++                INPUT0_TYPE comp_scale = my_token_comp_ptr[0];
++                INPUT0_TYPE comp_zp = my_token_comp_ptr[1];
+ 
++                MAKE_VECTOR_TYPE(OUTPUT_TYPE, QUERIES_PER_WI) qk_val;
+                 unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-                    GET_VECTOR_ELEMENT(acc_lo, q_idx) = mad(sub_group_broadcast(GET_VECTOR_ELEMENT(qk_val, q_idx), i), val_lo, GET_VECTOR_ELEMENT(acc_lo, q_idx));
+-                    GET_VECTOR_ELEMENT(acc_hi, q_idx) = mad(sub_group_broadcast(GET_VECTOR_ELEMENT(qk_val, q_idx), i), val_hi, GET_VECTOR_ELEMENT(acc_hi, q_idx));
++                    GET_VECTOR_ELEMENT(qk_val, q_idx) = slm_qk_vals[q_idx * SEQ_LEN_PARTITION_SIZE + blocks_num_per_partition * PAGED_ATTENTION_BLOCK_SIZE + sglid];
++                }
++                for (uint i = 0; i < leftovers; i++) {
++                    // Dual-nibble: BLOCK_READN reads 1 packed byte per lane
++                    INPUT2_TYPE packed_val = BLOCK_READN(INPUT2_TYPE, 1, value_cache, packed_block_offset + i * phys_adjusted_v_head_size + packed_byte_idx);
++                    MAKE_VECTOR_TYPE(char, U4_ELEMS_PER_BYTE) buff = unpack_to_char(*(uint4x2_t *)&packed_val);
++                    INPUT0_TYPE val_lo = (CAT(convert_, INPUT0_TYPE)(buff.s0) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
++                    INPUT0_TYPE val_hi = (CAT(convert_, INPUT0_TYPE)(buff.s1) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
++
++                    unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                        GET_VECTOR_ELEMENT(acc_lo, q_idx) = mad(sub_group_broadcast(GET_VECTOR_ELEMENT(qk_val, q_idx), i), val_lo, GET_VECTOR_ELEMENT(acc_lo, q_idx));
++                        GET_VECTOR_ELEMENT(acc_hi, q_idx) = mad(sub_group_broadcast(GET_VECTOR_ELEMENT(qk_val, q_idx), i), val_hi, GET_VECTOR_ELEMENT(acc_hi, q_idx));
++                    }
+                 }
+-            }
+ 
+ #else  // !USE_DUAL_NIBBLE_V_OPT
+ 
+ #if IS_KV_COMPRESSED && IS_INT4_V
+-            const uint packed_block_offset = block_indices[last_block_idx] * KV_HEADS_NUM * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE
+-                                                + head_idx * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE;
++                const uint packed_block_offset = block_indices[last_block_idx] * KV_HEADS_NUM * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE
++                                                    + head_idx * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE;
+ 
+-            // INT4: per-token embedded scales
+-            INPUT0_TYPE* my_token_comp_ptr = (INPUT0_TYPE*)(value_cache + packed_block_offset + sglid * phys_adjusted_v_head_size + phys_v_head_size);
+-            INPUT0_TYPE comp_scale = my_token_comp_ptr[0];
+-            INPUT0_TYPE comp_zp = my_token_comp_ptr[1];
++                // INT4: per-token embedded scales
++                INPUT0_TYPE* my_token_comp_ptr = (INPUT0_TYPE*)(value_cache + packed_block_offset + sglid * phys_adjusted_v_head_size + phys_v_head_size);
++                INPUT0_TYPE comp_scale = my_token_comp_ptr[0];
++                INPUT0_TYPE comp_zp = my_token_comp_ptr[1];
+ #elif IS_KV_COMPRESSED && !IS_INT4_V
+-            const uint value_comp_offset = block_offset + V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
+-            INPUT0_TYPE* value_comp_ptr = value_cache + value_comp_offset;
+-            INPUT0_TYPE comp_scale = value_comp_ptr[0 + sglid];
+-            INPUT0_TYPE comp_zp = value_comp_ptr[PAGED_ATTENTION_BLOCK_SIZE + sglid];
++                const uint value_comp_offset = block_offset + V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
++                INPUT0_TYPE* value_comp_ptr = value_cache + value_comp_offset;
++                INPUT0_TYPE comp_scale = value_comp_ptr[0 + sglid];
++                INPUT0_TYPE comp_zp = value_comp_ptr[PAGED_ATTENTION_BLOCK_SIZE + sglid];
+ #endif
+ 
+-            MAKE_VECTOR_TYPE(OUTPUT_TYPE, QUERIES_PER_WI) qk_val;
+-            unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-                GET_VECTOR_ELEMENT(qk_val, q_idx) = slm_qk_vals[q_idx * SEQ_LEN_PARTITION_SIZE + blocks_num_per_partition * PAGED_ATTENTION_BLOCK_SIZE + sglid];
+-            }
+-            for (uint i = 0; i < leftovers; i++) {
++                MAKE_VECTOR_TYPE(OUTPUT_TYPE, QUERIES_PER_WI) qk_val;
++                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                    GET_VECTOR_ELEMENT(qk_val, q_idx) = slm_qk_vals[q_idx * SEQ_LEN_PARTITION_SIZE + blocks_num_per_partition * PAGED_ATTENTION_BLOCK_SIZE + sglid];
++                }
++                for (uint i = 0; i < leftovers; i++) {
+ #if IS_KV_COMPRESSED && IS_INT4_V
+-                // INT4 adjacent packing: scalar read of packed byte + nibble selection
+-                const uint packed_byte_idx = head_size_idx / 2;
+-                const uint nibble_sel = head_size_idx & 1;
+-                uint token_offset = packed_block_offset + i * phys_adjusted_v_head_size + packed_byte_idx;
+-                char packed_value = value_cache[token_offset];
+-                MAKE_VECTOR_TYPE(char, U4_ELEMS_PER_BYTE) buff = unpack_to_char(*(uint4x2_t *)&packed_value);
+-                INPUT2_TYPE value_packed = (nibble_sel == 0) ? buff.s0 : buff.s1;
++                    // INT4 adjacent packing: scalar read of packed byte + nibble selection
++                    const uint packed_byte_idx = head_size_idx / 2;
++                    const uint nibble_sel = head_size_idx & 1;
++                    uint token_offset = packed_block_offset + i * phys_adjusted_v_head_size + packed_byte_idx;
++                    char packed_value = value_cache[token_offset];
++                    MAKE_VECTOR_TYPE(char, U4_ELEMS_PER_BYTE) buff = unpack_to_char(*(uint4x2_t *)&packed_value);
++                    INPUT2_TYPE value_packed = (nibble_sel == 0) ? buff.s0 : buff.s1;
+ 
+ #else  // !(IS_KV_COMPRESSED && IS_INT4_V)
+-                INPUT2_TYPE value_packed = BLOCK_READN(INPUT2_TYPE, 1, value_cache, value_offset + i * V_HEAD_SIZE);
++                    INPUT2_TYPE value_packed = BLOCK_READN(INPUT2_TYPE, 1, value_cache, value_offset + i * V_HEAD_SIZE);
+ 
+ #endif  // !(IS_KV_COMPRESSED && IS_INT4_V)
+ 
+ #if IS_KV_COMPRESSED
+-                #define VALUE_UNCOMPRESSED INPUT0_TYPE
+-                #define TO_VALUE_UNCOMPRESSED_TYPE(val) CAT(convert_, VALUE_UNCOMPRESSED)(val)
+-                // docs/design-m8-asymmetric-kv.md, Bug A fix A2 (see the matching comment at this
+-                // kernel's main per-partition V loop above): explicit (char) reinterpretation so
+-                // this non-4-bit V read is correct regardless of the value port's declared
+-                // signedness. Safe for the IS_INT4_V arm too - value_packed there is a nibble in
+-                // [0, 15], identical under signed or unsigned interpretation - so this one cast
+-                // covers both arms without special-casing which one set value_packed.
+-                VALUE_UNCOMPRESSED value_val = (TO_VALUE_UNCOMPRESSED_TYPE((char)value_packed) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
++                    #define VALUE_UNCOMPRESSED INPUT0_TYPE
++                    #define TO_VALUE_UNCOMPRESSED_TYPE(val) CAT(convert_, VALUE_UNCOMPRESSED)(val)
++                    // docs/design-m8-asymmetric-kv.md, Bug A fix A2 (see the matching comment at this
++                    // kernel's main per-partition V loop above): explicit (char) reinterpretation so
++                    // this non-4-bit V read is correct regardless of the value port's declared
++                    // signedness. Safe for the IS_INT4_V arm too - value_packed there is a nibble in
++                    // [0, 15], identical under signed or unsigned interpretation - so this one cast
++                    // covers both arms without special-casing which one set value_packed.
++                    VALUE_UNCOMPRESSED value_val = (TO_VALUE_UNCOMPRESSED_TYPE((char)value_packed) - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
+ #else
+-                VALUE_UNCOMPRESSED value_val = value_packed;
++                    VALUE_UNCOMPRESSED value_val = value_packed;
+ #endif
+-                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-                    GET_VECTOR_ELEMENT(acc, q_idx) = mad(sub_group_broadcast(GET_VECTOR_ELEMENT(qk_val, q_idx), i), value_val, GET_VECTOR_ELEMENT(acc, q_idx));
++                    unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                        GET_VECTOR_ELEMENT(acc, q_idx) = mad(sub_group_broadcast(GET_VECTOR_ELEMENT(qk_val, q_idx), i), value_val, GET_VECTOR_ELEMENT(acc, q_idx));
++                    }
+                 }
+-            }
+ #endif  // !USE_DUAL_NIBBLE_V_OPT
+-        }
++            }
+ 
+ 
+ #if SG_SCALE_FACTOR > 1
+-        }
++            }
+ #endif
+ 
+ #if SG_SCALE_FACTOR > 1
+-        // Reuse slm_qk_vals SLM to sum-up results between two sets of subgroups
+-        __local OUTPUT_TYPE* tmp_reduction_slm_mem = (__local OUTPUT_TYPE*)&slm_qk_vals[0];
+-        if ((partition_seq_len > (SEQ_LEN_PARTITION_SIZE / SG_SCALE_FACTOR)) || (leftovers != 0)) {
+-            barrier(CLK_LOCAL_MEM_FENCE);
++            // Reuse slm_qk_vals SLM to sum-up results between two sets of subgroups
++            __local OUTPUT_TYPE* tmp_reduction_slm_mem = (__local OUTPUT_TYPE*)&slm_qk_vals[0];
++            if ((partition_seq_len > (SEQ_LEN_PARTITION_SIZE / SG_SCALE_FACTOR)) || (leftovers != 0)) {
++                barrier(CLK_LOCAL_MEM_FENCE);
+ 
+-            if (sgid >= SUBGROUPS_PER_WG / SG_SCALE_FACTOR) {
++                if (sgid >= SUBGROUPS_PER_WG / SG_SCALE_FACTOR) {
+ #ifdef USE_DUAL_NIBBLE_V_OPT
+-                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-                    tmp_reduction_slm_mem[q_idx * V_HEAD_SIZE + packed_byte_idx * 2] = GET_VECTOR_ELEMENT(acc_lo, q_idx);
+-                    tmp_reduction_slm_mem[q_idx * V_HEAD_SIZE + packed_byte_idx * 2 + 1] = GET_VECTOR_ELEMENT(acc_hi, q_idx);
+-                }
++                    unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                        tmp_reduction_slm_mem[q_idx * V_HEAD_SIZE + packed_byte_idx * 2] = GET_VECTOR_ELEMENT(acc_lo, q_idx);
++                        tmp_reduction_slm_mem[q_idx * V_HEAD_SIZE + packed_byte_idx * 2 + 1] = GET_VECTOR_ELEMENT(acc_hi, q_idx);
++                    }
+ #else
+-                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-                    tmp_reduction_slm_mem[q_idx * V_HEAD_SIZE + head_size_idx] = GET_VECTOR_ELEMENT(acc, q_idx);
+-                }
++                    unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                        tmp_reduction_slm_mem[q_idx * V_HEAD_SIZE + head_size_idx] = GET_VECTOR_ELEMENT(acc, q_idx);
++                    }
+ #endif
+-            }
++                }
+ 
+-            barrier(CLK_LOCAL_MEM_FENCE);
++                barrier(CLK_LOCAL_MEM_FENCE);
+ 
+-            if (sgid < SUBGROUPS_PER_WG / SG_SCALE_FACTOR) {
++                if (sgid < SUBGROUPS_PER_WG / SG_SCALE_FACTOR) {
+ #ifdef USE_DUAL_NIBBLE_V_OPT
+-                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-                    GET_VECTOR_ELEMENT(acc_lo, q_idx) += tmp_reduction_slm_mem[q_idx * V_HEAD_SIZE + packed_byte_idx * 2];
+-                    GET_VECTOR_ELEMENT(acc_hi, q_idx) += tmp_reduction_slm_mem[q_idx * V_HEAD_SIZE + packed_byte_idx * 2 + 1];
+-                }
++                    unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                        GET_VECTOR_ELEMENT(acc_lo, q_idx) += tmp_reduction_slm_mem[q_idx * V_HEAD_SIZE + packed_byte_idx * 2];
++                        GET_VECTOR_ELEMENT(acc_hi, q_idx) += tmp_reduction_slm_mem[q_idx * V_HEAD_SIZE + packed_byte_idx * 2 + 1];
++                    }
+ #else
+-                unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
+-                    GET_VECTOR_ELEMENT(acc, q_idx) += tmp_reduction_slm_mem[q_idx * V_HEAD_SIZE + head_size_idx];
+-                }
++                    unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                        GET_VECTOR_ELEMENT(acc, q_idx) += tmp_reduction_slm_mem[q_idx * V_HEAD_SIZE + head_size_idx];
++                    }
+ #endif
++                }
+             }
++#endif
+         }
++
++        // arcint (patches/0015): let the next iteration's block-1 (QK compute) safely rewrite
++        // slm_qk_vals (and, when SG_SCALE_FACTOR > 1, block-3's reuse of it as
++        // tmp_reduction_slm_mem) once every work-item is done reading it in this iteration's
++        // block-3 above.
++        barrier(CLK_LOCAL_MEM_FENCE);
++    }
++
++    // arcint (patches/0015): single write of the fully-merged (across up to partitions_per_wg
++    // folded partitions) state, replacing the per-partition write the pre-patch kernel used to
++    // do inline. wg_partition_idx (not the loop's fine-grained partition_idx, which after the
++    // loop holds whichever raw partition was last processed or attempted) addresses exp_sums/
++    // max_logits/tmp_out, matching their P-wide (not raw-partitions-wide) allocation. The
++    // predicate uses this SEQUENCE's own bounded partition count - ceil(ceil(effective_seq_len /
++    // SEQ_LEN_PARTITION_SIZE) / partitions_per_wg) - rather than the pre-patch effective_seq_len
++    // > SEQ_LEN_PARTITION_SIZE check: a short sequence sharing a mixed-batch dispatch with a
++    // longer one can have total_partitions_num > 1 globally while still needing only this one
++    // work-group, and must go straight to `output` - the correctness hazard the design names.
++    //
++    // Noted on review, stated here rather than left implicit: the pre-patch kernel gated the
++    // exp_sums/max_logits write on plain `seq_len` (block 2, inline) but the tmp_out/output write
++    // on `effective_seq_len` (SWA-adjusted, block 3) - two DIFFERENT quantities already, on the
++    // unpatched kernel, whenever SWA trims the effective window. This patch unifies both writes
++    // below onto the SAME `seq_bounded_partitions`, itself derived from `effective_seq_len` - a
++    // deliberate correction (the two gates must agree, or the finalization can read one buffer
++    // written and the other not, under SWA), not an unexamined side effect. Benign: it can only
++    // change behaviour for SWA sequences whose full (pre-trim) length crosses a partition
++    // boundary that their trimmed, effective length does not - i.e. exactly the sequences for
++    // which the pre-patch kernel's own two predicates already disagreed.
++#if SWA_BLOCK_SKIP_ENABLED && !MULTI_TOKENS_PROCESSING
++    const uint effective_seq_len = seq_len - swa_start_token;
++#else
++    const uint effective_seq_len = seq_len;
+ #endif
++    const uint seq_bounded_partitions = CEIL_DIV(CEIL_DIV(effective_seq_len, SEQ_LEN_PARTITION_SIZE), partitions_per_wg);
++
++    {
++#if HEADS_PER_WI > 1 && HEADS_LEFTOVERS_NUM > 0
++        if (seq_bounded_partitions > 1 && sgid < HEADS_PER_WI && sgid < iter_heads_num) {
++#else
++        if (seq_bounded_partitions > 1 && sgid < HEADS_PER_WI) {
++#endif
++            const uint head_idx = GET_MULTIPLE_HEAD_IDX_OR_FIXED_VAL(sgid, 0);
++            const uint exp_sums_offset = seq_idx * HEADS_NUM * total_partitions_num +
++                                         (head_num_idx + head_idx) * total_partitions_num +
++                                         wg_partition_idx;
++            exp_sums[exp_sums_offset] = GET_VECTOR_ELEMENT(running_sum, head_idx);
++
++            const uint max_logits_offset = exp_sums_offset;
++            max_logits[max_logits_offset] = GET_VECTOR_ELEMENT(running_max, head_idx);
++        }
++    }
+ 
+ #if SG_SCALE_FACTOR > 1
+-        if (sgid < SUBGROUPS_PER_WG / SG_SCALE_FACTOR) {
++    if (sgid < SUBGROUPS_PER_WG / SG_SCALE_FACTOR) {
+ #endif
+ 
+ #ifdef USE_DUAL_NIBBLE_V_OPT
+-        if (effective_seq_len > SEQ_LEN_PARTITION_SIZE && total_partitions_num > 1) {
+-            unroll_for (uint q_idx = 0; q_idx < HEADS_PER_WI; q_idx++) {
++    if (seq_bounded_partitions > 1 && total_partitions_num > 1) {
++        unroll_for (uint q_idx = 0; q_idx < HEADS_PER_WI; q_idx++) {
+ #if HEADS_LEFTOVERS_NUM > 0
+-                if (q_idx >= iter_heads_num)
+-                    break;
++            if (q_idx >= iter_heads_num)
++                break;
+ #endif
+-                const uint base_offset = seq_idx * (HEADS_NUM * V_HEAD_SIZE * total_partitions_num) +
+-                                         (head_num_idx + q_idx) * (V_HEAD_SIZE * total_partitions_num) +
+-                                         partition_idx * V_HEAD_SIZE;
++            const uint base_offset = seq_idx * (HEADS_NUM * V_HEAD_SIZE * total_partitions_num) +
++                                     (head_num_idx + q_idx) * (V_HEAD_SIZE * total_partitions_num) +
++                                     wg_partition_idx * V_HEAD_SIZE;
+ 
+-                tmp_out[base_offset + packed_byte_idx * 2] = GET_VECTOR_ELEMENT(acc_lo, q_idx);
+-                tmp_out[base_offset + packed_byte_idx * 2 + 1] = GET_VECTOR_ELEMENT(acc_hi, q_idx);
+-            }
+-        } else {
+-            unroll_for (uint q_idx = 0; q_idx < HEADS_PER_WI; q_idx++) {
++            tmp_out[base_offset + packed_byte_idx * 2] = GET_VECTOR_ELEMENT(acc_lo, q_idx);
++            tmp_out[base_offset + packed_byte_idx * 2 + 1] = GET_VECTOR_ELEMENT(acc_hi, q_idx);
++        }
++    } else {
++        unroll_for (uint q_idx = 0; q_idx < HEADS_PER_WI; q_idx++) {
+ #if HEADS_LEFTOVERS_NUM > 0
+-                if (q_idx >= iter_heads_num)
+-                    break;
++            if (q_idx >= iter_heads_num)
++                break;
+ #endif
+-                const uint base_offset = seq_idx * (HEADS_NUM * V_HEAD_SIZE) +
+-                                         (head_num_idx + q_idx) * V_HEAD_SIZE;
++            const uint base_offset = seq_idx * (HEADS_NUM * V_HEAD_SIZE) +
++                                     (head_num_idx + q_idx) * V_HEAD_SIZE;
+ 
+-                output[base_offset + packed_byte_idx * 2] = GET_VECTOR_ELEMENT(acc_lo, q_idx);
+-                output[base_offset + packed_byte_idx * 2 + 1] = GET_VECTOR_ELEMENT(acc_hi, q_idx);
+-            }
++            output[base_offset + packed_byte_idx * 2] = GET_VECTOR_ELEMENT(acc_lo, q_idx);
++            output[base_offset + packed_byte_idx * 2 + 1] = GET_VECTOR_ELEMENT(acc_hi, q_idx);
+         }
++    }
+ #else  // !USE_DUAL_NIBBLE_V_OPT
+-        if (effective_seq_len > SEQ_LEN_PARTITION_SIZE && total_partitions_num > 1) {
+-            unroll_for (uint q_idx = 0; q_idx < HEADS_PER_WI; q_idx++) {
++    if (seq_bounded_partitions > 1 && total_partitions_num > 1) {
++        unroll_for (uint q_idx = 0; q_idx < HEADS_PER_WI; q_idx++) {
+ #if HEADS_LEFTOVERS_NUM > 0
+-                if (q_idx >= iter_heads_num)
+-                    break;
++            if (q_idx >= iter_heads_num)
++                break;
+ #endif
+-                const uint tmp_out_offset = seq_idx * (HEADS_NUM * V_HEAD_SIZE * total_partitions_num) +
+-                                            (head_num_idx + q_idx) * (V_HEAD_SIZE * total_partitions_num) +
+-                                            partition_idx * V_HEAD_SIZE +
+-                                            sgid * SUBGROUP_SIZE +
+-                                            sglid;
++            const uint tmp_out_offset = seq_idx * (HEADS_NUM * V_HEAD_SIZE * total_partitions_num) +
++                                        (head_num_idx + q_idx) * (V_HEAD_SIZE * total_partitions_num) +
++                                        wg_partition_idx * V_HEAD_SIZE +
++                                        sgid * SUBGROUP_SIZE +
++                                        sglid;
+ 
+-                tmp_out[tmp_out_offset] = GET_VECTOR_ELEMENT(acc, q_idx);
+-            }
+-        } else {
+-            unroll_for (uint q_idx = 0; q_idx < HEADS_PER_WI; q_idx++) {
++            tmp_out[tmp_out_offset] = GET_VECTOR_ELEMENT(acc, q_idx);
++        }
++    } else {
++        unroll_for (uint q_idx = 0; q_idx < HEADS_PER_WI; q_idx++) {
+ #if HEADS_LEFTOVERS_NUM > 0
+-                if (q_idx >= iter_heads_num)
+-                    break;
++            if (q_idx >= iter_heads_num)
++                break;
+ #endif
+-                const uint output_offset = seq_idx * (HEADS_NUM * V_HEAD_SIZE) +
+-                                           (head_num_idx + q_idx) * V_HEAD_SIZE +
+-                                           sgid * SUBGROUP_SIZE +
+-                                           sglid;
++            const uint output_offset = seq_idx * (HEADS_NUM * V_HEAD_SIZE) +
++                                       (head_num_idx + q_idx) * V_HEAD_SIZE +
++                                       sgid * SUBGROUP_SIZE +
++                                       sglid;
+ 
+-                output[output_offset] = GET_VECTOR_ELEMENT(acc, q_idx);
+-            }
++            output[output_offset] = GET_VECTOR_ELEMENT(acc, q_idx);
+         }
++    }
+ #endif  // !USE_DUAL_NIBBLE_V_OPT
+ 
+ #if SG_SCALE_FACTOR > 1
+-        }
+-#endif
+     }
++#endif
+ }
+ 
+ #endif
+@@ -1038,7 +1223,13 @@ KERNEL(pa_sdpa_finalization_stage)(
+ #if MULTI_TOKENS_PROCESSING
+     const __global int* gws_subseq_mapping,
+ #endif
+-    const uint total_partitions_num) {
++    const uint total_partitions_num,
++    // arcint (patches/0015): S - how many raw 256-token partitions each stage-0 work-group
++    // folded via the online merge. 1 (default, every pre-existing caller) makes the formula
++    // below reduce exactly to CEIL_DIV(effective_seq_len, SEQ_LEN_PARTITION_SIZE), the
++    // pre-patch value - integer ceiling division has no rounding-mode ambiguity, so this is
++    // byte-identical when unbounded, unlike the stage-0 kernel's softmax merge (see there).
++    const uint partitions_per_wg) {
+     const uint seq_idx = get_global_id(0);
+     const uint head_num_idx = get_global_id(1);
+     const uint head_size_idx = get_global_id(2);
+@@ -1058,7 +1249,11 @@ KERNEL(pa_sdpa_finalization_stage)(
+ #else
+     const uint effective_seq_len = seq_len;
+ #endif
+-    const uint num_of_partitions = min((uint)CEIL_DIV(effective_seq_len, SEQ_LEN_PARTITION_SIZE), total_partitions_num);
++    // arcint (patches/0015): CEIL_DIV(..., partitions_per_wg) mirrors the stage-0 kernel's fold
++    // (S consecutive raw partitions per work-group) - this sequence's own bounded partition
++    // count, capped at total_partitions_num (P) the same way the pre-patch formula capped the
++    // raw count. partitions_per_wg == 1 (default) makes this identical to the pre-patch formula.
++    const uint num_of_partitions = min((uint)CEIL_DIV(CEIL_DIV(effective_seq_len, SEQ_LEN_PARTITION_SIZE), partitions_per_wg), total_partitions_num);
+ 
+     if (num_of_partitions <= 1) {
+         /* Short path, no need any actions for currently processing sequence */
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
+index 6ea9722..f0db814 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
+@@ -12,6 +12,7 @@
+ #include <array>
+ #include <cstdint>
+ #include <memory>
++#include <sstream>
+ #include <utility>
+ 
+ #include "../primitive_ocl_base.hpp"
+@@ -516,6 +517,10 @@
+ 
+         args.push_back({ArgumentDescriptor::Types::OUTPUT, 0});
+         add_intermediate_inputs(args, has_scores_output, false, desc->has_score_aggregation);
++        // arcint (patches/0015): partitions_per_wg (S) - the paged_attention_opt.cl kernel's new
++        // trailing parameter, wired the way the finalization kernels' pre-existing
++        // total_partitions_num scalar (index 0 there) already is.
++        args.push_back({ArgumentDescriptor::Types::SCALAR, 0});  // partitions_per_wg
+ 
+         return args;
+     }
+@@ -524,6 +529,8 @@
+         return DispatchDataFunc{[](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {
+             assert(!params.is_dynamic());
+             auto& wgs = kd.params.workGroups;
++            auto& scalars = kd.params.scalars;
++            scalars.resize(1);
+             const auto desc = params.typed_desc<paged_attention>();
+             auto* rtp = static_cast<PagedAttentionRuntimeParams*>(rt_params);
+ 
+@@ -542,6 +549,9 @@
+             auto sg_scale = get_pa_sg_number_scale_factor(params.get_device_info(), head_size, SDPAStage::SINGLE_TOKEN, get_kv_compressed(params));
+             wgs.global = {total_tokens, heads_num, head_size * rtp->num_of_partitions * sg_scale};
+             wgs.local = {1, 1, head_size * sg_scale};
++
++            scalars[0].t = ScalarDescriptor::Types::UINT32;
++            scalars[0].v.u32 = static_cast<uint32_t>(rtp->partitions_per_wg);
+         }};
+     }
+ };
+@@ -570,6 +580,8 @@
+         return DispatchDataFunc{[](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {
+             assert(!params.is_dynamic());
+             auto& wgs = kd.params.workGroups;
++            auto& scalars = kd.params.scalars;
++            scalars.resize(1);
+             const auto desc = params.typed_desc<paged_attention>();
+             auto* rtp = static_cast<PagedAttentionRuntimeParams*>(rt_params);
+ 
+@@ -588,6 +600,10 @@
+             auto gqa_heads_num = kv_groups * ceil_div(kv_group_size, get_heads_per_wi(kv_group_size));
+             wgs.global = {total_tokens, gqa_heads_num, head_size * rtp->num_of_partitions * sg_scale};
+             wgs.local = {1, 1, head_size * sg_scale};
++
++            // arcint (patches/0015): see PagedAttentionGeneratorSingleToken's dispatch func above.
++            scalars[0].t = ScalarDescriptor::Types::UINT32;
++            scalars[0].v.u32 = static_cast<uint32_t>(rtp->partitions_per_wg);
+         }};
+     }
+ };
+@@ -620,6 +636,9 @@
+         add_intermediate_inputs(args, has_scores_output, false, desc->has_score_aggregation);
+ 
+         args.push_back({ArgumentDescriptor::Types::SCALAR, 0});  // total_partitions_num
++        // arcint (patches/0015): the finalization kernel's new trailing partitions_per_wg
++        // parameter - see paged_attention_opt.cl.
++        args.push_back({ArgumentDescriptor::Types::SCALAR, 1});  // partitions_per_wg
+ 
+         return args;
+     }
+@@ -629,7 +648,7 @@
+             assert(!params.is_dynamic());
+             auto& wgs = kd.params.workGroups;
+             auto& scalars = kd.params.scalars;
+-            scalars.resize(1);
++            scalars.resize(2);
+ 
+             const auto desc = params.typed_desc<paged_attention>();
+             auto* rtp = static_cast<PagedAttentionRuntimeParams*>(rt_params);
+@@ -643,6 +662,8 @@
+ 
+             scalars[0].t = ScalarDescriptor::Types::UINT32;
+             scalars[0].v.u32 = static_cast<uint32_t>(rtp->num_of_partitions);
++            scalars[1].t = ScalarDescriptor::Types::UINT32;
++            scalars[1].v.u32 = static_cast<uint32_t>(rtp->partitions_per_wg);
+         }};
+     }
+ };
+@@ -735,6 +756,8 @@
+         }
+         args.push_back({ArgumentDescriptor::Types::OUTPUT, 0});
+         add_intermediate_inputs(args, has_scores_output, true, desc->has_score_aggregation);
++        // arcint (patches/0015): see PagedAttentionGeneratorSingleToken's get_arguments_desc.
++        args.push_back({ArgumentDescriptor::Types::SCALAR, 0});  // partitions_per_wg
+         return args;
+     }
+ 
+@@ -742,6 +765,8 @@
+         return DispatchDataFunc{[](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {
+             assert(!params.is_dynamic());
+             auto& wgs = kd.params.workGroups;
++            auto& scalars = kd.params.scalars;
++            scalars.resize(1);
+             const auto desc = params.typed_desc<paged_attention>();
+             auto* rtp = static_cast<PagedAttentionRuntimeParams*>(rt_params);
+             const size_t total_tokens = params.input_layouts[0].get_partial_shape()[0].get_length();
+@@ -758,6 +783,9 @@
+             auto sg_scale = get_pa_sg_number_scale_factor(params.get_device_info(), head_size, SDPAStage::MULTI_TOKENS, get_kv_compressed(params));
+             wgs.global = {total_tokens, heads_num, head_size * rtp->num_of_partitions * sg_scale};
+             wgs.local = {1, 1, head_size * sg_scale};
++
++            scalars[0].t = ScalarDescriptor::Types::UINT32;
++            scalars[0].v.u32 = static_cast<uint32_t>(rtp->partitions_per_wg);
+         }};
+     }
+ };
+@@ -793,6 +821,9 @@
+         add_intermediate_inputs(args, has_scores_output, true, desc->has_score_aggregation);
+ 
+         args.push_back({ArgumentDescriptor::Types::SCALAR, 0});  // total_partitions_num
++        // arcint (patches/0015): see PagedAttentionGeneratorSingleTokenFinalization's
++        // get_arguments_desc.
++        args.push_back({ArgumentDescriptor::Types::SCALAR, 1});  // partitions_per_wg
+ 
+         return args;
+     }
+@@ -802,7 +833,7 @@
+             assert(!params.is_dynamic());
+             auto& wgs = kd.params.workGroups;
+             auto& scalars = kd.params.scalars;
+-            scalars.resize(1);
++            scalars.resize(2);
+ 
+             const auto desc = params.typed_desc<paged_attention>();
+             auto* rtp = static_cast<PagedAttentionRuntimeParams*>(rt_params);
+@@ -816,6 +847,8 @@
+ 
+             scalars[0].t = ScalarDescriptor::Types::UINT32;
+             scalars[0].v.u32 = static_cast<uint32_t>(rtp->num_of_partitions);
++            scalars[1].t = ScalarDescriptor::Types::UINT32;
++            scalars[1].v.u32 = static_cast<uint32_t>(rtp->partitions_per_wg);
+         }};
+     }
+ };
+@@ -1414,6 +1447,13 @@
+     Stage::Ptr pa_sdpa_micro_mixed = make_stage<SDPAMicroGenerator>(false);
+ #endif
+ 
++    // arcint (patches/0015, review round A): identity (raw pointer) of each intermediate memory
++    // object this primitive's kernel arguments were last bound against - see the check in
++    // execute() below. Empty until the first execute() call, which is exactly the state that
++    // makes that call's own comparison see "changed" and rebind unconditionally the first time,
++    // matching kernel_generator_base.hpp's own need_args_update{true} default for a fresh KernelData.
++    std::vector<void*> m_last_seen_intermediates;
++
+     PagedAttentionOptImpl() : SDPAImplBase(PagedAttentionOpt::get_type_info_static()) {}
+     explicit PagedAttentionOptImpl(const kernel_impl_params& params) : PagedAttentionOptImpl() {
+         const auto desc = params.typed_desc<paged_attention>();
+@@ -1611,6 +1651,44 @@
+         }
+         rt_params->num_of_partitions = ceil_div(effective_context_len, rt_params->partition_size);
+ 
++        // arcint (patches/0015): PAGED_ATTENTION_MAX_PARTITIONS bounds num_of_partitions for the
++        // GENERATE/MIXED case only - partition_size there is the fixed seq_len_partition_size
++        // (256, get_partitioning_size's non-PREFILL branch above); PREFILL's partition_size is
++        // head-size-derived, a different scheme this patch does not touch. 0 (default, and every
++        // pre-existing caller) is unbounded: partitions_per_wg stays 1 and num_of_partitions
++        // keeps its raw value, byte-identical to before this patch. When bounded, P consecutive
++        // 256-token partitions collapse into S = ceil(raw_partitions / P) per work-group, and the
++        // stage-0/finalization kernels merge S partitions per work-group with an online softmax
++        // fold (paged_attention_opt.cl) instead of allocating one work-group and one
++        // exp_sums/max_logits/tmp_out slot per raw partition. Also excluded: has_scores_output()
++        // - that path's softmax_results buffer is strided by total_partitions_num but addressed
++        // with the fine-grained (raw) partition_idx (paged_attention_opt.cl's
++        // PAGED_ATTENTION_SCORES_OUTPUT block), a separate feature this patch does not rework;
++        // folding partitions there would write outside that buffer's bounds.
++        rt_params->partitions_per_wg = 1;
++        if (rt_params->stage != PagedAttentionStage::PREFILL && !desc->has_scores_output()) {
++            const auto max_partitions = params.get_program().get_config().get_paged_attention_max_partitions();
++            if (max_partitions > 0 && rt_params->num_of_partitions > max_partitions) {
++                const auto raw_partitions = rt_params->num_of_partitions;
++                rt_params->num_of_partitions = max_partitions;
++                rt_params->partitions_per_wg = ceil_div(raw_partitions, max_partitions);
++            }
++        }
++
++        // arcint (patches/0015, added on review): captures the SAME SG_SCALE_FACTOR value the
++        // stage-0 dispatch functions independently compute (get_pa_sg_number_scale_factor,
++        // SDPAStage::SINGLE_TOKEN and SDPAStage::MULTI_TOKENS are treated identically by that
++        // function's own condition, so SINGLE_TOKEN is representative for GENERATE and MIXED
++        // alike) - read-only diagnostic, not used by any dispatch or buffer-sizing decision; see
++        // the struct field's own comment and get_kernels_dump_info() below.
++        {
++            const auto value_cache_dt = params.get_program().get_config().get_value_cache_precision();
++            const bool dual_nibble_v = can_use_dual_nibble_v(get_kv_compressed(params), value_cache_dt, desc->v_head_size);
++            const size_t effective_head_size = dual_nibble_v ? desc->v_head_size / u4_elems_per_byte : desc->v_head_size;
++            rt_params->sg_scale_factor = get_pa_sg_number_scale_factor(
++                params.get_device_info(), effective_head_size, SDPAStage::SINGLE_TOKEN, get_kv_compressed(params));
++        }
++
+         if ((rt_params->stage == PagedAttentionStage::PREFILL || rt_params->stage == PagedAttentionStage::MIXED) && !params.is_dynamic())
+             rt_params->paged_attention_aligned_seq_len = static_cast<size_t>(get_aligned_seq_len(params, rt_params->stage));
+ 
+@@ -1649,6 +1727,33 @@
+         }
+     }
+ 
++    // arcint (patches/0015, added on review): a device-free-readable diagnostic, requested to
++    // settle a review disagreement with evidence rather than more tracing - a test (or an
++    // operator) reads this the same way the existing tests already read entry-point names
++    // (paged_attention_gpu_test.cpp's own dump_info.get_entries().find("sdpa_micro") pattern),
++    // via a plain std::string, no plugin-internal types crossing the test/plugin boundary.
++    // Appends one extra "entry" (PrimitiveImplOCL::add_entry_point does not care what a string
++    // contains) carrying the actual runtime facts update_rt_params resolved for the LAST
++    // execution: which stage ran, the online-merge fold width, the raw (pre-fold) partition
++    // count, and SG_SCALE_FACTOR - so a test can assert on what the dispatch ACTUALLY was
++    // instead of assuming it from source. Format: semicolon-separated key=value pairs after the
++    // "arcint_0015_diag:" tag, deliberately grep/substring-friendly rather than a structured type,
++    // matching this file's own existing entry-point convention.
++    cldnn::KernelDumpInfo get_kernels_dump_info(const cldnn::kernel_impl_params& impl_params) const override {
++        auto info = PrimitiveImplOCL::get_kernels_dump_info(impl_params);
++        auto* rt_params = static_cast<PagedAttentionRuntimeParams*>(m_rt_params.get());
++        if (rt_params != nullptr) {
++            std::ostringstream oss;
++            oss << "arcint_0015_diag:stage=" << static_cast<int>(rt_params->stage)
++                << ";sg_scale_factor=" << rt_params->sg_scale_factor
++                << ";partitions_per_wg=" << rt_params->partitions_per_wg
++                << ";num_of_partitions=" << rt_params->num_of_partitions
++                << ";max_context_len=" << rt_params->max_context_len;
++            info.add_entry_point(oss.str());
++        }
++        return info;
++    }
++
+     // update impl_parameter and rt_parameter
+     void update(primitive_inst& inst, const kernel_impl_params& impl_params) override {
+         SDPAImplBase::update(inst, impl_params);
+@@ -1663,6 +1768,53 @@
+         const bool has_adaptive_rkv = desc->has_adaptive_rkv;
+ 
+         update_stages_flags(instance);
++
++        // arcint (patches/0015, review round A/B): primitive_inst::realloc_intermediates()
++        // (primitive_inst.cpp, generic framework code, not part of this patch) never sets
++        // ExecutionFlags::MEMORY_CHANGED / ARG_UPDATE_REQUIRED when it replaces an intermediate
++        // buffer's identity - neither branch (engine.reinterpret_buffer's same-handle new
++        // wrapper, nor allocate_internal_buffer's genuine new allocation) does. The ONLY thing
++        // that forces execute_stage() to rebind kernel arguments (get_arguments() + stream.
++        // set_arguments(), primitive_ocl_base.hpp) is stage.kd.need_args_update, which
++        // update_stages_flags() (just above) derives entirely from ExecutionFlags::
++        // ARG_UPDATE_REQUIRED | IMPL_CHANGED - bits that a pure intermediate-buffer change never
++        // sets on its own. Recorded as item B in the patch header: a pre-existing gap in shared
++        // framework code, not fixed here (out of scope for a paged-attention-local patch,
++        // upstream-worthy on its own). This is the local (A) fix, scoped to this primitive:
++        // track the identity (raw pointer) of each intermediate memory object this primitive
++        // last dispatched kernel arguments against; if ANY differ from what
++        // instance.get_intermediates_memories() holds now - which, at this point in execute(),
++        // is always the POST-reallocation state, since realloc_if_needed() runs in the caller
++        // (primitive_inst::execute()) before _impl->execute() is ever invoked - force every
++        // stage's arguments to rebind on this call. Deliberately does not try to distinguish
++        // "reinterpret, same handle" from "genuine reallocation, different handle" - the former
++        // is very likely already harmless (reinterpret_buffer explicitly reuses the same
++        // underlying handle and shares its mem_tracker), but telling them apart cheaply from
++        // here risks getting it wrong in the one direction that matters; comparing identity is
++        // cheap (a pointer per intermediate, no allocation on the common no-change path) and
++        // conservative in the safe direction.
++        {
++            const auto& current_intermediates = instance.get_intermediates_memories();
++            bool intermediates_changed = current_intermediates.size() != m_last_seen_intermediates.size();
++            if (!intermediates_changed) {
++                for (size_t i = 0; i < current_intermediates.size(); i++) {
++                    if (current_intermediates[i].get() != m_last_seen_intermediates[i]) {
++                        intermediates_changed = true;
++                        break;
++                    }
++                }
++            }
++            if (intermediates_changed) {
++                m_last_seen_intermediates.assign(current_intermediates.size(), nullptr);
++                for (size_t i = 0; i < current_intermediates.size(); i++) {
++                    m_last_seen_intermediates[i] = current_intermediates[i].get();
++                }
++                for (auto& stage : _stages) {
++                    stage->kd.need_args_update = true;
++                }
++            }
++        }
++
+         kernel_dump_info.clear_entries();
+         auto* rt_params = static_cast<PagedAttentionRuntimeParams*>(m_rt_params.get());
+         assert(rt_params != nullptr);
+@@ -1787,6 +1939,20 @@
+         const auto desc = params.typed_desc<paged_attention>();
+         const auto indexes_dt = ov::element::u8;
+         const auto element_size = 4;  // 4 bytes
++        // arcint (patches/0015), recon corrected against source rather than guessed: tmp_out
++        // (the mixed-stage intermediate softmax*V output - named by role, not number: these
++        // descs are packed densely and has_scores_output() shifts every index from exp_sums
++        // onward by two, so there is no single fixed index for it; in the no-scores MIXED-stage
++        // indexing arcint serves it is index 5) is declared OUTPUT_TYPE by both kernels that
++        // touch it (paged_attention_opt.cl:98, 1037 - `__global OUTPUT_TYPE* tmp_out`), which
++        // make_layout_jit_constants("OUTPUT", output_layouts[0], ...) resolves from the IR's
++        // real output element type (f16 on every model this repo serves), not the hardcoded
++        // 4-byte element_size above that the other index/counter and softmax-accumulator
++        // buffers correctly share (see the comment at their allocation sites below). Sizing
++        // tmp_out with element_size double-allocates a buffer whose bytes are never addressed
++        // at that width: no kernel line changes, same addresses written and read, half the
++        // bytes reserved.
++        const auto tmp_out_element_size = get_element_size(params.output_layouts[0].data_type);
+         const int64_t target_seq_len_block_size = 16;
+ 
+         auto stage = PagedAttentionStage::UNKNOWN;
+@@ -1802,6 +1968,18 @@
+             partition_size = get_partitioning_size(params, desc->v_head_size, stage);
+             const auto max_context_len = get_max_context_len(params);
+             num_of_partitions = ceil_div(max_context_len, partition_size);
++            // arcint (patches/0015): mirror update_rt_params' PAGED_ATTENTION_MAX_PARTITIONS
++            // bound here too, so a buffer-size query issued before rt_params exists (this
++            // branch) reserves the same, bounded amount that the bounded dispatch will actually
++            // address, rather than the raw (potentially much larger) partition count - see the
++            // matching comment in update_rt_params. Also excluded: has_scores_output() - see the
++            // matching comment there.
++            if (stage != PagedAttentionStage::PREFILL && !desc->has_scores_output()) {
++                const auto max_partitions = params.get_program().get_config().get_paged_attention_max_partitions();
++                if (max_partitions > 0 && num_of_partitions > max_partitions) {
++                    num_of_partitions = max_partitions;
++                }
++            }
+         }
+         bool can_use_micro_sdpa = false;
+ #ifdef ENABLE_ONEDNN_FOR_GPU
+@@ -1879,15 +2057,36 @@
+ 
+                 // Intermediate tmp output buffer is not used for PREFILL stage
+                 tmp_out_elements_count = get_element_size(softmax_accumulator_type);
++                // arcint (patches/0015, noted on review): this dummy buffer's byte size
++                // (tmp_out_elements_count * tmp_out_element_size, below) is now halved for the
++                // has_scores_output PREFILL case relative to before this patch (tmp_out_element_
++                // size is 2 for f16 output where the pre-patch element_size was always 4) -
++                // harmless, since this buffer is never addressed by a PREFILL-stage kernel
++                // (see the comment above); it exists only because the allocation call site is
++                // shared with GENERATE/MIXED.
+             }
+         }
+ 
+         // PREFILL stage without scores_output doesn't require additional buffers for softmax, exp_sums and max_logits.
+         // GENERATE/MIXED stages require additional buffers for softmax, exp_sums and max_logits.
+         if (!can_use_micro_sdpa && (stage != PagedAttentionStage::PREFILL || has_scores_output)) {
+-            internal_buffers.emplace_back(buf_elements_count * element_size, indexes_dt);      // 5: softmax exp_sums
+-            internal_buffers.emplace_back(buf_elements_count * element_size, indexes_dt);      // 6: softmax max_logits
+-            internal_buffers.emplace_back(tmp_out_elements_count * element_size, indexes_dt);  // 7: intermediate output
++            internal_buffers.emplace_back(buf_elements_count * element_size, indexes_dt);      // 5: softmax exp_sums (f32, genuinely 4 B)
++            internal_buffers.emplace_back(buf_elements_count * element_size, indexes_dt);      // 6: softmax max_logits (f32, genuinely 4 B)
++            // arcint (patches/0015, moved here on review): ov::element::Type(dynamic).size()
++            // returns 0, not a thrown error - sizing this buffer by a still-unresolved output
++            // type would silently allocate 0 bytes (tmp_out_elements_count * 0) rather than fail
++            // loudly. Asserted right here, not unconditionally near the top of this function,
++            // because this line is the only one that actually uses tmp_out_element_size - a
++            // PREFILL-without-scores-output call never reaches this block at all (see the `if`
++            // above) and should not pay for (or fail on) an invariant this specific call does
++            // not depend on. This kernel's output type is expected to always be resolved to a
++            // concrete type (f16/f32) by the time this runs - shape can stay dynamic, the
++            // element type does not - so this is a defensive assert on that invariant, not a
++            // case this task observed failing.
++            OPENVINO_ASSERT(tmp_out_element_size > 0,
++                            "[GPU] paged_attention: output element type is unresolved (dynamic) "
++                            "when sizing the intermediate-output buffer");
++            internal_buffers.emplace_back(tmp_out_elements_count * tmp_out_element_size, indexes_dt);  // 7: intermediate output (OUTPUT_TYPE, e.g. f16)
+         }
+ 
+         const auto multi_tokens_mode = stage == PagedAttentionStage::MIXED;
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.hpp
+index 0211778..cb418c4 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.hpp
+@@ -31,6 +31,21 @@ struct PagedAttentionRuntimeParams : public ImplRuntimeParams {
+     bool use_micro_sdpa = false;
+     bool use_gqa_kernel = false;
+     size_t query_block_size = 16;
++
++    // arcint (patches/0015): consecutive 256-token partitions folded into one GENERATE/MIXED
++    // stage-0 work-group when PAGED_ATTENTION_MAX_PARTITIONS bounds num_of_partitions below the
++    // raw ceil(effective_context_len / partition_size). 1 (default, matches every pre-existing
++    // caller) means no folding - num_of_partitions is already the raw partition count and each
++    // work-group covers exactly one 256-token partition, byte-identical to before this patch.
++    size_t partitions_per_wg = 1;
++
++    // arcint (patches/0015, added on review): mirrors the SG_SCALE_FACTOR jit constant each
++    // stage-0 dispatch function independently recomputes via get_pa_sg_number_scale_factor -
++    // captured once here, at the same point num_of_partitions/partitions_per_wg are, purely as a
++    // read-only diagnostic surfaced through PagedAttentionOptImpl::get_kernels_dump_info() (see
++    // the .cpp) so a test or operator can confirm which dispatch shape actually ran without
++    // guessing from source. Not read by any dispatch or buffer-sizing code itself.
++    size_t sg_scale_factor = 1;
+ };
+ 
+ struct PagedAttentionOpt : public ImplementationManager {
+diff --git a/src/plugins/intel_gpu/src/plugin/compiled_model.cpp b/src/plugins/intel_gpu/src/plugin/compiled_model.cpp
+index cedd926..2bc2933 100644
+--- a/src/plugins/intel_gpu/src/plugin/compiled_model.cpp
++++ b/src/plugins/intel_gpu/src/plugin/compiled_model.cpp
+@@ -343,6 +343,7 @@ ov::Any CompiledModel::get_property(const std::string& name) const {
+             ov::PropertyName{ov::intel_gpu::moe_otd_device_pool_bytes.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::intel_gpu::moe_cpu_tier.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::intel_gpu::moe_cpu_tier_threads.name(), PropertyMutability::RO},
++            ov::PropertyName{ov::intel_gpu::paged_attention_max_partitions.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::device::id.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::execution_devices.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::runtime_requirements.name(), PropertyMutability::RO},
+diff --git a/src/plugins/intel_gpu/src/plugin/plugin.cpp b/src/plugins/intel_gpu/src/plugin/plugin.cpp
+index 9677587..ecaeb82 100644
+--- a/src/plugins/intel_gpu/src/plugin/plugin.cpp
++++ b/src/plugins/intel_gpu/src/plugin/plugin.cpp
+@@ -814,6 +814,7 @@ std::vector<ov::PropertyName> Plugin::get_supported_properties() const {
+         ov::PropertyName{ov::intel_gpu::moe_otd_device_pool_bytes.name(), PropertyMutability::RW},
+         ov::PropertyName{ov::intel_gpu::moe_cpu_tier.name(), PropertyMutability::RW},
+         ov::PropertyName{ov::intel_gpu::moe_cpu_tier_threads.name(), PropertyMutability::RW},
++        ov::PropertyName{ov::intel_gpu::paged_attention_max_partitions.name(), PropertyMutability::RW},
+         ov::PropertyName{ov::intel_gpu::config_file.name(), PropertyMutability::RW},
+     };
+ 
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
+index 3c582e6..7aa31ab 100644
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
+@@ -102,6 +102,198 @@ INSTANTIATE_TEST_SUITE_P(
+     paged_attention_u4_swa_tail_test,
+     ::testing::Values(paged_attention_test_params{{{1, 35}}, 8, 2, 128, 128, 16, 16, ENABLE_CACHE_COMPRESSION, ov::internal::CacheQuantMode::BY_CHANNEL, DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2, false, 0, {}, false, {}, {}, ov::element::u4}));
+ 
++// patches/0015 (o-0015-design.md, part A): PAGED_ATTENTION_MAX_PARTITIONS bounds the
++// GENERATE/MIXED stage-0 work-group count and folds the excess 256-token partitions into an
++// online softmax merge per work-group instead of giving each its own work-group and
++// exp_sums/max_logits/tmp_out slot (paged_attention_opt.cl). This exercises exactly the case the
++// design names as the bound's point: a MIXED-stage sequence (4 new tokens over a 2000-token
++// past) whose raw partition count - ceil(2000/256) = 8 - is well above P_MAX = 2, so
++// PARTITIONS_PER_WG (S) folds 4 raw partitions per work-group (S = ceil(8/2) = 4), i.e.
++// L = 2000 > 256 * P_MAX = 512, the condition the task asked this test to cover. No cache
++// compression, so any disagreement with the float reference below tolerance is attributable to
++// the merge itself (reassociated summation, f16 rounding in the folded normalisation multiply -
++// see the design's "byte-exactness across this patch is NOT expected" note) rather than
++// quantization noise.
++//
++// RED-first, stated precisely (no GPU device was touched by this task; this is the read-and-trace
++// argument the series' own convention asks for when no card is available - see e.g. the
++// u4_swa_tail/asymmetric-KV tests above): the online merge's correctness rests on the rescale
++// step in paged_attention_opt.cl's stage-0 kernel - scaling the running V accumulator (acc /
++// acc_lo+acc_hi) by acc_scale = alpha / (alpha + beta) before folding in the next partition's
++// contribution (see the "arcint (patches/0015)" comment at the QK*V calculation block). Comment
++// out just that one `GET_VECTOR_ELEMENT(acc, q_idx) *= ...` statement (and its acc_lo/acc_hi
++// dual-nibble twin) - i.e. accumulate every folded partition's contribution as if it already
++// carried its full final weight, never shrinking the earlier partitions' share - and this test
++// must fail: the reference divides the true (past-256-token) softmax weight across all 8 raw
++// partitions, so an unrescaled accumulator overweights every partition after the first by a
++// factor that grows with S, and the P_MAX=2 arm's output diverges from the float reference by
++// far more than the tolerance below, while the P_MAX=0 (unbounded, single-partition-per-
++// work-group, this merge code never runs) arm in the same instantiation is unaffected - the
++// exact asymmetry that isolates the merge as the fault, not the reference or the harness.
++static paged_attention_test_params paged_attention_bounded_partials_params(size_t max_partitions) {
++    paged_attention_test_params p{};
++    p.subsequences = {{4, 2000}};
++    p.num_heads = 8;
++    p.num_kv_heads = 2;
++    p.k_head_size = 128;
++    p.v_head_size = 128;
++    p.block_size = 16;
++    p.sliding_window_size = 0;
++    p.kv_cache_compression = DISABLE_CACHE_COMPRESSION;
++    p.key_cache_quant_mode = ov::internal::CacheQuantMode::BY_TOKEN;
++    p.dynamic_paddings = STATIC_INPUT_PAD;
++    p.scores_mode = DISABLE_SCORES;
++    p.rotation_config = DISABLE_ROTATION;
++    p.disable_flashattn_v2 = DISABLE_FA_V2;
++    p.paged_attention_max_partitions = max_partitions;
++    return p;
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    patches_0015_paged_attention_bounded_partials,
++    paged_attention_test,
++    ::testing::Values(
++        // P_MAX = 2: forces the fold (S = 4) this patch adds.
++        paged_attention_bounded_partials_params(2),
++        // P_MAX = 0 (unbounded, the pre-existing behaviour, every prior caller's default):
++        // same scenario, same reference, folding never engages - the control arm.
++        paged_attention_bounded_partials_params(0)));
++
++// patches/0015, added on review (Opus): paged_attention_bounded_partials_params above sets
++// kv_cache_compression = DISABLE_CACHE_COMPRESSION, which makes get_pa_sg_number_scale_factor
++// return SG_SCALE_FACTOR = 1 unconditionally (paged_attention_opt.cpp:55-63 - the scale factor
++// of 2 is gated on is_kv_compressed) - so that instantiation alone can never exercise, let alone
++// catch a bug in, the SG_SCALE_FACTOR > 1 cross-subgroup reduction path. These four cover exactly
++// what the review named: compressed KV (the configurations this patch exists for, where
++// SG_SCALE_FACTOR == 2 for 128/256-wide heads) at a bound that forces folding, the dual-nibble V
++// read path (a distinct KV precision combination, u4 symmetric, from the asymmetric-KV
++// bounded-partials case below), the GENERATE (pure decode) stage the bound is a decode feature
++// for, and P_MAX = 1 (every raw partition folds into the single work-group, bypassing the
++// finalization kernel's cross-work-group merge entirely - a different code path than P_MAX = 2's
++// still needs the finalization).
++static paged_attention_test_params paged_attention_bounded_partials_compressed_params(
++    size_t max_partitions,
++    std::vector<SubsequenceDescriptor> subsequences,
++    ov::element::Type kv_cache_precision,
++    ov::element::Type value_cache_precision) {
++    paged_attention_test_params p{};
++    p.subsequences = subsequences;
++    p.num_heads = 8;
++    p.num_kv_heads = 2;
++    p.k_head_size = 128;
++    p.v_head_size = 128;
++    p.block_size = 16;
++    p.sliding_window_size = 0;
++    p.kv_cache_compression = ENABLE_CACHE_COMPRESSION;
++    p.key_cache_quant_mode = ov::internal::CacheQuantMode::BY_TOKEN;
++    p.dynamic_paddings = STATIC_INPUT_PAD;
++    p.scores_mode = DISABLE_SCORES;
++    p.rotation_config = DISABLE_ROTATION;
++    p.disable_flashattn_v2 = DISABLE_FA_V2;
++    p.kv_cache_precision = kv_cache_precision;
++    p.value_cache_precision = value_cache_precision;
++    p.paged_attention_max_partitions = max_partitions;
++    return p;
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    patches_0015_paged_attention_sg_scale_2,
++    paged_attention_test,
++    ::testing::Values(
++        // (a) The blocker case, stated precisely: MIXED stage, compressed u8 key / i4 value
++        // (docs/design-m8-asymmetric-kv.md's asymmetric decode kernel, patches/0010), 2000-token
++        // past (raw partitions = ceil(2000/256) = 8) at P_MAX = 2 (S = 4) - SG_SCALE_FACTOR == 2
++        // for this 128-wide head, so the cross-subgroup reduction bug (fixed above) is live here.
++        // RED-first, stated precisely (no GPU device was touched by this task): before the fix
++        // above, this case must FAIL - the read-and-trace argument is in the header and the fix
++        // comment at the acc-scale-or-reset step in paged_attention_opt.cl. The orchestrator runs
++        // this on-card; see the report for the two-stage (unfixed, then fixed) build/staging plan.
++        paged_attention_bounded_partials_compressed_params(2, {{4, 2000}}, ov::element::u8, ov::element::u4),
++        // (b) Dual-nibble V read path, a different KV precision combination (symmetric u4, not
++        // (a)'s asymmetric u8:i4): can_use_dual_nibble_v requires is_i4_u4(value_dt) and
++        // v_head_size (128) aligned for it (v_head_size / u4_elems_per_byte % subgroup_size == 0)
++        // - both true here. Same P_MAX = 2 bound, same SG_SCALE_FACTOR == 2 exposure.
++        paged_attention_bounded_partials_compressed_params(2, {{4, 2000}}, ov::element::u4, ov::element::dynamic),
++        // (c) GENERATE (pure decode, num_tokens == 1) rather than MIXED - the bound is a
++        // decode-feature (design note: "Decode binds ... P=32 restores 512", "P_MAX ships at
++        // whatever [decode t/s] says"), and this is the stage-0 SingleToken/GQASingleToken
++        // dispatch path, not MultiTokens - a different generator class than (a)/(b) exercise.
++        paged_attention_bounded_partials_compressed_params(2, {{1, 2000}}, ov::element::u8, ov::element::u4),
++        // (d) P_MAX = 1: every raw partition (8, at this 2000-token past) folds into the single
++        // work-group this dispatch launches (total_partitions_num == 1), so the tmp_out/output
++        // predicate's total_partitions_num > 1 half is always false and this sequence must go
++        // straight to `output` - the finalization kernel's cross-work-group merge never runs at
++        // all for it. Exercises partitions_per_wg == raw_partitions end to end within one
++        // work-group, the deepest fold this patch can produce for this scenario.
++        paged_attention_bounded_partials_compressed_params(1, {{4, 2000}}, ov::element::u8, ov::element::u4),
++        // arcint (patches/0015, added for the SIGBUS bisect): 40,000-token past - raw_partitions =
++        // ceil(40000/256) = 157, P_MAX=32 -> S = ceil(157/32) = 5 - past what any of the cases
++        // above (S <= 4) reach, closer to the depth (S=15, the 119,074-token model prompt) where
++        // the on-card fault was observed. Deliberately does NOT depend on the gdb backtrace: a
++        // faster, device-test-only bisect than re-running the full model at that depth.
++        paged_attention_bounded_partials_compressed_params(32, {{4, 40000}}, ov::element::u8, ov::element::u4),
++        // 120,000-token past - raw_partitions = ceil(120000/256) = 469, P_MAX=32 -> S = ceil(469/32)
++        // = 15, matching the crash depth's own fold width exactly (the model prompt's S=15,
++        // fine partition index up to ~466, from the orchestrator's own bisect numbers).
++        paged_attention_bounded_partials_compressed_params(32, {{4, 120000}}, ov::element::u8, ov::element::u4)));
++
++// patches/0015, added on review: a review round reported (unmeasured, from tracing the source)
++// that the SG_SCALE_FACTOR > 1 cross-subgroup reduction double-counts the upper subgroup half's
++// contribution across folded partitions. An on-card run of the four cases above (unfixed kernel)
++// came back all PASSING, contradicting that trace - per this repository's own measurement
++// discipline (a claimed defect needs a measurement of its root cause, or it gets retracted), that
++// contradiction has to be resolved with evidence, not more tracing. This test supplies the
++// evidence: it reads back get_kernels_dump_info()'s new arcint_0015_diag entry (see
++// PagedAttentionOptImpl::get_kernels_dump_info, paged_attention_opt.cpp) and asserts, from the
++// ACTUAL runtime values update_rt_params resolved for this exact dispatch - not source-reading -
++// that the configuration the trace assumed was really exercised: SG_SCALE_FACTOR == 2, the fold
++// width (partitions_per_wg) >= 2, and the stage is MIXED (== 2, PagedAttentionStage's own
++// declared order: GENERATE = 0, PREFILL = 1, MIXED = 2, UNKNOWN = 3). If any of these do not
++// hold, the earlier all-PASS result does not contradict the trace at all - the bug's own
++// precondition was simply never reached, and the question the orchestrator's message actually
++// asked reduces to "how are those conditions failing", not "is the trace wrong".
++class paged_attention_sg_scale_2_diag_test : public PagedAttentionTest<paged_attention_test_params> {};
++
++TEST_P(paged_attention_sg_scale_2_diag_test, dispatch_matches_the_traced_precondition) {
++    auto p = GetParam();
++    ASSERT_TRUE(this->pam.has_value());
++    auto& pam = *this->pam;
++
++    auto result = run_gpu_inference(pam, p);
++
++    auto pa_inst = result.network->get_primitive("paged_attention");
++    ASSERT_NE(pa_inst, nullptr);
++    auto* impl = pa_inst->get_impl();
++    ASSERT_NE(impl, nullptr);
++    const auto dump_info = impl->get_kernels_dump_info(*pa_inst->get_impl_params());
++    const auto& entries = dump_info.get_entries();
++
++    const auto diag_pos = entries.find("arcint_0015_diag:");
++    ASSERT_NE(diag_pos, std::string::npos)
++        << "Expected the arcint_0015_diag entry (paged_attention_opt.cpp's "
++        << "PagedAttentionOptImpl::get_kernels_dump_info override) - got: " << entries;
++    const auto diag = entries.substr(diag_pos);
++
++    ASSERT_NE(diag.find("stage=2;"), std::string::npos)
++        << "Expected MIXED stage (2): " << diag;
++    ASSERT_NE(diag.find("sg_scale_factor=2;"), std::string::npos)
++        << "Expected SG_SCALE_FACTOR == 2 (get_pa_sg_number_scale_factor, compressed KV, this "
++        << "head size) - if this is 1, the traced bug's precondition was never reached: " << diag;
++    ASSERT_EQ(diag.find("partitions_per_wg=1;"), std::string::npos)
++        << "Expected the fold to actually engage (partitions_per_wg > 1) - if it stayed 1, "
++        << "PAGED_ATTENTION_MAX_PARTITIONS did not bind for this sequence length: " << diag;
++
++    const auto reference = PagedAttentionReference(pam).get_reference(result.key_cache_mem);
++    compare(result.outputs.at("output_data").get_memory(), nullptr, nullptr, reference);
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    patches_0015_paged_attention_sg_scale_2_diag,
++    paged_attention_sg_scale_2_diag_test,
++    ::testing::Values(
++        // Same case (a) from patches_0015_paged_attention_sg_scale_2 above - the blocker case.
++        paged_attention_bounded_partials_compressed_params(2, {{4, 2000}}, ov::element::u8, ov::element::u4)));
++
+ // docs/design-m8-asymmetric-kv.md item 4 (patches/0010): device-free-reference half of the
+ // u8-K/i4-V decode kernel test. This exercises the real GPU compile+dispatch (on-card orchestrator
+ // half) against PagedAttentionReference::get_reference() (the CPU/device-free oracle - float truth,
+@@ -261,6 +453,309 @@ INSTANTIATE_TEST_SUITE_P(
+         ov::element::u4                                 // value_cache_precision - symmetric both-4-bit
+     }));
+ 
++// arcint defect hunt (patches/0008-0010 follow-up): u8-K/i4-V PREFILL beyond ~2048 tokens.
++// Measured on real hardware (arcint 0.2.13, --paged-kv u8:i4): every request whose prompt is
++// over ~2,048 tokens returns HTTP 500 with clEnqueueWriteBuffer / clFinish CL_OUT_OF_RESOURCES,
++// while --paged-kv u8 succeeds at every depth and u8:i4 succeeds for short (~300 token) prompts.
++// Under arcint's own serving shape (prefill chunk 128), only the FIRST chunk of any prompt takes
++// PagedAttentionStage::PREFILL (past_len == 0, routed to the unaudited sdpa_opt.cl per
++// patches/0010 SS3); every following chunk has past_len > 0 and takes PagedAttentionStage::MIXED,
++// which is routed to PagedAttentionGeneratorMultiTokens - the SAME paged_attention_opt.cl "opt"
++// kernel patches/0009/0010 split IS_INT4_K/IS_INT4_V for. This reproduces that MIXED-stage shape
++// directly: one subsequence, a chunk-sized batch of new tokens (128) appended to a past_len that
++// crosses the 2048-token line, u8 key / i4 (u4) value.
++class paged_attention_asymmetric_kv_prefill_test : public PagedAttentionTest<paged_attention_test_params> {};
++
++TEST_P(paged_attention_asymmetric_kv_prefill_test, matches_cpu_reference) {
++    auto p = GetParam();
++    ASSERT_TRUE(this->pam.has_value());
++    auto& pam = *this->pam;
++
++    auto result = run_gpu_inference(pam, p);
++
++    auto pa_inst = result.network->get_primitive("paged_attention");
++    ASSERT_NE(pa_inst, nullptr);
++    auto* impl = pa_inst->get_impl();
++    ASSERT_NE(impl, nullptr);
++    const auto dump_info = impl->get_kernels_dump_info(*pa_inst->get_impl_params());
++    ASSERT_NE(dump_info.get_entries().find("paged_attention_opt__multi_tokens"), std::string::npos)
++        << "Expected the MIXED-stage opt kernel (paged_attention_opt, multi_tokens stage) to run: "
++        << dump_info.get_entries();
++    ASSERT_EQ(dump_info.get_entries().find("sdpa_micro"), std::string::npos)
++        << "micro-SDPA should stay declined for a key/value packing-class mismatch (patches/0009): "
++        << dump_info.get_entries();
++
++    const auto reference = PagedAttentionReference(pam).get_reference(result.key_cache_mem);
++    compare(result.outputs.at("output_data").get_memory(), nullptr, nullptr, reference);
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    regression_paged_attention_asymmetric_prefill,
++    paged_attention_asymmetric_kv_prefill_test,
++    ::testing::Values(
++        // RED: u8-K/i4-V, past_len 2048 + 128 new tokens = 2176 total, crosses the measured
++        // ~2048-token threshold. Expected to fail (mismatch, exception, or a GPU fault) on the
++        // pre-fix tree - this is the case this test file is here to bisect.
++        paged_attention_test_params{
++            {{128, 2048}},                                   // subsequences: 128 new tokens, 2048 cached (MIXED stage)
++            8, 2, 128, 128, 16, 0,                            // num_heads, num_kv_heads, k_head_size, v_head_size, block_size, sliding_window
++            ENABLE_CACHE_COMPRESSION,
++            ov::internal::CacheQuantMode::BY_CHANNEL,
++            DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++            false, 0, {},
++            false, {}, {},
++            ov::element::u8,                                  // kv_cache_precision (key)
++            false, {}, true,
++            std::nullopt, false, std::nullopt, false, false,
++            ov::element::u4                                   // value_cache_precision - the asymmetric half
++        },
++        // Bracket: same shape, u8-K/i4-V, but only 1024 cached + 128 new = 1152 total - below the
++        // measured threshold. Expected to PASS: brackets the failure to "long", not "asymmetric".
++        paged_attention_test_params{
++            {{128, 1024}},
++            8, 2, 128, 128, 16, 0,
++            ENABLE_CACHE_COMPRESSION,
++            ov::internal::CacheQuantMode::BY_CHANNEL,
++            DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++            false, 0, {},
++            false, {}, {},
++            ov::element::u8,
++            false, {}, true,
++            std::nullopt, false, std::nullopt, false, false,
++            ov::element::u4
++        }));
++
++// Control: identical MIXED-stage, past-2048 shape, but SYMMETRIC u8:u8 (no asymmetry at all).
++// Expected to PASS at every depth (matches the measured hardware behavior: --paged-kv u8 succeeds
++// at every depth) - brackets the failure to "asymmetric", not merely "long".
++class paged_attention_symmetric_u8_prefill_test : public PagedAttentionTest<paged_attention_test_params> {};
++
++TEST_P(paged_attention_symmetric_u8_prefill_test, matches_cpu_reference) {
++    auto p = GetParam();
++    ASSERT_TRUE(this->pam.has_value());
++    auto& pam = *this->pam;
++
++    auto result = run_gpu_inference(pam, p);
++
++    const auto reference = PagedAttentionReference(pam).get_reference(result.key_cache_mem);
++    compare(result.outputs.at("output_data").get_memory(), nullptr, nullptr, reference);
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    regression_paged_attention_symmetric_u8_prefill,
++    paged_attention_symmetric_u8_prefill_test,
++    ::testing::Values(paged_attention_test_params{
++        {{128, 2048}},
++        8, 2, 128, 128, 16, 0,
++        ENABLE_CACHE_COMPRESSION,
++        ov::internal::CacheQuantMode::BY_CHANNEL,
++        DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++        false, 0, {},
++        false, {}, {},
++        ov::element::u8,
++        false, {}, true,
++        std::nullopt, false, std::nullopt, false, false,
++        ov::element::u8
++    }));
++
++// arcint defect hunt follow-up: the existing decode_serves_u8_key_i4_value case (patches/0010)
++// only exercises past_len=35 - well under SEQ_LEN_PARTITION_SIZE (256), so it only ever compiles
++// and dispatches the SINGLE partition / no-leftover-across-partitions arm of the SINGLE_TOKEN
++// per-partition V loop. This brackets past_len across the multi-partition threshold instead, at
++// the same asymmetric u8-K/i4-V precision, to see whether the measured ~2048-token cliff lives in
++// the DECODE (GENERATE stage, SINGLE_TOKEN kernel) partition/leftover math rather than prefill.
++class paged_attention_asymmetric_kv_decode_long_test : public PagedAttentionTest<paged_attention_test_params> {};
++
++TEST_P(paged_attention_asymmetric_kv_decode_long_test, matches_cpu_reference) {
++    auto p = GetParam();
++    ASSERT_TRUE(this->pam.has_value());
++    auto& pam = *this->pam;
++
++    auto result = run_gpu_inference(pam, p);
++
++    const auto reference = PagedAttentionReference(pam).get_reference(result.key_cache_mem);
++    compare(result.outputs.at("output_data").get_memory(), nullptr, nullptr, reference);
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    regression_paged_attention_asymmetric_decode_long,
++    paged_attention_asymmetric_kv_decode_long_test,
++    ::testing::Values(
++        // RED candidate: 1 new token decoded against 2100 cached (crosses the measured ~2048
++        // threshold), u8-K/i4-V, multiple SEQ_LEN_PARTITION_SIZE=256 partitions plus a leftover.
++        paged_attention_test_params{
++            {{1, 2100}},
++            8, 2, 128, 128, 16, 0,
++            ENABLE_CACHE_COMPRESSION,
++            ov::internal::CacheQuantMode::BY_CHANNEL,
++            DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++            false, 0, {},
++            false, {}, {},
++            ov::element::u8,
++            false, {}, true,
++            std::nullopt, false, std::nullopt, false, false,
++            ov::element::u4
++        },
++        // Bracket: 1 new token decoded against 500 cached - a few partitions (SEQ_LEN_PARTITION_
++        // SIZE=256) but well under the measured threshold. Expected to PASS.
++        paged_attention_test_params{
++            {{1, 500}},
++            8, 2, 128, 128, 16, 0,
++            ENABLE_CACHE_COMPRESSION,
++            ov::internal::CacheQuantMode::BY_CHANNEL,
++            DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++            false, 0, {},
++            false, {}, {},
++            ov::element::u8,
++            false, {}, true,
++            std::nullopt, false, std::nullopt, false, false,
++            ov::element::u4
++        }));
++
++// arcint defect hunt follow-up #2: a MIXED-stage write that must CONTINUE a block already
++// partially filled (past_len not block-aligned), crossing the measured ~2048-token cliff. Earlier
++// brackets in this file used block-aligned past_lens (2048, 1024 at block_size=16), so the "new"
++// tokens always started a fresh block - never exercising patches/0010 SS7's "block-partial" write
++// continuation arm for the asymmetric case at this scale.
++class paged_attention_asymmetric_kv_partial_block_test : public PagedAttentionTest<paged_attention_test_params> {};
++
++TEST_P(paged_attention_asymmetric_kv_partial_block_test, matches_cpu_reference) {
++    auto p = GetParam();
++    ASSERT_TRUE(this->pam.has_value());
++    auto& pam = *this->pam;
++
++    auto result = run_gpu_inference(pam, p);
++
++    const auto reference = PagedAttentionReference(pam).get_reference(result.key_cache_mem);
++    compare(result.outputs.at("output_data").get_memory(), nullptr, nullptr, reference);
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    regression_paged_attention_asymmetric_partial_block,
++    paged_attention_asymmetric_kv_partial_block_test,
++    ::testing::Values(
++        // past_len=2040 is NOT block-aligned (2040 % 16 == 8): the last past block has 8 valid
++        // tokens, and this call's first 8 new tokens must complete it before starting fresh
++        // blocks. Crosses the measured ~2048-token cliff.
++        paged_attention_test_params{
++            {{128, 2040}},
++            8, 2, 128, 128, 16, 0,
++            ENABLE_CACHE_COMPRESSION,
++            ov::internal::CacheQuantMode::BY_CHANNEL,
++            DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++            false, 0, {},
++            false, {}, {},
++            ov::element::u8,
++            false, {}, true,
++            std::nullopt, false, std::nullopt, false, false,
++            ov::element::u4
++        },
++        // Bracket: identical non-aligned-continuation shape, but under the threshold.
++        paged_attention_test_params{
++            {{128, 1000}},
++            8, 2, 128, 128, 16, 0,
++            ENABLE_CACHE_COMPRESSION,
++            ov::internal::CacheQuantMode::BY_CHANNEL,
++            DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++            false, 0, {},
++            false, {}, {},
++            ov::element::u8,
++            false, {}, true,
++            std::nullopt, false, std::nullopt, false, false,
++            ov::element::u4
++        }));
++
++// arcint defect hunt follow-up #3: a TRUE PagedAttentionStage::PREFILL call (past_len == 0 for
++// every subsequence, no continuation) - this is the ONLY dispatch that reaches
++// PagedAttentionSDPAOptGeneratorMultiToken ("sdpa_opt" kernel, sdpa_opt.cl), which patches/0010
++// SS3 read but explicitly did NOT fix: it hard-codes IS_KV_COMPRESSED=0 for its own paged
++// multi-token stage regardless of config, so a u8-K/i4-V request lands here with the READ side
++// treating the value cache as UNCOMPRESSED (full V_HEAD_SIZE per-token stride) while the WRITE
++// side (pa_kv_cache_update_ref.cl, correctly split by patches/0010 SS7) has physically packed it
++// (PACKED_ADJUSTED_V_HEAD_SIZE per-token stride, about half the unpacked size). Every block read
++// with the wrong (larger) stride drifts further from the true block boundary than the last, so
++// the total offset error grows linearly with block count / context length - consistent with a
++// prompt-length-triggered cliff rather than a fixed small-buffer overrun.
++class paged_attention_asymmetric_kv_pure_prefill_test : public PagedAttentionTest<paged_attention_test_params> {};
++
++TEST_P(paged_attention_asymmetric_kv_pure_prefill_test, matches_cpu_reference) {
++    auto p = GetParam();
++    ASSERT_TRUE(this->pam.has_value());
++    auto& pam = *this->pam;
++
++    auto result = run_gpu_inference(pam, p);
++
++    const auto reference = PagedAttentionReference(pam).get_reference(result.key_cache_mem);
++    compare(result.outputs.at("output_data").get_memory(), nullptr, nullptr, reference);
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    regression_paged_attention_asymmetric_pure_prefill,
++    paged_attention_asymmetric_kv_pure_prefill_test,
++    ::testing::Values(
++        // RED candidate: a single-shot PREFILL of 2304 new tokens, past_len 0 for the one
++        // subsequence - crosses the measured ~2048-token cliff, u8-K/i4-V.
++        paged_attention_test_params{
++            {{2304, 0}},
++            8, 2, 128, 128, 16, 0,
++            ENABLE_CACHE_COMPRESSION,
++            ov::internal::CacheQuantMode::BY_CHANNEL,
++            DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++            false, 0, {},
++            false, {}, {},
++            ov::element::u8,
++            false, {}, true,
++            std::nullopt, false, std::nullopt, false, false,
++            ov::element::u4
++        },
++        // Bracket: same shape, 300 new tokens, past_len 0 - the depth the measured hardware
++        // reports as succeeding. Expected to PASS.
++        paged_attention_test_params{
++            {{300, 0}},
++            8, 2, 128, 128, 16, 0,
++            ENABLE_CACHE_COMPRESSION,
++            ov::internal::CacheQuantMode::BY_CHANNEL,
++            DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++            false, 0, {},
++            false, {}, {},
++            ov::element::u8,
++            false, {}, true,
++            std::nullopt, false, std::nullopt, false, false,
++            ov::element::u4
++        }));
++
++// Control: identical single-shot PREFILL shape (past_len 0, 2304 new tokens) but SYMMETRIC u8:u8.
++// Expected to PASS - brackets the failure to "asymmetric", not merely "a long single-shot prefill".
++class paged_attention_symmetric_u8_pure_prefill_test : public PagedAttentionTest<paged_attention_test_params> {};
++
++TEST_P(paged_attention_symmetric_u8_pure_prefill_test, matches_cpu_reference) {
++    auto p = GetParam();
++    ASSERT_TRUE(this->pam.has_value());
++    auto& pam = *this->pam;
++
++    auto result = run_gpu_inference(pam, p);
++
++    const auto reference = PagedAttentionReference(pam).get_reference(result.key_cache_mem);
++    compare(result.outputs.at("output_data").get_memory(), nullptr, nullptr, reference);
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    regression_paged_attention_symmetric_u8_pure_prefill,
++    paged_attention_symmetric_u8_pure_prefill_test,
++    ::testing::Values(paged_attention_test_params{
++        {{2304, 0}},
++        8, 2, 128, 128, 16, 0,
++        ENABLE_CACHE_COMPRESSION,
++        ov::internal::CacheQuantMode::BY_CHANNEL,
++        DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++        false, 0, {},
++        false, {}, {},
++        ov::element::u8,
++        false, {}, true,
++        std::nullopt, false, std::nullopt, false, false,
++        ov::element::u8
++    }));
++
+ class paged_attention_swa_partition_finalization_test : public PagedAttentionTest<paged_attention_test_params> {};
+ 
+ TEST_P(paged_attention_swa_partition_finalization_test, ignores_inactive_partition) {
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.h b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.h
+index ec8d563..344f6b4 100644
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.h
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.h
+@@ -2219,6 +2219,10 @@ public:
+         if (value_cache_precision != ov::element::dynamic) {
+             config.set_property(ov::value_cache_precision(value_cache_precision));
+         }
++        // patches/0015: 0 (default) is unbounded, byte-identical to before this option existed -
++        // setting it unconditionally to p.paged_attention_max_partitions is harmless for every
++        // pre-existing test case (none of which mentions the field, so it stays 0).
++        config.set_property(ov::intel_gpu::paged_attention_max_partitions(p.paged_attention_max_partitions));
+         cldnn::network::ptr network = tests::get_network(tests::get_test_engine(), topology, config, tests::get_test_stream_ptr(), false);
+         network->set_input_data("query", query_mem);
+         network->set_input_data("key", key_mem);
+@@ -3048,6 +3052,13 @@ struct paged_attention_test_params {
+     // explicitly (e.g. kv_cache_precision=u8, value_cache_precision=u4) to exercise the
+     // asymmetric decode path patches/0010 adds.
+     ov::element::Type value_cache_precision = ov::element::dynamic;
++
++    // patches/0015: PAGED_ATTENTION_MAX_PARTITIONS. 0 (default) is unbounded - every existing
++    // positional-init test case above (none of which mentions this field) keeps launching one
++    // GENERATE/MIXED-stage work-group per 256-token partition, byte-identical to before this
++    // option existed. Set explicitly (e.g. 2) to force several raw partitions to fold into one
++    // work-group via the online-merge path.
++    size_t paged_attention_max_partitions = 0;
+ };
+ 
+ const auto ENABLE_CACHE_COMPRESSION = true;

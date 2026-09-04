@@ -8,14 +8,16 @@ same releases by tag and adds what a reader upgrading needs first: the
 runtime dependency. Every number here was measured; the measurement
 protocol and the retractions are in `DESIGN.md` §7.
 
-Runtime dependency throughout: `marfrit-openvino`, a source build of
-OpenVINO at the pinned upstream commit `71640275` (the 2026.4.0 nightly of
-2026-08-21) with the patch series in `patches/` applied. The patch level
-is part of the package version (`+p1`, `+p2`) and a release names the level
-it was built and measured against; the dependency is strict because a
-different nightly is a different ABI.
+Runtime dependency throughout: `marfrit-openvino`, a source build of OpenVINO
+at the pinned upstream commit `71640275` (the 2026.4.0 nightly of 2026-08-21)
+with the patch series in `patches/` applied. The patch level is part of the
+package version (`+p1`, `+p2`, `+p3`) and a release names the level it was
+built and measured against; the dependency is strict because a different
+nightly is a different ABI.
 
 ## Unreleased
+
+Requires `marfrit-openvino 2026.4.0~dev20260821+p3` (patches 0003–0016).
 
 ### Added since 0.2.13 (unreleased)
 - `--paged-attention-max-partitions N` (default 0, unbounded): engine side
@@ -460,6 +462,19 @@ different nightly is a different ABI.
   byte-identical against the served head; the engine's drafter disable is
   per lane and re-armed on the next request, with a feed cap one row below
   the window for plugins without 0014.
+
+### Dependencies since 0.2.13 (unreleased)
+- `marfrit-openvino +p3`: three new plugin patches (0014–0016) on the same
+  upstream commit; the runtime reports `...-marfrit-p3`. Patch 0014 is the
+  DFlash2 Assign-layout fix above; 0015 is the paged-attention bounded
+  partials and f16 host-sizing fix behind `--paged-attention-max-partitions`,
+  plus the argument rebind fix (the implementation records the identity of
+  every intermediate its kernel arguments were bound to and forces a
+  rebind when any changes, closing a use-after-free that appears only
+  once the bound above makes the buffer's size plateau); 0016 sizes the
+  paged-attention intermediate buffers from the current call instead of
+  the previous one, a stale-count hardening on top of 0015's corrected
+  buffers. Patches 0001 and 0002 remain deliberately unapplied.
 
 ### Known defects in 0.2.13, found by the long-context window (2026-09-03)
 - `--dflash` at depth: on the same card and model the DFlash2 drafter

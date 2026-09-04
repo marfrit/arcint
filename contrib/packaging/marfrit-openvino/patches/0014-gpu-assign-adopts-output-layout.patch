@@ -1,0 +1,105 @@
+# GPU plugin: Assign adopts a same-type, same-rank output layout instead of asserting
+#
+# Measured (arcint, 2026-09-03, the 24 GB card, the dense 27B target with
+# the DFlash2 block-diffusion draft head served as a stateful IR): the
+# head keeps a per-layer K/V state of the last W = 2048 rows through a
+# ReadValue -> Concat(new rows) -> Slice(last W) -> Assign chain, with the
+# variable declared [1, 8, -1, 128] and initialised to 0 rows. Every
+# prompt tried below W drafts (1,680, 1,966; 2,058 degrades within its
+# request); a prompt whose first draft concatenates
+# EXACTLY W rows (measured: 1,615 new rows on 433 held, at 2,481 and
+# 3,251 prompt tokens; the 433 is arithmetic, 2,048 minus the logged 1,615,
+# not a logged value, and it sits oddly beside the 0-row variable layout
+# in the same message) fails in the assign with
+#   Check 'variable.get_layout() == instance.get_output_layout()' failed
+#   at src/plugins/intel_gpu/src/graph/impls/cpu/assign.cpp:54:
+#   [GPU] Layout mismatch: variable layout: f16:bfyx:1x8x0x128:nopad
+#   assign output layout: f16:bfyx:1x8x2048x128:nopad
+# and the engine disables the drafter. primitive_inst::realloc_if_needed
+# gives a non-kv_cache stateful primitive's variable the assign's output
+# layout before execution - by reading of primitive_inst.cpp; that shorter
+# prompts pass through the same variable is measured (1,966 tokens), that
+# their prefill feed was one assign of 1,966 rows is inferred, not logged;
+# at the exact-window size that update did not run. Which runtime path skips
+# it was not traced (no DEBUG_CAPS build on the record); this patch
+# closes the consequence, not the cause, and says so.
+#
+# The change: in assign_impl::execute_impl, when the variable's layout
+# differs from the output layout but the data type and rank agree, adopt
+# the output layout (variable.set_layout) - exactly what the skipped
+# update would have done - and copy; a genuine type or rank mismatch
+# still asserts with the same message. Verified on this tree (read, not
+# assumed): VariableState::set_layout calls update_device_buffer, which
+# allocates a fresh buffer whenever the held size is below the new
+# layout's bytes and drops a 0-byte buffer entirely, so the copy that
+# follows is in bounds; a guard after the adoption asserts memory present
+# and actual size >= the adopted bytes, so a tree whose set_layout only
+# relabels refuses loudly instead of writing past the buffer. Nothing else in the plugin
+# changes; a variable that was updated normally takes the same path as
+# before (the branch is not entered).
+#
+# Red and green, measured on the card rather than in a unit test, with
+# the head named per number: the RE-EXPORTED F16 head (runtime slice
+# start, f16 weights) on the unpatched plugin disables at 2,481 and 3,251
+# prompt tokens (feeding 1,615 rows) and drafts at 2,155 where the served
+# int4 head had failed - two variables changed there, graph and weight
+# precision, and which one moved that edge was not isolated; the SERVED
+# int4 head on the unpatched plugin disables at 2,155 and 2,230; with this patch the SERVED head drafts at
+# 2,481 and 3,251 (1.88 accepted per cycle over 64 tokens), and, run
+# afterwards with the memory guard in place, at 1,966 / 2,155 / 2,266 /
+# 2,481 / 3,251 (3.76 / 2.13 / 2.67 / 1.83 / 1.88) - the served head's own
+# failing prompts pass under this patch.
+# Longer prompts and a 3,000-token decode are in the record below; the
+# decode grows the state a few rows per step and does not enter this
+# branch, so it is not evidence about the patch.
+#
+# Not covered: the root cause in the shape-update path; the export-side
+# change that makes the trim's slice start a runtime value (a separate,
+# defensive fix in tools/export_dflash.py, bit-exact on CPU) does NOT
+# clear this case on its own (measured: 2,155 drafts, 3,251 still fails
+# without this patch).
+#
+# Window record (2026-09-03, the 24 GB card, served int4 head, this patch,
+# 64-token greedy prose probes unless stated): prompt 2,481 tokens 1.88
+# accepted per cycle; 3,251 → 1.88; 17,126 → 1.39; a 763-token prompt
+# followed by a 3,000-token decode → 3.53 per cycle over the whole decode
+# (the state crosses the window during decode without incident).
+diff --git a/src/plugins/intel_gpu/src/graph/impls/cpu/assign.cpp b/src/plugins/intel_gpu/src/graph/impls/cpu/assign.cpp
+index 1bf2d2e5..1b8dca5f 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/cpu/assign.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/cpu/assign.cpp
+@@ -51,9 +51,31 @@ struct assign_impl : public typed_primitive_impl<assign> {
+     event::ptr execute_impl(const std::vector<event::ptr>& events, assign_inst& instance) override {
+         auto& variable = instance.get_network().get_variable(variable_id);
+ 
+-        OPENVINO_ASSERT(variable.get_layout() == instance.get_output_layout(),
+-                        "[GPU] Layout mismatch: variable layout: ", variable.get_layout().to_short_string(),
+-                        " assign output layout: ", instance.get_output_layout().to_short_string());
++        // arcint (patches/0014). A dynamic-shaped variable is normally given the
++        // assign's output layout by primitive_inst::realloc_if_needed before this
++        // runs; measured on a stateful draft head (Concat -> Slice(last W rows) ->
++        // Assign, W = 2048) the update did not happen when the concatenation
++        // landed exactly on W rows, and the assert below fired with the
++        // variable still at its initial 0-row layout. Same data type and rank:
++        // adopt the output layout here, which is what the skipped update would
++        // have done; a genuine type or rank mismatch still asserts.
++        if (variable.get_layout() != instance.get_output_layout()) {
++            const auto& vl = variable.get_layout();
++            const auto& ol = instance.get_output_layout();
++            OPENVINO_ASSERT(vl.data_type == ol.data_type && vl.get_rank() == ol.get_rank(),
++                            "[GPU] Layout mismatch: variable layout: ", vl.to_short_string(),
++                            " assign output layout: ", ol.to_short_string());
++            variable.set_layout(ol);
++            // On this tree VariableState::set_layout reallocates when the held
++            // buffer is smaller than the new layout (update_device_buffer) and
++            // drops a 0-byte buffer entirely; guard the copy below so a tree
++            // whose set_layout only relabels refuses here instead of writing
++            // past the buffer.
++            OPENVINO_ASSERT(variable.get_memory() != nullptr &&
++                            variable.get_actual_mem_size() >= ol.bytes_count(),
++                            "[GPU] Assign: variable memory (", variable.get_actual_mem_size(),
++                            " bytes) smaller than the adopted layout ", ol.to_short_string());
++        }
+ 
+         auto& stream = instance.get_network().get_stream();
+ 

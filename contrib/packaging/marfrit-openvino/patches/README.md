@@ -140,6 +140,105 @@ diagnostic.
 
 Upstream: not yet filed.
 
+### 0014-gpu-assign-adopts-output-layout.patch
+
+`assign_impl::execute_impl` asserted when a non-`kv_cache` stateful
+primitive's variable layout diverged from the assign's output layout — hit
+by the DFlash2 draft head's own K/V state chain (`ReadValue` → `Concat` →
+`Slice` → `Assign`) at prompts whose first draft concatenates exactly the
+window's row count. When the data type and rank still agree, the patch
+adopts the output layout (`variable.set_layout`) instead of asserting — the
+update a skipped runtime path would otherwise have made — and copies; a
+genuine type or rank mismatch still asserts with the same message. A
+variable updated normally takes the same path as before.
+
+Measured on the served int4 draft head: the unpatched plugin disables the
+drafter at 2,155 / 2,230 prompt tokens; patched, it drafts at those depths
+and further out (1,966 / 2,155 / 2,266 / 2,481 / 3,251), byte-identical to
+the unpatched plugin everywhere the unpatched plugin does not disable.
+
+Upstream: not yet filed.
+
+### 0015-paged-attention-bounded-partials.patch
+
+Three changes to the GPU plugin's paged-attention implementation:
+
+- **Host-side sizing fix**: `get_internal_buffer_descs` sized `tmp_out` at
+  4 bytes/element unconditionally; the kernel already declares it
+  `OUTPUT_TYPE` (f16 on every model this repository serves), so the mixed
+  stage was allocating exactly twice the bytes its kernels address. Sized
+  from the real output dtype instead — no kernel change, same addresses
+  read and written, half the term.
+- **A bound on the online-merge partition count**: a new read-write plugin
+  property, `PAGED_ATTENTION_MAX_PARTITIONS` (0 = unbounded, today's
+  behaviour, the default), the way 0008 added `VALUE_CACHE_PRECISION`.
+  arcint's engine side is `--paged-attention-max-partitions N`, which reads
+  the key back after compile to detect a plugin that carries it, and never
+  refuses a load against a plugin that does not. Bounded, the mixed-stage
+  scratch term stops scaling with `n_ctx` past a small fixed partition
+  count instead of growing forever.
+- **The argument rebind fix**: `realloc_intermediates` can replace an
+  intermediate buffer's identity without raising the flags that make
+  `execute_stage` rebind kernel arguments — harmless while `tmp_out` grew
+  without bound on every chunk, live once the bound above makes its size
+  plateau and a later genuine reallocation can occur with nothing else on
+  that call touching outputs. `PagedAttentionOptImpl` now records the
+  identity of every intermediate its kernel arguments were last bound to
+  and forces a rebind on any change, closing a use-after-free that only
+  appears once the buffer stops growing every call (this patch's own
+  header, section "FIX A"/"the argument rebind"; DESIGN.md §7.0.2ac).
+
+Bit-exact at `PAGED_ATTENTION_MAX_PARTITIONS == 0` by construction. The
+plugin's 220 paged-attention unit tests pass. At the unbounded setting the
+patched plugin is byte-identical to the unpatched one on both cards. On
+the 24 GB card, bound 0 against 32: the 64-token greedy output and the
+acceptance answer are byte-identical between the two arms and the task
+scores 10/10 on both. On the 16 GiB card, the patched plugin at the bound
+serves a 119,074-token prompt from a 131,072-token pool that the
+unpatched plugin cannot; with a deeper, 165,680-token pool the same
+prompt still crashed at the time this patch's header was written (a
+separate, pre-existing defect in the asymmetric packed-value path,
+patches 0008–0010, tracked in DESIGN.md §7.0.2ac/§7.0.2ad, not this
+patch's). **Upgrade note**: this inserts an option into the GPU
+model-cache blob's positionally-serialised property list — clear the GPU
+model cache (`--cache-dir`, if set) when upgrading to a plugin level
+carrying this patch; 0008's own schema guard (`execution_config.cpp`)
+rejects a stale-schema blob outright rather than misreading it.
+
+Upstream: not yet filed.
+
+### 0016-paged-attention-intermediate-sizing.patch
+
+`get_internal_buffer_descs` reused the previous call's `num_of_partitions`
+whenever `m_rt_params` was already non-null, because nothing resets that
+field between calls — the "already computed" branch fires on every call
+after the first and sizes the current call's intermediates
+(`exp_sums`/`max_logits`/`tmp_out`) from the *last* call's partition count,
+not the one about to execute. Harmless while depth only grows a few rows a
+step, real once depth grows a full page and the buffers are undersized for
+the call about to run. Fixed by sizing from the current call. Regenerated
+on top of the corrected 0015 (same three files, same post-image hashes
+0015 leaves them at).
+
+Evidence: four unit tests — two red-first review tests
+(`paged_attention_review_swa_mirror_test`, the sliding-window shrink
+mirrored into the fresh sizing estimate, and
+`paged_attention_review_bound_governing_stage_test`, the bound gated on
+the stale stage that computed it) plus the two regression tests this
+patch was written for (`paged_attention_asymmetric_kv_deep_pool_test`,
+asymmetric deep-pool, and `paged_attention_growth_test`,
+repeated-execute growth) — plus a byte-identity ladder at 8,418 tokens
+(u8:i4, chunk 128, unbounded, 16 GiB card) — 0015+0016 together 6/6
+byte-equal to the untouched plugin's output, against the untouched
+plugin's own roughly 1-in-14 run-to-run noise. All 19 tests in the
+combined filter pass on the 24 GB card. Does not touch, and is not
+evidence about, the deep-prompt crash diagnosed in `DESIGN.md` §7.0.2ad as
+a driver/runtime fault outside this plugin (a page-fault storm at the
+OpenCL runtime's own direct-submission semaphore buffer) — this patch
+neither causes nor closes it.
+
+Upstream: not yet filed.
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.

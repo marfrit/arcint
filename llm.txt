@@ -223,13 +223,19 @@ that target.
 
 Patch series to date (contrib/packaging/marfrit-openvino/patches/): 0001-0002
 measured and NOT carried (an instrument, and a fusion bound that produced
-wrong output); 0003-0013 applied on top of the same pinned upstream commit --
+wrong output); 0003-0016 applied on top of the same pinned upstream commit --
 0003 MoE per-infer expert-mask subbuffer churn, 0004 OTD perf counters, 0005
 device-resident MoE slot pool, 0006 async batched slot uploads, 0007 drop the
 redundant per-MoE-layer stream finish, 0008 VALUE_CACHE_PRECISION config
 option, 0009 asymmetric KV kernel plan, 0010 asymmetric decode kernel (u8
 keys, i4 values), 0011 MoE host compute tier kernel, 0012 MoE host tier
-decode-path redirect, 0013 per-expert routing histogram.
+decode-path redirect, 0013 per-expert routing histogram, 0014 GPU Assign
+adopts a same-type/same-rank output layout instead of asserting, 0015 paged
+attention bounded partials (f16 host sizing, PAGED_ATTENTION_MAX_PARTITIONS,
+and the argument rebind fix closing a use-after-free that appears once the
+bound makes the buffer's size plateau), 0016 paged-attention intermediate
+buffers sized from the current call. Packaged as marfrit-openvino +p3
+(patches 0003-0016).
 
 ## Key design points
 
