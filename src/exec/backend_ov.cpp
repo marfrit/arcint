@@ -835,6 +835,22 @@ public:
         // produced it.
         double              stall_accum = 0.0;
         std::vector<double> stalls;
+
+        // M11 step profile (ARCINT_PROFILE_CYCLE, DESIGN §7.0.2aa row): the
+        // last paged_forward's own t0..t3 split and the last propose phase's
+        // four segments, mirrored here so generate_paged's cycle line can
+        // read them without a new clock read of its own. Populated
+        // unconditionally where the clock was already being read for
+        // ARCINT_FORWARD_SPLIT / the MTP head step (tens of nanoseconds,
+        // 5278); only the cycle line itself is gated.
+        double last_fwd_ms_index  = 0.0;
+        double last_fwd_ms_infer  = 0.0;
+        double last_fwd_ms_logits = 0.0;
+        double last_fwd_ms_hidden = 0.0;
+        double mtp_step_ms_embed  = 0.0;
+        double mtp_step_ms_mask   = 0.0;
+        double mtp_step_ms_layer  = 0.0;
+        double mtp_step_ms_head   = 0.0;
     };
 
     OvBackend(const Artifact& artifact, const Config& cfg, int n_ctx)
@@ -1435,7 +1451,20 @@ public:
             seq.insert(seq.end(), drafts.begin(), drafts.end());
 
             const auto t_verify = clock::now();
-            logits              = forward(lane, seq, past);
+            // forward() (step_stats_, ~6186/6224) increments
+            // decode_embed_seconds/decode_forward_seconds on every call,
+            // including this one, and this call is ALSO bracketed into
+            // draft_verify_seconds right below -- both counting the same
+            // verify pass. Save and restore so the paged path's rule holds
+            // here too: the served decode line's "other" subtracts
+            // draft_verify_seconds once, so this pass must not also land in
+            // decode_forward_seconds/decode_embed_seconds, or it is counted
+            // twice and `other` goes negative instead of naming the verify.
+            const double saved_embed_seconds   = stats.decode_embed_seconds;
+            const double saved_forward_seconds = stats.decode_forward_seconds;
+            logits                             = forward(lane, seq, past);
+            stats.decode_embed_seconds   = saved_embed_seconds;
+            stats.decode_forward_seconds = saved_forward_seconds;
             stats.draft_verify_seconds +=
                 std::chrono::duration<double>(clock::now() - t_verify).count();
             stats.draft_proposed += static_cast<int>(drafts.size());
@@ -1742,6 +1771,15 @@ private:
                                 const TokenCallback& on_piece, GenerationStats& stats) {
         using clock = std::chrono::steady_clock;
 
+        // M11 step profile (DESIGN §7.0.2aa row, the M11 design note (not in
+        // the repository)): one line per drafting cycle, off by default and
+        // reachable only through this switch. Segments 2-15 of that note's
+        // table had no timer at all before this; ARCINT_FORWARD_SPLIT
+        // (5283) is unaffected and averages over 64 forwards, which mixes
+        // depths -- this is a strict superset, one line per cycle, no
+        // averaging.
+        static const bool profile_cycle = profile_cycle_enabled();
+
         // Review follow-up: one id per call, so the dump instrument can
         // tell which cycles belong to the same request (a lane is reused
         // across requests, so lane id alone is not enough to chain cycles).
@@ -1971,6 +2009,19 @@ private:
             // branch has a lattice to dump; ngram and MTP proposals carry no
             // candidate set for the offline oracle to bound.
             bool used_dflash = false;
+            // The propose phase's own cost, previously untimed (M11 §1 row
+            // 2-5): turnstile wait, embed.infer() for the anchor token, and
+            // whichever drafter runs. Net of turnstile wait, same pattern as
+            // decode_embed_seconds/decode_forward_seconds below.
+            double     propose_waited = lane.stall_accum;
+            const auto t_propose      = clock::now();
+            // M11 step profile only: commit() (below, and in the accept loop)
+            // flushes lane.stall_accum into lane.stalls and zeroes it every
+            // time it runs, so by the time the cycle line prints, stall_accum
+            // alone can read 0 even though this cycle waited -- the entries
+            // this cycle pushed are still in lane.stalls, appended after this
+            // mark.
+            const size_t stalls_at_propose = profile_cycle ? lane.stalls.size() : 0;
             if (dflash_active(lane) && in.sampler.greedy()) {
                 drafts = dflash_draft(lane, next, past);
                 // Set AFTER the call, not before: a failed draft can disable
@@ -1989,6 +2040,19 @@ private:
                 drafts = drafter_->draft(history, draft_tokens_);
                 if (drafts.size() > drafts_max_) drafts.resize(drafts_max_);
             }
+            const double propose_ms =
+                1000.0 * (seconds_since_tp(t_propose) - (lane.stall_accum - propose_waited));
+            stats.draft_propose_seconds += propose_ms / 1000.0;
+            // M11 step profile only: the propose call above is mtp_feed's
+            // want_draft=true invocation, which is the only one that reads
+            // the head's logits; the promotion step below (mtp_ready_ block,
+            // want_draft=false) calls mtp_feed again per accepted draft and
+            // would otherwise overwrite lane.mtp_step_ms_* before the cycle
+            // line gets to read this cycle's own propose numbers.
+            const double cyc_mtp_embed_ms = lane.mtp_step_ms_embed;
+            const double cyc_mtp_mask_ms  = lane.mtp_step_ms_mask;
+            const double cyc_mtp_layer_ms = lane.mtp_step_ms_layer;
+            const double cyc_mtp_head_ms  = lane.mtp_step_ms_head;
 
             // One page every kv_block_tokens_ tokens, so the pool lock is
             // touched once per 16 or 32 decode steps rather than per step.
@@ -2035,9 +2099,24 @@ private:
                 if (rrow != c) la_rows.push_back(static_cast<int32_t>(rrow));
             }
 
-            const auto t_verify = clock::now();
-            logits = paged_forward(lane, embed_paged(lane, seq), past, la_rows, 1);
-            stats.draft_verify_seconds += seconds_since_tp(t_verify);
+            // Net of turnstile wait, same pattern as the neighbouring
+            // embed/forward timers above: decode_wait_seconds (LaneReset,
+            // the sum of every lane.stalls entry) already counts this same
+            // wait, so a gross verify duration would double it.
+            double     verify_waited = lane.stall_accum;
+            const auto t_verify      = clock::now();
+            // M11 step profile only: an extra pair of clock reads around the
+            // verify embed, gated so the always-served path (profile_cycle
+            // off) makes exactly the same calls it made before this change.
+            const auto te0 = profile_cycle ? clock::now() : clock::time_point{};
+            const ov::Tensor vembed = embed_paged(lane, seq);
+            const double vembed_ms =
+                profile_cycle
+                    ? std::chrono::duration<double, std::milli>(clock::now() - te0).count()
+                    : 0.0;
+            logits = paged_forward(lane, vembed, past, la_rows, 1);
+            stats.draft_verify_seconds +=
+                seconds_since_tp(t_verify) - (lane.stall_accum - verify_waited);
             stats.draft_proposed += static_cast<int>(drafts.size());
 
             const size_t rows = logits.get_size() / logits.get_shape().back();
@@ -2085,6 +2164,9 @@ private:
 
             size_t accepted = 0;
             bool   stop     = false;
+            // M11 step profile only: brackets the accept loop, which
+            // otherwise had no timer at all (§1 row 12).
+            const auto t_accept0 = profile_cycle ? clock::now() : clock::time_point{};
             for (size_t i = 0; i < drafts.size(); ++i) {
                 const int want = pick_row(lane, sampler, logits, i);
                 if (trace) {
@@ -2111,6 +2193,10 @@ private:
                     break;
                 }
             }
+            const double accept_ms =
+                profile_cycle
+                    ? std::chrono::duration<double, std::milli>(clock::now() - t_accept0).count()
+                    : 0.0;
             stats.draft_accepted += static_cast<int>(accepted);
 
             // M11 dump instrument: dflash_dump_realized (computed above,
@@ -2164,6 +2250,40 @@ private:
             // The accepted rows (anchor + accepted drafts) are now context; only
             // they enter the drafter's state, so there is nothing to roll back.
             if (dflash_active(lane)) dflash_append(lane, 0, accepted + 1, past);
+
+            // M11 step profile: one line per drafting cycle (ARCINT_PROFILE_CYCLE),
+            // a strict superset of ARCINT_FORWARD_SPLIT=1 (which averages over 64
+            // forwards and so mixes prefill's last chunks with decode's first
+            // steps at exactly the depth of interest). Every number here was
+            // already computed above under the same switch or is an
+            // already-read timestamp (paged_forward's t0..t3, mirrored onto
+            // the lane); no new default behaviour.
+            if (profile_cycle) {
+                int frag = 0;
+                for (size_t i = 0; i + 1 < lane.blocks.size(); ++i) {
+                    if (lane.blocks[i + 1] != lane.blocks[i] + 1) ++frag;
+                }
+                const double cycle_ms =
+                    std::chrono::duration<double, std::milli>(clock::now() - t_propose).count();
+                // lane.stall_accum alone can read 0 here (commit() flushes it
+                // into lane.stalls and zeroes it every time it runs, and the
+                // accept loop above may have called commit() one or more
+                // times) -- add back whatever this cycle pushed there since
+                // stalls_at_propose.
+                double wait_ms = 1000.0 * lane.stall_accum;
+                for (size_t i = stalls_at_propose; i < lane.stalls.size(); ++i) {
+                    wait_ms += 1000.0 * lane.stalls[i];
+                }
+                // Residual by design: ensure_blocks, the drafter dump and the MTP promotion
+                // loop sit inside cycle_ms but carry no field, so propose + verify + accept +
+                // wait < cycle_ms; the cycle that ends a request breaks out before this line.
+                const std::string line = format_profile_cycle_line(
+                    past, seq.size(), accepted, propose_ms, cyc_mtp_embed_ms, cyc_mtp_mask_ms,
+                    cyc_mtp_layer_ms, cyc_mtp_head_ms, vembed_ms, lane.last_fwd_ms_index,
+                    lane.last_fwd_ms_infer, lane.last_fwd_ms_logits, lane.last_fwd_ms_hidden,
+                    accept_ms, wait_ms, cycle_ms, frag);
+                log::info("cycle", "%s", line.c_str());
+            }
 
             c = static_cast<size_t>(la_rows[1 + accepted]);   // promotion
             past += 1 + accepted;
@@ -5190,6 +5310,15 @@ private:
     ov::Tensor paged_forward(Lane& lane, const ov::Tensor& embeds, size_t past,
                              std::vector<int32_t> la_rows, int interval,
                              bool want_logits = true, bool want_feats = true) {
+        // ARCINT_PROFILE_CYCLE: the index-build segment below (pos, blocks,
+        // the 9 x set_i32 into USM host) is timed only under the switch --
+        // this function runs on every prefill chunk too, and an unconditional
+        // pair of clock reads there is not the "tens of nanoseconds against a
+        // forward measured in milliseconds" case the file already accepts at
+        // 5278 (a prefill chunk can be much cheaper than a decode step).
+        static const bool profile_cycle = profile_cycle_enabled();
+        const auto t_index0 = profile_cycle ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
         const size_t n   = embeds.get_shape()[0];
         const size_t tot = past + n;
         const size_t nblk = (tot + kv_block_tokens_ - 1) / kv_block_tokens_;
@@ -5273,6 +5402,11 @@ private:
         // request should land near the isolated 211 ms) or INPUT-related (a
         // repeat should still cost close to 430 ms).
         static const bool split_repeat = split_log && std::string(split_env) == "2";
+        if (profile_cycle) {
+            lane.last_fwd_ms_index = std::chrono::duration<double, std::milli>(
+                                          std::chrono::steady_clock::now() - t_index0)
+                                          .count();
+        }
         with_turn(lane, [&] {
             // Four steady_clock::now() reads every served forward (t0..t3),
             // whether or not ARCINT_FORWARD_SPLIT is set: on this host
@@ -5286,6 +5420,12 @@ private:
             const auto t2 = std::chrono::steady_clock::now();
             if (mtp_ready_) copy_out(lane.req.get_tensor("hidden_states"), lane.hidden);
             const auto t3 = std::chrono::steady_clock::now();
+            // Mirrored onto the lane so generate_paged's cycle line (M11 step
+            // profile) can read this forward's split without a clock read of
+            // its own -- t0..t3 above are already unconditional.
+            lane.last_fwd_ms_infer  = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            lane.last_fwd_ms_logits = std::chrono::duration<double, std::milli>(t2 - t1).count();
+            lane.last_fwd_ms_hidden = std::chrono::duration<double, std::milli>(t3 - t2).count();
             // The repeat's own two reads are gated on split_repeat, not
             // unconditional like t0..t3 above: they exist only to time a
             // forward that itself only happens under ARCINT_FORWARD_SPLIT=2.
@@ -6191,6 +6331,11 @@ private:
 
     int mtp_feed_locked(Lane& lane, int next, bool want_draft) {
         try {
+            // M11 step profile: four steady_clock::now() reads per head step,
+            // unconditional, on the same "tens of nanoseconds against a
+            // forward measured in milliseconds" argument paged_forward
+            // already makes for its own t0..t3.
+            const auto pt0 = std::chrono::steady_clock::now();
             ov::Tensor ids(ov::element::i64, ov::Shape{1, 1});
             ids.data<int64_t>()[0] = next;
             lane.embed.set_input_tensor(ids);
@@ -6198,10 +6343,16 @@ private:
             const ov::Tensor src = lane.embed.get_output_tensor(0);
             ov::Tensor       emb(src.get_element_type(), src.get_shape());
             std::memcpy(emb.data(), src.data(), src.get_byte_size());
+            const auto pt1 = std::chrono::steady_clock::now();
+            lane.mtp_step_ms_embed =
+                std::chrono::duration<double, std::milli>(pt1 - pt0).count();
 
             const ov::Tensor pos  = mtp_positions(lane.mtp_pos, 1);
             // Nothing is masked: the head attends to its whole committed prefix.
             const ov::Tensor mask = mtp_mask(lane.mtp_len, 1);
+            const auto pt2 = std::chrono::steady_clock::now();
+            lane.mtp_step_ms_mask =
+                std::chrono::duration<double, std::milli>(pt2 - pt1).count();
 
             ov::Tensor beam(ov::element::i32, ov::Shape{1});
             beam.data<int32_t>()[0] = 0;
@@ -6212,19 +6363,35 @@ private:
             lane.mtp_layer.set_tensor("attention_mask", mask);
             lane.mtp_layer.set_tensor("beam_idx", beam);
             lane.mtp_layer.infer();
+            const auto pt3 = std::chrono::steady_clock::now();
+            lane.mtp_step_ms_layer =
+                std::chrono::duration<double, std::milli>(pt3 - pt2).count();
 
             ++lane.mtp_len;
             ++lane.mtp_pos;
             lane.mtp_has_pending = false;
-            if (!want_draft) return -1;
+            if (!want_draft) {
+                lane.mtp_step_ms_head = 0.0;
+                return -1;
+            }
 
             lane.mtp_head.set_input_tensor(lane.mtp_layer.get_output_tensor(0));
             lane.mtp_head.infer();
             const ov::Tensor lg   = lane.mtp_head.get_output_tensor(0);
             const size_t     v    = lg.get_shape().back();
             const size_t     rows = v ? lg.get_size() / v : 0;
-            if (rows == 0) return -1;
-            return Sampler::argmax(lg.data<const float>() + (rows - 1) * v, v);
+            if (rows == 0) {
+                lane.mtp_step_ms_head =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - pt3)
+                        .count();
+                return -1;
+            }
+            const int drafted = Sampler::argmax(lg.data<const float>() + (rows - 1) * v, v);
+            lane.mtp_step_ms_head =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pt3)
+                    .count();
+            return drafted;
         } catch (const std::exception& e) {
             log::warn("mtp", "head failed, disabling it for this process: %s", e.what());
             mtp_ready_ = false;

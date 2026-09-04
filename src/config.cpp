@@ -220,7 +220,8 @@ std::string usage_text() {
         "                            the pooled OS thread, not the request -- it is never\n"
         "                            undone once set\n"
         "  --moe-cpu-tier            compute expert FFNs that would evict a device\n"
-        "                            slot on the host CPU instead (needs --offload-ratio)\n"
+        "                            slot on the host CPU instead (needs --offload-ratio;\n"
+        "                            refuses --prefix-cache-mib > 0, DESIGN §3.4)\n"
         "  --moe-cpu-tier-threads N  worker threads for that tier (0 = auto)\n"
         "\n"
         "memory\n"
@@ -731,6 +732,12 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.moe_cpu_tier && cfg.offload_ratio == 0) {
         return fail("--moe-cpu-tier needs --offload-ratio > 0: with every expert "
                     "resident there is nothing for the host tier to compute");
+    }
+    if (cfg.moe_cpu_tier && cfg.prefix_cache_mib > 0) {
+        return fail("--moe-cpu-tier with --prefix-cache-mib > 0 violates DESIGN §3.4: "
+                    "the host tier's arithmetic depends on expert LRU residency, so a "
+                    "continuation restored from the prefix cache is not byte-identical "
+                    "to a cold run -- drop --prefix-cache-mib or run without the tier");
     }
     if (cfg.prefill_chunk < 0) return fail("--prefill-chunk must be >= 0");
 

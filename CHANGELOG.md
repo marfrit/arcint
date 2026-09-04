@@ -20,6 +20,18 @@ nightly is a different ABI.
 Requires `marfrit-openvino 2026.4.0~dev20260821+p3` (patches 0003–0016).
 
 ### Added since 0.2.13 (unreleased)
+- `ARCINT_PROFILE_CYCLE=1`: one line per served drafting cycle on the paged
+  path naming every segment (propose with its MTP embed/mask/layer/head
+  split, verify embed, the forward's index/infer/logits/hidden split, the
+  accept loop, the turnstile wait, the cycle wall, block-table
+  fragmentation). The served decode line now carries `propose` and `verify`
+  as their own terms and subtracts both from `other` (it used to fold the
+  whole verify forward of every drafting cycle into `other` unlabelled, and
+  never timed the drafter's own forward); the stateful path no longer counts
+  the verify forward twice. `GenerationStats::draft_propose_seconds` added.
+  No behaviour change; red-first tests in `tests/test_decode_stats.cpp` and
+  `tests/test_profile_cycle.cpp`. The owed M11 step profile at depth runs on
+  this instrumentation (DESIGN §7.0.2af when measured).
 - `--paged-attention-max-partitions N` (default 0, unbounded): engine side
   of plugin patch 0015. The plugin side is patch 0015
   (`patches/0015-paged-attention-bounded-partials.patch`), carried by
@@ -124,6 +136,20 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p3` (patches 0003–0016).
   report it as measured-so-far, not as a cleared ceiling.
 
 ### Fixed since 0.2.13 (unreleased)
+- `--moe-cpu-tier` now refuses `--prefix-cache-mib > 0` (loud, in the
+  refusal ladder). The M9 equivalence gates on the offloaded path (24 GB
+  card, `marfrit-openvino +p3`): the coder at `--offload-ratio 20
+  --paged-kv u8:i4` passes every equivalence and concurrency check; the 35B
+  at `--offload-ratio 50 --moe-cpu-tier` passes concurrency and every
+  equivalence check but one, deterministically (3 of 3): a continuation
+  restored from the prefix cache forks from the cold run on one token about
+  140 characters in. Diagnosis (DESIGN §7.0.2ae): the host tier's expert LRU
+  residency is process-global and selects device-f16 versus host-f32
+  arithmetic, which are not bit-equal, so greedy output depends on the
+  process's request history -- a violation of §3.4 as written. Until the
+  host kernel is made bit-equal to the device GEMV (plugin patch 0018, in
+  work), the combination fails loud. Two red-first tests in
+  `tests/test_config.cpp`.
 - Activations charged at the wrong chunk could refuse an explicit --n-ctx
   that auto-fit itself would adopt for the identical request. MEASURED
   (unpatched plugin, coder, u8:i4): --n-ctx omitted adopts 101,824 at belt

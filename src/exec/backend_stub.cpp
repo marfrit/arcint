@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -216,6 +217,24 @@ const char* finish_reason_name(FinishReason r) {
         case FinishReason::Abort:  return "abort";
     }
     return "stop";
+}
+
+bool profile_cycle_enabled() { return std::getenv("ARCINT_PROFILE_CYCLE") != nullptr; }
+
+std::string format_profile_cycle_line(size_t past, size_t n, size_t accepted, double propose_ms,
+                                      double propose_embed_ms, double propose_mask_ms,
+                                      double propose_layer_ms, double propose_head_ms,
+                                      double verify_embed_ms, double verify_index_ms,
+                                      double verify_infer_ms, double verify_logits_ms,
+                                      double verify_hidden_ms, double accept_ms, double wait_ms,
+                                      double cycle_ms, int frag) {
+    return log::format(
+        "past %zu n %zu accepted %zu | propose %.2f (embed %.2f mask %.2f layer %.2f "
+        "head %.2f) | verify embed %.2f index %.2f infer %.2f logits %.2f hidden %.2f | "
+        "accept %.2f wait %.2f total %.2f ms | frag %d",
+        past, n, accepted, propose_ms, propose_embed_ms, propose_mask_ms, propose_layer_ms,
+        propose_head_ms, verify_embed_ms, verify_index_ms, verify_infer_ms, verify_logits_ms,
+        verify_hidden_ms, accept_ms, wait_ms, cycle_ms, frag);
 }
 
 std::unique_ptr<Backend> make_stub_backend(const ModelEntry& entry, Quant quant, int n_ctx,

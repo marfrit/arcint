@@ -16,6 +16,13 @@
 #include "util/utf8.h"
 
 namespace lgc::api {
+
+double decode_other_seconds(const GenerationStats& stats) {
+    return stats.decode_seconds - stats.decode_forward_seconds - stats.decode_embed_seconds -
+           stats.decode_sample_seconds - stats.decode_emit_seconds - stats.decode_wait_seconds -
+           stats.draft_verify_seconds - stats.draft_propose_seconds;
+}
+
 namespace {
 
 using json = nlohmann::json;
@@ -113,9 +120,7 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
 
     std::string decode_suffix;
     if (stats.decode_seconds > 0.0) {
-        const double other = stats.decode_seconds - stats.decode_forward_seconds -
-                             stats.decode_embed_seconds - stats.decode_sample_seconds -
-                             stats.decode_emit_seconds - stats.decode_wait_seconds;
+        const double other = decode_other_seconds(stats);
         decode_suffix = log::format(
             " | graph %.2f s, embed %.2f s, sample %.2f s, emit %.2f s, wait %.2f s, "
             "other %.2f s",
@@ -123,12 +128,17 @@ void log_stats(int slot, const GenerationStats& stats, FinishReason reason) {
             stats.decode_sample_seconds, stats.decode_emit_seconds,
             stats.decode_wait_seconds, other);
     }
-    if (stats.draft_proposed > 0) {
+    // Printed whenever a subtracted term is non-zero, not only when a draft was
+    // proposed: propose time accrues on every paged drafting cycle, so a request
+    // that proposed nothing would otherwise subtract a term it never shows.
+    if (stats.draft_proposed > 0 || stats.draft_propose_seconds > 0.0) {
         decode_suffix += log::format(
-            " | draft accept %.1f%% (%d/%d), verify %.2f s, re-forward %.2f s, rollback %.2f s",
-            100.0 * stats.draft_accepted / stats.draft_proposed, stats.draft_accepted,
-            stats.draft_proposed, stats.draft_verify_seconds, stats.draft_reforward_seconds,
-            stats.draft_rollback_seconds);
+            " | draft accept %.1f%% (%d/%d), propose %.2f s, verify %.2f s, re-forward %.2f s, "
+            "rollback %.2f s",
+            stats.draft_proposed > 0 ? 100.0 * stats.draft_accepted / stats.draft_proposed : 0.0,
+            stats.draft_accepted,
+            stats.draft_proposed, stats.draft_propose_seconds, stats.draft_verify_seconds,
+            stats.draft_reforward_seconds, stats.draft_rollback_seconds);
     }
     // Visible even on a request that drafted nothing at all: a lane whose
     // drafter is currently off (disabled by an earlier failure, re-armed only

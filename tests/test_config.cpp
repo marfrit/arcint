@@ -576,6 +576,25 @@ TEST(config_moe_cpu_tier_rejects_garbage) {
                     "--moe-cpu-tier-threads", "lots"}));
 }
 
+// M9 note (not in the repository): with the CPU tier on, greedy output
+// depends on the process's request history -- the expert LRU residency
+// selects device f16 vs host f32 arithmetic, and the two are not bit-equal --
+// so a continuation restored from the prefix cache is not byte-identical to
+// a cold run. That is a measured DESIGN §3.4 violation, so the combination
+// must fail loud until the host kernel is made bit-equal to the device GEMV.
+TEST(config_moe_cpu_tier_rejects_prefix_cache) {
+    CHECK(rejected({"--stub", "--offload-ratio", "20", "--moe-cpu-tier",
+                    "--prefix-cache-mib", "512"}));
+}
+
+TEST(config_moe_cpu_tier_accepts_prefix_cache_at_zero) {
+    Config cfg;
+    CHECK(run({"--stub", "--offload-ratio", "20", "--moe-cpu-tier",
+               "--prefix-cache-mib", "0"}, cfg).ok);
+    CHECK(cfg.moe_cpu_tier);
+    CHECK_EQ(cfg.prefix_cache_mib, 0);
+}
+
 TEST(config_fit_margin_mib_defaults_256) {
     Config cfg;
     CHECK(run({"--stub"}, cfg).ok);

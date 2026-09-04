@@ -291,7 +291,10 @@ buffers sized from the current call. Packaged as marfrit-openvino +p3
   Owed: the prefill price, and prefix byte-exactness.
 - M9/M14 MoE expert offload on the host tier: --moe-cpu-tier computes
   capacity-miss experts on the CPU instead of a PCIe upload, ahead of the
-  device-resident slot pool and async batched uploads underneath it.
+  device-resident slot pool and async batched uploads underneath it. Refuses
+  --prefix-cache-mib > 0: expert LRU residency picks device f16 vs host f32
+  arithmetic, so a cache-restored continuation is not byte-identical to a cold
+  run (DESIGN §3.4).
 - M12: --pin-dispatch pins a lane's dispatch thread (measured null on a quiet
   host, opt-in); the exporter's --moe-lowering tiled.
 - M13: --vision is reserved and refused; a VLM checkpoint's vision tower and
@@ -335,7 +338,8 @@ server
                             the pooled OS thread, not the request -- it is never
                             undone once set
   --moe-cpu-tier            compute expert FFNs that would evict a device
-                            slot on the host CPU instead (needs --offload-ratio)
+                            slot on the host CPU instead (needs --offload-ratio;
+                            refuses --prefix-cache-mib > 0, DESIGN §3.4)
   --moe-cpu-tier-threads N  worker threads for that tier (0 = auto)
 
 memory

@@ -142,6 +142,12 @@ struct GenerationStats {
     double decode_wait_seconds    = 0.0;
     double draft_rollback_seconds = 0.0;
     double draft_verify_seconds   = 0.0;   // the one pass that checks all drafts
+    // The propose phase's own cost -- turnstile wait, embed.infer() for the
+    // anchor token, and the drafter itself (MTP layer+head, DFlash, or the
+    // n-gram drafter) -- previously invisible (M11, DESIGN §7.0.2aa row):
+    // nothing timed it, so it fell into the served decode line's "other" on
+    // every drafting request.
+    double draft_propose_seconds   = 0.0;
     double draft_reforward_seconds = 0.0;  // re-running the accepted prefix after a reject
     double prefill_seconds   = 0.0;
     // Where prefill goes, mirroring the decode breakdown. It existed for decode
@@ -180,6 +186,24 @@ struct GenerationStats {
         return decode_seconds > 0.0 ? completion_tokens / decode_seconds : 0.0;
     }
 };
+
+// M11 step profile (DESIGN §7.0.2aa row, the M11 design note (not in the
+// repository)): one line per drafting cycle on the paged serving path,
+// naming every segment that had no timer before it (propose, verify's
+// index build and infer/logits/hidden split, the accept loop, the
+// turnstile wait). Gated on ARCINT_PROFILE_CYCLE, off by default. Declared
+// here (defined in backend_stub.cpp, which every build links, matching
+// finish_reason_name above) so the gating and formatting are each one
+// definition and each testable without a GPU.
+bool profile_cycle_enabled();
+
+std::string format_profile_cycle_line(size_t past, size_t n, size_t accepted, double propose_ms,
+                                      double propose_embed_ms, double propose_mask_ms,
+                                      double propose_layer_ms, double propose_head_ms,
+                                      double verify_embed_ms, double verify_index_ms,
+                                      double verify_infer_ms, double verify_logits_ms,
+                                      double verify_hidden_ms, double accept_ms, double wait_ms,
+                                      double cycle_ms, int frag);
 
 class Backend {
 public:

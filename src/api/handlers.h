@@ -72,6 +72,20 @@ struct HttpResult {
     nlohmann::json body;
 };
 
+// What the served decode line's "other" term is, after every segment that
+// has its own timer is subtracted out. M11 (DESIGN §7.0.2aa row): on a
+// drafting request this used to omit draft_verify_seconds and
+// draft_propose_seconds, so the propose/verify/accept work of every
+// drafting cycle (the served line's "graph" stays near-zero for those
+// cycles — the forward cost is timed as `verify`, not `graph`) landed in
+// `other` unlabelled instead of under its own name. `propose` and `verify`
+// are exclusive terms (subtracted here); `re-forward` sits inside `graph` and
+// `rollback` inside `other`, both zero on the paged path. draft_propose_seconds
+// is written on the paged path only; on the stateful path propose remains part
+// of `other`. Exposed here, not left static in handlers.cpp, so the
+// accounting itself is unit-testable without a GPU.
+double decode_other_seconds(const GenerationStats& stats);
+
 // Takes a lane for one request, or returns the 503 that says why not — with
 // the reservation arithmetic in it, so "busy" is a number and not a mood.
 std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out);
