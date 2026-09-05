@@ -38,7 +38,11 @@ coder q4; all three target models reach 10/10 on the fleet harness.
   M11 drafting II                 measured, drafter fixes landed - free levers on the DFlash chain null or negative (§7.0.2z); at depth the MTP layer's KV state is charged against the reservation and the drafters' rotary subgraphs stay f32 (acceptance was zero past 65,504 tokens, an f16 position overflow); DFlash beats plain at 77k (18.8 vs 15.3 t/s, 40.6% accepted), MTP never beats plain at any measured depth on this artifact
   M12 dispatch pin, tiled exporter done - --pin-dispatch measured null on a quiet host, opt-in; exporter --moe-lowering tiled
   M13 vision reserved             done - --vision refused; vision IRs reported at load, never loaded (coder: 6 files, 428.3 MiB)
-  M14 host compute tier --moe-cpu-tier done - 35B/16 GiB card 15.0/15.5 vs 10.4/10.6 t/s at ratio 50/8 GiB; 14.1/14.8 vs 7.4/7.5 at ratio 75/5 GiB; byte-identical, 10/10. Under patch 0018's static partition (0.3.0 release gate): decode holds at 16.4 vs 11.3-11.4 tier OFF (second request), byte-identical; prefill 26.6 vs 87.5 on the same request (per-expert fallback every layer) and a cold sequence's first requests take minutes -- 0.3.1 items
+  M14 host compute tier --moe-cpu-tier done - 35B/16 GiB card 15.0/15.5 vs 10.4/10.6 t/s at ratio 50/8 GiB; 14.1/14.8 vs 7.4/7.5 at ratio 75/5 GiB; byte-identical, 10/10. Under patch 0018's static partition (0.3.0 release gate): decode holds at 16.4 vs 11.3-11.4 tier OFF (second request), tier ON identical to itself across processes/requests (§3.4; ON==OFF on that prompt was sample-dependent, shown by 0.3.1's first acceptance run); prefill 26.6 vs 87.5 on the same request (per-expert fallback every layer) and a cold sequence's first requests take minutes -- campaigns
+
+After 0.3.0 every open defect or lever is one campaign document under
+docs/campaigns/ (README there: rules, template, index of thirteen); the
+milestone document's backlog rows are frozen and point there.
 
 Two M2 walls came down. Slicing logits to the last token before the LM head
 removed an out-of-memory wall at ~8k tokens (the graph computed logits for

@@ -432,7 +432,13 @@ reference implementation the equivalence suite compares against.
 | M11 drafting II | measured, drafter fixes landed — free levers on the DFlash chain: Viterbi negative, blocks 12/16 trade throughput for tokens per cycle, ngram below plain decode; the oracle floors the re-rank headroom at +0.74 per cycle; adapter is a decision, tree not pursued. At depth: the MTP layer's KV state is now charged against the reservation (it overcommitted the card past 76k) and the drafters' rotary subgraphs stay f32 (acceptance collapsed to zero past 65,504 tokens, an f16 position overflow); DFlash beats plain at 77k (18.8 vs 15.3 t/s, 40.6% accepted, ≈ 4.4 tokens per cycle), MTP never beats plain at any measured depth on this artifact |
 | M12 dispatch pin, tiled exporter | done — `--pin-dispatch` measured null on a quiet host, opt-in; exporter `--moe-lowering tiled` |
 | M13 vision reserved | done — `--vision` refused; vision IRs reported at load and never loaded (coder: 6 files, 428.3 MiB on disk) |
-| M14 host compute tier (`--moe-cpu-tier`) | done — 35B on the 16 GiB card 15.0/15.5 t/s vs 10.4/10.6 at ratio 50 / 8 GiB; 14.1/14.8 vs 7.4/7.5 at ratio 75 / 5 GiB; text byte-identical, 10/10. Re-measured at the 0.3.0 release gate under patch 0018's static partition: decode holds (16.4 t/s vs 11.3–11.4 tier OFF on the second request), tier ON byte-identical to tier OFF; prefill loses 3× (26.6 vs 87.5 t/s on the same request, every layer on the per-expert fallback) and a cold sequence's first requests take minutes — both carried to 0.3.1 |
+| M14 host compute tier (`--moe-cpu-tier`) | done — 35B on the 16 GiB card 15.0/15.5 t/s vs 10.4/10.6 at ratio 50 / 8 GiB; 14.1/14.8 vs 7.4/7.5 at ratio 75 / 5 GiB; text byte-identical, 10/10. Re-measured at the 0.3.0 release gate under patch 0018's static partition: decode holds (16.4 t/s vs 11.3–11.4 tier OFF on the second request), tier ON identical to itself across processes and requests (the §3.4 promise; it also matched tier OFF on that window's prompt, which the first 0.3.1 acceptance run showed to be a property of the sample — device f16 and host f32 are not bit-equal); prefill loses 3× (26.6 vs 87.5 t/s on the same request, every layer on the per-expert fallback) and a cold sequence's first requests take minutes — both carried forward as campaigns |
+
+Every open defect and lever after 0.3.0 is its own campaign under
+[docs/campaigns/](docs/campaigns/README.md): one document each, with the
+measurement that defines it, its gate and its entry criteria, sized so one
+session can carry it. `docs/milestone-0.3.0.md` is the record of how 0.3.0
+was planned and closed; its backlog rows are frozen and point there.
 
 Verification: 409 unit cases device-free (413 with the OpenVINO backend, one
 of them a CPU-affinity pin that needs a host allowing core 0), a 64-check curl
