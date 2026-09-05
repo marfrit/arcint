@@ -60,13 +60,16 @@ struct Reservation {
     // ratio makes eligible to be paged in -- informational only, never
     // subtracted from device_total_bytes. Both are zero when offload is
     // off. `slot_source` says how the DEVICE figure was priced: "forced"
-    // (ARCINT_FIT_SLOT_BYTES), "probe" (the plateau probe), or "static"
-    // (patch 0018's MOE_CPU_TIER_STATIC_PARTITION reported true -- the
-    // probe is skipped, since every slot is pinned and never evicted, and
-    // the device figure is computed exactly instead, with the same
-    // formula/source -- "ir" or "config" -- the host-side ledger used);
-    // empty when offload is off or the probe failed with an explicit
-    // --n-ctx to fall back on.
+    // (ARCINT_FIT_SLOT_BYTES), "probe" (the plateau probe under the LRU
+    // partition), "probe-static" (the same probe under patch 0018's static
+    // partition -- it saturates as the pinned set fills on first use
+    // instead of by eviction; the pinned pool's analytic ceiling is logged
+    // beside it as a cross-check, never charged: on the 16 GiB card the
+    // driver keeps most of that pool host-mapped and charging it refused a
+    // configuration the card serves), or "static" (the analytic ceiling,
+    // used only as an upper-bound fallback when the probe threw under the
+    // static partition); empty when offload is off or the probe failed
+    // under LRU with an explicit --n-ctx to fall back on.
     uint64_t    expert_slot_bytes      = 0;
     uint64_t    expert_slot_host_bytes = 0;
     uint64_t    drafter_bytes          = 0;

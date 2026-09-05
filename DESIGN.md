@@ -1255,7 +1255,7 @@ measurement, on the agent endpoint with its real pool.
   `Fault response: Unsuccessful` on the B60 during the red run.
 - **Determinism**: two identical greedy runs produce identical bytes (verified
   on the A770/Vulkan agent baseline as achievable on this hardware class).
-- **In CI today**: 155 unit cases, a 48-check curl round-trip and the
+- **In CI today**: 409 unit cases device-free (413 with the OpenVINO backend), a 64-check curl round-trip and the
   lane-accounting stress (`tests/concurrency/stress.sh`, stub-only), all three
   under `ctest`. They cover the parts of the contract that need no GPU and are
   therefore already gateable — the overflow 400 and its numbers, tool-call
@@ -1295,7 +1295,10 @@ measurement, on the agent endpoint with its real pool.
   a clean ASan report on x86_64 and disappears with the fix.
 - Perf regression tracking against the campaign numbers: B60 ≥ 60 t/s decode
   for the 27B coder q4 (the OpenVINO baseline it must beat to justify its
-  existence), A770 ≥ 17 t/s for the dense 3.8.
+  existence), A770 ≥ 17 t/s for the dense 3.8 (a bar from the GGUF/Vulkan
+  agent baseline: the dense 27B's int4 IR does not fit the 16 GiB card at
+  any depth, so it is not measurable there — §7.0.2ai; the dense agent is
+  served on the 24 GB card).
 - **Per-operation profile of a decode step** (`PERF_COUNT`, coder q4, B60,
   2026-08-28). Two findings, one solid and one alarming.
 
@@ -1400,7 +1403,7 @@ cadence and card time.
 
 | class | cadence | card time | members |
 |---|---|---|---|
-| Unit tests | every commit, every milestone | seconds to minutes | `arcint-test` via `ctest` in the stub build — among them config parsing and the refusal ladder (`tests/test_config.cpp`), the fit arithmetic (`tests/test_fit.cpp`), decode accounting and the cycle-profile line (`tests/test_decode_stats.cpp`, `tests/test_profile_cycle.cpp`), a 48-check curl round-trip (ctest's `roundtrip`) and the lane-accounting stress test (ctest's `stress`, `tests/concurrency/stress.sh`, stub-only). Plus the plugin unit tests each patch carries (`ov_gpu_unit_tests` filters: `patches_0015_paged_attention_*`, `regression_paged_attention_*` and 0016's own review suites, `moe_otd_perf_counters.*` from 0017) — these need a card but run in minutes, red-first wherever the test reports a found defect (construction locks say so), and run whenever their own patch changes |
+| Unit tests | every commit, every milestone | seconds to minutes | `arcint-test` via `ctest` in the stub build — among them config parsing and the refusal ladder (`tests/test_config.cpp`), the fit arithmetic (`tests/test_fit.cpp`), decode accounting and the cycle-profile line (`tests/test_decode_stats.cpp`, `tests/test_profile_cycle.cpp`), a 64-check curl round-trip (ctest's `roundtrip`) and the lane-accounting stress test (ctest's `stress`, `tests/concurrency/stress.sh`, stub-only). Plus the plugin unit tests each patch carries (`ov_gpu_unit_tests` filters: `patches_0015_paged_attention_*`, `regression_paged_attention_*` and 0016's own review suites, `moe_otd_perf_counters.*` from 0017) — these need a card but run in minutes, red-first wherever the test reports a found defect (construction locks say so), and run whenever their own patch changes |
 | Milestone gates | once per milestone increment | one card window, minutes | `tests/equivalence/run.sh` and `tests/concurrency/run.py` on the configuration the milestone changes (M9: the two offload configurations; M11: drafter on/off at the depth in question), plus the milestone's own measurement cell (M14's reference cell, M11's step profile), one process per configuration, numbers into §7 |
 | Acceptance | once per release, before the tag | hours | the Prüfstand at 10/10 on the production coder artifact through the deployed package; the equivalence and concurrency suites on every production configuration (the coder paged, the 35B offload, the agent with MTP); the depth ladder on both cards (the 98,147-token prefill at u8 and u8:i4); the packaging build with its version-stamp check; the post-deploy smoke |
 
@@ -3756,19 +3759,27 @@ this section opened with:
   the pool by observing eviction; the static partition pins every slot at
   bind time and evicts nothing, so the probe's first chunk always hit
   `LRUCache::evict_one`'s "no evictable (unpinned) slot" throw and the
-  load died before this section's own detection logic ever ran. Fixed by
-  skipping the probe when `MOE_CPU_TIER_STATIC_PARTITION` reads `true`
-  and pricing the device figure instead from arcint's own host-side
-  ledger — the same IR-walk (`slot_pool_from_ir`) or config-derived
-  per-expert-bytes formula the host (GTT) estimate already computes,
-  reused verbatim as the device charge under a static partition, since
-  that ceiling IS what the pinned pool holds (`backend_ov.cpp`, logged as
-  `source: static`). Nothing here calls the plugin's own
-  `resident_slot_count()` — that count lives inside patch 0018's C++
-  (`static_partition.hpp`/the OTD_PERF log line) and stays there; arcint's
-  figure is an independent formula over the same model shape, not a read
-  of the plugin's own number, and nothing today cross-checks the two
-  agree.
+  load died before this section's own detection logic ever ran. First
+  fixed (2026-09-04) by skipping the probe when
+  `MOE_CPU_TIER_STATIC_PARTITION` reads `true` and charging the pinned
+  pool's analytic ceiling as the device figure — the same IR-walk
+  (`slot_pool_from_ir`) or config-derived per-expert-bytes formula the
+  host (GTT) estimate computes. The 0.3.0 release gate (§7.0.2ai) showed
+  that ceiling is the wrong *admission* charge on the 16 GiB card: the
+  driver keeps most of the pinned pool host-mapped there (§7.0.2t's
+  two-ledger finding applies to the pinned pool exactly as to the LRU
+  one), the probe had read 0.11 GiB of VRAM for the same 7.50 GiB pool,
+  and charging 7.50 refused a configuration the card serves. So the
+  probe now runs under the static partition as well — with the prefill
+  fallback below fixed nothing evicts, and it saturates as the pinned
+  set fills on first use — the ceiling is only the fallback when the
+  probe throws, and it is logged beside the probe's reading as the
+  cross-check this paragraph used to say nothing provided
+  (`backend_ov.cpp`, `source: probe-static` for the measurement,
+  `static` for the fallback). Nothing here calls the plugin's own
+  `resident_slot_count()` — that count lives inside patch 0018's C++ and
+  stays there; arcint's ceiling is an independent formula over the same
+  model shape, and the probe is the measurement it is checked against.
 - **The prefill fallback path has the identical crash, one call site
   over.** `OffloadExpertWeightProvider::acquire_one` — the per-expert path
   `exec_prefill_onednn` falls back to — had no static-partition awareness
@@ -3833,8 +3844,36 @@ drafter, `--draft 4 --draft-ngram 3`, no MoE routing involved) — which
 passed in an earlier clean run of the same suite and failed in this one;
 recorded as an open, separate item (§7.0.1: a flake between two
 otherwise-identical runs, not touched by anything in this section, not
-yet re-run enough times to characterise). Production was confirmed
-restored and health-checked after every load in this sequence.
+yet re-run enough times to characterise). Re-run at the 0.3.0 release
+gate: six fresh processes on the tier configuration, six identical
+outputs (§7.0.2ai) — one failure in about nine runs on the record, not
+reproduced; the check stays in the suite and the flake stays open as a
+rare event, not a mechanism. Production was confirmed restored and
+health-checked after every load in this sequence.
+
+**Update (2026-09-05): the oversized routing-weights declaration beside
+the bug #2 fix, investigated — harmless, upstream, no change.** Patch
+0018's header flagged, and the M14 handoff carried, a pre-existing line in
+the resident branch of the same per-expert prefill loop,
+`routing_weights_size = n_token * max_topk`, declaring a oneDNN memory
+extent `max_topk` times what the gather kernel writes (one weight per
+gathered row, `n_token` of them). Read against the plugin and the vendored
+oneDNN rather than assumed: the object is the `down` matmul's per-row
+binary-multiply post-op input, whose descriptor is fixed at primitive
+creation as `{n_token, 1}` (`post_op_bin_mul(false)`,
+`grouped_matmul_helper.hpp`) — exactly the `n_token` contiguous elements
+gather wrote; `forward()` binds the caller's object verbatim, and oneDNN's
+execute path (`cvt_primitive_args`) only classifies and counts arguments,
+it never compares a bound memory's descriptor with the primitive's. The
+inflated extent is neither read nor inspected, and it cannot overrun the
+buffer: the scratch is allocated at `max_topk * token_num` and
+`n_token ≤ token_num` (a token routes to a given expert at most once). At
+the served shapes (`num_experts_per_tok` 10 for the coder, 8 for the 35B)
+the declaration is 10×/8× the consumed count, all inside the allocation —
+consistent with every gate on this path passing byte-identical. The line
+is verbatim upstream at the pin; the tidy fix (declare `{n_token, 1}` to
+mirror the creation-time descriptor) is an upstream cosmetic, not a patch
+worth carrying (§1, smallest sufficient divergence). Closed.
 
 #### 7.0.2af M14: the readback decomposed — the 283 µs was queue backlog, not transfer (2026-09-04)
 
@@ -4394,6 +4433,223 @@ misapply.** The standing observation that "the A770 never uses XMX" is about
 check, and DP4A is the path. It says nothing about OpenVINO, and it does not
 make the A770 a control group for this question. A second card is only a
 contrast if it is measured on the same stack.
+
+#### 7.0.2ah M10 re-scoped: the gate is priced in VRAM, and only a new kernel pays in that currency (2026-09-05)
+
+**The decision (operator, 2026-09-05).** 0.3.0 ships with M10 re-scoped as
+§7.0.2y proposed: the context claim the row was written to buy is
+discharged by M8's u8:i4 flag (+28.3% on the 24 GB card, +28.4% on the
+16 GiB card, §7.0.2y's table, measured); the VRAM-resident sub-4-bit
+expert path is a new GPU-kernel milestone and is backlogged to 0.3.1
+(`docs/milestone-0.3.0.md`, "Backlog for 0.3.1"); the host-side
+sub-4-bit storage question stays attached to M14 as a candidate
+extension, also 0.3.1. No M10 code was written for 0.3.0.
+
+**The recon that informed it** — a bounded read of the sources, no code,
+recorded here in its public-safe form (the working note is
+operator-local):
+
+- *NNCF 3.3.0.* `INT3_SYM`/`INT2_SYM` are implemented, not stubs; the
+  OpenVINO output is a plain dequantize subgraph — a packed `u3`
+  constant, the `2^(bits-1)` offset folded as an `i8` zero-point, `f16`
+  group scales — and the pinned runtime defines `u2`/`u3` element types,
+  so the artifact is representable. Mixed precision is per weight
+  tensor, a binary primary/backup split by a sensitivity ratio; there is
+  no per-node bit-width API. In the batched IR form the served artifacts
+  use (one stacked constant per layer per tensor) per-expert granularity
+  is inexpressible; in the unrolled form it is constructible with
+  multi-pass compression under `ignored_scope`, unverified. NNCF 3.3.0
+  is installed in the tooling venv, so the `compress_weights(INT3_SYM)`
+  smoke test that would clear §7.0.2y's "undocumented" caveat is a
+  ten-minute item — still unrun, carried to the backlog.
+- *K-quant formats (llama.cpp).* Per 256-weight block: Q3_K 110 B
+  (3.4375 bpw), IQ3_XXS 98 B (3.0625), Q2_K 84 B (2.625); the i-quants
+  index a compile-time grid that an importer would vendor (MIT). So
+  "dequant to int4 at load" is a re-quantization: the artifact on disk
+  stays sub-4-bit, the resident representation is int4.
+- *The pinned runtime.* The MoE fusion matcher
+  (`keep_moe_3gemm_const_precision.cpp`) requires `u4` on all twelve
+  weight and zero-point constants, so a `u3` expert artifact never
+  reaches the fused MoE op; the kernel type table is `{u4, i4, u8, i8}`
+  and oneDNN has no 3-bit type, so a `u3` GEMV/GEMM is a from-scratch
+  kernel with in-kernel dequant — §7.0.2y's 800–1,500-line HYPOTHESIS
+  stands as the order of magnitude. Per-expert uniformity is structural:
+  one element type per layer per tensor in the batched form, one byte
+  count per expert in the offload provider's per-expert bin ranges.
+- *The gate, resolved.* Its currency is VRAM — "≥ 15% more max context"
+  is KV headroom after weights. Route 2 as written (K-quant import,
+  dequant to int4 at load) leaves int4 resident and is byte-identical to
+  the baseline on the gated axis; its real wins (disk, host pool bytes, a
+  host kernel computing the blocks natively) are M14's territory. Route 1
+  (NNCF `u3`) needs the same new kernel. The routes converge; what
+  remains is the resident format — `u3` group-quant or K-quant blocks —
+  decidable by measurement on one expert layer once a kernel path exists.
+- *Magnitude, bounded from the record (an estimate, not a measurement).*
+  The coder's experts are ≈ 85% of its parameters (184 × 3 × 2048 × 512
+  × 40 layers ≈ 23.2B of 27B), ≈ 10.9 GiB of the 12.8 GiB int4 weights;
+  4 → 3.44 bpw on all of them frees ≈ 1.5 GiB against a KV budget of
+  ≈ 1.4 GiB on the 16 GiB card (§7.0.2y, 171,312 tokens × 8.8 KiB); a
+  rarely-routed-only variant at a third of the experts still clears 15%.
+  The byte count is not the obstacle; the kernel is the milestone. The
+  dense 27B has no experts, so M10 never touched the 24 GB card's agent.
+
+**Carried to 0.3.1.** (1) The VRAM-resident sub-4-bit expert path: a
+matcher for the new element type, an oneDNN bypass, GEMV/GEMM with
+in-kernel dequant, judged by a fusion-impact profile (ground rule 2), with
+a decode regression of known sign (§7.0.3's u4-KV precedent). (2) The two
+pre-work measurements: the `INT3_SYM` smoke test, and the routing
+histogram (patch 0013, `MOE_OTD_ROUTING_HIST`) over a longer corpus — the
+acceptance prompt alone left most of 7,360 experts at 0–2 routings, no
+distribution to threshold "rarely-routed" on. (3) The per-expert bpw map
+as an artifact format (design). (4) Optional: K-quant storage for M14's
+host tier. Closing M10 as re-scoped is not a "baseline reached" claim;
+ground rule 3's survey obligation transfers to the 0.3.1 item.
+
+#### 7.0.2ai The 0.3.0 release gate: the static partition holds §3.4, refuses the 16 GiB card, and is not yet fast (2026-09-05)
+
+The acceptance set of §5/§5.1 run on the release-candidate bits — this
+tree at the tag, and plugin patches 0003–0018 as the built
+`marfrit-openvino +p4` package, its libraries extracted and loaded ahead
+of the installed runtime in every process (each process's map checked:
+the GPU plugin came from the extracted package and the runtime string
+ended in `marfrit-p4`). One fresh process per arm; `ARCINT_MOE_DEVICE_
+POOL_BYTES` at 8 GiB for every offload cell (§7.0.2af's lesson);
+production stopped only on the card being borrowed and re-verified
+fresh after every window.
+
+**M14's reference cell under the static partition (16 GiB card, 35B
+int4, ratio 50, 8 GiB pool, u8 KV, one lane, n_ctx 65,536, the
+1,198-token prompt, 64 greedy tokens, two requests per process).** Tier
+OFF, two processes: prefill 65.7/87.6 and 82.4/87.4 t/s, decode 9.5/11.4
+and 11.0/11.3 — inside the 2026-09-04 reproduction's spread. Tier ON on
+the bits as they stood at the start of the gate: **refused at load, both
+processes.** The device term under the static partition was priced
+analytically at the whole pinned pool, 7.50 GiB (`source: static`), and
+9.17 GiB of weights + 0.47 of drafters + 7.50 left the 15.11 GiB card
+zero KV. The LRU arm on the same card, same pool budget, minutes earlier,
+had priced the same pool by the plateau probe at 0.11 GiB: the pool's
+slots live in host-mapped memory on this card (§7.0.2t's two-ledger
+finding), and only that 0.11 GiB class is VRAM. The analytic figure was
+never wrong about the pool's size, it was wrong about where the driver
+put it — the over-charge went unnoticed on the 24 GB card, where the M9
+gate passed because 22.7 − 9.17 − 0.47 − 7.50 still leaves room. Fixed
+in this release before the tag: the plateau probe runs under the static
+partition too (with the prefill fallback's own fix in place nothing
+evicts, so it saturates as the pinned set fills on first use), the
+analytic figure is the fallback only when the probe throws and is
+logged beside the probe's reading as a cross-check, and the zero-byte
+refusal applies to the fallback alone — a probe that reads ~0 on this
+card is a measurement. `slot_source` gained `probe-static`.
+On the fixed binary, with no forced term, the probe ran under the
+static partition and settled at 0.11 GiB (`source: probe-static`), the
+cross-check line read "pinned-pool ceiling 7.50 GiB (source: config)
+against 0.11 GiB measured resident (source: probe-static)", and the
+reservation admitted max ctx 425,328 — the same admission the LRU arm
+gets. Two tier-ON processes: 11.1/4.0 then 26.7/16.4 t/s (prefill/decode,
+first then second request) and 25.8/15.4 then 26.6/16.4. All arms —
+tier OFF twice, tier ON forced twice, tier ON fixed twice — produced the
+same 64 tokens, and every process's second request matched its first.
+
+**F2's runtime at the cell.** Warm, the tier under the static partition
+holds M14's result: decode 16.4 t/s on the second request of both
+processes (15.4 already on the first request of the warm-cache one), at
+the LRU-era record (15.0/15.5, §7.0.2x) and above tier OFF's 11.3–11.4 on
+the same request in the same window (first requests: 4.0 and 15.4 against
+tier OFF's 9.5 and 11.0). Two costs stand beside it. Prefill runs at
+26.6–26.7 t/s on the second request against tier OFF's 87.4–87.6 (first
+requests 11.1 and 25.8 against 65.7 and 82.4): the plugin's counter
+`grouped_fallbacks=40` says every layer's prefill took the per-expert
+fallback (the grouped-GEMM prefill refuses any batch with a non-resident
+expert, and under a static half every batch has one), with the host path
+per token for the non-resident experts. And the first processes of a
+fresh sequence pay a one-time warming: with the device term forced to the
+probe's figure so the fit would admit them (a diagnostic, not the shipped
+path), the first two tier-ON processes loaded in 340 and 275 s (tier OFF:
+30–45), served their first request at 2.8/0.1 and 9.9/4.2 t/s and their
+second at 9.2/4.7 and 26.7/16.6, while the fourth tier-ON process of the
+night was fast from its first request; on the fixed binary tier-ON loads
+ran 215–585 s against tier OFF's 30–45. `created_onednn_kernels=325` per
+process is one candidate owner (first-use JIT of the per-expert kernels,
+one per token count); a page cache warmed by the earlier processes'
+first-use fills is another; the two were not separated. M14's own gate —
+an honestly reported decode number against the device-tier path, win or
+lose — reads, under the static partition: **decode holds, prefill loses
+3×, and a cold sequence's first requests are minutes, not seconds.**
+Carried to 0.3.1 as "the static partition's prefill and cold start"
+(`docs/milestone-0.3.0.md`, backlog). One counter note for readers of
+`OTD_PERF` lines: under the static partition the LRU hit counters read
+`gpu_hits=0, gpu_misses=1116` — they count the LRU path, which the
+pinned pool never takes; the line is not evidence of thrash.
+
+**§3.4 under the static partition, the reason patch 0018 exists.** All
+four served arms — tier OFF twice, tier ON twice — produced the same 64
+tokens (one hash), and every process's second request matched its
+first. E2, the history check §7.0.2ae introduced (tier on, no prefix
+cache): PROMPT, PROMPT, CONT in one process, CONT in a fresh one. The
+two PROMPT answers are identical, and **CONT after history is
+byte-identical to CONT in a fresh process** — the exact fork that
+condemned the LRU tier on 2026-09-04 is gone.
+
+**The dense 27B on the 16 GiB card** refuses at any depth on this
+artifact: 13.59 GiB of weights plus 1.18 of drafters (MTP off) against
+15.11 usable leaves no KV at n_ctx 8,192. §5's "A770 ≥ 17 t/s for the
+dense 3.8" bar dates from the GGUF/Vulkan agent baseline and is not
+measurable on the int4 IR there; the dense agent is served on the 24 GB
+card, where its numbers are below.
+
+**The 24 GB card.** The coder at M9's cell (`--offload-ratio 20
+--paged-kv u8:i4`, 8 GiB pool): the equivalence suite, all checks passed,
+at one lane and again at two; the concurrency suite, all checks passed.
+The n-gram flake of §7.0.2ae (the suite's "speculative decoding is
+deterministic across runs", `--draft 4 --draft-ngram 3`, on the 35B tier
+configuration): six fresh processes, one after another, six identical
+outputs (4 of 12 drafts accepted in each) — one failure in about nine
+runs on the record, not reproduced, kept as a rare event rather than a
+mechanism. The coder served-style (no offload, u8 KV) on this card: 53.4
+t/s on a cold first request, 69.2 on the second, byte-identical — §5's
+≥ 60 t/s bar holds at steady state.
+The dense 27B agent (`--paged-kv u8`) on the same card: the concurrency
+suite, all checks passed; the equivalence suite, all checks passed —
+including the MTP section, which is M11's shallow gate on the release
+bits (MTP identical to plain greedy; MTP with the prefix cache, warm
+equal to cold with a real hit; the head accepting 68.4% at this depth),
+and the cold/warm cache section — with one server start skipped and then
+isolated: `--prefill-chunk 1` refuses at load on any artifact with an
+MTP head. The load-time check that verifies the logits slice runs a
+probe forward of `--prefill-chunk` tokens and expected the two rows MTP's
+verifier slices for, from a one-token forward; chunk 1 with `--mtp off`
+loads, chunk 2 with MTP loads. Not a served configuration (the suite's
+chunk sweep is a measurement, not a gate, §5), and a refusal rather than
+a wrong answer — but it aborted the suite's sweep, and its message
+blamed the token axis. Fixed before the tag: the expectation is
+`min(slice rows, probe tokens)` (`logits_slice_rows_expected`, `fit.h`,
+with the discriminating case red-first in `tests/test_fit.cpp`); on the
+rebuilt binary chunk 1 with MTP loads and logs "logits slice verified: 1
+row(s) for a 1-token forward (the slice keeps the last 2)", and the dense
+agent's full equivalence suite with its chunk-1 sweep included passes
+every gated check (chunks 1, 7 and 64 all differ from the unchunked
+baseline, reported not gated, as §5 says they will).
+
+**The coder exactly as served (16 GiB card, `--paged-kv u8`, n_ctx
+98,304, prefix cache 2 GiB, the live unit's own flags on the release
+binary).** Prüfstand — the acceptance task at the artifact's decoding
+regime for this row, greedy, thinking off, scored by executing the
+candidate — **10/10, twice, byte-identical answers**; 479-token greedy
+answers at 48.0 and 49.5 t/s decode (prefill 251 and 676 t/s), one
+reservation overshoot self-corrected at load (14.87 against 14.86 GiB,
+pass 1 of 4). The equivalence suite on this configuration: all checks
+passed; the concurrency suite: all checks passed.
+
+**Device-free, on the final tree:** 409 unit cases (413 with the OpenVINO
+backend on the dev host, one of them a CPU-affinity pin the container's
+cgroup does not allow), the 64-check curl round-trip and the
+lane-accounting stress, all green on this repository's aarch64 build host, where the affinity
+case passes; the same three there under UBSan (`-fsanitize=undefined
+-fno-sanitize-recover=all`) with zero runtime errors; and under
+ASan+UBSan (no-recover, the stub build) on the x86_64 dev host: 409 cases
+with the container-restricted affinity case failing, round-trip and stress
+passed, zero sanitizer reports. Production on the dev host was restored and freshly verified
+after every window (both units active on their cards, health 200).
 
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 

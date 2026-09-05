@@ -1,3 +1,29 @@
+arcint (0.3.0-1) trixie; urgency=medium
+
+  * 0.3.0: the campaign's milestones ship. M9's equivalence gates close on
+    the offloaded path: plugin patch 0018 replaces the host tier's
+    history-dependent LRU expert residency with a static partition, so
+    greedy output no longer depends on request history (DESIGN.md §3.4);
+    five load-time bugs were fixed getting the allow branch to actually
+    pass, and --moe-cpu-tier with --prefix-cache-mib > 0 is allowed again
+    when the plugin reports MOE_CPU_TIER_STATIC_PARTITION, refused
+    otherwise. M11 drafter fixes: the MTP layer's KV state is charged
+    against the reservation (it overcommitted the card at depth), the
+    drafters' rotary subgraphs stay f32 so acceptance no longer collapses
+    past 65,504 tokens, ARCINT_DRAFT_F32/ARCINT_DRAFT_ROPE_F16 switches,
+    ARCINT_PROFILE_CYCLE per-cycle profile. M14: the host tier's readback
+    decomposed (patch 0017; usm_host destinations, one wait). M10
+    re-scoped: the context claim is discharged by --paged-kv u8:i4; the
+    sub-4-bit expert kernel path is 0.3.1. Full record: DESIGN.md
+    §7.0.2ae–§7.0.2ah and CHANGELOG.md.
+  * Requires marfrit-openvino +p4 (patches 0003–0018). The dependency is
+    now a floor on the patch level within the pinned nightly
+    (>= +p4-1, << the next nightly) instead of an exact pin: the exact pin
+    (Depends: = +p1-1) made apt REMOVE arcint when the runtime was upgraded
+    to +p3 on 2026-09-04. The ABI is the nightly, not the patch level.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 05 Sep 2026 01:40:00 +0200
+
 arcint (0.2.13-1) trixie; urgency=medium
 
   * M7 fit pass: measured two-ledger reservation; auto-fit of --n-ctx. An

@@ -33,10 +33,12 @@ coder q4; all three target models reach 10/10 on the fleet harness.
   M6 two lanes per service        done - one process, byte-identical, 10/10 each
   M7 fit pass                     done - two-ledger reservation measured; explicit --n-ctx verify-only, never lowered
   M8 asymmetric KV --paged-kv u8:i4  done - serves, 10/10, +28% ctx (8.8 vs 11.3 KiB/token); owes prefill price, prefix byte-exactness
-  M9 device-tier expert slot pool done - 35B/16 GiB card 0.4 t/s (ratio 25, unpatched) -> 9.1 (ratio 50 / 8 GiB pool, 16-token probe) and 10.4 (64-token probe)
+  M9 expert offload v2            done - device-tier slot pool: 35B/16 GiB card 0.4 t/s (ratio 25, unpatched) -> 9.1 (ratio 50 / 8 GiB pool, 16-token probe) and 10.4 (64-token probe); plugin patch 0018's static residency partition closes §3.4 with the host tier on (a continuation restored from the prefix cache matches a cold run, 24 GB card)
+  M10 sub-4-bit expert weights    re-scoped - the context claim is discharged by --paged-kv u8:i4 (+28% on both served configurations); the sub-4-bit expert path is a new GPU-kernel milestone (the pinned runtime's MoE fusion matches u4 only), backlogged to 0.3.1
+  M11 drafting II                 measured, drafter fixes landed - free levers on the DFlash chain null or negative (§7.0.2z); at depth the MTP layer's KV state is charged against the reservation and the drafters' rotary subgraphs stay f32 (acceptance was zero past 65,504 tokens, an f16 position overflow); DFlash beats plain at 77k (18.8 vs 15.3 t/s, 40.6% accepted), MTP never beats plain at any measured depth on this artifact
   M12 dispatch pin, tiled exporter done - --pin-dispatch measured null on a quiet host, opt-in; exporter --moe-lowering tiled
   M13 vision reserved             done - --vision refused; vision IRs reported at load, never loaded (coder: 6 files, 428.3 MiB)
-  M14 host compute tier --moe-cpu-tier done - 35B/16 GiB card 15.0/15.5 vs 10.4/10.6 t/s at ratio 50/8 GiB; 14.1/14.8 vs 7.4/7.5 at ratio 75/5 GiB; byte-identical, 10/10
+  M14 host compute tier --moe-cpu-tier done - 35B/16 GiB card 15.0/15.5 vs 10.4/10.6 t/s at ratio 50/8 GiB; 14.1/14.8 vs 7.4/7.5 at ratio 75/5 GiB; byte-identical, 10/10. Under patch 0018's static partition (0.3.0 release gate): decode holds at 16.4 vs 11.3-11.4 tier OFF (second request), byte-identical; prefill 26.6 vs 87.5 on the same request (per-expert fallback every layer) and a cold sequence's first requests take minutes -- 0.3.1 items
 
 Two M2 walls came down. Slicing logits to the last token before the LM head
 removed an out-of-memory wall at ~8k tokens (the graph computed logits for

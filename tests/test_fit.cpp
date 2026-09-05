@@ -2981,3 +2981,18 @@ TEST(a_fixed_weights_only_charge_fails_the_derivative_bound) {
     CHECK(reduction < derivative_bound);
 }
 
+
+// ------------------------------------------------ logits_slice_rows_expected
+
+// 0.3.0 release gate (DESIGN §7.0.2ai): --prefill-chunk 1 on an MTP artifact
+// refused at load because the slice check expected the slice's 2 rows from a
+// 1-token probe forward. The discriminating case is (keep 2, tokens 1): the
+// old rule -- expect keep_rows regardless of tokens -- answers 2, the graph
+// hands back 1. Everything the old rule got right must stay right.
+TEST(logits_slice_expected_rows_is_bounded_by_the_probe_tokens) {
+    CHECK_EQ(logits_slice_rows_expected(2, 1), static_cast<size_t>(1));    // MTP slice, chunk 1
+    CHECK_EQ(logits_slice_rows_expected(2, 2), static_cast<size_t>(2));    // chunk 2 loads
+    CHECK_EQ(logits_slice_rows_expected(2, 128), static_cast<size_t>(2));  // the usual floor probe
+    CHECK_EQ(logits_slice_rows_expected(1, 1), static_cast<size_t>(1));    // plain decode slice
+    CHECK_EQ(logits_slice_rows_expected(1, 64), static_cast<size_t>(1));
+}

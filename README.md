@@ -102,14 +102,17 @@ costs ~63k tokens of context headroom; parking the draft on the A770
 (`--dflash-device`) buys 35k of that back for 5 t/s of PCIe round-trips, with
 output byte-identical to the same-card run. The DFlash2 rows were taken with prompts under 2,048 tokens: the exported
 head's state variable is fixed at 2,048 rows and the drafter disables itself
-on longer prompts (known defect, 2026-09-03, fixed in the unreleased tree
-by plugin patch 0014 and a capped, recoverable drafter; the drafter-on
-acceptance task scores 10/10 at that depth). At production context (155648) the MTP
+on longer prompts (fixed in 0.3.0 by plugin patch 0014 and a capped,
+recoverable drafter; the drafter-on acceptance task scores 10/10 at that
+depth). At production context (155648) the MTP
 head serves at 36.2 t/s and 93.2% acceptance, 10/10 greedy, on short
-prompts; with prompts of 76k tokens and more its acceptance falls to zero and
-decode to 1 t/s (known defect, 2026-09-03; the cause is not yet measured —
-by code reading the reconstructed MTP layer keeps an unpaged state and a
-dense mask over the whole context). Prefill on the
+prompts; with prompts of 76k tokens and more its acceptance fell to zero and
+decode to 1 t/s — measured and fixed in 0.3.0 (DESIGN §7.0.2ag): an f16
+position overflow at 65,504 tokens in the drafters' rotary subgraphs, now
+kept at f32, and the MTP layer's unpaged KV state, now charged against the
+reservation. Acceptance is back at depth (90.8% at 77k), but MTP's cycle
+wall still loses to plain decoding there; DFlash wins at depth instead
+(18.8 vs 15.3 t/s at 77k). Prefill on the
 coder reaches ~1970 t/s.
 
 **Long context against the short-prompt numbers** (2026-09-03, `DESIGN.md`
@@ -117,10 +120,12 @@ coder reaches ~1970 t/s.
 off, one process per arm, shallowest first). Dense 27B agent on the 24 GB card, u8, decode
 t/s: plain 22.3 / 19.9 / 16.3 at 8.9k / 37.7k / 76.4k tokens; MTP 25.7 /
 12.6 / 1.0 (acceptance 89% / 79% / 0%); DFlash2 19.8 / 11.0 / 5.3 (1.69 /
-1.43 / 1.00 tokens per cycle, measured on the unreleased build that carries
-plugin patch 0014 and the capped, recoverable drafter). DFlash is below
-plain decoding at every one of these depths, the MTP head from 37.7k, and
-both accept nothing at 76k; the short-prompt rows above are short-prompt rows. Coder on the 16 GiB
+1.43 / 1.00 tokens per cycle, on the build that carries plugin patch 0014
+and the capped, recoverable drafter). At that point DFlash was below plain
+decoding at every one of these depths, the MTP head from 37.7k, and both
+accepted nothing at 76k — the rotary overflow above, since fixed; after the
+fix DFlash beats plain at 77k. The short-prompt rows above are short-prompt
+rows. Coder on the 16 GiB
 card: u8 and u8:i4 decode at parity to 72k tokens (40.3 vs 39.2 t/s) while
 the u8:i4 prefill costs +7% / +25% / +72% at 8.9k / 37.7k / 71.7k.
 
@@ -138,7 +143,7 @@ Text output byte-identical over 64 greedy tokens between the two paths at both r
 task 10/10 at ratio 50 / 8 GiB (the ratio-75 cell has the text identity, no
 acceptance run).
 
-**Context by KV precision.** (Known defect, 2026-09-03: a 141,902-token prefill at u8:i4 on the 16 GiB card ran the GPU out of resources; prompts to 8,909 tokens prefill at every depth setting tried, the failing depth between the two is being bracketed; an earlier "over 2,048 tokens" statement here was a window-design artifact and is retracted.) `--paged-kv u8:i4` (asymmetric key/value
+**Context by KV precision.** (Known defect, still open at 0.3.0: a 141,902-token prefill at u8:i4 on the 16 GiB card ran the GPU out of resources; bracketed since — the fault moves with the prefill chunk, and the fit's chunk belt keeps the card serving while the plugin-side cause stays open, DESIGN §7.0.2ab/§7.0.2ac; an earlier "over 2,048 tokens" statement here was a window-design artifact and is retracted.) `--paged-kv u8:i4` (asymmetric key/value
 precision) against the `u8` default, same artifact, same card:
 
 | model | card | u8 auto-fit | u8:i4 auto-fit | gain |
@@ -416,16 +421,18 @@ reference implementation the equivalence suite compares against.
 | M6 two lanes per service | done — byte-identical under interleaving on both cards, 10/10 on each lane concurrently |
 | M7 fit pass | done — two-ledger reservation measured; an explicit `--n-ctx` is verify-only, never lowered, and its refusal trims the prefix-cache reserve first |
 | M8 asymmetric KV (`--paged-kv u8:i4`) | done — serves, 10/10; +28% context (8.8 vs 11.3 KiB/token); owed: prefill price, prefix byte-exactness |
-| M9 device-tier expert slot pool | done — 35B on the 16 GiB card 0.4 t/s (ratio 25, unpatched) → 9.1 (ratio 50 / 8 GiB pool, 16-token probe) and 10.4 (64-token probe) |
-| M11 drafting II | measured — free levers on the DFlash chain: Viterbi negative, blocks 12/16 trade throughput for tokens per cycle, ngram below plain decode; the oracle floors the re-rank headroom at +0.74 per cycle; adapter is a decision, tree not pursued |
+| M9 expert offload v2 | done — device-tier slot pool: 35B on the 16 GiB card 0.4 t/s (ratio 25, unpatched) → 9.1 (ratio 50 / 8 GiB pool, 16-token probe) and 10.4 (64-token probe); the equivalence gates close on the offloaded path with plugin patch 0018, a static expert-residency partition replacing the host tier's history-dependent LRU, so greedy output no longer depends on request history (§3.4): a continuation restored from the prefix cache matches a cold run with the tier on, measured on the 24 GB card |
+| M10 sub-4-bit expert weights | re-scoped — the context claim is discharged by `--paged-kv u8:i4` (+28% on both served configurations); the sub-4-bit expert path is a new GPU-kernel milestone (the pinned runtime's MoE fusion matches u4 only) and is backlogged to 0.3.1 |
+| M11 drafting II | measured, drafter fixes landed — free levers on the DFlash chain: Viterbi negative, blocks 12/16 trade throughput for tokens per cycle, ngram below plain decode; the oracle floors the re-rank headroom at +0.74 per cycle; adapter is a decision, tree not pursued. At depth: the MTP layer's KV state is now charged against the reservation (it overcommitted the card past 76k) and the drafters' rotary subgraphs stay f32 (acceptance collapsed to zero past 65,504 tokens, an f16 position overflow); DFlash beats plain at 77k (18.8 vs 15.3 t/s, 40.6% accepted, ≈ 4.4 tokens per cycle), MTP never beats plain at any measured depth on this artifact |
 | M12 dispatch pin, tiled exporter | done — `--pin-dispatch` measured null on a quiet host, opt-in; exporter `--moe-lowering tiled` |
 | M13 vision reserved | done — `--vision` refused; vision IRs reported at load and never loaded (coder: 6 files, 428.3 MiB on disk) |
-| M14 host compute tier (`--moe-cpu-tier`) | done — 35B on the 16 GiB card 15.0/15.5 t/s vs 10.4/10.6 at ratio 50 / 8 GiB; 14.1/14.8 vs 7.4/7.5 at ratio 75 / 5 GiB; text byte-identical, 10/10 |
+| M14 host compute tier (`--moe-cpu-tier`) | done — 35B on the 16 GiB card 15.0/15.5 t/s vs 10.4/10.6 at ratio 50 / 8 GiB; 14.1/14.8 vs 7.4/7.5 at ratio 75 / 5 GiB; text byte-identical, 10/10. Re-measured at the 0.3.0 release gate under patch 0018's static partition: decode holds (16.4 t/s vs 11.3–11.4 tier OFF on the second request), tier ON byte-identical to tier OFF; prefill loses 3× (26.6 vs 87.5 t/s on the same request, every layer on the per-expert fallback) and a cold sequence's first requests take minutes — both carried to 0.3.1 |
 
-Verification: 306 unit cases, a 61-check curl round-trip, a lane-accounting
-stress (200 requests, 24-way, 8 lanes, queueing and refusing), an equivalence
-suite and a concurrency suite that run where the card is. Clean under ASan and
-UBSan on x86_64.
+Verification: 409 unit cases device-free (413 with the OpenVINO backend, one
+of them a CPU-affinity pin that needs a host allowing core 0), a 64-check curl
+round-trip, a lane-accounting stress (200 requests, 24-way, 8 lanes, queueing
+and refusing), an equivalence suite and a concurrency suite that run where the
+card is. Clean under ASan and UBSan on x86_64.
 
 [CHANGELOG.md](CHANGELOG.md) lists what each release changed and the
 runtime it depends on. [DESIGN.md](DESIGN.md) records how these numbers were taken, including the

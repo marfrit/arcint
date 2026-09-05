@@ -120,6 +120,21 @@ inline uint64_t expert_slot_bytes_static(int num_expert, int ratio_pct, uint64_t
     return expert_slot_bytes(num_expert, ratio_pct, per_expert_bytes, moe_layers);
 }
 
+// The load-time logits-slice verification (backend_ov.cpp, the activation
+// floor probe): the slice keeps the LAST `keep_rows` rows of the token axis,
+// and a forward of `tokens` tokens cannot return more rows than it was given
+// tokens, so the row count the graph must hand back is min(keep_rows,
+// tokens) -- not keep_rows. Found at the 0.3.0 release gate (DESIGN
+// §7.0.2ai): with MTP's 2-row slice and --prefill-chunk 1 the probe runs one
+// token, the check expected two rows, and a configuration that serves
+// correctly (every serve-time read indexes by the tensor's actual row
+// count) was refused at load with a message blaming the token axis. Callers
+// gate on keep_rows > 0 first, as backend_ov.cpp does; an unsliced graph
+// returns `tokens` rows and is not this function's claim.
+inline size_t logits_slice_rows_expected(size_t keep_rows, size_t tokens) {
+    return std::min(keep_rows, tokens);
+}
+
 // M11 §1.3 (DESIGN §7.0.2ag, "the fix design: MTP's verify cost and zero
 // acceptance at depth"): the MTP layer's own state -- `mtp_layer`, driven by
 // mtp_prime_paged in backend_ov.cpp -- is a STATEFUL paged KV pair,

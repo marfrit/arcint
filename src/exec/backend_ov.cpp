@@ -3243,7 +3243,8 @@ private:
         // Only when offload is on; otherwise neither ledger has anything to
         // reserve and both stay exactly zero, not an estimate of zero.
         uint64_t    slot_pool         = 0;  // device (VRAM) charge -- goes into the budget
-        std::string slot_source;            // "forced" | "probe"
+        std::string slot_source;            // "forced" | "probe" | "probe-static" | "static"
+        bool        probe_priced_device = false;  // the plateau probe ran and set slot_pool
         uint64_t    slot_host_bytes   = 0;  // host (GTT) estimate -- informational only
         std::string slot_host_source;       // "ir" | "config"
         if (offload_ratio_ > 0) {
@@ -3288,7 +3289,12 @@ private:
             // what makes output history-independent), so under that
             // partition every probe chunk would drive `evict_one` into
             // its own "no evictable (unpinned) slot" throw and the load
-            // would die before this file gets a chance to run it.
+            // would die before this file gets a chance to run it. (That
+            // throw was bug #2's -- acquire_one() reached from the probe's
+            // own prefill chunks. With bug #2 fixed, non-resident experts
+            // take the host tier without an upload and nothing evicts, so
+            // the probe runs under the static partition too; see the probe
+            // block below, and why it must.)
             // Detected the same READ-ONLY property key the
             // --prefix-cache-mib refusal (below, moved here 2026-09-04)
             // needs, but NOT the same call: patch 0018 registers
@@ -3340,14 +3346,27 @@ private:
             }
 
             if (!forced) {
-                if (!static_partition_reported) {
-                    // Device term: the plateau probe only. The analytic IR walk
-                    // (slot_pool_from_ir) is not used to charge the device
-                    // budget -- measured on the card, its ceiling formula lands
-                    // on the HOST figure, not what the driver actually keeps in
-                    // VRAM -- so it stays a future source (§2) pending a formula
-                    // for the true device-resident LRU set, and is used below
-                    // only for the host-side ledger.
+                {
+                    // Device term: the plateau probe, under BOTH residency
+                    // partitions. The analytic IR walk (slot_pool_from_ir) is
+                    // not used to charge the device budget -- measured on the
+                    // card, its ceiling formula lands on the HOST figure, not
+                    // what the driver actually keeps in VRAM. That held for
+                    // the LRU partition since M7, and it holds for the static
+                    // partition as well, measured 2026-09-05 (16 GiB card,
+                    // 35B, ratio 50, 8 GiB pool): charging the whole pinned
+                    // pool analytically (7.50 GiB) refused a configuration
+                    // the card demonstrably serves, because the driver keeps
+                    // most of that pool host-mapped there -- the probe under
+                    // LRU had read 0.11 GiB resident for the same pool.
+                    // Admission is charged with what is resident, so the
+                    // probe runs; under the static partition it saturates as
+                    // the pinned set fills on first use instead of by
+                    // eviction (bug #2's fix routes non-resident experts to
+                    // the host tier, nothing evicts) and terminates on the
+                    // same plateau. The analytic figure is the fallback only
+                    // if the probe throws under the static partition, and is
+                    // logged beside the probe's reading as the cross-check.
                     bool probe_ok = true;
                     try {
                         const size_t probe_blocks =
@@ -3399,11 +3418,18 @@ private:
                         probe_ok = false;
                     }
                     if (probe_ok) {
-                        slot_source = "probe";
+                        slot_source = static_partition_reported ? "probe-static" : "probe";
                         log::info("load",
                                   "expert slots: plateau probe settled at %.2f GiB after "
-                                  "distinct-token chunks (source: probe)",
-                                  static_cast<double>(slot_pool) / (1u << 30));
+                                  "distinct-token chunks (source: %s)",
+                                  static_cast<double>(slot_pool) / (1u << 30),
+                                  slot_source.c_str());
+                    } else if (static_partition_reported) {
+                        log::warn("load", "%s",
+                                  "expert slot pool: the plateau probe failed under the static "
+                                  "residency partition; falling back to the analytic pinned-pool "
+                                  "figure below, an UPPER bound (it counts the whole pinned pool "
+                                  "as VRAM-resident, which the driver need not honour)");
                     } else if (!cfg.n_ctx_explicit) {
                         throw std::runtime_error(
                             "--offload-ratio > 0: the engine could not size the expert slot pool "
@@ -3415,17 +3441,7 @@ private:
                                   "alone (the fit below is verify-only and cannot promise this "
                                   "term is honest)");
                     }
-                } else {
-                    // Static partition confirmed: skip the eviction-based
-                    // probe entirely (it cannot terminate -- see the
-                    // comment above `static_partition_reported`) and price
-                    // the device term exactly, below, once the per-expert
-                    // byte count the host-side ledger computes next is
-                    // known.
-                    log::info("load", "%s",
-                              "expert slot pool: plugin reports a static residency partition; "
-                              "the plateau probe is skipped (device figure computed exactly, "
-                              "source: static)");
+                    probe_priced_device = probe_ok;
                 }
 
                 // Host-side ledger (GTT): informational, never charged
@@ -3443,18 +3459,26 @@ private:
                               "layer x %d layers x %.2f MiB)",
                               static_cast<double>(slot_host_bytes) / (1u << 30), ir->slots,
                               ir->moe_layers, static_cast<double>(ir->per_expert_bytes) / (1u << 20));
-                    if (static_partition_reported) {
-                        // Same total this ledger just priced as a host-side
-                        // ceiling (ir->total_bytes is itself built from
-                        // repeated expert_slot_bytes calls, one per matched
-                        // MoE layer) -- under the static partition that
-                        // ceiling IS the device-resident figure, so it is
-                        // reused verbatim rather than re-derived.
+                    if (static_partition_reported && !probe_priced_device) {
+                        // Analytic fallback (the probe threw): the same total
+                        // this ledger just priced as a host-side ceiling
+                        // (ir->total_bytes is built from repeated
+                        // expert_slot_bytes calls, one per matched MoE
+                        // layer). Under the static partition it is the
+                        // pinned pool's full size -- an upper bound on what
+                        // the driver keeps in VRAM, not a measurement of it.
                         slot_pool   = ir->total_bytes;
                         slot_source = "static";
                         log::info("load",
-                                  "expert slot pool: device figure %.2f GiB (static, exact, "
-                                  "source: ir)",
+                                  "expert slot pool: device figure %.2f GiB (static, analytic "
+                                  "fallback, upper bound, source: ir)",
+                                  static_cast<double>(slot_pool) / (1u << 30));
+                    } else if (static_partition_reported) {
+                        log::info("load",
+                                  "expert slot pool: pinned-pool ceiling %.2f GiB (source: ir) "
+                                  "against %.2f GiB measured resident (source: probe-static) -- "
+                                  "the difference is what the driver keeps host-mapped",
+                                  static_cast<double>(ir->total_bytes) / (1u << 30),
                                   static_cast<double>(slot_pool) / (1u << 30));
                     }
                 } else {
@@ -3480,20 +3504,26 @@ private:
                         log::info("load",
                                   "expert slots host-side: %.2f GiB (GTT, source: config)",
                                   static_cast<double>(slot_host_bytes) / (1u << 30));
-                        if (static_partition_reported) {
-                            // Patch 0018 fix (this call site): under the
-                            // static partition the device-resident figure is
-                            // this SAME formula -- expert_slot_bytes_static
-                            // is expert_slot_bytes verbatim, named separately
-                            // only so this call site and its own test read
-                            // as pricing the device term, not the host
-                            // ceiling the line above prices.
+                        if (static_partition_reported && !probe_priced_device) {
+                            // Analytic fallback (the probe threw): the same
+                            // formula -- expert_slot_bytes_static is
+                            // expert_slot_bytes verbatim, named separately so
+                            // this call site reads as pricing the device
+                            // term. An upper bound, see the ir branch above.
                             slot_pool = expert_slot_bytes_static(artifact_.n_expert, offload_ratio_,
                                                                  per_expert_config, artifact_.n_layer);
                             slot_source = "static";
                             log::info("load",
-                                      "expert slot pool: device figure %.2f GiB (static, exact, "
-                                      "source: config)",
+                                      "expert slot pool: device figure %.2f GiB (static, analytic "
+                                      "fallback, upper bound, source: config)",
+                                      static_cast<double>(slot_pool) / (1u << 30));
+                        } else if (static_partition_reported) {
+                            log::info("load",
+                                      "expert slot pool: pinned-pool ceiling %.2f GiB (source: "
+                                      "config) against %.2f GiB measured resident (source: "
+                                      "probe-static) -- the difference is what the driver keeps "
+                                      "host-mapped",
+                                      static_cast<double>(slot_host_bytes) / (1u << 30),
                                       static_cast<double>(slot_pool) / (1u << 30));
                         }
                     }
@@ -3518,17 +3548,17 @@ private:
                 }
 
                 // A static partition pins the device slot pool by
-                // definition -- once any expert has routed even once, the
-                // plugin holds it in VRAM for good (that is what makes the
-                // output history-independent; see the comment above
-                // `static_partition_reported`). slot_pool == 0 here means
-                // this ledger's own arithmetic (the IR walk or the
-                // config-derived formula, above) could not price it -- not
-                // that the plugin has nothing pinned. Charging the device
-                // budget 0 bytes for a pool the plugin is actually filling
-                // is exactly the M7 under-count this section exists to
-                // remove, so this is a hard refusal, not a warning.
-                if (static_partition_reported && slot_pool == 0) {
+                // definition. When the probe could not run and the analytic
+                // fallback ALSO left slot_pool at 0, this ledger's own
+                // arithmetic (the IR walk or the config-derived formula,
+                // above) could not price it -- not that the plugin has
+                // nothing pinned. Charging the device budget 0 bytes for a
+                // pool the plugin is actually filling is exactly the M7
+                // under-count this section exists to remove, so that case is
+                // a hard refusal. A probe that RAN and read ~0 is a
+                // measurement (the driver kept the pool host-mapped), not an
+                // unpriced term, and is charged as read.
+                if (static_partition_reported && !probe_priced_device && slot_pool == 0) {
                     throw std::runtime_error(
                         "--moe-cpu-tier: the plugin reports a static residency "
                         "partition but this ledger could not price the device slot "
@@ -3643,16 +3673,35 @@ private:
                 const ov::Tensor lg    = lane0.req.get_tensor("logits");
                 const size_t     vocab = lg.get_shape().back();
                 const size_t     rows  = vocab > 0 ? lg.get_size() / vocab : 0;
-                if (rows != logits_keep_rows_) {
+                // A forward of T tokens yields min(T, keep) rows: the slice
+                // keeps the LAST keep rows, and the graph cannot return more
+                // rows than it was given tokens. This probe runs at the
+                // served chunk, so with --prefill-chunk below the slice
+                // (MTP's verifier keeps 2; the 0.3.0 release gate ran the
+                // suite's chunk-1 sweep on an MTP artifact and this check
+                // refused the load, blaming the token axis) the honest
+                // expectation is the probe's own token count, not the slice
+                // size. Serve-time reads index by the tensor's actual row
+                // count, never by logits_keep_rows_, so a short forward is
+                // safe there. Note the check's reach: at a served chunk at or
+                // below the slice size any graph returns `tokens` rows, sliced
+                // correctly or not, so the token-axis claim is only verified
+                // when the probe runs above the slice (the usual chunk 128);
+                // a chunk-1 load is admitted, not verified.
+                const size_t expect = lgc::logits_slice_rows_expected(logits_keep_rows_, probe_floor_c);
+                if (rows != expect) {
                     std::ostringstream os;
                     os << lg.get_shape();
                     throw std::runtime_error(log::format(
-                        "logits slice did not take: %zu row(s) for a %zu-token forward, "
-                        "shape %s -- the token axis is not where the slice assumed",
-                        rows, probe_floor_c, os.str().c_str()));
+                        "logits slice did not take: %zu row(s) for a %zu-token forward "
+                        "(the slice keeps the last %zu, so %zu expected), shape %s -- the "
+                        "token axis is not where the slice assumed",
+                        rows, probe_floor_c, logits_keep_rows_, expect, os.str().c_str()));
                 }
-                log::info("load", "logits slice verified: %zu row(s) for a %zu-token forward",
-                          rows, probe_floor_c);
+                log::info("load",
+                          "logits slice verified: %zu row(s) for a %zu-token forward (the "
+                          "slice keeps the last %zu)",
+                          rows, probe_floor_c, logits_keep_rows_);
             }
             // What a SECOND lane costs, measured rather than assumed to be
             // another full peak. On the B60 with the coder it costs nothing:

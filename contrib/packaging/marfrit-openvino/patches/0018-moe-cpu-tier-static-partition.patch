@@ -130,11 +130,20 @@
 # construction (that is the whole point: it is what makes output history-
 # independent), so every probe chunk drove LRUCache::evict_one_unlocked() into its
 # "no evictable (unpinned) slot" throw and the load died before reaching the rest of
-# Phase B. Fixed by reading the same MOE_CPU_TIER_STATIC_PARTITION property (below)
-# once the model is compiled and skipping the probe entirely when it is true,
-# pricing the device term analytically instead (the same per-expert-bytes formula
-# the host-side ledger already computes, reused verbatim under a static partition
-# since the pinned pool's size IS that ceiling, not an estimate of it).
+# Phase B. First fixed (2026-09-04) by reading the same MOE_CPU_TIER_STATIC_
+# PARTITION property (below) once the model is compiled and skipping the probe
+# when it is true, pricing the device term analytically instead (the pinned pool's
+# full size). The 0.3.0 release gate (2026-09-05, arcint DESIGN Section 7.0.2ai)
+# showed that ceiling is the wrong ADMISSION charge on the 16 GiB card: the driver
+# keeps most of the pinned pool host-mapped there, the LRU probe had read 0.11 GiB
+# of VRAM for the same 7.50 GiB pool, and charging 7.50 refused a configuration
+# the card serves. Final fix, arcint-side: the plateau probe runs under the static
+# partition as well -- with bug #2 (below) fixed, non-resident experts take the
+# host tier without an upload and nothing evicts, so the probe saturates as the
+# pinned set fills on first use -- the analytic ceiling is only the fallback when
+# the probe throws, and is logged beside the probe's reading as a cross-check
+# (arcint logs "source: probe-static" for the measured figure, "static" for the
+# fallback).
 #
 # Bug #3, found by this session's first gate run, fixed in arcint (backend_ov.cpp,
 # not this patch's own files): the plugin-side fix above (bug #2) is real and
@@ -219,9 +228,30 @@
 #     line a few lines above in the resident (device) branch of the same loop,
 #     `routing_weights_size = n_token * max_topk`, declares a larger oneDNN
 #     memory shape than the gather kernel ever writes for this fused-prefill
-#     path; unchanged by this patch (present verbatim in ovsrc-m17b) and not
-#     reached by anything this patch touches, but worth a dedicated look on its
-#     own -- not attempted here.
+#     path; unchanged by this patch (present verbatim in ovsrc-m17b and in the
+#     pristine upstream tree at the pin) and not reached by anything this patch
+#     touches. INVESTIGATED 2026-09-05, harmless, no change made: that memory
+#     object is the down matmul's binary post-op input (onednn_matmul::type::
+#     with_bin_mul_per_row -> post_op_bin_mul(false), grouped_matmul_helper.hpp),
+#     whose descriptor is baked into the primitive at creation as {m_M, 1} with
+#     m_M = n_token -- exactly the n_token contiguous elements the gather kernel
+#     wrote. onednn_linear::forward() binds the caller's memory object verbatim
+#     as DNNL_ARG_ATTR_MULTIPLE_POST_OP(0)|DNNL_ARG_SRC_1, and oneDNN's execute
+#     path (cvt_primitive_args, thirdparty/onednn_gpu/src/common/
+#     primitive_exec_types.cpp) only classifies and counts arguments through
+#     pd->arg_usage(); it never compares a bound memory's descriptor with the
+#     primitive's, so the over-declared 1-D extent is never read from, nor even
+#     inspected. It cannot overrun the buffer either: scratch.routing_weights is
+#     allocated at max_batch = max_topk * token_num (get_internal_buffer_descs),
+#     and n_token <= token_num because a token routes to a given expert at most
+#     once, so n_token * max_topk <= max_batch always. At the shapes served
+#     (num_experts_per_tok 10 for the coder, 8 for the 35B) the declaration is
+#     10x/8x the consumed n_token, all of it inside the allocation -- consistent
+#     with every equivalence gate on this path passing byte-identical. The only
+#     conceivable exposure is a future oneDNN that starts validating post-op
+#     argument descriptors at execute; the tidy fix would be declaring
+#     {n_token, 1} ab to mirror the creation-time descriptor -- an upstream
+#     cosmetic, not carried here (smallest sufficient divergence).
 #   - `on_load_expert_weights`'s false return is genuinely overloaded (OTD off
 #     entirely vs. not-resident under this patch's static partition) and its
 #     one caller (exec_prefill_onednn, the fix above) does not distinguish
@@ -250,7 +280,7 @@
 # Measured this session, in full (supersedes the "Measurement recipe" this header
 # used to carry as owed-but-not-run):
 #   1. This patch's own 4 unit tests (--gtest_filter=moe_3gemm_static_partition.*,
-#      /tmp/o3o-so/m18/ov_gpu_unit_tests): 4/4 PASSED, host-only, no GPU load.
+#      the staged m18 build's ov_gpu_unit_tests): 4/4 PASSED, host-only, no GPU load.
 #   2. A clean load and a served completion, --offload-ratio 50 --moe-cpu-tier, no
 #      --prefix-cache-mib, GPU.1, 35B, u8 paged KV: measured clean (bug #2's own
 #      verification, this session; log lines "listening on ..." and a real "slot 0:
@@ -301,11 +331,11 @@
 # recorded here, before the allow branch could be trusted. It has now happened, and
 # it passed.
 #
-# m18 path (dev host, not committed): /tmp/o3o-bugfix/ovsrc-m18, built from a fresh
+# m18 tree (the dev host's working copy, not committed), built from a fresh
 # copy of the pinned ovsrc-m17b baseline (the retired F1 draft's ovsrc-m18/build-m18
 # were deleted first, per task). Bug #2 (acquire_one, above) was found and fixed in
 # this same ovsrc-m18 tree after the first build of the F2-only source produced the
-# evict_one crash on a real load; the source and the staged build at /tmp/o3o-so/m18
+# evict_one crash on a real load; the source and the staged m18 build
 # were rebuilt afterward and re-verified to carry the fix (`grep -rn acquire_one` on
 # expert_weight_provider.hpp/expert_weight_providers.{hpp,cpp}/moe_3gemm_swiglu_opt.cpp
 # shows std::optional<size_t> throughout, not the original plain size_t). Bugs #1 and

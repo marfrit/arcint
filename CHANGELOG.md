@@ -11,22 +11,61 @@ protocol and the retractions are in `DESIGN.md` §7.
 Runtime dependency throughout: `marfrit-openvino`, a source build of OpenVINO
 at the pinned upstream commit `71640275` (the 2026.4.0 nightly of 2026-08-21)
 with the patch series in `patches/` applied. The patch level is part of the
-package version (`+p1`, `+p2`, `+p3`) and a release names the level it was
-built and measured against; the dependency is strict because a different
-nightly is a different ABI.
+package version (`+p1` … `+p4`) and a release names the level it was built
+and measured against. The dependency pins the nightly, because a different
+nightly is a different ABI, and since 0.3.0 floors the patch level within
+it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
+pin made apt remove arcint when the runtime was upgraded to +p3.
 
-## Unreleased
+## 0.3.0 — 2026-09-05
 
-Requires `marfrit-openvino 2026.4.0~dev20260821+p3` (patches 0003–0016) for
-everything below except patches 0017 and 0018 themselves. Those two are new
-in this section and not yet in any built package (`+p4`, carrying both, is
-owed); the measurements attributed to them below were run against a plugin
-built locally from this tree's `patches/` on the dev host, not against an
-installed package.
+Requires `marfrit-openvino 2026.4.0~dev20260821+p4` (patches 0003–0018),
+built and verified 2026-09-04 (the GPU plugin carries
+`MOE_CPU_TIER_STATIC_PARTITION` and patch 0017's counters), not yet deployed.
+The measurements attributed to patches 0017 and 0018 below were run against
+a plugin built from this tree's `patches/` on the dev host, the same source
+the package was built from.
 
-### Added since 0.2.13 (unreleased)
+### Scope
+- M10 (sub-4-bit expert weights) is re-scoped (DESIGN §7.0.2ah): the
+  context claim it was written to buy is discharged by `--paged-kv u8:i4`
+  (+28% on both served configurations, §7.0.2y); the VRAM-resident sub-4-bit
+  expert path is a new GPU-kernel milestone -- the pinned runtime's MoE
+  fusion matches u4 only, its kernels carry no sub-4-bit type, and the gate
+  is priced in VRAM, which neither route as written reaches without that
+  kernel -- and is backlogged to 0.3.1 with its entry criteria in
+  `docs/milestone-0.3.0.md`. No M10 code in this release.
+
+### Release gate
+- The §5/§5.1 acceptance set, run on these bits with the built `+p4`
+  package's libraries loaded in every process and the runtime string
+  checked per process (DESIGN §7.0.2ai has the full record): the coder at
+  M9's offload cell (ratio 20, u8:i4, 24 GB card) passes the equivalence
+  suite at one and two lanes and the concurrency suite; the coder exactly
+  as served (16 GiB card, u8) passes both suites and the acceptance task
+  10/10 twice with byte-identical greedy answers; the dense agent (24 GB
+  card) passes both suites including the MTP section and, after the
+  chunk-1 fix below, the full chunk sweep; the 35B host-tier cell under
+  the static partition passes E2 and is byte-identical to tier OFF across
+  six processes; the n-gram determinism flake did not reproduce in six
+  fresh processes; the coder decodes at 69.2 t/s warm on the 24 GB card
+  (the ≥ 60 bar) and 48.0/49.5 on the 16 GiB card. Two things the gate
+  found are fixed in this release: the static partition's device-pool
+  over-charge (M9, above) and the chunk-1 slice check (Fixed, below). Two
+  it found are 0.3.1's: the host tier's prefill under the static
+  partition (26.6 vs 87.5 t/s on the second request, every layer on the per-expert fallback) and
+  a cold sequence's first requests (loads of 215–585 s, first requests at
+  minutes) — `docs/milestone-0.3.0.md`, backlog. The dense 27B does not
+  fit the 16 GiB card on this artifact, so §5's old A770 bar for it is
+  recorded as not measurable there. Device-free: 409 unit cases (413 with
+  the OpenVINO backend, one container-restricted affinity case), the
+  64-check round-trip and the lane-accounting stress; the same three
+  under UBSan on the aarch64 build host, and under ASan+UBSan on the
+  x86_64 dev host with zero sanitizer reports.
+
+### Added
 - Plugin patch 0017 (`patches/0017-moe-cpu-tier-readback-decomposition.patch`,
-  not in any built package yet): the CPU tier's per-layer readback decomposed
+  carried by `marfrit-openvino +p4`): the CPU tier's per-layer readback decomposed
   into counters (topk_id, enqueue, wait, drain, warm/steady split), its
   x/routing-weight destinations moved from pageable memory to `usm_host`, the
   three reads merged into one wait, and two switches
@@ -163,7 +202,22 @@ installed package.
   fault) -- 165,680 is NOT yet confirmed usable at that full depth;
   report it as measured-so-far, not as a cleared ceiling.
 
-### Fixed since 0.2.13 (unreleased)
+### Fixed
+- `--prefill-chunk 1` on an artifact with an MTP head refused at load
+  ("logits slice did not take: 1 row(s) for a 1-token forward ... the token
+  axis is not where the slice assumed"). The load-time check that verifies
+  the logits slice runs a probe forward of `--prefill-chunk` tokens and
+  expected the slice's full row count (2 for MTP's verifier) from it; a
+  forward cannot return more rows than it was given tokens, and every
+  serve-time read indexes by the tensor's actual row count, so the
+  configuration served correctly and only the check was wrong -- and it
+  blamed the wrong thing. The expectation is now `min(slice rows, probe
+  tokens)` (`logits_slice_rows_expected` in `exec/fit.h`, red-first in
+  `tests/test_fit.cpp`); chunk 1 with MTP loads and logs "logits slice
+  verified: 1 row(s) for a 1-token forward (the slice keeps the last 2)".
+  Found by the 0.3.0 release gate, where it aborted the equivalence suite's
+  chunk sweep on the dense agent (DESIGN §7.0.2ai). Not a served
+  configuration.
 - Drafters at depth (DESIGN §7.0.2ag). Two defects, both measured on the
   dense 27B agent artifact on the 24 GB card. (1) Zero acceptance past
   65,504 tokens for MTP and DFlash alike: both drafter graphs compute their
@@ -208,25 +262,43 @@ installed package.
   tier and cache with one).
   Patch 0018 now exists (13 files; F1, a bit-equal host kernel, was
   retired by review as impractical, see DESIGN §7.0.2ae's update for the
-  mechanism reason). Three load-time bugs surfaced and were fixed before the
+  mechanism reason). Five load-time bugs surfaced and were fixed before the
   allow branch could be trusted, none a numerics problem: the device-pool
   sizing probe and the prefill per-expert fallback path both assumed a slot
   could always be evicted or acquired, which the static partition's 100%-pinned
   pool makes false; the refusal gate itself queried
   `MOE_CPU_TIER_STATIC_PARTITION` on the wrong object (`core_`, before
   compile, which always throws for this key) instead of the compiled model
-  (after compile, where the plugin actually answers it); and the property
+  (after compile, where the plugin actually answers it); `ARCINT_FIT_SLOT_BYTES`
+  (an experiment-only override of the device-pool sizing) could bypass that
+  refusal entirely, fail-open on the exact gate this section exists to
+  guarantee -- the refusal is hoisted out of the sizing branch, and a static
+  partition that priced its device pool at zero bytes now refuses instead of
+  undercharging the budget; and the property
   itself, found in review after the first passing gate run, never checked
   whether the tier was even on, so it reported the F2 rule "in effect" for
   every load regardless -- full detail in DESIGN §7.0.2ae's update and the
-  patch's own header. With all four fixed, `tests/equivalence/run.sh`
+  patch's own header. With all five fixed, `tests/equivalence/run.sh`
   was run for real against `--moe-cpu-tier --prefix-cache-mib 4096
   --kv-block-size 32` on the 24 GB card: **the continuation-restore check
   passes.** The allow branch is verified on real hardware, not asserted.
+  The 0.3.0 release gate then found a sixth, on the 16 GiB card: under the
+  static partition the device slot pool was charged at its full analytic
+  size (7.50 GiB) and the 35B tier-ON cell refused to load, where the
+  driver keeps that pool host-mapped and the LRU probe reads 0.11 GiB of
+  VRAM for it. The plateau probe now runs under the static partition too
+  (nothing evicts once the prefill fallback is fixed), the analytic figure
+  is only the fallback when the probe throws and is logged beside the
+  probe's reading as a cross-check, and the zero-byte refusal applies to
+  the fallback alone (DESIGN §7.0.2ai; the reservation line reads
+  `source: probe-static`).
   One unrelated check in the same run flaked (`speculative decoding is
   deterministic across runs`, an n-gram drafter with no MoE routing
   involved) -- passed in an earlier clean run of the same suite, failed in
-  this one; open, separate, not yet characterised.
+  this one; re-run at the 0.3.0 release gate as six fresh processes on the
+  tier configuration, six identical outputs -- one failure in about nine
+  runs on the record, not reproduced, kept as a rare event rather than
+  a mechanism (DESIGN §7.0.2ai).
 
 - Activations charged at the wrong chunk could refuse an explicit --n-ctx
   that auto-fit itself would adopt for the identical request. MEASURED
@@ -567,7 +639,7 @@ installed package.
   per lane and re-armed on the next request, with a feed cap one row below
   the window for plugins without 0014.
 
-### Dependencies since 0.2.13 (unreleased)
+### Dependencies
 - `marfrit-openvino +p3`: three new plugin patches (0014–0016) on the same
   upstream commit; the runtime reports `...-marfrit-p3`. Patch 0014 is the
   DFlash2 Assign-layout fix above; 0015 is the paged-attention bounded
@@ -579,18 +651,43 @@ installed package.
   paged-attention intermediate buffers from the current call instead of
   the previous one, a stale-count hardening on top of 0015's corrected
   buffers. Patches 0001 and 0002 remain deliberately unapplied.
+- `marfrit-openvino +p4`: two more plugin patches (0017–0018) on the same
+  upstream commit; the runtime reports `...-marfrit-p4`. 0017 is the host
+  tier's readback decomposition (counters, `usm_host` destinations, one
+  wait); 0018 is the static expert-residency partition that closes §3.4
+  with the tier on, plus its own two load-time fixes (the refusal gate read
+  the partition property on the wrong object; the property's default never
+  checked whether the tier was on). Built and verified (the GPU plugin
+  carries `MOE_CPU_TIER_STATIC_PARTITION` and 0017's counters), not yet
+  installed anywhere. The arcint package's own dependency on it is now a
+  floor on the patch level capped at the next nightly (`>= +p4-1`,
+  `<< 2026.4.0~dev20260822`) instead of an exact pin -- the exact pin made
+  apt remove arcint when the runtime was upgraded to +p3 on 2026-09-04;
+  the ABI is the nightly, not the patch level.
 
-### Known defects in 0.2.13, found by the long-context window (2026-09-03)
-- `--dflash` at depth: on the same card and model the DFlash2 drafter
+### Known defects in 0.2.13 (found by the long-context window, 2026-09-03), and their status at 0.3.0
+- **Closed in 0.3.0** (`DESIGN.md` §7.0.2ag): the zero acceptance was an
+  f16 position overflow at 65,504 tokens in the drafters' rotary
+  subgraphs, now kept at f32; DFlash beats plain at 77k tokens (18.8 vs
+  15.3 t/s, 40.6% accepted, about 4.4 tokens per cycle). As recorded at
+  0.2.13: `--dflash` at depth: on the same card and model the DFlash2 drafter
   reaches 1.69 / 1.43 / 1.00 tokens per cycle at 8.9k / 37.7k / 76k tokens
   and decodes below plain at each (19.8 vs 22.3, 11.0 vs 19.9, 5.3 vs 16.3
   t/s); the zero acceptance at 76k is not yet explained. Serve deep
   contexts without a drafter.
-- `--paged-kv u8:i4` prefill price (the M8 item owed since 0.2.13): +7% /
+- **Still open at 0.3.0.** `--paged-kv u8:i4` prefill price (the M8 item owed since 0.2.13): +7% /
   +25% / +72% of prefill time at 8.9k / 37.7k / 71.7k tokens on the coder,
   decode at parity; by code reading it is the opt attention path u8:i4 is
   forced onto, not yet measured as such.
-- `--mtp on` at depth: on the 24 GB card the dense 27B agent's MTP verify
+- **Mechanism found and fixed in 0.3.0; the serving verdict stands**
+  (`DESIGN.md` §7.0.2ag): the same rotary overflow zeroed MTP's acceptance,
+  and the MTP layer's unpaged KV state was never charged against the
+  reservation and overcommitted the card at depth (the spiking verify cost
+  below); both fixed -- acceptance 90.8% at 77k -- but MTP's cycle wall is
+  about 390 ms against a break-even near 130 ms, so MTP still never beats
+  plain decoding at any measured depth on this artifact. Serve deep
+  contexts with `--mtp off`; DFlash wins there instead. As recorded at
+  0.2.13: `--mtp on` at depth: on the 24 GB card the dense 27B agent's MTP verify
   accepts 79% of drafts at 37.7k tokens (12.6 t/s) but 0% at 76k and 143k
   tokens, where decode falls to 1.0 and 0.3 t/s against plain decoding's
   16.3 at 76k, and its prefill runs 13% slower than plain there and at
@@ -608,7 +705,8 @@ installed package.
   half plain with 0% acceptance -- and the MTP-serving forward's 763 ms
   against the plain graph's 211 ms for the same two tokens is not yet
   explained. Serve deep contexts with `--mtp off` until it is.
-- `--paged-kv u8:i4`: a 141,902-token prefill on the coder (16 GiB card,
+- **Still open at 0.3.0** (the chunk belt keeps the card serving; the
+  plugin-side cause is unresolved). `--paged-kv u8:i4`: a 141,902-token prefill on the coder (16 GiB card,
   auto-fit 171,312) failed with a GPU out-of-resources error and every
   later request in that process failed with it; prompts up to 8,909
   tokens succeed at every depth setting tried. The failing depth lies
@@ -625,7 +723,9 @@ installed package.
   while the plugin-side cause (a mixed-stage intermediate buffer sized by
   query heads is the reading; a larger one passes where a smaller faults,
   so it is not a threshold) stays open.
-- `--dflash`: the exported draft head carries a state variable fixed at
+- **Closed in 0.3.0**: plugin patch 0014's Assign-layout fix plus a capped,
+  recoverable drafter; every M11 depth number above 2,048 tokens on the
+  record was taken after it. As recorded at 0.2.13: `--dflash`: the exported draft head carries a state variable fixed at
   2,048 rows; the first draft after a prompt longer than that fails and the
   drafter disables itself for the process (decode continues without
   drafts). Every DFlash number on the record was taken with prompts under
@@ -660,8 +760,10 @@ installed package.
   `drm/xe` tracker item (#8390) reporting the same runtime heap region
   on this card's generation, plus a second candidate mechanism for the
   SAME fault, not yet separated (a stable-branch ring-ordering fix
-  present in `linux-7.1.y`, absent from the dev host's kernel) -- an
-  operator decision on the host kernel, not made. `--paged-kv u8:i4`
+  present in `linux-7.1.y`) -- backported onto the dev host's kernel on
+  2026-09-04 as an out-of-tree module, and one 98k-token crash-configuration
+  run has passed since with no fault lines: a single sample, not a rate
+  result. `--paged-kv u8:i4`
   beyond about 98k tokens under the bypass stays unsafe on
   fault-reporting cards; at bound 32 with the 165,680-token pool the
   16 GiB card passed 5 of 5 runs on a quiet host and 4 of 7 earlier

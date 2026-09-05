@@ -121,11 +121,12 @@ drafter until it is.
 ## 5. Runtime stack
 
 `marfrit-openvino`: source build pinned at upstream commit `71640275` (the
-2026.4.0 nightly of 2026-08-21), patch series **0003–0013** applied
-(`contrib/packaging/marfrit-openvino/patches/`); 0014/0015 are
-measured/designed but not yet in that directory (CHANGELOG "Unreleased").
-Package version carries the patch level: **`+p2` is the 0003–0013 level**,
-and production still serves **`+p1`** (§7.0.2w). Compute-runtime **26.27**
+2026.4.0 nightly of 2026-08-21), patch series **0003–0018** applied
+(`contrib/packaging/marfrit-openvino/patches/`). Package version carries
+the patch level: **`+p4` is the 0003–0018 level** and the one 0.3.0
+requires (CHANGELOG); the arcint package depends on it as a floor within
+the pinned nightly. At the 0.3.0 tag the dev host's production units still
+serve `+p3` — deployment is a separate decision (DESIGN §7.0.2ai). Compute-runtime **26.27**
 (past the fix window for USM-pool issue 916). Kernel driver: **xe KMD**; no version recorded.
 
 ## 6. Not supported / not measured
