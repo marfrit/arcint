@@ -1,0 +1,6 @@
+{
+  "binary": "/bin/true",
+  "model_root": "/nonexistent",
+  "device_large": "GPU.0",
+  "device_small": "GPU.1"
+}

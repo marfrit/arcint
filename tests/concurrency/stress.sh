@@ -17,7 +17,7 @@ N="${2:-200}"
 CONC="${3:-24}"
 SLOTS="${4:-8}"
 
-command -v python3 >/dev/null || { echo "python3 required" >&2; exit 2; }
+command -v python3 >/dev/null || { echo "python3 required" >&2; exit 77; }
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"; [[ -n "${SRV:-}" ]] && kill -9 "$SRV" 2>/dev/null' EXIT
 SRV=""
 FAILED=0

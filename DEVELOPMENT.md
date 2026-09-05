@@ -22,20 +22,37 @@ Development and every published measurement ran on:
 
 ## Build and test
 
+Two ctest targets (docs/design-0.3.1-test-ladder.md), not one:
+
+- **Unit** — `LABELS unit`, device-free, every commit: `arcint-test` (the
+  hand-rolled harness), the HTTP round trip, the stub-only concurrency stress
+  test, and the acceptance enumeration's own consistency checks.
+- **Acceptance** — `LABELS acceptance`, needs a card and `-DARCINT_OPENVINO=ON`,
+  enumerated in `tests/acceptance/cells.json`; run through
+  `tests/acceptance/run.py`, never bare `ctest`, because `ctest`'s own skip
+  semantics would let a card-less run go green with every cell skipped.
+
+Unit:
+
     cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
     cmake --build build
-    ctest --test-dir build --output-on-failure     # unit tests + HTTP round trip
-    ./build/arcint --stub --port 8090 -v          # serving skeleton, no model
+    ctest --test-dir build --output-on-failure -L unit   # the unit gate
+    ./build/arcint --stub --port 8090 -v                  # serving skeleton, no model
 
-With a card and a model directory:
+Acceptance, with a card and a model root:
 
-    cmake -S . -B build-ov -DCMAKE_BUILD_TYPE=Release -DARCINT_OPENVINO=ON
-    cmake --build build-ov
-    ./build-ov/arcint --model /path/to/ir-dir --device GPU.0 --port 8090
-    tests/equivalence/run.sh ./build-ov/arcint /path/to/ir-dir GPU.0
+    cmake -S . -B build-accept -DCMAKE_BUILD_TYPE=Release -DARCINT_OPENVINO=ON \
+          -DARCINT_ACCEPTANCE=ON -DARCINT_ACCEPTANCE_MODEL_ROOT=/path/to/models/ov
+    cmake --build build-accept
+    ctest --test-dir build-accept -N -L acceptance        # lists the twelve cells
+    tests/acceptance/run.py --manifest build-accept/acceptance/run_manifest.json \
+          --all --allow-skip pruefstand   # name every 77, or the run does not count
 
-The equivalence suite is the contract: byte-equality gates for cache, chunking,
-and speculation. A configuration that cannot pass it does not become a default.
+`-DARCINT_ACCEPTANCE=ON` is refused at configure time without
+`-DARCINT_OPENVINO=ON`: a stub binary would "pass" a card cell by serving stub
+bytes. The equivalence suite behind several cells is the contract:
+byte-equality gates for cache, chunking, and speculation. A configuration that
+cannot pass it does not become a default.
 
 ## Security posture
 

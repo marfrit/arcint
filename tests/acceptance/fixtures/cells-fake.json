@@ -1,0 +1,17 @@
+[
+  {
+    "name": "always-pass",
+    "runner": {"cmd": "/bin/true", "args": [], "env": {}},
+    "external": null
+  },
+  {
+    "name": "always-fail",
+    "runner": {"cmd": "/bin/false", "args": [], "env": {}},
+    "external": null
+  },
+  {
+    "name": "always-skip",
+    "runner": {"cmd": "fixtures/skip77.sh", "args": [], "env": {}},
+    "external": null
+  }
+]

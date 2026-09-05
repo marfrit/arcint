@@ -787,10 +787,16 @@ misc
   stop, toolcall, chat, prefix_cache, block_pool, turnstile), exec/ (backend
   interface, stub, backend_ov), api/ (error, handlers), http/ (cpp-httplib
   wiring).
-- tests/: 409 unit cases device-free, 413 with the OpenVINO backend (hand-rolled
-  harness, no framework), roundtrip.sh (64 curl checks, both wired into ctest), concurrency/stress.sh (lane
-  accounting, stub-only, also in ctest), and equivalence/run.sh plus
-  concurrency/run.py, which need a real card.
+- tests/: two ctest label sets. `unit` (what bare ctest runs, device-free): 409
+  cases, 413 with the OpenVINO backend (hand-rolled harness, no framework; a
+  skip is a failure unless named, --max-skips 0), roundtrip.sh (64 curl checks),
+  concurrency/stress.sh (lane accounting, stub-only), and the acceptance
+  enumeration's own consistency check and runner self-test. `acceptance`
+  (registered only under -DARCINT_ACCEPTANCE=ON with the OpenVINO backend):
+  the card-requiring cells enumerated in tests/acceptance/cells.json and run by
+  tests/acceptance/run.py (an unnamed skip fails the run); equivalence/run.sh
+  and concurrency/run.py are its runners. docs/release-checklist.md and the
+  DESIGN §5.1 acceptance row are generated from that enumeration.
 - third_party/: cpp-httplib 0.18.3, nlohmann/json 3.11.3, single headers.
 
 ## Build

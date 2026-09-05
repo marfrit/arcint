@@ -18,6 +18,13 @@ std::vector<Case>& cases();
 int  register_case(const char* name, void (*fn)());
 void fail(const char* file, int line, const std::string& msg);
 
+// Thrown by skip() to unwind out of the case body; test_main.cpp's per-case
+// runner catches it and records the reason. A case that skips reports neither
+// pass nor fail.
+struct SkipSignal {};
+
+[[noreturn]] void skip(const std::string& reason);
+
 template <typename T>
 std::string show(const T& v);
 
@@ -45,7 +52,16 @@ std::string show(const T& v) {
 
 }  // namespace t
 
-#define TEST(name)                                                        \
+// A SKIP_UNLESS at the top of a case that probes a host property (a CPU pin,
+// an optional tool) rather than asserting one. The condition is what must
+// hold for the rest of the case to mean anything; skip() unwinds when it does
+// not.
+#define SKIP_UNLESS(cond, reason)                                        \
+    do {                                                                 \
+        if (!(cond)) t::skip(reason);                                   \
+    } while (0)
+
+#define TEST(name)                                                       \
     static void name();                                                   \
     [[maybe_unused]] static const int name##_registered =                 \
         t::register_case(#name, &name);                                   \

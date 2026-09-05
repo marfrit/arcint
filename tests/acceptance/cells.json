@@ -1,0 +1,287 @@
+[
+  {
+    "name": "coder-offload-1lane",
+    "design": [
+      "§5",
+      "§3.4"
+    ],
+    "artifact_class": "coder-int4",
+    "card_class": "large",
+    "runner": {
+      "cmd": "tests/equivalence/run.sh",
+      "args": [
+        "{binary}",
+        "{model_root}/qwen36-coder-b5-ov",
+        "{device_large}"
+      ],
+      "env": {
+        "ARCINT_EXTRA_ARGS": "--offload-ratio 20 --paged-kv u8:i4",
+        "ARCINT_MOE_DEVICE_POOL_BYTES": "8589934592"
+      }
+    },
+    "flags": "ARCINT_EXTRA_ARGS=--offload-ratio 20 --paged-kv u8:i4; ARCINT_MOE_DEVICE_POOL_BYTES=8 GiB (the suite adds its own --n-ctx 8192 and per-section cache flags)",
+    "gates": "byte-equality: cold vs warm cache, chunked vs unchunked prefill, one chunk size vs another",
+    "reports": "chunk sweep",
+    "external": null
+  },
+  {
+    "name": "coder-offload-2lane",
+    "design": [
+      "§5"
+    ],
+    "artifact_class": "coder-int4",
+    "card_class": "large",
+    "runner": {
+      "cmd": "tests/equivalence/run.sh",
+      "args": [
+        "{binary}",
+        "{model_root}/qwen36-coder-b5-ov",
+        "{device_large}"
+      ],
+      "env": {
+        "ARCINT_EXTRA_ARGS": "--offload-ratio 20 --paged-kv u8:i4 --parallel 2",
+        "ARCINT_MOE_DEVICE_POOL_BYTES": "8589934592"
+      }
+    },
+    "flags": "ARCINT_EXTRA_ARGS=--offload-ratio 20 --paged-kv u8:i4 --parallel 2; ARCINT_MOE_DEVICE_POOL_BYTES=8 GiB",
+    "gates": "the same byte-equality claims as coder-offload-1lane, held at --parallel 2",
+    "reports": null,
+    "external": null
+  },
+  {
+    "name": "coder-offload-concurrency",
+    "design": [
+      "§4.1",
+      "§5"
+    ],
+    "artifact_class": "coder-int4",
+    "card_class": "large",
+    "runner": {
+      "cmd": "tests/concurrency/run.py",
+      "args": [
+        "{binary}",
+        "{model_root}/qwen36-coder-b5-ov",
+        "{device_large}"
+      ],
+      "env": {
+        "ARCINT_EXTRA_ARGS": "--offload-ratio 20 --paged-kv u8:i4",
+        "ARCINT_MOE_DEVICE_POOL_BYTES": "8589934592"
+      }
+    },
+    "flags": "ARCINT_EXTRA_ARGS=--offload-ratio 20 --paged-kv u8:i4; ARCINT_MOE_DEVICE_POOL_BYTES=8 GiB",
+    "gates": "no cross-slot bleed, cold/warm per lane, cancellation, admission (§4.1)",
+    "reports": null,
+    "external": null
+  },
+  {
+    "name": "coder-served-large",
+    "design": [
+      "§5"
+    ],
+    "artifact_class": "coder-int4",
+    "card_class": "large",
+    "runner": {
+      "cmd": "tests/equivalence/run.sh",
+      "args": [
+        "{binary}",
+        "{model_root}/qwen36-coder-b5-ov",
+        "{device_large}"
+      ],
+      "env": {
+        "ARCINT_EXTRA_ARGS": "--paged-kv u8"
+      }
+    },
+    "flags": "ARCINT_EXTRA_ARGS=--paged-kv u8, no offload (the served precision; the suite's own --n-ctx 8192)",
+    "gates": "steady-state decode >= 60 t/s (measured 53.4 cold / 69.2 warm, DESIGN §7.0.2ai)",
+    "reports": "53.4 t/s cold, 69.2 t/s warm",
+    "external": null
+  },
+  {
+    "name": "coder-served-small",
+    "design": [
+      "§5"
+    ],
+    "artifact_class": "coder-int4",
+    "card_class": "small",
+    "runner": {
+      "cmd": "tests/equivalence/run.sh",
+      "args": [
+        "{binary}",
+        "{model_root}/qwen36-coder-b5-ov",
+        "{device_small}"
+      ],
+      "env": {
+        "ARCINT_EXTRA_ARGS": "--paged-kv u8"
+      }
+    },
+    "flags": "ARCINT_EXTRA_ARGS=--paged-kv u8 (the served precision at the suite's own --n-ctx 8192; the served depth 98,304 and 2 GiB prefix cache are the pruefstand cell's)",
+    "gates": "the equivalence and concurrency suites both pass on the 16 GiB card",
+    "reports": "48.0/49.5 t/s",
+    "external": null
+  },
+  {
+    "name": "agent-dense",
+    "design": [
+      "§3.5.2",
+      "§5"
+    ],
+    "artifact_class": "agent-dense",
+    "card_class": "large",
+    "runner": {
+      "cmd": "tests/equivalence/run.sh",
+      "args": [
+        "{binary}",
+        "{model_root}/qwen38-b7c1-ov",
+        "{device_large}"
+      ],
+      "env": {
+        "ARCINT_EXTRA_ARGS": "--paged-kv u8"
+      }
+    },
+    "flags": "ARCINT_EXTRA_ARGS=--paged-kv u8 (the suite's own --n-ctx 8192; its MTP section is M11's shallow gate)",
+    "gates": "MTP identity (equivalence's MTP section) and MTP acceptance > 10%",
+    "reports": null,
+    "external": null
+  },
+  {
+    "name": "tier-reference-cell",
+    "design": [
+      "§3.4",
+      "§7.0.2ai"
+    ],
+    "artifact_class": "coder-35b-int4",
+    "card_class": "small",
+    "runner": {
+      "cmd": "tests/acceptance/cells/tier_reference.sh",
+      "args": [
+        "{binary}",
+        "{model_root}/qwen36-35b-a3b-int4-ov",
+        "{device_small}",
+        "--offload-ratio",
+        "50",
+        "--paged-kv",
+        "u8",
+        "--parallel",
+        "1",
+        "--n-ctx",
+        "65536"
+      ],
+      "env": {
+        "ARCINT_MOE_DEVICE_POOL_BYTES": "8589934592"
+      }
+    },
+    "flags": "ratio 50, ARCINT_MOE_DEVICE_POOL_BYTES=8 GiB pool, u8 KV, 1 lane, n_ctx 65536, 1,198-tok prompt, 64 greedy tokens, 2 requests/process",
+    "gates": "tier ON/OFF byte-identity and E2 (CONT after history == CONT fresh)",
+    "reports": "16.4 t/s decode, 26.6 t/s prefill",
+    "external": null,
+    "increment": 2
+  },
+  {
+    "name": "ngram-determinism-repeat",
+    "design": [
+      "§7.0.2ae"
+    ],
+    "artifact_class": "coder-35b-int4",
+    "card_class": "small",
+    "runner": {
+      "cmd": "tests/acceptance/cells/ngram_determinism.sh",
+      "args": [
+        "{binary}",
+        "{model_root}/qwen36-35b-a3b-int4-ov",
+        "{device_small}",
+        "--draft",
+        "4",
+        "--draft-ngram",
+        "3",
+        "--repeats",
+        "6"
+      ],
+      "env": {}
+    },
+    "flags": "--draft 4 --draft-ngram 3, six fresh processes",
+    "gates": "six fresh processes produce identical output",
+    "reports": null,
+    "external": null,
+    "increment": 2
+  },
+  {
+    "name": "depth-ladder",
+    "design": [
+      "§5.1"
+    ],
+    "artifact_class": "both",
+    "card_class": "both",
+    "runner": {
+      "cmd": "tests/acceptance/cells/depth_ladder.sh",
+      "args": [
+        "{binary}",
+        "{model_root}",
+        "{device_large}",
+        "{device_small}",
+        "--prefill-tokens",
+        "98147"
+      ],
+      "env": {}
+    },
+    "flags": "98,147-token prefill at u8 and u8:i4, both cards",
+    "gates": "the load completes at both KV precisions on both cards",
+    "reports": "t/s per card and precision",
+    "external": null,
+    "increment": 2
+  },
+  {
+    "name": "pruefstand",
+    "design": [
+      "§5"
+    ],
+    "artifact_class": "coder-int4",
+    "card_class": "deployed-package",
+    "runner": null,
+    "flags": "greedy, thinking off",
+    "gates": "10/10 on the production coder artifact through the deployed package",
+    "reports": null,
+    "external": {
+      "env": "ARCINT_PRUEFSTAND",
+      "invocation": "$ARCINT_PRUEFSTAND --greedy --no-thinking",
+      "score_parse": "last line matches 'score: (\\d+)/10'",
+      "reference_score": "10/10"
+    }
+  },
+  {
+    "name": "sanitizers",
+    "design": [
+      "§5"
+    ],
+    "artifact_class": "none",
+    "card_class": "none",
+    "runner": {
+      "cmd": "tests/acceptance/cells/sanitizers.sh",
+      "args": [
+        "{binary}"
+      ],
+      "env": {}
+    },
+    "flags": "-fno-sanitize-recover; ASan+UBSan on x86_64, UBSan elsewhere; over unit+roundtrip+stress",
+    "gates": "zero sanitizer reports",
+    "reports": null,
+    "external": null,
+    "increment": 2
+  },
+  {
+    "name": "package-build",
+    "design": [
+      "§5.1"
+    ],
+    "artifact_class": "none",
+    "card_class": "none",
+    "runner": {
+      "cmd": "contrib/packaging/arcint/build-deb.sh",
+      "args": [],
+      "env": {}
+    },
+    "flags": "version stamp (build-deb.sh:60), RPATH probe",
+    "gates": "the package build succeeds, is version-stamped, and its RPATH probe passes; a post-deploy smoke run follows the install, outside this cell",
+    "reports": "",
+    "external": null
+  }
+]

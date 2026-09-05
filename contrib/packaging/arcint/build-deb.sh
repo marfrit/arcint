@@ -77,9 +77,12 @@ cmake -S "$SRC" -B build \
 cmake --build build -j"$(nproc)"
 
 # The gates are the product. A package built from a tree whose unit tests fail
-# is a package that ships a claim nobody checked. GPU-dependent suites skip
-# themselves when no card is present; the unit suite must pass regardless.
-( cd build && ctest --output-on-failure -R unit )
+# is a package that ships a claim nobody checked. -L unit selects the whole
+# device-free set (unit, roundtrip, stress, acceptance-enumeration,
+# acceptance-runner) -- not just the test named "unit" -- and --no-tests=error
+# turns "ctest found nothing to run" into a build failure instead of a silent
+# no-op, which is what happened before the ladder was labelled at all.
+( cd build && ctest --output-on-failure --no-tests=error -L unit )
 
 ROOT="$work/pkgroot"
 mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/share/doc/arcint" "$ROOT/usr/share/arcint"

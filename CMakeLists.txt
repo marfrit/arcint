@@ -164,6 +164,28 @@ install(FILES packaging/arcint.service
         DESTINATION "${CMAKE_INSTALL_DATADIR}/arcint")
 
 # --------------------------------------------------------------------- tests
+#
+# Two ctest targets, not one (docs/design-0.3.1-test-ladder.md): everything
+# below with LABELS unit is device-free and is what bare `ctest` runs; the
+# card-requiring acceptance cells, only ever registered under ARCINT_ACCEPTANCE,
+# carry LABELS acceptance instead so the partition is assertable
+# (`ctest -N -L acceptance` must list zero tests in a default build).
+option(ARCINT_ACCEPTANCE
+       "Register the card-requiring acceptance cells (tests/acceptance/cells.json); needs ARCINT_OPENVINO" OFF)
+
+if(ARCINT_ACCEPTANCE AND NOT ARCINT_TESTS)
+  message(FATAL_ERROR
+    "ARCINT_ACCEPTANCE=ON requires ARCINT_TESTS=ON: without enable_testing() the "
+    "cells register nowhere and `ctest -L acceptance` reports zero tests, green.")
+endif()
+
+if(ARCINT_ACCEPTANCE AND NOT ARCINT_OPENVINO)
+  message(FATAL_ERROR
+    "ARCINT_ACCEPTANCE=ON requires ARCINT_OPENVINO=ON. A stub binary would "
+    "'pass' a card cell by serving stub bytes, which is worse than refusing "
+    "to configure at all (docs/design-0.3.1-test-ladder.md §7).")
+endif()
+
 if(ARCINT_TESTS)
   enable_testing()
   add_executable(arcint-test
@@ -199,11 +221,21 @@ if(ARCINT_TESTS)
   target_compile_definitions(arcint-test PRIVATE
     ARCINT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   target_compile_options(arcint-test PRIVATE -Wall -Wextra -Wpedantic)
-  add_test(NAME unit COMMAND arcint-test)
+
+  # --max-skips 0: a skip is a failure here unless the case is named with
+  # --allow-skip <case> (tests/harness.h's SKIP_UNLESS). Local, filtered runs
+  # (`./build/arcint-test some_filter`) are unaffected; this only binds ctest's
+  # own invocation.
+  add_test(NAME unit COMMAND arcint-test --max-skips 0)
+  set_tests_properties(unit PROPERTIES LABELS unit)
 
   add_test(NAME roundtrip
            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/roundtrip.sh" "$<TARGET_FILE:arcint>")
-  set_tests_properties(roundtrip PROPERTIES TIMEOUT 120)
+  # roundtrip.sh exits 77 with a reason when curl or python3 is missing. That
+  # is deliberately NOT a ctest skip here: the package recipe gates on
+  # `-L unit`, and a builder without curl must fail that gate, not pass it with
+  # the 64 round-trip checks unrun (docs/design-0.3.1-test-ladder.md §7).
+  set_tests_properties(roundtrip PROPERTIES TIMEOUT 120 LABELS unit)
 
   # Lane accounting under load. Stub-only on purpose: it is the half of §4.1
   # that needs no card and therefore can run in CI and under the sanitizers,
@@ -212,5 +244,58 @@ if(ARCINT_TESTS)
   add_test(NAME stress
            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/stress.sh"
                    "$<TARGET_FILE:arcint>" 60 12 4)
-  set_tests_properties(stress PROPERTIES TIMEOUT 300)
+  set_tests_properties(stress PROPERTIES TIMEOUT 300 LABELS unit)
+
+  # Both device-free: the generator's own consistency check, and the
+  # acceptance runner's self-test against a fixture manifest. Neither needs a
+  # card or ARCINT_ACCEPTANCE, so both run in every build.
+  add_test(NAME acceptance-enumeration
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tools/acceptance_manifest.py" --check)
+  set_tests_properties(acceptance-enumeration PROPERTIES LABELS unit)
+
+  add_test(NAME acceptance-runner
+           COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/acceptance/selftest.py")
+  set_tests_properties(acceptance-runner PROPERTIES LABELS unit)
+endif()
+
+if(ARCINT_ACCEPTANCE)
+  # Parameters for the card-requiring cells, resolved at configure time into a
+  # generated run manifest alongside $<TARGET_FILE:arcint> -- not environment,
+  # which does not appear in the ctest log (docs/design-0.3.1-test-ladder.md §2).
+  set(ARCINT_ACCEPTANCE_MODEL_ROOT "" CACHE PATH
+      "Root directory holding the model IR directories the acceptance cells serve")
+  set(ARCINT_ACCEPTANCE_DEVICE_LARGE "GPU.0" CACHE STRING
+      "OpenVINO device string for the 24 GB card in acceptance cells")
+  set(ARCINT_ACCEPTANCE_DEVICE_SMALL "GPU.1" CACHE STRING
+      "OpenVINO device string for the 16 GB card in acceptance cells")
+
+  set(ARCINT_ACCEPTANCE_MANIFEST "${CMAKE_CURRENT_BINARY_DIR}/acceptance/run_manifest.json")
+  file(GENERATE OUTPUT "${ARCINT_ACCEPTANCE_MANIFEST}" CONTENT
+"{
+  \"binary\": \"$<TARGET_FILE:arcint>\",
+  \"model_root\": \"${ARCINT_ACCEPTANCE_MODEL_ROOT}\",
+  \"device_large\": \"${ARCINT_ACCEPTANCE_DEVICE_LARGE}\",
+  \"device_small\": \"${ARCINT_ACCEPTANCE_DEVICE_SMALL}\"
+}
+")
+
+  set(ARCINT_ACCEPTANCE_CELLS "${CMAKE_CURRENT_SOURCE_DIR}/tests/acceptance/cells.json")
+  file(READ "${ARCINT_ACCEPTANCE_CELLS}" _arcint_cells_json)
+  string(JSON _arcint_cell_count LENGTH "${_arcint_cells_json}")
+  if(_arcint_cell_count GREATER 0)
+    math(EXPR _arcint_cell_last "${_arcint_cell_count} - 1")
+    foreach(_arcint_i RANGE ${_arcint_cell_last})
+      string(JSON _arcint_cell_name GET "${_arcint_cells_json}" ${_arcint_i} "name")
+      add_test(NAME "acceptance-${_arcint_cell_name}"
+               COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/acceptance/run.py"
+                       --manifest "${ARCINT_ACCEPTANCE_MANIFEST}"
+                       --cells "${ARCINT_ACCEPTANCE_CELLS}"
+                       --cell "${_arcint_cell_name}")
+      # No SKIP_RETURN_CODE here on purpose: a per-cell ctest entry must not be
+      # able to go green on a skip by itself. `tests/acceptance/run.py --all
+      # --allow-skip <cell>` is the only entry point that may treat a skip as
+      # anything but a failure (docs/design-0.3.1-test-ladder.md §7).
+      set_tests_properties("acceptance-${_arcint_cell_name}" PROPERTIES LABELS acceptance)
+    endforeach()
+  endif()
 endif()

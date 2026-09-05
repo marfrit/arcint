@@ -22,6 +22,14 @@ TEST(pin_current_thread_pins_to_the_requested_core) {
     }
     CHECK(core >= 0);
 
+    // Probe with the identical mask first: a no-op with respect to which CPUs
+    // are enabled, so it changes nothing about the assertion below, but a
+    // sandbox that denies sched_setaffinity outright (a restrictive seccomp
+    // profile, not merely a restrictive cpuset) fails it distinctly from a
+    // bug in pin_current_thread itself.
+    SKIP_UNLESS(pthread_setaffinity_np(pthread_self(), sizeof(original), &original) == 0,
+                "sched_setaffinity is denied in this sandbox");
+
     CHECK(pin_current_thread(core));
 
     cpu_set_t after;

@@ -25,13 +25,19 @@ the allowlist is pinned against.
 
     cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
     cmake --build build
-    ctest --test-dir build --output-on-failure
+    ctest --test-dir build --output-on-failure -L unit
 
     ./build/arcint --stub --port 8090 -v
 
 This builds the **stub**, which serves the HTTP surface without a model and is
 what the test suite runs against. In this configuration `--model` is refused
-at startup instead of starting something that cannot run.
+at startup instead of starting something that cannot run. `-L unit` selects
+the device-free gate (`arcint-test`, the HTTP round trip, the stub-only
+concurrency stress test, and the acceptance enumeration's own consistency
+checks) — the only thing bare `ctest` ever runs. The card-requiring
+acceptance cells are a separate, enumerated target
+([docs/design-0.3.1-test-ladder.md](docs/design-0.3.1-test-ladder.md)); see
+[DEVELOPMENT.md](DEVELOPMENT.md) for how to build and run them.
 
 A build that serves a model needs OpenVINO:
 

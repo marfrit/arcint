@@ -12,7 +12,7 @@ if [[ -z "$BIN" || ! -x "$BIN" ]]; then
 fi
 
 for tool in curl python3; do
-  command -v "$tool" >/dev/null || { echo "roundtrip: $tool is required" >&2; exit 2; }
+  command -v "$tool" >/dev/null || { echo "roundtrip: $tool is required" >&2; exit 77; }
 done
 
 PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')

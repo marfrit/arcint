@@ -21,6 +21,7 @@ before being trusted:
                          reservation numbers, not an allocation failure
 """
 import json
+import os
 import re
 import socket
 import subprocess
@@ -55,9 +56,14 @@ class Server:
         self.port = free_port()
         self.log_path = log_path
         self.log = open(log_path, "wb")
+        # ARCINT_EXTRA_ARGS: the same channel tests/equivalence/run.sh honours.
+        # The acceptance cells (tests/acceptance/cells.json) pass their served
+        # configuration this way; the positional list ends at the device, and
+        # anything after it is dropped, which a cell must never rely on.
+        extra_env = os.environ.get("ARCINT_EXTRA_ARGS", "").split()
         self.proc = subprocess.Popen(
             [binary, "--model", model, "--device", device, "--host", "127.0.0.1",
-             "--port", str(self.port), *extra],
+             "--port", str(self.port), *extra_env, *extra],
             stdout=self.log, stderr=subprocess.STDOUT)
 
     @property
