@@ -72,8 +72,8 @@ Every 77 (skip) must be named on that command line, or the run does not count as
 
 - [ ] `tier-reference-cell` -- tests/acceptance/cells/tier_reference.sh (§3.4, §7.0.2ai)
       flags: ratio 50, ARCINT_MOE_DEVICE_POOL_BYTES=8 GiB pool, u8 KV, 1 lane, n_ctx 65536, 1,198-tok prompt, 64 greedy tokens, 2 requests/process
-      gates: tier ON/OFF byte-identity and E2 (CONT after history == CONT fresh)
-      reports: 16.4 t/s decode, 26.6 t/s prefill
+      gates: tier ON byte-identical to itself across processes and requests, tier OFF likewise, and E2
+      reports: ON vs OFF identity and the first divergence; the warm rates
       references: not yet filled
       timeout: 7200s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 

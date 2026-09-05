@@ -60,7 +60,7 @@ One file, `tests/acceptance/cells.json` (JSON, matching the `models/allowlist-ra
 | `coder-served-large` | equivalence + decode sample | coder, 24 GB, no offload | `--paged-kv u8` | §5 | gates ≥ 60 t/s at steady state (53.4 cold / 69.2 warm, §7.0.2ai) |
 | `coder-served-small` | equivalence + concurrency | coder, 16 GiB | `--paged-kv u8 --n-ctx 98304`, 2 GiB prefix cache | §5 | gates suites; reports 48.0/49.5 t/s |
 | `agent-dense` | equivalence (incl. MTP section) + concurrency | dense 27B, 24 GB | `--paged-kv u8` | §3.5.2, §5 | gates MTP identity + acceptance > 10% |
-| `tier-reference-cell` | window script | 35B int4, 16 GiB | ratio 50, 8 GiB pool, u8 KV, 1 lane, n_ctx 65536, 1,198-tok prompt, 64 greedy tokens, 2 requests/process | §3.4, §7.0.2ai | gates tier ON/OFF byte-identity and E2 (CONT after history = CONT fresh); reports 16.4 t/s decode, 26.6 prefill |
+| `tier-reference-cell` | window script | 35B int4, 16 GiB | ratio 50, 8 GiB pool, u8 KV, 1 lane, n_ctx 65536, 1,198-tok prompt, 64 greedy tokens, 2 requests/process | §3.4, §7.0.2ai | gates tier ON byte-identical to itself and tier OFF likewise (§3.4 is history-independence, not ON-equals-OFF -- device f16 vs host f32 are not bit-equal, §7.0.2ae/§7.0.2af) and E2 (CONT after history = CONT fresh); reports ON-vs-OFF identity and the first divergence, and the warm rates |
 | `ngram-determinism-repeat` | window script | 35B tier config | `--draft 4 --draft-ngram 3`, six fresh processes | §7.0.2ae | gates six identical outputs |
 | `depth-ladder` | window script | both cards | 98,147-token prefill at u8 and u8:i4 | §5.1 | gates load; reports t/s |
 | `pruefstand` | **external** | coder, through the deployed package | greedy, thinking off | §5 | gates 10/10 |
@@ -171,6 +171,20 @@ Gated vs reported, decided (all §7.0.2ai):
 | coder-served-large warm 69.2 | gate at §5's ≥ 60 bar, `samples: 1` | §8.3 |
 | coder-served-small 48.0/49.5 | **gate** 43.2 t/s | 3.1 % spread |
 | depth-ladder t/s ×4 | report | one sample each |
+
+**Amendment (2026-09-05): the ON/OFF decode ratio row above is a rate
+comparison, not a byte-identity claim, and stands unchanged.** A card-window
+finding on the committed seed prompt showed every tier-ON output differing
+from tier OFF, which is permitted (§7.0.2ae/§7.0.2af: device f16 and host f32
+arithmetic are not bit-equal, and the 0.3.0 gate's ON-equals-OFF agreement
+was a property of that one sample). `tier_reference.sh`'s identity check was
+gating ON-equals-OFF anyway -- a claim the engine never made. §3.4's actual
+invariant is history-independence: tier ON identical to itself across
+processes and requests, tier OFF likewise, and E2. The runner now gates
+exactly that (two groups, not one baseline for all seven outputs) and
+reports whether ON agrees with OFF this time, with the first divergence
+point if not. The ratio row's own claim -- that the ON/OFF *rate* gap
+cancels process drift -- was never about byte content and needed no change.
 
 **Prefill stays a report.** Gating 26.6 freezes a defect as a specification: the
 loss is a known mechanism (`grouped_fallbacks=40`, the per-expert fallback),

@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
-# tier-reference-cell (DESIGN §3.4, §7.0.2ai; docs/design-0.3.1-test-ladder.md
-# Increment 2). The static device/host partition the plugin uses under
-# --moe-cpu-tier must not change what the model says: two OFF processes and
-# two ON processes, all given the same prompt, must all produce the same
-# bytes. E2 additionally checks a turn: CONT (the prompt plus one added
+# tier-reference-cell (DESIGN §3.4, §7.0.2ae/§7.0.2af/§7.0.2ai;
+# docs/design-0.3.1-test-ladder.md Increment 2, corrected 2026-09-05 by the
+# Increment-3 review). §3.4's actual invariant is HISTORY-INDEPENDENCE, not
+# ON-equals-OFF: the static partition must not change what a given arm says
+# across processes and requests -- two OFF processes and two ON processes,
+# each asked twice, must each agree WITH ITSELF. Device f16 vs host f32
+# arithmetic is not bit-equal (DESIGN §7.0.2ae/§7.0.2af), so tier ON is
+# permitted to differ from tier OFF on a given prompt; the 0.3.0 gate's
+# ON-equals-OFF agreement was a property of that one sample, never a claim
+# the engine makes. This cell gates ON self-identity and OFF self-identity
+# separately and only REPORTS whether ON agrees with OFF this time (and
+# where the first difference falls, if not) -- a report, because a
+# same-or-different reading here is not itself a defect either way.
+# E2 additionally checks a turn: CONT (the prompt plus one added
 # sentence) served from the SAME tier-on process that was already asked
 # PROMPT twice -- so its KV state for that prefix is warm -- must match CONT
 # served from a FRESH process that has never seen PROMPT at all. That is
@@ -194,34 +203,72 @@ fi
 grouped_fallbacks=$(grep -a -o -E 'grouped_fallbacks=[0-9]+' "$WORK/on1.log" | tail -1 | grep -a -o -E '[0-9]+$')
 emit_metric grouped-fallbacks-on "$grouped_fallbacks" count
 
-# ------------------------------------------------- byte-identity, all arms
+# ------------------------------------------- byte-identity, WITHIN one arm
 #
-# Every one of the seven non-baseline outputs must be present AND identical
-# to the baseline: a missing file is a FAIL here, never silently dropped
-# from the comparison (a run that produced nothing to compare is not a run
-# that agreed with anything), and the baseline is never compared with
-# itself -- that would always "pass" even if every other request failed.
-echo "  -- byte-identity across all arms and both requests, against off1's first run"
-BASE="$WORK/off1-run1.txt"
-if [[ -s "$BASE" ]]; then
-  others=(off1-run2 off2-run1 off2-run2 on1-run1 on1-run2 on2-run1 on2-run2)
-  compared=0
-  for name in "${others[@]}"; do
-    cand="$WORK/$name.txt"
+# §3.4's invariant, corrected (Increment-3 review, 2026-09-05): each arm
+# must agree with ITSELF across its own two fresh processes and two
+# requests, not with the other arm -- device f16 vs host f32 arithmetic is
+# not bit-equal (DESIGN §7.0.2ae/§7.0.2af), so tier ON differing from tier
+# OFF on a given prompt is permitted, and gating that would gate a claim the
+# engine never made. Every non-baseline output in a group must be present
+# AND identical to that group's own baseline: a missing file is a FAIL here,
+# never silently dropped from the comparison, and the baseline is never
+# compared with itself -- that would always "pass" even if every other
+# request in the group failed.
+identity_group() {  # identity_group <label> <baseline-name> <other-name>...
+  local label="$1" baseline_name="$2"; shift 2
+  local base="$WORK/$baseline_name.txt"
+  echo "  -- $label: byte-identity across its own processes and requests, against $baseline_name"
+  if [[ ! -s "$base" ]]; then
+    fail "$baseline_name produced a baseline output for $label to compare the rest against"
+    return
+  fi
+  local total=$# compared=0
+  for name in "$@"; do
+    local cand="$WORK/$name.txt"
     if [[ ! -f "$cand" ]]; then
-      fail "$name byte-identical to off1-run1 (no output was produced)"
+      fail "$name byte-identical to $baseline_name (no output was produced)"
       continue
     fi
     compared=$((compared + 1))
-    if cmp -s "$BASE" "$cand"; then
-      pass "$name byte-identical to off1-run1"
+    if cmp -s "$base" "$cand"; then
+      pass "$name byte-identical to $baseline_name"
     else
-      fail "$name byte-identical to off1-run1"
+      fail "$name byte-identical to $baseline_name"
     fi
   done
-  echo "       compared $compared of ${#others[@]} outputs against the off1-run1 baseline"
+  echo "       compared $compared of $total outputs against the $baseline_name baseline"
+}
+
+identity_group "tier ON"  on1-run1  on1-run2 on2-run1 on2-run2
+identity_group "tier OFF" off1-run1 off1-run2 off2-run1 off2-run2
+
+# ----------------------------------------------------- REPORT: ON vs OFF
+#
+# Not gated (see the header comment): whether tier ON agrees with tier OFF
+# on this prompt is data about the arithmetic, not a pass/fail claim. Real
+# per-token boundaries are not available here (the API returns text, not a
+# token array), so a divergence is reported as the first differing
+# CHARACTER, said explicitly rather than dressed up as a token index.
+if [[ -s "$WORK/on1-run1.txt" && -s "$WORK/off1-run1.txt" ]]; then
+  python3 - "$WORK/on1-run1.txt" "$WORK/off1-run1.txt" <<'PY'
+import sys
+on = open(sys.argv[1], encoding="utf-8").read()
+off = open(sys.argv[2], encoding="utf-8").read()
+if on == off:
+    print("  --   tier ON vs OFF: identical")
+else:
+    n = 0
+    for a, b in zip(on, off):
+        if a != b:
+            break
+        n += 1
+    length = max(len(on), len(off))
+    print(f"  --   tier ON vs OFF: differ (first differing character at index {n} "
+          f"of {length}; permitted, DESIGN §7.0.2ae)")
+PY
 else
-  fail "off1-run1 produced a baseline output to compare everything else against"
+  echo "  --   tier ON vs OFF: not compared (on1-run1 or off1-run1 missing; see the FAILs above)"
 fi
 
 # --------------------------------------------------------------------- E2

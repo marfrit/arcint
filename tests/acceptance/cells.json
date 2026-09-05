@@ -312,8 +312,8 @@
       }
     },
     "flags": "ratio 50, ARCINT_MOE_DEVICE_POOL_BYTES=8 GiB pool, u8 KV, 1 lane, n_ctx 65536, 1,198-tok prompt, 64 greedy tokens, 2 requests/process",
-    "gates": "tier ON/OFF byte-identity and E2 (CONT after history == CONT fresh)",
-    "reports": "16.4 t/s decode, 26.6 t/s prefill",
+    "gates": "tier ON byte-identical to itself across processes and requests, tier OFF likewise, and E2",
+    "reports": "ON vs OFF identity and the first divergence; the warm rates",
     "external": null,
     "timeout_seconds": 7200,
     "references": null,
