@@ -5911,6 +5911,51 @@ prefills on micro-SDPA (§7.0.2as), the charge is gone (§7.0.2at), the
 depth ladder is green on both cards (§7.0.2au) and the chunk cap is the
 default's (this record). The `+p6` package is built and not yet deployed.
 
+#### 7.0.2aw 0.3.1 tagged and deployed: the coder serves `+p6` at 10/10; the agent unit's pre-0.3.0 context is refused by the fit it never ran under (2026-09-05)
+
+The tag `v0.3.1` (commit `0a16fa1`) closes the day: unit and acceptance
+tests differentiated, patches 0019 and 0020, the fit's microkernel arm
+and its 2,048 cap, the turnstile and round-trip fixes, the campaigns and
+the two milestone records, and the runtime floor at `+p6` on the
+operator's decision. Acceptance evidence for the tag, stated as what it
+is: the depth ladder on both cards at both precisions against `+p6`
+(§7.0.2au, §7.0.2av), the chunk ladder (§7.0.2av), the Prüfstand through
+a u8:i4 server on the 0020 plugin (§7.0.2as) — and, on the operator's
+word, no re-run of the byte-exactness, tier or concurrency cells for
+this tag ("skip byte exactness for now").
+
+**Deployment.** `marfrit-openvino +p6` installed over `+p3` on the dev
+host, then `arcint 0.3.1-1` built from the tag's tarball by the recipe
+(its unit gate five of five) over `0.2.12-1+p3`, both units restarted.
+The restart fell into the host's scheduled backup, which held both
+models' reads to about 12 MB/s for twenty minutes — the cold-start
+record's disk term (§7.0.2aq) at its worst; no defect, noted because a
+ten-minute silent load looks like a hang and is not one. The coder
+(16 GiB card, u8, n_ctx 98,304, 2 GiB prefix cache) came up, reports
+`0.3.1 (0a16fa1cdf6f)` on `/props`, and scores **10/10** on the
+Prüfstand through the deployed endpoint.
+
+The dense agent unit (24 GB card, `--n-ctx 155648 --mtp on --paged-kv
+u8`, 8 GiB prefix cache) did not: its first process exited at the fit,
+"requested n_ctx 155648 on 1 lane needs 5.38 GiB of KV but the
+reservation admits 127536 per lane" — weights 13.59 GiB, drafters 3.16,
+MTP state 0.97 (8.0 KiB/token), activations 0.03, margin 0.25, GDN rows
+303 MiB, KV 36.2 KiB/token, of 22.71 GiB. That is the accounting 0.3.0
+introduced and this unit never ran under: 0.2.12 served 155,648 here
+without charging the MTP layer's KV state, which §7.0.2ag measured
+overcommitting the card past 76k tokens. An explicit `--n-ctx` is
+verify-only, never lowered (§7's M7 rule), so the refusal is the designed
+answer, and systemd's on-failure restart then re-read the model every
+ten minutes to refuse again; the unit is stopped. Three ways out, each
+a served-behaviour change and so the operator's call, not this
+record's: lower the context to what the fit admits (127,536 at these
+flags); serve MTP off, the guidance §7.0.2ag already gives at depth on
+this artifact, which frees the 0.97 GiB state and admits more; or serve
+`--paged-kv u8:i4` on `+p6`, the format the floor exists for, which by
+the KV cost model brings the pool under budget at 155,648 — unmeasured
+on the dense artifact with MTP, so a window before it is served. The
+coder's deployment stands either way.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

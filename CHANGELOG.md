@@ -24,8 +24,13 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p6` (patches 0003–0020)
 below `+p6` the mixed `--paged-kv u8:i4` cache is possible but pointless
 (prefill at +55 % to +90 % of u8's time, a depth-scaled scratch charge);
 at `+p6` it prefills on micro-SDPA, the charge is gone and the depth
-ladder is green on both cards. The package recipe carries the new floor;
-the `+p6` package is built and not yet deployed.
+ladder is green on both cards. Deployed 2026-09-05 (DESIGN §7.0.2aw):
+`+p6` and `arcint 0.3.1-1` on the dev host's two units; the coder serves
+it, Prüfstand 10/10 through the deployed endpoint; the dense agent unit's
+configured context (155,648 with MTP on, set under 0.2.12's accounting)
+is refused by the 0.3.x fit — the MTP layer's KV state and the drafters
+are charged since 0.3.0 (§7.0.2ag) and the reservation admits 127,536 —
+so that unit is stopped pending the operator's flag decision.
 
 - **Unit and acceptance tests differentiated** (0.3.1's lead item,
   `docs/design-0.3.1-test-ladder.md`): bare `ctest` is the unit set by

@@ -148,7 +148,7 @@ the patch level: **`+p4` is the 0003–0018 level** and the one 0.3.0
 requires (CHANGELOG); **`+p5` adds 0019** (the prefill fallback's
 three-way answer, DESIGN §7.0.2ap; built 2026-09-05, not deployed);
 **`+p6` adds 0020** (u8:i4 prefill on micro-SDPA at parity with u8,
-DESIGN §7.0.2as; built 2026-09-05, not deployed) — the
+DESIGN §7.0.2as; built and deployed 2026-09-05, §7.0.2aw) — the
 level to serve `--paged-kv u8:i4` at, since below it the format's prefill
 costs +55 % to +90 % of u8's time (§7.0.2ar). From 0.3.1 the arcint
 package depends on **`+p6` as a floor** within the pinned nightly
@@ -156,8 +156,9 @@ package depends on **`+p6` as a floor** within the pinned nightly
 but pointless); 0.3.0's floor was `+p4`. Nothing arcint drives reaches
 0019's branch, and 0020 changes the runtime's speed and the fit's
 scratch charge, not the served contract.
-At the 0.3.0 tag the dev host's production units still serve `+p3` —
-deployment is a separate decision (DESIGN §7.0.2ai). Compute-runtime
+At the 0.3.1 tag the dev host's coder unit serves `+p6` with `arcint
+0.3.1` (Prüfstand 10/10); the dense agent unit is stopped pending a flag
+decision, its pre-0.3.0 context refused by the fit (§7.0.2aw). Compute-runtime
 **26.27** (past the fix window for USM-pool issue 916). Kernel driver:
 **xe KMD**; no version recorded.
 
