@@ -298,12 +298,13 @@ if(ARCINT_ACCEPTANCE)
       set_tests_properties("acceptance-${_arcint_cell_name}" PROPERTIES LABELS acceptance)
 
       # Per-cell TIMEOUT from cells.json's own timeout_seconds. The external
-      # cell (pruefstand) carries JSON null there, which the GET returns as an
-      # empty string without an error, so the guard is on the value, not only
-      # on ERROR_VARIABLE: that cell keeps ctest's default -- unbounded here,
-      # since the external harness's own timeout is out of this repository's
-      # hands. ERROR_VARIABLE turns an absent key into a normal (non-fatal)
-      # miss instead of a configure error.
+      # cell (pruefstand) has no "timeout_seconds" key at all -- ERROR_VARIABLE
+      # turns that absent-key GET into a normal (non-fatal) miss instead of a
+      # configure error, and the guard checks the error, not only the value:
+      # that cell keeps ctest's default -- unbounded here, since the external
+      # harness's own timeout is out of this repository's hands. The value
+      # check stays too, defensively, in case some future cell carries an
+      # explicit JSON null there instead of omitting the key.
       string(JSON _arcint_cell_timeout ERROR_VARIABLE _arcint_timeout_err
              GET "${_arcint_cells_json}" ${_arcint_i} "timeout_seconds")
       if(NOT _arcint_timeout_err AND NOT _arcint_cell_timeout STREQUAL "")
