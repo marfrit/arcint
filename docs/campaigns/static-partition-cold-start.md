@@ -49,9 +49,11 @@ only "decode still at the record").
 ## Entry criteria
 
 The warming's owner identified — kernel cache vs. page cache vs. first-use
-fills — before anything is built, per the backlog row. Not yet met: no
-window has isolated the three candidates from each other; that isolation is
-this campaign's first deliverable, not a precondition already on record.
+fills — before anything is built, per the backlog row. Met 2026-09-05
+(first window, DESIGN §7.0.2aq): the three were isolated, and the owner
+of the tier-ON load turned out to be a fourth candidate outside the
+list — the admission path's own load-time prefills, run at tier speed —
+with the page cache owning the first-request cost.
 
 ## Scope — in / out
 
@@ -182,3 +184,53 @@ for a faster cold start.
   this instance cannot be the JIT term. Page cache, first-use fills, or
   neither: one sample, no counter read, a reading for steps 3 and 4 of
   the ladder above to confirm or refute, not a finding.
+- 2026-09-05, afternoon — recon and design note
+  (`docs/design-static-partition-cold-start.md`). Ladder step 1 answered
+  without a card: the compute runtime's on-disk program cache is on by
+  default in the dev container, populated (5,019 files, 517 MB against a
+  1 GiB cap) and writing (it grew when plugin unit tests ran today); the
+  production units carry no environment that changes it. Read on the
+  patched tree: `bind()` reserves the pinned slots and does not fill
+  them — the fill is on first acquisition, so the first request pays the
+  resident set's uploads; host-tier experts are read through the plugin's
+  mmap of the 18.6 GB weight file per token; the host's ARC is at its
+  40 GiB cap with two production models beside any test process, and
+  `arcstats` counts the disk reads `fincore` cannot see. The engine's
+  `warmup()` is one token on lane 0. Window driver written (operator-
+  local): P0 sizing, P1 as found, a timed file read, P2 file warm, P3
+  file warm with an empty runtime cache directory, P4 with a 256-token
+  pre-warm request; ARC counters, load times, both requests' rates,
+  `[OTD_PERF]` and output hashes per process. Not run yet: the `+p5`
+  package build is loading the host; the window follows it.
+- 2026-09-05, the first window (DESIGN §7.0.2aq; two void attempts of
+  the driver before it, recorded there). Owners separated: kernel JIT is
+  7 s of load and nothing on requests (P3 − P2; 57 programs compiled
+  into an empty runtime cache); first-use fills are a residual of a few
+  percent to a third on the first request, removed by one 222-token
+  pre-warm request (P4); the disk is the term of the recorded size —
+  270 s of cumulative reads inside the plugin, load 264 s and a first
+  prefill 4× slower for the one process that found the artifact out of
+  the 40 GiB ARC (three models overrun it), tier OFF as much as ON — and
+  the tier-ON load with every cache warm is a constant 169–178 s of
+  which the compile is 5.5 s: the rest is the admission path's
+  load-time prefills (plateau probe up to 8 × 128 tokens, a 128-token
+  logits check, the activation-fit ladder 128…2,048 = 3,968 tokens)
+  running at the tier's 25 t/s. Discriminator: the probe bypassed, D2
+  loaded in 145 s against P2's 169 (the probe's share, 24 s; the fit
+  ladder still ran — the chunk-cap variable accepts only `off`); D1, the
+  same environment one process earlier, hit the disk again (180 s of
+  reads in the plugin, load 259 s, first request 10.2 / 8.0 t/s) because
+  the artifact had left the ARC between the windows — a second sample of
+  the disk term, and a warning that a test sequence on this host
+  self-evicts its own artifact. All eight
+  outputs and the earlier windows' tier-ON output share one hash. The
+  cliff of §7.0.2ai's size did not reproduce with the artifact cached.
+  Entry criterion (owner named) met: the load-time probe forwards, plus
+  the file cache. Lever chosen, not built yet: persist the fit ledger per
+  (artifact, device, flags, runtime) so the probes are skipped when the
+  ledger vouches — the operator's "save the heuristics", at the admission
+  level; a pre-warm request at start for the first-request residual; the
+  disk term is the host's memory. Not run: ladder step 2's second half
+  (the plugin's own kernel persistence, `cache_dir`) — moot, since the
+  JIT term is 7 s. Next: the ledger's red case and the tier cell's cold
+  metric.

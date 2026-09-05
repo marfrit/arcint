@@ -5317,6 +5317,140 @@ test (one token, batched-GEMV path, untouched by 0019) passes on the
 its first run's scratch read all zeros — pre-existing by path, not shown
 so by a measurement on the unpatched tree.
 
+#### 7.0.2aq The cold start's three owners, separated: the tier-ON load is the load-time probe forwards at tier speed, the first-request cliff is the disk, and kernel JIT is seven seconds (2026-09-05)
+
+The `static-partition-cold-start` campaign's first window
+(`docs/campaigns/static-partition-cold-start.md`, design note
+`docs/design-static-partition-cold-start.md`), 16 GiB card, 35B int4,
+ratio 50, 8 GiB device pool, u8 KV, one lane, n_ctx 65,536, prefix cache
+off, chunk 2,048, the `+p4` runtime, the 1,167-token reference prompt, 64
+greedy tokens, two requests per process, the plugin's counters on; the
+dense agent's production unit serving on the other card throughout; the
+host's ARC at its 40 GiB cap. Two earlier attempts of the same driver are
+void — the first captured its server-starting function through a
+command substitution and, read from the driver's logic rather than
+measured, left each step's server running under the next; the second
+failed its own prompt sizing — and both churned the host's file cache,
+so this window's "as found" state is theirs, not the morning's.
+
+**Step 1, answered without a card.** The compute runtime's on-disk
+program cache is on by default in the container (5,019 files, 517 MB
+against a 1 GiB cap) and grew when the plugin unit tests ran; the units
+set no environment that changes it.
+
+**The ladder.** Wall time from spawn to health 200; rates as the server
+prints them; ARC misses from the host's kstat before and after each
+process; the plugin's counters from the last `[OTD_PERF]` line.
+
+| process | state | to health | request 1 prefill / decode t/s | request 2 | disk I/O in the plugin | ARC misses |
+|---|---|---|---|---|---|---|
+| P0 sizing, tier OFF | file cache cold after the churn (ARC 24 GB) | 264 s | 19.3 / — (957 tok), then 79.0 (1,167 tok) | — | 270 s cumulative, 278,775 tensor loads, 969 µs avg | +99,676 |
+| P1 tier ON | file cached by P0 | 178 s | 23.2 / 12.4 | 26.2 / 16.6 | 5.0 s, 43,155 loads | +609 |
+| R: `dd` of the 18.6 GB weight file | — | 16.2 s, 1.15 GB/s | — | — | — | +2,447 |
+| P2 tier ON | file warm, runtime cache intact | 169 s | 25.5 / 15.6 | 26.3 / 16.3 | 2.3 s | +187 |
+| P3 tier ON | file warm, runtime cache pointed at an empty directory | 176 s | 25.1 / 14.9 | 26.3 / 16.5 | 2.4 s | +297 |
+| P4 tier ON | file warm, cache intact, a 222-token pre-warm request first (13.6 s) | 169 s | 26.0 / 16.5 | 26.3 / 16.4 | 2.4 s | +17 |
+
+Every one of the eight outputs is the same 298 bytes
+(`5d8e98890376923d`), the hash §7.0.2al's diagnostic rerun recorded for
+all four of its tier-ON outputs (its "character 194 of 349" was the
+ON-against-OFF comparison, 349 the longer of those two texts): the
+static partition's history independence held across every cache state
+here, and the §7.0.2ak divergence did not reappear.
+`created_onednn_kernels` read 4,687 in each ladder process that ran the
+full admission path with the tier on (4,734 with the tier off, 4,836 in
+P4 with its pre-warm's extra shape, 4,346 with the plateau probe
+bypassed) — not §7.0.2ai's 325, which was a different
+counter read or a different tree; the figure is per process and
+independent of the runtime cache, as oneDNN's in-process primitive
+creation is by design. P3's empty runtime cache directory received 57
+programs, 5.9 MB.
+
+**What the deltas say.**
+
+- *Kernel JIT (P3 − P2): 7 s of load, nothing on the requests.* The
+  runtime cache is hit in every ordinary process and missing it costs
+  seven seconds. Not the owner.
+- *First-use fills (request 2 − request 1): 12.4 → 16.6 t/s decode in P1
+  (file freshly cached), 15.6 → 16.3 in P2 (file warm), 16.5 → 16.4 in
+  P4 after the pre-warm.* A residual of a few percent to a third,
+  removed entirely by one 222-token request; not the recorded cliff.
+- *The disk (P0): 270 s of cumulative read time inside the plugin, load
+  264 s, the first prefill four times slower than the next.* The one term
+  of the size the record described, and it belongs to the file cache: a
+  40 GiB ARC serving two production models of 12 and 14 GB beside an
+  18.6 GB test artifact cannot keep all three, and P0 read the artifact
+  back from disk after the churn. Tier OFF pays it as much as tier ON;
+  P1, one process later, read 5 s.
+- *The tier-ON load is 169 s with every cache warm (P2, P4), 176 s with
+  an empty runtime cache (P3) and 178 s with the file just cached (P1)*,
+  and the compile inside it is 5.5 s (`paged model ready in 5.5 s`). What
+  fills the rest is in the log's order: the expert-slot plateau probe (up
+  to eight 128-token prefills of distinct tokens, until the device figure
+  plateaus twice — it ran under the static partition too, `source:
+  probe-static`, and settled at 0.11 GiB, which the next line calls
+  "under 5 % of the host-side estimate") and the activation-fit ladder
+  (128, 256, 512, 1,024, 2,048 tokens: 3,968 tokens; the logits-slice
+  check inspects the ladder's own 128-token floor forward, not a further
+  one). As an order-of-magnitude reading only: some 5,000 prefill tokens
+  at the tier's served 25 t/s would be 200 s, more than the 163 s the
+  warm load leaves after its compile, so the per-forward rates at 128 to
+  2,048 tokens are higher than the served rate (D2's 24 s for the probe
+  fits about five 128-token chunks, not eight). The direction is the
+  point: the admission measurements are prefills, and tier-ON prefill
+  runs at a third of tier OFF's (the `static-partition-prefill`
+  campaign's own number), which is why the same path is the record's
+  30–45 s with the tier off. The probe's share is measured by the discriminator below;
+  the ladder's is the remainder after the compile, by the log's order.
+
+**The discriminator**, two more tier-ON processes four minutes after
+the ladder, the plateau probe bypassed in both by forcing its figure
+(`ARCINT_FIT_SLOT_BYTES` at the probe's own 0.11 GiB; the log says
+"Phase B probe and analytic walk skipped"). D1 reached health in 259 s
+and served its first request at 10.2 / 8.0 t/s — slower than any ladder
+process — and its counters say why: 180 s of cumulative disk reads
+inside the plugin at 4.5 ms per load, where P2 had read 2.3 s at 54 µs.
+The artifact had left the file cache again between the windows: the
+ARC stood at 33.9 GB at the ladder's end and at 14.5 GB when read by
+hand from the host's kstat after this pair (the discriminator's driver
+sampled no ARC), the production unit serving on the other card in
+between; the plugin's counter is the measurement, the shrinkage its
+reading. So
+D1 is not the probe bypass, it is a second sample of the disk term: a
+load of 259 s and a first request at 0.4 of the warm rate, from reads
+alone. D2, the same environment one process later with the artifact
+re-cached by D1 (2.1 s of reads), reached health in 145 s and served
+24.4 / 15.6: against P2's 169 s that is the plateau probe's share, 24 s.
+`ARCINT_PREFILL_CHUNK_CAP` accepts only `off` (the belt switch), so D2's
+"128" did nothing and the activation-fit ladder ran to 2,048 in both;
+145 s less the 5.3 s compile is the ladder plus the logits check, about
+140 s, by subtraction — not a per-forward timing, which the load path
+does not log. Both outputs the same 298 bytes as every other.
+
+**The owner, named.** Of the morning's 215–585 s tier-ON loads, ~170 s
+is the load-time probe forwards running at tier prefill speed — a
+constant, not a warming, and saveable: the figures those forwards
+measure (the slot figure, the activation line) are functions of the
+artifact, the device, the flags and the runtime, not of the process. The
+rest is the disk term of a file cache that three models overrun, and it
+slows the first request too — D1's 0.4 of the warm rate, from reads
+alone; §7.0.2ai's 0.1–4.2 t/s decode did not reproduce in this window,
+artifact cached or not. The disk term does not exist when the artifact
+is cached and is the same with the tier off. The operator's
+hypothesis — "save the heuristics and the cold start goes away" — is
+right at the admission level: cache the fit ledger per (artifact, device,
+flags, runtime) and the tier-ON load falls to the compile plus whatever
+the ledger cannot vouch for. Kernel JIT is not worth a lever.
+
+**Not closed here.** The lever is not built: a persisted fit ledger
+changes the admission path (DESIGN §7.0.2a's terms, the refusal logic)
+and needs its own red case (a ledger written by one process, read by the
+next, refused when the artifact hash, device, flags or runtime differ).
+The gate's cold metric in the tier cell is not emitted yet. Both are the
+campaign's next step; the disk term is the host's memory and stays an
+operational fact (or a pre-read of the artifact at service start, kept
+out of the gate's timing).
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,
