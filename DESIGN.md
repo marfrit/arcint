@@ -5742,6 +5742,80 @@ campaign keeps the belt and the charge for every plugin below `+p6` and
 for the pairings 0020 does not admit, and its own gate (the fault
 reproduced one variable at a time on the generic path) is unchanged.
 
+#### 7.0.2au The depth ladder on `+p6`: green on both cards at both precisions; the measured chunk cap is now the whole of the u8:i4 prefill price (2026-09-05)
+
+The debt §7.0.2at named: `depth-ladder` (tests/acceptance/cells.json, the
+fault campaign's own regression test) against the `+p6` package's
+runtime, both cards, both KV precisions, the engine at `d4dc137` (the
+fit's microkernel arm, §7.0.2at) — so against the `+p4` references, which
+were filled with the engine at `82cce71`, both the plugin level and the
+engine moved. The package's libraries on the process's
+library path for the window, nothing installed; both production units
+stopped for it and restored after, health 200 on both. Coder int4, one
+lane, no offload, prefix cache off, the cell's own sizing (98,187-token
+prompt, n_ctx 100,653, one fresh process per cell, one request of 32
+tokens; the first cell's process also carries the sizing rounds — its two
+prefills read 1,024.3 then 1,025.6 t/s, 0.13 %, so the warm/cold
+asymmetry against the other three cells is measured and negligible). The
+chunk each cell ran is **by the code**, not by the log: the runner passes
+no `--prefill-chunk`, so u8 runs the default 2,048 (`config.h`) and 4-bit
+values the measured cap 128 (`kMaxMeasuredPackedValuesChunk`); the
+load-time line that names the cap was written into each cell's server
+log, which the runner deletes with its work directory — a runner defect,
+fixed in the same commit (the cell now prints the load banner) and not
+verified on a card until the next ladder. Lane count, offload and prefix
+cache are the engine's defaults (one, none, off), by the same reading.
+977 s wall for the four cells, from the window's driver, not the cell
+log (840 s of it is the cells' own prefill and decode time).
+
+| card | precision | prefill t/s | decode t/s | reference (`+p4`, §7.0.2al) |
+|---|---|---|---|---|
+| 24 GB | u8 | 1,025.6 | 45.7 | 1,025.5 / 20.8 |
+| 24 GB | u8:i4 | **450.3** | 45.4 | 120.9 / 45.9 |
+| 16 GiB | u8 | 620.9 | 29.3 | 621.0 / 29.2 |
+| 16 GiB | u8:i4 | **365.3** | 26.4 | 170.3 / 26.1 |
+
+Every cell served and no fault or out-of-resources line in any log; the
+cell passes, its references are report-only and stay the `+p4` fill (the
+release picks its level, and the references follow it then). u8 prefill
+is unchanged within 0.1 t/s on both cards, as it must be: 0020 and the
+fit arm touch only the u8:i4 path. u8 decode on the 24 GB card is not:
+the `+p4` reference's 20.8 t/s against 45.7 here. The reference itself
+recorded that sample as emit-dominated over its 32 tokens; this window's
+decode line is graph-dominated (0.69 s graph, 0.00 s emit of 0.70 s), and
+the u8:i4 cell on the same card read 45.9 then and 45.4 now. One sample
+each, recorded, not explained.
+
+**What the u8:i4 rows say.** 3.7× and 2.1× over the `+p4` references
+at the same depth on the same cards — and still 2.3× and 1.7× under
+u8. §7.0.2as measured parity *at a held chunk* (128 against 128); here
+u8 runs the default 2,048 while u8:i4 is capped at 128 by
+`kMaxMeasuredPackedValuesChunk`, the largest chunk any 4-bit-values
+prefill was ever measured to pass, set when the generic path's buffers
+were the fault. On the microkernel path those buffers are not allocated
+(§7.0.2at), so the reading that fits is that what remains of the u8:i4
+prefill price on `+p6` is the cap itself: sixteen chunks for every one u8
+runs (768 against 48 at this depth), a chunk-count price rather than a
+kernel price. The arithmetic on the record makes it plausible without
+proving it: §7.0.2as measured u8 *at chunk 128* at 397.5 t/s against
+u8:i4's 401.0 at 71.7k on this card, and this window's u8:i4 at 98k reads
+365.3 — u8 held at 128 would land near it. That is consistent-with, not
+measured; raising the cap is the measurement, not a decision: a
+chunk ladder (256, 512, 1,024, 2,048) at u8:i4 on the microkernel path
+with the VRAM sampler running, on the 16 GiB card first, at the fault
+campaign's own depths. Until it is measured the cap stands; the fault
+campaign carries the ladder as its next window.
+
+**What this changes on the record.** The `+p6` runtime and the fit's
+microkernel arm pass the release-gate cell that the fault campaign owns,
+on both cards; the deployment decision for `+p6` has its acceptance
+evidence. `docs/model_requirements.md` §3's owed depth ladder is paid.
+§7.0.2as's "parity with u8" and §7.0.2at's "on `+p6` the format's prefill
+is u8's" hold **at a held chunk of 128**, which is how they were measured;
+in the default configuration the format still costs 2.3× and 1.7× of u8's
+prefill time at 98k on the 24 GB and 16 GiB cards, and the cap is the
+reading for why — narrowed here rather than left standing unqualified.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

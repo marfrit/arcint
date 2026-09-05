@@ -130,6 +130,15 @@ lines() {  # lines <log>
   grep -a -E "slot [0-9]+: (prefill|decode) " "$1" | tail -4 | sed 's/^/       /'
 }
 
+banner() {  # banner <log> -- the load lines a record needs and the per-cell log
+  # does not survive to show (this runner's WORK dir is removed on exit): the
+  # served n_ctx and chunk, the reservation line, and the 4-bit-values fit
+  # decision (DESIGN §7.0.2au review: the first +p6 ladder's record could
+  # only say "chunk 128 by the code" because these lines were discarded).
+  grep -a -E "n_ctx [0-9]+ \| device|reservation: |4-bit values: (plugin patch|scratch term|prefill scratch charged)" "$1" \
+    | sed 's/^/       /'
+}
+
 metric_value() {  # metric_value <log> <prefill|decode> last
   # Unlike tier_reference.sh's own metric_value, this cell has no separate
   # sizing server: size_prompt.py's own calibration pings (max_tokens=1, one
@@ -215,6 +224,7 @@ run_cell() {  # run_cell <tag> <device>
     pass "$tag: no GPU-fault / out-of-resources line in the log"
   fi
 
+  banner "$log"
   lines "$log"
 
   # Names carry card and precision (docs/design-0.3.1-test-ladder.md §8.7:

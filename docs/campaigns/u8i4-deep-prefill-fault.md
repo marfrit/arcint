@@ -161,3 +161,18 @@ stays green on both cards at both KV precisions throughout.
   generic path is still a reading, and the belt and charge stay there.
   Owed to this campaign: `depth-ladder` on both cards at both precisions
   against the `+p6` package.
+- 2026-09-05 — the owed `depth-ladder` against `+p6`, both cards, both
+  precisions, the engine at `d4dc137` (DESIGN §7.0.2au): green, no fault
+  line, 977 s wall by the driver. u8 prefill unchanged within 0.1 t/s
+  (1,025.6 / 620.9 t/s on the 24 GB / 16 GiB card; one u8 decode
+  reference, 20.8 t/s on the 24 GB card, did not reproduce — 45.7,
+  recorded); u8:i4 prefill 450.3 / 365.3 t/s against the `+p4`
+  references' 120.9 / 170.3 (plugin and engine both moved) — and still
+  under u8, consistent with u8 running the default 2,048-token chunk while
+  the belt's measured cap holds u8:i4 at 128 (by the code; the runner now
+  prints the load banner so the next run shows it). Next window for this
+  campaign: a chunk ladder
+  (256, 512, 1,024, 2,048) at u8:i4 on `+p6` with the VRAM sampler, 16 GiB
+  card first, at this campaign's own depths — the measurement that can
+  raise `kMaxMeasuredPackedValuesChunk`. The gate on the generic path is
+  unchanged.

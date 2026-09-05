@@ -93,6 +93,16 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   The detection is the plugin's own build stamp (`marfrit-p<N>`), read
   from the GPU plugin, not the core library. Every other pairing and
   every older plugin keep the belt and the charge.
+  The depth ladder then ran against `+p6` on both cards at both
+  precisions (DESIGN §7.0.2au): green, u8 prefill unchanged within
+  0.1 t/s (one u8 decode reference on the 24 GB card, 20.8 t/s, did not
+  reproduce: 45.7, recorded), u8:i4 prefill at 98k tokens 450 / 365 t/s
+  on the 24 GB / 16 GiB card against 121 / 170 at `+p4` with the engine of
+  that fill — still under u8's 1,026 / 621, consistent with the belt's
+  measured chunk cap holding 4-bit values at 128 where u8 runs 2,048;
+  the chunk ladder that would raise the cap is the fault campaign's next
+  measurement. The ladder cell now prints each server's load banner, so
+  the served chunk is on the record next time.
 - Known, open, on the record: one follow-up window had two tier-ON
   processes disagree on the same prompt (§7.0.2ak); a diagnostic rerun did
   not reproduce it (§7.0.2al); the runner now prints every output's hash.

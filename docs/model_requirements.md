@@ -89,7 +89,8 @@ by the same term). `--paged-attention-max-partitions` (plugin patch
 term past a fixed depth. The prefill price itself is measured and removed
 (DESIGN §7.0.2ar/§7.0.2as): at a held chunk the generic kernel cost
 +55 %/+90 % at 37.7k/71.7k tokens; with patch **0020** (`+p6`) the mixed
-stage runs on micro-SDPA at parity with u8, values still four-bit in VRAM.
+stage runs on micro-SDPA at parity with u8 at that same held chunk (128),
+values still four-bit in VRAM.
 On that path the scratch buffer is not allocated (measured with the VRAM
 sampler, §7.0.2at: ≤ 9 MiB consumed by a 71.7k prefill against 573 MiB on
 the generic kernel), and the fit charges nothing for it when the GPU
@@ -97,8 +98,13 @@ plugin's build number names patch level 6 or later and the pairing is
 eight-bit keys with four-bit values: **auto-fit at u8:i4 then lands at
 171,392 on the 16 GiB card**, and a 118,454-token prefill at chunk 128 ran
 on that pool without a fault. The chunk cap (128, the largest measured)
-stays. Still owed: cold/warm prefix-cache byte-exactness at u8:i4, and the
-depth ladder on both cards against the `+p6` package.
+stays, and on `+p6` it accounts, by the record's arithmetic, for the
+remaining u8:i4 prefill price: the depth ladder against `+p6` (§7.0.2au)
+reads 450 / 365 t/s at 98k tokens on the 24 GB / 16 GiB card at u8:i4
+against u8's 1,026 / 621, u8:i4 capped at chunk 128 where u8 runs the
+default 2,048. Whether raising the cap closes it is the chunk ladder
+still to be measured. Still owed: cold/warm prefix-cache byte-exactness
+at u8:i4.
 
 ## 4. Drafters
 
