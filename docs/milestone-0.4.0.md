@@ -112,3 +112,37 @@ are served natively (route 3 = the kernel campaign). Not a single session.
 ## Status
 
 - 2026-09-05 — recorded; nothing started. Independent of 0.5.0.
+- 2026-09-06 — discussion closed, decisions recorded (operator, 2026-09-05/06):
+  the allowlist keeps its families; the point is comparing quantisations
+  of the same model, so the K-quant tensors are served **natively** (a
+  new block format with in-kernel dequant, the route the sub4bit-vram-
+  kernel campaign owns), not re-quantised; the engine opens the file **in
+  process**; the served IR's chat template governs a GGUF-opened model for
+  now (the file's own differs — Unsloth's merges leading system messages
+  and drops the no-user-query exception); the order is the dense 27B at
+  Q4_K_M, then the pruned coder's MoE file, then the sub-4-bit set. The
+  gate stays as written above. Reference files exist for every stage in
+  the operator's store, all `qwen35`/`qwen35moe`, each carrying its MTP
+  layer as block 64/40. **Tokenizer measured identical** between the
+  dense Q4_K_M file and the served IR: tokens equal over the IR's 248,077
+  entries (the file pads to 248,320), merges equal (247,587), the
+  pre-tokenizer is the same regex (llama.cpp's `qwen35` type quotes it
+  from `tokenizer.json`), eos 248046 in both; only the pad id differs.
+  One Q4_K_M file is four block types (Q4_K, Q5_K, Q6_K, Q8_0), so the
+  first kernel set is four decoders in the fully-connected path plus the
+  embedding gather; the MoE fusion is the second; IQ4_XS/IQ3_S/Q3_K the
+  third. Next artifact: `docs/design-gguf-native.md` from two recon
+  passes (the converter's tensor map and block layouts; the plugin's
+  compressed-weight kernels and what they accept).
+- 2026-09-06 — recon done and the design note written:
+  `docs/design-gguf-native.md` (template IR read with mapped weights, the
+  GGUF's bytes replacing each decompression subgraph as tagged u8
+  constants; a plugin op `FullyConnectedKQuant` with K-quant unpack in
+  the fully-connected kernel, an embedding gather and the expert fusion;
+  exactness in three layers; four stages with gates). Findings that
+  shaped it: the converter's V-head reorder and `−exp(A_log)` / `+1`
+  norm transforms must be undone at open; the plugin's compressed-weight
+  path accepts only integer zero points and a flat group size, its
+  expert fusion matches twelve u4 constants and nothing else, and no
+  patch in the series touches the weight format. Open points are §6 of
+  the note.
