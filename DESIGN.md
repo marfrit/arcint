@@ -5816,6 +5816,101 @@ in the default configuration the format still costs 2.3× and 1.7× of u8's
 prefill time at 98k on the 24 GB and 16 GiB cards, and the cap is the
 reading for why — narrowed here rather than left standing unqualified.
 
+#### 7.0.2av The chunk ladder at u8:i4 on `+p6`: every rung to 2,048 serves 118k tokens without a fault on both cards; the microkernel path gets its own measured cap, and the package floor moves to `+p6` (2026-09-05)
+
+§7.0.2au's next window, run the same evening: is the belt's measured
+cap (128) — set when the generic kernel's buffers were the fault — still
+needed on the microkernel path, or is it now the whole of the u8:i4
+prefill price in the default configuration? The measurement that answers
+it is a chunk ladder with the cap switched off.
+
+**The ladder.** Coder int4, `--paged-kv u8:i4`, `+p6` runtime (plugin
+stamped `p6`), engine at `d4dc137` + the ladder cell's banner change,
+auto-fit, prefix cache off, `ARCINT_PREFILL_CHUNK_CAP=off` with an
+explicit `--prefill-chunk`, one fresh process per rung, the 118,454-token
+prompt of §7.0.2at (§7.0.2ab's fault depth class), one request of 16
+tokens, the host's VRAM counter sampled every 2 s. 16 GiB card first,
+every rung; then the 24 GB card at the two largest.
+
+| card | chunk | served n_ctx (auto-fit) | prefill t/s | free VRAM during the prefill | fault |
+|---|---|---|---|---|---|
+| 16 GiB | 128 | 171,392 | 342.2 | 973 MiB, flat | none |
+| 16 GiB | 256 | 167,760 | 432.4 | 968–973, flat | none |
+| 16 GiB | 512 | 161,280 | 513.3 | 968–975, flat | none |
+| 16 GiB | 1,024 | 148,176 | 562.7 | 968 floor, flat | none |
+| 16 GiB | 2,048 | 124,896 | 592.4 | 962–970, flat | none |
+| 24 GB | 2,048 | 262,144 | 780.0 | 10,094 → 7,832, then held | none |
+| 24 GB | 1,024 | 262,144 | 723.3 | 8,089–8,103, flat | none |
+
+Every rung served; no fault, out-of-resources, reset or timeout line in
+any log. The served depth shrinks with the chunk on the 16 GiB card
+because the activation term grows with it (0.02 GiB at 128, 0.40 at
+2,048: the fit re-probed upward when its search asked for the bigger
+chunk, and Phase E trimmed one pass on every 16 GiB rung — at 2,048
+"overshoot 14.88 against a 14.86 GiB ceiling, correcting"); on the 24 GB
+card every rung admits
+the artifact's train maximum. Chunk 128's rate reproduces §7.0.2at's
+(342.2 against 341.5). The 16-token outputs differ between chunks (128,
+512 and the 256/1,024/2,048 group each hash differently) — chunk
+boundaries move where the graph slices, the property the belt's own
+comment states; equivalence is within a chunk, never across one.
+
+Recorded, not explained: on every one of the seven rungs, on both
+cards, the counter's free VRAM drops by 2.1–2.6 GiB within ±2 s of the
+health mark (the 16 GiB rungs from ≈3,070 to ≈970 MiB, the 24 GB rungs
+from ≈10,100–10,460 to ≈7,830–8,090) and is flat from then on through
+the whole prefill; with a 2 s sampler the drop lands one sample before
+or after the mark, which is why an earlier draft of this paragraph read
+it as two behaviours. The engine's own residency audit reported
+"deferred commit" for the 24 GB loads (the driver reporting 0.23–0.24 GiB
+less than requested). The drop does not scale with the served pool
+(1.07–1.47 GiB of KV on the 16 GiB rungs, 2.25 on the 24 GB ones), so it
+is not read here as the pool's commit or as anything else; it precedes
+the first chunk and is not what the belt exists for. The 24 GB card had
+7.8 GiB free at its floor, the 16 GiB card 962 MiB.
+
+**What changes.** The microkernel path gets its own cap,
+`kMaxMeasuredPackedValuesChunkMicro = 2048` (fit.h): the largest chunk
+measured on that path, the engine's default request, still a cap (nothing
+above it is measured). The generic path keeps 128 — its cap was measured
+against buffers that path still allocates. Every site the §7.0.2at arm
+touched (both fit primitives, the ceiling, the seed, the Phase-E belt
+site, the no-geometry branches, the load log) takes the path's cap. Red
+first: the arm tests asked for 2,048 and 1,024 on the microkernel path
+and failed on the 128 cap; 414 unit cases green after. The depth ladder
+then ran again at the new default (`+p6`, both cards, both precisions,
+the cell now printing each server's banner — its first run on a card):
+
+| card | precision | served chunk | prefill t/s | decode t/s | at the 128 cap (§7.0.2au) |
+|---|---|---|---|---|---|
+| 24 GB | u8 | 2,048 | 1,025.0 | 21.3 | 1,025.6 / 45.7 |
+| 24 GB | u8:i4 | 2,048 | **915.1** | 45.3 | 450.3 / 45.4 |
+| 16 GiB | u8 | 1,024 | 620.9 | 16.5 | 620.9 / 29.3 |
+| 16 GiB | u8:i4 | 2,048 | **665.0** | 26.4 | 365.3 / 26.4 |
+
+Green, no fault line in any of the four logs, 825 s wall by the driver.
+u8:i4 prefill at 98k is now 89 % of u8's on the 24 GB card and above it
+on the 16 GiB card — where the banner shows u8 served at chunk 1,024 by
+the fit's own activation ladder (its larger KV pool leaves less room at
+this n_ctx) while u8:i4 got 2,048; not investigated further here. The
+32-token decode figures move between runs on both cards at u8 (45.7 →
+21.3 and 29.3 → 16.5 against unchanged u8:i4 figures), which puts
+§7.0.2au's 20.8-against-45.7 remark in its place: that reference's
+"emit-dominated" sample is one of two states a 32-token decode on a
+fresh process lands in, and a decode reference at this cell's shape needs
+more than one sample before it can gate anything. u8 prefill is unchanged
+within 0.6 t/s across all three runs of the cell today.
+
+**The package floor.** On the operator's decision the same evening — "move
+the dependency to `+p6`; without it the mixed KV cache is possible but
+pointless" — the arcint package's dependency floor moves from `+p4` to
+`+p6` for 0.3.1 (`contrib/packaging/arcint/build-deb.sh`, the recipe's
+changelog): below it u8:i4 prefills at +55 % to +90 % of u8's time
+(§7.0.2ar) under a depth-scaled scratch charge (§7.0.2ab); at `+p6` it
+prefills on micro-SDPA (§7.0.2as), the charge is gone (§7.0.2at), the
+depth ladder is green on both cards (§7.0.2au) and the chunk cap is the
+default's (this record). The `+p6` package is built and not yet deployed.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

@@ -176,3 +176,17 @@ stays green on both cards at both KV precisions throughout.
   card first, at this campaign's own depths — the measurement that can
   raise `kMaxMeasuredPackedValuesChunk`. The gate on the generic path is
   unchanged.
+- 2026-09-05 — the chunk ladder (DESIGN §7.0.2av): on `+p6` at u8:i4
+  with the cap switched off, every rung 128 → 2,048 prefilled 118,454
+  tokens on the 16 GiB card without a fault, free VRAM flat at the idle
+  level (342 → 592 t/s); the 24 GB card at 2,048 and 1,024 likewise (780
+  / 723 t/s). On every rung of both cards the VRAM counter drops by
+  2.1–2.6 GiB at the health mark, before the first chunk, and is flat
+  through the prefill — recorded, unexplained, not the belt's concern. The
+  microkernel path now has its own measured cap, 2,048; the generic
+  path keeps 128 and this campaign's gate on it. The depth ladder at the
+  new default: green on both cards, u8:i4 prefill 915.1 / 665.0 t/s at
+  98k on the 24 GB / 16 GiB card (u8 1,025.0 / 620.9, the latter served
+  at chunk 1,024 by the fit's activation ladder). The package floor moves
+  to `+p6` (operator's decision). Still open here: the fault's owner on
+  the generic path; the load-end VRAM drop is noted, not owned.

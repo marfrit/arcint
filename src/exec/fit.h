@@ -855,14 +855,28 @@ constexpr int kMaxMeasuredPackedValuesChunk = 128;
 // applies this after its budget ladder; the microkernel arm below
 // (patch 0020, `packed_values_mixed_stage_on_micro`) applies it ALONE,
 // because there the budget ladder would halve the chunk for a buffer the
-// plugin no longer allocates, while the cap still stands for what it is:
-// the largest chunk any 4-bit-values prefill has been measured to pass on
-// any plugin, microkernel path included (DESIGN §7.0.2as measured chunk
-// 128 there, nothing larger).
-inline int packed_values_measured_chunk_cap(int requested_chunk, int block_size) {
-    if (requested_chunk <= 0 || block_size <= 0) return requested_chunk;
-    if (requested_chunk <= kMaxMeasuredPackedValuesChunk) return requested_chunk;
-    int capped = (kMaxMeasuredPackedValuesChunk / block_size) * block_size;
+// plugin no longer allocates, while a cap still stands for what it is:
+// the largest chunk a 4-bit-values prefill has been measured to pass on
+// that path -- 128 on the generic path (the default `cap`), 2,048 on the
+// microkernel path (`kMaxMeasuredPackedValuesChunkMicro`, below).
+//
+// The microkernel path has its own measured cap (DESIGN §7.0.2av, the
+// chunk ladder on `+p6`): on the 16 GiB card, coder, u8:i4, auto-fit,
+// `ARCINT_PREFILL_CHUNK_CAP=off`, one process per rung, a 118,454-token
+// prefill at 128, 256, 512, 1,024 and 2,048 served without a fault line,
+// free VRAM flat at the idle level on every rung (342 -> 592 t/s); the
+// 24 GB card at 2,048 and 1,024 likewise. 2,048 is the engine's default
+// request and the largest chunk measured; nothing above it has been, so
+// it is still a cap, not a removal. The generic path's 128 is untouched
+// -- that cap was measured against the generic kernel's own buffers,
+// which are the fault the belt exists for.
+constexpr int kMaxMeasuredPackedValuesChunkMicro = 2048;
+
+inline int packed_values_measured_chunk_cap(int requested_chunk, int block_size,
+                                             int cap = kMaxMeasuredPackedValuesChunk) {
+    if (requested_chunk <= 0 || block_size <= 0 || cap <= 0) return requested_chunk;
+    if (requested_chunk <= cap) return requested_chunk;
+    int capped = (cap / block_size) * block_size;
     if (capped < block_size) capped = block_size;
     return capped;
 }
@@ -1526,12 +1540,14 @@ inline PackedValuesFitTerm fit_context_packed_values(const FitTerms& base, int r
     // mixed stage runs on micro-SDPA, which allocates none of the buffers
     // this term prices, so the fit is the term-free fit exactly -- and
     // the belt's budget ladder must not run either, or it halves the
-    // chunk for a buffer that does not exist. The measured cap alone
-    // stands (nothing larger than 128 has been measured on this path).
-    // Nothing to iterate: the chunk no longer depends on the depth.
+    // chunk for a buffer that does not exist. The microkernel path's own
+    // measured cap alone stands (`kMaxMeasuredPackedValuesChunkMicro`,
+    // 2,048 since §7.0.2av's chunk ladder; 128 before it). Nothing to
+    // iterate: the chunk no longer depends on the depth.
     if (mixed_stage_on_micro) {
         r.fit   = fit_context(base);
-        r.chunk = packed_values_measured_chunk_cap(requested_chunk, block_size);
+        r.chunk = packed_values_measured_chunk_cap(requested_chunk, block_size,
+                                                   kMaxMeasuredPackedValuesChunkMicro);
         r.per_token_bytes = 0;
         r.fixed_bytes      = 0;
         r.iterations       = 1;
@@ -1761,10 +1777,12 @@ inline PackedValuesFitTerm fit_context_packed_values_at_depth(
         return r;
     }
     // Patch 0020 arm -- see fit_context_packed_values's own: no term, the
-    // measured cap alone, whatever the depth or the partition bound.
+    // microkernel path's measured cap alone, whatever the depth or the
+    // partition bound.
     if (mixed_stage_on_micro) {
         r.fit   = fit_context(base);
-        r.chunk = packed_values_measured_chunk_cap(requested_chunk, block_size);
+        r.chunk = packed_values_measured_chunk_cap(requested_chunk, block_size,
+                                                   kMaxMeasuredPackedValuesChunkMicro);
         r.fixed_bytes      = 0;
         r.per_token_bytes = 0;
         r.iterations       = 1;

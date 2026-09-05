@@ -426,11 +426,13 @@ memory
                             SEPARATE, hard ceiling
                             (kMaxMeasuredPackedValuesChunk, fit.h) applies
                             after the budget-based shrink, WHEN the belt is
-                            not disabled by the switch above: 128 tokens, the
-                            largest chunk this repository has a passing card
-                            measurement for -- an explicit --prefill-chunk
-                            above 128 under 4-bit paged VALUES is reduced at
-                            least to 128, even at a served depth shallow
+                            not disabled by the switch above: 128 tokens on
+                            the generic kernel's path, the largest chunk with
+                            a passing card measurement there (the microkernel
+                            path from +p6 has its own cap, 2048, §7.0.2av) --
+                            an explicit --prefill-chunk above the path's cap
+                            under 4-bit paged VALUES is reduced at least to
+                            it, even at a served depth shallow
                             enough that the budget check alone would leave a
                             bigger chunk unchanged (2048, the default, has
                             never been validated on any plugin for this
@@ -574,7 +576,9 @@ memory
                             buffers (VRAM sampler: <= 9 MiB consumed by a
                             71.7k prefill vs 573 MiB on +p4's generic
                             kernel), so the fit charges no scratch term
-                            and keeps only the measured chunk cap (128)
+                            and keeps only the path's measured chunk cap
+                            (2048 since the §7.0.2av chunk ladder; the
+                            generic path keeps 128)
                             when the GPU plugin's build number names
                             marfrit-p6 or later (fit.h
                             packed_values_mixed_stage_on_micro; the

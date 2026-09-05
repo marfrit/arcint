@@ -26,7 +26,11 @@ OV_PREFIX=/usr/lib/marfrit-openvino
 # The ABI is the nightly, not the patch level: floor the patch level, cap at
 # the next nightly. An exact pin (Depends: = +p1-1) made apt REMOVE arcint when
 # the runtime was upgraded to +p3 on 2026-09-04; never render "=" here again.
-OV_DEP_VERSION="2026.4.0~dev20260821+p4-1"
+OV_DEP_VERSION="2026.4.0~dev20260821+p6-1"
+# The +p6 floor is 0.3.1's (debian/changelog's UNRELEASED entry; DESIGN
+# §7.0.2av): building 0.3.0's tarball with it would re-issue the released
+# 0.3.0-1 version string under different Depends. Refused until the tag.
+[ "$PKGVER" != 0.3.0 ] || { echo "the +p6 floor is 0.3.1's; bump PKGVER and the tarball sha at the tag" >&2; exit 1; }
 OV_DEP_NEXT_NIGHTLY="2026.4.0~dev20260822"
 HERE=$(dirname "$(readlink -f "$0")")
 

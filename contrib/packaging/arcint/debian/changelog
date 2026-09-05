@@ -1,3 +1,17 @@
+arcint (0.3.1-1) UNRELEASED; urgency=medium
+
+  * Requires marfrit-openvino +p6 (patches 0003-0020). The floor moves from
+    +p4 on the operator's decision (2026-09-05): below +p6 the mixed
+    --paged-kv u8:i4 cache is possible but pointless -- its prefill costs
+    +55 % to +90 % of u8's time (DESIGN.md §7.0.2ar) and the fit charges a
+    depth-scaled scratch term for the generic kernel's buffers
+    (§7.0.2ab); at +p6 the mixed stage runs on micro-SDPA at parity
+    (§7.0.2as), the term is gone (§7.0.2at) and the depth ladder is green
+    on both cards (§7.0.2au). Same floor shape as before (>= +p6-1, << the
+    next nightly).
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 05 Sep 2026 22:00:00 +0200
+
 arcint (0.3.0-1) trixie; urgency=medium
 
   * 0.3.0: the campaign's milestones ship. M9's equivalence gates close on

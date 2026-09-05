@@ -2625,9 +2625,9 @@ private:
                 log::info("load",
                           "4-bit values: plugin patch level %d runs the %s mixed prefill stage on "
                           "micro-SDPA (patch 0020); the generic kernel's scratch term is not "
-                          "charged, the measured chunk cap (%d) stays",
+                          "charged, the path's measured chunk cap (%d) stays",
                           gpu_plugin_patch_level_, effective_paged_kv.c_str(),
-                          kMaxMeasuredPackedValuesChunk);
+                          kMaxMeasuredPackedValuesChunkMicro);
             } else {
                 log::info("load",
                           "4-bit values: plugin patch level %d (%s); the %s mixed prefill stage "
@@ -3235,7 +3235,8 @@ private:
             // ceiling is the measured cap alone (fit.h's own arm does the
             // same for the term below).
             chunk_ceiling = static_cast<size_t>(std::max(
-                packed_values_measured_chunk_cap(static_cast<int>(configured), cfg.kv_block_size),
+                packed_values_measured_chunk_cap(static_cast<int>(configured), cfg.kv_block_size,
+                                                 kMaxMeasuredPackedValuesChunkMicro),
                 1));
             log::info("load",
                       "4-bit values: served-chunk ceiling %zu (the measured cap; the mixed stage "
@@ -4131,9 +4132,10 @@ private:
                     // Patch 0020 arm (§7.0.2at review): the budget ladder
                     // never ran, so classifying against it would name
                     // "budget" for a chunk that was the measured cap and
-                    // nothing else (an explicit n_ctx between 64k and 128k
-                    // on `+p6` makes the ladder's own answer coincide with
-                    // 128).
+                    // nothing else (with the cap at 128 an explicit n_ctx
+                    // between 64k and 128k on `+p6` made the ladder's own
+                    // answer coincide with it; at 2,048 the ladder's answer
+                    // is a budget figure the arm never used).
                     limit = "measured cap";
                 } else {
                     const long long partitions_for_reason = packed_values_bounded_partitions(
@@ -4396,8 +4398,9 @@ private:
         // worse than not looping at all, since the extra probes bought
         // nothing served. Seeded from `packed_values_scratch_chunk_`
         // instead whenever a 4-bit-values load actually priced one --
-        // defensively re-clamped to `configured` and `kMaxMeasured
-        // PackedValuesChunk` (the search's own belt already enforces
+        // defensively re-clamped to `configured` and the path's measured
+        // cap (`kMaxMeasuredPackedValuesChunk`, or the microkernel path's
+        // own from §7.0.2av; the search's own belt already enforces
         // both; this is a second, explicit guard at the seam between the
         // climb and Phase E, not a new bound) -- so the belt call site's
         // own `min()` becomes the no-op it was designed to be, and only
@@ -4420,13 +4423,16 @@ private:
                 ? (cap_off ? static_cast<int>(packed_values_scratch_chunk_)
                            : static_cast<int>(std::min<size_t>(
                                  {static_cast<size_t>(packed_values_scratch_chunk_), configured,
-                                  static_cast<size_t>(kMaxMeasuredPackedValuesChunk)})))
+                                  static_cast<size_t>(packed_values_mixed_stage_on_micro_
+                                                          ? kMaxMeasuredPackedValuesChunkMicro
+                                                          : kMaxMeasuredPackedValuesChunk)})))
                 // Patch 0020 arm without geometry (§7.0.2at review): the
                 // term was never priced (no heads/head_dim to price it
                 // with), but the measured cap needs no geometry and holds
                 // on this path as on every other 4-bit-values load.
                 : (packed_values && packed_values_mixed_stage_on_micro_ && !cap_off)
-                      ? packed_values_measured_chunk_cap(static_cast<int>(chunk), cfg.kv_block_size)
+                      ? packed_values_measured_chunk_cap(static_cast<int>(chunk), cfg.kv_block_size,
+                                                         kMaxMeasuredPackedValuesChunkMicro)
                       : static_cast<int>(chunk);
         // The M9 4-bit-values prefill-chunk belt (exec/fit.h's
         // prefill_chunk_cap_for_packed_values) and the snapshot grid it
@@ -5276,7 +5282,8 @@ private:
                 // cap applies here too (the same choice the climb made).
                 const int capped =
                     packed_values_mixed_stage_on_micro_
-                        ? packed_values_measured_chunk_cap(belt_input, cfg.kv_block_size)
+                        ? packed_values_measured_chunk_cap(belt_input, cfg.kv_block_size,
+                                                           kMaxMeasuredPackedValuesChunkMicro)
                         : prefill_chunk_cap_for_packed_values_ex(
                               belt_input, belt_partitions, geometry->heads, geometry->head_size,
                               paged_attention_element_bytes,
@@ -5313,7 +5320,8 @@ private:
                 // the seed above already applied it; re-applied here for
                 // the same defensive reason the geometry branch keeps its
                 // own assignment.
-                prefill_chunk_ = packed_values_measured_chunk_cap(prefill_chunk_, cfg.kv_block_size);
+                prefill_chunk_ = packed_values_measured_chunk_cap(prefill_chunk_, cfg.kv_block_size,
+                                                                  kMaxMeasuredPackedValuesChunkMicro);
             } else {
                 log::warn("load", "%s",
                           "4-bit paged KV values requested, but this artifact's config.json "

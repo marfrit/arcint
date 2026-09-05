@@ -97,14 +97,15 @@ the generic kernel), and the fit charges nothing for it when the GPU
 plugin's build number names patch level 6 or later and the pairing is
 eight-bit keys with four-bit values: **auto-fit at u8:i4 then lands at
 171,392 on the 16 GiB card**, and a 118,454-token prefill at chunk 128 ran
-on that pool without a fault. The chunk cap (128, the largest measured)
-stays, and on `+p6` it accounts, by the record's arithmetic, for the
-remaining u8:i4 prefill price: the depth ladder against `+p6` (§7.0.2au)
-reads 450 / 365 t/s at 98k tokens on the 24 GB / 16 GiB card at u8:i4
-against u8's 1,026 / 621, u8:i4 capped at chunk 128 where u8 runs the
-default 2,048. Whether raising the cap closes it is the chunk ladder
-still to be measured. Still owed: cold/warm prefix-cache byte-exactness
-at u8:i4.
+on that pool without a fault. The chunk cap was then the remaining
+price: the first depth ladder against `+p6` (§7.0.2au) read 450 / 365
+t/s at 98k tokens on the 24 GB / 16 GiB card at u8:i4 against u8's 1,026
+/ 621, u8:i4 capped at chunk 128 where u8 ran the default 2,048. The
+chunk ladder (§7.0.2av) then served 118k tokens at every chunk from 128
+to 2,048 on the 16 GiB card and at 2,048 and 1,024 on the 24 GB card
+without a fault, so the microkernel path's cap is 2,048
+(the generic path's stays 128). Still owed: cold/warm prefix-cache
+byte-exactness at u8:i4.
 
 ## 4. Drafters
 
@@ -149,10 +150,12 @@ three-way answer, DESIGN §7.0.2ap; built 2026-09-05, not deployed);
 **`+p6` adds 0020** (u8:i4 prefill on micro-SDPA at parity with u8,
 DESIGN §7.0.2as; built 2026-09-05, not deployed) — the
 level to serve `--paged-kv u8:i4` at, since below it the format's prefill
-costs +55 % to +90 % of u8's time (§7.0.2ar). The arcint package depends
-on `+p4` as a floor within the pinned nightly; nothing arcint drives
-reaches 0019's branch, and 0020 changes the runtime's speed, not its
-contract.
+costs +55 % to +90 % of u8's time (§7.0.2ar). From 0.3.1 the arcint
+package depends on **`+p6` as a floor** within the pinned nightly
+(operator's decision, 2026-09-05: below it the mixed cache is possible
+but pointless); 0.3.0's floor was `+p4`. Nothing arcint drives reaches
+0019's branch, and 0020 changes the runtime's speed and the fit's
+scratch charge, not the served contract.
 At the 0.3.0 tag the dev host's production units still serve `+p3` —
 deployment is a separate decision (DESIGN §7.0.2ai). Compute-runtime
 **26.27** (past the fix window for USM-pool issue 916). Kernel driver:

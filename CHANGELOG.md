@@ -19,6 +19,14 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+Requires `marfrit-openvino 2026.4.0~dev20260821+p6` (patches 0003–0020)
+from 0.3.1 on — the floor moves from `+p4` on the operator's decision:
+below `+p6` the mixed `--paged-kv u8:i4` cache is possible but pointless
+(prefill at +55 % to +90 % of u8's time, a depth-scaled scratch charge);
+at `+p6` it prefills on micro-SDPA, the charge is gone and the depth
+ladder is green on both cards. The package recipe carries the new floor;
+the `+p6` package is built and not yet deployed.
+
 - **Unit and acceptance tests differentiated** (0.3.1's lead item,
   `docs/design-0.3.1-test-ladder.md`): bare `ctest` is the unit set by
   construction; `ARCINT_ACCEPTANCE` registers sixteen enumerated cells
@@ -66,8 +74,8 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   of the wrong provider type, dormant in every configuration arcint
   drives. Red first with a new plugin unit test, green with the patch on
   both cards. The `+p5` package is built and not deployed; arcint's
-  dependency floor stays at `+p4`, since nothing it drives reaches the
-  branch.
+  dependency floor stayed at `+p4` for this patch, since nothing it
+  drives reaches the branch (it moves to `+p6` below).
 - **Plugin patch 0020, recipe at `+p6`: the u8:i4 prefill price is gone**
   (`u8i4-prefill-price` closed, DESIGN §7.0.2ar–§7.0.2as). At a held
   chunk the format cost +55 % and +90 % of u8's prefill time at 37.7k
@@ -100,9 +108,16 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   on the 24 GB / 16 GiB card against 121 / 170 at `+p4` with the engine of
   that fill — still under u8's 1,026 / 621, consistent with the belt's
   measured chunk cap holding 4-bit values at 128 where u8 runs 2,048;
-  the chunk ladder that would raise the cap is the fault campaign's next
-  measurement. The ladder cell now prints each server's load banner, so
-  the served chunk is on the record next time.
+  the chunk ladder ran the same evening (DESIGN §7.0.2av): with the cap
+  off, every chunk from 128 to 2,048 prefilled 118k tokens at u8:i4 on
+  `+p6` without a fault on the 16 GiB card (342 → 592 t/s), and 2,048 /
+  1,024 on the 24 GB card (780 / 723 t/s). The microkernel path now has
+  its own measured cap of 2,048 — the engine's default chunk — so u8:i4
+  on `+p6` prefills at the same chunk as u8; the generic path keeps 128.
+  The depth ladder at the new default is green on both cards: u8:i4
+  prefill 915 / 665 t/s at 98k tokens on the 24 GB / 16 GiB card against
+  u8's 1,025 / 621. The ladder cell now prints each server's load banner,
+  so the served chunk is on the record.
 - Known, open, on the record: one follow-up window had two tier-ON
   processes disagree on the same prompt (§7.0.2ak); a diagnostic rerun did
   not reproduce it (§7.0.2al); the runner now prints every output's hash.

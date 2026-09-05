@@ -3012,6 +3012,11 @@ TEST(packed_values_mixed_stage_on_micro_is_the_pairing_0020_admits_from_p6) {
 }
 
 TEST(packed_values_measured_chunk_cap_is_the_ceiling_alone) {
+    // The microkernel path's own cap (§7.0.2av), passed explicitly.
+    CHECK_EQ(packed_values_measured_chunk_cap(4096, kCoderKvBlockSize,
+                                              kMaxMeasuredPackedValuesChunkMicro), 2048);
+    CHECK_EQ(packed_values_measured_chunk_cap(1024, kCoderKvBlockSize,
+                                              kMaxMeasuredPackedValuesChunkMicro), 1024);
     CHECK_EQ(packed_values_measured_chunk_cap(2048, kCoderKvBlockSize), 128);
     CHECK_EQ(packed_values_measured_chunk_cap(256, kCoderKvBlockSize), 128);
     CHECK_EQ(packed_values_measured_chunk_cap(128, kCoderKvBlockSize), 128);
@@ -3049,12 +3054,29 @@ TEST(fit_context_packed_values_on_micro_charges_nothing_and_keeps_the_measured_c
     CHECK(generic.fit.max_ctx < micro.fit.max_ctx);
     // A larger request is still capped -- unlike `belt_enabled=false`, the
     // measurement bypass, which pins the request.
+    // DESIGN §7.0.2av: the microkernel path has its own measured cap,
+    // 2,048 (every rung 128..2048 prefilled 118k tokens on the 16 GiB card
+    // without a fault, VRAM flat); the generic path's 128 is untouched.
     const PackedValuesFitTerm micro_2048 = fit_context_packed_values(
         base, /*requested_chunk=*/2048, kCoderHeads, kCoderHeadSize, kScratchBudget,
         kM9KvBlockTokens, /*belt_enabled=*/true, /*max_partitions=*/0, /*element_bytes=*/2,
         /*mixed_stage_on_micro=*/true);
-    CHECK_EQ(micro_2048.chunk, 128);
+    CHECK_EQ(micro_2048.chunk, kMaxMeasuredPackedValuesChunkMicro);
+    CHECK_EQ(micro_2048.chunk, 2048);
     CHECK_EQ(micro_2048.fit.max_ctx, plain.max_ctx);
+    const PackedValuesFitTerm micro_4096 = fit_context_packed_values(
+        base, /*requested_chunk=*/4096, kCoderHeads, kCoderHeadSize, kScratchBudget,
+        kM9KvBlockTokens, /*belt_enabled=*/true, /*max_partitions=*/0, /*element_bytes=*/2,
+        /*mixed_stage_on_micro=*/true);
+    CHECK_EQ(micro_4096.chunk, 2048);  // still a cap: nothing above 2,048 is measured
+    const PackedValuesFitTerm generic_2048 = fit_context_packed_values(
+        base, /*requested_chunk=*/2048, kCoderHeads, kCoderHeadSize, kScratchBudget,
+        kM9KvBlockTokens, /*belt_enabled=*/true, /*max_partitions=*/0, /*element_bytes=*/2);
+    CHECK_EQ(generic_2048.chunk, generic.chunk);  // the generic path keeps its own answer
+    CHECK_EQ(generic_2048.chunk,
+             prefill_chunk_cap_for_packed_values_ex(2048, (generic.fit.max_ctx + 255) / 256,
+                                                    kCoderHeads, kCoderHeadSize, 2,
+                                                    kScratchBudget, kM9KvBlockTokens));
     // The measurement switch still wins over the arm: no cap at all.
     const PackedValuesFitTerm micro_off = fit_context_packed_values(
         base, /*requested_chunk=*/2048, kCoderHeads, kCoderHeadSize, kScratchBudget,
@@ -3073,7 +3095,7 @@ TEST(fit_context_packed_values_at_depth_on_micro_charges_nothing_and_keeps_the_m
         base, /*requested_chunk=*/1024, kCoderHeads, kCoderHeadSize, kScratchBudget,
         kR8KvBlockTokens, kR8RequestedD, /*max_partitions=*/0, /*element_bytes=*/2,
         /*belt_enabled=*/true, /*mixed_stage_on_micro=*/true);
-    CHECK_EQ(micro.chunk, 128);
+    CHECK_EQ(micro.chunk, 1024);  // under the microkernel cap (2,048): the request stands
     CHECK_EQ(micro.fixed_bytes, 0ull);
     CHECK_EQ(micro.per_token_bytes, 0ull);
     CHECK_EQ(micro.fit.max_ctx, plain.max_ctx);
@@ -3087,7 +3109,7 @@ TEST(fit_context_packed_values_at_depth_on_micro_charges_nothing_and_keeps_the_m
         kR8KvBlockTokens, kR8RequestedD, /*max_partitions=*/32, /*element_bytes=*/2,
         /*belt_enabled=*/true, /*mixed_stage_on_micro=*/true);
     CHECK_EQ(micro_bounded.fixed_bytes, 0ull);
-    CHECK_EQ(micro_bounded.chunk, 128);
+    CHECK_EQ(micro_bounded.chunk, 1024);
     CHECK_EQ(micro_bounded.fit.max_ctx, plain.max_ctx);
 }
 
