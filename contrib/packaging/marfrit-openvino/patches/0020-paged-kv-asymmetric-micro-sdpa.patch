@@ -1,0 +1,392 @@
+# Paged KV, u8 keys / i4 values: the MIXED stage runs on micro-SDPA
+
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0003-0019 (verified: applies cleanly on the pristine pin with exactly that
+# series). Campaign u8i4-prefill-price (arcint DESIGN.md sections 7.0.2ar/7.0.2as).
+#
+# The price this removes. With the chunk held at 128 on the 16 GiB card (coder, no
+# offload), u8:i4 prefill cost +55 % of u8's time at 37,707 tokens and +90 % at 71,727
+# (DESIGN 7.0.2ar), and the profiler could not name the kernel. The cause, by reading
+# and now by removal: patches/0009 made supports_micro_sdpa() decline every key/value
+# pair whose packing classes differ, so the served pairing (u8 keys by channel, the
+# plugin's default, with i4 values by token) fell from the microkernel
+# attention path to the generic paged_attention_opt multi_tokens kernel for every chunk
+# after the first. Decode was never affected (patches/0010's split read kernel).
+#
+# What changes (three files, one gate split):
+#   sdpa_gen_micro.cpp  The generator sets the VALUE operand's type and layout from the
+#                       value precision (patches/0008's VALUE_CACHE_PRECISION) instead of
+#                       the key's: problem_vs.Ta_ext becomes u4/i4 whenever the value
+#                       cache is four-bit; the JIT layout constants are computed per side
+#                       (the key keeps upstream's three layouts, the value is packed
+#                       head/2 + inline scale/zp -- the layout pa_kv_cache_update_ref.cl
+#                       already writes for IS_INT4_V); IS_INT4_K_CACHE / IS_INT4_V_CACHE
+#                       are emitted per side, IS_INT4_KV_CACHE keeps its symmetric
+#                       meaning. VAL_ELEMENTS_PER_BYTE, which the kernel uses to advance
+#                       the value pointer across key chunks, is derived from the value
+#                       CACHE's precision on the mixed stage rather than from the
+#                       new-token input port (which is not four-bit under u8 keys):
+#                       without that the pointer overshot by two from the second 128-key
+#                       chunk on -- measured as NaN for every query whose causal context
+#                       passed 128 keys, and only those.
+#   sdpa_micro.cl       The five blocks gated on IS_INT4_KV_CACHE split into their key side
+#                       (ldk, ldkq, the K block pointer and its scales) and value side
+#                       (ldv, ldvq, the V block's inline scales), each on its own macro;
+#                       IS_INT4_KV_CACHE is still emitted for the symmetric case, with no
+#                       consumer left in the kernel source.
+#   paged_attention_opt.cpp  supports_micro_sdpa() admits eight-bit keys with four-bit
+#                       values; four-bit keys with eight-bit values still decline (no
+#                       layout on either kernel). Four-bit values under BY_TOKEN keys are
+#                       declined too: measured on the staged tree as NaN past 128 keys
+#                       with the patch's own test, not diagnosed, and not what the plugin
+#                       serves by default (key_cache_quant_mode defaults to BY_CHANNEL,
+#                       execution_config.cpp; arcint sets nothing).
+#
+# Red first, then green (ov_gpu_unit_tests on the staged tree, the 16 GiB card, the
+# production units running beside the test binary, 2026-09-05):
+#   paged_attention_u8i4_mixed_micro_test.mixed_stage_serves_u8_key_i4_value_on_micro_sdpa
+#   (new; three shapes: 25 queries over a 34-token past, 25 over 128, 300 over 64; u8 keys
+#   BY_CHANNEL, u4 values; the u4 mixed micro regression's exactly-representable fill and
+#   its 1e-2 tolerance against the float reference; asserts "sdpa_micro" in the kernel
+#   dump). On the 0019 tree: FAILED, the dump naming paged_attention_opt__multi_tokens.
+#   With the patch: PASS, 3/3. The older regression_paged_attention_asymmetric_prefill
+#   cases (patches/0015: 128 new tokens over a 2,048 and a 1,024 past, u8-K/i4-V, random
+#   data) now run on micro-SDPA and match the reference; their assertion that micro-SDPA
+#   "stays declined" is turned around, being the routing this patch changes. The whole
+#   paged-attention set with the u4 micro, asymmetric decode, bounded-partials and
+#   symmetric-u4 suites: 276 of 277 pass, one pre-existing skip. patches/0010's decode
+#   test keeps asserting that "sdpa_micro" is absent from its kernel dump, and still
+#   passes: the decode (single-token) stage has no microkernel variant; this patch
+#   changes the MIXED stage's selection only.
+#
+# Served, on the recipe-built plugin (pin + 0003-0020, staged over the packaged runtime),
+# 16 GiB card, coder, no offload, chunk 128, the price window's own prompts:
+#   37,707 tokens: u8:i4 459.0 t/s (82.2 s) against u8 456.8 t/s -- before, 295.1 against
+#   456.8 (+55 %); 71,727 tokens: u8:i4 401.0 t/s (178.9 s) against u8 397.5 -- before,
+#   209.3 against 397.9 (+90 %). Parity at both depths. The u8:i4 32-token outputs are
+#   byte-identical to the generic path's at both depths; the Pruefstand through the
+#   u8:i4 server at 37,707 tokens: 10/10 (479 tokens). Decode, one sample each: u8:i4
+#   31.4 / 28.1 t/s at 32 tokens against u8's 33.3 / 30.8 -- a report. No fault line.
+#
+# Not changed: the write kernel, the decode read kernel (patches/0010), the PREFILL stage
+# (which reads the new tokens' f16 inputs, not the cache), the value cache layout, the
+# auto-fit ceiling. The values stay four-bit in VRAM throughout: the microkernel unpacks
+# them in registers, which is the constraint the campaign's invariants state.
+#
+# Upstream: not yet filed.
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/sdpa_gen_micro.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/sdpa_gen_micro.cpp
+@@ -1175,6 +1175,16 @@
+ 
+         const auto kv_precision = params.get_program().get_config().get_kv_cache_precision();
+         const bool is_int4_logical = data_type_traits::is_i4_u4(kv_precision);
++        // arcint (patch 0020). The value side decides its own layout: patches/0008 lets the
++        // value cache precision differ from the key's, and the served pairing is u8 keys by
++        // channel (the plugin's default key mode) with i4 values by token. The key side keeps
++        // upstream's three layouts unchanged; the
++        // value side is packed (head/2 + scale/zp inline per token, the layout
++        // pa_kv_cache_update_ref.cl writes for IS_INT4_V) whenever the VALUE precision is
++        // four-bit, whether or not the key's is. IS_INT4_KV_CACHE keeps its symmetric
++        // meaning (both sides four-bit); the kernel source gates each side on its own macro.
++        const auto value_precision = params.get_program().get_config().get_value_cache_precision();
++        const bool is_int4_value = data_type_traits::is_i4_u4(value_precision);
+ 
+         auto scales_zp_size = 4;  // scale + zp
+         if (is_int4_logical) {
+@@ -1182,21 +1192,25 @@
+             // K: dim order {0,1,3,2} (col-major), packed block_size in innermost dim
+             //    physical: [blocks, heads, head_size, packed_block + scales] u8
+             //    packed_block = block_size/2 bytes, scales = 4 bytes
+-            // V: dim order {0,1,2,3} (row-major), packed head_size in innermost dim
+-            //    physical: [blocks, heads, block_size, packed_head + scales] u8
+             jit.make("IS_INT4_KV_CACHE", 1);
++            jit.make("IS_INT4_K_CACHE", 1);
+             jit.make("IS_KEY_BY_CHANNEL", 1);
+             jit.make("ADJUSTED_K_HEAD_SIZE", k_head_size);
+-            jit.make("ADJUSTED_V_HEAD_SIZE", v_head_size / 2 + scales_zp_size);
+             jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", config.paged_attention_block_size / 2 + scales_zp_size);
+         } else if (pa_desc->is_key_by_channel) {
+             jit.make("IS_KEY_BY_CHANNEL", 1);
+             jit.make("ADJUSTED_K_HEAD_SIZE", k_head_size);
+             jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", config.paged_attention_block_size + scales_zp_size);
+-            jit.make("ADJUSTED_V_HEAD_SIZE", v_head_size + scales_zp_size);
+         } else {
+             jit.make("ADJUSTED_K_HEAD_SIZE", k_head_size + scales_zp_size);
+             jit.make("ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE", config.paged_attention_block_size);
++        }
++        if (is_int4_logical || is_int4_value) {
++            // V: dim order {0,1,2,3} (row-major), packed head_size in innermost dim
++            //    physical: [blocks, heads, block_size, packed_head + scales] u8
++            jit.make("IS_INT4_V_CACHE", 1);
++            jit.make("ADJUSTED_V_HEAD_SIZE", v_head_size / 2 + scales_zp_size);
++        } else {
+             jit.make("ADJUSTED_V_HEAD_SIZE", v_head_size + scales_zp_size);
+         }
+     } else if (config.is_paged_attention) {
+@@ -1206,7 +1220,17 @@
+     }
+ 
+     jit.make("KEY_ELEMENTS_PER_BYTE", elems_per_byte(params.input_layouts[1].data_type));
+-    jit.make("VAL_ELEMENTS_PER_BYTE", elems_per_byte(params.input_layouts[2].data_type));
++    // arcint (patch 0020). On the mixed stage the kernel walks the VALUE CACHE (input 4), whose
++    // packing is the value precision's, not the new-token value input's (input 2): with u8
++    // keys and i4 values the input port is not four-bit while the cache is, and the row
++    // advance `ldv * tile / VAL_ELEMENTS_PER_BYTE` overshot by two from the second key chunk
++    // on -- measured as NaN for every query whose causal context passed 128 keys, and only
++    // those. The symmetric four-bit case carried the right value through the input port by
++    // the two precisions being equal.
++    const bool int4_value_cache_walk =
++        config.is_paged_attention && !m_is_prefill &&
++        data_type_traits::is_i4_u4(params.get_program().get_config().get_value_cache_precision());
++    jit.make("VAL_ELEMENTS_PER_BYTE", int4_value_cache_walk ? 2 : elems_per_byte(params.input_layouts[2].data_type));
+ 
+     int tile_k = gemm_kq.getSetting("wg_tile_m");
+     int tile_q = gemm_kq.getSetting("wg_tile_n");
+@@ -1579,6 +1603,11 @@
+     // Detect INT4 KV cache: stored as u8 but logical precision is u4/i4
+     const auto kv_cache_precision = is_paged_attention ? params.get_program().get_config().get_kv_cache_precision() : ov::element::dynamic;
+     const bool is_int4_kv_cache = data_type_traits::is_i4_u4(kv_cache_precision);
++    // arcint (patch 0020): the value operand's own precision (patches/0008), which may be
++    // four-bit while the key's is not -- the served u8:i4 pairing. Equal to the key's in
++    // every configuration that existed before, so the symmetric paths are unchanged.
++    const auto value_cache_precision = is_paged_attention ? params.get_program().get_config().get_value_cache_precision() : ov::element::dynamic;
++    const bool is_int4_value_cache = data_type_traits::is_i4_u4(value_cache_precision);
+ 
+     // For INT4 PA generate: override Ta_ext to u4/i4 so micro-kernel handles u4 unpacking
+     if (is_int4_kv_cache && is_paged_attention && !is_prefill) {
+@@ -1749,9 +1778,10 @@
+     /* Update for second GEMM: V*S */
+     auto problem_vs = problem;
+     problem_vs.Ta_ext = convert_type(V.data_type);
+-    // For INT4 V: override Ta_ext to u4/i4
+-    if (is_int4_kv_cache && is_paged_attention && !is_prefill) {
+-        problem_vs.Ta_ext = convert_type(kv_cache_precision);
++    // For INT4 V: override Ta_ext to u4/i4 -- keyed on the VALUE precision (patch 0020), so
++    // the microkernel unpacks four-bit values under eight-bit keys too.
++    if ((is_int4_kv_cache || is_int4_value_cache) && is_paged_attention && !is_prefill) {
++        problem_vs.Ta_ext = convert_type(value_cache_precision);
+     }
+     problem_vs.A.layout = micro::MatrixLayout::N;
+ 
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
+@@ -1594,8 +1594,27 @@
+         // (paged_attention_gpu_test.cpp's decode_serves_u8_key_i4_value) asserts sdpa_micro is
+         // absent from the dispatched kernel list specifically because this decline is live and
+         // load-bearing, not because the case is unreachable.
++        // arcint (patch 0020): the paragraphs above describe the decline as it stood through
++        // patches/0009-0019 -- kept as history; from this patch on, eight-bit keys with four-bit
++        // values are admitted (below), so that decline is no longer the active gate for the
++        // served pairing. The decode (single-token) stage has no microkernel variant and is
++        // unaffected either way.
+         const auto value_cache_dt = params.get_program().get_config().get_value_cache_precision();
+-        if (data_type_traits::is_i4_u4(kv_cache_dt) != data_type_traits::is_i4_u4(value_cache_dt)) {
++        // arcint (patch 0020): the generator now sets the value operand's type and layout from
++        // the value precision alone (sdpa_gen_micro.cpp), so eight-bit keys with four-bit
++        // values -- the served u8:i4 pairing -- run on micro-SDPA's mixed stage. Four-bit keys
++        // with eight-bit values have no layout of their own on either kernel and still decline.
++        if (data_type_traits::is_i4_u4(kv_cache_dt) && !data_type_traits::is_i4_u4(value_cache_dt)) {
++            return false;
++        }
++        // Four-bit values under BY_TOKEN keys: measured on the staged tree (2026-09-05, the
++        // patch's own unit test with by-token keys) as NaN for every query whose causal
++        // context passes 128 keys, and only those; by-channel keys -- the plugin's default
++        // and what arcint serves -- pass the same cases. Not diagnosed; declined, so that
++        // pairing keeps the generic kernel it had, the same way upstream declines four-bit
++        // BY_TOKEN keys above.
++        if (!data_type_traits::is_i4_u4(kv_cache_dt) && data_type_traits::is_i4_u4(value_cache_dt) &&
++            !desc->is_key_by_channel) {
+             return false;
+         }
+ 
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa_micro.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa_micro.cl
+@@ -293,32 +293,37 @@
+         uint ldk = HEAD_SIZE * KV_HEADS_NUM + INPUT1_PAD_BEFORE_FEATURE_NUM + INPUT1_PAD_AFTER_FEATURE_NUM;
+         uint ldv = HEAD_SIZE * KV_HEADS_NUM + INPUT2_PAD_BEFORE_FEATURE_NUM + INPUT2_PAD_AFTER_FEATURE_NUM;
+     #else
+-        #if IS_INT4_KV_CACHE
++        // arcint (patch 0020): each side on its own four-bit gate, so u8 keys can pair with
++        // i4 values (IS_INT4_KV_CACHE, both sides, implies both gates).
++        #if IS_INT4_K_CACHE
+         // INT4 K BY_CHANNEL Layout::N: ldk = column stride in u4 elements.
+         // ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE is in bytes (packed_block + scale = 12).
+         // Multiply by 2 for u4: 12 * 2 = 24 u4 elements → 12 byte stride.
+         uint ldk = ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE * 2;
++        #else
++        uint ldk = ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE;
++        #endif
++        #if IS_INT4_V_CACHE
+         // INT4 V per-token Layout::N: ldv = row stride in u4 elements.
+         // ADJUSTED_V_HEAD_SIZE is in bytes (packed_head + scale = 68).
+         // Multiply by 2 for u4: 68 * 2 = 136 u4 elements → 68 byte stride.
+         uint ldv = ADJUSTED_V_HEAD_SIZE * 2;
+         #else
+-        uint ldk = ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE;
+         uint ldv = HEAD_SIZE;
+         #endif
+         uint ldkc = HEAD_SIZE * KV_HEADS_NUM + INPUT1_PAD_BEFORE_FEATURE_NUM + INPUT1_PAD_AFTER_FEATURE_NUM;
+         uint ldvc = HEAD_SIZE * KV_HEADS_NUM + INPUT2_PAD_BEFORE_FEATURE_NUM + INPUT2_PAD_AFTER_FEATURE_NUM;
+         #if IS_KV_COMPRESSED_PA
+-            #if IS_INT4_KV_CACHE
+-                // INT4 K BY_CHANNEL: scale stride = ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE bytes / 2 in f16 elements
++            #if IS_INT4_K_CACHE || IS_KEY_BY_CHANNEL
++                // INT4 K BY_CHANNEL, and u8 K BY_CHANNEL: scale stride = ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE bytes / 2 in f16 elements
+                 uint ldkq = ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE / 2;
++            #else
++                uint ldkq = 1;
++            #endif
++            #if IS_INT4_V_CACHE
+                 // INT4 V per-token: scale stride = ADJUSTED_V_HEAD_SIZE bytes / 2 in f16 elements
+                 uint ldvq = ADJUSTED_V_HEAD_SIZE / 2;
+-            #elif IS_KEY_BY_CHANNEL
+-                uint ldkq = ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE / 2;
+-                uint ldvq = 1;
+             #else
+-                uint ldkq = 1;
+                 uint ldvq = 1;
+             #endif
+         #endif
+@@ -621,7 +626,7 @@
+         for (;k0 < past_lens[gws_mapping];) {
+     #endif
+             int k_block_num = k0 / PAGED_ATTENTION_BLOCK_SIZE + sg_i_kq;
+-            #if IS_INT4_KV_CACHE
++            #if IS_INT4_K_CACHE
+                 // INT4 BY_CHANNEL Layout::N: micro-kernel adds sg_i_kq * tile_sg_m * sizeof(u4)
+                 // = sg_i_kq * PAGED_ATTENTION_BLOCK_SIZE / 2 bytes
+                 global KEY_DATA_T *K0 = K + KV_HEADS_NUM * ADJUSTED_K_HEAD_SIZE * ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE * block_indices[base_block_index + k_block_num]
+@@ -631,7 +636,7 @@
+                                         - PAGED_ATTENTION_BLOCK_SIZE * sg_i_kq;
+             #endif
+             #if IS_KV_COMPRESSED_PA
+-                #if IS_INT4_KV_CACHE
++                #if IS_INT4_K_CACHE
+                     // INT4 BY_CHANNEL: scales at packed_block_size offset within each column
+                     // packed_block_size = PAGED_ATTENTION_BLOCK_SIZE / 2 = 8 bytes
+                     global KEY_DATA_T *K0_scales = K0 + (PAGED_ATTENTION_BLOCK_SIZE / 2) * (sg_i_kq + 1);
+@@ -1079,8 +1084,8 @@
+             global VAL_DATA_T *Vb0 = V + KV_HEADS_NUM * ADJUSTED_V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE * block_indices[base_block_index + v_block_num];
+             int kb_chunk = min(k_chunk - kb0, PAGED_ATTENTION_BLOCK_SIZE);
+             #if IS_KV_COMPRESSED_PA
+-                #if IS_INT4_KV_CACHE
+-                // INT4: scales embedded at HEAD_SIZE/2 offset within each token row
++                #if IS_INT4_V_CACHE
++                // INT4 V: scales embedded at HEAD_SIZE/2 offset within each token row
+                 global VAL_DATA_T *Vb0_scales = Vb0 + HEAD_SIZE / 2;
+                 global VAL_DATA_T *Vb0_zp = Vb0_scales + 2;
+                 #else
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
+@@ -64,6 +64,93 @@
+     ::testing::Values(
+         paged_attention_test_params{{{25, 34}}, 32, 2, 128, 128, 16, 0, ENABLE_CACHE_COMPRESSION, ov::internal::CacheQuantMode::BY_CHANNEL, DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2, false, 0, {}, false, {}, {}, ov::element::u4},
+         paged_attention_test_params{{{25, 128}}, 32, 2, 128, 128, 16, 0, ENABLE_CACHE_COMPRESSION, ov::internal::CacheQuantMode::BY_CHANNEL, DYNAMIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2, false, 0, {}, false, {}, {}, ov::element::u4}));
++
++// arcint (patch 0020, u8i4-prefill-price). The served pairing -- u8 keys by channel (the
++// plugin's default key mode), i4 values by token -- on the MIXED stage through micro-SDPA.
++// Before this patch supports_micro_sdpa() declined every key/value pair whose packing classes
++// differ (patches/0009), so 25 new tokens over a 34-token past at u8:i4 ran the generic opt
++// kernel: the "sdpa_micro" assertion below is the red case
++// (the dump names the opt kernel instead). Same synthetic fill and tolerance as the u4 mixed
++// micro regression above: every value is exactly representable in four bits, so a mismatch
++// against the float reference is a layout or stride error, not quantisation noise.
++static paged_attention_test_params u8i4_mixed_micro_params(std::vector<SubsequenceDescriptor> subsequences) {
++    paged_attention_test_params p{subsequences, 32, 2, 128, 128, 16, 0, ENABLE_CACHE_COMPRESSION,
++                                  ov::internal::CacheQuantMode::BY_CHANNEL, DYNAMIC_INPUT_PAD, DISABLE_SCORES,
++                                  DISABLE_ROTATION, DISABLE_FA_V2, false, 0, {}, false, {}, {}, ov::element::u8};
++    p.value_cache_precision = ov::element::u4;
++    return p;
++}
++
++class paged_attention_u8i4_mixed_micro_test : public PagedAttentionTest<paged_attention_test_params> {};
++
++TEST_P(paged_attention_u8i4_mixed_micro_test, mixed_stage_serves_u8_key_i4_value_on_micro_sdpa) {
++    if (!tests::get_test_engine().get_device_info().supports_immad)
++        GTEST_SKIP() << "Micro SDPA requires DPAS/XMX support";
++
++    auto p = GetParam();
++    ASSERT_TRUE(this->pam.has_value());
++    auto& pam = *this->pam;
++
++    for (size_t sequence = 0; sequence < pam.subsequence_descs.size(); ++sequence) {
++        std::fill(pam.query_data[sequence].begin(), pam.query_data[sequence].end(), ov::float16{8.0f});
++        std::fill(pam.key_data[sequence].begin(), pam.key_data[sequence].end(), ov::float16{-1.0f});
++        std::fill(pam.value_data[sequence].begin(), pam.value_data[sequence].end(), ov::float16{0.0f});
++
++        const int past_len = pam.subsequence_descs[sequence].past_len;
++        const int num_tokens = pam.subsequence_descs[sequence].num_tokens;
++        for (int token = 0; token < num_tokens; ++token) {
++            const float key_value = -0.2f + 0.4f * static_cast<float>(token % p.block_size) /
++                                                     static_cast<float>(p.block_size - 1);
++            const ov::float16 value = token % 2 == 0 ? ov::float16{-1.0f} : ov::float16{1.0f};
++            for (int head = 0; head < p.num_kv_heads; ++head) {
++                const size_t key_offset = (static_cast<size_t>(past_len + token) * p.num_kv_heads + head) *
++                                          p.k_head_size;
++                const size_t value_offset = (static_cast<size_t>(past_len + token) * p.num_kv_heads + head) *
++                                            p.v_head_size;
++                std::fill_n(pam.key_data[sequence].begin() + key_offset, p.k_head_size, ov::float16{key_value});
++                std::fill_n(pam.value_data[sequence].begin() + value_offset, p.v_head_size, value);
++            }
++        }
++    }
++
++    auto result = run_gpu_inference(pam, p);
++    auto pa_inst = result.network->get_primitive("paged_attention");
++    ASSERT_NE(pa_inst, nullptr);
++    auto* impl = pa_inst->get_impl();
++    ASSERT_NE(impl, nullptr);
++    const auto dump_info = impl->get_kernels_dump_info(*pa_inst->get_impl_params());
++    ASSERT_NE(dump_info.get_entries().find("sdpa_micro"), std::string::npos)
++        << "u8-key / i4-value must run on micro SDPA: " << dump_info.get_entries();
++
++    this->tolerance = 1e-2f;
++    const auto reference = PagedAttentionReference(pam).get_reference(result.key_cache_mem);
++    if (std::getenv("ARCINT_TEST_NAN_MAP") != nullptr) {
++        // Diagnostic only: which query rows carry NaN, and how many elements per row.
++        auto out_mem = result.outputs.at("output_data").get_memory();
++        cldnn::mem_lock<ov::float16, cldnn::mem_lock_type::read> ptr(out_mem, tests::get_test_stream());
++        const size_t row = static_cast<size_t>(p.num_heads) * p.v_head_size;
++        const size_t rows = out_mem->count() / row;
++        std::string map;
++        for (size_t r = 0; r < rows; ++r) {
++            size_t nans = 0, bad = 0;
++            for (size_t j = 0; j < row; ++j) {
++                const float v = static_cast<float>(ptr[r * row + j]);
++                if (std::isnan(v)) ++nans;
++                else if (std::fabs(v - static_cast<float>(std::get<0>(reference)[r * row + j])) > this->tolerance) ++bad;
++            }
++            map += (nans == row ? "N" : nans > 0 ? "n" : bad > 0 ? "x" : ".");
++        }
++        std::cout << "NAN-MAP rows=" << rows << " per-row=" << row << " [" << map << "]" << std::endl;
++    }
++    compare(result.outputs.at("output_data").get_memory(), nullptr, nullptr, reference);
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    patches_0020_paged_attention_u8i4_mixed_micro,
++    paged_attention_u8i4_mixed_micro_test,
++    ::testing::Values(u8i4_mixed_micro_params({{25, 34}}),
++                      u8i4_mixed_micro_params({{25, 128}}),
++                      u8i4_mixed_micro_params({{300, 64}})));
+ #endif
+ 
+ class paged_attention_u4_swa_tail_test : public PagedAttentionTest<paged_attention_test_params> {};
+@@ -478,11 +565,12 @@
+     auto* impl = pa_inst->get_impl();
+     ASSERT_NE(impl, nullptr);
+     const auto dump_info = impl->get_kernels_dump_info(*pa_inst->get_impl_params());
+-    ASSERT_NE(dump_info.get_entries().find("paged_attention_opt__multi_tokens"), std::string::npos)
+-        << "Expected the MIXED-stage opt kernel (paged_attention_opt, multi_tokens stage) to run: "
+-        << dump_info.get_entries();
+-    ASSERT_EQ(dump_info.get_entries().find("sdpa_micro"), std::string::npos)
+-        << "micro-SDPA should stay declined for a key/value packing-class mismatch (patches/0009): "
++    // arcint (patch 0020): the MIXED stage of the u8-key / i4-value pairing now runs on
++    // micro-SDPA (the generator sets the value operand from the value precision); the
++    // generic multi_tokens kernel is no longer this configuration's path. The reference
++    // comparison below is unchanged -- the same float truth at a 2,048-plus past.
++    ASSERT_NE(dump_info.get_entries().find("sdpa_micro"), std::string::npos)
++        << "u8-key / i4-value MIXED stage must run on micro-SDPA (patches/0020): "
+         << dump_info.get_entries();
+ 
+     const auto reference = PagedAttentionReference(pam).get_reference(result.key_cache_mem);

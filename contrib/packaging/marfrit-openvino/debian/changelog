@@ -1,3 +1,22 @@
+marfrit-openvino (2026.4.0~dev20260821+p6-1) bookworm trixie; urgency=medium
+
+  * One more patch applied on top of +p5, same upstream commit (71640275),
+    same smallest-sufficient-divergence numbering:
+    - patches/0020: the u8-key / i4-value paged KV pairing runs its
+      prefill on micro-SDPA instead of the generic paged-attention
+      kernel (the generator takes the value operand's type and layout
+      from the value precision; the selector admits the pairing).
+      MEASURED on the 16 GiB card, coder, chunk 128: u8:i4 prefill at
+      parity with u8 (459 vs 457 t/s at 37,707 tokens, 401 vs 398 at
+      71,727) where it cost +55 % / +90 % before; outputs byte-identical
+      to the generic path's; Pruefstand 10/10 through the u8:i4 server.
+  * The runtime reports itself as 2026.4.0-22849-71640275d29-marfrit-p6,
+    so a version string in a log distinguishes this build from +p5 and
+    from the stock nightly. Not yet built as a package at the time of
+    this entry.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 05 Sep 2026 19:00:00 +0200
+
 marfrit-openvino (2026.4.0~dev20260821+p5-1) bookworm trixie; urgency=medium
 
   * One more patch applied on top of +p4, same upstream commit (71640275),

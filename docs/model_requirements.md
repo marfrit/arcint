@@ -89,8 +89,12 @@ depth. `--paged-attention-max-partitions` (engine side in this tree,
 unreleased; plugin patch **0015** is written but in no built package, and
 no plugin carrying its key exists yet, so its effect is priced by the
 engine's own arithmetic and not measured on a card) bounds the partition
-count to flatten the term past a fixed depth. Still owed: the full-resolution u8:i4 prefill
-price, and cold/warm prefix-cache byte-exactness at u8:i4.
+count to flatten the term past a fixed depth. The prefill price itself is
+measured and removed (DESIGN §7.0.2ar/§7.0.2as): at a held chunk the
+generic kernel cost +55 %/+90 % at 37.7k/71.7k tokens; with patch **0020**
+(`+p6`) the mixed stage runs on micro-SDPA at parity with u8, values still
+four-bit in VRAM. Still owed: cold/warm prefix-cache byte-exactness at
+u8:i4, and the scratch charge above re-measured on the microkernel path.
 
 ## 4. Drafters
 
@@ -127,13 +131,18 @@ campaign (`docs/campaigns/`).
 ## 5. Runtime stack
 
 `marfrit-openvino`: source build pinned at upstream commit `71640275` (the
-2026.4.0 nightly of 2026-08-21), patch series **0003–0019** applied
+2026.4.0 nightly of 2026-08-21), patch series **0003–0020** applied
 (`contrib/packaging/marfrit-openvino/patches/`). Package version carries
 the patch level: **`+p4` is the 0003–0018 level** and the one 0.3.0
 requires (CHANGELOG); **`+p5` adds 0019** (the prefill fallback's
-three-way answer, DESIGN §7.0.2ap; recipe bumped 2026-09-05, package not
-yet built); the arcint package depends on `+p4` as a floor within the
-pinned nightly, since nothing arcint drives reaches 0019's branch.
+three-way answer, DESIGN §7.0.2ap; built 2026-09-05, not deployed);
+**`+p6` adds 0020** (u8:i4 prefill on micro-SDPA at parity with u8,
+DESIGN §7.0.2as; recipe bumped 2026-09-05, package not yet built) — the
+level to serve `--paged-kv u8:i4` at, since below it the format's prefill
+costs +55 % to +90 % of u8's time (§7.0.2ar). The arcint package depends
+on `+p4` as a floor within the pinned nightly; nothing arcint drives
+reaches 0019's branch, and 0020 changes the runtime's speed, not its
+contract.
 At the 0.3.0 tag the dev host's production units still serve `+p3` —
 deployment is a separate decision (DESIGN §7.0.2ai). Compute-runtime
 **26.27** (past the fix window for USM-pool issue 916). Kernel driver:

@@ -332,6 +332,35 @@ none of their paths. Full account in the patch header and arcint's
 
 Upstream: not yet filed.
 
+### 0020-paged-kv-asymmetric-micro-sdpa.patch
+
+The served asymmetric pairing — u8 keys by channel, i4 values by token —
+ran its prefill on the generic paged-attention kernel because 0009
+declined micro-SDPA for any key/value pair of differing packing classes,
+and paid +55 % / +90 % prefill time at 37.7k / 71.7k tokens against u8
+at the same chunk (DESIGN §7.0.2ar). The generator now sets the value
+operand's type and layout from the value precision, the kernel source
+gates each side's four-bit layout on its own macro, the value pointer's
+per-chunk advance derives its packing from the value cache rather than
+the new-token input port, and the selector admits eight-bit keys with
+four-bit values (four-bit keys with eight-bit values, and four-bit
+values under BY_TOKEN keys, still decline — the latter measured as NaN
+past 128 keys, not diagnosed, and not the plugin's default).
+
+Red first: a new mixed-stage unit test with u8 keys and u4 values failed
+on the 0019 tree with the dump naming the generic kernel, and passes
+with the patch (3/3 shapes, the float reference at 1e-2); 0015's
+asymmetric prefill regressions at a 2,048-token past now run on
+micro-SDPA and match; 276/277 of the paged-attention set pass.
+MEASURED on the recipe-built plugin, 16 GiB card, coder, chunk 128:
+u8:i4 459 against u8 457 t/s at 37,707 tokens and 401 against 398 at
+71,727 — parity — with the u8:i4 outputs byte-identical to the generic
+path's and the Prüfstand 10/10 through the u8:i4 server. The values
+stay four-bit in VRAM; the microkernel unpacks them in registers.
+DESIGN §7.0.2as.
+
+Upstream: not yet filed.
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.

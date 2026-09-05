@@ -163,3 +163,19 @@ value copy is a verdict, not a fix.
   device-side event timeline of one chunk per arm. A lever within the
   four-bit invariant is microkernel work (the fast path taught the packed
   value read).
+- 2026-09-05, evening — closed by the lever (patch 0020, DESIGN
+  §7.0.2as), on the operator's call to write the kernel and check rather
+  than instrument further. micro-SDPA serves the u8-key / i4-value mixed
+  stage: the generator takes the value operand from the value precision,
+  the kernel source gates each side on its own four-bit macro, the
+  selector admits the pairing; values stay four-bit in VRAM (registers
+  unpack). Red first (a new mixed-stage unit test named the generic
+  kernel on the 0019 tree; 3/3 with the patch; 276/277 of the
+  paged-attention set). Served on the recipe-built plugin, chunk 128,
+  16 GiB card: u8:i4 459 against u8 457 t/s at 37,707 tokens and 401
+  against 398 at 71,727 — parity, where the gate asked ≤ +25 % — outputs
+  byte-identical to the generic path's, Prüfstand 10/10 through the
+  u8:i4 server. Recipe at `+p6`, package not built. Left open, elsewhere:
+  the fit's scratch charge for the generic path (`u8i4-deep-prefill-
+  fault`) is unmeasured on the microkernel path, which allocates none of
+  it.

@@ -65,8 +65,19 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   forced off took the host branch for device weights through a downcast
   of the wrong provider type, dormant in every configuration arcint
   drives. Red first with a new plugin unit test, green with the patch on
-  both cards. The `+p5` package is not built yet; arcint's dependency
-  floor stays at `+p4`, since nothing it drives reaches the branch.
+  both cards. The `+p5` package is built and not deployed; arcint's
+  dependency floor stays at `+p4`, since nothing it drives reaches the
+  branch.
+- **Plugin patch 0020, recipe at `+p6`: the u8:i4 prefill price is gone**
+  (`u8i4-prefill-price` closed, DESIGN §7.0.2ar–§7.0.2as). At a held
+  chunk the format cost +55 % and +90 % of u8's prefill time at 37.7k
+  and 71.7k tokens on the 16 GiB card because the mixed stage ran the
+  generic paged-attention kernel; 0020 runs it on micro-SDPA with the
+  values still four-bit in VRAM — 459 against 457 t/s and 401 against
+  398, parity, outputs byte-identical to the generic path's, Prüfstand
+  10/10. u8-against-u8:i4 byte-identity does not hold at depth (recorded
+  in §7.0.2ar; the invariant is u8:i4 against itself). `+p6` is the
+  level to serve u8:i4 at; the package is not built yet.
 - Known, open, on the record: one follow-up window had two tier-ON
   processes disagree on the same prompt (§7.0.2ak); a diagnostic rerun did
   not reproduce it (§7.0.2al); the runner now prints every output's hash.

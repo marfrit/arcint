@@ -5555,6 +5555,93 @@ this counter), which sees every kernel launched whether or not the
 profiler attributes it. Any lever remains microkernel work under the
 four-bit invariant; the campaign is not closed by this window.
 
+#### 7.0.2as The u8:i4 prefill price is removed: patch 0020 runs the mixed stage on micro-SDPA, parity with u8 at both depths, values still four-bit in VRAM (2026-09-05)
+
+The `u8i4-prefill-price` campaign, closed by a lever the same evening
+§7.0.2ar could not name the kernel for. The operator's call: "faster to
+just write the kernel and check than to run hours of measurements to
+find where the degradation lives" — and the check is the measurement.
+
+**What the kernel is.** The value cache under u8:i4 was already read
+in registers by the decode kernel (patch 0010); prefill's every chunk
+after the first (the MIXED stage, past tokens from the cache) went to
+the generic paged-attention kernel because patch 0009's selector
+declined micro-SDPA for any key/value pair whose packing classes differ.
+The microkernel path already knew four-bit values — upstream's symmetric
+int4 KV cache (by-channel keys, packed values) runs on it — so the
+change is the generator taking the *value* operand's type and layout
+from the value precision (patch 0008's property) instead of the key's,
+the kernel source gating each side's four-bit layout on its own macro
+(five blocks), and the selector admitting eight-bit keys with four-bit
+values. Nothing is copied or widened: the microkernel unpacks the
+nibbles in registers, which is the constraint the campaign's invariants
+state. One more thing the red case found: the kernel's value-pointer
+advance across key chunks divided by an elements-per-byte constant
+taken from the new-token input port, which is not four-bit under u8
+keys while the cache is — every query whose causal context passed 128
+keys came back NaN, and only those, until that constant was derived
+from the value cache's own precision.
+
+**Red, then green.** A new mixed-stage unit test (u8 keys by channel,
+u4 values; 25 queries over a 34-token past, 25 over 128, 300 over 64;
+the u4 micro regression's exactly-representable fill, 1e-2 against the
+float reference; "sdpa_micro" asserted in the kernel dump) failed on
+the 0019 tree with the dump naming the generic kernel, and passes with
+the patch, three of three. Patch 0015's asymmetric prefill regressions
+(128 new tokens over a 2,048-token past, random data) now run on
+micro-SDPA and match; their assertion that micro-SDPA stays
+declined is turned around, being the routing this patch changes. With
+the u4 micro, asymmetric decode, bounded-partials, symmetric-u4 and
+basic paged-attention suites: 276 of 277 pass, one pre-existing skip.
+Four-bit values under BY_TOKEN keys are declined by the patch: the same
+test with by-token keys gave NaN past 128 keys, not diagnosed, and not
+what the plugin serves — its key mode defaults to by-channel and arcint
+sets nothing.
+
+**Served, on the recipe-built plugin** (the pin plus 0003–0020, built in
+the package recipe's own tree and staged over the packaged runtime
+layout), 16 GiB card, coder int4, no offload, one lane, chunk 128, the
+price window's prompts, one fresh process per arm:
+
+| depth | u8:i4, §7.0.2ar | u8:i4, patch 0020 | u8 |
+|---|---|---|---|
+| 37,707 tokens | 295.1 t/s, +55 % | 459.0 t/s (82.2 s) | 456.8 t/s (82.5 s) |
+| 71,727 tokens | 209.3 t/s, +90 % | 401.0 t/s (178.9 s) | 397.5 t/s (180.4 s) |
+
+Parity at both depths; the campaign's gate asked for ≤ +25 % at 71.7k.
+The u8:i4 32-token greedy outputs are byte-identical to the generic
+path's at both depths (§7.0.2ar's hashes); the Prüfstand through the
+u8:i4 server at 37,707 tokens: 10/10, 479 tokens in 10.9 s. Decode, one
+sample each: u8:i4 31.4 and 28.1 t/s at 32 tokens against u8's 33.3 and
+30.8 — a report. No fault line in any arm. A first check on the debug
+tree's build (which carries the two patches the recipe omits) had
+already shown 462 against 462 t/s at 37,707 tokens; the recipe build is
+the one on the record.
+
+**One observation kept.** The u8 arm's 32-token answer at 37,707 tokens
+on this build differs from the price window's u8 answer on the `+p4`
+package (first difference at character 85 of 166), and the debug tree's
+build gave a third answer on the same prompt (the 140 bytes the other
+two builds give at 71,727 tokens), while at 71,727 all three agree byte
+for byte. Two more fresh u8 processes on this build at 37,707 tokens
+returned the same 32 tokens as this build's first (one hash, three
+processes), so the u8 path is run-to-run deterministic here and the
+difference is between builds — three builds, three answers, one prompt;
+none of the three differs in a u8 kernel by reading. One sample per
+build, not explained; a question for the release gate's own
+equivalence cells, which compare within one build, and noted for the
+next package's byte-identity check against `+p4` on this prompt.
+
+**What this changes on the record.** §7.0.2ar's +55/+90 % at a held
+chunk were the generic path's price (§7.0.2aa's +7/+25/+72 % carry the
+chunk confound §7.0.2ar names); from `+p6` on the format's prefill is
+u8's. `docs/model_requirements.md` §3's "u8:i4 is a
+decode-only saving" verdict rested on the fit's charge for the generic
+path's scratch (§7.0.2ab, §7.0.2ac) and on this price; the scratch term
+is the fault campaign's and stays until it is re-measured on the
+microkernel path, which allocates none of it. The campaign is closed;
+the M8 row's owed item is closed with it.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,
