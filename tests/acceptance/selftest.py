@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """Self-test for tests/acceptance/run.py (docs/design-0.3.1-test-ladder.md §5).
 
-Five assertions against the fixture manifest in fixtures/cells-fake.json
-(/bin/true, /bin/false and a 77-exiting script), run through run.py itself
-rather than reimplementing its logic:
+Eight assertions against the fixture manifest in fixtures/cells-fake.json
+(/bin/true, /bin/false, a 77-exiting script, and a script that passes while
+printing a promoted-skip line), run through run.py itself rather than
+reimplementing its logic, in the order main() below runs them:
 
-  1. every cell passing                       -> exit 0
-  2. an unnamed skip                          -> exit != 0
-  3. the same skip, named via --allow-skip    -> exit 0
-  4. --allow-skip naming a cell that passed   -> exit != 0
-  5. --allow-skip naming an unknown cell      -> exit != 0
+  1. every cell passing                              -> exit 0
+  2. an unnamed skip                                 -> exit != 0
+  3. the same skip, named via --allow-skip           -> exit 0
+  4. --allow-skip naming a cell that passed          -> exit != 0
+  5. --allow-skip naming an unknown cell             -> exit != 0
+  6. a failing cell                                  -> exit != 0
+  7. a promoted named skip (cell/check), unnamed     -> exit != 0
+  8. the same, named via --allow-skip <cell>/<check> -> exit 0
 
 This is arcint-test's --allow-skip discipline in miniature, run over
 run.py's own domain (cells) rather than harness.h's (cases) -- one rule,
-checked in two places.
+checked in two places. Assertions 7-8 are the same discipline applied to a
+runner's own internal skip (tests/equivalence/run.sh's MTP section is the
+motivating case): a cell can pass overall and still owe a name for a part
+of it that was skipped.
 """
 import json
 import os
@@ -61,6 +68,7 @@ def main():
     pass_only = subset(["always-pass"])
     pass_skip = subset(["always-pass", "always-skip"])
     fail_only = subset(["always-fail"])
+    named_skip_only = subset(["prints-a-named-skip"])
     try:
         check("all cells pass -> exit 0",
               run(pass_only) == 0, True)
@@ -77,10 +85,15 @@ def main():
               run(pass_only, allow_skip=["totally-unknown"]) == 0, False)
         check("a failing cell -> exit != 0",
               run(fail_only) == 0, False)
+        check("a promoted named skip (cell/check), unnamed -> exit != 0",
+              run(named_skip_only) == 0, False)
+        check("the same, named via --allow-skip <cell>/<check> -> exit 0",
+              run(named_skip_only, allow_skip=["prints-a-named-skip/mtp-section"]) == 0, True)
     finally:
         os.unlink(pass_only)
         os.unlink(pass_skip)
         os.unlink(fail_only)
+        os.unlink(named_skip_only)
 
     if FAILED:
         print(f"\n{len(FAILED)} assertion(s) failed: {', '.join(FAILED)}", file=sys.stderr)

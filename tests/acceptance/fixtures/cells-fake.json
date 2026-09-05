@@ -13,5 +13,10 @@
     "name": "always-skip",
     "runner": {"cmd": "fixtures/skip77.sh", "args": [], "env": {}},
     "external": null
+  },
+  {
+    "name": "prints-a-named-skip",
+    "runner": {"cmd": "fixtures/mtp-skip.sh", "args": [], "env": {}},
+    "external": null
   }
 ]

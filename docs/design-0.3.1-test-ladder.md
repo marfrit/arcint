@@ -31,7 +31,7 @@ Spec: `docs/milestone-0.3.0.md:91` — device-free `ctest` is the unit gate, a s
 
 **Skip semantics.** ctest's `SKIP_RETURN_CODE` marks a skip as not-failed, so `ctest -L acceptance` on a card-less machine would go **green with every cell skipped**. That is the failure this row exists to close. So the acceptance target is `tests/acceptance/run.py --all`, not bare ctest: a cell exits 0 / 1 / 77(skip, with a printed reason), and the runner exits non-zero unless every 77 is named on the command line as `--allow-skip <cell>`. Symmetrically it exits non-zero when `--allow-skip` names a cell that ran, or a name absent from the enumeration — so the allow-list cannot rot. The per-cell ctest tests call the runner, so its exit code is ctest's.
 
-The suites carry the same defect internally: `tests/equivalence/run.sh:225` prints "no MTP head in $MODEL; skipping the MTP gates" and still exits 0 at `:267`. Increment 2 makes it print a machine-readable `SKIP <check> <reason>` line that the runner promotes to a named skip.
+The suites carry the same defect internally: `tests/equivalence/run.sh:225` prints "no MTP head in $MODEL; skipping the MTP gates" and still exits 0 at `:267`. Increment 2 makes it print a machine-readable `ACCEPTANCE-SKIP <check> <reason>` line that the runner promotes to a named skip -- not a bare `SKIP`, because `tests/harness.h`'s unit-test harness already prints its own `SKIP %s: %s` lines (`tests/test_main.cpp`), and the sanitizers cell tails its ctest log to its own stdout, so a bare `SKIP` would let a unit-test skip get promoted as an acceptance one by accident.
 
 ## 3. The enumeration
 

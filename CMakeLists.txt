@@ -296,6 +296,20 @@ if(ARCINT_ACCEPTANCE)
       # --allow-skip <cell>` is the only entry point that may treat a skip as
       # anything but a failure (docs/design-0.3.1-test-ladder.md §7).
       set_tests_properties("acceptance-${_arcint_cell_name}" PROPERTIES LABELS acceptance)
+
+      # Per-cell TIMEOUT from cells.json's own timeout_seconds. The external
+      # cell (pruefstand) carries JSON null there, which the GET returns as an
+      # empty string without an error, so the guard is on the value, not only
+      # on ERROR_VARIABLE: that cell keeps ctest's default -- unbounded here,
+      # since the external harness's own timeout is out of this repository's
+      # hands. ERROR_VARIABLE turns an absent key into a normal (non-fatal)
+      # miss instead of a configure error.
+      string(JSON _arcint_cell_timeout ERROR_VARIABLE _arcint_timeout_err
+             GET "${_arcint_cells_json}" ${_arcint_i} "timeout_seconds")
+      if(NOT _arcint_timeout_err AND NOT _arcint_cell_timeout STREQUAL "")
+        set_tests_properties("acceptance-${_arcint_cell_name}" PROPERTIES
+                              TIMEOUT "${_arcint_cell_timeout}")
+      endif()
     endforeach()
   endif()
 endif()

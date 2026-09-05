@@ -15,45 +15,51 @@ Every 77 (skip) must be named on that command line, or the run does not count as
       flags: ARCINT_EXTRA_ARGS=--offload-ratio 20 --paged-kv u8:i4; ARCINT_MOE_DEVICE_POOL_BYTES=8 GiB (the suite adds its own --n-ctx 8192 and per-section cache flags)
       gates: byte-equality: cold vs warm cache, chunked vs unchunked prefill, one chunk size vs another
       reports: chunk sweep
+      timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
 - [ ] `coder-offload-2lane` -- tests/equivalence/run.sh (§5)
       flags: ARCINT_EXTRA_ARGS=--offload-ratio 20 --paged-kv u8:i4 --parallel 2; ARCINT_MOE_DEVICE_POOL_BYTES=8 GiB
       gates: the same byte-equality claims as coder-offload-1lane, held at --parallel 2
+      timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
 - [ ] `coder-offload-concurrency` -- tests/concurrency/run.py (§4.1, §5)
       flags: ARCINT_EXTRA_ARGS=--offload-ratio 20 --paged-kv u8:i4; ARCINT_MOE_DEVICE_POOL_BYTES=8 GiB
       gates: no cross-slot bleed, cold/warm per lane, cancellation, admission (§4.1)
+      timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
 - [ ] `coder-served-large` -- tests/equivalence/run.sh (§5)
       flags: ARCINT_EXTRA_ARGS=--paged-kv u8, no offload (the served precision; the suite's own --n-ctx 8192)
       gates: steady-state decode >= 60 t/s (measured 53.4 cold / 69.2 warm, DESIGN §7.0.2ai)
       reports: 53.4 t/s cold, 69.2 t/s warm
+      timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
 - [ ] `coder-served-small` -- tests/equivalence/run.sh (§5)
       flags: ARCINT_EXTRA_ARGS=--paged-kv u8 (the served precision at the suite's own --n-ctx 8192; the served depth 98,304 and 2 GiB prefix cache are the pruefstand cell's)
       gates: the equivalence and concurrency suites both pass on the 16 GiB card
       reports: 48.0/49.5 t/s
+      timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
 - [ ] `agent-dense` -- tests/equivalence/run.sh (§3.5.2, §5)
       flags: ARCINT_EXTRA_ARGS=--paged-kv u8 (the suite's own --n-ctx 8192; its MTP section is M11's shallow gate)
       gates: MTP identity (equivalence's MTP section) and MTP acceptance > 10%
+      timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
 - [ ] `tier-reference-cell` -- tests/acceptance/cells/tier_reference.sh (§3.4, §7.0.2ai)
       flags: ratio 50, ARCINT_MOE_DEVICE_POOL_BYTES=8 GiB pool, u8 KV, 1 lane, n_ctx 65536, 1,198-tok prompt, 64 greedy tokens, 2 requests/process
       gates: tier ON/OFF byte-identity and E2 (CONT after history == CONT fresh)
       reports: 16.4 t/s decode, 26.6 t/s prefill
-      runner: not yet in the tree (Increment 2); the cell cannot run
+      timeout: 7200s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
 - [ ] `ngram-determinism-repeat` -- tests/acceptance/cells/ngram_determinism.sh (§7.0.2ae)
-      flags: --draft 4 --draft-ngram 3, six fresh processes
+      flags: ARCINT_EXTRA_ARGS=--offload-ratio 50 --moe-cpu-tier (the 35B tier config); --draft 4 --draft-ngram 3, six fresh processes
       gates: six fresh processes produce identical output
-      runner: not yet in the tree (Increment 2); the cell cannot run
+      timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
 - [ ] `depth-ladder` -- tests/acceptance/cells/depth_ladder.sh (§5.1)
       flags: 98,147-token prefill at u8 and u8:i4, both cards
       gates: the load completes at both KV precisions on both cards
       reports: t/s per card and precision
-      runner: not yet in the tree (Increment 2); the cell cannot run
+      timeout: 10800s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
 - [ ] `pruefstand` -- external (§5)
       flags: greedy, thinking off
@@ -63,9 +69,11 @@ Every 77 (skip) must be named on that command line, or the run does not count as
 - [ ] `sanitizers` -- tests/acceptance/cells/sanitizers.sh (§5)
       flags: -fno-sanitize-recover; ASan+UBSan on x86_64, UBSan elsewhere; over unit+roundtrip+stress
       gates: zero sanitizer reports
-      runner: not yet in the tree (Increment 2); the cell cannot run
+      reports: device-free build only (ARCINT_OPENVINO=OFF): the 4 rope-precision cases gated on ARCINT_OPENVINO are not instrumented by this cell
+      timeout: 1800s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
 - [ ] `package-build` -- contrib/packaging/arcint/build-deb.sh (§5.1)
       flags: version stamp (build-deb.sh:60), RPATH probe
       gates: the package build succeeds, is version-stamped, and its RPATH probe passes; a post-deploy smoke run follows the install, outside this cell
+      timeout: 1800s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 <!-- END GENERATED by tools/acceptance_manifest.py -->

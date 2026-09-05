@@ -72,6 +72,10 @@ def render_checklist(cells):
         lines.append(f"      gates: {c['gates']}")
         if c.get("reports"):
             lines.append(f"      reports: {c['reports']}")
+        if c.get("timeout_seconds"):
+            lines.append(f"      timeout: {c['timeout_seconds']}s "
+                         "(the generated per-cell ctest test's own TIMEOUT; "
+                         "run.py --all enforces the same figure itself)")
         if c.get("increment"):
             lines.append(f"      runner: not yet in the tree (Increment {c['increment']}); the cell cannot run")
         if c.get("external"):

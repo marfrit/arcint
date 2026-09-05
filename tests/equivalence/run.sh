@@ -223,6 +223,7 @@ if [[ -f "$MODEL/openvino_mtp_layer.xml" && -f "$MODEL/openvino_mtp_lm_head.xml"
   fi
 else
   echo "  --   no MTP head in $MODEL; skipping the MTP gates"
+  echo "ACCEPTANCE-SKIP mtp-section no-mtp-head-in-artifact"
 fi
 
 # ------------------------------------------------- cold vs warm cache (§3.4)
