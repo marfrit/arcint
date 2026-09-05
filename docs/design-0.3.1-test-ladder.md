@@ -318,3 +318,46 @@ with no values to gate against yet: `tier-reference-cell` and `depth-ladder`
 claim out of `coder-served-large`/`coder-served-small`, §3). Every other
 cell carries `[]`, because none of the others has a runner that emits
 `ACCEPTANCE-METRIC` at all.
+
+### 8.9 Amendment (2026-09-05): `gate_at: null` is the report-only reference
+
+§8.1's table has rows that are *reports*, not gates — tier OFF decode, the
+static-partition prefill, the depth-ladder singles — and §8.4 speaks of
+demoting a reference to a report. The schema as landed in Increment 3 had no
+such thing: once a cell's `references` is a list, §8.2's "a printed metric with
+no reference ⇒ FAIL" applies to every `ACCEPTANCE-METRIC` line the runner
+prints, so filling `tier-reference-cell` would have had to either gate its
+prefill (freezing a defect, §8.1's own objection) or stop printing it (losing
+the record). The first real fill hit exactly that.
+
+A reference whose `gate_at` is `null` is **recorded and reported, never
+compared**: it carries every other mandatory field — `value`, `unit`,
+`direction`, `samples`, `spread_pct`, `config`, `prompt_tokens`, `design`,
+`measured`, `binary` — so the number the run prints has a record to be read
+against, run.py prints `REPORT <cell>/<metric>: <value> <unit> (recorded
+<value> <unit>, not gated)` with the runner's own number string, counts it
+neither as compared nor as a regression, and `--allow-regress` on it is
+refused as "did not regress". Four rules stay armed on a report-only metric:
+it must still be printed (a declared report the runner no longer emits is the
+same stale enumeration a missing gated reference is), its unit must match,
+its value must parse as a finite number, and `gate_at` must otherwise be a
+number — a `"14.8"` string, like a string `value`, is refused by `--check` and
+by run.py's own shape check rather than compared as text. Promoting a report
+to a gate, or demoting one, is the `gate_at` field moving under §8.4's
+citation rule, visible in the checklist and the §5.1 span as "report only,
+not gated" against "gate … at …".
+
+Proven device-free (`selftest.py`, 41 assertions): a report-only reference
+with a value far below its record ⇒ exit 0, `REPORT` printed, no `REGRESSED`,
+`0 compared`; `--allow-regress` naming it ⇒ non-zero for the did-not-regress
+reason; the reference declared but never printed ⇒ non-zero by the
+missing-metric rule and not a schema error; `gate_at` or `value` as a string
+⇒ schema error, `gate_at` `null` ⇒ none. Red before the mechanism landed: the
+exit-0/`REPORT` pair and the string-`gate_at` check. The other two run-level
+cases were already non-zero — one by a `TypeError` comparing a float against
+`null`, one by the missing-metric rule that applied regardless — which is why
+each asserts its reason in run.py's output and not the exit alone; a
+re-introduced crash cannot keep either green. Review-found while landing:
+the "not counted as compared" half and the `value` type check had no red
+case of their own until the count and the string-`value` assertions were
+added.

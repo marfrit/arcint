@@ -45,6 +45,10 @@ Metric comparison (§8.5), each fixture a script printing one or more
   --allow-regress naming a metric that held          -> exit != 0
   --allow-regress naming an unknown metric           -> exit != 0
   references: null, runner prints a metric anyway    -> exit 0 (report, not a gate)
+  gate_at null (§8.9), value far below the record    -> exit 0, REPORT printed,
+                                                        0 compared
+  --allow-regress naming a report-only metric        -> exit != 0, "did not regress"
+  gate_at null, runner never prints the metric       -> exit != 0, missing-metric rule
 
 Declared expected skips (§2's amendment: a coder-artifact cell's MTP section
 is a KNOWN skip, not an anomaly to keep re-naming on every command line):
@@ -160,10 +164,13 @@ def main():
     declared_missing = subset(["declared-skip-missing"])
     ref_skip = subset(["metric-ref-but-skips"])
     no_refs_key = subset(["no-references-key"])
+    report_only = subset(["metric-report-only"])
+    report_only_missing = subset(["metric-report-only-missing"])
     all_metric_fixtures = [pass_only, pass_skip, fail_only, named_skip_only,
                            at_gate, below_band, above_band, far_better,
                            unknown_name, missing, nan, wrong_unit, null_refs,
-                           declared_fires, declared_missing, ref_skip, no_refs_key]
+                           declared_fires, declared_missing, ref_skip, no_refs_key,
+                           report_only, report_only_missing]
     try:
         check("all cells pass -> exit 0",
               run(pass_only) == 0, True)
@@ -240,6 +247,35 @@ def main():
         # time too, matching --check's own authority.
         check("a cell with no \"references\" key at all -> exit != 0",
               run(no_refs_key) == 0, False)
+
+        # §8.9: a reference with gate_at null is recorded and reported,
+        # never gated -- a value far below the record passes with a REPORT
+        # line and no REGRESSED; but the metric must still be printed, a
+        # declared report that vanished is the same stale enumeration a
+        # missing gated reference is.
+        rc, stderr = run_capture(report_only)
+        check("report-only reference (gate_at null), value far below record -> exit 0",
+              rc == 0, True)
+        check("... and REPORT is printed, never REGRESSED",
+              "REPORT metric-report-only/fake-prefill" in stderr and "REGRESSED" not in stderr, True)
+        check("... and it is not counted as compared",
+              "0 compared, 0 regressed" in stderr, True)
+        # The next two were non-zero before the mechanism existed too -- one
+        # by a TypeError comparing a float against None, one by the missing-
+        # metric rule that already applied -- so each asserts the REASON in
+        # stderr, not just the exit: a crash must not keep either green
+        # (review, 2026-09-05).
+        rc, stderr = run_capture(report_only, allow_regress=["metric-report-only/fake-prefill"])
+        check("--allow-regress naming a report-only metric -> exit != 0 (nothing to excuse)",
+              rc == 0, False)
+        check("... for the did-not-regress reason, not a crash",
+              "--allow-regress metric-report-only/fake-prefill: did not regress" in stderr, True)
+        rc, stderr = run_capture(report_only_missing)
+        check("report-only reference the runner never printed -> exit != 0",
+              rc == 0, False)
+        check("... by the missing-metric rule, not a schema error",
+              "reference declared but the runner never printed it" in stderr
+              and "schema error" not in stderr, True)
     finally:
         for path in all_metric_fixtures:
             os.unlink(path)
@@ -263,10 +299,22 @@ def main():
              "measured": "1970-01-01", "binary": "b"}
         ]
     }
+    report_cell = json.loads(json.dumps(valid_cell))
+    report_cell["references"][0]["gate_at"] = None
+    text_gate_cell = json.loads(json.dumps(valid_cell))
+    text_gate_cell["references"][0]["gate_at"] = "14.8"
+    text_value_cell = json.loads(json.dumps(valid_cell))
+    text_value_cell["references"][0]["value"] = "16.4"
     check("--check: a well-formed reference -> no schema errors",
           len(acceptance_manifest.validate_cells([valid_cell])) == 0, True)
     check("--check: a reference missing a mandatory field -> schema error",
           len(acceptance_manifest.validate_cells([broken_cell])) == 0, False)
+    check("--check: gate_at null (report-only, §8.9) -> no schema errors",
+          len(acceptance_manifest.validate_cells([report_cell])) == 0, True)
+    check("--check: gate_at as a string -> schema error",
+          len(acceptance_manifest.validate_cells([text_gate_cell])) == 0, False)
+    check("--check: value as a string -> schema error",
+          len(acceptance_manifest.validate_cells([text_value_cell])) == 0, False)
 
     if FAILED:
         print(f"\n{len(FAILED)} of {TOTAL} assertion(s) failed: {', '.join(FAILED)}",

@@ -188,10 +188,13 @@ emit_metric prefill-warm-2nd-off "$prefill_off" t/s
 emit_metric decode-warm-2nd-on   "$decode_on"   t/s
 emit_metric prefill-warm-2nd-on  "$prefill_on"  t/s
 if [[ -n "$decode_off" && -n "$decode_on" ]]; then
-  # One decimal, on/off from the SAME window (this invocation), which is why
-  # it cancels the process-to-process drift a lone decode-warm-2nd-on figure
+  # Two decimals: the first real run put the ratio at 1.31-1.34 against a
+  # band derived by §8.3 from those samples, and one decimal would quantise
+  # both the sample and its gate to the same 1.3 -- a gate with no margin
+  # to read. On/off from the SAME window (this invocation), which is why it
+  # cancels the process-to-process drift a lone decode-warm-2nd-on figure
   # cannot (§8.1's own reason for gating the ratio as well as the rate).
-  ratio=$(python3 -c "print(f'{${decode_on}/${decode_off}:.1f}')" 2>/dev/null || true)
+  ratio=$(python3 -c "print(f'{${decode_on}/${decode_off}:.2f}')" 2>/dev/null || true)
   emit_metric decode-ratio-on-off "$ratio" ratio
 fi
 

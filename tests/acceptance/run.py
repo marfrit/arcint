@@ -248,7 +248,18 @@ def _reference_shape_error(cell_name, ref):
         return f"reference {ref.get('metric', '?')!r} missing field(s): {', '.join(missing)}"
     if ref["direction"] not in DIRECTIONS:
         return f"reference {ref['metric']!r} has unknown direction {ref['direction']!r}"
+    if not _is_number(ref["value"]):
+        return f"reference {ref['metric']!r} has a non-numeric value {ref['value']!r}"
+    # gate_at null is the report-only form (docs/design-0.3.1-test-ladder.md
+    # §8.9): recorded, printed, never compared. Anything else must be a number
+    # a comparison can use -- a "14.8" string would compare as text or crash.
+    if ref["gate_at"] is not None and not _is_number(ref["gate_at"]):
+        return f"reference {ref['metric']!r} has a non-numeric gate_at {ref['gate_at']!r} (null or a number)"
     return None
+
+
+def _is_number(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
 
 
 def compare_metrics(cell_name, cell, metrics):
@@ -339,8 +350,16 @@ def compare_metrics(cell_name, cell, metrics):
             hard_fail = True
             continue
 
-        compared += 1
         gate_at, target, direction = ref["gate_at"], ref["value"], ref["direction"]
+        if gate_at is None:
+            # Report-only (§8.9): the record is there to be read next to the
+            # run's own number, and to keep the missing-metric rule (below)
+            # armed; it is not a threshold, so it counts neither as compared
+            # nor as a regression, and --allow-regress has nothing to name.
+            messages.append(f"REPORT {qualified}: {value_str} {unit} "
+                            f"(recorded {target} {unit}, not gated)")
+            continue
+        compared += 1
         if direction == "lower-is-worse":
             is_regression = value < gate_at
             is_improvement = value > target
@@ -350,14 +369,14 @@ def compare_metrics(cell_name, cell, metrics):
 
         if is_regression:
             regressed.append(qualified)
-            messages.append(f"REGRESSED {qualified}: {value} {unit} against gate {gate_at} {unit}")
+            messages.append(f"REGRESSED {qualified}: {value_str} {unit} against gate {gate_at} {unit}")
         elif is_improvement:
             delta = value - target
             improved.append(qualified)
-            messages.append(f"PASS {qualified}: {value} {unit}; "
+            messages.append(f"PASS {qualified}: {value_str} {unit}; "
                              f"IMPROVED {delta:+.2f} {unit} vs recorded {target} {unit}")
         else:
-            messages.append(f"PASS {qualified}: {value} {unit}")
+            messages.append(f"PASS {qualified}: {value_str} {unit}")
 
     for metric in by_metric:
         if metric not in seen:

@@ -116,6 +116,15 @@ def validate_cells(cells):
             if ref["direction"] not in DIRECTIONS:
                 errors.append(f"{name}/{metric}: direction must be one of "
                               f"{DIRECTIONS}, got {ref['direction']!r}")
+            if not _is_number(ref["value"]):
+                errors.append(f"{name}/{metric}: value must be a number, got {ref['value']!r}")
+            # gate_at null is the report-only reference (§8.9): recorded and
+            # printed by run.py, never compared. Otherwise it is the number
+            # run.py compares against, and a string here would compare as
+            # text -- refuse it at --check time, not on the first real run.
+            if ref["gate_at"] is not None and not _is_number(ref["gate_at"]):
+                errors.append(f"{name}/{metric}: gate_at must be a number or null "
+                              f"(report-only), got {ref['gate_at']!r}")
             if metric in seen_metrics:
                 errors.append(f"{name}/{metric}: duplicate reference for this metric")
             seen_metrics.add(metric)
@@ -139,6 +148,19 @@ def validate_cells(cells):
     return errors
 
 
+def _is_number(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def gate_phrase(ref):
+    """'gate <direction> at <gate_at> <unit>' for a gated reference, or
+    'report only, not gated' for the §8.9 form -- one place, so the §5.1
+    span and the checklist cannot disagree about which a reference is."""
+    if ref["gate_at"] is None:
+        return "report only, not gated"
+    return f"gate {ref['direction']} at {ref['gate_at']} {ref['unit']}"
+
+
 def cell_phrase(cell):
     phrase = f"`{cell['name']}` gates {cell['gates']}"
     if cell.get("reports"):
@@ -148,8 +170,7 @@ def cell_phrase(cell):
         phrase += " (references: not yet filled)"
     elif references:
         rendered = "; ".join(
-            f"{r['metric']} {r['value']} {r['unit']} (gate {r['direction']} "
-            f"at {r['gate_at']} {r['unit']})"
+            f"{r['metric']} {r['value']} {r['unit']} ({gate_phrase(r)})"
             for r in references)
         phrase += f" (references: {rendered})"
     expected_skips = cell.get("expected_skips")
@@ -200,7 +221,7 @@ def render_checklist(cells):
         elif references:
             for r in references:
                 lines.append(f"      reference: {r['metric']} = {r['value']} {r['unit']} "
-                             f"(gate {r['direction']} at {r['gate_at']} {r['unit']}, "
+                             f"({gate_phrase(r)}, "
                              f"{r['samples']} sample(s), {r['spread_pct']}% spread) "
                              f"-- {r['config']}, {r['prompt_tokens']} prompt tokens, "
                              f"{r['design']}, measured {r['measured']}, {r['binary']}")

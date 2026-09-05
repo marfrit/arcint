@@ -146,5 +146,27 @@
        "config": "selftest fixture, not a measurement", "prompt_tokens": 100,
        "design": "§8.5", "measured": "1970-01-01", "binary": "fixture"}
     ]
+  },
+  {
+    "name": "metric-report-only",
+    "runner": {"cmd": "fixtures/metric-report-only.sh", "args": [], "env": {}},
+    "external": null,
+    "references": [
+      {"metric": "fake-prefill", "value": 20.0, "gate_at": null, "unit": "t/s",
+       "direction": "lower-is-worse", "samples": 2, "spread_pct": 0.0,
+       "config": "selftest fixture, not a measurement", "prompt_tokens": 100,
+       "design": "§8.9", "measured": "1970-01-01", "binary": "fixture"}
+    ]
+  },
+  {
+    "name": "metric-report-only-missing",
+    "runner": {"cmd": "/bin/true", "args": [], "env": {}},
+    "external": null,
+    "references": [
+      {"metric": "fake-prefill", "value": 20.0, "gate_at": null, "unit": "t/s",
+       "direction": "lower-is-worse", "samples": 2, "spread_pct": 0.0,
+       "config": "selftest fixture, not a measurement", "prompt_tokens": 100,
+       "design": "§8.9", "measured": "1970-01-01", "binary": "fixture"}
+    ]
   }
 ]
