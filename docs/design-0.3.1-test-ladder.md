@@ -103,3 +103,153 @@ Every one of these runs device-free.
 - **Wrongly red.** `--no-tests=error` requires a recent enough ctest; check the package builder's CMake before relying on it, and fall back to asserting the count from `ctest -N -L unit`. Widening the recipe to three tests adds up to ~7 minutes and binds an ephemeral port twice — a builder with a restrictive network namespace turns a green package red. That failure is real and should stand.
 - **`ARCINT_OPENVINO`.** The OV build has 4 more cases and `test_config.cpp:47-58` on the other branch. Never assert a bare case *total*; assert skips. `ARCINT_ACCEPTANCE=ON` with `ARCINT_OPENVINO=OFF` must be refused at configure time — a stub binary would "pass" a card cell by serving stub bytes, the worst available outcome.
 - **python3** becomes a hard dependency of two more unit tests. It already is one for `roundtrip` and `stress`, so this changes degree, not kind.
+
+
+## 8. Increment 3 — references, so a regression fails instead of scrolling past
+
+A measured number is prose in `reports` today (`cells.json:99`, `:124`, `:181`),
+rendered into the checklist and DESIGN §5.1 by `acceptance_manifest.py:36-38`
+(`DESIGN.md:1408`), and compared to nothing. This increment gates a subset of
+them under the one-entry-point discipline §2 gave skips.
+
+### 8.1 What a reference is
+
+Per cell, `"references": [ … ]`:
+
+    {"metric": "decode-warm-on", "value": 16.4, "gate_at": 14.8, "unit": "t/s",
+     "direction": "lower-is-worse", "samples": 2, "spread_pct": 0.0,
+     "config": "16 GiB card, 35B int4, ratio 50, 8 GiB pool, u8 KV, 1 lane,
+                n_ctx 65536, --moe-cpu-tier, 2nd request of a fresh process",
+     "prompt_tokens": 1197, "design": "§7.0.2ai", "measured": "2026-09-…",
+     "binary": "arcint <sha>, +p4"}
+
+`value` is the record; `gate_at` is what run.py compares, derived by §8.3 and
+written out, not computed at run time — a threshold you cannot read in the file
+is not reviewable. `direction` sets the sense (`lower-is-worse` for t/s,
+`higher-is-worse` for seconds and counters). `config` and `prompt_tokens` are
+mandatory: CLAUDE.md's rule that a number names card, depth, precision and
+configuration, as a schema constraint `acceptance-enumeration` enforces.
+
+Gated vs reported, decided (all §7.0.2ai):
+
+| number | verdict | why |
+|---|---|---|
+| tier ON decode, 2nd request 16.4/16.4 | **gate** 14.8 t/s | two agreeing samples |
+| tier ON/OFF decode ratio, same window (16.4 vs 11.3–11.4) | **gate** ≥ 1.30 | cancels process drift; this is M14's actual claim |
+| tier OFF decode 9.5–11.4 | report | 20 % spread, unexplained |
+| first-request decode 0.1–4.2, load 215–585 s | report | 42× spread; §7.0.2ai names two owners, separates neither |
+| prefill, static partition, 26.6–26.7 warm | report + gate `grouped_fallbacks` ≤ 40/process | below |
+| coder-served-large warm 69.2 | gate at §5's ≥ 60 bar, `samples: 1` | §8.3 |
+| coder-served-small 48.0/49.5 | **gate** 43.2 t/s | 3.1 % spread |
+| depth-ladder t/s ×4 | report | one sample each |
+
+**Prefill stays a report.** Gating 26.6 freezes a defect as a specification: the
+loss is a known mechanism (`grouped_fallbacks=40`, the per-expert fallback),
+0.3.1 is chartered to fix it, and the fixing commit would rewrite the reference
+in the same breath — a ratchet that moves only for the wrong reason. What can
+worsen unnoticed is the mechanism, so gate the counter, not the rate: integer,
+deterministic, and it *is* the 3×. Confirm in the fill window that 40 is per
+process independent of request count; if it scales with requests, report it.
+
+### 8.2 Wire format, and who compares
+
+Runners print `ACCEPTANCE-METRIC <metric> <value> <unit>`, mirroring
+`ACCEPTANCE-SKIP` (`run.py:50`); run.py scans the stream it already scans
+(`run.py:126-131`), qualifies to `<cell>/<metric>`, compares against
+`cells.json`. **run.py compares, not the runner.** §2's principle is that one
+entry point may tolerate: a comparing runner would keep a copy of the threshold
+in shell, decide its own exit code, and leave `--allow-regress` nothing to
+attach to — the `SKIP_RETURN_CODE` hole again. *Rejected:* run.py parsing the
+server's own `prefill|decode … t/s` lines (`tier_reference.sh:100-102`,
+`depth_ladder.sh:117-119`) — a log format is not a contract, and only the runner
+knows which request was warm.
+
+Rules, symmetric with skips:
+
+- worse than `gate_at` ⇒ **FAIL**, unless named `--allow-regress <cell>/<metric>`
+  in `--all`; no such flag in `--cell` (`run.py:203-213`);
+- `--allow-regress` naming a metric that held, or an unknown one ⇒ non-zero
+  (`run.py:256-259`'s rule, second domain);
+- a printed metric with no reference ⇒ **FAIL**;
+- a declared reference the runner never printed ⇒ **FAIL** (missing metric) —
+  an error, yes: a reference that can be silently absent is a gate that measures
+  nothing, this increment's premise;
+- better than the band ⇒ pass, printed `IMPROVED <delta>`, never auto-ratcheted;
+  the summary (`run.py:264-266`) gains `N compared, M regressed, K improved`.
+
+### 8.3 Tolerance from a spread
+
+**Gate on the worst sample, band by measurement noise, refuse to gate an
+unexplained spread.** With `s` = spread of the warm samples over their minimum:
+`s ≤ 5 %` ⇒ `gate_at = min × 0.90`; `5 < s ≤ 10 %` ⇒ `× (1 − 2s)`; `s > 10 %` ⇒
+**not a reference** — that wide is an unmeasured mechanism, which CLAUDE.md does
+not let one encode as a tolerance. `tol_abs` floor 0.5 t/s.
+
+Applied: tier warm decode 16.4/16.4, `s = 0` ⇒ 14.8 — which sits *below* the
+LRU-era record 15.0/15.5 (§7.0.2x): the band is sized by noise, not by the
+mechanism's margin, which is why the ON/OFF ratio is the second gate.
+coder-served-small 48.0/49.5 ⇒ 43.2.
+
+**A single sample is never a band.** 69.2 gates against §5's independently
+stated ≥ 60 t/s bar and records `samples: 1`: that tolerance came from a
+commitment, not from measured variance. A single sample with no such bar stays a
+report until a second exists (the depth-ladder four).
+
+### 8.4 Where the values come from, and how they change
+
+From this window's runs of the committed runners, never the 0.3.0 ad-hoc
+scripts. The prompt is tiled from `prompts/filler-seed.txt` and sized against
+the server's own `usage.prompt_tokens` (`size_prompt.py:96`; ±3 % tier, ±2 %
+ladder), so the depth is this artifact's, not the 1,198-token document —
+§7.0.2ai's figures are the window's sanity envelope, not its references. Each
+reference stores the `prompt_tokens` the sizer reported.
+
+A commit moving `value`/`gate_at` cites, in `design` and in the message, the
+DESIGN §7.0.2x that measured the new number, and regenerates: references render
+beside their cell in `docs/release-checklist.md` (`acceptance_manifest.py:66-86`)
+and into the §5.1 span, so the number moving is a visible diff and
+`acceptance-enumeration` fails otherwise. Demoting a reference to a report takes
+the same citation — §7.0's retraction culture applied to thresholds.
+
+### 8.5 Red-first, device-free
+
+Extend `fixtures/cells-fake.json` and `selftest.py:73-91` (8 assertions → 18),
+each fixture a two-line script printing a metric line: at `gate_at` ⇒ 0; below
+band, lower-is-worse ⇒ ≠ 0, and 0 when named; above band, higher-is-worse
+seconds ⇒ ≠ 0 (proves `direction` is honoured, not assumed); far better ⇒ 0 with
+`IMPROVED`; unknown name ⇒ ≠ 0; reference declared, nothing printed ⇒ ≠ 0;
+`NaN`/wrong unit ⇒ ≠ 0; `--allow-regress` on a metric that held, and on an
+unknown one ⇒ ≠ 0 each. Run them all once with the comparison stubbed out: every
+one green there, or they measure nothing.
+
+### 8.6 Files, sizes, and what the fill window records
+
+`cells.json` +~90; `run.py` +~120 (regex, compare, `--allow-regress`,
+accounting); `selftest.py` + 7 fixtures +~130; `tier_reference.sh` +~30 and
+`depth_ladder.sh` +~25 (emit per request from a known index, not `tail -4` of a
+log); `acceptance_manifest.py` +~30; regenerated checklist and §5.1 span. No
+CMake change — `acceptance-runner` already runs the selftest.
+
+The window records per metric: card, artifact, KV precision, lanes, n_ctx,
+offload ratio and pool bytes, the sizer's `prompt_tokens`, which process and
+which request, the arcint commit and the `+pN`, and the raw server line — both
+processes, both requests, never one number.
+
+### 8.7 Risks
+
+- **A cold/warm mix in a reference.** The `lines()` helpers tail four matching
+  lines of a log holding both requests. The name must state the request
+  (`decode-warm-2nd`) and the runner emit it from a known index, or the first
+  gate to fire will be a process that logged differently.
+- **Sizing tolerance against a t/s reference.** ±3 % of prompt tokens moves
+  prefill directly and decode slightly — inside a 10 % band, not a tight one. No
+  reference tightens below ~5 % without tightening `--tol` first, and
+  `prompt_tokens` is stored so the interaction is auditable. 64 decoded tokens
+  is a short window: quantisation, not noise.
+- **Both cards under one name.** `depth-ladder` is `card_class: both` and emits
+  four numbers; a bare `decode` would average two cards. Names carry card and
+  precision (`decode-large-u8`); the schema check refuses an unqualified name in
+  a `both` cell — likewise tier ON/OFF.
+- **`--allow-regress` rot**, worse than a named skip: a slide once excused stays
+  excused. The delta prints into the summary; the checklist carries a line for
+  the reason.
