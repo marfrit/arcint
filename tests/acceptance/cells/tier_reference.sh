@@ -113,6 +113,11 @@ lines() {  # lines <log> -- the server's own reported prefill/decode rates (repo
   # which shifted every fixed index by one on the first real run of this
   # runner: the "2nd request" metrics were the first request's.
   grep -a -E "slot [0-9]+: (prefill|decode) " "$1" | tail -4 | sed 's/^/       /'
+  # The plugin's own per-process counters, when the runtime was asked to
+  # print them (MOE_OTD_PERF_LOG=1): the last [OTD_PERF] line carries
+  # static_partition, seed, resident_checksum and grouped_fallbacks. The
+  # work dir is deleted on exit, so this is the only place they survive.
+  grep -a -o -E '\[OTD_PERF\].*' "$1" | tail -1 | sed 's/^/       /'
 }
 
 metric_value() {  # metric_value <log> <prefill|decode> <request-index, 1-based>

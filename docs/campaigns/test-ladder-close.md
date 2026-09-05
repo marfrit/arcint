@@ -154,3 +154,15 @@ sample the committed runner printed, never a number from an ad-hoc script
   which is `static-partition-cold-start`'s cost, not a decode reference.
   This window's rates are therefore usable for the fill from the second
   processes, with the first processes reported beside them.
+- 2026-09-05, closed. Three more windows (DESIGN §7.0.2al): the two
+  24 GB-card cells passed (warm decode 66.5 t/s against §5's 60 bar), the
+  ladder served all four cells on a quiet host with one prefill per
+  process (both morning u8:i4 failures did not reproduce), the tier
+  diagnostic passed with hashes printed and the §7.0.2ak divergence not
+  reproduced. References filled per §8.3 from three windows' samples:
+  `decode-warm-2nd-on` gates at 14.8, `decode-ratio-on-off` at 1.17, the
+  large-card warm decode at 60; nineteen report-only references carry the
+  record. `grouped_fallbacks` read 400, not 40 — report-only until its
+  unit is read off the plugin. The milestone row carries the closing
+  line; the open engine findings (one unreproduced divergence, one
+  unreproduced fault) live in their campaigns.

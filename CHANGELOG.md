@@ -17,6 +17,31 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## Unreleased
+
+- **Unit and acceptance tests differentiated** (0.3.1's lead item,
+  `docs/design-0.3.1-test-ladder.md`): bare `ctest` is the unit set by
+  construction; `ARCINT_ACCEPTANCE` registers sixteen enumerated cells
+  (`tests/acceptance/cells.json`) that `tests/acceptance/run.py --all` runs,
+  failing on any skip or regression not named; references with gates
+  derived from the runners' own samples (three gated, nineteen report-only
+  as of the fill) and declared expected skips; `docs/release-checklist.md`
+  and DESIGN §5.1's row are generated from the enumeration with a drift
+  check that runs as a unit test. The first real runs corrected the
+  enumeration nine times (six and a schema form in §7.0.2aj, two in
+  §7.0.2ak) and are on the record (DESIGN §7.0.2aj–§7.0.2al).
+  The package recipe's unit gate covers the whole unit set.
+- **Campaigns**: every open defect after 0.3.0 is one document under
+  `docs/campaigns/` with the prior art surveyed; the milestone document's
+  backlog rows are frozen.
+- Known, open, on the record: one follow-up window had two tier-ON
+  processes disagree on the same prompt (§7.0.2ak); a diagnostic rerun did
+  not reproduce it (§7.0.2al); the runner now prints every output's hash.
+  The u8:i4 deep-prefill fault on the 24 GB card reappeared once, with a
+  third deep prefill in one process and a second client on the card
+  (§7.0.2aj), and did not reproduce with one prefill per process on a quiet
+  card (§7.0.2al).
+
 ## 0.3.0 — 2026-09-05
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p4` (patches 0003–0018),

@@ -154,8 +154,11 @@ refused at startup with every term. At request time, a third concurrent request
 is a 503 carrying the same arithmetic (--queue-timeout S restores queueing).
 
 Verification: 409 unit cases device-free (413 with the OpenVINO backend), a 64-check curl round-trip, a lane-accounting
-stress (200 requests, 24-way, 8 lanes, both queueing and refusing), an
-equivalence suite and a concurrency suite that run where the card is. Clean
+stress (200 requests, 24-way, 8 lanes, both queueing and refusing) -- the unit
+set, what bare ctest runs; and an acceptance target of sixteen enumerated cells
+(tests/acceptance/) that runs where the cards are, fails on any skip or
+regression not named, and carries twenty-two references filled from its own
+runners' samples (three gated, nineteen report-only). Clean
 under ASan and UBSan on x86_64.
 
 ## Contracts

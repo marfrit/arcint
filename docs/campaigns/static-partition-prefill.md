@@ -122,3 +122,11 @@ keep passing throughout.
 ## Status
 
 - 2026-09-05 — opened from the 0.3.1 backlog row; nothing started.
+- 2026-09-05, later — the counter's number is not 40. With the plugin's
+  counters on (`MOE_OTD_PERF_LOG=1`), the tier reference cell's second
+  tier-ON process printed `grouped_fallbacks=400` after two requests of
+  1,167 tokens (DESIGN §7.0.2al): five per layer per request over 40
+  layers, or ten per process, and the unit is unread either way — the
+  "one per layer" reading above came from §7.0.2ai's single reading of
+  40. The reference is report-only until this campaign's recon reads the
+  counter's unit off the plugin.

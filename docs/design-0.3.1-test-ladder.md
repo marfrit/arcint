@@ -186,6 +186,18 @@ reports whether ON agrees with OFF this time, with the first divergence
 point if not. The ratio row's own claim -- that the ON/OFF *rate* gap
 cancels process drift -- was never about byte content and needed no change.
 
+**Amendment (2026-09-05, the fill):** two rows above were demoted to
+report-only when the references were written (DESIGN §7.0.2al). The
+small-card coder decode (48.0/49.5 in the table) came from §7.0.2ai's ad-hoc
+script; the committed runner has one sample (47.6) and this card has no
+independently stated bar, so §8.3's single-sample rule makes it a report
+until a second window. `grouped_fallbacks` read 400 per process after two
+requests, not the 40 the row assumed, and its unit is unread; gating it at
+40 would have failed the first real run for a number nobody understands.
+Gated as planned: the tier warm decode (14.8 from 16.4/16.4/16.4), the
+ON/OFF ratio (1.17 from 1.31/1.38/1.31) and the large-card warm decode at
+§5's 60.
+
 **Prefill stays a report.** Gating 26.6 freezes a defect as a specification: the
 loss is a known mechanism (`grouped_fallbacks=40`, the per-expert fallback),
 0.3.1 is chartered to fix it, and the fixing commit would rewrite the reference

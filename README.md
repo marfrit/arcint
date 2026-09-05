@@ -440,11 +440,13 @@ measurement that defines it, its gate and its entry criteria, sized so one
 session can carry it. `docs/milestone-0.3.0.md` is the record of how 0.3.0
 was planned and closed; its backlog rows are frozen and point there.
 
-Verification: 409 unit cases device-free (413 with the OpenVINO backend, one
-of them a CPU-affinity pin that needs a host allowing core 0), a 64-check curl
-round-trip, a lane-accounting stress (200 requests, 24-way, 8 lanes, queueing
-and refusing), an equivalence suite and a concurrency suite that run where the
-card is. Clean under ASan and UBSan on x86_64.
+Verification: 409 unit cases device-free (413 with the OpenVINO backend), a
+64-check curl round-trip, a lane-accounting stress (200 requests, 24-way, 8
+lanes, queueing and refusing) — the unit set, which is what bare `ctest` runs;
+and an acceptance target of sixteen enumerated cells (`tests/acceptance/`)
+that runs where the cards are, fails on any skip or regression not named on
+its command line, and carries twenty-two references filled from its own
+runners' samples. Clean under ASan and UBSan on x86_64.
 
 [CHANGELOG.md](CHANGELOG.md) lists what each release changed and the
 runtime it depends on. [DESIGN.md](DESIGN.md) records how these numbers were taken, including the
