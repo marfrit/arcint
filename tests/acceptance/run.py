@@ -183,25 +183,41 @@ def _run_streaming(cmd, env, cwd, timeout_seconds, shell=False):
 
 
 def run_external(cell, manifest):
+    """An external cell's command is the run manifest's value under the
+    cell's `manifest_key` (docs/design-pruefstand-cell.md §1) -- an
+    operator-supplied wrapper, configured into the build like the model root
+    and the device strings, never read from the environment (which does not
+    appear in the ctest log, docs/design-0.3.1-test-ladder.md §2). Empty means
+    not configured: a skip, by name. The wrapper's score comes back on the
+    ordinary ACCEPTANCE-METRIC channel and is gated by the cell's references
+    like any other metric; nothing here parses a score."""
     ext = cell["external"]
-    env_var = ext["env"]
-    value = os.environ.get(env_var, "")
-    if not value:
+    key = ext.get("manifest_key")
+    if not isinstance(key, str) or not key:
+        return FAIL, "cells.json schema error: external block has no manifest_key", [], []
+    # A manifest without the key at all is not "not configured": it is a
+    # manifest generated before the key existed (or written by hand), and the
+    # runner path treats an unknown manifest key as a hard error too
+    # (format_args). Only an EMPTY value is the operator's "no wrapper here".
+    if key not in manifest:
+        return FAIL, (f"run manifest has no key {key!r} "
+                      "(reconfigure; the key is generated at configure time)"), [], []
+    command = manifest[key]
+    if not isinstance(command, str) or not command:
         return SKIP, "external-harness-not-configured", [], []
-    invocation = ext["invocation"].replace(f"${env_var}", value)
     env = dict(os.environ)
     timeout_seconds = cell.get("timeout_seconds")
     try:
         rc, named_skips, metrics, timed_out = _run_streaming(
-            invocation, env, REPO_ROOT, timeout_seconds, shell=True)
+            command, env, REPO_ROOT, timeout_seconds, shell=True)
     except OSError as e:
-        return FAIL, f"could not start {env_var}: {e}", [], []
+        return FAIL, f"could not start manifest {key!r} command: {e}", [], []
     if timed_out:
         return FAIL, f"timeout ({timeout_seconds}s)", named_skips, metrics
     if rc == SKIP:
-        return SKIP, f"{env_var} exited 77", named_skips, metrics
+        return SKIP, f"manifest {key!r} command exited 77", named_skips, metrics
     if rc != 0:
-        return FAIL, f"{env_var} exited {rc}", named_skips, metrics
+        return FAIL, f"manifest {key!r} command exited {rc}", named_skips, metrics
     return PASS, None, named_skips, metrics
 
 

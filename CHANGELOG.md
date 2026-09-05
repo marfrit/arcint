@@ -48,6 +48,16 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   TIME-WAIT. Every server now probes its own port; red first with a
   planted listener, green at the density that failed. No served
   behaviour changed.
+- **The Prüfstand cell runs from the dev host** (`pruefstand-cell-remote`
+  closed, DESIGN §7.0.2ao, `docs/design-pruefstand-cell.md`): the
+  acceptance target's one external cell takes its command from the run
+  manifest's `pruefstand` key (`-DARCINT_ACCEPTANCE_PRUEFSTAND=<operator
+  wrapper>`, empty by default), not from an environment variable; the
+  wrapper prints `ACCEPTANCE-METRIC score <n> points` and the cell's
+  reference gates it at 10 — the old `score_parse` contract was never
+  read. First real run through the cell: 10/10 on the deployed package.
+  `run.py --all` on a host with the wrapper configured needs no
+  `--allow-skip pruefstand`.
 - Known, open, on the record: one follow-up window had two tier-ON
   processes disagree on the same prompt (§7.0.2ak); a diagnostic rerun did
   not reproduce it (§7.0.2al); the runner now prints every output's hash.

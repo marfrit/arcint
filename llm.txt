@@ -802,8 +802,11 @@ misc
   (registered only under -DARCINT_ACCEPTANCE=ON with the OpenVINO backend):
   the card-requiring cells enumerated in tests/acceptance/cells.json and run by
   tests/acceptance/run.py (an unnamed skip fails the run); equivalence/run.sh
-  and concurrency/run.py are its runners. docs/release-checklist.md and the
-  DESIGN §5.1 acceptance row are generated from that enumeration.
+  and concurrency/run.py are its runners; the one external cell (the
+  Prüfstand) runs the operator's wrapper named by the run manifest's
+  `pruefstand` key and gates its score as an ordinary metric.
+  docs/release-checklist.md and the DESIGN §5.1 acceptance row are generated
+  from that enumeration.
 - third_party/: cpp-httplib 0.18.3, nlohmann/json 3.11.3, single headers.
 
 ## Build

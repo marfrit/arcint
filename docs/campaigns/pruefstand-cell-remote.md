@@ -118,3 +118,17 @@ runner reaches or verifies it does.
 ## Status
 
 - 2026-09-05 — opened from the 0.3.1 window; nothing started.
+- 2026-09-05, closed (shape 1, DESIGN §7.0.2ao; design note
+  `docs/design-pruefstand-cell.md`). Recon found the score contract inert
+  (`run_external` never read `score_parse`) and the invocation naming a
+  wrapper that does not exist. Change: run-manifest key `pruefstand` from
+  `ARCINT_ACCEPTANCE_PRUEFSTAND` (empty by default); the cell's external
+  block names the key only; the environment is no channel; the wrapper
+  prints `ACCEPTANCE-METRIC score <n> points` and the cell's reference
+  gates it at 10 through §8.2's existing comparison; `validate_cells`
+  checks the external shape; `timeout_seconds` 1800. Red first: eight
+  self-test assertions failed on the old runner, 58 pass after. Real run
+  from the dev host against the deployed package (0.2.12-1+p3, its own
+  port, units untouched): `PUNKTE 10/10`, `PASS pruefstand/score: 10
+  points`, exit 0. `run.py --all` no longer needs `--allow-skip pruefstand`
+  where the wrapper is configured.

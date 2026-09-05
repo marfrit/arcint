@@ -168,5 +168,17 @@
        "config": "selftest fixture, not a measurement", "prompt_tokens": 100,
        "design": "§8.9", "measured": "1970-01-01", "binary": "fixture"}
     ]
+  },
+  {
+    "name": "external-cell",
+    "runner": null,
+    "external": {"manifest_key": "pruefstand"},
+    "references": [
+      {"metric": "score", "value": 10, "gate_at": 10, "unit": "points",
+       "direction": "lower-is-worse", "samples": 2, "spread_pct": 0.0,
+       "config": "selftest fixture, not a measurement", "prompt_tokens": 100,
+       "design": "docs/design-pruefstand-cell.md §1", "measured": "1970-01-01",
+       "binary": "fixture"}
+    ]
   }
 ]

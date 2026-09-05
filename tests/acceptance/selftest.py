@@ -69,15 +69,30 @@ Increment-3 review fixes (2026-09-05), each proving one MAJOR:
   item  7 -- a cell with no "references" key at all (not null, absent) is a
              schema error at run time too, not only at --check
 
-Plus one schema assertion, exercised directly against
+The external cell (docs/design-pruefstand-cell.md §1, §3), driven through a
+temporary manifest whose `pruefstand` key names fixtures/external-score.sh:
+
+  manifest key empty                              -> unnamed skip, exit != 0
+  the same, named via --allow-skip                -> exit 0, reason printed
+  manifest without the key at all                 -> exit != 0, a failure, not a skip
+  the environment variable set, manifest key empty -> still a skip (the
+                                                     environment is not a channel)
+  manifest key names a wrapper printing score 10  -> exit 0
+  ... printing score 9                            -> exit != 0, REGRESSED
+  ... printing no metric line                     -> exit != 0, missing metric
+  ... exiting 1                                   -> exit != 0
+
+Plus schema assertions, exercised directly against
 tools/acceptance_manifest.py's validate_cells() rather than through run.py
 (that function's authority is --check, not the runner):
 
   a reference missing a mandatory field -> a non-empty error list
+  an external block without manifest_key -> error; external plus runner -> error
 """
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -111,18 +126,39 @@ def run(cells_path, allow_skip=(), allow_regress=()):
     return run_capture(cells_path, allow_skip, allow_regress)[0]
 
 
-def run_capture(cells_path, allow_skip=(), allow_regress=()):
+def run_capture(cells_path, allow_skip=(), allow_regress=(), manifest=FAKE_MANIFEST, env=None):
     """Like run(), but also returns run.py's own stderr (where its PASS /
     FAIL / REGRESSED / IMPROVED lines land -- the runner's own raw output
-    goes to run.py's stdout instead, via _run_streaming's passthrough)."""
-    cmd = [RUN_PY, "--cells", cells_path, "--manifest", FAKE_MANIFEST,
+    goes to run.py's stdout instead, via _run_streaming's passthrough).
+    `manifest` and `env` exist for the external cell, whose command comes
+    from the manifest and whose environment must NOT be a channel."""
+    cmd = [RUN_PY, "--cells", cells_path, "--manifest", manifest,
            "--source-dir", HERE, "--all"]
     for name in allow_skip:
         cmd += ["--allow-skip", name]
     for name in allow_regress:
         cmd += ["--allow-regress", name]
-    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                          env=env)
     return proc.returncode, proc.stderr
+
+
+def manifest_with(pruefstand):
+    """A temporary copy of the fixture manifest whose `pruefstand` key is
+    `pruefstand` -- the external cell's command line, which the selftest
+    points at fixtures/external-score.sh by absolute path (run.py runs an
+    external command from the repository root, not --source-dir). None
+    removes the key altogether: a manifest from before the key existed."""
+    with open(FAKE_MANIFEST, encoding="utf-8") as f:
+        manifest = json.load(f)
+    if pruefstand is None:
+        del manifest["pruefstand"]
+    else:
+        manifest["pruefstand"] = pruefstand
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(manifest, f)
+    return path
 
 
 def run_cell_mode(cells_path, cell_name):
@@ -277,6 +313,47 @@ def main():
         check("... by the missing-metric rule, not a schema error",
               "reference declared but the runner never printed it" in stderr
               and "schema error" not in stderr, True)
+
+        # The external cell (docs/design-pruefstand-cell.md §3): its command
+        # is the manifest's `pruefstand` key and nothing else; its score is a
+        # metric like any other, so §8.2's rules gate it unchanged.
+        external = subset(["external-cell"])
+        all_metric_fixtures.append(external)
+        wrapper = shlex.quote(os.path.join(HERE, "fixtures", "external-score.sh"))
+        m_empty = manifest_with("")
+        m_absent = manifest_with(None)
+        m_ten = manifest_with(f"{wrapper} 10")
+        m_nine = manifest_with(f"{wrapper} 9")
+        m_silent = manifest_with(f"{wrapper} none")
+        m_fails = manifest_with(f"{wrapper} 10 1")
+        all_metric_fixtures += [m_empty, m_absent, m_ten, m_nine, m_silent, m_fails]
+        rc, stderr = run_capture(external, manifest=m_empty)
+        check("external cell, manifest key empty -> unnamed skip, exit != 0", rc == 0, False)
+        check("... with the not-configured reason",
+              "external-harness-not-configured" in stderr, True)
+        rc, stderr = run_capture(external, allow_skip=["external-cell"], manifest=m_absent)
+        check("manifest without the key at all -> exit != 0 even when the skip is named",
+              rc == 0, False)
+        check("... as a failure naming the key, not a skip",
+              "run manifest has no key 'pruefstand'" in stderr
+              and "external-harness-not-configured" not in stderr, True)
+        check("the same, named via --allow-skip -> exit 0",
+              run_capture(external, allow_skip=["external-cell"], manifest=m_empty)[0] == 0, True)
+        env_set = dict(os.environ, ARCINT_PRUEFSTAND=f"{wrapper} 10")
+        check("the environment variable set, manifest key empty -> still a skip (env is not a channel)",
+              run_capture(external, allow_skip=["external-cell"], manifest=m_empty, env=env_set)[0] == 0,
+              True)
+        check("manifest key names a wrapper printing score 10 -> exit 0",
+              run_capture(external, manifest=m_ten)[0] == 0, True)
+        rc, stderr = run_capture(external, manifest=m_nine)
+        check("... printing score 9 -> exit != 0", rc == 0, False)
+        check("... as a REGRESSED metric", "REGRESSED external-cell/score" in stderr, True)
+        rc, stderr = run_capture(external, manifest=m_silent)
+        check("... printing no metric line -> exit != 0", rc == 0, False)
+        check("... by the missing-metric rule",
+              "reference declared but the runner never printed it" in stderr, True)
+        check("... exiting 1 -> exit != 0",
+              run_capture(external, manifest=m_fails)[0] == 0, False)
     finally:
         for path in all_metric_fixtures:
             os.unlink(path)
@@ -316,6 +393,20 @@ def main():
           len(acceptance_manifest.validate_cells([text_gate_cell])) == 0, False)
     check("--check: value as a string -> schema error",
           len(acceptance_manifest.validate_cells([text_value_cell])) == 0, False)
+    # The external shape (docs/design-pruefstand-cell.md §1): an object naming
+    # a manifest key, on a cell with no runner.
+    external_ok = {"name": "ext", "runner": None,
+                   "external": {"manifest_key": "pruefstand"}, "references": []}
+    external_no_key = {"name": "ext", "runner": None,
+                       "external": {"env": "ARCINT_PRUEFSTAND"}, "references": []}
+    external_and_runner = {"name": "ext", "runner": {"cmd": "/bin/true", "args": []},
+                           "external": {"manifest_key": "pruefstand"}, "references": []}
+    check("--check: a well-formed external cell -> no schema errors",
+          len(acceptance_manifest.validate_cells([external_ok])) == 0, True)
+    check("--check: an external block without manifest_key -> schema error",
+          len(acceptance_manifest.validate_cells([external_no_key])) == 0, False)
+    check("--check: external plus a runner -> schema error",
+          len(acceptance_manifest.validate_cells([external_and_runner])) == 0, False)
 
     # The runners' log matchers, against a real server log excerpt
     # (fixtures/server-log-sample.log: the load banner -- which carries

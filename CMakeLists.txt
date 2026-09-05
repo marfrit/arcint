@@ -268,6 +268,18 @@ if(ARCINT_ACCEPTANCE)
       "OpenVINO device string for the 24 GB card in acceptance cells")
   set(ARCINT_ACCEPTANCE_DEVICE_SMALL "GPU.1" CACHE STRING
       "OpenVINO device string for the 16 GB card in acceptance cells")
+  # The one external cell's command (docs/design-pruefstand-cell.md §1): the
+  # operator's wrapper that reaches the Prüfstand harness from this host and
+  # prints `ACCEPTANCE-METRIC score <n> points`. Empty (the default) means the
+  # cell skips by name. Lives in the cache and the generated manifest only --
+  # never in a tracked file, which is the point of configuring it here.
+  set(ARCINT_ACCEPTANCE_PRUEFSTAND "" CACHE STRING
+      "Command line of the operator's Prüfstand wrapper for the external acceptance cell (empty: the cell skips; backslashes and double quotes are escaped into the manifest, generator expressions are not supported)")
+  # A command line, unlike the four paths above, may well carry a double
+  # quote; unescaped it would break the whole manifest, and run.py would die
+  # in json.load before any cell ran.
+  string(REPLACE "\\" "\\\\" _arcint_pruefstand_json "${ARCINT_ACCEPTANCE_PRUEFSTAND}")
+  string(REPLACE "\"" "\\\"" _arcint_pruefstand_json "${_arcint_pruefstand_json}")
 
   set(ARCINT_ACCEPTANCE_MANIFEST "${CMAKE_CURRENT_BINARY_DIR}/acceptance/run_manifest.json")
   file(GENERATE OUTPUT "${ARCINT_ACCEPTANCE_MANIFEST}" CONTENT
@@ -275,7 +287,8 @@ if(ARCINT_ACCEPTANCE)
   \"binary\": \"$<TARGET_FILE:arcint>\",
   \"model_root\": \"${ARCINT_ACCEPTANCE_MODEL_ROOT}\",
   \"device_large\": \"${ARCINT_ACCEPTANCE_DEVICE_LARGE}\",
-  \"device_small\": \"${ARCINT_ACCEPTANCE_DEVICE_SMALL}\"
+  \"device_small\": \"${ARCINT_ACCEPTANCE_DEVICE_SMALL}\",
+  \"pruefstand\": \"${_arcint_pruefstand_json}\"
 }
 ")
 
@@ -297,14 +310,13 @@ if(ARCINT_ACCEPTANCE)
       # anything but a failure (docs/design-0.3.1-test-ladder.md §7).
       set_tests_properties("acceptance-${_arcint_cell_name}" PROPERTIES LABELS acceptance)
 
-      # Per-cell TIMEOUT from cells.json's own timeout_seconds. The external
-      # cell (pruefstand) has no "timeout_seconds" key at all -- ERROR_VARIABLE
-      # turns that absent-key GET into a normal (non-fatal) miss instead of a
-      # configure error, and the guard checks the error, not only the value:
-      # that cell keeps ctest's default -- unbounded here, since the external
-      # harness's own timeout is out of this repository's hands. The value
-      # check stays too, defensively, in case some future cell carries an
-      # explicit JSON null there instead of omitting the key.
+      # Per-cell TIMEOUT from cells.json's own timeout_seconds. A cell may
+      # omit the key (the external cell did until docs/design-pruefstand-
+      # cell.md gave it one) -- ERROR_VARIABLE turns that absent-key GET into
+      # a normal (non-fatal) miss instead of a configure error, and the guard
+      # checks the error, not only the value: such a cell keeps ctest's
+      # default. The value check stays too, defensively, in case some future
+      # cell carries an explicit JSON null there instead of omitting the key.
       string(JSON _arcint_cell_timeout ERROR_VARIABLE _arcint_timeout_err
              GET "${_arcint_cells_json}" ${_arcint_i} "timeout_seconds")
       if(NOT _arcint_timeout_err AND NOT _arcint_cell_timeout STREQUAL "")

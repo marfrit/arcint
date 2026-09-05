@@ -705,25 +705,6 @@
     ]
   },
   {
-    "name": "pruefstand",
-    "design": [
-      "§5"
-    ],
-    "artifact_class": "coder-int4",
-    "card_class": "deployed-package",
-    "runner": null,
-    "flags": "greedy, thinking off",
-    "gates": "10/10 on the production coder artifact through the deployed package",
-    "reports": null,
-    "external": {
-      "env": "ARCINT_PRUEFSTAND",
-      "invocation": "$ARCINT_PRUEFSTAND --greedy --no-thinking",
-      "score_parse": "last line matches 'score: (\\d+)/10'",
-      "reference_score": "10/10"
-    },
-    "references": []
-  },
-  {
     "name": "sanitizers",
     "design": [
       "§5"
@@ -762,5 +743,37 @@
     "external": null,
     "timeout_seconds": 1800,
     "references": []
+  },
+  {
+    "name": "pruefstand",
+    "design": [
+      "§5"
+    ],
+    "artifact_class": "coder-int4",
+    "card_class": "deployed-package",
+    "runner": null,
+    "flags": "greedy, thinking off, 4,000-token cap, the served model name; the operator's wrapper runs the harness's request script against the deployed package's own port and its Lua scorer over the answer (docs/design-pruefstand-cell.md)",
+    "gates": "10/10 on the production coder artifact through the deployed package",
+    "reports": null,
+    "external": {
+      "manifest_key": "pruefstand"
+    },
+    "timeout_seconds": 1800,
+    "references": [
+      {
+        "metric": "score",
+        "value": 10,
+        "gate_at": 10,
+        "unit": "points",
+        "direction": "lower-is-worse",
+        "samples": 3,
+        "spread_pct": 0.0,
+        "config": "the deployed coder package on the 16 GiB card, its own port, greedy, thinking off, 4,000-token cap; scored by executing the answer against ten RFC 4180 cases",
+        "prompt_tokens": 282,
+        "design": "§5",
+        "measured": "2026-09-05",
+        "binary": "one run through this cell against the deployed 0.2.12-1+p3 package (DESIGN §7.0.2ao); two 0.3.0 release-candidate runs from the session host (§7.0.2ai), which measured the candidate, not the deployed package"
+      }
+    ]
   }
 ]

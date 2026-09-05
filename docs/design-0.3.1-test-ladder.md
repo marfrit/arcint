@@ -81,7 +81,7 @@ same way, into `coder-served-small-concurrency` and a new
 running `tests/concurrency/run.py`) — `agent-dense`'s own row keeps only
 what its equivalence run gates (MTP identity and acceptance).
 
-**External dependency, honestly.** The Prüfstand harness is fleet tooling outside this repository. Its cell carries `"external": {"env": "ARCINT_PRUEFSTAND", "invocation": …, "score_parse": …}` and the reference score — never the harness. Unset env ⇒ the cell reports `SKIPPED external-harness-not-configured`, which must then be named in `--allow-skip`, so a release that ran without it says so in its own log rather than passing.
+**External dependency, honestly.** The Prüfstand harness is fleet tooling outside this repository. Its cell carries `"external": {"env": "ARCINT_PRUEFSTAND", "invocation": …, "score_parse": …}` and the reference score — never the harness. Unset env ⇒ the cell reports `SKIPPED external-harness-not-configured`, which must then be named in `--allow-skip`, so a release that ran without it says so in its own log rather than passing. *(Superseded 2026-09-05 by `docs/design-pruefstand-cell.md`: the environment variable contradicted this note's own §2 and the score contract was never read; the cell's command now comes from the run manifest's `pruefstand` key, and the score is an ordinary gated metric.)*
 
 **DESIGN §5.1 and the checklist are generated.** `tools/acceptance_manifest.py` renders the §5.1 acceptance block and `docs/release-checklist.md` between marker comments; `--check` regenerates and diffs. Rejected: hand-maintained plus a consistency test — `llm.txt:790` is the measured outcome of that policy.
 

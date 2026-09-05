@@ -94,6 +94,24 @@ def validate_cells(cells):
                         errors.append(f"{name}: metric_qualifiers group {group!r} must be "
                                       "a non-empty list of non-empty strings")
 
+        # The external shape (docs/design-pruefstand-cell.md §1): an object
+        # naming the run-manifest key that carries the operator's command,
+        # on a cell that has no runner of its own -- a cell is one or the
+        # other. Checked here so a malformed external cell fails the
+        # device-free acceptance-enumeration test, not the first card window.
+        external = cell.get("external")
+        if external is not None:
+            if not isinstance(external, dict):
+                errors.append(f"{name}: \"external\" must be an object or null")
+            else:
+                key = external.get("manifest_key")
+                if not isinstance(key, str) or not key:
+                    errors.append(f"{name}: external block needs a non-empty "
+                                  "\"manifest_key\" (the run manifest's key holding "
+                                  "the operator's command)")
+            if cell.get("runner"):
+                errors.append(f"{name}: a cell is external or has a runner, not both")
+
         if "references" not in cell:
             errors.append(f"{name}: missing \"references\" (must be a list, or null "
                           "if not yet filled)")
@@ -238,9 +256,15 @@ def render_checklist(cells):
             lines.append(f"      runner: not yet in the tree (Increment {c['increment']}); the cell cannot run")
         if c.get("external"):
             ext = c["external"]
-            lines.append(f"      external: env {ext['env']}; unset -> "
-                         f"SKIPPED external-harness-not-configured "
-                         f"(reference {ext.get('reference_score', '?')})")
+            expected = "; ".join(f"`ACCEPTANCE-METRIC {r['metric']} <n> {r['unit']}`"
+                                 for r in (c.get("references") or []))
+            contract = (f"the wrapper prints {expected}, gated by the reference above"
+                        if expected else
+                        "the cell declares no reference, so any metric line the wrapper "
+                        "prints is a hard fail")
+            lines.append(f"      external: the run manifest's `{ext.get('manifest_key', '?')}` "
+                         "command (an ARCINT_ACCEPTANCE_* cache variable at configure "
+                         f"time); empty -> SKIPPED external-harness-not-configured; {contract}")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
