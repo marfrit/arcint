@@ -111,12 +111,18 @@ byte-identical to the served head. Its K/V state window is fixed at
 **2,048 rows**; past it an `Assign` layout mismatch silently disabled the
 drafter process-wide (measured: the failing case is a first draft that
 concatenates *exactly* the 2,048 rows; shorter prompts draft), fixed by
-unreleased plugin patch **0014**.
+plugin patch **0014** (released in `+p4`).
 
-At depth, both lose: on the dense 27B agent (24 GB card, u8 KV), MTP and
-DFlash2 both **accept nothing at 76.4k tokens** and decode below plain
-(§7.0.2aa); cause not established. Guidance: serve deep contexts without a
-drafter until it is.
+At depth (dense 27B agent, 24 GB card, u8 KV, §7.0.2ag): the zero
+acceptance §7.0.2aa saw at 76.4k tokens was an f16 position overflow at
+65,504 in the drafters' rotary subgraphs, now kept f32, and the MTP layer's
+KV state is now charged against the reservation. At 77,134 tokens MTP
+accepts 90.8% again but still loses to plain (4.9 against 15.3 t/s): its
+cycle wall is about 390 ms against its own break-even near 130 ms, so even
+full acceptance cannot outrun it on this artifact. DFlash2 beats plain
+there (18.8 against 15.3 t/s, 40.6% accepted). Guidance: at depth serve
+with DFlash2 or plain, MTP off; the MTP cycle is the `mtp-cycle-wall`
+campaign (`docs/campaigns/`).
 
 ## 5. Runtime stack
 

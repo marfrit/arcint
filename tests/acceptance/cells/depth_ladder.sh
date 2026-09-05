@@ -46,10 +46,22 @@ done
 
 [[ -d "$MODEL" ]] || { echo "depth_ladder: model dir $MODEL not found" >&2; exit 77; }
 
-# Room for the prompt plus the 32-token completion plus block-alignment
-# slack; the fit deciding this is not enough is the very thing this cell
-# gates, so the margin here is generous on purpose.
-N_CTX=$((PREFILL_TOKENS + 4096))
+# Room for the prompt (sized to within +/-2% of PREFILL_TOKENS), the
+# 32-token completion and block-alignment slack -- and no more. The first
+# real run asked for a flat +4,096 and was refused on the 16 GiB card at
+# u8:i4 by 1,011 tokens: the honest fit admitted 101,232 tokens at chunk
+# 128 with unbounded partials, which covers the prompt with room to spare,
+# so the refusal measured the runner's margin, not the card. The fit
+# deciding the prompt itself does not fit is what this cell gates; the
+# margin must not be what makes it fail. (The record's 16 GiB u8:i4 serves
+# of this prompt, DESIGN §7.0.2ac/§7.0.2ad, ran with the partition bound at
+# 32; this cell runs the unbounded default on purpose, the configuration a
+# user gets without the knob.)
+# One tolerance for the sizer and the margin: changing --tol without the
+# margin (or the reverse) would silently under-provision, the very failure
+# being fixed here.
+TOL_PCT=2
+N_CTX=$((PREFILL_TOKENS + PREFILL_TOKENS * TOL_PCT / 100 + 32 + 512))
 
 WORK=$(mktemp -d)
 trap 'stop_server; rm -rf "$WORK"' EXIT
@@ -152,13 +164,31 @@ run_cell() {  # run_cell <tag> <device>
     return
   fi
 
-  local promptfile="$WORK/$tag-prompt.txt"
-  if ! python3 "$REPO_ROOT/tests/acceptance/size_prompt.py" \
-         --seed "$SEED" --target "$PREFILL_TOKENS" --tol 2 \
-         --url "http://127.0.0.1:$PORT" --out "$promptfile"; then
-    fail "$tag: the reference prompt could be sized"
-    stop_server
-    return
+  # Size the prompt ONCE, in the first cell whose server starts, and reuse
+  # it: the token count is the tokenizer's, the same for every cell of one
+  # artifact, while each sizing round is itself a full prefill at this depth
+  # (the first real run measured two rounds on the 24 GB card at u8:i4,
+  # 78,867 then 98,187 tokens: 546 s and 812 s before the measured request
+  # even started). The ladder's order puts u8 first on purpose: its rounds
+  # are the cheap ones, and only if that server fails to start does the
+  # next cell size instead (size_prompt.py writes its output only after
+  # passing tolerance, so a partial prompt is never reused). Re-sizing per cell also
+  # changed the cell's shape from the 0.3.0 gate's one prefill per process
+  # to three, and the third faulted (CL_OUT_OF_RESOURCES) where one had
+  # passed -- a finding for the u8i4-deep-prefill-fault campaign, not a
+  # shape this runner should impose. Only the sizing cell's process carries
+  # the rounds; every later cell asks exactly one request.
+  local promptfile="$WORK/prompt.txt"
+  if [[ ! -s "$promptfile" ]]; then
+    if ! python3 "$REPO_ROOT/tests/acceptance/size_prompt.py" \
+           --seed "$SEED" --target "$PREFILL_TOKENS" --tol "$TOL_PCT" \
+           --url "http://127.0.0.1:$PORT" --out "$promptfile"; then
+      fail "$tag: the reference prompt could be sized"
+      stop_server
+      return
+    fi
+  else
+    echo "       prompt reused from the first cell ($(wc -c < "$promptfile") bytes, sized once per artifact)"
   fi
 
   local outfile="$WORK/$tag-out.txt" req_ok=1

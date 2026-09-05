@@ -4651,6 +4651,175 @@ with the container-restricted affinity case failing, round-trip and stress
 passed, zero sanitizer reports. Production on the dev host was restored and freshly verified
 after every window (both units active on their cards, health 200).
 
+#### 7.0.2aj The acceptance target's first real run: the enumeration corrected six times, and tier ON is not tier OFF (2026-09-05)
+
+The 0.3.1 lead item (§5, `docs/design-0.3.1-test-ladder.md`) split the
+ladder into `ctest -L unit` and `tests/acceptance/run.py --all`, and its
+Increment 2 owed one card window: the committed runners on the committed
+tree, both cards, every cell, no ad-hoc script. Run on the dev host on the
+Increment-2 commit with the `+p4` runtime, both production units stopped
+for the window and restored after (both active, health 200, fresh
+verification). What follows is what the target did, cell by cell, and
+what it corrected. The numbers here are the window's sanity envelope for
+the fill (§8.4 of the design note); the references themselves come from
+the follow-up window in §7.0.2ak, printed by the corrected runners.
+
+**Passed on the 24 GB card** (`GPU.0`): the coder at M9's offload cell
+(`--offload-ratio 20 --paged-kv u8:i4`, 8 GiB pool) — the equivalence
+suite at one lane and at two, the concurrency suite; the coder served
+(`--paged-kv u8`, no offload) — the equivalence suite; the dense 27B agent
+(`--paged-kv u8`) — the equivalence suite including its MTP section. The
+coder cells each carried the equivalence suite's "no MTP head, skipping
+the MTP gates" path, promoted to a named skip `<cell>/mtp-section` —
+three here and a fourth on the other card, none named on the command
+line, so the run refused them (correction 1, below).
+
+**Passed on the 16 GiB card** (`GPU.1`): the coder served (`--paged-kv
+u8`) — the equivalence suite (its MTP skip likewise); the n-gram
+determinism cell (`--draft 4 --draft-ngram 3` on the 35B tier
+configuration, `--offload-ratio 50 --moe-cpu-tier`): six fresh processes,
+six identical outputs (sha256 `434a635e…` on all six, 235 prompt tokens,
+64 completion tokens, 33.3% of drafts accepted in each) — and the runner
+would have failed a drafter that never fired, which is the check the
+Increment-2 review added.
+
+**The tier reference cell (16 GiB card, 35B int4, ratio 50, 8 GiB pool, u8
+KV, one lane, n_ctx 65,536)** sized its prompt against the artifact's own
+tokenizer to 1,167 tokens (target 1,198 ± 3%, two rounds) and ran the
+four fresh processes, two requests each, 64 greedy tokens:
+
+| process | request | prefill | decode |
+|---|---|---|---|
+| tier OFF, 1 | 1st | 79.8 t/s | 9.3 t/s |
+| tier OFF, 1 | 2nd | 86.2 | 12.4 |
+| tier OFF, 2 | 1st | 79.8 | 12.1 |
+| tier OFF, 2 | 2nd | 86.1 | 12.5 |
+| tier ON, 1 | 1st | 23.1 | 14.8 |
+| tier ON, 1 | 2nd | 26.3 | 16.6 |
+| tier ON, 2 | 1st | 25.4 | 15.6 |
+| tier ON, 2 | 2nd | 26.3 | 16.4 |
+
+Warm decode ON 16.6/16.4 against OFF 12.4/12.5 — ratio 1.34/1.31 on the
+like-for-like second requests; §7.0.2ai's window had 16.4/16.4 against
+11.3–11.4 (1.44). Tier OFF's warm decode drifted 9% between the two
+windows on the same card and flags, which is why the OFF rate stays a
+report and the ratio, taken inside one window, is the gate. Prefill
+under the static partition: 26.3 warm against 86 — the 3× of §7.0.2ai
+unchanged, 0.3.1's charter. E2 held: PROMPT == PROMPT in one tier-ON
+process, and CONT from that warm process == CONT from a fresh one
+(prefill 24.8–26.3, decode 15.3–16.6).
+
+Then the finding. The runner compared all seven later outputs against
+tier OFF's first: the three OFF outputs identical to it, all four ON
+outputs different from it — `FAIL tier-reference-cell: runner exited 1`,
+4 checks failed. That is not §3.4 failing. Device f16 and host f32
+arithmetic are not bit-equal (§7.0.2ae, §7.0.2af), the 0.3.0 gate's
+ON-equals-OFF agreement was a property of that one prompt, and §3.4
+promises history-independence — tier ON identical to itself across
+processes and requests, which the window's data shows (four ON outputs,
+one text; four OFF outputs, one text) and E2. The runner was gating a
+claim the engine never made; corrected on `main` the same day to gate
+the two groups separately plus E2, and report ON-versus-OFF with the
+first differing character (correction 4).
+
+**The depth ladder (98,147-token prefill, n_ctx 102,243, one fresh process
+per card and precision)** sized its prompt to 98,187 tokens (two rounds,
+deviation 0.0%). On the 24 GB card at u8: served, no fault line, 1,018 and
+1,026 t/s on the two full prefills, 27.7 t/s over the 32 decoded tokens
+(the belt fires only under 4-bit values, so u8 kept the pre-cap chunk of
+2,048). On the 24 GB card at u8:i4 the cell **failed**. The
+chunk belt priced 4-bit values at this depth and cut the served chunk from
+2,048 to 128 ("empirical belt, measured — limit: budget", scratch 606 MiB
+at chunk 128, no partition bound set, f16 partials); the sizer's two
+rounds then prefilled 78,867 tokens in 546 s (144 t/s) and 98,187 in
+812 s (121 t/s) — an 8× prefill price against u8 at this depth and this
+chunk, against the +72% §7.0.2aa measured at 71.7k on the 16 GiB card
+with both arms at the same pre-belt auto-fit chunk; the two are not the
+same measurement, since here the belt cut the chunk sixteenfold and u8
+ran at 2,048, and the number is for the `u8i4-prefill-price` campaign to
+take again with the chunk held constant — and the measured request, the
+third deep prefill in that process, ended in `clEnqueueMapBuffer …
+CL_OUT_OF_RESOURCES` and the process terminating on `clFinish`. The host
+kernel log at that moment: a GuC job timeout on the 24 GB card ("Check
+job timeout … not started"), a device coredump, a GT reset, and
+`Timedout job` lines in two processes — the ladder's arcint and a python
+process that was not the runner's (the runner's python never touches the
+card). That signature is **not** §7.0.2ad's: that class shows a page-fault
+storm at one address and CAT-error lines, and §7.0.2ad records that no
+`Timedout job` line accompanies any of its crashes; here there were no
+page-fault or CAT lines at all. The class is open. A second client on the
+card is a candidate, not a finding — nothing in this window measured
+VRAM headroom — and which client the python was is not on the record;
+both processes were gone before it could be read. The record's passes of
+this prompt on this card at u8:i4 (§7.0.2ad's knob table) ran with the
+partition bound at 32 or the belt bypassed, one prefill per process, and
+the host's state in those windows was not recorded, so they do not
+bracket this one. Two consequences on `main`: the runner sizes its prompt
+once per artifact and reuses it, so every cell after the sizing one asks
+exactly one request (the shape the 0.3.0 gate measured; the sizing rounds
+were also 546 s and 812 s of wall time for the u8:i4 cell at this depth),
+and the cell's own u8:i4 result on the 24 GB card is owed by a rerun on a
+quiet card, one prefill per process, recorded in §7.0.2ak. The
+16 GiB card's two cells: at u8, served — 619 and 622 t/s on the two full
+prefills, 31.7 t/s over 32 decoded tokens, no fault line; at u8:i4,
+**refused at load**, and that refusal measured the runner, not the card:
+the honest fit priced 4-bit values at chunk 128 (scratch 606 MiB,
+unbounded partials) and admitted 101,232 tokens on one lane, the runner
+asked for 102,243 (the prompt's target plus a flat 4,096) and missed by
+1,011. The prompt itself (98,187 tokens plus 32 of completion) fits
+inside what was admitted. The record's serves of this prompt on this card
+at u8:i4 (§7.0.2ac, §7.0.2ad) ran with the partition bound at 32, which
+the cell does not set — it measures the unbounded default a user gets
+without the knob, and now asks for the prompt plus 2% plus the completion
+plus block slack, nothing more; its 16 GiB u8:i4 result is owed by the
+same rerun as the 24 GB one.
+
+**Device-free cells, on the dev host:** sanitizers — a fresh ASan+UBSan
+build (x86_64, no-recover, `ctest -L unit`), five unit tests passed, zero
+sanitizer reports; package-build — the release recipe run on the
+Increment-2 commit's own tarball (the recipe's default is the v0.3.0 tag),
+unit gate five of five, `built: … arcint_0.3.0-1_amd64.deb` — labelled
+0.3.0-1 by the recipe's version and not a release package, left in place.
+
+**The six corrections, all on `main` before this record** (the runners
+that will fill the references are the corrected ones):
+
+1. *Expected skips.* The coder artifact carries no MTP head, so the
+   equivalence suite's MTP section is a known skip of that artifact class,
+   not an anomaly to name on every command line. `cells.json` now declares
+   `expected_skips` per cell; run.py pre-names them, fails the cell if a
+   declared skip does not occur, and rejects `--allow-skip` on one.
+2. *Rate claims the suite never measured.* `coder-served-large` and
+   `coder-served-small` said "≥ 60 t/s" and "48.0/49.5" in their gate text
+   while running the equivalence suite, which measures no rate. A decode
+   probe (`decode_probe.sh`: one fresh process, two requests on a
+   1,050-token sized prompt, byte-identity gated, cold and warm rates
+   emitted) is its own cell on each card.
+3. *Concurrency on the small card and the dense agent* ran at the 0.3.0
+   gate but were never enumerated. Two cells added. Sixteen cells now.
+4. *The tier cell's gate*, above.
+5. *The ladder's sizing shape.* Sizing the prompt through the server in
+   every cell cost two full prefills per cell at this depth and made each
+   process ask three deep requests where the 0.3.0 gate asked one. The
+   runner sizes once per artifact and reuses the prompt.
+6. *The ladder's margin.* A flat 4,096 tokens over the prompt is what the
+   16 GiB card refused at u8:i4, not the prompt. The runner asks for the
+   prompt plus its sizing tolerance, the completion and block slack.
+
+And a seventh the fill exposed: the schema had no report-only reference,
+so filling the tier cell would have gated its prefill (freezing the 3× as
+a specification) or dropped the record. `gate_at: null` is now the
+report-only form (design note §8.9), red-first in the self-test.
+
+The target's own summary: `12 cell(s) run, 9 passed, 1 skipped, 4 named
+skip(s) promoted, 2 failed`, exit 1, 8,512 s of wall time; the one skip
+is the external cell, named. The two failures and the four unnamed skips
+are the findings above, each resolved on `main` when the target reported
+them — the tier cell's gate, the four declared skips, and the ladder's
+margin and sizing shape — with the ladder's two u8:i4 results owed by a
+rerun. Production was restored after the window and verified fresh: both
+units active on their cards, health 200 on both endpoints.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,
