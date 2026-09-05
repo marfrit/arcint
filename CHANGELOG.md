@@ -28,9 +28,12 @@ ladder is green on both cards. Deployed 2026-09-05 (DESIGN §7.0.2aw):
 `+p6` and `arcint 0.3.1-1` on the dev host's two units; the coder serves
 it, Prüfstand 10/10 through the deployed endpoint; the dense agent unit's
 configured context (155,648 with MTP on, set under 0.2.12's accounting)
-is refused by the 0.3.x fit — the MTP layer's KV state and the drafters
-are charged since 0.3.0 (§7.0.2ag) and the reservation admits 127,536 —
-so that unit is stopped pending the operator's flag decision.
+was refused by the 0.3.x fit — the MTP layer's KV state and the drafters
+are charged since 0.3.0 (§7.0.2ag) and the reservation admits 127,536;
+on the operator's decision it now serves `--paged-kv u8:i4` at chunk 512
+and 151,552 tokens (§7.0.2ax: 30.5 t/s on a short request; 377 t/s
+prefill and 2.2 t/s decode with MTP on at 71.7k tokens, the
+`mtp-cycle-wall` defect on the served unit, no fault).
 
 - **Unit and acceptance tests differentiated** (0.3.1's lead item,
   `docs/design-0.3.1-test-ladder.md`): bare `ctest` is the unit set by

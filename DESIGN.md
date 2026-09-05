@@ -5956,6 +5956,49 @@ the KV cost model brings the pool under budget at 155,648 — unmeasured
 on the dense artifact with MTP, so a window before it is served. The
 coder's deployment stands either way.
 
+#### 7.0.2ax The agent unit serves u8:i4 on `+p6`: 151,552 tokens with MTP on, and the MTP cycle wall at depth is now the unit's own number (2026-09-05)
+
+The operator's answer to §7.0.2aw's three options was the third: serve
+the dense agent with `--paged-kv u8:i4`, the format the `+p6` floor
+exists for. What the fit then said, in order, each a fresh process:
+
+| flags (24 GB card, dense 27B, MTP on, 8 GiB prefix cache) | KV KiB/token | activations | admits | requested |
+|---|---|---|---|---|
+| `u8`, default chunk (128 served) | 36.2 | 0.03 GiB | 127,536 | 155,648 — refused |
+| `u8:i4`, default chunk (2,048 by §7.0.2av's cap) | 28.2 | 0.60 GiB | 139,104 | 155,648 — refused |
+| `u8:i4 --prefill-chunk 512` | 28.2 | 0.15 GiB | 152,096 | 155,648 — refused |
+| `u8:i4 --prefill-chunk 512 --n-ctx 151552` | 28.2 | 0.15 GiB | 152,096 | **served** |
+
+Two things the table shows that the flags alone would not. The
+microkernel path's 2,048 cap costs 0.57 GiB of activations on this
+artifact (329 KiB per chunk token, probed), which is 20k tokens of u8:i4
+KV — on a card this full, the chunk is a context lever, and 512 buys
+13k tokens back. And the MTP state term (1.06–1.16 GiB at these depths)
+plus the drafters' 3.16 GiB are what 0.2.12 never charged; §7.0.2ag's
+measured overcommit is why they are charged now, and 155,648 with MTP on
+does not fit the card under honest accounting at any chunk. The unit
+serves 151,552 (the fit's 152,096 less the prefix cache's spare pages,
+2,691 of them kept — Phase E's own correction), 2.6 % under the
+configured 155,648 it ran at before. Both unit edits are committed in
+the unit repository; the unit manager could not edit `--paged-kv` or
+`--prefill-chunk` (not fields it knows), so this was a hand edit, per
+the operator-local rule.
+
+**Functional check through the deployed endpoint.** `/props` reports
+`0.3.1 (0a16fa1cdf6f)`, MTP enabled. A 40-token request: 120 tokens at
+30.5 t/s, draft acceptance 68 %. A 71,727-token request (the price
+window's prompt): prefill 377.5 t/s at chunk 512 (167 s of graph in
+190 s), then 64 tokens at **2.2 t/s** — verify 24.0 s of the 28.5 s,
+acceptance 64 %, no fault or out-of-resources line. That decode is the
+`mtp-cycle-wall` campaign's own defect on the served unit: §7.0.2ag
+measured MTP at 4.9 t/s against plain's 15.3 at 77k on this artifact at
+u8, and the guidance there is MTP off at depth; whether u8:i4 or the
+chunk accounts for 2.2 against 4.9 is not measured here (one request,
+two variables). The unit serves; its deep-context decode is the
+campaign's number, not this deployment's, and turning MTP off would
+also hand back the 1.16 GiB state and most of the 3.16 GiB of drafters
+— the operator's next call, recorded with its numbers.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

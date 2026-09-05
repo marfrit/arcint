@@ -66,7 +66,7 @@ plan), **0010** (per-side decode kernels) — served: **u8:i4**.
 | f16 | 20.0 | coder, 24 GB card, §7.0.3 |
 | u8 (default) | 11.3 | coder, same card |
 | u4 (symmetric — "a tax") | 6.3 | **35B**, §7.0.2w; the +63% on `PagedAttentionExtension` at 32k is the coder, 24 GB card, §7.0.3 |
-| u8:i4 | 8.8 | **35B**, §7.0.2w; the coder's 16 GiB auto-fit gain matches this cost model to 0.1 pp, §7.0.2y |
+| u8:i4 | 8.8 | **35B**, §7.0.2w; the coder's 16 GiB auto-fit gain matches this cost model to 0.1 pp, §7.0.2y; the dense 27B agent serves it at 28.2 KiB/token (u8: 36.2) on the 24 GB card, §7.0.2ax |
 
 u8 leads decode by +2.5% at 32k but f16 leads by 7.8% at 53.5k (crossover
 not located); u8 costs up to 22% of prefill at 115k. u8:i4 scores 10/10 and,
@@ -157,8 +157,10 @@ but pointless); 0.3.0's floor was `+p4`. Nothing arcint drives reaches
 0019's branch, and 0020 changes the runtime's speed and the fit's
 scratch charge, not the served contract.
 At the 0.3.1 tag the dev host's coder unit serves `+p6` with `arcint
-0.3.1` (Prüfstand 10/10); the dense agent unit is stopped pending a flag
-decision, its pre-0.3.0 context refused by the fit (§7.0.2aw). Compute-runtime
+0.3.1` (Prüfstand 10/10) and the dense agent unit serves `--paged-kv
+u8:i4` at 151,552 tokens, chunk 512, MTP on (§7.0.2aw, §7.0.2ax; its
+pre-0.3.0 context of 155,648 is refused by the fit's accounting of the
+MTP state and drafters). Compute-runtime
 **26.27** (past the fix window for USM-pool issue 916). Kernel driver:
 **xe KMD**; no version recorded.
 
