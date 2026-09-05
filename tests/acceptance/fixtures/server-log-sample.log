@@ -1,0 +1,7 @@
+lgc  load: sampler defaults from artifact: temp 1.00 top_p 0.95 top_k 20
+lgc  load: qwen3.6-35b-a3b q4 | 30 GDN + 10 attn layers | weights 17.4 GiB | 10/10 greedy, 3/3 tool probe (B60, 262144, 2026-08-30); 62.7 t/s decode at 53.5k, 1584 t/s prefill
+lgc  load: n_ctx 65536 | device GPU.1 | prefill chunked at 2048 tok | 1 lane
+lgc  slot 0: prefill  1167 tok in 134.93 s (  8.6 t/s) | graph 134.84 s, embed 0.01 s, pages 0.00 s, restore 0.07 s, wait 0.00 s, other 0.00 s
+lgc  slot 0: decode     64 tok in 13.09 s (  4.9 t/s) | graph 12.82 s, embed 0.03 s, sample 0.01 s, emit 0.23 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
+lgc  slot 0: prefill  1167 tok in 44.34 s ( 26.3 t/s) | graph 44.26 s, embed 0.01 s, pages 0.00 s, restore 0.07 s, wait 0.00 s, other 0.00 s
+lgc  slot 0: decode     64 tok in  3.87 s ( 16.5 t/s) | graph 3.82 s, embed 0.02 s, sample 0.01 s, emit 0.01 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s

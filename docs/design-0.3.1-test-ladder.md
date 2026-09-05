@@ -247,6 +247,16 @@ ladder), so the depth is this artifact's, not the 1,198-token document —
 §7.0.2ai's figures are the window's sanity envelope, not its references. Each
 reference stores the `prompt_tokens` the sizer reported.
 
+**Which process (2026-09-05).** `tier_reference.sh` takes each arm's metrics
+from the arm's *second* process, second request. The first process of a
+window is the cold one on the record (§7.0.2ai's warming; §7.0.2ak, where the
+first OFF process decoded at 0.3 t/s and the next at 11.9 seconds later), and
+that cost has its own owner, `static-partition-cold-start`; a decode
+reference that included it would gate that campaign's number, not decode.
+The first process's lines are still reported beside it. Consequence, stated:
+this gate cannot see a regression that affects only a window's first
+process. A reference's `config` names the process as well as the request.
+
 A commit moving `value`/`gate_at` cites, in `design` and in the message, the
 DESIGN §7.0.2x that measured the new number, and regenerates: references render
 beside their cell in `docs/release-checklist.md` (`acceptance_manifest.py:66-86`)

@@ -100,7 +100,9 @@ metric_value() {  # metric_value <log> <prefill|decode> <last|last2>
     last2) n=2 ;;
     *) echo "decode_probe: metric_value: bad index '$3'" >&2; return 1 ;;
   esac
-  grep -a -E "$kind" "$log" | grep -a "t/s" | tail -n "$n" | head -n 1 \
+  # "slot N:" lines only: the load banner also carries "t/s decode" and
+  # "t/s prefill" (the artifact's recorded rates) and must never count.
+  grep -a -E "slot [0-9]+: $kind " "$log" | tail -n "$n" | head -n 1 \
     | grep -a -o -E '[0-9]+\.[0-9]+ t/s' | grep -a -o -E '^[0-9]+\.[0-9]+'
 }
 

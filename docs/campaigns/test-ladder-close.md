@@ -138,3 +138,19 @@ sample the committed runner printed, never a number from an ad-hoc script
   cell, small decode probe, small concurrency) running the same day, the
   two 24 GB-card cells and the ladder's u8:i4 rerun (one prefill per
   process, both cards) once that card is free.
+- 2026-09-05, follow-up window (tier cell): runner correction 7. The
+  `metric_value` helper matched "prefill|decode" plus "t/s", and the
+  server's load banner ("62.7 t/s decode at 53.5k, 1584 t/s prefill", the
+  artifact's recorded rates) matched too, shifting every fixed index by
+  one: the emitted "warm 2nd" metrics were the first request's (4.9 t/s
+  decode ON where the second request read 16.5). Shown red against the
+  fake server once it printed the banner and distinct per-request rates;
+  all three runners now match the server's own `slot N:` request lines.
+  The tier metrics now come from each arm's SECOND process: the first
+  process of this window (`off1`) decoded at 0.3 then 1.7 t/s where
+  `off2`, seconds later, read 11.7 / 11.9 and both ON processes hit the
+  record on their second request (26.3 / 16.5, 26.3 / 16.4; E2 25.4–26.3 /
+  15.5–16.5) — the cold-sequence first process the record already knows,
+  which is `static-partition-cold-start`'s cost, not a decode reference.
+  This window's rates are therefore usable for the fill from the second
+  processes, with the first processes reported beside them.

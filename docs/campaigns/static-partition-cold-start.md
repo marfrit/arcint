@@ -131,7 +131,18 @@ kinds of recomputed work, and each step below moves exactly one of them;
 4. *First-use fills.* One process, runtime and page cache both warm: the
    first request's decode against the second's, then the same process
    after one explicit pre-warm request. The delta is the fill term.
-5. Whichever step swallows the 215→45 s and the first-request cliff
+5. *Outputs, not only times.* Every step above also keeps the greedy
+   text of each process and compares cold against warm byte for byte.
+   The follow-up window of 2026-09-05 (DESIGN §7.0.2ak) had two tier-ON
+   processes on the same flags and ledger produce different greedy text
+   for the same prompt — the one with the slow first request against the
+   one without, though the slow one loaded faster — with nothing else
+   compared and no counter read: if a process's cold state changes
+   arithmetic, that is a history-dependence of a new kind (on the host's
+   state, not the process's requests) and a §3.4 finding for this
+   campaign before any lever, with the plugin's own counters
+   (`resident_checksum`, `grouped_fallbacks`) read per process.
+6. Whichever step swallows the 215→45 s and the first-request cliff
    names the owner. If step 2: the lever is a persistent, pre-populated
    kernel cache (already saveable; make it reliable). If step 3 or 4: no
    file can hold it, and the lever is a pre-warm at service start, kept
@@ -158,3 +169,16 @@ for a faster cold start.
   window's four-step ladder in the pipeline above; the honest reading is
   that only the compiled-kernel term is saveable, and the runtime may
   already be saving it. Not run yet: needs a quiet card.
+- 2026-09-05, a data point from the follow-up acceptance window (DESIGN
+  §7.0.2ak): the first process of the window — tier **OFF**, ratio 50,
+  8 GiB pool, 16 GiB card, loaded in 12.4 s — served its first request at
+  52.8 t/s prefill / 0.3 t/s decode (216 s for 64 tokens, all in `graph`)
+  and its second at 5.3 / 1.7; the next OFF process, started seconds
+  later with the same flags, read 48.8 / 11.7 then 85.2 / 11.9. It was
+  the first process on that card after both production units had been
+  restarted (both models loaded) and the card's unit stopped again. Its
+  load took 12.4 s, so the first-request cliff here exists without
+  §7.0.2ai's slow load; and tier OFF creates no host oneDNN kernels, so
+  this instance cannot be the JIT term. Page cache, first-use fills, or
+  neither: one sample, no counter read, a reading for steps 3 and 4 of
+  the ladder above to confirm or refute, not a finding.

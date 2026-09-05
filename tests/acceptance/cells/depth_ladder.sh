@@ -127,7 +127,7 @@ PY
 }
 
 lines() {  # lines <log>
-  grep -a -E "prefill|decode" "$1" | grep -a "t/s" | tail -4 | sed 's/^/       /'
+  grep -a -E "slot [0-9]+: (prefill|decode) " "$1" | tail -4 | sed 's/^/       /'
 }
 
 metric_value() {  # metric_value <log> <prefill|decode> last
@@ -141,7 +141,9 @@ metric_value() {  # metric_value <log> <prefill|decode> last
   # nothing asks this server anything after the real completion, so the
   # last matching line is always it, regardless of how many calibration
   # rounds size_prompt.py needed this time.
-  grep -a -E "$2" "$1" | grep -a "t/s" | tail -1 \
+  # "slot N:" lines only: the load banner also carries "t/s decode" and
+  # "t/s prefill" (the artifact's recorded rates) and must never count.
+  grep -a -E "slot [0-9]+: $2 " "$1" | tail -1 \
     | grep -a -o -E '[0-9]+\.[0-9]+ t/s' | grep -a -o -E '^[0-9]+\.[0-9]+'
 }
 

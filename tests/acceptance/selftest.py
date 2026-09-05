@@ -77,6 +77,7 @@ tools/acceptance_manifest.py's validate_cells() rather than through run.py
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -315,6 +316,33 @@ def main():
           len(acceptance_manifest.validate_cells([text_gate_cell])) == 0, False)
     check("--check: value as a string -> schema error",
           len(acceptance_manifest.validate_cells([text_value_cell])) == 0, False)
+
+    # The runners' log matchers, against a real server log excerpt
+    # (fixtures/server-log-sample.log: the load banner -- which carries
+    # "62.7 t/s decode" and "1584 t/s prefill" -- then two requests, 8.6/4.9
+    # and 26.3/16.5). The first real run of tier_reference.sh (DESIGN
+    # §7.0.2ak) matched the banner and shifted every request index by one;
+    # a fixture that reproduced less of the log than the grep depends on
+    # had proved the wrong thing. Each helper is lifted out of its script
+    # by name so the assertion runs the committed code, not a copy.
+    sample = os.path.join(HERE, "fixtures", "server-log-sample.log")
+
+    def helper(script, name, *args):
+        src = open(os.path.join(HERE, "cells", script), encoding="utf-8").read()
+        m = re.search(r"^" + re.escape(name) + r"\(\) \{.*?^\}", src, re.S | re.M)
+        assert m, f"{script} has no {name}()"
+        proc = subprocess.run(["bash", "-c", m.group(0) + "\n" + name + ' "$@"', "_", *args],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        return proc.stdout.strip()
+
+    check("tier_reference.sh metric_value: request 2 is the second request, not the first",
+          helper("tier_reference.sh", "metric_value", sample, "decode", "2") == "16.5", True)
+    check("... and request 1 is the first request, not the banner",
+          helper("tier_reference.sh", "metric_value", sample, "prefill", "1") == "8.6", True)
+    check("depth_ladder.sh metric_value: last is the last request",
+          helper("depth_ladder.sh", "metric_value", sample, "decode", "last") == "16.5", True)
+    check("decode_probe.sh metric_value: last2 is the request before the last",
+          helper("decode_probe.sh", "metric_value", sample, "decode", "last2") == "4.9", True)
 
     if FAILED:
         print(f"\n{len(FAILED)} of {TOTAL} assertion(s) failed: {', '.join(FAILED)}",

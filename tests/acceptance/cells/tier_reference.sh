@@ -107,7 +107,12 @@ PY
 }
 
 lines() {  # lines <log> -- the server's own reported prefill/decode rates (reported, not gated)
-  grep -a -E "prefill|decode" "$1" | grep -a "t/s" | tail -4 | sed 's/^/       /'
+  # The server's per-request lines are "slot N: prefill|decode ... t/s". A
+  # looser "prefill|decode" + "t/s" also matched the load banner ("62.7 t/s
+  # decode at 53.5k, 1584 t/s prefill" -- the artifact's recorded rates),
+  # which shifted every fixed index by one on the first real run of this
+  # runner: the "2nd request" metrics were the first request's.
+  grep -a -E "slot [0-9]+: (prefill|decode) " "$1" | tail -4 | sed 's/^/       /'
 }
 
 metric_value() {  # metric_value <log> <prefill|decode> <request-index, 1-based>
@@ -117,7 +122,7 @@ metric_value() {  # metric_value <log> <prefill|decode> <request-index, 1-based>
   # the first gate to fire will be a process that logged differently"). Each
   # request here produces exactly one prefill line and one decode line, so
   # index 2 names the second (warm) request unambiguously.
-  grep -a -E "$2" "$1" | grep -a "t/s" | sed -n "${3}p" \
+  grep -a -E "slot [0-9]+: $2 " "$1" | sed -n "${3}p" \
     | grep -a -o -E '[0-9]+\.[0-9]+ t/s' | grep -a -o -E '^[0-9]+\.[0-9]+'
 }
 
@@ -173,16 +178,20 @@ done
 
 # --------------------------------------------------------- ACCEPTANCE-METRIC
 #
-# off1 and on1 stand for their arm here (off2/on2 exist above only to prove
-# repeatability within the baseline before the tier is even involved); the
-# 2nd request of each (index 2, docs/design-0.3.1-test-ladder.md §8.7) is the
+# off2 and on2 stand for their arm here: the FIRST process of a window is
+# the cold one on the record (DESIGN §7.0.2ai's cold-sequence warming, and
+# the follow-up window of §7.0.2ak, where off1 decoded at 0.3 t/s after the
+# host's file cache had been churned and off2 at 11.9 seconds later) -- that
+# cost belongs to the static-partition-cold-start campaign, not to a decode
+# reference; the first processes' lines are still reported above. The 2nd
+# request of each (index 2, docs/design-0.3.1-test-ladder.md §8.7) is the
 # warm one DESIGN §7.0.2ai's reference cell reports. run.py, not this
 # script, decides whether any of these numbers is a regression -- it holds
 # the reference and the gate (§8.2).
-decode_off=$(metric_value "$WORK/off1.log" decode 2)
-prefill_off=$(metric_value "$WORK/off1.log" prefill 2)
-decode_on=$(metric_value "$WORK/on1.log" decode 2)
-prefill_on=$(metric_value "$WORK/on1.log" prefill 2)
+decode_off=$(metric_value "$WORK/off2.log" decode 2)
+prefill_off=$(metric_value "$WORK/off2.log" prefill 2)
+decode_on=$(metric_value "$WORK/on2.log" decode 2)
+prefill_on=$(metric_value "$WORK/on2.log" prefill 2)
 emit_metric decode-warm-2nd-off  "$decode_off"  t/s
 emit_metric prefill-warm-2nd-off "$prefill_off" t/s
 emit_metric decode-warm-2nd-on   "$decode_on"   t/s
@@ -203,7 +212,7 @@ fi
 # log is not this cell's failure to detect -- §8's amendment says a cell may
 # print nothing rather than invent a zero, and the missing-metric rule stays
 # silent here because tier-reference-cell's references are still null.
-grouped_fallbacks=$(grep -a -o -E 'grouped_fallbacks=[0-9]+' "$WORK/on1.log" | tail -1 | grep -a -o -E '[0-9]+$')
+grouped_fallbacks=$(grep -a -o -E 'grouped_fallbacks=[0-9]+' "$WORK/on2.log" | tail -1 | grep -a -o -E '[0-9]+$')
 emit_metric grouped-fallbacks-on "$grouped_fallbacks" count
 
 # ------------------------------------------- byte-identity, WITHIN one arm
@@ -238,9 +247,28 @@ identity_group() {  # identity_group <label> <baseline-name> <other-name>...
       pass "$name byte-identical to $baseline_name"
     else
       fail "$name byte-identical to $baseline_name"
+      # The work dir is gone when this script exits, so a divergence must be
+      # diagnosable from the log alone (the follow-up window of 2026-09-05
+      # found on2 differing from on1 and had nothing left to read but the
+      # verdict): both texts, verbatim, and where they first part.
+      python3 - "$base" "$cand" "$baseline_name" "$name" <<'PY'
+import sys, hashlib
+a = open(sys.argv[1], encoding="utf-8").read(); b = open(sys.argv[2], encoding="utf-8").read()
+n = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+print(f"       first differing character at index {n} of {max(len(a), len(b))}")
+for label, t in ((sys.argv[3], a), (sys.argv[4], b)):
+    print(f"       {label} sha256={hashlib.sha256(t.encode()).hexdigest()[:16]} text={t!r}")
+PY
     fi
   done
   echo "       compared $compared of $total outputs against the $baseline_name baseline"
+  # Every output's hash, pass or fail, so two windows can be compared later
+  # without either's work dir.
+  for name in "$baseline_name" "$@"; do
+    if [[ -f "$WORK/$name.txt" ]]; then
+      echo "       $name sha256=$(sha256sum "$WORK/$name.txt" | cut -c1-16)"
+    fi
+  done
 }
 
 identity_group "tier ON"  on1-run1  on1-run2 on2-run1 on2-run2
