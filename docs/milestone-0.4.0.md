@@ -146,3 +146,17 @@ are served natively (route 3 = the kernel campaign). Not a single session.
   expert fusion matches twelve u4 constants and nothing else, and no
   patch in the series touches the weight format. Open points are §6 of
   the note.
+- 2026-09-06 — stage 0 landed: a memory-mapped GGUF v3 reader
+  (`src/core/gguf.*`), host reference dequantizers for Q8_0, Q4_K, Q5_K
+  and Q6_K transcribed from ggml (`src/core/gguf_dequant.*`), a generated
+  fixture (`tests/fixtures/qwen35-tiny.gguf`, its reference dequantization
+  from gguf-py beside it; `tools/gguf_fixture.py` regenerates both,
+  seeded), twelve unit cases (metadata, tensor table, exact equality of
+  every quantized tensor against gguf-py's decoder, both branches of the
+  6-bit scale unpack, three refusals by name) — red first with stub
+  implementations, 426 cases green after. The generator caught its own
+  Q5_K field-order mistake through gguf-py's decoder before the fixture
+  was written. Still owed for stage 0: the comparison against a real
+  Q4_K_M tensor on the dev host (`tools/gguf_dequant_check.py` is ready
+  for it). Kernel side (plugin patch 0021, the fully-connected decoder)
+  in progress.

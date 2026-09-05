@@ -68,6 +68,8 @@ add_library(arcint_core STATIC
   src/core/affinity.cpp
   src/core/artifact.cpp
   src/core/block_pool.cpp
+  src/core/gguf.cpp
+  src/core/gguf_dequant.cpp
   src/core/model_registry.cpp
   src/core/prefix_cache.cpp
   src/core/reasoning.cpp
@@ -209,6 +211,7 @@ if(ARCINT_TESTS)
     tests/test_turnstile.cpp
     tests/test_provenance.cpp
     tests/test_sha256.cpp
+    tests/test_gguf.cpp
     tests/test_affinity.cpp
     tests/test_fit.cpp
     tests/test_decode_stats.cpp
@@ -226,7 +229,11 @@ if(ARCINT_TESTS)
   # --allow-skip <case> (tests/harness.h's SKIP_UNLESS). Local, filtered runs
   # (`./build/arcint-test some_filter`) are unaffected; this only binds ctest's
   # own invocation.
-  add_test(NAME unit COMMAND arcint-test --max-skips 0)
+  # gguf_real_file_spot_check (docs/design-gguf-native.md stage 0) is the one
+  # named exception: it only runs with ARCINT_GGUF_REAL=<path> set to a real
+  # GGUF file not shipped with the repo, so it skips in every default build.
+  add_test(NAME unit COMMAND arcint-test --max-skips 0
+           --allow-skip gguf_real_file_spot_check)
   set_tests_properties(unit PROPERTIES LABELS unit)
 
   add_test(NAME roundtrip

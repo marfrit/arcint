@@ -1,0 +1,41 @@
+{
+ "bin": "qwen35-tiny.dequant.bin",
+ "tensors": {
+  "blk.0.ffn_down.weight": {
+   "byte_offset": 131072,
+   "n_floats": 131072,
+   "qtype": "Q6_K",
+   "shape": [
+    512,
+    256
+   ]
+  },
+  "blk.0.ffn_gate.weight": {
+   "byte_offset": 0,
+   "n_floats": 32768,
+   "qtype": "Q4_K",
+   "shape": [
+    64,
+    512
+   ]
+  },
+  "blk.0.ssm_out.weight": {
+   "byte_offset": 655360,
+   "n_floats": 8192,
+   "qtype": "Q5_K",
+   "shape": [
+    32,
+    256
+   ]
+  },
+  "nextn.eh_proj.weight": {
+   "byte_offset": 688128,
+   "n_floats": 1024,
+   "qtype": "Q8_0",
+   "shape": [
+    16,
+    64
+   ]
+  }
+ }
+}
