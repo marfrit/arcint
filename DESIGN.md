@@ -5451,6 +5451,110 @@ campaign's next step; the disk term is the host's memory and stays an
 operational fact (or a pre-read of the artifact at service start, kept
 out of the gate's timing).
 
+#### 7.0.2ar The u8:i4 prefill price at a held chunk: +55 % and +90 %, in the infer wall and not in any counted kernel (2026-09-05)
+
+The `u8i4-prefill-price` campaign's first window
+(`docs/campaigns/u8i4-prefill-price.md`): 16 GiB card, coder int4, no
+offload, one lane, prefix cache off, the `+p4` runtime, n_ctx sized to
+the depth plus 2 % and 544 tokens, one fresh process per arm, one
+32-token greedy request on a prompt sized by the runner (37,707 and
+71,727 tokens), the coder unit stopped for the window and restored after
+it. §7.0.2aa's +7/+25/+72 % were taken with each arm at its own auto-fit
+chunk, before the belt; here the u8:i4 arm's belt picked chunk 128 at
+both depths and the u8 arm was forced to the same 128, so the chunk is
+held and the format is what differs.
+
+| depth | u8:i4 prefill | u8 prefill, chunk 128 | u8:i4 time | infer wall ("graph") |
+|---|---|---|---|---|
+| 37,707 | 295.1 t/s, 127.8 s | 456.8 t/s, 82.6 s | +55 % | 127.2 s against 82.0 s |
+| 71,727 | 209.3 t/s, 342.8 s | 397.9 t/s, 180.3 s | +90 % | 341.8 s against 179.3 s |
+
+Neither arm logged a fault. The whole difference is inside the infer
+wall; embeddings, page handling and restore are equal and small.
+
+**Where the profiler puts it: nowhere it can see.** One process per arm
+and depth with `ARCINT_PROFILE=128`, `ARCINT_PROFILE_SWEEP=128`,
+`ARCINT_PROFILE_PAST=<depth>` — a synthetic prefill to the depth, then one
+128-token chunk captured under `PERF_COUNT`:
+
+| capture | u8:i4 node total | u8 node total | paged attention, u8:i4 | paged attention, u8 |
+|---|---|---|---|---|
+| chunk 128 at past 37,700 | 136.3 ms | 177.5 ms | 4.0 ms (10 nodes) | 46.7 ms |
+| chunk 128 at past 71,700 | 139.1 ms | 218.9 ms | 7.2 ms | 88.2 ms |
+
+Every other row is equal between the arms to within 1.5 ms (the 40
+reference-kernel FullyConnected nodes at 65 ms, the 331 GEMM nodes at
+35 ms, the GDN at 15.8 against 14.4 ms). The counter says the u8:i4 chunk is the
+*cheaper* one, by 41 and 80 ms, while the served prefill says it is the
+dearer one by 153 and 290 ms per chunk (the wall difference over the
+295 and 561 chunks). So the price is not in any counted kernel's
+execution, and §7.0.2ab's warning about this instrument holds a third
+time: `PERF_COUNT` omits transfers and everything between kernels, and
+that is where the price lives. The reading that the generic attention
+kernel's *compute* is the cost (§7.0.2aa, "by code reading") is refuted
+for every row the counter does attribute; the u8:i4 arm's attention row
+itself is not attributed (below), so for attention that reading is
+untested by this instrument, not refuted. What the counter cannot see —
+the depth-scaling partial buffers the mixed stage allocates and merges
+per chunk, the host work around them — is the candidate that remains,
+and the discriminator below asks its growth directly. Both arms report the same
+primitive implementation name for attention, so the profile does not
+say which stage kernel ran inside it; the served rates do.
+
+**Byte-identity does not extend to depth.** The two arms' 32-token
+greedy continuations differ: at 37,707 tokens from character 126 of
+182, at 71,727 from character 46. §7.0.2y's identity was measured at 16
+tokens on short prompts; a four-bit value cache is lossier than an
+eight-bit one. The reading is that at these depths the four-bit loss
+reaches the argmax; not measured in this window (no quantisation-error
+or margin figure, and no arm repeated at one depth). The campaign's
+invariant is re-stated by it: a lever must leave u8:i4's output identical to u8:i4's
+own before the lever, not to u8's. The u8:i4 arm produced the same 182
+bytes at both depths; u8's two answers differ from each other.
+
+**The values stay four-bit in VRAM** (the operator's constraint, 2026-09-
+05, now in the campaign's invariants): the context gain is the format's
+purpose, and a lever that materialises a u8 copy of the values for
+prefill hands it back. Admissible levers dequantise in registers or in a
+bounded, charged transient; the fast microkernel attention path taught
+the packed value read is the one that fits. §7.0.2ab lists native
+four-bit values in micro-SDPA as an upstream candidate, undecided; patch
+0009's header put a kernel-source rewrite of the generic kernel over the
+divergence bar for a memory lever.
+
+**The discriminator: the partition bound.** The same 37,707-token
+prompt, chunk 128, with `--paged-attention-max-partitions 32` (patch
+0015's bounded partials: the mixed stage's partial buffers at a fixed
+size, no per-chunk growth): u8:i4 prefilled at 276.4 t/s (136.4 s)
+against 295.1 unbounded, u8 at 457.0 against 456.8, the bounded u8:i4
+output byte-identical to the unbounded one. Bounding the scratch did not
+move the price; it added the merge's own 7 %. So the partial buffers'
+growth with depth — the second reading, from §7.0.2ab's era — does not
+own it; their per-chunk reallocation, which the bound does not remove
+(§7.0.2ab: pre-sizing removes the churn, not the size), is not tested by
+it.
+
+**What the profile cannot have seen, by arithmetic.** The artifact has
+10 attention layers with 16 query heads of 256 (the load banner). Two
+matmuls of 2 × 10 × 16 × 128 × 37,700 × 256 flops are 0.79 TFLOP, so
+4.0 ms would be about 200 TFLOP/s — an order of magnitude above this
+card — and the u8 rows calibrate the counter: 46.7 ms at past 37,700
+and 88.2 ms at 71,700 (1.50 TFLOP) are both 17 TFLOP/s, the same rate
+at both depths, as attention should scale. So the counter is not
+reporting the u8:i4 arm's attention kernels, only some part of the
+primitive (both arms name the same implementation, so which stage
+kernels ran is not in the table). The instrument therefore does not attribute the u8:i4
+price — the campaign's gate asks for a named kernel or stage at two
+depths, and `PERF_COUNT` cannot name it for this arm, the class of
+blindness §7.0.2ab recorded. Measured and standing: the price (+55 %,
++90 % at a held chunk, growing with depth), its location (the infer
+wall, not embeddings or pages), and two refuted readings (counted kernel
+compute; partial-buffer growth). Next instrument: a device-side timeline
+of one chunk per arm (the OpenCL event trace §7.0.2ab used to calibrate
+this counter), which sees every kernel launched whether or not the
+profiler attributes it. Any lever remains microkernel work under the
+four-bit invariant; the campaign is not closed by this window.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,
