@@ -149,7 +149,7 @@ budget of zero). Each card lands where its memory says: B60 chunk 2048, A770
 refused at startup with every term. At request time, a third concurrent request
 is a 503 carrying the same arithmetic (--queue-timeout S restores queueing).
 
-Verification: 306 unit cases, a 61-check curl round-trip, a lane-accounting
+Verification: 409 unit cases device-free (413 with the OpenVINO backend), a 64-check curl round-trip, a lane-accounting
 stress (200 requests, 24-way, 8 lanes, both queueing and refusing), an
 equivalence suite and a concurrency suite that run where the card is. Clean
 under ASan and UBSan on x86_64.
@@ -787,8 +787,8 @@ misc
   stop, toolcall, chat, prefix_cache, block_pool, turnstile), exec/ (backend
   interface, stub, backend_ov), api/ (error, handlers), http/ (cpp-httplib
   wiring).
-- tests/: 306 unit cases (hand-rolled harness, no framework), roundtrip.sh
-  (48 curl checks, both wired into ctest), concurrency/stress.sh (lane
+- tests/: 409 unit cases device-free, 413 with the OpenVINO backend (hand-rolled
+  harness, no framework), roundtrip.sh (64 curl checks, both wired into ctest), concurrency/stress.sh (lane
   accounting, stub-only, also in ctest), and equivalence/run.sh plus
   concurrency/run.py, which need a real card.
 - third_party/: cpp-httplib 0.18.3, nlohmann/json 3.11.3, single headers.
