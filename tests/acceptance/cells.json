@@ -23,7 +23,14 @@
     "gates": "byte-equality: cold vs warm cache, chunked vs unchunked prefill, one chunk size vs another",
     "reports": "chunk sweep",
     "external": null,
-    "timeout_seconds": 3600
+    "timeout_seconds": 3600,
+    "references": [],
+    "expected_skips": [
+      {
+        "check": "mtp-section",
+        "reason": "coder artifact carries no MTP head"
+      }
+    ]
   },
   {
     "name": "coder-offload-2lane",
@@ -48,7 +55,14 @@
     "gates": "the same byte-equality claims as coder-offload-1lane, held at --parallel 2",
     "reports": null,
     "external": null,
-    "timeout_seconds": 3600
+    "timeout_seconds": 3600,
+    "references": [],
+    "expected_skips": [
+      {
+        "check": "mtp-section",
+        "reason": "coder artifact carries no MTP head"
+      }
+    ]
   },
   {
     "name": "coder-offload-concurrency",
@@ -74,7 +88,8 @@
     "gates": "no cross-slot bleed, cold/warm per lane, cancellation, admission (§4.1)",
     "reports": null,
     "external": null,
-    "timeout_seconds": 3600
+    "timeout_seconds": 3600,
+    "references": []
   },
   {
     "name": "coder-served-large",
@@ -95,10 +110,43 @@
       }
     },
     "flags": "ARCINT_EXTRA_ARGS=--paged-kv u8, no offload (the served precision; the suite's own --n-ctx 8192)",
-    "gates": "steady-state decode >= 60 t/s (measured 53.4 cold / 69.2 warm, DESIGN §7.0.2ai)",
-    "reports": "53.4 t/s cold, 69.2 t/s warm",
+    "gates": "byte-equality: two greedy runs, cold vs warm cache, a restored continuation vs cold, and (draft 4) a copy-the-input prompt",
+    "reports": null,
     "external": null,
-    "timeout_seconds": 3600
+    "timeout_seconds": 3600,
+    "references": [],
+    "expected_skips": [
+      {
+        "check": "mtp-section",
+        "reason": "coder artifact carries no MTP head"
+      }
+    ]
+  },
+  {
+    "name": "coder-served-large-decode",
+    "design": [
+      "§5",
+      "§7.0.2ai"
+    ],
+    "artifact_class": "coder-int4",
+    "card_class": "large",
+    "runner": {
+      "cmd": "tests/acceptance/cells/decode_probe.sh",
+      "args": [
+        "{binary}",
+        "{model_root}/qwen36-coder-b5-ov",
+        "{device_large}"
+      ],
+      "env": {
+        "ARCINT_EXTRA_ARGS": "--paged-kv u8"
+      }
+    },
+    "flags": "ARCINT_EXTRA_ARGS=--paged-kv u8, no offload (the served precision)",
+    "gates": "byte-identity of the two requests' outputs; the warm second-request decode rate against its reference once filled (reports until then, §8.8)",
+    "reports": "0.3.0 record (DESIGN §7.0.2ai): 53.4 t/s cold / 69.2 t/s warm decode",
+    "external": null,
+    "timeout_seconds": 1800,
+    "references": null
   },
   {
     "name": "coder-served-small",
@@ -119,10 +167,69 @@
       }
     },
     "flags": "ARCINT_EXTRA_ARGS=--paged-kv u8 (the served precision at the suite's own --n-ctx 8192; the served depth 98,304 and 2 GiB prefix cache are the pruefstand cell's)",
-    "gates": "the equivalence and concurrency suites both pass on the 16 GiB card",
-    "reports": "48.0/49.5 t/s",
+    "gates": "byte-equality (as coder-served-large), on the 16 GiB card",
+    "reports": null,
     "external": null,
-    "timeout_seconds": 3600
+    "timeout_seconds": 3600,
+    "references": [],
+    "expected_skips": [
+      {
+        "check": "mtp-section",
+        "reason": "coder artifact carries no MTP head"
+      }
+    ]
+  },
+  {
+    "name": "coder-served-small-decode",
+    "design": [
+      "§5",
+      "§7.0.2ai"
+    ],
+    "artifact_class": "coder-int4",
+    "card_class": "small",
+    "runner": {
+      "cmd": "tests/acceptance/cells/decode_probe.sh",
+      "args": [
+        "{binary}",
+        "{model_root}/qwen36-coder-b5-ov",
+        "{device_small}"
+      ],
+      "env": {
+        "ARCINT_EXTRA_ARGS": "--paged-kv u8"
+      }
+    },
+    "flags": "ARCINT_EXTRA_ARGS=--paged-kv u8, no offload (the served precision)",
+    "gates": "byte-identity of the two requests' outputs; the warm second-request decode rate against its reference once filled (reports until then, §8.8)",
+    "reports": "0.3.0 record (DESIGN §7.0.2ai): 48.0/49.5 t/s decode",
+    "external": null,
+    "timeout_seconds": 1800,
+    "references": null
+  },
+  {
+    "name": "coder-served-small-concurrency",
+    "design": [
+      "§4.1",
+      "§5"
+    ],
+    "artifact_class": "coder-int4",
+    "card_class": "small",
+    "runner": {
+      "cmd": "tests/concurrency/run.py",
+      "args": [
+        "{binary}",
+        "{model_root}/qwen36-coder-b5-ov",
+        "{device_small}"
+      ],
+      "env": {
+        "ARCINT_EXTRA_ARGS": "--paged-kv u8"
+      }
+    },
+    "flags": "ARCINT_EXTRA_ARGS=--paged-kv u8",
+    "gates": "no cross-slot bleed, cold/warm per lane, cancellation, admission (§4.1)",
+    "reports": null,
+    "external": null,
+    "timeout_seconds": 3600,
+    "references": []
   },
   {
     "name": "agent-dense",
@@ -147,7 +254,35 @@
     "gates": "MTP identity (equivalence's MTP section) and MTP acceptance > 10%",
     "reports": null,
     "external": null,
-    "timeout_seconds": 3600
+    "timeout_seconds": 3600,
+    "references": []
+  },
+  {
+    "name": "agent-dense-concurrency",
+    "design": [
+      "§3.5.2",
+      "§4.1",
+      "§5"
+    ],
+    "artifact_class": "agent-dense",
+    "card_class": "large",
+    "runner": {
+      "cmd": "tests/concurrency/run.py",
+      "args": [
+        "{binary}",
+        "{model_root}/qwen38-b7c1-ov",
+        "{device_large}"
+      ],
+      "env": {
+        "ARCINT_EXTRA_ARGS": "--paged-kv u8"
+      }
+    },
+    "flags": "ARCINT_EXTRA_ARGS=--paged-kv u8",
+    "gates": "no cross-slot bleed, cold/warm per lane, cancellation, admission (§4.1)",
+    "reports": null,
+    "external": null,
+    "timeout_seconds": 3600,
+    "references": []
   },
   {
     "name": "tier-reference-cell",
@@ -180,7 +315,14 @@
     "gates": "tier ON/OFF byte-identity and E2 (CONT after history == CONT fresh)",
     "reports": "16.4 t/s decode, 26.6 t/s prefill",
     "external": null,
-    "timeout_seconds": 7200
+    "timeout_seconds": 7200,
+    "references": null,
+    "metric_qualifiers": [
+      [
+        "on",
+        "off"
+      ]
+    ]
   },
   {
     "name": "ngram-determinism-repeat",
@@ -210,7 +352,8 @@
     "gates": "six fresh processes produce identical output",
     "reports": null,
     "external": null,
-    "timeout_seconds": 3600
+    "timeout_seconds": 3600,
+    "references": []
   },
   {
     "name": "depth-ladder",
@@ -235,7 +378,18 @@
     "gates": "the load completes at both KV precisions on both cards",
     "reports": "t/s per card and precision",
     "external": null,
-    "timeout_seconds": 10800
+    "timeout_seconds": 10800,
+    "references": null,
+    "metric_qualifiers": [
+      [
+        "large",
+        "small"
+      ],
+      [
+        "u8",
+        "u8i4"
+      ]
+    ]
   },
   {
     "name": "pruefstand",
@@ -253,7 +407,8 @@
       "invocation": "$ARCINT_PRUEFSTAND --greedy --no-thinking",
       "score_parse": "last line matches 'score: (\\d+)/10'",
       "reference_score": "10/10"
-    }
+    },
+    "references": []
   },
   {
     "name": "sanitizers",
@@ -273,7 +428,8 @@
     "gates": "zero sanitizer reports",
     "reports": "device-free build only (ARCINT_OPENVINO=OFF): the 4 rope-precision cases gated on ARCINT_OPENVINO are not instrumented by this cell",
     "external": null,
-    "timeout_seconds": 1800
+    "timeout_seconds": 1800,
+    "references": []
   },
   {
     "name": "package-build",
@@ -291,6 +447,7 @@
     "gates": "the package build succeeds, is version-stamped, and its RPATH probe passes; a post-deploy smoke run follows the install, outside this cell",
     "reports": "",
     "external": null,
-    "timeout_seconds": 1800
+    "timeout_seconds": 1800,
+    "references": []
   }
 ]

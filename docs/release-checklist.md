@@ -15,11 +15,13 @@ Every 77 (skip) must be named on that command line, or the run does not count as
       flags: ARCINT_EXTRA_ARGS=--offload-ratio 20 --paged-kv u8:i4; ARCINT_MOE_DEVICE_POOL_BYTES=8 GiB (the suite adds its own --n-ctx 8192 and per-section cache flags)
       gates: byte-equality: cold vs warm cache, chunked vs unchunked prefill, one chunk size vs another
       reports: chunk sweep
+      expected skip: mtp-section (declared: coder artifact carries no MTP head; pre-named -- --allow-skip naming it is an error)
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
 - [ ] `coder-offload-2lane` -- tests/equivalence/run.sh (§5)
       flags: ARCINT_EXTRA_ARGS=--offload-ratio 20 --paged-kv u8:i4 --parallel 2; ARCINT_MOE_DEVICE_POOL_BYTES=8 GiB
       gates: the same byte-equality claims as coder-offload-1lane, held at --parallel 2
+      expected skip: mtp-section (declared: coder artifact carries no MTP head; pre-named -- --allow-skip naming it is an error)
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
 - [ ] `coder-offload-concurrency` -- tests/concurrency/run.py (§4.1, §5)
@@ -29,14 +31,33 @@ Every 77 (skip) must be named on that command line, or the run does not count as
 
 - [ ] `coder-served-large` -- tests/equivalence/run.sh (§5)
       flags: ARCINT_EXTRA_ARGS=--paged-kv u8, no offload (the served precision; the suite's own --n-ctx 8192)
-      gates: steady-state decode >= 60 t/s (measured 53.4 cold / 69.2 warm, DESIGN §7.0.2ai)
-      reports: 53.4 t/s cold, 69.2 t/s warm
+      gates: byte-equality: two greedy runs, cold vs warm cache, a restored continuation vs cold, and (draft 4) a copy-the-input prompt
+      expected skip: mtp-section (declared: coder artifact carries no MTP head; pre-named -- --allow-skip naming it is an error)
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
+
+- [ ] `coder-served-large-decode` -- tests/acceptance/cells/decode_probe.sh (§5, §7.0.2ai)
+      flags: ARCINT_EXTRA_ARGS=--paged-kv u8, no offload (the served precision)
+      gates: byte-identity of the two requests' outputs; the warm second-request decode rate against its reference once filled (reports until then, §8.8)
+      reports: 0.3.0 record (DESIGN §7.0.2ai): 53.4 t/s cold / 69.2 t/s warm decode
+      references: not yet filled
+      timeout: 1800s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
 - [ ] `coder-served-small` -- tests/equivalence/run.sh (§5)
       flags: ARCINT_EXTRA_ARGS=--paged-kv u8 (the served precision at the suite's own --n-ctx 8192; the served depth 98,304 and 2 GiB prefix cache are the pruefstand cell's)
-      gates: the equivalence and concurrency suites both pass on the 16 GiB card
-      reports: 48.0/49.5 t/s
+      gates: byte-equality (as coder-served-large), on the 16 GiB card
+      expected skip: mtp-section (declared: coder artifact carries no MTP head; pre-named -- --allow-skip naming it is an error)
+      timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
+
+- [ ] `coder-served-small-decode` -- tests/acceptance/cells/decode_probe.sh (§5, §7.0.2ai)
+      flags: ARCINT_EXTRA_ARGS=--paged-kv u8, no offload (the served precision)
+      gates: byte-identity of the two requests' outputs; the warm second-request decode rate against its reference once filled (reports until then, §8.8)
+      reports: 0.3.0 record (DESIGN §7.0.2ai): 48.0/49.5 t/s decode
+      references: not yet filled
+      timeout: 1800s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
+
+- [ ] `coder-served-small-concurrency` -- tests/concurrency/run.py (§4.1, §5)
+      flags: ARCINT_EXTRA_ARGS=--paged-kv u8
+      gates: no cross-slot bleed, cold/warm per lane, cancellation, admission (§4.1)
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
 - [ ] `agent-dense` -- tests/equivalence/run.sh (§3.5.2, §5)
@@ -44,10 +65,16 @@ Every 77 (skip) must be named on that command line, or the run does not count as
       gates: MTP identity (equivalence's MTP section) and MTP acceptance > 10%
       timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
+- [ ] `agent-dense-concurrency` -- tests/concurrency/run.py (§3.5.2, §4.1, §5)
+      flags: ARCINT_EXTRA_ARGS=--paged-kv u8
+      gates: no cross-slot bleed, cold/warm per lane, cancellation, admission (§4.1)
+      timeout: 3600s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
+
 - [ ] `tier-reference-cell` -- tests/acceptance/cells/tier_reference.sh (§3.4, §7.0.2ai)
       flags: ratio 50, ARCINT_MOE_DEVICE_POOL_BYTES=8 GiB pool, u8 KV, 1 lane, n_ctx 65536, 1,198-tok prompt, 64 greedy tokens, 2 requests/process
       gates: tier ON/OFF byte-identity and E2 (CONT after history == CONT fresh)
       reports: 16.4 t/s decode, 26.6 t/s prefill
+      references: not yet filled
       timeout: 7200s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
 - [ ] `ngram-determinism-repeat` -- tests/acceptance/cells/ngram_determinism.sh (§7.0.2ae)
@@ -59,6 +86,7 @@ Every 77 (skip) must be named on that command line, or the run does not count as
       flags: 98,147-token prefill at u8 and u8:i4, both cards
       gates: the load completes at both KV precisions on both cards
       reports: t/s per card and precision
+      references: not yet filled
       timeout: 10800s (the generated per-cell ctest test's own TIMEOUT; run.py --all enforces the same figure itself)
 
 - [ ] `pruefstand` -- external (§5)

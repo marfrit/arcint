@@ -101,6 +101,21 @@ lines() {  # lines <log> -- the server's own reported prefill/decode rates (repo
   grep -a -E "prefill|decode" "$1" | grep -a "t/s" | tail -4 | sed 's/^/       /'
 }
 
+metric_value() {  # metric_value <log> <prefill|decode> <request-index, 1-based>
+  # Pulls the t/s figure out of the <index>-th matching line of <log>, in the
+  # order the server printed them -- a KNOWN request index, not a tail of the
+  # log (docs/design-0.3.1-test-ladder.md §8.7: "a differently-shaped log ...
+  # the first gate to fire will be a process that logged differently"). Each
+  # request here produces exactly one prefill line and one decode line, so
+  # index 2 names the second (warm) request unambiguously.
+  grep -a -E "$2" "$1" | grep -a "t/s" | sed -n "${3}p" \
+    | grep -a -o -E '[0-9]+\.[0-9]+ t/s' | grep -a -o -E '^[0-9]+\.[0-9]+'
+}
+
+emit_metric() {  # emit_metric <metric> <value> <unit> -- silent if <value> is empty
+  [[ -n "$2" ]] && printf 'ACCEPTANCE-METRIC %s %s %s\n' "$1" "$2" "$3"
+}
+
 echo "== tier-reference-cell on $DEV (${SERVER_ARGS[*]})"
 
 # ------------------------------------------------------------- prompt sizing
@@ -146,6 +161,38 @@ for arm in off1 off2 on1 on2; do
   lines "$WORK/$arm.log"
   stop_server
 done
+
+# --------------------------------------------------------- ACCEPTANCE-METRIC
+#
+# off1 and on1 stand for their arm here (off2/on2 exist above only to prove
+# repeatability within the baseline before the tier is even involved); the
+# 2nd request of each (index 2, docs/design-0.3.1-test-ladder.md §8.7) is the
+# warm one DESIGN §7.0.2ai's reference cell reports. run.py, not this
+# script, decides whether any of these numbers is a regression -- it holds
+# the reference and the gate (§8.2).
+decode_off=$(metric_value "$WORK/off1.log" decode 2)
+prefill_off=$(metric_value "$WORK/off1.log" prefill 2)
+decode_on=$(metric_value "$WORK/on1.log" decode 2)
+prefill_on=$(metric_value "$WORK/on1.log" prefill 2)
+emit_metric decode-warm-2nd-off  "$decode_off"  t/s
+emit_metric prefill-warm-2nd-off "$prefill_off" t/s
+emit_metric decode-warm-2nd-on   "$decode_on"   t/s
+emit_metric prefill-warm-2nd-on  "$prefill_on"  t/s
+if [[ -n "$decode_off" && -n "$decode_on" ]]; then
+  # One decimal, on/off from the SAME window (this invocation), which is why
+  # it cancels the process-to-process drift a lone decode-warm-2nd-on figure
+  # cannot (§8.1's own reason for gating the ratio as well as the rate).
+  ratio=$(python3 -c "print(f'{${decode_on}/${decode_off}:.1f}')" 2>/dev/null || true)
+  emit_metric decode-ratio-on-off "$ratio" ratio
+fi
+
+# grouped_fallbacks is the plugin's own [OTD_PERF] counter (DESIGN §7.0.2ai,
+# §4561-4580); it exists only on a patched runtime, so its absence from the
+# log is not this cell's failure to detect -- §8's amendment says a cell may
+# print nothing rather than invent a zero, and the missing-metric rule stays
+# silent here because tier-reference-cell's references are still null.
+grouped_fallbacks=$(grep -a -o -E 'grouped_fallbacks=[0-9]+' "$WORK/on1.log" | tail -1 | grep -a -o -E '[0-9]+$')
+emit_metric grouped-fallbacks-on "$grouped_fallbacks" count
 
 # ------------------------------------------------- byte-identity, all arms
 #

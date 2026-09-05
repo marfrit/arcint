@@ -48,6 +48,13 @@ Acceptance, with a card and a model root:
     tests/acceptance/run.py --manifest build-accept/acceptance/run_manifest.json \
           --all --allow-skip pruefstand   # name every 77, or the run does not count
 
+A cell's runner may also print `ACCEPTANCE-METRIC <metric> <value> <unit>`
+lines; run.py compares each against the cell's own `references` in
+`cells.json` and fails the run on a regression unless it is named
+`--allow-skip`-style with `--allow-regress <cell>/<metric>` (only in --all;
+a regression in --cell mode fails outright) -- a `references: null` cell has
+none yet and reports its numbers instead of gating them.
+
 `-DARCINT_ACCEPTANCE=ON` is refused at configure time without
 `-DARCINT_OPENVINO=ON`: a stub binary would "pass" a card cell by serving stub
 bytes. The equivalence suite behind several cells is the contract:

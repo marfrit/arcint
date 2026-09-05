@@ -2,21 +2,149 @@
   {
     "name": "always-pass",
     "runner": {"cmd": "/bin/true", "args": [], "env": {}},
-    "external": null
+    "external": null,
+    "references": null
   },
   {
     "name": "always-fail",
     "runner": {"cmd": "/bin/false", "args": [], "env": {}},
-    "external": null
+    "external": null,
+    "references": null
   },
   {
     "name": "always-skip",
     "runner": {"cmd": "fixtures/skip77.sh", "args": [], "env": {}},
-    "external": null
+    "external": null,
+    "references": null
   },
   {
     "name": "prints-a-named-skip",
     "runner": {"cmd": "fixtures/mtp-skip.sh", "args": [], "env": {}},
+    "external": null,
+    "references": null
+  },
+  {
+    "name": "declared-skip-fires",
+    "runner": {"cmd": "fixtures/mtp-skip.sh", "args": [], "env": {}},
+    "external": null,
+    "references": null,
+    "expected_skips": [{"check": "mtp-section", "reason": "fixture: declared for testing"}]
+  },
+  {
+    "name": "declared-skip-missing",
+    "runner": {"cmd": "/bin/true", "args": [], "env": {}},
+    "external": null,
+    "references": null,
+    "expected_skips": [{"check": "mtp-section", "reason": "fixture: declared for testing"}]
+  },
+  {
+    "name": "metric-at-gate",
+    "runner": {"cmd": "fixtures/metric-at-gate.sh", "args": [], "env": {}},
+    "external": null,
+    "references": [
+      {"metric": "fake-decode", "value": 20.0, "gate_at": 18.0, "unit": "t/s",
+       "direction": "lower-is-worse", "samples": 2, "spread_pct": 0.0,
+       "config": "selftest fixture, not a measurement", "prompt_tokens": 100,
+       "design": "§8.5", "measured": "1970-01-01", "binary": "fixture"}
+    ]
+  },
+  {
+    "name": "metric-below-band",
+    "runner": {"cmd": "fixtures/metric-below-band.sh", "args": [], "env": {}},
+    "external": null,
+    "references": [
+      {"metric": "fake-decode", "value": 20.0, "gate_at": 18.0, "unit": "t/s",
+       "direction": "lower-is-worse", "samples": 2, "spread_pct": 0.0,
+       "config": "selftest fixture, not a measurement", "prompt_tokens": 100,
+       "design": "§8.5", "measured": "1970-01-01", "binary": "fixture"}
+    ]
+  },
+  {
+    "name": "metric-above-band",
+    "runner": {"cmd": "fixtures/metric-above-band.sh", "args": [], "env": {}},
+    "external": null,
+    "references": [
+      {"metric": "fake-latency", "value": 2.0, "gate_at": 3.0, "unit": "s",
+       "direction": "higher-is-worse", "samples": 1, "spread_pct": 0.0,
+       "config": "selftest fixture, not a measurement", "prompt_tokens": 1,
+       "design": "§8.5", "measured": "1970-01-01", "binary": "fixture"}
+    ]
+  },
+  {
+    "name": "metric-far-better",
+    "runner": {"cmd": "fixtures/metric-far-better.sh", "args": [], "env": {}},
+    "external": null,
+    "references": [
+      {"metric": "fake-decode", "value": 20.0, "gate_at": 18.0, "unit": "t/s",
+       "direction": "lower-is-worse", "samples": 2, "spread_pct": 0.0,
+       "config": "selftest fixture, not a measurement", "prompt_tokens": 100,
+       "design": "§8.5", "measured": "1970-01-01", "binary": "fixture"}
+    ]
+  },
+  {
+    "name": "metric-unknown-name",
+    "runner": {"cmd": "fixtures/metric-unknown-name.sh", "args": [], "env": {}},
+    "external": null,
+    "references": [
+      {"metric": "fake-decode", "value": 20.0, "gate_at": 18.0, "unit": "t/s",
+       "direction": "lower-is-worse", "samples": 2, "spread_pct": 0.0,
+       "config": "selftest fixture, not a measurement", "prompt_tokens": 100,
+       "design": "§8.5", "measured": "1970-01-01", "binary": "fixture"}
+    ]
+  },
+  {
+    "name": "metric-missing",
+    "runner": {"cmd": "/bin/true", "args": [], "env": {}},
+    "external": null,
+    "references": [
+      {"metric": "fake-decode", "value": 20.0, "gate_at": 18.0, "unit": "t/s",
+       "direction": "lower-is-worse", "samples": 2, "spread_pct": 0.0,
+       "config": "selftest fixture, not a measurement", "prompt_tokens": 100,
+       "design": "§8.5", "measured": "1970-01-01", "binary": "fixture"}
+    ]
+  },
+  {
+    "name": "metric-nan",
+    "runner": {"cmd": "fixtures/metric-nan.sh", "args": [], "env": {}},
+    "external": null,
+    "references": [
+      {"metric": "fake-decode", "value": 20.0, "gate_at": 18.0, "unit": "t/s",
+       "direction": "lower-is-worse", "samples": 2, "spread_pct": 0.0,
+       "config": "selftest fixture, not a measurement", "prompt_tokens": 100,
+       "design": "§8.5", "measured": "1970-01-01", "binary": "fixture"}
+    ]
+  },
+  {
+    "name": "metric-wrong-unit",
+    "runner": {"cmd": "fixtures/metric-wrong-unit.sh", "args": [], "env": {}},
+    "external": null,
+    "references": [
+      {"metric": "fake-decode", "value": 20.0, "gate_at": 18.0, "unit": "t/s",
+       "direction": "lower-is-worse", "samples": 2, "spread_pct": 0.0,
+       "config": "selftest fixture, not a measurement", "prompt_tokens": 100,
+       "design": "§8.5", "measured": "1970-01-01", "binary": "fixture"}
+    ]
+  },
+  {
+    "name": "metric-null-refs",
+    "runner": {"cmd": "fixtures/metric-null-refs.sh", "args": [], "env": {}},
+    "external": null,
+    "references": null
+  },
+  {
+    "name": "no-references-key",
+    "runner": {"cmd": "/bin/true", "args": [], "env": {}},
     "external": null
+  },
+  {
+    "name": "metric-ref-but-skips",
+    "runner": {"cmd": "fixtures/metric-ref-skip.sh", "args": [], "env": {}},
+    "external": null,
+    "references": [
+      {"metric": "fake-decode", "value": 20.0, "gate_at": 18.0, "unit": "t/s",
+       "direction": "lower-is-worse", "samples": 2, "spread_pct": 0.0,
+       "config": "selftest fixture, not a measurement", "prompt_tokens": 100,
+       "design": "§8.5", "measured": "1970-01-01", "binary": "fixture"}
+    ]
   }
 ]

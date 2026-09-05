@@ -33,6 +33,21 @@ Spec: `docs/milestone-0.3.0.md:91` — device-free `ctest` is the unit gate, a s
 
 The suites carry the same defect internally: `tests/equivalence/run.sh:225` prints "no MTP head in $MODEL; skipping the MTP gates" and still exits 0 at `:267`. Increment 2 makes it print a machine-readable `ACCEPTANCE-SKIP <check> <reason>` line that the runner promotes to a named skip -- not a bare `SKIP`, because `tests/harness.h`'s unit-test harness already prints its own `SKIP %s: %s` lines (`tests/test_main.cpp`), and the sanitizers cell tails its ctest log to its own stdout, so a bare `SKIP` would let a unit-test skip get promoted as an acceptance one by accident.
 
+**Increment 3 amendment (2026-09-05): declared expected skips.** The MTP
+section fires on *every* coder-artifact cell running the equivalence suite
+(`coder-offload-1lane`, `coder-offload-2lane`, `coder-served-large`,
+`coder-served-small`) for the same reason every time -- the coder artifact
+itself carries no MTP head -- so naming it on every `--all` command line is
+a fixed incantation, not a decision. `cells.json` gains an optional
+`"expected_skips": [{"check", "reason"}]` per cell; a declared skip is
+pre-named (no `--allow-skip` needed), prints `SKIP <cell>/<check>
+(declared: <reason>)`, and its *absence* fails the cell -- the enumeration
+would be stale, the artifact having grown the capability the skip was
+declared against. `--allow-skip` naming a declared one is an error: it is
+already named by definition, so naming it again is the same rot as an
+unused entry. `agent-dense` (the dense artifact, which does carry an MTP
+head) does not declare it.
+
 ## 3. The enumeration
 
 One file, `tests/acceptance/cells.json` (JSON, matching the `models/allowlist-raw.json` precedent that `tests/test_provenance.cpp:18` already reads from the source tree). Per cell: `name`, `runner` + args, `artifact_class`, `card_class`, `flags`, `design` (defining section), `gates`, `reports`, `external`.
@@ -51,6 +66,20 @@ One file, `tests/acceptance/cells.json` (JSON, matching the `models/allowlist-ra
 | `pruefstand` | **external** | coder, through the deployed package | greedy, thinking off | §5 | gates 10/10 |
 | `sanitizers` | ASan+UBSan (x86_64), UBSan elsewhere, over unit+roundtrip+stress | none | `-fno-sanitize-recover` | §5 | gates zero reports |
 | `package-build` | `contrib/packaging/arcint/build-deb.sh` | none | version stamp (`:60`), RPATH probe | §5.1 | gates; post-deploy smoke follows |
+
+**Increment 3 correction (2026-09-05): a cell's `gates` text must not claim
+more than its own runner enforces.** `coder-served-large`'s "equivalence +
+decode sample" and `coder-served-small`'s "equivalence + concurrency" were
+prose describing what the 0.3.0 window ran by hand, not what these cells'
+actual runner (`tests/equivalence/run.sh` alone) gates; both rows now gate
+byte-equality only, and the decode-rate claim moves to two new sibling cells
+(`coder-served-large-decode`, `coder-served-small-decode`, runner
+`tests/acceptance/cells/decode_probe.sh`) that actually measure it, with
+`references: null` until the fill window. The concurrency claim moves the
+same way, into `coder-served-small-concurrency` and a new
+`agent-dense-concurrency` (mirroring `coder-offload-concurrency`, both
+running `tests/concurrency/run.py`) — `agent-dense`'s own row keeps only
+what its equivalence run gates (MTP identity and acceptance).
 
 **External dependency, honestly.** The Prüfstand harness is fleet tooling outside this repository. Its cell carries `"external": {"env": "ARCINT_PRUEFSTAND", "invocation": …, "score_parse": …}` and the reference score — never the harness. Unset env ⇒ the cell reports `SKIPPED external-harness-not-configured`, which must then be named in `--allow-skip`, so a release that ran without it says so in its own log rather than passing.
 
@@ -253,3 +282,25 @@ processes, both requests, never one number.
 - **`--allow-regress` rot**, worse than a named skip: a slide once excused stays
   excused. The delta prints into the summary; the checklist carries a line for
   the reason.
+
+### 8.8 Amendment (2026-09-05): `references: null` as the interim state
+
+§8.2 says a printed metric with no reference is a FAIL. Taken literally, that
+rule fires the moment `tier_reference.sh` and `depth_ladder.sh` start
+printing `ACCEPTANCE-METRIC` lines, since every cell's `references` is `[]`
+until the fill window this increment hands off to writes real numbers in —
+which would make landing the wire format and landing the numbers one
+inseparable change, the opposite of a red-first mechanism. The schema
+distinguishes two JSON shapes instead of one: `"references": []` means the
+cell is expected to print nothing comparable, so any `ACCEPTANCE-METRIC`
+line from it is still the FAIL §8.2 describes; `"references": null` means
+"not yet filled" — every printed metric is a report, exempt from both the
+unknown-metric and the missing-reference rule, until a later commit replaces
+the `null` with a real list and cites the `design`/`measured` provenance
+§8.4 requires. Four cells carry `null` now, because they print metrics today
+with no values to gate against yet: `tier-reference-cell` and `depth-ladder`
+(this increment's own runners), and `coder-served-large-decode` and
+`coder-served-small-decode` (added by the same review that split the rate
+claim out of `coder-served-large`/`coder-served-small`, §3). Every other
+cell carries `[]`, because none of the others has a runner that emits
+`ACCEPTANCE-METRIC` at all.

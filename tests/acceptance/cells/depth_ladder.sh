@@ -118,6 +118,25 @@ lines() {  # lines <log>
   grep -a -E "prefill|decode" "$1" | grep -a "t/s" | tail -4 | sed 's/^/       /'
 }
 
+metric_value() {  # metric_value <log> <prefill|decode> last
+  # Unlike tier_reference.sh's own metric_value, this cell has no separate
+  # sizing server: size_prompt.py's own calibration pings (max_tokens=1, one
+  # to five rounds -- read: it, too, prints a prefill/decode line) share the
+  # SAME log as the one real completion this cell asks. A fixed index (say,
+  # 1) would therefore name a calibration round, not the request -- the
+  # exact "differently-shaped log" failure docs/design-0.3.1-test-ladder.md
+  # §8.7 warns about. The known index that IS stable here is the last one:
+  # nothing asks this server anything after the real completion, so the
+  # last matching line is always it, regardless of how many calibration
+  # rounds size_prompt.py needed this time.
+  grep -a -E "$2" "$1" | grep -a "t/s" | tail -1 \
+    | grep -a -o -E '[0-9]+\.[0-9]+ t/s' | grep -a -o -E '^[0-9]+\.[0-9]+'
+}
+
+emit_metric() {  # emit_metric <metric> <value> <unit> -- silent if <value> is empty
+  [[ -n "$2" ]] && printf 'ACCEPTANCE-METRIC %s %s %s\n' "$1" "$2" "$3"
+}
+
 echo "== depth-ladder: ${PREFILL_TOKENS}-token prefill at u8 and u8:i4, on both cards (n-ctx $N_CTX)"
 
 SEED="$REPO_ROOT/tests/acceptance/prompts/filler-seed.txt"
@@ -142,11 +161,12 @@ run_cell() {  # run_cell <tag> <device>
     return
   fi
 
-  local outfile="$WORK/$tag-out.txt"
+  local outfile="$WORK/$tag-out.txt" req_ok=1
   if ask "$outfile" "$promptfile" 32 && [[ -s "$outfile" ]]; then
     pass "$tag: served a non-empty completion (HTTP 200)"
   else
     fail "$tag: served a non-empty completion (HTTP 200)"
+    req_ok=0
   fi
 
   # The fault signatures on the record for this exact prefill depth
@@ -164,6 +184,23 @@ run_cell() {  # run_cell <tag> <device>
   fi
 
   lines "$log"
+
+  # Names carry card and precision (docs/design-0.3.1-test-ladder.md §8.7:
+  # "both cards under one name" -- a bare `decode` would average two cards).
+  # <tag> is "<card>-<precision>" (e.g. "large-u8:i4"); the colon in a
+  # u8:i4 precision is stripped so the metric name has none.
+  local card="${tag%%-*}" prec_token="${precision//:/}"
+  # Emitted only if the one request this cell asks actually succeeded
+  # (Increment-3 review, 2026-09-05, MAJOR 4) -- a failed request has no
+  # rate to report, and the cell fails anyway (above) without one.
+  if [[ "$req_ok" == 1 ]]; then
+    local decode_v prefill_v
+    decode_v=$(metric_value "$log" decode last)
+    prefill_v=$(metric_value "$log" prefill last)
+    emit_metric "decode-${card}-${prec_token}"  "$decode_v"  t/s
+    emit_metric "prefill-${card}-${prec_token}" "$prefill_v" t/s
+  fi
+
   stop_server
 }
 
