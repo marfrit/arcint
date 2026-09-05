@@ -90,7 +90,7 @@ what its equivalence run gates (MTP identity and acceptance).
 Rule: **a unit case may assert only properties of arcint's own code; where it needs a host capability it probes first and SKIPs with a reason.** Present offenders:
 
 - `tests/test_affinity.cpp:10-35` — post-`eae32d1` it picks the first allowed core, but still fails where `sched_setaffinity` is denied outright. Gets `SKIP_UNLESS(pin permitted, …)`.
-- `tests/test_turnstile.cpp:59,63,84` — 30/50 ms sleeps; timing-sensitive on a loaded builder and under ASan. Keep, but documented as the one timing-dependent case.
+- `tests/test_turnstile.cpp:59,63,84` — 30/50 ms sleeps; timing-sensitive on a loaded builder and under ASan. Keep, but documented as the one timing-dependent case. *(Superseded 2026-09-05 by the `turnstile-wall-time` campaign, DESIGN §7.0.2am: the cases now synchronise on `Turnstile::issued()`; no sleep decides an assertion.)*
 - `tests/test_artifact.cpp:27` reads `TMPDIR`; `tests/test_provenance.cpp:18` reads the source tree via `ARCINT_SOURCE_DIR` (`CMakeLists.txt:198-199`) — both fine in-tree, both recorded.
 - `tests/roundtrip.sh:14-15` and `tests/concurrency/stress.sh:20` exit 2 when `curl`/`python3` are missing, which ctest reports as a *failure*. Becomes exit 77 with a reason.
 

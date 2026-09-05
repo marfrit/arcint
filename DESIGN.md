@@ -5050,6 +5050,73 @@ Production on the dev host was restored and verified after each window
 (both units active, health 200); the 24 GB card's unit was stopped only
 for its two cells.
 
+#### 7.0.2am The turnstile tests synchronise instead of sleeping; the roundtrip flake did not reproduce under build load (2026-09-05)
+
+The `turnstile-wall-time` campaign (`docs/campaigns/turnstile-wall-time.md`),
+device-free, on the aarch64 build host: four cores, no card, the same host
+class §5's Sanitizers paragraph runs UBSan on.
+
+**The defect, shown red.** Two of `tests/test_turnstile.cpp`'s three cases
+decided an assertion by a wall-clock sleep. The ordering case started the
+third contender 30 ms after seeing the second's "started" flag; the wait
+case released the held turn 50 ms after starting the other thread and
+required a reported wait of at least 40 ms. Neither sleep observed
+anything: both assumed the contender had reached `Turnstile::take()` —
+where the ticket is issued under the mutex, and where the order is decided
+— inside the window. With a 100 ms delay injected between the flag and
+`take()` in the slowed thread, both cases failed three of three runs: the
+order came out {3, 2}, and the waiter took an uncontended turn after the
+release and reported zero.
+
+**The rewrite.** `Turnstile` gains `issued()` beside `served()` — tickets
+handed out, waiting ones included, `served() <= issued()` — test-only in
+the same sense, nothing publishes it. The ordering case waits for
+`issued()` to advance before it starts the next contender; the second
+contender deliberately dawdles 20 ms before asking, which is the bad luck
+the old form failed on. The wait case waits for the other's ticket, then
+measures its own interval from that moment to just before the release and
+requires the reported wait to be at least that: the waiter's clock starts
+before its ticket and stops after the release, both orderings passing
+through the turnstile's mutex, so the bound holds by construction under
+any scheduling of either thread — given the one premise that
+`steady_clock` is a single system-wide monotonic clock, which it is here
+(`CLOCK_MONOTONIC`). Removing either
+synchronising wait made its case fail ten of ten (mutation); fifty
+consecutive runs green after. One draft of the wait case went red first
+and is worth recording: the case takes a solo turn before the held one, so
+the held turn is ticket 1 and `issued()` read 2 before the other thread had
+asked — the wait anchors on the count observed after taking the held turn,
+not on a literal.
+
+**The gate.** `ctest -L unit --repeat until-fail:20` under a continuous
+clean rebuild of this tree at `-j4` (308 and 289 s per build, load average
+2.6–5.1 over 54 samples at 15 s, against 0.5 idle): twenty of twenty green
+in 426.6 s. Then the `roundtrip` entry alone, forty more repeats under the
+same load: forty of forty green in 356.6 s, about 9 s each against 5.5 s
+idle. That is the reproduction attempt for the 0.3.1 window's one observed
+roundtrip flake, whose load was a parallel build on this host and whose
+log was not kept: sixty runs under matched load, not reproduced; it stays
+on the record as observed once.
+
+**The roundtrip sleep, the campaign's finding.** Of `tests/roundtrip.sh`'s
+six sleeps, five are bounded polls for an observed event (four boot health
+checks, the SIGTERM exit). One was not: the cancellation check slept a
+fixed 0.5 s and then grepped the server log for the abort line — the
+turnstile tests' class, a fixed window deciding an assertion. Measured
+under the same build load, five runs, by the script's own clock
+(`date +%s%N`) from curl's return after its 0.5 s cut to the first `grep`
+that found the line: 11, 13, 13, 16 and 32 ms — the line was already there
+at the poll's first look, and spawning that grep is most of the figure —
+so the window had at least a fifteen-fold margin on this host and this is
+*not* shown to be the flake's mechanism. It is
+replaced anyway, by a bounded poll for the line itself (fifty steps of
+0.1 s); red first with a pattern the server never logs — the check fails
+after its bound instead of hanging — and green with the real one.
+
+No served behaviour changed. `docs/design-0.3.1-test-ladder.md` §4's line
+that kept the turnstile sleeps as "the one timing-dependent case" is
+superseded by this section.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

@@ -118,3 +118,19 @@ this campaign.
 ## Status
 
 - 2026-09-05 — opened from the 0.3.1 window; nothing started.
+- 2026-09-05, closed (DESIGN §7.0.2am). Red first: a 100 ms delay between
+  the contender's flag and its `take()` failed both sleep-gated cases
+  three of three (order {3, 2}; a zero wait). Rewrite: `Turnstile::issued()`
+  (test-only, beside `served()`); the ordering case waits for the ticket
+  count to advance before starting the next contender, with the second
+  contender dawdling 20 ms on purpose; the wait case bounds the reported
+  wait by an interval it measures itself, which holds by construction.
+  Removing either wait fails its case ten of ten; fifty local runs green.
+  Gate: `ctest -L unit --repeat until-fail:20` under a continuous `-j4`
+  clean rebuild (load 2.6–5.1), twenty of twenty; `roundtrip` forty more
+  under the same load, forty of forty — sixty runs, the flake not
+  reproduced, on the record as observed once. Finding: `roundtrip.sh`'s
+  cancellation check was the same class (a fixed 0.5 s sleep before the
+  abort-line grep); measured 11–32 ms latency under load, so not shown to
+  be the flake; replaced by a bounded poll, red first with a never-logged
+  pattern. No served behaviour changed; CHANGELOG line under Unreleased.

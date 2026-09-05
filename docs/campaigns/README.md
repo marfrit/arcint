@@ -63,7 +63,7 @@ Ordered by what unblocks what; the order is advice, not a queue.
 
 | campaign | charter | origin | size |
 |---|---|---|---|
-| [test-ladder-close](test-ladder-close.md) | close the 0.3.1 lead item: fill the acceptance references from the runners' own windows, record the first real run | 0.3.1 lead item, `docs/design-0.3.1-test-ladder.md` | small, in progress |
+| [test-ladder-close](test-ladder-close.md) | close the 0.3.1 lead item: fill the acceptance references from the runners' own windows, record the first real run | 0.3.1 lead item, `docs/design-0.3.1-test-ladder.md` | small, closed 2026-09-05 |
 | [prefill-fallback-tristate](prefill-fallback-tristate.md) | patch 0018's overloaded `false` return in the per-expert prefill loop becomes a three-way answer | DESIGN §7.0.2ae, patch 0018 header | small |
 | [static-partition-cold-start](static-partition-cold-start.md) | a cold sequence's first processes pay minutes of warming under the static partition; find the owner, then remove it | DESIGN §7.0.2ai | medium |
 | [static-partition-prefill](static-partition-prefill.md) | tier-ON prefill runs at a third of tier OFF because every layer takes the per-expert fallback; a grouped prefill on the resident subset | DESIGN §7.0.2ai | medium–large |
@@ -72,7 +72,7 @@ Ordered by what unblocks what; the order is advice, not a queue.
 | [u8i4-deep-prefill-fault](u8i4-deep-prefill-fault.md) | the out-of-resources fault at deep u8:i4 prefill on the 16 GiB card; the chunk belt mitigates, the plugin-side cause is open | DESIGN §7.0.2ab, §7.0.2ac | medium |
 | [direct-submission-fault](direct-submission-fault.md) | the runtime's direct-submission semaphore evicted under VRAM pressure; diagnosed, the kernel-side fix operator-local and unmeasured on the record, not closed | DESIGN §7.0.2ad | small (measurement), external |
 | [mtp-cycle-wall](mtp-cycle-wall.md) | MTP never beats plain decoding at depth on the dense agent: a 390 ms cycle against a 130 ms break-even; cut the cycle or record the verdict as final | DESIGN §7.0.2ag | medium |
-| [turnstile-wall-time](turnstile-wall-time.md) | the turnstile test orders threads by wall-clock sleeps and flaked once under build load | 0.3.1 window | small |
+| [turnstile-wall-time](turnstile-wall-time.md) | the turnstile test orders threads by wall-clock sleeps and flaked once under build load | 0.3.1 window | small, closed 2026-09-05 |
 | [pruefstand-cell-remote](pruefstand-cell-remote.md) | the Prüfstand acceptance cell can only skip by name where the harness does not live; make it runnable from the card window | 0.3.1 window | small |
 | [sub4bit-vram-kernel](sub4bit-vram-kernel.md) | VRAM-resident sub-4-bit expert weights: a new GPU kernel path with in-kernel dequant, the only route that pays M10's gate in its own currency | M10 re-scope, DESIGN §7.0.2ah | large |
 | [kquant-host-storage](kquant-host-storage.md) | the host compute tier computing K-quant blocks natively, so offloaded experts are sub-4-bit on disk and in the host pool | M14 extension, DESIGN §7.0.2ah | large, after the kernel campaign's format measurement |

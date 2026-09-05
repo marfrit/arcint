@@ -340,7 +340,13 @@ assert not any(l.strip() == "data: [DONE]" for l in frames), "stream completed; 
 PY2
 check "the cut stream carries partial output and no [DONE]" $?
 
-sleep 0.5
+# The abort is logged at the next scheduler boundary, not at the disconnect,
+# so wait for the line itself, bounded, rather than for a fixed half-second
+# that a loaded builder can outlast (DESIGN §7.0.2am).
+for _ in $(seq 1 50); do
+  grep -q 'aborted: client gone' "$CANCEL_LOG" && break
+  sleep 0.1
+done
 grep -q 'aborted: client gone' "$CANCEL_LOG"
 check "the server logs the abort at a scheduler boundary" $?
 

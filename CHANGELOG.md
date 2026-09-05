@@ -34,6 +34,15 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 - **Campaigns**: every open defect after 0.3.0 is one document under
   `docs/campaigns/` with the prior art surveyed; the milestone document's
   backlog rows are frozen.
+- **Unit tests no longer time their threads** (`turnstile-wall-time`
+  closed, DESIGN §7.0.2am): the turnstile cases synchronise on the
+  ticket count (`Turnstile::issued()`, test-only) instead of 30/50 ms
+  sleeps, shown red with a slowed contender first; `roundtrip.sh`'s
+  cancellation check polls for the abort line instead of sleeping 0.5 s.
+  `ctest -L unit` twenty times and `roundtrip` forty more (sixty in all)
+  green under a continuous parallel build on the aarch64 build host; the one roundtrip
+  flake of the 0.3.1 window did not reproduce. No served behaviour
+  changed.
 - Known, open, on the record: one follow-up window had two tier-ON
   processes disagree on the same prompt (§7.0.2ak); a diagnostic rerun did
   not reproduce it (§7.0.2al); the runner now prints every output's hash.

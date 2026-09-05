@@ -42,4 +42,9 @@ uint64_t Turnstile::served() const {
     return now_serving_;
 }
 
+uint64_t Turnstile::issued() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return next_ticket_;
+}
+
 }  // namespace lgc

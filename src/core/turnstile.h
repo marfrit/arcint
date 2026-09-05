@@ -49,6 +49,13 @@ public:
     // it, so it is not a metric anyone reads.
     uint64_t served() const;
 
+    // Tickets handed out so far, the ones still waiting included, so
+    // served() <= issued() at any instant. Exposed for the tests too: it is
+    // how a test knows a contender has *asked* — the order is fixed the moment
+    // the ticket is issued — without guessing at how long the scheduler took
+    // to get it there. Nothing publishes it either.
+    uint64_t issued() const;
+
 private:
     void release();
 
