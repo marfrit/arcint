@@ -5117,6 +5117,96 @@ No served behaviour changed. `docs/design-0.3.1-test-ladder.md` §4's line
 that kept the turnstile sleeps as "the one timing-dependent case" is
 superseded by this section.
 
+#### 7.0.2an The roundtrip flake reproduced on the dev host: two derived ports, never probed, collide with the previous runs' TIME-WAIT sockets (2026-09-05)
+
+§7.0.2am closed the `turnstile-wall-time` campaign with the roundtrip
+flake "not reproduced in sixty runs" on the aarch64 build host. The same
+gate, run the same afternoon on the x86_64 dev container (eight cores, the
+OpenVINO build tree, both production units running and untouched — the
+unit set opens no device), reproduced it twice within the hour, and the
+instrumented rerun measured the cause. That paragraph of §7.0.2am is
+superseded here; the turnstile half of the campaign stands.
+
+**The reproduction.** Load as in §7.0.2am: a continuous clean rebuild of a
+stub-only tree at `-j8` (13–15 s per build; load average 0.4 rising to
+7.6). `ctest -L unit --repeat until-fail:20`: the `unit` entry twenty of
+twenty, `roundtrip` nineteen green and the twentieth red; `roundtrip`
+alone, forty repeats asked: ten green, the eleventh red. Both reds the same
+signature — the `--served-model-name` server ("alias") dies at start with
+`could not bind 127.0.0.1:<port>`, its seven checks fail, everything else
+passes.
+
+**The cause, measured.** The script picked the main server's port by
+asking the kernel (bind to port 0, read, close) and derived the other two
+servers' ports from it: alias = main + 3, operator = main + 4 — never
+probed. An instrumented copy dumped every socket on the neighbouring ports
+before each derived server started, sixty runs back to back under the
+same load: four failed (runs 34, 36, 53, 59), and in every one the alias
+port was already held, before the alias server was even launched, by a
+TIME-WAIT socket whose *local* port was the alias port — a curl source
+port from an earlier run of the same loop. The chain is visible in the
+dumps for two of the four: run 53's alias port (56394) is in run 34's list
+of curl source ports to its main server, and run 59's (34618) is in run
+53's. For runs 34 and 36 the holders' peers (44055, 41648) are earlier
+runs' server ports whose logs were not kept, so the attribution there is
+by the same pattern, not traced. A client socket's TIME-WAIT lasts 60 s.
+The dumps show one more thing, measured: every one of the 342 TIME-WAIT
+local ports in the five kept dumps is even, and every one of the ten
+kernel picks is odd — on this kernel outgoing connections draw even
+source ports and port-0 binds draw odd ones (the parity split is the
+measurement; that it is the kernel's policy is a reading). So of the two
+derived ports only main + 3 was ever exposed to curl's source ports;
+main + 4 sits in the other class, which is why the operator server never
+failed. That the port-0 pick itself never lands on a held port is a
+reading as well; what was measured is that no pick collided in 240 runs
+while the derived port did, four times in sixty. One further reading,
+not measured here: a listener's address-reuse option does not override a
+TIME-WAIT left by a client socket that set none, which is why the server's
+bind fails rather than sharing.
+
+So the trigger is run *density* inside the TIME-WAIT window, and the
+build load was incidental. A reading with the section's own numbers: a
+run issues about 35 curl connections (22 of them to the main server, the
+ones the dumps list), the dev host's loop completed a run every ~2.5 s
+(about 25 runs, ~850 held even ports inside any 60 s window), one derived
+port sat in that parity class, and the class holds 14,116 ports — roughly
+three to four expected failures in sixty runs; four were observed. The
+aarch64 host, at ~9 s per run under its load, holds about a quarter of
+that: about one expected in sixty, zero observed — consistent with the
+rate, and not evidence against it, since a mean near one leaves a third
+to a half chance of sixty clean runs. §7.0.2am's "not reproduced" was
+therefore never evidence of absence. The 0.3.1 window's original flake —
+one run, during the acceptance target, whose runners poll their servers
+with curl — is consistent with the same mechanism; its log was not kept,
+so that is a reading too.
+
+**The fix.** Every server in `tests/roundtrip.sh` now picks its own port
+with the same kernel probe (`free_port`); nothing is derived. Red first,
+deterministic and device-free: a listener planted on main + 3 before the
+alias server starts (a listener, not a TIME-WAIT — the same symptom from
+a different holder) makes the old script fail as the dev host did
+(`could not bind`, seven checks), and the fixed script passes with the
+same listener in place. Green at the density that failed: the fixed
+script ran 120 of 120 green on the dev host under the same load (load
+average 1.7–8.5, a run every ~2.5 s, no `could not bind` in any log).
+
+**What remains.** A probe-then-bind window still exists for every server,
+the length of its start-up; a concurrent localhost connect landing on
+exactly that port in that window would fail the same way. The container's
+loopback traffic was sampled for 120 s at 0.5 s (every TCP socket, not
+just the units' ports) to see who else connects there: nothing reached the
+production units' ports at all — the unit manager that runs in the same
+container reads systemd and the journal rather than polling the units'
+HTTP endpoints — and the only loopback connections besides the
+roundtrip's own were a handful to the unit manager's API, answering this
+session's own queries. That is this container as configured today, not
+a property of the script; and on this kernel such a connect would draw
+an even port where the probe returns odd ones (a reading from the parity
+split above), which narrows the window further. The belt, if it is ever
+needed, is the server
+binding port 0 itself and announcing the port, which removes the window;
+not done, no served behaviour changed.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

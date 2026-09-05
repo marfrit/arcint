@@ -15,7 +15,21 @@ for tool in curl python3; do
   command -v "$tool" >/dev/null || { echo "roundtrip: $tool is required" >&2; exit 77; }
 done
 
-PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+# A port the kernel says is free right now. Every server below picks its own
+# this way: a port derived from another one (PORT + 3) was never checked, and
+# the script's own curl connections draw source ports from the same ephemeral
+# range, so under back-to-back runs (a client socket's TIME-WAIT lasts 60 s)
+# it was taken out from under the alias server (DESIGN §7.0.2an). The
+# pick-then-bind window that remains is the server's start-up, the same for
+# all four.
+free_port() {
+  python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
+}
+need_port() {  # need_port <value>: an empty pick would fail four checks later, confusingly
+  [[ -n "$1" ]] || { echo "roundtrip: could not pick a free port" >&2; exit 1; }
+}
+
+PORT=$(free_port); need_port "$PORT"
 BASE="http://127.0.0.1:${PORT}"
 WORK=$(mktemp -d)
 LOG="${WORK}/server.log"
@@ -310,7 +324,7 @@ check "404 uses the error envelope too" $?
 #
 # Needs its own server: the zero-latency stub finishes before a client could
 # possibly hang up, so a disconnect against it would prove nothing.
-CANCEL_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+CANCEL_PORT=$(free_port); need_port "$CANCEL_PORT"
 CANCEL_LOG="${WORK}/cancel.log"
 "$BIN" --stub --host 127.0.0.1 --port "$CANCEL_PORT" --n-ctx 4096 --stub-delay-ms 40 -v \
   >"$CANCEL_LOG" 2>&1 &
@@ -363,7 +377,7 @@ wait "$CANCEL_PID" 2>/dev/null
 # that the presented name moves and artifact identity does not: a roster that
 # discovers names from /v1/models pins itself to whatever it finds, so renaming
 # has to be possible without touching which artifact the allowlist accepts.
-ALIAS_PORT=$((PORT + 3))
+ALIAS_PORT=$(free_port); need_port "$ALIAS_PORT"
 ALIAS_LOG="${WORK}/alias.log"
 "$BIN" --stub --host 127.0.0.1 --port "$ALIAS_PORT" --n-ctx 40960 \
        --served-model-name qwen3.6-coder >"$ALIAS_LOG" 2>&1 &
@@ -409,7 +423,7 @@ kill -TERM "$ALIAS_PID" 2>/dev/null; wait "$ALIAS_PID" 2>/dev/null; ALIAS_PID=""
 # being gated: the flags override only what they set, /props says the regime
 # came from the operator, and the usage block carries the draft counters that
 # tell a caller which performance regime its request actually got.
-OP_PORT=$((PORT + 4))
+OP_PORT=$(free_port); need_port "$OP_PORT"
 OP_LOG="${WORK}/op.log"
 "$BIN" --stub --host 127.0.0.1 --port "$OP_PORT" --n-ctx 4096 \
        --temp 0 --chat-template-kwarg enable_thinking=false >"$OP_LOG" 2>&1 &

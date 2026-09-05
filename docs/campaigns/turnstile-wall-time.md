@@ -134,3 +134,20 @@ this campaign.
   abort-line grep); measured 11–32 ms latency under load, so not shown to
   be the flake; replaced by a bounded poll, red first with a never-logged
   pattern. No served behaviour changed; CHANGELOG line under Unreleased.
+- 2026-09-05, later — re-opened and closed again (DESIGN §7.0.2an). The
+  same gate on the x86_64 dev host (unit set only, no card touched)
+  reproduced the roundtrip flake twice: the alias server died with
+  `could not bind`. Sixty instrumented runs: four failures, each with the
+  alias port (main + 3, never probed) held by a TIME-WAIT socket that was
+  an earlier run's curl source port — measured, chain visible across
+  runs 34 → 53 → 59; all 342 held ports even, all ten kernel picks odd,
+  so only main + 3 was ever exposed. Load was incidental; run density
+  inside the 60 s TIME-WAIT window is the trigger, consistent with the
+  aarch64 host's lower density (about one expected in sixty, zero seen).
+  Fix: every server picks its own port with the kernel
+  probe (`free_port`); red first with a planted listener on main + 3
+  (old script fails, seven checks), green with the fix; 120 of 120 green
+  at the failing density under the same load. Residual probe-then-bind
+  window recorded with a 120 s loopback sample (nothing else connects to
+  the units' ports in that container; the unit manager reads systemd, not
+  HTTP); belt named (server binds port 0 itself), not done.
