@@ -149,9 +149,12 @@ Three consumers, in this order:
    one f16 per 32), and accumulates in f32 as the bf-tiled kernel does.
    Both the decode shape (few rows) and the prefill shape (a chunk of
    rows) come from the same kernel family, as today. Weight bytes are
-   read in their GGUF layout; the tile is 256 wide along K by
-   construction. Activation-side dynamic quantization stays off for this
-   op in the first version.
+   read in their GGUF layout and decoded inside the inner loop — the
+   operator's rule for every kernel here: **no unpack at load, no
+   prepass at compile, no second copy of the weights in any format**;
+   the only bytes in VRAM are the file's. The tile is 256 wide along K
+   by construction (32 for Q8_0). Activation-side dynamic quantization
+   stays off for this op in the first version.
 2. **Embedding gather**: rows of the Q4_K embedding gathered by token id
    and dequantized to f16 in-kernel (a row is 20 super-blocks; the gather
    is block-preserving). The IR's i8 embedding is replaced by this.
@@ -224,8 +227,9 @@ allowlist's families; llama.cpp byte-identity as a gate.
    family's served IR directory exists. Acceptable for this repository's
    purpose (comparing quantisations of models it already serves); it is
    the reason this is not a general GGUF engine.
-3. **Group-of-256 tiles** in the FC kernel against the bf-tiled kernel's
-   current tiling: the recon did not read the tiling constants deeply
-   enough to say whether a 256-wide K tile fits the kernel's register
-   budget on Arc as-is; the first implementation step is that reading,
-   and it may put the unpack in a separate per-super-block prepass.
+3. Resolved by the operator (2026-09-06): the kernels decode the
+   blocks in the inner loop, with no separate unpack at load time and no
+   prepass. If the bf-tiled kernel's register budget on Arc does not
+   take a 256-wide K tile, the kernel is written as its own GEMV/GEMM
+   pair over super-blocks rather than as a variant of bf-tiled; the
+   first implementation step is that reading.
