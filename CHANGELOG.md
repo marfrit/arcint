@@ -77,7 +77,22 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   398, parity, outputs byte-identical to the generic path's, Prüfstand
   10/10. u8-against-u8:i4 byte-identity does not hold at depth (recorded
   in §7.0.2ar; the invariant is u8:i4 against itself). `+p6` is the
-  level to serve u8:i4 at; the package is not built yet.
+  level to serve u8:i4 at; the package is built (2026-09-05) and not
+  deployed.
+- **The fit stops charging the generic kernel's prefill scratch from
+  `+p6`** (`u8i4-deep-prefill-fault` status, DESIGN §7.0.2at): measured
+  with the host VRAM sampler, a 71.7k-token u8:i4 prefill on the 16 GiB
+  card consumes ≤ 9 MiB on the patch-0020 plugin against 573 MiB on
+  `+p4`'s generic kernel, so a load with eight-bit keys and four-bit
+  values on a plugin whose build number names patch level 6 or later
+  charges no scratch term and keeps only the measured chunk cap (128).
+  Auto-fit at u8:i4 on that card goes from 101,824 to 171,392 tokens; a
+  118,454-token prefill ran on that pool with free VRAM flat, no fault
+  (the package's libraries on the process's path for the window; nothing
+  deployed).
+  The detection is the plugin's own build stamp (`marfrit-p<N>`), read
+  from the GPU plugin, not the core library. Every other pairing and
+  every older plugin keep the belt and the charge.
 - Known, open, on the record: one follow-up window had two tier-ON
   processes disagree on the same prompt (§7.0.2ak); a diagnostic rerun did
   not reproduce it (§7.0.2al); the runner now prints every output's hash.

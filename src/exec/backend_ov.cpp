@@ -2600,6 +2600,43 @@ private:
                           "4-bit values: plugin does not carry the bound; scratch term stays "
                           "depth-scaled");
             }
+            // Patch 0020 engine side (DESIGN §7.0.2at): the level is read
+            // from the plugin's own build number, not the core library's
+            // -- a staged runtime can pair one level's core with another's
+            // plugin, and the kernel path is the plugin's. `get_versions`
+            // returns one entry per plugin the device name resolves to;
+            // the highest stamped level found is taken (there is one).
+            gpu_plugin_patch_level_             = 0;
+            packed_values_mixed_stage_on_micro_ = false;
+            try {
+                for (const auto& kv : core_.get_versions(device)) {
+                    const char* build = kv.second.buildNumber;
+                    if (build == nullptr) continue;
+                    gpu_plugin_patch_level_ =
+                        std::max(gpu_plugin_patch_level_, marfrit_patch_level(build));
+                }
+            } catch (const std::exception&) {
+                gpu_plugin_patch_level_ = 0;
+            }
+            packed_values_mixed_stage_on_micro_ = packed_values_mixed_stage_on_micro(
+                gpu_plugin_patch_level_, static_cast<int>(kv_prec.bitwidth()),
+                static_cast<int>(value_prec.bitwidth()));
+            if (packed_values_mixed_stage_on_micro_) {
+                log::info("load",
+                          "4-bit values: plugin patch level %d runs the %s mixed prefill stage on "
+                          "micro-SDPA (patch 0020); the generic kernel's scratch term is not "
+                          "charged, the measured chunk cap (%d) stays",
+                          gpu_plugin_patch_level_, effective_paged_kv.c_str(),
+                          kMaxMeasuredPackedValuesChunk);
+            } else {
+                log::info("load",
+                          "4-bit values: plugin patch level %d (%s); the %s mixed prefill stage "
+                          "runs the generic kernel, scratch term charged",
+                          gpu_plugin_patch_level_,
+                          gpu_plugin_patch_level_ > 0 ? "below the 0020 level, or not its pairing"
+                                                      : "no recipe stamp in the build number",
+                          effective_paged_kv.c_str());
+            }
         }
         // The served path could not be profiled at all until now: enable_profiling
         // was wired on the stateful reference path only, so every per-kernel number
@@ -3193,7 +3230,18 @@ private:
         // `configured` value (no ceiling narrower than the full requested
         // chunk) whenever the switch is set.
         size_t chunk_ceiling = configured;
-        if (packed_values && packed_geom && !cap_off) {
+        if (packed_values && packed_geom && !cap_off && packed_values_mixed_stage_on_micro_) {
+            // Patch 0020 arm: no buffer to price at any depth, so the
+            // ceiling is the measured cap alone (fit.h's own arm does the
+            // same for the term below).
+            chunk_ceiling = static_cast<size_t>(std::max(
+                packed_values_measured_chunk_cap(static_cast<int>(configured), cfg.kv_block_size),
+                1));
+            log::info("load",
+                      "4-bit values: served-chunk ceiling %zu (the measured cap; the mixed stage "
+                      "runs on micro-SDPA, no scratch buffer to price at n_ctx %d)",
+                      chunk_ceiling, wanted);
+        } else if (packed_values && packed_geom && !cap_off) {
             const long long partitions_at_wanted = packed_values_bounded_partitions(
                 wanted, paged_attention_max_partitions_effective);
             const int chunk_at_wanted = prefill_chunk_cap_for_packed_values_ex(
@@ -3954,7 +4002,7 @@ private:
                     packed_geom->heads, packed_geom->head_size,
                     kPrefillScratchBudgetBytesPackedValues, cfg.kv_block_size, wanted,
                     paged_attention_max_partitions_effective, paged_attention_element_bytes,
-                    /*belt_enabled=*/!cap_off);
+                    /*belt_enabled=*/!cap_off, packed_values_mixed_stage_on_micro_);
             } else {
                 int  last_probed_chunk = static_cast<int>(chunk);
                 bool converged         = false;
@@ -3963,7 +4011,7 @@ private:
                         fterms, static_cast<int>(configured), packed_geom->heads,
                         packed_geom->head_size, kPrefillScratchBudgetBytesPackedValues,
                         cfg.kv_block_size, !cap_off, paged_attention_max_partitions_effective,
-                        paged_attention_element_bytes);
+                        paged_attention_element_bytes, packed_values_mixed_stage_on_micro_);
                     if (term.chunk <= last_probed_chunk) {
                         // c* did not grow past what is already measured --
                         // `term` is CONSISTENT with the activations it was
@@ -4036,7 +4084,7 @@ private:
                         fterms, last_probed_chunk, packed_geom->heads,
                         packed_geom->head_size, kPrefillScratchBudgetBytesPackedValues,
                         cfg.kv_block_size, !cap_off, paged_attention_max_partitions_effective,
-                        paged_attention_element_bytes);
+                        paged_attention_element_bytes, packed_values_mixed_stage_on_micro_);
                 }
             }
             fit                                    = term.fit;
@@ -4045,10 +4093,13 @@ private:
             packed_values_scratch_fixed_bytes_     = term.fixed_bytes;
             packed_values_scratch_chunk_           = term.chunk;
             packed_values_log_per_token_bytes =
-                packed_values_prefill_scratch_bytes_per_token_ex(
-                    term.chunk, packed_geom->heads, packed_geom->head_size,
-                    paged_attention_element_bytes) +
-                packed_values_partials_exp_max_bytes_per_token(term.chunk, packed_geom->heads);
+                packed_values_mixed_stage_on_micro_
+                    ? 0
+                    : packed_values_prefill_scratch_bytes_per_token_ex(
+                          term.chunk, packed_geom->heads, packed_geom->head_size,
+                          paged_attention_element_bytes) +
+                          packed_values_partials_exp_max_bytes_per_token(term.chunk,
+                                                                         packed_geom->heads);
             // Round-12 review (Opus), finding 2 (REAL defect): the
             // reduction log used to sit at the Phase E belt call site
             // (further down), naming which of three limits ("budget",
@@ -4075,21 +4126,31 @@ private:
             if (!cap_off && term.chunk < static_cast<int>(configured)) {
                 const long long depth_for_reason =
                     cfg.n_ctx_explicit ? static_cast<long long>(wanted) : term.fit.max_ctx;
-                const long long partitions_for_reason = packed_values_bounded_partitions(
-                    depth_for_reason, paged_attention_max_partitions_effective);
-                const int budget_only = prefill_chunk_cap_for_packed_values_budget_only_ex(
-                    static_cast<int>(configured), partitions_for_reason, packed_geom->heads,
-                    packed_geom->head_size, paged_attention_element_bytes,
-                    kPrefillScratchBudgetBytesPackedValues, cfg.kv_block_size);
                 const char* limit = "budget";
-                if (term.chunk != budget_only) {
+                if (packed_values_mixed_stage_on_micro_) {
+                    // Patch 0020 arm (§7.0.2at review): the budget ladder
+                    // never ran, so classifying against it would name
+                    // "budget" for a chunk that was the measured cap and
+                    // nothing else (an explicit n_ctx between 64k and 128k
+                    // on `+p6` makes the ladder's own answer coincide with
+                    // 128).
                     limit = "measured cap";
-                } else if (budget_only == cfg.kv_block_size &&
-                           !packed_values_scratch_fits_budget(
-                               budget_only, partitions_for_reason, packed_geom->heads,
-                               packed_geom->head_size, paged_attention_element_bytes,
-                               kPrefillScratchBudgetBytesPackedValues)) {
-                    limit = "bound";
+                } else {
+                    const long long partitions_for_reason = packed_values_bounded_partitions(
+                        depth_for_reason, paged_attention_max_partitions_effective);
+                    const int budget_only = prefill_chunk_cap_for_packed_values_budget_only_ex(
+                        static_cast<int>(configured), partitions_for_reason, packed_geom->heads,
+                        packed_geom->head_size, paged_attention_element_bytes,
+                        kPrefillScratchBudgetBytesPackedValues, cfg.kv_block_size);
+                    if (term.chunk != budget_only) {
+                        limit = "measured cap";
+                    } else if (budget_only == cfg.kv_block_size &&
+                               !packed_values_scratch_fits_budget(
+                                   budget_only, partitions_for_reason, packed_geom->heads,
+                                   packed_geom->head_size, paged_attention_element_bytes,
+                                   kPrefillScratchBudgetBytesPackedValues)) {
+                        limit = "bound";
+                    }
                 }
                 log::info("load",
                           "prefill chunk %zu -> %d for 4-bit values (query heads %d, head size "
@@ -4285,7 +4346,21 @@ private:
             // carries the bound key carries the f16 host sizing too, both
             // ship in patch 0015) -- unconditional whenever the key was
             // accepted, not a separate confirmation.
-            if (paged_attention_bound_accepted_) {
+            if (packed_values_mixed_stage_on_micro_) {
+                // Patch 0020 arm: the term above printed 0.0 MiB; say why,
+                // ahead of the 0015 bound disclosure (which +p6 also
+                // carries, and which bounds buffers this pairing no longer
+                // allocates).
+                log::info("load",
+                          "4-bit values: scratch term not charged -- plugin patch level %d runs "
+                          "the mixed prefill stage on micro-SDPA (patch 0020); chunk %d is the "
+                          "measured cap, not a budget choice%s",
+                          gpu_plugin_patch_level_, packed_values_chunk,
+                          (paged_attention_bound_accepted_ && cfg.paged_attention_max_partitions > 0)
+                              ? "; the partition bound is set on the plugin and not priced (the "
+                                "buffers it bounds are not allocated on this path)"
+                              : "");
+            } else if (paged_attention_bound_accepted_) {
                 if (cfg.paged_attention_max_partitions > 0) {
                     log::info("load",
                               "4-bit values: plugin bounds attention partials at %d (f16 "
@@ -4346,7 +4421,13 @@ private:
                            : static_cast<int>(std::min<size_t>(
                                  {static_cast<size_t>(packed_values_scratch_chunk_), configured,
                                   static_cast<size_t>(kMaxMeasuredPackedValuesChunk)})))
-                : static_cast<int>(chunk);
+                // Patch 0020 arm without geometry (§7.0.2at review): the
+                // term was never priced (no heads/head_dim to price it
+                // with), but the measured cap needs no geometry and holds
+                // on this path as on every other 4-bit-values load.
+                : (packed_values && packed_values_mixed_stage_on_micro_ && !cap_off)
+                      ? packed_values_measured_chunk_cap(static_cast<int>(chunk), cfg.kv_block_size)
+                      : static_cast<int>(chunk);
         // The M9 4-bit-values prefill-chunk belt (exec/fit.h's
         // prefill_chunk_cap_for_packed_values) and the snapshot grid it
         // feeds (cache_grid_, tied to the chunk) both need the SERVED pool
@@ -5190,10 +5271,16 @@ private:
                 const long long belt_partitions = packed_values_bounded_partitions(
                     static_cast<long long>(paged_n_ctx_), paged_attention_max_partitions_effective);
                 const int belt_input = belt_requested_chunk(prefill_chunk_, packed_values_scratch_chunk_);
-                const int capped = prefill_chunk_cap_for_packed_values_ex(
-                    belt_input, belt_partitions, geometry->heads, geometry->head_size,
-                    paged_attention_element_bytes, kPrefillScratchBudgetBytesPackedValues,
-                    cfg.kv_block_size);
+                // Patch 0020 arm: the budget ladder prices a buffer the
+                // microkernel path does not allocate, so only the measured
+                // cap applies here too (the same choice the climb made).
+                const int capped =
+                    packed_values_mixed_stage_on_micro_
+                        ? packed_values_measured_chunk_cap(belt_input, cfg.kv_block_size)
+                        : prefill_chunk_cap_for_packed_values_ex(
+                              belt_input, belt_partitions, geometry->heads, geometry->head_size,
+                              paged_attention_element_bytes,
+                              kPrefillScratchBudgetBytesPackedValues, cfg.kv_block_size);
                 // Round-12 review (Opus), finding 2 (REAL defect): this
                 // used to log a "prefill chunk X -> Y" reduction with its
                 // own limit name whenever `capped < prefill_chunk_` --
@@ -5220,6 +5307,13 @@ private:
                 if (capped != prefill_chunk_) {
                     prefill_chunk_ = capped;
                 }
+            } else if (packed_values_mixed_stage_on_micro_) {
+                // Patch 0020 arm without geometry (§7.0.2at review): no
+                // term to size, but the measured cap needs no geometry --
+                // the seed above already applied it; re-applied here for
+                // the same defensive reason the geometry branch keeps its
+                // own assignment.
+                prefill_chunk_ = packed_values_measured_chunk_cap(prefill_chunk_, cfg.kv_block_size);
             } else {
                 log::warn("load", "%s",
                           "4-bit paged KV values requested, but this artifact's config.json "
@@ -7242,6 +7336,17 @@ private:
     // carries the f16 host sizing too, both ship together in patch 0015 --
     // 4 otherwise).
     bool                           paged_attention_bound_accepted_ = false;
+    // Patch 0020 engine side (DESIGN §7.0.2at): the GPU plugin's own patch
+    // level, read from its build number (`marfrit-p<N>`, the recipe's
+    // stamp -- the detection contract is stated at fit.h's
+    // `kPackedValuesMixedStageMicroPatchLevel`), and whether this load's
+    // key/value pairing runs its mixed prefill stage on micro-SDPA there
+    // (u8 keys, 4-bit values, level >= 6). When true the fit charges no
+    // scratch term and the belt applies only the measured chunk cap; read
+    // at the climb, the ceiling and the belt call site, like the two
+    // members above.
+    int                            gpu_plugin_patch_level_ = 0;
+    bool                           packed_values_mixed_stage_on_micro_ = false;
     size_t                         la_row_bytes_     = 0;
     size_t                         logits_keep_rows_ = 0;  // 0: unsliced
     size_t                         cache_grid_       = 0;  // paged snapshot grid; 0: the chunk

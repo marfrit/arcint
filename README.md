@@ -443,7 +443,7 @@ next feature lines are recorded, not started: **0.4.0 opens and runs GGUF
 checkpoints** (`docs/milestone-0.4.0.md`) and **0.5.0 serves Qwen Flash
 Next** (`docs/milestone-0.5.0.md`).
 
-Verification: 409 unit cases device-free (413 with the OpenVINO backend), a
+Verification: 414 unit cases device-free (418 with the OpenVINO backend), a
 64-check curl round-trip, a lane-accounting stress (200 requests, 24-way, 8
 lanes, queueing and refusing) — the unit set, which is what bare `ctest` runs;
 and an acceptance target of sixteen enumerated cells (`tests/acceptance/`)

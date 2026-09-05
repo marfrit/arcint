@@ -2982,6 +2982,116 @@ TEST(a_fixed_weights_only_charge_fails_the_derivative_bound) {
 }
 
 
+// ------------------------------------ packed values on the microkernel path (patch 0020)
+
+// DESIGN §7.0.2at: from runtime patch level `+p6` the u8-key / 4-bit-value
+// pairing's mixed prefill stage runs on micro-SDPA, which allocates none of
+// the three partial buffers the scratch term prices. The detection is the
+// GPU plugin's own build number (`marfrit-p<N>`, stamped by the recipe);
+// 0020 carries no property of its own. Red first: with the arm absent, the
+// microkernel flag was ignored and the term still charged (the assertions
+// on `fit.max_ctx == plain` and `chunk == 128` failed on the search and on
+// the explicit path).
+TEST(marfrit_patch_level_reads_the_recipes_stamp) {
+    CHECK_EQ(marfrit_patch_level("2026.4.0-22849-71640275d29-marfrit-p6"), 6);
+    CHECK_EQ(marfrit_patch_level("2026.4.0-22849-71640275d29-marfrit-p4"), 4);
+    CHECK_EQ(marfrit_patch_level("2026.4.0-22849-71640275d29-marfrit-p12"), 12);
+    CHECK_EQ(marfrit_patch_level("2026.4.0-22849-71640275d29"), 0);  // a stock build
+    CHECK_EQ(marfrit_patch_level("marfrit-p"), 0);                   // no digit follows
+    CHECK_EQ(marfrit_patch_level(""), 0);
+}
+
+TEST(packed_values_mixed_stage_on_micro_is_the_pairing_0020_admits_from_p6) {
+    CHECK(packed_values_mixed_stage_on_micro(6, 8, 4));    // u8:i4 on +p6
+    CHECK(packed_values_mixed_stage_on_micro(7, 8, 4));    // and every later level
+    CHECK(!packed_values_mixed_stage_on_micro(5, 8, 4));   // +p5: generic kernel, charged
+    CHECK(!packed_values_mixed_stage_on_micro(0, 8, 4));   // a stock plugin
+    CHECK(!packed_values_mixed_stage_on_micro(6, 4, 4));   // i4:i4 -- 0020 does not touch it
+    CHECK(!packed_values_mixed_stage_on_micro(6, 8, 8));   // u8: no packed values at all
+    CHECK(!packed_values_mixed_stage_on_micro(6, 16, 4));  // f16 keys: not the served pairing
+}
+
+TEST(packed_values_measured_chunk_cap_is_the_ceiling_alone) {
+    CHECK_EQ(packed_values_measured_chunk_cap(2048, kCoderKvBlockSize), 128);
+    CHECK_EQ(packed_values_measured_chunk_cap(256, kCoderKvBlockSize), 128);
+    CHECK_EQ(packed_values_measured_chunk_cap(128, kCoderKvBlockSize), 128);
+    CHECK_EQ(packed_values_measured_chunk_cap(64, kCoderKvBlockSize), 64);  // never raised
+    CHECK_EQ(packed_values_measured_chunk_cap(2048, 0), 2048);              // nothing to floor to
+    CHECK_EQ(packed_values_measured_chunk_cap(0, kCoderKvBlockSize), 0);
+    // The same function `prefill_chunk_cap_for_packed_values_ex` applies
+    // after its ladder -- 2048 at a shallow depth (no budget shrink) lands
+    // on the cap either way.
+    CHECK_EQ(prefill_chunk_cap_for_packed_values_ex(2048, /*partitions=*/8, kCoderHeads,
+                                                    kCoderHeadSize, 4, kScratchBudget,
+                                                    kCoderKvBlockSize),
+             packed_values_measured_chunk_cap(2048, kCoderKvBlockSize));
+}
+
+// The search: on the microkernel path the fit is the term-free fit
+// exactly (no per-token slope, no fixed margin), and the served chunk is
+// the measured cap, not the belt's budget ladder (which would halve 128
+// to 32 at this fixture's depth for a buffer that no longer exists).
+TEST(fit_context_packed_values_on_micro_charges_nothing_and_keeps_the_measured_cap) {
+    const FitTerms base = m9_base_terms();
+    const FitResult plain = fit_context(base);
+    const PackedValuesFitTerm micro = fit_context_packed_values(
+        base, kM9RequestedChunk, kCoderHeads, kCoderHeadSize, kScratchBudget, kM9KvBlockTokens,
+        /*belt_enabled=*/true, /*max_partitions=*/0, /*element_bytes=*/2,
+        /*mixed_stage_on_micro=*/true);
+    const PackedValuesFitTerm generic = fit_context_packed_values(
+        base, kM9RequestedChunk, kCoderHeads, kCoderHeadSize, kScratchBudget, kM9KvBlockTokens,
+        /*belt_enabled=*/true, /*max_partitions=*/0, /*element_bytes=*/2);
+    CHECK_EQ(micro.per_token_bytes, 0ull);
+    CHECK_EQ(micro.fixed_bytes, 0ull);
+    CHECK_EQ(micro.fit.max_ctx, plain.max_ctx);
+    CHECK_EQ(micro.chunk, kM9RequestedChunk);  // 128: at the cap, the ladder never ran
+    CHECK(generic.chunk < micro.chunk);        // the generic path's ladder shrinks it here
+    CHECK(generic.fit.max_ctx < micro.fit.max_ctx);
+    // A larger request is still capped -- unlike `belt_enabled=false`, the
+    // measurement bypass, which pins the request.
+    const PackedValuesFitTerm micro_2048 = fit_context_packed_values(
+        base, /*requested_chunk=*/2048, kCoderHeads, kCoderHeadSize, kScratchBudget,
+        kM9KvBlockTokens, /*belt_enabled=*/true, /*max_partitions=*/0, /*element_bytes=*/2,
+        /*mixed_stage_on_micro=*/true);
+    CHECK_EQ(micro_2048.chunk, 128);
+    CHECK_EQ(micro_2048.fit.max_ctx, plain.max_ctx);
+    // The measurement switch still wins over the arm: no cap at all.
+    const PackedValuesFitTerm micro_off = fit_context_packed_values(
+        base, /*requested_chunk=*/2048, kCoderHeads, kCoderHeadSize, kScratchBudget,
+        kM9KvBlockTokens, /*belt_enabled=*/false, /*max_partitions=*/0, /*element_bytes=*/2,
+        /*mixed_stage_on_micro=*/true);
+    CHECK_EQ(micro_off.chunk, 2048);
+}
+
+// The explicit path, at the round-8 fixture's own depth: the generic path
+// charged 629,260,288 bytes at chunk 64 (the test above); the microkernel
+// arm charges nothing, serves the cap, and admits the same request.
+TEST(fit_context_packed_values_at_depth_on_micro_charges_nothing_and_keeps_the_measured_cap) {
+    const FitTerms base = r8_terms(kR8ActivationCorrect);
+    const FitResult plain = fit_context(base);
+    const PackedValuesFitTerm micro = fit_context_packed_values_at_depth(
+        base, /*requested_chunk=*/1024, kCoderHeads, kCoderHeadSize, kScratchBudget,
+        kR8KvBlockTokens, kR8RequestedD, /*max_partitions=*/0, /*element_bytes=*/2,
+        /*belt_enabled=*/true, /*mixed_stage_on_micro=*/true);
+    CHECK_EQ(micro.chunk, 128);
+    CHECK_EQ(micro.fixed_bytes, 0ull);
+    CHECK_EQ(micro.per_token_bytes, 0ull);
+    CHECK_EQ(micro.fit.max_ctx, plain.max_ctx);
+    CHECK(micro.fit.max_ctx >= kR8RequestedD);
+    CHECK(micro.fit.admissible);
+    // Bounded partitions (0015's key, which +p6 also carries) change
+    // nothing on this arm: the bound applies to buffers that are not
+    // allocated.
+    const PackedValuesFitTerm micro_bounded = fit_context_packed_values_at_depth(
+        base, /*requested_chunk=*/1024, kCoderHeads, kCoderHeadSize, kScratchBudget,
+        kR8KvBlockTokens, kR8RequestedD, /*max_partitions=*/32, /*element_bytes=*/2,
+        /*belt_enabled=*/true, /*mixed_stage_on_micro=*/true);
+    CHECK_EQ(micro_bounded.fixed_bytes, 0ull);
+    CHECK_EQ(micro_bounded.chunk, 128);
+    CHECK_EQ(micro_bounded.fit.max_ctx, plain.max_ctx);
+}
+
+
 // ------------------------------------------------ logits_slice_rows_expected
 
 // 0.3.0 release gate (DESIGN §7.0.2ai): --prefill-chunk 1 on an MTP artifact

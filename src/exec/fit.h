@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -848,6 +849,78 @@ constexpr uint64_t kPrefillScratchBudgetBytesPackedValues = 512ull << 20;  // 51
 // function).
 constexpr int kMaxMeasuredPackedValuesChunk = 128;
 
+// The measured ceiling on its own -- `requested_chunk` pulled down to
+// `kMaxMeasuredPackedValuesChunk` (floored to a `block_size` multiple, never
+// below one block), never raised. `prefill_chunk_cap_for_packed_values_ex`
+// applies this after its budget ladder; the microkernel arm below
+// (patch 0020, `packed_values_mixed_stage_on_micro`) applies it ALONE,
+// because there the budget ladder would halve the chunk for a buffer the
+// plugin no longer allocates, while the cap still stands for what it is:
+// the largest chunk any 4-bit-values prefill has been measured to pass on
+// any plugin, microkernel path included (DESIGN §7.0.2as measured chunk
+// 128 there, nothing larger).
+inline int packed_values_measured_chunk_cap(int requested_chunk, int block_size) {
+    if (requested_chunk <= 0 || block_size <= 0) return requested_chunk;
+    if (requested_chunk <= kMaxMeasuredPackedValuesChunk) return requested_chunk;
+    int capped = (kMaxMeasuredPackedValuesChunk / block_size) * block_size;
+    if (capped < block_size) capped = block_size;
+    return capped;
+}
+
+// Patch 0020 engine side (DESIGN §7.0.2as, §7.0.2at): from runtime patch
+// level `+p6` on, the plugin runs the MIXED (past > 0) prefill stage of the
+// u8-key / 4-bit-value pairing on micro-SDPA, whose only internal buffer is
+// a small index array -- the three depth-scaled partial buffers the term
+// above prices (tmp_out, exp_sums, max_logits) are allocated only on the
+// generic kernel's path, which that pairing no longer takes. Measured on
+// the 16 GiB card (§7.0.2at): the free-VRAM floor of a 71.7k-token u8:i4
+// prefill at chunk 128 sits at the idle level on the 0020 plugin, and
+// hundreds of MiB below it on `+p4`. Under this arm the fit charges no
+// scratch term and applies only the measured chunk cap.
+//
+// DETECTION CONTRACT, stated plainly because nothing enforces it in code:
+// the recipe (`contrib/packaging/marfrit-openvino/build-openvino.sh`)
+// stamps the patch level into the plugin's own build number as
+// `marfrit-p<N>` and refuses to build when it does not, and the GPU
+// plugin's `ov::Version::buildNumber` reports that string. Patch 0020
+// adds no property of its own (unlike 0015's bound key), so the level is
+// the contract: a plugin whose build number names `p6` or later carries
+// 0020. A plugin built from a tree with 0020 applied but an older level
+// stamped (a hand-staged build) is priced as the generic path -- safe,
+// merely conservative. The pairing is NARROWER than the gate 0020 opens
+// (§7.0.2at review): the plugin admits any non-four-bit by-channel key
+// with four-bit values, so f16:i4 runs micro there too -- but only
+// eight-bit keys (u8, and its i8 alias, which the loader maps to the same
+// element type) with four-bit values have been measured on that path, so
+// f16:i4 keeps the charge because it is unmeasured, not because the
+// plugin declines it. Four-bit keys (i4:i4) and by-token keys are declined
+// by 0020 and stay on the charged path either way. The key mode is the
+// plugin's default by-channel one, which this repository never changes.
+constexpr int kPackedValuesMixedStageMicroPatchLevel = 6;
+
+// `marfrit-p<N>` anywhere in `build_number` -> N; 0 when absent or when no
+// digit follows the tag (a stock OpenVINO build, or a malformed stamp).
+inline int marfrit_patch_level(const std::string& build_number) {
+    const std::string tag = "marfrit-p";
+    const size_t at = build_number.find(tag);
+    if (at == std::string::npos) return 0;
+    size_t i = at + tag.size();
+    long long level = 0;
+    bool any = false;
+    while (i < build_number.size() && build_number[i] >= '0' && build_number[i] <= '9') {
+        level = level * 10 + (build_number[i] - '0');
+        any = true;
+        ++i;
+        if (level > 1000000) return 0;  // not a patch level anyone stamps
+    }
+    return any ? static_cast<int>(level) : 0;
+}
+
+inline bool packed_values_mixed_stage_on_micro(int patch_level, int key_bits, int value_bits) {
+    return patch_level >= kPackedValuesMixedStageMicroPatchLevel && key_bits == 8 &&
+           value_bits == 4;
+}
+
 // The two numbers the proxy formula above needs from the artifact's own
 // geometry: QUERY heads (`num_attention_heads` -- the plugin's MIXED-stage
 // buffer is sized by query heads, not KV heads; see the round-2 review
@@ -1095,13 +1168,7 @@ inline int prefill_chunk_cap_for_packed_values_ex(int requested_chunk, long long
     // function already goes): the served chunk under 4-bit values never
     // silently exceeds the largest chunk actually validated,
     // `kMaxMeasuredPackedValuesChunk`.
-    if (chunk > kMaxMeasuredPackedValuesChunk) {
-        int capped = kMaxMeasuredPackedValuesChunk;
-        capped     = (capped / block_size) * block_size;
-        if (capped < block_size) capped = block_size;
-        chunk = capped;
-    }
-    return chunk;
+    return packed_values_measured_chunk_cap(chunk, block_size);
 }
 
 inline int prefill_chunk_cap_for_packed_values(int requested_chunk, long long max_ctx_tokens,
@@ -1410,7 +1477,8 @@ inline PackedValuesFitTerm fit_context_packed_values(const FitTerms& base, int r
                                                       uint64_t scratch_budget_bytes, int block_size,
                                                       bool belt_enabled = true,
                                                       int max_partitions = 0,
-                                                      int element_bytes = 4) {
+                                                      int element_bytes = 4,
+                                                      bool mixed_stage_on_micro = false) {
     PackedValuesFitTerm r;
     if (requested_chunk <= 0 || heads <= 0 || head_size <= 0 || element_bytes <= 0) {
         // Nothing to price (mirrors prefill_chunk_cap_for_packed_values's
@@ -1448,6 +1516,22 @@ inline PackedValuesFitTerm fit_context_packed_values(const FitTerms& base, int r
     if (!belt_enabled) {
         r.fit   = fit_context(base);
         r.chunk = requested_chunk;
+        r.per_token_bytes = 0;
+        r.fixed_bytes      = 0;
+        r.iterations       = 1;
+        return r;
+    }
+
+    // Patch 0020 arm (`packed_values_mixed_stage_on_micro`, above): the
+    // mixed stage runs on micro-SDPA, which allocates none of the buffers
+    // this term prices, so the fit is the term-free fit exactly -- and
+    // the belt's budget ladder must not run either, or it halves the
+    // chunk for a buffer that does not exist. The measured cap alone
+    // stands (nothing larger than 128 has been measured on this path).
+    // Nothing to iterate: the chunk no longer depends on the depth.
+    if (mixed_stage_on_micro) {
+        r.fit   = fit_context(base);
+        r.chunk = packed_values_measured_chunk_cap(requested_chunk, block_size);
         r.per_token_bytes = 0;
         r.fixed_bytes      = 0;
         r.iterations       = 1;
@@ -1660,7 +1744,7 @@ inline int belt_requested_chunk(int prefill_chunk, int priced_chunk) {
 inline PackedValuesFitTerm fit_context_packed_values_at_depth(
     const FitTerms& base, int requested_chunk, int heads, int head_size,
     uint64_t scratch_budget_bytes, int block_size, long long depth, int max_partitions,
-    int element_bytes, bool belt_enabled = true) {
+    int element_bytes, bool belt_enabled = true, bool mixed_stage_on_micro = false) {
     PackedValuesFitTerm r;
     if (requested_chunk <= 0 || heads <= 0 || head_size <= 0 || element_bytes <= 0 ||
         depth <= 0) {
@@ -1671,6 +1755,16 @@ inline PackedValuesFitTerm fit_context_packed_values_at_depth(
     if (!belt_enabled) {
         r.fit   = fit_context(base);
         r.chunk = requested_chunk;
+        r.fixed_bytes      = 0;
+        r.per_token_bytes = 0;
+        r.iterations       = 1;
+        return r;
+    }
+    // Patch 0020 arm -- see fit_context_packed_values's own: no term, the
+    // measured cap alone, whatever the depth or the partition bound.
+    if (mixed_stage_on_micro) {
+        r.fit   = fit_context(base);
+        r.chunk = packed_values_measured_chunk_cap(requested_chunk, block_size);
         r.fixed_bytes      = 0;
         r.per_token_bytes = 0;
         r.iterations       = 1;

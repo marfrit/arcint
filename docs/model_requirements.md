@@ -81,20 +81,24 @@ runtime, root-caused with a free-VRAM sampler (§7.0.2ab). The edge sits
 between 71.7k and 119k tokens on that card at chunk 128 and moves with the
 prefill chunk and the pool depth, so it is not a token threshold; a first
 reading that named the buffer alone as the mechanism was retracted. The **belt** (`--prefill-chunk` capped under 4-bit
-values) and an honest reservation term now price it; **once charged, u8:i4
-auto-fit lands at 101,824 — below plain u8's 133,456** on that shape
-(101,984 before the acceptance ceiling was narrowed by the same term), so
-u8:i4 is a decode-only saving there until the buffer stops scaling with
-depth. `--paged-attention-max-partitions` (engine side in this tree,
-unreleased; plugin patch **0015** is written but in no built package, and
-no plugin carrying its key exists yet, so its effect is priced by the
-engine's own arithmetic and not measured on a card) bounds the partition
-count to flatten the term past a fixed depth. The prefill price itself is
-measured and removed (DESIGN §7.0.2ar/§7.0.2as): at a held chunk the
-generic kernel cost +55 %/+90 % at 37.7k/71.7k tokens; with patch **0020**
-(`+p6`) the mixed stage runs on micro-SDPA at parity with u8, values still
-four-bit in VRAM. Still owed: cold/warm prefix-cache byte-exactness at
-u8:i4, and the scratch charge above re-measured on the microkernel path.
+values) and an honest reservation term price it on every plugin below
+`+p6`: **charged, u8:i4 auto-fit lands at 101,824 — below plain u8's
+133,456** on that shape (101,984 before the acceptance ceiling was narrowed
+by the same term). `--paged-attention-max-partitions` (plugin patch
+**0015**, in `+p4` and later) bounds the partition count to flatten the
+term past a fixed depth. The prefill price itself is measured and removed
+(DESIGN §7.0.2ar/§7.0.2as): at a held chunk the generic kernel cost
++55 %/+90 % at 37.7k/71.7k tokens; with patch **0020** (`+p6`) the mixed
+stage runs on micro-SDPA at parity with u8, values still four-bit in VRAM.
+On that path the scratch buffer is not allocated (measured with the VRAM
+sampler, §7.0.2at: ≤ 9 MiB consumed by a 71.7k prefill against 573 MiB on
+the generic kernel), and the fit charges nothing for it when the GPU
+plugin's build number names patch level 6 or later and the pairing is
+eight-bit keys with four-bit values: **auto-fit at u8:i4 then lands at
+171,392 on the 16 GiB card**, and a 118,454-token prefill at chunk 128 ran
+on that pool without a fault. The chunk cap (128, the largest measured)
+stays. Still owed: cold/warm prefix-cache byte-exactness at u8:i4, and the
+depth ladder on both cards against the `+p6` package.
 
 ## 4. Drafters
 
@@ -137,7 +141,7 @@ the patch level: **`+p4` is the 0003–0018 level** and the one 0.3.0
 requires (CHANGELOG); **`+p5` adds 0019** (the prefill fallback's
 three-way answer, DESIGN §7.0.2ap; built 2026-09-05, not deployed);
 **`+p6` adds 0020** (u8:i4 prefill on micro-SDPA at parity with u8,
-DESIGN §7.0.2as; recipe bumped 2026-09-05, package not yet built) — the
+DESIGN §7.0.2as; built 2026-09-05, not deployed) — the
 level to serve `--paged-kv u8:i4` at, since below it the format's prefill
 costs +55 % to +90 % of u8's time (§7.0.2ar). The arcint package depends
 on `+p4` as a floor within the pinned nightly; nothing arcint drives
@@ -155,8 +159,8 @@ deployment is a separate decision (DESIGN §7.0.2ai). Compute-runtime
 - INT3/INT2 expert weights: study owed, no kernel, no allowlist entry.
 - `q8` weight format: accepted by the flag, no acceptance run found.
 - Vision IRs: reserved, `--vision` refused.
-- Full-resolution u8:i4 prefill price and prefix-cache byte-exactness at
-  u8:i4: named, not yet measured.
+- Prefix-cache byte-exactness at u8:i4: named, not yet measured (the
+  prefill price and the scratch charge are measured and closed, §3).
 - GDN context shift / server-side truncation: refused by policy — an
   overflow is an HTTP 400 with the numbers, and a shift is not honestly
   implementable on a recurrent state (§3.8).

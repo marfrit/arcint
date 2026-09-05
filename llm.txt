@@ -161,7 +161,7 @@ budget of zero). Each card lands where its memory says: B60 chunk 2048, A770
 refused at startup with every term. At request time, a third concurrent request
 is a 503 carrying the same arithmetic (--queue-timeout S restores queueing).
 
-Verification: 409 unit cases device-free (413 with the OpenVINO backend), a 64-check curl round-trip, a lane-accounting
+Verification: 414 unit cases device-free (418 with the OpenVINO backend), a 64-check curl round-trip, a lane-accounting
 stress (200 requests, 24-way, 8 lanes, both queueing and refusing) -- the unit
 set, what bare ctest runs; and an acceptance target of sixteen enumerated cells
 (tests/acceptance/) that runs where the cards are, fails on any skip or
@@ -568,6 +568,21 @@ memory
                             served depth is 101,824, and the 97,727-token
                             prompt prefills in 442 s (221 t/s) with a
                             free-VRAM floor of 814 MiB, no driver fault.
+                            FROM +p6 (patch 0020, DESIGN §7.0.2at): the
+                            u8-key/4-bit-value mixed stage runs on
+                            micro-SDPA, which allocates none of these
+                            buffers (VRAM sampler: <= 9 MiB consumed by a
+                            71.7k prefill vs 573 MiB on +p4's generic
+                            kernel), so the fit charges no scratch term
+                            and keeps only the measured chunk cap (128)
+                            when the GPU plugin's build number names
+                            marfrit-p6 or later (fit.h
+                            packed_values_mixed_stage_on_micro; the
+                            recipe's stamp is the contract, 0020 adds no
+                            property). Auto-fit at u8:i4 on the 16 GiB
+                            card: 171,392 (was 101,824); a 118,454-token
+                            prefill at chunk 128 on that pool, VRAM flat
+                            at 971-978 MiB, no fault.
   --paged-kv KEY[:VALUE]    KV precision on the paged path (default: u8). KEY and
                             VALUE each one of f16, u8, i8, u4, i4; omitting :VALUE
                             applies KEY to both the key and value cache ("u8" and
@@ -802,8 +817,8 @@ misc
   stop, toolcall, chat, prefix_cache, block_pool, turnstile), exec/ (backend
   interface, stub, backend_ov), api/ (error, handlers), http/ (cpp-httplib
   wiring).
-- tests/: two ctest label sets. `unit` (what bare ctest runs, device-free): 409
-  cases, 413 with the OpenVINO backend (hand-rolled harness, no framework; a
+- tests/: two ctest label sets. `unit` (what bare ctest runs, device-free): 414
+  cases, 418 with the OpenVINO backend (hand-rolled harness, no framework; a
   skip is a failure unless named, --max-skips 0), roundtrip.sh (64 curl checks),
   concurrency/stress.sh (lane accounting, stub-only), and the acceptance
   enumeration's own consistency check and runner self-test. `acceptance`

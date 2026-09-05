@@ -179,3 +179,8 @@ value copy is a verdict, not a fix.
   the fit's scratch charge for the generic path (`u8i4-deep-prefill-
   fault`) is unmeasured on the microkernel path, which allocates none of
   it.
+- 2026-09-05 — the `+p6` package is built from the recipe (version string
+  `marfrit-p6`, the plugin carries 0020's value-side macro), stored beside
+  `+p4`/`+p5` and not deployed; the production units still serve `+p3`.
+  The scratch-charge question left open above is answered in
+  `u8i4-deep-prefill-fault`'s status of the same day.

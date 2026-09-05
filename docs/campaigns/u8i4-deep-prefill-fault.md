@@ -142,3 +142,22 @@ stays green on both cards at both KV precisions throughout.
   refused at load by the runner's own margin, not by the card (fit admits
   101,232 tokens unbounded at chunk 128) — a runner correction, not a
   finding here.
+- 2026-09-05 — the scratch charge on the microkernel path, measured
+  (DESIGN §7.0.2at): with the host VRAM sampler running, a 71,727-token
+  u8:i4 prefill at chunk 128 on the 16 GiB card consumes ≤ 9 MiB of free
+  VRAM on the patch-0020 plugin and 573 MiB on `+p4`'s generic kernel
+  (the fit charged 436.5 MiB on both loads; the 256 MiB margin covered the
+  generic path's excess — one more point on the yardstick's error, kept
+  here). The fit now charges no scratch term and applies only the measured
+  chunk cap when the GPU plugin's build number names patch level 6 or
+  later and the pairing is eight-bit keys with four-bit values (fit.h's
+  `packed_values_mixed_stage_on_micro`; the contract is the recipe's
+  stamp, since 0020 adds no property). On the `+p6` package, auto-fit
+  admits 171,392 tokens (101,824 charged) and a 118,454-token prefill at
+  chunk 128 ran on that pool with free VRAM flat at 971–978 MiB, no fault
+  — the pool size and depth class of this campaign's defining fault. The
+  gate is unchanged for every plugin below `+p6` and for the pairings
+  0020 does not admit (i4:i4, four-bit keys): the fault's owner on the
+  generic path is still a reading, and the belt and charge stay there.
+  Owed to this campaign: `depth-ladder` on both cards at both precisions
+  against the `+p6` package.

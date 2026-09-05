@@ -1255,7 +1255,7 @@ measurement, on the agent endpoint with its real pool.
   `Fault response: Unsuccessful` on the B60 during the red run.
 - **Determinism**: two identical greedy runs produce identical bytes (verified
   on the A770/Vulkan agent baseline as achievable on this hardware class).
-- **In CI today**: 409 unit cases device-free (413 with the OpenVINO backend), a 64-check curl round-trip and the
+- **In CI today**: 414 unit cases device-free (418 with the OpenVINO backend), a 64-check curl round-trip and the
   lane-accounting stress (`tests/concurrency/stress.sh`, stub-only), all three
   under `ctest`. They cover the parts of the contract that need no GPU and are
   therefore already gateable — the overflow 400 and its numbers, tool-call
@@ -5645,6 +5645,102 @@ path's scratch (§7.0.2ab, §7.0.2ac) and on this price; the scratch term
 is the fault campaign's and stays until it is re-measured on the
 microkernel path, which allocates none of it. The campaign is closed;
 the M8 row's owed item is closed with it.
+
+#### 7.0.2at The scratch charge on the microkernel path: the generic kernel's partials are not allocated there, measured; the fit stops charging them from `+p6` (2026-09-05)
+
+`u8i4-deep-prefill-fault`'s open question after §7.0.2as: the fit's
+scratch term (§7.0.2ab, §7.0.2ac) prices three buffers the generic
+paged-attention kernel allocates on the MIXED stage — `tmp_out`,
+`exp_sums`, `max_logits`, sized by chunk × query heads × head size ×
+element bytes × partitions — and patch 0020 moves the u8-key / 4-bit-
+value pairing's MIXED stage off that kernel. Whether the buffers are
+gone was a code reading (the plugin's `get_internal_buffer_descs`
+allocates them only when micro-SDPA is not used, and the microkernel
+path's own internal buffer is an index array of a few KiB), not a
+measurement. This window measures it, and the `+p6` package is built.
+
+**The measurement.** 16 GiB card, coder artifact, `--paged-kv u8:i4`,
+chunk 128, prefix cache off, explicit n_ctx 73,678, the 71,727-token
+price-window prompt, two requests per process (32 and 64 tokens), the
+host's VRAM allocator sampled every 2 s through the kernel driver's
+debugfs (`vram_mm`, the same counter §7.0.2ab used). Two runtimes, one
+engine binary (the fit still charged 436.5 MiB on both loads): the
+patch-0020 plugin staged over the `+p4` layout (the build §7.0.2as
+served), then the `+p4` package's own plugin (generic kernel).
+
+| plugin | idle after load | during the first prefill | during the second | consumed by the prefill |
+|---|---|---|---|---|
+| 0020 (micro-SDPA) | 1,821 MiB free | 1,812–1,821 MiB | 1,783–1,793 | **≤ 9 MiB** (first prefill) |
+| `+p4` (generic) | 1,820 MiB free | 1,820 → **1,247 MiB** floor | 1,499–1,511 (held) | **573 MiB** |
+
+The generic path consumes 573 MiB over the first prefill and holds it
+(the plugin's intermediate pool grows to the largest shape seen and does
+not shrink — §7.0.2ab's own observation); the microkernel path's free
+VRAM does not move during the first prefill, and sits 28–38 MiB lower
+during the second request (64 tokens against 32) — observed, not
+explained, and two orders of magnitude under the generic path's
+consumption. Outputs: both plugins produce the same 32-token
+answer as the price window's u8:i4 output at this depth (one hash across
+three builds of the kernel path), and the generic path's rate is the
+§7.0.2ar price (209 t/s against the microkernel's 401 in §7.0.2as; this
+window's own microkernel run was slowed by the package build sharing the
+host, so its rate is not quoted). No fault line in either log.
+
+A second reading, recorded and not explained: the generic path consumed
+573 MiB where the fit charged 436.5 MiB (tmp_out at f16 288 MiB × 1.5
+plus the two f32 partials, at 288 partitions). The 256 MiB margin covered
+the difference at this depth. The proxy is a yardstick, not the plugin's
+allocation arithmetic (§7.0.2ab said so); this is one more data point on
+which side of it the yardstick errs at 71.7k, for the fault campaign.
+
+**The fit.** From `+p6` on, a load with eight-bit keys and four-bit
+values charges no scratch term and applies only the measured chunk cap
+(128): `fit_context_packed_values` and `_at_depth` take a
+`mixed_stage_on_micro` arm (fit.h), the belt's budget ladder does not run
+there (it would halve the chunk for a buffer that no longer exists), and
+the chunk ceiling and the Phase-E belt call site follow. The measurement
+switch `ARCINT_PREFILL_CHUNK_CAP=off` still wins (no cap at all). The
+detection is the GPU plugin's own build number, `marfrit-p<N>`, which the
+recipe stamps and refuses to build without — 0020 adds no property
+(0015's bound key was that patch's own contract); read through
+`ov::Core::get_versions` on the plugin, not the core library, because a
+staged runtime can pair one level's core with another's plugin (this
+window's staged plugin reports `p5` and is priced as the generic path;
+the `+p6` package's reports `p6`). The engine's gate is narrower than
+the plugin's: 0020 admits any non-four-bit by-channel key with four-bit
+values, so f16:i4 runs micro there too, but only u8:i4 is measured on
+that path and f16:i4 keeps the charge for that reason; i4:i4 and by-token
+keys are declined by 0020 and stay charged either way. Red first: the two arms' tests
+failed on the arm-less signature (term still charged, chunk 32), 414 unit
+cases green after.
+
+**Functional check on the `+p6` package** (the operator's "quick
+functional test, not an hour of testing"): the same card and artifact,
+auto-fit, `--paged-kv u8:i4`, chunk 128, the package's libraries
+extracted and put on the process's library path for the window (nothing
+installed; the production units stopped and restored, as every window).
+The fit admits **171,392** tokens (the reservation's ceiling 171,552,
+trimmed by Phase E's page rounding) where the charged term admitted
+101,824 (§7.0.2ab)
+— the pool §7.0.2ab's fault was measured on, 171,312, with a prefill of
+119,074 tokens at chunk 128 on the generic path. The
+118,454-token prompt prefilled at chunk 128 in 346.9 s (341.5 t/s) and
+decoded (21.3 t/s), no fault line in the log or the host's kernel log
+grep; free VRAM sat at 971–978 MiB for the whole prefill — the idle level
+after load — where §7.0.2ab's generic-path prefill of the same class on
+the same pool size went to 0 MiB and faulted. One cell, one process; the
+depth ladder on both cards at both precisions against the `+p6` package
+is the fault campaign's own regression test and is still owed there.
+
+**What this changes on the record.** `docs/model_requirements.md` §3's
+"u8:i4 is a decode-only saving until the buffer stops scaling with depth"
+is retired: on `+p6` the format's prefill is u8's (§7.0.2as) and its
+auto-fit is the KV cost model's (+28 % over u8, §7.0.2y) with no scratch
+term. The `+p6` package exists (built from the recipe, plugin stamped
+`marfrit-p6`, not deployed; production stays at `+p3`). The fault
+campaign keeps the belt and the charge for every plugin below `+p6` and
+for the pairings 0020 does not admit, and its own gate (the fault
+reproduced one variable at a time on the generic path) is unchanged.
 
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
