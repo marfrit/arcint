@@ -107,6 +107,41 @@ window's cells: `tier-reference-cell` with the new cold metric, and E2 →
 review → commit → DESIGN §7.0.2x record naming the owner and the fix,
 CHANGELOG line, the backlog row's closing line.
 
+**The first window, as a ladder** (operator hypothesis, 2026-09-05: "if
+the heuristics are saved, the cold start goes away" — testable, because
+under the static partition there is no learned state to save, only three
+kinds of recomputed work, and each step below moves exactly one of them;
+`research-cold-start.md` has the knobs):
+
+1. *Is a kernel cache already doing the "later processes are fast"?* Read
+   the compute runtime's on-disk program cache state in the container
+   (enabled, directory, size against its cap, populated). If it is the
+   mechanism, the cold process is a cache miss and step 2 measures the
+   miss.
+2. *Compiled kernels.* Two loads of the tier-ON reference cell, the
+   runtime cache cleared before the first and intact before the second,
+   page cache warm in both (the files read once by timed `dd` before
+   either): load time, `created_onednn_kernels`, first-request decode.
+   The delta is the JIT term. Then the same with the plugin's own
+   persistence, if any, and OpenVINO's `cache_dir` on for this graph.
+3. *Page cache.* Two loads with the runtime cache intact, the artifact
+   files evicted before the first (measured by a timed read, not
+   `fincore` — the root is on ZFS and its ARC is invisible to it) and
+   warm before the second. The delta is the I/O term.
+4. *First-use fills.* One process, runtime and page cache both warm: the
+   first request's decode against the second's, then the same process
+   after one explicit pre-warm request. The delta is the fill term.
+5. Whichever step swallows the 215→45 s and the first-request cliff
+   names the owner. If step 2: the lever is a persistent, pre-populated
+   kernel cache (already saveable; make it reliable). If step 3 or 4: no
+   file can hold it, and the lever is a pre-warm at service start, kept
+   out of the gate's timing. If two steps share it, both levers, and the
+   record says which bought what.
+
+Every number: card, artifact, flags, pool bytes, the runtime's patch
+level, and which of the four caches was warm — a load time without that
+list is the kind of figure §7.0.2ai could not separate.
+
 ## Invariants
 
 The static partition's history-independence (DESIGN §3.4, the reason patch
@@ -118,3 +153,8 @@ for a faster cold start.
 ## Status
 
 - 2026-09-05 — opened from the 0.3.1 backlog row; nothing started.
+- 2026-09-05, later — the operator's hypothesis ("save the heuristics
+  periodically and the cold start goes away") turned into the first
+  window's four-step ladder in the pipeline above; the honest reading is
+  that only the compiled-kernel term is saveable, and the runtime may
+  already be saving it. Not run yet: needs a quiet card.
