@@ -218,6 +218,10 @@ the package was built from.
   Found by the 0.3.0 release gate, where it aborted the equivalence suite's
   chunk sweep on the dense agent (DESIGN §7.0.2ai). Not a served
   configuration.
+- After the tag, test-only: the affinity pin unit test pinned to CPU 0 by
+  literal and failed on a package-build host whose cpuset excludes it
+  (`tests/test_affinity.cpp`); it pins to the first allowed core. The 0.3.0
+  package is built from that commit, whose engine sources are the tag's.
 - Drafters at depth (DESIGN §7.0.2ag). Two defects, both measured on the
   dense 27B agent artifact on the 24 GB card. (1) Zero acceptance past
   65,504 tokens for MTP and DFlash alike: both drafter graphs compute their
