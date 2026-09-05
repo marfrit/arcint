@@ -5262,6 +5262,61 @@ comes last, after `package-build`; a release gate that wants the
 *candidate* measured through it deploys the built package between the two,
 or the cell's own first line names the older package, visibly.
 
+#### 7.0.2ap The prefill fallback's weight-side answer is three-way; patch 0019, recipe at `+p5` (2026-09-05)
+
+The `prefill-fallback-tristate` campaign
+(`docs/campaigns/prefill-fallback-tristate.md`), closed on the item patch
+0018's own header reported (§7.0.2ae).
+
+**The defect, re-read on the tree.** In the plugin's per-expert prefill
+loop, patch 0018 made the caller read `on_load_expert_weights()`'s
+`false` as "not resident under the static partition: run this expert on
+the host tier", and the host branch downcasts the weight provider to the
+offload type. The same `false` was also the answer for "no offload tier at
+all", where every expert's weights are on the device and the per-expert
+handles are valid as initialised. Before 0018 the return was ignored and
+the device path always ran; after it, a resident-only load reaching the
+loop took the host branch for device weights through a downcast of the
+wrong type. The loop is reached only through the dispatch's plain else —
+both fast prefill paths off, two internal plugin properties arcint never
+sets — so the branch was dormant, as 0018 said.
+
+**The fix (patch 0019).** The answer is an enum with three values: no
+offload tier, a device slot acquired or pinned, the host tier. The loop
+takes the device path for the first two and the host branch for the
+third, with an assertion that the provider is the offload one right
+before the downcast.
+
+**Red, then green.** A new plugin unit test drives a resident load of 40
+tokens (above the batched-GEMV threshold) with both fast paths forced off
+through the internal properties and checks the output against the
+suite's own reference. On the 0018 tree it failed with "Can not open file
+for mapping": the loop took the host branch and the misread provider
+tried to map a weight file that does not exist — the misrouting, made
+visible rather than silent. With 0019 it passes, and the four
+static-partition cases and the sixteen smoke accuracy cases pass beside
+it: 21 of 21 on the 24 GB card and 21 of 21 on the 16 GiB card, the
+production units running beside the test binary throughout (a plugin unit
+test's allocations are kilobytes), built and run in the staged 0018
+source tree on the dev host, which now carries 0019. The provider-type
+assertion sits above the host branch's blocking readbacks, so a wrong
+provider fails before any device read. The new case's tolerance is the
+suite's flat 0.15 plus 1 % of the reference — 40 tokens of u4 experts
+reach |21|, where one f16 ULP is 0.016 and the first run missed the flat
+bar by 0.006 on one element; a misrouted expert misses by tens. The
+generated diff applies cleanly on the pristine pin with exactly 0003–0018
+applied.
+
+**What was not run, on the operator's word** ("a quick functional test,
+not an hour of testing for thirty seconds of coding"): the three
+acceptance cells the campaign named as the no-change proof. The branch is
+on none of their paths. The `+p5` package is not built; the recipes are
+bumped. Observed on the way and not investigated: the 0012-era sentinel
+test (one token, batched-GEMV path, untouched by 0019) passes on the
+24 GB card and fails on the 16 GiB card beside its resident service with
+its first run's scratch read all zeros — pre-existing by path, not shown
+so by a measurement on the unpatched tree.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

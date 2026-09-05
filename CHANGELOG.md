@@ -58,6 +58,15 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   read. First real run through the cell: 10/10 on the deployed package.
   `run.py --all` on a host with the wrapper configured needs no
   `--allow-skip pruefstand`.
+- **Plugin patch 0019, recipe at `+p5`** (`prefill-fallback-tristate`
+  closed, DESIGN §7.0.2ap): the MoE per-expert prefill fallback's
+  weight-side answer is three-way (no offload tier / device slot / host
+  tier); under 0018 a resident-only load with both fast prefill paths
+  forced off took the host branch for device weights through a downcast
+  of the wrong provider type, dormant in every configuration arcint
+  drives. Red first with a new plugin unit test, green with the patch on
+  both cards. The `+p5` package is not built yet; arcint's dependency
+  floor stays at `+p4`, since nothing it drives reaches the branch.
 - Known, open, on the record: one follow-up window had two tier-ON
   processes disagree on the same prompt (§7.0.2ak); a diagnostic rerun did
   not reproduce it (§7.0.2al); the runner now prints every output's hash.

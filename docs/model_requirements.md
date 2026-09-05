@@ -127,13 +127,17 @@ campaign (`docs/campaigns/`).
 ## 5. Runtime stack
 
 `marfrit-openvino`: source build pinned at upstream commit `71640275` (the
-2026.4.0 nightly of 2026-08-21), patch series **0003–0018** applied
+2026.4.0 nightly of 2026-08-21), patch series **0003–0019** applied
 (`contrib/packaging/marfrit-openvino/patches/`). Package version carries
 the patch level: **`+p4` is the 0003–0018 level** and the one 0.3.0
-requires (CHANGELOG); the arcint package depends on it as a floor within
-the pinned nightly. At the 0.3.0 tag the dev host's production units still
-serve `+p3` — deployment is a separate decision (DESIGN §7.0.2ai). Compute-runtime **26.27**
-(past the fix window for USM-pool issue 916). Kernel driver: **xe KMD**; no version recorded.
+requires (CHANGELOG); **`+p5` adds 0019** (the prefill fallback's
+three-way answer, DESIGN §7.0.2ap; recipe bumped 2026-09-05, package not
+yet built); the arcint package depends on `+p4` as a floor within the
+pinned nightly, since nothing arcint drives reaches 0019's branch.
+At the 0.3.0 tag the dev host's production units still serve `+p3` —
+deployment is a separate decision (DESIGN §7.0.2ai). Compute-runtime
+**26.27** (past the fix window for USM-pool issue 916). Kernel driver:
+**xe KMD**; no version recorded.
 
 ## 6. Not supported / not measured
 

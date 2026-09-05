@@ -31,7 +31,7 @@ set -euo pipefail
 # tilde so that a future 2026.4.0 release sorts ABOVE this dev build.
 OV_VER=2026.4.0.dev20260821
 OV_TOK_VER=2026.4.0.0.dev20260821
-PKGVER=2026.4.0~dev20260821+p4
+PKGVER=2026.4.0~dev20260821+p5
 PKGREL=1
 # Sorts above the unpatched 2026.4.0~dev20260821-1 and still below a real
 # 2026.4.0 release, because the tilde keeps the whole thing under it.
@@ -43,7 +43,7 @@ PKGREL=1
 OV_BUILD_DIR=${OV_BUILD_DIR:-${OV_SRC:-$HOME/ovsrc-pkg}}   # OpenVINO writes bin/intel64/Release under the SOURCE tree, whatever the build dir
 OV_BIN=$OV_BUILD_DIR/bin/intel64/Release
 OV_TBB=${OV_BUILD_PREFIX:-$HOME/ovinstall}/runtime/3rdparty/tbb/lib
-PATCHLEVEL=marfrit-p4
+PATCHLEVEL=marfrit-p5
 PYTAG=cp313
 OV_WHEEL=openvino-${OV_VER}-22849-${PYTAG}-${PYTAG}-manylinux_2_28_x86_64.whl
 OV_TOK_WHEEL=openvino_tokenizers-${OV_TOK_VER}-py3-none-manylinux_2_28_x86_64.whl

@@ -1,3 +1,25 @@
+marfrit-openvino (2026.4.0~dev20260821+p5-1) bookworm trixie; urgency=medium
+
+  * One more patch applied on top of +p4, same upstream commit (71640275),
+    same smallest-sufficient-divergence numbering:
+    - patches/0019: the MoE per-expert prefill fallback's weight-side
+      answer becomes three-way (no offload tier / device slot acquired or
+      pinned / host tier). Patch 0018's single `false` meant both "no
+      offload tier" and "not resident", and its caller took the host path
+      for both -- on a resident-only load with both fast prefill paths
+      forced off it downcast the resident provider to the offload one
+      (undefined behaviour) for weights that were on the device. Dormant
+      in every configuration arcint drives; closes the item 0018's own
+      header reported. Red first with a new plugin unit test (the
+      misrouted branch tried to map a weight file that does not exist),
+      green with the patch, 21 of 21 MoE cases on both cards.
+  * The runtime reports itself as 2026.4.0-22849-71640275d29-marfrit-p5,
+    so a version string in a log distinguishes this build from +p4 and
+    from the stock nightly. Not yet built as a package at the time of
+    this entry.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 05 Sep 2026 13:40:00 +0200
+
 marfrit-openvino (2026.4.0~dev20260821+p4-1) bookworm trixie; urgency=medium
 
   * Two more patches applied on top of +p3, same upstream commit

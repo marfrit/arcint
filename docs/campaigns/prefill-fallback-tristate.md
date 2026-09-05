@@ -81,3 +81,17 @@ the three cells is the gate's teeth. §3.4 untouched.
 ## Status
 
 - 2026-09-05 — opened from the 0.3.0 known-defect list; nothing started.
+- 2026-09-05, closed (patch 0019, DESIGN §7.0.2ap). Recon on the staged
+  tree confirmed the two meanings and found the second consequence: with
+  the tier off the caller took the host path for weights that were on the
+  device, not only the downcast. Fix: `ExpertWeightsSide` (no tier /
+  device acquired or pinned / host tier); the loop runs the device path
+  for both device answers; an assertion guards the downcast. Red first:
+  a new plugin unit test (resident load, 40 tokens, both fast prefill
+  paths off via the internal properties) failed on the 0018 tree with the
+  misread provider trying to map a nonexistent weight file; green with
+  0019, 21 of 21 MoE cases on each card, units running. Recipes bumped to
+  `+p5` (package not built). Not run, on the operator's word for a quick
+  functional test: the three acceptance cells; the branch is on none of
+  their paths. The campaign's gate is therefore met on the unit-test half
+  and waived on the cell half, recorded as such.

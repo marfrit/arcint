@@ -301,7 +301,34 @@ return from `on_load_expert_weights` is genuinely overloaded (OTD off
 vs. not resident under this partition) and its one caller does not
 distinguish them, but the ambiguous path is reachable only when
 `MOE_USE_GROUPED_GEMM_PREFILL` is forced off, which arcint never does —
-dormant in every configuration this repository drives today.
+dormant in every configuration this repository drives today. *(Fixed by
+0019, below.)*
+
+Upstream: not yet filed.
+
+### 0019-moe-prefill-fallback-tristate.patch
+
+Closes the item 0018's header reported. `on_load_expert_weights` now
+answers three ways — no offload tier (every expert's weights are on the
+device as initialised), a device slot acquired or pinned, or the host
+tier (not resident under the static partition) — and the per-expert
+prefill loop takes the device path for both device answers. Under 0018 a
+resident-only load reaching that loop, which needs both fast prefill
+paths forced off through internal properties arcint never sets, took the
+host branch for weights that were on the device through a downcast of the
+wrong provider type. An assertion now guards the downcast.
+
+Red first: a new plugin unit test, `moe_3gemm_prefill_fallback.resident_
+load_with_grouped_prefill_off_matches_reference` (40 tokens, both fast
+paths off, no offload, checked against the suite's own reference), failed
+on the 0018 tree — the misread provider tried to map a weight file that
+does not exist — and passes with the patch; the four
+`moe_3gemm_static_partition.*` and sixteen smoke accuracy cases pass
+alongside it, 21 of 21 on each card, 2026-09-05. The three acceptance
+cells the campaign named as the no-change proof were not run for this
+patch (a quick functional test, on the operator's word); the branch is on
+none of their paths. Full account in the patch header and arcint's
+`DESIGN.md` §7.0.2ap.
 
 Upstream: not yet filed.
 

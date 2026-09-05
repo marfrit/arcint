@@ -5,3 +5,4 @@ __pycache__/
 CLAUDE.local.md
 *.local.md
 .claude/
+*.local.md.tmp.*
