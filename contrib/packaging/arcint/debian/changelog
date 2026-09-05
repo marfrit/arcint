@@ -16,6 +16,10 @@ arcint (0.3.0-1) trixie; urgency=medium
     re-scoped: the context claim is discharged by --paged-kv u8:i4; the
     sub-4-bit expert kernel path is 0.3.1. Full record: DESIGN.md
     §7.0.2ae–§7.0.2ah and CHANGELOG.md.
+  * Built from the v0.3.0 tag plus one test-only commit after it: the
+    affinity pin unit test pinned to CPU 0 by literal and failed on a build
+    host whose cpuset excludes it; it now pins to the first allowed core.
+    The engine's own sources are the tag's, unchanged.
   * Requires marfrit-openvino +p4 (patches 0003–0018). The dependency is
     now a floor on the patch level within the pinned nightly
     (>= +p4-1, << the next nightly) instead of an exact pin: the exact pin

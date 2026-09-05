@@ -12,15 +12,25 @@ TEST(pin_current_thread_pins_to_the_requested_core) {
     CPU_ZERO(&original);
     CHECK_EQ(pthread_getaffinity_np(pthread_self(), sizeof(original), &original), 0);
 
-    CHECK(pin_current_thread(0));
+    // The requested core must be one this process may use at all: a
+    // container's cpuset can exclude CPU 0 (the 0.3.0 package build ran in
+    // one allowing 1,5-7,9,11,14-15), and a literal 0 there tests the
+    // host, not the pin. The first allowed core is as good a request as any.
+    int core = -1;
+    for (int c = 0; c < CPU_SETSIZE; ++c) {
+        if (CPU_ISSET(c, &original)) { core = c; break; }
+    }
+    CHECK(core >= 0);
+
+    CHECK(pin_current_thread(core));
 
     cpu_set_t after;
     CPU_ZERO(&after);
     CHECK_EQ(pthread_getaffinity_np(pthread_self(), sizeof(after), &after), 0);
     CHECK_EQ(CPU_COUNT(&after), 1);
-    CHECK(CPU_ISSET(0, &after));
+    CHECK(CPU_ISSET(core, &after));
 
-    // Restore, so later tests in this process are not left pinned to CPU 0.
+    // Restore, so later tests in this process are not left pinned to one CPU.
     CHECK_EQ(pthread_setaffinity_np(pthread_self(), sizeof(original), &original), 0);
 }
 
