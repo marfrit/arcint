@@ -17,10 +17,10 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
-## Unreleased
+## 0.3.1 — 2026-09-05
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p6` (patches 0003–0020)
-from 0.3.1 on — the floor moves from `+p4` on the operator's decision:
+— the floor moves from `+p4` on the operator's decision:
 below `+p6` the mixed `--paged-kv u8:i4` cache is possible but pointless
 (prefill at +55 % to +90 % of u8's time, a depth-scaled scratch charge);
 at `+p6` it prefills on micro-SDPA, the charge is gone and the depth

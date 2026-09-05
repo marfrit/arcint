@@ -1,5 +1,16 @@
-arcint (0.3.1-1) UNRELEASED; urgency=medium
+arcint (0.3.1-1) trixie; urgency=medium
 
+  * 0.3.1: the campaigns closed since 0.3.0 ship. Unit and acceptance
+    tests differentiated (bare ctest is the unit set; an enumerated
+    acceptance target with references from the runners' own windows);
+    plugin patches 0019 (the prefill fallback's three-way answer) and
+    0020 (the u8:i4 mixed prefill stage on micro-SDPA, parity with u8 at
+    a held chunk); the fit stops charging the generic kernel's prefill
+    scratch on +p6 and the microkernel path gets its own measured chunk
+    cap of 2,048, so u8:i4 auto-fit on the 16 GiB card goes from 101,824
+    to 171,392 tokens and its 98k-token prefill from 170 to 665 t/s; the
+    turnstile and round-trip tests no longer time their threads. Full
+    record: DESIGN.md §7.0.2aj-§7.0.2av and CHANGELOG.md.
   * Requires marfrit-openvino +p6 (patches 0003-0020). The floor moves from
     +p4 on the operator's decision (2026-09-05): below +p6 the mixed
     --paged-kv u8:i4 cache is possible but pointless -- its prefill costs
