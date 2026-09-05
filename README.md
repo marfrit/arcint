@@ -438,7 +438,10 @@ Every open defect and lever after 0.3.0 is its own campaign under
 [docs/campaigns/](docs/campaigns/README.md): one document each, with the
 measurement that defines it, its gate and its entry criteria, sized so one
 session can carry it. `docs/milestone-0.3.0.md` is the record of how 0.3.0
-was planned and closed; its backlog rows are frozen and point there.
+was planned and closed; its backlog rows are frozen and point there. The
+next feature lines are recorded, not started: **0.4.0 opens and runs GGUF
+checkpoints** (`docs/milestone-0.4.0.md`) and **0.5.0 serves Qwen Flash
+Next** (`docs/milestone-0.5.0.md`).
 
 Verification: 409 unit cases device-free (413 with the OpenVINO backend), a
 64-check curl round-trip, a lane-accounting stress (200 requests, 24-way, 8

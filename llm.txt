@@ -42,7 +42,15 @@ coder q4; all three target models reach 10/10 on the fleet harness.
 
 After 0.3.0 every open defect or lever is one campaign document under
 docs/campaigns/ (README there: rules, template, index of thirteen); the
-milestone document's backlog rows are frozen and point there.
+milestone document's backlog rows are frozen and point there. Next feature
+lines, recorded 2026-09-05 and not started: 0.4.0 = open and run GGUF
+checkpoints (docs/milestone-0.4.0.md; three routes -- offline import to IR,
+in-process graph build, native K-quant blocks in the plugin -- recon picks;
+gate: opens, Prüfstand at its own bit width, exact-block files byte-identical
+to the IR from the same weights); 0.5.0 = Qwen Flash Next
+(docs/milestone-0.5.0.md; recon pins the checkpoint and its config deltas
+first; gate: loads on both cards, Prüfstand, depth ladder, drafters measured
+against plain).
 
 Two M2 walls came down. Slicing logits to the last token before the LM head
 removed an out-of-memory wall at ~8k tokens (the graph computed logits for

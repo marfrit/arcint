@@ -1441,7 +1441,11 @@ and owns the state.
 The 0.3.0 extension series (M7–M14: auto-fit, asymmetric KV, expert-offload
 v2, sub-4-bit experts, tree drafting, exporter lowering, projector-off
 loading, a vendored CPU compute tier) is planned in
-`docs/milestone-0.3.0.md`; milestones join this table as they close.
+`docs/milestone-0.3.0.md`; milestones join this table as they close. The
+lines after it are recorded in `docs/milestone-0.4.0.md` (open and run GGUF
+checkpoints; plugin patches in scope, not gated by hardware) and
+`docs/milestone-0.5.0.md` (Qwen Flash Next; its recon pins the checkpoint
+first) — charters with gates, nothing started as of 2026-09-05.
 
 | # | milestone | exit criterion | state |
 |---|---|---|---|
