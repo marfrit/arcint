@@ -19,6 +19,23 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+- **0.4.1, the native decode kernel in llama.cpp's shape** (DESIGN
+  §7.0.2bc, plugin patch 0023 now carrying the kernel, `+p8` recipe,
+  package not built). A work-group per group of output rows, four
+  subgroups with their lanes along K; a Q4_K/Q5_K super-block's quant
+  bytes are one sub-group block read and its activations another,
+  shared by the group's rows, the scales decoded by eight lanes and
+  broadcast; Q6_K block-reads its 2-aligned blocks as dwords with one
+  shuffle. Exact (f32 over f16 activations). In isolation on the 24 GB
+  card, streamed: the gate projection 156 µs against 170 (321 GB/s,
+  71 % of the card's measured 453 GB/s random-read ceiling), the Q4_K
+  down projection 160 against 219, the Q6_K down projection 508 against
+  646, every tensor shape of the served model faster. Served, dense
+  Qwen3.8-27B Q4_K_M native, `u8` KV: 12.0 t/s decode at 856 prompt
+  tokens against 9.9, 8.6 at 71.7k against 8.5, Prüfstand 10/10, greedy
+  outputs byte-identical to 0.4.0's at both depths. The deep step's
+  stillness is open. A 16× "dispatch-bound" reading of the first form
+  was a cold-kernel-cache artefact and is retracted in the record.
 - **0.4.1, the native decode kernel on the integer dot: measured and not
   carried** (DESIGN §7.0.2bb). Activations quantised to int8 per 32 in
   registers, byte-parallel unpack, the 4×8-bit dot: correct, 194 µs

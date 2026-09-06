@@ -404,16 +404,31 @@ DESIGN §7.0.2az.
 
 Upstream: not yet filed.
 
-### 0023-kquant-timing-streams.patch
+### 0023-kquant-decode-rows.patch
 
-The K-quant kernel's timing test (the `DISABLED_` case in the
-fully-connected suite) rebuilt to stream: eight weight buffers in
-rotation on one queue, so no launch finds its rows in L2 and none
-overlaps another. Ten launches of one buffer had let a third of it hit
-the 18 MB L2 and overstated every launch figure of 0021 and 0022; the
-0022 kernel reads the gate projection at 293 GB/s streamed on the 24 GB
-card. The int8-activation decode kernel this window built is recorded
-in DESIGN §7.0.2bb and not carried: 8/10 on the Prüfstand.
+The K-quant kernel's decode variant in llama.cpp's shape (DESIGN
+§7.0.2bc): a work-group per group of output rows (four, sixteen on the
+long-K down projection), four subgroups with their lanes along K, a
+subgroup taking one super-block per iteration. A Q4_K/Q5_K
+super-block's 128 quant bytes are one sub-group block read (lane l holds
+positions l and l + 16 of every sub-block) and its 256 activations
+another, read once and shared by the group's rows; the eight scale/min
+pairs are decoded by lanes 0–7 and broadcast. Q6_K's 2-aligned blocks
+are block-read as dwords from the dword below and redistributed with one
+shuffle (a 16-bit block read two bytes off a dword returns the wrong
+word on every lane but the first — measured). Exact: f32 accumulation
+over f16 activations. The tiled prefill variant is unchanged.
+
+Measured streamed on the 24 GB card against 0022: the gate projection
+156 µs (321 GB/s) against 170, the Q4_K down projection 160 against 219,
+Q5_K 5,120² 105 against 137, the Q6_K down projection 508 against 646.
+Served, dense Qwen3.8-27B Q4_K_M native, `u8` KV: 12.0 t/s decode at
+856 tokens against 9.9, Prüfstand 10/10, outputs byte-identical.
+
+Also carried: the timing test streams (eight weight buffers in rotation
+on one queue; ten launches of one buffer had let a third of it hit the
+18 MB L2 and overstated every launch figure of 0021 and 0022) and runs
+over the served model's own tensor types and shapes.
 
 Upstream: not yet filed.
 

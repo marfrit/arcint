@@ -6422,6 +6422,137 @@ runtime's fixed cost per launch is lower — the next lever for either
 path is that fixed cost, measured per node with the profile, not the
 inner loop. Plugin patch 0023 carries the corrected timing test only.
 
+#### 7.0.2bc 0.4.1, the native decode kernel in llama.cpp's shape: block reads along K, 20 % more served decode at 1k, 10/10, byte-identical; a 16× reading retracted (2026-09-06)
+
+The operator's window after §7.0.2bb ("kernel first … measurements after
+the fact; if we end up losing again, I am willing to spend the utility
+bill"), with the standing objection that 10–25 % of a card's bandwidth
+is not a number to accept. What was built, what the instruments said,
+and what the served path did.
+
+**The shape.** llama.cpp's CUDA decode (read from `mmvq.cu` and
+`vecdotq.cuh`, not its documentation): a thread block per output row,
+its lanes along K, sixteen lanes per super-block. Transplanted to Xe as
+patch 0023's decode variant: a work-group per group of output rows,
+four subgroups with their lanes along K, a subgroup taking one
+super-block per iteration, the subgroups' partials reduced through
+local memory. Four steps, each correct on both cards (14/14 against the
+host reference) before it was timed:
+
+1. Lanes reading their eight quant bytes and two runs of eight
+   activations with per-lane loads: 96 four-byte gathers per lane per
+   row in the compiled kernel, 1.35–1.5× slower than 0022 on the wide
+   shapes.
+2. The 128 quant bytes of a Q4_K/Q5_K super-block as one sub-group
+   block read (eight bytes per lane: positions l and l + 16 of every
+   sub-block) and the 256 activations as another (sixteen halves per
+   lane) — no gathers. The first cut took sixteen bytes per lane instead
+   of eight, read 128 bytes past every last block, faulted the card
+   (engine resets, ten-minute hangs per timing run) and failed the
+   reference; the size fixed, 14/14. The block reads' lane mapping was
+   probed rather than assumed: lane l holds element 16 i + l.
+3. The activation block read once per super-block and shared by the
+   work-group's rows (super-blocks outer, rows inner), the eight
+   scale/min pairs decoded by lanes 0–7 and broadcast instead of by
+   every lane: 195 µs on the gate projection.
+4. The same loop with the super-block index clamped and the
+   contribution masked, so a step of several super-blocks could issue
+   its loads together: 156 µs at one super-block per step — faster than
+   step 3 by 20 % for a change the compiler was meant to fold, and kept
+   in that form because that is the form that was measured; two and
+   four super-blocks per step were slower.
+
+Q6_K needed its own form. Its 210-byte blocks are 2-aligned, and a
+16-bit block read two bytes off a dword returns the neighbour's word on
+every lane but the first (probed); so its 128 low-nibble bytes and 64
+high-bit bytes are block-read as dwords from the dword at or below the
+block and each lane takes its word from the lane that holds it with one
+shuffle, the sixteen scales one uniform load with a per-lane select.
+The first form of it, with per-lane scale gathers, was 814 µs on the
+down projection; this one 508.
+
+**In isolation** (the streamed timing test of §7.0.2bb, now over the
+model's own tensor types at their shapes; every configuration warmed
+once, then two repeats; 24 GB card unless named):
+
+| M = 1, streamed | 0022 kernel | this kernel | 16 GiB card, this kernel |
+|---|---|---|---|
+| gate/up, Q4_K, N 17,408 × K 5,120 (44 MB) | 170 µs, 295 GB/s | **156 µs, 321 GB/s** | 171 µs |
+| q/k/v, Q4_K, N 1,024 | 85–97 µs | 83–89 µs | 56–58 µs |
+| Q4_K, N 5,120 × K 5,120 | 107 µs | 96–99 µs | 74–76 µs |
+| down, Q4_K, N 5,120 × K 17,408 | 219 µs, 229 GB/s | **158–162 µs, 314 GB/s** | 258 µs |
+| attention output, Q5_K, 5,120 × 5,120 | 137 µs | 105 µs | 79 µs |
+| down, Q6_K, N 5,120 × K 17,408 (73 MB) | 646 µs, 113 GB/s | **508 µs, 144 GB/s** | 851 µs |
+| Q6_K, N 1,024 | 107–126 µs | 84–85 µs | 71–73 µs |
+
+The rows-per-group choice is by shape: four rows per work-group on the
+K = 5,120 shapes (sixteen was 176–189 µs on the gate), sixteen on the
+K = 17,408 down projection (four was 189 µs, sixteen 159: the shared
+activation block is the lever when K is long). Four subgroups beat
+eight (170–175 µs) and two (234 µs). The 16 GiB card's Q6_K figure is a
+loss against the per-lane-gather form there (636 µs) and is left open:
+that card does not serve a GGUF-opened model.
+
+**The ceiling, measured rather than quoted.** A streaming read of
+512 MiB of random bytes on the 24 GB card runs at 453 GB/s at every
+work-group size tried — 99 % of the card's 456 GB/s specification.
+(`clpeak` reports 1,139 GB/s on the same card: its test data compresses
+on Xe2, and its figure is not a ceiling for weights.) The gate
+projection at 321 GB/s is 71 % of what the memory system delivers to a
+kernel; 0022's 295 was 65 %.
+
+**Served** (dense Qwen3.8-27B Q4_K_M through `--gguf-native`, 24 GB
+card, `u8` KV, chunk 256, one fresh process per cell; the same protocol
+as §7.0.2ay's benchmark):
+
+| prompt tokens | 0.4.0 native (0021 kernel) | this kernel |
+|---|---|---|
+| 856 | 213 t/s prefill, 9.9 t/s decode | 212 / **12.0** |
+| 71,727 | 174 / 8.5 | 173 / 8.6 |
+
+The Prüfstand at 10/10, its decode at 12.8–14.1 t/s over the run; the
+greedy outputs byte-identical to 0.4.0's at both depths (the kernel is
+exact: f32 accumulation over f16 activations). The step at 856 tokens
+went from 101 to 83 ms — 18 ms, against about 10 ms of kernel time
+saved by the table above (48 layers × the per-tensor differences), so
+the launch sequence gained more than its kernels did. The step at
+71.7k went from 118 to 116 ms, and that 2 ms is not explained by any
+row above: at that depth the decode step is bound by something the
+kernel does not touch, and the profile at depth (`ARCINT_PROFILE` at
+71,700) is the next measurement, not a narrative.
+
+**An intermediate result that would have ended the window wrongly.**
+The first form of the kernel timed at 2.5–2.9 ms on the gate projection
+on both cards, sixteen times 0022, and the reading written down was
+"one work-group per row is dispatch-bound on Xe". It was not: the same
+binary at the same shape timed 72 µs in one process and 2.8 ms in
+another, and the pattern was the first process after every rebuild —
+one of the three shapes stalls by about 2.5 ms in the process that
+first compiles a kernel, and never again (the persistent kernel cache
+is the candidate; not root-caused). Warmed, the form was 1.35–1.5×
+slower than 0022, not 16×; work-group size costs tens of percent here
+(sixteen-lane groups 275 µs against 229 for four subgroups), never an
+order of magnitude. The timing ritual now warms every configuration
+once and reports repeats, and the correctness cases gate the timing
+loop (a kernel that faults the card hangs every timing run after it).
+
+**Refuted and retracted here (§7.0.1).** "The served number never moved
+because the kernel was never what it was waiting on" (§7.0.2bb): the
+kernel was worth 18 ms of the 101 ms step at 1k, a fifth of it. What
+survives of that section is the remainder — 83 ms of step for about
+49 ms of kernel time — and the deep step, where the kernel moved
+nothing. And the 16× dispatch reading above, which never reached this
+document but did reach the kernel's comments for two hours.
+
+**What this closes.** The native path's decode kernel is in llama.cpp's
+shape with block reads along K, exact, 10/10, faster than 0022 on every
+tensor type and shape of the served model on the 24 GB card, and 20 %
+faster served at 1k. Plugin patch 0023 carries it (kernel, host,
+utilities, the timing test over the model's shapes) in the `+p8`
+recipe; the package is not built. Open: the deep step (profile at
+71.7k), the 16 GiB card's Q6_K form, the first-process stall, and the
+remaining gap between kernel time and step time at 1k.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

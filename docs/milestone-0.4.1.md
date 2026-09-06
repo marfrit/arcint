@@ -144,3 +144,15 @@ to keep on the other card.
   and the difference is the fixed cost of 401 launches and the narrow
   projections — on both paths. Next lever: that fixed cost, measured per
   node with the profile.
+- 2026-09-06 — **the native decode kernel in llama.cpp's shape, served**
+  (DESIGN §7.0.2bc, patch 0023 now the kernel): block reads along K,
+  the activation block shared by a work-group's rows, Q6_K as dwords
+  with a shuffle; exact. Faster than 0022 on every tensor shape of the
+  served model on the 24 GB card (gate 156 µs against 170, Q6_K down
+  508 against 646); served 12.0 t/s decode at 856 tokens against 9.9,
+  8.6 at 71.7k against 8.5, Prüfstand 10/10, byte-identical outputs.
+  The §7.0.2bb sentence "the kernel was never what it was waiting on"
+  is retracted for the 1k step (a fifth of it was the kernel) and
+  stands for the deep step, which did not move: the profile at 71.7k is
+  the next measurement. Also open: the 16 GiB card's Q6_K form, the
+  first-process stall of a freshly compiled kernel, `+p8` not built.
