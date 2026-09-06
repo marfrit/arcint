@@ -194,6 +194,7 @@ if(ARCINT_TESTS)
   enable_testing()
   add_executable(arcint-test
     tests/test_main.cpp
+    tests/test_patches_mirror.cpp
     tests/test_utf8.cpp
     tests/test_toolcall.cpp
     tests/test_sampler.cpp

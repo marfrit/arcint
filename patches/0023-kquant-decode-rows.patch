@@ -1,0 +1,588 @@
+# The K-quant kernel's decode variant in llama.cpp's shape: block reads along K
+
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0003-0022. arcint 0.4.1 (DESIGN.md section 7.0.2bc). Replaces the earlier 0023
+# (the timing test only), which is carried inside this one.
+#
+# What changes:
+#   fully_connected_gpu_kquant.cl   The decode variant (TILE_M == 1): a work-group per
+#                       group of output rows (KQ_ROWS: four, sixteen on the long-K down
+#                       projection), KQ_WG = 4 subgroups with their lanes along K, a subgroup
+#                       taking one super-block per iteration; super-blocks outer, rows inner,
+#                       so the activation super-block is read once (a sub-group block read,
+#                       converted once) and shared by the rows; the subgroups' partials
+#                       reduced through local memory. The tiled prefill variant is unchanged.
+#   kquant_utils.cl     The row pieces. Q4_K/Q5_K (kq_row_q4k_x): the 128 quant bytes as one
+#                       intel_sub_group_block_read_uc8 -- lane l holds positions l and l + 16
+#                       of every sub-block -- the eight scale/min pairs decoded by lanes 0..7
+#                       and broadcast, the min term from the activation pair sums. Q6_K
+#                       (kq_row_q6k_x): the 2-aligned 210-byte blocks block-read as dwords
+#                       from the dword at or below the block and redistributed with one
+#                       shuffle (a 16-bit block read two bytes off a dword returns the wrong
+#                       word on every lane but the first -- measured), the scales one uniform
+#                       load; on Xe2 the subgroup prefetches its next Q6_K super-block (one
+#                       cache line per lane: the Q6_K down projection 500 -> 397 us on the 24 GB
+#                       card, measured; the Q4_K/Q5_K shapes and the 16 GiB card lose with the
+#                       same prefetch and do not get it). Q8_0 per lane. Exact: f32 accumulation
+#                       over f16 activations.
+#   fully_connected_kernel_kquant.cpp   The decode dispatch: a work-group of 4 x 16 lanes per
+#                       rows_per_group(K) output rows; KQ_ROWS and KQ_PREFETCH (Xe2) as jit
+#                       constants; the subgroup reduce among the required device features. The
+#                       width-sized K split of 0022 goes.
+#   fully_connected_gpu_test.cpp   Two more correctness cases (Q8_0 and Q5_K at one row); the
+#                       timing case streams (eight weight buffers in rotation on one queue: ten
+#                       launches of one buffer had let a third of it hit L2), warms every network
+#                       to steady state before the clock (a network's second execution costs
+#                       twice its third, measured) and runs over the served model's own tensor
+#                       types and shapes.
+#
+# MEASURED streamed at steady state on the 24 GB card, one row, against 0022 in the same
+# instrument: the gate projection (Q4_K, N 17,408, K 5,120) 141 us / 355 GB/s (79 % of the
+# card's measured 453 GB/s random-read ceiling) against 170; the Q4_K down projection
+# (N 5,120, K 17,408) 146 against 219; Q5_K 5,120 x 5,120 60 against 137; the Q6_K down
+# projection 397 against 646; the N 1,024 projections 20-33 us. Served (dense Qwen3.8-27B
+# Q4_K_M native, u8 KV): 12.1 t/s decode at 856 prompt tokens against 0.4.0's 9.9, 10.1 at
+# 71.7k against 8.5, Pruefstand 10/10, greedy outputs byte-identical at both depths. DESIGN
+# 7.0.2bc-7.0.2bd.
+#
+# Upstream: not yet filed.
+
+clean test copy written
+--- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
+@@ -1,17 +1,19 @@
+-// arcint (patches 0021/0022): fully connected over GGUF K-quant weights, decoded in the inner loop.
+-// One LANE per output column: each lane walks its own row's super-blocks along K and decodes
+-// one 32-value sub-block at a time into registers. Weights stay in their file layout
+-// (KQ_ROW_BYTES per row); nothing is unpacked outside this kernel.
++// arcint (patches 0021-0023): fully connected over GGUF K-quant weights, decoded in the inner
++// loop. Weights stay in their file layout (KQ_ROW_BYTES per row); nothing is unpacked outside
++// this kernel.
+ //
+ // Two variants are compiled from this source and chosen at dispatch by the row count (host
+ // side):
+-//   TILE_M == 1 (decode): the weights are the whole stream. K is split over the KQ_WG
+-//   subgroups of a work-group (reduced through local memory), KQ_WG sized by the host so a
+-//   launch fills the card whatever the projection's width. On Xe2 each lane decodes its
+-//   sub-block and multiplies it with the one activation row on the vector unit (the same
+-//   address in every lane, one broadcast read); on Xe-HPG it packs the sub-block for the
+-//   one-row matrix multiply instead (kquant_utils.cl), which is cheap there and not on Xe2
+-//   (measured both ways, DESIGN 7.0.2az).
++//   TILE_M == 1 (decode): the weights are the whole stream, read in llama.cpp's shape
++//   (DESIGN 7.0.2bc): a work-group per KQ_ROWS output rows, KQ_WG subgroups with their
++//   lanes along K, a subgroup taking one super-block per iteration. For Q4_K/Q5_K the
++//   super-block's 128 quant bytes are one sub-group block read (8 bytes per lane) and the
++//   256 activations another (16 per lane), converted once and shared by the KQ_ROWS rows;
++//   the eight scale/min pairs are decoded by lanes 0..7 and broadcast. Q6_K block-reads its
++//   words as dwords and shuffles; Q8_0 reads per lane. f32 accumulation over f16 activations, exact; the subgroups' partials are
++//   reduced through local memory. Four subgroups and four rows (sixteen on the long-K down
++//   projection) were measured best on the 24 GB card; the earlier lane-per-column form
++//   (patch 0022) was 8-27% slower on the same three shapes.
+ //   TILE_M > 1 (prefill): the decoded sub-block, converted to f16, is this lane's column of
+ //   the B operand of the subgroup matrix multiply (XMX, cl_intel_subgroup_matrix_multiply_
+ //   accumulate); the activation rows are the A operand. A work-group of KQ_WG subgroups
+@@ -32,6 +34,7 @@
+ #  define KQ_BLOCK 32
+ #  define KQ_BLOCK_BYTES 34
+ #  define KQ_SUBS 1
++#  define KQ_ROW_STEP 8          // decode: a subgroup takes eight 32-value blocks per step
+ #  define KQ_DECODE(blk, s, y) kq_dec_q8_0(blk, y)
+ #elif KQ_TYPE == 12
+ #  define KQ_BLOCK 256
+@@ -53,6 +56,9 @@
+ #endif
+ 
+ #define KQ_BLOCKS (KQ_K / KQ_BLOCK)
++#ifndef KQ_ROW_STEP
++#  define KQ_ROW_STEP 1
++#endif
+ 
+ // A operand of the f16 matrix multiply: with 16 lanes a lane holds one k per row (short),
+ // with 8 lanes two consecutive k (int). KQ_A_T is the 8-row tile, KQ_A1_T one row.
+@@ -93,8 +99,17 @@
+ #  endif
+ #endif
+ 
++// The decode variant's work-group is KQ_WG subgroups along dimension 0 (one row); the
++// tiled variant's KQ_WG subgroups along dimension 1 (KQ_WG x SIMD columns).
++#if TILE_M == 1
++#  define KQ_WG_X KQ_WG
++#  define KQ_WG_Y 1
++#else
++#  define KQ_WG_X 1
++#  define KQ_WG_Y KQ_WG
++#endif
+ REQD_SUB_GROUP_SIZE(SIMD)
+-__attribute__((reqd_work_group_size(SIMD, KQ_WG, 1)))
++__attribute__((reqd_work_group_size(SIMD * KQ_WG_X, KQ_WG_Y, 1)))
+ KERNEL(fully_connected_gpu_kquant)(
+     OPTIONAL_SHAPE_INFO_ARG
+     const __global INPUT0_TYPE* input,
+@@ -108,8 +123,13 @@
+ #endif
+ )
+ {
++#if TILE_M == 1
++    const uint lane = get_sub_group_local_id();
++    const uint sg = get_sub_group_id();
++#else
+     const uint lane = get_local_id(0);
+     const uint sg = get_local_id(1);
++#endif
+     const uint tile = get_global_id(2);
+ #if OUTPUT_3D
+     const uint rows_per_batch = INPUT0_FEATURE_NUM;
+@@ -122,64 +142,95 @@
+         return;
+ 
+ #if TILE_M == 1
+-    const uint n = get_global_id(0);       // lane = output column; the work-group's subgroups split K
+-    const uint nn = min(n, (uint)KQ_N - 1);
++    // Decode in llama.cpp's shape (kquant_utils.cl, the kq_row_* pieces): this work-group is
++    // output rows n0 .. n0 + KQ_ROWS - 1, its KQ_WG subgroups walk the super-blocks in turn.
++    const uint n0 = get_group_id(1) * KQ_ROWS;
+ #if OUTPUT_3D
+     const uint ibase = INPUT0_GET_INDEX(r0 / rows_per_batch, r0 % rows_per_batch, 0, 0);
+ #else
+     const uint ibase = INPUT0_GET_INDEX(r0, 0, 0, 0);
+ #endif
+-    const __global uchar* wrow = weights + (ulong)nn * KQ_ROW_BYTES;
+-    // The work-group's KQ_WG subgroups split the row's super-blocks (the host sizes KQ_WG by
+-    // N so a launch fills the card: a narrow projection gets more subgroups per column,
+-    // measured). The split stays at super-block granularity: the eight sub-blocks of one
+-    // super-block are one unrolled body whose loads the compiler hoists together; a
+-    // sub-block-granular split serialised them (measured, 1.6x slower on both cards).
+-    const uint kb0 = (sg * KQ_BLOCKS) / KQ_WG, kb1 = ((sg + 1) * KQ_BLOCKS) / KQ_WG;
+-    float acc = 0.0f;
+-    for (uint kb = kb0; kb < kb1; ++kb) {
+-        const __global uchar* blk = wrow + kb * KQ_BLOCK_BYTES;
+-        __attribute__((opencl_unroll_hint(KQ_SUBS)))
+-        for (uint s = 0; s < KQ_SUBS; ++s) {
+-        const __global INPUT0_TYPE* x = input + ibase + kb * KQ_BLOCK + s * 32;
+-#if SIMD == 8
+-        // Xe-HPG: the one-row matrix multiply is cheap (measured 3x over the fused path on
+-        // the 16 GiB card); the sub-block is packed, not decoded.
+-        int8 b0, b1; float2 dl, mo;
+-        KQ_PACK(blk, s, &b0, &b1, &dl, &mo);
+-        const KQ_A1_T a0 = KQ_A1_READ(x);
+-        const KQ_A1_T a1 = KQ_A1_READ(x + 16);
+-        const float S0 = KQ_MAD(a0, b0, 0.0f), X0 = KQ_MAD(a0, KQ_ONES8, 0.0f);
+-        const float S1 = KQ_MAD(a1, b1, 0.0f), X1 = KQ_MAD(a1, KQ_ONES8, 0.0f);
+-        acc += (dl.s0 * S0 - mo.s0 * X0) + (dl.s1 * S1 - mo.s1 * X1);
+-#else
+-        // Xe2: a one-row matrix multiply occupies the systolic array like an eight-row one
+-        // (measured 46 cycles, 3x a lane's fused multiply-adds for the same 16 values); the
+-        // sub-block is decoded and multiplied on the vector unit, the activation address the
+-        // same in every lane (one broadcast read).
+-        float y[32];
+-        KQ_DECODE(blk, s, y);
+-        const float16 ya = vload16(0, y);
+-        const float16 yb = vload16(0, y + 16);
+-        const float16 fa = convert_float16(vload16(0, x));
+-        const float16 fb = convert_float16(vload16(0, x + 16));
+-        const float16 p = fma(fa, ya, fb * yb);
+-        const float8 p8 = p.lo + p.hi;
+-        const float4 p4 = p8.lo + p8.hi;
+-        acc += (p4.s0 + p4.s1) + (p4.s2 + p4.s3);
++    const __global INPUT0_TYPE* xrow = input + ibase;
++#if KQ_WG > 1
++    __local float red[KQ_ROWS][KQ_WG];
++#else
++    float red[KQ_ROWS][1];
+ #endif
++    float acc[KQ_ROWS];
++    __attribute__((opencl_unroll_hint(KQ_ROWS)))
++    for (uint rr = 0; rr < KQ_ROWS; ++rr) acc[rr] = 0.0f;
++    // Super-blocks outer, rows inner: the activation super-block is read once and shared by
++    // the rows. KQ_STEP super-blocks per subgroup per iteration, unconditionally loaded (the
++    // index clamped, the contribution masked); 1 measured faster than 2 and 4, and the form
++    // is kept as measured (the same loop without the clamp and mask compiled 20% slower).
++#ifndef KQ_STEP
++#  define KQ_STEP 1
++#endif
++    for (uint kb0 = sg * KQ_ROW_STEP * KQ_STEP; kb0 < KQ_BLOCKS; kb0 += KQ_WG * KQ_ROW_STEP * KQ_STEP) {
++        __attribute__((opencl_unroll_hint(KQ_STEP)))
++        for (uint u = 0; u < KQ_STEP; ++u) {
++            const uint kbr = kb0 + u * KQ_ROW_STEP;
++            const float mask = kbr < KQ_BLOCKS ? 1.0f : 0.0f;
++            const uint kb = min(kbr, (uint)KQ_BLOCKS - 1);
++            const __global INPUT0_TYPE* xsb = xrow + kb * KQ_BLOCK;
++#if KQ_TYPE == 12 || KQ_TYPE == 13
++            const float16 x = convert_float16(as_half16(intel_sub_group_block_read_us16((const __global ushort*)xsb)));
++            float8 xp;
++            __attribute__((opencl_unroll_hint(8)))
++            for (uint s = 0; s < 8; ++s) xp[s] = x[2 * s] + x[2 * s + 1];
++#elif KQ_TYPE == 14
++            // the two 128-value halves as dwords: lane l gets run r's positions 2l, 2l + 1
++            const uint4 xa = intel_sub_group_block_read4((const __global uint*)xsb);
++            const uint4 xb = intel_sub_group_block_read4((const __global uint*)(xsb + 128));
++            const float16 x = (float16)(convert_float8(as_half8(xa)), convert_float8(as_half8(xb)));
++#endif
++            __attribute__((opencl_unroll_hint(KQ_ROWS)))
++            for (uint rr = 0; rr < KQ_ROWS; ++rr) {
++                const __global uchar* blk = weights + (ulong)min(n0 + rr, (uint)KQ_N - 1) * KQ_ROW_BYTES + kb * KQ_BLOCK_BYTES;
++#if KQ_TYPE == 14 && KQ_PREFETCH
++                // Q6_K on Xe2: this subgroup's next super-block of the row prefetched, one cache
++                // line per lane. Measured: the Q6_K down projection 500 -> 398 us on the 24 GB
++                // card; the Q4_K/Q5_K shapes lose 15-45 % with the same prefetch and do not get
++                // it, and the 16 GiB card (Xe-HPG) loses 12 % on Q6_K and does not get it.
++                {
++                    const uint kbn = kb + KQ_WG * KQ_ROW_STEP * KQ_STEP;
++                    if (kbn < KQ_BLOCKS && lane < (KQ_BLOCK_BYTES + 63) / 64)
++                        prefetch(blk + (kbn - kb) * KQ_BLOCK_BYTES + lane * 64, 64);
++                }
++#endif
++#if KQ_TYPE == 12
++                acc[rr] = fma(mask, kq_row_q4k_x(blk, lane, x, xp, 0u), acc[rr]);
++#elif KQ_TYPE == 13
++                acc[rr] = fma(mask, kq_row_q4k_x(blk, lane, x, xp, 1u), acc[rr]);
++#elif KQ_TYPE == 14
++                acc[rr] = fma(mask, kq_row_q6k_x(blk, lane, x), acc[rr]);
++#else
++                if (kb + (lane >> 1) < KQ_BLOCKS) acc[rr] = fma(mask, kq_row_q8_0_piece(blk, lane, xsb), acc[rr]);
++#endif
++            }
+         }
+     }
+-#  if KQ_WG > 1
+-    __local float red[KQ_WG][SIMD];
+-    red[sg][lane] = acc;
++    __attribute__((opencl_unroll_hint(KQ_ROWS)))
++    for (uint rr = 0; rr < KQ_ROWS; ++rr) {
++        const float a = sub_group_reduce_add(acc[rr]);
++#if KQ_WG > 1
++        if (lane == 0) red[rr][sg] = a;
++#else
++        red[rr][0] = a;
++#endif
++    }
++#if KQ_WG > 1
+     barrier(CLK_LOCAL_MEM_FENCE);
+     if (sg != 0)
+         return;
+-    for (uint j = 1; j < KQ_WG; ++j) acc += red[j][lane];
+-#  endif
++#endif
++    // lane rr writes row n0 + rr
++    if (lane >= KQ_ROWS || n0 + lane >= KQ_N)
++        return;
++    const uint n = n0 + lane;
+     float sums[1];
+-    sums[0] = acc;
++    sums[0] = 0.0f;
++    for (uint j = 0; j < KQ_WG; ++j) sums[0] += red[lane][j];
+ #else
+     const uint n = (get_group_id(0) * KQ_WG + sg) * SIMD + lane;   // lane = output column; the work-group's subgroups take KQ_WG x SIMD columns
+     const uint nn = min(n, (uint)KQ_N - 1);
+@@ -247,8 +298,10 @@
+         for (uint t = 0; t < 8; ++t) sums[g * 8 + t] = acc[g][t];
+ #endif
+ 
++#if TILE_M > 1
+     if (n >= KQ_N)
+         return;
++#endif
+     __attribute__((opencl_unroll_hint(TILE_M)))
+     for (uint t = 0; t < TILE_M; ++t) {
+         const uint r = r0 + t;
+--- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/include/batch_headers/kquant_utils.cl
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/include/batch_headers/kquant_utils.cl
+@@ -202,3 +202,113 @@
+     *b0 = (int8)(p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+     *b1 = (int8)(p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+ }
++
++// ---- the decode variant in llama.cpp's shape (patch 0023, DESIGN 7.0.2bc) ----
++//
++// A subgroup takes one super-block per iteration, its sixteen lanes along K. Q4_K/Q5_K
++// (kq_row_q4k_x): lane l holds, in every one of the eight sub-blocks, the values at
++// positions l and l + 16 -- the 128 quant bytes are one intel_sub_group_block_read_uc8
++// (lane l gets bytes l + 16 i, i < 8: sub-block pair i / 2, position 16 (i % 2) + l, low
++// nibble the even sub-block, high nibble the odd one), the 256 activations one
++// block_read_us16 (lane l gets x[l + 16 t]: sub-block t / 2, position 16 (t % 2) + l),
++// loaded once per super-block by the kernel and shared by its rows. The eight scale/min
++// pairs are decoded by lanes 0..7, one each, and broadcast; the min term is the pair sums
++// times the mins. Q6_K (kq_row_q6k_x): dword block reads and a shuffle, below. Q8_0
++// (kq_row_q8_0_piece): lane l reads its own bytes and activations. f32 accumulation over f16 activations,
++// exact, no activation quantisation.
++
++// Q8_0: a subgroup takes eight 32-value blocks (256 values, 272 bytes); lane l takes half a
++// block: block l / 2, values 16 (l % 2) .. +16.
++inline float kq_row_q8_0_piece(const __global uchar* blk8, uint lane, const __global half* xsb) {
++    const __global uchar* b = blk8 + (lane >> 1) * 34;
++    const float d = kq_f16at(b);
++    const ushort8 q = vload8(0, (const __global ushort*)(b + 2 + (lane & 1) * 16));
++    const float16 x = convert_float16(vload16(0, xsb + (lane >> 1) * 32 + (lane & 1) * 16));
++    float acc = 0.0f;
++    __attribute__((opencl_unroll_hint(8)))
++    for (int i = 0; i < 8; ++i) {
++        const int q0 = (int)(char)(q[i] & 0xFFu), q1 = (int)(char)(q[i] >> 8);
++        acc = fma(x[2 * i], (float)q0, acc);
++        acc = fma(x[2 * i + 1], (float)q1, acc);
++    }
++    return d * acc;
++}
++
++#pragma OPENCL EXTENSION cl_intel_subgroups : enable
++#pragma OPENCL EXTENSION cl_intel_subgroups_char : enable
++#pragma OPENCL EXTENSION cl_intel_subgroups_short : enable
++// ---- v18: the activation super-block is loaded once per work-group iteration (block read,
++// converted once, pair sums once) and shared by the KQ_ROWS rows; the eight scale/min
++// pairs of a row's super-block are decoded by lanes 0..7 (one pair each) and broadcast.
++inline float kq_row_q4k_x(const __global uchar* blk, uint lane, float16 x, float8 xp, uint fifth) {
++    const uint4 h = vload4(0, (const __global uint*)blk);
++    const float d = kq_f16bits(h.s0), dmin = kq_f16bits(h.s0 >> 16);
++    uint sc = 0, mn = 0;
++    if (lane < 8) kq_scale_min_k4(lane, h.s1, h.s2, h.s3, &sc, &mn);
++    const float dl_me = d * (float)sc, ml_me = dmin * (float)mn;
++    const uchar8 q = intel_sub_group_block_read_uc8(blk + (fifth ? 48 : 16));
++    uchar2 qh = (uchar2)(0, 0);
++    if (fifth) qh = intel_sub_group_block_read_uc2(blk + 16);
++    float acc = 0.0f;
++    __attribute__((opencl_unroll_hint(8)))
++    for (uint i = 0; i < 8; ++i) {
++        const uint P = i >> 1, m = i & 1;
++        const uint lo = q[i] & 0xFu, hi = q[i] >> 4;
++        uint f_lo = 0, f_hi = 0;
++        if (fifth) { f_lo = ((qh[m] >> (2 * P)) & 1u) << 4; f_hi = ((qh[m] >> (2 * P + 1)) & 1u) << 4; }
++        acc = fma(x[4 * P + m],     sub_group_broadcast(dl_me, 2 * P)     * (float)(lo | f_lo), acc);
++        acc = fma(x[4 * P + 2 + m], sub_group_broadcast(dl_me, 2 * P + 1) * (float)(hi | f_hi), acc);
++    }
++    __attribute__((opencl_unroll_hint(8)))
++    for (uint s = 0; s < 8; ++s) acc = fma(-sub_group_broadcast(ml_me, s), xp[s], acc);
++    return acc;
++}
++
++// Q6_K in the block-read shape: lane l holds, in each of the eight 32-value runs, the values
++// at positions 2l and 2l + 1 -- the activations of a 128-value half are one block_read4
++// (lane l gets dwords l + 16 r: run r, positions 2l, 2l + 1). The 210-byte blocks are only
++// 2-aligned and a block read needs a dword address (measured: a 16-bit block read two bytes
++// off returns the neighbour's word on every lane but the first), so the 128 ql bytes and the
++// 64 qh bytes are block-read as dwords from the dword at or below the block (two reads per
++// row) and each lane takes its word from the lane that holds it with one shuffle; the one
++// word an odd block's last lane needs past those reads is a uniform load. The sixteen
++// scales are one uniform load, each lane selecting its byte. No min.
++inline float kq_row_q6k_x(const __global uchar* blk, uint lane, float16 x) {
++    const uint odd = ((uint)(ulong)blk >> 1) & 1u;          // the block starts two bytes past a dword
++    const __global uchar* b4 = blk - 2 * odd;
++    const float d = kq_f16at(blk + 208);
++    const uint w = lane + odd, src = w >> 1, hi = (w & 1) * 16;   // this lane's word, in words from b4
++    const uint2 dq = intel_sub_group_block_read2((const __global uint*)b4);          // ql: lane l holds dwords l and 16 + l
++    const uint dh = intel_sub_group_block_read((const __global uint*)(b4 + 128));    // qh: lane l holds dword 32 + l
++    const uint tail = (uint)*(const __global ushort*)(blk + 190);                    // qh's last word (dword 48 for an odd block)
++    const ushort8 sw = vload8(0, (const __global ushort*)(blk + 192));               // the 16 scale bytes
++    float acc = 0.0f;
++    __attribute__((opencl_unroll_hint(2)))
++    for (uint h = 0; h < 2; ++h) {
++        const uint qlh = h == 0 ? dq.s0 : dq.s1;                                       // ql half h: dwords 16h .. 16h+15
++        const uint g0 = intel_sub_group_shuffle(qlh, src) >> hi;                       // values 0..31 of the half: word 32h + w
++        const uint g1a = intel_sub_group_shuffle(qlh, (8 + src) & 15u);                // values 32..63: word 32h + 16 + w
++        const uint g1b = intel_sub_group_shuffle(h == 0 ? dq.s1 : dh, 0u);             //   (the lane past the half: the next read's first dword)
++        const uint g1 = (src < 8 ? g1a : g1b) >> hi;
++        const uint qa = intel_sub_group_shuffle(dh, (8 * h + src) & 15u);              // qh half h: word 64 + 16h + w
++        const uint qw = ((h == 1 && src == 8) ? tail : qa) >> hi;
++        const ushort sv0 = sw[4 * h], sv1 = sw[4 * h + 1], sv2 = sw[4 * h + 2], sv3 = sw[4 * h + 3];   // scale pairs of runs 0..3
++        const float s0 = d * (float)(lane < 8 ? (char)(sv0 & 0xFFu) : (char)(sv0 >> 8));
++        const float s1 = d * (float)(lane < 8 ? (char)(sv1 & 0xFFu) : (char)(sv1 >> 8));
++        const float s2 = d * (float)(lane < 8 ? (char)(sv2 & 0xFFu) : (char)(sv2 >> 8));
++        const float s3 = d * (float)(lane < 8 ? (char)(sv3 & 0xFFu) : (char)(sv3 >> 8));
++        __attribute__((opencl_unroll_hint(2)))
++        for (uint b = 0; b < 2; ++b) {
++            const uint q0b = (g0 >> (8 * b)) & 0xFFu, q1b = (g1 >> (8 * b)) & 0xFFu, qhb = (qw >> (8 * b)) & 0xFFu;
++            const int v0 = (int)((q0b & 0xFu) | ((qhb & 3u) << 4)) - 32;          // run 0
++            const int v1 = (int)((q1b & 0xFu) | (((qhb >> 2) & 3u) << 4)) - 32;   // run 1
++            const int v2 = (int)((q0b >> 4) | (((qhb >> 4) & 3u) << 4)) - 32;     // run 2
++            const int v3 = (int)((q1b >> 4) | (((qhb >> 6) & 3u) << 4)) - 32;     // run 3
++            acc = fma(x[8 * h + b],     s0 * (float)v0, acc);
++            acc = fma(x[8 * h + 2 + b], s1 * (float)v1, acc);
++            acc = fma(x[8 * h + 4 + b], s2 * (float)v2, acc);
++            acc = fma(x[8 * h + 6 + b], s3 * (float)v3, acc);
++        }
++    }
++    return acc;
++}
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_kquant.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_kquant.cpp
+@@ -14,31 +14,25 @@
+ // sub-block, the activations and four partial sums per row all live in registers).
+ static constexpr size_t kTileMGemm = 32;
+ static constexpr size_t kColumnGroups = 8; // subgroups per work-group sharing the staged activation tile (prefill)
+-// Decode: subgroups per work-group splitting a column's super-blocks, sized so a launch has
+-// about kDecodeThreads subgroups whatever the projection's width (a narrow projection at a
+-// fixed split of four ran at a fraction of the card, measured), within the work-group
+-// limit and the row's super-block count (the split stays at super-block granularity, see
+-// the kernel).
+-static constexpr size_t kMaxSubgroups = 64;
+-// Xe2 hides the loads with about four subgroups per column of the widest projection (eight
+-// ran slower, measured); Xe-HPG, with four times the thread slots, wants twice the count.
+-static size_t decode_threads_of(const fully_connected_params& params) {
+-    return params.engineInfo.arch >= gpu_arch::xe2 ? 4096 : 8192;
+-}
+-
+ static size_t tile_m_of(int kernel_number) { return kernel_number == 0 ? 1 : kTileMGemm; }
+ // Both variants multiply on the matrix unit or read the activations as its A operand: the
+ // subgroup is its N, 16 on Xe2 and later, 8 before.
+-static size_t simd_of(const fully_connected_params& params) {
++static size_t simd_of(const fully_connected_params& params, int kernel_number) {
++    // The decode variant runs on the vector unit: subgroup 16 everywhere. The tiled variant
++    // multiplies on the matrix unit: its N, 16 on Xe2 and later, 8 before.
++    if (kernel_number == 0) return kSimd;
+     return params.engineInfo.arch >= gpu_arch::xe2 ? kSimd : 8;
+ }
+-static size_t wg_of(const fully_connected_params& params, int kernel_number) {
+-    if (kernel_number != 0) return kColumnGroups;
+-    const size_t columns = CeilDiv(params.kquant_n, simd_of(params));
+-    const size_t blocks = params.kquant_k / (params.kquant_type == 8 ? 32 : 256);  // super-blocks per row
+-    size_t wg = CeilDiv(decode_threads_of(params), std::max<size_t>(columns, 1));
+-    wg = std::min({wg, kMaxSubgroups, std::max<size_t>(blocks, 1)});
+-    return std::max<size_t>(wg, 1);
++// Decode (kernel 0): a work-group per group of output rows, kRowSubgroups subgroups with
++// their lanes along K -- llama.cpp's shape (DESIGN 7.0.2bc). Measured on the 24 GB card:
++// four subgroups beat eight and two; the K = 17,408 down projection wants the activation
++// block shared by 16 rows, the K = 5,120 shapes want the work-group count of 4 rows.
++static constexpr size_t kRowSubgroups = 4;
++static size_t rows_per_group(const fully_connected_params& params) {
++    return params.kquant_k > 8192 ? 16 : 4;
++}
++static size_t wg_of(const fully_connected_params&, int kernel_number) {
++    return kernel_number == 0 ? kRowSubgroups : kColumnGroups;
+ }
+ 
+ // Rows of the activation: flattened [M, K] (batch) or [B, M, K] (batch x feature).
+@@ -85,6 +79,7 @@
+ DeviceFeaturesKey FullyConnected_kquant::get_required_device_features_key(const Params& params) const {
+     auto k = get_common_subgroups_device_features_key(params);
+     k.requires_blocked_read_write_short();  // block reads of the activation rows
++    k.requires_subgroup_reduce();
+     return k;
+ }
+ 
+@@ -120,16 +115,19 @@
+     DispatchData d;
+     d.tile_m = static_cast<uint32_t>(tile_m_of(kernel_number));
+     d.tile_n = static_cast<uint32_t>(wg_of(params, kernel_number));  // subgroups per work-group, not a column tile
+-    d.tile_mk = static_cast<uint32_t>(simd_of(params));  // the subgroup size
++    d.tile_mk = static_cast<uint32_t>(simd_of(params, kernel_number));  // the subgroup size
+     const size_t n = params.kquant_n;
+     const size_t rows = rows_of(params);
+-    // A lane per output column, a work-group of ksplit subgroups per subgroup of columns, a
+-    // work-group per tile of rows.
+-    if (kernel_number == 0)
+-        d.gws = { Align(n, d.tile_mk), d.tile_n, CeilDiv(rows, d.tile_m) };
+-    else
++    // Decode: a work-group of kRowSubgroups subgroups per rows_per_group output rows. Tiled:
++    // a lane per output column, a work-group of kColumnGroups subgroups sharing the staged
++    // activation tile, a work-group per tile of rows.
++    if (kernel_number == 0) {
++        d.gws = { d.tile_mk * d.tile_n, CeilDiv(n, rows_per_group(params)), CeilDiv(rows, d.tile_m) };
++        d.lws = { d.tile_mk * d.tile_n, 1, 1 };
++    } else {
+         d.gws = { CeilDiv(n, d.tile_mk * d.tile_n) * d.tile_mk, d.tile_n, CeilDiv(rows, d.tile_m) };
+-    d.lws = { d.tile_mk, d.tile_n, 1 };
++        d.lws = { d.tile_mk, d.tile_n, 1 };
++    }
+     return d;
+ }
+ 
+@@ -147,6 +145,9 @@
+     jit.AddConstant(MakeJitConstant("TILE_M", static_cast<size_t>(dispatchData.tile_m)));
+     jit.AddConstant(MakeJitConstant("KQ_WG", static_cast<size_t>(dispatchData.tile_n)));
+     jit.AddConstant(MakeJitConstant("SIMD", static_cast<size_t>(dispatchData.tile_mk)));
++    jit.AddConstant(MakeJitConstant("KQ_ROWS", rows_per_group(params)));
++    // Q6_K prefetches its next super-block on Xe2 only (measured both ways, DESIGN 7.0.2bd).
++    jit.AddConstant(MakeJitConstant("KQ_PREFETCH", params.engineInfo.arch >= gpu_arch::xe2 ? 1 : 0));
+     const bool out3d = params.outputs[0].GetLayout() == DataLayout::bfyx;
+     if (out3d)
+         jit.AddConstant(MakeJitConstant("OUTPUT_3D", true));
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/fully_connected_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/fully_connected_gpu_test.cpp
+@@ -6702,7 +6702,7 @@
+     ::testing::Values(std::make_tuple(12, 1L, false, 512, 48), std::make_tuple(12, 37L, false, 512, 48),
+                       std::make_tuple(12, 5L, true, 512, 48), std::make_tuple(13, 3L, false, 512, 48),
+                       std::make_tuple(14, 1L, false, 512, 48), std::make_tuple(14, 19L, true, 512, 48),
+-                      std::make_tuple(8, 2L, false, 512, 48),
++                      std::make_tuple(8, 2L, false, 512, 48), std::make_tuple(8, 1L, false, 512, 48), std::make_tuple(13, 1L, false, 768, 48),
+                       std::make_tuple(12, 100L, true, 1280, 300), std::make_tuple(14, 65L, false, 256, 17),
+                       std::make_tuple(8, 1L, false, 96, 5), std::make_tuple(13, 33L, true, 768, 64)));
+ 
+@@ -6729,38 +6729,56 @@
+ 
+ // Timing at the dense model's gate projection shape, both kernels (run by name; prints KQPERF lines).
+ TEST(fully_connected_gpu_kquant_perf, DISABLED_dense_shapes_q4k) {
++    // Streams: eight independent weight buffers in rotation on one queue, so no launch
++    // finds its rows in the 18 MB L2 (ten launches of ONE buffer let a third of it hit,
++    // which overstated every launch figure before this test was corrected; and eight
++    // networks on their own streams overlapped their launches -- DESIGN 7.0.2bb).
+     tests::random_generator rg(GET_SUITE_NAME);
+     auto& engine = get_test_engine();
+-    const int t = 12;
+-    // (N, K, rows): the gate projection at four row counts, then the value projection and the
+-    // down projection at one row (narrow and deep: the decode split's two other regimes).
+-    const std::vector<std::tuple<size_t, size_t, std::vector<long>>> shapes = {
+-        {17408, 5120, {1L, 32L, 256L, 2048L}}, {1024, 5120, {1L}}, {5120, 17408, {1L}}};
++    // The dense model's own tensor types at their shapes (Q4_K_M: gate/up and q/k/v Q4_K,
++    // the attention output Q5_K, the down projection Q6_K).
++    const std::vector<std::tuple<int, size_t, size_t, std::vector<long>>> shapes = {
++        {12, 17408, 5120, {1L, 32L, 256L, 2048L}}, {12, 1024, 5120, {1L}}, {12, 5120, 5120, {1L}}, {12, 5120, 17408, {1L}},
++        {13, 5120, 5120, {1L}}, {14, 5120, 17408, {1L}}, {14, 1024, 5120, {1L}}};
++    const int rotation = 8;
+     for (const auto& sh : shapes) {
+-    const size_t N = std::get<0>(sh), K = std::get<1>(sh);
++    const int t = std::get<0>(sh);
++    const size_t N = std::get<1>(sh), K = std::get<2>(sh);
+     const size_t rb = kq_host::row_bytes(t, K);
+-    auto wbytes = rg.generate_random_1d<uint8_t>(N * rb, 0, 255);
+-    auto weights_mem = engine.allocate_memory({ { (long)N, (long)rb }, data_types::u8, format::bfyx });
+-    set_values(weights_mem, wbytes);
+-    for (long m : std::get<2>(sh)) {
++    std::vector<memory::ptr> weights_mems;
++    for (int r = 0; r < rotation; ++r) {
++        auto wbytes = rg.generate_random_1d<uint8_t>(N * rb, 0, 255);
++        auto wm = engine.allocate_memory({ { (long)N, (long)rb }, data_types::u8, format::bfyx });
++        set_values(wm, wbytes);
++        weights_mems.push_back(wm);
++    }
++    for (long m : std::get<3>(sh)) {
+         auto xh = rg.generate_random_1d<ov::float16>(m * K, -1.0f, 1.0f);
+         auto input_mem = engine.allocate_memory({ { m, (long)K }, data_types::f16, format::bfyx });
+         set_values(input_mem, xh);
+-        auto fc = fully_connected("fc_kq", input_info("input"), "weights", "", data_types::f16, 2, 2, true);
+-        fc.kquant_type = t; fc.kquant_k = K; fc.kquant_n = N;
+-        topology topology(input_layout("input", layout{ { -1, (long)K }, data_types::f16, format::bfyx }), data("weights", weights_mem), fc);
+-        auto config = get_test_default_config(engine);
+-        config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+-        network net(engine, topology, config);
+-        net.set_input_data("input", input_mem);
+-        net.execute(); net.get_stream().finish();
+-        const int reps = 10;
++        std::vector<std::unique_ptr<network>> nets;
++        for (int r = 0; r < rotation; ++r) {
++            auto fc = fully_connected("fc_kq", input_info("input"), "weights", "", data_types::f16, 2, 2, true);
++            fc.kquant_type = t; fc.kquant_k = K; fc.kquant_n = N;
++            topology topology(input_layout("input", layout{ { -1, (long)K }, data_types::f16, format::bfyx }), data("weights", weights_mems[r]), fc);
++            auto config = get_test_default_config(engine);
++            config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
++            auto prog = program::build_program(engine, topology, config, false, false);
++            nets.push_back(std::make_unique<network>(prog, get_test_stream_ptr(), uint16_t{0}));  // one queue: launches in sequence, as a served step issues them
++            nets.back()->set_input_data("input", input_mem);
++            nets.back()->execute();
++        }
++        get_test_stream().finish();
++        // Steady state before timing: a network's second execution costs about twice its
++        // third and later ones (measured), and a served step is at the later ones.
++        for (int i = 0; i < 2; ++i) for (auto& n : nets) n->execute();
++        get_test_stream().finish();
++        const int reps = 2;
+         auto t0 = std::chrono::steady_clock::now();
+-        for (int i = 0; i < reps; ++i) { net.execute(); }
+-        net.get_stream().finish();
+-        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
+-        std::cout << "KQPERF M=" << m
+-                  << " N=" << N << " K=" << K << " Q4_K: " << us << " us per run, " << (double)(N * rb) / us / 1e3 << " GB/s weights" << std::endl;
++        for (int i = 0; i < reps; ++i) for (auto& n : nets) n->execute();
++        get_test_stream().finish();
++        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / (reps * rotation);
++        std::cout << "KQPERF M=" << m << " N=" << N << " K=" << K << " type " << t << ": " << us << " us per run, " << (double)(N * rb) / us / 1e3 << " GB/s weights (streamed)" << std::endl;
+     }
+     }
+ }

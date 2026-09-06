@@ -1,0 +1,331 @@
+# MoE per-expert prefill fallback: the weight-side answer is three-way, not a false with two meanings
+
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0003-0018 (verified: applies cleanly on the pristine pin with exactly that
+# series applied). Closes the item patch 0018's own header reported as "not fixed,
+# investigated" (arcint DESIGN.md section 7.0.2ae; campaign prefill-fallback-tristate).
+#
+# The defect. Patch 0018 taught exec_prefill_onednn's per-expert loop
+# (moe_3gemm_swiglu_opt.cpp) to read on_load_expert_weights()'s `false` as "this
+# expert is not resident under the static partition: no device slot, run it on
+# the host CPU tier", and the host branch downcasts _weight_provider to
+# OffloadExpertWeightProvider to build the expert descriptor. But the same
+# `false` was also the answer when there is no offload tier at all
+# (`!is_offloaded()`, the ResidentExpertWeightProvider), where every expert's
+# weights ARE on the device and _dnnl_weights[expert_no] is valid as
+# init_dnnl_weights() left it. Before 0018 the return was ignored and the device
+# path always ran; after it, a resident-only load reaching that loop took the
+# host branch for weights that were on the device, through a downcast of the
+# wrong provider type -- undefined behaviour. Reachable only through the
+# top-level dispatch's plain else, i.e. with MOE_USE_GROUPED_GEMM_PREFILL and
+# MOE_USE_MICRO_GEMM_PREFILL both off, which arcint never sets: dormant in every
+# configuration arcint drives, and reported rather than fixed in 0018.
+#
+# The fix. on_load_expert_weights() returns an ExpertWeightsSide:
+#   kDeviceResident  no offload tier; _dnnl_weights[expert_no] valid as initialised
+#   kDeviceAcquired  offload tier; a slot acquired (LRU) or pinned (static partition)
+#   kHostTier        offload tier, static partition, not resident; the host computes it
+# The loop takes the device path for both device answers and the host branch for
+# kHostTier only, with an OPENVINO_ASSERT that the provider is the offload one
+# right before the downcast -- the belt for the case this patch removes.
+#
+# Red first, then green (ov_gpu_unit_tests, this tree, 2026-09-05):
+#   moe_3gemm_prefill_fallback.resident_load_with_grouped_prefill_off_matches_reference
+#   -- a resident load (no offload property), 40 tokens (above the batched-GEMV
+#   threshold of 32), both fast prefill paths forced off through the internal
+#   properties, checked against the suite's own f32 reference. On the 0018 tree
+#   the test FAILED with "Can not open file for mapping": the loop took the host
+#   branch and the misread provider tried to map a weight file that does not
+#   exist -- the misrouting, made visible. With this patch: PASS, and the four
+#   moe_3gemm_static_partition.* cases plus the sixteen smoke/
+#   moe_3gemm_compressed_gpu_random.* accuracy cases pass with it, 21 of 21 on
+#   each of the two cards (the 24 GB and the 16 GiB one), the production units
+#   left running beside the test binary, built and run in the staged 0018
+#   source tree on the dev host (an incremental rebuild of the two files).
+#   Tolerance for the new case is the suite's flat 0.15 plus 1 % of the
+#   reference; the relative term was added after the first green run with the
+#   fix missed the flat bar by 0.006 on one element: 40 tokens of u4 experts
+#   reach |21| where one f16 ULP is 0.016, and a misrouted expert misses by
+#   tens (the red run threw before producing output). The provider-type
+#   assertion sits above the host branch's blocking readbacks, so a wrong
+#   provider fails before any device read.
+#
+# Not run for this patch, on the operator's word (a quick functional test for a
+# small change): the three acceptance cells (tier reference, coder offload one
+# and two lanes) named by the campaign as the no-change proof. The changed
+# branch is not on any path those cells take. Observed and NOT investigated:
+# moe_3gemm_cpu_tier.sentinel_skip_leaves_rows_untouched (patches/0012, one
+# token, batched-GEMV path, untouched here) passes on the 24 GB card and fails
+# on the 16 GiB card beside its resident service with run A's scratch read all
+# zeros; pre-existing to this patch by path, not by measurement on the 0018 tree.
+#
+# Upstream: not yet filed.
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -1340,16 +1340,28 @@
+         needs_fallback = false;
+     }
+ 
+-    // arcint F2 (patch 0018, bug #2 fix). Returns true when `expert_no`'s
+-    // weights are resident on the device after this call (the caller,
+-    // exec_prefill_onednn, may then use the device oneDNN kernels via
+-    // _dnnl_weights[expert_no]) and false when they are not and never will
+-    // be for this call (the static partition has not pinned this expert;
+-    // acquire_one() returned nullopt rather than evicting a pinned slot).
+-    // False is also returned, as before, when OTD is off entirely.
+-    bool on_load_expert_weights(size_t expert_no, typed_primitive_inst<moe_3gemm_fused_compressed>& instance, dnnl::stream& dnn_stream) {
++    // arcint (patch 0019). Where an expert's weights are for one pass of
++    // exec_prefill_onednn's per-expert loop -- three answers, because patch
++    // 0018's single `false` meant two different things (no offload tier at
++    // all, where every expert is resident; and not resident under the
++    // static partition) and its caller took the host path for both, which
++    // on a resident-only load downcast the resident provider to the offload
++    // one (undefined behaviour) for weights that were on the device.
++    enum class ExpertWeightsSide {
++        kDeviceResident,  // no offload tier: _dnnl_weights[expert_no] is valid as init_dnnl_weights() left it
++        kDeviceAcquired,  // offload tier: a device slot acquired (LRU) or pinned (static partition); _dnnl_weights[expert_no] now points at it
++        kHostTier,        // offload tier, static partition, not resident: no device slot; the host CPU tier computes this expert
++    };
++
++    // Returns kDeviceAcquired when `expert_no`'s weights are resident on the
++    // device after this call (the caller may then use the device oneDNN
++    // kernels via _dnnl_weights[expert_no]), kHostTier when they are not and
++    // never will be for this call (the static partition has not pinned this
++    // expert; acquire_one() returned nullopt rather than evicting a pinned
++    // slot), and kDeviceResident when there is no offload tier at all.
++    ExpertWeightsSide on_load_expert_weights(size_t expert_no, typed_primitive_inst<moe_3gemm_fused_compressed>& instance, dnnl::stream& dnn_stream) {
+         if (!_weight_provider->is_offloaded())
+-            return false;
++            return ExpertWeightsSide::kDeviceResident;
+ 
+         dnn_stream.wait();
+ 
+@@ -1357,7 +1369,7 @@
+         auto& dnnl_weights = _dnnl_weights[expert_no];
+         auto acquired = _weight_provider->acquire_one(static_cast<uint32_t>(expert_no), stream);
+         if (!acquired)
+-            return false;
++            return ExpertWeightsSide::kHostTier;
+         auto lru_expert_no = static_cast<int64_t>(*acquired);
+         auto& params = instance._weights;
+ 
+@@ -1380,7 +1392,7 @@
+         CONVERT_DNNL_OTD(up, 1)
+         CONVERT_DNNL_OTD(down, 2)
+ #    undef CONVERT_DNNL_OTD
+-        return true;
++        return ExpertWeightsSide::kDeviceAcquired;
+     }
+ 
+     int get_num_grouped_experts(int num_total_experts) {
+@@ -2924,15 +2936,17 @@
+                 continue;
+             }
+ 
+-            // arcint F2 (patch 0018, bug #2 fix). `resident` is false when
+-            // this expert is not in the static partition's pinned set (or,
+-            // as before this fix, always true when OTD is off or the LRU
+-            // rule is in effect -- see on_load_expert_weights()/
+-            // acquire_one()). Only a resident expert has a device slot to
+-            // read _dnnl_weights[expert_no] from, so get_kernel() and the
+-            // oneDNN device forward() calls below only run in that branch;
+-            // dnnl_weights is only valid to read when resident is true.
+-            const bool resident = on_load_expert_weights(expert_no, instance, dnn_stream);
++            // arcint F2 (patch 0018, bug #2 fix; patch 0019 made the answer
++            // three-way). kHostTier only when this expert is not in the
++            // static partition's pinned set; kDeviceAcquired under the
++            // offload tier otherwise (LRU or pinned); kDeviceResident when
++            // there is no offload tier and every expert's weights are on the
++            // device as init_dnnl_weights() left them. Only kHostTier lacks
++            // a device slot, so get_kernel() and the oneDNN device forward()
++            // calls below run for both device answers; the host branch is
++            // reachable only with the offload provider, which its downcast
++            // relies on.
++            const ExpertWeightsSide side = on_load_expert_weights(expert_no, instance, dnn_stream);
+ 
+             // expert_mask
+             expert_mask_gpu& expert_mask_mem = scratch.expert_masks[expert_no];
+@@ -2956,7 +2970,7 @@
+                                          {1, lws_size},
+                                          instance.needs_completion_event());
+ 
+-            if (resident) {
++            if (side != ExpertWeightsSide::kHostTier) {
+                 auto& dnnl_weights = _dnnl_weights[expert_no];
+                 int64_t routing_weights_size = static_cast<int64_t>(n_token * max_topk);
+                 onednn_kernel& kernel = get_kernel(n_token, static_cast<int>(expert_no), instance);
+@@ -2996,6 +3010,11 @@
+                     perf->cpu_tier_experts.fetch_add(1, std::memory_order_relaxed);
+                     perf->cpu_tier_pairs.fetch_add(static_cast<uint64_t>(n_token), std::memory_order_relaxed);
+                 }
++                // arcint (patch 0019). Before the blocking readbacks below: the
++                // downcast further down is only valid for the offload provider.
++                OPENVINO_ASSERT(_weight_provider->is_offloaded(),
++                                "moe_3gemm: host-tier prefill fallback reached without an offload provider (expert ",
++                                expert_no, ")");
+ 
+                 const size_t hidden = static_cast<size_t>(_hidden_size);
+                 const size_t n_token_sz = static_cast<size_t>(n_token);
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
+@@ -2101,3 +2101,160 @@
+     // unpinned residents at any time.
+     EXPECT_LE(cache.size(), max_total);
+ }
++
++
++// =============================================================================
++// arcint (patch 0019, prefill-fallback-tristate). exec_prefill_onednn on a
++// RESIDENT load (no offload tier) with both fast prefill paths forced off,
++// so the per-expert oneDNN loop is the path taken. Patch 0018 made that loop
++// read on_load_expert_weights()'s `false` as "not resident, route to the
++// host tier" -- but the same `false` was also the answer for "no offload tier
++// at all", where every expert IS resident; the loop then downcast the
++// resident provider to the offload one (undefined behaviour) and took the
++// host path for weights that were on the device. Red on that tree: a crash
++// or an output that does not match the reference. Green once the answer is
++// three-way and the loop takes the device path for a resident load.
++// =============================================================================
++TEST(moe_3gemm_prefill_fallback, resident_load_with_grouped_prefill_off_matches_reference) {
++    auto& engine = get_test_engine();
++    if (!engine.get_device_info().supports_immad) {
++        GTEST_SKIP() << "No immad support";
++    }
++
++    tests::random_generator rg(GET_SUITE_NAME);
++    Moe3GemmConfig config;
++    config.batch_size = 1;
++    config.seq_len = 40;  // above the batched-GEMV threshold (32): a prefill, not a decode step
++    config.hidden_size = 128;
++    config.inter_size = 256;
++    config.num_experts = 4;
++    config.top_k = 2;
++    config.group_size = 128;
++    config.is_u4 = true;
++
++    Moe3GemmReference ref(config, rg);
++
++    auto hidden_states = rg.generate_random_1d<ov::float16>(config.batch_size * config.seq_len * config.hidden_size, -1.0f, 1.0f, 1000);
++    auto routing_weights = rg.generate_random_1d<ov::float16>(config.batch_size * config.seq_len * config.num_experts, 0.0f, 1.0f, 1000);
++    auto w0_data = rg.generate_random_1d<float>(config.num_experts * config.hidden_size * config.inter_size, -1.0f, 0.0f, 1000);
++    auto w1_data = rg.generate_random_1d<float>(config.num_experts * config.hidden_size * config.inter_size, -1.0f, 0.0f, 1000);
++    auto w2_data = rg.generate_random_1d<float>(config.num_experts * config.inter_size * config.hidden_size, -1.0f, 0.0f, 1000);
++    for (size_t i = 0; i < config.num_experts * config.hidden_size * config.inter_size; ++i) {
++        w0_data[i] /= 7.0f;
++        w1_data[i] /= 11.0f;
++        w2_data[i] /= 7.0f;
++    }
++    auto [w0_q, w0_scale, w0_zp] = ref.quantize(w0_data, config.num_experts, config.hidden_size, config.inter_size, config.group_size);
++    auto [w1_q, w1_scale, w1_zp] = ref.quantize(w1_data, config.num_experts, config.hidden_size, config.inter_size, config.group_size);
++    auto [w2_q, w2_scale, w2_zp] = ref.quantize(w2_data, config.num_experts, config.inter_size, config.hidden_size, config.group_size);
++    auto w0_q_packed = ref.pack(w0_q);
++    auto w0_zp_packed = ref.pack(w0_zp);
++    auto w1_q_packed = ref.pack(w1_q);
++    auto w1_zp_packed = ref.pack(w1_zp);
++    auto w2_q_packed = ref.pack(w2_q);
++    auto w2_zp_packed = ref.pack(w2_zp);
++
++    auto create_weight_tensor = [&](const std::vector<uint8_t>& values, int64_t b, int64_t f, int64_t y, int64_t x) {
++        auto mem = engine.allocate_memory({data_types::u4, format::bfyx, {b, f, y, x}});
++        set_values(mem, values);
++        get_test_stream().finish();
++        return mem;
++    };
++    auto create_f16_tensor_3d = [&](const std::vector<ov::float16>& values, int64_t d0, int64_t d1, int64_t d2) {
++        auto mem = engine.allocate_memory(layout{ov::PartialShape{d0, d1, d2}, data_types::f16, format::bfyx});
++        set_values(mem, values);
++        get_test_stream().finish();
++        return mem;
++    };
++    auto make_scale = [&](const std::vector<ov::float16>& v, int64_t E, int64_t ofm, int64_t G) {
++        auto fmt = G > 1 ? format::byfx : format::bfyx;
++        auto shape = G > 1 ? ov::PartialShape{E, ofm, G, 1} : ov::PartialShape{E, ofm, 1};
++        auto mem = engine.allocate_memory(layout{shape, data_types::f16, fmt});
++        set_values(mem, v);
++        get_test_stream().finish();
++        return mem;
++    };
++    auto make_zp = [&](const std::vector<uint8_t>& v, int64_t E, int64_t ofm, int64_t G) {
++        auto fmt = G > 1 ? format::byfx : format::bfyx;
++        auto shape = G > 1 ? ov::PartialShape{E, ofm, G, 1} : ov::PartialShape{E, ofm, 1};
++        auto mem = engine.allocate_memory(layout{shape, data_types::u4, fmt});
++        set_values(mem, v);
++        get_test_stream().finish();
++        return mem;
++    };
++
++    size_t group_num = config.hidden_size / config.group_size;
++    size_t group_num2 = config.inter_size / config.group_size;
++    auto hidden_states_mem = create_f16_tensor_3d(hidden_states, config.batch_size, config.seq_len, config.hidden_size);
++    auto routing_weights_mem = create_f16_tensor_3d(routing_weights, config.batch_size, config.seq_len, config.num_experts);
++    auto w0_weight_mem = create_weight_tensor(w0_q_packed, config.num_experts, config.inter_size, config.group_size, group_num);
++    auto w0_scale_mem = make_scale(w0_scale, config.num_experts, config.inter_size, group_num);
++    auto w0_zp_mem = make_zp(w0_zp_packed, config.num_experts, config.inter_size, group_num);
++    auto w1_weight_mem = create_weight_tensor(w1_q_packed, config.num_experts, config.inter_size, config.group_size, group_num);
++    auto w1_scale_mem = make_scale(w1_scale, config.num_experts, config.inter_size, group_num);
++    auto w1_zp_mem = make_zp(w1_zp_packed, config.num_experts, config.inter_size, group_num);
++    auto w2_weight_mem = create_weight_tensor(w2_q_packed, config.num_experts, config.hidden_size, config.group_size, group_num2);
++    auto w2_scale_mem = make_scale(w2_scale, config.num_experts, config.hidden_size, group_num2);
++    auto w2_zp_mem = make_zp(w2_zp_packed, config.num_experts, config.hidden_size, group_num2);
++
++    topology topology;
++    topology.add(input_layout("hidden_states", hidden_states_mem->get_layout()));
++    topology.add(input_layout("routing_weights", routing_weights_mem->get_layout()));
++    topology.add(data("w0_weight", w0_weight_mem));
++    topology.add(data("w0_scale", w0_scale_mem));
++    topology.add(data("w0_zp", w0_zp_mem));
++    topology.add(data("w1_weight", w1_weight_mem));
++    topology.add(data("w1_scale", w1_scale_mem));
++    topology.add(data("w1_zp", w1_zp_mem));
++    topology.add(data("w2_weight", w2_weight_mem));
++    topology.add(data("w2_scale", w2_scale_mem));
++    topology.add(data("w2_zp", w2_zp_mem));
++
++    MoERouterFused::Config router_config;
++    router_config.num_expert = config.num_experts;
++    router_config.top_k = config.top_k;
++    topology.add(moe_router_fused("router", {input_info("routing_weights")}, router_config));
++
++    cldnn::MOECompressed::Config moe_config;
++    moe_config.hidden_size = config.hidden_size;
++    moe_config.inter_size = config.inter_size;
++    moe_config.num_expert = config.num_experts;
++    moe_config.top_k = config.top_k;
++    moe_config.group_size = config.group_size;
++    moe_config.out_type = data_types::f16;
++    moe_config.has_zp = true;
++    std::vector<input_info> moe_inputs{input_info("hidden_states"), input_info("router", 0), input_info("router", 1),
++                                       input_info("w0_weight"), input_info("w0_scale"), input_info("w0_zp"),
++                                       input_info("w1_weight"), input_info("w1_scale"), input_info("w1_zp"),
++                                       input_info("w2_weight"), input_info("w2_scale"), input_info("w2_zp")};
++    topology.add(moe_3gemm_fused_compressed("moe_3gemm_fused_compressed", moe_inputs, moe_config));
++
++    auto net_config = get_test_default_config(engine);
++    net_config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
++    // Both fast prefill paths off: the top-level dispatch's plain else, i.e.
++    // exec_prefill_onednn, is what runs for these 40 tokens. No offload
++    // property is set, so the provider is the resident one.
++    net_config.set_property(ov::intel_gpu::moe_use_grouped_gemm_prefill(false));
++    net_config.set_property(ov::intel_gpu::moe_use_micro_gemm_prefill(false));
++    network network(engine, topology, net_config);
++    network.set_input_data("hidden_states", hidden_states_mem);
++    network.set_input_data("routing_weights", routing_weights_mem);
++
++    auto outputs = network.execute();
++    auto output_prim = outputs.begin()->second.get_memory();
++    get_test_stream().flush();
++    cldnn::mem_lock<ov::float16, mem_lock_type::read> output_ptr(output_prim, get_test_stream());
++
++    auto ref_output = ref.run_reference_softmax(hidden_states, routing_weights, w0_data, w1_data, w2_data);
++    // The accuracy suite's flat 0.15 plus 1 % of the reference. The relative
++    // term was added after the first green run with the fix missed the flat
++    // bar by 0.006 on one element: 40 tokens of u4 experts reach |21| here,
++    // where one f16 ULP is already 0.016 (a misrouted expert misses by tens,
++    // not hundredths -- the red run threw before producing any output).
++    ASSERT_EQ(output_prim->count(), ref_output.size());
++    for (size_t i = 0; i < ref_output.size(); ++i) {
++        const float expected = static_cast<float>(ref_output[i]);
++        const float tolerance = 0.15f * (config.hidden_size / 128) + 0.01f * std::abs(expected);
++        ASSERT_NEAR(static_cast<float>(output_ptr[i]), expected, tolerance) << "elem " << i;
++    }
++}
