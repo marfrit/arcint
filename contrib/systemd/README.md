@@ -39,3 +39,10 @@ Things worth copying rather than re-learning:
 Adjust `--model` to where your artifacts are, `--cache-dir` to a writable
 place (it is the only thing the process writes), and the `Conflicts=` lines to
 the units that actually share a card on your host.
+
+A GGUF-opened unit (0.4.0 stage 1) is the same unit with `--gguf FILE` added
+and `--model` naming the served IR of the same architecture as the template;
+it needs `marfrit-openvino` at `+p7` (patch 0021). None of the units above is
+served that way yet: the K-quant path prefills at chunk 256 and decodes at
+about half the IR's rate on the 24 GB card (the top-level README's *Measured*
+section), which is 0.4.1's work.

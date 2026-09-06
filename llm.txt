@@ -173,7 +173,7 @@ budget of zero). Each card lands where its memory says: B60 chunk 2048, A770
 refused at startup with every term. At request time, a third concurrent request
 is a 503 carrying the same arithmetic (--queue-timeout S restores queueing).
 
-Verification: 414 unit cases device-free (418 with the OpenVINO backend), a 64-check curl round-trip, a lane-accounting
+Verification: 430 unit cases device-free (438 with the OpenVINO backend), a 64-check curl round-trip, a lane-accounting
 stress (200 requests, 24-way, 8 lanes, both queueing and refusing) -- the unit
 set, what bare ctest runs; and an acceptance target of sixteen enumerated cells
 (tests/acceptance/) that runs where the cards are, fails on any skip or
@@ -833,8 +833,8 @@ misc
   stop, toolcall, chat, prefix_cache, block_pool, turnstile), exec/ (backend
   interface, stub, backend_ov), api/ (error, handlers), http/ (cpp-httplib
   wiring).
-- tests/: two ctest label sets. `unit` (what bare ctest runs, device-free): 414
-  cases, 418 with the OpenVINO backend (hand-rolled harness, no framework; a
+- tests/: two ctest label sets. `unit` (what bare ctest runs, device-free): 430
+  cases, 438 with the OpenVINO backend (hand-rolled harness, no framework; a
   skip is a failure unless named, --max-skips 0), roundtrip.sh (64 curl checks),
   concurrency/stress.sh (lane accounting, stub-only), and the acceptance
   enumeration's own consistency check and runner self-test. `acceptance`

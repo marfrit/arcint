@@ -83,6 +83,24 @@ of the series above:
 |---|---|---|---|---|
 | llama.cpp, SYCL | A770 | GGUF Q4_K_M | 14.4 t/s | 10/10 |
 
+**The same file through arcint** (0.4.0 stage 1, DESIGN §7.0.2ay): the dense
+Qwen3.8-27B as Unsloth's Q4_K_M, opened on the dense IR template with
+`--gguf`, against Intel's own int4 IR export of the same model. B60, `u8` KV,
+one lane, MTP off, prefix cache off, one fresh process per cell, a 64-token
+decode after the prompt; the chunk is the fit's choice per arm:
+
+| weights | prompt | chunk | prefill | decode | task |
+|---|---|---|---|---|---|
+| GGUF Q4_K_M, K-quant kernel | 856 | 256 | 213 t/s | 9.9 t/s | 10/10 |
+| GGUF Q4_K_M, K-quant kernel | 71,727 | 256 | 174 t/s | 8.5 t/s | — |
+| Intel int4 IR | 856 | 2048 | 1,609 t/s | 23.1 t/s | — |
+| Intel int4 IR | 71,727 | 2048 | 552 t/s | 16.5 t/s | — |
+
+The GGUF path prefills 3.2× to 7.6× slower and decodes at about half the
+rate; the kernel is the eighth of a measured ladder and the two named
+contributors (the decode kernel at half the card's bandwidth, the activation
+reservation that holds the GGUF arm at chunk 256) are 0.4.1's work.
+
 The 70.1 t/s row at ~30k context matters as much as the peak: the usual
 throughput collapse with depth is absent from the served path, a property of
 the paged block tables. Every arcint row is additionally gated by
@@ -182,11 +200,21 @@ are `full_attention_interval = 4`, 262144 context, and share one tokenizer:
 
 ## Where the artifacts come from
 
-**arcint loads an OpenVINO IR directory, and nothing else.** Concretely:
+**arcint loads an OpenVINO IR directory.** Concretely:
 `openvino_language_model.{xml,bin}`, `openvino_text_embeddings_model.{xml,bin}`,
-the tokenizer and detokenizer IRs, `config.json` and the chat template. A GGUF
-will not load. Neither will GPTQ or NVFP4 safetensors — those are llama.cpp
-and vLLM formats, and OpenVINO does not read them.
+the tokenizer and detokenizer IRs, `config.json` and the chat template. GPTQ
+or NVFP4 safetensors will not load — those are vLLM formats, and OpenVINO does
+not read them. **A GGUF opens on top of such a directory** since 0.4.0
+stage 1: `--gguf FILE --model DIR` takes the served IR of the same
+architecture as the topology template and replaces its projections with the
+file's own K-quant rows (Q4_K, Q5_K, Q6_K, Q8_0), decoded inside the
+fully-connected kernel of the patched runtime (`marfrit-openvino +p7`,
+patch 0021) — no unpack at load, no second copy of the weights. The file's
+geometry is checked against the template's; the template's tokenizer and
+chat template are served; the embedding, the GDN state tensors and the MTP
+layer stay the template's. Dense models of the allowlisted families in stage
+1 (`docs/design-gguf-native.md`, `docs/milestone-0.4.0.md`); the rates are
+in *Measured*.
 
 All three models are downloadable, and every number in the *Measured* section
 was taken on the published copy. Two are Intel's own exports and need no work;
@@ -235,14 +263,16 @@ If you only want to run arcint, take the table and stop reading here. The rest
 of this section is for anyone who needs a different calibration than the
 published ones provide.
 
-**There is no shortcut from GGUF.** llama.cpp gained an OpenVINO backend in
-early 2026, and it was built and tested against these models: the production
-GDN hybrid aborts during scheduling because the recurrent DeltaNet states are
-not mapped in the GGML frontend (`pre-allocated tensor (cache_r_l0) in buffer
-(OPENVINO0) that cannot run CPY`), and a classic MoE falls to a CPU path and
-asserts in `get_rows`. Its validation list is dense models only. The path
-starts at the Hugging Face checkpoint, not at a quantised file you already
-have.
+**The GGUF shortcut is `--gguf`, above, and it still needs the IR.** The
+template supplies the topology, the tokenizer, the chat template and the
+tensors the file's rows do not replace, so a served IR of the architecture
+has to exist first. The other route was tried and does not work: llama.cpp
+gained an OpenVINO backend in early 2026, and it was built and tested against
+these models — the production GDN hybrid aborts during scheduling because the
+recurrent DeltaNet states are not mapped in the GGML frontend (`pre-allocated
+tensor (cache_r_l0) in buffer (OPENVINO0) that cannot run CPY`), and a classic
+MoE falls to a CPU path and asserts in `get_rows`. Its validation list is
+dense models only. A new calibration starts at the Hugging Face checkpoint.
 
     pip install "optimum[openvino]" nncf accelerate pillow "huggingface_hub[cli]"
     pip install "transformers==5.2.0" "openvino==2026.3.0" torchvision
@@ -311,6 +341,13 @@ Marked with the milestone that delivered them. **[M0]** means it works against
 the stub backend; **[M1]**–**[M6]** mean it runs against the real models on a
 real card.
 
+- **[0.4.0]** **GGUF opened in process** (`--gguf FILE --model DIR`): the
+  file's K-quant rows replace the template IR's projections and are decoded
+  inside the fully-connected kernel of the patched runtime (patch 0021) —
+  no unpack at load, no second copy. Dense models of the allowlisted
+  families; the file's geometry checked against the template's, the AWQ
+  activation scales of an AWQ template set to one, its norms compared with
+  the file's. 10/10 on the served dense model; rates under *Measured*.
 - **[M0]** OpenAI-compatible **`/v1/chat/completions`** and
   **`/v1/completions`** over HTTP.
 - **[M0]** **`/health`** (liveness, model-loaded, queue depth) and **`/props`**
@@ -432,6 +469,7 @@ reference implementation the equivalence suite compares against.
 | M11 drafting II | measured, drafter fixes landed — free levers on the DFlash chain: Viterbi negative, blocks 12/16 trade throughput for tokens per cycle, ngram below plain decode; the oracle floors the re-rank headroom at +0.74 per cycle; adapter is a decision, tree not pursued. At depth: the MTP layer's KV state is now charged against the reservation (it overcommitted the card past 76k) and the drafters' rotary subgraphs stay f32 (acceptance collapsed to zero past 65,504 tokens, an f16 position overflow); DFlash beats plain at 77k (18.8 vs 15.3 t/s, 40.6% accepted, ≈ 4.4 tokens per cycle), MTP never beats plain at any measured depth on this artifact |
 | M12 dispatch pin, tiled exporter | done — `--pin-dispatch` measured null on a quiet host, opt-in; exporter `--moe-lowering tiled` |
 | M13 vision reserved | done — `--vision` refused; vision IRs reported at load and never loaded (coder: 6 files, 428.3 MiB on disk) |
+| 0.4.0 GGUF, stage 1 | served — the dense Qwen3.8-27B Q4_K_M opens on the dense IR template, 10/10 through the GGUF-opened model; 213 / 9.9 t/s prefill / decode at 856 tokens and 174 / 8.5 at 71.7k against Intel's int4 IR at 1,609 / 23.1 and 552 / 16.5 (24 GB card; the K-quant kernel's eighth version, DESIGN §7.0.2ay); owed in stage 1: the embedding gather, the MTP layer from the file, the `+p7` package; stage 2 MoE, stage 3 sub-4-bit |
 | M14 host compute tier (`--moe-cpu-tier`) | done — 35B on the 16 GiB card 15.0/15.5 t/s vs 10.4/10.6 at ratio 50 / 8 GiB; 14.1/14.8 vs 7.4/7.5 at ratio 75 / 5 GiB; text byte-identical, 10/10. Re-measured at the 0.3.0 release gate under patch 0018's static partition: decode holds (16.4 t/s vs 11.3–11.4 tier OFF on the second request), tier ON identical to itself across processes and requests (the §3.4 promise; it also matched tier OFF on that window's prompt, which the first 0.3.1 acceptance run showed to be a property of the sample — device f16 and host f32 are not bit-equal); prefill loses 3× (26.6 vs 87.5 t/s on the same request, every layer on the per-expert fallback) and a cold sequence's first requests take minutes — both carried forward as campaigns |
 
 Every open defect and lever after 0.3.0 is its own campaign under
@@ -439,11 +477,11 @@ Every open defect and lever after 0.3.0 is its own campaign under
 measurement that defines it, its gate and its entry criteria, sized so one
 session can carry it. `docs/milestone-0.3.0.md` is the record of how 0.3.0
 was planned and closed; its backlog rows are frozen and point there. The
-next feature lines are recorded, not started: **0.4.0 opens and runs GGUF
-checkpoints** (`docs/milestone-0.4.0.md`) and **0.5.0 serves Qwen Flash
-Next** (`docs/milestone-0.5.0.md`).
+next feature lines: **0.4.0 opens and runs GGUF checkpoints**
+(`docs/milestone-0.4.0.md`, stage 1 served, its rates the price recorded
+above) and **0.5.0 serves Qwen Flash Next** (`docs/milestone-0.5.0.md`).
 
-Verification: 414 unit cases device-free (418 with the OpenVINO backend), a
+Verification: 430 unit cases device-free (438 with the OpenVINO backend), a
 64-check curl round-trip, a lane-accounting stress (200 requests, 24-way, 8
 lanes, queueing and refusing) — the unit set, which is what bare `ctest` runs;
 and an acceptance target of sixteen enumerated cells (`tests/acceptance/`)
