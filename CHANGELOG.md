@@ -19,6 +19,16 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+- **0.4.1, the native decode kernel on the integer dot: measured and not
+  carried** (DESIGN §7.0.2bb). Activations quantised to int8 per 32 in
+  registers, byte-parallel unpack, the 4×8-bit dot: correct, 194 µs
+  against 225 for the shipped kernel in isolation — and 8/10 on the
+  Prüfstand, the first score below ten on this model, at the same served
+  decode rate (10.1 t/s). The timing instrument was found L2-assisted
+  (ten launches of one 50 MB weight) and rebuilt to stream (plugin patch
+  0023, the test only): the shipped kernel reads rows at 293 GB/s from
+  DRAM; the served step's 154 GB/s effective is the 401 launches' fixed
+  cost and the narrow shapes, not the inner loop.
 - **0.4.1 lever 2: a GGUF-opened model is repacked at load into the
   runtime's own compressed form** (DESIGN §7.0.2ba, `docs/design-gguf-
   native.md` §3.6; the operator's decision, reversing 0.4.0's no-unpack

@@ -6342,6 +6342,86 @@ rows; a mixed open — those two types native, Q4_K repacked — is a flag
 away and trades prefill for context), the load time (an exhaustive
 check at every load), and the deferred stage-1 items.
 
+#### 7.0.2bb 0.4.1, the native path's decode kernel on the integer dot: faster in isolation, 8/10 on the Prüfstand, and the same served rate; the timing instrument corrected (2026-09-06)
+
+The operator's next window after §7.0.2ba ("start the work on 0021"):
+the K-quant kernel's decode variant rebuilt the way llama.cpp's CUDA
+path does it, and what the measurements said about that, about the
+instrument, and about where the served decode step's time is.
+
+**What was built.** Activations quantised per 32-block to int8 with an
+f32 scale and the block's sum (q8_1's scheme), the weights unpacked
+byte-parallel on dwords — Q4_K two operations per four values, Q5_K
+six, Q6_K eleven with the −32 folded in and no min, Q8_0 two — and the
+4×8-bit integer dot (`dot_acc_sat_4x8packed_*_int`, a native
+instruction on Xe) accumulating in int32, the block's scale and min
+applied once per sub-block. Four steps on the 24 GB card, the gate
+projection at one row under the timing test as it then was:
+
+| decode kernel, M = 1, 24 GB card | gate projection | down projection (K 17,408) |
+|---|---|---|
+| 0022 as shipped (f32 fused multiply-add) | 199–230 µs | 241 µs |
+| int8 dot, activations quantised into local memory by the work-group | 230 µs | 291 µs |
+| + activation dwords read once per super-block, broadcast from registers | 214 µs | 293 µs |
+| + no prologue: each super-block quantised in registers inside the weight loop | 194 µs | 253 µs |
+| + the decode work-group capped at eight subgroups | 196 µs | 199 µs |
+
+Every step was correct on both cards (12/12 against the host reference
+at a tolerance widened by 2^-7 of Σ|x·w| for the int8 activations). The
+instruction count of the super-block body fell from about 1,900 (0021)
+through 1,080 (§7.0.2az) to about 600 here, and the time barely moved
+until the prologue went: an ablation that skipped the quantisation
+prologue alone was worth 46 µs of 214, and neither a two-way unroll nor
+an eight-way K split moved anything. The prologue's cost was its own
+chain of gather loads and local-memory stores before any weight moved,
+whatever it was split over.
+
+**Served, and the quality gate.** The dense Q4_K_M through
+`--gguf-native` on this kernel, 24 GB card, `u8` KV: decode 10.1 t/s at
+856 prompt tokens (0.4.0's kernel: 9.9), 8.5 at 71.7k (8.5), the 1k
+greedy output byte-identical to 0.4.0's — and **the Prüfstand at 8/10**,
+the first score below ten on this model on any path: two cases wrong
+("einfach CRLF" and "nur LF", both with a duplicated last field in the
+parsed rows), the same generation that scored 10/10 on the f32 kernel
+and on the repack. Int8 activations per 32 are llama.cpp's precision;
+on this model and this task they are not this repository's. The int8
+path is therefore not carried, and the native decode stays f32 exact.
+
+**The instrument, corrected.** The timing test ran ten launches of one
+50 MB weight back to back; 18 MB of it can stay in L2 between launches,
+and every launch figure in §7.0.2ay, §7.0.2az and the table above is
+that L2-assisted number. Rebuilt to stream — eight weight buffers in
+rotation on one queue, so no launch finds its rows in cache and none
+overlaps another (eight networks on their own streams overlapped, and
+read 392 GB/s that no served step gets) — the 0022 kernel reads the gate
+projection at 171 µs (293 GB/s) and the down projection at 219 µs
+(229 GB/s) on the 24 GB card, the value projection at 97 µs for 3 MB;
+the int8 kernel at 159 and 165 µs (316 and 304 GB/s); lane-contiguous
+addresses gain 9 % there. So the kernels stream at about 300 GB/s from
+DRAM, near what the runtime's own path gets, and the served decode step
+— 99 ms for 15.2 GB, 154 GB/s effective, unchanged across every kernel
+of this window — is not the inner loop. It is the 401 launches: their
+fixed cost, the narrow projections (the value projection at 27–85 µs
+for 3 MB, 35–110 GB/s), the head-order gathers. The served number never
+moved because the kernel was never what it was waiting on.
+
+**Refuted and retracted here (§7.0.1).** "The decode kernel is
+instruction-bound" (§7.0.2az): three kernels with 1,900, 1,080 and 600
+instructions per super-block served at the same rate. "The kernels read
+rows at 222 GB/s" and every other launch-level bandwidth figure before
+this section: L2-assisted, by up to a third of the rows. A work-group
+cap of eight subgroups, taken for the down projection's occupancy: it
+put the f32 kernel at 2.6 ms on two shapes (measured, reverted). The
+16 GiB card's numbers today varied by up to 40 % between identical
+runs and are not compared.
+
+**What this closes.** The native path's decode is at its kernel's rate;
+the remaining 40 % of the served step is per-launch and per-shape, the
+repack path pays the same 401 launches and serves 16 t/s because the
+runtime's fixed cost per launch is lower — the next lever for either
+path is that fixed cost, measured per node with the profile, not the
+inner loop. Plugin patch 0023 carries the corrected timing test only.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

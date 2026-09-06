@@ -404,6 +404,19 @@ DESIGN §7.0.2az.
 
 Upstream: not yet filed.
 
+### 0023-kquant-timing-streams.patch
+
+The K-quant kernel's timing test (the `DISABLED_` case in the
+fully-connected suite) rebuilt to stream: eight weight buffers in
+rotation on one queue, so no launch finds its rows in L2 and none
+overlaps another. Ten launches of one buffer had let a third of it hit
+the 18 MB L2 and overstated every launch figure of 0021 and 0022; the
+0022 kernel reads the gate projection at 293 GB/s streamed on the 24 GB
+card. The int8-activation decode kernel this window built is recorded
+in DESIGN §7.0.2bb and not carried: 8/10 on the Prüfstand.
+
+Upstream: not yet filed.
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.

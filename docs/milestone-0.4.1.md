@@ -135,3 +135,12 @@ to keep on the other card.
   decodes at the same effective bandwidth. Open: the resident size
   (Q6_K/Q5_K at u8; a mixed open is a flag away), the load time, the
   deferred stage-1 items.
+- 2026-09-06 — **the native decode kernel on the integer dot, measured
+  and not carried** (DESIGN §7.0.2bb): llama.cpp's q8_1 recipe on Xe,
+  correct and 14 % faster in isolation, scores 8/10 on the Prüfstand and
+  serves at the same rate; the timing instrument was L2-assisted and now
+  streams (patch 0023). Finding that re-aims the milestone: the kernels
+  stream at ~300 GB/s, the served decode step is at 154 GB/s effective,
+  and the difference is the fixed cost of 401 launches and the narrow
+  projections — on both paths. Next lever: that fixed cost, measured per
+  node with the profile.
