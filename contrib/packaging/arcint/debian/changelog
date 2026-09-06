@@ -1,3 +1,26 @@
+arcint (0.4.0-1) trixie; urgency=medium
+
+  * 0.4.0: a GGUF opens in process and serves. `--gguf FILE` with `--model`
+    naming the served IR of the same architecture as the topology template:
+    the file's K-quant rows (Q4_K, Q5_K, Q6_K, Q8_0) replace the template's
+    projections as u8 constants aliasing the file's map, and plugin patch
+    0021 decodes the super-blocks inside its fully-connected kernel -- no
+    unpack at load, no reorder at compile, no second copy of the weights.
+    The template's AWQ activation scales are set to one, its norms compared
+    with the file's; the tokenizer, chat template, embedding, GDN state
+    tensors and MTP layer stay the template's. Dense Qwen3.8-27B Q4_K_M on
+    the 24 GB card: 10/10 on the Prüfstand through the GGUF-opened model;
+    213 / 9.9 t/s prefill / decode at 856 prompt tokens and 174 / 8.5 at
+    71.7k against Intel's int4 IR at 1,609 / 23.1 and 552 / 16.5 (the
+    rates are 0.4.1's work). Stage 0 beneath it: a memory-mapped GGUF
+    reader, ggml's dequantizers as the host reference, a fixture, tests.
+    Full record: CHANGELOG.md, DESIGN.md §7.0.2ay.
+  * Depends on marfrit-openvino >= 2026.4.0~dev20260821+p7-1 (patches
+    0003-0021): patch 0021 is the K-quant kernel; below +p7 the op is
+    unknown to the plugin and --gguf cannot serve.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 06 Sep 2026 06:00:00 +0200
+
 arcint (0.3.1-1) trixie; urgency=medium
 
   * 0.3.1: the campaigns closed since 0.3.0 ship. Unit and acceptance

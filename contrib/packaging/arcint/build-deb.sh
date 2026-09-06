@@ -11,7 +11,7 @@
 # It carries the CMake package, the headers and the runtime that arcint links.
 set -euo pipefail
 
-PKGVER=0.3.1
+PKGVER=0.4.0
 UPSTREAM_TAG=v${PKGVER}
 PKGREL=1
 # The public repository, not the fleet one. The fleet repo (still named
@@ -19,18 +19,18 @@ PKGREL=1
 # and carries operator-local notes; the published tree is the same code without
 # them, so the package is built from what anyone can check.
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
-# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v0.3.1.tar.gz,
-# taken after the tag was pushed (one commit after the tag, as 0.3.0's was).
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-4e237e35bc564202b39a32ec5e6399484f1a3f280328de7cf2856c1c603fc1df}
+# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v0.4.0.tar.gz,
+# taken after the tag was pushed (one commit after the tag, as 0.3.1's was).
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-}
 OV_PREFIX=/usr/lib/marfrit-openvino
 # The ABI is the nightly, not the patch level: floor the patch level, cap at
 # the next nightly. An exact pin (Depends: = +p1-1) made apt REMOVE arcint when
 # the runtime was upgraded to +p3 on 2026-09-04; never render "=" here again.
-OV_DEP_VERSION="2026.4.0~dev20260821+p6-1"
-# The +p6 floor is 0.3.1's (debian/changelog's UNRELEASED entry; DESIGN
-# §7.0.2av): building 0.3.0's tarball with it would re-issue the released
-# 0.3.0-1 version string under different Depends. Refused until the tag.
-[ "$PKGVER" != 0.3.0 ] || { echo "the +p6 floor is 0.3.1's; bump PKGVER and the tarball sha at the tag" >&2; exit 1; }
+OV_DEP_VERSION="2026.4.0~dev20260821+p7-1"
+# The +p7 floor is 0.4.0's (patch 0021, the K-quant kernel --gguf needs;
+# DESIGN §7.0.2ay): building an older tag with it would re-issue a released
+# version string under different Depends. Refused.
+case "$PKGVER" in 0.3.*) echo "the +p7 floor is 0.4.0's; bump PKGVER and the tarball sha at the tag" >&2; exit 1 ;; esac
 OV_DEP_NEXT_NIGHTLY="2026.4.0~dev20260822"
 HERE=$(dirname "$(readlink -f "$0")")
 

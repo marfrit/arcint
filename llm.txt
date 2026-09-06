@@ -55,11 +55,13 @@ file's; embedding, GDN state and MTP stay the template's.
 After 0.3.0 every open defect or lever is one campaign document under
 docs/campaigns/ (README there: rules, template, index of thirteen); the
 milestone document's backlog rows are frozen and point there. Next feature
-lines, recorded 2026-09-05 and not started: 0.4.0 = open and run GGUF
-checkpoints (docs/milestone-0.4.0.md; three routes -- offline import to IR,
-in-process graph build, native K-quant blocks in the plugin -- recon picks;
-gate: opens, Prüfstand at its own bit width, exact-block files byte-identical
-to the IR from the same weights); 0.5.0 = Qwen Flash Next
+lines: 0.4.0 = open and run GGUF checkpoints (docs/milestone-0.4.0.md; stage
+1 -- in-process open on a template IR, native K-quant blocks decoded in the
+plugin's kernel -- served and tagged as 0.4.0 on 2026-09-06; stages 2 MoE
+and 3 sub-4-bit follow); 0.4.1 = the GGUF path at the card's speed
+(docs/milestone-0.4.1.md: decode at bandwidth, the prefill tile's activation
+reads, the activation reservation, the +p7 package; gate within 1.5x of
+Intel's int4 IR at prefill and 1.2x at decode); 0.5.0 = Qwen Flash Next
 (docs/milestone-0.5.0.md; recon pins the checkpoint and its config deltas
 first; gate: loads on both cards, Prüfstand, depth ladder, drafters measured
 against plain).

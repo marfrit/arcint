@@ -175,3 +175,11 @@ are served natively (route 3 = the kernel campaign). Not a single session.
   kernel, the MTP layer from the file, the decode kernel at bandwidth
   and 2-D block loads for the prefill tile, the activation reservation
   at chunk 256; then stage 2.
+- 2026-09-06 — **0.4.0 tagged at stage 1** (operator: "proceed as
+  suggested"). The decision on the two owed pieces: the embedding gather
+  and the MTP layer from the file are deferred, recorded as items in
+  `docs/milestone-0.4.1.md`, because neither moves a rate or a score (the
+  template's embedding and MTP layer serve). 0.4.1 is the rates against
+  Intel's IR. Stages 2 and 3 of this charter follow 0.4.1; this record
+  stays open for them. Runtime floor `+p7`, the package built from the
+  recipe on the pristine pin tree for the tag.

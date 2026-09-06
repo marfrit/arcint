@@ -17,7 +17,18 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
-## Unreleased
+## 0.4.0 — 2026-09-06
+
+Requires `marfrit-openvino 2026.4.0~dev20260821+p7` (patches 0003–0021):
+patch 0021 is the K-quant kernel `--gguf` serves through; below `+p7` the
+op is unknown to the plugin and a GGUF-opened model cannot serve (the IR
+path is unchanged from 0.3.1 and runs on `+p6`). Stage 1 of the 0.4.0
+charter ships; what it owes is carried into `docs/milestone-0.4.1.md`
+(the rates: decode at bandwidth, the prefill tile's activation reads, the
+activation reservation that pins the GGUF arm at chunk 256) and recorded
+as items there (the embedding gather from the file, the MTP layer from
+the file). Stage 2 (MoE files) and stage 3 (sub-4-bit) stay in the 0.4.0
+milestone record as later stages.
 
 - **0.4.0 stage 1: a GGUF opens in process and serves** (DESIGN §7.0.2ay,
   `docs/design-gguf-native.md`). `--gguf FILE` with `--model` naming the

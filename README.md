@@ -478,8 +478,10 @@ measurement that defines it, its gate and its entry criteria, sized so one
 session can carry it. `docs/milestone-0.3.0.md` is the record of how 0.3.0
 was planned and closed; its backlog rows are frozen and point there. The
 next feature lines: **0.4.0 opens and runs GGUF checkpoints**
-(`docs/milestone-0.4.0.md`, stage 1 served, its rates the price recorded
-above) and **0.5.0 serves Qwen Flash Next** (`docs/milestone-0.5.0.md`).
+(`docs/milestone-0.4.0.md`, stage 1 tagged as 0.4.0, its rates the price
+recorded above), **0.4.1 runs the GGUF path at the card's speed**
+(`docs/milestone-0.4.1.md`) and **0.5.0 serves Qwen Flash Next**
+(`docs/milestone-0.5.0.md`).
 
 Verification: 430 unit cases device-free (438 with the OpenVINO backend), a
 64-check curl round-trip, a lane-accounting stress (200 requests, 24-way, 8
