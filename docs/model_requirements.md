@@ -9,8 +9,12 @@ is said explicitly.
 
 ## 1. Artifact format
 
-An **OpenVINO IR directory**, nothing else — no GGUF, no safetensors (GPTQ,
-NVFP4; llama.cpp/vLLM formats OpenVINO does not read).
+An **OpenVINO IR directory** — and, since 0.4.0 stage 1, a **GGUF of the
+same architecture opened on that directory as its topology template**
+(`--gguf FILE --model DIR`, DESIGN §7.0.2ay: the file's K-quant rows
+replace the IR's projections, decoded in the plugin's kernel from `+p7`;
+the IR's embedding, norms, GDN state tensors and MTP layer stay). No
+safetensors (GPTQ, NVFP4; formats OpenVINO does not read).
 `load_artifact` (`src/core/artifact.cpp`) requires, in a directory whose
 basename matches an allowlist alias: `openvino_language_model.{xml,bin}`,
 `openvino_text_embeddings_model.xml`, `openvino_tokenizer.xml`,
@@ -148,7 +152,9 @@ the patch level: **`+p4` is the 0003–0018 level** and the one 0.3.0
 requires (CHANGELOG); **`+p5` adds 0019** (the prefill fallback's
 three-way answer, DESIGN §7.0.2ap; built 2026-09-05, not deployed);
 **`+p6` adds 0020** (u8:i4 prefill on micro-SDPA at parity with u8,
-DESIGN §7.0.2as; built and deployed 2026-09-05, §7.0.2aw) — the
+DESIGN §7.0.2as; built and deployed 2026-09-05, §7.0.2aw); **`+p7` adds
+0021** (GGUF K-quant weights decoded in the fully-connected kernel,
+§7.0.2ay; recipe bumped 2026-09-06, package not built) — `+p6` is the
 level to serve `--paged-kv u8:i4` at, since below it the format's prefill
 costs +55 % to +90 % of u8's time (§7.0.2ar). From 0.3.1 the arcint
 package depends on **`+p6` as a floor** within the pinned nightly
@@ -166,7 +172,10 @@ MTP state and drafters). Compute-runtime
 
 ## 6. Not supported / not measured
 
-- GGUF, safetensors (GPTQ, NVFP4): wrong format, not loaded.
+- safetensors (GPTQ, NVFP4): wrong format, not loaded. GGUF: Q4_K/Q5_K/
+  Q6_K/Q8_0 projections served natively on a template IR (dense `qwen35`,
+  0.4.0 stage 1); MoE files and the sub-4-bit types (IQ4_XS, IQ3_S,
+  IQ3_XXS, Q3_K) are stages 2 and 3, not yet served.
 - A plain-cast `q8` KV (no scales): refused as "quietly worse."
 - INT3/INT2 expert weights: study owed, no kernel, no allowlist entry.
 - `q8` weight format: accepted by the flag, no acceptance run found.

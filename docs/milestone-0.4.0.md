@@ -160,3 +160,18 @@ are served natively (route 3 = the kernel campaign). Not a single session.
   Q4_K_M tensor on the dev host (`tools/gguf_dequant_check.py` is ready
   for it). Kernel side (plugin patch 0021, the fully-connected decoder)
   in progress.
+- 2026-09-06 — stage 1 served (DESIGN §7.0.2ay): `--gguf` opens the dense
+  Qwen3.8-27B Q4_K_M on the dense IR template, 497 projections from the
+  file, Prüfstand 10/10 through the GGUF-opened model on the 24 GB card;
+  plugin patch 0021 (`+p7` recipe, package not built) decodes Q4_K/Q5_K/
+  Q6_K/Q8_0 in the fully-connected kernel. The first serve was 0/10
+  because the template's AWQ activation scales compensated weights now
+  raw; the pass sets them to one. The kernel climbed a measured ladder
+  of eight versions from 28.8 / 3.5 t/s (prefill / decode) to the
+  benchmark the operator asked for, against Intel's own int4 IR export
+  on the same card: 213 / 9.9 at 856 prompt tokens and 174 / 8.5 at
+  71.7k, the IR 1,609 / 23.1 and 552 / 16.5 (chunk 256 against 2048,
+  the fit's choice per arm). Owed within stage 1: the embedding gather
+  kernel, the MTP layer from the file, the decode kernel at bandwidth
+  and 2-D block loads for the prefill tile, the activation reservation
+  at chunk 256; then stage 2.

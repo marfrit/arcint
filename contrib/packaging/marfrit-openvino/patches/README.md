@@ -361,6 +361,32 @@ DESIGN §7.0.2as.
 
 Upstream: not yet filed.
 
+### 0021-fully-connected-kquant.patch
+
+GGUF K-quant weights (Q4_K, Q5_K, Q6_K, Q8_0) served as stored through
+the fully-connected path (arcint 0.4.0 stage 1, `docs/design-gguf-
+native.md`): arcint builds an op the plugin recognises by type name
+("FullyConnectedKQuant", "arcint_opset") over a u8 constant holding the
+file's rows, and a new kernel decodes the super-blocks in its inner
+loop — no unpack at load, no reorder at compile, no second copy of the
+weights. One lane per output column, two variants from one source
+chosen by the row count: decode with a broadcast activation read and K
+split over four subgroups; prefill on the subgroup matrix multiply
+(XMX) with the super-block's activation tile staged in local memory
+per work-group of eight subgroups. Eleven correctness cases against a
+host reference on both cards, a malformed request refused at shape
+inference, the fully-connected suite otherwise unchanged, a timing test
+(disabled by name) at the dense model's gate projection. MEASURED: the
+dense Qwen3.8-27B Q4_K_M file opens on the dense IR template and scores
+10/10 on the Prüfstand through the served endpoint; against Intel's own
+int4 IR export on the 24 GB card it prefills 3.2× to 7.6× slower and
+decodes at about half the rate (213 / 9.9 t/s at 856 tokens, 174 / 8.5
+at 71.7k, the IR 1,609 / 23.1 and 552 / 16.5). The header records the
+eight-version ladder that got the kernel here from 28.8 / 3.5. DESIGN
+§7.0.2ay.
+
+Upstream: not yet filed.
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.

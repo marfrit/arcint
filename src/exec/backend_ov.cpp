@@ -70,6 +70,7 @@
 #include "config.h"
 #include "core/affinity.h"
 #include "exec/fit.h"
+#include "exec/gguf_graph.h"
 #include "core/artifact.h"
 #include "core/block_pool.h"
 #include "core/dflash_select.h"
@@ -2339,6 +2340,49 @@ private:
         return out;
     }
 
+    // The GGUF open (0.4.0 stage 1). Refuses by name: an architecture other
+    // than the template's, a geometry mismatch (every differing field
+    // printed), a tensor the template needs that the file lacks or carries in
+    // a type this stage does not serve.
+    void apply_gguf_weights(const std::shared_ptr<ov::Model>& model, const std::string& path) {
+        auto file = std::make_shared<gguf::GgufFile>(gguf::GgufFile::open(path));
+        const GgufGeometry fg = gguf_geometry(*file);
+        const nlohmann::json& c  = artifact_.config;
+        const nlohmann::json& tc = c.contains("text_config") && c["text_config"].is_object() ? c["text_config"] : c;
+        auto j = [&](const char* key) -> int64_t { return tc.contains(key) && tc[key].is_number_integer() ? tc[key].get<int64_t>() : 0; };
+        GgufGeometry ag;
+        ag.n_layers = j("num_hidden_layers"); ag.hidden = j("hidden_size"); ag.n_heads = j("num_attention_heads");
+        ag.n_kv_heads = j("num_key_value_heads"); ag.head_dim = j("head_dim");
+        ag.linear_k_heads = j("linear_num_key_heads"); ag.linear_v_heads = j("linear_num_value_heads");
+        ag.linear_k_dim = j("linear_key_head_dim"); ag.linear_v_dim = j("linear_value_head_dim");
+        ag.full_attention_interval = j("full_attention_interval");
+        ag.vocab = j("vocab_size");
+        const auto mism = gguf_geometry_mismatches(fg, ag);
+        if (!mism.empty()) {
+            std::string all;
+            for (const auto& m : mism) all += (all.empty() ? "" : "; ") + m;
+            throw std::runtime_error(log::format("--gguf %s is not this artifact's architecture: %s", path.c_str(), all.c_str()));
+        }
+        // The file's own quantization census, for the record next to the rates.
+        std::map<int32_t, std::pair<int, size_t>> census;
+        for (const auto& t : file->tensors()) { census[t.ggml_type].first++; census[t.ggml_type].second += file->bytes(t); }
+        std::string cs;
+        for (const auto& [ty, cb] : census)
+            cs += log::format("%s%s x%d (%zu MiB)", cs.empty() ? "" : ", ", gguf::type_name(ty).c_str(), cb.first, cb.second >> 20);
+        log::info("load", "gguf: %s -- %s, %zu tensors: %s", path.c_str(),
+                  file->get_string("general.name").value_or("?").c_str(), file->tensors().size(), cs.c_str());
+        const std::string ft = file->get_string("tokenizer.chat_template").value_or("");
+        if (!ft.empty() && ft != artifact_.chat_template)
+            log::info("load", "gguf: the file's chat template differs from the artifact's (%zu against %zu chars); the artifact's is served",
+                      ft.size(), artifact_.chat_template.size());
+        gguf_report_ = gguf_apply_to_template(model, file, fg);
+        gguf_file_   = file;  // the constants alias its map; held for the compiled model's life
+        status_.weights_bytes = gguf_report_.bytes_from_file;  // the file's rows, not the template's .bin
+        log::info("load", "gguf: %s; the embedding, norms, GDN state tensors and any MTP layer stay the template's",
+                  gguf_report_.summary().c_str());
+        gguf_path_ = path;
+    }
+
     void load_paged(const Config& cfg, int req_n_ctx) {
         paged_ = true;
         const std::string& device  = cfg.device;
@@ -2346,6 +2390,14 @@ private:
         const std::string  mtp_dev = cfg.mtp_device.empty() ? device : cfg.mtp_device;
 
         std::shared_ptr<ov::Model> model = core_.read_model(artifact_.language_model_xml);
+        // 0.4.0 (docs/design-gguf-native.md §3.1): the served IR is the topology
+        // template; the file's K-quant rows replace its projections, as stored.
+        // The file is opened, its geometry checked against the artifact's
+        // config.json, the model rewritten, and the outcome logged before any
+        // other pass touches the graph (the template's own weights stay mapped
+        // and unread). A plugin below +p7 has no kernel for the tagged constants
+        // and refuses at compile with the op named; nothing falls back.
+        if (!cfg.gguf_path.empty()) apply_gguf_weights(model, cfg.gguf_path);
         // --gate-pad N: widen the shared-expert gate (see pad_gate_matmuls). A
         // deployment choice with a known price, like --paged-kv: DESIGN 7.0.2g
         // has the break-even. Off by default for this fleet's answer lengths.
@@ -7344,6 +7396,10 @@ private:
     // carries the f16 host sizing too, both ship together in patch 0015 --
     // 4 otherwise).
     bool                           paged_attention_bound_accepted_ = false;
+    // 0.4.0: the GGUF the weights came from, and what the open replaced/kept.
+    std::string                    gguf_path_;
+    GgufApplyReport                gguf_report_;
+    std::shared_ptr<gguf::GgufFile> gguf_file_;
     // Patch 0020 engine side (DESIGN §7.0.2at): the GPU plugin's own patch
     // level, read from its build number (`marfrit-p<N>`, the recipe's
     // stamp -- the detection contract is stated at fit.h's

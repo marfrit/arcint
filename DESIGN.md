@@ -5999,6 +5999,169 @@ campaign's number, not this deployment's, and turning MTP off would
 also hand back the 1.16 GiB state and most of the 3.16 GiB of drafters
 — the operator's next call, recorded with its numbers.
 
+#### 7.0.2ay 0.4.0 stage 1: a GGUF opens in process on the served IR and serves at 10/10, its K-quant rows decoded in the kernel; the first kernel's rates are the price (2026-09-06)
+
+The 0.4.0 charter's first serve (`docs/design-gguf-native.md`,
+`docs/milestone-0.4.0.md`): the dense Qwen3.8-27B at Unsloth's Q4_K_M,
+opened by `--gguf FILE --model <the dense IR directory>` on the 24 GB
+card, plugin patch 0021 (`+p7`), the operator's rule in force — no
+unpack at load, no reorder at compile, the only bytes on the card are
+the file's.
+
+**What the open does, measured on this file.** 866 tensors: Q4_K ×294,
+Q6_K ×67, Q5_K ×48, Q8_0 ×1, F32 ×456. The pass replaced 497
+projections in the template (Q4_K ×288, Q6_K ×65, Q5_K ×48, and the
+dense file's F32 GDN alpha/beta ×96), 15.2 GB of rows, in 55 s of
+compile; device-resident 14.94 GiB; health at 90 s. Kept from the
+template: the embedding (i8 per row; the file's Q4_K needs the gather
+kernel, a later patch), the norms, the GDN state tensors, the MTP layer.
+The converter's value-head reorder was inverted on five tensors per GDN
+layer (rows on four, the activation's columns on the output projection);
+`tools/gguf_ir_compare.py` checks the inverse on the host — cosine
+between the file's and the template's dequantized weights 0.04–0.43 as
+stored, 0.993–0.996 un-reordered, on every one of them, layer 0 and 3.
+The tokenizer is the template's, measured identical to the file's
+(§milestone 2026-09-06); the chat template is the template's, the
+file's differs (logged).
+
+**The first serve scored 0/10 and the cause was the template's AWQ.**
+The dense IR is AWQ-quantized, and the exporter left sixteen
+activation-side multipliers in the graph, one per attention layer on
+the gate path (`awq_mul/scale`, values 1 to 72). With the projections
+replaced by the file's raw rows and those multipliers left standing,
+the model stayed fluent and its Prüfstand answer looped (0/10, every
+case a timeout or a wrong split). The compare tool had the signature
+before the answer did: against the template's dequantized weights the
+file's `o_proj` sits at cosine 0.95, `up_proj` at 0.50 and 0.81 (layers
+0 and 3), `down_proj` at 0.95 and 0.97, while every other projection
+reads 0.993–0.996 — consistent with AWQ's fold (the output projection's
+input scaled through those multipliers, the down projection's input
+through the up projection's rows), inferred from the cosines and not
+measured further. The pass now sets every `awq_mul/scale` constant to
+one (16 on this template) and compares every norm the file also carries
+with the template's (209 constants, max |diff| 0 — the exporter did not
+fold anything into the norms). With that: **Prüfstand 10/10 through
+the GGUF-opened model**, all ten cases, the same harness and scorer as
+every other 10/10 on the record.
+
+**Rates: the kernel ladder, and the benchmark against Intel's own int4
+export.** The first kernel served at 28.8 t/s prefill and 3.5 t/s
+decode (24 GB card, `u8` KV, one lane, MTP off, prefix cache off, n_ctx
+32,768, chunk 256, the plugin from the dev tree at patch 0021 staged
+over the `+p6` layout) — one output column per work-item over eight
+activation rows, no subgroup cooperation. Eight versions later the
+same file serves at the rates in the table below. The ladder was
+climbed on one shape, the dense model's gate projection (N 17,408, K
+5,120, Q4_K, 50 MB of rows), with a timing test in the plugin's suite
+(`DISABLED_gate_proj_shape_q4k_rows_1_to_2048`, one launch, ten
+repetitions, the network's own stream waited on — the first timing
+waited on the test stream and reported 1.1 TB/s on a 450 GB/s card,
+retracted before it was written down). Each rung was a measurement,
+not a guess:
+
+| kernel (24 GB card, one launch) | M = 1 | M = 32 | M = 2048 |
+|---|---|---|---|
+| one subgroup per column, lanes over K, byte decode (the first) | 523 µs (16 GB card) | 9.4 ms | — |
+| lane per column, uniform activation loads, word decode | 234 µs | 7.4 ms | 298 ms |
+| + XMX for the tile, A operand read from global memory | 234 µs | 5.9 ms | 298 ms |
+| + A tile staged in local memory per work-group (served) | 225 µs | 0.95 ms | 39.5 ms |
+
+What each rung found. The compiled first kernel reported
+`private_size 256`: a run-time loop bound over the per-row accumulators
+sent them to scratch memory (the compiler's dump, `.zeinfo`; fixed by
+compile-time bounds with clamped rows). The per-row cost then stayed at
+about 230 µs through two rewrites of the inner product, because the
+cost was never the arithmetic: with one subgroup per column, every
+column re-read the activation row (178 MB per row per launch out of
+cache). One lane per column with the activation address uniform over
+the subgroup fixed decode (one broadcast read) but not the tile, and
+the matrix-multiply instructions (`intel_sub_group_f16_f16_matrix_
+mad_k16`, the decoded sub-block as the lane's column of B) did not
+move the tile either — until an experiment that dropped the A-operand
+loads alone brought the 2048-row launch from 298 ms to 11 ms. The
+activation tile was being re-read once per 16 columns, 22.8 GB per
+launch, at what the cache hierarchy gives for 32-byte reads scattered
+over 32 rows. Staging each super-block's tile (32 rows × 256 values) in
+local memory once per work-group of eight subgroups cut that by eight
+and the launch to 39.5 ms. Decode sits at 222 GB/s of rows against the
+card's ~450: the decoders' instruction count, not bandwidth (the
+word-based decoders halved the first version's; the rest is a later
+patch). Correctness on every rung: the eleven plugin cases on both
+cards against the host reference (the tiled variant's tolerance widened
+by 2^-11 of Σ|x·w| for its f16 weight copies), then the Prüfstand.
+
+**The benchmark the operator asked for**, same card, same flags, one
+fresh process per cell, the file through the K-quant kernel against
+Intel's own int4 IR export of the same model (`qwen38-intel-int4-ov`,
+allowlisted for the comparison), prefill plus a 64-token decode at two
+depths; `u8` KV, one lane, MTP off, prefix cache off; the chunk is the
+fit's choice per arm and is part of the result:
+
+| arm | prompt | chunk | prefill | decode (64 tok) | resident |
+|---|---|---|---|---|---|
+| GGUF Q4_K_M, K-quant kernel | 856 | 256 | 213.0 t/s | 9.9 t/s | 14.94 GiB |
+| GGUF Q4_K_M, K-quant kernel | 71,727 | 256 | 173.8 t/s | 8.5 t/s | 14.94 GiB |
+| Intel int4 IR (`qwen38-intel-int4-ov`) | 856 | 2048 | 1,609.4 t/s | 23.1 t/s | 13.06 GiB |
+| Intel int4 IR (`qwen38-intel-int4-ov`) | 71,727 | 2048 | 551.7 t/s | 16.5 t/s | 13.06 GiB |
+
+Prüfstand through the GGUF-opened model on this kernel: 10/10 (the
+gate before the benchmark; 182.7 t/s prefill and 12.1 t/s decode on
+its 282-token / 1,079-token exchange). Read the table as it is: the
+K-quant path is 3.2× to 7.6× slower at prefill and about 2× at decode, and
+it is the same model at 1.9 GiB more resident (the template's i8
+embedding and the file's Q6_K rows against Intel's int4 throughout). Two known contributors, both recorded and
+neither priced apart: the GGUF arm prefills at chunk 256 because the
+fit charges 2.65 GiB of activations for it (the kernel's f32 outputs
+and the fused ops around them) where the IR's path charges a fraction,
+and the decode kernel runs at half the card's bandwidth. No fault line
+in any cell.
+
+**What was built.** Stage 0: the reader (`src/core/gguf.*`), ggml's
+dequantizers as the host reference (`src/core/gguf_dequant.*`), the
+fixture with gguf-py's own decoding beside it, exact-equality tests.
+Stage 1: the tensor map and the V-head inverse (`src/core/gguf_map.*`,
+device-free tests), the op the engine builds (`src/exec/kquant_op.h`),
+the template pass (`src/exec/gguf_graph.*`: memory-mapped template
+read, decompression chains replaced by tagged u8 constants aliasing the
+file's map and owning the file with them, the value-head inverse as a
+gather on the projection's output — no row is copied — or on the
+activation for the output projection, the AWQ neutralisation, the norm
+comparison, a report),
+`--gguf`, and plugin patch 0021: the primitive's three fields, shape
+inference over `[N, K]` for a `[N, row_bytes]` memory with the refusal
+on the main thread, the kernel and its decoders, seven correctness
+cases on the 16 GiB card against a host reference, the
+fully-connected suite otherwise unchanged (1,161 run, 1,070 passed, the
+rest skipped, as before plus the eight). Two defects found and fixed on
+the way: the impl re-derived the weights' shape as `[bytes / K, K]`
+(27 rows of 512 for 48 of 288), and a missing kernel terminated the
+process from a worker thread instead of refusing.
+
+**Retracted from an earlier draft of this record** (§7.0.1): it said
+the kernel's decoders were "one source, compiled as OpenCL C in the
+plugin and as C++ in the host test, so the two cannot drift". No such
+host compile exists; the kernel's reference in the plugin's tests is a
+second, independent transcription of ggml's formulas (`kq_host`), and
+the decoders are further checked end to end by the 10/10. The shared-
+source host compile is owed. The first review of this change also
+found the aliasing constants owned nothing — the file was kept alive
+only by a runtime-info entry on a model the load discards after
+compile — which held only because compile copies every constant to the
+device; the constants now own the file through the constructor made
+for that.
+
+**Still open in stage 1.** The embedding from the file (gather kernel);
+the MTP layer from the file; the plugin-below-+p7 refusal message
+(untested: the op is simply unknown there); the rates' two named
+contributors — the decode kernel at half the card's bandwidth (the
+decoders' instruction count) and the prefill tile's activation reads
+(2-D block loads, Xe2 only, are the next rung) — and the activation
+reservation that holds the GGUF arm at chunk 256. The device-free test
+of the pass on a toy template exists (`tests/test_gguf_graph.cpp`,
+OpenVINO-gated: four projections, the AWQ constant, a norm; it checks
+the replacement, the aliasing, the gathers, the neutralisation, the
+refusal).
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

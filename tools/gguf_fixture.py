@@ -205,6 +205,12 @@ QUANT_TENSORS = {
     "blk.0.ffn_down.weight": ((512, 256), GGMLQuantizationType.Q6_K),
     "blk.0.ssm_out.weight":  ((32, 256), GGMLQuantizationType.Q5_K),
     "nextn.eh_proj.weight":  ((16, 64), GGMLQuantizationType.Q8_0),
+    # For the template-pass test (tests/test_gguf_graph.cpp): a value-head
+    # row-reordered projection (rows = 4 value heads x 64) and a fused
+    # q/k/v projection (2 x 2 key heads x 64 q/k rows, then the 256 value
+    # rows), both at the fixture's toy GDN geometry.
+    "blk.0.attn_gate.weight": ((256, 256), GGMLQuantizationType.Q4_K),
+    "blk.0.attn_qkv.weight":  ((512, 256), GGMLQuantizationType.Q6_K),
 }
 
 
@@ -231,6 +237,18 @@ def main():
     writer.add_uint32("qwen35.block_count", 2)
     writer.add_uint32("qwen35.embedding_length", 64)
     writer.add_float32("qwen35.rope.freq_base", 10000.0)
+    # The geometry keys the engine's open reads (core/gguf_map.cpp), at the
+    # toy sizes the pass test uses: one model layer plus one MTP block, two
+    # GDN key heads of 64 against four value heads of 64.
+    writer.add_uint32("qwen35.nextn_predict_layers", 1)
+    writer.add_uint32("qwen35.attention.head_count", 4)
+    writer.add_uint32("qwen35.attention.head_count_kv", 2)
+    writer.add_uint32("qwen35.attention.key_length", 16)
+    writer.add_uint32("qwen35.ssm.group_count", 2)
+    writer.add_uint32("qwen35.ssm.time_step_rank", 4)
+    writer.add_uint32("qwen35.ssm.state_size", 64)
+    writer.add_uint32("qwen35.ssm.inner_size", 256)
+    writer.add_uint32("qwen35.full_attention_interval", 4)
     writer.add_string("tokenizer.ggml.pre", "qwen2")
     tokens = ["<pad>", "<s>", "</s>", "hello", ",", " world", "!", "▁tok"]
     writer.add_array("tokenizer.ggml.tokens", tokens)
@@ -243,11 +261,16 @@ def main():
     manifest = {}
     blob = bytearray()
 
+    # The exact-equality reference covers the four original tensors; the two
+    # added for the template-pass test are checked structurally there and
+    # would double the reference's size for nothing.
     for name, (shape, qtype) in QUANT_TENSORS.items():
         data = rng.standard_normal(shape).astype(np.float32)
         quantized = quantize_any(data, qtype)
         self_check(name, data, quantized, qtype)
         writer.add_tensor(name, quantized, raw_dtype=qtype)
+        if name in ("blk.0.attn_gate.weight", "blk.0.attn_qkv.weight"):
+            continue
         reference = quants.dequantize(quantized, qtype).astype(np.float32)
         manifest[name] = {
             "shape": list(reference.shape),
@@ -259,6 +282,10 @@ def main():
 
     norm = rng.standard_normal((64,)).astype(np.float32)
     writer.add_tensor("output_norm.weight", norm)
+    # A layer norm the pass compares with the template's (the test builds a
+    # template whose input_layernorm constant holds these same values).
+    attn_norm = (1.0 + 0.01 * np.arange(512, dtype=np.float32)).astype(np.float32)
+    writer.add_tensor("blk.0.attn_norm.weight", attn_norm)
 
     embd = rng.standard_normal((8, 64)).astype(np.float32).astype(np.float16)
     writer.add_tensor("token_embd.weight", embd)

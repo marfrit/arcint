@@ -334,6 +334,10 @@ std::string usage_text() {
         "  --no-paged                stateful reference path instead of the paged executor\n"
         "  --emb-device DEV          run the embeddings gather elsewhere (default: --device)\n"
         "  --mtp-device DEV          run the MTP head elsewhere (default: --device)\n"
+        "  --gguf FILE               serve this GGUF's weights on --model's topology (the\n"
+        "                            served IR of the same architecture is the template);\n"
+        "                            K-quant rows go to the card as stored, decoded in the\n"
+        "                            kernel. Needs --model and a plugin at +p7 or later\n"
         "  --dflash DIR              DFlash2 block drafter directory (7 drafts per\n"
         "                            verify pass; greedy only, like --mtp). One\n"
         "                            drafter per server: conflicts with --mtp on\n"
@@ -394,6 +398,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--model") {
             if (!value(v)) return fail("--model needs a path");
             cfg.model_path = std::string(v);
+        } else if (arg == "--gguf") {
+            if (!value(v)) return fail("--gguf needs a path");
+            cfg.gguf_path = std::string(v);
         } else if (arg == "--model-id") {
             if (!value(v)) return fail("--model-id needs a value");
             cfg.model_id = std::string(v);
@@ -758,6 +765,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     // decide it: this combination now parses, and backend_ov.cpp's load
     // path (tier_prefix_cache_decision, config.h) makes the call instead.
     if (cfg.prefill_chunk < 0) return fail("--prefill-chunk must be >= 0");
+    if (!cfg.gguf_path.empty() && cfg.model_path.empty()) return fail("--gguf needs --model (the template IR directory)");
+    if (!cfg.gguf_path.empty() && !cfg.paged) return fail("--gguf serves on the paged path only");
 
     // The prefill grid and the cache grid have to be the same grid. A cache hit
     // is where a warm run starts, and a warm run must present the model the same

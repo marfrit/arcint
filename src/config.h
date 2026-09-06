@@ -13,6 +13,7 @@ struct SamplerDefaults;  // core/model_registry.h
 struct Config {
     // Exactly one of these selects what gets served.
     std::string model_path;  // OpenVINO IR directory (M1+)
+    std::string gguf_path;   // --gguf: weights from this GGUF, --model as the topology template (0.4.0)
     bool        stub = false;
 
     std::string model_id;  // allowlist entry; defaults to the coder under --stub

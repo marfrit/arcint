@@ -40,6 +40,18 @@ coder q4; all three target models reach 10/10 on the fleet harness.
   M13 vision reserved             done - --vision refused; vision IRs reported at load, never loaded (coder: 6 files, 428.3 MiB)
   M14 host compute tier --moe-cpu-tier done - 35B/16 GiB card 15.0/15.5 vs 10.4/10.6 t/s at ratio 50/8 GiB; 14.1/14.8 vs 7.4/7.5 at ratio 75/5 GiB; byte-identical, 10/10. Under patch 0018's static partition (0.3.0 release gate): decode holds at 16.4 vs 11.3-11.4 tier OFF (second request), tier ON identical to itself across processes/requests (§3.4; ON==OFF on that prompt was sample-dependent, shown by 0.3.1's first acceptance run); prefill 26.6 vs 87.5 on the same request (per-expert fallback every layer) and a cold sequence's first requests take minutes -- campaigns
 
+0.4.0 stage 1 served (2026-09-06, DESIGN §7.0.2ay): --gguf FILE opens a
+GGUF in process on the served IR of the same architecture (--model) as the
+topology template; the file's Q4_K/Q5_K/Q6_K/Q8_0 rows replace the IR's
+projections as u8 constants and plugin patch 0021 (+p7) decodes the
+super-blocks in its fully-connected kernel -- no unpack at load, no reorder
+at compile. Dense Qwen3.8-27B Q4_K_M: 10/10 on the Prüfstand through the
+GGUF-opened model; against Intel's int4 IR on the 24 GB card, prefill
+3.2-7.6x slower and decode about half (213 / 9.9 t/s at 856 tokens, 174 /
+8.5 at 71.7k; the IR 1,609 / 23.1, 552 / 16.5). The
+template's AWQ activation scales are set to one; its norms equal the
+file's; embedding, GDN state and MTP stay the template's.
+
 After 0.3.0 every open defect or lever is one campaign document under
 docs/campaigns/ (README there: rules, template, index of thirteen); the
 milestone document's backlog rows are frozen and point there. Next feature

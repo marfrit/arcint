@@ -1,0 +1,1101 @@
+# GGUF K-quant weights served as stored: a fully-connected op that decodes the blocks in its kernel
+
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0003-0020 (verified: applies cleanly on the pristine pin with exactly that
+# series). arcint 0.4.0 stage 1, docs/design-gguf-native.md (DESIGN.md section 7.0.2ay).
+#
+# What this is for. arcint opens a GGUF in process on the served IR of the same
+# architecture as a topology template and hands every projection's weight to the
+# plugin as the file's own bytes: a u8 constant [N, row_bytes] of Q4_K / Q5_K / Q6_K /
+# Q8_0 super-blocks, laid out exactly as in the file. The operator's rule for the
+# whole path: no unpack at load, no reorder at compile, no second copy of the weights
+# in any format -- the only bytes on the card are the file's.
+#
+# What changes:
+#   src/plugin/ops/fully_connected_kquant.cpp  A factory for the op arcint builds,
+#                       "FullyConnectedKQuant" in "arcint_opset", recognised by TYPE NAME
+#                       ONLY: the op class lives in arcint (it implements shape inference
+#                       there), the plugin reads two runtime-info integers off the node
+#                       (arcint_kquant_type = the ggml type id, arcint_kquant_k = the
+#                       logical K) and the row count off the weights' shape. No class
+#                       crosses the library boundary. Inputs: activation, weights, an
+#                       optional bias.
+#   primitives/fully_connected.hpp  Three fields on the primitive (kquant_type, kquant_k,
+#                       kquant_n), hashed, compared, serialised.
+#   graph/fully_connected.cpp  Shape inference sees the weights as [N, K] (the memory is
+#                       [N, row_bytes]); a malformed request (a K that is not a whole
+#                       number of blocks, a byte count that is not N rows) is refused
+#                       HERE, on the main thread, as an exception the caller sees -- a
+#                       missing kernel at impl selection would terminate the process from
+#                       a worker thread, which the first version of this patch did.
+#   impls/ocl/fully_connected.cpp  The kernel's weights tensor is pinned to [N, row_bytes]:
+#                       the impl used to re-derive a 2-D weights shape as [bytes / K, K]
+#                       from the activation's feature size, which handed the kernel 27 rows
+#                       of 512 for 48 rows of 288 (measured, the first run of the tests).
+#   impls/onednn/fully_connected_onednn.hpp  oneDNN declines K-quant primitives.
+#   kernel_selector  weight_bias_params carries the three fields; the FC kernel base
+#                       declines K-quant weights unless a kernel says SupportsKQuant();
+#                       the new kernel fully_connected_gpu_kquant (kernels/fully_connected/
+#                       fully_connected_kernel_kquant.{h,cpp}, cl_kernels/
+#                       fully_connected_gpu_kquant.cl, include/batch_headers/
+#                       kquant_utils.cl) asks for the weights' own layout so the compile-
+#                       time reorder is a no-op and decodes super-blocks in its inner loop.
+#                       One LANE per output column; two variants compiled from the one
+#                       source and chosen at dispatch by the activation's row count:
+#                         decode (one row): each lane walks its column's super-blocks,
+#                         decodes a 32-value sub-block into registers and multiplies it
+#                         with the row (one broadcast read per subgroup); K is split over
+#                         four subgroups of a work-group, reduced through local memory.
+#                         prefill (rows > 1): tiles of 32 rows; the decoded sub-block,
+#                         converted to f16, is the lane's column of the B operand of the
+#                         subgroup matrix multiply (XMX, intel_sub_group_f16_f16_matrix_
+#                         mad_k16; subgroup 16 on Xe2, 8 before), the activation tile of a
+#                         super-block is staged in local memory once per work-group of
+#                         eight subgroups and read from there as the A operand. f32
+#                         accumulation; bias, activation and eltwise fusions as the
+#                         reference kernel; 2-D and 3-D activations; dynamic shapes.
+#                       kquant_utils.cl is ggml's dequantize_row_* formula for formula
+#                       (get_scale_min_k4 included), over 32-bit or 16-bit words of the
+#                       block with a shift, a mask and a convert per value. Its reference
+#                       in the tests below is a second, independent transcription of the
+#                       same formulas (kq_host); a host compile of this source is owed.
+#
+# How the kernel got here, measured at the dense model's gate projection (N 17,408, K
+# 5,120, Q4_K, 50 MB of rows; the DISABLED_ timing test prints these): eight
+# versions, the 24 GB card, one launch --
+#   one subgroup per column, lanes over K, byte-wise decode:    M=1 523 us (16 GB card), M=32 9.4 ms
+#     -- private_size 256 in the compiled kernel: a run-time loop bound over the
+#        accumulators sent them to scratch; the activation re-read per column.
+#   lane per column, uniform activation loads, word decode:    M=1 234 us, M=2048 298 ms
+#   + XMX for the tile, A operand from global memory:          M=1 234 us, M=2048 298 ms
+#     -- dropping the A loads alone gave 11 ms: the tile re-read once per 16 columns.
+#   + A tile staged in local memory per work-group (this one):  M=1 225 us (222 GB/s of
+#        rows), M=32 0.95 ms, M=256 5.6 ms, M=2048 39.5 ms; 16 GB card 509 us / 78 ms.
+#
+# Red first: eleven correctness cases (Q4_K at M = 1, 37 and a 3-D 5; Q5_K; Q6_K at
+# 1 and a 3-D 19; Q8_0; K over one to five super-blocks, N not a multiple of the
+# subgroup) build random, structurally valid super-blocks, dequantize them on the host
+# with ggml's formulas, and compare the kernel's output with a plain f32 matmul at
+# 2e-3 relative plus, for the tiled variant, 2^-11 of the sum of |x_k w_k| (its
+# weights are f16 copies) -- with the weights tensor mis-derived (above) every case
+# failed with "could not find a suitable kernel"; all eleven pass on both cards, the
+# refusal case is an exception at network build. The fully-connected suite is
+# unchanged beside them.
+#
+# MEASURED end to end (arcint at the stage-1 commit, 24 GB card): the dense
+# Qwen3.8-27B Q4_K_M file opens on the dense IR template -- 497 projections from the
+# file (Q4_K x288, Q6_K x65, Q5_K x48, F32 x96), 14.94 GiB resident -- and scores
+# 10/10 on the Prüfstand through the served endpoint. Rates, the same card, one fresh process per cell, u8 KV, one lane, MTP off,
+# prefix cache off, the chunk the fit's choice per arm (256 for this path: it charges 2.65
+# GiB of activations for the kernel's f32 outputs; 2048 for the IR): 213 t/s prefill and
+# 9.9 t/s decode at 856 prompt tokens, 173.8 and 8.5 at 71,727, against Intel's own int4
+# IR export of the same model at 1,609 / 23.1 and 551.7 / 16.5 -- prefill 3.2x to 7.6x
+# slower, decode about 2x. No fault line in any cell. The first kernel served at 28.8
+# and 3.5.
+#
+# What this patch does NOT do: the embedding gather (the template's i8 embedding stays,
+# a later patch), the expert fusion for MoE files (stage 2), the sub-4-bit block types
+# IQ4_XS / IQ3_S / IQ3_XXS / Q3_K (stage 3), any activation-side dynamic quantisation,
+# 2-D block loads for the A operand (Xe2 only; the next step for prefill).
+#
+# Upstream: not yet filed.
+
+--- a/src/plugins/intel_gpu/include/intel_gpu/plugin/primitives_list.hpp
++++ b/src/plugins/intel_gpu/include/intel_gpu/plugin/primitives_list.hpp
+@@ -298,6 +298,7 @@
+ REGISTER_FACTORY(internal, MulticlassNmsIEInternal);
+ REGISTER_FACTORY(internal, FullyConnected);
+ REGISTER_FACTORY(internal, FullyConnectedCompressed);
++REGISTER_FACTORY(internal, FullyConnectedKQuant);
+ REGISTER_FACTORY(internal, RMS);
+ REGISTER_FACTORY(internal, GatherCompressed);
+ REGISTER_FACTORY(internal, KVCache);
+--- a/src/plugins/intel_gpu/include/intel_gpu/primitives/fully_connected.hpp
++++ b/src/plugins/intel_gpu/include/intel_gpu/primitives/fully_connected.hpp
+@@ -178,6 +178,14 @@
+     /// @brief Weights transposed.
+     bool weights_transposed = true;
+ 
++    // arcint (patch 0021): a GGUF K-quant weight served as stored. 0 = not one; otherwise the
++    // ggml type id (8 = Q8_0, 12 = Q4_K, 13 = Q5_K, 14 = Q6_K) and the logical contraction
++    // size K -- the weights memory itself is u8 [N, row_bytes], the file's bytes, so the
++    // kernel that reads it is the only place the blocks are decoded (no reorder, no unpack).
++    uint8_t kquant_type = 0;
++    size_t kquant_k = 0;
++    size_t kquant_n = 0;
++
+ 
+     size_t hash() const override {
+         size_t seed = primitive::hash();
+@@ -193,6 +201,9 @@
+         seed = hash_combine(seed, activation_precomputed_reduction.is_valid());
+         seed = hash_combine(seed, decompression_zero_point_scalar.has_value());
+         seed = hash_combine(seed, decompression_zero_point_scalar.value_or(0.0f));
++        seed = hash_combine(seed, kquant_type);
++        seed = hash_combine(seed, kquant_k);
++        seed = hash_combine(seed, kquant_n);
+         return seed;
+     }
+ 
+@@ -212,7 +223,10 @@
+                activation_scale.is_valid() == rhs_casted.activation_scale.is_valid() &&
+                activation_zero_point.is_valid() == rhs_casted.activation_zero_point.is_valid() &&
+                activation_precomputed_reduction.is_valid() == rhs_casted.activation_precomputed_reduction.is_valid() &&
+-               decompression_zero_point_scalar.value_or(0.0f) == rhs_casted.decompression_zero_point_scalar.value_or(0.0f);
++               decompression_zero_point_scalar.value_or(0.0f) == rhs_casted.decompression_zero_point_scalar.value_or(0.0f) &&
++               kquant_type == rhs_casted.kquant_type &&
++               kquant_k == rhs_casted.kquant_k &&
++               kquant_n == rhs_casted.kquant_n;
+     }
+ 
+     void save(BinaryOutputBuffer& ob) const override {
+@@ -239,6 +253,9 @@
+         } else {
+             ob << false;
+         }
++        ob << kquant_type;
++        ob << kquant_k;
++        ob << kquant_n;
+     }
+ 
+     void load(BinaryInputBuffer& ib) override {
+@@ -267,6 +284,9 @@
+         } else {
+             decompression_zero_point_scalar = std::optional<float>();
+         }
++        ib >> kquant_type;
++        ib >> kquant_k;
++        ib >> kquant_n;
+     }
+ 
+ protected:
+--- a/src/plugins/intel_gpu/src/graph/fully_connected.cpp
++++ b/src/plugins/intel_gpu/src/graph/fully_connected.cpp
+@@ -100,6 +100,20 @@
+     auto input_layout = impl_param.get_input_layout();
+     auto input_pshape = input_layout.get_partial_shape();
+     auto weights_layout = *impl_param.weights_layout;
++    // arcint (patch 0021): a K-quant weight is u8 [N, row_bytes]; shape inference wants [N, K].
++    if (desc->kquant_type != 0) {
++        // Refused here, on the main thread, so a malformed request is an exception the caller sees
++        // (a missing kernel at impl selection would terminate the process from a worker thread).
++        const auto t = desc->kquant_type; const auto k = desc->kquant_k;
++        const size_t row_bytes = t == 8 ? (k % 32 ? 0 : (k / 32) * 34) : t == 12 ? (k % 256 ? 0 : (k / 256) * 144)
++                               : t == 13 ? (k % 256 ? 0 : (k / 256) * 176) : t == 14 ? (k % 256 ? 0 : (k / 256) * 210) : 0;
++        const auto wp = weights_layout.get_partial_shape();
++        const size_t total = wp.is_static() ? ov::shape_size(wp.to_shape()) : 0;
++        OPENVINO_ASSERT(row_bytes != 0 && desc->kquant_n != 0 && total == desc->kquant_n * row_bytes,
++                        "[GPU] ", desc->id, ": K-quant weights of ggml type ", static_cast<int>(t), " need K a multiple of the block (K = ", k,
++                        ") and ", desc->kquant_n, " rows of ", row_bytes, " bytes; the constant holds ", total, " bytes");
++        weights_layout.set_partial_shape(ov::PartialShape{static_cast<int64_t>(desc->kquant_n), static_cast<int64_t>(desc->kquant_k)});
++    }
+     auto weights_pshape = weights_layout.get_partial_shape();
+     auto output_type = desc->output_data_types[0].value_or(input_layout.data_type);
+     if (data_type_traits::is_i8_u8(input_layout.data_type) && desc->output_data_types[0])
+@@ -190,6 +204,20 @@
+     auto desc = impl_param.typed_desc<fully_connected>();
+     auto input_layout = impl_param.get_input_layout();
+     auto weights_layout = *impl_param.weights_layout;
++    // arcint (patch 0021): see calc_output_layout above.
++    if (desc->kquant_type != 0) {
++        // Refused here, on the main thread, so a malformed request is an exception the caller sees
++        // (a missing kernel at impl selection would terminate the process from a worker thread).
++        const auto t = desc->kquant_type; const auto k = desc->kquant_k;
++        const size_t row_bytes = t == 8 ? (k % 32 ? 0 : (k / 32) * 34) : t == 12 ? (k % 256 ? 0 : (k / 256) * 144)
++                               : t == 13 ? (k % 256 ? 0 : (k / 256) * 176) : t == 14 ? (k % 256 ? 0 : (k / 256) * 210) : 0;
++        const auto wp = weights_layout.get_partial_shape();
++        const size_t total = wp.is_static() ? ov::shape_size(wp.to_shape()) : 0;
++        OPENVINO_ASSERT(row_bytes != 0 && desc->kquant_n != 0 && total == desc->kquant_n * row_bytes,
++                        "[GPU] ", desc->id, ": K-quant weights of ggml type ", static_cast<int>(t), " need K a multiple of the block (K = ", k,
++                        ") and ", desc->kquant_n, " rows of ", row_bytes, " bytes; the constant holds ", total, " bytes");
++        weights_layout.set_partial_shape(ov::PartialShape{static_cast<int64_t>(desc->kquant_n), static_cast<int64_t>(desc->kquant_k)});
++    }
+ 
+     auto output_type = desc->output_data_types[0].value_or(input_layout.data_type);
+     if (data_type_traits::is_i8_u8(input_layout.data_type) && desc->output_data_types[0])
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl/fully_connected.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl/fully_connected.cpp
+@@ -108,7 +108,14 @@
+                 input0_layout.set_partial_shape(reshape_to_2d(input0_pshape, feature, primitive->input_size));
+                 input0_layout.format = format::bfyx;
+             }
+-            if (input1_pshape.size() != 2) {
++            if (primitive->kquant_type != 0) {
++                // arcint (patch 0021): the file's bytes, [N, row_bytes] -- never re-derived from K.
++                const int64_t total = input1_pshape.is_static() ? static_cast<int64_t>(ov::shape_size(input1_pshape.to_shape())) : 0;
++                const int64_t n = static_cast<int64_t>(primitive->kquant_n);
++                OPENVINO_ASSERT(n > 0 && total % n == 0, "[GPU] K-quant weights of ", total, " bytes are not ", n, " rows");
++                input1_layout.set_partial_shape(ov::PartialShape{n, total / n});
++                input1_layout.format = format::bfyx;
++            } else if (input1_pshape.size() != 2) {
+                 input1_layout.set_partial_shape(reshape_to_2d(input1_pshape, feature, primitive->weights_rank));
+                 // input1_layout.format = format::bfyx;
+             }
+@@ -175,6 +182,10 @@
+         auto updated_impl_param = update_impl_params(impl_param);
+         auto params = get_weights_bias_default_params<kernel_selector::fully_connected_params>(updated_impl_param, false, is_shape_agnostic);
+         params.allowInputReordering = true;
++        // arcint (patch 0021)
++        params.kquant_type = primitive->kquant_type;
++        params.kquant_k = primitive->kquant_k;
++        params.kquant_n = primitive->kquant_n;
+ 
+         bool commpressed = primitive->decompression_scale.is_valid();
+         bool with_zp = primitive->decompression_zero_point.is_valid();
+--- a/src/plugins/intel_gpu/src/graph/impls/onednn/fully_connected_onednn.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/onednn/fully_connected_onednn.hpp
+@@ -32,6 +32,9 @@
+             LOG_AND_RETURN_FALSE(node);
+ 
+         const auto& fc_node = node.as<fully_connected>();
++        // arcint (patch 0021): K-quant weights are decoded by the OCL kquant kernel only.
++        if (fc_node.get_primitive()->kquant_type != 0)
++            LOG_AND_RETURN_FALSE(node);
+         const auto& in_layout = fc_node.get_input_layout(0);
+         const auto& out_layout = fc_node.get_output_layout(0);
+         auto in0_dt = in_layout.data_type;
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_base.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_base.cpp
+@@ -191,6 +191,10 @@
+             DO_NOT_USE_THIS_KERNEL(p.layerID);
+     }
+ 
++    // arcint (patch 0021): K-quant weights are u8 bytes only a decoding kernel can read.
++    if (params.kquant_type != 0 && !SupportsKQuant())
++        DO_NOT_USE_THIS_KERNEL(p.layerID);
++
+     return true;
+ }
+ 
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_base.h
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_base.h
+@@ -66,6 +66,8 @@
+ 
+     // Fused ops
+     virtual JitConstants GetFusedPrimitivesJitConstants(const fully_connected_params& params, const DispatchData& dispatchData) const;
++    // arcint (patch 0021): only a kernel that decodes K-quant blocks may take K-quant weights.
++    virtual bool SupportsKQuant() const { return false; }
+     Datatype GetAccumulatorType(const fully_connected_params& params) const;
+     Datatype GetActivationType(const fully_connected_params& params) const;
+     // --Fused ops
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_selector.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_selector.cpp
+@@ -22,6 +22,7 @@
+ #include "fully_connected_kernel_bf_tiled.h"
+ #include "fully_connected_kernel_bf_tiled_dyn_b.h"
+ #include "fully_connected_kernel_gemv.h"
++#include "fully_connected_kernel_kquant.h"
+ 
+ namespace kernel_selector {
+ 
+@@ -47,6 +48,7 @@
+     // Standalone is kept at low priority for force_implementations test support.
+     Attach<FullyConnected_bf_tiled_dyn_b>();
+     Attach<FullyConnected_GEMV>();
++    Attach<FullyConnected_kquant>();
+ }
+ 
+ KernelsData fully_connected_kernel_selector::GetBestKernels(const Params& params) const {
+--- a/src/plugins/intel_gpu/src/kernel_selector/weight_bias_params.h
++++ b/src/plugins/intel_gpu/src/kernel_selector/weight_bias_params.h
+@@ -24,6 +24,11 @@
+     DataTensor decompression_scale;
+     DataTensor decompression_zero_point;
+ 
++    // arcint (patch 0021): GGUF K-quant weights (ggml type id, logical K); 0 = not one.
++    uint8_t kquant_type = 0;
++    size_t kquant_k = 0;
++    size_t kquant_n = 0;
++
+     ParamsKey GetParamsKey() const override;
+ };
+ 
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/fully_connected_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/fully_connected_gpu_test.cpp
+@@ -21,6 +21,8 @@
+ #include "fully_connected_inst.h"
+ 
+ #include <cmath>
++#include <chrono>
++#include <iostream>
+ 
+ using namespace cldnn;
+ using namespace ::tests;
+@@ -6548,3 +6550,210 @@
+                                            std::make_tuple(2, 8, 4, 4, 3, true)          // 3D with zero-point
+                                            ),
+                          fully_connected_gpu_u2_validation::GetTestCaseName);
++
++
++// ------------------------------------------------------------------------------------------------
++// arcint (patch 0021): GGUF K-quant weights served as stored, decoded in the kernel.
++// Red case: with the kquant kernel absent (or declining), a fully_connected whose primitive
++// carries kquant_type has no implementation and the network fails to build; with it, the output
++// must match a plain f32 reference over the host-dequantized weights. The host decoder here is
++// ggml's formula (a copy; arcint's own reference lives in its src/core/gguf_dequant.cpp).
++namespace {
++
++struct kq_host {
++    static float f16(const uint8_t* p) { return static_cast<float>(ov::float16::from_bits(static_cast<uint16_t>(p[0] | (p[1] << 8)))); }
++    static void scale_min_k4(int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
++        if (j < 4) { d = q[j] & 63; m = q[j + 4] & 63; }
++        else { d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
++    }
++    static size_t row_bytes(int t, size_t k) {
++        switch (t) { case 8: return k / 32 * 34; case 12: return k / 256 * 144; case 13: return k / 256 * 176; case 14: return k / 256 * 210; }
++        return 0;
++    }
++    static void dequant_row(int t, const uint8_t* row, size_t k, float* y) {
++        if (t == 8) {
++            for (size_t b = 0; b < k / 32; ++b) {
++                const uint8_t* q = row + b * 34; const float d = f16(q);
++                for (int l = 0; l < 32; ++l) y[b * 32 + l] = d * static_cast<float>(static_cast<int8_t>(q[2 + l]));
++            }
++            return;
++        }
++        for (size_t b = 0; b < k / 256; ++b) {
++            float* yb = y + b * 256;
++            if (t == 12 || t == 13) {
++                const uint8_t* q = row + b * (t == 12 ? 144 : 176);
++                const float d = f16(q), dmin = f16(q + 2);
++                const uint8_t* qh = q + 16;
++                const uint8_t* qs = t == 12 ? q + 16 : q + 48;
++                int is = 0; uint8_t u1 = 1, u2 = 2;
++                for (int j = 0; j < 256; j += 64) {
++                    uint8_t sc, m;
++                    scale_min_k4(is + 0, q + 4, sc, m); const float d1 = d * sc, m1 = dmin * m;
++                    scale_min_k4(is + 1, q + 4, sc, m); const float d2 = d * sc, m2 = dmin * m;
++                    for (int l = 0; l < 32; ++l) yb[j + l] = d1 * ((qs[l] & 0xF) + (t == 13 && (qh[l] & u1) ? 16 : 0)) - m1;
++                    for (int l = 0; l < 32; ++l) yb[j + 32 + l] = d2 * ((qs[l] >> 4) + (t == 13 && (qh[l] & u2) ? 16 : 0)) - m2;
++                    qs += 32; is += 2; u1 <<= 2; u2 <<= 2;
++                }
++            } else {  // Q6_K
++                const uint8_t* q = row + b * 210;
++                const uint8_t* ql = q; const uint8_t* qh = q + 128; const int8_t* sc = reinterpret_cast<const int8_t*>(q + 192);
++                const float d = f16(q + 208);
++                for (int n = 0; n < 256; n += 128) {
++                    for (int l = 0; l < 32; ++l) {
++                        const int is = l / 16;
++                        const int q1 = ((ql[l + 0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
++                        const int q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
++                        const int q3 = ((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
++                        const int q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
++                        yb[n + l + 0] = d * sc[is + 0] * q1;
++                        yb[n + l + 32] = d * sc[is + 2] * q2;
++                        yb[n + l + 64] = d * sc[is + 4] * q3;
++                        yb[n + l + 96] = d * sc[is + 6] * q4;
++                    }
++                    ql += 64; qh += 32; sc += 8;
++                }
++            }
++        }
++    }
++    // Structurally valid random blocks: every byte random except the f16 scales, drawn small.
++    static std::vector<uint8_t> random_rows(tests::random_generator& rg, int t, size_t n, size_t k) {
++        const size_t rb = row_bytes(t, k);
++        std::vector<uint8_t> bytes = rg.generate_random_1d<uint8_t>(n * rb, 0, 255);
++        auto put_f16 = [&](size_t off, float v) { const uint16_t b = ov::float16(v).to_bits(); bytes[off] = b & 0xFF; bytes[off + 1] = b >> 8; };
++        for (size_t r = 0; r < n; ++r) {
++            for (size_t blk = 0; blk < rb / (t == 8 ? 34 : (t == 12 ? 144 : (t == 13 ? 176 : 210))); ++blk) {
++                const size_t base = r * rb + blk * (t == 8 ? 34 : (t == 12 ? 144 : (t == 13 ? 176 : 210)));
++                const float sd = 0.001f + 0.004f * static_cast<float>(rg.generate_random_1d<uint8_t>(1, 0, 255)[0]) / 255.f;
++                if (t == 8) put_f16(base, sd * 8);
++                else if (t == 14) put_f16(base + 208, sd * 0.25f);
++                else { put_f16(base, sd); put_f16(base + 2, sd * 0.5f); }
++            }
++        }
++        return bytes;
++    }
++};
++
++}  // namespace
++
++class fully_connected_gpu_kquant : public ::testing::TestWithParam<std::tuple<int, long, bool, size_t, size_t>> {};
++
++TEST_P(fully_connected_gpu_kquant, matches_the_host_dequantized_reference) {
++    const int t = std::get<0>(GetParam());
++    const long m = std::get<1>(GetParam());
++    const bool three_d = std::get<2>(GetParam());
++    tests::random_generator rg(GET_SUITE_NAME);
++    auto& engine = get_test_engine();
++
++    const size_t K = std::get<3>(GetParam()), N = std::get<4>(GetParam());
++    const size_t rb = kq_host::row_bytes(t, K);
++    auto wbytes = kq_host::random_rows(rg, t, N, K);
++    std::vector<float> wf(N * K);
++    for (size_t r = 0; r < N; ++r) kq_host::dequant_row(t, wbytes.data() + r * rb, K, wf.data() + r * K);
++
++    auto xh = rg.generate_random_1d<ov::float16>(static_cast<size_t>(m) * K, -2.0f, 2.0f);
++    std::vector<float> xf(xh.begin(), xh.end());
++
++    // Reference: plain f32 matmul on the host over the dequantized weights.
++    std::vector<float> ref(static_cast<size_t>(m) * N, 0.f), refmag(ref.size(), 0.f);
++    for (long i = 0; i < m; ++i)
++        for (size_t n = 0; n < N; ++n) {
++            double acc = 0, mag = 0;
++            for (size_t k = 0; k < K; ++k) {
++                const double p = static_cast<double>(xf[i * K + k]) * wf[n * K + k];
++                acc += p; mag += std::fabs(p);
++            }
++            ref[i * N + n] = static_cast<float>(acc);
++            refmag[i * N + n] = static_cast<float>(mag);
++        }
++
++    const ov::PartialShape in_shape = three_d ? ov::PartialShape{1, m, static_cast<long>(K)} : ov::PartialShape{m, static_cast<long>(K)};
++    auto input_mem = engine.allocate_memory({ in_shape, data_types::f16, format::bfyx });
++    set_values(input_mem, xh);
++    auto weights_mem = engine.allocate_memory({ { static_cast<long>(N), static_cast<long>(rb) }, data_types::u8, format::bfyx });
++    set_values(weights_mem, wbytes);
++
++    auto fc = fully_connected("fc_kq", input_info("input"), "weights", "", data_types::f32, three_d ? 3 : 2, 2, true);
++    fc.kquant_type = static_cast<uint8_t>(t);
++    fc.kquant_k = K;
++    fc.kquant_n = N;
++    const ov::PartialShape dyn_shape = three_d ? ov::PartialShape{1, -1, static_cast<long>(K)} : ov::PartialShape{-1, static_cast<long>(K)};
++    topology topology(input_layout("input", layout{ dyn_shape, data_types::f16, format::bfyx }), data("weights", weights_mem), fc);
++    auto config = get_test_default_config(engine);
++    config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
++    config.set_property(ov::intel_gpu::optimize_data(true));
++    network net(engine, topology, config);
++    net.set_input_data("input", input_mem);
++    auto outputs = net.execute();
++    ASSERT_EQ(outputs.size(), size_t(1));
++    auto out_mem = outputs.begin()->second.get_memory();
++    cldnn::mem_lock<float> out(out_mem, get_test_stream());
++    ASSERT_EQ(out.size(), ref.size());
++    for (size_t i = 0; i < ref.size(); ++i) {
++        // f32 accumulation in a different order; the tiled variant (M > 1) multiplies f16 copies
++        // of the decoded weights, each within 2^-11 relative.
++        const float tol = 2e-3f * (1.0f + std::fabs(ref[i])) + (m > 1 ? 4.9e-4f * refmag[i] : 0.f);
++        ASSERT_NEAR(out[i], ref[i], tol) << "type " << t << " m " << m << " i " << i;
++    }
++}
++
++// (type, M, 3-D activation, K, N): K spans one to five super-blocks (so lanes get unequal
++// sub-block counts), N is not a multiple of the subgroup, M crosses the row tile.
++INSTANTIATE_TEST_SUITE_P(smoke, fully_connected_gpu_kquant,
++    ::testing::Values(std::make_tuple(12, 1L, false, 512, 48), std::make_tuple(12, 37L, false, 512, 48),
++                      std::make_tuple(12, 5L, true, 512, 48), std::make_tuple(13, 3L, false, 512, 48),
++                      std::make_tuple(14, 1L, false, 512, 48), std::make_tuple(14, 19L, true, 512, 48),
++                      std::make_tuple(8, 2L, false, 512, 48),
++                      std::make_tuple(12, 100L, true, 1280, 300), std::make_tuple(14, 65L, false, 256, 17),
++                      std::make_tuple(8, 1L, false, 96, 5), std::make_tuple(13, 33L, true, 768, 64)));
++
++TEST(fully_connected_gpu_kquant_refusal, a_k_that_is_not_a_whole_number_of_super_blocks_has_no_kernel) {
++    auto& engine = get_test_engine();
++    const size_t K = 300, N = 16;  // not a multiple of 256: no row_bytes, every kernel declines
++    auto input_mem = engine.allocate_memory({ { 1, static_cast<long>(K) }, data_types::f16, format::bfyx });
++    auto weights_mem = engine.allocate_memory({ { static_cast<long>(N), 200 }, data_types::u8, format::bfyx });
++    auto fc = fully_connected("fc_kq", input_info("input"), "weights", "", data_types::f32, 2, 2, true);
++    fc.kquant_type = 12;
++    fc.kquant_k = K;
++    fc.kquant_n = N;
++    topology topology(input_layout("input", layout{ { -1, static_cast<long>(K) }, data_types::f16, format::bfyx }), data("weights", weights_mem), fc);
++    auto config = get_test_default_config(engine);
++    config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
++    // The shape-inference refusal, by its message -- not just any throw.
++    try {
++        network net(engine, topology, config); net.set_input_data("input", input_mem); net.execute();
++        FAIL() << "a K that is not a whole number of super-blocks was accepted";
++    } catch (const ov::Exception& e) {
++        ASSERT_NE(std::string(e.what()).find("K-quant weights of ggml type"), std::string::npos) << e.what();
++    }
++}
++
++// Timing at the dense model's gate projection shape, both kernels (run by name; prints KQPERF lines).
++TEST(fully_connected_gpu_kquant_perf, DISABLED_gate_proj_shape_q4k_rows_1_to_2048) {
++    tests::random_generator rg(GET_SUITE_NAME);
++    auto& engine = get_test_engine();
++    const size_t K = 5120, N = 17408; const int t = 12;
++    const size_t rb = kq_host::row_bytes(t, K);
++    auto wbytes = rg.generate_random_1d<uint8_t>(N * rb, 0, 255);
++    auto weights_mem = engine.allocate_memory({ { (long)N, (long)rb }, data_types::u8, format::bfyx });
++    set_values(weights_mem, wbytes);
++    for (long m : {1L, 32L, 256L, 2048L}) {
++        auto xh = rg.generate_random_1d<ov::float16>(m * K, -1.0f, 1.0f);
++        auto input_mem = engine.allocate_memory({ { m, (long)K }, data_types::f16, format::bfyx });
++        set_values(input_mem, xh);
++        auto fc = fully_connected("fc_kq", input_info("input"), "weights", "", data_types::f16, 2, 2, true);
++        fc.kquant_type = t; fc.kquant_k = K; fc.kquant_n = N;
++        topology topology(input_layout("input", layout{ { -1, (long)K }, data_types::f16, format::bfyx }), data("weights", weights_mem), fc);
++        auto config = get_test_default_config(engine);
++        config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
++        network net(engine, topology, config);
++        net.set_input_data("input", input_mem);
++        net.execute(); net.get_stream().finish();
++        const int reps = 10;
++        auto t0 = std::chrono::steady_clock::now();
++        for (int i = 0; i < reps; ++i) { net.execute(); }
++        net.get_stream().finish();
++        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
++        std::cout << "KQPERF M=" << m
++                  << " N=" << N << " K=" << K << " Q4_K: " << us << " us per run, " << (double)(N * rb) / us / 1e3 << " GB/s weights" << std::endl;
++    }
++}
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
+@@ -0,0 +1,235 @@
++// arcint (patch 0021): fully connected over GGUF K-quant weights, decoded in the inner loop.
++// One LANE per output column: each lane walks its own row's super-blocks along K and decodes
++// one 32-value sub-block at a time into registers. Weights stay in their file layout
++// (KQ_ROW_BYTES per row); nothing is unpacked outside this kernel.
++//
++// Two variants are compiled from this source and chosen at dispatch by the row count (host
++// side):
++//   TILE_M == 1 (decode): the weights are the whole stream. Each lane multiplies its decoded
++//   sub-block with the one activation row -- the same address in every lane, one broadcast
++//   read per subgroup -- and K is split over the KQ_WG subgroups of a work-group (reduced
++//   through local memory) so enough subgroups are in flight to cover the load latency.
++//   TILE_M > 1 (prefill): the decoded sub-block, converted to f16, is this lane's column of
++//   the B operand of the subgroup matrix multiply (XMX, cl_intel_subgroup_matrix_multiply_
++//   accumulate); the activation rows are the A operand. A work-group of KQ_WG subgroups
++//   (KQ_WG x SIMD columns) stages each super-block's activation tile (TILE_M rows x 256 k)
++//   in local memory once and every subgroup reads its A operands from there: reading them
++//   from global memory per subgroup re-read the tile once per 16 columns and ran at a
++//   fraction of the matrix unit (measured, 30x). The weights are read and decoded once per
++//   TILE_M rows.
++//
++// Every loop over the tile has a compile-time bound and every private array a constant index
++// after unrolling: rows and columns past the end are clamped to the last one and their
++// results dropped, rather than bounded at run time. A run-time bound sends the accumulators
++// to scratch memory (the compiled kernel reports private_size > 0), measured as a 10x loss.
++#include "include/batch_headers/fetch_data.cl"
++#include "include/batch_headers/kquant_utils.cl"
++
++#if KQ_TYPE == 8
++#  define KQ_BLOCK 32
++#  define KQ_BLOCK_BYTES 34
++#  define KQ_SUBS 1
++#  define KQ_DECODE(blk, s, y) kq_dec_q8_0(blk, y)
++#elif KQ_TYPE == 12
++#  define KQ_BLOCK 256
++#  define KQ_BLOCK_BYTES 144
++#  define KQ_SUBS 8
++#  define KQ_DECODE(blk, s, y) kq_dec_q4_K_sub(blk, s, y)
++#elif KQ_TYPE == 13
++#  define KQ_BLOCK 256
++#  define KQ_BLOCK_BYTES 176
++#  define KQ_SUBS 8
++#  define KQ_DECODE(blk, s, y) kq_dec_q5_K_sub(blk, s, y)
++#elif KQ_TYPE == 14
++#  define KQ_BLOCK 256
++#  define KQ_BLOCK_BYTES 210
++#  define KQ_SUBS 8
++#  define KQ_DECODE(blk, s, y) kq_dec_q6_K_sub(blk, s, y)
++#else
++#  error "fully_connected_gpu_kquant.cl: unsupported KQ_TYPE"
++#endif
++
++#define KQ_BLOCKS (KQ_K / KQ_BLOCK)
++
++#if TILE_M > 1
++// A operand of the f16 matrix multiply, one 8 x 16 tile of activation rows: with 16 lanes a
++// lane holds one k per row (short), with 8 lanes two consecutive k (int).
++#  if SIMD == 16
++#    define KQ_A_T short8
++#    define KQ_A_ELEM short
++#  elif SIMD == 8
++#    define KQ_A_T int8
++#    define KQ_A_ELEM int
++#  else
++#    error "fully_connected_gpu_kquant.cl: the matrix multiply takes a subgroup of 8 or 16"
++#  endif
++#  define KQ_GROUPS (TILE_M / 8)
++// The staged activation tile: TILE_M rows of one super-block (KQ_BLOCK halves), 16 bytes per
++// work-item per pass.
++#  define KQ_TILE_BYTES (TILE_M * KQ_BLOCK * 2)
++#  define KQ_WG_ITEMS (SIMD * KQ_WG)
++#  define KQ_TILE_PASSES (KQ_TILE_BYTES / (16 * KQ_WG_ITEMS))
++#  if KQ_TILE_PASSES * 16 * KQ_WG_ITEMS != KQ_TILE_BYTES
++#    error "fully_connected_gpu_kquant.cl: the activation tile is not a whole number of passes"
++#  endif
++#endif
++
++REQD_SUB_GROUP_SIZE(SIMD)
++__attribute__((reqd_work_group_size(SIMD, KQ_WG, 1)))
++KERNEL(fully_connected_gpu_kquant)(
++    OPTIONAL_SHAPE_INFO_ARG
++    const __global INPUT0_TYPE* input,
++    __global OUTPUT_TYPE* output,
++    const __global uchar* weights
++#if BIAS_TERM
++    , const __global BIAS_TYPE* biases
++#endif
++#if HAS_FUSED_OPS_DECLS
++    , FUSED_OPS_DECLS
++#endif
++)
++{
++    const uint lane = get_local_id(0);
++    const uint sg = get_local_id(1);
++    const uint tile = get_global_id(2);
++#if OUTPUT_3D
++    const uint rows_per_batch = INPUT0_FEATURE_NUM;
++    const uint rows = INPUT0_BATCH_NUM * rows_per_batch;
++#else
++    const uint rows = INPUT0_BATCH_NUM;
++#endif
++    const uint r0 = tile * TILE_M;
++    if (r0 >= rows)                        // uniform over the work-group
++        return;
++
++#if TILE_M == 1
++    const uint n = get_global_id(0);       // lane = output column; the work-group's subgroups split K
++    const uint nn = min(n, (uint)KQ_N - 1);
++#if OUTPUT_3D
++    const uint ibase = INPUT0_GET_INDEX(r0 / rows_per_batch, r0 % rows_per_batch, 0, 0);
++#else
++    const uint ibase = INPUT0_GET_INDEX(r0, 0, 0, 0);
++#endif
++    const __global uchar* wrow = weights + (ulong)nn * KQ_ROW_BYTES;
++    const uint kb0 = (sg * KQ_BLOCKS) / KQ_WG, kb1 = ((sg + 1) * KQ_BLOCKS) / KQ_WG;
++    float4 acc = (float4)(0.0f);
++    for (uint kb = kb0; kb < kb1; ++kb) {
++        const __global uchar* blk = wrow + kb * KQ_BLOCK_BYTES;
++        __attribute__((opencl_unroll_hint(KQ_SUBS)))
++        for (uint s = 0; s < KQ_SUBS; ++s) {
++            float y[32];
++            KQ_DECODE(blk, s, y);
++            const float16 ya = vload16(0, y);
++            const float16 yb = vload16(0, y + 16);
++            const __global INPUT0_TYPE* x = input + ibase + kb * KQ_BLOCK + s * 32;  // one address for the whole subgroup
++            const float16 fa = convert_float16(vload16(0, x));
++            const float16 fb = convert_float16(vload16(0, x + 16));
++            const float16 p = fma(fa, ya, fb * yb);
++            const float8 p8 = p.lo + p.hi;
++            acc += p8.lo + p8.hi;
++        }
++    }
++#  if KQ_WG > 1
++    __local float4 red[KQ_WG][SIMD];
++    red[sg][lane] = acc;
++    barrier(CLK_LOCAL_MEM_FENCE);
++    if (sg != 0)
++        return;
++    for (uint j = 1; j < KQ_WG; ++j) acc += red[j][lane];
++#  endif
++    float sums[1];
++    sums[0] = (acc.s0 + acc.s1) + (acc.s2 + acc.s3);
++#else
++    const uint n = (get_group_id(0) * KQ_WG + sg) * SIMD + lane;   // lane = output column; the work-group's subgroups take KQ_WG x SIMD columns
++    const uint nn = min(n, (uint)KQ_N - 1);
++    const __global uchar* wrow = weights + (ulong)nn * KQ_ROW_BYTES;
++
++    // This work-item's share of the tile staging: 16 bytes of one row per pass.
++    const uint item = sg * SIMD + lane;
++    uint stage_src[KQ_TILE_PASSES];
++    __attribute__((opencl_unroll_hint(KQ_TILE_PASSES)))
++    for (uint p = 0; p < KQ_TILE_PASSES; ++p) {
++        const uint chunk = p * KQ_WG_ITEMS + item;            // 16-byte chunk of the tile
++        const uint t = chunk / (KQ_BLOCK * 2 / 16);           // row of the tile
++        const uint off = (chunk % (KQ_BLOCK * 2 / 16)) * 8;   // halves into the row's super-block
++        const uint r = min(r0 + t, rows - 1);
++#if OUTPUT_3D
++        stage_src[p] = INPUT0_GET_INDEX(r / rows_per_batch, r % rows_per_batch, 0, 0) + off;
++#else
++        stage_src[p] = INPUT0_GET_INDEX(r, 0, 0, 0) + off;
++#endif
++    }
++    __local ushort xt[TILE_M * KQ_BLOCK];
++
++    float8 acc[KQ_GROUPS];
++    __attribute__((opencl_unroll_hint(KQ_GROUPS)))
++    for (uint g = 0; g < KQ_GROUPS; ++g) acc[g] = (float8)(0.0f);
++
++    for (uint kb = 0; kb < KQ_BLOCKS; ++kb) {
++        // Stage this super-block's activation tile.
++        barrier(CLK_LOCAL_MEM_FENCE);                            // the previous super-block's reads are done
++        __attribute__((opencl_unroll_hint(KQ_TILE_PASSES)))
++        for (uint p = 0; p < KQ_TILE_PASSES; ++p) {
++            const uint chunk = p * KQ_WG_ITEMS + item;
++            const uint4 v = vload4(0, (const __global uint*)(input + stage_src[p] + kb * KQ_BLOCK));
++            vstore4(v, 0, (__local uint*)xt + chunk * 4);
++        }
++        barrier(CLK_LOCAL_MEM_FENCE);
++
++        const __global uchar* blk = wrow + kb * KQ_BLOCK_BYTES;
++        __attribute__((opencl_unroll_hint(KQ_SUBS)))
++        for (uint s = 0; s < KQ_SUBS; ++s) {
++            float y[32];
++            KQ_DECODE(blk, s, y);
++            // This lane's column of B for k = 0..15 and 16..31 of the sub-block: 16 halves,
++            // consecutive k paired in each int.
++            const int8 b0 = as_int8(convert_half16(vload16(0, y)));
++            const int8 b1 = as_int8(convert_half16(vload16(0, y + 16)));
++            __attribute__((opencl_unroll_hint(KQ_GROUPS)))
++            for (uint g = 0; g < KQ_GROUPS; ++g) {
++                KQ_A_T a0, a1;
++                __attribute__((opencl_unroll_hint(8)))
++                for (uint t = 0; t < 8; ++t) {
++                    const __local KQ_A_ELEM* xr = (const __local KQ_A_ELEM*)(xt + (g * 8 + t) * KQ_BLOCK + s * 32);
++                    a0[t] = xr[lane];
++                    a1[t] = ((const __local KQ_A_ELEM*)(xt + (g * 8 + t) * KQ_BLOCK + s * 32 + 16))[lane];
++                }
++                acc[g] = intel_sub_group_f16_f16_matrix_mad_k16(a0, b0, acc[g]);
++                acc[g] = intel_sub_group_f16_f16_matrix_mad_k16(a1, b1, acc[g]);
++            }
++        }
++    }
++    float sums[TILE_M];
++    __attribute__((opencl_unroll_hint(KQ_GROUPS)))
++    for (uint g = 0; g < KQ_GROUPS; ++g)
++        __attribute__((opencl_unroll_hint(8)))
++        for (uint t = 0; t < 8; ++t) sums[g * 8 + t] = acc[g][t];
++#endif
++
++    if (n >= KQ_N)
++        return;
++    __attribute__((opencl_unroll_hint(TILE_M)))
++    for (uint t = 0; t < TILE_M; ++t) {
++        const uint r = r0 + t;
++        if (r >= rows) continue;
++        const float sum = sums[t];
++#if OUTPUT_3D
++        const uint b = r / rows_per_batch, m = r % rows_per_batch;
++        const uint dst_index = OUTPUT_GET_INDEX(b, m, n, 0);
++#else
++        const uint m = r;
++        const uint dst_index = OUTPUT_GET_INDEX(m, n, 0, 0);
++#endif
++#if BIAS_TERM
++        ACTIVATION_TYPE dequantized = TO_ACTIVATION_TYPE(sum) + TO_ACTIVATION_TYPE(biases[n]);
++#else
++        ACTIVATION_TYPE dequantized = TO_ACTIVATION_TYPE(sum);
++#endif
++#if HAS_FUSED_OPS
++        FUSED_OPS;
++        output[dst_index] = FUSED_OPS_RESULT;
++#else
++        output[dst_index] = TO_OUTPUT_TYPE(ACTIVATION_TYPED(dequantized, ACTIVATION_PARAMS_TYPED));
++#endif
++    }
++}
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/include/batch_headers/kquant_utils.cl
+@@ -0,0 +1,100 @@
++// arcint (patch 0021): GGUF K-quant super-block decoders (ggml-quants.c's dequantize_row_*,
++// formula for formula). A row of a [N, K] weight is K/256 super-blocks (K/32 for Q8_0) laid
++// end to end, the file's own bytes. Every decoder reads one 32-value sub-block of one
++// super-block from global memory with vector loads into registers, decodes it there, and
++// produces 32 f32 values so the caller fuses the multiply-accumulate without materialising
++// the row.
++//
++// The quantised bytes are handled as 32-bit (Q4_K, Q5_K; 16-byte-aligned blocks) or 16-bit
++// (Q6_K, Q8_0; 210- and 34-byte blocks are only 2-aligned) words and each value is a shift, a
++// mask and a convert out of its word. Byte-wise vectors cost the compiler a move per byte
++// per lane (measured: three times the instructions). Nothing here indexes a private array
++// with a runtime value: the compiled kernel must report no private memory, or every lane's
++// arrays go to scratch and the kernel runs at a fraction of the weight bandwidth (measured).
++// Checked against an independent transcription of the same formulas in the plugin's unit
++// test (kq_host in fully_connected_gpu_test.cpp) and end to end by the served model.
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++
++inline float kq_f16bits(uint h) { return convert_float(as_half((ushort)(h & 0xFFFFu))); }
++inline float kq_f16at(const __global uchar* p) { return kq_f16bits((uint)p[0] | ((uint)p[1] << 8)); }
++
++// Q8_0: 32 values, {f16 d; int8 qs[32]} = 34 bytes; the bytes as 16 little-endian ushorts.
++inline void kq_dec_q8_0(const __global uchar* b, float* y) {
++    const float d = kq_f16at(b);
++    const ushort16 q = vload16(0, (const __global ushort*)(b + 2));
++    __attribute__((opencl_unroll_hint(32)))
++    for (int l = 0; l < 32; ++l) {
++        const int v = ((int)(short)(q[l >> 1] << ((1 - (l & 1)) * 8))) >> 8;  // sign-extend byte l
++        y[l] = d * (float)v;
++    }
++}
++
++// get_scale_min_k4 on the 12 scale bytes held as three little-endian uints (bytes 0-3, 4-7,
++// 8-11): eight 6-bit scales and eight 6-bit mins. j may be a runtime value; only shifts by it.
++inline void kq_scale_min_k4(uint j, uint s0, uint s1, uint s2, uint* d, uint* m) {
++    if (j < 4) {
++        const uint sh = 8 * j;
++        *d = (s0 >> sh) & 63; *m = (s1 >> sh) & 63;
++    } else {
++        const uint sh = 8 * (j - 4);
++        const uint hi = (s2 >> sh) & 0xFF, lo0 = (s0 >> sh) & 0xFF, lo1 = (s1 >> sh) & 0xFF;
++        *d = (hi & 0xF) | ((lo0 >> 6) << 4); *m = (hi >> 4) | ((lo1 >> 6) << 4);
++    }
++}
++
++// Q4_K: 256 values, {f16 d; f16 dmin; uchar scales[12]; uchar qs[128]} = 144 bytes; sub-block s = 0..7.
++// The 16-byte header (d, dmin, scales) is one load; the 32 bytes serving sub-blocks 2j / 2j+1
++// (low / high nibbles) are one more.
++inline void kq_dec_q4_K_sub(const __global uchar* b, uint s, float* y) {
++    const uint4 h = vload4(0, (const __global uint*)b);
++    const float d = kq_f16bits(h.s0), dmin = kq_f16bits(h.s0 >> 16);
++    uint sc, mn;
++    kq_scale_min_k4(s, h.s1, h.s2, h.s3, &sc, &mn);
++    const float dl = d * (float)sc, ml = dmin * (float)mn;
++    const uint8 q = vload8(0, (const __global uint*)(b + 16 + (s >> 1) * 32));
++    const uint shift = (s & 1) * 4;  // low nibbles for even s, high for odd
++    __attribute__((opencl_unroll_hint(32)))
++    for (int l = 0; l < 32; ++l)
++        y[l] = dl * (float)((q[l >> 2] >> ((l & 3) * 8 + shift)) & 0xFu) - ml;
++}
++
++// Q5_K: 256 values, {f16 d; f16 dmin; uchar scales[12]; uchar qh[32]; uchar qs[128]} = 176 bytes.
++inline void kq_dec_q5_K_sub(const __global uchar* b, uint s, float* y) {
++    const uint4 h = vload4(0, (const __global uint*)b);
++    const float d = kq_f16bits(h.s0), dmin = kq_f16bits(h.s0 >> 16);
++    uint sc, mn;
++    kq_scale_min_k4(s, h.s1, h.s2, h.s3, &sc, &mn);
++    const float dl = d * (float)sc, ml = dmin * (float)mn;
++    const uint8 qh = vload8(0, (const __global uint*)(b + 16));
++    const uint8 q = vload8(0, (const __global uint*)(b + 48 + (s >> 1) * 32));
++    const uint shift = (s & 1) * 4;
++    // bit s of qh[l] is the fifth bit: u1 = 1 << 2j for even s, u2 = 2 << 2j for odd s
++    __attribute__((opencl_unroll_hint(32)))
++    for (int l = 0; l < 32; ++l) {
++        const uint nib = (q[l >> 2] >> ((l & 3) * 8 + shift)) & 0xFu;
++        const uint hb = (qh[l >> 2] >> ((l & 3) * 8 + s)) & 1u;
++        y[l] = dl * (float)(nib | (hb << 4)) - ml;
++    }
++}
++
++// Q6_K: 256 values, {uchar ql[128]; uchar qh[64]; int8 scales[16]; f16 d} = 210 bytes. ggml
++// walks two halves of 128 values as four interleaved runs of 32; sub-block s = 0..7 here is
++// 32 consecutive values, i.e. run r = s & 3 of half h = s >> 2. Run r reads ql[l] or ql[l+32]
++// (low or high nibble) and two bits of qh[l]; 64 bytes of ql, 32 of qh and 8 scales per half.
++// The block is 2-aligned only, so the bytes are read as 16-bit words.
++inline void kq_dec_q6_K_sub(const __global uchar* b, uint s, float* y) {
++    const float d = kq_f16at(b + 208);
++    const uint hh = s >> 2, r = s & 3;
++    const ushort16 ql = vload16(0, (const __global ushort*)(b + hh * 64 + (r & 1) * 32));
++    const ushort16 qh = vload16(0, (const __global ushort*)(b + 128 + hh * 32));
++    const __global char* scp = (const __global char*)(b + 192) + hh * 8;
++    const float s0 = d * (float)scp[2 * r], s1 = d * (float)scp[2 * r + 1];
++    const uint shift = 2 * r;
++    const uint nib = (r >> 1) * 4;  // runs 2, 3 read the high nibble
++    __attribute__((opencl_unroll_hint(32)))
++    for (int l = 0; l < 32; ++l) {
++        const uint lo = ((uint)ql[l >> 1] >> ((l & 1) * 8 + nib)) & 0xFu;
++        const uint hi = ((uint)qh[l >> 1] >> ((l & 1) * 8 + shift)) & 3u;
++        y[l] = (l < 16 ? s0 : s1) * (float)((int)(lo | (hi << 4)) - 32);
++    }
++}
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_kquant.h
+@@ -0,0 +1,34 @@
++// arcint (patch 0021): fully connected over GGUF K-quant weights (Q4_K, Q5_K, Q6_K, Q8_0)
++// served as stored -- the weights memory is the file's bytes, u8 [N, row_bytes], decoded in
++// the kernel's inner loop. No unpack at load, no reorder at compile (the kernel asks for the
++// weights' own layout). Design: arcint docs/design-gguf-native.md §3.3.
++#pragma once
++
++#include "fully_connected_kernel_base.h"
++
++namespace kernel_selector {
++
++class FullyConnected_kquant : public FullyConnectedKernelBase {
++public:
++    using Parent = FullyConnectedKernelBase;
++    FullyConnected_kquant() : Parent("fully_connected_gpu_kquant") {}
++
++    using FullyConnectedKernelBase::GetTunedKernelsDataByIndex;
++    KernelsData GetKernelsData(const Params& params) const override;
++    KernelsPriority GetKernelsPriority(const Params& params) const override;
++    ParamsKey GetSupportedKey() const override;
++    DeviceFeaturesKey get_required_device_features_key(const Params& params) const override;
++
++    // Bytes one output row occupies for a ggml type id and a contraction size K; 0 = unsupported.
++    static size_t RowBytes(uint8_t kquant_type, size_t k);
++
++protected:
++    DispatchData SetDefault(const fully_connected_params& params, int autoTuneIndex = -1, int kernel_number = 0) const override;
++    std::vector<FusedOpType> GetSupportedFusedOps() const override { return {FusedOpType::ACTIVATION, FusedOpType::ELTWISE}; }
++    bool Validate(const Params& params) const override;
++    bool SupportsKQuant() const override { return true; }
++    JitConstants GetJitConstants(const fully_connected_params& params, const DispatchData& dispatchData) const override;
++    void GetUpdateDispatchDataFunc(KernelData& kd) const override;
++};
++
++}  // namespace kernel_selector
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_kquant.cpp
+@@ -0,0 +1,186 @@
++// arcint (patch 0021): see fully_connected_kernel_kquant.h.
++#include "fully_connected_kernel_kquant.h"
++#include "kernel_selector_utils.h"
++
++namespace kernel_selector {
++
++static constexpr size_t kSimd = 16;
++// Two variants of the one kernel source, chosen at dispatch by the activation's row count.
++// Kernel 0 carries one row (decode): the weights are the whole stream, read once, and K is
++// split over kKSplitGemv subgroups of a work-group so enough are in flight to cover the load
++// latency. Kernel 1 carries kTileMGemm rows (prefill): the weights are read once per tile and
++// the row tiles supply the parallelism. The tile is bounded by the register file (the decoded
++// sub-block, the activations and four partial sums per row all live in registers).
++static constexpr size_t kTileMGemm = 32;
++static constexpr size_t kKSplitGemv = 4;   // subgroups per work-group splitting K (decode)
++static constexpr size_t kColumnGroups = 8; // subgroups per work-group sharing the staged activation tile (prefill)
++
++static size_t tile_m_of(int kernel_number) { return kernel_number == 0 ? 1 : kTileMGemm; }
++static size_t wg_of(int kernel_number) { return kernel_number == 0 ? kKSplitGemv : kColumnGroups; }
++// The tiled kernel's subgroup is the matrix multiply's N: 16 on Xe2 and later, 8 before.
++static size_t simd_of(const fully_connected_params& params, int kernel_number) {
++    return (kernel_number == 0 || params.engineInfo.arch >= gpu_arch::xe2) ? kSimd : 8;
++}
++
++// Rows of the activation: flattened [M, K] (batch) or [B, M, K] (batch x feature).
++static size_t rows_of(const fully_connected_params& params) {
++    const auto& out = params.outputs[0];
++    size_t rows = out.Batch().v;
++    if (out.GetLayout() == DataLayout::bfyx)
++        rows = out.Batch().v * out.Feature().v;
++    return rows == 0 ? 1 : rows;  // shape-agnostic compile; the real figure comes at dispatch
++}
++
++size_t FullyConnected_kquant::RowBytes(uint8_t t, size_t k) {
++    switch (t) {
++        case 8:  return k % 32 ? 0 : (k / 32) * 34;     // Q8_0
++        case 12: return k % 256 ? 0 : (k / 256) * 144;  // Q4_K
++        case 13: return k % 256 ? 0 : (k / 256) * 176;  // Q5_K
++        case 14: return k % 256 ? 0 : (k / 256) * 210;  // Q6_K
++        default: return 0;
++    }
++}
++
++ParamsKey FullyConnected_kquant::GetSupportedKey() const {
++    ParamsKey k;
++    k.EnableInputDataType(Datatype::F16);
++    k.EnableOutputDataType(Datatype::F16);
++    k.EnableOutputDataType(Datatype::F32);
++    k.EnableInputWeightsType(WeightsType::UINT8);
++    k.EnableInputLayout(DataLayout::bf);
++    k.EnableInputLayout(DataLayout::bfyx);
++    k.EnableOutputLayout(DataLayout::bf);
++    k.EnableOutputLayout(DataLayout::bfyx);
++    k.EnableBiasPerOutput();
++    k.EnableBiasPerFeature();
++    k.EnableNonBiasTerm();
++    k.EnableTensorOffset();
++    k.EnableTensorPitches();
++    k.EnableDifferentInputWeightsTypes();
++    k.EnableDifferentTypes();
++    k.EnableDynamicShapesSupport();
++    k.EnableBatching();
++    return k;
++}
++
++DeviceFeaturesKey FullyConnected_kquant::get_required_device_features_key(const Params& params) const {
++    auto k = get_common_subgroups_device_features_key(params);
++    k.requires_blocked_read_write_short();  // block reads of the activation rows
++    return k;
++}
++
++bool FullyConnected_kquant::Validate(const Params& params) const {
++    if (!Parent::Validate(params))
++        DO_NOT_USE_THIS_KERNEL(params.layerID);
++    const auto& fc = static_cast<const fully_connected_params&>(params);
++    const auto& input = fc.inputs[0];
++    const auto& weights = fc.weights;
++    if (fc.kquant_type == 0 || fc.compressed)
++        DO_NOT_USE_THIS_KERNEL(params.layerID);
++    if (!params.engineInfo.supports_immad)  // the tiled variant is a subgroup matrix multiply
++        DO_NOT_USE_THIS_KERNEL(params.layerID);
++    if (weights.GetDType() != WeightsType::UINT8)
++        DO_NOT_USE_THIS_KERNEL(params.layerID);
++    const size_t row_bytes = RowBytes(fc.kquant_type, fc.kquant_k);
++    if (row_bytes == 0 || fc.kquant_n == 0 || weights.OFM().v != fc.kquant_n || weights.IFM().v != row_bytes)
++        DO_NOT_USE_THIS_KERNEL(params.layerID);
++    // The kernel walks K with a pitch of one from the row's first element.
++    if (input.GetLayout() == DataLayout::bfyx) {
++        if (input.X().pad.Total() != 0 || input.Y().pad.Total() != 0)
++            DO_NOT_USE_THIS_KERNEL(params.layerID);
++    } else if (input.Feature().pad.Total() != 0) {
++        DO_NOT_USE_THIS_KERNEL(params.layerID);
++    }
++    // 4-D outputs are not handled (same rule as bf_tiled).
++    if (fc.outputs[0].GetLayout() == DataLayout::bfyx && input.X().v > 1)
++        DO_NOT_USE_THIS_KERNEL(params.layerID);
++    return true;
++}
++
++FullyConnected_kquant::DispatchData FullyConnected_kquant::SetDefault(const fully_connected_params& params, int, int kernel_number) const {
++    DispatchData d;
++    d.tile_m = static_cast<uint32_t>(tile_m_of(kernel_number));
++    d.tile_n = static_cast<uint32_t>(wg_of(kernel_number));  // subgroups per work-group, not a column tile
++    d.tile_mk = static_cast<uint32_t>(simd_of(params, kernel_number));  // the subgroup size
++    const size_t n = params.kquant_n;
++    const size_t rows = rows_of(params);
++    // A lane per output column, a work-group of ksplit subgroups per subgroup of columns, a
++    // work-group per tile of rows.
++    if (kernel_number == 0)
++        d.gws = { Align(n, d.tile_mk), d.tile_n, CeilDiv(rows, d.tile_m) };
++    else
++        d.gws = { CeilDiv(n, d.tile_mk * d.tile_n) * d.tile_mk, d.tile_n, CeilDiv(rows, d.tile_m) };
++    d.lws = { d.tile_mk, d.tile_n, 1 };
++    return d;
++}
++
++KernelsPriority FullyConnected_kquant::GetKernelsPriority(const Params&) const {
++    return FORCE_PRIORITY_1;  // the only kernel that reads this weight format
++}
++
++JitConstants FullyConnected_kquant::GetJitConstants(const fully_connected_params& params, const DispatchData& dispatchData) const {
++    JitConstants jit = Parent::GetJitConstants(params, dispatchData);
++    const size_t row_bytes = RowBytes(params.kquant_type, params.kquant_k);
++    jit.AddConstant(MakeJitConstant("KQ_TYPE", static_cast<size_t>(params.kquant_type)));
++    jit.AddConstant(MakeJitConstant("KQ_K", params.kquant_k));
++    jit.AddConstant(MakeJitConstant("KQ_N", params.kquant_n));
++    jit.AddConstant(MakeJitConstant("KQ_ROW_BYTES", row_bytes));
++    jit.AddConstant(MakeJitConstant("TILE_M", static_cast<size_t>(dispatchData.tile_m)));
++    jit.AddConstant(MakeJitConstant("KQ_WG", static_cast<size_t>(dispatchData.tile_n)));
++    jit.AddConstant(MakeJitConstant("SIMD", static_cast<size_t>(dispatchData.tile_mk)));
++    const bool out3d = params.outputs[0].GetLayout() == DataLayout::bfyx;
++    if (out3d)
++        jit.AddConstant(MakeJitConstant("OUTPUT_3D", true));
++    // f32 accumulation throughout (the reference kernel's own rule for compressed f16 inputs).
++    Datatype activation_dt = GetActivationType(params);
++    if (activation_dt == Datatype::F16)
++        activation_dt = Datatype::F32;
++    jit.Merge(MakeTypeJitConstants(activation_dt, "ACTIVATION"));
++    jit.Merge(MakeTypeJitConstants(Datatype::F32, "ACCUMULATOR"));
++    jit.Merge(MakeActivationJitConstants(params.activations, activation_dt, "_TYPED"));
++    if (!params.fused_ops.empty()) {
++        std::vector<std::string> idx_order = out3d ? std::vector<std::string>{"b", "m", "n", "0"}
++                                                   : std::vector<std::string>{"m", "n", "0", "0"};
++        FusedOpsConfiguration conf = {"", idx_order, "dequantized", activation_dt, 1};
++        jit.Merge(MakeFusedOpsJitConstants(params, {conf}));
++    }
++    return jit;
++}
++
++// Which of the two compiled kernels runs for a row count: the one-row kernel for decode, the
++// tiled one for anything wider.
++static int kernel_for(const KernelData& kd, size_t rows) {
++    return (kd.kernels.size() > 1 && rows > 1) ? 1 : 0;
++}
++
++void FullyConnected_kquant::GetUpdateDispatchDataFunc(KernelData& kd) const {
++    kd.update_dispatch_data_func = [this](const Params& params, KernelData& kd) {
++        const auto& prim_params = static_cast<const fully_connected_params&>(params);
++        const int execute = kernel_for(kd, rows_of(prim_params));
++        for (size_t i = 0; i < kd.kernels.size(); ++i)
++            kd.kernels[i].skip_execution = static_cast<int>(i) != execute;
++        const auto dispatchData = SetDefault(prim_params, -1, execute);
++        kd.kernels[execute].params.workGroups.global = dispatchData.gws;
++        kd.kernels[execute].params.workGroups.local = dispatchData.lws;
++        kd.kernels[execute].skip_execution = KernelData::SkipKernelExecution(prim_params);
++    };
++}
++
++KernelsData FullyConnected_kquant::GetKernelsData(const Params& params) const {
++    const auto& fc = static_cast<const fully_connected_params&>(params);
++    // The weights' own layout is requested, so CheckWeights finds nothing to reorder.
++    KernelsData kds = GetCommonKernelsData(params, fc.inputs[0].GetLayout(), fc.weights.GetLayout(), EXE_MODE_DEFAULT, -1, 0);
++    if (kds.empty() || kds[0].kernels.empty())
++        return kds;
++    KernelsData tiled = GetCommonKernelsData(params, fc.inputs[0].GetLayout(), fc.weights.GetLayout(), EXE_MODE_DEFAULT, -1, 1);
++    if (!tiled.empty() && !tiled[0].kernels.empty())
++        kds[0].kernels.push_back(tiled[0].kernels.back());
++    GetUpdateDispatchDataFunc(kds[0]);
++    // A static shape dispatches without the update: pick the kernel here.
++    const int execute = kernel_for(kds[0], rows_of(fc));
++    for (size_t i = 0; i < kds[0].kernels.size(); ++i)
++        kds[0].kernels[i].skip_execution = static_cast<int>(i) != execute;
++    return kds;
++}
++
++}  // namespace kernel_selector

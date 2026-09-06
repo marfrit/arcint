@@ -1,6 +1,6 @@
 # Design note: opening GGUF files in process with native K-quant weights (0.4.0)
 
-Status: draft for discussion, 2026-09-06. Written from two read-only recon
+Status: stage 1 served, 2026-09-06 (DESIGN §7.0.2ay); the record below is the plan as decided, with the stage log at the end. Written from two read-only recon
 passes over the llama.cpp tree the operator keeps (a fork whose
 converter, quant formats, `qwen35` graph and tokenizer are byte-identical
 to upstream at its merge base) and over the pinned OpenVINO GPU plugin
@@ -233,3 +233,28 @@ allowlist's families; llama.cpp byte-identity as a gate.
    take a 256-wide K tile, the kernel is written as its own GEMV/GEMM
    pair over super-blocks rather than as a variant of bf-tiled; the
    first implementation step is that reading.
+
+## 7. Stage log
+
+- 2026-09-06 — stage 0 and stage 1 landed (DESIGN §7.0.2ay): the dense
+  Q4_K_M opens on the dense IR and scores 10/10 through the endpoint;
+  against Intel's int4 IR of the same model on the 24 GB card the eighth
+  kernel prefills 3.2–7.6× slower and decodes at about half (213 / 9.9
+  t/s at 856 tokens, 174 / 8.5 at 71.7k; the IR 1,609 / 23.1, 552 /
+  16.5). Two things the plan did not say and
+  the serve did: the template's AWQ folded activation-side scales into
+  the graph, which the pass now neutralises (and compares the norms); and
+  the ssm alpha/beta of the dense file are F32, served as f16 constants
+  through the template's own MatMul. Built differently from §3 above,
+  on purpose: the open is `--gguf FILE --model DIR` (the template named
+  by the operator, not resolved through the allowlist by the file's
+  metadata — that resolution is owed); the op is built by the engine and
+  recognised by the plugin by type name, with no plugin-side
+  transformation; the GDN state tensors (`ssm_a`, dt bias, conv1d) stay
+  the template's rather than being replaced from the file; the
+  value-head inverse for row-reordered projections is a gather on the
+  projection's output, not a row permutation (no copy). §1's per-tensor
+  table is block 0 of the file: Unsloth's files vary the type per layer
+  (this file has 67 Q6_K tensors, not one per layer for each of the
+  three modules listed). Open in stage 1: the embedding gather, the MTP
+  layer from the file, the rates.

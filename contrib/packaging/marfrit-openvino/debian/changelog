@@ -1,3 +1,23 @@
+marfrit-openvino (2026.4.0~dev20260821+p7-1) bookworm trixie; urgency=medium
+
+  * One more patch applied on top of +p6, same upstream commit (71640275),
+    same smallest-sufficient-divergence numbering:
+    - patches/0021: GGUF K-quant weights (Q4_K, Q5_K, Q6_K, Q8_0) served as
+      stored through the fully-connected path -- a u8 constant holding the
+      file's rows, an op the engine builds ("FullyConnectedKQuant",
+      "arcint_opset", recognised by name), a kernel that decodes the
+      super-blocks in its inner loop. No unpack at load, no reorder at
+      compile, no second copy of the weights (arcint 0.4.0 stage 1,
+      docs/design-gguf-native.md). Unit tests: the kernel against a host
+      reference for every type, 2-D and 3-D activations; a malformed
+      request refused at shape inference. The kernel is a first,
+      row-per-work-item version: it opens the dense Qwen3.8-27B Q4_K_M
+      file and serves it, at rates well under the IR's (recorded in
+      arcint DESIGN.md 7.0.2ay); the subgroup-cooperative version is the
+      next patch.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 06 Sep 2026 02:30:00 +0200
+
 marfrit-openvino (2026.4.0~dev20260821+p6-1) bookworm trixie; urgency=medium
 
   * One more patch applied on top of +p5, same upstream commit (71640275),

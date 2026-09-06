@@ -17,6 +17,35 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## Unreleased
+
+- **0.4.0 stage 1: a GGUF opens in process and serves** (DESIGN §7.0.2ay,
+  `docs/design-gguf-native.md`). `--gguf FILE` with `--model` naming the
+  served IR of the same architecture as the topology template: the
+  file's K-quant rows (Q4_K, Q5_K, Q6_K, Q8_0) replace the template's
+  projections as u8 constants aliasing the file's map, and plugin patch
+  0021 (`marfrit-openvino +p7`, recipe bumped, package not built) decodes
+  the super-blocks inside its fully-connected kernel — no unpack at load,
+  no reorder at compile. The dense Qwen3.8-27B Q4_K_M scores 10/10 on the
+  Prüfstand through the GGUF-opened model on the 24 GB card. Benchmark
+  against Intel's own int4 IR export of the same model, same card and
+  flags, one process per cell (`u8` KV, one lane, MTP off, the chunk the
+  fit's choice — 256 for the GGUF arm, 2048 for the IR): 213 / 9.9 t/s
+  prefill / decode at 856 prompt tokens and 173.8 / 8.5 at 71,727,
+  against 1,609 / 23.1 and 552 / 16.5 — prefill 3.2× to 7.6× slower,
+  decode about 2×. The kernel is the eighth of a measured ladder (one
+  lane per output column; decode with a broadcast activation read and a
+  K split over four subgroups; prefill on the subgroup matrix multiply
+  with the activation tile staged in local memory per work-group) from
+  a first version that served at 28.8 / 3.5. The template's AWQ
+  activation scales are set to one
+  (they compensated weights now raw), its norms are compared with the
+  file's (identical), its embedding, GDN state tensors and MTP layer stay.
+  Stage 0 beneath it: a GGUF reader, ggml's dequantizers as the host
+  reference, a fixture with gguf-py's decoding, exact-equality tests, and
+  `tools/gguf_ir_compare.py`, which checks the tensor map and the
+  value-head un-reorder on the host.
+
 ## 0.3.1 — 2026-09-05
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p6` (patches 0003–0020)

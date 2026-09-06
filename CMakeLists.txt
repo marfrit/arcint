@@ -70,6 +70,7 @@ add_library(arcint_core STATIC
   src/core/block_pool.cpp
   src/core/gguf.cpp
   src/core/gguf_dequant.cpp
+  src/core/gguf_map.cpp
   src/core/model_registry.cpp
   src/core/prefix_cache.cpp
   src/core/reasoning.cpp
@@ -97,7 +98,7 @@ endif()
 
 if(ARCINT_OPENVINO)
   find_package(OpenVINO REQUIRED COMPONENTS Runtime)
-  target_sources(arcint_core PRIVATE src/exec/backend_ov.cpp)
+  target_sources(arcint_core PRIVATE src/exec/backend_ov.cpp src/exec/gguf_graph.cpp)
   target_link_libraries(arcint_core PUBLIC openvino::runtime)
   target_compile_definitions(arcint_core PUBLIC ARCINT_OPENVINO=1)
 
@@ -212,6 +213,7 @@ if(ARCINT_TESTS)
     tests/test_provenance.cpp
     tests/test_sha256.cpp
     tests/test_gguf.cpp
+    tests/test_gguf_graph.cpp
     tests/test_affinity.cpp
     tests/test_fit.cpp
     tests/test_decode_stats.cpp

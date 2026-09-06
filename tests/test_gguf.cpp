@@ -142,7 +142,7 @@ bool throws_containing(const std::string& path, const std::string& needle) {
 TEST(gguf_opens_fixture) {
     gguf::GgufFile f = gguf::GgufFile::open(fixture_path());
     CHECK_EQ(f.alignment(), 32u);
-    CHECK_EQ(f.tensors().size(), 6u);
+    CHECK_EQ(f.tensors().size(), 9u);  // four quantized, two more for the pass test, three float
 }
 
 TEST(gguf_metadata_string_and_int_and_float) {
@@ -420,4 +420,78 @@ TEST(gguf_real_file_spot_check) {
                      found->name.c_str(), gguf::type_name(found->ggml_type).c_str(), out.size(),
                      sum / out.size(), max_abs, static_cast<unsigned long long>(checksum));
     }
+}
+
+// ---------------------------------------------------------------- core/gguf_map (0.4.0 stage 1)
+#include "core/gguf_map.h"
+
+// The converter's V-head reorder, inverted: with 16 key heads and 48 value
+// heads (three per key head), HF head h = i*3 + j sits at the file's head
+// j*16 + i. Red case: the identity would put HF head 1 at file head 1; the
+// converter put it at 16.
+TEST(gguf_v_head_map_inverts_the_converters_tiled_order) {
+    const auto m = gguf_v_head_to_file_head(16, 48);
+    CHECK_EQ(m.size(), static_cast<size_t>(48));
+    CHECK_EQ(m[0], 0);
+    CHECK_EQ(m[1], 16);
+    CHECK_EQ(m[2], 32);
+    CHECK_EQ(m[3], 1);
+    CHECK_EQ(m[47], 47);
+    // a bijection
+    std::vector<int> seen(48, 0);
+    for (auto v : m) { CHECK(v >= 0 && v < 48); seen[static_cast<size_t>(v)]++; }
+    for (int s : seen) CHECK_EQ(s, 1);
+    // equal head counts: no reorder
+    const auto id = gguf_v_head_to_file_head(8, 8);
+    for (size_t h = 0; h < id.size(); ++h) CHECK_EQ(id[h], static_cast<int64_t>(h));
+    // counts that do not divide: no reorder either (the converter would not have)
+    const auto odd = gguf_v_head_to_file_head(5, 12);
+    for (size_t h = 0; h < odd.size(); ++h) CHECK_EQ(odd[h], static_cast<int64_t>(h));
+}
+
+TEST(gguf_module_map_names_every_projection_of_the_served_family) {
+    const auto* qkv = gguf_module_map("linear_attn.in_proj_qkv");
+    CHECK(qkv != nullptr);
+    CHECK(qkv->gguf_tensor == "attn_qkv");
+    CHECK(qkv->reorder == GgufReorder::RowsQKV);
+    CHECK(gguf_module_map("linear_attn.out_proj")->reorder == GgufReorder::Columns);
+    CHECK(gguf_module_map("mlp.down_proj")->reorder == GgufReorder::None);
+    CHECK(gguf_module_map("self_attn.q_proj")->gguf_tensor == "attn_q");
+    CHECK(gguf_module_map("self_attn.o_proj")->gguf_tensor == "attn_output");
+    CHECK(gguf_module_map("linear_attn.in_proj_a")->gguf_tensor == "ssm_alpha");
+    CHECK(gguf_module_map("something_else") == nullptr);
+}
+
+TEST(gguf_geometry_reads_the_fixtures_keys) {
+    // The fixture carries the converter's key set at a toy geometry
+    // (tools/gguf_fixture.py): two blocks of which one is the MTP block,
+    // two GDN key heads of 64 against four value heads of 64.
+    const auto f = gguf::GgufFile::open(fixture_path());
+    const GgufGeometry g = gguf_geometry(f);
+    CHECK_EQ(g.n_layers, 1);
+    CHECK_EQ(g.hidden, 64);
+    CHECK_EQ(g.n_heads, 4);
+    CHECK_EQ(g.n_kv_heads, 2);
+    CHECK_EQ(g.head_dim, 16);
+    CHECK_EQ(g.linear_k_heads, 2);
+    CHECK_EQ(g.linear_v_heads, 4);
+    CHECK_EQ(g.linear_k_dim, 64);
+    CHECK_EQ(g.linear_v_dim, 64);   // inner_size 256 / 4 value heads
+    CHECK_EQ(g.full_attention_interval, 4);
+    CHECK_EQ(g.vocab, 8);
+    CHECK(gguf_geometry_mismatches(g, g).empty());
+}
+
+TEST(gguf_geometry_mismatches_name_every_differing_field_and_nothing_else) {
+    GgufGeometry a; a.n_layers = 64; a.hidden = 5120; a.n_heads = 24; a.n_kv_heads = 4; a.head_dim = 256;
+    a.linear_k_heads = 16; a.linear_v_heads = 48; a.linear_v_dim = 128; a.full_attention_interval = 4; a.vocab = 248320;
+    GgufGeometry b = a;
+    CHECK(gguf_geometry_mismatches(a, b).empty());
+    b.vocab = 0;  // unknown on one side: not compared
+    CHECK(gguf_geometry_mismatches(a, b).empty());
+    b = a; b.n_layers = 65; b.linear_v_heads = 32;
+    const auto m = gguf_geometry_mismatches(a, b);
+    CHECK_EQ(m.size(), static_cast<size_t>(2));
+    CHECK(m[0].find("layers") != std::string::npos);
+    CHECK(m[1].find("GDN value heads") != std::string::npos);
 }
