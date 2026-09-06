@@ -12,11 +12,14 @@ marfrit-openvino (2026.4.0~dev20260821+p8-1) bookworm trixie; urgency=medium
       shape -- a work-group per group of output rows, subgroups along K,
       the super-block's quant bytes and activations as sub-group block
       reads shared by the rows, Q6_K's 2-aligned blocks as dwords with a
-      shuffle; exact. Faster than 0022 on every tensor shape of the dense
-      Q4_K_M model on the 24 GB card (gate projection 156 us against 170,
-      Q6_K down projection 508 against 646), 20 % more served decode at
-      1k, Prufstand 10/10. The timing test streams (eight weight buffers
-      in rotation) over the model's own shapes. DESIGN 7.0.2bb-7.0.2bc.
+      shuffle, its next super-block prefetched on Xe2; exact. Faster than
+      0022 on every tensor shape of the dense Q4_K_M model on the 24 GB
+      card (gate projection 141 us against 170, Q6_K down projection 397
+      against 646, steady state), served decode 12.1 t/s at 1k against
+      0.4.0's 9.9 and 10.1 at 71.7k against 8.5, Prufstand 10/10. The
+      timing test streams (eight weight buffers in rotation), warms to
+      steady state and runs over the model's own shapes. DESIGN
+      7.0.2bb-7.0.2bd.
 
  -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 06 Sep 2026 13:10:00 +0200
 

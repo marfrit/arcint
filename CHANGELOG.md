@@ -19,6 +19,23 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+- **0.4.1, three root causes and a survey after the new kernel** (DESIGN
+  §7.0.2bd). The timing instrument's figures were a second-execution
+  regime (a network's second execution costs twice its third); at steady
+  state the gate projection streams at 355 GB/s (79 % of the card's
+  measured ceiling) and the narrow projections at 20–33 µs, not 84. The
+  first-process stall is a driver-side effect of a cold persistent
+  kernel cache (6 ms ticks on random shapes; not the disk, not the
+  plugin's asynchronous compilation, not the wait mode), absent from a
+  served step. The profiler's depth capture prefilled the whole depth in
+  one forward and blew the card and then the host at 71.7k; it now walks
+  in served chunks, and shows the kernel's forward 10–11 ms faster at
+  both depths. A survey of other projects' Intel GPU kernels (four
+  research agents, four language groups) yielded one measured win: a
+  software prefetch of the next super-block, which hurts Q4_K/Q5_K and
+  takes the Q6_K down projection from 500 to 397 µs — carried for Q6_K
+  on Xe2. Served: 12.1 t/s decode at 856 prompt tokens, 10.1 at 71.7k
+  (0.4.0: 9.9 and 8.5), Prüfstand 10/10, byte-identical outputs.
 - **0.4.1, the native decode kernel in llama.cpp's shape** (DESIGN
   §7.0.2bc, plugin patch 0023 now carrying the kernel, `+p8` recipe,
   package not built). A work-group per group of output rows, four

@@ -6553,6 +6553,157 @@ recipe; the package is not built. Open: the deep step (profile at
 71.7k), the 16 GiB card's Q6_K form, the first-process stall, and the
 remaining gap between kernel time and step time at 1k.
 
+#### 7.0.2bd 0.4.1, root causes after §7.0.2bc: the instrument's early-execution regime, the cold-cache stall, the deep step; and what other projects' Intel kernels do (2026-09-06)
+
+The operator's directive after §7.0.2bc: "do the appropriate root cause",
+and a survey, by research agents in English, Chinese, Japanese/Korean and
+French/German/Russian sources, of optimised Intel GPU kernels for what
+this repository has not considered. Three root causes were measured, one
+survey item was measured and carried, and the rest are listed with their
+evidence.
+
+**Root cause 1 — the launch figures were an early-execution regime.**
+Every launch figure in §7.0.2ay–§7.0.2bc came from the second and third
+executions of a freshly built network (one warm-up execute, then two
+timed passes over eight networks). Timing each launch alone shows the
+second execution of a network costs about twice the third and later
+ones (gate projection: 300 µs, then 155; the N = 1,024 shape: 330, then
+150 — with a `finish` after each), and the served step is at the later
+ones. The timing test now warms every network three times before the
+clock. Steady state on the 24 GB card, this kernel:
+
+| M = 1, steady, 24 GB card | early-execution figure (§7.0.2bc) | steady state |
+|---|---|---|
+| gate/up Q4_K 17,408 × 5,120 | 156 µs, 321 GB/s | **140–142 µs, 354–358 GB/s** |
+| q/k/v Q4_K N 1,024 | 83–89 µs | **19–20 µs** |
+| Q4_K 5,120² | 96–99 µs | 50–51 µs |
+| down Q4_K 5,120 × 17,408 | 158–162 µs | 145 µs, 346 GB/s |
+| attention output Q5_K 5,120² | 105 µs | 59–60 µs |
+| down Q6_K 5,120 × 17,408 | 508 µs, 144 GB/s | 500 µs, 146 GB/s (397 with the prefetch below) |
+| Q6_K N 1,024 | 84–85 µs | 30 µs |
+
+The comparison with 0022 in §7.0.2bc was in the same regime on both
+sides and stands; the absolute bandwidth claims were understated: the
+gate projection streams at 79 % of the card's measured 453 GB/s
+random-read ceiling, not 71 %, and the narrow shapes were dominated by
+the per-execution cost, not by their bytes. What the second execution
+pays is not root-caused (the plugin's first-executions path; not the
+kernel).
+
+**Root cause 2 — the first-process stall.** Reproduced at will: with the
+driver's persistent kernel cache cold (`~/.cache/neo_compiler_cache`
+removed), every timed launch of five of the seven shapes runs 2–6 ms
+with wild jitter — all sixteen launches, not the first — while the two
+long-K shapes (sixteen rows per work-group) never stall. With the cache
+warm no launch stalls; with the cache on tmpfs the stall is unchanged
+(disk I/O is not it); with the persistent cache disabled outright
+(`NEO_CACHE_PERSISTENT=0`) there is no stall at all, only a mild
+first-pass cost (480 → 280 µs). Timed alone on the shared stream the
+stalled launches are quantised at 2,996 and 5,996 µs — one or two
+3 ms ticks — and the stall picks different shapes in different runs. It
+survives the plugin's asynchronous static-shape compilation being
+disabled, the driver's completion wait being forced to spin, the
+driver's direct-submission controller being switched off and its idle
+timeout raised to 500 ms — and it vanishes when the driver's direct
+submission itself is switched off (`NEO_EnableDirectSubmission=0`, cold
+cache: every launch at 70–450 µs), as it does with the persistent cache
+off. A thread dump during a stalled loop shows the compiler translating
+in worker threads while one driver-internal thread sleeps in a loop.
+So the stall needs two things: a kernel binary that this process
+compiled and stored (not one it loaded from the cache), and the
+user-mode ring; the mechanism inside the driver — a residency or
+ring-restart round trip for a freshly compiled binary is the candidate
+— is not measured further here. Not a kernel property, and not in a served step
+(401 back-to-back launches keep the queue busy); it is why every
+timing ritual warms every configuration once.
+
+**Root cause 3 — the deep step.** The profiler's decode-step capture
+prefilled the whole depth in ONE forward; at 71.7k tokens that is
+770 GB of activations, the card ran out (`CL_OUT_OF_RESOURCES`), the
+driver evicted to host memory (36 GB of shared memory) and the host
+went out of memory — the dev host's user session died with it, both
+production units with the session. The capture now walks to depth in
+the served chunks (this commit). At 71.7k, this kernel's decode step:
+the paged attention's 16 launches are 36 % of the step's counters
+against 0.2 % at 1k, the 401 K-quant launches 58 % against 90 %. The
+forward's wall clock, the same profiler process for each kernel (its
+counters on, so above the served step):
+
+| forward wall clock, M = 1 | at 1,000 tokens | at 71,700 tokens |
+|---|---|---|
+| 0021 (0.4.0's kernel) | 120.1 ms | 127.5 ms |
+| 0022 | 119.2 ms | 131.3 ms |
+| this kernel (0023) | 110.1 ms | 116.6 ms |
+
+The forward gains 10–11 ms at both depths. The served step gained 18 ms
+at 1k (101 → 83) and 1 ms at 71.7k (117.6 → 116.3): at depth the served
+step is not the forward — about 15 ms of per-step work outside the graph
+(the block table, sampling, the request path) sits beside it and hides
+what the kernel saved. That work is the next measurement (a host-side
+profile of the served loop at depth), not a kernel.
+
+**The survey.** Four research agents read other projects' Intel GPU
+kernels and the vendor's own material — llama.cpp's SYCL and OpenCL
+backends, Intel's llm-scaler ESIMD kernels, OpenVINO's own int4 GEMV
+kernel, oneDNN's generator, XeTLA and cutlass-sycl, Intel's Triton
+backend, the oneAPI optimisation guide, Chips and Cheese's
+micro-benchmarks, Intel's int2 GEMV paper — in English, Chinese
+(mostly blocked to automated reading), Japanese and Korean (measured
+llama.cpp backend comparisons on Arc, no kernel-level content) and
+French, German and Russian (architecture coverage only). What was new
+here, measured first:
+- Software prefetch of the next super-block (one cache line per lane,
+  cutlass-sycl's staged mainloop as the pattern): on the 24 GB card,
+  steady, the Q4_K gate 142 → 207 µs (worse), N 1,024 20 → 25, Q5_K
+  60 → 74 — and the Q6_K down projection 500 → **397 µs**, Q6_K
+  N 1,024 30 → 33; on the 16 GiB card the Q6_K down projection 843 →
+  950 (worse). Carried for Q6_K on Xe2 only (`KQ_PREFETCH` from the
+  host by architecture); served, 12.1 t/s at 856 tokens and 10.1 at
+  71.7k against 12.0 and 8.6 without it, 10/10, byte-identical.
+- Large-register mode (Intel's guide; three agents): forced
+  (`-cl-intel-256-GRF-per-thread`) the Q4_K gate 142 → 176 (worse), the
+  Q6_K down projection 500 → 444; the compiler's automatic choice
+  (`-cl-intel-enable-auto-large-GRF-mode`) leaves Q4_K alone and gives
+  Q6_K the same 440 — the Q6_K kernel is register-heavy and
+  latency-bound, the Q4_K one is not; on top of the prefetch it adds
+  nothing (397 either way) and is not carried.
+- llama.cpp SYCL's "reorder" (a load-time layout that separates quant
+  bytes from scales; +31 % on the A770 for Q4_0, and the Q8_0 case on
+  the B70 from 21 % to 66 % of bandwidth): this repository's repack
+  (§7.0.2ba) is the same move taken further; an exact reorder of the
+  native Q6_K into 4-byte-aligned planes is the open middle ground.
+- OpenVINO's own int4 GEMV kernel (`fully_connected_gpu_gemv.cl`): K
+  split over sixteen subgroups with the activation broadcast — the 0022
+  shape; measured 29–35 % faster than its predecessor on long-K shapes
+  in the upstream PR. Not new here.
+- Not measured here, in the order the evidence suggests: LSC
+  cache-control hints (L1 bypass for streamed weights; +11–54 % on Ponte
+  Vecchio in Intel's Triton backend issue, untested on Battlemage); an
+  exact reorder of native Q6_K into dword-aligned planes at load (the
+  llm-scaler kernels repack Q6_K's high bits host-side for the same
+  reason); the 2D block-load and prefetch intrinsics (Xe2 only); a
+  persistent work-stealing kernel over row tiles (Intel's B60 MoE post,
+  >80 % claimed); K-slicing across work-groups for the long-K shapes
+  (XeTLA, llm-scaler); dequantisation by f16 denormal reinterpretation
+  (oneDNN); routing the weights through the texture path (llama.cpp's
+  Adreno kernels, unmeasured on Arc by anyone).
+- Confirmed by the sources: sixteen-lane subgroups; dword alignment for
+  block reads is a documented Xe-wide constraint; int8 activations are
+  llama.cpp's own trade-off; ~65–85 % of peak DRAM bandwidth is where
+  Intel's own decode kernels land on this card class (Intel's int2 GEMV
+  paper: ~83 % on the B580).
+
+**What this closes.** Patch 0023 carries the kernel with the Q6_K
+prefetch, the host's architecture gate and the steady-state timing test;
+the profiler's depth capture is fixed (fd5563d). Served on the 24 GB
+card: 12.1 t/s decode at 856 prompt tokens against 0.4.0's 9.9, 10.1 at
+71.7k against 8.5, Prüfstand 10/10, greedy outputs byte-identical at
+both depths. Open, in order: the served loop's per-step work outside the
+graph at depth (a host-side profile), which hides more of the kernel
+than the kernel now costs; the exact dword-aligned reorder of native
+Q6_K; the LSC hints; the second execution's cost in the plugin; the
+16 GiB card's Q6_K form; `+p8` not built.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

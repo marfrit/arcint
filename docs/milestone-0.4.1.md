@@ -156,3 +156,16 @@ to keep on the other card.
   stands for the deep step, which did not move: the profile at 71.7k is
   the next measurement. Also open: the 16 GiB card's Q6_K form, the
   first-process stall of a freshly compiled kernel, `+p8` not built.
+- 2026-09-06 — **root causes and the survey** (DESIGN §7.0.2bd): the
+  instrument was in a second-execution regime (steady state: gate
+  355 GB/s, narrow shapes 20–33 µs); the first-process stall is a
+  driver-side cold-cache effect, not a kernel property; the profiler at
+  depth prefilled in one forward (fixed) and shows the forward 10–11 ms
+  faster at both depths, while the served deep step hides it behind
+  per-step work outside the graph. Four research agents surveyed other
+  projects' Intel kernels; one item measured as a win (a next-super-
+  block prefetch for Q6_K on Xe2: down projection 500 → 397 µs) and is
+  in patch 0023. Served 12.1 / 10.1 t/s at 856 / 71.7k tokens, 10/10,
+  byte-identical. Open: the served loop's per-step host work at depth
+  (a host profile), an exact dword-aligned reorder of native Q6_K, the
+  LSC cache hints, `+p8` not built.

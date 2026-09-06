@@ -416,19 +416,27 @@ another, read once and shared by the group's rows; the eight scale/min
 pairs are decoded by lanes 0–7 and broadcast. Q6_K's 2-aligned blocks
 are block-read as dwords from the dword below and redistributed with one
 shuffle (a 16-bit block read two bytes off a dword returns the wrong
-word on every lane but the first — measured). Exact: f32 accumulation
-over f16 activations. The tiled prefill variant is unchanged.
+word on every lane but the first — measured); on Xe2 the subgroup
+prefetches its next Q6_K super-block, one cache line per lane (the
+Q4_K/Q5_K shapes and the 16 GiB card lose with the same prefetch and do
+not get it). Exact: f32 accumulation over f16 activations. The tiled
+prefill variant is unchanged.
 
-Measured streamed on the 24 GB card against 0022: the gate projection
-156 µs (321 GB/s) against 170, the Q4_K down projection 160 against 219,
-Q5_K 5,120² 105 against 137, the Q6_K down projection 508 against 646.
-Served, dense Qwen3.8-27B Q4_K_M native, `u8` KV: 12.0 t/s decode at
-856 tokens against 9.9, Prüfstand 10/10, outputs byte-identical.
+Measured streamed at steady state on the 24 GB card against 0022 in the
+same instrument: the gate projection 141 µs (355 GB/s, 79 % of the
+card's measured random-read ceiling) against 170, the Q4_K down
+projection 146 against 219, Q5_K 5,120² 60 against 137, the Q6_K down
+projection 397 against 646, the N 1,024 projections 20–33 µs. Served,
+dense Qwen3.8-27B Q4_K_M native, `u8` KV: 12.1 t/s decode at 856 tokens
+against 0.4.0's 9.9, 10.1 at 71.7k against 8.5, Prüfstand 10/10,
+outputs byte-identical at both depths (DESIGN §7.0.2bc–bd).
 
 Also carried: the timing test streams (eight weight buffers in rotation
 on one queue; ten launches of one buffer had let a third of it hit the
-18 MB L2 and overstated every launch figure of 0021 and 0022) and runs
-over the served model's own tensor types and shapes.
+18 MB L2 and overstated every launch figure of 0021 and 0022), warms
+every network to steady state before the clock (a network's second
+execution costs twice its third) and runs over the served model's own
+tensor types and shapes.
 
 Upstream: not yet filed.
 

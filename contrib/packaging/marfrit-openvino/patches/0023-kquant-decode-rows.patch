@@ -20,26 +20,34 @@
 #                       from the dword at or below the block and redistributed with one
 #                       shuffle (a 16-bit block read two bytes off a dword returns the wrong
 #                       word on every lane but the first -- measured), the scales one uniform
-#                       load. Q8_0 per lane. Exact: f32 accumulation over f16 activations.
+#                       load; on Xe2 the subgroup prefetches its next Q6_K super-block (one
+#                       cache line per lane: the Q6_K down projection 500 -> 397 us on the 24 GB
+#                       card, measured; the Q4_K/Q5_K shapes and the 16 GiB card lose with the
+#                       same prefetch and do not get it). Q8_0 per lane. Exact: f32 accumulation
+#                       over f16 activations.
 #   fully_connected_kernel_kquant.cpp   The decode dispatch: a work-group of 4 x 16 lanes per
-#                       rows_per_group(K) output rows; KQ_ROWS as a jit constant; the subgroup
-#                       reduce among the required device features. The width-sized K split of
-#                       0022 goes.
+#                       rows_per_group(K) output rows; KQ_ROWS and KQ_PREFETCH (Xe2) as jit
+#                       constants; the subgroup reduce among the required device features. The
+#                       width-sized K split of 0022 goes.
 #   fully_connected_gpu_test.cpp   Two more correctness cases (Q8_0 and Q5_K at one row); the
 #                       timing case streams (eight weight buffers in rotation on one queue: ten
-#                       launches of one buffer had let a third of it hit L2) and runs over the
-#                       served model's own tensor types and shapes.
+#                       launches of one buffer had let a third of it hit L2), warms every network
+#                       to steady state before the clock (a network's second execution costs
+#                       twice its third, measured) and runs over the served model's own tensor
+#                       types and shapes.
 #
-# MEASURED streamed on the 24 GB card, one row, against 0022: the gate projection (Q4_K,
-# N 17,408, K 5,120) 156 us / 321 GB/s against 170 / 295; the Q4_K down projection (N 5,120,
-# K 17,408) 160 against 219; Q5_K 5,120 x 5,120 105 against 137; the Q6_K down projection
-# 508 against 646; every tensor shape of the dense Q4_K_M model faster. A streaming read of
-# random bytes on that card runs at 453 GB/s. Served (dense Qwen3.8-27B Q4_K_M native, u8
-# KV): 12.0 t/s decode at 856 prompt tokens against 9.9, 8.6 at 71.7k against 8.5,
-# Pruefstand 10/10, greedy outputs byte-identical at both depths.
+# MEASURED streamed at steady state on the 24 GB card, one row, against 0022 in the same
+# instrument: the gate projection (Q4_K, N 17,408, K 5,120) 141 us / 355 GB/s (79 % of the
+# card's measured 453 GB/s random-read ceiling) against 170; the Q4_K down projection
+# (N 5,120, K 17,408) 146 against 219; Q5_K 5,120 x 5,120 60 against 137; the Q6_K down
+# projection 397 against 646; the N 1,024 projections 20-33 us. Served (dense Qwen3.8-27B
+# Q4_K_M native, u8 KV): 12.1 t/s decode at 856 prompt tokens against 0.4.0's 9.9, 10.1 at
+# 71.7k against 8.5, Pruefstand 10/10, greedy outputs byte-identical at both depths. DESIGN
+# 7.0.2bc-7.0.2bd.
 #
 # Upstream: not yet filed.
 
+clean test copy written
 --- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
 +++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
 @@ -1,17 +1,19 @@
@@ -124,7 +132,7 @@
      const uint tile = get_global_id(2);
  #if OUTPUT_3D
      const uint rows_per_batch = INPUT0_FEATURE_NUM;
-@@ -122,64 +142,84 @@
+@@ -122,64 +142,95 @@
          return;
  
  #if TILE_M == 1
@@ -213,6 +221,17 @@
 +            __attribute__((opencl_unroll_hint(KQ_ROWS)))
 +            for (uint rr = 0; rr < KQ_ROWS; ++rr) {
 +                const __global uchar* blk = weights + (ulong)min(n0 + rr, (uint)KQ_N - 1) * KQ_ROW_BYTES + kb * KQ_BLOCK_BYTES;
++#if KQ_TYPE == 14 && KQ_PREFETCH
++                // Q6_K on Xe2: this subgroup's next super-block of the row prefetched, one cache
++                // line per lane. Measured: the Q6_K down projection 500 -> 398 us on the 24 GB
++                // card; the Q4_K/Q5_K shapes lose 15-45 % with the same prefetch and do not get
++                // it, and the 16 GiB card (Xe-HPG) loses 12 % on Q6_K and does not get it.
++                {
++                    const uint kbn = kb + KQ_WG * KQ_ROW_STEP * KQ_STEP;
++                    if (kbn < KQ_BLOCKS && lane < (KQ_BLOCK_BYTES + 63) / 64)
++                        prefetch(blk + (kbn - kb) * KQ_BLOCK_BYTES + lane * 64, 64);
++                }
++#endif
 +#if KQ_TYPE == 12
 +                acc[rr] = fma(mask, kq_row_q4k_x(blk, lane, x, xp, 0u), acc[rr]);
 +#elif KQ_TYPE == 13
@@ -255,7 +274,7 @@
  #else
      const uint n = (get_group_id(0) * KQ_WG + sg) * SIMD + lane;   // lane = output column; the work-group's subgroups take KQ_WG x SIMD columns
      const uint nn = min(n, (uint)KQ_N - 1);
-@@ -247,8 +287,10 @@
+@@ -247,8 +298,10 @@
          for (uint t = 0; t < 8; ++t) sums[g * 8 + t] = acc[g][t];
  #endif
  
@@ -465,11 +484,13 @@
      return d;
  }
  
-@@ -147,6 +145,7 @@
+@@ -147,6 +145,9 @@
      jit.AddConstant(MakeJitConstant("TILE_M", static_cast<size_t>(dispatchData.tile_m)));
      jit.AddConstant(MakeJitConstant("KQ_WG", static_cast<size_t>(dispatchData.tile_n)));
      jit.AddConstant(MakeJitConstant("SIMD", static_cast<size_t>(dispatchData.tile_mk)));
 +    jit.AddConstant(MakeJitConstant("KQ_ROWS", rows_per_group(params)));
++    // Q6_K prefetches its next super-block on Xe2 only (measured both ways, DESIGN 7.0.2bd).
++    jit.AddConstant(MakeJitConstant("KQ_PREFETCH", params.engineInfo.arch >= gpu_arch::xe2 ? 1 : 0));
      const bool out3d = params.outputs[0].GetLayout() == DataLayout::bfyx;
      if (out3d)
          jit.AddConstant(MakeJitConstant("OUTPUT_3D", true));
@@ -484,7 +505,7 @@
                        std::make_tuple(12, 100L, true, 1280, 300), std::make_tuple(14, 65L, false, 256, 17),
                        std::make_tuple(8, 1L, false, 96, 5), std::make_tuple(13, 33L, true, 768, 64)));
  
-@@ -6729,38 +6729,52 @@
+@@ -6729,38 +6729,56 @@
  
  // Timing at the dense model's gate projection shape, both kernels (run by name; prints KQPERF lines).
  TEST(fully_connected_gpu_kquant_perf, DISABLED_dense_shapes_q4k) {
@@ -546,6 +567,10 @@
 +            nets.back()->set_input_data("input", input_mem);
 +            nets.back()->execute();
 +        }
++        get_test_stream().finish();
++        // Steady state before timing: a network's second execution costs about twice its
++        // third and later ones (measured), and a served step is at the later ones.
++        for (int i = 0; i < 2; ++i) for (auto& n : nets) n->execute();
 +        get_test_stream().finish();
 +        const int reps = 2;
          auto t0 = std::chrono::steady_clock::now();
