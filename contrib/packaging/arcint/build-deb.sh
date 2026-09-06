@@ -21,7 +21,7 @@ PKGREL=1
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
 # sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v0.4.0.tar.gz,
 # taken after the tag was pushed (one commit after the tag, as 0.3.1's was).
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-}
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-0ec119aadceb3ea510c535793f12df9d66c6c770368e6e82930227b8a42489ac}
 OV_PREFIX=/usr/lib/marfrit-openvino
 # The ABI is the nightly, not the patch level: floor the patch level, cap at
 # the next nightly. An exact pin (Depends: = +p1-1) made apt REMOVE arcint when
