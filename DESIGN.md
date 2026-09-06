@@ -6704,6 +6704,156 @@ than the kernel now costs; the exact dword-aligned reorder of native
 Q6_K; the LSC hints; the second execution's cost in the plugin; the
 16 GiB card's Q6_K form; `+p8` not built.
 
+#### 7.0.2be 0.4.1, the table worked through: the served step split on the host, the mixed open as the default, the file's embedding, the verdict cache, `+p8` deployed, the gates on both cards (2026-09-06)
+
+The operator's directive after §7.0.2bd: work through the seven open
+items in order, adjust served units where a measurement says so, change
+dependency sources where they pay, test the serving pipeline only at
+the end of the turn and on both cards, and time every long run. Every
+served number below is on the `+p8` runtime as installed on the dev
+host (item 5), 24 GB card, `u8` KV, one fresh process per cell.
+
+**1. The served step, split on the host.** `ARCINT_PROFILE_CYCLE` now
+prints a line per plain decode step (the loop with no drafter had no
+line; the cycle line was the drafting loop's): the embedding lookup,
+paged_forward's own index build, graph wait, logits copy, the sampling,
+the detokenise and callback halves of the commit, and the wall of the
+whole iteration. The mean of the last 40 of 64 tokens, before the
+changes below:
+
+| step, ms | embedding | index | graph | logits | sampling | step | loop |
+|---|---|---|---|---|---|---|---|
+| native, 856 tokens | 6.7 | 0.06 | 75.7 | 0.09 | 0.15 | 82.7 | — |
+| native, 71.7k | 3.0 | 0.07 | 93.0 | 0.10 | 0.16 | 96.4 | — |
+| mixed, 856 | 1.0 | 0.05 | 70.1 | 0.09 | 0.15 | 71.5 | — |
+| mixed, 71.7k | 3.1 | 0.06 | 88.6 | 0.08 | 0.14 | 91.9 | — |
+| mixed, file embedding, 856 | 0.02 | 0.05 | 70.6 | 0.09 | 0.20 | 71.1 | 79.4 |
+| mixed, file embedding, 71.7k | 0.00 | 0.06 | 90.0 | 0.09 | 0.13 | 90.3 | 91.1 |
+
+What sits outside the kernels, in the order of size:
+
+- The graph forward itself carries about 30 ms of launch sequence
+  around the ~45 ms of K-quant kernels at 1k: some 1,300 launches per
+  step, of which 209 RMS norms, 144 gathers, 96 Swish and 64 Multiply
+  eltwise unfused around the gate/up projections, 96 small f16 matmuls,
+  48 GDN steps, 48 convolutions, 16 paged attentions. Fusing the eltwise
+  into the K-quant kernel as post-ops (the plugin's `FUSED_OPS` on the
+  store) removes 160 launches and their intermediates (item 3) at once:
+  the next plugin patch, not this one.
+- The first decode step after a prefill costs 2.3× the steady step and
+  the second 1.3× (216 and 100 ms against 93 at depth; 186 and 105
+  against 75 at 1k): the plugin's first executions of the one-token
+  shape, the same effect §7.0.2bd measured on the timing instrument.
+- At depth the request's own accounting shows decode 7.22 s = graph
+  6.09 s + emit 1.12 s over 64 tokens, and the first token's loop is
+  1.23 s against its 0.22 s step: the first emitted piece after a 71.7k
+  prefill cost about a second on the host in that run. With the commit's
+  two halves on the step line (the detokeniser is an OpenVINO CPU model,
+  the callback the server's), the rerun of the same cell did not
+  reproduce it: emit 0.01 s over 64 tokens, the first step's detokenise
+  0.56 ms, the callback 0.00, the decode 11.2 t/s with a steady step of
+  89.5 ms. Observed once, not root-caused; the instrument stays.
+- The template's embedding model cost 1–7 ms per token, 0.1 to 12 ms
+  from step to step: a device round trip with a queue in front of it.
+  Item 7 removes it.
+
+**2. The mixed open, now the default** (`--gguf-mode mixed`: Q4_K
+repacked into the runtime's compressed form, Q5_K and Q6_K the file's
+rows in the K-quant kernel; `repack` and `native` stay flags):
+
+| 24 GB card, u8 KV | resident | max ctx at u8 | 856: prefill / decode | 71.7k: prefill / decode | load |
+|---|---|---|---|---|---|
+| native (0023) | 14.94 GiB | 100k | 212 / 11.6 | 173 / 8.5 | 55–78 s |
+| **mixed** | 16.26 GiB | 86k | 302 / 12.7 | 258 / 10.2 | 267–285 s, 88–168 with the verdicts kept |
+| repack (§7.0.2ba) | 18.73 GiB | 46k | 1,005 / 16.1 | fits only at u8:i4 | 406 s |
+
+The 71.7k cell is back inside `u8` KV, which the milestone's protocol
+requires; the greedy outputs at both depths are byte-identical to the
+native path's. Prefill at 302 t/s is the Q6_K down projection and the
+Q5_K attention output through the K-quant kernel's tiled variant: the
+milestone's lever 2, untouched. The decode figures over 64 tokens
+scatter by ±2 t/s between runs (10.9, 12.7 and 13.6 for the same cell
+today); the Prüfstand's 1,145-token decode is the steadier number:
+14.5 t/s with the file's embedding against 12.1 with the template's.
+
+**3. The activation reservation, its carrier measured by the mode
+census.** The fit charges 10,986 KiB per chunk token in native mode,
+3,471–3,906 in mixed, 0.03 GiB in all on the IR path. The difference
+between native and mixed is the 288 Q4_K projections moving from the
+K-quant op to the runtime's own fully-connected: about 26 KB per token
+per native projection — an f16 output of the projection's width (17,408
+for gate/up) that the plugin's memory pool keeps rather than reuses
+across layers, plus the Swish and Multiply intermediates the runtime's
+own path fuses away as post-ops. The plugin's allocation rule
+(`primitive_inst::allocate_output`) goes through the pool only when the
+node can share its buffer and the memory dependencies allow; which of
+the two fails for the K-quant node needs the pool's dump, a debug-build
+option. Not fixed here: the mixed open halves it (chunk 512–1024
+instead of 256), and the fused post-op above removes the rest of the
+intermediates.
+
+**4. The load time.** Of a 285 s mixed load, the repack is 18 s and the
+exhaustive deviation check 224 s; of the native load nothing is either.
+The verdict per repacked projection is now kept between loads of the
+same file (`--gguf-check once`, the default: keyed by the file's size
+and mtime, the tensor's offset, type and dims, and the bound; only a
+passed verdict is written; the configured cache directory or the
+user's) — the next load of the served file was 88 s, of which the
+repack 35 s and the check 0. `--gguf-check always` re-checks at every
+load.
+
+**5. `+p8` built and deployed.** The recipe at patches 0003–0023 built
+in 13 minutes on the dev host (an incremental build; 1,058 objects),
+`marfrit-openvino 2026.4.0~dev20260821+p8-1` installed there, both
+production units restarted on it and answering. The served IR path is
+untouched by 0022/0023 (the kernel exists only for tagged K-quant
+constants): the coder's equivalence suite on the 16 GiB card under
+`+p8` is 9 of 9 checks byte-identical (two greedy runs, sliced logits,
+speculative determinism, the drafter's acceptance, warm against cold
+cache, the cache hit, a cached continuation), the MTP section skipped
+as declared for that artifact.
+
+**6. The gates.** Prüfstand 10/10 through the GGUF-opened model in its
+default form on the deployed runtime. The equivalence suite on the
+GGUF-opened model passes its first check (two greedy runs
+byte-identical) and then starts a stateful-path server for its
+logits-slicing check, which a GGUF-opened model refuses by design
+(`--gguf` serves on the paged path only), and stops: the cold/warm and
+chunk checks need a variant of the suite that skips the stateful
+sections — open, not a failure of the path. The 16 GiB card
+cannot hold the GGUF-opened model: 16.26 GiB resident against a 16 GB
+card, the load dies in the driver (`CL_OUT_OF_RESOURCES`); the gate's
+"measured and recorded at both depths" is recorded as this, and the
+native form at 14.94 GiB leaves no room for activations there either.
+On the deployed runtime with the file's embedding, the native form
+serves 212 / 12.8 t/s at 856 tokens and 173 / 10.3 at 71.7k (step 74.5
+and 91.9 ms), the repack 16.2 t/s at 856 (a 57.6 ms step), the mixed
+default 10.9–13.6 over 64 tokens and 14.5 over the Prüfstand's 1,145.
+
+**7. The deferred items.** The embedding from the file:
+`token_embd.weight` (Q4_K, 248,320 × 5,120, 682 MiB) is copied out of
+the map into host memory at load and one row is dequantised per token
+with ggml's own decoder (`--gguf-embed file`, the default); the
+template's i8 embedding model no longer runs on the served path. The
+first form read the rows from the map and page-faulted from disk at
+37 ms per new token (measured, 8.8 t/s); copied, the lookup is 0.02 ms.
+The greedy output at 856 tokens is byte-identical to the template
+embedding's; at 71.7k it differs (086d5e71ad47 against 5e3fb7a8d72c):
+the file's Q4_K rows are not the template's i8 rows, and at that depth
+a near-tie flips. Prüfstand 10/10 either way. The MTP layer stays the
+template's: `--mtp on` on the GGUF-opened model serves 13.6 t/s at 856
+tokens with the same greedy output (the first measurement of that
+combination).
+
+**What is left in the table.** The decode bar (within 1.2× of the IR's
+23.1 and 16.5 t/s) is not met on any form: the mixed default serves
+14.5 / 10.2, the repack 16.1 at 1k and does not fit at depth. The
+levers that remain are named by measurement: the fused post-op on the
+K-quant kernel (160 launches and the intermediates), the 2D block loads
+for the tiled variant's A operand (the mixed form's prefill), and the
+first-piece second at depth on the host. The `+p8` package is the
+deployment; arcint itself is not yet packaged past 0.4.0.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

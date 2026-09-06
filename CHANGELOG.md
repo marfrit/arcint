@@ -19,6 +19,28 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+- **0.4.1, the open table worked through** (DESIGN §7.0.2be). The
+  served step is split on the host (`ARCINT_PROFILE_CYCLE` on the plain
+  decode loop): the graph forward is 70–92 ms of a 71–96 ms step, the
+  template's embedding model cost 1–7 ms per token, the first decode
+  step after a prefill 2.3× and the second 1.3×, and at depth the first
+  emitted piece a second on the host. The mixed form is the default for
+  a GGUF-opened model (`--gguf-mode mixed`: Q4_K repacked, Q5_K and Q6_K
+  the file's rows): 16.26 GiB resident, a 71.7k context at `u8` KV,
+  302 / 12.7 t/s at 856 tokens and 258 / 10.2 at 71.7k, byte-identical
+  outputs, Prüfstand 10/10. The embedding rows come from the file
+  (`--gguf-embed file`, the default), copied to host memory at load and
+  dequantised per token; the deviation verdicts are kept between loads
+  (`--gguf-check once`, the default: 285 → 88 s). The activation
+  reservation's carrier is measured by the mode census (the native
+  K-quant op's outputs, kept rather than pooled: 11 MB per chunk token
+  native, 3.5–3.9 mixed). `marfrit-openvino +p8` built (13 min) and
+  deployed on the dev host; the IR path's equivalence on the 16 GiB
+  card is 9/9 under it; the 16 GiB card cannot hold the GGUF-opened
+  model (16.26 GiB against 16 GB). `--mtp on` on the GGUF-opened model
+  serves 13.6 t/s with the same greedy output. The decode bar of the
+  milestone is not met on any form; the next levers are the fused
+  post-op on the K-quant kernel and the tiled variant's 2D block loads.
 - **0.4.1, three root causes and a survey after the new kernel** (DESIGN
   §7.0.2bd). The timing instrument's figures were a second-execution
   regime (a network's second execution costs twice its third); at steady

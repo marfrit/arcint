@@ -438,6 +438,10 @@ every network to steady state before the clock (a network's second
 execution costs twice its third) and runs over the served model's own
 tensor types and shapes.
 
+Built into `+p8` on 2026-09-06 (13 minutes, incremental) and deployed on
+the dev host; the IR path's equivalence suite on the 16 GiB card is 9/9
+under it (DESIGN §7.0.2be).
+
 Upstream: not yet filed.
 
 ## Deliberately NOT applied

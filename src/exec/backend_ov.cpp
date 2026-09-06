@@ -1996,6 +1996,7 @@ private:
         FinishReason reason   = FinishReason::Stop;
         past                  = prompt_ids.size();
         auto         t_step_prev = clock::now();   // ARCINT_PROFILE_CYCLE: wall per loop iteration
+        double       last_detok_ms = 0.0, last_callback_ms = 0.0;   // the commit's two halves, for the step line
 
         auto commit = [&](int tok, Control& out) {
             if (trace) log::info("trace", "commit pos=%zu tok=%d", past, tok);
@@ -2008,7 +2009,11 @@ private:
             }
             ++stats.completion_tokens;
             const auto t_emit = clock::now();
-            out = on_piece(tokenizer_->decode_one(tok), tok);
+            const std::string piece = tokenizer_->decode_one(tok);
+            last_detok_ms = 1000.0 * seconds_since_tp(t_emit);
+            const auto t_cb = clock::now();
+            out = on_piece(piece, tok);
+            last_callback_ms = 1000.0 * seconds_since_tp(t_cb);
             stats.decode_emit_seconds += seconds_since_tp(t_emit);
             sampler.observe(tok);
             if (drafting_.load()) history.push_back(tok);
@@ -2124,9 +2129,10 @@ private:
                     t_step_prev = now;
                     log::info("step",
                               "past %zu | embed %.2f | index %.2f infer %.2f logits %.2f hidden %.2f | "
-                              "sample %.2f | forward %.2f step %.2f loop %.2f ms",
+                              "sample %.2f | detok %.2f callback %.2f | forward %.2f step %.2f loop %.2f ms",
                               past, step_embed_ms, lane.last_fwd_ms_index, lane.last_fwd_ms_infer,
                               lane.last_fwd_ms_logits, lane.last_fwd_ms_hidden, step_sample_ms,
+                              last_detok_ms, last_callback_ms,
                               step_fwd_ms, step_embed_ms + step_fwd_ms + step_sample_ms, loop_ms);
                 }
                 continue;
@@ -2421,10 +2427,12 @@ private:
                 if (te->ggml_type == static_cast<int32_t>(gguf::GgmlType::F16)) rb = 2 * k;
                 else if (te->ggml_type == static_cast<int32_t>(gguf::GgmlType::F32)) rb = 4 * k;
                 if (rb > 0) {
-                    gguf_embed_ = GgufEmbed{te, static_cast<size_t>(rb), static_cast<size_t>(k), static_cast<size_t>(te->dims[1])};
-                    log::info("load", "gguf: the embedding rows come from the file (token_embd.weight, %s, %zu x %zu), "
-                                      "dequantised on the host per token; the template's embedding model serves only the stateful path",
-                              gguf::type_name(te->ggml_type).c_str(), gguf_embed_.vocab, gguf_embed_.width);
+                    gguf_embed_ = GgufEmbed{te, static_cast<size_t>(rb), static_cast<size_t>(k), static_cast<size_t>(te->dims[1]), {}};
+                    const uint8_t* src = file->data(*te);
+                    gguf_embed_.bytes.assign(src, src + file->bytes(*te));
+                    log::info("load", "gguf: the embedding rows come from the file (token_embd.weight, %s, %zu x %zu, %zu MiB copied to "
+                                      "host memory), dequantised on the host per token; the template's embedding model serves only the stateful path",
+                              gguf::type_name(te->ggml_type).c_str(), gguf_embed_.vocab, gguf_embed_.width, gguf_embed_.bytes.size() >> 20);
                 } else {
                     log::info("load", "gguf: token_embd.weight is %s, which has no row decoder here; the template's embedding serves",
                               gguf::type_name(te->ggml_type).c_str());
@@ -5816,7 +5824,7 @@ private:
             // The file's own rows, on the host: no device call, no turn taken.
             ov::Tensor out(ov::element::f32, ov::Shape{n, gguf_embed_.width});
             float* dst = out.data<float>();
-            const uint8_t* base = gguf_file_->data(*gguf_embed_.t);
+            const uint8_t* base = gguf_embed_.bytes.data();
             for (size_t i = 0; i < n; ++i) {
                 const int id = ids[i];
                 if (id < 0 || static_cast<size_t>(id) >= gguf_embed_.vocab)
@@ -7492,7 +7500,11 @@ private:
     // the host per looked-up token -- one row of K values, microseconds -- instead of the
     // template's own embedding model. Unset when the file lacks the tensor, its type has no
     // row decoder, or --gguf-embed template.
-    struct GgufEmbed { const gguf::TensorInfo* t = nullptr; size_t row_bytes = 0; size_t width = 0; size_t vocab = 0; };
+    struct GgufEmbed {
+        const gguf::TensorInfo* t = nullptr; size_t row_bytes = 0; size_t width = 0; size_t vocab = 0;
+        std::vector<uint8_t> bytes;   // the table copied out of the map at load: a row read from the map page-faulted
+                                      // from disk per new token (37 ms per served token, measured) -- 715 MB in RAM instead
+    };
     GgufEmbed                      gguf_embed_;
     // Patch 0020 engine side (DESIGN §7.0.2at): the GPU plugin's own patch
     // level, read from its build number (`marfrit-p<N>`, the recipe's

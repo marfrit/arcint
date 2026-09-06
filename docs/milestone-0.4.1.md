@@ -169,3 +169,18 @@ to keep on the other card.
   byte-identical. Open: the served loop's per-step host work at depth
   (a host profile), an exact dword-aligned reorder of native Q6_K, the
   LSC cache hints, `+p8` not built.
+- 2026-09-06 — **the table worked through** (DESIGN §7.0.2be): the
+  served step split on the host (graph 70–92 ms of a 71–96 ms step; the
+  template's embedding 1–7 ms, gone; the first step after a prefill 2.3×;
+  the first emitted piece at depth a second); the mixed open as the
+  default (16.26 GiB, 71.7k at `u8`, 302 / 12.7 and 258 / 10.2 t/s,
+  Prüfstand 10/10); lever 3's carrier measured by the mode census (the
+  native op's outputs kept, not pooled); the load 285 → 88 s with the
+  verdicts kept; `+p8` built and deployed, the IR path 9/9 on the 16 GiB
+  card; the 16 GiB card cannot hold the GGUF-opened model; the embedding
+  from the file; `--mtp on` served; the equivalence suite's stateful
+  sections cannot run on a GGUF-opened model (paged only) and the suite
+  needs a variant for it. The decode bar stays unmet: next the
+  fused post-op on the K-quant kernel (160 launches and the
+  intermediates), the tiled variant's 2D block loads (the mixed form's
+  prefill), the first-piece second at depth.
