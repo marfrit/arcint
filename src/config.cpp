@@ -338,6 +338,13 @@ std::string usage_text() {
         "                            served IR of the same architecture is the template);\n"
         "                            K-quant rows go to the card as stored, decoded in the\n"
         "                            kernel. Needs --model and a plugin at +p7 or later\n"
+        "  --gguf-native             keep the file's own K-quant rows and decode them in the\n"
+        "                            plugin's kernel (needs the +p7 runtime) instead of the\n"
+        "                            default repack into the runtime's compressed form\n"
+        "  --dyn-quant on|off        the runtime's per-token int8 activation quantization on\n"
+        "                            compressed weights; default: the runtime's own for an IR,\n"
+        "                            off for a GGUF-opened model (f16 activations reproduce the\n"
+        "                            native path's greedy output byte for byte, at the same rate)\n"
         "  --dflash DIR              DFlash2 block drafter directory (7 drafts per\n"
         "                            verify pass; greedy only, like --mtp). One\n"
         "                            drafter per server: conflicts with --mtp on\n"
@@ -401,6 +408,13 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--gguf") {
             if (!value(v)) return fail("--gguf needs a path");
             cfg.gguf_path = std::string(v);
+        } else if (arg == "--gguf-native") {
+            cfg.gguf_native = true;
+        } else if (arg == "--dyn-quant") {
+            if (!value(v)) return fail("--dyn-quant needs on or off");
+            if (v == "off") cfg.dyn_quant = 2;
+            else if (v == "on") cfg.dyn_quant = 1;
+            else return fail("--dyn-quant takes on or off");
         } else if (arg == "--model-id") {
             if (!value(v)) return fail("--model-id needs a value");
             cfg.model_id = std::string(v);
@@ -767,6 +781,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.prefill_chunk < 0) return fail("--prefill-chunk must be >= 0");
     if (!cfg.gguf_path.empty() && cfg.model_path.empty()) return fail("--gguf needs --model (the template IR directory)");
     if (!cfg.gguf_path.empty() && !cfg.paged) return fail("--gguf serves on the paged path only");
+    if (cfg.gguf_native && cfg.gguf_path.empty()) return fail("--gguf-native needs --gguf");
 
     // The prefill grid and the cache grid have to be the same grid. A cache hit
     // is where a warm run starts, and a warm run must present the model the same

@@ -6233,6 +6233,115 @@ here; the operator's question of a repack at load into the plugin's own
 compressed layout — the layout Intel's IR path runs at 355 GB/s effective
 — is the next decision, recorded in the milestone.
 
+#### 7.0.2ba 0.4.1 lever 2: the repack at load — the K-quant rows in the plugin's own compressed form, the mins as columns, at the IR's prefill rate and 10/10 (2026-09-06)
+
+The operator's decision after §7.0.2az ("repack it is then, but make
+sure quality does not degrade — make an equivalent projection; if that
+is impossible, we need to go back to the drawing board"). What was
+built, what "equivalent" turned out to mean, what was measured, and the
+one detour that was refuted on the way. `docs/design-gguf-native.md`
+§3.6 is the design; `src/core/gguf_repack.*` the host pass;
+`--gguf-native` keeps the 0.4.0 path.
+
+**Equivalence, defined by arithmetic and then measured.** No form the
+plugin computes reproduces ggml's f32 dequantizer bit for bit: a
+K-quant scale d·sc is an f16 times a 6-bit integer (17 bits) and rounds
+to f16, and the plugin's kernels compute q·scale in half, which rounds
+every value at 2^-11 relative. So the gate is a bound on the deviation
+of every weight from ggml's value, in units of the group's quantisation
+step, the analytic worst case of that arithmetic per block type: 1/64
+for Q4_K, 1/32 for Q5_K and Q6_K, 1/16 for Q8_0 (|q| up to 127). The
+stored integers, Q8_0's scales and the mins are the block's own. The
+fixture measures 0.013, 0.028, 0.029 and 0.051 steps at most and
+0.003–0.011 RMS; the served file measures 0.0294 steps at most over its
+25.6 G values, none over bound, at every load (a tensor over its bound
+refuses the load). For scale: the quantisation itself moves a weight by
+up to half a step, and the native path's own tiled kernel already
+rounds its f16 copies at the same 2^-11 (§7.0.2ay). The served
+computation on the host — the widened activation, the multiply-
+accumulate — lands within 5 % of its f16 rounding budget of the f32
+reference for every type (`tests/test_gguf_repack.cpp`).
+
+**The mins ride as columns, because the fast path takes integer zero
+points only.** The first repack carried Q4_K's and Q5_K's mins as an
+f16 zero point per group (ml/dl). Legal IR, accepted by the plugin,
+10/10 on the Prüfstand, and its 1k greedy output was byte-identical to
+the native path's — but oneDNN declines an f16 zero point (its weight
+zero points are u8/s8/u4/s4) and the OCL kernels took the 336
+projections: 15.9 t/s decode, 98 t/s prefill, and the fit pinned at
+chunk 128 because the probe measured 11 MB of activations per chunk
+token (`activation fit … 11558.5 KiB per chunk token`, 1.41 GiB at
+128, max context 42k). Two readings for that slope, each settled by one
+probe: the 240 head-order gathers the pass adds (moved into the
+repacked rows and column groups at load; the slope stayed at 11 MB),
+and the plugin's dynamic activation quantization on that path (off:
+279 KiB per token, chunk 2048 — but prefill 112 t/s on those kernels).
+The zero point itself was the cause: dropped, the same projections went
+to oneDNN at 298 KiB per token. So the min term is now exact columns of
+the same tensor — for every group the integer mn, two u4 nibbles under
+the super-block's own f16 dmin as the group scale — and the activation
+is widened by its group sums (−16·Σx_g, −Σx_g) through one reduce, one
+small matmul and one concat per distinct activation, shared by every
+projection reading it; a column-reordered projection takes its order at
+build and its augmented groups follow the heads. One plain fully-
+connected with no zero point, oneDNN's path throughout.
+
+**Measured, the augmented form** (24 GB card, `u8` KV, one lane, MTP
+off, prefix cache off, one fresh process per cell, the deployed `+p7`
+runtime; the plugin's dynamic activation quantization on, the IR's
+setting):
+
+| arm | prompt | chunk | prefill | decode (64 tok) | resident | max ctx |
+|---|---|---|---|---|---|---|
+| native rows, K-quant kernel (0.4.0) | 856 | 256 | 213.0 t/s | 9.9 t/s | 14.94 GiB | 100,176 |
+| repacked, f16 zero point (the first form) | 856 | 128 | 98.3 t/s | 15.7 t/s | 18.18 GiB | 42,368 |
+| **repacked, mins as columns (served)** | 856 | 2048 | **1,005.2 t/s** | **16.1 t/s** | 18.73 GiB | 46,368 |
+| Intel int4 IR | 856 | 2048 | 1,609.4 t/s | 23.1 t/s | 13.06 GiB | 212,944 |
+| repacked, mins as columns, f16 activations (**the default**) | 856 | 2048 | 939.5 t/s | 16.2 t/s | 18.73 GiB | 46,368 |
+| repacked, mins as columns, **`u8:i4` KV** (the only KV that fits 71.7k beside 18.73 GiB) | 71,727 | 512 | 420.0 t/s | 13.4 t/s | 18.73 GiB | 80,016 |
+| native rows (0.4.0), `u8` | 71,727 | 256 | 173.8 t/s | 8.5 t/s | 14.94 GiB | 100,176 |
+| Intel int4 IR, `u8` | 71,727 | 2048 | 551.7 t/s | 16.5 t/s | 13.06 GiB | 212,944 |
+
+Prüfstand through the repacked model: 10/10 under the served default
+(f16 activations: 425.8 t/s prefill and 17.3 t/s decode on its 282-
+token / 1,559-token exchange; 10/10 with int8 activations as well, at
+646 t/s and 17.4 t/s). Load: 406–427 s, of
+which the repack and its exhaustive deviation check are most (the
+native open: 90–150 s). Resident: 18.73 GiB against 14.94 native — Q6_K
+at u8 with an f16 scale per 16 is 9 bits per weight against 6.56, Q5_K
+at u8 with its augmented columns 10 against 5.5, Q4_K 5.1 against 4.5 —
+and with it the context at `u8` KV: 46k on this card, so the 71.7k cell
+runs at `u8:i4` and says so.
+
+**The greedy outputs.** The f16-zero-point form reproduced the native
+path's 1k output byte for byte (sha 23e06c37e0d6, 346 characters). The
+augmented form does not: its output agrees for the first 146
+characters and then takes the other branch of a near-tie ("… the
+mathematical nature of *the operations*" against "*how information*").
+The same fork appears between two native runs at 71.7k with different
+kernel versions (§7.0.2az: 5e3fb7a8d72c against 48c1b1b06c17), so it is
+a property of the token, not of the projection. The one arithmetic
+difference between the two repacked forms is oneDNN's per-token int8
+activation quantization, the plugin's default for compressed weights
+and the setting Intel's IR arm runs; with it off (`--dyn-quant off`,
+f16 activations through the same oneDNN path) the augmented form
+reproduces the native output byte for byte again (sha 23e06c37e0d6) at
+939.5 t/s prefill and 16.2 t/s decode — the same rate. So f16
+activations are the default for a GGUF-opened model: the projection is
+equivalent to the bound above, and the served greedy output is the
+native path's, byte for byte, at 856 tokens on this prompt. Int8
+activations remain a flag (`--dyn-quant on`), the IR's own setting.
+
+**What this closes and what it opens.** Lever 3 of the milestone (the
+activation reservation at chunk 256) closed with the zero point: it was
+never the K-quant kernel's f32 outputs. Prefill is at 62 % of the IR's
+at 856 tokens; decode at 70 %, which is the resident bytes (18.7
+against 13.1 GiB at about the same effective bandwidth). Open: the
+resident size (Q6_K and Q5_K cost 37 % and 80 % more than their native
+rows; a mixed open — those two types native, Q4_K repacked — is a flag
+away and trades prefill for context), the load time (an exhaustive
+check at every load), and the deferred stage-1 items.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

@@ -219,6 +219,90 @@ against int4's 4.5). It fits the 24 GB card with room and does not fit the
 prefix cache, drafters and the belt are unchanged: from the fit's point
 of view a GGUF-opened model is an artifact with different constants.
 
+### 3.6 The repack at load (0.4.1 lever 2, the operator's decision)
+
+The native kernel of §3.3 reads the file's bytes and, on the 24 GB
+card, decodes at half the card's bandwidth with no lever found to hide
+the arithmetic (DESIGN §7.0.2az). The operator asked whether a repack at
+load — an unpack, the thing 0.4.0's rule excluded — would do better at
+the same precision, and chose it on the condition that the projection
+be equivalent. Since 0.4.1 the default open repacks every K-quant
+projection on the host into the plugin's own grouped compressed-weight
+form with an f16 scale per group and no zero point — the form the
+runtime's fastest kernels (oneDNN's int4 GEMM, the path Intel's own IR
+runs) take (`src/core/gguf_repack.*`; `--gguf-native` keeps the 0.4.0
+path):
+
+| block | weights | scale (f16) | zero point | group | the min |
+|---|---|---|---|---|---|
+| Q4_K | u4, the block's nibbles | d·sc | none | 32 | augmented columns |
+| Q5_K | u8, the block's 5-bit values | d·sc | none | 32 | augmented columns |
+| Q6_K | u8, the block's 6-bit values | d·sc, ggml's own per-16 scales | 32, an integer | 16 | — |
+| Q8_0 | i8, the block's bytes | the block's own d | none | 32 | — |
+
+**The mins ride as columns.** Q4_K and Q5_K values are dl·q − ml with
+a per-group min ml = dmin·mn (dmin an f16 per super-block, mn a 6-bit
+integer). The obvious zero point ml/dl is not an integer, and the
+runtime's fast path takes integer zero points only — an f16 one is
+legal IR and the plugin accepts it, but oneDNN declines it (its weight
+zero points are u8/s8/u4/s4) and the OCL kernels take over: measured,
+those prefill at 98–112 t/s where the same model's IR does 1,609, and
+their dynamic activation quantization charges 11 MB of activations per
+chunk token, which pinned the fit at chunk 128 (DESIGN §7.0.2ba). So
+the min is carried *exactly* as extra columns of the same tensor: for
+every group the integer mn — two u4 nibbles hi/lo for a u4 tensor, one
+u8 for a u8 one — under the super-block's own f16 dmin as that
+augmented group's scale, and the activation is widened by the matching
+group sums, −16·Σx_g and −Σx_g, so that
+
+    Σ_k x_k (dl q_k − ml) = Σ_k x_k dl q_k + (−16 X_g) dmin hi + (−X_g) dmin lo
+
+falls out of one plain fully-connected with no zero point. The widening
+is one reduce (the group sums), one small matmul (a constant
+[K/32, K/8] with −16 and −1 in the right places) and one concat per
+distinct activation, built once and shared by every projection that
+reads it; it costs K/8 extra u4 columns per projection (12.5 % of the
+u4 bytes, the same as an f16 zero point per group would have). A
+column-reordered projection (the output projection, §3.1) takes its
+order at build, and its augmented groups then follow the 128-wide heads
+(four groups each) so that a super-block's dmin never has to serve
+columns from two super-blocks.
+
+**What "equivalent" is and is not.** The stored integers, Q8_0's scales
+and the mins are the block's own. Nothing else can be exact: a K-quant
+scale d·sc is an f16 times a 6-bit integer (17 bits) and rounds to f16,
+and the plugin's kernels compute q·scale in half, which rounds every
+value at 2^-11 relative — no form the plugin computes reproduces ggml's
+f32 dequantizer bit for bit. The deviation per weight is therefore
+bounded and measured, in units of the group's quantisation step: under
+1/64 of a step for Q4_K, 1/32 for Q5_K and Q6_K, 1/16 for Q8_0 (|q| up
+to 127), the analytic worst cases of the half arithmetic; the fixture
+measures 0.013, 0.028, 0.029 and 0.051 steps at most and 0.003–0.011
+steps RMS, and the served computation on the host — the widened
+activation, the multiply-accumulate — lands within 5 % of its f16
+rounding budget of the f32 reference for every type
+(`tests/test_gguf_repack.cpp`). The open measures the same deviation
+over every value of the served file and refuses a tensor over its
+bound. For scale: the quantisation itself moves a weight by up to half
+a step; the native path's own tiled kernel already rounds its f16 copies
+of the values at the same 2^-11, and every served IR's weights carry
+that rounding. The served gate says whether any of this is a quality
+change: the Prüfstand, and the benchmark's greedy outputs against the
+native path's, byte for byte (DESIGN §7.0.2ba). One more knob decided
+that comparison: the plugin quantizes activations per token to int8 for
+its compressed fully-connected path by default (the served IRs'
+setting), and that flipped a near-tie token against the native path;
+with f16 activations (`--dyn-quant off`, the default for a GGUF-opened
+model) the output is the native path's byte for byte, at the same rate.
+
+What the repack costs. Q6_K at u8 with an f16 scale per 16 is 9 bits
+per weight against 6.56, Q5_K at u8 with its augmented columns is 10
+against 5.5, Q4_K with its augmented columns 5.1 against 4.5 (this
+file: about 3 GB more resident than the native rows); the repack and
+its check are a host pass over the file at load. What it gives: the
+plugin's compressed fully-connected path at prefill and at decode, and
+the IR's activation reservation (chunk 2048 instead of 256).
+
 ## 4. Stages and gates
 
 | stage | scope | gate |

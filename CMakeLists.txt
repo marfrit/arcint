@@ -71,6 +71,7 @@ add_library(arcint_core STATIC
   src/core/gguf.cpp
   src/core/gguf_dequant.cpp
   src/core/gguf_map.cpp
+  src/core/gguf_repack.cpp
   src/core/model_registry.cpp
   src/core/prefix_cache.cpp
   src/core/reasoning.cpp
@@ -214,6 +215,7 @@ if(ARCINT_TESTS)
     tests/test_sha256.cpp
     tests/test_gguf.cpp
     tests/test_gguf_graph.cpp
+    tests/test_gguf_repack.cpp
     tests/test_affinity.cpp
     tests/test_fit.cpp
     tests/test_decode_stats.cpp

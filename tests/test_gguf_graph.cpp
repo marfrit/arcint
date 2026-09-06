@@ -14,6 +14,7 @@
 #include "harness.h"
 
 #include <openvino/core/model.hpp>
+#include <openvino/op/concat.hpp>
 #include <openvino/op/constant.hpp>
 #include <openvino/op/convert.hpp>
 #include <openvino/op/gather.hpp>
@@ -22,6 +23,7 @@
 #include <openvino/op/parameter.hpp>
 #include <openvino/op/reshape.hpp>
 #include <openvino/op/result.hpp>
+#include <openvino/op/subtract.hpp>
 #include <openvino/op/subtract.hpp>
 
 #include <cstdlib>
@@ -113,7 +115,7 @@ TEST(gguf_pass_replaces_the_exporters_chains_with_kquant_ops_that_alias_the_file
     Toy toy = toy_template();
     CHECK_EQ(ops_of<ov::op::v0::MatMul>(toy.model).size(), static_cast<size_t>(4));
 
-    const GgufApplyReport rep = gguf_apply_to_template(toy.model, file, toy_geometry());
+    const GgufApplyReport rep = gguf_apply_to_template(toy.model, file, toy_geometry(), GgufWeightsMode::Native);
     CHECK_EQ(rep.replaced.size(), static_cast<size_t>(4));
     CHECK_EQ(ops_of<ov::op::v0::MatMul>(toy.model).size(), static_cast<size_t>(0));
     const auto kq = ops_of<FullyConnectedKQuant>(toy.model);
@@ -142,7 +144,7 @@ TEST(gguf_pass_replaces_the_exporters_chains_with_kquant_ops_that_alias_the_file
 TEST(gguf_pass_inverts_the_value_head_reorder_as_gathers_on_the_right_side) {
     auto file = std::make_shared<gguf::GgufFile>(gguf::GgufFile::open(fixture()));
     Toy toy = toy_template();
-    (void)gguf_apply_to_template(toy.model, file, toy_geometry());
+    (void)gguf_apply_to_template(toy.model, file, toy_geometry(), GgufWeightsMode::Native);
     // to_file for 2 key heads, 4 value heads: HF head h = i*2 + j -> file head j*2 + i:
     // 0 -> 0, 1 -> 2, 2 -> 1, 3 -> 3.
     const auto to_file = gguf_v_head_to_file_head(2, 4);
@@ -175,7 +177,7 @@ TEST(gguf_pass_inverts_the_value_head_reorder_as_gathers_on_the_right_side) {
 TEST(gguf_pass_neutralises_awq_multipliers_and_compares_norms) {
     auto file = std::make_shared<gguf::GgufFile>(gguf::GgufFile::open(fixture()));
     Toy toy = toy_template();
-    const GgufApplyReport rep = gguf_apply_to_template(toy.model, file, toy_geometry());
+    const GgufApplyReport rep = gguf_apply_to_template(toy.model, file, toy_geometry(), GgufWeightsMode::Native);
     CHECK_EQ(rep.awq_scales_neutralized, static_cast<size_t>(1));
     bool ones = false;
     for (const auto& c : ops_of<ov::op::v0::Constant>(toy.model)) {
@@ -195,9 +197,66 @@ TEST(gguf_pass_refuses_a_template_whose_module_the_file_lacks) {
     auto y = projection(x, "mlp.up_proj", 64, 512);  // no blk.0.ffn_up in the fixture
     auto model = std::make_shared<ov::Model>(ov::ResultVector{std::make_shared<ov::op::v0::Result>(y)}, ov::ParameterVector{x});
     bool threw = false;
-    try { (void)gguf_apply_to_template(model, file, toy_geometry()); }
+    try { (void)gguf_apply_to_template(model, file, toy_geometry(), GgufWeightsMode::Native); }
     catch (const std::runtime_error& e) { threw = std::string(e.what()).find("ffn_up") != std::string::npos; }
     CHECK(threw);
+}
+
+// 0.4.1 lever 2: the default mode repacks every projection into the plugin's
+// own decompression chain (Const -> Convert -> [Subtract] -> Multiply ->
+// Reshape -> MatMul), leaves no K-quant op in the graph, and reports a
+// deviation under the per-type bound over every value it packed.
+TEST(gguf_pass_repacks_into_the_plugins_decompression_chain_by_default) {
+    auto file = std::make_shared<gguf::GgufFile>(gguf::GgufFile::open(fixture()));
+    Toy toy = toy_template();
+    const GgufApplyReport rep = gguf_apply_to_template(toy.model, file, toy_geometry());
+    CHECK(rep.mode == GgufWeightsMode::Repack);
+    CHECK_EQ(rep.replaced.size(), size_t{4});
+    CHECK_EQ(ops_of<FullyConnectedKQuant>(toy.model).size(), size_t{0});
+    CHECK_EQ(rep.repack_over_bound, size_t{0});
+    CHECK(rep.repack_max_steps > 0.0 && rep.repack_max_steps < 1.0 / 16.0);
+    size_t values = 0;
+    for (const auto& r : rep.replaced) values += static_cast<size_t>(r.n * r.k);
+    CHECK_EQ(rep.repack_checked, values);
+    // The value-head reorder lives in the constants: no gather in the graph, the report says permuted.
+    size_t gathers = 0;
+    for (const auto& g : ops_of<ov::op::v8::Gather>(toy.model))
+        if (g->get_friendly_name().find("/gguf_v_head_order") != std::string::npos) ++gathers;
+    CHECK_EQ(gathers, size_t{0});
+    size_t permuted = 0;
+    for (const auto& r : rep.replaced) { if (r.rows_permuted) ++permuted; CHECK(!r.columns_gathered); }
+    CHECK_EQ(permuted, size_t{3});  // in_proj_qkv, in_proj_z (rows) and out_proj (columns)
+    // The Q4_K projections read a widened activation (their mins ride as columns): a Concat per distinct activation.
+    size_t widened = 0;
+    for (const auto& c : ops_of<ov::op::v0::Concat>(toy.model))
+        if (c->get_friendly_name().find("/gguf_widened") != std::string::npos) ++widened;
+    CHECK(widened >= 1);
+    // Every MatMul's weight input is the chain, ending in an integer constant of the repacked type.
+    size_t chains = 0;
+    for (const auto& mm : ops_of<ov::op::v0::MatMul>(toy.model)) {
+        auto node = mm->input_value(1).get_node_shared_ptr();
+        if (std::dynamic_pointer_cast<ov::op::v0::Convert>(node)) node = node->input_value(0).get_node_shared_ptr();  // f32 template MatMul
+        auto reshape = std::dynamic_pointer_cast<ov::op::v1::Reshape>(node);
+        if (!reshape) continue;
+        auto mul = std::dynamic_pointer_cast<ov::op::v1::Multiply>(reshape->input_value(0).get_node_shared_ptr());
+        CHECK(mul != nullptr);
+        if (!mul) continue;
+        auto sc = std::dynamic_pointer_cast<ov::op::v0::Constant>(mul->input_value(1).get_node_shared_ptr());
+        CHECK(sc && sc->get_element_type() == ov::element::f16 && sc->get_shape().size() == 3 && sc->get_shape()[2] == 1);
+        auto x = mul->input_value(0).get_node_shared_ptr();
+        if (auto sub = std::dynamic_pointer_cast<ov::op::v1::Subtract>(x)) x = sub->input_value(0).get_node_shared_ptr();
+        auto conv = std::dynamic_pointer_cast<ov::op::v0::Convert>(x);
+        CHECK(conv != nullptr);
+        if (!conv) continue;
+        auto w = std::dynamic_pointer_cast<ov::op::v0::Constant>(conv->input_value(0).get_node_shared_ptr());
+        CHECK(w != nullptr);
+        if (!w) continue;
+        const auto et = w->get_element_type();
+        CHECK(et == ov::element::u4 || et == ov::element::u8 || et == ov::element::i8);
+        CHECK_EQ(w->get_shape().size(), size_t{3});
+        ++chains;
+    }
+    CHECK_EQ(chains, size_t{4});
 }
 
 #endif  // ARCINT_OPENVINO

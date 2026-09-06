@@ -2344,7 +2344,7 @@ private:
     // than the template's, a geometry mismatch (every differing field
     // printed), a tensor the template needs that the file lacks or carries in
     // a type this stage does not serve.
-    void apply_gguf_weights(const std::shared_ptr<ov::Model>& model, const std::string& path) {
+    void apply_gguf_weights(const std::shared_ptr<ov::Model>& model, const std::string& path, bool native) {
         auto file = std::make_shared<gguf::GgufFile>(gguf::GgufFile::open(path));
         const GgufGeometry fg = gguf_geometry(*file);
         const nlohmann::json& c  = artifact_.config;
@@ -2375,9 +2375,9 @@ private:
         if (!ft.empty() && ft != artifact_.chat_template)
             log::info("load", "gguf: the file's chat template differs from the artifact's (%zu against %zu chars); the artifact's is served",
                       ft.size(), artifact_.chat_template.size());
-        gguf_report_ = gguf_apply_to_template(model, file, fg);
+        gguf_report_ = gguf_apply_to_template(model, file, fg, native ? GgufWeightsMode::Native : GgufWeightsMode::Repack);
         gguf_file_   = file;  // the constants alias its map; held for the compiled model's life
-        status_.weights_bytes = gguf_report_.bytes_from_file;  // the file's rows, not the template's .bin
+        status_.weights_bytes = gguf_report_.bytes_from_file;  // the file's rows (or their repack), not the template's .bin
         log::info("load", "gguf: %s; the embedding, norms, GDN state tensors and any MTP layer stay the template's",
                   gguf_report_.summary().c_str());
         gguf_path_ = path;
@@ -2397,7 +2397,7 @@ private:
         // other pass touches the graph (the template's own weights stay mapped
         // and unread). A plugin below +p7 has no kernel for the tagged constants
         // and refuses at compile with the op named; nothing falls back.
-        if (!cfg.gguf_path.empty()) apply_gguf_weights(model, cfg.gguf_path);
+        if (!cfg.gguf_path.empty()) apply_gguf_weights(model, cfg.gguf_path, cfg.gguf_native);
         // --gate-pad N: widen the shared-expert gate (see pad_gate_matmuls). A
         // deployment choice with a known price, like --paged-kv: DESIGN 7.0.2g
         // has the break-even. Off by default for this fleet's answer lengths.
@@ -2697,6 +2697,13 @@ private:
         // (§7.0: 53.6 ms for a step whose node sum is 19.01 ms), so a profiled run
         // is for shares, never for rates.
         if (std::getenv("ARCINT_PROFILE") != nullptr) props[ov::enable_profiling.name()] = true;
+        // 0.4.1 (DESIGN §7.0.2ba): the plugin quantizes activations per token to int8 for
+        // its compressed fully-connected path, its default and the served IRs' setting.
+        // A GGUF-opened model keeps them f16 unless told otherwise: measured at the same
+        // rate (940 against 1,005 t/s prefill, 16.2 against 16.1 decode) and byte-identical
+        // to the native path's greedy output where int8 activations flipped a near-tie.
+        const bool dyn_quant_off = cfg.dyn_quant == 2 || (cfg.dyn_quant == 0 && !cfg.gguf_path.empty());
+        if (dyn_quant_off) props[ov::hint::dynamic_quantization_group_size.name()] = uint64_t{0};
         if (offload_ratio_ > 0) {
             props["OFFLOAD_RATIO"]        = offload_ratio_;
             props[ov::weights_path.name()] = artifact_.language_model_bin;

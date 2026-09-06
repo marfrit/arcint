@@ -121,3 +121,17 @@ to keep on the other card.
   runs Intel's own kernels at the IR's rate but is the unpack at load the
   0.4.0 rule excluded, at 2^-11 relative rounding of the block scales and
   ~10 % more bytes for the 6-bit tensors.
+- 2026-09-06 — **lever 2, the repack, taken and served** (DESIGN
+  §7.0.2ba, design note §3.6): the K-quant rows repacked at load into
+  the runtime's compressed form with no zero point, the mins as columns;
+  equivalence a measured bound per weight (0.029 steps at most over the
+  served file); 1,005 / 16.1 t/s at 856 tokens (native 213 / 9.9, the
+  IR 1,609 / 23.1; 420 / 13.4 at 71.7k at `u8:i4`, the KV that fits),
+  Prüfstand 10/10, f16 activations byte-identical to the native output,
+  chunk 2048 — lever 3 closed with
+  it (the reservation was the f16 zero point's kernels, not the K-quant
+  kernel). The gate's decode target (within 1.2× of the IR) is not met:
+  the repacked model is 18.73 GiB resident against the IR's 13.06 and
+  decodes at the same effective bandwidth. Open: the resident size
+  (Q6_K/Q5_K at u8; a mixed open is a flag away), the load time, the
+  deferred stage-1 items.

@@ -14,6 +14,8 @@ struct Config {
     // Exactly one of these selects what gets served.
     std::string model_path;  // OpenVINO IR directory (M1+)
     std::string gguf_path;   // --gguf: weights from this GGUF, --model as the topology template (0.4.0)
+    bool        gguf_native = false;  // --gguf-native: the file's own rows in the plugin's K-quant kernel instead of the repack (0.4.1)
+    int         dyn_quant = 0;        // --dyn-quant: 0 = unset (the runtime's default for an IR, off for a GGUF-opened model), 1 = on, 2 = off (0.4.1)
     bool        stub = false;
 
     std::string model_id;  // allowlist entry; defaults to the coder under --stub

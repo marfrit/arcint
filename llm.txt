@@ -46,9 +46,16 @@ topology template; the file's Q4_K/Q5_K/Q6_K/Q8_0 rows replace the IR's
 projections as u8 constants and plugin patch 0021 (+p7) decodes the
 super-blocks in its fully-connected kernel -- no unpack at load, no reorder
 at compile. Dense Qwen3.8-27B Q4_K_M: 10/10 on the Prüfstand through the
-GGUF-opened model; against Intel's int4 IR on the 24 GB card, prefill
-3.2-7.6x slower and decode about half (213 / 9.9 t/s at 856 tokens, 174 /
-8.5 at 71.7k; the IR 1,609 / 23.1, 552 / 16.5). The
+GGUF-opened model. 0.4.1 (DESIGN 7.0.2ba): the rows are repacked at load into
+the runtime's own compressed form by default (u4/u8/i8, f16 scale per
+group, no zero point; Q4_K/Q5_K mins as exact extra columns with the
+activation widened by its group sums; the plugin's int8 activation
+quantization off for GGUF-opened models) -- equivalence a measured bound per
+weight (1/64 step Q4_K, 1/32 Q5_K/Q6_K, 1/16 Q8_0; 0.029 at most over the
+file), the native greedy output byte for byte; 940 / 16.2 t/s at 856 tokens
+(native rows 213 / 9.9, --gguf-native; the IR 1,609 / 23.1), 420 / 13.4 at
+71.7k at u8:i4 KV (the IR 552 / 16.5 at u8); resident 18.73 GiB (native
+14.94), max ctx 46k at u8. The
 template's AWQ activation scales are set to one; its norms equal the
 file's; embedding, GDN state and MTP stay the template's.
 

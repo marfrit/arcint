@@ -19,6 +19,29 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+- **0.4.1 lever 2: a GGUF-opened model is repacked at load into the
+  runtime's own compressed form** (DESIGN §7.0.2ba, `docs/design-gguf-
+  native.md` §3.6; the operator's decision, reversing 0.4.0's no-unpack
+  rule on the condition of an equivalent projection). The K-quant rows
+  become grouped u4/u8/i8 weights with an f16 scale per group and no
+  zero point; Q4_K's and Q5_K's mins ride exactly as extra columns of
+  the same tensor under the super-block's own f16 dmin, with the
+  activation widened by its group sums (a reduce, a small matmul and a
+  concat per distinct activation). Equivalence is a bound on every
+  weight's deviation from ggml's value in quantisation steps (1/64 for
+  Q4_K, 1/32 for Q5_K and Q6_K, 1/16 for Q8_0, the plugin's own half
+  arithmetic), measured over the served file at every load (0.029 steps
+  at most, none over bound) and on the host end to end. Dense Qwen3.8-27B
+  Q4_K_M on the 24 GB card, `u8` KV: 1,005 t/s prefill and 16.1 t/s
+  decode at 856 prompt tokens against 213 / 9.9 native and 1,609 / 23.1
+  for Intel's IR; Prüfstand 10/10; resident 18.73 GiB against 14.94
+  (Q6_K and Q5_K at u8), max context 46k at `u8` KV; at 71.7k tokens,
+  which fits only at `u8:i4` KV, 420 / 13.4 t/s against the IR's 552 /
+  16.5 at `u8`. The runtime's per-token int8 activation quantization is
+  off for a GGUF-opened model (it flipped a near-tie token; with f16
+  activations the greedy output is the native path's byte for byte at
+  the same rate). New flags: `--gguf-native` (the 0.4.0 path),
+  `--dyn-quant on|off`.
 - **0.4.1 lever 1: the K-quant decode kernel on the matrix unit** (DESIGN
   §7.0.2az, plugin patch 0022, `marfrit-openvino +p8` recipe, package not
   built). The quantised integers become f16 bit patterns for the subgroup

@@ -27,6 +27,19 @@
 
 namespace lgc {
 
+// How a projection's K-quant rows reach the graph (0.4.1 lever 2,
+// docs/design-gguf-native.md §3.6):
+//   Repack -- the default: the rows are repacked at load into the plugin's
+//             grouped compressed-weight form (u4/u8/i8 with an f16 scale and,
+//             for the K types with a min, an f16 zero point per group), the
+//             form the served IRs use and the runtime's fastest kernels take;
+//             a bounded deviation per weight (core/gguf_repack.h), measured
+//             at load and reported.
+//   Native -- the file's own bytes as a tagged u8 constant feeding
+//             FullyConnectedKQuant, decoded in the plugin's kernel (0.4.0);
+//             exact on the decode path, slower.
+enum class GgufWeightsMode { Repack, Native };
+
 struct GgufReplacement {
     std::string ir_name;    // the IR constant's friendly name
     std::string gguf_name;  // the tensor taken from the file
@@ -40,7 +53,14 @@ struct GgufReplacement {
 struct GgufApplyReport {
     std::vector<GgufReplacement> replaced;
     std::vector<std::string>     kept;      // IR constants deliberately left as the template's (by role)
-    size_t bytes_from_file = 0;             // the K-quant bytes now in the graph
+    size_t bytes_from_file = 0;             // the K-quant bytes now in the graph (native) or the repacked bytes
+    GgufWeightsMode mode = GgufWeightsMode::Repack;
+    // Repack mode: the deviation of the repacked projections from ggml's
+    // dequantized values, in units of the group's quantisation step -- the
+    // largest over every weight and the count over the per-type bound.
+    double repack_max_steps = 0.0;
+    size_t repack_over_bound = 0;
+    size_t repack_checked = 0;
     // The exporter's AWQ folded per-channel scales into the graph as
     // activation-side multipliers (the attention gate's `awq_mul/scale`)
     // compensating weights it had divided; with the projections now the
@@ -62,6 +82,7 @@ struct GgufApplyReport {
 // from the file, has an unexpected shape or a type this stage does not serve.
 GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
                                        const std::shared_ptr<gguf::GgufFile>& file,
-                                       const GgufGeometry& geometry);
+                                       const GgufGeometry& geometry,
+                                       GgufWeightsMode mode = GgufWeightsMode::Repack);
 
 }  // namespace lgc

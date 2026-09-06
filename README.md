@@ -91,15 +91,20 @@ decode after the prompt; the chunk is the fit's choice per arm:
 
 | weights | prompt | chunk | prefill | decode | task |
 |---|---|---|---|---|---|
-| GGUF Q4_K_M, K-quant kernel | 856 | 256 | 213 t/s | 9.9 t/s | 10/10 |
-| GGUF Q4_K_M, K-quant kernel | 71,727 | 256 | 174 t/s | 8.5 t/s | — |
+| **GGUF Q4_K_M, repacked at load (0.4.1, the default)** | 856 | 2048 | **940 t/s** | **16.2 t/s** | 10/10 |
+| GGUF Q4_K_M, repacked, `u8:i4` KV (the KV that fits 71.7k) | 71,727 | 512 | 420 t/s | 13.4 t/s | — |
+| GGUF Q4_K_M, native rows, K-quant kernel (`--gguf-native`) | 856 | 256 | 213 t/s | 9.9 t/s | 10/10 |
+| GGUF Q4_K_M, native rows | 71,727 | 256 | 174 t/s | 8.5 t/s | — |
 | Intel int4 IR | 856 | 2048 | 1,609 t/s | 23.1 t/s | — |
 | Intel int4 IR | 71,727 | 2048 | 552 t/s | 16.5 t/s | — |
 
-The GGUF path prefills 3.2× to 7.6× slower and decodes at about half the
-rate; the kernel is the eighth of a measured ladder and the two named
-contributors (the decode kernel at half the card's bandwidth, the activation
-reservation that holds the GGUF arm at chunk 256) are 0.4.1's work.
+The repack (DESIGN §7.0.2ba) puts the file's K-quant rows into the runtime's
+own compressed form at load — the mins as exact extra columns, no zero
+point — so the projection stays within a measured fraction of a
+quantisation step of ggml's values (1/64 for Q4_K) and the greedy output is
+the native path's byte for byte; it costs resident memory (18.7 against
+14.9 GiB: Q6_K and Q5_K at u8) and with it context at `u8` KV (46k on this
+card). The native path is the exact-bytes reference, kept behind a flag.
 
 The 70.1 t/s row at ~30k context matters as much as the peak: the usual
 throughput collapse with depth is absent from the served path, a property of
@@ -207,9 +212,10 @@ or NVFP4 safetensors will not load — those are vLLM formats, and OpenVINO does
 not read them. **A GGUF opens on top of such a directory** since 0.4.0
 stage 1: `--gguf FILE --model DIR` takes the served IR of the same
 architecture as the topology template and replaces its projections with the
-file's own K-quant rows (Q4_K, Q5_K, Q6_K, Q8_0), decoded inside the
-fully-connected kernel of the patched runtime (`marfrit-openvino +p7`,
-patch 0021) — no unpack at load, no second copy of the weights. The file's
+file's own K-quant rows (Q4_K, Q5_K, Q6_K, Q8_0). Since 0.4.1 the rows
+are repacked at load into the runtime's own compressed form (the default;
+`--gguf-native` keeps 0.4.0's path, the rows decoded inside the patched
+runtime's kernel, patch 0021 in `marfrit-openvino +p7`). The file's
 geometry is checked against the template's; the template's tokenizer and
 chat template are served; the embedding, the GDN state tensors and the MTP
 layer stay the template's. Dense models of the allowlisted families in stage
@@ -342,9 +348,12 @@ the stub backend; **[M1]**–**[M6]** mean it runs against the real models on a
 real card.
 
 - **[0.4.0]** **GGUF opened in process** (`--gguf FILE --model DIR`): the
-  file's K-quant rows replace the template IR's projections and are decoded
-  inside the fully-connected kernel of the patched runtime (patch 0021) —
-  no unpack at load, no second copy. Dense models of the allowlisted
+  file's K-quant rows replace the template IR's projections — since 0.4.1
+  repacked at load into the runtime's own compressed form, the mins as
+  exact columns (an equivalent projection, measured: within 1/64 of a
+  quantisation step per weight, the native greedy output byte for byte),
+  or with `--gguf-native` decoded inside the patched runtime's kernel
+  (patch 0021, no unpack, no second copy). Dense models of the allowlisted
   families; the file's geometry checked against the template's, the AWQ
   activation scales of an AWQ template set to one, its norms compared with
   the file's. 10/10 on the served dense model; rates under *Measured*.
