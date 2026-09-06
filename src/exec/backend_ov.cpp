@@ -6432,7 +6432,20 @@ private:
             log::warn("profile", "not enough KV pages for the decode step at depth %zu", depth);
             return;
         }
-        paged_forward(lane, embed_paged(lane, make_tokens(depth)), 0, {0}, 0);
+        // Walk to `depth` in the served chunks, as the sweep does for `past`: one
+        // forward of the whole depth was the capture's prefill until 2026-09-06, and
+        // at 71.7k tokens that is 770 GB of activations -- the card ran out, the
+        // driver evicted to host memory and the host went out of memory with it.
+        {
+            size_t at = 0;
+            while (at < depth) {
+                const size_t take = std::min<size_t>(depth - at, static_cast<size_t>(
+                    std::max(1, prefill_chunk_)));
+                paged_forward(lane, embed_paged(lane, make_tokens(take)), at, {0}, 0,
+                              false);
+                at += take;
+            }
+        }
         paged_forward(lane, embed_paged(lane, {0}), depth, {0}, 0);
         dump("decode step", 1);
 
