@@ -410,6 +410,24 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             cfg.gguf_path = std::string(v);
         } else if (arg == "--gguf-native") {
             cfg.gguf_native = true;
+            cfg.gguf_mode = 1;
+        } else if (arg == "--gguf-mode") {
+            if (!value(v)) return fail("--gguf-mode needs repack, native or mixed");
+            if (v == "repack") cfg.gguf_mode = 0;
+            else if (v == "native") cfg.gguf_mode = 1;
+            else if (v == "mixed") cfg.gguf_mode = 2;
+            else return fail("--gguf-mode needs repack, native or mixed");
+            cfg.gguf_native = cfg.gguf_mode == 1;
+        } else if (arg == "--gguf-embed") {
+            if (!value(v)) return fail("--gguf-embed needs file or template");
+            if (v == "file") cfg.gguf_embed_file = true;
+            else if (v == "template") cfg.gguf_embed_file = false;
+            else return fail("--gguf-embed needs file or template");
+        } else if (arg == "--gguf-check") {
+            if (!value(v)) return fail("--gguf-check needs once or always");
+            if (v == "once") cfg.gguf_check_once = true;
+            else if (v == "always") cfg.gguf_check_once = false;
+            else return fail("--gguf-check needs once or always");
         } else if (arg == "--dyn-quant") {
             if (!value(v)) return fail("--dyn-quant needs on or off");
             if (v == "off") cfg.dyn_quant = 2;
@@ -782,6 +800,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (!cfg.gguf_path.empty() && cfg.model_path.empty()) return fail("--gguf needs --model (the template IR directory)");
     if (!cfg.gguf_path.empty() && !cfg.paged) return fail("--gguf serves on the paged path only");
     if (cfg.gguf_native && cfg.gguf_path.empty()) return fail("--gguf-native needs --gguf");
+    if (cfg.gguf_mode != 2 && cfg.gguf_path.empty()) return fail("--gguf-mode needs --gguf");
 
     // The prefill grid and the cache grid have to be the same grid. A cache hit
     // is where a warm run starts, and a warm run must present the model the same

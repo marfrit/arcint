@@ -13,6 +13,9 @@
 #include "exec/kquant_op.h"
 #include "harness.h"
 
+#include <cstdlib>
+#include <filesystem>
+
 #include <openvino/core/model.hpp>
 #include <openvino/op/concat.hpp>
 #include <openvino/op/constant.hpp>
@@ -257,6 +260,53 @@ TEST(gguf_pass_repacks_into_the_plugins_decompression_chain_by_default) {
         ++chains;
     }
     CHECK_EQ(chains, size_t{4});
+}
+
+TEST(gguf_pass_mixed_mode_repacks_q4k_and_keeps_the_other_types_native) {
+    auto file = std::make_shared<gguf::GgufFile>(gguf::GgufFile::open(fixture()));
+    Toy toy = toy_template();
+    const GgufApplyReport rep = gguf_apply_to_template(toy.model, file, toy_geometry(), GgufWeightsMode::Mixed);
+    CHECK(rep.mode == GgufWeightsMode::Mixed);
+    CHECK_EQ(rep.replaced.size(), size_t{4});
+    size_t q4 = 0, other = 0;
+    for (const auto& r : rep.replaced) {
+        const bool is_q4 = r.ggml_type == static_cast<int32_t>(gguf::GgmlType::Q4_K);
+        CHECK_EQ(r.repacked, is_q4);
+        if (is_q4) ++q4; else ++other;
+    }
+    CHECK(q4 >= 1);
+    CHECK(other >= 1);
+    // The native ones are K-quant ops in the graph, the repacked ones are not.
+    CHECK_EQ(ops_of<FullyConnectedKQuant>(toy.model).size(), other);
+    CHECK_EQ(rep.repack_over_bound, size_t{0});
+    CHECK(rep.summary().find("mixed") != std::string::npos);
+    CHECK(gguf_tensor_mode(GgufWeightsMode::Mixed, static_cast<int32_t>(gguf::GgmlType::Q6_K)) == GgufWeightsMode::Native);
+    CHECK(gguf_tensor_mode(GgufWeightsMode::Repack, static_cast<int32_t>(gguf::GgmlType::Q6_K)) == GgufWeightsMode::Repack);
+}
+
+TEST(gguf_pass_keeps_a_passed_deviation_verdict_between_loads_of_the_same_file) {
+    auto file = std::make_shared<gguf::GgufFile>(gguf::GgufFile::open(fixture()));
+    char tmpl[] = "/tmp/arcint-verdicts-XXXXXX";
+    const char* dir = ::mkdtemp(tmpl);
+    CHECK(dir != nullptr);
+    const std::string vdir = std::string(dir) + "/gguf-verdicts";
+    Toy first = toy_template();
+    const GgufApplyReport a = gguf_apply_to_template(first.model, file, toy_geometry(), GgufWeightsMode::Repack, vdir, fixture());
+    CHECK_EQ(a.repack_verdicts_cached, size_t{0});
+    CHECK(a.repack_checked > 0);
+    CHECK(a.check_seconds >= 0.0 && a.repack_seconds >= 0.0);
+    // Second load of the same file: every projection's verdict is read back, nothing is re-checked.
+    Toy second = toy_template();
+    const GgufApplyReport b = gguf_apply_to_template(second.model, file, toy_geometry(), GgufWeightsMode::Repack, vdir, fixture());
+    CHECK_EQ(b.repack_verdicts_cached, a.replaced.size());
+    CHECK_EQ(b.repack_checked, size_t{0});
+    CHECK_NEAR(b.repack_max_steps, a.repack_max_steps, 1e-9);
+    // Without a directory (--gguf-check always) the check runs every time.
+    Toy third = toy_template();
+    const GgufApplyReport c = gguf_apply_to_template(third.model, file, toy_geometry(), GgufWeightsMode::Repack, "", fixture());
+    CHECK_EQ(c.repack_verdicts_cached, size_t{0});
+    CHECK_EQ(c.repack_checked, a.repack_checked);
+    std::filesystem::remove_all(dir);
 }
 
 #endif  // ARCINT_OPENVINO

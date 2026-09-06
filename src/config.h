@@ -15,6 +15,9 @@ struct Config {
     std::string model_path;  // OpenVINO IR directory (M1+)
     std::string gguf_path;   // --gguf: weights from this GGUF, --model as the topology template (0.4.0)
     bool        gguf_native = false;  // --gguf-native: the file's own rows in the plugin's K-quant kernel instead of the repack (0.4.1)
+    int         gguf_mode = 2;        // --gguf-mode: 0 = repack, 1 = native (also --gguf-native), 2 = mixed (Q4_K repacked, the rest native; the default, DESIGN 7.0.2be) (0.4.1)
+    bool        gguf_embed_file = true;  // --gguf-embed file|template: the token embedding rows from the file, dequantised on the host per token (0.4.1)
+    bool        gguf_check_once = true;  // --gguf-check once|always: keep each repacked projection's deviation verdict between loads of the same file (0.4.1)
     int         dyn_quant = 0;        // --dyn-quant: 0 = unset (the runtime's default for an IR, off for a GGUF-opened model), 1 = on, 2 = off (0.4.1)
     bool        stub = false;
 

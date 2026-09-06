@@ -71,6 +71,8 @@
 #include "core/affinity.h"
 #include "exec/fit.h"
 #include "exec/gguf_graph.h"
+#include "core/gguf_dequant.h"
+#include "exec/kquant_op.h"
 #include "core/artifact.h"
 #include "core/block_pool.h"
 #include "core/dflash_select.h"
@@ -1993,6 +1995,7 @@ private:
         const auto   t_decode = clock::now();
         FinishReason reason   = FinishReason::Stop;
         past                  = prompt_ids.size();
+        auto         t_step_prev = clock::now();   // ARCINT_PROFILE_CYCLE: wall per loop iteration
 
         auto commit = [&](int tok, Control& out) {
             if (trace) log::info("trace", "commit pos=%zu tok=%d", past, tok);
@@ -2096,17 +2099,35 @@ private:
                 const ov::Tensor emb1 = embed_paged(lane, {next});
                 stats.decode_embed_seconds +=
                     seconds_since_tp(t_emb) - (lane.stall_accum - waited);
+                const double step_embed_ms = 1000.0 * (seconds_since_tp(t_emb) - (lane.stall_accum - waited));
                 waited           = lane.stall_accum;
                 const auto t_fwd = clock::now();
                 logits = paged_forward(lane, emb1, past, {static_cast<int32_t>(c)}, 0);
-                stats.decode_forward_seconds +=
-                    seconds_since_tp(t_fwd) - (lane.stall_accum - waited);
+                const double step_fwd_ms = 1000.0 * (seconds_since_tp(t_fwd) - (lane.stall_accum - waited));
+                stats.decode_forward_seconds += step_fwd_ms / 1000.0;
                 ++past;
                 const auto t_smp = clock::now();
                 next = pick(lane, sampler, logits);
-                stats.decode_sample_seconds += seconds_since_tp(t_smp);
+                const double step_sample_ms = 1000.0 * seconds_since_tp(t_smp);
+                stats.decode_sample_seconds += step_sample_ms / 1000.0;
                 if (mtp_ready_) {
                     mtp_set_pending(lane, lane.hidden, 0);
+                }
+                // ARCINT_PROFILE_CYCLE on the plain decode step (no drafter): the
+                // host-side split of one served token -- the cycle line below is
+                // the drafting loop's and this branch leaves before it. index/
+                // infer/logits/hidden are paged_forward's own t0..t3, mirrored on
+                // the lane; the rest of the step is this loop's embed and sample.
+                if (profile_cycle) {
+                    const auto now = clock::now();
+                    const double loop_ms = std::chrono::duration<double, std::milli>(now - t_step_prev).count();
+                    t_step_prev = now;
+                    log::info("step",
+                              "past %zu | embed %.2f | index %.2f infer %.2f logits %.2f hidden %.2f | "
+                              "sample %.2f | forward %.2f step %.2f loop %.2f ms",
+                              past, step_embed_ms, lane.last_fwd_ms_index, lane.last_fwd_ms_infer,
+                              lane.last_fwd_ms_logits, lane.last_fwd_ms_hidden, step_sample_ms,
+                              step_fwd_ms, step_embed_ms + step_fwd_ms + step_sample_ms, loop_ms);
                 }
                 continue;
             }
@@ -2344,7 +2365,19 @@ private:
     // than the template's, a geometry mismatch (every differing field
     // printed), a tensor the template needs that the file lacks or carries in
     // a type this stage does not serve.
-    void apply_gguf_weights(const std::shared_ptr<ov::Model>& model, const std::string& path, bool native) {
+    // Where the repack's deviation verdicts live between loads: the configured cache
+    // directory, else the user's cache (a served unit without --cache-dir still keeps
+    // its verdicts; the 224 s check ran at every load before this).
+    static std::string gguf_verdict_dir(const Config& cfg) {
+        if (!cfg.cache_dir.empty()) return cfg.cache_dir + "/gguf-verdicts";
+        if (const char* x = std::getenv("XDG_CACHE_HOME"); x != nullptr && x[0] != '\0') return std::string(x) + "/arcint/gguf-verdicts";
+        if (const char* h = std::getenv("HOME"); h != nullptr && h[0] != '\0') return std::string(h) + "/.cache/arcint/gguf-verdicts";
+        return std::string();
+    }
+    void apply_gguf_weights(const std::shared_ptr<ov::Model>& model, const std::string& path, int mode_flag,
+                            const std::string& verdict_dir, bool embed_from_file) {
+        const GgufWeightsMode mode = mode_flag == 1 ? GgufWeightsMode::Native
+                                   : mode_flag == 2 ? GgufWeightsMode::Mixed : GgufWeightsMode::Repack;
         auto file = std::make_shared<gguf::GgufFile>(gguf::GgufFile::open(path));
         const GgufGeometry fg = gguf_geometry(*file);
         const nlohmann::json& c  = artifact_.config;
@@ -2375,12 +2408,31 @@ private:
         if (!ft.empty() && ft != artifact_.chat_template)
             log::info("load", "gguf: the file's chat template differs from the artifact's (%zu against %zu chars); the artifact's is served",
                       ft.size(), artifact_.chat_template.size());
-        gguf_report_ = gguf_apply_to_template(model, file, fg, native ? GgufWeightsMode::Native : GgufWeightsMode::Repack);
+        gguf_report_ = gguf_apply_to_template(model, file, fg, mode, verdict_dir, path);
         gguf_file_   = file;  // the constants alias its map; held for the compiled model's life
         status_.weights_bytes = gguf_report_.bytes_from_file;  // the file's rows (or their repack), not the template's .bin
-        log::info("load", "gguf: %s; the embedding, norms, GDN state tensors and any MTP layer stay the template's",
+        log::info("load", "gguf: %s; the norms, GDN state tensors and any MTP layer stay the template's",
                   gguf_report_.summary().c_str());
         gguf_path_ = path;
+        if (embed_from_file) {
+            if (const auto* te = file->tensor("token_embd.weight"); te != nullptr && te->dims.size() == 2) {
+                const int64_t k = static_cast<int64_t>(te->dims[0]);
+                int64_t rb = FullyConnectedKQuant::row_bytes(te->ggml_type, k);
+                if (te->ggml_type == static_cast<int32_t>(gguf::GgmlType::F16)) rb = 2 * k;
+                else if (te->ggml_type == static_cast<int32_t>(gguf::GgmlType::F32)) rb = 4 * k;
+                if (rb > 0) {
+                    gguf_embed_ = GgufEmbed{te, static_cast<size_t>(rb), static_cast<size_t>(k), static_cast<size_t>(te->dims[1])};
+                    log::info("load", "gguf: the embedding rows come from the file (token_embd.weight, %s, %zu x %zu), "
+                                      "dequantised on the host per token; the template's embedding model serves only the stateful path",
+                              gguf::type_name(te->ggml_type).c_str(), gguf_embed_.vocab, gguf_embed_.width);
+                } else {
+                    log::info("load", "gguf: token_embd.weight is %s, which has no row decoder here; the template's embedding serves",
+                              gguf::type_name(te->ggml_type).c_str());
+                }
+            } else {
+                log::info("load", "gguf: the file has no 2-D token_embd.weight; the template's embedding serves");
+            }
+        }
     }
 
     void load_paged(const Config& cfg, int req_n_ctx) {
@@ -2397,7 +2449,9 @@ private:
         // other pass touches the graph (the template's own weights stay mapped
         // and unread). A plugin below +p7 has no kernel for the tagged constants
         // and refuses at compile with the op named; nothing falls back.
-        if (!cfg.gguf_path.empty()) apply_gguf_weights(model, cfg.gguf_path, cfg.gguf_native);
+        if (!cfg.gguf_path.empty())
+            apply_gguf_weights(model, cfg.gguf_path, cfg.gguf_mode,
+                               cfg.gguf_check_once ? gguf_verdict_dir(cfg) : std::string(), cfg.gguf_embed_file);
         // --gate-pad N: widen the shared-expert gate (see pad_gate_matmuls). A
         // deployment choice with a known price, like --paged-kv: DESIGN 7.0.2g
         // has the break-even. Off by default for this fleet's answer lengths.
@@ -5758,6 +5812,20 @@ private:
     // layout, and the head's food -- it crosses host memory either way).
     ov::Tensor embed_paged(Lane& lane, const std::vector<int>& ids) {
         const size_t n = ids.size();
+        if (gguf_embed_.t != nullptr) {
+            // The file's own rows, on the host: no device call, no turn taken.
+            ov::Tensor out(ov::element::f32, ov::Shape{n, gguf_embed_.width});
+            float* dst = out.data<float>();
+            const uint8_t* base = gguf_file_->data(*gguf_embed_.t);
+            for (size_t i = 0; i < n; ++i) {
+                const int id = ids[i];
+                if (id < 0 || static_cast<size_t>(id) >= gguf_embed_.vocab)
+                    throw std::runtime_error(log::format("token id %d outside the file's embedding (%zu rows)", id, gguf_embed_.vocab));
+                gguf::dequantize_row(gguf_embed_.t->ggml_type, base + static_cast<size_t>(id) * gguf_embed_.row_bytes,
+                                     gguf_embed_.width, dst + i * gguf_embed_.width);
+            }
+            return out;
+        }
         ov::Tensor id_tensor(ov::element::i64, ov::Shape{1, n});
         int64_t*   idp = id_tensor.data<int64_t>();
         for (size_t i = 0; i < n; ++i) idp[i] = ids[i];
@@ -7420,6 +7488,12 @@ private:
     std::string                    gguf_path_;
     GgufApplyReport                gguf_report_;
     std::shared_ptr<gguf::GgufFile> gguf_file_;
+    // 0.4.1: the token embedding rows from the file (token_embd.weight), dequantised on
+    // the host per looked-up token -- one row of K values, microseconds -- instead of the
+    // template's own embedding model. Unset when the file lacks the tensor, its type has no
+    // row decoder, or --gguf-embed template.
+    struct GgufEmbed { const gguf::TensorInfo* t = nullptr; size_t row_bytes = 0; size_t width = 0; size_t vocab = 0; };
+    GgufEmbed                      gguf_embed_;
     // Patch 0020 engine side (DESIGN §7.0.2at): the GPU plugin's own patch
     // level, read from its build number (`marfrit-p<N>`, the recipe's
     // stamp -- the detection contract is stated at fit.h's

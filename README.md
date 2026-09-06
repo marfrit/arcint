@@ -214,7 +214,11 @@ stage 1: `--gguf FILE --model DIR` takes the served IR of the same
 architecture as the topology template and replaces its projections with the
 file's own K-quant rows (Q4_K, Q5_K, Q6_K, Q8_0). Since 0.4.1 the rows
 are repacked at load into the runtime's own compressed form (the default;
-`--gguf-native` keeps 0.4.0's path, the rows decoded inside the patched
+`--gguf-mode repack|native|mixed` chooses the form (0.4.1: `mixed` repacks
+Q4_K and keeps every other type as the file's rows, which is where the
+repack's residency went); `--gguf-check once|always` keeps each repacked
+projection's deviation verdict between loads of the same file (`once`, the
+default) or re-checks at every load. `--gguf-native` keeps 0.4.0's path, the rows decoded inside the patched
 runtime's kernel, patch 0021 in `marfrit-openvino +p7`). The file's
 geometry is checked against the template's; the template's tokenizer and
 chat template are served; the embedding, the GDN state tensors and the MTP

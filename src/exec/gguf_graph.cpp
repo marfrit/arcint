@@ -2,7 +2,11 @@
 
 #include "core/gguf_repack.h"
 
+#include <chrono>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <sys/stat.h>
 #include <map>
 
 #include <algorithm>
@@ -90,16 +94,66 @@ std::shared_ptr<ov::Node> gather_rows_back(const ov::Output<ov::Node>& y, int64_
 
 }  // namespace
 
+GgufWeightsMode gguf_tensor_mode(GgufWeightsMode mode, int32_t ggml_type) {
+    if (mode != GgufWeightsMode::Mixed) return mode;
+    return ggml_type == static_cast<int32_t>(gguf::GgmlType::Q4_K) ? GgufWeightsMode::Repack : GgufWeightsMode::Native;
+}
+
+namespace {
+// The deviation verdict of one repacked projection, kept between loads.
+struct Verdict { double max_steps = 0.0; size_t values = 0; };
+
+std::string verdict_key(const std::string& file_path, const gguf::TensorInfo& t, double bound) {
+    struct stat st {};
+    if (file_path.empty() || ::stat(file_path.c_str(), &st) != 0) return "";
+    std::ostringstream k;
+    k << "repack-v1|" << st.st_size << '|' << st.st_mtim.tv_sec << '.' << st.st_mtim.tv_nsec << '|' << t.name << '|'
+      << t.offset << '|' << t.ggml_type << '|' << bound;
+    for (auto d : t.dims) k << 'x' << d;
+    // FNV-1a over the key text: a file name, not a claim of uniqueness beyond the fields above.
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : k.str()) { h ^= c; h *= 1099511628211ull; }
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%016llx", static_cast<unsigned long long>(h));
+    return buf;
+}
+
+bool read_verdict(const std::string& dir, const std::string& key, Verdict& v) {
+    if (dir.empty() || key.empty()) return false;
+    std::ifstream in(std::filesystem::path(dir) / (key + ".verdict"));
+    std::string tag;
+    if (!(in >> tag >> v.max_steps >> v.values) || tag != "ok") return false;
+    return true;
+}
+
+void write_verdict(const std::string& dir, const std::string& key, const Verdict& v) {
+    if (dir.empty() || key.empty()) return;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return;
+    std::ofstream out(std::filesystem::path(dir) / (key + ".verdict"));
+    out.precision(17);
+    out << "ok " << v.max_steps << ' ' << v.values << '\n';
+}
+}  // namespace
+
 std::string GgufApplyReport::summary() const {
     std::unordered_map<int32_t, std::pair<int, size_t>> per_type;
-    for (const auto& r : replaced) { per_type[r.ggml_type].first++; per_type[r.ggml_type].second += r.bytes; }
+    size_t repacked = 0;
+    for (const auto& r : replaced) { per_type[r.ggml_type].first++; per_type[r.ggml_type].second += r.bytes; if (r.repacked) ++repacked; }
     std::ostringstream s;
-    s << replaced.size() << " projection(s) from the file" << (mode == GgufWeightsMode::Repack ? " (repacked)" : " (native rows)");
+    s << replaced.size() << " projection(s) from the file";
+    if (mode == GgufWeightsMode::Repack) s << " (repacked)";
+    else if (mode == GgufWeightsMode::Native) s << " (native rows)";
+    else s << " (mixed: " << repacked << " repacked, " << (replaced.size() - repacked) << " native rows)";
     for (const auto& [t, cb] : per_type)
         s << ", " << gguf::type_name(t) << " x" << cb.first << " (" << (cb.second >> 20) << " MiB)";
-    if (mode == GgufWeightsMode::Repack)
+    if (repacked != 0) {
         s << "; repack deviation max " << repack_max_steps << " quantisation step(s) over " << repack_checked << " value(s), "
           << repack_over_bound << " over bound";
+        if (repack_verdicts_cached != 0) s << " (" << repack_verdicts_cached << " verdict(s) from an earlier load)";
+        s << "; repack " << static_cast<int>(repack_seconds) << " s, check " << static_cast<int>(check_seconds) << " s";
+    }
     s << "; " << kept.size() << " constant(s) kept from the template; " << awq_scales_neutralized
       << " AWQ activation scale(s) set to one; " << norms_compared << " norm(s) compared with the file, max |diff| "
       << norms_max_abs_diff;
@@ -192,9 +246,12 @@ static std::shared_ptr<ov::Node> repacked_matmul(const ov::Output<ov::Node>& act
 GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
                                        const std::shared_ptr<gguf::GgufFile>& file,
                                        const GgufGeometry& g,
-                                       GgufWeightsMode mode) {
+                                       GgufWeightsMode mode,
+                                       const std::string& verdict_dir,
+                                       const std::string& file_path) {
     GgufApplyReport rep;
     rep.mode = mode;
+    using wall = std::chrono::steady_clock;
     std::map<std::string, Widened> widened;  // one widening per distinct activation (repack mode)
     const auto to_file = gguf_v_head_to_file_head(g.linear_k_heads, g.linear_v_heads);
     const int64_t v_rows = g.linear_v_heads * g.linear_v_dim;
@@ -264,8 +321,10 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
         const int64_t row_bytes = FullyConnectedKQuant::row_bytes(t->ggml_type, k);
         std::shared_ptr<ov::Node> replacement;
         std::shared_ptr<ov::Node> post;  // an output-side gather when the rows were reordered
+        const GgufWeightsMode tmode = gguf_tensor_mode(mode, t->ggml_type);
         if (row_bytes != 0) {
-            if (mode == GgufWeightsMode::Repack) {
+            if (tmode == GgufWeightsMode::Repack) {
+                r.repacked = true;
                 // A column-reordered projection (the output projection) takes its
                 // order at build; the mins' augmented groups then follow the heads.
                 std::vector<int64_t> dest_of;
@@ -277,15 +336,30 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
                     for (int64_t hf = 0; hf < g.linear_v_heads; ++hf)
                         for (int64_t e = 0; e < d; ++e) dest_of[static_cast<size_t>(to_file[static_cast<size_t>(hf)] * d + e)] = hf * d + e;
                 }
+                const auto t_repack = wall::now();
                 auto packed = gguf::repack_tensor(*file, *t, dest_of.empty() ? nullptr : &dest_of);
-                const auto dv = gguf::repack_deviation(*file, *t, packed, repack_bound_steps(t->ggml_type));
-                rep.repack_max_steps = std::max(rep.repack_max_steps, dv.max_steps);
-                rep.repack_over_bound += dv.over;
-                rep.repack_checked += dv.values;
-                if (dv.over != 0)
-                    throw std::runtime_error("gguf: " + gguf_name + " repacked outside its bound: " + std::to_string(dv.over) +
-                                             " value(s) over " + std::to_string(repack_bound_steps(t->ggml_type)) +
-                                             " quantisation step(s), max " + std::to_string(dv.max_steps));
+                rep.repack_seconds += std::chrono::duration<double>(wall::now() - t_repack).count();
+                const double bound = repack_bound_steps(t->ggml_type);
+                const std::string key = verdict_key(file_path, *t, bound);
+                Verdict v;
+                if (read_verdict(verdict_dir, key, v)) {
+                    // Checked and passed by an earlier load of this very file (size, mtime,
+                    // offset, type, dims); the repack itself is deterministic in the bytes.
+                    rep.repack_max_steps = std::max(rep.repack_max_steps, v.max_steps);
+                    ++rep.repack_verdicts_cached;
+                } else {
+                    const auto t_check = wall::now();
+                    const auto dv = gguf::repack_deviation(*file, *t, packed, bound);
+                    rep.check_seconds += std::chrono::duration<double>(wall::now() - t_check).count();
+                    rep.repack_max_steps = std::max(rep.repack_max_steps, dv.max_steps);
+                    rep.repack_over_bound += dv.over;
+                    rep.repack_checked += dv.values;
+                    if (dv.over != 0)
+                        throw std::runtime_error("gguf: " + gguf_name + " repacked outside its bound: " + std::to_string(dv.over) +
+                                                 " value(s) over " + std::to_string(bound) +
+                                                 " quantisation step(s), max " + std::to_string(dv.max_steps));
+                    write_verdict(verdict_dir, key, Verdict{dv.max_steps, dv.values});
+                }
                 // The value-head reorder is undone in the repacked rows and column
                 // groups themselves, not by gathers in the graph (a gather per
                 // projection cost the plugin an activation buffer per token: the fit
@@ -313,7 +387,7 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
                 replacement = std::make_shared<FullyConnectedKQuant>(act_out, w, t->ggml_type, k, n);
                 r.bytes = static_cast<size_t>(n) * static_cast<size_t>(row_bytes);
             }
-            if (mode == GgufWeightsMode::Native && (reorder == GgufReorder::RowsV || reorder == GgufReorder::RowsQKV)) {
+            if (tmode == GgufWeightsMode::Native && (reorder == GgufReorder::RowsV || reorder == GgufReorder::RowsQKV)) {
                 const int64_t first = reorder == GgufReorder::RowsQKV ? 2 * qk_rows : 0;
                 if (first + v_rows != n)
                     throw std::runtime_error("gguf: " + gguf_name + " has " + std::to_string(n) + " rows; expected " +
