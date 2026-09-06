@@ -168,6 +168,28 @@ Three consumers, in this order:
 The sub-4-bit set (IQ4_XS, IQ3_S, IQ3_XXS, Q3_K) is the same three
 consumers with codebook decoders, after the linear set is measured.
 
+**What the fully-connected kernel became (0.4.0 stage 1, DESIGN
+§7.0.2ay; 0.4.1 lever 1, §7.0.2az).** Not a bf-tiled variant: its own
+kernel, one lane per output column, two variants from one source chosen
+at dispatch by the row count. The bf-tiled register budget was never the
+question; the measured questions were scratch memory (a run-time loop
+bound), the activation re-read per column, and the prefill tile's
+activation reads — each answered by a rung of the ladder in §7.0.2ay.
+The decode of a block is now a *packing*, not a dequantisation: every
+quantised integer q' below 1,024 becomes the f16 bit pattern
+`0x6400 | q'` (that is f16(1024 + q')) with a shift, a mask and an or,
+and the lane's 16 packed values are its column of the B operand of the
+subgroup matrix multiply. The scale and the offset are applied to the
+multiply's sums instead of to the values: for a sub-block half,
+Σ x·value = dl·S − mo·X with S = A×B over the packed values and X = A×1
+(the same multiply against f16 1.0), mo = 1024·dl + (the min, or 32·dl
+for Q6_K's −32, or 128·dl for Q8_0's sign); Q6_K's two scales per
+sub-block are why the halves are separate. The 1,024× offset costs
+seven bits of the f32 accumulator, measured within 2e-3 of the f32
+reference at K 1,280. Both variants use it: decode with the one row as
+the A operand (a block read per 16 values) and K split over four
+subgroups; prefill with the row tile staged in local memory.
+
 ### 3.4 Exactness, in three layers
 
 - **Host reference**: a C++ dequantizer for every block type in arcint

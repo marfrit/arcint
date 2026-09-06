@@ -66,7 +66,7 @@ allow single-digit milliseconds.
 
 Deferred from 0.4.0 stage 1 and carried here as items, not as gates: the
 embedding gather from the file (the template's i8 embedding serves; the
-file's Q4_K needs a gather kernel, plugin patch 0022) and the MTP layer
+file's Q4_K needs a gather kernel, a later plugin patch) and the MTP layer
 from the file (the template's serves; `--mtp on` on a GGUF-opened model is
 untested). Neither moves a rate in the table above.
 
@@ -108,3 +108,16 @@ to keep on the other card.
 ## Status
 
 - 2026-09-06 — recorded at the close of 0.4.0 stage 1; nothing started.
+- 2026-09-06 — lever 1 taken (DESIGN §7.0.2az, plugin patch 0022, `+p8`
+  recipe): the packed matrix-unit decode is 3× on the 16 GiB card and a
+  loss on the 24 GB card, where a one-row matrix multiply costs like an
+  eight-row one; the split by width lands on both. The 24 GB card's
+  decode launch stays at 200–230 µs against a 148 µs skeleton, and the
+  served decode rate did not move (10.0 t/s). No lever tried hides the
+  arithmetic behind the stream; the gate is not in reach on the native
+  path with what is measured. Open decision, the operator's: a repack at
+  load into the plugin's own compressed layout (u4 per group of 32 with
+  an f16 scale and zero point for Q4_K, u8 for Q5_K/Q6_K/Q8_0), which
+  runs Intel's own kernels at the IR's rate but is the unpack at load the
+  0.4.0 rule excluded, at 2^-11 relative rounding of the block scales and
+  ~10 % more bytes for the 6-bit tensors.

@@ -387,6 +387,23 @@ eight-version ladder that got the kernel here from 28.8 / 3.5. DESIGN
 
 Upstream: not yet filed.
 
+### 0022-kquant-decode-split.patch
+
+The K-quant kernel's decode variant (arcint 0.4.1 lever 1, `docs/
+milestone-0.4.1.md`): the super-blocks packed for the subgroup matrix
+multiply on Xe-HPG — the quantised integers become f16 bit patterns with
+a shift, a mask and an or, the scale and the offset applied to the
+multiply's sums — which makes the 16 GiB card's decode launch 3× faster
+(509 → 179 µs at the gate projection); the fused multiply-add path kept
+on Xe2, where a one-row matrix multiply occupies the systolic array like
+an eight-row one (measured, 46 cycles); and the decode work-group sized
+by the projection's width on both, so a narrow projection fills the
+card. The served decode rate on the 24 GB card did not move (10.0
+against 9.9 t/s). Three readings refuted on the way are in the header.
+DESIGN §7.0.2az.
+
+Upstream: not yet filed.
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.

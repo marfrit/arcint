@@ -1,3 +1,16 @@
+marfrit-openvino (2026.4.0~dev20260821+p8-1) bookworm trixie; urgency=medium
+
+  * One more patch applied on top of +p7, same upstream commit (71640275),
+    same smallest-sufficient-divergence numbering:
+    - patches/0022: the K-quant kernel's decode variant -- packed for the
+      subgroup matrix multiply on Xe-HPG (the 16 GiB card's decode launch
+      3x faster), the fused path kept on Xe2 where a one-row matrix
+      multiply costs like an eight-row one (measured), and the decode
+      work-group sized by the projection's width on both so narrow
+      projections fill the card. arcint 0.4.1 lever 1, DESIGN 7.0.2az.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 06 Sep 2026 07:30:00 +0200
+
 marfrit-openvino (2026.4.0~dev20260821+p7-1) bookworm trixie; urgency=medium
 
   * One more patch applied on top of +p6, same upstream commit (71640275),

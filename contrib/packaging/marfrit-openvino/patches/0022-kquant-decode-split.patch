@@ -1,0 +1,451 @@
+# The K-quant kernel's decode variant: packed for the matrix unit on Xe-HPG, split by width on both
+
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0003-0021. arcint 0.4.1, lever 1 of docs/milestone-0.4.1.md (DESIGN.md
+# section 7.0.2az): the fully-connected K-quant kernel of patch 0021, one-row (decode)
+# variant, made cheaper where a measurement said it could be.
+#
+# What changes (four files of 0021, no new ones):
+#   kquant_utils.cl     Beside the f32 decoders, PACKERS for the subgroup matrix multiply:
+#                       every quantised integer q' below 1,024 becomes the f16 bit pattern
+#                       0x6400 | q' (that is f16(1024 + q')) with a shift, a mask and an or --
+#                       no convert -- and the lane's 16 values are its column of the B
+#                       operand; the scale and the offset are applied to the multiply's sums,
+#                       not to the values (sum x*value = dl*S - mo*X, X = the same multiply
+#                       against f16 1.0; Q6_K's two scales per sub-block keep the halves
+#                       apart; Q8_0's sign is a xor). The 1,024x offset costs seven bits of
+#                       the f32 accumulator, measured within 2e-3 of the f32 reference.
+#   fully_connected_gpu_kquant.cl   The decode variant splits a column's super-blocks over
+#                       the work-group's subgroups as before, but on Xe-HPG (subgroup 8) it
+#                       packs the sub-block and runs the one-row matrix multiply, and on Xe2
+#                       (subgroup 16) it keeps the fused multiply-add path: a one-row
+#                       multiply occupies Xe2's systolic array like an eight-row one
+#                       (measured 46 cycles, three times a lane's FMAs for the same 16
+#                       values), and on Xe-HPG it is cheap (measured 3x over the fused path).
+#                       The split stays at super-block granularity: a sub-block-granular
+#                       split serialised the loads the unrolled eight-sub-block body hoists
+#                       (measured, 1.6x slower on both cards).
+#   fully_connected_kernel_kquant.cpp   The decode work-group is sized by the projection's
+#                       width so a launch has about 4,096 (Xe2) or 8,192 (Xe-HPG) subgroups
+#                       whatever N is, within the work-group limit and the row's super-block
+#                       count; a fixed split of four left a narrow projection at a fraction
+#                       of the card. Both variants take the subgroup size from the
+#                       architecture.
+#   fully_connected_gpu_test.cpp   The tolerance carries the f16-copy term on every row
+#                       count; the timing test covers the gate projection at four row counts
+#                       and the value and down projections at one row.
+#
+# MEASURED, the plugin's timing test, one launch, ten repetitions, the network's stream
+# waited on (the window's spread on the 24 GB card is about 15 % between runs of the same
+# binary; the 16 GiB card's is small):
+#                                            24 GB card          16 GiB card
+#   gate projection  N 17,408 K 5,120, M=1   225 -> 199..230 us   509 -> 179 us
+#   down projection  N 5,120 K 17,408, M=1   (not timed on 0021) 241 us  |  188 us
+#   value projection N 1,024 K 5,120,  M=1   (not timed on 0021)  27 us  |   27 us
+#   gate projection, M=2048 (the tiled variant, unchanged)   39.6 ms   |  78.2 ms
+# Readings refuted on the way, each by one timing: prefetching the next super-block,
+# a K split of eight, a two-way unroll (all worse or within 6 % on Xe2); reading the
+# weights lane-contiguous (7 % on the stripped skeleton, the pattern is not the floor);
+# the activations per lane through plain loads or local memory (35 us and 8 us of the
+# 106 us the block reads cost on Xe2 -- the matrix-unit decode was dropped there instead).
+# Served (the dense Qwen3.8-27B Q4_K_M through arcint on the 24 GB card, same protocol as
+# 0021's benchmark): decode 10.0 t/s at 856 prompt tokens against 9.9 on 0021 -- the 24 GB
+# card's decode launch did not move, and the served rate says so; 7.4 t/s at 71,727 against
+# 8.5, a difference this patch has no mechanism for and that is recorded, not attributed.
+# The 16 GiB card's gain is a launch-level measurement; no GGUF-opened model is served
+# there.
+#
+# Correctness: the eleven cases of 0021 on both cards against the host reference, the
+# refusal case, the fully-connected suite otherwise unchanged.
+#
+# Upstream: not yet filed.
+
+--- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
+@@ -1,14 +1,17 @@
+-// arcint (patch 0021): fully connected over GGUF K-quant weights, decoded in the inner loop.
++// arcint (patches 0021/0022): fully connected over GGUF K-quant weights, decoded in the inner loop.
+ // One LANE per output column: each lane walks its own row's super-blocks along K and decodes
+ // one 32-value sub-block at a time into registers. Weights stay in their file layout
+ // (KQ_ROW_BYTES per row); nothing is unpacked outside this kernel.
+ //
+ // Two variants are compiled from this source and chosen at dispatch by the row count (host
+ // side):
+-//   TILE_M == 1 (decode): the weights are the whole stream. Each lane multiplies its decoded
+-//   sub-block with the one activation row -- the same address in every lane, one broadcast
+-//   read per subgroup -- and K is split over the KQ_WG subgroups of a work-group (reduced
+-//   through local memory) so enough subgroups are in flight to cover the load latency.
++//   TILE_M == 1 (decode): the weights are the whole stream. K is split over the KQ_WG
++//   subgroups of a work-group (reduced through local memory), KQ_WG sized by the host so a
++//   launch fills the card whatever the projection's width. On Xe2 each lane decodes its
++//   sub-block and multiplies it with the one activation row on the vector unit (the same
++//   address in every lane, one broadcast read); on Xe-HPG it packs the sub-block for the
++//   one-row matrix multiply instead (kquant_utils.cl), which is cheap there and not on Xe2
++//   (measured both ways, DESIGN 7.0.2az).
+ //   TILE_M > 1 (prefill): the decoded sub-block, converted to f16, is this lane's column of
+ //   the B operand of the subgroup matrix multiply (XMX, cl_intel_subgroup_matrix_multiply_
+ //   accumulate); the activation rows are the A operand. A work-group of KQ_WG subgroups
+@@ -51,18 +54,34 @@
+ 
+ #define KQ_BLOCKS (KQ_K / KQ_BLOCK)
+ 
++// A operand of the f16 matrix multiply: with 16 lanes a lane holds one k per row (short),
++// with 8 lanes two consecutive k (int). KQ_A_T is the 8-row tile, KQ_A1_T one row.
++#if SIMD == 16
++#  define KQ_A_T short8
++#  define KQ_A1_T short
++#  define KQ_A_ELEM short
++#  define KQ_A1_READ(p) as_short(intel_sub_group_block_read_us((const __global ushort*)(p)))
++#elif SIMD == 8
++#  define KQ_A_T int8
++#  define KQ_A1_T int
++#  define KQ_A_ELEM int
++#  define KQ_A1_READ(p) as_int(intel_sub_group_block_read((const __global uint*)(p)))
++#else
++#  error "fully_connected_gpu_kquant.cl: the matrix multiply takes a subgroup of 8 or 16"
++#endif
++#define KQ_MAD(a, b, acc) intel_sub_group_f16_f16_matrix_mad_k16(a, b, acc)
++#if KQ_TYPE == 8
++#  define KQ_PACK(blk, s, b0, b1, dl, mo) kq_pack_q8_0(blk, s, b0, b1, dl, mo)
++#elif KQ_TYPE == 12
++#  define KQ_PACK(blk, s, b0, b1, dl, mo) kq_pack_q4_K_sub(blk, s, b0, b1, dl, mo)
++#elif KQ_TYPE == 13
++#  define KQ_PACK(blk, s, b0, b1, dl, mo) kq_pack_q5_K_sub(blk, s, b0, b1, dl, mo)
++#else
++#  define KQ_PACK(blk, s, b0, b1, dl, mo) kq_pack_q6_K_sub(blk, s, b0, b1, dl, mo)
++#endif
++#define KQ_SUBBLOCKS (KQ_K / 32)
++
+ #if TILE_M > 1
+-// A operand of the f16 matrix multiply, one 8 x 16 tile of activation rows: with 16 lanes a
+-// lane holds one k per row (short), with 8 lanes two consecutive k (int).
+-#  if SIMD == 16
+-#    define KQ_A_T short8
+-#    define KQ_A_ELEM short
+-#  elif SIMD == 8
+-#    define KQ_A_T int8
+-#    define KQ_A_ELEM int
+-#  else
+-#    error "fully_connected_gpu_kquant.cl: the matrix multiply takes a subgroup of 8 or 16"
+-#  endif
+ #  define KQ_GROUPS (TILE_M / 8)
+ // The staged activation tile: TILE_M rows of one super-block (KQ_BLOCK halves), 16 bytes per
+ // work-item per pass.
+@@ -111,26 +130,48 @@
+     const uint ibase = INPUT0_GET_INDEX(r0, 0, 0, 0);
+ #endif
+     const __global uchar* wrow = weights + (ulong)nn * KQ_ROW_BYTES;
++    // The work-group's KQ_WG subgroups split the row's super-blocks (the host sizes KQ_WG by
++    // N so a launch fills the card: a narrow projection gets more subgroups per column,
++    // measured). The split stays at super-block granularity: the eight sub-blocks of one
++    // super-block are one unrolled body whose loads the compiler hoists together; a
++    // sub-block-granular split serialised them (measured, 1.6x slower on both cards).
+     const uint kb0 = (sg * KQ_BLOCKS) / KQ_WG, kb1 = ((sg + 1) * KQ_BLOCKS) / KQ_WG;
+-    float4 acc = (float4)(0.0f);
++    float acc = 0.0f;
+     for (uint kb = kb0; kb < kb1; ++kb) {
+         const __global uchar* blk = wrow + kb * KQ_BLOCK_BYTES;
+         __attribute__((opencl_unroll_hint(KQ_SUBS)))
+         for (uint s = 0; s < KQ_SUBS; ++s) {
+-            float y[32];
+-            KQ_DECODE(blk, s, y);
+-            const float16 ya = vload16(0, y);
+-            const float16 yb = vload16(0, y + 16);
+-            const __global INPUT0_TYPE* x = input + ibase + kb * KQ_BLOCK + s * 32;  // one address for the whole subgroup
+-            const float16 fa = convert_float16(vload16(0, x));
+-            const float16 fb = convert_float16(vload16(0, x + 16));
+-            const float16 p = fma(fa, ya, fb * yb);
+-            const float8 p8 = p.lo + p.hi;
+-            acc += p8.lo + p8.hi;
++        const __global INPUT0_TYPE* x = input + ibase + kb * KQ_BLOCK + s * 32;
++#if SIMD == 8
++        // Xe-HPG: the one-row matrix multiply is cheap (measured 3x over the fused path on
++        // the 16 GiB card); the sub-block is packed, not decoded.
++        int8 b0, b1; float2 dl, mo;
++        KQ_PACK(blk, s, &b0, &b1, &dl, &mo);
++        const KQ_A1_T a0 = KQ_A1_READ(x);
++        const KQ_A1_T a1 = KQ_A1_READ(x + 16);
++        const float S0 = KQ_MAD(a0, b0, 0.0f), X0 = KQ_MAD(a0, KQ_ONES8, 0.0f);
++        const float S1 = KQ_MAD(a1, b1, 0.0f), X1 = KQ_MAD(a1, KQ_ONES8, 0.0f);
++        acc += (dl.s0 * S0 - mo.s0 * X0) + (dl.s1 * S1 - mo.s1 * X1);
++#else
++        // Xe2: a one-row matrix multiply occupies the systolic array like an eight-row one
++        // (measured 46 cycles, 3x a lane's fused multiply-adds for the same 16 values); the
++        // sub-block is decoded and multiplied on the vector unit, the activation address the
++        // same in every lane (one broadcast read).
++        float y[32];
++        KQ_DECODE(blk, s, y);
++        const float16 ya = vload16(0, y);
++        const float16 yb = vload16(0, y + 16);
++        const float16 fa = convert_float16(vload16(0, x));
++        const float16 fb = convert_float16(vload16(0, x + 16));
++        const float16 p = fma(fa, ya, fb * yb);
++        const float8 p8 = p.lo + p.hi;
++        const float4 p4 = p8.lo + p8.hi;
++        acc += (p4.s0 + p4.s1) + (p4.s2 + p4.s3);
++#endif
+         }
+     }
+ #  if KQ_WG > 1
+-    __local float4 red[KQ_WG][SIMD];
++    __local float red[KQ_WG][SIMD];
+     red[sg][lane] = acc;
+     barrier(CLK_LOCAL_MEM_FENCE);
+     if (sg != 0)
+@@ -138,7 +179,7 @@
+     for (uint j = 1; j < KQ_WG; ++j) acc += red[j][lane];
+ #  endif
+     float sums[1];
+-    sums[0] = (acc.s0 + acc.s1) + (acc.s2 + acc.s3);
++    sums[0] = acc;
+ #else
+     const uint n = (get_group_id(0) * KQ_WG + sg) * SIMD + lane;   // lane = output column; the work-group's subgroups take KQ_WG x SIMD columns
+     const uint nn = min(n, (uint)KQ_N - 1);
+--- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/include/batch_headers/kquant_utils.cl
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/include/batch_headers/kquant_utils.cl
+@@ -1,18 +1,25 @@
+-// arcint (patch 0021): GGUF K-quant super-block decoders (ggml-quants.c's dequantize_row_*,
+-// formula for formula). A row of a [N, K] weight is K/256 super-blocks (K/32 for Q8_0) laid
+-// end to end, the file's own bytes. Every decoder reads one 32-value sub-block of one
+-// super-block from global memory with vector loads into registers, decodes it there, and
+-// produces 32 f32 values so the caller fuses the multiply-accumulate without materialising
+-// the row.
+-//
+-// The quantised bytes are handled as 32-bit (Q4_K, Q5_K; 16-byte-aligned blocks) or 16-bit
+-// (Q6_K, Q8_0; 210- and 34-byte blocks are only 2-aligned) words and each value is a shift, a
+-// mask and a convert out of its word. Byte-wise vectors cost the compiler a move per byte
+-// per lane (measured: three times the instructions). Nothing here indexes a private array
+-// with a runtime value: the compiled kernel must report no private memory, or every lane's
+-// arrays go to scratch and the kernel runs at a fraction of the weight bandwidth (measured).
+-// Checked against an independent transcription of the same formulas in the plugin's unit
+-// test (kq_host in fully_connected_gpu_test.cpp) and end to end by the served model.
++// arcint (patches 0021/0022): GGUF K-quant super-block decoders and packers (ggml-quants.c's
++// dequantize_row_* formulas). A row of a [N, K] weight is K/256 super-blocks (K/32 for Q8_0)
++// laid end to end, the file's own bytes. Every routine reads one 32-value sub-block of one
++// super-block from global memory with vector loads into registers:
++//   kq_dec_*   produce 32 f32 values (the fused multiply-accumulate path; a shift, a mask
++//              and a convert per value out of 32-bit or 16-bit words of the block --
++//              byte-wise vectors cost the compiler a move per byte per lane, measured 3x);
++//   kq_pack_*  produce this lane's B operand for two f16 subgroup matrix multiplies
++//              (k = 0..15 and 16..31; consecutive k paired in each int, low half first) plus
++//              the two scalars that turn the multiplies' sums into the dot product:
++//                value_k = dl * q_k + c          (ggml: d*sc*q - dmin*mn; d*sc*(q6-32); d*q8)
++//                packed_k = f16(1024 + q'_k)      (q' = q, q6, or q8+128: an unsigned integer
++//                                                 below 1024, whose f16 is 0x6400 | q' -- no convert)
++//                sum x*value = dl * S - mo * X   (S = A x B over the packed values, X = A x 1,
++//                                                 mo = 1024*dl + (min | 32*dl | 128*dl))
++//              so packing a value is a shift, a mask and an or, and the 1024x offset falls
++//              out of the f32 sums (seven bits of the accumulator; measured within 2e-3 of
++//              the f32 reference at K 1,280).
++// Nothing here indexes a private array with a runtime value: the compiled kernel must report
++// no private memory, or every lane's arrays go to scratch (measured, 10x). Checked against an
++// independent transcription of the same formulas in the plugin's unit test (kq_host in
++// fully_connected_gpu_test.cpp) and end to end by the served model.
+ #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+ 
+ inline float kq_f16bits(uint h) { return convert_float(as_half((ushort)(h & 0xFFFFu))); }
+@@ -98,3 +105,100 @@
+         y[l] = (l < 16 ? s0 : s1) * (float)((int)(lo | (hi << 4)) - 32);
+     }
+ }
++
++// ---- packers for the matrix unit ----
++#define KQ_HALF_BASE 0x64006400u   // two f16 1024.0: 0x6400 | q is f16(1024 + q) for 0 <= q < 1024
++#define KQ_ONES8 ((int8)(0x3C003C00))  // sixteen f16 1.0: the B operand that sums the activations
++
++
++// One int of B from a word v holding the even value's nibble in bits 0-3 and the odd value's
++// in bits 8-11.
++inline int kq_pair4(uint v) { return (int)(KQ_HALF_BASE | (v & 0xFu) | ((v << 8) & 0xF0000u)); }
++
++// Q8_0: 32 values, {f16 d; int8 qs[32]} = 34 bytes; value = d * q8. Packed as 1024 + (q8 + 128):
++// the raw byte xor 0x80. The bytes as 16 little-endian ushorts (2-aligned block).
++inline void kq_pack_q8_0(const __global uchar* b, uint s, int8* b0, int8* b1, float2* dl, float2* mo) {
++    const float d = kq_f16at(b);
++    *dl = (float2)(d); *mo = (float2)((1024.0f + 128.0f) * d);
++    const ushort16 q = vload16(0, (const __global ushort*)(b + 2));
++    int p[16];
++    __attribute__((opencl_unroll_hint(16)))
++    for (int i = 0; i < 16; ++i) {
++        const uint w = q[i];
++        p[i] = (int)(KQ_HALF_BASE | (((w & 0xFFu) | ((w << 8) & 0xFF0000u)) ^ 0x00800080u));
++    }
++    *b0 = (int8)(p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
++    *b1 = (int8)(p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
++}
++
++// Q4_K: 256 values, {f16 d; f16 dmin; uchar scales[12]; uchar qs[128]} = 144 bytes; sub-block
++// s = 0..7; value = d*sc * q - dmin*mn. The 16-byte header is one load; the 32 bytes serving
++// sub-blocks 2j / 2j+1 (low / high nibbles) are one more. Values 2i, 2i+1 are bytes 2i, 2i+1:
++// bits 16*(i&1) and +8 of dword i>>1.
++inline void kq_pack_q4_K_sub(const __global uchar* b, uint s, int8* b0, int8* b1, float2* dl, float2* mo) {
++    const uint4 h = vload4(0, (const __global uint*)b);
++    const float d = kq_f16bits(h.s0), dmin = kq_f16bits(h.s0 >> 16);
++    uint sc, mn;
++    kq_scale_min_k4(s, h.s1, h.s2, h.s3, &sc, &mn);
++    const float dls = d * (float)sc, mls = dmin * (float)mn;
++    *dl = (float2)(dls); *mo = (float2)(1024.0f * dls + mls);
++    const uint8 q = vload8(0, (const __global uint*)(b + 16 + (s >> 1) * 32));
++    const uint shift = (s & 1) * 4;  // low nibbles for even s, high for odd
++    int p[16];
++    __attribute__((opencl_unroll_hint(16)))
++    for (int i = 0; i < 16; ++i)
++        p[i] = kq_pair4(q[i >> 1] >> ((i & 1) * 16 + shift));
++    *b0 = (int8)(p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
++    *b1 = (int8)(p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
++}
++
++// Q5_K: 256 values, {f16 d; f16 dmin; uchar scales[12]; uchar qh[32]; uchar qs[128]} = 176 bytes;
++// value = d*sc * (q4 | fifth bit << 4) - dmin*mn, the fifth bit being bit s of qh[l].
++inline void kq_pack_q5_K_sub(const __global uchar* b, uint s, int8* b0, int8* b1, float2* dl, float2* mo) {
++    const uint4 h = vload4(0, (const __global uint*)b);
++    const float d = kq_f16bits(h.s0), dmin = kq_f16bits(h.s0 >> 16);
++    uint sc, mn;
++    kq_scale_min_k4(s, h.s1, h.s2, h.s3, &sc, &mn);
++    const float dls = d * (float)sc, mls = dmin * (float)mn;
++    *dl = (float2)(dls); *mo = (float2)(1024.0f * dls + mls);
++    const uint8 qh = vload8(0, (const __global uint*)(b + 16));
++    const uint8 q = vload8(0, (const __global uint*)(b + 48 + (s >> 1) * 32));
++    const uint shift = (s & 1) * 4;
++    int p[16];
++    __attribute__((opencl_unroll_hint(16)))
++    for (int i = 0; i < 16; ++i) {
++        const uint v = q[i >> 1] >> ((i & 1) * 16 + shift);
++        const uint u = qh[i >> 1] >> ((i & 1) * 16 + s);   // bit 0: the even value's fifth bit, bit 8: the odd's
++        p[i] = kq_pair4(v) | (int)(((u & 1u) << 4) | ((u << 12) & 0x100000u));
++    }
++    *b0 = (int8)(p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
++    *b1 = (int8)(p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
++}
++
++// Q6_K: 256 values, {uchar ql[128]; uchar qh[64]; int8 scales[16]; f16 d} = 210 bytes; value =
++// d*scale * (q6 - 32), q6 = nibble of ql | two bits of qh << 4. ggml walks two halves of 128
++// values as four interleaved runs of 32; sub-block s = 0..7 here is 32 consecutive values,
++// i.e. run r = s & 3 of half h = s >> 2: run r reads ql[l] or ql[l+32] (low or high nibble)
++// and bits 2r, 2r+1 of qh[l]; 64 bytes of ql, 32 of qh and 8 scales per half, two scales per
++// run (values 0-15 and 16-31). The block is 2-aligned only: 16-bit words. Packed as
++// 1024 + q6, so the -32 joins the offset.
++inline void kq_pack_q6_K_sub(const __global uchar* b, uint s, int8* b0, int8* b1, float2* dl, float2* mo) {
++    const float d = kq_f16at(b + 208);
++    const uint hh = s >> 2, r = s & 3;
++    const ushort16 ql = vload16(0, (const __global ushort*)(b + hh * 64 + (r & 1) * 32));
++    const ushort16 qh = vload16(0, (const __global ushort*)(b + 128 + hh * 32));
++    const __global char* scp = (const __global char*)(b + 192) + hh * 8;
++    const float s0 = d * (float)scp[2 * r], s1 = d * (float)scp[2 * r + 1];
++    *dl = (float2)(s0, s1); *mo = (float2)((1024.0f + 32.0f) * s0, (1024.0f + 32.0f) * s1);
++    const uint shift = 2 * r;
++    const uint nib = (r >> 1) * 4;  // runs 2, 3 read the high nibble
++    int p[16];
++    __attribute__((opencl_unroll_hint(16)))
++    for (int i = 0; i < 16; ++i) {
++        const uint v = (uint)ql[i] >> nib;      // bits 0-3: even value's nibble, bits 8-11: odd's
++        const uint u = (uint)qh[i] >> shift;    // bits 0-1: even value's high bits, bits 8-9: odd's
++        p[i] = kq_pair4(v) | (int)(((u & 3u) << 4) | ((u << 12) & 0x300000u));
++    }
++    *b0 = (int8)(p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
++    *b1 = (int8)(p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
++}
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_kquant.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_kquant.cpp
+@@ -1,6 +1,7 @@
+ // arcint (patch 0021): see fully_connected_kernel_kquant.h.
+ #include "fully_connected_kernel_kquant.h"
+ #include "kernel_selector_utils.h"
++#include <algorithm>
+ 
+ namespace kernel_selector {
+ 
+@@ -12,14 +13,32 @@
+ // the row tiles supply the parallelism. The tile is bounded by the register file (the decoded
+ // sub-block, the activations and four partial sums per row all live in registers).
+ static constexpr size_t kTileMGemm = 32;
+-static constexpr size_t kKSplitGemv = 4;   // subgroups per work-group splitting K (decode)
+ static constexpr size_t kColumnGroups = 8; // subgroups per work-group sharing the staged activation tile (prefill)
++// Decode: subgroups per work-group splitting a column's super-blocks, sized so a launch has
++// about kDecodeThreads subgroups whatever the projection's width (a narrow projection at a
++// fixed split of four ran at a fraction of the card, measured), within the work-group
++// limit and the row's super-block count (the split stays at super-block granularity, see
++// the kernel).
++static constexpr size_t kMaxSubgroups = 64;
++// Xe2 hides the loads with about four subgroups per column of the widest projection (eight
++// ran slower, measured); Xe-HPG, with four times the thread slots, wants twice the count.
++static size_t decode_threads_of(const fully_connected_params& params) {
++    return params.engineInfo.arch >= gpu_arch::xe2 ? 4096 : 8192;
++}
+ 
+ static size_t tile_m_of(int kernel_number) { return kernel_number == 0 ? 1 : kTileMGemm; }
+-static size_t wg_of(int kernel_number) { return kernel_number == 0 ? kKSplitGemv : kColumnGroups; }
+-// The tiled kernel's subgroup is the matrix multiply's N: 16 on Xe2 and later, 8 before.
+-static size_t simd_of(const fully_connected_params& params, int kernel_number) {
+-    return (kernel_number == 0 || params.engineInfo.arch >= gpu_arch::xe2) ? kSimd : 8;
++// Both variants multiply on the matrix unit or read the activations as its A operand: the
++// subgroup is its N, 16 on Xe2 and later, 8 before.
++static size_t simd_of(const fully_connected_params& params) {
++    return params.engineInfo.arch >= gpu_arch::xe2 ? kSimd : 8;
++}
++static size_t wg_of(const fully_connected_params& params, int kernel_number) {
++    if (kernel_number != 0) return kColumnGroups;
++    const size_t columns = CeilDiv(params.kquant_n, simd_of(params));
++    const size_t blocks = params.kquant_k / (params.kquant_type == 8 ? 32 : 256);  // super-blocks per row
++    size_t wg = CeilDiv(decode_threads_of(params), std::max<size_t>(columns, 1));
++    wg = std::min({wg, kMaxSubgroups, std::max<size_t>(blocks, 1)});
++    return std::max<size_t>(wg, 1);
+ }
+ 
+ // Rows of the activation: flattened [M, K] (batch) or [B, M, K] (batch x feature).
+@@ -100,8 +119,8 @@
+ FullyConnected_kquant::DispatchData FullyConnected_kquant::SetDefault(const fully_connected_params& params, int, int kernel_number) const {
+     DispatchData d;
+     d.tile_m = static_cast<uint32_t>(tile_m_of(kernel_number));
+-    d.tile_n = static_cast<uint32_t>(wg_of(kernel_number));  // subgroups per work-group, not a column tile
+-    d.tile_mk = static_cast<uint32_t>(simd_of(params, kernel_number));  // the subgroup size
++    d.tile_n = static_cast<uint32_t>(wg_of(params, kernel_number));  // subgroups per work-group, not a column tile
++    d.tile_mk = static_cast<uint32_t>(simd_of(params));  // the subgroup size
+     const size_t n = params.kquant_n;
+     const size_t rows = rows_of(params);
+     // A lane per output column, a work-group of ksplit subgroups per subgroup of columns, a
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/fully_connected_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/fully_connected_gpu_test.cpp
+@@ -6689,9 +6689,9 @@
+     cldnn::mem_lock<float> out(out_mem, get_test_stream());
+     ASSERT_EQ(out.size(), ref.size());
+     for (size_t i = 0; i < ref.size(); ++i) {
+-        // f32 accumulation in a different order; the tiled variant (M > 1) multiplies f16 copies
++        // f32 accumulation in a different order, and the matrix-unit paths multiply f16 copies
+         // of the decoded weights, each within 2^-11 relative.
+-        const float tol = 2e-3f * (1.0f + std::fabs(ref[i])) + (m > 1 ? 4.9e-4f * refmag[i] : 0.f);
++        const float tol = 2e-3f * (1.0f + std::fabs(ref[i])) + 4.9e-4f * refmag[i];
+         ASSERT_NEAR(out[i], ref[i], tol) << "type " << t << " m " << m << " i " << i;
+     }
+ }
+@@ -6728,15 +6728,21 @@
+ }
+ 
+ // Timing at the dense model's gate projection shape, both kernels (run by name; prints KQPERF lines).
+-TEST(fully_connected_gpu_kquant_perf, DISABLED_gate_proj_shape_q4k_rows_1_to_2048) {
++TEST(fully_connected_gpu_kquant_perf, DISABLED_dense_shapes_q4k) {
+     tests::random_generator rg(GET_SUITE_NAME);
+     auto& engine = get_test_engine();
+-    const size_t K = 5120, N = 17408; const int t = 12;
++    const int t = 12;
++    // (N, K, rows): the gate projection at four row counts, then the value projection and the
++    // down projection at one row (narrow and deep: the decode split's two other regimes).
++    const std::vector<std::tuple<size_t, size_t, std::vector<long>>> shapes = {
++        {17408, 5120, {1L, 32L, 256L, 2048L}}, {1024, 5120, {1L}}, {5120, 17408, {1L}}};
++    for (const auto& sh : shapes) {
++    const size_t N = std::get<0>(sh), K = std::get<1>(sh);
+     const size_t rb = kq_host::row_bytes(t, K);
+     auto wbytes = rg.generate_random_1d<uint8_t>(N * rb, 0, 255);
+     auto weights_mem = engine.allocate_memory({ { (long)N, (long)rb }, data_types::u8, format::bfyx });
+     set_values(weights_mem, wbytes);
+-    for (long m : {1L, 32L, 256L, 2048L}) {
++    for (long m : std::get<2>(sh)) {
+         auto xh = rg.generate_random_1d<ov::float16>(m * K, -1.0f, 1.0f);
+         auto input_mem = engine.allocate_memory({ { m, (long)K }, data_types::f16, format::bfyx });
+         set_values(input_mem, xh);
+@@ -6756,4 +6762,5 @@
+         std::cout << "KQPERF M=" << m
+                   << " N=" << N << " K=" << K << " Q4_K: " << us << " us per run, " << (double)(N * rb) / us / 1e3 << " GB/s weights" << std::endl;
+     }
++    }
+ }

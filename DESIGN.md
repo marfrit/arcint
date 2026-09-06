@@ -6162,6 +6162,77 @@ OpenVINO-gated: four projections, the AWQ constant, a norm; it checks
 the replacement, the aliasing, the gathers, the neutralisation, the
 refusal).
 
+#### 7.0.2az 0.4.1 lever 1: the decode kernel on the matrix unit is a win on Xe-HPG and a loss on Xe2; the served rate on the 24 GB card did not move (2026-09-06)
+
+The first lever of `docs/milestone-0.4.1.md`, taken with the plugin's
+timing test (DESIGN §7.0.2ay's ladder harness, extended to the value and
+down projections) and closed with the served benchmark. Plugin patch
+0022 (`+p8` recipe, package not built) is what came out.
+
+**The idea and what it did.** Decoding a K-quant value was a shift, a
+mask, a convert and a multiply-add per value on the vector unit. The
+matrix unit takes f16 operands, and every quantised integer q' below
+1,024 *is* an f16 bit pattern: `0x6400 | q'` = f16(1024 + q'). So a lane
+packs its 16 values with a shift, a mask and an or, runs the one-row
+subgroup matrix multiply against the activations (and the same multiply
+against f16 1.0 for Σx), and applies the block's scale and offset to the
+two sums: Σ x·value = dl·S − mo·X. The 1,024× offset costs seven bits of
+the f32 accumulator, measured within the test tolerance at K 1,280.
+Correct on both cards (12/12 against the host reference). Rates, one
+launch at the gate projection (N 17,408, K 5,120, Q4_K), one row:
+
+| decode kernel, M = 1 | 24 GB card (Xe2) | 16 GiB card (Xe-HPG) |
+|---|---|---|
+| 0021 as served (fused multiply-add) | 225 µs | 509 µs |
+| packed, one-row matrix multiply (v9) | 284 µs | 170 µs |
+| 0022: matrix multiply on Xe-HPG, fused path on Xe2, split by width | 199–230 µs | 179 µs |
+
+**Why Xe2 lost, measured by ablation** (each row removes one thing from
+the v9 kernel; the differences overlap): the weights-only skeleton 148
+µs (338 GB/s of rows; reading them lane-contiguous, 138 µs — the file's
+layout is not the floor); the activation block reads add about 106 µs
+(plain per-lane loads recover 35 of them, local memory 8); the four
+one-row multiplies per sub-block add about 84 µs — 46 cycles each, on
+Xe2 a one-row `dpas` occupies the systolic array like an eight-row one,
+three times a lane's FMAs for the same 16 values; the packing adds
+about 91 µs on top of those and 14 µs alone. On Xe-HPG the multiply is
+cheap (removing it saved 26 of 181 µs) and the packing replaced 300 µs
+of byte-wise decode. Hence the split by architecture. Readings refuted
+by one timing each: prefetching the next super-block, a K split of
+eight, a two-way unroll (all worse, or −6 %); a sub-block-granular K
+split (1.6× slower on both cards: the unrolled eight-sub-block body is
+what lets the compiler hoist a super-block's loads).
+
+**The split by width.** With four subgroups per column fixed, the value
+projection (N 1,024) launched 256 subgroups on a card with 1,280
+thread slots; the decode work-group is now sized so a launch has about
+4,096 subgroups on Xe2 (8,192 on Xe-HPG: eight per column of the widest
+projection ran slower on Xe2 and faster on Xe-HPG, measured) within the
+work-group limit and the row's super-block count. Down projection (N
+5,120, K 17,408): 241 µs on the 24 GB card, 188 on the 16 GiB card;
+value projection: 27 µs on both (a launch's fixed cost; 100 GB/s).
+
+**Served, the same protocol as §7.0.2ay's benchmark** (24 GB card, `u8`
+KV, one lane, MTP off, prefix cache off, chunk 256): decode 10.0 t/s at
+856 prompt tokens against 9.9 on 0021, prefill unchanged at 212.6 t/s;
+at 71,727 tokens 7.4 t/s against 8.5 — a difference this patch has no
+mechanism for (the kernel does not see the depth), recorded and not
+attributed. The profile of the decode step on the deployed runtime
+(`ARCINT_PROFILE`, shares only) puts the K-quant kernel at 93.3 % of
+node time; nothing else in the step is worth a lever. The window's
+run-to-run spread on the 24 GB card is about 15 % for short launches
+(the same binary timed the gate projection at 230 and 199 µs in two
+consecutive windows); the 16 GiB card's spread is small.
+
+**What this says about the milestone.** The 24 GB card's decode launch
+sits at 200–230 µs against a 148 µs skeleton and a ~110 µs byte floor,
+and no lever tried moved it: the arithmetic is not hidden behind the
+stream and the matrix unit does not help one row. The gate (within 1.2×
+of the IR's decode) is not in reach on this path with what is measured
+here; the operator's question of a repack at load into the plugin's own
+compressed layout — the layout Intel's IR path runs at 355 GB/s effective
+— is the next decision, recorded in the milestone.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

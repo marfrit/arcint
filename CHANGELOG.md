@@ -17,6 +17,18 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## Unreleased
+
+- **0.4.1 lever 1: the K-quant decode kernel on the matrix unit** (DESIGN
+  §7.0.2az, plugin patch 0022, `marfrit-openvino +p8` recipe, package not
+  built). The quantised integers become f16 bit patterns for the subgroup
+  matrix multiply on Xe-HPG (the 16 GiB card's decode launch 509 → 179
+  µs); on Xe2 a one-row matrix multiply costs like an eight-row one, so
+  the fused path stays; the decode work-group is sized by the
+  projection's width on both. The served decode rate on the 24 GB card
+  did not move (10.0 against 9.9 t/s at 856 tokens); three readings were
+  refuted by measurement and are on the record.
+
 ## 0.4.0 — 2026-09-06
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p7` (patches 0003–0021):
