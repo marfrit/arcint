@@ -7096,6 +7096,133 @@ and the handoff's "decode is the launch sequence around the kernels,
 not the kernels" (it is the bytes, the Q6_K kernel, and the host time
 per K-quant node, in that order).
 
+#### 7.0.2bh 0.4.1, the Q6_K decode rate on the 24 GB card, worked through in one window: fewer messages (patch 0024) move the 16 GiB card and not this one; alignment, layout, prefetch and dispatch measured null; the read shape the card wants measured by a probe, and it needs the bytes laid out for it (2026-09-07)
+
+The operator's order after §7.0.2bg: the Q6_K decode rate next, in a
+30-minute card window, the setup tailored to it. The record going in:
+the K-quant kernel on Q6_K at 188 GB/s per served step against 372 for
+the same kernel on Q4_K and 389–401 for the runtime's gemm, on a card
+whose random-read ceiling is 453 (§7.0.2bg); the Q6_K row of patch 0023
+block-reads the 128 ql and 64 qh bytes as dwords from the dword below
+the 2-aligned block and gathers the tail word, the sixteen scales and
+the two bytes of `d` per lane (§7.0.2bc). Counting messages per
+super-block per row — Q4_K two, Q5_K three, Q6_K six — and setting them
+against the three measured rates (72, 59 and 35 bytes per message at
+372, 316 and 188 GB/s) gave a line straight enough to build on: the
+first form (v26, now patch 0024) reads the block's last twenty bytes as
+one 16-bit block read at the dword below them and takes every value by
+a broadcast, three messages instead of six, the last block of the last
+row guarded per lane against the 12–14 bytes the read runs past it.
+Everything else was prepared off the card: the plugin build, a chain
+that takes both cards for the unit tests and then only the 24 GB card
+for the served cells, and the kernel's measurement knobs behind
+compile-time defines switched at run time through the tree's
+`ARCINT_CL_OPTS` (§7.0.2bc's knob).
+
+**Patch 0024, measured** (the streamed timing test of 0023, every
+process warmed once, one row; the served cells on the deployed `+p8`
+base with the staged plugin, mixed form, `u8` KV, one fresh process
+per cell):
+
+| Q6_K decode, µs | 24 GB card, 0023 | 24 GB card, 0024 | 16 GiB card, 0023 | 16 GiB card, 0024 |
+|---|---|---|---|---|
+| down projection, N 5,120 × K 17,408 | 397 | **400** | 510 | **385** |
+| N 1,024 × K 5,120 | 34 | 34 | 44 | 34 |
+| every Q4_K and Q5_K shape | — | unchanged | — | unchanged |
+
+Correctness 14/14 on both cards. Served on the 24 GB card: greedy
+outputs byte-identical to §7.0.2bg's at 856 tokens (23e06c37e0d6) and
+71,727 (086d5e71ad47), Prüfstand 10/10, prefill 433 / 291 t/s, the
+decode step 70.6 and 88.2 ms against 68.9 and 87.6 — unchanged within
+the run-to-run scatter. So the message count was the 16 GiB card's
+limiter (−25 % on its down projection) and not the 24 GB card's, and
+the straight line through three points is retracted as a mechanism
+below. The patch stays: fewer messages, exact, a gain where it is one.
+
+**What bounds the row on the 24 GB card, one part removed at a time**
+(the same test, the down projection, the knobs off in every served
+number above; wrong values by design, timing only):
+
+| the v26 row with … | µs |
+|---|---|
+| everything (the baseline) | 400 |
+| the value decode removed (the reads, the shuffles, one fold) | 291 |
+| the shuffles and broadcasts removed (own-lane words) | 294 |
+| the prefetch removed | 392 |
+| only its three reads (folded, no decode, no shuffles) | 353 |
+| the three reads from the cache line below (aligned), full decode | 402 |
+| the same, reads only | 358 |
+| the reads as per-row planes (the shape a load-time reorder gives), full decode | 402 |
+| the same, reads only | 329 |
+
+And the dispatch, rows × subgroups per work-group, Q6_K only (the Q4_K
+rows in the same runs unchanged at 145–147): 16 × 4 (the rule) 399,
+8 × 4 411, 4 × 4 442, 8 × 8 430, 16 × 8 422, 16 × 2 489, 4 × 8 468,
+8 × 2 717; on the N 1,024 shape the rule's 4 × 4 (34) is the best of
+the same eight. Four readings. The arithmetic and the variable-index
+shuffles cost about 105 µs each on top of the reads, and the reads
+alone, in this three-message shape, cost 330–358 — so the row is at a
+floor set by its read shape and pays its ALU on top of it, where the
+Q4_K row (one byte-wise block read per super-block, every lane's bytes
+its own, no shuffles) pays neither. Forcing the same reads onto cache
+lines or onto planes changes nothing: alignment is not the mechanism.
+The Xe2 prefetch of §7.0.2bd is worth nothing on this form (392
+without it). And the dispatch is already the best of eight.
+
+**The read shape the card wants, measured by a probe** (an OpenCL
+program over the down projection's 73 MB in random bytes, the decode
+dispatch's 16 rows × 4 subgroups, five read shapes, each folded into a
+register; best of five after three warm runs; the rate as the 210-byte
+bytes each block carries, since the card fetches every line of the row
+whatever the message shape):
+
+| read shape, 24 GB card | µs | GB/s |
+|---|---|---|
+| 0023/0024's: block_read2 + block_read + us from the dword below, 210-byte stride | 253 | 289 |
+| byte-wise uc8 + uc4 + us at the file's 210-byte stride (wrong values off a dword) | 255 | 287 |
+| the same three byte-wise reads on 16-byte-aligned 224-byte blocks | 210 | 349 |
+| one uc8, 128 bytes per block (Q4_K's one message) | 175 | 418 |
+| two uc8, 256 bytes per block (over-read) | 183 | 399 |
+| one block_read4 of 256 bytes from the dword below (one dword message) | 191 | 383 |
+
+And the alignment rule for byte-wise block reads, probed the way
+§7.0.2bc probed the 16-bit ones: `intel_sub_group_block_read_uc8` and
+`_uc4` return the right bytes at +0, +4, +8 and +16 and the wrong ones
+at +2 — a dword address is required and sufficient, so Q4_K's shape
+cannot be read off the file's 2-aligned Q6_K blocks. Three messages of
+mixed width from the dword below is what the file's layout allows, and
+the card moves 289 GB/s that way against 383–418 for one or two wide
+messages per block.
+
+**What follows, on the record.** The Q6_K decode lever is a load-time
+reorder of the native Q6_K rows into 224-byte blocks (ql 128, qh 64,
+scales 16, d 2, pad 14; +6.7 % bytes on the Q6_K set, 4.24 → 4.53 GB
+per token, about 0.3 GiB resident), read in the kernel as two byte-wise
+block reads per super-block: the first the ql bytes in Q4_K's shape
+(lane l holds positions l and l + 16 of every run, no shuffles), the
+second qh in the same shape plus one scale byte and the bytes of `d`
+per lane, broadcast by uniform index. The tiled prefill variant reads
+the new stride with its existing vloads. Predicted from the probe:
+183–210 µs for the down projection against 400, about 12 ms per served
+step at 1k (§7.0.2bg's 23.7 → 12), which is the largest single decode
+item left. The arcint side is a second layout under the K-quant op
+(the file's rows stay the default for Q4_K/Q5_K), the plugin side one
+decode row and one correctness case; both are hours, not a window, and
+were not started. The augmentation packing and the host time per
+K-quant node (§7.0.2bg) are unchanged by this section.
+
+Retracted here (§7.0.1): §7.0.2bg's "bytes per message" as the Q6_K
+mechanism on the 24 GB card (a line through three points; halving the
+messages moved the 16 GiB card and not this one); the handoff's "an
+exact dword-aligned reorder of the native Q6_K rows at load" as the
+lever in that form (alignment alone is null with the current read
+shape: 402 against 398; what the reorder buys is the shape, not the
+alignment); the Xe2 Q6_K prefetch's 500 → 397 (§7.0.2bd) as a
+standing gain (392 without it on this row). Not measured: the ISA
+instruction counts (the intercept layer's dumps are raw ISA; the host
+has `ocloc` but no `iga64`), moot once the reads-only variant carried
+most of the time.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

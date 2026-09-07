@@ -19,6 +19,21 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+- **0.4.1, the Q6_K decode rate worked through** (DESIGN §7.0.2bh,
+  plugin patch 0024, not yet in a built package). The Q6_K decode row
+  reads the super-block's tail (the last qh word, the scales, `d`) as
+  one block read with broadcasts instead of four per-lane gathers:
+  exact, 14/14 on both cards, served outputs byte-identical, the
+  16 GiB card's Q6_K down projection 510 → 385 µs, the 24 GB card
+  unchanged (397 → 400). The same window measured, on the 24 GB card,
+  the row's arithmetic and shuffles at ~105 µs each over reads of
+  330–358, alignment and plane layouts null, the prefetch null, the
+  dispatch already the best of eight, and by a probe the read shapes
+  the card moves at 289 (the current), 349 (16-byte-aligned blocks) and
+  383–418 GB/s (one or two wide messages per block); byte-wise block
+  reads are exact only at dword addresses. The next Q6_K form is a
+  load-time reorder into 224-byte blocks read in Q4_K's shape,
+  predicted 183–210 µs against 400, not started.
 - **0.4.1, the logits slice on a K-quant lm_head, and the decode step on
   the device timeline** (DESIGN §7.0.2bg). A GGUF-opened model whose
   `output.weight` stays in the file's rows (the mixed default, native)

@@ -452,6 +452,24 @@ package: `+p8` as installed carries the 24 GB card's rule on both.
 
 Upstream: not yet filed.
 
+### 0024-kquant-q6k-tail-block-read.patch
+
+The Q6_K decode row's last twenty bytes (qh's last word, the sixteen
+scales, d) as one 16-bit sub-group block read at the dword below them
+and broadcasts, in place of four per-lane gathers: six load messages
+per super-block per row become three (DESIGN §7.0.2bh). Exact, 14/14 on
+both cards, served outputs byte-identical. Measured streamed at steady
+state: the 16 GiB card's Q6_K down projection 510 → 385 µs and its
+N 1,024 shape 44 → 34; the 24 GB card unchanged (397 → 400, 34 → 34),
+where the same window measured the row's arithmetic and shuffles at
+~105 µs each and its three reads at 353 of the 400, insensitive to
+alignment, layout and dispatch — the next Q6_K form is a load-time
+reorder into 224-byte blocks read as two byte-wise block reads, on the
+record, not in this patch.
+
+Package: not yet built (`+p9` will carry 0023's per-architecture rule
+and this).
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.

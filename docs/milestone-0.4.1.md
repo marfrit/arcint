@@ -214,3 +214,16 @@ to keep on the other card.
   `u8` 86k → 109k tokens; Prüfstand 10/10. Next: the Q6_K decode rate (the dword-aligned
   reorder), the host cost per K-quant node (plugin-side), the tiled
   variant's register spill and its 2D block loads.
+- 2026-09-07 — **the Q6_K decode rate, one 30-minute window** (DESIGN
+  §7.0.2bh, patch 0024): the tail of the super-block as one block read
+  and broadcasts (six messages → three): exact, byte-identical served,
+  10/10, the 16 GiB card's down projection 510 → 385 µs, the 24 GB
+  card's unchanged at 400. Measured there: the arithmetic and the
+  shuffles ~105 µs each, the three reads alone 330–358, alignment and
+  plane layouts null, the prefetch null, 16 × 4 the best dispatch of
+  eight; a probe puts the current read shape at 289 GB/s against
+  383–418 for one or two wide messages per block, and byte-wise block
+  reads need a dword address. The lever is a load-time reorder into
+  224-byte blocks read in Q4_K's shape (predicted 183–210 µs, ~12 ms
+  per step), designed on the record, not started. 28 of the 30
+  minutes used across four card slots.
