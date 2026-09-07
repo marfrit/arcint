@@ -103,18 +103,24 @@ void repack_row(int32_t type, const uint8_t* row, RepackedTensor& r, int64_t n_r
         }
         return;
     }
-    if (type == 12 || type == 13) {  // Q4_K (u4) / Q5_K (u8): the values, and the mins as augmented columns
+    if (type == 12 || type == 13) {  // Q4_K (u4) / Q5_K (u8): the values, and the mins
         const bool u4 = type == 12;
+        const bool split = r.mins == RepackMins::Split;
         const size_t gbytes = u4 ? 16 : 32;
         uint8_t* w = r.weights.data() + n_row * (static_cast<size_t>(r.width()) / (u4 ? 2 : 1));
         const int64_t main_groups = k / 32;
-        const int64_t aug_first = main_groups;  // the augmented groups follow the main ones
+        // RepackMins::Split: min_matrix[row][g] takes the group's min directly
+        // (one float multiply of the file's f16 dmin and the integer mn,
+        // rounded to f16 once) -- no augmented group, no shared scale.
+        uint16_t* min_row = split ? r.min_matrix.data() + n_row * main_groups : nullptr;
+        const int64_t aug_first = main_groups;  // the augmented groups follow the main ones (Exact/Shared/Nibble only)
         // The mins are written after the row's main groups: an augmented group's scale is the
         // dmin of the one super-block it serves (Exact) or chosen over the groups it is shared by
         // (Shared: the largest dmin; Nibble: the largest min at 15), and every group's integer
         // is then expressed under that scale.
         struct GroupMin { int64_t ag; int64_t slot; float dmin; uint8_t m6; };
-        std::vector<GroupMin> gmins(static_cast<size_t>(main_groups));
+        std::vector<GroupMin> gmins;
+        if (!split) gmins.resize(static_cast<size_t>(main_groups));
         for (int64_t b = 0; b < k / 256; ++b) {
             const uint8_t* blk = row + b * (u4 ? 144 : 176);
             const float d = f16at(blk), dmin = f16at(blk + 2);
@@ -134,9 +140,11 @@ void repack_row(int32_t type, const uint8_t* row, RepackedTensor& r, int64_t n_r
                 uint8_t* out = w + dg * gbytes;
                 if (u4) for (int l = 0; l < 32; l += 2) out[l / 2] = static_cast<uint8_t>(q[l] | (q[l + 1] << 4));
                 else std::memcpy(out, q, 32);
-                gmins[static_cast<size_t>(g)] = GroupMin{aug_first + pl.aug_group_of[static_cast<size_t>(g)], pl.aug_slot_of[static_cast<size_t>(g)], dmin, m6};
+                if (split) min_row[dg] = to_f16(dmin * static_cast<float>(m6));
+                else gmins[static_cast<size_t>(g)] = GroupMin{aug_first + pl.aug_group_of[static_cast<size_t>(g)], pl.aug_slot_of[static_cast<size_t>(g)], dmin, m6};
             }
         }
+        if (split) return;  // no augmented columns: the mins are min_matrix's alone
         const int64_t aug_groups = r.k_aug / 32;
         std::vector<float> s(static_cast<size_t>(aug_groups), 0.0f);
         for (const auto& gm : gmins) {
@@ -215,8 +223,14 @@ float main_value(const RepackedTensor& r, int64_t row, int64_t c) {
 }
 
 // The min the repacked form carries for main group `g` of row `row` (0 for the
-// types without one): the stored integer under the augmented group's scale.
+// types without one): the stored integer under the augmented group's scale,
+// or min_matrix's own f16-rounded value under RepackMins::Split.
 float min_of_group(const RepackedTensor& r, int64_t row, int64_t g) {
+    if (r.mins == RepackMins::Split) {
+        if (r.min_matrix.empty()) return 0.0f;
+        const int64_t groups = r.k / 32;
+        return f16_to_f32(r.min_matrix[static_cast<size_t>(row * groups + g)]);
+    }
     if (r.k_aug == 0) return 0.0f;
     const int64_t wgroups = r.width() / r.group;
     const int64_t ag = r.k / 32 + g / r.groups_per_aug, slot = g % r.groups_per_aug;
@@ -262,16 +276,21 @@ RepackedTensor repack_tensor(const GgufFile& file, const TensorInfo& t, const st
         // (a 128-wide head) under a head-wise column order so that a head's groups keep one dmin.
         const bool u4 = t.ggml_type == 12;
         r.mins = mins;
-        r.aug_slots = (u4 && mins != RepackMins::Nibble) ? 2 : 1;
-        const int64_t per_group = 32 / r.aug_slots;                  // groups one augmented group can hold
-        if (mins == RepackMins::Exact) r.groups_per_aug = column_dest_of ? 4 : 8;
-        else if (mins == RepackMins::Shared) r.groups_per_aug = std::min<int64_t>(per_group, u4 ? 16 : 32);
-        else r.groups_per_aug = per_group;                           // Nibble: 32 (u4), 32 (u8, the same byte as Shared)
-        r.k_aug = ((r.k / 32 + r.groups_per_aug - 1) / r.groups_per_aug) * 32;   // one augmented group of 32 columns per groups_per_aug groups
-        // The runtime's int4 fully-connected walks K in pairs of groups: a width with an odd
-        // number of groups faulted on the card (CL_OUT_OF_RESOURCES on the first forward of
-        // the Nibble packing at K = 5,120: 165 groups; DESIGN 7.0.2bl). One zero group more.
-        if (((r.k + r.k_aug) / 32) % 2 != 0) r.k_aug += 32;
+        if (mins == RepackMins::Split) {
+            // No augmented columns: min_matrix carries the mins instead (allocated below).
+            r.k_aug = 0;
+        } else {
+            r.aug_slots = (u4 && mins != RepackMins::Nibble) ? 2 : 1;
+            const int64_t per_group = 32 / r.aug_slots;                  // groups one augmented group can hold
+            if (mins == RepackMins::Exact) r.groups_per_aug = column_dest_of ? 4 : 8;
+            else if (mins == RepackMins::Shared) r.groups_per_aug = std::min<int64_t>(per_group, u4 ? 16 : 32);
+            else r.groups_per_aug = per_group;                           // Nibble: 32 (u4), 32 (u8, the same byte as Shared)
+            r.k_aug = ((r.k / 32 + r.groups_per_aug - 1) / r.groups_per_aug) * 32;   // one augmented group of 32 columns per groups_per_aug groups
+            // The runtime's int4 fully-connected walks K in pairs of groups: a width with an odd
+            // number of groups faulted on the card (CL_OUT_OF_RESOURCES on the first forward of
+            // the Nibble packing at K = 5,120: 165 groups; DESIGN 7.0.2bl). One zero group more.
+            if (((r.k + r.k_aug) / 32) % 2 != 0) r.k_aug += 32;
+        }
     } else if (column_dest_of) {
         throw std::runtime_error("gguf repack: a column order is only applied to Q4_K/Q5_K tensors (" + t.name + ")");
     }
@@ -280,6 +299,8 @@ RepackedTensor repack_tensor(const GgufFile& file, const TensorInfo& t, const st
     const size_t wgroups = static_cast<size_t>(r.width() / r.group);
     r.weights.assign(static_cast<size_t>(r.n * r.width()) / (r.weights_type == RepackWeights::U4 ? 2 : 1), 0);
     r.scale.assign(static_cast<size_t>(r.n) * wgroups, 0);
+    if (mins == RepackMins::Split && (t.ggml_type == 12 || t.ggml_type == 13))
+        r.min_matrix.assign(static_cast<size_t>(r.n * (r.k / 32)), 0);
     const size_t row_bytes = static_cast<size_t>(r.k / block) * block_bytes_of(t.ggml_type);
     const uint8_t* data = file.data(t);
     const unsigned threads = std::max(1u, std::min(std::thread::hardware_concurrency(), 16u));
@@ -296,15 +317,19 @@ void permute_rows(RepackedTensor& r, const std::vector<int64_t>& src_of) {
     if (static_cast<int64_t>(src_of.size()) != r.n) throw std::runtime_error("gguf repack: row permutation size mismatch");
     const size_t wrow = r.weights.size() / static_cast<size_t>(r.n);
     const size_t groups = r.scale.size() / static_cast<size_t>(r.n);
+    const size_t mgroups = r.min_matrix.empty() ? 0 : r.min_matrix.size() / static_cast<size_t>(r.n);
     std::vector<uint8_t> w(r.weights.size());
     std::vector<uint16_t> sc(r.scale.size());
+    std::vector<uint16_t> mm(r.min_matrix.size());
     for (int64_t dest = 0; dest < r.n; ++dest) {
         const int64_t src = src_of[static_cast<size_t>(dest)];
         if (src < 0 || src >= r.n) throw std::runtime_error("gguf repack: row permutation out of range");
         std::copy_n(r.weights.data() + src * wrow, wrow, w.data() + dest * wrow);
         std::copy_n(r.scale.data() + src * groups, groups, sc.data() + dest * groups);
+        if (mgroups) std::copy_n(r.min_matrix.data() + src * mgroups, mgroups, mm.data() + dest * mgroups);
     }
     r.weights.swap(w); r.scale.swap(sc);
+    if (mgroups) r.min_matrix.swap(mm);
 }
 
 std::vector<uint16_t> augmentation_matrix(const RepackedTensor& r) {
@@ -370,6 +395,31 @@ RepackDeviation repack_deviation(const GgufFile& file, const TensorInfo& t, cons
 
 void matvec_repacked_host(const RepackedTensor& r, const std::vector<float>& x, std::vector<float>& y) {
     if (static_cast<int64_t>(x.size()) != r.k) throw std::runtime_error("gguf repack: activation length mismatch");
+    if (r.mins == RepackMins::Split && !r.min_matrix.empty()) {
+        // The served split computation: two independent MatMuls, each rounded to
+        // f16 on the way out (like every fully-connected on this path), added
+        // once more in f16 -- not a single running accumulator over both terms.
+        std::vector<float> xr(static_cast<size_t>(r.k));
+        for (int64_t c = 0; c < r.k; ++c) xr[static_cast<size_t>(c)] = r16(x[static_cast<size_t>(c)]);
+        const int64_t groups = r.k / 32;
+        std::vector<float> gs(static_cast<size_t>(groups));
+        for (int64_t g = 0; g < groups; ++g) {
+            float s = 0; for (int64_t i = 0; i < 32; ++i) s += xr[static_cast<size_t>(g * 32 + i)];
+            gs[static_cast<size_t>(g)] = r16(s);
+        }
+        y.assign(static_cast<size_t>(r.n), 0.0f);
+        for (int64_t row = 0; row < r.n; ++row) {
+            double main_acc = 0;
+            for (int64_t c = 0; c < r.k; ++c) main_acc += static_cast<double>(xr[static_cast<size_t>(c)]) * static_cast<double>(main_value(r, row, c));
+            const float main_t = r16(static_cast<float>(main_acc));
+            double min_acc = 0;
+            for (int64_t g = 0; g < groups; ++g)
+                min_acc += static_cast<double>(gs[static_cast<size_t>(g)]) * static_cast<double>(-f16_to_f32(r.min_matrix[static_cast<size_t>(row * groups + g)]));
+            const float min_t = r16(static_cast<float>(min_acc));
+            y[static_cast<size_t>(row)] = r16(main_t + min_t);
+        }
+        return;
+    }
     // The widened activation: x (f16), then the group sums through the augmentation matrix (f16).
     std::vector<float> xa(static_cast<size_t>(r.width()), 0.0f);
     for (int64_t c = 0; c < r.k; ++c) xa[static_cast<size_t>(c)] = r16(x[static_cast<size_t>(c)]);

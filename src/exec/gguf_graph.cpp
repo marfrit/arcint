@@ -18,6 +18,7 @@
 
 #include <openvino/core/graph_util.hpp>
 #include <openvino/core/rt_info.hpp>
+#include <openvino/op/add.hpp>
 #include <openvino/op/constant.hpp>
 #include <openvino/op/convert.hpp>
 #include <openvino/op/gather.hpp>
@@ -149,9 +150,11 @@ std::string GgufApplyReport::summary() const {
     for (const auto& [t, cb] : per_type)
         s << ", " << gguf::type_name(t) << " x" << cb.first << " (" << (cb.second >> 20) << " MiB)";
     if (repacked != 0) {
-        s << "; mins " << (mins == gguf::RepackMins::Exact ? "exact" : mins == gguf::RepackMins::Shared ? "shared (two super-blocks per augmented group, inexact)" : "nibble (one nibble per group, inexact)");
+        s << "; mins " << (mins == gguf::RepackMins::Exact ? "exact" : mins == gguf::RepackMins::Shared ? "shared (two super-blocks per augmented group, inexact)"
+                          : mins == gguf::RepackMins::Nibble ? "nibble (one nibble per group, inexact)"
+                          : "split (the min term a separate MatMul, no augmented columns; the file's mins under one f16 rounding, bound 2x)");
         s << "; repack deviation max " << repack_max_steps << " quantisation step(s) over " << repack_checked << " value(s), "
-          << repack_over_bound << (mins == gguf::RepackMins::Exact ? " over bound" : " over the exact bound (accepted: --gguf-mins)");
+          << repack_over_bound << (mins == gguf::RepackMins::Exact || mins == gguf::RepackMins::Split ? " over bound" : " over the exact bound (accepted: --gguf-mins)");
         if (repack_verdicts_cached != 0) s << " (" << repack_verdicts_cached << " verdict(s) from an earlier load)";
         s << "; repack " << static_cast<int>(repack_seconds) << " s, check " << static_cast<int>(check_seconds) << " s";
     }
@@ -181,29 +184,48 @@ static double repack_bound_steps(int32_t ggml_type) {
 // For the augmented types (Q4_K, Q5_K: core/gguf_repack.h) the activation is
 // widened first by its group sums through the augmentation matrix -- one
 // reduce, one small matmul and one concat, built once per distinct
-// activation and shared by every projection reading it.
+// activation and shared by every projection reading it. RepackMins::Split
+// takes no augmented columns, but reads the same group sums for its own min
+// term (activation_group_sums, below) -- the cache holds both, keyed apart.
 struct Widened {
     ov::Output<ov::Node> out;
 };
-static ov::Output<ov::Node> widen_activation(const ov::Output<ov::Node>& act, const gguf::RepackedTensor& r,
-                                             std::map<std::string, Widened>& cache, const std::string& name) {
-    if (r.k_aug == 0) return act;
+
+// [.., K] -> [.., K/32, 32] (special zero keeps the leading dims) -> sum over
+// 32 -> [.., K/32], one reduce per distinct activation, cached and shared by
+// every projection reading it (the augmented forms' widening and
+// RepackMins::Split's min term alike).
+static ov::Output<ov::Node> activation_group_sums(const ov::Output<ov::Node>& act, int64_t k,
+                                                   std::map<std::string, Widened>& cache, const std::string& name) {
     const std::string key = std::to_string(reinterpret_cast<uintptr_t>(act.get_node())) + ":" + std::to_string(act.get_index()) +
-                            ":" + std::to_string(r.k) + ":" + std::to_string(r.k_aug) + ":" + std::to_string(r.groups_per_aug) +
-                            ":" + (r.weights_type == gguf::RepackWeights::U4 ? "u4" : "u8");
+                            ":sums:" + std::to_string(k);
     auto it = cache.find(key);
     if (it != cache.end()) return it->second.out;
-    const int64_t groups = r.k / 32;
+    const int64_t groups = k / 32;
     const auto rank = act.get_partial_shape().rank();
     if (!rank.is_static() || (rank.get_length() != 2 && rank.get_length() != 3))
         throw std::runtime_error("gguf: the activation of " + name + " is not 2-D or 3-D");
     const bool three_d = rank.get_length() == 3;
-    // [.., K] -> [.., K/32, 32] (special zero keeps the leading dims) -> sum over 32 -> [.., K/32]
     std::vector<int64_t> shape = three_d ? std::vector<int64_t>{0, 0, groups, 32} : std::vector<int64_t>{0, groups, 32};
     auto shape_c = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{shape.size()}, shape);
     auto grouped = std::make_shared<ov::op::v1::Reshape>(act, shape_c, true);
     auto axis_c = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{three_d ? 3 : 2});
     auto sums = std::make_shared<ov::op::v1::ReduceSum>(grouped, axis_c, false);
+    cache[key] = Widened{sums->output(0)};
+    return sums->output(0);
+}
+
+static ov::Output<ov::Node> widen_activation(const ov::Output<ov::Node>& act, const gguf::RepackedTensor& r,
+                                             std::map<std::string, Widened>& cache, const std::string& name) {
+    if (r.k_aug == 0) return act;
+    const std::string key = std::to_string(reinterpret_cast<uintptr_t>(act.get_node())) + ":" + std::to_string(act.get_index()) +
+                            ":widened:" + std::to_string(r.k) + ":" + std::to_string(r.k_aug) + ":" + std::to_string(r.groups_per_aug) +
+                            ":" + (r.weights_type == gguf::RepackWeights::U4 ? "u4" : "u8");
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second.out;
+    const int64_t groups = r.k / 32;
+    const auto sums = activation_group_sums(act, r.k, cache, name);
+    const bool three_d = act.get_partial_shape().rank().get_length() == 3;
     const auto mbits = gguf::augmentation_matrix(r);
     auto m_owner = std::make_shared<std::vector<uint16_t>>(mbits);
     auto m = std::make_shared<ov::op::v0::Constant>(ov::element::f16, ov::Shape{static_cast<size_t>(groups), static_cast<size_t>(r.k_aug)},
@@ -219,8 +241,30 @@ static ov::Output<ov::Node> widen_activation(const ov::Output<ov::Node>& act, co
     return wide->output(0);
 }
 
+// RepackMins::Split's min term: y += MatMul(sums, -min_matrix^T), added to the
+// main MatMul's output (the caller). NegMins[g][row] = -min_matrix[row][g],
+// transposed and sign-flipped (exact: negating an f16 value is exactly
+// flipping its sign bit, never a rounding).
+static std::shared_ptr<ov::Node> split_min_term(const ov::Output<ov::Node>& act, const gguf::RepackedTensor& r,
+                                                std::map<std::string, Widened>& cache, const std::string& name) {
+    const int64_t groups = r.k / 32;
+    auto neg = std::make_shared<std::vector<uint16_t>>(static_cast<size_t>(groups * r.n));
+    for (int64_t row = 0; row < r.n; ++row)
+        for (int64_t g = 0; g < groups; ++g)
+            (*neg)[static_cast<size_t>(g * r.n + row)] = static_cast<uint16_t>(r.min_matrix[static_cast<size_t>(row * groups + g)] ^ 0x8000u);
+    auto m = std::make_shared<ov::op::v0::Constant>(ov::element::f16, ov::Shape{static_cast<size_t>(groups), static_cast<size_t>(r.n)},
+                                                    static_cast<const void*>(neg->data()), std::shared_ptr<void>(neg, neg->data()));
+    m->set_friendly_name(name + "/gguf_min_term");
+    std::shared_ptr<ov::Node> m_typed = m;
+    if (act.get_element_type() != ov::element::f16)
+        m_typed = std::make_shared<ov::op::v0::Convert>(m, act.get_element_type());
+    const auto sums = activation_group_sums(act, r.k, cache, name);
+    return std::make_shared<ov::op::v0::MatMul>(sums, m_typed, false, false);
+}
+
 static std::shared_ptr<ov::Node> repacked_matmul(const ov::Output<ov::Node>& act, const gguf::RepackedTensor& r,
-                                                 const std::shared_ptr<ov::op::v0::MatMul>& mm, const std::string& name) {
+                                                 const std::shared_ptr<ov::op::v0::MatMul>& mm, const std::string& name,
+                                                 std::map<std::string, Widened>& cache) {
     const size_t n = static_cast<size_t>(r.n), width = static_cast<size_t>(r.width()), gs = static_cast<size_t>(r.group), groups = width / gs;
     const ov::element::Type wt = r.weights_type == gguf::RepackWeights::U4 ? ov::element::u4
                                : r.weights_type == gguf::RepackWeights::U8 ? ov::element::u8 : ov::element::i8;
@@ -242,7 +286,19 @@ static std::shared_ptr<ov::Node> repacked_matmul(const ov::Output<ov::Node>& act
     x = std::make_shared<ov::op::v1::Reshape>(x, shape_c, false);
     if (mm->get_input_element_type(1) != ov::element::f16)
         x = std::make_shared<ov::op::v0::Convert>(x, mm->get_input_element_type(1));
-    return std::make_shared<ov::op::v0::MatMul>(act, x, mm->get_transpose_a(), mm->get_transpose_b());
+    auto main_mm = std::make_shared<ov::op::v0::MatMul>(act, x, mm->get_transpose_a(), mm->get_transpose_b());
+    if (r.mins != gguf::RepackMins::Split || r.min_matrix.empty()) return main_mm;
+    // RepackMins::Split: the min term is a second, unquantised MatMul added to
+    // the main one, not augmented columns of it -- the point of the flag
+    // (DESIGN §7.0.2bg's `--dyn-quant on` finding: the augmented columns ride
+    // through the same quantised fully-connected as the weights).
+    auto minterm = split_min_term(act, r, cache, name);
+    // The min constant owns its own (negated, transposed) copy; the repacked tensor's
+    // min_matrix has nothing left to alias (5.5 MB per gate on the served file).
+    owner->min_matrix.clear(); owner->min_matrix.shrink_to_fit();
+    auto added = std::make_shared<ov::op::v1::Add>(main_mm->output(0), minterm->output(0));
+    added->set_friendly_name(name + "/gguf_split");
+    return added;
 }
 
 GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
@@ -344,8 +400,14 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
                 const auto t_repack = wall::now();
                 auto packed = gguf::repack_tensor(*file, *t, dest_of.empty() ? nullptr : &dest_of, mins);
                 rep.repack_seconds += std::chrono::duration<double>(wall::now() - t_repack).count();
-                const double bound = repack_bound_steps(t->ggml_type);
-                const std::string key = verdict_key(file_path, *t, bound + (mins == gguf::RepackMins::Exact ? 0.0 : mins == gguf::RepackMins::Shared ? 1000.0 : 2000.0));  // the packing is part of the key
+                // The split form's bound: the exact form's terms plus one f16 rounding of the
+                // min product dmin * mn (up to 2^-11 of the min, in steps -- not bounded a
+                // priori). Twice the exact bound is the MEASURED bound: it holds on the fixture
+                // (0.0158 on Q4_K against 1/64) and on the served file. Refused over it like
+                // the exact form: the mins are the file's, the form is exact-class.
+                const double bound = repack_bound_steps(t->ggml_type) * (mins == gguf::RepackMins::Split ? 2.0 : 1.0);
+                const std::string key = verdict_key(file_path, *t, bound + (mins == gguf::RepackMins::Exact ? 0.0 : mins == gguf::RepackMins::Shared ? 1000.0
+                                                    : mins == gguf::RepackMins::Nibble ? 2000.0 : 3000.0));  // the packing is part of the key
                 Verdict v;
                 if (read_verdict(verdict_dir, key, v)) {
                     // Checked and passed by an earlier load of this very file (size, mtime,
@@ -361,7 +423,7 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
                     rep.repack_checked += dv.values;
                     // An inexact mins packing (--gguf-mins shared|nibble) is a chosen cost: its
                     // deviation is reported in the summary, not refused (DESIGN 7.0.2bl).
-                    if (dv.over != 0 && mins == gguf::RepackMins::Exact)
+                    if (dv.over != 0 && (mins == gguf::RepackMins::Exact || mins == gguf::RepackMins::Split))
                         throw std::runtime_error("gguf: " + gguf_name + " repacked outside its bound: " + std::to_string(dv.over) +
                                                  " value(s) over " + std::to_string(bound) +
                                                  " quantisation step(s), max " + std::to_string(dv.max_steps));
@@ -386,7 +448,7 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
                 } else if (reorder == GgufReorder::Columns) {
                     r.rows_permuted = true;  // the order lives in the constant
                 }
-                replacement = repacked_matmul(widen_activation(act_out, packed, widened, name), packed, mm, name);
+                replacement = repacked_matmul(widen_activation(act_out, packed, widened, name), packed, mm, name, widened);
                 r.bytes = packed.bytes();
             } else if (q6k_aligned && t->ggml_type == static_cast<int32_t>(gguf::GgmlType::Q6_K)) {
                 // The file's 210-byte super-blocks are 2-aligned and a block read needs a dword

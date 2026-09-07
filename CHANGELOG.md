@@ -17,6 +17,46 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## Unreleased — 0.4.2 in progress (2026-09-07)
+
+Runtime: `marfrit-openvino +p11` unchanged; no plugin patch in this
+increment. Measured on the 24 GB card, dense Qwen3.8-27B Q4_K_M, `u8`
+KV, one fresh process per cell (DESIGN §7.0.2bo):
+
+- The runtime's int4 gemm on the repacked Q4_K set -- 47 % of the
+  856-token prefill's device time -- runs at 86 TFLOP/s, 88 % of the
+  card's f16 matrix roof, read from its disassembly beside the kernel
+  the Intel int4 IR runs (int8 operands, 130 TFLOP/s). The int8 form
+  measured dead on this runtime for the exact repack: at the K-quant's
+  32-wide groups the int8 kernel is issue-bound on the per-group
+  accumulator drain (gemm 413 ms against 420 at f16; per-token
+  quantisation 411). `--dyn-quant on` stays a flag; the 0.4.2 prefill
+  gate (1,100 t/s at 856 tokens) is not reachable through this gemm and
+  the record says so.
+- `--gguf-mins split`: the min term as a separate f16 fully-connected
+  on the activation's group sums instead of augmented columns of the
+  quantised one (K back to 5,120, no concat). Exact-class: the file's
+  mins under one f16 rounding, refused over twice the exact bound (a
+  measured bound, not a derived one: 0.0158 steps on the fixture,
+  0.0187 on the served file, none over). Served: decode step 55.05 → 53.53 ms at 1k
+  and 73.3 → 72.17 at 71.7k, resident 16.54 → 16.30 GiB (max context
+  111,776 → 120,240 at `u8`), Prüfstand 10/10, the 1k greedy output
+  byte-identical to the exact form's, the 71.7k one the shared
+  packing's text; prefill 967 t/s against the exact form's 948 from
+  the second request of a process on (the min term costs 40 ms on the
+  device in either form), the first request of a process about 180 ms
+  slower by its kernel compilation, by the served rates (every 1k
+  prefill figure of 0.4.1 was a first request: 907 there is 948
+  warm). The default stays exact; moving it is the operator's call.
+- `ARCINT_DYN_QUANT_GROUP=<n|max>`: a measurement switch on the
+  runtime's dynamic-quantisation group size when `--dyn-quant on`.
+- `--help` now lists `--gguf-mode`, `--gguf-mins`, `--gguf-q6k`,
+  `--gguf-embed` and `--gguf-check` (it never had, and still described
+  the retired `--gguf-native` behaviour; `--gguf-native` stays as the
+  alias it is).
+- `tools/igadis.cpp` counts `dpas` and writes the disassembly text
+  beside the binary when `IGADIS_DUMP` is set.
+
 ## 0.4.1 — 2026-09-07
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p11` (patches 0003–0029):

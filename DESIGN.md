@@ -7854,6 +7854,229 @@ gate's 13.5 at 2,048 rows, and the packed form showed the count is not
 what moves it; what the sweep says binds is the per-tile decode and
 re-read count, divided by the tile.
 
+#### 7.0.2bo 0.4.2, the runtime's int4 gemm on the repacked set: at the card's f16 rate, the int8 form measured dead at 32-wide groups, and the min term as a separate term (`--gguf-mins split`) (2026-09-07)
+
+The 0.4.1 record left the 856-token prefill of the mixed form at 907
+t/s against the operator's bar of 1,341 (§7.0.2bn) and named the
+runtime's int4 gemm on the repacked Q4_K set as the larger half of it:
+418 ms of the prefill's 1,070 ms of device time, the runtime's own
+kernel. This section is that kernel on the device timeline per shape,
+its disassembly beside the kernel Intel's int4 IR of the same model
+runs, the int8 form of it measured, and the one host-side lever that
+was left -- which turned out to be a decode lever.
+
+**The instrument, per shape.** The intercept layer's kernel-name
+tracking now carries the global and local work sizes
+(`CLI_DevicePerformanceTimeGWSTracking`, `...LWSTracking`), which
+splits the runtime's `gemm_kernel` launches by shape where the name
+alone did not, and its transfer tracking marks each logits copy, on
+which the prefill parser anchors: the request's prefill is the run of
+launches between the previous logits copy and the 65th from the end of
+a 64-token run (the load's probe forwards copy logits too, and the
+request can follow the load by less than the one-second host gap the
+earlier parser looked for -- it did on the IR, and the first table of
+the day was the load's; a gap anchor inside the run then lost the
+first layers of a request that compiled kernels). The kernel ISA
+binaries are dumped in the same run (`CLI_DumpKernelISABinaries`),
+and `tools/igadis.cpp` now counts `dpas` and writes the disassembly
+text beside the binary (`IGADIS_DUMP=1`). Four cells on the 24 GB
+card, arcint 0.4.1 on `+p11`, `u8` KV, chunk 2,048, one fresh process
+each, the 856-token prompt, traced (traced rates are for shares; the
+record's rates are untraced):
+
+| the 856-token prefill, device time | the IR (int4, dyn-quant on) | mixed exact | mixed shared | mixed nibble |
+|---|---|---|---|---|
+| busy | 503 ms | 894 | 871 | 828 |
+| the runtime's gemm | 325 (65 %) | **420** (47 %) | 397 | 390 |
+| the tiled K-quant launches | -- | 285 | 285 | 271 |
+| gated delta net | 78 | 76 | 77 | 77 |
+| everything else | 100 | 113 | 112 | 90 |
+| greedy output | 50815ed40613 | 23e06c37e0d6 | 23e06c37e0d6 | 98c732f5e252 |
+
+The gemm follows K: the shared packing's 5.6 % shorter width takes
+5.5 % off it, the nibble's another 2 %. Per launch at 856 rows, from
+the launch sequence of one layer: the IR's gate and up projections
+(17,408 × 5,120) at 1.08 and 1.26 ms, dispatched as 952 work-groups
+of 512 work-items; the mixed form's (17,408 × 5,760) at 1.92 and 2.06
+ms, dispatched as 160 work-groups of 128 -- 640 subgroups, a
+persistent grid that walks 15 output tiles each. In FLOP terms the
+mixed form's gate launch runs at 86 TFLOP/s, the IR's at 130.
+
+**The two kernels, disassembled.** Both are oneDNN's generated gemm.
+The IR's runs `dpas` on int8 operands into int32 accumulators (its
+activations quantised per token and 128-wide group by the runtime's
+dynamic quantisation, 14 ms of its prefill; its weights u4 with a u4
+zero point per 128-wide group); ours runs `dpas` on f16 operands into
+f32 (the activation f16, the u4 weights decompressed in the loop under
+the runtime's f16 math mode -- the plugin sets `fpmath_mode::f16` for
+an f16 activation on compressed weights, and the catalog's plain
+f16 × f16 entry serves it). One `dpas.8x8` occupies the matrix unit
+for 16 cycles on this part, 2,048 f16 or 4,096 int8 multiply-adds,
+which is where the card's 98 TFLOP/s f16 and 197 int8 peaks come from
+(160 vector engines at 2.4 GHz). The K-loop of each kernel, read
+instruction by instruction:
+
+| the K-loop, one subgroup | ours (f16 × u4/32, no zero point) | the IR's (int8 × u4/128 + zero point) |
+|---|---|---|
+| register tile | 48 rows × 32 columns (12 accumulator ranges, f32) | 64 × 16 (8 ranges, int32) |
+| K per iteration / `dpas` per iteration | 128 / 96 | 128 / 32 |
+| decompression per 32 weights | `and`, `shr`, three `mul` (two rescale the nibble read as an f16 denormal, one applies the group scale) -- on the weights, before the `dpas` | `and`, `shr`, one `add` (the zero point); the scales applied to the int32 accumulators once per weight group: `mov`, `mul` (the activation scale), `mad` (the weight scale) per accumulator register |
+| non-`dpas` instructions per `dpas` | 7.4 | 14.0 |
+| matrix-unit cycles / issue slots per iteration | 1,536 / 810 | 512 / 480 |
+| loads | 2D block loads for both operands, six prefetches, no local memory, a barrier per iteration | the same, five prefetches, no barrier |
+| bound by (a reading of the counts, not a counter) | the matrix unit: 810 slots against 1,536 matrix cycles (88 % of the f16 roof measured) | issue, on the reading that a `dpas` also takes an issue slot and the drain's three-deep dependency serialises (66 % of the int8 roof measured; the count alone, 480 against 512, would say the matrix unit) |
+
+Ours is at the f16 matrix unit's rate: the decompression is free
+beside it (1.9× issue headroom), and the 12 % it misses is the
+barrier, the tile switches and the epilogue. Nothing host-side changes
+that at f16 -- not the zero point (free either way in this kernel),
+not u8 weights (fewer instructions the loop does not need, twice the
+bytes), not folding the rescale into the scale. The IR's kernel has
+twice the roof and spends a third of its issue slots draining int32
+accumulators into f32 through the per-group scales, three
+instructions per accumulator register per weight group. That cost
+scales with the group count, and the exact repack's groups are 32
+wide -- the K-quant's own sub-blocks; a Q4_K value has no exact
+expression under a wider scale (§7.0.2ba). At 32-wide groups the
+drain is four times the IR's and the int8 kernel is issue-bound at
+about 124 multiply-adds per cycle per engine -- under the f16 kernel's
+128.
+
+**Measured.** The exact mixed form with `--dyn-quant on`, one traced
+cell: the runtime switches the gate to the int8 class (`dpas` on u8
+weights and s8 activations; 512 `dpas` with 4,101 `mad` and 5,130
+`mov` per program against the IR's 2,571 and 3,710) and the launch
+takes 1.91–2.66 ms where the f16 kernel took 1.92–2.06: the gemm 413
+ms against 420, the dynamic quantisation 12 ms on top, the greedy
+output §7.0.2bg's (3cba6c3128b2, 2/10 there). The disassembly named
+one int8 variant that cell had not covered -- the activation scale per
+token rather than per token and group takes the `mul` out of the
+drain and would issue at 1.4× the f16 kernel if the runtime selected
+it -- so the engine can now ask for the runtime's group-size hint
+(`ARCINT_DYN_QUANT_GROUP=max`, a measurement switch; the runtime's own
+default for a hybrid linear-attention model is 128): on the split
+form below, the per-token setting serves at 709 t/s against the
+128-wide setting's 677 and the f16 form's 668, the gemm 411 ms
+traced. Dead, and with its mechanism measured rather than narrated:
+the handoff's lever 2, int8 activations with the min term kept exact,
+cannot pay on this runtime's kernels with 32-wide groups, whatever is
+done about the min term. Retracted here (§7.0.1): §7.0.2bg's "the
+share `--dyn-quant on` could halve" as an expectation.
+
+**The lever that was left: the min term as a separate term
+(`--gguf-mins split`).** The exact repack carries each group's min as
+augmented columns of the same tensor -- K widened by an eighth (5,120
+→ 5,760), the activation widened by its group sums through a small
+matmul and a concat (§7.0.2ba). The gemm follows K, so the
+augmentation is 11 % of it, and the widening's own launches (the
+reduce, the matmul, two concats per distinct activation) another 16
+ms. The split form keeps the main columns as they are (K = 5,120, the
+same u4 values and f16 scales byte for byte) and carries the min term
+as a second fully-connected on the group sums: `y = MatMul(x, W_main)
++ MatMul(sums(x), -M)` with `M[g][n] = f16(dmin_sb(g) · mn)`, one f16
+value per group per row -- the same bytes as the augmented columns
+(K/16 per row either way), one rounding of the min product where the
+augmented form stores the integer under `dmin` exactly. That rounding
+adds up to 2^-11 of the min, in steps, to the exact form's deviation
+-- a term nothing bounds a priori (the min can be many steps where
+the group's scale is small), so the split form's bound is a measured
+one, not a derived one: twice the exact bound, which holds on the
+fixture's Q4_K tensor (0.0158 steps against the exact form's 0.0133
+and its 1/64; one value of 32,768 over 1/64, none over 2/64) and on
+the served file, and which the load refuses over. The served
+computation emulated on the host agrees with the f32 reference at
+1.44× the exact form's deviation (`tests/test_gguf_repack.cpp`,
+`tests/test_gguf_graph.cpp`) -- the emulation assumes two
+f16-rounded partial products added in f16; the plugin may fuse the
+add into either fully-connected as a post-op on its f32 accumulator
+instead, which is one rounding fewer and is not measured. It is
+exact-class: the mins are the file's, refused over the bound like the
+exact form, not reported like the shared and nibble packings. On the
+served file the load reports 0.0187 steps, none over the bound (the
+exact form 0.0141).
+
+**Served** (the 24 GB card, `u8` KV, chunk 2,048, `--mtp off`, one
+fresh process per cell, the 0.4.2 tree on `+p11`; the exact form's
+control in the same window):
+
+| mixed form | exact (control) | **split** | split + dyn-quant (group 128) | split + dyn-quant per token |
+|---|---|---|---|---|
+| resident / max ctx at `u8` | 16.54 GiB / 111,776 | **16.30 / 120,240** | 16.30 / 118,832 | 16.30 / 118,832 |
+| prefill, 856 tokens, first request | 824 t/s | 668 | 677 | 709 |
+| decode step at 1k (64 tokens) | 55.05 ms | **53.53** | 53.36 | 53.43 |
+| prefill, 71,727 tokens | 451 (§7.0.2bn) | **458** | -- | -- |
+| decode step at 71.7k | 73.3 (§7.0.2bn) | **72.17** | -- | -- |
+| Prüfstand | 10/10 (§7.0.2bn) | 10/10 at 18.6 t/s | 10/10 at 18.7 | 10/10 at 18.7 |
+| greedy output, 1k | 23e06c37e0d6 | **23e06c37e0d6** | 23e06c37e0d6 | 23e06c37e0d6 |
+| greedy output, 71.7k | 086d5e71ad47 | 5e3fb7a8d72c | -- | -- |
+
+Three readings. The decode step gains 1.5 ms at 1k and 1.1 at 71.7k
+(the bar is 51.8 / 72.5: the mixed form now 1.7 ms over at 1k and
+under at depth), 0.24 GiB come back and with them 8.5k tokens of
+context at `u8`; the 1k output is byte-identical to the exact form's,
+the 71.7k output is the shared packing's (§7.0.2bl: the near-tie that
+flips back to the template-embedding runs' text). Second, the split
+form makes `--dyn-quant on` serve 10/10 with the 1k output
+byte-identical -- the augmented columns were what broke it in
+§7.0.2bg -- for no rate, which closes that lever on its measured
+mechanism. Third, the first-request prefill is slower, and the device
+timeline says where: 1,240 ms of span for 877 ms busy (the exact form
+959 / 894). On the device the split form is neutral -- the main gemm
+loses 41 ms at K = 5,120 (308.7 against 349.8 over the same 232
+launches), the min term's 200 f16 gemm launches at 0.2 ms (`[856 ×
+160] × [160 × N]`, 24 TFLOP/s) put 40 back, the widening's launches
+are gone (−16), everything else the same: the min term costs the same
+40 ms in either form, inside the main gemm at its rate on four times
+the FLOPs (640 augmented columns against 160 sums) or beside it at
+little over a quarter of the rate. The 300 ms of host
+idle are the first request's, and so is a part of every 1k prefill
+figure on this record: three 856-token requests to one process, no
+prefix cache, same window --
+
+| 856-token prefill, one process | request 1 | request 2 | request 3 | decode step (requests 2, 3) |
+|---|---|---|---|---|
+| exact | 826 t/s | 948 | 947 | 54.0 ms |
+| **split** | 709 | **967** | **967** | **53.3** |
+
+The first request of a process compiles the runtime's gemm kernels
+for the request's row count (the load's probe forwards run other row
+counts), about 130 ms of it in the exact form and 320 in the split
+form with its second fully-connected per projection by the served
+rates above (the traced first requests put the host idle at 65 and
+363 ms -- the two instruments agree on the difference, 180–200 ms,
+better than on the absolute); from the second
+request on the split form prefills 2 % faster than the exact one and
+decodes 1.3 % faster, byte-identical. Every 1k prefill rate in
+§7.0.2ba–bn was a first request of a fresh process -- the method the
+cells were pre-registered with, kept because it is what a fresh
+deployment serves first -- and the 907 t/s of §7.0.2bn carries about
+120 ms of that; against the bar it is 948 warm. Recorded here, not
+corrected there. The warm split prefill on the device timeline
+(the second request of a traced process): 896 ms of span for 869
+busy, 27 ms of host idle, the same launches at the same durations as
+the first request's -- the compilation is all the difference.
+
+**What this closes.** The runtime's int4 gemm on the repacked set is
+at the card's f16 rate; the 2× the IR has over it is int8 arithmetic
+that the K-quant's 32-wide groups make unprofitable on this runtime's
+int8 kernel, measured three ways (group 128, per token, and the
+augmented form). The handoff's 0.4.2 gate -- 1,100 t/s at 856 tokens
+on the mixed form through this gemm -- is not reachable by any
+host-side form of the projection, and the record says so instead of
+a narrower gate: what the prefill has left is the tiled K-quant
+share (285 ms, 0.4.3) and the 100 ms of everything else (the 48
+per-layer 4.7 MB host writes at 17 ms among them, the same in the IR).
+The split form ships as a flag with its prices measured: warm, it is
+faster than the exact form at everything measured (prefill +2 % at
+1k, +1.5 % at 71.7k, the decode step −1.3 % and −1.5 %), 0.24 GiB
+smaller, exact-class, byte-identical at 1k; what it costs is 180 ms
+more on the first request of a process and a different 71.7k text (a
+near-tie, §7.0.2bl). The default stays exact in this increment, and
+moving it is the operator's call (§7.0.2bl's rule: the score is a
+floor, not a fingerprint). Also fixed on the way: `--help` had never listed
+`--gguf-mode`, `--gguf-mins` or `--gguf-q6k` and still described the
+retired `--gguf-native` behaviour.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

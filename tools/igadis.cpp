@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 static int starts(const char* s, const char* p) { return strncmp(s, p, strlen(p)) == 0; }
 int main(int argc, char** argv) {
     for (int a = 1; a < argc; ++a) {
@@ -25,7 +26,9 @@ int main(int argc, char** argv) {
         char* text = NULL; char* copy = NULL;
         st = iga_context_disassemble(ctx, &dopts, buf, (uint32_t)len, NULL, NULL, &text);
         if (st != IGA_SUCCESS || !text) { fprintf(stderr, "%s: disassemble: %s\n", argv[a], iga_status_to_string(st)); iga_context_release(ctx); continue; }
-        long instr = 0, send = 0, mov = 0, indirect = 0, mad = 0, shifts = 0, cmp = 0, sel = 0;
+        // IGADIS_DUMP (set to anything) writes the disassembly text beside the input as <file>.asm
+        if (getenv("IGADIS_DUMP")) { std::string o = std::string(argv[a]) + ".asm"; FILE* d = fopen(o.c_str(), "w"); if (d) { fputs(text, d); fclose(d); } }
+        long instr = 0, send = 0, mov = 0, indirect = 0, mad = 0, shifts = 0, cmp = 0, sel = 0, dpas = 0;
         copy = strdup(text);  // the text belongs to the context; strtok needs its own copy
         for (char* line = strtok(copy, "\n"); line; line = strtok(NULL, "\n")) {
             char* s = line; while (*s == ' ' || *s == '\t') ++s;
@@ -40,8 +43,9 @@ int main(int argc, char** argv) {
             if (starts(s, "shl") || starts(s, "shr") || starts(s, "asr")) ++shifts;
             if (starts(s, "cmp")) ++cmp;
             if (starts(s, "sel")) ++sel;
+            if (starts(s, "dpas")) ++dpas;
         }
-        printf("%s: %ld bytes, %ld instr, %ld send, %ld mov (%ld indirect), %ld mad, %ld shift, %ld cmp, %ld sel\n", argv[a], len, instr, send, mov, indirect, mad, shifts, cmp, sel);
+        printf("%s: %ld bytes, %ld instr, %ld dpas, %ld send, %ld mov (%ld indirect), %ld mad, %ld shift, %ld cmp, %ld sel\n", argv[a], len, instr, dpas, send, mov, indirect, mad, shifts, cmp, sel);
         free(copy); iga_context_release(ctx); free(buf);
     }
     return 0;

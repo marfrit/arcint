@@ -2398,7 +2398,8 @@ private:
     }
     void apply_gguf_weights(const std::shared_ptr<ov::Model>& model, const std::string& path, int mode_flag,
                             const std::string& verdict_dir, bool embed_from_file, bool q6k_aligned, int mins_flag) {
-        const gguf::RepackMins mins = mins_flag == 1 ? gguf::RepackMins::Shared : mins_flag == 2 ? gguf::RepackMins::Nibble : gguf::RepackMins::Exact;
+        const gguf::RepackMins mins = mins_flag == 1 ? gguf::RepackMins::Shared : mins_flag == 2 ? gguf::RepackMins::Nibble
+                                     : mins_flag == 3 ? gguf::RepackMins::Split : gguf::RepackMins::Exact;
         const GgufWeightsMode mode = mode_flag == 1 ? GgufWeightsMode::Native
                                    : mode_flag == 2 ? GgufWeightsMode::Mixed : GgufWeightsMode::Repack;
         auto file = std::make_shared<gguf::GgufFile>(gguf::GgufFile::open(path));
@@ -2783,6 +2784,22 @@ private:
         // to the native path's greedy output where int8 activations flipped a near-tie.
         const bool dyn_quant_off = cfg.dyn_quant == 2 || (cfg.dyn_quant == 0 && !cfg.gguf_path.empty());
         if (dyn_quant_off) props[ov::hint::dynamic_quantization_group_size.name()] = uint64_t{0};
+        // Measurement switch (0.4.2): the quantization's group size along K when it is
+        // on -- a number, or "max" for one scale per token. The runtime's own default for
+        // a hybrid linear-attention model is 128 (DESIGN §7.0.2bo); the int4 gemm's
+        // accumulator drain per weight group is what the per-token form leaves out.
+        if (!dyn_quant_off) {
+            if (const char* g = std::getenv("ARCINT_DYN_QUANT_GROUP")) {
+                uint64_t gs = 0;
+                if (std::string(g) == "max") gs = std::numeric_limits<uint64_t>::max();
+                else if (!parse_u64_strict(g, gs) || gs == 0)
+                    throw std::runtime_error(log::format("ARCINT_DYN_QUANT_GROUP='%s' is not a group size (a positive integer, or max)", g));
+                props[ov::hint::dynamic_quantization_group_size.name()] = gs;
+                log::info("load", "dynamic quantization group size %s (ARCINT_DYN_QUANT_GROUP)", g);
+            }
+        } else if (std::getenv("ARCINT_DYN_QUANT_GROUP") != nullptr) {
+            log::warn("load", "ARCINT_DYN_QUANT_GROUP is set but dynamic quantization is off (--dyn-quant on turns it on): ignored");
+        }
         if (offload_ratio_ > 0) {
             props["OFFLOAD_RATIO"]        = offload_ratio_;
             props[ov::weights_path.name()] = artifact_.language_model_bin;

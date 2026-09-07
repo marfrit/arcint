@@ -19,6 +19,7 @@
 #include <filesystem>
 
 #include <openvino/core/model.hpp>
+#include <openvino/op/add.hpp>
 #include <openvino/op/concat.hpp>
 #include <openvino/op/constant.hpp>
 #include <openvino/op/convert.hpp>
@@ -327,6 +328,70 @@ TEST(gguf_pass_repacks_with_an_inexact_mins_packing_on_request_and_reports_its_d
     for (const auto& r : a.replaced) if (r.repacked) wa += r.bytes;
     for (const auto& r : b.replaced) if (r.repacked) wb += r.bytes;
     CHECK(wb <= wa);  // fewer augmented columns at the served widths; at the fixture's K the even-count padding takes the saving back
+}
+
+// RepackMins::Split (0.4.2, DESIGN §7.0.2bo; §7.0.2bg's `--dyn-quant on` finding): the
+// min term is a second, unquantised MatMul added to the main one instead of
+// augmented columns of it, so the widened activation's group-sum columns
+// never reach the runtime's per-token int8 activation quantization. No
+// Concat, no widened activation for the projection, one MatMul over the
+// file's main columns alone (width K, not K + K/8) plus one small MatMul.
+TEST(gguf_pass_split_mins_adds_the_min_term_as_a_separate_matmul_with_no_augmented_columns) {
+    auto file = std::make_shared<gguf::GgufFile>(gguf::GgufFile::open(fixture()));
+    Toy toy = toy_template();
+    const GgufApplyReport rep = gguf_apply_to_template(toy.model, file, toy_geometry(), GgufWeightsMode::Repack, "", fixture(), true, gguf::RepackMins::Split);
+    CHECK(rep.mins == gguf::RepackMins::Split);
+    // mlp.gate_proj (blk.0.ffn_gate.weight, Q4_K, N=64, K=512) has a min: Split's path.
+    const GgufReplacement* gate = nullptr;
+    for (const auto& r : rep.replaced) if (r.gguf_name == "blk.0.ffn_gate.weight") gate = &r;
+    CHECK(gate != nullptr);
+    if (!gate) return;
+    CHECK(gate->repacked);
+    CHECK_EQ(gate->k, int64_t{512});
+    // No Concat / no widened activation anywhere in the graph under Split.
+    for (const auto& c : ops_of<ov::op::v0::Concat>(toy.model))
+        CHECK(c->get_friendly_name().find("/gguf_widened") == std::string::npos);
+    // toy's first Result is mlp.gate_proj's: its replacement is the Add.
+    auto add = std::dynamic_pointer_cast<ov::op::v1::Add>(toy.model->get_results()[0]->input_value(0).get_node_shared_ptr());
+    CHECK(add != nullptr);
+    if (!add) return;
+    auto main_mm = std::dynamic_pointer_cast<ov::op::v0::MatMul>(add->input_value(0).get_node_shared_ptr());
+    auto min_mm = std::dynamic_pointer_cast<ov::op::v0::MatMul>(add->input_value(1).get_node_shared_ptr());
+    CHECK(main_mm != nullptr);
+    CHECK(min_mm != nullptr);
+    if (!main_mm || !min_mm) return;
+    // The main MatMul's weight chain ends in a u4 constant of N*K values (not N*(K+K/8)).
+    auto node = main_mm->input_value(1).get_node_shared_ptr();
+    if (auto outer = std::dynamic_pointer_cast<ov::op::v0::Convert>(node)) node = outer->input_value(0).get_node_shared_ptr();  // toy's own f32 MatMul
+    auto reshape = std::dynamic_pointer_cast<ov::op::v1::Reshape>(node);
+    CHECK(reshape != nullptr);
+    if (!reshape) return;
+    auto mul = std::dynamic_pointer_cast<ov::op::v1::Multiply>(reshape->input_value(0).get_node_shared_ptr());
+    CHECK(mul != nullptr);
+    if (!mul) return;
+    auto x = mul->input_value(0).get_node_shared_ptr();
+    if (auto sub = std::dynamic_pointer_cast<ov::op::v1::Subtract>(x)) x = sub->input_value(0).get_node_shared_ptr();  // Q5_K/Q6_K only
+    auto conv = std::dynamic_pointer_cast<ov::op::v0::Convert>(x);
+    CHECK(conv != nullptr);
+    if (!conv) return;
+    auto w = std::dynamic_pointer_cast<ov::op::v0::Constant>(conv->input_value(0).get_node_shared_ptr());
+    CHECK(w != nullptr);
+    if (!w) return;
+    CHECK(w->get_element_type() == ov::element::u4);
+    size_t values = 1;
+    for (auto d : w->get_shape()) values *= d;
+    CHECK_EQ(values, size_t{64 * 512});  // N * K exactly: no augmented columns
+    // The min term's own constant: f16, [K/32, N] = [16, 64], named .../gguf_min_term.
+    auto min_node = min_mm->input_value(1).get_node_shared_ptr();
+    if (auto outer = std::dynamic_pointer_cast<ov::op::v0::Convert>(min_node)) min_node = outer->input_value(0).get_node_shared_ptr();  // toy's f32 activation
+    auto min_const = std::dynamic_pointer_cast<ov::op::v0::Constant>(min_node);
+    CHECK(min_const != nullptr);
+    if (!min_const) return;
+    CHECK(min_const->get_friendly_name().find("/gguf_min_term") != std::string::npos);
+    CHECK(min_const->get_element_type() == ov::element::f16);
+    CHECK_EQ(min_const->get_shape().size(), size_t{2});
+    CHECK_EQ(min_const->get_shape()[0], size_t{512 / 32});
+    CHECK_EQ(min_const->get_shape()[1], size_t{64});
 }
 
 // The native Q6_K rows are laid out in 224-byte blocks by default (kquant type 114: the file's

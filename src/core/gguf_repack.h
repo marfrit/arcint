@@ -29,6 +29,28 @@
 // Q4_K, 1/32 for Q5_K and Q6_K, 1/16 for Q8_0) and checked by the tests over
 // the fixture; the native path's own tiled kernel already multiplies f16
 // copies of the decoded values (DESIGN §7.0.2ay), its Xe2 decode is f32-exact.
+//
+// RepackMins::Split's rounding sequence, on top of the above. The main
+// columns are the exact form's, byte for byte -- same weights, same scale.
+// The min itself is one float multiply of the file's f16 dmin (already
+// exact, decoded once) and the integer mn, rounded to f16 once (min_matrix):
+// one rounding the augmented-column form's mins do not carry (there, the
+// stored integer is exact under the group's own f16 scale, with no second
+// product to round). That rounding adds up to 2^-11 of the min, in steps,
+// to the exact form's deviation -- a term nothing bounds a priori (the min
+// can be many steps where the group's scale is small), so the split form's
+// bound is MEASURED, not derived: twice the exact bound, which holds on the
+// fixture's Q4_K tensor (0.0158 steps against the exact form's 0.0133 and
+// 1/64) and on the served file; the load refuses a split tensor over it, the
+// same way it refuses an exact one over its bound
+// (tests/test_gguf_repack.cpp). Served as y = MatMul(act, W_main) +
+// MatMul(sums, -mins) (gguf_graph.cpp). matvec_repacked_host emulates it as
+// f16(f16(sum of f16(f16(q)*scale)*x)) + f16(sum of f16(group sum of x) *
+// -min)) -- two independently-rounded partial dot products added once more
+// in f16, not the exact form's single running accumulator. That is an
+// ASSUMPTION about the served graph: the plugin may fuse the Add into either
+// fully-connected as a post-op on its f32 accumulator (one rounding fewer);
+// which it does is not measured.
 
 #include <cstddef>
 #include <cstdint>
@@ -48,7 +70,12 @@ enum class RepackZeroPoint { None, U8Scalar };
 // one nibble per group under a scale shared by 32 groups, the largest min of
 // the 32 at 15 (+3.1 %). The inexact forms err by at most half the shared
 // scale per group min; the load reports their deviation instead of refusing it.
-enum class RepackMins { Exact, Shared, Nibble };
+// Split: no augmented columns at all (k_aug == 0); every group's min goes into
+// `RepackedTensor::min_matrix` instead, one f16 value per row per group, so
+// the runtime can add the min term through a second, unquantised MatMul
+// instead of folding it into the widened, quantised fully-connected (the
+// widening's group-sum columns are what --dyn-quant on was destroying).
+enum class RepackMins { Exact, Shared, Nibble, Split };
 
 struct RepackedTensor {
     RepackWeights   weights_type = RepackWeights::U4;
@@ -64,8 +91,12 @@ struct RepackedTensor {
     std::vector<uint16_t> scale;     // f16 bits, [n][(k + k_aug)/group]
     uint8_t zp_u8 = 0;               // when zp_type == U8Scalar
     std::vector<int64_t> column_dest_of;  // the column order applied at build (empty: the file's); column dest_of[c] holds the file's column c
+    // RepackMins::Split only: f16 bits, [n][k/32] -- min_matrix[row*  (k/32) + g]
+    // is f16(dmin_of_the_group's_super_block * mn), one rounding, the min itself
+    // (positive). Empty for every other packing and for the types without a min.
+    std::vector<uint16_t> min_matrix;
     int64_t width() const { return k + k_aug; }
-    size_t bytes() const { return weights.size() + 2 * scale.size(); }
+    size_t bytes() const { return weights.size() + 2 * scale.size() + 2 * min_matrix.size(); }
 };
 
 // True for the four block types this repack serves (Q8_0, Q4_K, Q5_K, Q6_K).
@@ -82,9 +113,11 @@ bool repack_supported(int32_t ggml_type);
 RepackedTensor repack_tensor(const GgufFile& file, const TensorInfo& t, const std::vector<int64_t>* column_dest_of = nullptr,
                              RepackMins mins = RepackMins::Exact);
 
-// The min the repacked form carries for main group `g` of row `row` (the
-// stored integer under the augmented group's scale; 0 for the types without
-// one). Exact for RepackMins::Exact, the requantised value otherwise.
+// The min the repacked form carries for main group `g` of row `row` (0 for
+// the types without one). Exact for RepackMins::Exact, the requantised value
+// for Shared/Nibble, and min_matrix's f16-rounded value for Split -- in every
+// case the stored integer or value under the relevant scale, not a column of
+// `weights` when the packing is Split (there are none).
 float repacked_group_min(const RepackedTensor& r, int64_t row, int64_t g);
 
 // Rows reordered after the fact: row `dest` of the result is row

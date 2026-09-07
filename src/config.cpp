@@ -338,9 +338,22 @@ std::string usage_text() {
         "                            served IR of the same architecture is the template);\n"
         "                            K-quant rows go to the card as stored, decoded in the\n"
         "                            kernel. Needs --model and a plugin at +p7 or later\n"
-        "  --gguf-native             keep the file's own K-quant rows and decode them in the\n"
-        "                            plugin's kernel (needs the +p7 runtime) instead of the\n"
-        "                            default repack into the runtime's compressed form\n"
+        "  --gguf-mode repack|native|mixed\n"
+        "                            how the file's projections reach the graph (default:\n"
+        "                            mixed, Q4_K repacked and every other type native rows)\n"
+        "  --gguf-native             alias for --gguf-mode native\n"
+        "  --gguf-mins exact|shared|nibble|split\n"
+        "                            the repacked projections' mins packing (default: exact,\n"
+        "                            +12.5% on the Q4_K set; shared +6.25%, nibble +3.1%,\n"
+        "                            both inexact; split: the min term a separate term on\n"
+        "                            the group sums, K the model's, a decode lever)\n"
+        "  --gguf-q6k aligned|file   native Q6_K rows in 224-byte dword-aligned blocks\n"
+        "                            (default: aligned) or the file's own 210-byte rows\n"
+        "  --gguf-embed file|template\n"
+        "                            the token embedding rows from the file, dequantised on\n"
+        "                            the host per token (default), or the template's\n"
+        "  --gguf-check once|always  keep each repacked projection's deviation verdict\n"
+        "                            between loads of the same file (default) or re-check\n"
         "  --dyn-quant on|off        the runtime's per-token int8 activation quantization on\n"
         "                            compressed weights; default: the runtime's own for an IR,\n"
         "                            off for a GGUF-opened model (f16 activations reproduce the\n"
@@ -419,11 +432,12 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             else return fail("--gguf-mode needs repack, native or mixed");
             cfg.gguf_native = cfg.gguf_mode == 1;
         } else if (arg == "--gguf-mins") {
-            if (!value(v)) return fail("--gguf-mins needs exact, shared or nibble");
+            if (!value(v)) return fail("--gguf-mins needs exact, shared, nibble or split");
             if (v == "exact") cfg.gguf_mins = 0;
             else if (v == "shared") cfg.gguf_mins = 1;
             else if (v == "nibble") cfg.gguf_mins = 2;
-            else return fail("--gguf-mins needs exact, shared or nibble");
+            else if (v == "split") cfg.gguf_mins = 3;
+            else return fail("--gguf-mins needs exact, shared, nibble or split");
         } else if (arg == "--gguf-q6k") {
             if (!value(v)) return fail("--gguf-q6k needs aligned or file");
             if (v == "aligned") cfg.gguf_q6k_aligned = true;

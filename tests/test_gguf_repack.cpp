@@ -205,6 +205,130 @@ TEST(q4_k_mins_as_one_nibble_per_group_quarter_the_augmentation_within_half_a_st
     CHECK(worst <= 1.0);
 }
 
+// RepackMins::Split: no augmented columns at all (the widened activation's
+// group-sum columns are what --dyn-quant on was quantising along with the
+// weights, DESIGN §7.0.2bg); the min goes into RepackedTensor::min_matrix
+// instead, one f16 value per row per group, computed independently here from
+// the raw super-block (ggml's own get_scale_min_k4 bit layout, not the
+// repack's) so the test does not just check the code against itself.
+namespace {
+void scale_min_k4_ref(int s, const uint8_t* q, uint8_t& d, uint8_t& m) {
+    if (s < 4) { d = q[s] & 63; m = q[s + 4] & 63; }
+    else { d = static_cast<uint8_t>((q[s + 4] & 0xF) | ((q[s - 4] >> 6) << 4)); m = static_cast<uint8_t>((q[s + 4] >> 4) | ((q[s] >> 6) << 4)); }
+}
+}  // namespace
+
+TEST(q4_k_mins_split_has_no_augmented_columns_and_min_matrix_matches_the_raw_super_block) {
+    // Q4_K (type 12, 144-byte blocks) and Q5_K (type 13, 176-byte blocks): the
+    // scale/min 6-bit decoding sits at the same offset (4) in both block
+    // layouts, so one loop body covers both -- the block stride is the only
+    // thing that differs.
+    for (int type : {12, 13}) {
+        gguf::GgufFile f = gguf::GgufFile::open(fixture_path());
+        const auto& t = tensor_of_type(f, type);
+        const auto r = gguf::repack_tensor(f, t, nullptr, gguf::RepackMins::Split);
+        CHECK(r.mins == gguf::RepackMins::Split);
+        CHECK_EQ(r.width(), r.k);
+        CHECK_EQ(r.k_aug, int64_t{0});
+        const int64_t groups = r.k / 32;
+        CHECK_EQ(r.min_matrix.size(), static_cast<size_t>(r.n) * static_cast<size_t>(groups));
+        const uint8_t* data = f.data(t);
+        const size_t block_bytes = type == 12 ? 144 : 176;
+        const size_t row_bytes = static_cast<size_t>(r.k / 256) * block_bytes;
+        int checked = 0;
+        for (int64_t row : {int64_t{0}, r.n / 2, r.n - 1}) {
+            for (int64_t g = 0; g < groups; ++g) {
+                const int64_t b = g / 8, s = g % 8;
+                const uint8_t* blk = data + static_cast<size_t>(row) * row_bytes + static_cast<size_t>(b) * block_bytes;
+                const float dmin = gguf::f16_to_f32(static_cast<uint16_t>(blk[2] | (blk[3] << 8)));
+                uint8_t sc6, m6; scale_min_k4_ref(static_cast<int>(s), blk + 4, sc6, m6);
+                (void)sc6;
+                const uint16_t expected = gguf::f32_to_f16(dmin * static_cast<float>(m6));
+                CHECK_EQ(r.min_matrix[static_cast<size_t>(row * groups + g)], expected);
+                ++checked;
+            }
+        }
+        CHECK(checked > 0);
+    }
+}
+
+TEST(q6_k_and_q8_0_are_unaffected_by_gguf_mins_split) {
+    gguf::GgufFile f = gguf::GgufFile::open(fixture_path());
+    for (int type : {8, 14}) {
+        const auto& t = tensor_of_type(f, type);
+        const auto exact = gguf::repack_tensor(f, t);
+        const auto split = gguf::repack_tensor(f, t, nullptr, gguf::RepackMins::Split);
+        CHECK_EQ(split.k_aug, int64_t{0});
+        CHECK(split.min_matrix.empty());
+        CHECK_EQ(split.weights, exact.weights);
+        CHECK_EQ(split.scale, exact.scale);
+    }
+}
+
+TEST(q4_k_split_mins_matvec_agrees_with_the_f32_reference_within_2x_of_the_exact_forms_deviation) {
+    gguf::GgufFile f = gguf::GgufFile::open(fixture_path());
+    const auto& t = tensor_of_type(f, 12);
+    const auto exact = gguf::repack_tensor(f, t);
+    const auto split = gguf::repack_tensor(f, t, nullptr, gguf::RepackMins::Split);
+    std::vector<float> w; gguf::dequantize_tensor(f, t, w);
+    std::vector<float> x(static_cast<size_t>(exact.k));
+    for (int64_t c = 0; c < exact.k; ++c) x[static_cast<size_t>(c)] = std::sin(0.37f * static_cast<float>(c)) * 1.5f;
+    std::vector<float> y_exact, y_split;
+    gguf::matvec_repacked_host(exact, x, y_exact);
+    gguf::matvec_repacked_host(split, x, y_split);
+    double max_abs_exact = 0, max_abs_split = 0;
+    for (int64_t row = 0; row < exact.n; ++row) {
+        double ref = 0;
+        for (int64_t c = 0; c < exact.k; ++c) ref += static_cast<double>(x[static_cast<size_t>(c)]) * static_cast<double>(w[static_cast<size_t>(row * exact.k + c)]);
+        max_abs_exact = std::max(max_abs_exact, std::fabs(static_cast<double>(y_exact[static_cast<size_t>(row)]) - ref));
+        max_abs_split = std::max(max_abs_split, std::fabs(static_cast<double>(y_split[static_cast<size_t>(row)]) - ref));
+    }
+    std::printf("  q4_k split matvec: max |y-ref| exact %.3g, split %.3g (%.2fx)\n", max_abs_exact, max_abs_split,
+               max_abs_exact > 0 ? max_abs_split / max_abs_exact : 0.0);
+    CHECK(max_abs_split <= 2.0 * max_abs_exact + 1e-6);
+}
+
+// The main columns are the exact form's, byte for byte; the min term carries
+// one rounding the exact form's does not (a single float multiply of dmin and
+// mn, rounded to f16 once -- gguf_repack.h's "What is exact and what is not").
+// Measured on this fixture that pushes one value of 32,768 (0.003 %) a hair
+// past the exact form's 1/64 bound (0.0158 steps): the split form's own bound
+// is twice the exact one -- a MEASURED bound (the extra term is up to 2^-11 of
+// the min in steps, which nothing bounds a priori; 2x holds on this fixture
+// and on the served file, DESIGN 7.0.2bo) --
+// and the load refuses a split tensor over it exactly as it refuses an exact
+// one over 1/64 -- the mins are the file's, the form is exact-class, unlike
+// Shared/Nibble whose deviation is reported and accepted.
+TEST(q4_k_split_mins_repack_deviation_holds_twice_the_exact_bound) {
+    gguf::GgufFile f = gguf::GgufFile::open(fixture_path());
+    const auto& t = tensor_of_type(f, 12);
+    const auto exact = gguf::repack_tensor(f, t);
+    const auto r = gguf::repack_tensor(f, t, nullptr, gguf::RepackMins::Split);
+    const auto dve = gguf::repack_deviation(f, t, exact, 1.0 / 64.0);
+    const auto dv64 = gguf::repack_deviation(f, t, r, 1.0 / 64.0);
+    const auto dv = gguf::repack_deviation(f, t, r, 2.0 / 64.0);
+    std::printf("  q4_k split: max %.5f steps (exact %.5f), rms %.5f, %zu of %zu over 1/64, %zu over 2/64\n",
+               dv.max_steps, dve.max_steps, dv.rms_steps, dv64.over, dv64.values, dv.over);
+    CHECK_EQ(dve.over, size_t{0});             // the exact form holds its bound exactly
+    CHECK(dv64.over != 0);                     // and the split form does not (the extra rounding is real: red before the 2x bound)
+    CHECK(dv.max_steps <= 2.0 / 64.0);         // the split form's bound, the one the load refuses over
+    CHECK_EQ(dv.over, size_t{0});
+    CHECK(dv64.over * 1000 <= dv64.values);    // a handful of borderline groups, not a systematic miss
+
+    // Q5_K's own exact bound is 1/32 (twice Q4_K's 1/64, one more decoded bit
+    // of range): the split form's is twice that, 2/32.
+    const auto& t5 = tensor_of_type(f, 13);
+    const auto exact5 = gguf::repack_tensor(f, t5);
+    const auto r5 = gguf::repack_tensor(f, t5, nullptr, gguf::RepackMins::Split);
+    const auto dve5 = gguf::repack_deviation(f, t5, exact5, 1.0 / 32.0);
+    const auto dv5 = gguf::repack_deviation(f, t5, r5, 2.0 / 32.0);
+    std::printf("  q5_k split: max %.5f steps (exact %.5f), rms %.5f, %zu of %zu over 2/32\n",
+               dv5.max_steps, dve5.max_steps, dv5.rms_steps, dv5.over, dv5.values);
+    CHECK_EQ(dve5.over, size_t{0});
+    CHECK(dv5.max_steps <= 2.0 / 32.0);
+    CHECK_EQ(dv5.over, size_t{0});
+}
+
 TEST(repack_refuses_a_type_it_does_not_serve) {
     gguf::GgufFile f = gguf::GgufFile::open(fixture_path());
     const gguf::TensorInfo* f32 = nullptr;
@@ -285,6 +409,19 @@ TEST(a_head_wise_column_order_is_applied_at_build_and_refused_when_it_splits_a_g
     std::vector<float> y, yp; gguf::matvec_repacked_host(r, x, y); gguf::matvec_repacked_host(p, xp, yp);
     double md = 0; for (size_t i = 0; i < y.size(); ++i) md = std::max(md, static_cast<double>(std::fabs(y[i] - yp[i])));
     CHECK(md <= 1e-3);
+    // RepackMins::Split under the same head-wise order: min_matrix is written
+    // at the destination group `dg`, not the source group `g` (gguf_repack.cpp's
+    // repack_row, `min_row[dg] = ...`) -- a wrong index there would still pass
+    // the min_matrix-vs-raw-block test above (which reads its own row's groups
+    // consistently) but would fail here, where the permuted and unpermuted
+    // split repacks are cross-checked against each other.
+    const auto ps = gguf::repack_tensor(f, t, &dest_of, gguf::RepackMins::Split);
+    const auto dvps = gguf::repack_deviation(f, t, ps, 2.0 / 64.0);
+    CHECK_EQ(dvps.over, size_t{0});
+    const auto rs = gguf::repack_tensor(f, t, nullptr, gguf::RepackMins::Split);
+    std::vector<float> ys, yps; gguf::matvec_repacked_host(rs, x, ys); gguf::matvec_repacked_host(ps, xp, yps);
+    double mds = 0; for (size_t i = 0; i < ys.size(); ++i) mds = std::max(mds, static_cast<double>(std::fabs(ys[i] - yps[i])));
+    CHECK(mds <= 1e-3);
     std::vector<int64_t> split(static_cast<size_t>(t.dims[0]));
     for (size_t c = 0; c < split.size(); ++c) split[c] = static_cast<int64_t>((c + 1) % split.size());
     bool threw = false;
