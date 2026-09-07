@@ -1,3 +1,57 @@
+# The K-quant kernel's decode variant in llama.cpp's shape: block reads along K
+
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0003-0022. arcint 0.4.1 (DESIGN.md section 7.0.2bc). Replaces the earlier 0023
+# (the timing test only), which is carried inside this one.
+#
+# What changes:
+#   fully_connected_gpu_kquant.cl   The decode variant (TILE_M == 1): a work-group per
+#                       group of output rows (KQ_ROWS: four, sixteen on the long-K down
+#                       projection), KQ_WG = 4 subgroups with their lanes along K, a subgroup
+#                       taking one super-block per iteration; super-blocks outer, rows inner,
+#                       so the activation super-block is read once (a sub-group block read,
+#                       converted once) and shared by the rows; the subgroups' partials
+#                       reduced through local memory. The tiled prefill variant is unchanged.
+#   kquant_utils.cl     The row pieces. Q4_K/Q5_K (kq_row_q4k_x): the 128 quant bytes as one
+#                       intel_sub_group_block_read_uc8 -- lane l holds positions l and l + 16
+#                       of every sub-block -- the eight scale/min pairs decoded by lanes 0..7
+#                       and broadcast, the min term from the activation pair sums. Q6_K
+#                       (kq_row_q6k_x): the 2-aligned 210-byte blocks block-read as dwords
+#                       from the dword at or below the block and redistributed with one
+#                       shuffle (a 16-bit block read two bytes off a dword returns the wrong
+#                       word on every lane but the first -- measured), the scales one uniform
+#                       load; on Xe2 the subgroup prefetches its next Q6_K super-block (one
+#                       cache line per lane: the Q6_K down projection 500 -> 397 us on the 24 GB
+#                       card, measured; the Q4_K/Q5_K shapes and the 16 GiB card lose with the
+#                       same prefetch and do not get it). Q8_0 per lane. Exact: f32 accumulation
+#                       over f16 activations.
+#   fully_connected_kernel_kquant.cpp   The decode dispatch, per architecture: 4 subgroups x 16
+#                       lanes per 4 output rows on the K = 5,120 shapes; on the long-K projections
+#                       16 rows x 4 subgroups on Xe2 and 8 x 8 on Xe-HPG (measured both ways);
+#                       KQ_ROWS and KQ_PREFETCH (Xe2) as jit constants; the subgroup reduce among
+#                       the required device features. The width-sized K split of 0022 goes.
+#   fully_connected_gpu_test.cpp   Two more correctness cases (Q8_0 and Q5_K at one row); the
+#                       timing case streams (eight weight buffers in rotation on one queue: ten
+#                       launches of one buffer had let a third of it hit L2), warms every network
+#                       to steady state before the clock (a network's second execution costs
+#                       twice its third, measured) and runs over the served model's own tensor
+#                       types and shapes.
+#
+# MEASURED streamed at steady state on the 24 GB card, one row, against 0022 in the same
+# instrument: the gate projection (Q4_K, N 17,408, K 5,120) 141 us / 355 GB/s (79 % of the
+# card's measured 453 GB/s random-read ceiling) against 170; the Q4_K down projection
+# (N 5,120, K 17,408) 146 against 219; Q5_K 5,120 x 5,120 60 against 137; the Q6_K down
+# projection 397 against 646; the N 1,024 projections 20-33 us. Served (dense Qwen3.8-27B
+# Q4_K_M native, u8 KV): 12.1 t/s decode at 856 prompt tokens against 0.4.0's 9.9, 10.1 at
+# 71.7k against 8.5, Pruefstand 10/10, greedy outputs byte-identical at both depths.
+# On the 16 GiB card (Xe-HPG), same instrument, against 0022: the gate projection 154 us
+# against 159, N 1,024 21 against 25, Q5_K 5,120^2 64 against 98 -- and the long-K down
+# projections behind: Q4_K 204 against 172, Q6_K 510 against 467 (16 rows x 4 subgroups there
+# was 224 and 842); that card does not serve a GGUF-opened model of this size. DESIGN
+# 7.0.2bc-7.0.2be.
+#
+# Upstream: not yet filed.
+
 --- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
 +++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
 @@ -1,17 +1,19 @@

@@ -25,10 +25,11 @@
 #                       card, measured; the Q4_K/Q5_K shapes and the 16 GiB card lose with the
 #                       same prefetch and do not get it). Q8_0 per lane. Exact: f32 accumulation
 #                       over f16 activations.
-#   fully_connected_kernel_kquant.cpp   The decode dispatch: a work-group of 4 x 16 lanes per
-#                       rows_per_group(K) output rows; KQ_ROWS and KQ_PREFETCH (Xe2) as jit
-#                       constants; the subgroup reduce among the required device features. The
-#                       width-sized K split of 0022 goes.
+#   fully_connected_kernel_kquant.cpp   The decode dispatch, per architecture: 4 subgroups x 16
+#                       lanes per 4 output rows on the K = 5,120 shapes; on the long-K projections
+#                       16 rows x 4 subgroups on Xe2 and 8 x 8 on Xe-HPG (measured both ways);
+#                       KQ_ROWS and KQ_PREFETCH (Xe2) as jit constants; the subgroup reduce among
+#                       the required device features. The width-sized K split of 0022 goes.
 #   fully_connected_gpu_test.cpp   Two more correctness cases (Q8_0 and Q5_K at one row); the
 #                       timing case streams (eight weight buffers in rotation on one queue: ten
 #                       launches of one buffer had let a third of it hit L2), warms every network
@@ -42,12 +43,15 @@
 # (N 5,120, K 17,408) 146 against 219; Q5_K 5,120 x 5,120 60 against 137; the Q6_K down
 # projection 397 against 646; the N 1,024 projections 20-33 us. Served (dense Qwen3.8-27B
 # Q4_K_M native, u8 KV): 12.1 t/s decode at 856 prompt tokens against 0.4.0's 9.9, 10.1 at
-# 71.7k against 8.5, Pruefstand 10/10, greedy outputs byte-identical at both depths. DESIGN
-# 7.0.2bc-7.0.2bd.
+# 71.7k against 8.5, Pruefstand 10/10, greedy outputs byte-identical at both depths.
+# On the 16 GiB card (Xe-HPG), same instrument, against 0022: the gate projection 154 us
+# against 159, N 1,024 21 against 25, Q5_K 5,120^2 64 against 98 -- and the long-K down
+# projections behind: Q4_K 204 against 172, Q6_K 510 against 467 (16 rows x 4 subgroups there
+# was 224 and 842); that card does not serve a GGUF-opened model of this size. DESIGN
+# 7.0.2bc-7.0.2be.
 #
 # Upstream: not yet filed.
 
-clean test copy written
 --- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
 +++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
 @@ -1,17 +1,19 @@
@@ -403,7 +407,7 @@ clean test copy written
 +}
 --- a/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_kquant.cpp
 +++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_kquant.cpp
-@@ -14,31 +14,25 @@
+@@ -14,31 +14,29 @@
  // sub-block, the activations and four partial sums per row all live in registers).
  static constexpr size_t kTileMGemm = 32;
  static constexpr size_t kColumnGroups = 8; // subgroups per work-group sharing the staged activation tile (prefill)
@@ -429,27 +433,29 @@ clean test copy written
 +    if (kernel_number == 0) return kSimd;
      return params.engineInfo.arch >= gpu_arch::xe2 ? kSimd : 8;
  }
--static size_t wg_of(const fully_connected_params& params, int kernel_number) {
--    if (kernel_number != 0) return kColumnGroups;
++// Decode (kernel 0): a work-group per group of output rows, subgroups with their lanes
++// along K -- llama.cpp's shape (DESIGN 7.0.2bc). Measured per architecture at steady state
++// (DESIGN 7.0.2be): on Xe2 four subgroups beat eight and two, the K = 17,408 down
++// projection wants the activation block shared by 16 rows and the K = 5,120 shapes the
++// work-group count of 4 rows; on Xe-HPG the K = 5,120 shapes take the same 4 x 4, the
++// long-K projections 8 rows x 8 subgroups (16 x 4 there was 45 % slower on Q6_K).
++static bool long_k(const fully_connected_params& params) { return params.kquant_k > 8192; }
++static size_t rows_per_group(const fully_connected_params& params) {
++    if (!long_k(params)) return 4;
++    return params.engineInfo.arch >= gpu_arch::xe2 ? 16 : 8;
++}
+ static size_t wg_of(const fully_connected_params& params, int kernel_number) {
+     if (kernel_number != 0) return kColumnGroups;
 -    const size_t columns = CeilDiv(params.kquant_n, simd_of(params));
 -    const size_t blocks = params.kquant_k / (params.kquant_type == 8 ? 32 : 256);  // super-blocks per row
 -    size_t wg = CeilDiv(decode_threads_of(params), std::max<size_t>(columns, 1));
 -    wg = std::min({wg, kMaxSubgroups, std::max<size_t>(blocks, 1)});
 -    return std::max<size_t>(wg, 1);
-+// Decode (kernel 0): a work-group per group of output rows, kRowSubgroups subgroups with
-+// their lanes along K -- llama.cpp's shape (DESIGN 7.0.2bc). Measured on the 24 GB card:
-+// four subgroups beat eight and two; the K = 17,408 down projection wants the activation
-+// block shared by 16 rows, the K = 5,120 shapes want the work-group count of 4 rows.
-+static constexpr size_t kRowSubgroups = 4;
-+static size_t rows_per_group(const fully_connected_params& params) {
-+    return params.kquant_k > 8192 ? 16 : 4;
-+}
-+static size_t wg_of(const fully_connected_params&, int kernel_number) {
-+    return kernel_number == 0 ? kRowSubgroups : kColumnGroups;
++    return (long_k(params) && params.engineInfo.arch < gpu_arch::xe2) ? 8 : 4;
  }
  
  // Rows of the activation: flattened [M, K] (batch) or [B, M, K] (batch x feature).
-@@ -85,6 +79,7 @@
+@@ -85,6 +83,7 @@
  DeviceFeaturesKey FullyConnected_kquant::get_required_device_features_key(const Params& params) const {
      auto k = get_common_subgroups_device_features_key(params);
      k.requires_blocked_read_write_short();  // block reads of the activation rows
@@ -457,7 +463,7 @@ clean test copy written
      return k;
  }
  
-@@ -120,16 +115,19 @@
+@@ -120,16 +119,19 @@
      DispatchData d;
      d.tile_m = static_cast<uint32_t>(tile_m_of(kernel_number));
      d.tile_n = static_cast<uint32_t>(wg_of(params, kernel_number));  // subgroups per work-group, not a column tile
@@ -484,7 +490,7 @@ clean test copy written
      return d;
  }
  
-@@ -147,6 +145,9 @@
+@@ -147,6 +149,9 @@
      jit.AddConstant(MakeJitConstant("TILE_M", static_cast<size_t>(dispatchData.tile_m)));
      jit.AddConstant(MakeJitConstant("KQ_WG", static_cast<size_t>(dispatchData.tile_n)));
      jit.AddConstant(MakeJitConstant("SIMD", static_cast<size_t>(dispatchData.tile_mk)));
