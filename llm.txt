@@ -71,8 +71,11 @@ and 3 sub-4-bit follow); 0.4.1 = the GGUF path at the card's speed
 451 t/s prefill and 54.9 / 73.3 ms decode steps at 856 / 71,727 tokens
 against the IR's 1,609 / 552 and 43.3 / 60.6 -- the gate met at depth,
 missed at 1k prefill; the native form meets decode at 15.22 GiB); 0.4.2 =
-the runtime's int4 gemm on the repacked set (the larger half of the 1k
-prefill); 0.4.3 = the tiled K-quant kernel's next 30 % (work-group size,
+the runtime's int4 gemm on the repacked set (tagged 2026-09-07 on +p11: the
+gemm at 88 % of the card's f16 matrix roof, int8 activations dead at 32-wide
+groups, the 1k prefill gate unreachable through it; --gguf-mins split as a
+decode lever, 53.5 / 72.2 ms steps at 1k / 71.7k, 16.30 GiB, warm prefill
+967 t/s; DESIGN 7.0.2bo); 0.4.3 = the tiled K-quant kernel's next 30 % (work-group size,
 the 2D prefetch, a per-type tile); 0.4.4 = the Q5_K decode rate; 0.5.0 = Qwen Flash Next
 (docs/milestone-0.5.0.md; recon pins the checkpoint and its config deltas
 first; gate: loads on both cards, Prüfstand, depth ladder, drafters measured

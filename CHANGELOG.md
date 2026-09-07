@@ -17,11 +17,12 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
-## Unreleased — 0.4.2 in progress (2026-09-07)
+## 0.4.2 — 2026-09-07
 
-Runtime: `marfrit-openvino +p11` unchanged; no plugin patch in this
-increment. Measured on the 24 GB card, dense Qwen3.8-27B Q4_K_M, `u8`
-KV, one fresh process per cell (DESIGN §7.0.2bo):
+Requires `marfrit-openvino 2026.4.0~dev20260821+p11` unchanged; no
+plugin patch in this release. Measured on the 24 GB card, dense
+Qwen3.8-27B Q4_K_M, `u8` KV, one fresh process per cell (DESIGN
+§7.0.2bo):
 
 - The runtime's int4 gemm on the repacked Q4_K set -- 47 % of the
   856-token prefill's device time -- runs at 86 TFLOP/s, 88 % of the

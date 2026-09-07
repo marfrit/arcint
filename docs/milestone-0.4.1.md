@@ -296,3 +296,14 @@ to keep on the other card.
   forms byte-identical. Carried as point releases: 0.4.2 the repacked
   set's gemm, 0.4.3 the tiled kernel's next 30 %, 0.4.4 the Q5_K decode
   rate (the handoff has the measurements each starts from).
+- 2026-09-07 — **tagged 0.4.2** on `+p11` (no plugin change; DESIGN
+  §7.0.2bo). The repacked set's gemm measured at 88 % of the card's f16
+  matrix roof from its disassembly beside the IR's int8 kernel; int8
+  activations dead at the K-quant's 32-wide groups (three forms
+  measured); the 1k prefill gate (1,100 t/s) closed as unreachable
+  through this gemm -- what the prefill has left is 0.4.3's tiled share.
+  `--gguf-mins split` (the min term as a separate f16 term, exact-class):
+  decode 55.05 → 53.53 ms at 1k, 73.3 → 72.17 at 71.7k, 16.30 GiB, warm
+  prefill 967 vs 948 t/s, 10/10, the 1k output byte-identical; the
+  default stays exact. Every 0.4.1 1k prefill figure was a first request
+  of a process (kernel compilation): 907 there is 948 warm.

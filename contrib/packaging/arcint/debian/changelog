@@ -1,3 +1,21 @@
+arcint (0.4.2-1) trixie; urgency=medium
+
+  * 0.4.2: the runtime's int4 gemm on the repacked set measured at the
+    card's f16 rate (88 % of the matrix roof, read from its disassembly
+    beside the Intel IR's int8 kernel); int8 activations measured dead at
+    the K-quant's 32-wide groups (--dyn-quant on: gemm 413/411 ms against
+    420 at f16), the 0.4.2 prefill gate closed as unreachable through this
+    gemm. New: --gguf-mins split, the min term as a separate f16 term on
+    the activation's group sums (exact-class, a measured bound of twice
+    the exact one, refused over): decode step 55.05 -> 53.53 ms at 856
+    tokens and 73.3 -> 72.17 at 71,727, resident 16.54 -> 16.30 GiB, warm
+    prefill 967 vs 948 t/s, Pruefstand 10/10, the 1k output byte-identical;
+    the default stays exact. ARCINT_DYN_QUANT_GROUP measurement switch;
+    --help lists the GGUF flags. Requires marfrit-openvino +p11 unchanged
+    (no plugin patch). DESIGN 7.0.2bo.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Mon, 07 Sep 2026 23:10:00 +0200
+
 arcint (0.4.1-1) trixie; urgency=medium
 
   * 0.4.1: the GGUF path at the card's speed, as far as it got. Requires
