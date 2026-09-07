@@ -1,0 +1,186 @@
+# K-quant type 114: Q6_K in 224-byte blocks (arcint's dword-aligned layout of the file's rows)
+
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0003-0025. arcint 0.4.1 (DESIGN.md section 7.0.2bj).
+#
+# What changes:
+#   fully_connected_kernel_kquant.cpp, fully_connected_kquant.cpp (ops), fully_connected.cpp
+#                       (graph): a second Q6_K type id, 114, whose row is 224 bytes per
+#                       super-block -- the file's 210 bytes then 14 zero bytes, laid out by arcint
+#                       at load (--gguf-q6k aligned, its default) so every block is dword-aligned.
+#   fully_connected_gpu_kquant.cl   KQ_TYPE 114 takes Q6_K's decoders at the 224-byte stride; the
+#                       decode dispatch and the Xe2 prefetch as for 14.
+#   kquant_utils.cl     kq_row_q6k_x: for type 114 the block is dword-aligned by layout, so the
+#                       odd-block shuffle-down path of 0025 compiles out.
+#   fully_connected_gpu_test.cpp   The host reference and the random blocks at the 224-byte
+#                       stride; two correctness cases (type 114 at one row, and at nineteen 3-D);
+#                       the timing test's two Q6_K shapes at type 114.
+#
+# MEASURED streamed at steady state (the timing test of 0023, every process warmed once, one
+# row) against type 14 under 0025 in the same run, 2026-09-07:
+#   24 GB card (Xe2):     down projection N 5,120 x K 17,408: 204 us (114) against 262 (14);
+#                         N 1,024 x K 5,120: 27 against 27.
+#   16 GiB card (Xe-HPG): down projection 247 against 260; N 1,024: 27 against 28.
+# Correctness 16/16 on both cards. Served on the 24 GB card (mixed form, u8 KV, +p9 base, the
+# file-row control in the same window): greedy outputs byte-identical at 856 and 71,727 tokens,
+# Pruefstand 10/10 (17.0 t/s over its 1,145 tokens); prefill 531 t/s at 856 tokens against 418
+# and 335 at 71,727 against 291 (the tiled variant's vector loads were paying for the 2-byte
+# alignment too); the decode step 59.8 ms against 60.8 at 856 tokens and 77.7 against 79.9 at
+# 71,727 -- the long-K down projections' gain; the K = 5,120 Q6_K shapes (the lm_head among
+# them) are on the short-K dispatch and do not move. Resident 16.26 -> 16.54 GiB.
+
+--- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
+@@ -46,9 +46,12 @@
+ #  define KQ_BLOCK_BYTES 176
+ #  define KQ_SUBS 8
+ #  define KQ_DECODE(blk, s, y) kq_dec_q5_K_sub(blk, s, y)
+-#elif KQ_TYPE == 14
++#elif KQ_TYPE == 14 || KQ_TYPE == 114
++// 114: Q6_K in 224-byte blocks -- the file's 210 bytes then 14 zero bytes per super-block, laid
++// out by arcint at load so every block is dword-aligned (patch 0026, DESIGN 7.0.2bj). The same
++// decoders at a wider stride; the decode row takes its even path without the shuffles.
+ #  define KQ_BLOCK 256
+-#  define KQ_BLOCK_BYTES 210
++#  define KQ_BLOCK_BYTES (KQ_TYPE == 114 ? 224 : 210)
+ #  define KQ_SUBS 8
+ #  define KQ_DECODE(blk, s, y) kq_dec_q6_K_sub(blk, s, y)
+ #else
+@@ -178,7 +181,7 @@
+             float8 xp;
+             __attribute__((opencl_unroll_hint(8)))
+             for (uint s = 0; s < 8; ++s) xp[s] = x[2 * s] + x[2 * s + 1];
+-#elif KQ_TYPE == 14
++#elif KQ_TYPE == 14 || KQ_TYPE == 114
+             // the two 128-value halves as dwords: lane l gets run r's positions 2l, 2l + 1
+             const uint4 xa = intel_sub_group_block_read4((const __global uint*)xsb);
+             const uint4 xb = intel_sub_group_block_read4((const __global uint*)(xsb + 128));
+@@ -187,7 +190,7 @@
+             __attribute__((opencl_unroll_hint(KQ_ROWS)))
+             for (uint rr = 0; rr < KQ_ROWS; ++rr) {
+                 const __global uchar* blk = weights + (ulong)min(n0 + rr, (uint)KQ_N - 1) * KQ_ROW_BYTES + kb * KQ_BLOCK_BYTES;
+-#if KQ_TYPE == 14 && KQ_PREFETCH
++#if (KQ_TYPE == 14 || KQ_TYPE == 114) && KQ_PREFETCH
+                 // Q6_K on Xe2: this subgroup's next super-block of the row prefetched, one cache
+                 // line per lane. Measured: the Q6_K down projection 500 -> 398 us on the 24 GB
+                 // card; the Q4_K/Q5_K shapes lose 15-45 % with the same prefetch and do not get
+@@ -202,7 +205,7 @@
+                 acc[rr] = fma(mask, kq_row_q4k_x(blk, lane, x, xp, 0u), acc[rr]);
+ #elif KQ_TYPE == 13
+                 acc[rr] = fma(mask, kq_row_q4k_x(blk, lane, x, xp, 1u), acc[rr]);
+-#elif KQ_TYPE == 14
++#elif KQ_TYPE == 14 || KQ_TYPE == 114
+                 // the last block of the last row: its scale read must not run past the buffer
+                 acc[rr] = fma(mask, kq_row_q6k_x(blk, lane, x,
+                                                  (uint)(min(n0 + rr, (uint)KQ_N - 1) == (uint)KQ_N - 1 && kb == (uint)KQ_BLOCKS - 1)),
+--- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/include/batch_headers/kquant_utils.cl
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/include/batch_headers/kquant_utils.cl
+@@ -287,7 +287,11 @@
+ // and d are then constant-index broadcasts. The tail read runs 12-14 bytes past the block; on
+ // the last block of the last row (`last`, uniform) each lane loads its own word instead.
+ inline float kq_row_q6k_x(const __global uchar* blk, uint lane, float16 x, uint last) {
++#if KQ_TYPE == 114
++    const uint odd = 0u;                                    // 224-byte blocks: dword-aligned by layout (patch 0026)
++#else
+     const uint odd = ((uint)(ulong)blk >> 1) & 1u;          // the block starts two bytes past a dword
++#endif
+     const __global uchar* b4 = blk - 2 * odd;
+     ushort4 q = intel_sub_group_block_read_us4((const __global ushort*)b4);           // ql: words l, l+16, l+32, l+48 of b4
+     ushort2 hq = intel_sub_group_block_read_us2((const __global ushort*)(b4 + 128));  // qh: words 64+l, 80+l
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_kquant.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_kquant.cpp
+@@ -54,6 +54,7 @@
+         case 12: return k % 256 ? 0 : (k / 256) * 144;  // Q4_K
+         case 13: return k % 256 ? 0 : (k / 256) * 176;  // Q5_K
+         case 14: return k % 256 ? 0 : (k / 256) * 210;  // Q6_K
++        case 114: return k % 256 ? 0 : (k / 256) * 224; // Q6_K in 224-byte blocks (arcint's layout, patch 0026)
+         default: return 0;
+     }
+ }
+--- a/src/plugins/intel_gpu/src/plugin/ops/fully_connected_kquant.cpp
++++ b/src/plugins/intel_gpu/src/plugin/ops/fully_connected_kquant.cpp
+@@ -25,6 +25,7 @@
+         case 12: return k % 256 ? 0 : (k / 256) * 144;
+         case 13: return k % 256 ? 0 : (k / 256) * 176;
+         case 14: return k % 256 ? 0 : (k / 256) * 210;
++        case 114: return k % 256 ? 0 : (k / 256) * 224;  // Q6_K in 224-byte blocks (arcint's layout, patch 0026)
+         default: return 0;
+     }
+ }
+--- a/src/plugins/intel_gpu/src/graph/fully_connected.cpp
++++ b/src/plugins/intel_gpu/src/graph/fully_connected.cpp
+@@ -106,7 +106,8 @@
+         // (a missing kernel at impl selection would terminate the process from a worker thread).
+         const auto t = desc->kquant_type; const auto k = desc->kquant_k;
+         const size_t row_bytes = t == 8 ? (k % 32 ? 0 : (k / 32) * 34) : t == 12 ? (k % 256 ? 0 : (k / 256) * 144)
+-                               : t == 13 ? (k % 256 ? 0 : (k / 256) * 176) : t == 14 ? (k % 256 ? 0 : (k / 256) * 210) : 0;
++                               : t == 13 ? (k % 256 ? 0 : (k / 256) * 176) : t == 14 ? (k % 256 ? 0 : (k / 256) * 210)
++                               : t == 114 ? (k % 256 ? 0 : (k / 256) * 224) : 0;  // 114: Q6_K in 224-byte blocks (patch 0026)
+         const auto wp = weights_layout.get_partial_shape();
+         const size_t total = wp.is_static() ? ov::shape_size(wp.to_shape()) : 0;
+         OPENVINO_ASSERT(row_bytes != 0 && desc->kquant_n != 0 && total == desc->kquant_n * row_bytes,
+@@ -210,7 +211,8 @@
+         // (a missing kernel at impl selection would terminate the process from a worker thread).
+         const auto t = desc->kquant_type; const auto k = desc->kquant_k;
+         const size_t row_bytes = t == 8 ? (k % 32 ? 0 : (k / 32) * 34) : t == 12 ? (k % 256 ? 0 : (k / 256) * 144)
+-                               : t == 13 ? (k % 256 ? 0 : (k / 256) * 176) : t == 14 ? (k % 256 ? 0 : (k / 256) * 210) : 0;
++                               : t == 13 ? (k % 256 ? 0 : (k / 256) * 176) : t == 14 ? (k % 256 ? 0 : (k / 256) * 210)
++                               : t == 114 ? (k % 256 ? 0 : (k / 256) * 224) : 0;  // 114: Q6_K in 224-byte blocks (patch 0026)
+         const auto wp = weights_layout.get_partial_shape();
+         const size_t total = wp.is_static() ? ov::shape_size(wp.to_shape()) : 0;
+         OPENVINO_ASSERT(row_bytes != 0 && desc->kquant_n != 0 && total == desc->kquant_n * row_bytes,
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/fully_connected_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/fully_connected_gpu_test.cpp
+@@ -6567,7 +6567,7 @@
+         else { d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
+     }
+     static size_t row_bytes(int t, size_t k) {
+-        switch (t) { case 8: return k / 32 * 34; case 12: return k / 256 * 144; case 13: return k / 256 * 176; case 14: return k / 256 * 210; }
++        switch (t) { case 8: return k / 32 * 34; case 12: return k / 256 * 144; case 13: return k / 256 * 176; case 14: return k / 256 * 210; case 114: return k / 256 * 224; }
+         return 0;
+     }
+     static void dequant_row(int t, const uint8_t* row, size_t k, float* y) {
+@@ -6594,8 +6594,8 @@
+                     for (int l = 0; l < 32; ++l) yb[j + 32 + l] = d2 * ((qs[l] >> 4) + (t == 13 && (qh[l] & u2) ? 16 : 0)) - m2;
+                     qs += 32; is += 2; u1 <<= 2; u2 <<= 2;
+                 }
+-            } else {  // Q6_K
+-                const uint8_t* q = row + b * 210;
++            } else {  // Q6_K (14: the file's 210-byte blocks; 114: arcint's 224-byte blocks, 14 zero bytes after each)
++                const uint8_t* q = row + b * (t == 114 ? 224 : 210);
+                 const uint8_t* ql = q; const uint8_t* qh = q + 128; const int8_t* sc = reinterpret_cast<const int8_t*>(q + 192);
+                 const float d = f16(q + 208);
+                 for (int n = 0; n < 256; n += 128) {
+@@ -6621,11 +6621,12 @@
+         std::vector<uint8_t> bytes = rg.generate_random_1d<uint8_t>(n * rb, 0, 255);
+         auto put_f16 = [&](size_t off, float v) { const uint16_t b = ov::float16(v).to_bits(); bytes[off] = b & 0xFF; bytes[off + 1] = b >> 8; };
+         for (size_t r = 0; r < n; ++r) {
+-            for (size_t blk = 0; blk < rb / (t == 8 ? 34 : (t == 12 ? 144 : (t == 13 ? 176 : 210))); ++blk) {
+-                const size_t base = r * rb + blk * (t == 8 ? 34 : (t == 12 ? 144 : (t == 13 ? 176 : 210)));
++            const size_t bs = t == 8 ? 34 : (t == 12 ? 144 : (t == 13 ? 176 : (t == 14 ? 210 : 224)));
++            for (size_t blk = 0; blk < rb / bs; ++blk) {
++                const size_t base = r * rb + blk * bs;
+                 const float sd = 0.001f + 0.004f * static_cast<float>(rg.generate_random_1d<uint8_t>(1, 0, 255)[0]) / 255.f;
+                 if (t == 8) put_f16(base, sd * 8);
+-                else if (t == 14) put_f16(base + 208, sd * 0.25f);
++                else if (t == 14 || t == 114) put_f16(base + 208, sd * 0.25f);
+                 else { put_f16(base, sd); put_f16(base + 2, sd * 0.5f); }
+             }
+         }
+@@ -6702,6 +6703,7 @@
+     ::testing::Values(std::make_tuple(12, 1L, false, 512, 48), std::make_tuple(12, 37L, false, 512, 48),
+                       std::make_tuple(12, 5L, true, 512, 48), std::make_tuple(13, 3L, false, 512, 48),
+                       std::make_tuple(14, 1L, false, 512, 48), std::make_tuple(14, 19L, true, 512, 48),
++                      std::make_tuple(114, 1L, false, 512, 48), std::make_tuple(114, 19L, true, 512, 48),
+                       std::make_tuple(8, 2L, false, 512, 48), std::make_tuple(8, 1L, false, 512, 48), std::make_tuple(13, 1L, false, 768, 48),
+                       std::make_tuple(12, 100L, true, 1280, 300), std::make_tuple(14, 65L, false, 256, 17),
+                       std::make_tuple(8, 1L, false, 96, 5), std::make_tuple(13, 33L, true, 768, 64)));
+@@ -6739,7 +6741,7 @@
+     // the attention output Q5_K, the down projection Q6_K).
+     const std::vector<std::tuple<int, size_t, size_t, std::vector<long>>> shapes = {
+         {12, 17408, 5120, {1L, 32L, 256L, 2048L}}, {12, 1024, 5120, {1L}}, {12, 5120, 5120, {1L}}, {12, 5120, 17408, {1L}},
+-        {13, 5120, 5120, {1L}}, {14, 5120, 17408, {1L}}, {14, 1024, 5120, {1L}}};
++        {13, 5120, 5120, {1L}}, {14, 5120, 17408, {1L}}, {14, 1024, 5120, {1L}}, {114, 5120, 17408, {1L}}, {114, 1024, 5120, {1L}}};
+     const int rotation = 8;
+     for (const auto& sh : shapes) {
+     const int t = std::get<0>(sh);

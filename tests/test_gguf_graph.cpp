@@ -15,6 +15,7 @@
 #include "harness.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 
 #include <openvino/core/model.hpp>
@@ -119,7 +120,8 @@ TEST(gguf_pass_replaces_the_exporters_chains_with_kquant_ops_that_alias_the_file
     Toy toy = toy_template();
     CHECK_EQ(ops_of<ov::op::v0::MatMul>(toy.model).size(), static_cast<size_t>(4));
 
-    const GgufApplyReport rep = gguf_apply_to_template(toy.model, file, toy_geometry(), GgufWeightsMode::Native);
+    // The file's own rows for every type (--gguf-q6k file): this case is about aliasing.
+    const GgufApplyReport rep = gguf_apply_to_template(toy.model, file, toy_geometry(), GgufWeightsMode::Native, "", "", false);
     CHECK_EQ(rep.replaced.size(), static_cast<size_t>(4));
     CHECK_EQ(ops_of<ov::op::v0::MatMul>(toy.model).size(), static_cast<size_t>(0));
     const auto kq = ops_of<FullyConnectedKQuant>(toy.model);
@@ -308,6 +310,41 @@ TEST(gguf_pass_keeps_a_passed_deviation_verdict_between_loads_of_the_same_file) 
     CHECK_EQ(c.repack_verdicts_cached, size_t{0});
     CHECK_EQ(c.repack_checked, a.repack_checked);
     std::filesystem::remove_all(dir);
+}
+
+// The native Q6_K rows are laid out in 224-byte blocks by default (kquant type 114: the file's
+// 210 bytes then 14 zero bytes per super-block, every block dword-aligned, DESIGN §7.0.2bj);
+// --gguf-q6k file keeps the file's rows (type 14). The fixture's ffn_down is Q6_K with one
+// block per row, so consecutive rows alternate the block parity the layout removes.
+TEST(gguf_pass_lays_q6k_rows_out_in_224_byte_blocks_by_default_and_keeps_the_files_rows_on_request) {
+    auto file = std::make_shared<gguf::GgufFile>(gguf::GgufFile::open(fixture()));
+    const auto* t = file->tensor("blk.0.ffn_down.weight");
+    CHECK(t != nullptr);
+    if (!t) return;
+    CHECK_EQ(t->ggml_type, static_cast<int32_t>(gguf::GgmlType::Q6_K));
+    const uint8_t* src = file->data(*t);
+    for (int aligned = 1; aligned >= 0; --aligned) {
+        auto x = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 256});
+        auto y = projection(x, "mlp.down_proj", 512, 256);
+        auto model = std::make_shared<ov::Model>(ov::ResultVector{std::make_shared<ov::op::v0::Result>(y)}, ov::ParameterVector{x}, "down");
+        const GgufApplyReport rep = gguf_apply_to_template(model, file, toy_geometry(), GgufWeightsMode::Native, "", fixture(), aligned != 0);
+        CHECK_EQ(rep.q6k_aligned, aligned);
+        const auto ops = ops_of<FullyConnectedKQuant>(model);
+        CHECK_EQ(ops.size(), size_t{1});
+        if (ops.empty()) continue;
+        CHECK_EQ(ops[0]->kquant_type(), static_cast<int64_t>(aligned ? 114 : 14));
+        auto w = std::dynamic_pointer_cast<ov::op::v0::Constant>(ops[0]->input_value(1).get_node_shared_ptr());
+        CHECK(w != nullptr);
+        if (!w) continue;
+        const size_t stride = aligned ? 224 : 210;
+        CHECK_EQ(w->get_shape()[0], size_t{512});
+        CHECK_EQ(w->get_shape()[1], stride);
+        const uint8_t* bytes = w->get_data_ptr<uint8_t>();
+        for (size_t row : {size_t{0}, size_t{3}, size_t{511}}) {
+            CHECK_EQ(std::memcmp(bytes + row * stride, src + row * 210, 210), 0);
+            if (aligned) for (size_t i = 210; i < 224; ++i) CHECK_EQ(static_cast<int>(bytes[row * 224 + i]), 0);
+        }
+    }
 }
 
 // The logits slice (DESIGN §7.0.2e) walks from the first Result to the LM

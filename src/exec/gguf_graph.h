@@ -58,6 +58,7 @@ struct GgufReplacement {
 };
 
 struct GgufApplyReport {
+    int q6k_aligned = 0;         // native Q6_K projections laid out in 224-byte blocks (type 114)
     std::vector<GgufReplacement> replaced;
     std::vector<std::string>     kept;      // IR constants deliberately left as the template's (by role)
     size_t bytes_from_file = 0;             // the K-quant bytes now in the graph (native) or the repacked bytes
@@ -96,11 +97,14 @@ struct GgufApplyReport {
 // skips the check it already passed -- the exhaustive check is most of a
 // 406 s load on the dense model (DESIGN 7.0.2bd); a verdict is only ever
 // written for a projection that passed.
+// q6k_aligned: the native Q6_K rows laid out in 224-byte blocks (kquant type 114) instead of
+// the file's 210-byte rows (+6.7 % on that set; DESIGN 7.0.2bj).
 GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
                                        const std::shared_ptr<gguf::GgufFile>& file,
                                        const GgufGeometry& geometry,
                                        GgufWeightsMode mode = GgufWeightsMode::Repack,
                                        const std::string& verdict_dir = "",
-                                       const std::string& file_path = "");
+                                       const std::string& file_path = "",
+                                       bool q6k_aligned = true);
 
 }  // namespace lgc

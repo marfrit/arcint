@@ -237,3 +237,11 @@ to keep on the other card.
   decode 13.4 → 15.3 t/s at 856 tokens and 9.6 → 11.9 at 71.7k (the
   step 70.6 → 61.0 and 88.2 → 79.9 ms). The decode bar (51.8 ms) is
   9 ms away; the 224-byte layout is next.
+- 2026-09-07 — **the native Q6_K rows in 224-byte blocks** (DESIGN
+  §7.0.2bj, patch 0026, `--gguf-q6k`): the long-K decode 262 → 204 µs
+  as the probe predicted, 16/16, byte-identical, 10/10; served, the
+  prefill 418 → 531 t/s at 1k and 291 → 335 at 71.7k (the tiled
+  variant's loads were paying for the alignment too), the decode step
+  60.8 → 59.8 and 79.9 → 77.7 ms — the 33 Q6_K tensors with K = 5,120
+  (the lm_head among them) sit on the short-K dispatch and did not
+  move: the next thing to time on the served step's timeline.

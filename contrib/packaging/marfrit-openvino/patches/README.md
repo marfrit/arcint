@@ -486,6 +486,23 @@ the mixed form's decode 13.4 → 15.3 t/s at 856 tokens and 9.6 → 11.9 at
 
 Package: not yet built (`+p10`).
 
+### 0026-kquant-q6k-224-byte-blocks.patch
+
+A second Q6_K type id (114) whose super-blocks are 224 bytes — the
+file's 210 then 14 zero bytes, laid out by arcint at load
+(`--gguf-q6k aligned`, the default) so every block is dword-aligned and
+0025's decode row takes its shuffle-free path unconditionally; the
+same decoders at the wider stride (DESIGN §7.0.2bj). Exact, 16/16 on
+both cards, served outputs byte-identical, Prüfstand 10/10. Measured
+streamed at steady state: the Q6_K down projection 262 → 204 µs on the
+24 GB card (the probe's 183–210 prediction) and 260 → 247 on the 16 GiB
+card; the K = 5,120 shapes unchanged. Served, the mixed form's prefill
+418 → 531 t/s at 856 tokens and 291 → 335 at 71,727 (the tiled
+variant's loads were paying for the alignment too), the decode step
+1–2 ms shorter; 6.7 % more bytes on the Q6_K set.
+
+Package: not yet built (`+p10`).
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.

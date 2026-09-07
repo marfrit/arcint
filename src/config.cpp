@@ -418,6 +418,11 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             else if (v == "mixed") cfg.gguf_mode = 2;
             else return fail("--gguf-mode needs repack, native or mixed");
             cfg.gguf_native = cfg.gguf_mode == 1;
+        } else if (arg == "--gguf-q6k") {
+            if (!value(v)) return fail("--gguf-q6k needs aligned or file");
+            if (v == "aligned") cfg.gguf_q6k_aligned = true;
+            else if (v == "file") cfg.gguf_q6k_aligned = false;
+            else return fail("--gguf-q6k needs aligned or file");
         } else if (arg == "--gguf-embed") {
             if (!value(v)) return fail("--gguf-embed needs file or template");
             if (v == "file") cfg.gguf_embed_file = true;

@@ -19,6 +19,19 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+- **0.4.1, the native Q6_K rows in 224-byte blocks** (DESIGN §7.0.2bj,
+  plugin patch 0026, `--gguf-q6k aligned|file`, default `aligned`; not
+  yet in a built package). The Q6_K rows of a GGUF-opened model are laid
+  out at load in 224-byte super-blocks (the file's 210 bytes then 14
+  zero bytes; kquant type 114) so every block is dword-aligned and the
+  decode row needs no shuffle; 6.7 % more bytes on that set (the
+  reference model 16.26 → 16.54 GiB resident). Exact, 16/16 on both
+  cards, served outputs byte-identical, Prüfstand 10/10 at 17.0 t/s.
+  The Q6_K down projection 262 → 204 µs on the 24 GB card; served, the
+  mixed form's prefill 418 → 531 t/s at 856 tokens and 291 → 335 at
+  71,727, the decode step 60.8 → 59.8 and 79.9 → 77.7 ms. The K = 5,120
+  Q6_K shapes, the lm_head among them, are on the short-K dispatch and
+  did not move.
 - **0.4.1, the Q6_K decode row without variable-index shuffles** (DESIGN
   §7.0.2bi, plugin patch 0025, not yet in a built package). The ISA of
   the sixteen-row decode bodies counted (`tools/igadis.cpp`): the Q6_K

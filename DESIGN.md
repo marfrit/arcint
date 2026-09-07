@@ -7309,6 +7309,62 @@ new kernel.
 
 Retracted here (§7.0.1): nothing.
 
+#### 7.0.2bj 0.4.1, the native Q6_K rows in 224-byte blocks (patch 0026, `--gguf-q6k`): the long-K decode at the probe's prediction, the prefill up a quarter, and the K = 5,120 shapes untouched (2026-09-07)
+
+The layout §7.0.2bh designed and §7.0.2bi made a stride away: the
+native Q6_K rows laid out at load in 224-byte super-blocks — the
+file's 210 bytes, then 14 zero bytes — so every block is dword-aligned
+and the decode row of patch 0025 takes its even path with no shuffle
+at all. On the plugin side a second Q6_K type id (114) whose row is
+224 bytes per super-block and whose decoders are the existing ones at
+the wider stride; on arcint's side the copy at load
+(`--gguf-q6k aligned`, the default; `file` keeps the file's rows and
+type 14), 6.7 % more bytes on that set (4,243 → 4,525 MiB, the model
+16.26 → 16.54 GiB resident), one memcpy per super-block, and the
+correctness case on the fixture's own Q6_K tensor for both settings.
+The plugin's correctness set grows by two cases (type 114 at one row
+and at nineteen, 3-D).
+
+**Measured** (the streamed timing test, warmed; 16/16 on both cards):
+
+| Q6_K decode, µs | 24 GB card, file rows (0025) | 24 GB card, 224-byte blocks | 16 GiB card, file rows | 16 GiB card, 224-byte blocks |
+|---|---|---|---|---|
+| down projection, N 5,120 × K 17,408 | 262 | **204** (383 GB/s of the padded bytes, 359 of the file's) | 260 | **247** |
+| N 1,024 × K 5,120 | 27 | 27 | 28 | 27 |
+
+The probe's prediction for the long-K shape was 183–210 µs; 204. The
+K = 5,120 shape does not move on either card. Served on the 24 GB
+card, mixed form, `u8` KV, one fresh process per cell, the file-row
+control in the same window:
+
+| mixed form | prefill | decode (64 tokens) | step | Prüfstand | resident, max ctx at `u8` |
+|---|---|---|---|---|---|
+| 856 tokens, file rows (control) | 418 t/s | 15.5 t/s | 60.8 ms | — | 16.26 GiB, 79k |
+| 856 tokens, 224-byte blocks | **531** | 15.5 | 59.8 | 10/10 at **17.0** | 16.54 GiB, 71k |
+| 71,727 tokens, file rows (§7.0.2bi) | 291 | 11.9 | 79.9 | — | —, 109k |
+| 71,727 tokens, 224-byte blocks | **335** | 10.3 (64 tokens; the step is the figure) | **77.7** | — | —, 101k |
+
+Greedy outputs byte-identical to the file rows' at both depths
+(23e06c37e0d6, 086d5e71ad47). Two readings. The decode step moved 1–2
+ms where the long-K gain alone (32 down projections × 58 µs) is 1.9:
+the layout does what it does for the down projections and nothing for
+the other 33 Q6_K tensors of the set, which have K = 5,120 — the
+attention-side projections and the lm_head (248,320 × 5,120, 1.04 GB
+per step) — and run on the short-K dispatch (4 rows × 4 subgroups),
+where the N 1,024 timing above is near the launch floor and says
+nothing about the lm_head's rate; that is the next thing to time, on
+the served step's device timeline. And the prefill gained a quarter
+at 1k and 15 % at depth without a kernel change: the tiled variant's
+vector loads of the block were paying for the 2-byte alignment as
+well, which no prefill measurement had isolated. Against the
+operator's bars the mixed form stands at 40 % of the prefill bar at
+1k (531 of 1,341) and 73 % at depth (335 of 460), and at 59.8 ms
+against the decode bar's 51.8.
+
+Retracted here (§7.0.1): nothing; §7.0.2bh's "about 5 ms per step"
+for this layout was the long-K figure applied to the whole set, and
+is corrected above to what it is.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

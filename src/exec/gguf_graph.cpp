@@ -154,6 +154,7 @@ std::string GgufApplyReport::summary() const {
         if (repack_verdicts_cached != 0) s << " (" << repack_verdicts_cached << " verdict(s) from an earlier load)";
         s << "; repack " << static_cast<int>(repack_seconds) << " s, check " << static_cast<int>(check_seconds) << " s";
     }
+    if (q6k_aligned != 0) s << "; " << q6k_aligned << " Q6_K projection(s) in 224-byte blocks";
     s << "; " << kept.size() << " constant(s) kept from the template; " << awq_scales_neutralized
       << " AWQ activation scale(s) set to one; " << norms_compared << " norm(s) compared with the file, max |diff| "
       << norms_max_abs_diff;
@@ -248,7 +249,8 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
                                        const GgufGeometry& g,
                                        GgufWeightsMode mode,
                                        const std::string& verdict_dir,
-                                       const std::string& file_path) {
+                                       const std::string& file_path,
+                                       bool q6k_aligned) {
     GgufApplyReport rep;
     rep.mode = mode;
     using wall = std::chrono::steady_clock;
@@ -381,6 +383,22 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
                 }
                 replacement = repacked_matmul(widen_activation(act_out, packed, widened, name), packed, mm, name);
                 r.bytes = packed.bytes();
+            } else if (q6k_aligned && t->ggml_type == static_cast<int32_t>(gguf::GgmlType::Q6_K)) {
+                // The file's 210-byte super-blocks are 2-aligned and a block read needs a dword
+                // (DESIGN 7.0.2bc, 7.0.2bh): laid out at 224 bytes each -- the block's bytes, then
+                // 14 zero bytes -- every block is dword-aligned and the decode row reads its own
+                // words with no shuffles (kquant type 114, DESIGN 7.0.2bj). +6.7 % on the Q6_K set.
+                const int64_t blocks = k / 256;
+                auto owner = std::make_shared<std::vector<uint8_t>>(static_cast<size_t>(n) * static_cast<size_t>(blocks) * 224, uint8_t{0});
+                const uint8_t* src = file->data(*t);
+                for (int64_t rb = 0; rb < n * blocks; ++rb)
+                    std::memcpy(owner->data() + static_cast<size_t>(rb) * 224, src + static_cast<size_t>(rb) * 210, 210);
+                auto w = std::make_shared<ov::op::v0::Constant>(ov::element::u8, ov::Shape{static_cast<size_t>(n), static_cast<size_t>(blocks) * 224},
+                                                                static_cast<const void*>(owner->data()), std::shared_ptr<void>(owner, owner->data()));
+                w->set_friendly_name(name + "/gguf_224");
+                replacement = std::make_shared<FullyConnectedKQuant>(act_out, w, 114, k, n);
+                r.bytes = owner->size();
+                rep.q6k_aligned++;
             } else {
                 auto w = u8_constant(file->data(*t), n, row_bytes, file);
                 w->set_friendly_name(name + "/gguf");

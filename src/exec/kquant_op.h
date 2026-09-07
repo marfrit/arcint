@@ -5,7 +5,10 @@
 // level +p7 (patch 0021) recognises it by type name only -- "FullyConnectedKQuant"
 // in "arcint_opset" -- and reads two runtime-info integers off the node, so
 // no class crosses the library boundary:
-//   arcint_kquant_type  the ggml type id (8 = Q8_0, 12 = Q4_K, 13 = Q5_K, 14 = Q6_K)
+//   arcint_kquant_type  the ggml type id (8 = Q8_0, 12 = Q4_K, 13 = Q5_K, 14 = Q6_K), or 114 =
+//                       Q6_K in 224-byte blocks: the file's 210 bytes then 14 zero bytes per
+//                       super-block, laid out at load so every block is dword-aligned (the
+//                       decode row then reads its own words without shuffles, DESIGN 7.0.2bj)
 //   arcint_kquant_k     the logical contraction size K
 // Inputs: (0) the activation [.., K], (1) the weights as a u8 constant
 // [N, row_bytes] holding the file's bytes verbatim, (2) an optional bias [N].
@@ -53,6 +56,7 @@ public:
             case 12: return k % 256 ? 0 : (k / 256) * 144;
             case 13: return k % 256 ? 0 : (k / 256) * 176;
             case 14: return k % 256 ? 0 : (k / 256) * 210;
+            case 114: return k % 256 ? 0 : (k / 256) * 224;
             default: return 0;
         }
     }

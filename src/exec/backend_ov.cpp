@@ -2397,7 +2397,7 @@ private:
         return std::string();
     }
     void apply_gguf_weights(const std::shared_ptr<ov::Model>& model, const std::string& path, int mode_flag,
-                            const std::string& verdict_dir, bool embed_from_file) {
+                            const std::string& verdict_dir, bool embed_from_file, bool q6k_aligned) {
         const GgufWeightsMode mode = mode_flag == 1 ? GgufWeightsMode::Native
                                    : mode_flag == 2 ? GgufWeightsMode::Mixed : GgufWeightsMode::Repack;
         auto file = std::make_shared<gguf::GgufFile>(gguf::GgufFile::open(path));
@@ -2430,7 +2430,7 @@ private:
         if (!ft.empty() && ft != artifact_.chat_template)
             log::info("load", "gguf: the file's chat template differs from the artifact's (%zu against %zu chars); the artifact's is served",
                       ft.size(), artifact_.chat_template.size());
-        gguf_report_ = gguf_apply_to_template(model, file, fg, mode, verdict_dir, path);
+        gguf_report_ = gguf_apply_to_template(model, file, fg, mode, verdict_dir, path, q6k_aligned);
         gguf_file_   = file;  // the constants alias its map; held for the compiled model's life
         status_.weights_bytes = gguf_report_.bytes_from_file;  // the file's rows (or their repack), not the template's .bin
         log::info("load", "gguf: %s; the norms, GDN state tensors and any MTP layer stay the template's",
@@ -2475,7 +2475,7 @@ private:
         // and refuses at compile with the op named; nothing falls back.
         if (!cfg.gguf_path.empty())
             apply_gguf_weights(model, cfg.gguf_path, cfg.gguf_mode,
-                               cfg.gguf_check_once ? gguf_verdict_dir(cfg) : std::string(), cfg.gguf_embed_file);
+                               cfg.gguf_check_once ? gguf_verdict_dir(cfg) : std::string(), cfg.gguf_embed_file, cfg.gguf_q6k_aligned);
         // --gate-pad N: widen the shared-expert gate (see pad_gate_matmuls). A
         // deployment choice with a known price, like --paged-kv: DESIGN 7.0.2g
         // has the break-even. Off by default for this fleet's answer lengths.
