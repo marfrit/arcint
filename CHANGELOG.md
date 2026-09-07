@@ -20,7 +20,8 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 ## Unreleased
 
 - **0.4.1, the Q6_K decode rate worked through** (DESIGN §7.0.2bh,
-  plugin patch 0024, not yet in a built package). The Q6_K decode row
+  plugin patch 0024; `marfrit-openvino +p9` = patches 0003–0024 built in
+  14 minutes and installed on the dev host, 2026-09-07). The Q6_K decode row
   reads the super-block's tail (the last qh word, the scales, `d`) as
   one block read with broadcasts instead of four per-lane gathers:
   exact, 14/14 on both cards, served outputs byte-identical, the
