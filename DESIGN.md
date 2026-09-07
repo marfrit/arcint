@@ -7232,6 +7232,83 @@ Q6_K row pays over the Q4_K row is the shuffles and the wider decode,
 and both go away only with a layout each lane can read its own bytes
 from.
 
+#### 7.0.2bi 0.4.1, the Q6_K decode row's ISA read instruction by instruction, and the row without variable-index shuffles (patch 0025) (2026-09-07)
+
+The operator's order after §7.0.2bh: `+p9`, then a deep dive into the
+indirect moves per row and super-block, and the instructions. `+p9`
+(patches 0003–0024) built from the recipe in fourteen minutes and
+was installed on the dev host, both units restarted on it. The dive:
+the intercept layer's ISA dumps of the sixteen-row decode bodies of
+§7.0.2bh, disassembled through `libiga64` (`tools/igadis.cpp`) and
+counted by class, then read.
+
+**The accounting, per row and super-block of the sixteen-row body**
+(the down projection's kernel; the whole body divided by sixteen):
+
+| per row and super-block | Q4_K | Q6_K (0024) | what it is in the Q6_K row |
+|---|---|---|---|
+| instructions | 178 | 296 | |
+| indirect moves `mov r[a0]` + address-register setups | 0 + 0 | 15 + 21 | ten `intel_sub_group_shuffle` with a per-lane index and ten `sub_group_broadcast` with a run-time index (`4h + odd`); each is an `add a0` and an indirect move |
+| shifts | 15 | 54 | the variable `>> hi` per word after the shuffle, then the byte extraction by shifts — the Q4_K row's compiler extracts bytes as register regions (`mov :uw <- :ub`, 256 of them) and shifts nothing |
+| branches (goto, join, jmpi) and syncs | 2.5 + 0.8 | 12.5 + 2.2 | the per-row `last` guard of 0024 (a goto/join per row) and the lane-dependent selects |
+| int-to-float converts | 16 | 24 | sixteen values, eight scales |
+| mad / mul / bfn / sel / add | 24 / 19 / 2 / 4 / 12 | 16 / 25 / 16 / 12 / 47 | the same arithmetic split differently; the adds are the `- 32` per value and the address arithmetic |
+| sends | 3.6 | 8.6 | the reads, and the tail window's per-lane path |
+
+Everything the Q6_K row pays over the Q4_K row traces to one decision
+of §7.0.2bc: the 2-aligned block is read as dwords from the dword
+below it, and each lane then fetches its word from the lane that holds
+it. That is 118 of the 296 instructions (the shuffles, their setups,
+the variable shifts and the selects), and it is also why the compiler
+cannot use byte regions for the extraction. §7.0.2bh's probe had
+already shown that a 16-bit block read at the same dword-aligned base
+is exact; what it did not say is that this read lands the right words
+in the right lanes by itself: lane l holds words l, l + 16, l + 32,
+l + 48 of the ql bytes and l, l + 16 of the qh bytes — for an even
+block exactly the positions 2l, 2l + 1 of every run the decode wants,
+for an odd block (the block starts one word later) the previous lane's,
+which one fixed-delta `intel_sub_group_shuffle_down` per register puts
+right, lane 15 taking the following register's lane 0, under a uniform
+branch. The tail window's scales and `d` are then constant-index
+broadcasts. That is the v27 row (patch 0025): no indirect move, no
+variable shift, the same arithmetic, the same `last` guard.
+
+**Measured** (the streamed timing test, warmed; correctness 14/14 on
+both cards; the served cells on `+p9` with the staged v27 plugin):
+
+| Q6_K decode, µs, streamed | 24 GB card, 0024 | 24 GB card, v27 | 16 GiB card, 0024 | 16 GiB card, v27 |
+|---|---|---|---|---|
+| down projection, N 5,120 × K 17,408 (73 MB) | 400 | **259** (282 GB/s) | 385 | **262** |
+| N 1,024 × K 5,120 | 34 | **28** | 34 | **28** |
+| every Q4_K and Q5_K shape | — | unchanged | — | unchanged |
+
+The per-row `last` guard costs nothing the instrument can see (275 µs
+with it removed for timing, inside the run-to-run band of the earlier
+sweeps). Served on the 24 GB card, mixed form, `u8` KV, one fresh
+process per cell, against the `+p9` runtime's own numbers of the same
+morning (§7.0.2bh):
+
+| mixed form | prefill | decode (64 tokens) | step | Prüfstand | greedy output |
+|---|---|---|---|---|---|
+| 856 tokens, 0024 | 433 t/s | 13.4 t/s | 70.6 ms | 10/10 at 14.4 t/s | 23e06c37e0d6 |
+| 856 tokens, v27 | 432 | **15.3** | **61.0** | **10/10 at 16.7** | 23e06c37e0d6 |
+| 71,727 tokens, 0024 | 291 | 9.6 | 88.2 | — | 086d5e71ad47 |
+| 71,727 tokens, v27 | 291 | **11.9** | **79.9** | — | 086d5e71ad47 |
+
+Eight milliseconds off the step at both depths, byte-identical, which
+is the Q6_K set's 23.7 ms of §7.0.2bg going to about 15.4 at the new
+rate (65 launches, the lm_head among them). Against the operator's
+decode bar (19.3 t/s, a 51.8 ms step) the mixed form is now at 61.0 ms;
+what remains, by the same accounting, is the 224-byte layout of
+§7.0.2bh (the two-message read shape, 259 → 183–210 µs on the down
+projection, about 5 ms per step), the host time per K-quant node
+(about 6 ms), the augmentation's packing (1.7) and Q5_K (0.6). The
+Q6_K row now reads its block in the same shape the 224-byte layout
+would give it, so that layout is a stride and a type id away, not a
+new kernel.
+
+Retracted here (§7.0.1): nothing.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

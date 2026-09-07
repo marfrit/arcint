@@ -1,0 +1,111 @@
+# The K-quant kernel's Q6_K decode row without variable-index shuffles
+
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0003-0024. arcint 0.4.1 (DESIGN.md section 7.0.2bi).
+#
+# What changes:
+#   kquant_utils.cl     kq_row_q6k_x: 0024's row read the 2-aligned 210-byte block as dwords
+#                       from the dword at or below it and had every lane fetch its word from the
+#                       lane holding it -- ten shuffles with a per-lane index and ten broadcasts
+#                       with a run-time index per super-block per row, each an address-register
+#                       setup and an indirect move, plus a variable shift per word: 118 of the
+#                       row's 296 instructions against the Q4_K row's 178 (the ISA counted,
+#                       DESIGN 7.0.2bi). A 16-bit sub-group block read at the same dword-aligned
+#                       base is exact (wrong only two bytes off a dword, DESIGN 7.0.2bh) and gives
+#                       lane l words l, l+16, l+32, l+48 of ql, l and l+16 of qh, and word l of
+#                       the tail window: for an even block the lane's own positions 2l, 2l+1 of
+#                       every run; for an odd block the previous lane's, which one fixed-delta
+#                       intel_sub_group_shuffle_down per register puts right (lane 15 taking the
+#                       following register's lane 0) under a uniform branch. The scales and d
+#                       are constant-index broadcasts. Same arithmetic, same last-block guard.
+#
+# MEASURED streamed at steady state (the timing test of 0023, every process warmed once, one
+# row) against 0024 in the same instrument, 2026-09-07:
+#   24 GB card (Xe2):     down projection N 5,120 x K 17,408: 259 us against 400 (282 GB/s);
+#                         N 1,024 x K 5,120: 28 against 34. Every Q4_K/Q5_K shape unchanged.
+#   16 GiB card (Xe-HPG): down projection 262 against 385; N 1,024: 28 against 34.
+# Correctness 14/14 on both cards. Served on the 24 GB card (mixed form, u8 KV, +p9 base):
+# greedy outputs byte-identical to 0024's at 856 and 71,727 tokens, Pruefstand 10/10 (16.7 t/s
+# over its 1,145 tokens against 14.4), decode 15.3 t/s at 856 tokens against 13.4 (the step
+# 61.0 ms against 70.6) and 11.9 at 71,727 against 9.6 (79.9 against 88.2).
+
+--- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/include/batch_headers/kquant_utils.cl
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/include/batch_headers/kquant_utils.cl
+@@ -273,41 +273,53 @@
+ // row) and each lane takes its word from the lane that holds it with one shuffle; the one
+ // word an odd block's last lane needs past those reads is a uniform load. The sixteen
+ // scales are one uniform load, each lane selecting its byte. No min.
+-// v26 (2026-09-07): the block's last twenty bytes -- qh's last word, the sixteen scales, d --
+-// were four per-lane gathers (the scales as a vector load, the tail word, the two bytes of d):
+-// six load messages per super-block per row against Q4_K's two, and the decode rates of the
+-// three types follow bytes per message almost linearly (372, 316, 188 GB/s at 72, 59, 35
+-// bytes per message; DESIGN 7.0.2bg). Now one 16-bit sub-group block read of the 32 bytes at
+-// the dword at or below those twenty (a 2-aligned 16-bit block read returns the neighbour's
+-// word, DESIGN 7.0.2bc; b4 + 192 is a dword): lane l holds word l, every value is one
+-// broadcast, three messages per block. The read runs 12-14 bytes past the block; on the last
+-// block of the last row (`last`, uniform) each lane loads its own word within the block instead.
++// v27 (2026-09-07): no variable-index shuffles. v26 read the block as dwords from the dword at
++// or below it and had every lane fetch its word from the lane holding it: ten shuffles and ten
++// runtime-index broadcasts per super-block per row, each an address-register setup and an
++// indirect move, plus a variable shift per word -- 118 of the row's 296 instructions against
++// the Q4_K row's 178 (DESIGN 7.0.2bh, the ISA counted). A 16-bit sub-group block read at that
++// same dword-aligned base is legal (wrong only two bytes off a dword) and gives lane l words
++// l, l + 16, l + 32, l + 48 of ql (b4 + 0), l and l + 16 of qh (b4 + 128), and word l of the
++// tail window (b4 + 192: the last qh word of an odd block, the sixteen scales, d). For an even
++// block those are the lane's own positions 2l, 2l + 1 of every run; for an odd block (the
++// block starts one word later) every lane takes the next lane's word with a fixed-delta
++// shuffle-down, lane 15 the following register's lane 0, under a uniform branch. The scales
++// and d are then constant-index broadcasts. The tail read runs 12-14 bytes past the block; on
++// the last block of the last row (`last`, uniform) each lane loads its own word instead.
+ inline float kq_row_q6k_x(const __global uchar* blk, uint lane, float16 x, uint last) {
+     const uint odd = ((uint)(ulong)blk >> 1) & 1u;          // the block starts two bytes past a dword
+     const __global uchar* b4 = blk - 2 * odd;
+-    const uint w = lane + odd, src = w >> 1, hi = (w & 1) * 16;   // this lane's word, in words from b4
+-    const uint2 dq = intel_sub_group_block_read2((const __global uint*)b4);          // ql: lane l holds dwords l and 16 + l
+-    const uint dh = intel_sub_group_block_read((const __global uint*)(b4 + 128));    // qh: lane l holds dword 32 + l
+-    ushort tw;                                                                       // word lane of b4 + 192: [tail,] scales, d
++    ushort4 q = intel_sub_group_block_read_us4((const __global ushort*)b4);           // ql: words l, l+16, l+32, l+48 of b4
++    ushort2 hq = intel_sub_group_block_read_us2((const __global ushort*)(b4 + 128));  // qh: words 64+l, 80+l
++    ushort tw;                                                                         // the tail window: word 96+l
+     if (last) {
+         tw = lane < 9u + odd ? *(const __global ushort*)(b4 + 192 + 2 * lane) : (ushort)0;
+     } else {
+         tw = intel_sub_group_block_read_us((const __global ushort*)(b4 + 192));
+     }
+-    const uint tail = (uint)sub_group_broadcast(tw, 0u);                             // qh's last word (an odd block's)
+-    const float d = kq_f16bits((uint)sub_group_broadcast(tw, 8u + odd));
++    if (odd) {
++        // blk's word i is b4's word i + 1: shift every register down one lane
++        const ushort q0 = intel_sub_group_shuffle_down(q.s0, q.s1, 1u);
++        const ushort q1 = intel_sub_group_shuffle_down(q.s1, q.s2, 1u);
++        const ushort q2 = intel_sub_group_shuffle_down(q.s2, q.s3, 1u);
++        const ushort q3 = intel_sub_group_shuffle_down(q.s3, hq.s0, 1u);
++        const ushort h0 = intel_sub_group_shuffle_down(hq.s0, hq.s1, 1u);
++        const ushort h1 = intel_sub_group_shuffle_down(hq.s1, tw, 1u);                // lane 15: the tail word, blk + 190
++        tw = intel_sub_group_shuffle_down(tw, (ushort)0, 1u);
++        q = (ushort4)(q0, q1, q2, q3); hq = (ushort2)(h0, h1);
++    }
++    // now: lane l holds, for half h, ql bytes 64h + 2l, +1 (runs 0/2) in q[2h], ql bytes
++    // 64h + 32 + 2l, +1 (runs 1/3) in q[2h + 1], qh bytes 128 + 32h + 2l, +1 in hq[h]; the
++    // scale words are lanes 0..7 of tw, d lane 8.
++    const float d = kq_f16bits((uint)sub_group_broadcast(tw, 8u));
+     float acc = 0.0f;
+     __attribute__((opencl_unroll_hint(2)))
+     for (uint h = 0; h < 2; ++h) {
+-        const uint qlh = h == 0 ? dq.s0 : dq.s1;                                       // ql half h: dwords 16h .. 16h+15
+-        const uint g0 = intel_sub_group_shuffle(qlh, src) >> hi;                       // values 0..31 of the half: word 32h + w
+-        const uint g1a = intel_sub_group_shuffle(qlh, (8 + src) & 15u);                // values 32..63: word 32h + 16 + w
+-        const uint g1b = intel_sub_group_shuffle(h == 0 ? dq.s1 : dh, 0u);             //   (the lane past the half: the next read's first dword)
+-        const uint g1 = (src < 8 ? g1a : g1b) >> hi;
+-        const uint qa = intel_sub_group_shuffle(dh, (8 * h + src) & 15u);              // qh half h: word 64 + 16h + w
+-        const uint qw = ((h == 1 && src == 8) ? tail : qa) >> hi;
+-        const ushort sv0 = sub_group_broadcast(tw, 4 * h + odd), sv1 = sub_group_broadcast(tw, 4 * h + 1 + odd),
+-                     sv2 = sub_group_broadcast(tw, 4 * h + 2 + odd), sv3 = sub_group_broadcast(tw, 4 * h + 3 + odd);   // scale pairs of runs 0..3
++        const uint g0 = (uint)(h == 0 ? q.s0 : q.s2);
++        const uint g1 = (uint)(h == 0 ? q.s1 : q.s3);
++        const uint qw = (uint)(h == 0 ? hq.s0 : hq.s1);
++        const ushort sv0 = sub_group_broadcast(tw, 4 * h), sv1 = sub_group_broadcast(tw, 4 * h + 1),
++                     sv2 = sub_group_broadcast(tw, 4 * h + 2), sv3 = sub_group_broadcast(tw, 4 * h + 3);   // scale pairs of runs 0..3
+         const float s0 = d * (float)(lane < 8 ? (char)(sv0 & 0xFFu) : (char)(sv0 >> 8));
+         const float s1 = d * (float)(lane < 8 ? (char)(sv1 & 0xFFu) : (char)(sv1 >> 8));
+         const float s2 = d * (float)(lane < 8 ? (char)(sv2 & 0xFFu) : (char)(sv2 >> 8));

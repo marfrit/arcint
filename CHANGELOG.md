@@ -19,6 +19,21 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+- **0.4.1, the Q6_K decode row without variable-index shuffles** (DESIGN
+  §7.0.2bi, plugin patch 0025, not yet in a built package). The ISA of
+  the sixteen-row decode bodies counted (`tools/igadis.cpp`): the Q6_K
+  row spent 118 of its 296 instructions per row and super-block on
+  fetching words from other lanes (ten shuffles and ten run-time-index
+  broadcasts, each an address-register setup and an indirect move, plus
+  a variable shift per word); the Q4_K row has none of it. The row now
+  reads its 2-aligned block with 16-bit block reads at the dword below
+  it, which land each lane's own words directly for even blocks and one
+  fixed-delta shuffle-down away for odd ones. Exact, 14/14 on both
+  cards, served outputs byte-identical: the Q6_K down projection 400 →
+  259 µs on the 24 GB card and 385 → 262 on the 16 GiB card; the mixed
+  form's decode 13.4 → 15.3 t/s at 856 tokens (Prüfstand 10/10 at 16.7)
+  and 9.6 → 11.9 at 71,727, eight milliseconds off the step at both
+  depths.
 - **0.4.1, the Q6_K decode rate worked through** (DESIGN §7.0.2bh,
   plugin patch 0024; `marfrit-openvino +p9` = patches 0003–0024 built in
   14 minutes and installed on the dev host, 2026-09-07). The Q6_K decode row

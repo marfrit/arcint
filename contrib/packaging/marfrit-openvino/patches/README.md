@@ -470,6 +470,22 @@ record, not in this patch.
 
 Package: `+p9` (2026-09-07).
 
+### 0025-kquant-q6k-no-shuffles.patch
+
+The Q6_K decode row without variable-index shuffles (DESIGN §7.0.2bi):
+16-bit sub-group block reads at the dword below the 2-aligned block put
+each lane's own words in place for even blocks, and one fixed-delta
+shuffle-down per register does it for odd ones; the scales and `d` are
+constant-index broadcasts. The ISA count had put 118 of the row's 296
+instructions per row and super-block on word fetches from other lanes.
+Exact, 14/14 on both cards, served outputs byte-identical, Prüfstand
+10/10. Measured streamed at steady state: the Q6_K down projection
+400 → 259 µs on the 24 GB card and 385 → 262 on the 16 GiB card; served,
+the mixed form's decode 13.4 → 15.3 t/s at 856 tokens and 9.6 → 11.9 at
+71,727 (eight milliseconds off the step at both depths).
+
+Package: not yet built (`+p10`).
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.

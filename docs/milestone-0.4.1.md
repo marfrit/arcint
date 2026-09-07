@@ -227,3 +227,13 @@ to keep on the other card.
   224-byte blocks read in Q4_K's shape (predicted 183–210 µs, ~12 ms
   per step), designed on the record, not started. 28 of the 30
   minutes used across four card slots.
+- 2026-09-07 — **`+p9` built and installed** (patches 0003–0024, 14
+  minutes); **the Q6_K row's ISA read and the shuffles removed**
+  (DESIGN §7.0.2bi, patch 0025): 118 of 296 instructions per row and
+  super-block were word fetches from other lanes; 16-bit block reads at
+  the dword below the block put the words in their lanes. Q6_K down
+  projection 400 → 259 µs (24 GB card), 385 → 262 (16 GiB card),
+  14/14, byte-identical served, Prüfstand 10/10; the mixed form's
+  decode 13.4 → 15.3 t/s at 856 tokens and 9.6 → 11.9 at 71.7k (the
+  step 70.6 → 61.0 and 88.2 → 79.9 ms). The decode bar (51.8 ms) is
+  9 ms away; the 224-byte layout is next.
