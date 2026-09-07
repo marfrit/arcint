@@ -582,7 +582,7 @@ form): the warm 856-token prefill 940 → 1,001 t/s (first request 903 →
 962), 71,727 tokens 451 → 464; the decode steps unchanged (54.8 / 73.7
 ms); outputs byte-identical at both depths.
 
-Package: `+p12` (build started 2026-09-08 on the dev host; the served figures above were taken with patch 0030 staged into the +p11 runtime, the package itself not yet served).
+Package: `+p12` (built 2026-09-08 01:00 local on the dev host, installed there at 01:05, both units on it; the served figures above were taken with patch 0030 staged into the +p11 runtime before the package existed).
 
 ## Deliberately NOT applied
 
