@@ -273,3 +273,15 @@ to keep on the other card.
   the bars). The gathers were a fifth of the launch; the per-tile decode
   and the weights re-read per 32-row tile are the rest — the row tile
   and the GRF mode are the next sweep.
+- 2026-09-07 — **the tiled variant's operands by 2D block loads**
+  (DESIGN §7.0.2bn, patch 0029): the activation block from global
+  memory in the matrix unit's layout, the sixteen weight rows by
+  transposed block reads, then 64-row tiles in the 256-register mode
+  on Xe2 (Xe-HPG: 32 rows, the mode); exact, byte-identical served,
+  10/10; prefill 672 → 907 t/s at 1k (68 % of the bar) and 385 → 451
+  at 71.7k (98 %), the Q6_K down launch 11.1 → 4.4 ms at 856 rows on
+  the fixed instrument. The packed B operand (2.7× slower: a
+  `dpas` chain broken at every sub-block) and hoisted loads (50 %
+  slower served) measured and dropped. The timing test's activations
+  had been in host memory: every tiled figure before this entry timed
+  the bus, and the §7.0.2bm tile sweep is retracted and redone.

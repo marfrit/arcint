@@ -7621,7 +7621,9 @@ costs accumulator registers (one register per row of the tile); the
 256-register mode was a loss on the decode kernel (§7.0.2bd) because
 it halves occupancy on a bandwidth-bound kernel, and is the natural
 thing to measure on this one. The sweep, the same window's
-instrument, the gate on the 24 GB card, µs:
+instrument, the gate on the 24 GB card, µs — **retracted in §7.0.2bn:
+the instrument's activations were in host memory, and this table
+timed the bus; the sweep redone in device memory reverses it** —
 
 | rows per tile × GRF | M = 32 | M = 256 | M = 2,048 |
 |---|---|---|---|
@@ -7652,6 +7654,178 @@ staging and the local-memory reads" as an attribution to the reads:
 removing the gathers took 5 ms; the rest of that figure is the decode
 and the weight re-reads per tile, above.
 
+
+#### 7.0.2bn 0.4.1, the tiled variant's operands: two forms that lose, the instrument that had been timing the bus, the 2D block loads and the 64-row tile at 256 registers (patch 0029) (2026-09-07)
+
+The operator's order after §7.0.2bm: the tiled variant's register
+spill and its 2D block loads. Four forms of the inner loop went through
+the plugin's timing test and the served endpoint in one afternoon; two
+lost, the test turned out to have been measuring the wrong thing since
+it was written, and the two that won are patch 0029.
+
+**The packed B operand (a loss, not shipped).** §7.0.2az's form on the
+tiled path: the B column as `f16(1024 + q)` straight from the nibbles,
+the scale and the offset applied to the sub-block's two sums, the row's
+Σx per sub-block half staged beside the tile by the same work-items
+(one shuffle per pair of chunks). Correct on both cards (21/21) and
+slower on every tiled shape: on the instrument of that hour the gate at
+2,048 rows 34.8 → 92.5 ms, the Q5_K attention output 17.0 → 28.3, the
+224-byte Q6_K down projection 108.5 → 113.9, the 16 GiB card 69.3 →
+131.1 on the gate. The ISA (offline, `ocloc` over the plugin's own jit
+source at the 17,408 × 5,120 shape, `tools/igadis.cpp` for the counts)
+says why it could not have won and why it lost:
+
+| the tiled kernel, one super-block body, Xe2 | decode form | packed form |
+|---|---|---|
+| instructions | 2,421 | 2,611 |
+| `mov` (the converts among them) | 891 | 470 |
+| `mad` | 289 | 553 |
+| local-memory messages | 74 | 146 |
+| global messages | 86 | 49 |
+
+The packing trades the converts for fmas one for one: what the decode
+spends turning 32 values into f16, the packed form spends applying the
+scale and the offset to 32 partial sums per row group, and the Σx reads
+come on top. And the fmas wait: in the decode form the 64 `dpas` of a
+super-block run as eight chains into the same accumulators, which the
+matrix unit pipelines; in the packed form every `dpas` starts from zero
+and a `mad` reads its result two instructions later (`{$9}` on the
+`dpas`, `{$9.dst}` on the `mad`), so each of the 64 pays the systolic
+latency in full. The option was built (`--gguf-prefill`, the plugin's
+`ARCINT_KQ_PREFILL`) and withdrawn with the numbers; nothing of it is
+in the tree.
+
+**The loads hoisted ahead of the decode (a loss, not shipped).** The
+same disassembly issues every A block read two instructions before the
+`dpas` that waits on it, and the Q6_K body carries 242 global messages
+per super-block from its 16-bit gathers. So v33: the A operands read at
+the top of the sub-block, the next weight pair (or the aligned Q6_K's
+next half) loaded as dwords a sub-block ahead through register
+decoders. Correct (21/21 both cards); served on the 24 GB card the
+prefill fell 672 → 437 t/s at 856 tokens and 385 → 321 at 71,727, the
+tiled launch on the device timeline 5.4 → 9.2 ms. The compiler had
+already scheduled what it could; holding sixteen more registers live
+through the decode cost more than the latency it hid.
+
+**The 2D block loads (v32).** `cl_intel_subgroup_2d_block_io` on the
+24 GB card (the compiler knows the plain reads of 8/16/32 rows × 16
+columns at 8, 16 and 32 bits and the transposed 32-bit reads of 16 or
+32 rows × 8 dwords; the 16 GiB card has none of them). Both operands go
+through it: the A operand is one `2d_block_read_16b_8r16x1c` of the
+activations from global memory — eight rows, sixteen halves, lane l
+takes k = l, the matrix unit's layout without a tile staged, a barrier
+run or a byte of local memory, the work-group's eight subgroups sharing
+the block through L1 — and the subgroup's sixteen weight rows come by
+`2d_block_read_transpose_32b_16r8x1c`: one message brings 32 bytes of
+each of the sixteen rows, lane l its own row's eight dwords; five
+messages per super-block for Q4_K, six for Q5_K, seven for the 224-byte
+Q6_K, from where the decode runs on registers (`kq_dec_*_w`, the same
+arithmetic). Rows past the matrix read as zeros and are dropped where
+they always were. The message addresses dwords, so the row pitch must
+be a multiple of 16 bytes and the block offsets of 4: Q4_K, Q5_K and
+the aligned Q6_K qualify; the file's 210-byte Q6_K rows, Q8_0's 34-byte
+blocks and everything on Xe-HPG keep the staged path.
+
+Correct on both cards (21/21). And then the two instruments
+disagreed: the timing test put the 2D form at 1.5–2× *slower* on every
+shape (the gate at 2,048 rows 35.1 → 65.4 ms), while the served 24 GB
+card ran the prefill *faster*, 672 → 766 t/s at 856 tokens and 385 →
+410 at 71,727, outputs byte-identical, Prüfstand 10/10; and the served
+device timeline (`tools/cl_timeline_steps.py`'s method, the request's
+run of launches up to the lm_head slice) put the tiled launches at
+5.4 ms (v30) against 4.1 (2D), the Q6_K down projection at 856 rows
+11.1 → 7.6 ms:
+
+| the served 856-token prefill, 24 GB card, mixed form | v30 (staged) | v33 (hoisted) | v32 (2D) |
+|---|---|---|---|
+| device span / busy | 1,369 / 1,221 ms | 1,823 / 1,670 | 1,129 / 1,070 |
+| the tiled K-quant launches (112) | 612 ms | 1,059 | 463 |
+| of which the Q6_K down projection (32 launches) | 11.1 ms each | — | 7.6 |
+| the runtime's int4 gemm on the repacked set (448) | 419 | 419 | 418 |
+| gated delta net | 76 | 77 | 76 |
+
+**The instrument.** The timing test allocated its activation rows with
+`engine.allocate_memory(layout)`, which on this runtime returns the
+*lockable* allocation — host memory — and every tiled figure the test
+had produced since §7.0.2bc timed a kernel reading its A operand over
+the bus: the staged path once per column work-group, the 2D path once
+per subgroup, which is the whole disagreement. With both operands in
+device memory (`allocation_type::usm_device`, `copy_from`) the test
+agrees with the served timeline to within 5 %, and the absolute figures
+are a third of what the record carried:
+
+| the timing test, 24 GB card, device memory, ms | v30 (staged) | 2D |
+|---|---|---|
+| gate Q4_K 17,408 × 5,120, M = 856 / 2,048 | 5.64 / 13.49 | 5.25 / 12.10 |
+| attention output Q5_K 5,120 × 5,120, M = 856 / 2,048 | 1.72 / 3.98 | 1.71 / 3.90 |
+| down Q6_K (224) 5,120 × 17,408, M = 856 / 2,048 | 10.88 / 25.12 | 7.22 / 16.91 |
+
+(The M = 1 decode figures of §7.0.2bc–bj are untouched: their
+activation is 10 KB and read once.) Retracted here (§7.0.1), as
+absolutes: §7.0.2bc's 39.5 ms and §7.0.2bm's 34.6 ms per 2,048-row gate
+launch (13.5 in device memory) and the row-tile × GRF table of
+§7.0.2bm; the served rates those sections report stand, as do their
+directions. The test now carries the served row count (856) and valid
+scales in its rows.
+
+**The row tile, swept on the fixed instrument** (2D form, µs, the 24 GB
+card; 21/21 at 64 rows):
+
+| rows per tile × registers | gate M = 856 / 2,048 | Q5_K M = 856 / 2,048 | Q6_K M = 856 / 2,048 |
+|---|---|---|---|
+| 32 × 128 (0028) | 5,262 / 12,099 | 1,705 / 3,907 | 7,175 / 16,914 |
+| 32 × 256 | 3,945 / 9,369 | 1,224 / 2,771 | 6,358 / 14,523 |
+| 64 × 128 | 4,452 / 10,092 | 1,581 / 3,428 | 7,255 / 16,725 |
+| **64 × 256** | **3,371 / 7,229** | **1,043 / 2,213** | **4,412 / 9,964** |
+| 128 × 128 | 17,206 / 40,134 | 6,642 / 18,492 | 26,895 / 73,736 |
+| 128 × 256 | 6,870 / 16,428 | 973 / 1,870 | 9,239 / 19,218 |
+
+The opposite of the retracted table, and the reason §7.0.2bm gave for
+the sweep was right: the tile divides the per-tile decode and the
+weight re-reads, and the accumulators are what it costs. 64 rows at
+128 registers spill; 64 at 256 halves nothing that matters on a kernel
+that is not bandwidth-bound (the decode kernel, which is, lost 15–45 %
+in the same mode, §7.0.2bd, and keeps 128: the tiled kernel is compiled
+in its own batch with `-cl-intel-256-GRF-per-thread`). The staged path
+gains the same way (Q6_K at 856 rows 10.9 → 5.97 ms at 64 × 256), so
+the mode is not a property of the 2D loads.
+
+**Shipped (patch 0029):** the 2D loads on Xe2 for the aligned layouts,
+64-row tiles in the 256-register mode on Xe2; Xe-HPG at 32 × 128 until
+measured there (below). Served on the 24 GB card, mixed form, `u8` KV,
+one fresh process per cell:
+
+| mixed form, 24 GB card, `u8` KV | 0028 (§7.0.2bm) | 0029 at 32 × 128 (v32) | **0029 shipped, 64 × 256** | the bar |
+|---|---|---|---|---|
+| prefill, 856 tokens | 672 t/s | 766 | **907** | 1,341 (68 %) |
+| decode step at 1k (64 tokens) | 54.8 ms | 54.8 | 54.9 | 51.8 |
+| prefill, 71,727 tokens | 385 | 410 | **451** | 460 (98 %) |
+| decode step at 71.7k | 73.2 | 73.0 | 73.3 | 72.5 |
+| Prüfstand | 10/10 at 18.4 t/s | 10/10 at 18.5 | 10/10 at 18.4 | 10/10 |
+| greedy outputs, 1k / 71.7k | 23e06c37e0d6 / 086d5e71ad47 | the same | the same | — |
+
+The prefill bar at depth is met within 2 %; at 1k the gap is 32 %, and
+the served timeline of the 2D form at 32 × 128 says what it is made
+of: 1,070 ms of device time for 856 tokens, of which the tiled
+launches were 463 (now about 300 at 64 × 256), the runtime's int4 gemm
+on the repacked Q4_K set 418, the gated delta net 76, everything else
+110 — the repacked set's gemm is now the larger half of the prefill,
+and it is the runtime's kernel, not this one.
+
+The 16 GiB card (Xe-HPG, no 2D block loads, the staged path) had its
+own sweep on the fixed instrument: at 32 rows the 256-register mode
+takes the gate at 856 rows 10.3 → 8.0 ms, Q5_K 3.18 → 2.73, the Q6_K
+down projection 14.8 → 12.9; 64 rows at 256 wins the first two (6.8,
+2.20) and loses the third (18.3), so it keeps 32 rows and gains the
+mode (v37: 21/21, the timing test at 8.0 / 2.73 / 12.9 ms; its M = 1
+decode figures unchanged, that kernel is compiled at 128).
+
+Retracted here (§7.0.1): §7.0.2bm's "the kernel is instruction-issue
+bound (~2,000 instructions per sixteen dpas)" as the mechanism — the
+2,421 instructions per super-block would issue in about 9 ms of the
+gate's 13.5 at 2,048 rows, and the packed form showed the count is not
+what moves it; what the sweep says binds is the per-tile decode and
+re-read count, divided by the tile.
 
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 

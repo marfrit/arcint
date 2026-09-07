@@ -533,6 +533,31 @@ on the 24 GB card; served, the mixed form's prefill 551 → 672 t/s at
 
 Package: not yet built (`+p11`).
 
+### 0029-kquant-tiled-2d-block-loads.patch
+
+The tiled (prefill) variant reads both operands by Xe2's 2D block
+loads (`cl_intel_subgroup_2d_block_io`): the activation block straight
+from global memory in the matrix unit's layout, with no tile staged,
+no barrier and no local memory, and the subgroup's sixteen weight rows
+by transposed 32-bit block reads, one message per 32 bytes of sixteen
+rows instead of a dword gather per lane per dword; the decode runs on
+registers through the same arithmetic (DESIGN §7.0.2bn). Xe2 only, for
+the dword-aligned layouts (Q4_K, Q5_K, the 224-byte Q6_K); everything
+else keeps 0028's staged path. With the loads in place the row tile is
+64 in the 256-register mode on Xe2 (the tiled kernel is compiled in
+its own batch with `-cl-intel-256-GRF-per-thread`; the decode kernel
+stays at 128, where it measured better); Xe-HPG keeps 32 rows and
+gains the mode. Exact: 21/21 on both cards, served outputs
+byte-identical, Prüfstand 10/10. Served on the 24 GB card, the mixed
+form's prefill 672 → 907 t/s at 856 tokens and 385 → 451 at 71,727;
+the Q6_K down projection's launch at 856 rows 11.1 → 4.4 ms. The
+timing test's operands move to device memory (they were in the
+lockable host allocation, which timed the bus, not the kernel: every
+tiled figure it gave before this patch is retracted as an absolute),
+its rows get valid scales, and it gains the served row count.
+
+Package: not yet built (`+p11`).
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.

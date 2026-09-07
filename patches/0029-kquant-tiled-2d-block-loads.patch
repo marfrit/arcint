@@ -1,0 +1,316 @@
+# The K-quant kernel's tiled variant reads its operands by 2D block loads (Xe2) and takes 64-row
+# tiles in the 256-register mode; the timing test's operands move to device memory
+
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0003-0028. arcint 0.4.1 (DESIGN.md section 7.0.2bn).
+#
+# What changes:
+#   fully_connected_gpu_kquant.cl   Under KQ_2D (Xe2, the dword-aligned layouts: Q4_K, Q5_K, the
+#                       224-byte Q6_K) the tiled variant reads the A operand by
+#                       intel_sub_group_2d_block_read_16b_8r16x1c straight from global memory in
+#                       the matrix unit's layout -- no tile staged, no barrier, no local memory,
+#                       the work-group's subgroups sharing the block through L1 -- and the
+#                       subgroup's sixteen weight rows by intel_sub_group_2d_block_read_transpose_
+#                       32b_16r8x1c, one message per 32 bytes of the sixteen rows (five per
+#                       super-block for Q4_K, six for Q5_K, seven for Q6_K) instead of a dword
+#                       gather per lane per dword. Rows past the matrix read as zeros and are
+#                       dropped where they always were. Otherwise 0028's staged path, unchanged.
+#   kquant_utils.cl     The three decodes from a super-block already in registers (kq_dec_*_w),
+#                       the same arithmetic as the pointer forms.
+#   fully_connected_kernel_kquant.cpp   KQ_2D from the architecture, the type, the row pitch (a
+#                       multiple of 16 bytes) and the input's padding (none); ARCINT_KQ_2D=0
+#                       forces the staged path for measurement. The row tile is 64 on Xe2, 32 on
+#                       Xe-HPG, and the tiled kernel alone is compiled in the 256-register mode
+#                       (-cl-intel-256-GRF-per-thread, its own batch); the decode kernel stays at
+#                       128, where it measured better (DESIGN 7.0.2bd).
+#   fully_connected_gpu_test.cpp   The timing test's activations and weights in device memory
+#                       (allocate_memory(layout) is the lockable host allocation: every tiled
+#                       figure the test gave before this patch timed the bus), valid scales in
+#                       its rows, and the served row count (856) among its shapes.
+#
+# MEASURED 2026-09-07 (correctness 21/21 on both cards at the shipped configuration), the timing
+# test in device memory, us per launch, 0028 -> 0029:
+#   24 GB card (2D, 64 x 256): gate Q4_K 17,408 x 5,120 at M = 856 / 2,048: 5,641 / 13,485 ->
+#     3,382 / 7,233; Q5_K 5,120^2: 1,722 / 3,979 -> 1,044 / 2,215; the 224-byte Q6_K down
+#     projection 5,120 x 17,408: 10,884 / 25,086 -> 4,384 / 9,929.
+#   16 GiB card (staged, 32 x 256): gate 10,335 / 24,435 -> 8,021 / 18,767; Q5_K 3,179 / 7,202 ->
+#     2,730 / 6,382; Q6_K 14,824 / 33,813 -> 12,929 / 30,350. Its M = 1 decode figures unchanged.
+# Served on the 24 GB card (mixed form, u8 KV, +p10 base): prefill 672 -> 907 t/s at 856 tokens
+# and 385 -> 451 at 71,727 (the operator's bars 1,341 and 460); the decode step unchanged (54.9 /
+# 73.3 ms); Pruefstand 10/10; greedy outputs byte-identical at both depths (23e06c37e0d6,
+# 086d5e71ad47). On the served device timeline the Q6_K down projection's launch at 856 rows
+# 11.1 -> 7.6 ms with the 2D loads at 32 x 128 (the 64 x 256 form was not traced).
+# Measured and not shipped: the packed B operand (f16(1024 + q), 2.7x slower: every dpas starts
+# from zero and its result is read at once) and the operand loads hoisted ahead of the decode
+# (served -35 %).
+
+--- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
+@@ -21,7 +21,7 @@
+ //   in local memory once and every subgroup reads its A operands from there: reading them
+ //   from global memory per subgroup re-read the tile once per 16 columns and ran at a
+ //   fraction of the matrix unit (measured, 30x). The weights are read and decoded once per
+-//   TILE_M rows.
++//   TILE_M rows: 64 on Xe2, where the kernel is built in the 256-register mode, 32 on Xe-HPG.
+ //
+ // Every loop over the tile has a compile-time bound and every private array a constant index
+ // after unrolling: rows and columns past the end are clamped to the last one and their
+@@ -239,6 +239,72 @@
+     for (uint j = 0; j < KQ_WG; ++j) sums[0] += red[lane][j];
+ #else
+     const uint n = (get_group_id(0) * KQ_WG + sg) * SIMD + lane;   // lane = output column; the work-group's subgroups take KQ_WG x SIMD columns
++#if KQ_2D
++    // v32 (patch 0029): both operands by 2D block loads (cl_intel_subgroup_2d_block_io). The
++    // A operand is one 8-row x 16-half block of the activations read straight from global
++    // memory in the matrix unit's layout (lane l takes k = l of the eight rows); the
++    // work-group's subgroups share it through L1, so no tile is staged, no barrier runs and
++    // no local memory is used. The subgroup's sixteen weight rows are read by transposed
++    // 32-bit block reads: one message brings 32 bytes of each of the sixteen rows, lane l its
++    // own row's eight dwords -- five (Q4_K), six (Q5_K) or seven (Q6_K) messages per super-block
++    // instead of a dword gather per lane per dword. Rows past the matrix (columns past KQ_N,
++    // activation rows past the last) read as zeros and their results are dropped below.
++    // The decode and the multiply are v30's, so the result is bit-identical.
++    const int wy = (int)((get_group_id(0) * KQ_WG + sg) * SIMD);          // this subgroup's first weight row
++#  define KQ_W_READ(dst, dw) intel_sub_group_2d_block_read_transpose_32b_16r8x1c((const __global void*)weights, KQ_ROW_BYTES, KQ_N, KQ_ROW_BYTES, (int2)((int)(kb * (KQ_BLOCK_BYTES / 4) + (dw)), wy), (dst))
++#  define KQ_A_READ(dst, k, row) intel_sub_group_2d_block_read_16b_8r16x1c((const __global void*)input, KQ_K * 2, (int)rows, KQ_K * 2, (int2)((int)(k), (int)(row)), (dst))
++    float8 acc[KQ_GROUPS];
++    __attribute__((opencl_unroll_hint(KQ_GROUPS)))
++    for (uint g = 0; g < KQ_GROUPS; ++g) acc[g] = (float8)(0.0f);
++
++    for (uint kb = 0; kb < KQ_BLOCKS; ++kb) {
++#  if KQ_TYPE == 12
++        uint hw[8];
++        KQ_W_READ(hw, 0);
++        const uint4 h = (uint4)(hw[0], hw[1], hw[2], hw[3]);
++        uint qw[8];
++#  elif KQ_TYPE == 13
++        uint hw[8], qhw[8];
++        KQ_W_READ(hw, 0);
++        KQ_W_READ(qhw, 4);
++        const uint4 h = (uint4)(hw[0], hw[1], hw[2], hw[3]);
++        const uint8 qh8 = vload8(0, qhw);
++        uint qw[8];
++#  else
++        uint scw[8], ql0[8], ql1[8], qhw[8];
++        KQ_W_READ(scw, 48);
++        const uint8 sc8 = vload8(0, scw);
++#  endif
++        __attribute__((opencl_unroll_hint(KQ_SUBS)))
++        for (uint s = 0; s < KQ_SUBS; ++s) {
++            float y[32];
++#  if KQ_TYPE == 12
++            if ((s & 1) == 0) KQ_W_READ(qw, 4 + (s >> 1) * 8);
++            kq_dec_q4_K_w(h, vload8(0, qw), s, y);
++#  elif KQ_TYPE == 13
++            if ((s & 1) == 0) KQ_W_READ(qw, 12 + (s >> 1) * 8);
++            kq_dec_q5_K_w(h, qh8, vload8(0, qw), s, y);
++#  else
++            if ((s & 3) == 0) {
++                KQ_W_READ(ql0, (s >> 2) * 16);
++                KQ_W_READ(ql1, (s >> 2) * 16 + 8);
++                KQ_W_READ(qhw, 32 + (s >> 2) * 8);
++            }
++            kq_dec_q6_K_w((s & 1) ? vload8(0, ql1) : vload8(0, ql0), vload8(0, qhw), sc8, s, y);
++#  endif
++            const int8 b0 = as_int8(convert_half16(vload16(0, y)));
++            const int8 b1 = as_int8(convert_half16(vload16(0, y + 16)));
++            __attribute__((opencl_unroll_hint(KQ_GROUPS)))
++            for (uint g = 0; g < KQ_GROUPS; ++g) {
++                ushort aw0[8], aw1[8];
++                KQ_A_READ(aw0, kb * KQ_BLOCK + s * 32, r0 + g * 8);
++                KQ_A_READ(aw1, kb * KQ_BLOCK + s * 32 + 16, r0 + g * 8);
++                acc[g] = intel_sub_group_f16_f16_matrix_mad_k16(as_short8(vload8(0, aw0)), b0, acc[g]);
++                acc[g] = intel_sub_group_f16_f16_matrix_mad_k16(as_short8(vload8(0, aw1)), b1, acc[g]);
++            }
++        }
++    }
++#else
+     const uint nn = min(n, (uint)KQ_N - 1);
+     const __global uchar* wrow = weights + (ulong)nn * KQ_ROW_BYTES;
+ 
+@@ -307,6 +373,7 @@
+             }
+         }
+     }
++#endif  // KQ_2D
+     float sums[TILE_M];
+     __attribute__((opencl_unroll_hint(KQ_GROUPS)))
+     for (uint g = 0; g < KQ_GROUPS; ++g)
+--- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/include/batch_headers/kquant_utils.cl
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/include/batch_headers/kquant_utils.cl
+@@ -106,6 +106,51 @@
+     }
+ }
+ 
++// The same three decodes from a super-block already in registers (the tiled variant's 2D
++// block loads, patch 0029): h is the block's first four dwords, q the eight dwords serving
++// the sub-block pair, qh/ql/sc the corresponding runs. Same arithmetic as the pointer forms,
++// bit for bit.
++inline void kq_dec_q4_K_w(uint4 h, uint8 q, uint s, float* y) {
++    const float d = kq_f16bits(h.s0), dmin = kq_f16bits(h.s0 >> 16);
++    uint sc, mn;
++    kq_scale_min_k4(s, h.s1, h.s2, h.s3, &sc, &mn);
++    const float dl = d * (float)sc, ml = dmin * (float)mn;
++    const uint shift = (s & 1) * 4;
++    __attribute__((opencl_unroll_hint(32)))
++    for (int l = 0; l < 32; ++l)
++        y[l] = dl * (float)((q[l >> 2] >> ((l & 3) * 8 + shift)) & 0xFu) - ml;
++}
++inline void kq_dec_q5_K_w(uint4 h, uint8 qh, uint8 q, uint s, float* y) {
++    const float d = kq_f16bits(h.s0), dmin = kq_f16bits(h.s0 >> 16);
++    uint sc, mn;
++    kq_scale_min_k4(s, h.s1, h.s2, h.s3, &sc, &mn);
++    const float dl = d * (float)sc, ml = dmin * (float)mn;
++    const uint shift = (s & 1) * 4;
++    __attribute__((opencl_unroll_hint(32)))
++    for (int l = 0; l < 32; ++l) {
++        const uint nib = (q[l >> 2] >> ((l & 3) * 8 + shift)) & 0xFu;
++        const uint hb = (qh[l >> 2] >> ((l & 3) * 8 + s)) & 1u;
++        y[l] = dl * (float)(nib | (hb << 4)) - ml;
++    }
++}
++// ql: the run's 32 bytes of ql (dwords hh*16 + (r&1)*8 ..), qh: the half's 32 bytes (dwords
++// 32 + hh*8 ..), sc: dwords 48..55 of the 224-byte block (scales, then d at byte 208).
++inline void kq_dec_q6_K_w(uint8 ql, uint8 qh, uint8 sc, uint s, float* y) {
++    const float d = kq_f16bits(sc[4]);
++    const uint hh = s >> 2, r = s & 3;
++    const uint sb = hh * 8 + 2 * r;   // byte of scales[16]
++    const float s0 = d * (float)((int)(char)((sc[sb >> 2] >> ((sb & 3) * 8)) & 0xFFu));
++    const float s1 = d * (float)((int)(char)((sc[(sb + 1) >> 2] >> (((sb + 1) & 3) * 8)) & 0xFFu));
++    const uint shift = 2 * r;
++    const uint nib = (r >> 1) * 4;
++    __attribute__((opencl_unroll_hint(32)))
++    for (int l = 0; l < 32; ++l) {
++        const uint lo = (ql[l >> 2] >> ((l & 3) * 8 + nib)) & 0xFu;
++        const uint hi = (qh[l >> 2] >> ((l & 3) * 8 + shift)) & 3u;
++        y[l] = (l < 16 ? s0 : s1) * (float)((int)(lo | (hi << 4)) - 32);
++    }
++}
++
+ // ---- packers for the matrix unit ----
+ #define KQ_HALF_BASE 0x64006400u   // two f16 1024.0: 0x6400 | q is f16(1024 + q) for 0 <= q < 1024
+ #define KQ_ONES8 ((int8)(0x3C003C00))  // sixteen f16 1.0: the B operand that sums the activations
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_kquant.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_kquant.cpp
+@@ -2,6 +2,8 @@
+ #include "fully_connected_kernel_kquant.h"
+ #include "kernel_selector_utils.h"
+ #include <algorithm>
++#include <cstdlib>
++#include <string>
+ 
+ namespace kernel_selector {
+ 
+@@ -12,9 +14,38 @@
+ // latency. Kernel 1 carries kTileMGemm rows (prefill): the weights are read once per tile and
+ // the row tiles supply the parallelism. The tile is bounded by the register file (the decoded
+ // sub-block, the activations and four partial sums per row all live in registers).
+-static constexpr size_t kTileMGemm = 32;
++static constexpr size_t kTileMGemm = 32;       // Xe-HPG (the tiled kernel is built in the 256-register mode, below)
++static constexpr size_t kTileMGemmXe2 = 64;    // Xe2
+ static constexpr size_t kColumnGroups = 8; // subgroups per work-group sharing the staged activation tile (prefill)
+-static size_t tile_m_of(int kernel_number) { return kernel_number == 0 ? 1 : kTileMGemm; }
++// The row tile and the register file go together (DESIGN 7.0.2bn, the timing test with its
++// operands in device memory): on Xe2, 64 rows at 256 registers beat 32 at 128 on every served
++// shape (the Q6_K down projection at 856 rows 7.2 -> 4.4 ms, the gate at 2,048 rows 12.1 ->
++// 7.2) and 64 rows at 128 registers spill; on Xe-HPG the 256-register mode wins at 32 rows
++// (Q6_K 14.8 -> 12.9, Q5_K 3.2 -> 2.7) and 64 rows lose on Q6_K there (18.3), so the tile
++// stays 32. The tiled kernel alone is built in that mode: the decode kernel measured a loss
++// there (DESIGN 7.0.2bd).
++static bool large_grf(const fully_connected_params&) { return true; }
++static size_t tile_m_of(const fully_connected_params& params, int kernel_number) {
++    if (kernel_number == 0) return 1;
++    return params.engineInfo.arch >= gpu_arch::xe2 ? kTileMGemmXe2 : kTileMGemm;
++}
++// The tiled variant reads both operands by 2D block loads on Xe2 (patch 0029, DESIGN
++// 7.0.2bn): the activation tile from global memory in the matrix unit's A layout and the
++// subgroup's sixteen weight rows by transposed 32-bit block reads. The message addresses
++// 32-bit elements, so the row pitch must be a multiple of 16 bytes and the block's byte
++// offsets multiples of 4: the K-quant layouts with dword-aligned blocks (Q4_K 144, Q5_K 176,
++// the 224-byte Q6_K), not the file's 210-byte Q6_K rows or Q8_0's 34-byte blocks. Every
++// activation row must be one pitch from the last (no padding on any axis).
++static bool two_d_loads(const fully_connected_params& params, int kernel_number) {
++    if (kernel_number == 0 || params.engineInfo.arch < gpu_arch::xe2) return false;
++    const int t = params.kquant_type;
++    if (t != 12 && t != 13 && t != 114) return false;
++    if (FullyConnected_kquant::RowBytes(static_cast<uint8_t>(t), params.kquant_k) % 16 != 0) return false;
++    const auto& in = params.inputs[0];
++    if (in.Batch().pad.Total() != 0 || in.Feature().pad.Total() != 0) return false;
++    if (const char* e = std::getenv("ARCINT_KQ_2D")) return std::atoi(e) != 0;  // measurement: 0 forces the staged path
++    return true;
++}
+ // Both variants multiply on the matrix unit or read the activations as its A operand: the
+ // subgroup is its N, 16 on Xe2 and later, 8 before.
+ static size_t simd_of(const fully_connected_params& params, int kernel_number) {
+@@ -118,7 +149,7 @@
+ 
+ FullyConnected_kquant::DispatchData FullyConnected_kquant::SetDefault(const fully_connected_params& params, int, int kernel_number) const {
+     DispatchData d;
+-    d.tile_m = static_cast<uint32_t>(tile_m_of(kernel_number));
++    d.tile_m = static_cast<uint32_t>(tile_m_of(params, kernel_number));
+     d.tile_n = static_cast<uint32_t>(wg_of(params, kernel_number));  // subgroups per work-group, not a column tile
+     d.tile_mk = static_cast<uint32_t>(simd_of(params, kernel_number));  // the subgroup size
+     const size_t n = params.kquant_n;
+@@ -151,6 +182,7 @@
+     jit.AddConstant(MakeJitConstant("KQ_WG", static_cast<size_t>(dispatchData.tile_n)));
+     jit.AddConstant(MakeJitConstant("SIMD", static_cast<size_t>(dispatchData.tile_mk)));
+     jit.AddConstant(MakeJitConstant("KQ_ROWS", rows_per_group(params)));
++    jit.AddConstant(MakeJitConstant("KQ_2D", two_d_loads(params, dispatchData.tile_m > 1 ? 1 : 0) ? 1 : 0));
+     // Q6_K prefetches its next super-block on Xe2 only (measured both ways, DESIGN 7.0.2bd).
+     jit.AddConstant(MakeJitConstant("KQ_PREFETCH", params.engineInfo.arch >= gpu_arch::xe2 ? 1 : 0));
+     const bool out3d = params.outputs[0].GetLayout() == DataLayout::bfyx;
+@@ -199,8 +231,17 @@
+     if (kds.empty() || kds[0].kernels.empty())
+         return kds;
+     KernelsData tiled = GetCommonKernelsData(params, fc.inputs[0].GetLayout(), fc.weights.GetLayout(), EXE_MODE_DEFAULT, -1, 1);
+-    if (!tiled.empty() && !tiled[0].kernels.empty())
++    if (!tiled.empty() && !tiled[0].kernels.empty()) {
+         kds[0].kernels.push_back(tiled[0].kernels.back());
++        if (large_grf(fc)) {
++            // The tiled kernel alone in the 256-register mode (its own compile batch).
++            auto& options = kds[0].kernels.back().code.kernelString->options;
++            const std::string small = "-ze-exp-register-file-size 128";
++            const auto at = options.find(small);
++            if (at != std::string::npos) options.replace(at, small.size(), "-ze-exp-register-file-size 256");
++            options += " -cl-intel-256-GRF-per-thread";
++        }
++    }
+     GetUpdateDispatchDataFunc(kds[0]);
+     // A static shape dispatches without the update: pick the kernel here.
+     const int execute = kernel_for(kds[0], rows_of(fc));
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/fully_connected_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/fully_connected_gpu_test.cpp
+@@ -6773,8 +6773,8 @@
+     // The dense model's own tensor types at their shapes (Q4_K_M: gate/up and q/k/v Q4_K,
+     // the attention output Q5_K, the down projection Q6_K).
+     const std::vector<std::tuple<int, size_t, size_t, std::vector<long>>> shapes = {
+-        {12, 17408, 5120, {1L, 32L, 256L, 2048L}}, {12, 1024, 5120, {1L}}, {12, 5120, 5120, {1L}}, {12, 5120, 17408, {1L}},
+-        {13, 5120, 5120, {1L}}, {14, 5120, 17408, {1L}}, {14, 1024, 5120, {1L}}, {114, 5120, 17408, {1L}}, {114, 1024, 5120, {1L}}};
++        {12, 17408, 5120, {1L, 32L, 256L, 856L, 2048L}}, {12, 1024, 5120, {1L}}, {12, 5120, 5120, {1L}}, {12, 5120, 17408, {1L}},
++        {13, 5120, 5120, {1L, 856L, 2048L}}, {14, 5120, 17408, {1L}}, {14, 1024, 5120, {1L}}, {114, 5120, 17408, {1L, 856L, 2048L}}, {114, 1024, 5120, {1L}}};
+     const int rotation = 8;
+     for (const auto& sh : shapes) {
+     const int t = std::get<0>(sh);
+@@ -6782,15 +6782,17 @@
+     const size_t rb = kq_host::row_bytes(t, K);
+     std::vector<memory::ptr> weights_mems;
+     for (int r = 0; r < rotation; ++r) {
+-        auto wbytes = rg.generate_random_1d<uint8_t>(N * rb, 0, 255);
+-        auto wm = engine.allocate_memory({ { (long)N, (long)rb }, data_types::u8, format::bfyx });
+-        set_values(wm, wbytes);
++        auto wbytes = kq_host::random_rows(rg, t, N, K);  // valid scales: random bytes are NaN and infinity in f16, and time differently
++        // Device memory, explicitly: allocate_memory(layout) takes the lockable (host) allocation,
++        // and a kernel reading its activation rows over the bus times nothing (DESIGN 7.0.2bn).
++        auto wm = engine.allocate_memory({ { (long)N, (long)rb }, data_types::u8, format::bfyx }, allocation_type::usm_device);
++        wm->copy_from(get_test_stream(), wbytes.data(), true);
+         weights_mems.push_back(wm);
+     }
+     for (long m : std::get<3>(sh)) {
+         auto xh = rg.generate_random_1d<ov::float16>(m * K, -1.0f, 1.0f);
+-        auto input_mem = engine.allocate_memory({ { m, (long)K }, data_types::f16, format::bfyx });
+-        set_values(input_mem, xh);
++        auto input_mem = engine.allocate_memory({ { m, (long)K }, data_types::f16, format::bfyx }, allocation_type::usm_device);
++        input_mem->copy_from(get_test_stream(), xh.data(), true);
+         std::vector<std::unique_ptr<network>> nets;
+         for (int r = 0; r < rotation; ++r) {
+             auto fc = fully_connected("fc_kq", input_info("input"), "weights", "", data_types::f16, 2, 2, true);

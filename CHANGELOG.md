@@ -19,6 +19,27 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+- **0.4.1, the tiled variant's operands by 2D block loads on Xe2**
+  (DESIGN §7.0.2bn, plugin patch 0029, not yet in a built package). The
+  prefill kernel reads the activation block straight from global memory
+  in the matrix unit's layout and the weights by transposed block reads,
+  one message per 32 bytes of sixteen rows; the decode is unchanged, so
+  the result is exact: 21/21 on both cards, served outputs
+  byte-identical, Prüfstand 10/10. With the loads in place the row tile
+  goes to 64 in the 256-register mode on Xe2 (the tiled kernel alone is
+  built in that mode; Xe-HPG keeps 32 rows and gains the mode). Served
+  on the 24 GB card, the mixed form's prefill 672 → 907 t/s at 856
+  tokens and 385 → 451 at 71,727 (68 % and 98 % of the operator's
+  bars); the Q6_K down projection's launch at 856 rows 11.1 → 4.4 ms on
+  the timing test in device memory. Two forms measured and not shipped: the
+  packed B operand (`f16(1024 + q)`, the scale on the sums) is 2.7×
+  slower on the gate — every `dpas` starts from zero and its result is
+  read at once — and hoisting the operand loads ahead of the decode is
+  50 % slower served. The plugin's timing test had its activations in
+  host memory since it was written; every tiled figure it produced
+  before this entry timed the bus (the 2,048-row gate launch is 13.5 ms
+  in device memory, not 34.6), and the row-tile sweep recorded under
+  §7.0.2bm is retracted and re-measured.
 - **0.4.1, the tiled variant's tile in the matrix unit's layout**
   (DESIGN §7.0.2bm, plugin patch 0028, not yet in a built package). The
   prefill kernel stages its activation tile so that each matrix-multiply
