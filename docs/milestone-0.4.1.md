@@ -249,3 +249,13 @@ to keep on the other card.
   the Q6_K set 23.7 → 13.3 ms per step, the device 62.7 → 52.3 of a
   59.8 ms step; the 7.5 ms of host idle around the K-quant nodes is
   the largest item left against the 51.8 ms bar.
+- 2026-09-07 — **the host idle named and removed** (DESIGN §7.0.2bk,
+  patch 0027): a call log found 81 `clFinish` per served step against
+  the IR's 2; a thread-local and a gdb stack traced them to the
+  plugin's unfused-subgraph fallback, taken because its runtime fusion
+  check did not know the K-quant kernel — the kernel's fused ops had
+  never run. Accepted by name, the fused residual add runs in the
+  kernel bit-for-bit as before: 21/21 plugin cases on both cards, the
+  mixed form's decode step 59.8 → 54.7 ms at 1k (17.2 t/s, Prüfstand
+  10/10 at 18.4) and 77.7 → 73.3 at 71.7k, byte-identical. The decode
+  bar (51.8 ms) is 3 ms away at 1k.

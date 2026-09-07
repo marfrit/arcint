@@ -1,0 +1,166 @@
+# The K-quant kernel's fused ops run: the runtime fusion check accepts the kernel
+
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0003-0026. arcint 0.4.1 (DESIGN.md section 7.0.2bk).
+#
+# What changes:
+#   primitive_inst.cpp  is_valid_fusion(): for a dynamic OCL fully-connected node the check accepted
+#                       a fused eltwise only on the bf_tiled and bfyx_ref kernels; every K-quant node
+#                       with a fused eltwise (the residual add after each down and output projection,
+#                       the MLP's Swish and Multiply on the native form) was declared invalid every
+#                       step and executed through the unfused-subgraph fallback -- a separate
+#                       sub-network whose output read (network_output::get_memory) drains the queue
+#                       on an in-order stream: 79 clFinish per served decode step of the dense GGUF
+#                       model, 25 ms inside them, the card idle at each. The kernel's own FUSED_OPS
+#                       (patch 0021) had never executed. Now accepted by name.
+#   fully_connected_gpu_kquant.cl, fully_connected_kernel_kquant.cpp   The fused ops take the value
+#                       the unfused path would have stored -- the sum rounded to the output type --
+#                       so fusing changes no bit of the served output.
+#   fully_connected_gpu_test.cpp   Five correctness cases with a residual add fused into the op
+#                       (the decode and the tiled variant, both Q6_K layouts, Q5_K, Q4_K; the
+#                       residual a dynamic input, as in the served graph), each checking that the
+#                       eltwise is no longer a primitive of its own and that the output matches the
+#                       unfused rounding. A constant [1, M, N] residual makes the plugin's own fusing
+#                       throw "get_dims() is called for dynamic shape" -- not this patch's path.
+#
+# MEASURED 2026-09-07 (correctness 21/21 on both cards): served on the 24 GB card, mixed form with
+# the 224-byte Q6_K layout, u8 KV, one fresh process per cell, against 0026 on the same base:
+# the decode step 59.8 -> 54.7 ms at 856 tokens (17.2 t/s; Pruefstand 10/10 at 18.4 over its
+# 1,145 tokens against 17.0) and 77.7 -> 73.3 at 71,727 (11.1 t/s); greedy outputs byte-identical
+# at both depths; prefill 551 / 341 t/s. clFinish over the whole traced process: 6,663 with 0026,
+# 1,064 with this patch -- the per-step count from 81 to the IR's 2 (the load's are the same).
+# The timing test after this build: the type-114 rows read 2.7 ms per launch on the first run
+# and 202 us on the rerun (the cold-cache stall of a freshly compiled kernel, DESIGN 7.0.2bd).
+
+--- a/src/plugins/intel_gpu/src/graph/primitive_inst.cpp
++++ b/src/plugins/intel_gpu/src/graph/primitive_inst.cpp
+@@ -3080,8 +3080,13 @@
+         // TODO: Only fc_bf_tiled_kernel & ref kernel are verified for fused eltwise. To support more fc kernels for eltwise fusion
+         if (!get_node().get_selected_impl())
+             LOG_AND_RETURN_FALSE(_node);
++        // arcint (patch 0027): the K-quant kernel carries FUSED_OPS on its store in both variants
++        // (patch 0021); without this line every fused eltwise on a K-quant node ran through the
++        // unfused subgraph, whose output read drains the queue (79 clFinish per served decode
++        // step of the dense GGUF model, DESIGN 7.0.2bk).
+         if (!data_type_traits::is_i8_u8(get_node().get_input_layout(0).data_type) &&
+             (get_node().get_selected_impl()->get_kernel_name().find("fully_connected_gpu_bf_tiled") == std::string::npos) &&
++            (get_node().get_selected_impl()->get_kernel_name().find("fully_connected_gpu_kquant") == std::string::npos) &&
+             (get_node().get_selected_impl()->get_kernel_name().find("fully_connected_gpu_bfyx_ref") == std::string::npos)) {
+             LOG_AND_RETURN_FALSE(_node);
+         }
+--- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
+@@ -326,6 +326,9 @@
+         ACTIVATION_TYPE dequantized = TO_ACTIVATION_TYPE(sum);
+ #endif
+ #if HAS_FUSED_OPS
++        // The fused eltwise/activation sees the value the unfused path would have stored (the
++        // sum rounded to the output type), so fusing changes no bit (patch 0027).
++        const OUTPUT_TYPE dq_out = TO_OUTPUT_TYPE(ACTIVATION_TYPED(dequantized, ACTIVATION_PARAMS_TYPED));
+         FUSED_OPS;
+         output[dst_index] = FUSED_OPS_RESULT;
+ #else
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_kquant.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_kquant.cpp
+@@ -166,7 +166,8 @@
+     if (!params.fused_ops.empty()) {
+         std::vector<std::string> idx_order = out3d ? std::vector<std::string>{"b", "m", "n", "0"}
+                                                    : std::vector<std::string>{"m", "n", "0", "0"};
+-        FusedOpsConfiguration conf = {"", idx_order, "dequantized", activation_dt, 1};
++        // The fused ops take the output-typed value (patch 0027: the same bits as the unfused eltwise).
++        FusedOpsConfiguration conf = {"", idx_order, "dq_out", params.outputs[0].GetDType(), 1};
+         jit.Merge(MakeFusedOpsJitConstants(params, {conf}));
+     }
+     return jit;
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/fully_connected_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/fully_connected_gpu_test.cpp
+@@ -6636,7 +6636,7 @@
+ 
+ }  // namespace
+ 
+-class fully_connected_gpu_kquant : public ::testing::TestWithParam<std::tuple<int, long, bool, size_t, size_t>> {};
++class fully_connected_gpu_kquant : public ::testing::TestWithParam<std::tuple<int, long, bool, size_t, size_t, bool>> {};
+ 
+ TEST_P(fully_connected_gpu_kquant, matches_the_host_dequantized_reference) {
+     const int t = std::get<0>(GetParam());
+@@ -6646,6 +6646,7 @@
+     auto& engine = get_test_engine();
+ 
+     const size_t K = std::get<3>(GetParam()), N = std::get<4>(GetParam());
++    const bool with_residual = std::get<5>(GetParam());  // an eltwise sum of an [M, N] f16 tensor after the op, fused into it (patch 0027)
+     const size_t rb = kq_host::row_bytes(t, K);
+     auto wbytes = kq_host::random_rows(rg, t, N, K);
+     std::vector<float> wf(N * K);
+@@ -6673,18 +6674,46 @@
+     auto weights_mem = engine.allocate_memory({ { static_cast<long>(N), static_cast<long>(rb) }, data_types::u8, format::bfyx });
+     set_values(weights_mem, wbytes);
+ 
+-    auto fc = fully_connected("fc_kq", input_info("input"), "weights", "", data_types::f32, three_d ? 3 : 2, 2, true);
++    // f16 output when a residual is fused: the served model's own type, and the fused add's rounding is the point.
++    auto fc = fully_connected("fc_kq", input_info("input"), "weights", "", with_residual ? data_types::f16 : data_types::f32, three_d ? 3 : 2, 2, true);
+     fc.kquant_type = static_cast<uint8_t>(t);
+     fc.kquant_k = K;
+     fc.kquant_n = N;
+     const ov::PartialShape dyn_shape = three_d ? ov::PartialShape{1, -1, static_cast<long>(K)} : ov::PartialShape{-1, static_cast<long>(K)};
+     topology topology(input_layout("input", layout{ dyn_shape, data_types::f16, format::bfyx }), data("weights", weights_mem), fc);
++    std::vector<ov::float16> resh;
++    memory::ptr res_mem_keep;
++    if (with_residual) {
++        resh = rg.generate_random_1d<ov::float16>(static_cast<size_t>(m) * N, -4.0f, 4.0f);
++        const ov::PartialShape res_shape = three_d ? ov::PartialShape{1, m, static_cast<long>(N)} : ov::PartialShape{m, static_cast<long>(N)};
++        auto res_mem = engine.allocate_memory({ res_shape, data_types::f16, format::bfyx });
++        set_values(res_mem, resh);
++        // the residual is another node's output in the served graph, not a constant: a dynamic input here
++        // (a constant [1, M, N] residual makes the plugin's fusing throw "get_dims() is called for dynamic shape")
++        const ov::PartialShape res_dyn = three_d ? ov::PartialShape{1, -1, static_cast<long>(N)} : ov::PartialShape{-1, static_cast<long>(N)};
++        topology.add(input_layout("res", layout{ res_dyn, data_types::f16, format::bfyx }));
++        topology.add(eltwise("add", { input_info("fc_kq"), input_info("res") }, eltwise_mode::sum));
++        topology.add(reorder("out", input_info("add"), format::bfyx, data_types::f32));
++        res_mem_keep = res_mem;
++    }
+     auto config = get_test_default_config(engine);
+     config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+     config.set_property(ov::intel_gpu::optimize_data(true));
+     network net(engine, topology, config);
+     net.set_input_data("input", input_mem);
++    if (with_residual) net.set_input_data("res", res_mem_keep);
+     auto outputs = net.execute();
++    if (with_residual) {
++        // Fused: the eltwise is no longer a primitive of its own, and the op ran it (the unfused-subgraph
++        // fallback would leave the outputs right but the queue drained per node -- DESIGN 7.0.2bk).
++        const auto ids = net.get_executed_primitive_ids();
++        EXPECT_TRUE(std::find(ids.begin(), ids.end(), "add") == ids.end()) << "the residual add was not fused into the K-quant op";
++        for (size_t i = 0; i < ref.size(); ++i) {
++            // the unfused path: the f16 sum, then the f16 add; the fused path must match it bit for bit
++            const float y16 = static_cast<float>(ov::float16(ref[i]));
++            ref[i] = static_cast<float>(ov::float16(y16 + static_cast<float>(resh[i])));
++        }
++    }
+     ASSERT_EQ(outputs.size(), size_t(1));
+     auto out_mem = outputs.begin()->second.get_memory();
+     cldnn::mem_lock<float> out(out_mem, get_test_stream());
+@@ -6700,13 +6729,17 @@
+ // (type, M, 3-D activation, K, N): K spans one to five super-blocks (so lanes get unequal
+ // sub-block counts), N is not a multiple of the subgroup, M crosses the row tile.
+ INSTANTIATE_TEST_SUITE_P(smoke, fully_connected_gpu_kquant,
+-    ::testing::Values(std::make_tuple(12, 1L, false, 512, 48), std::make_tuple(12, 37L, false, 512, 48),
+-                      std::make_tuple(12, 5L, true, 512, 48), std::make_tuple(13, 3L, false, 512, 48),
+-                      std::make_tuple(14, 1L, false, 512, 48), std::make_tuple(14, 19L, true, 512, 48),
+-                      std::make_tuple(114, 1L, false, 512, 48), std::make_tuple(114, 19L, true, 512, 48),
+-                      std::make_tuple(8, 2L, false, 512, 48), std::make_tuple(8, 1L, false, 512, 48), std::make_tuple(13, 1L, false, 768, 48),
+-                      std::make_tuple(12, 100L, true, 1280, 300), std::make_tuple(14, 65L, false, 256, 17),
+-                      std::make_tuple(8, 1L, false, 96, 5), std::make_tuple(13, 33L, true, 768, 64)));
++    ::testing::Values(std::make_tuple(12, 1L, false, 512, 48, false), std::make_tuple(12, 37L, false, 512, 48, false),
++                      std::make_tuple(12, 5L, true, 512, 48, false), std::make_tuple(13, 3L, false, 512, 48, false),
++                      std::make_tuple(14, 1L, false, 512, 48, false), std::make_tuple(14, 19L, true, 512, 48, false),
++                      std::make_tuple(114, 1L, false, 512, 48, false), std::make_tuple(114, 19L, true, 512, 48, false),
++                      std::make_tuple(8, 2L, false, 512, 48, false), std::make_tuple(8, 1L, false, 512, 48, false), std::make_tuple(13, 1L, false, 768, 48, false),
++                      std::make_tuple(12, 100L, true, 1280, 300, false), std::make_tuple(14, 65L, false, 256, 17, false),
++                      std::make_tuple(8, 1L, false, 96, 5, false), std::make_tuple(13, 33L, true, 768, 64, false),
++                      // the residual add fused into the op (patch 0027): both variants, both Q6_K layouts, Q5_K
++                      std::make_tuple(114, 1L, true, 512, 48, true), std::make_tuple(114, 19L, true, 512, 48, true),
++                      std::make_tuple(14, 1L, false, 512, 48, true), std::make_tuple(13, 1L, true, 512, 48, true),
++                      std::make_tuple(12, 37L, true, 512, 48, true)));
+ 
+ TEST(fully_connected_gpu_kquant_refusal, a_k_that_is_not_a_whole_number_of_super_blocks_has_no_kernel) {
+     auto& engine = get_test_engine();

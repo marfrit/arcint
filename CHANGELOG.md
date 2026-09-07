@@ -19,6 +19,19 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+- **0.4.1, the K-quant kernel's fused ops run** (DESIGN §7.0.2bk, plugin
+  patch 0027, not yet in a built package). The plugin's runtime fusion
+  check accepted a fused eltwise on a dynamic fully-connected node only
+  on two of its own kernels; every K-quant node with a fused residual
+  add was executed through the unfused-subgraph fallback, whose output
+  read drains the queue — 79 `clFinish` per served decode step, the
+  card idle at each, the "host time per K-quant node" of §7.0.2bg. The
+  check now accepts the K-quant kernel, whose fused ops take the value
+  the unfused path stored, so nothing changes bit-wise; 21/21 plugin
+  cases on both cards with five fused ones. Served on the 24 GB card:
+  the mixed form's decode 15.5 → 17.2 t/s at 856 tokens (the step
+  59.8 → 54.7 ms; Prüfstand 10/10 at 18.4 t/s) and 10.3 → 11.1 at
+  71,727 (77.7 → 73.3 ms), outputs byte-identical.
 - **0.4.1, the native Q6_K rows in 224-byte blocks** (DESIGN §7.0.2bj,
   plugin patch 0026, `--gguf-q6k aligned|file`, default `aligned`; not
   yet in a built package). The Q6_K rows of a GGUF-opened model are laid

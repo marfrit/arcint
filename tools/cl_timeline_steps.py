@@ -27,6 +27,7 @@ ap.add_argument("--marker", default=None, help="kernel name occurring once per s
 ap.add_argument("--dump-steps", action="store_true")
 ap.add_argument("--prefill", action="store_true", help="also report the launches before the first decode step back to the last gap > --prefill-gap-ms (the served prefill)")
 ap.add_argument("--prefill-gap-ms", type=float, default=1000.0)
+ap.add_argument("--host", action="store_true", help="with CLI_ChromeCallLogging: the host API calls per steady step, by name (count and host time)")
 a = ap.parse_args()
 
 raw = open(a.trace, "rb").read().decode("utf-8", "replace").strip()
@@ -39,9 +40,15 @@ except json.JSONDecodeError:
 if isinstance(ev, dict):
     ev = ev.get("traceEvents", [])
 
+host = []
 dev = []
 for e in ev:
     if e.get("ph") != "X":
+        continue
+    if str(e.get("tid", 0)) in ("0", "0.0") or (isinstance(e.get("tid"), int)):
+        # host API calls (CLI_ChromeCallLogging): integer tids are host threads
+        if a.host and e.get("cat") != "Device":
+            ts = float(e["ts"]); host.append((ts, ts + float(e.get("dur", 0.0)), e.get("name", "?")))
         continue
     # device commands sit on queue threads (tid "N.1"); the host thread is tid 0
     if str(e.get("tid", 0)) in ("0", "0.0"):
@@ -158,6 +165,26 @@ if a.prefill and len(steps) > 1:
     print(f"{'count':>6} {'ms':>8} {'share':>6} {'us/launch':>9}  name")
     for n, (c, t) in sorted(pagg.items(), key=lambda kv: -kv[1][1])[: a.top]:
         print(f"{c:6d} {t/1000:8.2f} {100*t/ptot:5.1f}% {t/c:9.1f}  {n[:110]}")
+
+# host API calls per steady step: the calls whose start falls inside the step's device span,
+# widened by the inter-step gap so the enqueues that precede the step's first kernel count too
+if a.host and host:
+    host.sort()
+    hagg = collections.defaultdict(lambda: [0, 0.0])
+    nst = 0
+    for k in range(len(steps) - a.tail, len(steps)):
+        st = steps[k]
+        lo = steps[k - 1][-1][1] if k > 0 else st[0][0]
+        hi = st[-1][1]
+        for ts, te, n in host:
+            if lo <= ts < hi:
+                hagg[n][0] += 1; hagg[n][1] += te - ts
+        nst += 1
+    tot = sum(v[1] for v in hagg.values())
+    print(f"\nhost API calls per step (steady, {nst} steps): {sum(v[0] for v in hagg.values())/nst:.0f} calls, {tot/nst/1000:.2f} ms inside the calls")
+    print(f"{'count':>7} {'ms/step':>8} {'us/call':>8}  call")
+    for n, (c, t) in sorted(hagg.items(), key=lambda kv: -kv[1][1])[: a.top]:
+        print(f"{c/nst:7.0f} {t/nst/1000:8.3f} {t/c:8.1f}  {n[:90]}")
 
 # the largest intra-step gaps (host stalls inside a step)
 if a.dump_steps:

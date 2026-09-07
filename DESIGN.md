@@ -7391,6 +7391,95 @@ untouched" (above; the served timeline shows 229 → 123 µs and the
 lm_head 5.35 → 2.56 ms), and §7.0.2bh's "about 5 ms per step" for
 this layout, which was the long-K figure applied to the whole set.
 
+#### 7.0.2bk 0.4.1, the host idle around the K-quant nodes named: the plugin's runtime fusion check rejects our kernel, every fused residual add runs through the unfused-subgraph fallback, and that fallback drains the queue — 79 times per step; patch 0027 (2026-09-07)
+
+§7.0.2bg had the mixed form's step at 62.7 ms of device time in 71.1,
+and the idle scaling with the K-quant node count (0 nodes 2.3 ms, 113
+nodes 8.4, 401 nodes 14.2) with a per-execution allocation as the
+hypothesis; §7.0.2bj's v28 step had 52.3 of 59.8. The instrument that
+named it was the intercept layer's host call log on one served step
+(`tools/cl_timeline_steps.py --host`): the mixed form issues 20,894
+OpenCL calls per step against the IR's 14,809, and among them
+**81 `clFinish` against the IR's 2** — 25 ms of the step spent inside
+a full queue drain, one after every K-quant projection: the sequence
+is the K-quant launch, a `generic_eltwise_ref` launch, a flush, a
+finish, the next norm. No allocation call appears per step: the
+allocation hypothesis of §7.0.2bg is retracted.
+
+Naming the caller took three instruments, in order: an environment-
+gated print at the plugin's two per-node drain sites (the shape-
+inference sync and the gather skip check) — zero hits; a thread-local
+"current primitive" printed from the stream's own `finish()` — the
+residual `Add` of every layer, 80 per forward, plus the graph's
+Result; and gdb on a relink of the plugin without `-s`, breaking on
+`clFinish` after the load's 1,450 drains — the stack:
+`clFinish ← ocl_stream::finish ← primitive_inst::execute ←
+network::execute_impl`, through the one inline `finish` in the
+plugin's headers: `network_output::get_memory()`, which drains the
+stream on an in-order queue, called at the end of the **unfused-
+subgraph** path of `primitive_inst::execute`.
+
+The mechanism, read from the source once the stack pointed at it.
+The fusing pass fuses the residual add (and the MLP's Swish and
+Multiply) into the K-quant node at build, because patch 0021 declared
+`FUSED_OPS` support and the kernel carries it on its store. At run
+time, for a dynamic node, `primitive_inst::is_valid_fusion()` accepts
+a fused eltwise on an OCL fully-connected node only when the selected
+kernel's name contains `fully_connected_gpu_bf_tiled` or
+`fully_connected_gpu_bfyx_ref` ("only these are verified for fused
+eltwise"); ours is `fully_connected_gpu_kquant`, so every K-quant node
+with a fused eltwise is declared invalid every step and executed
+through `get_unfused_subgraph()`: a separate sub-network of the node
+and its fused primitives, whose output memory is read back through
+`network_output::get_memory()` — the drain. So the K-quant kernel's
+fused path had never executed in any served number of this milestone;
+the residual add ran as its own launch (the 79 `generic_eltwise_ref`
+of §7.0.2bg's census), and the card idled at each of the 79 drains.
+The repack form has no K-quant node and 2.3 ms of idle; the native
+form has fused eltwise on 401 nodes and 14.2.
+
+**Patch 0027**: the runtime check accepts the K-quant kernel; the
+kernel's fused ops take the output-typed value (the sum rounded to
+f16, what the unfused add saw) so the fusion changes no bit; the
+correctness set gains five cases with a residual add fused into the
+op (both variants, both Q6_K layouts, Q5_K, Q4_K), each checking that
+the eltwise is no longer a primitive of its own and that the output
+matches the unfused rounding.
+
+**Measured.** The plugin's correctness set 21/21 on both cards (the
+five fused cases among them). Served on the 24 GB card, mixed form
+with the 224-byte Q6_K layout, `u8` KV, one fresh process per cell,
+against §7.0.2bj's cells on the same runtime base:
+
+| mixed form | prefill | decode (64 tokens) | step | Prüfstand | greedy output |
+|---|---|---|---|---|---|
+| 856 tokens, 0026 | 531 t/s | 15.5 t/s | 59.8 ms | 10/10 at 17.0 t/s | 23e06c37e0d6 |
+| 856 tokens, 0027 | 551 | **17.2** | **54.7** | **10/10 at 18.4** | 23e06c37e0d6 |
+| 71,727 tokens, 0026 | 335 | 10.3 | 77.7 | — | 086d5e71ad47 |
+| 71,727 tokens, 0027 | 341 | 11.1 | **73.3** | — | 086d5e71ad47 |
+
+Byte-identical at both depths: the fused add rounds where the unfused
+one did. Five milliseconds off the step at 1k and four at depth, and
+the call log of the same served process on the fixed plugin: 1,064 `clFinish` in the whole trace against 6,663 with 0026 — the load's own drains being the same, the per-step count from 81 to the IR's 2.
+Against the operator's decode bar the mixed form stands at 54.7 ms
+against 51.8 — 17.2 t/s against 19.3 at 1k, 11.1 against 13.8 at
+depth — with the augmentation's packing (§7.0.2bg, about 1.7 ms) and
+Q5_K's rate (0.6) the items left on the device, and the host's share
+now measured rather than inferred. On the timing test's side, a note
+for the next reader: the type-114 rows of the first run after this
+build read 2.7 ms per launch and 202 µs on the rerun — §7.0.2bd's
+cold-cache stall on a freshly compiled kernel, not the kernel.
+
+Retracted here (§7.0.1): §7.0.2bg's per-execution allocation as the
+host cost per K-quant node (no allocation call per step; the cost was
+the fallback's drain), and its "30–50 µs of host time per K-quant
+execution" as a mechanism (it was ~95 µs of drained idle per fused
+node); §7.0.2bg's and the handoff's "the MLP's Swish and Multiply are
+fused into the K-quant kernel" as a statement about execution (fused
+at build, unfused at run time through the fallback); §7.0.2be's
+"fused post-op … removes 160 launches" stands corrected in the other
+direction: the launches existed because the fusion never ran.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

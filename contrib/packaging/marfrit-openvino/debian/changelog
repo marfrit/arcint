@@ -1,3 +1,25 @@
+marfrit-openvino (2026.4.0~dev20260821+p10-1) bookworm trixie; urgency=medium
+
+  * Three more patches applied on top of +p9, same upstream commit
+    (71640275), same smallest-sufficient-divergence numbering:
+    - patches/0025: the Q6_K decode row without variable-index shuffles
+      (16-bit block reads at the dword below the 2-aligned block, a
+      fixed-delta shuffle-down for odd blocks). Q6_K down projection 400
+      -> 259 us on the 24 GB card, 385 -> 262 on the 16 GiB card; exact.
+      DESIGN 7.0.2bi.
+    - patches/0026: K-quant type 114, Q6_K in 224-byte dword-aligned
+      blocks (arcint's --gguf-q6k aligned layout, the default): 262 ->
+      204 us; the mixed form's prefill 418 -> 531 t/s at 1k. DESIGN
+      7.0.2bj.
+    - patches/0027: the runtime fusion check accepts the K-quant kernel,
+      so a fused residual add runs in the kernel instead of through the
+      unfused-subgraph fallback that drained the queue 79 times per
+      served step; bit-identical. The mixed form's decode step 59.8 ->
+      54.7 ms at 1k (17.2 t/s, Pruefstand 10/10 at 18.4) and 77.7 -> 73.3
+      at 71.7k. DESIGN 7.0.2bk.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 07 Sep 2026 16:10:00 +0200
+
 marfrit-openvino (2026.4.0~dev20260821+p9-1) bookworm trixie; urgency=medium
 
   * One more patch applied on top of +p8, same upstream commit (71640275),

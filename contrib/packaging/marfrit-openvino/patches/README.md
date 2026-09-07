@@ -484,7 +484,7 @@ Exact, 14/14 on both cards, served outputs byte-identical, Prüfstand
 the mixed form's decode 13.4 → 15.3 t/s at 856 tokens and 9.6 → 11.9 at
 71,727 (eight milliseconds off the step at both depths).
 
-Package: not yet built (`+p10`).
+Package: `+p10` (2026-09-07).
 
 ### 0026-kquant-q6k-224-byte-blocks.patch
 
@@ -501,7 +501,24 @@ card; the K = 5,120 shapes unchanged. Served, the mixed form's prefill
 variant's loads were paying for the alignment too), the decode step
 1–2 ms shorter; 6.7 % more bytes on the Q6_K set.
 
-Package: not yet built (`+p10`).
+Package: `+p10` (2026-09-07).
+
+### 0027-kquant-fused-ops-run.patch
+
+The plugin's runtime fusion check accepts the K-quant kernel (DESIGN
+§7.0.2bk). Until now a fused eltwise on a dynamic fully-connected node
+was accepted only on the bf_tiled and reference kernels, so every
+K-quant node with a fused residual add was executed through the
+unfused-subgraph fallback, whose output read drains the queue: 79
+`clFinish` per served decode step, the card idle at each — the "host
+time per K-quant node" of §7.0.2bg, named by a call log, a thread-local
+and a gdb stack. The kernel's fused ops take the value the unfused path
+stored (the sum rounded to the output type), so nothing changes bit-wise;
+five correctness cases with a fused residual added. Served on the 24 GB
+card: the mixed form's decode step 59.8 → 54.7 ms at 856 tokens (17.2
+t/s, Prüfstand 10/10 at 18.4) and 77.7 → 73.3 at 71,727, byte-identical.
+
+Package: `+p10` (2026-09-07).
 
 ## Deliberately NOT applied
 
