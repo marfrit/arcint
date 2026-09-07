@@ -7361,9 +7361,35 @@ operator's bars the mixed form stands at 40 % of the prefill bar at
 1k (531 of 1,341) and 73 % at depth (335 of 460), and at 59.8 ms
 against the decode bar's 51.8.
 
-Retracted here (§7.0.1): nothing; §7.0.2bh's "about 5 ms per step"
-for this layout was the long-K figure applied to the whole set, and
-is corrected above to what it is.
+**Correction, the same afternoon, from the served step's device
+timeline** (the instrument of §7.0.2bg on the v28 process, 856
+tokens, steady state): the K = 5,120 Q6_K shapes did move — the
+twenty-four mid-size projections run at 123 µs per launch against 229
+under 0024 and the lm_head at 2.56 ms against 5.35 — and the timing
+test's N 1,024 shape, at 27 µs, sits at the launch floor and cannot
+show it; "did not move" above is retracted. The split of that gain
+between 0025 (the shuffles) and 0026 (the layout) is not measured for
+those shapes. The step, on the device, under v28:
+
+| per step, 856 tokens, mixed form, v28 | ms | launches |
+|---|---|---|
+| runtime gemm on the repacked Q4_K set | 30.2 + 0.9 | 272 + 272 |
+| K-quant Q6_K: 31 down projections at 239 µs, 24 at 123, the lm_head 2.56, the rest 0.4 | **13.3** (23.7 under 0024) | 65 |
+| K-quant Q5_K, 48 at 68.6 µs | 3.2 | 48 |
+| everything else | 4.7 | ~1,470 |
+| device busy | **52.3** (62.7 under 0024) | 2,125 |
+| the untraced step (§7.0.2bj's cell) | 59.8 | |
+| idle in the untraced step | **7.5** | |
+
+Against the bar's 51.8 ms the idle is the largest single item left,
+and it is host time around the K-quant nodes (§7.0.2bg: 0 nodes
+2.3 ms, 113 nodes 8.4); what the host does per execution of our node
+is the next instrument.
+
+Retracted here (§7.0.1): §7.0.2bj's own "the K = 5,120 Q6_K shapes
+untouched" (above; the served timeline shows 229 → 123 µs and the
+lm_head 5.35 → 2.56 ms), and §7.0.2bh's "about 5 ms per step" for
+this layout, which was the long-K figure applied to the whole set.
 
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 

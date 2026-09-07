@@ -243,5 +243,9 @@ to keep on the other card.
   prefill 418 → 531 t/s at 1k and 291 → 335 at 71.7k (the tiled
   variant's loads were paying for the alignment too), the decode step
   60.8 → 59.8 and 79.9 → 77.7 ms — the 33 Q6_K tensors with K = 5,120
-  (the lm_head among them) sit on the short-K dispatch and did not
-  move: the next thing to time on the served step's timeline.
+  (the lm_head among them) looked unmoved in the timing test (its
+  N 1,024 shape is at the launch floor); the served timeline shows them
+  at 123 µs against 229 and the lm_head at 2.56 ms against 5.35 —
+  the Q6_K set 23.7 → 13.3 ms per step, the device 62.7 → 52.3 of a
+  59.8 ms step; the 7.5 ms of host idle around the K-quant nodes is
+  the largest item left against the 51.8 ms bar.
