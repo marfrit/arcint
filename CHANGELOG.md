@@ -20,7 +20,8 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 ## Unreleased
 
 - **0.4.1, the K-quant kernel's fused ops run** (DESIGN §7.0.2bk, plugin
-  patch 0027, not yet in a built package). The plugin's runtime fusion
+  patch 0027; `marfrit-openvino +p10` = patches 0003–0027, built in 12
+  minutes and installed on the dev host, 2026-09-07). The plugin's runtime fusion
   check accepted a fused eltwise on a dynamic fully-connected node only
   on two of its own kernels; every K-quant node with a fused residual
   add was executed through the unfused-subgraph fallback, whose output
@@ -33,8 +34,8 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   59.8 → 54.7 ms; Prüfstand 10/10 at 18.4 t/s) and 10.3 → 11.1 at
   71,727 (77.7 → 73.3 ms), outputs byte-identical.
 - **0.4.1, the native Q6_K rows in 224-byte blocks** (DESIGN §7.0.2bj,
-  plugin patch 0026, `--gguf-q6k aligned|file`, default `aligned`; not
-  yet in a built package). The Q6_K rows of a GGUF-opened model are laid
+  plugin patch 0026, `--gguf-q6k aligned|file`, default `aligned`; in
+  `+p10`). The Q6_K rows of a GGUF-opened model are laid
   out at load in 224-byte super-blocks (the file's 210 bytes then 14
   zero bytes; kquant type 114) so every block is dword-aligned and the
   decode row needs no shuffle; 6.7 % more bytes on that set (the
@@ -46,7 +47,7 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   Q6_K shapes, the lm_head among them, are on the short-K dispatch and
   did not move.
 - **0.4.1, the Q6_K decode row without variable-index shuffles** (DESIGN
-  §7.0.2bi, plugin patch 0025, not yet in a built package). The ISA of
+  §7.0.2bi, plugin patch 0025; in `+p10`). The ISA of
   the sixteen-row decode bodies counted (`tools/igadis.cpp`): the Q6_K
   row spent 118 of its 296 instructions per row and super-block on
   fetching words from other lanes (ten shuffles and ten run-time-index
