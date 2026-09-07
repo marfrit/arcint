@@ -18,7 +18,9 @@
 #   kquant_utils.cl     The three decodes from a super-block already in registers (kq_dec_*_w),
 #                       the same arithmetic as the pointer forms.
 #   fully_connected_kernel_kquant.cpp   KQ_2D from the architecture, the type, the row pitch (a
-#                       multiple of 16 bytes) and the input's padding (none); ARCINT_KQ_2D=0
+#                       multiple of 16 bytes) and the input's layout (pitches equal to the
+#                       logical dims on every axis, no first-element offset: the block is
+#                       addressed from the buffer's start at a pitch of K); ARCINT_KQ_2D=0
 #                       forces the staged path for measurement. The row tile is 64 on Xe2, 32 on
 #                       Xe-HPG, and the tiled kernel alone is compiled in the 256-register mode
 #                       (-cl-intel-256-GRF-per-thread, its own batch); the decode kernel stays at
@@ -35,6 +37,8 @@
 #     projection 5,120 x 17,408: 10,884 / 25,086 -> 4,384 / 9,929.
 #   16 GiB card (staged, 32 x 256): gate 10,335 / 24,435 -> 8,021 / 18,767; Q5_K 3,179 / 7,202 ->
 #     2,730 / 6,382; Q6_K 14,824 / 33,813 -> 12,929 / 30,350. Its M = 1 decode figures unchanged.
+#   The file-layout Q6_K (type 14, --gguf-q6k file; the staged path at 64 x 256 on the 24 GB
+#     card): 9,888 us at M = 856 against the aligned layout's 4,399.
 # Served on the 24 GB card (mixed form, u8 KV, +p10 base): prefill 672 -> 907 t/s at 856 tokens
 # and 385 -> 451 at 71,727 (the operator's bars 1,341 and 460); the decode step unchanged (54.9 /
 # 73.3 ms); Pruefstand 10/10; greedy outputs byte-identical at both depths (23e06c37e0d6,
@@ -55,7 +59,7 @@
  //
  // Every loop over the tile has a compile-time bound and every private array a constant index
  // after unrolling: rows and columns past the end are clamped to the last one and their
-@@ -239,6 +239,72 @@
+@@ -239,6 +239,74 @@
      for (uint j = 0; j < KQ_WG; ++j) sums[0] += red[lane][j];
  #else
      const uint n = (get_group_id(0) * KQ_WG + sg) * SIMD + lane;   // lane = output column; the work-group's subgroups take KQ_WG x SIMD columns
@@ -90,10 +94,12 @@
 +        const uint4 h = (uint4)(hw[0], hw[1], hw[2], hw[3]);
 +        const uint8 qh8 = vload8(0, qhw);
 +        uint qw[8];
-+#  else
++#  elif KQ_TYPE == 114
 +        uint scw[8], ql0[8], ql1[8], qhw[8];
 +        KQ_W_READ(scw, 48);
 +        const uint8 sc8 = vload8(0, scw);
++#  else
++#    error "fully_connected_gpu_kquant.cl: the 2D block loads serve Q4_K, Q5_K and the 224-byte Q6_K only"
 +#  endif
 +        __attribute__((opencl_unroll_hint(KQ_SUBS)))
 +        for (uint s = 0; s < KQ_SUBS; ++s) {
@@ -104,7 +110,7 @@
 +#  elif KQ_TYPE == 13
 +            if ((s & 1) == 0) KQ_W_READ(qw, 12 + (s >> 1) * 8);
 +            kq_dec_q5_K_w(h, qh8, vload8(0, qw), s, y);
-+#  else
++#  elif KQ_TYPE == 114
 +            if ((s & 3) == 0) {
 +                KQ_W_READ(ql0, (s >> 2) * 16);
 +                KQ_W_READ(ql1, (s >> 2) * 16 + 8);
@@ -128,7 +134,7 @@
      const uint nn = min(n, (uint)KQ_N - 1);
      const __global uchar* wrow = weights + (ulong)nn * KQ_ROW_BYTES;
  
-@@ -307,6 +373,7 @@
+@@ -307,6 +375,7 @@
              }
          }
      }
@@ -201,7 +207,7 @@
  
  namespace kernel_selector {
  
-@@ -12,9 +14,38 @@
+@@ -12,9 +14,39 @@
  // latency. Kernel 1 carries kTileMGemm rows (prefill): the weights are read once per tile and
  // the row tiles supply the parallelism. The tile is bounded by the register file (the decoded
  // sub-block, the activations and four partial sums per row all live in registers).
@@ -227,22 +233,23 @@
 +// subgroup's sixteen weight rows by transposed 32-bit block reads. The message addresses
 +// 32-bit elements, so the row pitch must be a multiple of 16 bytes and the block's byte
 +// offsets multiples of 4: the K-quant layouts with dword-aligned blocks (Q4_K 144, Q5_K 176,
-+// the 224-byte Q6_K), not the file's 210-byte Q6_K rows or Q8_0's 34-byte blocks. Every
-+// activation row must be one pitch from the last (no padding on any axis).
++// the 224-byte Q6_K), not the file's 210-byte Q6_K rows or Q8_0's 34-byte blocks. The
++// activation block is addressed from the buffer's start at a pitch of K: every row must be
++// one pitch from the last and the first at offset 0 (no padding on any axis, no offset).
 +static bool two_d_loads(const fully_connected_params& params, int kernel_number) {
 +    if (kernel_number == 0 || params.engineInfo.arch < gpu_arch::xe2) return false;
 +    const int t = params.kquant_type;
 +    if (t != 12 && t != 13 && t != 114) return false;
 +    if (FullyConnected_kquant::RowBytes(static_cast<uint8_t>(t), params.kquant_k) % 16 != 0) return false;
 +    const auto& in = params.inputs[0];
-+    if (in.Batch().pad.Total() != 0 || in.Feature().pad.Total() != 0) return false;
++    if (in.PitchesDifferFromLogicalDims() || in.GetFirstElementOffset() != 0) return false;
 +    if (const char* e = std::getenv("ARCINT_KQ_2D")) return std::atoi(e) != 0;  // measurement: 0 forces the staged path
 +    return true;
 +}
  // Both variants multiply on the matrix unit or read the activations as its A operand: the
  // subgroup is its N, 16 on Xe2 and later, 8 before.
  static size_t simd_of(const fully_connected_params& params, int kernel_number) {
-@@ -118,7 +149,7 @@
+@@ -118,7 +150,7 @@
  
  FullyConnected_kquant::DispatchData FullyConnected_kquant::SetDefault(const fully_connected_params& params, int, int kernel_number) const {
      DispatchData d;
@@ -251,7 +258,7 @@
      d.tile_n = static_cast<uint32_t>(wg_of(params, kernel_number));  // subgroups per work-group, not a column tile
      d.tile_mk = static_cast<uint32_t>(simd_of(params, kernel_number));  // the subgroup size
      const size_t n = params.kquant_n;
-@@ -151,6 +182,7 @@
+@@ -151,6 +183,7 @@
      jit.AddConstant(MakeJitConstant("KQ_WG", static_cast<size_t>(dispatchData.tile_n)));
      jit.AddConstant(MakeJitConstant("SIMD", static_cast<size_t>(dispatchData.tile_mk)));
      jit.AddConstant(MakeJitConstant("KQ_ROWS", rows_per_group(params)));
@@ -259,7 +266,7 @@
      // Q6_K prefetches its next super-block on Xe2 only (measured both ways, DESIGN 7.0.2bd).
      jit.AddConstant(MakeJitConstant("KQ_PREFETCH", params.engineInfo.arch >= gpu_arch::xe2 ? 1 : 0));
      const bool out3d = params.outputs[0].GetLayout() == DataLayout::bfyx;
-@@ -199,8 +231,17 @@
+@@ -199,8 +232,17 @@
      if (kds.empty() || kds[0].kernels.empty())
          return kds;
      KernelsData tiled = GetCommonKernelsData(params, fc.inputs[0].GetLayout(), fc.weights.GetLayout(), EXE_MODE_DEFAULT, -1, 1);
@@ -287,7 +294,7 @@
 -        {12, 17408, 5120, {1L, 32L, 256L, 2048L}}, {12, 1024, 5120, {1L}}, {12, 5120, 5120, {1L}}, {12, 5120, 17408, {1L}},
 -        {13, 5120, 5120, {1L}}, {14, 5120, 17408, {1L}}, {14, 1024, 5120, {1L}}, {114, 5120, 17408, {1L}}, {114, 1024, 5120, {1L}}};
 +        {12, 17408, 5120, {1L, 32L, 256L, 856L, 2048L}}, {12, 1024, 5120, {1L}}, {12, 5120, 5120, {1L}}, {12, 5120, 17408, {1L}},
-+        {13, 5120, 5120, {1L, 856L, 2048L}}, {14, 5120, 17408, {1L}}, {14, 1024, 5120, {1L}}, {114, 5120, 17408, {1L, 856L, 2048L}}, {114, 1024, 5120, {1L}}};
++        {13, 5120, 5120, {1L, 856L, 2048L}}, {14, 5120, 17408, {1L, 856L}}, {14, 1024, 5120, {1L}}, {114, 5120, 17408, {1L, 856L, 2048L}}, {114, 1024, 5120, {1L}}};
      const int rotation = 8;
      for (const auto& sh : shapes) {
      const int t = std::get<0>(sh);

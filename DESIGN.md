@@ -7820,6 +7820,33 @@ down projection 14.8 → 12.9; 64 rows at 256 wins the first two (6.8,
 mode (v37: 21/21, the timing test at 8.0 / 2.73 / 12.9 ms; its M = 1
 decode figures unchanged, that kernel is compiled at 128).
 
+**The native form on 0029.** With the tiled kernel now running the
+gate at 3.4 ms per 856 rows (45 TFLOPS, against the runtime's int4
+gemm at about 50 on the repacked set), the handoff's first question
+was the form with no repack at all — every projection through the
+K-quant kernel, no augmented columns, no min term in the runtime's
+kernel. Served on the 24 GB card, the same cells:
+
+| 0029, 24 GB card, `u8` KV | mixed (default) | native | the bar |
+|---|---|---|---|
+| resident | 16.54 GiB | **15.22** (max ctx 155k) | — |
+| prefill, 856 tokens | **907** t/s | 662 | 1,341 |
+| decode step at 1k | 54.9 ms | **51.3** | 51.8 |
+| prefill, 71,727 | **451** | 395 | 460 |
+| decode step at 71.7k | 73.3 | **70.3** | 72.5 |
+| Prüfstand | 10/10 at 18.4 t/s | 10/10 at 19.8 | 10/10 |
+| greedy outputs | 23e06c37e0d6 / 086d5e71ad47 | the same | — |
+
+The native form meets the operator's decode bar at both depths and
+the size by 1.3 GiB more, and pays for it at prefill (49 % and 86 % of
+the bars against the mixed form's 68 % and 98 %): the repacked set's
+gemm is still faster than the tiled kernel on Q4_K by about the
+difference. The default stays mixed, the prefill gap being the larger
+of the two; `--gguf-mode native` is the flag for a deployment that
+wants decode and context over prefill. The outputs of the two forms
+agree byte for byte at both depths, as §7.0.2be found for the
+template-embedding runs.
+
 Retracted here (§7.0.1): §7.0.2bm's "the kernel is instruction-issue
 bound (~2,000 instructions per sixteen dpas)" as the mechanism — the
 2,421 instructions per super-block would issue in about 9 ms of the

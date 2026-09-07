@@ -31,7 +31,10 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   on the 24 GB card, the mixed form's prefill 672 → 907 t/s at 856
   tokens and 385 → 451 at 71,727 (68 % and 98 % of the operator's
   bars); the Q6_K down projection's launch at 856 rows 11.1 → 4.4 ms on
-  the timing test in device memory. Two forms measured and not shipped: the
+  the timing test in device memory. The native form (`--gguf-mode
+  native`) on the same patch: 662 / 395 t/s prefill, decode steps 51.3
+  and 70.3 ms (the decode bars met), 15.22 GiB resident, 10/10, the same
+  outputs; mixed stays the default. Two forms measured and not shipped: the
   packed B operand (`f16(1024 + q)`, the scale on the sums) is 2.7×
   slower on the gate — every `dpas` starts from zero and its result is
   read at once — and hoisting the operand loads ahead of the decode is
