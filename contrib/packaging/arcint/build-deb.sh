@@ -20,8 +20,9 @@ PKGREL=1
 # them, so the package is built from what anyone can check.
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
 # sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v0.4.3.tar.gz,
-# taken after the tag was pushed (one commit after the tag, as 0.4.2's was).
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-9dce7d47de253d7f812e84087efa152af8eb740a7178adf70deff9404dd8df80}
+# taken after the tag was pushed; the tag was moved once, to the commit that mirrors
+# patch 0030 at the top level (its first tree failed the series test in the unit ladder).
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-a5a44cd7f9a1c9914bc53389fb1e2daa2769ca564eb1cf73415f88b3d7fb5cbe}
 OV_PREFIX=/usr/lib/marfrit-openvino
 # The ABI is the nightly, not the patch level: floor the patch level, cap at
 # the next nightly. An exact pin (Depends: = +p1-1) made apt REMOVE arcint when
