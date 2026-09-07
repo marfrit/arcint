@@ -20,7 +20,7 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 ## Unreleased
 
 - **0.4.1, the tiled variant's operands by 2D block loads on Xe2**
-  (DESIGN §7.0.2bn, plugin patch 0029, not yet in a built package). The
+  (DESIGN §7.0.2bn, plugin patch 0029, `marfrit-openvino +p11`). The
   prefill kernel reads the activation block straight from global memory
   in the matrix unit's layout and the weights by transposed block reads,
   one message per 32 bytes of sixteen rows; the decode is unchanged, so
@@ -44,7 +44,7 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   in device memory, not 34.6), and the row-tile sweep recorded under
   §7.0.2bm is retracted and re-measured.
 - **0.4.1, the tiled variant's tile in the matrix unit's layout**
-  (DESIGN §7.0.2bm, plugin patch 0028, not yet in a built package). The
+  (DESIGN §7.0.2bm, plugin patch 0028, `marfrit-openvino +p11`). The
   prefill kernel stages its activation tile so that each matrix-multiply
   operand is one block read of local memory instead of eight per-lane
   gathers; exact, 21/21 on both cards, served outputs byte-identical.

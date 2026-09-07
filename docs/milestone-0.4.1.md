@@ -284,4 +284,8 @@ to keep on the other card.
   `dpas` chain broken at every sub-block) and hoisted loads (50 %
   slower served) measured and dropped. The timing test's activations
   had been in host memory: every tiled figure before this entry timed
-  the bus, and the §7.0.2bm tile sweep is retracted and redone.
+  the bus, and the §7.0.2bm tile sweep is retracted and redone. Reviewed
+  (the 2D gate on every input axis); `+p11` (0003–0029) built and
+  installed on the dev host. The native form on the same patch meets
+  the decode bars (51.3 / 70.3 ms) at 15.22 GiB and 662 / 395 t/s
+  prefill; mixed stays the default.

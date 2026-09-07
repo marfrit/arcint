@@ -531,7 +531,7 @@ served outputs byte-identical. The 2,048-row gate launch 39.5 → 34.6 ms
 on the 24 GB card; served, the mixed form's prefill 551 → 672 t/s at
 856 tokens and 341 → 385 at 71,727.
 
-Package: not yet built (`+p11`).
+Package: `+p11` (built 2026-09-07 18:24, installed on the dev host, both units on it).
 
 ### 0029-kquant-tiled-2d-block-loads.patch
 
@@ -556,7 +556,7 @@ lockable host allocation, which timed the bus, not the kernel: every
 tiled figure it gave before this patch is retracted as an absolute),
 its rows get valid scales, and it gains the served row count.
 
-Package: not yet built (`+p11`).
+Package: `+p11` (built 2026-09-07 18:24, installed on the dev host, both units on it).
 
 ## Deliberately NOT applied
 
