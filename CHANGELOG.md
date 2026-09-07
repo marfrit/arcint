@@ -17,7 +17,28 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
-## Unreleased
+## 0.4.1 — 2026-09-07
+
+Requires `marfrit-openvino 2026.4.0~dev20260821+p11` (patches 0003–0029):
+0022–0025 the K-quant decode rows, 0026 the 224-byte Q6_K layout the
+default `--gguf-q6k aligned` serves through, 0027 the runtime's fusion
+check, 0028–0029 the prefill kernel; below `+p11` a GGUF-opened model
+refuses at compile with the op named (the IR path is unchanged and runs
+on `+p6`). The GGUF path opens in its mixed form by default (Q4_K rows
+repacked into the runtime's compressed form with the mins as exact
+columns, Q5_K/Q6_K rows native), 16.54 GiB resident for the 15.3 GB
+dense Qwen3.8-27B Q4_K_M. Against the milestone's gate
+(`docs/milestone-0.4.1.md`: within 1.5× of Intel's int4 IR at prefill
+and 1.2× at decode, 24 GB card, `u8` KV, one fresh process per cell):
+prefill 907 t/s at 856 tokens (1.77× — missed) and 451 at 71,727
+(1.22× — met); decode 54.9 ms per step at 1k (1.27× — missed by the
+mixed form, met by `--gguf-mode native` at 51.3) and 73.3 at 71.7k
+(1.21× — at the line; native 70.3, met). Prüfstand 10/10 through every
+form; greedy outputs byte-identical between the forms. What the gate
+still owes is carried as three point releases: 0.4.2 the runtime's int4
+gemm on the repacked set (418 of ~900 ms of the 856-token prefill's
+device time), 0.4.3 the tiled kernel's next 30 % (work-group size, the
+2D prefetch, a per-type tile), 0.4.4 the deferred Q5_K decode rate.
 
 - **0.4.1, the tiled variant's operands by 2D block loads on Xe2**
   (DESIGN §7.0.2bn, plugin patch 0029, `marfrit-openvino +p11`). The

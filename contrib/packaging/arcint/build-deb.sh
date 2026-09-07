@@ -11,7 +11,7 @@
 # It carries the CMake package, the headers and the runtime that arcint links.
 set -euo pipefail
 
-PKGVER=0.4.0
+PKGVER=0.4.1
 UPSTREAM_TAG=v${PKGVER}
 PKGREL=1
 # The public repository, not the fleet one. The fleet repo (still named
@@ -19,18 +19,20 @@ PKGREL=1
 # and carries operator-local notes; the published tree is the same code without
 # them, so the package is built from what anyone can check.
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
-# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v0.4.0.tar.gz,
-# taken after the tag was pushed (one commit after the tag, as 0.3.1's was).
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-0ec119aadceb3ea510c535793f12df9d66c6c770368e6e82930227b8a42489ac}
+# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v0.4.1.tar.gz,
+# taken after the tag was pushed (one commit after the tag, as 0.4.0's was).
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-}
 OV_PREFIX=/usr/lib/marfrit-openvino
 # The ABI is the nightly, not the patch level: floor the patch level, cap at
 # the next nightly. An exact pin (Depends: = +p1-1) made apt REMOVE arcint when
 # the runtime was upgraded to +p3 on 2026-09-04; never render "=" here again.
-OV_DEP_VERSION="2026.4.0~dev20260821+p7-1"
-# The +p7 floor is 0.4.0's (patch 0021, the K-quant kernel --gguf needs;
-# DESIGN §7.0.2ay): building an older tag with it would re-issue a released
-# version string under different Depends. Refused.
-case "$PKGVER" in 0.3.*) echo "the +p7 floor is 0.4.0's; bump PKGVER and the tarball sha at the tag" >&2; exit 1 ;; esac
+OV_DEP_VERSION="2026.4.0~dev20260821+p11-1"
+# The +p11 floor is 0.4.1's (patches 0022-0029: the decode rows, the 224-byte
+# Q6_K layout the default --gguf-q6k serves through, the fusion check, the
+# prefill kernel; DESIGN §7.0.2bc-bn); 0.4.0's was +p7 (patch 0021). Building
+# an older tag with it would re-issue a released version string under
+# different Depends. Refused.
+case "$PKGVER" in 0.3.*|0.4.0) echo "the +p11 floor is 0.4.1's; bump PKGVER and the tarball sha at the tag" >&2; exit 1 ;; esac
 OV_DEP_NEXT_NIGHTLY="2026.4.0~dev20260822"
 HERE=$(dirname "$(readlink -f "$0")")
 

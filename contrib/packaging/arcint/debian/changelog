@@ -1,3 +1,24 @@
+arcint (0.4.1-1) trixie; urgency=medium
+
+  * 0.4.1: the GGUF path at the card's speed, as far as it got. Requires
+    marfrit-openvino +p11 (patches 0003-0029). The GGUF-opened model
+    serves in its mixed form by default: the Q4_K rows repacked at load
+    into the runtime's own compressed form with the mins as exact extra
+    columns (equivalent within 1/64 of a quantisation step, the native
+    greedy output byte for byte; the verdict kept between loads), the
+    Q5_K/Q6_K rows native in 224-byte dword-aligned blocks. New options:
+    --gguf-mode repack|native|mixed, --gguf-embed file|template,
+    --gguf-check once|always, --gguf-q6k aligned|file, --gguf-mins
+    exact|shared|nibble (the inexact packings report their deviation).
+    The logits slice at a K-quant lm_head; the served step split under
+    ARCINT_PROFILE_CYCLE=1. Dense Qwen3.8-27B Q4_K_M on the 24 GB card:
+    16.54 GiB resident, 907 t/s prefill and 54.9 ms per decode step at
+    856 tokens, 451 t/s and 73.3 ms at 71,727 (0.4.0: 213 / 101 ms and
+    174 / 118); --gguf-mode native 15.22 GiB, 662 / 51.3 and 395 / 70.3.
+    Pruefstand 10/10 through every form. DESIGN 7.0.2ba-bn.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 07 Sep 2026 18:45:00 +0200
+
 arcint (0.4.0-1) trixie; urgency=medium
 
   * 0.4.0: a GGUF opens in process and serves. `--gguf FILE` with `--model`

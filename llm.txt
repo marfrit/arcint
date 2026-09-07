@@ -67,9 +67,13 @@ lines: 0.4.0 = open and run GGUF checkpoints (docs/milestone-0.4.0.md; stage
 1 -- in-process open on a template IR, native K-quant blocks decoded in the
 plugin's kernel -- served and tagged as 0.4.0 on 2026-09-06; stages 2 MoE
 and 3 sub-4-bit follow); 0.4.1 = the GGUF path at the card's speed
-(docs/milestone-0.4.1.md: decode at bandwidth, the prefill tile's activation
-reads, the activation reservation, the +p7 package; gate within 1.5x of
-Intel's int4 IR at prefill and 1.2x at decode); 0.5.0 = Qwen Flash Next
+(docs/milestone-0.4.1.md; tagged 2026-09-07 on +p11: the mixed form 907 /
+451 t/s prefill and 54.9 / 73.3 ms decode steps at 856 / 71,727 tokens
+against the IR's 1,609 / 552 and 43.3 / 60.6 -- the gate met at depth,
+missed at 1k prefill; the native form meets decode at 15.22 GiB); 0.4.2 =
+the runtime's int4 gemm on the repacked set (the larger half of the 1k
+prefill); 0.4.3 = the tiled K-quant kernel's next 30 % (work-group size,
+the 2D prefetch, a per-type tile); 0.4.4 = the Q5_K decode rate; 0.5.0 = Qwen Flash Next
 (docs/milestone-0.5.0.md; recon pins the checkpoint and its config deltas
 first; gate: loads on both cards, Prüfstand, depth ladder, drafters measured
 against plain).

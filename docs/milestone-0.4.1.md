@@ -289,3 +289,10 @@ to keep on the other card.
   installed on the dev host. The native form on the same patch meets
   the decode bars (51.3 / 70.3 ms) at 15.22 GiB and 662 / 395 t/s
   prefill; mixed stays the default.
+- 2026-09-07 — **tagged 0.4.1** on `+p11`. The gate: prefill 907 t/s at 1k
+  (1.77× the IR — missed) and 451 at 71.7k (1.22× — met); decode 54.9 ms
+  at 1k (1.27× — missed by the mixed form, met by the native form at
+  51.3) and 73.3 at 71.7k (1.21×; native 70.3). Prüfstand 10/10, the
+  forms byte-identical. Carried as point releases: 0.4.2 the repacked
+  set's gemm, 0.4.3 the tiled kernel's next 30 %, 0.4.4 the Q5_K decode
+  rate (the handoff has the measurements each starts from).
