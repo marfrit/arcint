@@ -75,8 +75,11 @@ the runtime's int4 gemm on the repacked set (tagged 2026-09-07 on +p11: the
 gemm at 88 % of the card's f16 matrix roof, int8 activations dead at 32-wide
 groups, the 1k prefill gate unreachable through it; --gguf-mins split as a
 decode lever, 53.5 / 72.2 ms steps at 1k / 71.7k, 16.30 GiB, warm prefill
-967 t/s; DESIGN 7.0.2bo); 0.4.3 = the tiled K-quant kernel's next 30 % (work-group size,
-the 2D prefetch, a per-type tile); 0.4.4 = the Q5_K decode rate; 0.5.0 = Qwen Flash Next
+967 t/s; DESIGN 7.0.2bo); 0.4.3 = the tiled K-quant kernel's activation reads 32 rows
+per 2D message (tagged 2026-09-08 on +p12, plugin patch 0030: the gate 3.37 -> 2.86 ms,
+Q6_K down 4.40 -> 3.59 at 856 rows; served warm 1k prefill 940 -> 1,001 t/s, 71.7k 451 ->
+464, decode unchanged, byte-identical; the prefetches, 16-row reads and a mad split
+measured dead; DESIGN 7.0.2bp); 0.4.4 = the Q5_K decode rate; 0.5.0 = Qwen Flash Next
 (docs/milestone-0.5.0.md; recon pins the checkpoint and its config deltas
 first; gate: loads on both cards, Prüfstand, depth ladder, drafters measured
 against plain).

@@ -1,3 +1,18 @@
+arcint (0.4.3-1) trixie; urgency=medium
+
+  * 0.4.3: the tiled K-quant kernel's activation reads 32 rows at a time
+    (plugin patch 0030): the 2D path issued 128 activation messages per
+    super-block per subgroup against 5-7 weight messages; a 32-row 2D read
+    makes that 32. Requires marfrit-openvino +p12 (patches 0003-0030). On
+    the 24 GB card the timing test's gate Q4_K 3.37 -> 2.86 ms at 856 rows,
+    the 224-byte Q6_K down projection 4.40 -> 3.59, Q5_K 1.04 -> 0.99 by its
+    128-row tile; served, the exact mixed form's warm 856-token prefill
+    940 -> 1,001 t/s and 71,727 tokens 451 -> 464, decode steps unchanged,
+    outputs byte-identical, Pruefstand 10/10. No engine code change; the
+    release names the runtime floor. DESIGN 7.0.2bp.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Tue, 08 Sep 2026 01:20:00 +0200
+
 arcint (0.4.2-1) trixie; urgency=medium
 
   * 0.4.2: the runtime's int4 gemm on the repacked set measured at the

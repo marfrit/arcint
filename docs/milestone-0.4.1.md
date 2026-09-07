@@ -307,3 +307,13 @@ to keep on the other card.
   prefill 967 vs 948 t/s, 10/10, the 1k output byte-identical; the
   default stays exact. Every 0.4.1 1k prefill figure was a first request
   of a process (kernel compilation): 907 there is 948 warm.
+- 2026-09-08 — **tagged 0.4.3** on `+p12` (plugin patch 0030; DESIGN
+  §7.0.2bp). The tiled K-quant kernel's activation reads 32 rows per 2D
+  message (the lever the plan had not named: 128 activation messages per
+  super-block per subgroup against 5–7 weight messages), 16 subgroups per
+  work-group on Xe2, Q5_K on a 128-row tile: the timing test's gate 3.37 →
+  2.86 ms and Q6_K down 4.40 → 3.59 at 856 rows (the plan's 30 % gate missed
+  at 15–18 %); served, the exact mixed form's warm 856-token prefill 940 →
+  1,001 t/s and 71.7k 451 → 464, the first form over the depth bar; decode
+  unchanged, byte-identical, 10/10. Prefetches, 16-row reads and a split of
+  the matrix-unit calls measured dead. 0.4.4 (the Q5_K decode rate) next.

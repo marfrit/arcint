@@ -17,7 +17,7 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
-## Unreleased — 0.4.3 in progress (2026-09-08)
+## 0.4.3 — 2026-09-08
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p12` (patches
 0003–0030): 0030 is the tiled K-quant kernel's activation reads 32
