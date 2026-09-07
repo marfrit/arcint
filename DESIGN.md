@@ -7620,7 +7620,32 @@ milliseconds. A larger row tile divides both by the same factor and
 costs accumulator registers (one register per row of the tile); the
 256-register mode was a loss on the decode kernel (§7.0.2bd) because
 it halves occupancy on a bandwidth-bound kernel, and is the natural
-thing to measure on this one. That sweep is the next window.
+thing to measure on this one. The sweep, the same window's
+instrument, the gate on the 24 GB card, µs:
+
+| rows per tile × GRF | M = 32 | M = 256 | M = 2,048 |
+|---|---|---|---|
+| **32 × 128 (the kernel)** | 516 | 4,589 | **34,638** |
+| 32 × 256 | 538 | 5,046 | 63,545 |
+| 64 × 128 | 952 | 8,169 | 111,749 (spills) |
+| 64 × 256 | 527 | 4,366 | 43,164 |
+| 128 × 128 | 1,825 | 11,091 | 79,275 (spills) |
+| 128 × 256 | 1,055 | 12,137 | 90,273 |
+
+Correctness 21/21 at 64 and 128 rows. The tile stays at 32: a larger
+one spills at 128 registers and halves occupancy at 256, and neither
+the halved decode count nor the halved weight re-reads bought the
+difference back. So the re-reads and the per-tile decode *count* are
+not what binds; the instruction stream is: the loop body's ~2,000
+instructions per sixteen `dpas` are the decode of every value to f32
+and its conversion back to f16 before it reaches the matrix unit (the
+`float y[32]` and its thirty-two converts per sub-block). The
+utilities carry a second form that never reached the tiled path — the
+packers (`kq_pack_*`), which build the B operand by a shift, a mask
+and an or per value as `f16(1024 + q)` and let the 1024 fall out of
+the f32 sums with one extra multiply by ones — at a rounding that is
+not the decode path's. That is the next lever, and by the operator's
+rule it is an option.
 
 Retracted here (§7.0.1): §7.0.2bc's "28 of the 39.5 ms are the
 staging and the local-memory reads" as an attribution to the reads:
