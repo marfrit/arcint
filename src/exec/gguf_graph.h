@@ -23,6 +23,7 @@
 #include <openvino/core/model.hpp>
 
 #include "core/gguf.h"
+#include "core/gguf_repack.h"
 #include "core/gguf_map.h"
 
 namespace lgc {
@@ -58,6 +59,7 @@ struct GgufReplacement {
 };
 
 struct GgufApplyReport {
+    gguf::RepackMins mins = gguf::RepackMins::Exact;  // the mins' packing of the repacked projections (--gguf-mins)
     int q6k_aligned = 0;         // native Q6_K projections laid out in 224-byte blocks (type 114)
     std::vector<GgufReplacement> replaced;
     std::vector<std::string>     kept;      // IR constants deliberately left as the template's (by role)
@@ -105,6 +107,7 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
                                        GgufWeightsMode mode = GgufWeightsMode::Repack,
                                        const std::string& verdict_dir = "",
                                        const std::string& file_path = "",
-                                       bool q6k_aligned = true);
+                                       bool q6k_aligned = true,
+                                       gguf::RepackMins mins = gguf::RepackMins::Exact);
 
 }  // namespace lgc

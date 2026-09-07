@@ -28,6 +28,15 @@ const gguf::TensorInfo& tensor_of_type(const gguf::GgufFile& f, int32_t type) {
     throw std::runtime_error("fixture has no 2-D tensor of type " + std::to_string(type));
 }
 
+
+// The augmented width the repack gives a k: one group of 32 per `per_aug` groups, then one
+// zero group more when the total group count would be odd (the runtime's int4 kernel walks K
+// in pairs of groups; an odd count faulted on the card, DESIGN §7.0.2bl).
+int64_t padded_aug(int64_t k, int64_t per_aug) {
+    const int64_t base = ((k / 32 + per_aug - 1) / per_aug) * 32;
+    return ((k + base) / 32) % 2 ? base + 32 : base;
+}
+
 }  // namespace
 
 TEST(f32_to_f16_rounds_to_nearest_even_and_inverts_f16_to_f32) {
@@ -96,7 +105,7 @@ TEST(q5_k_repacks_with_its_mins_as_augmented_columns_within_the_bound) {
     const auto r = gguf::repack_tensor(f, t);
     CHECK(r.weights_type == gguf::RepackWeights::U8);
     CHECK(r.zp_type == gguf::RepackZeroPoint::None);
-    CHECK_EQ(r.k_aug, r.k / 8);
+    CHECK_EQ(r.k_aug, padded_aug(r.k, 8));
     const auto dv = gguf::repack_deviation(f, t, r, 1.0 / 32.0);
     std::printf("  q5_k: max %.5f steps, rms %.5f steps, %zu of %zu over 1/32\n", dv.max_steps, dv.rms_steps, dv.over, dv.values);
     CHECK(dv.max_steps <= 1.0 / 32.0);
@@ -119,6 +128,81 @@ TEST(q6_k_repacks_within_the_scale_rounding_bound) {
     std::printf("  q6_k: max %.5f steps, rms %.5f steps, %zu of %zu over 1/32\n", dv.max_steps, dv.rms_steps, dv.over, dv.values);
     CHECK(dv.max_steps <= 1.0 / 32.0 + 1e-9);
     CHECK_EQ(dv.over, size_t{0});
+}
+
+// The mins' packing as an option (--gguf-mins). Exact: two nibbles per group,
+// one super-block per augmented group, +12.5 % on a Q4_K set. Shared: two
+// super-blocks share an augmented group under the larger dmin, the other
+// block's mins requantised in steps of it (+6.25 %). Nibble: one nibble per
+// group under a scale shared by 32 groups (+3.1 %), the coarsest. The cost
+// of the inexact forms is bounded here per group -- half a step of the shared
+// scale -- and measured in the deviation the load reports.
+namespace {
+double max_min_error_in_scale_steps(const gguf::RepackedTensor& exact, const gguf::RepackedTensor& r) {
+    // |stored min - exact min| against half the augmented group's scale, per group of every row
+    const int64_t groups = r.k / 32, wgroups = r.width() / r.group;
+    double worst = 0;
+    for (int64_t row = 0; row < r.n; ++row)
+        for (int64_t g = 0; g < groups; ++g) {
+            const float s = gguf::f16_to_f32(r.scale[static_cast<size_t>(row * wgroups + r.k / 32 + g / r.groups_per_aug)]);
+            const double e = std::fabs(static_cast<double>(gguf::repacked_group_min(r, row, g)) - static_cast<double>(gguf::repacked_group_min(exact, row, g)));
+            worst = std::max(worst, s > 0 ? e / (0.5 * s) : (e > 0 ? 1e9 : 0.0));
+        }
+    return worst;
+}
+}  // namespace
+
+TEST(q4_k_mins_shared_by_two_super_blocks_halve_the_augmentation_within_half_a_step_of_the_shared_scale) {
+    gguf::GgufFile f = gguf::GgufFile::open(fixture_path());
+    const auto& t = tensor_of_type(f, 12);
+    const auto exact = gguf::repack_tensor(f, t);
+    const auto r = gguf::repack_tensor(f, t, nullptr, gguf::RepackMins::Shared);
+    CHECK(r.mins == gguf::RepackMins::Shared);
+    CHECK_EQ(r.aug_slots, int64_t{2});
+    CHECK_EQ(r.groups_per_aug, int64_t{16});
+    CHECK_EQ(r.k_aug, padded_aug(r.k, 16));   // K/16 before the even-count padding; at the served K (5,120 / 17,408) half the exact form's
+    CHECK(r.k_aug <= exact.k_aug);
+    CHECK(max_min_error_in_scale_steps(exact, r) <= 1.0 + 1e-3);
+    const auto dv = gguf::repack_deviation(f, t, r, 1.0 / 64.0);
+    const auto dve = gguf::repack_deviation(f, t, exact, 1.0 / 64.0);
+    std::printf("  q4_k mins shared: max %.4f steps (exact %.4f), rms %.4f, %zu of %zu over the exact bound\n", dv.max_steps, dve.max_steps, dv.rms_steps, dv.over, dv.values);
+    CHECK(dv.max_steps >= dve.max_steps);  // the cost is measured, never hidden
+}
+
+TEST(q4_k_mins_as_one_nibble_per_group_quarter_the_augmentation_within_half_a_step_of_the_shared_scale) {
+    gguf::GgufFile f = gguf::GgufFile::open(fixture_path());
+    const auto& t = tensor_of_type(f, 12);
+    const auto exact = gguf::repack_tensor(f, t);
+    const auto r = gguf::repack_tensor(f, t, nullptr, gguf::RepackMins::Nibble);
+    CHECK(r.mins == gguf::RepackMins::Nibble);
+    CHECK_EQ(r.aug_slots, int64_t{1});
+    CHECK_EQ(r.groups_per_aug, int64_t{32});
+    CHECK_EQ(r.k_aug, padded_aug(r.k, 32));
+    CHECK_EQ(((r.k + r.k_aug) / 32) % 2, int64_t{0});
+    // the rule at the served widths: 5,120 -> 192 columns against the exact form's 640, 17,408 -> 576 against 2,176
+    CHECK_EQ(padded_aug(5120, 32), int64_t{192}); CHECK_EQ(padded_aug(5120, 8), int64_t{640}); CHECK_EQ(padded_aug(5120, 16), int64_t{320});
+    CHECK_EQ(padded_aug(17408, 32), int64_t{576}); CHECK_EQ(padded_aug(17408, 8), int64_t{2176}); CHECK_EQ(padded_aug(17408, 16), int64_t{1088});
+    CHECK(max_min_error_in_scale_steps(exact, r) <= 1.0 + 1e-3);
+    const auto dv = gguf::repack_deviation(f, t, r, 1.0 / 64.0);
+    std::printf("  q4_k mins nibble: max %.4f steps, rms %.4f, %zu of %zu over the exact bound\n", dv.max_steps, dv.rms_steps, dv.over, dv.values);
+    // the served computation stays within the requantised mins' own budget: half a shared-scale step per group, times |X_g|
+    std::vector<float> w; gguf::dequantize_tensor(f, t, w);
+    std::vector<float> x(static_cast<size_t>(r.k));
+    for (int64_t c = 0; c < r.k; ++c) x[static_cast<size_t>(c)] = std::sin(0.37f * static_cast<float>(c)) * 1.5f;
+    std::vector<float> y; gguf::matvec_repacked_host(r, x, y);
+    const int64_t wgroups = r.width() / r.group;
+    double worst = 0;
+    for (int64_t row = 0; row < r.n; ++row) {
+        double ref = 0, mag = 0, budget = 0;
+        for (int64_t c = 0; c < r.k; ++c) { const double p = static_cast<double>(x[c]) * w[row * r.k + c]; ref += p; mag += std::fabs(p); }
+        for (int64_t g = 0; g < r.k / 32; ++g) {
+            double xg = 0; for (int64_t i = 0; i < 32; ++i) xg += x[static_cast<size_t>(g * 32 + i)];
+            budget += std::fabs(xg) * 0.5 * gguf::f16_to_f32(r.scale[static_cast<size_t>(row * wgroups + r.k / 32 + g / r.groups_per_aug)]);
+        }
+        worst = std::max(worst, std::fabs(static_cast<double>(y[row]) - ref) / (1e-3 + mag * 0.002 + budget));
+    }
+    std::printf("  q4_k mins nibble: worst %.3f of (rounding budget + the mins' own)\n", worst);
+    CHECK(worst <= 1.0);
 }
 
 TEST(repack_refuses_a_type_it_does_not_serve) {

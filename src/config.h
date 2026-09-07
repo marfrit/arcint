@@ -17,6 +17,7 @@ struct Config {
     bool        gguf_native = false;  // --gguf-native: the file's own rows in the plugin's K-quant kernel instead of the repack (0.4.1)
     int         gguf_mode = 2;        // --gguf-mode: 0 = repack, 1 = native (also --gguf-native), 2 = mixed (Q4_K repacked, the rest native; the default, DESIGN 7.0.2be) (0.4.1)
     bool        gguf_embed_file = true;  // --gguf-embed file|template: the token embedding rows from the file, dequantised on the host per token (0.4.1)
+    int         gguf_mins = 0;        // --gguf-mins exact|shared|nibble: the repacked projections' mins packing (0 exact, +12.5 % on the Q4_K set; 1 shared, +6.25 %, inexact; 2 nibble, +3.1 %, inexact; DESIGN 7.0.2bl)
     bool        gguf_q6k_aligned = true; // --gguf-q6k aligned|file: the native Q6_K rows in 224-byte dword-aligned blocks (kquant type 114) or the file's 210-byte rows (0.4.1, DESIGN 7.0.2bj)
     bool        gguf_check_once = true;  // --gguf-check once|always: keep each repacked projection's deviation verdict between loads of the same file (0.4.1)
     int         dyn_quant = 0;        // --dyn-quant: 0 = unset (the runtime's default for an IR, off for a GGUF-opened model), 1 = on, 2 = off (0.4.1)

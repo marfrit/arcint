@@ -41,6 +41,14 @@ namespace lgc::gguf {
 
 enum class RepackWeights { U4, U8, I8 };
 enum class RepackZeroPoint { None, U8Scalar };
+// How the mins are packed into the augmented columns (--gguf-mins). Exact: the
+// file's mins bit for bit, one super-block per augmented group (+12.5 % on a
+// Q4_K set). Shared: two super-blocks per augmented group under the larger
+// dmin, the other block's mins requantised in steps of it (+6.25 %). Nibble:
+// one nibble per group under a scale shared by 32 groups, the largest min of
+// the 32 at 15 (+3.1 %). The inexact forms err by at most half the shared
+// scale per group min; the load reports their deviation instead of refusing it.
+enum class RepackMins { Exact, Shared, Nibble };
 
 struct RepackedTensor {
     RepackWeights   weights_type = RepackWeights::U4;
@@ -49,7 +57,9 @@ struct RepackedTensor {
     int64_t k = 0;               // contraction, the model's
     int64_t k_aug = 0;           // extra columns carrying the mins (0 for Q6_K, Q8_0)
     int64_t group = 32;          // values per scale
-    int64_t groups_per_aug = 8;  // groups whose mins share one augmented group (a super-block's 8; 4 under a head-wise column order)
+    int64_t groups_per_aug = 8;  // groups whose mins share one augmented group (a super-block's 8; 4 under a head-wise column order; 16 / 32 for the inexact packings)
+    RepackMins mins = RepackMins::Exact;
+    int64_t aug_slots = 2;       // augmented columns per group: 2 (hi and lo nibbles of a 6-bit min) or 1 (one nibble, or one u8 byte)
     std::vector<uint8_t>  weights;   // [n][(k + k_aug) values]; u4: two per byte, even index low nibble
     std::vector<uint16_t> scale;     // f16 bits, [n][(k + k_aug)/group]
     uint8_t zp_u8 = 0;               // when zp_type == U8Scalar
@@ -69,15 +79,23 @@ bool repack_supported(int32_t ggml_type);
 // std::runtime_error for an unsupported type, a k that is not a whole number
 // of blocks, or a permutation that splits a group. Rows are processed in
 // parallel.
-RepackedTensor repack_tensor(const GgufFile& file, const TensorInfo& t, const std::vector<int64_t>* column_dest_of = nullptr);
+RepackedTensor repack_tensor(const GgufFile& file, const TensorInfo& t, const std::vector<int64_t>* column_dest_of = nullptr,
+                             RepackMins mins = RepackMins::Exact);
+
+// The min the repacked form carries for main group `g` of row `row` (the
+// stored integer under the augmented group's scale; 0 for the types without
+// one). Exact for RepackMins::Exact, the requantised value otherwise.
+float repacked_group_min(const RepackedTensor& r, int64_t row, int64_t g);
 
 // Rows reordered after the fact: row `dest` of the result is row
 // `src_of[dest]` of the input.
 void permute_rows(RepackedTensor& r, const std::vector<int64_t>& src_of);
 
 // The [k/group][k_aug] f16 matrix (row-major bits) that turns a token's
-// group sums into its augmented columns: -16 and -1 per group for a u4
-// tensor, -1 for a u8 one, zeros elsewhere. Empty when k_aug == 0.
+// group sums into its augmented columns: -16 and -1 per group when a group
+// has two augmented columns (hi and lo nibbles), -1 when it has one (a u8
+// byte, or one nibble under RepackMins::Nibble), zeros elsewhere. Empty when
+// k_aug == 0.
 std::vector<uint16_t> augmentation_matrix(const RepackedTensor& r);
 
 // The plugin's arithmetic on the main columns, emulated on the host in the

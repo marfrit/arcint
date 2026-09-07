@@ -149,8 +149,9 @@ std::string GgufApplyReport::summary() const {
     for (const auto& [t, cb] : per_type)
         s << ", " << gguf::type_name(t) << " x" << cb.first << " (" << (cb.second >> 20) << " MiB)";
     if (repacked != 0) {
+        s << "; mins " << (mins == gguf::RepackMins::Exact ? "exact" : mins == gguf::RepackMins::Shared ? "shared (two super-blocks per augmented group, inexact)" : "nibble (one nibble per group, inexact)");
         s << "; repack deviation max " << repack_max_steps << " quantisation step(s) over " << repack_checked << " value(s), "
-          << repack_over_bound << " over bound";
+          << repack_over_bound << (mins == gguf::RepackMins::Exact ? " over bound" : " over the exact bound (accepted: --gguf-mins)");
         if (repack_verdicts_cached != 0) s << " (" << repack_verdicts_cached << " verdict(s) from an earlier load)";
         s << "; repack " << static_cast<int>(repack_seconds) << " s, check " << static_cast<int>(check_seconds) << " s";
     }
@@ -250,9 +251,11 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
                                        GgufWeightsMode mode,
                                        const std::string& verdict_dir,
                                        const std::string& file_path,
-                                       bool q6k_aligned) {
+                                       bool q6k_aligned,
+                                       gguf::RepackMins mins) {
     GgufApplyReport rep;
     rep.mode = mode;
+    rep.mins = mins;
     using wall = std::chrono::steady_clock;
     std::map<std::string, Widened> widened;  // one widening per distinct activation (repack mode)
     const auto to_file = gguf_v_head_to_file_head(g.linear_k_heads, g.linear_v_heads);
@@ -339,10 +342,10 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
                         for (int64_t e = 0; e < d; ++e) dest_of[static_cast<size_t>(to_file[static_cast<size_t>(hf)] * d + e)] = hf * d + e;
                 }
                 const auto t_repack = wall::now();
-                auto packed = gguf::repack_tensor(*file, *t, dest_of.empty() ? nullptr : &dest_of);
+                auto packed = gguf::repack_tensor(*file, *t, dest_of.empty() ? nullptr : &dest_of, mins);
                 rep.repack_seconds += std::chrono::duration<double>(wall::now() - t_repack).count();
                 const double bound = repack_bound_steps(t->ggml_type);
-                const std::string key = verdict_key(file_path, *t, bound);
+                const std::string key = verdict_key(file_path, *t, bound + (mins == gguf::RepackMins::Exact ? 0.0 : mins == gguf::RepackMins::Shared ? 1000.0 : 2000.0));  // the packing is part of the key
                 Verdict v;
                 if (read_verdict(verdict_dir, key, v)) {
                     // Checked and passed by an earlier load of this very file (size, mtime,
@@ -356,7 +359,9 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
                     rep.repack_max_steps = std::max(rep.repack_max_steps, dv.max_steps);
                     rep.repack_over_bound += dv.over;
                     rep.repack_checked += dv.values;
-                    if (dv.over != 0)
+                    // An inexact mins packing (--gguf-mins shared|nibble) is a chosen cost: its
+                    // deviation is reported in the summary, not refused (DESIGN 7.0.2bl).
+                    if (dv.over != 0 && mins == gguf::RepackMins::Exact)
                         throw std::runtime_error("gguf: " + gguf_name + " repacked outside its bound: " + std::to_string(dv.over) +
                                                  " value(s) over " + std::to_string(bound) +
                                                  " quantisation step(s), max " + std::to_string(dv.max_steps));

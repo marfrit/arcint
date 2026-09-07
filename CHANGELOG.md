@@ -19,6 +19,22 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+- **0.4.1, the mins' packing as an option** (DESIGN §7.0.2bl,
+  `--gguf-mins exact|shared|nibble`, default `exact`). The repacked
+  projections' mins occupy half of every augmented group under the
+  exact form (+12.5 % on the Q4_K set); no exact packing shares one,
+  so the inexact ones are flags with a measured price: `shared` (two
+  super-blocks per augmented group under the larger `dmin`, +6.25 %)
+  and `nibble` (one nibble per group under a scale shared by 32 groups,
+  +3.1 %). The load reports their deviation instead of refusing it;
+  the repack tests bound the error per group at half the shared scale.
+  Served on the 24 GB card, mixed form: shared 15.88 GiB resident
+  (exact 16.54), the u8 ceiling 131k tokens, the decode step 53.7 ms
+  (54.7), Prüfstand 10/10, the 1k output byte-identical, the depth
+  output a near-tie flip; nibble 15.60 GiB, 140k, 52.5 ms, 10/10 with a
+  different text from the first token. An odd augmented group count
+  faulted the runtime's int4 kernel; the width is padded to an even
+  count for every packing.
 - **0.4.1, the K-quant kernel's fused ops run** (DESIGN §7.0.2bk, plugin
   patch 0027; `marfrit-openvino +p10` = patches 0003–0027, built in 12
   minutes and installed on the dev host, 2026-09-07). The plugin's runtime fusion

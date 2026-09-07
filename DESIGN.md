@@ -7480,6 +7480,84 @@ at build, unfused at run time through the fallback); §7.0.2be's
 "fused post-op … removes 160 launches" stands corrected in the other
 direction: the launches existed because the fusion never ran.
 
+#### 7.0.2bl 0.4.1, the augmentation's packing as an option: exactness has a price and the price is a flag (`--gguf-mins exact|shared|nibble`) (2026-09-07)
+
+The operator's order after §7.0.2bk: start the augmentation's packing,
+Q5_K's rate and the tiled variant, and — on the first — "exactness cost
+needs to be an option". The augmentation (§7.0.2ba, `core/gguf_repack.h`)
+carries each group's 6-bit min as two u4 columns, hi and lo, under the
+super-block's own f16 `dmin` as the augmented group's scale, so that
+the min term falls out of the same fully-connected exactly; a
+super-block's eight groups take sixteen of an augmented group's
+thirty-two columns and the other sixteen are zeros: 12.5 % on the
+Q4_K set, 1.3 GB per token of the mixed form (§7.0.2bg). One scale
+per group of thirty-two columns is the runtime's layout, and two
+super-blocks have two `dmin`s, so no exact packing shares an
+augmented group. What can be shared is a *chosen* scale, with the
+mins that do not divide by it requantised:
+
+- **shared**: two super-blocks per augmented group under the larger
+  of their `dmin`s; the other block's mins become `round(mn · dmin /
+  s)` in steps of `s`. +6.25 % on the set.
+- **nibble**: one nibble per group, thirty-two groups (four
+  super-blocks) per augmented group, the scale the largest min of the
+  thirty-two at 15; every min is `round(dmin · mn / s)`. +3.1 %.
+
+Both err by at most half the shared scale per group min, which the
+repack tests bound per group of every row against the exact form
+(`tests/test_gguf_repack.cpp`), and both are priced on the fixture's
+Q4_K tensor by the deviation the load reports (in units of the group's
+quantisation step; the exact form's bound is 1/64):
+
+| packing | augmented columns | max deviation | rms | values over the exact bound |
+|---|---|---|---|---|
+| exact (default) | K/8 | 0.013 steps | 0.003 | 0 of 32,768 |
+| shared | K/16 | 0.147 | 0.037 | 13,243 |
+| nibble | K/32 | 0.717 | 0.212 | 29,273 |
+
+The load reports an inexact packing's deviation in its summary instead
+of refusing it (the exact form still refuses any value over its bound),
+the verdict cache keys the packing, and the plugin side needs nothing:
+the repacked tensor is the same u4-per-32 form with fewer augmented
+columns, and the widening matrix follows the slot layout.
+
+**Served** (the 24 GB card, mixed form with the 224-byte Q6_K layout,
+`+p10`, `u8` KV, one fresh process per cell; the exact form's cells
+from §7.0.2bk):
+
+| mixed form, 856 tokens | resident | max ctx at `u8` | Q4_K set | prefill | decode (64) | step | Prüfstand | greedy output |
+|---|---|---|---|---|---|---|---|---|
+| exact (§7.0.2bk) | 16.54 GiB | 112k | 11,264 MiB | 551 t/s | 17.2 t/s | 54.7 ms | 10/10 at 18.4 (1,145 tokens) | 23e06c37e0d6 |
+| shared | **15.88** | 131k | 10,638 | 559 | 17.4 | 53.7 | 10/10 at 18.8 (1,077) | 23e06c37e0d6 |
+| nibble | **15.60** | 140k | 10,379 | 527 | 17.8 | **52.5** | 10/10 at 19.1 (**474** tokens) | 98c732f5e252 |
+
+At 71,727 tokens the shared form serves 345 / 12.8 t/s at a 72.3 ms
+step (the exact form 341 / 11.1 at 73.3) with the greedy output
+5e3fb7a8d72c against the exact form's 086d5e71ad47 — a near-tie
+flipped back to what the template-embedding runs of §7.0.2be produced.
+The load reports what the packings cost on the served file: shared, a
+maximum of 10.5 quantisation steps with 41 % of the 18.7 G values over
+the exact bound; nibble, 15.3 steps. Two readings. The shared packing
+is free at the acceptance gate: 10/10, the 1k output byte-identical,
+0.66 GiB back, 19k more tokens of context at `u8`, one millisecond off
+the step. The nibble packing reaches to 0.7 ms of the operator's
+decode bar and passes the acceptance task — but its text is different
+from the first token at 1k, and the acceptance run answers in 474
+tokens where the exact form takes 1,145: the same score for a
+different program. That is the reason the default stays exact and the
+inexact forms are flags: the score is a floor, not a fingerprint.
+
+One thing the option cost on the way. The runtime's int4
+fully-connected walks K in pairs of groups; the nibble packing's
+augmented part left the width with an odd group count (165 at
+K = 5,120) and the first served forward faulted in the driver
+(`CL_OUT_OF_RESOURCES` on the load's probe). One zero group more when
+the count is odd (0.6 %), for every packing, and it serves.
+
+Retracted here (§7.0.1): nothing; the first §7.0.2bg estimate of the
+packing's worth ("about 1.7 ms") assumed the exact half, which does not
+exist.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

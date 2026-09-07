@@ -418,6 +418,12 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             else if (v == "mixed") cfg.gguf_mode = 2;
             else return fail("--gguf-mode needs repack, native or mixed");
             cfg.gguf_native = cfg.gguf_mode == 1;
+        } else if (arg == "--gguf-mins") {
+            if (!value(v)) return fail("--gguf-mins needs exact, shared or nibble");
+            if (v == "exact") cfg.gguf_mins = 0;
+            else if (v == "shared") cfg.gguf_mins = 1;
+            else if (v == "nibble") cfg.gguf_mins = 2;
+            else return fail("--gguf-mins needs exact, shared or nibble");
         } else if (arg == "--gguf-q6k") {
             if (!value(v)) return fail("--gguf-q6k needs aligned or file");
             if (v == "aligned") cfg.gguf_q6k_aligned = true;

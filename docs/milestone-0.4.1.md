@@ -259,3 +259,9 @@ to keep on the other card.
   mixed form's decode step 59.8 → 54.7 ms at 1k (17.2 t/s, Prüfstand
   10/10 at 18.4) and 77.7 → 73.3 at 71.7k, byte-identical. The decode
   bar (51.8 ms) is 3 ms away at 1k.
+- 2026-09-07 — **the mins' packing as an option** (DESIGN §7.0.2bl,
+  `--gguf-mins`): exact stays the default; `shared` gives 0.66 GiB and
+  1 ms back at 10/10 with the 1k output byte-identical; `nibble` gives
+  0.94 GiB and 2.2 ms (a 52.5 ms step, 0.7 ms from the bar) at 10/10
+  with a different text. The runtime's int4 kernel faulted on an odd
+  augmented group count; padded to even.

@@ -312,6 +312,23 @@ TEST(gguf_pass_keeps_a_passed_deviation_verdict_between_loads_of_the_same_file) 
     std::filesystem::remove_all(dir);
 }
 
+// The mins' packing is an option of the repack (--gguf-mins): the inexact forms
+// halve or quarter the augmentation and are reported, not refused.
+TEST(gguf_pass_repacks_with_an_inexact_mins_packing_on_request_and_reports_its_deviation) {
+    auto file = std::make_shared<gguf::GgufFile>(gguf::GgufFile::open(fixture()));
+    Toy exact = toy_template();
+    const GgufApplyReport a = gguf_apply_to_template(exact.model, file, toy_geometry(), GgufWeightsMode::Mixed, "", fixture(), true, gguf::RepackMins::Exact);
+    Toy shared = toy_template();
+    const GgufApplyReport b = gguf_apply_to_template(shared.model, file, toy_geometry(), GgufWeightsMode::Mixed, "", fixture(), true, gguf::RepackMins::Shared);
+    CHECK(b.mins == gguf::RepackMins::Shared);
+    CHECK(b.repack_max_steps >= a.repack_max_steps);
+    CHECK(b.summary().find("mins shared") != std::string::npos);
+    size_t wa = 0, wb = 0;
+    for (const auto& r : a.replaced) if (r.repacked) wa += r.bytes;
+    for (const auto& r : b.replaced) if (r.repacked) wb += r.bytes;
+    CHECK(wb <= wa);  // fewer augmented columns at the served widths; at the fixture's K the even-count padding takes the saving back
+}
+
 // The native Q6_K rows are laid out in 224-byte blocks by default (kquant type 114: the file's
 // 210 bytes then 14 zero bytes per super-block, every block dword-aligned, DESIGN §7.0.2bj);
 // --gguf-q6k file keeps the file's rows (type 14). The fixture's ffn_down is Q6_K with one
