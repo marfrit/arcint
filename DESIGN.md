@@ -7218,10 +7218,19 @@ exact dword-aligned reorder of the native Q6_K rows at load" as the
 lever in that form (alignment alone is null with the current read
 shape: 402 against 398; what the reorder buys is the shape, not the
 alignment); the Xe2 Q6_K prefetch's 500 → 397 (§7.0.2bd) as a
-standing gain (392 without it on this row). Not measured: the ISA
-instruction counts (the intercept layer's dumps are raw ISA; the host
-has `ocloc` but no `iga64`), moot once the reads-only variant carried
-most of the time.
+standing gain (392 without it on this row). The ISA, counted after the window
+through `libiga64` (the intercept layer's dumps are raw ISA;
+`tools/igadis.cpp` disassembles them; the host had the library and no
+binary — a tool installed as the need arose, the operator's standing
+instruction of the same day): per row and super-block the decode
+kernel runs about 296 instructions on Q6_K against 178 on Q4_K (4,729
+against 2,845 for the sixteen-row bodies; 1,297 against ~800 for the
+four-row ones), with 15 variable-index register moves per row and
+super-block on Q6_K (the shuffles; Q4_K has none) and 858 shifts
+against 245. The static count agrees with the ablation: the ALU the
+Q6_K row pays over the Q4_K row is the shuffles and the wider decode,
+and both go away only with a layout each lane can read its own bytes
+from.
 
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
