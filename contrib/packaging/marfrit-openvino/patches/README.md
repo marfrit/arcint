@@ -448,7 +448,8 @@ and 842). That card does not serve a GGUF-opened model of this size.
 Built into `+p8` on 2026-09-06 (13 minutes, incremental) and deployed on
 the dev host; the IR path's equivalence suite on the 16 GiB card is 9/9
 under it (DESIGN §7.0.2be). The per-architecture rule postdates the
-package: `+p8` as installed carries the 24 GB card's rule on both.
+package: `+p8` as installed carries the 24 GB card's rule on both; `+p9`
+carries this rule.
 
 Upstream: not yet filed.
 
@@ -467,8 +468,7 @@ alignment, layout and dispatch — the next Q6_K form is a load-time
 reorder into 224-byte blocks read as two byte-wise block reads, on the
 record, not in this patch.
 
-Package: not yet built (`+p9` will carry 0023's per-architecture rule
-and this).
+Package: `+p9` (2026-09-07).
 
 ## Deliberately NOT applied
 

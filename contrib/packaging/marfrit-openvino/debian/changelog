@@ -1,3 +1,22 @@
+marfrit-openvino (2026.4.0~dev20260821+p9-1) bookworm trixie; urgency=medium
+
+  * One more patch applied on top of +p8, same upstream commit (71640275),
+    same smallest-sufficient-divergence numbering, and one refined:
+    - patches/0023 (refined): the K-quant decode dispatch chosen per
+      architecture -- the long-K projections at 16 rows x 4 subgroups on
+      Xe2 and 8 x 8 on Xe-HPG, measured both ways (the 16 GiB card's Q6_K
+      down projection 842 -> 510 us against +p8's rule). DESIGN 7.0.2be.
+    - patches/0024: the Q6_K decode row's tail (the last qh word, the
+      sixteen scales, d) as one 16-bit block read at the dword below and
+      broadcasts, in place of four per-lane gathers: three load messages
+      per super-block per row instead of six. Exact, served outputs
+      byte-identical, Prufstand 10/10. The 16 GiB card's Q6_K down
+      projection 510 -> 385 us; the 24 GB card unchanged (400), where the
+      same window measured the row bound by its read shape and its
+      arithmetic, not its message count. DESIGN 7.0.2bh.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 07 Sep 2026 12:40:00 +0200
+
 marfrit-openvino (2026.4.0~dev20260821+p8-1) bookworm trixie; urgency=medium
 
   * One more patch applied on top of +p7, same upstream commit (71640275),
