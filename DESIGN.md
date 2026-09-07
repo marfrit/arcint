@@ -6845,6 +6845,33 @@ template's: `--mtp on` on the GGUF-opened model serves 13.6 t/s at 856
 tokens with the same greedy output (the first measurement of that
 combination).
 
+**The 16 GiB card, the A/B 0023 had not had.** Patch 0023's header
+measured the 24 GB card only; the operator asked for the fresh number.
+On the A770, same instrument, same window, 14/14 both sides:
+
+| A770, steady, µs | 0022 | 0023 as shipped | 0023, rule per architecture |
+|---|---|---|---|
+| gate Q4_K 17,408 × 5,120 | 159 | 154 | 154 |
+| q/k/v Q4_K N 1,024 | 24–26 | 20–22 | 21 |
+| Q4_K 5,120² | 53–56 | 54 | 54 |
+| down Q4_K 5,120 × 17,408 | 171–174 | 224 | 204 |
+| Q5_K 5,120² | 98 | 62 | 64 |
+| down Q6_K 5,120 × 17,408 | 467 | 842 | 510 |
+| Q6_K N 1,024 | 39 | 46 | 44 |
+
+The long-K rule (sixteen rows per work-group) was the 24 GB card's; on
+Xe-HPG the sweep puts the long-K projections at eight rows × eight
+subgroups (the gate keeps 4 × 4), which the host now selects by
+architecture, and the 24 GB card's figures are unchanged. Even so the
+two down projections stay 19 % and 9 % behind 0022's lane-per-column
+form on that card, while every other shape is ahead; per token of the
+served model that is about level. What 0022's Xe-HPG decode had — the
+sub-block packed for the one-row matrix multiply — is not in 0023's
+tree; carrying it back as a second decode body selected by architecture
+is a maintenance decision, put to the operator with these numbers. That
+card cannot hold the GGUF-opened model of this size, so no served
+number exists for it.
+
 **What is left in the table.** The decode bar (within 1.2× of the IR's
 23.1 and 16.5 t/s) is not met on any form: the mixed default serves
 14.5 / 10.2, the repack 16.1 at 1k and does not fit at depth. The

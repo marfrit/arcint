@@ -438,9 +438,17 @@ every network to steady state before the clock (a network's second
 execution costs twice its third) and runs over the served model's own
 tensor types and shapes.
 
+On the 16 GiB card (Xe-HPG), same instrument, against 0022: the gate
+projection 154 µs against 159, Q5_K 64 against 98, the N 1,024 shapes
+ahead — and the long-K down projections behind, Q4_K 204 against 172
+and Q6_K 510 against 467, with the host's rule per architecture (eight
+rows × eight subgroups there; sixteen × four, the 24 GB card's, was 224
+and 842). That card does not serve a GGUF-opened model of this size.
+
 Built into `+p8` on 2026-09-06 (13 minutes, incremental) and deployed on
 the dev host; the IR path's equivalence suite on the 16 GiB card is 9/9
-under it (DESIGN §7.0.2be).
+under it (DESIGN §7.0.2be). The per-architecture rule postdates the
+package: `+p8` as installed carries the 24 GB card's rule on both.
 
 Upstream: not yet filed.
 
