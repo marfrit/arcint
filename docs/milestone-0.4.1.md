@@ -184,3 +184,11 @@ to keep on the other card.
   fused post-op on the K-quant kernel (160 launches and the
   intermediates), the tiled variant's 2D block loads (the mixed form's
   prefill), the first-piece second at depth.
+- 2026-09-07 — **the other stacks measured on the same card and bytes**
+  (DESIGN §7.0.2bf): llama.cpp Vulkan 126 / 108 t/s prefill and 7.8 / 7.0
+  decode at 1k / 10k, SYCL 249 / 206 and 14.2 / 12.4, arcint mixed 309 /
+  358 and 13.4 / 11.7, repack 937 / 1,051 and 16.3 / 16.1, the IR 1,598 /
+  1,434 and 23.4 / 23.4. Vulkan is the slowest on this card; SYCL's
+  decode equals the mixed form's from the same bytes. The operator's
+  goal (within 20 % of the IR at the mixed form's size) is not met by
+  either GGUF form.

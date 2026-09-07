@@ -6881,6 +6881,53 @@ for the tiled variant's A operand (the mixed form's prefill), and the
 first-piece second at depth on the host. The `+p8` package is the
 deployment; arcint itself is not yet packaged past 0.4.0.
 
+#### 7.0.2bf 0.4.1, the same bytes on the same card through the other stacks: llama.cpp Vulkan and SYCL against the GGUF-opened forms and the Intel IR, at 1k and 10k (2026-09-07)
+
+The operator's question after §7.0.2be — whether Vulkan's infrastructure
+is a competitor — answered by measurement rather than argument, with the
+depth held at 10k ("enough to get a trend"). One 24 GB card, the dense
+Qwen3.8-27B Q4_K_M file for every GGUF arm, 64 generated tokens per cell,
+one fresh process per cell. llama.cpp at upstream 7b13a84, built on the
+dev host with its Vulkan backend (Mesa's driver) and its SYCL backend
+(oneAPI 2026.1; its Level Zero path segfaulted in the container, whose
+loader is absent, so SYCL ran on its OpenCL backend). `llama-bench -fa 1
+-ngl 99`, prompt processing of 1,000 and 10,000 tokens from an empty
+context, generation of 64 at depth 1,000 and 10,000. arcint's cells are
+the served endpoint on the deployed `+p8` runtime, prompts of 856 and
+10,010 tokens, `u8` KV.
+
+| stack, B60 | prefill 1k | prefill 10k | decode at 1k | decode at 10k | resident |
+|---|---|---|---|---|---|
+| Intel int4 IR through arcint (the reference; different bytes) | 1,598 t/s | 1,434 | 23.4 | 23.4 | 13.06 GiB |
+| arcint, repack form | 937 | 1,051 | 16.3 | 16.1 | 18.73 GiB |
+| arcint, mixed form (the default) | 309 | 358 | 13.4 | 11.7 | 16.26 GiB |
+| llama.cpp SYCL (OpenCL backend) | 249 | 206 | 14.2 | 12.4 | — |
+| llama.cpp Vulkan | 126 | 108 | 7.8 | 7.0 | — |
+
+Reading it. Against the two stacks that read the same bytes, arcint's
+default form is ahead of Vulkan by 2.5× at prefill and 1.7× at decode,
+and ahead of SYCL at prefill (1.2× at 1k, 1.7× at 10k) while level with
+it at decode (13.4 against 14.2 at 1k, 11.7 against 12.4 at 10k). The
+repack form is ahead of both on every cell. The trend from 1k to 10k is
+the same shape on every stack: decode loses 10–13 %, prefill loses
+10–17 % on llama.cpp's backends and gains on arcint's (the served chunk
+grows into the prefill); the IR's decode does not move at all over that
+range. Against the operator's goal (within 20 % of the IR: 1,147 t/s and
+18.7 t/s at 10k), the mixed form is at 25 % and 63 % of the IR, the
+repack at 73 % and 69 % — the repack is the closer form on rate and the
+mixed form on size, and neither is inside the bar.
+
+So Vulkan is not the infrastructure to move to for this card: it is the
+slowest stack measured on it, as the fleet note already said. SYCL is
+the stack to keep in view: its decode equals the mixed form's from the
+same bytes with none of this repository's kernel work, which says the
+K-quant decode here is at the level of Intel's own engineers' and not
+beyond it, and that the next lever is not in the kernel.
+
+Retracted here (§7.0.1): nothing; the earlier statements about Vulkan
+on Battlemage (§7.0.2bd's survey, the fleet note) were narrated from
+other people's measurements and are now this card's own.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

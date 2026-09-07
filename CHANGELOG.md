@@ -19,6 +19,12 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+- **0.4.1, the other stacks on the same card and bytes** (DESIGN
+  §7.0.2bf): llama.cpp 7b13a84 Vulkan and SYCL against arcint's GGUF
+  forms and the Intel IR, dense Qwen3.8-27B Q4_K_M, 24 GB card, at 1k and
+  10k. Prefill 126 / 249 / 309 (mixed) / 937 (repack) / 1,598 (IR) t/s at
+  1k; decode at 10k depth 7.0 / 12.4 / 11.7 / 16.1 / 23.4. Vulkan is the
+  slowest stack on this card; SYCL's decode equals the mixed form's.
 - **0.4.1, the open table worked through** (DESIGN §7.0.2be). The
   served step is split on the host (`ARCINT_PROFILE_CYCLE` on the plain
   decode loop): the graph forward is 70–92 ms of a 71–96 ms step, the
