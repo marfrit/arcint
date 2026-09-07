@@ -1,3 +1,24 @@
+marfrit-openvino (2026.4.0~dev20260821+p11-1) bookworm trixie; urgency=medium
+
+  * Two more patches applied on top of +p10, same upstream commit
+    (71640275), same smallest-sufficient-divergence numbering:
+    - patches/0028: the K-quant kernel's tiled (prefill) variant stages
+      its activation tile in the matrix unit's own layout, one block read
+      per operand instead of eight per-lane gathers; exact. The mixed
+      form's prefill 551 -> 672 t/s at 856 tokens and 341 -> 385 at
+      71,727 on the 24 GB card. DESIGN 7.0.2bm.
+    - patches/0029: the tiled variant's operands by Xe2's 2D block loads
+      (the activation block straight from global memory, the sixteen
+      weight rows by transposed block reads), 64-row tiles in the
+      256-register mode on Xe2 (32 rows and the mode on Xe-HPG); exact,
+      outputs byte-identical, Pruefstand 10/10. The mixed form's prefill
+      672 -> 907 t/s at 856 tokens and 385 -> 451 at 71,727; the decode
+      step unchanged. The plugin's timing test moves its operands to
+      device memory (it had been timing the bus for every tiled shape).
+      DESIGN 7.0.2bn.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 07 Sep 2026 18:20:00 +0200
+
 marfrit-openvino (2026.4.0~dev20260821+p10-1) bookworm trixie; urgency=medium
 
   * Three more patches applied on top of +p9, same upstream commit
