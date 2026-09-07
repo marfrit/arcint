@@ -8077,6 +8077,127 @@ floor, not a fingerprint). Also fixed on the way: `--help` had never listed
 `--gguf-mode`, `--gguf-mins` or `--gguf-q6k` and still described the
 retired `--gguf-native` behaviour.
 
+#### 7.0.2bp 0.4.3, the tiled variant's activation reads 32 rows at a time (patch 0030): the lever the record had not named, the ones it had measured against it, and the tiled share on the served prefill (2026-09-08)
+
+The handoff's list for the tiled K-quant kernel after §7.0.2bn was the
+work-group size, the 2D prefetch builtins, a per-type row tile and
+three small items, with a gate of 30 % off the tiled launches. The
+design pass counted the 2D path's messages from the source before
+touching any of them and found the lever the record had not named: on
+a 64-row tile a subgroup issues five to seven transposed weight
+messages per super-block and 128 activation messages -- eight
+sub-blocks × eight row groups × two 8-row reads -- and the 2D block
+reads exist in 16- and 32-row forms whose destination holds the rows
+in order, so one 32-row read is four row groups' operands unchanged.
+Everything went into one build behind measurement knobs and one
+timing window decided it.
+
+**The sweep** (the 24 GB card, the plugin's timing test in device
+memory, warm, µs per launch at 856 / 2,048 rows; 0029's constants are
+the first row; Q5_K on its 128-row tile throughout, the one change
+that was measured before the window, §7.0.2bn; correctness 22/22 on
+both cards and 22/22 on every knob before a number was read):
+
+| tiled kernel, Xe2 | gate Q4_K 17,408 × 5,120 | Q5_K 5,120² | Q6_K-224 down 5,120 × 17,408 | small Q6_K 1,024 × 5,120 (856) |
+|---|---|---|---|---|
+| 0029 (8-row A reads, 8 subgroups) | 3,373 / 7,178 | 969 / 1,864 | 4,400 / 9,973 | 295 |
+| 16-row A reads | 3,082 / 6,600 | 1,492 / 3,055 | 4,191 / 9,484 | 274 |
+| **32-row A reads** | **2,898 / 6,320** | 978 / 1,965 | **3,686 / 8,677** | **237** |
+| 32-row, 16 subgroups per work-group | **2,859 / 6,158** | 990 / 1,983 | **3,585 / 8,216** | 244 |
+| 8-row reads, 16 subgroups (Q5_K's shipped form) | 3,480 / 7,693 | 985 / 1,891 | 4,404 / 9,821 | 296 |
+| 32-row, 4 subgroups | 3,053 / 6,971 | 977 / 1,963 | 3,809 / 9,102 | 245 |
+| the next super-block's weight rows prefetched (8 subgroups, 8-row reads) | 4,016 / 8,737 | 2,322 / 4,861 | 4,516 / 10,141 | 303 |
+| the same at 32-row reads | 2,822 / 6,042 | 1,020 / 2,023 | 3,725 / 8,801 | 254 |
+| the next sub-block's activations prefetched (32-row reads) | 3,178 / 7,048 | 1,142 / 2,499 | 3,933 / 9,606 | 240 |
+| both prefetches, 16 subgroups, 32-row reads | 2,793 / 5,999 | 1,002 / 2,130 | 3,736 / 8,683 | 250 |
+| the two matrix-unit calls split over the row groups (8-row reads) | 3,037 / 6,665 | 1,856 / 3,848 | 4,085 / 9,616 | 254 |
+| the staged path (`ARCINT_KQ_2D=0`), 4 / 8 / 16 subgroups | 13,387 / 3,401 / 3,254 | 3,942 / 1,067 / 1,021 | 20,493 / 5,934 / 5,961 | 891 / 365 / 413 |
+
+The 32-row read is the lever: −14 % on the gate, −16 % on the Q6_K
+down projection, −20 % on the small Q6_K, at 856 rows, −12 % and
+−13 % at 2,048; the 16-row form wins less and loses half on Q5_K (a
+reading: its 128-row tile holds sixteen row groups, and no counter was
+taken). Sixteen subgroups per work-group -- by the source, the number
+of subgroups that read the same activation block on a path with no
+local memory and no barrier; a reading, not a counter -- take the Q6_K
+down projection another 4 % and the gate 1 % at the tall read, and
+alone cost the gate 3 %; four lose. The weight prefetch one super-block ahead,
+the decode kernel's Q6_K win of §7.0.2bd, loses on every tiled type
+before the tall read (Q5_K 2.4×) and after it gains 2–3 % on the gate
+while costing Q5_K 4 %; the activation prefetch loses everywhere; the
+split of the two matrix-unit calls is inert under the tall read and
+1.9× slower on Q5_K without it. Q5_K itself: the 128-row tile gives it
+7 % at 856 rows and 16 % at 2,048, and the tall read gives it nothing
+(+1 % / +5 %), so it keeps the 8-row read on its tile. Shipped: 32-row
+reads for Q4_K and the 224-byte Q6_K, 8-row for Q5_K, sixteen
+subgroups on Xe2, no prefetch; the staged path (Xe-HPG) unchanged by
+construction and re-timed in the window. Not shipped and recorded: the
+gate's 2.3 % from both prefetches at sixteen subgroups -- a type that
+is not on the served default's tiled path, from a lever that costs the
+two that are.
+
+The shipped build, re-timed in its own window (the sweep's cells are
+the knob build's): gate 2,859 / 6,163, Q5_K 987 / 1,891, Q6_K down
+3,590 / 8,229, the small Q6_K 250; the file-layout Q6_K (type 14, the
+staged path on Xe2, which keeps 8 subgroups) 9,918 at 856 rows, as at
+0029. Against the handoff's timing gate -- the Q6_K down projection at
+856 rows ≤ 3.1 ms and the gate ≤ 2.4 -- the window ends at 3.59 and 2.86:
+−18 % and −15 % where 30 % was asked. The 30 % was the record's reading
+of what the per-tile decode and re-read count could give divided by
+the tile; the sweep says the activation traffic was the larger part of
+what remained, and after it the kernel's next structural cost is the
+one §7.0.2bn named last: the weights decoded once per 64-row tile,
+fourteen times at 856 rows, which a different accumulator scheme would
+have to remove.
+
+**Served** (the 24 GB card, arcint 0.4.2, the exact mixed form, `u8` KV,
+chunk 2,048, `--mtp off`, one fresh process per cell, three 856-token
+requests to a process -- the first compiles the request's kernels,
+§7.0.2bo -- and one 71,727-token request; the plugin staged as 0029
+and as 0030 on the same runtime; the 0030 column is the shipped build's
+own run, the review-fixed one):
+
+| exact mixed form | 0029 (`+p11`) | **0030** |
+|---|---|---|
+| prefill, 856 tokens, first request / warm | 903 / 940 t/s | 962 / **1,001** |
+| decode step at 1k (64 tokens) | 54.8 ms | 54.8 |
+| prefill, 71,727 tokens | 451 (§7.0.2bn) | **464** |
+| decode step at 71.7k | 73.3 (§7.0.2bn) | 73.7 |
+| Prüfstand | 10/10 (§7.0.2bn) | 10/10 at 18.4 t/s |
+| greedy outputs, 1k / 71.7k | 23e06c37e0d6 / 086d5e71ad47 | the same |
+| the 16 GiB card's timing test (staged path, 32 × 256) | 8.0 / 2.73 / 12.9 ms | 8.01 / 2.73 / 12.92 |
+
+The warm 856-token prefill crosses 1,000 t/s on the exact form (the
+split form of §7.0.2bo was not run on 0030; its 2 % is an
+extrapolation); the decode step does not move, as it must -- the
+decode kernel is untouched, and every cell of the sweep timed M = 1 on
+every shape for a knob that leaked into it: 216 / 85 / 204 / 20 µs
+throughout, within 1 %.
+
+**What this closes.** The tiled share of the served 856-token prefill was 285 ms at
+0029 (§7.0.2bo); the 0030 run was not traced, and scaling the 0029
+shares by the timing test's per-type gains puts it near 245 -- with
+one open item in that arithmetic: the served step's 47 small Q6_K
+launches run 1.44 ms each on the 0029 timeline, and the 1,024 × 5,120
+shape the timing test gained for them runs 0.3, so they are another
+shape, not identified. The served wall clock gives 56 ms back at 856
+tokens. The prefill's other parts are what they were: the runtime's
+gemm at the f16 rate (§7.0.2bo), the gated delta net, the hundred
+milliseconds of everything else. Against the operator's bar of 1,341
+t/s the exact form stands at 75 % warm (68 % at the tag of 0.4.1,
+first requests); at depth, where 0.4.1 stood at 98 % of the 460 bar,
+0030's 464 is the first form to cross it. The kernel's next structural
+cost is named above and is not a knob; the handoff's 0.4.4 (the Q5_K
+decode rate) is the decode side's remainder. Patch 0030 ships in
+`marfrit-openvino +p12` (patches 0003–0030), the runtime floor of
+0.4.3.
+
+Retracted here (§7.0.1): the 0029 review's small item, carried in the
+internal notes after §7.0.2bn, that "Q5_K's six weight messages could
+be five" -- 44 dwords in 8-dword messages is six, and Q4_K's 36 in five
+and Q6_K's 53 in seven are the floor too; the item never reached this
+record as a claim and is closed here so that it cannot.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

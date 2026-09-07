@@ -1,0 +1,195 @@
+# The K-quant kernel's tiled variant reads its activation block 32 rows at a time on Xe2, takes
+# 16 subgroups per work-group there, and gives Q5_K a 128-row tile
+
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0003-0029. arcint 0.4.3 (DESIGN.md section 7.0.2bp).
+#
+# What changes:
+#   fully_connected_gpu_kquant.cl   Under KQ_2D, the A operand of a sub-block is read by
+#                       intel_sub_group_2d_block_read_16b_32r16x1c -- 32 rows in one message
+#                       whose destination holds the rows in order, so rows 8u..8u+7 are row
+#                       group u's operand unchanged (KQ_A_TALL 32: four row groups per read
+#                       instead of one; the reads per super-block per subgroup 128 -> 32 on a
+#                       64-row tile). Q5_K keeps the 8-row read (KQ_A_TALL 8) on its 128-row
+#                       tile. The weight reads, the decodes and the matrix-unit calls are 0029's.
+#   fully_connected_kernel_kquant.cpp   KQ_A_TALL from the type and the path (32 on the 2D path
+#                       for Q4_K and the 224-byte Q6_K, 8 otherwise); the tiled kernel's
+#                       work-group is 16 subgroups on Xe2 (kColumnGroupsXe2) and stays 8 on
+#                       Xe-HPG's staged path; the row tile is per type: 128 for Q5_K where the
+#                       2D loads run (a 64 KB staged tile otherwise, never taken), 64 for the
+#                       rest on Xe2, 32 on Xe-HPG; the work-group of 16 only where the 2D
+#                       loads run (Xe2's staged types -- the file-layout Q6_K, Q8_0 -- keep 8,
+#                       unmeasured at 16); large_grf carries its measurement per architecture
+#                       in its comment.
+#   fully_connected_gpu_test.cpp   A 141-row Q5_K case (two tiles at 128 rows, the second
+#                       partial); the small Q6_K shape 1,024 x 5,120 at 856 rows in the timing
+#                       test (the served step's 47 launches of it were not timed before).
+#
+# MEASURED 2026-09-07 (UTC; the record's dates are local) -- correctness 22/22 on both cards, and
+# 22/22 on every knob of the sweep --
+# the timing test in device memory, warm, us per launch, 0029 -> 0030, the 24 GB card:
+#   gate Q4_K 17,408 x 5,120 at M = 856 / 2,048: 3,373 / 7,178 -> 2,859 / 6,158 (-15 % / -14 %);
+#   Q5_K 5,120^2: 1,044 / 2,215 -> 969 / 1,864 by the 128-row tile alone (-7 % / -16 %), 987 /
+#   1,891 in the shipped build (8-row reads, 16 subgroups); the 224-byte Q6_K down projection 5,120 x 17,408: 4,400 /
+#   9,973 -> 3,585 / 8,216 (-18 % / -18 %); the small Q6_K 1,024 x 5,120 at 856: 295 -> 244
+#   (-17 %). The shipped build re-timed (m41): gate
+#   2,859 / 6,163, Q5_K 987 / 1,891, Q6_K 3,590 / 8,229, the small Q6_K 250; the file-layout
+#   Q6_K (type 14, the staged path on Xe2 at 8 subgroups) 9,918 at 856, as before. The 16 GiB card (Xe-HPG, staged path, 32 x 256, 8 subgroups): unchanged by
+#   construction, its figures re-taken in the same window. M = 1 (the decode kernel) unchanged
+#   on every shape: no knob leaked into kernel 0.
+# The sweep (DESIGN 7.0.2bp): the 32-row read is the lever (-14 % gate, -16 % Q6_K at 8
+#   subgroups); 16-row reads win less and lose 54 % on Q5_K; a work-group of 16 takes Q6_K
+#   another 4 % and 4 loses; a prefetch of the next super-block's weight rows
+#   (intel_sub_group_2d_block_prefetch_32b_16r8x1c; the transposed prefetch name does not
+#   compile on bmg) loses on every type before the tall read (Q5_K 2.4x) and after it gains
+#   2-3 % on the gate while costing Q5_K 4 % -- not shipped; the next sub-block's activation
+#   prefetch (prefetch_16b_32r16x1c) loses everywhere; splitting the two matrix-unit calls
+#   over the row groups is inert under the tall read and 1.9x slower on Q5_K without it.
+#   The record's "Q5_K's six weight messages could be five" was a miscount: 44 dwords in
+#   8-dword messages is six.
+# Served on the 24 GB card (arcint 0.4.2, mixed form, u8 KV, +p11 base): the warm 856-token prefill 940 -> 1,001 t/s
+# (first request 903 -> 962), 71,727 tokens 451 -> 464; the decode steps unchanged (54.8 / 73.7
+# ms); Pruefstand 10/10; greedy outputs byte-identical at both depths (23e06c37e0d6,
+# 086d5e71ad47); the 16 GiB card's staged-path figures unchanged (8.01 / 2.73 / 12.92 ms).
+launched
+--- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
+@@ -253,6 +253,14 @@
+     const int wy = (int)((get_group_id(0) * KQ_WG + sg) * SIMD);          // this subgroup's first weight row
+ #  define KQ_W_READ(dst, dw) intel_sub_group_2d_block_read_transpose_32b_16r8x1c((const __global void*)weights, KQ_ROW_BYTES, KQ_N, KQ_ROW_BYTES, (int2)((int)(kb * (KQ_BLOCK_BYTES / 4) + (dw)), wy), (dst))
+ #  define KQ_A_READ(dst, k, row) intel_sub_group_2d_block_read_16b_8r16x1c((const __global void*)input, KQ_K * 2, (int)rows, KQ_K * 2, (int2)((int)(k), (int)(row)), (dst))
++#  if KQ_A_TALL == 32
++// The block's rows land in the destination in order: d[0..7] is one KQ_A_READ result, d[8..15]
++// the next row group's, and so on -- a taller read replaces several KQ_A_READ calls untouched
++// (DESIGN 7.0.2bp: 32 wins on Q4_K/Q6_K-224, Q5_K at its 128-row tile keeps the 8-row read).
++#    define KQ_A_TALL_READ(dst, k, row) intel_sub_group_2d_block_read_16b_32r16x1c((const __global void*)input, KQ_K * 2, (int)rows, KQ_K * 2, (int2)((int)(k), (int)(row)), (dst))
++#  elif KQ_A_TALL != 8
++#    error "KQ_A_TALL is 8 or 32"
++#  endif
+     float8 acc[KQ_GROUPS];
+     __attribute__((opencl_unroll_hint(KQ_GROUPS)))
+     for (uint g = 0; g < KQ_GROUPS; ++g) acc[g] = (float8)(0.0f);
+@@ -296,6 +304,26 @@
+ #  endif
+             const int8 b0 = as_int8(convert_half16(vload16(0, y)));
+             const int8 b1 = as_int8(convert_half16(vload16(0, y + 16)));
++#  if KQ_A_TALL == 32
++            // One 2D read per KQ_A_TALL rows: the block's rows land in the destination in order,
++            // so rows 8u..8u+7 are group gb * (KQ_A_TALL/8) + u's A operand, unchanged.
++#    define KQ_A_GPM (KQ_A_TALL / 8)
++#    if KQ_GROUPS % KQ_A_GPM != 0
++#      error "the row tile must be a multiple of KQ_A_TALL rows"
++#    endif
++            __attribute__((opencl_unroll_hint(KQ_GROUPS / KQ_A_GPM)))
++            for (uint gb = 0; gb < KQ_GROUPS / KQ_A_GPM; ++gb) {
++                ushort aw0[KQ_A_TALL], aw1[KQ_A_TALL];
++                KQ_A_TALL_READ(aw0, kb * KQ_BLOCK + s * 32, r0 + gb * KQ_A_TALL);
++                KQ_A_TALL_READ(aw1, kb * KQ_BLOCK + s * 32 + 16, r0 + gb * KQ_A_TALL);
++                __attribute__((opencl_unroll_hint(KQ_A_GPM)))
++                for (uint u = 0; u < KQ_A_GPM; ++u) {
++                    const uint g = gb * KQ_A_GPM + u;
++                    acc[g] = intel_sub_group_f16_f16_matrix_mad_k16(as_short8(vload8(0, aw0 + u * 8)), b0, acc[g]);
++                    acc[g] = intel_sub_group_f16_f16_matrix_mad_k16(as_short8(vload8(0, aw1 + u * 8)), b1, acc[g]);
++                }
++            }
++#  else
+             __attribute__((opencl_unroll_hint(KQ_GROUPS)))
+             for (uint g = 0; g < KQ_GROUPS; ++g) {
+                 ushort aw0[8], aw1[8];
+@@ -304,6 +332,7 @@
+                 acc[g] = intel_sub_group_f16_f16_matrix_mad_k16(as_short8(vload8(0, aw0)), b0, acc[g]);
+                 acc[g] = intel_sub_group_f16_f16_matrix_mad_k16(as_short8(vload8(0, aw1)), b1, acc[g]);
+             }
++#  endif
+         }
+     }
+ #else
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_kquant.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_kquant.cpp
+@@ -17,6 +17,11 @@
+ static constexpr size_t kTileMGemm = 32;       // Xe-HPG (the tiled kernel is built in the 256-register mode, below)
+ static constexpr size_t kTileMGemmXe2 = 64;    // Xe2
+ static constexpr size_t kColumnGroups = 8; // subgroups per work-group sharing the staged activation tile (prefill)
++static constexpr size_t kColumnGroupsXe2 = 16;  // tiled kernel, Xe2 2D path: measured at the 32-row
++// read on the 24 GB card, 16 against 8: Q6_K-224 down 3.72 -> 3.58 ms at 856 rows and 8.69 -> 8.22
++// at 2,048, the gate 2.90 -> 2.86 / 6.32 -> 6.16, Q5_K +1 %; 4 loses; the staged path keeps 8
++// (4 was 4x slower there, 16 mixed).
++static constexpr size_t kTileMGemmXe2Q5K = 128;  // Q5_K on the Xe2 2D path (DESIGN 7.0.2bn: 973/1,870 us at 856/2,048 rows against 1,043/2,213 at 64)
+ // The row tile and the register file go together (DESIGN 7.0.2bn, the timing test with its
+ // operands in device memory): on Xe2, 64 rows at 256 registers beat 32 at 128 on every served
+ // shape (the Q6_K down projection at 856 rows 7.2 -> 4.4 ms, the gate at 2,048 rows 12.1 ->
+@@ -24,11 +29,11 @@
+ // (Q6_K 14.8 -> 12.9, Q5_K 3.2 -> 2.7) and 64 rows lose on Q6_K there (18.3), so the tile
+ // stays 32. The tiled kernel alone is built in that mode: the decode kernel measured a loss
+ // there (DESIGN 7.0.2bd).
++// Measured both ways on both architectures that reach this kernel, tiled kernel only: Xe2 at
++// 64 rows (the gate at 2,048 rows 12.1 -> 7.2 ms; 64 rows at 128 registers spill), Xe-HPG at 32
++// rows (Q6_K 14.8 -> 12.9, Q5_K 3.2 -> 2.7). Neither prefers 128. A third architecture reaching
++// this kernel is unmeasured: measure before inheriting the constant.
+ static bool large_grf(const fully_connected_params&) { return true; }
+-static size_t tile_m_of(const fully_connected_params& params, int kernel_number) {
+-    if (kernel_number == 0) return 1;
+-    return params.engineInfo.arch >= gpu_arch::xe2 ? kTileMGemmXe2 : kTileMGemm;
+-}
+ // The tiled variant reads both operands by 2D block loads on Xe2 (patch 0029, DESIGN
+ // 7.0.2bn): the activation tile from global memory in the matrix unit's A layout and the
+ // subgroup's sixteen weight rows by transposed 32-bit block reads. The message addresses
+@@ -47,6 +52,21 @@
+     if (const char* e = std::getenv("ARCINT_KQ_2D")) return std::atoi(e) != 0;  // measurement: 0 forces the staged path
+     return true;
+ }
++static size_t tile_m_of(const fully_connected_params& params, int kernel_number) {
++    if (kernel_number == 0) return 1;
++    if (params.engineInfo.arch < gpu_arch::xe2) return kTileMGemm;
++    // Q5_K alone takes a 128-row tile, and only where the 2D loads run: the staged path would
++    // want 64 KB of local memory for that tile, and 128 rows were never measured there.
++    if (params.kquant_type == 13 && two_d_loads(params, kernel_number)) return kTileMGemmXe2Q5K;
++    return kTileMGemmXe2;
++}
++// Tiled kernel, 2D path only (DESIGN 7.0.2bp): measured on the 24 GB card, device memory,
++// 856 / 2,048 rows -- gate Q4_K 3.37 -> 2.90 ms / 7.18 -> 6.32, Q6_K-224 down 4.40 -> 3.69 /
++// 9.97 -> 8.68, the small Q6_K 1,024 x 5,120 0.295 -> 0.237 at 856; Q5_K at its 128-row tile
++// 0.969 -> 0.978 / 1.864 -> 1.965, so it keeps the 8-row read.
++static size_t tall_of(const fully_connected_params& params, int kernel_number) {
++    return two_d_loads(params, kernel_number) && params.kquant_type != 13 ? 32 : 8;
++}
+ // Both variants multiply on the matrix unit or read the activations as its A operand: the
+ // subgroup is its N, 16 on Xe2 and later, 8 before.
+ static size_t simd_of(const fully_connected_params& params, int kernel_number) {
+@@ -67,7 +87,7 @@
+     return params.engineInfo.arch >= gpu_arch::xe2 ? 16 : 8;
+ }
+ static size_t wg_of(const fully_connected_params& params, int kernel_number) {
+-    if (kernel_number != 0) return kColumnGroups;
++    if (kernel_number != 0) return two_d_loads(params, kernel_number) ? kColumnGroupsXe2 : kColumnGroups;
+     return (long_k(params) && params.engineInfo.arch < gpu_arch::xe2) ? 8 : 4;
+ }
+ 
+@@ -186,6 +206,7 @@
+     jit.AddConstant(MakeJitConstant("KQ_2D", two_d_loads(params, dispatchData.tile_m > 1 ? 1 : 0) ? 1 : 0));
+     // Q6_K prefetches its next super-block on Xe2 only (measured both ways, DESIGN 7.0.2bd).
+     jit.AddConstant(MakeJitConstant("KQ_PREFETCH", params.engineInfo.arch >= gpu_arch::xe2 ? 1 : 0));
++    jit.AddConstant(MakeJitConstant("KQ_A_TALL", tall_of(params, dispatchData.tile_m > 1 ? 1 : 0)));
+     const bool out3d = params.outputs[0].GetLayout() == DataLayout::bfyx;
+     if (out3d)
+         jit.AddConstant(MakeJitConstant("OUTPUT_3D", true));
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/fully_connected_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/fully_connected_gpu_test.cpp
+@@ -6736,6 +6736,8 @@
+                       std::make_tuple(8, 2L, false, 512, 48, false), std::make_tuple(8, 1L, false, 512, 48, false), std::make_tuple(13, 1L, false, 768, 48, false),
+                       std::make_tuple(12, 100L, true, 1280, 300, false), std::make_tuple(14, 65L, false, 256, 17, false),
+                       std::make_tuple(8, 1L, false, 96, 5, false), std::make_tuple(13, 33L, true, 768, 64, false),
++                      // Q5_K takes a 128-row tile on Xe2: two tiles, the second partial (141 = 128 + 13)
++                      std::make_tuple(13, 141L, false, 768, 48, false),
+                       // the residual add fused into the op (patch 0027): both variants, both Q6_K layouts, Q5_K
+                       std::make_tuple(114, 1L, true, 512, 48, true), std::make_tuple(114, 19L, true, 512, 48, true),
+                       std::make_tuple(14, 1L, false, 512, 48, true), std::make_tuple(13, 1L, true, 512, 48, true),
+@@ -6774,7 +6776,7 @@
+     // the attention output Q5_K, the down projection Q6_K).
+     const std::vector<std::tuple<int, size_t, size_t, std::vector<long>>> shapes = {
+         {12, 17408, 5120, {1L, 32L, 256L, 856L, 2048L}}, {12, 1024, 5120, {1L}}, {12, 5120, 5120, {1L}}, {12, 5120, 17408, {1L}},
+-        {13, 5120, 5120, {1L, 856L, 2048L}}, {14, 5120, 17408, {1L, 856L}}, {14, 1024, 5120, {1L}}, {114, 5120, 17408, {1L, 856L, 2048L}}, {114, 1024, 5120, {1L}}};
++        {13, 5120, 5120, {1L, 856L, 2048L}}, {14, 5120, 17408, {1L, 856L}}, {14, 1024, 5120, {1L}}, {114, 5120, 17408, {1L, 856L, 2048L}}, {114, 1024, 5120, {1L, 856L}}};
+     const int rotation = 8;
+     for (const auto& sh : shapes) {
+     const int t = std::get<0>(sh);

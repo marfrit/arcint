@@ -558,6 +558,32 @@ its rows get valid scales, and it gains the served row count.
 
 Package: `+p11` (built 2026-09-07 18:24, installed on the dev host, both units on it).
 
+### 0030-kquant-tiled-tall-a-reads.patch
+
+The tiled (prefill) variant reads its activation block 32 rows per 2D
+message on Xe2 (`intel_sub_group_2d_block_read_16b_32r16x1c`; the
+destination holds the rows in order, so each 8-row slice is one row
+group's operand unchanged), which takes the activation messages per
+super-block per subgroup from 128 to 32 on a 64-row tile; the work-group
+is 16 subgroups there (8 on Xe-HPG's staged path); Q5_K takes a 128-row
+tile where the 2D loads run and keeps the 8-row read on it (DESIGN
+§7.0.2bp). Exact: 22/22 on both cards (a 141-row Q5_K case added),
+served outputs byte-identical, Prüfstand 10/10; the decode kernel is
+untouched. The timing test in device memory on the 24 GB card, 856 /
+2,048 rows: the gate Q4_K 3.37 / 7.18 → 2.86 / 6.16 ms, Q5_K 1.04 /
+2.22 → 0.99 / 1.89, the 224-byte Q6_K down projection 4.40 / 9.97 →
+3.59 / 8.23, the small Q6_K 1,024 × 5,120 0.295 → 0.250 at 856. Measured
+and not shipped: the next super-block's weight prefetch (loses on every
+type before the tall read, Q5_K 2.4×; 2–3 % on the gate after it at 4 %
+on Q5_K), the next sub-block's activation prefetch (loses everywhere),
+16-row reads (54 % worse on Q5_K), a split of the two matrix-unit calls
+over the row groups (inert under the tall read). Served on the 24 GB card (arcint 0.4.2, the exact mixed
+form): the warm 856-token prefill 940 → 1,001 t/s (first request 903 →
+962), 71,727 tokens 451 → 464; the decode steps unchanged (54.8 / 73.7
+ms); outputs byte-identical at both depths.
+
+Package: `+p12` (build started 2026-09-08 on the dev host; the served figures above were taken with patch 0030 staged into the +p11 runtime, the package itself not yet served).
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.

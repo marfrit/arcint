@@ -17,6 +17,31 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## Unreleased — 0.4.3 in progress (2026-09-08)
+
+Requires `marfrit-openvino 2026.4.0~dev20260821+p12` (patches
+0003–0030): 0030 is the tiled K-quant kernel's activation reads 32
+rows per 2D message on Xe2, 16 subgroups per work-group there, and a
+128-row tile for Q5_K -- exact, the decode kernel untouched (DESIGN
+§7.0.2bp). Measured on the 24 GB card:
+
+- The plugin's timing test in device memory, 856 / 2,048 rows: the gate
+  Q4_K 3.37 / 7.18 → 2.86 / 6.16 ms, Q5_K 1.04 / 2.22 → 0.99 / 1.89,
+  the 224-byte Q6_K down projection 4.40 / 9.97 → 3.59 / 8.23, the
+  small Q6_K 1,024 × 5,120 0.295 → 0.250 at 856. The handoff's timing
+  gate (Q6_K ≤ 3.1, the gate ≤ 2.4) is missed: −18 % and −15 % where
+  30 % was asked; the sweep is on the record.
+- Served, the exact mixed form (arcint 0.4.2): the warm 856-token
+  prefill 940 → 1,001 t/s (first request 903 → 962), 71,727 tokens
+  451 → 464; decode steps unchanged (54.8 / 73.7 ms); Prüfstand 10/10;
+  greedy outputs byte-identical at both depths. The 16 GiB card's
+  staged path is unchanged by construction and re-timed.
+- Measured and not shipped: a prefetch of the next super-block's weight
+  rows, a prefetch of the next sub-block's activations, 16-row reads, a
+  split of the two matrix-unit calls over the row groups. Retracted:
+  "Q5_K's six weight messages could be five" (44 dwords in 8-dword
+  messages is six).
+
 ## 0.4.2 — 2026-09-07
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p11` unchanged; no
