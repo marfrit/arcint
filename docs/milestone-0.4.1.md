@@ -192,3 +192,25 @@ to keep on the other card.
   decode equals the mixed form's from the same bytes. The operator's
   goal (within 20 % of the IR at the mixed form's size) is not met by
   either GGUF form.
+- 2026-09-07 — **the decode step on the device timeline** (DESIGN
+  §7.0.2bg): the OpenCL intercept layer on one served process per form
+  (`tools/cl_timeline_steps.py`), 24 GB card, 856 tokens, `u8`. No form
+  is launch-bound: the mixed default keeps the card busy 62.7 of its
+  71.1 ms (IR 37.9 of 43.3, repack 55.3 of 57.6, native 60.3 of 74.5).
+  Every fully-connected kernel runs at 86–89 % of the 453 GB/s ceiling
+  except the K-quant kernel on Q6_K (188 GB/s, 23.7 ms per step) and
+  Q5_K (316). The decode gap against the IR is bytes (17.4 against
+  14.0 GB per token, 1.3 GB of it the repack's augmentation), the Q6_K
+  kernel (12 ms), and host time per K-quant node (6 ms); the bar sits at
+  the floor of the file's bytes. Retracted: §7.0.2be's "30 ms launch
+  sequence" and "160 unfused eltwise around gate/up" (fused since patch
+  0021). `--dyn-quant on` on the mixed form: prefill unchanged, Prüfstand
+  2/10 — dead. The prefill trace found the logits slice not applied to
+  a K-quant lm_head (the walk knew only a MatMul): every chunk ran the
+  head over all rows and copied 850 MB of logits; fixed red-first, the
+  mixed form's prefill at 856 tokens 288 → 413 t/s, byte-identical,
+  the activation fit 3,438 → 2,129 KiB per chunk token.
+  At 71.7k: prefill 258 → 291 t/s, byte-identical, the served ceiling at
+  `u8` 86k → 109k tokens; Prüfstand 10/10. Next: the Q6_K decode rate (the dword-aligned
+  reorder), the host cost per K-quant node (plugin-side), the tiled
+  variant's register spill and its 2D block loads.

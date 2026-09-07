@@ -19,6 +19,23 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+- **0.4.1, the logits slice on a K-quant lm_head, and the decode step on
+  the device timeline** (DESIGN §7.0.2bg). A GGUF-opened model whose
+  `output.weight` stays in the file's rows (the mixed default, native)
+  had every prefill chunk compute the head over all its rows and copy
+  `[M, vocab]` f32 logits to the host (850 MB per 856-token prompt): the
+  slice of §7.0.2e accepted only a MatMul head. Fixed (`exec/graph_rewrites.h`,
+  a red-first test): the mixed form's prefill at 856 tokens 288 → 413 t/s
+  on the 24 GB card, outputs byte-identical, the activation reservation
+  3,438 → 2,129 KiB per chunk token; at 71,727 tokens 258 → 291 t/s and the
+  maximum context at `u8` KV 86k → 109k tokens; Prüfstand 10/10. The device
+  timeline (`tools/cl_timeline_steps.py` over an OpenCL intercept-layer
+  trace) shows every form device-bound at decode (mixed: 62.7 ms of
+  device time in a 71.1 ms step) with every fully-connected kernel at
+  86–89 % of the card's bandwidth except the K-quant kernel on Q6_K
+  (188 GB/s); the "launch sequence" and "unfused eltwise" readings of
+  §7.0.2be are retracted, and `--dyn-quant on` on the mixed form is dead
+  (Prüfstand 2/10, no prefill gain).
 - **0.4.1, the other stacks on the same card and bytes** (DESIGN
   §7.0.2bf): llama.cpp 7b13a84 Vulkan and SYCL against arcint's GGUF
   forms and the Intel IR, dense Qwen3.8-27B Q4_K_M, 24 GB card, at 1k and

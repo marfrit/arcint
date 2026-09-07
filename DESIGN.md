@@ -6928,6 +6928,174 @@ Retracted here (§7.0.1): nothing; the earlier statements about Vulkan
 on Battlemage (§7.0.2bd's survey, the fleet note) were narrated from
 other people's measurements and are now this card's own.
 
+#### 7.0.2bg 0.4.1, the decode step on the device timeline: every fully-connected kernel within 15 % of the card's bandwidth except the K-quant kernel on Q6_K; the launch-sequence and fused-post-op readings retracted; `--dyn-quant on` 2/10; the logits slice missing at the K-quant lm_head, fixed (2026-09-07)
+
+§7.0.2be left the decode bar unmet with two levers named by
+subtraction: "about 30 ms of launch sequence around ~45 ms of K-quant
+kernels" and "96 Swish and 64 Multiply unfused around the gate/up
+projections", to be settled by an ablation or by the device timeline
+§7.0.2bb had proposed and nobody had built. Two things were already on
+the record before any window: the K-quant kernel has carried the
+plugin's `FUSED_OPS` on its store since patch 0021, and the decode-step
+node dump of the native form (2026-09-06) lists the MLP's 64 Swish and
+64 Multiply with no implementation and no time — fused — while the 96
+Swish and 64 Multiply it does launch are the linear attention's gate and
+norm and the attention's output gate. So the ablation had nothing to
+remove, and the timeline was built instead: the OpenCL intercept layer
+of §7.0.2d (already on the dev host), one served process per form,
+`CLI_ChromePerformanceTiming` for the per-kernel device intervals, the
+trace's tail segmented into decode steps on the one copy every step
+ends with (the sampled row's logits, 248,320 × 4 bytes), steady state
+the last 40 of 64 steps. `tools/cl_timeline_steps.py` is the parser.
+24 GB card, 856-token prompt, `u8` KV, MTP off, the deployed `+p8`
+runtime, the 0.4.0 tree with the step line. The greedy outputs of the
+traced processes are byte-identical to the untraced runs' (the three
+GGUF forms 23e06c37e0d6, the IR 50815ed40613). The tracer's cost on the
+step is +4 % on the IR and +15–18 % on the GGUF forms (§7.0.2d's +42 %
+was a launch-bound decode; these are not), and the device intervals do
+not carry it: the untraced step of the same form and binary
+(§7.0.2be's step lines, the IR's from its 23.1 t/s) is the denominator.
+
+**The step, on the device.**
+
+| form, 856 tokens | launches per step | device busy | untraced step | idle in the untraced step | traced step |
+|---|---|---|---|---|---|
+| Intel int4 IR (13.0 GiB of weights) | 1,265 | 37.9 ms | 43.3 ms | 5.4 ms (12 %) | 44.9 |
+| repack (19,085 MiB) | 2,164 | 55.3 | 57.6 | 2.3 (4 %) | 66.4 |
+| **mixed** (16,587 MiB) | 2,124 | 62.7 | 71.1 | 8.4 (12 %) | 83.8 |
+| native (15,335 MiB) | 1,676 | 60.3 | 74.5 | 14.2 (19 %) | 87.2 |
+
+No form is launch-bound. The mixed default keeps the card busy for
+62.7 of its 71.1 ms; the "30 ms launch sequence" was the native form's
+kernel sum subtracted from the mixed form's step. What the device time
+is made of, per step, with the bytes each class reads and the rate that
+implies against the 453 GB/s the random-read probe measured on this
+card (§7.0.2bd):
+
+| per step | runtime gemm on repacked or IR weights | K-quant, Q4_K | K-quant, Q5_K | K-quant, Q6_K (the lm_head within) | everything else |
+|---|---|---|---|---|---|
+| IR | 34.8 ms, 465 launches, 13.96 GB, **401 GB/s** | — | — | — | 3.1 |
+| repack | 49.7 + 1.2 small, 385 launches, 20.0 GB, **393** | — | — | — | 4.4 |
+| mixed | 30.2 + 0.9, 272 launches, 11.8 GB, **389** | — | 3.3, 48, 1.04 GB, 316 | 23.7, 65, 4.45 GB, **188** (5.35) | 4.6 |
+| native | 0.5 | 28.2, 288, 10.5 GB, 372 (gate/up 354) | 3.3, 48, 318 | 23.7, 65, **188** (5.59) | 5.1 |
+
+Every fully-connected kernel on this card runs at 86–89 % of the
+measured ceiling — the runtime's own gemm on u4 IR weights, the same
+gemm on the repacked rows, and the K-quant kernel on Q4_K rows alike —
+except the K-quant kernel on Q6_K at 188 GB/s and, less so, on Q5_K at
+316. "Everything else" (attention 0.8 ms, GDN 0.4, conv 0.2, the norms
+0.5, the mixed form's activation widening about 1.4 across ~480 small
+launches) is 3–5 ms on every form. The decode gap between the mixed
+form and the IR is therefore three measured items and nothing else:
+3.4 GB more bytes per token (17.4 against 14.0, of which 1.31 GB is the
+repack's augmentation — each super-block's eight mins occupy a 32-wide
+augmented group, half of it zeros, +12.5 % on the Q4_K set), the Q6_K
+kernel at half the rate of the others (12 ms of the 23.7 would go at
+the gemm's rate), and 6 ms more idle than the repack form. The idle
+tracks the K-quant node count (0 → 2.3 ms, 113 → 8.4, 401 → 14.2: about
+30–50 µs of host time per K-quant execution that the queue does not
+hide), not the launch count (the repack form has the most launches and
+the least idle); a per-execution cost on the custom node — §7.0.2be
+item 3's unpooled output is the candidate — is the plugin-side thing to
+read next, as a hypothesis.
+
+The bar arithmetic, from these numbers. The mixed form must read
+17.4 GB per token; at the gemm's 389 GB/s that is 44.7 ms, plus 4.6 of
+everything else, plus the repack form's 2.3 of idle: 51.6 ms, 19.4 t/s,
+against the operator's bar of 51.8 ms (19.3 t/s, the IR's 23.1 within
+20 %). The bar sits exactly at the floor of the file's bytes on this
+card. It is reachable only with every lever and no margin — the Q6_K
+kernel at the others' rate (−12 ms), the idle at the repack form's
+(−6), the augmentation's idle half (−1.7) — and the only margin the
+file does not dictate is the augmentation's.
+
+**The first decode step after a prefill** (§7.0.2be: 2.3×) is host
+time: on the mixed form its 2,213 launches take 64.2 ms on the device
+inside a 265 ms span, 201 ms with the card idle.
+
+**What a served prefill is made of**, the same traces, the two chunks
+of the 856-token prompt (chunk 512 on the mixed form, 2,048 on the
+IR):
+
+| prefill of 856 tokens | launches | device busy | span | idle | the largest items |
+|---|---|---|---|---|---|
+| IR | 3,236 | 541 ms | 736 | 195 (26 %) | gemm at M>1 321 ms (59 %), GDN 78, gemm at M=1 38, conv 19, dynamic quantisation 14 |
+| mixed | 4,698 | 2,331 | 3,308 | 977 (30 %) | tiled K-quant Q6_K down 750 (32 %), f16 gemm on the repacked set 419 (18 %), **the lm_head's tiled kernel 332 (14 %)**, Q6_K tiled 311, Q5_K tiled 162, GDN 77, **a 850 MB device-to-host copy 60** |
+
+Three readings. The tiled K-quant variant is 69 % of the mixed form's
+prefill device time, as §7.0.2be said (lever 2), and the intercept
+layer's kernel names carry a fact the unit tests never showed: every
+tiled launch spills registers (`SPILL=1216–1472` bytes per thread; the
+decode variant spills nothing), which the 2D block loads will have to
+take into account. The runtime's f16 gemm on the repacked set is 18 %,
+the share `--dyn-quant on` could halve. And the lm_head runs its tiled
+kernel over every row of the chunk and copies 850,247,680 bytes —
+856 × 993,280, the f32 logits of every prompt token — to the host once
+per prefill: §7.0.2e's defect in a new place. The repack form's trace
+copies one row per chunk; the mixed and native forms' copy every row,
+and their load logs had said so all along ("logits NOT sliced: every
+prefill chunk will compute and copy [M, vocab] logits"), one line among
+a hundred. The slice walks from the first Result to the LM head and
+accepted only a MatMul; on a GGUF-opened model whose `output.weight`
+stays in the file's rows (mixed: Q6_K; native) the head is the K-quant
+op. Fixed in the walk (the op's input 0 is the activation, input 1 the
+u8 rows; `exec/graph_rewrites.h` exposes the rewrite), red first: a
+K-quant head in the paged layout is not sliced by the old walk, and is
+by the new one, with a MatMul head as the control (`tests/test_gguf_graph.cpp`).
+The served effect on the mixed form is measured below; the reservation
+fit had charged 993 KiB per chunk token for the logits alone.
+
+**`--dyn-quant on` on the mixed form** (§7.0.2be's second prefill
+lever: the runtime's per-token int8 activations on the repacked set),
+same card and runtime, one fresh process per cell, the dyn-quant-off
+control in the same window:
+
+| mixed form, u8 KV | prefill | decode (64 tokens) | step | greedy output | Prüfstand |
+|---|---|---|---|---|---|
+| 856 tokens, dyn-quant on | 290.5 t/s | 13.7 t/s | 69.1 ms | 3cba6c3128b2 (differs) | **2/10** (9 of 10 cases return an empty table) |
+| 856 tokens, off (control, same window) | 288.2 | 13.4 | 69.6 | 23e06c37e0d6 | 10/10 (§7.0.2be) |
+| 71,727 tokens, on | 258.7 | 9.6 | 87.8 | 086d5e71ad47 (same as off) | — |
+| 71,727 tokens, off (§7.0.2be) | 258 | 10.2–11.2 | 89.5–90.3 | 086d5e71ad47 | — |
+
+Dead: the prefill does not move at either depth (the mixed form's
+prefill is the tiled kernel's, above), the decode step gains 1–2 ms,
+and the acceptance task fails. The mechanism is not measured; the
+repack's augmented columns carry group sums of the activation and are
+quantised with it, which is the first thing to test if the lever is
+ever wanted, and the int8-activation form that scored 8/10 in §7.0.2bb
+was a different scheme. The flag stays off for GGUF-opened models.
+
+**The logits slice on the K-quant head, served** (the fixed tree on
+the deployed runtime, mixed form, one fresh process per cell, the load
+log now "logits sliced to the last 1 row(s)" and the probe's "slice
+verified"):
+
+| mixed form, u8 KV, 24 GB card | prefill | decode (64 tokens) | step | greedy output | activation fit | max ctx at u8 |
+|---|---|---|---|---|---|---|
+| 856 tokens, before (§7.0.2be, the same-window control above) | 288–302 t/s | 12.7–13.4 | 69.6–71.1 ms | 23e06c37e0d6 | 3,438 KiB per chunk token, chunk 1024 = 3.48 GiB | 86k |
+| 856 tokens, sliced | **412.7** | 13.6 (Prüfstand 1,145 tokens: 14.5) | 68.9 | 23e06c37e0d6 | **2,129**, chunk 1024 = 2.06 GiB | — |
+| 71,727 tokens, before | 258 | 10.2–11.2 | 89.5–90.3 | 086d5e71ad47 | — | 86,592 |
+| 71,727 tokens, sliced | **291.2** | 9.7 | 87.6 | 086d5e71ad47 | 2,219 | **109,248** |
+
+Prüfstand 10/10. Prefill +37 % at 1k and +13 % at depth, the outputs
+byte-identical at both, and 1.3 GiB of activation reservation per
+1,024-token chunk returned to the KV pool: the served ceiling at `u8`
+moves from 86k to 109k tokens. Against the operator's prefill bar
+(1,341 t/s at 1k, 460 at depth) the mixed form is now at 31 % and
+63 %; the rest of the distance is the tiled kernel.
+
+Retracted here (§7.0.1): §7.0.2be's "about 30 ms of launch sequence
+around the ~45 ms of K-quant kernels" (the mixed form's device time is
+62.7 of 71.1 ms and its K-quant kernels 27 ms of it; the 45 was the
+native form's kernel sum); its "96 Swish and 64 Multiply eltwise
+unfused around the gate/up projections", and the fused post-op named as
+the next plugin patch on the strength of it (the MLP's eltwise has been
+fused into the K-quant kernel since patch 0021; the launched ones are
+the GDN's and the attention's gates, 0.2 ms of device time per step);
+and the handoff's "decode is the launch sequence around the kernels,
+not the kernels" (it is the bytes, the Q6_K kernel, and the host time
+per K-quant node, in that order).
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

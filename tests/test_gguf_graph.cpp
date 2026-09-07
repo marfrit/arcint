@@ -10,6 +10,7 @@
 #ifdef ARCINT_OPENVINO
 
 #include "exec/gguf_graph.h"
+#include "exec/graph_rewrites.h"
 #include "exec/kquant_op.h"
 #include "harness.h"
 
@@ -307,6 +308,36 @@ TEST(gguf_pass_keeps_a_passed_deviation_verdict_between_loads_of_the_same_file) 
     CHECK_EQ(c.repack_verdicts_cached, size_t{0});
     CHECK_EQ(c.repack_checked, a.repack_checked);
     std::filesystem::remove_all(dir);
+}
+
+// The logits slice (DESIGN §7.0.2e) walks from the first Result to the LM
+// head and cuts its input to the last row. On a GGUF-opened model whose
+// output.weight stays in the file's rows (mixed, native), the head is a
+// FullyConnectedKQuant, not a MatMul: the walk must accept it, or every prefill
+// chunk computes and copies [M, vocab] logits (an OpenCL timeline caught the
+// 850 MB copy per 856-token prefill and the head's tiled kernel over every
+// row, 2026-09-07).
+TEST(gguf_pass_slices_the_logits_at_a_kquant_lm_head) {
+    // A MatMul head, the case that always worked: the control.
+    {
+        Toy toy = toy_template();
+        CHECK(slice_logits_to_last_token(toy.model, 1, 0));
+        const auto head = toy.model->get_results()[0]->input_value(0).get_node_shared_ptr();
+        CHECK_EQ(std::string(head->input_value(0).get_node()->get_type_name()), std::string("Slice"));
+    }
+    // A K-quant head in the paged layout [tokens, 1, hidden]: Q8_0, K = 256, N = 16.
+    {
+        const int64_t k = 256, n = 16;
+        auto x = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::PartialShape{-1, 1, k});
+        auto w = ov::op::v0::Constant::create(ov::element::u8, ov::Shape{size_t(n), size_t(FullyConnectedKQuant::row_bytes(8, k))},
+                                              std::vector<uint8_t>(size_t(n) * size_t(FullyConnectedKQuant::row_bytes(8, k)), 0));
+        auto head = std::make_shared<FullyConnectedKQuant>(x, w, 8, k, n);
+        auto model = std::make_shared<ov::Model>(ov::ResultVector{std::make_shared<ov::op::v0::Result>(head)}, ov::ParameterVector{x}, "kq_head");
+        CHECK(slice_logits_to_last_token(model, 1, 0));
+        CHECK_EQ(std::string(head->input_value(0).get_node()->get_type_name()), std::string("Slice"));
+        CHECK_EQ(head->input_value(1).get_node_shared_ptr().get(), static_cast<ov::Node*>(w.get()));  // the weights untouched
+        CHECK_EQ(model->output(0).get_partial_shape()[2].get_length(), n);
+    }
 }
 
 #endif  // ARCINT_OPENVINO

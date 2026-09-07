@@ -71,6 +71,7 @@
 #include "core/affinity.h"
 #include "exec/fit.h"
 #include "exec/gguf_graph.h"
+#include "exec/graph_rewrites.h"
 #include "core/gguf_dequant.h"
 #include "exec/kquant_op.h"
 #include "core/artifact.h"
@@ -636,27 +637,40 @@ std::optional<SlotPoolIr> slot_pool_from_ir(const std::shared_ptr<ov::Model>& mo
     return out;
 }
 
+}  // namespace
+
+// Declared in exec/graph_rewrites.h: outside the anonymous namespace for its test.
 bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model,
                                 int64_t keep_rows, int64_t token_axis) {
     const auto& results = model->get_results();
     if (results.empty()) return false;
 
-    // Walk back through shape-only ops to the matmul that is the LM head.
+    // Walk back through shape-only ops to the matmul that is the LM head -- or
+    // to the FullyConnectedKQuant a GGUF-opened model has in its place when
+    // output.weight stays in the file's rows (exec/kquant_op.h: input 0 the
+    // activation [.., K], input 1 the u8 rows). Until 2026-09-07 the walk knew
+    // only the MatMul, and the mixed and native forms served every prefill
+    // chunk unsliced: the head's tiled kernel over every row and an [M, vocab]
+    // f32 copy to the host per chunk (850 MB for 856 tokens), found by an OpenCL
+    // timeline; the load log had said "logits NOT sliced" all along.
     std::shared_ptr<ov::Node> node = results[0]->input_value(0).get_node_shared_ptr();
+    const auto is_kquant = [](const std::shared_ptr<ov::Node>& n) {
+        return n && std::string(n->get_type_name()) == "FullyConnectedKQuant";
+    };
     for (int hop = 0; hop < 8 && node && node->get_input_size() > 0; ++hop) {
-        if (ov::as_type_ptr<ov::op::v0::MatMul>(node) != nullptr) break;
+        if (ov::as_type_ptr<ov::op::v0::MatMul>(node) != nullptr || is_kquant(node)) break;
         const std::string t = node->get_type_name();
         if (t != "Convert" && t != "Reshape") return false;
         node = node->input_value(0).get_node_shared_ptr();
     }
     const auto matmul = ov::as_type_ptr<ov::op::v0::MatMul>(node);
-    if (matmul == nullptr) return false;
+    if (matmul == nullptr && !is_kquant(node)) return false;
 
     // Rewriting the wrong operand would silently produce wrong logits with no
     // error, which is the one failure mode a graph rewrite must not have. Only
     // proceed when input 0 is unmistakably the activation: not transposed, and
     // not a constant weight.
-    if (matmul->get_transpose_a()) return false;
+    if (matmul != nullptr && matmul->get_transpose_a()) return false;
     if (ov::as_type_ptr<ov::op::v0::Constant>(
             node->input_value(0).get_node_shared_ptr()) != nullptr) {
         return false;
@@ -690,6 +704,8 @@ bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model,
     model->validate_nodes_and_infer_types();
     return true;
 }
+
+namespace {
 
 // The attention KV is the only part of the state that grows with context: at
 // 262144 tokens it is ~10.7 GiB in fp32 against 12.8 GiB of weights, which does
