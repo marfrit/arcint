@@ -265,3 +265,11 @@ to keep on the other card.
   0.94 GiB and 2.2 ms (a 52.5 ms step, 0.7 ms from the bar) at 10/10
   with a different text. The runtime's int4 kernel faulted on an odd
   augmented group count; padded to even.
+- 2026-09-07 — **the tiled variant's tile staged in the matrix unit's
+  layout** (DESIGN §7.0.2bm, patch 0028): 128 one-element local-memory
+  gathers per loop body became 16 block reads; exact, 21/21 both cards,
+  byte-identical served; the 2,048-row gate launch 39.5 → 34.6 ms, the
+  prefill 551 → 672 t/s at 1k and 341 → 385 at 71.7k (50 % and 84 % of
+  the bars). The gathers were a fifth of the launch; the per-tile decode
+  and the weights re-read per 32-row tile are the rest — the row tile
+  and the GRF mode are the next sweep.

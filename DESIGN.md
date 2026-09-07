@@ -7558,6 +7558,76 @@ Retracted here (§7.0.1): nothing; the first §7.0.2bg estimate of the
 packing's worth ("about 1.7 ms") assumed the exact half, which does not
 exist.
 
+#### 7.0.2bm 0.4.1, the tiled variant's activation tile staged in the matrix unit's own layout: one block read per operand instead of eight gathers per lane (patch 0028) (2026-09-07)
+
+The operator's order after §7.0.2bl: the tiled variant's register
+spill and its 2D block loads. The ISA of the tiled Q4_K gate kernel
+(`tools/igadis.cpp` over the dumps of §7.0.2bh; 1,978 instructions,
+151 sends per loop body) says where its time is before any block-load
+extension is touched: of the 151 sends, 138 go to local memory, and
+128 of those are `load.slm.d16u32` — one 16-bit element per lane per
+message. That is the A operand of every matrix multiply assembled lane
+by lane from a row-major tile: for each sub-block, half and row group,
+eight rows read at `xt[row * 256 + s * 32 + lane]`, eight gathers for
+eight rows, against sixteen `dpas` in the same body. §7.0.2bc had
+measured the staging and these reads at 28 of the 39.5 ms of a
+2,048-row gate launch without splitting them. The spill the kernel
+names carry (`SPILL=1216–1472`) has no scratch send in the
+disassembly: whatever the compiler reports, no spill traffic runs in
+the loop.
+
+The change (v30, patch 0028) is the tile's layout in local memory,
+nothing else. The 16-byte chunks each work-item stages are stored not
+row by row but in the layout the matrix unit reads: for sub-block s,
+half h (k 0–15 or 16–31 of it) and row group g, the eight rows' sixteen
+halves contiguous, `[s][h][g][row][lane]`. A chunk of eight consecutive
+k of one row lands whole in one such row, so the stores are the same
+`vstore4`s at a different address; and an A operand is then one
+`intel_sub_group_block_read_us8` of local memory — lane l takes halves
+l + 16 t, which is the operand's definition — on a 16-wide subgroup,
+or one `intel_sub_group_block_read8` of uints on Xe-HPG's 8-wide, the
+same bytes read two halves per lane. Sixteen block reads per loop body
+where there were 128 gathers; the decode of the weights, the B operand
+and the accumulators untouched, so the arithmetic is unchanged and the
+result must be bit-identical to v29's.
+
+**Measured** (the plugin's correctness set 21/21 on both cards; the
+streamed timing test, warmed, the gate projection Q4_K 17,408 × 5,120):
+
+| tiled gate launch, µs | 24 GB card, 0023–0027 | 24 GB card, v30 | 16 GiB card, before | 16 GiB card, v30 |
+|---|---|---|---|---|
+| M = 32 | 656 | **510** | 2,965 | 2,674 |
+| M = 256 | 5,030 | 4,717 | 10,400 | 9,152 |
+| M = 2,048 | 39,500 | **34,577** | 78,400 | 69,433 |
+
+Served on the 24 GB card, mixed form, `u8` KV, one fresh process per
+cell, against §7.0.2bk's cells: prefill **551 → 672 t/s** at 856
+tokens and **341 → 385** at 71,727, the decode step unchanged (54.8
+and 73.2 ms), Prüfstand 10/10 at 18.4 t/s, both greedy outputs
+byte-identical (23e06c37e0d6, 086d5e71ad47). Against the operator's
+prefill bar the mixed form stands at 50 % at 1k (672 of 1,341) and
+84 % at depth (385 of 460).
+
+So the gathers were a fifth of the launch, not the 28 ms §7.0.2bc
+had put on "the staging and the local-memory reads" together. What
+the tile costs now is arithmetic and re-reading: with 32 rows per
+tile the lane decodes its column of every super-block (the `float
+y[32]`, thirty-two converts, the scale pairs) once per 32 rows, and
+each 32-row tile reads the whole 44.6 MB gate matrix again — 64
+times over a 2,048-row prefill, 2.85 GB of weights for one launch,
+against 365 GFLOP that the matrix unit would do in a few
+milliseconds. A larger row tile divides both by the same factor and
+costs accumulator registers (one register per row of the tile); the
+256-register mode was a loss on the decode kernel (§7.0.2bd) because
+it halves occupancy on a bandwidth-bound kernel, and is the natural
+thing to measure on this one. That sweep is the next window.
+
+Retracted here (§7.0.1): §7.0.2bc's "28 of the 39.5 ms are the
+staging and the local-memory reads" as an attribution to the reads:
+removing the gathers took 5 ms; the rest of that figure is the decode
+and the weight re-reads per tile, above.
+
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

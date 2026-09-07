@@ -19,6 +19,15 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+- **0.4.1, the tiled variant's tile in the matrix unit's layout**
+  (DESIGN §7.0.2bm, plugin patch 0028, not yet in a built package). The
+  prefill kernel stages its activation tile so that each matrix-multiply
+  operand is one block read of local memory instead of eight per-lane
+  gathers; exact, 21/21 on both cards, served outputs byte-identical.
+  The 2,048-row gate launch 39.5 → 34.6 ms on the 24 GB card; served,
+  the mixed form's prefill 551 → 672 t/s at 856 tokens and 341 → 385 at
+  71,727. The rest of the tile's time is the per-tile decode and the
+  weights re-read per 32-row tile, measured next.
 - **0.4.1, the mins' packing as an option** (DESIGN §7.0.2bl,
   `--gguf-mins exact|shared|nibble`, default `exact`). The repacked
   projections' mins occupy half of every augmented group under the

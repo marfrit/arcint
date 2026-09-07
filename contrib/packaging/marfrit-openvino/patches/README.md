@@ -520,6 +520,19 @@ t/s, Prüfstand 10/10 at 18.4) and 77.7 → 73.3 at 71,727, byte-identical.
 
 Package: `+p10` (2026-09-07).
 
+### 0028-kquant-tiled-a-layout.patch
+
+The tiled (prefill) variant stages its activation tile in the matrix
+unit's own layout, so each A operand is one block read of local memory
+instead of eight per-lane gathers (128 one-element local-memory
+gathers per loop body against sixteen `dpas` in the ISA; DESIGN
+§7.0.2bm). Same stores, same arithmetic: exact, 21/21 on both cards,
+served outputs byte-identical. The 2,048-row gate launch 39.5 → 34.6 ms
+on the 24 GB card; served, the mixed form's prefill 551 → 672 t/s at
+856 tokens and 341 → 385 at 71,727.
+
+Package: not yet built (`+p11`).
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.

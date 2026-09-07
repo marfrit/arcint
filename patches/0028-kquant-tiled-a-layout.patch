@@ -1,0 +1,97 @@
+# The K-quant kernel's tiled variant stages its activation tile in the matrix unit's layout
+
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0003-0027. arcint 0.4.1 (DESIGN.md section 7.0.2bm).
+#
+# What changes:
+#   fully_connected_gpu_kquant.cl   The tiled (prefill) variant stored its activation tile in
+#                       local memory row by row and assembled every A operand of the subgroup
+#                       matrix multiply lane by lane: eight one-element gathers per operand, 128
+#                       load.slm.d16u32 per loop body against sixteen dpas (the ISA counted). The
+#                       tile is now staged in the operand's own layout -- for sub-block, half and
+#                       row group, the eight rows' sixteen halves contiguous -- with the same
+#                       16-byte staging stores at a different address, and each operand is one
+#                       sub-group block read of local memory (16-bit on a 16-wide subgroup, 32-bit
+#                       on Xe-HPG's 8-wide; the same bytes). The decode, the B operand and the
+#                       accumulators are untouched: the arithmetic is unchanged.
+#
+# MEASURED 2026-09-07 (correctness 21/21 on both cards), the streamed timing test warmed, the
+# gate projection Q4_K 17,408 x 5,120, against 0027 in the same instrument:
+#   24 GB card:  M = 32: 656 -> 510 us; M = 256: 5,030 -> 4,717; M = 2,048: 39,500 -> 34,577.
+#   16 GiB card: M = 32: 2,965 -> 2,674; M = 256: 10,400 -> 9,152; M = 2,048: 78,400 -> 69,433.
+# Served on the 24 GB card (mixed form, u8 KV, +p10 base): prefill 551 -> 672 t/s at 856 tokens
+# and 341 -> 385 at 71,727; the decode step unchanged; Pruefstand 10/10; greedy outputs
+# byte-identical at both depths. The gathers were a fifth of the launch; what the tile costs
+# now is its per-32-row decode of the weights and the weights re-read once per row tile.
+
+--- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/fully_connected_gpu_kquant.cl
+@@ -242,22 +242,32 @@
+     const uint nn = min(n, (uint)KQ_N - 1);
+     const __global uchar* wrow = weights + (ulong)nn * KQ_ROW_BYTES;
+ 
+-    // This work-item's share of the tile staging: 16 bytes of one row per pass.
++    // This work-item's share of the tile staging: 16 bytes of one row per pass. The tile is
++    // staged in the matrix unit's A layout (v30, patch 0028): for sub-block s, half h (k 0..15
++    // or 16..31 of it) and row group g, the eight rows' sixteen halves contiguous --
++    // [s][h][g][row][lane] -- so that an A operand is one sub-group block read of local memory
++    // (lane l takes halves l + 16 t) instead of eight one-element gathers per lane. A 16-byte
++    // chunk of a row (eight consecutive k) lands in one such row, whole.
+     const uint item = sg * SIMD + lane;
+     uint stage_src[KQ_TILE_PASSES];
++    uint stage_dst[KQ_TILE_PASSES];                           // in uints (four per chunk)
+     __attribute__((opencl_unroll_hint(KQ_TILE_PASSES)))
+     for (uint p = 0; p < KQ_TILE_PASSES; ++p) {
+         const uint chunk = p * KQ_WG_ITEMS + item;            // 16-byte chunk of the tile
+         const uint t = chunk / (KQ_BLOCK * 2 / 16);           // row of the tile
+-        const uint off = (chunk % (KQ_BLOCK * 2 / 16)) * 8;   // halves into the row's super-block
++        const uint off8 = chunk % (KQ_BLOCK * 2 / 16);        // which eight halves of the row's super-block
++        const uint off = off8 * 8;                            // halves into the row's super-block
+         const uint r = min(r0 + t, rows - 1);
+ #if OUTPUT_3D
+         stage_src[p] = INPUT0_GET_INDEX(r / rows_per_batch, r % rows_per_batch, 0, 0) + off;
+ #else
+         stage_src[p] = INPUT0_GET_INDEX(r, 0, 0, 0) + off;
+ #endif
++        const uint s = off8 >> 2, h = (off8 >> 1) & 1u, l0 = (off8 & 1u) * 8;
++        stage_dst[p] = ((((s * 2 + h) * KQ_GROUPS + (t >> 3)) * 8 + (t & 7)) * 16 + l0) / 2;
+     }
+-    __local ushort xt[TILE_M * KQ_BLOCK];
++    __local ushort xt[TILE_M * KQ_BLOCK] __attribute__((aligned(256)));
++#define KQ_TILE_ROW(s, h, g) (xt + ((((s) * 2 + (h)) * KQ_GROUPS + (g)) * 8) * 16)
+ 
+     float8 acc[KQ_GROUPS];
+     __attribute__((opencl_unroll_hint(KQ_GROUPS)))
+@@ -268,9 +278,8 @@
+         barrier(CLK_LOCAL_MEM_FENCE);                            // the previous super-block's reads are done
+         __attribute__((opencl_unroll_hint(KQ_TILE_PASSES)))
+         for (uint p = 0; p < KQ_TILE_PASSES; ++p) {
+-            const uint chunk = p * KQ_WG_ITEMS + item;
+             const uint4 v = vload4(0, (const __global uint*)(input + stage_src[p] + kb * KQ_BLOCK));
+-            vstore4(v, 0, (__local uint*)xt + chunk * 4);
++            vstore4(v, 0, (__local uint*)xt + stage_dst[p]);
+         }
+         barrier(CLK_LOCAL_MEM_FENCE);
+ 
+@@ -285,13 +294,14 @@
+             const int8 b1 = as_int8(convert_half16(vload16(0, y + 16)));
+             __attribute__((opencl_unroll_hint(KQ_GROUPS)))
+             for (uint g = 0; g < KQ_GROUPS; ++g) {
+-                KQ_A_T a0, a1;
+-                __attribute__((opencl_unroll_hint(8)))
+-                for (uint t = 0; t < 8; ++t) {
+-                    const __local KQ_A_ELEM* xr = (const __local KQ_A_ELEM*)(xt + (g * 8 + t) * KQ_BLOCK + s * 32);
+-                    a0[t] = xr[lane];
+-                    a1[t] = ((const __local KQ_A_ELEM*)(xt + (g * 8 + t) * KQ_BLOCK + s * 32 + 16))[lane];
+-                }
++                // the A operands: one block read each from the staged layout (v30)
++#if SIMD == 16
++                const KQ_A_T a0 = as_short8(intel_sub_group_block_read_us8((const __local ushort*)KQ_TILE_ROW(s, 0, g)));
++                const KQ_A_T a1 = as_short8(intel_sub_group_block_read_us8((const __local ushort*)KQ_TILE_ROW(s, 1, g)));
++#else
++                const KQ_A_T a0 = as_int8(intel_sub_group_block_read8((const __local uint*)KQ_TILE_ROW(s, 0, g)));
++                const KQ_A_T a1 = as_int8(intel_sub_group_block_read8((const __local uint*)KQ_TILE_ROW(s, 1, g)));
++#endif
+                 acc[g] = intel_sub_group_f16_f16_matrix_mad_k16(a0, b0, acc[g]);
+                 acc[g] = intel_sub_group_f16_f16_matrix_mad_k16(a1, b1, acc[g]);
+             }
