@@ -1,3 +1,19 @@
+arcint (0.4.4-1) trixie; urgency=medium
+
+  * 0.4.4: the agent configuration (u8 keys, i4 values, MTP on) served a
+    text that depended on the physical pages a request got -- plugin patch
+    0033, one condition in the micro-SDPA generator (the value gemm's
+    alignment keyed on the value precision), with the test harness that
+    could not see it corrected. Requires marfrit-openvino +p15 (patches
+    0003-0033): every +p14 runtime serves that configuration wrong, so the
+    dependency floor rises. Also: the recurrent-state rows live on the
+    device (130-token prefill 667 -> 770 t/s on the 24 GB card, restores
+    0.03 -> 0.00 s), the short-prompt fault of 190-215 tokens fixed (patch
+    0032, +p14), the kernel review's first pass recorded, a u8:i4
+    request-index gate in the equivalence suite. DESIGN 7.0.2bq-7.0.2bu.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Tue, 08 Sep 2026 20:20:00 +0200
+
 arcint (0.4.3-1) trixie; urgency=medium
 
   * 0.4.3: the tiled K-quant kernel's activation reads 32 rows at a time

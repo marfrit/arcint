@@ -17,7 +17,15 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
-## Unreleased — the alternation: patch 0033 (2026-09-08)
+## 0.4.4 — 2026-09-08
+
+Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033);
+the dependency floor rises from +p12 because every +p14 runtime serves the
+agent configuration (u8 keys, i4 values, MTP on) wrong. Five pieces of work
+since 0.4.3, each with its own subsection below; the release itself changes
+nothing else.
+
+### The alternation: patch 0033 (2026-09-08)
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033);
 DESIGN §7.0.2bu.
@@ -51,7 +59,7 @@ DESIGN §7.0.2bu.
   fill's own quantisation (eight levels per row); with sixteen levels per row
   it is gone.
 
-## Unreleased — the kernel review's first pass (2026-09-08)
+### The kernel review's first pass (2026-09-08)
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p12` as before (an
 arcint-only change; measured on the installed +p14); DESIGN §7.0.2bt.
@@ -77,7 +85,7 @@ arcint-only change; measured on the installed +p14); DESIGN §7.0.2bt.
 - Open, found on the way: the IR with MTP on gives a different greedy text
   per request index in one process, the same sequence in every process.
 
-## Unreleased — the short-prompt fault (2026-09-08)
+### The short-prompt fault: patch 0032 (2026-09-08)
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p14` (patches 0003–0032)
 for the fix below; DESIGN §7.0.2bs. arcint's own code is unchanged and
@@ -102,7 +110,7 @@ its package floor stays at +p12, as with 0031.
   reading (the runtime's gemm as the faulting element) is retracted in
   DESIGN §7.0.2bs.
 
-## Unreleased — the handoff's open items (2026-09-08)
+### The handoff's open items (2026-09-08)
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p13` (patches 0003–0031)
 for the fix below; DESIGN §7.0.2br.
@@ -142,7 +150,7 @@ for the fix below; DESIGN §7.0.2br.
 - A GGUF on a production unit: the operator's call; the IR is faster on
   every axis and smaller (numbers in DESIGN).
 
-## Unreleased — 0.4.4 measured, nothing shipped (2026-09-08)
+### The Q5_K decode row measured, nothing shipped; the plan's next item, now 0.4.5 (2026-09-08)
 
 The Q5_K decode row (DESIGN §7.0.2bq). Two row rewrites, both
 bit-identical to the shipped row (the dword form checked on both cards),

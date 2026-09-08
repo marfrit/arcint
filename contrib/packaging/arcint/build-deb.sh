@@ -11,7 +11,7 @@
 # It carries the CMake package, the headers and the runtime that arcint links.
 set -euo pipefail
 
-PKGVER=0.4.3
+PKGVER=0.4.4
 UPSTREAM_TAG=v${PKGVER}
 PKGREL=1
 # The public repository, not the fleet one. The fleet repo (still named
@@ -19,20 +19,21 @@ PKGREL=1
 # and carries operator-local notes; the published tree is the same code without
 # them, so the package is built from what anyone can check.
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
-# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v0.4.3.tar.gz,
-# taken after the tag was pushed; the tag was moved once, to the commit that mirrors
-# patch 0030 at the top level (its first tree failed the series test in the unit ladder).
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-a5a44cd7f9a1c9914bc53389fb1e2daa2769ca564eb1cf73415f88b3d7fb5cbe}
+# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v0.4.4.tar.gz,
+# taken after the tag was pushed (recorded in the follow-up commit, as for every tag).
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-}
 OV_PREFIX=/usr/lib/marfrit-openvino
 # The ABI is the nightly, not the patch level: floor the patch level, cap at
 # the next nightly. An exact pin (Depends: = +p1-1) made apt REMOVE arcint when
 # the runtime was upgraded to +p3 on 2026-09-04; never render "=" here again.
-OV_DEP_VERSION="2026.4.0~dev20260821+p12-1"
-# The +p12 floor is 0.4.3's (patch 0030, the tiled K-quant kernel's 32-row activation
-# reads; DESIGN §7.0.2bp); +p11 was 0.4.1's and 0.4.2's (patches 0022-0029), +p7 0.4.0's
-# (patch 0021). Building an older tag with it would re-issue a released version string
-# under different Depends. Refused.
-case "$PKGVER" in 0.3.*|0.4.0|0.4.1|0.4.2) echo "the +p12 floor is 0.4.3's; bump PKGVER and the tarball sha at the tag" >&2; exit 1 ;; esac
+OV_DEP_VERSION="2026.4.0~dev20260821+p15-1"
+# The +p15 floor is 0.4.4's (patch 0033: with four-bit values the verify pass read the
+# value rows through the f16 row's alignment, the agent configuration's alternating
+# text; DESIGN §7.0.2bu -- every +p14 runtime serves that configuration wrong, so the
+# floor is what makes apt pull the fix); +p12 was 0.4.3's (patch 0030), +p11 0.4.1's and
+# 0.4.2's (patches 0022-0029), +p7 0.4.0's (patch 0021). Building an older tag with it
+# would re-issue a released version string under different Depends. Refused.
+case "$PKGVER" in 0.3.*|0.4.0|0.4.1|0.4.2|0.4.3) echo "the +p15 floor is 0.4.4's; bump PKGVER and the tarball sha at the tag" >&2; exit 1 ;; esac
 OV_DEP_NEXT_NIGHTLY="2026.4.0~dev20260822"
 HERE=$(dirname "$(readlink -f "$0")")
 
