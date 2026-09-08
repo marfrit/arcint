@@ -3273,6 +3273,13 @@ private:
         // ---- allocate the state tables (rows), per lane ----------------------
         ov::RemoteContext rctx = core_.get_default_context(device);
         for (auto& lane : lanes_) alloc_la_rows(rctx, *lane);
+        // The resident zero rows, one per distinct state shape, before any request: the
+        // map is then never mutated on the request path.
+        try {
+            for (size_t i = 0; i < la_state_shapes_.size(); ++i) la_zero_row(i);
+        } catch (const std::exception& e) {
+            la_host_fallback("zero row allocation", e);
+        }
         if (std::getenv("ARCINT_PA_HOST_INPUTS") != nullptr) {
             usm_ctx_        = rctx;
             pa_host_inputs_ = true;
@@ -5622,10 +5629,11 @@ private:
     }
 
     // The GDN checkpoint rows are per lane rather than a window into one shared
-    // table, and the reason is right below: a row write stages the whole tensor
-    // host-side and copies it back, so two lanes sharing one tensor would zero
-    // each other's rows on every prefix-cache restore.
+    // table, and the reason is right below: a row write zeroes the table's other
+    // rows (see write_paged_row), so two lanes sharing one tensor would zero each
+    // other's rows on every prefix-cache restore.
     void alloc_la_rows(ov::RemoteContext& rctx, Lane& lane) {
+        la_ctx_ = rctx;
         lane.la_tensors.clear();
         for (size_t i = 0; i < la_state_names_.size(); ++i) {
             ov::Shape sh = la_state_shapes_[i];
@@ -5636,7 +5644,52 @@ private:
         }
     }
 
+    ov::Shape la_row_shape(size_t i) const {
+        ov::Shape sh = la_state_shapes_[i];
+        sh[0]        = 1;
+        return sh;
+    }
+    // A ROI view of one checkpoint row of one state tensor; still a remote tensor, so a
+    // copy into or out of it is the plugin's offset copy, not a whole-table staging.
+    ov::RemoteTensor la_row_view(Lane& lane, size_t i, size_t row) const {
+        ov::Shape full = la_state_shapes_[i];
+        full[0]        = rows_per_lane_;
+        ov::Coordinate begin(full.size(), 0), end(full.begin(), full.end());
+        begin[0] = row;
+        end[0]   = row + 1;
+        return ov::Tensor(lane.la_tensors[i], begin, end).as<ov::RemoteTensor>();
+    }
+    // One resident zero row per distinct state shape, filled from the host once.
+    ov::RemoteTensor la_zero_row(size_t i) {
+        const ov::Shape rs = la_row_shape(i);
+        auto it = la_zero_rows_.find(rs);
+        if (it != la_zero_rows_.end()) return it->second;
+        ov::RemoteTensor z = la_ctx_.create_tensor(ov::element::f16, rs);
+        ov::Tensor host(ov::element::f16, rs);
+        std::memset(host.data(), 0, host.get_byte_size());
+        z.copy_from(host);
+        la_zero_rows_.emplace(rs, z);
+        return z;
+    }
+    void la_host_fallback(const char* what, const std::exception& e) {
+        if (la_device_rows_.load())
+            log::warn("state", "%s on the device refused (%s); the host path serves the rows from here on",
+                      what, e.what());
+        la_device_rows_.store(false);
+    }
+
     void zero_paged_rows(Lane& lane) {
+        if (la_device_rows_.load()) {
+            try {
+                for (size_t i = 0; i < lane.la_tensors.size(); ++i) {
+                    ov::RemoteTensor z = la_zero_row(i);
+                    for (size_t r = 0; r < rows_per_lane_; ++r) la_row_view(lane, i, r).copy_from(z);
+                }
+                return;
+            } catch (const std::exception& e) {
+                la_host_fallback("row zeroing", e);
+            }
+        }
         for (size_t i = 0; i < lane.la_tensors.size(); ++i) {
             ov::Shape sh = la_state_shapes_[i];
             sh[0]        = rows_per_lane_;
@@ -5648,6 +5701,21 @@ private:
 
     std::vector<std::vector<uint8_t>> read_paged_row(Lane& lane, size_t row) {
         std::vector<std::vector<uint8_t>> out;
+        if (row >= rows_per_lane_) throw std::out_of_range("checkpoint row");
+        if (la_device_rows_.load()) {
+            try {
+                for (size_t i = 0; i < lane.la_tensors.size(); ++i) {
+                    ov::Tensor host(ov::element::f16, la_row_shape(i));
+                    la_row_view(lane, i, row).copy_to(host);
+                    const uint8_t* base = static_cast<const uint8_t*>(host.data());
+                    out.emplace_back(base, base + host.get_byte_size());
+                }
+                return out;
+            } catch (const std::exception& e) {
+                la_host_fallback("row read", e);
+                out.clear();
+            }
+        }
         for (size_t i = 0; i < lane.la_tensors.size(); ++i) {
             ov::Shape full = la_state_shapes_[i];
             full[0]        = rows_per_lane_;
@@ -5660,7 +5728,30 @@ private:
         return out;
     }
 
+    // Writes one checkpoint row and leaves every other row of the table zero -- the
+    // whole-table host staging did that as a side effect; kept because the old path did
+    // it, whether the verify graph needs the other rows zero is untested.
     void write_paged_row(Lane& lane, size_t row, const std::vector<std::vector<uint8_t>>& blobs) {
+        if (row >= rows_per_lane_) throw std::out_of_range("checkpoint row");
+        if (blobs.size() != lane.la_tensors.size()) throw std::runtime_error("row blob count mismatch");
+        for (size_t i = 0; i < lane.la_tensors.size(); ++i)
+            if (blobs[i].size() != ov::shape_size(la_row_shape(i)) * ov::element::f16.size())
+                throw std::runtime_error("row blob size mismatch");
+        if (la_device_rows_.load()) {
+            try {
+                for (size_t i = 0; i < lane.la_tensors.size(); ++i) {
+                    const ov::Shape rs = la_row_shape(i);
+                    ov::RemoteTensor z = la_zero_row(i);
+                    for (size_t r = 0; r < rows_per_lane_; ++r)
+                        if (r != row) la_row_view(lane, i, r).copy_from(z);
+                    const ov::Tensor host(ov::element::f16, rs, blobs[i].data());
+                    la_row_view(lane, i, row).copy_from(host);
+                }
+                return;
+            } catch (const std::exception& e) {
+                la_host_fallback("row write", e);
+            }
+        }
         for (size_t i = 0; i < lane.la_tensors.size(); ++i) {
             ov::Shape full = la_state_shapes_[i];
             full[0]        = rows_per_lane_;
@@ -7475,6 +7566,20 @@ private:
     ov::InferRequest               paged_req_;
     std::vector<std::string>       la_state_names_;   // conv + gdn table port names
     std::vector<ov::Shape>         la_state_shapes_;  // one row; the rows dim is filled in
+    // Kernel review 2026-09-08: the recurrent state rows are zeroed on the device by a
+    // row-sized copy from one resident zero row per state shape, and a checkpoint row is
+    // read or written through a ROI view of its tensor. Before, every request uploaded the
+    // whole per-lane table of every layer from a zero-filled host tensor (48 x 6 MB of GDN
+    // tables plus the small conv ones per request on the 27B hybrid = 22 ms of device time,
+    // 3 % of an 856-token prefill; 0.03 of the 0.19 s wall of a 130-token one), and a
+    // checkpoint row read or write staged the whole table both ways. If the plugin refuses a remote-to-remote ROI copy the host path takes over for
+    // the rest of the process (logged once).
+    // la_zero_rows_ is filled at load (after the lanes' rows exist) and only read on the
+    // request path, where two lanes are two threads; the fallback flag is atomic for the
+    // same reason.
+    ov::RemoteContext              la_ctx_;
+    std::map<ov::Shape, ov::RemoteTensor> la_zero_rows_;
+    std::atomic<bool>              la_device_rows_{true};
     std::vector<std::string>       kv_pool_names_;
     std::vector<ov::element::Type> kv_pool_types_;
     std::vector<ov::Shape>         kv_pool_shapes_;   // with the blocks dim filled in

@@ -8581,6 +8581,99 @@ of one group and no served configuration takes that path. The 85-token
 two-text alternation stays open and is unrelated (it does not fault and
 the native form shows it).
 
+#### 7.0.2bt The kernel review, first pass: every kernel on the card counted, timed and disassembled; the recurrent-state rows zeroed on the device (2026-09-08)
+
+The operator's directive after the 0032 fix: every kernel that reaches
+the card -- the plugin's, oneDNN's, the micro-gemm blobs -- disassembled
+and reviewed for efficiency. This section is the first pass: the census,
+the ranked table, what the disassemblies say kernel by kernel, and the one
+patch it produced so far. The raw material (call logs, traces, every ISA
+binary and jit source, the parsers) stays on the dev host; the record here
+is what a reader needs to rank the rest.
+
+**The census.** One 856-token chat prompt with 64 output tokens, under the
+intercept layer with the call log, the chrome trace, the per-kernel ISA
+and jit-source dumps, on the 24 GB card. The tracer's overhead sits in the
+span, not in the device durations (the card's own timestamps).
+
+| form | prefill: launches, device busy | steady decode step: launches, busy | kernel variants |
+|---|---|---|---|
+| IR, the agent unit's config (u8:i4 KV, MTP on, chunk 512) | 4,315, 681 ms | 1,763, 48.8 ms | 233 |
+| GGUF mixed exact (u8 KV, MTP off) | 2,406, 841 ms | 2,045, 52.0 ms | 117 |
+
+**The ranked table**, by device time over one prefill plus 64 steps, with
+what the ISA says. Bandwidth shares are against the 453 GB/s probe ceiling
+(§7.0.2bd); the byte counts of the K-quant launches come from the jit
+sources' filter dimensions.
+
+| # | kernel | share | the reading | lever |
+|---|---|---|---|---|
+| 1 | oneDNN M=1 decode gemm | 68 % of the IR step, 58 % of the GGUF step | one 128-k chunk per iteration; one 2D block load of packed int4 per 32 k, 80 ALU instructions of unpack, zero point and scale per 512 weights, then two DPAS; a work-group barrier per chunk; eight-way k-parallel inside the work-group with an SLM reduction; 80 work-groups, one wave. 73–79 % of the ceiling; by the instruction count the dequant would fit under the loads, unmeasured | oneDNN strategy only |
+| 2 | oneDNN lm_head gemm | 11.7 % of the IR step (two launches with MTP) | the same loop shape on a grid of 3,880 work-groups in 48 waves of ten short chunk iterations each: 48 latency chains in series, 49 % of the ceiling. The GGUF form's K-quant lm_head does the same job at 96 % | oneDNN strategy only |
+| 3 | oneDNN small-M gemm (the MTP verify rows) | 5.9 % of the IR step | 40 work-groups, half the device; 3.6× the M=1 launch on the same weights | oneDNN strategy only |
+| 4 | the K-quant decode kernel | 32 % of the GGUF step | 71–96 % of the ceiling by shape (o_proj 71, the down projection 72, the lm_head 96: the shapes with one to four waves pay ramp and drain). Its own row and unroll knobs measured: any row count but four leaves the kernel's path; the block unroll of two is slower on every shape at 128 registers, four spills to scratch | none from the tiling |
+| 5 | oneDNN int8 prefill gemm | 66 % of the IR prefill | 32 DPAS per iteration against ~590 ALU instructions of int4-to-int8 dequant done per thread, no SLM sharing: 102 TFLOP/s against an int8 XMX roof of twice the f16 roof's 98 TFLOP/s (§7.0.2bo), about half | oneDNN strategy only |
+| 6 | gated delta net prefill | 9–11 % of both prefills | one subgroup per head and value block walks tokens sequentially with ~10 cross-lane reductions per token; 1,536 subgroups on 1,280 thread slots; 1.86 µs per token per layer | two tokens per iteration; the chunked form (large) |
+| 7 | host-to-device state writes | 3.2 % of the IR prefill, 2 % of the GGUF one | 48 uploads of 5–6 MB per request (the gated-delta-net tables; the 48 conv tables are small and below the table's cut): arcint's own zeroing of the recurrent-state rows | **this section's patch** |
+| 8 | the MTP head's GQA broadcast | 0.9 % of the IR step | the drafter's attention is not paged; its graph materialises K and V from 4 heads to 24 over the whole context every step | export-side |
+| 9 | the KV-cache append | 1.2 % of the IR step | by-channel u8 keys re-quantise the whole 16-token block per appended token; inherent to the scale scheme | none |
+| 10 | the reference kernels (activation, eltwise, slice, reduce, concat, gather, rms) | ~5 % of the prefill, ~2 % of the step, a quarter of the launches | small each; fusion | later |
+| 11 | the f16 prefill gemm; the tiled K-quant prefill | 48 % and 27 % of the GGUF prefill | at the f16 roof (§7.0.2bo); at the record's 50 % (§7.0.2bp–bq); the tiled kernel's epilogue stores a 64×16 tile with 64 scattered 16-bit stores, negligible | none new |
+
+Spills, the review's first suspicion, carry under one percent: two
+256-register variants (a small tiled K-quant shape, a rare generate-variant
+micro-SDPA) and the micro-SDPA prefill's 35 loads and 18 stores to scratch.
+
+**The reading behind the table**, and it is a reading: what the ISA
+suggests, unmeasured until a strategy-override experiment runs. The big
+items are oneDNN's strategy choices -- the decode gemm near its roof; the
+lm_head and small-M gemms at half of it, where the grid shape is the
+visible difference from the fast one; the int8 prefill gemm with eighteen
+ALU instructions per DPAS, which reads as issue-bound but no counter has
+said so. The plugin's fully-connected passes oneDNN a primitive
+descriptor and attributes (§7.0.2br's deterministic flag is one) and no
+strategy hint that this reading found; they are recorded for an upstream
+offer or that experiment. The cheap levers are arcint's own, and the
+first is done.
+
+**Patch 1: the recurrent-state rows on the device.** A fresh request
+zeroed every conv and gated-delta-net layer's per-lane state table by
+uploading a zero-filled host copy of the whole table -- 48 layers × 6 MB
+on the 27B hybrid, 22 ms of device time per request in the IR form, 17 ms
+in the GGUF one -- and a checkpoint row's read or write staged the whole
+table both ways. Now one resident zero row per distinct state shape is
+filled once, and a ROI view of the target row (the same view the KV host
+tier uses, §4.4) takes a device-side copy from it; a row read or write goes
+through the same view; the write still zeroes the other rows first, the
+old side effect kept. If the plugin refuses a remote-to-remote ROI copy the
+host path takes over for the process, logged once (it did not). An
+arcint-only change: the runtime floor stays at +p12; measured on the
+installed +p14. Measured on the 24 GB card, the agent unit's config
+(u8:i4 KV, MTP on, chunk 512, n-ctx 8192, prefix cache off), two fresh
+processes of the new binary against the installed 0.4.3, three requests
+each; "restore" is the prefill line's wall time for the cache lookup,
+the restore and the row zeroing, which with the cache off is the zeroing:
+
+| prompt | before | after |
+|---|---|---|
+| 130 tokens | 0.19 s, 667–669 t/s, restore 0.03 s | **0.17 s, 769–773 t/s**, restore 0.00 |
+| 856 tokens | 0.71 s, 1,203–1,205 t/s, restore 0.03 s | **0.68 s, 1,247–1,252 t/s**, restore 0.00 |
+
+Output-neutral: the same texts per request in the same order before and
+after. The equivalence suite on the new binary passes every gate,
+including the prefix-cache restores that go through the row read and
+write (warm byte-identical to cold, with MTP and without, a continuation
+restored from cache matching a cold run).
+
+**A finding on the way**, open: the agent unit's own configuration with
+MTP on gave a different greedy text for the same 130-token prompt at each
+of three requests in one process -- and the same three texts in the same
+order in every process (four of four, before and after the patch alike),
+so a state carried across requests, deterministic in the request index,
+not noise. The suite's own two-run gate passes with its settings; open,
+the bracket (MTP off, the prefix cache on, u8 KV) is the next section's
+subject.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

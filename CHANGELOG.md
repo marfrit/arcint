@@ -17,6 +17,32 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## Unreleased — the kernel review's first pass (2026-09-08)
+
+Requires `marfrit-openvino 2026.4.0~dev20260821+p12` as before (an
+arcint-only change; measured on the installed +p14); DESIGN §7.0.2bt.
+
+- **Every kernel on the card counted, timed and disassembled** (DESIGN
+  §7.0.2bt): a census of one served request per form (233 and 117 kernel
+  variants), a ranked table with what each disassembly says, and the
+  levers. The big items are oneDNN strategy choices (the M=1 decode gemm
+  near its bandwidth roof; the lm_head and small-M gemms at half of it,
+  the grid shape the visible difference; the int8 prefill gemm at half
+  the XMX roof with eighteen ALU instructions per DPAS -- readings from
+  the ISA, unmeasured until a strategy-override experiment); the cheap
+  ones are arcint's own.
+- **Prefill: the recurrent-state rows are zeroed on the device.** A fresh
+  request uploaded a zero-filled copy of every layer's state table from
+  the host (48 × 6 MB on the 27B hybrid, 22 ms per request); now a resident
+  zero row is copied into each row through a ROI view, and checkpoint rows
+  are read and written through the same view instead of staging the whole
+  table. 24 GB card, the agent unit's config: 130 tokens 667 → 770 t/s
+  (+15 %), 856 tokens 1,204 → 1,250 t/s (+4 %), the prefill line's
+  restore time 0.03 → 0.00 s; output-neutral; the equivalence suite's
+  prefix-cache gates pass.
+- Open, found on the way: the IR with MTP on gives a different greedy text
+  per request index in one process, the same sequence in every process.
+
 ## Unreleased — the short-prompt fault (2026-09-08)
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p14` (patches 0003–0032)
