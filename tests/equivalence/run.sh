@@ -230,6 +230,24 @@ if [[ -f "$MODEL/openvino_mtp_layer.xml" && -f "$MODEL/openvino_mtp_lm_head.xml"
   else
     fail "the MTP head is actually accepting (got ${macc:-no}% -- the head is inert)"
   fi
+
+  # The served pairing, u8 keys with i4 values, three requests in one process.
+  # The gates above run at the default KV precision and could not see the
+  # 2026-09-08 defect (DESIGN §7.0.2bu): with four-bit values the verify pass
+  # read the value rows through a wrong alignment, so what it read depended on
+  # the physical pages a request happened to get, and the same prompt gave a
+  # different greedy text at the second request of a process than at the
+  # first. Byte-identity across the request index is the claim; it is not the
+  # near-tie question (MTP against plain greedy, reported above).
+  start_server "$WORK/mtpi4.log" --mtp on --paged-kv u8:i4 || exit 1
+  ask "$WORK/mtpi4a.txt" "$PROMPT"
+  ask "$WORK/mtpi4b.txt" "$PROMPT"
+  ask "$WORK/mtpi4c.txt" "$PROMPT"
+  if cmp -s "$WORK/mtpi4a.txt" "$WORK/mtpi4b.txt" && cmp -s "$WORK/mtpi4b.txt" "$WORK/mtpi4c.txt"; then
+    pass "MTP at u8:i4: the same text on three requests of one process"
+  else
+    fail "MTP at u8:i4: the same text on three requests of one process (the pages decide the text)"
+  fi
 else
   echo "  --   no MTP head in $MODEL; skipping the MTP gates"
   echo "ACCEPTANCE-SKIP mtp-section no-mtp-head-in-artifact"

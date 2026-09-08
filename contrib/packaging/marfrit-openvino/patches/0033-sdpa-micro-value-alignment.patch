@@ -1,0 +1,482 @@
+# The micro-SDPA generator gives the V*S micro-gemm the packed row's alignment whenever the VALUE
+# precision is four-bit: under u8 keys with i4 values it used the f16 row's (128 bytes) for a
+# 132-byte row, and the verify pass read value rows that depended on the physical pages a request got
+
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0003-0032. arcint 0.4.4 series (DESIGN.md section 7.0.2bu).
+#
+# What changes:
+#   sdpa_gen_micro.cpp   One condition: problem_vs.A's alignment is the packed row (v_head_size *
+#                       u4 + 4 bytes: 132 at head 256, 68 at 128) when the value cache is four-bit,
+#                       not only when the key cache is. Patch 0020 keyed the operand's type
+#                       (Ta_ext) on the value precision and left the alignment on the key's, so the
+#                       served pairing (u8 keys by channel, i4 values by token) told the gemm
+#                       strategy its rows were 128-byte aligned (alignment_for_ld returns the lowest
+#                       set bit of head * 2, capped at 128). A strategy addressing 128-byte-aligned rows reads
+#                       something that depends on the page's address: the agent configuration's
+#                       greedy text alternated by request parity (the page pool is a stack, odd
+#                       requests get ascending pages, even ones descending) and was wrong from the
+#                       first request, MTP on differing from MTP off.
+#   paged_attention_gpu_test.h
+#                       The harness addressed cache pages as start + j in ten places and built
+#                       only ascending contiguous block tables, so a kernel reading a neighbouring
+#                       page passed every case; now every page goes through the table, num_blocks
+#                       is the table's maximum, and permute_pages()/page_order give a test a
+#                       reversed table or a gap after page 0 (the served pool's third request;
+#                       ARCINT_TEST_PAGE_PERM overrides for exploration). The four-bit value
+#                       packing of past tokens is adjacent pairs (byte n = dims 2n, 2n+1), as
+#                       pa_kv_cache_update_ref.cl writes and the readers expect; it was
+#                       (dim 32g + lane, dim 32g + 16 + lane), a layout no kernel reads, invisible
+#                       while every dim of a token carried the same value.
+#   paged_attention_gpu_test.cpp
+#                       The mixed-micro tests' fill could not see a misread page: all past keys -1,
+#                       past values 0, new keys by token % 16 only, a query of 8 (one-hot softmax on
+#                       each page's last token). Now every token, head and page has its own key
+#                       (within 4e-4 of the u8 by-channel grid) and value (all sixteen four-bit
+#                       levels in every token-and-head row, stored exactly), a query of 1/64. Cases
+#                       added: the served verify shapes at head 128 and the served geometry (24
+#                       heads, 4 KV heads, head 256) under ascending, reversed and gapped tables.
+#
+# MEASURED 2026-09-08 on the 24 GB card:
+#   Plugin test, full statistics over every element against the float reference: before the
+#     line the u8:i4 cases err by 2.0-2.3 on 98-99 % of elements (value range 15) and the
+#     served three-token case hangs the binary (aborts under a reversed or gapped table); with it
+#     exact: at most 0.001 on every case, none over 1e-2. The same fill through f16 KV and through u8 KV: exact to the tolerance. The
+#     tests' tolerance stays at 1e-2. (Retracted on the record, DESIGN 7.0.2bu: a first fill with
+#     eight levels per row measured its own quantisation as a 0.11 "floor"; the review's
+#     arithmetic reproduced the element map from the fill, sixteen levels per row removed it.)
+#   Plugin test on the patch's exact content: u8:i4 mixed micro 14/14, u4 mixed micro 2/2,
+#     paged_attention 255/255 under the default and under a reversed table, sdpa 47/47.
+#   Served (arcint 0.4.3, IR agent model, u8:i4, MTP on, chunk 512, one process): 130 tokens,
+#     six requests: 825b1747 x6 = the MTP-off text (before: two texts alternating, neither the
+#     MTP-off one); 8,005 tokens twice: e8010a09, e8010a09 (before: d2845b6c); prefill 865/870
+#     t/s against 869/874; decode at 8k 20-23 t/s against 21.6. Equivalence suite on the fixed
+#     plugin: every gate, including the new "MTP at u8:i4: the same text on three requests of
+#     one process"; on the unfixed plugin that gate fails and the rest pass.
+#
+# Package: +p15.
+
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/sdpa_gen_micro.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/sdpa_gen_micro.cpp
+@@ -1845,8 +1845,9 @@
+     problem_vs.B.layout = micro::MatrixLayout::Pr;
+     problem_vs.C.layout = micro::MatrixLayout::N;
+ 
+-    if (is_int4_kv_cache && is_paged_attention && !is_prefill) {
++    if ((is_int4_kv_cache || is_int4_value_cache) && is_paged_attention && !is_prefill) {
+         // INT4 V: ldv = packed_head_bytes + scales = v_head_size * u4 + 4 = 68
++        // arcint (m54 experiment): keyed on the VALUE precision, as Ta_ext above already is.
+         problem_vs.A.setAlignment(static_cast<int>(v_head_size * problem_vs.Ta_ext) + 4);
+     } else {
+         problem_vs.A.setAlignment(micro::alignment_for_ld(static_cast<int>(v_head_size * problem.Ta)));
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.h
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.h
+@@ -3,6 +3,8 @@
+ //
+ 
+ #pragma once
++#include <algorithm>
++#include <cstdlib>
+ 
+ #include <intel_gpu/primitives/activation.hpp>
+ #include <intel_gpu/primitives/data.hpp>
+@@ -210,6 +212,12 @@
+             int block_indices_end_pos = block_indices_start_pos + required_blocks;
+             block_indices_begins.push_back(block_indices_end_pos);
+         }
++        // arcint (patch 0033): the harness always built an ascending contiguous block table, the
++        // one shape a served page pool never guarantees, and a kernel that read a neighbouring
++        // page instead of following the table passed every case (DESIGN 7.0.2bu). The cache
++        // fills and num_blocks below go through the table; a test asks for another order with
++        // paged_attention_test_params::page_order (the fixture applies it; ARCINT_TEST_PAGE_PERM
++        // replaces it for exploration).
+         max_context_len.push_back(max_len);
+ 
+         if (rotation_config.apply_rotation) {
+@@ -254,6 +262,21 @@
+         return get_QKV_memory(value_data, num_kv_heads, v_head_size, true);
+     }
+ 
++    // "reverse": each subsequence's pages in descending order. "gap": page 0 stays, every other
++    // page shifts up by one, so logical blocks 0 and 1 sit on pages 0 and 2 -- the served pool's
++    // third request. Call once, before any cache memory is built.
++    void permute_pages(const std::string& mode) {
++        if (mode.empty()) return;
++        for (size_t i = 0; i + 1 < block_indices_begins.size(); ++i) {
++            auto first = block_indices.begin() + block_indices_begins[i];
++            auto last = block_indices.begin() + block_indices_begins[i + 1];
++            if (mode == "reverse") std::reverse(first, last);
++        }
++        if (mode == "gap") {
++            for (auto& page : block_indices) if (page != 0) page += 1;
++        }
++    }
++
+     cldnn::memory::ptr get_key_cache_memory_cm() {
+         constexpr int kv_sub_block_size = 16;
+         auto key_cache_dt = kv_cache_compression ? cldnn::data_types::i8 : cldnn::data_types::f16;
+@@ -269,7 +292,7 @@
+             }
+         }
+ 
+-        const auto num_blocks = block_indices.back() + 1;
++        const auto num_blocks = *std::max_element(block_indices.begin(), block_indices.end()) + 1;
+         auto key_cache_shape = ov::PartialShape{static_cast<int64_t>(num_blocks),
+                                                 static_cast<int64_t>(num_kv_heads),
+                                                 static_cast<int64_t>(adjusted_block_size),
+@@ -283,7 +306,6 @@
+                 continue;
+ 
+             const int blocks_num = cldnn::ceil_div(past_len + 1, block_size);
+-            const int start_block_idx = block_indices[block_indices_begins[i]];
+ 
+             for (int block_idx = 0; block_idx < blocks_num; block_idx++) {
+                 const int last_token_idx = (block_idx == blocks_num - 1) ? (past_len - block_size * block_idx) : block_size;
+@@ -295,7 +317,7 @@
+                             key_data[i].data() + input_token_offset * static_cast<size_t>(num_kv_heads) * head_size + static_cast<size_t>(head_idx) * head_size;
+ 
+                         if (!kv_cache_compression) {
+-                            const size_t base = (static_cast<size_t>(start_block_idx + block_idx) * num_kv_heads * block_size * head_size) +
++                            const size_t base = (static_cast<size_t>(block_indices[block_indices_begins[i] + block_idx]) * num_kv_heads * block_size * head_size) +
+                                                 (static_cast<size_t>(head_idx) * block_size * head_size);
+                             const size_t off = base + static_cast<size_t>(token_idx) * head_size;
+                             set_values(test_stream, memory, src_ptr, head_size, off);
+@@ -311,7 +333,7 @@
+                             int8_t* qptr = reinterpret_cast<int8_t*>(qdata.data());
+ 
+                             const size_t block_stride_i8 = static_cast<size_t>(adjusted_head_size) * block_size;
+-                            const size_t block_base_i8 = (static_cast<size_t>(start_block_idx + block_idx) * num_kv_heads + head_idx) * block_stride_i8;
++                            const size_t block_base_i8 = (static_cast<size_t>(block_indices[block_indices_begins[i] + block_idx]) * num_kv_heads + head_idx) * block_stride_i8;
+ 
+                             const size_t data_off_i8 = block_base_i8 + token_idx * head_size;
+                             set_values(test_stream, memory, qptr, head_size, data_off_i8);
+@@ -333,7 +355,7 @@
+                             //   zp fp16 region per-subblock per-channel      : [(block_size / sub_block) * head_size]
+                             const size_t block_stride_i8 = static_cast<size_t>(adjusted_block_size) * static_cast<size_t>(head_size);
+                             const size_t block_base_i8 =
+-                                (static_cast<size_t>(start_block_idx + block_idx) * static_cast<size_t>(num_kv_heads) + static_cast<size_t>(head_idx)) *
++                                (static_cast<size_t>(block_indices[block_indices_begins[i] + block_idx]) * static_cast<size_t>(num_kv_heads) + static_cast<size_t>(head_idx)) *
+                                 block_stride_i8;
+ 
+                             const int subblock_count = block_size / kv_sub_block_size;
+@@ -416,7 +438,7 @@
+             }
+         }
+ 
+-        auto num_blocks = block_indices.back() + 1;
++        auto num_blocks = *std::max_element(block_indices.begin(), block_indices.end()) + 1;
+         auto key_cache_shape = ov::PartialShape{num_blocks, num_kv_heads, adjusted_head_size, adjusted_block_size};
+         auto key_cache_layout = cldnn::layout{key_cache_shape, key_cache_dt, cldnn::format::bfyx};
+         auto memory = test_engine.allocate_memory(key_cache_layout);
+@@ -424,7 +446,6 @@
+             int past_len = subsequence_descs[i].past_len;
+             if (past_len != 0) {
+                 int blocks_num = cldnn::ceil_div(past_len + 1, block_size);
+-                int start_block_idx = block_indices[block_indices_begins[i]];
+                 for (int block_idx = 0; block_idx < blocks_num; block_idx++) {
+                     int last_token_idx = block_idx == blocks_num - 1 ? (past_len - block_size * block_idx) : block_size;
+                     // quantize by channel
+@@ -461,7 +482,7 @@
+                                     }
+ 
+                                     const size_t block_offset =
+-                                        static_cast<size_t>(start_block_idx + block_idx) * num_kv_heads * k_head_size * adjusted_block_size +
++                                        static_cast<size_t>(block_indices[block_indices_begins[i] + block_idx]) * num_kv_heads * k_head_size * adjusted_block_size +
+                                         head_idx * k_head_size * adjusted_block_size;
+                                     const size_t row_offset = block_offset + d * adjusted_block_size;
+ 
+@@ -494,7 +515,7 @@
+                                             *(key_data[i].data() + input_token_offset * num_kv_heads * k_head_size + head_idx * k_head_size + k_head_size_idx);
+                                     }
+                                     auto [quantized_data, scale, zp] = quantize_data(token_block.data(), last_token_idx, true);
+-                                    size_t output_block_offset = (start_block_idx + block_idx) * num_kv_heads * adjusted_head_size * adjusted_block_size +
++                                    size_t output_block_offset = (block_indices[block_indices_begins[i] + block_idx]) * num_kv_heads * adjusted_head_size * adjusted_block_size +
+                                                                  head_idx * adjusted_head_size * adjusted_block_size;
+                                     size_t output_offset = output_block_offset + k_head_size_idx * adjusted_block_size;
+                                     set_values(test_stream, memory, quantized_data.data(), last_token_idx, output_offset);
+@@ -513,7 +534,7 @@
+                                     size_t input_token_offset = block_idx * block_size + token_idx;
+                                     ov::float16* data_ptr = key_data[i].data() + input_token_offset * num_kv_heads * k_head_size + head_idx * k_head_size;
+                                     // shape: [num_blocks, num_kv_heads, adjusted_head_size, block_size]
+-                                    size_t output_block_offset = (start_block_idx + block_idx) * num_kv_heads * adjusted_head_size * block_size +
++                                    size_t output_block_offset = (block_indices[block_indices_begins[i] + block_idx]) * num_kv_heads * adjusted_head_size * block_size +
+                                                                  head_idx * adjusted_head_size * block_size;
+ 
+                                     if (is_int4_kv_cache()) {
+@@ -585,7 +606,7 @@
+                                         key_data[i].data() + input_token_offset * num_kv_heads * k_head_size + head_idx * k_head_size + k_head_size_idx;
+ 
+                                     // shape: [num_blocks, num_kv_heads, k_head_size, block_size]
+-                                    size_t output_offset = (start_block_idx + block_idx) * num_kv_heads * k_head_size * block_size +
++                                    size_t output_offset = (block_indices[block_indices_begins[i] + block_idx]) * num_kv_heads * k_head_size * block_size +
+                                                            head_idx * k_head_size * block_size + k_head_size_idx * block_size + token_idx;
+ 
+                                     set_values(test_stream, memory, data_ptr, 1, output_offset);
+@@ -616,7 +637,7 @@
+         // PACKED_ADJUSTED_V_HEAD_SIZE = v_head_size/2 + scales_zp_size = 32 + 4 = 36.
+         const int adjusted_head_size = is_int4_value_cache() ? (head_size / 2 + scale_zp_bytes) : (head_size + scale_zp_bytes);
+ 
+-        const auto num_blocks = block_indices.back() + 1;
++        const auto num_blocks = *std::max_element(block_indices.begin(), block_indices.end()) + 1;
+         auto value_cache_shape = ov::PartialShape{static_cast<int64_t>(num_blocks),
+                                                   static_cast<int64_t>(num_kv_heads),
+                                                   static_cast<int64_t>(block_size),
+@@ -630,7 +651,6 @@
+                 continue;
+ 
+             const int blocks_num = cldnn::ceil_div(past_len + 1, block_size);
+-            const int start_block_idx = block_indices[block_indices_begins[i]];
+ 
+             for (int block_idx = 0; block_idx < blocks_num; block_idx++) {
+                 const int last_token_idx = (block_idx == blocks_num - 1) ? (past_len - block_size * block_idx) : block_size;
+@@ -643,7 +663,7 @@
+                                                static_cast<size_t>(head_idx) * head_size;
+ 
+                         if (!kv_cache_compression) {
+-                            const size_t base = (static_cast<size_t>(start_block_idx + block_idx) * static_cast<size_t>(num_kv_heads) *
++                            const size_t base = (static_cast<size_t>(block_indices[block_indices_begins[i] + block_idx]) * static_cast<size_t>(num_kv_heads) *
+                                                  static_cast<size_t>(block_size) * static_cast<size_t>(head_size)) +
+                                                 (static_cast<size_t>(head_idx) * static_cast<size_t>(block_size) * static_cast<size_t>(head_size));
+                             const size_t off = base + static_cast<size_t>(token_idx) * static_cast<size_t>(head_size);
+@@ -674,7 +694,7 @@
+ 
+                             const size_t block_stride = static_cast<size_t>(adjusted_head_size) * static_cast<size_t>(block_size);
+                             const size_t block_base =
+-                                (static_cast<size_t>(start_block_idx + block_idx) * static_cast<size_t>(num_kv_heads) + static_cast<size_t>(head_idx)) *
++                                (static_cast<size_t>(block_indices[block_indices_begins[i] + block_idx]) * static_cast<size_t>(num_kv_heads) + static_cast<size_t>(head_idx)) *
+                                 block_stride;
+ 
+                             // Token base: each token occupies adjusted_head_size bytes (inline comp)
+@@ -684,8 +704,11 @@
+                             const int num_packed_groups = packed_head_size / 16;
+                             for (int g = 0; g < num_packed_groups; g++) {
+                                 for (int lane = 0; lane < 16; lane++) {
+-                                    int dim_even = (g * 2) * 16 + lane;
+-                                    int dim_odd = (g * 2 + 1) * 16 + lane;
++                                    // arcint (patch 0033): adjacent pairs, byte n = (dim 2n, dim 2n + 1),
++                                    // as pa_kv_cache_update_ref.cl writes and the readers expect;
++                                    // was (dim 32g + lane, dim 32g + 16 + lane), which no kernel reads.
++                                    int dim_even = g * 32 + lane * 2;
++                                    int dim_odd = g * 32 + lane * 2 + 1;
+                                     int q0 = static_cast<int>(std::nearbyint(static_cast<float>(src_ptr[dim_even]) * scale_val + zp_val));
+                                     int q1 = static_cast<int>(std::nearbyint(static_cast<float>(src_ptr[dim_odd]) * scale_val + zp_val));
+                                     q0 = std::max(0, std::min(15, q0));
+@@ -712,7 +735,7 @@
+ 
+                             const size_t block_stride_i8 = static_cast<size_t>(adjusted_head_size) * static_cast<size_t>(block_size);
+                             const size_t block_base_i8 =
+-                                (static_cast<size_t>(start_block_idx + block_idx) * static_cast<size_t>(num_kv_heads) + static_cast<size_t>(head_idx)) *
++                                (static_cast<size_t>(block_indices[block_indices_begins[i] + block_idx]) * static_cast<size_t>(num_kv_heads) + static_cast<size_t>(head_idx)) *
+                                 block_stride_i8;
+ 
+                             const size_t data_off_i8 = block_base_i8 + static_cast<size_t>(token_idx) * static_cast<size_t>(head_size);
+@@ -1826,6 +1849,8 @@
+                     p.rotation_config,
+                     p.kv_cache_precision,
+                     p.value_cache_precision);
++        if (const char* perm = std::getenv("ARCINT_TEST_PAGE_PERM")) pam->permute_pages(perm);
++        else pam->permute_pages(p.page_order);
+ 
+         if (p.zero_key_data) {
+             for (auto& sequence_key_data : pam->key_data) {
+@@ -3070,6 +3095,10 @@
+     // use of `subsequences` already in this file).
+     int growth_chunk_size = 0;
+     int64_t growth_final_total_tokens = 0;
++
++    // arcint (patch 0033): the physical page order the harness hands the sequence's blocks --
++    // "" ascending contiguous (the historical shape), "reverse", "gap"; see permute_pages().
++    std::string page_order;
+ };
+ 
+ const auto ENABLE_CACHE_COMPRESSION = true;
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
+@@ -22,24 +22,36 @@
+     ASSERT_TRUE(this->pam.has_value());
+     auto& pam = *this->pam;
+ 
++    // arcint (patch 0033): the fill before this one could not see a misread page -- every past
++    // token carried the same key and a zero value, the new tokens' keys depended on token % 16
++    // only, and a query of 8 made the softmax one-hot on the page's last token. Now every token
++    // of the past and the present has its own key (block, head and token distinct, on the
++    // 16-level grid u8 by-channel stores within 4e-4), values on the 16 integer levels four-bit
++    // by-token stores exactly -- all sixteen present in every (token, head) row, so the row's
++    // range is 15 and its scale 1; a first version put eight per row and measured its own
++    // quantisation as a 0.11 "floor" (DESIGN 7.0.2bu) -- distinct per token, head and 16-dim
++    // group, and a query of 1/64 keeps every token's weight within a factor of five of the
++    // others. Calibrated: f16 KV and u8 KV exact to the tolerance, the served pairing before the
++    // fix 2.0-2.3 on 98-99 % of the elements (value range 15).
+     for (size_t sequence = 0; sequence < pam.subsequence_descs.size(); ++sequence) {
+-        std::fill(pam.query_data[sequence].begin(), pam.query_data[sequence].end(), ov::float16{8.0f});
+-        std::fill(pam.key_data[sequence].begin(), pam.key_data[sequence].end(), ov::float16{-1.0f});
+-        std::fill(pam.value_data[sequence].begin(), pam.value_data[sequence].end(), ov::float16{0.0f});
++        std::fill(pam.query_data[sequence].begin(), pam.query_data[sequence].end(), ov::float16{0.015625f});
+ 
+         const int past_len = pam.subsequence_descs[sequence].past_len;
+         const int num_tokens = pam.subsequence_descs[sequence].num_tokens;
+-        for (int token = 0; token < num_tokens; ++token) {
++        const int v_group = std::max(1, p.v_head_size / 16);
++        for (int token = 0; token < past_len + num_tokens; ++token) {
+             const float key_value = -0.2f + 0.4f * static_cast<float>(token % p.block_size) /
+-                                                     static_cast<float>(p.block_size - 1);
+-            const ov::float16 value = token % 2 == 0 ? ov::float16{-1.0f} : ov::float16{1.0f};
++                                                     static_cast<float>(p.block_size - 1) +
++                                    0.01f * static_cast<float>(token / p.block_size);
+             for (int head = 0; head < p.num_kv_heads; ++head) {
+-                const size_t key_offset = (static_cast<size_t>(past_len + token) * p.num_kv_heads + head) *
+-                                          p.k_head_size;
+-                const size_t value_offset = (static_cast<size_t>(past_len + token) * p.num_kv_heads + head) *
+-                                            p.v_head_size;
+-                std::fill_n(pam.key_data[sequence].begin() + key_offset, p.k_head_size, ov::float16{key_value});
+-                std::fill_n(pam.value_data[sequence].begin() + value_offset, p.v_head_size, value);
++                const size_t key_offset = (static_cast<size_t>(token) * p.num_kv_heads + head) * p.k_head_size;
++                const size_t value_offset = (static_cast<size_t>(token) * p.num_kv_heads + head) * p.v_head_size;
++                std::fill_n(pam.key_data[sequence].begin() + key_offset, p.k_head_size,
++                            ov::float16{key_value + 0.02f * static_cast<float>(head)});
++                for (int d = 0; d < p.v_head_size; ++d) {
++                    const int level = (d / v_group + head + token) % 16 - 7;
++                    pam.value_data[sequence][value_offset + d] = ov::float16{static_cast<float>(level)};
++                }
+             }
+         }
+     }
+@@ -55,6 +67,21 @@
+ 
+     this->tolerance = 1e-2f;
+     const auto reference = PagedAttentionReference(pam).get_reference(result.key_cache_mem);
++    if (std::getenv("ARCINT_TEST_ERR_STATS") != nullptr) {
++        // Diagnostic (patch 0033): the error over EVERY element -- compare() below asserts at the
++        // first -- for calibrating a fill against the float reference.
++        auto out_mem = result.outputs.at("output_data").get_memory();
++        cldnn::mem_lock<ov::float16, cldnn::mem_lock_type::read> ptr(out_mem, tests::get_test_stream());
++        double max_err = 0.0; size_t bad = 0, nans = 0; const size_t n = out_mem->count();
++        for (size_t j = 0; j < n; ++j) {
++            const float v = static_cast<float>(ptr[j]);
++            if (std::isnan(v)) { ++nans; continue; }
++            const double e = std::fabs(v - static_cast<float>(std::get<0>(reference)[j]));
++            if (e > max_err) max_err = e;
++            if (e > this->tolerance) ++bad;
++        }
++        std::cout << "ERR-STATS elements=" << n << " max=" << max_err << " over_tol=" << bad << " nan=" << nans << std::endl;
++    }
+     compare(result.outputs.at("output_data").get_memory(), nullptr, nullptr, reference);
+ }
+ 
+@@ -81,6 +108,21 @@
+     return p;
+ }
+ 
++// arcint (patch 0033): the served agent's geometry (24 heads, 4 KV heads, head 256) and the page
++// orders a served pool produces. Before the patch the verify pass read the four-bit value rows
++// through the f16 row's alignment: errors of 2.0-2.3 on 98-99 % of the elements here, and
++// the three-token case hung the test binary (DESIGN 7.0.2bu).
++static paged_attention_test_params u8i4_mixed_micro_served(std::vector<SubsequenceDescriptor> subsequences,
++                                                           const char* page_order = "") {
++    paged_attention_test_params p = u8i4_mixed_micro_params(subsequences);
++    p.num_heads = 24;
++    p.num_kv_heads = 4;
++    p.k_head_size = 256;
++    p.v_head_size = 256;
++    p.page_order = page_order;
++    return p;
++}
++
+ class paged_attention_u8i4_mixed_micro_test : public PagedAttentionTest<paged_attention_test_params> {};
+ 
+ TEST_P(paged_attention_u8i4_mixed_micro_test, mixed_stage_serves_u8_key_i4_value_on_micro_sdpa) {
+@@ -91,24 +133,36 @@
+     ASSERT_TRUE(this->pam.has_value());
+     auto& pam = *this->pam;
+ 
++    // arcint (patch 0033): the fill before this one could not see a misread page -- every past
++    // token carried the same key and a zero value, the new tokens' keys depended on token % 16
++    // only, and a query of 8 made the softmax one-hot on the page's last token. Now every token
++    // of the past and the present has its own key (block, head and token distinct, on the
++    // 16-level grid u8 by-channel stores within 4e-4), values on the 16 integer levels four-bit
++    // by-token stores exactly -- all sixteen present in every (token, head) row, so the row's
++    // range is 15 and its scale 1; a first version put eight per row and measured its own
++    // quantisation as a 0.11 "floor" (DESIGN 7.0.2bu) -- distinct per token, head and 16-dim
++    // group, and a query of 1/64 keeps every token's weight within a factor of five of the
++    // others. Calibrated: f16 KV and u8 KV exact to the tolerance, the served pairing before the
++    // fix 2.0-2.3 on 98-99 % of the elements (value range 15).
+     for (size_t sequence = 0; sequence < pam.subsequence_descs.size(); ++sequence) {
+-        std::fill(pam.query_data[sequence].begin(), pam.query_data[sequence].end(), ov::float16{8.0f});
+-        std::fill(pam.key_data[sequence].begin(), pam.key_data[sequence].end(), ov::float16{-1.0f});
+-        std::fill(pam.value_data[sequence].begin(), pam.value_data[sequence].end(), ov::float16{0.0f});
++        std::fill(pam.query_data[sequence].begin(), pam.query_data[sequence].end(), ov::float16{0.015625f});
+ 
+         const int past_len = pam.subsequence_descs[sequence].past_len;
+         const int num_tokens = pam.subsequence_descs[sequence].num_tokens;
+-        for (int token = 0; token < num_tokens; ++token) {
++        const int v_group = std::max(1, p.v_head_size / 16);
++        for (int token = 0; token < past_len + num_tokens; ++token) {
+             const float key_value = -0.2f + 0.4f * static_cast<float>(token % p.block_size) /
+-                                                     static_cast<float>(p.block_size - 1);
+-            const ov::float16 value = token % 2 == 0 ? ov::float16{-1.0f} : ov::float16{1.0f};
++                                                     static_cast<float>(p.block_size - 1) +
++                                    0.01f * static_cast<float>(token / p.block_size);
+             for (int head = 0; head < p.num_kv_heads; ++head) {
+-                const size_t key_offset = (static_cast<size_t>(past_len + token) * p.num_kv_heads + head) *
+-                                          p.k_head_size;
+-                const size_t value_offset = (static_cast<size_t>(past_len + token) * p.num_kv_heads + head) *
+-                                            p.v_head_size;
+-                std::fill_n(pam.key_data[sequence].begin() + key_offset, p.k_head_size, ov::float16{key_value});
+-                std::fill_n(pam.value_data[sequence].begin() + value_offset, p.v_head_size, value);
++                const size_t key_offset = (static_cast<size_t>(token) * p.num_kv_heads + head) * p.k_head_size;
++                const size_t value_offset = (static_cast<size_t>(token) * p.num_kv_heads + head) * p.v_head_size;
++                std::fill_n(pam.key_data[sequence].begin() + key_offset, p.k_head_size,
++                            ov::float16{key_value + 0.02f * static_cast<float>(head)});
++                for (int d = 0; d < p.v_head_size; ++d) {
++                    const int level = (d / v_group + head + token) % 16 - 7;
++                    pam.value_data[sequence][value_offset + d] = ov::float16{static_cast<float>(level)};
++                }
+             }
+         }
+     }
+@@ -142,6 +196,21 @@
+         }
+         std::cout << "NAN-MAP rows=" << rows << " per-row=" << row << " [" << map << "]" << std::endl;
+     }
++    if (std::getenv("ARCINT_TEST_ERR_STATS") != nullptr) {
++        // Diagnostic (patch 0033): the error over EVERY element -- compare() below asserts at the
++        // first -- for calibrating a fill against the float reference.
++        auto out_mem = result.outputs.at("output_data").get_memory();
++        cldnn::mem_lock<ov::float16, cldnn::mem_lock_type::read> ptr(out_mem, tests::get_test_stream());
++        double max_err = 0.0; size_t bad = 0, nans = 0; const size_t n = out_mem->count();
++        for (size_t j = 0; j < n; ++j) {
++            const float v = static_cast<float>(ptr[j]);
++            if (std::isnan(v)) { ++nans; continue; }
++            const double e = std::fabs(v - static_cast<float>(std::get<0>(reference)[j]));
++            if (e > max_err) max_err = e;
++            if (e > this->tolerance) ++bad;
++        }
++        std::cout << "ERR-STATS elements=" << n << " max=" << max_err << " over_tol=" << bad << " nan=" << nans << std::endl;
++    }
+     compare(result.outputs.at("output_data").get_memory(), nullptr, nullptr, reference);
+ }
+ 
+@@ -150,7 +219,22 @@
+     paged_attention_u8i4_mixed_micro_test,
+     ::testing::Values(u8i4_mixed_micro_params({{25, 34}}),
+                       u8i4_mixed_micro_params({{25, 128}}),
+-                      u8i4_mixed_micro_params({{300, 64}})));
++                      u8i4_mixed_micro_params({{300, 64}}),
++                      // arcint 2026-09-08: the served verify shapes (MTP: one drafted token plus
++                      // the real one over the prompt's past) -- the served u8:i4 + MTP config gives
++                      // request-varying texts on the micro mixed stage and the reference text on
++                      // the opt kernel; these shapes were not in the test.
++                      u8i4_mixed_micro_params({{2, 130}}),
++                      u8i4_mixed_micro_params({{2, 512}}),
++                      u8i4_mixed_micro_params({{2, 856}}),
++                      u8i4_mixed_micro_params({{3, 1000}}),
++                      u8i4_mixed_micro_served({{2, 130}}),
++                      u8i4_mixed_micro_served({{2, 130}}, "reverse"),
++                      u8i4_mixed_micro_served({{2, 130}}, "gap"),
++                      u8i4_mixed_micro_served({{2, 145}}, "reverse"),
++                      u8i4_mixed_micro_served({{2, 145}}, "gap"),
++                      u8i4_mixed_micro_served({{3, 1000}}),
++                      u8i4_mixed_micro_served({{3, 1000}}, "reverse")));
+ #endif
+ 
+ class paged_attention_u4_swa_tail_test : public PagedAttentionTest<paged_attention_test_params> {};

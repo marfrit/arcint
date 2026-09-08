@@ -17,6 +17,40 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## Unreleased — the alternation: patch 0033 (2026-09-08)
+
+Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033);
+DESIGN §7.0.2bu.
+
+- **The agent configuration's alternating greedy text is a plugin defect,
+  fixed** (patch 0033, DESIGN §7.0.2bu): with u8 keys and i4 values the
+  micro-SDPA generator gave the V*S micro-gemm the f16 row's alignment (128
+  bytes) for the 132-byte packed value row, so what the verify pass read
+  depended on the physical pages a request happened to get. Patch 0020 had
+  keyed the operand's type on the value precision and left the alignment on
+  the key's. The first request of a process was already wrong; the parity of
+  a stack-shaped page pool made it visible. Served on the 24 GB card, MTP on
+  now gives the MTP-off text six times out of six at 130 tokens and one text
+  twice at 8,005; prefill and decode rates unchanged.
+- **The plugin test that should have caught it could not**: its harness built
+  ascending contiguous block tables and addressed pages as start + j, and its
+  fill made every page look alike. The patch makes the harness go through the
+  table with a selectable page order, gives the mixed-micro tests a fill that
+  distinguishes token, head and page, and adds the served geometry (24 heads,
+  4 KV heads, head 256). Red on the pinned nightly plus 0003–0032 (errors of
+  2.0–2.3 on a value range of 15; the served shape with three new tokens
+  hangs), exact with the line.
+- **Equivalence suite**: a new gate, MTP at u8:i4 with three requests in one
+  process byte-identical. The suite's MTP gates ran at the default KV precision
+  and could not see this class.
+- **Also fixed in the harness**: it packed past tokens' four-bit values as
+  (dim, dim + 16) pairs where production uses adjacent pairs, invisible while
+  every dim of a token carried the same value.
+- **Retracted on the record** (DESIGN §7.0.2bu): a residual of 0.11 read
+  during the search as "the four-bit value path's own floor" was the first
+  fill's own quantisation (eight levels per row); with sixteen levels per row
+  it is gone.
+
 ## Unreleased — the kernel review's first pass (2026-09-08)
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p12` as before (an

@@ -8674,6 +8674,119 @@ not noise. The suite's own two-run gate passes with its settings; open,
 the bracket (MTP off, the prefix cache on, u8 KV) is the next section's
 subject.
 
+#### 7.0.2bu The alternation: with four-bit values the verify pass read the value rows through the f16 row's alignment; patch 0033 (2026-09-08)
+
+The finding §7.0.2bt left open, run to ground (the bracket it named -- MTP
+off, the prefix cache on, u8 KV -- is measured below: each of the three
+sides holds one text). The agent unit's own
+configuration (the IR of the dense Qwen3.8-27B, u8 keys with i4 values, MTP
+on) gave two greedy texts for one 130-token prompt, alternating by request
+parity within a process, and neither was the text of MTP off or of symmetric
+u8 -- so the first request was already wrong, and only the alternation made
+it visible. Every measurement below is on the 24 GB card, one fresh process
+per cell, sixteen output tokens, the text named by the first eight hex digits
+of its SHA-256.
+
+**Where it was not.** Each ruled out by a measurement, not by reading: the KV
+pool's contents (zeroed per request: alternates), memory reuse, the prefix
+cache (off and on: alternates, the warm requests hit the cache and still
+alternate), the recurrent-state rows, the drafter's reset, oneDNN's
+determinism attribute on the int8 gemm, the plugin's intermediates. The
+plugin's tensor dumps of two consecutive requests differed in one input: the
+block table. Request 1 held pages 0..8 ascending, request 2 pages 10..2
+descending. The page pool is a stack -- release pushes a sequence's pages in
+order, allocate pops from the back -- so odd requests get an ascending run and
+even ones a descending run. Three pool experiments (development knobs, not
+shipped) closed it: pages as the pool hands them, alternates; fresh pages
+sorted ascending, the odd text moves to requests 3 and 5, exactly the requests
+whose logical blocks 0 and 1 land on pages 0 and 2; the lowest free pages
+first, so every request gets the first request's page set, six identical
+texts. Page identity is the whole carrier.
+
+**Where it was.** Every kernel that takes the block table (ten) indexes it;
+the micro K tile is 16 keys in every paged configuration, the host splits
+appended tokens at the page remainder, a paged tile is cut at past_len, and
+the single-query micro SDPA passed a NaN-tail test (5/5). The plugin's u8:i4
+mixed-micro test, given the served shape (two new tokens over 130) during the
+search, was green with its fill of the time. The defect is one line in the
+micro-SDPA generator: the V*S
+micro-gemm's A operand gets its alignment from the packed row (head/2 + 4
+bytes) only when the *key* precision is four-bit; under u8 keys with i4
+values it kept the f16 row's, 128 for a 132-byte row (the helper returns the
+lowest set bit of the row length, capped at 128; 68-byte rows at head 128 get
+the same 128).
+Patch 0020 keyed the operand's type on the value precision and left the
+alignment on the key's. A gemm strategy told its rows are 128-byte aligned
+addresses them accordingly, and what it reads then depends on the page's
+address -- hence page identity, hence parity.
+
+**Measured, served** (`/usr/bin/arcint` 0.4.3, the agent configuration, chunk
+512, no prefix cache):
+
+| plugin | 130 tokens, six requests | 8,005 tokens, twice | prefill 8k | decode at 8k |
+|---|---|---|---|---|
+| +p14 stage m53 | 410be5ff 009c9d5e 410be5ff 834cb18e 410be5ff 834cb18e | d2845b6c, d2845b6c (stops at 7 tokens) | 869, 874 t/s | 21.6 t/s |
+| m53 + the line (m54) | 825b1747 x6 = the MTP-off text | e8010a09, e8010a09 | 865, 870 t/s | 20.2, 22.9 t/s (64 tokens) |
+
+The line changes no rate (prefill within 1 %; the decode samples are too short
+to separate) and makes MTP on byte-equal to MTP off on this prompt. The
+equivalence suite on the fixed plugin passes every gate, including a new
+one: MTP at u8:i4, the same text on three requests of one process.
+
+**Why the plugin test was green.** Two blindnesses, both in the test harness
+and both now part of the patch. The harness always built an ascending
+contiguous block table and addressed cache pages as `start + j` in ten
+places, the one shape a served pool never guarantees; it now goes through the
+table, and a page order can be requested (reversed, or a gap after page 0 --
+the served third request's shape). And the mixed-micro tests' fill made every
+page look alike: every past token carried the same key and a zero value, the
+new tokens' keys depended on the token's position within its page only, and
+a query of 8 made the softmax one-hot on each page's last token, so a misread
+page returned identical bytes. The fill now gives every token, head and page
+its own key (on the sixteen-level grid u8 by-channel stores within 4e-4) and
+value (on the sixteen integer levels i4 by-token stores exactly -- all
+sixteen present in every token-and-head row, so the row's scale is 1 --
+distinct per token, head and 16-dim group), with a query of 1/64 so every
+token's weight is within a factor of five of the others.
+
+With that fill, full statistics over every element against the float
+reference: before the line the u8:i4 cases err by 2.0-2.3 on 98-99 % of
+their elements (the value range is 15) and the served geometry with three
+new tokens over 1,000 hangs the test binary (aborts under a reversed or
+gapped table); with the line, exact: at most 0.001 on every case (head 128 and 256,
+u8:i4 and symmetric u4, the three page orders), none over 1e-2. The same fill through f16 KV and
+through symmetric u8 is exact to the tolerance, so the reference and the
+fill are sound. The tests' tolerance stays at 1e-2.
+
+**Retracted on the record (§7.0.1).** A first version of that fill put eight
+consecutive levels in each token-and-head row instead of sixteen, and the
+search read what followed as a kernel property: a residual of 0.11 with
+the line, "the four-bit value path's own floor", located by an element map
+in the middle half of the head dims and announced as a defect for its own
+patch. The review's arithmetic showed it to be the fill's own quantisation:
+a row of eight levels has range 7, a quantisation step of 7/15 instead of
+1, so its dequantised levels miss the integers by 0, 0.067, 0.133, 0.2, 0.2, 0.133, 0.067, 0 across the
+eight groups -- zero at the outer quarters, largest in the middle half --
+and weighted by the nine rows in sixteen that do not wrap past level 15
+this gives 0.075 and 0.1125 on the map's groups against 0.073 and 0.110
+measured, and 0.0068 for u8 by token against 0.0068 measured. Sixteen levels
+per row make the same rows exact, and the "floor" is gone (the line above).
+No kernel defect stands behind that number; the earlier readings that it
+was "not token mixing" and "unchanged by the line" were correct and are
+explained by the same arithmetic.
+
+**On the way, fixed.** The harness packed the past tokens' four-bit values
+as (dim, dim + 16) pairs where the production writer and reader use adjacent
+pairs; with 16-dim value groups the reader saw the other group's value on
+half the dims. Production agrees with itself (the served text equals the
+symmetric u8 text); the harness is corrected in the patch.
+
+The ledger records every mechanism narrated during the search in order with
+its measurement; the one that reached a document is retracted above. The
+11:20 localisation to "the micro-SDPA MIXED stage with 4-bit values" was
+right as far as it went; the alignment line was recorded as a hypothesis
+before its measurement, as §7.0.1 requires.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

@@ -646,6 +646,55 @@ there at 09:15, both units restarted onto it and serving; the served
 figures above were taken with patch 0032 staged into the +p13 runtime
 before the package existed).
 
+### 0033-sdpa-micro-value-alignment.patch
+
+The micro-SDPA generator gives the V*S micro-gemm the packed row's
+alignment whenever the *value* precision is four-bit. Under u8 keys with
+i4 values -- the served pairing -- it used the f16 row's, 128 bytes for a
+132-byte row (68 at head 128; `alignment_for_ld` returns the lowest set
+bit of `head * 2`, capped at 128): patch 0020 keyed the operand's type on the value
+precision and left the alignment on the key's. A gemm strategy told its
+rows are 128-byte aligned addresses them accordingly, and what it read
+depended on the physical pages a request happened to get: the agent
+configuration's greedy text alternated by request parity (the page pool
+is a stack -- odd requests get an ascending run of pages, even ones a
+descending run) and was wrong from the first request, MTP on differing
+from MTP off (DESIGN §7.0.2bu). One condition fixes it.
+
+The plugin test of that exact shape was green for two reasons, both
+corrected here: the harness built only ascending contiguous block tables
+and addressed cache pages as `start + j` in ten places (now through the
+table, with `page_order` per test: reversed, or a gap after page 0 -- the
+served pool's third request), and its fill made every page look alike
+(all past keys −1, past values 0, a query of 8: a one-hot softmax on each
+page's last token). The fill now gives every token, head and page its own
+key (within 4e-4 of the u8 by-channel grid) and value (all sixteen four-bit
+levels in every token-and-head row, stored exactly), with a query of 1/64; the served geometry (24 heads, 4 KV heads, head 256) is in the
+cases under the three page orders. The harness also packed past tokens'
+four-bit values as (dim, dim + 16) pairs where the production writer and
+the readers use adjacent pairs -- invisible while every dim of a token
+carried the same value; corrected.
+
+Measured 2026-09-08 on the 24 GB card. Plugin test, full statistics over
+every element against the float reference: before the line the u8:i4
+cases err by 2.0–2.3 on 98–99 % of elements (value range 15) and the
+served three-token case hangs the test binary; with it exact: at most 0.001 on every case, none over 1e-2. The same
+fill through f16 KV and through u8 KV is exact to the tolerance. The tests'
+tolerance stays at 1e-2. Retracted on the record (DESIGN §7.0.2bu): a first
+fill with eight levels per row measured its own quantisation as a 0.11
+"floor" of the four-bit value path; the review's arithmetic reproduced the
+element map from the fill, and sixteen levels per row removed it.
+Served (arcint 0.4.3, the IR agent model, u8:i4, MTP on, one process): 130
+tokens six times, 825b1747 ×6 = the MTP-off text (before: two texts
+alternating, neither the MTP-off one); 8,005 tokens twice, one text;
+prefill 865/870 t/s against 869/874, decode at 8k within the noise. The
+equivalence suite on the fixed plugin passes every gate including the new
+one (MTP at u8:i4, three requests of one process byte-identical); on the
+unfixed plugin that gate fails and the rest pass. The whole paged-attention
+suite passes under the default and a reversed table, the SDPA suite too.
+
+Package: `+p15`.
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.
