@@ -17,6 +17,26 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## Unreleased — 0.4.4 measured, nothing shipped (2026-09-08)
+
+The Q5_K decode row (DESIGN §7.0.2bq). Two row rewrites, both
+bit-identical to the shipped row (the dword form checked on both cards),
+and a dispatch sweep on the 24 GB card; none faster: the fifth bit and
+the nibbles extracted on dwords (80 → 31 integer operations per row per
+super-block, Q4_K's 16 → 6: Q5_K 69.1 → 71.3 µs, the gate 193.2 →
+193.0), the dispatch (4 rows × 4 subgroups is the optimum of the 3 × 3
+matrix), the header and high-bit reads through one block read (69.3 /
+69.1 / 69.1 for the three forms, 69.2 / 69.2 / 72.5 repeated). The row is bound by
+neither its integer work nor its dispatch nor its message count; the
+served launch stays 0.129 ms (279 GB/s on 10,240 × 5,120). No patch
+0031; `+p12` stays the floor. The timing test's one-row figures moved
+at 0029's instrument change (Q4_K gate 141 → 217 µs, Q5_K 60 → 85)
+while the served launches did not, and drift between days by a tenth on
+the gate and a fifth on Q5_K:
+the served per-launch figure is the decode gate, the test compares
+forms on one instrument. Next lever on record: a Q5_K layout in the
+card's read shape, as 0026 did for Q6_K.
+
 ## 0.4.3 — 2026-09-08
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p12` (patches

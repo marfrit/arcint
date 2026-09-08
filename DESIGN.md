@@ -8198,6 +8198,137 @@ be five" -- 44 dwords in 8-dword messages is six, and Q4_K's 36 in five
 and Q6_K's 53 in seven are the floor too; the item never reached this
 record as a claim and is closed here so that it cannot.
 
+#### 7.0.2bq 0.4.4, the Q5_K decode row: bit-identical with three fifths of its integer work gone and not one microsecond faster; the dispatch swept; the timing test's own step change read from the served traces (2026-09-08)
+
+The handoff's third point release was the Q5_K decode rate: the
+decode variant (M = 1, the vector unit, lanes along K, §7.0.2bc)
+streamed Q4_K at 355 GB/s and the 224-byte Q6_K at 379, Q5_K at 316
+(60 µs on the 5,120² shape of the timing test -- the test's figures of
+§7.0.2bc–bj, before the instrument change below), and the three levers
+were the header and high-bit reads merged, the fifth bit extracted per
+sub-block instead of per value, and the dispatch. Three things had to
+be settled before any of them, and the first was the number itself.
+
+**The instrument, again.** The timing test's one-row figures moved
+between two builds of 2026-09-07 -- the Q4_K gate 141 → 217 µs, Q5_K
+60 → 85, the 224-byte Q6_K unchanged at 203 -- at the build that put
+the test's operands in device memory (§7.0.2bn) and shipped 0029. The
+served device timeline says the kernel did not: the decode-variant
+launches of the mixed form are the same in the 0028, 0029 and 0030
+traces to the microsecond (the Q6_K down projection 0.240 ms, the
+small Q6_K 0.069, Q5_K 0.129, every one compiled at 128
+registers by its name), and a build with the tiled kernel's
+256-register mode forced off for the whole primitive leaves the
+test's rows where they are: shipped / forced to 128 / shipped again,
+the gate 216.0 / 215.6 / 218.8 µs, Q5_K 88.1 / 84.5 / 81.9, the 224-byte
+Q6_K 203.5 / 201.2 / 203.5 -- Q5_K's own 7 % spread across the three is
+the argument. So the test's one-row figures since 0029 are the
+instrument's own state -- its weights' placement, or the valid scales
+its rows gained, a reading -- and they drift between days by a tenth
+on the gate and a fifth on Q5_K (193 / 69 on 2026-09-08); the served
+launch is the gate and the test compares forms on one instrument.
+Read from the served trace, the Q5_K tensor of the mixed form is
+10,240 × 5,120 (36 MB of rows), about 32 launches a step by the
+per-hash table of the traced request (an earlier table of §7.0.2bg
+counted 23 in a shorter window) at 0.129 ms: 279 GB/s, 4.1 ms of the
+54.8 ms step. At the
+224-byte Q6_K's 325 GB/s that is 0.6 ms back; at the 453 GB/s
+random-read ceiling, 1.6. The bar (51.8) is 3.0 away: this row
+cannot reach it alone, and this section does not claim it can.
+
+**The row, read from the code.** Q5_K's decode row is Q4_K's
+function with the fifth bit on: a uniform 16-byte header load per
+lane, one `uc8` block read for the 128 nibble bytes (lane l takes
+bytes 48 + 16i + l), one `uc2` for the 32 high-bit bytes (bytes 16 + l
+and 32 + l), then per value a shift, an and, a shift and an or to
+place the fifth bit, and the same sixteen fmas Q4_K runs. The
+handoff's first lever, merging the header and the high-bit reads, was
+rejected by derivation before any build: the header must be resident
+in every lane (the scale decode indexes all three scale dwords), so
+any block read of it costs broadcasts and shuffles to save one
+message that moves no bytes the `uc2` does not already pull; and 176
+bytes over 16 lanes is 11 per lane, for which no block read exists.
+The second lever was built: with the lane's eight nibble bytes as two
+dwords and its two high-bit bytes as one 16-bit word, two masked
+shift-or pairs per dword place all four fifth bits (the mapping
+proved from the old code and checked by a 10,000-draw model before
+the edit), the integer operations per row per super-block 80 → 31,
+Q4_K's 16 → 6, and not one floating-point operation or its order
+touched. It is bit-identical: a build with the two masks swapped
+fails exactly the type-13 cases (the red case), the 22 cases pass on
+both cards, and the test's row dump for the old row and the new one on
+the same inputs (one row, K = 5,120, N = 256, f32; two processes, the
+old row kept under a jit constant) compares byte for byte, types 12
+and 13, both cards.
+
+And it is not faster. The timing test, one row, the old row against
+the new in the same binary, warm, both cards:
+
+| M = 1, µs | the 24 GB card, old / new | the 16 GiB card, old / new |
+|---|---|---|
+| gate Q4_K 17,408 × 5,120 | 193.2 / 193.0 | 142.3 / 141.8 |
+| Q5_K 5,120² | 69.1 / 71.3 | 68.4 / 68.1 |
+| Q6_K-224 down 5,120 × 17,408 (the row is not this one) | 204.1 / 203.1 | 240.9 / 242.7 |
+
+Sixty per cent of the row's integer instructions gone and the launch
+where it was: the decode row is not issue-bound, on either
+architecture, for either type. The dispatch sweep on the 24 GB card
+(type 13, rows per work-group × subgroups, the same shape):
+
+| rows × subgroups | 2 | 4 | 8 |
+|---|---|---|---|
+| 4 | 100.5 | **69.2** | 85.7 |
+| 8 | 107.2 | 71.3 | 88.3 |
+| 16 | 81.9 | 71.5 | 88.7 |
+
+The shipped 4 × 4 is the optimum, against the design's pre-registered
+expectation of 8 rows slightly ahead; read from the matrix, not
+counted: more rows per subgroup amortise a few per cent of shared
+work and lose it to the tail, more subgroups lose to the reduction.
+With the integer work measured free, the derivation that rejected
+the first lever no longer held on its cost side, so it was built too,
+in two forms behind a knob: the header by one dword block read and
+four broadcasts instead of the uniform 16-byte load (one message
+fewer if the uniform load was sixteen), and the two high-bit bytes
+taken from that same read by two shuffles instead of their own
+message. Both bit-identical to the old row (the same dump comparison,
+both types); both at the old row's time on the 24 GB card: Q5_K 69.3 /
+69.1 / 69.1 µs for the three forms and 69.2 / 69.2 / 72.5 on the
+repeat, the gate 193 / 193 / 194 and 193 / 192 / 192 -- the scatter
+that makes a null a null. Messages do not bind it either.
+
+**Served.** The exact mixed form on the 24 GB card, the decode
+per-hash table of the traced request: Q5_K 0.129 ms on the new row
+as on the old, the Q6_K launches within the trace's scatter (0.239 and
+0.065 against 0.240 and 0.069), the greedy output 23e06c37e0d6 at 1k
+in every cell; the split form's step 53.4 ms (53.5, §7.0.2bo).
+
+**What this closes.** Three levers, three measured nulls, one instrument correction, and
+no patch: the fifth-bit rewrite is bit-identical and changes nothing
+a user can see, so it is recorded here and not carried (the campaign's
+rule); the dev tree is back at 0030 and `+p12` stays the runtime
+floor. The Q5_K decode row runs at 279 GB/s on the served shape
+against the 224-byte Q6_K's 325 and the card's 453, and what binds it
+is none of the three things the handoff named -- the reading that is
+left, from §7.0.2bh's Q6_K work on the same card, is the read shape:
+the 176-byte block delivers its bytes to the lanes in three shapes
+(a uniform 16, a 2 per lane, an 8 per lane) where the 224-byte Q6_K
+layout of 0026 delivers dwords -- the reads without shuffles (0025)
+were worth 400 → 259 µs on that row and the layout (0026) the rest of
+the way to its probe's prediction. A Q5_K layout in the shape the card's read probe of
+§7.0.2bh names (a "type 113" beside 114, the same load-time
+re-blocking) is the next lever, and it is a layout change with its
+own bytes to price, not a window. Recorded as the handoff's open item
+for the decode side; 0.4.4 ends without a rate, with the decode rows
+of both cards measured bit-exact against their old forms, and with
+the timing test's step change of 2026-09-07 attributed to the
+instrument, not the kernel.
+
+Retracted here (§7.0.1): the handoff's Q5_K decode figure, 316 GB/s
+at 60 µs -- the timing test before 0029's instrument change; the
+served launch, 0.129 ms and 279 GB/s on the served shape, is the
+figure, and it has not moved since 0028.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,
