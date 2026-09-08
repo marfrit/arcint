@@ -1,3 +1,21 @@
+marfrit-openvino (2026.4.0~dev20260821+p14-1) bookworm trixie; urgency=medium
+
+  * One more patch applied on top of +p13, same upstream commit (71640275),
+    same smallest-sufficient-divergence numbering:
+    - patches/0032: the micro-SDPA prefill's next-K-tile prefetch walked
+      256 rows from inside row 0 of K whatever the tile (its geometry in
+      oneDNN's transposed-K order; the plugin's K is [tokens x d]), so a
+      prefill chunk of 129-255 keys read 256 - N rows past the buffer; a
+      prompt of 190-214 tokens killed a served process with an engine
+      memory CAT error whenever the pages behind the buffer were unmapped.
+      Upstream's fix of the same day (PR #37878), plus a regression test
+      that is red on the pinned nightly. Served after: the faulting
+      lengths serve, one text; the paged-attention and SDPA suites
+      264/264. Rates unchanged (856 tokens warm 1,008-1,009 t/s against
+      1,010; the decode step 54.5-54.7 ms against 54.7; the same text).
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Tue, 08 Sep 2026 09:10:00 +0200
+
 marfrit-openvino (2026.4.0~dev20260821+p13-1) bookworm trixie; urgency=medium
 
   * One more patch applied on top of +p12, same upstream commit (71640275),

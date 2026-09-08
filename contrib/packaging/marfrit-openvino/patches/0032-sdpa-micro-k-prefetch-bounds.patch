@@ -1,0 +1,176 @@
+# The micro-SDPA prefill's K-tile prefetches address K as [tokens x d]: the next-tile prefetch
+# walked 256 rows from inside row 0 whatever the tile: past the buffer's end on every prefill
+# chunk of 129-255 keys (upstream's fix, PR #37878)
+
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0003-0031. arcint 0.4.4 series (DESIGN.md section 7.0.2bs).
+#
+# What changes:
+#   sdpa_micro.cl        The two cooperative K-tile prefetches (first tile, next tile) in
+#                       upstream master's form (openvinotoolkit/openvino PR #37878, merged
+#                       2026-09-08, after the pin): the key-row stride is ldk unless TRANSPOSE_K
+#                       (the pinned nightly advanced by one ELEMENT), r is the row length d and
+#                       c the remaining key count for both calls (the next-tile call had them
+#                       swapped: the remaining keys as the row length, d = 256 as the row count),
+#                       rmax/cmax their caps (PREFETCH_D_MAX, wg_tile_m). Before: the next-tile
+#                       prefetch's pointer was K + (k0 + wg_tile_m) ELEMENTS -- inside row 0 --
+#                       and from there it walked 256 rows of up to 256 B whatever the tile;
+#                       cooperative_prefetch_2d_rem's clamp (max_off from the same swapped
+#                       geometry) did not bound it. A prefill chunk of N keys with a next tile,
+#                       129 to 255 keys, read 256 - N rows past the end of K; 256 keys and beyond
+#                       are in bounds. Whether the pages after the K buffer were mapped decided
+#                       between a served prompt and an engine memory CAT error with a
+#                       compute-engine reset.
+#   paged_attention_gpu_test.cpp
+#                       arcint_short_prompt_prefill: the paged-attention primitive alone, one
+#                       subsequence of N new tokens on exact-size buffers, the served geometry
+#                       (24 heads, 4 KV heads, head 256, block 16, u8 KV, BY_CHANNEL), N = 193
+#                       196 202 205 208 211 214 217 (unpadded), 205 padded, 256, 856. RED on the
+#                       pinned nightly: 193-217 fault (CL_OUT_OF_RESOURCES) or hang, 256 and 856
+#                       pass (in bounds). Upstream's own test (sdpa_gpu_test.cpp) is coverage
+#                       only -- its header says the pre-fix order passes it too -- so the
+#                       reproducer here is the regression test.
+#
+# MEASURED 2026-09-08 on the 24 GB card:
+#   Served (arcint 0.4.3, the exact mixed form of the dense Qwen3.8-27B Q4_K_M, u8 KV, --mtp
+#     off, n-ctx 8192, prefix cache off, one fresh process per cell, the default prefill chunk):
+#     before, prompts of 190, 202, 205 (x6 processes), 208, 211, 214 tokens killed the process on
+#     the first request (HTTP 500, CL_OUT_OF_RESOURCES on a buffer map, "Engine memory CAT error
+#     class=ccs" + engine reset in the host's kernel log; 190 in the one process that tried it),
+#     130, 145, 154, 163, 175, 181, 193, 196 and 217-259 served, 205 at
+#     --prefill-chunk 256 served once and faulted on the second request; --prefill-chunk 128
+#     (one query tile per chunk, no next tile to prefetch) never faulted. The intercept layer
+#     pinned the failing enqueue (CLI_FinishAfterEnqueue) to sdpa_micro__prefill, GWS 32x768,
+#     and its argument dump showed every buffer covering the kernel's extent and the subsequence
+#     table and tile mapping correct -- the kernel faulted on correct inputs. Knob bisect on the
+#     reproducer: host prefetches off -> 5/5 pass; the micro-gemm's own block-2D prefetches off
+#     -> still fault; block Q loads off -> still fault; the non-micro path -> pass.
+#   After (patch 0032 staged into the +p13 runtime, one process): 190, 205, 211, 205, 190, 211
+#     tokens served, six requests, one text (the same text the non-faulting lengths gave before),
+#     no fault; the plugin's paged-attention and SDPA suites 264/264; the reproducer 11/11.
+#     Rates unchanged: 856 tokens warm 1,008-1,009 t/s against 1,010 on the +p13 runtime, the
+#     decode step 54.5-54.7 ms against 54.7 (3.49-3.50 s per 64 tokens against 3.50), the same
+#     greedy text (283b2c44), four requests each, one fresh process per runtime.
+#   Not touched: the K-scale / K-zero-point prefetches of the 2D-quantised key path (KEY_SCALES ==
+#     QUANTIZE_2D), which keep the pinned order and are bounded by their cmax of one group; no
+#     served configuration takes that path (u8 keys are BY_CHANNEL, a common scale).
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa_micro.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa_micro.cl
+@@ -508,17 +508,14 @@
+ 
+ #if PREFETCH_K0
+     /* Prefetch first K tile. */
+-#if TRANSPOSE_K
+-    const uint stride_k0 = ldk;
+-#else
+-    const uint stride_k0 = 1;
+-#endif
++    // arcint (patches/0032, upstream's form): K is [tokens x d] unless TRANSPOSE_K, so a key row
++    // is ldk elements apart; r is the row length d, c the key count, rmax/cmax their caps.
+     cooperative_prefetch_2d_k(
+-            /* ptr */ K + window_k_begin * stride_k0,
++            /* ptr */ K + (size_t)window_k_begin * (TRANSPOSE_K ? 1 : ldk),
+             /* r */ d,
+             /* c */ causal_k - window_k_begin,
+-            /* rmax */ ugemm_kq_wg_tile_m,
+-            /* cmax */ PREFETCH_D_MAX,
++            /* rmax */ PREFETCH_D_MAX,
++            /* cmax */ ugemm_kq_wg_tile_m,
+             /* ld */ ldk,
+             /* sg_id */ sg_ij,
+             /* n_sg */ sg_per_wg,
+@@ -1000,18 +997,19 @@
+ #if PREFETCH_K
+         /* Prefetch next K tile. */
+         if (!last) {
+-#if TRANSPOSE_K
+-            const uint stride_k = ldk;
+-#else
+-            const uint stride_k = 1;
+-#endif
+-
++            // arcint (patches/0032, upstream's form). The pinned nightly's call took the remaining
++            // keys as the row length and d = 256 as the row count, at a stride of one element:
++            // 256 rows x 256 B prefetched from K + k0 + wg_tile_m elements regardless of causal_k,
++            // past the end of K on the second-to-last chunk of every prefill; whether the pages
++            // after the buffer were mapped decided between a served prompt and an engine memory
++            // CAT error (190-214-token prompts served, 24 GB card, 2026-09-08; the unit test
++            // arcint_short_prompt_prefill reproduces it on exact-size buffers).
+             cooperative_prefetch_2d_k(
+-                    /* ptr */ K + (k0 + ugemm_kq_wg_tile_m) * stride_k,
+-                    /* r */ causal_k - k0 - ugemm_kq_wg_tile_m,
+-                    /* c */ d,
+-                    /* rmax */ ugemm_kq_wg_tile_m,
+-                    /* cmax */ D_MAX,
++                    /* ptr */ K + (size_t)(k0 + ugemm_kq_wg_tile_m) * (TRANSPOSE_K ? 1 : ldk),
++                    /* r */ d,
++                    /* c */ causal_k - k0 - ugemm_kq_wg_tile_m,
++                    /* rmax */ PREFETCH_D_MAX,
++                    /* cmax */ ugemm_kq_wg_tile_m,
+                     /* ld*/ ldk,
+                     /* sg_id */ sg_ij,
+                     /* n_sg */ sg_per_wg,
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
+@@ -646,6 +646,61 @@
+         ov::element::u8
+     }));
+ 
++// arcint (patches/0032) regression test: the micro-SDPA PREFILL stage's next-K-tile prefetch
++// walked 256 rows from inside row 0 of K whatever the tile (its geometry in oneDNN's K^T
++// order, in a kernel whose K is [tokens x d]), 256 - N rows past a K of N rows for every prefill
++// chunk of 129-255 keys; a served process died of an engine memory CAT error at 190-214 prompt
++// tokens, or not, depending on what was mapped after the buffer. This runs the primitive alone,
++// one subsequence of N new tokens on exact-size test buffers, the served geometry (24 heads,
++// 4 KV heads, head 256, block 16, u8 KV, BY_CHANNEL), unpadded inputs and padded. RED on the
++// pinned nightly (2026-09-08, 24 GB card): 193-217 fault with CL_OUT_OF_RESOURCES or hang,
++// 256 and 856 pass (in bounds); GREEN 11/11 with the two prefetch calls in upstream's form.
++static paged_attention_test_params short_prompt_prefill_params(int tokens, bool dyn_pad) {
++    return paged_attention_test_params{
++        {{tokens, 0}},
++        24, 4, 256, 256, 16, 0,
++        ENABLE_CACHE_COMPRESSION,
++        ov::internal::CacheQuantMode::BY_CHANNEL,
++        dyn_pad, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2,
++        false, 0, {},
++        false, {}, {},
++        ov::element::u8,
++        false, {}, true,
++        std::nullopt, false, std::nullopt, false, false,
++        ov::element::u8
++    };
++}
++
++class paged_attention_short_prompt_prefill_test : public PagedAttentionTest<paged_attention_test_params> {};
++
++TEST_P(paged_attention_short_prompt_prefill_test, matches_cpu_reference) {
++    if (!tests::get_test_engine().get_device_info().supports_immad)
++        GTEST_SKIP() << "Micro SDPA requires DPAS/XMX support";
++    auto p = GetParam();
++    ASSERT_TRUE(this->pam.has_value());
++    auto& pam = *this->pam;
++
++    auto result = run_gpu_inference(pam, p);
++
++    const auto reference = PagedAttentionReference(pam).get_reference(result.key_cache_mem);
++    compare(result.outputs.at("output_data").get_memory(), nullptr, nullptr, reference);
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    arcint_short_prompt_prefill,
++    paged_attention_short_prompt_prefill_test,
++    ::testing::Values(short_prompt_prefill_params(193, STATIC_INPUT_PAD),
++                      short_prompt_prefill_params(196, STATIC_INPUT_PAD),
++                      short_prompt_prefill_params(202, STATIC_INPUT_PAD),
++                      short_prompt_prefill_params(205, STATIC_INPUT_PAD),
++                      short_prompt_prefill_params(208, STATIC_INPUT_PAD),
++                      short_prompt_prefill_params(211, STATIC_INPUT_PAD),
++                      short_prompt_prefill_params(214, STATIC_INPUT_PAD),
++                      short_prompt_prefill_params(217, STATIC_INPUT_PAD),
++                      short_prompt_prefill_params(205, DYNAMIC_INPUT_PAD),
++                      short_prompt_prefill_params(256, STATIC_INPUT_PAD),
++                      short_prompt_prefill_params(856, STATIC_INPUT_PAD)));
++
+ // arcint defect hunt follow-up: the existing decode_serves_u8_key_i4_value case (patches/0010)
+ // only exercises past_len=35 - well under SEQ_LEN_PARTITION_SIZE (256), so it only ever compiles
+ // and dispatches the SINGLE partition / no-leftover-across-partitions arm of the SINGLE_TOKEN

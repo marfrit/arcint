@@ -609,6 +609,43 @@ IR) — both in the patch header, neither fixed.
 
 Package: `+p13` (built 2026-09-08 05:14 local on the dev host, installed there at 05:17, both units on it; the served figures above were taken with patch 0031 staged into the +p12 runtime before the package existed).
 
+### 0032-sdpa-micro-k-prefetch-bounds.patch
+
+The micro-SDPA prefill's two cooperative K-tile prefetches in upstream
+master's form (openvinotoolkit/openvino PR #37878, merged 2026-09-08,
+eighteen days after the pin). The pinned nightly prefetched the *next* K
+tile with its geometry in oneDNN's transposed-K order -- the remaining
+keys as the row length, d = 256 as the row count, at a stride of one
+element -- so its pointer landed inside row 0 of K and it walked 256
+rows of up to 256 B from there whatever the tile, unclamped (the
+helper's clamp comes from the same swapped geometry): a prefill chunk
+of N keys with a next tile, 129 to 255 keys, read 256 − N rows past the
+end of K; 256 keys and beyond are in bounds. Whether the pages behind
+the K buffer were mapped decided between a served prompt and an engine
+memory CAT error with a compute-engine reset -- the "190–215-token
+fault" of 0031's header (190–214 served faults; the reproducer faults
+at 193–217), which was never the gemm. The patch fixes the
+stride (ldk unless TRANSPOSE_K), the row length (d) and the row count
+(the remaining keys) for both calls, and adds a regression test: the
+paged-attention primitive alone, the served geometry (24 heads, 4 KV
+heads, head 256, u8 KV by channel), one subsequence of 193–217 new
+tokens on exact-size buffers -- red on the pinned nightly (faults or
+hangs), 11/11 green with the patch (DESIGN §7.0.2bs). Found with the
+intercept layer (the launch pinned, every argument and its buffer
+dumped, all correct), the disassembled micro-gemm blobs (their loads
+are surface-bounded), and one environment switch per access class in
+the generator (the host prefetches off: 5/5 pass). Served on the 24 GB
+card: 190/205/211 tokens six requests in one process, one text, where
+a fresh process died on its first request before; the plugin's
+paged-attention and SDPA suites 264/264. Rates unchanged: 856 tokens
+warm 1,008–1,009 t/s against 1,010 on +p13, the decode step 54.5–54.7
+ms against 54.7, the same greedy text, four requests each.
+
+Package: `+p14` (built 2026-09-08 09:14 local on the dev host, installed
+there at 09:15, both units restarted onto it and serving; the served
+figures above were taken with patch 0032 staged into the +p13 runtime
+before the package existed).
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.

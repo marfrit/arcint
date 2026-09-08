@@ -17,6 +17,31 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## Unreleased — the short-prompt fault (2026-09-08)
+
+Requires `marfrit-openvino 2026.4.0~dev20260821+p14` (patches 0003–0032)
+for the fix below; DESIGN §7.0.2bs. arcint's own code is unchanged and
+its package floor stays at +p12, as with 0031.
+
+- **Defect found and fixed (plugin patch 0032):** a prompt of 190 to
+  214 tokens killed a mixed-form process (an engine memory CAT error)
+  -- and any paged-attention prefill of 129 to 255 tokens could, on any
+  model, whenever the pages behind its K buffer were unmapped. The
+  plugin's micro-SDPA prefill prefetched the next K tile with its
+  geometry in oneDNN's transposed-K order: from inside row 0 (a
+  one-element stride), 256 rows whatever the tile, so 256 − N rows past
+  a K of N rows. Upstream fixed the same thing the same day
+  (PR #37878); the patch is its two hunks plus a regression test that is
+  red on the pinned nightly (193–217 tokens on exact buffers fault or
+  hang; 256 and 856 pass, in bounds) and green with the fix. Served
+  after: 190, 205 and 211 tokens six requests in one process, one text,
+  no fault; the plugin's paged-attention and SDPA suites 264/264. Rates
+  unchanged (856 tokens warm 1,008–1,009 t/s against 1,010; the decode
+  step 54.5–54.7 ms against 54.7; the same text). The
+  `--prefill-chunk 64` workaround is withdrawn. The record's earlier
+  reading (the runtime's gemm as the faulting element) is retracted in
+  DESIGN §7.0.2bs.
+
 ## Unreleased — the handoff's open items (2026-09-08)
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p13` (patches 0003–0031)

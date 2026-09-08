@@ -8450,6 +8450,11 @@ faulting cell, and that is as far as the record goes without a
 mechanism. Until it is found, a GGUF deployment that sees short
 prompts serves them at `--prefill-chunk 64`, which is deterministic
 and does not fault (its rate cost at 1k is not measured here).
+*(Found the same day, §7.0.2bs: the mechanism is in the plugin's
+micro-SDPA prefill, not in the gemm; the "one element of every
+faulting cell" reading above was the wrong element, and the
+non-monotonic pattern was placement after all -- of the pages behind
+the K buffer.)*
 
 **Patch 0020's declined combination** (4-bit values under BY_TOKEN
 keys: NaN past 128 keys, declined by the selector, §7.0.2as). Read,
@@ -8486,6 +8491,95 @@ Slower on every axis and larger; its case is serving the file's own
 quantisation. Nothing was changed. If the file's weights are wanted
 on a unit: `--gguf-mins split`, `--mtp off`, `--n-ctx` at or under
 120k at `u8`, through the unit manager's rollout, not a hand edit.
+
+#### 7.0.2bs The short-prompt fault: a K-tile prefetch in the micro-SDPA prefill ran 256 rows past the buffer; patch 0032, upstream's fix of the same day (2026-09-08)
+
+The fault §7.0.2br left open -- a prompt of about 190 to 215 tokens
+killing a mixed-form process with an engine memory CAT error -- has a
+measured mechanism, a fix, and a regression test that is red without
+it. It was never the gemm, and never the GGUF path: the plugin's
+paged-attention prefill on the pinned nightly prefetches past the end
+of every prompt's K buffer, and whether the pages behind that buffer
+happen to be mapped decides between a served prompt and a dead
+process. The forms and lengths that "never faulted" were the ones
+whose neighbours happened to be mapped.
+
+**How it was found.** The intercept layer with a finish after every
+enqueue pinned the failing launch to the micro-SDPA prefill kernel at
+two query tiles (GWS 32 × 768). Memory reuse off, USM off and the
+control all faulted, which ruled out the allocator's placement of the
+kernel's own buffers. A dump of the compiled sources showed the mixed
+form running two variants of that kernel per layer, differing only in
+whether V carries the fused projection's padding, and the native form
+running the unpadded one everywhere -- the faulting one -- without
+faulting. The micro-gemm bodies inside the kernel are not source (oneDNN
+generates them at load time as machine code in an inline-asm block), so
+they were extracted from the dump and disassembled: their K and V reads
+are 2D block loads whose surface height is the key count the kernel
+passes, hardware-bounded. The call log at the request's own launch (the
+first sixteen two-tile launches in any log are the load ladder's
+256-token pass) showed every argument at offset 0 of a live allocation
+larger than the kernel's extent, in both forms; a dump of every buffer
+argument of that launch, USM off, showed the subsequence table (0, 205),
+the tile mapping (0, 0), (128, 0) and the shape information all correct.
+The kernel faulted on correct inputs.
+
+Then the primitive alone: a unit test in the plugin (24 heads, 4 KV
+heads, head 256, block 16, u8 KV by channel -- the served geometry --
+one subsequence of N new tokens on exact-size buffers) faults at 193,
+202, 205, 208, 211, 214 and 217 tokens, hangs at 196 and 202 (a run each),
+and passes at 256 and 856; 193 serves in arcint and faults here, so the
+served pattern was the neighbours' slack. Environment switches in the
+generator, one class of access each: the host-side cooperative K/V
+prefetches off, 5/5 pass; the micro-gemm's own block-2D prefetches off,
+still faults; the block Q loads off, still faults; the non-micro path,
+pass. The source then reads plainly. The kernel prefetches the first K
+tile with the geometry (row length d, row count = keys, stride 1
+element) and the *next* K tile with the arguments in the other order
+(row length = remaining keys, row count = d = 256, stride 1 element):
+the pointer lands *inside row 0* of K (k0 + 128 elements, not rows),
+and from there the helper walks 256 rows of up to 256 B whatever the
+tile, its clamp computed from the same swapped geometry. So a prefill
+chunk of N keys with a next tile to prefetch -- 129 to 255 keys -- reads
+256 − N rows past the end of K; at 256 keys and beyond the walk is in
+bounds, which is why 256 and 856 pass and every faulting length lies
+below 256. The order is oneDNN's, for a
+transposed K; the plugin's K is [tokens × d]. Upstream fixed exactly this
+on 2026-09-08 (openvinotoolkit/openvino PR #37878, "Fix out-of-bounds
+next-K-tile prefetch in micro SDPA"), eighteen days after the pinned
+nightly: the stride ldk unless TRANSPOSE_K, row length d and row count
+the remaining keys for both calls. **Patch 0032** is those two hunks, plus
+the reproducer as a regression test (upstream's own test is coverage:
+its header says the pre-fix order passes it too).
+
+**Measured** on the 24 GB card. The reproducer 11/11 green with the patch
+(193–217 unpadded, 205 padded, 256, 856); the plugin's paged-attention
+and SDPA suites 264/264. Served (arcint 0.4.3, the exact mixed form,
+u8 KV, `--mtp off`, n-ctx 8192, prefix cache off, the default prefill
+chunk), one process: 190, 205, 211, 205, 190, 211 tokens, six requests
+served, one text -- the same text the non-faulting lengths gave before
+-- where before a fresh process died on its first request at 190, 202,
+205, 208, 211 and 214 tokens, every time (205: six processes; 190: the
+one process that tried it). Rates unchanged: 856 tokens warm
+1,008–1,009 t/s against 1,010 on +p13, the decode step 54.5–54.7 ms
+against 54.7 (3.49–3.50 s per 64 tokens against 3.50), the greedy text
+the same (283b2c44), four requests each, one fresh process per runtime,
+the patch staged into the +p13 runtime. It ships as `+p14`; arcint's
+own runtime floor stays at +p12 as with 0031, the fix being the
+runtime's.
+
+Two readings of §7.0.2br are withdrawn: the gemm as "the one element
+of every faulting cell" (the SDPA was the element, the gemm ran in the
+non-faulting forms too and was never suspect by measurement), and
+"placement of the kernel's own buffers" (the placement that mattered
+was of whatever lay behind them). The workaround it named,
+`--prefill-chunk 64`, worked for the right reason -- one query tile per
+chunk has no next K tile to prefetch -- and is no longer needed. Not
+touched by the patch: the K-scale and K-zero-point prefetches of the
+2D-quantised key path keep the pinned order; they are bounded by a cap
+of one group and no served configuration takes that path. The 85-token
+two-text alternation stays open and is unrelated (it does not fault and
+the native form shows it).
 
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
