@@ -584,6 +584,31 @@ ms); outputs byte-identical at both depths.
 
 Package: `+p12` (built 2026-09-08 01:00 local on the dev host, installed there at 01:05, both units on it; the served figures above were taken with patch 0030 staged into the +p11 runtime before the package existed).
 
+### 0031-fc-deterministic-gemm.patch
+
+The f16-activation compressed fully-connected — the form a GGUF-opened
+model's repacked projections take — sets oneDNN's deterministic
+attribute before its primitive descriptor is built. oneDNN's gemm
+selector scores a k-parallel strategy (split-K across work-groups with
+atomic accumulation) best whenever the plain M × N tiling underfills the
+device, and that reduction's order varies run to run: the same 235-token
+prompt to one process gave five different greedy texts over twelve
+requests, on 0029 and 0030 alike, with MTP and the logits slice on or
+off, while 64 and 856 rows were byte-stable and the IR at 235 was too
+(DESIGN §7.0.2br). With the attribute the 235-token prompt is one text
+4/4, and the served rates are unchanged (856 tokens warm 1,008 t/s and a
+54.1 ms step; 71,727 tokens 464 t/s and 73.0 ms; the outputs the same;
+at 85 and 145 tokens the text changes with the kernel, chosen knowingly).
+Found by the equivalence suite, which runs on a GGUF-opened model since
+its stateful section became skippable. Open after it: a two-text
+alternation at 85 tokens on the GGUF path (the native form too, so not
+this gemm), and a process fault at about 190–215 tokens in the mixed form
+at the default prefill chunk (an engine memory CAT error at 16.5 GiB
+resident; not at `--prefill-chunk 64`, not in the native form, not in the
+IR) — both in the patch header, neither fixed.
+
+Package: `+p13` (built 2026-09-08 05:14 local on the dev host, installed there at 05:17, both units on it; the served figures above were taken with patch 0031 staged into the +p12 runtime before the package existed).
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.

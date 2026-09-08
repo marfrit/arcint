@@ -8329,6 +8329,164 @@ at 60 µs -- the timing test before 0029's instrument change; the
 served launch, 0.129 ms and 279 GB/s on the served shape, is the
 figure, and it has not moved since 0028.
 
+#### 7.0.2br The handoff's open items after 0.4.4: the 16 GiB card's ceiling, the load's parallel repack, the equivalence suite on a GGUF-opened model, patch 0020's declined combination, and the production question (2026-09-08)
+
+Five items the 0.4.x handoff carried outside any point release, taken
+in turn after 0.4.4.
+
+**The 16 GiB card.** Its random-read ceiling over incompressible
+bytes, by the probe that gave the 24 GB card 453 GB/s (§7.0.2bd),
+measured for the first time: **414–418 GB/s** (512 MB and 2 GB
+buffers, work-groups of 256 and 512, best and mean within 1 %); the
+24 GB card re-read 453–454 in the same window. The probe had only
+ever enumerated the first OpenCL platform, and on this host each card
+sits on its own, which is why the number was missing. The other half
+of the item -- a second decode body per architecture with a served
+16 GiB-card GGUF case -- has no model to serve: the dev host's smaller
+GGUF files are of no allowlisted family with a template (a 2B, an
+embedding model, a 35B MoE, the 27B's MTP-only file), and the 27B
+does not fit. Closed as measured; the served case waits for a file.
+
+**The load.** The handoff's reading -- "the verdict cache's load:
+repack 35–60 s of the 88–168 s; parallel across tensors is the
+obvious step" -- was measured before it was built. From the served
+logs of sixteen loads of the same 15.3 GB file (the phase table is in
+the session ledger; the figures here are its range): the repack 7–85 s
+with the deviation check at zero when the verdict cache holds the
+file (the first load of a new packing pays the check: 235 s over
+18.7 G values), the compile 15–34 s, the rest 22–74 s -- and the
+repack's own spread follows what ran on the host before it (7 s right
+after another load of the same file, 85 s after nine minutes of
+kernel tests), which is the page cache of a file the loader maps and
+touches, not the code. The code did one thing at a time across the
+288 repacked tensors (the rows of one tensor in up to sixteen
+threads; the tensors in sequence, each with its graph edit). Now the
+repack and the check run across tensors in a bounded pool -- the
+workers each take whole tensors with the row threading reduced so the
+count does not multiply -- and the graph edits follow in the original
+order on the calling thread; the file's mapping is advised for
+read-ahead at open. Byte-identical by test (the same tensors through
+one and four workers, the verdict cache empty and warm), and the test
+found a thread-order dependence in the deviation's root-mean-square
+sum that the row-ordered reduction removed (no test had asserted that
+figure exactly). Measured on the 24 GB card, the exact mixed form,
+loads back to back (old = the installed 0.4.3, new = this tree):
+
+| load of the served file | old | new |
+|---|---|---|
+| fresh verdict cache (the check runs) | 335 s (repack 23, check 261) | **135** (repack + check 75 on 8 workers) |
+| warm cache, first pair | 75 (repack 31) | 102 (repack 36) |
+| warm cache, second pair | 99 (repack 43) | 70 (repack 14) |
+
+The first load of a packing is 2.5× faster; the warm loads are what
+the page cache makes them, on either binary (the compile 20–30 s and
+the rest are untouched). The item the record named -- the parallel
+step -- is done and its worth is the check, not the repack.
+
+**The equivalence suite on a GGUF-opened model.** The suite (`tests/equivalence/run.sh`, §5) could not run
+on a GGUF-opened model because its one non-gated diagnostic -- the
+stateful executor against the paged one -- starts a server that
+`--gguf` refuses, and the driver ended there. `ARCINT_SKIP_STATEFUL=1`
+skips that section and nothing else; every gated check is paged and
+runs. Run on the 24 GB card, the exact mixed form (arcint 0.4.3 on
+`+p12`): the prefix-cache gates pass (warm output byte-identical to
+cold, the console's hit, a continuation of a cached prompt hits and
+matches a cold run; MTP with the prefix cache warm = cold), the
+copy-prompt drafter gate passes (42.5 % accepted), and four gates
+fail. Three are the same finding and the fourth is a fact about the
+template: `--mtp on` on a GGUF-opened model is inert -- the template's
+MTP head accepts 0 % against the file's weights -- which the milestone
+had carried as "untested".
+
+The finding: **two greedy runs of the suite's 235-token prompt in one
+process differ.** Twelve requests to four processes gave five texts,
+with MTP and the logits slice on or off alike, while the 856-token
+prompt has been byte-stable in every process of this record. The
+bisect, four requests per process: the IR 4/4 one text; the native form
+4/4; the mixed form at `--prefill-chunk 64` 4/4, and the native form's
+text; the mixed form at the default chunk, exact and split, on 0029 and
+0030 alike, not. The one element of every failing cell is the
+runtime's f16 gemm on the repacked set at 235 rows. Its source says
+why (oneDNN 3.13, `kernel_evaluator.cpp`): the selector scores a
+k-parallel strategy -- split-K across work-groups, the partial sums
+accumulated atomically -- best whenever the plain M × N tiling
+underfills the device, and that reduction's order varies; the
+catalog's f16 entries carry the tag; `attr->set_deterministic(true)`
+scores every such entry out and pins the k-parallel-local work-group
+count to one, and the plugin never set it. **Patch 0031** sets it in
+the f16-activation branch of the compressed fully-connected, one line:
+the 235-token prompt is one text 4/4, and the served rates do not
+move (856 tokens warm 1,008 t/s and a 54.1 ms step against 1,001 /
+54.8; 71,727 tokens 464 t/s and 73.0 ms against 464 / 73.7; the
+greedy outputs the same at both depths). At 85 and 145 tokens the
+text changes with the patch (the strategy pinned is a different
+kernel; a near-tie moves, §3.2's class) -- chosen knowingly, the
+alternative being the five texts. It ships as `+p13`.
+
+Two things the fix does not cover, both measured and open. At 85
+tokens two texts alternate across requests -- in the mixed form and
+in the native form, whose projections never touch the runtime's gemm,
+and not in the IR: the GGUF path's own, unattributed. It shows on the
+0029 plugin (8-row reads) as on 0030, at `--prefill-chunk 64`, and
+with the head unsliced (six requests each, both texts in every
+cell); the split form gave one text six times, which at the observed
+odds of the two texts is as likely chance as a lead. So it is not the
+tall read, not the chunking, not the head slice, and the mins
+packing's gemm width is unproven either way. And a
+prompt of about 190 to 215 tokens can fault the process in the mixed
+form at the default chunk: `CL_OUT_OF_RESOURCES` on a buffer map, and
+in the host's kernel log an engine reset (the f16 process) and an
+engine memory CAT error with a reset of the compute engine and a
+timed-out job in the process (the `--dyn-quant on` one) -- a kernel
+touching unmapped memory, at 16.5 GiB resident on the 24 GB card, so
+not the VRAM-pressure class of §7.0.2ad. It reproduced at 205 tokens
+in four processes (the shipped f16 form, `--dyn-quant on`, the
+deterministic build), at 190 and 211 once each, and not at 154, 163,
+175, 181, 196, 235 or 856; not in the native form, not at
+`--prefill-chunk 64`, not in the IR. Non-monotonic in the row count,
+so a placement reading rather than a tile boundary; the runtime's
+compressed gemm at those row counts is the one element of every
+faulting cell, and that is as far as the record goes without a
+mechanism. Until it is found, a GGUF deployment that sees short
+prompts serves them at `--prefill-chunk 64`, which is deterministic
+and does not fault (its rate cost at 1k is not measured here).
+
+**Patch 0020's declined combination** (4-bit values under BY_TOKEN
+keys: NaN past 128 keys, declined by the selector, §7.0.2as). Read,
+not run. BY_TOKEN keys are not a choice arcint makes: the plugin's
+default is BY_CHANNEL and it forces BY_TOKEN only for a graph with
+cache-block rotation, which arcint's graphs do not carry; and the
+plugin's own paged-attention implementation already disables its
+micro-SDPA path for 4-bit BY_TOKEN keys "due to accuracy issues" --
+so the combination 0020 declines is one upstream declines too, on the
+key side, and nothing served reaches it. The value-side code 0020
+added is gated on the value precision alone (the page stride, the
+per-token scale and zero point offsets all follow the plain block
+size), so bug A's class -- a value stride computed from a key
+parameter -- was not found again by reading; the two pre-existing
+BY_TOKEN key-scale formulas (`ldkq = 1`, the scale pointer at the head
+size minus the subgroup index) are the untested intersection with the
+4-bit value unpack on that kernel, and the ranking is a reading. The
+localising experiment is written down for whoever needs the path: the
+0020 micro-SDPA test at BY_TOKEN, one head, 129 keys and 256 keys,
+with the decline bypassed, the existing per-row NaN map naming the
+first wrong element (head element 0 of every row past 128 says the
+page index; a fixed interior offset says the key-scale formula). Not
+run: the path serves nothing, and the record does not narrate a
+mechanism it did not measure.
+
+**A GGUF on a production unit.** The operator's call, with the numbers
+beside it: the agent unit serves the IR at 13.06 GiB, 1,574 t/s and a
+45 ms step at 856 tokens, 151,552 tokens of context at `u8:i4` with MTP
+on. The same model's GGUF in the mixed form on the same card is 16.54
+GiB (16.30 split), 1,001 t/s warm and 54.8 ms (53.5 split), 112k
+tokens at `u8` (120k split), and `--mtp on` on a GGUF-opened model is
+inert (above).
+Slower on every axis and larger; its case is serving the file's own
+quantisation. Nothing was changed. If the file's weights are wanted
+on a unit: `--gguf-mins split`, `--mtp off`, `--n-ctx` at or under
+120k at `u8`, through the unit manager's rollout, not a hand edit.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

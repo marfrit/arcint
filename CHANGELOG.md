@@ -17,6 +17,46 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## Unreleased — the handoff's open items (2026-09-08)
+
+Requires `marfrit-openvino 2026.4.0~dev20260821+p13` (patches 0003–0031)
+for the fix below; DESIGN §7.0.2br.
+
+- **Defect found and fixed (plugin patch 0031):** a GGUF-opened model
+  in the mixed form was not deterministic run to run at some prompt
+  lengths -- the same 235-token prompt to one process gave five greedy
+  texts over twelve requests. The runtime's f16 gemm on the repacked
+  set takes a k-parallel (split-K, atomic-accumulate) strategy when the
+  tiling underfills the card; the patch sets oneDNN's deterministic
+  attribute on that fully-connected. 4/4 one text after; rates
+  unchanged (856 tokens warm 1,008 t/s / 54.1 ms, 71,727 tokens 464 t/s
+  / 73.0 ms; at 85 and 145 tokens the text changes, a near-tie moved by
+  the different kernel, chosen knowingly). Found by the equivalence suite, which now runs on a
+  GGUF-opened model (`ARCINT_SKIP_STATEFUL=1` skips its one stateful
+  section, a non-gated diagnostic).
+- **Defects found and open:** (1) at 85 tokens two texts alternate on
+  the GGUF path, in the native form too, not in the IR; (2) a prompt of
+  about 190–215 tokens can fault the process in the mixed form at the
+  default prefill chunk (an engine memory CAT error at 16.5 GiB
+  resident; not at `--prefill-chunk 64`, not in the native form, not in
+  the IR). A GGUF deployment that sees short prompts should serve at
+  `--prefill-chunk 64` until (2) is found. (3) `--mtp on` on a
+  GGUF-opened model is inert: the template's MTP head accepts 0 %.
+- The load: the repack and its deviation check run across tensors in a
+  bounded pool (the graph edits stay sequential); the mapping is advised
+  for read-ahead. The first load of a packing (the check runs) 335 → 135
+  s; warm loads inside the page-cache scatter (70–102 s). Byte-identical
+  by test for 1 and 4 workers; a thread-order dependence in the
+  deviation's rms sum fixed on the way.
+- The 16 GiB card's random-read ceiling over incompressible bytes:
+  414–418 GB/s (the probe now enumerates every OpenCL platform).
+- Patch 0020's declined combination (4-bit values under BY_TOKEN keys):
+  read, not run -- BY_TOKEN keys never reach arcint's served path, and
+  the plugin's own code disables micro-SDPA for 4-bit BY_TOKEN keys; the
+  localising test is written down in DESIGN.
+- A GGUF on a production unit: the operator's call; the IR is faster on
+  every axis and smaller (numbers in DESIGN).
+
 ## Unreleased — 0.4.4 measured, nothing shipped (2026-09-08)
 
 The Q5_K decode row (DESIGN §7.0.2bq). Two row rewrites, both

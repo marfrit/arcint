@@ -217,6 +217,7 @@ if(ARCINT_TESTS)
     tests/test_gguf.cpp
     tests/test_gguf_graph.cpp
     tests/test_gguf_repack.cpp
+    tests/test_gguf_parallel.cpp
     tests/test_affinity.cpp
     tests/test_fit.cpp
     tests/test_decode_stats.cpp

@@ -82,13 +82,22 @@ cp "$WORK/det1.txt" "$WORK/base.txt"
 #
 # Two different executors over the same compiler. We do not assume they agree,
 # we measure whether they do: kernel paths differ, so a near-tie may land the
-# other way (the §3.2 class). Reported, not gated.
-start_server "$WORK/stateful.log" --no-paged || exit 1
-ask "$WORK/stateful.txt" "$PROMPT"
-if cmp -s "$WORK/base.txt" "$WORK/stateful.txt"; then
-  echo "  -- stateful vs paged: byte-identical on this prompt"
+# other way (the §3.2 class). Reported, not gated. A GGUF-opened model serves
+# on the paged path only (--gguf refuses --no-paged), so this section is
+# skipped under ARCINT_SKIP_STATEFUL=1 instead of ending the suite at a
+# server that cannot start; every gated check below is paged and still runs.
+# The comparison is against the literal string "1", not mere non-emptiness:
+# ARCINT_SKIP_STATEFUL=0 (an explicit "off") must NOT skip the section.
+if [[ "${ARCINT_SKIP_STATEFUL:-}" == "1" ]]; then
+  echo "  -- stateful vs paged: skipped (ARCINT_SKIP_STATEFUL: the model serves on the paged path only)"
 else
-  echo "  -- stateful vs paged: DIFFER (near-tie class, recorded not gated)"
+  start_server "$WORK/stateful.log" --no-paged || exit 1
+  ask "$WORK/stateful.txt" "$PROMPT"
+  if cmp -s "$WORK/base.txt" "$WORK/stateful.txt"; then
+    echo "  -- stateful vs paged: byte-identical on this prompt"
+  else
+    echo "  -- stateful vs paged: DIFFER (near-tie class, recorded not gated)"
+  fi
 fi
 
 # ------------------------------- the logits slice must not change the answer

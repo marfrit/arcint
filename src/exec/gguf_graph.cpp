@@ -4,9 +4,6 @@
 
 #include <chrono>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
-#include <sys/stat.h>
 #include <map>
 
 #include <algorithm>
@@ -14,6 +11,7 @@
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 #include <openvino/core/graph_util.hpp>
@@ -100,44 +98,6 @@ GgufWeightsMode gguf_tensor_mode(GgufWeightsMode mode, int32_t ggml_type) {
     return ggml_type == static_cast<int32_t>(gguf::GgmlType::Q4_K) ? GgufWeightsMode::Repack : GgufWeightsMode::Native;
 }
 
-namespace {
-// The deviation verdict of one repacked projection, kept between loads.
-struct Verdict { double max_steps = 0.0; size_t values = 0; };
-
-std::string verdict_key(const std::string& file_path, const gguf::TensorInfo& t, double bound) {
-    struct stat st {};
-    if (file_path.empty() || ::stat(file_path.c_str(), &st) != 0) return "";
-    std::ostringstream k;
-    k << "repack-v1|" << st.st_size << '|' << st.st_mtim.tv_sec << '.' << st.st_mtim.tv_nsec << '|' << t.name << '|'
-      << t.offset << '|' << t.ggml_type << '|' << bound;
-    for (auto d : t.dims) k << 'x' << d;
-    // FNV-1a over the key text: a file name, not a claim of uniqueness beyond the fields above.
-    uint64_t h = 1469598103934665603ull;
-    for (unsigned char c : k.str()) { h ^= c; h *= 1099511628211ull; }
-    char buf[32];
-    std::snprintf(buf, sizeof buf, "%016llx", static_cast<unsigned long long>(h));
-    return buf;
-}
-
-bool read_verdict(const std::string& dir, const std::string& key, Verdict& v) {
-    if (dir.empty() || key.empty()) return false;
-    std::ifstream in(std::filesystem::path(dir) / (key + ".verdict"));
-    std::string tag;
-    if (!(in >> tag >> v.max_steps >> v.values) || tag != "ok") return false;
-    return true;
-}
-
-void write_verdict(const std::string& dir, const std::string& key, const Verdict& v) {
-    if (dir.empty() || key.empty()) return;
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    if (ec) return;
-    std::ofstream out(std::filesystem::path(dir) / (key + ".verdict"));
-    out.precision(17);
-    out << "ok " << v.max_steps << ' ' << v.values << '\n';
-}
-}  // namespace
-
 std::string GgufApplyReport::summary() const {
     std::unordered_map<int32_t, std::pair<int, size_t>> per_type;
     size_t repacked = 0;
@@ -156,26 +116,13 @@ std::string GgufApplyReport::summary() const {
         s << "; repack deviation max " << repack_max_steps << " quantisation step(s) over " << repack_checked << " value(s), "
           << repack_over_bound << (mins == gguf::RepackMins::Exact || mins == gguf::RepackMins::Split ? " over bound" : " over the exact bound (accepted: --gguf-mins)");
         if (repack_verdicts_cached != 0) s << " (" << repack_verdicts_cached << " verdict(s) from an earlier load)";
-        s << "; repack " << static_cast<int>(repack_seconds) << " s, check " << static_cast<int>(check_seconds) << " s";
+        s << "; repack+check " << static_cast<int>(repack_seconds) << " s on " << repack_workers << " worker(s)";
     }
     if (q6k_aligned != 0) s << "; " << q6k_aligned << " Q6_K projection(s) in 224-byte blocks";
     s << "; " << kept.size() << " constant(s) kept from the template; " << awq_scales_neutralized
       << " AWQ activation scale(s) set to one; " << norms_compared << " norm(s) compared with the file, max |diff| "
       << norms_max_abs_diff;
     return s.str();
-}
-
-// The per-type bound on the repack's deviation of the main columns, in
-// quantisation steps (core/gguf_repack.h, tests/test_gguf_repack.cpp): the
-// plugin's half arithmetic rounds every value (|q - zp| * 2^-11 steps) and,
-// for the K types, the group's scale (another |q| * 2^-11); the mins are
-// exact.
-static double repack_bound_steps(int32_t ggml_type) {
-    switch (ggml_type) {
-        case 8:  return 1.0 / 16.0;   // |q| <= 127: the value rounding alone
-        case 12: return 1.0 / 64.0;   // |q| <= 15: the value and the scale rounding
-        default: return 1.0 / 32.0;   // Q5_K |q| <= 31; Q6_K |q - 32| <= 32
-    }
 }
 
 // The plugin's own decompression form: Const -> Convert(f16) -> [Subtract zp]
@@ -329,6 +276,32 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
             weights.push_back(c);
     }
 
+    // Phase (a), sequential and cheap: resolve every weight's target tensor,
+    // its MatMul and (for a projection to repack) the column order and bound
+    // its check runs under -- everything gguf_repack_all needs, and nothing
+    // that touches a tensor's bytes. No graph edit is APPLIED here (replace_node
+    // is not called until phase (c)); a column-reorder Gather may be built
+    // (its node exists, unconnected) and then discarded below when the
+    // tensor turns out to repack instead, same as before this was split.
+    struct WeightPlan {
+        std::shared_ptr<ov::op::v0::Constant> c;
+        std::string name, gguf_name;
+        GgufReorder reorder = GgufReorder::None;
+        std::shared_ptr<ov::op::v0::MatMul> mm;
+        const gguf::TensorInfo* t = nullptr;
+        int64_t n = 0, k = 0;
+        ov::Output<ov::Node> act_out;
+        bool columns_gathered = false;
+        int64_t row_bytes = 0;
+        GgufWeightsMode tmode = GgufWeightsMode::Native;
+        std::vector<int64_t> dest_of;  // repack mode only (empty: the file's own order)
+        double bound = 0.0;            // repack mode only
+        int repack_index = -1;         // index into repack_results; -1 when not repacked
+    };
+    std::vector<WeightPlan> plans;
+    plans.reserve(weights.size());
+    std::vector<gguf::RepackRequest> requests;
+
     for (const auto& c : weights) {
         const std::string name = c->get_friendly_name();
         std::string gguf_name;
@@ -361,11 +334,13 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
             throw std::runtime_error("gguf: " + gguf_name + " has " + std::to_string(n) + " rows, the template's " + name +
                                      " has " + std::to_string(ir_shape.empty() ? 0 : ir_shape[0]));
 
-        ov::Output<ov::Node> act_out = mm->input_value(0);
-        GgufReplacement r;
-        r.ir_name = name; r.gguf_name = gguf_name; r.ggml_type = t->ggml_type; r.n = n; r.k = k;
+        WeightPlan p;
+        p.c = c; p.name = name; p.gguf_name = gguf_name; p.reorder = reorder; p.mm = mm; p.t = t; p.n = n; p.k = k;
+        p.act_out = mm->input_value(0);
 
-        // The activation-side permutation for a column-reordered projection.
+        // The activation-side permutation for a column-reordered projection
+        // (undone below instead, for a repacked one -- the mins then follow
+        // the head-wise order at build, not a gather at every forward).
         if (reorder == GgufReorder::Columns) {
             std::vector<int64_t> idx(static_cast<size_t>(k));
             const int64_t d = g.linear_v_dim;
@@ -373,61 +348,92 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
                 for (int64_t e = 0; e < d; ++e) idx[to_file[hf] * d + e] = hf * d + e;
             auto idx_c = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{static_cast<size_t>(k)}, idx);
             auto axis_c = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {-1});
-            auto gather = std::make_shared<ov::op::v8::Gather>(act_out, idx_c, axis_c);
+            auto gather = std::make_shared<ov::op::v8::Gather>(p.act_out, idx_c, axis_c);
             gather->set_friendly_name(mm->get_friendly_name() + "/gguf_v_head_order");
-            act_out = gather->output(0);
-            r.columns_gathered = true;
+            p.act_out = gather->output(0);
+            p.columns_gathered = true;
         }
 
-        const int64_t row_bytes = FullyConnectedKQuant::row_bytes(t->ggml_type, k);
+        p.row_bytes = FullyConnectedKQuant::row_bytes(t->ggml_type, k);
+        p.tmode = gguf_tensor_mode(mode, t->ggml_type);
+
+        if (p.row_bytes != 0 && p.tmode == GgufWeightsMode::Repack) {
+            // A column-reordered projection (the output projection) takes its
+            // order at build; the mins' augmented groups then follow the heads.
+            if (reorder == GgufReorder::Columns) {
+                p.act_out = mm->input_value(0);  // not the gather built above: the columns themselves move
+                p.columns_gathered = false;
+                p.dest_of.resize(static_cast<size_t>(k));
+                const int64_t d = g.linear_v_dim;
+                for (int64_t hf = 0; hf < g.linear_v_heads; ++hf)
+                    for (int64_t e = 0; e < d; ++e) p.dest_of[static_cast<size_t>(to_file[static_cast<size_t>(hf)] * d + e)] = hf * d + e;
+            }
+            // The split form's bound: the exact form's terms plus one f16 rounding of the
+            // min product dmin * mn (up to 2^-11 of the min, in steps -- not bounded a
+            // priori). Twice the exact bound is the MEASURED bound: it holds on the fixture
+            // (0.0158 on Q4_K against 1/64) and on the served file. Refused over it like
+            // the exact form: the mins are the file's, the form is exact-class.
+            p.bound = gguf::repack_bound_steps(t->ggml_type) * (mins == gguf::RepackMins::Split ? 2.0 : 1.0);
+            p.repack_index = static_cast<int>(requests.size());
+            requests.push_back(gguf::RepackRequest{t, p.dest_of, p.bound});
+        }
+        plans.push_back(std::move(p));
+    }
+
+    // Phase (b): every tensor to repack, at once, cross-tensor, in a bounded
+    // worker pool (core/gguf_repack.h's gguf_repack_all -- device-free,
+    // tested without OpenVINO in tests/test_gguf_parallel.cpp). repack_seconds
+    // is the wall time of this WHOLE phase, not a sum of per-tensor repack
+    // calls: the repack and the deviation check of every requested tensor
+    // (cache read; on a miss, the check over the bound and the verdict
+    // write) happen inside it, so there is no separate check_seconds to time
+    // any more -- it stays at 0 for callers of the struct. A tensor over its
+    // bound (RepackMins::Exact/Split) throws from inside gguf_repack_all,
+    // after every request has been attempted, naming the tensor -- the exact
+    // message this loop used to throw inline.
+    std::vector<gguf::RepackResult> repack_results;
+    if (!requests.empty()) {
+        const unsigned workers = std::max(1u, std::thread::hardware_concurrency());
+        const auto t0 = wall::now();
+        repack_results = gguf::gguf_repack_all(*file, requests, mins, verdict_dir, file_path, workers);
+        rep.repack_seconds = std::chrono::duration<double>(wall::now() - t0).count();
+        rep.repack_workers = workers;
+    }
+
+    // Phase (c), sequential, in the file's own tensor order: exactly the
+    // graph edits phase (a) used to do inline, now reading a repacked
+    // tensor's RepackedTensor and verdict from `repack_results` instead of
+    // computing them here.
+    for (auto& p : plans) {
+        const std::string& name = p.name;
+        const std::string& gguf_name = p.gguf_name;
+        const GgufReorder reorder = p.reorder;
+        const auto& mm = p.mm;
+        const auto* t = p.t;
+        const int64_t n = p.n, k = p.k;
+        ov::Output<ov::Node> act_out = p.act_out;
+
+        GgufReplacement r;
+        r.ir_name = name; r.gguf_name = gguf_name; r.ggml_type = t->ggml_type; r.n = n; r.k = k;
+        r.columns_gathered = p.columns_gathered;
+
+        const int64_t row_bytes = p.row_bytes;
         std::shared_ptr<ov::Node> replacement;
         std::shared_ptr<ov::Node> post;  // an output-side gather when the rows were reordered
-        const GgufWeightsMode tmode = gguf_tensor_mode(mode, t->ggml_type);
+        const GgufWeightsMode tmode = p.tmode;
         if (row_bytes != 0) {
             if (tmode == GgufWeightsMode::Repack) {
                 r.repacked = true;
-                // A column-reordered projection (the output projection) takes its
-                // order at build; the mins' augmented groups then follow the heads.
-                std::vector<int64_t> dest_of;
-                if (reorder == GgufReorder::Columns) {
-                    act_out = mm->input_value(0);  // not the gather built above: the columns themselves move
-                    r.columns_gathered = false;
-                    dest_of.resize(static_cast<size_t>(k));
-                    const int64_t d = g.linear_v_dim;
-                    for (int64_t hf = 0; hf < g.linear_v_heads; ++hf)
-                        for (int64_t e = 0; e < d; ++e) dest_of[static_cast<size_t>(to_file[static_cast<size_t>(hf)] * d + e)] = hf * d + e;
-                }
-                const auto t_repack = wall::now();
-                auto packed = gguf::repack_tensor(*file, *t, dest_of.empty() ? nullptr : &dest_of, mins);
-                rep.repack_seconds += std::chrono::duration<double>(wall::now() - t_repack).count();
-                // The split form's bound: the exact form's terms plus one f16 rounding of the
-                // min product dmin * mn (up to 2^-11 of the min, in steps -- not bounded a
-                // priori). Twice the exact bound is the MEASURED bound: it holds on the fixture
-                // (0.0158 on Q4_K against 1/64) and on the served file. Refused over it like
-                // the exact form: the mins are the file's, the form is exact-class.
-                const double bound = repack_bound_steps(t->ggml_type) * (mins == gguf::RepackMins::Split ? 2.0 : 1.0);
-                const std::string key = verdict_key(file_path, *t, bound + (mins == gguf::RepackMins::Exact ? 0.0 : mins == gguf::RepackMins::Shared ? 1000.0
-                                                    : mins == gguf::RepackMins::Nibble ? 2000.0 : 3000.0));  // the packing is part of the key
-                Verdict v;
-                if (read_verdict(verdict_dir, key, v)) {
+                gguf::RepackResult& rr = repack_results[static_cast<size_t>(p.repack_index)];
+                gguf::RepackedTensor packed = std::move(rr.packed);
+                rep.repack_max_steps = std::max(rep.repack_max_steps, rr.max_steps);
+                if (rr.verdict_cached) {
                     // Checked and passed by an earlier load of this very file (size, mtime,
                     // offset, type, dims); the repack itself is deterministic in the bytes.
-                    rep.repack_max_steps = std::max(rep.repack_max_steps, v.max_steps);
                     ++rep.repack_verdicts_cached;
                 } else {
-                    const auto t_check = wall::now();
-                    const auto dv = gguf::repack_deviation(*file, *t, packed, bound);
-                    rep.check_seconds += std::chrono::duration<double>(wall::now() - t_check).count();
-                    rep.repack_max_steps = std::max(rep.repack_max_steps, dv.max_steps);
-                    rep.repack_over_bound += dv.over;
-                    rep.repack_checked += dv.values;
-                    // An inexact mins packing (--gguf-mins shared|nibble) is a chosen cost: its
-                    // deviation is reported in the summary, not refused (DESIGN 7.0.2bl).
-                    if (dv.over != 0 && (mins == gguf::RepackMins::Exact || mins == gguf::RepackMins::Split))
-                        throw std::runtime_error("gguf: " + gguf_name + " repacked outside its bound: " + std::to_string(dv.over) +
-                                                 " value(s) over " + std::to_string(bound) +
-                                                 " quantisation step(s), max " + std::to_string(dv.max_steps));
-                    write_verdict(verdict_dir, key, Verdict{dv.max_steps, dv.values});
+                    rep.repack_over_bound += rr.over_bound;
+                    rep.repack_checked += rr.checked;
                 }
                 // The value-head reorder is undone in the repacked rows and column
                 // groups themselves, not by gathers in the graph (a gather per
@@ -488,12 +494,12 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
             std::vector<float> f(static_cast<size_t>(n) * static_cast<size_t>(k));
             gguf::dequantize_tensor(*file, *t, f);
             if (reorder == GgufReorder::RowsV) {
-                std::vector<float> p(f.size());
+                std::vector<float> fp(f.size());  // named apart from the outer WeightPlan `p`
                 const int64_t head_rows = n / g.linear_v_heads;
                 for (int64_t hf = 0; hf < g.linear_v_heads; ++hf)
                     for (int64_t d = 0; d < head_rows; ++d)
-                        std::copy_n(f.data() + (to_file[hf] * head_rows + d) * k, k, p.data() + (hf * head_rows + d) * k);
-                f.swap(p);
+                        std::copy_n(f.data() + (to_file[hf] * head_rows + d) * k, k, fp.data() + (hf * head_rows + d) * k);
+                f.swap(fp);
                 r.rows_permuted = true;
             }
             auto w32 = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{static_cast<size_t>(n), static_cast<size_t>(k)}, f);

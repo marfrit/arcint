@@ -72,8 +72,17 @@ struct GgufApplyReport {
     size_t repack_over_bound = 0;
     size_t repack_checked = 0;
     size_t repack_verdicts_cached = 0;      // projections whose deviation verdict came from an earlier load (gguf_check once)
-    double repack_seconds = 0.0;            // wall time of the repacks
-    double check_seconds = 0.0;             // wall time of the deviation checks
+    // 0.4.2: the repack and the deviation check of every tensor to repack run
+    // together, cross-tensor, in one bounded worker pool (core/gguf_repack.h's
+    // gguf_repack_all) instead of one tensor after another -- repack_seconds is
+    // now the wall time of that WHOLE parallel phase (every tensor's repack
+    // and check both), not a sum of individual repack calls; check_seconds
+    // stays for callers of this struct but is folded into repack_seconds and
+    // is always 0 now that the two no longer run as separate, separately-
+    // timed steps.
+    double repack_seconds = 0.0;            // wall time of the parallel repack+check phase
+    double check_seconds = 0.0;             // always 0 now (see above); kept for source compatibility
+    unsigned repack_workers = 0;            // the worker pool size the parallel phase ran with
     // The exporter's AWQ folded per-channel scales into the graph as
     // activation-side multipliers (the attention gate's `awq_mul/scale`)
     // compensating weights it had divided; with the projections now the

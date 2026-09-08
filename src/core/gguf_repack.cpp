@@ -1,10 +1,17 @@
 #include "core/gguf_repack.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
+
+#include <sys/stat.h>
 
 #include "core/gguf_dequant.h"
 
@@ -252,7 +259,8 @@ float repacked_group_min(const RepackedTensor& r, int64_t row, int64_t g) { retu
 
 bool repack_supported(int32_t t) { return t == 8 || t == 12 || t == 13 || t == 14; }
 
-RepackedTensor repack_tensor(const GgufFile& file, const TensorInfo& t, const std::vector<int64_t>* column_dest_of, RepackMins mins) {
+RepackedTensor repack_tensor(const GgufFile& file, const TensorInfo& t, const std::vector<int64_t>* column_dest_of, RepackMins mins,
+                             unsigned threads) {
     if (!repack_supported(t.ggml_type))
         throw std::runtime_error("gguf repack: " + t.name + " is " + type_name(t.ggml_type) + ", not a repacked type");
     if (t.dims.size() != 2) throw std::runtime_error("gguf repack: " + t.name + " is not 2-D");
@@ -303,11 +311,11 @@ RepackedTensor repack_tensor(const GgufFile& file, const TensorInfo& t, const st
         r.min_matrix.assign(static_cast<size_t>(r.n * (r.k / 32)), 0);
     const size_t row_bytes = static_cast<size_t>(r.k / block) * block_bytes_of(t.ggml_type);
     const uint8_t* data = file.data(t);
-    const unsigned threads = std::max(1u, std::min(std::thread::hardware_concurrency(), 16u));
+    const unsigned n_threads = threads != 0 ? threads : std::max(1u, std::min(std::thread::hardware_concurrency(), 16u));
     std::vector<std::thread> pool;
-    for (unsigned th = 0; th < threads; ++th)
+    for (unsigned th = 0; th < n_threads; ++th)
         pool.emplace_back([&, th]() {
-            for (int64_t row = th; row < r.n; row += threads) repack_row(t.ggml_type, data + row * row_bytes, r, row, pl);
+            for (int64_t row = th; row < r.n; row += n_threads) repack_row(t.ggml_type, data + row * row_bytes, r, row, pl);
         });
     for (auto& th : pool) th.join();
     return r;
@@ -356,7 +364,8 @@ void dequantize_repacked(const RepackedTensor& r, std::vector<float>& out) {
             out[static_cast<size_t>(row * r.k + c)] = main_value(r, row, c) - min_of_group(r, row, c / 32);
 }
 
-RepackDeviation repack_deviation(const GgufFile& file, const TensorInfo& t, const RepackedTensor& r, double step_fraction) {
+RepackDeviation repack_deviation(const GgufFile& file, const TensorInfo& t, const RepackedTensor& r, double step_fraction,
+                                 unsigned threads) {
     // Row by row in parallel (a whole tensor dequantized twice is gigabytes;
     // the served file has 25.6 G values and this runs at every load). A
     // column-reordered tensor is compared through the order it was built
@@ -364,31 +373,50 @@ RepackDeviation repack_deviation(const GgufFile& file, const TensorInfo& t, cons
     const int64_t wgroups = r.width() / r.group;
     const size_t row_bytes = static_cast<size_t>(r.k / (t.ggml_type == 8 ? 32 : 256)) * block_bytes_of(t.ggml_type);
     const uint8_t* data = file.data(t);
-    const unsigned threads = std::max(1u, std::min(std::thread::hardware_concurrency(), 16u));
-    std::vector<RepackDeviation> part(threads);
-    std::vector<double> sq(threads, 0.0);
+    const unsigned n_threads = threads != 0 ? threads : std::max(1u, std::min(std::thread::hardware_concurrency(), 16u));
+    // Every row's own max/sum-of-squares/over-count is exact and independent
+    // of threading; only the ACROSS-row combination of the sum of squares is
+    // a floating-point reduction, and summing threads' partials in thread
+    // order (as the previous version did) makes that reduction's rounding
+    // depend on how many threads happened to run -- observable as a
+    // `rms_steps` that moved with `threads` alone, nothing else. Reducing by
+    // row index instead, 0 to n-1, fixes the order regardless of the thread
+    // count: gguf_repack_all runs the very same tensor through a smaller
+    // pool than a lone call would, and its result must not differ for that.
+    std::vector<double> row_max(static_cast<size_t>(r.n), 0.0);
+    std::vector<double> row_sq(static_cast<size_t>(r.n), 0.0);
+    std::vector<size_t> row_over(static_cast<size_t>(r.n), 0);
     std::vector<std::thread> pool;
-    for (unsigned th = 0; th < threads; ++th)
+    for (unsigned th = 0; th < n_threads; ++th)
         pool.emplace_back([&, th]() {
             std::vector<float> ref(static_cast<size_t>(r.k));
-            for (int64_t row = th; row < r.n; row += threads) {
+            for (int64_t row = th; row < r.n; row += n_threads) {
                 dequantize_row(t.ggml_type, data + row * row_bytes, static_cast<size_t>(r.k), ref.data());
+                double mx = 0.0, sq = 0.0;
+                size_t over = 0;
                 for (int64_t c = 0; c < r.k; ++c) {
                     const int64_t dc = r.column_dest_of.empty() ? c : r.column_dest_of[static_cast<size_t>(c)];  // where the file's column c sits
                     const float got = main_value(r, row, dc) - min_of_group(r, row, dc / 32);
                     const double step = std::fabs(static_cast<double>(f16_to_f32(r.scale[row * wgroups + dc / r.group])));
                     const double e = std::fabs(static_cast<double>(got) - static_cast<double>(ref[c])) / (step > 0 ? step : 1.0);
-                    part[th].max_steps = std::max(part[th].max_steps, e);
-                    sq[th] += e * e;
-                    if (e > step_fraction) ++part[th].over;
-                    ++part[th].values;
+                    mx = std::max(mx, e);
+                    sq += e * e;
+                    if (e > step_fraction) ++over;
                 }
+                row_max[static_cast<size_t>(row)] = mx;
+                row_sq[static_cast<size_t>(row)] = sq;
+                row_over[static_cast<size_t>(row)] = over;
             }
         });
     for (auto& th : pool) th.join();
     RepackDeviation dv;
-    double s = 0;
-    for (unsigned th = 0; th < threads; ++th) { dv.max_steps = std::max(dv.max_steps, part[th].max_steps); dv.over += part[th].over; dv.values += part[th].values; s += sq[th]; }
+    double s = 0.0;
+    for (int64_t row = 0; row < r.n; ++row) {
+        dv.max_steps = std::max(dv.max_steps, row_max[static_cast<size_t>(row)]);
+        dv.over += row_over[static_cast<size_t>(row)];
+        s += row_sq[static_cast<size_t>(row)];
+    }
+    dv.values = static_cast<size_t>(r.n) * static_cast<size_t>(r.k);
     dv.rms_steps = dv.values ? std::sqrt(s / static_cast<double>(dv.values)) : 0.0;
     return dv;
 }
@@ -453,6 +481,175 @@ void matvec_repacked_host(const RepackedTensor& r, const std::vector<float>& x, 
         }
         y[static_cast<size_t>(row)] = static_cast<float>(acc);
     }
+}
+
+double repack_bound_steps(int32_t ggml_type) {
+    switch (ggml_type) {
+        case 8:  return 1.0 / 16.0;   // Q8_0, |q| <= 127: the value rounding alone
+        case 12: return 1.0 / 64.0;   // Q4_K, |q| <= 15: the value and the scale rounding
+        default: return 1.0 / 32.0;   // Q5_K |q| <= 31; Q6_K |q - 32| <= 32
+    }
+}
+
+namespace {
+
+// The deviation verdict of one repacked projection, kept between loads
+// (moved here, unchanged, from gguf_graph.cpp's anonymous namespace -- the
+// caller no longer needs its own copy).
+struct Verdict {
+    double max_steps = 0.0;
+    size_t values = 0;
+};
+
+// The packing is part of the key (gguf_graph.cpp's scheme before this cache
+// moved here, unchanged): a numeric offset added to the bound, 0 for Exact so
+// an Exact verdict file written by an old build is still found by a new one.
+// Without this, an Exact load could read back a verdict a Shared/Nibble load
+// of the same tensor/bound had written -- those never refuse and always
+// write, so a bad Exact repack could be waved through on a stale, unrelated
+// pass (tests/test_gguf_parallel.cpp's collision test).
+double verdict_mins_offset(RepackMins mins) {
+    switch (mins) {
+        case RepackMins::Exact:  return 0.0;
+        case RepackMins::Shared: return 1000.0;
+        case RepackMins::Nibble: return 2000.0;
+        case RepackMins::Split:  return 3000.0;
+    }
+    return 0.0;
+}
+
+std::string verdict_key(const std::string& file_path, const TensorInfo& t, double bound, RepackMins mins) {
+    struct stat st {};
+    if (file_path.empty() || ::stat(file_path.c_str(), &st) != 0) return "";
+    std::ostringstream k;
+    k << "repack-v1|" << st.st_size << '|' << st.st_mtim.tv_sec << '.' << st.st_mtim.tv_nsec << '|' << t.name << '|'
+      << t.offset << '|' << t.ggml_type << '|' << (bound + verdict_mins_offset(mins));
+    for (auto d : t.dims) k << 'x' << d;
+    // FNV-1a over the key text: a file name, not a claim of uniqueness beyond the fields above.
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : k.str()) { h ^= c; h *= 1099511628211ull; }
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%016llx", static_cast<unsigned long long>(h));
+    return buf;
+}
+
+bool read_verdict(const std::string& dir, const std::string& key, Verdict& v) {
+    if (dir.empty() || key.empty()) return false;
+    std::ifstream in(std::filesystem::path(dir) / (key + ".verdict"));
+    std::string tag;
+    if (!(in >> tag >> v.max_steps >> v.values) || tag != "ok") return false;
+    return true;
+}
+
+void write_verdict(const std::string& dir, const std::string& key, const Verdict& v) {
+    if (dir.empty() || key.empty()) return;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return;
+    std::ofstream out(std::filesystem::path(dir) / (key + ".verdict"));
+    out.precision(17);
+    out << "ok " << v.max_steps << ' ' << v.values << '\n';
+}
+
+}  // namespace
+
+std::vector<RepackResult> gguf_repack_all(const GgufFile& file, const std::vector<RepackRequest>& requests,
+                                          RepackMins mins, const std::string& verdict_dir,
+                                          const std::string& file_path, unsigned threads) {
+    std::vector<RepackResult> results(requests.size());
+    std::vector<std::string> errors(requests.size());  // per-request; empty means no error
+
+    // The cross-tensor pool: N workers (>= 1), each taking whole requests off
+    // the list until none are left. The pool never grows past the number of
+    // requests -- a lone request gets one worker, not `n_workers` of them
+    // idling. Reduce the intra-tensor thread count from the pool size that
+    // ACTUALLY runs (`actual_workers`), not the raw requested `threads`: a
+    // single request on a 16-thread host used to compute intra from
+    // n_workers == threads (== 16 by default) and repack single-threaded,
+    // even though only one worker ever ran.
+    const unsigned n_workers = std::max<unsigned>(1u, threads != 0 ? threads : std::thread::hardware_concurrency());
+    const unsigned actual_workers = static_cast<unsigned>(std::min<size_t>(n_workers, std::max<size_t>(requests.size(), 1)));
+    const unsigned pool_default = std::max(1u, std::min(std::thread::hardware_concurrency(), 16u));
+    const unsigned intra = std::max(1u, pool_default / actual_workers);
+
+    // Created once, up front, on the calling thread: write_verdict below also
+    // calls create_directories, but several workers writing a verdict for
+    // different tensors at once would otherwise race to create the same
+    // directory concurrently. Ignored on failure the same way write_verdict
+    // ignores it -- a verdict that cannot be written is a slower next load,
+    // never a wrong one.
+    if (!verdict_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(verdict_dir, ec);
+    }
+
+    auto process_one = [&](size_t i) {
+        const RepackRequest& req = requests[i];
+        if (req.tensor == nullptr) { errors[i] = "gguf: repack request has no tensor"; return; }
+        const TensorInfo& t = *req.tensor;
+        try {
+            RepackedTensor packed = repack_tensor(file, t, req.column_dest_of.empty() ? nullptr : &req.column_dest_of, mins, intra);
+            RepackResult res;
+            const std::string key = verdict_key(file_path, t, req.bound, mins);
+            Verdict v;
+            if (read_verdict(verdict_dir, key, v)) {
+                // Checked and passed by an earlier load of this very file (size, mtime,
+                // offset, type, dims, bound); the repack itself is deterministic in the
+                // bytes, so there is nothing left to measure.
+                res.max_steps = v.max_steps;
+                res.verdict_cached = true;
+            } else {
+                const auto dv = repack_deviation(file, t, packed, req.bound, intra);
+                res.max_steps = dv.max_steps;
+                res.over_bound = dv.over;
+                res.checked = dv.values;
+                // An inexact mins packing (--gguf-mins shared|nibble) is a chosen cost:
+                // its deviation is reported, never refused (DESIGN 7.0.2bl).
+                if (dv.over != 0 && (mins == RepackMins::Exact || mins == RepackMins::Split)) {
+                    errors[i] = "gguf: " + t.name + " repacked outside its bound: " + std::to_string(dv.over) +
+                                " value(s) over " + std::to_string(req.bound) +
+                                " quantisation step(s), max " + std::to_string(dv.max_steps);
+                    return;
+                }
+                write_verdict(verdict_dir, key, Verdict{dv.max_steps, dv.values});
+            }
+            res.packed = std::move(packed);
+            results[i] = std::move(res);
+        } catch (const std::exception& e) {
+            errors[i] = e.what();
+        }
+    };
+
+    // Largest tensor first: a handful of big projections (the dense model's
+    // largest Q4_K sets) otherwise end up the tail, each finishing alone
+    // after every small tensor's worker has gone idle. Sorting the request
+    // INDICES (not `requests` itself) keeps every result at its own request's
+    // slot in `results`/`errors` regardless of the order they are processed in.
+    std::vector<size_t> order(requests.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        auto size_of = [&](size_t i) -> int64_t {
+            const auto* t = requests[i].tensor;
+            return (t && t->dims.size() >= 2) ? static_cast<int64_t>(t->dims[0]) * static_cast<int64_t>(t->dims[1]) : 0;
+        };
+        return size_of(a) > size_of(b);
+    });
+
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> pool;
+    for (unsigned w = 0; w < actual_workers; ++w)
+        pool.emplace_back([&]() {
+            for (size_t j = next.fetch_add(1); j < order.size(); j = next.fetch_add(1)) process_one(order[j]);
+        });
+    for (auto& w : pool) w.join();
+
+    // Rethrown on the calling thread, in the requests' own order, after every
+    // one of them has been attempted -- not on the first failure, so a
+    // tensor later in the list is not left unprocessed just because an
+    // earlier one (running concurrently) happened to fail first.
+    for (const auto& e : errors)
+        if (!e.empty()) throw std::runtime_error(e);
+    return results;
 }
 
 }  // namespace lgc::gguf

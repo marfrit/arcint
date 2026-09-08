@@ -209,6 +209,18 @@ GgufFile GgufFile::open(const std::string& path) {
     // larger than that (header alone is 24 bytes), so this only guards an
     // input that already failed the size check above in a future edit.
     void* map = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map != MAP_FAILED) {
+        // Read-ahead hints only (POSIX): the loader is about to walk every
+        // repacked tensor's bytes at once (gguf_repack_all, cross-tensor
+        // parallel) rather than one projection's rows at a time, so ask the
+        // kernel to start paging the whole file in now instead of faulting
+        // it in 4 KiB at a time per reader. Both calls may fail (an
+        // unsupported filesystem, ENOSYS) -- a hint that does nothing is not
+        // an error; correctness never depends on it, only how much of the
+        // load is spent waiting on first-touch faults.
+        ::madvise(map, size, MADV_WILLNEED);
+        ::posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+    }
     ::close(fd);
     if (map == MAP_FAILED) {
         throw std::runtime_error(log::format("gguf: mmap failed for '%s'", path.c_str()));

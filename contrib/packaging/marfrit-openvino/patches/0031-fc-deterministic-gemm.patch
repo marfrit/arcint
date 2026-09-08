@@ -1,0 +1,55 @@
+# The f16-activation compressed fully-connected asks oneDNN for a deterministic gemm: the
+# k-parallel strategies its selector takes for skinny row counts accumulate in a varying order
+
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0003-0030. arcint 0.4.4 series (DESIGN.md section 7.0.2br).
+#
+# What changes:
+#   fully_connected_onednn.cpp   In the branch that serves an f16 activation on compressed
+#                       weights (fpmath_mode f16, the GGUF-opened model's repacked projections),
+#                       attr->set_deterministic(true) before the primitive descriptor is built.
+#                       oneDNN's gemm selector (kernel_evaluator.cpp) scores a k-parallel
+#                       strategy -- split-K over work-groups, the partial sums accumulated
+#                       atomically -- best whenever the plain M x N tiling underfills the
+#                       device; the reduction's order then varies run to run and so does the
+#                       output. The deterministic attribute scores every k-parallel entry out
+#                       (infinite cost) and pins the k-parallel-local work-group count to one.
+#                       The int8-activation branch (the IR's dynamic quantisation) is untouched.
+#
+# MEASURED 2026-09-08 on the 24 GB card (the exact mixed form of the dense Qwen3.8-27B Q4_K_M,
+# u8 KV, --mtp off, greedy, four requests of one prompt to one process):
+#   235 tokens: before, five different texts over twelve requests in four processes (MTP and the
+#     logits slice on or off alike); after, one text, 4/4. 145 tokens: 4/4 before and after.
+#   Rates unchanged: 856 tokens warm 1,008 t/s and a 54.1 ms decode step (1,001 / 54.8 before);
+#     71,727 tokens 464 t/s and 73.0 ms (464 / 73.7), the greedy outputs the same at both depths
+#     (23e06c37e0d6, 086d5e71ad47). At 85 and 145 tokens the text changes with the patch (a
+#     different kernel, a near-tie moved): chosen knowingly, the alternative being five texts.
+#   NOT fixed by this patch, recorded as open: (1) at 85 tokens two texts alternate across
+#     requests, in the mixed form and in the native form alike (no runtime gemm on the native
+#     form's projections) and not in the IR -- the GGUF path's own, unattributed; (2) a prompt
+#     of about 190-215 tokens can fault the process in the mixed form at the default prefill
+#     chunk (an engine memory CAT error in the host's kernel log, at 16.5 GiB resident), on 0029
+#     and on this patch alike, not in the native form, not at --prefill-chunk 64, not in the IR;
+#     154-196 and 235 tokens serve -- the runtime's compressed gemm at those row counts is the
+#     one element of every faulting cell; placement-dependent by the pattern.
+1
+--- a/src/plugins/intel_gpu/src/graph/impls/onednn/fully_connected_onednn.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/onednn/fully_connected_onednn.cpp
+@@ -365,6 +365,17 @@
+                 OPENVINO_ASSERT(prim->input_size <= 3, "[GPU] Dynamic quantization for 4D matmul is not implemented");
+             } else {
+                 attr->set_fpmath_mode(dnnl::fpmath_mode::f16, true);
++                // An f16 activation on compressed weights runs oneDNN's own gemm, whose
++                // selector takes a k-parallel strategy (split-K over work-groups, the partial
++                // sums accumulated atomically) whenever the plain M x N tiling underfills the
++                // device; that reduction's order varies run to run, and so does the output --
++                // measured: the same 235-token prompt to one process, five different greedy
++                // texts over twelve requests, while 64 and 856 rows (tilings that fill the
++                // device) are byte-stable. The deterministic
++                // attribute scores every k-parallel strategy out (kernel_evaluator: infinite
++                // cost) and pins the k-parallel-local work-group count to one, before the
++                // primitive descriptor is built from this attr. arcint patch 0031.
++                attr->set_deterministic(true);
+             }
+ 
+             auto weights_layout = impl_params.get_input_layout(1);

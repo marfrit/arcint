@@ -1,3 +1,21 @@
+marfrit-openvino (2026.4.0~dev20260821+p13-1) bookworm trixie; urgency=medium
+
+  * One more patch applied on top of +p12, same upstream commit (71640275),
+    same smallest-sufficient-divergence numbering:
+    - patches/0031: the f16-activation compressed fully-connected (a
+      GGUF-opened model's repacked projections) asks oneDNN for a
+      deterministic gemm. Its selector takes k-parallel strategies for
+      skinny row counts, whose atomic accumulation order varies: the same
+      235-token prompt gave five greedy texts over twelve requests; with
+      the attribute, one text, 4/4. Rates unchanged (856 tokens warm 1,008
+      t/s / 54.1 ms step; 71,727 tokens 464 t/s / 73.0 ms; outputs the
+      same). Open, recorded in the patch header: a two-text alternation at
+      85 tokens on the GGUF path (native form too), and a process fault at
+      about 190-215 tokens in the mixed form at the default prefill chunk.
+      DESIGN 7.0.2br.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Tue, 08 Sep 2026 05:05:00 +0200
+
 marfrit-openvino (2026.4.0~dev20260821+p12-1) bookworm trixie; urgency=medium
 
   * One more patch applied on top of +p11, same upstream commit (71640275),

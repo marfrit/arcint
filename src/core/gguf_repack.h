@@ -109,9 +109,14 @@ bool repack_supported(int32_t ggml_type);
 // mins then share an augmented group per 4 groups (a 128-wide head). Throws
 // std::runtime_error for an unsupported type, a k that is not a whole number
 // of blocks, or a permutation that splits a group. Rows are processed in
-// parallel.
+// parallel: `threads` bounds the pool (0, the default, means today's
+// behaviour -- hardware_concurrency capped at 16, at least 1); every row's
+// result depends only on that row, never on which thread computed it or how
+// many there were, so the output is byte-identical for any `threads` value
+// (gguf_repack_all, below, relies on this to run several tensors' repacks at
+// once with a smaller `threads` each, without changing a single byte).
 RepackedTensor repack_tensor(const GgufFile& file, const TensorInfo& t, const std::vector<int64_t>* column_dest_of = nullptr,
-                             RepackMins mins = RepackMins::Exact);
+                             RepackMins mins = RepackMins::Exact, unsigned threads = 0);
 
 // The min the repacked form carries for main group `g` of row `row` (0 for
 // the types without one). Exact for RepackMins::Exact, the requantised value
@@ -150,7 +155,99 @@ struct RepackDeviation {
     size_t over = 0;
     size_t values = 0;
 };
-RepackDeviation repack_deviation(const GgufFile& file, const TensorInfo& t, const RepackedTensor& r, double step_fraction);
+// `threads` bounds the pool the same way repack_tensor's does (0: today's
+// default). Every value's own deviation depends only on its row, but
+// `rms_steps` is a running sum of squares over all of them -- floating-point
+// addition is not associative, so summing the threads' partial sums in
+// thread order (as repack_tensor's row writes never needed to) would make
+// the RMS depend on how many threads happened to run. Rows are instead
+// reduced into their OWN slot and merged in row order, 0 to n-1, once every
+// thread has joined: a fixed order no matter how many threads did the work,
+// so max_steps, rms_steps, over and values are all byte-identical for any
+// `threads` value (the determinism invariant, DESIGN §3.4, applied to a
+// load-time measurement rather than a served token).
+RepackDeviation repack_deviation(const GgufFile& file, const TensorInfo& t, const RepackedTensor& r, double step_fraction,
+                                 unsigned threads = 0);
+
+// One tensor to repack and verify at load, gathered up front by the caller
+// (gguf_apply_to_template builds one of these per projection it will
+// repack) so gguf_repack_all needs nothing from the graph itself.
+// `column_dest_of` empty means the file's own column order. `bound` is the
+// deviation bound in quantisation steps THIS tensor's check is scored
+// against -- repack_bound_steps(tensor->ggml_type), doubled under
+// RepackMins::Split; picking it is the caller's job, not this function's.
+struct RepackRequest {
+    const TensorInfo*     tensor = nullptr;
+    std::vector<int64_t>  column_dest_of;
+    double                bound = 0.0;
+};
+
+// One tensor's outcome from gguf_repack_all: the repacked form, and its
+// deviation verdict -- freshly measured this call (max_steps/over_bound/
+// checked filled in, verdict_cached false) or read from an earlier load's
+// verdict file for the same bytes and bound (max_steps only, the others left
+// at zero, verdict_cached true) -- gguf_apply_to_template's summary counts
+// verdict_cached results apart from freshly-checked ones, as it always has.
+struct RepackResult {
+    RepackedTensor packed;
+    double         max_steps = 0.0;
+    size_t         over_bound = 0;
+    size_t         checked = 0;
+    bool           verdict_cached = false;
+};
+
+// The repack + deviation-check loop of gguf_apply_to_template
+// (src/exec/gguf_graph.cpp, DESIGN §7.0.2ba/§7.0.2bd), factored out so it
+// runs device-free and is testable without OpenVINO (tests/test_gguf_
+// parallel.cpp). Every request is repacked and, on a verdict-cache miss
+// (`verdict_dir` + `file_path`, keyed by the file's size/mtime, the tensor's
+// offset/type/dims and `bound` -- gguf_apply_to_template's own scheme,
+// unchanged), checked against its own bound; a request over its bound that
+// the caller marked as unforgiving by passing `mins` as Exact or Split is an
+// error, collected here and thrown after every request has been attempted
+// (not on the first failure) naming the tensor -- the exact message
+// gguf_apply_to_template used to throw inline before this was pulled out of
+// the graph pass. `mins == Shared || mins == Nibble` never refuses: the
+// deviation is reported in the result instead (DESIGN 7.0.2bl's chosen
+// cost). A tensor whose repack_tensor call itself throws (an unsupported
+// type, a k that is not a whole number of blocks, a permutation that splits
+// a group) fails the same way, with that exception's own message.
+//
+// The graph edits that follow a repack (permuting rows for a value-head
+// reorder, building the MatMul, and everything else gguf_apply_to_template
+// does per tensor) are NOT this function's job and stay on the calling
+// thread, walking `requests` (or rather the caller's own list of tensors, of
+// which `requests` is the repacked subset) in their original order -- this
+// function only produces the per-tensor RepackedTensor and verdict that
+// walk then consumes.
+//
+// `threads` bounds the pool of workers that take whole requests off the
+// list concurrently (0, the default, means hardware_concurrency, at least
+// 1); the pool never grows past the number of requests, so one request gets
+// one worker rather than `threads` of them idling. Each worker then calls
+// repack_tensor / repack_deviation with a SMALLER intra-tensor thread count:
+// today's default (hardware_concurrency capped at 16) divided by the ACTUAL
+// worker count the pool ran with, not the raw requested `threads` -- so a
+// single request gets the whole per-request budget instead of repacking
+// single-threaded because a caller happened to pass a large `threads`. That
+// keeps workers * intra <= min(hardware_concurrency, 16) whenever the pool
+// has 16 or fewer workers; with more than 16 requests in flight, intra sits
+// at its floor of 1 and the OS thread total climbs past that ceiling, one
+// thread per extra worker. Requests are taken off the list largest-tensor-
+// first (row count * width), so a few big tensors are not left as the tail,
+// each finishing alone after every small one's worker has gone idle.
+std::vector<RepackResult> gguf_repack_all(const GgufFile& file, const std::vector<RepackRequest>& requests,
+                                          RepackMins mins, const std::string& verdict_dir,
+                                          const std::string& file_path, unsigned threads = 0);
+
+// The per-type bound on the repack's deviation of the main columns, in
+// quantisation steps: the plugin's half arithmetic rounds every value
+// (|q - zp| * 2^-11 steps) and, for the K types, the group's own scale
+// (another |q| * 2^-11); the mins are exact. Moved here from gguf_graph.cpp
+// so gguf_repack_all's callers (the graph pass) and its tests share one
+// definition. Doubling it under RepackMins::Split (the min product's own f16
+// rounding, gguf_repack.h's file comment above) is the caller's choice.
+double repack_bound_steps(int32_t ggml_type);
 
 // The served computation for one activation row on the host, f16 roundings
 // emulated (the widened activation, the plain multiply-accumulate in f32):
