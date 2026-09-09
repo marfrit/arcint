@@ -2,6 +2,7 @@ build*/
 *.o
 __pycache__/
 .cache/
+tools/flash-next-watch.log
 CLAUDE.local.md
 *.local.md
 .claude/
