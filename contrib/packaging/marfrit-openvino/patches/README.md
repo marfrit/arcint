@@ -770,8 +770,11 @@ patterns 0033 exercises for the served shape. No kernel change; 0033's
 infrastructure (discriminating fill, permuted page tables, float reference,
 1e-2 tolerance) carries this shape as-is.
 
-Not yet measured — awaits a GPU window. build-m18 (`ENABLE_TESTS=ON`) is the
-executing tree.
+**MEASURED 2026-09-09: 7/7 cells PASS.** RED-C-03 CLOSED GREEN. The "fits,
+unverified" verdict for 0010/0020/0032/0033 at Flash-Next's shape becomes
+"fits, verified by measurement." Three pre-existing BY_TOKEN failures in
+the 0035 suite (original geometry, "reverse" page order) are the known
+block-size gate from 0034, not flash-next related.
 
 ## Deliberately NOT applied
 

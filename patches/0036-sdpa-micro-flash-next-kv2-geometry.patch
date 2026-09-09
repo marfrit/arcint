@@ -27,8 +27,12 @@
 # FIX C audit becomes "fits, verified" and RED-C-03 closes green. If any case fails, the failure
 # output is the finding, and the kernel fix is the next patch.
 #
-# MEASURED: not yet -- awaits a GPU window. Verified: patch applies cleanly to ovsrc-m18
-# (dry-run 2026-09-09, ENABLE_TESTS=ON confirmed in build-m18/CMakeCache.txt).
+# MEASURED 2026-09-09: 7/7 flash-next cells PASS at 1e-2 tolerance (ascending, reversed,
+# gapped page orders). RED-C-03 CLOSED GREEN. The "fits, unverified" verdict becomes
+# "fits, verified" -- GQA group size 12 at (24, 2, 256) exercises every stride and
+# alignment path. Run on build-m18 (ENABLE_TESTS=ON), ovsrc-m18, dev host GPU.
+# 3 pre-existing BY_TOKEN failures (0035 suite, original geometry, "reverse" page order)
+# are the known block-size gate from patch 0034, not flash-next related.
 
 --- a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
 +++ b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
