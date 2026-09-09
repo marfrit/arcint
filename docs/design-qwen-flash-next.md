@@ -1088,3 +1088,43 @@ actually apples-to-apples.
   specifically (the table's right column) — the methodology and left
   column are landable now; the right column's actual Flash-Next figures
   are not.
+
+## §6 — MoE GGUF is not served: exact refusal path
+
+The FIX B delta table's parenthetical ("MoE GGUF not served, §6") and
+`model_requirements.md` §6 both name this gap. This section records the
+exact loader behaviour, verified from code, not documentation:
+
+**The GGUF serving path refuses a MoE file at the architecture gate.**
+`gguf_geometry()` (`src/core/gguf_map.cpp:41-42`) checks
+`general.architecture` from the file's metadata against the only accepted
+value, `"qwen35"` (stage 1, dense):
+
+    if (arch != "qwen35")
+        throw std::runtime_error(
+            "gguf: architecture '" + arch + "' is not served "
+            "(stage 1 serves qwen35)");
+
+A MoE file from the served family declares `general.architecture =
+"qwen35moe"`. The check is a hard `std::runtime_error` throw before any
+tensor matching or weight reading begins — not a silent fallback.
+
+A second refusal would fire if the architecture gate were bypassed:
+`gguf_apply_to_template()` (`src/exec/gguf_graph.cpp:318`) throws for any
+IR constant whose module name has no entry in `kLayerModules`
+(`gguf_map.cpp:22-35`). That table maps only the dense MLP projections
+(`ffn_gate`, `ffn_up`, `ffn_down`); MoE expert tensors (`ffn_gate_exps`,
+`ffn_up_exps`, `ffn_down_exps`, `ffn_gate_inp`, shared-expert variants)
+are absent, producing `gguf_module_map() == nullptr` and the throw:
+
+    if (!found) throw std::runtime_error(
+        "gguf: no tensor map for IR constant " + name);
+
+**Consequence for FIX 8.2**: the artifact
+`Qwen3.6-27B-A3B-Coder-Q4_K_S.gguf` (14.03 GiB, MoE, `qwen35moe`) is
+refused at `gguf_geometry()`. The dense `Qwen3.8-27B-UD-Q3_K_XL.gguf`
+on the dev host is also ruled out: Q3_K is in `model_requirements.md` §6's
+own "not yet served" list (stages 2/3). The served case for the 16 GiB
+card is a Q4_K_S requant of the on-disk `Qwen3.8-27B-Q4_K_M` (17.1 GB)
+via `llama-quantize` on the dev host (target ≤ 14.5 GiB, no fetch needed),
+which passes the architecture gate and fits within the card's budget.

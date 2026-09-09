@@ -1,0 +1,73 @@
+# RED-C-03: the Flash-Next full-attention geometry (24 query heads, 2 KV heads, head_dim 256) has
+# never been run through the u8:i4 paged-attention/micro-SDPA regression harness. Every measured
+# cell uses one of two shapes -- (24, 4, 256) from the dense/agent and (16, 2, ~128) from the
+# MoE/coder -- but Flash-Next combines the query-head/head_dim pair from the dense shape with the
+# KV-head count from the MoE shape: a GQA group size of 12 that no test exercises. Patch 0033's
+# own history (a real alignment bug invisible to a geometry-blind test suite until the fill was
+# redesigned) is the standing counter-example to "parameterized code is safe by inspection" in
+# this exact kernel family.
+#
+# Mechanism: adds a u8i4_mixed_micro_flash_next factory (num_kv_heads = 2, all else identical to
+# u8i4_mixed_micro_served which uses num_kv_heads = 4) and instantiates it under the same three
+# page orders 0033 already exercises for the served shape. The harness infrastructure (permuted
+# page tables, discriminating fill, float reference, 1e-2 tolerance) is unchanged from 0033.
+#
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0003-0035. arcint 0.5.0 series (design-qwen-flash-next.md FIX C addendum).
+#
+# What changes:
+#   paged_attention_gpu_test.cpp   One factory (u8i4_mixed_micro_flash_next: 24 heads, 2 KV heads,
+#                                  head 256, the Flash-Next full-attention layer geometry) and its
+#                                  instantiation under ascending, reversed, and gapped page tables.
+#                                  No kernel change, no harness change -- 0033's infrastructure
+#                                  carries this shape as-is.
+#
+# RED FIRST: this patch must be built and run BEFORE any kernel fix. If the (24, 2, 256) shape
+# passes at 1e-2 tolerance on all three page orders, the "fits, unverified" verdict from the
+# FIX C audit becomes "fits, verified" and RED-C-03 closes green. If any case fails, the failure
+# output is the finding, and the kernel fix is the next patch.
+#
+# MEASURED: not yet -- awaits a GPU window. Verified: patch applies cleanly to ovsrc-m18
+# (dry-run 2026-09-09, ENABLE_TESTS=ON confirmed in build-m18/CMakeCache.txt).
+
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
+@@ -127,6 +127,20 @@
+     return p;
+ }
+
++// arcint (patch 0036, RED-C-03): Flash-Next full-attention geometry -- 24 query heads, 2 KV
++// heads, head_dim 256 -- a GQA group size of 12 that no prior test exercises. The served factory
++// above uses num_kv_heads = 4 (group size 6); this is the only difference.
++static paged_attention_test_params u8i4_mixed_micro_flash_next(std::vector<SubsequenceDescriptor> subsequences,
++                                                                const char* page_order = "") {
++    paged_attention_test_params p = u8i4_mixed_micro_params(subsequences);
++    p.num_heads = 24;
++    p.num_kv_heads = 2;
++    p.k_head_size = 256;
++    p.v_head_size = 256;
++    p.page_order = page_order;
++    return p;
++}
++
+ // arcint (patch 0034): patch 0020 declines four-bit values under BY_TOKEN keys, on a 2026-09-05
+ // measurement of NaN past 128 keys. Re-measured 2026-09-08 with 0033's discriminating fill, on the
+ // 24 GB card, and the decline was NOT lifted -- because the same by-token cases fail with EIGHT-bit
+@@ -294,7 +308,16 @@
+                       u8i4_mixed_micro_served({{2, 145}}, "reverse"),
+                       u8i4_mixed_micro_served({{2, 145}}, "gap"),
+                       u8i4_mixed_micro_served({{3, 1000}}),
+-                      u8i4_mixed_micro_served({{3, 1000}}, "reverse")));
++                      u8i4_mixed_micro_served({{3, 1000}}, "reverse"),
++                      // arcint 2026-09-09 (RED-C-03): Flash-Next full-attention geometry
++                      // (24 heads, 2 KV heads, head 256) under the three page orders.
++                      u8i4_mixed_micro_flash_next({{2, 130}}),
++                      u8i4_mixed_micro_flash_next({{2, 130}}, "reverse"),
++                      u8i4_mixed_micro_flash_next({{2, 130}}, "gap"),
++                      u8i4_mixed_micro_flash_next({{2, 145}}, "reverse"),
++                      u8i4_mixed_micro_flash_next({{2, 145}}, "gap"),
++                      u8i4_mixed_micro_flash_next({{3, 1000}}),
++                      u8i4_mixed_micro_flash_next({{3, 1000}}, "reverse")));
+
+ // arcint (patch 0035): the by-token key-fill fix -- the constant fill overflowed fp16 zp in
+ // quantize_data(); the per-dimension ramp keeps every token's range meaningful (DESIGN 7.0.2br).

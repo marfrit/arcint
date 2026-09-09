@@ -751,6 +751,28 @@ instantiation contributes 0 runs. Served unchanged: 825b1747 on three requests
 of the agent configuration's 130-token prompt, and the equivalence suite passes
 on both units' configurations.
 
+### 0035-sdpa-by-token-test-key-fill.patch
+
+Test-only: fixes the BY_TOKEN test harness's key fill (constant per-dimension →
+per-dimension linear ramp, the same correction FIX 2 applied to the value fill).
+No kernel change, no served behaviour change. Part of 0034's measurement pass.
+
+### 0036-sdpa-micro-flash-next-kv2-geometry.patch
+
+RED-C-03: Flash-Next's full-attention geometry (24 query heads, 2 KV heads,
+head_dim 256) through the u8:i4 paged-attention/micro-SDPA regression harness.
+Every prior cell uses `(24, 4, 256)` (dense/agent) or `(16, 2, ~128)`
+(MoE/coder); Flash-Next is a third combination — GQA group size 12 — that no
+test exercises. One factory function (`u8i4_mixed_micro_flash_next`, identical
+to 0033's `u8i4_mixed_micro_served` with `num_kv_heads` changed from 4 to 2),
+seven instantiations under ascending, reversed and gapped page tables, the same
+patterns 0033 exercises for the served shape. No kernel change; 0033's
+infrastructure (discriminating fill, permuted page tables, float reference,
+1e-2 tolerance) carries this shape as-is.
+
+Not yet measured — awaits a GPU window. build-m18 (`ENABLE_TESTS=ON`) is the
+executing tree.
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.
