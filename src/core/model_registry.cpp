@@ -200,6 +200,31 @@ std::vector<ModelEntry> build_registry() {
         r.push_back(std::move(e));
     }
 
+    {
+        // Qwen3.5-2B: the smallest dense qwen3_5 checkpoint, exported for FIX 8.2
+        // (GGUF serving on the 16 GiB card). Hybrid architecture: 18 linear-attention
+        // + 6 full-attention layers. Hashes unpinned until first successful load.
+        ModelEntry e;
+        e.id                      = "qwen3.5-2b";
+        e.family                  = "qwen3.5";
+        e.artifact_aliases        = {"qwen35-2b-ov"};
+        e.ov_arch                 = "Qwen3_5ForConditionalGeneration";
+        e.model_type              = "qwen3_5";
+        e.moe                     = false;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = false;
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2048;
+        e.n_expert                = 0;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 24;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
     return r;
 }
 

@@ -896,6 +896,35 @@ What to measure, concretely:
   calculation actually needs to stay honest under contention — see
   "DRAM contention with FIX D" below.
 
+**DRAM read bandwidth measurement (2026-09-10, dev host = 5700X 8-core,
+DDR4, 8 of 16 logical cores online in the container):**
+
+| Workload     | Threads | Buffer  | MB/s aggregate | MB/s per thread |
+|--------------|---------|---------|---------------:|----------------:|
+| memcpy       |       1 | 256 MiB |         20,025 |          20,025 |
+| memcpy       |       6 | 256 MiB |         35,267 |           5,878 |
+| memcpy       |       1 | 1 GiB   |         19,363 |          19,363 |
+| memcpy       |       6 | 1 GiB   |         37,435 |           6,239 |
+| AVX2 dequant |       1 | 256 MiB |          9,405 |           9,405 |
+| AVX2 dequant |       6 | 256 MiB |         41,699 |           6,950 |
+| AVX2 dequant |       1 | 1 GiB   |          9,394 |           9,394 |
+| AVX2 dequant |       6 | 1 GiB   |         46,423 |           7,737 |
+
+Method: `gcc -O2 -mavx2 -mf16c -mfma`, pinned threads (cores
+1,3,4,6,8,10), buffers allocated with `aligned_alloc(64)`, 2 warmup + 8
+measured iterations (best of 8). Dequant kernel: Q4_0-style (18-byte
+blocks, f16 scale + 16 packed-nibble bytes → AVX2 widen + FMA,
+accumulate to registers, no write-back — pure source-read bandwidth).
+memcpy is read+write (measures DDR4 channel saturation including the
+write-back traffic the dequant path avoids).
+
+Key numbers for FIX E's crossover: single-thread dequant reads the
+source buffer at **9.4 GB/s** (compute-bound — below the ~20 GB/s
+single-thread memcpy, so the ALU is the bottleneck, not DRAM). At 6
+threads the aggregate dequant throughput is **42–46 GB/s** (exceeds
+memcpy's 35–37 GB/s because dequant has no write-back traffic). A
+256 MiB expert slab takes ~27 ms to dequant on 1 core, ~6 ms on 6.
+
 The crossover point `q*` FreeToken derives (paper's own term, `q* ~=
 m·B_P/B_H` where `m` is the expert's byte size) becomes, once both rates
 are measured on arcint's own hardware and kernel: below `q*` tokens
@@ -1171,6 +1200,70 @@ before KV pool or scratch allocation.
 (b) a Q4_K_S requant of the 27B (~14.5 GiB target) — which is marginal
 at best given VRAM overhead beyond raw weights. Neither path is zero-prep;
 the "remaining assumption" from the metadata check is answered: refusal.
+
+**Path (a) attempted (2026-09-10):** A 2B template IR was exported via
+optimum-intel 2.1.0 (`OVModelForVisualCausalLM`, transformers 5.2.0) to
+the multi-component layout arcint expects (language_model, text_embeddings,
+tokenizer, detokenizer, chat_template). The 2B was added to the model
+registry (`qwen35-2b-ov`, `n_layer = 24`, `n_embd = 2048`,
+`full_attention_interval = 4`). The GGUF file loaded — geometry matched,
+the process compiled and served on GPU.1 (1.76 GiB device-resident, 9.1 s
+compile). However: **0 projections repacked** (0 repacked, 0 native rows).
+The GGUF contributed only the embedding rows (Q6_K, 248320 × 2048,
+397 MiB) and 79 norm comparisons; all projection weights served from the
+template's int8_asym constants.
+
+Root cause: `gguf_apply_to_template` matches weight constants by the
+`_openvino_orig_weight` suffix, which the AWQ export path produces. The 2B
+IR was exported with optimum-intel's default int8_asym per-channel
+quantisation, which does not create these marker constants. The 27B's 497
+repacked projections work because that artifact was AWQ-quantised. The 2B
+needs an AWQ export (or the export must otherwise preserve the original
+weight constants with the marker suffix) for GGUF projection replacement
+to function.
+
+**Marker forensics (2026-09-10):** The 27B artifact's `openvino_config.json`
+records `quant_method: "awq"`, `bits: 4`, `group_size: 64`, `sym: false`,
+`ratio: 1.0`, `optimum_version: "2.3.0"`, `transformers_version: "5.2.0"`,
+`dataset: "fleetcode"`, `num_samples: 32`. The AWQ weight-compression pass
+(implemented by NNCF, invoked through optimum-intel's
+`OVWeightQuantizationConfig`) inserts FakeQuantize nodes around each
+projection constant; the original weight gets the `_openvino_orig_weight`
+suffix, and the FQ subgraph carries `/scale`, `/zero_point`,
+`/fq_weights_1`. The 27B has 2,485 such constants = 497 projections × 5
+FQ components each. The 2B's bare `OVModelForVisualCausalLM.from_pretrained
+(export=True)` (no `quantization_config`) produced int8_asym constants
+folded directly, with no FakeQuantize subgraph and no marker suffix.
+
+**2B AWQ re-export attempts (2026-09-10):** Three paths tried, all blocked:
+
+1. *Python API, CausalLM path* (`OVModelForCausalLM` +
+   `OVWeightQuantizationConfig(quant_method="awq", bits=4, dataset="wikitext2")`):
+   export succeeds, produces int4-compressed weights, but 0
+   `_openvino_orig_weight` constants. The CausalLM path folds compressed
+   weights directly without FakeQuantize subgraphs.
+
+2. *CLI, VL path with local corpus* (`optimum-cli export openvino --task
+   image-text-to-text --awq --dataset ~/fleetcode`): rejected by
+   optimum-intel 2.3.0's `OVWeightQuantizationConfig.post_init()` which
+   validates dataset names against a hardcoded allowlist — visual LLMs
+   accept only `{'contextual'}`, LLMs accept `{'c4', 'c4-new', 'auto',
+   'gsm8k', 'wikitext2'}`. The 27B's `"dataset": "fleetcode"` predates
+   this validation.
+
+3. *CLI, VL path with predefined dataset* (`--dataset contextual`):
+   `contextual` is deprecated and falls back to `textvqa`, which hits a
+   `video_processor_class` NoneType error in transformers 5.2.0 (the
+   Qwen3.5 processor has no video processor class attribute).
+
+**Root cause:** the `_openvino_orig_weight` naming is produced only by the
+VL export pipeline's FakeQuantize insertion, but that pipeline's calibration
+path is broken for Qwen3.5 on the current toolchain. The CausalLM path
+compresses correctly but uses different constant naming that
+`gguf_apply_to_template` does not match. Fix options: (a) patch
+optimum-intel to accept local datasets for VL models, (b) backport to the
+optimum-intel version used for the 27B, or (c) extend `gguf_map.cpp` to
+match the CausalLM path's constant names.
 
 **Optional follow-on stress case** (if path (b) is pursued): a Q4_K_S
 requant of the on-disk `Qwen3.8-27B-Q4_K_M` (17.1 GB → target ≤ 14.5 GiB)

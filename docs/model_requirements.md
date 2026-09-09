@@ -173,9 +173,15 @@ MTP state and drafters). Compute-runtime
 ## 6. Not supported / not measured
 
 - safetensors (GPTQ, NVFP4): wrong format, not loaded. GGUF: Q4_K/Q5_K/
-  Q6_K/Q8_0 projections served natively on a template IR (dense `qwen35`,
-  0.4.0 stage 1); MoE files and the sub-4-bit types (IQ4_XS, IQ3_S,
-  IQ3_XXS, Q3_K) are stages 2 and 3, not yet served.
+  Q6_K/Q8_0 projections served from GGUF on a template IR (dense `qwen35`,
+  0.4.0 stage 1) **only when the IR carries `_openvino_orig_weight`
+  FakeQuantize markers** — produced by optimum-intel's AWQ weight-compression
+  export path (NNCF). An IR exported without weight compression (default
+  int8_asym) loads and serves, but all projections come from the template's
+  own constants; the GGUF contributes only embeddings and norms (0
+  projections repacked — measured on the 2B, 2026-09-10). MoE files and the
+  sub-4-bit types (IQ4_XS, IQ3_S, IQ3_XXS, Q3_K) are stages 2 and 3, not
+  yet served.
 - A plain-cast `q8` KV (no scales): refused as "quietly worse."
 - INT3/INT2 expert weights: study owed, no kernel, no allowlist entry.
 - `q8` weight format: accepted by the flag, no acceptance run found.
