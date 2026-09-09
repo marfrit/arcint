@@ -388,18 +388,147 @@ exists to compile and inspect.
   ceiling estimate), not a measured card run -- there is no Flash-Next
   artifact to load and no plateau probe to run against one yet.
 
+### FIX C addendum (2026-09-09): synthetic-fixture buildability audit
+
+The "un-runnable until a Flash-Next IR exists" verdict above was too broad.
+Every GDN kernel red case in the 0021-0030 patch series was written as a
+synthetic fixture -- a toy graph or toy test-harness geometry built by hand,
+never a real export -- and the same is true of most of FIX C's own red
+cases once each is checked against the test infrastructure that would carry
+it, rather than assumed blocked by analogy to RED-C-01/RED-C-04. Read for
+this pass: `tests/test_gguf_graph.cpp` (arcint's own synthetic-`ov::Model`
+IR-pass tests, CPU-only, no device), `contrib/packaging/marfrit-openvino/
+patches/README.md` and the 0032-0035 patch diffs themselves (the OpenVINO
+GPU plugin's own unit-test harness), and the state of `~/ovsrc` and
+`~/ovsrc-pkg` on the dev host.
+
+**RED-C-03 -- buildable today, and the concrete shape is now known.** The
+paged-attention/micro-SDPA regression harness this case names does not live
+in this repository at all: it is `src/plugins/intel_gpu/tests/unit/
+test_cases/paged_attention_gpu_test.{h,cpp}` inside the pinned OpenVINO
+tree, carried forward by patches 0032-0035. That harness builds its KV
+cache, block tables and reference output entirely from test parameters
+(`num_heads`, `num_kv_heads`, `k_head_size`, `v_head_size`, a subsequence
+list, a page order) -- it never touches an exported IR or a real checkpoint.
+Patch 0033 already added the served-geometry case as a small static
+factory:
+
+    static paged_attention_test_params u8i4_mixed_micro_served(...) {
+        paged_attention_test_params p = u8i4_mixed_micro_params(subsequences);
+        p.num_heads = 24; p.num_kv_heads = 4;
+        p.k_head_size = 256; p.v_head_size = 256;
+        p.page_order = page_order;
+        return p;
+    }
+
+RED-C-03's cell is the same factory with `num_kv_heads = 4` changed to `2`,
+instantiated under the same three page orders (`""`, `"reverse"`, `"gap"`)
+0033 already exercises for the served shape, and compared to the harness's
+own float reference at the suite's existing 1e-2 tolerance -- exactly the
+pattern already in `INSTANTIATE_TEST_SUITE_P(..., paged_attention_
+u8i4_mixed_micro_test, ...)`. No Flash-Next export, no `qwen4_exp`
+transformers support, and no change to arcint's own `tests/` tree are
+needed; the fixture is a few dozen lines added as a new numbered patch
+(e.g. `0036-...`) touching only `paged_attention_gpu_test.{h,cpp}`, the
+same file pair 0032-0035 already touch. This is *not* a job for
+`test_gguf_graph.cpp` or a new file in arcint's own `tests/`: that file
+exercises `src/exec/gguf_graph.cpp`'s IR-rewrite pass (CPU-only, no kernel
+dispatch), which the paged-attention kernel path never goes through --
+`gguf_graph.cpp` and `paged_attention_gpu_test.cpp` are different
+codebases (this repository vs. the patched OpenVINO tree) testing different
+layers (graph rewrite vs. compiled-kernel correctness).
+
+What is genuinely missing is infrastructure, not geometry: `~/build-ov-
+selftest` does not exist on the dev host, and `~/ovsrc/build-dbg` is a
+stale, barely-configured tree (370 MiB, no `ov_gpu_unit_tests` binary,
+default `-DENABLE_TESTS=OFF` per `build-openvino.sh`). Every prior red case
+in 0015-0035 was validated by reconfiguring a *separate* build of `~/ovsrc`
+(or a scratch copy) with `-DENABLE_TESTS=ON` and building the
+`ov_gpu_unit_tests` target by hand each time -- there is no persisted
+test-enabled tree to build against today. Standing that build up (and
+running it under the test-window ritual, since it needs a free GPU) is the
+actual next step, not an IR export.
+
+**RED-C-02 -- also buildable today, no export needed.** The plateau probe
+(`MOE_OTD_PERF_LOG`) and the offload-ratio machinery it drives
+(`expert_slot_bytes` in `fit.h`) take `num_expert`, `per_expert_bytes` and
+`moe_layers` as plain parameters; nothing in the probed path reads a
+compiled Flash-Next graph. A synthetic 512-expert configuration at
+Flash-Next's own `per_expert_bytes` (2,457,600 B, from the Fit section
+above) and `--offload-ratio` in the high 80s/low 90s is expressible without
+any checkpoint. Not audited further in this pass beyond confirming the
+inputs are synthesizable; the actual probe run still needs both GPUs free
+(the test-window ritual) and was not executed here.
+
+**RED-C-01 and RED-C-04 -- genuinely blocked, but not for the reason
+stated.** Both read as "un-runnable until IR exists" in the table above,
+and that remains correct, but the mechanism is narrower than "no IR": both
+tests hinge on a fact only a real exporter run can supply. RED-C-01 asks
+whether the *actual* trailing dims Flash-Next's exporter produces for the
+GDN head-swap reshape land on the hardcoded literal `[.., 32, 128]` in
+`route_head_swap_permutes` -- a synthetic graph can be built with any
+trailing dims we choose, including `[.., 32, 128]` itself, but that would
+only prove the pass matches what we assumed, not what the real exporter
+emits; the open question is the exporter's behavior, which cannot be
+synthesized. RED-C-04 is the same shape of gap: it asks whether a real QSA/
+indexer export contains an op this repository's passes do not recognize,
+and a hand-built graph can trivially be made to contain (or not contain)
+an unrecognized op either way, again proving nothing about what the real
+exporter does. A synthetic fixture *can* still exercise the general refusal
+mechanism itself (feed `load_artifact` a synthetic `config.json` carrying
+the indexer keys alongside a graph with a deliberately-unrecognized op, and
+assert refusal-by-name rather than silent fallback) -- that is worth
+building as a mechanism test, but it is a weaker claim than RED-C-04 as
+written, which is about what the real exporter's output actually contains.
+
+**RED-C-05 -- likely buildable, not attempted in this pass.** The claim is
+that `fit.h`'s MTP-state charge should be derived from compiled
+`conv_state_table.`/`gated_delta_state_table.`-prefixed tensor shapes the
+way `kv_bytes_token_` already is (`backend_ov.cpp:3150-3294`), not from the
+`kMtpStateBytesPerToken = 8192` literal. Since that derivation already
+walks the compiled model's own tensors by name/prefix generically, a
+synthetic `ov::Model` carrying result tensors named with those prefixes at
+a chosen (non-dense-drafter) shape should be enough to exercise it, in the
+same style as `test_gguf_graph.cpp`'s toy templates. Not read closely enough
+in this pass to commit to the exact fixture shape; flagged as the next one
+to scope, not as blocked.
+
+**Summary**: of FIX C's five red cases, RED-C-02 and RED-C-03 are buildable
+as synthetic fixtures today with no export dependency (RED-C-03's shape is
+now fully specified above), RED-C-05 is likely buildable pending a closer
+read of `backend_ov.cpp:3150-3294`, and RED-C-01/RED-C-04 remain genuinely
+blocked on a real export -- not because no test infrastructure exists, but
+because the fact under test (what the real exporter actually emits) cannot
+be conjured synthetically without begging the question. Test code itself
+is not written as part of this pass, per instruction; this is the
+buildability assessment to review before it is.
+
 ## FIX A — Export harness and upstream blocker
 
-**The blocker.** `Qwen/Qwen3.8-Flash-Next` reports `model_type: qwen4_exp`,
-`architectures[0]: Qwen4ExpForConditionalGeneration`. No transformers
-release carries a `qwen4_exp` modeling module — `import
-transformers.models.qwen4_exp` fails with `ModuleNotFoundError` against
-every pinned version checked so far. optimum-intel's export path
-(`OVModelForCausalLM.from_pretrained(..., export=True)`) resolves the
-architecture through transformers' model-type registry, so it fails the
-same way, one layer up. There is no export path for this checkpoint today.
-This is upstream's gap: nothing in arcint's own code is implicated, and
-nothing here is fixable by editing this repository.
+**The blocker (updated 2026-09-09).** Two upstream gaps, not one. The
+original framing ("no transformers release carries qwen4_exp") was stale:
+HF Transformers contributed `qwen4_exp` on 2026-08-26 (PR #48337), and
+`transformers.models.qwen4_exp` imports cleanly in transformers 5.17.0.
+The actual blocker chain, verified in a fresh venv on the dev host:
+
+  1. **optimum-intel 2.1.0 pins `transformers<5.6,>=4.51`.**
+     `pip install optimum-intel` resolves to transformers 5.5.4, which does
+     NOT carry `qwen4_exp` (`ModuleNotFoundError` on import). The cap is
+     an explicit `<5.6` in optimum-intel's own requirements, not a solver
+     accident.
+
+  2. **Force-upgrading transformers to 5.17.0 breaks optimum-intel 2.1.0
+     at import time.** The crash site is
+     `optimum.intel.openvino.modeling_visual_language` (line 40), which
+     does `from transformers.models.qwen2_vl.modeling_qwen2_vl import
+     Qwen2VLModel, VisionRotaryEmbedding` — `VisionRotaryEmbedding` was
+     removed or renamed in transformers 5.17.0, so the import fails with
+     `ImportError: cannot import name 'VisionRotaryEmbedding'`. This
+     triggers before any qwen4_exp code path is reached: the
+     `OVModelForCausalLM` import itself crashes.
+
+Both gaps are upstream (optimum-intel's version cap and its stale
+qwen2_vl import); nothing in arcint's own code is implicated.
 
 **The harness.** `tools/export_flash_next.py` is landed and runs today. It
 checks transformers-support before touching the network: import
@@ -446,16 +575,23 @@ operator infrastructure and belongs in `CLAUDE.local.md`, not here.
 `qwen4_exp` by then, the operator picks (a) or (b) — this memo does not
 decide it.
 
-**Current status (2026-09-09):** harness exists and its red case is
-verified (both failure modes — transformers absent, and transformers
-present without `qwen4_exp` — were exercised directly; the exact-reason
-assertion fires and the script exits 1). Watcher is registered
-(`tools/watch_flash_next_export.py`, log path `tools/flash-next-watch.log`,
-suggested weekly cadence in its docstring) but not yet added to any
-crontab — that step is operator-side, tracked in `CLAUDE.local.md`.
-Neither of the two options above has been chosen; none of this repository's
-other Flash-Next work (FIX B's delta table above, FIX C's kernel audit,
-FIX D's n-gram offload) waited on this decision.
+**Current status (2026-09-09):** harness exists. The transformers-support
+check gate fires and exits 1 under the production venv (transformers 5.5.4,
+capped by optimum-intel 2.1.0's `<5.6` pin). Under a force-upgraded venv
+(transformers 5.17.0), the gate passes but `OVModelForCausalLM` import
+crashes immediately (`ImportError: cannot import name
+'VisionRotaryEmbedding'` from `transformers.models.qwen2_vl` -- stale
+optimum-intel import, not a qwen4_exp issue). Both blockers are upstream;
+the export path is unblocked when optimum-intel releases a version that
+both lifts the `transformers<5.6` cap and fixes its own
+`modeling_visual_language.py` imports.
+
+Watcher (`tools/watch_flash_next_export.py`, log path
+`tools/flash-next-watch.log`, suggested weekly cadence in its docstring)
+is not yet added to any crontab — that step is operator-side, tracked in
+`CLAUDE.local.md`. Neither of the two options above has been chosen; none
+of this repository's other Flash-Next work (FIX B's delta table above,
+FIX C's kernel audit, FIX D's n-gram offload) waited on this decision.
 
 ## FIX D — N-gram table host-offload and dequantise-on-gather
 

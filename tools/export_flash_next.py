@@ -8,20 +8,22 @@ plan. The plan is the ordinary path every other served architecture in this
 repo's allowlist went through -- optimum-intel's OVModelForCausalLM export,
 which needs transformers to recognise the architecture first.
 
-It does not, as of this writing: qwen4_exp / Qwen4ExpForConditionalGeneration
-has no modeling module in the pinned transformers. That is upstream's gap,
-not arcint's, and this script's whole job while the gap stands is to refuse
-loudly and specifically, naming exactly what is missing and what version was
-checked, so the refusal is legible to a script (tools/watch_flash_next_export.py)
-and to a person without reading a traceback.
+Two upstream gaps block this as of 2026-09-09: optimum-intel 2.1.0 pins
+transformers<5.6, which excludes the version that carries qwen4_exp
+(5.17.0+), and even force-upgraded, optimum-intel's own imports break
+against transformers 5.17.0 (VisionRotaryEmbedding removed). Both gaps are
+upstream's, not arcint's. This script checks both and refuses with a named
+reason when either blocks, so the refusal is legible to a script
+(tools/watch_flash_next_export.py) and to a person without reading a
+traceback.
 
     python3 tools/export_flash_next.py --out /models/ov/qwen38-flash-next
 
-Today this exits 1 with a named-reason assertion. When upstream lands
-qwen4_exp, the same invocation should proceed straight to the optimum-intel
-export below -- if it needs more than a version bump at that point (a new
-config key optimum-intel's OpenVINO config class does not map yet, say),
-that is a small, ordinary follow-up, not a rewrite of this file.
+Today this exits 1 with a named-reason assertion. When both blockers clear,
+the same invocation should proceed straight to the optimum-intel export
+below -- if it needs more than a version bump at that point (a new config
+key optimum-intel's OpenVINO config class does not map yet, say), that is
+a small, ordinary follow-up, not a rewrite of this file.
 """
 import argparse
 import importlib
@@ -35,7 +37,7 @@ MODELING_MODULE = f"transformers.models.{MODEL_TYPE}"
 KNOWN_BLOCKER = (
     "known upstream blocker (docs/design-qwen-flash-next.md, FIX A; "
     "HANDOFF-0.5.0.local.md FIX A) -- not an arcint defect, nothing to fix "
-    "here until transformers ships it"
+    "here until upstream ships it"
 )
 
 
@@ -69,11 +71,41 @@ def check_transformers_support():
     return version
 
 
+def check_optimum_intel_compat():
+    """Check that optimum-intel is installed and compatible with the current
+    transformers. Returns (optimum_intel_version, transformers_version) on
+    success. Raises AssertionError naming the exact incompatibility on
+    failure -- the two known failure modes as of 2026-09-09:
+
+      1. optimum-intel pins transformers<5.6, which excludes the version
+         that carries qwen4_exp.
+      2. Even with transformers force-upgraded, optimum-intel 2.1.0's own
+         imports break (VisionRotaryEmbedding removed in transformers 5.x).
+    """
+    try:
+        import importlib.metadata
+        oi_version = importlib.metadata.version("optimum-intel")
+    except Exception:
+        oi_version = "unknown"
+
+    try:
+        from optimum.intel import OVModelForCausalLM  # noqa: F401
+    except ImportError as exc:
+        raise AssertionError(
+            f"optimum-intel {oi_version} fails to import with the current "
+            f"transformers: {exc}. This is the {KNOWN_BLOCKER}."
+        ) from exc
+
+    import transformers
+    return oi_version, transformers.__version__
+
+
 def export(checkpoint, out_dir):
-    """The actual export, reached only once check_transformers_support()
-    returns cleanly. Same shape as any other allowlisted-architecture
-    export in this repo's chain: optimum-intel builds the OpenVINO IR
-    straight from the HF checkpoint, no hand-written graph."""
+    """The actual export, reached only once both check_transformers_support()
+    and check_optimum_intel_compat() return cleanly. Same shape as any other
+    allowlisted-architecture export in this repo's chain: optimum-intel
+    builds the OpenVINO IR straight from the HF checkpoint, no hand-written
+    graph."""
     from optimum.intel import OVModelForCausalLM
 
     model = OVModelForCausalLM.from_pretrained(
@@ -95,11 +127,19 @@ def main():
     try:
         version = check_transformers_support()
     except AssertionError as exc:
-        print(f"REFUSED: {exc}", file=sys.stderr)
+        print(f"REFUSED (transformers): {exc}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"transformers {version} carries {MODELING_MODULE} -- "
-          f"attempting the optimum-intel export")
+    print(f"transformers {version} carries {MODELING_MODULE}")
+
+    try:
+        oi_version, tf_version = check_optimum_intel_compat()
+    except AssertionError as exc:
+        print(f"REFUSED (optimum-intel): {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"optimum-intel {oi_version} + transformers {tf_version} "
+          f"-- attempting the export")
     export(args.checkpoint, args.out)
 
 
