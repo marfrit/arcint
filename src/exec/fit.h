@@ -9,6 +9,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "core/gguf.h"
+
 // M7 — auto-fit and the honest reservation (design: "M7 — Auto-fit and the
 // honest reservation", 2026-09-01, §1/§2/§4). Pure arithmetic, no OpenVINO
 // types, so it builds and runs on any host: the load path in backend_ov.cpp
@@ -1879,5 +1881,121 @@ inline PackedValuesFitTerm fit_context_packed_values_at_depth(
 // and by auto-fit's own re-probe loop in backend_ov.cpp, and fit_context_
 // packed_values, the unchanged belt search, which auto-fit now runs for
 // its own served chunk instead of a second analytic pass.)
+
+// FIX D (0.5.0, docs/design-qwen-flash-next.md "FIX D — N-gram table:
+// host-offload + dequantise-on-gather"): the n-gram embedding table's
+// host-RAM budget arithmetic.
+//
+// Everything above this point in the file prices a CARD's memory. This is
+// the first term that prices the HOST's: Qwen Flash Next's
+// `per_layer_token_embd` table (51.2 G elements, per-layer n-gram
+// embeddings) is too large for either card and stays host-resident by
+// design (read one gathered row at a time, `exec/ngram_gather.h`'s
+// `gather_dequant`), and FIX E's host-resident expert pool draws on the
+// SAME RAM budget -- the two contend for one host, not one card, so this
+// arithmetic is deliberately separate from `fit_context` above rather than
+// folded into it.
+//
+// `ngram_table_bytes` mirrors `FullyConnectedKQuant::row_bytes` above's
+// shape (ceil to a whole block, block size and bytes/block from the type's
+// own layout) but is NOT K-quant-specific: `lgc::gguf::type_info` already
+// carries Q4_0/Q4_1/Q8_0's block_size (32, not 256) and type_size (18/20/34
+// bytes) alongside the K-quant entries that function's row_bytes reads, so
+// one formula serves both families here. Unknown/unsupported types return 0
+// (`is_known_type` false) -- "nothing to price," matching this file's other
+// pure-arithmetic functions' convention for a missing input rather than
+// throwing.
+inline uint64_t ngram_table_bytes(int32_t ggml_type, uint64_t n_elements) {
+    if (!lgc::gguf::is_known_type(ggml_type)) return 0;
+    const auto info = lgc::gguf::type_info(ggml_type);
+    if (info.block_size == 0) return 0;
+    const uint64_t blocks = (n_elements + info.block_size - 1) / info.block_size;
+    return blocks * info.type_size;
+}
+
+// The Flash-Next checkpoint's own n-gram element count, derived (not
+// hand-typed) from the two figures the recon logged together in
+// HANDOFF-0.5.0.local.md: "51.2 G elements, 97.7 GiB BF16". BF16 is 2
+// bytes/element with no block padding, so element count = bf16_bytes / 2;
+// the 97.7 GiB figure is the more precise of the pair (a rounded byte
+// total divides back to a cleaner count than "51.2 G" does), and using it
+// here reproduces the recon's own quoted quantised sizes almost exactly
+// (see the constants below) where using the flatly-rounded "51.2 G"
+// figure would not (q4_1 would come out 29.80 GiB against the recon's
+// quoted "~30.5 GiB", a rounding artifact of the headline number, not a
+// second, independent count).
+constexpr uint64_t kFlashNextNgramElements =
+    (97'700ull * (1ull << 30) / 1000) / 2;  // 97.7 GiB (fixed-point) / 2 bytes-per-bf16-element
+
+// The three shipped/candidate precisions' host-resident sizes at
+// kFlashNextNgramElements, computed by ngram_table_bytes and recorded here
+// as compile-time-checked constants (tests/test_fit.cpp asserts these
+// against ngram_table_bytes directly, so this comment's numbers cannot
+// silently drift from the function's own arithmetic): Q4_0 (the shipped
+// GGUF's precision) ~27.48 GiB (~29.5 GB decimal -- the recon's "~29 GB"),
+// Q4_1 ~30.53 GiB (the recon's "~30.5 GiB"), Q8_0 ~51.90 GiB (the recon's
+// "~51.9 GiB"). None of these three fit the dev container's 48 GiB budget
+// alongside anything else non-trivial resident -- Q8_0 does not fit at
+// all, and even Q4_1's ~17.5 GiB of headroom is the same RAM FIX E's
+// host-resident expert pool wants (HANDOFF-0.5.0.local.md's own framing:
+// "the host-resident expert pool wants the same memory").
+
+// FIX D's fit-doc line: given the n-gram table's own resident bytes, the
+// expert pool's own resident bytes (FIX E, computed elsewhere -- this file
+// does not know that formula, only takes its output), whatever else is
+// already resident on the host (runtime/OS/process baseline) and a margin
+// (the same "don't shave it to zero" stance `FitTerms::margin` takes on the
+// card), the two together with the host's own budget: refuse -- do not
+// swap -- when the sum exceeds it. Named `_must_refuse`, mirroring this
+// file's own `explicit_overshoot_must_refuse` naming: a boolean the caller
+// tests by name, not a throw (this file stays pure arithmetic throughout;
+// the actual load-time refusal-by-name belongs at the backend_ov.cpp call
+// site that has a real host to report, per this repository's stance that a
+// budget check here is pure and testable without a host at all).
+inline bool host_ram_fit_must_refuse(uint64_t ngram_bytes, uint64_t expert_pool_bytes,
+                                     uint64_t other_resident_bytes, uint64_t host_ram_bytes,
+                                     uint64_t margin_bytes) {
+    // Additions are on uint64_t bytes; the design's own inputs (a ~50 GiB
+    // table, a host in the tens-of-GiB range) sit nowhere near 2^64, so no
+    // overflow guard is needed here -- unlike the signed `long long` budget
+    // arithmetic in fit_context above, which subtracts and can legitimately
+    // go negative.
+    const uint64_t required = ngram_bytes + expert_pool_bytes + other_resident_bytes + margin_bytes;
+    return required > host_ram_bytes;
+}
+
+// The itemized line for the fit doc / a load-time log: the same inputs and
+// verdict as host_ram_fit_must_refuse, plus the numbers that verdict was
+// computed from (so a refusal message can name every term, the same
+// "name the card, the depth, the KV precision" discipline this
+// repository's session rules require of any number that moves) and the
+// signed headroom/shortfall (negative when refused).
+struct HostRamFit {
+    uint64_t ngram_bytes          = 0;
+    uint64_t expert_pool_bytes    = 0;
+    uint64_t other_resident_bytes = 0;
+    uint64_t host_ram_bytes       = 0;
+    uint64_t margin_bytes         = 0;
+    uint64_t required_bytes       = 0;  // sum of the four resident/margin terms
+    int64_t  headroom_bytes       = 0;  // host_ram_bytes - required_bytes; negative = shortfall
+    bool     refuse               = false;
+};
+
+inline HostRamFit host_ram_fit(uint64_t ngram_bytes, uint64_t expert_pool_bytes,
+                               uint64_t other_resident_bytes, uint64_t host_ram_bytes,
+                               uint64_t margin_bytes) {
+    HostRamFit r;
+    r.ngram_bytes          = ngram_bytes;
+    r.expert_pool_bytes    = expert_pool_bytes;
+    r.other_resident_bytes = other_resident_bytes;
+    r.host_ram_bytes       = host_ram_bytes;
+    r.margin_bytes         = margin_bytes;
+    r.required_bytes = ngram_bytes + expert_pool_bytes + other_resident_bytes + margin_bytes;
+    r.headroom_bytes =
+        static_cast<int64_t>(host_ram_bytes) - static_cast<int64_t>(r.required_bytes);
+    r.refuse = host_ram_fit_must_refuse(ngram_bytes, expert_pool_bytes, other_resident_bytes,
+                                        host_ram_bytes, margin_bytes);
+    return r;
+}
 
 }  // namespace lgc

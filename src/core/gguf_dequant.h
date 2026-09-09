@@ -22,10 +22,12 @@ float bf16_to_f32(uint16_t h);
 // `n_elements` must be a multiple of the type's block size (true for any
 // whole GGUF tensor row, and for a whole tensor since rows are packed
 // contiguously with no inter-row padding). Supports F32, F16, BF16 (plain
-// copy/convert) and Q8_0, Q4_K, Q5_K, Q6_K (ggml's block formats). Throws
-// std::runtime_error for any other type -- stage 0 implements exactly the
-// four K-quant types the design note's four decoders start with, plus
-// pass-through for the file's own float types.
+// copy/convert), Q8_0, Q4_K, Q5_K, Q6_K (ggml's K-quant block formats), and
+// -- added for FIX D, docs/design-qwen-flash-next.md, the n-gram embedding
+// table's 32-element-block plain quant formats -- Q4_0 and Q4_1. Throws
+// std::runtime_error for any other type -- stage 0's four K-quant types plus
+// pass-through for the file's own float types, plus the two plain formats
+// FIX D added; nothing else is implemented.
 void dequantize_row(int32_t ggml_type, const uint8_t* block_bytes, size_t n_elements, float* out);
 
 // Dequantizes a whole tensor's bytes (out.resize()'d to t.n_elements).

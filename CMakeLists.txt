@@ -221,6 +221,7 @@ if(ARCINT_TESTS)
     tests/test_gguf_parallel.cpp
     tests/test_affinity.cpp
     tests/test_fit.cpp
+    tests/test_ngram_gather.cpp
     tests/test_decode_stats.cpp
     tests/test_profile_cycle.cpp
     tests/test_rope_precision.cpp

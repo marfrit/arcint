@@ -75,6 +75,45 @@ void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
     }
 }
 
+// FIX D (docs/design-qwen-flash-next.md): the n-gram embedding table
+// (`per_layer_token_embd`) ships in Q4_0/Q4_1 -- 32-element blocks, but NOT
+// K-quant: no per-superblock scale/min packing, just one f16 scale (Q4_0) or
+// one f16 scale plus one f16 min (Q4_1) per 32-element block of 4-bit
+// nibbles. Transcribed from ggml-quants.c's dequantize_row_q4_0 /
+// dequantize_row_q4_1.
+void dequantize_row_q4_0(const uint8_t* p, size_t n_elements, float* out) {
+    constexpr size_t kBlock = 32;
+    for (size_t b = 0; b * kBlock < n_elements; ++b) {
+        const uint8_t* block = p + b * 18;  // 2B d + 16B packed nibbles
+        const float    d     = f16_to_f32(read_u16(block));
+        const uint8_t* qs    = block + 2;
+        float*         y     = out + b * kBlock;
+        for (size_t l = 0; l < 16; ++l) {
+            const int x0 = (qs[l] & 0x0F) - 8;
+            const int x1 = (qs[l] >> 4) - 8;
+            y[l]      = static_cast<float>(x0) * d;
+            y[l + 16] = static_cast<float>(x1) * d;
+        }
+    }
+}
+
+void dequantize_row_q4_1(const uint8_t* p, size_t n_elements, float* out) {
+    constexpr size_t kBlock = 32;
+    for (size_t b = 0; b * kBlock < n_elements; ++b) {
+        const uint8_t* block = p + b * 20;  // 2B d + 2B m + 16B packed nibbles
+        const float    d     = f16_to_f32(read_u16(block));
+        const float    m     = f16_to_f32(read_u16(block + 2));
+        const uint8_t* qs    = block + 4;
+        float*         y     = out + b * kBlock;
+        for (size_t l = 0; l < 16; ++l) {
+            const int x0 = qs[l] & 0x0F;  // no -8 offset: Q4_1 is (x*d + m), not centered
+            const int x1 = qs[l] >> 4;
+            y[l]      = static_cast<float>(x0) * d + m;
+            y[l + 16] = static_cast<float>(x1) * d + m;
+        }
+    }
+}
+
 void dequantize_row_q8_0(const uint8_t* p, size_t n_elements, float* out) {
     constexpr size_t kBlock = 32;
     for (size_t b = 0; b * kBlock < n_elements; ++b) {
@@ -194,13 +233,15 @@ void dequantize_row(int32_t ggml_type, const uint8_t* block_bytes, size_t n_elem
             for (size_t i = 0; i < n_elements; ++i) out[i] = bf16_to_f32(read_u16(block_bytes + 2 * i));
             return;
         case GgmlType::Q8_0: dequantize_row_q8_0(block_bytes, n_elements, out); return;
+        case GgmlType::Q4_0: dequantize_row_q4_0(block_bytes, n_elements, out); return;
+        case GgmlType::Q4_1: dequantize_row_q4_1(block_bytes, n_elements, out); return;
         case GgmlType::Q4_K: dequantize_row_q4_k(block_bytes, n_elements, out); return;
         case GgmlType::Q5_K: dequantize_row_q5_k(block_bytes, n_elements, out); return;
         case GgmlType::Q6_K: dequantize_row_q6_k(block_bytes, n_elements, out); return;
         default:
             throw std::runtime_error(log::format(
-                "gguf: dequantize_row: %s is not implemented (stage 0 covers Q8_0/Q4_K/Q5_K/Q6_K "
-                "and F32/F16/BF16 passthrough)",
+                "gguf: dequantize_row: %s is not implemented (stage 0 covers Q8_0/Q4_K/Q5_K/Q6_K, "
+                "FIX D adds Q4_0/Q4_1, and F32/F16/BF16 passthrough)",
                 type_name(ggml_type).c_str()));
     }
 }

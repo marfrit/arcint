@@ -456,3 +456,499 @@ crontab — that step is operator-side, tracked in `CLAUDE.local.md`.
 Neither of the two options above has been chosen; none of this repository's
 other Flash-Next work (FIX B's delta table above, FIX C's kernel audit,
 FIX D's n-gram offload) waited on this decision.
+
+## FIX D — N-gram table host-offload and dequantise-on-gather
+
+### The tensor
+
+`per_layer_token_embd` -- Flash-Next's per-layer n-gram embedding table. Not
+attention, not an expert: a lookup table read by `ggml_get_rows` (the
+reference implementation's own op for it), one row per token id, 160
+elements wide per row. Two figures for its size were logged together in the
+recon (HANDOFF-0.5.0.local.md): "51.2 G elements, 97.7 GiB BF16" -- these
+are the same tensor rounded two different ways (51.2 G is the headline
+count rounded to one decimal; 97.7 GiB divides back to a cleaner element
+count, ~52.45 G, and is the more precise of the pair). `src/exec/fit.h`'s
+`kFlashNextNgramElements` is derived from the 97.7 GiB figure for exactly
+that reason -- see its own comment.
+
+At 51-52 G elements this table alone is larger than either card in scope
+(the served family's own weights, by comparison, fit inside a single card).
+It is host-resident by design, not as a fallback: nothing in this
+repository loads a table this size onto a card, and nothing should.
+
+### The format: 32-element blocks, not K-quant
+
+The shipped GGUF quantises this table Q4_0. Q4_0, Q4_1 and Q8_0 -- the three
+precisions this section prices -- all block at **32 elements**, one
+constant-width scale (and, for Q4_1, one min) per block, no per-superblock
+scale-of-scales packing. This is deliberately different from the K-quant
+family (Q4_K/Q5_K/Q6_K, `core/gguf_dequant.cpp`'s existing
+`dequantize_row_q4_k`/etc, and the `FullyConnectedKQuant` op,
+`exec/kquant_op.h`) that the rest of this codebase's GGUF-native path
+already decodes: K-quant blocks at **256** elements, and 160 (this table's
+row width) is not a multiple of 256 -- a K-quant block would cross a row
+boundary, which GGUF's own layout rule forbids ("a quantization block runs
+along dims[0] and never crosses a row boundary", `core/gguf.h`). 160 = 5 x
+32 exactly, so every row is a whole number of 32-element blocks and the
+existing K-quant decoders and op simply do not apply here; this is why FIX D
+needed its own kernel rather than reusing `FullyConnectedKQuant`.
+
+Byte layout (from `core/gguf.h`'s own type table, unchanged by this work):
+
+| format | block elements | bytes/block | per-block layout |
+|---|---|---|---|
+| Q4_0 | 32 | 18 | f16 `d` (scale) + 16B of 4-bit nibbles, code centered at 8 (`(nibble-8)*d`) |
+| Q4_1 | 32 | 20 | f16 `d` (scale) + f16 `m` (min) + 16B of 4-bit nibbles (`nibble*d + m`) |
+| Q8_0 | 32 | 34 | f16 `d` (scale) + 32B signed int8 (`qs[l]*d`) |
+
+### What landed: the gather-with-dequant kernel (harness, red-first)
+
+`src/exec/ngram_gather.h`:
+
+- `gather_dequant_scalar` -- the reference path, a thin wrapper over
+  `lgc::gguf::dequantize_row` (per row, per gathered index). This function
+  did not cover Q4_0/Q4_1 before this work -- only Q8_0 and the four
+  K-quant types plus the float pass-throughs -- so FIX D's first change was
+  adding `dequantize_row_q4_0`/`dequantize_row_q4_1` to
+  `core/gguf_dequant.cpp` (transcribed from ggml-quants.c's own
+  `dequantize_row_q4_0`/`q4_1`, the same way every decoder already in that
+  file is transcribed and commented). This keeps one reference dequantizer
+  per type, reused rather than re-derived, matching that file's own stated
+  purpose ("these exist to check a fixture and, later, real tensors").
+- `gather_dequant` -- the fast path: AVX2 block kernels
+  (`dequant_block_q4_0_avx2`, `_q4_1_avx2`, `_q8_0_avx2`) dispatched per
+  gathered row, falling back to `gather_dequant_scalar` whenever AVX2 is
+  unavailable at runtime, the type is outside this kernel's three formats,
+  or the row width is not a whole multiple of 32.
+
+**AVX2 only, gated by cpuid at runtime, never assumed at compile time.** The
+dev container's host is a Zen 3 part: AVX2 yes, AVX-512 no -- AVX-512 there
+is a SIGILL, not a graceful degrade. The three AVX2 block-dequant functions
+are marked `__attribute__((target("avx2")))` (GCC/Clang function
+multiversioning) rather than relying on a blanket `-mavx2` build flag, so
+this header compiles into a binary built with no `-march`/`-mavx2` at all;
+`gather_dequant` calls into them only after `cpu_has_avx2()`
+(`__builtin_cpu_supports("avx2")`, a runtime cpuid check) returns true. No
+`fma` target string appears anywhere in this file: every block dequant does
+an explicit multiply then an explicit add (two separate instructions, two
+separate roundings), matching the scalar reference's own separate
+operations term for term -- an FMA'd multiply-add rounds once where a
+multiply-then-add rounds twice, and the two are not always bit-identical,
+which would have broken the byte-exact check below for no reason connected
+to an actual kernel bug.
+
+**The red-first test**, `tests/test_ngram_gather.cpp`: a synthetic
+1000-row x 160-column table, quantised into all three formats from known,
+per-dimension-varying float input (not a constant fill -- see the file's own
+comment on why: a constant-per-dimension fill hid a real defect elsewhere in
+this codebase's history, `HANDOFF-0.4.7.local.md`'s BY_TOKEN NaN record) via
+test-local quantizers transcribed from ggml-quants.c's
+`quantize_row_q4_0`/`q4_1`/`q8_0`. For a sample of gathered row indices
+(including both table edges), the test asserts, `memcmp`-exact:
+
+1. `gather_dequant`'s AVX2-or-scalar dispatch output against
+   `gather_dequant_scalar`'s forced-scalar output, for the identical input
+   -- the kernel-correctness case this section exists to make pass;
+2. `gather_dequant_scalar`'s own per-row output against calling
+   `lgc::gguf::dequantize_row` directly on the same row bytes -- an
+   independent check that does not route through either of the two
+   functions the first check compares, so a bug shared by both cannot hide
+   from it;
+3. a loose (1.0f) tolerance check of the dequantized values against the
+   known source floats, catching a wrong-scale or wrong-sign defect the
+   byte-exact checks (which only prove internal *consistency*, not
+   *correctness* against ground truth) would not.
+
+On a host without AVX2, the AVX2-specific cases skip by name
+(`SKIP_UNLESS(ngram::cpu_has_avx2(), ...)`); a fourth case
+(`ngram_gather_scalar_path_matches_dequantize_row_on_any_host`) runs
+unconditionally so the suite is not entirely skip-gated on such a host (this
+repository's own ctest invocation runs `--max-skips 0`, so an all-skip file
+would itself be a red flag caught by CI, not a silent pass).
+
+All cases pass on the dev container (AVX2 present, confirmed via
+`cpu_has_avx2()` returning true in the same test run). No microbench
+(token-gathers/s) has been taken yet -- see "What's blocked", below.
+
+### The memory budget: n-gram table vs. expert pool vs. host RAM
+
+`src/exec/fit.h` adds the host-RAM side of the fit arithmetic (everything
+above it in that file prices a *card's* memory; this is the first term that
+prices the *host's*):
+
+- `ngram_table_bytes(ggml_type, n_elements)` -- `ceil(n_elements /
+  block_size) * bytes_per_block`, reading `block_size`/`type_size` from
+  `lgc::gguf::type_info` (the same table `core/gguf.cpp` already carries;
+  no new numbers). Returns 0 for a type the reader does not know, matching
+  this file's convention for "nothing to price" rather than throwing.
+- `kFlashNextNgramElements` -- Flash-Next's own element count, derived from
+  the recon's 97.7 GiB BF16 figure (see above).
+- `host_ram_fit_must_refuse(ngram_bytes, expert_pool_bytes,
+  other_resident_bytes, host_ram_bytes, margin_bytes)` -- `true` when the
+  sum would overrun the host's RAM budget. Pure arithmetic, no throw (this
+  file stays testable without a host throughout); the load-time refusal
+  *by name*, with an actual host's numbers, is backend_ov.cpp's job at the
+  call site, not landed as part of this pass (no artifact exists yet to
+  load).
+- `HostRamFit` / `host_ram_fit(...)` -- the itemized version of the same
+  check (required bytes, signed headroom/shortfall, the `refuse` bool),
+  for a fit-doc line or a load-time log to name every term.
+
+**The fit table**, `ngram_table_bytes` evaluated at `kFlashNextNgramElements`
+(~52.45 G elements) for each candidate precision, against the two hosts in
+scope:
+
+| precision | table size | dev container (48 GiB RAM) | fits alongside FIX E's expert pool? |
+|---|---|---|---|
+| Q4_0 (shipped) | 27.48 GiB (~29.5 GB decimal) | fits alone | ~20.5 GiB left for everything else |
+| Q4_1 | 30.53 GiB | fits alone | ~17.5 GiB left -- **the same RAM FIX E's host-resident expert pool wants** (HANDOFF-0.5.0.local.md's own framing) |
+| Q8_0 | 51.90 GiB | **does not fit** | refused outright, `host_ram_fit_must_refuse` is unconditionally true regardless of `expert_pool_bytes` |
+
+A unit host with materially more RAM (this section's own test fixture uses
+128 GiB as an illustrative, not measured, second row) has enough headroom
+for Q4_1 plus a generous expert-pool allocation with margin to spare --
+`tests/test_ngram_gather.cpp`'s
+`host_ram_fit_admits_q4_1_ngram_table_on_a_128gib_unit_host` case pins this
+so the budget check is not read as "refuses everything unconditionally."
+No real unit-host RAM figure was measured for this table; the 128 GiB row
+is a fixture bound, not a claim about actual unit hardware.
+
+vLLM's own `VLLM_PLE_CPU_OFFLOAD=1` (auto-enabled on their reference
+80 GB-class cards, gated on host RAM >= 51 GB) is the closest published
+comparison point: their threshold sits almost exactly at this table's Q8_0
+size, which is consistent with Q8_0 being the precision they expect to need
+that much host RAM for in the first place.
+
+### What's blocked, and why
+
+Everything gated on an actual Flash-Next artifact is not landed, for the
+same reason FIX A/B/C all name: no export exists yet
+(`transformers.qwen4_exp` is absent from every pinned transformers version
+checked, FIX A's own blocker). Specifically:
+
+1. **Microbench numbers (token-gathers/s against the host's DRAM
+   ceiling)** -- needs the real table (or a full-size synthetic one built to
+   the real element count) resident in host RAM on the dev host, and a
+   timed loop of `gather_dequant` calls at realistic batch/index
+   distributions. The 1000-row fixture above proves correctness, not
+   throughput at scale; a throughput number taken on it would not be a
+   measurement of anything the real table's access pattern implies (a
+   1000-row table fits entirely in L2/L3 cache, defeating the DRAM-ceiling
+   question this item exists to answer).
+2. **Integration**: the gather path in the graph (`ggml_get_rows` analogue
+   at the right op level, wired to the budget check above) is not built --
+   there is no Flash-Next IR to wire it into, and no served checkpoint in
+   this repository's existing families uses a table this shape, so there is
+   nothing to integrate against today. FIX D's own item 3 stays open until
+   FIX A's export blocker clears.
+3. **The refusal case as a load-time behavior** (not just the pure
+   arithmetic's boolean, which is covered) -- `backend_ov.cpp` does not yet
+   call `host_ram_fit_must_refuse` anywhere, because there is no load path
+   that reads a table this shape yet.
+4. **FIX E crossover**: HANDOFF-0.5.0.local.md is explicit that "FIX D and
+   FIX E contend for one DRAM budget, and the crossover calibration must be
+   measured with both paths live, not FIX E alone" -- this section's fit
+   table treats the expert pool's RAM draw as a given input
+   (`expert_pool_bytes`), not something FIX D calibrates; the live,
+   both-paths-active DRAM-bandwidth measurement is FIX E's own "Done when"
+   item 1, not duplicated here.
+
+## FIX E — Expert-pool CPU executor design
+
+### Scope and status
+
+Design only, per the handoff's own split: what follows is landable without
+a Flash-Next artifact (calibration methodology, the worker-pool
+architecture, the overlap strategy, the DRAM-contention accounting, the
+FreeToken comparison protocol). The kernel work itself — AVX2 dequant
+routines for Q4_K/Q5_K/Q6_K, the pinned pool's thread-affinity plumbing,
+the gate-weighted partial-output combine — is explicitly out of scope for
+this pass (see "What's landable now" below) and follows once FIX A's
+export blocker clears.
+
+The existing host CPU tier (patches/0011-0012, extended by 0017-0019) is
+the starting point, not a green field: `MOE_CPU_TIER`, the AVX2/scalar
+grouped-int4 kernel, the mmap weight accessor, the M14 perf counters, the
+static-partition residency fix (0018/0019) all exist today and are
+measured on the served 35B MoE (`docs/design-qwen-flash-next.md` FIX C
+above cites 15.0/15.5 t/s at ratio 50 with the host tier on, against
+10.4/10.6 without it). FIX E is the design for what changes on top of
+that tier to make it Flash-Next-shaped: 512 experts at 6% activation
+instead of the served model's smaller pool, K-quant GGUF dequant instead
+of the grouped-int4 layout the existing kernel targets, and a bandwidth
+calibration step the existing tier does not do at all — 0011-0012 pick
+their CPU/device split by static residency partition (0018's F2), not by
+a measured transfer-vs-compute crossover. FreeToken's contribution is
+exactly that crossover heuristic; this section is where arcint adopts the
+idea, re-derived from the paper's description rather than the reference
+CUDA implementation (Apache-2.0 fork-tax avoidance, per the handoff).
+
+### Why a new dequant path at all
+
+The existing patches/0011 kernel operates on arcint's own grouped-int4
+layout — the layout the served model's export produces. Flash-Next, if
+and when it ships as GGUF (the export blocker in FIX A above is silent on
+container format; a GGUF community quantisation is the likelier first
+artifact to exist, independent of the optimum-intel path), carries
+K-quant blocks (Q4_K/Q5_K/Q6_K: a two-level structure, per-superblock
+scale/min in a higher precision than the per-sub-block quantised
+weights, packed at 256-weight superblock granularity). That is a
+different bit layout from arcint's grouped-int4 tables, not a
+reparametrisation of the same one — the existing kernel's inner loop
+cannot read it. This design proposes new AVX2 dequant kernels, one per
+K-quant type, sharing the existing tier's thread pool, mmap accessor and
+perf-counter scaffolding rather than replacing any of it.
+
+### Bandwidth calibration methodology
+
+FreeToken's `ft bench bw` heuristic (paper §4, "Bandwidth-Adaptive
+Execution") measures, at load time, the achievable PCIe host-to-device
+transfer rate (`B_P`) and the achievable CPU expert-execution rate
+expressed as an equivalent bandwidth (`B_H`), then routes each cache-miss
+token to whichever path — stream the weight over PCIe and execute on
+device, or execute in place on the CPU — is cheaper for that token's
+expert size at that moment. arcint needs the same two numbers, measured
+on arcint's own hardware and kernels rather than assumed from FreeToken's
+published figures (per this repository's measurement-discipline rule:
+every number is named against the card, the host and the configuration
+it was taken on).
+
+What to measure, concretely:
+
+- **`B_P` — PCIe stream rate.** Time a repeated non-blocking upload of a
+  known expert-slot-sized buffer (per-expert bytes from `fit.h`'s
+  `expert_slot_bytes` arithmetic) through the existing staging-ring path
+  (patches/0006), amortised the same way 0006 already amortises real
+  traffic — batched, not per-tensor. Measured, not read off a spec sheet:
+  the design doc's own FIX C section above already treats PCIe 4.0 x16's
+  "~28 GB/s" as a nameplate figure to be checked against, not trusted.
+- **`B_H` — CPU-execution equivalent bandwidth.** Time the new AVX2
+  K-quant dequant-and-GEMV kernel over a representative expert (same
+  slot size, same activation count) on the pinned worker pool at steady
+  state (warm caches, no first-request JIT cost — see
+  `feedback-first-request-compiles-kernels` in memory: a fresh process
+  pays a one-time kernel-compile/warmup cost that must not leak into a
+  steady-state rate). Expressed as bytes-of-weight-processed per second
+  so it is directly comparable to `B_P`.
+- **DRAM achieved bandwidth**, independently of both of the above: a
+  saturating multi-thread streaming-read microbenchmark (e.g. a
+  many-thread sequential-read sweep sized well past the 32 MiB L3, so it
+  measures DRAM and not cache) run twice — once with FIX D's n-gram
+  streaming path idle, once with it active — because `B_H` above is
+  itself DRAM-bound (the dequant kernel is a bandwidth-bound gather over
+  mostly-cold weight pages) and shares the same DDR4 channel FIX D's
+  table lookups stream through. This is the number the crossover
+  calculation actually needs to stay honest under contention — see
+  "DRAM contention with FIX D" below.
+
+The crossover point `q*` FreeToken derives (paper's own term, `q* ~=
+m·B_P/B_H` where `m` is the expert's byte size) becomes, once both rates
+are measured on arcint's own hardware and kernel: below `q*` tokens
+routed to a given cold expert in a step, stream-and-execute-on-device is
+cheaper; at or above it, execute-in-place on the CPU pool is cheaper.
+This is a per-load, per-hardware constant (a function of the two
+measured rates and the expert byte size), not a per-token decision
+computed at serving time from scratch — it is computed once at load and
+consulted, the same shape the existing static-partition design (0018)
+already uses for its own load-time decision.
+
+### Worker-pool architecture
+
+A persistent pool of `N` OS threads, created once at model load (not
+per-request, not per-layer) and pinned one-to-one to physical cores via
+the existing `core/affinity.h` (`pin_current_thread`, already used by
+`--pin-dispatch` — see `src/exec/backend_ov.cpp` around the dispatch-pin
+code) — pinned to physical cores specifically, not SMT siblings: two
+threads sharing one physical core's execution units contend for the same
+AVX2 ALU and L1 rather than adding throughput, and the dev host's 8
+physical / 16 SMT-thread topology gives exactly 8 independent execution
+units to place work on, not 16. `moe_cpu_tier_threads_` (already a
+config field, `MOE_CPU_TIER_THREADS`) is the existing knob this reuses;
+its default ("auto") should resolve to the physical core count, not the
+logical one, on hosts where that distinction matters — the dev host is
+one such host and should not silently oversubscribe to 16.
+
+Each worker owns:
+
+- an mmap window into the GGUF weight file (extending the existing
+  0011 mmap accessor to a K-quant-block-aware stride instead of the
+  grouped-int4 stride it uses today);
+- a per-K-quant-type AVX2 dequant-and-accumulate kernel (Q4_K, Q5_K,
+  Q6_K each need their own inner loop — the superblock scale/min
+  layout differs per type, not just the sub-block bit width) that
+  dequantises a block on the fly and accumulates directly into the
+  gate-weighted partial-output buffer, rather than materialising a
+  dequantised f32/f16 weight tensor in DRAM first. Dequant-on-the-fly is
+  the point: materialising first would double the DRAM traffic this
+  design is trying to keep under the calibrated `B_H`, once for the
+  dequant write and again for the GEMV read.
+- a lock-free work queue (or the existing tier's queue primitive if one
+  already exists in 0011-0012's thread-pool code — re-use over
+  reinvention per this repository's own default) fed `(layer, expert,
+  token-batch)` triples by the dispatch path.
+
+### Gate-weighted partial outputs
+
+Each active expert's contribution to a token's MoE output is scaled by
+that token's routing gate weight before combination (standard MoE
+combine, unchanged by where the expert executes). What FIX E adds is that
+this combine has to be identical in shape whether the expert ran on
+device or on the CPU pool: the CPU kernel's accumulation buffer layout
+must match what `mlp_reduce` (patches/0012's join point) already expects
+from a host excursion, so a token whose 10 routed experts split
+CPU/device combines through the same reduce path already wired by 0012,
+with the K-quant kernel and calibrated `q*` split as the only new inputs
+to that decision — not a new combine path. This reuses 0012's join
+rather than adding a second one, which matters directly for FIX D's
+determinism concern below: two independent combine paths would be two
+independent places for a floating-point-order divergence to hide.
+
+### Overlap strategy
+
+The served model's existing host-tier overlap (0012: "how the host
+excursion overlaps the GPU work and joins before `mlp_reduce`") is the
+template — GPU-resident attention and GPU-resident experts for a layer
+proceed on the device queue while the CPU pool works its own assigned
+experts for the same layer concurrently, joining only at the reduce.
+Flash-Next's much higher offload ratio (high 80s-low 90s percent, per
+FIX C above) means the CPU pool is doing much more of the per-layer work
+than the served model's ratio-50/75 measurements exercised, so the
+overlap window that mattered little at ratio 50 (a small CPU tail
+finishing after a much larger GPU-resident majority) is the dominant cost
+at ratio ~90 (a small GPU-resident minority finishing well before a much
+larger CPU tail). The design implication: at Flash-Next's ratio, GPU
+attention finishing early and idling while the CPU pool is still the
+long pole is the expected steady state, not an edge case — the
+per-layer, per-step split has to be sized so the CPU pool's finish time
+tracks the GPU's attention-plus-resident-expert finish time as closely as
+the calibrated `q*` split allows, rather than treating GPU idle time at
+this ratio as a bug to chase.
+
+### DRAM contention with FIX D
+
+FIX D's n-gram table offload and FIX E's CPU expert pool are both,
+fundamentally, DRAM-bandwidth-bound gather workloads over the same
+dual-channel DDR4 bus on the same host, active in the same decode step
+(the n-gram lookup happens at layer 2's PLE embedding per the config
+keys FIX B's delta table already reads — `ple_layer_ids`,
+`ple_embed_dim` — while MoE layers, including any of the 48 that route
+through the CPU pool, are spread across the rest of the stack). Neither
+path saturates the bus alone by construction — the calibration
+methodology above measures `B_H` and DRAM bandwidth twice, once with
+FIX D idle and once active, specifically because the two are not
+independent: a `B_H` measured with FIX D's streaming path off overstates
+what's actually available once both are live in the same served step.
+This design does not attempt to prescribe a fixed split of DRAM budget
+between the two features here — that's an implementation-time tuning
+question — but it names the two measured rates (`B_H`-with-ngram-idle and
+`B_H`-with-ngram-active) as the pair the calibration profile below must
+carry, so the crossover `q*` used at serving time is the contended one,
+not the idealized one.
+
+### Calibration profile format
+
+One profile per host, recorded (not merely spec-sheet-derived) at
+calibration time, carrying at minimum:
+
+- host identity as an opaque calibration-profile label (never a real
+  hostname per this repository's public-repo rule — an operator-chosen
+  tag, with the real host recorded only in `CLAUDE.local.md` if needed
+  for reproduction);
+- CPU ISA level actually used (`AVX2`, since the dev host has no
+  AVX-512) and physical-core / SMT-thread counts separately;
+- measured DRAM bandwidth, n-gram streaming path OFF;
+- measured DRAM bandwidth, n-gram streaming path ON (FIX D's contention
+  case);
+- measured `B_P` (PCIe stream rate) on the card in scope, named with the
+  card;
+- measured `B_H` per K-quant type (Q4_K/Q5_K/Q6_K each dequant at a
+  different rate — a single averaged number would hide which type
+  dominates a given expert mix), both with and without FIX D active;
+- the derived `q*` crossover per K-quant type, both contention cases;
+- date and the `marfrit-openvino` patch level the measurement was taken
+  against, per this repository's changelog convention.
+
+**Done-when item (1)** requires this profile to exist for both unit
+hosts and the dev container, with the dev-host row explicit on the
+figures above (AVX2, 8 physical cores, DRAM measured both ways). Not
+done in this pass — this section defines the format and methodology; the
+harness that runs and records it is implementation work, listed under
+"What's landable now" below.
+
+### FreeToken comparison methodology
+
+Per `feedback-no-baseline-claim-without-survey` and the
+`reference-freetoken-edge-moe` memory note, no arcint claim about serving
+Flash-Next stands alone — it is stated against FreeToken's own published
+row for the closest comparable case. FreeToken's paper reports Qwen3.6-
+35B-A3B (the served model's own family, not Flash-Next — FreeToken's
+own model list does not cover Flash-Next per the memory note) at 77-83
+tok/s on an RTX 5090 with 8 GB-96 GB card targets; the appropriate
+comparison card class for the dev host's setup is the smaller end of
+that range, not the 5090 row, since neither card in scope here is a
+5090-class device.
+
+The claim row required by done-when item (4) must state, side by side:
+
+| | FreeToken (published) | arcint (measured) |
+|---|---|---|
+| served model | (their row's model) | Flash-Next, once exported |
+| card | (their row's card, named) | the card in scope, named |
+| precision | (their row's, if stated) | the KV/weight precision arcint served at |
+| offload ratio / resident fraction | (if stated) | measured, per FIX C's arithmetic |
+| decode rate | 77-83 tok/s (35B-A3B, RTX 5090) | measured |
+
+Two honesty constraints apply directly: FreeToken's 35B-A3B row is the
+served model's family, not Flash-Next, so an arcint Flash-Next number
+compared against it is a cross-model comparison and must say so plainly
+rather than implying an apples-to-apples read; and if FreeToken has no
+row at all comparable in card class or model to what arcint actually
+measures, the claim row must say that gap out loud rather than pick the
+nearest FreeToken number silently. Per DESIGN §7.0.1, a mechanism
+narrated without a matching measurement gets retracted rather than
+edited around — this applies equally to a comparison row assembled from
+a paper's headline figure without checking whether the comparison is
+actually apples-to-apples.
+
+### What's landable now vs. what needs the export
+
+**Landable now, no Flash-Next artifact required:**
+
+- This design section itself.
+- The calibration harness: the DRAM-bandwidth microbenchmark (both n-gram
+  states), the `B_P` PCIe-stream measurement (against any expert-sized
+  buffer, not specifically Flash-Next's — the existing served-model
+  expert size already exercises the same staging-ring path), and the
+  calibration-profile recording format above. None of this depends on
+  Flash-Next's config or weights.
+- The K-quant AVX2 dequant kernels' correctness (Q4_K/Q5_K/Q6_K
+  bit-layout decode against known-good reference vectors) — a GGUF
+  K-quant block is a fixed, documented bit layout independent of which
+  model's weights fill it, so a synthetic or third-party GGUF file
+  exercises the kernel today.
+- The microbench required by done-when item (2) — "CPU-executor token
+  rate vs PCIe-stream rate, crossover measured" — against the **served**
+  35B MoE, using its existing expert sizes and either its existing
+  grouped-int4 kernel (0011) or a synthetic K-quant re-encode of the same
+  weights for the new kernel path. This is explicitly what done-when
+  item (2) asks for ("microbench on the served 35B MoE's experts"), so it
+  needs no Flash-Next artifact at all and should be run before FIX A
+  unblocks, not after.
+
+**Needs the export (blocked on FIX A):**
+
+- Done-when item (3), the served-family hybrid run against the
+  equivalence suite's byte-exactness gates — "served-family" reads as
+  the served 35B MoE here too per the same logic as item (2), so this
+  may also be landable pre-export; if it in fact requires Flash-Next
+  specifically, it is blocked the same way FIX C's RED-C-01/03/04/05
+  are, on FIX A.
+- Wiring the calibrated `q*` split into Flash-Next's actual 512-expert,
+  10+1-active routing at serving time — needs a compiled Flash-Next
+  graph to route against, same blocker as everywhere else in this
+  document that depends on a real artifact.
+- The final FreeToken claim row's arcint-side numbers for Flash-Next
+  specifically (the table's right column) — the methodology and left
+  column are landable now; the right column's actual Flash-Next figures
+  are not.
