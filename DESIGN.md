@@ -8873,14 +8873,31 @@ group at 36 keys, three at 102, all four from 126. That is arithmetic on the
 counts above, not a mechanism, and it constrains all three candidates equally:
 whatever the common element is, it fails per KV head, not per element.
 
-No mechanism is claimed. The common element -- the harness's own by-token
-page writing, its cache sizing, or the key dequantisation both kernels share
--- was not measured, and this section names those three candidates rather
-than choosing one. What the record can say is that the re-test cannot reach a
-verdict on this instrument, because the instrument fails in a configuration
-the decline does not govern; so **the decline stays**, and patch 0034 carries
-the six cases that carry the finding as a DISABLED instantiation, so the next
-reader starts from the measurement.
+No mechanism was claimed at the time of writing. The common element -- the
+harness's own by-token page writing, its cache sizing, or the key
+dequantisation both kernels share -- was not measured, and this section
+named those three candidates rather than choosing one. What the record
+could say is that the re-test cannot reach a verdict on this instrument,
+because the instrument fails in a configuration the decline does not
+govern; so **the decline stays**.
+
+**Patch 0035 found the mechanism (2026-09-09).** It was candidate 1: the
+harness's own by-token page writing. `std::fill_n` gave every dimension
+of a token's key vector the same fp16 value; `quantize_data()` then saw
+`min == max`, fell through to the `diff = 0.001` fallback, computed
+`scale = 255000`, and derived a zero-point that overflows fp16 for tokens
+whose base key value exceeds ~0.257 (zp ≈ −66430, below fp16 min −65504
+→ −inf). The kernel correctly propagated −inf → inf, then softmax hit
+inf − inf = NaN. The NaN counts from 0034's table match arithmetically:
+head 3 at head 256 (base 0.26+) overflows from block 0, producing one
+KV-head group of NaN at 36 keys; heads 1–3 overflow at 102 keys (three
+groups); all four from 126 keys. At head 128 the base stays below 0.257
+at 36 keys, so no overflow -- exact. Every row predicted, every row
+confirmed. The fix replaces the constant fill with a per-dimension
+linear ramp (±0.128 / ±0.256); all 6 cases pass enabled.
+The decline itself remains: this was a test bug, not a kernel bug, but
+the decline's own measurement is still unreproduced on the current fill.
+Patch 0020's decline is now re-testable (FIX 2b).
 
 Nothing served is affected. BY_TOKEN keys are not a choice arcint makes: the
 plugin defaults to BY_CHANNEL and forces BY_TOKEN only for a graph with

@@ -1,0 +1,114 @@
+# 0035: fix BY_TOKEN fp16 overflow in the test harness key fill
+#
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0003-0034. arcint 0.4.6 series (DESIGN.md section 7.0.2br).
+#
+# What changes:
+#   paged_attention_gpu_test.cpp
+#     The key fill in both mixed-stage test bodies (u4 mixed micro and u8i4
+#     mixed micro) used std::fill_n, giving every dimension of a token's key
+#     vector the same fp16 value. quantize_data() then saw min == max, fell
+#     through to the diff = 0.001 fallback, computed scale = 255000, and
+#     derived a zero-point that overflows fp16 for tokens whose base key value
+#     exceeds ~0.257 (head 1, block 4, token 15: zp ~= -66430, below fp16 min
+#     -65504 -> -inf). The kernel correctly propagated -inf through
+#     decompression -> inf, then softmax hit inf - inf = NaN.
+#
+#     Fix: replace the constant fill with a per-dimension linear ramp
+#     (+/-0.128 over 128 dims, +/-0.256 over 256). This gives quantize_data()
+#     a meaningful range on every token, keeping scale ~= 1000 and zp well
+#     within fp16 bounds. No kernel change -- the bug was in the test data,
+#     not the attention path.
+#
+#     The reproducer suite (0034's DISABLED_arcint_0034_by_token_nan) is
+#     renamed to arcint_0035_by_token_key_fill and enabled -- all 6 cases
+#     pass. The "no mechanism is claimed" note above the by_token helper is
+#     updated: the mechanism is now measured (candidate 1 of 3 from 0034's
+#     header -- the harness's own by-token page writing).
+#
+# WHY THIS WAS A TEST BUG, NOT A KERNEL BUG. The NaN counts from 0034
+# (one KV-head group at 36 keys at head 256, three at 102, all four from 126;
+# exact at 36 keys at head 128) follow arithmetically from the overflow
+# threshold: key_value = -0.2 + 0.4*(t%16)/15 + 0.01*(t/16) + 0.02*head,
+# so fp16 zp overflows when the constant value exceeds 65504/255000 ~= 0.257.
+# Head 3 at head 256 (base 0.26+) overflows from block 0; head 0 at head 128
+# (base -0.2 to +0.21) stays within bounds at 36 keys. Every row of the
+# measurement table matches the prediction, confirming the root cause.
+# Production models always have diverse key dimensions, so this overflow
+# cannot occur outside the harness.
+#
+# MEASURED 2026-09-09 on the 24 GB card, this patch's exact content:
+#   All 6 cases in arcint_0035_by_token_key_fill pass (enabled, no
+#     --gtest_also_run_disabled_tests needed). 14/14 in the 0020 regression
+#     suite pass (no regressions).
+#
+# Package: no floor change. This patch changes the test harness only; arcint's
+# runtime floor stays at +p15.
+
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
+@@ -46,8 +46,11 @@
+             for (int head = 0; head < p.num_kv_heads; ++head) {
+                 const size_t key_offset = (static_cast<size_t>(token) * p.num_kv_heads + head) * p.k_head_size;
+                 const size_t value_offset = (static_cast<size_t>(token) * p.num_kv_heads + head) * p.v_head_size;
+-                std::fill_n(pam.key_data[sequence].begin() + key_offset, p.k_head_size,
+-                            ov::float16{key_value + 0.02f * static_cast<float>(head)});
++                {
++                    const float base = key_value + 0.02f * static_cast<float>(head);
++                    for (int d = 0; d < p.k_head_size; ++d)
++                        pam.key_data[sequence][key_offset + d] = ov::float16{base + 0.002f * static_cast<float>(d - p.k_head_size / 2)};
++                }
+                 for (int d = 0; d < p.v_head_size; ++d) {
+                     const int level = (d / v_group + head + token) % 16 - 7;
+                     pam.value_data[sequence][value_offset + d] = ov::float16{static_cast<float>(level)};
+@@ -133,13 +136,11 @@
+ // at 36 keys, three quarters at 102, all of them from 126. The failure tracks the causal length and
+ // the head size, and ignores the value precision and the kernel. What the common element is -- the
+ // harness's own by-token page writing, its cache sizing, or the key dequantisation both kernels
+-// share -- is NOT measured, and no mechanism is claimed here.
++// share -- the root cause was the test harness key fill (patch 0035): std::fill_n gave every
++// dimension the same value, so quantize_data() hit min==max and overflowed fp16 zp.
+ //
+ // Nothing served is affected: arcint never selects BY_TOKEN keys (the plugin defaults to BY_CHANNEL
+ // and forces BY_TOKEN only for graphs carrying cache-block rotation, which arcint's do not).
+-// The instantiation below is DISABLED for that reason -- it is the reproducer, kept so the next
+-// reader starts from the measurement instead of rebuilding it. Run it with
+-// --gtest_also_run_disabled_tests.
+ static paged_attention_test_params u8i4_mixed_micro_by_token(std::vector<SubsequenceDescriptor> subsequences) {
+     paged_attention_test_params p = u8i4_mixed_micro_served(std::move(subsequences));
+     p.key_cache_quant_mode = ov::internal::CacheQuantMode::BY_TOKEN;
+@@ -195,8 +196,11 @@
+             for (int head = 0; head < p.num_kv_heads; ++head) {
+                 const size_t key_offset = (static_cast<size_t>(token) * p.num_kv_heads + head) * p.k_head_size;
+                 const size_t value_offset = (static_cast<size_t>(token) * p.num_kv_heads + head) * p.v_head_size;
+-                std::fill_n(pam.key_data[sequence].begin() + key_offset, p.k_head_size,
+-                            ov::float16{key_value + 0.02f * static_cast<float>(head)});
++                {
++                    const float base = key_value + 0.02f * static_cast<float>(head);
++                    for (int d = 0; d < p.k_head_size; ++d)
++                        pam.key_data[sequence][key_offset + d] = ov::float16{base + 0.002f * static_cast<float>(d - p.k_head_size / 2)};
++                }
+                 for (int d = 0; d < p.v_head_size; ++d) {
+                     const int level = (d / v_group + head + token) % 16 - 7;
+                     pam.value_data[sequence][value_offset + d] = ov::float16{static_cast<float>(level)};
+@@ -282,15 +286,15 @@
+                       u8i4_mixed_micro_served({{3, 1000}}),
+                       u8i4_mixed_micro_served({{3, 1000}}, "reverse")));
+
+-// arcint (patch 0034): the by-token reproducer, disabled -- see the note on
+-// u8i4_mixed_micro_by_token above. Exact at 36 keys, all-NaN at 132, at both value precisions.
++// arcint (patch 0035): the by-token key-fill fix -- the constant fill overflowed fp16 zp in
++// quantize_data(); the per-dimension ramp keeps every token's range meaningful (DESIGN 7.0.2br).
+ INSTANTIATE_TEST_SUITE_P(
+-    DISABLED_arcint_0034_by_token_nan,
++    arcint_0035_by_token_key_fill,
+     paged_attention_u8i4_mixed_micro_test,
+     ::testing::Values(u8i4_by_token_default_geom({{2, 34}}),               // exact
+                       u8u8_by_token(u8i4_by_token_default_geom({{2, 34}})),  // exact
+-                      u8i4_by_token_default_geom({{2, 130}}),              // all NaN, generic kernel
+-                      u8u8_by_token(u8i4_by_token_default_geom({{2, 130}})),  // all NaN, micro SDPA
++                      u8i4_by_token_default_geom({{2, 130}}),              // was NaN, now passes
++                      u8u8_by_token(u8i4_by_token_default_geom({{2, 130}})),  // was NaN, now passes
+                       u8i4_mixed_micro_by_token({{2, 130}}),               // served geometry
+                       u8u8_by_token(u8i4_mixed_micro_by_token({{2, 130}}))));
+ #endif

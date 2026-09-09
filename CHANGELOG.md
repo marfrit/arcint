@@ -123,6 +123,21 @@ skip).
   cache-block rotation, which arcint's do not carry), and every by-channel
   case is exact.
 
+### Plugin patch 0035: BY_TOKEN key-fill fix (test harness only)
+
+- **Root cause found for 0034's BY_TOKEN NaN** (DESIGN §7.0.2br). The
+  mixed-stage test's key fill (`std::fill_n`) gave every dimension the same
+  fp16 value. `quantize_data()` hit `min == max`, used the `diff = 0.001`
+  fallback, computed `scale = 255000`, and derived a zero-point that
+  overflows fp16 for tokens whose base key value exceeds ~0.257 — producing
+  −inf, then inf through decompression, then NaN in softmax. Every row of
+  0034's measurement table matches the prediction arithmetically.
+- **Fix**: per-dimension linear ramp (±0.128 over 128 dims) replaces the
+  constant fill at both test bodies. All 6 cases from 0034's reproducer
+  suite pass enabled; 14/14 in the 0020 regression suite pass.
+- **No kernel change, no floor change.** The bug was in the test data, not the
+  attention path. Patch 0020's declined combination is now re-testable.
+
 ## 0.4.4 — 2026-09-08
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033);
