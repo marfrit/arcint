@@ -216,13 +216,14 @@ fi
 # for the same reason: byte-identity alone would also pass a head that is never
 # accepted, so acceptance has to be non-zero too.
 #
-# The acceptance gate below has one more corner (DESIGN §7.0.2br, "the
-# equivalence suite on a GGUF-opened model"): the MTP head served is always the
-# template export's own IR (openvino_mtp_layer.xml / openvino_mtp_lm_head.xml),
-# never part of a GGUF file's body, and acceptance against a GGUF-opened model
-# was MEASURED at 0%. Why it is exactly zero is not measured -- that is a fact
-# about the pairing, recorded, not a mechanism -- so the gate reports it rather
-# than failing, and only when the head demonstrably ran (see the condition).
+# A GGUF-opened model's head was measured at 0% acceptance through 0.4.5,
+# because the hidden-state tap only recognised MatMul and a GGUF-opened
+# model's output head is FullyConnectedKQuant -- the tap failed, MTP was
+# disabled at load, and the drafter never ran. With the tap fixed, the same
+# configuration measures 73.0% acceptance (24 GB card, dense template opened
+# with --gguf over a Q4_K_M file, --paged-kv u8, 2026-09-09), so a GGUF-opened
+# model's drafter is gated exactly like an IR-opened model's below -- there is
+# no separate skip for it any more.
 if [[ -f "$MODEL/openvino_mtp_layer.xml" && -f "$MODEL/openvino_mtp_lm_head.xml" ]]; then
   start_server "$WORK/mtpoff.log" --mtp off || exit 1
   ask "$WORK/mtpoff.txt" "$PROMPT"
@@ -253,15 +254,6 @@ if [[ -f "$MODEL/openvino_mtp_layer.xml" && -f "$MODEL/openvino_mtp_lm_head.xml"
   macc=$(grep -o 'draft accept \([0-9.]*\)%' "$WORK/mtpon.log" | tail -1 | grep -o '[0-9.]*')
   if [[ -n "$macc" ]] && awk "BEGIN{exit !(${macc:-0} > 10)}"; then
     pass "the MTP head is actually accepting (${macc}%)"
-  elif [[ "$GGUF_OPENED" == "1" && -n "$macc" ]] && grep -q 'GGUF-opened model' "$WORK/mtpon.log"; then
-    # Only when the head actually ran and accepted nothing. An EMPTY $macc means
-    # there was no "draft accept" line at all -- the head failed to compile,
-    # expose_hidden_state failed, the process fell over, or the log format moved
-    # -- and folding that into the skip would hide a real regression on every
-    # GGUF run. The grep ties the skip to the server's own load-time warning, so
-    # the two say the same thing or the gate fails.
-    echo "     MTP acceptance ${macc}%: measured inert on a GGUF-opened model (DESIGN §7.0.2br); the served head is the template export's, and why acceptance is exactly zero is not measured"
-    echo "ACCEPTANCE-SKIP mtp-acceptance gguf-opened-head-inert"
   else
     fail "the MTP head is actually accepting (got ${macc:-no}% -- the head is inert)"
   fi

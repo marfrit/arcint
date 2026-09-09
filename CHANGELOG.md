@@ -17,6 +17,39 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.4.6 — 2026-09-09
+
+Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033) —
+unchanged from 0.4.5. No plugin patch.
+
+### The hidden-state tap on a GGUF-opened model: it never ran
+
+`expose_hidden_state` — the walk that publishes the base model's final hidden
+state so the MTP head can be primed on a prompt — accepted only `MatMul` as
+the LM-head terminator. A GGUF-opened model whose `output.weight` stays in the
+file's rows has `FullyConnectedKQuant` there instead, so the walk failed at
+hop 0, MTP was silently disabled, and the drafter never proposed a token.
+The "0 % accepted" measured at 0.4.3 (DESIGN §7.0.2br) was the symptom; the
+framing ("the drafter proposes tokens the body rejects") was wrong. Fixed: the
+walk accepts `FullyConnectedKQuant` alongside `MatMul`, a failure logs the node
+it stopped on, and the same configuration now measures **73.0 % acceptance**
+with the greedy text byte-identical across both arms. The `gguf_mtp_inert_warning`
+introduced at 0.4.5, premised on the 0 % being a pairing property, is retired
+with its tests and its equivalence-suite skip path. DESIGN §7.0.2bw.
+
+Root cause: the same backward walk existed twice in `backend_ov.cpp`, twenty
+lines apart; `slice_logits_to_last_token` was taught the K-quant head at 0.4.1
+and `expose_hidden_state` was not, in the same pass.
+
+### The contrib agent recipe tracks the dense 27B agent
+
+`contrib/systemd/arcint-agent.service` still described the 35B MoE agent
+(`qwen3.6-35b-a3b`, `--paged-kv u8`, no `--mtp`, `--n-ctx 262144`). It now
+carries the dense 27B agent configuration: `qwen3.8-27b`, `--paged-kv u8:i4`,
+`--mtp on`, `--n-ctx 151552`, `--prefill-chunk 512`. Flags that are no-ops on a
+dense model (`--gate-pad`) or already the default (`--repetition-penalty 1.0`)
+are omitted; the recipe is a template, not a unit dump.
+
 ## 0.4.5 — 2026-09-08
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033) —

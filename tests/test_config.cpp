@@ -639,30 +639,6 @@ TEST(tier_prefix_cache_decision_tier_and_cache_with_static_partition_allows) {
                .has_value());
 }
 
-// gguf_mtp_inert_warning's four corners (DESIGN §7.0.2br): the MTP head
-// served is always the template export's own IR, never part of the GGUF
-// file's body, so MTP against a GGUF-opened model is inert regardless of
-// what the file replaced elsewhere in the graph. Warns exactly the one
-// corner where both a GGUF file was opened AND MTP is actually wanted.
-TEST(gguf_mtp_inert_warning_no_gguf_allows_regardless_of_mtp) {
-    CHECK(!gguf_mtp_inert_warning(/*gguf_opened=*/false, /*mtp_wanted=*/true).has_value());
-}
-
-TEST(gguf_mtp_inert_warning_mtp_not_wanted_allows_regardless_of_gguf) {
-    CHECK(!gguf_mtp_inert_warning(/*gguf_opened=*/true, /*mtp_wanted=*/false).has_value());
-}
-
-TEST(gguf_mtp_inert_warning_neither_allows) {
-    CHECK(!gguf_mtp_inert_warning(/*gguf_opened=*/false, /*mtp_wanted=*/false).has_value());
-}
-
-TEST(gguf_mtp_inert_warning_gguf_and_mtp_wanted_warns) {
-    const auto warning = gguf_mtp_inert_warning(/*gguf_opened=*/true, /*mtp_wanted=*/true);
-    CHECK(warning.has_value());
-    CHECK(warning->find("head") != std::string::npos);
-    CHECK(warning->find("file") != std::string::npos);
-}
-
 TEST(config_fit_margin_mib_defaults_256) {
     Config cfg;
     CHECK(run({"--stub"}, cfg).ok);

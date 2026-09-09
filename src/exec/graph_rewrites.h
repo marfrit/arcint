@@ -20,4 +20,17 @@ namespace lgc {
 // model untouched, when the head is not unmistakably one of those two.
 bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model, int64_t keep_rows, int64_t token_axis);
 
+// Publishes the base model's final hidden state -- the LM head's activation
+// input -- as a second output named "hidden_states", so the MTP head can be
+// primed on a prompt instead of seeing only the rows the logits slice keeps
+// (backend_ov.cpp: this has to run before that slice). The head is the same
+// terminator slice_logits_to_last_token walks to: the MatMul the walk from
+// the first Result reaches through Convert/Reshape only, or the
+// FullyConnectedKQuant a GGUF-opened model has in its place when
+// output.weight stays in the file's rows (exec/kquant_op.h). Returns false,
+// and leaves the model untouched, when the head is not unmistakably one of
+// those two within 8 hops -- --mtp on then has no hidden state to prime the
+// head with (log tag "mtp").
+bool expose_hidden_state(const std::shared_ptr<ov::Model>& model);
+
 }  // namespace lgc

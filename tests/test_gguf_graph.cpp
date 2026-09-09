@@ -459,4 +459,52 @@ TEST(gguf_pass_slices_the_logits_at_a_kquant_lm_head) {
     }
 }
 
+// expose_hidden_state (backend_ov.cpp, primes the MTP head, DESIGN's MTP
+// section) walks the same MatMul-or-FullyConnectedKQuant terminator as
+// slice_logits_to_last_token above. Before this fix the walk knew only
+// MatMul: a GGUF export whose output.weight stays in the file's rows always
+// has FullyConnectedKQuant there instead (exec/kquant_op.h), so --mtp on
+// over such an export logged "could not expose the hidden state; MTP
+// disabled" and drafted nothing, ever -- measured on the dense template
+// (--gguf, a Q4_K_M file, --paged-kv u8). The three cases
+// below are the two terminators the fix accepts and one node that is
+// neither, which must still fail closed.
+TEST(gguf_pass_exposes_the_hidden_state_at_a_kquant_or_matmul_head) {
+    // A MatMul head, the case that always worked: the control.
+    {
+        auto x = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 8});
+        auto w = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{4, 8}, std::vector<float>(32, 1.0f));
+        auto head = std::make_shared<ov::op::v0::MatMul>(x, w, false, true);
+        auto model = std::make_shared<ov::Model>(ov::ResultVector{std::make_shared<ov::op::v0::Result>(head)}, ov::ParameterVector{x}, "mm_head");
+        CHECK(expose_hidden_state(model));
+        CHECK_EQ(model->get_results().size(), size_t{2});
+        if (model->get_results().size() != 2) return;
+        CHECK_EQ(model->get_results()[1]->input_value(0).get_node_shared_ptr().get(), static_cast<ov::Node*>(x.get()));
+        CHECK_EQ(model->get_results()[1]->get_output_tensor(0).get_names().count("hidden_states"), size_t{1});
+    }
+    // A K-quant head, the case that used to fail closed at hop 0: Q8_0, K = 256, N = 16.
+    {
+        const int64_t k = 256, n = 16;
+        auto x = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::PartialShape{-1, 1, k});
+        auto w = ov::op::v0::Constant::create(ov::element::u8, ov::Shape{size_t(n), size_t(FullyConnectedKQuant::row_bytes(8, k))},
+                                              std::vector<uint8_t>(size_t(n) * size_t(FullyConnectedKQuant::row_bytes(8, k)), 0));
+        auto head = std::make_shared<FullyConnectedKQuant>(x, w, 8, k, n);
+        auto model = std::make_shared<ov::Model>(ov::ResultVector{std::make_shared<ov::op::v0::Result>(head)}, ov::ParameterVector{x}, "kq_head");
+        CHECK(expose_hidden_state(model));
+        CHECK_EQ(model->get_results().size(), size_t{2});
+        if (model->get_results().size() != 2) return;
+        CHECK_EQ(model->get_results()[1]->input_value(0).get_node_shared_ptr().get(), static_cast<ov::Node*>(x.get()));
+        CHECK_EQ(model->get_results()[1]->get_output_tensor(0).get_names().count("hidden_states"), size_t{1});
+    }
+    // Neither: an Add straight into the Result. Must fail closed and leave the model untouched.
+    {
+        auto x = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 8});
+        auto c = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{8}, std::vector<float>(8, 1.0f));
+        auto head = std::make_shared<ov::op::v1::Add>(x, c);
+        auto model = std::make_shared<ov::Model>(ov::ResultVector{std::make_shared<ov::op::v0::Result>(head)}, ov::ParameterVector{x}, "neither");
+        CHECK(!expose_hidden_state(model));
+        CHECK_EQ(model->get_results().size(), size_t{1});
+    }
+}
+
 #endif  // ARCINT_OPENVINO

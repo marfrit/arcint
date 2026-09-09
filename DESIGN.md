@@ -8488,7 +8488,11 @@ GiB (16.30 split), 1,001 t/s warm and 54.8 ms (53.5 split), 112k
 tokens at `u8` (120k split), and `--mtp on` on a GGUF-opened model is
 inert (above).
 Slower on every axis and larger; its case is serving the file's own
-quantisation. Nothing was changed. If the file's weights are wanted
+quantisation. *(One of those axes is withdrawn, §7.0.2bw: the drafter was not
+inert on a GGUF-opened model, it was switched off at load by a defect in the
+hidden-state tap. With that fixed it accepts 73.0 % and is output-neutral, so
+this verdict's drafter column no longer holds and the resident-size and rate
+columns are what remain of it.)* Nothing was changed. If the file's weights are wanted
 on a unit: `--gguf-mins split`, `--mtp off`, `--n-ctx` at or under
 120k at `u8`, through the unit manager's rollout, not a hand edit.
 
@@ -8891,7 +8895,9 @@ elements already NaN at 36 keys at head 256 -- is not that pattern. The two
 were taken on different fills and different geometries and are not the same
 measurement; which of the differences accounts for it is unmeasured.
 
-**MTP on a GGUF-opened model is inert, and now says so.** §7.0.2br measured
+**MTP on a GGUF-opened model is inert, and now says so.** *(Retracted the next
+day, §7.0.2bw: it was never inert. The head was switched off at load and never
+drafted at all; "0 % accepted" was measured correctly and framed wrongly.)* §7.0.2br measured
 `--mtp on` against a GGUF-opened model accepting 0 %: the head served is
 always the template export's own IR, and its weights are not part of the
 file's body, so the drafter proposes tokens the body rejects. The server said
@@ -8928,6 +8934,54 @@ length in the K/V allocation -- a 129-row view of a 151-row allocation whose
 tail holds NaN, against the same rows in an exact allocation. Green 5/5 on
 the 24 GB card, and it was in no patch until now; patch 0034 carries it. It
 costs nothing and it guards the form patch 0032 fixed on the paged side.
+
+#### 7.0.2bw 0.4.6, the hidden-state tap and the retired inert-MTP warning: one walk that did not know the K-quant head, and a warning that framed its symptom as a fact (2026-09-09)
+
+Two gaps, one root cause.
+
+**Gap A: `expose_hidden_state` failed on every GGUF-opened model.** The walk
+from the first Result to the LM-head projection accepted only
+`ov::op::v0::MatMul` as its terminator. A GGUF-opened model whose
+`output.weight` stays in the file's rows has `FullyConnectedKQuant` in its
+place (`exec/kquant_op.h`), so the walk failed at hop 0 on every such model,
+`want_mtp_` was set to false, and the drafter never ran. The "0 % accepted"
+measured in §7.0.2br was correct -- no tokens were accepted -- but the framing
+("the drafter proposes tokens the body rejects") was wrong: it never proposed.
+The walk now accepts `FullyConnectedKQuant` alongside `MatMul`, and a failure
+logs the node the walk stopped on with its type and friendly name.
+
+Root cause: the same backward walk exists twice in `backend_ov.cpp`, twenty
+lines apart. `slice_logits_to_last_token` was taught the K-quant head on
+2026-09-07 (§7.0.2bg); `expose_hidden_state` was not, in the same pass. The
+duplication is a defect in its own right and is carried as a separate item.
+
+**Gap B: the `gguf_mtp_inert_warning` is retired.** The load-time warning
+introduced in §7.0.2bv ("the MTP head served is the template export's...
+measured at 0 % accepted") was premised on the 0 % being a fact about the
+artifact pairing. With the tap fixed, the same configuration measures **73.0 %
+acceptance** (the 24 GB card, the dense template opened with `--gguf` over a
+Q4_K_M file, `--paged-kv u8`), and the drafter's text matches the non-MTP arm
+byte for byte. The 0 % was a defect, not a pairing property, so the warning,
+its declaration (`config.h`), its definition (`config.cpp`), its four unit
+tests (`test_config.cpp`), and the equivalence suite's `ACCEPTANCE-SKIP
+mtp-acceptance gguf-opened-head-inert` path (`tests/equivalence/run.sh`) are
+all removed. A GGUF-opened model's drafter is gated exactly like an IR-opened
+model's: acceptance above the threshold passes, below it fails.
+
+Measured on the 24 GB card, the dense template opened with `--gguf` over the
+15.3 GB Q4_K_M file, `--paged-kv u8`:
+
+- Red (before the fix): `hidden state walk stopped at hop 0 on
+  FullyConnectedKQuant "__module.model.lm_head/ov_ext::linear/MatMul"`,
+  `/props` `mtp enabled false`, `draft accept 0.0 %`.
+- Green (with the fix): no warning, `mtp enabled true`, **`draft accept
+  73.0 %`**, greedy text `283b2c44` identical across all four requests of both
+  arms.
+
+Red-first tests (`tests/test_gguf_graph.cpp`): the MatMul head (the control),
+the K-quant head (the case that failed), and an `Add` node (neither terminator
+-- must fail closed). The function is declared in `exec/graph_rewrites.h` and
+defined outside the anonymous namespace, same as `slice_logits_to_last_token`.
 
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 

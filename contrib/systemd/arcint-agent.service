@@ -1,45 +1,34 @@
-# arcint-agent — Qwen3.6-35B-A3B on the 24 GB card, the agent endpoint.
+# arcint-agent — Qwen3.8-27B dense + MTP on the 24 GB card, the agent endpoint.
 #
-# Why this card and this model (measured 2026-08-30, same tasks, same probes):
-#   here     62.7 t/s decode at 53.5k context, 1584 t/s prefill
-#   before   12.45 t/s on llama.cpp/Vulkan on the 16 GB card, ~58 t/s prefill
-# Acceptance task 10/10 greedy, tool probe 3/3. The IR is Intel's official
-# export of the checkpoint. The model fits the card whole: weights+graph
-# 17.38 GiB of 22.71, the reservation admitting 377552 tokens against a
-# trained maximum of 262144. No offload, no streaming, no CPU experts.
+# The dense 27B on GPU.0 (the 24 GB card). Weights+graph 13.4 GiB of 22.71
+# usable, the reservation admitting 151,552 tokens at u8:i4 KV with an 8 GiB
+# prefix cache and MTP on. Acceptance task 10/10 greedy, tool probe 3/3.
 #
-# --n-ctx (0.2.13, M7 fit pass): the fit pass now verifies an explicit depth
-# against a measured reservation at start and refuses loudly, itemized, if the
-# card cannot hold it; the prefix cache's reserve pages are trimmed before any
-# refusal, the request itself is never lowered. Ship the depth as a multiple of
-# 4096 at or below what the log reports as admissible for THIS model on THIS
-# card. Verified under the 0.2.13 ledger (2026-09-03, u8, 8 GiB prefix
-# cache, one lane): the explicit 262144 below comes up with 16,386 live pages
-# and 6,816 spare pages for cached prefixes after the reserve trim -- the
-# trained maximum, the depth this unit has always shipped.
+# --n-ctx (0.3.0+, M7 fit pass): the fit verifies an explicit depth against
+# a measured reservation at start and refuses loudly if the card cannot hold
+# it; the prefix cache's reserve pages are trimmed before any refusal.
 
 [Unit]
-Description=arcint-agent — Qwen3.6-35B-A3B on OpenVINO, GPU.0 (Arc Pro B60), :8087
+Description=arcint-agent — Qwen3.8-27B dense + MTP on OpenVINO, GPU.0, :8087
 Documentation=https://github.com/marfrit/arcint
 After=default.target
-# One card, one resident model: name the other units that want this card.
-#Conflicts=some-other-engine-on-gpu0.service
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/arcint \
-    --model /models/ov/qwen36-35b-a3b-int4-ov \
-    --model-id qwen3.6-35b-a3b \
-    --served-model-name qwen3.6-agent \
+    --model /models/ov/qwen38-b7c1-ov \
+    --model-id qwen3.8-27b \
+    --served-model-name qwen3.8-agent \
     --device GPU.0 \
     --host 0.0.0.0 \
     --port 8087 \
-    --n-ctx 262144 \
+    --n-ctx 151552 \
     --prefix-cache-mib 8192 \
     --cache-dir %h/.cache/arcint-agent \
     --queue-timeout 30 \
-    --paged-kv u8 \
-    --gate-pad 16
+    --prefill-chunk 512 \
+    --paged-kv u8:i4 \
+    --mtp on
 Restart=on-failure
 RestartSec=30
 TimeoutStartSec=20min

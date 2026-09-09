@@ -6,3 +6,4 @@ CLAUDE.local.md
 *.local.md
 .claude/
 *.local.md.tmp.*
+*.local.md.bak*

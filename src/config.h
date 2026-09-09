@@ -352,25 +352,6 @@ bool kv_precision_is_packed_four_bit(const std::string& requested, const std::st
 std::optional<std::string> tier_prefix_cache_decision(bool static_partition_reported, bool tier_on,
                                                        int prefix_cache_mib);
 
-// `--mtp on` against a GGUF-opened model (DESIGN §7.0.2br, "the equivalence
-// suite on a GGUF-opened model"). MEASURED, once: acceptance is 0% -- the
-// drafter proposes and nothing is accepted, on the 24 GB card in the mixed
-// form, arcint 0.4.3 on +p12. What is also fact: the MTP head served is
-// always the template export's own openvino_mtp_layer.xml /
-// openvino_mtp_lm_head.xml, because GGUF-opening replaces the main graph's
-// weights and the head's weights are not in the file at all.
-//
-// WHY acceptance is exactly zero is NOT measured, and this warning does not
-// say. Several candidates are untested -- which node expose_hidden_state
-// taps on a GGUF-native graph, where the drafted token's embeddings come
-// from, whether the file and the template export are even the same
-// checkpoint -- and CLAUDE.md's rule is that an explanation without a
-// measurement of its root cause is not carried. So the warning names the
-// pairing and the measurement, not a mechanism: it exists only so a silent
-// 0% does not read as a defect on every request. Returns std::nullopt when
-// there is nothing to warn about (no GGUF file opened, or MTP not wanted).
-std::optional<std::string> gguf_mtp_inert_warning(bool gguf_opened, bool mtp_wanted);
-
 // Strict base-10 uint64 parse: refuses empty input and trailing garbage
 // (strtoull alone happily parses "8e9" as 8 and ignores "e9"), and refuses
 // any value that does not round-trip through decimal formatting -- which

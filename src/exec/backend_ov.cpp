@@ -301,25 +301,8 @@ ov::Tensor deserialise_state(const std::vector<uint8_t>& blob) {
 // only computes on its way into the LM head. Exposing it as a second output
 // costs nothing; it has to happen *before* the logits slice, or the head would
 // see only the rows the slice keeps and could not be primed over a prompt.
-bool expose_hidden_state(const std::shared_ptr<ov::Model>& model) {
-    const auto& results = model->get_results();
-    if (results.empty()) return false;
-
-    std::shared_ptr<ov::Node> node = results[0]->input_value(0).get_node_shared_ptr();
-    for (int hop = 0; hop < 8 && node && node->get_input_size() > 0; ++hop) {
-        if (ov::as_type_ptr<ov::op::v0::MatMul>(node) != nullptr) break;
-        const std::string t = node->get_type_name();
-        if (t != "Convert" && t != "Reshape") return false;
-        node = node->input_value(0).get_node_shared_ptr();
-    }
-    if (ov::as_type_ptr<ov::op::v0::MatMul>(node) == nullptr) return false;
-
-    const auto res = std::make_shared<ov::op::v0::Result>(node->input_value(0));
-    res->get_output_tensor(0).set_names({"hidden_states"});
-    model->add_results({res});
-    model->validate_nodes_and_infer_types();
-    return true;
-}
+// Definition moved below, out of this anonymous namespace (declared in
+// exec/graph_rewrites.h for its test, same as slice_logits_to_last_token).
 
 // The DFlash2 drafter conditions on the residual stream after target layers
 // {ids}: HF's hidden_states[id+1], which is the value entering layer id+1's
@@ -701,6 +684,59 @@ bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model,
 
     const auto slice = std::make_shared<ov::op::v8::Slice>(hidden, start, stop, step, ax);
     node->input(0).replace_source_output(slice->output(0));
+    model->validate_nodes_and_infer_types();
+    return true;
+}
+
+// Declared in exec/graph_rewrites.h: outside the anonymous namespace for its
+// test, same as slice_logits_to_last_token above, whose walk this mirrors.
+//
+// Measured on the 24 GB card, dense template opened with --gguf over a
+// Q4_K_M file, --paged-kv u8:
+//
+//   lgc  mtp:  could not expose the hidden state; MTP disabled
+//   lgc  mtp:  --mtp on, but this export carries no MTP head
+//
+// i.e. --mtp on silently drafts zero tokens rather than drafting and being
+// rejected. The walk below used to accept only ov::op::v0::MatMul as the LM
+// head, so a GGUF export whose output.weight stays in the file's rows --
+// FullyConnectedKQuant in its place (exec/kquant_op.h), input 0 the
+// activation exactly as for MatMul (gguf_graph.cpp:472,478) -- failed at hop
+// 0 every time: not measured until the log lines below named the node.
+bool expose_hidden_state(const std::shared_ptr<ov::Model>& model) {
+    const auto& results = model->get_results();
+    if (results.empty()) return false;
+
+    const auto is_kquant = [](const std::shared_ptr<ov::Node>& n) {
+        return n && std::string(n->get_type_name()) == "FullyConnectedKQuant";
+    };
+
+    std::shared_ptr<ov::Node> node = results[0]->input_value(0).get_node_shared_ptr();
+    int hop = 0;
+    for (; hop < 8 && node && node->get_input_size() > 0; ++hop) {
+        if (ov::as_type_ptr<ov::op::v0::MatMul>(node) != nullptr || is_kquant(node)) break;
+        const std::string t = node->get_type_name();
+        if (t != "Convert" && t != "Reshape") {
+            log::warn("mtp",
+                      "hidden state walk stopped at hop %d on %s \"%s\": not MatMul, "
+                      "FullyConnectedKQuant, Convert or Reshape",
+                      hop, t.c_str(), node->get_friendly_name().c_str());
+            return false;
+        }
+        node = node->input_value(0).get_node_shared_ptr();
+    }
+    if (node == nullptr || (ov::as_type_ptr<ov::op::v0::MatMul>(node) == nullptr && !is_kquant(node))) {
+        log::warn("mtp",
+                  "hidden state walk gave up after %d hop(s) at %s \"%s\": not a MatMul or "
+                  "FullyConnectedKQuant projection head",
+                  hop, node ? node->get_type_name() : "<null>",
+                  node ? node->get_friendly_name().c_str() : "<null>");
+        return false;
+    }
+
+    const auto res = std::make_shared<ov::op::v0::Result>(node->input_value(0));
+    res->get_output_tensor(0).set_names({"hidden_states"});
+    model->add_results({res});
     model->validate_nodes_and_infer_types();
     return true;
 }
@@ -2537,13 +2573,6 @@ private:
         // One drafter per verify loop: an explicit --mtp on + --dflash is a
         // config error; mtp auto yields to the requested drafter.
         want_mtp_ = cfg.mtp != "off" && artifact_.has_mtp_head && !want_dflash_;
-        // DESIGN §7.0.2br: said once at load rather than left to read as an
-        // unexplained 0% acceptance on every request. Paged-only on purpose
-        // -- --gguf is refused on the stateful path (config.cpp), so there
-        // is nothing to warn about there.
-        if (const auto warning = gguf_mtp_inert_warning(!cfg.gguf_path.empty(), want_mtp_)) {
-            log::warn("mtp", "%s", warning->c_str());
-        }
         if (want_mtp_ && !expose_hidden_state(model)) {
             log::warn("mtp", "%s", "could not expose the hidden state; MTP disabled");
             want_mtp_ = false;

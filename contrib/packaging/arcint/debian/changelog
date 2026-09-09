@@ -1,3 +1,15 @@
+arcint (0.4.6-1) trixie; urgency=medium
+
+  * 0.4.6: the hidden-state tap on a GGUF-opened model never ran -- the
+    walk accepted only MatMul, not FullyConnectedKQuant, so --mtp on over a
+    GGUF-opened model silently disabled the drafter since 0.4.0. Fixed: the
+    same configuration measures 73.0% acceptance with byte-identical greedy
+    text. The gguf_mtp_inert_warning (0.4.5) is retired. The contrib agent
+    recipe mirrors the served dense 27B unit. Runtime floor unchanged:
+    marfrit-openvino +p15 (patches 0003-0033). DESIGN 7.0.2bw.
+
+ -- Markus Fritsche <fritsche.markus@gmail.com>  Tue, 09 Sep 2026 12:00:00 +0200
+
 arcint (0.4.5-1) trixie; urgency=medium
 
   * 0.4.5: the small open items of the 0.4.4 handoff. /props reports the
