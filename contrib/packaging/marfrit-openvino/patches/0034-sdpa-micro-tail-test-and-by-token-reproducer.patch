@@ -1,0 +1,256 @@
+# Two tests and no kernel change: the single-query micro-SDPA tail test, and the by-token
+# reproducer that kept patch 0020's decline in place
+
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on top of
+# patches/0003-0033. arcint 0.4.5 series (DESIGN.md section 7.0.2bv).
+#
+# What changes:
+#   sdpa_gpu_test.cpp   The single-query micro SDPA's tail test, five cases: is the output
+#                       independent of what lies PAST the sequence length in the K/V allocation?
+#                       K and V are a 129-row view of a 151-row allocation whose tail holds NaN
+#                       (or 65504), against the same rows in an exact allocation. This is the
+#                       non-paged neighbour of what patch 0032 fixed on the paged side, where the
+#                       prefill's next-K-tile prefetch walked 256 rows from inside row 0 of K. A
+#                       served drafter head (24 heads, head 256, 129 keys) reuses a grown buffer
+#                       on its second request, so a kernel reading past the sequence length would
+#                       change its draft with no input changing. The test passed on 2026-09-08 and
+#                       was carried in no patch; it costs nothing.
+#   paged_attention_gpu_test.cpp
+#                       The by-token reproducer, DISABLED, plus the helpers it needs, plus a
+#                       dispatch line that PRINTS the kernel actually chosen instead of asserting
+#                       micro SDPA for every case (the by-token cases deliberately take the
+#                       generic kernel: patch 0020's decline is live for them). The by-channel
+#                       cases -- what arcint serves -- still assert micro SDPA.
+#
+# WHY THE DECLINE STAYS. The 0.4.4 handoff asked for patch 0020's declined pairing (four-bit
+# values under BY_TOKEN keys, declined on a 2026-09-05 measurement of NaN past 128 keys) to be
+# re-tested with patch 0033's discriminating fill under the three page orders, and lifted if
+# green. It is not green, and not for the expected reason. Measured 2026-09-08 on the 24 GB card,
+# one fresh process per cell, the served geometry (24 heads, 4 KV heads, head 256, block 16)
+# unless stated, routing read from the dispatched kernel list rather than assumed:
+#
+#   by-token, i4 values,  36 keys                    generic kernel   3,072 of 12,288 elements NaN
+#   by-token, i4 values, 102 keys                    generic kernel   9,216 of 12,288 NaN
+#   by-token, i4 values, 126 and 128 keys            generic kernel   every element NaN
+#   by-token, i4 values, 132-1,003 keys, 3 orders    generic kernel   every element NaN
+#   by-token, U8 VALUES, 132-1,003 keys, 3 orders    MICRO SDPA       every element NaN
+#   by-channel, all of patches_0020_..._u8i4_mixed_micro  micro SDPA  none; max error 0.000488
+#
+# The eight-bit row settles it: that pairing is not what 0020 declines, it runs on a different
+# kernel, and it fails identically. Two kernels producing all-NaN from one fill point at
+# something the two runs share -- which of the candidates below that is was not measured, and
+# note the third of them is itself kernel-side. The fill is not simply unusable either -- at the test's
+# DEFAULT geometry (32 heads, 2 KV heads, head 128) the by-token cases are exact at 36 keys (max
+# 0.002, no NaN, both value precisions) and all-NaN at 132:
+#
+#   head 128:  36 keys exact                                      132 keys all NaN
+#   head 256:  36 keys 25% NaN, 102 keys 75%, 126 keys all        132 keys all NaN
+#
+# The NaN counts are whole KV-head groups, not scattered elements: at 24 query heads over 4 KV
+# heads and head 256 each row is 6,144 elements and each KV-head group is 6 query heads, so 3,072
+# is one group, 9,216 three, 12,288 all four -- one group at 36 keys, three at 102, all four from
+# 126. Arithmetic on the counts, not a mechanism; it constrains all three candidates the same way:
+# whatever the common element is, it fails per KV head.
+#
+# So what is measured is a NaN that tracks the causal length and the head size and ignores both
+# the value precision and the kernel. NO MECHANISM IS CLAIMED: the common element -- the harness's
+# own by-token page writing, its cache sizing, or the key dequantisation both kernels share -- was
+# not measured. The re-test cannot reach a verdict on this instrument, because the instrument
+# fails in a configuration the decline does not govern; the decline stays, and the six cases that
+# carry the finding ship DISABLED so the next reader starts from the measurement rather than
+# rebuilding it (run with --gtest_also_run_disabled_tests).
+#
+# Nothing served is affected: arcint never selects BY_TOKEN keys -- the plugin defaults to
+# BY_CHANNEL and forces BY_TOKEN only for a graph carrying cache-block rotation, which arcint's
+# graphs do not (DESIGN 7.0.2br) -- and every by-channel case is exact.
+#
+# Not retracted, not reproduced: patch 0020's own note recorded this pairing as NaN "for every
+# query whose causal context passes 128 keys, and only those", measured 2026-09-05 on the staged
+# tree with that patch's own by-token test and the fill of the time. A quarter of the elements NaN
+# at 36 keys at head 256 is not that pattern. The two were taken on different fills and different
+# geometries; which difference accounts for it is unmeasured.
+#
+# MEASURED 2026-09-08 on the 24 GB card, this patch's exact content, on a a plugin test build reconfigured
+# with ENABLE_DEBUG_CAPS=OFF:
+#   The whole paged_attention and sdpa unit suites: 320 tests ran, 280 passed, 40 skipped
+#     (pre-existing vlsdpa skips), 0 failed. The tail test 5/5. The disabled instantiation
+#     contributes 0 runs, as intended.
+#   Served, unchanged: the agent configuration's 130-token prompt gives 825b1747 on three
+#     requests of one process, and the equivalence suite passes on both units' configurations
+#     (24 GB card at u8:i4, 13 gates; 16 GiB card at u8, 9 gates plus that artifact's MTP skip).
+#
+# Package: no floor change. This patch adds tests and changes no kernel; arcint's runtime floor
+# stays at +p15.
+
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/sdpa_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/sdpa_gpu_test.cpp
+@@ -362,6 +362,84 @@
+     }
+ }
+ 
++// arcint (patch 0034): does the single-query micro SDPA's output depend on what lies in the K/V
++// buffers BEYOND the sequence length? K and V are given as a 129-row view of a 151-row allocation
++// whose tail holds NaN (or 65504), against the same 129 rows in an exact allocation. This is the
++// non-paged form patch 0032 fixed on the paged side: there the prefill's next-K-tile prefetch
++// walked 256 rows from inside row 0 of K. A served drafter head (24 heads, head 256, 129 keys)
++// reuses a grown buffer on its second request, so a kernel that reads past the sequence length
++// changes its draft without any input changing. Measured green 5/5 on the 24 GB card.
++struct micro_tail_params { int heads; int head_size; int kv; int spare; bool nan_tail; };
++class sdpa_micro_tail_test : public ::testing::TestWithParam<micro_tail_params> {};
++TEST_P(sdpa_micro_tail_test, output_independent_of_the_buffer_tail) {
++    auto& engine = get_test_engine();
++    if (!engine.get_device_info().supports_immad) GTEST_SKIP() << "micro SDPA needs immad";
++    const auto p = GetParam();
++    const ov::Shape q_shape{1, (size_t)p.heads, 1, (size_t)p.head_size};
++    const ov::Shape kv_shape{1, (size_t)p.heads, (size_t)p.kv, (size_t)p.head_size};
++    const ov::Shape big_shape{1, (size_t)p.heads, (size_t)(p.kv + p.spare), (size_t)p.head_size};
++    const layout q_layout(q_shape, data_types::f16, format::bfyx);
++    const layout kv_layout(kv_shape, data_types::f16, format::bfyx);
++    const layout big_layout(big_shape, data_types::f16, format::bfyx);
++    tests::random_generator rg; rg.set_seed(GET_SUITE_NAME);
++    auto qv = rg.generate_random_1d<ov::float16>(ov::shape_size(q_shape), -1.0f, 1.0f);
++    auto kv_vals = rg.generate_random_1d<ov::float16>(ov::shape_size(kv_shape), -1.0f, 1.0f);
++    auto vv = rg.generate_random_1d<ov::float16>(ov::shape_size(kv_shape), -1.0f, 1.0f);
++    auto run = [&](bool tail) {
++        auto q_mem = engine.allocate_memory(q_layout);
++        set_values(q_mem, qv);
++        // Declared here, not inside the branch: the views below alias these, so the
++        // allocations have to outlive the network execution at the end of this lambda.
++        memory::ptr big_k, big_v, k_mem, v_mem;
++        if (tail) {
++            big_k = engine.allocate_memory(big_layout);
++            big_v = engine.allocate_memory(big_layout);
++            const ov::float16 fill = p.nan_tail ? ov::float16::from_bits(0x7e00) : ov::float16(65504.0f);
++            std::vector<ov::float16> garbage(ov::shape_size(big_shape), fill);
++            set_values(big_k, garbage); set_values(big_v, garbage);
++            k_mem = engine.reinterpret_buffer(*big_k, kv_layout);
++            v_mem = engine.reinterpret_buffer(*big_v, kv_layout);
++        } else {
++            k_mem = engine.allocate_memory(kv_layout);
++            v_mem = engine.allocate_memory(kv_layout);
++        }
++        set_values(k_mem, kv_vals); set_values(v_mem, vv);
++        topology topo;
++        const layout q_dyn(ov::PartialShape{1, (int64_t)p.heads, -1, (int64_t)p.head_size}, data_types::f16, format::bfyx);
++        const layout kv_dyn(ov::PartialShape{1, (int64_t)p.heads, -1, (int64_t)p.head_size}, data_types::f16, format::bfyx);
++        topo.add(input_layout("q", q_dyn)); topo.add(input_layout("k", kv_dyn)); topo.add(input_layout("v", kv_dyn));
++        topo.add(scaled_dot_product_attention("sdpa", {input_info("q"), input_info("k"), input_info("v")}, false, -1,
++                                              {0, 1, 2, 3}, {0, 1, 2, 3}, {0, 1, 2, 3}, {0, 1, 2, 3}, {}, false));
++        topo.add(reorder("result", input_info("sdpa"), format::bfyx, data_types::f16));
++        ExecutionConfig config = get_test_default_config(engine);
++        config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
++        config.set_property(ov::intel_gpu::force_implementations(ov::intel_gpu::ImplForcingMap{{"sdpa", {format::type::bfyx, "sdpa_micro"}}}));
++        auto network = get_network(engine, topo, config, get_test_stream_ptr(), false);
++        network->set_input_data("q", q_mem); network->set_input_data("k", k_mem); network->set_input_data("v", v_mem);
++        auto out = network->execute().at("result").get_memory();
++        std::string kernels;
++        for (const auto& info : network->get_primitives_info())
++            if (info.type_id == "scaled_dot_product_attention") kernels = network->get_primitive_info(info.original_id);
++        cldnn::mem_lock<ov::float16, mem_lock_type::read> lock(out, get_test_stream());
++        return std::make_pair(std::vector<ov::float16>(lock.begin(), lock.end()), kernels);
++    };
++    auto exact = run(false); auto tail = run(true);
++    ASSERT_NE(exact.second.find("sdpa_micro"), std::string::npos) << exact.second;
++    size_t ndiff = 0, nnan = 0;
++    for (size_t i = 0; i < exact.first.size(); ++i) {
++        const float a = exact.first[i], b = tail.first[i];
++        if (std::isnan(b)) ++nnan;
++        if (a != b) ++ndiff;
++    }
++    EXPECT_EQ(ndiff, 0u) << ndiff << " of " << exact.first.size() << " outputs differ with a "
++                         << (p.nan_tail ? "NaN" : "65504") << " tail (" << nnan
++                         << " NaN); the kernel reads past the sequence length";
++}
++INSTANTIATE_TEST_SUITE_P(arcint_micro_sdpa_tail, sdpa_micro_tail_test,
++    ::testing::Values(micro_tail_params{24, 256, 129, 22, true}, micro_tail_params{24, 256, 129, 22, false},
++                      micro_tail_params{24, 256, 129, 127, true}, micro_tail_params{4, 256, 129, 22, true},
++                      micro_tail_params{24, 256, 256, 22, true}));
++
+ TEST(sdpa_gpu_custom, scalar_placeholder_mask_matches_scale_only) {
+     tests::random_generator rg;
+     rg.set_seed(GET_SUITE_NAME);
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
+@@ -123,6 +123,44 @@
+     return p;
+ }
+ 
++// arcint (patch 0034): patch 0020 declines four-bit values under BY_TOKEN keys, on a 2026-09-05
++// measurement of NaN past 128 keys. Re-measured 2026-09-08 with 0033's discriminating fill, on the
++// 24 GB card, and the decline was NOT lifted -- because the same by-token cases fail with EIGHT-bit
++// values too, a pairing this decline does not govern and which runs on micro SDPA rather than the
++// generic kernel. Two different kernels, one fill, the same all-NaN output. The fill is not the
++// explanation either: at head 128 with 36 keys both precisions are exact (max 0.002, no NaN), and
++// both go all-NaN at 132 keys; at the served head 256 the NaN is already a quarter of the elements
++// at 36 keys, three quarters at 102, all of them from 126. The failure tracks the causal length and
++// the head size, and ignores the value precision and the kernel. What the common element is -- the
++// harness's own by-token page writing, its cache sizing, or the key dequantisation both kernels
++// share -- is NOT measured, and no mechanism is claimed here.
++//
++// Nothing served is affected: arcint never selects BY_TOKEN keys (the plugin defaults to BY_CHANNEL
++// and forces BY_TOKEN only for graphs carrying cache-block rotation, which arcint's do not).
++// The instantiation below is DISABLED for that reason -- it is the reproducer, kept so the next
++// reader starts from the measurement instead of rebuilding it. Run it with
++// --gtest_also_run_disabled_tests.
++static paged_attention_test_params u8i4_mixed_micro_by_token(std::vector<SubsequenceDescriptor> subsequences) {
++    paged_attention_test_params p = u8i4_mixed_micro_served(std::move(subsequences));
++    p.key_cache_quant_mode = ov::internal::CacheQuantMode::BY_TOKEN;
++    return p;
++}
++
++// The same, at the test's default geometry (32 heads, 2 KV heads, head 128) rather than the served
++// one (24 heads, 4 KV heads, head 256): this is the pair that shows the length threshold.
++static paged_attention_test_params u8i4_by_token_default_geom(std::vector<SubsequenceDescriptor> subsequences) {
++    paged_attention_test_params p = u8i4_mixed_micro_params(std::move(subsequences));
++    p.key_cache_quant_mode = ov::internal::CacheQuantMode::BY_TOKEN;
++    return p;
++}
++
++// Eight-bit values, by-token keys: the control that kept the decline in place. The fill writes
++// sixteen integer levels per (token, head) row, which u8 by-token stores exactly.
++static paged_attention_test_params u8u8_by_token(paged_attention_test_params p) {
++    p.value_cache_precision = ov::element::u8;
++    return p;
++}
++
+ class paged_attention_u8i4_mixed_micro_test : public PagedAttentionTest<paged_attention_test_params> {};
+ 
+ TEST_P(paged_attention_u8i4_mixed_micro_test, mixed_stage_serves_u8_key_i4_value_on_micro_sdpa) {
+@@ -173,8 +211,16 @@
+     auto* impl = pa_inst->get_impl();
+     ASSERT_NE(impl, nullptr);
+     const auto dump_info = impl->get_kernels_dump_info(*pa_inst->get_impl_params());
+-    ASSERT_NE(dump_info.get_entries().find("sdpa_micro"), std::string::npos)
+-        << "u8-key / i4-value must run on micro SDPA: " << dump_info.get_entries();
++    // arcint (patch 0034): the routing is printed rather than assumed, because the by-token cases
++    // of the disabled instantiation below deliberately take the generic kernel -- the decline is
++    // live for them. The by-channel cases, which are what arcint serves, still assert micro SDPA.
++    const bool key_by_channel = p.key_cache_quant_mode == ov::internal::CacheQuantMode::BY_CHANNEL;
++    std::cout << "DISPATCH keys=" << (key_by_channel ? "by-channel" : "by-token")
++              << " entries=" << dump_info.get_entries() << std::endl;
++    if (key_by_channel) {
++        ASSERT_NE(dump_info.get_entries().find("sdpa_micro"), std::string::npos)
++            << "u8-key / i4-value must run on micro SDPA: " << dump_info.get_entries();
++    }
+ 
+     this->tolerance = 1e-2f;
+     const auto reference = PagedAttentionReference(pam).get_reference(result.key_cache_mem);
+@@ -235,6 +281,18 @@
+                       u8i4_mixed_micro_served({{2, 145}}, "gap"),
+                       u8i4_mixed_micro_served({{3, 1000}}),
+                       u8i4_mixed_micro_served({{3, 1000}}, "reverse")));
++
++// arcint (patch 0034): the by-token reproducer, disabled -- see the note on
++// u8i4_mixed_micro_by_token above. Exact at 36 keys, all-NaN at 132, at both value precisions.
++INSTANTIATE_TEST_SUITE_P(
++    DISABLED_arcint_0034_by_token_nan,
++    paged_attention_u8i4_mixed_micro_test,
++    ::testing::Values(u8i4_by_token_default_geom({{2, 34}}),               // exact
++                      u8u8_by_token(u8i4_by_token_default_geom({{2, 34}})),  // exact
++                      u8i4_by_token_default_geom({{2, 130}}),              // all NaN, generic kernel
++                      u8u8_by_token(u8i4_by_token_default_geom({{2, 130}})),  // all NaN, micro SDPA
++                      u8i4_mixed_micro_by_token({{2, 130}}),               // served geometry
++                      u8u8_by_token(u8i4_mixed_micro_by_token({{2, 130}}))));
+ #endif
+ 
+ class paged_attention_u4_swa_tail_test : public PagedAttentionTest<paged_attention_test_params> {};

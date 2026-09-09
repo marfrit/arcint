@@ -1,3 +1,18 @@
+arcint (0.4.5-1) trixie; urgency=medium
+
+  * 0.4.5: the small open items of the 0.4.4 handoff. /props reports the
+    configuration actually served -- the cache block named the stateful
+    defaults on every server, including two units serving u8:i4 and u8 with
+    prefix caches that were hitting. --mtp on against a GGUF-opened model
+    warns once at load that it is inert (0% accepted, measured; the reason
+    is not measured), and the equivalence suite reports that rather than
+    failing its acceptance gate. Plugin patch 0034 adds the single-query
+    micro-SDPA tail test and, DISABLED, the by-token reproducer that kept
+    patch 0020's decline in place; it is test-only, so the runtime floor
+    stays at marfrit-openvino +p15 (patches 0003-0033).
+
+ -- Markus Fritsche <fritsche.markus@gmail.com>  Tue, 08 Sep 2026 21:00:00 +0200
+
 arcint (0.4.4-1) trixie; urgency=medium
 
   * 0.4.4: the agent configuration (u8 keys, i4 values, MTP on) served a

@@ -11,7 +11,7 @@
 # It carries the CMake package, the headers and the runtime that arcint links.
 set -euo pipefail
 
-PKGVER=0.4.4
+PKGVER=0.4.5
 UPSTREAM_TAG=v${PKGVER}
 PKGREL=1
 # The public repository, not the fleet one. The fleet repo (still named

@@ -97,6 +97,22 @@ struct ModelStatus {
     bool        mtp_enabled  = false;
     uint64_t    weights_bytes = 0;
 
+    // The KV precision actually served, not the one Config asked for: on the
+    // paged path --paged-kv can be overridden at load by ARCINT_PAGED_KV
+    // (backend_ov.cpp's effective_paged_kv), and cfg.kv_dtype is a different
+    // field entirely -- the STATEFUL path's precision, meaningless on a paged
+    // server. /props (src/api/handlers.cpp) reads this instead of guessing
+    // from cfg. Empty when nothing is loaded (the stub backend), which is
+    // what lets /props print null rather than a default that was never
+    // served.
+    std::string kv_precision;
+    // Whether a prefix cache is actually serving. Set once, where prefix_
+    // cache_ is constructed (backend_ov.cpp), which already knows the true
+    // answer (cfg.prefix_cache_mib > 0) for both the paged and stateful
+    // paths -- kept here rather than re-derived at /props time so a future
+    // load path that decides differently cannot drift from what /props says.
+    bool prefix_cache_enabled = false;
+
     Reservation     reservation;
     SamplerDefaults sampler_defaults;
 };

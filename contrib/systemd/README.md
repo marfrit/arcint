@@ -44,5 +44,5 @@ A GGUF-opened unit (0.4.0 stage 1) is the same unit with `--gguf FILE` added
 and `--model` naming the served IR of the same architecture as the template;
 it needs `marfrit-openvino` at `+p7` (patch 0021). None of the units above is
 served that way yet: the K-quant path prefills at chunk 256 and decodes at
-about half the IR's rate on the 24 GB card (the top-level README's *Measured*
+about half the IR's rate on the 24 GB card (*FURTHER-READING.md*'s *Measured*
 section), which is 0.4.1's work.

@@ -8787,6 +8787,148 @@ its measurement; the one that reached a document is retracted above. The
 right as far as it went; the alignment line was recorded as a hypothesis
 before its measurement, as §7.0.1 requires.
 
+#### 7.0.2bv 0.4.5, the small open items: `/props` reporting what is served, patch 0020's declined pairing re-measured and kept declined, MTP said out loud on a GGUF-opened model (2026-09-08)
+
+Four items the 0.4.4 handoff carried, each closed by a test or a
+measurement. None of them moves a served text: the 130-token prompt on the
+agent configuration gives 825b1747 on three requests of one process, matching
+§7.0.2bu's figure for the same prompt and configuration, and the equivalence suite passes on both units' configurations
+(the 24 GB card at `u8:i4`, 13 gates; the 16 GiB card at `u8`, 9 gates and
+the artifact's own MTP skip).
+
+**`/props` reported the stateful defaults, on every server.** The `cache`
+block was three Config fields and a hardcoded `false`, none of which the
+paged path reads. Both served units answered with the identical block --
+`kv_dtype "fp16"`, `prefix_cache false`, `kv_block_size 32` -- while one of
+them served `u8:i4` with an 8 GiB prefix cache that its own `/health` showed
+hitting, and the other `u8` with 2 GiB. `kv_dtype` named a precision neither
+served; `prefix_cache` was the M3 placeholder; `kv_block_size` is the prefix
+cache's checkpoint granularity and the stateful path's block, not the paged
+page size, which the block did not report at all.
+
+The values cannot be read off Config, which is why the fix is not in the
+handler alone: `--paged-kv` is overridable at load by `ARCINT_PAGED_KV`, so
+the spec that won is `effective_paged_kv` in `load_paged`, and whether a
+prefix cache exists is decided where it is constructed. `ModelStatus` now
+carries both -- the served KV precision and whether a cache is serving --
+and the block reports `path`, `kv_dtype`, `kv_block_tokens`, `kv_block_size`,
+`prefix_cache`, `prefix_cache_mib` and the GDN checkpoint budget. A stub
+loads nothing, so its path, precision and page size read `null` rather than a
+default it never ran. Measured on the served configurations of both units:
+
+| unit | `/props` cache block, this tree |
+|---|---|
+| 24 GB, `--paged-kv u8:i4 --prefix-cache-mib 8192 --n-ctx 151552` | `path paged, kv_dtype u8:i4, kv_block_tokens 16, kv_block_size 32, prefix_cache true, prefix_cache_mib 8192` |
+| 16 GiB, `--paged-kv u8 --prefix-cache-mib 2048 --n-ctx 98304` | `path paged, kv_dtype u8, kv_block_tokens 16, kv_block_size 32, prefix_cache true, prefix_cache_mib 2048` |
+
+Each agrees with the reservation block beside it (28,928 and 11,600 bytes per
+token). Reporting only; no engine change. Red first on both levels: the unit
+test on the assembled JSON aborts on the missing `path` key against the old
+block, and `tests/roundtrip.sh`'s stub assertion fails.
+
+**Patch 0020's declined pairing: re-measured, and the decline stays.** The
+handoff asked for the declined combination -- four-bit values under BY_TOKEN
+keys -- to be re-tested with 0033's discriminating fill and the three page
+orders, and lifted if green. It is not green, and the reason it is not green
+is not the one the item expected. All on the 24 GB card, one fresh process
+per cell, the served geometry (24 heads, 4 KV heads, head 256, block 16)
+unless said otherwise, with the routing read from the dispatched kernel list
+rather than assumed.
+
+The by-token cases fail before anything is lifted, on the generic kernel the
+pairing has always had, and they fail as total NaN rather than a wrong value:
+
+| by-token case | kernel dispatched | NaN |
+|---|---|---|
+| i4 values, 36 keys | generic paged attention | 3,072 of 12,288 |
+| i4 values, 102 keys | generic | 9,216 of 12,288 |
+| i4 values, 126 and 128 keys | generic | every element |
+| i4 values, 132-1,003 keys, three page orders | generic | every element |
+| **u8 values**, 132-1,003 keys, three page orders | **micro SDPA** | every element |
+| by-channel, every case of `patches_0020_paged_attention_u8i4_mixed_micro` | micro SDPA | none; max error 0.000488 |
+
+The eight-bit row is what settles it. That pairing is not what 0020 declines,
+it runs on a different kernel, and it fails identically. Two kernels
+producing all-NaN from one fill point at their common input, not at either
+kernel. And the fill is not simply unusable: at the test's default geometry
+(32 heads, 2 KV heads, head 128) the by-token cases are exact at 36 keys --
+max 0.002, no NaN, at both value precisions -- and go all-NaN at 132. So what
+is measured is a NaN that tracks the causal length and the head size and
+ignores both the value precision and the kernel:
+
+| head size | 36 keys | 102 | 126 | 132 and up |
+|---|---|---|---|---|
+| 128 | exact | -- | -- | all NaN |
+| 256 (served geometry) | 25 % NaN | 75 % | all | all |
+
+The NaN counts are not scattered elements. At 24 query heads over 4 KV heads
+and head 256, each row is 6,144 elements and each KV-head group is 6 query
+heads: 3,072 NaN is one whole group, 9,216 is three, 12,288 is all four. So at
+head 256 the by-token failure arrives a whole KV-head group at a time -- one
+group at 36 keys, three at 102, all four from 126. That is arithmetic on the
+counts above, not a mechanism, and it constrains all three candidates equally:
+whatever the common element is, it fails per KV head, not per element.
+
+No mechanism is claimed. The common element -- the harness's own by-token
+page writing, its cache sizing, or the key dequantisation both kernels share
+-- was not measured, and this section names those three candidates rather
+than choosing one. What the record can say is that the re-test cannot reach a
+verdict on this instrument, because the instrument fails in a configuration
+the decline does not govern; so **the decline stays**, and patch 0034 carries
+the six cases that carry the finding as a DISABLED instantiation, so the next
+reader starts from the measurement.
+
+Nothing served is affected. BY_TOKEN keys are not a choice arcint makes: the
+plugin defaults to BY_CHANNEL and forces BY_TOKEN only for a graph with
+cache-block rotation, which arcint's graphs do not carry (§7.0.2br), and
+every by-channel case is exact.
+
+Not retracted, but not reproduced either: 0020's own note recorded this
+pairing as NaN "for every query whose causal context passes 128 keys, and
+only those", measured on 2026-09-05 on the staged tree with that patch's own
+by-token test and the fill of the time. The pattern above -- a quarter of the
+elements already NaN at 36 keys at head 256 -- is not that pattern. The two
+were taken on different fills and different geometries and are not the same
+measurement; which of the differences accounts for it is unmeasured.
+
+**MTP on a GGUF-opened model is inert, and now says so.** §7.0.2br measured
+`--mtp on` against a GGUF-opened model accepting 0 %: the head served is
+always the template export's own IR, and its weights are not part of the
+file's body, so the drafter proposes tokens the body rejects. The server said
+nothing at load and the equivalence suite failed its acceptance gate, which
+reads as a defect when it is a fact about the artifact pairing. A pure
+decision function now returns the warning text for exactly that corner (a
+GGUF file opened and MTP wanted), the paged load path logs it once -- the
+stateful path is not touched, `--gguf` being refused there -- and the suite
+detects GGUF-openness from its own `ARCINT_EXTRA_ARGS`, reports the
+acceptance as `ACCEPTANCE-SKIP mtp-acceptance gguf-opened-head-inert` instead
+of failing, and takes the same fact as implying the stateful-vs-paged skip
+that previously needed an environment variable set by hand. The gate stays
+able to fail on an IR-opened model: acceptance above the threshold passes as
+before, and the copy-drafter gate, which does accept on GGUF weights (42.5 %,
+§7.0.2br), is untouched. Red first: the four-corner unit test does not link
+before the function exists.
+
+**Measured on a GGUF-opened model**, which is what makes the two paragraphs
+above more than a reading of the code. On the 24 GB card, the dense template
+opened with `--gguf` over the 15.3 GB Q4_K_M file at `u8` KV: the load-time
+warning fires (the server's own `mtp:` line names the head and the file), and
+the suite passes every gate -- 12 ok, 0 failed, one `ACCEPTANCE-SKIP
+mtp-acceptance gguf-opened-head-inert` at **0.0 % accepted**, with the
+stateful section skipped for the reason the flag implies. The acceptance
+figure confirms §7.0.2br's 0 % on this runtime; why it is exactly zero is
+still not measured. The gate can still fail: it reports the skip only when the
+acceptance line exists AND the server's warning is in the log, so a head that
+never ran -- failing to compile, or losing the hidden state -- fails the gate
+as it did before rather than being folded into the skip.
+
+**The single-query micro-SDPA tail test** (§7.0.2bs's non-paged neighbour):
+five cases asking whether the output depends on what lies past the sequence
+length in the K/V allocation -- a 129-row view of a 151-row allocation whose
+tail holds NaN, against the same rows in an exact allocation. Green 5/5 on
+the 24 GB card, and it was in no patch until now; patch 0034 carries it. It
+costs nothing and it guards the form patch 0032 fixed on the paged side.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

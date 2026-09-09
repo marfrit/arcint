@@ -181,6 +181,17 @@ std::optional<std::string> tier_prefix_cache_decision(bool static_partition_repo
            "the plugin does not report a static residency partition";
 }
 
+// See config.h: the 0% is measured, the reason for it is not, and this text
+// says only the first (DESIGN §7.0.2br).
+std::optional<std::string> gguf_mtp_inert_warning(bool gguf_opened, bool mtp_wanted) {
+    if (!gguf_opened || !mtp_wanted) return std::nullopt;
+    return "--mtp on with a GGUF-opened model: the MTP head served is the "
+           "template export's (openvino_mtp_layer.xml / openvino_mtp_lm_head.xml) "
+           "and its weights are not in the GGUF file, which was measured at 0% "
+           "accepted (DESIGN 7.0.2br); why it is exactly zero was not measured. "
+           "Serving continues with MTP inert -- --mtp off avoids the propose cost";
+}
+
 bool parse_u64_strict(const std::string& s, uint64_t& out) {
     if (s.empty()) return false;
 

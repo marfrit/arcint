@@ -91,8 +91,15 @@ check "/health reports slots and queue depth" $?
 curl -sS "${BASE}/props" -o "${WORK}/props.json"
 jassert "${WORK}/props.json" 'd["model"]["id"]=="qwen3.6-27b-a3b-coder" and d["model"]["n_ctx"]==256'
 check "/props reports the served model and context" $?
-jassert "${WORK}/props.json" 'd["cache"]["kv_block_size"]==32 and d["cache"]["kv_dtype"]=="fp16"'
-check "/props reports the cache configuration" $?
+# A stub loads nothing: the served path, precision and page size are all
+# unknowable, so they must read null rather than a stateful-path default the
+# stub never ran (the M3 defect this contract replaces -- every stub and
+# every real server used to report the identical hardcoded block).
+jassert "${WORK}/props.json" \
+  'd["cache"]["path"] is None and d["cache"]["kv_dtype"] is None and \
+   d["cache"]["kv_block_tokens"] is None and d["cache"]["prefix_cache"] is False and \
+   d["cache"]["prefix_cache_mib"]==0 and d["cache"]["kv_block_size"]==32'
+check "/props reports the cache configuration (stub: nothing served, no guessing)" $?
 jassert "${WORK}/props.json" 'd["sampler_defaults"]["provenance"]=="provisional"'
 check "/props marks provisional sampler defaults as such" $?
 jassert "${WORK}/props.json" 'd["model"]["arch_hash"]=="6745cfe3d57e3f0f" and d["model"]["template_hash"]=="e84f32a23fdda276"'

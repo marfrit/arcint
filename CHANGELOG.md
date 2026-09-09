@@ -17,6 +17,79 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.4.5 — 2026-09-08
+
+Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033) —
+unchanged from 0.4.4. Patch 0034 is test-only and is in **no built package**:
+it changes no kernel, so the floor does not move and the next package build is
+what first carries it. The small
+open items the 0.4.4 handoff carried, closed one by one; DESIGN §7.0.2bv.
+Nothing here moves a served text: the agent configuration's 130-token prompt
+gives 825b1747 on three requests of one process, matching §7.0.2bu, and the
+equivalence suite passes on both units' configurations (24 GB card at
+`u8:i4`, 13 gates; 16 GiB card at `u8`, 9 gates plus that artifact's own MTP
+skip).
+
+### `/props` reports the configuration that is served
+
+- **The `cache` block named the stateful defaults on every server**
+  (DESIGN §7.0.2bv). Both served units answered with the identical
+  `kv_dtype "fp16", prefix_cache false, kv_block_size 32` while one served
+  `u8:i4` with an 8 GiB prefix cache its own `/health` showed hitting, and
+  the other `u8` with 2 GiB. The paged path reads none of those three fields.
+- **It now reports what the load path resolved**: `path`, `kv_dtype`,
+  `kv_block_tokens`, `kv_block_size`, `prefix_cache`, `prefix_cache_mib` and
+  the GDN checkpoint budget. The served KV precision and whether a prefix
+  cache exists are carried on `ModelStatus`, not re-derived from Config,
+  because `ARCINT_PAGED_KV` can override the flag at load. A stub loads
+  nothing and reports `null` for the three it cannot know rather than a
+  default it never ran.
+- Reporting only; no engine change. **If you parse `/props`**: `kv_dtype` now
+  carries the paged pair (`"u8:i4"`) rather than always `"fp16"`,
+  `prefix_cache` is no longer hardcoded false, and `kv_block_tokens` is new
+  and is the paged page size — `kv_block_size` keeps its old meaning, the
+  prefix cache's checkpoint granularity.
+
+### `--mtp on` against a GGUF-opened model says it is inert
+
+- **The server warns once at load** naming the mismatch: the MTP head served
+  is the template export's own IR and its weights are not part of the GGUF
+  file's body, so the drafter proposes tokens the body rejects (0 % accepted,
+  measured in DESIGN §7.0.2br). Behaviour is unchanged — it warns, it does not
+  disable MTP; `--mtp off` avoids the propose cost.
+- **Measured on a GGUF-opened model** (24 GB card, the dense template opened
+  with `--gguf` over the 15.3 GB Q4_K_M file, `u8` KV): the warning fires and
+  the suite passes every gate — 12 ok, 0 failed, one `ACCEPTANCE-SKIP` at
+  0.0 % accepted. The gate still fails when the head never ran: the skip needs
+  both an acceptance figure and the server's own warning in the log.
+- **The equivalence suite reports that as a fact rather than a failure**:
+  `ACCEPTANCE-SKIP mtp-acceptance gguf-opened-head-inert`. It detects
+  GGUF-openness from its own `ARCINT_EXTRA_ARGS` and takes it as implying the
+  stateful-vs-paged skip that previously needed `ARCINT_SKIP_STATEFUL=1` set
+  by hand. The gate stays able to fail on an IR-opened model, and the
+  copy-drafter gate — which does accept on GGUF weights — is untouched.
+
+### Plugin patch 0034: two tests, no kernel change
+
+- **The single-query micro-SDPA tail test** (5 cases): does the output depend
+  on what lies past the sequence length in the K/V allocation? Green 5/5 on
+  the 24 GB card. It guards the non-paged form patch 0032 fixed on the paged
+  side, and had been carried in no patch.
+- **Patch 0020's declined pairing was re-measured and stays declined**
+  (DESIGN §7.0.2bv). Four-bit values under BY_TOKEN keys fail as total NaN —
+  but so do EIGHT-bit values under BY_TOKEN keys, which that decline does not
+  govern and which run on micro SDPA rather than the generic kernel. Two
+  kernels, one fill, the same all-NaN output. The fill is not the explanation
+  either: at head 128 the by-token cases are exact at 36 keys and all-NaN at
+  132, at both value precisions. The failure tracks the causal length and the
+  head size and ignores the value precision and the kernel; no mechanism is
+  claimed. The six cases that carry the finding ship as a DISABLED
+  instantiation so the next reader starts from the measurement.
+- **Nothing served is affected**: arcint never selects BY_TOKEN keys (the
+  plugin defaults to BY_CHANNEL and forces BY_TOKEN only for graphs with
+  cache-block rotation, which arcint's do not carry), and every by-channel
+  case is exact.
+
 ## 0.4.4 — 2026-09-08
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033);

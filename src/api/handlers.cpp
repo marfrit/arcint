@@ -464,11 +464,29 @@ json props(const Context& ctx) {
     return json{
         {"model", std::move(model)},
         {"chat_template_caps", ctx.backend->template_caps()},
+        // What is actually served, not a Config default the load path may
+        // never have read (the M3 defect this replaced: a stub and a paged
+        // u8:i4 agent server reported the identical hardcoded block).
+        // `kv_dtype` and `prefix_cache` come off ModelStatus, which the two load paths in
+        // backend_ov.cpp set from the fact they each resolved (effective_
+        // paged_kv on the paged path, cfg.kv_dtype on the stateful one); the
+        // stub backend leaves st.kv_precision empty on purpose, which is what
+        // lets this print null instead of guessing.
         {"cache",
-         {{"kv_block_size", cfg.kv_block_size},
-          {"kv_dtype", cfg.kv_dtype},
-          {"gdn_checkpoint_budget_mib", cfg.gdn_checkpoint_budget_mib},
-          {"prefix_cache", false}}},  // M3
+         {{"path", st.stub ? json(nullptr) : json(cfg.paged ? "paged" : "stateful")},
+          {"kv_dtype", st.kv_precision.empty() ? json(nullptr) : json(st.kv_precision)},
+          {"kv_block_tokens", (st.reservation.measured && st.reservation.kv_block_tokens > 0)
+                                  ? json(st.reservation.kv_block_tokens)
+                                  : json(nullptr)},
+          // --kv-block-size is the prefix cache's checkpoint granularity (see
+          // PrefixCache's `block_size` constructor argument, src/core/
+          // prefix_cache.h) and the stateful path's KV block -- NOT the
+          // paged page size, which is kv_block_tokens above and can differ
+          // from it (u8:i4 pages at 16 tokens against a 32-token cache grid).
+          {"kv_block_size", cfg.kv_block_size},
+          {"prefix_cache", st.prefix_cache_enabled},
+          {"prefix_cache_mib", cfg.prefix_cache_mib},
+          {"gdn_checkpoint_budget_mib", cfg.gdn_checkpoint_budget_mib}}},
         {"mtp", {{"requested", cfg.mtp}, {"enabled", st.mtp_enabled}}},
         {"sampler_defaults",
          {{"temperature", sd.temperature},

@@ -2,7 +2,7 @@
 
 These are the Debian recipes this project is actually deployed with, published
 because "build it yourself" is otherwise the only instruction an outside reader
-gets, and because the numbers in the top-level README depend on a *patched*
+gets, and because the numbers in the README and FURTHER-READING.md depend on a *patched*
 OpenVINO that nobody can reproduce without knowing exactly which patch.
 
 They are not a supported product. No `.deb` is published anywhere — the built
@@ -37,7 +37,7 @@ instruction, which is the one thing this directory exists to prevent.
 ## The pin
 
 `2026.4.0-22849-71640275d29` — upstream commit `71640275`. Every measurement in
-the top-level README was taken on that code. A patch that does not apply
+the README and FURTHER-READING.md was taken on that code. A patch that does not apply
 cleanly to that commit is a bug in `patches/`, not a reason to move the pin.
 
 The patched build reports itself as `…-71640275d29-marfrit-pN` (`+p6` is the

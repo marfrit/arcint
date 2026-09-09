@@ -695,6 +695,62 @@ suite passes under the default and a reversed table, the SDPA suite too.
 
 Package: `+p15`.
 
+### 0034-sdpa-micro-tail-test-and-by-token-reproducer.patch
+
+Two tests, no kernel change; arcint's runtime floor stays at +p15
+(DESIGN §7.0.2bv).
+
+The **single-query micro-SDPA tail test** (5 cases) asks whether the output
+depends on what lies *past* the sequence length in the K/V allocation: K and V
+as a 129-row view of a 151-row allocation whose tail holds NaN (or 65504),
+against the same rows in an exact allocation. It is the non-paged neighbour of
+what 0032 fixed on the paged side, where the prefill's next-K-tile prefetch
+walked 256 rows from inside row 0 of K. A served drafter head (24 heads, head
+256, 129 keys) reuses a grown buffer on its second request, so a kernel reading
+past the sequence length would change its draft with no input changing. Green
+5/5 on the 24 GB card; it had been carried in no patch.
+
+The **by-token reproducer** is DISABLED, and it is why patch 0020's decline
+(four-bit values under BY_TOKEN keys) stays in place. Re-measured 2026-09-08
+with 0033's discriminating fill under the three page orders, on the 24 GB card,
+routing read from the dispatched kernel list rather than assumed: the by-token
+cases fail as *total NaN* on the generic kernel -- and so do **eight-bit**
+values under by-token keys, a pairing that decline does not govern and which
+runs on micro SDPA. Two kernels, one fill, the same all-NaN output — something the two runs share. The fill is
+not the explanation: at the test's default geometry (32 heads, 2 KV heads, head
+128) the by-token cases are exact at 36 keys (max 0.002, no NaN, both value
+precisions) and all-NaN at 132; at the served head 256 the NaN is a quarter of
+the elements already at 36 keys, three quarters at 102, all from 126. At 132 keys and beyond the failure is total at both value
+precisions and on both kernels; the partial gradient below 132 was measured on
+four-bit values and the generic kernel only. **No mechanism is claimed** -- the common element
+(the harness's own by-token page writing, its cache sizing, or the key
+dequantisation both kernels share) was not measured. The re-test therefore
+cannot reach a verdict on this instrument, since the instrument fails in a
+configuration the decline does not govern. The six cases that carry the finding
+ship disabled so the next reader starts from the measurement
+(`--gtest_also_run_disabled_tests`).
+
+Nothing served is affected: arcint never selects BY_TOKEN keys (the plugin
+defaults to BY_CHANNEL and forces BY_TOKEN only for a graph with cache-block
+rotation, which arcint's do not carry, DESIGN §7.0.2br), and every by-channel
+case is exact. The dispatch assertion is now conditional for that reason: the
+by-channel cases still assert micro SDPA, the by-token ones print the kernel
+they actually got.
+
+Not retracted, not reproduced: 0020's own note recorded this pairing as NaN
+"for every query whose causal context passes 128 keys, and only those",
+measured 2026-09-05 on the staged tree with that patch's own by-token test and
+the fill of the time. A quarter of the elements NaN at 36 keys is not that
+pattern; the two were taken on different fills and geometries, and which
+difference accounts for it is unmeasured.
+
+Measured on the patch's exact content, a plugin test build reconfigured with
+`ENABLE_DEBUG_CAPS=OFF`: the whole paged_attention and sdpa suites 320 ran,
+280 passed, 40 skipped (pre-existing vlsdpa), 0 failed; the disabled
+instantiation contributes 0 runs. Served unchanged: 825b1747 on three requests
+of the agent configuration's 130-token prompt, and the equivalence suite passes
+on both units' configurations.
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.

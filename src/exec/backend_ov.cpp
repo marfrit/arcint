@@ -895,6 +895,16 @@ public:
                 prefix_cache_->set_demote([this](PrefixCache::Entry& e) { return demote_entry(e); });
             }
         }
+        // /props (src/api/handlers.cpp) reads this rather than cfg.prefix_
+        // cache_mib > 0 directly, so the two can never drift: whatever this
+        // constructor actually decided is what gets reported, on both the
+        // paged and stateful paths below.
+        status_.prefix_cache_enabled = (prefix_cache_ != nullptr);
+        // The KV precision the STATEFUL path will actually serve. Set here so the
+        // two fallbacks in the retype below can lower it, and read once where the
+        // status is filled; the paged path sets status_.kv_precision itself from
+        // the spec that won (effective_paged_kv).
+        std::string stateful_served_kv = cfg.kv_dtype;
         // M11 dump instrument (the M11 design note (not in the repository) O): opt-in, read once. One
         // JSON line per verify cycle that actually drafted through DFlash;
         // dflash_select stashes the lattice for that cycle on the lane, and
@@ -984,6 +994,9 @@ public:
 
         std::shared_ptr<ov::Model> model = core_.read_model(artifact.language_model_xml);
 
+        // What /props will report: the retype below can fall back to fp32 in two
+        // ways, and a block that then said "fp16" would be the requested-vs-served
+        // confusion this reporting exists to remove.
         if (cfg.kv_dtype != "fp32") {
             const ov::element::Type kv = ov::element::f16;  // config refuses anything else
             try {
@@ -994,11 +1007,13 @@ public:
                               cfg.kv_dtype.c_str(), n);
                 } else {
                     log::warn("load", "%s", "could not retype the KV state; it stays fp32");
+                    stateful_served_kv = "fp32";
                 }
             } catch (const std::exception& e) {
                 log::warn("load", "KV retype to %s failed, staying fp32: %s", cfg.kv_dtype.c_str(),
                           e.what());
                 model = core_.read_model(artifact.language_model_xml);
+                stateful_served_kv = "fp32";
             }
         }
 
@@ -1204,6 +1219,9 @@ public:
         status_.n_attn_layer     = artifact.n_attn_layer;
         status_.mtp_enabled      = mtp_ready_;
         status_.weights_bytes    = artifact.weights_bytes;
+        // What the retype above actually left in the graph, which is cfg.kv_dtype
+        // unless it fell back to fp32 (both fallbacks are logged).
+        status_.kv_precision     = stateful_served_kv;
         status_.sampler_defaults = artifact.sampler;
     }
 
@@ -2519,6 +2537,13 @@ private:
         // One drafter per verify loop: an explicit --mtp on + --dflash is a
         // config error; mtp auto yields to the requested drafter.
         want_mtp_ = cfg.mtp != "off" && artifact_.has_mtp_head && !want_dflash_;
+        // DESIGN §7.0.2br: said once at load rather than left to read as an
+        // unexplained 0% acceptance on every request. Paged-only on purpose
+        // -- --gguf is refused on the stateful path (config.cpp), so there
+        // is nothing to warn about there.
+        if (const auto warning = gguf_mtp_inert_warning(!cfg.gguf_path.empty(), want_mtp_)) {
+            log::warn("mtp", "%s", warning->c_str());
+        }
         if (want_mtp_ && !expose_hidden_state(model)) {
             log::warn("mtp", "%s", "could not expose the hidden state; MTP disabled");
             want_mtp_ = false;
@@ -2632,6 +2657,10 @@ private:
         // line and in both refusal messages, misnaming what was actually
         // requested.
         const std::string effective_paged_kv = asym_kv ? (pk_key + ":" + pk_value) : pk_key;
+        // /props reads this, not cfg.paged_kv: ARCINT_PAGED_KV may have
+        // overridden the flag above, and effective_paged_kv is already the
+        // spec that won (see the comment on that variable's declaration).
+        status_.kv_precision = effective_paged_kv;
         // Said out loud at load, because it is a throughput decision now and not
         // only a memory one: u8 halves KV and costs up to 22% of prefill at
         // depth (§7.0.3 chose it on decode evidence, which did not see that).
