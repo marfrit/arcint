@@ -1144,17 +1144,36 @@ refused at `gguf_geometry()`. The dense `Qwen3.8-27B-UD-Q3_K_XL.gguf`
 on the dev host is also ruled out: Q3_K is in `model_requirements.md` §6's
 own "not yet served" list (stages 2/3).
 
-The served case for the 16 GiB card is the on-disk
+The candidate served case was the on-disk
 `Qwen3.5-2B-Q4_K_M.gguf` (1.19 GiB, dense, `general.architecture =
 "qwen35"`, `qwen35.full_attention_interval = 4`, Q4_K_M is a served type).
 Verified on the dev host 2026-09-09T19:42:34+00:00: GGUF magic ok, 24 blocks,
 head_count 8, head_count_kv 2, key_length 256, value_length 256.
-The remaining assumption is that the template-IR geometry acceptance step
-(`gguf_apply_to_template`) succeeds — which the load attempt answers by
-name, not by speculation.
 
-**Optional follow-on stress case**: a Q4_K_S requant of the on-disk
-`Qwen3.8-27B-Q4_K_M` (17.1 GB → target ≤ 14.5 GiB) via `llama-quantize`
+**Window B measurement (2026-09-09, GPU.1 = A770 16 GiB):**
+The template-IR geometry acceptance step (`gguf_apply_to_template`) **refuses
+the 2B** — no matching 2B template IR exists on disk; the only available IR
+is the 27B artifact:
+
+    --gguf Qwen3.5-2B-Q4_K_M.gguf is not this artifact's architecture:
+    layers: file 24, artifact 64; hidden size: file 2048, artifact 5120;
+    attention heads: file 8, artifact 24; kv heads: file 2, artifact 4;
+    GDN value heads: file 16, artifact 48
+
+The 27B Q4_K_M (15.93 GiB) passes both the architecture gate and geometry
+matching against the 27B IR, repacks 497 projections (288 repacked, 209
+native, 38 s on 8 workers), but fails compilation with
+`CL_OUT_OF_RESOURCES` — the file alone exceeds the card's usable VRAM
+before KV pool or scratch allocation.
+
+**FIX 8.2 consequence**: GGUF serving on the 16 GiB card requires either
+(a) exporting a 2B template IR (a new artifact, not on disk today), or
+(b) a Q4_K_S requant of the 27B (~14.5 GiB target) — which is marginal
+at best given VRAM overhead beyond raw weights. Neither path is zero-prep;
+the "remaining assumption" from the metadata check is answered: refusal.
+
+**Optional follow-on stress case** (if path (b) is pursued): a Q4_K_S
+requant of the on-disk `Qwen3.8-27B-Q4_K_M` (17.1 GB → target ≤ 14.5 GiB)
 via `llama-quantize` (`--allow-requantize`, built from llama.cpp HEAD
 2026-09-09) exercises real served-weight scale (414–418
 GB/s regime) on the 16 GiB card. Run off-peak with `--threads 6`, never
