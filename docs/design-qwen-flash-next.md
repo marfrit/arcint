@@ -725,6 +725,34 @@ All cases pass on the dev container (AVX2 present, confirmed via
 `cpu_has_avx2()` returning true in the same test run). No microbench
 (token-gathers/s) has been taken yet -- see "What's blocked", below.
 
+**FIX D verification (2026-09-10, the dev host, build from source at HEAD `67ef4d9`):**
+All 9 TEST() cases from `tests/test_ngram_gather.cpp` (commit `3cc08f9`)
+executed for the first time on the dev host. Binary built from source
+(`cmake -B build -DCMAKE_BUILD_TYPE=Release`, GCC 14.2.0), checksums of
+all five source files (`test_ngram_gather.cpp`, `ngram_gather.h`,
+`gguf_dequant.cpp`, `gguf_dequant.h`, `fit.h`) verified byte-identical
+between the git HEAD and the dev host's non-git copy. Result:
+
+    host: the dev container (hostname verified)
+    date: 2026-09-09T23:25:14+0000
+    binary: build/arcint-test (md5 415fabb648eefe10093977244d1dfb78)
+    filter: ngram → 9 cases run, 0 failed, 0 skipped
+
+Per-case (each run individually, same binary):
+
+    ngram_gather_q4_0_avx2_matches_scalar_reference_byte_exact     PASS
+    ngram_gather_q4_1_avx2_matches_scalar_reference_byte_exact     PASS
+    ngram_gather_q8_0_avx2_matches_scalar_reference_byte_exact     PASS
+    ngram_gather_scalar_path_matches_dequantize_row_on_any_host    PASS
+    ngram_table_bytes_matches_the_recon_quoted_figures              PASS
+    ngram_table_bytes_unknown_type_prices_as_nothing                PASS
+    host_ram_fit_refuses_q8_0_ngram_table_on_the_48gib_dev_container   PASS
+    host_ram_fit_refuses_q4_1_ngram_table_plus_an_oversized_expert_pool PASS
+    host_ram_fit_admits_q4_1_ngram_table_on_a_128gib_unit_host         PASS
+
+No skips (AVX2 present on the Zen 3 host). **FIX D's red-first kernel
+tests are now verified by execution, not only by code review.**
+
 ### The memory budget: n-gram table vs. expert pool vs. host RAM
 
 `src/exec/fit.h` adds the host-RAM side of the fit arithmetic (everything
@@ -924,6 +952,12 @@ single-thread memcpy, so the ALU is the bottleneck, not DRAM). At 6
 threads the aggregate dequant throughput is **42–46 GB/s** (exceeds
 memcpy's 35–37 GB/s because dequant has no write-back traffic). A
 256 MiB expert slab takes ~27 ms to dequant on 1 core, ~6 ms on 6.
+
+**Consequence: the host feed at ~45 GB/s is ~11% of the A770's measured
+414–418 GB/s demand; the q\* policy must therefore be card-resident-first.**
+Every expert that fits on the card must stay there — CPU execution is not
+a competitive alternative to card-resident compute at this bandwidth ratio,
+only to PCIe streaming of cold experts.
 
 The crossover point `q*` FreeToken derives (paper's own term, `q* ~=
 m·B_P/B_H` where `m` is the expert's byte size) becomes, once both rates
@@ -1245,7 +1279,7 @@ folded directly, with no FakeQuantize subgraph and no marker suffix.
 
 2. *CLI, VL path with local corpus* (`optimum-cli export openvino --task
    image-text-to-text --awq --dataset ~/fleetcode`): rejected by
-   optimum-intel 2.3.0's `OVWeightQuantizationConfig.post_init()` which
+   `OVWeightQuantizationConfig.post_init()` (optimum-intel 2.0.0+) which
    validates dataset names against a hardcoded allowlist — visual LLMs
    accept only `{'contextual'}`, LLMs accept `{'c4', 'c4-new', 'auto',
    'gsm8k', 'wikitext2'}`. The 27B's `"dataset": "fleetcode"` predates
@@ -1264,6 +1298,37 @@ compresses correctly but uses different constant naming that
 optimum-intel to accept local datasets for VL models, (b) backport to the
 optimum-intel version used for the 27B, or (c) extend `gguf_map.cpp` to
 match the CausalLM path's constant names.
+
+**Export-tooling fixes (2026-09-10, `tools/export_2b_awq.py`):** all three
+fronts addressed:
+
+- **Front 2 (dataset allowlist):** `bypass_dataset_validation()` sets
+  `config.dataset` after `post_init()` has run. Tested: the bug
+  (custom string rejected) and the fix (arbitrary string/None accepted)
+  both verified on the dev host's venv (optimum-intel 2.0.0). 3/3 tests
+  pass.
+
+- **Front 3 (VL calibration bug):** `make_text_calibration_data()` builds
+  calibration samples from `AutoTokenizer` alone, never instantiating
+  `AutoProcessor` or touching `video_processor_class`. Deterministic,
+  in-vocab-range, correct tensor shape. 3/3 tests pass.
+
+- **Front 1 (CausalLM naming):** moot IF the VL path produces markers
+  once fronts 2+3 are fixed. The export script uses `OVQuantizer.quantize()`
+  with explicit `calibration_dataset` and AWQ config; whether this produces
+  `_openvino_orig_weight` FakeQuantize subgraphs (as the 27B's VL export
+  did) or folds weights directly (as the CausalLM path did) is **not yet
+  verified by a real export run**. `count_orig_weight_markers()` checks
+  the result and warns if markers are 0. 2/2 utility tests pass.
+
+**Remaining gap:** the full export (`python3 tools/export_2b_awq.py`)
+has not been run. It needs the Qwen3.5-2B checkpoint downloadable from HF
+and ~10-30 min CPU time on the dev host; no GPU window. If the export
+produces 0 markers, the gap narrows to front 1 alone: extend
+`gguf_graph.cpp` to match CausalLM-style constant names (option (c) above).
+
+All 8 tests: `python3 tools/test_export_2b_awq.py` on the dev host, 0.015 s,
+2026-09-09T23:xx+0000, optimum-intel 2.0.0, transformers 5.0.0.
 
 **Optional follow-on stress case** (if path (b) is pursued): a Q4_K_S
 requant of the on-disk `Qwen3.8-27B-Q4_K_M` (17.1 GB → target ≤ 14.5 GiB)
