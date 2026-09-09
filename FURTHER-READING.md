@@ -93,8 +93,7 @@ position overflow at 65,504 tokens in the drafters' rotary subgraphs, now
 kept at f32, and the MTP layer's unpaged KV state, now charged against the
 reservation. Acceptance is back at depth (90.8% at 77k), but MTP's cycle
 wall still loses to plain decoding there; DFlash wins at depth instead
-(18.8 vs 15.3 t/s at 77k). Prefill on the
-coder reaches ~1970 t/s.
+(18.8 vs 15.3 t/s at 77k).
 
 **Long context against the short-prompt numbers** (2026-09-03, `DESIGN.md`
 §7.0.2aa; a real document truncated to depth, 400 greedy tokens, prefix cache

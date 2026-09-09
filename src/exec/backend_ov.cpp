@@ -622,37 +622,47 @@ std::optional<SlotPoolIr> slot_pool_from_ir(const std::shared_ptr<ov::Model>& mo
 
 }  // namespace
 
-// Declared in exec/graph_rewrites.h: outside the anonymous namespace for its test.
-bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model,
-                                int64_t keep_rows, int64_t token_axis) {
-    const auto& results = model->get_results();
-    if (results.empty()) return false;
+// Declared in exec/graph_rewrites.h: outside the anonymous namespace for its
+// test. The projection walk that all three share is find_projection_head;
+// slice_logits_to_last_token and expose_hidden_state are its two consumers.
+//
+// Until 2026-09-07 the walk knew only the MatMul, and the mixed and native
+// forms served every prefill chunk unsliced: the head's tiled kernel over
+// every row and an [M, vocab] f32 copy to the host per chunk (850 MB for 856
+// tokens), found by an OpenCL timeline; the load log had said "logits NOT
+// sliced" all along.
 
-    // Walk back through shape-only ops to the matmul that is the LM head -- or
-    // to the FullyConnectedKQuant a GGUF-opened model has in its place when
-    // output.weight stays in the file's rows (exec/kquant_op.h: input 0 the
-    // activation [.., K], input 1 the u8 rows). Until 2026-09-07 the walk knew
-    // only the MatMul, and the mixed and native forms served every prefill
-    // chunk unsliced: the head's tiled kernel over every row and an [M, vocab]
-    // f32 copy to the host per chunk (850 MB for 856 tokens), found by an OpenCL
-    // timeline; the load log had said "logits NOT sliced" all along.
-    std::shared_ptr<ov::Node> node = results[0]->input_value(0).get_node_shared_ptr();
+std::shared_ptr<ov::Node> find_projection_head(const std::shared_ptr<ov::Model>& model) {
+    const auto& results = model->get_results();
+    if (results.empty()) return nullptr;
+
     const auto is_kquant = [](const std::shared_ptr<ov::Node>& n) {
         return n && std::string(n->get_type_name()) == "FullyConnectedKQuant";
     };
+
+    std::shared_ptr<ov::Node> node = results[0]->input_value(0).get_node_shared_ptr();
     for (int hop = 0; hop < 8 && node && node->get_input_size() > 0; ++hop) {
-        if (ov::as_type_ptr<ov::op::v0::MatMul>(node) != nullptr || is_kquant(node)) break;
+        if (ov::as_type_ptr<ov::op::v0::MatMul>(node) != nullptr || is_kquant(node))
+            return node;
         const std::string t = node->get_type_name();
-        if (t != "Convert" && t != "Reshape") return false;
+        if (t != "Convert" && t != "Reshape") return nullptr;
         node = node->input_value(0).get_node_shared_ptr();
     }
-    const auto matmul = ov::as_type_ptr<ov::op::v0::MatMul>(node);
-    if (matmul == nullptr && !is_kquant(node)) return false;
+    if (node && (ov::as_type_ptr<ov::op::v0::MatMul>(node) != nullptr || is_kquant(node)))
+        return node;
+    return nullptr;
+}
+
+bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model,
+                                int64_t keep_rows, int64_t token_axis) {
+    auto node = find_projection_head(model);
+    if (!node) return false;
 
     // Rewriting the wrong operand would silently produce wrong logits with no
     // error, which is the one failure mode a graph rewrite must not have. Only
     // proceed when input 0 is unmistakably the activation: not transposed, and
     // not a constant weight.
+    const auto matmul = ov::as_type_ptr<ov::op::v0::MatMul>(node);
     if (matmul != nullptr && matmul->get_transpose_a()) return false;
     if (ov::as_type_ptr<ov::op::v0::Constant>(
             node->input_value(0).get_node_shared_ptr()) != nullptr) {
@@ -688,49 +698,10 @@ bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model,
     return true;
 }
 
-// Declared in exec/graph_rewrites.h: outside the anonymous namespace for its
-// test, same as slice_logits_to_last_token above, whose walk this mirrors.
-//
-// Measured on the 24 GB card, dense template opened with --gguf over a
-// Q4_K_M file, --paged-kv u8:
-//
-//   lgc  mtp:  could not expose the hidden state; MTP disabled
-//   lgc  mtp:  --mtp on, but this export carries no MTP head
-//
-// i.e. --mtp on silently drafts zero tokens rather than drafting and being
-// rejected. The walk below used to accept only ov::op::v0::MatMul as the LM
-// head, so a GGUF export whose output.weight stays in the file's rows --
-// FullyConnectedKQuant in its place (exec/kquant_op.h), input 0 the
-// activation exactly as for MatMul (gguf_graph.cpp:472,478) -- failed at hop
-// 0 every time: not measured until the log lines below named the node.
 bool expose_hidden_state(const std::shared_ptr<ov::Model>& model) {
-    const auto& results = model->get_results();
-    if (results.empty()) return false;
-
-    const auto is_kquant = [](const std::shared_ptr<ov::Node>& n) {
-        return n && std::string(n->get_type_name()) == "FullyConnectedKQuant";
-    };
-
-    std::shared_ptr<ov::Node> node = results[0]->input_value(0).get_node_shared_ptr();
-    int hop = 0;
-    for (; hop < 8 && node && node->get_input_size() > 0; ++hop) {
-        if (ov::as_type_ptr<ov::op::v0::MatMul>(node) != nullptr || is_kquant(node)) break;
-        const std::string t = node->get_type_name();
-        if (t != "Convert" && t != "Reshape") {
-            log::warn("mtp",
-                      "hidden state walk stopped at hop %d on %s \"%s\": not MatMul, "
-                      "FullyConnectedKQuant, Convert or Reshape",
-                      hop, t.c_str(), node->get_friendly_name().c_str());
-            return false;
-        }
-        node = node->input_value(0).get_node_shared_ptr();
-    }
-    if (node == nullptr || (ov::as_type_ptr<ov::op::v0::MatMul>(node) == nullptr && !is_kquant(node))) {
-        log::warn("mtp",
-                  "hidden state walk gave up after %d hop(s) at %s \"%s\": not a MatMul or "
-                  "FullyConnectedKQuant projection head",
-                  hop, node ? node->get_type_name() : "<null>",
-                  node ? node->get_friendly_name().c_str() : "<null>");
+    auto node = find_projection_head(model);
+    if (!node) {
+        log::warn("mtp", "could not find the projection head; hidden state not exposed");
         return false;
     }
 

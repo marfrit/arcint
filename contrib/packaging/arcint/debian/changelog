@@ -1,3 +1,16 @@
+arcint (0.4.7-1) trixie; urgency=medium
+
+  * 0.4.7: closing the 0.4.x ledger. Shared find_projection_head() helper
+    replaces two duplicated backward walks in backend_ov.cpp (FIX 7). The
+    BY_TOKEN key-fill fix (patch 0035) validated: 15/18 pass, 3 expected
+    plugin refusals; patch 0020's decline lifted (FIX 2b). Stock-vs-patched
+    A/B: byte-equal output, <0.3% rate noise on the same nightly (FIX 9).
+    Unsourced ~1970 t/s claim deleted (FIX 8.1). Contrib agent recipe adds
+    --cache-host-mib 4096 (FIX 6); coder n-ctx corrected to 131072 (FIX 4).
+    Runtime floor unchanged: marfrit-openvino +p15 (patches 0003-0033).
+
+ -- Markus Fritsche <fritsche.markus@gmail.com>  Tue, 09 Sep 2026 18:00:00 +0200
+
 arcint (0.4.6-1) trixie; urgency=medium
 
   * 0.4.6: the hidden-state tap on a GGUF-opened model never ran -- the

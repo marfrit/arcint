@@ -11,6 +11,11 @@
 
 namespace lgc {
 
+// Walks back from the first Result through Convert/Reshape to the MatMul or
+// FullyConnectedKQuant that is the LM head's projection. Returns the node,
+// or nullptr when the head is not unmistakably one of those two within 8 hops.
+std::shared_ptr<ov::Node> find_projection_head(const std::shared_ptr<ov::Model>& model);
+
 // Slices the LM head's input to its last `keep_rows` rows along `token_axis`
 // (-1: rank - 2, the dense export's token axis; 0: the paged export's), so a
 // prefill computes and copies `keep_rows` rows of logits instead of one per

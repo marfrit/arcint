@@ -28,7 +28,8 @@ ExecStart=/usr/bin/arcint \
     --queue-timeout 30 \
     --prefill-chunk 512 \
     --paged-kv u8:i4 \
-    --mtp on
+    --mtp on \
+    --cache-host-mib 4096
 Restart=on-failure
 RestartSec=30
 TimeoutStartSec=20min

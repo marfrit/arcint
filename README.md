@@ -84,9 +84,6 @@ off, one process per arm, shallowest first). Coder on the 16 GiB card: u8 and
 u8:i4 decode at parity to 72k tokens (40.3 vs 39.2 t/s) while the u8:i4
 prefill costs +7% / +25% / +72% at 8.9k / 37.7k / 71.7k.
 
-Prefill on the coder reaches ~1970 t/s (card, prompt depth and KV precision
-not stated for this figure in the source measurement).
-
 ### Dense: Qwen3.8-27B (Arc Pro B60, 24 GB)
 
 **The same file through arcint** (0.4.0 stage 1, DESIGN §7.0.2ay): the dense

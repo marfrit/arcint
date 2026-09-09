@@ -1188,6 +1188,18 @@ The number to beat in production is the replay's 35 s per pool miss on the
 agent; 45 MiB came back in 0.02 s here, and the 1.7 GB case is the next
 measurement, on the agent endpoint with its real pool.
 
+**Production value (0.4.7).** `--cache-host-mib 4096` on the agent unit.
+Arithmetic: at u8:i4, the dense 27B's 10 attention layers × 4 KV heads
+× 128 dim cost 7,680 bytes per token of KV; the replay's 82 pool misses
+averaged 107k tokens each, ~785 MiB per session. 4,096 MiB holds five
+such sessions in the host tier, covering the replay's interleaved workload
+(three long sessions where the pool held two). The dev container's 48 GiB
+of RAM leaves 44 GiB after this budget, which is far above the process's
+own 7.8 GiB peak and the OpenCL driver's host allocations. The gate test
+at this value (§4.4 above) returned 45 MiB in 0.02 s; the 1.7 GB worst case
+at the link's measured 14.25 GB/s is ~0.12 s, against the 35 s cold prefill
+it replaces.
+
 ## 5. Testing and acceptance
 
 - **Prüfstand gate**: the fleet's 10-point code-generation harness runs against
@@ -2930,7 +2942,9 @@ own port widths were used):
 
 M7's audit number for the first row was 155,488; the fit pass reproduces it
 to within one overshoot correction. The second row's u8 figure is 35,152
-tokens above the hand-set 98,304 the coder serves today. The gain matches
+tokens above the hand-set 98,304 the coder was serving at the time. The
+contrib recipe ships 131,072 (the multiple of 4,096 below the u8 fit);
+the live unit's `--n-ctx` was raised from 98,304 to match. The gain matches
 the cost model's 11.3 → 8.8 KiB/token to within 0.1 pp. Greedy text is
 byte-identical u8 vs u8:i4 at 16 tokens on both cards, and the coder's
 acceptance task at u8:i4 scores 10/10 without offload and 10/10 twice with
@@ -8899,6 +8913,53 @@ The decline itself remains: this was a test bug, not a kernel bug, but
 the decline's own measurement is still unreproduced on the current fill.
 Patch 0020's decline is now re-testable (FIX 2b).
 
+**FIX 2b: full `arcint_0035_by_token_key_fill` suite and 0020 re-test
+(2026-09-09).** One window on the 24 GB card, m18 tree with patch 0035's
+per-dimension linear ramp fill, one fresh process, 32 tests from 2 suites.
+
+The 18-case `arcint_0035_by_token_key_fill` suite (all by-token, u8:i4
+unless noted):
+
+| # | cell | result |
+|---|---|---|
+| 0 | default geom {2,34} i4-value | pass |
+| 1 | default geom {2,34} u8-value | pass |
+| 2 | default geom {2,130} i4-value | pass (was NaN pre-0035) |
+| 3 | default geom {2,130} u8-value | pass (was NaN pre-0035) |
+| 4 | served geom {2,130} i4-value | pass |
+| 5 | served geom {2,130} u8-value | pass |
+| 6 | block_sweep {2,130} block_size=16 | pass |
+| 7 | block_sweep {2,130} block_size=32 | refused: plugin requires block_size=16 for BY_TOKEN |
+| 8 | block_sweep {2,130} block_size=64 | refused: plugin requires block_size=16 for BY_TOKEN |
+| 9 | block_sweep {2,130} block_size=256 | refused: plugin requires block_size=16 for BY_TOKEN |
+| 10 | default geom {2,50} (4 blocks) | pass |
+| 11 | default geom {2,66} (5 blocks) | pass |
+| 12 | default geom {2,82} (6 blocks) | pass |
+| 13 | default geom {2,98} (7 blocks) | pass |
+| 14 | default geom {132,0} (pure prefill, production writer) | pass |
+| 15 | default geom {36,0} (pure prefill) | pass |
+| 16 | default geom {132,0} u8-value (pure prefill, production writer) | pass |
+| 17 | default geom {2,130} i4-value (duplicate of case 2) | pass |
+
+15 pass, 3 refused. The 3 refusals are the plugin's own hard constraint
+(`paged_attention.cpp:72`: BY_TOKEN compressed requires block_size=16);
+the sweep cells confirm the constraint holds and are not failures of the
+fill fix. Every case at block_size=16 — the only size the plugin accepts
+for BY_TOKEN — passes, at all block counts from 3 to 9 and both pure-
+prefill and mixed stages. The 0034 NaN table's rows 2–4 (which were
+all-NaN) now pass.
+
+The 14-case `patches_0020_paged_attention_u8i4_mixed_micro` suite (the
+declined pairing: 4-bit values under by-channel keys, micro SDPA mixed
+stage): **14/14 pass.** Every case that was total NaN on the pre-0035
+constant fill passes on the per-dimension ramp. The three page orders
+(sequential, reverse, gap) at the served geometry, the longer contexts at
+512 and 856 keys, and the 3-token/{1000 keys} shape all pass.
+
+**Verdict: the decline is lifted.** The NaN that prompted the decline
+(§7.0.2bv) was the harness's own key fill, not the kernel. On the corrected
+instrument every case passes. Patch 0020 ships.
+
 Nothing served is affected. BY_TOKEN keys are not a choice arcint makes: the
 plugin defaults to BY_CHANNEL and forces BY_TOKEN only for a graph with
 cache-block rotation, which arcint's graphs do not carry (§7.0.2br), and
@@ -8911,6 +8972,34 @@ by-token test and the fill of the time. The pattern above -- a quarter of the
 elements already NaN at 36 keys at head 256 -- is not that pattern. The two
 were taken on different fills and different geometries and are not the same
 measurement; which of the differences accounts for it is unmeasured.
+
+**Stock-vs-patched A/B (2026-09-09).** One window on the 24 GB card, same
+upstream nightly (`2026.4.0-22849-71640275d29`), same binary, same model
+(Qwen3.8-27B dense, MTP on, `u8:i4` KV, 151 552 context), same 850-token
+prompt. The only difference is `LD_LIBRARY_PATH`: the patched cell loads
+`/usr/lib/marfrit-openvino/openvino/libs` (the `marfrit-openvino` package at
+`+p15`, carrying patches 0003–0035); the stock cell loads the venv's unpatched
+install of the same nightly.
+
+| cell | prefill t/s (3 measured) | decode t/s (3 measured) | text hash |
+|---|---|---|---|
+| patched | 1436 / 1436 / 1434 | 23.5 / 23.6 / 23.5 | `5519a049` ×4 |
+| stock | 1436 / 1433 / 1436 | 23.6 / 23.6 / 23.6 | `5519a049` ×4 |
+
+Output is byte-equal across cells and across runs. Rates are within run-to-run
+noise (< 0.3 %). The warm-up pass (not tabled) was 1397 / 22.3 patched and
+1394 / 22.3 stock — also indistinguishable.
+
+**Config-eligibility caveat.** The A/B deliberately excludes every
+function-enabling patch: `--paged-kv` quantisation (patches 0003–0004),
+micro-SDPA mixed stage (0020), prefix-cache snapshot/restore (0013),
+host-tier KV (0025), GGUF K-quant heads (0021). Those change what the
+runtime *can do*, not what it does on a matched configuration; a stock
+runtime cannot serve the same configuration at the same depth with the
+same KV precision, so an equal-config comparison is the only honest one.
+The patches that *are* loaded — graph-rewrite fixes, paged-attention
+kernel fixes, the BY_TOKEN fill fix (0035) — touch code paths that this
+prompt exercises, and they produce the same output at the same speed.
 
 **MTP on a GGUF-opened model is inert, and now says so.** *(Retracted the next
 day, §7.0.2bw: it was never inert. The head was switched off at load and never

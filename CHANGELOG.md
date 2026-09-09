@@ -17,6 +17,51 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.4.7 — 2026-09-09
+
+Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033) —
+unchanged from 0.4.4. Patches 0034–0035 are test-only in the arcint source
+tree and are not part of the runtime package.
+
+### Shared projection-head helper (FIX 7)
+
+The two backward walks in `backend_ov.cpp` — one in `slice_logits_to_last_token`,
+one in `expose_hidden_state` — are replaced by a single `find_projection_head()`
+helper declared in `graph_rewrites.h`. Both callers use it; all three
+`test_gguf_graph.cpp` cases pass unchanged (MatMul control, K-quant head,
+negative Add node). 91 lines removed, one shared function added.
+
+### Patch 0020's decline lifted (FIX 2b)
+
+The full 18-case `arcint_0035_by_token_key_fill` suite ran on the corrected
+instrument (patch 0035's per-dimension ramp fill): 15 pass, 3 refused at
+non-16 block sizes (the plugin's own hard constraint). The 14-case
+`patches_0020_paged_attention_u8i4_mixed_micro` suite — the declined pairing
+of 4-bit values under by-channel keys — passes 14/14. The NaN was the
+harness's own fill, not the kernel. Patch 0020 ships. DESIGN §7.0.2br.
+
+### Stock-vs-patched A/B (FIX 9)
+
+One window on the 24 GB card, same upstream nightly, same binary, same model.
+Only `LD_LIBRARY_PATH` differs: patched (`+p15`, patches 0003–0035) vs stock
+(the venv's unpatched install of the same nightly). Output byte-equal,
+rates within < 0.3 % run-to-run noise (prefill ~1435 t/s, decode ~23.5 t/s
+both cells). Config-eligibility caveat: the A/B deliberately excludes every
+function-enabling patch — those change what the runtime can do, not what it
+does on a matched configuration.
+
+### Unsourced claim deleted (FIX 8.1)
+
+The `~1970 t/s` prefill claim (card, prompt depth and KV precision unstated)
+was removed from both `README.md` and `FURTHER-READING.md`.
+
+### Contrib recipes updated (FIX 4, FIX 6)
+
+- `contrib/systemd/arcint-agent.service` adds `--cache-host-mib 4096`
+  (the host KV tier, DESIGN §4.4).
+- `contrib/systemd/README.md` corrects the coder's `--n-ctx` from 262144
+  to 131072 and documents `--cache-host-mib`.
+
 ## 0.4.6 — 2026-09-09
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033) —

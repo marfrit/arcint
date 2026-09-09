@@ -23,7 +23,7 @@ Things worth copying rather than re-learning:
   artifact.** A proxy pins its roster to the former; the latter refuses to
   start on the wrong directory.
 - **The reservation decides the context, not the flag.** `--n-ctx 151552` on
-  the 24 GB card and `--n-ctx 262144` on the 16 GB card are the flags; the
+  the 24 GB card and `--n-ctx 131072` on the 16 GB card are the flags; the
   actual served context is whatever the reservation arithmetic on that card
   allows, printed at boot, not a defect.
 - **`--gate-pad 16` is a no-op on a dense model.** It matters only for MoE
@@ -35,6 +35,10 @@ Things worth copying rather than re-learning:
   KV pages. Both are byte-equal on the acceptance task.
 - **`--prefill-chunk 512`** on the agent keeps prompt ingestion chunked so
   chunked-prefill scheduling works; the coder leaves it at the default.
+- **`--cache-host-mib 4096`** on the agent enables the host KV tier (§4.4):
+  evicted prefix-cache entries are demoted to host RAM instead of being
+  discarded, so a returning session restores from host memory (~0.1 s) rather
+  than re-prefilling from scratch (~35 s).
 - `TimeoutStartSec=20min`: a cold blob cache means minutes of graph compile
   before the port answers, and systemd must not call that a hung start.
 - A restart is a full reload of the model; `RestartSec=30` so a crash loop
