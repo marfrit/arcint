@@ -224,6 +224,7 @@ if(ARCINT_TESTS)
     tests/test_gguf_parallel.cpp
     tests/test_affinity.cpp
     tests/test_fit.cpp
+    tests/test_flash_next_offload.cpp
     tests/test_ngram_gather.cpp
     tests/test_ngram_row_ids.cpp
     tests/test_ngram_lookup.cpp

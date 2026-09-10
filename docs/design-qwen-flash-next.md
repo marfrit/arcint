@@ -1853,3 +1853,89 @@ The probe source, exact byte-counts and both timings are in
 `HANDOFF-0.5.0.local.md`. This is the ceiling the FIX E consequence
 sentence's "≈45 GB/s" was rounded from and its "~11 %" versus the
 414–418 GB/s VRAM ceiling holds under the measured figure.
+
+## WP7 — Expert-offload serving policy, and WP8 — the MTP head (2026-09-10)
+
+**WP7 landed the policy, the replay, and the config dry-run; the live gather is
+parked.** The streaming plan of §Fit and §WP6b now has an in-repo home:
+
+- `src/exec/flash_next_offload.h` — pure-arithmetic (no OpenVINO types, same
+  discipline as `fit.h`) residency sizing, miss-traffic and t/s projection, and
+  a load-time refusal (`flash_next_offload_must_refuse`). It is the C++ mirror
+  of `tools/flash_next_fit.py`; `tests/test_flash_next_offload.cpp` (9 cases)
+  cross-checks the two are numerically identical and pins the measured feeds
+  (DRAM 44.4, NVMe **1.68** GiB/s in-container, WP6b).
+- `tools/expert_lru_replay.py` (+ `tools/test_expert_lru_replay.py`, 6 cases,
+  and the committed `tools/testdata/qwen4exp_moe_trace_sample.txt` fixture) —
+  the reproducible replacement for the WP6b routing-trace LRU sweep, which lived
+  only in a scratch fork on the measurement host. `--check` reproduces the WP6b hit-rate table on
+  the sha-pinned trace (cbc4fe8c...) within ~1.4 points.
+- `arcint --flash-next-offload-plan HIT` — device-free dry-run that prints the
+  serving plan for the single-A770 target and admits/refuses. One-page config:
+  `docs/serving-config-flash-next.md`.
+
+**THE CACHE-MODEL CORRECTION (dated).** WP6b's hit-rate table did not state its
+cache model. The replay identifies it: it is a **per-layer LRU** (each of the 48
+layers holds its own resident slots), which is also the model arcint's own slot
+pool implements (`fit.h expert_slot_bytes` is per-layer). A **global** shared
+LRU — FreeToken's paper shape — reads a materially more optimistic hit-rate on
+the same trace (~93.8 % flat vs the per-layer 88.1 % at a 16 GiB budget), a
+> 50 % t/s overstatement if adopted. The projection uses the per-layer number;
+the global figure is the FreeToken comparison point, recorded, not adopted. The
+served-config integration (the live expert gather from NVMe-resident GGUF rows
+on a miss) is **PARKED on the backbone-IR emission (FIX A)** — identical to FIX
+D Link 3's parked integration; the policy, replay and dry-run are what land
+windowless.
+
+**WP8 — the shipped GGUF carries no MTP head (dated correction to the amort
+lever).** The delta table above (`text_config.mtp_num_hidden_layers: 1`) records
+the **HF checkpoint's** config; the shipped **quantised artifact** is a different
+object. Inventoried across all three shards of
+`Qwen3.8-Flash-Next-UD-Q3_K_XL`: block index range **0..47** (= the 48 backbone
+layers, no MTP/nextn block beyond them), **zero** `nextn` / `mtp` / `eh_proj` /
+`shared_head` tensors, and **no `mtp.*` KV**. The `hc_*` tensors are
+hyper-connections, `*_shexp` is the MoE shared expert, `indexer.*` is QSA,
+`ssm_*` is GatedDeltaNet — the model is fully accounted for with no trained MTP
+head. Consequence: **MTP amortization is 1× as the model ships** (confirming
+WP6b), so the 30–40 t/s figures earlier notes attached to a re-exported MTP head
+are **not reachable from this artifact**. Realizing that lever needs the trained
+MTP head, which is **not on the fleet** (the fleet holds only this GGUF and the
+*dense*-27B `Qwen3.8-27B-MTP-ONLY` GGUF, a different model) and whose extraction
+is upstream-gated (FIX A's transformers/optimum chain). WP8 as briefed ("extract
+the MTP head from the GGUF tensor set") is therefore a **located defect**: the
+tensor set does not contain it. This supersedes any reading of RED-C-05 that
+assumed a Flash-Next MTP head is present in the served artifact.
+
+Reproduce the inventory (needs the GGUF present, on the measurement host): dump
+each shard's tensor directory with any GGUF reader (llama.cpp `gguf-dump
+--no-tensor-data`, or the `gguf` Python package's `GGUFReader`) and confirm
+`max(blk.N index) == 47`, `grep -iE 'nextn|mtp|eh_proj|shared_head'` returns
+nothing across all three shards, and no `*.mtp.*`/`mtp.num_hidden_layers` KV is
+present. The only embedding-like tensors are `token_embd` and
+`per_layer_token_embd` (the PLE table, dtype 20 = IQ4_NL).
+
+### WP9 — the prediction (falsifiable, dated 2026-09-10); confirming window BLOCKED
+
+Written before any window, per the WP9 discipline. **Prediction:** serving
+`Qwen3.8-Flash-Next-UD-Q3_K_XL` on **one A770** (15 GiB usable VRAM + 44 GiB
+DRAM), **PLE table 26.82 GiB DRAM-resident**, expert pool **~24 GiB resident
+(~217 slots/layer, ~42 % of the 56.25 GiB pool)**, **KV pinned `--paged-kv u8`**
+(the plugin u4 auto-drop, `execution_config.cpp:345`, NOT relied on — it needs
+its own KLD cell first), **MTP amortization 1×** (the artifact has no MTP head,
+WP8), at the measured per-layer LRU hit ~94.4 % and NVMe miss feed 1.68 GiB/s:
+**≈ 16.7 t/s (≈ 17.8 at a rounded 95 %), NVMe-miss-bound** (cite the projected-
+decode table in `docs/serving-config-flash-next.md`).
+
+**The confirming hold-and-restore window is BLOCKED, not skipped:** there is no
+servable Flash-Next artifact — the backbone IR is not emitted
+(`build_backbone_ir()` raises `NotImplementedError`, FIX A, watcher-gated), and
+arcint serves OpenVINO IR, not the GGUF directly. Every term of the prediction
+that CAN be measured without the graph already is (NVMe 1.68 GiB/s in-container,
+WP6b; DRAM 44.4 GiB/s, WP2; per-layer hit-rate, `expert_lru_replay.py` on the
+sha-pinned trace). The one unmeasured term is an end-to-end served decode at the
+streaming hierarchy, which requires the graph. A GPU window taken now would
+measure nothing and would interrupt the production services for no data, so it
+is not taken. When the backbone IR lands, the measured served t/s is appended
+here next to this prediction in the same commit; a miss is a located defect
+(name which term — hit rate, miss cost, overhead — is wrong and by how much),
+not a failure.

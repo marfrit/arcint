@@ -22,6 +22,30 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033) —
 unchanged from 0.4.7. No plugin patch.
 
+### WP7 — Flash-Next expert-offload serving policy (windowless)
+
+`src/exec/flash_next_offload.h`: pure-arithmetic (no OpenVINO types) residency
+sizing, streaming t/s projection, regime label and load-time refusal
+(`flash_next_offload_must_refuse`) for the single-A770 Flash-Next target — the
+C++ mirror of `tools/flash_next_fit.py`, cross-checked numerically identical by
+`tests/test_flash_next_offload.cpp` (9 cases). `tools/expert_lru_replay.py`
+(+ its 6-case ladder and the committed `tools/testdata/qwen4exp_moe_trace_sample.txt`
+fixture) is the reproducible, in-repo replacement for the WP6b routing-trace LRU
+sweep; `--check` reproduces the WP6b hit-rate table on the sha-pinned trace
+within ~1.4 points. New dry-run flag `--flash-next-offload-plan HIT` prints the
+serving plan and admits/refuses (device-free). One-page config doc:
+`docs/serving-config-flash-next.md`.
+
+**Cache-model correction:** WP6b's hit-rate table is a **per-layer** LRU (the
+shape arcint's own slot pool has), not a global LRU (FreeToken's shape, ~93.8 %
+flat, a > 50 % t/s overstatement if adopted). **WP8 correction:** the shipped
+`UD-Q3_K_XL` GGUF carries **no MTP head** (block range 0..47, no `nextn`/`mtp`
+tensor across all three shards), so MTP amortization is 1× as the model ships —
+the 30–40 t/s lever needs a trained MTP head not present in the artifact. The
+live expert gather is parked on the backbone-IR emission (FIX A); the policy,
+replay, dry-run and doc land windowless. See `docs/design-qwen-flash-next.md`
+"WP7 … WP8".
+
 ### Plain (non-AWQ) export projection matching (option (c))
 
 `gguf_apply_to_template` (`src/exec/gguf_graph.cpp`) now admits

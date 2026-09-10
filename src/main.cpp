@@ -8,6 +8,7 @@
 #include "config.h"
 #include "core/artifact.h"
 #include "exec/backend.h"
+#include "exec/flash_next_offload.h"
 #include "http/server.h"
 #include "util/log.h"
 #include "util/text.h"
@@ -50,6 +51,41 @@ int main(int argc, char** argv) {
         std::printf("arcint %s (%s) %s, %s\n", ARCINT_VERSION, ARCINT_GIT_SHA,
                     ARCINT_BUILD_TYPE, ARCINT_COMPILER);
         return 0;
+    }
+    if (cfg.flash_next_offload_plan) {
+        // WP7 dry-run: size the Flash-Next expert-offload serving plan for the
+        // single-A770 target at the measured per-layer LRU hit-rate. Device-free
+        // (no card, no served graph); the live expert gather it sizes is parked
+        // on the backbone IR (FIX A). Target budget = docs/serving-config-flash-next.md.
+        const double GiB = static_cast<double>(1ull << 30);
+        const auto B = [&](double g) { return static_cast<uint64_t>(g * GiB + 0.5); };
+        const double vram = 15.0, dram = 44.0, backbone = 2.3, kv = 3.0, act = 2.0;
+        const lgc::OffloadPlan p = lgc::flash_next_plan(
+            B(vram), B(dram), B(backbone), B(kv), B(act), cfg.flash_next_offload_hit);
+        const bool refuse = lgc::flash_next_offload_must_refuse(p, /*floor_tps=*/0.0);
+        std::printf("Flash-Next expert-offload plan (single-A770 target, dry-run):\n");
+        std::printf("  card budget: VRAM %.1f GiB, DRAM %.1f GiB "
+                    "(backbone %.1f + KV %.1f + activations %.1f reserved on VRAM)\n",
+                    vram, dram, backbone, kv, act);
+        std::printf("  measured feeds: DRAM %.1f GiB/s, NVMe miss %.2f GiB/s; MTP amort 1x (GGUF has no MTP head)\n",
+                    lgc::kFlashNextDramBwGiBs, lgc::kFlashNextNvmeBwGiBs);
+        std::printf("  PLE table %.2f GiB DRAM-resident: %s\n",
+                    static_cast<double>(lgc::kFlashNextTableBytes) / GiB,
+                    p.table_fits_dram ? "yes" : "NO (random hashed gather would be seek-bound)");
+        std::printf("  resident expert pool: %.2f GiB (%.0f%% of %.2f GiB), %d slots/layer "
+                    "(VRAM %.2f + DRAM %.2f GiB)\n",
+                    static_cast<double>(p.budget.expert_bytes) / GiB, p.resident_frac * 100.0,
+                    static_cast<double>(512ull * 48 * lgc::kFlashNextSliceBytes) / GiB,
+                    p.slots_per_layer,
+                    static_cast<double>(p.budget.vram_for_experts) / GiB,
+                    static_cast<double>(p.budget.dram_for_experts) / GiB);
+        std::printf("  per-layer LRU hit-rate (measured input): %.1f%%\n",
+                    cfg.flash_next_offload_hit * 100.0);
+        std::printf("  projected decode: %.1f t/s (%s) -- bandwidth-bound estimate, not served\n",
+                    p.projected_tps, lgc::flash_next_regime_name(p.regime));
+        std::printf("  verdict: %s\n", refuse ? "REFUSE (PLE table cannot be DRAM-resident)"
+                                              : "ADMIT (table-residency only; the t/s above is advisory)");
+        return refuse ? 1 : 0;
     }
 
     lgc::log::set_level(level_for(cfg.verbosity));

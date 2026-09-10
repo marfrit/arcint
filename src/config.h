@@ -15,6 +15,14 @@ struct Config {
     std::string model_path;  // OpenVINO IR directory (M1+)
     std::string gguf_path;   // --gguf: weights from this GGUF, --model as the topology template (0.4.0)
     std::string flash_next_ngram_path;  // --flash-next-ngram: FIX D per_layer_token_embd table (24-byte ARCINGRM header + block-quantised payload); admitted only when the artifact's config.json declares an n-gram table (docs/design-qwen-flash-next.md FIX D Link 2)
+    // --flash-next-offload-plan HIT: WP7 dry-run. Given the measured per-layer
+    // LRU hit-rate (0..1, from tools/expert_lru_replay.py) and the single-A770
+    // target card budget, print the expert-offload serving plan (resident
+    // bytes, slots/layer, projected t/s, regime) and admit/refuse, then exit.
+    // Device-free; consumes src/exec/flash_next_offload.h. The live expert
+    // gather it sizes is parked on the backbone IR (FIX A).
+    bool        flash_next_offload_plan = false;
+    double      flash_next_offload_hit  = 0.0;
     bool        gguf_native = false;  // --gguf-native: the file's own rows in the plugin's K-quant kernel instead of the repack (0.4.1)
     int         gguf_mode = 2;        // --gguf-mode: 0 = repack, 1 = native (also --gguf-native), 2 = mixed (Q4_K repacked, the rest native; the default, DESIGN 7.0.2be) (0.4.1)
     bool        gguf_embed_file = true;  // --gguf-embed file|template: the token embedding rows from the file, dequantised on the host per token (0.4.1)

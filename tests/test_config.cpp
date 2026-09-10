@@ -22,6 +22,24 @@ bool rejected(std::vector<const char*> args) {
 
 }  // namespace
 
+// WP7: --flash-next-offload-plan takes the measured per-layer hit-rate, sets the
+// dry-run flag, and (like --help/--version) does not require something to serve.
+TEST(config_flash_next_offload_plan_parses_hit) {
+    Config cfg;
+    CHECK(run({"--flash-next-offload-plan", "0.944"}, cfg).ok);
+    CHECK(cfg.flash_next_offload_plan);
+    CHECK_NEAR(cfg.flash_next_offload_hit, 0.944, 1e-9);
+    // no --model / --stub needed: the dry-run is device-free
+    CHECK(!cfg.stub);
+}
+
+TEST(config_flash_next_offload_plan_rejects_out_of_range) {
+    CHECK(rejected({"--flash-next-offload-plan", "1.5"}));    // > 1
+    CHECK(rejected({"--flash-next-offload-plan", "-0.1"}));   // < 0
+    CHECK(rejected({"--flash-next-offload-plan"}));           // missing value
+    CHECK(rejected({"--flash-next-offload-plan", "abc"}));    // not a number
+}
+
 TEST(config_stub_defaults) {
     Config cfg;
     CHECK(run({"--stub"}, cfg).ok);

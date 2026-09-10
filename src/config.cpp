@@ -387,6 +387,10 @@ std::string usage_text() {
         "\n"
         "misc\n"
         "  -v, -vv                   raise console verbosity\n"
+        "  --flash-next-offload-plan HIT\n"
+        "                            print the Flash-Next expert-offload serving\n"
+        "                            plan for the target card at measured per-layer\n"
+        "                            LRU hit-rate HIT (0..1), then exit (WP7 dry-run)\n"
         "  --version                 print version and exit\n"
         "  -h, --help                print this help and exit\n";
 }
@@ -429,6 +433,16 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--flash-next-ngram") {
             if (!value(v)) return fail("--flash-next-ngram needs a path to the per_layer_token_embd table");
             cfg.flash_next_ngram_path = std::string(v);
+        } else if (arg == "--flash-next-offload-plan") {
+            double h = 0.0;
+            if (!value(v) || !parse_double(v, h)) {
+                return fail("--flash-next-offload-plan needs the measured per-layer LRU hit-rate (0..1)");
+            }
+            if (!(h >= 0.0 && h <= 1.0)) {
+                return fail("--flash-next-offload-plan hit-rate must be in [0, 1]");
+            }
+            cfg.flash_next_offload_plan = true;
+            cfg.flash_next_offload_hit = h;
         } else if (arg == "--gguf-native") {
             cfg.gguf_native = true;
             cfg.gguf_mode = 1;
@@ -681,7 +695,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         }
     }
 
-    if (cfg.show_help || cfg.show_version) return {};
+    if (cfg.show_help || cfg.show_version || cfg.flash_next_offload_plan) return {};
 
     // ------------------------------------------------------------ validation
     if (cfg.model_path.empty() && !cfg.stub) {

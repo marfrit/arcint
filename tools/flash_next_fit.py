@@ -86,18 +86,20 @@ def self_test():
     expect_dram = 1000.0 / ((TRAFFIC_GIB / 44.4) * 1000.0)
     if abs(full_res - expect_dram) > 0.1:
         fails.append(f"h=1 should hit DRAM ceiling {expect_dram:.1f}, got {full_res:.1f}")
-    # Full miss (h=0), no amortization -> NVMe ceiling.
-    full_miss = project_tps(0.0, 44.4, 4.66, amortization=1.0)
-    expect_nvme = 1000.0 / ((TRAFFIC_GIB / 4.66) * 1000.0)
+    # Full miss (h=0), no amortization -> NVMe ceiling (measured miss feed 1.68).
+    full_miss = project_tps(0.0, 44.4, 1.68, amortization=1.0)
+    expect_nvme = 1000.0 / ((TRAFFIC_GIB / 1.68) * 1000.0)
     if abs(full_miss - expect_nvme) > 0.1:
         fails.append(f"h=0 should hit NVMe ceiling {expect_nvme:.1f}, got {full_miss:.1f}")
     # Amortization must raise full-miss throughput monotonically.
-    if not project_tps(0.0, 44.4, 4.66, amortization=3.0) > full_miss:
+    if not project_tps(0.0, 44.4, 1.68, amortization=3.0) > full_miss:
         fails.append("amortization did not raise the miss-bound throughput")
-    # HDD floor must be far below NVMe (the tier finding).
+    # HDD floor must be strictly below the NVMe miss ceiling, in proportion to
+    # the tier bandwidths (at h=0 the rate is linear in feed bw, so the ratio is
+    # exactly hdd_bw/nvme_bw = 0.413/1.68).
     hdd = project_tps(0.0, 44.4, 0.413, amortization=1.0)
-    if not hdd < full_miss / 5:
-        fails.append("HDD floor not far below NVMe -- tier model wrong")
+    if not (hdd < full_miss and abs(hdd / full_miss - 0.413 / 1.68) < 1e-6):
+        fails.append("HDD floor not proportionally below NVMe -- tier model wrong")
     # Residency accounting: table must be subtracted from DRAM first.
     res, vfe, dfe = resident_expert_gib(15, 44, 2.3, 3.0, 2.0)
     if dfe > 44 - TABLE_GIB:
@@ -153,7 +155,8 @@ def parse_args(argv=None):
     ap.add_argument("--kv", type=float, default=3.0, help="KV pool GiB (pinned precision)")
     ap.add_argument("--activation", type=float, default=2.0)
     ap.add_argument("--dram-bw", type=float, default=44.4, help="DRAM read GiB/s (measured)")
-    ap.add_argument("--nvme-bw", type=float, default=4.66, help="NVMe read GiB/s (measured)")
+    ap.add_argument("--nvme-bw", type=float, default=1.68,
+                    help="NVMe miss-feed GiB/s (measured in-container, WP6b: 1.68)")
     ap.add_argument("--amort", type=float, default=1.0, help="MTP tokens-per-weight-load")
     ap.add_argument("--compute-floor-ms", type=float, default=0.0)
     ap.add_argument("--hit-rates", type=float, nargs="*",
