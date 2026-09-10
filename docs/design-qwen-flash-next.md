@@ -1898,13 +1898,24 @@ hyper-connections, `*_shexp` is the MoE shared expert, `indexer.*` is QSA,
 `ssm_*` is GatedDeltaNet — the model is fully accounted for with no trained MTP
 head. Consequence: **MTP amortization is 1× as the model ships** (confirming
 WP6b), so the 30–40 t/s figures earlier notes attached to a re-exported MTP head
-are **not reachable from this artifact**. Realizing that lever needs the trained
-MTP head, which is **not on the fleet** (the fleet holds only this GGUF and the
-*dense*-27B `Qwen3.8-27B-MTP-ONLY` GGUF, a different model) and whose extraction
-is upstream-gated (FIX A's transformers/optimum chain). WP8 as briefed ("extract
-the MTP head from the GGUF tensor set") is therefore a **located defect**: the
-tensor set does not contain it. This supersedes any reading of RED-C-05 that
-assumed a Flash-Next MTP head is present in the served artifact.
+are **not reachable from the shipped GGUF**. "Extract the MTP head from the GGUF
+tensor set" cannot be done: the tensor set does not contain it.
+
+**AMENDED (2026-09-11, WP8b) — the MTP head is NOT upstream-gated.** An earlier
+version of this section read that the trained head was "not on the fleet" and its
+extraction "upstream-gated (FIX A's transformers/optimum chain)". That was wrong
+and is retracted: the upstream HF checkpoint `Qwen/Qwen3.8-Flash-Next` DOES carry
+the trained MTP head — `model.safetensors.index.json` lists **31 `mtp.*` tensors
+across 28 of 131 shards** (`mtp.fc_embedding`, `mtp.fc_hidden`,
+`mtp.pre_fc_norm_{embedding,hidden}`, `mtp.layers.0.self_attn.*` including the QSA
+`indexer`, `mtp.layers.0.mlp.experts.{gate_up,down}_proj` (a 512-expert MoE) and
+`shared_expert`, `mtp.hyper_connection_mixer.*`). safetensors is
+range-addressable, so acquisition is a **range-sliced fetch of only those tensors
+(WP8b) — a tooling task, not a gate**. Net: **No MTP in the GGUF (verified across
+shards); upstream MTP tensors CONFIRMED PRESENT via the index (31 tensors / 28
+shards); acquisition = range-sliced safetensors fetch.** RED-C-05 still requires
+the fit's MTP-state charge be derived from the compiled head's real tensor shapes
+once the head is exported.
 
 Reproduce the inventory (needs the GGUF present, on the measurement host): dump
 each shard's tensor directory with any GGUF reader (llama.cpp `gguf-dump

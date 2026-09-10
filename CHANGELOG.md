@@ -38,13 +38,13 @@ serving plan and admits/refuses (device-free). One-page config doc:
 
 **Cache-model correction:** WP6b's hit-rate table is a **per-layer** LRU (the
 shape arcint's own slot pool has), not a global LRU (FreeToken's shape, ~93.8 %
-flat, a > 50 % t/s overstatement if adopted). **WP8 correction:** the shipped
-`UD-Q3_K_XL` GGUF carries **no MTP head** (block range 0..47, no `nextn`/`mtp`
-tensor across all three shards), so MTP amortization is 1× as the model ships —
-the 30–40 t/s lever needs a trained MTP head not present in the artifact. The
-live expert gather is parked on the backbone-IR emission (FIX A); the policy,
-replay, dry-run and doc land windowless. See `docs/design-qwen-flash-next.md`
-"WP7 … WP8".
+flat, a > 50 % t/s overstatement if adopted). **WP8:** the shipped `UD-Q3_K_XL`
+GGUF carries **no MTP head** (block range 0..47, no `nextn`/`mtp` tensor across
+all three shards), so MTP amortization is 1× as the model ships. The trained MTP
+head is **NOT** upstream-gated, though: the HF checkpoint index lists 31 `mtp.*`
+tensors across 28 shards, range-fetchable (WP8b). The live expert gather is
+parked on the backbone-IR emission (FIX A); the policy, replay, dry-run and doc
+land windowless. See `docs/design-qwen-flash-next.md` "WP7 … WP8".
 
 ### Plain (non-AWQ) export projection matching (option (c))
 
