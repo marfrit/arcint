@@ -18,6 +18,7 @@ from export_qwen4_exp import (  # noqa: E402
     ARCHITECTURE,
     MODEL_TYPE,
     PASSTHROUGH_FILES,
+    REFERENCE_COMMIT,
     REQUIRED_OUTPUTS,
     build_backbone_ir,
     load_config,
@@ -277,7 +278,11 @@ class TestOutputLayout(unittest.TestCase):
                 build_backbone_ir(d, geo, "/no/such/checkpoint")
         msg = str(cm.exception)
         self.assertIn("qwen4_exp", msg)
-        self.assertIn("watch_flash_next_export", msg)
+        # WP5 pivot: the arcint-original emission no longer waits on the
+        # upstream optimum-intel watcher. The refusal now pins the reference
+        # commit it will read and names the acceptance gate (the KLD harness).
+        self.assertIn("kld_harness", msg)
+        self.assertIn(REFERENCE_COMMIT[:8], msg)
         self.assertIn("n_layer=4", msg)
 
 

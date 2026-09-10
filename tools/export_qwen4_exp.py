@@ -196,24 +196,52 @@ def write_output_layout(out_dir, checkpoint_dir, geometry, options,
             )
 
 
+# The arcint-original emission reads its forward-pass spec from the HF
+# transformers reference, PINNED so a later read is against the same code:
+#   transformers @ main, src/transformers/models/qwen4_exp/modeling_qwen4_exp.py
+#   commit 5b7dcb0d36c242d8d85920a81c564ef3a86ca6dd (2026-09-09), generated
+#   from modular_qwen4_exp.py (Apache-2.0, "The Qwen Team and HuggingFace").
+# The installed dev-host venv (transformers 5.0.0) does NOT carry qwen4_exp; its
+# cousin qwen3_next covers GDN + MoE + RoPE + RMSNorm but NOT the three
+# qwen4_exp-specific modules (GatedResidual, QSA, PLE). The module inventory to
+# emit, with the reference class that specifies each:
+#   Qwen4ExpTextNGramEmbedding  - hashed n-gram row_ids (arcint: exec/ngram_row_ids.h)
+#   Qwen4ExpTextPLELayer        - PLE inject: gating + dilated conv. WHICH layer
+#     is unreconciled: HF config.json (FIX B) declares ple_layer_ids [2]; the
+#     Unsloth GGUF KV (WP2) records qwen4exp.ple.layers [1]. Both are pre-
+#     conversion one-indexed claims; settle against the pinned reference's
+#     index convention (config.py:149-150 one->zero-based) before injecting.
+#   Qwen4ExpTextGatedResidual   - hyper-connection stream mix (hc_count, hc_lowrank)
+#   Qwen4ExpTextQSAIndexer      - Qwen Sparse Attention block selection
+#   Qwen4ExpTextAttention       - MHA + q-norm + RoPE + gate scaling (full-attn layers)
+#   Qwen4ExpTextGatedDeltaNet   - GDN linear attention (interval 4 -> 36 of 48)
+#   Qwen4ExpTextTopKRouter / Experts / SparseMoeBlock - 512 experts, top-10, width 640
+#   MTP x1 head                 - text_config.mtp (hybrid, layer_types, ...)
+# Acceptance is the KLD gate in tools/kld_harness.py (threshold 0.0599 nats),
+# NOT "compiles and serves". Every emitted component is validated against the
+# torch reference (max-abs + KL drift on synthetic weights) before the whole
+# backbone is admitted.
+REFERENCE_COMMIT = "5b7dcb0d36c242d8d85920a81c564ef3a86ca6dd"
+
+
 def build_backbone_ir(out_dir, geometry, checkpoint_dir):
     """Reconstruct the qwen4_exp backbone as an ov::Model and save it.
 
-    Refuses with a named reason: the linear-attention + full-attention +
-    512-expert MoE + 51B n-gram embedding + MTP head graph is the
-    watcher-gated increment (`tools/watch_flash_next_export.py`;
-    upstream `optimum-intel` needs to lift both its `<5.6` transformers
-    cap and its stale `VisionRotaryEmbedding` import, OR the operator
-    picks the fallback and this function ships the graph). The
-    geometry carried in the message is what the shim already produced,
-    so a caller sees the surface reached, not a generic KeyError.
+    Refuses with a named reason until the arcint-original graph emission is
+    numerically validated against the pinned reference (see REFERENCE_COMMIT
+    and the module inventory above). The geometry carried in the message is
+    what the shim already produced, so a caller sees the surface reached, not
+    a generic KeyError. The acceptance instrument (KLD vs BF16, red-probed) is
+    landed in tools/kld_harness.py; the remaining surface is the per-module
+    emission + per-module numeric validation, not the gate.
     """
     raise NotImplementedError(
-        "qwen4_exp backbone reconstruction is watcher-gated "
-        f"({ARCHITECTURE}, tools/watch_flash_next_export.py). Config, "
-        "tokenizer and sidecar passthrough succeeded; the ov::Model "
-        f"graph is the remaining surface. Geometry: n_layer="
-        f"{geometry.get('n_layer')} n_embd={geometry.get('n_embd')} "
+        f"qwen4_exp backbone reconstruction not yet emitted ({ARCHITECTURE}). "
+        f"Reference pinned: transformers@{REFERENCE_COMMIT} "
+        "modeling_qwen4_exp.py. Config, tokenizer and sidecar passthrough "
+        "succeeded; the ov::Model graph (GatedResidual/QSA/PLE/GDN/MoE/MTP) "
+        "is the remaining surface, gated by tools/kld_harness.py. Geometry: "
+        f"n_layer={geometry.get('n_layer')} n_embd={geometry.get('n_embd')} "
         f"num_experts={geometry.get('num_experts')}"
     )
 
