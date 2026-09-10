@@ -356,12 +356,37 @@ ple.py:465-478 `NGramEmbedding.row_ids`:
     mixed = XOR_p (token[p] * layer_multipliers[p])          [int64, wrapping]
     row[h] = mixed % ngram_heads_vocab_sizes[h] + ngram_heads_offsets[h]
   The three buffers (layer_multipliers, ngram_heads_vocab_sizes,
-  ngram_heads_offsets) ship as int64 checkpoint tensors; the reference's
-  `derive_ngram_hash_constants` (ple.py:239-268) is the DUMMY-weight path that
-  recomputes them "the way HF derives them at init" and is the oracle a loader
-  test checks the checkpoint tensors against. arcint derives its test vectors
-  from that oracle (torch-free); a check of arcint's loaded buffers against the
-  real checkpoint tensors is still owed once an artifact exists.
+  ngram_heads_offsets) are derived constants (not trained weights); the
+  reference's `derive_ngram_hash_constants` (ple.py:239-268) is the DUMMY-weight
+  path that recomputes them "the way HF derives them at init" and is the oracle
+  a loader test checks against. arcint derives its test vectors from that oracle
+  (torch-free).
+
+  **CLOSED 2026-09-10 (WP2, against the real artifact): the "check of arcint's
+  loaded buffers against the real checkpoint is still owed" item below is now
+  met.** The Unsloth UD-Q3_K_XL GGUF of Qwen3.8-Flash-Next (arch `qwen4exp`)
+  ships the constants as GGUF KV metadata, not tensors and not derived-at-init:
+    ngram_size 3, heads_per_ngram 8 (-> 16 heads), eos_token_id 248044,
+    layer_multipliers [23703573157769, 20109073645365, 8052911324071],
+    head_vocab_sizes [20000003 .. 20000171] (16 primes near 2e7),
+    head_offsets [0 .. 300001275] (last offset+vocab 320001446).
+  UNRECONCILED PLE-layer index: this GGUF KV records `qwen4exp.ple.layers [1]`
+  (one-indexed), while the HF config.json read in the design doc (FIX B) gives
+  `ple_layer_ids [2]`. Both are pre-conversion one-indexed claims about the
+  same field; which layer build_backbone_ir injects PLE on must be settled
+  against the pinned reference's one->zero-based conversion (ple.py/config.py),
+  not assumed from either number.
+  arcint's own C++ `lgc::ngram::derive_hash_constants` AND the reference's
+  torch-free oracle both reproduce all three buffers BYTE-EXACT at
+  ngram_size=3, 16 heads, base 20000000, ple_layer_index 0, vocab_size 248320,
+  seed 1234. row_ids over sample token histories produced only in-band indices
+  (< 320001536 table rows) that gathered distinct, nonzero-scale real rows.
+  The PLE table `per_layer_token_embd.weight` is GGUF dtype 20 =
+  `GGML_TYPE_IQ4_NL` (4.5 bpw, 32/block, 18 B/block, one fp16 scale/block),
+  shape [160, 320001536], 90 B/row, 28,800,138,240 B (~26.8 GiB) on disk in
+  that artifact -- the available quantized table, distinct from the ~47.7 GiB
+  FP8 upstream figure noted below. (Operator host/path detail in the 0.5.0
+  session handoff, not here.)
   heads: num_ngram_heads = (ngram_size-1)*heads_per_ngram (config.py:49-51;
   Qwen3.8: 8x2-gram + 8x3-gram = 16); each head owns a prime vocab slice;
   global row space = concatenated offsets. Per token: [T,16] rows x 160 dim.
