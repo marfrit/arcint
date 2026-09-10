@@ -611,6 +611,50 @@ is not yet added to any crontab — that step is operator-side, tracked in
 of this repository's other Flash-Next work (FIX B's delta table above,
 FIX C's kernel audit, FIX D's n-gram offload) waited on this decision.
 
+**Decision memo (2026-09-10): watcher stays, construction path is an
+arcint-original `qwen4_exp` export shim.** The two-link upstream chain
+(optimum-intel's `<5.6` transformers cap AND its stale `VisionRotaryEmbedding`
+import) is not a gate on our work, only on acceptance against the real
+checkpoint. The construction path is the same pattern this repo already
+uses for `tools/export_mtp.py` and `tools/export_dflash.py`: read the
+checkpoint's `config.json`, walk its `state_dict` directly, build the
+`ov::Model` from config geometry and HF weights, write the multi-component
+IR layout — bypassing optimum-intel's export pipeline entirely.
+
+**Shim landed (`tools/export_qwen4_exp.py`, 2026-09-10):** the argument
+parser (`--checkpoint`, `--out`, `--moe-lowering`, `--rope`, `--dry-run`);
+a `translate_config()` that walks the checkpoint's `text_config` and
+returns the arcint-internal geometry dict the graph builder keys off
+(`n_layer`, `n_embd`, `n_head`, `n_head_kv`, `head_dim`, `n_ff`,
+`rms_norm_eps`, `rope_theta`, `max_position_embeddings`,
+`tie_word_embeddings`, `layer_types`, `full_attention_interval`, the
+GDN linear-attention heads and head-dims and conv kernel, MoE keys
+`num_experts` / `moe_topk` / `moe_intermediate_size` /
+`num_shared_experts` / `moe_norm_topk`, `mtp_layers`); and a
+`write_output_layout()` that (a) passes the checkpoint's own
+`config.json`, `chat_template.jinja`, `tokenizer.json` and
+`tokenizer_config.json` through verbatim — the arcint loader
+(`src/core/artifact.cpp`) reads HF-native keys from `text_config` and
+hashes `chat_template.jinja`, so a fabricated stand-in produces an
+artifact whose hashes diverge from every existing pin, (b) writes an
+`arcint.json` sidecar carrying the derived geometry and the shim's own
+knobs (`moe_lowering`, `rope`), and (c) invokes the caller's
+`component_writer(out, geo, options)` and asserts every entry in
+`REQUIRED_OUTPUTS` is present after it returns — the layout is not
+silently half-built. 23 unit tests cover the three surfaces
+(`tools/test_export_qwen4_exp.py`), all pass on this repository's
+Python 3 stdlib alone (no venv). The backbone graph reconstruction
+(`build_backbone_ir()`) refuses at runtime with a named
+`NotImplementedError` naming the watcher and the geometry it was
+handed; the graph is the watcher-gated increment.
+
+**Acceptance against the real checkpoint awaits the watcher.** Watcher
+stays running; nothing about the shim replaces it. Once either upstream
+gap clears, `build_backbone_ir()` walks the state_dict layer by layer
+and produces `openvino_language_model.xml` tensor by tensor, the same
+shape `export_mtp.py` uses for its 1-layer head. None of the argument,
+config-passthrough or layout code is affected by that work.
+
 ## FIX D — N-gram table host-offload and dequantise-on-gather
 
 ### The tensor
