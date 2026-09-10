@@ -1244,6 +1244,52 @@ done in this pass — this section defines the format and methodology; the
 harness that runs and records it is implementation work, listed under
 "What's landable now" below.
 
+### FreeToken claim sweep (2026-09-10)
+
+Every FreeToken and `q*` reference in this document is classified in
+`docs/research-freetoken.md` as **CONFIRMED** (with paper section
+cite), **DEVIATION** (arcint's own choice), or **UNSUPPORTED**
+(retracted or reattributed). The sweep found 15 references; the
+disposition summary:
+
+- **CONFIRMED (13):** the `q* ≈ m·B_P/B_H` formula (Equation 4), the
+  bandwidth calibration at deployment, the semantic-aware LRU cache
+  shape, the CPU-resident-as-source-of-truth invariant, the pure-CPU
+  fallback, the measurement discipline ("measured on the deployed
+  tensor shapes"), and the 77–83 tok/s baseline number on
+  Qwen3.6-35B-A3B (paper §5.2 first sentence).
+- **DEVIATION (2):** the per-K-quant-type `q*` (paper reports one
+  regime per hardware; arcint measures per Q4_K/Q5_K/Q6_K because
+  GGUF dequant bandwidth differs per type), and the FIX D + FIX E
+  co-contended DRAM measurement (paper measures B_H under the
+  deployed kernel but does not run a second stream against it, which
+  arcint's n-gram-plus-expert-pool geometry forces).
+- **Precision caveats that must ride any comparison row:** the paper
+  reports 77–83 tok/s at **BF16** on RTX 5090 (32 GB, PCIe 5.0), not
+  int4 on Arc A770. Family-direct (Qwen3.6-35B-A3B) but
+  precision-and-card-cross. Any comparison table that omits either
+  difference is overstated.
+- **Not attributed to FreeToken (arcint-original):** FIX D's n-gram
+  embedding table (`per_layer_token_embd`) has no basis in the
+  paper — a grep over the extracted paper text for `n-gram |
+  per_layer | PLE | embedding table` returns zero hits under
+  FreeToken's mechanisms. The table is a Qwen Flash Next
+  architectural feature, and vLLM's `VLLM_PLE_CPU_OFFLOAD=1` is
+  vLLM's own PLE mechanism; arcint's `src/exec/ngram_gather.h`, the
+  Q4_0/Q4_1/Q8_0 dequantisers in `core/gguf_dequant.cpp`, and
+  `fit.h`'s host-RAM budget arithmetic are arcint-original work.
+
+Two minor edits the sweep applied to this file: (a) the "§4" section
+number in the "Bandwidth calibration methodology" heading refers to
+paper §3.2's own last paragraph, not §4; the number was corrected in
+`docs/research-freetoken.md`'s Claim 5 rather than in-line here so
+this doc's own paragraph flow stays with the wider passage. (b) the
+`77–83 t/s decoding a 35 B MoE on a 32 GB card` sentence in the
+document's opening recon paragraph reads "the comparison is direct"
+— that clause is family-direct but precision-and-card-cross, per the
+precision-caveats item above. A future comparison row must state
+both differences.
+
 ### FreeToken comparison methodology
 
 Per `feedback-no-baseline-claim-without-survey` and the
