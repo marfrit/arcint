@@ -1,3 +1,19 @@
+arcint (0.5.0-1) trixie; urgency=medium
+
+  * 0.5.0: Qwen3.5-2B dense qwen35 GGUF served on the 16 GiB card for
+    the first time (186 projections replaced: 98 repacked, 88 native
+    rows), unlocked by two extensions to gguf_apply_to_template: the
+    plain (non-AWQ) VL export naming path (".weight" primary + FQ
+    subgraph, disambiguated by feeding a MatMul through the exporter's
+    chain -- option (c) from the 2B marker forensics), and per-head-
+    scalar shape admission for ssm_alpha / ssm_beta under the RowsV
+    reorder. FIX A decision memo landed with the arcint-original
+    qwen4_exp export shim (tools/export_qwen4_exp.py, 23 unit tests);
+    the backbone graph awaits the watcher. Runtime floor unchanged:
+    marfrit-openvino +p15 (patches 0003-0033).
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Thu, 10 Sep 2026 03:00:00 +0200
+
 arcint (0.4.7-1) trixie; urgency=medium
 
   * 0.4.7: closing the 0.4.x ledger. Shared find_projection_head() helper

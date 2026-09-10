@@ -17,6 +17,85 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.5.0 — 2026-09-10
+
+Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033) —
+unchanged from 0.4.7. No plugin patch.
+
+### Plain (non-AWQ) export projection matching (option (c))
+
+`gguf_apply_to_template` (`src/exec/gguf_graph.cpp`) now admits
+`.weight`-suffixed projection Constants under `kLayerPrefix` when the
+exporter's decompression chain reaches a MatMul (`matmul_of()`
+non-null). This is the naming pattern produced by
+`OVModelForVisualCausalLM.from_pretrained(export=True).save_pretrained()`
+without an AWQ pass (NNCF int8_asym per-channel), where the FakeQuantize
+subgraph is present but the primary weight has no distinguishing
+suffix. A norm's `.weight` feeds the `input_layernorm` / `post_attention_layernorm`
+Multiply that fans out (Q/K/V after `input_layernorm`, gate/up after
+`post_attention_layernorm`), so `matmul_of` returns null on the
+single-consumer walk and the norm is silently skipped. The 27B AWQ
+path (`._openvino_orig_weight`) is unchanged.
+
+Companion per-head-scalar shape admission (`n == g.linear_v_heads`) so
+`linear_attn.in_proj_a` / `in_proj_b` — per-head scalars on `qwen3_5`,
+one row per v-head — pass the RowsV reorder check that used to throw
+`expected 0 q/k rows and V value rows`.
+
+New synthetic-IR test
+(`tests/test_gguf_graph.cpp::gguf_pass_matches_plain_export_names_and_repacks_the_same_projections`):
+builds a toy with the plain naming pattern and asserts
+`rep.replaced.size() == 4` against the fixture. The 12 prior
+`gguf_pass_*` cases still pass on the same run.
+
+### Qwen3.5-2B dense GGUF on the 16 GiB card
+
+First served `qwen3_5` 2B artifact against `Qwen3.5-2B-Q4_K_M.gguf`
+(Unsloth): **186 projection(s) from the file (mixed: 98 repacked, 88
+native rows), Q8_0 x36, Q5_K x36, Q4_K x98, Q6_K x16**, one lane,
+`--paged-kv f16`, n_ctx 4096. 186 = 18 linear-attention × 8 +
+6 full-attention × 7 — every layer projection recovered from the file,
+no throws. `lm_head` is not separately matched (tied embeddings on
+this 2B: no `self.model.lm_head.weight` Const exists; the head serves
+against the shared `embed_tokens.weight`, which the loader's embedding-
+from-file path handles). Paged model ready 7.4 s, device-resident
+1.34 GiB, one completion returned (temperature 0.0, greedy).
+
+### FIX A: qwen4_exp export shim (arcint-original)
+
+`tools/export_qwen4_exp.py` lands the CLI plumbing, config-to-arcint-
+geometry translation (`translate_config()`) and output-layout writer
+(`write_output_layout()`) for the `qwen4_exp` architecture. The layout
+writer passes the checkpoint's HF-native `config.json`,
+`chat_template.jinja` and tokenizer files through verbatim (the arcint
+loader hashes `chat_template.jinja` and reads HF-native geometry keys
+from `text_config`; a fabricated stand-in produces hash divergence
+against every existing pin), writes an `arcint.json` sidecar carrying
+the derived geometry and export knobs, and asserts every
+`REQUIRED_OUTPUTS` entry after the caller's `component_writer` runs.
+23 unit tests, all pass on the Python 3 stdlib (no venv). The
+backbone graph (`build_backbone_ir()`) refuses at runtime with a
+named `NotImplementedError` naming `tools/watch_flash_next_export.py`
+and the geometry; the graph is the watcher-gated increment.
+
+Watcher (`tools/watch_flash_next_export.py`) stays running; the shim
+does not replace it. When either upstream gap clears
+(`optimum-intel`'s `<5.6` transformers cap or its stale
+`VisionRotaryEmbedding` import), the graph builder becomes the
+next-session increment.
+
+### Not in this release
+
+- Full 2B AWQ export: `tools/export_2b_awq.py`'s Phase 2 (OVQuantizer)
+  is blocked by `_prepare_visual_causal_lm_calibration_data` calling
+  `AutoProcessor.from_pretrained(config.processor)` even when the
+  caller supplies a pre-tokenized `list[dict]`; Front 3 as recorded is
+  insufficient without an optimum-intel patch. Plain (int8_asym)
+  export succeeds and is what the 2B GGUF work uses, via option (c).
+- MoE GGUF serving stays refused at the `general.architecture ==
+  "qwen35"` gate (§6). Q4_K_S of the 27B is on disk as a fetch, not
+  as a served case.
+
 ## 0.4.7 — 2026-09-09
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033) —
