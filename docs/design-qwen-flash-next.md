@@ -1932,8 +1932,11 @@ Written before any window, per the WP9 discipline. **Prediction:** serving
 DRAM), **PLE table 26.82 GiB DRAM-resident**, expert pool **~24 GiB resident
 (~217 slots/layer, ~42 % of the 56.25 GiB pool)**, **KV pinned `--paged-kv u8`**
 (the plugin u4 auto-drop, `execution_config.cpp:345`, NOT relied on — it needs
-its own KLD cell first), **MTP amortization 1×** (the artifact has no MTP head,
-WP8), at the measured per-layer LRU hit ~94.4 % and NVMe miss feed 1.68 GiB/s:
+its own KLD cell first), **MTP amortization 1×** (the shipped GGUF has no MTP
+head, WP8; the trained head is now acquired off HF — WP8b — but its measured
+draft-acceptance awaits the scheduled speculative window, so amort stays 1× as a
+measured input until then, not as an assumption), at the measured per-layer LRU
+hit ~94.4 % and NVMe miss feed 1.68 GiB/s:
 **≈ 16.7 t/s (≈ 17.8 at a rounded 95 %), NVMe-miss-bound** (cite the projected-
 decode table in `docs/serving-config-flash-next.md`).
 
@@ -1950,3 +1953,36 @@ is not taken. When the backbone IR lands, the measured served t/s is appended
 here next to this prediction in the same commit; a miss is a located defect
 (name which term — hit rate, miss cost, overhead — is wrong and by how much),
 not a failure.
+
+### WP8b EXECUTED — MTP head acquired; acceptance path located (2026-09-11)
+
+**Acquired.** `tools/fetch_safetensors_tensors.py` range-sliced the 31 `mtp.*`
+tensors out of `Qwen/Qwen3.8-Flash-Next` (360 GB checkpoint) — **4.856 GiB
+fetched, no shard downloaded whole**. Validated: 31 tensors, all BF16, 0
+shape/dtype mismatches against the config geometry (hidden 2560, 24 q-heads /
+2 kv-heads gated / head_dim 256, 512-expert MoE moe_inter 640, QSA indexer,
+hyper-connection mixers). Assembled `mtp_head.safetensors`, sha256
+`97d31bd9d30596d2ae9d58c3092eb1c2be47f52881b207e77289ebf8869b0a71`, landed in
+NVMe staging (byte-exact sha after copy) with a 31-line acquisition log
+(URL / range / bytes / sha256 / timestamp per tensor).
+
+**Acceptance measurement — path located, not windowless.** The number the
+projection wants (Flash-Next MTP draft acceptance on the WP6b corpus) needs the
+MTP head run as a speculative draft against the served target. The corpus is
+saved (prose + code). The llama.cpp qwen4exp fork has the machinery in
+principle (`convert_hf_to_gguf.py --mtp`, `supports_mtp_export=True` via
+`_QwenMtpMixin`, `examples/speculative`), but three concrete gaps stand between
+here and a number, each evidenced, none a bare blocker:
+  1. `--mtp` (mtp_only) also keeps base `embed_tokens` / `norm` / `lm_head` —
+     not in the 31-tensor slice; +~2.5 GB to fetch (same tool).
+  2. the fork's MTP remapper only maps the DENSE head's names (`mtp.fc`,
+     `pre_fc_norm_*`, `norm`); Flash-Next's `mtp.fc_embedding`/`fc_hidden`,
+     `hyper_connection_mixer.*` and `self_attn.indexer.*` are unmapped — the
+     convert path and the nextn decode graph need extending for this structure
+     (the shipped GGUF carries no MTP, so no one has run it).
+  3. running acceptance loads the 84 GB target speculatively; the measurement
+     host currently has ~46 GiB free against a guarded ~75 GiB resident
+     workload, so the target run is an operator-scheduled window, not a
+     windowless step — the same class as WP9's served measurement.
+So amortization stays **1× as a MEASURED input** until that window; the head is
+in hand and the path is de-risked end to end.
