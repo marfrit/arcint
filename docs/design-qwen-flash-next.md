@@ -896,9 +896,16 @@ scope:
 
 | precision | table size | dev container (48 GiB RAM) | fits alongside FIX E's expert pool? |
 |---|---|---|---|
+| **IQ4_NL (measured artifact, WP2)** | **26.82 GiB** (51.2 G elems measured, not the 52.45 G estimate; 90 B/160-wide row) | fits alone | ~21.2 GiB left -- see the WP6 close below, where that is not enough |
 | Q4_0 (shipped) | 27.48 GiB (~29.5 GB decimal) | fits alone | ~20.5 GiB left for everything else |
 | Q4_1 | 30.53 GiB | fits alone | ~17.5 GiB left -- **the same RAM FIX E's host-resident expert pool wants** (HANDOFF-0.5.0.local.md's own framing) |
 | Q8_0 | 51.90 GiB | **does not fit** | refused outright, `host_ram_fit_must_refuse` is unconditionally true regardless of `expert_pool_bytes` |
+
+(WP2 measured the real Unsloth UD-Q3_K_XL artifact: the PLE table ships as
+GGUF dtype 20 = `GGML_TYPE_IQ4_NL`, [160, 320001536] = 51.2 G elements,
+28,800,138,240 B = **26.82 GiB** on disk. The element count is ~1.25 G below
+the doc's earlier ~52.45 G estimate; the IQ4_NL row above uses the measured
+count.)
 
 A unit host with materially more RAM (this section's own test fixture uses
 128 GiB as an illustrative, not measured, second row) has enough headroom
@@ -914,6 +921,54 @@ vLLM's own `VLLM_PLE_CPU_OFFLOAD=1` (auto-enabled on their reference
 comparison point: their threshold sits almost exactly at this table's Q8_0
 size, which is consistent with Q8_0 being the precision they expect to need
 that much host RAM for in the first place.
+
+### WP6 — full-model fit close (measured element counts, 2026-09-10)
+
+Every term below is an int4 (0.5 B/param) or measured-IQ4_NL price of the REAL
+Unsloth UD-Q3_K_XL GGUF's tensor element counts (read off the artifact, not
+derived from the param card). KV is at the PINNED precision (f16 — the serving
+config must pin it; the GPU plugin auto-drops KV to u4 the moment it sees
+4-bit weights, `execution_config.cpp:345`, and u4 KV has no KLD cell yet).
+
+| term | params | size | where |
+|---|---|---|---|
+| routed experts (48 layers × gate/up/down) | 120.80 B | **56.25 GiB** int4 | offload pool (device working set + host remainder) |
+| PLE n-gram table | 51.20 B | **26.82 GiB** IQ4_NL | host-resident (mmapped) |
+| attention + GDN projections/state | 3.00 B | 1.40 GiB int4 | device |
+| token_embd + lm_head | 1.27 B | 0.59 GiB int4 | device |
+| shared expert + norms + misc backbone | 0.68 B | 0.31 GiB int4 | device |
+| MTP head | — | not present in this artifact | (would add a little) |
+| **weights total** | **176.94 B** | **85.38 GiB** | — |
+
+Memory in scope: host **48 GiB**; the dev pair's two Intel cards give **≈37.7
+GiB usable** combined (a ~24 GiB and a ~16 GiB card; 22.71 + ~15). Combined
+device+host ≈ **85.7 GiB**.
+
+**It does not fit.** Two ways to see it, both with the numbers:
+
+- *Total-memory view.* Weights alone are 85.38 GiB against 85.7 GiB of
+  combined device+host memory — ~0.3 GiB of slack before a single byte of KV
+  pool, activation reservation, or allocator margin. Those are not zero (12
+  full-attention layers of f16 KV + GDN recurrent state + activations are
+  several GiB), so the real budget is negative.
+- *Host-resident view (the FIX D/E design intent: table host-resident, experts
+  host-offloaded).* Host must hold the PLE table (26.82 GiB) plus the expert
+  pool the device cannot keep resident. Even in the optimistic split where the
+  device holds ~30 GiB of experts (leaving no room there for KV), the host
+  carries 26.82 + 26.25 = 53.07 GiB > 48 GiB — over by ~5 GiB before KV
+  staging or margin. In the pessimistic (design-intent) split where the full
+  56.25 GiB expert pool is host-resident, host needs 26.82 + 56.25 = 83.07 GiB,
+  over by ~35 GiB.
+
+The shortfall is weight-dominated (experts 56.25 + table 26.82 = 83.07 GiB).
+The 2-bit down-quant lever that would have halved the expert pool is CLOSED:
+the 640-width Flash-Next experts tolerate ~3-4 bit, not 2-bit (DECIDED FACTS,
+KLD). So there is no down-quant rescue to wish for. What would change the
+arithmetic, stated as facts rather than hopes: a materially larger-RAM host
+(the expert pool + table want ~83 GiB host-resident, i.e. a ~96 GiB-class
+host, not the 48 GiB dev container); expert pruning (the coder already shipped
+184 of 256); or a different, larger-VRAM card pairing. None of those is the
+48 GiB dev pair this line prices.
 
 ### Link 1: synthetic table generator (2026-09-10)
 
