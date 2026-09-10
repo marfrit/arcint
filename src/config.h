@@ -14,6 +14,7 @@ struct Config {
     // Exactly one of these selects what gets served.
     std::string model_path;  // OpenVINO IR directory (M1+)
     std::string gguf_path;   // --gguf: weights from this GGUF, --model as the topology template (0.4.0)
+    std::string flash_next_ngram_path;  // --flash-next-ngram: FIX D per_layer_token_embd table (24-byte ARCINGRM header + block-quantised payload); admitted only when the artifact's config.json declares an n-gram table (docs/design-qwen-flash-next.md FIX D Link 2)
     bool        gguf_native = false;  // --gguf-native: the file's own rows in the plugin's K-quant kernel instead of the repack (0.4.1)
     int         gguf_mode = 2;        // --gguf-mode: 0 = repack, 1 = native (also --gguf-native), 2 = mixed (Q4_K repacked, the rest native; the default, DESIGN 7.0.2be) (0.4.1)
     bool        gguf_embed_file = true;  // --gguf-embed file|template: the token embedding rows from the file, dequantised on the host per token (0.4.1)

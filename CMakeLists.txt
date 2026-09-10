@@ -73,6 +73,7 @@ add_library(arcint_core STATIC
   src/core/gguf_map.cpp
   src/core/gguf_repack.cpp
   src/core/model_registry.cpp
+  src/core/ngram_header.cpp
   src/core/prefix_cache.cpp
   src/core/reasoning.cpp
   src/core/sampler.cpp
@@ -209,6 +210,7 @@ if(ARCINT_TESTS)
     tests/test_config.cpp
     tests/test_props.cpp
     tests/test_artifact.cpp
+    tests/test_ngram_admit.cpp
     tests/test_prefix_cache.cpp
     tests/test_reasoning.cpp
     tests/test_block_pool.cpp

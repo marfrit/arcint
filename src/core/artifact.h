@@ -79,8 +79,51 @@ struct Artifact {
     std::string mtp_exported_layer_xml;  // optimum-intel's own export of the layer, when present
     std::string mtp_lm_head_xml;
 
+    // FIX D Link 2 (docs/design-qwen-flash-next.md §"Link 1"/"Links 2 and 3"):
+    // Flash-Next declares an n-gram embedding table in its config via
+    // `ngram_size`, `ngram_vocab_size_base`, `heads_per_ngram`,
+    // `ple_embed_dim` and `ple_layer_ids`. `load_artifact` reads them into
+    // the struct below if they appear in `text_config`. Zero fields
+    // mean "the checkpoint does not declare an n-gram table" -- the
+    // dense qwen35 checkpoints on the current allowlist land there, and
+    // no admission path fires. When any of the below is non-zero, the
+    // artifact carries an n-gram component, and load-time refusal or
+    // admission is `admit_ngram_table_from_disk`'s job.
+    struct NGramConfig {
+        int  ngram_size            = 0;   // 0 = no n-gram declared
+        int  ngram_vocab_size_base = 0;
+        int  heads_per_ngram       = 0;
+        int  ple_embed_dim         = 0;
+        std::vector<int> ple_layer_ids;
+    };
+    NGramConfig ngram_config;
+
     ArtifactInfo to_info(Quant quant) const;
 };
+
+// FIX D Link 2 (docs/design-qwen-flash-next.md §"Links 2 and 3"): the
+// on-disk `--flash-next-ngram` admission. Reads the 24-byte ARCINGRM
+// header from `path`, cross-checks the header's `(ggml_type, n_cols,
+// n_rows)` against `artifact.ngram_config`, and reports the
+// `payload_bytes` the loader must add to a host_ram_fit refusal.
+//
+// Returns:
+//   - empty string + non-zero `out_payload_bytes`: admission passed,
+//     shape and size are consistent.
+//   - non-empty error string: the file was refused, `out_payload_bytes`
+//     is zero, and the error names the exact failure (bad magic, wrong
+//     type, shape mismatch against the config, host-RAM refusal).
+//
+// The function does not open the language-model IR or the checkpoint;
+// its inputs are Artifact's config fields (already parsed by
+// load_artifact) and the file path. This keeps admission testable
+// without a full artifact directory on disk.
+std::string admit_ngram_table_from_disk(const Artifact& artifact,
+                                        const std::string& path,
+                                        uint64_t host_ram_bytes,
+                                        uint64_t other_resident_bytes,
+                                        uint64_t margin_bytes,
+                                        uint64_t& out_payload_bytes);
 
 // Returns an error message on failure. The directory basename decides which
 // allowlist entry the artifact claims to be; a name outside the allowlist is

@@ -354,6 +354,11 @@ std::string usage_text() {
         "                            the host per token (default), or the template's\n"
         "  --gguf-check once|always  keep each repacked projection's deviation verdict\n"
         "                            between loads of the same file (default) or re-check\n"
+        "  --flash-next-ngram PATH   Flash-Next per_layer_token_embd table (24-byte\n"
+        "                            ARCINGRM header + block-quantised payload). The\n"
+        "                            artifact's config.json must declare an n-gram table\n"
+        "                            (ngram_size, ple_embed_dim, ...) or the file is\n"
+        "                            refused. Design: docs/design-qwen-flash-next.md FIX D.\n"
         "  --dyn-quant on|off        the runtime's per-token int8 activation quantization on\n"
         "                            compressed weights; default: the runtime's own for an IR,\n"
         "                            off for a GGUF-opened model (f16 activations reproduce the\n"
@@ -421,6 +426,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--gguf") {
             if (!value(v)) return fail("--gguf needs a path");
             cfg.gguf_path = std::string(v);
+        } else if (arg == "--flash-next-ngram") {
+            if (!value(v)) return fail("--flash-next-ngram needs a path to the per_layer_token_embd table");
+            cfg.flash_next_ngram_path = std::string(v);
         } else if (arg == "--gguf-native") {
             cfg.gguf_native = true;
             cfg.gguf_mode = 1;

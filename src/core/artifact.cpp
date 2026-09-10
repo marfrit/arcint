@@ -8,6 +8,8 @@
 #include <sstream>
 #include <sys/stat.h>
 
+#include "core/ngram_header.h"
+#include "exec/fit.h"
 #include "util/log.h"
 #include "util/sha256.h"
 
@@ -201,6 +203,25 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out) 
         a.n_gdn_layer  = a.n_layer - a.n_attn_layer;
     }
 
+    // ------------------------------------------------------ n-gram (FIX D)
+    // The Flash-Next checkpoint declares its n-gram embedding table via
+    // five text_config keys (docs/design-qwen-flash-next.md FIX B delta
+    // table; the RED-B-01 red case sits on the loader having no field
+    // for them). All zeros means "no n-gram declared" -- the dense
+    // qwen35 checkpoints on the current allowlist land there and the
+    // admission path below never fires.
+    a.ngram_config.ngram_size            = int_or(tc, "ngram_size", 0);
+    a.ngram_config.ngram_vocab_size_base = int_or(tc, "ngram_vocab_size_base", 0);
+    a.ngram_config.heads_per_ngram       = int_or(tc, "heads_per_ngram", 0);
+    a.ngram_config.ple_embed_dim         = int_or(tc, "ple_embed_dim", 0);
+    if (tc.contains("ple_layer_ids") && tc["ple_layer_ids"].is_array()) {
+        for (const json& v : tc["ple_layer_ids"]) {
+            if (v.is_number_integer()) {
+                a.ngram_config.ple_layer_ids.push_back(v.get<int>());
+            }
+        }
+    }
+
     // ------------------------------------------------------ tokens, sampler
     a.sampler = entry->sampler;  // family-card fallback, marked provisional
     if (!a.generation.is_null()) {
@@ -273,6 +294,117 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out) 
 
     out = std::move(a);
     return std::nullopt;
+}
+
+std::string admit_ngram_table_from_disk(const Artifact& artifact,
+                                        const std::string& path,
+                                        uint64_t host_ram_bytes,
+                                        uint64_t other_resident_bytes,
+                                        uint64_t margin_bytes,
+                                        uint64_t& out_payload_bytes) {
+    out_payload_bytes = 0;
+    if (artifact.ngram_config.ngram_size == 0 &&
+        artifact.ngram_config.ple_embed_dim == 0) {
+        return log::format(
+            "the artifact does not declare an n-gram table (config.json has "
+            "no non-zero ngram_size or ple_embed_dim); refusing to admit "
+            "%s as a per_layer_token_embd for a checkpoint that does not "
+            "have one",
+            path.c_str());
+    }
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) {
+        return log::format("could not open %s for reading", path.c_str());
+    }
+    std::array<uint8_t, ngram::kHeaderBytes> hdr_bytes{};
+    f.read(reinterpret_cast<char*>(hdr_bytes.data()), hdr_bytes.size());
+    if (!f) {
+        return log::format(
+            "%s is shorter than the ARCINGRM 24-byte header (%zd bytes read)",
+            path.c_str(), static_cast<ptrdiff_t>(f.gcount()));
+    }
+    ngram::Header header;
+    if (auto err = ngram::parse_header(hdr_bytes.data(), hdr_bytes.size(), header);
+        !err.empty()) {
+        return log::format("%s: %s", path.c_str(), err.c_str());
+    }
+
+    // Shape cross-check: the file's (n_cols, n_rows) must be consistent
+    // with the config's (ple_embed_dim, ngram_vocab_size_base) at
+    // physical-row width 160 (design doc's own row-width convention).
+    // n_cols must equal 160 today -- a non-160 row width is admitted
+    // through the header parser but not by this admission surface,
+    // because the AVX2 kernel and the fit arithmetic assume 160.
+    constexpr uint32_t kPhysicalRowWidth = 160;
+    if (header.n_cols != kPhysicalRowWidth) {
+        return log::format(
+            "%s: n_cols %u differs from the served row width %u "
+            "(the AVX2 gather kernel and fit arithmetic assume 160)",
+            path.c_str(), header.n_cols, kPhysicalRowWidth);
+    }
+    if (artifact.ngram_config.ple_embed_dim > 0 &&
+        (artifact.ngram_config.ple_embed_dim % kPhysicalRowWidth) != 0) {
+        return log::format(
+            "%s: config's ple_embed_dim %d is not a multiple of the "
+            "physical row width %u (a real spec would need this, and "
+            "the current admission has no other place to catch it)",
+            path.c_str(), artifact.ngram_config.ple_embed_dim,
+            kPhysicalRowWidth);
+    }
+    if (artifact.ngram_config.ngram_vocab_size_base > 0 &&
+        artifact.ngram_config.ple_embed_dim > 0) {
+        const uint64_t rows_per_vocab_entry =
+            artifact.ngram_config.ple_embed_dim / kPhysicalRowWidth;
+        const uint64_t expected_rows =
+            static_cast<uint64_t>(artifact.ngram_config.ngram_vocab_size_base) *
+            rows_per_vocab_entry;
+        if (header.n_rows != expected_rows) {
+            return log::format(
+                "%s: n_rows %u differs from the config-implied %llu "
+                "(ngram_vocab_size_base %d x ple_embed_dim/%u = %d)",
+                path.c_str(), header.n_rows,
+                static_cast<unsigned long long>(expected_rows),
+                artifact.ngram_config.ngram_vocab_size_base,
+                kPhysicalRowWidth,
+                artifact.ngram_config.ple_embed_dim / kPhysicalRowWidth);
+        }
+    }
+
+    // File size must equal header + payload; a truncated or over-sized
+    // file (a common corruption on rsync interrupts) fails here rather
+    // than deep in a decode.
+    const uint64_t payload = ngram::payload_bytes(header);
+    const uint64_t on_disk = file_size(path);
+    if (on_disk != ngram::kHeaderBytes + payload) {
+        return log::format(
+            "%s: on-disk size %llu differs from header + payload %llu "
+            "(24 + %u x %u x %zu)",
+            path.c_str(),
+            static_cast<unsigned long long>(on_disk),
+            static_cast<unsigned long long>(ngram::kHeaderBytes + payload),
+            header.n_rows, header.n_cols / ngram::kBlockElements,
+            ngram::bytes_per_block(header.ggml_type));
+    }
+
+    // Host-RAM fit refusal. `host_ram_fit_must_refuse` is pure arithmetic
+    // (`src/exec/fit.h`); this call site names the actual host numbers.
+    if (host_ram_bytes > 0 &&
+        host_ram_fit_must_refuse(payload, /*expert_pool_bytes=*/0,
+                                 other_resident_bytes, host_ram_bytes,
+                                 margin_bytes)) {
+        return log::format(
+            "%s (%llu payload bytes) does not fit the host RAM budget "
+            "(host_ram %llu, other resident %llu, margin %llu)",
+            path.c_str(),
+            static_cast<unsigned long long>(payload),
+            static_cast<unsigned long long>(host_ram_bytes),
+            static_cast<unsigned long long>(other_resident_bytes),
+            static_cast<unsigned long long>(margin_bytes));
+    }
+
+    out_payload_bytes = payload;
+    return {};
 }
 
 }  // namespace lgc
