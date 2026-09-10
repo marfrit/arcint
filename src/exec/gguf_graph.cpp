@@ -39,6 +39,7 @@ namespace {
 constexpr const char* kLayerPrefix  = "self.model.model.language_model.layers.";
 constexpr const char* kWeightSuffix = "._openvino_orig_weight";
 constexpr const char* kHeadConst    = "self.model.lm_head._openvino_orig_weight";
+constexpr const char* kPlainWeightSuffix = ".weight";
 
 // Follows the single-consumer chain from a weight constant to the MatMul it
 // feeds (Const -> Convert -> Subtract -> Multiply -> [Reshape] -> Convert ->
@@ -266,14 +267,33 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
     const int64_t qk_rows = g.linear_k_heads * g.linear_k_dim;
 
     // Snapshot the constants first: replacing nodes while iterating get_ops() is undefined.
+    // Two suffixes name a weight constant that gguf_apply_to_template consumes:
+    // (a) "._openvino_orig_weight" -- the AWQ export marker (27B artifact,
+    //     2026-09-04). matmul_of() failing on one of these is a defect and
+    //     throws below; the marker exists precisely to name a projection.
+    // (b) ".weight" WHEN the Constant feeds a MatMul through the exporter's
+    //     Convert->Subtract->Multiply->Reshape->Convert chain -- the plain
+    //     (non-AWQ) VL export pattern used on the Qwen3.5-2B checkpoint
+    //     (design doc §6, 2026-09-10 forensics; option (c)). "matmul_of"
+    //     returning nullptr is the disambiguator against norm weights (which
+    //     end in ".weight" too but do not go through the FQ chain to a
+    //     MatMul): silently skip, do not throw.
     std::vector<std::shared_ptr<ov::op::v0::Constant>> weights;
+    const size_t kAwqLen = std::strlen(kWeightSuffix);
+    const size_t kPlainLen = std::strlen(kPlainWeightSuffix);
     for (const auto& op : model->get_ops()) {
         auto c = std::dynamic_pointer_cast<ov::op::v0::Constant>(op);
         if (!c) continue;
         const std::string& name = c->get_friendly_name();
-        if (name.size() > std::strlen(kWeightSuffix) &&
-            name.compare(name.size() - std::strlen(kWeightSuffix), std::string::npos, kWeightSuffix) == 0)
+        if (name.size() > kAwqLen &&
+            name.compare(name.size() - kAwqLen, std::string::npos, kWeightSuffix) == 0) {
             weights.push_back(c);
+        } else if (name.size() > kPlainLen &&
+                   name.compare(name.size() - kPlainLen, std::string::npos, kPlainWeightSuffix) == 0 &&
+                   name.rfind(kLayerPrefix, 0) == 0 &&
+                   matmul_of(c) != nullptr) {
+            weights.push_back(c);
+        }
     }
 
     // Phase (a), sequential and cheap: resolve every weight's target tensor,
@@ -307,13 +327,20 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
         std::string gguf_name;
         GgufReorder reorder = GgufReorder::None;
         int64_t layer = -1;
+        // The AWQ marker suffix wins when present; otherwise the plain
+        // ".weight" suffix (admitted only when matmul_of() succeeded,
+        // above).
+        const bool is_awq = name.size() > kAwqLen &&
+            name.compare(name.size() - kAwqLen, std::string::npos, kWeightSuffix) == 0;
+        const size_t suffix_len = is_awq ? kAwqLen : kPlainLen;
+
         if (name == kHeadConst) {
             gguf_name = "output.weight";
         } else if (name.rfind(kLayerPrefix, 0) == 0) {
             const std::string rest = name.substr(std::strlen(kLayerPrefix));
             const size_t dot = rest.find('.');
             layer = std::stoll(rest.substr(0, dot));
-            const std::string module = rest.substr(dot + 1, rest.size() - dot - 1 - std::strlen(kWeightSuffix));
+            const std::string module = rest.substr(dot + 1, rest.size() - dot - 1 - suffix_len);
             const GgufModuleMap* found = gguf_module_map(module);
             if (!found) throw std::runtime_error("gguf: no tensor map for IR constant " + name);
             gguf_name = "blk." + std::to_string(layer) + "." + std::string(found->gguf_tensor) + ".weight";
@@ -441,12 +468,28 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
                 // measured 2.65 GiB at chunk 256 with them, DESIGN §7.0.2ba).
                 if (reorder == GgufReorder::RowsV || reorder == GgufReorder::RowsQKV) {
                     const int64_t first = reorder == GgufReorder::RowsQKV ? 2 * qk_rows : 0;
-                    if (first + v_rows != n)
+                    // Two admitted shapes under a v-head-major reorder:
+                    // (a) first + v_rows == n: a full value projection --
+                    //     v_rows = linear_v_heads * linear_v_dim rows per
+                    //     head (in_proj_z, in_proj_qkv's value slice,
+                    //     out_proj's activation-side permutation).
+                    // (b) first == 0 and n == linear_v_heads: a per-head
+                    //     scalar tensor -- ssm_alpha, ssm_beta on the
+                    //     Qwen3.5-2B checkpoint (Unsloth 2026-09-09 GGUF:
+                    //     ssm_beta = 16 rows, one per v-head); the file's
+                    //     value-head ordering still applies, but with a
+                    //     per-head stride of 1 instead of linear_v_dim.
+                    int64_t d;
+                    if (first + v_rows == n) {
+                        d = g.linear_v_dim;
+                    } else if (first == 0 && n == g.linear_v_heads) {
+                        d = 1;
+                    } else {
                         throw std::runtime_error("gguf: " + gguf_name + " has " + std::to_string(n) + " rows; expected " +
-                                                 std::to_string(first) + " q/k rows and " + std::to_string(v_rows) + " value rows");
+                                                 std::to_string(first) + " q/k rows and " + std::to_string(v_rows) + " value rows (or " + std::to_string(g.linear_v_heads) + " per-head scalars)");
+                    }
                     std::vector<int64_t> src_of(static_cast<size_t>(n));
                     for (int64_t i = 0; i < n; ++i) src_of[static_cast<size_t>(i)] = i;
-                    const int64_t d = g.linear_v_dim;
                     for (int64_t h = 0; h < g.linear_v_heads; ++h)
                         for (int64_t e = 0; e < d; ++e) src_of[static_cast<size_t>(first + h * d + e)] = first + to_file[static_cast<size_t>(h)] * d + e;
                     gguf::permute_rows(packed, src_of);
@@ -480,10 +523,18 @@ GgufApplyReport gguf_apply_to_template(const std::shared_ptr<ov::Model>& model,
             }
             if (tmode == GgufWeightsMode::Native && (reorder == GgufReorder::RowsV || reorder == GgufReorder::RowsQKV)) {
                 const int64_t first = reorder == GgufReorder::RowsQKV ? 2 * qk_rows : 0;
-                if (first + v_rows != n)
+                // Same two-shape admission as the Repack branch above:
+                // full projection (v_rows), or per-head scalar (d=1).
+                int64_t d;
+                if (first + v_rows == n) {
+                    d = g.linear_v_dim;
+                } else if (first == 0 && n == g.linear_v_heads) {
+                    d = 1;
+                } else {
                     throw std::runtime_error("gguf: " + gguf_name + " has " + std::to_string(n) + " rows; expected " +
-                                             std::to_string(first) + " q/k rows and " + std::to_string(v_rows) + " value rows");
-                post = gather_rows_back(replacement->output(0), n, first, to_file, g.linear_v_dim);
+                                             std::to_string(first) + " q/k rows and " + std::to_string(v_rows) + " value rows (or " + std::to_string(g.linear_v_heads) + " per-head scalars)");
+                }
+                post = gather_rows_back(replacement->output(0), n, first, to_file, d);
                 post->set_friendly_name(mm->get_friendly_name() + "/gguf_v_head_order");
                 r.rows_permuted = true;
             }

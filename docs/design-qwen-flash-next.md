@@ -1336,3 +1336,86 @@ via `llama-quantize` (`--allow-requantize`, built from llama.cpp HEAD
 2026-09-09) exercises real served-weight scale (414–418
 GB/s regime) on the 16 GiB card. Run off-peak with `--threads 6`, never
 the closing artifact, never mid-day on the serving container.
+
+**Full-export attempt (2026-09-10).** `tools/export_2b_awq.py` was run
+against the checkpoint on the newer stack that produced the 27B AWQ
+(optimum-intel 2.1.0 + transformers 5.2.0). Phase 1 (plain VL export)
+completes. Phase 2 (OVQuantizer AWQ) dies with
+`AutoProcessor.from_pretrained(config.processor)` reaching a 404 on
+`None`: the VL calibration path still instantiates the processor even
+when the caller supplies a pre-tokenized `list[dict]` as
+`calibration_dataset`, because `OVQuantizer._prepare_visual_causal_lm_calibration_data`
+routes by model class (`OVModelForVisualCausalLM`), not dataset shape.
+Front 3 as written is insufficient: **AWQ via optimum-intel 2.1.0's
+Python API is not reachable for `qwen3_5` on this toolchain without
+patching optimum-intel.** Path (a) from the fix options above stays
+open; path (c) is landed below.
+
+**Plain (non-AWQ) VL export produces 0 markers, as forecast.**
+`OVModelForVisualCausalLM.from_pretrained(export=True).save_pretrained()`
+lands NNCF int8_asym per-channel over 205 / 205 layers. On the exported
+`openvino_language_model.xml`, `grep -c "_openvino_orig_weight" …` =
+**0** markers over 2584 total `Const` nodes; the projection weights are
+named `<...>.weight` with FQ companions `<...>.weight/scale`,
+`<...>.weight/zero_point` (both `Const`), `<...>.weight/zero_point/subtract`
+(`Subtract` op), `<...>.weight/fq_weights_1` (`Multiply` op — not a
+Constant despite the name).
+
+**Option (c) landed (`src/exec/gguf_graph.cpp`, 2026-09-10).**
+`kPlainWeightSuffix = ".weight"`: the weight-Constant filter admits
+`.weight`-suffixed Constants under `kLayerPrefix` when `matmul_of()`
+succeeds. The FQ-chain-to-MatMul walk itself disambiguates a projection
+weight from a norm weight (a norm's `.weight` feeds a fan-out Multiply,
+`targets.size() != 1` → `matmul_of` returns nullptr → silent skip). The
+27B AWQ path (`_openvino_orig_weight`) is unchanged and still throws on
+a no-MatMul chain. A companion per-head-scalar shape admission
+(`n == g.linear_v_heads` case) unblocks `linear_attn.in_proj_a` /
+`in_proj_b`, which on `qwen3_5` are per-head scalars (`ssm_alpha` /
+`ssm_beta`, one row per v-head) rather than full projections — the
+RowsV reorder used to throw `expected 0 q/k rows and V value rows`
+against them.
+
+Synthetic-IR test in the ovsrc-m18 tradition:
+`tests/test_gguf_graph.cpp::gguf_pass_matches_plain_export_names_and_repacks_the_same_projections`
+builds a toy with the plain naming and confirms `replaced.size() == 4`
+against the fixture; the prior gguf_pass suite (12 cases) still passes
+in the same run. Full arcint-test invocation and output are in
+`HANDOFF-0.5.0.local.md`.
+
+**First served 2B on a 16 GiB card.** The first `qwen3_5` 2B dense IR
+loaded on the 16 GiB card against `Qwen3.5-2B-Q4_K_M.gguf` (Unsloth
+export) with `--paged-kv f16` and `n_ctx 4096`, one lane. The load
+report: **186 projection(s) from the file (mixed: 98 repacked, 88
+native rows), Q8_0 x36 (1 MiB), Q5_K x36 (198 MiB), Q4_K x98 (551
+MiB), Q6_K x16 (129 MiB)** — 186 = 18 linear-attention layers × 8
+projections + 6 full-attention layers × 7 projections, every layer
+projection recovered from the file, no throws. Paged model ready 7.4 s,
+device-resident 1.34 GiB, activation 0.19 GiB at chunk 2048; analytic
+max_ctx per lane 1,079,520 on 15.11 GiB usable of the 16 GiB card.
+`/v1/completions` at temperature 0.0 returned deterministic output for
+the greedy prompt. Full command line, log tail and /props body are in
+`HANDOFF-0.5.0.local.md`.
+
+**Limitation: `lm_head` not admitted for tied-embedding checkpoints.**
+`self.model.lm_head._openvino_orig_weight` (the AWQ head constant this
+file's `kHeadConst` matches) has no plain-export analogue on the 2B:
+its `config.json` sets `tie_word_embeddings: true`, and the exporter
+inlines the head as `__module.model.lm_head/ov_ext::linear/{Convert,
+MatMul}` against the shared `embed_tokens.weight` Const rather than
+emitting a separate `self.model.lm_head.weight`. Option (c)'s
+`kLayerPrefix` filter is therefore correct-by-construction on `qwen3_5`
+2B: the 186-projection count accounts for every layer weight and the
+head shares `embed_tokens.weight`, which the loader already replaces
+through its own embedding-from-file path (dequantised on the host per
+token, not part of `gguf_apply_to_template`'s projection loop). A
+non-tied plain-export checkpoint would need `kPlainHeadConst`; there
+is no such checkpoint on the served allowlist today.
+
+**Host feed measurement in the same window.** Single-thread DDR4 read
+bandwidth: **44.4 GiB/s** on the dev host's Zen 3 SoC (single-threaded
+`memcpy` in read+write mode measured 19.1 GiB/s in the same run — half
+the raw traffic per byte moved, matching the shared-bus arithmetic).
+The probe source, exact byte-counts and both timings are in
+`HANDOFF-0.5.0.local.md`. This is the ceiling the FIX E consequence
+sentence's "≈45 GB/s" was rounded from and its "~11 %" versus the
+414–418 GB/s VRAM ceiling holds under the measured figure.

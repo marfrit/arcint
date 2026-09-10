@@ -94,6 +94,35 @@ Toy toy_template() {
     return {std::make_shared<ov::Model>(results, ov::ParameterVector{x512, x256}, "toy"), awq, norm};
 }
 
+// Plain (non-AWQ) VL export naming (option (c) from the marker
+// forensics): primary weight Constant is "<...>.weight" with no
+// distinguishing suffix. The pass identifies these by feeding-a-MatMul-
+// through-the-FQ-chain, not by suffix marker. This fixture reuses the
+// group-wise u4 shape of projection() above -- the real plain export
+// on this repository's 2B checkpoint is int8_asym per-channel u8,
+// covered end-to-end by the dev-host load (design doc §6); only the
+// naming and matmul-reachability path are what option (c) needs to see.
+ov::Output<ov::Node> plain_projection(const ov::Output<ov::Node>& x, const std::string& module, size_t n, size_t k) {
+    const std::string base = "self.model.model.language_model.layers.0." + module + ".weight";
+    auto w = ov::op::v0::Constant::create(ov::element::u4, ov::Shape{n, k / 64, 64}, std::vector<uint8_t>(n * k, 2));
+    w->set_friendly_name(base);
+    auto zp = ov::op::v0::Constant::create(ov::element::u4, ov::Shape{n, k / 64, 1}, std::vector<uint8_t>(n * k / 64, 8));
+    zp->set_friendly_name(base + "/zero_point");
+    auto sc = ov::op::v0::Constant::create(ov::element::f16, ov::Shape{n, k / 64, 1}, std::vector<ov::float16>(n * k / 64, ov::float16(0.01f)));
+    sc->set_friendly_name(base + "/scale");
+    auto cw = std::make_shared<ov::op::v0::Convert>(w, ov::element::f16);
+    auto cz = std::make_shared<ov::op::v0::Convert>(zp, ov::element::f16);
+    auto sub = std::make_shared<ov::op::v1::Subtract>(cw, cz);
+    sub->set_friendly_name(base + "/zero_point/subtract");
+    auto mul = std::make_shared<ov::op::v1::Multiply>(sub, sc);
+    mul->set_friendly_name(base + "/fq_weights_1");
+    auto rs = std::make_shared<ov::op::v1::Reshape>(mul, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, {int64_t(n), int64_t(k)}), false);
+    auto cv = std::make_shared<ov::op::v0::Convert>(rs, ov::element::f32);
+    auto mm = std::make_shared<ov::op::v0::MatMul>(x, cv, false, true);
+    mm->set_friendly_name("__module.model.model.language_model.layers.0." + module + "/plain::linear/MatMul");
+    return mm->output(0);
+}
+
 GgufGeometry toy_geometry() {
     GgufGeometry g;
     g.linear_k_heads = 2; g.linear_v_heads = 4; g.linear_k_dim = 64; g.linear_v_dim = 64;
@@ -505,6 +534,71 @@ TEST(gguf_pass_exposes_the_hidden_state_at_a_kquant_or_matmul_head) {
         CHECK(!expose_hidden_state(model));
         CHECK_EQ(model->get_results().size(), size_t{1});
     }
+}
+
+// FIX option (c), 2026-09-10: the plain (non-AWQ) VL export names its
+// projection primary Constant "<...>.weight" instead of "<...>._openvino_
+// orig_weight" (the AWQ marker the 27B artifact carries). This test
+// builds a toy template with the plain naming pattern and confirms
+// gguf_apply_to_template still matches the same four projections against
+// the fixture, in Repack mode. The synthetic template co-exists with the
+// legacy AWQ-marker projection() helper (used by the earlier TESTs);
+// both patterns must remain matchable indefinitely -- 27B stays AWQ.
+TEST(gguf_pass_matches_plain_export_names_and_repacks_the_same_projections) {
+    auto file = std::make_shared<gguf::GgufFile>(gguf::GgufFile::open(fixture()));
+    auto x512 = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 512});
+    auto x256 = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 256});
+    // A norm scale that must NOT be picked up: ends in ".weight", but its
+    // consumer is a Multiply that fans out (rms_norm result feeds Q/K/V).
+    std::vector<float> nv(512);
+    for (size_t i = 0; i < 512; ++i) nv[i] = 1.0f + 0.01f * static_cast<float>(i);
+    auto norm = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{1, 1, 512}, nv);
+    norm->set_friendly_name("self.model.model.language_model.layers.0.input_layernorm.weight");
+    auto normed = std::make_shared<ov::op::v1::Multiply>(x512, norm);
+    // Give the normed output two consumers so matmul_of returns nullptr on
+    // the norm (targets.size() != 1, the natural rms_norm fanout).
+    auto gate = plain_projection(normed, "mlp.gate_proj", 64, 512);
+    auto up_stub = std::make_shared<ov::op::v0::Convert>(normed, ov::element::f32);
+    // Four projections matching the fixture's blk.0 tensors, plain naming.
+    auto out = plain_projection(x256, "linear_attn.out_proj", 32, 256);
+    auto z = plain_projection(x256, "linear_attn.in_proj_z", 256, 256);
+    auto qkv = plain_projection(x256, "linear_attn.in_proj_qkv", 512, 256);
+    ov::ResultVector results{
+        std::make_shared<ov::op::v0::Result>(gate),
+        std::make_shared<ov::op::v0::Result>(out),
+        std::make_shared<ov::op::v0::Result>(z),
+        std::make_shared<ov::op::v0::Result>(qkv),
+        std::make_shared<ov::op::v0::Result>(up_stub),
+    };
+    auto model = std::make_shared<ov::Model>(results, ov::ParameterVector{x512, x256}, "plain_toy");
+
+    const GgufApplyReport rep = gguf_apply_to_template(model, file, toy_geometry(), GgufWeightsMode::Native);
+    // All four plain-named projections must be picked up. If option (c)
+    // regresses, the count drops to zero and the pass silently kept
+    // template weights -- the exact failure mode 2026-09-10 recorded on
+    // the 2B (0 repacked projections, template int8_asym constants
+    // served instead of GGUF bytes).
+    CHECK_EQ(rep.replaced.size(), size_t{4});
+    CHECK_EQ(ops_of<ov::op::v0::MatMul>(model).size(), size_t{0});
+    CHECK_EQ(ops_of<FullyConnectedKQuant>(model).size(), size_t{4});
+    // The norm did not throw and did not turn into a K-quant op:
+    // replaced == 4 (only the projections) and the run reached this
+    // point at all is the norm defense -- matmul_of at collection time
+    // returned nullptr on the norm's rms_norm-fanout Multiply.
+    // Every replacement names one of the four expected modules -- proves
+    // the module parser stripped ".weight" instead of "._openvino_orig_weight".
+    size_t seen_gate = 0, seen_out = 0, seen_z = 0, seen_qkv = 0;
+    for (const auto& r : rep.replaced) {
+        if (r.gguf_name == "blk.0.ffn_gate.weight") ++seen_gate;
+        else if (r.gguf_name == "blk.0.ssm_out.weight") ++seen_out;
+        else if (r.gguf_name == "blk.0.attn_gate.weight") ++seen_z;
+        else if (r.gguf_name == "blk.0.attn_qkv.weight") ++seen_qkv;
+    }
+    // The exact gguf names come from kLayerModules -- the totals are
+    // what matter: each of the four IR modules must map to some gguf
+    // tensor the fixture carries, and none of them may be missing.
+    CHECK_EQ(seen_gate + seen_out + seen_z + seen_qkv, size_t{4});
+    (void)up_stub;
 }
 
 #endif  // ARCINT_OPENVINO
