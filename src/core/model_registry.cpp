@@ -203,7 +203,10 @@ std::vector<ModelEntry> build_registry() {
     {
         // Qwen3.5-2B: the smallest dense qwen3_5 checkpoint, exported for FIX 8.2
         // (GGUF serving on the 16 GiB card). Hybrid architecture: 18 linear-attention
-        // + 6 full-attention layers. Hashes unpinned until first successful load.
+        // + 6 full-attention layers. Hashes pinned 2026-09-10 off the real IR at
+        // /models/ov/qwen35-2b-ov on the dev host (sha256 prefixes, byte-identical to the
+        // server's load path): same tokenizer and chat template as qwen38-b7c1-ov;
+        // the plain export carries no MTP graph (mtp_head_exported false).
         ModelEntry e;
         e.id                      = "qwen3.5-2b";
         e.family                  = "qwen3.5";
@@ -211,15 +214,21 @@ std::vector<ModelEntry> build_registry() {
         e.ov_arch                 = "Qwen3_5ForConditionalGeneration";
         e.model_type              = "qwen3_5";
         e.moe                     = false;
-        e.has_mtp_head            = false;
-        e.mtp_head_pinned         = false;
-        e.mtp_in_checkpoint       = true;
+        e.has_mtp_head            = false;  // no MTP graph in the export
+        e.mtp_head_pinned         = true;   // inspected 2026-09-10
+        e.mtp_in_checkpoint       = true;   // config: mtp_num_hidden_layers 1
         e.n_embd                  = 2048;
         e.n_expert                = 0;
         e.full_attention_interval = 4;
         e.n_layer                 = 24;
         e.n_ctx_train             = 262144;
         e.quants                  = {Quant::Q4};
+        e.arch_hash               = "ec0078368fcce101";
+        e.template_hash           = "c3cf9e34abf4f9e3";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 1884937298ull;
+        e.status                  = "provisional; dense qwen35 marker export (FIX 8.2), "
+                                    "served via GGUF on the 16 GiB card, not acceptance-scored";
         e.sampler = qwen_card_defaults();
         split_layers(e);
         r.push_back(std::move(e));

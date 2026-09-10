@@ -1,5 +1,5 @@
 {
-  "_comment": "Raw IR metadata read off the actual IR directories under /models/ov/, first on 2026-08-28 (pre-M0 handover), extended as artifacts landed (2026-08-30: qwen38-intel-int4-ov, qwen36-35b-a3b-mtp-ov). sha256 prefixes, 16 hex chars. All five share tokenizer 87a7830d63fcf43b. full_attention_interval 4 = 1 in 4 layers full attention, rest GDN. Coder is expert-PRUNED: 184 of 256. 2026-08-28: mtp fields added after inspecting the IRs — all three checkpoints declare mtp_num_hidden_layers 1, and NONE of the exports contain an MTP graph (only 'logits'), so no MTP head is servable from these artifacts. 2026-08-28 (later): qwen38-b7c1-ov now DOES carry a servable MTP head. optimum-intel still drops it, so tools/export_mtp.py reconstructs it from the unquantised mtp.* tensors in /models/gptq/qwen38-gptq-mtp and writes openvino_mtp_layer.xml and openvino_mtp_lm_head.xml beside the model; measured 66% draft acceptance. The other two exports are unchanged.",
+  "_comment": "Raw IR metadata read off the actual IR directories under /models/ov/, first on 2026-08-28 (pre-M0 handover), extended as artifacts landed (2026-08-30: qwen38-intel-int4-ov, qwen36-35b-a3b-mtp-ov). sha256 prefixes, 16 hex chars. All six share tokenizer 87a7830d63fcf43b (2026-09-10: qwen35-2b-ov added, IR metadata read off /models/ov/qwen35-2b-ov on the dev host; it shares the same tokenizer and chat template as qwen38-b7c1-ov). full_attention_interval 4 = 1 in 4 layers full attention, rest GDN. Coder is expert-PRUNED: 184 of 256. 2026-08-28: mtp fields added after inspecting the IRs — all three checkpoints declare mtp_num_hidden_layers 1, and NONE of the exports contain an MTP graph (only 'logits'), so no MTP head is servable from these artifacts. 2026-08-28 (later): qwen38-b7c1-ov now DOES carry a servable MTP head. optimum-intel still drops it, so tools/export_mtp.py reconstructs it from the unquantised mtp.* tensors in /models/gptq/qwen38-gptq-mtp and writes openvino_mtp_layer.xml and openvino_mtp_lm_head.xml beside the model; measured 66% draft acceptance. The other two exports are unchanged.",
   "qwen36-coder-b5-ov": {
     "arch": [
       "Qwen3_5MoeForConditionalGeneration"
@@ -90,5 +90,23 @@
     "status": "head pairs (93.9% code / 75.4% prose draft acceptance, B60, 2026-08-30); --mtp on 48-53 t/s vs 71.5 t/s off — the serving loop is host-bound (36.5 ms of wall for 16.7 ms of device per accepted pair) and the f16 dense-expert head is 6.7 ms of device a draft, a wash on device time; not for production",
     "mtp_num_hidden_layers": 1,
     "mtp_head_exported": true
+  },
+  "qwen35-2b-ov": {
+    "arch": [
+      "Qwen3_5ForConditionalGeneration"
+    ],
+    "model_type": "qwen3_5",
+    "hidden": 2048,
+    "layers": 24,
+    "experts": null,
+    "ctx": 262144,
+    "full_attention_interval": 4,
+    "template_sha": "c3cf9e34abf4f9e3",
+    "tokenizer_sha": "87a7830d63fcf43b",
+    "lm_xml_sha": "ec0078368fcce101",
+    "lm_bin_bytes": 1884937298,
+    "status": "provisional; dense qwen35 marker export (FIX 8.2), served via GGUF on the 16 GiB card, not acceptance-scored",
+    "mtp_num_hidden_layers": 1,
+    "mtp_head_exported": false
   }
 }

@@ -4,15 +4,18 @@
 using namespace lgc;
 
 TEST(registry_holds_exactly_the_target_models) {
-    // Three checkpoints, four artifacts: Intel's public export of the 3.8 is its
-    // own entry with its own status, never an alias of our AWQ export.
+    // Six entries now: the four 3.6/3.8 artifacts, Intel's public export of the
+    // 3.8 (its own entry with its own status, never an alias of our AWQ export),
+    // and the dense qwen3.5-2b marker artifact (FIX 8.2, hashes pinned off the
+    // dev-host IR 2026-09-10).
     const auto ids = model_ids();
-    CHECK_EQ(ids.size(), 5u);
+    CHECK_EQ(ids.size(), 6u);
     CHECK(find_model("qwen3.6-27b-a3b-coder") != nullptr);
     CHECK(find_model("qwen3.6-35b-a3b") != nullptr);
     CHECK(find_model("qwen3.8-27b") != nullptr);
     CHECK(find_model("qwen3.8-27b-intel-int4") != nullptr);
     CHECK(find_model("qwen3.6-35b-a3b-mtp") != nullptr);
+    CHECK(find_model("qwen3.5-2b") != nullptr);
 }
 
 TEST(registry_rejects_everything_else) {
