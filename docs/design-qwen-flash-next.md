@@ -944,31 +944,46 @@ Memory in scope: host **48 GiB**; the dev pair's two Intel cards give **≈37.7
 GiB usable** combined (a ~24 GiB and a ~16 GiB card; 22.71 + ~15). Combined
 device+host ≈ **85.7 GiB**.
 
-**It does not fit.** Two ways to see it, both with the numbers:
+**It does not fit FULLY-RESIDENT.** (Reframed 2026-09-10 per the standing
+directive: a bare "does not fit" is banned — it was never established. What is
+measured below is a verdict against a *fully-resident serving plan*, and
+fully-resident is NOT the plan; it is the assumption this milestone exists to
+dissolve. A milestone that fit the conventional way would not need us.) The
+fully-resident numbers, which stay in the record as legitimate measured facts:
 
-- *Total-memory view.* Weights alone are 85.38 GiB against 85.7 GiB of
-  combined device+host memory — ~0.3 GiB of slack before a single byte of KV
-  pool, activation reservation, or allocator margin. Those are not zero (12
-  full-attention layers of f16 KV + GDN recurrent state + activations are
-  several GiB), so the real budget is negative.
-- *Host-resident view (the FIX D/E design intent: table host-resident, experts
-  host-offloaded).* Host must hold the PLE table (26.82 GiB) plus the expert
-  pool the device cannot keep resident. Even in the optimistic split where the
-  device holds ~30 GiB of experts (leaving no room there for KV), the host
-  carries 26.82 + 26.25 = 53.07 GiB > 48 GiB — over by ~5 GiB before KV
-  staging or margin. In the pessimistic (design-intent) split where the full
-  56.25 GiB expert pool is host-resident, host needs 26.82 + 56.25 = 83.07 GiB,
-  over by ~35 GiB.
+- *Total-memory view, fully resident.* Weights alone are 85.38 GiB against 85.7
+  GiB of combined device+host memory — ~0.3 GiB of slack before a single byte
+  of KV pool, activation reservation, or allocator margin. So a plan that holds
+  every weight resident at once does not fit.
+- *Host-resident-pool view, fully resident (table host-resident + the entire
+  expert pool host-resident).* Host needs the PLE table (26.82 GiB) + the full
+  56.25 GiB expert pool = 83.07 GiB against 48 GiB — over by ~35 GiB; even an
+  optimistic split that parks ~30 GiB of experts on the cards (no KV room
+  there) leaves the host at 53.07 GiB, still over by ~5 GiB.
 
-The shortfall is weight-dominated (experts 56.25 + table 26.82 = 83.07 GiB).
-The 2-bit down-quant lever that would have halved the expert pool is CLOSED:
-the 640-width Flash-Next experts tolerate ~3-4 bit, not 2-bit (DECIDED FACTS,
-KLD). So there is no down-quant rescue to wish for. What would change the
-arithmetic, stated as facts rather than hopes: a materially larger-RAM host
-(the expert pool + table want ~83 GiB host-resident, i.e. a ~96 GiB-class
-host, not the 48 GiB dev container); expert pruning (the coder already shipped
-184 of 256); or a different, larger-VRAM card pairing. None of those is the
-48 GiB dev pair this line prices.
+**The open question, stated positively and answerably:** which streaming
+hierarchy fits the measured envelope — 48 GiB DRAM + the dev-pair Arc cards +
+the dev host's NVMe + the measured host feed bandwidth — serving Flash-Next by pulling
+the top-10-of-512 expert working set on demand rather than resident? An
+existence proof sits at a SMALLER envelope: FreeToken serves Qwen3.6-35B at
+~39 t/s on an 8 GB RTX 4060 laptop with 64 GB RAM, and 284B/753B-class models
+on single desktop GPUs (paper benchmark section). Our cards are larger than
+theirs; any deficit is policy maturity, not physics. The published throughput
+is only arithmetically possible with speculative amortization — MTP/PLE
+acceptance multiplying tokens served per weight-load — so the fit is a
+function of **tokens-per-weight-load**, not LRU hit-rate alone.
+
+Constraints that stay true inside the streaming study (knobs, not escapes):
+the 2-bit down-quant lever is CLOSED (640-width experts tolerate >=3 bit only,
+Mixpert law / KLD DECIDED FACTS), so expert bits stay >=3; KV precision is
+pinned (above); table page locality and MTP acceptance are the amortizers.
+
+The answer is the **fit study** (next section / `RECONCILE`/handoff), which
+operationalizes this: route-trace -> LRU replay -> hit-rate vs NVMe-miss cost
+vs MTP acceptance, ending with the smallest working configuration on the dev
+pair and what each knob is worth in GiB or t/s. "It does not fit the
+traditional way — therefore we operationalize the science" is the milestone's
+own sentence.
 
 ### Link 1: synthetic table generator (2026-09-10)
 
