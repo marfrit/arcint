@@ -84,6 +84,34 @@ does not replace it. When either upstream gap clears
 `VisionRotaryEmbedding` import), the graph builder becomes the
 next-session increment.
 
+### FIX D Link 3: the n-gram table decode-time lookup (hashed-vocab)
+
+`src/exec/ngram_row_ids.h` implements Qwen Flash-Next's `per_layer_token_embd`
+row index — the piece the previous session deferred as a "spec hole". The
+FreeToken reference (Apache-2.0, pinned commit 505477ab) shows the table is a
+**hashed-vocab** store, not "one row per token id": `row_ids` XOR-multiply mixes
+the last n token ids per n-gram order (int64, wrapping), floor-mods per a
+per-head prime vocab size, and offsets into a concatenated global row space
+(16 heads × 160 on Qwen3.8), with eos bounding every window. Verified byte-for-
+byte against reference-derived vectors (`tools/gen_ngram_vectors.py` invokes the
+reference's own `derive_ngram_hash_constants`; the reference test vectors are
+**not** copied — Apache-2.0 fork-tax avoidance — arcint derives its own).
+
+`src/exec/ngram_table.h::NGramLookup` implements the reference's frozen
+`PLETableBackend.lookup` contract (`row_ids -> gather_dequant`) over the
+host-resident mmapped table; `load_ngram_lookup` admits + mmaps + derives the
+per-PLE-layer constants behind `--flash-next-ngram`, and `backend_ov.cpp` calls
+it at load and holds the lookup. The Link 2 admission row-count check is
+corrected from the equality `n_rows == base*(ple_embed_dim/160)` (a
+pre-correction model) to a lower bound `n_rows >= ngram_required_rows` (the
+hashed row space). `model_requirements.md` and the design doc are corrected in
+place, dated.
+
+Decode-time PLE injection into the residual stream (gated projections + dilated
+conv, `ple.py::PLELayer.forward`) needs the trained backbone and is fork-gated
+(no Flash-Next artifact exists yet); the lookup is proven against a synthetic
+table (`tests/test_ngram_lookup.cpp`), not a trained one.
+
 ### Not in this release
 
 - Full 2B AWQ export: `tools/export_2b_awq.py`'s Phase 2 (OVQuantizer)

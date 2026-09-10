@@ -39,6 +39,43 @@ context, one shared tokenizer (`87a7830d63fcf43b`). Two are **MoE** (Qwen3.6-35B
 256 experts; Qwen3.6-27B-A3B-Coder, 184 pruned from 256), one is **dense**
 (Qwen3.8-27B).
 
+## 1a. Flash-Next n-gram table (0.5.0, FIX D — updated 2026-09-10)
+
+Beyond §1's keys, `load_artifact` reads the Flash-Next per-layer n-gram
+embedding (PLE) keys from `config.json`'s `text_config`: `ngram_size`,
+`ngram_vocab_size_base`, `heads_per_ngram`, `ple_embed_dim`, `ple_layer_ids`,
+plus `vocab_size` and `eos_token_id` (the n-gram hash boundary). All zero means
+"no n-gram table declared" — every checkpoint currently on the allowlist (dense
+`qwen35`, the two MoE) lands there and the admission path stays cold.
+
+When declared, the `per_layer_token_embd` table is supplied out-of-band via
+`--flash-next-ngram <path>` (it is too large to sit on either card: ~30 GiB at
+Q4_1, host-resident by design). The file carries a 24-byte `ARCINGRM` header
+(ggml_type ∈ {Q4_0, Q4_1, Q8_0}, `n_cols == 160`, `n_rows`) and is admitted by
+`admit_ngram_table_from_disk` — header, type, row width, on-disk size, a
+host-RAM fit refusal, and a **row-count lower bound**.
+
+**Corrected 2026-09-10 (`docs/research-freetoken.md` "Code-side ground truth",
+pinned FreeToken reference commit 505477ab):** the table is **not** "one row per
+token id" and its row count is **not** `ngram_vocab_size_base *
+(ple_embed_dim/160)`. It is a **hashed-vocab** store: `row_ids`
+(`src/exec/ngram_row_ids.h`) XOR-multiply mixes the last n token ids per n-gram
+order, floor-mods per a per-head prime vocab size, and offsets into a
+concatenated global row space (16 heads × 160 on Qwen3.8). The required row
+count is that global space (`ngram_required_rows`); admission checks
+`n_rows >= required` (a lower bound — the shipped size may be padded via
+`split_ngram_parts`, to be pinned against a real artifact). The load seam
+`load_ngram_lookup` (`src/exec/ngram_table.h`) admits + mmaps the table and
+exposes the reference's `PLETableBackend.lookup` contract
+(`row_ids -> gather_dequant`); `backend_ov.cpp` calls it behind the flag.
+
+No Flash-Next artifact is on the allowlist or the dev host yet: the lookup is
+proven against a synthetic table (`tests/test_ngram_lookup.cpp`), not a trained
+one, and the decode-time PLE injection into the residual stream is fork-gated
+(needs the trained backbone). The trained table is either the upstream
+`qwen4_exp` artifact or an arcint-original trained table
+(`HANDOFF-0.5.0.local.md`, checkpoint fork).
+
 ## 2. Weight precisions
 
 `--quant q4|q8` is the accepted format pair (DESIGN §2); every artifact

@@ -74,6 +74,7 @@ add_library(arcint_core STATIC
   src/core/gguf_repack.cpp
   src/core/model_registry.cpp
   src/core/ngram_header.cpp
+  src/exec/ngram_table.cpp
   src/core/prefix_cache.cpp
   src/core/reasoning.cpp
   src/core/sampler.cpp
@@ -224,6 +225,8 @@ if(ARCINT_TESTS)
     tests/test_affinity.cpp
     tests/test_fit.cpp
     tests/test_ngram_gather.cpp
+    tests/test_ngram_row_ids.cpp
+    tests/test_ngram_lookup.cpp
     tests/test_decode_stats.cpp
     tests/test_profile_cycle.cpp
     tests/test_rope_precision.cpp

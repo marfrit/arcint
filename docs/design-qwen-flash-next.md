@@ -661,8 +661,21 @@ config-passthrough or layout code is affected by that work.
 
 `per_layer_token_embd` -- Flash-Next's per-layer n-gram embedding table. Not
 attention, not an expert: a lookup table read by `ggml_get_rows` (the
-reference implementation's own op for it), one row per token id, 160
-elements wide per row. Two figures for its size were logged together in the
+reference implementation's own op for it), 160 elements wide per row.
+
+**Correction (2026-09-10, from `docs/research-freetoken.md` "Code-side ground
+truth", pinned FreeToken reference commit 505477ab): this table is NOT "one row
+per token id".** An earlier draft of this section said so; that is a
+plain-embedding shape and is wrong. The table is a **hashed-vocab** store
+addressed by a GLOBAL hashed id: for each token and each n-gram order n in
+[2, ngram_size], the last n token ids (eos-bounded) are XOR-multiply mixed,
+reduced modulo a per-head prime vocab size, and offset into a concatenated
+global row space (16 heads x 160 on Qwen3.8 -> 2560-wide `ple_embed_dim`). The
+index function is `row_ids` (exec/ngram_row_ids.h), landed in Link 3 below. The
+attribution is explicit: the method is FreeToken's implementation
+(`ple.py::NGramEmbedding.row_ids`, Apache-2.0), which the paper does not
+document; arcint transcribed it from the code, it did not infer it. Two figures
+for its size were logged together in the
 recon (HANDOFF-0.5.0.local.md): "51.2 G elements, 97.7 GiB BF16" -- these
 are the same tensor rounded two different ways (51.2 G is the headline
 count rounded to one decimal; 97.7 GiB divides back to a cleaner element
@@ -900,58 +913,77 @@ generation procedure documented and implemented; this file's tests
 verify byte-layout and roundtrip correctness against the format's
 own math, not against Flash-Next's own outputs.
 
-### Links 2 and 3: integration surfaces, not yet landed
+### Links 2 and 3: landed
 
-**Link 2 (loader admission).** The arcint loader (`src/core/artifact.cpp`)
-has no field for `per_layer_token_embd` today (the RED-B-01 red case
-in FIX B pins exactly this hole). What is left to land:
+**Link 2 (loader admission) -- LANDED (`161f7c8`), row-count check corrected
+(2026-09-10).** `admit_ngram_table_from_disk` (`src/core/artifact.cpp`) reads
+the 24-byte `ARCINGRM` header, refuses a wrong magic / non-{Q4_0,Q4_1,Q8_0}
+type / `n_cols != 160`, checks the on-disk size against header + payload, and
+runs the `host_ram_fit_must_refuse` (`fit.h`) budget refusal with the expert
+pool's own draw (FIX E, still to be measured) passed as zero for now. The C++
+`ARCINGRM` parser (`src/core/ngram_header.cpp`) matches the Python emitter byte
+for byte; `Artifact::NGramConfig` carries the config keys.
 
-- A `--flash-next-ngram <path>` CLI flag in `src/config.h` / `config.cpp`.
-- At load time, read the 24-byte `ARCINGRM` header from the file and
-  parse `(ggml_type, n_cols, n_rows)`; refuse when the magic is wrong,
-  the type is not one of {Q4_0, Q4_1, Q8_0}, or `n_cols` is not a
-  multiple of 32. The header parser lives with the emitter today
-  (`tools/synthetic_ngram_table.py::parse_header`); Link 2's C++
-  equivalent has to match its layout byte for byte.
-- A shape check that ties `(n_rows, n_cols)` to the config's
-  `ngram_vocab_size_base * ple_embed_dim` accounting for the physical
-  row split (`ple_embed_dim / 160 = 16` physical 160-wide rows per
-  vocab entry on Flash-Next).
-- A host-RAM fit refusal via `host_ram_fit_must_refuse` (`fit.h`),
-  named at the call site with the file's `n_rows * bytes_per_row`
-  bytes, the expert pool's own draw (FIX E, still to be measured),
-  the host's RAM as read at load time, and a margin.
+The row-count check landed in `161f7c8` as an EQUALITY,
+`n_rows == ngram_vocab_size_base * (ple_embed_dim / 160)` -- the
+pre-correction "16 physical rows per vocab entry" model. The code-side ground
+truth (`docs/research-freetoken.md`) shows that is wrong: the physical table is
+sized to the concatenated per-head prime vocab sizes (`ple.py` /
+`derive_ngram_hash_constants` -> `model.py:164` ZeroTable / `weight.py:303`
+HostBank), which exceed `base * num_heads` (every prime is >= base) and grow
+with the PLE layer index. Link 3 corrects the check to a **lower bound**,
+`n_rows >= ngram_required_rows(config)` (the last PLE layer's band top,
+`exec/ngram_row_ids.h`): provably necessary (a lookup can reach that row) and
+not over-constraining -- **the exact shipped size may be padded up via
+`split_ngram_parts`, and the equality can only be pinned against a real
+artifact. Reconcile flag: when a Flash-Next checkpoint exists, verify
+`n_rows` against `split_ngram_parts * rows_per_shard` and the multi-layer
+shared-bank convention (one `PinnedUVATable` spans every PLE layer, so per-layer
+`row_ids` bands must not collide in a way arcint mis-serves).**
 
-**Link 3 (decode-time consumer).** `backend_ov.cpp`'s paged serve
-loop calls `gather_dequant` once per decode step per active PLE
-layer -- `fit.h`'s own comment names the design ("read one gathered
-row at a time"). The result feeds the residual stream at the
-`ple_layer_ids`-named layer indices. **Two spec holes remain before
-this can land honestly:**
+**Link 3 (decode-time lookup) -- LANDED (this batch). The two "spec holes" the
+previous session named are CLOSED by code acquisition, not inference.** They
+were paper-side only; the FreeToken implementation specifies both fully
+(`docs/research-freetoken.md` "Code-side ground truth"; the paper documents
+neither -- attribution is to FreeToken's implementation, Apache-2.0):
 
-- **The lookup index.** FIX B's delta table shows the Flash-Next
-  config declares `ngram_size: 3`, `heads_per_ngram: 8` and
-  `ple_conv_kernel_size: 4`, but neither the design doc nor the recon
-  documents the function `(token_history) -> row_index` the paged
-  loop should call. §"The tensor" writes "one row per token id",
-  which is the plain-embedding shape and not compatible with the
-  ngram-triple keying the `ngram_size: 3` field implies. The synthetic
-  stand-in indexes purely by row number, so Link 3 built against it
-  today would silently ship the wrong indexing convention if the real
-  procedure turns out to hash `(t_{k-2}, t_{k-1}, t_k)` into a row.
-- **The residual-stream contribution.** The result of the gather is
-  either summed into the residual stream or feeds a small MLP; the
-  design doc records neither.
+- **The lookup index -- CLOSED.** The `(token_history) -> row_index` function
+  is `ple.py::NGramEmbedding.row_ids`: the hashed-vocab index in §"The tensor"'s
+  correction above. arcint implements it in `exec/ngram_row_ids.h::row_ids`
+  (int64 XOR-multiply hash, per-head prime-vocab floor-mod, per-head offsets,
+  eos-bounded windows), byte-for-byte against reference-derived vectors
+  (`tests/test_ngram_row_ids.cpp` / `tools/gen_ngram_vectors.py`). The old
+  "one row per token id" is refused by a standing negative test.
+- **The residual-stream contribution -- CLOSED (documented) / fork-gated (to
+  build).** `ple.py::PLELayer.forward`: the gathered embedding feeds gated
+  key/value projections against the residual streams, then a dilated depthwise
+  conv (kernel 4, dilation `ngram_size`), and the result is added to `R` before
+  the attention hyper-connection mix on the `ple_layer_ids` layers. This is
+  fully documented; building it needs the TRAINED backbone weights
+  (`key_proj`/`value_proj`/norms/`conv1d`), which only a Flash-Next artifact
+  carries -- the checkpoint fork (`HANDOFF-0.5.0.local.md`).
 
-Both holes are structural, not merely narrative: without them the
-right decode-time call site is undefined. Link 3 is therefore
-deliberately deferred, not because the kernel is missing but because
-the paging loop it would be wired into has no documented target op.
-FIX A's shim's backbone graph would provide the answer (the
-`ov::Model` for `qwen4_exp` would contain the operator equivalent to
-`ggml_get_rows` for `per_layer_token_embd`, at the layer the config's
-`ple_layer_ids` names); a future session can look at that graph and
-name the indexing + combination convention exactly.
+What landed is the piece that is **wiring, not design**:
+`PLETableBackend.lookup` is a frozen contract (`ple.py:47-68`: row ids in,
+dequantized rows out, optional preallocated out-buffer) that arcint's
+`gather_dequant` satisfies shape-for-shape. `exec/ngram_table.h::NGramLookup`
+is arcint's implementation of it -- `row_ids` -> `gather_dequant` over the
+host-resident (mmapped) table, one `lookup` per PLE layer per request, exactly
+`PinnedUVATable.lookup`. `load_ngram_lookup` is the load seam: behind
+`--flash-next-ngram`, it admits (Link 2), mmaps, derives the per-PLE-layer
+dummy-weight hash constants (`derive_hash_constants`, the reference's own
+init-time derivation; a check of the real checkpoint's int64 buffers is still
+owed), and constructs the lookup. `backend_ov.cpp`'s loader calls it behind the
+flag and holds the lookup; decode-time consumption is the fork's first step.
+
+The wiring-proof test (`tests/test_ngram_lookup.cpp`) admits + mmaps a synthetic
+table and asserts the gathered bytes equal an independent per-row dequant of the
+HASHED rows -- and that they differ from the naive token-index gather, so a
+regression to the old shape fails. Removing the `row_ids` step (gathering the
+token index) turns three cases red; that is the deletion test the roadmap
+requires. The AVX2 gather path (`ngram_gather.h`) falls back to scalar on a
+non-AVX2 build host, so the lookup tests run there; the AVX2 kernel's own
+byte-exact cases still need an AVX2 host (the dev host).
 
 ### What's blocked, and why
 
@@ -969,16 +1001,23 @@ checked, FIX A's own blocker). Specifically:
    measurement of anything the real table's access pattern implies (a
    1000-row table fits entirely in L2/L3 cache, defeating the DRAM-ceiling
    question this item exists to answer).
-2. **Integration**: the gather path in the graph (`ggml_get_rows` analogue
-   at the right op level, wired to the budget check above) is not built --
-   there is no Flash-Next IR to wire it into, and no served checkpoint in
-   this repository's existing families uses a table this shape, so there is
-   nothing to integrate against today. FIX D's own item 3 stays open until
-   FIX A's export blocker clears.
-3. **The refusal case as a load-time behavior** (not just the pure
-   arithmetic's boolean, which is covered) -- `backend_ov.cpp` does not yet
-   call `host_ram_fit_must_refuse` anywhere, because there is no load path
-   that reads a table this shape yet.
+2. **Integration**: **partly landed (Link 3, 2026-09-10).** The
+   `row_ids -> gather_dequant` lookup (`exec/ngram_table.h::NGramLookup`) and
+   its load seam (`load_ngram_lookup`) are built and wired into
+   `backend_ov.cpp` behind `--flash-next-ngram`; the table is admitted, mmapped
+   and held. What remains blocked is the DECODE-TIME consumption -- feeding the
+   gathered rows through the gated PLE projections + conv into the residual
+   stream (`ple.py::PLELayer.forward`), which needs the trained backbone graph
+   (no Flash-Next IR exists yet, FIX A's blocker; the checkpoint fork in
+   HANDOFF-0.5.0.local.md). The lookup is proven against a synthetic table
+   (`tests/test_ngram_lookup.cpp`), not a real one.
+3. **The refusal case as a load-time behavior** -- **landed (Link 3,
+   2026-09-10).** `backend_ov.cpp` now calls `load_ngram_lookup`, which calls
+   `admit_ngram_table_from_disk` -> `host_ram_fit_must_refuse` at load and
+   throws a named refusal, behind `--flash-next-ngram`. (The backend
+   translation unit is OpenVINO-only and was not compiled on the non-OpenVINO
+   build host; the device-free seam it calls is compiled and green there.
+   Dev-host compile owed in the next build window.)
 4. **FIX E crossover**: HANDOFF-0.5.0.local.md is explicit that "FIX D and
    FIX E contend for one DRAM budget, and the crossover calibration must be
    measured with both paths live, not FIX E alone" -- this section's fit

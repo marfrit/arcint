@@ -31,6 +31,7 @@
 #include <set>
 
 #include <dirent.h>
+#include <unistd.h>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -72,6 +73,7 @@
 #include "exec/fit.h"
 #include "exec/gguf_graph.h"
 #include "exec/graph_rewrites.h"
+#include "exec/ngram_table.h"
 #include "core/gguf_dequant.h"
 #include "exec/kquant_op.h"
 #include "core/artifact.h"
@@ -958,6 +960,45 @@ public:
             log::info("load", "vision IRs present and not loaded: %zu files, %.1f MiB on disk",
                       artifact.unloaded_vision_irs.size(),
                       static_cast<double>(vision_bytes) / (1024.0 * 1024.0));
+        }
+
+        // FIX D Link 3 (docs/design-qwen-flash-next.md "Links 2 and 3"): load
+        // the per_layer_token_embd table behind --flash-next-ngram. Placed
+        // BEFORE the paged/stateful branch so it fires on both serve paths (it
+        // depends only on `artifact`/`cfg`). This admits (Link 2) + maps the
+        // table (paged in on demand) + derives the per-PLE-layer hash constants
+        // + holds a lookup (row_ids -> gather_dequant), and names a refusal at
+        // load rather than failing mid-decode. Decode-time consumption -- the
+        // reference's gated PLE injection into the residual stream -- needs the
+        // TRAINED backbone weights (key_proj/value_proj/norms/conv1d) and lands
+        // with the checkpoint fork (HANDOFF-0.5.0.local.md); today the table is
+        // loaded and held, not yet read during decode.
+        if (!cfg.flash_next_ngram_path.empty()) {
+            const long     pages    = ::sysconf(_SC_PHYS_PAGES);
+            const long     pagesize = ::sysconf(_SC_PAGE_SIZE);
+            const uint64_t host_ram = (pages > 0 && pagesize > 0)
+                                          ? static_cast<uint64_t>(pages) * static_cast<uint64_t>(pagesize)
+                                          : 0;
+            std::string err;
+            uint64_t    payload_bytes = 0;
+            // other_resident: the host-side expert-pool draw is FIX E, still to
+            // be measured; pass 0 so the table is admitted on its own footprint.
+            auto lk = ngram::load_ngram_lookup(artifact, cfg.flash_next_ngram_path, host_ram,
+                                               /*other_resident=*/0, /*margin=*/0, err,
+                                               payload_bytes);
+            if (lk.has_value()) {
+                ngram_lookup_ = std::move(lk);
+                log::info("load",
+                          "flash-next n-gram table admitted: %zu PLE layer(s), %u rows x %zu "
+                          "cols, %llu payload bytes (mapped, paged in on demand; decode-time PLE "
+                          "injection is fork-gated, table held not yet consumed)",
+                          ngram_lookup_->num_layers(), ngram_lookup_->n_rows(),
+                          ngram_lookup_->n_cols(),
+                          static_cast<unsigned long long>(payload_bytes));
+            } else if (!err.empty()) {
+                throw std::runtime_error(log::format("--flash-next-ngram %s refused: %s",
+                                                     cfg.flash_next_ngram_path.c_str(), err.c_str()));
+            }
         }
 
         if (cfg.paged) {
@@ -7779,6 +7820,11 @@ private:
     std::atomic<bool>              drafting_{false};
     size_t                         draft_tokens_ = 0;
     mutable size_t                 position_sections_ = 0;
+
+    // FIX D Link 3: the admitted, host-resident per_layer_token_embd table and
+    // its per-PLE-layer hash constants (--flash-next-ngram). Empty on the cold
+    // path. Held for the decode-time PLE injection the checkpoint fork wires in.
+    std::optional<ngram::NGramLookup> ngram_lookup_;
 };
 
 }  // namespace

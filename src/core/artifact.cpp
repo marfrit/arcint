@@ -1,5 +1,6 @@
 #include "core/artifact.h"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdio>
@@ -10,6 +11,7 @@
 
 #include "core/ngram_header.h"
 #include "exec/fit.h"
+#include "exec/ngram_row_ids.h"
 #include "util/log.h"
 #include "util/sha256.h"
 
@@ -221,6 +223,12 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out) 
             }
         }
     }
+    a.ngram_config.vocab_size = int_or(tc, "vocab_size", 0);
+    // The n-gram hash boundary is the checkpoint's eos_token_id (reference
+    // config.py:195-197). It is set from `a.eos_ids` below, once the full
+    // generation_config -> text_config -> config fallback chain has been read --
+    // a top-level `eos_token_id` (the common HF layout) must not be missed, or
+    // token 0 would silently act as a boundary.
 
     // ------------------------------------------------------ tokens, sampler
     a.sampler = entry->sampler;  // family-card fallback, marked provisional
@@ -247,6 +255,11 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out) 
     }
     if (a.eos_ids.empty()) collect_eos(tc, a.eos_ids);
     if (a.eos_ids.empty()) collect_eos(a.config, a.eos_ids);
+    // The n-gram hash boundary follows the same eos chain; -1 stays when the
+    // config carries no eos_token_id at all (admission refuses a declared table
+    // then, rather than hashing with a legal token id as the boundary).
+    a.ngram_config.ngram_boundary_token_id =
+        a.eos_ids.empty() ? -1 : a.eos_ids.front();
 
     if (file_exists(tokenizer_cfg)) {
         try {
@@ -303,14 +316,35 @@ std::string admit_ngram_table_from_disk(const Artifact& artifact,
                                         uint64_t margin_bytes,
                                         uint64_t& out_payload_bytes) {
     out_payload_bytes = 0;
-    if (artifact.ngram_config.ngram_size == 0 &&
-        artifact.ngram_config.ple_embed_dim == 0) {
+    const auto& nc = artifact.ngram_config;
+    if (nc.ngram_size == 0 && nc.ple_embed_dim == 0) {
         return log::format(
             "the artifact does not declare an n-gram table (config.json has "
             "no non-zero ngram_size or ple_embed_dim); refusing to admit "
             "%s as a per_layer_token_embd for a checkpoint that does not "
             "have one",
             path.c_str());
+    }
+
+    // The table is declared, so the whole n-gram config must be present and
+    // usable: the hash index and its dummy-weight constant derivation
+    // (exec/ngram_row_ids.h) need every one of these, and a missing field would
+    // otherwise be filled with a silent, wrong default (vocab_size 0 -> a
+    // multiplier bound of 2^63; an empty ple_layer_ids -> a fabricated single
+    // layer; a missing eos -> token 0 as the hash boundary). Refuse by name
+    // instead. The reference treats an empty ple_layer_ids as "no PLE at all".
+    if (nc.ngram_size < 2 || nc.heads_per_ngram < 1 || nc.ngram_vocab_size_base <= 0 ||
+        nc.ple_embed_dim <= 0 || nc.vocab_size <= 0 || nc.ple_layer_ids.empty() ||
+        nc.ngram_boundary_token_id < 0) {
+        return log::format(
+            "%s: the artifact declares an n-gram table but its config is "
+            "incomplete (ngram_size=%d heads_per_ngram=%d ngram_vocab_size_base=%d "
+            "ple_embed_dim=%d vocab_size=%d ple_layer_ids=%zu eos=%d); all must be "
+            "present (ngram_size>=2, the rest > 0, ple_layer_ids non-empty, an "
+            "eos_token_id found)",
+            path.c_str(), nc.ngram_size, nc.heads_per_ngram, nc.ngram_vocab_size_base,
+            nc.ple_embed_dim, nc.vocab_size, nc.ple_layer_ids.size(),
+            nc.ngram_boundary_token_id);
     }
 
     std::ifstream f(path, std::ios::binary);
@@ -352,22 +386,31 @@ std::string admit_ngram_table_from_disk(const Artifact& artifact,
             path.c_str(), artifact.ngram_config.ple_embed_dim,
             kPhysicalRowWidth);
     }
-    if (artifact.ngram_config.ngram_vocab_size_base > 0 &&
-        artifact.ngram_config.ple_embed_dim > 0) {
-        const uint64_t rows_per_vocab_entry =
-            artifact.ngram_config.ple_embed_dim / kPhysicalRowWidth;
-        const uint64_t expected_rows =
-            static_cast<uint64_t>(artifact.ngram_config.ngram_vocab_size_base) *
-            rows_per_vocab_entry;
-        if (header.n_rows != expected_rows) {
+    // Row-count admission. The table must hold every row id the hashed-vocab
+    // index (exec/ngram_row_ids.h) can produce: the concatenated per-head prime
+    // vocab sizes, topped by the last PLE layer's band. This is a LOWER bound
+    // (>=), not the pre-correction equality n_rows == base*(ple_embed_dim/160):
+    // that formula assumed a plain "rows per vocab entry" table and is
+    // inconsistent with the reference's own sizing (docs/research-freetoken.md
+    // "Code-side ground truth"; the exact shipped size may be padded up via
+    // split_ngram_parts and can only be pinned against a real artifact -- see
+    // docs/design-qwen-flash-next.md FIX D "Links 2 and 3" reconcile flag).
+    {
+        // The completeness check above guarantees every field here is valid.
+        const int num_ple_layers = static_cast<int>(artifact.ngram_config.ple_layer_ids.size());
+        const uint64_t required_rows = static_cast<uint64_t>(ngram::ngram_required_rows(
+            artifact.ngram_config.vocab_size, artifact.ngram_config.ngram_size,
+            artifact.ngram_config.heads_per_ngram,
+            artifact.ngram_config.ngram_vocab_size_base, num_ple_layers));
+        if (header.n_rows < required_rows) {
             return log::format(
-                "%s: n_rows %u differs from the config-implied %llu "
-                "(ngram_vocab_size_base %d x ple_embed_dim/%u = %d)",
+                "%s: n_rows %u is below the %llu rows the hashed n-gram index "
+                "needs (%d heads x prime vocab >= ngram_vocab_size_base %d, "
+                "last of %d PLE layer(s)); the table cannot hold every row id",
                 path.c_str(), header.n_rows,
-                static_cast<unsigned long long>(expected_rows),
-                artifact.ngram_config.ngram_vocab_size_base,
-                kPhysicalRowWidth,
-                artifact.ngram_config.ple_embed_dim / kPhysicalRowWidth);
+                static_cast<unsigned long long>(required_rows),
+                (artifact.ngram_config.ngram_size - 1) * artifact.ngram_config.heads_per_ngram,
+                artifact.ngram_config.ngram_vocab_size_base, num_ple_layers);
         }
     }
 

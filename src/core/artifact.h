@@ -95,6 +95,13 @@ struct Artifact {
         int  heads_per_ngram       = 0;
         int  ple_embed_dim         = 0;
         std::vector<int> ple_layer_ids;
+        // Needed by FIX D Link 3's dummy-weight hash-constant derivation
+        // (derive_hash_constants, exec/ngram_row_ids.h): vocab_size bounds the
+        // multipliers, eos_token_id (the config's ngram_boundary_token_id)
+        // bounds every hash window. Both read from text_config; zero when the
+        // checkpoint declares no n-gram table.
+        int  vocab_size            = 0;
+        int  ngram_boundary_token_id = -1;   // -1 = no eos_token_id found in the config chain
     };
     NGramConfig ngram_config;
 
