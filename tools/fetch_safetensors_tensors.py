@@ -27,7 +27,10 @@ Usage:
   fetch_safetensors_tensors.py --repo Qwen/Qwen3.8-Flash-Next --prefix mtp. --manifest
   # then fetch into a staging dir, assembling a single mtp.safetensors:
   fetch_safetensors_tensors.py --repo Qwen/Qwen3.8-Flash-Next --prefix mtp. \
-      --out /flash/staging/flash-next-mtp --assemble mtp_head.safetensors
+      --out ./staging/flash-next-mtp --assemble mtp_head.safetensors
+
+Scope: public, SHARDED safetensors checkpoints (requires
+model.safetensors.index.json); no HF-token auth, so a gated repo returns 401.
 """
 import argparse
 import hashlib
@@ -37,6 +40,7 @@ import re
 import struct
 import sys
 import time
+import urllib.error
 import urllib.request
 
 HF = "https://huggingface.co"
@@ -46,9 +50,17 @@ def resolve_url(repo, revision, shard):
     return f"{HF}/{repo}/resolve/{revision}/{shard}"
 
 
+# HTTP statuses that will never succeed on retry -- fail fast with the real
+# code instead of burning the backoff budget on a misleading generic error.
+_FATAL_HTTP = {400, 401, 403, 404, 405, 410, 416}
+
+
 def http_get(url, start=None, end=None, retries=4, timeout=60):
     """GET url, optionally Range [start, end] inclusive. Returns bytes. Retries
-    on transient errors with backoff. Range requests must come back 206."""
+    transient errors (timeouts, 5xx, 429, connection resets) with backoff; fails
+    fast on a fatal HTTP status. A Range request MUST come back 206 (a 200 means
+    the server ignored Range and would stream the whole file) -- refused, not
+    retried, since it will never change."""
     headers = {"User-Agent": "arcint-fetch-safetensors/1.0"}
     ranged = start is not None
     if ranged:
@@ -60,10 +72,16 @@ def http_get(url, start=None, end=None, retries=4, timeout=60):
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 code = r.getcode()
                 if ranged and code != 206:
-                    # server ignored Range and would stream the whole file -- refuse
                     raise RuntimeError(f"Range request returned {code}, not 206 "
                                        f"(server may not support ranges): {url}")
                 return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code in _FATAL_HTTP:  # 404/401/416/... never succeed on retry
+                raise RuntimeError(f"GET {url}: HTTP {e.code} {e.reason} (fatal, not retried)")
+            last = e
+            time.sleep(1.5 * (attempt + 1))
+        except RuntimeError:
+            raise  # the non-206 refusal above -- a logic condition, not transient
         except Exception as e:  # noqa: BLE001 -- transient network, retry
             last = e
             time.sleep(1.5 * (attempt + 1))
@@ -81,7 +99,7 @@ def read_header(url):
     """Fetch and parse a safetensors file header. Returns (header_dict,
     data_section_start_abs_offset)."""
     n_bytes = http_get(url, 0, 7)
-    (header_len,) = struct.unpack("<Q", n_bytes)
+    (header_len,) = struct.unpack("<Q", n_bytes[:8])  # slice guards a coalesced >8B 206 body
     header_json = http_get(url, 8, 8 + header_len - 1)
     header = json.loads(header_json)
     return header, 8 + header_len

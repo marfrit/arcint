@@ -1985,4 +1985,6 @@ here and a number, each evidenced, none a bare blocker:
      workload, so the target run is an operator-scheduled window, not a
      windowless step — the same class as WP9's served measurement.
 So amortization stays **1× as a MEASURED input** until that window; the head is
-in hand and the path is de-risked end to end.
+in hand and the acceptance path is located, the remaining work scoped above
+(gap 2 is convert + nextn-decode-graph engineering of unknown size — located,
+not yet de-risked).
