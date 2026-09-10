@@ -327,3 +327,84 @@ publication date is 2026-08-17 (arXiv metadata `citation_date`);
 authors Yang, Shuo; Fan, Xiaoze; Pan, Melissa; Xi, Haocheng; Wang, Zhe;
 Sun, Shanlin; Keutzer, Kurt; Han, Song; Zaharia, Matei; Xu, Chenfeng;
 Stoica, Ion.
+
+## Code-side ground truth (external acquisition 2026-09-10)
+
+Acquired: shallow clone of FlashML-org/FreeToken @ HEAD, pinned read-only in a
+local reference checkout at commit
+`505477ab4429579e552adedd165f3cd6dbd40200`. Paper-side WP-R left two questions
+open ("undocumented"); the code specifies both fully.
+
+License determination (made here, not pending): the reference repo is
+**Apache-2.0** (`LICENSE`, "Copyright 2026 FreeToken Authors"; no `NOTICE`
+file). Apache-2.0 would permit porting a fixture verbatim under its attribution
+terms, but that carries a permanent attribution/notice obligation into this
+public repository (the same "fork tax" FIX E already declines for the CUDA
+kernels). arcint therefore does **not** copy the reference's
+`tests/models/qwen4_exp/test_ple.py` vectors. It derives its own vectors by
+invoking the reference's own deterministic hash-constant code
+(`derive_ngram_hash_constants`, pure integer arithmetic, no torch) from the
+pinned checkout and transcribing the documented row-index mixing
+(`tools/gen_ngram_vectors.py`). The resulting numbers are computed facts, not
+copied expression.
+
+### Row indexing — the (token_history) -> row_index function
+ple.py:465-478 `NGramEmbedding.row_ids`:
+  rolling context = last (ngram_size-1) token ids; eos = hash boundary
+  (no n-gram crosses an eos; ple.py:448-463 _shift_ignore_eos)
+  per order n in 2..ngram_size:
+    mixed = XOR_p (token[p] * layer_multipliers[p])          [int64, wrapping]
+    row[h] = mixed % ngram_heads_vocab_sizes[h] + ngram_heads_offsets[h]
+  The three buffers (layer_multipliers, ngram_heads_vocab_sizes,
+  ngram_heads_offsets) ship as int64 checkpoint tensors; the reference's
+  `derive_ngram_hash_constants` (ple.py:239-268) is the DUMMY-weight path that
+  recomputes them "the way HF derives them at init" and is the oracle a loader
+  test checks the checkpoint tensors against. arcint derives its test vectors
+  from that oracle (torch-free); a check of arcint's loaded buffers against the
+  real checkpoint tensors is still owed once an artifact exists.
+  heads: num_ngram_heads = (ngram_size-1)*heads_per_ngram (config.py:49-51;
+  Qwen3.8: 8x2-gram + 8x3-gram = 16); each head owns a prime vocab slice;
+  global row space = concatenated offsets. Per token: [T,16] rows x 160 dim.
+  -> The design doc's "one row per token id" (tensor section) is WRONG:
+     the table is hashed-vocab (~47.7 GiB FP8 + one scalar scale at Qwen3.8
+     scale), addressed by GLOBAL hashed id. Corrected in the design doc in the
+     same batch of commits as this addendum (FIX D "The tensor" / "Links 2 and
+     3", dated 2026-09-10).
+
+### Residual-stream combination
+ple.py:524-543 + module docstring, `PLELayer`:
+  E = lookup(row_ids)                       [T, 2560], FP8 x scale
+  K = norm_key(key_proj(E)).view(hc, hidden); V = value_proj(E); Q = norm_query(R).view(hc, hidden)
+  u = <K_i,Q_i>/sqrt(hidden) per stream; U = sigmoid(sign(u)*sqrt(max(|u|,1e-6))) * V
+  D = U + silu(conv1d(norm_conv(U)))        depthwise, kernel 4, dilation = ngram_size
+  R += D                                    before the attention hyper-connection mix,
+                                            on the ple_layer_ids layers (HF stores
+                                            them one-indexed, config.py:149-150
+                                            converts to zero-based; "layer 1" is
+                                            the HF one-indexed first PLE layer)
+  checkpoint weight keys: key_proj [hc*h,2560], value_proj [h,2560],
+  norm_key/norm_query/norm_conv (zero-centered, loaded RAW), conv1d [hc*h,1,4],
+  plus the three int64 hash buffers.
+
+### Table provenance — CONSTRUCTION IS TRAINING, NOT INFERENCE
+model.py:164-203: table is NOT a state-dict entry; ships as 128 checkpoint
+shards attached via attach_table to a PLETableBackend. Four implementers:
+PinnedUVATable (pinned-host + Triton UVA gather, the real 47.7 GiB path);
+DiskRowTable (ple_disk.py:101, rows streamed from disk with a per-graph WAIT
+flag, selected by engine_config.ple_backend == "disk" — the implementer
+closest to arcint's host-offload + gather-on-demand shape); ZeroTable (dummy
+checkpoints); GpuResidentTable (small-table index_select oracle the other
+backends are diffed against). No training or table-construction script exists
+in the repo. Consequences:
+  - Entry criterion "checkpoint on the dev host" cannot be met by tooling;
+    milestone-0.5.0's gate needs the upstream artifact OR an arcint-original
+    trained table (option: M11 measurement fight before default).
+  - PLETableBackend.lookup is a FROZEN CONTRACT that gather_dequant
+    satisfies shape-for-shape: row ids in, dequantized rows out, optional
+    preallocated out-buffer for graph decode. Link 3 = wiring, not design.
+  - start_prefetch/join pattern (ple.py:575-581): row_ids() hashes on the
+    main stream, table.prefetch gathers on a private side stream before
+    layer 0, joined at forward. Same overlap budget FIX E's numbers gate.
+  - tests/models/qwen4_exp/test_ple.py is a reference-oracle suite. Not
+    mirrored (license determination above); arcint derives its own vectors
+    via tools/gen_ngram_vectors.py.
