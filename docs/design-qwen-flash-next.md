@@ -993,18 +993,20 @@ real UD-Q3_K_XL GGUF (48 layers, top-10 of 512). All t/s below are
 measured.
 
 Measured tier bandwidths: DRAM read ~44.4 GiB/s (the DRAM->VRAM feed); NVMe
-sequential read ~2.3 GB/s (2.14 GiB/s); HDD-backed store ~0.41 GB/s cold.
+sequential read ~2.3 GB/s raw / **~1.8 GB/s (1.68 GiB/s) in-container through
+ZFS** (the model now lives on an NVMe pool bind-mounted into the container --
+this is the real miss-feed rate); HDD-backed store ~0.41 GB/s cold.
 Per-token full-miss expert traffic = 10*48*2,457,600 = **1.0986 GiB**.
 
 Routing trace (2908-token corpus, ~61% code / 39% prose), LRU replay over the
 56.25 GiB expert pool. **Measured hit-rate by resident capacity:**
 
-| resident | % pool | hit % | -> t/s (NVMe miss) | t/s (HDD miss) |
+| resident | % pool | hit % | -> t/s (NVMe miss, measured 1.68 GiB/s) | t/s (HDD miss) |
 |---|---|---|---|---|
-| 16 GiB | 28% | 89.5% | 13 | — |
-| 24 GiB | 43% | **95.0%** | **20** | 6.4 |
-| 32 GiB | 57% | 97.1% | 26 | — |
-| 40 GiB | 71% | 98.0% | 29 | 13 |
+| 16 GiB | 28% | 89.5% | 11 | — |
+| 24 GiB | 43% | **95.0%** | **18** | 6.4 |
+| 32 GiB | 57% | 97.1% | 23 | — |
+| 40 GiB | 71% | 98.0% | 27 | 13 |
 
 Per-token: 480 unique slices, ~278 distinct expert *indices* of 512,
 **cross-token reuse 36.3%**. 91% of the pool is touched over the corpus, so the
@@ -1013,8 +1015,9 @@ high hit-rates come from temporal locality, not from caching the whole set.
 **Smallest working configuration (single A770, as-shipped):** PLE table (26.82
 GiB) pinned DRAM-resident (per-token random hashed gather is seek-bound on any
 paged tier); that leaves ~16 GiB DRAM + ~8 GiB VRAM for an expert LRU = ~24 GiB
-resident (~43% of pool) -> **95.0% hit** (measured) -> **~20 t/s** projected
-with a ~2.3 GB/s NVMe miss tier. The **~40 t/s DRAM->VRAM ceiling** (h=1) is the
+resident (~43% of pool) -> **95.0% hit** (measured) -> **~18 t/s** projected
+with the measured ~1.68 GiB/s in-container NVMe miss tier. The **~40 t/s
+DRAM->VRAM ceiling** (h=1) is the
 FreeToken regime: because the card cannot hold the working set, ~1 GiB of expert
 weight crosses the bus every token regardless of residency, and 44.4 GiB/s caps
 that at 40.4 t/s. So the model PROJECTS as servable on one A770 by streaming
@@ -1022,10 +1025,11 @@ that at 40.4 t/s. So the model PROJECTS as servable on one A770 by streaming
 not need to be resident.
 
 **Knobs, each priced (GiB or t/s):**
-- **Miss tier is decisive.** NVMe (2.3 GB/s) gives ~20 t/s at 95% hit; the
-  HDD tier (0.41 GB/s) gives ~6 t/s — a ~3x swing. The NVMe is the enabling
-  prerequisite (it needs ~91 GB of free NVMe; operator-local detail in the
-  handoff).
+- **Miss tier is decisive.** The NVMe (measured ~1.68 GiB/s in-container) gives
+  ~18 t/s at 95% hit; the HDD tier (0.41 GB/s) gives ~6 t/s — a ~3x swing. The
+  NVMe is the enabling prerequisite and is now PROVISIONED: the model lives on a
+  190 GiB NVMe pool bind-mounted into the container (operator-local detail in
+  the handoff).
 - **MTP acceptance — the biggest lever, and currently ABSENT.** The shipped
   UD-Q3_K_XL GGUF declares PLE (n-gram) but carries **no MTP/nextn/draft head**
   (measured: no such GGUF key; PLE is not a verify-accept loop). So
@@ -1050,7 +1054,7 @@ not need to be resident.
 
 No capacity statement here is bare: each is a verdict against a named residency
 plan. The fully-resident plan does not fit (WP6); the **streaming plan fits one
-A770 at ~20 t/s as-shipped and ~30-40 t/s with an MTP head re-exported**, with
+A770 at ~18 t/s as-shipped and ~30-40 t/s with an MTP head re-exported**, with
 a fast (NVMe) miss tier as the prerequisite.
 
 ### Link 1: synthetic table generator (2026-09-10)
