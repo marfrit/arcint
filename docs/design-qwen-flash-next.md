@@ -655,6 +655,62 @@ and produces `openvino_language_model.xml` tensor by tensor, the same
 shape `export_mtp.py` uses for its 1-layer head. None of the argument,
 config-passthrough or layout code is affected by that work.
 
+### WP3.5 — Nibble decision: int4_asym is a microkernel on the A770 (measured 2026-09-10)
+
+The backbone-IR precision was an open question: does the GPU plugin serve
+u4 asymmetric-weight matmuls with a real microkernel (halving decode-side
+weight traffic), or does it fall back to a reference kernel / a separate
+decompress-to-fp16 pass (no bandwidth win)? Measured directly on the A770,
+one bench window, a single 16384x16384 fp16 MatMul compressed by NNCF 3.3.0
+`compress_weights` two ways (`int8_asym` per-channel = today's served
+template; `int4_asym` group-128, `all_layers=True` = the candidate), run at
+batch 1 (decode-side GEMV) through the GPU plugin (OpenVINO
+`2026.4.0-22849-71640275` — the same upstream commit marfrit-openvino +p15 is
+built from; its patch series does not touch int4 FC kernel selection, so the
+kernel choice measured here is expected to be the served one — the IR-served
+path keeps the plugin's dynamic-quantization default, which this run used
+(arcint overrides it only on the GGUF-opened path, `backend_ov.cpp`). Confirm
+on the first real backbone load with `ARCINT_PROFILE` before a decode rate is
+quoted).
+
+Result — **(a) microkernel, confirmed:**
+
+- The matmul executes as `jit:gemm:any__i8` (a JIT-compiled gemm), for BOTH
+  int8 and int4 weights. The activation is dynamically quantised to int8
+  (`dynamic_quantize_gpu_opt`) and fed to the gemm. **No `reference`/`ref`
+  kernel** and **no separate `Convert` (u4->f16) decompression node** in the
+  runtime graph — the int4 weights feed the gemm directly.
+- Decisive bandwidth evidence: the **matmul primitive's own GPU time halves**,
+  823 us (int8) -> 396 us (int4) = **2.08x**, on a batch-1 GEMV that is
+  weight-bandwidth-bound. The halving, together with the absence of any
+  decompression node, is consistent only with the gemm consuming the u4 bytes
+  itself: a separate decompression pass would appear as its own primitive and
+  leave the gemm's own read volume — and time — at the int8 figure.
+- Static weight bytes: `int4_asym` 139,460,624 B vs `int8_asym` 268,484,608 B
+  = **0.519x** (the surplus over half is the group-128 fp16 scales and u4 zero
+  points) — weight traffic ~halves, as the primitive time confirms.
+- Single-op end-to-end decode latency: 1383.5 us -> 949.9 us = 1.46x. Lower
+  than 2x because a ~555-560 us per-infer remainder (by subtraction: the
+  activation-quantise node, kernel launch and host sync), fixed across both
+  precisions, is amortised by a many-layer backbone; the weight-traffic-bound
+  part (the matmul) is the clean 2.08x.
+- **Scope: one 16384x16384 MatMul at M=1.** The backbone's real shapes
+  (smaller K/N, expert projections) and the M>1 cases (prefill, MTP/DFlash
+  verify blocks) were not measured; the int4 advantage narrows as the gemm
+  turns compute-bound, so the backbone's decode-side gain is bounded above by
+  2x, not promised at it.
+
+**Decision (a holds): the served template type for Flash-Next is `int4_asym`.**
+The artifact pipeline becomes NNCF `compress_weights(mode=INT4_ASYM,
+group_size=128, all_layers=True)` applied to the shim's built backbone IR
+(FIX A) — done with the pinned NNCF 3.3.0 on the dev host's OpenVINO tooling
+venv, no external compute and no optimum-intel. `all_layers=True` is required:
+NNCF otherwise keeps the output projection in the int8 backup. This does not
+change the FIX D n-gram table path (Q4_0/Q4_1/Q8_0 host-resident gather); it
+is the backbone weights' served precision. The K-quant gather path is not the
+nibble carrier for the backbone — that was the "if (a) fails" branch, and (a)
+held.
+
 ## FIX D — N-gram table host-offload and dequantise-on-gather
 
 ### The tensor
