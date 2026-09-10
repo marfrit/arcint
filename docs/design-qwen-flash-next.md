@@ -846,6 +846,113 @@ comparison point: their threshold sits almost exactly at this table's Q8_0
 size, which is consistent with Q8_0 being the precision they expect to need
 that much host RAM for in the first place.
 
+### Link 1: synthetic table generator (2026-09-10)
+
+FIX D's own §"The tensor" and §"The format" describe the table's shape
+(the recon's ~52.45 G elements, 160-wide rows, the config keys
+`ngram_vocab_size_base` / `ple_embed_dim` / `ple_layer_ids` listed
+under FIX B's delta table) and the Q4_0 / Q4_1 / Q8_0 byte layouts,
+but FIX D has no section documenting how the table is *produced* from
+a source checkpoint. The recon summary in `HANDOFF-0.5.0.local.md`
+describes the tensor as "learned from the model's embeddings + n-gram
+statistics" without giving a procedure; a grep over this doc for
+`corpus`, `n-gram statistic`, `learned` and `training procedure`
+returns only meta-references (this section itself, the CLI-option
+mention in §6, no procedure). **The design-doc spec is too thin to
+implement real generation.**
+
+Per the roadmap's own allowance for that case,
+`tools/synthetic_ngram_table.py` lands a synthetic stand-in whose
+bytes match the Q4_0 / Q4_1 / Q8_0 layouts §"The format" records.
+The generator is deterministic on `(row, seed)` and uses the same
+per-column-varying fill `tests/test_ngram_gather.cpp` uses to avoid
+the constant-per-dimension trap (BY_TOKEN NaN class, recorded in
+`HANDOFF-0.4.7.local.md`). `_iround` is half-away-from-zero to match
+ggml (Python's `round()` is half-to-even, which diverges at every
+X.5 tie). Each emitted file carries a 24-byte `ARCINGRM` header
+naming the ggml_type, `n_cols` and `n_rows` -- so the FIX D Link 2
+loader knows the file's format without a companion sidecar and
+without inferring from size (a Q4_1 file of the right n_rows would
+otherwise admit as Q4_0). `tools/export_flash_next.py` exposes the
+emitter via `--emit-ngram-synthetic --out <path> --n-rows N --n-cols
+C --fmt F --seed S`; the mode skips the transformers-support and
+optimum-intel checks (the emitter needs neither).
+
+Test surface (`tools/test_synthetic_ngram_table.py`, 22 cases,
+stdlib-only, no venv needed): f16 round-trip (4), `_iround`
+half-away-from-zero versus Python's half-to-even (2), on-disk file
+size against `os.path.getsize` for each format (1), a golden Q4_0
+block whose 18 bytes pin sign, offset, scale and nibble packing
+against exact byte values (1), quantise -> python-reference dequant
+round-trip within the per-format half-step tolerance (Q4_0 0.02,
+Q4_1 0.02, Q8_0 0.002 -- half a grid step at the fill's amplitude;
+loose tolerances hid sign-and-offset regressions in an earlier
+revision) (1), determinism (2), argument refusals (3), header
+round-trip / bad magic / truncated / unknown type / non-block cols
+/ nonzero reserved (7), and CLI-wrapper byte-equality against the
+direct library call (1). All 22 pass in 0.04 s.
+
+**What the synthetic stand-in cannot do:** it does not reproduce the
+Flash-Next checkpoint's actual per-token embedding lookup values,
+only its byte layout. Any semantic acceptance (generation quality
+against a Flash-Next reference implementation) needs the real
+generation procedure documented and implemented; this file's tests
+verify byte-layout and roundtrip correctness against the format's
+own math, not against Flash-Next's own outputs.
+
+### Links 2 and 3: integration surfaces, not yet landed
+
+**Link 2 (loader admission).** The arcint loader (`src/core/artifact.cpp`)
+has no field for `per_layer_token_embd` today (the RED-B-01 red case
+in FIX B pins exactly this hole). What is left to land:
+
+- A `--flash-next-ngram <path>` CLI flag in `src/config.h` / `config.cpp`.
+- At load time, read the 24-byte `ARCINGRM` header from the file and
+  parse `(ggml_type, n_cols, n_rows)`; refuse when the magic is wrong,
+  the type is not one of {Q4_0, Q4_1, Q8_0}, or `n_cols` is not a
+  multiple of 32. The header parser lives with the emitter today
+  (`tools/synthetic_ngram_table.py::parse_header`); Link 2's C++
+  equivalent has to match its layout byte for byte.
+- A shape check that ties `(n_rows, n_cols)` to the config's
+  `ngram_vocab_size_base * ple_embed_dim` accounting for the physical
+  row split (`ple_embed_dim / 160 = 16` physical 160-wide rows per
+  vocab entry on Flash-Next).
+- A host-RAM fit refusal via `host_ram_fit_must_refuse` (`fit.h`),
+  named at the call site with the file's `n_rows * bytes_per_row`
+  bytes, the expert pool's own draw (FIX E, still to be measured),
+  the host's RAM as read at load time, and a margin.
+
+**Link 3 (decode-time consumer).** `backend_ov.cpp`'s paged serve
+loop calls `gather_dequant` once per decode step per active PLE
+layer -- `fit.h`'s own comment names the design ("read one gathered
+row at a time"). The result feeds the residual stream at the
+`ple_layer_ids`-named layer indices. **Two spec holes remain before
+this can land honestly:**
+
+- **The lookup index.** FIX B's delta table shows the Flash-Next
+  config declares `ngram_size: 3`, `heads_per_ngram: 8` and
+  `ple_conv_kernel_size: 4`, but neither the design doc nor the recon
+  documents the function `(token_history) -> row_index` the paged
+  loop should call. §"The tensor" writes "one row per token id",
+  which is the plain-embedding shape and not compatible with the
+  ngram-triple keying the `ngram_size: 3` field implies. The synthetic
+  stand-in indexes purely by row number, so Link 3 built against it
+  today would silently ship the wrong indexing convention if the real
+  procedure turns out to hash `(t_{k-2}, t_{k-1}, t_k)` into a row.
+- **The residual-stream contribution.** The result of the gather is
+  either summed into the residual stream or feeds a small MLP; the
+  design doc records neither.
+
+Both holes are structural, not merely narrative: without them the
+right decode-time call site is undefined. Link 3 is therefore
+deliberately deferred, not because the kernel is missing but because
+the paging loop it would be wired into has no documented target op.
+FIX A's shim's backbone graph would provide the answer (the
+`ov::Model` for `qwen4_exp` would contain the operator equivalent to
+`ggml_get_rows` for `per_layer_token_embd`, at the layer the config's
+`ple_layer_ids` names); a future session can look at that graph and
+name the indexing + combination convention exactly.
+
 ### What's blocked, and why
 
 Everything gated on an actual Flash-Next artifact is not landed, for the

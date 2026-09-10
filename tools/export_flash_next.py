@@ -117,18 +117,55 @@ def export(checkpoint, out_dir):
     print(f"exported {checkpoint} ({ARCHITECTURE}) to {out_dir}")
 
 
-def main():
+def emit_ngram_table(out_path, n_rows, n_cols, fmt, seed):
+    """FIX D Link 1: synthetic per_layer_token_embd stand-in. The real
+    generation procedure ("learned from the model's embeddings + n-gram
+    statistics as documented") has no procedure documented in
+    docs/design-qwen-flash-next.md -- the doc records what the table IS
+    (shape, byte layout, lines 662-701; the config keys at lines 108-111)
+    but not how it is produced from a source checkpoint. Until upstream
+    documents a procedure OR a decision memo names one here, the emitter
+    below produces a synthetic stand-in with the same byte layout, which
+    is what links 2 and 3 need to build against. See
+    tools/synthetic_ngram_table.py for the layout and its refusal rules."""
+    from synthetic_ngram_table import emit_synthetic_ngram_table
+    written, blocks_per_row = emit_synthetic_ngram_table(
+        out_path, n_rows=n_rows, n_cols=n_cols, fmt=fmt, seed=seed)
+    print(f"emitted {written} bytes to {out_path} "
+          f"({n_rows} rows x {blocks_per_row} blocks x "
+          f"{written // n_rows // blocks_per_row} bytes/block, fmt={fmt})")
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--checkpoint", default=CHECKPOINT,
                      help="HF repo id (default: the pinned Flash-Next checkpoint)")
     ap.add_argument("--out", default="/models/ov/qwen38-flash-next")
-    args = ap.parse_args()
+    ap.add_argument("--emit-ngram-synthetic", action="store_true",
+                    help="Emit a synthetic per_layer_token_embd table to --out "
+                    "and exit; skips the transformers-support / optimum-intel "
+                    "checks (this path does not need either). See "
+                    "tools/synthetic_ngram_table.py for the layout.")
+    ap.add_argument("--n-rows", type=int, default=1024,
+                    help="Rows in the synthetic table (default: 1024).")
+    ap.add_argument("--n-cols", type=int, default=160,
+                    help="Row width, must be a multiple of 32 "
+                    "(default: 160, the design doc's own row width).")
+    ap.add_argument("--fmt", choices=("q4_0", "q4_1", "q8_0"), default="q4_0",
+                    help="Quantisation format (default: q4_0, the shipped GGUF's).")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="Deterministic seed (default: 0).")
+    args = ap.parse_args(argv)
+
+    if args.emit_ngram_synthetic:
+        emit_ngram_table(args.out, args.n_rows, args.n_cols, args.fmt, args.seed)
+        return 0
 
     try:
         version = check_transformers_support()
     except AssertionError as exc:
         print(f"REFUSED (transformers): {exc}", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
     print(f"transformers {version} carries {MODELING_MODULE}")
 
@@ -136,12 +173,13 @@ def main():
         oi_version, tf_version = check_optimum_intel_compat()
     except AssertionError as exc:
         print(f"REFUSED (optimum-intel): {exc}", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
     print(f"optimum-intel {oi_version} + transformers {tf_version} "
           f"-- attempting the export")
     export(args.checkpoint, args.out)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
