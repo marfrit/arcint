@@ -19,7 +19,8 @@ Op choices where opset-13 differs from torch:
     -> the exact closed form. With L0 = strictly-lower(ut_system), the solve is
     (I + L0)^-1 @ rhs; L0 is 64x64 strictly lower triangular hence nilpotent
     (L0^64 = 0), so (I + L0)^-1 = sum_{p=0}^{63} (-L0)^p exactly. The finite sum
-    is built by geometric doubling (6 matmuls for chunk 64), no solver op.
+    is built by geometric doubling (6 steps x 2 matmuls = 12 matmuls for
+    chunk 64), no solver op.
 
 Entry point: build_gdn_model(config, state, seq_len) -> ov.Model with inputs
 `hidden_states` [1, T, H] f32 and `attention_mask` [1, T] f32, and result
