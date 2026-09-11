@@ -8,3 +8,4 @@ CLAUDE.local.md
 .claude/
 *.local.md.tmp.*
 *.local.md.bak*
+review.md
