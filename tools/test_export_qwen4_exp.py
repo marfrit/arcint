@@ -280,19 +280,37 @@ class TestOutputLayout(unittest.TestCase):
         passthrough = set(PASSTHROUGH_FILES)
         self.assertTrue(passthrough <= required | {"tokenizer_config.json"})
 
-    def test_backbone_build_refuses_full_size_as_window(self):
-        # E2 Phase B/C: the emitter EXISTS now (q4e.backbone from q4e.gguf_feed);
-        # the refusal is no longer "not yet emitted" -- it is that FULL-SIZE
-        # emission materialises the whole backbone and is window territory. The
-        # tiny end-to-end path (tiny=True / --gguf-ir --dry-run) is the CPU one.
+    def test_backbone_build_refuses_full_size_with_enumerated_blockers(self):
+        # E2 Phase B/C: the emitter EXISTS now (q4e.backbone from q4e.gguf_feed),
+        # so the refusal is not "not yet emitted". FIX C: nor is it "window
+        # territory" -- that named residency only and read as "get a GPU window
+        # and this works", which is false. The refusal must ENUMERATE its real
+        # blockers, so this cell asserts all three are named, that the head is
+        # recorded as RESOLVED (FIX B wired it), and that the banned framing is
+        # gone. The tiny path (tiny=True / --gguf-ir --dry-run) is the CPU one.
         geo = translate_config(SYNTHETIC_CONFIG)
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(NotImplementedError) as cm:
                 build_backbone_ir(d, geo, "/no/such/shards")  # tiny defaults False
         msg = str(cm.exception)
         self.assertIn("qwen4_exp", msg)
-        self.assertIn("WINDOW TERRITORY", msg)
         self.assertIn("n_layer=4", msg)
+        # (1) geometry, (2) ruled scope, (3) residency -- each named
+        self.assertIn("GEOMETRY", msg)
+        self.assertIn("_tiny_config", msg)
+        self.assertIn("SCOPE", msg)
+        self.assertIn("QSA", msg)
+        self.assertIn("indexer", msg)
+        self.assertIn("RESIDENCY", msg)
+        # residency names its assumption and a number, never a bare "does not fit"
+        self.assertIn("f32 ov Constant", msg)
+        self.assertIn("656.9 GiB", msg)
+        # the head is no longer a blocker -- and the refusal says so
+        self.assertIn("RESOLVED", msg)
+        self.assertIn("output.weight", msg)
+        # the banned framing
+        self.assertNotIn("WINDOW TERRITORY", msg)
+        self.assertNotIn("window's job", msg)
 
 
 class TestMain(unittest.TestCase):

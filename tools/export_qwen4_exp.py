@@ -15,9 +15,10 @@ and the sidecar `arcint.json` that carries the export-time knobs
 replacing the earlier unreachable full-safetensors-checkpoint path. A TINY config
 emits end to end on CPU (`--gguf-ir --dry-run`, .xml AND .bin hashes printed --
 the .xml carries the graph, the .bin the weights, and a weight change moves only
-the latter); the
-full-size 48-layer IR materialises the whole backbone and is WINDOW TERRITORY --
-refused here on CPU with a named reason.
+the latter); the full-size 48-layer IR is NOT IMPLEMENTED and refuses with its
+blockers ENUMERATED -- no full-size config, the unmapped QSA/indexer families,
+and only then residency (656.9 GiB of f32 constants, measured). A GPU window
+does not unblock any of the three.
 
 Usage:
     # config/tokenizer/sidecar passthrough (safetensors provenance path):
@@ -243,12 +244,17 @@ REFERENCE_COMMIT = "5b7dcb0d36c242d8d85920a81c564ef3a86ca6dd"
 # validated against the pin on random weights (E2 inc1-5b) AND on real GGUF
 # tensors (E2 Phase B: transcription-vs-pin 0.0 whole-backbone).
 #
-# BOUNDARY (windowless prep): a TINY config emits end to end on CPU -- that is
-# what `--gguf-ir --dry-run` does, and what this session records the artifact
-# hash of. FULL-SIZE emission (48 layers, hidden 2560, 512 experts) materialises
-# the whole backbone's weights and is WINDOW TERRITORY (both cards hold resident
-# services); this tool refuses it on CPU with a named reason rather than OOM the
-# host. The full-size IR is the window's job.
+# BOUNDARY: a TINY config emits end to end on CPU -- that is what `--gguf-ir
+# --dry-run` does, and what the .xml/.bin hashes are recorded from. FULL-SIZE
+# emission (48 layers, hidden 2560, 512 experts) is NOT IMPLEMENTED, and the
+# refusal in build_backbone_ir enumerates why: (1) no full-size config is
+# constructed at all, (2) 12 of 48 blocks are QSA and their families are
+# unmapped by the ruled causal-only scope, (3) only then residency -- 656.9 GiB
+# of f32 constants, measured over the shipped tensor list, the PLE n-gram table
+# alone 190.7 GiB. (1) and (2) are code and decisions, not hardware; (3) is not
+# a window-sized number. This is a correction of the earlier "WINDOW TERRITORY /
+# the full-size IR is the window's job" framing, which named residency only and
+# read as though a GPU window would make it work (REVIEW 2cd2b2f finding C).
 
 # Mirrors tests/python/test_backbone._make_config (small-but-complete: 4 GDN
 # layers, PLE at ple_layer_ids [2], every layer MoE). Kept here so the dry-run
@@ -320,13 +326,39 @@ def build_backbone_ir(out_dir, geometry, shards, seq_len=64, tiny=False):
     """
     if not tiny:
         # Refuse before importing openvino/torch so the refusal stays device-free.
+        # ENUMERATED, not hand-waved (FIX C, REVIEW 2cd2b2f finding C): the old
+        # text named residency only and read as "get a GPU window and this
+        # works". It would not. Every blocker below is measured or cited.
         raise NotImplementedError(
-            "full-size qwen4_exp backbone IR emission is WINDOW TERRITORY "
+            "full-size qwen4_exp backbone IR emission is NOT IMPLEMENTED "
             f"(n_layer={geometry.get('n_layer')} n_embd={geometry.get('n_embd')} "
-            f"num_experts={geometry.get('num_experts')}): materialising the whole "
-            "backbone's weights will not fit the CPU export host. Use --gguf-ir "
-            "--dry-run for the tiny end-to-end emission; run the full IR in a "
-            "GPU window (both cards hold resident services)."
+            f"num_experts={geometry.get('num_experts')}). A GPU window does not "
+            "unblock it; three things do, and none of them is a device:\n"
+            "  (1) GEOMETRY: there is no full-size config. This builder has only "
+            "_tiny_config(); nothing translates `geometry` into a "
+            "Qwen4ExpTextConfig, so there is no full-size model to emit. "
+            "Code-level, device-free.\n"
+            "  (2) SCOPE: the emitter is GDN-only by the frontier's causal-only "
+            "ruling (q4e/backbone.py 'CAUSAL-ONLY SCOPE', q4e/ref_backbone.py "
+            "'SCOPE'). The shipped checkpoint ships 12 of its 48 blocks as QSA "
+            "full-attention (blk 3,7,...,47) and their attn_q/k/v/output, "
+            "attn_q_norm/k_norm and indexer.* families are unmapped -- 120 "
+            "tensors, 2.30 GiB at f32, measured against the shipped tensor "
+            "list. The QSA indexer's per-query nonzero is not statically "
+            "opset-13-emittable (E1.5 finding 7); that decision is open, not "
+            "pending hardware.\n"
+            "  (3) RESIDENCY, and only then: this emitter materialises every "
+            "weight as an f32 ov Constant. Measured over the shipped tensor "
+            "list at that assumption, the causal-mapped set is 656.9 GiB "
+            "(461.4 GiB of per-block tensors across 48 blocks + 195.5 GiB of "
+            "globals), of which the PLE n-gram table alone is 190.7 GiB "
+            "(320,001,536 x 160, IQ4_NL in the file). No local card holds that "
+            "and neither does the export host's RAM -- so full-size needs a "
+            "different weight strategy (quantised constants, and a gather for "
+            "the n-gram table), not a bigger window.\n"
+            "Use --gguf-ir --dry-run for the tiny end-to-end emission. The head "
+            "wiring, which used to belong on this list, is RESOLVED: lm_head is "
+            "fed from the checkpoint's output.weight (it is not tied)."
         )
 
     import hashlib
