@@ -390,10 +390,20 @@ def build_backbone_ir(out_dir, geometry, shards, seq_len=64, tiny=False):
     xml = out / "openvino_language_model.xml"
     ov.save_model(model, str(xml))
     binf = xml.with_suffix(".bin")
-    return {
+
+    from q4e import artifact_identity as aid
+    rec = {
+        # Kept, and demoted: these are a PROVENANCE record of one emit, not an
+        # identity. Two emits of this tree produce two byte-variants on a 16/16
+        # split (REVIEW 57b1952 F1) and are the same model.
         "xml": hashlib.sha256(xml.read_bytes()).hexdigest(),
         "bin": hashlib.sha256(binf.read_bytes()).hexdigest(),
     }
+    # THE IDENTITY, per the contract endorsed by REVIEW 57b1952 F1:
+    # (op-graph topology, constant-blob multiset, bit-exact outputs). This is
+    # what two emits must agree on and what a comparison must use.
+    rec["identity"] = aid.artifact_identity(model)
+    return rec
 
 
 def load_config(checkpoint):
@@ -460,9 +470,22 @@ def main(argv=None):
                                    seq_len=args.seq_len, tiny=args.dry_run)
         mode = "tiny dry-run" if args.dry_run else "full-size"
         print(f"gguf-ir ({mode}): openvino_language_model.xml under {args.out}")
-        # graph AND weights: the .xml alone does not move when only weights do.
-        print(f"artifact sha256 (.xml, graph):   {digest['xml']}")
-        print(f"artifact sha256 (.bin, weights): {digest['bin']}")
+        # THE IDENTITY (contract, REVIEW 57b1952 F1): compare artifacts on these
+        # three, never on the byte hashes below.
+        ident = digest["identity"]
+        print(f"artifact identity contract:      {ident['contract']}")
+        print(f"  topology digest:               {ident['topology']}")
+        print(f"  constant-blob multiset digest: {ident['constants']}")
+        print(f"  bit-exact outputs digest:      {ident['outputs']} "
+              f"(on {ident['device']})")
+        print(f"  nodes {ident['n_nodes']}  constants {ident['n_constants']} "
+              f"({ident['n_distinct_constants']} distinct, "
+              f"{ident['const_bytes']} B)")
+        # Provenance of THIS emit only. Two emits of one tree land on a 16/16
+        # split across two byte-variants that are the same model, so a mismatch
+        # here is not a defect and an agreement here is not an identity.
+        print(f"emit provenance sha256 (.xml):   {digest['xml']}")
+        print(f"emit provenance sha256 (.bin):   {digest['bin']}")
         return 0
 
     if not args.checkpoint:
