@@ -23,10 +23,10 @@ Legs:
   * OV parity: the emitted OV model vs the transcription at atol=1e-5, with
     a max-abs table and a KLD on a small softmax head, at T=64 and T=96
     (row-local block: T only sizes the graph, no chunk/pad structure).
-  * masked-parity: trailing-zeros mask. The OV graph is row-local and takes
-    the ALREADY-masked input (the pin's apply_mask_to_padding_states is the
-    entry, pin 1252-1253 -- the model zeroes masked positions before the
-    block, exactly as the GDN leg does), so the masked parity asserts:
+  * masked-parity: trailing-zeros mask. Graph contract: the OV graph takes
+    the ALREADY-masked tensor -- the harness zeroes masked rows before
+    feeding the block (ref_hc.apply_mask_to_padding_states). The block is
+    row-local, so this leg asserts:
       (a) OV on the zeroed input emits the masked rows EXACTLY 0.0 (the
           reference's masked output, asserted like-for-like), and the live
           rows agree at atol=1e-5;
@@ -40,6 +40,28 @@ Legs:
     there. Here every op is row-local (group RMSNorm group_size=hidden,
     row-wise projections, per-row stream mean; pin 1021-1026), so a zeroed
     row is exactly inert for ANY content and nothing leaks between rows.
+
+WARNING -- model-path contract for the per-layer `use_combine=True` mixers
+(E2 increment 3, and any KLD instrument over the full layer stack). Two
+mask paths, only one is the model's own:
+  * the per-layer mixers (the decoder layer's `attn_hyper_connection` /
+    `mlp_hyper_connection`, called at pin 1288/1305) have NO mask input by
+    design -- this harness masks their input (apply_mask_to_padding_states,
+    pin 199) before the block; being row-local, the masked rows of their
+    3-tuple output (mixed, hyper_input, injection) are then exactly zero
+    under that masked input. That is a HARNESS-side property of the graph,
+    not a path the model executes.
+  * the model's own masked application (pin 1252-1253) lives in the PLE
+    layer's conv path (Qwen4ExpTextPLELayer.forward), not in front of the
+    decoder layer and not in front of the final mixer. The TextModel's
+    final `hyper_connection_mixer` is called at pin 1493 on the UNMASKED
+    layer-stack output: in the real model the padded rows carry live,
+    layer-generated values INTO the final mixer and come out NON-zero.
+  * a future KLD instrument that averages over ALL rows of the final-mixer
+    output must therefore NOT assume zero pads: score live rows only, or
+    subtract the reference's pad rows like-for-like.
+(Reviewer 160a64a finding: the earlier "exactly what the model does (pin
+1252-1253)" anchor for this leg was a wrong-path claim; it is retracted.)
 
 Devices:
   CPU is always run (host RAM, touches no card). GPU legs (GPU.0/GPU.1) run
@@ -184,7 +206,7 @@ def test_transcription_matches_pin():
             yr = ref(x)
             yp = pin(x)
         assert isinstance(yp, torch.Tensor), (
-            "use_combine=False must return a bare tensor (pin 1027-1028)"
+            "use_combine=False must return a bare tensor (pin 1028-1029)"
         )
         md = (yr - yp).abs().max().item()
         print(f"  T={T:>3}  max-abs(ref - pin) = {md:.3e}")
@@ -258,9 +280,12 @@ def test_hc_ov_parity_masked(device, T):
     mask[:, live:] = 0
 
     x = torch.randn(1, T, C * H)
-    # The model's entry: apply_mask_to_padding_states zeroes the masked
-    # rows BEFORE the block (pin 1252-1253); the OV graph is row-local and
-    # takes that already-masked tensor, exactly as the GDN leg does.
+    # The harness masks the input here: apply_mask_to_padding_states zeroes
+    # the masked rows before the block, and the OV graph -- row-local, no
+    # mask input by design -- takes that already-masked tensor, exactly as
+    # the GDN leg does. (The final mixer in the pin is called on the
+    # UNMASKED layer-stack output, pin 1493 -- see the file-header warning;
+    # that is a different path and is not what this leg anchors to.)
     x_masked = ref_hc.apply_mask_to_padding_states(x, mask)
     y_ref = _run_ref(ref, x, mask)
 

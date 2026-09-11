@@ -19,10 +19,10 @@ Pin = modeling_qwen4_exp.py, sha256
 
   pin 1021        hc_norm(x), group RMSNorm with group_size = hidden
   pin 152-172     Qwen4ExpTextRMSNorm: weight is ZERO-INITIALIZED (156) and
-                  applied as (1 + w) (171); _norm (163-164) reshapes the
-                  last dim into groups of `group_size`, mean-square over the
-                  group, rsqrt(mean + eps), flatten -- for group_size =
-                  hidden that is one group per (hc stream, row)
+                  applied as (1 + w) (171); _norm (161-165) reshapes the
+                  last dim into groups of `group_size` (163), mean-square
+                  over the group + rsqrt(mean + eps) (164), flatten (165) --
+                  for group_size = hidden that is one group per (hc stream, row)
   pin 1022        silu( down(x_norm) / hc_count )
   pin 1023        sigmoid( up(.) )
   pin 1024        unflatten(-1) into (hc_count, hidden)
@@ -30,14 +30,26 @@ Pin = modeling_qwen4_exp.py, sha256
   pin 1026        mean over the hc streams (dim=-2; the axis is DROPPED --
                   OV reduce_mean with keep_dims=False, because this is the
                   block's result and torch .mean has no keepdim)
-  pin 1027-1028   block_inject is None in this form -> return mixed_input
-                  ONLY (no 2*sigmoid injection stream)
+  pin 1027-1029   pin 1027 is the closing paren of the mean call; the
+                  None-return branch is 1028-1029: block_inject is None in
+                  this form -> return mixed_input ONLY (no 2*sigmoid
+                  injection stream)
 
 Op choices where opset-13 differs from torch (and what the first runs cost):
-  * the pin's float64 weight-cast (pin 171, "(x * w).to(float16)") ->
-    convert(f32 weight, f64) + 1.0 (f64), convert(f32): the 1 + w held in
-    64 bits, back to f32 before the multiply (gdn.py keeps the same 64-bit
-    divide in _rsqrt_eps). Cost: f64 convert/add/convert nodes.
+  * the (1 + w) scale of the zero-initialized hc_norm weight (pin 171) is
+    held in 64 bits: convert(w, f64) + 1.0 (f64), convert(f32). Why f64:
+    the pin's line 171 IS a plain fp32 add (1.0 + w) and torch rounds it
+    half-to-even; for f32 addends 1.0 + w with |w| >= 2^-30 the f64 sum is
+    EXACT, so convert(f64) + 1.0 -> convert(f32) equals round_f32(1 + w)
+    -- bit-identical to the pin's fp32 add (shared round-half-even). There
+    is no float64 cast in the pin; the f64 roundtrip is the safe lowering
+    of that fp32 add, not a transcription of one (the 160a64a review,
+    section 4, measured 0 mismatches over 15,000,000 f32 weights incl. the
+    exact-midpoint tie cases on the f32 grid). Cost: f64 convert/add/
+    convert nodes.
+  * gdn.py's _rsqrt_eps (1/sqrt(x+eps)) is pure fp32 -- nothing to match
+    here; the f64 nodes are this block's own (the 160a64a review, section
+    4, retracted an earlier claim that gdn.py kept a 64-bit divide).
   * torch .mean(dim=-2) drops its axis -> reduce_mean(keep_dims=False);
     the keep-dims mean (gdn.py's _rmean) yields a 4-D [1,T,1,H] result --
     the first dev-host run returned that shape and the test failed on it
@@ -84,7 +96,7 @@ def _mean_axis_drop(x, axis):
 def _gated_residual(hyper_input, T, H, hc, lowrank, weight_vec, eps, state):
     """hyper_input: [1, T, hc*H] -> mixed [1, T, H]."""
 
-    # pin 1021 -> Qwen4ExpTextRMSNorm, group_size = hidden (pin line 1010).
+    # pin 1021 -> Qwen4ExpTextRMSNorm, group_size = hidden (pin line 1009).
     # _norm (pin 161-165): reshape the last dim into (-1, group), then
     # x * rsqrt(mean(x^2) over the group + eps) (pin 164), flatten back
     # (pin 165). For group_size = H the groups are exactly the hc streams:
@@ -93,26 +105,30 @@ def _gated_residual(hyper_input, T, H, hc, lowrank, weight_vec, eps, state):
     x = _reshape(hyper_input, [1, T, hc, H])
     var = _rmean(_mul(x, x), 3)  # pin 164: x.pow(2).mean(-1, keepdim=True)
     xn = _mul(x, _rsqrt_eps(var, eps))  # pin 164: x * rsqrt(var + eps)
-    # pin 171: output * (1 + weight) with the zero-initialized hc_norm weight
-    # (pin 156); the "1 +" is part of the pin, not a convenience. In fp32
-    # 1 + w is emitted as convert(w, f64) + 1.0, convert(f32) -- the pin's
-    # float64 weight-cast (pin 171) is the numerically safe way to hold
-    # 1 + w, and gdn.py's 1/x form keeps the same 64-bit divide; the
-    # weights are O(1) checkpoint values, not 1e-8-scale ones, so the
-    # rounding cost is a few ulps of the gate weight, within the 1e-5 gate.
+    # pin 171: output * (1 + w) with the zero-initialized hc_norm weight
+    # (pin 156); the "1 +" is part of the pin, not a convenience. Pin lines
+    # 169-170 are a Llama-comment about .to(float16) ORDERING, not a 64-bit
+    # cast: line 171 is a plain fp32 add. fp32 1 + w is therefore emitted
+    # as convert(w, f64) + 1.0 (f64), convert(f32) -- for |w| >= 2^-30 the
+    # f64 sum is exact, so this roundtrip equals the pin's fp32 add
+    # bit-for-bit (shared round-half-even); the 160a64a review (section 4)
+    # measured 0 mismatches over 15,000,000 f32 weights (checkpoint
+    # weights are zero-init + drift, far above 2^-30). Any residual
+    # double-rounding corner needs |w| < 2^-30 and costs 1 ulp of the
+    # gate weight, ~7 orders of magnitude under the 1e-5 gate.
     w64 = op.convert(_c(np.ascontiguousarray(weight_vec, dtype=np.float32).reshape(1, 1, hc, H)), Type.f64)
     ones64 = op.constant(np.ones((1, 1, hc, H), np.float64))
     wn = op.convert(_add64(ones64, w64), Type.f32)
     xn = _mul(wn, xn)
     xg = _reshape(xn, [1, T, hc * H])  # pin 165: flatten(-2) -> [1, T, hc*H]
 
-    # pin 1022: silu(down(x_norm) / hc_count). The down Linear (pin 1011) is
+    # pin 1022: silu(down(x_norm) / hc_count). The down Linear (pin 1010) is
     # [hc_lowrank, hc*H], bias=False: y = x @ W^T.
     down = _mm(xg, _c(state["input_mix_weight_down.weight"]), tb=True)  # [1,T,lowrank]
     down = _mul(down, _c(np.float32(1.0 / hc)))  # pin 1022: "/ self.hc_count"
     silu_d = _silu(down)  # pin 1022: F.silu
 
-    # pin 1023: sigmoid(up(silu_d)). The up Linear (pin 1012) is
+    # pin 1023: sigmoid(up(silu_d)). The up Linear (pin 1011) is
     # [hc*H, hc_lowrank], bias=False.
     up = _mm(silu_d, _c(state["input_mix_weight_up.weight"]), tb=True)  # [1,T,hc*H]
     wgt = _sigmoid(up)  # pin 1023: torch.sigmoid
@@ -143,8 +159,9 @@ def build_hc_model(config, state, seq_len):
     hyper_input = op.parameter([1, T, hc * H], Type.f32)
     hyper_input.set_friendly_name("hyper_input")
 
-    # use_combine=False: no block_inject_weight (pin 1013, 1027-1028), so the
-    # forward is exactly the norm -> low-rank gate -> weighted mean above.
+    # use_combine=False: no block_inject_weight (pin 1012; the None-return
+    # branch is pin 1028-1029), so the forward is exactly the norm ->
+    # low-rank gate -> weighted mean above.
     mixed = _gated_residual(
         hyper_input, T, H, hc, lowrank, state["hc_norm.weight"], eps, state
     )
