@@ -55,7 +55,7 @@ class Qwen4ExpTextBackbone(nn.Module):
         ple_input_ids = input_ids                                # pin 1425 (no pad here)
         hidden = emb.repeat(1, 1, self.hc_count)                 # pin 1480  [1,T,hc*H]
         for layer in self.layers:
-            if layer.ple is not None:                            # pin 1282-1285: PLE additive
+            if layer.ple is not None:                            # pin 1283-1286: PLE additive
                 hidden = hidden + layer.ple(hidden, ple_input_ids, None, conv_mask=conv_mask)
             hidden, hyper, inj = layer.attn_hyper_connection(hidden)                # pin 1288
             g = layer.linear_attn(hidden, cache_params=None, attention_mask=conv_mask)  # pin 1289

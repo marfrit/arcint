@@ -37,6 +37,13 @@ Row ids for the PLE layer are produced by the in-file numpy int64 generator (the
 frontier-ruled test-side producer; serving uses src/exec/ngram_row_ids.h). No
 threshold tuning anywhere: parity floors are reported as measured.
 
+Standing cell (adopted from the REVIEWER seat, E2 stack re-review 2026-09-11):
+test_backbone_ov_parity_interior_mask_hole -- T=48, seed 3, an INTERIOR conv_mask
+hole [18:30). Frontier-suggested and first-run by the reviewer; adopted here as
+authored. A trailing-zeros mask alone (test_backbone_ov_parity_masked) never
+exercises a valid position AFTER a masked one, so it cannot catch a
+prefix-assuming emitter; the interior hole does.
+
 Run (dev-host venv):
     Q4E_GPU=  ~/openarc-venv/bin/python3 -m pytest tests/python/test_backbone.py -s --continue-on-collection-errors
 """
@@ -250,6 +257,41 @@ def test_backbone_ov_parity_masked(device):
     max_abs = float(np.max(np.abs(y_ref - y_ov)))
     print(f"\n[backbone-ov-parity-masked] device={device:<6} T={T:>3} live={live}  max-abs(logits)={max_abs:.3e}")
     assert max_abs < 1e-5, f"backbone masked parity failed device={device}: {max_abs:.3e}"
+
+
+@pytest.mark.parametrize("device", _device_params())
+def test_backbone_ov_parity_interior_mask_hole(device):
+    """Standing cell adopted from the REVIEWER seat (E2 stack re-review,
+    2026-09-11): an INTERIOR conv_mask hole [18:30) at T=48, seed 3 -- a
+    non-trailing mask. Rules out a prefix-assuming emitter: a trailing-zeros
+    mask never exercises a valid position after a masked one, an interior hole
+    does. Frontier-suggested, first-run by the reviewer; floor reported, no
+    tuning. OV-vs-ref (both sides get the identical interior mask)."""
+    _assert_pin()
+    config = _make_config()
+    ref = _build_ref(config, seed=3)
+    state = _state_np(ref)
+    T = 48
+
+    torch.manual_seed(3)
+    ids = torch.randint(1, config.vocab_size, (1, T))
+    mask = torch.ones(1, T)
+    mask[:, 18:30] = 0.0                                     # INTERIOR hole
+    with torch.no_grad():
+        y_ref = ref.logits(ids, mask).float().numpy()
+
+    row_ids = _gen_row_ids(config, _ple_index(config), ids[0].tolist())
+    model = build_backbone(config, state, seq_len=T)
+    y_ov = _run_ov(model, {
+        "input_ids": ids.numpy().astype(np.int64),
+        "ngram_row_ids": row_ids,
+        "conv_mask": mask.numpy().astype(np.float32),
+    }, device)
+
+    V = config.vocab_size
+    max_abs = float(np.max(np.abs(y_ref - y_ov)))
+    print(f"\n[backbone-ov-parity-interior-hole] device={device:<6} T={T}  hole=[18:30)  max-abs(logits)={max_abs:.3e}")
+    assert max_abs < 1e-5, f"backbone interior-hole parity failed device={device}: {max_abs:.3e}"
 
 
 def test_transcription_matches_pin():
