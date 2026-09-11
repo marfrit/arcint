@@ -9,5 +9,6 @@
 from . import gdn
 from . import hc
 from . import moe
+from . import ple
 
-__all__ = ["gdn", "hc", "moe"]
+__all__ = ["gdn", "hc", "moe", "ple"]

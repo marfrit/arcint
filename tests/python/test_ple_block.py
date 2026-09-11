@@ -257,7 +257,9 @@ def test_transcription_matches_pin():
         ids = torch.randint(1, config.vocab_size, (1, T))
         hs = torch.randn(1, T, config.hc_count * config.hidden_size)
         with torch.no_grad():
-            yr, yp = ref(hs, ids), pin(hs, ids)
+            # the pin PLELayer.forward requires past_key_values positionally;
+            # ref_ple's no-cache transcription drops it.
+            yr, yp = ref(hs, ids), pin(hs, ids, None)
         md = float((yr - yp).abs().max())
         print(f"  T={T:>3}  max-abs(ref - pin) = {md:.3e}")
         assert md == 0.0, f"transcription drifted from pin at T={T}: {md:.3e}"
