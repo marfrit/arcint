@@ -23,11 +23,23 @@ Legs:
   * OV parity: the emitted OV model vs the transcription at atol=1e-5, with
     a max-abs table and a KLD on a small softmax head, at T=64 and T=96
     (row-local block: T only sizes the graph, no chunk/pad structure).
-  * masked-parity: trailing-zeros attention mask (the reviewer 6e93b8f
-    extension asked why masked positions matter in THIS module; they do not
-    -- every op is row-local, so the test proves it: masked positions are
-    emitted exactly 0.0, and a garbage probe in masked rows leaves all other
-    rows unchanged).
+  * masked-parity: trailing-zeros mask. The OV graph is row-local and takes
+    the ALREADY-masked input (the pin's apply_mask_to_padding_states is the
+    entry, pin 1252-1253 -- the model zeroes masked positions before the
+    block, exactly as the GDN leg does), so the masked parity asserts:
+      (a) OV on the zeroed input emits the masked rows EXACTLY 0.0 (the
+          reference's masked output, asserted like-for-like), and the live
+          rows agree at atol=1e-5;
+      (b) a garbage probe in the masked rows leaves every live row EXACTLY
+          unchanged (the row-locality proof -- in GDN the same probe WOULD
+          leak through the recurrent state; here it must move nothing).
+    WHY masked positions do not matter in THIS module (the reviewer 6e93b8f
+    asked, per module): they cannot. In GDN, a masked position still
+    evolves the recurrent state (beta = sigmoid(0) = 0.5, g != 0), so a
+    graph that ignored the mask would diverge -- the mask carries signal
+    there. Here every op is row-local (group RMSNorm group_size=hidden,
+    row-wise projections, per-row stream mean; pin 1021-1026), so a zeroed
+    row is exactly inert for ANY content and nothing leaks between rows.
 
 Devices:
   CPU is always run (host RAM, touches no card). GPU legs (GPU.0/GPU.1) run
@@ -246,34 +258,43 @@ def test_hc_ov_parity_masked(device, T):
     mask[:, live:] = 0
 
     x = torch.randn(1, T, C * H)
+    # The model's entry: apply_mask_to_padding_states zeroes the masked
+    # rows BEFORE the block (pin 1252-1253); the OV graph is row-local and
+    # takes that already-masked tensor, exactly as the GDN leg does.
+    x_masked = ref_hc.apply_mask_to_padding_states(x, mask)
     y_ref = _run_ref(ref, x, mask)
 
-    # (a) masked rows are exactly zero on the reference side (the contract
-    # the OV graph must reproduce; assert here so the OV assertion below
+    # (a) the reference emits the masked rows exactly 0.0 (the contract the
+    # OV graph must reproduce; asserted here so the OV assertion below
     # compares like with like).
     assert float(np.max(np.abs(y_ref[:, live:]))) == 0.0, "ref: masked rows not exactly 0"
 
     model = hc.build_hc_model(config, state, seq_len=T)
     core = ov.Core()
     compiled = core.compile_model(model, device)
-    out = compiled({"hyper_input": x.float().numpy()})
+    out = compiled({"hyper_input": x_masked.float().numpy()})
     y_ov = out[compiled.output(0)]
 
-    # (a) OV emits the masked rows exactly 0.0 (not ~1e-8): the group-mean
-    # of zero is exact in the emit, and the weighted mean of zeros is 0.
-    assert float(np.max(np.abs(y_ov[:, live:]))) == 0.0, (
+    # (a) OV on the zeroed input emits the masked rows exactly 0.0: a zero
+    # row is normed to a zero group (rsqrt(eps) is finite, 0*finite=0),
+    # gates to sigmoid(0)=0.5, and the weighted mean of zero streams is 0
+    # -- exact, not ~1e-8.
+    masked_max = float(np.max(np.abs(y_ov[:, live:])))
+    assert masked_max == 0.0, (
         f"OV: masked rows not exactly 0 at device={device} T={T} "
-        f"(max {np.max(np.abs(y_ov[:, live:])):.3e})"
+        f"(max {masked_max:.3e}) -- a zero row must stay exactly zero"
     )
     # live rows agree with the transcription
     max_abs = float(np.max(np.abs(y_ref[:, :live] - y_ov[:, :live])))
     print(f"[ov-parity-masked] device={device:<6} T={T:>3} live={live:>2}  "
-          f"max-abs(live)={max_abs:.3e}  max-abs(masked)={0.0:.3e}")
+          f"max-abs(live)={max_abs:.3e}  max-abs(masked)={masked_max:.3e}")
     assert max_abs < 1e-5, f"OV hc masked parity failed device={device} T={T}: {max_abs:.3e}"
 
-    # (b) garbage probe: corrupt ONLY masked rows; every live row must move
-    # by exactly 0.0.
-    probe = x.clone()
+    # (b) garbage probe: corrupt ONLY masked rows (they are already zero --
+    # this is a DIFFERENT row content, not a re-zeroing) and re-run. If any
+    # op mixed positions, a live row would move; the block is row-local, so
+    # every live row must move by exactly 0.0.
+    probe = x_masked.clone()
     probe[:, live:] = torch.randn(1, T - live, C * H) * 1000.0
     out2 = compiled({"hyper_input": probe.float().numpy()})
     y_probe = out2[compiled.output(0)]

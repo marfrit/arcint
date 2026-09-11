@@ -25,16 +25,23 @@ The branch pinned here (what tools/q4e/hc.py emits as opset-13) is the
 decoder-layer mixers (pin lines 1288, 1303, 1305, 1309) and is NOT this
 increment's surface.
 
-Per-position-ness (why the parity table's masked case is a real
-discriminator, not a degeneracy): every op in the block is local to one
-[B, *, 4H] row -- the group RMSNorm (group_size = hidden) normalizes within
-a row, the two low-rank projections and the mean over the hc streams are
-row-wise. No op mixes positions. A masked (zeroed) row is therefore exactly
-inert: the block emits zero there for ANY row content, and garbage in a
-masked row cannot change any other row's output. (Contrast the GDN block,
-whose masked positions still evolve the recurrent state -- there the mask
-carries signal; here it cannot.) The test proves this empirically with a
-garbage-probe discriminator; see tests/python/test_hc_block.py.
+Per-position-ness (why the masked-parity case exists and what it proves --
+and how it differs from GDN's masked case): every op in the block is local
+to one [B, *, 4H] row -- the group RMSNorm (group_size = hidden) normalizes
+within a row, the two low-rank projections and the mean over the hc streams
+are row-wise. No op mixes positions. A masked (zeroed) row is therefore
+exactly inert: the block emits zero there for ANY row content, and garbage
+in a masked row cannot change any other row's output. The test proves this
+empirically:
+  (a) a zeroed row is emitted exactly 0.0 (var=0 -> rsqrt(eps) finite ->
+      norm 0 -> gate sigmoid(0)=0.5 -> weighted mean of zero streams = 0);
+  (b) a garbage probe in the masked rows leaves every live row's output
+      exactly 0.0-different.
+Contrast the GDN block: there masked positions still evolve the recurrent
+state (beta = sigmoid(0) = 0.5, g != 0), so the mask carries SIGNAL -- a
+graph that ignored it would diverge at randn scale. Here the mask is inert
+by construction, so the same probe (b) is the proof of row-locality rather
+than of mask consumption.
 """
 import torch
 import torch.nn.functional as F
