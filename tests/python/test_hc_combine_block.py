@@ -60,7 +60,7 @@ adds the block_inject Linear (hc_hidden_size -> hc_count, bias=False, pin
     block_inject_weight.weight
 
 Run (dev-host venv):
-    Q4E_GPU=        ~/openarc-venv/bin/python3 -m pytest tests/python/test_hc_combine_block.py -s
+    Q4E_GPU=        ~/openarc-venv/bin/python3 -m pytest tests/python/test_hc_combine_block.py -s --continue-on-collection-errors
 """
 import hashlib
 import os
@@ -244,7 +244,7 @@ def test_combine_ov_parity(device, T):
     compiled = core.compile_model(model, device)
     out = compiled({"hyper_input": x.float().numpy()})
     y_ov = tuple(
-        out[compiled.outputs()[i]] for i in range(len(compiled.outputs()))
+        out[compiled.outputs[i]] for i in range(len(compiled.outputs))
     )
     assert len(y_ov) == 3, f"expected 3 results (mixed/hyper_input/injection), got {len(y_ov)}"
 
@@ -317,7 +317,7 @@ def test_combine_ov_parity_masked(device, T):
     core = ov.Core()
     compiled = core.compile_model(model, device)
     out = compiled({"hyper_input": x_masked.float().numpy()})
-    y_ov = tuple(out[compiled.outputs()[i]] for i in range(len(compiled.outputs())))
+    y_ov = tuple(out[compiled.outputs[i]] for i in range(len(compiled.outputs)))
 
     masked_max = float(max(np.max(np.abs(o[:, live:])) for o in (y_ov[0], y_ov[1])))
     assert masked_max == 0.0, (
@@ -347,7 +347,7 @@ def test_combine_ov_parity_masked(device, T):
     out2 = compiled({"hyper_input": probe.float().numpy()})
     drift = float(
         max(
-            np.max(np.abs(out2[compiled.outputs()[i]][:, :live] - o[:, :live]))
+            np.max(np.abs(out2[compiled.outputs[i]][:, :live] - o[:, :live]))
             for i, o in enumerate(y_ov)
         )
     )

@@ -74,7 +74,7 @@ class Qwen4ExpTextGatedResidual(nn.Module):
             nn.Linear(hc_hidden_size, self.hc_count, bias=False) if use_combine else None
         )
 
-    def forward(self, hyper_input: torch.Tensor) -> torch.Tensor:
+    def forward(self, hyper_input: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         # pin 1021
         hyper_input_normed = self.hc_norm(hyper_input)
         # pin 1022: down projection, /hc_count, silu
