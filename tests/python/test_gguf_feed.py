@@ -14,6 +14,15 @@ reference (a hand-written dequant+reshape), so a shape-preserving permutation bu
 -- which the load leg alone cannot see -- is caught: the GDN conv1d [C,K]->[C,1,K]
 and the MoE gate|up fusion.
 
+WHAT THE `== 0.0` LEGS CANNOT GATE (measured, REVIEW 2cd2b2f finding A): the
+NAME half of the map, for any entry that shares a shape with another. Ref and
+pin both read the same mis-mapped tensor, so the difference cancels identically
+and a swap stays invisible -- 21 of the 30 `_LAYER_MAP` entries sit in such a
+class. The NAME-MAP GATE at the bottom of this file closes that: one row per
+map entry, the expected GGUF name hardcoded test-side and the reference read by
+an independent `GGUFReader`. Proven by swapping entries: the gate goes red on
+exactly the swapped pair while every `== 0.0` leg stays green.
+
 Real-weight source: the shipped UD-Q3_K_XL GGUF shards. Point Q4E_GGUF_SHARDS at
 the directory (or a glob) holding them; absent, every test here skips by name
 (the shards are ~90 GiB and live only on the dev host -- this is not a
@@ -24,8 +33,11 @@ Run (dev host):
         Q4E_GPU=  <venv>/bin/python3 -m pytest tests/python/test_gguf_feed.py -s \\
         --continue-on-collection-errors
 """
+import glob
+import hashlib
 import os
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -391,3 +403,241 @@ def test_declared_head_fixture_feeds_output_weight(feed):
     assert tie_gap > 1e-3, (
         f"tied fallback gives the same logits as the fed head ({tie_gap:.3e}) -- "
         "the head wiring is not observable, so this cell gates nothing")
+
+
+# --- FIX A: the name map's OWN gate (test-side names, the map bypassed) ----- #
+#
+# Measured problem (REVIEW 2cd2b2f finding A, reproduced by the census cell
+# below): 21 of the 30 `_LAYER_MAP` entries sit in a same-shape class, so a
+# swapped pair produces a state dict that LOADS -- and because ref and pin then
+# both consume the same mis-mapped tensor, every transcription-vs-pin leg above
+# stays at exactly 0.0. The `== 0.0` legs gate the SHAPE / RESHAPE / FUSION
+# half; they cannot gate the NAME half for any degenerate pair.
+#
+# The gate below is the two micro-cells' pattern (hardcoded GGUF names
+# test-side, `q4e.gguf_feed` bypassed on the reference side) extended to EVERY
+# mapped entry, degenerate or not. The names here are transcribed from the
+# shipped tensor list and are deliberately NOT imported from the map -- that is
+# the whole mechanism: swap two entries inside `_LAYER_MAP` and the two affected
+# rows go red while every parity leg stays green.
+#
+# Kept complete, not merely "the degenerate ones": the coverage cell asserts
+# this table names every map entry, so a NEW map entry lands red until someone
+# writes down, independently, which GGUF tensor it is supposed to read.
+
+_EXPECTED_LAYER = {
+    # GatedDeltaNet
+    "linear_attn.in_proj_qkv.weight": ("attn_qkv.weight", "direct2d"),
+    "linear_attn.in_proj_z.weight": ("attn_gate.weight", "direct2d"),
+    "linear_attn.in_proj_a.weight": ("ssm_alpha.weight", "direct2d"),
+    "linear_attn.in_proj_b.weight": ("ssm_beta.weight", "direct2d"),
+    "linear_attn.A_log": ("ssm_a", "vec"),
+    "linear_attn.dt_bias": ("ssm_dt.bias", "vec"),
+    "linear_attn.conv1d.weight": ("ssm_conv1d.weight", "conv"),
+    "linear_attn.norm.weight": ("ssm_norm.weight", "vec"),
+    "linear_attn.out_proj.weight": ("ssm_out.weight", "direct2d"),
+    # SparseMoeBlock
+    "mlp.gate.weight": ("ffn_gate_inp.weight", "direct2d"),
+    "mlp.experts.gate_up_proj": (("ffn_gate_exps.weight", "ffn_up_exps.weight"),
+                                 "fuse_gate_up"),
+    "mlp.experts.down_proj": ("ffn_down_exps.weight", "expert3d"),
+    "mlp.shared_expert.gate_proj.weight": ("ffn_gate_shexp.weight", "direct2d"),
+    "mlp.shared_expert.up_proj.weight": ("ffn_up_shexp.weight", "direct2d"),
+    "mlp.shared_expert.down_proj.weight": ("ffn_down_shexp.weight", "direct2d"),
+    "mlp.shared_expert_gate.weight": ("ffn_gate_inp_shexp.weight", "row"),
+    # hyper-connection mixers -- attn and mlp members are pairwise degenerate
+    "attn_hyper_connection.hc_norm.weight": ("hc_attn_norm.weight", "vec"),
+    "attn_hyper_connection.input_mix_weight_down.weight": ("hc_attn_down.weight", "direct2d"),
+    "attn_hyper_connection.input_mix_weight_up.weight": ("hc_attn_up.weight", "direct2d"),
+    "attn_hyper_connection.block_inject_weight.weight": ("hc_attn_inject.weight", "direct2d"),
+    "mlp_hyper_connection.hc_norm.weight": ("hc_ffn_norm.weight", "vec"),
+    "mlp_hyper_connection.input_mix_weight_down.weight": ("hc_ffn_down.weight", "direct2d"),
+    "mlp_hyper_connection.input_mix_weight_up.weight": ("hc_ffn_up.weight", "direct2d"),
+    "mlp_hyper_connection.block_inject_weight.weight": ("hc_ffn_inject.weight", "direct2d"),
+    # PLE
+    "ple.key_proj.weight": ("ple_key.weight", "direct2d"),
+    "ple.value_proj.weight": ("ple_value.weight", "direct2d"),
+    "ple.norm_key.weight": ("ple_norm_key.weight", "vec"),
+    "ple.norm_query.weight": ("ple_norm_query.weight", "vec"),
+    "ple.norm_conv.weight": ("ple_norm_conv.weight", "vec"),
+    "ple.conv1d.weight": ("ple_conv1d.weight", "conv"),
+}
+
+_EXPECTED_GLOBAL = {
+    "embed_tokens.weight": ("token_embd.weight", "direct2d"),
+    # After dequant this is shape-identical to embed_tokens -- the head the pin
+    # ties and this checkpoint does not (FIX B). A swap between the two is
+    # exactly the degeneracy this gate exists for.
+    "lm_head.weight": ("output.weight", "direct2d"),
+    "hyper_connection_mixer.hc_norm.weight": ("output_hc_norm.weight", "vec"),
+    "hyper_connection_mixer.input_mix_weight_down.weight": ("output_hc_down.weight", "direct2d"),
+    "hyper_connection_mixer.input_mix_weight_up.weight": ("output_hc_up.weight", "direct2d"),
+}
+
+# blk index each layer key is read from: PLE lives on the real PLE block (1),
+# everything else on a real GDN block (0). Same convention as the slice cells.
+def _blk_of(suffix):
+    return 1 if suffix.startswith("ple.") else 0
+
+
+_ROW_KINDS = ("direct2d", "expert3d", "fuse_gate_up")
+_GATE_ROWS = 2   # leading-axis rows to compare; enough to separate any two tensors
+
+
+@pytest.fixture(scope="module")
+def raw_index():
+    """An INDEPENDENT GGUF index: a plain `GGUFReader`, no q4e code anywhere in
+    the path. The reference side of the content-hash gate must not share a line
+    of name-resolution with the thing under test."""
+    from gguf import GGUFReader
+    if os.path.isdir(_SHARDS):
+        paths = sorted(glob.glob(os.path.join(_SHARDS, "*.gguf")))
+    else:
+        paths = sorted(glob.glob(_SHARDS))
+    assert paths, f"no shards for {_SHARDS!r}"
+    idx = {}
+    for p in paths:
+        for t in GGUFReader(p).tensors:
+            idx[t.name] = t
+    return idx
+
+
+def _raw_dequant(raw_index, name, rows=None):
+    """Independent dequant: gguf.quants straight off the reader's block data."""
+    from gguf import quants as _Q
+    t = raw_index[name]
+    data = t.data if rows is None else t.data[:rows]
+    tn = t.tensor_type.name
+    if tn in ("F32", "F16", "BF16"):
+        return np.ascontiguousarray(np.asarray(data), dtype=np.float32)
+    return _Q.dequantize(data, t.tensor_type).astype(np.float32)
+
+
+def _expected_array(raw_index, gname, kind, rows):
+    """The array the map SHOULD produce, built test-side: independent dequant +
+    an independently written reshape for each kind."""
+    r = rows if kind in _ROW_KINDS else None
+    if kind == "fuse_gate_up":
+        gate = _raw_dequant(raw_index, gname[0], rows=r)
+        up = _raw_dequant(raw_index, gname[1], rows=r)
+        return np.concatenate([gate, up], axis=1)
+    arr = _raw_dequant(raw_index, gname, rows=r)
+    if kind in ("direct2d", "vec", "expert3d"):
+        return arr
+    if kind == "row":
+        return arr.reshape(1, -1)
+    if kind == "conv":
+        return arr.reshape(arr.shape[0], 1, arr.shape[1])
+    raise AssertionError(f"unhandled kind {kind!r}")
+
+
+def _sha(arr):
+    return hashlib.sha256(
+        np.ascontiguousarray(arr, dtype=np.float32).tobytes()).hexdigest()
+
+
+@_skip
+def test_name_map_gate_covers_every_entry():
+    """The gate's own coverage: the test-side expectation table names EVERY map
+    entry. A new `_LAYER_MAP` / `_GLOBAL_MAP` key lands red here until someone
+    writes down -- independently of the map -- which GGUF tensor it reads."""
+    missing_layer = sorted(set(gguf_feed._LAYER_MAP) - set(_EXPECTED_LAYER))
+    extra_layer = sorted(set(_EXPECTED_LAYER) - set(gguf_feed._LAYER_MAP))
+    missing_global = sorted(set(gguf_feed._GLOBAL_MAP) - set(_EXPECTED_GLOBAL))
+    extra_global = sorted(set(_EXPECTED_GLOBAL) - set(gguf_feed._GLOBAL_MAP))
+    print(f"\n[map-gate-coverage] layer={len(_EXPECTED_LAYER)}/{len(gguf_feed._LAYER_MAP)}  "
+          f"global={len(_EXPECTED_GLOBAL)}/{len(gguf_feed._GLOBAL_MAP)}")
+    assert not missing_layer, f"map entries with no test-side expectation: {missing_layer}"
+    assert not missing_global, f"global entries with no test-side expectation: {missing_global}"
+    assert not extra_layer, f"expectations for absent layer keys: {extra_layer}"
+    assert not extra_global, f"expectations for absent global keys: {extra_global}"
+
+
+@_skip
+def test_name_map_degeneracy_census(feed, raw_index):
+    """WHY the content-hash gate exists, measured rather than asserted.
+
+    Group every mapped entry by the shape it has AFTER dequant + reshape (after
+    dequant everything is f32, so shape alone decides whether a swap still
+    loads). Entries sharing a class are interchangeable without any `== 0.0`
+    leg noticing: ref and pin both read the same wrong tensor and the
+    difference cancels identically. Reported, with the class membership, so the
+    number in the header of this section cannot go stale."""
+    entries = []
+    for suffix, (gname, kind) in _EXPECTED_LAYER.items():
+        blk = _blk_of(suffix)
+        names = gname if isinstance(gname, tuple) else (gname,)
+        entries.append((f"layers.{blk}.{suffix}",
+                        tuple(f"blk.{blk}.{g}" for g in names), kind))
+    for key, (gname, kind) in _EXPECTED_GLOBAL.items():
+        entries.append((key, (gname,), kind))
+
+    cls = defaultdict(list)
+    for key, names, kind in entries:
+        t = raw_index[names[0]]
+        logical = tuple(int(x) for x in reversed(t.shape))
+        if kind == "conv":
+            logical = (logical[0], 1, logical[1])
+        elif kind == "row":
+            logical = (1, logical[0])
+        elif kind == "fuse_gate_up":
+            logical = (logical[0], 2 * logical[1], logical[2])
+        cls[logical].append(key)
+
+    degenerate = {k: v for k, v in cls.items() if len(v) > 1}
+    n_deg = sum(len(v) for v in degenerate.values())
+    print(f"\n[map-degeneracy] {len(entries)} mapped entries, {n_deg} of them in a "
+          f"same-shape class ({len(degenerate)} classes) -- a swap inside such a "
+          f"class LOADS and leaves every ==0.0 leg green")
+    for shape, members in sorted(degenerate.items(), key=lambda kv: -len(kv[1])):
+        print(f"[map-degeneracy]   {list(shape)}: {', '.join(sorted(members))}")
+    assert n_deg >= 21, (
+        f"only {n_deg} entries look degenerate -- if the checkpoint's geometry "
+        "changed, re-read finding A before trusting the ==0.0 legs")
+    # and the gate must cover all of them
+    covered = {k for k, _, _ in entries}
+    for members in degenerate.values():
+        for m in members:
+            assert m in covered, f"degenerate entry {m} is outside the hash gate"
+
+
+@_skip
+@pytest.mark.parametrize("suffix", sorted(_EXPECTED_LAYER))
+def test_name_map_entry_content_layer(feed, raw_index, suffix):
+    """THE NAME-MAP GATE, one row per per-layer entry: what `pin_tensor` returns
+    for this pin key must be byte-identical to the tensor the test-side table
+    says it is -- read by an independent `GGUFReader`, dequantised
+    independently, reshaped independently. Swap this entry with its degenerate
+    twin inside `_LAYER_MAP` and THIS row goes red; the parity legs do not."""
+    gname, kind = _EXPECTED_LAYER[suffix]
+    blk = _blk_of(suffix)
+    names = gname if isinstance(gname, tuple) else (gname,)
+    full = tuple(f"blk.{blk}.{g}" for g in names)
+    got = feed.pin_tensor(f"layers.{blk}.{suffix}", rows=_GATE_ROWS)
+    want = _expected_array(raw_index, full if len(full) > 1 else full[0],
+                           kind, _GATE_ROWS)
+    g_sha, w_sha = _sha(got), _sha(want)
+    print(f"\n[map-gate] {suffix} -> {'|'.join(full)}  shape={list(got.shape)}  "
+          f"sha={g_sha[:16]}  {'OK' if g_sha == w_sha else 'MISMATCH'}")
+    assert got.shape == want.shape, (got.shape, want.shape)
+    assert g_sha == w_sha, (
+        f"{suffix}: map read a DIFFERENT tensor than {'|'.join(full)} "
+        f"(got {g_sha[:16]}, want {w_sha[:16]})")
+
+
+@_skip
+@pytest.mark.parametrize("key", sorted(_EXPECTED_GLOBAL))
+def test_name_map_entry_content_global(feed, raw_index, key):
+    """The same gate for the non-per-layer entries -- including
+    `embed_tokens.weight` vs `lm_head.weight`, which are shape-identical after
+    dequant and would swap silently (FIX B)."""
+    gname, kind = _EXPECTED_GLOBAL[key]
+    got = feed.pin_tensor(key, rows=_GATE_ROWS)
+    want = _expected_array(raw_index, gname, kind, _GATE_ROWS)
+    g_sha, w_sha = _sha(got), _sha(want)
+    print(f"\n[map-gate] {key} -> {gname}  shape={list(got.shape)}  "
+          f"sha={g_sha[:16]}  {'OK' if g_sha == w_sha else 'MISMATCH'}")
+    assert got.shape == want.shape, (got.shape, want.shape)
+    assert g_sha == w_sha, (
+        f"{key}: map read a DIFFERENT tensor than {gname} "
+        f"(got {g_sha[:16]}, want {w_sha[:16]})")
