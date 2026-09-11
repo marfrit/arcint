@@ -569,7 +569,13 @@ def test_declared_head_fixture_feeds_output_weight(feed):
     tie_gap = float(np.max(np.abs(y_ov - y_tied)))
     print(f"[declared-head] OV-vs-ref(fed head)={ov_max:.3e}   "
           f"OV(fed head)-vs-OV(tied fallback)={tie_gap:.3e}")
-    assert ov_max < 1e-2, f"OV does not reproduce the fed-head logits: {ov_max:.3e}"
+    # Gated at the measured floor (1.891e-07 at the tip), not at the old 1e-2
+    # sanity bound. PROVENANCE of this figure, which moved twice without either
+    # mover saying so: 1.214e-03 at FIX B (222ac82) -> 5.385e-04 at 58e3e09
+    # (FIX D changed the fed state) -> 1.891e-07 now (FIX-GDN-UTINV took the
+    # GDN UT-inverse defect out of it; ~99.97% of the 5.385e-04 was that).
+    # Both superseded values fail this bound, which is the point of asserting it.
+    assert ov_max < 1e-5, f"OV does not reproduce the fed-head logits: {ov_max:.3e}"
     assert tie_gap > 1e-3, (
         f"tied fallback gives the same logits as the fed head ({tie_gap:.3e}) -- "
         "the head wiring is not observable, so this cell gates nothing")
@@ -731,18 +737,31 @@ def test_name_map_degeneracy_census(feed, raw_index):
     loads). Entries sharing a class are interchangeable without any `== 0.0`
     leg noticing: ref and pin both read the same wrong tensor and the
     difference cancels identically. Reported, with the class membership, so the
-    number in the header of this section cannot go stale."""
+    number in the header of this section cannot go stale.
+
+    THE CENSUS IS TAKEN FROM THE MAP UNDER TEST, not from this file's
+    expectation table (corrected 2026-09-11, REVIEW 58e3e09 finding 6). The
+    coverage assertion at the end used to build `covered` from the very list it
+    had just grouped, so it could not fail by construction -- it read as a gate
+    and was not one, the exact shape the round before was called to fix. Now the
+    entries come from `gguf_feed._LAYER_MAP` / `_GLOBAL_MAP` and the coverage
+    target is `_EXPECTED_LAYER` / `_EXPECTED_GLOBAL`: a degenerate MAP entry
+    with no test-side expectation behind it is a real hole and lands red here.
+    (Shapes are read by name from the map, but a swapped name inside a
+    degenerate class has the same shape by definition, so the census measures
+    shape classes and is indifferent to a swap -- which is what the per-entry
+    content-hash rows are for.)"""
     entries = []
-    for suffix, (gname, kind) in _EXPECTED_LAYER.items():
+    for suffix, (gname, kind) in gguf_feed._LAYER_MAP.items():
         blk = _blk_of(suffix)
         names = gname if isinstance(gname, tuple) else (gname,)
         entries.append((f"layers.{blk}.{suffix}",
-                        tuple(f"blk.{blk}.{g}" for g in names), kind))
-    for key, (gname, kind) in _EXPECTED_GLOBAL.items():
-        entries.append((key, (gname,), kind))
+                        tuple(f"blk.{blk}.{g}" for g in names), kind, suffix))
+    for key, (gname, kind) in gguf_feed._GLOBAL_MAP.items():
+        entries.append((key, (gname,), kind, key))
 
     cls = defaultdict(list)
-    for key, names, kind in entries:
+    for key, names, kind, _ in entries:
         t = raw_index[names[0]]
         logical = tuple(int(x) for x in reversed(t.shape))
         if kind == "conv":
@@ -763,11 +782,16 @@ def test_name_map_degeneracy_census(feed, raw_index):
     assert n_deg >= 21, (
         f"only {n_deg} entries look degenerate -- if the checkpoint's geometry "
         "changed, re-read finding A before trusting the ==0.0 legs")
-    # and the gate must cover all of them
-    covered = {k for k, _, _ in entries}
-    for members in degenerate.values():
-        for m in members:
-            assert m in covered, f"degenerate entry {m} is outside the hash gate"
+    # ... and every degenerate MAP entry must have a test-side expectation
+    # behind it, i.e. be a row of the content-hash gate. Independent sources:
+    # the census comes from the map, `gated` from this file's own table.
+    gated = {f"layers.{_blk_of(s)}.{s}" for s in _EXPECTED_LAYER} | set(_EXPECTED_GLOBAL)
+    holes = sorted({m for members in degenerate.values() for m in members} - gated)
+    print(f"[map-degeneracy] gate rows={len(gated)}  degenerate entries outside "
+          f"the gate={holes if holes else 'none'}")
+    assert not holes, (
+        f"degenerate map entries with no content-hash row behind them: {holes} "
+        "-- a swap inside their class would pass every cell in this file")
 
 
 @_skip
@@ -810,3 +834,100 @@ def test_name_map_entry_content_global(feed, raw_index, key):
     assert g_sha == w_sha, (
         f"{key}: map read a DIFFERENT tensor than {gname} "
         f"(got {g_sha[:16]}, want {w_sha[:16]})")
+
+
+# --- FIX C's residency figures, promoted from literals to facts ------------ #
+@_skip
+def test_refusal_residency_figures_are_recomputed_from_the_file(raw_index):
+    """REVIEW 58e3e09 finding 5: the full-size refusal's residency numbers
+    (656.9 / 461.4 / 195.5 / 190.7 GiB, "12 of 48", "120 tensors, 2.30 GiB")
+    were f-string literals with nothing behind them. They were correct -- the
+    reviewer recomputed every one -- but nothing re-derived them, so they would
+    rot silently if the checkpoint changed. FIX B set the better precedent in
+    that same round (`test_lm_head_is_not_tied_in_this_checkpoint` exists
+    precisely "so the claim cannot rot"); C did not follow it. This cell does.
+
+    Literals that assert are facts; literals that sit are drift.
+
+    Everything here is recomputed from the shipped tensor list through an
+    INDEPENDENT `GGUFReader` -- nelem x 4 bytes, the f32-ov-Constant assumption
+    the refusal itself names -- and then the refusal's OWN text is required to
+    contain each number as it is formatted here. Change the checkpoint and this
+    goes red at the exact figure that moved."""
+    import sys
+    sys.path.insert(0, str(REPO_ROOT / "tools"))
+    from export_qwen4_exp import build_backbone_ir
+
+    try:
+        build_backbone_ir("/nonexistent", {"n_layer": 48, "n_embd": 2560,
+                                           "num_experts": 512}, "/no/such/shards")
+        raise AssertionError("full-size emission did not refuse")
+    except NotImplementedError as e:
+        msg = str(e)
+
+    GB = 1024.0 ** 3
+
+    def nbytes(t):
+        n = 1
+        for x in t.shape:
+            n *= int(x)
+        return n * 4                      # f32 ov Constant, the stated assumption
+
+    # the per-block GGUF suffixes the causal map consumes
+    mapped = set()
+    for g, _kind in gguf_feed._LAYER_MAP.values():
+        mapped.update(g if isinstance(g, tuple) else (g,))
+    globals_ = {g for g, _ in gguf_feed._GLOBAL_MAP.values()} | {gguf_feed._PLE_TABLE}
+
+    per_block = glob_bytes = 0
+    unmapped_n = unmapped_bytes = 0
+    blocks, qsa, gdn = set(), set(), set()
+    for name, t in raw_index.items():
+        if name.startswith("blk."):
+            _, idx, suffix = name.split(".", 2)
+            blocks.add(int(idx))
+            if ".attn_q." in name:
+                qsa.add(int(idx))
+            if suffix.startswith("ssm_a"):
+                gdn.add(int(idx))
+            if suffix in mapped:
+                per_block += nbytes(t)
+            else:
+                unmapped_n += 1
+                unmapped_bytes += nbytes(t)
+        elif name in globals_:
+            glob_bytes += nbytes(t)
+
+    per_block_gib = per_block / GB
+    glob_gib = glob_bytes / GB
+    total_gib = per_block_gib + glob_gib
+    unmapped_gib = unmapped_bytes / GB
+    ple = raw_index[gguf_feed._PLE_TABLE]
+    ple_gib = nbytes(ple) / GB
+    ple_shape = tuple(int(x) for x in ple.shape)
+
+    print(f"\n[residency] blocks={len(blocks)}  QSA={len(qsa)} {sorted(qsa)[:4]}...  GDN={len(gdn)}")
+    print(f"[residency] per-block mapped={per_block_gib:.1f} GiB  globals={glob_gib:.1f} GiB  "
+          f"total={total_gib:.1f} GiB  (f32 ov Constants)")
+    print(f"[residency] PLE n-gram table {list(ple_shape)} {ple.tensor_type.name} "
+          f"-> {ple_gib:.2f} GiB f32")
+    print(f"[residency] unmapped (ruled scope): {unmapped_n} tensors  {unmapped_gib:.2f} GiB")
+
+    # every figure the refusal states must be the figure the file yields
+    for label, text in (
+        ("total", f"{total_gib:.1f} GiB"),
+        ("per-block", f"{per_block_gib:.1f} GiB"),
+        ("globals", f"{glob_gib:.1f} GiB"),
+        ("PLE table", f"{ple_gib:.1f} GiB"),
+        ("unmapped bytes", f"{unmapped_gib:.2f} GiB"),
+        ("unmapped count", f"{unmapped_n} tensors"),
+        ("QSA blocks", f"{len(qsa)} of its {len(blocks)} blocks"),
+        ("PLE table shape", f"{ple_shape[1]:,} x {ple_shape[0]}"),
+    ):
+        assert text in msg, (
+            f"refusal's {label} figure is stale: the file yields {text!r}, which "
+            f"does not appear in the refusal text")
+
+    # and the QSA block list the refusal names
+    assert sorted(qsa) == list(range(3, 48, 4)), sorted(qsa)
+    assert f"blk {min(qsa)},{sorted(qsa)[1]},...,{max(qsa)}" in msg.replace(", ", ",")
