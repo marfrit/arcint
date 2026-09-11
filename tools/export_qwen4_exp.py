@@ -13,7 +13,9 @@ and the sidecar `arcint.json` that carries the export-time knobs
 `build_backbone_ir()` (E2 Phase C) builds the ov::Model from real GGUF weights
 (via `q4e.gguf_feed`) + the arcint-original opset-13 emitter (`q4e.backbone`),
 replacing the earlier unreachable full-safetensors-checkpoint path. A TINY config
-emits end to end on CPU (`--gguf-ir --dry-run`, artifact hash printed); the
+emits end to end on CPU (`--gguf-ir --dry-run`, .xml AND .bin hashes printed --
+the .xml carries the graph, the .bin the weights, and a weight change moves only
+the latter); the
 full-size 48-layer IR materialises the whole backbone and is WINDOW TERRITORY --
 refused here on CPU with a named reason.
 
@@ -295,17 +297,22 @@ def gguf_fed_state(config, feed):
             state[k] = v.detach().cpu().numpy()
             continue
         gl = (1 if ".ple." in k else 0) if k.startswith("layers.") else None
-        rows = shape[0] if v.ndim >= 1 else None
-        arr = feed.pin_tensor(k, rows=rows, gguf_layer=gl)
-        sl = arr[tuple(slice(0, s) for s in shape)]
-        state[k] = np.ascontiguousarray(sl).astype(np.float32)
+        # feed.fitted, never pin_tensor + a hand slice: the fused gate_up's ff
+        # axis is two stacked halves and a leading slice of the concat takes
+        # both of them from gate (FIX D).
+        state[k] = feed.fitted(k, shape, gguf_layer=gl).astype(np.float32)
     return state
 
 
 def build_backbone_ir(out_dir, geometry, shards, seq_len=64, tiny=False):
     """Build the qwen4_exp backbone as an ov::Model from GGUF weights and save
-    it under `out_dir` (openvino_language_model.xml/.bin). Returns the sha256 of
-    the emitted .xml.
+    it under `out_dir` (openvino_language_model.xml/.bin). Returns
+    `{"xml": sha256, "bin": sha256}`.
+
+    BOTH hashes, because the .xml carries the GRAPH and the .bin carries the
+    WEIGHTS: the FIX D change (true gate|up halves) moved the .bin and left the
+    .xml byte-identical, so an artifact record that quotes only the .xml cannot
+    witness a weight change at all.
 
     `tiny=True` uses the small end-to-end-CPU config (the dry-run). `tiny=False`
     (full-size, from `geometry`) is refused here: the full backbone's residency
@@ -339,8 +346,11 @@ def build_backbone_ir(out_dir, geometry, shards, seq_len=64, tiny=False):
     out.mkdir(parents=True, exist_ok=True)
     xml = out / "openvino_language_model.xml"
     ov.save_model(model, str(xml))
-    digest = hashlib.sha256(xml.read_bytes()).hexdigest()
-    return digest
+    binf = xml.with_suffix(".bin")
+    return {
+        "xml": hashlib.sha256(xml.read_bytes()).hexdigest(),
+        "bin": hashlib.sha256(binf.read_bytes()).hexdigest(),
+    }
 
 
 def load_config(checkpoint):
@@ -407,7 +417,9 @@ def main(argv=None):
                                    seq_len=args.seq_len, tiny=args.dry_run)
         mode = "tiny dry-run" if args.dry_run else "full-size"
         print(f"gguf-ir ({mode}): openvino_language_model.xml under {args.out}")
-        print(f"artifact sha256: {digest}")
+        # graph AND weights: the .xml alone does not move when only weights do.
+        print(f"artifact sha256 (.xml, graph):   {digest['xml']}")
+        print(f"artifact sha256 (.bin, weights): {digest['bin']}")
         return 0
 
     if not args.checkpoint:

@@ -224,7 +224,43 @@ class GgufFeed:
             return int(m.group(1)), m.group(2)
         return None, pin_key
 
-    def pin_tensor(self, pin_key, rows=None, gguf_layer=None):
+    def fitted(self, pin_key, shape, gguf_layer=None):
+        """The fed tensor NARROWED to `shape` -- the only correct way to fit a
+        real GGUF tensor to a smaller (fixture / tiny-config) geometry.
+
+        Every axis is a leading-index slice EXCEPT the fused `gate_up_proj` ff
+        axis, which is two stacked halves: narrowing it needs
+        `gate[:ff]` ++ `up[:ff]` taken at the REAL ff, never a leading slice of
+        the concatenated tensor. That distinction is FIX D (REVIEW 2cd2b2f
+        finding D): with real ff 640 and a tiny target of 2*32, a leading slice
+        of the concat returns gate rows 0:64 and never reaches the up half at
+        all -- the fed 'up' half was measurably `gate[32:64]`, and
+        `ffn_up_exps` never entered the state dict through this key.
+
+        Callers use this instead of slicing `pin_tensor`'s result themselves;
+        that is what makes the old failure unreachable rather than merely
+        fixed."""
+        shape = tuple(int(s) for s in shape)
+        rows = shape[0] if shape else None
+        fuse_ff = None
+        if pin_key.endswith("mlp.experts.gate_up_proj"):
+            if len(shape) != 3 or shape[1] % 2:
+                raise ValueError(
+                    f"fused gate_up target {shape} is not [E, 2*ff, in]: the ff "
+                    "axis must be an even stack of gate|up halves")
+            fuse_ff = shape[1] // 2
+        arr = self.pin_tensor(pin_key, rows=rows, gguf_layer=gguf_layer,
+                              fuse_ff=fuse_ff)
+        if arr.ndim != len(shape):
+            raise ValueError(f"{pin_key!r}: fed rank {arr.ndim} != target {shape}")
+        for a, s in zip(arr.shape, shape):
+            if a < s:
+                raise ValueError(
+                    f"{pin_key!r}: fed axis {a} < target {s} "
+                    "(the real tensor is smaller than the requested fixture)")
+        return np.ascontiguousarray(arr[tuple(slice(0, s) for s in shape)])
+
+    def pin_tensor(self, pin_key, rows=None, gguf_layer=None, fuse_ff=None):
         """Dequantised f32 numpy for a pin `Qwen4ExpTextModel` state-dict key,
         in the pin's own axis order.
 
@@ -238,6 +274,12 @@ class GgufFeed:
         `gguf_layer` overrides the block index read from `pin_key` -- needed when
         the tiny fixture declares a layer GDN that the real model ships as a QSA
         (full-attention) block: feed the GDN keys from a real GDN block instead.
+
+        `fuse_ff` narrows the fused `gate_up_proj` correctly: each half is cut to
+        `fuse_ff` at the REAL ff width BEFORE the concat, so the result is
+        gate[:fuse_ff] ++ up[:fuse_ff]. Prefer `fitted()`, which derives it from
+        the target shape -- slicing this method's [E, 2*ff_real, in] result by
+        hand is the FIX D bug (it takes both halves from gate).
 
         Raises for a derived / non-weight buffer -- the caller must not feed
         those (the pin recomputes them)."""
@@ -257,7 +299,7 @@ class GgufFeed:
             if pin_key not in _GLOBAL_MAP:
                 raise KeyError(f"no GGUF map entry for global key {pin_key!r}")
             gname, kind = _GLOBAL_MAP[pin_key]
-            return self._materialise(gname, kind, rows=rows)
+            return self._materialise(gname, kind, rows=rows, fuse_ff=fuse_ff)
 
         if suffix not in _LAYER_MAP:
             raise KeyError(f"no GGUF map entry for layer key suffix {suffix!r}")
@@ -266,9 +308,9 @@ class GgufFeed:
             gname = tuple(f"blk.{layer}.{g}" for g in gname)
         else:
             gname = f"blk.{layer}.{gname}"
-        return self._materialise(gname, kind, rows=rows)
+        return self._materialise(gname, kind, rows=rows, fuse_ff=fuse_ff)
 
-    def _materialise(self, gname, kind, rows=None):
+    def _materialise(self, gname, kind, rows=None, fuse_ff=None):
         # rows slices the leading axis only for kinds whose pin leading axis IS
         # the GGUF leading axis; vec/row/conv are small and their leading axes
         # differ, so they dequant whole.
@@ -277,6 +319,18 @@ class GgufFeed:
         if kind == "fuse_gate_up":
             gate = self.dequant(gname[0], rows=r)      # [E, ff, in]
             up = self.dequant(gname[1], rows=r)        # [E, ff, in]
+            if fuse_ff is not None:
+                # TRUE HALVES (FIX D): cut each half at the REAL ff, then concat.
+                # Slicing the concatenated [E, 2*ff_real, in] instead would take
+                # both halves out of gate whenever the target is narrower than
+                # ff_real -- measured at ff_real=640 vs a 2*32 target.
+                ff_real = gate.shape[1]
+                if fuse_ff > ff_real:
+                    raise ValueError(
+                        f"fused gate_up: requested ff {fuse_ff} > real ff "
+                        f"{ff_real} ({gname[0]})")
+                gate = gate[:, :fuse_ff]
+                up = up[:, :fuse_ff]
             return np.concatenate([gate, up], axis=1)  # [E, 2*ff, in]
         arr = self.dequant(gname, rows=r)
         if kind in ("direct2d", "vec", "expert3d"):

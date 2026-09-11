@@ -7,7 +7,7 @@ tensors keeps transcription-vs-pin at 0.0 because BOTH sides then carry
 byte-identical weights. So a non-0.0 here is a NAME-MAP or a RESHAPE/FUSION bug,
 never a quantisation-accuracy story (that is a later, separate gate -- KLD).
 
-Each slice cell feeds ONE module's weights (sliced to the tiny config's shape)
+Each slice cell feeds ONE module's weights (narrowed to the tiny config's shape)
 into an otherwise-random tiny model and checks transcription-vs-pin == 0.0. Two
 micro-cells additionally check the non-trivial reshapes against an INDEPENDENT
 reference (a hand-written dequant+reshape), so a shape-preserving permutation bug
@@ -71,24 +71,25 @@ def feed():
     return gguf_feed.GgufFeed(_SHARDS)
 
 
-def _fit(arr, shape):
-    """Leading-index slice of `arr` down to `shape` (each target dim <= arr's)."""
-    assert arr.ndim == len(shape), (arr.shape, shape)
-    for a, s in zip(arr.shape, shape):
-        assert a >= s, f"feed axis {a} < target {s} (need a bigger real tensor)"
-    return arr[tuple(slice(0, s) for s in shape)]
+def _fit(feed, pin_key, shape, gguf_layer=None):
+    """The real tensor narrowed to a tiny-fixture `shape`.
+
+    Delegates to `GgufFeed.fitted` -- NOT a leading-index slice of
+    `pin_tensor`'s result, which is FIX D: the fused `gate_up_proj` ff axis is
+    two stacked halves, so a leading slice of the concat takes BOTH halves out
+    of gate whenever the target is narrower than the real ff (measured: real ff
+    640 vs a 2*32 target; `ffn_up_exps` never reached the state dict)."""
+    return feed.fitted(pin_key, shape, gguf_layer=gguf_layer)
 
 
 def _feed_state(config, feed, keys, seed=0):
-    """Tiny random ref state with `keys` overwritten by feed-sliced real
+    """Tiny random ref state with `keys` overwritten by feed-narrowed real
     tensors. Returns (ref, pin) both loaded with that state."""
     ref = tb._build_ref(config, seed=seed)
     sd = ref.state_dict()
     for pin_key in keys:
-        rows = sd[pin_key].shape[0] if sd[pin_key].ndim >= 1 else None
-        arr = feed.pin_tensor(pin_key, rows=rows)
         sd[pin_key] = torch.from_numpy(
-            np.ascontiguousarray(_fit(arr, tuple(sd[pin_key].shape)))
+            _fit(feed, pin_key, tuple(sd[pin_key].shape))
         ).to(sd[pin_key].dtype)
     ref.load_state_dict(sd)
     pin = pin_mod.Qwen4ExpTextModel(config).eval()
@@ -181,6 +182,49 @@ def test_moe_gate_up_fuse_reference(feed):
 
 
 @_skip
+def test_fused_gate_up_narrowing_takes_true_halves(feed):
+    """FIX D (REVIEW 2cd2b2f finding D): narrowing the fused `gate_up_proj` to a
+    smaller fixture must take TRUE HALVES at the real ff.
+
+    The old code sliced `pin_tensor`'s [E, 2*ff_real, in] result by leading
+    index. With ff_real=640 and a tiny target of 2*32, that leading slice never
+    reaches the up half at all -- the measured failure was
+
+        tiny 'up' half == real up  [0:32]  : False
+        tiny 'up' half == real GATE[32:64] : True
+
+    so `ffn_up_exps` never entered the tiny fed state through this key at all.
+    `GgufFeed.fitted` now cuts each half at the real ff before the concat, and
+    the callers use it instead of slicing by hand -- which is what makes the old
+    failure unreachable rather than merely repaired. Asserted here against the
+    real geometry (ff_real) AND against the old wrong answer."""
+    ff_real = feed.dequant("blk.0.ffn_gate_exps.weight", rows=1).shape[1]
+    ff_t = 32                              # the tiny config's moe_intermediate_size
+    E, IN = 2, 16
+    assert ff_real == 640, f"real expert ff moved: {ff_real} (re-read finding D)"
+    assert ff_t < ff_real, "this cell only bites when the target is NARROWER"
+
+    got = feed.fitted("layers.0.mlp.experts.gate_up_proj", (E, 2 * ff_t, IN))
+    gate = feed.dequant("blk.0.ffn_gate_exps.weight", rows=E)[:, :, :IN]
+    up = feed.dequant("blk.0.ffn_up_exps.weight", rows=E)[:, :, :IN]
+
+    gate_ok = np.array_equal(got[:, :ff_t], gate[:, :ff_t])
+    up_ok = np.array_equal(got[:, ff_t:], up[:, :ff_t])
+    # the OLD answer: a leading slice of the concat -> both halves out of gate
+    old_wrong = np.array_equal(got[:, ff_t:], gate[:, ff_t:2 * ff_t])
+    print(f"\n[fused-halves] ff_real={ff_real} tiny_ff={ff_t}  shape={list(got.shape)}  "
+          f"gate-half-from-gate={gate_ok}  up-half-from-UP={up_ok}  "
+          f"up-half-from-gate[{ff_t}:{2*ff_t}](the old bug)={old_wrong}")
+    assert gate_ok, "gate half is not gate[:ff]"
+    assert up_ok, "up half is not up[:ff] -- the fused narrowing is still wrong"
+    assert not old_wrong, "up half still equals gate's second block (FIX D regressed)"
+
+    # and the guard that makes an over-wide request a named error, not silence
+    with pytest.raises(ValueError):
+        feed.fitted("layers.0.mlp.experts.gate_up_proj", (E, 2 * (ff_real + 1), IN))
+
+
+@_skip
 def test_gdn_layer_feed_transcription(feed):
     """Slice cell: all GDN (linear_attn) weights of layer 0 fed from GGUF."""
     tb._assert_pin()
@@ -223,14 +267,24 @@ def test_ple_feed_transcription(feed):
 @_skip
 def test_backbone_assembled_from_feed(feed):
     """Assembly cell (Phase B step 3): the WHOLE tiny backbone loaded from
-    gguf_feed tensors -- every weight fed from the real GGUF, sliced to the tiny
-    config. GDN/MoE/hc keys are fed from a real GDN block (blk.0); PLE from the
-    real PLE block (blk.1); globals from token_embd / output_hc_*. Two legs:
+    gguf_feed tensors.
+
+    WHAT THIS ACTUALLY COVERS (reworded under FIX D; the old framing said "on
+    real weights" and left the geometry implicit): every weight is a REAL GGUF
+    tensor NARROWED to the tiny config's geometry -- a leading-index cut on each
+    axis, and true gate|up halves on the fused expert tensor. That is real
+    BYTES through the real name map, not the real model's geometry: 2 of 512
+    experts, ff 32 of 640, hidden 16 of 2560, vocab 257 of 248320, 4 layers of
+    48. What it gates is the name map, the reshapes/fusion and the assembly
+    wiring; what it does NOT gate is anything that only appears at full width.
+
+    GDN/MoE/hc keys are fed from a real GDN block (blk.0); PLE from the real PLE
+    block (blk.1); globals from token_embd / output_hc_*. Two legs:
     transcription-vs-pin (ref vs pin on the SAME fed tensors) = 0.0 exactly (the
-    required parity leg), plus OV build_backbone vs ref REPORTED (on real weights
-    the divergence is a few-token OV-emission numerics effect, not the random-
-    weight 1e-5 floor -- see the asserts). Small-config only -- full 48-layer
-    full-width residency is window territory."""
+    required parity leg), plus OV build_backbone vs ref REPORTED (at real weight
+    magnitudes the divergence is a few-token OV-emission numerics effect, not the
+    random-weight 1e-5 floor -- see the asserts). Full 48-layer full-width
+    residency is window territory."""
     from q4e.backbone import build_backbone
     tb._assert_pin()
     config = tb._make_config()
@@ -244,10 +298,8 @@ def test_backbone_assembled_from_feed(feed):
             gl = 1 if ".ple." in k else 0  # ple from blk.1, GDN/MoE/hc from blk.0
         else:
             gl = None
-        rows = sd[k].shape[0] if sd[k].ndim >= 1 else None
-        arr = feed.pin_tensor(k, rows=rows, gguf_layer=gl)
         sd[k] = torch.from_numpy(
-            np.ascontiguousarray(_fit(arr, tuple(sd[k].shape)))).to(sd[k].dtype)
+            _fit(feed, k, tuple(sd[k].shape), gguf_layer=gl)).to(sd[k].dtype)
         fed += 1
     ref.load_state_dict(sd)
     pin = pin_mod.Qwen4ExpTextModel(config).eval()
@@ -337,8 +389,6 @@ def test_declared_head_fixture_feeds_output_weight(feed):
       3. RED GUARD -- dropping `lm_head.weight` from the state (the pin's tie)
          changes the OV logits materially. Without this leg, an emitter that
          ignored the fed head would still pass leg 2 only by accident."""
-    import hashlib
-
     from q4e.backbone import build_backbone
     tb._assert_pin()
     config = tb._make_config()
@@ -351,10 +401,8 @@ def test_declared_head_fixture_feeds_output_weight(feed):
         if any(k.endswith(s) for s in gguf_feed._DERIVED_SUFFIXES):
             continue
         gl = (1 if ".ple." in k else 0) if k.startswith("layers.") else None
-        rows = sd[k].shape[0] if sd[k].ndim >= 1 else None
-        arr = feed.pin_tensor(k, rows=rows, gguf_layer=gl)
         sd[k] = torch.from_numpy(
-            np.ascontiguousarray(_fit(arr, tuple(sd[k].shape)))).to(sd[k].dtype)
+            _fit(feed, k, tuple(sd[k].shape), gguf_layer=gl)).to(sd[k].dtype)
         fed += 1
     ref.load_state_dict(sd)
 
@@ -403,7 +451,6 @@ def test_declared_head_fixture_feeds_output_weight(feed):
     assert tie_gap > 1e-3, (
         f"tied fallback gives the same logits as the fed head ({tie_gap:.3e}) -- "
         "the head wiring is not observable, so this cell gates nothing")
-
 
 # --- FIX A: the name map's OWN gate (test-side names, the map bypassed) ----- #
 #
