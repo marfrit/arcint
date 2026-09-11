@@ -105,9 +105,14 @@ def _make_config():
     )
 
 
-def _build_ref(config, seed=0):
+def _build_ref(config, seed=0, declare_lm_head=False):
+    """Random tiny reference. `declare_lm_head=True` registers the SEPARATE
+    head (`lm_head.weight`) the shipped checkpoint ships as `output.weight` --
+    the pin TextModel has no such key, so any leg that loads this state dict
+    into the pin must drop it (see test_gguf_feed's declared-head cell)."""
     torch.manual_seed(seed)
-    ref = ref_backbone.Qwen4ExpTextBackbone(config).eval()
+    ref = ref_backbone.Qwen4ExpTextBackbone(
+        config, declare_lm_head=declare_lm_head).eval()
     with torch.no_grad():
         for p in ref.parameters():
             p.normal_(0.0, 0.05)
@@ -292,6 +297,58 @@ def test_backbone_ov_parity_interior_mask_hole(device):
     max_abs = float(np.max(np.abs(y_ref - y_ov)))
     print(f"\n[backbone-ov-parity-interior-hole] device={device:<6} T={T}  hole=[18:30)  max-abs(logits)={max_abs:.3e}")
     assert max_abs < 1e-5, f"backbone interior-hole parity failed device={device}: {max_abs:.3e}"
+
+
+def test_backbone_head_declared_vs_tied_fallback():
+    """The head wiring, device-free (FIX B, the fallback half).
+
+    `build_backbone` takes `state["lm_head.weight"]` when the state provides one
+    and falls back to the pin's tie to `embed_tokens` (pin 1593) only when it is
+    absent. Both halves are asserted here on random weights, so the wiring is
+    covered without the real shards:
+      * declared head -> OV logits match `ref.logits` (which applies the head,
+        pin 1669) AND differ from the tied emission;
+      * no head in the state -> OV logits match the tie exactly.
+    The real-weights half (fed from the checkpoint's `output.weight`, which is
+    NOT tied -- measured) is `test_declared_head_fixture_feeds_output_weight`
+    in test_gguf_feed.py."""
+    _assert_pin()
+    config = _make_config()
+    T = 48
+    torch.manual_seed(11)
+    ids = torch.randint(1, config.vocab_size, (1, T))
+    mask = torch.ones(1, T)
+
+    # -- declared head -------------------------------------------------------
+    ref_h = _build_ref(config, seed=5, declare_lm_head=True)
+    state_h = _state_np(ref_h)
+    assert "lm_head.weight" in state_h
+    with torch.no_grad():
+        y_ref = ref_h.logits(ids, mask).float().numpy()
+    row_ids = _gen_row_ids(config, _ple_index(config), ids[0].tolist())
+    feed = {
+        "input_ids": ids.numpy().astype(np.int64),
+        "ngram_row_ids": row_ids,
+        "conv_mask": mask.numpy().astype(np.float32),
+    }
+    y_ov = _run_ov(build_backbone(config, state_h, seq_len=T), feed, "CPU")
+    head_err = float(np.max(np.abs(y_ref - y_ov)))
+
+    # -- tied fallback (same weights, head key removed) ----------------------
+    tied_state = {k: v for k, v in state_h.items() if k != "lm_head.weight"}
+    y_tied = _run_ov(build_backbone(config, tied_state, seq_len=T), feed, "CPU")
+    with torch.no_grad():
+        h = ref_h(ids, mask)
+        y_tie_ref = (h @ ref_h.embed_tokens.weight.t()).float().numpy()
+    tie_err = float(np.max(np.abs(y_tie_ref - y_tied)))
+    gap = float(np.max(np.abs(y_ov - y_tied)))
+
+    print(f"\n[backbone-head] declared: OV-vs-ref={head_err:.3e}   "
+          f"fallback: OV-vs-tied-ref={tie_err:.3e}   declared-vs-tied gap={gap:.3e}")
+    assert head_err < 1e-5, f"declared head not emitted: {head_err:.3e}"
+    assert tie_err < 1e-5, f"tied fallback drifted: {tie_err:.3e}"
+    assert gap > 1e-3, (
+        f"declared and tied emissions coincide ({gap:.3e}) -- the cell gates nothing")
 
 
 def test_transcription_matches_pin():

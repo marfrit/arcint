@@ -1,6 +1,22 @@
 """OV opset-13 emission of a small-but-complete qwen4_exp text backbone (E2
 inc5b, the assembly capstone): embed -> repeat(hc) -> N decoder layers ->
-final hyper_connection_mixer (use_combine=False) -> tied lm_head -> logits.
+final hyper_connection_mixer (use_combine=False) -> lm_head -> logits.
+
+THE HEAD: PIN-vs-CHECKPOINT DIVERGENCE (measured 2026-09-11; reviewer finding B
+of REVIEW 2cd2b2f, reproduced independently -- the table is in
+`q4e/ref_backbone`'s header). The pin TIES the head to the embedding (pin 1593
+`_tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}`, applied
+pin 1669). THE SHIPPED UD-Q3_K_XL CHECKPOINT DOES NOT: its `output.weight`
+(Q6_K) and `token_embd.weight` (Q8_0) are independent tensors -- row-band mean
+cosine -0.0016 / +0.0028 / +0.0263 / +0.0150 across the vocab, where tied would
+be 1.0.
+
+THE SERVED WEIGHTS ARE THE TRUTH, so this emitter takes the head from
+`state["lm_head.weight"]` WHEN THE STATE PROVIDES IT, and falls back to the
+pin's tie (`embed_tokens.weight`) only when it is absent -- which is the tiny
+random fixtures, and a genuinely tied checkpoint. Emitting the tie against this
+checkpoint would ship the wrong head; the fallback exists for sources that
+really are tied, not as a default for this one.
 
 Mirrors `tools/q4e/ref_backbone.Qwen4ExpTextBackbone.forward` (the transcription
 of Qwen4ExpTextModel.forward + Qwen4ExpTextDecoderLayer.forward, pin 1258-1497,
@@ -35,7 +51,7 @@ The per-layer composition (pin 1273-1310):
   hidden = hyper + (m.unsqueeze(-2) * inj.unsqueeze(-1)).flatten(-2)   pin 1308-9
 
 Inputs (static, batch 1, fixed T):
-  input_ids     [1, T]                    i64  (embedding lookup + tied lm_head)
+  input_ids     [1, T]                    i64  (embedding lookup; head per above)
   ngram_row_ids [1, T, num_ngram_heads]   i64  (fed PLE index -- see ple.py)
   conv_mask     [1, T]                    f32  (GDN + PLE mask; ones = full seq)
 Result: logits [1, T, vocab_size] f32.
@@ -111,8 +127,12 @@ def build_backbone(config, state, seq_len):
 
     # pin 1493: final hyper_connection_mixer (use_combine=False) -> [1,T,H]
     final = emit_hc(hidden, config, _sub(state, "hyper_connection_mixer."), T)
-    # ForCausalLM: logits = lm_head(final); lm_head.weight tied to embed_tokens
-    logits = _mm(final, _c(embed_w), tb=True)                 # [1,T,vocab]
+    # pin 1669: logits = lm_head(final). The served weights are the truth -- a
+    # fed `lm_head.weight` (GGUF output.weight) wins; the pin's tie to
+    # embed_tokens (pin 1593) is the fallback for sources that ship no head.
+    # See the module header: the shipped checkpoint is NOT tied.
+    head_w = state.get("lm_head.weight", embed_w)             # [vocab, H]
+    logits = _mm(final, _c(head_w), tb=True)                  # [1,T,vocab]
 
     res = op.result(logits)
     res.set_friendly_name("logits")

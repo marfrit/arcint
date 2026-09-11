@@ -25,6 +25,15 @@ resolved from the file's arch string). Resolved and cross-checked against the
 shipped UD-Q3_K_XL tensor list; the qwen4exp-only families (hyper-connection
 mixers, PLE) are not in QWEN35MOE and are mapped by name/shape below.
 
+THE HEAD IS NOT TIED IN THIS CHECKPOINT (measured 2026-09-11; reviewer finding B
+of REVIEW 2cd2b2f, reproduced independently). The pin declares the head tied to
+the embedding (pin 1593 `_tied_weights_keys`); the shipped UD-Q3_K_XL ships
+`output.weight` (Q6_K) AND `token_embd.weight` (Q8_0) as independent tensors --
+row-band mean cosine -0.0016 / +0.0028 / +0.0263 / +0.0150, where tied would be
+1.0 (full table in `q4e.ref_backbone`'s header). `lm_head.weight` is therefore a
+mapped global key here, and `has_lm_head()` reports whether a source declares
+one; the pin's tie is the fallback for sources that do not.
+
 GGUF 2D tensors come back from gguf-py already in pytorch [out, in] / [vocab,
 hidden] order (its `ReaderTensor.data` is shaped [ne1, ...], ne0 the inner
 quant dim), so 2D linears/embeddings need NO transpose. Reshapes that DO apply
@@ -60,6 +69,9 @@ def _require_gguf():
             "model directory on sys.path) resolves without GGUFReader and is not it."
         )
 
+
+# The separate LM head, when the source declares one (see _GLOBAL_MAP).
+_LM_HEAD = "output.weight"
 
 # --- pin-key-suffix -> (gguf name / names, reshape kind) ---------------------
 # Per-decoder-layer keys, relative to "layers.{i}." ; {i} -> blk.{i} in GGUF.
@@ -115,6 +127,12 @@ _GLOBAL_MAP = {
     "hyper_connection_mixer.hc_norm.weight": ("output_hc_norm.weight", "vec"),
     "hyper_connection_mixer.input_mix_weight_down.weight": ("output_hc_down.weight", "direct2d"),
     "hyper_connection_mixer.input_mix_weight_up.weight": ("output_hc_up.weight", "direct2d"),
+    # The LM head. PIN-vs-CHECKPOINT DIVERGENCE (measured; module header): the
+    # pin ties lm_head to embed_tokens, the shipped UD-Q3_K_XL does NOT -- it
+    # carries an independent output.weight (Q6_K) next to token_embd (Q8_0).
+    # Mapped here so the served head reaches the emitter; `has_lm_head()` says
+    # whether a given source declares one at all.
+    "lm_head.weight": (_LM_HEAD, "direct2d"),
 }
 
 # The pin ple_embedding.ngram_embedding.weight is a slice of this global table.
@@ -183,6 +201,16 @@ class GgufFeed:
 
     def gguf_type(self, gguf_name):
         return self._index[gguf_name].tensor_type.name
+
+    def has_lm_head(self):
+        """Does this source ship a SEPARATE lm_head (GGUF `output.weight`)?
+
+        The pin ties the head to the embedding (pin 1593); the shipped
+        UD-Q3_K_XL does not (measured -- see the module header of
+        `q4e.ref_backbone`). A caller building a state dict asks this to decide
+        between feeding `lm_head.weight` and leaving the tie in place; there is
+        no silent default, because guessing wrong ships the wrong head."""
+        return self.has(_LM_HEAD)
 
     def dequant(self, gguf_name, rows=None):
         if gguf_name not in self._index:

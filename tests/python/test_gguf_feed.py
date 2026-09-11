@@ -277,3 +277,117 @@ def test_backbone_assembled_from_feed(feed):
     # name-map/wiring gate. Only a gross-breakage sanity bound is asserted here.
     assert ov_max < 1e-2, f"OV assembly grossly diverges on fed weights: {ov_max:.3e}"
     assert np.median(per_row) < 1e-5, f"OV divergence is not token-confined: {np.median(per_row):.3e}"
+
+
+# --- the head: pin-vs-checkpoint divergence (FIX B) ------------------------- #
+@_skip
+def test_lm_head_is_not_tied_in_this_checkpoint(feed):
+    """THE PIN TIES THE HEAD; THIS CHECKPOINT DOES NOT (the measurement, run as
+    a cell so the claim cannot rot).
+
+    Pin 1593: `_tied_weights_keys = {"lm_head.weight": "model.embed_tokens.
+    weight"}`. The shipped UD-Q3_K_XL carries `output.weight` (Q6_K) AND
+    `token_embd.weight` (Q8_0) as INDEPENDENT tensors: row-band cosine sits at
+    the random-vector floor where a tie would give 1.0. Reported per band; the
+    gate is that no band looks tied."""
+    assert feed.has_lm_head(), "this checkpoint declares no output.weight"
+    print(f"\n[head-tie] token_embd={feed.gguf_type('token_embd.weight')}  "
+          f"output={feed.gguf_type('output.weight')}")
+    worst = 0.0
+    for lo in (0, 1000, 100000, 248000):
+        n = 64
+        emb = feed.dequant("token_embd.weight", rows=lo + n)[lo:lo + n]
+        out = feed.dequant("output.weight", rows=lo + n)[lo:lo + n]
+        cos = (emb * out).sum(1) / np.maximum(
+            np.linalg.norm(emb, axis=1) * np.linalg.norm(out, axis=1), 1e-30)
+        print(f"[head-tie] rows {lo}:{lo+n}  |embd|={np.linalg.norm(emb, axis=1).mean():.4f}  "
+              f"|out|={np.linalg.norm(out, axis=1).mean():.4f}  "
+              f"mean-cos={cos.mean():+.5f}  max-cos={cos.max():+.3f}")
+        worst = max(worst, float(np.abs(cos).max()))
+    # Tied => every |cos| == 1. The gate is generous on purpose: anything near
+    # 1 would mean the head IS a duplicate and the fallback is the right wiring.
+    assert worst < 0.5, (
+        f"max |cos| {worst:.3f} across bands looks TIED -- if this checkpoint "
+        "changed, the head wiring (q4e.backbone) must be revisited")
+
+
+@_skip
+def test_declared_head_fixture_feeds_output_weight(feed):
+    """DECLARED-HEAD FIXTURE (new with FIX B; the absence of one is what hid the
+    wrong head). Every prior fixture declares no head at all, so no cell could
+    see the head wiring -- the tiny config's parity legs were 0.0 *because* both
+    sides tied, not because the head was right.
+
+    This cell builds the tiny model WITH a head, feeds it from the real
+    `output.weight`, and checks three things:
+      1. the fed head is NOT the fed embedding (hash + max-abs divergence);
+      2. OV `build_backbone` reproduces the ref's fed-head logits;
+      3. RED GUARD -- dropping `lm_head.weight` from the state (the pin's tie)
+         changes the OV logits materially. Without this leg, an emitter that
+         ignored the fed head would still pass leg 2 only by accident."""
+    import hashlib
+
+    from q4e.backbone import build_backbone
+    tb._assert_pin()
+    config = tb._make_config()
+    ref = tb._build_ref(config, declare_lm_head=True)
+    sd = ref.state_dict()
+    assert "lm_head.weight" in sd, "fixture did not declare a head"
+
+    fed = 0
+    for k in list(sd):
+        if any(k.endswith(s) for s in gguf_feed._DERIVED_SUFFIXES):
+            continue
+        gl = (1 if ".ple." in k else 0) if k.startswith("layers.") else None
+        rows = sd[k].shape[0] if sd[k].ndim >= 1 else None
+        arr = feed.pin_tensor(k, rows=rows, gguf_layer=gl)
+        sd[k] = torch.from_numpy(
+            np.ascontiguousarray(_fit(arr, tuple(sd[k].shape)))).to(sd[k].dtype)
+        fed += 1
+    ref.load_state_dict(sd)
+
+    # 1. the served head is an independent tensor, not the embedding
+    emb_np = sd["embed_tokens.weight"].numpy()
+    head_np = sd["lm_head.weight"].numpy()
+    h_emb = hashlib.sha256(np.ascontiguousarray(emb_np).tobytes()).hexdigest()
+    h_head = hashlib.sha256(np.ascontiguousarray(head_np).tobytes()).hexdigest()
+    div = float(np.max(np.abs(emb_np - head_np)))
+    print(f"\n[declared-head] {fed} keys fed  embed-sha={h_emb[:16]}  "
+          f"head-sha={h_head[:16]}  max-abs(head-embed)={div:.3e}")
+    assert h_head != h_emb, "fed head is byte-identical to the embedding"
+    assert div > 0.0, "fed head does not diverge from the embedding"
+
+    # the transcription leg still holds on the shared (headless) keys
+    pin = pin_mod.Qwen4ExpTextModel(config).eval()
+    pin.load_state_dict({k: v for k, v in sd.items() if not k.startswith("lm_head.")})
+    md = _transcription_vs_pin(ref, pin)
+    print(f"[declared-head] transcription-vs-pin (head-free keys)={md:.3e}")
+    assert md == 0.0, md
+
+    # 2. OV emits the FED head
+    T = 64
+    torch.manual_seed(500 + T)
+    ids = torch.randint(1, config.vocab_size, (1, T))
+    mask = torch.ones(1, T)
+    with torch.no_grad():
+        y_ref = ref.logits(ids, mask).float().numpy()
+    row_ids = tb._gen_row_ids(config, tb._ple_index(config), ids[0].tolist())
+    state = {k: v.detach().cpu().numpy() for k, v in ref.state_dict().items()}
+    feed_in = {
+        "input_ids": ids.numpy().astype(np.int64),
+        "ngram_row_ids": row_ids,
+        "conv_mask": mask.numpy().astype(np.float32),
+    }
+    y_ov = tb._run_ov(build_backbone(config, state, seq_len=T), feed_in, "CPU")
+    ov_max = float(np.max(np.abs(y_ref - y_ov)))
+
+    # 3. RED GUARD: the tie is a DIFFERENT model on this checkpoint
+    tied_state = {k: v for k, v in state.items() if k != "lm_head.weight"}
+    y_tied = tb._run_ov(build_backbone(config, tied_state, seq_len=T), feed_in, "CPU")
+    tie_gap = float(np.max(np.abs(y_ov - y_tied)))
+    print(f"[declared-head] OV-vs-ref(fed head)={ov_max:.3e}   "
+          f"OV(fed head)-vs-OV(tied fallback)={tie_gap:.3e}")
+    assert ov_max < 1e-2, f"OV does not reproduce the fed-head logits: {ov_max:.3e}"
+    assert tie_gap > 1e-3, (
+        f"tied fallback gives the same logits as the fed head ({tie_gap:.3e}) -- "
+        "the head wiring is not observable, so this cell gates nothing")

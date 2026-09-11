@@ -274,12 +274,19 @@ def gguf_fed_state(config, feed):
     derived / non-fed buffers keep the pin's config-recomputed values. GDN/MoE/hc
     keys are fed from a real GDN block (blk.0), PLE from the real PLE block
     (blk.1) -- the tiny config declares layers GDN that the real model may ship
-    as QSA, so a slice cell feeds from a real GDN block."""
+    as QSA, so a slice cell feeds from a real GDN block.
+
+    THE HEAD follows the source, not the pin: when the GGUF declares a separate
+    `output.weight` (the shipped UD-Q3_K_XL does -- it is NOT tied, measured;
+    see `q4e.ref_backbone`'s header) the state dict carries `lm_head.weight` fed
+    from it, and `q4e.backbone` emits that head. Only a source WITHOUT a head
+    falls back to the pin's tie to `embed_tokens`."""
     import numpy as np
     import torch
     from q4e import ref_backbone, gguf_feed as _gf
 
-    ref = ref_backbone.Qwen4ExpTextBackbone(config)
+    ref = ref_backbone.Qwen4ExpTextBackbone(
+        config, declare_lm_head=feed.has_lm_head())
     sd = ref.state_dict()
     state = {}
     for k, v in sd.items():
