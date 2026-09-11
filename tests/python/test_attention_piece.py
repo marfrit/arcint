@@ -57,8 +57,11 @@ as indexer.q_proj [512, 2560] + indexer.k_proj [128, 2560]; 512 + 128 = 640 =
 5 x 128 only at n_heads=4. `test_indexer_head_count_is_four_or_the_pin_cannot_
 load_it` asserts both directions.
 
-Every cell re-hashes the oracle before it measures. CPU only; no card is
-touched by this file.
+Every cell re-hashes the oracle before it measures. CPU by default and no card
+is touched; `Q4E_GPU=GPU.0,GPU.1` adds the device legs, which require the card to
+be FREE (a resident arcint service holds all of its VRAM) and which pin
+INFERENCE_PRECISION_HINT f32 and print the precision the plugin actually used --
+see tests/python/q4e_device.py for why an unconfigured GPU compile runs f16.
 """
 import glob
 import hashlib
@@ -73,8 +76,10 @@ import torch
 # tools/ on the path so `import q4e` resolves to tools/q4e/.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "tools"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import openvino as ov  # noqa: E402
+from q4e_device import compile_for, device_params, effective_precision  # noqa: E402
 from transformers.models.qwen4_exp import modeling_qwen4_exp as pin_mod  # noqa: E402
 
 from q4e import attention as qattn  # noqa: E402
@@ -205,8 +210,12 @@ def _hidden(cfg, T):
     return (torch.randn(1, T, cfg.hidden_size, generator=g) * 0.02).float()
 
 
-def _run_ov(model, args):
-    return np.asarray(ov.Core().compile_model(model, "CPU")(args)[0])
+def _run_ov(model, args, device="CPU"):
+    """compile_for, never a bare compile_model: on a GPU device the plugin
+    defaults INFERENCE_PRECISION_HINT to f16 and the parity floors here live at
+    1e-7 (see tests/python/q4e_device.py)."""
+    compiled = compile_for(ov.Core(), model, device)
+    return np.asarray(compiled(args)[0]), effective_precision(compiled)
 
 
 # --------------------------------------------------------------------------- #
@@ -372,9 +381,10 @@ def test_qsa_price_is_zero_below_the_budget(cfg, attn_state, indexer_state, T):
 # 4. THE PARITY LEG: the emitted piece against the pin's REAL QSA path
 # --------------------------------------------------------------------------- #
 @_skip_shards
+@pytest.mark.parametrize("device", device_params())
 @pytest.mark.parametrize("T", [64, 96])
 def test_dense_attention_piece_parity_real_weights(cfg, attn_state,
-                                                   indexer_state, T):
+                                                   indexer_state, T, device):
     """Real width (H=2560, heads 24, kv 2, head_dim 256, rotary 64), real fed
     tensors, the emitted OV piece vs the pin WITH ITS REAL QSA INDEXER.
 
@@ -382,12 +392,17 @@ def test_dense_attention_piece_parity_real_weights(cfg, attn_state,
     exactly (cell 3 proves it independently), so this is equality-shaped
     against the thing that actually ships, floored by the pin's own f32-vs-f64
     rounding. Two gates, in this order: the yardstick must be sound, and only
-    then may the emitter be judged against it."""
+    then may the emitter be judged against it.
+
+    The GPU legs run only when Q4E_GPU names a device AND the card is free (a
+    resident service holds all of its VRAM). They carry
+    INFERENCE_PRECISION_HINT f32 and PRINT the precision the compiled model
+    reports, so a leg cannot claim f32 while the plugin ran f16."""
     hidden = _hidden(cfg, T)
     pid = np.arange(T, dtype=np.int64).reshape(1, T)
 
     model = qattn.build_dense_attention_model(cfg, attn_state, T)
-    ov_out = _run_ov(model, [hidden.numpy(), pid])
+    ov_out, prec = _run_ov(model, [hidden.numpy(), pid], device)
 
     qsa32 = _pin_attention(cfg, attn_state, indexer_state, False, torch.float32)
     dense64 = _pin_attention(cfg, attn_state, indexer_state, True, torch.float64)
@@ -406,15 +421,20 @@ def test_dense_attention_piece_parity_real_weights(cfg, attn_state,
     ratio = d_ov64 / yardstick if yardstick > 0 else float("inf")
     closer = "OV" if d_ov64 < yardstick else "pin-f32"
     sys.stdout.write(
-        f"\n[attn-parity] T={T}  |ov-pinQSA32| {d_ov32:.3e}  |ov-pin64| "
-        f"{d_ov64:.3e}  |pin32-pin64| {yardstick:.3e}  median-row {med:.3e}  "
-        f"ratio {ratio:.1f}x  closer-to-f64 {closer}\n")
+        f"\n[attn-parity] dev={device} prec={prec} T={T}  |ov-pinQSA32| "
+        f"{d_ov32:.3e}  |ov-pin64| {d_ov64:.3e}  |pin32-pin64| "
+        f"{yardstick:.3e}  median-row {med:.3e}  ratio {ratio:.1f}x  "
+        f"closer-to-f64 {closer}\n")
 
+    if device.upper().startswith("GPU"):
+        assert "f32" in prec or "float32" in prec, (
+            f"{device} compiled at {prec}, not f32 -- the floors below are "
+            "meaningless at f16; fix the compile config before reading them")
     assert yardstick <= _YARDSTICK_CEILING, (
         f"the f32 PIN itself drifted from f64 ({yardstick:.3e}) -- the "
         "yardstick is broken, stop")
     assert d_ov64 <= _FLOOR_FACTOR * yardstick, (
-        f"T={T}: emitter is {ratio:.0f}x the pin's own f32 rounding "
+        f"T={T} on {device}: emitter is {ratio:.0f}x the pin's own f32 rounding "
         f"({d_ov64:.3e} vs {yardstick:.3e}) -- not at the float floor")
 
 
@@ -422,17 +442,19 @@ def test_dense_attention_piece_parity_real_weights(cfg, attn_state,
 # 5. graph cost of the piece, reported (no threshold: the window budgets it)
 # --------------------------------------------------------------------------- #
 @_skip_shards
-def test_dense_attention_piece_graph_cost(cfg, attn_state):
+@pytest.mark.parametrize("device", device_params())
+def test_dense_attention_piece_graph_cost(cfg, attn_state, device):
     import time
     T = 64
     model = qattn.build_dense_attention_model(cfg, attn_state, T)
     nodes, const_bytes, counts = pwe.graph_measures(model)
     t0 = time.time()
-    ov.Core().compile_model(model, "CPU")
+    compile_for(ov.Core(), model, device)
     compile_s = time.time() - t0
     top = sorted(counts.items(), key=lambda kv: -kv[1])[:8]
     sys.stdout.write(
-        f"\n[attn-cost] T={T} nodes={nodes} const_bytes={const_bytes} "
-        f"({const_bytes / 1024**3:.3f} GiB) compile={compile_s:.2f}s\n"
+        f"\n[attn-cost] dev={device} T={T} nodes={nodes} "
+        f"const_bytes={const_bytes} ({const_bytes / 1024**3:.3f} GiB) "
+        f"compile={compile_s:.2f}s\n"
         f"[attn-cost]   {', '.join(f'{k} {v}' for k, v in top)}\n")
     assert nodes > 0 and const_bytes > 0

@@ -49,8 +49,10 @@ import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "tools"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import openvino as ov  # noqa: E402
+from q4e_device import compile_for, device_params  # noqa: E402
 from transformers.models.qwen4_exp import configuration_qwen4_exp as pin_cfg  # noqa: E402
 from transformers.models.qwen4_exp import modeling_qwen4_exp as pin_mod  # noqa: E402
 
@@ -114,11 +116,9 @@ def _state_np(module) -> dict:
 
 
 def _device_params():
-    devs = ["CPU"]
-    extra = os.environ.get("Q4E_GPU", "").strip()
-    if extra:
-        devs += [d for d in (s.strip() for s in extra.split(",")) if d]
-    return devs
+    # Shared with every other q4e suite; see tests/python/q4e_device.py for why
+    # the GPU legs must also carry INFERENCE_PRECISION_HINT f32.
+    return device_params()
 
 
 def _kld(p_logits, q_logits):
@@ -299,7 +299,7 @@ def test_ple_ov_parity(device, T):
     my = _gen_row_ids(config, 1, ids[0].tolist())  # [1,T,Hn] np.int64
 
     model = build_ple_model(config, state, seq_len=T)
-    compiled = ov.Core().compile_model(model, device)
+    compiled = compile_for(ov.Core(), model, device)
     out = compiled({"hidden_states": hs.float().numpy(),
                     "ngram_row_ids": my.astype(np.int64)})
     y_ov = out[compiled.outputs[0]]
@@ -334,7 +334,7 @@ def test_ple_ov_parity_masked(device, T):
     my = _gen_row_ids(config, 1, ids[0].tolist())  # [1,T,Hn] np.int64
 
     model = build_ple_model(config, state, seq_len=T, with_mask=True)
-    compiled = ov.Core().compile_model(model, device)
+    compiled = compile_for(ov.Core(), model, device)
     out = compiled({"hidden_states": hs.float().numpy(),
                     "ngram_row_ids": my.astype(np.int64),
                     "conv_mask": mask.float().numpy()})

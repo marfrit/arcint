@@ -74,8 +74,10 @@ import torch
 # tools/ on the path so `import q4e` resolves to tools/q4e/.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "tools"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import openvino as ov  # noqa: E402
+from q4e_device import compile_for, device_params  # noqa: E402
 from transformers.models.qwen4_exp import configuration_qwen4_exp as pin_cfg  # noqa: E402
 from transformers.models.qwen4_exp import modeling_qwen4_exp as pin_mod  # noqa: E402
 
@@ -167,11 +169,9 @@ def _state_np(module) -> dict:
 
 
 def _device_params():
-    devs = ["CPU"]
-    extra = os.environ.get("Q4E_GPU", "").strip()
-    if extra:
-        devs += [d for d in (s.strip() for s in extra.split(",")) if d]
-    return devs
+    # Shared with every other q4e suite; see tests/python/q4e_device.py for why
+    # the GPU legs must also carry INFERENCE_PRECISION_HINT f32.
+    return device_params()
 
 
 def _kld(p_logits: np.ndarray, q_logits: np.ndarray) -> float:
@@ -241,7 +241,7 @@ def test_combine_ov_parity(device, T):
 
     model = build_combine_model(config, state, seq_len=T)
     core = ov.Core()
-    compiled = core.compile_model(model, device)
+    compiled = compile_for(core, model, device)
     out = compiled({"hyper_input": x.float().numpy()})
     y_ov = tuple(
         out[compiled.outputs[i]] for i in range(len(compiled.outputs))
@@ -315,7 +315,7 @@ def test_combine_ov_parity_masked(device, T):
 
     model = build_combine_model(config, state, seq_len=T)
     core = ov.Core()
-    compiled = core.compile_model(model, device)
+    compiled = compile_for(core, model, device)
     out = compiled({"hyper_input": x_masked.float().numpy()})
     y_ov = tuple(out[compiled.outputs[i]] for i in range(len(compiled.outputs)))
 

@@ -223,7 +223,17 @@ def logits_from_ir(model_dir, token_ids, device="CPU"):
         xml = model_dir
     core = ov.Core()
     model = core.read_model(xml)
-    compiled = core.compile_model(model, device)
+    # INFERENCE_PRECISION_HINT f32 on any GPU device. The Intel GPU plugin
+    # defaults this to float16 (measured, OV 2026.4 on both Arc cards:
+    # `core.get_property("GPU", "INFERENCE_PRECISION_HINT")` -> float16, while
+    # CPU reports float32), so an unconfigured GPU compile silently executes the
+    # graph in f16. A KLD gate at 0.0599 nats cannot be read off an f16 forward
+    # and be about the export. CPU is left alone -- it is already f32. Mirrors
+    # tests/python/q4e_device.py, which carries the full note; this module is
+    # product tooling and cannot import from tests/.
+    cfg = ({"INFERENCE_PRECISION_HINT": "f32"}
+           if str(device).upper().startswith("GPU") else {})
+    compiled = core.compile_model(model, device, cfg)
 
     ids = np.asarray(token_ids, dtype=np.int64).reshape(1, -1)
     T = ids.shape[1]
