@@ -8,12 +8,21 @@ checkpoint's tensors, write the multi-component IR layout arcint's
 loader expects -- bypassing `optimum-intel`'s export pipeline. This
 script owns the CLI plumbing, the config-and-tokenizer passthrough,
 and the sidecar `arcint.json` that carries the export-time knobs
-(`--moe-lowering`, `--rope`); `build_backbone_ir()` is the next
-increment.
+(`--moe-lowering`, `--rope`).
+
+`build_backbone_ir()` (E2 Phase C) builds the ov::Model from real GGUF weights
+(via `q4e.gguf_feed`) + the arcint-original opset-13 emitter (`q4e.backbone`),
+replacing the earlier unreachable full-safetensors-checkpoint path. A TINY config
+emits end to end on CPU (`--gguf-ir --dry-run`, artifact hash printed); the
+full-size 48-layer IR materialises the whole backbone and is WINDOW TERRITORY --
+refused here on CPU with a named reason.
 
 Usage:
-    python3 tools/export_qwen4_exp.py --checkpoint <ckpt-dir> \\
-        --out <out-dir> [--dry-run]
+    # config/tokenizer/sidecar passthrough (safetensors provenance path):
+    python3 tools/export_qwen4_exp.py --checkpoint <ckpt-dir> --out <out-dir> [--dry-run]
+    # tiny end-to-end backbone IR from GGUF weights (windowless dry-run):
+    python3 tools/export_qwen4_exp.py --gguf-ir --dry-run \\
+        --gguf-shards <shard-dir> --out <out-dir>
 
 The `<ckpt-dir>` is a local snapshot: `config.json`, `*.safetensors`,
 `chat_template.jinja`, `tokenizer.json` and `tokenizer_config.json` must
@@ -224,26 +233,107 @@ def write_output_layout(out_dir, checkpoint_dir, geometry, options,
 REFERENCE_COMMIT = "5b7dcb0d36c242d8d85920a81c564ef3a86ca6dd"
 
 
-def build_backbone_ir(out_dir, geometry, checkpoint_dir):
-    """Reconstruct the qwen4_exp backbone as an ov::Model and save it.
+# --- The gguf_feed + q4e.backbone emission path (E2 Phase C) ------------------
+# The backbone IR is now built from (real GGUF weights via q4e.gguf_feed) +
+# (the arcint-original opset-13 emitter q4e.backbone), NOT from a full HF
+# safetensors checkpoint (the "unreachable full checkpoint path" the earlier
+# NotImplementedError named). q4e.backbone / ref_backbone are already parity-
+# validated against the pin on random weights (E2 inc1-5b) AND on real GGUF
+# tensors (E2 Phase B: transcription-vs-pin 0.0 whole-backbone).
+#
+# BOUNDARY (windowless prep): a TINY config emits end to end on CPU -- that is
+# what `--gguf-ir --dry-run` does, and what this session records the artifact
+# hash of. FULL-SIZE emission (48 layers, hidden 2560, 512 experts) materialises
+# the whole backbone's weights and is WINDOW TERRITORY (both cards hold resident
+# services); this tool refuses it on CPU with a named reason rather than OOM the
+# host. The full-size IR is the window's job.
 
-    Refuses with a named reason until the arcint-original graph emission is
-    numerically validated against the pinned reference (see REFERENCE_COMMIT
-    and the module inventory above). The geometry carried in the message is
-    what the shim already produced, so a caller sees the surface reached, not
-    a generic KeyError. The acceptance instrument (KLD vs BF16, red-probed) is
-    landed in tools/kld_harness.py; the remaining surface is the per-module
-    emission + per-module numeric validation, not the gate.
-    """
-    raise NotImplementedError(
-        f"qwen4_exp backbone reconstruction not yet emitted ({ARCHITECTURE}). "
-        f"Reference pinned: transformers@{REFERENCE_COMMIT} "
-        "modeling_qwen4_exp.py. Config, tokenizer and sidecar passthrough "
-        "succeeded; the ov::Model graph (GatedResidual/QSA/PLE/GDN/MoE/MTP) "
-        "is the remaining surface, gated by tools/kld_harness.py. Geometry: "
-        f"n_layer={geometry.get('n_layer')} n_embd={geometry.get('n_embd')} "
-        f"num_experts={geometry.get('num_experts')}"
+# Mirrors tests/python/test_backbone._make_config (small-but-complete: 4 GDN
+# layers, PLE at ple_layer_ids [2], every layer MoE). Kept here so the dry-run
+# is self-contained (a tool does not import from tests/).
+def _tiny_config():
+    from transformers.models.qwen4_exp import configuration_qwen4_exp as pin_cfg
+    return pin_cfg.Qwen4ExpTextConfig(
+        hidden_size=16, num_hidden_layers=4, hc_count=4, hc_lowrank=8,
+        rms_norm_eps=1e-6, layer_types=["linear_attention"] * 4,
+        num_experts=8, num_experts_per_tok=2, norm_topk_prob=True,
+        moe_intermediate_size=32, shared_expert_intermediate_size=32,
+        hidden_act="silu",
+        linear_num_key_heads=2, linear_num_value_heads=4,
+        linear_key_head_dim=8, linear_value_head_dim=8, linear_conv_kernel_dim=4,
+        ple_layer_ids=[2], ngram_size=3, heads_per_ngram=2,
+        ngram_vocab_size_base=17, make_ngram_vocab_size_divisible_by=128,
+        ple_embed_dim=32, ple_conv_kernel_size=4, seed=1234,
+        vocab_size=257, eos_token_id=0, pad_token_id=0,
     )
+
+
+def gguf_fed_state(config, feed):
+    """Numpy state dict (pin state-dict keys -> arrays) for `config`, every
+    weight fed from the GGUF via q4e.gguf_feed and sliced to the config's shape;
+    derived / non-fed buffers keep the pin's config-recomputed values. GDN/MoE/hc
+    keys are fed from a real GDN block (blk.0), PLE from the real PLE block
+    (blk.1) -- the tiny config declares layers GDN that the real model may ship
+    as QSA, so a slice cell feeds from a real GDN block."""
+    import numpy as np
+    import torch
+    from q4e import ref_backbone, gguf_feed as _gf
+
+    ref = ref_backbone.Qwen4ExpTextBackbone(config)
+    sd = ref.state_dict()
+    state = {}
+    for k, v in sd.items():
+        shape = tuple(v.shape)
+        if any(k.endswith(s) for s in _gf._DERIVED_SUFFIXES):
+            state[k] = v.detach().cpu().numpy()
+            continue
+        gl = (1 if ".ple." in k else 0) if k.startswith("layers.") else None
+        rows = shape[0] if v.ndim >= 1 else None
+        arr = feed.pin_tensor(k, rows=rows, gguf_layer=gl)
+        sl = arr[tuple(slice(0, s) for s in shape)]
+        state[k] = np.ascontiguousarray(sl).astype(np.float32)
+    return state
+
+
+def build_backbone_ir(out_dir, geometry, shards, seq_len=64, tiny=False):
+    """Build the qwen4_exp backbone as an ov::Model from GGUF weights and save
+    it under `out_dir` (openvino_language_model.xml/.bin). Returns the sha256 of
+    the emitted .xml.
+
+    `tiny=True` uses the small end-to-end-CPU config (the dry-run). `tiny=False`
+    (full-size, from `geometry`) is refused here: the full backbone's residency
+    is window territory -- run it in a GPU window, not on the CPU export host.
+    """
+    if not tiny:
+        # Refuse before importing openvino/torch so the refusal stays device-free.
+        raise NotImplementedError(
+            "full-size qwen4_exp backbone IR emission is WINDOW TERRITORY "
+            f"(n_layer={geometry.get('n_layer')} n_embd={geometry.get('n_embd')} "
+            f"num_experts={geometry.get('num_experts')}): materialising the whole "
+            "backbone's weights will not fit the CPU export host. Use --gguf-ir "
+            "--dry-run for the tiny end-to-end emission; run the full IR in a "
+            "GPU window (both cards hold resident services)."
+        )
+
+    import hashlib
+    from pathlib import Path
+
+    import openvino as ov
+
+    from q4e import gguf_feed
+    from q4e.backbone import build_backbone
+
+    feed = gguf_feed.GgufFeed(shards)
+    config = _tiny_config()
+    state = gguf_fed_state(config, feed)
+    model = build_backbone(config, state, seq_len=seq_len)
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    xml = out / "openvino_language_model.xml"
+    ov.save_model(model, str(xml))
+    digest = hashlib.sha256(xml.read_bytes()).hexdigest()
+    return digest
 
 
 def load_config(checkpoint):
@@ -264,11 +354,24 @@ def load_config(checkpoint):
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--checkpoint", required=True,
+    ap.add_argument("--checkpoint",
                     help="local checkpoint directory containing config.json, "
-                    "the safetensors, chat_template.jinja and tokenizer.json")
+                    "the safetensors, chat_template.jinja and tokenizer.json "
+                    "(required unless --gguf-ir)")
     ap.add_argument("--out", required=True,
                     help="output directory for the arcint IR layout")
+    ap.add_argument("--gguf-ir", action="store_true",
+                    help="build the backbone IR from GGUF weights (q4e.gguf_feed "
+                    "+ q4e.backbone). With --dry-run: emit the TINY config's IR "
+                    "end to end on CPU and print its artifact hash (Phase C "
+                    "windowless prep). Without --dry-run: full-size, refused on "
+                    "CPU as window territory.")
+    ap.add_argument("--gguf-shards",
+                    help="GGUF shard directory or glob (with --gguf-ir). No "
+                    "default location is baked in (this repo is public).")
+    ap.add_argument("--seq-len", type=int, default=64,
+                    help="fixed sequence length for the emitted static backbone "
+                    "(with --gguf-ir).")
     ap.add_argument("--moe-lowering", dest="moe_lowering",
                     choices=("batched", "unrolled", "tiled"),
                     default="tiled",
@@ -289,6 +392,19 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+
+    if args.gguf_ir:
+        if not args.gguf_shards:
+            raise SystemExit("--gguf-ir requires --gguf-shards")
+        digest = build_backbone_ir(args.out, geometry={}, shards=args.gguf_shards,
+                                   seq_len=args.seq_len, tiny=args.dry_run)
+        mode = "tiny dry-run" if args.dry_run else "full-size"
+        print(f"gguf-ir ({mode}): openvino_language_model.xml under {args.out}")
+        print(f"artifact sha256: {digest}")
+        return 0
+
+    if not args.checkpoint:
+        raise SystemExit("--checkpoint is required unless --gguf-ir")
     cfg = load_config(args.checkpoint)
     geo = translate_config(cfg)
     options = {"moe_lowering": args.moe_lowering, "rope": args.rope}
@@ -301,7 +417,10 @@ def main(argv=None):
         return 0
 
     def writer(out, geometry, opts):
-        build_backbone_ir(out, geometry, args.checkpoint)
+        # Full-size backbone emission is window territory (build_backbone_ir
+        # refuses tiny=False on CPU); the weights come from GGUF via --gguf-shards
+        # in a GPU window, not from the safetensors checkpoint on the export host.
+        build_backbone_ir(out, geometry, shards=args.gguf_shards, tiny=False)
 
     write_output_layout(args.out, args.checkpoint, geo, options,
                         component_writer=writer)

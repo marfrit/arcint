@@ -84,12 +84,21 @@ def make_checkpoint(root, cfg=None, chat_template="TEMPLATE",
 
 class TestArgumentPlumbing(unittest.TestCase):
     def test_required_flags(self):
+        # --out is the only PARSE-level requirement; --checkpoint is optional at
+        # parse time (a second mode, --gguf-ir, does not use it) and its
+        # presence is enforced in main().
         with self.assertRaises(SystemExit):
             parse_args([])
         with self.assertRaises(SystemExit):
-            parse_args(["--out", "/tmp/x"])
+            parse_args(["--checkpoint", "/tmp/x"])  # missing --out
+        a = parse_args(["--out", "/tmp/x"])         # valid: checkpoint optional
+        self.assertIsNone(a.checkpoint)
+        self.assertFalse(a.gguf_ir)
+        # main() enforces the per-mode requirements.
         with self.assertRaises(SystemExit):
-            parse_args(["--checkpoint", "/tmp/x"])
+            main(["--out", "/tmp/x"])                    # no --checkpoint, no --gguf-ir
+        with self.assertRaises(SystemExit):
+            main(["--gguf-ir", "--out", "/tmp/x"])       # --gguf-ir needs --gguf-shards
 
     def test_defaults(self):
         a = parse_args(["--checkpoint", "/nowhere", "--out", "/tmp/out"])
@@ -271,18 +280,18 @@ class TestOutputLayout(unittest.TestCase):
         passthrough = set(PASSTHROUGH_FILES)
         self.assertTrue(passthrough <= required | {"tokenizer_config.json"})
 
-    def test_backbone_build_refuses_named_reason(self):
+    def test_backbone_build_refuses_full_size_as_window(self):
+        # E2 Phase B/C: the emitter EXISTS now (q4e.backbone from q4e.gguf_feed);
+        # the refusal is no longer "not yet emitted" -- it is that FULL-SIZE
+        # emission materialises the whole backbone and is window territory. The
+        # tiny end-to-end path (tiny=True / --gguf-ir --dry-run) is the CPU one.
         geo = translate_config(SYNTHETIC_CONFIG)
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(NotImplementedError) as cm:
-                build_backbone_ir(d, geo, "/no/such/checkpoint")
+                build_backbone_ir(d, geo, "/no/such/shards")  # tiny defaults False
         msg = str(cm.exception)
         self.assertIn("qwen4_exp", msg)
-        # WP5 pivot: the arcint-original emission no longer waits on the
-        # upstream optimum-intel watcher. The refusal now pins the reference
-        # commit it will read and names the acceptance gate (the KLD harness).
-        self.assertIn("kld_harness", msg)
-        self.assertIn(REFERENCE_COMMIT[:8], msg)
+        self.assertIn("WINDOW TERRITORY", msg)
         self.assertIn("n_layer=4", msg)
 
 
