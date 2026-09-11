@@ -629,6 +629,15 @@ _EXPECTED_LAYER = {
     "mlp_hyper_connection.input_mix_weight_down.weight": ("hc_ffn_down.weight", "direct2d"),
     "mlp_hyper_connection.input_mix_weight_up.weight": ("hc_ffn_up.weight", "direct2d"),
     "mlp_hyper_connection.block_inject_weight.weight": ("hc_ffn_inject.weight", "direct2d"),
+    # DENSE-CAUSAL full attention (the 12 QSA blocks; blk.3 is the witness).
+    # `attn_q` is the FUSED [query|gate] projection -- 12288 = heads 24 x 2 x
+    # head_dim 256 -- not a query projection; the emitter splits it per head.
+    "self_attn.q_proj.weight": ("attn_q.weight", "direct2d"),
+    "self_attn.k_proj.weight": ("attn_k.weight", "direct2d"),
+    "self_attn.v_proj.weight": ("attn_v.weight", "direct2d"),
+    "self_attn.o_proj.weight": ("attn_output.weight", "direct2d"),
+    "self_attn.q_norm.weight": ("attn_q_norm.weight", "vec"),
+    "self_attn.k_norm.weight": ("attn_k_norm.weight", "vec"),
     # PLE
     "ple.key_proj.weight": ("ple_key.weight", "direct2d"),
     "ple.value_proj.weight": ("ple_value.weight", "direct2d"),
@@ -652,7 +661,17 @@ _EXPECTED_GLOBAL = {
 # blk index each layer key is read from: PLE lives on the real PLE block (1),
 # everything else on a real GDN block (0). Same convention as the slice cells.
 def _blk_of(suffix):
-    return 1 if suffix.startswith("ple.") else 0
+    # Which real block carries a family. `ple.*` ships on blk.1 only; the
+    # DENSE-ATTENTION families (`self_attn.*`) ship ONLY on the 12 QSA blocks
+    # (blk 3,7,...,47 -- `qwen4exp.attention.compress_ratios` is 4 exactly
+    # there and 0 on the 36 GDN blocks), so blk.0 has no attn_q/k/v at all and
+    # asking for one is a KeyError, not a miss. Everything else is per-block
+    # and blk.0 is the cheapest witness.
+    if suffix.startswith("ple."):
+        return 1
+    if suffix.startswith("self_attn."):
+        return 3
+    return 0
 
 
 _ROW_KINDS = ("direct2d", "expert3d", "fuse_gate_up")
@@ -840,8 +859,15 @@ def test_name_map_entry_content_global(feed, raw_index, key):
 @_skip
 def test_refusal_residency_figures_are_recomputed_from_the_file(raw_index):
     """REVIEW 58e3e09 finding 5: the full-size refusal's residency numbers
-    (656.9 / 461.4 / 195.5 / 190.7 GiB, "12 of 48", "120 tensors, 2.30 GiB")
-    were f-string literals with nothing behind them. They were correct -- the
+    (then 656.9 / 461.4 / 195.5 / 190.7 GiB, "12 of 48", "120 tensors,
+    2.30 GiB") were f-string literals with nothing behind them.
+
+    THE CELL EARNED ITS KEEP, 2026-09-12: mapping the six dense-attention
+    families moved four of those eight figures (total 656.9 -> 659.1, per-block
+    461.4 -> 463.6, unmapped 120 -> 48 tensors and 2.30 -> 0.07 GiB, the 2.2 GiB
+    delta being exactly the attn_q/k/v/output + q_norm/k_norm families crossing
+    from unmapped to mapped) and this cell is what caught the stale text. An
+    orphan branch had added the map entries and left the refusal saying 120. They were correct -- the
     reviewer recomputed every one -- but nothing re-derived them, so they would
     rot silently if the checkpoint changed. FIX B set the better precedent in
     that same round (`test_lm_head_is_not_tied_in_this_checkpoint` exists

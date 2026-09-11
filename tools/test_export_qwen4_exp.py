@@ -328,7 +328,11 @@ class TestOutputLayout(unittest.TestCase):
         self.assertIn("RESIDENCY", msg)
         # residency names its assumption and a number, never a bare "does not fit"
         self.assertIn("f32 ov Constant", msg)
-        self.assertIn("656.9 GiB", msg)
+        # recomputed 2026-09-12 after the dense-attention families were mapped
+        # (659.1 = 463.6 per-block + 195.5 globals); the test_gguf_feed
+        # residency cell re-derives every figure from the shipped tensor list
+        # and requires the refusal text to contain it.
+        self.assertIn("659.1 GiB", msg)
         # the head is no longer a blocker -- and the refusal says so
         self.assertIn("RESOLVED", msg)
         self.assertIn("output.weight", msg)

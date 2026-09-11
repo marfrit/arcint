@@ -119,6 +119,20 @@ _LAYER_MAP = {
     "ple.norm_query.weight": ("ple_norm_query.weight", "vec"),
     "ple.norm_conv.weight": ("ple_norm_conv.weight", "vec"),
     "ple.conv1d.weight": ("ple_conv1d.weight", "conv"),
+    # DENSE-CAUSAL full-attention layer (CORRECTION 2026-09-12: the QSA
+    # selection branch lives in the INDEXER sub-module and is the only ruled-out
+    # part; the dense projections below feed the emitted attention block
+    # tools/q4e/attention.py on the pin's own GGUF attn_q/k/v/output names,
+    # reached via the `self_attn.` prefix (distinct from the GDN input
+    # projections, which land on attn_qkv/attn_gate). The indexer's weights
+    # (indexer.q_proj/k_proj/q_norm/k_norm) are deliberately NOT mapped: the
+    # selection branch is not emitted.
+    "self_attn.q_proj.weight": ("attn_q.weight", "direct2d"),
+    "self_attn.k_proj.weight": ("attn_k.weight", "direct2d"),
+    "self_attn.v_proj.weight": ("attn_v.weight", "direct2d"),
+    "self_attn.o_proj.weight": ("attn_output.weight", "direct2d"),
+    "self_attn.q_norm.weight": ("attn_q_norm.weight", "vec"),
+    "self_attn.k_norm.weight": ("attn_k_norm.weight", "vec"),
 }
 
 # Global (non-per-layer) keys.
