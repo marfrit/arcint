@@ -8,5 +8,6 @@
 
 from . import gdn
 from . import hc
+from . import moe
 
-__all__ = ["gdn", "hc"]
+__all__ = ["gdn", "hc", "moe"]

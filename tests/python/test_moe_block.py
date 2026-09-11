@@ -140,9 +140,21 @@ def _state_keys():
 
 def _ref_and_pin(config, seed: int = 0):
     """ref_moe.Qwen4ExpTextSparseMoeBlock (forward transcribed, leaves are the
-    pin's) and the pin's own SparseMoeBlock, identical random weights, eval."""
+    pin's) and the pin's own SparseMoeBlock, identical random weights, eval.
+
+    The pin ZERO-initializes the router weight (pin 967) and leaves the expert
+    Parameters as `torch.empty` (pin 929-930, uninitialized memory) -- the real
+    values come from the trained checkpoint. A synthetic fixture must stand in a
+    seeded random checkpoint over EVERY parameter: a NON-ZERO router so the
+    logits are non-uniform and the top-k selection is unambiguous (a zero router
+    gives uniform probabilities -- an all-way tie that would over-select and
+    make OV/torch topk disagree on which experts), and finite expert weights.
+    Scale 0.05 keeps every gemv output O(1) at fp32 (atol 1e-5)."""
     torch.manual_seed(seed)
     ref = ref_moe.Qwen4ExpTextSparseMoeBlock(config).eval()
+    with torch.no_grad():
+        for p in ref.parameters():
+            p.normal_(0.0, 0.05)
     pin = pin_mod.Qwen4ExpTextSparseMoeBlock(config).eval()
     pin.load_state_dict(ref.state_dict())
     return ref, pin
