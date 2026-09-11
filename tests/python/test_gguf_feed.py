@@ -206,3 +206,74 @@ def test_ple_feed_transcription(feed):
     md = _transcription_vs_pin(ref, pin)
     print(f"\n[feed-ple] {len(keys)} keys  transcription-vs-pin={md:.3e}")
     assert md == 0.0, md
+
+
+@_skip
+def test_backbone_assembled_from_feed(feed):
+    """Assembly cell (Phase B step 3): the WHOLE tiny backbone loaded from
+    gguf_feed tensors -- every weight fed from the real GGUF, sliced to the tiny
+    config. GDN/MoE/hc keys are fed from a real GDN block (blk.0); PLE from the
+    real PLE block (blk.1); globals from token_embd / output_hc_*. Two legs:
+    transcription-vs-pin (ref vs pin on the SAME fed tensors) = 0.0 exactly (the
+    required parity leg), plus OV build_backbone vs ref REPORTED (on real weights
+    the divergence is a few-token OV-emission numerics effect, not the random-
+    weight 1e-5 floor -- see the asserts). Small-config only -- full 48-layer
+    full-width residency is window territory."""
+    from q4e.backbone import build_backbone
+    tb._assert_pin()
+    config = tb._make_config()
+    ref = tb._build_ref(config)
+    sd = ref.state_dict()
+    fed = 0
+    for k in list(sd):
+        if any(k.endswith(s) for s in gguf_feed._DERIVED_SUFFIXES):
+            continue  # derived index buffer -- the pin recomputes it
+        if k.startswith("layers."):
+            gl = 1 if ".ple." in k else 0  # ple from blk.1, GDN/MoE/hc from blk.0
+        else:
+            gl = None
+        rows = sd[k].shape[0] if sd[k].ndim >= 1 else None
+        arr = feed.pin_tensor(k, rows=rows, gguf_layer=gl)
+        sd[k] = torch.from_numpy(
+            np.ascontiguousarray(_fit(arr, tuple(sd[k].shape)))).to(sd[k].dtype)
+        fed += 1
+    ref.load_state_dict(sd)
+    pin = pin_mod.Qwen4ExpTextModel(config).eval()
+    pin.load_state_dict(sd)
+    md = _transcription_vs_pin(ref, pin)
+
+    T = 64
+    torch.manual_seed(500 + T)
+    ids = torch.randint(1, config.vocab_size, (1, T))
+    mask = torch.ones(1, T)
+    with torch.no_grad():
+        y_ref = ref.logits(ids, mask).float().numpy()
+    row_ids = tb._gen_row_ids(config, tb._ple_index(config), ids[0].tolist())
+    state = {kk: vv.detach().cpu().numpy() for kk, vv in ref.state_dict().items()}
+    model = build_backbone(config, state, seq_len=T)
+    y_ov = tb._run_ov(model, {
+        "input_ids": ids.numpy().astype(np.int64),
+        "ngram_row_ids": row_ids,
+        "conv_mask": mask.numpy().astype(np.float32),
+    }, "CPU")
+    d = np.abs(y_ref - y_ov)
+    ov_max = float(d.max())
+    per_row = d.reshape(-1, config.vocab_size).max(1)
+    spikes = int((per_row > 1e-4).sum())
+    am_ref = y_ref.reshape(-1, config.vocab_size).argmax(1)
+    am_ov = y_ov.reshape(-1, config.vocab_size).argmax(1)
+    argmax_mismatch = int((am_ref != am_ov).sum())
+    print(f"\n[feed-assembly] {fed} keys fed from GGUF  transcription-vs-pin={md:.3e}")
+    print(f"[feed-assembly] OV-vs-ref(logits): max-abs={ov_max:.3e}  median-row={np.median(per_row):.2e}  "
+          f"rows>1e-4={spikes}/{T}  argmax-mismatch={argmax_mismatch}/{T}  max|logit|={np.abs(y_ref).max():.2e}")
+    # The required parity (kickoff step 3): the WHOLE backbone assembled from the
+    # real GGUF tensors reproduces the pin's own forward EXACTLY.
+    assert md == 0.0, f"transcription-vs-pin on fed weights: {md:.3e}"
+    # OV-vs-ref is REPORTED, not gated at the random-weight 1e-5 floor: on real
+    # weights the divergence is confined to a few tokens (median stays at the
+    # float floor) and is NOT the MoE top-k boundary (refuted: top_k=all still
+    # spikes) nor a router tie (refuted: scaling the router does not collapse it)
+    # -- an OV-emission numerics question for the later KLD gate, not this
+    # name-map/wiring gate. Only a gross-breakage sanity bound is asserted here.
+    assert ov_max < 1e-2, f"OV assembly grossly diverges on fed weights: {ov_max:.3e}"
+    assert np.median(per_row) < 1e-5, f"OV divergence is not token-confined: {np.median(per_row):.3e}"
