@@ -15,12 +15,31 @@ Op choices where opset-13 differs from torch:
     left-zero-padded input (bit-for-bit the same taps as F.conv1d(padding=K-1)
     then [:seq_len], no GroupConvolution lowering to trust).
   * the unit-lower-triangular solve that condenses the delta-rule updates
-    (reference: solve_triangular / the export-branch forward substitution)
-    -> the exact closed form. With L0 = strictly-lower(ut_system), the solve is
-    (I + L0)^-1 @ rhs; L0 is 64x64 strictly lower triangular hence nilpotent
-    (L0^64 = 0), so (I + L0)^-1 = sum_{p=0}^{63} (-L0)^p exactly. The finite sum
-    is built by geometric doubling (6 steps x 2 matmuls = 12 matmuls for
-    chunk 64), no solver op.
+    -> the pin's OWN export-branch forward substitution (pin 355-366, the
+    `is_torchdynamo_exporting()` branch, written precisely because "not all
+    export targets support the fast triangular solver"), transcribed op for op
+    and unrolled over the 64 chunk rows. See `_ut_inverse`.
+
+    CORRECTION, 2026-09-11 (FIX-GDN-UTINV; REVIEW 58e3e09 finding 1). This
+    header used to claim a closed form: L0 = strictly-lower(ut_system) is 64x64
+    strictly lower triangular hence nilpotent, so
+    (I + L0)^-1 = sum_{p=0}^{63} (-L0)^p "exactly", built by geometric doubling,
+    "no solver op". The identity is true in EXACT arithmetic and FALSE in f32 on
+    this checkpoint's weights, by five orders of magnitude. Measured: the
+    intermediate powers explode before they cancel --
+    |(-L0)^p| for p=1..8 = 5.05e-01 7.79e+00 6.57e+01 3.58e+02 1.42e+03
+    4.39e+03 1.11e+04 2.32e+04, peaking at 7.377e+04 while the answer's entries
+    are O(1); the built inverse then sat 2.268e-02 from the exact one, against
+    1.825e-07 for the forward substitution at the SAME f32 precision. Two
+    independent f32 evaluations of the series disagreed with each other by
+    1.367e-02 -- the method is not reproducible in f32 better than 1e-2.
+    The doubling series was a DEVIATION from E1.5's prescription, introduced at
+    E2 inc1 and never tested on real weights until REVIEW 58e3e09; this is a
+    return to spec, not a new idea. It costs a much larger static graph (the
+    substitution unrolls to ~9 ops per chunk row instead of 12 matmuls total)
+    and that is the correct trade: correctness over elegance.
+    Random-weight fixtures cannot see any of this -- on them the powers DECAY
+    (peak 3.69e-02) and the two algorithms agree exactly.
 
 Entry point: build_gdn_model(config, state, seq_len) -> ov.Model with inputs
 `hidden_states` [1, T, H] f32 and `attention_mask` [1, T] f32, and result
@@ -113,20 +132,58 @@ def _l2norm_last(x, last_axis):
     return _mul(x, inv)
 
 
-def _ut_inverse(ut_orig, chunk):
-    """(I + L0)^-1 with L0 = strictly-lower(ut_orig), via the exact nilpotent
-    geometric series sum_{p=0}^{chunk-1} (-L0)^p built by doubling."""
+def _ut_inverse(ut_orig, chunk, lead):
+    """(I + L0)^-1 with L0 = strictly-lower(ut_orig), by the pin's OWN
+    export-branch FORWARD SUBSTITUTION (pin 355-366), unrolled.
+
+    `lead` is the static leading shape of `ut_orig` ([1, HV, C] here), so the
+    two trailing axes are the chunk x chunk system. Transcription, line for
+    line against the pin's `is_torchdynamo_exporting()` branch:
+
+      pin 360  ut_system = -ut_system.tril(-1)
+               -> A = negative(ut_orig * strictly_lower_ones)
+      pin 361  for i in range(1, chunk_size):
+               -> this Python loop; unrolled into the static graph
+      pin 362  row = ut_system[..., i, :i].clone()
+               -> row_i = A[..., i:i+1, :i]        (taken from A: row i has NOT
+                  been substituted yet, which is what the pin's in-place write
+                  order guarantees)
+      pin 363  sub = ut_system[..., :i, :i].clone()
+               -> sub = acc[..., :i, :i]           (the ALREADY-substituted rows
+                  0..i-1 -- the pin reads them back after writing them in place)
+      pin 364  ut_system[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+               -> reshape row to [..., i, 1], multiply by sub, reduce_sum over
+                  axis -2 keepdims, add row. The broadcast-multiply-and-reduce
+                  is emitted as written rather than folded into a matmul, so the
+                  contraction is the pin's, not an equivalent one.
+      pin 365  ut_system = ut_system + eye(chunk_size)
+               -> add(acc, eye)
+      pin 366  new_values, k_cumdecay = ut_system @ v_beta, @ decayed_k_beta
+               -> at the call site, unchanged.
+
+    The in-place row assignment of pin 364 has no opset-13 equivalent, so the
+    rows are ACCUMULATED: `acc` carries the finished rows 0..i-1 at full chunk
+    width (zero-padded past column i-1, which is what a strictly lower row is),
+    and each new row is concatenated on. Row 0 is never written by the pin's
+    loop, so it is taken from A unchanged.
+
+    ~9 ops per chunk row, ~567 per GDN block against the old series' 12 matmuls.
+    That growth is the point: see the module header for the f32 measurement that
+    condemned the series."""
+    R = len(lead) + 2                       # rank; rows axis R-2, cols axis R-1
     sl = _c(np.tril(np.ones((chunk, chunk), np.float32), -1))  # strictly lower ones
     eye = _c(np.eye(chunk, dtype=np.float32))
-    m = op.negative(_mul(ut_orig, sl))  # -L0
-    s = eye  # sum_{p=0}^{0}
-    mp = m   # (-L0)^1
-    n = 1
-    while n < chunk:
-        s = _add(s, _mm(mp, s))  # S_{2n} = S_n + (-L0)^n @ S_n
-        mp = _mm(mp, mp)         # (-L0)^{2n}
-        n *= 2
-    return s
+    a = op.negative(_mul(ut_orig, sl))      # pin 360: -ut_system.tril(-1)
+
+    acc = _slice(a, 0, 1, 1, R - 2)         # row 0: the pin's loop starts at 1
+    for i in range(1, chunk):               # pin 361
+        row = _slice(_slice(a, i, i + 1, 1, R - 2), 0, i, 1, R - 1)   # pin 362
+        sub = _slice(_slice(acc, 0, i, 1, R - 2), 0, i, 1, R - 1)     # pin 363
+        rowc = _reshape(row, lead + [i, 1])          # pin 364: row.unsqueeze(-1)
+        upd = _add(row, _rsum(_mul(rowc, sub), R - 2))  # pin 364: + (...).sum(-2)
+        pad = _c(np.zeros(lead + [1, chunk - i], np.float32))
+        acc = op.concat([acc, op.concat([upd, pad], axis=R - 1)], axis=R - 2)
+    return _add(acc, eye)                   # pin 365
 
 
 def _rmsnorm_gated(core, z, weight_vec, eps, last_axis):
@@ -234,7 +291,9 @@ def _gdn_subgraph(hidden, amask, config, state, T):
     intra = _mul(_mm(q_c, k_c, tb=True), pd)
     dkb = _mul(kb_c, expc5)                               # decayed_k_beta
 
-    inv = _ut_inverse(ut_orig, CHUNK)
+    # pin 355-365: the export branch's forward substitution builds the inverse
+    inv = _ut_inverse(ut_orig, CHUNK, [1, HV, C])
+    # pin 366: new_values, k_cumdecay = ut_system @ v_beta, @ decayed_k_beta
     new_values = _mm(inv, vb_c)                           # [1,HV,C,CHUNK,Dv]
     k_cumdecay = _mm(inv, dkb)                            # [1,HV,C,CHUNK,Dk]
 

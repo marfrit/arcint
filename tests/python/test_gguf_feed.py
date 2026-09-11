@@ -63,6 +63,12 @@ except Exception as e:  # module absent in the RED state
 _skip = pytest.mark.skipif(
     not _SHARDS, reason="Q4E_GGUF_SHARDS unset (real GGUF shards absent)")
 
+# How far above the REFERENCE's own f32-vs-f64 rounding the emitter may sit and
+# still count as "at the float floor". Relative, so it cannot be satisfied by a
+# reference that is itself drifting, and not a tuned constant: pre-fix the
+# nilpotent-series emitter sat at ~4500x this ratio at T=96, post-fix at O(1).
+_FLOOR_FACTOR = 20.0
+
 
 @pytest.fixture(scope="module")
 def feed():
@@ -281,10 +287,23 @@ def test_backbone_assembled_from_feed(feed):
     GDN/MoE/hc keys are fed from a real GDN block (blk.0); PLE from the real PLE
     block (blk.1); globals from token_embd / output_hc_*. Two legs:
     transcription-vs-pin (ref vs pin on the SAME fed tensors) = 0.0 exactly (the
-    required parity leg), plus OV build_backbone vs ref REPORTED (at real weight
-    magnitudes the divergence is a few-token OV-emission numerics effect, not the
-    random-weight 1e-5 floor -- see the asserts). Full 48-layer full-width
-    residency is window territory."""
+    required parity leg), plus OV build_backbone vs ref.
+
+    THE OV LEG WAS A DEFECT, NOT A NUMERICS STORY (resolved 2026-09-11,
+    FIX-GDN-UTINV). This cell used to report max-abs 2.320e-04 with 2 of 64
+    spike rows and call it "a few-token OV-emission numerics effect" for the
+    later KLD gate, with the MoE top-k boundary and a router tie recorded as
+    REFUTED. The actual cause was `q4e.gdn._ut_inverse` building the UT solve as
+    a nilpotent geometric series, which collapses in f32 on real weights. With
+    the pin's export-branch forward substitution the figure is 8.941e-08 with
+    ZERO spike rows -- the float floor. There is no residual few-token effect.
+
+    THIS CELL RUNS ONE SHAPE, T=64, and says so: T=64 is a single chunk, which
+    is the most favourable shape for exactly the class of bug that hid here (the
+    old error concentrated at the END of a chunk and only propagated from two
+    chunks on). The real gate is
+    test_gdn_emitter_real_weights_parity_sweep at T=64/96/128/256 against an f64
+    recomputation. Full 48-layer full-width residency is window territory."""
     from q4e.backbone import build_backbone
     tb._assert_pin()
     config = tb._make_config()
@@ -333,17 +352,120 @@ def test_backbone_assembled_from_feed(feed):
     # The required parity (kickoff step 3): the WHOLE backbone assembled from the
     # real GGUF tensors reproduces the pin's own forward EXACTLY.
     assert md == 0.0, f"transcription-vs-pin on fed weights: {md:.3e}"
-    # OV-vs-ref is REPORTED, not gated at the random-weight 1e-5 floor: on real
-    # weights the divergence is confined to a few tokens (median stays at the
-    # float floor) and is NOT the MoE top-k boundary (refuted: top_k=all still
-    # spikes) nor a router tie (refuted: scaling the router does not collapse it)
-    # -- an OV-emission numerics question for the later KLD gate, not this
-    # name-map/wiring gate. Only a gross-breakage sanity bound is asserted here.
-    assert ov_max < 1e-2, f"OV assembly grossly diverges on fed weights: {ov_max:.3e}"
-    assert np.median(per_row) < 1e-5, f"OV divergence is not token-confined: {np.median(per_row):.3e}"
+    # Gated at the float floor now that FIX-GDN-UTINV removed the real cause.
+    # These bounds are set from the measurement (8.941e-08 max, 3.35e-08 median,
+    # 0 spike rows at T=64), not tuned to pass: the pre-fix emitter produced
+    # 2.320e-04 / 2.17e-07 / 2 spike rows and fails every one of them.
+    assert ov_max < 1e-5, f"OV assembly diverges on fed weights: {ov_max:.3e}"
+    assert np.median(per_row) < 1e-6, f"OV median-row off the floor: {np.median(per_row):.3e}"
+    assert spikes == 0, f"{spikes} spike rows -- the UT-inverse class is back"
 
 
 # --- the head: pin-vs-checkpoint divergence (FIX B) ------------------------- #
+# --- the real-weights T-sweep: the standing law's acceptance leg ----------- #
+#
+# STANDING LAW (frontier, FIX-GDN-UTINV, 2026-09-11): every emitter acceptance
+# requires at least one REAL-WEIGHTS leg at >= 2 sequence lengths. Random-weight
+# parity is NECESSARY, NEVER SUFFICIENT.
+#
+# Why the law exists, measured (REVIEW 58e3e09 findings 1 and 3): on the random
+# fixtures the GDN block's intermediate powers DECAY (peak |(-L0)^p| 3.69e-02),
+# so `_ut_inverse`'s series was harmless and every 1e-5 floor in
+# test_backbone.py passed. On the shipped weights the same powers EXPLODE (peak
+# 7.38e+04 against an O(1) answer) and the block's numerics collapsed. A fixture
+# that makes every case alike certifies nothing -- the same class as the blind
+# PA fill of 2026-09-08.
+#
+# The reference here is recomputed in FLOAT64 from the SAME fed tensors, so the
+# leg measures the EMITTER, not the reference's own rounding: a reference whose
+# f32 and f64 agree to ~1e-7 cannot excuse an emitter that departs from both.
+
+
+@pytest.fixture(scope="module")
+def fed_state(feed):
+    """The tiny config's state dict with every weight fed from the real GGUF,
+    built once: (config, ref_f32, ref_f64, state_np). `ref_f64` is the SAME fed
+    tensors in double precision -- the yardstick the T-sweep measures against."""
+    tb._assert_pin()
+    config = tb._make_config()
+    ref = tb._build_ref(config)
+    sd = ref.state_dict()
+    for k in list(sd):
+        if any(k.endswith(s) for s in gguf_feed._DERIVED_SUFFIXES):
+            continue
+        gl = (1 if ".ple." in k else 0) if k.startswith("layers.") else None
+        sd[k] = torch.from_numpy(
+            _fit(feed, k, tuple(sd[k].shape), gguf_layer=gl)).to(sd[k].dtype)
+    ref.load_state_dict(sd)
+    ref64 = tb._build_ref(config).double()
+    ref64.load_state_dict({k: v.double() if v.is_floating_point() else v
+                           for k, v in ref.state_dict().items()})
+    ref64.eval()
+    state = {k: v.detach().cpu().numpy() for k, v in ref.state_dict().items()}
+    return config, ref, ref64, state
+
+
+@_skip
+@pytest.mark.parametrize("T", [64, 96, 128, 256])
+def test_gdn_emitter_real_weights_parity_sweep(feed, fed_state, T):
+    """FIX-GDN-UTINV acceptance: the assembled backbone on REAL fed weights at
+    four sequence lengths, each against an f64 recomputation of the same graph
+    from the same tensors.
+
+    Three distances per T:
+      |ov - r32|  the emitter vs the f32 reference (what the old cell reported)
+      |ov - r64|  the emitter vs the f64 truth     (THE gate)
+      |r32 - r64| the reference's OWN f32 rounding (the floor to beat)
+
+    The gate is relative, not a tuned constant: the emitter must sit within
+    `_FLOOR_FACTOR` of the reference's own f32 rounding. Pre-fix, the nilpotent
+    doubling series in `q4e.gdn._ut_inverse` missed it by ~4500x at T=96 and
+    worsened with T, because its error concentrates at the END of a chunk and
+    from two chunks on those rows enter the recurrent state (2/64 spike rows at
+    T=64 becomes 16/96, 51/128, 40/256). T=64 was the single most favourable
+    shape the old cell could have run."""
+    from q4e.backbone import build_backbone
+    config, ref, ref64, state = fed_state
+
+    torch.manual_seed(500 + T)
+    ids = torch.randint(1, config.vocab_size, (1, T))
+    mask = torch.ones(1, T)
+    with torch.no_grad():
+        y32 = ref.logits(ids, mask).float().numpy().astype(np.float64)
+        y64 = ref64.logits(ids, mask.double()).numpy()
+    row_ids = tb._gen_row_ids(config, tb._ple_index(config), ids[0].tolist())
+    y_ov = tb._run_ov(build_backbone(config, state, seq_len=T), {
+        "input_ids": ids.numpy().astype(np.int64),
+        "ngram_row_ids": row_ids,
+        "conv_mask": mask.numpy().astype(np.float32),
+    }, "CPU").astype(np.float64)
+
+    V = config.vocab_size
+    d_ov64 = np.abs(y_ov - y64)
+    ov_r32 = float(np.abs(y_ov - y32).max())
+    ov_r64 = float(d_ov64.max())
+    r32_r64 = float(np.abs(y32 - y64).max())
+    per_row = d_ov64.reshape(-1, V).max(1)
+    median = float(np.median(per_row))
+    spikes = int((per_row > 1e-4).sum())
+    am = int((y32.reshape(-1, V).argmax(1) != y_ov.reshape(-1, V).argmax(1)).sum())
+    closer = "OV" if ov_r64 < r32_r64 else "ref-f32"
+    chunks = (T + 63) // 64
+
+    print(f"\n[gdn-sweep] T={T:>3} chunks={chunks}  |ov-r32|={ov_r32:.3e}  "
+          f"|ov-r64|={ov_r64:.3e}  |r32-r64|={r32_r64:.3e}  "
+          f"median-row={median:.3e}  rows>1e-4={spikes}/{T}  argmax!={am}/{T}  "
+          f"ratio(ov-r64)/(r32-r64)={ov_r64 / max(r32_r64, 1e-30):.1f}  closer={closer}")
+
+    assert r32_r64 < 1e-5, (
+        f"the f32 REFERENCE itself drifted from f64 ({r32_r64:.3e}) -- this "
+        "computation is supposed to be stable; the yardstick is broken, stop")
+    assert ov_r64 <= _FLOOR_FACTOR * r32_r64, (
+        f"T={T}: emitter is {ov_r64 / max(r32_r64, 1e-30):.0f}x the reference's "
+        f"own f32 rounding ({ov_r64:.3e} vs {r32_r64:.3e}) -- not at the float "
+        "floor")
+
+
 @_skip
 def test_lm_head_is_not_tied_in_this_checkpoint(feed):
     """THE PIN TIES THE HEAD; THIS CHECKPOINT DOES NOT (the measurement, run as
