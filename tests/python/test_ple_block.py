@@ -183,6 +183,20 @@ def _row_ids(mult, sizes, offs, ng, hpn, eos, context, tokens):
     return out
 
 
+def _gen_row_ids(config, ple_idx, tokens):
+    """The TEST-SIDE row-id producer (this side of the parity seam; serving
+    uses src/exec/ngram_row_ids.h). Fresh (all-eos) context, no cache. Python
+    ints are true 64-bit and the result is np.int64 -- no float touches the
+    index path. Returns [1, T, num_ngram_heads]."""
+    mult, sizes, offs = _derive(config.vocab_size, config.ngram_size,
+                                config.heads_per_ngram, config.ngram_vocab_size_base, ple_idx)
+    eos = int(config.eos_token_id)
+    ctx = [eos] * (config.ngram_size - 1)
+    rows = _row_ids(mult, sizes, offs, config.ngram_size, config.heads_per_ngram,
+                    eos, ctx, [int(t) for t in tokens])
+    return np.array(rows, dtype=np.int64)[None]  # [1, T, Hn]
+
+
 # ---------------------------------------------------------------------------
 def test_ngram_row_ids_match_link3_vectors():
     """The python index derivation (pin-derived constants + the documented XOR
@@ -225,9 +239,9 @@ def test_ngram_row_ids_match_link3_vectors():
 
 @pytest.mark.parametrize("with_eos", [False, True])
 def test_ids_reproduce_pin_gather(with_eos):
-    """The fed ids (ref_ple.row_ids_from_input) reproduce the pin
-    NGramEmbedding's own gather EXACTLY -- so feeding them to the OV graph is
-    the same table lookup the pin does (the index is not emitted in-graph;
+    """The test-side numpy generator (_gen_row_ids) reproduces the pin
+    NGramEmbedding's own gather EXACTLY -- so feeding those ids to the OV graph
+    is the same table lookup the pin does (the index is not emitted in-graph;
     OV i64 arithmetic is 32-bit -- see tools/q4e/ple.py)."""
     _assert_pin()
     config = _make_config()
@@ -239,8 +253,8 @@ def test_ids_reproduce_pin_gather(with_eos):
         ids[0, 20] = 0
         ids[0, 41] = 0
     emb_pin = ref.ple_embedding(ids, None)
-    my = ref_ple.row_ids_from_input(ref.ple_embedding, ids[0])
-    emb_mine = ref.ple_embedding.ngram_embedding.weight[my].flatten(-2).unsqueeze(0)
+    my = _gen_row_ids(config, 1, ids[0].tolist())  # [1,T,Hn] np.int64
+    emb_mine = ref.ple_embedding.ngram_embedding.weight[torch.from_numpy(my[0])].flatten(-2).unsqueeze(0)
     md = float((emb_pin - emb_mine).abs().max())
     print(f"\n[ple-ids-reproduce-pin] with_eos={with_eos}  max-abs(pin-gather vs fed)={md:.3e}")
     assert md == 0.0, f"fed ids do not reproduce the pin's gather: {md:.3e}"
@@ -282,7 +296,7 @@ def test_ple_ov_parity(device, T):
     hs = torch.randn(1, T, C)
     with torch.no_grad():
         y_ref = ref(hs, ids).float().numpy()
-    my = ref_ple.row_ids_from_input(ref.ple_embedding, ids[0]).numpy()[None]  # [1,T,Hn]
+    my = _gen_row_ids(config, 1, ids[0].tolist())  # [1,T,Hn] np.int64
 
     model = build_ple_model(config, state, seq_len=T)
     compiled = ov.Core().compile_model(model, device)
@@ -317,7 +331,7 @@ def test_ple_ov_parity_masked(device, T):
     mask[:, live:] = 0.0
     with torch.no_grad():
         y_ref = ref(hs, ids, conv_mask=mask).float().numpy()
-    my = ref_ple.row_ids_from_input(ref.ple_embedding, ids[0]).numpy()[None]
+    my = _gen_row_ids(config, 1, ids[0].tolist())  # [1,T,Hn] np.int64
 
     model = build_ple_model(config, state, seq_len=T, with_mask=True)
     compiled = ov.Core().compile_model(model, device)

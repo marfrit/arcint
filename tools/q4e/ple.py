@@ -18,17 +18,22 @@ with eos-boundary shifting. It requires EXACT int64 arithmetic on values up to
     i64 Add,      [1] + 9000000000000000000     -> -2147483648 (INT32_MIN)
 
 so both Multiply and Add wrap at 2^32 / saturate at int32 for i64 operands.
-The hash therefore CANNOT be emitted as opset-13 integer ops on this build
-(every `token * multiplier` overflows int32). Per the constitution ("a claimed
-defect is accepted only with a measurement of its root cause") the measurement
-above is the record; per E1.5 finding 8 ("bake the where() in, or feed it as a
-second input") the index is produced by the validated derivation
-(ref_ple.row_ids_from_input / src/exec/ngram_row_ids.h, proven bit-exact
-against the committed Link-3 vectors, tests/ngram_row_ids_vectors.h) and FED to
-the graph as the int64 input `ngram_row_ids` [1, T, num_ngram_heads]. This graph
-emits ONLY the gather + the (float) PLE forward. tools/q4e/ple.py has NO float
-anywhere on what index path it does touch -- the fed ids are int64 and the only
-op consuming them is the (dtype-agnostic) Gather.
+
+  FRONTIER RULING (dated 2026-09-11): in-graph 64-bit hash is NO-GO on OV
+  2026.4.0 CPU (measured: multiply wraps mod 2^32, 1e5*1e5 -> 1410065408; add
+  breaks 1+9e18 -> INT32_MIN). Design boundary: the hash lives in the runtime
+  kernel; the graph consumes row_ids. row_ids are a DECLARED int64 GRAPH INPUT
+  `ngram_row_ids` [1, T, num_ngram_heads]; this graph emits ONLY the gather +
+  the (float) PLE forward, with NO float on the index path it touches (the fed
+  ids are int64 and the only op consuming them is the dtype-agnostic Gather).
+  The two PRODUCERS of the input, either side of the parity seam:
+    * tests   -- the in-file numpy int64 generator (test_ple_block._gen_row_ids),
+                 validated three-ways against the committed Link-3 vectors
+                 (tests/ngram_row_ids_vectors.h) before any graph run;
+    * serving -- arcint's vector-tested src/exec/ngram_row_ids.h (AVX2-verified;
+                 the NEON twin is a separate queue item). Not reimplemented here.
+  Deferred (optimization ticket, NEVER a correctness dependency): whether OV i64
+  Multiply holds on GPU.0/GPU.1 -- window territory, untested this session.
 
 The (float) forward (pin 1242-1255):
   embeddings = ngram_embedding[row_ids].flatten(-2)          (pin 1242, gather)

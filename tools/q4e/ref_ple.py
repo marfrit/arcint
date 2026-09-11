@@ -12,20 +12,21 @@ forward-wiring error (a dropped signed-sqrt, a wrong residual, a mis-normed
 stream) diverges from the pin while the leaf math stays the pin's. Validated
 AGAINST the pin at 0.0 (test drives both classes on the same weights).
 
-THE N-GRAM ROW INDEX. The row-index -> table-row function is a pure INTEGER
-hash (splitmix-derived multipliers, an XOR-of-(token*multiplier) reduced modulo
-a per-head prime vocab, eos-boundary shifting): pin 1080-1181, byte-identical
-to arcint's vector-tested src/exec/ngram_row_ids.h. It requires exact int64
-arithmetic on values up to ~2^63. The installed OpenVINO build's CPU integer
-kernels are 32-bit (measured: i64 Multiply wraps at 2^32, i64 Add breaks past
-int32 -- see tools/q4e/ple.py and the RECONCILE session block), so the index
-CANNOT be emitted as opset-13 integer ops on this build. The index is therefore
-produced by this validated derivation (row_ids below, proven bit-exact against
-the committed Link-3 vectors, tests/ngram_row_ids_vectors.h) and FED to the OV
-graph as an int64 input `ngram_row_ids`; tools/q4e/ple.py emits only the gather
-+ the (float) PLE forward. The row_ids helper here mirrors the pin's own
-NGramEmbedding path and the test asserts, per input, that its ids equal the ids
-the pin's NGramEmbedding uses internally.
+THE N-GRAM ROW INDEX (the parity seam). The row-index -> table-row function is
+a pure INTEGER hash (splitmix-derived multipliers, an XOR-of-(token*multiplier)
+reduced modulo a per-head prime vocab, eos-boundary shifting): pin 1080-1181,
+byte-identical to arcint's vector-tested src/exec/ngram_row_ids.h. It requires
+exact int64 arithmetic on values up to ~2^63; the installed OpenVINO build's CPU
+integer kernels are 32-bit (MEASURED -- see tools/q4e/ple.py's header), so the
+index is NOT emitted in-graph. Per the frontier ruling the graph consumes
+row_ids as a declared int64 input; the two PRODUCERS of that input, on the two
+sides of the parity seam, are:
+  * tests -- the in-file numpy int64 generator (test_ple_block._gen_row_ids),
+    true 64-bit python ints, validated three-ways against the committed Link-3
+    vectors (tests/ngram_row_ids_vectors.h) before any graph run;
+  * serving -- arcint's src/exec/ngram_row_ids.h (AVX2-verified; the NEON twin
+    is a separate queue item). This module does NOT reimplement or re-verify
+    that kernel.
 """
 import math
 
@@ -34,59 +35,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from transformers.models.qwen4_exp import modeling_qwen4_exp as _pin  # noqa: F401
-
-_MASK64 = (1 << 64) - 1
-
-
-def _s64(x: int) -> int:
-    x &= _MASK64
-    return x - (1 << 64) if x >= (1 << 63) else x
-
-
-def row_ids_from_input(ngemb, input_ids_row):
-    """Bit-exact n-gram row ids for one [T] sequence (fresh, all-eos context),
-    using the pin NGramEmbedding module's OWN derived buffers (layer_multipliers
-    / ngram_heads_vocab_sizes / ngram_heads_offsets, pin 1107-1111) and the
-    documented shift/XOR/mod mixing (pin 1131-1181). Returns [T, num_heads]
-    int64. Proven byte-equal to the committed Link-3 vectors and to the pin's
-    internal ids (see test_ple_block)."""
-    ngram = ngemb.ngram_size
-    hpn = ngemb.heads_per_ngram
-    eos = int(ngemb.eos_token_id)
-    mult = ngemb.layer_multipliers.tolist()
-    sizes = ngemb.ngram_heads_vocab_sizes.tolist()
-    offs = ngemb.ngram_heads_offsets.tolist()
-
-    tokens = [int(t) for t in input_ids_row]
-    ctx = [eos] * (ngram - 1)                              # fresh sequence (pin 1123)
-    packed = ctx + tokens
-    W = len(packed)
-    # in_segment (pin _shift_right_ignore_eos, 1121-1126): pos - prev_eos - 1
-    prev_eos = [-1] * W
-    last = -1
-    for p in range(W):
-        prev_eos[p] = last
-        if packed[p] == eos:
-            last = p
-    in_seg = [p - prev_eos[p] - 1 for p in range(W)]
-    shifted = [list(packed)]
-    for s in range(1, ngram):
-        shifted.append([packed[p - s] if (p - s >= 0 and in_seg[p] >= s) else eos
-                        for p in range(W)])
-    per = [[row[(ngram - 1) + i] for i in range(len(tokens))] for row in shifted]
-
-    out = []
-    for i in range(len(tokens)):
-        heads = []
-        for n in range(2, ngram + 1):                     # pin 1149
-            start = (n - 2) * hpn
-            mixed = _s64(per[0][i] * mult[0])             # pin 1152
-            for pos in range(1, n):                       # pin 1153-1157
-                mixed = _s64((mixed & _MASK64) ^ (_s64(per[pos][i] * mult[pos]) & _MASK64))
-            for h in range(start, start + hpn):           # pin 1160-1161
-                heads.append(mixed % sizes[h] + offs[h])
-        out.append(heads)
-    return torch.tensor(out, dtype=torch.long)
 
 
 class Qwen4ExpTextPLELayer(nn.Module):
@@ -140,4 +88,4 @@ class Qwen4ExpTextPLELayer(nn.Module):
         return output                                                  # pin 1255
 
 
-__all__ = ["Qwen4ExpTextPLELayer", "row_ids_from_input"]
+__all__ = ["Qwen4ExpTextPLELayer"]
