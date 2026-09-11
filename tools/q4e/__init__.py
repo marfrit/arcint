@@ -7,5 +7,6 @@
 # tests/python/test_gdn_block.py (CPU + GPU, max-abs + KLD).
 
 from . import gdn
+from . import hc
 
-__all__ = ["gdn"]
+__all__ = ["gdn", "hc"]
