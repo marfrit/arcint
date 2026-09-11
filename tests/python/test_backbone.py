@@ -5,14 +5,17 @@ RED state: `from q4e.backbone import build_backbone` -- the module does not
 exist yet (GREEN emits tools/q4e/backbone.py + adds `from . import backbone` to
 q4e/__init__.py). Collecting this file fails; the other test files still pass.
 
-CAUSAL-ONLY SCOPE (frontier ruling, recorded here per the kickoff): the stack is
-GDN-only linear_attention layers -- the QSA full-attention layer
-(Qwen4ExpTextAttention: q_proj [q|gate], mrope, the QSA indexer) is NOT
-assembled. The frontier ruled dense causal IS the semantics and the QSA indexer
-is a separate later concern; the indexer's per-query `nonzero` is not statically
-opset-13-emittable (E1.5 finding 7). With no QSA layer, rope/position_embeddings
-are unused, so none are emitted. A mixed-layer stack with a causal full-attn
-layer is deferred until the indexer no-op scope is settled.
+DENSE-CAUSAL SCOPE (CORRECTION, 2026-09-12 -- supersedes the CAUSAL-ONLY
+paragraph below, which over-read the frontier ruling). The checkpoint is
+48 layers = 36 GDN + 12 full-attention layers (layer_idx % 4 == 3). The
+frontier ruled dense causal IS the semantics; only the QSA INDEXER is ruled
+out (its per-query `nonzero` is not statically opset-13-emittable, E1.5
+finding 7). The full-attention layers assemble as DENSE CAUSAL, emitted from
+the pin's own Qwen4ExpTextAttention (pin 819-901) minus the selection branch,
+with RoPE in its degenerate-for-text form -- tools/q4e/attention.py. This
+suite's tiny fixtures stay all-linear (the parity floor for the harness
+shape); the real-width dense-causal piece is exercised piecewise in
+tests/python/test_piecewise_export.py.
 
 Pin facts this increment establishes (pin re-verified on the dev host, sha ca9f00bb):
   * PLE is ADDITIVE (hidden += ple(...), pin 1283-1284), not a layer replacement.

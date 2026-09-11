@@ -34,9 +34,14 @@ checkpoint). `declare_lm_head=True` registers the separate head
 key-for-key identical to the pin TextModel's, which every transcription-vs-pin
 parity leg depends on.
 
-SCOPE (frontier ruling): causal-only, GDN layers only -- no QSA full-attention
-layer, so rope / position_embeddings are unused (GDN ignores them) and are not
-constructed here. conv_mask is taken explicitly (the pin builds it from
+SCOPE (frontier ruling, CORRECTION 2026-09-12 -- supersedes the earlier
+causal-only phrasing): the checkpoint is 48 layers = 36 GDN + 12 full-attention
+layers; the rule excused the QSA INDEXER, not the attention layers. This
+transcription is the GDN-only HARNESS shape (tiny all-linear fixtures, the
+parity floor the E2 stack ran on) -- it never reaches the attention layers,
+which are dense-causal and live in tools/q4e/attention.py. rope /
+position_embeddings are unused by the GDN branches (they ignore them), so none
+are constructed here; conv_mask is taken explicitly (the pin builds it from
 attention_mask via create_recurrent_attention_mask; for a full sequence it is
 all-valid == ones). See tools/q4e/backbone.py.
 """

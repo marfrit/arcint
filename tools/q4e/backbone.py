@@ -23,15 +23,22 @@ of Qwen4ExpTextModel.forward + Qwen4ExpTextDecoderLayer.forward, pin 1258-1498,
 GDN-only no-cache branch) reusing the already-validated per-block emitters:
   gdn.emit_gdn  hc.emit_combine / emit_hc  moe.emit_moe  ple.emit_ple.
 
-CAUSAL-ONLY SCOPE (frontier ruling): the decoder layers are all
-`linear_attention` (GDN). The QSA full-attention layer (Qwen4ExpTextAttention,
-pin 819-904: q_proj [q|gate], mrope, the QSA indexer) is NOT assembled here --
-the frontier ruled dense causal IS the semantics and the QSA indexer is a
-separate, later concern, and the indexer's per-query `nonzero` is not statically
-emittable as opset-13 (E1.5 finding 7). With no QSA layer, rope /
-position_embeddings are unused (GDN ignores them), so none are emitted. A
-mixed-layer stack with a causal full-attn layer is deferred to when the
-indexer's no-op scope is settled; recorded in the test header.
+DENSE-CAUSAL SCOPE -- CORRECTION, 2026-09-12 (frontier ruling; supersedes the
+earlier CAUSAL-ONLY note, which wrongly read as excusing the attention LAYERS):
+the checkpoint is 48 layers = 36 `linear_attention` (GDN) + 12 full-attention
+layers (layer_idx % full_attention_interval == interval-1). The frontier rule
+excused the INDEXER only, not the attention layers: dense causal attention IS
+the semantics the QSA indexer approximates, so every full-attention layer
+assembles as DENSE CAUSAL -- emitted from the pin's own Qwen4ExpTextAttention
+(pin 819-901) MINUS the QSA selection branch (the per-batch/per-query Python
+loops and their `torch.nonzero`, pin 729-731, NOT statically opset-13-emittable,
+E1.5 finding 7) and with the pin's RoPE in its degenerate-for-text form (all
+four mrope position rows equal the text positions: pin 1433-1436 expands
+arange(T) to 4 identical rows, pin 1438-1440 hands row 0 to the QSA mask and
+rows 1-3 to the rotary module, pin 79-149). That emission is
+`tools/q4e/attention.py` (its layer piece is real-width parity-validated; this
+module's tiny fixtures stay all-linear for the harness floor). The GDN branches
+ignore position_embeddings and emit none.
 
 Two pin corrections this increment establishes (pin wins; dated in RECONCILE):
   * PLE is ADDITIVE, not a layer replacement: `hidden = hidden + ple(...)` at
