@@ -154,7 +154,7 @@ def _gated_residual(hyper_input, T, H, hc, lowrank, weight_vec, eps, state):
     # pin 1025: (w * x_norm.unflatten(-1, (hc, H))) elementwise over [1,T,hc,H]
     prod = _mul(w5, xn)
 
-    # pin 1026: .mean(dim=-2) over the hc streams -> [1, T, H]. torch's
+    # pin 1025-1027: .mean(dim=-2) over the hc streams -> [1, T, H]. torch's
     # .mean(dim=-2) DROPS the axis (no keepdim), so the OV reduce_mean uses
     # keep_dims=False (the gdn.py _rmean wrapper keeps dims -- that block
     # feeds the reduced axis straight into a matmul; here it is the result

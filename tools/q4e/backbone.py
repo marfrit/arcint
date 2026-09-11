@@ -19,7 +19,7 @@ checkpoint would ship the wrong head; the fallback exists for sources that
 really are tied, not as a default for this one.
 
 Mirrors `tools/q4e/ref_backbone.Qwen4ExpTextBackbone.forward` (the transcription
-of Qwen4ExpTextModel.forward + Qwen4ExpTextDecoderLayer.forward, pin 1258-1497,
+of Qwen4ExpTextModel.forward + Qwen4ExpTextDecoderLayer.forward, pin 1258-1498,
 GDN-only no-cache branch) reusing the already-validated per-block emitters:
   gdn.emit_gdn  hc.emit_combine / emit_hc  moe.emit_moe  ple.emit_ple.
 
@@ -38,13 +38,13 @@ Two pin corrections this increment establishes (pin wins; dated in RECONCILE):
     the layer top (pin 1283) -- E1.5 finding 2 (PLE "replaces" the layer) was
     wrong.
   * There is NO final RMSNorm: TextModel returns `hyper_connection_mixer(hidden)`
-    directly as last_hidden_state (pin 1493-1497) and ForCausalLM applies
+    directly as last_hidden_state (pin 1493-1496) and ForCausalLM applies
     lm_head to it (no norm) -- the kickoff's "-> RMSNorm -> lm_head" is inexact.
 
 The per-layer composition (pin 1273-1310):
   (PLE layer only) hidden = hidden + ple(hidden, row_ids, conv_mask)   pin 1283-4
   h, hyper, inj = attn_hyper_connection(hidden)      (use_combine=True) pin 1288
-  g = linear_attn(h, conv_mask)                                        pin 1289
+  g = linear_attn(h, conv_mask)                                        pin 1290
   hidden = hyper + (g.unsqueeze(-2) * inj.unsqueeze(-1)).flatten(-2)   pin 1302-3
   h, hyper, inj = mlp_hyper_connection(hidden)                          pin 1305
   m = mlp(h)                                          (MoE)             pin 1306
@@ -113,7 +113,7 @@ def build_backbone(config, state, seq_len):
 
         # pin 1288: attn_hyper_connection (use_combine=True)
         h, hyper, inj = emit_combine(hidden, config, _sub(state, pfx + "attn_hyper_connection."), T)
-        # pin 1289: linear_attn (GDN) on the mixed stream
+        # pin 1290: linear_attn (GDN) on the mixed stream
         g = emit_gdn(h, conv_mask, config, _sub(state, pfx + "linear_attn."), T)
         # pin 1302-1303: combine back into the hc stream
         hidden = _combine(hyper, g, inj, T, hc, H)

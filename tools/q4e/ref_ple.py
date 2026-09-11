@@ -5,7 +5,7 @@ The ORACLE is the pinned transformers reference (modeling_qwen4_exp.py sha256
 `ca9f00bbd73cfcfbad7ba6073b5ecc23ca27bdace58b746fe6ead6ab175efc0c`, re-hashed
 by the test before every numeric table). This module transcribes
 `Qwen4ExpTextPLELayer.forward` (pin lines 1235-1255, no-cache branch) reusing
-the pin's OWN leaves -- `Qwen4ExpTextNGramEmbedding` (pin 1080-1181, which
+the pin's OWN leaves -- `Qwen4ExpTextNGramEmbedding` (pin 1080-1180, which
 itself derives the hash constants and gathers the n-gram embedding),
 `Qwen4ExpTextRMSNorm` (pin 152-172) and torch's nn.Linear/nn.Conv1d -- so a
 forward-wiring error (a dropped signed-sqrt, a wrong residual, a mis-normed
@@ -14,7 +14,7 @@ AGAINST the pin at 0.0 (test drives both classes on the same weights).
 
 THE N-GRAM ROW INDEX (the parity seam). The row-index -> table-row function is
 a pure INTEGER hash (splitmix-derived multipliers, an XOR-of-(token*multiplier)
-reduced modulo a per-head prime vocab, eos-boundary shifting): pin 1080-1181,
+reduced modulo a per-head prime vocab, eos-boundary shifting): pin 1080-1180,
 byte-identical to arcint's vector-tested src/exec/ngram_row_ids.h. It requires
 exact int64 arithmetic on values up to ~2^63; the installed OpenVINO build's CPU
 integer kernels are 32-bit (MEASURED -- see tools/q4e/ple.py's header), so the
@@ -65,10 +65,10 @@ class Qwen4ExpTextPLELayer(nn.Module):
     def _short_conv(self, hidden_states):
         seq_len = hidden_states.shape[1]
         hidden_states = hidden_states.transpose(1, 2)                     # pin 1218
-        hidden_states = F.pad(hidden_states, (self.short_conv_state_len, 0))  # pin 1228
+        hidden_states = F.pad(hidden_states, (self.short_conv_state_len, 0))  # pin 1226
         hidden_states = hidden_states[..., -(self.short_conv_state_len + seq_len):]  # 1229
-        hidden_states = F.silu(self.conv1d(hidden_states))               # pin 1232
-        hidden_states = hidden_states.transpose(1, 2)                     # pin 1234
+        hidden_states = F.silu(self.conv1d(hidden_states))               # pin 1230
+        hidden_states = hidden_states.transpose(1, 2)                     # pin 1232
         return hidden_states
 
     def forward(self, hidden_states, input_ids, conv_mask=None):

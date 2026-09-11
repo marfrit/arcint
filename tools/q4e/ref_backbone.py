@@ -4,7 +4,7 @@ parity test.
 
 ORACLE: the pinned reference (modeling_qwen4_exp.py sha256 ca9f00bb...). This
 transcribes the DecoderLayer forward (pin 1273-1310) and the TextModel forward
-(pin 1400-1497), reusing the pin's OWN leaves (Qwen4ExpTextGatedDeltaNet,
+(pin 1400-1498), reusing the pin's OWN leaves (Qwen4ExpTextGatedDeltaNet,
 Qwen4ExpTextSparseMoeBlock, Qwen4ExpTextGatedResidual, Qwen4ExpTextPLELayer,
 nn.Embedding) so a composition-wiring error (a swapped hyper-connection, a
 dropped PLE add, a wrong combine order) diverges from the pin while every leaf's
@@ -93,7 +93,7 @@ class Qwen4ExpTextBackbone(nn.Module):
             if layer.ple is not None:                            # pin 1283-1286: PLE additive
                 hidden = hidden + layer.ple(hidden, ple_input_ids, None, conv_mask=conv_mask)
             hidden, hyper, inj = layer.attn_hyper_connection(hidden)                # pin 1288
-            g = layer.linear_attn(hidden, cache_params=None, attention_mask=conv_mask)  # pin 1289
+            g = layer.linear_attn(hidden, cache_params=None, attention_mask=conv_mask)  # pin 1290
             hidden = hyper + (g.unsqueeze(-2) * inj.unsqueeze(-1)).flatten(-2)      # pin 1302-1303
             hidden, hyper, inj = layer.mlp_hyper_connection(hidden)                 # pin 1305
             m = layer.mlp(hidden)                                                    # pin 1306

@@ -137,7 +137,7 @@ def _moe_subgraph(h2d, config, state, T):
     # sigmoid(shared_expert_gate(x)).
     sg = _mm(h2d, _c(state["shared_expert.gate_proj.weight"]), tb=True)  # [T, Is]
     su = _mm(h2d, _c(state["shared_expert.up_proj.weight"]), tb=True)    # [T, Is]
-    sinter = _mul(_silu(sg), su)                                         # pin 915
+    sinter = _mul(_silu(sg), su)                                         # pin 916
     sout = _mm(sinter, _c(state["shared_expert.down_proj.weight"]), tb=True)  # [T, H]
     sgate = op.sigmoid(_mm(h2d, _c(state["shared_expert_gate.weight"]), tb=True))  # [T,1]
     sout = _mul(sgate, sout)                                             # pin 996

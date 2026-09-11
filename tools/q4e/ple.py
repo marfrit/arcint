@@ -6,7 +6,7 @@ transformers reference, modeling_qwen4_exp.py 1235-1255) as a *static* graph:
 batch fixed to 1 and sequence length fixed at build time.
 
 THE N-GRAM ROW INDEX IS FED, NOT EMITTED (measured OV limitation). The
-row-index -> table-row function is a pure INTEGER hash (pin 1131-1181,
+row-index -> table-row function is a pure INTEGER hash (pin 1131-1180,
 byte-identical to arcint's vector-tested src/exec/ngram_row_ids.h): an
 XOR-of-(token * splitmix-multiplier) reduced modulo a per-head prime vocab,
 with eos-boundary shifting. It requires EXACT int64 arithmetic on values up to
@@ -86,19 +86,19 @@ def _group_rms(x, T, hc, H, weight_vec, eps):
 
 
 def _short_conv(x, conv_w, T, C, K, dilation):
-    """Dilated depthwise causal conv1d + silu (pin 1216-1234). x: [1,T,C] ->
+    """Dilated depthwise causal conv1d + silu (pin 1216-1233). x: [1,T,C] ->
     [1,T,C]. conv_w: [C,1,K]. Causal via a left zero-pad of (K-1)*dilation then
     K dilated taps (F.pad(state_len,0) + Conv1d(dilation), pin 1226-1232)."""
     xt = _transpose(x, [0, 2, 1])            # [1, C, T]   (pin 1218)
     state_len = (K - 1) * dilation
     xpad = op.concat([_c(np.zeros((1, C, state_len), np.float32)), xt], axis=2)  # [1,C,state_len+T]
     acc = None
-    for j in range(K):                       # depthwise dilated taps (pin 1232 conv1d)
+    for j in range(K):                       # depthwise dilated taps (pin 1230 conv1d)
         xs = _slice(xpad, j * dilation, j * dilation + T, 1, 2)  # [1, C, T]
         wj = _c(conv_w[:, 0, j].reshape(1, C, 1))
         term = _mul(xs, wj)
         acc = term if acc is None else _add(acc, term)
-    out = _silu(acc)                         # pin 1232: F.silu
+    out = _silu(acc)                         # pin 1230: F.silu
     return _transpose(out, [0, 2, 1])        # [1, T, C]   (pin 1232)
 
 
