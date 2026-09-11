@@ -254,4 +254,30 @@ def build_combine_model(config, state, seq_len):
     return model
 
 
-__all__ = ["build_hc_model", "build_combine_model"]
+def emit_hc(hyper_input, config, state, seq_len):
+    """use_combine=False mixer NODE for the assembled backbone (E2 inc5b):
+    hyper_input [1,T,hc*H] -> mixed [1,T,H]. Same body as build_hc_model."""
+    T = int(seq_len)
+    mixed, _ = _gated_residual(
+        hyper_input, T, config.hidden_size, config.hc_count, config.hc_lowrank,
+        state["hc_norm.weight"], config.rms_norm_eps, state,
+    )
+    return mixed
+
+
+def emit_combine(hyper_input, config, state, seq_len):
+    """use_combine=True mixer NODES for the assembled backbone: hyper_input
+    [1,T,hc*H] -> (mixed [1,T,H], hyper_input passthrough, injection
+    [1,T,hc_count]). Same body as build_combine_model (pin 1030-1031)."""
+    T = int(seq_len)
+    H, hc, lowrank, eps = config.hidden_size, config.hc_count, config.hc_lowrank, config.rms_norm_eps
+    mixed, xg = _gated_residual(
+        hyper_input, T, H, hc, lowrank, state["hc_norm.weight"], eps, state
+    )
+    inj = _mm(xg, _c(state["block_inject_weight.weight"]), tb=True)  # pin 1030
+    inj = _mul(inj, _c(np.float32(1.0 / hc)))
+    inj = _mul(_c(np.float32(2.0)), _sigmoid(inj))
+    return mixed, hyper_input, inj
+
+
+__all__ = ["build_hc_model", "build_combine_model", "emit_hc", "emit_combine"]

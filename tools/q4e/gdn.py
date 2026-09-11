@@ -137,7 +137,10 @@ def _rmsnorm_gated(core, z, weight_vec, eps, last_axis):
 
 
 # --- top-level emitter -----------------------------------------------------
-def build_gdn_model(config, state, seq_len):
+def _gdn_subgraph(hidden, amask, config, state, T):
+    """The GDN block body: hidden [1,T,H] f32 + amask [1,T] f32 -> out [1,T,H].
+    Shared by build_gdn_model (standalone) and emit_gdn (the assembled
+    backbone); the emitted ops are unchanged from the inc1 monolith."""
     H = config.hidden_size
     HK = config.linear_num_key_heads
     HV = config.linear_num_value_heads
@@ -149,18 +152,12 @@ def build_gdn_model(config, state, seq_len):
     value_dim = Dv * HV
     conv_dim = key_dim * 2 + value_dim
     ratio = HV // HK
-    T = int(seq_len)
     pad = (CHUNK - T % CHUNK) % CHUNK
     Tp = T + pad
     C = Tp // CHUNK
 
     def w(name):
         return state[name]
-
-    hidden = op.parameter([1, T, H], Type.f32)
-    hidden.set_friendly_name("hidden_states")
-    amask = op.parameter([1, T], Type.f32)
-    amask.set_friendly_name("attention_mask")
 
     # apply_mask_to_padding_states: hidden * attention_mask[:, :, None]
     x = _mul(hidden, _reshape(amask, [1, T, 1]))
@@ -274,10 +271,26 @@ def build_gdn_model(config, state, seq_len):
     core = _reshape(core, [1, T, value_dim])
     out = _mm(core, _c(w("out_proj.weight")), tb=True)   # [1,T,H]
 
+    return out
+
+
+def emit_gdn(hidden, amask, config, state, seq_len):
+    """The GDN subgraph for the assembled backbone (E2 inc5b)."""
+    return _gdn_subgraph(hidden, amask, config, state, int(seq_len))
+
+
+def build_gdn_model(config, state, seq_len):
+    H = config.hidden_size
+    T = int(seq_len)
+    hidden = op.parameter([1, T, H], Type.f32)
+    hidden.set_friendly_name("hidden_states")
+    amask = op.parameter([1, T], Type.f32)
+    amask.set_friendly_name("attention_mask")
+    out = _gdn_subgraph(hidden, amask, config, state, T)
     result = op.result(out)
     result.set_friendly_name("output")
     model = Model([result], [hidden, amask], "qwen4_exp_gdn_block")
     return model
 
 
-__all__ = ["build_gdn_model"]
+__all__ = ["build_gdn_model", "emit_gdn"]

@@ -10,5 +10,6 @@ from . import gdn
 from . import hc
 from . import moe
 from . import ple
+from . import backbone
 
-__all__ = ["gdn", "hc", "moe", "ple"]
+__all__ = ["gdn", "hc", "moe", "ple", "backbone"]

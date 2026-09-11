@@ -14,7 +14,7 @@ opset-13-emittable (E1.5 finding 7). With no QSA layer, rope/position_embeddings
 are unused, so none are emitted. A mixed-layer stack with a causal full-attn
 layer is deferred until the indexer no-op scope is settled.
 
-Pin facts this increment establishes (pin re-verified on dirac, sha ca9f00bb):
+Pin facts this increment establishes (pin re-verified on the dev host, sha ca9f00bb):
   * PLE is ADDITIVE (hidden += ple(...), pin 1283-1284), not a layer replacement.
   * NO final RMSNorm: TextModel returns hyper_connection_mixer(hidden) (pin 1493)
     and lm_head is applied to it directly (pin 1669, tied to embed_tokens). The
