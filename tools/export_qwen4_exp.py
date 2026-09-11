@@ -233,6 +233,12 @@ def write_output_layout(out_dir, checkpoint_dir, geometry, options,
 # NOT "compiles and serves". Every emitted component is validated against the
 # torch reference (max-abs + KL drift on synthetic weights) before the whole
 # backbone is admitted.
+# PROVENANCE, not a gate: this names the UPSTREAM commit the pinned reference
+# file was generated from. The gate that actually protects the emission is the
+# pin file's own sha256 (ca9f00bb..., with configuration_qwen4_exp.py's),
+# asserted by tests/python/test_backbone.py::_assert_pin on every q4e parity
+# cell. tools/test_export_qwen4_exp.py is stdlib-only and can only check that
+# this id is still declared and well-formed -- see FIX F's cell there.
 REFERENCE_COMMIT = "5b7dcb0d36c242d8d85920a81c564ef3a86ca6dd"
 
 

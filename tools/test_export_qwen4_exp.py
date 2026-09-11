@@ -280,6 +280,30 @@ class TestOutputLayout(unittest.TestCase):
         passthrough = set(PASSTHROUGH_FILES)
         self.assertTrue(passthrough <= required | {"tokenizer_config.json"})
 
+    def test_reference_commit_is_a_declared_wellformed_provenance_id(self):
+        """FIX F: `REFERENCE_COMMIT` became an unused import when 2cd2b2f
+        rewrote the refusal message and dropped its only assertion (the old one
+        checked that the message quoted REFERENCE_COMMIT[:8] and named
+        kld_harness).
+
+        DECISION, recorded: the constant STAYS and the import earns its keep
+        here, but only for what this test can honestly gate. Re-quoting a
+        commit id inside an error string was never a provenance check -- it
+        asserted that a substring appeared in a substring. The SUBSTANTIVE
+        oracle gate is the pin FILE's sha256 (ca9f00bb..., plus the config
+        module's), asserted by tests/python/test_backbone.py::_assert_pin,
+        which every q4e parity cell calls; this file is stdlib-only by design
+        (no venv, no transformers), so it cannot reach the pin to hash it.
+
+        What it CAN gate is that the module still declares a well-formed
+        upstream provenance id -- so a botched edit or a silent deletion of the
+        comment block that names where the pinned reference came from lands
+        red here rather than nowhere."""
+        self.assertIsInstance(REFERENCE_COMMIT, str)
+        self.assertEqual(len(REFERENCE_COMMIT), 40, REFERENCE_COMMIT)
+        self.assertTrue(all(c in "0123456789abcdef" for c in REFERENCE_COMMIT),
+                        REFERENCE_COMMIT)
+
     def test_backbone_build_refuses_full_size_with_enumerated_blockers(self):
         # E2 Phase B/C: the emitter EXISTS now (q4e.backbone from q4e.gguf_feed),
         # so the refusal is not "not yet emitted". FIX C: nor is it "window
