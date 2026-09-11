@@ -1,6 +1,10 @@
 """OV opset-13 emission of the qwen4_exp GatedResidual (hyper-connection
-mixer), in its `use_combine=False` form -- the one the text model builds as
-its final `hyper_connection_mixer` (pin line 1393).
+mixer), in BOTH of its forms:
+  * `use_combine=False` (build_hc_model) -- the text model's final
+    `hyper_connection_mixer` (pin line 1393); returns only the mixed stream.
+  * `use_combine=True`  (build_combine_model) -- the per-layer attn/mlp
+    mixers (pin lines 1270-1271; class default, pin 1004); returns the pin's
+    3-tuple (mixed, hyper_input passthrough, injection) per pin 1030-1031.
 
 Mirrors `tools/q4e/ref_hc.Qwen4ExpTextGatedResidual.forward` (itself the
 pinned transformers reference, modeling_qwen4_exp.py 1003-1031) as a *static*
@@ -55,11 +59,16 @@ Op choices where opset-13 differs from torch (and what the first runs cost):
     the first dev-host run returned that shape and the test failed on it
     (see the red in the commit message).
 
-Entry point: build_hc_model(config, state, seq_len) -> ov.Model with input
-`hyper_input` [1, T, 4H] f32 and result `output` [1, T, H] f32 (the mixed
-stream). State keys are the GatedResidual's own state_dict keys (hc_norm,
-input_mix_weight_down/up); in the full checkpoint they are the
-`hyper_connection_mixer.*` tensors fetched by E3.
+Entry points:
+  build_hc_model(config, state, seq_len) -> ov.Model, input `hyper_input`
+    [1, T, 4H] f32, single result `output` [1, T, H] f32 (mixed). State keys:
+    hc_norm, input_mix_weight_down/up; in the full checkpoint the
+    `hyper_connection_mixer.*` tensors (E3).
+  build_combine_model(config, state, seq_len) -> ov.Model, same input, THREE
+    results in pin order (pin 1031): `mixed` [1,T,H], `hyper_passthrough`
+    [1,T,4H] (the raw input unchanged), `injection` [1,T,hc_count]. Adds the
+    fourth state key block_inject_weight (pin 1012); in the full checkpoint
+    the per-layer `*_hyper_connection.*` tensors (E3).
 """
 import numpy as np
 from openvino import Model, Type
@@ -94,7 +103,13 @@ def _mean_axis_drop(x, axis):
 
 # --- the block (every op cites its pin line) ------------------------------
 def _gated_residual(hyper_input, T, H, hc, lowrank, weight_vec, eps, state):
-    """hyper_input: [1, T, hc*H] -> mixed [1, T, H]."""
+    """hyper_input: [1, T, hc*H] -> (mixed [1, T, H], xg [1, T, hc*H]).
+
+    xg is the normed+flattened stream (hyper_input_normed, pin 1021 -> the
+    flatten of pin 165); it is returned alongside mixed so the use_combine
+    emitter can feed it to the block_inject projection (pin 1030) without
+    restating the norm/gate body. build_hc_model (use_combine=False) ignores
+    it, so its emitted graph is byte-identical to before."""
 
     # pin 1021 -> Qwen4ExpTextRMSNorm, group_size = hidden (pin line 1009).
     # _norm (pin 161-165): reshape the last dim into (-1, group), then
@@ -145,7 +160,7 @@ def _gated_residual(hyper_input, T, H, hc, lowrank, weight_vec, eps, state):
     # feeds the reduced axis straight into a matmul; here it is the result
     # and must be 3-D, not 4-D).
     mixed = _mean_axis_drop(prod, 2)  # [1, T, H]
-    return mixed
+    return mixed, xg
 
 
 # --- top-level emitter -----------------------------------------------------
@@ -162,7 +177,7 @@ def build_hc_model(config, state, seq_len):
     # use_combine=False: no block_inject_weight (pin 1012; the None-return
     # branch is pin 1028-1029), so the forward is exactly the norm ->
     # low-rank gate -> weighted mean above.
-    mixed = _gated_residual(
+    mixed, _ = _gated_residual(
         hyper_input, T, H, hc, lowrank, state["hc_norm.weight"], eps, state
     )
 
@@ -172,4 +187,71 @@ def build_hc_model(config, state, seq_len):
     return model
 
 
-__all__ = ["build_hc_model"]
+# --- top-level emitter (use_combine=True, the per-layer mixer) -------------
+def build_combine_model(config, state, seq_len):
+    """The use_combine=True GatedResidual (pin 1004: the class default is
+    True; the per-layer attn/mlp mixers, pin 1270-1271) as a static opset-13
+    graph. It adds the block_inject projection (pin 1012) to the
+    use_combine=False body and returns the pin's 3-tuple (pin 1030-1031),
+    in the pin's return order:
+
+      result 0  mixed        [1, T, H]         -- identical node to build_hc_model
+      result 1  hyper_input  [1, T, hc*H]      -- the RAW input, passed through
+                                                   unchanged (pin 1031 returns
+                                                   `hyper_input` as-is; its
+                                                   [1,T,hc*H] width is the model
+                                                   entry's repeat, pin 1480)
+      result 2  injection    [1, T, hc_count]  -- 2*sigmoid(inject(x_norm)/hc),
+                                                   pin 1030
+
+    The injection stream is CONSUMED downstream in the decoder layer (pin
+    1302-1303 after attn, 1308-1309 after mlp): `hidden.unsqueeze(-2) *
+    inj.unsqueeze(-1)` then `hyper_input + injection.flatten(-2)`. This block
+    only PRODUCES the 3-tuple; the combine sites belong to the assembled
+    layer and are not emitted here. No pad-row machinery is needed -- every
+    op is row-local exactly as in the use_combine=False body (the mixed and
+    hyper-passthrough row-locality is already the settled contract of
+    test_hc_block); the masked-row injection is exactly 2*sigmoid(0)=1 (a
+    zeroed normed row -> inject matmul of zeros -> sigmoid(0)=0.5 -> *2),
+    which the combine test asserts like-for-like against the pin.
+
+    State keys: the GatedResidual's own four (hc_norm, input_mix_weight_down/
+    up, block_inject_weight); in the full checkpoint these are the per-layer
+    `*_hyper_connection.*` tensors.
+    """
+    H = config.hidden_size
+    hc = config.hc_count
+    lowrank = config.hc_lowrank
+    eps = config.rms_norm_eps
+    T = int(seq_len)
+
+    hyper_input = op.parameter([1, T, hc * H], Type.f32)
+    hyper_input.set_friendly_name("hyper_input")
+
+    # mixed stream + the normed+flattened stream xg (hyper_input_normed, pin
+    # 1021 -> 165), shared op-for-op with the use_combine=False body.
+    mixed, xg = _gated_residual(
+        hyper_input, T, H, hc, lowrank, state["hc_norm.weight"], eps, state
+    )
+
+    # pin 1030: injection_weights = 2 * sigmoid( block_inject(x_norm) / hc ).
+    # block_inject (pin 1012) is Linear(hc*H -> hc_count, bias=False): weight
+    # is [hc_count, hc*H], so y = xg @ W^T -> [1, T, hc_count].
+    inj = _mm(xg, _c(state["block_inject_weight.weight"]), tb=True)  # [1,T,hc]
+    inj = _mul(inj, _c(np.float32(1.0 / hc)))        # pin 1030: "/ self.hc_count"
+    inj = _mul(_c(np.float32(2.0)), _sigmoid(inj))   # pin 1030: 2 * sigmoid(.)
+
+    # pin 1031: return mixed_input, hyper_input (raw passthrough), injection.
+    res_mixed = op.result(mixed)
+    res_mixed.set_friendly_name("mixed")
+    res_hyper = op.result(hyper_input)
+    res_hyper.set_friendly_name("hyper_passthrough")
+    res_inj = op.result(inj)
+    res_inj.set_friendly_name("injection")
+    model = Model(
+        [res_mixed, res_hyper, res_inj], [hyper_input], "qwen4_exp_hc_combine"
+    )
+    return model
+
+
+__all__ = ["build_hc_model", "build_combine_model"]
