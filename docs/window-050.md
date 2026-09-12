@@ -37,19 +37,20 @@ blockers and names the residency assumption):
 
 ---
 
-## 1. Holds — `data` must not go to sleep mid-window
+## 1. Holds — the GPU host must not go to sleep mid-window
 
-`data` (and with it dirac and both cards) is shut down nightly at 03:00 by a
-hertz cron unless a lock says otherwise. The lock is self-expiring and never
-overwrites a running foreign lock.
+The GPU host (and with it the dev container and both cards) is shut down
+nightly by a cron on the fleet's power-control host unless a lock says
+otherwise. The lock is self-expiring and never overwrites a running foreign
+lock.
 
 ```
 # RUN  — place a hold for the window's length plus slack
-ssh hertz 'sudo /opt/herding/bin/hold-data.sh <hours> "arcint dev"'
+ssh <power-host> 'sudo <hold-script> <hours> "arcint dev"'
 # RUN  — check remaining time
-ssh hertz 'sudo /opt/herding/bin/hold-data.sh status'
+ssh <power-host> 'sudo <hold-script> status'
 # UNTESTED — release early (not exercised; the lock was left to expire)
-ssh hertz 'sudo /opt/herding/bin/hold-data.sh frei'
+ssh <power-host> 'sudo <hold-script> release'
 ```
 
 Observed output shape (`RUN`, 2026-09-12):
@@ -58,21 +59,21 @@ Observed output shape (`RUN`, 2026-09-12):
 gesperrt bis 12.09. 06:00 (noch 5 h 0 min)  pid=4015039 owner=hold-data grund=arcint dev
 ```
 
-If `data` is off, wake it via the FRITZ!DECT plug (`UNTESTED` this session — the
-host was already up):
+If the GPU host is off, wake it via its smart plug (`UNTESTED` this session —
+the host was already up):
 
 ```
 # UNTESTED
-ssh hertz 'sudo /opt/herding/power/plug-switch <AIN> on'
+ssh <power-host> 'sudo <plug-switch-script> <plug-id> on'
 ```
 
-**If `data` freezes or dies silently** — GPU experiments can do that — its kernel
-log survives elsewhere; the local journal dies with the box. Check this FIRST
-after a freeze:
+**If the GPU host freezes or dies silently** — GPU experiments can do that — its
+kernel log survives elsewhere; the local journal dies with the box. Check this
+FIRST after a freeze:
 
 ```
 # UNTESTED this session (no freeze occurred)
-ssh hertz 'sudo tail -100 /var/log/boltz-netcon.log'
+ssh <power-host> 'sudo tail -100 <netconsole-capture>'
 ```
 
 ---
@@ -88,7 +89,7 @@ anyone noticing until a benchmark caught it by accident:
 
 ```
 # RUN
-ssh dirac 'systemctl --user list-units | grep -i arcint'
+ssh <dev-host> 'systemctl --user list-units | grep -i arcint'
 ```
 
 `RUN` output, 2026-09-12:
@@ -140,7 +141,7 @@ curl -s http://127.0.0.1:8087/v1/chat/completions -H 'Content-Type: application/
 
 ```
 # RUN
-ssh dirac '~/openarc-venv/bin/python3 -c "
+ssh <dev-host> '<venv>/bin/python3 -c "
 import openvino as ov; c=ov.Core()
 print(c.available_devices)
 for d in c.available_devices:
@@ -209,15 +210,15 @@ arcint-class processes on one card wedge under load).
 
 ```
 # RUN  — the driver, from a byte-exact staged tree
-ssh dirac 'cd ~/gpunight && TREE=$HOME/gpunight LOG=$HOME/gpunight/logs ./gpu_window.sh'
+ssh <dev-host> 'cd <staged-tree> && TREE=<staged-tree> LOG=<staged-tree>/logs ./gpu_window.sh'
 ```
 
 Per-file invocation it issues:
 
 ```
 # RUN
-Q4E_GPU=GPU.0,GPU.1 Q4E_GGUF_SHARDS=/flash-model \
-  ~/openarc-venv/bin/python3 -m pytest <file> -q -s --tb=short
+Q4E_GPU=GPU.0,GPU.1 Q4E_GGUF_SHARDS=<shards> \
+  <venv>/bin/python3 -m pytest <file> -q -s --tb=short
 ```
 
 CPU-only control, for the same tree (`RUN`, 2026-09-12): `Q4E_GPU=` empty →

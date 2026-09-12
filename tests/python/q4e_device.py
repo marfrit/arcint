@@ -5,7 +5,7 @@ rolled their own `_device_params()` and every one of them called
 `core.compile_model(model, device)` with NO config. On the Intel GPU plugin that
 is not neutral:
 
-    OV 2026.4.0-22849-71640275d29, dirac
+    OV 2026.4.0-22849-71640275d29, the dev host, both Arc cards
     GPU INFERENCE_PRECISION_HINT default = <Type: 'float16'>
     CPU INFERENCE_PRECISION_HINT default = <Type: 'float32'>
 
