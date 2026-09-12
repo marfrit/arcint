@@ -334,46 +334,84 @@ def build_backbone_ir(out_dir, geometry, shards, seq_len=64, tiny=False):
         # Refuse before importing openvino/torch so the refusal stays device-free.
         # ENUMERATED, not hand-waved (FIX C, REVIEW 2cd2b2f finding C): the old
         # text named residency only and read as "get a GPU window and this
-        # works". It would not. Every blocker below is measured or cited.
+        # works". It would not.
+        #
+        # UPDATED 2026-09-12. Two of the three blockers below are now retired
+        # and the third is a MEASURED, reproducible verification instead of a
+        # projection. The refusal stands for FULL-SIZE WEIGHT-BEARING EMISSION,
+        # which is a different thing from full-size STRUCTURE emission -- and
+        # the structure now exists: `q4e.serving_shape.build_serving_shape_ir`,
+        # 48 layers at real geometry, measured on the dev host 2026-09-12:
+        #
+        #     48 layers (36 GDN + 12 dense-causal), T=64
+        #     nodes                 84,372
+        #     graph const bytes     183.07 GiB   (declared)
+        #     arena blocks on disk  0 KiB        (nothing materialised)
+        #     build                 6.5 s, 4.6 GiB RSS
+        #
+        # Run `--serving-shape` for that verification. The superseded text is
+        # kept below rather than edited away, per the 5d5d6ae precedent.
         raise NotImplementedError(
-            "full-size qwen4_exp backbone IR emission is NOT IMPLEMENTED "
+            "full-size WEIGHT-BEARING qwen4_exp backbone IR emission is NOT "
+            "IMPLEMENTED "
             f"(n_layer={geometry.get('n_layer')} n_embd={geometry.get('n_embd')} "
-            f"num_experts={geometry.get('num_experts')}). A GPU window does not "
-            "unblock it; three things do, and none of them is a device:\n"
-            "  (1) GEOMETRY: there is no full-size config. This builder has only "
-            "_tiny_config(); nothing translates `geometry` into a "
-            "Qwen4ExpTextConfig, so there is no full-size model to emit. "
-            "Code-level, device-free.\n"
-            "  (2) SCOPE: the checkpoint ships 12 of its 48 blocks as QSA "
-            "full-attention (blk 3,7,...,47), and the emitter does not yet "
-            "ASSEMBLE those blocks into the stack, though the "
-            "dense-causal block itself is emitted and parity-validated "
-            "(q4e/attention.py; 'DENSE-CAUSAL SCOPE' in q4e/backbone.py and "
-            "q4e/ref_backbone.py). Their attn_q/k/v/output and "
-            "attn_q_norm/k_norm families ARE mapped as of 2026-09-12; what "
-            "stays unmapped is the indexer.* families alone -- 48 tensors, "
-            "0.07 GiB at f32, measured against the shipped tensor list -- "
+            f"num_experts={geometry.get('num_experts')}). Full-size STRUCTURE "
+            "emission IS implemented -- use --serving-shape. What remains:\n"
+            "  (1) GEOMETRY: RETIRED 2026-09-12. `q4e.piecewise_export."
+            "real_config()` is the full-size Qwen4ExpTextConfig, and "
+            "`q4e.serving_shape.build_serving_shape_ir()` assembles all 48 "
+            "blocks from it. The old text -- 'This builder has only "
+            "_tiny_config(); nothing translates geometry into a "
+            "Qwen4ExpTextConfig' -- was true when it was written and is not "
+            "now.\n"
+            "  (2) SCOPE: RETIRED as an assembly gap, RETAINED as a priced "
+            "approximation. All 12 QSA blocks (blk 3,7,...,47) now ASSEMBLE, "
+            "as dense causal, per the frontier ruling. What stays unmapped is "
+            "the indexer.* families alone -- 48 tensors, 0.07 GiB at f32 -- "
             "because the QSA indexer's per-query nonzero is not statically "
-            "opset-13-emittable (E1.5 finding 7). The frontier ruled dense "
-            "causal IS the semantics the indexer approximates, so that "
-            "exclusion is a priced approximation, not a missing layer; the "
-            "price is measured per shape in tests/python/"
-            "test_attention_piece.py, and is EXACTLY 0.0 below the indexer "
-            "budget (corrected 2026-09-12: the indexer selects every complete "
-            "block while (i+1)//4 <= 512, so the overlaid mask equals the "
-            "causal mask; 2.386e-02 over 29/2080 rows above it).\n"
-            "  (3) RESIDENCY, and only then: this emitter materialises every "
-            "weight as an f32 ov Constant. Measured over the shipped tensor "
-            "list at that assumption, the mapped set is 659.1 GiB "
-            "(463.6 GiB of per-block tensors across 48 blocks + 195.5 GiB of "
-            "globals), of which the PLE n-gram table alone is 190.7 GiB "
-            "(320,001,536 x 160, IQ4_NL in the file). No local card holds that "
-            "and neither does the export host's RAM -- so full-size needs a "
-            "different weight strategy (quantised constants, and a gather for "
-            "the n-gram table), not a bigger window.\n"
-            "Use --gguf-ir --dry-run for the tiny end-to-end emission. The head "
-            "wiring, which used to belong on this list, is RESOLVED: lm_head is "
-            "fed from the checkpoint's output.weight (it is not tied)."
+            "opset-13-emittable (E1.5 finding 7). The price is measured per "
+            "shape in tests/python/test_attention_piece.py and is EXACTLY 0.0 "
+            "for every prefill up to T=2051 (the boundary is block_topk*ratio"
+            "+ratio-1, not the budget 2048 -- CF-BOUNDS 2026-09-12), rising to "
+            "exactly max(0, T-2051) pruned rows above it: 1 row at T=2052, 29 "
+            "rows at T=2080.\n"
+            "  (3) RESIDENCY: the 659.1 GiB figure was correct FOR ITS STATED "
+            "ASSUMPTION -- 'this emitter materialises every weight as an f32 ov "
+            "Constant' -- and that assumption was a choice, not a fact about "
+            "the model. The serving shape makes the other choice: expert bodies "
+            "as u4 constants in the tiled lowering the GPU plugin fuses "
+            "(export_mtp.py:401 moe_block_tiled), the n-gram table as a gather "
+            "off `ngram_row_ids` [1,T,16] i64 rather than a 190.7 GiB emitted "
+            "constant, and every constant declared over sparse pages so a "
+            "48-layer real-geometry graph builds in 6.5 s inside 4.6 GiB of "
+            "RAM. The measured artifact is above.\n"
+            "  (4) WHAT ACTUALLY BLOCKS A WEIGHT-BEARING FULL-SIZE ARTIFACT, "
+            "measured 2026-09-12, and none of it is a device either:\n"
+            "      (a) SERIALISATION. `ov.save_model(model, path, "
+            "compress_to_fp16)` is the only entry point this OpenVINO build's "
+            "Python API offers and it writes the whole .bin -- 183 GiB against "
+            "27 GiB free on the dev host. The weightless form the load path can "
+            "consume (backend_ov.cpp:552-556, 'a weightless IR "
+            "(ov::weights_path) still carries every constant's shape and "
+            "element type in the XML') has no Python entry point here. The "
+            "shape round-trips through save/read at reduced geometry; the "
+            "full one is not written.\n"
+            "      (b) QUANTISED WEIGHT DATA. The serving shape declares u4 "
+            "expert bodies; nothing yet maps the shipped Q3_K_XL expert rows "
+            "into that layout with scales and zero-points. The structure is "
+            "the contract, not the fill.\n"
+            "      (c) THE PAGED PORT CONTRACT. The served forward feeds 13 "
+            "ports this IR does not declare (conv_state_table.N, "
+            "gated_delta_state_table.N, key_cache.N, value_cache.N, la.* -- "
+            "backend_ov.cpp:3191-3199 and :6141-6151). "
+            "tests/python/test_serving_shape.py carries that gap as a STRICT "
+            "xfail with each port's feed site, so it fails loudly the day it "
+            "closes.\n"
+            "Use --gguf-ir --dry-run for the tiny end-to-end emission, or "
+            "--serving-shape for the full-geometry structure verification. The "
+            "head wiring, which used to belong on this list, is RESOLVED: "
+            "lm_head is fed from the checkpoint's output.weight (it is not "
+            "tied)."
         )
 
     import hashlib
@@ -457,6 +495,12 @@ def parse_args(argv=None):
                     "reference convention); export_mtp.py defaults to "
                     "'interleaved' because its MTP-head oracle was A/B'd "
                     "under that pairing.")
+    ap.add_argument("--serving-shape", dest="serving_shape", action="store_true",
+                    help="verify the FULL-GEOMETRY serving-shape IR: 48 layers "
+                         "at real widths, expert bodies slot-referenced as u4 "
+                         "and never materialised, PLE via ngram_row_ids. Prints "
+                         "the structure report and the expert-slot arithmetic. "
+                         "Device-free, needs no shards, writes nothing.")
     ap.add_argument("--dry-run", action="store_true",
                     help="run passthrough + sidecar only, skip the backbone "
                     "build. Test-hook; write_output_layout(verify=False) is "
@@ -464,8 +508,61 @@ def parse_args(argv=None):
     return ap.parse_args(argv)
 
 
+def verify_serving_shape(seq_len=64, n_layers=None):
+    """Build the full-geometry serving-shape IR and print what it IS.
+
+    This is the "honest shape verification" that replaces the residency
+    blocker: not a claim that the artifact serves, but a measurement of the
+    structure -- node count, declared constant bytes, actual blocks on disk,
+    the port contract, and the expert-slot arithmetic the load path would do.
+    Nothing is written and no card is touched.
+    """
+    from q4e import piecewise_export as pwe_
+    from q4e import serving_shape as ss
+
+    arena = ss.SparseArena()
+    try:
+        import time
+        t0 = time.time()
+        model, rep = ss.build_serving_shape_ir(seq_len=seq_len, arena=arena,
+                                               n_layers=n_layers)
+        dt = time.time() - t0
+        cfg = pwe_.real_config()
+        print("serving-shape IR (structure only; no weight data materialised)")
+        print(f"  layers                {rep['n_layers']} "
+              f"({rep['gdn_layers']} GDN + {rep['attn_layers']} dense-causal)")
+        print(f"  seq_len               {rep['seq_len']}")
+        print(f"  nodes                 {rep['nodes']:,}")
+        print(f"  declared const bytes  "
+              f"{rep['graph_const_bytes'] / 2**30:.2f} GiB")
+        print(f"  arena blocks on disk  {arena.disk_kib()} KiB")
+        print(f"  build                 {dt:.2f} s")
+        for name, shape, etype in rep["inputs"]:
+            print(f"  input   {name:16s} {shape}  {etype}")
+        for name, shape, etype in rep["outputs"]:
+            print(f"  output  {name:16s} {shape}  {etype}")
+        sp = ss.slot_pool_from_ir(model, cfg.num_experts, 0)
+        print(f"  slot_pool_from_ir (backend_ov.cpp:577) -> {sp}")
+        if sp is None:
+            print("    nullopt: no op type contains 'moe'. The MoE fusion is a "
+                  "GPU-plugin COMPILE-time pass and this walk runs on "
+                  "read_model, so the config.json fallback at "
+                  "backend_ov.cpp:3746+ is what prices the host ledger. "
+                  "0 of 52 IRs in the dev host's model store carry a "
+                  "moe-typed op either.")
+        top = sorted(rep["op_histogram"].items(), key=lambda kv: -kv[1])[:8]
+        print("  ops  " + ", ".join(f"{k} {v}" for k, v in top))
+        return rep
+    finally:
+        arena.close()
+
+
 def main(argv=None):
     args = parse_args(argv)
+
+    if getattr(args, "serving_shape", False):
+        verify_serving_shape(seq_len=args.seq_len)
+        return 0
 
     if args.gguf_ir:
         if not args.gguf_shards:
