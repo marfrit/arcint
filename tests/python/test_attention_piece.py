@@ -24,24 +24,43 @@ supersedes the orphan's premise that the leg must be KLD-shaped because "QSA
 legitimately prunes". It does not prune, below the budget. For query i the
 indexer sees i+1 visible tokens, forms num_complete_blocks = (i+1)//ratio of
 them and keeps topk(min(block_topk, num_complete_blocks)) (pin 734, 757) with
-block_topk = budget//ratio = 2048//4 = 512. While (i+1)//4 <= 512 that min is
-num_complete_blocks, i.e. EVERY complete block is selected, and the incomplete
-tail is added unconditionally -- the selected set is every visible token and the
-overlaid mask equals the causal mask exactly. So up to ~2048 positions the
-approximation is not an approximation:
+block_topk = budget//ratio = 2048//4 = 512 (the definition is pin 684; pin 734
+and 757 are `num_complete_blocks` and the min). While (i+1)//4 <= 512 that min
+is num_complete_blocks, i.e. EVERY complete block is selected, and the
+incomplete tail is added unconditionally -- the selected set is every visible
+token and the overlaid mask equals the causal mask exactly.
+
+THE BOUNDARY IS 2051, NOT 2048 (CF-BOUNDS, corrected 2026-09-12; REVIEW e78812d
+F6). Row i is dense iff (i+1)//ratio <= block_topk. With ratio 4 and block_topk
+512 that is i+1 <= 2051, i.e. i <= 2050, because 2051//4 == 512 and 2052//4 ==
+513. So EVERY row of a prefill is dense iff
+
+    T <= block_topk * ratio + ratio - 1  ==  budget + ratio - 1  ==  2051
+
+and the number of pruned rows at any T is exactly max(0, T - 2051). The prose
+here said "up to ~2048" and the cell branched on `T <= budget`, which is wrong
+in the interval {2049, 2050, 2051}: the price there is still exactly 0.0 while
+the cell took the `else` branch and demanded `md > 0.0`. Not live at the time
+(the parametrisation was 64/96/2080), but a gate that would fail on a correct
+result is a defect in a file whose stated standard is derived-not-tuned bounds.
+The boundary is now the gate: 2051 and 2052 are parametrised, the threshold is
+DERIVED from the config rather than written down, and the row count is asserted
+EXACTLY rather than as "> 0".
 
     T=  64   |dense - QSA| max-abs 0.000000e+00    rows differing    0/64
     T=  96   |dense - QSA| max-abs 0.000000e+00    rows differing    0/96
+    T=2051   |dense - QSA| max-abs 0.000000e+00    rows differing    0/2051
+    T=2052   |dense - QSA| max-abs <sampled>       rows differing    1/2052
     T=2080   |dense - QSA| max-abs 2.385560e-02    rows differing   29/2080
 
 The zeros are exact and input-independent -- the masks are equal, so the
 arithmetic is the same arithmetic. The T=2080 magnitude is NOT: a second draw
 (seeded differently, same geometry and weights) gave 1.720381e-02 over the same
 29 rows. The ROW COUNT is the structural quantity and the magnitude is a sample,
-so the cell asserts ">0 above the budget, ==0 below" and pastes the number
-rather than bounding it. 29 rows, not 32: pruning needs
-num_complete_blocks > block_topk, i.e. (i+1)//4 > 512, so it begins near i=2048
-and the top rows of a 2080-token prefill are the only ones that see it.
+so the cell asserts the EXACT count and pastes the magnitude rather than
+bounding it. 29 rows at T=2080 = 2080 - 2051, and 1 row at T=2052 -- the first
+pruned row is i=2051, which is what makes 2051/2052 the pair that pins the
+boundary from both sides.
 
 That makes the parity leg at serving-relevant prefill lengths EQUALITY-shaped
 against the pin's REAL QSA path -- a far stronger gate than a KLD-shaped one,
@@ -347,11 +366,17 @@ def test_baked_rope_tables_are_the_pin_rotary_module(cfg, T):
 # 3. the oracle's own property, and the ruling's PRICE
 # --------------------------------------------------------------------------- #
 @_skip_shards
-@pytest.mark.parametrize("T", [64, 96, 2080])
+@pytest.mark.parametrize("T", [64, 96, 2051, 2052, 2080])
 def test_qsa_price_is_zero_below_the_budget(cfg, attn_state, indexer_state, T):
-    """DENSE vs QSA, both the pin, real weights. Below the budget the indexer
+    """DENSE vs QSA, both the pin, real weights. Below the boundary the indexer
     selects every visible token and the two are bit-identical; above it, the
-    divergence is the ruling's price and is PASTED, never tolerated silently."""
+    divergence is the ruling's price and is PASTED, never tolerated silently.
+
+    The boundary is DERIVED from the config here, not written down, and it is
+    `block_topk * ratio + ratio - 1` = 2051, not the budget 2048 (CF-BOUNDS,
+    REVIEW e78812d F6). 2051 and 2052 are parametrised so the boundary itself
+    is the gate rather than a claim in the prose, and the count of pruned rows
+    is asserted EXACTLY: max(0, T - 2051)."""
     hidden = _hidden(cfg, T)
     cs = _cos_sin(cfg, T, torch.float32)
     dense = _pin_attention(cfg, attn_state, indexer_state, True, torch.float32)
@@ -363,18 +388,33 @@ def test_qsa_price_is_zero_below_the_budget(cfg, attn_state, indexer_state, T):
     md = float(diff.max())
     rows = int(diff.amax(-1).squeeze(0).gt(0).sum())
     budget = cfg.indexer_budget
+    ratio = cfg.indexer_compress_ratio
+    block_topk = budget // ratio                     # pin 684
+    # Row i is dense iff (i+1)//ratio <= block_topk (pin 734, 757), i.e.
+    # i+1 <= block_topk*ratio + ratio - 1. Every row of a T-token prefill is
+    # dense iff T <= that. Derived, never a literal -- a config change moves it.
+    dense_max_T = block_topk * ratio + ratio - 1
+    expected_rows = max(0, T - dense_max_T)
     sys.stdout.write(
-        f"\n[qsa-price] T={T} block_topk={budget // cfg.indexer_compress_ratio} "
-        f"|dense-QSA| max-abs {md:.6e}  rows differing {rows}/{T}\n")
-    if T <= budget:
-        assert md == 0.0 and rows == 0, (
-            f"T={T} is inside the indexer budget {budget}, where every complete "
-            f"block is selected (topk(min(block_topk, nb)) == nb), so dense and "
-            f"QSA must be bit-identical -- got max-abs {md:.3e} over {rows} rows")
+        f"\n[qsa-price] T={T:5d} block_topk={block_topk} "
+        f"dense_max_T={dense_max_T} |dense-QSA| max-abs {md:.6e}  "
+        f"rows differing {rows}/{T}  (expected {expected_rows})\n")
+    assert dense_max_T == 2051, (
+        f"the derivation moved: block_topk {block_topk} x ratio {ratio} + "
+        f"{ratio} - 1 = {dense_max_T}, but the pin's geometry gives 2051")
+    assert rows == expected_rows, (
+        f"T={T}: the indexer prunes exactly the rows with (i+1)//{ratio} > "
+        f"{block_topk}, i.e. i >= {dense_max_T}, so {expected_rows} rows should "
+        f"differ -- measured {rows}. The boundary is structural, not a sample")
+    if expected_rows == 0:
+        assert md == 0.0, (
+            f"T={T} is at or below the dense boundary {dense_max_T}, where every "
+            f"complete block is selected (topk(min(block_topk, nb)) == nb), so "
+            f"dense and QSA must be bit-identical -- got max-abs {md:.3e}")
     else:
-        assert md > 0.0 and rows > 0, (
-            f"T={T} exceeds the budget {budget}; the indexer must prune and the "
-            f"price must be visible, otherwise this cell measures nothing")
+        assert md > 0.0, (
+            f"T={T} exceeds the dense boundary {dense_max_T}; the indexer must "
+            f"prune and the price must be visible, otherwise this measures nothing")
 
 
 # --------------------------------------------------------------------------- #

@@ -72,15 +72,23 @@ ACCEPTANCE IS TWO-LEGGED (both are needed; neither substitutes for the other):
 
         T=  64   |dense - QSA| max-abs 0.000000e+00   rows differing    0/64
         T=  96   |dense - QSA| max-abs 0.000000e+00   rows differing    0/96
+        T=2051   |dense - QSA| max-abs 0.000000e+00   rows differing    0/2051
+        T=2052   |dense - QSA| max-abs 2.307817e-06   rows differing    1/2052
         T=2080   |dense - QSA| max-abs 2.385560e-02   rows differing   29/2080
+
+    THE BOUNDARY IS 2051, NOT THE BUDGET 2048 (CF-BOUNDS, measured 2026-09-12).
+    Every row is dense iff T <= block_topk*ratio + ratio - 1 = 2051, and the
+    pruned-row count at any T is exactly max(0, T - 2051) -- 1 at T=2052 and 29
+    at T=2080, both measured, both predicted by the derivation before the run.
+    The 2049..2051 interval is exactly zero and used to sit on the wrong side of
+    the test's own branch.
 
     So this leg is EQUALITY-shaped at serving prefill lengths -- a stronger gate
     than a KLD-shaped one, not a weaker one -- and the price there is a measured
     0.0 rather than a tolerated residue. The price is non-zero only ABOVE the
-    budget (pruning needs (i+1)//4 > 512, i.e. from row i = 2051), where it is
-    PASTED and never bounded, the row count being the structural quantity and
-    the magnitude a sample. The end-to-end KLD gate decides small-enough for
-    T > 2048, later.
+    boundary, where it is PASTED and never bounded, the row count being the
+    structural quantity and the magnitude a sample. The end-to-end KLD gate
+    decides small-enough for T > 2051, later.
 
 `attention_scaling` (pin 133-134) multiplies cos/sin; for rope_type "default"
 the pin's own `compute_default_rope_parameters` returns 1.0 (pin 117), so the
