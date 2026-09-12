@@ -53,6 +53,7 @@ A checker with no negative cell is the same species of defect it is here to
 catch.
 """
 import ast
+import re
 import sys
 from pathlib import Path
 
@@ -651,10 +652,31 @@ if __name__ == "__main__":                                  # pragma: no cover
 #                      LEG 2 (`git ls-files`) skips. A clone and a tarball of
 #                      the SAME COMMIT therefore report different splits, and
 #                      both are correct.
-_COUNT_GATES = frozenset({"Q4E_GPU", "Q4E_GGUF_SHARDS", "Q4E_SERVING_FULL"})
+#   Q4E_GDN_UT_MODE    the GDN unit-test emit mode, read by tools/q4e/gdn.py.
+#                      RECORDED BECAUSE THE CENSUS READS IT (REVIEW fe68342,
+#                      M2), not because it was caught moving a count: it is a
+#                      switch the suite obeys through an IMPORTED MODULE rather
+#                      than through a test file, which is the shape the first
+#                      census could not see. "Measured count-harmless today" is
+#                      a date, not a property.
+_COUNT_GATES = frozenset({"Q4E_GPU", "Q4E_GGUF_SHARDS", "Q4E_SERVING_FULL",
+                          "Q4E_GDN_UT_MODE"})
 
+# The files whose CELLS are scanned for checkout-shaped gates: the suite's own
+# test modules, plus any conftest (a fixture there gates every cell under it).
 _SUITE_FILES = sorted((REPO_ROOT / "tests" / "python").glob("test_*.py")) + [
-    REPO_ROOT / "tools" / "test_export_qwen4_exp.py"]
+    REPO_ROOT / "tools" / "test_export_qwen4_exp.py"] + sorted(
+    (REPO_ROOT / "tests").rglob("conftest.py"))
+
+# The files scanned for `Q4E_*` READS. Wider than the cell scan on purpose
+# (REVIEW fe68342, M2): a gate does not have to live in a test file to move the
+# split. `tools/q4e/gdn.py` reads `Q4E_GDN_UT_MODE`, and every cell that emits
+# a GDN block obeys it through the import; `tests/python/q4e_device.py` reads
+# `Q4E_GPU` for the whole suite. Scanning only `test_*.py` censused neither.
+_CENSUS_FILES = sorted(
+    set(_SUITE_FILES)
+    | set((REPO_ROOT / "tests" / "python").glob("*.py"))
+    | set((REPO_ROOT / "tools" / "q4e").glob("*.py")))
 
 
 def test_the_suite_declares_no_count_gate_outside_the_recorded_set():
@@ -670,11 +692,15 @@ def test_the_suite_declares_no_count_gate_outside_the_recorded_set():
     So: every `Q4E_*` environment variable the suite reads must be one of the
     recorded gates. A new one is a new axis in that space, and it goes red here
     until the recorded matrix grows to cover it.
+
+    The census reads `_CENSUS_FILES`, which is WIDER than the test modules: a
+    variable read by an imported tooling module gates the suite exactly as much
+    as one read by a cell (REVIEW fe68342, M2).
     """
     import re
 
     found = {}
-    for path in _SUITE_FILES:
+    for path in _CENSUS_FILES:
         if not path.is_file():
             continue
         for name in re.findall(r"Q4E_[A-Z0-9_]+", path.read_text()):
@@ -699,45 +725,486 @@ def test_the_suite_declares_no_count_gate_outside_the_recorded_set():
         f"two axes left are the only ones that matter.")
 
 
-# The files whose cells skip on the CHECKOUT's shape rather than on an env
-# var: they need a git work tree. Written down because this is the axis that
-# produced K2's disagreement, and because the count of such cells IS the
+
+
+# ---------------------------------------------------------------------------
+# THE CHECKOUT-SHAPED GATES -- the axis that is not an environment variable.
+# K2 (REVIEW 9162ac9) recorded it per FILE with a regex. REVIEW fe68342 (B3)
+# showed that promise was not kept, so it is an ast scan over CELLS now.
+# ---------------------------------------------------------------------------
+#
+# WHAT THE REVIEWER DID, AND WHY THE OLD SHAPE DESERVED TO LOSE. The docstring
+# promised "a third one appearing silently would make the recorded env matrix
+# wrong without anything going red". The reviewer wrote a third checkout-gated
+# cell the ordinary other way --
+#
+#     def test_something(...):
+#         if not _in_git_worktree():
+#             pytest.skip("needs a git work tree")
+#
+# -- and the guard stayed GREEN while the clone-minus-tarball delta moved from
+# two to three. The regex `skipif\([^)]*(?:ls-files|_in_git_worktree|...)` sees
+# ONE syntactic shape: a decorator. An in-body `pytest.skip()` is the same gate
+# with the same effect on the count.
+#
+# TWO THINGS ARE WIDENED, not one:
+#
+#   1. the FORM. A cell is checkout-gated if a `skipif` it carries is
+#      checkout-flavoured, OR its body calls `pytest.skip()` on a
+#      checkout-flavoured path, OR it requests a fixture in the same file that
+#      does, OR its module gates itself wholesale (`pytestmark`, or a
+#      module-level `pytest.skip(..., allow_module_level=True)`), OR a
+#      `marks=` argument carries the gate onto one parametrised id. Helper
+#      functions are followed to a fixpoint, so gating on `_in_git_worktree()`
+#      is seen wherever the helper is named.
+#      THE LAST THREE OF THOSE ARE NOT THE REVIEWER'S SHAPE. They were found
+#      by asking, before re-measuring, which OTHER ordinary spellings of the
+#      same gate this scan would still miss -- the same question the reviewer
+#      asked of the regex, asked of its replacement.
+#   2. the GRANULARITY. The recorded set is CELLS, not files. The old set
+#      compared file names, so a second gated cell added to a file already in
+#      the set -- `test_citations.py`, say -- moved the delta without moving
+#      the set. The count of gated cells IS the clone-minus-tarball delta, so
+#      that is what gets recorded.
+#
+# WHAT STILL SLIPS, stated rather than implied. The scan is per-file and
+# reads `_SUITE_FILES` (the suite's test modules and any conftest), so two
+# gates cross a file boundary and are invisible to it:
+#
+#   * a fixture defined in an IMPORTED helper module -- `q4e_device.py`, or
+#     anything under `tools/q4e/` -- that skips on the checkout's shape;
+#   * a conftest fixture that skips: the conftest IS scanned, but the cells it
+#     gates live in other files, so the gate is seen and the cells are not.
+#
+# Neither exists in the tree today -- measured, not assumed: `pytest.skip(`
+# appears in no non-test module and in no conftest (there is no conftest at
+# all). Filed as CF-CHECKOUTGATE-IMPORT, DONE-WHEN the scan resolves fixtures
+# across the import graph or the suite gains a conftest, whichever comes
+# first. "Nothing does this today" is a date, not a property.
+
+_CHECKOUT_STRINGS = (
+    "ls-files", "is-inside-work-tree", "rev-parse", "--git-dir", ".git",
+    "work tree", "worktree",
+)
+_CHECKOUT_NAMES = re.compile(r"in_git|git_worktree|worktree|git_dir", re.I)
+
+
+def _checkout_flavoured(node):
+    """True if this subtree mentions the shape of the checkout: a name like
+    `_in_git_worktree`, or a string naming a git plumbing call or `.git`.
+
+    Deliberately generous. A false positive here fails an equality assertion
+    loudly and gets recorded; a false negative is the B3 defect, silent.
+    """
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name) and _CHECKOUT_NAMES.search(sub.id):
+            return True
+        if isinstance(sub, ast.Attribute) and _CHECKOUT_NAMES.search(sub.attr):
+            return True
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+            low = sub.value.lower()
+            if any(tok in low for tok in _CHECKOUT_STRINGS):
+                return True
+    return False
+
+
+def _called_names(node):
+    """The root identifier of every call made anywhere in this subtree."""
+    out = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            nm = _root_name(sub.func)
+            if nm:
+                out.add(nm)
+    return out
+
+
+def _flavoured_helpers(tree):
+    """Module functions that reach the checkout, transitively.
+
+    `test_citations._tracked_files` runs `git ls-files`; `_in_git_worktree`
+    runs `git rev-parse --is-inside-work-tree`. A cell that calls either and
+    then skips is checkout-gated even though the cell itself spells no git.
+    """
+    funcs = {n.name: n for n in ast.walk(tree)
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    flavoured = {name for name, fn in funcs.items()
+                 if _CHECKOUT_NAMES.search(name) or _checkout_flavoured(fn)}
+    changed = True
+    while changed:
+        changed = False
+        for name, fn in funcs.items():
+            if name in flavoured:
+                continue
+            if _called_names(fn) & flavoured:
+                flavoured.add(name)
+                changed = True
+    return flavoured
+
+
+def _reaches_checkout(node, helpers):
+    return _checkout_flavoured(node) or bool(_called_names(node) & helpers)
+
+
+def _calls_pytest_skip(fn):
+    """`pytest.skip(...)` called in this function's own body."""
+    for sub in ast.walk(fn):
+        if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                and sub.func.attr == "skip" and _root_name(sub.func) == "pytest"):
+            return True
+    return False
+
+
+def _mentions_gating_marker(node, markers):
+    """True if any name in this subtree is bound to a checkout-shaped marker.
+
+    Walking every name rather than reading the root one covers `marks=`:
+    `@pytest.mark.parametrize("x", [pytest.param(1, marks=_needs_git)])` gates
+    one id of a cell, which moves the count as surely as gating the cell.
+    """
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name) and markers.get(sub.id):
+            return True
+    return False
+
+
+def _decorator_gate(declist, helpers, markers):
+    """True if any decorator in this list is a checkout-flavoured skip gate,
+    written inline as `pytest.mark.skipif(...)`, bound to a module name, or
+    carried on a `marks=` argument."""
+    for dec in declist:
+        if isinstance(dec, ast.Call) and _is_pytest_mark_call(dec):
+            if _reaches_checkout(dec, helpers):
+                return True
+        if _mentions_gating_marker(dec, markers):
+            return True
+    return False
+
+
+def checkout_shaped_gated_cells(source, filename="<string>"):
+    """Every test cell in this module that skips when the tree has no `.git`.
+
+    Returns a sorted list of `"<basename>::<cell>"`. Its LENGTH is the
+    clone-minus-tarball delta for this file.
+    """
+    tree = ast.parse(source, filename=filename)
+    base = Path(filename).name
+    helpers = _flavoured_helpers(tree)
+
+    # module-level markers, and whether each one is a checkout gate
+    markers = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and _is_pytest_mark_call(node.value):
+            flav = _reaches_checkout(node.value, helpers)
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    markers[tgt.id] = flav
+
+    # Whole-module gates, which cost every cell in the file rather than one:
+    #   pytestmark = _needs_git                        (a bound marker)
+    #   pytestmark = pytest.mark.skipif(not _in_git_worktree(), ...)   (inline)
+    #   if not _in_git_worktree():
+    #       pytest.skip("...", allow_module_level=True)
+    # The last one is the cheapest way to gate a whole file and it is the one
+    # a cell-shaped scan would be most embarrassed to miss.
+    module_gated = False
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name) and tgt.id == "pytestmark":
+                    if (_mentions_gating_marker(node.value, markers)
+                            or _reaches_checkout(node.value, helpers)):
+                        module_gated = True
+        elif not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                   ast.ClassDef)):
+            for sub in ast.walk(node):
+                if (isinstance(sub, ast.Call)
+                        and isinstance(sub.func, ast.Attribute)
+                        and sub.func.attr == "skip"
+                        and _root_name(sub.func) == "pytest"
+                        and _reaches_checkout(node, helpers)):
+                    module_gated = True
+
+    # (function, inherited-gate) for module-level functions and class methods
+    funcs = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            funcs.append((node, module_gated))
+        elif isinstance(node, ast.ClassDef):
+            cls_gated = module_gated or _decorator_gate(
+                node.decorator_list, helpers, markers)
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    funcs.append((sub, cls_gated))
+
+    # a fixture that skips on the checkout gates every cell that requests it,
+    # and every fixture that requests IT -- to a fixpoint, as in LEG 2
+    fixtures = {fn.name: fn for fn, _ in funcs if _is_fixture(fn)}
+    gating = {name for name, fn in fixtures.items()
+              if _calls_pytest_skip(fn) and _reaches_checkout(fn, helpers)}
+    changed = True
+    while changed:
+        changed = False
+        for name, fn in fixtures.items():
+            if name in gating:
+                continue
+            if set(_params(fn)) & gating:
+                gating.add(name)
+                changed = True
+
+    out = []
+    for fn, inherited in funcs:
+        if not fn.name.startswith("test_") or _is_fixture(fn):
+            continue
+        gated = (
+            inherited
+            or _decorator_gate(fn.decorator_list, helpers, markers)
+            or (_calls_pytest_skip(fn) and _reaches_checkout(fn, helpers))
+            or bool(set(_params(fn)) & gating)
+        )
+        if gated:
+            out.append(f"{base}::{fn.name}")
+    return sorted(out)
+
+
+# The cells that skip on the CHECKOUT's shape rather than on an env var: they
+# need a git work tree. Written down because this is the axis that produced
+# K2's disagreement, and because the NUMBER OF THESE CELLS IS the
 # clone-minus-tarball delta.
 #
-# THIS SET WAS WRONG WHEN FIRST WRITTEN. The cell below said "only
-# test_citations may do this" and went red on its first run naming
-# test_window_manifest.py, which gates its sha-resolution cell the same way.
-# Two cells, not one -- which is exactly the 194/84 (clone) against 192/86
-# (tarball) gap that K2 asked to be reconciled: two fewer passes, two more
-# skips, both legitimate.
-_CHECKOUT_GATED_FILES = frozenset({"test_citations.py", "test_window_manifest.py"})
+# THE FILE-LEVEL VERSION OF THIS SET WAS WRONG TWICE, and both corrections are
+# on the record rather than edited away. First it said "only test_citations may
+# do this" and went red on its first run naming test_window_manifest.py -- two
+# cells, not one, which is exactly the 194/84 (clone) against 192/86 (tarball)
+# gap K2 was asked to reconcile. Then REVIEW fe68342 (B3) showed that a set of
+# FILE NAMES policed by a decorator regex cannot keep the promise its docstring
+# made: a third gated cell written as an in-body `pytest.skip()` left it green.
+_CHECKOUT_GATED_CELLS = frozenset({
+    "test_citations.py::test_every_resolvable_citation_points_at_a_line_that_exists",
+    "test_window_manifest.py::test_every_named_sha_resolves_to_a_commit",
+})
 
 
-def test_the_checkout_shaped_gates_are_exactly_the_recorded_files():
-    """The non-env gate, pinned to the files that have it.
+def test_the_checkout_shaped_gates_are_exactly_the_recorded_cells():
+    """The non-env gate, pinned to the CELLS that have it.
 
-    A cell gated on `git ls-files` / a git work tree skips in a tree with no
-    `.git` -- which is what a `git archive` extract is. That is legitimate, but
-    the SET of such cells must be closed, because their number is the whole
-    difference between a clone reading and a tarball reading of the same
-    commit. A third one appearing silently would make the recorded env matrix
-    wrong without anything going red.
+    A cell gated on a git work tree skips in a tree with no `.git` -- which is
+    what a `git archive` extract is. That is legitimate, but the SET of such
+    cells must be closed, because their number is the whole difference between
+    a clone reading and a tarball reading of the same commit. A third one
+    appearing silently would make the recorded env matrix wrong without
+    anything going red -- and that is now true of a gate written in the body of
+    a cell, which is how the reviewer proved the previous version of this cell
+    did not mean it.
+
+    Parametrised cells would break the cell-count-equals-delta identity (one
+    cell, many ids); none of the recorded ones is parametrised, and a new one
+    that is would show up here as a set difference first.
     """
-    import re
-
-    gated = {}
+    found = []
     for path in _SUITE_FILES:
         if not path.is_file():
             continue
-        hits = re.findall(r"skipif\([^)]*(?:ls-files|_in_git_worktree|worktree|\.git)",
-                          path.read_text())
-        if hits:
-            gated[path.name] = len(hits)
+        found.extend(checkout_shaped_gated_cells(path.read_text(), str(path)))
+    found = sorted(found)
 
-    print(f"[count-gates] checkout-shaped (git work tree) skip gates: {gated}")
-    assert set(gated) == set(_CHECKOUT_GATED_FILES), (
-        f"the files gating a skip on the checkout's shape are {sorted(gated)}, "
-        f"not the recorded {sorted(_CHECKOUT_GATED_FILES)}. Their count is the "
+    print(f"\n[count-gates] checkout-shaped (git work tree) gated cells "
+          f"({len(found)}): {found}")
+    assert set(found) == set(_CHECKOUT_GATED_CELLS), (
+        f"the cells gating a skip on the checkout's shape are {found}, not the "
+        f"recorded {sorted(_CHECKOUT_GATED_CELLS)}. Their COUNT is the "
         f"clone-minus-tarball delta in the recorded env matrix, so this set "
-        f"changing means that matrix is stale -- update both, and do not "
-        f"reconcile two readings by running one of them in the other's tree.")
+        f"changing means that matrix is stale -- re-measure it and update both, "
+        f"and do not reconcile two readings by running one of them in the "
+        f"other's tree.")
+
+
+def test_the_count_gate_census_reaches_past_the_test_files():
+    """M2 (REVIEW fe68342): the census population, asserted.
+
+    `tools/q4e/gdn.py` reads `Q4E_GDN_UT_MODE` and every cell that emits a GDN
+    block obeys it through the import; `tests/python/q4e_device.py` reads
+    `Q4E_GPU` for the whole suite. A census of `test_*.py` alone saw neither,
+    so narrowing it back would silently re-open the hole rather than fail.
+    """
+    scanned = {str(p.relative_to(REPO_ROOT)) for p in _CENSUS_FILES}
+    for expected in ("tools/q4e/gdn.py", "tests/python/q4e_device.py",
+                     "tests/python/test_citations.py",
+                     "tools/test_export_qwen4_exp.py"):
+        assert expected in scanned, (
+            f"{expected} is not in the count-gate census population; a "
+            f"`Q4E_*` read there would move the split unseen. Scanned: "
+            f"{sorted(scanned)}")
+
+
+# ---------------------------------------------------------------------------
+# THE CHECKOUT SCANNER'S OWN RED AND GREEN -- permanent, in-tree.
+# The first of these is the reviewer's B3 mutation, reduced.
+# ---------------------------------------------------------------------------
+
+_GATE_IN_BODY = '''
+import pytest
+
+def _in_git_worktree():
+    return False
+
+def test_one():
+    if not _in_git_worktree():
+        pytest.skip("needs a git work tree")
+    assert True
+'''
+
+_GATE_DECORATOR = '''
+import pytest
+
+def _in_git_worktree():
+    return False
+
+@pytest.mark.skipif(not _in_git_worktree(), reason="no .git")
+def test_one():
+    assert True
+'''
+
+_GATE_VIA_FIXTURE = '''
+import subprocess
+import pytest
+
+@pytest.fixture()
+def tracked():
+    r = subprocess.run(["git", "ls-files"], capture_output=True, text=True)
+    if r.returncode != 0:
+        pytest.skip("no index")
+    return r.stdout.split()
+
+def test_one(tracked):
+    assert tracked
+'''
+
+_GATE_VIA_MARKER_NAME = '''
+import pytest
+
+def _worktree():
+    return False
+
+_needs_git = pytest.mark.skipif(not _worktree(), reason="r")
+
+@_needs_git
+def test_one():
+    assert True
+'''
+
+_GATE_VIA_PARAM_MARKS = '''
+import pytest
+
+def _in_git_worktree():
+    return False
+
+_needs_git = pytest.mark.skipif(not _in_git_worktree(), reason="r")
+
+@pytest.mark.parametrize("x", [1, pytest.param(2, marks=_needs_git)])
+def test_one(x):
+    assert x
+'''
+
+_SKIP_UNRELATED = '''
+import os
+import pytest
+
+_SHARDS = os.environ.get("Q4E_GGUF_SHARDS", "")
+
+def test_one():
+    if not _SHARDS:
+        pytest.skip("needs the real shards")
+    assert True
+'''
+
+_GATE_WHOLE_MODULE_PYTESTMARK = '''
+import pytest
+
+def _in_git_worktree():
+    return False
+
+pytestmark = pytest.mark.skipif(not _in_git_worktree(), reason="r")
+
+def test_one():
+    assert True
+
+def test_two():
+    assert True
+'''
+
+_GATE_WHOLE_MODULE_SKIP = '''
+import subprocess
+import pytest
+
+if subprocess.run(["git", "rev-parse", "--is-inside-work-tree"]).returncode:
+    pytest.skip("not a git work tree", allow_module_level=True)
+
+def test_one():
+    assert True
+
+def test_two():
+    assert True
+'''
+
+_MODULE_SKIP_UNRELATED = '''
+import os
+import pytest
+
+if not os.environ.get("Q4E_GGUF_SHARDS"):
+    pytest.skip("needs the real shards", allow_module_level=True)
+
+def test_one():
+    assert True
+'''
+
+
+@pytest.mark.parametrize("form,source", [
+    ("in-body-skip", _GATE_IN_BODY),
+    ("skipif-decorator", _GATE_DECORATOR),
+    ("fixture-that-skips", _GATE_VIA_FIXTURE),
+    ("module-level-marker", _GATE_VIA_MARKER_NAME),
+    ("param-marks", _GATE_VIA_PARAM_MARKS),
+])
+def test_the_checkout_scanner_sees_every_gate_form(form, source):
+    """`in-body-skip` IS the B3 mutation: the shape that stayed green.
+
+    A scanner that knows only decorators re-opens the hole the moment somebody
+    writes the gate the other ordinary way.
+    """
+    assert checkout_shaped_gated_cells(source, f"<{form}>.py") == \
+        [f"<{form}>.py::test_one"], form
+
+
+@pytest.mark.parametrize("form,source", [
+    ("pytestmark", _GATE_WHOLE_MODULE_PYTESTMARK),
+    ("allow-module-level-skip", _GATE_WHOLE_MODULE_SKIP),
+])
+def test_the_checkout_scanner_sees_a_whole_module_gate(form, source):
+    """A module that gates itself costs EVERY cell in it, so it is the largest
+    possible error in the clone-minus-tarball delta and the one a cell-shaped
+    scan is likeliest to walk past."""
+    assert checkout_shaped_gated_cells(source, f"<{form}>.py") == [
+        f"<{form}>.py::test_one", f"<{form}>.py::test_two"], form
+
+
+@pytest.mark.parametrize("form,source", [
+    ("in-body-skip", _SKIP_UNRELATED),
+    ("module-level-skip", _MODULE_SKIP_UNRELATED),
+])
+def test_the_checkout_scanner_ignores_a_skip_that_is_not_checkout_shaped(form, source):
+    """False alarms are as fatal as misses. A shards-gated skip does NOT move
+    the clone-minus-tarball delta and must not be counted in it."""
+    assert checkout_shaped_gated_cells(source, f"<{form}>.py") == [], form
+
+
+def test_the_checkout_scanner_finds_the_two_recorded_cells_by_name():
+    """The scanner is run against the real modules it polices, so a rename or
+    a deletion of either cell shows up here as well as in the set equality."""
+    for base, cell in (("test_citations.py",
+                        "test_every_resolvable_citation_points_at_a_line_that_exists"),
+                       ("test_window_manifest.py",
+                        "test_every_named_sha_resolves_to_a_commit")):
+        path = REPO_ROOT / "tests" / "python" / base
+        found = checkout_shaped_gated_cells(path.read_text(), str(path))
+        assert f"{base}::{cell}" in found, (base, found)
