@@ -560,13 +560,23 @@ Run them in this order. Each earlier item is a control for the ones after it.
 
 | # | item | reproducer | expected | if it fails |
 |---|---|---|---|---|
-| 1 | **2-layer boot / 4 GiB chunking** | §4.4's boot sequence at `--layers 2` | the A770 refuses a 25,600,122,880 B object (cap 4,294,959,104 B); the B60 accepts it | chunk the PLE table, or pull `ov::intel_gpu::hint::enable_large_allocations` and record the cost — the lever is named in §4.4 and has never been pulled |
-| 2 | **u4 compressed selection (the fill)** | `tools/repro_fc_compressed_selection.py` | `production_2d` selects a compressed primitive on both cards; `as_emitted` is the open question | §4.5.1 below — the candidates are built to isolate it |
+| 1 | **1-layer boot, then depth / 4 GiB chunking** | §4.4's boot sequence at `--layers 1`, then 2, then deeper | the A770 refuses a 25,600,122,880 B object (cap 4,294,959,104 B); the B60 accepts it. Start at ONE layer: it is the cheapest shape that can carry the object-cap refusal, and a depth that boots is a control for the depth that does not | chunk the PLE table, or pull `ov::intel_gpu::hint::enable_large_allocations` and record the cost — the lever is named in §4.4 and has never been pulled |
+| 2 | **u4 compressed selection (the fill)** | `tools/repro_fc_compressed_selection.py` | `production_2d` selects a compressed primitive on both cards; `as_emitted` is the open question. **Detect on `MOECompressed` / `GatherMatmulCompressed` / `moe_3gemm_fused_compressed`, NOT `FullyConnectedCompressed`, and record the three gate terms** — see §4.5.1's RE-AIMED block | §4.5.1 below — the candidates are built to isolate it |
 | 3 | **scatter router legs** | `tests/python/test_moe_block.py` on GPU.0/GPU.1 | scatter passes on both cards, `\|dev−CPU\| ≈ 4e−07` (`RUN@be57428` §4.3) | a regression in the swap, not a new question |
 | 4 | **GDN row 65** | `tests/python/test_gdn_block.py` on both cards | first bad row 65 at every T ≥ 66, both cards (`RUN@be57428` §4.2) | unchanged: the open GDN defect, doctrine in §4.2 |
-| 5 | **MoE compile at short T** | `tools/repro_moe_compile_short_T.py <T> GPU.N` | CPU dies on SIGSEGV at T=6 and T=8 and nowhere else in a 15-value sweep; whether the CARD's plugin shares the cliff is unknown | if the card refuses the same two shapes, a short prefill is a serving constraint, not a curiosity |
+| 5 | **KLD gate vs the llama-fork reference, BOTH context regimes** | `tools/kld_harness.py` on the booted artifact, at a T **below** and a T **above** the 2051 boundary | mean per-token KL(P_ref‖P_cand) ≤ 0.0599 nats at both. The boundary is not decorative: the QSA→dense price is exactly 0.0 for T ≤ 2051 and non-zero above it (`RUN@692c0a6`, §8), so a gate run only below it has not exercised the dense rows at all | a KLD that passes below 2051 and fails above localises to the QSA→dense seam, which is the one place the price is known to change |
+| 6 | **MoE compile at short T, under the real plugin** | `tools/repro_moe_compile_short_T.py <T> GPU.N` | the CPU plugin dies on SIGSEGV at T=6 and T=8 and nowhere else; whether the CARD's plugin shares the cliff is unknown | if the card refuses the same two shapes, a short prefill is a serving constraint, not a curiosity |
 
-Item 5 is run LAST on each card because it may take the process down.
+Item 6 is run LAST on each card because it may take the process down. Item 5
+needs item 1 to have produced a booted artifact; if item 1 does not boot, item
+5 does not run and says so rather than being run at a reduced geometry whose
+number would not transfer (§7.2).
+
+On item 6's sweep width: the reviewer seat widened it from 15 values to 41
+(contiguous 1..34 plus 36/40/48/56/64/96/128, fresh process per T) on the dev
+host's CPU, 2026-09-12, and found T=6 and T=8 and **no third hit length** —
+RE-REVIEW §Priority 5, a dated record, not a live claim of this document. The
+card's own sweep is the window's to take.
 
 ### 4.5.1 The u4 compressed-selection experiment, prepared
 
@@ -580,6 +590,40 @@ repository has already been bitten by:
 * **Q1 SELECTION** — does a compressed primitive appear in the runtime graph at
   all (`FullyConnectedCompressed`, `MOECompressed`, the 3GEMM MoE fusion), or
   does it arrive as plain MatMuls over decompressed weights?
+
+  **RE-AIMED 2026-09-12, from the plugin's own pipeline.** Q1 is the right
+  question — it is worth 4× on every row of §5's ledger — but it was pointed at
+  the wrong primitive, and a window that greps for `FullyConnectedCompressed`
+  on the expert bodies will record a false negative. Dated read of the pinned
+  plugin tree (dev host, `~/ovsrc-pkg`, build 2026.4.0-22849;
+  `src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp`, a FOREIGN
+  tree this suite cannot regenerate — recorded in the `FLEET_IRS_*` manner):
+
+      :645  // MOE: TiledMoeBlock -> GatherMatmuls(compressed)
+            //      -> MoeOp(compressed) -> MoeOpWithRouting(compressed).
+            // Gated on supports_immad (systolic-only) and oneDNN
+            // (required for expert GEMM dispatch).
+      :647  if (device_info.supports_immad && config.get_use_onednn()
+            && !config.get_moe_disable_fusion()) {
+      :648      const std::vector<ov::element::Type>
+                supported_compressed_weights_types{u4, i4, i8, u8};
+      :654      ConvertTiledMoeBlockToGatherMatmuls(...)
+      :658      ConvertGatherMatmulToGatherMatmulCompressed({f32, f16}, ...)
+      :661      FuseMoERouter / MoeOpFusion
+
+  Two consequences the window must carry. **(a)** The expert bodies never reach
+  `FullyConnectedCompressed` — that is the projection head's primitive. They
+  reach `GatherMatmulCompressed` and then the MoE op, which is what the served
+  35B's A770 graph actually carries (`MOECompressed`,
+  `moe_3gemm_fused_compressed`, `moe_router_fused`, forty of each —
+  DESIGN §7.0.2u). Detect on those three names. **(b)** `u4` is already in the
+  pass's admitted type list at `:648`, so "is u4 selectable at all" is answered
+  on the record and is not what the window is testing. What it is testing is
+  the **gate**: `supports_immad` AND `use_onednn` AND NOT `moe_disable_fusion`,
+  plus whether our emitted shape matches the matcher. **Record all three gate
+  terms beside the verdict** — a run with oneDNN off gets no fusion at all and
+  a `u4` that falls back, which looks identical to "u4 was not selected" and
+  means something entirely different.
 * **Q2 IMPLEMENTATION** — if selected, is it the jit kernel or the `ocl:ref`
   fallback? `docs/prefill-baseline.md` §M2 measured 40 of 371
   `FullyConnectedCompressed` nodes falling from `jit:gemm:any__i8` onto
@@ -664,12 +708,43 @@ quantisation. Measured end to end on one real-weights expert piece
 | **quantisation cost, relative** | **17.6%** |
 
 The plumbing sits BELOW the f32 floor, so that 17.6% is quantisation and not a
-packing bug. It is large. Carrying the file's own blocks through
+packing bug. It is large. ~~Carrying the file's own blocks through
 `src/core/gguf_repack.cpp` instead — which is what `gguf_apply_to_template`
 does for the dense models arcint serves today — is the alternative, and which
 one the 0.5.0 artifact ships is a decision, not a measurement. It is **not
 made here**. Deciding it needs the KLD gate (§7) run on both at full geometry,
-which needed the fill to exist first. It does now.
+which needed the fill to exist first. It does now.~~
+
+**RETRACTED 2026-09-12 — there is no such alternative on this artifact, and
+the sentence above stays visible as retracted rather than being edited away
+(DESIGN §7.0.1).** The alternative was named and never measured. Measured now,
+and gated by `tests/python/test_repack_route.py`, four coordinates:
+
+| # | coordinate | cited | verdict, generated by the cell |
+|---|---|---|---|
+| C1 | type | `gguf_repack.cpp:260` | `repack_supported` admits ggml 8/12/13/14 (Q8_0, Q4_K, Q5_K, Q6_K). The shipped bodies are IQ3_XXS 94, IQ4_NL 43, IQ4_XS 2, Q8_0 5 — **139 of 144 refused on type alone** |
+| C2 | rank | `gguf_repack.cpp:266` | `repack_tensor` takes 2-D; every expert body is rank 3 `[in, out, E]`. Closes the Q8_0 tail too — **0 of 144 can enter `repack_tensor` at all** |
+| C3 | loss | `gguf_repack.h` §"What is exact and what is not", `gguf_repack.cpp:486` | the path is a TRANSCODE: a K-quant group scale "rounds to f16" and `repack_bound_steps` bounds a non-zero deviation. "Zero added loss" is a property of Q8_0's own stored form, not of the path |
+| C4 | representation | `design-gguf-native.md:52`, `serving_shape.py:138` | IQ4_NL is a 16-entry NON-UNIFORM codebook, IQ3_XXS a grid-plus-sign-table one; the matched IR chain is uniform affine over a u4/i4/u8/i8 `Constant`. **This coordinate sits above `gguf_repack.cpp` and would survive its repair** |
+
+So the KLD gate cannot be run "on both at full geometry": the second path does
+not exist to be run. **The 0.5.0 artifact ships the u4 fill, as PLUMBING AND
+FIXTURE**, which is where the ruling put it — not because the decision was
+weighed and went that way, but because the alternative was measured and is not
+reachable from here. The prize was real and is worth recording for whoever
+opens this next: the shipped expert bodies are **51.99 GiB** at the file's own
+mixed quantisation against the 56.25 GiB uniform-int4 figure in the WP6 fit, so
+a block-carrying route would have been lossless *and* 4.26 GiB smaller.
+
+What is NOT claimed: that no block-carrying route exists. C4 closes the affine
+chain only. A lossless IQ4_NL carry is representable in principle (u4 codes as
+indices into a 16-entry codebook `Gather`, times the per-32 f16 scale) and is
+NOT attempted, because a `Gather` decode is not the pattern
+`ConvertTiledMoeBlockToGatherMatmuls` matches and would take the expert path
+off the fused OTD route entirely — a design decision with a measurable cost,
+not a plumbing fix. IQ3_XXS, 94 of the 144 bodies, does not have even that
+option in reach. Full derivation, every hop cited both sides: the DESIGN NOTE
+of 2026-09-12 in `RECONCILE-0.5.0.local.md`.
 
 ## 5. Residency — the SIZE LEDGER, and the number that decides the window
 
@@ -845,6 +920,18 @@ record than a blank guessed.
 | GPU acceptance doctrine | \|ov−r64\| ≤ 20 × \|r32−r64\| | `RUN@be57428` §4.2 |
 | 86k-node GPU compile | **204.90 s** on B60, 86,143 nodes | `RUN@be57428` §6 |
 | → compile cost scaling | 0.55 ms/node to 29k, 2.38 ms/node at 86k | `RUN@be57428` §6 |
+| shipped expert bodies, census | IQ3_XXS 94, IQ4_NL 43, IQ4_XS 2, Q8_0 5 = 144 over 48 layers | `RUN@bd5f53c` `test_repack_route.py`, regenerated off `/flash-model` |
+| → shipped expert bytes on disk | **51.99 GiB** (55,823,564,800 B) | same cell |
+| → the same experts as emitted u4 | **56.25 GiB** (60,397,977,600 B = 512 × 48 × 2,457,600) | `flash_next_offload.h:45`, re-derived |
+| block-carrying repack route | **CLOSED**: 0 of 144 bodies enter `repack_tensor` (139 refused on type, the Q8_0 tail on rank) | `RUN@bd5f53c` `test_repack_route.py` |
+| MoE fusion gate, plugin side | `supports_immad && use_onednn && !moe_disable_fusion`; admitted weight types `{u4, i4, i8, u8}` | dated foreign-tree read, `transformations_pipeline.cpp:647-648`, `~/ovsrc-pkg` @ 2026.4.0-22849 |
+
+The two expert-byte rows are both correct and they are not the same number.
+**56.25 GiB is the artifact's**, and it is the one every residency row here is
+computed against, because the IR declares uniform u4. 51.99 GiB is what the
+GGUF holds at its own mixed quantisation — reachable only by a block-carrying
+route, which §4.5.1 records as closed. Do not "correct" the fit model to
+51.99: that would be sizing a pool for weights this artifact does not contain.
 
 **QUALIFIER on "materialised on disk 0 KiB" (`RUN@5663a44`, 2026-09-12).**
 That row is `SparseArena.disk_kib()`, and on the dev host's filesystem it
@@ -873,18 +960,33 @@ This qualifier was found while accepting the fill, not by re-reading the row.
 
 ### Terms still to be predicted — `UNTESTED`, fill before measuring
 
+A term is filled here ONLY where a measured constant already determines it, and
+the arithmetic is shown so the prediction can be attacked before the window
+rather than explained after it. Everything else is left blank on purpose.
+
 | term | prediction | then: measured | provenance of the prediction |
 |---|---|---|---|
-| resident GiB on the card | | | |
-| KV precision pinned | | | |
-| prefill t/s at T=2048 | | | |
-| decode t/s, single lane | | | |
-| expert hit rate (cache) | | | |
-| expert miss cost (per miss) | | | |
-| MTP acceptance rate | | | |
-| MTP overhead term | | | |
-| amortised t/s incl. MTP | | | |
+| resident GiB on the card | **7.8** GiB of expert pool on a 15.11 GiB A770 (backbone 2.3 + KV 3.0 + activation 2.0 leaving 7.8) | | `flash_next_fit.py --vram 15.11 --dram 44`, generated |
+| → expert pool total, VRAM+DRAM | **24.0 GiB of 56.25 (43%)** = VRAM 7.8 + DRAM 16.2 | | same run |
+| KV precision pinned | **u8** — a configuration choice, not a measurement; it is the `--kv 3.0` GiB row's premise | | handoff E5; pin it explicitly or this row is fiction |
+| prefill t/s at T=2048 | | | needs the window; no bandwidth model predicts prefill |
+| decode t/s, single lane | **10.0 t/s** at the WP6b hit rate, bandwidth-bound, MTP amort 1.0 | | `flash_next_fit.py --hit-rates 0.881`, generated. A PROJECTION and labelled as one in `flash_next_offload.h`'s header — every input measured, the t/s analytic |
+| expert hit rate (cache) | **88.1%**, PER-LAYER LRU at a 16 GiB budget | | WP6b routing-trace replay, `flash_next_offload.h`'s cache-model paragraph. Do NOT substitute the global-LRU 93.8%: same trace, more optimistic model, and adopting it overstates the t/s above |
+| expert miss cost (per miss) | **1.362 ms** from NVMe (2,457,600 B ÷ 1.68 GiB/s); 0.0515 ms if the slice is already DRAM-resident | | `flash_next_offload.h:45` slice bytes ÷ the WP6b in-container `dd iflag=direct` figure |
+| per-token full-miss traffic | **1.0986 GiB** (10 active × 48 layers × slice) | | `flash_next_fit.py`, generated |
+| MTP acceptance rate | | | needs the window |
+| MTP overhead term | | | needs the window |
+| amortised t/s incl. MTP | | | needs MTP acceptance; the `--amort` dial is wired and defaulted to 1.0 above, i.e. NO amortisation assumed |
 | 86k-node GPU compile, s | | **204.90** (B60, 86,143 nodes) | `RUN@be57428` §6 |
+
+**What would falsify the decode row.** 10.0 t/s assumes every miss is paid at
+NVMe bandwidth and nothing else is the bottleneck. A measured decode materially
+BELOW it means the bottleneck is not expert bandwidth — compute, the router, or
+the host excursion — and the streaming plan's whole premise needs re-reading. A
+measured decode materially ABOVE it means the hit rate beat the per-layer
+replay, and the replay is the thing to re-run. Either way the number to compare
+is single-lane, MTP off; with MTP on, compare against `--amort` set to the
+measured acceptance and not against this row.
 
 ### The coherence line — RESERVED, LEAVE EMPTY
 
