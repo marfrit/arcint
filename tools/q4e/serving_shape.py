@@ -353,7 +353,14 @@ class SparseArena:
 #        both sides (authored 4.52 GiB, cheapest single-module defect 6.23).
 #        It cannot see `qple` or `pwe`: dropping either leaves peak RSS at
 #        4.52 GiB exactly, because neither module's `_c` is reached with a
-#        large arena array during this build. Measured, not assumed.
+#        large arena array during this build. Measured, not assumed. `qbb` is
+#        in the same position for a structural reason (below) and is the one
+#        row of that derivation which is NOT probed.
+#        Which modules that cell sees and which it does not is generated from
+#        `PEAK_RSS_GIB_WHEN_DROPPED` and printed by
+#        ::test_the_rss_derivation_accounts_for_every_swapped_module, which
+#        fails if a module joins this tuple without a row (REVIEW 23938c1 F2:
+#        `qbb` joined it without one, and a docstring then counted six).
 #     ::test_every_module_binding_the_constant_factory_is_swapped
 #        closes that gap structurally -- an ast scan over tools/q4e asserting
 #        every module that BINDS `_c` appears below, whether or not this

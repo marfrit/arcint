@@ -50,6 +50,7 @@ arcint actually exports -- pattern, not type name -- and its figures are
 cross-checked against `src/exec/flash_next_offload.h:45`
 (kFlashNextSliceBytes = 2,457,600 B per expert-layer for gate+up+down).
 """
+import math
 import os
 import sys
 from pathlib import Path
@@ -610,34 +611,79 @@ def test_the_paged_gap_is_inventoried_precisely(built):
 # CF-RESIDENT (REVIEW 2a45349 F2). The peak-RSS ceiling for the 48-layer build,
 # DERIVED from measurement on both sides rather than chosen. Dev host,
 # 2026-09-12, OV 2026.4.0-22849, one variable per run (`rssprobe`, one module
-# dropped from `_C_MODULES`, nothing else):
+# dropped from `_C_MODULES`, nothing else).
 #
-#     as authored                    4.52 GiB   (198b736's own figure; the
-#                                                reviewer reproduced it, and so
-#                                                did this derivation's probe)
-#     `qmoe`  dropped                6.23 GiB   <- the CHEAPEST defect
-#     `qattn` dropped                8.98 GiB   (the reviewer's probe, exactly)
-#     `qhc`   dropped                9.51 GiB
-#     `qgdn`  dropped               30.10 GiB
-#     `qple`  dropped                4.52 GiB   <- invisible to this leg
-#     `pwe`   dropped                4.52 GiB   <- invisible to this leg
+# The derivation used to be a table in this comment, and REVIEW 23938c1 F2 is
+# what a table in a comment costs: `backbone` entered `_C_MODULES` in the same
+# commit, no row was added for it, and a sentence below counted "four of the
+# six" over a population that had become seven. So the table is DATA now.
+# Every module in `_C_MODULES` must appear here -- the cell below fails if one
+# does not -- and every count in prose about it is generated from this dict.
 #
-# The ceiling must sit above the authored peak and below the CHEAPEST defect,
-# 4.52 < ceiling < 6.23. It is the geometric mean of that pair,
-# sqrt(4.52 * 6.23) = 5.31 GiB, because that is the value with the same
-# RELATIVE margin on each side -- 17.2% of headroom above the authored peak,
-# 17.5% below the cheapest defect -- and peak RSS moves multiplicatively with
+# The ceiling must sit above the authored peak and below the CHEAPEST defect.
+# It is the GEOMETRIC MEAN of that pair, because that is the value with the
+# same RELATIVE margin on each side, and peak RSS moves multiplicatively with
 # how much of the model a defect copies, not additively.
+#
+# NO MARGIN IS QUOTED HERE, and that is the fix rather than an omission.
+# REVIEW 23938c1 F3: this comment used to say "17.2% of headroom above the
+# authored peak, 17.5% below the cheapest defect". Neither figure matched any
+# consistent definition of its side, and with the rounded constant they are
+# ordered the other way round -- in the one comment whose job is to stop the
+# next session raising the ceiling without re-deriving it.
+# `test_the_peak_rss_ceiling_is_the_geometric_mean_of_its_bracket` PRINTS both
+# margins from the three constants and asserts the derivation that justifies
+# them, so there is nothing here to drift.
+#
+# The ceiling stays a TYPED constant, re-derived by that cell rather than
+# computed at import: a ceiling computed from the pair would absorb a raise
+# silently, and the act this guard exists to catch is someone raising it. Typed
+# + re-derived, that act is a red.
 #
 # RAISING THIS TO MAKE A RUN PASS RE-OPENS THE DEFECT. If the authored peak
 # genuinely moves (a different OpenVINO, a different allocator), re-run both
 # sides and re-derive; the two figures are what the constant means.
-#
-# The last two rows are why this cell is not the whole closure:
-# `test_every_module_binding_the_constant_factory_is_swapped` is.
-PEAK_RSS_CEILING_GIB = 5.31
 PEAK_RSS_AUTHORED_GIB = 4.52
 PEAK_RSS_CHEAPEST_DEFECT_GIB = 6.23
+PEAK_RSS_CEILING_GIB = 5.31        # == round(sqrt(4.52 * 6.23), 2), asserted
+
+# Value = peak RSS in GiB of the 48-layer build with exactly that module
+# dropped. `None` = NOT PROBED, with the reason in the row; no row borrows a
+# figure it did not measure. Keys are module names as `_C_MODULES` reports
+# them (`ss._C_MODULES` holds them under the aliases in brackets).
+#
+# The rows at the authored figure are why the keystone cell is not the whole
+# closure: `test_every_module_binding_the_constant_factory_is_swapped` is.
+PEAK_RSS_GIB_WHEN_DROPPED = {
+    "moe":               6.23,   # [qmoe]  <- the CHEAPEST defect
+    "attention":         8.98,   # [qattn] the reviewer's probe, exactly
+    "hc":                9.51,   # [qhc]
+    "gdn":              30.10,   # [qgdn]
+    "ple":               4.52,   # [qple]  == authored: invisible to the RSS leg
+    "piecewise_export":  4.52,   # [pwe]   == authored: invisible to the RSS leg
+    # [qbb] NOT PROBED, and deliberately not given 4.52 by analogy.
+    # `build_serving_shape_ir` imports `backbone` so `shared_constants()` can
+    # swap it, and then never calls it: it reaches for `qgdn._c` directly for
+    # `embed_w` and `head_w`. So dropping it cannot move peak RSS in THIS
+    # build, for a structural reason rather than a measured one -- and that
+    # reason is asserted, not asserted-by-comment, in
+    # `test_the_rss_derivation_accounts_for_every_swapped_module`. The day
+    # serving_shape reaches into `qbb`, that assertion goes red and this row
+    # needs a probe.
+    "backbone":          None,
+}
+
+
+def _rss_ceiling_margins():
+    """`(above, below)`, the ceiling's two RELATIVE margins, from the constants.
+
+    `above` = how far the ceiling sits over the authored peak; `below` = how
+    far the cheapest visible defect sits over the ceiling. Ratios rather than
+    differences, because that is what "the same relative margin on each side"
+    means and what makes the geometric mean the right midpoint.
+    """
+    return (PEAK_RSS_CEILING_GIB / PEAK_RSS_AUTHORED_GIB - 1.0,
+            PEAK_RSS_CHEAPEST_DEFECT_GIB / PEAK_RSS_CEILING_GIB - 1.0)
 
 
 def _build_48_in_a_child():
@@ -709,10 +755,14 @@ def test_the_full_48_layer_stack_emits_at_real_geometry():
           f"{report['graph_const_bytes'] / 2**30:.2f} GiB")
     print(f"  arena blocks on disk  {report['disk_kib']} KiB")
     print(f"  build                 {report['build_seconds']:.1f} s")
+    above, below = _rss_ceiling_margins()
     print(f"  PEAK RSS              {rss:.2f} GiB   "
           f"(authored {PEAK_RSS_AUTHORED_GIB}, ceiling "
           f"{PEAK_RSS_CEILING_GIB}, cheapest defect "
           f"{PEAK_RSS_CHEAPEST_DEFECT_GIB})")
+    print(f"  ceiling margins       +{above * 100:.1f}% over the authored peak, "
+          f"+{below * 100:.1f}% under the cheapest defect "
+          f"(printed, never written down -- REVIEW 23938c1 F3)")
     assert report["n_layers"] == cfg.num_hidden_layers == 48
     assert report["gdn_layers"] == 36 and report["attn_layers"] == 12
     assert report["nodes"] > 50_000, report["nodes"]
@@ -777,10 +827,16 @@ def test_every_module_binding_the_constant_factory_is_swapped():
     `shared_constants()` swaps `_c` per module, and each importer holds its OWN
     binding, so a module missing from `_C_MODULES` keeps the copying factory
     and materialises its family's weights. The 48-layer cell catches that for
-    four of the six listed modules; dropping `qple` or `pwe` leaves peak RSS at
-    4.52 GiB EXACTLY, because this particular build never reaches their `_c`
-    with a large arena array. Measured, not inferred -- which is why a
-    behavioural leg alone would be a guard with holes in it.
+    SOME of the swapped modules and not others: dropping `qple` or `pwe` leaves
+    peak RSS at the authored figure EXACTLY, because this particular build
+    never reaches their `_c` with a large arena array. Measured, not inferred
+    -- which is why a behavioural leg alone would be a guard with holes in it.
+
+    HOW MANY of each is not written here (REVIEW 23938c1 F2: the count that
+    stood in this docstring said "four of the six" on the day `_C_MODULES`
+    became seven). The split is generated from `PEAK_RSS_GIB_WHEN_DROPPED` and
+    printed by `test_the_rss_derivation_accounts_for_every_swapped_module`,
+    which also fails if a module joins the swap list without a row.
 
     So the invariant is asserted structurally instead: a module that BINDS `_c`
     must be in `_C_MODULES`, whether or not today's build happens to call it.
@@ -816,6 +872,128 @@ def test_every_module_binding_the_constant_factory_is_swapped():
     assert not stale, (
         f"`_C_MODULES` lists {stale}, which bind no `_c`; the swap is a no-op "
         f"for them. Remove them, or this gate over-reports its own coverage.")
+
+
+def _serving_shape_attribute_bases():
+    """The module aliases `serving_shape.py` actually REACHES INTO (`alias.x`),
+    by ast. An alias that is imported and never dereferenced is in
+    `_C_MODULES` for the swap alone -- which is the whole of `backbone`'s
+    position in the RSS derivation.
+    """
+    import ast
+    tree = ast.parse((REPO_ROOT / "tools" / "q4e" / "serving_shape.py").read_text())
+    return {n.value.id for n in ast.walk(tree)
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)}
+
+
+def test_the_rss_derivation_accounts_for_every_swapped_module():
+    """REVIEW 23938c1 F2. The ceiling is derived over a POPULATION, and this
+    asserts the population is the one `shared_constants()` actually swaps.
+
+    The defect being closed is not arithmetic: the derivation table lived in a
+    comment, `backbone` joined `_C_MODULES` in the commit that wrote the table,
+    no row was added, and a docstring counted "four of the six" over seven.
+    Nothing was mismeasured and nothing went red. That is the shape.
+
+    So: every swapped module has a row here, every row is a swapped module, the
+    cheapest visible defect is MINIMISED OUT OF THE ROWS rather than copied
+    into a constant, and the one unprobed row states its structural reason --
+    `serving_shape` imports `backbone` for the swap and never dereferences it.
+    That last one is asserted from source, so the day the build reaches into
+    `qbb` this cell goes red and asks for a probe instead of letting the
+    ceiling be derived over a population with a hole in it.
+    """
+    listed = {m.__name__.rsplit(".", 1)[-1] for m in ss._C_MODULES}
+    rows = set(PEAK_RSS_GIB_WHEN_DROPPED)
+    probed = {m: v for m, v in PEAK_RSS_GIB_WHEN_DROPPED.items() if v is not None}
+    visible = sorted(m for m, v in probed.items() if v > PEAK_RSS_AUTHORED_GIB)
+    invisible = sorted(listed - set(visible))
+
+    print(f"\n[rss-derivation] swapped modules: {len(listed)}  "
+          f"probed: {len(probed)}  unprobed: {len(rows) - len(probed)}")
+    print(f"[rss-derivation] the 48-layer cell SEES {len(visible)} of "
+          f"{len(listed)}: {', '.join(visible)}")
+    print(f"[rss-derivation] INVISIBLE to it ({len(invisible)}): "
+          f"{', '.join(invisible)} -- covered by the structural leg only")
+    for m in sorted(PEAK_RSS_GIB_WHEN_DROPPED):
+        v = PEAK_RSS_GIB_WHEN_DROPPED[m]
+        print(f"    {m:20s} {'not probed' if v is None else f'{v:6.2f} GiB'}")
+
+    assert rows == listed, (
+        f"the peak-RSS derivation and `_C_MODULES` describe different "
+        f"populations. Rows with no swapped module: "
+        f"{sorted(rows - listed) or 'none'}; swapped modules with no row: "
+        f"{sorted(listed - rows) or 'none'}. A module that joins the swap list "
+        f"without a row makes every count about the derivation wrong and the "
+        f"ceiling's bracket unattributed -- add the row (probe it, or state "
+        f"why it cannot move peak RSS) rather than this assertion.")
+    assert visible, "no row exceeds the authored peak: the bracket has no upper end"
+    cheapest = min(probed[m] for m in visible)
+    assert PEAK_RSS_CHEAPEST_DEFECT_GIB == cheapest, (
+        f"PEAK_RSS_CHEAPEST_DEFECT_GIB is {PEAK_RSS_CHEAPEST_DEFECT_GIB}, but "
+        f"the cheapest visible defect in the rows is {cheapest} "
+        f"({min(visible, key=lambda m: probed[m])}). The constant is the "
+        f"ceiling's upper bracket; it must be the minimum of the measured "
+        f"defects, not a figure that was true when it was typed.")
+    assert "qbb" not in _serving_shape_attribute_bases(), (
+        "`serving_shape.py` now dereferences `qbb`, so dropping `backbone` "
+        "from `_C_MODULES` may move peak RSS. Its row in "
+        "PEAK_RSS_GIB_WHEN_DROPPED is `None` on the grounds that it cannot. "
+        "Probe it (rssprobe, one module dropped) and record the figure.")
+
+
+def test_the_peak_rss_ceiling_is_the_geometric_mean_of_its_bracket():
+    """REVIEW 23938c1 F3. The ceiling's justification, checked against the
+    ceiling -- and the two margins PRINTED instead of quoted.
+
+    What was wrong: the comment quoted "17.2% above / 17.5% below". The exact
+    geometric mean gives the same figure on both sides by construction, and
+    rounding it to 0.01 GiB splits them slightly the OTHER way (the margin
+    above the authored peak becomes the larger one). So the sentence disagreed
+    with its own argument, with the constant, and with itself, and nothing in
+    the suite could notice.
+
+    What is asserted now is the argument itself: the ceiling brackets its pair,
+    it IS the geometric mean rounded to 0.01 GiB, and the two relative margins
+    agree to within that rounding. The constant stays typed on purpose -- a
+    ceiling computed at import would quietly absorb a raise, and a raise is the
+    act this whole guard exists to catch. Typed and re-derived here, raising
+    `PEAK_RSS_CEILING_GIB` without re-recording a measured side is a red.
+    """
+    above, below = _rss_ceiling_margins()
+    exact = math.sqrt(
+        PEAK_RSS_CHEAPEST_DEFECT_GIB / PEAK_RSS_AUTHORED_GIB) - 1.0
+    unrounded = math.sqrt(PEAK_RSS_AUTHORED_GIB * PEAK_RSS_CHEAPEST_DEFECT_GIB)
+
+    print(f"\n[rss-ceiling] bracket {PEAK_RSS_AUTHORED_GIB} < "
+          f"{PEAK_RSS_CEILING_GIB} < {PEAK_RSS_CHEAPEST_DEFECT_GIB} GiB "
+          f"(authored < ceiling < cheapest defect)")
+    print(f"[rss-ceiling] sqrt({PEAK_RSS_AUTHORED_GIB} * "
+          f"{PEAK_RSS_CHEAPEST_DEFECT_GIB}) = {unrounded:.6f} -> "
+          f"{PEAK_RSS_CEILING_GIB} after rounding to 0.01 GiB")
+    print(f"[rss-ceiling] margins: +{above * 100:.3f}% above the authored "
+          f"peak, +{below * 100:.3f}% below the cheapest defect "
+          f"(exact mean: {exact * 100:.3f}% each side)")
+
+    assert (PEAK_RSS_AUTHORED_GIB < PEAK_RSS_CEILING_GIB
+            < PEAK_RSS_CHEAPEST_DEFECT_GIB), (
+        f"the ceiling {PEAK_RSS_CEILING_GIB} does not bracket: it must sit "
+        f"above the authored peak {PEAK_RSS_AUTHORED_GIB} and below the "
+        f"cheapest defect {PEAK_RSS_CHEAPEST_DEFECT_GIB}. One side of the "
+        f"derivation was re-measured and the other was not.")
+    assert PEAK_RSS_CEILING_GIB == round(unrounded, 2), (
+        f"the ceiling {PEAK_RSS_CEILING_GIB} is not sqrt("
+        f"{PEAK_RSS_AUTHORED_GIB} * {PEAK_RSS_CHEAPEST_DEFECT_GIB}) = "
+        f"{unrounded:.6f} rounded to 0.01 GiB ({round(unrounded, 2)}). Either "
+        f"the ceiling was raised without re-deriving it -- which re-opens the "
+        f"defect it guards -- or a measured side moved and the ceiling was "
+        f"not recomputed.")
+    assert abs(above - below) < 0.005, (
+        f"the ceiling's two relative margins differ by "
+        f"{abs(above - below) * 100:.3f} percentage points "
+        f"(+{above * 100:.3f}% / +{below * 100:.3f}%), which is more than the "
+        f"0.01 GiB rounding can explain. 'The same relative margin on each "
+        f"side' is the comment's whole justification for a geometric mean.")
 
 
 def test_the_constant_factory_scanner_detects_a_missing_module():
