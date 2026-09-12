@@ -13,14 +13,24 @@ the SAME result DENSELY:
   * routing (pin 969-978): router_logits = x @ gate.weight^T (pin 971);
     router_probs = softmax(logits, fp32, dim=-1) (pin 972); op.topk gives the
     top-k probabilities and their expert indices (pin 973); the values are
-    renormalized to sum 1 per row when norm_topk_prob (pin 974-975); the pin's
-    own one-hot construct (pin 941: `one_hot(top_k_index)`) then scatters the
-    renormalized scores into a dense `gate` [T, E] -- the renormalized weight
-    at each selected expert, 0 elsewhere. That is byte-for-byte the
-    `router_scores` the pin's loop multiplies in (pin 954), just laid out
-    densely, and using torch.topk's own indices reproduces the pin's selection
-    EXACTLY (including its tie-break on equal probabilities -- a value
-    threshold would over-select on a tie).
+    renormalized to sum 1 per row when norm_topk_prob (pin 974-975); those
+    indices are then scattered into a dense `gate` [T, E] -- the renormalized
+    weight at each selected expert, 0 elsewhere. That is the `router_scores`
+    the pin's loop multiplies in (pin 954), laid out densely.
+
+    FIDELITY, RESTATED AS MEASURED (2026-09-12, REVIEW 2a45349 F3; the
+    superseded sentence claimed "torch.topk's OWN indices ... tie-break
+    included", and both halves were wrong). This emitter calls OpenVINO's
+    `op.topk`; it never calls torch. Where the top-k is STRICT -- the k-th and
+    (k+1)-th probability differ -- the two agree and the selection reproduces
+    the pin. Where a row is DEGENERATE the tie-breaks differ: on a zeroed
+    hidden row, which a padded prefill reaches, every logit is 0 for any router
+    weight, and at E=16/k=4 the pin selects [9, 10, 11, 12] where this emitter
+    selects [0, 1, 2, 3]. The block output on such a row is exactly 0.0 on both
+    sides (bias-free experts give f_e(0) = 0), so the divergence is invisible
+    downstream. Neither sentence is decoration: the strict case is gated by
+    test_moe_block.py::test_moe_topk_argmax_consistency and the degenerate one
+    by ::test_a_degenerate_row_may_select_differently_and_still_emits_zero.
 
   * experts (pin 921-955), dense: every expert is computed for every token and
     weighted by `gate[:, e]`. A non-selected (token, expert) pair has gate
@@ -46,9 +56,10 @@ Op choices where opset-13 differs from torch:
   * softmax(dtype=torch.float) -> op.softmax on the f32 stream (inputs are
     already f32, so the dtype cast is a no-op).
   * torch.topk (pin 973) -> op.topk (values + indices); the pin's
-    `one_hot(top_k_index)` (pin 941) -> op.one_hot + reduce_sum scatters the
+    `one_hot(top_k_index)` (pin 941) -> op.scatter_elements_update writes the
     scores into the dense [T, E] gate -- no dynamic gather of variable-length
-    token lists, and no data-dependent loop.
+    token lists, and no data-dependent loop. one_hot and scatter agree here
+    ONLY because a row's TopK indices are distinct; see `_router_gate`.
 
 Entry points:
   build_moe_model(config, state, seq_len) -> ov.Model, input `hidden_states`
@@ -105,12 +116,21 @@ def _router_gate(h2d, config, state, T):
     The 22-node isolated router reproduces the same split: one_hot FAILs on
     both cards, scatter runs and returns sum=64.0000, identical to CPU.
 
-    The pin fidelity argument is unchanged and is why the swap is legitimate:
-    both forms scatter torch.topk's OWN indices (not a threshold on the value),
-    so the selection reproduces the pin EXACTLY, tie-break included. What
-    changed is the ops that carry the scatter, not which experts are selected
-    or with what weight -- and the 0.0 above is the proof rather than the
-    claim.
+    WHY THE SWAP IS LEGITIMATE, and it is a PREMISE rather than an identity
+    (CORRECTED 2026-09-12, REVIEW 2a45349 F3). The two layouts are NOT
+    equivalent in general: `one_hot` + reduce_sum SUMS a repeated index while
+    `ScatterElementsUpdate` ASSIGNS it, last write wins. Indices [3, 3, 5, 7]
+    with scores [.4, .3, .2, .1] give column 3 = 0.7 under one_hot and 0.3
+    under scatter. They agree here for one reason only -- a row's TopK indices
+    are DISTINCT -- and nothing in tree asserted that until
+    test_moe_block.py::test_scatter_equals_one_hot_exactly_when_the_indices_are_distinct,
+    which measures both the agreement and the divergence it rests on.
+
+    WHAT THE SWAP DID NOT CHANGE: which experts are selected, or with what
+    weight. The selection is `op.topk`'s -- OpenVINO's, not torch's, and the
+    module docstring above states exactly where that reproduces the pin (strict
+    rows) and where it does not (degenerate rows, output 0.0 on both sides).
+    The 0.000000e+00 above is that claim measured on the full block.
     """
     E = config.num_experts
     k = config.num_experts_per_tok
