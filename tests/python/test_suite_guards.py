@@ -1,0 +1,630 @@
+"""STRUCTURAL GUARD ON THE GUARDS: a declared skip marker that is never applied.
+
+WHY THIS FILE EXISTS (REVIEW e78812d, finding F4 leg 2, 2026-09-12). The
+`test_size_ledger.py` defect was not "a decorator was forgotten". It was that
+NOTHING IN THE TREE COULD SEE a forgotten decorator. The marker was declared at
+module level, every cell needed it, and the shards leg -- the only leg anyone
+ran -- was 112-green throughout, because with the shards present the guard is a
+no-op whether or not it is applied. The defect was visible for exactly one
+reason: somebody happened to run the device-free leg, where the four unguarded
+cells errored in fixture setup instead of skipping.
+
+The review's words for this are the specification of this file:
+
+    "Nothing asserts that a declared `skipif` is applied to anything. The
+    `_skip` defect was caught only because a device-free leg happened to be
+    run; the shards leg was 112-green throughout and could never see it. The
+    next unapplied guard is invisible again."
+
+The review proposed the cheap closure: "a meta-cell asserting every module-level
+`pytest.mark.skipif` is referenced at least once in the file". That leg is here
+(LEG 1) and it is necessary, but it was MEASURED INSUFFICIENT before this file
+was committed: staged tree `~/stage-cf1-red`, one of the four `@_skip`
+decorators deleted, LEG 1 alone -> 29 passed. Three applications remain, the
+marker is still "referenced at least once", and the cell that lost its guard
+errors in setup exactly as before. Reporting only that leg would have shipped a
+gate that cannot see a partial regression of the very defect it names.
+
+So there is a second, stronger leg. LEG 2 is a taint analysis over the module's
+own fixture graph, and it closes the class rather than the instance:
+
+    a module-level marker's CONDITION names a resource (`_SHARDS`);
+    a fixture is TAINTED if its body reads that resource, or if it requests a
+      tainted fixture (transitively, to a fixpoint);
+    a test cell that requests a tainted fixture MUST carry that marker.
+
+A cell that requests a tainted fixture and does not carry the guard is not a
+style problem: it is the 2026-09-12 defect, and it will error in fixture setup
+on the leg where the resource is absent. LEG 2 fires on the one-decorator
+mutation above, which is the whole reason it exists.
+
+Both legs are device-free, need no shards and no card: they read source with
+`ast`. They cost milliseconds and they run on every leg, which is the point --
+the guard on the guards must not itself be skippable.
+
+The scanner is proved able to fail in-tree and permanently:
+`test_the_scanner_detects_an_unapplied_marker`,
+`test_the_scanner_detects_the_unapplied_one_of_two` and
+`test_the_taint_scanner_detects_an_unguarded_cell` feed it synthetic modules
+carrying each defect shape, and `test_the_scanner_accepts_each_application_form`
+plus `test_the_taint_scanner_accepts_a_clean_module` feed it the legitimate
+forms, because a gate that false-alarms gets weakened and then guards nothing.
+A checker with no negative cell is the same species of defect it is here to
+catch.
+"""
+import ast
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Every directory that holds pytest cells. Kept explicit rather than globbed
+# from the repo root so that a stray `test_*.py` in a build tree cannot make
+# this cell fail for an unrelated reason.
+_SUITE_DIRS = (
+    REPO_ROOT / "tests" / "python",
+    REPO_ROOT / "tools",
+)
+
+
+def suite_files():
+    """Every pytest file this repository owns, sorted, as (relpath, Path)."""
+    out = []
+    for d in _SUITE_DIRS:
+        if not d.is_dir():
+            continue
+        for p in sorted(d.glob("test_*.py")):
+            out.append((str(p.relative_to(REPO_ROOT)), p))
+    return out
+
+
+def _is_pytest_mark_call(node):
+    """True for `pytest.mark.<anything>(...)` and for `pytest.mark.<anything>`.
+
+    Both forms produce a marker object: `skipif` takes arguments, `skip` and
+    `xfail` are usable bare. Either can be bound to a module-level name and
+    then forgotten.
+    """
+    target = node.func if isinstance(node, ast.Call) else node
+    # pytest.mark.NAME  ->  Attribute(attr=NAME, value=Attribute(attr='mark',
+    #                                 value=Name(id='pytest')))
+    if not isinstance(target, ast.Attribute):
+        return False
+    inner = target.value
+    return (
+        isinstance(inner, ast.Attribute)
+        and inner.attr == "mark"
+        and isinstance(inner.value, ast.Name)
+        and inner.value.id == "pytest"
+    )
+
+
+def declared_markers(tree):
+    """Module-level names bound to a pytest marker object.
+
+    Only module level: a marker built inside a function is applied at the point
+    it is built or not at all, and cannot be silently orphaned the way a
+    module-level one can.
+    """
+    names = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not _is_pytest_mark_call(node.value):
+            continue
+        for tgt in node.targets:
+            if isinstance(tgt, ast.Name):
+                names[tgt.id] = node.lineno
+    return names
+
+
+def _root_name(node):
+    """The leading identifier of a possibly-dotted expression, or None."""
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def applied_names(tree):
+    """Every name that is USED as a marker somewhere in the module.
+
+    Three application forms are recognised, because all three are real ways to
+    apply a marker and a scanner that knows only decorators would produce false
+    alarms the next time somebody uses one of the others:
+
+      1. a decorator on a function or a class          -> `@_skip`
+      2. a module-level or class-level `pytestmark`    -> `pytestmark = [_skip]`
+      3. a `marks=` argument, as in `pytest.param(x, marks=_skip)` or
+         `pytest.mark.parametrize(..., [pytest.param(..., marks=[_skip])])`
+    """
+    used = set()
+
+    for node in ast.walk(tree):
+        # form 1 -- decorators
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            for dec in node.decorator_list:
+                base = dec.func if isinstance(dec, ast.Call) else dec
+                nm = _root_name(base)
+                if nm:
+                    used.add(nm)
+
+        # form 2 -- pytestmark assignment, scalar or sequence
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name) and tgt.id == "pytestmark":
+                    for sub in ast.walk(node.value):
+                        if isinstance(sub, ast.Name):
+                            used.add(sub.id)
+
+        # form 3 -- marks=
+        if isinstance(node, ast.keyword) and node.arg == "marks":
+            for sub in ast.walk(node.value):
+                if isinstance(sub, ast.Name):
+                    used.add(sub.id)
+
+    return used
+
+
+def unapplied_markers(source, filename="<string>"):
+    """LEG 1. Declared module-level markers that are never applied.
+    Returns a sorted list of (name, lineno)."""
+    tree = ast.parse(source, filename=filename)
+    declared = declared_markers(tree)
+    used = applied_names(tree)
+    return sorted((n, ln) for n, ln in declared.items() if n not in used)
+
+
+# ---------------------------------------------------------------------------
+# LEG 2 -- the taint analysis
+# ---------------------------------------------------------------------------
+
+def _module_level_names(tree):
+    """Every name bound by a module-level assignment."""
+    out = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    out.add(tgt.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            out.add(node.target.id)
+    return out
+
+
+def _marker_resources(tree):
+    """For each module-level marker name, the module-level names its CONDITION
+    reads. `_skip = pytest.mark.skipif(not _SHARDS, ...)` -> {"_skip": {"_SHARDS"}}.
+
+    A marker with no readable condition (a bare `pytest.mark.slow`, or a
+    condition that is a literal) contributes an empty set and therefore taints
+    nothing -- correctly: it guards no resource.
+    """
+    modnames = _module_level_names(tree)
+    out = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or not _is_pytest_mark_call(node.value):
+            continue
+        res = set()
+        if isinstance(node.value, ast.Call) and node.value.args:
+            for sub in ast.walk(node.value.args[0]):
+                if isinstance(sub, ast.Name) and sub.id in modnames:
+                    res.add(sub.id)
+        for tgt in node.targets:
+            if isinstance(tgt, ast.Name):
+                out[tgt.id] = res
+    return out
+
+
+def _is_fixture(fn):
+    for dec in fn.decorator_list:
+        base = dec.func if isinstance(dec, ast.Call) else dec
+        if isinstance(base, ast.Attribute) and base.attr == "fixture":
+            return True
+        if isinstance(base, ast.Name) and base.id == "fixture":
+            return True
+    return False
+
+
+def _self_guards(fn):
+    """A fixture that skips on its own does not need the caller to be marked."""
+    for sub in ast.walk(fn):
+        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
+            if sub.func.attr in ("skip", "importorskip", "xfail"):
+                return True
+    return False
+
+
+def _params(fn):
+    a = fn.args
+    return [p.arg for p in (a.posonlyargs + a.args + a.kwonlyargs)]
+
+
+def _reads(fn, names):
+    """The subset of `names` the function body reads (parameters excluded --
+    a parameter shadows the module-level name)."""
+    shadow = set(_params(fn))
+    hit = set()
+    for sub in ast.walk(fn):
+        if isinstance(sub, ast.Name) and sub.id in names and sub.id not in shadow:
+            hit.add(sub.id)
+    return hit
+
+
+def _decorator_names_of(fn):
+    out = set()
+    for dec in fn.decorator_list:
+        base = dec.func if isinstance(dec, ast.Call) else dec
+        nm = _root_name(base)
+        if nm:
+            out.add(nm)
+    return out
+
+
+def unguarded_resource_cells(source, filename="<string>"):
+    """LEG 2. Test cells that reach a guarded resource without carrying a guard.
+
+    Returns a sorted list of (test_name, lineno, resource, marker_choices).
+    """
+    tree = ast.parse(source, filename=filename)
+    resources_by_marker = _marker_resources(tree)
+    all_resources = set().union(*resources_by_marker.values()) if resources_by_marker else set()
+    if not all_resources:
+        return []
+
+    # module-level pytestmark applies to every cell in the file
+    module_marks = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name) and tgt.id == "pytestmark":
+                    for sub in ast.walk(node.value):
+                        if isinstance(sub, ast.Name):
+                            module_marks.add(sub.id)
+
+    # collect functions at module level and inside classes, remembering the
+    # class's own decorators (a class-level guard covers its methods)
+    funcs = []          # (fn, inherited_marks)
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            funcs.append((node, set(module_marks)))
+        elif isinstance(node, ast.ClassDef):
+            cls_marks = set(module_marks) | _decorator_names_of(node)
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    funcs.append((sub, cls_marks))
+
+    fixtures = {fn.name: fn for fn, _ in funcs if _is_fixture(fn)}
+
+    # taint to a fixpoint
+    tainted = {}                                   # fixture name -> resources
+    changed = True
+    while changed:
+        changed = False
+        for name, fn in fixtures.items():
+            if _self_guards(fn):
+                continue
+            res = set(_reads(fn, all_resources))
+            for p in _params(fn):
+                res |= tainted.get(p, set())
+            if res and res != tainted.get(name, set()):
+                tainted[name] = res
+                changed = True
+
+    findings = []
+    for fn, inherited in funcs:
+        if not fn.name.startswith("test_") or _is_fixture(fn):
+            continue
+        if _self_guards(fn):
+            continue
+        res = set(_reads(fn, all_resources))
+        for p in _params(fn):
+            res |= tainted.get(p, set())
+        if not res:
+            continue
+        carried = _decorator_names_of(fn) | inherited
+        covered = set()
+        for m in carried:
+            covered |= resources_by_marker.get(m, set())
+        missing = res - covered
+        if missing:
+            choices = sorted(m for m, r in resources_by_marker.items() if r & missing)
+            findings.append((fn.name, fn.lineno, sorted(missing), choices))
+    return sorted(findings, key=lambda f: f[1])
+
+
+# ---------------------------------------------------------------------------
+# THE GATE
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("relpath,path", suite_files(),
+                         ids=[rp for rp, _ in suite_files()])
+def test_every_declared_marker_is_applied(relpath, path):
+    """No suite file may declare a module-level pytest marker it never applies.
+
+    This is the cell that would have caught the 2026-09-12 `_skip` defect on
+    the SHARDS leg, where the behavioural symptom does not exist.
+    """
+    orphans = unapplied_markers(path.read_text(), filename=relpath)
+    assert not orphans, (
+        f"{relpath}: declared pytest marker(s) never applied -- "
+        + ", ".join(f"{n} (line {ln})" for n, ln in orphans)
+        + ". A declared-and-unapplied guard is invisible on the leg where the "
+          "guard is a no-op; that is exactly how the size-ledger cells errored "
+          "in fixture setup on the device-free leg."
+    )
+
+
+@pytest.mark.parametrize("relpath,path", suite_files(),
+                         ids=[rp for rp, _ in suite_files()])
+def test_no_cell_reaches_a_guarded_resource_unguarded(relpath, path):
+    """LEG 2, the strong one. A cell that requests a resource-dependent fixture
+    must carry the marker that guards that resource.
+
+    This is the leg that fires on a PARTIAL regression -- one decorator deleted
+    out of four -- which LEG 1 cannot see and which was measured not to fire
+    before this cell existed.
+    """
+    bad = unguarded_resource_cells(path.read_text(), filename=relpath)
+    assert not bad, (
+        f"{relpath}: cell(s) reach a guarded resource without the guard -- "
+        + "; ".join(
+            f"{name} (line {ln}) reads {res} but carries none of {choices}"
+            for name, ln, res, choices in bad)
+        + ". Without the marker this cell ERRORS in fixture setup on the leg "
+          "where the resource is absent, instead of skipping."
+    )
+
+
+def test_the_suite_file_list_is_not_empty():
+    """A scanner that scanned nothing would pass the gate above vacuously."""
+    files = suite_files()
+    assert len(files) >= 10, f"expected the q4e suites, found {len(files)}: {files}"
+    names = {rp for rp, _ in files}
+    for expected in ("tests/python/test_size_ledger.py",
+                     "tests/python/test_attention_piece.py",
+                     "tests/python/test_gguf_feed.py"):
+        assert expected in names, f"{expected} not scanned; got {sorted(names)}"
+
+
+# ---------------------------------------------------------------------------
+# THE SCANNER'S OWN RED -- permanent, in-tree
+# ---------------------------------------------------------------------------
+
+_ORPHANED = '''
+import os
+import pytest
+_shards = os.environ.get("SHARDS", "")
+_skip = pytest.mark.skipif(not _shards, reason="needs shards")
+
+def test_one():
+    assert True
+'''
+
+_MISSED_ONE = '''
+import pytest
+_a = pytest.mark.skipif(True, reason="a")
+_b = pytest.mark.skipif(True, reason="b")
+
+@_a
+def test_one():
+    assert True
+
+def test_two():
+    assert True
+'''
+
+
+def test_the_scanner_detects_an_unapplied_marker():
+    """The exact shape of the 2026-09-12 defect, reduced to eight lines."""
+    found = unapplied_markers(_ORPHANED, "<orphaned>")
+    assert found == [("_skip", 5)], found
+
+
+def test_the_scanner_detects_the_unapplied_one_of_two():
+    """Half-applied is the likelier real-world shape and must not pass."""
+    found = unapplied_markers(_MISSED_ONE, "<missed-one>")
+    assert [n for n, _ in found] == ["_b"], found
+
+
+@pytest.mark.parametrize("form,source", [
+    ("decorator", '''
+import pytest
+_skip = pytest.mark.skipif(True, reason="r")
+
+@_skip
+def test_one():
+    assert True
+'''),
+    ("pytestmark-scalar", '''
+import pytest
+_skip = pytest.mark.skipif(True, reason="r")
+pytestmark = _skip
+
+def test_one():
+    assert True
+'''),
+    ("pytestmark-list", '''
+import pytest
+_skip = pytest.mark.skipif(True, reason="r")
+pytestmark = [_skip]
+
+def test_one():
+    assert True
+'''),
+    ("marks-kwarg", '''
+import pytest
+_skip = pytest.mark.skipif(True, reason="r")
+
+@pytest.mark.parametrize("x", [pytest.param(1, marks=_skip)])
+def test_one(x):
+    assert True
+'''),
+    ("marks-kwarg-list", '''
+import pytest
+_skip = pytest.mark.skipif(True, reason="r")
+
+@pytest.mark.parametrize("x", [pytest.param(1, marks=[_skip])])
+def test_one(x):
+    assert True
+'''),
+    ("on-a-class", '''
+import pytest
+_skip = pytest.mark.skipif(True, reason="r")
+
+@_skip
+class TestGroup:
+    def test_one(self):
+        assert True
+'''),
+    ("bare-marker-object", '''
+import pytest
+_slow = pytest.mark.slow
+
+@_slow
+def test_one():
+    assert True
+'''),
+])
+def test_the_scanner_accepts_each_application_form(form, source):
+    """False alarms are as fatal as misses: a gate that fires on a legitimate
+    application form gets weakened or deleted, and then it guards nothing."""
+    assert unapplied_markers(source, f"<{form}>") == [], form
+
+
+# --- LEG 2's own red/green: the exact size-ledger shape, reduced ---
+
+_TAINT_BAD = '''
+import os
+import pytest
+_SHARDS = os.environ.get("Q4E_GGUF_SHARDS", "").strip()
+_skip = pytest.mark.skipif(not _SHARDS, reason="needs shards")
+
+@pytest.fixture(scope="module")
+def feed():
+    return open(_SHARDS)
+
+@pytest.fixture(scope="module")
+def measured(feed):
+    return {"x": 1}
+
+@_skip
+def test_guarded(measured):
+    assert measured
+
+def test_unguarded(measured):
+    assert measured
+'''
+
+_TAINT_OK = '''
+import os
+import pytest
+_SHARDS = os.environ.get("Q4E_GGUF_SHARDS", "").strip()
+_skip = pytest.mark.skipif(not _SHARDS, reason="needs shards")
+
+@pytest.fixture(scope="module")
+def cfg():
+    return {"n": 1}
+
+@pytest.fixture(scope="module")
+def feed():
+    return open(_SHARDS)
+
+@pytest.fixture(scope="module")
+def measured(feed):
+    return {"x": 1}
+
+@_skip
+def test_guarded(measured):
+    assert measured
+
+def test_device_free(cfg):
+    assert cfg
+'''
+
+
+def test_the_taint_scanner_detects_an_unguarded_cell():
+    """`test_unguarded` requests `measured`, which requests `feed`, which reads
+    `_SHARDS`. Two hops -- the size-ledger shape exactly."""
+    bad = unguarded_resource_cells(_TAINT_BAD, "<taint-bad>")
+    assert [(n, res, ch) for n, _, res, ch in bad] == [
+        ("test_unguarded", ["_SHARDS"], ["_skip"])], bad
+
+
+def test_the_taint_scanner_accepts_a_clean_module():
+    """An unguarded cell that only touches an untainted fixture is legitimate --
+    `test_baked_rope_tables_are_the_pin_rotary_module` in the attention suite is
+    exactly this shape, and a gate that fired on it would be deleted within a
+    week."""
+    assert unguarded_resource_cells(_TAINT_OK, "<taint-ok>") == []
+
+
+def test_the_taint_scanner_honours_a_self_guarding_fixture():
+    """A fixture that calls pytest.skip() itself needs no marker at the call
+    site; flagging it would be a false alarm."""
+    src = '''
+import os
+import pytest
+_SHARDS = os.environ.get("S", "")
+_skip = pytest.mark.skipif(not _SHARDS, reason="r")
+
+@pytest.fixture(scope="module")
+def feed():
+    if not _SHARDS:
+        pytest.skip("no shards")
+    return open(_SHARDS)
+
+def test_one(feed):
+    assert feed
+'''
+    assert unguarded_resource_cells(src, "<self-guard>") == []
+
+
+def test_the_taint_scanner_honours_a_class_level_guard():
+    src = '''
+import os
+import pytest
+_SHARDS = os.environ.get("S", "")
+_skip = pytest.mark.skipif(not _SHARDS, reason="r")
+
+@pytest.fixture(scope="module")
+def feed():
+    return open(_SHARDS)
+
+@_skip
+class TestGroup:
+    def test_one(self, feed):
+        assert feed
+'''
+    assert unguarded_resource_cells(src, "<class-guard>") == []
+
+
+def test_the_scanner_ignores_a_marker_built_inside_a_function():
+    """Only module-level bindings can be orphaned invisibly; a local one is
+    applied where it is built or it is dead code the linter sees."""
+    src = '''
+import pytest
+
+def _build():
+    m = pytest.mark.skipif(True, reason="r")
+    return m
+'''
+    assert unapplied_markers(src, "<local>") == []
+
+
+if __name__ == "__main__":                                  # pragma: no cover
+    # Usable as a standalone auditor, so the gate can be run without pytest
+    # (for instance from a hook or from a staged tree before the suite starts).
+    rc = 0
+    for relpath, path in suite_files():
+        src = path.read_text()
+        for name, lineno in unapplied_markers(src, relpath):
+            print(f"UNAPPLIED  {relpath}:{lineno}  {name}")
+            rc = 1
+        for name, lineno, res, choices in unguarded_resource_cells(src, relpath):
+            print(f"UNGUARDED  {relpath}:{lineno}  {name}  reads {res}  "
+                  f"needs one of {choices}")
+            rc = 1
+    print("scanned", len(suite_files()), "files;", "CLEAN" if rc == 0 else "DEFECTS")
+    sys.exit(rc)
