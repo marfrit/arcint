@@ -178,12 +178,27 @@ class SparseArena:
         self.offset = 0
         self.hold = []
         self.declared_bytes = 0
+        # Bytes this arena was asked to WRITE (the fill). Distinct from
+        # `declared_bytes`, which counts address space handed out: an unfilled
+        # build declares tens of GiB and writes nothing at all.
+        self.written_bytes = 0
+        # Where each NAMED constant landed: (name, base, nbytes). The content
+        # acceptance reads a filled body back out of these pages -- the bytes
+        # the ov Constant actually wraps -- rather than out of the filler's
+        # return value, which would be checking the fill against itself.
+        self.placements = []
+        self._last_base = 0
+        # The f32 scales, by constant name. Kept as objects rather than read
+        # back from pages because they ARE f32 pages -- there is no packing to
+        # verify, and the read-back acceptance is about the u4 nibbles.
+        self.scales = {}
 
     def alloc(self, nbytes):
         nbytes = int(nbytes)
         # page-align so two buffers never share a page (a write to one would
         # otherwise fault in the other's page and quietly cost real memory)
         base = (self.offset + 4095) & ~4095
+        self._last_base = base
         if base + nbytes > self.capacity:
             raise MemoryError(
                 f"arena exhausted: {base + nbytes} > {self.capacity}; raise "
@@ -206,21 +221,103 @@ class SparseArena:
         buf = self.alloc(n * 8)
         return buf.view(np.int64)[:n].reshape(shape)
 
-    def constant(self, shape, ov_type):
+    def constant(self, shape, ov_type, fill=None, name=None):
         """An ov Constant of `shape` and `ov_type` over sparse pages, zero-copy.
 
         Sub-byte types go through the (array, shape, type) Tensor overload,
         which reinterprets a byte buffer -- that is the only way to declare a
         u4 tensor without allocating its dense form.
+
+        `fill`, when given, is a byte buffer written into the arena pages
+        BEFORE the Constant is built over them. Writing first and wrapping
+        after is not a style choice: `op.constant(tensor)` wraps the mapping
+        rather than copying it (that is the whole keystone mechanism), so a
+        write afterwards would be a mutation of a live Constant. Pages this
+        touches become real pages -- on disk and in RAM -- which is exactly
+        what a FILLED artifact is and exactly why the unfilled path must keep
+        passing `fill=None`.
         """
         elems = int(np.prod(shape)) if len(shape) else 1
         nbytes = (elems * ov_type.bitwidth + 7) // 8
         buf = self.alloc(nbytes)
+        if fill is not None:
+            src = np.frombuffer(np.ascontiguousarray(fill), dtype=np.uint8)
+            assert src.size == nbytes, (
+                f"fill is {src.size} B, the {list(shape)} {ov_type} constant "
+                f"is {nbytes} B")
+            buf[:nbytes] = src
+            self.written_bytes += nbytes
+        if name is not None:
+            self.placements.append(
+                {"name": name, "base": self._last_base, "nbytes": nbytes,
+                 "shape": [int(d) for d in shape], "type": str(ov_type)})
         tensor = ov.Tensor(buf, ov.Shape([int(d) for d in shape]), ov_type)
         return op.constant(tensor)
 
+    def f32_filled(self, values):
+        """An f32 Constant over arena pages carrying `values`, zero-copy.
+
+        Used only by the FILL: the unfilled build's scales are a materialised
+        `np.ones`, and moving those into the arena would write 78.6 MB of
+        pages per layer and break the `0 KiB on disk` measurement that is the
+        keystone's whole point.
+        """
+        arr = np.ascontiguousarray(values, dtype=np.float32)
+        buf = self.f32(arr.shape)
+        buf[...] = arr
+        self.written_bytes += arr.nbytes
+        return op.constant(buf, shared_memory=True)
+
+    def read_back(self, name):
+        """The raw bytes currently in the arena pages of a named constant.
+
+        Read from the mapping, so what comes back is what the ov Constant is
+        looking at -- including, if something went wrong, whatever overwrote
+        it."""
+        hits = [p for p in self.placements if p["name"] == name]
+        assert len(hits) == 1, (
+            f"{name!r} matches {len(hits)} placements; "
+            f"have {[p['name'] for p in self.placements][:8]}")
+        p = hits[0]
+        return np.array(self._mm[p["base"]:p["base"] + p["nbytes"]],
+                        dtype=np.uint8), p
+
     def disk_kib(self):
-        """Actual blocks on disk -- the measurement that proves the claim."""
+        """Blocks the filesystem has allocated for the arena file.
+
+        READ THE LIMITS BEFORE USING THIS AS EVIDENCE. It is reported by
+        198b736 as "arena blocks on disk 0 KiB" beside "183.07 GiB declared",
+        and on the dev host's filesystem it CANNOT DISTINGUISH an unwritten
+        arena from a written one. Measured 2026-09-12, dev host, ZFS
+        (recordsize 131072), one 4 GiB sparse file per probe:
+
+            written            st_blocks after msync   after `sync` + 12 s
+            nothing                        512 B                    512 B
+            512 MiB of zeros               512 B                    512 B
+            512 MiB of random            512 B              439,174,656 B
+
+        Two separate effects, and each defeats the check on its own:
+
+          * ZFS allocates on TRANSACTION-GROUP COMMIT, not on msync. Until the
+            txg syncs, a fully written file reports 512 B. The `flush()` below
+            is msync and is NOT sufficient; only a system `sync` plus a wait
+            is, which is not a thing a test should do.
+          * An all-zero record is stored as a HOLE. A arena deliberately
+            written full of zeros would report 0 KiB forever, correctly.
+
+        So `disk_kib() <= 64` is true of the unfilled build, and would ALSO be
+        true of a build that had materialised every constant as zeros, and of
+        one that had just written the real weights. It is reported here
+        because it is cheap and it is one more sign; it is not the guard. The
+        guard is `test_the_full_48_layer_stack_emits_at_real_geometry`'s peak
+        RSS (CF-RESIDENT) and, for a filled build, reading the pages back and
+        finding them non-zero.
+
+        This was found while accepting the fill: 2,693,529,600 B of expert
+        bodies written, 1,899,503,616 B reported even after msync.
+        """
+        if self._mm is not None:
+            self._mm.flush()            # msync: necessary, and not sufficient
         return os.stat(self.path).st_blocks * 512 // 1024
 
     def close(self):
@@ -309,7 +406,8 @@ def shared_constants():
 # The tiled MoE layer, expert bodies slot-referenced
 # --------------------------------------------------------------------------
 
-def _compressed_expert(arena, e, out, inn, name):
+def _compressed_expert(arena, e, out, inn, name, filler=None,
+                       layer=None, kind=None):
     """One expert-stacked weight in the tiled lowering's shape.
 
     rank-4 [E, out, groups, group_size] u4 Constant
@@ -319,15 +417,38 @@ def _compressed_expert(arena, e, out, inn, name):
     The trailing Reshape is not cosmetic: verify_moe_lowering.py:33-42 records
     a real GPU compile crashing inside the fusing pass's own rewrite when it
     was absent, "because the pass's matcher anchors on that Reshape node".
+
+    WITHOUT a `filler` this is the STRUCTURE emission: unwritten (zero) pages
+    behind the u4 constants and a materialised `np.ones` scale -- the artifact
+    198b736 measured at 183.07 GiB declared over 0 KiB of disk.
+
+    WITH a `filler` (q4e.expert_fill.ExpertFiller) the same shapes carry the
+    real checkpoint: the filler returns packed u4 codes, packed u4
+    zero-points and f32 scales for (layer, kind), and each of the three
+    constants is built OVER pages written first. The graph is structurally
+    identical either way -- same ops, shapes and element types -- which is
+    what lets the empty build's contract test speak for the filled one.
     """
     gs = EXPERT_GROUP_SIZE
     assert inn % gs == 0, f"{name}: inner {inn} is not a multiple of group {gs}"
     groups = inn // gs
-    w = arena.constant([e, out, groups, gs], EXPERT_DECLARED_TYPE)
+    if filler is None:
+        w = arena.constant([e, out, groups, gs], EXPERT_DECLARED_TYPE)
+        zp = arena.constant([e, out, groups, 1], EXPERT_DECLARED_TYPE)
+        scale = op.constant(np.ones((e, out, groups, 1), np.float32))
+    else:
+        pw, pzp, sc = filler.body(layer, kind, e, out, inn)
+        assert sc.shape == (e, out, groups, 1), (
+            f"{name}: filler returned scales {sc.shape}, the constant is "
+            f"{(e, out, groups, 1)}")
+        w = arena.constant([e, out, groups, gs], EXPERT_DECLARED_TYPE,
+                           fill=pw, name=name + "/weight_u4")
+        zp = arena.constant([e, out, groups, 1], EXPERT_DECLARED_TYPE,
+                            fill=pzp, name=name + "/zero_point")
+        scale = arena.f32_filled(sc)
+        arena.scales[name + "/scale"] = sc
     w.set_friendly_name(name + "/weight_u4")
-    zp = arena.constant([e, out, groups, 1], EXPERT_DECLARED_TYPE)
     zp.set_friendly_name(name + "/zero_point")
-    scale = op.constant(np.ones((e, out, groups, 1), np.float32))
     scale.set_friendly_name(name + "/scale")
     x = op.convert(w, Type.f32)
     x = op.subtract(x, op.convert(zp, Type.f32))
@@ -338,7 +459,8 @@ def _compressed_expert(arena, e, out, inn, name):
     return x
 
 
-def emit_moe_tiled(hidden_bth, config, state, arena, T, tag):
+def emit_moe_tiled(hidden_bth, config, state, arena, T, tag, filler=None,
+                   layer=None):
     """The MoE layer in the shape measured to fuse on the card
     (export_mtp.py:401 moe_block_tiled), at real geometry, expert bodies
     slot-referenced. Returns a [1,T,H] node."""
@@ -375,9 +497,12 @@ def emit_moe_tiled(hidden_bth, config, state, arena, T, tag):
     m_h3 = op.reshape(tiled, op.constant(np.array([E, -1, H], np.int32)),
                       special_zero=False)                              # [E,M,H]
 
-    gate_w = _compressed_expert(arena, E, I, H, f"{tag}/experts_gate")
-    up_w = _compressed_expert(arena, E, I, H, f"{tag}/experts_up")
-    down_w = _compressed_expert(arena, E, H, I, f"{tag}/experts_down")
+    gate_w = _compressed_expert(arena, E, I, H, f"{tag}/experts_gate",
+                                filler, layer, "gate")
+    up_w = _compressed_expert(arena, E, I, H, f"{tag}/experts_up",
+                              filler, layer, "up")
+    down_w = _compressed_expert(arena, E, H, I, f"{tag}/experts_down",
+                                filler, layer, "down")
 
     g = op.swish(op.matmul(m_h3, gate_w, transpose_a=False, transpose_b=True))
     u = op.matmul(m_h3, up_w, transpose_a=False, transpose_b=True)
@@ -479,7 +604,8 @@ def _ple_state(arena, config):
     }, head_dim, Hn
 
 
-def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None):
+def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
+                           filler=None):
     """The full-geometry serving-shape backbone as an ov::Model.
 
     Inputs
@@ -572,7 +698,8 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None):
 
                 h, hyper, inj = _split_combine(hidden, cfg, st,
                                                "mlp_hyper_connection.", T)
-                m = emit_moe_tiled(h, cfg, st, ar, T, f"layer{i}/moe")
+                m = emit_moe_tiled(h, cfg, st, ar, T, f"layer{i}/moe",
+                                   filler=filler, layer=i)
                 hidden = _recombine(hyper, inj, m, cfg, T)
 
             # the final mixer, use_combine=False (pin 1493-1496), then lm_head
@@ -601,7 +728,9 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None):
             "graph_const_bytes": const_bytes,
             "op_histogram": counts,
             "arena_declared_bytes": ar.declared_bytes,
+            "arena_written_bytes": ar.written_bytes,
             "arena_disk_kib": ar.disk_kib(),
+            "fill_census": filler.census() if filler is not None else None,
             "inputs": [(p.get_node().get_friendly_name(),
                         list(p.get_shape()), str(p.get_element_type()))
                        for p in model.inputs],

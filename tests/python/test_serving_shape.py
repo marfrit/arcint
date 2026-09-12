@@ -254,9 +254,25 @@ def test_the_dequant_chain_is_convert_subtract_multiply_reshape(built):
 
 
 def test_no_expert_constant_is_materialised(built):
-    """THE CLAIM, measured rather than argued: the arena declares tens of GiB
-    of constants and occupies zero blocks on disk, because no page is ever
-    written."""
+    """The arena declares tens of GiB of constants and occupies zero blocks on
+    disk, because no page is ever written.
+
+    WHAT THIS CELL DOES AND DOES NOT PROVE -- corrected 2026-09-12, while
+    accepting the fill. `disk_kib()` is NOT a discriminator on the dev host's
+    filesystem: ZFS allocates on transaction-group commit rather than on
+    msync, and stores an all-zero record as a hole. Measured, three rows, one
+    4 GiB sparse file each: nothing written -> 512 B; 512 MiB of zeros -> 512
+    B; 512 MiB of RANDOM bytes -> 512 B after msync and only 439,174,656 B
+    after a system `sync` and twelve seconds. So `disk_kib <= 64` is true of
+    this build, and would be equally true of one that had materialised every
+    constant as zeros, and of one that had just written real weights.
+
+    It is kept because it is cheap and it is one more sign, and because on a
+    filesystem that accounts blocks eagerly it does discriminate. The GUARD is
+    `test_the_full_48_layer_stack_emits_at_real_geometry`'s peak RSS
+    (CF-RESIDENT) -- which is exactly the finding that cell exists for, one
+    level further down than the reviewer found it.
+    """
     _, report, arena = built
     declared = report["arena_declared_bytes"]
     disk_kib = arena.disk_kib()
@@ -267,7 +283,9 @@ def test_no_expert_constant_is_materialised(built):
         f"layers -- the geometry is not real")
     assert disk_kib <= 64, (
         f"{disk_kib} KiB on disk: something WROTE to the arena, so the "
-        f"constants are materialising after all")
+        f"constants are materialising after all. NB the converse does not "
+        f"follow -- see this cell's docstring; 0 KiB is not proof of an "
+        f"unwritten arena on a copy-on-write filesystem.")
 
 
 # ---------------------------------------------------------------------------
@@ -698,6 +716,9 @@ def test_the_full_48_layer_stack_emits_at_real_geometry():
     assert report["n_layers"] == cfg.num_hidden_layers == 48
     assert report["gdn_layers"] == 36 and report["attn_layers"] == 12
     assert report["nodes"] > 50_000, report["nodes"]
+    # one more sign, not the guard -- see
+    # test_no_expert_constant_is_materialised for why `disk_kib` cannot
+    # distinguish an unwritten arena from a written one on this filesystem
     assert report["disk_kib"] <= 64
     assert report["outputs"][0][1] == [1, 64, cfg.vocab_size]
     assert rss <= PEAK_RSS_CEILING_GIB, (
