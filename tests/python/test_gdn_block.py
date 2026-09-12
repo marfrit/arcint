@@ -397,3 +397,151 @@ def test_an_unknown_chunk_emission_mode_is_refused():
     with pytest.raises(ValueError, match="unknown ut emit mode"):
         gdn.build_gdn_model(config, _state_np(ref), seq_len=96,
                             ut_mode="per-chunk")
+
+
+# The two sequence lengths the chunk-axis census is taken at, and the reason
+# they are this large. A "live chunk axis" is detected by looking for an axis
+# whose extent is C -- so C must be a value that occurs in the graph ONLY
+# because it is the chunk count. Every integer from 1 to CHUNK-1 occurs inside
+# `_ut_inverse` in EVERY mode (the forward substitution slices row i at width i
+# and pads it at width chunk-i, for i = 1..chunk-1), CHUNK itself occurs
+# everywhere, and the small head counts occur as leading axes (HK=2 and HV=4
+# collide with C=2 and C=4, the first chunk counts anyone reaches for). So the
+# smallest usable C is CHUNK+1, and the cell PROVES that rather than trusting
+# it: each value must be absent from the other's build.
+_CHUNK_SIG_TS = (4160, 4224)      # C = 65 and C = 66 at CHUNK = 64
+
+
+def _output_shapes(model):
+    """(op type, static output shape) for every output of every op in `model`."""
+    out = []
+    for node in model.get_ordered_ops():
+        for o in range(node.get_output_size()):
+            ps = node.get_output_partial_shape(o)
+            if ps.rank.is_dynamic:
+                continue
+            out.append((node.get_type_name(),
+                        tuple(int(d.get_length()) for d in ps if d.is_static)))
+    return out
+
+
+def _chunk_axis_census(shapes, c):
+    """How many axes in the graph have extent exactly `c`, plus the rank-5 set.
+
+    Counts EVERY axis at EVERY position, not a chosen one: the point is that
+    the chunk axis is nowhere, so a walk that skipped positions could pass the
+    claim by not looking.
+    """
+    hits = sum(s.count(c) for _, s in shapes)
+    rank5 = [s for _, s in shapes if len(s) == 5]
+    return hits, rank5, [s for s in rank5 if c in s]
+
+
+def test_no_emitted_op_sees_a_live_chunk_axis_under_perchunk():
+    """K0 (REVIEW 9162ac9). gdn.py's header claims, of the DEFAULT emission,
+    that "no emitted op ever sees a live chunk axis". That is the whole
+    mechanism of the row-65 fix and nothing held it. This does.
+
+    THE DISCRIMINATOR AND ITS TRAP. Asking "is C in this shape" is not a test:
+    at C=2 it collides with HK, at C=4 with HV, and at any C below CHUNK with
+    the forward substitution's own row sweep, which emits every extent from 1
+    to CHUNK-1 in every mode. The census therefore runs at C = 65 and C = 66,
+    and the first thing it asserts is that 65 does not occur in the C=66 graph
+    and 66 does not occur in the C=65 graph -- which is what makes each of them
+    a C-BUILD SIGNATURE rather than a number that happens to be in a shape.
+
+    BOTH DIRECTIONS, in one cell, because a one-directional probe is vacuous --
+    a walk that found nothing at all would pass "perchunk has zero". So
+    `batched` must come back NON-zero from the same walk, and the rank-5
+    positive control below must come back non-empty.
+
+    THE FOUR RANK-5 OUTPUTS IN `perchunk` ARE NOT CHUNK AXES. They are the
+    GQA repeat's ([1, T, HK, 1, Dk] and [1, T, HK, ratio, Dk], query and key),
+    and that is asserted here from their shapes rather than asserted in prose.
+    """
+    config = _make_config()
+    ref, _ = _ref_and_pin(config)
+    state = _state_np(ref)
+    HK = config.linear_num_key_heads
+    Dk = config.linear_key_head_dim
+    ratio = config.linear_num_value_heads // HK
+
+    cs, census = [], {}
+    for T in _CHUNK_SIG_TS:
+        c = (T + (gdn.CHUNK - T % gdn.CHUNK) % gdn.CHUNK) // gdn.CHUNK
+        cs.append(c)
+        for mode in ("batched", "perchunk"):
+            shapes = _output_shapes(
+                gdn.build_gdn_model(config, state, seq_len=T, ut_mode=mode))
+            census[(c, mode)] = (shapes,) + _chunk_axis_census(shapes, c)
+
+    c1, c2 = cs
+    assert c1 != c2 and min(cs) > gdn.CHUNK, (
+        f"the census needs two DIFFERENT chunk counts, both above CHUNK="
+        f"{gdn.CHUNK}: got {cs}. Below CHUNK the value collides with the "
+        f"forward substitution's row sweep and the discriminator is void.")
+
+    print(f"\n[chunk-axis] CHUNK={gdn.CHUNK} HK={HK} HV="
+          f"{config.linear_num_value_heads} ratio={ratio}; signatures C={c1}, C={c2}")
+    for c in cs:
+        for mode in ("batched", "perchunk"):
+            shapes, hits, rank5, rank5_c = census[(c, mode)]
+            other = c2 if c == c1 else c1
+            cross = sum(s.count(other) for _, s in shapes)
+            print(f"  C={c:>3} {mode:>9}  outputs={len(shapes):>6}  "
+                  f"axes==C {hits:>5}  rank5 {len(rank5):>5}  rank5-with-C "
+                  f"{len(rank5_c):>5}  axes=={other} (cross) {cross:>3}")
+
+    # 1. THE TRAP: each signature must be a property of ITS OWN build only.
+    for c in cs:
+        other = c2 if c == c1 else c1
+        for mode in ("batched", "perchunk"):
+            shapes = census[(c, mode)][0]
+            cross = sum(s.count(other) for _, s in shapes)
+            assert cross == 0, (
+                f"C={other} occurs {cross} times in the C={c} {mode} graph, so "
+                f"it is NOT a chunk-axis signature -- it collides with a "
+                f"config dimension or an unroll slice width. Pick chunk counts "
+                f"that occur nowhere else before reading anything below.")
+
+    # 2. BOTH DIRECTIONS from the same walk.
+    for c in cs:
+        b_hits = census[(c, "batched")][1]
+        p_hits, p_r5, p_r5c = census[(c, "perchunk")][1:]
+        assert b_hits > 0, (
+            f"the 'batched' graph at C={c} shows NO axis of extent {c}. That "
+            f"emission is defined by carrying the chunk axis, so a zero here "
+            f"means this walk cannot see chunk axes at all and the perchunk "
+            f"result below is vacuous.")
+        assert p_hits == 0, (
+            f"'perchunk' at C={c} has {p_hits} axes of extent {c}: an emitted "
+            f"op DOES see a live chunk axis, and gdn.py's header claim -- the "
+            f"whole mechanism of the row-65 fix -- is false. Shapes: "
+            f"{sorted({s for _, s in census[(c, 'perchunk')][0] if c in s})}")
+        # 3. ANTI-VACUITY on the same walk: rank-5 tensors still EXIST under
+        #    perchunk, so the zero above is "no chunk axis", not "no shapes
+        #    found". These four are the GQA repeat and nothing else.
+        assert len(p_r5) == 4 and not p_r5c, (
+            f"expected exactly 4 rank-5 outputs under perchunk (the GQA "
+            f"repeat's two per projection) and none carrying the chunk axis; "
+            f"got {len(p_r5)} rank-5 outputs, {len(p_r5c)} with C. If rank-5 "
+            f"outputs vanished entirely this cell's zero proves nothing.")
+        for s in p_r5:
+            assert s[2] == HK and s[3] in (1, ratio) and s[4] == Dk, (
+                f"rank-5 output {s} under perchunk is not a GQA repeat "
+                f"([1, T, HK={HK}, 1 or ratio={ratio}, Dk={Dk}]). A NEW rank-5 "
+                f"shape appeared and this cell cannot vouch for it being "
+                f"chunk-free by position -- identify it before trusting the "
+                f"census.")
+
+    # 4. The batched count is STRUCTURAL, not a function of how many chunks
+    #    there are: one unroll is emitted whatever C is, so the number of ops
+    #    carrying the chunk axis must not move between the two builds. (The
+    #    literal is generated above; the reviewer's 256 was at C=4, where the
+    #    graph is smaller -- it is not an invariant and is not asserted.)
+    b1, b2 = census[(c1, "batched")][1], census[(c2, "batched")][1]
+    assert b1 == b2, (
+        f"'batched' carries the chunk axis on {b1} axes at C={c1} but {b2} at "
+        f"C={c2}. One unroll is emitted regardless of C, so this count is "
+        f"structural; if it moved, the batched emission changed shape and the "
+        f"comparison this cell draws is no longer between the same two things.")
