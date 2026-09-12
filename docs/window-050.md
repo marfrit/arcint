@@ -548,6 +548,129 @@ Q4E_GPU= <venv>/bin/python boot.py <layers> <device> <T>
   feed site, carried as a strict xfail in
   `tests/python/test_serving_shape.py`.
 
+## 4.5 THE FRONTIER GPU PASS — what the next window runs, in order
+
+`RUN@5663a44` for the CPU preparation below; every GPU row is `UNTESTED` and
+belongs to the frontier. This section exists because the 0.5.0 window is now
+ONE pass: the emitter-side work is done, and each item here is a prepared
+experiment with a reproducer, an expected outcome and a stated first step —
+not a topic. An item with no reproducer does not belong on this list.
+
+Run them in this order. Each earlier item is a control for the ones after it.
+
+| # | item | reproducer | expected | if it fails |
+|---|---|---|---|---|
+| 1 | **2-layer boot / 4 GiB chunking** | §4.4's boot sequence at `--layers 2` | the A770 refuses a 25,600,122,880 B object (cap 4,294,959,104 B); the B60 accepts it | chunk the PLE table, or pull `ov::intel_gpu::hint::enable_large_allocations` and record the cost — the lever is named in §4.4 and has never been pulled |
+| 2 | **u4 compressed selection (the fill)** | `tools/repro_fc_compressed_selection.py` | `production_2d` selects a compressed primitive on both cards; `as_emitted` is the open question | §4.5.1 below — the candidates are built to isolate it |
+| 3 | **scatter router legs** | `tests/python/test_moe_block.py` on GPU.0/GPU.1 | scatter passes on both cards, `\|dev−CPU\| ≈ 4e−07` (`RUN@be57428` §4.3) | a regression in the swap, not a new question |
+| 4 | **GDN row 65** | `tests/python/test_gdn_block.py` on both cards | first bad row 65 at every T ≥ 66, both cards (`RUN@be57428` §4.2) | unchanged: the open GDN defect, doctrine in §4.2 |
+| 5 | **MoE compile at short T** | `tools/repro_moe_compile_short_T.py <T> GPU.N` | CPU dies on SIGSEGV at T=6 and T=8 and nowhere else in a 15-value sweep; whether the CARD's plugin shares the cliff is unknown | if the card refuses the same two shapes, a short prefill is a serving constraint, not a curiosity |
+
+Item 5 is run LAST on each card because it may take the process down.
+
+### 4.5.1 The u4 compressed-selection experiment, prepared
+
+**THE QUESTION.** `q4e.expert_fill` now puts real Q3_K_XL rows into the
+serving-shape IR's u4 expert bodies. The residency story rests on those weights
+STAYING u4 once the card compiles the graph: if the plugin decompresses them to
+f16 at compile time, the declared 4-bit slice is a 16-bit one and every row of
+§5's ledger is out by 4×. Two sub-questions, and the second is the one this
+repository has already been bitten by:
+
+* **Q1 SELECTION** — does a compressed primitive appear in the runtime graph at
+  all (`FullyConnectedCompressed`, `MOECompressed`, the 3GEMM MoE fusion), or
+  does it arrive as plain MatMuls over decompressed weights?
+* **Q2 IMPLEMENTATION** — if selected, is it the jit kernel or the `ocl:ref`
+  fallback? `docs/prefill-baseline.md` §M2 measured 40 of 371
+  `FullyConnectedCompressed` nodes falling from `jit:gemm:any__i8` onto
+  `ocl:ref:any__i8` at a 2048-token prefill, consuming a THIRD of the chunk
+  (68.3 ms against 38.9 ms for the other 331) — and all 371 are on the jit
+  kernel at M=1 and M=2. The compressed path is real, shape-sensitive, and has
+  a reference-kernel cliff. That evidence is all at **i8**; the expert bodies
+  are **u4**, grouped, rank-4 before the collapsing Reshape.
+
+**THE PRIOR, and it is not nothing.** §4.4 measured the same graph costing 7.6
+GiB of host on the GPU path against 28.5 GiB on the CPU path — "the CPU plugin
+expands the u4 constants host-side; the GPU plugin does not". That is evidence
+about LOAD-TIME host residency, not about which kernel the compiled graph runs,
+so it constrains Q1 without answering it and says nothing about Q2.
+
+**THE CANDIDATES**, each one variable from `as_emitted` except the control:
+
+| candidate | differs by | why it is in the list |
+|---|---|---|
+| `as_emitted` | — | what `serving_shape._compressed_expert` emits today |
+| `f16_scale` | scale f16 not f32 | `gguf_graph.cpp:229` builds an f16 scale |
+| `u8_scalar_zp` | zero-point scalar u8 not per-group u4 | `gguf_graph.cpp:225-228`, `RepackZeroPoint::U8Scalar` |
+| `production_2d` | rank-3 + rank-2 MatMul | **POSITIVE CONTROL**: `gguf_graph.cpp:216-235`, the shape arcint already serves on these cards |
+| `no_reshape` | trailing Reshape removed | **NEGATIVE CONTROL**: `verify_moe_lowering.py:33-42` records a real GPU compile crashing without it |
+
+**WHAT THE WINDOW EXECUTES, IN ORDER.** The reproducer's own header carries this
+and the numbered steps; in short: characterise on CPU first and check the IR
+hashes still match, then `production_2d` on the card (if THAT is not
+compressed, the detector is wrong and no other verdict counts), then
+`as_emitted` — which is the row this manifest is waiting for — then
+`f16_scale` / `u8_scalar_zp` only if `as_emitted` came back uncompressed, then
+`no_reshape` last.
+
+**IR HASHES, so the window can prove it ran what was characterised.** Written
+by the frontier's CPU step 1, not filled in here: a hash recorded in this
+document from an engineer session would be a claim about a tree the window has
+not run. The reproducer prints `sha256` per candidate and the window records
+them in the same commit as the GPU result, per CF-MANIFESTSHA.
+
+`RUN@5663a44`, dev host, CPU, OV 2026.4.0-22849, E=8 M=64 I=640 H=2560
+group=128 — every candidate builds, compiles, and hashes. **The Q1/Q2 columns
+are the window's to fill**, in the same commit as the GPU result.
+
+| candidate | ops | IR sha256 (CPU, `RUN@5663a44`) | Q1 selection | Q2 kernel |
+|---|---|---|---|---|
+| `as_emitted` | 12 | `de8a7a8a3a60daa60f299ad85f8677005154837256cb0462f13e3a8133334d57` | | |
+| `f16_scale` | 13 | `d2e06b2e44f447c9c5adbc322409ce9518b8b21307852f50a9f8bf695367b89b` | | |
+| `u8_scalar_zp` | 12 | `4fd60e75f2396c67760dec5242097b548d600e0a6840fb79523a03f5382d8cf4` | | |
+| `production_2d` | 13 | `4324e6003e4699d7cad1a5ad211ac98e903f030fb480679020f8d9be1f3d3fc2` | | |
+| `no_reshape` | 10 | `5f548715ed8b397d12fafb8b6bde23986d444096bb1fc9c81049afa7910afe78` | | |
+
+**WHAT CPU ALREADY SAYS, and it is less than it looks.** `FullyConnectedCompressed`
+and `MOECompressed` are GPU-plugin primitives; the CPU plugin neither names nor
+runs those passes, so a CPU histogram cannot answer Q1 either way and the
+reproducer refuses to print a verdict on CPU. What it does show is one real
+signal: four of the five candidates collapse to a single `FullyConnected`
+(`brgemm_avx2_f32`) with the u4 `Const` surviving into it, while `no_reshape`
+stays a plain `MatMul`. Even the CPU plugin's primitive choice responds to the
+trailing Reshape — consistent with `verify_moe_lowering.py:33-42`, on a
+different plugin, and not a substitute for it.
+
+**ONE CORRECTION ALREADY MADE HERE**, because the negative control was wrong
+the first time: deleting the trailing Reshape from the rank-4 chain does not
+build at all (`Incompatible MatMul matrix dimension ... 2560 ... 128`) — that
+is a shape error, not the defect. What `verify_moe_lowering.py:33-42` records
+is a FLAT RANK-3 weight with no groups dimension, which is shape-valid and
+compiles on CPU. `no_reshape` is now that.
+
+**THE OTHER QUESTION THE FILL RAISES, and it is not this one — but it now has
+a number.** The shipped checkpoint is a mixed k-quant (gate/up `IQ3_XXS`, down
+`IQ4_NL`, measured `RUN@5663a44`). `q4e.gguf_feed` hands back DEQUANTISED f32
+and `q4e.expert_fill` re-quantises to u4 grouped-affine — a SECOND
+quantisation. Measured end to end on one real-weights expert piece
+(`RUN@5663a44`, 8 real experts at real width, M=16, CPU):
+
+| leg | value |
+|---|---|
+| \|executed − dequantised-u4 reference\| | 2.423189e-09 |
+| f32 floor for the contraction | 2.171543e-08 |
+| \|executed − raw f32 reference\| | **5.657107e-04** |
+| output magnitude | 3.220204e-03 |
+| **quantisation cost, relative** | **17.6%** |
+
+The plumbing sits BELOW the f32 floor, so that 17.6% is quantisation and not a
+packing bug. It is large. Carrying the file's own blocks through
+`src/core/gguf_repack.cpp` instead — which is what `gguf_apply_to_template`
+does for the dense models arcint serves today — is the alternative, and which
+one the 0.5.0 artifact ships is a decision, not a measurement. It is **not
+made here**. Deciding it needs the KLD gate (§7) run on both at full geometry,
+which needed the fill to exist first. It does now.
+
 ## 5. Residency — the SIZE LEDGER, and the number that decides the window
 
 `RUN@wt+2e99661`, 2026-09-12, real checkpoint geometry, T=64, CPU, every row either built
