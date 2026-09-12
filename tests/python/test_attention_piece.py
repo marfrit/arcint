@@ -479,6 +479,144 @@ def test_dense_attention_piece_parity_real_weights(cfg, attn_state,
 
 
 # --------------------------------------------------------------------------- #
+# 4b. CF-ROPEAB: ONE VARIABLE AT A TIME, and the variable is named
+# --------------------------------------------------------------------------- #
+# REVIEW e78812d F5: ab69ea9's record puts "4 failed, 5 passed" immediately
+# above "same host, same invocation -> 9 passed", which reads as one transition
+# with one variable. It is not: two of those four failures came from the
+# suite's own first-draft rope bound, which the SAME commit corrected. Red
+# against suite revision A, green against revision B.
+#
+# Suite revision A is NOT RECOVERABLE -- ab69ea9 added this file whole, with the
+# corrected bound already in it, and the first draft existed only inside that
+# session. Rather than reconstruct it from prose, the attribution is closed
+# from the other side, by measurement:
+#
+#   * the emitter A/B was re-run at 692c0a6 with the archived orphan emitter
+#     (sha256 ca262ca2...) swapped in, ONE variable, suite fixed:
+#         orphan    -> 2 failed, 9 passed   (exactly the two parity legs)
+#         committed -> 11 passed
+#     and the two `[rope]` lines are BYTE-IDENTICAL across those two legs
+#     (|baked-f64| 1.759e-06 / 2.545e-06, |baked-pin| 5.960e-08, arg-ulp
+#     3.815e-06 / 7.629e-06, doubling 0.000e+00). The rope cell does not touch
+#     the emitter's attention path at all, so the two rope failures in the
+#     record CANNOT have been caused by the emitter. The variable was the bound.
+#
+#   * the cell below makes that permanent without depending on an untracked
+#     archive file: each of ab69ea9's two numeric defects is INJECTED
+#     SEPARATELY into the committed emitter and its own ratio measured, so the
+#     964999x headline is attributed rather than asserted.
+
+def _flat_split_weight(w, heads, d):
+    """The orphan's DEFECT 1 expressed as a permutation of `q_proj.weight`.
+
+    The committed emitter does the pin's thing: view [heads, 2d], take
+    [:, 0:d] as query and [:, d:2d] as gate (pin 867-869). The orphan sliced
+    the LEADING heads*d rows of the flat 2*heads*d axis as query and the
+    trailing block as gate. Those two readings of the SAME graph differ only in
+    which output rows land where, so feeding the committed emitter a permuted
+    weight reproduces the orphan's tensor exactly -- no second emitter, no
+    monkeypatch, and the equivalence is checkable (it is, against the archived
+    orphan's own number; see the docstring below).
+
+        correct picks, for head h:  query rows h*2d + [0..d)
+                                    gate  rows h*2d + [d..2d)
+        orphan  picks, for head h:  query rows      h*d + [0..d)
+                                    gate  rows heads*d + h*d + [0..d)
+    """
+    out = np.empty_like(w)
+    for h in range(heads):
+        out[h * 2 * d: h * 2 * d + d] = w[h * d: h * d + d]
+        out[h * 2 * d + d: (h + 1) * 2 * d] = \
+            w[heads * d + h * d: heads * d + (h + 1) * d]
+    return out
+
+
+@_skip_shards
+@pytest.mark.parametrize("T", [64, 96])
+def test_each_ab69ea9_defect_is_attributed_on_its_own(cfg, attn_state,
+                                                      indexer_state, T):
+    """The 964999x headline, split into its two causes, one variable per row.
+
+    Defect 1 -- the [query|gate] split read off the flat axis instead of per
+    head -- is injected as the weight permutation above. Defect 2 -- RMSNorm
+    summing where the pin means (pin 164) -- is injected by replacing the
+    emitter's `_rmean` with a reduce_sum for the duration of one build, which
+    is exactly what the orphan's line 120 did.
+
+    The gate is that each defect ALONE is catastrophic and the clean emitter is
+    at the floor: a defect that only shows up in combination would mean the
+    parity leg is passing for a compensating reason.
+
+    Cross-check on defect 1's reconstruction: with BOTH defects injected the
+    ratio must land on the archived orphan's own measured figure (964999.3x at
+    T=64, 469606.6x at T=96, re-measured at 692c0a6 with the orphan file
+    swapped in), which is what makes the permutation a faithful stand-in for a
+    file this repository does not track."""
+    hidden = _hidden(cfg, T)
+    pid = np.arange(T, dtype=np.int64).reshape(1, T)
+    heads = cfg.num_attention_heads
+    d = cfg.head_dim
+
+    dense64 = _pin_attention(cfg, attn_state, indexer_state, True, torch.float64)
+    qsa32 = _pin_attention(cfg, attn_state, indexer_state, False, torch.float32)
+    with torch.no_grad():
+        p64 = dense64(hidden.double(), _cos_sin(cfg, T, torch.float64),
+                      _causal(T, torch.float64), None)[0].numpy()
+        p32 = qsa32(hidden, _cos_sin(cfg, T, torch.float32),
+                    _causal(T, torch.float32), None)[0].numpy()
+    yardstick = float(np.max(np.abs(p32 - p64.astype(np.float32))))
+    assert yardstick > 0.0, "no yardstick: the f32 and f64 pins agree bitwise"
+
+    def _ratio(state, sum_not_mean):
+        saved = qattn._rmean
+        if sum_not_mean:
+            # the orphan's line 120: reduce_sum where pin 164 means -> a factor
+            # sqrt(head_dim) = 16 on the normalised vector
+            qattn._rmean = (lambda x, axis:
+                            qattn.op.reduce_sum(x, qattn._i([axis]), True))
+        try:
+            model = qattn.build_dense_attention_model(cfg, state, T)
+            out, _ = _run_ov(model, [hidden.numpy(), pid], "CPU")
+        finally:
+            qattn._rmean = saved
+        return float(np.max(np.abs(out - p64))) / yardstick
+
+    bad_w = dict(attn_state)
+    bad_w["q_proj.weight"] = _flat_split_weight(
+        np.ascontiguousarray(attn_state["q_proj.weight"]), heads, d)
+
+    rows = [
+        ("clean (committed emitter)",      attn_state, False),
+        ("defect 1 only: flat [q|gate]",   bad_w,      False),
+        ("defect 2 only: RMSNorm sum",     attn_state, True),
+        ("both (the orphan)",              bad_w,      True),
+    ]
+    sys.stdout.write(f"\n[defect-attribution] T={T} yardstick |pin32-pin64| "
+                     f"{yardstick:.3e}\n")
+    got = {}
+    for label, state, sm in rows:
+        r = _ratio(state, sm)
+        got[label] = r
+        sys.stdout.write(f"[defect-attribution]   {label:<30s} "
+                         f"{r:12.1f}x the pin's own f32 rounding\n")
+
+    assert got["clean (committed emitter)"] <= _FLOOR_FACTOR, (
+        "the clean emitter is not at the floor; the rest of this cell is moot")
+    for label in ("defect 1 only: flat [q|gate]", "defect 2 only: RMSNorm sum"):
+        assert got[label] > 1000.0, (
+            f"{label} alone moved the result only {got[label]:.1f}x -- either "
+            f"the injection is not reaching the emitter or the parity leg is "
+            f"passing for a compensating reason")
+    orphan_ref = {64: 964999.3, 96: 469606.6}[T]
+    both = got["both (the orphan)"]
+    assert 0.5 * orphan_ref <= both <= 2.0 * orphan_ref, (
+        f"the reconstruction does not land on the archived orphan's measured "
+        f"ratio ({both:.1f}x vs {orphan_ref}x) -- the permutation is not a "
+        f"faithful stand-in for the orphan emitter and this attribution is void")
+
+
+# --------------------------------------------------------------------------- #
 # 5. graph cost of the piece, reported (no threshold: the window budgets it)
 # --------------------------------------------------------------------------- #
 @_skip_shards
