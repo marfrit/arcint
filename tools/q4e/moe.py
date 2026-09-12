@@ -186,8 +186,14 @@ def build_moe_model(config, state, seq_len):
 # expert carries gate 0 and contributes exactly 0, so
 # sum over chunks of chunk outputs + shared == the pin's sparse output on the
 # same gate, and `router_gate` is exactly the pin's `router_gate` (same
-# softmax/topk in f32). The test pastes that gate-equality + chunk-sum parity
-# against the pin's own sparse MoE on fed real tensors.
+# softmax/topk in f32). The theorem is MEASURED, not asserted by construction:
+# `tests/python/test_moe_chunk_partition.py` (CF-CHUNKCOV, 2026-09-12) sweeps
+# four partitions of the expert axis -- including an uneven one and the
+# one-expert-per-chunk degenerate -- at two synthetic geometries against the
+# pin's own SPARSE block, plus a third geometry of 16 REAL expert bodies at
+# real width against a float64 recomputation. Between the discard of
+# `test_piecewise_export.py` and that file, these builders had no gate at all
+# (REVIEW e78812d F1).
 # ---------------------------------------------------------------------------
 def emit_router_gate(hidden_bth, config, state, seq_len):
     """[1,T,H] -> [T,E] dense top-k gate. The ROUTER is
@@ -215,7 +221,15 @@ def emit_experts_chunk(hidden_bth, gate_chunk, config, state, e0, e1, seq_len):
     """[1,T,H] x [T,C] (the gate slice for experts e0..e1) -> [T,H], the sum
     of the chunk's contributions -- pin 945-955 rolled over e in [e0, e1). The
     caller verifies sum-over-chunks == pin sparse outside the graph (the
-    theorem is measured in the test, not asserted by construction)."""
+    theorem is measured in the test, not asserted by construction):
+    `tests/python/test_moe_chunk_partition.py`.
+
+    The local `j` addresses the weight slice and the gate column TOGETHER --
+    `gate_up[j]`/`down[j]` are the chunk's j-th expert and `gate_chunk[:, j]`
+    is that expert's routed weight. That coupling is gated by the relabel-
+    invariance cell (permute the chunk's experts and its gate columns by the
+    same permutation -> output invariant; permute only the weights -> it
+    moves), because reading it off the source is not measuring it."""
     H = config.hidden_size
     I = config.moe_intermediate_size
     T = int(seq_len)
