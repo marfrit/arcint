@@ -28,16 +28,17 @@ in tools/q4e/moe.py, each naming the cell that gates it.
 Per-position-ness: the MoE block is fully ROW-LOCAL (the router, every expert
 gemv and the shared expert act per token; no op mixes positions). A masked
 (zeroed) row routes on all-zero logits: softmax is then uniform, an all-way
-tie, and each selected expert carries gate exactly 1/top_k. WHICH experts is
-NOT determined by index order -- that sentence stood here until 2026-09-12 and
-a measurement contradicts it: at E=16, top_k=4 the pin's `torch.topk` selects
-[9, 10, 11, 12] on such a row where OpenVINO's `op.topk` selects [0, 1, 2, 3]
+tie, and each selected expert carries gate exactly 1/top_k. WHICH experts each
+side then picks is NOT recited here. A sentence claiming index order decides it
+stood until 2026-09-12 and a measurement contradicted it; the two literal index
+sets that replaced it were gated by no cell (REVIEW 23938c1 F1) -- true of one
+OpenVINO build, silently false on the next. The tie-break is unspecified, the
+cell prints what each side picked, and the part that is measured and asserted
+is the mitigation: bias-free Linears give f_e(0) = 0, so whichever experts a
+zeroed row picks, both sides emit exactly 0.0 on it
 (test_moe_block.py::test_a_degenerate_row_may_select_differently_and_still_emits_zero).
-It does not matter here, and the reason is measured rather than assumed:
-bias-free Linears give f_e(0) = 0, so whichever experts a zeroed row picks,
-both sides emit exactly 0.0 on it. Because the block is row-local, a garbage
-probe in masked rows leaves every live row untouched -- the same row-locality
-proof the hc block carries.
+Because the block is row-local, a garbage probe in masked rows leaves every
+live row untouched -- the same row-locality proof the hc block carries.
 """
 import torch
 import torch.nn.functional as F

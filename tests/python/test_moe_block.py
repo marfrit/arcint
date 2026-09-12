@@ -496,6 +496,16 @@ def test_a_degenerate_row_may_select_differently_and_still_emits_zero():
     asserts BOTH halves -- the strict rows still agree, the zeroed row's output
     is exactly 0.0 on both sides -- so a future change that makes the
     divergence visible fails here instead of in a number nobody attributes.
+
+    WHAT THIS CELL DELIBERATELY DOES NOT ASSERT, and why (REVIEW 23938c1 F1):
+    the two index sets themselves. Which experts `torch.topk` and `op.topk`
+    each hand back on an all-way tie is a property of those two sort
+    implementations, not of this emitter; pinning them would go red on a benign
+    OpenVINO upgrade, and every prose copy of the literals would then have to
+    be chased by hand -- which is the recited-count defect one level down. So
+    the selections are PRINTED in the table below, the invariant that survives
+    any tie-break is asserted, and no docstring in this repository names the
+    indices. If a future reader wants them, the table is the source.
     """
     _assert_pin()
     config = _make_config()

@@ -23,12 +23,19 @@ the SAME result DENSELY:
     included", and both halves were wrong). This emitter calls OpenVINO's
     `op.topk`; it never calls torch. Where the top-k is STRICT -- the k-th and
     (k+1)-th probability differ -- the two agree and the selection reproduces
-    the pin. Where a row is DEGENERATE the tie-breaks differ: on a zeroed
+    the pin. Where a row is DEGENERATE the tie-break is UNSPECIFIED on both
+    sides and this emitter does not try to reproduce the pin's: on a zeroed
     hidden row, which a padded prefill reaches, every logit is 0 for any router
-    weight, and at E=16/k=4 the pin selects [9, 10, 11, 12] where this emitter
-    selects [0, 1, 2, 3]. The block output on such a row is exactly 0.0 on both
-    sides (bias-free experts give f_e(0) = 0), so the divergence is invisible
-    downstream. Neither sentence is decoration: the strict case is gated by
+    weight, so softmax is uniform and the k experts each side picks out of E
+    are whatever its own sort order yields. WHICH experts those are is NOT
+    written down here (REVIEW 23938c1 F1): the two literal index sets that
+    stood in this paragraph were a property of one OpenVINO build, gated by no
+    cell, and would have gone silently false on the next release. The cell
+    named below prints both selections for every row and asserts the part
+    that is load-bearing instead -- the block output on a degenerate row is
+    exactly 0.0 on both sides (bias-free experts give f_e(0) = 0), so whatever
+    the selection is, the divergence is invisible downstream. Neither sentence is
+    decoration: the strict case is gated by
     test_moe_block.py::test_moe_topk_argmax_consistency and the degenerate one
     by ::test_a_degenerate_row_may_select_differently_and_still_emits_zero.
 
