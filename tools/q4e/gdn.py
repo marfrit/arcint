@@ -45,6 +45,8 @@ Entry point: build_gdn_model(config, state, seq_len) -> ov.Model with inputs
 `hidden_states` [1, T, H] f32 and `attention_mask` [1, T] f32, and result
 `output` [1, T, H] f32.
 """
+import os
+
 import numpy as np
 from openvino import Model, Type
 from openvino import opset13 as op
@@ -132,6 +134,86 @@ def _l2norm_last(x, last_axis):
     return _mul(x, inv)
 
 
+# How the chunk axis is presented to the forward-substitution unroll below.
+# THE DEFECT THIS EXISTS FOR (frontier card pass 2026-09-12, ~/win-050/FINDINGS;
+# reproduced at this tip by `tests/python/test_gdn_block.py` and the T sweep in
+# that ledger): on both Arc cards, every multi-chunk static-T GDN graph is
+# corrupt from global row 65 onward, exactly T-65 rows, while T=64 (one chunk)
+# is clean at the f32 floor. The emitted math is identical in both cases; only
+# the extent of the chunk axis changes.
+#
+#   "batched"    ut_orig stays [1, HV, C, CHUNK, CHUNK] and the unroll runs
+#                once, with BOTH HV and C as leading axes. The form shipped up
+#                to 2026-09-12, and the one that is corrupt for C > 1. Kept
+#                selectable because it is the defect's reproducer.
+#   "folded"     the two leading axes are merged to [1, HV*C, CHUNK, CHUNK] by
+#                a pure view reshape (HV and C are adjacent and contiguous), so
+#                the unroll runs once at RANK 4 instead of rank 5 over the same
+#                leading volume. Two reshapes; node count essentially unchanged.
+#   "debatched"  the chunk axis is hoisted out OF THE UNROLL ONLY: C separate
+#                unroll instances, each [1, HV, CHUNK, CHUNK], concatenated
+#                back. Node count scales with C. NOTE this is batch-HV, not
+#                batch-1 -- it is exactly the leading shape the clean T=64 case
+#                already has. MEASURED USELESS: bit-identical corruption to
+#                "batched" (9.7893e-02, 31 bad, first row 65 at T=96), which is
+#                what EXCLUDES the unroll's own batching as the cause. Kept
+#                because that exclusion is the finding.
+#   "perchunk"   the chunk axis is hoisted out of EVERYTHING: no emitted op ever
+#                sees a tensor with a live chunk axis. Per chunk, at rank 4:
+#                cumsum, the pairwise decay, both k/q contractions, the unroll,
+#                and both inverse matmuls; the delta-rule carry stays an
+#                ordinary internal edge, as it already was. This is the brief's
+#                actual hypothesis; "debatched" was a partial form of it.
+#
+# DEFAULT IS "perchunk" SINCE 2026-09-12, because it is the only one of the four
+# that is correct on this plugin for C > 1 (measured, both cards; the card table
+# is in the commit that flipped it and in ~/win-050/FINDINGS). It is not free
+# and the cost is structural, not incidental: the unroll is ~1,900 ops and
+# "perchunk" emits one per chunk instead of one per graph, so the GDN block
+# grows LINEARLY IN C where "batched" was nearly flat --
+#
+#     T     C   batched   perchunk        x36 GDN blocks (the 48-layer stack)
+#      64   1      2054       2037
+#     256   4      2224       7750        80,064  ->    279,000
+#    2048  32      3680      61062       132,480  ->  2,198,232
+#
+# so at serving prefill lengths this form is NOT viable, and the route there is
+# the chunked STATEFUL prefill increment (the 13 paged-port xfails), not a
+# bigger static graph. What the flip buys is correct multi-chunk static graphs
+# at the shapes the window actually boots. The growth law is gated by
+# `test_the_chunk_emission_modes_agree_on_cpu_and_differ_in_node_count`.
+#
+# `Q4E_GDN_UT_MODE` overrides it for a whole suite run without editing code,
+# which is how the card legs were taken on both sides of the comparison.
+UT_EMIT_MODE = os.environ.get("Q4E_GDN_UT_MODE", "perchunk").strip() or "perchunk"
+
+_UT_MODES = ("batched", "folded", "debatched", "perchunk")
+
+
+def _ut_inverse_chunked(ut_orig, chunk, hv, c, mode):
+    """(I + L0)^-1 for every chunk, presenting the chunk axis per `mode`.
+
+    Returns [1, hv, c, chunk, chunk] in every mode; the modes differ only in
+    the shape the unroll's ops see, never in the arithmetic they perform.
+    """
+    if mode not in _UT_MODES:
+        raise ValueError(f"unknown ut emit mode {mode!r}; expected one of {_UT_MODES}")
+    if mode == "batched":
+        return _ut_inverse(ut_orig, chunk, [1, hv, c])
+    if mode == "folded":
+        # HV and C are adjacent leading axes of a contiguous tensor, so merging
+        # them is a view: the unroll sees rank 4 with the same leading volume.
+        folded = _reshape(ut_orig, [1, hv * c, chunk, chunk])
+        inv = _ut_inverse(folded, chunk, [1, hv * c])
+        return _reshape(inv, [1, hv, c, chunk, chunk])
+    parts = []
+    for ci in range(c):
+        one = _reshape(_slice(ut_orig, ci, ci + 1, 1, 2), [1, hv, chunk, chunk])
+        inv_i = _ut_inverse(one, chunk, [1, hv])
+        parts.append(_reshape(inv_i, [1, hv, 1, chunk, chunk]))
+    return op.concat(parts, axis=2) if c > 1 else parts[0]
+
+
 def _ut_inverse(ut_orig, chunk, lead):
     """(I + L0)^-1 with L0 = strictly-lower(ut_orig), by the pin's OWN
     export-branch FORWARD SUBSTITUTION (pin 355-366), unrolled.
@@ -194,10 +276,14 @@ def _rmsnorm_gated(core, z, weight_vec, eps, last_axis):
 
 
 # --- top-level emitter -----------------------------------------------------
-def _gdn_subgraph(hidden, amask, config, state, T):
+def _gdn_subgraph(hidden, amask, config, state, T, ut_mode=None):
     """The GDN block body: hidden [1,T,H] f32 + amask [1,T] f32 -> out [1,T,H].
     Shared by build_gdn_model (standalone) and emit_gdn (the assembled
-    backbone); the emitted ops are unchanged from the inc1 monolith."""
+    backbone); the emitted ops are unchanged from the inc1 monolith.
+
+    `ut_mode` selects how the chunk axis reaches the forward-substitution
+    unroll -- see UT_EMIT_MODE. None takes the module default."""
+    mode = UT_EMIT_MODE if ut_mode is None else ut_mode
     H = config.hidden_size
     HK = config.linear_num_key_heads
     HV = config.linear_num_value_heads
@@ -271,6 +357,57 @@ def _gdn_subgraph(hidden, amask, config, state, T):
     v_beta = _mul(v, beta_u)
     k_beta = _mul(k, beta_u)
 
+    add_mask = np.where(np.triu(np.ones((CHUNK, CHUNK), np.float32), 1) > 0,
+                        -1e30, 0.0).astype(np.float32)
+
+    if mode == "perchunk":
+        # The chunk axis never becomes a tensor axis: it is a Python loop, and
+        # every emitted op below is rank 4 with leading shape [1, HV, ...] --
+        # the same leading shape the single-chunk T=64 graph has, which is the
+        # only shape measured clean on this plugin. The arithmetic is the
+        # batched path's, term for term; only the shapes the ops see differ.
+        last = _c(np.zeros((1, HV, Dk, Dv), np.float32))
+        cores = []
+        for ci in range(C):
+            lo, hi = ci * CHUNK, (ci + 1) * CHUNK
+            q_i = _slice(q, lo, hi, 1, 2)                 # [1,HV,CHUNK,Dk]
+            k_i = _slice(k, lo, hi, 1, 2)
+            kb_i = _slice(k_beta, lo, hi, 1, 2)
+            vb_i = _slice(v_beta, lo, hi, 1, 2)           # [1,HV,CHUNK,Dv]
+            dec_i = _slice(decay_t, lo, hi, 1, 2)         # [1,HV,CHUNK]
+
+            cum_i = op.cumsum(dec_i, op.constant(np.int64(2)))
+            expc4 = _reshape(op.exp(cum_i), [1, HV, CHUNK, 1])
+            pd_i = op.exp(_add(_sub(_reshape(cum_i, [1, HV, CHUNK, 1]),
+                                    _reshape(cum_i, [1, HV, 1, CHUNK])),
+                               _c(add_mask)))
+
+            ut_i = _mul(_mm(kb_i, k_i, tb=True), pd_i)    # [1,HV,CHUNK,CHUNK]
+            it = _mul(_mm(q_i, k_i, tb=True), pd_i)
+            dkb_i = _mul(kb_i, expc4)
+            inv_i = _ut_inverse(ut_i, CHUNK, [1, HV])     # pin 355-365
+            nv = _mm(inv_i, vb_i)                         # pin 366
+            kcd = _mm(inv_i, dkb_i)
+
+            qd = _mul(q_i, expc4)
+            cum_last_i = _slice(cum_i, CHUNK - 1, CHUNK, 1, 2)   # [1,HV,1]
+            kd = _mul(k_i, _reshape(op.exp(_sub(cum_last_i, cum_i)),
+                                    [1, HV, CHUNK, 1]))
+            cd = _reshape(op.exp(cum_last_i), [1, HV, 1, 1])
+
+            v_new = _sub(nv, _mm(kcd, last))
+            inter = _mm(qd, last)
+            cores.append(_add(inter, _mm(it, v_new)))     # [1,HV,CHUNK,Dv]
+            last = _add(_mul(last, cd), _mm(kd, v_new, ta=True))
+
+        core = op.concat(cores, axis=2) if C > 1 else cores[0]  # [1,HV,Tp,Dv]
+        if pad > 0:
+            core = _slice(core, 0, T, 1, 2)
+        core = _transpose(core, [0, 2, 1, 3])            # [1,T,HV,Dv]
+        core = _rmsnorm_gated(core, z, w("norm.weight"), eps, 3)
+        core = _reshape(core, [1, T, value_dim])
+        return _mm(core, _c(w("out_proj.weight")), tb=True)
+
     q_c = _reshape(q, [1, HV, C, CHUNK, Dk])
     k_c = _reshape(k, [1, HV, C, CHUNK, Dk])
     kb_c = _reshape(k_beta, [1, HV, C, CHUNK, Dk])
@@ -284,15 +421,14 @@ def _gdn_subgraph(hidden, amask, config, state, T):
     # pairwise decay: exp(cum_i - cum_j), strictly-upper masked to 0
     cd_i = _reshape(cum, [1, HV, C, CHUNK, 1])
     cd_j = _reshape(cum, [1, HV, C, 1, CHUNK])
-    add_mask = np.where(np.triu(np.ones((CHUNK, CHUNK), np.float32), 1) > 0, -1e30, 0.0)
-    pd = op.exp(_add(_sub(cd_i, cd_j), _c(add_mask.astype(np.float32))))
+    pd = op.exp(_add(_sub(cd_i, cd_j), _c(add_mask)))
 
     ut_orig = _mul(_mm(kb_c, k_c, tb=True), pd)           # [1,HV,C,CHUNK,CHUNK]
     intra = _mul(_mm(q_c, k_c, tb=True), pd)
     dkb = _mul(kb_c, expc5)                               # decayed_k_beta
 
     # pin 355-365: the export branch's forward substitution builds the inverse
-    inv = _ut_inverse(ut_orig, CHUNK, [1, HV, C])
+    inv = _ut_inverse_chunked(ut_orig, CHUNK, HV, C, mode)
     # pin 366: new_values, k_cumdecay = ut_system @ v_beta, @ decayed_k_beta
     new_values = _mm(inv, vb_c)                           # [1,HV,C,CHUNK,Dv]
     k_cumdecay = _mm(inv, dkb)                            # [1,HV,C,CHUNK,Dk]
@@ -333,23 +469,23 @@ def _gdn_subgraph(hidden, amask, config, state, T):
     return out
 
 
-def emit_gdn(hidden, amask, config, state, seq_len):
+def emit_gdn(hidden, amask, config, state, seq_len, ut_mode=None):
     """The GDN subgraph for the assembled backbone (E2 inc5b)."""
-    return _gdn_subgraph(hidden, amask, config, state, int(seq_len))
+    return _gdn_subgraph(hidden, amask, config, state, int(seq_len), ut_mode)
 
 
-def build_gdn_model(config, state, seq_len):
+def build_gdn_model(config, state, seq_len, ut_mode=None):
     H = config.hidden_size
     T = int(seq_len)
     hidden = op.parameter([1, T, H], Type.f32)
     hidden.set_friendly_name("hidden_states")
     amask = op.parameter([1, T], Type.f32)
     amask.set_friendly_name("attention_mask")
-    out = _gdn_subgraph(hidden, amask, config, state, T)
+    out = _gdn_subgraph(hidden, amask, config, state, T, ut_mode)
     result = op.result(out)
     result.set_friendly_name("output")
     model = Model([result], [hidden, amask], "qwen4_exp_gdn_block")
     return model
 
 
-__all__ = ["build_gdn_model", "emit_gdn"]
+__all__ = ["build_gdn_model", "emit_gdn", "UT_EMIT_MODE", "CHUNK"]

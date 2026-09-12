@@ -282,3 +282,118 @@ def test_gdn_ov_parity(device, T):
         f"1e-4, first at row {first_bad}. GPU acceptance is distance-to-truth "
         f"at 20x the floor -- see this cell's docstring for the measurement "
         f"that forced the doctrine")
+
+
+# ---------------------------------------------------------------------------
+# THE CHUNK-AXIS EMISSION MODES (the de-batch spike, 2026-09-12)
+# ---------------------------------------------------------------------------
+
+def test_the_chunk_emission_modes_agree_on_cpu_and_differ_in_node_count():
+    """All four `ut_mode`s are the same arithmetic; only the shapes ops see
+    differ. Both halves of that are asserted, because both are load-bearing.
+
+    WHY THIS EXISTS. On both Arc cards every multi-chunk static-T GDN graph is
+    corrupt from global row 65 onward, exactly T-65 rows, while T=64 is clean
+    at the f32 floor (frontier card pass, ~/win-050/FINDINGS). The spike that
+    chased it needed four emissions of one algebra, so the card could be asked
+    which SHAPE it mishandles rather than which arithmetic. That question only
+    means anything if the four really are one algebra, which is this cell.
+
+    The node counts are GENERATED here, not recited: "perchunk costs nodes" is
+    a claim about the graph and it dies here if it stops being true.
+    """
+    config = _make_config()
+    ref, _ = _ref_and_pin(config)
+    state = _state_np(ref)
+    modes = ("batched", "folded", "debatched", "perchunk")
+
+    core = ov.Core()
+    print("\n[ut-modes] node count by mode, generated from the emitted graph")
+    for T in (64, 96, 128):
+        x = torch.randn(1, T, config.hidden_size)
+        mask = torch.ones(1, T, dtype=torch.long)
+        with torch.no_grad():
+            y_ref = ref(x, mask).float().numpy().astype(np.float64)
+        nodes, outs = {}, {}
+        for mode in modes:
+            m = gdn.build_gdn_model(config, state, seq_len=T, ut_mode=mode)
+            nodes[mode] = len(m.get_ordered_ops())
+            c = compile_for(core, m, "CPU")
+            outs[mode] = np.asarray(
+                c({"hidden_states": x.float().numpy(),
+                   "attention_mask": mask.float().numpy()})[c.output(0)], np.float64)
+        chunks = (T + (gdn.CHUNK - T % gdn.CHUNK) % gdn.CHUNK) // gdn.CHUNK
+        print(f"  T={T:>3} C={chunks}  "
+              + "  ".join(f"{m}={nodes[m]}" for m in modes)
+              + "   max|mode-batched| "
+              + " ".join(f"{m}={np.max(np.abs(outs[m] - outs['batched'])):.2e}"
+                         for m in modes[1:]))
+
+        for mode in modes[1:]:
+            spread = float(np.max(np.abs(outs[mode] - outs["batched"])))
+            assert spread < 1e-4, (
+                f"ut_mode={mode!r} at T={T} disagrees with 'batched' by "
+                f"{spread:.3e} on CPU. The modes must be one algebra emitted "
+                f"four ways -- if they are not, the card comparison they exist "
+                f"for compares two different computations and means nothing.")
+        if chunks == 1:
+            assert nodes["debatched"] == nodes["batched"] + 9, (
+                f"at C=1 'debatched' is one unroll like 'batched', plus the "
+                f"slice/reshape pair: expected {nodes['batched'] + 9} nodes, "
+                f"got {nodes['debatched']}")
+            assert nodes["perchunk"] <= nodes["batched"], (
+                f"at C=1 'perchunk' has no chunk axis to hoist and must not "
+                f"cost more than 'batched': {nodes['perchunk']} vs "
+                f"{nodes['batched']}")
+        else:
+            assert nodes["perchunk"] > nodes["batched"], (
+                f"'perchunk' emits C unrolls and must cost more nodes than the "
+                f"single batched one at C={chunks}: {nodes['perchunk']} vs "
+                f"{nodes['batched']}. If they are equal the mode is not taking "
+                f"effect and every green it reports is the batched path's.")
+
+    # THE GROWTH LAW, generated, because it is the number that says where this
+    # form stops being usable. 'perchunk' is the default and it emits one
+    # ~1,900-op unroll PER CHUNK, so the block grows linearly in C; projected
+    # over the 48-layer stack's 36 GDN blocks it reaches millions of nodes at
+    # serving prefill lengths, and the route there is the stateful-prefill
+    # increment rather than a bigger static graph. gdn.py's header carries that
+    # table; this keeps its shape honest.
+    counts = {}
+    for T in (64, 128, 192, 256):
+        c_of_t = (T + (gdn.CHUNK - T % gdn.CHUNK) % gdn.CHUNK) // gdn.CHUNK
+        counts[c_of_t] = len(gdn.build_gdn_model(
+            config, state, seq_len=T, ut_mode="perchunk").get_ordered_ops())
+    cs = sorted(counts)
+    steps = [counts[b] - counts[a] for a, b in zip(cs, cs[1:])]
+    print("[ut-modes] perchunk nodes by C: "
+          + " ".join(f"C{c}={counts[c]}" for c in cs)
+          + f"  -> per-chunk increments {steps}")
+    # Linear from C=2 on. The C1 -> C2 step is ONE node larger than the rest
+    # and that is not noise: at C == 1 the emitter returns `cores[0]` directly,
+    # so the `concat` over chunks does not exist yet and appears exactly once,
+    # at C == 2. Asserting all increments equal is what this cell did first,
+    # and it went red on [1905, 1904, 1904] -- the graph was right and the
+    # claim was too strong.
+    steps_from_two = steps[1:]
+    assert len(set(steps_from_two)) == 1, (
+        f"'perchunk' node growth is not linear in C for C >= 2 (increments "
+        f"{steps_from_two}). The cost table in gdn.py's header, and the "
+        f"projection that says this form is not viable at prefill lengths, "
+        f"both assume exactly one unroll per chunk -- re-derive them before "
+        f"changing this.")
+    assert steps[0] == steps_from_two[0] + 1, (
+        f"the C1 -> C2 step is {steps[0]} against {steps_from_two[0]} for every "
+        f"later chunk; it should be exactly one larger (the chunk `concat` that "
+        f"C == 1 does not emit). A different gap means the C == 1 path and the "
+        f"C > 1 path have diverged by more than that concat.")
+
+
+def test_an_unknown_chunk_emission_mode_is_refused():
+    """The mode string reaches a comparison, not a silent default. A typo that
+    fell through to 'batched' would report the defect as fixed."""
+    config = _make_config()
+    ref, _ = _ref_and_pin(config)
+    with pytest.raises(ValueError, match="unknown ut emit mode"):
+        gdn.build_gdn_model(config, _state_np(ref), seq_len=96,
+                            ut_mode="per-chunk")
