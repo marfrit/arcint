@@ -177,4 +177,106 @@ def build_moe_model(config, state, seq_len):
     return model
 
 
-__all__ = ["build_moe_model", "emit_moe"]
+# ---------------------------------------------------------------------------
+# PIECEWISE MoE pieces (window-050 / piecewise_export). The real checkpoint has
+# E=512 experts; a single dense MoE graph at real width is ~6.7 GB (gate_up)
+# + ~3.4 GB (down) of f32 constants for ONE layer, so the real-width MoE piece
+# is split into ROUTER / EXPERT-CHUNK / SHARED pieces. The equality theorem
+# (dense == sparse) makes the chunk split measurement-exact: a non-selected
+# expert carries gate 0 and contributes exactly 0, so
+# sum over chunks of chunk outputs + shared == the pin's sparse output on the
+# same gate, and `router_gate` is exactly the pin's `router_gate` (same
+# softmax/topk in f32). The test pastes that gate-equality + chunk-sum parity
+# against the pin's own sparse MoE on fed real tensors.
+# ---------------------------------------------------------------------------
+def emit_router_gate(hidden_bth, config, state, seq_len):
+    """[1,T,H] -> [T,E] dense top-k gate. The ROUTER is
+    `Qwen4ExpTextTopKRouter.forward`, pin 969-978 (linear -> f32 softmax ->
+    topk -> the norm_topk_prob renormalisation); pin 954 is where the expert
+    loop multiplies the routed weight back in, which is a different line and
+    was the citation this docstring carried until 2026-09-12."""
+    H = config.hidden_size
+    T = int(seq_len)
+    return _router_gate(_reshape(hidden_bth, [T, H]), config, state, T)
+
+
+def build_router_model(config, state, seq_len):
+    T = int(seq_len)
+    H = config.hidden_size
+    hidden = op.parameter([1, T, H], Type.f32)
+    hidden.set_friendly_name("hidden_states")
+    gate = emit_router_gate(hidden, config, state, seq_len)
+    res = op.result(gate)
+    res.set_friendly_name("router_gate")
+    return Model([res], [hidden], "qwen4_exp_moe_router")
+
+
+def emit_experts_chunk(hidden_bth, gate_chunk, config, state, e0, e1, seq_len):
+    """[1,T,H] x [T,C] (the gate slice for experts e0..e1) -> [T,H], the sum
+    of the chunk's contributions -- pin 945-955 rolled over e in [e0, e1). The
+    caller verifies sum-over-chunks == pin sparse outside the graph (the
+    theorem is measured in the test, not asserted by construction)."""
+    H = config.hidden_size
+    I = config.moe_intermediate_size
+    T = int(seq_len)
+    h2d = _reshape(hidden_bth, [T, H])
+    gate_up = state["experts.gate_up_proj"][e0:e1]  # [C, 2I, H]
+    down = state["experts.down_proj"][e0:e1]        # [C, H, I]
+    acc = None
+    for j in range(e1 - e0):
+        gu = _mm(h2d, _c(gate_up[j]), tb=True)      # [T, 2I]  (pin 951)
+        g = _slice(gu, 0, I, 1, 1)                  # [T, I]
+        u = _slice(gu, I, 2 * I, 1, 1)              # [T, I]
+        inter = _mul(_silu(g), u)                   # pin 952
+        de = _mm(inter, _c(down[j]), tb=True)       # [T, H]   (pin 953)
+        ge = _slice(gate_chunk, j, j + 1, 1, 1)     # [T, 1]   the routed weight
+        contrib = _mul(de, ge)                      # pin 954 (dense)
+        acc = contrib if acc is None else _add(acc, contrib)
+    return acc
+
+
+def build_experts_chunk_model(config, state, seq_len, e0, e1):
+    T = int(seq_len)
+    H = config.hidden_size
+    C = e1 - e0
+    hidden = op.parameter([1, T, H], Type.f32)
+    hidden.set_friendly_name("hidden_states")
+    gate = op.parameter([T, C], Type.f32)
+    gate.set_friendly_name("gate_chunk")
+    out = emit_experts_chunk(hidden, gate, config, state, e0, e1, T)
+    res = op.result(out)
+    res.set_friendly_name("output")
+    return Model([res], [hidden, gate], f"qwen4_exp_moe_chunk_{e0}_{e1}")
+
+
+def emit_shared_expert(hidden_bth, config, state, seq_len):
+    """[1,T,H] -> [T,H], the shared-expert term scaled by sigmoid(shared
+    expert gate) -- pin 986-996."""
+    H = config.hidden_size
+    I = config.shared_expert_intermediate_size
+    T = int(seq_len)
+    h2d = _reshape(hidden_bth, [T, H])
+    sg = _mm(h2d, _c(state["shared_expert.gate_proj.weight"]), tb=True)
+    su = _mm(h2d, _c(state["shared_expert.up_proj.weight"]), tb=True)
+    sinter = _mul(_silu(sg), su)
+    sout = _mm(sinter, _c(state["shared_expert.down_proj.weight"]), tb=True)
+    sgate = op.sigmoid(_mm(h2d, _c(state["shared_expert_gate.weight"]), tb=True))
+    return _mul(sgate, sout)
+
+
+def build_shared_expert_model(config, state, seq_len):
+    T = int(seq_len)
+    H = config.hidden_size
+    hidden = op.parameter([1, T, H], Type.f32)
+    hidden.set_friendly_name("hidden_states")
+    out = emit_shared_expert(hidden, config, state, T)
+    res = op.result(out)
+    res.set_friendly_name("output")
+    return Model([res], [hidden], "qwen4_exp_moe_shared")
+
+
+__all__ = [
+    "build_moe_model", "emit_moe",
+    "build_router_model", "build_experts_chunk_model",
+    "build_shared_expert_model",
+]

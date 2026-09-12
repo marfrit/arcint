@@ -102,11 +102,34 @@ def _short_conv(x, conv_w, T, C, K, dilation):
     return _transpose(out, [0, 2, 1])        # [1, T, C]   (pin 1232)
 
 
-def _ple_subgraph(hidden, row_ids, config, state, T, conv_mask=None):
+def _embed_windows(local_ids, windows, head_dim, T):
+    """Per-head windowed n-gram gather (the real-width serving form). local_ids
+    [1,T,Hn] i64 carries the BASE-ADJUSTED per-head row ids; `windows` is a
+    list of Hn numpy [K_h, head_dim] f32 tables (each head's own reachable row
+    window, in the GGUF row order -- head h's rows are the contiguous
+    segments offset_h..offset_h+size_h). Output [1,T,Hn*head_dim]: the same
+    concat the pin's single-table gather + flatten(-2) produces when the
+    windows are faithful slices (FIX-D doctrine: narrow the fed rows, never
+    change semantics)."""
+    parts = []
+    for h, w in enumerate(windows):
+        local = _slice(local_ids, h, h + 1, 1, 2)          # [1,T,1]
+        parts.append(_reshape(op.gather(_c(np.ascontiguousarray(w, np.float32)),
+                                        local, _i(0)), [1, T, head_dim]))
+    return op.concat(parts, axis=-1)                        # [1,T,Hn*head_dim]
+
+
+def _ple_subgraph(hidden, row_ids, config, state, T, conv_mask=None,
+                  windows=None):
     """hidden: [1,T,hc*H] f32; row_ids: [1,T,Hn] i64 -> output [1,T,hc*H].
     conv_mask (optional): [1,T] f32; when given, zeroes both gated streams
     before the conv (pin 1251-1253 -- these apply_mask sites belong to THIS
-    path, not the final mixer)."""
+    path, not the final mixer). `windows` (optional): list of Hn per-head [K_h,
+    head_dim] f32 tables; when given, `row_ids` is the per-head base-adjusted
+    embedding selection and the whole-table [V, head_dim] constant is NOT
+    emitted (the real table is [320,001,536, 160] f32 = 190.74 GiB -- 204.8e9
+    bytes, which is ~205 decimal GB and was mislabelled GiB here; host-mmap
+    serving, WP6b 26.82 GiB quantized -- never an emitted constant)."""
     H = config.hidden_size
     hc = config.hc_count
     eps = config.rms_norm_eps
@@ -119,9 +142,12 @@ def _ple_subgraph(hidden, row_ids, config, state, T, conv_mask=None):
     # pin 1242: embeddings = ngram_embedding(ngram_ids).flatten(-2). The fed
     # int64 ids index the table; Gather is dtype-agnostic (no float, no i64
     # arithmetic) -- the index path this graph touches is exact.
-    emb_w = _c(state["ple_embedding.ngram_embedding.weight"])  # [V, head_dim] f32
-    gathered = op.gather(emb_w, row_ids, op.constant(np.int64(0)))  # [1,T,Hn,head_dim]
-    emb = _reshape(gathered, [1, T, Hn * head_dim])                 # [1,T,ple_embed_dim]
+    if windows is not None:
+        emb = _embed_windows(row_ids, windows, head_dim, T)   # [1,T,ple_embed_dim]
+    else:
+        emb_w = _c(state["ple_embedding.ngram_embedding.weight"])  # [V, head_dim] f32
+        gathered = op.gather(emb_w, row_ids, _i(0))          # [1,T,Hn,head_dim]
+        emb = _reshape(gathered, [1, T, Hn * head_dim])      # [1,T,ple_embed_dim]
 
     # pin 1243: key = norm_key(key_proj(emb)).unflatten(hc,H)
     key = _mm(emb, _c(state["key_proj.weight"]), tb=True)          # [1,T,hc*H]
@@ -165,7 +191,7 @@ def emit_ple(hidden_bth, row_ids_node, config, state, seq_len, conv_mask=None):
     return _ple_subgraph(hidden_bth, row_ids_node, config, state, int(seq_len), conv_mask)
 
 
-def build_ple_model(config, state, seq_len, with_mask=False):
+def build_ple_model(config, state, seq_len, with_mask=False, windows=None):
     H = config.hidden_size
     hc = config.hc_count
     Hn = (config.ngram_size - 1) * config.heads_per_ngram
@@ -182,10 +208,10 @@ def build_ple_model(config, state, seq_len, with_mask=False):
         conv_mask.set_friendly_name("conv_mask")
         params.append(conv_mask)
 
-    out = _ple_subgraph(hidden, row_ids, config, state, T, conv_mask)
+    out = _ple_subgraph(hidden, row_ids, config, state, T, conv_mask, windows)
     res = op.result(out)
     res.set_friendly_name("output")
     return Model([res], params, "qwen4_exp_ple")
 
 
-__all__ = ["build_ple_model", "emit_ple"]
+__all__ = ["build_ple_model", "emit_ple", "_embed_windows"]
