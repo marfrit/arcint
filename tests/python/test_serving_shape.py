@@ -507,6 +507,78 @@ def test_the_paged_gap_is_inventoried_precisely(built):
 # The keystone: the whole 48-layer stack. Opt-in, because it is expensive.
 # ---------------------------------------------------------------------------
 
+# CF-RESIDENT (REVIEW 2a45349 F2). The peak-RSS ceiling for the 48-layer build,
+# DERIVED from measurement on both sides rather than chosen. Dev host,
+# 2026-09-12, OV 2026.4.0-22849, one variable per run (`rssprobe`, one module
+# dropped from `_C_MODULES`, nothing else):
+#
+#     as authored                    4.52 GiB   (198b736's own figure; the
+#                                                reviewer reproduced it, and so
+#                                                did this derivation's probe)
+#     `qmoe`  dropped                6.23 GiB   <- the CHEAPEST defect
+#     `qattn` dropped                8.98 GiB   (the reviewer's probe, exactly)
+#     `qhc`   dropped                9.51 GiB
+#     `qgdn`  dropped               30.10 GiB
+#     `qple`  dropped                4.52 GiB   <- invisible to this leg
+#     `pwe`   dropped                4.52 GiB   <- invisible to this leg
+#
+# The ceiling must sit above the authored peak and below the CHEAPEST defect,
+# 4.52 < ceiling < 6.23. It is the geometric mean of that pair,
+# sqrt(4.52 * 6.23) = 5.31 GiB, because that is the value with the same
+# RELATIVE margin on each side -- 17.2% of headroom above the authored peak,
+# 17.5% below the cheapest defect -- and peak RSS moves multiplicatively with
+# how much of the model a defect copies, not additively.
+#
+# RAISING THIS TO MAKE A RUN PASS RE-OPENS THE DEFECT. If the authored peak
+# genuinely moves (a different OpenVINO, a different allocator), re-run both
+# sides and re-derive; the two figures are what the constant means.
+#
+# The last two rows are why this cell is not the whole closure:
+# `test_every_module_binding_the_constant_factory_is_swapped` is.
+PEAK_RSS_CEILING_GIB = 5.31
+PEAK_RSS_AUTHORED_GIB = 4.52
+PEAK_RSS_CHEAPEST_DEFECT_GIB = 6.23
+
+
+def _build_48_in_a_child():
+    """Run the keystone build in a FRESH interpreter and return its report plus
+    its own peak RSS.
+
+    `ru_maxrss` is a high-water mark for the whole process, so measuring it
+    inside pytest would measure whatever ran before this cell -- torch, the
+    other suites, the module-scope 8-layer fixture. A child process is the only
+    way the number means "this build", and it is also what makes the ceiling
+    above reproducible from a bare shell.
+    """
+    import json
+    import subprocess
+    src = r"""
+import json, resource, sys, time
+sys.path.insert(0, %r)
+from q4e import serving_shape as ss
+arena = ss.SparseArena()
+try:
+    t0 = time.time()
+    model, report = ss.build_serving_shape_ir(seq_len=64, arena=arena)
+    report["build_seconds"] = time.time() - t0
+    report["disk_kib"] = arena.disk_kib()
+    report["peak_rss_gib"] = resource.getrusage(
+        resource.RUSAGE_SELF).ru_maxrss / 2**20
+    report.pop("op_histogram", None)
+    sys.stdout.write("REPORT " + json.dumps(report) + "\n")
+finally:
+    arena.close()
+""" % str(REPO_ROOT / "tools")
+    r = subprocess.run([sys.executable, "-c", src], capture_output=True,
+                       text=True, timeout=1800)
+    line = [l for l in r.stdout.splitlines() if l.startswith("REPORT ")]
+    assert line, (
+        "the keystone child produced no report.\n"
+        f"rc={r.returncode}\nstdout tail:\n{r.stdout[-2000:]}\n"
+        f"stderr tail:\n{r.stderr[-2000:]}")
+    return json.loads(line[-1][len("REPORT "):])
+
+
 @pytest.mark.skipif(not os.environ.get("Q4E_SERVING_FULL"),
                     reason="Q4E_SERVING_FULL unset: the full 48-layer "
                            "real-geometry build is the keystone cell and is "
@@ -514,28 +586,149 @@ def test_the_paged_gap_is_inventoried_precisely(built):
 def test_the_full_48_layer_stack_emits_at_real_geometry():
     """FULL GEOMETRY STRUCTURE EMISSION -- the thing the refusal said was
     blocked. 48 layers, 36 GDN + 12 dense-causal, real widths, real vocabulary,
-    experts slot-referenced, PLE table declared and never materialised."""
-    import time
-    arena = ss.SparseArena()
-    try:
-        t0 = time.time()
-        model, report = ss.build_serving_shape_ir(seq_len=64, arena=arena)
-        dt = time.time() - t0
-        cfg = pwe.real_config()
-        print(f"\n[serving-shape FULL] {report['n_layers']} layers "
-              f"({report['gdn_layers']} GDN + {report['attn_layers']} attn), "
-              f"T={report['seq_len']}")
-        print(f"  nodes                 {report['nodes']:,}")
-        print(f"  declared constants    "
-              f"{report['arena_declared_bytes'] / 2**30:.2f} GiB")
-        print(f"  graph const bytes     "
-              f"{report['graph_const_bytes'] / 2**30:.2f} GiB")
-        print(f"  arena blocks on disk  {arena.disk_kib()} KiB")
-        print(f"  build                 {dt:.1f} s")
-        assert report["n_layers"] == cfg.num_hidden_layers == 48
-        assert report["gdn_layers"] == 36 and report["attn_layers"] == 12
-        assert report["nodes"] > 50_000, report["nodes"]
-        assert arena.disk_kib() <= 64
-        assert report["outputs"][0][1] == [1, 64, cfg.vocab_size]
-    finally:
-        arena.close()
+    experts slot-referenced, PLE table declared and never materialised.
+
+    AND ITS RESIDENCY, which until CF-RESIDENT nothing measured. The headline
+    is "183 GiB declared, built on a 48 GiB host"; the two assertions that
+    carried it (`declared > 8 GiB`, `disk_kib <= 64`) are both INVARIANT to a
+    module dropping out of `_C_MODULES`, because a copied constant lives in
+    anonymous memory and never touches the arena file. The reviewer dropped
+    `qattn` and every quantity this cell observed stayed bit-identical while
+    peak RSS doubled. `peak_rss_gib` is the quantity that moves.
+    """
+    report = _build_48_in_a_child()
+    cfg = pwe.real_config()
+    rss = report["peak_rss_gib"]
+    print(f"\n[serving-shape FULL] {report['n_layers']} layers "
+          f"({report['gdn_layers']} GDN + {report['attn_layers']} attn), "
+          f"T={report['seq_len']}")
+    print(f"  nodes                 {report['nodes']:,}")
+    print(f"  declared constants    "
+          f"{report['arena_declared_bytes'] / 2**30:.2f} GiB")
+    print(f"  graph const bytes     "
+          f"{report['graph_const_bytes'] / 2**30:.2f} GiB")
+    print(f"  arena blocks on disk  {report['disk_kib']} KiB")
+    print(f"  build                 {report['build_seconds']:.1f} s")
+    print(f"  PEAK RSS              {rss:.2f} GiB   "
+          f"(authored {PEAK_RSS_AUTHORED_GIB}, ceiling "
+          f"{PEAK_RSS_CEILING_GIB}, cheapest defect "
+          f"{PEAK_RSS_CHEAPEST_DEFECT_GIB})")
+    assert report["n_layers"] == cfg.num_hidden_layers == 48
+    assert report["gdn_layers"] == 36 and report["attn_layers"] == 12
+    assert report["nodes"] > 50_000, report["nodes"]
+    assert report["disk_kib"] <= 64
+    assert report["outputs"][0][1] == [1, 64, cfg.vocab_size]
+    assert rss <= PEAK_RSS_CEILING_GIB, (
+        f"peak RSS {rss:.2f} GiB exceeds the derived ceiling "
+        f"{PEAK_RSS_CEILING_GIB} GiB. The build declared the same "
+        f"{report['arena_declared_bytes'] / 2**30:.2f} GiB over the same "
+        f"{report['nodes']:,} nodes and still wrote {report['disk_kib']} KiB "
+        f"to disk, so every other assertion in this cell is satisfied -- that "
+        f"is the CF-RESIDENT signature. Check `_C_MODULES` in "
+        f"tools/q4e/serving_shape.py against "
+        f"test_every_module_binding_the_constant_factory_is_swapped before "
+        f"touching this number; the cheapest module to drop costs "
+        f"{PEAK_RSS_CHEAPEST_DEFECT_GIB} GiB.")
+
+
+# ---------------------------------------------------------------------------
+# CF-RESIDENT leg 2 -- the structural one, which runs on EVERY leg
+# ---------------------------------------------------------------------------
+
+def _modules_binding_the_constant_factory():
+    """Every module under tools/q4e that binds the name `_c` at module level,
+    by ast rather than by import: `from .gdn import _c`, `import _c as ...`,
+    or its own `def _c` / `_c = ...`.
+
+    Read from source on purpose. Importing to ask would run each module, and a
+    module that failed to import would silently drop out of the answer -- the
+    same shape of invisibility this whole finding is about.
+    """
+    import ast
+    src_dir = REPO_ROOT / "tools" / "q4e"
+    found = {}
+    for p in sorted(src_dir.glob("*.py")):
+        if p.name == "__init__.py":
+            continue
+        tree = ast.parse(p.read_text(), filename=str(p))
+        where = None
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for a in node.names:
+                    if (a.asname or a.name.split(".")[0]) == "_c":
+                        where = node.lineno
+            elif isinstance(node, ast.FunctionDef) and node.name == "_c":
+                where = node.lineno
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id == "_c":
+                        where = node.lineno
+        if where is not None:
+            found[p.stem] = where
+    return found
+
+
+def test_every_module_binding_the_constant_factory_is_swapped():
+    """CF-RESIDENT, the leg the peak-RSS assertion cannot cover.
+
+    `shared_constants()` swaps `_c` per module, and each importer holds its OWN
+    binding, so a module missing from `_C_MODULES` keeps the copying factory
+    and materialises its family's weights. The 48-layer cell catches that for
+    four of the six listed modules; dropping `qple` or `pwe` leaves peak RSS at
+    4.52 GiB EXACTLY, because this particular build never reaches their `_c`
+    with a large arena array. Measured, not inferred -- which is why a
+    behavioural leg alone would be a guard with holes in it.
+
+    So the invariant is asserted structurally instead: a module that BINDS `_c`
+    must be in `_C_MODULES`, whether or not today's build happens to call it.
+    On its first run this found `q4e.backbone`, which binds `_c`
+    (backbone.py:70) and spends it on `embed_w` and `head_w` -- 2.37 GiB each
+    at real geometry, the largest pair in the model.
+
+    The technique is `test_suite_guards.py`'s: read the source with `ast`,
+    device-free, no shards, runs on every leg.
+    """
+    binders = _modules_binding_the_constant_factory()
+    listed = {m.__name__.rsplit(".", 1)[-1] for m in ss._C_MODULES}
+    print(f"\n[contract-cmodules] modules binding `_c`: "
+          f"{', '.join(f'{k} (:{v})' for k, v in sorted(binders.items()))}")
+    print(f"[contract-cmodules] _C_MODULES: {sorted(listed)}")
+
+    assert binders, (
+        "no module under tools/q4e binds `_c` -- the scanner is broken, not "
+        "the tree (q4e.gdn defines it and at least five modules import it)")
+    missing = sorted(set(binders) - listed)
+    assert not missing, (
+        "module(s) bind the `_c` constant factory but are absent from "
+        "`_C_MODULES` in tools/q4e/serving_shape.py: "
+        + ", ".join(f"{m} (q4e/{m}.py:{binders[m]})" for m in missing)
+        + ". `shared_constants()` will not swap them, so every constant they "
+          "build during a serving-shape build is COPIED into anonymous memory "
+          "-- invisible to the node count, to the declared bytes and to "
+          "`disk_kib`, and visible only as peak RSS or as an OOM.")
+    # and the reverse: a name in _C_MODULES that no longer binds `_c` is a
+    # stale entry whose swap is a no-op, which would make this gate weaker
+    # than it reads.
+    stale = sorted(listed - set(binders))
+    assert not stale, (
+        f"`_C_MODULES` lists {stale}, which bind no `_c`; the swap is a no-op "
+        f"for them. Remove them, or this gate over-reports its own coverage.")
+
+
+def test_the_constant_factory_scanner_detects_a_missing_module():
+    """The scanner's own red, in tree and permanent.
+
+    A gate that can only pass is not a gate. `_C_MODULES` minus one entry must
+    be rejected by the same comparison the cell above runs.
+    """
+    binders = _modules_binding_the_constant_factory()
+    listed = {m.__name__.rsplit(".", 1)[-1] for m in ss._C_MODULES}
+    assert not (set(binders) - listed), "precondition: the tree is clean"
+    for drop in sorted(listed):
+        mutated = listed - {drop}
+        missing = set(binders) - mutated
+        assert missing == {drop}, (
+            f"dropping {drop!r} from _C_MODULES was not detected as missing: "
+            f"{missing}")
+    print(f"[contract-cmodules] scanner rejects each of {len(listed)} "
+          f"single-module deletions")

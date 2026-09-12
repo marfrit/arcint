@@ -128,6 +128,7 @@ from openvino import Model, Type
 from openvino import opset13 as op
 
 from . import attention as qattn
+from . import backbone as qbb
 from . import gdn as qgdn
 from . import hc as qhc
 from . import ple as qple
@@ -237,10 +238,36 @@ class SparseArena:
 
 
 # Every module that imported `_c` from q4e.gdn holds its OWN binding, so all of
-# them have to be swapped. Missing one would silently materialise that family's
-# weights -- which is why the contract test measures resident bytes rather than
-# trusting this list.
-_C_MODULES = (qgdn, qattn, qhc, qple, pwe)
+# them have to be swapped. Missing one silently materialises that family's
+# weights: the build still emits the same 84,372 nodes, still declares the same
+# bytes, still occupies 0 KiB on disk, and costs GiB of anonymous memory that
+# nothing observes until the host OOMs.
+#
+# CF-RESIDENT (REVIEW 2a45349 F2, closed 2026-09-12). This comment used to end
+# "-- which is why the contract test measures resident bytes rather than
+# trusting this list". IT DID NOT MEASURE RESIDENT BYTES. The reviewer dropped
+# `qattn` from the tuple and the whole suite stayed green while peak RSS went
+# 4.52 -> 8.98 GiB. Two cells now carry the claim, and between them they cover
+# what neither covers alone:
+#
+#   tests/python/test_serving_shape.py
+#     ::test_the_full_48_layer_stack_emits_at_real_geometry
+#        asserts peak RSS of the 48-layer build against a ceiling derived from
+#        both sides (authored 4.52 GiB, cheapest single-module defect 6.23).
+#        It cannot see `qple` or `pwe`: dropping either leaves peak RSS at
+#        4.52 GiB exactly, because neither module's `_c` is reached with a
+#        large arena array during this build. Measured, not assumed.
+#     ::test_every_module_binding_the_constant_factory_is_swapped
+#        closes that gap structurally -- an ast scan over tools/q4e asserting
+#        every module that BINDS `_c` appears below, whether or not this
+#        build happens to call it.
+#
+# `backbone` was the one the scan found on its first run: it binds `_c`
+# (backbone.py:70) and spends it on `embed_w` and `head_w`, 2.37 GiB each at
+# real geometry -- the largest pair in the model. `build_serving_shape_ir`
+# does not call it today, so nothing leaked; it is listed because the next
+# path that does must not have to remember.
+_C_MODULES = (qgdn, qattn, qhc, qple, pwe, qbb)
 try:                                              # moe is imported lazily by pwe
     from . import moe as qmoe
     _C_MODULES = _C_MODULES + (qmoe,)
