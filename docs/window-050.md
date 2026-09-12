@@ -9,12 +9,38 @@ the serving measurement is taken.
 
 | marker | meaning |
 |---|---|
-| `RUN` | executed on the dev host and its output is recorded here or in RECONCILE |
+| `RUN@<sha>` | executed on the dev host, on the tree named by `<sha>`, and its output is recorded here or in RECONCILE |
+| `RUN@wt+<sha>` | executed on a WORKING TREE at `<sha>` carrying uncommitted deltas — the code is not provably `<sha>`; RECONCILE names the delta |
+| `RUN@unrecorded` | executed, but the tree it ran on was never recorded and cannot now be established |
 | `DRY` | the command is correct and was exercised in a no-op / device-free form, but its real effect was not produced |
 | `UNTESTED` | written down from the design and never executed — treat every claim about it as a guess |
 
 A command with no marker is a defect in this file. No command here is marked
 `RUN` unless this repository holds the output.
+
+### CF-MANIFESTSHA — the law added 2026-09-12 (REVIEW e78812d, F7)
+
+**A `RUN` marker must name the commit its output came from.** The review's
+words: the manifest recorded *"CPU-only control, for the same tree (`RUN`,
+2026-09-12): 101 passed with shards, 33 passed / 59 skipped device-free"*, while
+at the tip those figures were 112 and 42/70. *"Both figures are true of their
+own trees and a reader cannot tell them apart — which is the b929924 gap one
+level up, in the tracked operating document."* This file already applied that
+rule to the reserved coherence row ("in the same commit as the measurement") and
+not to its own 38 `RUN` markers.
+
+Two conventions, so the law is applicable rather than aspirational:
+
+* For a measurement **of the tree** (a suite result, a node count, a parity
+  figure), the id is the tree the measurement ran on.
+* For an observation that does **not** depend on the tree (host state, service
+  state, card enumeration, a plugin property), the id is the **session tip** at
+  which it was recorded — it dates the observation without claiming the code
+  caused it.
+
+`tests/python/test_window_manifest.py` enforces it: every `RUN` in this file
+must carry an id, and the number of `RUN@unrecorded` markers is a **ratchet**
+that may only ever go down.
 
 ---
 
@@ -45,15 +71,15 @@ otherwise. The lock is self-expiring and never overwrites a running foreign
 lock.
 
 ```
-# RUN  — place a hold for the window's length plus slack
+# RUN@e78812d  — place a hold for the window's length plus slack
 ssh <power-host> 'sudo <hold-script> <hours> "arcint dev"'
-# RUN  — check remaining time
+# RUN@e78812d  — check remaining time
 ssh <power-host> 'sudo <hold-script> status'
 # UNTESTED — release early (not exercised; the lock was left to expire)
 ssh <power-host> 'sudo <hold-script> release'
 ```
 
-Observed output shape (`RUN`, 2026-09-12):
+Observed output shape (`RUN@e78812d`, 2026-09-12):
 
 ```
 gesperrt bis 12.09. 06:00 (noch 5 h 0 min)  pid=4015039 owner=hold-data grund=arcint dev
@@ -88,11 +114,11 @@ allocation errors at best, host OOM at worst.
 anyone noticing until a benchmark caught it by accident:
 
 ```
-# RUN
+# RUN@e78812d
 ssh <dev-host> 'systemctl --user list-units | grep -i arcint'
 ```
 
-`RUN` output, 2026-09-12:
+`RUN@e78812d` output, 2026-09-12:
 
 ```
 arcint-agent.service   active running   Qwen3.8-27B dicht + MTP, GPU.0 (Arc Pro B60), :8087
@@ -107,7 +133,7 @@ path and stays stopped (reservation mneme 361).
 ### Stop order, with timestamps recorded
 
 ```
-# RUN
+# RUN@e78812d
 date -Is
 systemctl --user stop arcint-agent        # frees GPU.0 (B60)
 date -Is
@@ -116,7 +142,7 @@ date -Is
 systemctl --user is-active arcint-agent arcint
 ```
 
-`RUN`, 2026-09-12: agent stopped `23:54:40Z`, coder stopped `23:54:41Z`, both
+`RUN@e78812d`, 2026-09-12: agent stopped `23:54:40Z`, coder stopped `23:54:41Z`, both
 report `inactive`, host RAM in use fell 18 GiB → 0 GiB.
 
 ### Take a coherence baseline BEFORE stopping
@@ -127,20 +153,20 @@ entirely by `reasoning_content` and returns an EMPTY `content`, which looks like
 a broken endpoint and is not one.
 
 ```
-# RUN  — max_tokens must be >= ~64; 200 used here
+# RUN@e78812d  — max_tokens must be >= ~64; 200 used here
 curl -s http://127.0.0.1:8087/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"qwen3.8-agent","messages":[{"role":"user",
        "content":"What is the capital of France? Answer in one word."}],
        "max_tokens":200,"temperature":0}'
 ```
 
-`RUN` baseline, 2026-09-12 23:54Z: `content='Paris'`, 27 completion tokens, MTP
+`RUN@e78812d` baseline, 2026-09-12 23:54Z: `content='Paris'`, 27 completion tokens, MTP
 `accepted_prediction_tokens=13 rejected_prediction_tokens=1`.
 
 ### Card enumeration once the cards are free
 
 ```
-# RUN
+# RUN@e78812d
 ssh <dev-host> '<venv>/bin/python3 -c "
 import openvino as ov; c=ov.Core()
 print(c.available_devices)
@@ -148,7 +174,7 @@ for d in c.available_devices:
     if d.startswith(\"GPU\"): print(d, c.get_property(d,\"GPU_DEVICE_TOTAL_MEM_SIZE\"))"'
 ```
 
-`RUN` output, 2026-09-12:
+`RUN@e78812d` output, 2026-09-12:
 
 ```
 OV 2026.4.0-22849-71640275d29   devices ['CPU', 'GPU.0', 'GPU.1']
@@ -164,7 +190,7 @@ INFERENCE_PRECISION_HINT default (both): float16      <-- see §3
 ## 3. `INFERENCE_PRECISION_HINT` — wire it or the parity columns are fiction
 
 **The Intel GPU plugin defaults `INFERENCE_PRECISION_HINT` to `float16`.** CPU
-defaults to `float32`. Measured (`RUN`, OV 2026.4.0, both Arc cards). So a
+defaults to `float32`. Measured (`RUN@829a213`, OV 2026.4.0, both Arc cards). So a
 `compile_model(model, "GPU.0")` with no config executes the graph in f16 while
 the suite's assertions compare it against an f64 reference at a floor of ~1e-7.
 f16 carries about three decimal digits. That alone fails every GPU parity leg,
@@ -184,7 +210,7 @@ def compile_for(core, model, device):
     return core.compile_model(model, device, cfg)
 ```
 
-Accepted value forms, measured (`RUN`):
+Accepted value forms, measured (`RUN@829a213`):
 
 ```
 accepted 'f32'             -> <Type: 'float32'>
@@ -209,22 +235,27 @@ leftovers between files (GPU test processes have survived SIGTERM before, and tw
 arcint-class processes on one card wedge under load).
 
 ```
-# RUN  — the driver, from a byte-exact staged tree
+# RUN@wt+2e99661  — the driver, from a byte-exact staged tree
 ssh <dev-host> 'cd <staged-tree> && TREE=<staged-tree> LOG=<staged-tree>/logs ./gpu_window.sh'
 ```
 
 Per-file invocation it issues:
 
 ```
-# RUN
+# RUN@wt+2e99661
 Q4E_GPU=GPU.0,GPU.1 Q4E_GGUF_SHARDS=<shards> \
   <venv>/bin/python3 -m pytest <file> -q -s --tb=short
 ```
 
-CPU-only control, for the same tree (`RUN`, 2026-09-12): `Q4E_GPU=` empty →
-**101 passed** with shards, **33 passed / 59 skipped** device-free.
+CPU-only control (`RUN@e78812d`): `Q4E_GPU=` empty → **112 passed** with
+shards, **42 passed / 70 skipped, 0 errors** device-free.
 
-### GPU RESULTS — `RUN` 2026-09-12, both cards, f32 pinned
+> The figures here were **101** and **33/59** until 2026-09-12. Both were
+> true — of the tree they ran on, which was not the tip. That is the
+> defect CF-MANIFESTSHA exists to prevent, recorded rather than edited
+> away; §8's own numbers moved for the same reason.
+
+### GPU RESULTS — `RUN@wt+2e99661` 2026-09-12, both cards, f32 pinned
 
 Suite, one process per file, `Q4E_GPU=GPU.0,GPU.1`:
 
@@ -268,7 +299,7 @@ indexer. Gate is 20× the pin's own f32-vs-f64 rounding; the worst card leg is
 
 T=64 is one chunk; T=96 is two. Identical to four figures on both cards, so it is
 deterministic, not a race. An independent tiny-width sweep against an f64
-reference locates the divergence point exactly (`RUN`):
+reference locates the divergence point exactly (`RUN@wt+2e99661`):
 
 ```
     T chunks            CPU          GPU.0          GPU.1
@@ -309,7 +340,7 @@ program_builder.cpp:268        Input moerouterfused:MoERouterFused_24271.out1
 `[64,2]` is `[T, top_k]`. The **plugin's own** MoE router fusion builds a
 primitive it then cannot lay out or register. It is not our graph.
 
-Minimal reproducer and the piece-level sidestep (`RUN`, both cards):
+Minimal reproducer and the piece-level sidestep (`RUN@wt+2e99661`, both cards):
 
 | piece | nodes | CPU | GPU.0 | GPU.1 |
 |---|---|---|---|---|
@@ -373,7 +404,7 @@ workaround asserted without a measured before/after is neither.
 
 ## 5. Residency — the SIZE LEDGER, and the number that decides the window
 
-`RUN`, 2026-09-12, real checkpoint geometry, T=64, CPU, every row either built
+`RUN@wt+2e99661`, 2026-09-12, real checkpoint geometry, T=64, CPU, every row either built
 and measured (`graph`) or computed from the shipped tensor list (`file`):
 
 ```
@@ -416,12 +447,12 @@ scheduling preference; it is 3.5 GiB.
 
 ## 6. The 86k-node compile — an observation with a budget, not a milestone
 
-CPU behaviour is known (`RUN`, REVIEW 57b1952 §7): node count is linear in GDN
+CPU behaviour is known (`RUN@57b1952`, REVIEW 57b1952 §7): node count is linear in GDN
 layer count at ~1,879 nodes/block, and an 86k-node graph (the tiny width at the
 checkpoint's 36 GDN layers) compiles on CPU in 22 s without falling over.
 
 ```
-layers    nodes  nonconst   xml MB  build s  compile s      (RUN, CPU)
+layers    nodes  nonconst   xml MB  build s  compile s   (RUN@57b1952, CPU)
      4     9671      3727     4.25     0.10       1.92
     12    28663     10975    12.71     0.38       6.09
     36    85639     32719    38.05     0.95      21.95
@@ -430,7 +461,7 @@ layers    nodes  nonconst   xml MB  build s  compile s      (RUN, CPU)
 Whether the GPU plugin's per-shape kernel JIT behaves the same on 86k nodes was
 **not** answered there and is not answerable from CPU numbers.
 
-`RUN` 2026-09-12, 20-minute hard budget per attempt, each attempt in its own
+`RUN@wt+2e99661` 2026-09-12, 20-minute hard budget per attempt, each attempt in its own
 child process so a wedged compile cannot take the run with it:
 
 ```
@@ -507,18 +538,19 @@ record than a blank guessed.
 
 | term | value | provenance |
 |---|---|---|
-| card under test | A770, 15.11 GiB reported (16,225,243,136 B) | `RUN` GPU.1 enumeration |
-| alternate card | B60, 22.71 GiB reported (24,385,683,456 B) | `RUN` GPU.0 enumeration |
-| CARD-tier weights at f32 | 18.492 GiB | `RUN` size ledger |
-| → fits A770 reserve | **no**, −3.492 GiB | `RUN` size ledger |
-| → fits B60 | yes, +4.218 GiB | `RUN` size ledger |
-| offload tier | 450.000 GiB f32 (48 × 9.375) | `RUN` size ledger, file-sourced |
-| host-mmap tier | 190.736 GiB f32 n-gram table | `RUN` size ledger, file-sourced |
-| f32 : quantized ratio | 7.72× | `RUN` size ledger vs WP6b 85.38 GiB |
-| GPU inference precision | f32, pinned explicitly | `RUN` §3 |
-| QSA→dense price, T ≤ 2048 | **0.0, exact** | `RUN` attention piece |
-| QSA→dense price, T = 2080 | 2.386e-02 over 29/2080 rows | `RUN` attention piece |
-| attention piece floor vs pin | 1.855e-07 (T=64), 1.535e-07 (T=96) | `RUN` attention piece |
+| card under test | A770, 15.11 GiB reported (16,225,243,136 B) | `RUN@e78812d` GPU.1 enumeration |
+| alternate card | B60, 22.71 GiB reported (24,385,683,456 B) | `RUN@e78812d` GPU.0 enumeration |
+| CARD-tier weights at f32 | 18.492 GiB | `RUN@wt+2e99661` size ledger |
+| → fits A770 reserve | **no**, −3.492 GiB | `RUN@wt+2e99661` size ledger |
+| → fits B60 | yes, +4.218 GiB | `RUN@wt+2e99661` size ledger |
+| offload tier | 450.000 GiB f32 (48 × 9.375) | `RUN@wt+2e99661` size ledger, file-sourced |
+| host-mmap tier | 190.736 GiB f32 n-gram table | `RUN@wt+2e99661` size ledger, file-sourced |
+| f32 : quantized ratio | 7.72× | `RUN@wt+2e99661` size ledger vs WP6b 85.38 GiB |
+| GPU inference precision | f32, pinned explicitly | `RUN@829a213` §3 |
+| QSA→dense price, T ≤ **2051** | **0.0, exact** (boundary derived, not the budget 2048) | `RUN@692c0a6` attention piece |
+| QSA→dense price, T = 2052 | 2.307817e-06 over **1**/2052 rows | `RUN@692c0a6` attention piece |
+| QSA→dense price, T = 2080 | 2.385560e-02 over **29**/2080 rows = T−2051 | `RUN@692c0a6` attention piece |
+| attention piece floor vs pin | 1.855e-07 (T=64), 1.535e-07 (T=96) | `RUN@e78812d` attention piece |
 | KLD gate threshold | ≤ 0.0599 nats mean per-token | harness, red-probed |
 
 ### Terms still to be predicted — `UNTESTED`, fill before measuring
@@ -556,7 +588,7 @@ belongs to §2's stop procedure, not to this table.)
 ## 9. Morning restore — non-negotiable, before any close-out
 
 ```
-# RUN
+# RUN@e78812d
 date -Is
 systemctl --user start arcint arcint-agent
 systemctl --user is-active arcint arcint-agent
