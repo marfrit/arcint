@@ -1020,10 +1020,42 @@ def test_the_peak_rss_ceiling_is_the_geometric_mean_of_its_bracket():
     assertion constrains the CEILING against the two measured sides, and
     nothing in it constrains `_rss_ceiling_margins()`, which computes the two
     margins by its own two formulas. Break either formula and the gap leaves
-    the bound while the ceiling still round-trips. Measured, not argued: with
-    `below` taken against the authored peak instead of the ceiling, this cell
-    goes red at 30.8 pp against a 0.2211 pp bound while every other assertion
-    here passes. So it can fail, for a defect its sibling cannot see.
+    the bound while the ceiling still round-trips. So it can fail, for a defect
+    its sibling cannot see.
+
+    RETRACTION, H1 (REVIEW f8229d8), and it is the defect class this cell is
+    named after. This paragraph used to read "goes red at 30.8 pp against a
+    0.2211 pp bound". BOTH FIGURES WERE WRONG AND NEITHER CAME FROM A RUN.
+    30.8 was typed from intent before the mutation was executed; the run that
+    produced 20.3540 happened in the same session, corrected the commit
+    message, and never came back to this docstring. 0.2211 is the worse half:
+    it is the derivative at `c`, which the paragraph four lines below this one
+    DISOWNS as the wrong bound in the same breath -- so the docstring quoted as
+    "the bound" the exact number it names as the tolerance that can red without
+    a defect, leaving a live invitation to "reconcile" the two by setting the
+    tolerance to it. Clause 2 does not exempt red figures: a number written
+    from what a mutation OUGHT to produce is a recital whichever side of the
+    assertion it sits on. Regenerated below by running each mutation.
+
+    WHAT THE MUTATIONS ACTUALLY PRODUCE (`/tmp` copies of the clean tree, dev
+    host CPU, this cell alone, `-k geometric_mean`). The control is the live
+    tree: `1 passed`, gap 0.1521 pp <= 0.2213 pp.
+
+        ENG  below vs the AUTHORED PEAK    gap 20.3540 pp   1 failed
+        M1   the two returns SWAPPED       gap  0.1521 pp   1 failed
+        M2   the -1.0 dropped              gap  0.1521 pp   1 failed
+        M3   bracket ends swapped          gap  0.1103 pp   1 failed
+        M4   both margins the SAME expr    gap  0.0000 pp   1 failed
+
+    ONLY `ENG` IS CAUGHT BY THE GAP BOUND. M1-M4 all sit INSIDE 0.2213 pp and
+    passed everything this cell asserted until H2 added `0 < below < above < 1`
+    -- REVIEW f8229d8 §14 found them by attacking the cell rather than reading
+    it. M1 is the one that matters: it prints `+17.326% above / +17.478% below`,
+    the two margins ordered backwards, which is F3 itself, the defect this cell
+    was written to prevent walking straight through its own guard. M4 makes
+    "two independently computed margins" vacuous at gap exactly 0. The bound
+    tests that the margins AGREE; it never tested that either is the right
+    formula, and the invariant is what closes that.
 
     The bound is the exact one, not the derivative at `c`: `gap(gm) == 0` and
     `gap(c) = |integral from gm to c of (1/a + d/t**2) dt|`, so with
@@ -1074,6 +1106,24 @@ def test_the_peak_rss_ceiling_is_the_geometric_mean_of_its_bracket():
         f"the ceiling was raised without re-deriving it -- which re-opens the "
         f"defect it guards -- or a measured side moved and the ceiling was "
         f"not recomputed.")
+    # H2 (REVIEW f8229d8). The ORDER and RANGE of the two margins, which the
+    # gap bound does not constrain: it tests only that they AGREE, so every
+    # formula defect preserving the near-symmetry walks through it -- including
+    # the two margins ordered backwards, which is F3, the defect this cell
+    # exists to prevent. Not a restatement of the formulas: `below < above` is
+    # forced by the ROUNDING (c > gm makes the upper margin the larger one) and
+    # `0 < .. < 1` by the bracket, both independently of how either is
+    # computed. Four mutations that passed the bound alone are red on this line
+    # and are listed in the docstring.
+    assert 0 < below < above < 1, (
+        f"the ceiling's margins are +{above * 100:.3f}% above / "
+        f"+{below * 100:.3f}% below, which breaks `0 < below < above < 1`. "
+        f"Both must be positive (the ceiling sits strictly inside its "
+        f"bracket), both under 1 (neither side doubles), and `below` must be "
+        f"the SMALLER, because rounding the geometric mean UP to 0.01 GiB is "
+        f"what makes the upper margin the larger one. A violation here is a "
+        f"margin computed by the wrong formula, not a bracket that moved -- "
+        f"the bracket has its own assertion above.")
     assert abs(above - below) <= gap_bound, (
         f"the ceiling's two relative margins differ by "
         f"{abs(above - below) * 100:.4f} percentage points "
