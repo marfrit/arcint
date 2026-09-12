@@ -874,6 +874,9 @@ def test_every_module_binding_the_constant_factory_is_swapped():
         f"for them. Remove them, or this gate over-reports its own coverage.")
 
 
+_SERVING_SHAPE_PY = REPO_ROOT / "tools" / "q4e" / "serving_shape.py"
+
+
 def _serving_shape_attribute_bases():
     """The module aliases `serving_shape.py` actually REACHES INTO (`alias.x`),
     by ast. An alias that is imported and never dereferenced is in
@@ -881,9 +884,41 @@ def _serving_shape_attribute_bases():
     position in the RSS derivation.
     """
     import ast
-    tree = ast.parse((REPO_ROOT / "tools" / "q4e" / "serving_shape.py").read_text())
+    tree = ast.parse(_SERVING_SHAPE_PY.read_text())
     return {n.value.id for n in ast.walk(tree)
             if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)}
+
+
+def _serving_shape_import_alias(module):
+    """The local name `serving_shape.py` binds for `q4e.<module>`, by ast.
+
+    CF-GUARDALIAS (REVIEW 7c26cce F8). The deref guard below used to spell its
+    subject as the literal string `"qbb"`. That string is not the module; it is
+    one spelling of the alias the module happened to be imported under, and an
+    assertion keyed on a spelling passes VACUOUSLY the moment the spelling
+    changes. Measured on a mutated tree before this function existed: rename
+    every `qbb` to `qback` and add one real `qback._c` dereference, and the
+    cell reported `1 passed` while `backbone` WAS being reached into -- the
+    `None` row in `PEAK_RSS_GIB_WHEN_DROPPED` kept a licence it had just lost.
+
+    So the alias is DERIVED from the `ImportFrom` node instead of typed -- the
+    same move `cite()` makes for line numbers one level down, and for the same
+    reason (clause 2: the defining source generates it, nobody recites it).
+    Uniqueness and existence are both asserted: a `backbone` import that has
+    been removed, or bound twice, names nothing, and that is a red rather than
+    a silent pass.
+    """
+    import ast
+    tree = ast.parse(_SERVING_SHAPE_PY.read_text())
+    bound = [a.asname or a.name.rsplit(".", 1)[-1]
+             for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+             for a in n.names if a.name.rsplit(".", 1)[-1] == module]
+    assert len(bound) == 1, (
+        f"`serving_shape.py` binds {module!r} {len(bound)} times ({bound}); "
+        f"this guard needs exactly one alias to track. If the import was "
+        f"removed, {module!r} no longer belongs in `_C_MODULES` either; if it "
+        f"is bound twice, the deref guard below would only watch one of them.")
+    return bound[0]
 
 
 def test_the_rss_derivation_accounts_for_every_swapped_module():
@@ -900,8 +935,13 @@ def test_the_rss_derivation_accounts_for_every_swapped_module():
     into a constant, and the one unprobed row states its structural reason --
     `serving_shape` imports `backbone` for the swap and never dereferences it.
     That last one is asserted from source, so the day the build reaches into
-    `qbb` this cell goes red and asks for a probe instead of letting the
+    `backbone` this cell goes red and asks for a probe instead of letting the
     ceiling be derived over a population with a hole in it.
+
+    CF-GUARDALIAS (REVIEW 7c26cce F8): that deref assertion names the module
+    and resolves its alias through `_serving_shape_import_alias`, because the
+    hardcoded spelling it used to carry passed vacuously under a rename -- see
+    that function's docstring for the measured red.
     """
     listed = {m.__name__.rsplit(".", 1)[-1] for m in ss._C_MODULES}
     rows = set(PEAK_RSS_GIB_WHEN_DROPPED)
@@ -935,11 +975,16 @@ def test_the_rss_derivation_accounts_for_every_swapped_module():
         f"({min(visible, key=lambda m: probed[m])}). The constant is the "
         f"ceiling's upper bracket; it must be the minimum of the measured "
         f"defects, not a figure that was true when it was typed.")
-    assert "qbb" not in _serving_shape_attribute_bases(), (
-        "`serving_shape.py` now dereferences `qbb`, so dropping `backbone` "
-        "from `_C_MODULES` may move peak RSS. Its row in "
-        "PEAK_RSS_GIB_WHEN_DROPPED is `None` on the grounds that it cannot. "
-        "Probe it (rssprobe, one module dropped) and record the figure.")
+    alias = _serving_shape_import_alias("backbone")
+    print(f"[rss-derivation] `backbone` is imported as `{alias}` (derived from "
+          f"the ImportFrom node, not typed) and is dereferenced: "
+          f"{alias in _serving_shape_attribute_bases()}")
+    assert alias not in _serving_shape_attribute_bases(), (
+        f"`serving_shape.py` now dereferences `{alias}` (its alias for "
+        f"`backbone`), so dropping `backbone` from `_C_MODULES` may move peak "
+        f"RSS. Its row in PEAK_RSS_GIB_WHEN_DROPPED is `None` on the grounds "
+        f"that it cannot. Probe it (rssprobe, one module dropped) and record "
+        f"the figure.")
 
 
 def test_the_peak_rss_ceiling_is_the_geometric_mean_of_its_bracket():
@@ -954,11 +999,40 @@ def test_the_peak_rss_ceiling_is_the_geometric_mean_of_its_bracket():
     the suite could notice.
 
     What is asserted now is the argument itself: the ceiling brackets its pair,
-    it IS the geometric mean rounded to 0.01 GiB, and the two relative margins
-    agree to within that rounding. The constant stays typed on purpose -- a
-    ceiling computed at import would quietly absorb a raise, and a raise is the
-    act this whole guard exists to catch. Typed and re-derived here, raising
-    `PEAK_RSS_CEILING_GIB` without re-recording a measured side is a red.
+    and it IS the geometric mean rounded to 0.01 GiB. The constant stays typed
+    on purpose -- a ceiling computed at import would quietly absorb a raise,
+    and a raise is the act this whole guard exists to catch. Typed and
+    re-derived here, raising `PEAK_RSS_CEILING_GIB` without re-recording a
+    measured side is a red.
+
+    CF-TOLGEN (REVIEW 7c26cce F9). The margin tolerance was the hand-typed
+    `0.005`, and it was unfailable: with `c == round(gm, 2)` (the round-trip
+    assertion below, which is the real gate) the error `|c - gm| <= 0.005`
+    propagates to the gap with derivative `1/a + d/c**2`, so at 4.52 / 6.23 the
+    widest gap that arithmetic ALLOWS is 0.44219 * 0.005 = 0.002211 -- inside
+    0.005 by 2.3x, always, while its sibling passes. `0.005` also tracked
+    nothing: the bound scales with the bracket, and at a = 1, d = 100 the same
+    constant is a SPURIOUS red at 0.01.
+
+    The tolerance is now GENERATED from the bracket it is a bound for, which
+    fixes both halves. What that leaves is a check that is not dead weight, and
+    the distinction is worth stating because F9 read it as dead: the round-trip
+    assertion constrains the CEILING against the two measured sides, and
+    nothing in it constrains `_rss_ceiling_margins()`, which computes the two
+    margins by its own two formulas. Break either formula and the gap leaves
+    the bound while the ceiling still round-trips. Measured, not argued: with
+    `below` taken against the authored peak instead of the ceiling, this cell
+    goes red at 30.8 pp against a 0.2211 pp bound while every other assertion
+    here passes. So it can fail, for a defect its sibling cannot see.
+
+    The bound is the exact one, not the derivative at `c`: `gap(gm) == 0` and
+    `gap(c) = |integral from gm to c of (1/a + d/t**2) dt|`, so with
+    `|c - gm| <= 0.005` and the integrand falling in `t`, the supremum is
+    `0.005 * (1/a + d/(c - 0.005)**2)` -- 0.2213 pp here against the observed
+    0.1521 pp. Taking the derivative at `c` instead gives 0.2211 pp, which is
+    below the true supremum and would be a tolerance that can be exceeded
+    without a defect; the 1.01 slack factor REVIEW 7c26cce F9 suggested is
+    that same gap covered by a fudge instead of by the integral.
     """
     above, below = _rss_ceiling_margins()
     exact = math.sqrt(
@@ -974,6 +1048,18 @@ def test_the_peak_rss_ceiling_is_the_geometric_mean_of_its_bracket():
     print(f"[rss-ceiling] margins: +{above * 100:.3f}% above the authored "
           f"peak, +{below * 100:.3f}% below the cheapest defect "
           f"(exact mean: {exact * 100:.3f}% each side)")
+    # CF-TOLGEN: the tolerance is GENERATED from the bracket, never typed. The
+    # supremum of the gap over `|c - gm| <= 0.005`, integrand taken at the
+    # worst end of the interval so this is an upper bound and not an estimate.
+    _HALF_GRID = 0.005                     # half of the 0.01 GiB rounding grid
+    gap_bound = _HALF_GRID * (1.0 / PEAK_RSS_AUTHORED_GIB
+                              + PEAK_RSS_CHEAPEST_DEFECT_GIB
+                              / (PEAK_RSS_CEILING_GIB - _HALF_GRID) ** 2)
+    print(f"[rss-ceiling] margin gap {abs(above - below) * 100:.4f} pp <= "
+          f"{gap_bound * 100:.4f} pp, the most the 0.01 GiB rounding can "
+          f"explain at this bracket (generated: 0.005 * (1/{PEAK_RSS_AUTHORED_GIB} "
+          f"+ {PEAK_RSS_CHEAPEST_DEFECT_GIB}/"
+          f"{PEAK_RSS_CEILING_GIB - _HALF_GRID:.3f}^2))")
 
     assert (PEAK_RSS_AUTHORED_GIB < PEAK_RSS_CEILING_GIB
             < PEAK_RSS_CHEAPEST_DEFECT_GIB), (
@@ -988,12 +1074,17 @@ def test_the_peak_rss_ceiling_is_the_geometric_mean_of_its_bracket():
         f"the ceiling was raised without re-deriving it -- which re-opens the "
         f"defect it guards -- or a measured side moved and the ceiling was "
         f"not recomputed.")
-    assert abs(above - below) < 0.005, (
+    assert abs(above - below) <= gap_bound, (
         f"the ceiling's two relative margins differ by "
-        f"{abs(above - below) * 100:.3f} percentage points "
-        f"(+{above * 100:.3f}% / +{below * 100:.3f}%), which is more than the "
-        f"0.01 GiB rounding can explain. 'The same relative margin on each "
-        f"side' is the comment's whole justification for a geometric mean.")
+        f"{abs(above - below) * 100:.4f} percentage points "
+        f"(+{above * 100:.3f}% / +{below * 100:.3f}%), which EXCEEDS the "
+        f"{gap_bound * 100:.4f} pp the 0.01 GiB rounding can explain at this "
+        f"bracket. The assertion above already forces the ceiling to be the "
+        f"rounded geometric mean, so the gap cannot get here through the "
+        f"ceiling: what is wrong is how a margin is COMPUTED "
+        f"(`_rss_ceiling_margins`), not how wide this tolerance is. Do not "
+        f"widen it -- it is derived from the bracket, and widening it would "
+        f"only hide the formula that changed.")
 
 
 def test_the_constant_factory_scanner_detects_a_missing_module():
