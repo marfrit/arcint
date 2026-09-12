@@ -50,6 +50,10 @@ from q4e import piecewise_export as pwe  # noqa: E402
 from q4e import ple as qple  # noqa: E402
 
 _SHARDS = os.environ.get("Q4E_GGUF_SHARDS", "").strip()
+# EVERY cell here needs the shards: the shapes come from the checkpoint, not
+# from config arithmetic (that is the whole point of the rewrite). Declaring the
+# marker and forgetting to APPLY it made the device-free run error out in
+# fixture setup instead of skipping -- caught by the close-out, 2026-09-12.
 _skip = pytest.mark.skipif(
     not _SHARDS, reason="Q4E_GGUF_SHARDS unset: the ledger measures real widths")
 
@@ -197,6 +201,7 @@ def measured(cfg, real_shapes, file_bytes):
     return m
 
 
+@_skip
 def test_graph_constants_match_the_fed_tensor_bytes(real_shapes, measured):
     """THE AGREEMENT GATE. For every buildable piece the constant bytes the graph
     carries must equal the sum of its fed real tensors' f32 bytes, plus only the
@@ -225,6 +230,7 @@ def test_graph_constants_match_the_fed_tensor_bytes(real_shapes, measured):
                          f"{got:>14,d} {over:>+12,d}\n")
 
 
+@_skip
 def test_size_ledger_is_complete_and_reconciles(measured, file_bytes, capsys):
     """The ledger itself: every piece present, totals per tier, and the two
     confrontations -- the cards, and WP6b's figure for the same checkpoint."""
@@ -262,6 +268,7 @@ def test_size_ledger_is_complete_and_reconciles(measured, file_bytes, capsys):
         "checkpoint; one of them has the architecture wrong")
 
 
+@_skip
 def test_card_tier_does_not_fit_the_a770_reserve_at_f32(measured):
     """The verdict the window needs, stated with its residency assumption named.
 
@@ -294,6 +301,7 @@ def test_card_tier_does_not_fit_the_a770_reserve_at_f32(measured):
         "believing this.")
 
 
+@_skip
 def test_ledger_json_round_trip(measured):
     """The window manifest pastes this table; it has to be machine-readable too,
     so a later session can diff two nights instead of re-reading prose."""
