@@ -250,11 +250,11 @@ Q4E_GPU=GPU.0,GPU.1 Q4E_GGUF_SHARDS=<shards> \
 CPU-only control (`RUN@e78812d`): `Q4E_GPU=` empty → **112 passed** with
 shards, **42 passed / 70 skipped, 0 errors** device-free.
 
-**HOW TO READ ANY SUITE COUNT IN THIS FILE (K2, `RUN@9146546`).** A
+**HOW TO READ ANY SUITE COUNT IN THIS FILE (K2, `RUN@wt+fe68342`).** A
 passed/skipped split is only meaningful next to the switches that were set,
 because every skip in this suite is gated. Two honest readings of the same
 commit differed by two passes and the reconciliation is that there are exactly
-four coordinates, now enumerated and held by
+five coordinates, now enumerated and held by
 `tests/python/test_suite_guards.py`:
 
 | coordinate | effect when open |
@@ -262,17 +262,20 @@ four coordinates, now enumerated and held by
 | `Q4E_GPU` | empty → CPU only; a device list adds the per-device legs |
 | `Q4E_GGUF_SHARDS` | unset → every real-weight cell skips **by name** |
 | `Q4E_SERVING_FULL` | `1` → runs the 48-layer keystone build (off by default on purpose) |
+| `Q4E_GDN_UT_MODE` | read by `tools/q4e/gdn.py`, so it is a switch the suite obeys through an imported module rather than through a test file; its effect on the split is a row of the close-out matrix like any other |
 | **a git work tree** | *not* an env var: a `git archive` extract has no `.git`, so the two cells gated on `git ls-files` (`test_citations` LEG 2 and `test_window_manifest`'s sha resolution) skip |
 
 So a clone and a tarball of the same commit differ by exactly **two** passes,
 and both are correct. `test_the_suite_declares_no_count_gate_outside_the_
-recorded_set` goes red if a fifth coordinate appears, and
-`test_the_checkout_shaped_gates_are_exactly_the_recorded_files` goes red if a
-third checkout-gated cell does — the point being that a future disagreement is
-always attributable to a named coordinate, and **nobody reconciles two counts
-by opening a gate.** The measured matrix for the current tip is in the
-close-out; the historical figures above keep their own `RUN@` ids and are not
-retro-fitted.
+recorded_set` goes red if a new `Q4E_*` switch appears, and
+`test_the_checkout_shaped_gates_are_exactly_the_recorded_cells` goes red if a
+third checkout-gated cell does — in a decorator or in the body of a cell, since
+`pytest.skip("no .git")` written inline is the same gate — the point being that
+a future disagreement is always attributable to a named coordinate, and
+**nobody reconciles two counts by opening a gate.** The measured matrix for the
+current tip is in the close-out; the historical figures above keep the commit
+ids their own markers carry (the `@<sha>` suffix the header table defines) and
+are not retro-fitted.
 
 > The figures here were **101** and **33/59** until 2026-09-12. Both were
 > true — of the tree they ran on, which was not the tip. That is the
