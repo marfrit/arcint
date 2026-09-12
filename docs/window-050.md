@@ -569,57 +569,9 @@ Run them in this order. Each earlier item is a control for the ones after it.
 
 Item 6 is run LAST on each card because it may take the process down.
 
-### 4.5.2 THE GDN ROW-65 DEFECT IS FIXED IN THE EMITTER (`RUN@61bd61a`, 2026-09-12)
-
-The multi-chunk GDN corruption that item 4 was written to re-confirm is **gone
-on GPU.1**, fixed in `tools/q4e/gdn.py` with no OpenVINO change. What changed is
-the SHAPE the ops see, never the arithmetic: the chunk axis is no longer a
-tensor axis at all but a Python loop, so no emitted op carries a live chunk
-axis. `ut_mode` / `Q4E_GDN_UT_MODE` selects among four emissions of the same
-algebra, which agree **bit-identically on CPU** (0.00e+00).
-
-| T | C | batched (RED) | perchunk (GREEN) | floor | perchunk ratio |
-|---|---|---|---|---|---|
-| 96 | 2 | 9.7893e-02 | **8.9964e-07** | 7.065e-07 | 1.3× |
-| 128 | 2 | 9.7893e-02 | **1.1901e-06** | 1.183e-06 | 1.0× |
-| 192 | 3 | 9.7893e-02 | **1.1901e-06** | 1.183e-06 | 1.0× |
-| 256 | 4 | 9.9173e-02 | **1.1901e-06** | 1.183e-06 | 1.0× |
-
-**THE ATTRIBUTION IN `~/win-050/FINDINGS` IS WRONG, and the upstream draft must
-not be filed as written.** The spike's own hypothesis was wrong in the same
-direction, which is how it was caught. De-batching *only* the unrolled
-triangular solve — `debatched`, which nearly doubles the node count and so
-demonstrably changes the graph — reproduces the corruption **bit-identically**
-(9.7893e-02, 31 rows, first row 65). And the unroll at rank 5 with the chunk
-axis live is **clean in isolation on the card** (5.520e-08, both slices). No
-isolated op reproduces the fault: not the rank-5 matmul, not `cumsum`, not the
-pairwise decay. It needs the whole rank-5 region in one graph, so it is a
-fusion/graph-context effect rather than a per-op miscompile.
-
-The drafted one-liner — *"slice index 0 is always correct and every other slice
-is deterministically wrong; batch=1 is always correct"* — is also falsified by
-the evidence already in hand: at T=64, `HV=4`, so the solve is **already batched
-four wide** and every slice is correct. Batch is not 1 in the clean case. The
-axis that matters is the chunk axis specifically.
-
-**What the fix costs**, and why it is not the serving answer: one ~1,900-op
-unroll per chunk, linear in C where the batched form was nearly flat.
-
-| T | C | batched | perchunk | ×36 GDN blocks (48-layer stack) |
-|---|---|---|---|---|
-| 256 | 4 | 2,224 | 7,750 | 80,064 → **279,000** |
-| 2048 | 32 | 3,680 | 61,062 | 132,480 → **2,198,232** |
-
-So multi-chunk **static** prefill is now correct at the shapes this window
-boots, and is still not the route at serving prefill lengths — that remains the
-chunked stateful-prefill increment. Mitigation ladder unchanged in destination,
-changed in starting point: the `T ≤ 64` restriction is lifted.
-
-Not run by this seat, and therefore open: **GPU.0** (B60) confirmation, and any
-shape with C > 4. Item 5
-needs item 1 to have produced a booted artifact; if item 1 does not boot, item
-5 does not run and says so rather than being run at a reduced geometry whose
-number would not transfer (§7.2).
+Item 5 needs item 1 to have produced a booted artifact; if item 1 does not
+boot, item 5 does not run and says so rather than being run at a reduced
+geometry whose number would not transfer (§7.2).
 
 On item 6's sweep width: the reviewer seat widened it from 15 values to 41
 (contiguous 1..34 plus 36/40/48/56/64/96/128, fresh process per T) on the dev
@@ -794,6 +746,56 @@ off the fused OTD route entirely — a design decision with a measurable cost,
 not a plumbing fix. IQ3_XXS, 94 of the 144 bodies, does not have even that
 option in reach. Full derivation, every hop cited both sides: the DESIGN NOTE
 of 2026-09-12 in `RECONCILE-0.5.0.local.md`.
+
+### 4.5.2 THE GDN ROW-65 DEFECT IS FIXED IN THE EMITTER (`RUN@61bd61a`, 2026-09-12)
+
+The multi-chunk GDN corruption that item 4 was written to re-confirm is **gone
+on GPU.1**, fixed in `tools/q4e/gdn.py` with no OpenVINO change. What changed is
+the SHAPE the ops see, never the arithmetic: the chunk axis is no longer a
+tensor axis at all but a Python loop, so no emitted op carries a live chunk
+axis. `ut_mode` / `Q4E_GDN_UT_MODE` selects among four emissions of the same
+algebra, which agree **bit-identically on CPU** (0.00e+00).
+
+| T | C | batched (RED) | perchunk (GREEN) | floor | perchunk ratio |
+|---|---|---|---|---|---|
+| 96 | 2 | 9.7893e-02 | **8.9964e-07** | 7.065e-07 | 1.3× |
+| 128 | 2 | 9.7893e-02 | **1.1901e-06** | 1.183e-06 | 1.0× |
+| 192 | 3 | 9.7893e-02 | **1.1901e-06** | 1.183e-06 | 1.0× |
+| 256 | 4 | 9.9173e-02 | **1.1901e-06** | 1.183e-06 | 1.0× |
+
+**THE ATTRIBUTION IN `~/win-050/FINDINGS` IS WRONG, and the upstream draft must
+not be filed as written.** The spike's own hypothesis was wrong in the same
+direction, which is how it was caught. De-batching *only* the unrolled
+triangular solve — `debatched`, which nearly doubles the node count and so
+demonstrably changes the graph — reproduces the corruption **bit-identically**
+(9.7893e-02, 31 rows, first row 65). And the unroll at rank 5 with the chunk
+axis live is **clean in isolation on the card** (5.520e-08, both slices). No
+isolated op reproduces the fault: not the rank-5 matmul, not `cumsum`, not the
+pairwise decay. It needs the whole rank-5 region in one graph, so it is a
+fusion/graph-context effect rather than a per-op miscompile.
+
+The drafted one-liner — *"slice index 0 is always correct and every other slice
+is deterministically wrong; batch=1 is always correct"* — is also falsified by
+the evidence already in hand: at T=64, `HV=4`, so the solve is **already batched
+four wide** and every slice is correct. Batch is not 1 in the clean case. The
+axis that matters is the chunk axis specifically.
+
+**What the fix costs**, and why it is not the serving answer: one ~1,900-op
+unroll per chunk, linear in C where the batched form was nearly flat.
+
+| T | C | batched | perchunk | ×36 GDN blocks (48-layer stack) |
+|---|---|---|---|---|
+| 256 | 4 | 2,224 | 7,750 | 80,064 → **279,000** |
+| 2048 | 32 | 3,680 | 61,062 | 132,480 → **2,198,232** |
+
+So multi-chunk **static** prefill is now correct at the shapes this window
+boots, and is still not the route at serving prefill lengths — that remains the
+chunked stateful-prefill increment. Mitigation ladder unchanged in destination,
+changed in starting point: the `T ≤ 64` restriction is lifted.
+
+Not run by this seat, and therefore open: **GPU.0** (B60) confirmation, and any
+shape with C > 4.
+
 
 ## 5. Residency — the SIZE LEDGER, and the number that decides the window
 
