@@ -120,6 +120,19 @@ _ANCHORED = [
     # -- the `_c` binding CF-RESIDENT's ast scan found ----------------------
     ("tools/q4e/serving_shape.py", "backbone.py:70",
      "tools/q4e/backbone.py", "from .gdn import _c"),
+    # -- THE REPACK's four coordinates: a reader acts on every one of these --
+    ("tests/python/test_repack_route.py", "gguf_repack.cpp:260",
+     "src/core/gguf_repack.cpp", "bool repack_supported(int32_t t)"),
+    ("tests/python/test_repack_route.py", "gguf_repack.cpp:266",
+     "src/core/gguf_repack.cpp",
+     "if (t.dims.size() != 2) throw std::runtime_error("),
+    ("tests/python/test_repack_route.py", "gguf_repack.cpp:486",
+     "src/core/gguf_repack.cpp", "double repack_bound_steps(int32_t ggml_type)"),
+    ("tests/python/test_repack_route.py", "design-gguf-native.md:52",
+     "docs/design-gguf-native.md", "uses codebooks and sign tables"),
+    ("tests/python/test_repack_route.py", "serving_shape.py:138",
+     "tools/q4e/serving_shape.py",
+     "shipped tensor is IQ4_NL, which OpenVINO has no element type for"),
 ]
 
 
