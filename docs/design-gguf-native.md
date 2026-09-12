@@ -50,6 +50,18 @@ high bits (176 B). Q6_K: 128 bytes low nibbles, 64 bytes of 2-bit highs,
 16 signed 8-bit sub-scales, `d`; value `d·sc·(q − 32)` per 16 (210 B).
 Q8_0: `d` and 32 int8 (34 B). The sub-4-bit set (IQ4_XS, IQ3_S, IQ3_XXS,
 Q3_K) uses codebooks and sign tables, a different kind of decoder.
+**IQ4_NL is a codebook type too and is NOT in that set** — at 4.5 bpw
+(18 B per 32: one f16 `d`, then 32 nibbles) it is not sub-4-bit, but it
+decodes through a 16-entry NON-UNIFORM lookup rather than by scaling the
+code: `value = d · kvalues[q]`. Measured off the shipped artifact's own
+bytes rather than taken from the header, the levels are `[−127, −104,
+−83, −65, −49, −35, −22, −10, 1, 13, 25, 38, 53, 69, 89, 113]`,
+consecutive spacings 11…24 (**2.18×** between the widest and the
+narrowest), so the best affine fit over the 16 codes still leaves 0.847
+of a step — which is why no `Convert→Subtract(zp)→Multiply(scale)` chain
+carries an IQ4_NL block exactly, whatever `zp` and `scale` are chosen.
+Gated by `tests/python/test_repack_route.py`'s IQ4_NL cell, which
+re-derives all of it from the shards.
 
 **Converter transforms that the open must undo or reproduce** (the
 converter's `qwen.py`, byte-identical to upstream): `A_log → −exp` into

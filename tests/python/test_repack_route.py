@@ -31,14 +31,38 @@ more above it:
       f16 scales are the block's own. "ZERO added loss" is a property of Q8_0
       here, not of the path.
 
-  C4  REPRESENTATION. IQ4_NL is a 16-entry NON-UNIFORM codebook and IQ3_XXS a
-      grid-plus-sign-table codebook (docs/design-gguf-native.md:52). The IR
-      chain the GPU plugin's MoE fusion matches is uniform affine --
-      Convert -> Subtract(zero_point) -> Multiply(scale) -- over a Constant
-      declared u4/i4/u8/i8. A codebook is not an affine dequant, so even a
-      perfectly carried IQ3_XXS block has no element type to be declared as and
-      no chain to be decoded by. `serving_shape.py:138` already records this
-      for the PLE table's IQ4_NL, one tensor family earlier.
+  C4  REPRESENTATION. The IR chain the GPU plugin's MoE fusion matches is
+      uniform affine -- Convert -> Subtract(zero_point) -> Multiply(scale) --
+      over a Constant declared u4/i4/u8/i8. Within one block that is
+      `(q - zp) * s` over `q in 0..15`: sixteen EQUALLY SPACED levels. A
+      codebook is not an affine dequant.
+
+      WHICH EVIDENCE CLOSES WHICH BODIES (rewritten under H3, REVIEW f8229d8,
+      after C4 was found citing two lines that do not carry it):
+
+        IQ3_XXS  94 bodies  28.11 GiB  docs/design-gguf-native.md:52, which
+                                       names IQ3_XXS in the codebook-and-sign-
+                                       table set. The citation reaches.
+        IQ4_XS    2 bodies   0.83 GiB  same line, same list. Reaches.
+        IQ4_NL   43 bodies  18.90 GiB  MEASURED, not cited to prose -- see
+                                       `test_iq4nl_levels_are_non_uniform...`
+                                       below. The levels recovered from the
+                                       shipped bytes are
+                                       [-127,-104,...,89,113], spacings 11..24
+                                       (2.18x), best affine fit off by 0.847
+                                       of a step.
+
+      WHAT C4 DOES NOT DO, stated because it was previously implied. C4 was
+      advertised as the coordinate that "sits ABOVE gguf_repack.cpp and would
+      survive its repair". That is true for all three groups NOW that the
+      IQ4_NL half is measured -- but it was NOT established by the citations
+      originally given, which were `design-gguf-native.md:52` (a sub-4-bit list
+      that does not contain IQ4_NL; the string does not occur in that document
+      at all) and `serving_shape.py:138` (which says IQ4_NL has no OpenVINO
+      ELEMENT TYPE -- a different proposition). The 43 IQ4_NL bodies were, and
+      remain, closed independently by C1 (type refused) and C2 (rank refused);
+      the verdict never depended on C4 for them, and this cell does not pad
+      C4's weight to make it look as though it did.
 
 WHAT THIS MODULE DELIBERATELY DOES NOT ASSERT. Not that a block-carrying route
 is impossible -- only that `gguf_repack.cpp` is not one for this artifact.
@@ -311,6 +335,106 @@ def test_the_shipped_expert_census_regenerates_off_the_shards():
     assert ranks == {SHIPPED_EXPERT_RANK}, (
         f"expert bodies are rank {sorted(ranks)} on disk, not "
         f"{SHIPPED_EXPERT_RANK}. C2 is derived from this.")
+
+
+@_skip
+def test_iq4nl_levels_are_non_uniform_so_no_affine_chain_carries_them():
+    """C4 for the 43 IQ4_NL bodies, MEASURED off the shipped bytes.
+
+    H3 (REVIEW f8229d8). This cell exists because C4's IQ4_NL half used to be
+    cited to `design-gguf-native.md`, whose codebook sentence lists the
+    SUB-4-BIT set and does not mention IQ4_NL at all (the string does not occur
+    in that document) -- and to `serving_shape.py:138`, which says IQ4_NL has
+    no OpenVINO ELEMENT TYPE, a different proposition from "non-uniform
+    codebook". The claim was true and its citations did not reach it, on the
+    second-largest group of bodies in the file.
+
+    So it is measured here instead of cited to prose. The affine chain the GPU
+    fusion matches is `Convert -> Subtract(zp) -> Multiply(scale)`: within one
+    block that is `(q - zp) * s` over `q in 0..15`, i.e. SIXTEEN EQUALLY SPACED
+    levels, whatever `zp` and `s` are. If IQ4_NL's sixteen levels are not
+    equally spaced, no choice of the two reproduces them, and the "carry it
+    exactly" route is shut for these bodies independently of `gguf_repack.cpp`.
+
+    The levels are recovered from the file's OWN bytes -- the f16 `d` read out
+    of each 18-byte block and the dequantised values divided by it -- and the
+    nibble order is DERIVED by consistency rather than assumed: the mapping is
+    accepted only if every code resolves to exactly one ratio under it.
+    """
+    import glob
+
+    import numpy as np
+    from gguf import GGUFReader
+    from gguf.quants import dequantize
+
+    tensor = None
+    for path in sorted(glob.glob(os.path.join(_SHARDS, "*.gguf"))):
+        reader = GGUFReader(path, "r")
+        tensor = next((t for t in reader.tensors
+                       if t.name.endswith("ffn_down_exps.weight")
+                       and t.tensor_type.name == "IQ4_NL"), None)
+        if tensor is not None:
+            break
+    assert tensor is not None, "no IQ4_NL expert body found in the shards"
+
+    nblocks = 200_000
+    raw = tensor.data.view(np.uint8).reshape(-1)[:nblocks * 18].copy()
+    blocks = raw.reshape(nblocks, 18)
+    scale = blocks[:, :2].copy().view(np.float16).astype(np.float64).reshape(-1)
+    lo = (blocks[:, 2:] & 0xF).astype(np.int64)
+    hi = (blocks[:, 2:] >> 4).astype(np.int64)
+    values = dequantize(raw, tensor.tensor_type).astype(np.float64).reshape(nblocks, 32)
+
+    live = scale != 0
+    ratios = values[live] / scale[live][:, None]
+    orders = {"lo-first": np.concatenate([lo, hi], axis=1),
+              "interleaved": np.stack([lo, hi], axis=2).reshape(nblocks, 32)}
+    levels = None
+    for name, order in orders.items():
+        table, consistent = {}, True
+        for code in range(16):
+            picked = np.unique(np.round(ratios[order[live] == code], 6))
+            if picked.size != 1:
+                consistent = False
+                break
+            table[code] = float(picked[0])
+        if consistent:
+            levels = [table[c] for c in range(16)]
+            print(f"\n[iq4nl] nibble order resolved by consistency: {name} "
+                  f"(every code -> exactly one value/scale over "
+                  f"{nblocks:,} blocks)")
+            break
+    assert levels is not None, (
+        "no candidate nibble order maps every code to a single value/scale. "
+        "The block layout assumed here (2 B f16 scale + 32 nibbles) does not "
+        "hold for this tensor -- do not conclude anything about the levels.")
+
+    spacing = np.diff(levels)
+    fit = np.stack([np.arange(16, dtype=np.float64), np.ones(16)], axis=1)
+    coef, *_ = np.linalg.lstsq(fit, np.array(levels), rcond=None)
+    residual = np.abs(np.array(levels) - fit @ coef).max()
+    steps = residual / abs(coef[0])
+
+    print(f"[iq4nl] levels (value/scale): {[int(v) for v in levels]}")
+    print(f"[iq4nl] consecutive spacings: {[int(s) for s in spacing]}")
+    print(f"[iq4nl] spacing min {spacing.min():g} max {spacing.max():g} "
+          f"-> {spacing.max() / spacing.min():.2f}x")
+    print(f"[iq4nl] best affine fit value = {coef[0]:.4f}*q {coef[1]:+.4f}; "
+          f"max residual {residual:.4f} scale units = {steps:.3f} AFFINE STEPS")
+
+    assert spacing.min() > 0, "the levels are not monotonic; the recovery is wrong"
+    assert spacing.max() > 2 * spacing.min(), (
+        f"the IQ4_NL levels are near-uniform at this artifact (spacing "
+        f"{spacing.min():g}..{spacing.max():g}). C4's IQ4_NL half rests on "
+        f"their NON-uniformity -- if they are uniform, an affine chain may "
+        f"carry them and the route must be re-derived for these 43 bodies.")
+    assert steps > 0.5, (
+        f"the best affine fit over the 16 codes is within {steps:.3f} of a "
+        f"step, so an affine `(q - zp) * scale` chain approximates IQ4_NL "
+        f"better than this cell's argument assumes. The argument is that no "
+        f"affine chain carries it EXACTLY; a small residual here would make "
+        f"that true but uninteresting, and C4's weight for these bodies "
+        f"should be restated rather than left standing on a near-miss.")
 
 
 def test_the_type_parser_detects_a_widened_repack_supported():
