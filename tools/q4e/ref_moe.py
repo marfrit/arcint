@@ -17,19 +17,27 @@ The block is STATELESS (no KV cache branch), so -- unlike the GDN block --
 there is a single forward to mirror. Routing is data-dependent: the pin's
 router does `torch.topk` and the expert layer loops over the hit experts with
 `torch.where` / `index_add_`. tools/q4e/moe.py emits the SAME result as a
-STATIC DENSE graph (every expert computed, gated by a top-k threshold mask),
-which equals the sparse loop exactly because a non-selected (token, expert)
-pair carries gate 0 -> its dense contribution is `f_e(x) * 0.0 == 0.0` (see
-tools/q4e/moe.py for the equivalence argument and the tie caveat).
+STATIC DENSE graph -- every expert computed, weighted by a dense gate built by
+SCATTERING TopK's own indices, which is not the same thing as a threshold on
+the value and the difference matters on a tie. That equals the sparse loop
+exactly because a non-selected (token, expert) pair carries gate 0, so its
+dense contribution is `f_e(x) * 0.0 == 0.0`. The equivalence argument, the
+distinctness premise the scatter layout rests on, and the tie caveat are all
+in tools/q4e/moe.py, each naming the cell that gates it.
 
 Per-position-ness: the MoE block is fully ROW-LOCAL (the router, every expert
 gemv and the shared expert act per token; no op mixes positions). A masked
-(zeroed) row routes on all-zero logits (uniform softmax -> the first `top_k`
-experts by index, gate = 1/top_k each) and emits the experts' + shared
-outputs at x=0 -- NOT zero in general (bias-free Linears give 0 at x=0, so in
-fact this block emits exactly 0 on a zero row too; that is asserted, not
-assumed). Because it is row-local, a garbage probe in masked rows leaves every
-live row untouched -- the same row-locality proof the hc block carries.
+(zeroed) row routes on all-zero logits: softmax is then uniform, an all-way
+tie, and each selected expert carries gate exactly 1/top_k. WHICH experts is
+NOT determined by index order -- that sentence stood here until 2026-09-12 and
+a measurement contradicts it: at E=16, top_k=4 the pin's `torch.topk` selects
+[9, 10, 11, 12] on such a row where OpenVINO's `op.topk` selects [0, 1, 2, 3]
+(test_moe_block.py::test_a_degenerate_row_may_select_differently_and_still_emits_zero).
+It does not matter here, and the reason is measured rather than assumed:
+bias-free Linears give f_e(0) = 0, so whichever experts a zeroed row picks,
+both sides emit exactly 0.0 on it. Because the block is row-local, a garbage
+probe in masked rows leaves every live row untouched -- the same row-locality
+proof the hc block carries.
 """
 import torch
 import torch.nn.functional as F

@@ -21,13 +21,17 @@ the C++ and not about the export:
     std::string tname = node->get_type_name();  ... tolower ...
     if (tname.find("moe") == std::string::npos) continue;      // :585
 NO ARCINT-EXPORTED IR CARRIES AN OP WHOSE TYPE NAME CONTAINS "moe". Measured
-over the whole model store on the dev host, 2026-09-12:
+over the whole model store on the dev host, 2026-09-12, widened by
+REVIEW 2a45349 and re-run independently here:
 
-    find /models/ov -name '*.xml' -size +100k | wc -l   -> 52
-    ... of which carry a moe-typed op                   -> 0
+    find /models/ov -name '*.xml' -size +100k | wc -l   ->  52
+    find /models/ov -name '*.xml'             | wc -l   -> 172   (no filter)
+    ... of 172, carrying a <layer type="...moe...">     ->   0
+    ... of 172, carrying the string "moe" at all        ->   0
 
-including `qwen36-35b-a3b-int4-ov/openvino_language_model.xml`, the 35B-A3B MoE
-checkpoint that is the ground truth `moe_block_tiled` was extracted from
+The negative is stronger than this file first stated it: 0 of 172, not 0 of 52.
+The population includes `qwen36-35b-a3b-int4-ov/openvino_language_model.xml`,
+the 35B-A3B MoE checkpoint that is the ground truth `moe_block_tiled` was extracted from
 (export_mtp.py:406-409). Its op histogram is Const/Convert/Multiply/Reshape/
 Subtract/MatMul/Swish -- the tiled dequant chain -- and no fused MoE node,
 because the fusion (`ConvertTiledMoeBlockToGatherMatmuls`) is a GPU-PLUGIN
@@ -70,10 +74,29 @@ from q4e import serving_shape as ss  # noqa: E402
 _CONTRACT_LAYERS = 8
 _T = 8
 
-# Measured on the dev host, 2026-09-12, and asserted below so the finding
-# cannot rot silently into prose.
-FLEET_IRS_SCANNED = 52
-FLEET_IRS_WITH_MOE_TYPED_OP = 0
+# A DATED HOST CENSUS, NOT A GENERATED COUNT -- and the distinction is the
+# point of writing it this way. This suite cannot regenerate these figures: a
+# staged tree has no /models/ov, and the population is the dev host's model
+# store rather than anything this repository owns. So they are recorded with
+# their date and their exact command, and the only thing asserted below is the
+# ZERO, which is the load-bearing half.
+#
+# Measured 2026-09-12, twice -- first by 198b736 over the size-filtered
+# population, then WIDER by REVIEW 2a45349 and re-run here independently:
+#
+#   A  find /models/ov -name '*.xml' -size +100k        -> 52 IRs
+#   B  find /models/ov -name '*.xml'   (no size filter) -> 172 IRs
+#   C  of B, carrying a <layer type="...moe..."> (case-insensitive) -> 0
+#   D  of B, carrying the string "moe" ANYWHERE, names included     -> 0
+#
+# C is the right method because the C++ test is
+# `lowercase(get_type_name()).find("moe")`, and in an IR an op's type name is
+# exactly the `<layer ... type="...">` attribute. D is the widest form the
+# claim could take and it also holds. The negative is stronger than 198b736
+# stated it: 0 of 172, not 0 of 52.
+FLEET_IRS_SIZE_FILTERED = 52          # population A, 198b736's own
+FLEET_IRS_ALL = 172                   # population B, the wider one
+FLEET_IRS_WITH_MOE_TYPED_OP = 0       # C, and D too
 
 
 @pytest.fixture(scope="module")
@@ -256,7 +279,7 @@ def slot_pool_from_tiled_ir(model, num_expert, ratio_pct):
     exports instead of a type name: the Constants with leading dim
     `num_expert` that feed a dequant chain, grouped per MoE layer.
 
-    Same per-expert arithmetic as backend_ov.cpp:600-603 (product of dims[1:]
+    Same per-expert arithmetic as backend_ov.cpp:600-604 (product of dims[1:]
     times the CEILED element size) and the same slot ceiling as fit.h:95.
     """
     per_layer = {}
@@ -313,7 +336,8 @@ def test_the_cpp_type_name_matcher_finds_nothing_and_the_line_is_named(built):
     print(f"\n[contract-otd] moe-typed ops in the serving-shape IR: {typed}")
     print(f"[contract-otd] slot_pool_from_ir(backend_ov.cpp:577) -> {got}")
     print(f"[contract-otd] dev-host model store, 2026-09-12: "
-          f"{FLEET_IRS_WITH_MOE_TYPED_OP} of {FLEET_IRS_SCANNED} IRs carry one")
+          f"{FLEET_IRS_WITH_MOE_TYPED_OP} of {FLEET_IRS_ALL} IRs carry one "
+          f"({FLEET_IRS_SIZE_FILTERED} of them over 100k)")
     assert typed == [], (
         "an op type now contains 'moe'; slot_pool_from_ir may match -- "
         "re-derive this cell instead of editing it")
@@ -334,7 +358,7 @@ def test_the_pattern_matcher_prices_the_expert_pool_and_lands_on_the_cpp_constan
     gate+up+down at real geometry = 2*(640*2560) + 2560*640 = 4,915,200 int4
     values = 2,457,600 bytes. The IR walk cannot reproduce that figure, and the
     reason is structural rather than a bug in either side:
-    backend_ov.cpp:603 uses `element_type().size()`, which CEILS a 4-bit width
+    backend_ov.cpp:604 uses `element_type().size()`, which CEILS a 4-bit width
     to one whole byte -- so it reads 4,915,200 B per expert, EXACTLY 2x. The
     C++ comment at :610-615 anticipates over-reservation ("this over-reserves
     rather than under-reserves, pending an on-card audit"); this cell measures
@@ -452,23 +476,81 @@ def test_the_serving_shape_survives_save_and_read_back(tmp_path):
 # NOT MET AND NAMED -- the paged serving ports
 # ---------------------------------------------------------------------------
 
-_PAGED_PORTS = [
-    # backend_ov.cpp:3191-3199 classifies these by name prefix at load time
-    ("conv_state_table.", "backend_ov.cpp:3191"),
-    ("gated_delta_state_table.", "backend_ov.cpp:3196"),
-    ("key_cache.", "backend_ov.cpp:3200"),
-    ("value_cache.", "backend_ov.cpp:3200"),
-    # backend_ov.cpp:6141-6151 feeds these every forward
-    ("past_lens", "backend_ov.cpp:6143"),
-    ("subsequence_begins", "backend_ov.cpp:6144"),
-    ("block_indices", "backend_ov.cpp:6145"),
-    ("block_indices_begins", "backend_ov.cpp:6146"),
-    ("max_context_len", "backend_ov.cpp:6147"),
-    ("la.block_indices", "backend_ov.cpp:6148"),
-    ("la.block_indices_begins", "backend_ov.cpp:6149"),
-    ("la.past_lens", "backend_ov.cpp:6150"),
-    ("la.cache_interval", "backend_ov.cpp:6151"),
-]
+_BACKEND_OV = REPO_ROOT / "src" / "exec" / "backend_ov.cpp"
+
+
+def cite(anchor, path=None):
+    """`<file>:<line>` for the ONE line of `path` that contains `anchor`.
+
+    CF-COUNTS (REVIEW 2a45349 F4). The table below used to write its line
+    numbers out by hand, and three of the thirteen had drifted by one line:
+    `gated_delta_state_table.` was written :3196 where the prefix test is at
+    :3195, and `key_cache.` / `value_cache.` were both written :3200 where it
+    is at :3199 (:3200 is the `is_value` line underneath). Nothing was wrong
+    with the ports; the citations rotted because a line was inserted above
+    them, in a repository whose standard is grep-verified citations.
+
+    Hand-correcting them would be right until the next edit above them. This
+    resolves an ANCHOR -- a substring of the cited code, which is the thing
+    actually meant -- and derives the number, so the citation cannot drift at
+    all. The PROSE-CLAIM LAW's clause 2 ("counts are generated by their
+    defining gate, never recited") applied to line numbers.
+
+    Uniqueness is asserted, not hoped for: an anchor that matches two lines
+    names neither, and one that matches none has been edited away.
+    """
+    p = path or _BACKEND_OV
+    hits = [i for i, line in enumerate(p.read_text().splitlines(), 1)
+            if anchor in line]
+    assert len(hits) == 1, (
+        f"citation anchor {anchor!r} matches {len(hits)} lines of {p.name}"
+        + (f" ({hits[:6]})" if hits else " -- it has been edited away")
+        + ". An anchor must identify exactly one line or it cites nothing.")
+    return f"{p.name}:{hits[0]}"
+
+
+# (port prefix, the CODE that classifies or feeds it). The file:line in the
+# printed inventory is derived from the second column by `cite`, never typed.
+_PAGED_PORT_ANCHORS = (
+    # classified by name prefix at load time
+    ("conv_state_table.", 'name.rfind("conv_state_table.", 0) == 0'),
+    ("gated_delta_state_table.", 'name.rfind("gated_delta_state_table.", 0) == 0'),
+    ("key_cache.",
+     'name.rfind("key_cache.", 0) == 0 || name.rfind("value_cache.", 0) == 0'),
+    ("value_cache.",
+     'name.rfind("key_cache.", 0) == 0 || name.rfind("value_cache.", 0) == 0'),
+    # fed every forward
+    ("past_lens", 'set_i32("past_lens"'),
+    ("subsequence_begins", 'set_i32("subsequence_begins"'),
+    ("block_indices", 'set_i32("block_indices"'),
+    ("block_indices_begins", 'set_i32("block_indices_begins"'),
+    ("max_context_len", 'set_i32("max_context_len"'),
+    ("la.block_indices", 'set_i32("la.block_indices"'),
+    ("la.block_indices_begins", 'set_i32("la.block_indices_begins"'),
+    ("la.past_lens", 'set_i32("la.past_lens"'),
+    ("la.cache_interval", 'set_i32("la.cache_interval"'),
+)
+
+_PAGED_PORTS = [(port, cite(anchor)) for port, anchor in _PAGED_PORT_ANCHORS]
+
+
+def test_the_paged_port_citations_resolve_to_the_code_they_name():
+    """The anchors above must each still identify exactly one line -- `cite`
+    asserts that as it builds `_PAGED_PORTS`, so this cell mostly documents the
+    result and prints it. It also pins the two facts the inventory depends on:
+    thirteen ports, and the two classification sites they fall into."""
+    assert len(_PAGED_PORTS) == len(_PAGED_PORT_ANCHORS)
+    lines = sorted(int(c.split(":")[1]) for _, c in _PAGED_PORTS)
+    print("\n[contract-cite] paged-port citations, resolved from anchors:")
+    for port, c in _PAGED_PORTS:
+        print(f"  {port:28s} {c}")
+    classify = [ln for ln in lines if ln < 5000]
+    feed = [ln for ln in lines if ln >= 5000]
+    print(f"[contract-cite] classified at {min(classify)}-{max(classify)}, "
+          f"fed at {min(feed)}-{max(feed)}")
+    assert len(classify) == 4 and len(feed) == 9, (
+        f"{len(classify)} classified / {len(feed)} fed; the inventory's two "
+        f"sites moved and the split above is no longer the document's")
 
 
 @pytest.mark.xfail(strict=True, reason=(

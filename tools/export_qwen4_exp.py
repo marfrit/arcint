@@ -554,8 +554,10 @@ def verify_serving_shape(seq_len=64, n_layers=None):
                   "GPU-plugin COMPILE-time pass and this walk runs on "
                   "read_model, so the config.json fallback at "
                   "backend_ov.cpp:3746+ is what prices the host ledger. "
-                  "0 of 52 IRs in the dev host's model store carry a "
-                  "moe-typed op either.")
+                  "0 of 172 IRs in the dev host's model store carry a "
+                  "moe-typed op either (census 2026-09-12; 52 of those 172 "
+                  "are over 100k, which was the narrower population 198b736 "
+                  "first reported).")
         top = sorted(rep["op_histogram"].items(), key=lambda kv: -kv[1])[:8]
         print("  ops  " + ", ".join(f"{k} {v}" for k, v in top))
         return rep

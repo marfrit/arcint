@@ -44,9 +44,9 @@ C++ side, `src/exec/backend_ov.cpp:577-623` `slot_pool_from_ir`:
     case-insensitively                                    (backend_ov.cpp:581-585)
   * its expert-weight inputs are the Constant operands, or a Constant behind
     exactly ONE Convert, whose LEADING DIMENSION equals `num_expert`
-                                                          (backend_ov.cpp:588-603)
+                                                          (backend_ov.cpp:588-604)
   * per-expert bytes = product of dims[1:] x element_type().size()
-                                                          (backend_ov.cpp:600-603)
+                                                          (backend_ov.cpp:600-604)
   * an unmatched graph returns nullopt and the caller falls back to the
     plateau probe -- "this function never guesses"        (backend_ov.cpp:566-569)
 
@@ -707,7 +707,7 @@ def slot_pool_from_ir(model, num_expert, ratio_pct):
             elems = 1
             for d in sh[1:]:                                   # :602
                 elems *= d
-            # :603 -- element_type().size(), which CEILS a sub-byte width to a
+            # :604 -- element_type().size(), which CEILS a sub-byte width to a
             # whole byte. That is deliberate over-reservation, per the comment
             # at :610-615, and the contract test measures the factor.
             et = src.get_output_element_type(0)

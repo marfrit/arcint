@@ -715,7 +715,7 @@ record than a blank guessed.
 | expert body declared type | u4, rank-4 [E, out, groups, 128] | `RUN@198b736` contract test |
 | per-expert int4 slice | 2,457,600 B (gate+up+down) | `flash_next_offload.h:45`, re-derived |
 | → as the IR walk reads it | 4,915,200 B = **exactly 2×** | `RUN@198b736` (u4 ceiled to 1 B) |
-| `slot_pool_from_ir` on any arcint IR | **nullopt** — 0 of 52 IRs carry a moe-typed op | `RUN@198b736` |
+| `slot_pool_from_ir` on any arcint IR | **nullopt** — 0 of 172 IRs carry a moe-typed op (52 of them over 100k; the wider census re-run 2026-09-12) | `RUN@198b736` |
 | MoE router on GPU | scatter shape OK both cards; one_hot FAILs | `RUN@be57428` §4.3 |
 | → cost of the swap | 0.000000e+00 on CPU | `RUN@be57428` |
 | GDN GPU first bad row | 65, at every T ≥ 66, both cards | `RUN@be57428` §4.2 |
