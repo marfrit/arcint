@@ -833,7 +833,7 @@ record than a blank guessed.
 | KLD gate threshold | ≤ 0.0599 nats mean per-token | harness, red-probed |
 | serving-shape IR, 48 layers | 84,372 nodes, 36 GDN + 12 dense-causal | `RUN@198b736` `--serving-shape` |
 | → declared constants | 183.07 GiB | `RUN@198b736` |
-| → materialised on disk | **0 KiB** | `RUN@198b736` |
+| → materialised on disk | **0 KiB** — but see the qualifier below; this figure does not discriminate | `RUN@198b736`, qualified `RUN@5663a44` |
 | → build cost | 6.43 s, 4.6 GiB RSS | `RUN@198b736` |
 | expert body declared type | u4, rank-4 [E, out, groups, 128] | `RUN@198b736` contract test |
 | per-expert int4 slice | 2,457,600 B (gate+up+down) | `flash_next_offload.h:45`, re-derived |
@@ -845,6 +845,31 @@ record than a blank guessed.
 | GPU acceptance doctrine | \|ov−r64\| ≤ 20 × \|r32−r64\| | `RUN@be57428` §4.2 |
 | 86k-node GPU compile | **204.90 s** on B60, 86,143 nodes | `RUN@be57428` §6 |
 | → compile cost scaling | 0.55 ms/node to 29k, 2.38 ms/node at 86k | `RUN@be57428` §6 |
+
+**QUALIFIER on "materialised on disk 0 KiB" (`RUN@5663a44`, 2026-09-12).**
+That row is `SparseArena.disk_kib()`, and on the dev host's filesystem it
+CANNOT distinguish an unwritten arena from a written one. Measured, ZFS
+(recordsize 131072), one 4 GiB sparse file per row:
+
+| written into the file | `st_blocks × 512` after msync | after `sync` + 12 s |
+|---|---|---|
+| nothing | 512 B | 512 B |
+| 512 MiB of zeros | 512 B | 512 B |
+| 512 MiB of **random** | 512 B | **439,174,656 B** |
+
+ZFS allocates on transaction-group commit rather than on msync, and stores an
+all-zero record as a hole. So 0 KiB is true of the unfilled build, and would be
+equally true of a build that had materialised every constant as zeros, and of
+one that had just written the real weights. The row is kept because it is one
+more sign and because it does discriminate on an eagerly-accounting
+filesystem; it is **not** the evidence for the keystone. That is the peak-RSS
+assertion in
+`tests/python/test_serving_shape.py::test_the_full_48_layer_stack_emits_at_real_geometry`
+(CF-RESIDENT, ceiling 5.31 GiB derived from a 4.52-GiB authored peak and a
+6.23-GiB cheapest defect) and, for a FILLED build, the non-zero fraction on
+read-back, which no filesystem can fake.
+
+This qualifier was found while accepting the fill, not by re-reading the row.
 
 ### Terms still to be predicted — `UNTESTED`, fill before measuring
 
