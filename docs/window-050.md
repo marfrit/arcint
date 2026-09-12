@@ -255,23 +255,34 @@ shards, **42 passed / 70 skipped, 0 errors** device-free.
 > defect CF-MANIFESTSHA exists to prevent, recorded rather than edited
 > away; §8's own numbers moved for the same reason.
 
-### GPU RESULTS — `RUN@wt+2e99661` 2026-09-12, both cards, f32 pinned
+### GPU RESULTS — `RUN@be57428` 2026-09-12, both cards, f32 pinned
 
-Suite, one process per file, `Q4E_GPU=GPU.0,GPU.1`:
+Suite, one process per file, `Q4E_GPU=GPU.0,GPU.1`, after the MOE-GPU-FUSION
+fix (§4.3):
 
-| file | result | note |
-|---|---|---|
-| `test_hc_block.py` | **13 passed** | green on both cards |
-| `test_hc_combine_block.py` | **13 passed** | green on both cards |
-| `test_ple_block.py` | **16 passed** | green on both cards |
-| `test_attention_piece.py` | **15 passed** | green on both cards, REAL width |
-| `test_gdn_block.py` | 2 failed, 5 passed | GPU T=96 only; see §4.2 |
-| `test_moe_block.py` | 10 failed, 6 passed | every GPU leg, MoERouterFused |
-| `test_backbone.py` | 8 failed, 6 passed | every GPU leg, same root |
+| file | `RUN@wt+2e99661` | `RUN@be57428` | note |
+|---|---|---|---|
+| `test_hc_block.py` | 13 passed | **13 passed** | green on both cards |
+| `test_hc_combine_block.py` | 13 passed | **13 passed** | green on both cards |
+| `test_ple_block.py` | 16 passed | **16 passed** | green on both cards |
+| `test_attention_piece.py` | 15 passed | **19 passed** | REAL width; +CF-BOUNDS, +CF-ROPEAB |
+| `test_moe_chunk_partition.py` | — | **16 passed** | new (CF-CHUNKCOV), 3 geometries |
+| `test_moe_block.py` | 10 failed, 6 passed | **2 failed, 14 passed** | see below |
+| `test_backbone.py` | 8 failed, 6 passed | **2 failed, 12 passed** | remaining 2 are the GDN T=96 root |
+| `test_gdn_block.py` | 2 failed, 5 passed | 4 failed, 9 passed | §4.2 — more shapes, same defect |
 
-**This is the first time any GPU parity leg in this suite has been green.** The
-previous window recorded "ALL 22 GPU.1 legs fail"; it ran before §3 was wired.
-Three whole files and the real-width attention piece now pass on both cards.
+Five whole files green on both cards, including the real-width dense-causal
+attention piece and the real-weights MoE chunk partition.
+
+The two remaining `test_moe_block.py` GPU failures are
+`test_moe_row_locality` on both cards. That cell **could not fail before**: the
+model did not compile, so the row-locality property was never evaluated on a
+card at all. It is a NEW finding surfaced by the fix, carried forward, not
+fixed here — and it is the honest cost of the fix being real.
+
+`test_gdn_block.py` goes from 2 failed to 4 failed because §4.2's doctrine
+added the T=65/T=66 boundary pair; the number of DEFECTS is unchanged and the
+number of shapes that see it went up.
 
 #### 4.1 The attention piece on GPU — the real-width piece that runs
 
@@ -286,121 +297,256 @@ tensors, 150 nodes, 0.186 GiB of constants, against the pin WITH its real QSA
 indexer. Gate is 20× the pin's own f32-vs-f64 rounding; the worst card leg is
 2.3×. Every leg printed and asserted `float32`.
 
-#### 4.2 GDN on GPU — fails at ≥2 chunks, and the magnitude is NOT explained
+#### 4.2 GDN on GPU — localised to row 65, and the acceptance doctrine decided
+
+`RUN@be57428`, 2026-09-12. The failure survives; what changed is that it is now
+localised to a row and a shape, and that the GPU acceptance question is settled
+by measurement instead of left open.
+
+**THE DOCTRINE: distance-to-truth, gated at 20x the reference's own f32
+rounding.** BOTH sides were measured against an f64 recomputation from the same
+weights, on CPU and both cards:
 
 ```
-[ov-parity] device=CPU    T= 64  max-abs=1.401e-06  KLD=2.418e-12
-[ov-parity] device=CPU    T= 96  max-abs=1.401e-06  KLD=2.162e-12
-[ov-parity] device=GPU.0  T= 64  max-abs=9.313e-07  KLD=1.774e-12
-[ov-parity] device=GPU.0  T= 96  max-abs=7.981e-02  KLD=4.997e-03   <-- FAIL
-[ov-parity] device=GPU.1  T= 64  max-abs=9.388e-07  KLD=1.742e-12
-[ov-parity] device=GPU.1  T= 96  max-abs=7.981e-02  KLD=4.997e-03   <-- FAIL
+device  T     |ov-r64|    |r32-r64|    |ov-r32|   ov/floor
+CPU     64   5.7251e-07  4.4179e-07  5.6624e-07       1.30
+CPU     96   8.3250e-07  9.4986e-07  9.3132e-07       0.88
+CPU    128   7.5987e-07  8.0206e-07  9.9838e-07       0.95
+CPU    256   1.6980e-06  9.1336e-07  1.4603e-06       1.86
+GPU.0   64   7.1151e-07  4.4179e-07  6.8545e-07       1.61
+GPU.0   96   7.4504e-02  9.4986e-07  7.4504e-02   78437.26
+GPU.0  128   7.5063e-02  8.0206e-07  7.5063e-02   93588.29
+GPU.0  256   1.2177e-01  9.1336e-07  1.2177e-01  133325.58
+GPU.1   96   7.4505e-02  9.4986e-07  7.4505e-02   78437.33
 ```
 
-T=64 is one chunk; T=96 is two. Identical to four figures on both cards, so it is
-deterministic, not a race. An independent tiny-width sweep against an f64
-reference locates the divergence point exactly (`RUN@wt+2e99661`):
+Three measured reasons, not a preference:
+
+1. **The f32 reference is sound** — 4.42e-07 to 9.50e-07 from f64 at every T,
+   on every device (it is torch on CPU, so device-independent). That is what
+   makes a relative gate possible: the denominator is trustworthy.
+2. **Where the defect lives the two criteria are indistinguishable** —
+   `|ov-r32|` and `|ov-r64|` agree to four significant figures at T ≥ 96,
+   because the error dwarfs both floors. The defect cannot decide the question.
+3. **Where they differ, the absolute gate is the unanchored one.** The floor
+   itself MOVES with T (4.42e-07 → 9.50e-07), so the old flat `< 1e-5` calls a
+   result 20× the floor and one 10× the floor the same thing.
+
+Wired into `test_gdn_block.py`: `|ov − ref_f64| ≤ 20 × |ref_f32 − ref_f64|`,
+plus a second assert that fails outright if the f32 reference leaves the floor.
+CPU 0.94×, GPU.0 T=64 0.53×, GPU.1 T=64 0.39× — all pass.
+
+**THE LOCALISATION.** Per-row on GPU.0 at T=96 and T=128: row 63 → 2.6e-07,
+**row 64 → 1.3e-07 — both at the float floor** — first bad row **65**, and
+`n_bad = T − 65` exactly. The T-sweep pins the threshold:
 
 ```
-    T chunks            CPU          GPU.0          GPU.1
-   32      1      2.041e-12      2.951e-12      2.837e-12
-   64      1      3.457e-12      2.673e-12      2.645e-12
-   96      2      3.428e-12      3.796e-08      3.796e-08
-  128      2      4.783e-12      3.100e-08      3.100e-08
-  192      3      8.155e-12      5.957e-08      5.957e-08
-  256      4      8.201e-12      5.071e-08      5.071e-08
+T    pad   max-abs      first bad row   n bad     (GPU.0; CPU clean at every T)
+64     0   6.8545e-07        -1            0
+65    63   1.1735e-06        -1            0
+66    62   3.6024e-02        65            1
+67    61   2.5580e-02        65            2
+68    60   4.6185e-02        65            3
+80    48   4.5380e-02        65           15
+96    32   7.4504e-02        65           31
 ```
 
-CPU stays at 1e-12 at every chunk count. GPU steps up by four orders of
-magnitude at the FIRST inter-chunk state carry and then stays flat — it does not
-grow with chunk count. So the carry (`S' = S·chunk_decay + kᵀ·v_new`) is
-confirmed as **a** divergence point between the two plugins, at 3–6e-08, which
-is the f32 floor.
+Reproduced on GPU.1 through the wired gate: T=65 ratio 0.51× (clean), T=66
+18717× with exactly one bad row at index 65.
 
-**That does not explain 7.981e-02.** Six orders of magnitude separate the two
-measurements. Naming the carry as the cause of the test failure would be
-narrating a mechanism rather than measuring one. **Status: the GDN GPU failure at
-T≥96 is OPEN with its root cause unidentified.** What is established is the
-failure itself, its determinism across cards, and that a carry-related
-CPU/GPU difference exists at the f32 floor.
+So the second chunk's **first** row is correct on both cards, and the corruption
+begins at the first row that mixes the carried state with the in-chunk
+accumulation. **That refines rather than confirms the earlier reading**: the
+2026-09-12 record named "the first inter-chunk state carry" as the divergence
+point; row 64 at 1.3e-07 says the carry ARRIVES correct. The op responsible is
+still **NOT identified** and this item stays **OPEN**. What is established: the
+row (65), the shape threshold (a non-first chunk holding a second live row),
+determinism across both cards, and CPU at the float floor at every shape.
 
-#### 4.3 MOE-GPU-FUSION — localised to 22 nodes, workaround found
+T=65 and T=66 are now parametrised into the suite, so the boundary pair is a
+standing gate rather than a note in a document.
 
-Both the `test_moe_block.py` and `test_backbone.py` GPU failures have one root,
-in two manifestations:
+#### 4.3 MOE-GPU-FUSION — **FIXED**, wired, with a before/after
+
+`RUN@be57428`, 2026-09-12. Neither of the two candidate shapes this manifest
+recorded on 2026-09-12 (`RUN@wt+2e99661`: split the router into two models, or
+keep the router on CPU) turned out to be needed.
+
+The fusion is not triggered by "a router". It is triggered by **this** router.
+The q4e emitter built the dense `[T, E]` gate with the pin's one-hot construct
+(`one_hot → multiply → reduce_sum`); the production 35B-A3B export builds the
+same gate with `ScatterElementsUpdate` (`tools/export_mtp.py:472-494`). The
+plugin's matcher fires on the former and then fails to register its own
+primitive:
 
 ```
-add_required_reorders.cpp:342  No layout format available for
-    moerouterfused:MoERouterFused_301441, impl_type: any
-    (format: bfyx, data_type: f32)  shape=[64,2]
-program_builder.cpp:268        Input moerouterfused:MoERouterFused_24271.out1
-    hasn't been found in primitive_ids map
+program_builder.cpp:268  Input moerouterfused:MoERouterFused_1152.out1
+                         hasn't been found in primitive_ids map
 ```
 
-`[64,2]` is `[T, top_k]`. The **plugin's own** MoE router fusion builds a
-primitive it then cannot lay out or register. It is not our graph.
+The 22-node reproducer, re-run first, splits the two cleanly:
 
-Minimal reproducer and the piece-level sidestep (`RUN@wt+2e99661`, both cards):
-
-| piece | nodes | CPU | GPU.0 | GPU.1 |
+| variant | nodes | CPU | GPU.0 | GPU.1 |
 |---|---|---|---|---|
-| `moe_router` (gate only) | 22 | OK | **FAIL** MoERouterFused | **FAIL** |
-| `moe_shared_expert` | 17 | OK | OK, \|dev−CPU\| 6.112e-10 | OK, 4.948e-10 |
-| `moe_experts_chunk_8` | 196 | OK | OK, \|dev−CPU\| 2.766e-04 | OK, 3.052e-04 |
+| `q4e_router` (one_hot) | 22 | OK sum=64.0000 | **FAIL** MoERouterFused | **FAIL** |
+| `tiled_router` (scatter) | 21 | OK sum=64.0000 | **OK** 0.63 s | **OK** 0.53 s |
+| softmax only | 7 | OK | OK | OK |
+| topk only | 8 | OK | OK | OK |
 
-So **the expert bodies and the shared expert run on GPU**; only the router's
-22-node softmax→topk subgraph dies. Levers tried, each a measured result:
+**The swap costs nothing, measured rather than argued:**
 
-| lever | GPU.0 | GPU.1 |
+```
+EQUIVALENCE on CPU  |one_hot-router - scatter-router| = 0.000000e+00
+```
+
+FULL MoE BLOCK, one variable (`q4e/moe.py::_router_gate`), same weights, same
+input:
+
+| device | BEFORE one_hot (422 nodes) | AFTER scatter (421 nodes) |
 |---|---|---|
-| baseline, f32 pinned | FAIL | FAIL |
-| `EXECUTION_MODE_HINT=ACCURACY` | FAIL | FAIL |
-| `OV_GPU_DISABLE_TRANSFORMATIONS=1` | FAIL | FAIL |
-| **softmax only, no topk** | **OK** sum=64.0000 | **OK** |
-| **topk only, no softmax** | **OK** sum=1566.3918 | **OK** |
+| CPU | OK | OK, \|dev−CPU\| 0.000000e+00 |
+| GPU.0 | **FAIL** MoERouterFused | **OK**, \|dev−CPU\| 4.023314e-07 |
+| GPU.1 | **FAIL** MoERouterFused | **OK**, \|dev−CPU\| 4.451722e-07 |
 
-No MoE-specific key exists in the GPU plugin's `SUPPORTED_PROPERTIES` (the full
-list was enumerated; the only transform-adjacent keys are
-`GPU_ENABLE_SDPA_OPTIMIZATION`, `GPU_ENABLE_LOOP_UNROLLING`,
-`GPU_DISABLE_WINOGRAD_CONVOLUTION`, `EXECUTION_MODE_HINT`). Neither that hint nor
-the documented `OV_GPU_DISABLE_TRANSFORMATIONS` env var suppresses the fusion.
+Pin fidelity is untouched: both forms scatter `torch.topk`'s OWN indices, so
+the selection reproduces the pin exactly, tie-break included. What changed is
+the ops that carry the scatter — and the 0.0 is the proof, not the claim.
 
-**THE WORKAROUND, measured: the matcher needs the softmax→topk PAIR. Either half
-alone compiles and runs on both cards.** Two ways to use that:
+**A SECOND, DIFFERENT MoE BLOCKER, found behind the first** (`RUN@be57428`):
+the full TILED block with u4 compressed expert bodies compiles on CPU (85
+nodes) and fails on both cards at a different site:
 
-1. Emit the router as two models — softmax side and topk side — so neither
-   presents the full pattern. `UNTESTED` as a wired change; the two halves were
-   each proven to run.
-2. Keep the router on CPU and the expert bodies on GPU. The router is 22 nodes
-   and 5 MB; the cost is a host round-trip of `[T, E]`. `UNTESTED` as a wired
-   change.
+```
+compile_graph.cpp:54  [GPU] Failed to select implementation for
+    name:fullyconnectedcompressed:MatMul_82  type: fully_connected
+    original_type: FullyConnectedCompressed
+    could not create a primitive descriptor for the matmul primitive
+```
 
-Both need a test change, and a documented workaround with a measured
-before/after is a cell, not a defeat. Neither is wired tonight; what is recorded
-is the characterisation and the two candidate shapes.
+So the router was the first gate and the compressed-weight matmul is the next
+one. `UNTESTED`: whether a different group size, a u8 declaration, or a
+scale/zero-point layout change clears it. That is the next MoE item, and it is
+the one that stands between the serving-shape IR and a card.
 
-A 22-node reproducer is also exactly the right size for an upstream report.
+### MoE legs and MOE-GPU-FUSION — status, superseded text kept
 
-### MoE legs and MOE-GPU-FUSION — stated honestly
-
-The MoE GPU legs have historically hit a plugin fusion path
-(`MOE-GPU-FUSION` in RECONCILE). Status as of this manifest: **carried forward,
-not fixed.** What is and is not known must stay separated:
-
-- `UNTESTED` — whether pinning f32 alone changes the MoE GPU outcome. It is the
-  first thing to read off the run, and it is a cell, not a prediction.
-- `UNTESTED` — a plugin key that disables the router-fusion transform. No such
-  key has been verified to exist in OV 2026.4; until one is quoted from the
-  plugin's own `SUPPORTED_PROPERTIES` or source, "disable the transform" is a
-  hypothesis.
-- `UNTESTED` — graph-shape variants that sidestep the matcher (for example the
-  already-landed router / expert-chunk / shared-expert split, which is a
-  different graph shape than the fused single-layer MoE).
+Until `RUN@be57428` this section read "**carried forward, not fixed**" and
+listed three `UNTESTED` items: whether pinning f32 alone changes the outcome
+(it does not — the fusion failure is structural), whether a plugin key disables
+the transform (no such key exists; the full `SUPPORTED_PROPERTIES` was
+enumerated), and whether a graph-shape variant sidesteps the matcher. **The
+third one was the answer**, and it is now wired and measured above rather than
+hypothesised.
 
 A documented workaround that needs a test change is a cell, not a defeat. A
-workaround asserted without a measured before/after is neither.
+workaround asserted without a measured before/after is neither. This one has
+its before/after, on both cards, with a 0.0 equivalence leg behind it.
 
 ---
+
+## 4.4 THE BOOT — the serving-shape IR on the reserved card
+
+`RUN@198b736` (the IR) / `RUN@be57428` (the cards), 2026-09-12. No prediction
+was written for this and none is claimed: the job was that the path either
+lights up or its first failure is named exactly.
+
+**IT LIT UP.** The serving-shape IR — real geometry (H=2560, E=512, I=640,
+vocab 248,320), expert bodies slot-referenced as rank-4 u4 constants over
+sparse pages, PLE fed by `ngram_row_ids [1,T,16] i64`, dense-causal attention,
+the tiled MoE lowering — compiles AND runs a forward on both cards:
+
+```
+layers  device  nodes  declared GiB  arena KiB  build s  compile s  infer s  peak host GiB
+     1  CPU      2290          7.49          0     3.14       5.17    0.619          28.50
+     1  GPU.1    2290          7.49          0     2.85      14.02    0.400           7.63
+     1  GPU.0    2290          7.49          0     3.57      10.48    0.629           7.57
+     2  CPU      4670         58.03          0     2.94       9.22    1.160          39.84
+     2  GPU.1    4670         58.03          0     ~3.5       FAIL      ---           5.49
+     2  GPU.0    4670         58.03          0     3.51       FAIL      ---           5.57
+```
+
+Every leg that compiled returned `logits (1, 8, 248320)`, `finite=True`, f32
+pinned.
+
+### The 2-layer failure, named exactly — and it is a NEW serving constraint
+
+```
+engine.cpp:319  [GPU] Exceeded max size of memory object allocation:
+                requested 25600122880 bytes, but max alloc size supported
+                by device is 4294959104 bytes   (GPU.1, A770)
+                                    24385683456 bytes   (GPU.0, B60)
+                Please try to reduce batch size, use lower precision, or set
+                ov::intel_gpu::hint::enable_large_allocations config property
+                to true.
+```
+
+25,600,122,880 B is the PLE n-gram table exactly: 320,001,536 × 160 nibbles.
+Layer index 1 is the PLE layer, so it enters at the 2-layer step and nowhere
+earlier — which is why 1 layer boots on both cards and 2 does not.
+
+**THE A770 CAPS A SINGLE MEMORY OBJECT AT 4,294,959,104 B ≈ 4.00 GiB**, not at
+its 15.11 GiB of VRAM. The B60's cap is its whole 24,385,683,456 B. That is a
+per-OBJECT limit, distinct from the per-card capacity §5 measures, and it has
+not appeared in this repository before. It does not bite the CARD tier's
+largest single tensor today (`embed_tokens` / `lm_head` at 248,320 × 2,560 f32
+= 2.37 GiB each, comfortably under 4 GiB), but any strategy that consolidates
+weights into one large object on GPU.1 has a 4 GiB ceiling, and a quantised
+n-gram table must be chunked or host-resident on either card regardless.
+
+`UNTESTED`: whether `ov::intel_gpu::hint::enable_large_allocations` lifts the
+A770's 4 GiB cap, and at what cost. The plugin names the lever; nothing here
+has pulled it.
+
+Two things to read off this and NOT more than these:
+
+* **`absmax = 0.0000e+00` on every leg, and that is correct.** Every weight is
+  an unwritten page. This is a STRUCTURE artifact: it proves the graph
+  compiles, allocates, schedules and produces a finite tensor of the right
+  shape on the reserved card. It proves nothing whatsoever about numerics, and
+  no parity claim may be built on it. The numeric gates live in the per-piece
+  suites, on real fed tensors.
+* **The GPU path costs 7.6 GiB of host memory where the CPU path costs 28.5.**
+  The CPU plugin expands the u4 constants host-side; the GPU plugin does not.
+  That is a 3.7x difference in host residency for the same graph, measured, and
+  it matters for the offload budget — but it is one shape at one layer count
+  and is not yet a serving figure.
+
+The 2-layer step is where the PLE n-gram table enters (declared 7.49 -> 58.03
+GiB, because layer index 1 is the PLE layer), and the CPU leg pays 39.84 GiB of
+peak host for it. That is the first quantitative sign of what §5's HOST-MMAP
+tier costs when it is carried as a graph constant instead of an mmap — which is
+exactly why serving reads it through `src/exec/ngram_table.h` instead.
+
+### Boot sequence as executed
+
+```
+# RUN@be57428
+date -Is                                       # 06:03:10Z
+systemctl --user stop arcint-agent             # frees GPU.0 (B60)
+systemctl --user stop arcint                   # frees GPU.1 (A770)
+systemctl --user is-active arcint-agent arcint # inactive inactive
+<venv>/bin/python -c "<card enumeration>"      # GPU.0 22.71 GiB, GPU.1 15.11 GiB
+# one process per leg, never two on a card at once
+Q4E_GPU= <venv>/bin/python boot.py <layers> <device> <T>
+```
+
+### What the boot did NOT do, stated plainly
+
+* **The slot pool was not pointed at the real shards.** The expert bodies are
+  declared u4 and unfilled; nothing yet maps the shipped Q3_K_XL expert rows
+  into that layout with scales and zero-points. So there is no offload-policy
+  log, no miss-tier rate and no slot-churn figure from this window — those need
+  weights, not a card. `UNTESTED`.
+* **No generation request was issued.** A forward on zero weights produces zero
+  logits; a decode loop over them would be a ceremony, not a measurement.
+* **The full 48-layer stack was not compiled on a card.** At 48 layers the
+  declared constants are 183.07 GiB and the 2-layer CPU leg already peaks at
+  39.84 GiB of host. The structure builds (§4.4 above, 84,372 nodes, 6.43 s);
+  compiling it needs the quantised fill and the host-mmap tier, not a bigger
+  card. `UNTESTED`.
+* **The paged port contract is not emitted** — 13 ports, each named with its
+  feed site, carried as a strict xfail in
+  `tests/python/test_serving_shape.py`.
 
 ## 5. Residency — the SIZE LEDGER, and the number that decides the window
 
@@ -445,11 +591,16 @@ scheduling preference; it is 3.5 GiB.
 
 ---
 
-## 6. The 86k-node compile — an observation with a budget, not a milestone
+## 6. The 86k-node compile — **ANSWERED**
 
-CPU behaviour is known (`RUN@57b1952`, REVIEW 57b1952 §7): node count is linear in GDN
-layer count at ~1,879 nodes/block, and an 86k-node graph (the tiny width at the
-checkpoint's 36 GDN layers) compiles on CPU in 22 s without falling over.
+The question this section carried was: *"whether the GPU plugin's per-shape
+kernel JIT copes with 86k nodes is STILL UNANSWERED"*. It was unanswerable
+while §4.3's fusion defect stopped program building in seconds at every layer
+count including 4. With §4.3 wired, the experiment ran.
+
+CPU behaviour, unchanged reference (`RUN@57b1952`, REVIEW 57b1952 §7): node
+count is linear in GDN layer count at ~1,879 nodes/block, and an 86k-node graph
+compiles on CPU in 22 s.
 
 ```
 layers    nodes  nonconst   xml MB  build s  compile s   (RUN@57b1952, CPU)
@@ -458,47 +609,46 @@ layers    nodes  nonconst   xml MB  build s  compile s   (RUN@57b1952, CPU)
     36    85639     32719    38.05     0.95      21.95
 ```
 
-Whether the GPU plugin's per-shape kernel JIT behaves the same on 86k nodes was
-**not** answered there and is not answerable from CPU numbers.
-
-`RUN@wt+2e99661` 2026-09-12, 20-minute hard budget per attempt, each attempt in its own
-child process so a wedged compile cannot take the run with it:
+`RUN@be57428`, 2026-09-12, 20-minute hard budget per attempt, each attempt in
+its own child process:
 
 ```
-layers  device   nodes      const B  build s  compile s  peak host GiB  result
-     4     CPU    9671      756,660     3.15       1.59           0.83  OK
-     4   GPU.0      --           --       --         --             --  RuntimeError
-     4   GPU.1      --           --       --         --             --  RuntimeError
-    12     CPU   28663    2,153,108     3.29       5.77           1.17  OK
-    12   GPU.0      --           --       --         --             --  RuntimeError
-    12   GPU.1      --           --       --         --             --  RuntimeError
-    36     CPU   85639    6,342,452     3.92      18.95           2.17  OK
-    36   GPU.0      --           --       --         --             --  RuntimeError
-    36   GPU.1      --           --       --         --             --  RuntimeError
+layers  device   nodes   const B   build s  compile s  peak host GiB  result
+     4   GPU.0    9727    849,892     0.10       5.41           1.34  OK
+     4   GPU.1    9727    849,892     0.11       5.34           1.33  OK
+    12   GPU.0   28831  2,432,804     0.30      15.88           1.22  OK
+    12   GPU.1   28831  2,432,804     0.31      16.43           1.23  OK
+    36   GPU.0   86143  7,181,540     0.96     204.90           2.00  OK
+    36   GPU.1   86143  7,181,540     0.92     203.79           2.01  OK
 ```
 
-**THE EXPERIMENT IS BLOCKED UPSTREAM OF ITS OWN QUESTION, and no budget was
-spent.** Every GPU attempt fails in seconds, at every layer count including 4,
-because the backbone contains an MoE layer and the plugin's `MoERouterFused`
-defect (§4.3) stops program building before any node-count behaviour is reached.
-The 20-minute budget was never approached. So: **whether the GPU plugin's
-per-shape kernel JIT copes with 86k nodes is STILL UNANSWERED**, and it cannot be
-answered with this graph until §4.3 has a wired workaround. Saying "the 86k
-compile failed on GPU" would be true and useless — it failed at 9,671 nodes too,
-for a reason that has nothing to do with node count.
+**YES — the GPU plugin's per-shape JIT copes with 86 thousand nodes.** 86,143
+nodes compile on **both** cards, in 204.90 s (B60) and 203.79 s (A770) — within
+0.5% of each other — well inside the 20-minute budget, at 2.0 GiB of peak host
+memory. The compile cost is not a card property. Every previous attempt, at every layer count,
+died in seconds with a `RuntimeError` that had nothing to do with node count.
 
-The CPU column reproduces REVIEW 57b1952 §7 (there: 9671 / 28663 / 85639 nodes,
-1.92 / 6.09 / 21.95 s; here 1.59 / 5.77 / 18.95 s on a quieter host). Peak host
-memory is modest and linear-ish: 0.83 → 1.17 → 2.17 GiB.
+**The cost is superlinear in nodes and that is the finding worth carrying**:
 
-The F3 hoist candidate (~65% node cut) was **not attempted** this session — it is
-only worth measuring against a GPU compile that can start, which §4.3 currently
-prevents. `UNTESTED`.
+```
+nodes    compile s   ms per node
+ 9,727        5.41       0.56
+28,831       15.88       0.55
+86,143      204.90       2.38
+```
 
-A timeout is a result and gets written down as one. So is a blocker that makes
-the timeout unreachable.
+Flat at ~0.55 ms/node to 29k nodes, then **4.3× worse per node** at 86k. The
+GPU compile is 9.3× the CPU's 21.95 s at the same scale, against 2.8× at 4
+layers. Whatever the plugin does that is not linear starts between 29k and 86k
+nodes — that is where a node-count reduction (the F3 hoist) would pay, and it
+is now a measurable payoff rather than a guess.
 
----
+The F3 hoist (~65% node cut) is still **`UNTESTED`**, but its premise is no
+longer hypothetical: it was "only worth measuring against a GPU compile that
+can start", and the compile now starts.
+
+A timeout is a result and gets written down as one. So is a budget that was
+never approached — twice, in opposite directions.
 
 ## 7. The KLD gate
 
@@ -547,11 +697,31 @@ record than a blank guessed.
 | host-mmap tier | 190.736 GiB f32 n-gram table | `RUN@wt+2e99661` size ledger, file-sourced |
 | f32 : quantized ratio | 7.72× | `RUN@wt+2e99661` size ledger vs WP6b 85.38 GiB |
 | GPU inference precision | f32, pinned explicitly | `RUN@829a213` §3 |
+| GPU.1 max single allocation | **4,294,959,104 B (4.00 GiB)** | `RUN@be57428` §4.4 |
+| GPU.0 max single allocation | 24,385,683,456 B (whole VRAM) | `RUN@be57428` §4.4 |
+| serving-shape boot, 1 layer | compiles + infers on BOTH cards | `RUN@be57428` §4.4 |
+| → GPU.1 compile / infer | 14.02 s / 0.400 s, 7.63 GiB host | `RUN@be57428` §4.4 |
+| → GPU.0 compile / infer | 10.48 s / 0.629 s, 7.57 GiB host | `RUN@be57428` §4.4 |
+| → CPU host cost, same graph | 28.50 GiB (3.7× the GPU path) | `RUN@be57428` §4.4 |
 | QSA→dense price, T ≤ **2051** | **0.0, exact** (boundary derived, not the budget 2048) | `RUN@692c0a6` attention piece |
 | QSA→dense price, T = 2052 | 2.307817e-06 over **1**/2052 rows | `RUN@692c0a6` attention piece |
 | QSA→dense price, T = 2080 | 2.385560e-02 over **29**/2080 rows = T−2051 | `RUN@692c0a6` attention piece |
 | attention piece floor vs pin | 1.855e-07 (T=64), 1.535e-07 (T=96) | `RUN@e78812d` attention piece |
 | KLD gate threshold | ≤ 0.0599 nats mean per-token | harness, red-probed |
+| serving-shape IR, 48 layers | 84,372 nodes, 36 GDN + 12 dense-causal | `RUN@198b736` `--serving-shape` |
+| → declared constants | 183.07 GiB | `RUN@198b736` |
+| → materialised on disk | **0 KiB** | `RUN@198b736` |
+| → build cost | 6.43 s, 4.6 GiB RSS | `RUN@198b736` |
+| expert body declared type | u4, rank-4 [E, out, groups, 128] | `RUN@198b736` contract test |
+| per-expert int4 slice | 2,457,600 B (gate+up+down) | `flash_next_offload.h:45`, re-derived |
+| → as the IR walk reads it | 4,915,200 B = **exactly 2×** | `RUN@198b736` (u4 ceiled to 1 B) |
+| `slot_pool_from_ir` on any arcint IR | **nullopt** — 0 of 52 IRs carry a moe-typed op | `RUN@198b736` |
+| MoE router on GPU | scatter shape OK both cards; one_hot FAILs | `RUN@be57428` §4.3 |
+| → cost of the swap | 0.000000e+00 on CPU | `RUN@be57428` |
+| GDN GPU first bad row | 65, at every T ≥ 66, both cards | `RUN@be57428` §4.2 |
+| GPU acceptance doctrine | \|ov−r64\| ≤ 20 × \|r32−r64\| | `RUN@be57428` §4.2 |
+| 86k-node GPU compile | **204.90 s** on B60, 86,143 nodes | `RUN@be57428` §6 |
+| → compile cost scaling | 0.55 ms/node to 29k, 2.38 ms/node at 86k | `RUN@be57428` §6 |
 
 ### Terms still to be predicted — `UNTESTED`, fill before measuring
 
@@ -566,7 +736,7 @@ record than a blank guessed.
 | MTP acceptance rate | | | |
 | MTP overhead term | | | |
 | amortised t/s incl. MTP | | | |
-| 86k-node GPU compile, s | | | |
+| 86k-node GPU compile, s | | **204.90** (B60, 86,143 nodes) | `RUN@be57428` §6 |
 
 ### The coherence line — RESERVED, LEAVE EMPTY
 
