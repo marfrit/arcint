@@ -59,11 +59,28 @@ ACCEPTANCE IS TWO-LEGGED (both are needed; neither substitutes for the other):
     mask, which makes the pin's own code path exactly dense causal). Same float
     width on both sides, so the verdict is the f32 floor. This is the leg that
     can see defects 1 and 2; a reference written from the same misreading cannot.
-  * PRICE, KLD-shaped (frontier ruling): emitted vs the pin WITH its real QSA
-    indexer, on identical fed real tensors. Non-zero BY DESIGN -- QSA prunes
-    keys the dense block keeps -- and the divergence is the honest measurement
-    of the causal-scope ruling's price in output space, PASTED, never asserted
-    equal. The end-to-end KLD gate decides small-enough, later.
+  * PRICE (frontier ruling, CORRECTED 2026-09-12): emitted vs the pin WITH its
+    real QSA indexer, on identical fed real tensors. The superseded text here
+    read "PRICE, KLD-shaped ... Non-zero BY DESIGN -- QSA prunes keys the dense
+    block keeps"; it is recorded rather than edited away because the premise,
+    not the wording, is what was wrong. MEASURED, the indexer does not prune
+    below its budget: query i keeps topk(min(block_topk, num_complete_blocks))
+    (pin 757) with block_topk = budget // compress_ratio = 2048 // 4 = 512
+    (pin 684), so while (i+1)//4 <= 512 the min IS num_complete_blocks, every
+    complete block is selected, the incomplete tail is added unconditionally
+    (pin 762-763), and the overlaid mask EQUALS the causal mask.
+
+        T=  64   |dense - QSA| max-abs 0.000000e+00   rows differing    0/64
+        T=  96   |dense - QSA| max-abs 0.000000e+00   rows differing    0/96
+        T=2080   |dense - QSA| max-abs 2.385560e-02   rows differing   29/2080
+
+    So this leg is EQUALITY-shaped at serving prefill lengths -- a stronger gate
+    than a KLD-shaped one, not a weaker one -- and the price there is a measured
+    0.0 rather than a tolerated residue. The price is non-zero only ABOVE the
+    budget (pruning needs (i+1)//4 > 512, i.e. from row i = 2051), where it is
+    PASTED and never bounded, the row count being the structural quantity and
+    the magnitude a sample. The end-to-end KLD gate decides small-enough for
+    T > 2048, later.
 
 `attention_scaling` (pin 133-134) multiplies cos/sin; for rope_type "default"
 the pin's own `compute_default_rope_parameters` returns 1.0 (pin 117), so the

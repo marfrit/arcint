@@ -69,27 +69,47 @@ Totals confront BOTH the 22.71 GiB card figure and ~15 GiB (the actual
 reserve) and the WP6b numbers (176.94 B params / 85.38 GiB; routed 120.80 B /
 56.25 GiB offload).
 
-PARITY LEGS (tests/python/test_piecewise_export.py) -- every piece has a
-numeric leg vs the pin/f64 reference on FED REAL tensors at >= 2 sequence
-lengths and (GDN/attention/MoE) >= 2 input shapes:
+PARITY LEGS (CORRECTED 2026-09-12). The superseded header named
+`tests/python/test_piecewise_export.py` as the home of every leg below. That
+file was DISCARDED in the 2026-09-12 triage (its test-side key convention was
+`self_attn.`/`mlp.`/`linear_attn.`-prefixed against emitters that read
+module-relative keys, and it asserted indexer_n_heads == 3 where the file says
+4). The legs now live in the per-piece suites named per bullet; one bullet has
+NO home and says so. Every piece has a numeric leg vs the pin/f64 reference on
+FED REAL tensors at >= 2 sequence lengths and (GDN/attention/MoE) >= 2 input
+shapes:
   * gdn_block: emitted GDN vs an f64 reference on fed real weights;
     max-abs at the OV-f32-vs-f64 floor.
-  * attention_block: emitted DENSE-CAUSAL vs the pin's own Qwn4ExpTextAttention
-    WITH ITS INDEXER (QSA) on fed real weights and identical fed tensors.
-    ACCEPTANCE IS KLD-SHAPED, NOT EQUALITY-SHAPED (frontier ruling): the leg
-    PASTES the small non-zero divergence (QSA legitimately prunes) and asserts
-    finite non-neg sanity, not equality; the emission MATH is separately
-    floored against an f64 dense-causal reference.
+  * attention_block (tests/python/test_attention_piece.py): emitted
+    DENSE-CAUSAL vs the pin's own Qwen4ExpTextAttention WITH ITS INDEXER (QSA)
+    on fed real weights and identical fed tensors. The superseded text read
+    "ACCEPTANCE IS KLD-SHAPED, NOT EQUALITY-SHAPED (frontier ruling): the leg
+    PASTES the small non-zero divergence (QSA legitimately prunes)". MEASURED,
+    QSA does not prune below its budget and the price is EXACTLY 0.0 there
+    (0.000000e+00 over 0 rows at T=64 and T=96; 2.385560e-02 over 29/2080 above
+    it), so the leg is EQUALITY-shaped at serving prefill lengths and pastes the
+    non-zero price only above the budget. See the corrected PRICE paragraph in
+    q4e/attention.py. The emission MATH is separately floored against the pin
+    with its indexer stubbed to an all-zero additive mask -- not against a
+    hand-written reference, which is what shared the emitter's misreading.
   * moe_*: router gate equality with the pin's `router_gate` on fed real
-    tensors, and sum-over-chunks + shared == the pin's SPARSE MoE output
-    (the dense==sparse theorem, measured, not asserted); shared piece vs the
-    pin's shared term.
-  * gatedresidual_* / hc_combine: equality vs the pin's hl.pyw mixers on fed
-    real tensors (the mixer classes already have transcription-vs-pin == 0).
-  * ple_block: vs the pin's Qwen4ExpTextPLELayer on fed real weights and the
-    leg-windowed table (row_ids seam, parity-validated index). max-abs at the
-    conv-floored bound.
-  * embed / lm_head: exactness (Gather/MatMul are exact) on real rows.
+    tensors (tests/python/test_moe_block.py, which also gates dense==sparse for
+    the FULL graph). **THE CHUNK LEG HAS NO HOME AS OF 2026-09-12**: the only
+    cell that ever ran sum-over-chunks + shared == the pin's SPARSE output went
+    with the discarded file, so `build_experts_chunk_model`'s partition of the
+    expert axis and its per-chunk gate slice are UNGATED -- test_size_ledger.py
+    builds moe_router and moe_shexp but never an expert chunk. Treat the
+    chunk-split theorem as asserted-by-construction until a cell exists.
+  * gatedresidual_* / hc_combine (tests/python/test_hc_block.py,
+    test_hc_combine_block.py): equality vs the pin's mixers on fed real tensors
+    (the mixer classes already have transcription-vs-pin == 0).
+  * ple_block (tests/python/test_ple_block.py): vs the pin's
+    Qwen4ExpTextPLELayer on fed real weights. max-abs at the conv-floored
+    bound. The leg-windowed table (`windows=`) is exercised for SIZE only, by
+    test_size_ledger.py; `emit_ple` still does not forward `windows`
+    (CARRY-FORWARD).
+  * embed / lm_head: exactness (Gather/MatMul are exact) on real rows; sized in
+    test_size_ledger.py.
 """
 import math
 

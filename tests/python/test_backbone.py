@@ -15,7 +15,8 @@ the pin's own Qwen4ExpTextAttention (pin 819-901) minus the selection branch,
 with RoPE in its degenerate-for-text form -- tools/q4e/attention.py. This
 suite's tiny fixtures stay all-linear (the parity floor for the harness
 shape); the real-width dense-causal piece is exercised piecewise in
-tests/python/test_piecewise_export.py.
+tests/python/test_attention_piece.py (test_piecewise_export.py was discarded in
+the 2026-09-12 triage).
 
 Pin facts this increment establishes (pin re-verified on the dev host, sha ca9f00bb):
   * PLE is ADDITIVE (hidden += ple(...), pin 1283-1284), not a layer replacement.
