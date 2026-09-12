@@ -628,3 +628,116 @@ if __name__ == "__main__":                                  # pragma: no cover
             rc = 1
     print("scanned", len(suite_files()), "files;", "CLEAN" if rc == 0 else "DEFECTS")
     sys.exit(rc)
+
+
+# ---------------------------------------------------------------------------
+# K2 (REVIEW 9162ac9): THE COUNT GATES ARE ENUMERATED, so two honest readings
+# of "LEG A" can be reconciled without anyone opening a gate to make the
+# numbers match.
+# ---------------------------------------------------------------------------
+
+# Every switch that can move this suite's passed/skipped split. Three env vars
+# and one property of the checkout. A reading of LEG A is only comparable to
+# another reading at the SAME point in this space, which is why the close-out
+# and window-050 record the command AND the env beside every count.
+#
+#   Q4E_GPU            comma list of devices; empty = CPU only
+#   Q4E_GGUF_SHARDS    path to the real GGUF shards; unset = every real-weight
+#                      cell skips by name
+#   Q4E_SERVING_FULL   1 = run the 48-layer keystone build (deliberately not
+#                      on every pass)
+#   a git work tree    NOT an env var, and the one that caught us out: a bare
+#                      `git archive` extract has no .git, so test_citations'
+#                      LEG 2 (`git ls-files`) skips. A clone and a tarball of
+#                      the SAME COMMIT therefore report different splits, and
+#                      both are correct.
+_COUNT_GATES = frozenset({"Q4E_GPU", "Q4E_GGUF_SHARDS", "Q4E_SERVING_FULL"})
+
+_SUITE_FILES = sorted((REPO_ROOT / "tests" / "python").glob("test_*.py")) + [
+    REPO_ROOT / "tools" / "test_export_qwen4_exp.py"]
+
+
+def test_the_suite_declares_no_count_gate_outside_the_recorded_set():
+    """The reconciliation K2 asked for, as an assertion rather than prose.
+
+    Two readings of LEG A at the same commit differed (194/84 against 192/86)
+    and both were honest: one was a clone, one a `git archive` extract, and the
+    citation scan's `git ls-files` leg is gated on that difference. The fix is
+    not to pick a number; it is to make the SPACE the numbers live in closed,
+    so a future disagreement is always attributable to a named coordinate and
+    nobody ever reconciles two counts by quietly exporting a variable.
+
+    So: every `Q4E_*` environment variable the suite reads must be one of the
+    recorded gates. A new one is a new axis in that space, and it goes red here
+    until the recorded matrix grows to cover it.
+    """
+    import re
+
+    found = {}
+    for path in _SUITE_FILES:
+        if not path.is_file():
+            continue
+        for name in re.findall(r"Q4E_[A-Z0-9_]+", path.read_text()):
+            found.setdefault(name, set()).add(path.name)
+
+    print(f"\n[count-gates] recorded {sorted(_COUNT_GATES)}")
+    for name in sorted(found):
+        print(f"  {name:<20} read by {len(found[name])} file(s): "
+              f"{', '.join(sorted(found[name])[:4])}")
+
+    undeclared = sorted(set(found) - _COUNT_GATES)
+    assert not undeclared, (
+        f"the suite reads {undeclared}, which is not in the recorded count-gate "
+        f"set. Every such variable can move the passed/skipped split, so a "
+        f"recorded count becomes ambiguous the moment one exists undeclared. "
+        f"Add it to _COUNT_GATES and to the env matrix in the close-out and "
+        f"window-050 -- do NOT reconcile two counts by setting it.")
+    unused = sorted(_COUNT_GATES - set(found))
+    assert not unused, (
+        f"_COUNT_GATES lists {unused}, which no suite file reads any more. A "
+        f"stale gate makes the matrix over-report the space and hides that the "
+        f"two axes left are the only ones that matter.")
+
+
+# The files whose cells skip on the CHECKOUT's shape rather than on an env
+# var: they need a git work tree. Written down because this is the axis that
+# produced K2's disagreement, and because the count of such cells IS the
+# clone-minus-tarball delta.
+#
+# THIS SET WAS WRONG WHEN FIRST WRITTEN. The cell below said "only
+# test_citations may do this" and went red on its first run naming
+# test_window_manifest.py, which gates its sha-resolution cell the same way.
+# Two cells, not one -- which is exactly the 194/84 (clone) against 192/86
+# (tarball) gap that K2 asked to be reconciled: two fewer passes, two more
+# skips, both legitimate.
+_CHECKOUT_GATED_FILES = frozenset({"test_citations.py", "test_window_manifest.py"})
+
+
+def test_the_checkout_shaped_gates_are_exactly_the_recorded_files():
+    """The non-env gate, pinned to the files that have it.
+
+    A cell gated on `git ls-files` / a git work tree skips in a tree with no
+    `.git` -- which is what a `git archive` extract is. That is legitimate, but
+    the SET of such cells must be closed, because their number is the whole
+    difference between a clone reading and a tarball reading of the same
+    commit. A third one appearing silently would make the recorded env matrix
+    wrong without anything going red.
+    """
+    import re
+
+    gated = {}
+    for path in _SUITE_FILES:
+        if not path.is_file():
+            continue
+        hits = re.findall(r"skipif\([^)]*(?:ls-files|_in_git_worktree|worktree|\.git)",
+                          path.read_text())
+        if hits:
+            gated[path.name] = len(hits)
+
+    print(f"[count-gates] checkout-shaped (git work tree) skip gates: {gated}")
+    assert set(gated) == set(_CHECKOUT_GATED_FILES), (
+        f"the files gating a skip on the checkout's shape are {sorted(gated)}, "
+        f"not the recorded {sorted(_CHECKOUT_GATED_FILES)}. Their count is the "
+        f"clone-minus-tarball delta in the recorded env matrix, so this set "
+        f"changing means that matrix is stale -- update both, and do not "
+        f"reconcile two readings by running one of them in the other's tree.")

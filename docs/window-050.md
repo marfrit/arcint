@@ -250,6 +250,30 @@ Q4E_GPU=GPU.0,GPU.1 Q4E_GGUF_SHARDS=<shards> \
 CPU-only control (`RUN@e78812d`): `Q4E_GPU=` empty → **112 passed** with
 shards, **42 passed / 70 skipped, 0 errors** device-free.
 
+**HOW TO READ ANY SUITE COUNT IN THIS FILE (K2, `RUN@9146546`).** A
+passed/skipped split is only meaningful next to the switches that were set,
+because every skip in this suite is gated. Two honest readings of the same
+commit differed by two passes and the reconciliation is that there are exactly
+four coordinates, now enumerated and held by
+`tests/python/test_suite_guards.py`:
+
+| coordinate | effect when open |
+|---|---|
+| `Q4E_GPU` | empty → CPU only; a device list adds the per-device legs |
+| `Q4E_GGUF_SHARDS` | unset → every real-weight cell skips **by name** |
+| `Q4E_SERVING_FULL` | `1` → runs the 48-layer keystone build (off by default on purpose) |
+| **a git work tree** | *not* an env var: a `git archive` extract has no `.git`, so the two cells gated on `git ls-files` (`test_citations` LEG 2 and `test_window_manifest`'s sha resolution) skip |
+
+So a clone and a tarball of the same commit differ by exactly **two** passes,
+and both are correct. `test_the_suite_declares_no_count_gate_outside_the_
+recorded_set` goes red if a fifth coordinate appears, and
+`test_the_checkout_shaped_gates_are_exactly_the_recorded_files` goes red if a
+third checkout-gated cell does — the point being that a future disagreement is
+always attributable to a named coordinate, and **nobody reconciles two counts
+by opening a gate.** The measured matrix for the current tip is in the
+close-out; the historical figures above keep their own `RUN@` ids and are not
+retro-fitted.
+
 > The figures here were **101** and **33/59** until 2026-09-12. Both were
 > true — of the tree they ran on, which was not the tip. That is the
 > defect CF-MANIFESTSHA exists to prevent, recorded rather than edited
