@@ -74,7 +74,44 @@ from .gdn import _c, _i, _mm, _mul, _add, _slice, _reshape, _rsum, _silu  # noqa
 def _router_gate(h2d, config, state, T):
     """Dense top-k routing weights [T, E] (pin 969-978): the renormalized score
     at each selected expert, 0 elsewhere -- the pin's `router_scores` (pin 954)
-    laid out densely via the pin's own one-hot construct (pin 941)."""
+    laid out densely.
+
+    MOE-GPU-FUSION, FIXED AND MEASURED 2026-09-12 (window-050 §4.3). The dense
+    layout used to be built with the pin's own one-hot construct (pin 941):
+
+        onehot = op.one_hot(idx, E, 1.0, 0.0, -1)            # [T, k, E]
+        gate   = op.reduce_sum(onehot * scores[:, :, None], axis=1)
+
+    That shape makes the Intel GPU plugin's own router fusion fire and then
+    fail, on BOTH cards, at every width tried:
+
+        program_builder.cpp:268  Input moerouterfused:MoERouterFused_1152.out1
+                                 hasn't been found in primitive_ids map
+
+    It is replaced by the ScatterElementsUpdate layout the production 35B-A3B
+    export uses (tools/export_mtp.py:472-494 `moe_block_tiled`, extracted from
+    the one IR on record that provably fuses). SAME ARITHMETIC -- measured
+    byte-exact, not argued:
+
+        |one_hot-router - scatter-router| on CPU, full MoE block  0.000000e+00
+
+    and the before/after on the cards, one variable (this function):
+
+        device   BEFORE one_hot (422 nodes)   AFTER scatter (421 nodes)
+        CPU      OK                            OK    |dev-CPU| 0.000000e+00
+        GPU.0    FAIL MoERouterFused           OK    |dev-CPU| 4.023314e-07
+        GPU.1    FAIL MoERouterFused           OK    |dev-CPU| 4.451722e-07
+
+    The 22-node isolated router reproduces the same split: one_hot FAILs on
+    both cards, scatter runs and returns sum=64.0000, identical to CPU.
+
+    The pin fidelity argument is unchanged and is why the swap is legitimate:
+    both forms scatter torch.topk's OWN indices (not a threshold on the value),
+    so the selection reproduces the pin EXACTLY, tie-break included. What
+    changed is the ops that carry the scatter, not which experts are selected
+    or with what weight -- and the 0.0 above is the proof rather than the
+    claim.
+    """
     E = config.num_experts
     k = config.num_experts_per_tok
 
@@ -84,10 +121,11 @@ def _router_gate(h2d, config, state, T):
     probs = op.softmax(logits, -1)  # [T, E]
 
     # pin 973: router_top_value, router_indices = torch.topk(probs, k).
-    # op.topk returns values (descending) and the selected expert indices.
-    tk = op.topk(probs, op.constant(np.array(k, np.int64)), -1, "max", "value")
+    # i32 indices: what ScatterElementsUpdate takes in the production shape.
+    tk = op.topk(probs, op.constant(np.array(k, np.int32)), -1, "max", "value",
+                 index_element_type="i32")
     vals = tk.output(0)                       # [T, k]  the top-k probabilities
-    idx = op.convert(tk.output(1), Type.i64)  # [T, k]  the selected experts
+    idx = tk.output(1)                        # [T, k]  the selected experts
 
     if config.norm_topk_prob:
         # pin 974-975: router_top_value /= router_top_value.sum(-1, keepdim).
@@ -95,17 +133,20 @@ def _router_gate(h2d, config, state, T):
     else:
         scores = vals
 
-    # pin 941: expert_mask = one_hot(top_k_index). Scatter the (renormalized)
-    # scores into a dense [T, E] gate -- 0 at non-selected experts. Using
-    # torch.topk's own indices (not a threshold on the value) reproduces the
-    # pin's selection EXACTLY, including whatever tie-break torch.topk makes on
-    # equal probabilities (a threshold mask would over-select on a tie).
-    onehot = op.one_hot(
-        idx, op.constant(np.array(E, np.int64)),
-        op.constant(np.float32(1.0)), op.constant(np.float32(0.0)), -1,
-    )  # [T, k, E]
-    scores3 = _reshape(scores, [T, k, 1])
-    gate = op.reduce_sum(_mul(onehot, scores3), _i([1]), False)  # [T, E]
+    # A full-range Slice before the scatter. Numerically a no-op
+    # (begin (0,0), end shape_of(scores), step (1,1)); the ground-truth IR has
+    # it (export_mtp.py:483-492, "Slice411, between its Divide and its
+    # ScatterElementsUpdate") and window-D fusion checking flagged its absence,
+    # so it is reproduced literally rather than assumed irrelevant.
+    scores = op.slice(scores,
+                      op.constant(np.array([0, 0], np.int32)),
+                      op.shape_of(scores, output_type="i32"),
+                      op.constant(np.array([1, 1], np.int32)),
+                      op.constant(np.array([0, 1], np.int32)))
+    # zeros [T, E] derived from probs so the shape needs no ShapeOf plumbing
+    zeros = _mul(probs, _c(np.float32(0.0)))
+    gate = op.scatter_elements_update(zeros, idx, scores,
+                                      op.constant(np.array(-1, np.int32)))
     return gate
 
 

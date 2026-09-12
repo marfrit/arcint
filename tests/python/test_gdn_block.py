@@ -168,11 +168,69 @@ def test_transcription_matches_pin():
         assert md < 1e-5, f"transcription drifted from pin at T={T}: {md:.3e}"
 
 
-@pytest.mark.parametrize("T", [64, 96])
+@pytest.mark.parametrize("T", [64, 65, 66, 96])
 @pytest.mark.parametrize("device", _device_params())
 def test_gdn_ov_parity(device, T):
-    """The emitted OV GDN model equals the transcription at atol=1e-5, with a
-    max-abs + KLD table, at T=64 (1 chunk) and T=96 (2 chunks / pad rows)."""
+    """The emitted OV GDN model against the f64 TRUTH, gated RELATIVELY against
+    the f32 reference's own rounding.
+
+    THE GPU ACCEPTANCE DOCTRINE, decided 2026-09-12 by measurement (window-050
+    §4.2). The question was whether a GPU leg should be judged by
+    equality-to-reference (|ov - ref_f32|, what this cell used to assert at a
+    flat 1e-5) or by distance-to-truth (|ov - ref_f64|). Both sides were
+    measured against an f64 recomputation at T=64/96/128/256 on CPU and both
+    cards:
+
+        device  T     |ov-r64|    |r32-r64|    |ov-r32|   ov/floor
+        CPU     64   5.7251e-07  4.4179e-07  5.6624e-07       1.30
+        CPU     96   8.3250e-07  9.4986e-07  9.3132e-07       0.88
+        CPU    128   7.5987e-07  8.0206e-07  9.9838e-07       0.95
+        CPU    256   1.6980e-06  9.1336e-07  1.4603e-06       1.86
+        GPU.0   64   7.1151e-07  4.4179e-07  6.8545e-07       1.61
+        GPU.0   96   7.4504e-02  9.4986e-07  7.4504e-02   78437.26
+        GPU.0  128   7.5063e-02  8.0206e-07  7.5063e-02   93588.29
+        GPU.0  256   1.2177e-01  9.1336e-07  1.2177e-01  133325.58
+        GPU.1  96   7.4505e-02  9.4986e-07  7.4505e-02   78437.33   (etc)
+
+    The numbers force the choice, three ways:
+
+      1. The f32 REFERENCE IS SOUND -- 4.42e-07 to 9.50e-07 from f64 at every
+         T, on every device (it is torch on CPU, so device-independent). It is
+         a legitimate yardstick, which is what makes a relative gate possible
+         at all.
+      2. WHERE THE DEFECT LIVES THE TWO CRITERIA ARE INDISTINGUISHABLE:
+         |ov-r32| and |ov-r64| agree to four significant figures at T >= 96,
+         because the error dwarfs both floors. So the defect cannot decide it.
+      3. WHERE THEY DIFFER, THE ABSOLUTE GATE IS THE UNANCHORED ONE. The floor
+         itself MOVES with T (4.42e-07 -> 9.50e-07), so a flat `< 1e-5` is a
+         drifting standard: it would pass a result 20x the floor at T=64 and
+         10x at T=96 and call both the same thing.
+
+    So: DISTANCE TO TRUTH, gated at 20x the reference's own f32 rounding --
+    the FIX-GDN-UTINV doctrine (commit 1f075f0), now applied to the device
+    legs. The gate has a denominator that is itself measured every run, so a
+    drifting yardstick cannot satisfy it, and a second assert fails outright if
+    the f32 reference leaves the float floor.
+
+    T=65 and T=66 are parametrised because they are the boundary pair that
+    pins the failure. Measured on GPU.0:
+
+        T    pad   max-abs      first bad row   n bad
+        64     0   6.8545e-07        -1            0
+        65    63   1.1735e-06        -1            0
+        66    62   3.6024e-02        65            1
+        67    61   2.5580e-02        65            2
+        96    32   7.4504e-02        65           31
+
+    Row 64 -- the FIRST row of the second chunk -- is always correct
+    (1.341e-07). Row 65 is always the first wrong one, and the count is exactly
+    T-65. So the inter-chunk state ARRIVES correct and the corruption begins at
+    the first row that mixes the carried state with the in-chunk accumulation.
+    That refines, and does not confirm, the earlier "the carry is the
+    divergence point" reading. The op responsible is NOT identified; what is
+    established is the row, the shape threshold, and that CPU is at the float
+    floor at every one of these shapes.
+    """
     _assert_pin()
     config = _make_config()
     ref, _ = _ref_and_pin(config)
@@ -182,6 +240,10 @@ def test_gdn_ov_parity(device, T):
     mask = torch.ones(1, T, dtype=torch.long)
     with torch.no_grad():
         y_ref = ref(x, mask).float().numpy()
+        # the f64 TRUTH, from the SAME weights -- the doctrine's denominator
+        ref64 = ref_gdn.Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).eval().double()
+        ref64.load_state_dict({k: v.double() for k, v in ref.state_dict().items()})
+        y_64 = ref64(x.double(), mask).numpy()
 
     model = gdn.build_gdn_model(config, state, seq_len=T)
     core = ov.Core()
@@ -193,6 +255,12 @@ def test_gdn_ov_parity(device, T):
     y_ov = out[compiled.output(0)]
 
     max_abs = float(np.max(np.abs(y_ref - y_ov)))
+    d_ov64 = float(np.max(np.abs(np.asarray(y_ov, np.float64) - y_64)))
+    floor = float(np.max(np.abs(y_ref.astype(np.float64) - y_64)))
+    rows_bad = int((np.max(np.abs(np.asarray(y_ov, np.float64) - y_64),
+                           axis=-1)[0] > 1e-4).sum())
+    first_bad = int(np.argmax(np.max(np.abs(np.asarray(y_ov, np.float64) - y_64),
+                                     axis=-1)[0] > 1e-4)) if rows_bad else -1
 
     # KLD on a small fixed softmax head over the hidden dim.
     rng = np.random.default_rng(0)
@@ -201,5 +269,16 @@ def test_gdn_ov_parity(device, T):
         y_ref.reshape(-1, config.hidden_size) @ head,
         y_ov.reshape(-1, config.hidden_size) @ head,
     )
-    print(f"\n[ov-parity] device={device:<6} T={T:>3}  max-abs={max_abs:.3e}  KLD={kld:.3e}")
-    assert max_abs < 1e-5, f"OV GDN parity failed device={device} T={T}: {max_abs:.3e}"
+    ratio = d_ov64 / floor if floor > 0 else float("inf")
+    print(f"\n[ov-parity] device={device:<6} T={T:>3}  |ov-r64|={d_ov64:.4e}  "
+          f"|r32-r64|={floor:.4e}  |ov-r32|={max_abs:.4e}  ratio={ratio:.2f}x  "
+          f"KLD={kld:.3e}  rows>1e-4 {rows_bad}/{T} first={first_bad}")
+    assert floor < 1e-5, (
+        f"the f32 REFERENCE itself left the float floor ({floor:.3e}) -- the "
+        f"denominator of this gate is broken, stop before reading the emitter")
+    assert d_ov64 <= 20.0 * floor, (
+        f"OV GDN on {device} at T={T} is {ratio:.0f}x the reference's own f32 "
+        f"rounding ({d_ov64:.4e} vs {floor:.4e}); {rows_bad}/{T} rows past "
+        f"1e-4, first at row {first_bad}. GPU acceptance is distance-to-truth "
+        f"at 20x the floor -- see this cell's docstring for the measurement "
+        f"that forced the doctrine")
