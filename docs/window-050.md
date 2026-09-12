@@ -563,11 +563,60 @@ Run them in this order. Each earlier item is a control for the ones after it.
 | 1 | **1-layer boot, then depth / 4 GiB chunking** | §4.4's boot sequence at `--layers 1`, then 2, then deeper | the A770 refuses a 25,600,122,880 B object (cap 4,294,959,104 B); the B60 accepts it. Start at ONE layer: it is the cheapest shape that can carry the object-cap refusal, and a depth that boots is a control for the depth that does not | chunk the PLE table, or pull `ov::intel_gpu::hint::enable_large_allocations` and record the cost — the lever is named in §4.4 and has never been pulled |
 | 2 | **u4 compressed selection (the fill)** | `tools/repro_fc_compressed_selection.py` | `production_2d` selects a compressed primitive on both cards; `as_emitted` is the open question. **Detect on `MOECompressed` / `GatherMatmulCompressed` / `moe_3gemm_fused_compressed`, NOT `FullyConnectedCompressed`, and record the three gate terms** — see §4.5.1's RE-AIMED block | §4.5.1 below — the candidates are built to isolate it |
 | 3 | **scatter router legs** | `tests/python/test_moe_block.py` on GPU.0/GPU.1 | scatter passes on both cards, `\|dev−CPU\| ≈ 4e−07` (`RUN@be57428` §4.3) | a regression in the swap, not a new question |
-| 4 | **GDN row 65** | `tests/python/test_gdn_block.py` on both cards | first bad row 65 at every T ≥ 66, both cards (`RUN@be57428` §4.2) | unchanged: the open GDN defect, doctrine in §4.2 |
+| 4 | **GDN row 65 — FIXED IN THE EMITTER** | `tests/python/test_gdn_block.py` on both cards; `Q4E_GDN_UT_MODE=batched` reproduces the defect on demand | ~~first bad row 65 at every T ≥ 66, both cards (`RUN@be57428` §4.2)~~ → **green at every T with the default `perchunk` emission** (`RUN@61bd61a`, GPU.1: T=96/128/192/256 at 1.0–1.3× the per-run f32 floor, 0 bad rows; backbone T=96 1.038e-04 → 5.960e-08). Item 4's job is now to confirm it on **GPU.0** as well, which this seat did not run | if GPU.0 disagrees with GPU.1, the fix is card-specific and the emitter default must go back behind a device check |
 | 5 | **KLD gate vs the llama-fork reference, BOTH context regimes** | `tools/kld_harness.py` on the booted artifact, at a T **below** and a T **above** the 2051 boundary | mean per-token KL(P_ref‖P_cand) ≤ 0.0599 nats at both. The boundary is not decorative: the QSA→dense price is exactly 0.0 for T ≤ 2051 and non-zero above it (`RUN@692c0a6`, §8), so a gate run only below it has not exercised the dense rows at all | a KLD that passes below 2051 and fails above localises to the QSA→dense seam, which is the one place the price is known to change |
 | 6 | **MoE compile at short T, under the real plugin** | `tools/repro_moe_compile_short_T.py <T> GPU.N` | the CPU plugin dies on SIGSEGV at T=6 and T=8 and nowhere else; whether the CARD's plugin shares the cliff is unknown | if the card refuses the same two shapes, a short prefill is a serving constraint, not a curiosity |
 
-Item 6 is run LAST on each card because it may take the process down. Item 5
+Item 6 is run LAST on each card because it may take the process down.
+
+### 4.5.2 THE GDN ROW-65 DEFECT IS FIXED IN THE EMITTER (`RUN@61bd61a`, 2026-09-12)
+
+The multi-chunk GDN corruption that item 4 was written to re-confirm is **gone
+on GPU.1**, fixed in `tools/q4e/gdn.py` with no OpenVINO change. What changed is
+the SHAPE the ops see, never the arithmetic: the chunk axis is no longer a
+tensor axis at all but a Python loop, so no emitted op carries a live chunk
+axis. `ut_mode` / `Q4E_GDN_UT_MODE` selects among four emissions of the same
+algebra, which agree **bit-identically on CPU** (0.00e+00).
+
+| T | C | batched (RED) | perchunk (GREEN) | floor | perchunk ratio |
+|---|---|---|---|---|---|
+| 96 | 2 | 9.7893e-02 | **8.9964e-07** | 7.065e-07 | 1.3× |
+| 128 | 2 | 9.7893e-02 | **1.1901e-06** | 1.183e-06 | 1.0× |
+| 192 | 3 | 9.7893e-02 | **1.1901e-06** | 1.183e-06 | 1.0× |
+| 256 | 4 | 9.9173e-02 | **1.1901e-06** | 1.183e-06 | 1.0× |
+
+**THE ATTRIBUTION IN `~/win-050/FINDINGS` IS WRONG, and the upstream draft must
+not be filed as written.** The spike's own hypothesis was wrong in the same
+direction, which is how it was caught. De-batching *only* the unrolled
+triangular solve — `debatched`, which nearly doubles the node count and so
+demonstrably changes the graph — reproduces the corruption **bit-identically**
+(9.7893e-02, 31 rows, first row 65). And the unroll at rank 5 with the chunk
+axis live is **clean in isolation on the card** (5.520e-08, both slices). No
+isolated op reproduces the fault: not the rank-5 matmul, not `cumsum`, not the
+pairwise decay. It needs the whole rank-5 region in one graph, so it is a
+fusion/graph-context effect rather than a per-op miscompile.
+
+The drafted one-liner — *"slice index 0 is always correct and every other slice
+is deterministically wrong; batch=1 is always correct"* — is also falsified by
+the evidence already in hand: at T=64, `HV=4`, so the solve is **already batched
+four wide** and every slice is correct. Batch is not 1 in the clean case. The
+axis that matters is the chunk axis specifically.
+
+**What the fix costs**, and why it is not the serving answer: one ~1,900-op
+unroll per chunk, linear in C where the batched form was nearly flat.
+
+| T | C | batched | perchunk | ×36 GDN blocks (48-layer stack) |
+|---|---|---|---|---|
+| 256 | 4 | 2,224 | 7,750 | 80,064 → **279,000** |
+| 2048 | 32 | 3,680 | 61,062 | 132,480 → **2,198,232** |
+
+So multi-chunk **static** prefill is now correct at the shapes this window
+boots, and is still not the route at serving prefill lengths — that remains the
+chunked stateful-prefill increment. Mitigation ladder unchanged in destination,
+changed in starting point: the `T ≤ 64` restriction is lifted.
+
+Not run by this seat, and therefore open: **GPU.0** (B60) confirmation, and any
+shape with C > 4. Item 5
 needs item 1 to have produced a booted artifact; if item 1 does not boot, item
 5 does not run and says so rather than being run at a reduced geometry whose
 number would not transfer (§7.2).
