@@ -623,6 +623,27 @@ def test_the_paged_port_citations_resolve_to_the_code_they_name():
 #     means a per-port march updates the inventory cell in the same commit as
 #     each port, and a reader planning "kill one xfail per commit" should know
 #     there is one xfail here and thirteen ports.
+#
+# AND WHY THESE THIRTEEN ARE THE BOOT BLOCKER, read out of the C++ 2026-09-13,
+# because the question "can a shallow boot run before the ports exist" is worth
+# a definite answer: there is no non-paged forward to boot into.
+#
+#   * the backend compiles the served IR as `paged_model_`
+#     (backend_ov.cpp:2965) and every lane's request comes from it (:3019);
+#   * the forward at :6141-6151 sets `past_lens`, `subsequence_begins`,
+#     `block_indices`, `block_indices_begins`, `max_context_len`,
+#     `la.block_indices`, `la.block_indices_begins`, `la.past_lens` and
+#     `la.cache_interval` UNCONDITIONALLY -- nine `set_tensor` calls with no
+#     branch, which is the nine "fed" citations of this inventory;
+#   * `ov::InferRequest::set_tensor` on a name the compiled model does not
+#     declare throws. A static full-sequence IR therefore cannot be served by
+#     this path at any depth, shallow included.
+#
+# So the ports are not a refinement of a working boot; they ARE the boot. That
+# is a fact about the C++, and it is the reason the MoE-handshake gap
+# (`test_the_cpp_type_name_matcher_finds_nothing_and_the_line_is_named`) was
+# withdrawn as a blocker: it changes a log line, these change whether a forward
+# can be issued at all.
 @pytest.mark.xfail(strict=True, reason=(
     "the serving-shape IR is the STATIC full-sequence shape, not the paged "
     "one. The paged port contract (conv_state_table.N / "
