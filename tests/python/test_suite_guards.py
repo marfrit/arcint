@@ -747,40 +747,71 @@ def test_the_suite_declares_no_count_gate_outside_the_recorded_set():
 # ONE syntactic shape: a decorator. An in-body `pytest.skip()` is the same gate
 # with the same effect on the count.
 #
-# TWO THINGS ARE WIDENED, not one:
+# TWO THINGS WERE WIDENED, not one: the FORM (a `skipif` the cell carries, an
+# in-body `pytest.skip()`, a fixture named in the signature, `pytestmark`, a
+# module-level `pytest.skip(..., allow_module_level=True)`, `marks=` on one
+# parametrised id) and the GRANULARITY (the recorded set is CELLS, not file
+# names, so a second gated cell in a file already in the set moves it).
 #
-#   1. the FORM. A cell is checkout-gated if a `skipif` it carries is
-#      checkout-flavoured, OR its body calls `pytest.skip()` on a
-#      checkout-flavoured path, OR it requests a fixture in the same file that
-#      does, OR its module gates itself wholesale (`pytestmark`, or a
-#      module-level `pytest.skip(..., allow_module_level=True)`), OR a
-#      `marks=` argument carries the gate onto one parametrised id. Helper
-#      functions are followed to a fixpoint, so gating on `_in_git_worktree()`
-#      is seen wherever the helper is named.
-#      THE LAST THREE OF THOSE ARE NOT THE REVIEWER'S SHAPE. They were found
-#      by asking, before re-measuring, which OTHER ordinary spellings of the
-#      same gate this scan would still miss -- the same question the reviewer
-#      asked of the regex, asked of its replacement.
-#   2. the GRANULARITY. The recorded set is CELLS, not files. The old set
-#      compared file names, so a second gated cell added to a file already in
-#      the set -- `test_citations.py`, say -- moved the delta without moving
-#      the set. The count of gated cells IS the clone-minus-tarball delta, so
-#      that is what gets recorded.
+# ---------------------------------------------------------------------------
+# WHAT THIS SCAN PROMISES -- NARROWED TO WHAT THE CELLS PROVE (RR2-B1, REVIEW
+# b6b826b). THE PREVIOUS WORDING CLAIMED A CLASS AND DELIVERED A LIST.
+# ---------------------------------------------------------------------------
 #
-# WHAT STILL SLIPS, stated rather than implied. The scan is per-file and
-# reads `_SUITE_FILES` (the suite's test modules and any conftest), so two
-# gates cross a file boundary and are invisible to it:
+# The reviewer wrote gates in three more ordinary spellings and this scan saw
+# none of them; worse, two of the forms it DOES see, it sees because of the
+# author's choice of English. Measured, in the reviewer's runs and reproduced
+# in this session before a word of this comment was changed:
 #
-#   * a fixture defined in an IMPORTED helper module -- `q4e_device.py`, or
-#     anything under `tools/q4e/` -- that skips on the checkout's shape;
-#   * a conftest fixture that skips: the conftest IS scanned, but the cells it
-#     gates live in other files, so the gate is seen and the cells are not.
+#     S1-helper-skip         (the guard factored into a helper)   MISSED
+#     S2-usefixtures         (@pytest.mark.usefixtures("..."))    MISSED
+#     S3-getfixturevalue     (request.getfixturevalue("..."))     MISSED
+#     S4a const + skipif, reason= says "work tree"                SEEN
+#     S4b const + skipif, neutral reason                          MISSED
+#     S5b const + in-body skip, neutral reason                    MISSED
 #
-# Neither exists in the tree today -- measured, not assumed: `pytest.skip(`
-# appears in no non-test module and in no conftest (there is no conftest at
-# all). Filed as CF-CHECKOUTGATE-IMPORT, DONE-WHEN the scan resolves fixtures
-# across the import graph or the suite gains a conftest, whichever comes
-# first. "Nothing does this today" is a date, not a property.
+# S4a and S4b are the same gate with different prose. So a green from this scan
+# does NOT mean "no checkout gate was added"; it means "no gate in one of the
+# seven forms below was added". The difference is not academic and it is
+# measured: at b6b826b, with S1 applied to a real tree, THIS FILE WAS 76-GREEN
+# while the clone-minus-tarball delta was three (209/84 against 206/87).
+#
+# THE SEVEN FORMS THIS SCAN PROMISES, each one pinned by a named cell here:
+#
+#     skipif-decorator            test_the_checkout_scanner_sees_every_gate_form
+#     module-level-marker                 (same cell, its `form` ids are the
+#     param-marks                          promise -- five of the seven)
+#     in-body-skip
+#     fixture-that-skips  (named in the cell's SIGNATURE)
+#     pytestmark                  test_the_checkout_scanner_sees_a_whole_module_gate
+#     allow-module-level-skip             (same cell)
+#
+# plus two negative controls, because a false alarm gets a gate weakened and
+# then it guards nothing: a shards-gated skip, in-body and module-level, must
+# NOT be counted (test_the_checkout_scanner_ignores_a_skip_that_is_not_
+# checkout_shaped).
+#
+# EVERYTHING ELSE IS OUT OF SCOPE AND IS WRITTEN DOWN AS SUCH. The scan does
+# not follow skip CALLS through helpers (it follows the CONDITION, which is not
+# the same thing), does not resolve a fixture request that is not a signature
+# parameter, and cannot be relied on for a condition hoisted into a module
+# constant. Filed as CF-CHECKOUTGATE-FORMS, with the reviewer's three specimens
+# pasted below as live cells that assert the miss: when the scan changes, those
+# cells go red and this comment has to be rewritten with them. Class-level
+# guards are handled by the code and pinned by NO cell, so they are not
+# promised either.
+#
+# ALSO STILL OUT OF SCOPE, and older: the scan is per-file, so a fixture in an
+# IMPORTED helper module (`q4e_device.py`, anything under `tools/q4e/`) or a
+# conftest fixture gating cells in other files is invisible. Neither exists in
+# the tree today -- measured: `pytest.skip(` appears in no non-test module and
+# there is no conftest at all. That one is CF-CHECKOUTGATE-IMPORT.
+#
+# THE GUARD FAMILY IS FROZEN AT ROUND THREE (operator rule, 2026-09-13): a
+# finding that this prose is more ambitious than this scan inherits as
+# carry-forward from here and does not open a round. The narrowing above is the
+# last word the prose gets; the next word belongs to the code, under
+# CF-CHECKOUTGATE-FORMS.
 
 _CHECKOUT_STRINGS = (
     "ls-files", "is-inside-work-tree", "rev-parse", "--git-dir", ".git",
@@ -979,6 +1010,12 @@ def checkout_shaped_gated_cells(source, filename="<string>"):
 # gap K2 was asked to reconcile. Then REVIEW fe68342 (B3) showed that a set of
 # FILE NAMES policed by a decorator regex cannot keep the promise its docstring
 # made: a third gated cell written as an in-body `pytest.skip()` left it green.
+# Then REVIEW b6b826b (RR2-B1) showed the cell-level ast scan could not keep ITS
+# docstring's promise either -- three more spellings walked past it. THE THIRD
+# CORRECTION IS A NARROWING, NOT A WIDENING: the scan stayed as it is and the
+# promise came down to it, with the missed forms pasted in as live cells. That
+# was the operator's classification of the two options, not the author's
+# preference.
 _CHECKOUT_GATED_CELLS = frozenset({
     "test_citations.py::test_every_resolvable_citation_points_at_a_line_that_exists",
     "test_window_manifest.py::test_every_named_sha_resolves_to_a_commit",
@@ -986,16 +1023,26 @@ _CHECKOUT_GATED_CELLS = frozenset({
 
 
 def test_the_checkout_shaped_gates_are_exactly_the_recorded_cells():
-    """The non-env gate, pinned to the CELLS that have it.
+    """The non-env gate, pinned to the CELLS that have it, IN THE SEVEN FORMS
+    THE SPECIMEN CELLS PROVE -- and no wider than that.
 
     A cell gated on a git work tree skips in a tree with no `.git` -- which is
     what a `git archive` extract is. That is legitimate, but the SET of such
     cells must be closed, because their number is the whole difference between
-    a clone reading and a tarball reading of the same commit. A third one
-    appearing silently would make the recorded env matrix wrong without
-    anything going red -- and that is now true of a gate written in the body of
-    a cell, which is how the reviewer proved the previous version of this cell
-    did not mean it.
+    a clone reading and a tarball reading of the same commit.
+
+    WHAT A GREEN HERE MEANS, exactly: no cell written in one of the seven forms
+    listed in this section's header has joined the recorded set. It does NOT
+    mean the recorded delta is still two. A gate whose skip sits in a helper, or
+    whose fixture is requested by `usefixtures` or `getfixturevalue`, passes
+    this cell -- measured at b6b826b, where the reviewer's S1 specimen left this
+    file 76-green while the clone-minus-tarball delta was three. Those forms are
+    CF-CHECKOUTGATE-FORMS and are pinned as misses by
+    `test_cf_checkoutgate_forms_records_the_gates_this_scan_does_not_see`.
+
+    So this cell is a tripwire on seven spellings, not a proof about the delta.
+    The delta itself is established by MEASUREMENT -- the clone and tarball rows
+    of the recorded matrix -- and that is the only thing that establishes it.
 
     Parametrised cells would break the cell-count-equals-delta identity (one
     cell, many ids); none of the recorded ones is parametrised, and a new one
@@ -1208,3 +1255,155 @@ def test_the_checkout_scanner_finds_the_two_recorded_cells_by_name():
         path = REPO_ROOT / "tests" / "python" / base
         found = checkout_shaped_gated_cells(path.read_text(), str(path))
         assert f"{base}::{cell}" in found, (base, found)
+
+
+# ---------------------------------------------------------------------------
+# CF-CHECKOUTGATE-FORMS -- the gates this scan does not see, as live cells.
+#
+# OPENED BY REVIEW b6b826b (RR2-B1). The finding was that the scan's coverage
+# was a list of spellings while its docstring claimed a class, and that two of
+# the spellings it did catch, it caught by reading English: S4a (`reason=` says
+# "work tree") was seen and S4b (the same gate, neutral reason) was not.
+#
+# The three specimens below are the reviewer's, pasted verbatim in substance.
+# They are NOT aspirational: each one asserts that the scan MISSES it, which is
+# the true statement today and is therefore the honest one. Their value is that
+# the miss is now pinned. The day the scan learns a form, its cell goes red, and
+# whoever taught it has to come here, move the form into the promise list in
+# this section's header, and say so -- which is exactly the coupling that was
+# absent when a docstring could promise a class for free.
+#
+# DONE-WHEN (the repair, specified by the review, not invented here):
+#   a) follow skip CALLS through helpers to a fixpoint, with the machinery that
+#      already follows the condition -- not a parallel scanner;
+#   b) resolve fixture requests structurally: signature parameters,
+#      `usefixtures`, `request.getfixturevalue(...)` string literals, and
+#      indirect parametrisation;
+#   c) resolve a condition hoisted into a module constant (one assignment hop).
+# Each repair lands with its specimen promoted from this table to the promise.
+#
+# NOT IN THIS CF, and named so the ceiling is not mistaken for the whole story:
+# dynamic skips (`getattr(pytest, "sk" + "ip")`), gating inside `exec`, and
+# plugin- or conftest-level gating are unreachable by any static per-file scan
+# and are not on the DONE-WHEN. CF-CHECKOUTGATE-IMPORT holds the cross-file
+# fixture case.
+# ---------------------------------------------------------------------------
+
+_CF_S1_HELPER_SKIP = '''
+import subprocess
+import pytest
+def _in_git_worktree():
+    return subprocess.run(["git", "rev-parse", "--is-inside-work-tree"]).returncode == 0
+def _require_git():
+    if not _in_git_worktree():
+        pytest.skip("needs a git work tree")
+def test_one():
+    _require_git()
+    assert True
+'''
+
+_CF_S2_USEFIXTURES = '''
+import subprocess
+import pytest
+@pytest.fixture()
+def tracked_sources():
+    r = subprocess.run(["git", "ls-files"], capture_output=True, text=True)
+    if r.returncode != 0:
+        pytest.skip("no index")
+    return r.stdout.split()
+@pytest.mark.usefixtures("tracked_sources")
+def test_one():
+    assert True
+'''
+
+_CF_S3_GETFIXTUREVALUE = '''
+import subprocess
+import pytest
+@pytest.fixture()
+def tracked_sources():
+    r = subprocess.run(["git", "ls-files"], capture_output=True, text=True)
+    if r.returncode != 0:
+        pytest.skip("no index")
+    return r.stdout.split()
+def test_one(request):
+    files = request.getfixturevalue("tracked_sources")
+    assert files
+'''
+
+# (specimen id, why this spelling is ordinary rather than contrived, source)
+_CF_CHECKOUTGATE_FORMS = (
+    ("S1-helper-skip",
+     "the three-line guard factored into a helper, which is what anyone does "
+     "on the second cell that needs it. The scan follows the CONDITION through "
+     "helpers and not the SKIP CALL, so the cell looks unguarded",
+     _CF_S1_HELPER_SKIP),
+    ("S2-usefixtures",
+     "the standard spelling when a cell wants a fixture's effect and not its "
+     "value. Fixture gating keys on the signature, and usefixtures puts the "
+     "name in a decorator string instead. NOTE the fixture here is called "
+     "`tracked_sources`: with a name containing `worktree` the old scan "
+     "happened to catch it, which is the S2/S2b pair the review used to show "
+     "that the green carried no information",
+     _CF_S2_USEFIXTURES),
+    ("S3-getfixturevalue",
+     "the fixture requested by name at run time through `request`, invisible "
+     "to any signature scan and legitimate in a cell that decides which "
+     "fixture it needs",
+     _CF_S3_GETFIXTUREVALUE),
+)
+
+
+def _scan(source, form):
+    """One entry point for both cells below, so the negative assertions in the
+    CF cell and the non-vacuity check exercise the same code path."""
+    return checkout_shaped_gated_cells(source, f"<{form}>.py")
+
+
+@pytest.mark.parametrize("form,why,source", _CF_CHECKOUTGATE_FORMS,
+                         ids=[f for f, _, _ in _CF_CHECKOUTGATE_FORMS])
+def test_cf_checkoutgate_forms_records_the_gates_this_scan_does_not_see(
+        form, why, source):
+    """CF-CHECKOUTGATE-FORMS, held open by an assertion instead of by a note.
+
+    Each specimen is a real checkout gate that this scan does not report. The
+    cell asserts the MISS, so the limitation is a measured fact in the tree
+    rather than a sentence in a design document, and so that teaching the scan
+    one of these forms cannot happen quietly: the cell reds, and the promise
+    list in this section's header must be updated in the same commit.
+
+    The miss is not hypothetical and not new here -- at b6b826b, S1 applied to
+    a real tree left this file 76-green while the clone-minus-tarball delta was
+    three (209 passed / 84 skipped against 206 / 87).
+    """
+    assert why.strip(), form
+    seen = _scan(source, form)
+    assert seen == [], (
+        f"{form} is recorded in CF-CHECKOUTGATE-FORMS as a gate this scan does "
+        f"NOT see, and the scan now reports {seen}. That is progress and it is "
+        f"not free: move this form into the promise list in this section's "
+        f"header, state which repair (a/b/c of the DONE-WHEN) landed, and delete "
+        f"this specimen from _CF_CHECKOUTGATE_FORMS -- the promise and the cells "
+        f"are supposed to be the same artifact.")
+
+
+def test_the_cf_specimen_assertions_are_not_vacuous():
+    """The negative cell above must be able to fail.
+
+    A cell asserting `== []` passes trivially if the scanner is broken, if the
+    specimen does not parse, or if the source is empty. So: the SAME `_scan`
+    path, fed the one form this scan does catch, must report it. If this cell
+    ever goes red, the CF cell above is meaningless and neither can be
+    believed.
+    """
+    control = '''
+import pytest
+def _in_git_worktree():
+    return False
+def test_one():
+    if not _in_git_worktree():
+        pytest.skip("needs a git work tree")
+    assert True
+'''
+    assert _scan(control, "CONTROL-in-body") == ["<CONTROL-in-body>.py::test_one"]
+    for form, _, source in _CF_CHECKOUTGATE_FORMS:
+        assert ast.parse(source), form
