@@ -95,6 +95,10 @@ _T = 8
 # exactly the `<layer ... type="...">` attribute. D is the widest form the
 # claim could take and it also holds. The negative is stronger than 198b736
 # stated it: 0 of 172, not 0 of 52.
+#
+# RE-MEASURED A THIRD TIME, 2026-09-13, independently, when a brief named this
+# gap a hard blocker: A -> 52, B -> 172, C -> 0, D -> 0. Same four figures, same
+# commands. The zero is now three readings old and has never moved.
 FLEET_IRS_SIZE_FILTERED = 52          # population A, 198b736's own
 FLEET_IRS_ALL = 172                   # population B, the wider one
 FLEET_IRS_WITH_MOE_TYPED_OP = 0       # C, and D too
@@ -344,8 +348,39 @@ def test_the_cpp_type_name_matcher_finds_nothing_and_the_line_is_named(built):
     creates such a node is a GPU-plugin COMPILE-time pass; this function runs
     on `read_model`.
 
+    WHY NO EMITTER CAN CLOSE THIS, measured in the plugin source 2026-09-13
+    rather than inferred, because a brief proposed closing it from the export
+    side as a hard blocker:
+
+      * the op types whose names contain "moe" are `MoeOp` and
+        `MoeOpWithRouting`, and they are PRODUCED, not read. The chain is named
+        in one line of the plugin's own pipeline --
+        `transformations_pipeline.cpp:644`: "MOE: TiledMoeBlock ->
+        GatherMatmuls(compressed) -> MoeOp(compressed) ->
+        MoeOpWithRouting(compressed)" -- registered at :654 as
+        `ov::pass::ConvertTiledMoeBlockToGatherMatmuls`, inside
+        `compile_model`.
+      * `TiledMoeBlock` IS NOT AN OP. `grep -rn 'OPENVINO_OP("TiledMoeBlock'`
+        over the whole plugin tree returns nothing: it is the name of a
+        PATTERN (the tiled dequant chain this file already asserts --
+        Convert/Subtract/Multiply/Reshape/MatMul), matched by a `MatcherPass`.
+        There is no class in any opset for an exporter to instantiate.
+
+    So the demand at :585 is not a contract an exporter can satisfy in
+    principle, and emitting something to satisfy it would mean inventing a type
+    name for a log line. The route that CAN work is the pattern matcher
+    (`slot_pool_from_tiled_ir`, below, and the C++ change it implies), and it
+    is worth exactly what the nullopt path costs -- which is nothing:
+
     Asserted, not lamented: the analytic route is nullopt here, so
     backend_ov.cpp:3746+ config.json fallback is what prices the host ledger.
+    THAT LEDGER LINE IS INFORMATIONAL. backend_ov.cpp:3729-3734 says so in the
+    source -- "Host-side ledger (GTT): informational, never charged against the
+    device budget" -- and the device term is priced by the plateau probe
+    (:3631+), with the analytic figure used only if the probe throws. Nothing
+    in the load path refuses an IR for lacking a moe-typed op: `grep -n
+    'throw\\|log::error' src/exec/backend_ov.cpp | grep -iE 'moe|expert'` is
+    empty. A missing moe-typed op is a `source: config` log line, not a gate.
     """
     model, _, _ = built
     cfg = pwe.real_config()
@@ -572,6 +607,22 @@ def test_the_paged_port_citations_resolve_to_the_code_they_name():
         f"sites moved and the split above is no longer the document's")
 
 
+# WHAT THE PAGED GAP IS, COUNTED -- because a brief described it as "the 13
+# strict-xfails" and that is not the shape of it (measured 2026-09-13: the whole
+# suite carries TWO `xfail(strict=True)` decorators, one here and one in
+# test_moe_block.py, and every matrix row reads `2 xfailed`):
+#
+#   * THIRTEEN PORTS, in `_PAGED_PORTS`, each citation resolved from an anchor
+#     at import -- 4 classified at backend_ov.cpp:3191-3199, 9 fed at :6141-6151.
+#   * ONE strict xfail over all thirteen: `test_the_paged_port_contract_is_
+#     satisfied` is all-or-nothing, so it retires on the commit that lands the
+#     LAST port, not the first.
+#   * AND `test_the_paged_gap_is_inventoried_precisely` asserts every one of the
+#     thirteen is still absent. So THE FIRST PORT THAT LANDS REDS THAT CELL.
+#     That is deliberate -- it is the "promote instead of forget" rule -- but it
+#     means a per-port march updates the inventory cell in the same commit as
+#     each port, and a reader planning "kill one xfail per commit" should know
+#     there is one xfail here and thirteen ports.
 @pytest.mark.xfail(strict=True, reason=(
     "the serving-shape IR is the STATIC full-sequence shape, not the paged "
     "one. The paged port contract (conv_state_table.N / "
