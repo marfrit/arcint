@@ -23,6 +23,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 using namespace lgc;
 
