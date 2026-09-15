@@ -289,7 +289,7 @@ curl -sSN "${BASE}/v1/chat/completions" -H 'Content-Type: application/json' \
   --next -sSN "${BASE}/v1/chat/completions" -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"b"}],"temperature":0,"stream":true}' -o /dev/null \
   -v 2>"${WORK}/keepalive.log"
-if grep -q 'Re-using existing' "${WORK}/keepalive.log" && \
+if grep -Eq 'Re-?using existing' "${WORK}/keepalive.log" && \
    ! grep -q 'shutting down connection' "${WORK}/keepalive.log"; then
   pass "streaming keeps the connection alive for the next request"
 else
