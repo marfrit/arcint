@@ -1062,3 +1062,49 @@ are on the persistent paths named above. The one-layer MoE block's
 absolute `max_abs`/`mean_abs` are the stable reading. No acceptance row
 moves on this leg: `window-052.md`'s speed row is untouched, V1 stands, and
 the ratio-75 point stays a sweep point, not a gate.
+
+- 2026-09-24 (dated append — operator backlog: the fully-resident NATIVE route
+does not exist) — prompted by the operator's question whether a fully-on-GPU
+MoE option still exists. Verified in the dev branch:
+
+  * The percentage range is **[0, 100]** (`code`: `src/config.cpp:849`,
+    `--offload-ratio must be a percentage in [0, 100]`). `--offload-ratio 0` is
+    therefore accepted, and omitting the flag leaves the default 0; both mean
+    **every expert resident on the card**. The fully-on-GPU path EXISTS for the
+    fused path: it is the default when the flag is omitted (`code`:
+    `src/config.h:149`, `offload_ratio = 0`), and it is what the deployed MoE
+    coder unit runs — the other deployed unit is dense and has no MoE at all;
+    both omit the flag.
+  * `--moe-cpu-tier` with ratio 0 is refused by design (`code`:
+    `src/config.cpp:862`): the host tier would have nothing to compute.
+  * **The gap** (`code`): for the NATIVE formats there is no fully-resident
+    configuration at all. Patch 0043 asserts
+    (`contrib/packaging/marfrit-openvino/patches/0043-*:726-729`)
+    `OPENVINO_ASSERT(!native || (_cpu_tier && _weight_provider->is_offloaded()),
+    "native expert formats (IQ4_NL / IQ3_XXS) need OFFLOAD_RATIO in (0, 100)
+    and MOE_CPU_TIER=YES …")`. The **ratio-0 half is verifiable in-tree**: at
+    ratio 0 arcint never sets the property, so the provider is not offloaded and
+    the native tensors have no reader on the fused path. The **ratio-100 half
+    rests on the assert's own message string**, not on a condition evaluable in
+    this tree — recorded as such rather than asserted.
+  * Root cause is plumbing, not the assert: arcint sets the plugin's
+    `OFFLOAD_RATIO` property only when the ratio is `> 0` (`code`:
+    `src/exec/backend_ov.cpp:1183`, `:1224`), so at ratio 0 the provider is
+    never marked offloaded and the native tensors have no reader on the fused
+    path. The assert is the symptom.
+
+  **Lever (backlog).** Give the slot pool an all-resident configuration:
+ratio-0 semantics = `n` resident device slots, provider offloaded, NO host
+tier. Gate: serve a native-format MoE with every expert resident on the GPU and
+measure decode rate plus repeat determinism — byte-identity is against its OWN
+configuration, because the native route is NOT bit-identical to the host tier
+(DESIGN §7.0.2cf). Owner: this campaign's step 3, the resident-compute path the
+VENICE speed row is held on. Evidence class: `code` for both guards;
+`measured-here` for the cost of the tier route itself
+(`docs/benchmark-served-services.md`, 2026-09-24: the coder's `--moe-cpu-tier`
+arms at R = 99 and R = 75 lose 66–99 % of decode/prefill and move the answer
+digests, with the resident share deciding whether they diverge).
+
+  **Graduation rule:** recorded as a lever here because the owner is this
+campaign's native route; if it grows a gate of its own (a served acceptance),
+the campaign rules say it becomes its own document.
