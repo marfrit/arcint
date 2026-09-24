@@ -1167,3 +1167,17 @@ the campaign rules say it becomes its own document.
     tier (a campaign-sized change, not a leg), or (b) name a different target;
     the Flash-Next native artifact already carries IQ3_XXS/IQ4_NL experts and
     its open lever is the fully-resident configuration.
+- 2026-09-24 (IQ3_XXS leg, dated append — the operator decision and the IQ2_S
+  decoder) — Operator decision on the blocked conversion: **port the
+  serving-shape emitter to `qwen3_5_moe` and add an IQ2_S native decode**.
+  Design note: `docs/design-qwen35moe-serving-shape.md`. Landed this session:
+  `q4e.native_blocks.iq2_s_split` / `iq2_s_decode` + the 1024-entry
+  `iq2s_grid`, red-first cells (`tests/python/test_native_blocks.py`),
+  bit-exact against gguf-py on the real shard — `blk.0.ffn_gate_exps.weight`
+  and `blk.0.ffn_up_exps.weight`, two experts, every row, **max|diff| 0.0**.
+  The hand-built cell is mutation-sensitive: moving the sign bytes into the
+  low-index region flips its sign assertion red. Evidence class `code`
+  (llama.cpp `dequantize_row_iq2_s`) + `measured-here` (the gguf-py oracle).
+  OWED: the plugin `kWeightFormatIq2S` + pattern/tier/OCL (design note §4),
+  the `qwen3_5_moe` emitter (design note §5), the full-depth export, and the
+  A770 window (gate, design note §6).

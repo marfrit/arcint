@@ -95,9 +95,64 @@ def test_q8_0_split_and_decode_on_a_hand_built_block():
     assert np.array_equal(y[0, 32:], qs.astype(np.float32) * np.float32(-2.0))
 
 
+def test_iq2_s_split_and_decode_on_a_hand_built_block():
+    # one 256-value block, d = 1.0. ib32 = 0: low indices [0, 1, 2, 3], sign
+    # bytes [0x00, 0xFF, 0, 0], qh = 0x01, scales[0] = 0x0F.
+    #   l=0: idx = 0 | ((0x01 >> 0) & 3) << 8 = 256, scale low nibble 15
+    #   l=1: idx = 1 | ((0x01 >> 2) & 3) << 8 = 1,   sign 0xFF -> all negative
+    #   l=2: idx = 2, l=3: idx = 3                    scale high nibble 0
+    # scales are lo, lo, hi, hi per 32-value sub-block: 3.875 then 0.125.
+    block = np.zeros(82, np.uint8)
+    block[0:2] = _f16_bytes(1.0)
+    block[2:34].reshape(8, 4)[0] = [0, 1, 2, 3]
+    block[34:66].reshape(8, 4)[0] = [0x00, 0xFF, 0, 0]
+    block[66:74][0] = 0x01
+    block[74:82][0] = 0x0F
+    gridix, signix, scales = nb.iq2_s_split(block[None, :])
+    assert gridix.shape == (1, 32) and gridix.dtype == np.uint16
+    assert signix.shape == (1, 32) and signix.dtype == np.uint8
+    assert scales.shape == (1, 32) and scales.dtype == np.float32
+    assert [int(x) for x in gridix[0, :4]] == [256, 1, 2, 3]
+    assert int(signix[0, 1]) == 0xFF
+    assert scales[0, 0] == np.float32(3.875) and scales[0, 2] == np.float32(0.125)
+    y = nb.iq2_s_decode(gridix, signix, scales)
+    assert np.array_equal(y[0, 0:8], nb.IQ2S_GRID[256].astype(np.float32) * np.float32(3.875))
+    assert np.array_equal(y[0, 8:16], -nb.IQ2S_GRID[1].astype(np.float32) * np.float32(3.875))
+    assert np.array_equal(y[0, 16:24], nb.IQ2S_GRID[2].astype(np.float32) * np.float32(0.125))
+    assert np.array_equal(y[0, 24:32], nb.IQ2S_GRID[3].astype(np.float32) * np.float32(0.125))
+
+
 def test_every_split_has_its_block_geometry_and_decode():
-    assert set(nb.SPLIT) == set(nb.BLOCK_BYTES) == set(nb.DECODE) == {"IQ4_NL", "IQ3_XXS", "IQ4_XS", "Q8_0"}
-    assert nb.BLOCK_BYTES == {"IQ4_NL": (32, 18), "IQ3_XXS": (256, 98), "IQ4_XS": (256, 136), "Q8_0": (32, 34)}
+    assert set(nb.SPLIT) == set(nb.BLOCK_BYTES) == set(nb.DECODE) == {
+        "IQ4_NL", "IQ3_XXS", "IQ2_S", "IQ4_XS", "Q8_0"}
+    assert nb.BLOCK_BYTES == {"IQ4_NL": (32, 18), "IQ3_XXS": (256, 98),
+                             "IQ2_S": (256, 82), "IQ4_XS": (256, 136),
+                             "Q8_0": (32, 34)}
+
+
+@_skip
+@pytest.mark.parametrize("name", ["blk.0.ffn_gate_exps.weight",
+                                  "blk.0.ffn_up_exps.weight"])
+def test_iq2_s_split_decodes_the_real_shard_exactly_as_gguf_py_does(feed, name):
+    """IQ2_S, the format the 35B-A3B UD-IQ3_XXS file ships its gate/up experts
+    in: gguf-py's own dequantize of the same bytes, every row of two experts.
+    The other formats are pinned by the test above; this one skips when the
+    gated shards are the Flash-Next checkpoint (whose gate/up are IQ3_XXS)."""
+    if feed.gguf_type(name) != "IQ2_S":
+        pytest.skip(f"{name} is {feed.gguf_type(name)}, not IQ2_S for these shards")
+    raw = feed.raw_rows(name, rows=2)
+    ref = np.asarray(feed.dequant(name, rows=2), np.float32)
+    E, out, row_bytes = raw.shape
+    parts = nb.SPLIT["IQ2_S"](raw.reshape(E * out, row_bytes))
+    y = nb.DECODE["IQ2_S"](*parts).reshape(E, out, -1)
+    assert y.shape == ref.shape, (y.shape, ref.shape)
+    d = np.abs(y - ref)
+    print(f"\n[iq2-s] {name}: rows {E * out}, max|diff| {d.max():.3e}, exact {np.array_equal(y, ref)}")
+    assert np.array_equal(y, ref), f"{name}: max|diff| {d.max():.3e}"
+    gridix, signix, scales = parts
+    assert gridix.shape == (E * out, ref.shape[-1] // 8)
+    assert signix.shape == (E * out, ref.shape[-1] // 8)
+    assert scales.shape == (E * out, ref.shape[-1] // 8)
 
 
 @pytest.fixture(scope="module")
@@ -117,7 +172,10 @@ def test_the_split_decodes_the_real_shard_exactly_as_gguf_py_does(feed, name, fm
     bytes. Two experts, every row. The split is a byte re-arrangement, so the
     decode must land on gguf-py's f32 to float rounding, not to a tolerance
     that could hide a wrong table or a swapped nibble."""
-    assert feed.gguf_type(name) == fmt
+    assert feed.gguf_type(name) in nb.SPLIT, (
+        f"{name} is {feed.gguf_type(name)}, not a format this module splits")
+    if feed.gguf_type(name) != fmt:
+        pytest.skip(f"{name} is {feed.gguf_type(name)}, not {fmt} for these shards")
     raw = feed.raw_rows(name, rows=2)                      # [2, out, row_bytes]
     ref = np.asarray(feed.dequant(name, rows=2), np.float32)   # [2, out, in]
     E, out, row_bytes = raw.shape
