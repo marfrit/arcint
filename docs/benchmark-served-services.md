@@ -1,13 +1,10 @@
 # benchmark-served-services — packaged 0.5.0 vs the qfndev tip, two deployed services
 
-Recorded 2026-09-24 from one card window, then corrected the same day when the
-operator's direct answers to the arm-design questions arrived. Protocol, exact
-flags, raw rows, deltas and caveats for eight served sessions: the two deployed
-services, each run as a direct invocation of a single `arcint` process (the
-deployment units stayed disabled and stopped throughout), under the packaged
-binary and under the qfndev tip, plus the configuration-delta arms the
-operator ordered — and two earlier delta arms retained because they were
-already measured (see §4b).
+Recorded 2026-09-24 from one card reservation (three sampling windows). Protocol, exact flags, raw rows,
+deltas and caveats for ten served sessions: the two deployed services, each
+run as a direct invocation of a single `arcint` process (the deployment units
+stayed disabled and stopped throughout), under the packaged binary and under
+the qfndev tip, plus the configuration-delta arms named in §3a.
 
 Every measured value below is `measured-here`. Dispositions of fact carry
 `paper` / `code` / `measured-here`; the flag-applicability dispositions are
@@ -46,6 +43,8 @@ by PCI id, never by number (`docs/sop-card-window.md` §2). Classes are `code`
 - **Extension-vs-cold labelling**: the server's prefill line counts the whole
   prompt, including the cached part. The extension figures here are
   `prompt_tokens − cache_hit_tokens` over the printed prefill wall time.
+- **Repeat discipline**: the coder R = 75 arm was run **twice** (two fresh
+  sessions, §4), because its answer-digest claim is load-bearing.
 - **Instrument hygiene** (`docs/sop-card-window.md`): a physical-host sampler
   started before the leg (2 s interval: `MemAvailable`, `Shmem`, ZFS ARC,
   leg `VmRSS`, `drm-resident-vram0`, `drm-resident-gtt`) with a `MemAvailable
@@ -81,17 +80,23 @@ after the `--cache-dir` path (operator-local, omitted):
 
 - **C-P** = the above, packaged binary, installed plugin.
 - **C-Q0** = the above, qfndev binary, `ov-0049` (via `LD_LIBRARY_PATH`). This
-  is the operator-requested isolated binary/plugin arm.
-- **C-D-ratio-99** = C-Q0 + `--offload-ratio 99 --moe-cpu-tier` (the
-  operator's direct answer).
+  is the isolated binary/plugin arm.
+- **C-D-ratio-75** = C-Q0 + `--offload-ratio 75 --moe-cpu-tier` — **primary
+  configuration delta**, two fresh sessions (a, b).
+- **C-D-ratio-99** = C-Q0 + `--offload-ratio 99 --moe-cpu-tier` — retained in
+  the appendix (§4b) because it is the arm that diverges at every depth.
 
 `code`: `--moe-cpu-tier` is refused without `--offload-ratio` — the engine's
 own guard (`src/config.cpp`) reads *"--moe-cpu-tier needs --offload-ratio > 0:
 with every expert resident there is nothing for the host tier to compute"*.
 `measured-here`: the bare flag on the coder flags exits `2` with exactly that
-message (captured in the packet), so the ratio the operator names is the only
-way it becomes applicable. **R = 99** is the percentage OFF the card, so the resident share is
-`ceil(184·(100−99)/100) = 2` experts per layer (`code`: `src/exec/fit.h`).
+message (captured in the packet). **R is the percentage OFF the card**, so the
+resident share is `ceil(184·(100−R)/100)` (`code`: `src/exec/fit.h`): **46 of
+184** experts per layer at R = 75, **2 of 184** at R = 99. These are the
+config-side ceiling budget the engine reserves (`code`: fit.h states the
+formula is the repository's ceiling fallback pending an on-card audit of the
+plugin's own rounding), and they match the printed `expert slots host-side`
+figures; they are the config-side budget, not an audited plugin partition.
 
 **Service D (dense agent, port 8087, B60 / `GPU.0`)**, the unit's flags exactly
 after the `--cache-dir` path:
@@ -106,31 +111,29 @@ after the `--cache-dir` path:
 ```
 
 - **D-P** = the above, packaged binary, installed plugin.
-- **D-Q0** = the above, qfndev binary, `ov-0049`. This is the
-  operator-requested isolated binary/plugin arm. The operator decided
-  **keep the unit's `i8:u8`** — no `--paged-kv u8` is added.
+- **D-Q0** = the above, qfndev binary, `ov-0049`. This is the isolated
+  binary/plugin arm.
 - **D-mtp** = D-Q0 with `--mtp off` (DESIGN §7.0.2ag measures MTP as a loss on
   the dense agent: a 390 ms cycle against a 130 ms break-even at depth).
+- **D-kv** = D-Q0 with `--paged-kv u8` replacing the unit's `i8:u8` —
+  **first-class configuration delta**.
 
-### 3a. Provenance of the arm design (two operator inputs)
+Note the dense unit does **not** lack a paged-KV spec: it carries the
+asymmetric `i8:u8` (K `i8`, V `u8`). D-kv is therefore a labelled
+configuration delta, not a fork difference.
 
-The arm set was named in two steps, and the record keeps both because they
-disagree on one arm:
+### 3a. Arm-design provenance
 
-- A reviewer-relayed ruling named coder **R = 75** and a dense
-  **`--paged-kv u8` override**; those two arms (C-D-ratio-75, D-kv) were run.
-  The relayed ruling also named **D-mtp** (`--mtp off`); it stays in the
-  operator's set because the direct answers did not contradict it.
-- The operator's direct answers to the arm-design questions then arrived:
-  coder **ratio 99**, dense **keep the unit's `i8:u8`**, isolated arms **yes,
-  both models**. These supersede the relayed ruling.
-
-The record therefore executes R = 99 and keep_unit, and retains the two
-superseded arms in §4b rather than dropping measured data.
+*Operator ruling relayed 2026-09-24 — R = 75 primary, KV variant first-class,
+R = 99 retained in the appendix.* An interim arm set (R = 99 primary, dense
+keeping `i8:u8`) was executed in the same window before the ruling; the
+relayed ruling supersedes it. The interim arms are not deleted: D-kv becomes
+first-class here because it was already measured, and C-D-ratio-99 stays in
+the appendix because it is the arm that diverges at every depth.
 
 ## 4. Results — service C, coder, A770 (digests admissible)
 
-All raw `slot 0` lines are in §7. Derived extension rate =
+Main-table raw `slot 0` lines are in §7. Derived extension rate =
 `(prompt − hit) / prefill_s`.
 
 | arm | T_boot s | depth | prompt tok | cache-hit tok | ext tok | prefill s | ext prefill t/s | TTFT s | decode t/s | served digest |
@@ -141,9 +144,12 @@ All raw `slot 0` lines are in §7. Derived extension rate =
 | C-Q0 | 77.767 | 1 | 1 | 0 | 1 | 0.48 | 2.1 | 0.763 | 34.4 | `0edc8dd7e703` |
 | C-Q0 | | 4096 | 4096 | 0 | 4096 | 2.97 | 1379.1 | 2.970 | 43.9 | `709556a93505` |
 | C-Q0 | | 16384 | 16384 | 3072 | 13312 | 11.01 | 1209.1 | 11.010 | 42.4 | `d8d45653ff32` |
-| C-D-ratio-99 | 580.378 | 1 | 1 | 0 | 1 | 0.60 | 1.7 | 0.809 | 1.1 | `f732f7fce8be` |
-| C-D-ratio-99 | | 4096 | 4096 | 0 | 4096 | 374.59 | 10.9 | 374.591 | 14.8 | `2c2c31439df7` |
-| C-D-ratio-99 | | 16384 | 16384 | 2048 | 14336 | 1187.47 | 12.1 | 1187.476 | 11.9 | `e458e88df4d8` |
+| C-D-ratio-75a | 544.353 | 1 | 1 | 0 | 1 | 0.61 | 1.6 | 0.802 | 1.3 | `0edc8dd7e703` |
+| C-D-ratio-75a | | 4096 | 4096 | 0 | 4096 | 306.35 | 13.4 | 306.351 | 7.3 | `709556a93505` |
+| C-D-ratio-75a | | 16384 | 16384 | 2048 | 14336 | 916.92 | 15.6 | 916.926 | 7.2 | `460dee9d6d7c` |
+| C-D-ratio-75b | 546.325 | 1 | 1 | 0 | 1 | 0.53 | 1.9 | 0.726 | 1.4 | `0edc8dd7e703` |
+| C-D-ratio-75b | | 4096 | 4096 | 0 | 4096 | 305.42 | 13.4 | 305.421 | 7.2 | `709556a93505` |
+| C-D-ratio-75b | | 16384 | 16384 | 2048 | 14336 | 914.35 | 15.7 | 914.353 | 7.3 | `460dee9d6d7c` |
 
 **P→Q0 (fork + plugin), coder.** Extension prefill: 1383.8 → 1379.1 t/s
 (−0.3 %) at 4096 and 1211.3 → 1209.1 t/s (−0.2 %) at 16384. Decode:
@@ -152,41 +158,65 @@ All raw `slot 0` lines are in §7. Derived extension rate =
 noise. `T_boot` 79.3 → 77.8 s. The served digests are equal at all three
 depths.
 
-**Q0→C-D-ratio-99 (configuration), coder.** Extension prefill:
-1379.1 → 10.9 t/s (−99.2 %) at 4096 and 1209.1 → 12.1 t/s (−99.0 %) at
-16384. Decode: 34.4 → 1.1 t/s (−96.8 %) at 1, 43.9 → 14.8 (−66.3 %) at 4096,
-42.4 → 11.9 (−71.9 %) at 16384. `T_boot` 77.8 → 580.4 s (×7.5).
-**The served digest differs from C-P/C-Q0 at every depth**
-(`f732f7fce8be`, `2c2c31439df7`, `e458e88df4d8`): at R = 99 the CPU tier
-carries essentially every routed expert, and the route is not
-answer-equivalent to the resident route even at the 1-token start. This is
-the static-partition/CPU-tier answer-dependence class already on this record
-(`docs/campaigns/expert-hot-set-lru.md`, `docs/campaigns/sub4bit-vram-kernel.md`),
-now shown at R = 99 to be present from the first token.
+**Q0→C-D-ratio-75 (configuration, primary), coder.** The two fresh sessions
+agree on the three digests and within run noise on the rates:
 
-The 580.4 s `T_boot` needs its own sentence: the load line says *"language
-model ready in 22.1 s (paged)"*, but `/props` became ready only at 580.4 s.
-The gap is the distinct-token plateau probe, which runs forwards through the
-CPU tier at R = 99; **`T_boot` here is probe-dominated, not
-compile-dominated** (`measured-here`: the probe line follows the ready line in
-`server.err`; `code`: the whole load sequence completes before
-`http: listening`).
+| quantity | run a | run b | vs C-Q0 |
+|---|---|---|---|
+| T_boot s | 544.353 | 546.325 | ×7.0 |
+| ext prefill t/s @ 4096 | 13.4 | 13.4 | −99.0 % |
+| ext prefill t/s @ 16384 | 15.6 | 15.7 | −98.7 % |
+| decode t/s @ 1 / 4096 / 16384 | 1.3 / 7.3 / 7.2 | 1.4 / 7.2 / 7.3 | −96 / −83 / −83 % |
+| digest @ 1 | `0edc8dd7e703` | `0edc8dd7e703` | **equal to C-Q0** |
+| digest @ 4096 | `709556a93505` | `709556a93505` | **equal to C-Q0** |
+| digest @ 16384 | `460dee9d6d7c` | `460dee9d6d7c` | **diverges from C-Q0** |
 
-## 4b. The two superseded arms (retained, not part of the operator's set)
+An earlier pre-ruling pass of the same R = 75 configuration (one further
+session, not tabulated) produced the identical three digests, so the
+byte-identity at depths 1 and 4096 and the divergence at 16384 are reproduced
+across **three** independent sessions of the same config. The repeat does not
+disagree with the first run.
 
-Both were run under the earlier reviewer-relayed ruling; the operator's direct
-answers superseded them. They are kept because they were measured.
+**The `T_boot` penalty is probe-bound, not fill-bound.** For both fresh
+sessions the compile line is small and `/props` is late:
 
-| arm | T_boot s | depth | hit | ext | prefill s | ext prefill t/s | decode t/s | served digest |
-|---|---|---|---|---|---|---|---|---|
-| C-D-ratio-75 | 563.347 | 1 / 4096 / 16384 | 0 / 0 / 2048 | 1 / 4096 / 14336 | 0.61 / 305.70 / 915.94 | 1.6 / 13.4 / 15.7 | 1.4 / 7.9 / 7.2 | `0edc8dd7e703` / `709556a93505` / `460dee9d6d7c` |
-| D-kv (`--paged-kv u8`) | 102.243 | 1 / 4096 / 16384 | 0 / 0 / 3584 | 1 / 4096 / 12800 | 0.20 / 3.60 / 15.02 | 5.0 / 1137.8 / 852.2 | 21.9 / 23.9 / 20.2 | `851f3dfa4518` / `29344a729932` / `f580ae279d58` |
+```
+lgc  load: language model ready in 22.9 s (paged); device-resident 1.20 GiB   # run a, t_boot 544.353 s
+lgc  load: language model ready in 23.0 s (paged); device-resident 1.20 GiB   # run b, t_boot 546.325 s
+```
 
-The contrast between the two coder ratios is the sharpest single result here:
-at **R = 75** (46/184 resident) the digest matches C-P/C-Q0 at depths 1 and
-4096 and diverges only at 16384; at **R = 99** (2/184 resident) it diverges at
-every depth. So the CPU-tier route's answer-dependence is a function of the
-resident share, not a single fixed property.
+The gap (≈521 s, inferred as `t_boot − compile`; the logs carry no
+timestamps) is the distinct-token plateau probe, which runs forwards through
+the CPU tier at R = 75 — by line order the probe follows the ready line. The
+model compile is ≈23 s, so the probe is ≈23× the compile. `measured-here` (the
+probe line follows the ready line in `server.err`); `code` (the full load
+sequence completes before `http: listening`). The same shape holds at R = 99 (compile 22.1 s,
+`/props` 580.4 s).
+
+## 4b. Appendix — C-D-ratio-99 (retained, superseded for primacy)
+
+Not deleted: this is the arm that diverges at **every** depth, which is half of
+the resident-share finding below.
+
+| arm | T_boot s | depth | hit | ext | prefill s | ext prefill t/s | TTFT s | decode t/s | served digest |
+|---|---|---|---|---|---|---|---|---|---|
+| C-D-ratio-99 | 580.378 | 1 | 0 | 1 | 0.60 | 1.7 | 0.809 | 1.1 | `f732f7fce8be` |
+| C-D-ratio-99 | | 4096 | 0 | 4096 | 374.59 | 10.9 | 374.591 | 14.8 | `2c2c31439df7` |
+| C-D-ratio-99 | | 16384 | 2048 | 14336 | 1187.47 | 12.1 | 1187.476 | 11.9 | `e458e88df4d8` |
+
+Q0→C-D-ratio-99: ext prefill 1379.1 → 10.9 t/s (−99.2 %) at 4096 and
+1209.1 → 12.1 t/s (−99.0 %) at 16384; decode 34.4 → 1.1 (−96.8 %),
+43.9 → 14.8 (−66.3 %), 42.4 → 11.9 (−71.9 %); `T_boot` 77.8 → 580.4 s
+(×7.5). Digests differ from C-P/C-Q0 at all three depths.
+
+**Resident-share finding (updated by the repeat).** At **R = 75** (46/184
+resident) the served digest is byte-identical to C-P/C-Q0 at depths 1 and 4096
+and diverges only at 16384; **three independent sessions of the same config
+agree**. At **R = 99** (2/184 resident) it diverges at every depth. The
+CPU-tier route's answer-dependence is therefore a function of the resident
+share, not a fixed property. This is the static-partition/CPU-tier
+answer-dependence class already on this record
+(`docs/campaigns/expert-hot-set-lru.md`, `docs/campaigns/sub4bit-vram-kernel.md`).
 
 ## 5. Results — service D, dense agent, B60 (digests NOT admissible)
 
@@ -201,6 +231,9 @@ resident share, not a single fixed property.
 | D-mtp | 100.248 | 1 | 1 | 0 | 1 | 0.22 | 4.5 | 0.541 | 19.5 | `851f3dfa4518` |
 | D-mtp | | 4096 | 4096 | 0 | 4096 | 3.27 | 1252.6 | 3.273 | 21.4 | `29344a729932` |
 | D-mtp | | 16384 | 16384 | 3584 | 12800 | 13.43 | 953.1 | 13.434 | 21.3 | `f580ae279d58` |
+| D-kv | 102.243 | 1 | 1 | 0 | 1 | 0.20 | 5.0 | 0.517 | 21.9 | `851f3dfa4518` |
+| D-kv | | 4096 | 4096 | 0 | 4096 | 3.60 | 1137.8 | 3.603 | 23.9 | `29344a729932` |
+| D-kv | | 16384 | 16384 | 3584 | 12800 | 15.02 | 852.2 | 15.018 | 20.2 | `f580ae279d58` |
 
 **P→Q0 (fork + plugin), dense.** Extension prefill: 1140.9 → 1140.9 t/s
 (0 %) at 4096 and 854.5 → 851.6 t/s (−0.3 %) at 16384. Decode:
@@ -214,12 +247,19 @@ resident share, not a single fixed property.
 are equal at all three depths. (The decode move is mixed and single-run; the
 prefill move is the larger and consistent one.)
 
+**Q0→D-kv (configuration, first-class), dense.** Extension prefill:
+1140.9 → 1137.8 t/s (−0.3 %) at 4096 and 851.6 → 852.2 t/s (+0.1 %) at
+16384 — prefill-neutral. Decode: 20.5 → 21.9 (+6.8 %) at 1, 24.6 → 23.9
+(−2.8 %) at 4096, 20.2 → 20.2 (0 %) at 16384. `T_boot` 106.5 → 102.2 s
+(−4.0 %). The served digests are equal at all three depths (under the B60
+caveat, §6).
+
 ## 6. Digests, and what they are admissible for
 
 - **A770 (coder arms): admissible.** C-P and C-Q0 are byte-identical at all
-  three depths (and so is the superseded C-D-ratio-75 at depths 1 and 4096).
-  **C-D-ratio-99 diverges at every depth** — the configuration delta moves the
-  answer, so it is reported as a configuration result, never as a fork result.
+  three depths. C-D-ratio-75 is byte-identical to them at depths 1 and 4096,
+  and diverges at 16384; both fresh sessions give the same three digests, and
+  the earlier pre-ruling pass agrees. C-D-ratio-99 differs at every depth.
 - **B60 (dense arms): NOT admissible as byte-identity.** This card carries a
   known per-card determinism defect (`docs/campaigns/served-prefill-determinism.md`,
   DESIGN §7.0.2cb), so the dense arms' matching digests are recorded as
@@ -237,9 +277,9 @@ run inside `unshare -rm` with the contiguous CPU view; flags as §3):
 ```
 
 Verbatim `slot 0` lines from each arm's `server.err` (stderr is where arcint
-logs; the stdout file is empty). The C-D-ratio-99 block also reproduces its
-three load lines, verbatim. The two superseded arms' lines follow the
-operator-set arms.
+logs; the stdout file is empty). The C-D-ratio-99 appendix block also
+reproduces its three `load:` lines. The retained appendix arm's lines follow
+the main-table arms.
 
 **C-P**
 ```
@@ -261,17 +301,24 @@ lgc  slot 0: prefill 16384 tok in 11.01 s (1488.4 t/s) | cache hit 3072 tok (18.
 lgc  slot 0: decode     32 tok in  0.75 s ( 42.4 t/s) | graph 0.72 s, embed 0.01 s, sample 0.00 s, emit 0.01 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
 ```
 
-**C-D-ratio-99**
+**C-D-ratio-75a**
 ```
-lgc  load: MoE host compute tier enabled (threads=auto)
-lgc  load: host tier: plugin reports a static residency partition; the prefix cache is allowed
-lgc  load: expert slots host-side: 0.12 GiB (GTT, source: config)
-lgc  slot 0: prefill     1 tok in  0.60 s (  1.7 t/s) | graph 0.60 s, embed 0.00 s, pages 0.00 s, restore 0.00 s, wait 0.00 s, other 0.00 s
-lgc  slot 0: decode     32 tok in 27.86 s (  1.1 t/s) | graph 27.58 s, embed 0.02 s, sample 0.01 s, emit 0.26 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
-lgc  slot 0: prefill  4096 tok in 374.59 s ( 10.9 t/s) | cache snapshot 0.04 s | graph 374.52 s, embed 0.03 s, pages 0.00 s, restore 0.00 s, wait 0.00 s, other 0.00 s
-lgc  slot 0: decode     32 tok in  2.17 s ( 14.8 t/s) | graph 2.14 s, embed 0.01 s, sample 0.01 s, emit 0.01 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
-lgc  slot 0: prefill 16384 tok in 1187.47 s ( 13.8 t/s) | cache hit 2048 tok (12.5%) | cache snapshot 0.04 s | graph 1187.32 s, embed 0.08 s, pages 0.00 s, restore 0.04 s, wait 0.00 s, other 0.00 s
-lgc  slot 0: decode     32 tok in  2.68 s ( 11.9 t/s) | graph 2.16 s, embed 0.01 s, sample 0.01 s, emit 0.50 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
+lgc  slot 0: prefill     1 tok in  0.61 s (  1.6 t/s) | graph 0.61 s, embed 0.00 s, pages 0.00 s, restore 0.00 s, wait 0.00 s, other 0.00 s
+lgc  slot 0: decode     32 tok in 24.17 s (  1.3 t/s) | graph 23.92 s, embed 0.02 s, sample 0.01 s, emit 0.23 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
+lgc  slot 0: prefill  4096 tok in 306.35 s ( 13.4 t/s) | cache snapshot 0.03 s | graph 306.29 s, embed 0.03 s, pages 0.00 s, restore 0.00 s, wait 0.00 s, other 0.00 s
+lgc  slot 0: decode     32 tok in  4.41 s (  7.3 t/s) | graph 4.01 s, embed 0.01 s, sample 0.01 s, emit 0.38 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
+lgc  slot 0: prefill 16384 tok in 916.92 s ( 17.9 t/s) | cache hit 2048 tok (12.5%) | cache snapshot 0.04 s | graph 916.76 s, embed 0.08 s, pages 0.00 s, restore 0.04 s, wait 0.00 s, other 0.00 s
+lgc  slot 0: decode     32 tok in  4.44 s (  7.2 t/s) | graph 3.99 s, embed 0.01 s, sample 0.01 s, emit 0.42 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
+```
+
+**C-D-ratio-75b**
+```
+lgc  slot 0: prefill     1 tok in  0.53 s (  1.9 t/s) | graph 0.53 s, embed 0.00 s, pages 0.00 s, restore 0.00 s, wait 0.00 s, other 0.00 s
+lgc  slot 0: decode     32 tok in 22.43 s (  1.4 t/s) | graph 22.19 s, embed 0.01 s, sample 0.01 s, emit 0.22 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
+lgc  slot 0: prefill  4096 tok in 305.42 s ( 13.4 t/s) | cache snapshot 0.04 s | graph 305.35 s, embed 0.03 s, pages 0.00 s, restore 0.00 s, wait 0.00 s, other 0.00 s
+lgc  slot 0: decode     32 tok in  4.42 s (  7.2 t/s) | graph 4.00 s, embed 0.01 s, sample 0.01 s, emit 0.40 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
+lgc  slot 0: prefill 16384 tok in 914.35 s ( 17.9 t/s) | cache hit 2048 tok (12.5%) | cache snapshot 0.04 s | graph 914.19 s, embed 0.08 s, pages 0.00 s, restore 0.04 s, wait 0.00 s, other 0.00 s
+lgc  slot 0: decode     32 tok in  4.41 s (  7.3 t/s) | graph 3.99 s, embed 0.01 s, sample 0.01 s, emit 0.40 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
 ```
 
 **D-P**
@@ -304,17 +351,7 @@ lgc  slot 0: prefill 16384 tok in 13.43 s (1219.7 t/s) | cache hit 3584 tok (21.
 lgc  slot 0: decode     32 tok in  1.50 s ( 21.3 t/s) | graph 1.49 s, embed 0.00 s, sample 0.00 s, emit 0.01 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
 ```
 
-**C-D-ratio-75 (superseded, §4b)**
-```
-lgc  slot 0: prefill     1 tok in  0.61 s (  1.6 t/s) | graph 0.61 s, embed 0.00 s, pages 0.00 s, restore 0.00 s, wait 0.00 s, other 0.00 s
-lgc  slot 0: decode     32 tok in 23.54 s (  1.4 t/s) | graph 23.28 s, embed 0.01 s, sample 0.01 s, emit 0.24 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
-lgc  slot 0: prefill  4096 tok in 305.70 s ( 13.4 t/s) | cache snapshot 0.04 s | graph 305.63 s, embed 0.03 s, pages 0.00 s, restore 0.00 s, wait 0.00 s, other 0.00 s
-lgc  slot 0: decode     32 tok in  4.04 s (  7.9 t/s) | graph 4.00 s, embed 0.01 s, sample 0.01 s, emit 0.03 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
-lgc  slot 0: prefill 16384 tok in 915.94 s ( 17.9 t/s) | cache hit 2048 tok (12.5%) | cache snapshot 0.04 s | graph 915.79 s, embed 0.08 s, pages 0.00 s, restore 0.04 s, wait 0.00 s, other 0.00 s
-lgc  slot 0: decode     32 tok in  4.43 s (  7.2 t/s) | graph 4.00 s, embed 0.01 s, sample 0.01 s, emit 0.42 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
-```
-
-**D-kv (superseded, §4b)**
+**D-kv**
 ```
 lgc  slot 0: prefill     1 tok in  0.20 s (  4.9 t/s) | graph 0.20 s, embed 0.00 s, pages 0.00 s, restore 0.00 s, wait 0.00 s, other 0.00 s
 lgc  slot 0: decode     32 tok in  1.46 s ( 21.9 t/s) | graph 0.00 s, embed 0.00 s, sample 0.00 s, emit 0.32 s, wait 0.00 s, other 0.04 s | draft accept 65.0% (13/20), propose 0.13 s, verify 0.97 s, re-forward 0.00 s, rollback 0.00 s
@@ -322,6 +359,19 @@ lgc  slot 0: prefill  4096 tok in  3.60 s (1137.2 t/s) | cache snapshot 0.06 s |
 lgc  slot 0: decode     32 tok in  1.34 s ( 23.9 t/s) | graph 0.00 s, embed 0.00 s, sample 0.00 s, emit 0.06 s, wait 0.00 s, other 0.05 s | draft accept 65.0% (13/20), propose 0.15 s, verify 1.07 s, re-forward 0.00 s, rollback 0.00 s
 lgc  slot 0: prefill 16384 tok in 15.02 s (1091.1 t/s) | cache hit 3584 tok (21.9%) | cache snapshot 0.20 s | graph 13.41 s, embed 0.05 s, pages 0.00 s, restore 0.08 s, wait 0.00 s, other 1.28 s
 lgc  slot 0: decode     32 tok in  1.58 s ( 20.2 t/s) | graph 0.00 s, embed 0.00 s, sample 0.00 s, emit 0.01 s, wait 0.00 s, other 0.14 s | draft accept 88.2% (15/17), propose 0.21 s, verify 1.23 s, re-forward 0.00 s, rollback 0.00 s
+```
+
+**C-D-ratio-99 (appendix, §4b)**
+```
+lgc  load: MoE host compute tier enabled (threads=auto)
+lgc  load: host tier: plugin reports a static residency partition; the prefix cache is allowed
+lgc  load: expert slots host-side: 0.12 GiB (GTT, source: config)
+lgc  slot 0: prefill     1 tok in  0.60 s (  1.7 t/s) | graph 0.60 s, embed 0.00 s, pages 0.00 s, restore 0.00 s, wait 0.00 s, other 0.00 s
+lgc  slot 0: decode     32 tok in 27.86 s (  1.1 t/s) | graph 27.58 s, embed 0.02 s, sample 0.01 s, emit 0.26 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
+lgc  slot 0: prefill  4096 tok in 374.59 s ( 10.9 t/s) | cache snapshot 0.04 s | graph 374.52 s, embed 0.03 s, pages 0.00 s, restore 0.00 s, wait 0.00 s, other 0.00 s
+lgc  slot 0: decode     32 tok in  2.17 s ( 14.8 t/s) | graph 2.14 s, embed 0.01 s, sample 0.01 s, emit 0.01 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
+lgc  slot 0: prefill 16384 tok in 1187.47 s ( 13.8 t/s) | cache hit 2048 tok (12.5%) | cache snapshot 0.04 s | graph 1187.32 s, embed 0.08 s, pages 0.00 s, restore 0.04 s, wait 0.00 s, other 0.00 s
+lgc  slot 0: decode     32 tok in  2.68 s ( 11.9 t/s) | graph 2.16 s, embed 0.01 s, sample 0.01 s, emit 0.50 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
 ```
 
 ## 8. Caveats
@@ -345,7 +395,8 @@ lgc  slot 0: decode     32 tok in  1.58 s ( 20.2 t/s) | graph 0.00 s, embed 0.00
    C-P/C-Q0 (snapshot grid 1024) but 2048 for C-D-ratio-75/99 (snapshot grid
    2048), so the 16384 extension base is 3072 vs 2048. A configuration
    artifact of the delta, not a fork difference. `measured-here`.
-5. **Single run per arm.** Each cell is one session; depth-1 decode is a
+5. **Single run per main-table arm, except R = 75.** Every main-table cell is
+   one session except C-D-ratio-75, which has two; depth-1 decode is a
    first-token warm-up and carries more variance than the deeper rows.
    `measured-here`.
 6. **The paged graph's blob cache is off.** The engine sets
@@ -358,13 +409,13 @@ lgc  slot 0: decode     32 tok in  1.58 s ( 20.2 t/s) | graph 0.00 s, embed 0.00
 
 ## 9. What failed, and what was missing
 
-Nothing failed and no context point is missing: all eight arms returned `rc=0`,
-reached `/props`, completed all three depths, and left no `arcint` process.
-The physical samplers recorded **0 watchdog trips** (minimum
-`MemAvailable` ≈ 28.8 GiB on the main window, ≈ 43.0 GiB on the R = 99 window),
-far above the 4 GiB threshold. No arm was refused. The only point that needs a
-label rather than a number is the depth-4096 row (cold, not an extension;
-§8.2).
+Nothing failed and no context point is missing: all ten sessions returned
+`rc=0`, reached `/props`, completed all three depths, and left no `arcint`
+process. The physical samplers recorded **0 watchdog trips** (minimum
+`MemAvailable` ≈ 28.8 GiB on the main window, ≈ 38.96 GiB on the R = 75
+window, ≈ 43.0 GiB on the R = 99 window), far above the 4 GiB threshold. No
+arm was refused. The only point that needs a label rather than a number is the
+depth-4096 row (cold, not an extension; §8.2).
 
 ## 10. The packet
 
