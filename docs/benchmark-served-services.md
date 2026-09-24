@@ -422,3 +422,18 @@ depth-4096 row (cold, not an extension; §8.2).
 The operator-local packet (host, unit, paths, raw JSON, sampler logs, the
 harness) is in the git-ignored `docs/benchmark-served-services.local.md` and on
 the card host under a persistent `bench-out` directory, not `/tmp`.
+
+## 11. 2026-09-24 — the IQ3_XXS 35B-A3B arm was NOT run (BLOCKED before conversion)
+
+The operator asked for an A770 leg on `unsloth/Qwen3.6-35B-A3B-GGUF`'s
+`Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf` (13,211,155,424 B; sha256
+`9c964e65…88fbe`, its HF LFS oid). The fetch is DONE and verified on the card
+host's ZFS pool. The conversion into an arcint artifact is **BLOCKED before any
+served session**: the shard is `qwen35moe` (40 layers / 256 experts / top-8),
+while the native serving-shape emitter is the Flash-Next `qwen4_exp` graph only,
+and the file's gate/up experts are `IQ2_S`, which neither the emitter nor the
+plugin's native formats carries. The named refusals and the `code` /
+`measured-here` dispositions are in `docs/campaigns/sub4bit-vram-kernel.md`
+(2026-09-24, IQ3_XXS leg). No row is filled, no digest is claimed. The recorded
+int4 comparand (DESIGN §7.0.2v: 9.1 t/s decode at ratio 50, 8 GiB device pool)
+is unchanged and remains **previously measured**, not re-measured.

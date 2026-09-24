@@ -1108,3 +1108,62 @@ digests, with the resident share deciding whether they diverge).
   **Graduation rule:** recorded as a lever here because the owner is this
 campaign's native route; if it grows a gate of its own (a served acceptance),
 the campaign rules say it becomes its own document.
+
+- 2026-09-24 (IQ3_XXS leg, dated append — the 35B-A3B conversion is BLOCKED
+  before any card window) — Operator decision: *"IQ3_XXS first with conversion
+  and benchmark, then continue the roadmap"*, aimed at a fully-resident A770
+  route for Qwen3.6-35B-A3B. The fetch is DONE and verified; the conversion is
+  BLOCKED on the emitter's model family and on the source file's expert format,
+  both measured, so no benchmark arm runs. No conversion, fit or rate is
+  fabricated. Evidence class is `measured-here` unless stated.
+
+  * **Fetch (card host, ZFS pool, not the ext4 store):** HF repo
+    `unsloth/Qwen3.6-35B-A3B-GGUF`, file `Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf`,
+    **13,211,155,424 B**, magic `GGUF`, sha256
+    `9c964e657212fea1f24905dd7b0a89b82fd807d19fab0b41da14251b07b88fbe` — the
+    exact HF LFS oid of that path (`measured-here`: `sha256sum` of the landed
+    file; size and oid are the API's own). Size alone proves completeness only;
+    the hash is the check.
+  * **The shard is `qwen35moe`, not the emitter's `qwen4_exp`.**
+    `general.architecture = qwen35moe`, `qwen35moe.block_count = 40`,
+    `expert_count = 256`, `expert_used_count = 8` (`measured-here`: gguf-py on
+    the fetched file). The native serving-shape route emits ONE graph family —
+    the Flash-Next `qwen4_exp` backbone: `export_serving_artifact.py` keys the
+    shard admission on `qwen4exp.ple.eos_token_id` (`code`:
+    `tools/export_serving_artifact.py:78`) and `build_serving_shape_ir`
+    hardwires the hyper-connection width and the PLE (`code`:
+    `tools/q4e/serving_shape.py:1267`, `:1290`, `:1385`, `:1401`), while
+    `q4e/piecewise_export.py:129`'s `REAL_GEOMETRY` is 48 layers / 512 experts /
+    `hc_count 4` / `ple_layer_ids [2]`. This GGUF carries none of it
+    (`measured-here`: its 54 metadata keys hold no `qwen4exp.*`,
+    `hyper_connection.*` or PLE key). Driving the named exporter returns the
+    refusal verbatim:
+
+        EXPORT [shards] REFUSED: the first shard lacks one of
+        qwen4exp.ple.eos_token_id=None tokenizer.ggml.eos_token_id=248046
+        tokenizer.chat_template=present
+
+  * **The experts are not the native formats the route carries.**
+    `ffn_gate_exps` and `ffn_up_exps` are **IQ2_S** (ggml type 22) on all 40
+    layers; `ffn_down_exps` is IQ3_XXS on 37 layers and IQ4_XS on 3
+    (`measured-here`: gguf-py type histogram `Q6_K 252, F32 361, IQ3_XXS 37,
+    IQ2_S 80, IQ4_XS 3`). `q4e.native_blocks` splits IQ4_NL / IQ3_XXS / IQ4_XS
+    / Q8_0 only (`code`: `tools/q4e/native_blocks.py:220`) and the plugin's
+    native `weight_format`s are IQ4_NL=1, IQ3_XXS=2, Q8_0=3 (`code`: patch
+    0043, `kWeightFormat*`); neither carries an IQ2_S decode (`code`:
+    `src/core/gguf_dequant.cpp`'s `dequantize_row` switch has no IQ2_S case).
+    The named fill refuses verbatim:
+
+        blk.0.ffn_gate_exps.weight: IQ2_S is not a native expert format this
+        fill carries (['IQ3_XXS', 'IQ4_NL', 'IQ4_XS', 'Q8_0'])
+
+  * **Consequence.** No arcint artifact carrying this checkpoint's experts
+    exists or can be driven from the named tooling, so the A770 arms (fully
+    resident, or resident + tier) cannot run for the requested model. The
+    fully-resident NATIVE gap recorded immediately above is real but belongs to
+    the `qwen4_exp` native artifact; it does not transfer to a `qwen35moe` one.
+    **OWED: an operator decision** — (a) port the serving-shape emitter to
+    `qwen3_5_moe` and add an IQ2_S native decode across emitter, plugin and
+    tier (a campaign-sized change, not a leg), or (b) name a different target;
+    the Flash-Next native artifact already carries IQ3_XXS/IQ4_NL experts and
+    its open lever is the fully-resident configuration.
