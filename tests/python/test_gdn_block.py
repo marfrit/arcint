@@ -455,6 +455,53 @@ def test_the_chunk_emission_modes_agree_on_cpu_and_differ_in_node_count():
         f"C > 1 path have diverged by more than that concat.")
 
 
+def test_the_served_prefill_graph_does_not_grow_with_the_prompt_length():
+    """LYON's compile-once property (0.5.4). The served prefill graph carries
+    its GDN state in Variables and its chunk axis is dynamic, so ONE compile is
+    replayed across every prompt length. The static `perchunk` form unrolls
+    ~1,900 ops PER CHUNK (`code`: docs/window-050.md §4.2) -- 2,198,232 nodes at
+    T=2048 over the 48-layer stack -- which is the 2.2M-node cost LYON retires.
+
+    Red-first: the `perchunk` control asserts the static form GROWS with T (the
+    incumbent red); the served path asserts it does not. This cell fails if the
+    served emitter stops being dynamic/stateful, or if `perchunk` stops
+    unrolling (i.e. the defect's reproducer silently changed)."""
+    from openvino import opset13 as ovop
+    from q4e import serving_shape as ss
+
+    config = _make_config()
+    ref, _ = _ref_and_pin(config)
+    state = _state_np(ref)
+    H = config.hidden_size
+    beam = ovop.constant(np.array([0], np.int64))
+
+    # the served path: dynamic in T, stateful conv + stateful (Loop) core
+    sinks = []
+    hidden = ovop.parameter([1, -1, H], ov.Type.f32)
+    amask = ovop.parameter([1, -1], ov.Type.f32)
+    out = gdn.emit_gdn(hidden, amask, config, state, None,
+                       conv_emitter=ss.stateful_short_conv(0, beam, sinks),
+                       core_emitter=ss.stateful_gdn_core(0, beam, sinks))
+    served = ov.Model([ovop.result(out)], list(sinks), [hidden, amask], "served")
+    n_served = len(served.get_ordered_ops())
+    types = {n.get_type_name() for n in served.get_ordered_ops()}
+    assert "Loop" in types and "Assign" in types and "ReadValue" in types, types
+    assert len(sinks) == 2, f"{len(sinks)} Assign(s); the two stateful hooks carry two states"
+
+    # the incumbent static form: grows ~1,900 ops per chunk
+    static = {T: len(gdn.build_gdn_model(config, state, seq_len=T,
+                                         ut_mode="perchunk").get_ordered_ops())
+              for T in (64, 256, 512)}
+    print(f"\n[lyon] served(dynamic T) nodes={n_served}  "
+          f"static perchunk nodes={static}  "
+          f"per-chunk growth={static[512] - static[64]} over 448 tokens")
+    assert static[512] > static[256] > static[64], (
+        f"the perchunk control no longer unrolls per chunk: {static}")
+    assert n_served < static[64], (
+        f"the served path ({n_served} nodes) is not smaller than one perchunk "
+        f"chunk ({static[64]}); the stateful route did not retire the unroll")
+
+
 def test_an_unknown_chunk_emission_mode_is_refused():
     """The mode string reaches a comparison, not a silent default. A typo that
     fell through to 'batched' would report the defect as fixed."""
