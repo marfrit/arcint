@@ -556,6 +556,46 @@ std::vector<ModelEntry> build_registry() {
         split_layers(e);
         r.push_back(std::move(e));
     }
+    {
+        // The FULL-DEPTH (40-layer) native rung, exported 2026-09-25 from the
+        // same GGUF and emitter as d4 above. It exists to answer whether the
+        // depth-4 artifact's degenerate greedy text is truncation or an
+        // emitter defect; it is still a measurement artifact (native experts,
+        // no PLE/n-gram table), and no quality claim rides on it.
+        //
+        // Hashes and weights_bytes read off its own serving-shape.json, not
+        // guessed: arch b94ecc6ab6b200ac (the single language-model xml),
+        // template 55d4931433fe502b, tokenizer 87a7830d63fcf43b, lm .bin
+        // 23,429,144,641 B in one segment -- 2026-09-25. The 120 expert
+        // bodies are the GGUF's own blocks (census: 40 IQ2_S gate + 40 IQ2_S
+        // up + 37 IQ3_XXS down + 3 IQ4_XS down folded onto IQ4_NL).
+        ModelEntry e;
+        e.id                      = "qwen3.6-35b-a3b-native-d40";
+        e.family                  = "qwen3.6";
+        e.artifact_aliases        = {"qwen36-35b-a3b-d40n-ov"};
+        e.ov_arch                 = "Qwen3_5MoeForConditionalGeneration";
+        e.model_type              = "qwen3_5_moe";
+        e.moe                     = true;
+        e.has_mtp_head            = false;  // the export writes none
+        e.mtp_head_pinned         = true;   // inspected 2026-09-25
+        e.mtp_in_checkpoint       = true;   // config: mtp_num_hidden_layers 1
+        e.n_embd                  = 2048;
+        e.n_expert                = 256;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 40;     // 30 GDN + 10 attention (i % 4 == 3)
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};   // the coarse label; the experts are the GGUF's IQ2_S/IQ3_XXS/IQ4_XS
+        e.arch_hash               = "b94ecc6ab6b200ac";
+        e.template_hash           = "55d4931433fe502b";  // the GGUF's own chat template
+        e.tokenizer_hash          = "87a7830d63fcf43b";  // passthrough; vocab == the GGUF's, id for id
+        e.weights_bytes           = 23429144641ull;  // the one language-model .bin, off --inspect-artifact
+        e.status                  = "measurement artifact: the full-depth (40-layer) native-format "
+                                    "(IQ2_S/IQ3_XXS/IQ4_XS) serving-shape rung; no PLE/n-gram table, "
+                                    "served inertly";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
 
     return r;
 }

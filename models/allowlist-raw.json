@@ -1,263 +1,281 @@
 {
-  "_comment": "Raw IR metadata read off the actual IR directories under /models/ov/, first on 2026-08-28 (pre-M0 handover), extended as artifacts landed (2026-08-30: qwen38-intel-int4-ov, qwen36-35b-a3b-mtp-ov). sha256 prefixes, 16 hex chars. All six share tokenizer 87a7830d63fcf43b (2026-09-10: qwen35-2b-ov added, IR metadata read off /models/ov/qwen35-2b-ov on the dev host; it shares the same tokenizer and chat template as qwen38-b7c1-ov). full_attention_interval 4 = 1 in 4 layers full attention, rest GDN. Coder is expert-PRUNED: 184 of 256. 2026-08-28: mtp fields added after inspecting the IRs — all three checkpoints declare mtp_num_hidden_layers 1, and NONE of the exports contain an MTP graph (only 'logits'), so no MTP head is servable from these artifacts. 2026-08-28 (later): qwen38-b7c1-ov now DOES carry a servable MTP head. optimum-intel still drops it, so tools/export_mtp.py reconstructs it from the unquantised mtp.* tensors in /models/gptq/qwen38-gptq-mtp and writes openvino_mtp_layer.xml and openvino_mtp_lm_head.xml beside the model; measured 66% draft acceptance. The other two exports are unchanged.",
-  "qwen36-coder-b5-ov": {
-    "arch": [
-      "Qwen3_5MoeForConditionalGeneration"
-    ],
-    "model_type": "qwen3_5_moe",
-    "hidden": 2048,
-    "layers": 40,
-    "experts": 184,
-    "ctx": 262144,
-    "full_attention_interval": 4,
-    "template_sha": "e84f32a23fdda276",
-    "tokenizer_sha": "87a7830d63fcf43b",
-    "lm_xml_sha": "6745cfe3d57e3f0f",
-    "lm_bin_bytes": 13760293946,
-    "status": "production, 10/10",
-    "mtp_num_hidden_layers": 1,
-    "mtp_head_exported": false
-  },
-  "qwen36-35b-a3b-int4-ov": {
-    "arch": [
-      "Qwen3_5MoeForConditionalGeneration"
-    ],
-    "model_type": "qwen3_5_moe",
-    "hidden": 2048,
-    "layers": 40,
-    "experts": 256,
-    "ctx": 262144,
-    "full_attention_interval": 4,
-    "template_sha": "c3f7038f278583e1",
-    "tokenizer_sha": "87a7830d63fcf43b",
-    "lm_xml_sha": "21fe4d57d6d016f5",
-    "lm_bin_bytes": 18646558274,
-    "status": "unmeasured against current harness",
-    "mtp_num_hidden_layers": 1,
-    "mtp_head_exported": false
-  },
-  "qwen38-b7c1-ov": {
-    "arch": [
-      "Qwen3_5ForConditionalGeneration"
-    ],
-    "model_type": "qwen3_5",
-    "hidden": 5120,
-    "layers": 64,
-    "experts": null,
-    "ctx": 262144,
-    "full_attention_interval": 4,
-    "template_sha": "c3cf9e34abf4f9e3",
-    "tokenizer_sha": "87a7830d63fcf43b",
-    "lm_xml_sha": "5892b9b333bf0ab3",
-    "lm_bin_bytes": 14405167394,
-    "status": "provisional, 7/10 (AWQ-only; SE calibration degenerates greedy - do not re-add SE)",
-    "mtp_num_hidden_layers": 1,
-    "mtp_head_exported": true
-  },
-  "qwen38-intel-int4-ov": {
-    "arch": [
-      "Qwen3_5ForConditionalGeneration"
-    ],
-    "model_type": "qwen3_5",
-    "hidden": 5120,
-    "layers": 64,
-    "experts": null,
-    "ctx": 262144,
-    "full_attention_interval": 4,
-    "template_sha": "c3cf9e34abf4f9e3",
-    "tokenizer_sha": "87a7830d63fcf43b",
-    "lm_xml_sha": "ab94a08ce150de6a",
-    "lm_bin_bytes": 13929177378,
-    "status": "10/10 greedy on the acceptance task (paged+MTP, B60, 2026-08-30), 36.3 t/s, 90.8% draft acceptance (296/326); Intel's public int4 export with the reconstructed MTP head beside it; --mtp off 25.0 t/s, reconstructed layer 36.9-37.3 (code) / 33.8-34.0 (prose), Intel's exported layer + our lm_head 37.7-38.1 / 34.3-34.9 t/s",
-    "mtp_num_hidden_layers": 1,
-    "mtp_head_exported": true,
-    "_note": "Intel's export also ships openvino_mtp_model.{xml,bin} of its own (263 MB int4, one MTP layer, no lm_head, same interface as our openvino_mtp_layer). arcint keys the head on openvino_mtp_layer + openvino_mtp_lm_head, which are the reconstructed ones."
-  },
-  "qwen36-35b-a3b-mtp-ov": {
-    "arch": [
-      "Qwen3_5MoeForConditionalGeneration"
-    ],
-    "model_type": "qwen3_5_moe",
-    "hidden": 2048,
-    "layers": 40,
-    "experts": 256,
-    "ctx": 262144,
-    "full_attention_interval": 4,
-    "template_sha": "c3f7038f278583e1",
-    "tokenizer_sha": "87a7830d63fcf43b",
-    "lm_xml_sha": "21fe4d57d6d016f5",
-    "lm_bin_bytes": 18646558274,
-    "status": "head pairs (93.9% code / 75.4% prose draft acceptance, B60, 2026-08-30); --mtp on 48-53 t/s vs 71.5 t/s off — the serving loop is host-bound (36.5 ms of wall for 16.7 ms of device per accepted pair) and the f16 dense-expert head is 6.7 ms of device a draft, a wash on device time; not for production",
-    "mtp_num_hidden_layers": 1,
-    "mtp_head_exported": true
-  },
-  "qwen35-2b-ov": {
-    "arch": [
-      "Qwen3_5ForConditionalGeneration"
-    ],
-    "model_type": "qwen3_5",
-    "hidden": 2048,
-    "layers": 24,
-    "experts": null,
-    "ctx": 262144,
-    "full_attention_interval": 4,
-    "template_sha": "c3cf9e34abf4f9e3",
-    "tokenizer_sha": "87a7830d63fcf43b",
-    "lm_xml_sha": "ec0078368fcce101",
-    "lm_bin_bytes": 1884937298,
-    "status": "provisional; dense qwen35 marker export (FIX 8.2), served via GGUF on the 16 GiB card, not acceptance-scored",
-    "mtp_num_hidden_layers": 1,
-    "mtp_head_exported": false
-  },
-  "qwen38-flash-next-d4-ov": {
-    "_note": "2026-09-13: the serving-shape IR of Qwen3.8 Flash-Next (qwen4exp) at DEPTH 4 of 48, real weights from the UD-Q3_K_XL shards (tools/export_serving_artifact.py --layers 4, tree wt+6743ffb, serving-shape.json beside it). Hashes read off /models/ov/qwen38-flash-next-d4-ov on the dev host. The n-gram table is not in the .bin: it binds to the IR's ngram_table.K ports from the GGUF shard at load (--ngram-gguf). A measurement artifact for the served path -- 44 layers are missing, its answers are not the model's.",
-    "arch": [
-      "Qwen4ExpForConditionalGeneration"
-    ],
-    "model_type": "qwen4_exp",
-    "hidden": 2560,
-    "layers": 4,
-    "experts": 512,
-    "ctx": 262144,
-    "full_attention_interval": 4,
-    "template_sha": "12827f24b742ea4e",
-    "tokenizer_sha": "87a7830d63fcf43b",
-    "lm_xml_sha": "2910a860bf9dc6bb",
-    "lm_bin_bytes": 9427885993,
-    "status": "measurement artifact: depth 4 of 48, served-path boot; not the model's answers",
-    "mtp_num_hidden_layers": 1,
-    "mtp_head_exported": false
-  },
-  "qwen38-flash-next-ov": {
-    "_note": "2026-09-13: the serving-shape IR at ALL 48 layers, real weights (tools/export_serving_artifact.py --layers 48, tree 092df69; serving-shape.json beside it). Hashes read off /models/ov/qwen38-flash-next-ov on the dev host. Built to be pointed at by the served binary; window-050 §4.10 predicts and records the residency refusal (measured on the A770: the plugin stages every constant in USM host memory at compile and the host runs out first).",
-    "arch": [
-      "Qwen4ExpForConditionalGeneration"
-    ],
-    "model_type": "qwen4_exp",
-    "hidden": 2560,
-    "layers": 48,
-    "experts": 512,
-    "ctx": 262144,
-    "full_attention_interval": 4,
-    "template_sha": "12827f24b742ea4e",
-    "tokenizer_sha": "87a7830d63fcf43b",
-    "lm_xml_sha": "3f574b776a8dd2c6",
-    "lm_bin_bytes": 81948724009,
-    "status": "full depth, 48 of 48: built; the served-path compile on the A770 was refused by HOST memory (USM host staging of 69 GiB of constants, window-050 §4.10); not servable on this host",
-    "mtp_num_hidden_layers": 1,
-    "mtp_head_exported": false
-  },
-  "qwen38-flash-next-d48g-ov": {
-    "_note": "2026-09-18: the 48-layer serving-shape IR re-exported from tree f91ea73 through the corrected fill (DESIGN 7.0.2bz: the GGUF converter's folded norm gammas and -exp(A_log) undone at the feed, the sigmoid output gate, the tiled key-head pairing), after the fill's three defects were found against llama.cpp's own tensors of the same GGUF. Its depth-4 sibling agrees with llama.cpp at every cut (layer 3 out corr 0.9987). Supersedes d48f (tree da52858, xml f89a162348b13d18), which served logits with no information about the model (KL 12.4 nats against the model's own capture). Hashes read off the export log.",
-    "arch": [
-      "Qwen4ExpForConditionalGeneration"
-    ],
-    "model_type": "qwen4_exp",
-    "hidden": 2560,
-    "layers": 48,
-    "experts": 512,
-    "ctx": 262144,
-    "full_attention_interval": 4,
-    "template_sha": "12827f24b742ea4e",
-    "tokenizer_sha": "87a7830d63fcf43b",
-    "lm_xml_sha": "a077e6e4bfa9b847",
-    "lm_bin_bytes": 80061287197,
-    "status": "full-depth fused-MoE artifact through the corrected fill; the KLD gate against the model's own capture is its acceptance",
-    "mtp_num_hidden_layers": 1,
-    "mtp_head_exported": false
-  },
-  "qwen38-flash-next-d48n-ov": {
-    "_note": "2026-09-18: the 48-layer serving-shape IR with the checkpoint's own expert blocks (IQ3_XXS / IQ4_XS gate-up, IQ4_NL / Q8_0 down, per layer as the GGUF ships them) decoded in standard ops, exported from tree 69dfffd (--expert-format native). Serves through marfrit-openvino +p19 (patch 0043), every routed expert on the CPU tier. Its depth-4 sibling agrees with llama.cpp at layer 0/1/2/3 out corr 0.99991 / 0.99989 / 0.99970 / 0.99953 (d48g's u4 repack: 0.99924 / 0.99918 / - / 0.99873). Hashes read off the export log.",
-    "arch": [
-      "Qwen4ExpForConditionalGeneration"
-    ],
-    "model_type": "qwen4_exp",
-    "hidden": 2560,
-    "layers": 48,
-    "experts": 512,
-    "ctx": 262144,
-    "full_attention_interval": 4,
-    "template_sha": "12827f24b742ea4e",
-    "tokenizer_sha": "87a7830d63fcf43b",
-    "lm_xml_sha": "641fcb1863f83629",
-    "lm_bin_bytes": 77492280673,
-    "status": "full-depth artifact with the checkpoint's native expert formats (patch 0043, every routed expert on the CPU tier); the KLD gate against the model's own capture is its acceptance",
-    "mtp_num_hidden_layers": 1,
-    "mtp_head_exported": false
-  },
-  "qwen38-flash-next-d12-ov": {
-    "_note": "2026-09-13: the serving-shape IR of Qwen3.8 Flash-Next (qwen4exp) at DEPTH 12 of 48 -- the depth ladder's first rung (docs/window-051.md row (b)), real weights from the UD-Q3_K_XL shards (tools/export_serving_artifact.py --layers 12, tree d93508c, serving-shape.json beside it). Hashes read off /models/ov/qwen38-flash-next-d12-ov on the dev host (build 1,450.9 s, peak host 30.39 GiB). A measurement artifact: 36 layers are missing, its answers are not the model's.",
-    "arch": [
-      "Qwen4ExpForConditionalGeneration"
-    ],
-    "model_type": "qwen4_exp",
-    "hidden": 2560,
-    "layers": 12,
-    "experts": 512,
-    "ctx": 262144,
-    "full_attention_interval": 4,
-    "template_sha": "12827f24b742ea4e",
-    "tokenizer_sha": "87a7830d63fcf43b",
-    "lm_xml_sha": "7738fa87cddca8e2",
-    "lm_bin_bytes": 22613492905,
-    "status": "measurement artifact: depth 12 of 48, the depth ladder's first rung; not the model's answers",
-    "mtp_num_hidden_layers": 1,
-    "mtp_head_exported": false
-  },
-  "qwen38-flash-next-d12r-ov": {
-    "_note": "2026-09-17: the DEPTH-12 artifact of 2026-09-13 rewritten in memory by tools/moe_tiled_rewrite.py at tree 0b66c43 and written back with ov.save_model (NOT an export: same u4 codes and zero-points, scales rounded to f16, the MoE block in the shape the GPU plugin's tiled matcher accepts -- two Reshapes, a one-input Swish, an f16 dequant chain with a trailing Convert). The first Flash-Next serving-shape artifact that compiles to moe_3gemm_fused_compressed; with --offload-ratio 99 --moe-cpu-tier it is 3.00 GiB device-resident on the 24 GiB card against 17.73 unfused. Hashes read off the artifact on the dev host (arcint --inspect-artifact). A measurement artifact: 36 layers are missing, its answers are not the model's; superseded by a re-export from the shards.",
-    "arch": [
-      "Qwen4ExpForConditionalGeneration"
-    ],
-    "model_type": "qwen4_exp",
-    "hidden": 2560,
-    "layers": 12,
-    "experts": 512,
-    "ctx": 262144,
-    "full_attention_interval": 4,
-    "template_sha": "12827f24b742ea4e",
-    "tokenizer_sha": "87a7830d63fcf43b",
-    "lm_xml_sha": "d1d1005332c96fbc",
-    "lm_bin_bytes": 22141633733,
-    "status": "measurement artifact: depth 12 of 48, the fused-MoE rewrite of the first rung; not the model's answers",
-    "mtp_num_hidden_layers": 1,
-    "mtp_head_exported": false
-  },
-  "qwen38-flash-next-seg12-ov": {
-    "_note": "2026-09-14: ALL 48 layers as a SEGMENTED chain of four 12-layer compiled models (tools/export_serving_artifact.py --layers 48 --segment-layers 12, tree c00500f, filled 2026-09-13 22:09-23:39Z on the dev host). The directory holds segment0/..segment3/ (own openvino_language_model.{xml,bin} each) and one expert_bodies.u8 blob (144 bodies, 60,397,977,600 B) that the segmented runtime refills one segment at a time; serving-shape.json carries segments[] and the body index. lm_xml_sha is NOT a file digest here: a segmented artifact hashes as segplan::chain_arch_hash over the four segment xml digests in segment order (src/core/artifact.cpp), and it was read off the directory with `arcint --model <dir> --inspect-artifact`, which printed arch 32d3060ca30238d1, per-segment bins 4,944,946,409 + 4,813,218,673 + 4,813,218,673 + 7,382,270,833 = 21,953,654,588 B, and one 36-slot buffer set of 15,099,494,400 B (14.06 GiB). A measurement artifact: no segmented runtime drives it yet, so its answers are not the model's either way.",
-    "arch": [
-      "Qwen4ExpForConditionalGeneration"
-    ],
-    "model_type": "qwen4_exp",
-    "hidden": 2560,
-    "layers": 48,
-    "experts": 512,
-    "ctx": 262144,
-    "full_attention_interval": 4,
-    "template_sha": "12827f24b742ea4e",
-    "tokenizer_sha": "87a7830d63fcf43b",
-    "lm_xml_sha": "32d3060ca30238d1",
-    "lm_bin_bytes": 21953654588,
-    "status": "measurement artifact: 48 layers as a 4x12 segment chain; no segmented runtime yet; not the model's answers",
-    "mtp_num_hidden_layers": 1,
-    "mtp_head_exported": false
-  },
-  "qwen36-35b-a3b-d4n-ov": {
-    "arch": [
-      "Qwen3_5MoeForConditionalGeneration"
-    ],
-    "model_type": "qwen3_5_moe",
-    "hidden": 2048,
-    "layers": 4,
-    "experts": 256,
-    "ctx": 262144,
-    "full_attention_interval": 4,
-    "template_sha": "55d4931433fe502b",
-    "tokenizer_sha": "87a7830d63fcf43b",
-    "lm_xml_sha": "391bd21db6368d57",
-    "lm_bin_bytes": 4284499713,
-    "status": "measurement artifact: depth 4 of 40, native IQ2_S/IQ3_XXS experts, no PLE/n-gram table; not the model's answers",
-    "mtp_num_hidden_layers": 1,
-    "mtp_head_exported": false
-  }
+ "_comment": "Raw IR metadata read off the actual IR directories under /models/ov/, first on 2026-08-28 (pre-M0 handover), extended as artifacts landed (2026-08-30: qwen38-intel-int4-ov, qwen36-35b-a3b-mtp-ov). sha256 prefixes, 16 hex chars. All six share tokenizer 87a7830d63fcf43b (2026-09-10: qwen35-2b-ov added, IR metadata read off /models/ov/qwen35-2b-ov on the dev host; it shares the same tokenizer and chat template as qwen38-b7c1-ov). full_attention_interval 4 = 1 in 4 layers full attention, rest GDN. Coder is expert-PRUNED: 184 of 256. 2026-08-28: mtp fields added after inspecting the IRs \u2014 all three checkpoints declare mtp_num_hidden_layers 1, and NONE of the exports contain an MTP graph (only 'logits'), so no MTP head is servable from these artifacts. 2026-08-28 (later): qwen38-b7c1-ov now DOES carry a servable MTP head. optimum-intel still drops it, so tools/export_mtp.py reconstructs it from the unquantised mtp.* tensors in /models/gptq/qwen38-gptq-mtp and writes openvino_mtp_layer.xml and openvino_mtp_lm_head.xml beside the model; measured 66% draft acceptance. The other two exports are unchanged.",
+ "qwen36-coder-b5-ov": {
+  "arch": [
+   "Qwen3_5MoeForConditionalGeneration"
+  ],
+  "model_type": "qwen3_5_moe",
+  "hidden": 2048,
+  "layers": 40,
+  "experts": 184,
+  "ctx": 262144,
+  "full_attention_interval": 4,
+  "template_sha": "e84f32a23fdda276",
+  "tokenizer_sha": "87a7830d63fcf43b",
+  "lm_xml_sha": "6745cfe3d57e3f0f",
+  "lm_bin_bytes": 13760293946,
+  "status": "production, 10/10",
+  "mtp_num_hidden_layers": 1,
+  "mtp_head_exported": false
+ },
+ "qwen36-35b-a3b-int4-ov": {
+  "arch": [
+   "Qwen3_5MoeForConditionalGeneration"
+  ],
+  "model_type": "qwen3_5_moe",
+  "hidden": 2048,
+  "layers": 40,
+  "experts": 256,
+  "ctx": 262144,
+  "full_attention_interval": 4,
+  "template_sha": "c3f7038f278583e1",
+  "tokenizer_sha": "87a7830d63fcf43b",
+  "lm_xml_sha": "21fe4d57d6d016f5",
+  "lm_bin_bytes": 18646558274,
+  "status": "unmeasured against current harness",
+  "mtp_num_hidden_layers": 1,
+  "mtp_head_exported": false
+ },
+ "qwen38-b7c1-ov": {
+  "arch": [
+   "Qwen3_5ForConditionalGeneration"
+  ],
+  "model_type": "qwen3_5",
+  "hidden": 5120,
+  "layers": 64,
+  "experts": null,
+  "ctx": 262144,
+  "full_attention_interval": 4,
+  "template_sha": "c3cf9e34abf4f9e3",
+  "tokenizer_sha": "87a7830d63fcf43b",
+  "lm_xml_sha": "5892b9b333bf0ab3",
+  "lm_bin_bytes": 14405167394,
+  "status": "provisional, 7/10 (AWQ-only; SE calibration degenerates greedy - do not re-add SE)",
+  "mtp_num_hidden_layers": 1,
+  "mtp_head_exported": true
+ },
+ "qwen38-intel-int4-ov": {
+  "arch": [
+   "Qwen3_5ForConditionalGeneration"
+  ],
+  "model_type": "qwen3_5",
+  "hidden": 5120,
+  "layers": 64,
+  "experts": null,
+  "ctx": 262144,
+  "full_attention_interval": 4,
+  "template_sha": "c3cf9e34abf4f9e3",
+  "tokenizer_sha": "87a7830d63fcf43b",
+  "lm_xml_sha": "ab94a08ce150de6a",
+  "lm_bin_bytes": 13929177378,
+  "status": "10/10 greedy on the acceptance task (paged+MTP, B60, 2026-08-30), 36.3 t/s, 90.8% draft acceptance (296/326); Intel's public int4 export with the reconstructed MTP head beside it; --mtp off 25.0 t/s, reconstructed layer 36.9-37.3 (code) / 33.8-34.0 (prose), Intel's exported layer + our lm_head 37.7-38.1 / 34.3-34.9 t/s",
+  "mtp_num_hidden_layers": 1,
+  "mtp_head_exported": true,
+  "_note": "Intel's export also ships openvino_mtp_model.{xml,bin} of its own (263 MB int4, one MTP layer, no lm_head, same interface as our openvino_mtp_layer). arcint keys the head on openvino_mtp_layer + openvino_mtp_lm_head, which are the reconstructed ones."
+ },
+ "qwen36-35b-a3b-mtp-ov": {
+  "arch": [
+   "Qwen3_5MoeForConditionalGeneration"
+  ],
+  "model_type": "qwen3_5_moe",
+  "hidden": 2048,
+  "layers": 40,
+  "experts": 256,
+  "ctx": 262144,
+  "full_attention_interval": 4,
+  "template_sha": "c3f7038f278583e1",
+  "tokenizer_sha": "87a7830d63fcf43b",
+  "lm_xml_sha": "21fe4d57d6d016f5",
+  "lm_bin_bytes": 18646558274,
+  "status": "head pairs (93.9% code / 75.4% prose draft acceptance, B60, 2026-08-30); --mtp on 48-53 t/s vs 71.5 t/s off \u2014 the serving loop is host-bound (36.5 ms of wall for 16.7 ms of device per accepted pair) and the f16 dense-expert head is 6.7 ms of device a draft, a wash on device time; not for production",
+  "mtp_num_hidden_layers": 1,
+  "mtp_head_exported": true
+ },
+ "qwen35-2b-ov": {
+  "arch": [
+   "Qwen3_5ForConditionalGeneration"
+  ],
+  "model_type": "qwen3_5",
+  "hidden": 2048,
+  "layers": 24,
+  "experts": null,
+  "ctx": 262144,
+  "full_attention_interval": 4,
+  "template_sha": "c3cf9e34abf4f9e3",
+  "tokenizer_sha": "87a7830d63fcf43b",
+  "lm_xml_sha": "ec0078368fcce101",
+  "lm_bin_bytes": 1884937298,
+  "status": "provisional; dense qwen35 marker export (FIX 8.2), served via GGUF on the 16 GiB card, not acceptance-scored",
+  "mtp_num_hidden_layers": 1,
+  "mtp_head_exported": false
+ },
+ "qwen38-flash-next-d4-ov": {
+  "_note": "2026-09-13: the serving-shape IR of Qwen3.8 Flash-Next (qwen4exp) at DEPTH 4 of 48, real weights from the UD-Q3_K_XL shards (tools/export_serving_artifact.py --layers 4, tree wt+6743ffb, serving-shape.json beside it). Hashes read off /models/ov/qwen38-flash-next-d4-ov on the dev host. The n-gram table is not in the .bin: it binds to the IR's ngram_table.K ports from the GGUF shard at load (--ngram-gguf). A measurement artifact for the served path -- 44 layers are missing, its answers are not the model's.",
+  "arch": [
+   "Qwen4ExpForConditionalGeneration"
+  ],
+  "model_type": "qwen4_exp",
+  "hidden": 2560,
+  "layers": 4,
+  "experts": 512,
+  "ctx": 262144,
+  "full_attention_interval": 4,
+  "template_sha": "12827f24b742ea4e",
+  "tokenizer_sha": "87a7830d63fcf43b",
+  "lm_xml_sha": "2910a860bf9dc6bb",
+  "lm_bin_bytes": 9427885993,
+  "status": "measurement artifact: depth 4 of 48, served-path boot; not the model's answers",
+  "mtp_num_hidden_layers": 1,
+  "mtp_head_exported": false
+ },
+ "qwen38-flash-next-ov": {
+  "_note": "2026-09-13: the serving-shape IR at ALL 48 layers, real weights (tools/export_serving_artifact.py --layers 48, tree 092df69; serving-shape.json beside it). Hashes read off /models/ov/qwen38-flash-next-ov on the dev host. Built to be pointed at by the served binary; window-050 \u00a74.10 predicts and records the residency refusal (measured on the A770: the plugin stages every constant in USM host memory at compile and the host runs out first).",
+  "arch": [
+   "Qwen4ExpForConditionalGeneration"
+  ],
+  "model_type": "qwen4_exp",
+  "hidden": 2560,
+  "layers": 48,
+  "experts": 512,
+  "ctx": 262144,
+  "full_attention_interval": 4,
+  "template_sha": "12827f24b742ea4e",
+  "tokenizer_sha": "87a7830d63fcf43b",
+  "lm_xml_sha": "3f574b776a8dd2c6",
+  "lm_bin_bytes": 81948724009,
+  "status": "full depth, 48 of 48: built; the served-path compile on the A770 was refused by HOST memory (USM host staging of 69 GiB of constants, window-050 \u00a74.10); not servable on this host",
+  "mtp_num_hidden_layers": 1,
+  "mtp_head_exported": false
+ },
+ "qwen38-flash-next-d48g-ov": {
+  "_note": "2026-09-18: the 48-layer serving-shape IR re-exported from tree f91ea73 through the corrected fill (DESIGN 7.0.2bz: the GGUF converter's folded norm gammas and -exp(A_log) undone at the feed, the sigmoid output gate, the tiled key-head pairing), after the fill's three defects were found against llama.cpp's own tensors of the same GGUF. Its depth-4 sibling agrees with llama.cpp at every cut (layer 3 out corr 0.9987). Supersedes d48f (tree da52858, xml f89a162348b13d18), which served logits with no information about the model (KL 12.4 nats against the model's own capture). Hashes read off the export log.",
+  "arch": [
+   "Qwen4ExpForConditionalGeneration"
+  ],
+  "model_type": "qwen4_exp",
+  "hidden": 2560,
+  "layers": 48,
+  "experts": 512,
+  "ctx": 262144,
+  "full_attention_interval": 4,
+  "template_sha": "12827f24b742ea4e",
+  "tokenizer_sha": "87a7830d63fcf43b",
+  "lm_xml_sha": "a077e6e4bfa9b847",
+  "lm_bin_bytes": 80061287197,
+  "status": "full-depth fused-MoE artifact through the corrected fill; the KLD gate against the model's own capture is its acceptance",
+  "mtp_num_hidden_layers": 1,
+  "mtp_head_exported": false
+ },
+ "qwen38-flash-next-d48n-ov": {
+  "_note": "2026-09-18: the 48-layer serving-shape IR with the checkpoint's own expert blocks (IQ3_XXS / IQ4_XS gate-up, IQ4_NL / Q8_0 down, per layer as the GGUF ships them) decoded in standard ops, exported from tree 69dfffd (--expert-format native). Serves through marfrit-openvino +p19 (patch 0043), every routed expert on the CPU tier. Its depth-4 sibling agrees with llama.cpp at layer 0/1/2/3 out corr 0.99991 / 0.99989 / 0.99970 / 0.99953 (d48g's u4 repack: 0.99924 / 0.99918 / - / 0.99873). Hashes read off the export log.",
+  "arch": [
+   "Qwen4ExpForConditionalGeneration"
+  ],
+  "model_type": "qwen4_exp",
+  "hidden": 2560,
+  "layers": 48,
+  "experts": 512,
+  "ctx": 262144,
+  "full_attention_interval": 4,
+  "template_sha": "12827f24b742ea4e",
+  "tokenizer_sha": "87a7830d63fcf43b",
+  "lm_xml_sha": "641fcb1863f83629",
+  "lm_bin_bytes": 77492280673,
+  "status": "full-depth artifact with the checkpoint's native expert formats (patch 0043, every routed expert on the CPU tier); the KLD gate against the model's own capture is its acceptance",
+  "mtp_num_hidden_layers": 1,
+  "mtp_head_exported": false
+ },
+ "qwen38-flash-next-d12-ov": {
+  "_note": "2026-09-13: the serving-shape IR of Qwen3.8 Flash-Next (qwen4exp) at DEPTH 12 of 48 -- the depth ladder's first rung (docs/window-051.md row (b)), real weights from the UD-Q3_K_XL shards (tools/export_serving_artifact.py --layers 12, tree d93508c, serving-shape.json beside it). Hashes read off /models/ov/qwen38-flash-next-d12-ov on the dev host (build 1,450.9 s, peak host 30.39 GiB). A measurement artifact: 36 layers are missing, its answers are not the model's.",
+  "arch": [
+   "Qwen4ExpForConditionalGeneration"
+  ],
+  "model_type": "qwen4_exp",
+  "hidden": 2560,
+  "layers": 12,
+  "experts": 512,
+  "ctx": 262144,
+  "full_attention_interval": 4,
+  "template_sha": "12827f24b742ea4e",
+  "tokenizer_sha": "87a7830d63fcf43b",
+  "lm_xml_sha": "7738fa87cddca8e2",
+  "lm_bin_bytes": 22613492905,
+  "status": "measurement artifact: depth 12 of 48, the depth ladder's first rung; not the model's answers",
+  "mtp_num_hidden_layers": 1,
+  "mtp_head_exported": false
+ },
+ "qwen38-flash-next-d12r-ov": {
+  "_note": "2026-09-17: the DEPTH-12 artifact of 2026-09-13 rewritten in memory by tools/moe_tiled_rewrite.py at tree 0b66c43 and written back with ov.save_model (NOT an export: same u4 codes and zero-points, scales rounded to f16, the MoE block in the shape the GPU plugin's tiled matcher accepts -- two Reshapes, a one-input Swish, an f16 dequant chain with a trailing Convert). The first Flash-Next serving-shape artifact that compiles to moe_3gemm_fused_compressed; with --offload-ratio 99 --moe-cpu-tier it is 3.00 GiB device-resident on the 24 GiB card against 17.73 unfused. Hashes read off the artifact on the dev host (arcint --inspect-artifact). A measurement artifact: 36 layers are missing, its answers are not the model's; superseded by a re-export from the shards.",
+  "arch": [
+   "Qwen4ExpForConditionalGeneration"
+  ],
+  "model_type": "qwen4_exp",
+  "hidden": 2560,
+  "layers": 12,
+  "experts": 512,
+  "ctx": 262144,
+  "full_attention_interval": 4,
+  "template_sha": "12827f24b742ea4e",
+  "tokenizer_sha": "87a7830d63fcf43b",
+  "lm_xml_sha": "d1d1005332c96fbc",
+  "lm_bin_bytes": 22141633733,
+  "status": "measurement artifact: depth 12 of 48, the fused-MoE rewrite of the first rung; not the model's answers",
+  "mtp_num_hidden_layers": 1,
+  "mtp_head_exported": false
+ },
+ "qwen38-flash-next-seg12-ov": {
+  "_note": "2026-09-14: ALL 48 layers as a SEGMENTED chain of four 12-layer compiled models (tools/export_serving_artifact.py --layers 48 --segment-layers 12, tree c00500f, filled 2026-09-13 22:09-23:39Z on the dev host). The directory holds segment0/..segment3/ (own openvino_language_model.{xml,bin} each) and one expert_bodies.u8 blob (144 bodies, 60,397,977,600 B) that the segmented runtime refills one segment at a time; serving-shape.json carries segments[] and the body index. lm_xml_sha is NOT a file digest here: a segmented artifact hashes as segplan::chain_arch_hash over the four segment xml digests in segment order (src/core/artifact.cpp), and it was read off the directory with `arcint --model <dir> --inspect-artifact`, which printed arch 32d3060ca30238d1, per-segment bins 4,944,946,409 + 4,813,218,673 + 4,813,218,673 + 7,382,270,833 = 21,953,654,588 B, and one 36-slot buffer set of 15,099,494,400 B (14.06 GiB). A measurement artifact: no segmented runtime drives it yet, so its answers are not the model's either way.",
+  "arch": [
+   "Qwen4ExpForConditionalGeneration"
+  ],
+  "model_type": "qwen4_exp",
+  "hidden": 2560,
+  "layers": 48,
+  "experts": 512,
+  "ctx": 262144,
+  "full_attention_interval": 4,
+  "template_sha": "12827f24b742ea4e",
+  "tokenizer_sha": "87a7830d63fcf43b",
+  "lm_xml_sha": "32d3060ca30238d1",
+  "lm_bin_bytes": 21953654588,
+  "status": "measurement artifact: 48 layers as a 4x12 segment chain; no segmented runtime yet; not the model's answers",
+  "mtp_num_hidden_layers": 1,
+  "mtp_head_exported": false
+ },
+ "qwen36-35b-a3b-d4n-ov": {
+  "arch": [
+   "Qwen3_5MoeForConditionalGeneration"
+  ],
+  "model_type": "qwen3_5_moe",
+  "hidden": 2048,
+  "layers": 4,
+  "experts": 256,
+  "ctx": 262144,
+  "full_attention_interval": 4,
+  "template_sha": "55d4931433fe502b",
+  "tokenizer_sha": "87a7830d63fcf43b",
+  "lm_xml_sha": "391bd21db6368d57",
+  "lm_bin_bytes": 4284499713,
+  "status": "measurement artifact: depth 4 of 40, native IQ2_S/IQ3_XXS experts, no PLE/n-gram table; not the model's answers",
+  "mtp_num_hidden_layers": 1,
+  "mtp_head_exported": false
+ },
+ "qwen36-35b-a3b-d40n-ov": {
+  "arch": [
+   "Qwen3_5MoeForConditionalGeneration"
+  ],
+  "model_type": "qwen3_5_moe",
+  "hidden": 2048,
+  "layers": 40,
+  "experts": 256,
+  "ctx": 262144,
+  "full_attention_interval": 4,
+  "template_sha": "55d4931433fe502b",
+  "tokenizer_sha": "87a7830d63fcf43b",
+  "lm_xml_sha": "b94ecc6ab6b200ac",
+  "lm_bin_bytes": 23429144641,
+  "status": "measurement artifact: the full-depth (40-layer) native IQ2_S/IQ3_XXS/IQ4_XS serving-shape rung, no PLE/n-gram table; not a quality claim",
+  "mtp_num_hidden_layers": 1,
+  "mtp_head_exported": false
+ }
 }

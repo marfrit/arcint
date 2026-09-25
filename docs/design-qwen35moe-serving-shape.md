@@ -433,3 +433,67 @@ arithmetic, not a full-depth estimate.
   text is degenerate; whether that is truncation or an emitter weight-mapping
   defect is not resolved here. The device-free verification covered the expert
   bodies and the norm weights only.
+
+## 10. The full-depth (40-layer) native export, landed 2026-09-25 — verified before any card
+
+The A770 window (§9) left one decisive question open: was the depth-4
+artifact's degenerate greedy text **truncation** or an **emitter/fill defect**?
+A full-depth artifact answers it without a card. Evidence classes: `code`,
+`measured-here`, `previously-measured`.
+
+### 10.1 The export
+
+`tools/export_serving_artifact.py --family qwen35moe --layers 40
+--expert-format native` over the same checkpoint shard as depth 4, with the
+served int4 artifact as the tokenizer passthrough. `measured-here` (its own
+log): feed 6.8 s; **build 249.2 s** for **40 layers = 30 GDN + 10 attn,
+14,499 nodes**; dense fill 612 tensors / 7.23 GiB; expert fill **120 bodies /
+24,662,507,520 B**; save 236.7 s → language-model `.bin`
+**23,429,144,641 B** (21.82 GiB) and embeddings `.bin` 2,034,237,448 B (1.89
+GiB); `lm_xml_sha b94ecc6ab6b200ac`; chat template `55d4931433fe502b`;
+tokenizer `87a7830d63fcf43b`. **peak_host_GiB 29.38** — inside the container's
+44 GiB cgroup cap, so the full-depth build is a single process, not a
+segmented one (`code`: `qwen35moe` refuses `--segment-layers`). Artifact about
+25.9 GiB.
+
+### 10.2 The all-body type census — 120/120 match the GGUF
+
+`measured-here`, read off the saved IR's Constants (the emitter names them
+`layer{i}/moe/experts_{kind}/...`), against gguf-py's own tensor types:
+
+| role | IR bodies | GGUF types |
+|---|---|---|
+| gate | 40 × IQ2_S | 40 × IQ2_S |
+| up | 40 × IQ2_S | 40 × IQ2_S |
+| down | 37 × IQ3_XXS + 3 × IQ4_XS→IQ4_NL | 37 × IQ3_XXS + 3 × IQ4_XS |
+
+The three IQ4_XS down layers fold onto the IQ4_NL layout
+(`native_blocks.iq4_xs_split`), exactly as depth 4 did.
+
+### 10.3 Sampled byte-exactness — the artifact, not the emitter
+
+`measured-here`: the IR's packed Constant **bytes** (not a re-run of the fill)
+compared against the emitter's packing recomputed from the GGUF — one gate and
+one up body at layer 0 (IQ2_S), down at layers 0 and 19 (IQ3_XXS), down at
+layers 34 and 39 (IQ4_XS→IQ4_NL). Every one: **grid indices, sign bytes and
+block scales byte-equal**, `grid_ok/sign_ok/scale_ok = True`. Shapes read off
+the artifact: IQ2_S `[256,512,64,8]` + `[256,512,64,4]` + f16 `[256,512,64,2]`;
+IQ3_XXS `[256,2048,16,8]` + `[256,2048,16,4]` + f16 `[256,2048,16,1]`;
+IQ4_NL codes packed `[134,217,728]` u8 + f16 `[256,2048,16,1]`.
+
+### 10.4 Admission
+
+`qwen3.6-35b-a3b-native-d40` (artifact `qwen36-35b-a3b-d40n-ov`) is admitted
+with `n_layer 40`, 10 attention + 30 GDN, 256 experts, `arch_hash
+b94ecc6ab6b200ac`, template `55d4931433fe502b`, tokenizer
+`87a7830d63fcf43b`, **`weights_bytes 23,429,144,641`** — all read off the
+artifact's own `serving-shape.json`. The depth-4 rung stays admitted beside
+it. `measured-here`: `--inspect-artifact` prints
+`admitted as qwen3.6-35b-a3b-native-d40`; `tests/test_registry.cpp` is 20
+cases, 0 failed (the new entry has its own red-first cell), `test_provenance`
+4/0, `test_ngram_ports` 13/0.
+
+### 10.5 OWED
+
+The **A770 reading** of the full-depth artifact — coherence, rate, digests,
+fit, 262144, V4 — is the window that follows in this leg, recorded in §11.
