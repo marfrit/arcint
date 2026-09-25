@@ -1399,7 +1399,13 @@ rc 0. Emitter side: the packed chain decodes random blocks to `max diff/bound
 f32 dot's summation order), and all four sampled real IQ2_S expert tensors
 (`blk.0` gate/up, `blk.2` gate, and the IQ3_XXS down that stays on its own
 route) are byte-identical to the checkpoint's own blocks -- 80 B weight plus
-the f16 `d`, `w80exact=True dexact=True`.
+the f16 `d`, `w80exact=True dexact=True`. A depth-4 export
+(`tools/export_serving_artifact.py --layers 4 --expert-format native
+--native-packed`, `qwen36-35b-a3b-d4packed-ov`) against the re-laid depth-4
+artifact: **expert fill 2,415,919,104 -> 1,241,513,984 B (-48.6 %)** and the
+language-model `.bin` 4,284,499,713 -> 3,898,623,853 B. (The 48.6 % is below
+the 82/128 = 64 % the IQ2_S bodies alone would give; the IQ3_XXS downs, which
+stay on their own route, are unchanged.)
 
 **OWED.** The card leg: a packed artifact compiling through the GPU plugin
 (the matcher firing) and serving under all-resident. The OTD CPU-tier decode
