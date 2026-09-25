@@ -1459,3 +1459,24 @@ the campaign rules say it becomes its own document.
     block, the matcher, `moe_compressed.hpp`, `moe_3gemm`/`moe_otd_runtime`,
     the CPU row decoder and the OCL `native_dot_iq2s`. Red-first cells owed
     (packed geometry + byte-exactness vs gguf-py). See design note §12.4.
+
+[DATED IN PLACE 2026-09-26 (the payoff leg — packing landed, the gate BLOCKED)]:
+patch `0052-iq2s-packed-format.patch` lands `kWeightFormatIq2SPacked == 5` — the
+checkpoint's own IQ2_S block with the f16 `d` lifted into the scale slot, 80
+self-contained bytes + one f16 per 256 = **82 B/256** (the GGUF's own size)
+against the re-laid form's 128 — additively, across the op/blocks/matcher/CPU
+tier/OCL/runtime plus the emitter (`_native_packed_expert`, `--native-packed`).
+Device-free: census **120/120** packed (exactly the GGUF's own types), sampled
+byte-exactness full-E `w80_ok=True d_ok=True`, the chain bit-exact to
+1.28e-07; admitted as `qwen3.6-35b-a3b-native-d40packed` (lm `.bin`
+15,623,664,495 B vs the re-laid f16 d40's 19,482,424,091). The A770
+all-resident gate (`GPU.1`, ratio 0 + dispatch, chunk 1024, n-ctx 262144,
+depths 1/4096) is **BLOCKED twice**: the compile's host RAM still bites (RSS
+44,292,600 kB → container MemAvailable 3,149,125 kB → watchdog SIGKILL
+21:33:41Z; no fit verdict), and the packed decode chain's rank-6 signs
+`Select` `[256,512,8,8,4,8]` gets no layout in
+`add_required_reorders.cpp:342` — the matcher itself **fires**
+(`iq2sp RESOLVED` ×8). Control with the same plugin: the re-laid d4
+all-resident compiles and serves, 57.1 t/s decode, `device-resident 2.71 GiB`.
+OWED: the rank-6 `Select` layout and a packed rate; the 262144 fit; the OTD
+CPU-tier row decoder; the logits-level V4 A/B. See design note §13.
