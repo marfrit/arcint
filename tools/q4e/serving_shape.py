@@ -881,6 +881,9 @@ def _native_expert(arena, e, out, inn, name, fmt, parts):
     rows = e * out
     groups = inn // 32
     g4 = op.constant(np.array([e, out, groups, 32], np.int64))
+    if fmt == "IQ2_S_PACKED":
+        w80, d = parts
+        return _native_packed_expert(arena, e, out, inn, name, w80, d)
     if fmt in ("IQ4_NL", "IQ4_XS"):
         # IQ4_XS splits to the IQ4_NL layout (its 6-bit sub-block scales are
         # folded into the per-32 f32 scale, native_blocks.iq4_xs_split), so
@@ -1004,6 +1007,90 @@ def _native_expert(arena, e, out, inn, name, fmt, parts):
     arena.scales[name + "/block_scale"] = np.ascontiguousarray(scales, np.float32)
     x = op.multiply(x, op.convert(sc, Type.f32))
     x = op.reshape(x, op.constant(np.array([e, out, inn], np.int64)), special_zero=False)
+    x.set_friendly_name(name + "/native_f32")
+    return x
+
+
+def _native_packed_expert(arena, e, out, inn, name, w80, d):
+    """IQ2_S-PACKED (patch 0052). The checkpoint's own 82-byte ggml block per
+    256 values, kept VERBATIM: 32 B qs (four 2-bit low index bytes per ib32) |
+    32 B RAW sign masks | 8 B qh (two high index bits per l) | 8 B four-bit
+    sub-block scales, with the f16 d lifted into the scale slot. The weight
+    Constant is [E, out, K/256, 80] u8 -- 82 B per 256 against the re-laid
+    IQ2_S's 128 B and the u4 repack's 144 B, the GGUF's own size (design note
+    12.4: 10.35 GiB of experts against 14.47 re-laid). The decode is
+    arithmetic in f32 (the same style as _unpack_u8_to_u4_f32): idx =
+    qs + 256*((qh >> 2l) & 3), y = d*(0.5+nib)*0.25 * grid[idx] * sign, the
+    low nibble for l<2 and the high for l>=2. Bit-exact against
+    native_blocks.iq2_s_decode.
+
+    The arithmetic is the CPU oracle; the plugin's matcher replaces the whole
+    chain, reading only the two Constants (the packed u8 weight and the f16 d).
+    """
+    from q4e import native_blocks as nb
+    rows = e * out
+    nblk = inn // 256
+    assert inn % 256 == 0, (inn, "IQ2_S-packed needs a multiple of 256")
+    assert w80.shape == (rows, nblk * 80) and d.shape == (rows, nblk), (w80.shape, d.shape)
+    f32 = lambda v: op.constant(np.array(v, np.float32))
+    i64 = lambda v: op.constant(np.array(v, np.int64))
+
+    w = arena.constant([e, out, nblk, 80], Type.u8,
+                       fill=np.ascontiguousarray(w80.reshape(e, out, nblk, 80)),
+                       name=name + "/iq2s_packed_u8")
+    w.set_friendly_name(name + "/iq2s_packed_u8")
+
+    def sl(a, b):
+        return op.slice(w, i64([a]), i64([b]), i64([1]), i64([-1]))
+
+    qs = op.convert(op.reshape(sl(0, 32), i64([e, out, nblk, 8, 4]), special_zero=False), Type.f32)
+    sg = op.convert(op.reshape(sl(32, 64), i64([e, out, nblk, 8, 4]), special_zero=False), Type.f32)
+    qh = op.convert(op.reshape(sl(64, 72), i64([e, out, nblk, 8]), special_zero=False), Type.f32)
+    scb = op.convert(op.reshape(sl(72, 80), i64([e, out, nblk, 8]), special_zero=False), Type.f32)
+
+    # high_l = (qh >> 2l) & 3 in f32 arithmetic: a per-l divisor broadcasts
+    # over the last axis, so no shifts and no Concat -- floor(qh/[1,4,16,64])
+    # then mod 4 (floor(f/4) subtracted back)
+    qh_u = op.unsqueeze(qh, i64([-1]))                              # [E,out,nblk,8,1]
+    qh_f = op.floor(op.divide(qh_u, f32([1.0, 4.0, 16.0, 64.0])))
+    high = op.subtract(qh_f, op.multiply(op.floor(op.divide(qh_f, f32(4.0))), f32(4.0)))
+    idx = op.add(qs, op.multiply(high, f32(256.0)))
+    idx.set_friendly_name(name + "/iq2s_packed_index")
+
+    grid = op.constant(nb.IQ2S_GRID.astype(np.float32))            # [1024,8]
+    mag = op.gather(grid, op.convert(idx, Type.i32), i64(0))       # [E,out,nblk,8,4,8]
+    mag = op.reshape(mag, i64([e, out, nblk, 256]), special_zero=False)
+    mag.set_friendly_name(name + "/iq2s_packed_grid")
+
+    # IQ2_S signs are the RAW byte: bit j flips value j
+    bits = op.bitwise_and(op.unsqueeze(op.convert(sg, Type.i32), i64([-1])),
+                          op.constant(nb.KMASK_IQ2XS.astype(np.int32)))   # [E,out,nblk,8,4,8]
+    neg = op.greater(bits, op.constant(np.int32(0)))
+    sign = op.reshape(op.select(neg, f32(-1.0), f32(1.0)),
+                      i64([e, out, nblk, 256]), special_zero=False)
+    sign.set_friendly_name(name + "/iq2s_packed_sign")
+    x = op.multiply(mag, sign)
+
+    # a 32-value group carries two 4-bit scales: the low nibble for l=0,1 and
+    # the high for l=2,3 (ggml-quants.c dequantize_row_iq2_s). Same trick: the
+    # per-l divisor [1,1,16,16] broadcasts, then mod 16.
+    scb_u = op.unsqueeze(scb, i64([-1]))                            # [E,out,nblk,8,1]
+    sc_f = op.floor(op.divide(scb_u, f32([1.0, 1.0, 16.0, 16.0])))
+    nib = op.subtract(sc_f, op.multiply(op.floor(op.divide(sc_f, f32(16.0))), f32(16.0)))
+    sc32 = op.reshape(op.broadcast(op.reshape(nib, i64([e, out, nblk, 8, 4, 1]), special_zero=False),
+                                   i64([e, out, nblk, 8, 4, 8])),
+                      i64([e, out, nblk, 256]), special_zero=False)
+    sc32.set_friendly_name(name + "/iq2s_packed_scale32")
+
+    dd16 = np.ascontiguousarray(d, np.float16).reshape(e, out, nblk, 1)
+    dd = arena.constant([e, out, nblk, 1], Type.f16, fill=dd16, name=name + "/block_scale")
+    dd.set_friendly_name(name + "/block_scale")
+    arena.scales[name + "/block_scale"] = np.ascontiguousarray(d, np.float32).reshape(e, out, nblk)
+    # ggml's own association: d * (0.5 + s) * 0.25, left to right
+    scale = op.multiply(op.multiply(op.convert(dd, Type.f32), op.add(f32(0.5), sc32)),
+                        f32(0.25))
+    x = op.multiply(x, scale)
+    x = op.reshape(x, i64([e, out, inn]), special_zero=False)
     x.set_friendly_name(name + "/native_f32")
     return x
 

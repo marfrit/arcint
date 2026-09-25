@@ -340,6 +340,11 @@ def main(argv=None):
                          "USM-host buffer and the 26.82 GiB pin never happens. "
                          "The bound is max_tokens x Hn, Hn = (ngram_size - 1) x "
                          "heads_per_ngram; the table itself still has to be on disk")
+    ap.add_argument("--native-packed", action="store_true",
+                    help="with --expert-format native: carry the checkpoint's own "
+                         "82-byte IQ2_S block VERBATIM (82 B/256, the GGUF size; "
+                         "plugin format 5, patch 0052) instead of the re-laid "
+                         "split form (128 B/256)")
     ap.add_argument("--dense-fp16", action="store_true",
                     help="store the graph's f32 Constants (dense weights, norms, head) as "
                          "f16; the native expert bodies are u8/f16 already and unaffected. "
@@ -394,7 +399,7 @@ def main(argv=None):
         # and decoded in ops (DESIGN 7.0.2bz; design-routing-aware-expert-
         # execution 2.3a-2.3c); the u4 repack costs 0.10-0.13 relative RMS per
         # tensor
-        filler = ef.NativeExpertFiller(feed)
+        filler = ef.NativeExpertFiller(feed, packed=args.native_packed)
     else:
         filler = ef.ExpertFiller(ef.gguf_expert_source(feed), ss.EXPERT_GROUP_SIZE)
     reader0 = feed._readers[0]

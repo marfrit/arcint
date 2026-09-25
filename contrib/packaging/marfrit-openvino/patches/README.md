@@ -1356,6 +1356,55 @@ disclosed the same as 0046-0050 (the built plugin reports
 the A770 and its rate against the tiered arm — is the card leg's, not this
 patch's.
 
+## 0052 — IQ2_S-packed: the checkpoint's own block, verbatim
+
+The checkpoint (`Qwen3.6-35B-A3B-UD-IQ3_XXS`) serves 80 IQ2_S expert tensors.
+The 0050 route re-laid each into a split form -- a u16 index, a sign byte and
+an f16 scale per 8 values -- at 128 B per 256. This patch carries the
+checkpoint's own block instead, with the f16 `d` lifted into the scale slot:
+**80 self-contained bytes** (32 B qs low-2-bit indices | 32 B RAW sign masks |
+8 B qh high-2-bit | 8 B 4-bit sub-block scales) plus one f16 per 256-value
+block -- **82 B/256**, the GGUF's own size (design note 12.4: 10.35 GiB of
+experts against 14.47). Added additively: `kWeightFormatIq2S` (4) and every
+other path are untouched.
+
+- `ov_ops/moe_compressed.{hpp,cpp}`: `kWeightFormatIq2SPacked == 5`, the
+`is_native_format` membership, the weight-shape assert
+`[E, out, K/256, 80]` (K = dim 2 × 256), and the affine `group_size`
+cross-check skipped -- this format's scale is per 256, not per group.
+- `native_expert_block.{hpp,cpp}`: `NativeIq2sPackedWeightsBlock`. It matches
+the emitter's chain (`tools/q4e/serving_shape.py _native_packed_expert`): four
+`Slice`s carve qs / signs / qh / sub-block scales out of the last axis; the
+2-bit high index bits and the 4-bit sub-block scales come out in f32
+arithmetic (a per-l divisor broadcasts over a new last axis, `floor` + mod --
+no shifts, no `Concat`); the magnitudes are `Gather(iq2s_grid[1024,8])` and
+the signs the RAW byte (bit j flips value j). Anchors: `weight`, `scale`,
+`reshape`.
+- `convert_tiled_moe_block_to_gather_matmuls.cpp`: the block joins the native
+`Or` (tried first -- its first op after the Constant is a `Slice`, not the
+IQ2_S block's `Reshape`); `resolve` sets format 5 with `zp` aliasing `scale`;
+`hidden_size` takes 256 values per group row for it.
+- `moe_cpu_expert.{hpp,cpp}`: `kQuantFormatIq2SPacked == 5` and the CPU-tier
+row decoder (80-byte block, `d` from `m.s[n*nblk + ib]`).
+- `moe_expert_swiglu.cl`: `native_dot_iq2s_packed` -- the OCL per-expert decode
+-- plus the gate/up/down weight and scale slot strides for format 5.
+- `moe_otd_runtime.cpp`: the scale transpose is skipped for format 5 (the
+scale slot is a plain per-256 f16 vector, not an `[oc, groups]` payload).
+- `moe_3gemm_swiglu_opt.cpp`: the native gate/up and down asserts admit 5.
+
+MEASURED (2026-09-25/26, device-free): the 0050 build dir (`build-meas-0050`,
+debug caps OFF) relinks clean with the patch applied -- the GPU plugin links,
+rc 0. Emitter side: the packed chain decodes random blocks to `max diff/bound
+1.28e-07` against `native_blocks.iq2_s_packed_decode` (bit-exact modulo the
+f32 dot's summation order), and all four sampled real IQ2_S expert tensors
+(`blk.0` gate/up, `blk.2` gate, and the IQ3_XXS down that stays on its own
+route) are byte-identical to the checkpoint's own blocks -- 80 B weight plus
+the f16 `d`, `w80exact=True dexact=True`.
+
+**OWED.** The card leg: a packed artifact compiling through the GPU plugin
+(the matcher firing) and serving under all-resident. The OTD CPU-tier decode
+path is untested against the emitter's chain.
+
 ## Not carried either: the measurement instrument
 
 The arcint session's working tree also carries per-stage timing accumulators

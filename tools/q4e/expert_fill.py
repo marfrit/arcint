@@ -309,9 +309,13 @@ class NativeExpertFiller:
     over e*out rows. `layer_of` maps an IR layer to a GGUF
     block as in `gguf_expert_source`. The census matches ExpertFiller's."""
 
-    def __init__(self, feed, layer_of=None):
+    def __init__(self, feed, layer_of=None, packed=False):
         self._feed = feed
         self._layer_of = layer_of
+        # arcint (patch 0052): carry the checkpoint's own 82-byte IQ2_S block
+        # VERBATIM (82 B/256, the GGUF size) instead of re-laying it into the
+        # split form (128 B/256); the emitter's _native_packed_expert reads it.
+        self._packed = packed
         self.served = []
         self._seen = {}
 
@@ -331,6 +335,10 @@ class NativeExpertFiller:
         block, nbytes = nb.BLOCK_BYTES[fmt]
         assert raw.shape[2] == inn // block * nbytes, (
             f"{gname}: {raw.shape[2]} B per row is not {inn} values of {fmt}")
+        if self._packed and fmt in nb.PACKED:
+            parts = nb.PACKED[fmt](raw.reshape(e * out, raw.shape[2]))
+            self.served.append((layer, kind, (e, out, inn), int(sum(p.nbytes for p in parts))))
+            return fmt + "_PACKED", parts
         parts = nb.SPLIT[fmt](raw.reshape(e * out, raw.shape[2]))
         self.served.append((layer, kind, (e, out, inn), int(sum(p.nbytes for p in parts))))
         return fmt, parts

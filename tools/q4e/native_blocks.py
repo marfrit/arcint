@@ -409,7 +409,57 @@ def iq2_s_decode(gridix, signix, scales):
     return (mag * sign * scales[:, :, None].astype(np.float32)).reshape(rows, inn)
 
 
+def iq2_s_packed_split(raw):
+    """raw: u8 [rows, in // 256 * 82] -> (w80 u8 [rows, in // 256 * 80], d f32
+    [rows, in // 256]).
+
+    The PACKED form (patch 0052): the checkpoint's own block kept VERBATIM as
+    80 self-contained bytes -- 32 qs (four 2-bit low index bytes per ib32) |
+    32 RAW sign masks | 8 qh (two high index bits per l) | 8 four-bit
+    sub-block scales -- with the f16 d lifted out to the scale slot. 82 B per
+    256 values, the GGUF's own size, against the re-laid IQ2_S's 128 B (8
+    index + 4 sign + 2 f16 scale per 32)."""
+    raw = np.ascontiguousarray(raw, dtype=np.uint8)
+    rows, nbytes = raw.shape
+    assert nbytes % IQ2_S_BYTES == 0, f"{nbytes} B is not whole IQ2_S blocks"
+    nb = nbytes // IQ2_S_BYTES
+    blk = raw.reshape(rows, nb, IQ2_S_BYTES)
+    d = _f16_le(blk[:, :, 0:2])                                     # [rows, nb]
+    w80 = blk[:, :, 2:82].reshape(rows, nb * 80)                    # d stripped
+    return w80, d
+
+
+def iq2_s_packed_decode(w80, d):
+    """The exact f32 decode of the packed form -- ggml's
+    `d * (0.5 + s) * 0.25 * grid * sign` with the association the emitter's
+    chain uses (d and (0.5+s) first, then 0.25). w80 u8 [rows, nb*80], d f32
+    [rows, nb] -> [rows, nb*256]."""
+    w80 = np.ascontiguousarray(w80, dtype=np.uint8)
+    rows, nbytes = w80.shape
+    assert nbytes % 80 == 0, f"{nbytes} B is not whole packed blocks"
+    nb = nbytes // 80
+    b = w80.reshape(rows, nb, 80)
+    qs = b[:, :, 0:32].reshape(rows, nb, 8, 4).astype(np.int64)
+    signs = b[:, :, 32:64].reshape(rows, nb, 8, 4)
+    qh = b[:, :, 64:72].astype(np.int64)
+    sc = b[:, :, 72:80].astype(np.int64)
+    high = (qh[:, :, :, None] >> (2 * np.arange(4))) & 3
+    idx = (qs | (high << 8)).reshape(rows, nb * 32)
+    signix = signs.reshape(rows, nb * 32)
+    lo = (sc & 0x0F).astype(np.float32)
+    hi = (sc >> 4).astype(np.float32)
+    nib = np.stack([lo, lo, hi, hi], axis=-1).reshape(rows, nb * 32)
+    d16 = np.repeat(d.astype(np.float32)[:, :, None], 32, axis=2).reshape(rows, nb * 32)
+    s = (d16 * (np.float32(0.5) + nib)) * np.float32(0.25)
+    mag = IQ2S_GRID[idx].astype(np.float32).reshape(rows, nb * 32, 8)
+    bits = (signix[:, :, None] & KMASK_IQ2XS[None, None, :]) != 0
+    sign = np.where(bits, np.float32(-1.0), np.float32(1.0))
+    return ((mag * sign) * s[:, :, None]).reshape(rows, nb * 256)
+
+
 SPLIT = {"IQ4_NL": iq4_nl_split, "IQ3_XXS": iq3_xxs_split, "IQ2_S": iq2_s_split,
          "IQ4_XS": iq4_xs_split, "Q8_0": q8_0_split}
+#: the packed re-lay of the same raw blocks (patch 0052), keyed by GGUF type.
+PACKED = {"IQ2_S": iq2_s_packed_split}
 DECODE = {"IQ4_NL": iq4_nl_decode, "IQ3_XXS": iq3_xxs_decode, "IQ2_S": iq2_s_decode,
           "IQ4_XS": iq4_xs_decode, "Q8_0": q8_0_decode}

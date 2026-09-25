@@ -90,6 +90,44 @@ def test_the_chain_decodes_random_blocks_exactly(fmt, inn):
                      "BitwiseAnd", "Greater", "Select", "MatMul", "Result"}, types
 
 
+def test_the_packed_chain_decodes_random_blocks_exactly():
+    """patch 0052: IQ2_S carried VERBATIM (82 B/256) and decoded in-graph,
+    bit-exact against native_blocks.iq2_s_decode."""
+    inn = 512
+    e, out, T = 3, 5, 7
+    rng = np.random.default_rng(23)
+    raw = _random_raw(rng, e * out, inn, "IQ2_S")
+    w80, d = nb.PACKED["IQ2_S"](raw)
+    # the chain carries d as f16 and evaluates d*(0.5+nib)*0.25 in f32:
+    # the oracle is iq2_s_packed_decode, the same f32 arithmetic
+    w_ref = nb.iq2_s_packed_decode(w80, d).reshape(e, out, inn)
+    # not alike: every row differs from every other, and no row is constant
+    assert len({r.tobytes() for r in w_ref.reshape(e * out, inn)}) == e * out
+    assert (w_ref.reshape(e * out, inn).std(axis=1) > 0).all()
+    # 82 B/256 -- the GGUF's own size, against the re-laid IQ2_S's 128 B/256
+    assert w80.nbytes / (e * out * inn) == 80.0 / 256.0
+    arena = ss.SparseArena()
+    try:
+        model = _matmul_model(arena, e, out, inn, "IQ2_S_PACKED", (w80, d), T)
+        x = rng.standard_normal((1, T, inn)).astype(np.float32)
+        compiled = ov.Core().compile_model(model, "CPU")
+        y = compiled({"x": x})[compiled.output(0)]
+    finally:
+        arena.close()
+    want = np.einsum("tk,eok->eto", x[0], w_ref)
+    bound = np.einsum("tk,eok->eto", np.abs(x[0]), np.abs(w_ref))
+    dmax = np.abs(y - want)
+    print(f"\n[native-chain packed] IQ2_S_PACKED inn={inn}: max|diff| {dmax.max():.3e} vs "
+          f"max|want| {np.abs(want).max():.3e}; max diff/bound {(dmax / bound).max():.2e}")
+    assert y.shape == (e, T, out)
+    assert (dmax <= 1e-5 * bound + 1e-6).all(), (
+        f"IQ2_S_PACKED: max|diff| {dmax.max():.3e}, max diff/bound {(dmax / bound).max():.2e}")
+    types = {n.get_type_name() for n in model.get_ordered_ops()}
+    assert types <= {"Parameter", "Constant", "Convert", "Gather", "Reshape", "Multiply", "Unsqueeze",
+                     "BitwiseAnd", "Greater", "Select", "MatMul", "Result", "Slice", "Floor",
+                     "Add", "Subtract", "Broadcast", "Divide"}, types
+
+
 def test_an_unknown_format_is_refused():
     arena = ss.SparseArena()
     try:

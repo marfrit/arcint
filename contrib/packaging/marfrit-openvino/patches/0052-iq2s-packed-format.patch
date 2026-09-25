@@ -1,0 +1,429 @@
+--- a/src/common/transformations/include/ov_ops/moe_compressed.hpp
++++ b/src/common/transformations/include/ov_ops/moe_compressed.hpp
+@@ -59,9 +59,19 @@
+     static constexpr size_t kWeightFormatIq3Xxs = 2;
+     static constexpr size_t kWeightFormatQ8_0 = 3;
+     static constexpr size_t kWeightFormatIq2S = 4;
++    // arcint (patch 0052). 5 = IQ2_S-PACKED: the checkpoint's OWN 82-byte
++    // ggml block per 256 values, with the f16 d lifted out -- the weight is
++    // 80 self-contained bytes (32 B qs low-2-bit indices | 32 B RAW sign
++    // masks | 8 B qh high-2-bit | 8 B 4-bit sub-block scales) and the scale
++    // slot carries d as f16 [E, out, K/256, 1]. The zero-point slot aliases
++    // the scale (nothing reads it). 128 B/256 re-laid -> 82 B/256, the GGUF's
++    // own size (design note 12.4; 10.35 GiB of experts against 14.47). Added
++    // additively: kWeightFormatIq2S and every other path are untouched.
++    static constexpr size_t kWeightFormatIq2SPacked = 5;
+     static bool is_native_format(size_t f) {
+         return f == kWeightFormatIq4Nl || f == kWeightFormatIq3Xxs ||
+-               f == kWeightFormatQ8_0 || f == kWeightFormatIq2S;
++               f == kWeightFormatQ8_0 || f == kWeightFormatIq2S ||
++               f == kWeightFormatIq2SPacked;
+     }
+ 
+     /// \brief Constructs a MOECompressed operation with config only
+--- a/src/common/transformations/src/ov_ops/moe_compressed.cpp
++++ b/src/common/transformations/src/ov_ops/moe_compressed.cpp
+@@ -120,6 +120,13 @@
+             OPENVINO_ASSERT(s.size() == 4 && s[3].get_length() == 8,
+                             "MOECompressed ", name, " IQ2_S weight must be [E, ofm, K/32, 8], got ", s);
+             actual_K = static_cast<size_t>(s[2].get_length()) * 32;
++        } else if (weight_format == kWeightFormatIq2SPacked) {
++            // arcint (patch 0052): the checkpoint's 82-byte ggml block with
++            // the f16 d lifted out -- 80 self-contained bytes per 256 values
++            // (qs|signs|qh|sub-block scales); d is the separate f16 scale.
++            OPENVINO_ASSERT(s.size() == 4 && s[3].get_length() == 80,
++                            "MOECompressed ", name, " IQ2_S-packed weight must be [E, ofm, K/256, 80], got ", s);
++            actual_K = static_cast<size_t>(s[2].get_length()) * 256;
+         } else if (weight_format == kWeightFormatIq4Nl || weight_format == kWeightFormatQ8_0) {
+             OPENVINO_ASSERT(s.size() == 4 && s[3].get_length() == 32,
+                             "MOECompressed ", name, " IQ4_NL/Q8_0 weight must be [E, ofm, K/32, 32], got ", s);
+@@ -162,9 +169,14 @@
+         check_weight_K(3, m_config.hidden_size, "GEMM3 gate", m_config.gate_up_weight_format);
+         check_weight_K(6, m_config.hidden_size, "GEMM3 up", m_config.gate_up_weight_format);
+         check_weight_K(9, m_config.inter_size, "GEMM3 down", m_config.down_weight_format);
+-        check_scale(4, m_config.hidden_size, "GEMM3 gate");
+-        check_scale(7, m_config.hidden_size, "GEMM3 up");
+-        check_scale(10, m_config.inter_size, "GEMM3 down");
++        // arcint (patch 0052): the packed IQ2_S scale/zp slots alias the
++        // weight, so the affine group_size cross-check does not apply to them.
++        if (m_config.gate_up_weight_format != kWeightFormatIq2SPacked) {
++            check_scale(4, m_config.hidden_size, "GEMM3 gate");
++            check_scale(7, m_config.hidden_size, "GEMM3 up");
++        }
++        if (m_config.down_weight_format != kWeightFormatIq2SPacked)
++            check_scale(10, m_config.inter_size, "GEMM3 down");
+         check_zp(5, "GEMM3 gate");
+         check_zp(8, "GEMM3 up");
+         check_zp(11, "GEMM3 down");
+--- a/src/common/transformations/include/transformations/pattern_blocks/native_expert_block.hpp
++++ b/src/common/transformations/include/transformations/pattern_blocks/native_expert_block.hpp
+@@ -21,6 +21,7 @@
+ class TRANSFORMATIONS_API NativeIq3xxsWeightsBlock;
+ class TRANSFORMATIONS_API NativeQ8WeightsBlock;
+ class TRANSFORMATIONS_API NativeIq2sWeightsBlock;
++class TRANSFORMATIONS_API NativeIq2sPackedWeightsBlock;
+ 
+ }  // namespace ov::pass::pattern::op
+ 
+@@ -66,3 +67,17 @@
+ public:
+     NativeIq2sWeightsBlock();
+ };
++
++/// IQ2_S-PACKED (patch 0052): the checkpoint's own 82-byte ggml block kept
++/// VERBATIM as a u8 Constant [E, out, K/256, 80] (d lifted into the f16 scale
++/// slot [E, out, K/256, 1]). Four Slices carve qs / signs / qh / sub-block
++/// scales out of the last axis; the 2-bit high index bits and the 4-bit
++/// sub-block scales are extracted in f32 arithmetic (a per-l divisor
++/// broadcasts over a new last axis, floor + mod -- no shifts, no Concat); the
++/// magnitudes come from Gather(iq2s_grid [1024, 8]) and the signs from the RAW
++/// sign bytes (bit j flips value j). 82 B/256, the GGUF's own size.
++/// anchors: weight (the u8 block), scale (the f16 d), reshape
++class ov::pass::pattern::op::NativeIq2sPackedWeightsBlock : public ov::pass::pattern::op::Block {
++public:
++    NativeIq2sPackedWeightsBlock();
++};
+--- a/src/common/transformations/src/transformations/pattern_blocks/native_expert_block.cpp
++++ b/src/common/transformations/src/transformations/pattern_blocks/native_expert_block.cpp
+@@ -13,11 +13,15 @@
+ #include "openvino/op/broadcast.hpp"
+ #include "openvino/op/constant.hpp"
+ #include "openvino/op/convert.hpp"
++#include "openvino/op/divide.hpp"
++#include "openvino/op/floor.hpp"
+ #include "openvino/op/gather.hpp"
+ #include "openvino/op/greater.hpp"
+ #include "openvino/op/multiply.hpp"
+ #include "openvino/op/reshape.hpp"
+ #include "openvino/op/select.hpp"
++#include "openvino/op/slice.hpp"
++#include "openvino/op/subtract.hpp"
+ #include "openvino/op/unsqueeze.hpp"
+ #include "openvino/pass/pattern/op/optional.hpp"
+ #include "openvino/pass/pattern/op/pattern.hpp"
+@@ -30,6 +34,56 @@
+ namespace v3 = ov::op::v3;
+ namespace v8 = ov::op::v8;
+ namespace v13 = ov::op::v13;
++
++// arcint (patch 0052): the IQ2_S-packed decode, the chain
++// tools/q4e/serving_shape.py _native_packed_expert writes. See the header.
++ov::pass::pattern::op::NativeIq2sPackedWeightsBlock::NativeIq2sPackedWeightsBlock()
++    : Block({}, {}, "NativeIq2sPackedWeightsBlock") {
++    auto C = []() { return wrap_type<v0::Constant>(); };
++    auto weight = wrap_type<v0::Constant>(ov::pass::pattern::type_matches(ov::element::u8));
++    // one field of the 80-byte block, carved out of the last axis
++    auto field = [&]() { return wrap_type<v8::Slice>({weight, C(), C(), C(), C()}); };
++    auto f32_of = [&](const std::shared_ptr<ov::Node>& slice) {
++        return wrap_type<v0::Convert>({wrap_type<v1::Reshape>({slice, C()})});
++    };
++    auto qs = f32_of(field());
++    auto sg = f32_of(field());
++    auto qh = f32_of(field());
++    auto scb = f32_of(field());
++    // high_l = (qh >> 2l) & 3: floor(qh / [1,4,16,64]) then mod 4
++    auto qh_u = wrap_type<v0::Unsqueeze>({qh, C()});
++    auto qh_f = wrap_type<v0::Floor>({wrap_type<v1::Divide>({qh_u, C()})});
++    auto high = wrap_type<v1::Subtract>(
++        {qh_f, wrap_type<v1::Multiply>({wrap_type<v0::Floor>({wrap_type<v1::Divide>({qh_f, C()})}), C()})});
++    auto idx = wrap_type<v1::Add>({qs, wrap_type<v1::Multiply>({high, C()})});
++    auto mag = wrap_type<v1::Reshape>(
++        {wrap_type<v8::Gather>({C(), wrap_type<v0::Convert>({idx}), C()}), C()});
++    // the RAW sign byte: bit j flips value j
++    auto sg_u = wrap_type<v0::Unsqueeze>({wrap_type<v0::Convert>({sg}), C()});
++    auto bits = wrap_type<v13::BitwiseAnd>({sg_u, C()});
++    auto neg = wrap_type<v1::Greater>({bits, C()});
++    auto sign = wrap_type<v1::Reshape>({wrap_type<v1::Select>({neg, C(), C()}), C()});
++    auto mag_sign = wrap_type<v1::Multiply>({mag, sign});
++    // the 4-bit sub-block scales: floor(scb / [1,1,16,16]) then mod 16
++    auto sc_u = wrap_type<v0::Unsqueeze>({scb, C()});
++    auto sc_f = wrap_type<v0::Floor>({wrap_type<v1::Divide>({sc_u, C()})});
++    auto nib = wrap_type<v1::Subtract>(
++        {sc_f, wrap_type<v1::Multiply>({wrap_type<v0::Floor>({wrap_type<v1::Divide>({sc_f, C()})}), C()})});
++    auto sc32 = wrap_type<v1::Reshape>(
++        {wrap_type<v3::Broadcast>({wrap_type<v1::Reshape>({nib, C()}), C()}), C()});
++    // d * (0.5 + s) * 0.25, ggml's own association
++    auto dd = wrap_type<v0::Constant>(ov::pass::pattern::type_matches(ov::element::f16));
++    auto dd_f32 = ov::pass::pattern::optional<v0::Convert>({dd});
++    auto scale = wrap_type<v1::Multiply>(
++        {wrap_type<v1::Multiply>({dd_f32, wrap_type<v1::Add>({C(), sc32})}), C()});
++    auto x = wrap_type<v1::Multiply>({mag_sign, scale});
++    auto reshape = wrap_type<v1::Reshape>({x, C()});
++    auto weights_input = ov::pass::pattern::optional<v0::Convert>({reshape});
++
++    m_inputs = ov::OutputVector{weight};
++    m_outputs = ov::OutputVector{weights_input};
++    REGISTER_ANCHORS(this, weight, scale, reshape);
++}
+ 
+ ov::pass::pattern::op::NativeIq4nlWeightsBlock::NativeIq4nlWeightsBlock() : Block({}, {}, "NativeIq4nlWeightsBlock") {
+     auto codes = wrap_type<v0::Constant>(ov::pass::pattern::type_matches(ov::element::u4));
+--- a/src/common/transformations/src/transformations/common_optimizations/convert_tiled_moe_block_to_gather_matmuls.cpp
++++ b/src/common/transformations/src/transformations/common_optimizations/convert_tiled_moe_block_to_gather_matmuls.cpp
+@@ -222,6 +222,7 @@
+     std::shared_ptr<pattern::op::NativeIq3xxsWeightsBlock> iq3xxs;
+     std::shared_ptr<pattern::op::NativeQ8WeightsBlock> q8;
+     std::shared_ptr<pattern::op::NativeIq2sWeightsBlock> iq2s;
++    std::shared_ptr<pattern::op::NativeIq2sPackedWeightsBlock> iq2sp;
+     std::shared_ptr<ov::Node> either;
+ };
+ 
+@@ -231,7 +232,9 @@
+     w.iq3xxs = std::make_shared<pattern::op::NativeIq3xxsWeightsBlock>();
+     w.q8 = std::make_shared<pattern::op::NativeQ8WeightsBlock>();
+     w.iq2s = std::make_shared<pattern::op::NativeIq2sWeightsBlock>();
+-    w.either = std::make_shared<pattern::op::Or>(ov::OutputVector{w.iq4nl, w.iq3xxs, w.q8, w.iq2s});
++    w.iq2sp = std::make_shared<pattern::op::NativeIq2sPackedWeightsBlock>();
++    w.either = std::make_shared<pattern::op::Or>(
++        ov::OutputVector{w.iq2sp, w.iq4nl, w.iq3xxs, w.q8, w.iq2s});
+     return w;
+ }
+ 
+@@ -509,6 +512,16 @@
+                 r.zp = w.iq2s->get_anchor("signix", pm).value();
+                 return true;
+             }
++            // arcint (patch 0052): the packed IQ2_S carries its own f16 d, so
++            // the scale slot aliases the weight and the zp slot aliases the
++            // scale (nothing reads it: the block is self-contained).
++            if (auto wgt = w.iq2sp->get_anchor("weight", pm)) {
++                r.format = MOECompressed::kWeightFormatIq2SPacked;
++                r.weight = wgt.value();
++                r.scale = w.iq2sp->get_anchor("scale", pm).value();
++                r.zp = r.scale;
++                return true;
++            }
+             return false;
+         };
+         Resolved gate, up, down;
+@@ -560,8 +573,11 @@
+         if (topk_shape.rank().is_dynamic() || topk_shape.size() < 2 || !topk_shape[1].is_static()) {
+             return false;
+         }
+-        // a native weight holds one 32-value block per group row (2.3c)
+-        const size_t hidden_size = static_cast<size_t>(gate_shape[2].get_length()) * 32;
++        // a native weight holds one 32-value block per group row (2.3c); the
++        // packed form holds one 82-byte / 256-value block (patch 0052)
++        const size_t gate_block =
++            (gate.format == MOECompressed::kWeightFormatIq2SPacked) ? 256 : 32;
++        const size_t hidden_size = static_cast<size_t>(gate_shape[2].get_length()) * gate_block;
+         const size_t inter_size = static_cast<size_t>(gate_shape[1].get_length());
+         const size_t num_expert = static_cast<size_t>(gate_shape[0].get_length());
+ 
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+@@ -152,6 +152,19 @@
+         if (fmt == ov::op::internal::MOECompressed::kWeightFormatIq2S) {
+             return;
+         }
++        // arcint (patch 0052): IQ2_S-packed's scale slot aliases its weight
++        // (the f16 d lives inside the block), so it is not an affine
++        // [oc, groups] payload and must not be transposed.
++        if (fmt == ov::op::internal::MOECompressed::kWeightFormatIq2SPacked) {
++            return;
++        }
++        if (is_down) {
++            if (config.down_weight_format == ov::op::internal::MOECompressed::kWeightFormatIq2SPacked)
++                return;
++        } else {
++            if (config.gate_up_weight_format == ov::op::internal::MOECompressed::kWeightFormatIq2SPacked)
++                return;
++        }
+     }
+     size_t oc = 0;
+     size_t ic = 0;
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -607,7 +607,8 @@
+         // bytes (the "wrong dequant rejected" rule of 0045's test ladder).
+         OPENVINO_ASSERT(desc->_config.gate_up_weight_format == 1 ||
+                             desc->_config.gate_up_weight_format == 2 ||
+-                            desc->_config.gate_up_weight_format == 4,
++                            desc->_config.gate_up_weight_format == 4 ||
++                            desc->_config.gate_up_weight_format == 5,
+                         "native per-expert gate/up kernel supports IQ4_NL (1), IQ3_XXS (2) and IQ2_S (4); got format ",
+                         desc->_config.gate_up_weight_format);
+         if (desc->_config.activation_type == ov::op::internal::MOE::Activation_type::GEGLU_TANH)
+@@ -637,7 +638,8 @@
+         // refuse anything else rather than silently decode it as IQ4_NL.
+         OPENVINO_ASSERT(desc->_config.down_weight_format == 1 ||
+                             desc->_config.down_weight_format == 2 ||
+-                            desc->_config.down_weight_format == 3,
++                            desc->_config.down_weight_format == 3 ||
++                            desc->_config.down_weight_format == 5,
+                         "native per-expert down kernel supports IQ4_NL (1), IQ3_XXS (2) and Q8_0 (3); got format ",
+                         desc->_config.down_weight_format);
+         return jit;
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
+@@ -792,6 +792,39 @@
+         }
+         return;
+     }
++    if (m.format == kQuantFormatIq2SPacked) {
++        // arcint (patch 0052). The checkpoint's own IQ2_S block with the f16 d
++        // lifted out: 80 self-contained bytes per 256 values -- qs low-2-bit
++        // (32 B) | RAW signs (32 B) | qh high-2-bit (8 B) | 4-bit sub-block
++        // scales (8 B); d is m.s[n*nblk + ib]. idx = qs[ib*4+l] |
++        // (((qh[ib] >> 2l) & 3) << 8); db = d*(0.5+nib)*0.25, the low nibble
++        // for l<2 and the high for l>=2.
++        const int nblk = m.ic / 256;
++        const uint8_t* brow = m.w + static_cast<size_t>(n) * static_cast<size_t>(nblk) * 80u;
++        for (int ib = 0; ib < nblk; ib++) {
++            const uint8_t* blk = brow + static_cast<size_t>(ib) * 80u;
++            const float d = f16_to_f32(m.s[static_cast<size_t>(n) * static_cast<size_t>(nblk) +
++                                       static_cast<size_t>(ib)]);
++            const uint8_t* qs = blk;
++            const uint8_t* signs = blk + 32;
++            const uint8_t qhb = blk[64 + ib];
++            const uint8_t sc = blk[72 + ib];
++            const float dlo = d * (0.5f + static_cast<float>(sc & 0x0F)) * 0.25f;
++            const float dhi = d * (0.5f + static_cast<float>(sc >> 4)) * 0.25f;
++            for (int l = 0; l < 4; l++) {
++                const uint16_t gi = static_cast<uint16_t>(qs[ib * 4 + l]) |
++                                    static_cast<uint16_t>(((qhb >> (2 * l)) & 3) << 8);
++                const uint8_t sg = signs[ib * 4 + l];
++                const float dd = (l < 2) ? dlo : dhi;
++                const uint8_t* gr = &kIq2sGrid[static_cast<size_t>(gi) * 8u];
++                float* y = out + ib * 32 + l * 8;
++                for (int j = 0; j < 8; j++) {
++                    y[j] = dd * static_cast<float>(gr[j]) * ((sg & kIq2xsMask[j]) ? -1.0f : 1.0f);
++                }
++            }
++        }
++        return;
++    }
+     // IQ3_XXS
+     const uint8_t* gridix = m.w + static_cast<size_t>(n) * static_cast<size_t>(groups) * 8u;
+     const uint8_t* signix = m.z + static_cast<size_t>(n) * static_cast<size_t>(groups) * 4u;
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
+@@ -72,6 +72,9 @@
+ constexpr int kQuantFormatIq3Xxs = 2;
+ constexpr int kQuantFormatQ8_0 = 3;
+ constexpr int kQuantFormatIq2S = 4;
++// arcint (patch 0052). 5 = IQ2_S-packed: w = the raw 82-byte ggml block per
++// 256 values (f16 d | qs | signs | qh | sc); s/z unused.
++constexpr int kQuantFormatIq2SPacked = 5;
+ 
+ enum class GateAct { Silu, GeluTanh, GeluErf };   // mirrors MOE_GATE_ACT, mlp.cl:46-65
+ 
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
+@@ -1106,6 +1106,43 @@
+     return sub_group_reduce_add(acc);
+ }
+ 
++inline float native_dot_iq2s_packed(const __global uchar* W,
++                                    const __global half* S,
++                                    int n, int N, int K,
++                                    const __global half* x, int x_base,
++                                    int id_local) {
++    // arcint (patch 0052). IQ2_S-packed: the checkpoint's own 82-byte ggml
++    // block, with the f16 d LIFTED OUT -- 80 self-contained bytes per 256
++    // values: qs low-2-bit indices (32 B) | RAW sign masks (32 B) | qh
++    // high-2-bit (8 B) | 4-bit sub-block scales (8 B). d is the scale slot,
++    // [E, out, K/256] f16 -- the emitter's separate Constant, so the plugin
++    // carries the same bytes the checkpoint ships and the layout is the
++    // split form's own. idx = qs[ib*4+l] | (((qh[ib] >> 2l) & 3) << 8); the
++    // low nibble scales l<2 and the high nibble l>=2.
++    float acc = 0.0f;
++    const int nblk = K / 256;
++    const __global uchar* brow = W + (long)n * nblk * 80;
++    for (int ib = 0; ib < nblk; ib++) {
++        const __global uchar* blk = brow + (long)ib * 80;
++        float d = convert_float(S[(long)n * nblk + ib]);
++        uchar scb = blk[72 + ib];
++        float dlo = d * (0.5f + convert_float(scb & 0x0F)) * 0.25f;
++        float dhi = d * (0.5f + convert_float(scb >> 4)) * 0.25f;
++        uchar qhb = blk[64 + ib];
++        for (int j = id_local; j < 32; j += SUBGROUP_SIZE) {
++            int l = j >> 3;
++            int m = j & 7;
++            ushort gi = (ushort)blk[ib * 4 + l] | ((ushort)((qhb >> (2 * l)) & 3) << 8);
++            float mag = convert_float(NATIVE_IQ2S_GRID[gi * 8 + m]);
++            uchar signs = blk[32 + ib * 4 + l];
++            float sign = (signs & NATIVE_IQ2XS_MASK[m]) ? -1.0f : 1.0f;
++            float dd = (l < 2) ? dlo : dhi;
++            acc += convert_float(x[x_base + ib * 32 + j]) * dd * mag * sign;
++        }
++    }
++    return sub_group_reduce_add(acc);
++}
++
+ inline float native_dot_q8_0(const __global uchar* W,
+                              const __global half* S,
+                              int n, int N, int K,
+@@ -1282,6 +1319,9 @@
+     gate_zp     += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 8);
+     up_weight   += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 4);
+     up_zp       += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 8);
++#elif NATIVE_GU_FORMAT == 5  // IQ2_S-packed: 80 B per 256; d is the scale slot
++    gate_weight += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 256 * 80);
++    up_weight   += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 256 * 80);
+ #elif NATIVE_GU_FORMAT == 4  // IQ2_S: u8 [out, K/32, 8] indices + u8 [out, K/32, 4] signs
+     gate_weight += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 4);
+     gate_zp     += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 8);
+@@ -1291,9 +1331,14 @@
+     gate_weight += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 2);
+     up_weight   += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 2);
+ #endif
+-#if NATIVE_GU_FORMAT == 4  // IQ2_S: TWO f16 sub-block scales per group row
++#if NATIVE_GU_FORMAT == 4
++    // IQ2_S: TWO f16 sub-block scales per group row, row-major
+     gate_scale += (long)slot_index * ((long)(HIDDEN_SIZE / GATE_UP_GROUP_SIZE) * INTERMEDIATE_SIZE * 2);
+     up_scale   += (long)slot_index * ((long)(HIDDEN_SIZE / GATE_UP_GROUP_SIZE) * INTERMEDIATE_SIZE * 2);
++#elif NATIVE_GU_FORMAT == 5
++    // IQ2_S-packed: ONE f16 d per 256-value block
++    gate_scale += (long)slot_index * ((long)(HIDDEN_SIZE / 256) * INTERMEDIATE_SIZE);
++    up_scale   += (long)slot_index * ((long)(HIDDEN_SIZE / 256) * INTERMEDIATE_SIZE);
+ #else
+     gate_scale += (long)slot_index * ((long)(HIDDEN_SIZE / GATE_UP_GROUP_SIZE) * INTERMEDIATE_SIZE);
+     up_scale   += (long)slot_index * ((long)(HIDDEN_SIZE / GATE_UP_GROUP_SIZE) * INTERMEDIATE_SIZE);
+@@ -1316,6 +1361,15 @@
+                                (const __global half*)gate_scale,
+                                n, INTERMEDIATE_SIZE, HIDDEN_SIZE,
+                                (const __global half*)x, x_base, id_local);
++#elif NATIVE_GU_FORMAT == 5
++        su = native_dot_iq2s_packed((const __global uchar*)up_weight,
++                                    (const __global half*)up_scale,
++                                    n, INTERMEDIATE_SIZE, HIDDEN_SIZE,
++                                    (const __global half*)x, x_base, id_local);
++        sg = native_dot_iq2s_packed((const __global uchar*)gate_weight,
++                                    (const __global half*)gate_scale,
++                                    n, INTERMEDIATE_SIZE, HIDDEN_SIZE,
++                                    (const __global half*)x, x_base, id_local);
+ #elif NATIVE_GU_FORMAT == 4
+         su = native_dot_iq2s((const __global uchar*)up_weight,
+                              (const __global uchar*)up_zp,
+@@ -1367,11 +1421,18 @@
+     weight += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE / 4);
+     zps    += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE / 8);
+ #elif NATIVE_DOWN_FORMAT == 3 // Q8_0: i8 codes (K)
++#elif NATIVE_DOWN_FORMAT == 5  // IQ2_S-packed: 80 B per 256; d is the scale slot
++    weight += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE / 256 * 80);
++#elif NATIVE_DOWN_FORMAT == 4
+     weight += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE);
+ #else                        // IQ4_NL: packed u4 codes (K/2)
+     weight += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE / 2);
+ #endif
++#if NATIVE_DOWN_FORMAT == 5
++    scales += (long)slot_index * ((long)(INTERMEDIATE_SIZE / 256) * HIDDEN_SIZE);
++#else
+     scales += (long)slot_index * ((long)(INTERMEDIATE_SIZE / DOWN_GROUP_SIZE) * HIDDEN_SIZE);
++#endif
+ 
+     const int x_base = x_base_elem + token_idx * INTERMEDIATE_SIZE;
+     __global MOE_DTYPE* yrow = y + y_base_elem + token_idx * HIDDEN_SIZE;
+@@ -1385,6 +1446,11 @@
+                                 (const __global half*)scales,
+                                 n, HIDDEN_SIZE, INTERMEDIATE_SIZE,
+                                 (const __global half*)x, x_base, id_local);
++#elif NATIVE_DOWN_FORMAT == 5
++        acc = native_dot_iq2s_packed((const __global uchar*)weight,
++                                     (const __global half*)scales,
++                                     n, HIDDEN_SIZE, INTERMEDIATE_SIZE,
++                                     (const __global half*)x, x_base, id_local);
+ #elif NATIVE_DOWN_FORMAT == 3
+         acc = native_dot_q8_0((const __global uchar*)weight,
+                               (const __global half*)scales,
