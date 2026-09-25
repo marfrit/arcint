@@ -700,6 +700,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.offload_ratio)) {
                 return fail("--offload-ratio needs an integer");
             }
+            cfg.offload_ratio_set = true;
         } else if (arg == "--mtp") {
             if (!value(v)) return fail("--mtp needs a value");
             cfg.mtp = std::string(v);
@@ -859,13 +860,15 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         return fail("--moe-cpu-tier-threads needs --moe-cpu-tier: without the tier "
                     "there is no pool to size");
     }
-    if (cfg.moe_cpu_tier && cfg.offload_ratio == 0) {
-        return fail("--moe-cpu-tier needs --offload-ratio > 0: with every expert "
-                    "resident there is nothing for the host tier to compute");
+    if (cfg.moe_cpu_tier && cfg.offload_ratio == 0 && !cfg.moe_per_expert_dispatch) {
+        return fail("--moe-cpu-tier needs --offload-ratio > 0 (or an explicit 0 with "
+                    "--moe-per-expert-dispatch, the all-resident native route): with "
+                    "every expert resident and no dispatch there is nothing for the "
+                    "host tier to compute");
     }
-    if (cfg.moe_per_expert_dispatch && !cfg.moe_cpu_tier) {
-        return fail("--moe-per-expert-dispatch needs --moe-cpu-tier: non-resident "
-                    "experts fall back to the CPU tier");
+    if (cfg.moe_per_expert_dispatch && !cfg.moe_cpu_tier && cfg.offload_ratio > 0) {
+        return fail("--moe-per-expert-dispatch needs --moe-cpu-tier while experts are "
+                    "offloaded: non-resident experts fall back to the CPU tier");
     }
     // The --moe-cpu-tier / --prefix-cache-mib refusal USED to live here
     // (DESIGN §7.0.2ae's F0). Since plugin patch 0018 the answer depends on

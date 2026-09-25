@@ -261,6 +261,16 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out,
     a.language_model_xml = a.segments.front().language_model_xml;
     a.language_model_bin = a.segments.front().language_model_bin;
 
+    // ------------------------------------------- the declared expert format
+    // serving-shape.json's `expert_fill.format`, read so the backend can tell a
+    // native artifact (the checkpoint's own blocks; the all-resident pool at
+    // ratio 0 needs the offload provider's native reader) from an affine one
+    // (direct resident Constants; an explicit ratio 0 keeps the old path).
+    if (shape.is_object() && shape.contains("expert_fill") &&
+        shape.at("expert_fill").is_object()) {
+        a.expert_format = shape.at("expert_fill").value("format", std::string());
+    }
+
     // ------------------------------------------- expert bodies (window-051 §2)
     // The blob the runtime refills one segment at a time from. Its `entries[]`
     // is the index (global layer, kind, offset, bytes); the loader transcribes

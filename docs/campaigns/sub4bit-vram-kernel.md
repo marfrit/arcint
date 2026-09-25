@@ -1365,3 +1365,63 @@ the campaign rules say it becomes its own document.
     answer quality (degenerate greedy text — truncation or an emitter
     weight-mapping defect, unresolved; device-free verification covered expert
     bodies and norms only). The 0.5.4 LYON roadmap item is untouched.
+- 2026-09-25 (redirect leg — the speed defect, not another measurement). The
+  operator redirected the leg off the benchmark sweep: make the native route
+  faster. Evidence class per disposition: `code`, `measured-here`,
+  `previously-measured`.
+
+  * **The defect**: the all-resident native configuration — every expert
+    resident, only the routed experts computed on the GPU per-expert kernel —
+    was unreachable by a three-link dead end. `code`: `src/config.cpp` refused
+    `--moe-cpu-tier` at ratio 0; `src/exec/backend_ov.cpp` set the plugin's
+    `OFFLOAD_RATIO`/`ov::weights_path` only when the ratio was `> 0`, so an
+    explicit `0` was swallowed; the plugin's `prepare_moe_otd_params`
+    (`ops/moe.cpp`) set `lru_expert_num = 0` at `otd_ratio == 0`, so
+    `moe_3gemm_swiglu_opt.cpp` selected the **Resident** provider (no slot
+    pool, no native reader) while patch 0043's assert demanded
+    `_cpu_tier && is_offloaded()` — unsatisfiable at 0. The assert's rationale
+    ("until the OpenCL decode exists") was obsolete since patch 0045.
+  * **The fix**: plugin patch **`0051-native-fully-resident.patch`** — a native
+    format at ratio 0 enables the offload provider when `ov::weights_path` is
+    supplied (explicit 0 distinguishable from unset), pool sized at
+    `num_expert`; the assert requires only `is_offloaded()`. Arcint side: an
+    `offload_ratio_set` flag, the pure `moe_offload_active()` decision,
+    `Artifact` reading `expert_fill.format`, and the two config guards relaxed.
+  * **Red-first**: `tests/test_config.cpp` gained four cells;
+    `measured-here` mutation run reverting `moe_offload_active` to
+    `ratio > 0` fails exactly
+    `config_offload_active_covers_the_all_resident_native_case`; restored,
+    `config` = **74 cases, 0 failed** (was 69). Both builds clean.
+  * **The gate** (`measured-here`, A770 `GPU.1`, depth-4 artifact, u8 KV, chunk
+    2048, `--no-logits-slice`, plugin `ov-0051`, `--offload-ratio 0
+    --moe-cpu-tier --moe-per-expert-dispatch`): load **4.4 s**, device-resident
+    2.71 GiB; decode **49.9 / 56.8 t/s** at 1 / 4096; ext prefill **155.9 t/s**
+    @4096; digests `3f6d0ab1f8d9` / `8cccdbac48ed` — **byte-identical** to the
+    tiered ratio-50 arm (`previously-measured`, same day: 4.2 / 14.2 t/s
+    decode, 28.6 t/s prefill). **4.0× decode, 5.4× prefill.** Counters:
+    `cpu_tier_pairs=0`, `cpu_tier_experts=0`, `per_expert_dispatches=6847`,
+    `per_expert_gpu_invocations=544,832`, gpu hit 85.0 % — no expert touched
+    the CPU tier. Caveats: the first fit pass failed on **fragmentation, not
+    arithmetic** (pass 2 loaded by capping prefix-cache spare); the
+    dispatch-without-tier variant refuses at `moe_3gemm_swiglu_opt.cpp:1141`.
+  * **The sizing suspicion resolved** (`measured-here`): the artifact carries
+    **14.469 GiB** of expert bodies against the GGUF's 10.346 GiB — **1.399×**
+    (gate/up IQ2_S 1.561×, IQ3_XXS down 1.143×, IQ4_XS→IQ4_NL 1.059×). No
+    mis-map: the same bytes, re-laid (sampled byte-exactness §10.3 of the
+    design note). The "24 GB" premise came from the manifest's
+    `expert_fill.filled_bytes` (24,662,507,520 B), which sums the **f32 split
+    parts** and overstates the artifact by ≈1.55×; the lm `.bin` (21.82 GiB)
+    confirms 14.47 GiB experts + ~7.35 GiB dense. The inflation is the
+    plugin's native layout (u16 indices, two f16 scales per 32, vs the GGUF's
+    packed qs+qh and 4-bit nibbles); a packed layout is the size lever, OWED.
+  * **Full-depth coherence, confirmed** (`measured-here`): the interrupted
+    d40n sweep (stopped when the priority changed) loaded and served; its
+    depth-1 and depth-4096 text is coherent ("# Tools … execute_command …",
+    "system: You are a function calling AI model …"), so the depth-4 rung's
+    degenerate text was **depth-4 truncation**, not an emitter defect. Rate
+    0.5 / 1.5 t/s decode, 2.6 t/s ext prefill @4096; 16384 not run; reservation
+    max ctx 581,600/lane.
+  * **OWED**: the full-depth all-resident arm does not fit (14.47 GiB experts
+    vs 15.11 GiB VRAM) — the speed win is a small-depth one until a packed
+    native layout; a logits-level V4 A/B; the 0.5.4 LYON roadmap is the
+    operator's.

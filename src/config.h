@@ -147,6 +147,11 @@ struct Config {
     // stream on demand. 0 = everything resident. This is what lets a model that
     // does not fit a card run on it at all; it is not free (§7).
     int offload_ratio = 0;
+    // True iff --offload-ratio was given explicitly, so an explicit 0 (the
+    // fully-resident native pool) is distinguishable from "offload off". The
+    // backend forwards the property in that case; for an affine artifact an
+    // explicit 0 still leaves the plugin on the direct resident Constants.
+    bool offload_ratio_set = false;
 
     // The paged execution path (DESIGN §3.5.3, §7.0): arcint-owned block
     // tables and LA state rows, speculative rollback as row promotion,
@@ -384,6 +389,18 @@ bool kv_precision_is_packed_four_bit(const std::string& requested, const std::st
 // report) to refuse.
 std::optional<std::string> tier_prefix_cache_decision(bool static_partition_reported, bool tier_on,
                                                        int prefix_cache_mib);
+
+// Whether the MoE expert-offload machinery is active for a load (plugin patch
+// 0051). True when the ratio is > 0, OR when an explicit 0 was given for a
+// NATIVE artifact: the offload provider owns the only native reader, so an
+// all-resident native pool rides it. An affine artifact at an explicit 0 keeps
+// the direct resident Constants -- the pre-0051 behaviour, unchanged. This is
+// the pure decision backend_ov.cpp's load path calls; it is separated from the
+// member so a red-first cell can pin it without a GPU.
+inline bool moe_offload_active(int offload_ratio, bool offload_ratio_set,
+                               const std::string& expert_format) {
+    return offload_ratio > 0 || (offload_ratio_set && expert_format == "native");
+}
 
 // Strict base-10 uint64 parse: refuses empty input and trailing garbage
 // (strtoull alone happily parses "8e9" as 8 and ignores "e9"), and refuses

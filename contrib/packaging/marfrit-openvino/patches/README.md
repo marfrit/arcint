@@ -1315,6 +1315,47 @@ serialised pattern are. That is the A770 window. The emitter
 (`tools/q4e/serving_shape.py`'s IQ2_S branch and
 `build_qwen35moe_serving_shape_ir`) is in the arcint tree, not in this patch.
 
+## 0051 — the all-resident native pool: ratio 0 is a configuration, not an absence
+
+`0051-native-fully-resident.patch` fixes a three-link dead end that made the
+all-resident **native** configuration unreachable (and, with it, the fastest
+native route: every expert on the GPU, only the routed ones computed). The
+links, each on its own tree:
+
+- `src/config.cpp` refused `--moe-cpu-tier` when the ratio was 0;
+- the arcint backend set the plugin's `OFFLOAD_RATIO` (and `ov::weights_path`)
+only when the ratio was `> 0`, so an explicit `0` was swallowed;
+- the plugin's `prepare_moe_otd_params` (`ops/moe.cpp`) computed
+`lru_expert_num = 0` when `otd_ratio == 0` in the stock form, so
+`moe_3gemm_swiglu_opt.cpp` selected the **Resident** provider — which has no
+slot pool and **no native reader** — while patch 0043's assert demanded
+`_cpu_tier && is_offloaded()`, a combination unsatisfiable at 0.
+
+This patch:
+
+- `ops/moe.cpp`: for a native format at `otd_ratio == 0`, enable OTD when the
+caller supplied `ov::weights_path` (an explicit 0 is thereby distinguishable
+from unset) and size the pool at `num_expert` — every expert resident, read
+through the offload provider's native reader. `ratio == 100` stays disabled
+(all on disk cannot run).
+- `moe_3gemm_swiglu_opt.cpp`: the assert requires `_weight_provider->is_offloaded()`
+only. The tier was needed because (0043) no OpenCL decode existed yet; 0045
+added it, so the tier is unnecessary when there are no misses.
+
+MEASURED (2026-09-25, device-free): the patch reverse-applies cleanly on the
+0050 tree, and `ninja -j8 openvino_intel_gpu_plugin` in the debug-caps-OFF
+build dir is clean (rc 0, 6 targets, the plugin links). The arcint-side
+companion (`src/config.cpp` guard, a `offload_ratio_set` flag, and
+`src/exec/backend_ov.cpp` setting the property for an explicit 0) is in the
+arcint tree, not in this patch. The version stamp stays at `marfrit-p19`,
+disclosed the same as 0046-0050 (the built plugin reports
+`2026.4.0-22849-71640275d29-marfrit-p19`; its sha256 is
+`7a10444e7ab088232f8404ffb43c4ebbf51268a0e7d8f6983c16f313b25f0324`).
+
+**OWED.** The served gate — the all-resident native arm actually loading on
+the A770 and its rate against the tiered arm — is the card leg's, not this
+patch's.
+
 ## Not carried either: the measurement instrument
 
 The arcint session's working tree also carries per-stage timing accumulators

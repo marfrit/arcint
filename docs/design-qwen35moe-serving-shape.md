@@ -497,3 +497,132 @@ cases, 0 failed (the new entry has its own red-first cell), `test_provenance`
 
 The **A770 reading** of the full-depth artifact — coherence, rate, digests,
 fit, 262144, V4 — is the window that follows in this leg, recorded in §11.
+
+## 11. The speed defect: the all-resident native route, 2026-09-25
+
+Operator redirect, same day: *"before measuring more slow runs, spend the work
+on making it faster. This is not a measurement project."* The native route's
+only fast configuration -- every expert resident, only the routed experts
+computed on the GPU per-expert kernel -- was **unreachable**, by a three-link
+dead end. This section is the fix and the gate. Evidence classes: `code`,
+`measured-here`, `previously-measured`.
+
+### 11.1 The three links (each a bug, not a missing feature)
+
+1. `code` — `src/config.cpp` refused `--moe-cpu-tier` when the ratio was 0.
+2. `code` — `src/exec/backend_ov.cpp` set the plugin's `OFFLOAD_RATIO` (and
+   `ov::weights_path`) only when the ratio was `> 0`, so an explicit `0` was
+   swallowed. The plugin's own validator accepts 0 (`v <= 100`, patch 0005).
+3. `code` — the plugin's `prepare_moe_otd_params` (`ops/moe.cpp`) computed
+   `lru_expert_num = 0` when `otd_ratio == 0`, so `moe_3gemm_swiglu_opt.cpp`
+   selected the **ResidentExpertWeightProvider** — no slot pool, **no native
+   reader** — while patch 0043's assert demanded `_cpu_tier &&
+   is_offloaded()`, a conjunction unsatisfiable at 0. Its stated rationale
+   *"until the OpenCL decode exists"* was obsolete: patch 0045 added the
+   decode, and patch 0050 carried it to IQ2_S.
+
+### 11.2 The fix
+
+- **Plugin patch `0051-native-fully-resident.patch`** (`code`): a native format
+  at `otd_ratio == 0` enables OTD when the caller supplied `ov::weights_path`
+  (an explicit 0 is thereby distinguishable from unset) and sizes the pool at
+  `num_expert` — every expert resident, read through the offload provider's
+  native reader. The assert drops the `_cpu_tier` requirement: it needs only
+  `_weight_provider->is_offloaded()`, because the tier is unnecessary when
+  there are no misses.
+- **The arcint side** (`code`): a `offload_ratio_set` Config flag; the pure
+  function `moe_offload_active(ratio, ratio_set, expert_format)` in `config.h`
+  (ratio > 0, or an explicit 0 for a `native` artifact); `Artifact` now reads
+  `serving-shape.json`'s `expert_fill.format`; the two guards relaxed
+  (`--moe-cpu-tier` allowed at ratio 0 when dispatch is requested, and
+  `--moe-per-expert-dispatch` allowed without the tier at ratio 0).
+- **Red-first** (`measured-here`): `tests/test_config.cpp` gained
+  `config_offload_active_covers_the_all_resident_native_case` and three parse
+  cells. Mutation run 2026-09-25: reverting `moe_offload_active` to
+  `offload_ratio > 0` fails exactly that cell; restored, `config` is **74
+  cases, 0 failed** (up from 69). The OpenVINO build and the no-OpenVINO build
+  both compile clean.
+
+### 11.3 The gate — A770, depth-4 artifact (`measured-here`)
+
+`--offload-ratio 0 --moe-cpu-tier --moe-per-expert-dispatch`, u8 KV, chunk
+2048, `--no-logits-slice`, 1 lane, `--n-ctx 32768`, plugin `ov-0051`.
+
+| quantity | all-resident (this leg) | tiered ratio 50 (`previously-measured`, same day) |
+|---|---|---|
+| load | ready in **4.4 s**, device-resident 2.71 GiB | ready in 22.0 s, device-resident 1.28 GiB |
+| reservation max ctx | 7,066,560 / lane | 8,397,168 / lane |
+| decode t/s @1 / @4096 | 49.9 / **56.8** | 4.2 / 14.2 |
+| ext prefill t/s @4096 | **155.9** | 28.6 |
+| digest @1 / @4096 | `3f6d0ab1f8d9` / `8cccdbac48ed` | `3f6d0ab1f8d9` / `8cccdbac48ed` |
+
+The all-resident native route is **4.0× decode and 5.4× prefill** the tiered
+arm at the same depth, with **byte-identical digests** — and the counters say
+why: `cpu_tier_pairs=0`, `cpu_tier_experts=0`, `per_expert_dispatches=6847`,
+`per_expert_gpu_invocations=544,832`, gpu hit rate 85.0 %. No expert touched
+the CPU tier; the GPU per-expert kernel (patch 0050's IQ2_S path) computed
+every routed expert.
+
+Two caveats, stated: (a) the load's first fit pass failed on
+**fragmentation, not arithmetic** ("allocation failed at a budget that said it
+fits", pass 1/4), and pass 2/4 loaded by capping the prefix-cache spare at
+219,805 pages — the arithmetic fits, the allocator did not on the first pass;
+(b) the digests being identical again leaves the §9.6 question open (bit-exact
+kernel vs degenerate attractor) for this depth-4 rung.
+
+The dispatch-without-tier variant does **not** load: it reaches the plugin and
+refuses at `moe_3gemm_swiglu_opt.cpp:1141` (`dispatch_cpu_tier: x/routing-weight
+usm_host buffers not populated`) because the dispatch route needs the tier's
+hoisted host buffers even when there are no misses. The reachable all-resident
+configuration therefore carries `--moe-cpu-tier`.
+
+### 11.4 The sizing census (operator item 3) — resolved, no mis-map
+
+`measured-here`: the SAVED artifact's native body bytes, read off its own
+Constants, against the GGUF's raw block bytes, over all 40 layers:
+
+| role / GGUF type | artifact | GGUF | ratio |
+|---|---|---|---|
+| gate IQ2_S | 5.000 GiB | 3.203 GiB | **1.561** |
+| up IQ2_S | 5.000 GiB | 3.203 GiB | **1.561** |
+| down IQ3_XXS | 4.047 GiB | 3.541 GiB | 1.143 |
+| down IQ4_XS→IQ4_NL | 0.422 GiB | 0.398 GiB | 1.059 |
+| **experts, total** | **14.469 GiB** | **10.346 GiB** | **1.399** |
+
+The inflation is the plugin's native layout, not a mis-map: grid indices ride
+as four little-endian u16 (`8 B/32`) against the GGUF's packed qs+qh
+(`5 B/32`), and the two sub-block scales as two f16 (`4 B/32`) against the
+GGUF's 4-bit nibbles (`1 B/32`); gate/up is exactly 82 → 128 B per 256. The
+sampled byte-exactness (§10.3) proves the same bytes, re-laid.
+
+The **"24 GB / 600 MB per layer"** premise came from the manifest's
+`expert_fill.filled_bytes` (24,662,507,520 B). That field sums the **f32 split
+parts** (`q4e/native_blocks`' `scales` are f32), about 1.55× the artifact's
+actual Constant bytes — a manifest-field overstatement, not artifact size. The
+lm `.bin` (21.82 GiB) confirms the 14.47 GiB experts + ~7.35 GiB dense. A
+packed native layout (store the GGUF's 82 B blocks and decode them) is the
+size lever; it is not this leg's.
+
+### 11.5 The full-depth artifact's coherence — truncation, confirmed
+
+The interrupted full-depth sweep (`measured-here`; stopped the moment the
+priority changed, so 1 and 4096 are complete and 16384 is not): the d40n
+artifact **loaded and served** (compile 65.3 s, `weights+graph 3.68 GiB`,
+reservation `max ctx 581600 per lane`). Its greedy text is **coherent** —
+depth 1 `"\n# Tools\n\nYou have access to the following functions:\n\n1.
+**execute_command**: Run a command in the terminal..."`, depth 4096
+`"...system: You are a function calling AI model..."`. Rate: decode 0.5 t/s
+@1 and 1.5 t/s @4096, ext prefill 2.6 t/s @4096. So the depth-4 rung's
+degenerate text was **depth-4 truncation**, not an emitter/fill defect; the
+emitter is right.
+
+### 11.6 OWED
+
+- The **full-depth all-resident arm** does not fit (14.47 GiB of experts alone
+  against 15.11 GiB of VRAM), so the all-resident speed is a small-depth route
+  until the packed native layout and/or a smaller expert representation.
+- A **packed native layout** (the size lever) — the offload miss path copies
+  the inflated body across PCIe.
+- The **16384 point** of the full-depth sweep (interrupted by the redirect).
+- A **logits-level V4 A/B** to separate bit-exact kernel from attractor
+  robustness.

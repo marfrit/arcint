@@ -602,6 +602,54 @@ TEST(config_moe_cpu_tier_needs_offload_ratio) {
     CHECK(rejected({"--stub", "--moe-cpu-tier"}));
 }
 
+TEST(config_offload_ratio_zero_is_distinguishable_from_unset) {
+    // plugin patch 0051: an explicit 0 is the all-resident native pool, and it
+    // must be distinguishable from "offload off".
+    Config cfg;
+    CHECK(run({"--stub"}, cfg).ok);
+    CHECK(!cfg.offload_ratio_set);
+    CHECK_EQ(cfg.offload_ratio, 0);
+
+    Config cfg2;
+    CHECK(run({"--stub", "--offload-ratio", "0"}, cfg2).ok);
+    CHECK(cfg2.offload_ratio_set);
+    CHECK_EQ(cfg2.offload_ratio, 0);
+}
+
+TEST(config_all_resident_native_dispatch_is_accepted) {
+    // The all-resident native route: an explicit 0 plus per-expert dispatch,
+    // with or without the tier.
+    Config cfg;
+    CHECK(run({"--stub", "--offload-ratio", "0", "--moe-per-expert-dispatch"}, cfg).ok);
+    CHECK(cfg.offload_ratio_set);
+    CHECK(cfg.moe_per_expert_dispatch);
+    CHECK(!cfg.moe_cpu_tier);
+
+    Config cfg2;
+    CHECK(run({"--stub", "--offload-ratio", "0", "--moe-cpu-tier",
+               "--moe-per-expert-dispatch"}, cfg2).ok);
+    CHECK(cfg2.moe_cpu_tier);
+}
+
+TEST(config_dispatch_still_needs_tier_while_offloaded) {
+    // The guard protects a real fallback: while experts are offloaded, a
+    // dispatched miss needs the tier.
+    CHECK(rejected({"--stub", "--offload-ratio", "20", "--moe-per-expert-dispatch"}));
+    // ratio 0, tier, no dispatch: still nothing for the tier to compute.
+    CHECK(rejected({"--stub", "--moe-cpu-tier"}));
+}
+
+TEST(config_offload_active_covers_the_all_resident_native_case) {
+    // Red-first for the swallowed-property defect: reverting backend_ov.cpp to
+    // `ratio > 0` (or dropping the explicit-0 plumbing) makes the
+    // explicit-0-native case below fail.
+    CHECK(!moe_offload_active(0, false, "native"));  // unset -> no offload
+    CHECK( moe_offload_active(0, true,  "native"));  // explicit 0 + native -> all-resident pool
+    CHECK(!moe_offload_active(0, true,  "u4"));      // affine explicit 0 -> unchanged path
+    CHECK( moe_offload_active(50, false, ""));       // ratio > 0 -> offload
+    CHECK(!moe_offload_active(0, true,  ""));        // no declared format -> no offload
+}
+
 TEST(config_moe_cpu_tier_threads_needs_tier) {
     // A thread count without the tier would be accepted and silently ignored
     // (found in review); refuse it so a mistyped invocation cannot look tuned.

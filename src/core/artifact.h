@@ -96,6 +96,13 @@ struct Artifact {
     std::string expert_bodies_path;
     uint64_t    expert_bodies_bytes = 0;
     std::vector<ExpertBodyEntry> expert_bodies;
+    // The emitter's declared expert format from serving-shape.json's
+    // `expert_fill.format` ("native" for the checkpoint's own blocks, "u4"
+    // for the grouped-affine repack); empty when the manifest omits it (an
+    // HF export, or an artifact with no serving-shape.json). The all-resident
+    // native pool at --offload-ratio 0 is only meaningful for "native": an
+    // affine model stays on the direct resident Constants.
+    std::string expert_format;
 
     // True iff serving-shape.json declared segment_layers != null, i.e. the
     // artifact was produced (and must be driven) as a chain of segments,

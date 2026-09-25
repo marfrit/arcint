@@ -1,0 +1,52 @@
+diff -ruN a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp	2026-09-25 16:19:41.192145956 +0000
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp	2026-09-25 16:19:41.193145952 +0000
+@@ -1883,10 +1883,17 @@
+             const auto& nc = cur_moe->_config;
+             const bool native = ov::op::internal::MOECompressed::is_native_format(nc.gate_up_weight_format) ||
+                                 ov::op::internal::MOECompressed::is_native_format(nc.down_weight_format);
+-            OPENVINO_ASSERT(!native || (_cpu_tier && _weight_provider->is_offloaded()),
+-                            "native expert formats (IQ4_NL / IQ3_XXS) need OFFLOAD_RATIO in (0, 100) and "
+-                            "MOE_CPU_TIER=YES: every routed expert is computed on the CPU tier until the "
+-                            "OpenCL decode exists (patch 0043)");
++            // ARCINT (patch 0051): the CPU tier was also required because
++            // (0043) no OpenCL decode existed, so every native routed expert
++            // had to run on the tier. Patch 0045 added the decode, and
++            // moe.cpp now enables the OFFLOAD provider even at ratio 0
++            // (all-resident native pool), so the requirement is just that the
++            // OFFLOAD provider -- the one that owns the native reader -- is in
++            // use. The CPU tier is not needed when there are no misses.
++            OPENVINO_ASSERT(!native || _weight_provider->is_offloaded(),
++                            "native expert formats need the offload weight provider (which owns the "
++                            "native reader): supply OFFLOAD_RATIO (an explicit 0 enables the "
++                            "all-resident native pool)");
+         }
+         if (_cpu_tier && _weight_provider->is_offloaded()) {
+             static_cast<OffloadExpertWeightProvider*>(_weight_provider.get())->set_cpu_tier(true);
+diff -ruN a/src/plugins/intel_gpu/src/plugin/ops/moe.cpp b/src/plugins/intel_gpu/src/plugin/ops/moe.cpp
+--- a/src/plugins/intel_gpu/src/plugin/ops/moe.cpp	2026-09-25 16:19:41.191145959 +0000
++++ b/src/plugins/intel_gpu/src/plugin/ops/moe.cpp	2026-09-25 16:19:41.192145956 +0000
+@@ -41,10 +41,19 @@
+     const auto& config = op->get_config();
+     const auto& model = p.get_model();
+     const size_t otd_ratio = p.get_config().get_offload_ratio();
+-    // ratio=0  → all resident, no offload
+-    // ratio=100 → all on disk, cannot run → treat as disabled
+-    // otherwise → GPU-resident slots = num_expert * (100 - ratio) / 100
+-    if (otd_ratio > 0 && otd_ratio < 100) {
++    // ARCINT (patch 0051): ratio 0 is the ALL-RESIDENT case. The stock form
++    // disabled OTD there, leaving the ResidentExpertWeightProvider in place;
++    // for a NATIVE expert format that provider has no native reader, so patch
++    // 0043's assert was unsatisfiable at 0 (and config.cpp refused the tier
++    // there too). A native all-resident run needs the OFFLOAD provider with a
++    // full slot pool, so enable OTD whenever the caller supplied
++    // ov::weights_path -- an explicit 0 is thereby distinguishable from unset.
++    // ratio=100 stays disabled (all on disk cannot run).
++    const bool native = ov::op::internal::MOECompressed::is_native_format(config.gate_up_weight_format) ||
++                        ov::op::internal::MOECompressed::is_native_format(config.down_weight_format);
++    const bool resident_native = native && otd_ratio == 0 &&
++                                 !p.get_config().get_weights_path().empty();
++    if ((otd_ratio > 0 && otd_ratio < 100) || resident_native) {
+         lru_expert_num = std::max<size_t>(1, static_cast<size_t>(config.num_expert) * (100 - otd_ratio) / 100);
+     } else {
+         lru_expert_num = 0;

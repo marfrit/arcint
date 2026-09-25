@@ -1102,10 +1102,17 @@ public:
         // Order matters: the head must see every prompt position, so this runs
         // before the slice rewires the LM head's input.
         offload_ratio_ = cfg.offload_ratio;
-        if (offload_ratio_ > 0) {
-            log::info("load", "expert offload at %d%%: the plugin keeps that share of the MoE "
-                              "expert weights off the card and streams them",
-                      offload_ratio_);
+        offload_ratio_set_ = cfg.offload_ratio_set;
+        expert_format_ = artifact.expert_format;
+        if (offload_active()) {
+            if (offload_ratio_ > 0)
+                log::info("load", "expert offload at %d%%: the plugin keeps that share of the MoE "
+                                  "expert weights off the card and streams them",
+                          offload_ratio_);
+            else
+                log::info("load", "all-resident native expert pool (--offload-ratio 0): every "
+                          "expert stays in the device slots, read through the offload provider's "
+                          "native reader");
             // Measured 2026-09-01 (DESIGN 7.0.2s): the OTD slot buffers commit
             // physical memory lazily, so the residency this reservation reads
             // at load excludes them, and the max-ctx it derives is optimistic
@@ -1180,7 +1187,7 @@ public:
             ov::AnyMap cfg;
             cfg[ov::cache_mode.name()]   = ov::CacheMode::OPTIMIZE_SIZE;
             cfg[ov::weights_path.name()] = artifact.language_model_bin;
-            if (offload_ratio_ > 0) cfg["OFFLOAD_RATIO"] = offload_ratio_;
+            if (offload_active()) cfg["OFFLOAD_RATIO"] = offload_ratio_;
             if (std::getenv("ARCINT_PROFILE") != nullptr) cfg[ov::enable_profiling.name()] = true;
 
             // Was there anything to import, or is this the run that writes the
@@ -1221,7 +1228,7 @@ public:
             auto t_cold  = std::chrono::steady_clock::now();
             ov::AnyMap props;
             if (std::getenv("ARCINT_PROFILE") != nullptr) props[ov::enable_profiling.name()] = true;
-            if (offload_ratio_ > 0) {
+            if (offload_active()) {
                 // Expert offload needs the weights on disk to stream from: the
                 // plugin loads them on demand rather than keeping them resident.
                 props["OFFLOAD_RATIO"]        = offload_ratio_;
@@ -2711,6 +2718,8 @@ private:
         }
 
         offload_ratio_ = cfg.offload_ratio;
+        offload_ratio_set_ = cfg.offload_ratio_set;
+        expert_format_ = artifact_.expert_format;
         ov::AnyMap props;
         // u8 KV is the default, by §7.0.3's protocol run to completion on the
         // C++ endpoint (2026-08-29): 10/10 on the harness at base depth AND at
@@ -2928,7 +2937,7 @@ private:
         } else if (std::getenv("ARCINT_DYN_QUANT_GROUP") != nullptr) {
             log::warn("load", "ARCINT_DYN_QUANT_GROUP is set but dynamic quantization is off (--dyn-quant on turns it on): ignored");
         }
-        if (offload_ratio_ > 0) {
+        if (offload_active()) {
             props["OFFLOAD_RATIO"]        = offload_ratio_;
             props[ov::weights_path.name()] = artifact_.language_model_bin;
             // Experiment knob, ARCINT_FIT_SLOT_BYTES-style: forwards a device
@@ -3644,7 +3653,7 @@ private:
         bool        probe_priced_device = false;  // the plateau probe ran and set slot_pool
         uint64_t    slot_host_bytes   = 0;  // host (GTT) estimate -- informational only
         std::string slot_host_source;       // "ir" | "config"
-        if (offload_ratio_ > 0) {
+        if (offload_active()) {
             // §4 "the on-card red case": forces the DEVICE term for an A/B
             // against the exact bug M7 removes. Checked first and, when
             // valid, short-circuits the rest of Phase B entirely -- no
@@ -5787,7 +5796,7 @@ private:
         // fit ledger hitting: when probes ran, their forwards already filled
         // the slots as a side effect; the pre-warm is for the case where
         // probes were skipped.
-        if (offload_ratio_ > 0 && ledger_hit) {
+        if (offload_active() && ledger_hit) {
             Lane& pw_lane = *lanes_[0];
             const size_t pw_tokens = std::min<size_t>(
                 128, static_cast<size_t>(std::max(prefill_chunk_, 1)));
@@ -7842,6 +7851,16 @@ private:
     ov::Tensor                     last_hidden_;    // the base model's, this step
     ov::Tensor                     hidden_copy_;    // owned; last_hidden_ points here
     int                            offload_ratio_ = 0;
+    bool                           offload_ratio_set_ = false;  // --offload-ratio given (incl. 0)
+    std::string                    expert_format_;              // artifact's expert_fill.format
+    // Offload machinery is active when the ratio is > 0, OR when an explicit
+    // 0 was given for a NATIVE artifact: there the offload provider owns the
+    // only native reader, so the all-resident pool rides it (plugin patch
+    // 0051). An affine artifact at an explicit 0 stays on the direct resident
+    // Constants -- offload_active() is false, exactly as before.
+    bool offload_active() const {
+        return moe_offload_active(offload_ratio_, offload_ratio_set_, expert_format_);
+    }
     int                            pin_dispatch_ = -1;  // --pin-dispatch; -1 = off
     bool                           moe_cpu_tier_ = false;         // --moe-cpu-tier
     int                            moe_cpu_tier_threads_ = 0;     // --moe-cpu-tier-threads

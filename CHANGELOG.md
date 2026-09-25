@@ -389,11 +389,29 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   reference 9.1 t/s at ratio 50, 15.0/15.5 tier-on). The depth differs, so
   the supported delta is per-layer (native IQ2_S ≈3.8x the int4 affine
   per-expert layer).
-- **The fully-resident native arm is BLOCKED**: patch 0043's assert needs
-  `OFFLOAD_RATIO in (0,100)` + `MOE_CPU_TIER`, and arcint sets the property
-  only when the ratio is `> 0`, so ratio 0 — the fully-resident case —
-  refuses at compile. The depth-4 artifact otherwise fits with ≈9 GiB
-  headroom (reservation max ctx 8,397,168 per lane); 262144 is reachable.
+- **The fully-resident native arm was BLOCKED, and is now reachable**: patch
+  0043's assert needed `OFFLOAD_RATIO in (0,100)` + `MOE_CPU_TIER`, arcint set
+  the property only when the ratio was `> 0`, and the plugin disabled OTD at
+  ratio 0 — a three-link dead end. Plugin patch
+  `0051-native-fully-resident.patch` enables the offload provider at an
+  explicit 0 for a native artifact (pool = all experts) and relaxes the assert
+  to `is_offloaded()`; arcint gained `offload_ratio_set`,
+  `moe_offload_active()`, and `expert_fill.format` parsing, with the two config
+  guards relaxed. Red-first cell mutation-tested; `config` 74 cases, 0 failed.
+- **The all-resident native route is 4-5x faster**: on the A770 depth-4 rung,
+  `--offload-ratio 0 --moe-cpu-tier --moe-per-expert-dispatch` loads in 4.4 s
+  and serves at **49.9 / 56.8 t/s** decode and **155.9 t/s** extension prefill
+  at 4096, against the tiered ratio-50 arm's 4.2 / 14.2 and 28.6
+  (previously measured, same day), with **byte-identical digests** and
+  `cpu_tier_pairs=0` — no expert touched the CPU tier.
+- **The full-depth artifact is coherent**: the 40-layer native export (30 GDN
+  + 10 attn, 14,499 nodes, lm .bin 21.82 GiB) serves coherent text at depths 1
+  and 4096, so the depth-4 rung's degenerate text was depth-4 **truncation**,
+  not an emitter defect. Its 120 expert bodies are the GGUF's own blocks
+  (census 40 IQ2_S gate + 40 IQ2_S up + 37 IQ3_XXS down + 3 IQ4_XS down folded
+  onto IQ4_NL), sampled byte-exact; **14.469 GiB** of experts against the
+  GGUF's 10.346 GiB (**1.399x**; the manifest's `filled_bytes` overstates at
+  ~1.55x because it sums the f32 split parts).
 - **V4 does not fire here** (a negative against §7.0.2cf): served digests are
   byte-identical across resident shares 25/50/75/99 while the GPU per-expert
   route is exercised (up to 407,480 invocations, 2..192 resident slots).
