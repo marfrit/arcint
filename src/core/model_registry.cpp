@@ -630,6 +630,42 @@ std::vector<ModelEntry> build_registry() {
         r.push_back(std::move(e));
     }
 
+    {
+        // The same 40-layer artifact with the IQ2_S expert bodies carried as
+        // the checkpoint's OWN 82-byte block (`--native-packed`, plugin
+        // weight_format 5, 2026-09-25): 80 self-contained bytes + the f16 d
+        // per 256 values, 82 B/256 against the re-laid form's 128. lm .bin
+        // 15,623,664,495 B against the re-laid f16 form's 19,482,424,091.
+        // Every expert body is byte-identical to the GGUF (sampled readback,
+        // full-E), census 120/120 packed. The A770 all-resident rate arm.
+        ModelEntry e;
+        e.id                      = "qwen3.6-35b-a3b-native-d40packed";
+        e.family                  = "qwen3.6";
+        e.artifact_aliases        = {"qwen36-35b-a3b-d40packed-ov"};
+        e.ov_arch                 = "Qwen3_5MoeForConditionalGeneration";
+        e.model_type              = "qwen3_5_moe";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2048;
+        e.n_expert                = 256;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 40;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.arch_hash               = "49da9b360bb75d6c";   // its own lm xml, off --inspect-artifact
+        e.template_hash           = "55d4931433fe502b";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 15623664495ull;
+        e.status                  = "measurement artifact: the full-depth (40-layer) native-format "
+                                    "IQ2_S-PACKED serving-shape rung, dense stored f16; "
+                                    "no PLE/n-gram table, served inertly";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
     return r;
 }
 

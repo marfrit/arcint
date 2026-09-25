@@ -24,8 +24,13 @@ TEST(registry_holds_exactly_the_target_models) {
     // same day; it served noise -- its fill was wrong, DESIGN 7.0.2bz), then
     // d48g in its slot (2026-09-18, the re-export through the corrected
     // fill, which serves the Paris line), pinned by its own xml hash.
+    // Sixteen with the native qwen3_5_moe d4 rung and its full-depth d40
+    // (2026-09-25), and the dense-f16 d40 the same day.
+    // Seventeen with the IQ2_S-PACKED d40 (2026-09-25): the checkpoint's own
+    // 82-byte expert block through plugin weight_format 5, the A770
+    // all-resident rate arm.
     const auto ids = model_ids();
-    CHECK_EQ(ids.size(), 16u);   // d48n beside d48g (2026-09-18), the native qwen3_5_moe d4 rung (2026-09-25), and its full-depth d40 (2026-09-25)
+    CHECK_EQ(ids.size(), 17u);   // d48n beside d48g (2026-09-18), the native qwen3_5_moe d4 rung (2026-09-25), its d40 + d40f16 (2026-09-25), and the packed d40 (2026-09-25)
     CHECK(find_model("qwen3.8-flash-next-d48g") != nullptr);
     CHECK(find_by_artifact("qwen38-flash-next-d48g-ov") == find_model("qwen3.8-flash-next-d48g"));
     CHECK(find_model("qwen3.8-flash-next-d48n") != nullptr);
@@ -40,6 +45,7 @@ TEST(registry_holds_exactly_the_target_models) {
     CHECK(find_model("qwen3.6-35b-a3b-native-d4") != nullptr);
     CHECK(find_model("qwen3.6-35b-a3b-native-d40") != nullptr);
     CHECK(find_model("qwen3.6-35b-a3b-native-d40f16") != nullptr);
+    CHECK(find_model("qwen3.6-35b-a3b-native-d40packed") != nullptr);
     CHECK(find_model("qwen3.6-27b-a3b-coder") != nullptr);
     CHECK(find_model("qwen3.6-35b-a3b") != nullptr);
     CHECK(find_model("qwen3.8-27b") != nullptr);
