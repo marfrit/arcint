@@ -715,3 +715,82 @@ mutation-sensitive layout cell) and a byte-exactness readback against gguf-py.
 This leg scoped the contract but did **not** complete the variant; the size
 win it must beat is the f16 artifact's 18.14 GiB and the fit it must reach is
 ≤15.11 GiB with the runtime terms stated.
+
+## 13. The payoff leg, 2026-09-25/26 — the packing lands, the gate is BLOCKED on host RAM and the packed chain's layout
+
+### 13.1 The packing, landed and verified device-free
+
+Patch `patches/0052-iq2s-packed-format.patch` (mirrored) adds
+`kWeightFormatIq2SPacked == 5`: the checkpoint's own IQ2_S block with the f16
+`d` lifted into the scale slot — **80 self-contained bytes** (32 qs low-2-bit
+| 32 RAW signs | 8 qh | 8 four-bit sub-scales) + one f16 per 256 = **82 B/256**,
+the GGUF's own size, against the re-laid form's 128. Emitter-side:
+`native_blocks.iq2_s_packed_split` / `iq2_s_packed_decode`,
+`serving_shape._native_packed_expert`, `NativeExpertFiller(packed=True)`,
+`--native-packed`.
+
+Verified before any card (`/home/mfritsche/q35-bench/verify-d40packed.py`,
+device-free):
+
+- **census 120/120 packed**: 40 gate + 40 up `IQ2_S_PACKED`, 37 IQ3_XXS down,
+  3 IQ4_XS down — exactly the GGUF's own types.
+- **sampled byte-exactness, full-E** (layer0 gate/up, layer19 gate, layer39
+  up): `w80_ok=True d_ok=True` against `PACKED["IQ2_S"]` recomputed from the
+  shard, shapes `(256,512,8,80)` + `(256,512,8,1)`.
+- the chain decodes random blocks to max diff/bound **1.28e-07** against
+  `iq2_s_packed_decode` (`tests/python/test_native_expert_chain.py`, 6 pass).
+
+Artifact `qwen36-35b-a3b-d40packed-ov` (`--layers 40 --native-packled
+--dense-fp16`): **lm `.bin` 15,623,664,495 B (14.55 GiB)** against the re-laid
+f16 d40's 19,482,424,091 (18.14 GiB), expert fill 12,918,456,320 B (12.03 GiB)
+against the re-laid d40's 24,662,507,520. The reviewer's ~9.3 GiB lm `.bin`
+projection did not hold: the packing saves exactly the gate/up bodies' 46 B/256
+(3.59 GiB), and the IQ3_XXS/IQ4_XS downs, which stay on their own route, are
+unchanged. Admitted as `qwen3.6-35b-a3b-native-d40packed` (own hashes off its
+own manifest, arcint-test 615/0).
+
+### 13.2 The gate — BLOCKED
+
+One A770 window (GPU.1 = `8086:56a0`, 15.11 GiB), `--offload-ratio 0
+--moe-per-expert-dispatch --prefill-chunk 1024 --n-ctx 262144`, depths 1 and
+4096, sampler + watchdog (log `/home/mfritsche/q35-bench/packed-gate/`).
+
+- **Host RAM still bites.** The compile climbed monotonically
+  (`.../q35-d40packed-allres/sampler.log`): RSS 0 → **44,292,600 kB** over
+  ~3 min, container `MemAvailable` 45.99 → **3,149,125 kB**; the watchdog
+  `SIGKILL`ed at **21:33:41Z**. No `device-resident` line, no fit verdict —
+  262144 is **unanswered**. The reviewer's ~17 GiB compile projection did not
+  hold either: the cost is ≈3× the artifact's bytes (14.55 GiB → 44.3 GB),
+  matching the re-laid d40's 50.1 GiB at 18.14 GiB.
+- **The packed chain does not compile on the GPU.** A depth-4 diagnostic with
+  the same plugin (`q35-d4packed-fuse`) fails in
+  `add_required_reorders.cpp:342` `correct_layout_selected`:
+  *"No layout format available for select:Select_598 … format: bfwzyx,
+  data_type: f16, shape=[256,512,8,8,4,8]"* — the packed decode chain's
+  rank-6 signs `Select`. Instrumenting the matcher (`iq2sp RESOLVED` ×8, one
+  per layer's gate+up) proves the **matcher fires**; the chain is the emitter's
+  own, and its `Select` carries one axis more than the IQ2_S chain's rank-5
+  `[.,4,8]`. So the packing's remaining card defect is the packed chain's
+  rank-6 `Select` reaching the layout optimizer, not the matcher.
+- **Control, same plugin**: the re-laid depth-4 artifact, all-resident,
+  compiles and serves — t_boot 48.0 s, `device-resident 2.71 GiB`, decode
+  **57.1 t/s**, digest `80579cf33bff`. Patch 0052 changes nothing for the
+  re-laid route.
+
+### 13.3 Against the recorded arms
+
+| arm | depth | config | decode t/s |
+|---|---|---|---|
+| tiered native IQ2_S | 4 | ratio 50 + tier + dispatch | 14.2 |
+| all-resident native, re-laid | 4 | ratio 0 + dispatch | 49.9–56.8 (57.1 here) |
+| int4 | 40 | tier + dispatch | 5.4/5.3 |
+| **packed all-resident d40** | 40 | ratio 0 + dispatch | **BLOCKED** |
+
+### 13.4 OWED
+
+- the packed chain's rank-6 `Select` layout (the concrete card defect), then a
+  packed d4 rate;
+- the full-depth packed all-resident fit at 262144 (blocked on the ~3× compile
+  cost, not on the VRAM arithmetic);
+- the OTD CPU-tier row decoder against the packed emitter chain;
+- the logits-level V4 A/B.
