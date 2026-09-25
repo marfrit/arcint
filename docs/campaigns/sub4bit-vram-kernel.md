@@ -1480,3 +1480,19 @@ depths 1/4096) is **BLOCKED twice**: the compile's host RAM still bites (RSS
 all-resident compiles and serves, 57.1 t/s decode, `device-resident 2.71 GiB`.
 OWED: the rank-6 `Select` layout and a packed rate; the 262144 fit; the OTD
 CPU-tier row decoder; the logits-level V4 A/B. See design note §13.
+
+[DATED IN PLACE 2026-09-26 (the rank-5 fix leg)]: the packed decode chain's
+signs `Select` is now rank-5 — the `(nblk, ib32)` axes fused before the
+`Unsqueeze`, the bytes unchanged, the pattern block shape-agnostic so the
+matcher still fires. Red-first cell mutation-verified; the rebuilt depth-4
+packed artifact carries **no rank≥6 `Select`**, and the
+`add_required_reorders.cpp:342` refusal from the payoff leg is **gone**. A
+**new** blocker takes its place: packed depth-4 (all-resident AND ratio-50
+tier) both die at `program_builder.cpp:168` / `ocl_common.hpp:62`
+**`CL_OUT_OF_RESOURCES`** inside `cldnn::program::build_program`
+(`build_implementations`' `kernels_cache::build_all` or an allocation) — host
+RAM peaks 5.4 GB, not the cause; the re-laid control compiles and serves with
+the same plugin. Cause not localized; the packed d4 rate is OWED. Also
+recorded as its own lever: the compile materialises **≈3× the artifact's
+bytes** (14.55 GiB → 44.3 GB; the re-laid 18.14 GiB → 50.1 GiB), which is what
+blocks the 262144 fit. See design note §14.
