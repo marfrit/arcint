@@ -1292,3 +1292,76 @@ the campaign rules say it becomes its own document.
     V4/determinism reading. No card touched (`pgrep -x arcint` = 0); the
     served load cannot run device-free, so the no-PLE path is `code` + unit
     cells, not a served reading.
+- 2026-09-25 (the A770 window — the qwen3_5_moe/IQ2_S gate). The card was
+  touched only inside this window (sampler on the physical host, `MemAvailable
+  < 4 GiB` watchdog, one `arcint` leg at a time, 0 watchdog trips). Evidence
+  class per disposition: `code`, `measured-here`, or `previously-measured`.
+
+  * **The native IQ2_S graph compiles and serves on the A770** (item 1,
+    PASS). A measurement build of the pinned OpenVINO with patches 0003–0050
+    (debug caps OFF; GPU-plugin sha256 `582c3230…`, version
+    `2026.4.0-22849-71640275d29-marfrit-p19`) compiled the depth-4 artifact's
+    paged graph on `GPU.1`: "language model ready in 22.0 s (paged);
+    device-resident 1.28 GiB". The plugin's per-expert path ran (counters
+    below). The pre-existing plugin prefixes were not touched.
+  * **The served sweep** (item 2), A770 `GPU.1`, u8 KV, chunk 2048, 8 GiB
+    pool, `--moe-cpu-tier --moe-per-expert-dispatch --no-logits-slice`,
+    `--n-ctx 32768`, extension = `(prompt − hit)/prefill_s`:
+
+    | arm | R | slots | `T_boot` s | depth | hit | ext t/s | TTFT s | decode t/s | digest |
+    |---|---|---|---|---|---|---|---|---|---|
+    | n50 | 50 | 128 | 380.377 | 1 | 0 | 2.0 | 0.806 | 4.2 | `3f6d0ab1f8d9` |
+    | n50 | | | | 4096 | 0 | 28.6 | 143.006 | 14.2 | `8cccdbac48ed` |
+    | n50 | | | | 16384 | 2048 | 28.8 | 497.132 | 14.0 | `e2a836c80c1f` |
+    | n75 | 75 | 64 | 351.375 | 1 | 0 | 2.9 | 0.566 | 8.3 | `3f6d0ab1f8d9` |
+    | n75 | | | | 4096 | 0 | 19.1 | 214.407 | 13.4 | `8cccdbac48ed` |
+    | n75 | | | | 16384 | 2048 | 19.3 | 744.455 | 12.4 | `e2a836c80c1f` |
+    | n25 | 25 | 192 | 251.168 | 4096 | 0 | 51.0 | 80.270 | 15.1 | `8cccdbac48ed` |
+    | n99 | 99 | 2 | 395.360 | 4096 | 0 | 14.5 | 281.871 | 8.6 | `8cccdbac48ed` |
+
+  * **The int4 comparand** (item 3), the existing full-depth 40-layer int4
+    artifact at the same flags: `T_boot` 568.341 s, ext prefill 16.0 t/s
+    @4096 / 26.1 t/s @16384, decode 5.4 / 5.3 t/s, digests `012397a89576` /
+    `f3e9eb2ffa08` / `2d0ff8b1f891`; coherent text. `previously-measured`
+    §7.0.2v's 9.1 t/s (ratio 50, 8 GiB, tier OFF) and §7.0.2x's 15.0/15.5
+    (tier ON, no dispatch) are the fused-path references; this window's
+    comparand adds the native route's own dispatch, which the int4 arm reads
+    at 5.4 t/s. Depth differs (4 vs 40) — the supported delta is per-layer:
+    the native IQ2_S layer costs ≈3.8× the int4 affine per-expert layer.
+  * **The fit verdict** (item 4): the depth-4 artifact fits with ≈9 GiB
+    headroom — reservation `weights+graph 1.28 GiB + drafters 0.95 + expert
+    slots 0.15 + activations 3.40 + margin 0.25 + 1 x (GDN rows 9.6 MiB + KV
+    1.1 KiB/token) of 15.11 GiB -> max ctx 8397168 per lane`. The
+    **fully-resident NATIVE arm is BLOCKED** (`measured-here`, verbatim):
+    `Check '!native || (_cpu_tier && _weight_provider->is_offloaded())' failed
+    at .../moe_3gemm_swiglu_opt.cpp:1886: native expert formats (IQ4_NL /
+    IQ3_XXS) need OFFLOAD_RATIO in (0, 100) and MOE_CPU_TIER=YES`. `code`:
+    arcint sets the plugin's `OFFLOAD_RATIO` only when the ratio is `> 0`, and
+    ratio 0 IS the fully-resident configuration. Lever unchanged.
+  * **V4 does NOT fire here** (item 5) — a negative against the §7.0.2cf
+    expectation. The served digest is byte-identical across ratios 25/50/75/99
+    at depths 1 and 4096 (`3f6d0ab1f8d9` / `8cccdbac48ed`) and across 50/75 at
+    16384 (`e2a836c80c1f`), while the counters show the per-expert route
+    exercised hard (`measured-here`, `MOE_OTD_PERF_LOG=1`):
+    R=25 slots 192, gpu hit 65.03 %, 407,480 GPU invocations, 1,629 CPU-tier
+    experts; R=50 slots 128, 43.15 %, 273,416, 3,382; R=99 slots 2, 0.34 %,
+    1,590, 6,818. Two explanations remain open: (a) patch 0050's IQ2_S kernel
+    is bit-identical to the CPU tier, or (b) the 4-layer artifact's greedy
+    output collapses to a repeated-token attractor robust to the perturbation
+    (`measured-here`: its text is repetitive at every depth, unlike the
+    coherent int4 comparand). A logits-level A/B is OWED; the digest reading
+    does not prove (a).
+  * **262144 reachability** (item 6): the run's own reservation supports
+    `max ctx 8397168 per lane`, and an arm with `--n-ctx 262144` loaded and
+    served. Reachable for this depth-4 artifact.
+  * **The logits-slice finding**: without `--no-logits-slice` the load refuses
+    (`measured-here`): *"logits slice did not take: 128 row(s) … shape
+    [1,128,248320]"*. The `qwen3_5_moe` serving-shape export has the token
+    axis 1 (`[1, tokens, vocab]`), the served-path slice assumes axis 0, and
+    the same convention (`--no-logits-slice`) covers the `qwen4_exp`
+    serving-shape runs (`code`: `kld-d48n.sh:35`).
+  * **OWED**: the full-depth 40-layer export and its served reading; the
+    logits-level V4 A/B; a depth-4 int4 comparand; the depth-4 artifact's
+    answer quality (degenerate greedy text — truncation or an emitter
+    weight-mapping defect, unresolved; device-free verification covered expert
+    bodies and norms only). The 0.5.4 LYON roadmap item is untouched.

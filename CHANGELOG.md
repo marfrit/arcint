@@ -381,6 +381,25 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 - **Built, not served**: the served binary compiles clean with OpenVINO and
   its full device-free suite is 609 cases, 0 failed; the GPU load of the
   native IQ2_S graph is the A770 window's.
+- **Served on the A770** (depth-4 artifact, GPU.1): the native IQ2_S graph
+  loads, compiles and serves through patch 0050. At ratio 50, 8 GiB pool,
+  tier + per-expert dispatch, u8 KV: decode 14.2/14.0 t/s and extension
+  prefill 28.6/28.8 t/s at 4096/16384; the existing 40-layer int4 artifact
+  at the same flags reads 5.4/5.3 t/s decode (previously measured fused/tier
+  reference 9.1 t/s at ratio 50, 15.0/15.5 tier-on). The depth differs, so
+  the supported delta is per-layer (native IQ2_S ≈3.8x the int4 affine
+  per-expert layer).
+- **The fully-resident native arm is BLOCKED**: patch 0043's assert needs
+  `OFFLOAD_RATIO in (0,100)` + `MOE_CPU_TIER`, and arcint sets the property
+  only when the ratio is `> 0`, so ratio 0 — the fully-resident case —
+  refuses at compile. The depth-4 artifact otherwise fits with ≈9 GiB
+  headroom (reservation max ctx 8,397,168 per lane); 262144 is reachable.
+- **V4 does not fire here** (a negative against §7.0.2cf): served digests are
+  byte-identical across resident shares 25/50/75/99 while the GPU per-expert
+  route is exercised (up to 407,480 invocations, 2..192 resident slots).
+  Whether patch 0050's IQ2_S kernel is bit-exact or the 4-layer artifact's
+  greedy output is a degenerate attractor is not separated here; a
+  logits-level A/B is owed.
 
 ## 0.5.0 — 2026-09-13
 
