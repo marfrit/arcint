@@ -1281,6 +1281,40 @@ rows (`docs/window-053.md`) stay OPEN. The store ordering used by the
 transport is the store's own layer-major ordinal; a run against an artifact
 whose layer keys differ from the store's would need the store re-pointed.
 
+## 0050 — a fourth native expert format: IQ2_S (Qwen3.6-35B-A3B)
+
+`0050-native-expert-iq2s-format.patch` adds `MOECompressed::kWeightFormatIq2S
+= 4` and carries it through the pattern block, the op validation, the CPU
+tier's row decoder and the per-expert OpenCL decode — the shape of 0043/0045
+for one more format. `Qwen3.6-35B-A3B` (`qwen35moe`) ships IQ2_S (ggml type
+22) gate/up on all 40 layers over IQ3_XXS (37) / IQ4_XS (3) down, and IQ2_S
+is not one of 0043's three: one 10-bit grid index per EIGHT values (four per
+32) packed as little-endian u16 in a u8 `[E, out, K/32, 8]` weight slot, a
+RAW sign byte per 8 values in the zero-point slot, and TWO 4-bit sub-block
+scales per 32 (low nibble for values 0..15, high for 16..31) as f16
+`[E, out, K/32, 2]`. `moe_otd_runtime.cpp` skips the device scale transpose
+for IQ2_S (the two sub-scales are read row-major).
+
+**IQ4_XS down needs no new format**: `iq4_xs_split` folds its 6-bit sub-block
+scales into the per-32 f32 scale and lands on the IQ4_NL layout 0043 already
+carries, so the three IQ4_XS down tensors ride `kWeightFormatIq4Nl`
+unchanged (measured 2026-09-24 on `blk.34/38/39.ffn_down_exps`, split ->
+decode vs gguf-py `max|diff| 0.0`).
+
+MEASURED (2026-09-24, device-free): the patch applies, reverse-applies and
+re-applies on the 0049 tree, and `ninja -j6 openvino_intel_gpu_plugin` in
+`build-prod` is clean (rc 0, 47 targets, the plugin links). The plugin unit
+cell `moe_cpu_expert_native.iq2_s_row_decodes_...` compiles to an object with
+the plugin's own flags and the vendored gtest headers (that build dir has no
+unit-test target configured).
+
+**OWED.** The GPU compile of a 256-expert/IQ2_S block — the plugin's own
+`ConvertTiledMoeBlockNativeToMoeCompressed` firing and the native per-expert
+kernel launching — is NOT measured here; only the library build and the
+serialised pattern are. That is the A770 window. The emitter
+(`tools/q4e/serving_shape.py`'s IQ2_S branch and
+`build_qwen35moe_serving_shape_ir`) is in the arcint tree, not in this patch.
+
 ## Not carried either: the measurement instrument
 
 The arcint session's working tree also carries per-stage timing accumulators

@@ -1181,3 +1181,70 @@ the campaign rules say it becomes its own document.
   OWED: the plugin `kWeightFormatIq2S` + pattern/tier/OCL (design note §4),
   the `qwen3_5_moe` emitter (design note §5), the full-depth export, and the
   A770 window (gate, design note §6).
+- 2026-09-24 (qwen3_5_moe port leg, dated append — the plugin format, the
+  emitter, a depth-4 export; the A770 window stays OWED) — Operator decision
+  executed: the serving-shape emitter is ported to `qwen3_5_moe` and IQ2_S is
+  a native plugin format. One card-leg-free session. Evidence class per
+  disposition (`code` / `measured-here`).
+
+  * **The four conventions, measured BEFORE the code** (design note §5; no
+    card). (1) GDN output gate = **silu** (`code`: llama.cpp
+    `src/models/qwen35moe.cpp` `build_norm_gated` -> `ggml_silu`;
+    `measured-here`: the served int4 IR's `linear_attn.norm` chain carries
+    `aten::silu/Swish`, the only `Sigmoid` in `linear_attn` is on beta, and
+    GGUF `ssm_norm` == the IR Constant to `max|diff| 0.0`). (2) value/key head
+    map = **tiled** (`measured-here`: every value-head-indexed GDN tensor in
+    the GGUF is the HF interleave order re-laid into llama's tiled order —
+    sigma-map vs identity max|diff|: `attn_qkv` v `0.012` vs `0.395`,
+    `attn_gate` `0.012` vs `0.297`, `ssm_out` `0.036` vs `0.413`, `ssm_alpha`
+    `0.0069` vs `0.171`, `ssm_beta` `0.0043` vs `0.085`; `code`: llama.cpp
+    `ggml_repeat_4d`). (3) norms = **plain RMSNorm, no `(1+w)`**,
+    pre-norm residual (`measured-here`: GGUF `attn_norm`,
+    `post_attention_norm`, `ssm_norm`, `attn_q_norm`, `attn_k_norm` all equal
+    the served IR's Constants to `max|diff| 0.0`, no `+1` in the chain; so
+    `qattn._rmsnorm_hd` takes `norm_plus_one=False` for this family).
+    (4) the tiled MoE lowering is **E-agnostic** (`measured-here`, device-free:
+    a 256-expert top-8 block compiles to **3 GatherMatmul** primitives on the
+    CPU plugin exactly as 512/top-10; `code`: the matcher has no E bound).
+  * **Plugin patch 0050** (`0050-native-expert-iq2s-format.patch`, both patch
+    dirs): `MOECompressed::kWeightFormatIq2S = 4`, `NativeIq2sWeightsBlock`,
+    the `[E, ofm, K/32, 8]` weight branch, the CPU tier row decoder +
+    `kIq2sGrid[8192]`, the OpenCL `native_dot_iq2s` for gate/up, and the IQ2_S
+    scale-transpose skip in `moe_otd_runtime.cpp`. **IQ4_XS down (3 tensors)
+    needs NO new format**: `iq4_xs_split` folds its 6-bit sub-block scales onto
+    the IQ4_NL layout 0043 carries, so those tensors ride
+    `kWeightFormatIq4Nl` (`measured-here`: `blk.34/38/39.ffn_down_exps`,
+    split -> decode vs gguf-py `max|diff| 0.0`). Built clean on the pinned tree
+    2026-09-24 (`ninja -j6 openvino_intel_gpu_plugin` in `build-prod`, **rc
+    0**, 47 targets); the plugin unit cell compiles to an object with the
+    plugin's flags and the vendored gtest headers. A walker PASS is not a
+    compile and no card compile is claimed.
+  * **Emitter + depth-4 export** (`measured-here`, device-free): the
+    `build_qwen35moe_serving_shape_ir` port (plain pre-norm residual; reuses
+    `q4e.gdn` tiled, `emit_stateful_attention` with `norm_plus_one=False`,
+    `emit_moe_tiled` with the native filler) wired into
+    `tools/export_serving_artifact.py` (`--family qwen35moe`, auto-detected).
+    The depth-4 artifact `qwen36-35b-a3b-d4n-ov` (operator-local path):
+    **4 layers = 3 GDN + 1 attention, 1476 nodes, 12 native expert bodies
+    (2,415,919,104 B), LM `.bin` 4,284,499,713 B**, peak host 10.88 GiB. It
+    **loads** (`ov.Core().read_model`, 1476 nodes, CPU compile in the ad-hoc
+    leg; the artifact `read_model` alone in the commit-time check) and **all 12
+    gate/up IQ2_S and all 4 down IQ3_XXS blocks are byte-exact** — the emitted
+    codes/signs equal `iq2_s_split`/`iq3_xxs_split` and the decode reads
+    `max|diff| 0.0` against the GGUF. Red-first cells in
+    `tests/python/test_qwen35moe_serving_shape.py` (a low-byte-only index
+    mutant is caught; the 256-expert cell asserts 3 GatherMatmuls) plus the
+    mutation-sensitive `test_native_blocks.py` / `test_native_expert_gemv.py`
+    cells.
+  * **Suite**: `tests/python/test_native_blocks.py`,
+    `test_native_expert_gemv.py`, `test_qwen35moe_serving_shape.py` = **28
+    passed, 5 skipped**; `test_serving_shape.py` = **36 passed, 1 skipped**
+    (regression on the `_rmsnorm_hd` default). The patches mirror cell = **1
+    case run, 0 failed**.
+  * **OWED**: the A770 window (the gate: GPU compile of the native IQ2_S
+    pattern/kernel + served rate/digests), the full-depth 40-layer export, the
+    served binary's `qwen3_5_moe` load path (the artifact config carries the
+    geometry; `artifact.cpp`'s admission and the served loop for a non-PLE
+    family are unverified), and cell 4's card half. No card was touched
+    (`pgrep -x arcint` = 0 before and after); no rate, fit or export beyond
+    depth 4 is claimed.

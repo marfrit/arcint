@@ -180,15 +180,26 @@ def _freqs_tables(config, T):
     return cosT, sinT
 
 
-def _rmsnorm_hd(x, weight, eps, d):
+def _rmsnorm_hd(x, weight, eps, d, plus_one=True):
     """Qwen4ExpTextRMSNorm over the LAST axis, no group: pin 152-172. x is
     [1, T, heads, d]; the norm is a MEAN of squares (pin 164), not a sum. The
     [d] weight (zero-init, pin 156) is applied as the pin's (1 + w) (pin 171)
     through the f64-roundtrip lowering hc.py established -- bit-identical to the
     pin's fp32 add for |w| >= 2^-30, and checkpoint norm weights are zero-init
-    plus drift, far above that."""
+    plus drift, far above that.
+
+    `plus_one=False` drops the pin's (1 + w) and applies `weight` directly.
+    That is the `qwen3_5_moe` converter's convention: measured 2026-09-24
+    (`measured-here`) on the served int4 IR's `q_norm`/`k_norm` chain --
+    Power -> ReduceMean -> Add(eps) -> Sqrt -> Divide -> Multiply(x) ->
+    Multiply(weight), no `+1` -- and the GGUF's `attn_q_norm.weight` /
+    `attn_k_norm.weight` equal those Constants to `max|diff| 0.0`. The
+    qwen4exp path keeps the default (its converter folds `(1 + w)` into the
+    stored gamma, `gguf_feed._LAYER_MAP` kind `gamma1`)."""
     var = _rmean(_mul(x, x), 3)                    # pin 164: x.pow(2).mean(-1)
     xn = _mul(x, _rsqrt_eps(var, eps))             # pin 164: x * rsqrt(var+eps)
+    if not plus_one:
+        return _mul(_c(np.ascontiguousarray(weight, np.float32).reshape([1, 1, 1, d])), xn)
     w64 = op.convert(
         _c(np.ascontiguousarray(weight, np.float32).reshape([1, 1, 1, d])),
         Type.f64)

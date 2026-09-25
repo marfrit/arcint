@@ -154,6 +154,7 @@ module emits byte-identical in STRUCTURE to the ones the parity suites gate.
 import contextlib
 import os
 import tempfile
+import types
 
 import numpy as np
 import openvino as ov
@@ -914,6 +915,69 @@ def _native_expert(arena, e, out, inn, name, fmt, parts):
         sign = op.reshape(sign, g4, special_zero=False)
         sign.set_friendly_name(name + "/iq3xxs_sign")
         x = op.multiply(mag, sign)
+    elif fmt == "IQ2_S":
+        # IQ2_S (ggml type 22): four 10-bit grid indices per 32 values, one raw
+        # sign byte per 8 values, and TWO 4-bit sub-block scales per 32 (the low
+        # nibble serves values 0..15, the high nibble 16..31). The weight slot is
+        # the u8 [E,out,K/32,8] patch 0043/0045's fourth format reads: the four
+        # indices as little-endian u16, two bytes each. The scale slot is the
+        # compact [E,out,K/32,2] and is EXPANDED in-graph to [E,out,K/32,32] (lo
+        # repeated 16, hi repeated 16) -- the constant stays 4 B per 32 values,
+        # not the 64 B an expanded constant would cost.
+        gridix, signix, scales8 = parts
+        assert gridix.shape == (rows, inn // 8) and gridix.dtype == np.uint16, (
+            gridix.shape, gridix.dtype)
+        assert signix.shape == (rows, inn // 8) and scales8.shape == (rows, inn // 8), (
+            signix.shape, scales8.shape)
+        gi = np.ascontiguousarray(
+            gridix.reshape(e, out, groups, 4).astype("<u2")).view(np.uint8).reshape(
+            e, out, groups, 8)
+        w = arena.constant([e, out, groups, 8], Type.u8, fill=gi, name=name + "/gridix_u8")
+        w.set_friendly_name(name + "/gridix_u8")
+        w5 = op.reshape(w, op.constant(np.array([e, out, groups, 4, 2], np.int64)),
+                        special_zero=False)
+        lo = op.gather(w5, op.constant(np.array(0, np.int64)), op.constant(np.int64(-1)))
+        hi = op.gather(w5, op.constant(np.array(1, np.int64)), op.constant(np.int64(-1)))
+        idx = op.add(op.convert(lo, Type.i32),
+                     op.multiply(op.convert(hi, Type.i32),
+                                 op.constant(np.array(256, np.int32))))
+        idx.set_friendly_name(name + "/iq2s_index")
+        grid = op.constant(nb.IQ2S_GRID.astype(np.float32))                        # [1024, 8]
+        mag = op.gather(grid, idx, op.constant(np.int64(0)))                       # [E,out,g,4,8]
+        mag = op.reshape(mag, g4, special_zero=False)
+        mag.set_friendly_name(name + "/iq2s_grid")
+        # IQ2_S signs are the RAW byte: bit j flips value j (no 7-bit table
+        # index, unlike IQ3_XXS)
+        si = arena.constant([e, out, groups, 4], Type.u8,
+                            fill=np.ascontiguousarray(signix.reshape(e, out, groups, 4)),
+                            name=name + "/signix_u8")
+        si.set_friendly_name(name + "/signix_u8")
+        bits = op.bitwise_and(op.unsqueeze(op.convert(si, Type.i32), op.constant(np.int64(-1))),
+                              op.constant(nb.KMASK_IQ2XS.astype(np.int32)))        # [E,out,g,4,8]
+        neg = op.greater(bits, op.constant(np.int32(0)))
+        sign = op.reshape(op.select(neg, op.constant(np.float32(-1.0)),
+                                    op.constant(np.float32(1.0))),
+                          g4, special_zero=False)
+        sign.set_friendly_name(name + "/iq2s_sign")
+        x = op.multiply(mag, sign)
+        s4 = scales8.reshape(e, out, groups, 4)
+        sc2_f32 = np.stack([s4[..., 0], s4[..., 2]], axis=-1).astype(np.float32)   # lo, hi
+        sc2 = arena.constant([e, out, groups, 2], Type.f16,
+                             fill=np.ascontiguousarray(sc2_f32, np.float16),
+                             name=name + "/block_scale")
+        sc2.set_friendly_name(name + "/block_scale")
+        arena.scales[name + "/block_scale"] = sc2_f32
+        sc5 = op.reshape(op.convert(sc2, Type.f32),
+                         op.constant(np.array([e, out, groups, 1, 2], np.int64)),
+                         special_zero=False)
+        sc_rep = op.broadcast(sc5,
+                              op.constant(np.array([e, out, groups, 16, 2], np.int64)))
+        sc32 = op.reshape(sc_rep, g4, special_zero=False)
+        sc32.set_friendly_name(name + "/iq2s_scale32")
+        x = op.multiply(x, sc32)
+        x = op.reshape(x, op.constant(np.array([e, out, inn], np.int64)), special_zero=False)
+        x.set_friendly_name(name + "/native_f32")
+        return x
     elif fmt == "Q8_0":
         codes, scales = parts
         assert codes.shape == (rows, inn) and codes.dtype == np.int8 and scales.shape == (rows, groups), (
@@ -1863,11 +1927,13 @@ def emit_stateful_attention(hidden, pid, config, state, layer, beam,
     gate = qgdn._reshape(qgdn._slice(qg, d, 2 * d, 1, 3), [1, T, heads * d])
 
     q = qgdn._transpose(
-        qattn._rmsnorm_hd(q, state["q_norm.weight"], eps, d), [0, 2, 1, 3])
+        qattn._rmsnorm_hd(q, state["q_norm.weight"], eps, d,
+                          getattr(config, "norm_plus_one", True)), [0, 2, 1, 3])
     k = qgdn._reshape(
         qgdn._mm(hidden, qattn._c(state["k_proj.weight"]), tb=True), [1, T, kv, d])
     k = qgdn._transpose(
-        qattn._rmsnorm_hd(k, state["k_norm.weight"], eps, d), [0, 2, 1, 3])
+        qattn._rmsnorm_hd(k, state["k_norm.weight"], eps, d,
+                          getattr(config, "norm_plus_one", True)), [0, 2, 1, 3])
     v = qgdn._transpose(
         qgdn._reshape(qgdn._mm(hidden, qattn._c(state["v_proj.weight"]), tb=True),
                       [1, T, kv, d]), [0, 2, 1, 3])
@@ -2012,6 +2078,341 @@ def _ple_tail(hidden, emb, config, state, T, conv_mask=None):
     return qgdn._add(gv_flat, conv_out)
 
 
+
+# --------------------------------------------------------------------------
+# THE `qwen3_5_moe` SERVING SHAPE (design-qwen35moe-serving-shape, 2026-09-24)
+# --------------------------------------------------------------------------
+#
+# The native route emits ONE graph family today -- the Flash-Next `qwen4_exp`
+# backbone, whose layer is a HYPER-CONNECTION mixer around every sublayer and
+# whose PLE gathers an n-gram table. `Qwen3.6-35B-A3B` (`general.architecture
+# = qwen35moe`) has neither: 40 layers, 256 experts top-8, one shared expert,
+# and a PLAIN PRE-NORM RESIDUAL layer. The four conventions below are measured
+# (design note §5), not assumed; each cites its oracle.
+#
+#   1. GDN output gate = SILU, applied as a gated RMSNorm on the z projection
+#      (`code`: llama.cpp src/models/qwen35moe.cpp build_norm_gated ->
+#      ggml_silu; `measured-here`: the served int4 IR's linear_attn.norm chain
+#      carries `aten::silu/Swish`, the only Sigmoid in linear_attn sits on
+#      in_proj_b/beta).
+#   2. value/key head map = TILED (`measured-here`: every value-head-indexed
+#      GDN tensor in the GGUF is the HF interleave order re-laid into llama's
+#      tiled order -- qkv v sigma-map max|diff| 0.012 vs identity 0.395;
+#      attn_gate 0.012 vs 0.297; ssm_out 0.036 vs 0.413; ssm_alpha 0.0069 vs
+#      0.171; ssm_beta 0.0043 vs 0.085; `code`: llama.cpp ggml_repeat_4d).
+#   3. norms = PLAIN RMSNorm, no (1 + w), pre-norm residual (`measured-here`:
+#      GGUF attn_norm / post_attention_norm / ssm_norm / attn_q_norm /
+#      attn_k_norm all equal the served IR's Constants to max|diff| 0.0; the IR
+#      chain is Power -> ReduceMean -> Add(eps) -> Sqrt -> Divide -> Multiply(x)
+#      -> Multiply(weight), no +1). `_rmsnorm_hd` therefore takes
+#      `norm_plus_one=False` for this family.
+#   4. the tiled MoE lowering is E-agnostic (`measured-here`: a 256-expert
+#      top-8 tiled block compiles to 3 GatherMatmul primitives on the CPU
+#      plugin exactly as 512/top-10 does).
+
+QWEN35MOE_LM = {
+    "vocab_size": 248320,
+    "hidden_size": 2048,
+    "num_hidden_layers": 40,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "max_position_embeddings": 262144,
+    "rms_norm_eps": 1e-6,
+    "linear_key_head_dim": 128,
+    "linear_num_key_heads": 16,
+    "linear_value_head_dim": 128,
+    "linear_num_value_heads": 32,
+    "linear_conv_kernel_dim": 4,
+    "num_experts": 256,
+    "num_experts_per_tok": 8,
+    "moe_intermediate_size": 512,
+    "shared_expert_intermediate_size": 512,
+}
+
+
+def qwen35moe_real_config(n_layers=None):
+    """The `Qwen3.6-35B-A3B` geometry as a config object for the emitters,
+    read from the shard's own metadata (gguf-py) and the served int4 IR's
+    config.json. `rope_parameters` carries the text-degenerate mrope keys
+    `q4e.attention._freqs_tables` reads: partial rotary 0.25 of head_dim 256 =
+    64, theta 1e7, sections [11, 11, 10]. For TEXT all three mrope axes carry
+    the same position, so the recomposition is the identity and the tables are
+    the standard rope ones (`code`: qwen35moe.cpp ggml_rope_multi).
+
+    `norm_plus_one=False`: this converter's gammas are PLAIN (measured, §3).
+    `gdn_key_head_map="tiled"`: the GGUF's value heads are in llama's tiled
+    order (measured, §2). `output_gate_type="silu"` (measured, §1)."""
+    g = dict(QWEN35MOE_LM)
+    nl = int(n_layers if n_layers is not None else g["num_hidden_layers"])
+    c = types.SimpleNamespace(
+        vocab_size=g["vocab_size"], hidden_size=g["hidden_size"],
+        num_hidden_layers=nl, num_attention_heads=g["num_attention_heads"],
+        num_key_value_heads=g["num_key_value_heads"], head_dim=g["head_dim"],
+        max_position_embeddings=g["max_position_embeddings"],
+        rms_norm_eps=g["rms_norm_eps"],
+        linear_key_head_dim=g["linear_key_head_dim"],
+        linear_num_key_heads=g["linear_num_key_heads"],
+        linear_value_head_dim=g["linear_value_head_dim"],
+        linear_num_value_heads=g["linear_num_value_heads"],
+        linear_conv_kernel_dim=g["linear_conv_kernel_dim"],
+        num_experts=g["num_experts"], num_experts_per_tok=g["num_experts_per_tok"],
+        moe_intermediate_size=g["moe_intermediate_size"],
+        shared_expert_intermediate_size=g["shared_expert_intermediate_size"],
+        hidden_act="silu", output_gate_type="silu", norm_plus_one=False,
+        gdn_key_head_map="tiled", norm_topk_prob=True, full_attention_interval=4,
+        rope_parameters={"rope_type": "default", "rope_theta": 1e7,
+                         "partial_rotary_factor": 0.25, "mrope_section": [11, 11, 10]},
+        layer_types=["full_attention" if (i % 4) == 3 else "linear_attention"
+                     for i in range(nl)],
+    )
+    return c
+
+
+# module-relative key -> (GGUF tensor suffix under blk.{i}., reshape kind).
+# Kinds are `q4e.gguf_feed._materialise`'s; every gamma is `vec` (plain, §3),
+# `ssm_a` is `neglog` (stored -exp(A_log), the GDN computes -exp(A_log)), and
+# `ssm_conv1d` is `conv` ([K, C] -> [C, 1, K]).
+_QWEN35MOE_TENSORS = {
+    "input_norm.weight": ("attn_norm.weight", "vec"),
+    "post_attention_norm.weight": ("post_attention_norm.weight", "vec"),
+    "linear_attn.in_proj_qkv.weight": ("attn_qkv.weight", "direct2d"),
+    "linear_attn.in_proj_z.weight": ("attn_gate.weight", "direct2d"),
+    "linear_attn.in_proj_a.weight": ("ssm_alpha.weight", "direct2d"),
+    "linear_attn.in_proj_b.weight": ("ssm_beta.weight", "direct2d"),
+    "linear_attn.A_log": ("ssm_a", "neglog"),
+    "linear_attn.dt_bias": ("ssm_dt.bias", "vec"),
+    "linear_attn.conv1d.weight": ("ssm_conv1d.weight", "conv"),
+    "linear_attn.norm.weight": ("ssm_norm.weight", "vec"),
+    "linear_attn.out_proj.weight": ("ssm_out.weight", "direct2d"),
+    "self_attn.q_proj.weight": ("attn_q.weight", "direct2d"),
+    "self_attn.k_proj.weight": ("attn_k.weight", "direct2d"),
+    "self_attn.v_proj.weight": ("attn_v.weight", "direct2d"),
+    "self_attn.o_proj.weight": ("attn_output.weight", "direct2d"),
+    "self_attn.q_norm.weight": ("attn_q_norm.weight", "vec"),
+    "self_attn.k_norm.weight": ("attn_k_norm.weight", "vec"),
+    "mlp.gate.weight": ("ffn_gate_inp.weight", "direct2d"),
+    "mlp.shared_expert.gate_proj.weight": ("ffn_gate_shexp.weight", "direct2d"),
+    "mlp.shared_expert.up_proj.weight": ("ffn_up_shexp.weight", "direct2d"),
+    "mlp.shared_expert.down_proj.weight": ("ffn_down_shexp.weight", "direct2d"),
+    "mlp.shared_expert_gate.weight": ("ffn_gate_inp_shexp.weight", "row"),
+}
+
+
+def _qwen35_rmsnorm(x, weight, eps):
+    """Plain RMSNorm over the LAST axis, no (1 + w) -- the qwen35moe
+    convention (measured, §3). `x` [1, T, H]; `weight` the f32 memmap the
+    state dict holds."""
+    var = qgdn._rmean(qgdn._mul(x, x), -1)
+    xn = qgdn._mul(x, qgdn._rsqrt_eps(var, eps))
+    return qgdn._mul(qgdn._c(np.ascontiguousarray(weight, np.float32).reshape(1, 1, -1)), xn)
+
+
+def _qwen35_layer_state(ar, cfg, kind, layer, feed=None, census=None):
+    """Sparse-declared state for one `qwen35moe` decoder layer at the module-
+    relative keys `q4e.gdn` / `emit_stateful_attention` / `emit_moe_tiled`
+    consume. With `feed` the buffers are written from the real shards."""
+    H = cfg.hidden_size
+    st = {"input_norm.weight": ar.f32([H]),
+          "post_attention_norm.weight": ar.f32([H])}
+    if kind == "gdn":
+        kd, kh = cfg.linear_key_head_dim, cfg.linear_num_key_heads
+        vd, vh = cfg.linear_value_head_dim, cfg.linear_num_value_heads
+        conv_dim = kd * kh * 2 + vd * vh
+        st["linear_attn.in_proj_qkv.weight"] = ar.f32([conv_dim, H])
+        st["linear_attn.in_proj_z.weight"] = ar.f32([vd * vh, H])
+        st["linear_attn.in_proj_a.weight"] = ar.f32([vh, H])
+        st["linear_attn.in_proj_b.weight"] = ar.f32([vh, H])
+        st["linear_attn.A_log"] = ar.f32([vh])
+        st["linear_attn.dt_bias"] = ar.f32([vh])
+        st["linear_attn.conv1d.weight"] = ar.f32([conv_dim, 1, cfg.linear_conv_kernel_dim])
+        st["linear_attn.norm.weight"] = ar.f32([vd])
+        st["linear_attn.out_proj.weight"] = ar.f32([H, vd * vh])
+    else:
+        heads, kv, d = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
+        st["self_attn.q_proj.weight"] = ar.f32([heads * 2 * d, H])
+        st["self_attn.k_proj.weight"] = ar.f32([kv * d, H])
+        st["self_attn.v_proj.weight"] = ar.f32([kv * d, H])
+        st["self_attn.o_proj.weight"] = ar.f32([H, heads * d])
+        st["self_attn.q_norm.weight"] = ar.f32([d])
+        st["self_attn.k_norm.weight"] = ar.f32([d])
+    Is = cfg.shared_expert_intermediate_size
+    st["mlp.gate.weight"] = ar.f32([cfg.num_experts, H])
+    st["mlp.shared_expert.gate_proj.weight"] = ar.f32([Is, H])
+    st["mlp.shared_expert.up_proj.weight"] = ar.f32([Is, H])
+    st["mlp.shared_expert.down_proj.weight"] = ar.f32([H, Is])
+    st["mlp.shared_expert_gate.weight"] = ar.f32([1, H])
+    if feed is not None:
+        _fill_qwen35_layer(st, feed, layer, census)
+    return st
+
+
+def _fill_qwen35_layer(st, feed, layer, census):
+    """Write the real GGUF rows into the layer's arena buffers. Each axis is a
+    leading slice to the buffer's shape; no fused axis is narrowed here (`FIX
+    D` applies only to the fused `gate_up_proj`, which this emitter does not
+    use -- the routed experts are filled by `NativeExpertFiller`)."""
+    for key, buf in st.items():
+        suffix, kind = _QWEN35MOE_TENSORS[key]
+        gname = f"blk.{layer}.{suffix}"
+        arr = feed.mapped(gname, kind)
+        arr = np.ascontiguousarray(arr[tuple(slice(0, int(s)) for s in buf.shape)])
+        assert arr.shape == tuple(int(s) for s in buf.shape), (
+            f"{gname}: fed {arr.shape} != buffer {tuple(buf.shape)}")
+        buf[...] = arr
+        if census is not None:
+            census.append((gname, int(buf.nbytes)))
+
+
+def build_qwen35moe_serving_shape_ir(config=None, arena=None, n_layers=None,
+                                     filler=None, feed=None, rope_span=None):
+    """The `Qwen3.6-35B-A3B` (`qwen35moe`) serving-shape backbone as an
+    ov::Model, DYNAMIC IN T, with a PLAIN PRE-NORM RESIDUAL layer (no
+    hyper-connection, no PLE):
+
+        hidden = hidden + mixer(rmsnorm(hidden, attn_norm))
+        hidden = hidden + moe(rmsnorm(hidden, post_attention_norm))
+
+    Mixers: `q4e.gdn` (30 linear-attention layers, tiled key-head map,
+    stateful conv + token-sequential core) and `emit_stateful_attention` (10
+    full-attention layers at i % 4 == 3, fused q|gate split, silu output gate,
+    shared rope tables). The MoE layer is `emit_moe_tiled` with the native
+    filler, so the expert bodies carry the checkpoint's own IQ2_S (gate/up) and
+    IQ3_XXS / IQ4_XS (down) blocks.
+
+    Ports: `inputs_embeds`, `position_ids`, `conv_mask`, `attention_mask`,
+    `beam_idx`; state via the same Variables `stateful_short_conv` /
+    `stateful_gdn_core` / `emit_stateful_attention` carry. The embedding is NOT
+    in this graph (`tools/export_serving_artifact.py` emits it separately).
+
+    Returns (model, report); the report keys mirror `build_serving_shape_ir`'s
+    so the exporter can share its manifest path.
+    """
+    cfg = config if config is not None else qwen35moe_real_config()
+    T = -1
+    own_arena = arena is None
+    ar = arena if arena is not None else SparseArena()
+    n_total = int(cfg.num_hidden_layers)
+    depth = int(n_layers if n_layers is not None else n_total)
+    if not (1 <= depth <= n_total):
+        raise ValueError(f"n_layers {depth} outside 1..{n_total}")
+    nl = depth
+    H = cfg.hidden_size
+    V = cfg.vocab_size
+    sinks = []
+    dense_census = []
+    try:
+        with shared_constants():
+            inputs_embeds = op.parameter([1, T, H], Type.f32)
+            inputs_embeds.set_friendly_name("inputs_embeds")
+            inputs_embeds.output(0).set_names({"inputs_embeds"})
+            pid = op.parameter([1, T], Type.i64)
+            pid.set_friendly_name("position_ids")
+            pid.output(0).set_names({"position_ids"})
+            conv_mask = op.parameter([1, T], Type.f32)
+            conv_mask.set_friendly_name("conv_mask")
+            attn_mask = op.parameter([1, -1], Type.i64)
+            attn_mask.set_friendly_name("attention_mask")
+            attn_mask.output(0).set_names({"attention_mask"})
+            beam = op.parameter([-1], Type.i32)
+            beam.set_friendly_name("beam_idx")
+            beam.output(0).set_names({"beam_idx"})
+
+            span = int(rope_span if rope_span is not None
+                       else cfg.max_position_embeddings)
+            cos_np, sin_np = qattn._freqs_tables(cfg, span)
+            rope_cos = op.constant(cos_np)
+            rope_cos.set_friendly_name("rope/cos")
+            rope_sin = op.constant(sin_np)
+            rope_sin.set_friendly_name("rope/sin")
+
+            hidden = op.reshape(inputs_embeds,
+                                op.constant(np.array([1, -1, H], np.int64)),
+                                special_zero=False)
+            hidden.set_friendly_name("embed/out")
+            kinds = []
+            for i in range(depth):
+                kind = "attn" if (i % 4) == 3 else "gdn"
+                kinds.append(kind)
+                st = _qwen35_layer_state(ar, cfg, kind, i, feed, dense_census)
+                h = _qwen35_rmsnorm(hidden, st["input_norm.weight"], cfg.rms_norm_eps)
+                h.set_friendly_name(f"layer{i}/attn_norm")
+                if kind == "gdn":
+                    g = qgdn.emit_gdn(
+                        h, conv_mask, cfg, _strip(st, "linear_attn."), None,
+                        conv_emitter=stateful_short_conv(i, beam, sinks),
+                        core_emitter=stateful_gdn_core(i, beam, sinks))
+                else:
+                    g = emit_stateful_attention(
+                        h, pid, cfg, _strip(st, "self_attn."), i, beam,
+                        attn_mask, sinks, rope_cos, rope_sin)
+                hidden = op.add(hidden, g)
+                hidden.set_friendly_name(f"layer{i}/mixer_out")
+                h2 = _qwen35_rmsnorm(hidden, st["post_attention_norm.weight"],
+                                     cfg.rms_norm_eps)
+                h2.set_friendly_name(f"layer{i}/post_norm")
+                m = emit_moe_tiled(h2, cfg, st, ar, T, f"layer{i}/moe",
+                                   filler=filler, layer=i)
+                hidden = op.add(hidden, m)
+                hidden.set_friendly_name(f"layer{i}/out")
+
+            final_norm_w = ar.f32([H])
+            if feed is not None:
+                arr = feed.mapped("output_norm.weight", "vec")[:H]
+                final_norm_w[...] = np.ascontiguousarray(arr, np.float32)
+                dense_census.append(("output_norm.weight", int(final_norm_w.nbytes)))
+            fin = _qwen35_rmsnorm(hidden, final_norm_w, cfg.rms_norm_eps)
+            fin.set_friendly_name("final_norm")
+            head_w = ar.f32([V, H])
+            if feed is not None:
+                arr = feed.mapped("output.weight", "direct2d")[:V, :H]
+                head_w[...] = np.ascontiguousarray(arr, np.float32)
+                dense_census.append(("output.weight", int(head_w.nbytes)))
+            logits = op.matmul(fin, qgdn._c(head_w), transpose_a=False, transpose_b=True)
+            res = op.result(logits)
+            res.set_friendly_name("logits")
+            res.output(0).set_names({"logits"})
+            model = Model([res], sinks, [inputs_embeds, pid, conv_mask, attn_mask, beam],
+                          "qwen3_5_moe_serving_shape")
+
+        nodes, const_bytes, counts = pwe.graph_measures(model)
+        report = {
+            "n_layers": nl,
+            "layer_range": [0, depth],
+            "segment_first": True,
+            "segment_last": True,
+            "inputs_embeds_width": int(H),
+            "has_ple": False,
+            "expert_ports": [],
+            "gdn_layers": kinds.count("gdn"),
+            "attn_layers": kinds.count("attn"),
+            "seq_len": None,
+            "rope_span": span,
+            "nodes": nodes,
+            "graph_const_bytes": const_bytes,
+            "op_histogram": counts,
+            "ngram_table_rows": 0,
+            "ngram_staging_rows": None,
+            "ngram_row_bytes": 0,
+            "ngram_chunk_cap_bytes": int(NGRAM_CHUNK_CAP_BYTES),
+            "ngram_table_ports": [],
+            "dense_fill_census": dense_census,
+            "arena_declared_bytes": ar.declared_bytes,
+            "arena_written_bytes": ar.written_bytes,
+            "arena_disk_kib": ar.disk_kib(),
+            "fill_census": filler.census() if filler is not None else None,
+            "inputs": [(p.get_node().get_friendly_name(), _dims(p),
+                        str(p.get_element_type())) for p in model.inputs],
+            "outputs": [(r.get_node().get_friendly_name(), _dims(r),
+                         str(r.get_element_type())) for r in model.outputs],
+        }
+        return model, report
+    except BaseException:
+        if own_arena:
+            ar.close()
+        raise
+
+
 # --------------------------------------------------------------------------
 # The OTD contract, transcribed from the C++ so the test checks code, not prose
 # --------------------------------------------------------------------------
@@ -2069,6 +2470,7 @@ def _expert_slot_bytes(num_expert, ratio_pct, per_expert_bytes, moe_layers):
 
 __all__ = [
     "SparseArena", "shared_constants", "build_serving_shape_ir",
+    "build_qwen35moe_serving_shape_ir", "qwen35moe_real_config", "QWEN35MOE_LM",
     "emit_moe_tiled", "emit_stateful_attention", "stateful_short_conv",
     "stateful_gdn_core", "slot_pool_from_ir",
     "ngram_table_chunks", "ngram_table_ports", "ngram_chunked_gather",

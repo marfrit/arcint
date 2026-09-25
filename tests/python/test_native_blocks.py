@@ -58,6 +58,36 @@ def test_iq3_xxs_split_and_decode_on_a_hand_built_block():
     assert np.all(y[0, 8:32] == 7.0) and np.all(y[0, 32:] == 1.0)
 
 
+def test_iq2_s_split_and_decode_on_a_hand_built_block():
+    """IQ2_S (ggml type 22), the format the 35B-A3B checkpoint carries: one
+    10-bit grid index per 8 values, RAW sign bytes, two 4-bit sub-block scales
+    per 32. d = 8.0 and both scale nibbles 0 -> db = 8*0.5*0.25 = 1.0, grid 0
+    = eight 8s; the first sign byte 0x03 flips values 0 and 1. A second
+    sub-block sets qh bit 1 for l=0 -> idx 512 (grid[512] = 25,25,43,8,25,8,8,25),
+    which is the assembly the low byte alone cannot produce (0 vs 512)."""
+    block = np.zeros(82, np.uint8)
+    block[0:2] = _f16_bytes(8.0)
+    block[34] = 0x03                       # ib32 0, l 0 sign byte
+    gridix, signix, scales = nb.iq2_s_split(block[None, :])
+    assert gridix.shape == (1, 32) and gridix.dtype == np.uint16
+    assert signix.shape == (1, 32) and scales.shape == (1, 32)
+    assert gridix[0, 0] == 0 and signix[0, 0] == 3
+    assert np.all(scales[0] == np.float32(1.0))
+    y = nb.iq2_s_decode(gridix, signix, scales)
+    want = np.full(32, 8.0, np.float32)
+    want[0] = want[1] = -8.0
+    assert np.array_equal(y[0, :32], want)
+
+    # the 10-bit index: qh byte's bits 2*l, 2*l+1 for ib32 0; setting bit 1
+    # gives l=0 the high value 2 -> idx = 512, not 0
+    block2 = block.copy()
+    block2[66] = 0x02
+    g2, s2, sc2 = nb.iq2_s_split(block2[None, :])
+    assert g2[0, 0] == 512
+    y2 = nb.iq2_s_decode(g2, s2, sc2)
+    assert not np.array_equal(y2[0, :8], y[0, :8])
+
+
 def test_iq4_xs_split_and_decode_on_a_hand_built_block():
     # one 256-value block, d = 1.0: sub-block ib gets scale bits ls = ib + 30
     # (low nibble in scales_l[ib//2], the two high bits in scales_h) so the

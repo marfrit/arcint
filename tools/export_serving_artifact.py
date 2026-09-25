@@ -70,6 +70,12 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 
 MODEL_TYPE = "qwen4_exp"
 ARCHITECTURE = "Qwen4ExpForConditionalGeneration"
+# The native-route families. `qwen3_5_moe` is `Qwen3.6-35B-A3B`
+# (`general.architecture = qwen35moe`): a plain pre-norm residual layer, 256
+# experts top-8, no hyper-connection, no PLE; its experts are IQ2_S gate/up over
+# IQ3_XXS / IQ4_XS down, so it is native-only.
+QWEN35MOE_MODEL_TYPE = "qwen3_5_moe"
+QWEN35MOE_ARCHITECTURE = "Qwen3_5MoeForConditionalGeneration"
 # The GGUF's own hash-boundary key (llama.cpp gguf-py constants.py
 # `{arch}.ple.eos_token_id`; llama.cpp's PLE hashes with it, so does the pin
 # through config.eos_token_id). Read, never assumed: tokenizer.ggml.eos_token_id
@@ -138,6 +144,57 @@ def vocab_mismatches(tokenizer_json, gguf_token_list):
         if g != s:
             bad.append((i, s, g))
     return bad, len(defined)
+
+
+def qwen35moe_serving_config(n_layers, eos_token_id):
+    """config.json for `Qwen3.6-35B-A3B` as `tools/export_serving_artifact.py`
+    writes it: the real geometry (`serving_shape.QWEN35MOE_LM`) at
+    num_hidden_layers = `n_layers`, the served int4 artifact's own text_config
+    keys (read 2026-09-24), and NO PLE / n-gram keys -- this family has no
+    n-gram table. The context/rotary carry the shard's `rope.dimension_sections
+    = [11, 11, 10, 0]` as `mrope_section`."""
+    from q4e import serving_shape as ss
+    g = dict(ss.QWEN35MOE_LM)
+    nl = int(n_layers)
+    if nl < 1 or nl > g["num_hidden_layers"]:
+        raise ValueError(f"--layers {nl} outside 1..{g['num_hidden_layers']}")
+    text = {
+        "model_type": "qwen3_5_moe_text",
+        "vocab_size": g["vocab_size"],
+        "hidden_size": g["hidden_size"],
+        "num_hidden_layers": nl,
+        "num_attention_heads": g["num_attention_heads"],
+        "num_key_value_heads": g["num_key_value_heads"],
+        "head_dim": g["head_dim"],
+        "max_position_embeddings": g["max_position_embeddings"],
+        "rms_norm_eps": g["rms_norm_eps"],
+        "linear_conv_kernel_dim": g["linear_conv_kernel_dim"],
+        "linear_key_head_dim": g["linear_key_head_dim"],
+        "linear_num_key_heads": g["linear_num_key_heads"],
+        "linear_value_head_dim": g["linear_value_head_dim"],
+        "linear_num_value_heads": g["linear_num_value_heads"],
+        "num_experts": g["num_experts"],
+        "num_experts_per_tok": g["num_experts_per_tok"],
+        "moe_intermediate_size": g["moe_intermediate_size"],
+        "shared_expert_intermediate_size": g["shared_expert_intermediate_size"],
+        "attn_output_gate": True,
+        "full_attention_interval": 4,
+        "partial_rotary_factor": 0.25,
+        "output_router_logits": False,
+        "hidden_act": "silu",
+        "layer_types": ["full_attention" if (i % 4) == 3 else "linear_attention"
+                        for i in range(nl)],
+        "rope_parameters": {"rope_type": "default", "rope_theta": 10000000.0,
+                            "partial_rotary_factor": 0.25,
+                            "mrope_section": [11, 11, 10],
+                            "mrope_interleaved": True},
+        "tie_word_embeddings": False,
+        "eos_token_id": int(eos_token_id),
+        "torch_dtype": "bfloat16",
+    }
+    return {"architectures": [QWEN35MOE_ARCHITECTURE],
+            "model_type": QWEN35MOE_MODEL_TYPE, "text_config": text,
+            "tie_word_embeddings": False}
 
 
 def serving_config(n_layers, ple_eos_token_id, geometry=None):
@@ -231,7 +288,7 @@ def segment_ranges(layers, segment_layers):
     return ranges
 
 
-def build_embed_model(table_f32):
+def build_embed_model(table_f32, mdl_name="qwen4_exp_embed"):
     """token_embd as its own model, T DYNAMIC: input_ids [1, T] i64 ->
     [1, T, H] f32. `pwe.build_embed_piece` is static in T; the served
     `embed_paged` feeds [1, n] for every n a chunk or a decode step has."""
@@ -245,7 +302,7 @@ def build_embed_model(table_f32):
     out = op.gather(tbl, ids, op.constant(np.int64(0)))
     res = op.result(out)
     res.set_friendly_name("output")
-    return ov.Model([res], [ids], "qwen4_exp_embed")
+    return ov.Model([res], [ids], mdl_name)
 
 
 def main(argv=None):
@@ -260,6 +317,10 @@ def main(argv=None):
     ap.add_argument("--out", required=True, help="the artifact directory to write")
     ap.add_argument("--tree", default="unrecorded",
                     help="the commit the emitter code came from (CF-MANIFESTSHA)")
+    ap.add_argument("--family", choices=("qwen4_exp", "qwen35moe"), default=None,
+                    help="override the graph family (default: read from the shard's "
+                         "general.architecture; qwen35moe = Qwen3.6-35B-A3B, plain "
+                         "pre-norm residual, native experts only)")
     ap.add_argument("--arena", default=None,
                     help="path for the build's sparse arena file (default: "
                          "<out>/.arena.bin; the file is removed after the save "
@@ -309,10 +370,25 @@ def main(argv=None):
     # ---- the shards, the vocab comparison, the template, the boundary ------
     t0 = time.time()
     feed = gf.GgufFeed(args.shards)
+    family = args.family or ("qwen35moe" if str(feed.arch) in
+                             ("qwen35moe", "qwen3_5_moe") else "qwen4_exp")
+    if family == "qwen35moe":
+        if args.expert_format != "native":
+            say("shards", "REFUSED: qwen35moe carries IQ2_S gate/up experts; "
+                          "only --expert-format native can serve them")
+            return 2
+        if args.segment_layers is not None or args.ngram_staging_rows is not None:
+            say("shards", "REFUSED: qwen35moe has no PLE/n-gram table; the "
+                          "segmented and staging paths do not apply")
+            return 2
+        geometry = dict(ss.QWEN35MOE_LM)
+    else:
+        geometry = dict(pwe.REAL_GEOMETRY)
     if args.expert_format == "native":
-        # the checkpoint's own IQ4_NL / IQ3_XXS blocks, re-laid per role and
-        # decoded in ops (DESIGN 7.0.2bz; design-routing-aware-expert-execution
-        # 2.3a-2.3c); the u4 repack costs 0.10-0.13 relative RMS per tensor
+        # the checkpoint's own IQ4_NL / IQ3_XXS / IQ2_S blocks, re-laid per role
+        # and decoded in ops (DESIGN 7.0.2bz; design-routing-aware-expert-
+        # execution 2.3a-2.3c); the u4 repack costs 0.10-0.13 relative RMS per
+        # tensor
         filler = ef.NativeExpertFiller(feed)
     else:
         filler = ef.ExpertFiller(ef.gguf_expert_source(feed), ss.EXPERT_GROUP_SIZE)
@@ -320,16 +396,21 @@ def main(argv=None):
     ple_eos = gguf_field(reader0, PLE_EOS_KEY)
     gen_eos = gguf_field(reader0, GENERATION_EOS_KEY)
     template = gguf_field(reader0, CHAT_TEMPLATE_KEY)
+    if family == "qwen35moe":
+        # no PLE: the hash-boundary eos (qwen4exp.ple.eos_token_id) does not
+        # exist in this shard; the generation eos is the only one it declares
+        ple_eos = gen_eos
     if ple_eos is None or gen_eos is None or not template:
         say("shards", f"REFUSED: the first shard lacks one of {PLE_EOS_KEY}="
                       f"{ple_eos!r} {GENERATION_EOS_KEY}={gen_eos!r} "
                       f"{CHAT_TEMPLATE_KEY}={'present' if template else None}")
         return 2
     toks = gguf_tokens(reader0)
-    say("shards", f"feed over {args.shards} in {time.time() - t0:.1f}s; arch "
-                  f"{feed.arch}; {len(toks):,} tokens; {PLE_EOS_KEY}={ple_eos} "
-                  f"({toks[int(ple_eos)]!r}); {GENERATION_EOS_KEY}={gen_eos} "
-                  f"({toks[int(gen_eos)]!r}); chat template {len(template)} chars")
+    say("shards", f"feed over {args.shards} in {time.time() - t0:.1f}s; family "
+                  f"{family} (arch {feed.arch}); {len(toks):,} tokens; "
+                  f"eos={ple_eos} ({toks[int(ple_eos)]!r}); "
+                  f"{GENERATION_EOS_KEY}={gen_eos} ({toks[int(gen_eos)]!r}); "
+                  f"chat template {len(template)} chars")
     tok_src = Path(args.tokenizer_from)
     for name in TOKENIZER_PASSTHROUGH:
         if not (tok_src / name).is_file():
@@ -373,10 +454,15 @@ def main(argv=None):
         sink = ss.ExpertPortSink(writer=blob_writer) if blob is not None else None
         t0 = time.time()
         try:
-            model, rep = ss.build_serving_shape_ir(
-                arena=arena, n_layers=args.layers, filler=filler, feed=feed,
-                layer_range=None if args.segment_layers is None else (lo, hi),
-                expert_ports=sink, ngram_staging_rows=args.ngram_staging_rows)
+            if family == "qwen35moe":
+                model, rep = ss.build_qwen35moe_serving_shape_ir(
+                    arena=arena, n_layers=args.layers, filler=filler, feed=feed,
+                    rope_span=None)
+            else:
+                model, rep = ss.build_serving_shape_ir(
+                    arena=arena, n_layers=args.layers, filler=filler, feed=feed,
+                    layer_range=None if args.segment_layers is None else (lo, hi),
+                    expert_ports=sink, ngram_staging_rows=args.ngram_staging_rows)
         except Exception as exc:                                  # noqa: BLE001
             say("build", f"FAIL segment {k} layers {lo}..{hi - 1}: {type(exc).__name__}: {exc}")
             arena.close()
@@ -444,9 +530,9 @@ def main(argv=None):
 
     # ---- the embedding model -----------------------------------------------
     t0 = time.time()
-    V, H = pwe.REAL_GEOMETRY["vocab_size"], pwe.REAL_GEOMETRY["hidden_size"]
+    V, H = geometry["vocab_size"], geometry["hidden_size"]
     table = feed.fitted("embed_tokens.weight", (V, H))
-    emb = build_embed_model(table)
+    emb = build_embed_model(table, f"{family}_embed")
     del table
     emb_xml = out / "openvino_text_embeddings_model.xml"
     ov.save_model(emb, str(emb_xml), compress_to_fp16=False)
@@ -458,22 +544,35 @@ def main(argv=None):
     for name in TOKENIZER_PASSTHROUGH:
         shutil.copyfile(tok_src / name, out / name)
     (out / "chat_template.jinja").write_text(template)
-    cfg = serving_config(args.layers, ple_eos)
+    if family == "qwen35moe":
+        cfg = qwen35moe_serving_config(args.layers, gen_eos)
+        text = cfg["text_config"]
+        layer_types = text["layer_types"]
+        cfg_summary = (f"model_type {cfg['model_type']}, num_hidden_layers "
+                       f"{text['num_hidden_layers']}, layer_types "
+                       f"{layer_types.count('full_attention')} full-attention + "
+                       f"{layer_types.count('linear_attention')} GDN, "
+                       f"num_experts {text['num_experts']} top "
+                       f"{text['num_experts_per_tok']}, eos {text['eos_token_id']}")
+    else:
+        cfg = serving_config(args.layers, ple_eos)
+        cfg_summary = (f"num_hidden_layers {cfg['num_hidden_layers']}, layer_types "
+                       f"{cfg['layer_types'].count('qwen_sparse_attention')} attn + "
+                       f"{cfg['layer_types'].count('linear_attention')} GDN, "
+                       f"ple_layer_ids {cfg['ple_layer_ids']}, eos {cfg['eos_token_id']}")
     (out / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
     gen = {
         # FIRST is the n-gram hash boundary (artifact.cpp takes eos_ids.front()
-        # for it); the second is the chat turn end the served stop logic needs
-        "eos_token_id": [int(ple_eos), int(gen_eos)],
-        "pad_token_id": int(ple_eos),
+        # for it); the second is the chat turn end the served stop logic needs.
+        # qwen35moe has no PLE/n-gram table, so its single eos is the turn end.
+        "eos_token_id": ([int(gen_eos)] if family == "qwen35moe"
+                         else [int(ple_eos), int(gen_eos)]),
+        "pad_token_id": int(gen_eos if family == "qwen35moe" else ple_eos),
         "temperature": 1.0, "top_k": 20, "top_p": 0.95,
     }
     (out / "generation_config.json").write_text(json.dumps(gen, indent=2) + "\n")
     say("files", "tokenizer passthrough, chat_template.jinja, config.json "
-                 f"(num_hidden_layers {cfg['num_hidden_layers']}, layer_types "
-                 f"{cfg['layer_types'].count('qwen_sparse_attention')} attn + "
-                 f"{cfg['layer_types'].count('linear_attention')} GDN, ple_layer_ids "
-                 f"{cfg['ple_layer_ids']}, eos {cfg['eos_token_id']}), "
-                 f"generation_config.json (eos {gen['eos_token_id']})")
+                 f"({cfg_summary}), generation_config.json (eos {gen['eos_token_id']})")
 
     # ---- the manifest ------------------------------------------------------
     hashes = {}

@@ -16,6 +16,12 @@ per role, the file layout the CPU tier also reads):
     IQ3_XXS  weight  u8 grididx  [rows, K/4]   (one grid index per 4 values)
              signix  u8           [rows, K/8]   (one 7-bit sign-mask index per 8)
              scale   f16/f32     [rows, K/32]   (d*(0.5+s)*0.5, precomputed)
+    IQ2_S    weight  u8           [rows, K/32, 8]  (four 10-bit grid indices per
+             32 values, each index two little-endian bytes)
+             signix  u8           [rows, K/32, 4]  (one RAW sign byte per 8
+             values; bit j flips value j)
+             scale   f16/f32     [rows, K/32, 2]  (the low nibble's scale for
+             values 0..15, the high nibble's for 16..31)
     Q8_0     weight  i8          [rows, K]
              scale   f16/f32     [rows, K/32]
 
@@ -36,9 +42,9 @@ import numpy as np
 from q4e import native_blocks as nb
 
 #: The native formats the served artifact uses, keyed by the plugin's
-#: `MOECompressed::Config` weight_format value (patch 0043): IQ4_NL == 1,
-#: IQ3_XXS == 2, Q8_0 == 3.
-NATIVE_FORMATS = {1: "IQ4_NL", 2: "IQ3_XXS", 3: "Q8_0"}
+#: `MOECompressed::Config` weight_format value (patch 0043; IQ2_S added by
+#: patch 0050): IQ4_NL == 1, IQ3_XXS == 2, Q8_0 == 3, IQ2_S == 4.
+NATIVE_FORMATS = {1: "IQ4_NL", 2: "IQ3_XXS", 3: "Q8_0", 4: "IQ2_S"}
 
 BLOCK = 32
 
@@ -81,6 +87,25 @@ def decode_group_iq3_xxs(weight_row: np.ndarray, signix_row: np.ndarray, g: int)
     return out
 
 
+def decode_group_iq2_s(weight_row: np.ndarray, signix_row: np.ndarray,
+                       scales_row: np.ndarray, g: int) -> np.ndarray:
+    """One 32-value IQ2_S group from the artifact's per-role layout:
+    `weight_row` u8 [K/32, 8] (four 10-bit grid indices, two little-endian
+    bytes each), `signix_row` u8 [K/32, 4] (one RAW sign byte per 8 values,
+    bit j flips value j), `scales_row` f16/f32 [K/32, 2] (the low nibble's
+    scale for values 0..15, the high nibble's for 16..31). Returns
+    magnitudes*signs*scale (the block scale folded in)."""
+    out = np.empty(BLOCK, dtype=np.float32)
+    for l in range(4):
+        idx = int(weight_row[g, 2 * l]) | (int(weight_row[g, 2 * l + 1]) << 8)
+        signs = int(signix_row[g, l])
+        s = float(scales_row[g, 0] if l < 2 else scales_row[g, 1])
+        for m in range(8):
+            mag = float(nb.IQ2S_GRID[idx][m])
+            out[l * 8 + m] = s * mag * (-1.0 if (signs & int(nb.KMASK_IQ2XS[m])) else 1.0)
+    return out
+
+
 def decode_group_q8_0(weight_row: np.ndarray, g: int) -> np.ndarray:
     return weight_row[g * BLOCK:(g + 1) * BLOCK].astype(np.float32)
 
@@ -95,9 +120,14 @@ def decode_row(weight, scales, fmt: int, row: int, K: int, signix=None) -> np.nd
             vals = decode_group_iq4_nl(weight[row], g)
         elif name == "Q8_0":
             vals = decode_group_q8_0(weight[row], g)
+        elif name == "IQ2_S":
+            vals = decode_group_iq2_s(weight[row], signix[row], scales[row], g)
         else:
             vals = decode_group_iq3_xxs(weight[row], signix[row], g)
-        out[g * BLOCK:(g + 1) * BLOCK] = vals * np.float32(scales[row, g])
+        if name == "IQ2_S":
+            out[g * BLOCK:(g + 1) * BLOCK] = vals
+        else:
+            out[g * BLOCK:(g + 1) * BLOCK] = vals * np.float32(scales[row, g])
     return out
 
 
@@ -119,9 +149,12 @@ def gemv(weight, scales, fmt: int, x: np.ndarray, signix=None, rows: int | None 
                 vals = decode_group_iq4_nl(weight[r], g)
             elif name == "Q8_0":
                 vals = decode_group_q8_0(weight[r], g)
+            elif name == "IQ2_S":
+                vals = decode_group_iq2_s(weight[r], signix[r], scales[r], g)
             else:
                 vals = decode_group_iq3_xxs(weight[r], signix[r], g)
-            vals = vals * np.float32(scales[r, g])  # the block scale, applied in the K-loop
+            if name != "IQ2_S":
+                vals = vals * np.float32(scales[r, g])  # the block scale, applied in the K-loop
             acc += np.float32(np.dot(vals.astype(np.float64),
                                      x[g * BLOCK:(g + 1) * BLOCK].astype(np.float64)))
             acc = np.float32(acc)  # one rounding per group, like the kernel's float accumulation

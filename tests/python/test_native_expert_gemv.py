@@ -45,6 +45,19 @@ def q8_0(rows, K, seed=0):
     return codes, None, scales
 
 
+def iq2s(rows, K, seed=0):
+    """The artifact's IQ2_S per-role layout: weight u8 [rows, K/32, 8] holding
+    four 10-bit grid indices as little-endian u16, signix u8 [rows, K/32, 4]
+    RAW bytes, scales f32 [rows, K/32, 2] (lo for values 0..15, hi for 16..31)."""
+    groups = K // 32
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, 1024, size=(rows, groups, 4), dtype=np.uint16)
+    weight = np.ascontiguousarray(idx.astype("<u2")).view(np.uint8).reshape(rows, groups, 8)
+    signix = rng.integers(0, 256, size=(rows, groups, 4), dtype=np.uint8)
+    scales = np.linspace(0.5, 2.0, rows * groups * 2, dtype=np.float32).reshape(rows, groups, 2)
+    return weight, signix, scales
+
+
 # --- block-scale application -------------------------------------------------
 
 def test_iq4nl_block_scale_is_applied_in_the_gemv():
@@ -91,7 +104,7 @@ def test_iq3xxs_block_scale_is_applied_in_the_gemv():
 
 # --- fused == materialised ---------------------------------------------------
 
-@pytest.mark.parametrize("fmt,builder", [(1, iq4nl), (2, iq3xxs), (3, q8_0)])
+@pytest.mark.parametrize("fmt,builder", [(1, iq4nl), (2, iq3xxs), (3, q8_0), (4, iq2s)])
 def test_fused_gemv_matches_the_materialised_decode(fmt, builder):
     rows, K = 3, 128
     weight, signix, scales = builder(rows, K, seed=7)
@@ -116,7 +129,7 @@ def test_a_k_that_is_not_a_multiple_of_32_is_refused(fmt, builder):
 def test_an_unknown_format_is_refused_rather_than_decoded():
     weight, signix, scales = iq4nl(1, 64)
     x = np.ones(64, dtype=np.float32)
-    for fmt in (0, 4, 99):
+    for fmt in (0, 5, 99):
         with pytest.raises(ValueError):
             ne.gemv(weight, scales, fmt, x, signix=signix, rows=1)
 
@@ -183,6 +196,7 @@ def test_format_name_rejects_the_affine_zero():
     assert ne.format_name(1) == "IQ4_NL"
     assert ne.format_name(2) == "IQ3_XXS"
     assert ne.format_name(3) == "Q8_0"
+    assert ne.format_name(4) == "IQ2_S"
     with pytest.raises(ValueError):
         ne.format_name(0)
 
@@ -195,7 +209,7 @@ def test_reference_matches_the_native_blocks_oracle():
     outside this module. (The packed-nibble extraction is shared with the
     implementation and is covered by test_native_blocks' own cell.)"""
     rows, K = 2, 64
-    for fmt, builder in [(1, iq4nl), (2, iq3xxs), (3, q8_0)]:
+    for fmt, builder in [(1, iq4nl), (2, iq3xxs), (3, q8_0), (4, iq2s)]:
         weight, signix, scales = builder(rows, K, seed=41)
         name = ne.format_name(fmt)
         if name == "IQ4_NL":
@@ -207,6 +221,10 @@ def test_reference_matches_the_native_blocks_oracle():
             oracle = nb.iq4_nl_decode(codes, scales)
         elif name == "Q8_0":
             oracle = nb.q8_0_decode(weight, scales)
+        elif name == "IQ2_S":
+            gi = np.ascontiguousarray(weight).view("<u2").reshape(rows, K // 8)
+            oracle = nb.iq2_s_decode(gi, np.ascontiguousarray(signix).reshape(rows, K // 8),
+                                     np.repeat(scales, 2, axis=-1).reshape(rows, K // 8))
         else:
             oracle = nb.iq3_xxs_decode(weight, signix, scales)
         for r in range(rows):

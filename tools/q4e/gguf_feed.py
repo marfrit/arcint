@@ -272,6 +272,19 @@ class GgufFeed:
             raise KeyError(f"GGUF tensor {gguf_name!r} not in any shard")
         return _dequant(self._index[gguf_name], rows=rows)
 
+    def mapped(self, gguf_name, kind, rows=None, fuse_ff=None):
+        """One GGUF tensor by its OWN name through a reshape kind (the kinds
+        of `_LAYER_MAP` / `_GLOBAL_MAP`), without the qwen4_exp pin-key map.
+
+        The `qwen3_5_moe` serving-shape emitter (`serving_shape.
+        build_qwen35moe_serving_shape_ir`) carries its own module-relative key
+        table and reads the GGUF directly; routing it through `pin_tensor`
+        would need a second pin map whose only consumer is that emitter. This
+        exposes the same `_materialise` those maps run on, so a fed tensor is
+        reshaped/folded exactly as everywhere else (FIX D applies to
+        `fuse_gate_up`, `neglog` refuses a non-negative stored `ssm_a`)."""
+        return self._materialise(gguf_name, kind, rows=rows, fuse_ff=fuse_ff)
+
     def raw_rows(self, gguf_name, rows=None):
         """The tensor's BLOCK BYTES as the shard holds them, u8 with the
         reader's own leading axes (an expert tensor: [E, out, row_bytes]),
