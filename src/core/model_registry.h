@@ -123,6 +123,7 @@ struct ArtifactInfo {
     std::string arch_hash;
     std::string template_hash;
     std::string tokenizer_hash;
+    uint64_t    weights_bytes = 0;  // the .bin bytes the load charged (segment SUM)
     bool        has_mtp_head = false;
 };
 

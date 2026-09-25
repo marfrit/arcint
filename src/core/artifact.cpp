@@ -178,6 +178,7 @@ ArtifactInfo Artifact::to_info(Quant quant) const {
     info.arch_hash      = arch_hash;
     info.template_hash  = template_hash;
     info.tokenizer_hash = tokenizer_hash;
+    info.weights_bytes  = weights_bytes;
     info.has_mtp_head   = has_mtp_head;
     return info;
 }

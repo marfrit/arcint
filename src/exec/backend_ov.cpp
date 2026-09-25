@@ -8104,6 +8104,15 @@ private:
                     "(a served hybrid carries no n-gram table; the flag is for the serving-shape IR)",
                     gguf_path_.c_str()));
             }
+            // A no-PLE family (qwen3_5_moe) declares no table and no port: that
+            // pair is consistent and the binding stays inert. A config that
+            // DOES declare a table while the IR declares no port is not -- the
+            // PLE would be silently absent -- and is refused by name here,
+            // where before this check it loaded, holding a table nothing read.
+            const std::string declared = ngram::check_declared_table(
+                artifact_.ngram_config.ngram_size, artifact_.ngram_config.ple_embed_dim,
+                ngram_ports_);
+            if (!declared.empty()) throw std::runtime_error(declared);
             return;
         }
 
@@ -8228,6 +8237,18 @@ private:
     // context is eos for a forward at position 0 and the last ngram_size-1
     // tokens fed otherwise. Cheap: T x 16 ids, no table access here.
     void feed_ngram_ports(Lane& lane, size_t past, size_t n) {
+        // conv_mask is NOT part of the n-gram table: it is the GDN/attention
+        // padding mask, and a no-PLE serving-shape IR (qwen3_5_moe) declares it
+        // while declaring NO ngram_table.K port at all. Feed it whenever the
+        // graph declares it, BEFORE the table early return -- the first form
+        // returned on `ngram_ports_.empty()` and left conv_mask unset on
+        // exactly this family, so a no-PLE graph reached its forward with a
+        // required input never written.
+        if (ngram_ports_.declares_conv_mask) {
+            ov::Tensor m(ov::element::f32, ov::Shape{1, n});
+            std::fill_n(m.data<float>(), n, 1.0f);
+            lane.req.set_tensor(ngram::kConvMaskPort, m);
+        }
         if (ngram_ports_.empty()) return;
         if (lane.last_ids.size() != n) {
             throw std::runtime_error(log::format(
@@ -8265,11 +8286,6 @@ private:
             std::memcpy(lt.data(), local.data(), local.size() * sizeof(int64_t));
             lane.req.set_tensor(ngram::kChunkIdsPort, ct);
             lane.req.set_tensor(ngram::kLocalIdsPort, lt);
-        }
-        if (ngram_ports_.declares_conv_mask) {
-            ov::Tensor m(ov::element::f32, ov::Shape{1, n});
-            std::fill_n(m.data<float>(), n, 1.0f);
-            lane.req.set_tensor(ngram::kConvMaskPort, m);
         }
         // carry the context: the last ctx_len of (context ++ tokens)
         std::vector<int64_t> packed(lane.ngram_ctx);

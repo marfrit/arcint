@@ -25,7 +25,7 @@ TEST(registry_holds_exactly_the_target_models) {
     // d48g in its slot (2026-09-18, the re-export through the corrected
     // fill, which serves the Paris line), pinned by its own xml hash.
     const auto ids = model_ids();
-    CHECK_EQ(ids.size(), 13u);   // d48n beside d48g (2026-09-18, the native-format artifact)
+    CHECK_EQ(ids.size(), 14u);   // d48n beside d48g (2026-09-18), and the native qwen3_5_moe rung (2026-09-25)
     CHECK(find_model("qwen3.8-flash-next-d48g") != nullptr);
     CHECK(find_by_artifact("qwen38-flash-next-d48g-ov") == find_model("qwen3.8-flash-next-d48g"));
     CHECK(find_model("qwen3.8-flash-next-d48n") != nullptr);
@@ -37,6 +37,7 @@ TEST(registry_holds_exactly_the_target_models) {
     CHECK(find_model("qwen3.8-flash-next-d12") != nullptr);
     CHECK(find_model("qwen3.8-flash-next-seg12") != nullptr);
     CHECK(find_model("qwen3.8-flash-next") != nullptr);
+    CHECK(find_model("qwen3.6-35b-a3b-native-d4") != nullptr);
     CHECK(find_model("qwen3.6-27b-a3b-coder") != nullptr);
     CHECK(find_model("qwen3.6-35b-a3b") != nullptr);
     CHECK(find_model("qwen3.8-27b") != nullptr);
@@ -123,6 +124,7 @@ TEST(registry_the_segmented_entry_is_admitted_by_its_chain_hash_not_a_file_diges
     a.arch_hash      = e->arch_hash;
     a.template_hash  = e->template_hash;
     a.tokenizer_hash = e->tokenizer_hash;
+    a.weights_bytes  = e->weights_bytes;
     a.has_mtp_head   = false;
     CHECK(validate_artifact(*e, a).ok);
 
@@ -131,6 +133,67 @@ TEST(registry_the_segmented_entry_is_admitted_by_its_chain_hash_not_a_file_diges
     const ValidationResult res = validate_artifact(*e, bent);
     CHECK(!res.ok);
     CHECK(!res.errors.empty());
+}
+
+TEST(registry_the_native_qwen35moe_rung_is_admitted_without_a_ple) {
+    // 2026-09-25: the qwen3_5_moe serving-shape rung at depth 4, the first
+    // admitted artifact of this family that is NOT an HF export. It carries the
+    // checkpoint's own IQ2_S/IQ3_XXS experts and NO PLE / n-gram table, which
+    // is why its n-gram binding is inert and --ngram-gguf is not needed.
+    const ModelEntry* e = find_model("qwen3.6-35b-a3b-native-d4");
+    CHECK(e != nullptr);
+    if (e == nullptr) return;
+    CHECK(find_by_artifact("qwen36-35b-a3b-d4n-ov") == e);
+    CHECK(find_by_artifact("qwen36-35b-a3b-d4n-ov") !=
+          find_by_artifact("qwen36-35b-a3b-int4-ov"));
+    CHECK(e->moe);
+    CHECK_EQ(e->model_type, std::string("qwen3_5_moe"));
+    CHECK_EQ(e->ov_arch, std::string("Qwen3_5MoeForConditionalGeneration"));
+    CHECK_EQ(e->n_expert, 256);
+    CHECK_EQ(e->n_embd, 2048);
+    CHECK_EQ(e->n_layer, 4);  // of 40
+    CHECK_EQ(e->n_attn_layer, 1);
+    CHECK_EQ(e->n_gdn_layer, 3);
+    CHECK(!e->has_mtp_head);
+    CHECK_EQ(e->arch_hash, std::string("391bd21db6368d57"));
+    CHECK_EQ(e->template_hash, std::string("55d4931433fe502b"));
+    CHECK_EQ(e->weights_bytes, 4284499713ull);
+
+    // The accepting control: an artifact matching the entry in every respect.
+    ArtifactInfo a;
+    a.id             = e->id;
+    a.quant          = Quant::Q4;
+    a.n_ctx_train    = e->n_ctx_train;
+    a.n_layer        = e->n_layer;
+    a.n_gdn_layer    = e->n_gdn_layer;
+    a.n_attn_layer   = e->n_attn_layer;
+    a.arch_hash      = e->arch_hash;
+    a.template_hash  = e->template_hash;
+    a.tokenizer_hash = e->tokenizer_hash;
+    a.weights_bytes  = e->weights_bytes;
+    a.has_mtp_head   = false;
+    CHECK(validate_artifact(*e, a).ok);
+
+    // RED FIRST: each pinned field, flipped alone, refuses. The weights_bytes
+    // cell is the one this leg added -- before it, the allowlist pinned the
+    // number and nothing read it, so a re-exported .bin passed on its xml hash.
+    ArtifactInfo bad_arch = a;
+    bad_arch.arch_hash    = "0000000000000000";
+    CHECK(!validate_artifact(*e, bad_arch).ok);
+
+    ArtifactInfo bad_bytes = a;
+    bad_bytes.weights_bytes = e->weights_bytes + 1;
+    CHECK(!validate_artifact(*e, bad_bytes).ok);
+
+    ArtifactInfo missing_bytes = a;
+    missing_bytes.weights_bytes = 0;  // an artifact that reports nothing
+    CHECK(!validate_artifact(*e, missing_bytes).ok);
+
+    ArtifactInfo bad_layers = a;  // the full-depth geometry, under a depth-4 pin
+    bad_layers.n_layer      = 40;
+    bad_layers.n_gdn_layer  = 30;
+    bad_layers.n_attn_layer = 10;
+    CHECK(!validate_artifact(*e, bad_layers).ok);
 }
 
 TEST(registry_rejects_everything_else) {
@@ -234,6 +297,7 @@ ArtifactInfo good_coder_artifact() {
     a.arch_hash      = "6745cfe3d57e3f0f";
     a.template_hash  = "e84f32a23fdda276";
     a.tokenizer_hash = "87a7830d63fcf43b";
+    a.weights_bytes  = 13760293946ull;
     a.has_mtp_head   = false;
     return a;
 }
@@ -308,6 +372,7 @@ ArtifactInfo good_dense_artifact() {
     a.arch_hash      = e->arch_hash;
     a.template_hash  = e->template_hash;
     a.tokenizer_hash = e->tokenizer_hash;
+    a.weights_bytes  = e->weights_bytes;
     a.has_mtp_head   = e->has_mtp_head;
     return a;
 }

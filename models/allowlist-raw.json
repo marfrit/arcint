@@ -241,5 +241,23 @@
     "status": "measurement artifact: 48 layers as a 4x12 segment chain; no segmented runtime yet; not the model's answers",
     "mtp_num_hidden_layers": 1,
     "mtp_head_exported": false
+  },
+  "qwen36-35b-a3b-d4n-ov": {
+    "arch": [
+      "Qwen3_5MoeForConditionalGeneration"
+    ],
+    "model_type": "qwen3_5_moe",
+    "hidden": 2048,
+    "layers": 4,
+    "experts": 256,
+    "ctx": 262144,
+    "full_attention_interval": 4,
+    "template_sha": "55d4931433fe502b",
+    "tokenizer_sha": "87a7830d63fcf43b",
+    "lm_xml_sha": "391bd21db6368d57",
+    "lm_bin_bytes": 4284499713,
+    "status": "measurement artifact: depth 4 of 40, native IQ2_S/IQ3_XXS experts, no PLE/n-gram table; not the model's answers",
+    "mtp_num_hidden_layers": 1,
+    "mtp_head_exported": false
   }
 }

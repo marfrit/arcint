@@ -94,6 +94,49 @@ TEST(ngram_ports_is_empty_for_an_ir_without_the_table) {
     CHECK(!plan.declares_ids);
 }
 
+TEST(ngram_ports_the_no_ple_qwen35moe_shape_declares_conv_mask_but_no_table) {
+    // The `qwen3_5_moe` serving-shape IR (Qwen3.6-35B-A3B): inputs_embeds,
+    // position_ids, conv_mask, beam_idx (and the paged pass's own ports), with
+    // NO ngram_table.K and NO id ports. `plan.empty()` is exactly the condition
+    // backend_ov.cpp's bind_ngram_ports returns INERTLY on -- this family has
+    // no PLE, so the n-gram binding is not required and --ngram-gguf is not
+    // needed. conv_mask is the GDN/attention padding mask, not a table port,
+    // and feed_ngram_ports must feed it even when the table plan is empty.
+    const std::vector<PortDims> q35 = {
+        {"inputs_embeds", {1, -1, 2048}}, {"position_ids", {1, -1}},
+        {"conv_mask", {1, -1}}, {"attention_mask", {1, -1}}, {"beam_idx", {-1}},
+    };
+    const auto plan = ngram::plan_ngram_ports(q35);
+    CHECK(plan.empty());
+    CHECK(!plan.declares_ids);
+    CHECK(plan.declares_conv_mask);
+    // a config that declares NO table is consistent with that absence: inert
+    CHECK_EQ(ngram::check_declared_table(/*ngram_size=*/0, /*ple_embed_dim=*/0, plan),
+             std::string(""));
+}
+
+TEST(ngram_ports_a_declared_table_with_no_port_is_refused_by_name) {
+    // RED FIRST (2026-09-25): before this check the pair loaded silently -- the
+    // config said "this checkpoint has a PLE", the graph declared no port to
+    // carry it, and bind_ngram_ports returned inert, holding a table nothing
+    // read. The absence of a table must be a FIRST-CLASS case, not a nullptr
+    // that surfaces mid-decode. The control above keeps an empty plan alone
+    // from passing this cell for the wrong reason.
+    const std::vector<PortDims> q35 = {
+        {"inputs_embeds", {1, -1, 2048}}, {"position_ids", {1, -1}}, {"conv_mask", {1, -1}},
+    };
+    const auto plan = ngram::plan_ngram_ports(q35);
+    CHECK(plan.empty());
+    const std::string why =
+        ngram::check_declared_table(/*ngram_size=*/3, /*ple_embed_dim=*/2560, plan);
+    CHECK(!why.empty());
+    CHECK(why.find("declares an n-gram table") != std::string::npos);
+    CHECK(why.find("silently absent") != std::string::npos);
+    // With the table's own ports present the check is a no-op.
+    CHECK_EQ(ngram::check_declared_table(3, 2560, ngram::plan_ngram_ports(real_ports())),
+             std::string(""));
+}
+
 TEST(ngram_ports_refuses_a_gap_in_the_chunk_numbering) {
     auto in = real_ports();
     for (auto& p : in) {

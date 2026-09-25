@@ -358,6 +358,30 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   fill` and `ArcwellTransport` symbols, as
   `contrib/packaging/marfrit-openvino/patches/README.md` discloses).
 
+### The served `qwen3_5_moe` family (Qwen3.6-35B-A3B)
+
+- **The native rung is admitted**: `qwen3.6-35b-a3b-native-d4` pins the
+  depth-4 serving-shape artifact `qwen36-35b-a3b-d4n-ov` (3 GDN + 1
+  attention layer, 256 experts, the checkpoint's own IQ2_S/IQ3_XXS expert
+  bodies) by the hashes and `.bin` size read off its own manifest, not
+  guessed. A measurement artifact: 36 of 40 layers are missing and nothing
+  it says is the model's answer.
+- **`weights_bytes` is now a contract**: `ArtifactInfo` carries the byte
+  count the load charged and `validate_artifact` refuses a mismatch, the
+  same as a pinned hash. Before this, the allowlist pinned the number and
+  nothing read it.
+- **No PLE / n-gram table is a first-class case**: `bind_ngram_ports`
+  returns inertly when the config declares no table and the IR declares no
+  `ngram_table.K` port (so `--ngram-gguf` is NOT needed for this family),
+  and refuses by name when the config DOES declare a table the graph cannot
+  carry (`ngram::check_declared_table`). `feed_ngram_ports` now feeds the
+  GDN `conv_mask` independently of the table ports — the first form
+  returned on an empty table plan and left `conv_mask` unwritten on exactly
+  this family.
+- **Built, not served**: the served binary compiles clean with OpenVINO and
+  its full device-free suite is 609 cases, 0 failed; the GPU load of the
+  native IQ2_S graph is the A770 window's.
+
 ## 0.5.0 — 2026-09-13
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033) —

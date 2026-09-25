@@ -208,3 +208,58 @@ GatherMatmuls, and the emitter cell compiles on CPU; the signed/scale cells of
   and the served loop for a non-PLE family are unverified here — a depth-4
   `read_model` + CPU compile is what "loads" means on this leg.
 - **The 256-expert/IQ2_S GPU fusion** (cell 4's card half).
+
+## 8. The served-side admission, landed 2026-09-25 — no card window
+
+Evidence class per disposition: `code`, `measured-here` (device-free), or a
+build/test result.
+
+### 8.1 The registry entry
+
+`qwen3.6-35b-a3b-native-d4` admits the artifact directory
+`qwen36-35b-a3b-d4n-ov` by the numbers read off its own `serving-shape.json`
+and `.bin`, not guessed — `arcint --model <dir> --inspect-artifact` printed
+arch `391bd21db6368d57`, template `55d4931433fe502b`, tokenizer
+`87a7830d63fcf43b`, `4,284,499,713 B` in one segment (2026-09-25). The entry
+states plainly that it is a measurement artifact: depth 4 of 40, not the
+model's answers. `models/allowlist-raw.json` carries the same row, which
+`tests/test_provenance.cpp` holds against the compiled registry.
+
+### 8.2 `weights_bytes` becomes a contract
+
+The allowlist pinned `weights_bytes` and `validate_artifact` never read it, so
+a re-exported `.bin` passed admission on the strength of its xml hash alone.
+`ArtifactInfo` now carries `weights_bytes` (set in `Artifact::to_info`) and
+`validate_artifact` calls `check_u64`, which refuses a mismatch or an artifact
+that reports nothing and warns only when the entry leaves it unpinned.
+
+### 8.3 The no-PLE / no-n-gram path is first-class
+
+- `ngram::check_declared_table(ngram_size, ple_embed_dim, plan)` returns `""`
+  when the config declares no table and the IR declares no `ngram_table.K`
+  port — the `qwen3_5_moe` case, where the binding is INERT and `--ngram-gguf`
+  is not needed — and a named refusal when the config DOES declare a table the
+  graph cannot carry (the silent-nullptr case: a table admitted and held that
+  nothing reads).
+- `bind_ngram_ports` calls it in the empty-plan branch (after the existing
+  `--ngram-gguf` refusal) and returns inertly otherwise.
+- `feed_ngram_ports` feeds the GDN `conv_mask` whenever the graph declares it,
+  BEFORE the table-plan early return. The first form returned on
+  `ngram_ports_.empty()` and left `conv_mask` unwritten on exactly this family.
+
+### 8.4 Red-first, mutation-tested
+
+`tests/test_registry.cpp` (19 cases) and `tests/test_ngram_ports.cpp` (13
+cases) carry the cells. Mutation run 2026-09-25: making `check_u64` a no-op
+fails `registry_the_native_qwen35moe_rung_is_admitted_without_a_ple`; making
+`check_declared_table` always return `""` fails
+`ngram_ports_a_declared_table_with_no_port_is_refused_by_name`. Both restored
+and green. Whole device-free C++ suite: 609 cases, 0 failed, 2 skipped.
+
+### 8.5 OWED
+
+The GPU load of the native IQ2_S graph and the served arm (rate + digests
+against the int4 comparand, the 15.1 GiB fit verdict, the V4/determinism
+reading) — the A770 window. No card was touched (`pgrep -x arcint` = 0); the
+served load could not be exercised device-free, so 8.3 is `code` + unit cells,
+not a served reading.

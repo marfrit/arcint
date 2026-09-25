@@ -1248,3 +1248,47 @@ the campaign rules say it becomes its own document.
     family are unverified), and cell 4's card half. No card was touched
     (`pgrep -x arcint` = 0 before and after); no rate, fit or export beyond
     depth 4 is claimed.
+- 2026-09-25 (served-side admission leg, device-free — the A770 window still
+  OWED) — the OWED "served binary admits/serves the `qwen3_5_moe` family" item
+  is closed to the edge of the card. One card-leg-free session. Evidence class
+  per disposition: `code`, `measured-here` (device-free), or a build result.
+
+  * **Registry entry** `qwen3.6-35b-a3b-native-d4` for
+    `qwen36-35b-a3b-d4n-ov`: `model_type qwen3_5_moe`, `n_layer 4`, 256
+    experts, `arch_hash 391bd21db6368d57`, template `55d4931433fe502b`,
+    `weights_bytes 4,284,499,713` — read off the artifact's own manifest with
+    `arcint --model <dir> --inspect-artifact`, never guessed. The entry says
+    plainly it is a measurement artifact: depth 4 of 40, not the model's
+    answers. `models/allowlist-raw.json` carries the matching row
+    (`tests/test_provenance.cpp` holds the two together).
+  * **`weights_bytes` is a contract now**: the allowlist pinned the byte count
+    and `validate_artifact` never read it — a re-exported `.bin` passed on its
+    xml hash. `ArtifactInfo` carries it (set in `Artifact::to_info`) and
+    `check_u64` refuses a mismatch or a missing report.
+  * **No PLE / n-gram table, first-class** (`code` + unit cells): `ngram::
+    check_declared_table` returns `""` when the config declares no table and
+    the IR declares no `ngram_table.K` port (the `qwen3_5_moe` case: the
+    binding is INERT, `--ngram-gguf` is not needed) and a named refusal when
+    the config DOES declare a table the graph cannot carry. `bind_ngram_ports`
+    calls it in the empty-plan branch; `feed_ngram_ports` feeds the GDN
+    `conv_mask` BEFORE the table-plan early return — the first form returned on
+    `ngram_ports_.empty()` and left a required input unwritten on exactly this
+    family.
+  * **Red-first cells, mutation-tested** (`measured-here`): 2026-09-25,
+    `check_u64`->no-op fails
+    `registry_the_native_qwen35moe_rung_is_admitted_without_a_ple`;
+    `check_declared_table`->always-`""` fails
+    `ngram_ports_a_declared_table_with_no_port_is_refused_by_name`. Both
+    restored green. `tests/test_registry.cpp` 19 cases, `test_ngram_ports.cpp`
+    13, `test_provenance.cpp` 4; the whole device-free C++ suite is **609
+    cases, 0 failed, 2 skipped**.
+  * **Build-verified**: the served binary (`cmake --build` with
+    `ARCINT_OPENVINO=ON`) and the test binary compile clean from the tip, rc 0
+    on both the OpenVINO and the no-OpenVINO builds. `--inspect-artifact` on
+    the depth-4 artifact now reports `admitted as qwen3.6-35b-a3b-native-d4`.
+  * **OWED, stated not faked**: the GPU load of the native IQ2_S graph and the
+    served arm — rate + digests against the int4 comparand (the recorded
+    9.1 t/s at ratio 50), the fit verdict on 15.1 GiB, and the
+    V4/determinism reading. No card touched (`pgrep -x arcint` = 0); the
+    served load cannot run device-free, so the no-PLE path is `code` + unit
+    cells, not a served reading.

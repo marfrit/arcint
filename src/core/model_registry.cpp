@@ -509,6 +509,54 @@ std::vector<ModelEntry> build_registry() {
         r.push_back(std::move(e));
     }
 
+    {
+        // THE NATIVE `qwen3_5_moe` SERVING-SHAPE RUNG (2026-09-25): the
+        // Qwen3.6-35B-A3B serving-shape IR at DEPTH 4 of 40, emitted by
+        // tools/export_serving_artifact.py --family qwen35moe --layers 4
+        // --expert-format native, so its routed expert bodies are the
+        // checkpoint's OWN IQ2_S (gate/up) and IQ3_XXS (down) blocks decoded
+        // in standard ops -- the plugin's fourth native format (patch 0050).
+        // It is the first admitted artifact of this family that is NOT an HF
+        // export: it carries a plain pre-norm residual layer, no
+        // hyper-connection and NO PLE / n-gram table. That absence is why
+        // the n-gram binding is inert here and --ngram-gguf is not needed;
+        // the artifact's config.json declares no n-gram keys, and
+        // bind_ngram_ports must not force one (backend_ov.cpp).
+        //
+        // Hashes and weights_bytes read off the artifact's own manifest,
+        // never guessed: `arcint --model <dir> --inspect-artifact` printed
+        // arch 391bd21db6368d57 (the single language-model xml), template
+        // 55d4931433fe502b, tokenizer 87a7830d63fcf43b, 4,284,499,713 B in one
+        // segment -- 2026-09-25. A measurement artifact: 36 of the 40 layers
+        // are missing and nothing it says is the model's answer.
+        ModelEntry e;
+        e.id                      = "qwen3.6-35b-a3b-native-d4";
+        e.family                  = "qwen3.6";
+        e.artifact_aliases        = {"qwen36-35b-a3b-d4n-ov"};
+        e.ov_arch                 = "Qwen3_5MoeForConditionalGeneration";
+        e.model_type              = "qwen3_5_moe";
+        e.moe                     = true;
+        e.has_mtp_head            = false;  // the export writes none
+        e.mtp_head_pinned         = true;   // inspected 2026-09-25
+        e.mtp_in_checkpoint       = true;   // config: mtp_num_hidden_layers 1
+        e.n_embd                  = 2048;
+        e.n_expert                = 256;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 4;      // of 40: layer 3 is the one attention layer
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};   // the coarse label; the experts are the GGUF's IQ2_S/IQ3_XXS
+        e.arch_hash               = "391bd21db6368d57";
+        e.template_hash           = "55d4931433fe502b";  // the GGUF's own chat template
+        e.tokenizer_hash          = "87a7830d63fcf43b";  // passthrough; vocab == the GGUF's, id for id
+        e.weights_bytes           = 4284499713ull;   // the one language-model .bin, off --inspect-artifact
+        e.status                  = "measurement artifact: depth 4 of 40, the native-format "
+                                    "(IQ2_S/IQ3_XXS) serving-shape rung; no PLE/n-gram table, served "
+                                    "inertly; not the model's answers";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
     return r;
 }
 
@@ -540,6 +588,30 @@ void check_hash(ValidationResult& res, const char* field, const std::string& pin
     if (pinned != seen) {
         res.errors.push_back(log::format("%s mismatch: allowlist %s, artifact %s", field,
                                          pinned.c_str(), seen.c_str()));
+    }
+}
+
+// A pinned byte count is the same kind of contract as a pinned hash: the entry
+// says what the artifact IS. Before 2026-09-25 the allowlist pinned
+// weights_bytes and nothing read it, so a wrong or re-exported .bin passed
+// admission on the strength of its xml hash alone. A zero on either side is
+// "not pinned" / "not reported" and is named rather than silently compared.
+void check_u64(ValidationResult& res, const char* field, uint64_t pinned, uint64_t seen) {
+    if (pinned == 0) {
+        res.warnings.push_back(
+            log::format("%s not pinned in the allowlist; artifact reports %llu", field,
+                        static_cast<unsigned long long>(seen)));
+        return;
+    }
+    if (seen == 0) {
+        res.errors.push_back(log::format("%s missing from artifact, allowlist pins %llu", field,
+                                         static_cast<unsigned long long>(pinned)));
+        return;
+    }
+    if (pinned != seen) {
+        res.errors.push_back(log::format("%s mismatch: allowlist %llu, artifact %llu", field,
+                                         static_cast<unsigned long long>(pinned),
+                                         static_cast<unsigned long long>(seen)));
     }
 }
 
@@ -627,6 +699,7 @@ ValidationResult validate_artifact(const ModelEntry& entry, const ArtifactInfo& 
     check_hash(res, "arch_hash", entry.arch_hash, seen.arch_hash);
     check_hash(res, "template_hash", entry.template_hash, seen.template_hash);
     check_hash(res, "tokenizer_hash", entry.tokenizer_hash, seen.tokenizer_hash);
+    check_u64(res, "weights_bytes", entry.weights_bytes, seen.weights_bytes);
 
     if (seen.n_layer > 0 && seen.n_gdn_layer + seen.n_attn_layer != seen.n_layer) {
         res.errors.push_back(log::format("layer split does not sum: %d GDN + %d attn != %d",
