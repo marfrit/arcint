@@ -9382,8 +9382,16 @@ differ by `KL(A‖B)` mean **0.1361 (w0) / 0.1512 (w1)**, max |logit diff|
 flip their top token. The decided bound (3.0905e-03 below 2051, 2.6946e-02 at or above it)
 sits ~44x under that floor, so clause (d) of window-051 read **UNREADABLE on that card**.
 
+[DATED CORRECTION 2026-09-25: the card named in this section as `acm-g12` is
+**ACM-G10** (DG2-512; PCI `0x56A0`). `acm-g12` is a DIFFERENT DG2 die
+(DG2-256, 16 Xe-cores, shipped in Arc Pro A60 / A570M / A530M). Both are
+Xe-HPG, so the Xe-HPG-vs-Xe2 argument this section rests on is unaffected —
+only the die label changes. The `acm-g12` string in the measurement logs is a
+compiler-target label the toolchain printed; its provenance is unverified and
+is recorded as such, not as evidence about the silicon.]
+
 **The card is the variable.** [measured-here] The same bytes, request and
-harness on the **A770** (`acm-g12`, OpenVINO `GPU.1`) are **bit-identical**: at
+harness on the **A770** (`ACM-G10`, OpenVINO `GPU.1`) are **bit-identical**: at
 depth 48, r0↔r1 mean **-0.000000**, **0/1367** rows moved, argmax **1.0000**,
 max |diff| **0.000**. So `F_served = 0` there, the bound sits **above** the
 floor, and clause (d) closes with the **A770 as the measurement card**, while

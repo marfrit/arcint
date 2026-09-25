@@ -527,13 +527,18 @@ F_served is unreadable and the row says UNREADABLE, not PASS. The inherited
 > property of the served path. **CORRECTED 2026-09-20 (same day, after the ISA
 > test): the width is NOT the mechanism and the pin is DEAD.** `xe2`
 > *requires* subgroup size 16 — a kernel with `intel_reqd_sub_group_size(8)`
+> [DATED CORRECTION 2026-09-25: the A770 named in this row is **ACM-G10**
+> (DG2-512); `acm-g12` is a different DG2 die (DG2-256, shipped in Arc Pro
+> A60 / A570M / A530M). Both are Xe-HPG, so the subgroup-width argument below
+> is unaffected — only the die label changes.]
+>
 > fails to compile on every Xe2 target (`bmg-g21`, `bmg-g31`, `lnl-m`,
 > `ptl-h`) with *"Kernel compiled with required subgroup size 8, which is
-> unsupported on this platform"* (it compiles for `acm-g12`, the A770) — so
+> unsupported on this platform"* (it compiles for the A770, `ACM-G10`) — so
 > `get_subgroup_size`->16 is **forced by the platform**, not a choice we can
 > flip. And the disassembled reduction is a **fixed deterministic tree at both
 > widths** (`add(8)+add(4)+add(1)+add(1)` at 16 on `bmg-g21`;
-> `add(4)+add(1)+add(1)` at 8 on `acm-g12`; no SLM, no barrier). So the width
+> `add(4)+add(1)+add(1)` at 8 on `ACM-G10` (A770); no SLM, no barrier). So the width
 > explains the **card-to-card VALUE difference**, not the **run-to-run
 > variance**; it is a correlate of the card, not the mechanism. **The
 > mechanism is OPEN**, and after this amendment the peer session **refuted the

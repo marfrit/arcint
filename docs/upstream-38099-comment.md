@@ -9,7 +9,7 @@ Offered as a **sibling** of this issue, not a duplicate. #38099 reports **determ
 - Kernel **7.0.14-12-pve** (Debian 13), `xe` driver (`srcversion 898B416572903DCE3B55D5E`)
 - Device: **Arc Pro B60 = `bmg-g21` = OpenVINO `GPU.0`**, f16, `ocl::paged_gated_delta_net::opt`, prefill chunk 512
 - Model: a 48-layer hybrid with **36 GDN (linear-attention) layers and 12 full-attention layers** (full attention every 4th layer); the cut arms below are **single 1024-token forwards** (unchunked), not the served chunk-512 prefill
-- **Control:** the same bytes, the same request and the same harness on an **Arc A770 (`acm-g12`, `GPU.1`)** are **bit-identical** across repeats. The defect is Xe2-specific.
+- **Control:** the same bytes, the same request and the same harness on an **Arc A770 (`ACM-G10`, `GPU.1`)** are **bit-identical** across repeats. The defect is Xe2-specific.
 
 ### Observation
 
@@ -33,3 +33,24 @@ Two identical forwards of the same prefill differ on the B60, **only in the GDN 
 ### Conclusion offered
 
 The variance is at **execution** level on Xe2, below the kernel-choice level, in the GDN arithmetic. The instruments (input/output port digests, per-row state diff, the `clFinish` shim, the `ocloc` two-build diff) are in hand, and I can supply a minimal standalone reproducer on request.
+
+### Dated correction 2026-09-25 — the A770's die label (NOT POSTED)
+
+[code] The text above names the control card as `acm-g12`. That is wrong: the
+A770 is **ACM-G10** (DG2-512, PCI `0x56A0`). `acm-g12` is a DIFFERENT DG2 die —
+DG2-256, 16 Xe-cores — shipped in Arc Pro A60 / A570M / A530M. Both dies are
+**Xe-HPG**, which is the distinction the control actually rests on, so **no
+observation or number changes**: the A770 control still reproduces
+bit-identically across repeats and the defect remains Xe2-specific.
+
+Draft follow-up comment, to be appended to the issue:
+
+    Correction: the control card above is an Arc A770 = **ACM-G10** (DG2-512,
+    PCI 0x56A0). The text says `acm-g12`, which is a different DG2 die
+    (DG2-256, shipped in Arc Pro A60 / A570M / A530M). Both are Xe-HPG, so the
+    observation is unaffected: the A770 control still reproduces
+    bit-identically across repeats, and the defect remains Xe2-specific. No
+    numbers change.
+
+STATUS: **NOT POSTED.** Publishing an upstream comment is the operator's call;
+the text is prepared here so the correction is not silently skipped.

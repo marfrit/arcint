@@ -349,13 +349,13 @@ for a number does not close.
      `intel_reqd_sub_group_size(8)` + `sub_group_reduce_add` kernel fails to
      compile on **every** Xe2 target (`bmg-g21`, `bmg-g31`, `lnl-m`, `ptl-h`)
      with *"Kernel compiled with required subgroup size 8, which is
-     unsupported on this platform"*; it compiles for `acm-g12` (A770). So
+     unsupported on this platform"*; it compiles for the A770, `ACM-G10`. So
      `get_subgroup_size`->16 is **forced by the platform** — the one-line pin
      is not a choice we can flip, and the middle row of the handoff's
      P(fixed) table needs a different mechanism.
   2. **The reduction is a fixed deterministic tree at BOTH widths.** Disasm:
      width 16 / `bmg-g21` -> `add(8)+add(4)+add(1)+add(1)` register-halving
-     tree; width 8 / `acm-g12` -> `add(4)+add(1)+add(1)`. No SLM, no
+     tree; width 8 / `ACM-G10` (A770) -> `add(4)+add(1)+add(1)`. No SLM, no
      `barrier`, no send-to-SLM, on either arch. So the width explains the
      **card-to-card VALUE difference** (harmonisation) and **not the run-to-run
      variance**; the width is a **correlate** of the card, not the mechanism.
@@ -570,7 +570,7 @@ for a number does not close.
   deterministic-wrong-values family is a different failure mode than ours.
 - 2026-09-20 — **ISA disassembly works, and the kernel source is
   DEVICE-SPECIFIC** [measured-here]: `ocloc compile -file src_013.cl -device
-  xe-hpg -options "-cl-std=CL3.0 -cl-mad-enable"` builds (acm-g12) and
+  xe-hpg -options "-cl-std=CL3.0 -cl-mad-enable"` builds for the A770 (`ACM-G10`) and
   `ocloc disasm` yields `.text.paged_gated_delta_net_opt...asm` (1143 lines) +
   the SPIR-V section; persisted in the A770 disasm dir.
   The SAME bucket fails to compile for `-device xe2` (`bmg-g21`, error -11):
@@ -762,7 +762,7 @@ for a number does not close.
   for every Xe2 target with an explicit message — `bmg-g21`, `bmg-g31`,
   `lnl-m`, `ptl-h`: **"Kernel compiled with required subgroup size 8, which is
   unsupported on this platform"** (backend `-11`). The same kernel compiles for
-  `acm-g12` (A770). So `get_subgroup_size` returning 16 for `xe2` is FORCED by
+  the A770, `ACM-G10`. So `get_subgroup_size` returning 16 for `xe2` is FORCED by
   the platform, not discretionary; the one-line pin is dead, and the middle row
   of the handoff's fix table ("B60 deterministic in code we own") does not have
   the width pin as its mechanism. A fix must make the 16-wide path
@@ -770,7 +770,7 @@ for a number does not close.
 - 2026-09-20 — **suspect (a) refuted: the reduce lowering is a fixed tree at
   both widths** [measured-here]: `sub_group_reduce_add` in a minimal kernel,
   disassembled with `ocloc` — width 16 / `bmg-g21` lowers to a register-halving
-  add tree (`add (8)`, `add (4)`, two `add (1)`), width 8 / `acm-g12` to the
+  add tree (`add (8)`, `add (4)`, two `add (1)`), width 8 / `ACM-G10` (A770) to the
   same shape (`add (4)`, `add (1)`, `add (1)`). No SLM, no `barrier`, no
   `send`-to-SLM for the reduction, on either arch. So the reduction is a fixed,
   deterministic tree per launch; it cannot be the run-to-run variance.
@@ -944,3 +944,17 @@ for a number does not close.
   depth 48. Recorded in window-051's clause (d), DESIGN §7.0.2cb and the
   handoffs. The next city (0.5.2 VENICE) is open in its own campaign,
   `docs/campaigns/expert-hot-set-lru.md`.
+
+- 2026-09-25 — **dated correction: the measurement card is ACM-G10, not
+  `acm-g12`** [code]. Every row in this document that named the A770 as
+  `acm-g12` is corrected in place to **ACM-G10** (DG2-512, PCI `0x56A0`).
+  `acm-g12` is a DIFFERENT DG2 die — DG2-256, 16 Xe-cores, shipped in Arc Pro
+  A60 / A570M / A530M. Both dies are **Xe-HPG**, which is the distinction every
+  argument here actually rests on (Xe-HPG vs `xe2`), so **no conclusion moves**:
+  the subgroup-width pin stays dead, the reduction stays a fixed tree at both
+  widths, and the ×8 settlement on the A770 is untouched. The `acm-g12` strings
+  in the `ocloc` logs are compiler-target labels the toolchain printed; their
+  provenance is unverified and is now recorded as such rather than read as
+  evidence about the silicon. The same label error is present in the comment
+  already posted upstream (`docs/upstream-38099-comment.md`) and needs a
+  follow-up there.
