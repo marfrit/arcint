@@ -277,5 +277,23 @@
   "status": "measurement artifact: the full-depth (40-layer) native IQ2_S/IQ3_XXS/IQ4_XS serving-shape rung, no PLE/n-gram table; not a quality claim",
   "mtp_num_hidden_layers": 1,
   "mtp_head_exported": false
+ },
+ "qwen36-35b-a3b-d40f16-ov": {
+  "arch": [
+   "Qwen3_5MoeForConditionalGeneration"
+  ],
+  "model_type": "qwen3_5_moe",
+  "hidden": 2048,
+  "layers": 40,
+  "experts": 256,
+  "ctx": 262144,
+  "full_attention_interval": 4,
+  "template_sha": "55d4931433fe502b",
+  "tokenizer_sha": "87a7830d63fcf43b",
+  "lm_xml_sha": "43d2e607941c77ea",
+  "lm_bin_bytes": 19482424091,
+  "status": "measurement artifact: the full-depth (40-layer) native serving-shape rung, dense stored f16, no PLE/n-gram table",
+  "mtp_num_hidden_layers": 1,
+  "mtp_head_exported": false
  }
 }

@@ -870,6 +870,17 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         return fail("--moe-per-expert-dispatch needs --moe-cpu-tier while experts are "
                     "offloaded: non-resident experts fall back to the CPU tier");
     }
+    if (cfg.moe_per_expert_dispatch && cfg.offload_ratio == 0) {
+        // Ergonomics (operator 2026-09-25). The all-resident native route is
+        // reachable as `--offload-ratio 0 --moe-per-expert-dispatch`; the
+        // plugin's dispatch path hoists the tier's x/routing-weight host
+        // buffers (moe_3gemm_swiglu_opt.cpp:1141), so the tier must be ON
+        // internally even though, with every expert resident, it computes
+        // nothing (measured: cpu_tier_pairs=0). Enable it here rather than
+        // making the operator pass a flag that does no work. Stated, not
+        // silent: backend_ov.cpp logs "MoE host compute tier enabled".
+        cfg.moe_cpu_tier = true;
+    }
     // The --moe-cpu-tier / --prefix-cache-mib refusal USED to live here
     // (DESIGN §7.0.2ae's F0). Since plugin patch 0018 the answer depends on
     // a GPU-plugin property (MOE_CPU_TIER_STATIC_PARTITION) that only exists

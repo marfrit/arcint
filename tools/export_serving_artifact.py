@@ -340,6 +340,11 @@ def main(argv=None):
                          "USM-host buffer and the 26.82 GiB pin never happens. "
                          "The bound is max_tokens x Hn, Hn = (ngram_size - 1) x "
                          "heads_per_ngram; the table itself still has to be on disk")
+    ap.add_argument("--dense-fp16", action="store_true",
+                    help="store the graph's f32 Constants (dense weights, norms, head) as "
+                         "f16; the native expert bodies are u8/f16 already and unaffected. "
+                         "A size lever (campaign sub4bit-vram-kernel): the f32 dense part "
+                         "halves. The f16 rounding is the served-path's own precision.")
     ap.add_argument("--skip-hash", action="store_true",
                     help="do not sha256 the written IR files (the manifest "
                          "then says so)")
@@ -487,10 +492,10 @@ def main(argv=None):
                          f"port(s) under cap {rep['ngram_chunk_cap_bytes']:,}")
         lm_xml = seg_dir / "openvino_language_model.xml"
         t0 = time.time()
-        ov.save_model(model, str(lm_xml), compress_to_fp16=False)
+        ov.save_model(model, str(lm_xml), compress_to_fp16=args.dense_fp16)
         lm_bin = lm_xml.with_suffix(".bin")
         say("save", f"{lm_xml.relative_to(out)} + .bin ({lm_bin.stat().st_size / 2 ** 30:.2f} GiB) "
-                    f"in {time.time() - t0:.1f}s, compress_to_fp16=False")
+                    f"in {time.time() - t0:.1f}s, compress_to_fp16={args.dense_fp16}")
         del model
         arena.close()
         if not args.keep_arena and os.path.exists(arena_path):
@@ -535,7 +540,7 @@ def main(argv=None):
     emb = build_embed_model(table, f"{family}_embed")
     del table
     emb_xml = out / "openvino_text_embeddings_model.xml"
-    ov.save_model(emb, str(emb_xml), compress_to_fp16=False)
+    ov.save_model(emb, str(emb_xml), compress_to_fp16=args.dense_fp16)
     del emb
     say("embed", f"{emb_xml.name} + .bin ({emb_xml.with_suffix('.bin').stat().st_size / 2 ** 30:.2f} "
                  f"GiB, f32 [{V}, {H}], T dynamic) in {time.time() - t0:.1f}s")
@@ -625,7 +630,7 @@ def main(argv=None):
         "tokenizer_ids_compared": n_defined,
         "shards": shards, "arch": feed.arch,
         "sha256": hashes if hashes else "skipped (--skip-hash)",
-        "compress_to_fp16": False,
+        "compress_to_fp16": bool(args.dense_fp16),
     }
     (out / "serving-shape.json").write_text(json.dumps(manifest, indent=2) + "\n")
     say("done", f"{out} peak_host_GiB={peak_rss_gib():.2f}")

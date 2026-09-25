@@ -398,6 +398,19 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   to `is_offloaded()`; arcint gained `offload_ratio_set`,
   `moe_offload_active()`, and `expert_fill.format` parsing, with the two config
   guards relaxed. Red-first cell mutation-tested; `config` 74 cases, 0 failed.
+- **The dense half is quantised, and the dispatch form lost its flag**:
+  `tools/export_serving_artifact.py --dense-fp16` stores the graph's f32 dense
+  Constants as f16 — the 40-layer lm `.bin` falls 23.43 → **18.14 GiB**
+  (expert bodies byte-identical), and `config.cpp` auto-enables the tier for
+  `--moe-per-expert-dispatch` at ratio 0, so the all-resident form is
+  `--offload-ratio 0 --moe-per-expert-dispatch`.
+- **The full-depth all-resident gate is BLOCKED on host memory**, measured
+  three ways (cgroup OOM at 45.9 / 50.1 GiB at caps 44/48; sampler watchdog
+  SIGKILL at cap 56), and the fit arithmetic shows packing alone is not
+  enough: experts 10.35 + dense 1.84 + activations 3.40 + drafters 0.95 =
+  16.79 > 15.11 GiB, so the runtime terms must shrink too. The expert packing
+  is a new native `weight_format` across emitter + pattern block + matcher +
+  CPU tier + OCL — scoped, OWED.
 - **The all-resident native route is 4-5x faster**: on the A770 depth-4 rung,
   `--offload-ratio 0 --moe-cpu-tier --moe-per-expert-dispatch` loads in 4.4 s
   and serves at **49.9 / 56.8 t/s** decode and **155.9 t/s** extension prefill

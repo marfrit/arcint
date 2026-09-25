@@ -596,6 +596,39 @@ std::vector<ModelEntry> build_registry() {
         split_layers(e);
         r.push_back(std::move(e));
     }
+    {
+        // The same 40-layer artifact with the dense/graph part stored f16
+        // (`--dense-fp16`, 2026-09-25): lm .bin 19,482,424,091 B against the
+        // f32 form's 23,429,144,641. The native expert bodies are u8/f16
+        // already and byte-identical (sampled readback, same leg). A size
+        // lever toward the all-resident fit; no quality claim here.
+        ModelEntry e;
+        e.id                      = "qwen3.6-35b-a3b-native-d40f16";
+        e.family                  = "qwen3.6";
+        e.artifact_aliases        = {"qwen36-35b-a3b-d40f16-ov"};
+        e.ov_arch                 = "Qwen3_5MoeForConditionalGeneration";
+        e.model_type              = "qwen3_5_moe";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2048;
+        e.n_expert                = 256;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 40;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.arch_hash               = "43d2e607941c77ea";   // its own lm xml, off --inspect-artifact
+        e.template_hash           = "55d4931433fe502b";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 19482424091ull;
+        e.status                  = "measurement artifact: the full-depth (40-layer) native-format "
+                                    "(IQ2_S/IQ3_XXS/IQ4_XS) serving-shape rung, dense stored f16; "
+                                    "no PLE/n-gram table, served inertly";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
 
     return r;
 }

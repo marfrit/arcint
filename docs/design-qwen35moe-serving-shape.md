@@ -626,3 +626,92 @@ emitter is right.
 - The **16384 point** of the full-depth sweep (interrupted by the redirect).
 - A **logits-level V4 A/B** to separate bit-exact kernel from attractor
   robustness.
+
+## 12. The size lever, 2026-09-25 — the full-depth all-resident gate is BLOCKED on host memory; the dense half shrinks
+
+Operator redirect, same leg: *size is now the thing blocking the A770's
+full-context speed*. Evidence classes: `code`, `measured-here`.
+
+### 12.1 The ergonomics fix — the dispatch form no longer carries the tier flag
+
+`measured-here` + `code`: the first full-depth all-resident attempt with
+`--offload-ratio 0 --moe-per-expert-dispatch` (no tier) reached the plugin and
+refused at `moe_3gemm_swiglu_opt.cpp:1141` — *"dispatch_cpu_tier:
+x/routing-weight usm_host buffers not populated"* — because the dispatch path
+hoists the tier's host buffers. The flag was therefore **necessary for the
+plugin as built**, not a no-op. The ergonomics fix is arcint-side:
+`config.cpp` auto-enables `moe_cpu_tier` for `--moe-per-expert-dispatch` at
+ratio 0 (stated in a comment and in the load's own `MoE host compute tier
+enabled` line), so the reachable form is `--offload-ratio 0
+--moe-per-expert-dispatch`. Red-first: `tests/test_config.cpp`'s
+`config_all_resident_native_dispatch_is_accepted` now asserts
+`cfg.moe_cpu_tier` is auto-set; removing the auto-enable fails it. `config` =
+74 cases, 0 failed, on both builds.
+
+### 12.2 The dense half, quantised — `--dense-fp16`
+
+`code` + `measured-here`: `tools/export_serving_artifact.py` gained
+`--dense-fp16`, which stores the graph's f32 Constants (dense weights, norms,
+head) as f16; the native expert bodies are u8/f16 already and unaffected. The
+40-layer re-export (`qwen36-35b-a3b-d40f16-ov`):
+
+| | f32 (`d40n`) | f16 (`d40f16`) |
+|---|---|---|
+| language-model `.bin` | 23,429,144,641 B (21.82 GiB) | **19,482,424,091 B (18.14 GiB)** |
+| embeddings `.bin` | 2,034,237,448 B | **0.95 GiB** |
+| lm xml sha | `b94ecc6ab6b200ac` | `43d2e607941c77ea` |
+| expert bodies | 14.469 GiB | 14.469 GiB (byte-identical, sampled) |
+
+The expert bodies were re-verified byte-exact in the f16 artifact (layers 0
+gate/up IQ2_S, 0/19 down IQ3_XXS, 34/39 down IQ4_XS→IQ4_NL: grid/sign/scale
+all equal), so the dense half is what moved. Admitted as
+`qwen3.6-35b-a3b-native-d40f16` (registry 21 cases, 0 failed; a red-first
+cell refuses the f32 hash/bytes for this entry).
+
+### 12.3 The gate — BLOCKED, and the arithmetic behind it
+
+The full-depth all-resident arm **does not run on this host**, measured three
+ways:
+
+1. container cgroup cap 44 GiB → **cgroup OOM** at `anon-rss 45,914,140 kB`
+   (45.9 GiB) during compile;
+2. cap 48 GiB → **cgroup OOM** at `anon-rss 50,101,000 kB` (50.1 GiB);
+3. cap 56 GiB → the physical host's `MemAvailable` fell under 4 GiB and the
+   **sampler watchdog SIGKILLed** the leg (`measured-here`: watchdog count 1).
+
+The compile's host cost is the all-resident pool's materialisation of the
+18.1 GiB graph **plus** all 14.47 GiB of expert weights; the VRAM verdict is
+never reached.
+
+Its arithmetic does not close either, even at the GGUF's own expert size:
+`experts 10.35 + dense-f16 ≈1.84 + activations 3.40 + drafters 0.95 + margin
+0.25 = 16.79 GiB > 15.11`. So **packing the experts alone does not fit** the
+A770: the runtime terms (activations at chunk 2048, the embedding drafter)
+must shrink too — chunk 1024 brings the activation term to ≈1.7 and lands at
+≈15.09, just inside. The operator's `12.2–14.05 GiB` target charged neither
+the activation term nor the drafter.
+
+### 12.4 What packing would take (the next leg's spec)
+
+The 1.399× lives in the plugin's native layout, not the bytes: IQ2_S gate/up
+is stored as four little-endian u16 grid indices (`8 B/32`) + a RAW sign byte
+(`4 B/32`) + TWO f16 sub-scales (`4 B/32`) = **128 B/256** against the GGUF's
+**82 B/256** (qs 32 B + signs 32 B + qh 8 B + 4-bit scales 8 B + d 2 B). To
+reach ≈1.0× the kernel must read the packed form, which is a **new
+`weight_format`** in lockstep across:
+
+- `tools/q4e/serving_shape.py` `_native_expert` (a decode chain over the
+  packed Constants),
+- `native_expert_block.hpp/.cpp` (a new pattern block + anchors),
+- `convert_tiled_moe_block_to_gather_matmuls.cpp` (the format/resolution),
+- `moe_compressed.hpp` (a `kWeightFormatIq2SPacked` + its shape rule),
+- `moe_3gemm_swiglu_opt.cpp` / `moe_otd_runtime.cpp` (the scale/weight
+  handling and the transpose skip),
+- `moe_cpu_expert.cpp` `decode_native_row` (the CPU-tier row decoder),
+- `moe_expert_swiglu.cl` `native_dot_iq2s` (the OCL decode).
+
+Red-first cells owed: the packed byte geometry (`gridix` stride `K*5/32`, a
+mutation-sensitive layout cell) and a byte-exactness readback against gguf-py.
+This leg scoped the contract but did **not** complete the variant; the size
+win it must beat is the f16 artifact's 18.14 GiB and the fit it must reach is
+≤15.11 GiB with the runtime terms stated.

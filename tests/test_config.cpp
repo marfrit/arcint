@@ -623,7 +623,11 @@ TEST(config_all_resident_native_dispatch_is_accepted) {
     CHECK(run({"--stub", "--offload-ratio", "0", "--moe-per-expert-dispatch"}, cfg).ok);
     CHECK(cfg.offload_ratio_set);
     CHECK(cfg.moe_per_expert_dispatch);
-    CHECK(!cfg.moe_cpu_tier);
+    // Ergonomics: the dispatch form auto-enables the tier (the plugin hoists
+    // the tier's host buffers at moe_3gemm_swiglu_opt.cpp:1141 even when no
+    // expert misses), so the operator does not pass an otherwise no-op flag.
+    // Red-first: removing the auto-enable fails this line.
+    CHECK(cfg.moe_cpu_tier);
 
     Config cfg2;
     CHECK(run({"--stub", "--offload-ratio", "0", "--moe-cpu-tier",

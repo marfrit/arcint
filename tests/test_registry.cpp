@@ -25,7 +25,7 @@ TEST(registry_holds_exactly_the_target_models) {
     // d48g in its slot (2026-09-18, the re-export through the corrected
     // fill, which serves the Paris line), pinned by its own xml hash.
     const auto ids = model_ids();
-    CHECK_EQ(ids.size(), 15u);   // d48n beside d48g (2026-09-18), the native qwen3_5_moe d4 rung (2026-09-25), and its full-depth d40 (2026-09-25)
+    CHECK_EQ(ids.size(), 16u);   // d48n beside d48g (2026-09-18), the native qwen3_5_moe d4 rung (2026-09-25), and its full-depth d40 (2026-09-25)
     CHECK(find_model("qwen3.8-flash-next-d48g") != nullptr);
     CHECK(find_by_artifact("qwen38-flash-next-d48g-ov") == find_model("qwen3.8-flash-next-d48g"));
     CHECK(find_model("qwen3.8-flash-next-d48n") != nullptr);
@@ -39,6 +39,7 @@ TEST(registry_holds_exactly_the_target_models) {
     CHECK(find_model("qwen3.8-flash-next") != nullptr);
     CHECK(find_model("qwen3.6-35b-a3b-native-d4") != nullptr);
     CHECK(find_model("qwen3.6-35b-a3b-native-d40") != nullptr);
+    CHECK(find_model("qwen3.6-35b-a3b-native-d40f16") != nullptr);
     CHECK(find_model("qwen3.6-27b-a3b-coder") != nullptr);
     CHECK(find_model("qwen3.6-35b-a3b") != nullptr);
     CHECK(find_model("qwen3.8-27b") != nullptr);
@@ -251,6 +252,45 @@ TEST(registry_the_full_depth_native_qwen35moe_rung_is_admitted) {
     bad_layers.n_gdn_layer  = 3;
     bad_layers.n_attn_layer = 1;
     CHECK(!validate_artifact(*e, bad_layers).ok);
+}
+
+TEST(registry_the_f16_dense_full_depth_rung_is_admitted_by_its_own_hashes) {
+    // 2026-09-25: the same 40-layer artifact with the dense/graph part stored
+    // f16 (lm .bin 19,482,424,091 against the f32 form's 23,429,144,641). The
+    // native expert bodies are u8/f16 already and byte-identical, so only the
+    // dense half moved; the entry pins the f16 artifact's own xml hash and
+    // byte count, never the f32 one's.
+    const ModelEntry* e = find_model("qwen3.6-35b-a3b-native-d40f16");
+    CHECK(e != nullptr);
+    if (e == nullptr) return;
+    CHECK(find_by_artifact("qwen36-35b-a3b-d40f16-ov") == e);
+    CHECK(find_by_artifact("qwen36-35b-a3b-d40f16-ov") !=
+          find_by_artifact("qwen36-35b-a3b-d40n-ov"));
+    CHECK_EQ(e->n_layer, 40);
+    CHECK_EQ(e->n_attn_layer, 10);
+    CHECK_EQ(e->n_gdn_layer, 30);
+    CHECK_EQ(e->arch_hash, std::string("43d2e607941c77ea"));
+    CHECK_EQ(e->weights_bytes, 19482424091ull);
+
+    ArtifactInfo a;
+    a.id             = e->id;
+    a.quant          = Quant::Q4;
+    a.n_ctx_train    = e->n_ctx_train;
+    a.n_layer        = e->n_layer;
+    a.n_gdn_layer    = e->n_gdn_layer;
+    a.n_attn_layer   = e->n_attn_layer;
+    a.arch_hash      = e->arch_hash;
+    a.template_hash  = e->template_hash;
+    a.tokenizer_hash = e->tokenizer_hash;
+    a.weights_bytes  = e->weights_bytes;
+    a.has_mtp_head   = false;
+    CHECK(validate_artifact(*e, a).ok);
+
+    // RED FIRST: the f32 form's hash/bytes must NOT admit the f16 entry.
+    ArtifactInfo f32 = a;
+    f32.arch_hash     = "b94ecc6ab6b200ac";
+    f32.weights_bytes = 23429144641ull;
+    CHECK(!validate_artifact(*e, f32).ok);
 }
 
 TEST(registry_rejects_everything_else) {

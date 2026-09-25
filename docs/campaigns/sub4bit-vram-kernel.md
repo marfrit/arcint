@@ -1425,3 +1425,37 @@ the campaign rules say it becomes its own document.
     vs 15.11 GiB VRAM) — the speed win is a small-depth one until a packed
     native layout; a logits-level V4 A/B; the 0.5.4 LYON roadmap is the
     operator's.
+- 2026-09-25 (size lever leg). Operator: *size is now the thing blocking the
+  A770's full-context speed*. Evidence classes: `code`, `measured-here`.
+
+  * **Ergonomics (done)**: the first all-resident dispatch attempt without the
+    tier refused at `moe_3gemm_swiglu_opt.cpp:1141` (*"dispatch_cpu_tier:
+    x/routing-weight usm_host buffers not populated"*) — the tier IS needed by
+    the dispatch path. Fixed arcint-side: `config.cpp` auto-enables
+    `moe_cpu_tier` for `--moe-per-expert-dispatch` at ratio 0, so the reachable
+    form is `--offload-ratio 0 --moe-per-expert-dispatch`. Red-first cell;
+    `config` 74/0.
+  * **Dense half quantised (done)**: `--dense-fp16` stores the graph's f32
+    Constants as f16. The 40-layer re-export `qwen36-35b-a3b-d40f16-ov` reads
+    **lm .bin 19,482,424,091 B (18.14 GiB)** against the f32 form's
+    23,429,144,641; embeddings 0.95 GiB. The expert bodies are byte-identical
+    (sampled readback), admitted as `qwen3.6-35b-a3b-native-d40f16`
+    (registry 21/0). **5.3 GiB saved** on the dense half.
+  * **The full-depth all-resident gate is BLOCKED on host memory**
+    (`measured-here`, three attempts): cap 44 GiB → cgroup OOM at anon-rss
+    45.9 GiB; cap 48 GiB → cgroup OOM at 50.1 GiB; cap 56 GiB → the physical
+    host crossed the 4 GiB `MemAvailable` fence and the sampler watchdog
+    SIGKILLed it. The compile materialises the 18.1 GiB graph plus all
+    14.47 GiB of experts; the VRAM verdict is never reached.
+  * **The fit arithmetic corrected**: even at the GGUF's own expert size
+    (10.35 GiB), `experts 10.35 + dense-f16 ≈1.84 + activations 3.40 +
+    drafters 0.95 + margin 0.25 = 16.79 > 15.11`. Packing alone does NOT fit;
+    the runtime terms must shrink too (chunk 1024 → activations ≈1.7 → ≈15.09,
+    just inside). The operator's 12.2–14.05 target charged neither the
+    activation term nor the drafter.
+  * **Packing spec (OWED)**: the 1.399× is the plugin's native layout (IQ2_S
+    gate/up 128 B/256 vs the GGUF's 82), and tightening it is a new
+    `weight_format` in lockstep across the emitter decode chain, the pattern
+    block, the matcher, `moe_compressed.hpp`, `moe_3gemm`/`moe_otd_runtime`,
+    the CPU row decoder and the OCL `native_dot_iq2s`. Red-first cells owed
+    (packed geometry + byte-exactness vs gguf-py). See design note §12.4.
