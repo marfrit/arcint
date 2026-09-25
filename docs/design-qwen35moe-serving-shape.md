@@ -794,3 +794,59 @@ One A770 window (GPU.1 = `8086:56a0`, 15.11 GiB), `--offload-ratio 0
   cost, not on the VRAM arithmetic);
 - the OTD CPU-tier row decoder against the packed emitter chain;
 - the logits-level V4 A/B.
+
+## 14. The rank-5 fix lands; the packed route's next blocker, and the compile-cost lever, 2026-09-26
+
+### 14.1 The signs chain is rank-5 — landed
+
+`_native_packed_expert`'s sign bytes now reshape `(nblk, ib32)` into ONE axis
+before the `Unsqueeze`, so the `BitwiseAnd`/`Greater`/`Select` are rank 5
+(`[E,out,nblk*8,4,8]`) instead of rank 6. The fused axis flattens to the same
+order (`nblk*256 + ib32*32 + l*8 + m`), so the Constants' bytes are untouched;
+the pattern block's `Reshape` anchors are any Constant, so it still matches.
+Red-first `test_the_packed_chain_leaves_no_rank6_select` is mutation-verified
+(restoring the rank-6 reshape fails the cell); the byte-exactness cell still
+passes. The rebuilt depth-4 packed artifact carries **no rank≥6 `Select`**
+(ranks `[2, 5]`) and the `add_required_reorders.cpp:342` refusal is **gone**.
+
+### 14.2 The packed route's next blocker — `CL_OUT_OF_RESOURCES`
+
+It is a **different** defect, not the matcher and not the layout. A packed
+depth-4 all-resident run (`q35-d4packed-rank5`) and a packed depth-4 ratio-50
+tier run (`q35-d4packed-tier`) both die the same way:
+
+```
+Check 'false' failed at program_builder.cpp:168: [GPU] ProgramBuilder build failed!
+Exception from src/plugins/intel_gpu/src/runtime/ocl/ocl_common.hpp:62:
+[GPU] CL_OUT_OF_RESOURCES exception.
+```
+
+Host RAM is not it (sampler peaks 5.4 GB, `MemAvailable` 45.9 GB). The failure
+is inside `cldnn::program::build_program` → `build_implementations` (the
+`kernels_cache::build_all` kernel-build loop) or an allocation. Instrumenting
+`CreateSingleLayerPrimitive` shows every op is created (642 `GPU_OP` lines,
+ending at the lm_head `FullyConnected`); the throw is after that. The re-laid
+depth-4 control compiles and serves with the same plugin. **Cause not yet
+localized** (kernel build vs allocation); the packed d4 rate is **OWED**.
+
+### 14.3 The compile-cost lever (its own defect)
+
+The full-depth packed all-resident gate is blocked on **host RAM**, and the
+measured ratio is the lever:
+
+- packed artifact lm `.bin` **14.55 GiB** → compile RSS **44,292,600 kB**
+  (`≈3.0×`), container `MemAvailable` 45.99 → **3.15 GiB** → watchdog SIGKILL;
+- re-laid f16 d40 lm `.bin` 18.14 GiB → 50.1 GiB (`≈2.8×`).
+
+So the 262144 fit is blocked by a **materialisation factor**, not by the VRAM
+arithmetic, and the reviewer's ~17 GiB projection was wrong by ~2.6×. Candidates,
+unmeasured:
+
+1. **Pack the downs too** — IQ3_XXS/IQ4_XS are the remaining ~5.6 GiB of the
+   12.03 GiB expert fill (the gate/up share is 6.4 GiB at 82 B/256); they are
+   already the checkpoint's own 98/136 B/256, so the win is small unless the
+   emitter's split form (gridix+signix+f32 scales) is itself the overhead.
+2. **Find the ≈3×** — packed Constant + an expanded copy + reorder/constant
+   buffers. A ~3× on a 14.55 GiB artifact is ~30 GiB of host staging that no
+   VRAM budget pays for; cutting it is what makes the full-depth all-resident
+   arm reachable.
