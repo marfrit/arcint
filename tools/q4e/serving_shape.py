@@ -1044,7 +1044,13 @@ def _native_packed_expert(arena, e, out, inn, name, w80, d):
         return op.slice(w, i64([a]), i64([b]), i64([1]), i64([-1]))
 
     qs = op.convert(op.reshape(sl(0, 32), i64([e, out, nblk, 8, 4]), special_zero=False), Type.f32)
-    sg = op.convert(op.reshape(sl(32, 64), i64([e, out, nblk, 8, 4]), special_zero=False), Type.f32)
+    # the sign bytes carry (nblk, ib32) fused into ONE axis: the IQ2_S chain's
+    # signs Select is rank 5 [.,4,8] and the GPU plugin's layout optimizer has
+    # no layout for a rank-6 one (measured 2026-09-26, add_required_reorders
+    # :342 on packed shape [256,512,8,8,4,8]). The fused axis flattens to the
+    # SAME element order (nblk*256 + ib32*32 + l*8 + m), so the bytes and the
+    # decode are unchanged.
+    sg = op.convert(op.reshape(sl(32, 64), i64([e, out, nblk * 8, 4]), special_zero=False), Type.f32)
     qh = op.convert(op.reshape(sl(64, 72), i64([e, out, nblk, 8]), special_zero=False), Type.f32)
     scb = op.convert(op.reshape(sl(72, 80), i64([e, out, nblk, 8]), special_zero=False), Type.f32)
 
@@ -1064,7 +1070,7 @@ def _native_packed_expert(arena, e, out, inn, name, w80, d):
 
     # IQ2_S signs are the RAW byte: bit j flips value j
     bits = op.bitwise_and(op.unsqueeze(op.convert(sg, Type.i32), i64([-1])),
-                          op.constant(nb.KMASK_IQ2XS.astype(np.int32)))   # [E,out,nblk,8,4,8]
+                          op.constant(nb.KMASK_IQ2XS.astype(np.int32)))   # [E,out,nblk*8,4,8] rank 5
     neg = op.greater(bits, op.constant(np.int32(0)))
     sign = op.reshape(op.select(neg, f32(-1.0), f32(1.0)),
                       i64([e, out, nblk, 256]), special_zero=False)

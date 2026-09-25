@@ -128,6 +128,30 @@ def test_the_packed_chain_decodes_random_blocks_exactly():
                      "Add", "Subtract", "Broadcast", "Divide"}, types
 
 
+def test_the_packed_chain_leaves_no_rank6_select():
+    """The GPU plugin's layout optimizer has no layout for a rank-6 Select
+    (measured 2026-09-26: add_required_reorders.cpp:342 refused
+    [256,512,8,8,4,8]). The IQ2_S chain's signs Select is rank 5; the packed
+    chain must not add an axis. This cell fails if the extra axis returns."""
+    inn = 512
+    e, out = 3, 5
+    rng = np.random.default_rng(29)
+    raw = _random_raw(rng, e * out, inn, "IQ2_S")
+    w80, d = nb.PACKED["IQ2_S"](raw)
+    arena = ss.SparseArena()
+    try:
+        model = _matmul_model(arena, e, out, inn, "IQ2_S_PACKED", (w80, d), 2)
+        sels = [n for n in model.get_ordered_ops() if n.get_type_name() == "Select"]
+        assert sels, "no Select in the packed chain"
+        ranks = [len(n.get_output_shape(0)) for n in sels]
+        shapes = [list(n.get_output_shape(0)) for n in sels]
+        assert max(ranks) == 5, (
+            f"packed chain Select is rank {max(ranks)} (want 5, the IQ2_S "
+            f"chain's and the only rank the GPU layout optimizer lays out): {shapes}")
+    finally:
+        arena.close()
+
+
 def test_an_unknown_format_is_refused():
     arena = ss.SparseArena()
     try:
