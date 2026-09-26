@@ -1360,6 +1360,10 @@ the campaign rules say it becomes its own document.
     axis 1 (`[1, tokens, vocab]`), the served-path slice assumes axis 0, and
     the same convention (`--no-logits-slice`) covers the `qwen4_exp`
     serving-shape runs (`code`: `kld-d48n.sh:35`).
+    **Corrected 2026-09-26** (DESIGN §7.0.2cl): the paged load now takes the
+    token axis from the head's declared shape. The `qwen3_5_moe` serving shape
+    slices at load (`measured-here`, depth 4 and 40, the same digests). The
+    `qwen4_exp` runs are unmeasured with it.
   * **OWED**: the full-depth 40-layer export and its served reading; the
     logits-level V4 A/B; a depth-4 int4 comparand; the depth-4 artifact's
     answer quality (degenerate greedy text — truncation or an emitter

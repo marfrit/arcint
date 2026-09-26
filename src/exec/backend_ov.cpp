@@ -703,6 +703,16 @@ bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model,
     return true;
 }
 
+int64_t paged_logits_token_axis(const std::shared_ptr<ov::Model>& model) {
+    const auto node = find_projection_head(model);
+    if (!node) return 0;
+    const ov::PartialShape& ps = node->input_value(0).get_partial_shape();
+    if (ps.rank().is_static() && ps.rank().get_length() == 3 && ps[0].is_static() &&
+        ps[0].get_length() == 1 && ps[1].is_dynamic())
+        return 1;
+    return 0;
+}
+
 bool expose_hidden_state(const std::shared_ptr<ov::Model>& model) {
     auto node = find_projection_head(model);
     if (!node) {
@@ -1059,7 +1069,7 @@ public:
 
         log::info("load", "compiling embeddings graph on %s", device.c_str());
         auto t0    = std::chrono::steady_clock::now();
-        embeddings_ = core_.compile_model(artifact.text_embeddings_xml, device);
+        embeddings_ = compile_embeddings(artifact.text_embeddings_xml, device);
         log::info("load", "embeddings ready in %.1f s", seconds_since(t0));
 
         // One lane: the stateful graph has a single internal state, so this
@@ -2694,11 +2704,15 @@ private:
         if (cfg.slice_logits) {
             const int64_t keep = static_cast<int64_t>(1 + drafts_max_);
             // Token axis 0: the paged export's hidden state is [tokens, 1, hidden].
-            // Stated here, verified below by the probe's first forward.
-            if (slice_logits_to_last_token(model, keep, 0)) {
+            // A serving-shape IR keeps [1, tokens, hidden] (axis 1; until
+            // 2026-09-26 it refused here and ran under --no-logits-slice, a
+            // [M, vocab] f32 copy per prefill chunk). Stated from the head's
+            // declared shape, verified below by the probe's first forward.
+            const int64_t token_axis = paged_logits_token_axis(model);
+            if (slice_logits_to_last_token(model, keep, token_axis)) {
                 logits_keep_rows_ = static_cast<size_t>(keep);
-                log::info("load", "logits sliced to the last %lld row(s)",
-                          static_cast<long long>(keep));
+                log::info("load", "logits sliced to the last %lld row(s) on token axis %lld",
+                          static_cast<long long>(keep), static_cast<long long>(token_axis));
             } else {
                 log::warn("load", "%s", "logits NOT sliced: every prefill chunk will "
                                         "compute and copy [M, vocab] logits");
@@ -3090,7 +3104,7 @@ private:
             lanes_.back()->req   = paged_model_.create_infer_request();
         }
 
-        embeddings_ = core_.compile_model(artifact_.text_embeddings_xml, emb_dev);
+        embeddings_ = compile_embeddings(artifact_.text_embeddings_xml, emb_dev);
         for (auto& lane : lanes_) lane->embed = embeddings_.create_infer_request();
         log::info("load", "embeddings on %s", emb_dev.c_str());
 
@@ -6221,6 +6235,23 @@ private:
 
     // Embeddings as a host [n, hidden] f32 tensor (the paged graph's input
     // layout, and the head's food -- it crosses host memory either way).
+    // The embeddings model, compiled for `device`; on a CPU device its table is
+    // read into host memory rather than mapped (fit.h,
+    // embeddings_read_into_host_memory: first-use faults, DESIGN §7.0.2cl).
+    ov::CompiledModel compile_embeddings(const std::string& xml, const std::string& device) {
+        if (!embeddings_read_into_host_memory(device)) return core_.compile_model(xml, device);
+        const auto t0 = std::chrono::steady_clock::now();
+        auto model = core_.read_model(xml, std::string(), ov::AnyMap{ov::enable_mmap(false)});
+        log::info("load", "embeddings table read into host memory for %s in %.1f s (not mapped)",
+                  device.c_str(), seconds_since(t0));
+        // No model cache for this compile: the stateful load still has the
+        // core's cache_dir set here, and a cached compile of an in-memory model
+        // hashes the whole table for its key and writes a blob the size of the
+        // table (1 GiB), to import next time instead of this read. An empty
+        // per-call cache_dir turns caching off for this call only.
+        return core_.compile_model(model, device, ov::AnyMap{ov::cache_dir("")});
+    }
+
     ov::Tensor embed_paged(Lane& lane, const std::vector<int>& ids) {
         const size_t n = ids.size();
         lane.last_ids = ids;             // the n-gram feed reads them in paged_forward

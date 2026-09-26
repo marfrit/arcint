@@ -10073,6 +10073,66 @@ the plugin builds with `-cl-mad-enable` and contraction is the compiler's. Full 
 -> 222.9 t/s @4096, decode 15.2 -> 18.0 t/s, T_boot 95 -> 75 s**, the same
 digests. Row 3c's bar (460 t/s) is not met.
 
+#### 7.0.2cl Two host terms in the full-depth prefill: the unsliced logits and a cold embedding table; 222.9 -> 349.9 t/s (2026-09-26)
+
+Campaign: `docs/window-054.md` (LYON row 3c); no plugin change.
+
+**The profile.** [measured-here, A770 `GPU.1`, the full-depth packed u8
+artifact, all-resident, u8 KV, plugin 0060, the gate configuration of
+§7.0.2ci] An OpenCL timeline of the 4096-token request put 51.3 % of its
+device window (14.95 s, eight forwards of 512) in the grouped
+gate/up kernel, 19.8 % in grouped down and 16.1 % in device-to-host copies.
+Seven of those copies were 258 ms each, one right after each forward's last
+GEMM: the full `[M, vocab]` f32 logits. (The traced run's server line read
+15.49 s, 264.5 t/s, above the untraced 222.9: its "embed" was 0.84 s against
+3.50 s untraced, the term found below.) The gate configuration carried
+`--no-logits-slice` because the serving-shape IR had refused the slice at load
+(`docs/design-qwen35moe-serving-shape.md` §9.2).
+
+**Term 1, the slice's token axis.** [code] The paged load sliced the LM-head
+input on axis 0, the paged export's `[tokens, 1, hidden]`. A serving-shape IR
+keeps its batch of one through SDPAToPagedAttention: `[1, tokens, hidden]`.
+Sliced on axis 0, it kept every row, and the probe refused ("128 row(s) ...
+shape [1,128,248320]"). `paged_logits_token_axis` (`backend_ov.cpp`) now reads
+the axis from the head's declared shape: 1 when it is rank 3 with a static
+leading one and a dynamic second axis, else 0. The probe's verification is
+unchanged and still decides. Cell `paged_logits_token_axis_follows_the_head_layout`
+(red with the helper forced to 0). [measured-here] The load logs "logits slice
+verified: 1 row(s) for a 128-token forward". Two consequences follow. The
+activation fit falls from 1366.7 to 359.5 KiB per chunk token (the f32 logits
+row was 970 KiB of it), so the served chunk goes 512 -> 1024. Max ctx at this
+configuration goes 84,704 -> 112,288. Prefill **222.9 -> 264.1 t/s** @4096,
+decode 18.2, the same digests (`5f4625c0bf7c` / `b1a16fbc9d4c`). Depth 4, same
+card: prefill graph time 3.83 -> 1.22 s @4096, the same digests.
+
+**Term 2, the embedding table's first-use faults.** [measured-here] With the
+logits gone, the served log's own split put **3.80 s of the 15.51 s** prefill in
+"embed", the CPU embeddings model (`--emb-device CPU`). Every full-depth run
+shows it: 3.87 s at 0059, 3.50 s at 0060. The same model outside the server
+gathers 4096 rows in 23 ms cold and 5 ms warm. A major-fault sampler on the
+served process (`/proc/<pid>/stat` field 12, every 0.5 s) read bursts of
+100-650 faults, about 4 s apart, one per 1024-token chunk. [code] The CPU
+plugin serves the Gather from the `.bin` it maps. After a load has streamed 14
+GB of weights through the host, a prompt's rows are faulted in from the file.
+The load now reads the embeddings model with `enable_mmap=false` when the
+embedding device is the CPU (`fit.h`, `embeddings_read_into_host_memory`; cell
+red with the policy forced false). That compile has the model cache turned off
+(an empty per-call `cache_dir`; with the core's cache set, a cached compile of
+the in-memory model wrote a 1,017,122,896-byte blob, measured-here). A GPU
+embedding device keeps the mapping, because its compile copies the table to
+the card. The cell pins the policy. Only the served leg measures the faults.
+[measured-here] The read
+costs 2.5 s at load and 0.92 GiB more peak host anon (0.63 -> 1.55 GiB; the
+f16 table is 0.95 GiB). Embed is now 0.01 s; 12 major faults over the prefill
+window. Prefill **264.1 -> 349.9 t/s** @4096, decode 19.2 / 18.4 at 1 / 4096,
+the same digests.
+
+Not measured: the `qwen4_exp` serving-shape IR (Flash-Next), whose served
+arms also carry `--no-logits-slice`. It has the same `[1, tokens, hidden]`
+layout by its export, but no load of it has run the new axis. Row 3c (460
+t/s) is not met; the per-expert kernels are now the remaining 71 % of the
+device window.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

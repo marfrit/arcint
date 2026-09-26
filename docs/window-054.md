@@ -273,4 +273,11 @@ at the end, not many. **No measurement before the feature exists.**
   pair decoding its expert alone; patch 0060 tiles the pairs by expert:
   **222.9 t/s** at 4096 (decode 18.0), the same digests (DESIGN §7.0.2ck). Row 3c
   (460 t/s) is not met. **Rows 1–3 stay EMPTY.**
+- 2026-09-26, host-terms leg (`measured-here`, A770) — the 0060 timeline
+  held two host terms. The unsliced logits copied `[M, vocab]` f32 after each
+  forward: the serving-shape IR's token axis is 1, and the slice now finds it.
+  The CPU embedding table was faulted in cold from its mapped file, about 1 s
+  per chunk; the load now reads it into host memory. Prefill **349.9 t/s** at
+  4096 (decode 18.4), the same digests, max ctx 112,288 (DESIGN §7.0.2cl).
+  Row 3c (460 t/s) is not met. **Rows 1–3 stay EMPTY.**
 

@@ -139,6 +139,22 @@ inline size_t logits_slice_rows_expected(size_t keep_rows, size_t tokens) {
     return std::min(keep_rows, tokens);
 }
 
+// Where the embeddings model's table lives on the host (backend_ov.cpp, both
+// load paths). On a CPU embedding device the plugin serves the Gather from the
+// .bin it maps, so a prompt's rows are faulted in from the file at first use;
+// after a full-depth load has streamed 14 GB of weights through the host, they
+// are cold: 250-400 major faults per 1024-token chunk, 3.8 s of a 15.5 s
+// 4096-token prefill spent in "embed" against 5 ms for the same gather warm
+// (DESIGN §7.0.2cl, measured 2026-09-26). Read into host memory instead, the
+// table costs its size in resident host RAM (1 GiB f16 at vocab 248,320 x 2,048)
+// and no faults. A GPU embedding device copies the table to the card at
+// compile, so the mapping is only a staging path there and stays. Composite
+// devices (AUTO, HETERO:CPU, MULTI:CPU) keep the mapping too: not measured,
+// and not a configuration this repository serves.
+inline bool embeddings_read_into_host_memory(const std::string& device) {
+    return device.rfind("CPU", 0) == 0;
+}
+
 // M11 §1.3 (DESIGN §7.0.2ag, "the fix design: MTP's verify cost and zero
 // acceptance at depth"): the MTP layer's own state -- `mtp_layer`, driven by
 // mtp_prime_paged in backend_ov.cpp -- is a STATEFUL paged KV pair,

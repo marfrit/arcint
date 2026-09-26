@@ -506,6 +506,12 @@ The next profile (a device timeline of the 0059 prefill, `measured-here`) put
 patch 0060 decodes each expert once per tile of its tokens: **222.9 t/s** at
 4096, the same digests (DESIGN §7.0.2ck).
 
+The profile after 0060 (`measured-here`) found two host terms. The unsliced
+logits cost 7 x 258 ms, and fixing the slice's token axis also freed the chunk
+from 512 to 1024. The CPU embedding table was faulted in cold, 3.8 s per 4096
+tokens, and is now read into host memory at load. Result: **349.9 t/s** at
+4096, the same digests (DESIGN §7.0.2cl). The per-expert kernels are the rest.
+
 ## 5. Pipeline for the increment
 
 Recon (done, §1–3) → **this note** → red-first: the cell in §1 (landed) plus a

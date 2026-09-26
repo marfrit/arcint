@@ -25,6 +25,14 @@ std::shared_ptr<ov::Node> find_projection_head(const std::shared_ptr<ov::Model>&
 // model untouched, when the head is not unmistakably one of those two.
 bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model, int64_t keep_rows, int64_t token_axis);
 
+// The token axis of the paged graph's LM-head input, for the slice above: 1
+// when that input is rank 3 with a static leading axis of one and a dynamic
+// second axis -- a serving-shape IR keeps its [1, tokens, hidden] batch of one
+// through SDPAToPagedAttention -- else 0, the paged export's [tokens, 1,
+// hidden] (whose leading axes are both declared dynamic). No head: 0; the
+// slice then refuses on its own.
+int64_t paged_logits_token_axis(const std::shared_ptr<ov::Model>& model);
+
 // Publishes the base model's final hidden state -- the LM head's activation
 // input -- as a second output named "hidden_states", so the MTP head can be
 // primed on a prompt instead of seeing only the rows the logits slice keeps

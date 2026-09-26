@@ -464,6 +464,14 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   same output bytes, by measurement (block cell incl. a full and a split
   tile). Full depth on the A770: prefill 143.9 -> 222.9 t/s at
   4096, decode 15.2 -> 18.0 t/s. Stamp unchanged at `+p19`.
+- **The logits slice on a serving-shape IR** (DESIGN §7.0.2cl): the paged
+  load reads the LM head's token axis from its declared shape (1 for
+  `[1, tokens, hidden]`), so the `qwen3_5_moe` serving shape no longer needs
+  `--no-logits-slice`. With the slice, the activation fit frees the served chunk
+  from 512 to 1024. **The CPU embedding table is read into host memory** at load
+  (`--emb-device CPU`), no longer faulted in from the mapped file per prompt:
+  +0.92 GiB host, 2.5 s at load. Full depth on the A770: prefill 222.9 -> 349.9
+  t/s at 4096, max ctx 84,704 -> 112,288, the same digests.
 - **Instruments**: `tools/bigalloc.c` (large host allocations by call
   stack, peak-attributed), `tools/native_moe_match_probe.cpp` (the native
   matcher pass alone, device-free), `tools/native_moe_block_ab.cpp` (one

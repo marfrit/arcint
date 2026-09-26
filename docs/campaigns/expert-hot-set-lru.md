@@ -363,7 +363,10 @@ and the campaign stops. Every disposition carries an evidence class
   continuation, one A770 window, the VENICE plugin, kv u8, offload 99 + tier.
   The harness must pass `--no-logits-slice`: a load-time probe forward trips
   the default logits slice and the executor refuses to come up (a harness
-  fact recorded when the first attempt of this leg failed at load).
+  fact recorded when the first attempt of this leg failed at load). The
+  cause, found 2026-09-26: the slice assumed token axis 0 (`code`), and the
+  serving-shape IR's is 1 (`measured-here` on `qwen3_5_moe`). The load now reads the axis (DESIGN §7.0.2cl),
+  measured on `qwen3_5_moe` only; this route's IR has not been loaded with it.
 - 2026-09-21: **the served-path trace cell (§7.3) is RUN: one A770 window,
   the corpus census, the raw-key CSV agreement, and the stability statement.**
   [measured-here] Window `venice-census-003`, Arc A770 (`GPU.1`, PCI

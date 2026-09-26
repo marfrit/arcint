@@ -314,7 +314,11 @@ take: 128 row(s) for a 128-token forward (the slice keeps the last 1, so 1
 expected), shape [1,128,248320] -- the token axis is not where the slice
 assumed"*. That is the serving-shape layout (`[1, tokens, vocab]`, token axis
 1) against a served-path slice axis of 0, and it is why `--no-logits-slice`
-is the convention here — the same shape the `qwen4_exp` serving-shape export
+is the convention here (**corrected 2026-09-26**: the paged load now reads the
+token axis from the LM head's declared shape and slices axis 1 on this IR
+(`code`); verified at load on the depth-4 and full-depth artifacts, the same
+digests (`measured-here`, A770);
+the flag is no longer needed here, DESIGN §7.0.2cl) — the same shape the `qwen4_exp` serving-shape export
 has (§9.1). The compiled graph had already run the 128-token forward: the
 native IQ2_S compute **executed on the card** before the check refused.
 
