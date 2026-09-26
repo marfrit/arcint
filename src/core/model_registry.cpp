@@ -666,6 +666,140 @@ std::vector<ModelEntry> build_registry() {
         r.push_back(std::move(e));
     }
 
+    {
+        // The packed full-depth artifact RE-EXPORTED 2026-09-26 from the
+        // current emitter: the rank-5 signs chain (the entry above predates
+        // it) and the same --native-packed --dense-fp16 flags. Expert bodies
+        // unchanged (fill 12,918,456,320 B, the GGUF's own 82 B/256); lm .bin
+        // 15,623,664,527 B. It is the one the GPU native matcher fuses: 40 of
+        // 40 MoE blocks with plugin patches 0054 + 0057, 0 of 40 without --
+        // tools/native_moe_match_probe.cpp, measured the same day. The A770
+        // full-depth all-resident gate artifact.
+        ModelEntry e;
+        e.id                      = "qwen3.6-35b-a3b-native-d40packed2";
+        e.family                  = "qwen3.6";
+        e.artifact_aliases        = {"qwen36-35b-a3b-d40packed2-ov"};
+        e.ov_arch                 = "Qwen3_5MoeForConditionalGeneration";
+        e.model_type              = "qwen3_5_moe";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2048;
+        e.n_expert                = 256;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 40;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.arch_hash               = "6b4bf7f3cccf5c40";   // its own lm xml, off the export's [hash] line
+        e.template_hash           = "55d4931433fe502b";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 15623664527ull;
+        e.status                  = "measurement artifact: the full-depth (40-layer) native-format "
+                                    "IQ2_S-PACKED serving-shape rung, rank-5 signs chain, dense stored f16; "
+                                    "no PLE/n-gram table, served inertly";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
+        // The same packed full-depth artifact with the dense projections in the
+        // plugin's u8 group-16 form (`--dense-u8`, 2026-09-26): each Q6_K
+        // group's own (q, d*sc) recovered from the values, u8 with zero point 32
+        // and an f16 scale per 16 -- 111 projections converted, 140 kept plain
+        // (the 120 shared-expert weights the MoE op takes as they are, the 20
+        // attention k/v), 3.291 GiB of f16 to 1.851 GiB. lm .bin
+        // 14,077,670,352 B against the f16-dense 15,623,664,527 (the 1.440 GiB
+        // the pass reports). 40 of 40 MoE blocks fuse (patches 0054 + 0057).
+        ModelEntry e;
+        e.id                      = "qwen3.6-35b-a3b-native-d40packed-u8";
+        e.family                  = "qwen3.6";
+        e.artifact_aliases        = {"qwen36-35b-a3b-d40packed-u8-ov"};
+        e.ov_arch                 = "Qwen3_5MoeForConditionalGeneration";
+        e.model_type              = "qwen3_5_moe";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2048;
+        e.n_expert                = 256;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 40;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.arch_hash               = "8a778f9dca2cb283";   // its own lm xml, off the export's [hash] line
+        e.template_hash           = "55d4931433fe502b";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 14077670352ull;
+        e.status                  = "measurement artifact: the full-depth (40-layer) native-format "
+                                    "IQ2_S-PACKED serving-shape rung, dense projections u8 group-16 "
+                                    "(Q6_K-exact codes, f16 scale); no PLE/n-gram table, served inertly";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
+        // Depth 4 of the packed form, dense f32 (2026-09-26 rank-5 rebuild): the
+        // A/B rung the packed decode and the dense-u8 form are read against on the
+        // card (served before from an uncommitted entry). Not the model's answers.
+        ModelEntry e;
+        e.id                      = "qwen3.6-35b-a3b-native-d4packed";
+        e.family                  = "qwen3.6";
+        e.artifact_aliases        = {"qwen36-35b-a3b-d4packed-ov"};
+        e.ov_arch                 = "Qwen3_5MoeForConditionalGeneration";
+        e.model_type              = "qwen3_5_moe";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2048;
+        e.n_expert                = 256;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 4;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.arch_hash               = "17b28904ededbd34";   // its own lm xml, off --inspect-artifact
+        e.template_hash           = "55d4931433fe502b";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 3898623885ull;
+        e.status                  = "measurement artifact: depth 4 of 40, native IQ2_S-PACKED, dense f32; an A/B rung, not the model's answers";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
+        // Depth 4 of the packed form with --dense-u8 (2026-09-26): 26 projections
+        // u8 group-16 (the shared expert and attention k/v kept plain, 14 of 26).
+        // The dense-u8 A/B
+        // rung against the one above.
+        ModelEntry e;
+        e.id                      = "qwen3.6-35b-a3b-native-d4packed-u8";
+        e.family                  = "qwen3.6";
+        e.artifact_aliases        = {"qwen36-35b-a3b-d4packed-u8-ov"};
+        e.ov_arch                 = "Qwen3_5MoeForConditionalGeneration";
+        e.model_type              = "qwen3_5_moe";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2048;
+        e.n_expert                = 256;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 4;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.arch_hash               = "05e8a5ffc8253198";   // its own lm xml, off --inspect-artifact
+        e.template_hash           = "55d4931433fe502b";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 1973036848ull;
+        e.status                  = "measurement artifact: depth 4 of 40, native IQ2_S-PACKED, dense u8 group-16; an A/B rung, not the model's answers";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
     return r;
 }
 

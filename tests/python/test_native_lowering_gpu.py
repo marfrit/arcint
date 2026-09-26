@@ -14,6 +14,7 @@ tests/python/q4e_device.py; a new gate would be a new axis in the count
 space, test_suite_guards) and the patched runtime on PYTHONPATH; the SOP
 card window applies (docs/sop-card-window.md).
 """
+import os
 import sys
 from pathlib import Path
 
@@ -43,7 +44,10 @@ class _RandomNativeFiller:
 
     def native(self, layer, kind, e, out, inn):
         fmt = self.fmts[kind]
-        block, nbytes = nb.BLOCK_BYTES[fmt]
+        # "<fmt>_PACKED" serves the checkpoint's own block verbatim (patch 0052)
+        packed = fmt.endswith("_PACKED")
+        base = fmt[: -len("_PACKED")] if packed else fmt
+        block, nbytes = nb.BLOCK_BYTES[base]
         rows, nblk = e * out, inn // block
         raw = self.rng.integers(0, 256, size=(rows, nblk, nbytes), dtype=np.uint8)
         # the block scale keeps every decoded weight below ~0.3 whatever the
@@ -52,9 +56,12 @@ class _RandomNativeFiller:
         # card, and random 0.2-scale blocks overflowed it (NaN on GPU.1,
         # 2026-09-18) -- the same magnitude the affine control's 0.001..0.02
         # scales over 0..15 codes give
-        max_mag = {"IQ4_NL": 127.0, "IQ3_XXS": 62.0 * 7.75, "IQ4_XS": 127.0 * 32.0, "Q8_0": 128.0}[fmt]
+        max_mag = {"IQ4_NL": 127.0, "IQ3_XXS": 62.0 * 7.75, "IQ4_XS": 127.0 * 32.0, "Q8_0": 128.0,
+                   "IQ2_S": 43.0 * 3.875}[base]
         d = (self.rng.uniform(0.05, 1.0, size=(rows, nblk)).astype(np.float32) * (0.3 / max_mag))
         raw[:, :, 0:2] = d.astype("<f2").view(np.uint8).reshape(rows, nblk, 2)
+        if packed:
+            return fmt, nb.PACKED[base](raw.reshape(rows, nblk * nbytes))
         return fmt, nb.SPLIT[fmt](raw.reshape(rows, nblk * nbytes))
 
 
@@ -112,48 +119,93 @@ def _build(tmp_path, T, gate_up_fmt, down_fmt):
     return arena, cfg
 
 
+# the served routes: the tiered arm (ratio 50 + host tier) and the all-resident
+# native arm (ratio 0 + per-expert dispatch, patch 0051; the tier auto-enabled
+# as arcint's config does). The all-resident arm is the one the A770 serves.
+_ROUTES = {
+    "tier50": {"OFFLOAD_RATIO": "50", "MOE_CPU_TIER": "YES"},
+    "resident": {"OFFLOAD_RATIO": "0", "MOE_CPU_TIER": "YES", "MOE_PER_EXPERT_DISPATCH": "YES"},
+}
+
+
 @_skip
 @pytest.mark.parametrize("dev", _GPUS)
-@pytest.mark.parametrize("gate_up_fmt,down_fmt", [("affine", "affine"), ("IQ3_XXS", "IQ4_NL"), ("IQ4_XS", "Q8_0")])
-def test_the_native_block_lowers_to_the_fused_primitive_and_matches_the_cpu_plugin(tmp_path, dev, gate_up_fmt, down_fmt):
+@pytest.mark.parametrize("route", sorted(_ROUTES))
+@pytest.mark.parametrize("gate_up_fmt,down_fmt", [("affine", "affine"), ("IQ3_XXS", "IQ4_NL"), ("IQ4_XS", "Q8_0"),
+                                                  ("IQ2_S", "IQ3_XXS"), ("IQ2_S_PACKED", "IQ3_XXS")])
+def test_the_native_block_lowers_to_the_fused_primitive_and_matches_the_cpu_plugin(tmp_path, dev, route, gate_up_fmt,
+                                                                                   down_fmt):
+    if route == "resident" and gate_up_fmt == "affine":
+        pytest.skip("ratio 0 is the native formats' all-resident configuration (patch 0051); the affine "
+                    "control at ratio 0 takes the stock resident provider, a different path")
     _DEV = dev
     T = 6
     arena, cfg = _build(tmp_path, T, gate_up_fmt, down_fmt)
+    xml = str(tmp_path / "moe.xml")
+    props = dict(_ROUTES[route], WEIGHTS_PATH=str(tmp_path / "moe.bin"), INFERENCE_PRECISION_HINT="f16")
     try:
-        core = ov.Core()
-        xml = str(tmp_path / "moe.xml")
-        x = np.random.default_rng(2).standard_normal((1, T, cfg.hidden_size)).astype(np.float32)
-        ref = core.compile_model(core.read_model(xml), "CPU")
-        want = ref({"x": x})[ref.output(0)]
-        props = {"OFFLOAD_RATIO": "50", "MOE_CPU_TIER": "YES",
-                 "WEIGHTS_PATH": str(tmp_path / "moe.bin"), "INFERENCE_PRECISION_HINT": "f16"}
-        gpu = core.compile_model(core.read_model(xml), _DEV, props)
-        got = gpu({"x": x})[gpu.output(0)]
-        types = {}
-        native_nodes = []
-        for n in gpu.get_runtime_model().get_ordered_ops():
-            t = n.get_rt_info()["layerType"].astype(str) if "layerType" in n.get_rt_info() else n.get_type_name()
-            types[t] = types.get(t, 0) + 1
-            if "MOECompressedNative" in n.get_friendly_name():
-                native_nodes.append(n.get_friendly_name())
+        if _AB:
+            # a patched runtime the Python binding refuses: the C++ runner
+            # (tools/native_moe_block_ab.cpp) does the same CPU-vs-GPU run
+            moe_typed, native_nodes, st = _run_ab(xml, _DEV, T, props)
+        else:
+            moe_typed, native_nodes, st = _run_inprocess(xml, _DEV, T, cfg, props)
     finally:
         arena.close()
-    moe_typed = {k: v for k, v in types.items() if "moe" in k.lower()}
-    d = np.abs(got.astype(np.float64) - want.astype(np.float64))
-    # per token: the block's output is a top-2 sum of expert rows, so a wrong
-    # expert (or a wrong sign table in one) moves elements by the order of
-    # the row's RMS. The band is 2% of the element plus 1% of its row's RMS
-    # -- not a fraction of the tensor's peak applied everywhere (review,
-    # 2026-09-18). Calibrated on the stock control (A770, f16 path): its
-    # max diff was 0.6% of the row RMS at 1e-2 + 5e-3, so this band sits at
-    # 2x the measured f16 noise and 1/100 of a wrong expert.
-    rms_row = np.sqrt((want.astype(np.float64) ** 2).mean(axis=-1, keepdims=True))
-    band = 2e-2 * np.abs(want) + 1e-2 * rms_row
-    print(f"\n[native-lowering] {_DEV} {gate_up_fmt}/{down_fmt}: moe-typed primitives {moe_typed}; native nodes {native_nodes}; "
-          f"max|diff| {d.max():.4e} vs max|want| {np.abs(want).max():.4e}; max diff/band {(d / band).max():.3f}; "
-          f"corr {np.corrcoef(got.ravel(), want.ravel())[0, 1]:.6f}")
-    assert moe_typed, f"no MoE-typed primitive in the runtime graph: the lowering did not fire ({sorted(types)[:12]})"
+    print(f"\n[native-lowering] {_DEV} {route} {gate_up_fmt}/{down_fmt}: moe-typed primitives {moe_typed}; "
+          f"native nodes {native_nodes}; max|diff| {st['max_abs']:.4e} vs max|want| {st['max_want']:.4e}; "
+          f"max diff/band {st['max_over_band']:.3f}; corr {st['corr']:.6f}")
+    assert moe_typed, "no MoE-typed primitive in the runtime graph: the lowering did not fire"
     if gate_up_fmt != "affine":
         # the native pass names its op; the stock fusion never produces this name
         assert native_nodes, "a MoE primitive exists but none carries the native pass's name: the stock fusion took it"
-    assert (d <= band).all(), f"max diff/band {(d / band).max():.3f}, max|diff| {d.max():.4e}"
+    assert st["max_over_band"] <= 1.0, f"max diff/band {st['max_over_band']:.3f}, max|diff| {st['max_abs']:.4e}"
+
+
+# The band, both runners: per token the block's output is a top-2 sum of
+# expert rows, so a wrong expert (or a wrong sign table in one) moves elements
+# by the order of the row's RMS. It is 2% of the element plus 1% of its row's
+# RMS -- not a fraction of the tensor's peak applied everywhere (review,
+# 2026-09-18). Calibrated on the stock control (A770, f16 path): its max diff
+# was 0.6% of the row RMS at 1e-2 + 5e-3, so this band sits at 2x the measured
+# f16 noise and 1/100 of a wrong expert.
+_AB = os.environ.get("ARCINT_NATIVE_BLOCK_AB", "")
+_AB_LIB = os.environ.get("ARCINT_NATIVE_BLOCK_LIB", "")
+
+
+def _run_inprocess(xml, dev, T, cfg, props):
+    core = ov.Core()
+    x = np.random.default_rng(2).standard_normal((1, T, cfg.hidden_size)).astype(np.float32)
+    ref = core.compile_model(core.read_model(xml), "CPU")
+    want = ref({"x": x})[ref.output(0)]
+    gpu = core.compile_model(core.read_model(xml), dev, props)
+    got = gpu({"x": x})[gpu.output(0)]
+    moe_typed, native_nodes = 0, 0
+    for n in gpu.get_runtime_model().get_ordered_ops():
+        t = n.get_rt_info()["layerType"].astype(str) if "layerType" in n.get_rt_info() else n.get_type_name()
+        moe_typed += "moe" in t.lower()
+        native_nodes += "MOECompressedNative" in n.get_friendly_name()
+    d = np.abs(got.astype(np.float64) - want.astype(np.float64))
+    rms_row = np.sqrt((want.astype(np.float64) ** 2).mean(axis=-1, keepdims=True))
+    band = 2e-2 * np.abs(want) + 1e-2 * rms_row
+    return moe_typed, native_nodes, {"max_abs": d.max(), "max_want": np.abs(want).max(),
+                                     "max_over_band": (d / band).max(),
+                                     "corr": np.corrcoef(got.ravel(), want.ravel())[0, 1]}
+
+
+def _run_ab(xml, dev, T, props):
+    import subprocess
+    env = dict(os.environ, LD_LIBRARY_PATH=_AB_LIB + os.pathsep + os.environ.get("LD_LIBRARY_PATH", ""))
+    out = subprocess.run([_AB, xml, dev, str(T), "2"] + [f"{k}={v}" for k, v in props.items()],
+                         capture_output=True, text=True, env=env, check=True).stdout
+    moe_typed = native_nodes = 0
+    st = {}
+    for ln in out.splitlines():
+        f = ln.split()
+        kv = dict(x.split("=") for x in f[1:] if "=" in x)
+        if f and f[0] == "RUNTIME":
+            moe_typed, native_nodes = int(kv["moe_typed"]), int(kv["native_nodes"])
+        elif f and f[0] == "DIFF":
+            st = {k: float(v) for k, v in kv.items()}
+    assert st, out
+    return moe_typed, native_nodes, st

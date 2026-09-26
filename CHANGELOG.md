@@ -432,6 +432,40 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   greedy output is a degenerate attractor is not separated here; a
   logits-level A/B is owed.
 
+- **The full depth serves all-resident on the 16 GiB card** (DESIGN
+  §7.0.2ci, `docs/design-fit-levers.md`): the 40-layer packed artifact
+  with its dense projections in u8 (`--dense-u8`,
+  `qwen3.6-35b-a3b-native-d40packed-u8`) loads on the A770 at 13.11 GiB
+  device-resident, admits 84,704 tokens of u8 KV per lane with the
+  embeddings on the CPU, and decodes at 7.3–7.9 t/s (the 40-layer int4
+  comparand: 5.4); prefill 12.5 t/s at 4096. 262144 is not reachable at u8
+  KV. The "≈2.9× compile" that blocked it was unfused native decode chains
+  being constant-folded on the host, not a compile cost (retracted); the
+  compile now holds 0.47 GB.
+- **Plugin patches 0054–0058** (`marfrit-openvino`, version stamp unchanged
+  at `+p19` in the measurement builds; the package recipe applies the
+  directory): the IQ2_S-packed block hands the fused op its `d` Constant
+  (0054); the packed decoders read all eight 32-value sub-blocks (0055);
+  per-expert dispatch no longer overwrites an IQ4_NL / Q8_0 scale with its
+  aliased zero point, and the Q8_0 / IQ2_S down kernels get their slot
+  strides (0056); the native pattern blocks accept `--dense-fp16`'s
+  compressed value Constants (0057); the all-resident pool is filled at
+  bind (0058). Dispatch-route readings on IQ4_NL layers taken before 0056
+  are wrong and owed a re-measurement.
+- **Instruments**: `tools/bigalloc.c` (large host allocations by call
+  stack, peak-attributed), `tools/native_moe_match_probe.cpp` (the native
+  matcher pass alone, device-free), `tools/native_moe_block_ab.cpp` (one
+  block, CPU oracle against a GPU compile, for runtimes the Python binding
+  refuses).
+- **Emitter**: the re-laid IQ2_S chain's sub-block scales are no longer
+  interleaved (the CPU-plugin decode of that chain was wrong; the fused GPU
+  path was not); `emit_shared_expert` and the qwen3_5_moe attention name
+  the weights `--dense-u8` must keep plain; `--dense-u8` compresses the
+  constants it keeps to f16 before splicing its u8 chains (OpenVINO's
+  `compress_to_fp16` skips a model that already has one), refuses a
+  non-qwen35moe family, and keeps a projection whose f16 scale rounding
+  would exceed 2^-9.
+
 ## 0.5.0 — 2026-09-13
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033) —

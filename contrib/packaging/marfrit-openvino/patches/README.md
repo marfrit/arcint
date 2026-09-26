@@ -1447,9 +1447,74 @@ loads and serves), so artifact fit is not it either. The failing kernel is
 plugin, `addr2line` lands on unrelated std noise). Next step: a `-g` plugin
 or an `nm`-on-the-archives mapping of those offsets.
 
+## 0054 — IQ2_S-packed: the fused op's scale is the f16 `d` Constant (2026-09-26)
+
+`0052` registered the packed block's `scale` **Multiply** as the anchor the
+fused op takes as its scale; the callback's Constant guard then refused every
+packed block, the tiled MoE stayed unfused, and the GPU compile constant-folded
+the whole decode chain -- on the host (`ConstantFolding` inside
+`ConvertPrecision`, `MultiplyMultiplyFusion`: 1 GiB f32 per expert tensor,
+233.5 GiB allocated for a depth-4 compile) and on the card (`propagate_constants`,
+where the packed depth-4 load died with `CL_OUT_OF_RESOURCES` in an eltwise
+launch, the kernel 0053 left unnamed). The earlier "matcher fires" rested on a
+print inside `resolve()`, before the guard. This patch anchors `dd`.
+
+MEASURED (2026-09-26): `tools/native_moe_match_probe.cpp` on the packed depth-4
+IR -- `MOE_COMPRESSED 0` on the 0052 core, 4 with 0054; the scale slot is
+`Constant f16 [E, out, K/256, 1]`. Cell: `tests/python/test_native_moe_match.py`.
+
+## 0055 — IQ2_S-packed decode: eight sub-blocks per 256 values (2026-09-26)
+
+The CPU-tier row decoder and the OpenCL `native_dot_iq2s_packed` both indexed
+qs / signs / qh / scales and the input by the 256-value block index and decoded
+32 of every 256 values. Both now loop the eight 32-value sub-blocks.
+
+MEASURED (A770, one E = 256 top-8 block against the CPU plugin's exact decode,
+`tools/native_moe_block_ab.cpp`): 86x the band -> 0.12-0.39 on every route.
+
+## 0056 — per-expert dispatch: aliased zero points, down strides (2026-09-26)
+
+For IQ4_NL, Q8_0 and IQ2_S-packed the matcher sets `zp = scale`, and the
+constant cache gives both inputs one memory: the slot fill wrote the scale
+device-transposed (offsets 3..5) and then the zp's raw copy over the same bytes
+(6..8), so the per-expert kernels read a row-major scale as `[groups, oc]`. A
+native zp that aliases its scale is no longer uploaded (the device zp of a
+native format is never read by a kernel). Also: the Q8_0 down kernel had no
+slot offset (every expert read slot 0), and IQ2_S as a down projection had the
+wrong weight stride, no sign/scale strides and no decode branch.
+
+MEASURED (A770, E = 256 top-8, T 1 and 6): IQ4_NL 67-249x and Q8_0 101-263x
+the band under dispatch -> every pair either checkpoint uses at <= 0.40 on the
+resident-dispatch, tier-dispatch and non-dispatch routes. Still refused at
+compile (`Unable to cast reference from base to derived type`): IQ2_S as down
+and Q8_0 as gate/up under dispatch, which neither checkpoint uses.
+
+## 0057 — native blocks accept compressed value Constants (2026-09-26)
+
+`save_model(compress_to_fp16=True)` (the exporter's `--dense-fp16`) turns
+every f32 Constant into f16 + `Convert`, the decode chains' grids, tables, +-1
+and divisors included, and the blocks' bare `wrap_type<Constant>` then matched
+no layer. The blocks now take a value Constant bare or behind that `Convert`;
+all such values are exact in f16 and the kernels carry their own tables.
+
+MEASURED (probe, full-depth IRs): the f16 re-laid 40-layer artifact fused 0 of
+40 on the 0052 core (its 50.1 GiB compile was the chains being folded), 40 of 40
+with 0057; the re-exported packed one likewise.
+
+## 0058 — the all-resident pool is filled at bind (2026-09-26)
+
+At ratio 0 (0051) the pool holds every expert and the static partition's
+resident set is sorted by expert id, so slot i is expert i -- the layout the
+compile's constant upload already wrote. The provider nevertheless re-read each
+expert from the `.bin` on its first routing (measured, the full-depth 35B on
+the A770, plugin 0003-0057, depth 1: 7,267 misses, 50,354 tensor reads at
+5.0 ms, decode 1.0 t/s). With 0058, in the gate configuration: 0 misses,
+T_boot 245 -> 155 s, depth-1 decode 3.0 -> 7.3 t/s, the same digests. `bind()` now uploads only the scale/zp tensors (the kernels
+read the scale device-transposed) and marks every slot filled.
+
 ## Hazard: the measurement tree's patch set is applied but UNCOMMITTED
 
-`/models/ov/ovsrc-dbg` (the dev tree the measurement plugin is built from)
+The dev tree the measurement plugin is built from (its path is operator-local)
 carries this directory's patch set applied **to the working tree, not
 committed**. `git status` there shows the patched files as modified. So:
 
@@ -1460,7 +1525,7 @@ ocl_memory.cpp` dropped `0005`'s OTD device-resident-slot lock guard
 was read. Before and after any file-level revert there, run
 
 ```
-git -C /models/ov/ovsrc-dbg diff --stat <file>
+git -C <measurement tree> diff --stat <file>
 ```
 
 and re-apply anything lost. Do not `git checkout` a file in that tree without

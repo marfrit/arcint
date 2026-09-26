@@ -1,0 +1,45 @@
+# IQ2_S-packed: hand the fused op the f16 d Constant as its scale. 0052
+# registered the scale Multiply as the block anchor; the callback's Constant
+# guard then refused every packed block, the tiled MoE stayed unfused and
+# the GPU compile constant-folded the decode chain.
+#
+--- a/src/common/transformations/src/transformations/pattern_blocks/native_expert_block.cpp
++++ b/src/common/transformations/src/transformations/pattern_blocks/native_expert_block.cpp
+@@ -82,7 +82,14 @@
+ 
+     m_inputs = ov::OutputVector{weight};
+     m_outputs = ov::OutputVector{weights_input};
+-    REGISTER_ANCHORS(this, weight, scale, reshape);
++    // arcint (patch 0054): `dd` is the anchor the fused op takes as its
++    // scale -- the checkpoint's f16 d, [E, out, K/256, 1], what the OCL decode
++    // (S[n*nblk + ib]), the OTD runtime and the CPU tier read for format 5.
++    // 0052 handed the `scale` Multiply to the fused op instead; the callback's
++    // Constant guard then refused the block, the tiled MoE stayed unfused, and
++    // the GPU compile constant-folded the decode chain (1 GiB f32 per expert
++    // tensor at the 35B geometry, on the host and on the card).
++    REGISTER_ANCHORS(this, weight, dd, scale, reshape);
+ }
+ 
+ ov::pass::pattern::op::NativeIq4nlWeightsBlock::NativeIq4nlWeightsBlock() : Block({}, {}, "NativeIq4nlWeightsBlock") {
+--- a/src/common/transformations/src/transformations/common_optimizations/convert_tiled_moe_block_to_gather_matmuls.cpp
++++ b/src/common/transformations/src/transformations/common_optimizations/convert_tiled_moe_block_to_gather_matmuls.cpp
+@@ -512,13 +512,15 @@
+                 r.zp = w.iq2s->get_anchor("signix", pm).value();
+                 return true;
+             }
+-            // arcint (patch 0052): the packed IQ2_S carries its own f16 d, so
+-            // the scale slot aliases the weight and the zp slot aliases the
+-            // scale (nothing reads it: the block is self-contained).
++            // arcint (patch 0052): the packed IQ2_S's scale slot carries the
++            // checkpoint's own f16 d Constant ([E, out, K/256, 1]); the zp
++            // slot aliases it (nothing reads it: the block is self-contained).
++            // Patch 0054: the anchor is `dd`, the Constant -- 0052 took the
++            // scale Multiply, which the Constant guard below refused.
+             if (auto wgt = w.iq2sp->get_anchor("weight", pm)) {
+                 r.format = MOECompressed::kWeightFormatIq2SPacked;
+                 r.weight = wgt.value();
+-                r.scale = w.iq2sp->get_anchor("scale", pm).value();
++                r.scale = w.iq2sp->get_anchor("dd", pm).value();
+                 r.zp = r.scale;
+                 return true;
+             }

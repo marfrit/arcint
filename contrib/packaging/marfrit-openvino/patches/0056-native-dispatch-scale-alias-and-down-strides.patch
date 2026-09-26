@@ -1,0 +1,71 @@
+# Per-expert dispatch: do not upload a native zero-point that aliases its
+# scale (IQ4_NL, Q8_0, IQ2_S-packed) -- the raw copy undid the scale's device
+# transpose; give the Q8_0 and IQ2_S down kernels their slot strides and
+# IQ2_S down its decode branch.
+#
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+@@ -409,6 +409,21 @@
+             // so only the scale/zp tensors (3..8) are uploaded on this path.
+             if (!include_weights && offset_pos < 3)
+                 continue;
++            // arcint (patch 0056): a native format whose zero-point slot
++            // ALIASES its scale (IQ4_NL, Q8_0, IQ2_S-packed: the matcher sets
++            // zp = scale, and the constant cache gives both inputs ONE
++            // memory) must not upload the zp: offsets 3..5 wrote the scale
++            // device-transposed, and the zp's raw [oc, groups] copy into the
++            // same bytes undid it -- the per-expert kernels then read a
++            // row-major scale as [groups, oc] (measured on the A770, one
++            // E=256 block: IQ4_NL 125x and Q8_0 240x the CPU oracle's band).
++            // The device zp of a native format is never read by a kernel.
++            if (offset_pos >= 6 && tensors_by_offset[offset_pos] &&
++                tensors_by_offset[offset_pos] == tensors_by_offset[offset_pos - 3]) {
++                const size_t fmt = (offset_pos % 3 == 2) ? config.down_weight_format : config.gate_up_weight_format;
++                if (ov::op::internal::MOECompressed::is_native_format(fmt))
++                    continue;
++            }
+             auto plan = make_tensor_fill_plan(offset_pos, tensors_by_offset[offset_pos], expert, lru_experts[index]);
+             std::vector<uint8_t> payload;
+ 
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
+@@ -1425,15 +1425,24 @@
+     weight += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE / 4);
+     zps    += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE / 8);
+ #elif NATIVE_DOWN_FORMAT == 3 // Q8_0: i8 codes (K)
++    // (patch 0056: the 0045 form had no slot offset here -- every routed
++    // expert read slot 0's down weights)
++    weight += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE);
+ #elif NATIVE_DOWN_FORMAT == 5  // IQ2_S-packed: 80 B per 256; d is the scale slot
+     weight += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE / 256 * 80);
+-#elif NATIVE_DOWN_FORMAT == 4
+-    weight += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE);
++#elif NATIVE_DOWN_FORMAT == 4  // IQ2_S: u8 [out, K/32, 8] indices + u8 [out, K/32, 4] signs
++    // (patch 0056: the 0050 form strode the weight by K per row and left the
++    // sign slot at slot 0)
++    weight += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE / 4);
++    zps    += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE / 8);
+ #else                        // IQ4_NL: packed u4 codes (K/2)
+     weight += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE / 2);
+ #endif
+ #if NATIVE_DOWN_FORMAT == 5
+     scales += (long)slot_index * ((long)(INTERMEDIATE_SIZE / 256) * HIDDEN_SIZE);
++#elif NATIVE_DOWN_FORMAT == 4
++    // IQ2_S: TWO f16 sub-block scales per group row, row-major
++    scales += (long)slot_index * ((long)(INTERMEDIATE_SIZE / DOWN_GROUP_SIZE) * HIDDEN_SIZE * 2);
+ #else
+     scales += (long)slot_index * ((long)(INTERMEDIATE_SIZE / DOWN_GROUP_SIZE) * HIDDEN_SIZE);
+ #endif
+@@ -1455,6 +1464,12 @@
+                                      (const __global half*)scales,
+                                      n, HIDDEN_SIZE, INTERMEDIATE_SIZE,
+                                      (const __global half*)x, x_base, id_local);
++#elif NATIVE_DOWN_FORMAT == 4
++        acc = native_dot_iq2s((const __global uchar*)weight,
++                              (const __global uchar*)zps,
++                              (const __global half*)scales,
++                              n, HIDDEN_SIZE, INTERMEDIATE_SIZE,
++                              (const __global half*)x, x_base, id_local);
+ #elif NATIVE_DOWN_FORMAT == 3
+         acc = native_dot_q8_0((const __global uchar*)weight,
+                               (const __global half*)scales,

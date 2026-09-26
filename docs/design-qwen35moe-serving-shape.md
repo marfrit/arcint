@@ -729,7 +729,7 @@ the GGUF's own size, against the re-laid form's 128. Emitter-side:
 `serving_shape._native_packed_expert`, `NativeExpertFiller(packed=True)`,
 `--native-packed`.
 
-Verified before any card (`/home/mfritsche/q35-bench/verify-d40packed.py`,
+Verified before any card (the operator-local `verify-d40packed.py` check,
 device-free):
 
 - **census 120/120 packed**: 40 gate + 40 up `IQ2_S_PACKED`, 37 IQ3_XXS down,
@@ -753,7 +753,7 @@ own manifest, arcint-test 615/0).
 
 One A770 window (GPU.1 = `8086:56a0`, 15.11 GiB), `--offload-ratio 0
 --moe-per-expert-dispatch --prefill-chunk 1024 --n-ctx 262144`, depths 1 and
-4096, sampler + watchdog (log `/home/mfritsche/q35-bench/packed-gate/`).
+4096, sampler + watchdog (logs operator-local).
 
 - **Host RAM still bites.** The compile climbed monotonically
   (`.../q35-d40packed-allres/sampler.log`): RSS 0 → **44,292,600 kB** over
@@ -768,7 +768,11 @@ One A770 window (GPU.1 = `8086:56a0`, 15.11 GiB), `--offload-ratio 0
   *"No layout format available for select:Select_598 … format: bfwzyx,
   data_type: f16, shape=[256,512,8,8,4,8]"* — the packed decode chain's
   rank-6 signs `Select`. Instrumenting the matcher (`iq2sp RESOLVED` ×8, one
-  per layer's gate+up) proves the **matcher fires**; the chain is the emitter's
+  per layer's gate+up) proves the **matcher fires** [CORRECTED 2026-09-26: it
+  did not — the print sat inside `resolve()`, before the callback's Constant
+  guard that refused every packed block (the scale anchor was the scale
+  Multiply); the pass output held 0 fused ops. See `docs/design-fit-levers.md`
+  §3.2]; the chain is the emitter's
   own, and its `Select` carries one axis more than the IQ2_S chain's rank-5
   `[.,4,8]`. So the packing's remaining card defect is the packed chain's
   rank-6 `Select` reaching the layout optimizer, not the matcher.
@@ -811,6 +815,10 @@ passes. The rebuilt depth-4 packed artifact carries **no rank≥6 `Select`**
 
 ### 14.2 The packed route's next blocker — `CL_OUT_OF_RESOURCES`
 
+[CORRECTED 2026-09-26: "not the matcher" below is wrong. The failing launch was
+an eltwise run by `propagate_constants` on the decode chain the matcher had
+left unfused (patch 0054 fixes the anchor); `docs/design-fit-levers.md` §3.]
+
 It is a **different** defect, not the matcher and not the layout. A packed
 depth-4 all-resident run (`q35-d4packed-rank5`) and a packed depth-4 ratio-50
 tier run (`q35-d4packed-tier`) both die the same way:
@@ -831,6 +839,11 @@ localized** (kernel build vs allocation); the packed d4 rate is **OWED**.
 
 ### 14.3 The compile-cost lever (its own defect)
 
+[RETRACTED 2026-09-26: the ≈3× below is not a compile cost. It was the constant
+folding of native decode chains the matcher had left unfused; the fused
+full-depth compile holds 0.47 GB (`docs/design-fit-levers.md` §3, DESIGN
+§7.0.2ci).]
+
 The full-depth packed all-resident gate is blocked on **host RAM**, and the
 measured ratio is the lever:
 
@@ -850,3 +863,12 @@ unmeasured:
    buffers. A ~3× on a 14.55 GiB artifact is ~30 GiB of host staging that no
    VRAM budget pays for; cutting it is what makes the full-depth all-resident
    arm reachable.
+
+[DATED IN PLACE 2026-09-26: §14.3's "≈3× the artifact's bytes" is **not a
+compile cost** — it was the constant folding of native decode chains the
+matcher had left unfused (patches 0054, 0057; a stale packed d40), and the
+fused full-depth compile holds 0.47 GB. §13.2's "the matcher fires" rested on a
+print inside `resolve()`, before the callback's Constant guard that refused the
+block; §14.2's `CL_OUT_OF_RESOURCES` was an eltwise launched by
+`propagate_constants` on that unfused chain. The full-depth all-resident arm
+now serves on the A770: see `docs/design-fit-levers.md` §7 and DESIGN §7.0.2ci.]

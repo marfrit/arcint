@@ -1,0 +1,93 @@
+# IQ2_S-packed decode, CPU tier and OpenCL: a 256-value block is eight
+# 32-value sub-blocks. 0052 indexed qs/signs/qh/scales and x by the
+# 256-block index and decoded 32 of every 256 values.
+#
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
+@@ -799,6 +799,9 @@
+         // scales (8 B); d is m.s[n*nblk + ib]. idx = qs[ib*4+l] |
+         // (((qh[ib] >> 2l) & 3) << 8); db = d*(0.5+nib)*0.25, the low nibble
+         // for l<2 and the high for l>=2.
++        // (patch 0055: one 256-value block is EIGHT 32-value sub-blocks; the
++        // 0052 form indexed qs/signs/qh/scales and the output by the 256-block
++        // index and decoded 32 of every 256 values.)
+         const int nblk = m.ic / 256;
+         const uint8_t* brow = m.w + static_cast<size_t>(n) * static_cast<size_t>(nblk) * 80u;
+         for (int ib = 0; ib < nblk; ib++) {
+@@ -807,19 +810,21 @@
+                                        static_cast<size_t>(ib)]);
+             const uint8_t* qs = blk;
+             const uint8_t* signs = blk + 32;
+-            const uint8_t qhb = blk[64 + ib];
+-            const uint8_t sc = blk[72 + ib];
+-            const float dlo = d * (0.5f + static_cast<float>(sc & 0x0F)) * 0.25f;
+-            const float dhi = d * (0.5f + static_cast<float>(sc >> 4)) * 0.25f;
+-            for (int l = 0; l < 4; l++) {
+-                const uint16_t gi = static_cast<uint16_t>(qs[ib * 4 + l]) |
+-                                    static_cast<uint16_t>(((qhb >> (2 * l)) & 3) << 8);
+-                const uint8_t sg = signs[ib * 4 + l];
+-                const float dd = (l < 2) ? dlo : dhi;
+-                const uint8_t* gr = &kIq2sGrid[static_cast<size_t>(gi) * 8u];
+-                float* y = out + ib * 32 + l * 8;
+-                for (int j = 0; j < 8; j++) {
+-                    y[j] = dd * static_cast<float>(gr[j]) * ((sg & kIq2xsMask[j]) ? -1.0f : 1.0f);
++            for (int ib32 = 0; ib32 < 8; ib32++) {
++                const uint8_t qhb = blk[64 + ib32];
++                const uint8_t sc = blk[72 + ib32];
++                const float dlo = d * (0.5f + static_cast<float>(sc & 0x0F)) * 0.25f;
++                const float dhi = d * (0.5f + static_cast<float>(sc >> 4)) * 0.25f;
++                for (int l = 0; l < 4; l++) {
++                    const uint16_t gi = static_cast<uint16_t>(qs[ib32 * 4 + l]) |
++                                        static_cast<uint16_t>(((qhb >> (2 * l)) & 3) << 8);
++                    const uint8_t sg = signs[ib32 * 4 + l];
++                    const float dd = (l < 2) ? dlo : dhi;
++                    const uint8_t* gr = &kIq2sGrid[static_cast<size_t>(gi) * 8u];
++                    float* y = out + ib * 256 + ib32 * 32 + l * 8;
++                    for (int j = 0; j < 8; j++) {
++                        y[j] = dd * static_cast<float>(gr[j]) * ((sg & kIq2xsMask[j]) ? -1.0f : 1.0f);
++                    }
+                 }
+             }
+         }
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
+@@ -1122,22 +1122,26 @@
+     float acc = 0.0f;
+     const int nblk = K / 256;
+     const __global uchar* brow = W + (long)n * nblk * 80;
++    // (patch 0055: EIGHT 32-value sub-blocks per 256-value block; the 0052
++    // form indexed them by the 256-block index and read 32 of every 256 x.)
+     for (int ib = 0; ib < nblk; ib++) {
+         const __global uchar* blk = brow + (long)ib * 80;
+         float d = convert_float(S[(long)n * nblk + ib]);
+-        uchar scb = blk[72 + ib];
+-        float dlo = d * (0.5f + convert_float(scb & 0x0F)) * 0.25f;
+-        float dhi = d * (0.5f + convert_float(scb >> 4)) * 0.25f;
+-        uchar qhb = blk[64 + ib];
+-        for (int j = id_local; j < 32; j += SUBGROUP_SIZE) {
+-            int l = j >> 3;
+-            int m = j & 7;
+-            ushort gi = (ushort)blk[ib * 4 + l] | ((ushort)((qhb >> (2 * l)) & 3) << 8);
+-            float mag = convert_float(NATIVE_IQ2S_GRID[gi * 8 + m]);
+-            uchar signs = blk[32 + ib * 4 + l];
+-            float sign = (signs & NATIVE_IQ2XS_MASK[m]) ? -1.0f : 1.0f;
+-            float dd = (l < 2) ? dlo : dhi;
+-            acc += convert_float(x[x_base + ib * 32 + j]) * dd * mag * sign;
++        for (int ib32 = 0; ib32 < 8; ib32++) {
++            uchar scb = blk[72 + ib32];
++            float dlo = d * (0.5f + convert_float(scb & 0x0F)) * 0.25f;
++            float dhi = d * (0.5f + convert_float(scb >> 4)) * 0.25f;
++            uchar qhb = blk[64 + ib32];
++            for (int j = id_local; j < 32; j += SUBGROUP_SIZE) {
++                int l = j >> 3;
++                int m = j & 7;
++                ushort gi = (ushort)blk[ib32 * 4 + l] | ((ushort)((qhb >> (2 * l)) & 3) << 8);
++                float mag = convert_float(NATIVE_IQ2S_GRID[gi * 8 + m]);
++                uchar signs = blk[32 + ib32 * 4 + l];
++                float sign = (signs & NATIVE_IQ2XS_MASK[m]) ? -1.0f : 1.0f;
++                float dd = (l < 2) ? dlo : dhi;
++                acc += convert_float(x[x_base + ib * 256 + ib32 * 32 + j]) * dd * mag * sign;
++            }
+         }
+     }
+     return sub_group_reduce_add(acc);

@@ -1,0 +1,41 @@
+# The all-resident pool (ratio 0) holds every expert in expert order, which
+# is the layout the compile's constant upload already wrote. Fill only the
+# scale/zp tensors (device-transposed) at bind() and mark every slot filled,
+# instead of re-reading each expert from the .bin on its first routing.
+#
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+@@ -414,6 +414,33 @@
+     // simultaneous/acquire_one see live traffic.
+     if (_static_partition) reserve_static_partition();
+ 
++    // arcint (patch 0058). The all-resident pool (ratio 0, patch 0051: capacity
++    // == num_expert) holds EVERY expert, and the static partition's resident
++    // set is sorted by expert id, so slot i IS expert i -- the order the
++    // compile's ordinary constant upload already wrote the weight bytes in
++    // (try_prepare_partial_upload is off at ratio 0). Leaving the slots
++    // unfilled made every expert's first routing re-read it from the .bin
++    // (measured 2026-09-26, A770, the full-depth 35B: 7,267 misses in a
++    // 32-token decode, 50,354 tensor reads at ~5 ms, decode 1.0 t/s). Only
++    // the scale/zp tensors differ from the constant layout (the per-expert
++    // kernels read the scale device-transposed), so upload those here, as the
++    // arcwell path's tail does, and mark every slot filled.
++    if (_static_partition && !_pinned_nvme_fill && !_census_seed_active && _capacity >= _config.num_expert &&
++        _resident->gate_w != nullptr) {
++        auto& service_stream = _resident->gate_w->get_engine()->get_service_stream();
++        const auto resident_experts =
++            static_partition_resident_experts(_static_seed, layer_key(), _config.num_expert, _capacity);
++        for (std::size_t slot = 0; slot < resident_experts.size(); ++slot) {
++            OPENVINO_ASSERT(resident_experts[slot] == slot,
++                            "all-resident pool: slot ", slot, " holds expert ", resident_experts[slot],
++                            ", not the identity the constant upload laid out");
++            moe_otd::fill_weights_memory(service_stream, _config, _weight_bin_offsets, _weight_reader, *_resident,
++                                         {resident_experts[slot]}, {slot}, _staging, /*include_weights=*/false);
++            _cache->set_filled(slot);
++        }
++        service_stream.finish();
++    }
++
+     // arcint nvme-direct-expert-tier (patches/0048/0049). The first layer to
+     // bind runs the whole load barrier: every registered layer's pinned set is
+     // fetched over the arcwell batch surface, four batches in flight, and

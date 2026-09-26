@@ -29,8 +29,11 @@ TEST(registry_holds_exactly_the_target_models) {
     // Seventeen with the IQ2_S-PACKED d40 (2026-09-25): the checkpoint's own
     // 82-byte expert block through plugin weight_format 5, the A770
     // all-resident rate arm.
+    // Nineteen with the packed d40 re-exported on the rank-5 chain and its
+    // dense-u8 twin (2026-09-26): the ones the native matcher fuses 40 of 40.
+    // Twenty-one with their depth-4 A/B rungs, f32 and u8 dense (same day).
     const auto ids = model_ids();
-    CHECK_EQ(ids.size(), 17u);   // d48n beside d48g (2026-09-18), the native qwen3_5_moe d4 rung (2026-09-25), its d40 + d40f16 (2026-09-25), and the packed d40 (2026-09-25)
+    CHECK_EQ(ids.size(), 21u);   // d48n beside d48g (2026-09-18), the native qwen3_5_moe d4 rung (2026-09-25), its d40 + d40f16 (2026-09-25), the packed d40 (2026-09-25), packed2 + packed-u8 + their d4 rungs (2026-09-26)
     CHECK(find_model("qwen3.8-flash-next-d48g") != nullptr);
     CHECK(find_by_artifact("qwen38-flash-next-d48g-ov") == find_model("qwen3.8-flash-next-d48g"));
     CHECK(find_model("qwen3.8-flash-next-d48n") != nullptr);
@@ -46,6 +49,12 @@ TEST(registry_holds_exactly_the_target_models) {
     CHECK(find_model("qwen3.6-35b-a3b-native-d40") != nullptr);
     CHECK(find_model("qwen3.6-35b-a3b-native-d40f16") != nullptr);
     CHECK(find_model("qwen3.6-35b-a3b-native-d40packed") != nullptr);
+    CHECK(find_model("qwen3.6-35b-a3b-native-d40packed2") != nullptr);
+    CHECK(find_by_artifact("qwen36-35b-a3b-d40packed2-ov") == find_model("qwen3.6-35b-a3b-native-d40packed2"));
+    CHECK(find_model("qwen3.6-35b-a3b-native-d40packed-u8") != nullptr);
+    CHECK(find_model("qwen3.6-35b-a3b-native-d4packed") != nullptr);
+    CHECK(find_model("qwen3.6-35b-a3b-native-d4packed-u8") != nullptr);
+    CHECK(find_by_artifact("qwen36-35b-a3b-d40packed-u8-ov") == find_model("qwen3.6-35b-a3b-native-d40packed-u8"));
     CHECK(find_model("qwen3.6-27b-a3b-coder") != nullptr);
     CHECK(find_model("qwen3.6-35b-a3b") != nullptr);
     CHECK(find_model("qwen3.8-27b") != nullptr);

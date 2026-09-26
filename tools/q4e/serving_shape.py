@@ -970,11 +970,17 @@ def _native_expert(arena, e, out, inn, name, fmt, parts):
                              name=name + "/block_scale")
         sc2.set_friendly_name(name + "/block_scale")
         arena.scales[name + "/block_scale"] = sc2_f32
+        # lo serves values 0..15 and hi 16..31, so the pair is the OUTER axis
+        # of the 32: [.,2,1] -> [.,2,16]. (Corrected 2026-09-26: the first form
+        # broadcast [.,1,2] -> [.,16,2], which interleaves lo/hi value by value;
+        # the fused GPU kernels read the compact Constant in ggml's order and
+        # were unaffected, the CPU-plugin decode of this chain was wrong by up
+        # to 27 on a 30 weight -- test_native_expert_chain did not carry IQ2_S.)
         sc5 = op.reshape(op.convert(sc2, Type.f32),
-                         op.constant(np.array([e, out, groups, 1, 2], np.int64)),
+                         op.constant(np.array([e, out, groups, 2, 1], np.int64)),
                          special_zero=False)
         sc_rep = op.broadcast(sc5,
-                              op.constant(np.array([e, out, groups, 16, 2], np.int64)))
+                              op.constant(np.array([e, out, groups, 2, 16], np.int64)))
         sc32 = op.reshape(sc_rep, g4, special_zero=False)
         sc32.set_friendly_name(name + "/iq2s_scale32")
         x = op.multiply(x, sc32)
@@ -2227,13 +2233,21 @@ def emit_stateful_attention(hidden, pid, config, state, layer, beam,
     q = qgdn._transpose(
         qattn._rmsnorm_hd(q, state["q_norm.weight"], eps, d,
                           getattr(config, "norm_plus_one", True)), [0, 2, 1, 3])
+    # k/v named: q4e.dense_u8 keeps them plain. With q, k AND v all compressed
+    # the GPU plugin fuses the three horizontally and the served paged graph
+    # read garbage (measured 2026-09-26, depth-4 logits A/B: argmax 7/1000);
+    # either one left plain served clean.
+    k_w = qattn._c(state["k_proj.weight"])
+    k_w.set_friendly_name(f"attn{layer}/k_proj")
+    v_w = qattn._c(state["v_proj.weight"])
+    v_w.set_friendly_name(f"attn{layer}/v_proj")
     k = qgdn._reshape(
-        qgdn._mm(hidden, qattn._c(state["k_proj.weight"]), tb=True), [1, T, kv, d])
+        qgdn._mm(hidden, k_w, tb=True), [1, T, kv, d])
     k = qgdn._transpose(
         qattn._rmsnorm_hd(k, state["k_norm.weight"], eps, d,
                           getattr(config, "norm_plus_one", True)), [0, 2, 1, 3])
     v = qgdn._transpose(
-        qgdn._reshape(qgdn._mm(hidden, qattn._c(state["v_proj.weight"]), tb=True),
+        qgdn._reshape(qgdn._mm(hidden, v_w, tb=True),
                       [1, T, kv, d]), [0, 2, 1, 3])
     q, k = qattn._apply_rope(q, k, rope_cos, rope_sin, pid, rotary, T)
     q.set_friendly_name(f"attn{layer}/q_rope")            # localiser cut points

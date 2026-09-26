@@ -306,7 +306,11 @@ card:
 
 - **VRAM ceiling ≈ 38.2 layers** (`(15.111 − 2.519 − 0.850 − 0.25) / 0.3008`),
   where 0.3008 GiB/layer is the packed expert term (`12.031/40`).
-- **Host-compile ceiling ≈ 37.4 layers**: the compile materialises
+- **Host-compile ceiling ≈ 37.4 layers** [RETRACTED 2026-09-26: the 2.903×
+  was the constant folding of unfused native chains, not a compile cost; the
+  fused full-depth compile holds 0.47 GB and the ceiling does not exist —
+  `docs/design-fit-levers.md` §3; the dense term below was 3.677, not 2.519,
+  §4.1]: the compile materialises
   **2.903×** the artifact's bytes (`measured-here`: 44,292,600 kB RSS for a
   14.551 GiB artifact), and the usable host is ~40 GiB (44 GiB container minus
   the 4 GiB watchdog floor) → artifact ≤ **13.78 GiB** → experts ≤ 11.26 GiB →
@@ -476,7 +480,8 @@ No artifact byte was changed; no gate was run; the diagnostic pass change was
 reverted and the plugin reinstalled clean (sha `f9eb7ffdc5d83ee7`).
 
 **Still OWED:** LYON's chunked fused primitive; the fit levers (dense-u8 form,
-the 2.903x materialisation). LYON-001 rows stay EMPTY.
+the 2.903x materialisation) [DATED 2026-09-26: both closed —
+`docs/design-fit-levers.md`]. LYON-001 rows stay EMPTY.
 
 ## 5. Pipeline for the increment
 

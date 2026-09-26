@@ -1524,3 +1524,33 @@ packed d4 is SMALLER than the re-laid d4 that compiles (3.63 vs 4.28 GiB lm
 `.bin`), with the same graph shape — so the bound is **not size and not the
 graph: the prime suspect is patch 0052's packed OCL kernel build**, a
 kernel-build allocation. See design-lyon-stateful-prefill §4e.
+
+[DATED IN PLACE 2026-09-26 (the two fit levers — the full-depth all-resident gate PASSES)]:
+the 40-layer Qwen3.6-35B-A3B artifact serves **fully resident on the A770**
+(`measured-here`: `qwen36-35b-a3b-d40packed-u8-ov`, ratio 0 + dispatch, u8 KV,
+chunk 512, embeddings on the CPU, `--dyn-quant off`, plugin `ov-0058`):
+device-resident 13.11 GiB, reservation max ctx **84,704** per lane, decode
+**7.3–7.7 / 7.9 t/s** (depth 1 / after 4096), prefill **12.5 t/s** @4096,
+digests `5f4625c0bf7c` / `b1a16fbc9d4c` reproduced across three processes
+(the last on the committed re-export, whose exporter compresses the kept
+constants to f16 before splicing the u8 chains), coherent text, host max RSS
+≤ 1.08 GiB. 262144 is NOT reachable at u8 KV. **Retracted**: the
+entry above's "compile materialises 2.903× the artifact's bytes" and its
+"~36–37 of 40 layers" ceiling — the tracer (`tools/bigalloc.c`) attributes the
+host growth to constant folding of native decode chains the matcher had left
+unfused (0054: the packed block's scale anchor; 0057: `--dense-fp16`'s
+compressed value Constants, under which even the re-laid f16 d40 fused 0 of 40;
+a stale packed d40 re-exported), and the fused compile holds 0.47 GB. The
+entry's dense term (2.519) was an undercount: the census reads 3.677 GiB, and
+`--dense-u8` (Q6_K-exact u8 group-16, shared expert and attention k/v kept
+plain — both measured failures on the served path) takes it to 1.851 GiB of
+the 3.291 GiB it converts. Found on the way (A770, E = 256 block cells):
+per-expert dispatch computed IQ4_NL / Q8_0 wrong (0056) — the VENICE dispatch
+readings on IQ4_NL layers (7.0.2ce/cf) are owed a re-measurement; the packed
+decoders read 32 of every 256 values (0055); the emitter's re-laid IQ2_S CPU
+chain interleaved its scales. The resident pool re-read every expert from disk
+on first routing; 0058 fills it at bind (0 misses, T_boot 245 → 155 s).
+OWED: the q/k/v horizontal-fusion mechanism under compressed weights; the fit
+ledger's ≈0.4 GiB undercount at the edge; a full-depth KLD of the u8 artifact;
+the prefill rate under dispatch (LYON). See DESIGN §7.0.2ci and
+`docs/design-fit-levers.md`.

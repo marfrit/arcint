@@ -45,9 +45,9 @@ def _matmul_model(arena, e, out, inn, fmt, parts, T):
     return ov.Model([res], [x], "native_expert_chain")
 
 
-@pytest.mark.parametrize("fmt,inn", [("IQ4_NL", 64), ("IQ3_XXS", 512), ("IQ4_XS", 512), ("Q8_0", 64)])
+@pytest.mark.parametrize("fmt,inn", [("IQ4_NL", 64), ("IQ3_XXS", 512), ("IQ4_XS", 512), ("Q8_0", 64), ("IQ2_S", 512)])
 def test_the_chain_decodes_random_blocks_exactly(fmt, inn):
-    rng = np.random.default_rng({"IQ4_NL": 11, "IQ3_XXS": 13, "IQ4_XS": 17, "Q8_0": 19}[fmt])
+    rng = np.random.default_rng({"IQ4_NL": 11, "IQ3_XXS": 13, "IQ4_XS": 17, "Q8_0": 19, "IQ2_S": 23}[fmt])
     e, out, T = 3, 5, 7
     raw = _random_raw(rng, e * out, inn, fmt)
     parts = nb.SPLIT[fmt](raw)
@@ -86,8 +86,9 @@ def test_the_chain_decodes_random_blocks_exactly(fmt, inn):
     assert (d <= 1e-5 * bound + 1e-6).all(), f"{fmt}: max|diff| {d.max():.3e}, max diff/bound {(d / bound).max():.2e}"
     # the chain is standard ops only: nothing the plugin does not know
     types = {n.get_type_name() for n in model.get_ordered_ops()}
+    # (IQ2_S adds the 10-bit index Add and the sub-block scale Broadcast)
     assert types <= {"Parameter", "Constant", "Convert", "Gather", "Reshape", "Multiply", "Unsqueeze",
-                     "BitwiseAnd", "Greater", "Select", "MatMul", "Result"}, types
+                     "BitwiseAnd", "Greater", "Select", "MatMul", "Result", "Add", "Broadcast"}, types
 
 
 def test_the_packed_chain_decodes_random_blocks_exactly():

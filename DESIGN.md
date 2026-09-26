@@ -9615,6 +9615,10 @@ under 0047 with a non-zero card counter
 
 #### 7.0.2ce The native per-expert route's rate: V1 at the ratio-99 budget, and 1.81x at ratio 75 (2026-09-22)
 
+[DATED IN PLACE 2026-09-26: the dispatch-route readings below ran before patch
+0056, when per-expert dispatch computed IQ4_NL (and Q8_0) layers wrong — every
+Flash-Next IQ4_NL down layer. They are owed a re-measurement; see §7.0.2ci.]
+
 Campaign: `docs/campaigns/sub4bit-vram-kernel.md`; acceptance
 `docs/window-052.md` (G pinned 2026-09-22); plugin `ov-0047`
 (`f021de51b5812ee2`); design note
@@ -9689,6 +9693,12 @@ differently (159,264) and has no card pairs; it is the rate baseline, not a
 share point.
 
 #### 7.0.2cf The native per-expert route's card-vs-host divergence, quantified: the affine kernels are bit-identical, the native kernels are not (2026-09-22)
+
+[DATED IN PLACE 2026-09-26: the native-dispatch divergence measured below
+predates patch 0056, which fixed per-expert dispatch reading IQ4_NL / Q8_0
+scales wrong (the aliased zero point overwrote the scale's transpose). Part or
+all of this divergence may be that defect; re-measure before relying on it
+(§7.0.2ci).]
 
 Campaign: `docs/campaigns/sub4bit-vram-kernel.md` (V4 quantification leg);
 plugin `ov-0047` (`f021de51b5812ee2`); acceptance `docs/window-052.md`.
@@ -9953,6 +9963,69 @@ That closes the campaign gate's cold-TTFT, RSS and (host-fed) determinism rows;
 the miss-tier verdict is unchanged — LISBON keeps the host hop for runtime
 moves. The one OWED sub-row is the arcwell arm's restart determinism, and its
 reason is structural (B60-only), not a missing measurement.
+
+#### 7.0.2ci The full-depth 35B serves all-resident on the 16 GiB card: the "2.9× compile" was unfused native chains, the dense term goes u8 (2026-09-26)
+
+Campaign: `docs/campaigns/sub4bit-vram-kernel.md`; design note
+`docs/design-fit-levers.md` (the instrument §2, the compile wall §3, the dense
+form §4, the correctness defects found on the way §5, the pool fill §6, the
+gate §7). Plugin patches 0054–0058 (`contrib/packaging/marfrit-openvino/
+patches/README.md`); tools `tools/bigalloc.c`, `tools/bigalloc_report.py`,
+`tools/native_moe_match_probe.cpp`, `tools/native_moe_block_ab.cpp`,
+`tools/q4e/dense_u8.py`.
+
+**The finding.** [measured-here] The full-depth all-resident arm of
+Qwen3.6-35B-A3B loads and serves on the A770 (`GPU.1`, 15.11 GiB): device-
+resident 13.11 GiB, the run's own reservation admits 84,704 tokens of u8 KV per
+lane (embeddings on the CPU), decode 7.3–7.7 t/s at depth 1 and 7.9 t/s after
+a 4096-token prefill, prefill 12.5 t/s at 4096, digests `5f4625c0bf7c` /
+`b1a16fbc9d4c` reproduced by three processes (plugin prefixes `ov-0057`,
+`ov-0058`, and `ov-0058` on the committed re-export: runs g7/g8/g9), coherent
+text, host `wait4` max RSS ≤ 1.08 GiB. 262144 is not reachable at u8 KV.
+
+**Retraction** (design-qwen35moe-serving-shape §14.3, the campaign's
+2026-09-26 analysis entry): the "≈2.9× compile materialisation" is not a
+compile cost. [measured-here] An allocation tracer with call stacks attributes
+it to `ov::Node::constant_fold` (`ConstantFolding` inside `ConvertPrecision`,
+`MultiplyMultiplyFusion`) folding native decode chains the native matcher had
+left in place — 1 GiB f32 per expert tensor, 233.5 GiB allocated for a depth-4
+compile; with the chains fused the full-depth compile holds 0.47 GB. [code +
+measured-here] Three causes: the packed block's scale anchor was the scale
+Multiply and the Constant guard refused it (0054; the earlier "matcher fires"
+rested on a print before the guard); `--dense-fp16` compresses the chain's value
+Constants and no block matched a compressed artifact — the f16 re-laid d40
+fused 0 of 40 (0057); the full-depth packed artifact predated the rank-5 chain
+(re-exported).
+
+**The dense term** [measured-here] was 3.677 GiB of f16, not the 2.519 the fit
+arithmetic carried. `--dense-u8` writes the Q6_K projections in the plugin's u8
+group-16 compressed form, recovered exactly from the values (all 252 tensors;
+RMS weight error 1.32× the f16 artifact's own rounding). Two exclusions,
+measured on the served path: the shared expert (fused into the MoE op, which
+reads plain weights) and attention k/v (q, k and v all compressed are fused
+horizontally by the plugin and served KL 2.73 at depth 4; the fused kernel is
+exact alone — the mechanism is OPEN). Depth-4 served A/B against f32 dense: KL
+1.95e-4, argmax 983/1000. The exporter compresses the kept constants to f16
+BEFORE splicing the u8 chains: `compress_model_to_f16` skips a whole model that
+already carries a compressed-weight chain, and the first export kept 0.772 GiB
+f32 (lm `.bin` 14,490,689,806 B; re-exported 14,077,670,352 B, device residency
+and digests unchanged).
+
+**Correctness defects found by the extended lowering cell** [measured-here,
+A770, E = 256 top-8]: per-expert dispatch read IQ4_NL and Q8_0 wrong (the zp
+slot aliasing the scale overwrote its device transpose; 0056), the IQ2_S-packed
+decoders read 32 of every 256 values (0055), and the emitter's re-laid IQ2_S
+chain interleaved its sub-block scales (CPU decode only). Consequence: the
+dispatch-route readings before 0056 on IQ4_NL layers (the Flash-Next VENICE
+rate legs, 7.0.2ce, and 7.0.2cf's native-dispatch divergence) were taken on
+wrong arithmetic and are to be re-measured.
+
+**The pool fill** [measured-here]: at ratio 0 the pool held every expert but
+re-read each from the `.bin` on its first routing (run g6, `ov-0057`, depth 1:
+7,267 misses, 5.0 ms a read, decode 1.0 t/s; run g7, the gate configuration
+with a warmer page cache: 10,146 misses, 1.4 ms a read, 3.0 t/s); 0058 fills
+scale/zp at bind (g8 against g7): 0 misses, T_boot 245 → 155 s, depth-1 decode
+3.0 → 7.3 t/s, the same digests.
 
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 

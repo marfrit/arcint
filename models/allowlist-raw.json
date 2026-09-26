@@ -313,5 +313,77 @@
         "status": "measurement artifact: the full-depth (40-layer) native IQ2_S-PACKED (82 B/256, the checkpoint's own block + f16 d) serving-shape rung, dense stored f16, no PLE/n-gram table; the A770 all-resident rate arm",
         "mtp_num_hidden_layers": 1,
         "mtp_head_exported": false
+    },
+    "qwen36-35b-a3b-d40packed2-ov": {
+        "arch": [
+            "Qwen3_5MoeForConditionalGeneration"
+        ],
+        "model_type": "qwen3_5_moe",
+        "hidden": 2048,
+        "layers": 40,
+        "experts": 256,
+        "ctx": 262144,
+        "full_attention_interval": 4,
+        "template_sha": "55d4931433fe502b",
+        "tokenizer_sha": "87a7830d63fcf43b",
+        "lm_xml_sha": "6b4bf7f3cccf5c40",
+        "lm_bin_bytes": 15623664527,
+        "status": "measurement artifact: the full-depth (40-layer) native IQ2_S-PACKED serving-shape rung RE-EXPORTED 2026-09-26 (rank-5 signs chain), dense stored f16, no PLE/n-gram table; the A770 full-depth all-resident gate artifact",
+        "mtp_num_hidden_layers": 1,
+        "mtp_head_exported": false
+    },
+    "qwen36-35b-a3b-d40packed-u8-ov": {
+        "arch": [
+            "Qwen3_5MoeForConditionalGeneration"
+        ],
+        "model_type": "qwen3_5_moe",
+        "hidden": 2048,
+        "layers": 40,
+        "experts": 256,
+        "ctx": 262144,
+        "full_attention_interval": 4,
+        "template_sha": "55d4931433fe502b",
+        "tokenizer_sha": "87a7830d63fcf43b",
+        "lm_xml_sha": "8a778f9dca2cb283",
+        "lm_bin_bytes": 14077670352,
+        "status": "measurement artifact: the full-depth (40-layer) native IQ2_S-PACKED serving-shape rung, dense projections u8 group-16 (Q6_K-exact codes, f16 scale; --dense-u8, 2026-09-26), no PLE/n-gram table",
+        "mtp_num_hidden_layers": 1,
+        "mtp_head_exported": false
+    },
+    "qwen36-35b-a3b-d4packed-ov": {
+        "arch": [
+            "Qwen3_5MoeForConditionalGeneration"
+        ],
+        "model_type": "qwen3_5_moe",
+        "hidden": 2048,
+        "layers": 4,
+        "experts": 256,
+        "ctx": 262144,
+        "full_attention_interval": 4,
+        "template_sha": "55d4931433fe502b",
+        "tokenizer_sha": "87a7830d63fcf43b",
+        "lm_xml_sha": "17b28904ededbd34",
+        "lm_bin_bytes": 3898623885,
+        "status": "measurement artifact: depth 4 of 40, native IQ2_S-PACKED, dense f32 (2026-09-26 rank-5 rebuild); an A/B rung",
+        "mtp_num_hidden_layers": 1,
+        "mtp_head_exported": false
+    },
+    "qwen36-35b-a3b-d4packed-u8-ov": {
+        "arch": [
+            "Qwen3_5MoeForConditionalGeneration"
+        ],
+        "model_type": "qwen3_5_moe",
+        "hidden": 2048,
+        "layers": 4,
+        "experts": 256,
+        "ctx": 262144,
+        "full_attention_interval": 4,
+        "template_sha": "55d4931433fe502b",
+        "tokenizer_sha": "87a7830d63fcf43b",
+        "lm_xml_sha": "05e8a5ffc8253198",
+        "lm_bin_bytes": 1973036848,
+        "status": "measurement artifact: depth 4 of 40, native IQ2_S-PACKED, dense u8 group-16 (--dense-u8, 2026-09-26); an A/B rung",
+        "mtp_num_hidden_layers": 1,
+        "mtp_head_exported": false
     }
 }
