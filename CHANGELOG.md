@@ -483,6 +483,14 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   patch 0062, DESIGN §7.0.2cn): with every expert holding a slot, the MoE call
   reads only its top-k ids back. Full depth on the A770: prefill 625.7 ->
   653.7 t/s at 4096, the same digests. Stamp unchanged at `+p19`.
+- **Weight-rounding emulation arm** (plugin patch 0063, a measurement
+  instrument; default off, output bytes unchanged): `MOE_NATIVE_W_ROUND=f16|bf16`.
+  It found that the served logits of the 35B carry a deterministic floor that
+  does not scale with the perturbation: about 1e-4 per prefill row at depth
+  4, up to 0.24 at depth 40 (`docs/design-native-dpas-expert-kernel.md`
+  §6.2a). Stamp unchanged at `+p19`. `tools/native_kernel_harness.py` runs
+  the plugin's captured decoders outside the plugin, in f32, against f64
+  models of the exact and f16-rounded weights (§6.1a).
 - **Instruments**: `tools/bigalloc.c` (large host allocations by call
   stack, peak-attributed), `tools/native_moe_match_probe.cpp` (the native
   matcher pass alone, device-free), `tools/native_moe_block_ab.cpp` (one

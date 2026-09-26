@@ -1,0 +1,146 @@
+# Native per-expert kernels: a weight-rounding emulation arm, a measurement
+# instrument. MOE_NATIVE_W_ROUND=f16 rounds each decoded weight (the product
+# of its factors, in f32) to f16 before the multiply, as a matrix-unit B
+# operand would; bf16 is the instrument's red. Unset, the macros expand to
+# the kernels' own left-to-right product and the output bytes are 0062's.
+#
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
+@@ -1164,6 +1164,24 @@
+     return sub_group_reduce_add(acc);
+ }
+ 
++// arcint (patch 0063): the weight-rounding emulation arm, a measurement
++// instrument for the matrix-unit route (docs/design-native-dpas-expert-kernel.md
++// §6.2). The matrix unit takes f16 weights; NATIVE_W_ROUND = 1 rounds each
++// decoded weight (the product of its factors, in f32) to f16 before the
++// multiply, so the served cost of that rounding alone can be read against the
++// unrounded kernels; 2 rounds to bf16, the instrument's red. 0, the default,
++// expands to the kernels' own left-to-right product, token for token.
++#if NATIVE_W_ROUND == 1
++#  define NATIVE_W3(x, a, b, c) ((x) * convert_float(convert_half((a) * (b) * (c))))
++#  define NATIVE_W2(x, a, b) ((x) * convert_float(convert_half((a) * (b))))
++#elif NATIVE_W_ROUND == 2
++#  define NATIVE_W3(x, a, b, c) ((x) * intel_convert_as_bfloat16_float(intel_convert_bfloat16_as_ushort((a) * (b) * (c))))
++#  define NATIVE_W2(x, a, b) ((x) * intel_convert_as_bfloat16_float(intel_convert_bfloat16_as_ushort((a) * (b))))
++#else
++#  define NATIVE_W3(x, a, b, c) ((x) * (a) * (b) * (c))
++#  define NATIVE_W2(x, a, b) ((x) * (a) * (b))
++#endif
++
+ // arcint (patch 0060): the same decoders over a TILE of up to NATIVE_TILE_M
+ // tokens that share one expert: each weight element is decoded once and every
+ // token's lane accumulator takes the same left-to-right product, in the same
+@@ -1188,7 +1206,7 @@
+             const float fs = convert_float(s);
+             const float fv = convert_float(NATIVE_IQ4NL_TABLE[code]);
+             __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
+-                if (t < cnt) acc[t] += convert_float(x[xb[t] + g * 32 + j]) * fs * fv;
++                if (t < cnt) acc[t] += NATIVE_W2(convert_float(x[xb[t] + g * 32 + j]), fs, fv);
+         }
+     }
+     __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
+@@ -1213,7 +1231,7 @@
+             float sign = (signs & NATIVE_IQ2XS_MASK[m]) ? -1.0f : 1.0f;
+             const float fs = convert_float(s);
+             __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
+-                if (t < cnt) acc[t] += convert_float(x[xb[t] + g * 32 + j]) * fs * mag * sign;
++                if (t < cnt) acc[t] += NATIVE_W3(convert_float(x[xb[t] + g * 32 + j]), fs, mag, sign);
+         }
+     }
+     __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
+@@ -1239,7 +1257,7 @@
+             float sign = (signs & NATIVE_IQ2XS_MASK[m]) ? -1.0f : 1.0f;
+             float s = convert_float((l < 2) ? s0 : s1);
+             __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
+-                if (t < cnt) acc[t] += convert_float(x[xb[t] + g * 32 + j]) * s * mag * sign;
++                if (t < cnt) acc[t] += NATIVE_W3(convert_float(x[xb[t] + g * 32 + j]), s, mag, sign);
+         }
+     }
+     __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
+@@ -1270,7 +1288,7 @@
+                 float sign = (signs & NATIVE_IQ2XS_MASK[m]) ? -1.0f : 1.0f;
+                 float dd = (l < 2) ? dlo : dhi;
+                 __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
+-                    if (t < cnt) acc[t] += convert_float(x[xb[t] + ib * 256 + ib32 * 32 + j]) * dd * mag * sign;
++                    if (t < cnt) acc[t] += NATIVE_W3(convert_float(x[xb[t] + ib * 256 + ib32 * 32 + j]), dd, mag, sign);
+             }
+         }
+     }
+@@ -1290,7 +1308,7 @@
+             const float fs = convert_float(s);
+             const float fc = convert_float(codes[j]);
+             __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
+-                if (t < cnt) acc[t] += convert_float(x[xb[t] + g * 32 + j]) * fs * fc;
++                if (t < cnt) acc[t] += NATIVE_W2(convert_float(x[xb[t] + g * 32 + j]), fs, fc);
+         }
+     }
+     __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
+@@ -1366,8 +1384,8 @@
+                     if (t < cnt) {
+                         const float xv = convert_float(x[xb[t] + ib * 256 + ib32 * 32 + j]);
+                         __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_GU_TILE_N; r++) {
+-                            au[r][t] += xv * wud[r] * wum[r] * wus[r];
+-                            ag[r][t] += xv * wgd[r] * wgm[r] * wgs[r];
++                            au[r][t] += NATIVE_W3(xv, wud[r], wum[r], wus[r]);
++                            ag[r][t] += NATIVE_W3(xv, wgd[r], wgm[r], wgs[r]);
+                         }
+                     }
+                 }
+@@ -1411,7 +1429,7 @@
+                 if (t < cnt) {
+                     const float xv = convert_float(x[xb[t] + g * 32 + j]);
+                     __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_DOWN_TILE_N; r++)
+-                        acc[r][t] += xv * fs[r] * wm[r] * ws[r];
++                        acc[r][t] += NATIVE_W3(xv, fs[r], wm[r], ws[r]);
+                 }
+             }
+         }
+@@ -1443,7 +1461,7 @@
+                 if (t < cnt) {
+                     const float xv = convert_float(x[xb[t] + g * 32 + j]);
+                     __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_DOWN_TILE_N; r++)
+-                        acc[r][t] += xv * fs[r] * fv[r];
++                        acc[r][t] += NATIVE_W2(xv, fs[r], fv[r]);
+                 }
+             }
+         }
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -616,6 +616,20 @@
+ // as the byte-equality cell's in-build reference. MOE_NATIVE_TILE_N=1|2|4 sets
+ // both, read once per process.
+ constexpr int kNativeTileNGateUp = 2;
++// The weight-rounding emulation arm (patch 0063; moe_expert_swiglu.cl
++// NATIVE_W_ROUND): MOE_NATIVE_W_ROUND=f16|bf16, read once per process; unset is
++// the kernels' own arithmetic. Every native generator emits it (the decode
++// helpers are compiled once per program).
++static int native_w_round() {
++    static const int r = [] {
++        const char* v = std::getenv("MOE_NATIVE_W_ROUND");
++        if (v == nullptr) return 0;
++        const std::string s(v);
++        OPENVINO_ASSERT(s == "f16" || s == "bf16", "MOE_NATIVE_W_ROUND must be f16 or bf16; got ", s);
++        return s == "f16" ? 1 : 2;
++    }();
++    return r;
++}
+ constexpr int kNativeTileNDown = 4;
+ static int native_tile_n(int dflt) {
+     static const int n = [] {
+@@ -643,6 +657,7 @@
+         jit.make("NATIVE_TILE_M", kNativeTileM);
+         jit.make("NATIVE_GU_TILE_N", native_tile_n(kNativeTileNGateUp));
+         jit.make("NATIVE_DOWN_TILE_N", native_tile_n(kNativeTileNDown));
++        jit.make("NATIVE_W_ROUND", native_w_round());
+         auto desc = params.typed_desc<moe_3gemm_fused_compressed>();
+         // A gate/up projection is IQ3_XXS (2) or IQ4_XS-in-the-IQ4_NL-layout
+         // (1); Q8_0 is a down format in this checkpoint. Refuse a decode the
+@@ -681,6 +696,7 @@
+         jit.make("NATIVE_TILE_M", kNativeTileM);
+         jit.make("NATIVE_GU_TILE_N", native_tile_n(kNativeTileNGateUp));
+         jit.make("NATIVE_DOWN_TILE_N", native_tile_n(kNativeTileNDown));
++        jit.make("NATIVE_W_ROUND", native_w_round());
+         auto desc = params.typed_desc<moe_3gemm_fused_compressed>();
+         // Native down formats in this checkpoint: IQ4_NL (1; IQ4_XS shares the
+         // layout), IQ3_XXS (2), Q8_0 (3). The .cl's #else branch is IQ4_NL, so

@@ -123,8 +123,9 @@ Two B-operand forms for IQ2_S-packed, both built as arms:
   in f32 and rounded to f16. `code`: d carries 11 bits, (2s+1) up to 5 and the
   grid up to 6 (43). The product rounds by at most 2^-11 relative, for
   **normal d only**. A subnormal d breaks the bound, and the record has met
-  one: a scale in f16's subnormal range, design-fit-levers §4 (the dense u8 lever). The arm
-  asserts or counts subnormal d at fill.
+  one: a scale in f16's subnormal range, design-fit-levers §4 (the dense u8 lever). The
+  emulation arm as built (patch 0063) does not count subnormal weights; form
+  (b), chosen in §6.1a, carries d outside the operand and has no such case.
 - **(b) Exact**: B = f16((2s+1)·grid·sign), with |v| ≤ 31·43 = 1,333 < 2,048,
   so it is exact in f16. d/8 is applied once per 256-k super-block, after a
   16-deep dpas chain, as one fma per accumulator register. This is not
@@ -184,6 +185,104 @@ byte cell cannot gate.
    tiles padded to 1 / 31 / 32 / 33 pairs.
 6. **Rate.** Full-depth prefill at 4096 above 0062's 653.7 t/s. Full-depth
    decode not below 0062's 21.1 / 19.9 (the one-row matrix path, §2.7).
+
+### 6.2a Gate 2, measured before any kernel (2026-09-26)
+
+`measured-here`, A770. Patch 0063's emulation arm, the packed u8
+Qwen3.6-35B-A3B, all-resident, `--no-logits-slice` (chunk 512 at full depth,
+1024 at depth 4), a 4096-token prompt. The instrument is
+`tools/logits_dump_diff.py`. The rows compared are the request's prefill
+records; the load probe's and the post-divergence decode records are excluded.
+
+| arms | depth | KV | per-record mean KL (request) | argmax agree (request) |
+|---|---|---|---|---|
+| unrounded, repeated | 4 | u8 | 0 (dumps byte-identical) | all |
+| unrounded vs f16-rounded | 4 | u8 | 0.94–1.24e-4 | 1015–1023 / 1024 |
+| unrounded vs bf16-rounded | 4 | u8 | 0.71–1.00e-4 | 1018–1020 / 1024 |
+| unrounded vs f16-rounded | 4 | f16 | 0.81–1.27e-4 | 1014–1021 / 1024 |
+| unrounded vs bf16-rounded | 4 | f16 | 0.51–1.04e-4 | 1015–1020 / 1024 |
+| unrounded vs f16-rounded | 40 | u8 | 0.042–0.241 | 465–495 / 512 |
+| unrounded vs bf16-rounded | 40 | u8 | 0.014–0.180 | 467–496 / 512 |
+
+Greedy digest at 4096 tokens: depth 4 `8cccdbac48ed` in all three arms;
+depth 40 `b1a16fbc9d4c` unrounded, `29e9267e1d2d` for both f16 and bf16.
+
+What this settles:
+- **The instrument's red fails on prefill rows.** bf16 is 8× coarser than
+  f16 but reads no farther on the request's records, at either depth. The
+  tool's all-record summary (bf16 worst 0.43 at depth 40) includes load-probe
+  and post-divergence records, and is not used. Only the single-token decode
+  records order (depth 4, u8 KV: f16 3.6–9.1e-6, bf16 8.9–23.7e-6). Two
+  perturbation sizes were tried, no smaller one.
+- **The floor is deterministic** (the repeat is byte-identical).
+- **The floor is not the u8 KV cache**: f16 KV reads the same.
+- **The floor is present inside one forward** (the request's first chunk,
+  past = 0, reads 1.2e-4).
+- The reading consistent with all of it, NOT measured as a mechanism: once a
+  perturbation exceeds the f16 activation rounding, the downstream f16
+  roundings decorrelate. The served distance is then the path's own f16
+  activation noise, about 1e-4 per prefill row at depth 4 and 0.01–0.24 at
+  depth 40 (both arms), and not the size of the cause.
+
+So gate 2 cannot measure the rounding. Revised:
+
+- The served A/B is a **gross-error bound**, at twice the emulation arms'
+  own spread (both arms, per request record):
+  - depth 4: mean KL ≤ 2.6e-4 and argmax ≥ 1004/1024 per record;
+  - depth 40: mean KL ≤ 0.49 and argmax ≥ 418/512 per record.
+- **Its red is a gross mutant**, not bf16: a wrong grid row in the new
+  kernel must exceed the bound. That red is OWED: it runs with the kernel,
+  and until then the gate's failability is asserted, not shown.
+- The numerics of the rounding itself are **gate 1's** (block-level, against
+  the f64 host models) and the **Prüfstand's** (gate 3).
+- That depth 40 moves the greedy digest under any ulp-level change is now
+  known. A digest change is expected and is not, by itself, a failure.
+
+### 6.1a Gate 1's instrument, and the forms, measured (2026-09-26)
+
+`tools/native_kernel_harness.py` runs the plugin's own captured program (via
+`tools/cldump.c`) outside the plugin. It calls the served IQ2_S-packed row
+decoder with f32 sums out, next to a matrix-unit candidate. Both are checked
+against the f64 host models of §6.1, built from gguf-py's IQ2_S
+dequantisation of the same bytes. `measured-here`, A770, 512 rows, gate and
+up; the errors are max over elements of |y − y_ref| / S:
+
+| kernel (pairs) | ms (median of 30) | vs exact W | vs W16 | spill |
+|---|---|---|---|---|
+| served scalar, 0063 unset (32) | — | 4.96e-8 | 4.37e-5 | — |
+| served scalar, `NATIVE_W_ROUND` f16 (32) | — | 4.37e-5 | 4.6e-8 | — |
+| served scalar, bf16 (32) | — | 3.43e-4 | 3.49e-4 | — |
+| served scalar decoder, harness geometry (256) | 0.715–0.72 | 4.96e-8 | 4.37e-5 | — |
+| matrix, form (a), TM 16 (256) | 0.236 | 4.37e-5 | 3.96e-7 | 0 |
+| matrix, form (a), TM 32 (256) | 0.282 | 4.37e-5 | 3.96e-7 | 416 B |
+| matrix, form (a), TM 64 (256) | 0.516 | 4.37e-5 | 3.96e-7 | 4,160 B |
+| matrix, form (b), half2 grid table, TM 16 (256) | 0.293 | **4.48e-8** | 4.37e-5 | 0 |
+| matrix, form (b), half2 grid table, TM 32 (256) | 0.291 | 4.48e-8 | 4.37e-5 | 2,496 B |
+
+What it settles:
+- **The instrument sees the rounding** by three orders of magnitude. Block
+  level can gate what the served logits could not (§6.2a).
+- **Form (b) meets the pre-registered bound** (≤ 2 · 4.96e-8 against exact
+  W). Form (a) fails it, and against W16 it reads 3.96e-7, 8× the scalar's
+  4.96e-8 against W (the cause is not separated: the prototype's
+  accumulation or its rounding).
+- **Form (a)'s error against W16 is the same at every TM** (form (a)'s
+  error against W is the weight rounding and carries no tile-mate signal).
+  That points to rows being independent of their tile-mates; gate 5
+  measures it in the plugin.
+- **Plan change.** Gate/up (IQ2_S-packed, 48.8 % of the window) moves to the
+  matrix unit in form (b), TM 16, for every call size.
+- **Down (IQ3_XXS/IQ4_NL)** has no exact fold. Its per-32 scale would bring
+  back the per-scale drain §2.1 withdrew. So down stays on 0061's scalar row
+  kernel, also for every call size. Each projection's kernel is then
+  independent of the call size, which is what §3 requires.
+- The block's pairs here share one expert: its weights stay in cache, and
+  the served tile reads a different expert each time. `code`: that is 656 KiB
+  of gate/up bytes per expert, 168 MB per 256-expert layer-chunk; at a
+  bandwidth of about 400 GB/s (`paper`) that is about 0.4 ms. The speed-ups
+  in this table are harness against harness. The served scalar decoder runs
+  here in the harness's own launch geometry, and its rate (1.5 TFLOPS)
+  matches the served kernel's 1.74.
 
 ## 7. Pipeline
 

@@ -1640,6 +1640,38 @@ digests. Lowering cells: 81 passed, 1 skipped (the tier50 route keeps the
 hoist). Series 0003–0062 (60 patches) applies byte-identical to the built
 tree; the plugin compiles clean.
 
+## 0063 — native per-expert kernels: a weight-rounding emulation arm (2026-09-26)
+
+A measurement instrument for the matrix-unit route
+(`docs/design-native-dpas-expert-kernel.md` §6.2). The unit takes f16
+weights. `MOE_NATIVE_W_ROUND=f16` rounds each decoded weight — the f32
+product of its factors — to f16 before the multiply, in the tile and row
+decoders the served route runs. `bf16` is the instrument's red. Unset, the
+`NATIVE_W3`/`NATIVE_W2` macros expand to the kernels' own left-to-right
+product.
+
+MEASURED (A770, 2026-09-26):
+- Unset, the output bytes are 0062's: 81 cells pass, and the real-geometry
+  block hash is unchanged (`8fd20d91d867c8c4`). f16 and bf16 each move it.
+- What the served logits read is in the design note §6.2a: a deterministic
+  floor that the rounding does not resolve. The block-level reading (§6.1a,
+  `tools/native_kernel_harness.py`) does resolve it.
+- The rounded arms also reassociate: `x * f16(a*b*c)` against the unset
+  `((x*a)*b)*c`. That is an f32 term of about 2^-24 relative beside the
+  2^-11 rounding. The arms do not count subnormal weights.
+- A `--cache-dir` does not key on this switch. The paged load switches the
+  model cache off before compiling its graph (`backend_ov.cpp`,
+  `ov::cache_dir("")`), so the served arms compiled fresh; a cached path
+  would import the unrounded kernels silently.
+- Unset, the served digest at depth 40 is 0062's (`b1a16fbc9d4c`). The
+  real-geometry block hash (`tools/native_moe_block_ab.cpp`, 1,024 tokens,
+  IQ2_S-packed/IQ3_XXS, 256 experts, seed 2) reads `8fd20d91d867c8c4` on the
+  0063 build unset. The same runner on the 0061 build read the same value;
+  that run's log is operator-local, and this is the first time the value is
+  on the record.
+- Series 0003–0063 (61 patches) applies byte-identical to the built tree; the
+  plugin compiles clean.
+
 ## Hazard: the measurement tree's patch set is applied but UNCOMMITTED
 
 The dev tree the measurement plugin is built from (its path is operator-local)
