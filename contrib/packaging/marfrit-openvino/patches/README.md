@@ -1418,3 +1418,50 @@ The arcint session's working tree also carries per-stage timing accumulators
 20,480 calls were found. They are **not** part of any patch here, and the
 build script resets to the pinned commit and applies only this directory, so a
 dirty measurement tree cannot leak into a package.
+
+## 0053 — the OCL load diagnostics (2026-09-26)
+
+Three prints, no behaviour change: `kernels_cache::build_batch` prints every
+batch's hash, bucket, batch id, kernel count, `options` and entry-point names,
+and prints the same line plus `what()` if that batch's `build_kernels` throws;
+`ocl_kernel_builder::build_kernels` prints `fmt`/`bytes`/`options`/kernel names
+before each program build and grabs `CL_PROGRAM_BUILD_LOG` on failure;
+`ocl_common::rethrow` prints an `err`/`msg` line and a `backtrace()`.
+
+They exist because arcint's packed route (`0052`, `native_dot_iq2s_packed`)
+fails at load on the A770 with `Check 'false' failed` at
+`program_builder.cpp:168`, wrapping `CL_OUT_OF_RESOURCES`. The build *path*
+itself is exonerated by these prints: on a d4packed load all five
+`build_batch` batches and all five `ocl_kernel_builder` programs succeed (no
+`ARCINT_KC EXC`, no `ARCINT_KB FAIL`), so the failure is **not** a kernel
+build. `ARCINT_BT` names it instead:
+
+```
+ARCINT_BT err=-5 msg=[GPU] clEnqueueNDRangeKernel, error code: -5 CL_OUT_OF_RESOURCES
+```
+
+a **kernel launch**, not a compile. The artifact is 3.63 GiB
+(`qwen36-35b-a3b-d4packed-ov`, smaller than the 3.99 GiB re-laid control that
+loads and serves), so artifact fit is not it either. The failing kernel is
+**not yet named** — the backtrace frames are unsymbolized (a stripped Release
+plugin, `addr2line` lands on unrelated std noise). Next step: a `-g` plugin
+or an `nm`-on-the-archives mapping of those offsets.
+
+## Hazard: the measurement tree's patch set is applied but UNCOMMITTED
+
+`/models/ov/ovsrc-dbg` (the dev tree the measurement plugin is built from)
+carries this directory's patch set applied **to the working tree, not
+committed**. `git status` there shows the patched files as modified. So:
+
+**`git checkout -- <file>` in that tree silently reverts an arcint patch.**
+On 2026-09-26 a cleanup checkout of `src/plugins/intel_gpu/src/runtime/ocl/
+ocl_memory.cpp` dropped `0005`'s OTD device-resident-slot lock guard
+(`OPENVINO_ASSERT(!otd_device_slot, ...)`), unnoticed until `git diff --stat`
+was read. Before and after any file-level revert there, run
+
+```
+git -C /models/ov/ovsrc-dbg diff --stat <file>
+```
+
+and re-apply anything lost. Do not `git checkout` a file in that tree without
+checking its diff first; the patch set is the tree's only record of itself.
