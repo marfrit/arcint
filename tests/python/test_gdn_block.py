@@ -600,6 +600,53 @@ def test_the_chunked_stateful_core_is_the_chunked_algebra_across_boundaries():
             f"with itself")
 
 
+def test_the_chunked_served_core_leaves_no_dangling_beam_idx():
+    """LYON beam-free fix, artifact-level. Measured on the A770 (2026-09-26):
+    the chunked artifact was REFUSED with `Model references undeclared
+    parameters: beam_idx` -- the unfused chunked Loop kept its
+    `ReadValue -> Gather(beam_idx)` chain into the paged-attention rewrite,
+    which drops the declaration (`backend_ov.cpp`:2637). The chunked served
+    core must therefore reference `beam_idx` NOWHERE, so the rewrite has
+    nothing to dangle. Red-first: fails if the reference returns.
+
+    Built with the default (beam-free) conv so the `beam_idx` Parameter has no
+    OTHER consumer: any consumer found here is the GDN core's own."""
+    from openvino import opset13 as ovop
+    from q4e import serving_shape as ss
+
+    config = _make_config()
+    ref, _ = _ref_and_pin(config)
+    state = _state_np(ref)
+    beam = ovop.parameter([-1], ov.Type.i32)
+    beam.set_friendly_name("beam_idx")
+
+    def consumers(emitter):
+        # static T + CORE hook only: the default conv carries no beam, so every
+        # consumer found is the core's own, and `beam_idx` can be declared
+        # without the model becoming unregistered either way
+        sinks = []
+        h = ovop.parameter([1, 128, config.hidden_size], ov.Type.f32)
+        a = ovop.parameter([1, 128], ov.Type.f32)
+        o = gdn.emit_gdn(h, a, config, state, 128,
+                         core_emitter=emitter(0, beam, sinks))
+        m = ov.Model([ovop.result(o)], list(sinks), [h, a, beam], "gdn_core")
+        # the consumers of the beam OUTPUT are the ops that take it as input
+        return sorted(i.get_node().get_type_name()
+                      for i in beam.output(0).get_target_inputs())
+
+    c_cons = consumers(ss.stateful_gdn_core_chunked)
+    s_cons = consumers(ss.stateful_gdn_core)
+    print(f"\n[lyon-beam] chunked beam_idx consumers={c_cons}  "
+          f"sequential beam_idx consumers={s_cons}")
+    assert c_cons == [], (
+        f"the chunked served core still references beam_idx via {c_cons}; the "
+        f"unfused Loop leaves that chain alive and the paged-attention rewrite "
+        f"drops the declaration, refusing the artifact")
+    assert s_cons == ["Gather"], (
+        f"the sequential control's beam_idx consumers moved to {s_cons}; the "
+        f"cell can no longer tell the two paths apart and is vacuous")
+
+
 def test_an_unknown_chunk_emission_mode_is_refused():
     """The mode string reaches a comparison, not a silent default. A typo that
     fell through to 'batched' would report the defect as fixed."""

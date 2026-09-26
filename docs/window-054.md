@@ -197,5 +197,15 @@ at the end, not many. **No measurement before the feature exists.**
   a depth-4 chunked artifact was compiled on the A770 and the load **REFUSED**
   it — `Model references undeclared parameters: beam_idx` (`measured-here`;
   the chunked Loop does not fuse, so its `ReadValue → Gather(beam_idx)` chain
-  survives the pass that drops the declaration). Rows 1–3 stay EMPTY; the next
-  step is the beam-free chunked path or a chunked fusion matcher.
+  survives the pass that drops the declaration).
+- 2026-09-26, latest — the **beam-free fix landed**: the chunked core gathers
+  the state with a constant row 0, so no `beam_idx` reference survives the
+  paged-attention rewrite. Red-first cell
+  `test_the_chunked_served_core_leaves_no_dangling_beam_idx` (mutation-verified;
+  chunked consumers `[]`, sequential `['Gather']`). The A770 load check then
+  **advanced past the parameter error** and fails later, at the GPU program
+  build: `CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST` (`measured-here`). The
+  isolated chunked GDN block compiles on GPU.1, so the Loop is fine; the full
+  graph's failure is **not localized** and is the finding. The alternative — a
+  **chunked fusion matcher** — is the larger next change. **Rows 1–3 stay
+  EMPTY (OWED).**

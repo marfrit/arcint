@@ -176,6 +176,39 @@ Loop, or (b) make the chunked path beam-free (the served path is one lane, so a
 constant beam instead of the `beam_idx` parameter). Option (b) is small and is
 the cheaper next step.
 
+## 4c. The beam-free fix, and where the card stops (2026-09-26)
+
+**Landed**: the chunked core is **beam-free** — it gathers the recurrent state
+with a constant row 0 (`op.constant([0])`) instead of the `beam_idx` PARAMETER,
+because the served path is one lane and an unfused chunked Loop must not carry a
+`ReadValue → Gather(beam_idx)` chain into `SDPAToPagedAttention`'s rewrite
+(`backend_ov.cpp`:2637`, which drops the declaration). Red-first cell
+`test_the_chunked_served_core_leaves_no_dangling_beam_idx`
+(`measured-here`): the chunked core's `beam_idx` consumers are `[]`, the
+sequential control's are `['Gather']` — mutation-verified (restoring the
+parameter reference fails the cell). `tests/python/test_gdn_block.py` **14
+passed**.
+
+**The parameter error is GONE** on the A770 (`qwen36-35b-a3b-d4chunked-ov`,
+re-exported after the fix, `measured-here`): no `undeclared parameters`. But the
+full artifact now fails **later**, at the GPU program build:
+
+```
+Check 'false' failed at program_builder.cpp:168: [GPU] ProgramBuilder build failed!
+Exception from .../ocl_memory.cpp:606:
+[GPU] clWaitForEvents, error code: -14 CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST
+```
+
+The **isolated** chunked GDN block compiles on GPU.1 (`measured-here`: a
+128-token `emit_gdn` with the chunked core → `GPU.1 compile OK`; the sequential
+control too), so the Loop itself is fine on the plugin. The failure is in the
+**full** graph, cause **not localized**. So the in-graph chunked route is
+**not viable as emitted** tonight; the alternative the reviewer named — a
+**chunked fusion matcher** — is the larger next change, and per the brief this
+is the **finding**: the beam-free fix landed, the load check advanced past the
+parameter error, and the full-graph build stops with
+`CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST`. LYON-001 rows stay EMPTY.
+
 ## 5. Pipeline for the increment
 
 Recon (done, §1–3) → **this note** → red-first: the cell in §1 (landed) plus a

@@ -1976,7 +1976,18 @@ def stateful_gdn_core_chunked(layer, beam, sinks, chunk=None):
         var = ovutil.Variable(info)
         init = op.broadcast(op.constant(np.array(0.0, np.float32)),
                             i64([1, HV, Dk, Dv]))
-        past = op.gather(op.read_value(init, var), beam, i64(0))
+        # BEAM-FREE (arcint 0.5.4 LYON, 2026-09-26). The token-sequential core
+        # gathers the state with the `beam_idx` PARAMETER, and the fusion
+        # CONSUMES that chain -- so the parameter's declaration and its use
+        # disappear together. An unfused chunked Loop leaves the chain alive,
+        # and `SDPAToPagedAttention` then drops the declaration while the
+        # Gather still references it (`backend_ov.cpp`:2637), refusing the
+        # artifact: "Model references undeclared parameters: beam_idx". The
+        # served path is ONE LANE, so the gather is a constant row 0 -- no
+        # `beam_idx` reference survives to dangle. (`beam` is kept in the
+        # signature for the hook contract and deliberately unused.)
+        past = op.gather(op.read_value(init, var),
+                         op.constant(np.array([0], np.int64)), i64(0))
 
         # ceil(T / chunk) and the pad to a whole chunk, from ShapeOf
         n_tok = op.squeeze(op.gather(op.shape_of(q, output_type="i64"),
