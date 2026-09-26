@@ -135,6 +135,47 @@ is charged by the fit, not by the graph.
   increment's number** (§2); it cannot be met token-sequentially and cannot be
   met statically (the 2.2M-node compile).
 
+## 4b. What landed, and the card finding (2026-09-26, later)
+
+**Landed device-free** (`serving_shape.py`, `tests/python/test_gdn_block.py`):
+
+- `stateful_gdn_core_chunked` — a Loop body advancing **CHUNK tokens per
+  iteration**, reusing the chunked algebra (`gdn.py`'s `perchunk` core),
+  T-dynamic (`ceil(T/CHUNK)` off `ShapeOf`), zero-padding the inputs to a whole
+  chunk and slicing the buffer back to T, so a length that is not a multiple of
+  CHUNK is exact.
+- **Parity, byte-exact**: `|chunked-stateful − chunked| = 0.0000e+00` at
+  T = 128, 192, 224, 256 (`measured-here`, CPU). Against the token-sequential
+  core it is f32-bounded and **NOT** byte-exact (3.1e-07 … 5.7e-07 — different
+  summation order). **That is the finding the reviewer's clause anticipated:
+  byte-exactness against the token-sequential core is impossible**; the
+  byte-exact oracle is the chunked algebra, and it holds.
+- **Growth cell extended**: served sequential 164 nodes, served chunked
+  **206 nodes**, both T-invariant; the `perchunk` control still grows 13,329
+  nodes over 448 tokens. Neither served core is token-count shaped.
+- Config `Q4E_GDN_CORE=sequential|chunked` + `Q4E_GDN_CHUNK`, a typo refused.
+
+**THE MATCHER QUESTION — DECISION MEASURED, AND IT BITES.** Keeping the chunked
+body **in-graph** was chosen (stated in the emitter's docstring). The A770
+load check (`qwen36-35b-a3b-d4chunked-ov`, `Q4E_GDN_CORE=chunked`, GPU.1,
+`measured-here`) **refuses the artifact**:
+
+```
+Check 'unregistered_parameters.str().empty()' failed at src/core/src/model.cpp:264:
+Model references undeclared parameters: opset1::Parameter beam_idx () -> (i32[?])
+```
+
+The chunked Loop is **not** rewritten into `GatedDeltaNet` (the fusion reads a
+seq-1 body), so its `ReadValue → Gather(beam_idx)` chain **survives** into
+`SDPAToPagedAttention`'s rewrite (`backend_ov.cpp`:2637), which drops the
+`beam_idx` declaration. The token-sequential path never hits this because the
+fusion **consumes** that chain. So the cost of the in-graph decision is **not
+just the lost fused kernel — it is a load failure** in the current pipeline.
+The two ways out, both NOT done tonight: (a) extend the fusion to a chunked
+Loop, or (b) make the chunked path beam-free (the served path is one lane, so a
+constant beam instead of the `beam_idx` parameter). Option (b) is small and is
+the cheaper next step.
+
 ## 5. Pipeline for the increment
 
 Recon (done, §1–3) → **this note** → red-first: the cell in §1 (landed) plus a

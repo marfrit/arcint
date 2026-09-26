@@ -190,3 +190,12 @@ at the end, not many. **No measurement before the feature exists.**
 - 2026-09-26 — LYON-001 written as the 0.5.4 acceptance commit; all three rows
   EMPTY. Recon complete; the design note and the red-first cells are the next
   commit. No card touched.
+- 2026-09-26, later — the multi-block stateful core landed device-free
+  (`stateful_gdn_core_chunked`), byte-exact against the chunked algebra at
+  T=128/192/224/256, and the growth cell now covers both served cores
+  (164 sequential / 206 chunked nodes, T-invariant). The **card gate is OWED**:
+  a depth-4 chunked artifact was compiled on the A770 and the load **REFUSED**
+  it — `Model references undeclared parameters: beam_idx` (`measured-here`;
+  the chunked Loop does not fuse, so its `ReadValue → Gather(beam_idx)` chain
+  survives the pass that drops the declaration). Rows 1–3 stay EMPTY; the next
+  step is the beam-free chunked path or a chunked fusion matcher.
