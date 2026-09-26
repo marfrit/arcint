@@ -248,6 +248,110 @@ filler), so it yields no GPU answer. The interaction is therefore localised to
 likely fix remains the **chunked fusion matcher** (or a plugin-side Loop build
 fix), a daylight change.
 
+## 4e. THE A770 FULL-MODEL FIT — VERDICT WITH ARITHMETIC (2026-09-26, device-free)
+
+All inputs are my own measurements (`measured-here`) or the card property; the
+arithmetic is `code`.
+
+| term | bytes | GiB | source |
+|---|---|---|---|
+| d40packed lm `.bin` | 15,623,664,495 | **14.551** | export log |
+| d40packed expert fill | 12,918,456,320 | **12.031** | export census |
+| **dense + lm_head + norms** = lm `.bin` − experts | — | **2.519** | derived |
+| d40f16 (re-laid) lm `.bin` | 19,482,424,091 | 18.144 | export log |
+| embeddings `.bin` | 2,034,237,448 | 1.895 | export log |
+| A770 VRAM (`GPU.1`, `8086:56a0`) | — | **15.111** | `GPU_DEVICE_TOTAL_MEM_SIZE` |
+| drafters (MTP) | — | 0.95 | served load line |
+| activations, chunk 1024 / 512 / 256 | — | 1.700 / 0.850 / 0.425 | the reviewer's 1.7 at ≤1024, scaled with the chunk |
+| margin | — | 0.25 | the fit's own |
+
+### The flags-only fit does NOT close
+
+```
+chunk 1024, MTP on : 12.031 + 2.519 + 1.700 + 0.95 + 0.25 = 17.451  OVER by 2.340
+chunk 1024, MTP off: 12.031 + 2.519 + 1.700 + 0.00 + 0.25 = 16.501  OVER by 1.390
+chunk  512, MTP off: 12.031 + 2.519 + 0.850 + 0.00 + 0.25 = 15.651  OVER by 0.540
+chunk  256, MTP off: 12.031 + 2.519 + 0.425 + 0.00 + 0.25 = 15.226  OVER by 0.115
+```
+
+**Every flag-only combination is over.** The best (`chunk 256` + `--mtp off`)
+misses by **0.115 GiB**, and chunk 256 also spends the prefill rate this
+milestone exists for. So the packed + dense-f16 + MTP-off route does **not**
+reach 15.111 GiB.
+
+### The levers and their kind
+
+- **packed experts (`--native-packed`)** — *configuration, exists*: 12.031 GiB
+  (the downs, ~5.6 GiB of the fill, stay on their IQ3_XXS/IQ4_XS route).
+- **dense-f16 (`--dense-fp16`)** — *configuration, exists*: the 2.519 GiB term
+  is already f16 in the packed artifact.
+- **chunk (`--prefill-chunk N`)** — *configuration, exists*: the activation
+  term, but it costs prefill rate linearly.
+- **MTP (`--mtp off`)** — *configuration, exists*: 0.95 GiB.
+- **margin** — the fit's own 0.25; not a runtime switch.
+- **dense to u8/i4** — ***code*** (does not exist today). Halving the 2.519 GiB
+  term gives **14.391 GiB** (chunk 512) → **FITS by 0.720 GiB**. A quarter
+  (i4) gives 13.966 → fits by 1.145. Neither form exists in the tree: the
+  served int4 artifact is a **different family** (qwen3.5-2b / qwen36-coder
+  b5), and its quantisation is the **u4 group-affine repack** the native work
+  deliberately left (`_compressed_expert`), not a dense-weights u8 form. It is
+  emitter work (a dense u8/i4 Constant form + the plugin's matcher/precision
+  path), not a flag.
+
+### VERDICT
+
+**No.** With today's code, **no configuration fits the full-depth (40-layer)
+model on the A770's 15.111 GiB**, and the binding constraint is **not** the
+card:
+
+- **VRAM ceiling ≈ 38.2 layers** (`(15.111 − 2.519 − 0.850 − 0.25) / 0.3008`),
+  where 0.3008 GiB/layer is the packed expert term (`12.031/40`).
+- **Host-compile ceiling ≈ 37.4 layers**: the compile materialises
+  **2.903×** the artifact's bytes (`measured-here`: 44,292,600 kB RSS for a
+  14.551 GiB artifact), and the usable host is ~40 GiB (44 GiB container minus
+  the 4 GiB watchdog floor) → artifact ≤ **13.78 GiB** → experts ≤ 11.26 GiB →
+  **37.4 layers**.
+
+So the **host compile is the tighter wall**, and a dense-u8 form (the only
+lever that would clear the VRAM side) does **not** clear it: 12.031 + 1.260 +
+0.850 + 0.25 = 14.391 GiB → 41.8 GB of staging → still over ~40 GiB.
+
+**The A770 full-depth answer today is a ceiling, not a fit: ~36–37 of 40
+layers.** Two levers would be needed together — a dense-u8 form (strategy:
+emitter + plugin) **and** the compile-materialisation factor (the ~3× that
+§14.3 named as its own defect).
+
+**Caveat, stated not assumed**: whether the 1.895 GiB embeddings model is
+VRAM-resident is **not established** here (the reviewer's arithmetic omits it;
+the served loads I have do not print it). If it is resident, every ceiling
+above drops by ~6 layers and the verdict gets **worse**, not better.
+
+### Item 5 — the packed route's `CL_OUT_OF_RESOURCES`, bounded
+
+The premise needs one correction: the **d40 packed** artifact did **not** reach
+`CL_OUT_OF_RESOURCES` — it died at **host RAM** during the compile (watchdog
+SIGKILL, §13.2). Only the **d4 packed** (rank-5 chain) reached the program
+build and failed there:
+
+```
+program_builder.cpp:168 -> ocl_memory.cpp:606
+clWaitForEvents, error code: -14 CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST
+```
+
+**Bound:** the **packed d4 artifact is SMALLER than the re-laid d4 artifact
+that compiles** (lm `.bin` 3.63 vs 4.28 GiB; expert fill 1.24 vs 2.42 GiB), and
+both routes carry the **same** tiled-MoE graph shape, the same attention/GDN
+structure and the same activations. What differs is (a) the **Constants** (one
+u8 `[E,out,K/256,80]` block + a f16 `d` `[E,out,K/256,1]` against the re-laid
+form's three tensors) and (b) the **OCL kernel**: patch 0052 adds
+`native_dot_iq2s_packed`, which the re-laid route never builds. A kernel whose
+**build** fails is surfaced by the driver as `CL_OUT_OF_RESOURCES`-class errors.
+So the bound is: **not raw size, not the graph; the prime suspect is the packed
+OCL kernel's build (or the constant-reorder it needs), i.e. a kernel-build
+allocation, not a geometry interaction.** Localizing it needs a plugin-side
+print of the failing kernel id in `kernels_cache::build_all` — a daylight
+instrument, not attempted here. Not fixed, per the brief.
+
 ## 5. Pipeline for the increment
 
 Recon (done, §1–3) → **this note** → red-first: the cell in §1 (landed) plus a

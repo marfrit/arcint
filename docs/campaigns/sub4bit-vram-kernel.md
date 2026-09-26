@@ -1496,3 +1496,31 @@ the same plugin. Cause not localized; the packed d4 rate is OWED. Also
 recorded as its own lever: the compile materialises **≈3× the artifact's
 bytes** (14.55 GiB → 44.3 GB; the re-laid 18.14 GiB → 50.1 GiB), which is what
 blocks the 262144 fit. See design note §14.
+
+[DATED IN PLACE 2026-09-26 (A770 full-depth fit verdict, analysis leg, device-free)]:
+**No configuration fits the full-depth (40-layer) model on the A770's
+15.111 GiB with today's code, and the binding wall is the HOST COMPILE, not the
+card.** Arithmetic from my own measurements: packed experts **12.031 GiB**
+(fill 12,918,456,320 B) + dense/lm-head/norms **2.519 GiB** (lm `.bin`
+15,623,664,495 − experts) + activations 1.700 (chunk 1024) / 0.850 (512) / 0.425
+(256) + drafters 0.95 (MTP) + margin 0.25. Every **flag-only** combination is
+over: chunk 1024/MTP on 17.451 (+2.340), chunk 1024/MTP off 16.501 (+1.390),
+chunk 512/MTP off 15.651 (+0.540), chunk 256/MTP off 15.226 (+0.115). The only
+lever that clears the VRAM side is a **dense u8/i4 form** (2.519 → 1.260 → 14.391
+GiB, FITS by 0.720) — and that is **code**, not a flag: the served int4 artifact
+is a different family and its quantisation is the u4 group-affine repack the
+native work left, not a dense-weights form. Ceilings: VRAM **38.2 layers**;
+host compile **37.4 layers** (the compile materialises **2.903×** the artifact's
+bytes — `measured-here`, 44,292,600 kB RSS for 14.551 GiB; usable host ~40 GiB →
+artifact ≤ 13.78 GiB). The dense-u8 form does not clear the host wall either
+(14.391 GiB → ~41.8 GB staging). **Verdict: a ceiling — ~36–37 of 40 layers.**
+Only a dense-u8 form **and** the §14.3 compile-materialisation factor, together,
+reach full depth. Caveat: whether the 1.895 GiB embeddings model is
+VRAM-resident is NOT established; if it is, the ceilings drop ~6 layers and the
+verdict worsens. Second verdict, bounded not fixed: the **d40 packed** died at
+host RAM (not `CL_OUT_OF_RESOURCES`); only the **d4 packed** reached the program
+build (`clWaitForEvents ... CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST`). The
+packed d4 is SMALLER than the re-laid d4 that compiles (3.63 vs 4.28 GiB lm
+`.bin`), with the same graph shape — so the bound is **not size and not the
+graph: the prime suspect is patch 0052's packed OCL kernel build**, a
+kernel-build allocation. See design-lyon-stateful-prefill §4e.
