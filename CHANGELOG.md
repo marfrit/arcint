@@ -472,6 +472,13 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   (`--emb-device CPU`), no longer faulted in from the mapped file per prompt:
   +0.92 GiB host, 2.5 s at load. Full depth on the A770: prefill 222.9 -> 349.9
   t/s at 4096, max ctx 84,704 -> 112,288, the same digests.
+- **Native per-expert kernels decode several rows per load** (plugin patch
+  0061, DESIGN §7.0.2cm): gate and up together at 2 rows over a tile of 4
+  pairs, and down at 4 rows. The tile-uniform indices stay scalar, and no native
+  kernel spills. Same output bytes by measurement. Full depth on the A770:
+  prefill 349.9 -> 625.7 t/s at 4096, decode 18.4 -> 19.8. Stamp unchanged at
+  `+p19`. `tools/native_moe_block_ab.cpp` repeats the GPU run for timing
+  (`ARCINT_BLOCK_AB_REPEAT`).
 - **Instruments**: `tools/bigalloc.c` (large host allocations by call
   stack, peak-attributed), `tools/native_moe_match_probe.cpp` (the native
   matcher pass alone, device-free), `tools/native_moe_block_ab.cpp` (one

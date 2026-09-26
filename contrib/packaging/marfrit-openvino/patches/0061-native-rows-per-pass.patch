@@ -1,0 +1,367 @@
+# Native per-expert kernels: several output rows per pass, and uniform
+# indices. A subgroup decodes NATIVE_GU_TILE_N (2) rows of gate AND up, or
+# NATIVE_DOWN_TILE_N (4) rows of down (IQ3_XXS, IQ4_NL), per load of the
+# tile's activations; the tile shrinks from 8 to 4 pairs so the gate/up
+# accumulators fit the registers. The tile, pair and row indices go through
+# sub_group_broadcast so they stay scalar. Each (row, token) sum keeps the
+# one-row decoder's products and order; the output bytes equal 0060's by
+# measurement on the A770. MOE_NATIVE_TILE_N=1 restores the row-at-a-time
+# loop (the cell's reference).
+#
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
+@@ -1296,6 +1296,163 @@
+     __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
+         if (t < cnt) out[t] = sub_group_reduce_add(acc[t]);
+ }
++
++// arcint (patch 0061): the tile decoders over several output rows at once
++// (NATIVE_GU_TILE_N for gate/up, NATIVE_DOWN_TILE_N for down). A subgroup's N_BLOCK rows used to run one after another, and every row
++// re-read the tile's NATIVE_TILE_M token vectors from global memory -- twice
++// for gate/up, once per projection. Here one load of x[t][k] feeds every row of
++// the pass, gate and up together. Each (row, token) accumulator takes the same
++// products in the same order as the one-row decoders above, so its bytes are
++// expected to equal theirs -- by measurement, not by construction
++// (-cl-mad-enable, as above). Rows r >= nr are computed on row n0 and dropped.
++// The helpers are compiled once per program, and one program holds the gate/up
++// and the down kernels, so each projection's row count is its own constant
++// and both generators define both.
++#if NATIVE_GU_TILE_N > 1
++inline void native_gu_iq2s_packed_rows(const __global uchar* Wu, const __global half* Su,
++                                       const __global uchar* Wg, const __global half* Sg,
++                                       int n0, int nr, int K, const __global half* x, __private const int* xb,
++                                       int cnt, int id_local,
++                                       __private float (*ou)[NATIVE_TILE_M], __private float (*og)[NATIVE_TILE_M]) {
++    float au[NATIVE_GU_TILE_N][NATIVE_TILE_M], ag[NATIVE_GU_TILE_N][NATIVE_TILE_M];
++    __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_GU_TILE_N; r++)
++        __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) {
++            au[r][t] = 0.0f;
++            ag[r][t] = 0.0f;
++        }
++    const int nblk = K / 256;
++    for (int ib = 0; ib < nblk; ib++) {
++        float du[NATIVE_GU_TILE_N], dg[NATIVE_GU_TILE_N];
++        __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_GU_TILE_N; r++) {
++            const long n = n0 + (r < nr ? r : 0);
++            du[r] = convert_float(Su[n * nblk + ib]);
++            dg[r] = convert_float(Sg[n * nblk + ib]);
++        }
++        for (int ib32 = 0; ib32 < 8; ib32++) {
++            float ulo[NATIVE_GU_TILE_N], uhi[NATIVE_GU_TILE_N], glo[NATIVE_GU_TILE_N], ghi[NATIVE_GU_TILE_N];
++            uchar uqh[NATIVE_GU_TILE_N], gqh[NATIVE_GU_TILE_N];
++            __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_GU_TILE_N; r++) {
++                const long n = n0 + (r < nr ? r : 0);
++                const __global uchar* bu = Wu + (n * nblk + ib) * 80;
++                const __global uchar* bg = Wg + (n * nblk + ib) * 80;
++                const uchar scu = bu[72 + ib32];
++                const uchar scg = bg[72 + ib32];
++                ulo[r] = du[r] * (0.5f + convert_float(scu & 0x0F)) * 0.25f;
++                uhi[r] = du[r] * (0.5f + convert_float(scu >> 4)) * 0.25f;
++                glo[r] = dg[r] * (0.5f + convert_float(scg & 0x0F)) * 0.25f;
++                ghi[r] = dg[r] * (0.5f + convert_float(scg >> 4)) * 0.25f;
++                uqh[r] = bu[64 + ib32];
++                gqh[r] = bg[64 + ib32];
++            }
++            for (int j = id_local; j < 32; j += SUBGROUP_SIZE) {
++                const int l = j >> 3;
++                const int m = j & 7;
++                float wud[NATIVE_GU_TILE_N], wum[NATIVE_GU_TILE_N], wus[NATIVE_GU_TILE_N];
++                float wgd[NATIVE_GU_TILE_N], wgm[NATIVE_GU_TILE_N], wgs[NATIVE_GU_TILE_N];
++                __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_GU_TILE_N; r++) {
++                    const long n = n0 + (r < nr ? r : 0);
++                    const __global uchar* bu = Wu + (n * nblk + ib) * 80;
++                    const __global uchar* bg = Wg + (n * nblk + ib) * 80;
++                    const ushort giu = (ushort)bu[ib32 * 4 + l] | ((ushort)((uqh[r] >> (2 * l)) & 3) << 8);
++                    const ushort gig = (ushort)bg[ib32 * 4 + l] | ((ushort)((gqh[r] >> (2 * l)) & 3) << 8);
++                    wum[r] = convert_float(NATIVE_IQ2S_GRID[giu * 8 + m]);
++                    wgm[r] = convert_float(NATIVE_IQ2S_GRID[gig * 8 + m]);
++                    wus[r] = (bu[32 + ib32 * 4 + l] & NATIVE_IQ2XS_MASK[m]) ? -1.0f : 1.0f;
++                    wgs[r] = (bg[32 + ib32 * 4 + l] & NATIVE_IQ2XS_MASK[m]) ? -1.0f : 1.0f;
++                    wud[r] = (l < 2) ? ulo[r] : uhi[r];
++                    wgd[r] = (l < 2) ? glo[r] : ghi[r];
++                }
++                __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) {
++                    if (t < cnt) {
++                        const float xv = convert_float(x[xb[t] + ib * 256 + ib32 * 32 + j]);
++                        __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_GU_TILE_N; r++) {
++                            au[r][t] += xv * wud[r] * wum[r] * wus[r];
++                            ag[r][t] += xv * wgd[r] * wgm[r] * wgs[r];
++                        }
++                    }
++                }
++            }
++        }
++    }
++    __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_GU_TILE_N; r++)
++        __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
++            if (r < nr && t < cnt) {
++                ou[r][t] = sub_group_reduce_add(au[r][t]);
++                og[r][t] = sub_group_reduce_add(ag[r][t]);
++            }
++}
++#endif  // NATIVE_GU_TILE_N > 1
++
++#if NATIVE_DOWN_TILE_N > 1
++inline void native_dot_iq3xxs_rows(const __global uchar* W, const __global uchar* Z, const __global half* S,
++                                   int n0, int nr, int N, int K, const __global half* x, __private const int* xb,
++                                   int cnt, int id_local, __private float (*out)[NATIVE_TILE_M]) {
++    float acc[NATIVE_DOWN_TILE_N][NATIVE_TILE_M];
++    __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_DOWN_TILE_N; r++)
++        __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) acc[r][t] = 0.0f;
++    for (int g = 0; g < K / 32; g++) {
++        float fs[NATIVE_DOWN_TILE_N];
++        __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_DOWN_TILE_N; r++)
++            fs[r] = convert_float(S[g * N + n0 + (r < nr ? r : 0)]);
++        for (int j = id_local; j < 32; j += SUBGROUP_SIZE) {
++            const int l = j >> 3;
++            const int m = j & 7;
++            float wm[NATIVE_DOWN_TILE_N], ws[NATIVE_DOWN_TILE_N];
++            __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_DOWN_TILE_N; r++) {
++                const int n = n0 + (r < nr ? r : 0);
++                const __global uchar* gridix = W + n * (K / 4) + g * 8;
++                const __global uchar* signix = Z + n * (K / 8) + g * 4;
++                const uchar gi = (m < 4) ? gridix[2 * l] : gridix[2 * l + 1];
++                wm[r] = convert_float(NATIVE_IQ3XXS_GRID[gi * 4 + (m & 3)]);
++                const uchar signs = NATIVE_IQ2XS_SIGNS[signix[l] & 127];
++                ws[r] = (signs & NATIVE_IQ2XS_MASK[m]) ? -1.0f : 1.0f;
++            }
++            __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) {
++                if (t < cnt) {
++                    const float xv = convert_float(x[xb[t] + g * 32 + j]);
++                    __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_DOWN_TILE_N; r++)
++                        acc[r][t] += xv * fs[r] * wm[r] * ws[r];
++                }
++            }
++        }
++    }
++    __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_DOWN_TILE_N; r++)
++        __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
++            if (r < nr && t < cnt) out[r][t] = sub_group_reduce_add(acc[r][t]);
++}
++
++inline void native_dot_iq4nl_rows(const __global uchar* W, const __global half* S, int n0, int nr, int N, int K,
++                                  const __global half* x, __private const int* xb, int cnt, int id_local,
++                                  __private float (*out)[NATIVE_TILE_M]) {
++    float acc[NATIVE_DOWN_TILE_N][NATIVE_TILE_M];
++    __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_DOWN_TILE_N; r++)
++        __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) acc[r][t] = 0.0f;
++    for (int g = 0; g < K / 32; g++) {
++        float fs[NATIVE_DOWN_TILE_N];
++        __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_DOWN_TILE_N; r++)
++            fs[r] = convert_float(S[g * N + n0 + (r < nr ? r : 0)]);
++        for (int j = id_local; j < 32; j += SUBGROUP_SIZE) {
++            float fv[NATIVE_DOWN_TILE_N];
++            __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_DOWN_TILE_N; r++) {
++                const int n = n0 + (r < nr ? r : 0);
++                const uchar byte = W[n * (K / 2) + g * 16 + (j >> 1)];
++                const int code = (j & 1) ? (byte >> 4) : (byte & 0x0F);
++                fv[r] = convert_float(NATIVE_IQ4NL_TABLE[code]);
++            }
++            __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) {
++                if (t < cnt) {
++                    const float xv = convert_float(x[xb[t] + g * 32 + j]);
++                    __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_DOWN_TILE_N; r++)
++                        acc[r][t] += xv * fs[r] * fv[r];
++                }
++            }
++        }
++    }
++    __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_DOWN_TILE_N; r++)
++        __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
++            if (r < nr && t < cnt) out[r][t] = sub_group_reduce_add(acc[r][t]);
++}
++#endif  // NATIVE_DOWN_TILE_N > 1
+ #endif  // ARCINT_NATIVE_DECODE_DEFINED
+ #endif  // NATIVE_GATE_UP_ENABLE || NATIVE_DOWN_ENABLE
+ #endif  // ARCINT_PER_EXPERT_CL_HELPERS_DEFINED
+@@ -1453,7 +1610,10 @@
+     int cnt)
+ {
+     const int id_local = get_sub_group_local_id();
+-    const int n_start = get_global_id(2) * N_BLOCK;
++    // arcint (patch 0061): the same value in every lane of the subgroup (its
++    // lanes span dim 1); broadcast so the compiler keeps it, and what derives
++    // from it, scalar.
++    const int n_start = sub_group_broadcast((int)get_global_id(2), 0) * N_BLOCK;
+ 
+     // per-expert strides of the native slots (bytes; the slot fill writes one
+     // expert's tensor bytes at lru_expert_no * (tensor bytes / num_expert))
+@@ -1489,6 +1649,21 @@
+ 
+ 
+     const int n_end = min(n_start + N_BLOCK, INTERMEDIATE_SIZE);
++#if NATIVE_GU_FORMAT == 5 && NATIVE_GU_TILE_N > 1
++    // arcint (patch 0061): NATIVE_GU_TILE_N rows of gate and up per pass.
++    for (int n = n_start; n < n_end; n += NATIVE_GU_TILE_N) {
++        const int nr = min(NATIVE_GU_TILE_N, n_end - n);
++        float su[NATIVE_GU_TILE_N][NATIVE_TILE_M], sg[NATIVE_GU_TILE_N][NATIVE_TILE_M];
++        native_gu_iq2s_packed_rows((const __global uchar*)up_weight, (const __global half*)up_scale,
++                                   (const __global uchar*)gate_weight, (const __global half*)gate_scale, n, nr,
++                                   HIDDEN_SIZE, (const __global half*)x, xb, cnt, id_local, su, sg);
++        if (id_local == 0) {
++            __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_GU_TILE_N; r++)
++                __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
++                    if (r < nr && t < cnt) y[yb[t] + n + r] = (MOE_DTYPE)(su[r][t] * MOE_GATE_ACT(sg[r][t]));
++        }
++    }
++#else
+     for (int n = n_start; n < n_end; n++) {
+         float su[NATIVE_TILE_M], sg[NATIVE_TILE_M];
+ #if NATIVE_GU_FORMAT == 2
+@@ -1509,6 +1684,7 @@
+                 if (t < cnt) y[yb[t] + n] = (MOE_DTYPE)(su[t] * MOE_GATE_ACT(sg[t]));
+         }
+     }
++#endif  // NATIVE_GU_FORMAT == 5 && NATIVE_GU_TILE_N > 1
+ }
+ 
+ // KERNEL() names the generator's own entry point, so a source carries exactly
+@@ -1529,7 +1705,7 @@
+     int x_base_elem,
+     int y_base_elem)
+ {
+-    const int token_idx = get_global_id(0);
++    const int token_idx = sub_group_broadcast((int)get_global_id(0), 0);  // patch 0061: uniform
+     int xb[NATIVE_TILE_M] = {x_base_elem + token_idx * HIDDEN_SIZE};
+     int yb[NATIVE_TILE_M] = {y_base_elem + token_idx * INTERMEDIATE_SIZE};
+     FUNC_CALL(expert_gate_up_native_body)(gate_weight, gate_scale, gate_zp, up_weight, up_scale, up_zp, x, y, slot_index, xb, yb, 1);
+@@ -1550,7 +1726,7 @@
+     __global MOE_DTYPE*          y,
+     int experts_per_token)
+ {
+-    const int p = get_global_id(0);
++    const int p = sub_group_broadcast((int)get_global_id(0), 0);  // patch 0061: uniform
+     const int flat = pairs[3 * p + 1];
+     int xb[NATIVE_TILE_M] = {(flat / experts_per_token) * HIDDEN_SIZE};
+     int yb[NATIVE_TILE_M] = {flat * INTERMEDIATE_SIZE};
+@@ -1573,7 +1749,7 @@
+     __global MOE_DTYPE*          y,
+     int experts_per_token)
+ {
+-    const __global int* tile = tiles + (2 + 2 * NATIVE_TILE_M) * get_global_id(0);
++    const __global int* tile = tiles + (2 + 2 * NATIVE_TILE_M) * sub_group_broadcast((int)get_global_id(0), 0);  // patch 0061: uniform
+     const int cnt = tile[1];
+     int xb[NATIVE_TILE_M], yb[NATIVE_TILE_M];
+     __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) {
+@@ -1601,7 +1777,10 @@
+     int cnt)
+ {
+     const int id_local = get_sub_group_local_id();
+-    const int n_start = get_global_id(2) * N_BLOCK;
++    // arcint (patch 0061): the same value in every lane of the subgroup (its
++    // lanes span dim 1); broadcast so the compiler keeps it, and what derives
++    // from it, scalar.
++    const int n_start = sub_group_broadcast((int)get_global_id(2), 0) * N_BLOCK;
+ 
+ #if NATIVE_DOWN_FORMAT == 2   // IQ3_XXS: u8 grid indices (K/4) + u8 sign indices (K/8)
+     weight += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE / 4);
+@@ -1631,6 +1810,23 @@
+ 
+ 
+     const int n_end = min(n_start + N_BLOCK, HIDDEN_SIZE);
++#if (NATIVE_DOWN_FORMAT == 2 || NATIVE_DOWN_FORMAT == 1) && NATIVE_DOWN_TILE_N > 1
++    // arcint (patch 0061): NATIVE_DOWN_TILE_N rows per pass (IQ3_XXS, IQ4_NL).
++    for (int n = n_start; n < n_end; n += NATIVE_DOWN_TILE_N) {
++        const int nr = min(NATIVE_DOWN_TILE_N, n_end - n);
++        float acc[NATIVE_DOWN_TILE_N][NATIVE_TILE_M];
++#if NATIVE_DOWN_FORMAT == 2
++        native_dot_iq3xxs_rows((const __global uchar*)weight, (const __global uchar*)zps, (const __global half*)scales, n, nr, HIDDEN_SIZE, INTERMEDIATE_SIZE, (const __global half*)x, xb, cnt, id_local, acc);
++#else
++        native_dot_iq4nl_rows((const __global uchar*)weight, (const __global half*)scales, n, nr, HIDDEN_SIZE, INTERMEDIATE_SIZE, (const __global half*)x, xb, cnt, id_local, acc);
++#endif
++        if (id_local == 0) {
++            __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_DOWN_TILE_N; r++)
++                __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
++                    if (r < nr && t < cnt) y[yb[t] + n + r] = (MOE_DTYPE)(acc[r][t] * convert_float(routing_weights[rwb[t]]));
++        }
++    }
++#else
+     for (int n = n_start; n < n_end; n++) {
+         float acc[NATIVE_TILE_M];
+ #if NATIVE_DOWN_FORMAT == 2
+@@ -1649,6 +1845,7 @@
+                 if (t < cnt) y[yb[t] + n] = (MOE_DTYPE)(acc[t] * convert_float(routing_weights[rwb[t]]));
+         }
+     }
++#endif  // (NATIVE_DOWN_FORMAT == 2 || NATIVE_DOWN_FORMAT == 1) && NATIVE_DOWN_TILE_N > 1
+ }
+ 
+ #if !defined(NATIVE_DISPATCH_KIND) || NATIVE_DISPATCH_KIND == 0
+@@ -1665,7 +1862,7 @@
+     int rw_base_elem,
+     int y_base_elem)
+ {
+-    const int token_idx = get_global_id(0);
++    const int token_idx = sub_group_broadcast((int)get_global_id(0), 0);  // patch 0061: uniform
+     int xb[NATIVE_TILE_M] = {x_base_elem + token_idx * INTERMEDIATE_SIZE};
+     int rwb[NATIVE_TILE_M] = {rw_base_elem + token_idx};
+     int yb[NATIVE_TILE_M] = {y_base_elem + token_idx * HIDDEN_SIZE};
+@@ -1684,7 +1881,7 @@
+     int experts_per_token,
+     int max_topk)
+ {
+-    const int p = get_global_id(0);
++    const int p = sub_group_broadcast((int)get_global_id(0), 0);  // patch 0061: uniform
+     const int flat = pairs[3 * p + 1];
+     int xb[NATIVE_TILE_M] = {flat * INTERMEDIATE_SIZE};
+     int rwb[NATIVE_TILE_M] = {(flat / experts_per_token) * max_topk + pairs[3 * p + 2]};
+@@ -1704,7 +1901,7 @@
+     int experts_per_token,
+     int max_topk)
+ {
+-    const __global int* tile = tiles + (2 + 2 * NATIVE_TILE_M) * get_global_id(0);
++    const __global int* tile = tiles + (2 + 2 * NATIVE_TILE_M) * sub_group_broadcast((int)get_global_id(0), 0);  // patch 0061: uniform
+     const int cnt = tile[1];
+     int xb[NATIVE_TILE_M], rwb[NATIVE_TILE_M], yb[NATIVE_TILE_M];
+     __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) {
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -604,7 +604,29 @@
+     return (std::string(base) == "gate_up" ? gu : dn)[kind];
+ }
+ // Pairs per tile of the grouped kernels; moe_expert_swiglu.cl NATIVE_TILE_M.
+-constexpr int kNativeTileM = 8;
++// 8 in 0060; 4 since 0061, where the row-blocked gate/up fits the registers
++// only at 4 x 2 (NATIVE_GU_TILE_N below).
++constexpr int kNativeTileM = 4;
++// Output rows per pass of the native per-expert kernels (patch 0061), per
++// projection: moe_expert_swiglu.cl NATIVE_GU_TILE_N and NATIVE_DOWN_TILE_N,
++// divisors of N_BLOCK (4). Measured on the A770 (one real-geometry block, 1,024
++// tokens): gate/up at tile 4 x 2 rows (19.3 ms), down at 4 rows; gate/up at
++// 8 x 2 or 16 x 4 spills (313 and 454 ms, against 45.7 ms for the 0060
++// kernel). 1 is the 0060 row-at-a-time loop, kept
++// as the byte-equality cell's in-build reference. MOE_NATIVE_TILE_N=1|2|4 sets
++// both, read once per process.
++constexpr int kNativeTileNGateUp = 2;
++constexpr int kNativeTileNDown = 4;
++static int native_tile_n(int dflt) {
++    static const int n = [] {
++        const char* v = std::getenv("MOE_NATIVE_TILE_N");
++        if (v == nullptr) return 0;
++        const std::string s(v);
++        OPENVINO_ASSERT(s == "1" || s == "2" || s == "4", "MOE_NATIVE_TILE_N must be 1, 2 or 4; got ", s);
++        return std::stoi(s);
++    }();
++    return n != 0 ? n : dflt;
++}
+ 
+ class MoEExpertGateUpNative : public KernelGenerator {
+     int _kind = 0;
+@@ -619,6 +641,8 @@
+         jit.make("NATIVE_GATE_UP_ENABLE", 1);
+         jit.make("NATIVE_DISPATCH_KIND", _kind);
+         jit.make("NATIVE_TILE_M", kNativeTileM);
++        jit.make("NATIVE_GU_TILE_N", native_tile_n(kNativeTileNGateUp));
++        jit.make("NATIVE_DOWN_TILE_N", native_tile_n(kNativeTileNDown));
+         auto desc = params.typed_desc<moe_3gemm_fused_compressed>();
+         // A gate/up projection is IQ3_XXS (2) or IQ4_XS-in-the-IQ4_NL-layout
+         // (1); Q8_0 is a down format in this checkpoint. Refuse a decode the
+@@ -655,6 +679,8 @@
+         jit.make("NATIVE_DOWN_ENABLE", 1);
+         jit.make("NATIVE_DISPATCH_KIND", _kind);
+         jit.make("NATIVE_TILE_M", kNativeTileM);
++        jit.make("NATIVE_GU_TILE_N", native_tile_n(kNativeTileNGateUp));
++        jit.make("NATIVE_DOWN_TILE_N", native_tile_n(kNativeTileNDown));
+         auto desc = params.typed_desc<moe_3gemm_fused_compressed>();
+         // Native down formats in this checkpoint: IQ4_NL (1; IQ4_XS shares the
+         // layout), IQ3_XXS (2), Q8_0 (3). The .cl's #else branch is IQ4_NL, so

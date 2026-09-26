@@ -10133,6 +10133,58 @@ layout by its export, but no load of it has run the new axis. Row 3c (460
 t/s) is not met; the per-expert kernels are now the remaining 71 % of the
 device window.
 
+#### 7.0.2cm The per-expert kernels decode several rows per load: the full-depth prefill goes 349.9 -> 625.7 t/s (2026-09-26)
+
+Campaign: `docs/window-054.md` (LYON row 3c); plugin patch 0061.
+
+**Where the time was.** [measured-here, A770 `GPU.1`] The per-expert kernels
+held 71 % of the 0060 device window (§7.0.2cl's timeline). The prefill was not
+re-profiled after the host terms went; the 0061 timeline below puts them at
+74.4 %. All 40 layers
+run IQ2_S-packed gate/up; down is IQ3_XXS in 37 layers and IQ4_NL in 3 (the
+native matcher's report on the artifact). A real-geometry block (hidden 2048,
+inter 512, 256 experts, top-8, 1,024 tokens, random routing) timed with an
+OpenCL intercept layer, median of 20 repeats: grouped gate/up 45.7 ms, down
+17.5 ms. The first launch after a compile read 60–61 ms; one launch is not a
+kernel's time, and `tools/native_moe_block_ab.cpp` now repeats
+(`ARCINT_BLOCK_AB_REPEAT`). Timing-only mutants split gate/up: without the
+activation loads it read 27.0 ms, without the IQ2_S grid lookup 42.9 ms.
+[code] Each output row re-read its tile's 8 x 2048 activations from global
+memory, gate and up separately.
+
+**What did not work, measured.** Decoding 2 or 4 rows per pass at 8 pairs a
+tile made the served prefill 116.2 and 46.5 t/s (from 349.2). IGC's dump
+showed why: gate/up spilled 5,664 B at 4 rows against 2,304 B at 1, since
+SIMD16 on this card puts every per-lane float in two registers of 128
+([paper]: Xe-HPG GRF, 128 x 32 B; the dump reads `numGRF=128`, SIMD16). The
+2,304 B spill of the shipped 0060 kernel was mostly per-lane copies of
+tile-uniform indices. Taking them through `sub_group_broadcast` removed every
+spill, but the served rate did not move (354.0 t/s). Spill was not the bound.
+
+**What did.** On the block, gate/up with tile 4 x 2 rows reads 19.3 ms, and
+down with 4 rows reads 9.7 ms (8 x 2 spills: 313 ms; 16 x 4: 454 ms). Patch
+0061 ships that pair, with tile 4 and the uniform indices. The helpers are
+compiled once per program, and gate/up and down share one program, so the two
+row counts are separate constants that both generators define.
+[measured-here] Byte equality: row-blocked against row-at-a-time
+(`MOE_NATIVE_TILE_N=1`) in batched and grouped mode, T 1/6/17, three format
+pairs, every hash equal to 0060's. A gate/up reassociation mutant is red. A
+down reassociation mutant stayed green: the cell reads f16 output, and a
+rounding-level down change did not reach it. A gross down mutant is red, so
+the down path does run in the cell. Full depth, all-resident, u8 KV, chunk
+1024: **prefill 625.7 t/s @4096**, decode 20.9 / 19.8, the same digests
+(`5f4625c0bf7c` / `b1a16fbc9d4c`). Depth 4: 3,353 -> 5,826 t/s, the same digests
+(`7dc8d0c580cc` / `8cccdbac48ed`). Cells 81 passed, 1 skipped. Series
+0003–0061 (59 patches) applies to the pin byte-identical to the built tree;
+C++ ladder 617 run, 0 failed. A timeline of the 0061 prefill (traced 621.6
+t/s, window 6.75 s): grouped gate/up 46.9 %, grouped down 27.5 %, the GDN core
+5.8 %, DtoH 5.1 % (the per-layer hidden-state readback of §7.0.2cl, still
+there), dense GEMMs 2.7 %.
+
+The number sits above row 3c's 460 t/s. The row itself stays EMPTY, because
+which model and configuration the LYON rows gate on is an open operator
+question (`docs/window-054.md`).
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

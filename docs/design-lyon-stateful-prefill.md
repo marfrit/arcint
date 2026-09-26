@@ -512,6 +512,10 @@ from 512 to 1024. The CPU embedding table was faulted in cold, 3.8 s per 4096
 tokens, and is now read into host memory at load. Result: **349.9 t/s** at
 4096, the same digests (DESIGN §7.0.2cl). The per-expert kernels are the rest.
 
+Patch 0061 (`measured-here`) makes the per-expert kernels decode several rows
+per load of a tile's activations: **625.7 t/s** at 4096, the same digests
+(DESIGN §7.0.2cm).
+
 ## 5. Pipeline for the increment
 
 Recon (done, §1–3) → **this note** → red-first: the cell in §1 (landed) plus a

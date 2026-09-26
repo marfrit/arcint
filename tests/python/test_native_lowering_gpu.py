@@ -221,8 +221,9 @@ def _run_ab(xml, dev, T, props, extra_env=None):
 @pytest.mark.parametrize("dev", _GPUS)
 @pytest.mark.parametrize("gate_up_fmt,down_fmt", [("IQ2_S_PACKED", "IQ3_XXS"), ("IQ3_XXS", "IQ4_NL"),
                                                   ("IQ4_XS", "Q8_0")])
-# T=17: 34 pairs over _config()'s 4 experts, so one slot holds 9 or more -- a
-# full tile of NATIVE_TILE_M (8) and a split one; T in {1, 6} never fills one.
+# T=17: 34 pairs over _config()'s 4 experts, so one slot holds 9 or more --
+# full tiles of NATIVE_TILE_M and a split one (M = 8 in 0060, 4 since 0061);
+# T in {1, 6} never filled an 8-tile.
 @pytest.mark.parametrize("T", [1, 6, 17])
 @pytest.mark.parametrize("mode", ["batched", "grouped"])
 def test_batched_dispatch_is_bit_identical_to_per_pair(tmp_path, dev, gate_up_fmt, down_fmt, T, mode):
@@ -247,3 +248,40 @@ def test_batched_dispatch_is_bit_identical_to_per_pair(tmp_path, dev, gate_up_fm
           f"band {batched['max_over_band']:.3f}")
     assert batched["got_hash"] and batched["got_hash"] == per_pair["got_hash"]
     assert batched["max_over_band"] <= 1.0
+
+
+@_skip
+@pytest.mark.skipif(not _AB, reason="needs the C++ runner (ARCINT_NATIVE_BLOCK_AB): two GPU runs compared by bytes")
+@pytest.mark.parametrize("dev", _GPUS)
+@pytest.mark.parametrize("gate_up_fmt,down_fmt", [("IQ2_S_PACKED", "IQ3_XXS"), ("IQ3_XXS", "IQ4_NL"),
+                                                  ("IQ4_XS", "Q8_0")])
+@pytest.mark.parametrize("T", [1, 6, 17])
+@pytest.mark.parametrize("mode", ["batched", "grouped"])
+@pytest.mark.parametrize("tile_n", ["default", "2", "4"])
+def test_row_blocked_decode_is_bit_identical_to_row_at_a_time(tmp_path, dev, gate_up_fmt, down_fmt, T, mode, tile_n):
+    """Patch 0061: the native per-expert kernels decode several output rows
+    per pass (IQ2_S-packed gate and up together, IQ3_XXS and IQ4_NL down), so
+    one load of a token's activation feeds every row. "default" is the
+    shipped pair (gate/up 2, down 4); 2 and 4 set both. MOE_NATIVE_TILE_N=1 is
+    the 0060 row-at-a-time loop in the same build, the reference, and the
+    bytes must be equal. The cell reads f16 output: it catches a gate/up
+    reordering, but a rounding-level reordering of the down sum did not move
+    it (the product order there rests on the code). IQ4_XS/Q8_0 has no
+    row-blocked decode and is the control.
+    Measured on the A770 (GPU.1), as the cell above."""
+    arena, cfg = _build(tmp_path, T, gate_up_fmt, down_fmt)
+    xml = str(tmp_path / "moe.xml")
+    props = dict(_ROUTES["resident"], WEIGHTS_PATH=str(tmp_path / "moe.bin"), INFERENCE_PRECISION_HINT="f16")
+    try:
+        env_r = {"MOE_DISPATCH_MODE": mode}
+        if tile_n != "default":
+            env_r["MOE_NATIVE_TILE_N"] = tile_n
+        _, native_r, rows = _run_ab(xml, dev, T, props, env_r)
+        _, native_1, one = _run_ab(xml, dev, T, props, {"MOE_DISPATCH_MODE": mode, "MOE_NATIVE_TILE_N": "1"})
+    finally:
+        arena.close()
+    assert native_r and native_1, "the native pass did not take the block"
+    print(f"\n[rows-{tile_n} {mode}] {dev} {gate_up_fmt}/{down_fmt} T={T}: {rows['got_hash']} vs {one['got_hash']}; "
+          f"band {rows['max_over_band']:.3f}")
+    assert rows["got_hash"] and rows["got_hash"] == one["got_hash"]
+    assert rows["max_over_band"] <= 1.0

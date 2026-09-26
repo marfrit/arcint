@@ -280,4 +280,10 @@ at the end, not many. **No measurement before the feature exists.**
   per chunk; the load now reads it into host memory. Prefill **349.9 t/s** at
   4096 (decode 18.4), the same digests, max ctx 112,288 (DESIGN §7.0.2cl).
   Row 3c (460 t/s) is not met. **Rows 1–3 stay EMPTY.**
+- 2026-09-26, rows-per-pass leg (`measured-here`, A770) — the per-expert
+  kernels re-read the tile's activations for every output row. Patch 0061
+  decodes gate and up together at 2 rows (tile 4) and down at 4 rows:
+  **625.7 t/s** at 4096 (decode 19.8), the same digests (DESIGN §7.0.2cm). The
+  rate is above row 3c's 460 t/s. **Rows 1–3 stay EMPTY**: the row's model and
+  configuration are still the operator's question.
 

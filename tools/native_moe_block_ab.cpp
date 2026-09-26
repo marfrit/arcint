@@ -12,6 +12,14 @@
 //   TYPES <runtime layer type>=<count> ...
 //   DIFF max_abs=<d> max_want=<w> max_over_band=<r> corr=<c>
 //   GOT fnv1a64=<hash of the GPU output bytes>
+//   REPEAT n=<N> ms_mean=<m> ms_min=<m>   (only with ARCINT_BLOCK_AB_REPEAT=N)
+//
+// ARCINT_BLOCK_AB_REPEAT=N runs the GPU request N more times after the
+// checked run, for timing: the first launch after a compile runs before the
+// card has clocked up, so one launch is not a kernel's time (2026-09-26: one
+// block read 60.3 ms where repeats read about 49). Wall time per run is
+// printed; a kernel's own time comes from an OpenCL intercept layer over the
+// repeats.
 //
 // The band is the cell's: 2% of the element plus 1% of its row's RMS.
 //
@@ -19,7 +27,10 @@
 //          -I<ov src>/src/core/include -I<ov src>/src/inference/include -L<runtime lib> -lopenvino
 // Use:   native_moe_block_ab <moe.xml> <GPU.n> <T> <seed> [KEY=VALUE ...]
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <iostream>
 #include <map>
@@ -120,5 +131,17 @@ int main(int argc, char** argv) {
     const double corr = (n * swg - sw * sg) / std::sqrt((n * sww - sw * sw) * (n * sgg - sg * sg));
     std::cout << "DIFF max_abs=" << max_abs << " max_want=" << max_want << " max_over_band=" << max_ratio
               << " corr=" << corr << "\n";
+    if (const char* rep = std::getenv("ARCINT_BLOCK_AB_REPEAT")) {
+        const int reps = std::atoi(rep);
+        double sum = 0, best = 1e300;
+        for (int i = 0; i < reps; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            rq_gpu.infer();
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            sum += ms;
+            best = std::min(best, ms);
+        }
+        if (reps > 0) std::cout << "REPEAT n=" << reps << " ms_mean=" << sum / reps << " ms_min=" << best << "\n";
+    }
     return 0;
 }

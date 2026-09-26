@@ -1570,6 +1570,50 @@ the 0059 build; 0060 changes the batched path too (the tile-of-one body, the
 table write) and the two were not separated. Full depth: prefill 143.9 ->
 222.9 t/s @4096, decode 15.2 -> 18.0, T_boot 95 -> 75 s, the same digests.
 
+## 0061 — native per-expert kernels: several rows per pass, uniform indices (2026-09-26)
+
+The per-expert kernels held 71 % of the 0060 device window (DESIGN §7.0.2cl;
+74.4 % in the 0061 timeline). On one real-geometry block (hidden 2048, inter
+512, 256 experts, top-8, 1,024 tokens, IQ2_S-packed gate/up over IQ3_XXS down),
+the grouped gate/up kernel read 45.7 ms and down 17.5 ms, as the median of 20
+repeats. Timing-only mutants split gate/up's 45.7 ms: without the activation
+loads it read 27.0 ms, without the IQ2_S grid lookup 42.9 ms. Every output row
+re-read the tile's activations from global memory, gate and up separately.
+
+0061 decodes several rows per pass: gate and up together, NATIVE_GU_TILE_N (2)
+rows of each, and NATIVE_DOWN_TILE_N (4) rows of down (IQ3_XXS, IQ4_NL). The
+tile shrinks from 8 pairs to 4. A first form kept 8 pairs and spilled (IGC
+dump: 5,664 B at 4 rows); served full-depth prefill fell to 46.5 t/s at 4 rows
+and 116.2 at 2, against 349.2 at 1. The block grid: gate/up 19.3 ms at 4 x 2,
+313 ms at 8 x 2, 454 ms at 16 x 4. The tile, pair and row indices go through
+`sub_group_broadcast`. The compiler had kept them per lane, and the 0060
+gate/up kernel spilled 2,304 B. Removing that spill alone did not move the
+served rate (354.0 against 349.9 t/s). Every native kernel is now spill-free.
+
+The helpers are compiled once per program, and one program holds gate/up and
+down. So each projection has its own row constant, and both generators define
+both: one shared name would give down the first source's value.
+`MOE_NATIVE_TILE_N=1` restores the row-at-a-time loop; 2 or 4 sets both.
+
+MEASURED (A770): the lowering cell's block gives the same output bytes with row
+blocking (default, 2 and 4) as with 1. That holds in batched and grouped mode,
+at T 1, 6 and 17, and every hash equals 0060's. A mutant reassociating the
+gate/up product (`x * (dd * mag) * sign`) is red at T 6 and 17 (8 cases). The
+same reassociation in the down decoders stayed GREEN: the cell reads the
+block's f16 output, and a rounding-level change in the down sum did not move
+it. A gross down mutant (sign dropped, IQ4_NL halved) is red on both formats,
+so the down path does run in the cell. The real-geometry block: gate/up 45.7
+-> 19.3 ms, down 17.5 -> 9.7 ms, same hash. Depth 4: prefill 3,353 -> 5,826
+t/s @4096, the same digests. Full depth: prefill **349.9 -> 625.7 t/s**
+@4096, decode 19.2 / 18.4 -> 20.9 / 19.8, the same digests. The lowering cells:
+81 passed, 1 skipped. MEASURED (2026-09-26): the series 0003–0061 (59 patches)
+applies on the pinned tree, byte-identical to the built one; the plugin
+compiles clean; C++ ladder 617 run, 0 failed. The `r >= nr` tail (rows computed
+on n0 and dropped) is correct by reading (`code`) and never exercised: N_BLOCK
+4 is a multiple of every row count and every measured projection size is a
+multiple of 4. `MOE_NATIVE_TILE_N=4` (gate/up 4 x 4) is run by the cell for
+bytes only, never timed.
+
 ## Hazard: the measurement tree's patch set is applied but UNCOMMITTED
 
 The dev tree the measurement plugin is built from (its path is operator-local)
