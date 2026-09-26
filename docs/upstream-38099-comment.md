@@ -52,5 +52,7 @@ Draft follow-up comment, to be appended to the issue:
     bit-identically across repeats, and the defect remains Xe2-specific. No
     numbers change.
 
-STATUS: **NOT POSTED.** Publishing an upstream comment is the operator's call;
-the text is prepared here so the correction is not silently skipped.
+STATUS: **POSTED 2026-09-26** —
+<https://github.com/openvinotoolkit/openvino/issues/38099#issuecomment-5843016598>
+(operator decision 2026-09-26). The draft above is what was posted, verbatim;
+no numbers change and the observation stands as recorded.
