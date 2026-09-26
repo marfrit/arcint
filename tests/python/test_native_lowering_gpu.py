@@ -84,18 +84,18 @@ class _RandomAffineFiller:
         return pack_u4(codes), pack_u4(zp), sc
 
 
-def _config():
+def _config(hidden_size=512):
     from transformers.models.qwen4_exp import configuration_qwen4_exp as pin_cfg
     return pin_cfg.Qwen4ExpTextConfig(
-        hidden_size=512, num_hidden_layers=1, num_experts=4, num_experts_per_tok=2,
+        hidden_size=hidden_size, num_hidden_layers=1, num_experts=4, num_experts_per_tok=2,
         norm_topk_prob=True, moe_intermediate_size=256, shared_expert_intermediate_size=64,
         hidden_act="silu", hc_count=4, hc_lowrank=8, rms_norm_eps=1e-6,
         layer_types=["linear_attention"], vocab_size=257, eos_token_id=0, pad_token_id=0,
     )
 
 
-def _build(tmp_path, T, gate_up_fmt, down_fmt):
-    cfg = _config()
+def _build(tmp_path, T, gate_up_fmt, down_fmt, hidden_size=512):
+    cfg = _config(hidden_size)
     H, I, E, Is = cfg.hidden_size, cfg.moe_intermediate_size, cfg.num_experts, cfg.shared_expert_intermediate_size
     rng = np.random.default_rng(1)
     arena = ss.SparseArena(path=str(tmp_path / "arena.bin"))
@@ -202,6 +202,7 @@ def _run_ab(xml, dev, T, props, extra_env=None):
     moe_typed = native_nodes = 0
     st = {}
     got_hash = None
+    st_head = None
     for ln in out.splitlines():
         f = ln.split()
         kv = dict(x.split("=") for x in f[1:] if "=" in x)
@@ -211,8 +212,11 @@ def _run_ab(xml, dev, T, props, extra_env=None):
             st = {k: float(v) for k, v in kv.items()}
         elif f and f[0] == "GOT":
             got_hash = kv["fnv1a64"]
+        elif f and f[0] == "HEAD":
+            st_head = kv["fnv1a64"]
     assert st, out
     st["got_hash"] = got_hash
+    st["head_hash"] = st_head
     return moe_typed, native_nodes, st
 
 
@@ -285,3 +289,40 @@ def test_row_blocked_decode_is_bit_identical_to_row_at_a_time(tmp_path, dev, gat
           f"band {rows['max_over_band']:.3f}")
     assert rows["got_hash"] and rows["got_hash"] == one["got_hash"]
     assert rows["max_over_band"] <= 1.0
+
+
+@_skip
+@pytest.mark.skipif(not _AB, reason="needs the C++ runner (ARCINT_NATIVE_BLOCK_AB): GPU runs compared by bytes")
+@pytest.mark.parametrize("dev", _GPUS)
+@pytest.mark.parametrize("gate_up_fmt,down_fmt", [("IQ2_S_PACKED", "IQ3_XXS"), ("IQ3_XXS", "IQ4_NL")])
+@pytest.mark.parametrize("mode", ["batched", "grouped"])
+@pytest.mark.parametrize("hidden", [512, 2048])
+def test_a_tokens_bytes_do_not_depend_on_its_call(tmp_path, dev, gate_up_fmt, down_fmt, mode, hidden):
+    """Patch 0064: IQ2_S-packed gate/up runs on the matrix unit in tiles of up
+    to 16 pairs of one expert, for every call size. A token's output must not
+    depend on which other tokens share its call -- its tile-mates, its row in
+    the tile, the call's size -- or the served greedy output would depend on
+    how a prompt was chunked or cached (DESIGN §3's cold/warm invariant). The
+    runner draws the input rows in order from one stream, so token 0 is the
+    same at every T: its output bytes at T = 1 (alone), 17 and 40 (in tiles
+    with others, 40 filling a 16-tile over the cell's 4 experts) must be equal.
+    IQ3_XXS/IQ4_NL keeps the scalar kernels (the control). hidden 2048 is the
+    35B's eight 256-value blocks per row: at 512 (two) a reversed block order
+    in the one-pair kernel did not reach the f16 bytes and stayed green.
+    Measured on the A770 (GPU.1); the B60 differs run to run on its own
+    (DESIGN 7.0.2cb)."""
+    heads = {}
+    for T in (1, 17, 40):
+        (tmp_path / f"T{T}").mkdir()
+        arena, _ = _build(tmp_path / f"T{T}", T, gate_up_fmt, down_fmt, hidden)
+        xml = str(tmp_path / f"T{T}" / "moe.xml")
+        props = dict(_ROUTES["resident"], WEIGHTS_PATH=str(tmp_path / f"T{T}" / "moe.bin"),
+                     INFERENCE_PRECISION_HINT="f16")
+        try:
+            _, native, st = _run_ab(xml, dev, T, props, {"MOE_DISPATCH_MODE": mode, "ARCINT_BLOCK_AB_HASH_ROWS": "1"})
+        finally:
+            arena.close()
+        assert native, "the native pass did not take the block"
+        heads[T] = st["head_hash"]
+    print(f"\n[call-independence {mode} h{hidden}] {dev} {gate_up_fmt}/{down_fmt}: token 0 at T=1/17/40: {heads}")
+    assert heads[1] and heads[1] == heads[17] == heads[40]

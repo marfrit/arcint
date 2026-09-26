@@ -21,7 +21,8 @@ without a plugin rebuild.
 
 With --dpas <file.cl> the file is appended after the served decoders and its
 kernel `h_dpas_gu` (same arguments as h_scalar_gu; local size (1, 64, 1), one
-work-group per 32-pair tile and 64 columns) runs as arm "dpas", checked
+work-group per tile of --dpas-tm pairs, 16 as shipped, and 64 columns; the
+m1k arm's 64 work-items are 8 subgroups, one per 256-value block of K = 2048) runs as arm "dpas", checked
 against the same models. --repeat N times every kernel with profiling events,
 median of N after one warm launch.
 
@@ -46,6 +47,9 @@ HARNESS = r"""
 // work-group row per (pair tile, row pair); the tile is TM pairs of x rows.
 #define H_TM 4
 #define H_TN 2
+#ifndef H_TFILL
+#  define H_TFILL H_TM
+#endif
 __attribute__((intel_reqd_sub_group_size(16)))
 __kernel void h_scalar_gu(const __global uchar* gw, const __global half* gs,
                           const __global uchar* uw, const __global half* us,
@@ -54,17 +58,17 @@ __kernel void h_scalar_gu(const __global uchar* gw, const __global half* gs,
     const int tile = sub_group_broadcast((int)get_global_id(0), 0);
     const int n0 = sub_group_broadcast((int)get_global_id(2), 0) * H_TN;
     const int lane = get_sub_group_local_id();
-    const int cnt = min(H_TM, pairs - tile * H_TM);
+    const int cnt = min(H_TFILL, pairs - tile * H_TFILL);
     int xb[H_TM];
-    for (int t = 0; t < H_TM; t++) xb[t] = (tile * H_TM + min(t, cnt - 1)) * HARNESS_K;
+    for (int t = 0; t < H_TM; t++) xb[t] = (tile * H_TFILL + min(t, cnt - 1)) * HARNESS_K;
     float su[H_TN][H_TM], sg[H_TN][H_TM];
     native_gu_iq2s_packed_rows(uw, us, gw, gs, n0, H_TN, HARNESS_K, x, xb, cnt, lane, su, sg);
     if (lane == 0)
         for (int r = 0; r < H_TN; r++)
             for (int t = 0; t < H_TM; t++)
                 if (t < cnt) {
-                    og[(tile * H_TM + t) * n_rows + n0 + r] = sg[r][t];
-                    ou[(tile * H_TM + t) * n_rows + n0 + r] = su[r][t];
+                    og[(tile * H_TFILL + t) * n_rows + n0 + r] = sg[r][t];
+                    ou[(tile * H_TFILL + t) * n_rows + n0 + r] = su[r][t];
                 }
 }
 """
@@ -108,9 +112,13 @@ def main():
     ap.add_argument("--arms", default="0,1,2")
     ap.add_argument("--dpas", default="")
     ap.add_argument("--dpas-defs", default="")
-    ap.add_argument("--dpas-tm", type=int, default=32)
+    ap.add_argument("--dpas-tm", type=int, default=16)  # the shipped kNativeDpasTm
     ap.add_argument("--dpas-wg", type=int, default=64)
     ap.add_argument("--repeat", type=int, default=0)
+    ap.add_argument("--scalar-tfill", type=int, default=4, help="pairs per scalar tile (served decode: 1)")
+    ap.add_argument("--m1", action="store_true", help="also run the candidate's one-pair kernel h_dpas_gu_m1")
+    ap.add_argument("--m1k", action="store_true", help="also run its K-split one-pair kernel h_dpas_gu_m1k")
+    ap.add_argument("--m1k2", action="store_true", help="also run its K- and projection-split kernel h_dpas_gu_m1k2")
     args = ap.parse_args()
 
     dev = [d for p in cl.get_platforms() for d in p.get_devices() if args.device in d.name]
@@ -149,33 +157,48 @@ def main():
             ms.append((ev.profile.end - ev.profile.start) * 1e-6)
         return f"  ms median {np.median(ms):.3f} min {min(ms):.3f}" if ms else ""
 
-    arms = [a for a in args.arms.split(",") if a] + (["dpas"] if args.dpas else [])
+    outs = {}
+    arms = [a for a in args.arms.split(",") if a] + (["dpas"] if args.dpas else []) + (["m1"] if args.m1 else []) + (["m1k"] if args.m1k else []) + (["m1k2"] if args.m1k2 else [])
     for arm in arms:
-        w_round = 0 if arm == "dpas" else int(arm)
+        w_round = 0 if arm in ("dpas", "m1", "m1k", "m1k2") else int(arm)
         src, n_sub = re.subn(r"#define NATIVE_W_ROUND \d", f"#define NATIVE_W_ROUND {w_round}", base)
         assert n_sub or w_round == 0, "no NATIVE_W_ROUND in the source (a pre-0063 capture): the arms would be equal"
-        src += f"\n#define HARNESS_K {K}\n" + HARNESS
-        if arm == "dpas":
+        src += f"\n#define HARNESS_K {K}\n#define H_TFILL {args.scalar_tfill}\n" + HARNESS
+        if arm in ("dpas", "m1", "m1k", "m1k2"):
             src += "\n#define NATIVE_W_FORM(a, b, c) ((a) * (b) * (c))\n" + grid_h2(base) + open(args.dpas).read()
         prg = cl.Program(ctx, src).build(options="-cl-mad-enable -cl-std=CL3.0 " + args.dpas_defs)
-        if arm == "dpas":
+        if arm == "m1k2":
+            t = timed(lambda: prg.h_dpas_gu_m1k2(q, (pairs, n_rows // 8 * 128, 1), (1, 128, 1), *bufs,
+                                                 np.int32(pairs), np.int32(n_rows), og_b, ou_b))
+        elif arm == "m1k":
+            t = timed(lambda: prg.h_dpas_gu_m1k(q, (pairs, n_rows // 8 * 64, 1), (1, 64, 1), *bufs,
+                                                np.int32(pairs), np.int32(n_rows), og_b, ou_b))
+        elif arm == "m1":
+            t = timed(lambda: prg.h_dpas_gu_m1(q, (pairs, n_rows, 1), (1, args.dpas_wg, 1), *bufs,
+                                               np.int32(pairs), np.int32(n_rows), og_b, ou_b))
+        elif arm == "dpas":
             tiles = (pairs + args.dpas_tm - 1) // args.dpas_tm
             t = timed(lambda: prg.h_dpas_gu(q, (tiles, n_rows, 1), (1, args.dpas_wg, 1), *bufs,
                                             np.int32(pairs), np.int32(n_rows), og_b, ou_b))
         else:
-            tiles = (pairs + 3) // 4
+            tiles = (pairs + args.scalar_tfill - 1) // args.scalar_tfill
             t = timed(lambda: prg.h_scalar_gu(q, (tiles, 16, n_rows // 2), (1, 16, 1), *bufs,
                                               np.int32(pairs), np.int32(n_rows), og_b, ou_b))
         print(f"ARM {arm}{t}")
         cl.enqueue_copy(q, og, og_b)
         cl.enqueue_copy(q, ou, ou_b)
         q.finish()
+        outs[arm] = (og.copy(), ou.copy())
         for name, y in (("gate", og), ("up", ou)):
             yw, yw16, s = ref[name]
             e_w = np.abs(y - yw) / s
             e_w16 = np.abs(y - yw16) / s
             print(f"ARM {arm} {name}: max|y-y_W|/S {e_w.max():.3e}  max|y-y_W16|/S {e_w16.max():.3e}  "
                   f"median|y-y_W|/S {np.median(e_w):.3e}")
+    for other in ("m1", "m1k", "m1k2"):
+        if "dpas" in outs and other in outs:
+            same = all(np.array_equal(outs["dpas"][i].view(np.uint32), outs[other][i].view(np.uint32)) for i in (0, 1))
+            print(f"{other.upper()} vs tiled: {'BYTE-IDENTICAL' if same else 'DIFFERENT'}")
 
 
 if __name__ == "__main__":

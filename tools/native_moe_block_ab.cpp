@@ -13,6 +13,12 @@
 //   DIFF max_abs=<d> max_want=<w> max_over_band=<r> corr=<c>
 //   GOT fnv1a64=<hash of the GPU output bytes>
 //   REPEAT n=<N> ms_mean=<m> ms_min=<m>   (only with ARCINT_BLOCK_AB_REPEAT=N)
+//   HEAD rows=<k> fnv1a64=<hash of the first k output rows> (ARCINT_BLOCK_AB_HASH_ROWS=k)
+//
+// The input rows are drawn in order from one seeded stream, so row 0 is the
+// same at every T: the first rows' hash at T = 1 against T = 17 asks whether a
+// token's output bytes depend on the other tokens of its call (the matrix-unit
+// kernel's tile-mates, docs/design-native-dpas-expert-kernel.md gate 5).
 //
 // ARCINT_BLOCK_AB_REPEAT=N runs the GPU request N more times after the
 // checked run, for timing: the first launch after a compile runs before the
@@ -113,6 +119,13 @@ int main(int argc, char** argv) {
         const auto* b = static_cast<const unsigned char*>(got_t.data());
         for (size_t i = 0; i < got_t.get_byte_size(); ++i) h = (h ^ b[i]) * 1099511628211ull;
         std::cout << "GOT fnv1a64=" << std::hex << h << std::dec << "\n";
+        if (const char* hr = std::getenv("ARCINT_BLOCK_AB_HASH_ROWS")) {
+            const size_t k = std::min<size_t>(std::stoul(hr), T);
+            const size_t row_bytes = got_t.get_byte_size() / T;
+            uint64_t hh = 1469598103934665603ull;
+            for (size_t i = 0; i < k * row_bytes; ++i) hh = (hh ^ b[i]) * 1099511628211ull;
+            std::cout << "HEAD rows=" << k << " fnv1a64=" << std::hex << hh << std::dec << "\n";
+        }
     }
     const size_t row = want.get_shape().back();
     double max_abs = 0, max_want = 0, max_ratio = 0, sw = 0, sg = 0, sww = 0, sgg = 0, swg = 0;

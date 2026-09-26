@@ -284,6 +284,39 @@ What it settles:
   here in the harness's own launch geometry, and its rate (1.5 TFLOPS)
   matches the served kernel's 1.74.
 
+### 6.3 Outcome (2026-09-26)
+
+`measured-here`, A770, patch 0064, full depth unless named:
+
+| gate | result |
+|---|---|
+| 1 block numerics | form (b): 4.48e-8 of S (bound ≤ 9.9e-8); form (a) red at 4.37e-5 |
+| 2 served logits | depth 4: KL 4.0–7.8e-5, argmax ≥ 1015/1024; depth 40: KL 0.016–0.206, argmax ≥ 474/512; the gather mutant 0.47–0.72, 233–294/1024 (red) |
+| 3 Prüfstand | 10/10 (0062 in the same window: 10/10; the greedy answers differ, 663 and 529 tokens) |
+| 4 equivalence | all checks passed at full depth: warm = cold (hit 81.7 %), a restored continuation = cold, greedy repeat identical, speculative decoding deterministic; chunked vs unchunked differs (reported, not gated); stateful and MTP sections skipped |
+| 5 position independence | token 0 identical at T = 1 / 17 / 40, batched and grouped, at hidden 512 and 2048; the tiled gather mutant red at T = 40; a one-pair block-order mutant red at hidden 2048 (green at 512) |
+| 6 rate | prefill 952.1 t/s @4096 (0062: 653.7); decode within the spread of four interleaved runs each, the means 2.8 % / 0.9 % below |
+
+Changes against §4, all measured:
+- **TM 16**: at 32 the gate/up accumulators spill.
+- **8 subgroups** per work-group for prefill.
+- **The one-pair decode kernel with K split across subgroups.** Served
+  decode read 17.5 / 15.0 t/s with the tiled kernel on single-pair tiles,
+  and 19.5 / 18.2 with a one-pair kernel without the split, against 0062's
+  21.1 / 19.9 in the same session. With the split it reads within the spread
+  (the table).
+- **Byte identity.** The prototype's three forms (tiled, one-pair, one-pair
+  K-split) are bitwise identical at f32 in the harness. The served two
+  (tiled, K-split one-pair) are byte-identical at their f16 output in the
+  cell at hidden 512 and 2048. A block-order mutant in the served one-pair
+  kernel is red at 2048.
+- The first build did not run the kernel: the impl's `clone()` copies only
+  listed fields (0012's lesson, again).
+- Provenance: the harness figures (4.48e-8, the byte identity of the
+  one-pair forms) are the prototype's (`--dpas` file), whose kernels are the
+  patch's by construction. The served kernel is exercised by the lowering and
+  call-independence cells.
+
 ## 7. Pipeline
 
 Recon (this note) → review (done, applied) → the emulation arm and gate 1's

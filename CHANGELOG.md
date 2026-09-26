@@ -491,6 +491,12 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   §6.2a). Stamp unchanged at `+p19`. `tools/native_kernel_harness.py` runs
   the plugin's captured decoders outside the plugin, in f32, against f64
   models of the exact and f16-rounded weights (§6.1a).
+- **IQ2_S-packed gate/up on the matrix unit** (plugin patch 0064, DESIGN
+  §7.0.2co): exact operands ((2s+1)·grid·sign in f16, d/8 per 256-value
+  chain), on Xe-HPG; one route for every call size, with a K-split one-pair kernel for
+  decode; down stays scalar. Full depth on the A770: prefill 653.7 -> 952.1
+  t/s at 4096; decode means 0.9–2.8 % below 0062, inside the run-to-run spread, clock confounded. `MOE_NATIVE_GU=scalar`
+  restores 0061's gate/up. Stamp unchanged at `+p19`.
 - **Instruments**: `tools/bigalloc.c` (large host allocations by call
   stack, peak-attributed), `tools/native_moe_match_probe.cpp` (the native
   matcher pass alone, device-free), `tools/native_moe_block_ab.cpp` (one

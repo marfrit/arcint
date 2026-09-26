@@ -291,4 +291,8 @@ at the end, not many. **No measurement before the feature exists.**
   tier readback). Patch 0062 skips it when no expert can miss: **653.7 t/s**
   at 4096 (decode 19.9), the same digests (DESIGN §7.0.2cn). **Rows 1–3 stay
   EMPTY.**
+- 2026-09-26, matrix-unit leg (`measured-here`, A770) — IQ2_S-packed gate/up
+  now runs on the matrix unit with exact operands, for every call size
+  (patch 0064, DESIGN §7.0.2co): **952.1 t/s** at 4096, the 4096 digest
+  unchanged, decode means 0.9–2.8 % below 0062 (inside the spread, clock confounded). **Rows 1–3 stay EMPTY.**
 

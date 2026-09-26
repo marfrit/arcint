@@ -10209,6 +10209,65 @@ run on the vector units, not the matrix engines. [code] OTD_PERF on the
 served route changes signature: `avg_cpu_x_*` read 0 and `avg_cpu_topk_id_us`
 is the blocking topk read alone, as under NOHOIST.
 
+#### 7.0.2co IQ2_S-packed gate/up on the matrix unit, exact: the full-depth prefill goes 653.7 -> 952.1 t/s (2026-09-26)
+
+Campaign: `docs/window-054.md` (LYON row 3c); design
+`docs/design-native-dpas-expert-kernel.md` (§6.1a, §6.2a, §6.3); plugin patches
+0063 (instrument) and 0064.
+
+**The lever.** [measured-here, A770 `GPU.1`] After 0062, the per-expert
+kernels held 77.5 % of the full-depth prefill window, and gate/up ran about
+1.7 TFLOPS on the vector units. [code] Arcint's own K-quant kernel
+(0021–0028) had shown the matrix path on this card; its record set the
+constraints: decode to f16 and chain the multiplies, stage A in local memory
+on Xe-HPG, compile-time bounds, subgroup 8.
+
+**The numerics, and what the served logits could not tell.** [measured-here]
+- A weight-rounding emulation arm (0063) moved the served logits by the
+  path's own floor. Prefill rows read about 1e-4 at depth 4 and up to 0.24 at
+  depth 40, bf16 no farther than f16, and f16 KV the same as u8. The floor is
+  deterministic. Its mechanism is NOT measured.
+- The kernel harness (`tools/native_kernel_harness.py`) runs the plugin's own
+  decoders in f32 against f64 models, and it resolves the rounding by three
+  orders of magnitude.
+- [code] The shipped form avoids rounding entirely: B = (2s + 1) · grid ·
+  sign is an integer of magnitude at most 1,333, exact in f16, and d/8 scales
+  each 256-value chain once.
+- [measured-here] Its error is 4.48e-8 of Σ|x·w|, the scalar kernel's own
+  level. That was measured on the harness prototype, whose kernel the patch
+  transcribes.
+
+**The route.** [code] The cold/warm invariant (§3.4) forbids a matrix kernel
+for large calls beside a scalar one for small calls. Their bytes differ, and a
+token's bytes would then depend on how its prompt was chunked or cached. So
+on Xe-HPG (the A770; the B60 keeps 0061's scalar gate/up) IQ2_S-packed
+gate/up runs on the matrix unit for every call size:
+- tiles of 16 pairs for calls of 64 or more;
+- for smaller calls, one pair per work-group with K split across subgroups,
+  in the tiled kernel's chain order.
+Down stays scalar for every call size.
+[measured-here] Row independence holds: a token's bytes are identical alone,
+at T = 17 and at T = 40. An A-gather-off-by-one mutant in the tiled kernel is
+red at T = 40. A block-order mutant in the one-pair kernel is red at hidden
+2048 (the 35B's eight blocks per row) and green at 512, where two blocks did
+not reach the f16 output. The cell runs at both widths.
+
+**The numbers.** [measured-here, full depth, all-resident, u8 KV, chunk 1024]
+- **Prefill 952.1 t/s @4096** (653.7 on 0062).
+- Greedy digest at 4096 unchanged (`b1a16fbc9d4c`); at depth 1 it moved.
+- Served logits against 0063 unset stay inside the bounds pre-registered in
+  the design note (depth 4: mean KL ≤ 7.8e-5 per request record).
+- Decode: within 0062's run-to-run spread over four interleaved runs each;
+  the means are 2.8 % (depth 1) and 0.9 % (depth 4096) below.
+- The decode-step timeline puts the matrix gate/up at 92.8 against 120.0 µs,
+  and unchanged kernels slower. The whole-run mean clock read 1,650 against
+  1,902 MHz; the cause is not isolated.
+- Gate 4, the equivalence suite (`tests/equivalence/run.sh`) at full depth: all checks passed. Two greedy runs byte-identical; the logits slice leaves the answer; warm cache byte-identical to cold (hit 192 tokens, 81.7 %), and a restored continuation matches a cold run; speculative decoding deterministic and copy-exact. Chunked prefill differs from unchunked, which the suite reports but does not gate. Stateful vs paged is skipped (the serving shape is paged only), and so is MTP (no head).
+- Gate 3, the Prüfstand (the Lua CSV task, greedy, thinking off, the full-depth artifact): **10/10** on 0064, and 10/10 on 0062 in the same window. The answers differ (663 against 529 tokens), as a changed summation order can make them. Decode while answering: 20.2 against 20.8 t/s (`measured-here`).
+
+The prefill is above row 3c's 460 t/s; the row stays EMPTY (the operator's
+model question).
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

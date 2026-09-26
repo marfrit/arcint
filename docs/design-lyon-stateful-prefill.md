@@ -516,6 +516,11 @@ Patch 0061 (`measured-here`) makes the per-expert kernels decode several rows
 per load of a tile's activations: **625.7 t/s** at 4096, the same digests
 (DESIGN §7.0.2cm).
 
+Patches 0062 and 0064 (`measured-here`): 0062 drops the speculative
+hidden-state readback, 653.7 t/s. 0064 puts IQ2_S-packed gate/up on the
+matrix unit with exact operands, **952.1 t/s** at 4096 (DESIGN §7.0.2cn,
+§7.0.2co).
+
 ## 5. Pipeline for the increment
 
 Recon (done, §1–3) → **this note** → red-first: the cell in §1 (landed) plus a

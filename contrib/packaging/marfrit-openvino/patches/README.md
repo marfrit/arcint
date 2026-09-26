@@ -1672,6 +1672,77 @@ MEASURED (A770, 2026-09-26):
 - Series 0003–0063 (61 patches) applies byte-identical to the built tree; the
   plugin compiles clean.
 
+## 0064 — IQ2_S-packed gate/up on the matrix unit (2026-09-26)
+
+The native per-expert gate/up (IQ2_S-packed, every layer of the 35B) moves
+from the vector units to the matrix unit (`intel_sub_group_f16_f16_matrix_mad_k16`,
+Xe-HPG, subgroup 8); `docs/design-native-dpas-expert-kernel.md` is the design
+and its record.
+
+- **Exact operands.** The B operand is (2s + 1) · grid · sign, an integer of
+  magnitude at most 1,333, exact in f16, read from a half2 copy of the IQ2_S
+  grid (`NATIVE_IQ2S_GRID_H2`). A 16-deep chain covers one 256-value block,
+  and d/8 then scales it once per column. Every product the unit forms is
+  exact, so there is no weight rounding. The f16-rounded alternative (the
+  emulation arm, 0063) was measured and not taken.
+- **One route for every call size.** Kind 3: tiles of up to 16 pairs of one
+  expert, one work-group per tile and 64 columns, with the activations
+  gathered into local memory in the unit's A layout. Kind 4, for calls under
+  64 pairs: one pair per work-group, with K split across 8 subgroups whose
+  chains meet in local memory and are scaled in block order. A pair's bytes
+  are the same whichever kernel runs it, so they do not depend on the call.
+- **Down stays scalar** (0061): IQ3_XXS/IQ4_NL have no exact fold.
+- **Scope.** The stage is added only on Xe-HPG with the matrix unit and an
+  IQ2_S-packed gate/up. The executing impl copies `_gu_dpas`: the clone list
+  missed it at first, and the kernel silently did not run.
+- `MOE_NATIVE_GU=scalar` restores 0061's gate/up.
+
+MEASURED (A770, 2026-09-26):
+- Block (real geometry, 1,024 tokens, 256 experts, median of 20): gate/up
+  19.34 -> 7.98 ms, the block 41.5 -> 29.4 ms.
+- Block numerics (the kernel harness, f32 against f64 models): 4.48e-8 of
+  S, the scalar kernel's own level (4.96e-8).
+- Lowering cells: 85 passed, 1 skipped. The IQ2_S-packed block stays in the
+  CPU-oracle band (0.113).
+- Call independence: token 0 is byte-identical at T = 1 and 17 (one-pair
+  kernel) and T = 40 (tiled), batched and grouped. The scalar control is
+  green. Mutants on the final form:
+  - A-gather off by one in the tiled kernel: red at T = 40 only, as the
+    routing predicts (an earlier tiled-only build read it red at T = 17 and
+    40, and 377x out of band).
+  - The one-pair kernel's block order reversed: GREEN at hidden 512, where
+    the two blocks per row did not reach gate/up's f16 output, and RED at
+    hidden 2048, the 35B's eight blocks. There token 0 read
+    `dcebee691f6d72c1` in the one-pair kernel against the tiled kernel's
+    `75bcb4da4b4497e4`. The cell now runs at both widths (89 passed, 1
+    skipped on the final build), so it reads the served kernels' summation
+    order.
+- Full depth, all-resident, u8 KV, chunk 1024: prefill 653.7 -> **952.1
+  t/s** @4096; the greedy digests at depth 1 (`6d6c6660f021`, moved) and 4096
+  (`b1a16fbc9d4c`, unchanged).
+- Decode: 0062 read 20.0–21.1 / 18.3–20.0 t/s over four runs, 0064
+  19.1–20.4 / 19.3–19.4. The ranges overlap, and the means are 2.8 % and
+  0.9 % below (depth 1, depth 4096): less than 0062's own spread.
+- A decode-step timeline: the matrix gate/up takes 92.8 µs per launch
+  against the scalar kernel's 120.0. The unchanged dense GEMMs read 39.6
+  against 34.3 µs. The mean busy clock over the whole runs was 1,650
+  against 1,902 MHz; the clock cause is not isolated.
+- Served logits against 0063 unset: depth 4, request records mean KL
+  4.0–7.8e-5 and argmax 1015–1021/1024; depth 40, KL 0.016–0.206 and argmax
+  474–492/512. Both are inside the pre-registered bounds; the gather mutant
+  reads KL 0.47–0.72.
+- Gate 4, the equivalence suite (`tests/equivalence/run.sh`) at full depth: all checks passed. Two greedy runs byte-identical; the logits slice leaves the answer; warm cache byte-identical to cold (hit 192 tokens, 81.7 %), and a restored continuation matches a cold run; speculative decoding deterministic and copy-exact. Chunked prefill differs from unchunked, which the suite reports but does not gate. Stateful vs paged is skipped (the serving shape is paged only), and so is MTP (no head).
+- Gate 3, the Prüfstand (the Lua CSV task, greedy, thinking off, the full-depth artifact): **10/10** on 0064, and 10/10 on 0062 in the same window. The answers differ (663 against 529 tokens), as a changed summation order can make them. Decode while answering: 20.2 against 20.8 t/s.
+- Series 0003–0064 (62 patches) applies byte-identical to the built tree;
+  the plugin compiles clean; the C++ ladder reads 617 run, 0 failed.
+- Scope, `code`: only Xe-HPG (`arch == xe_hpg`, the matrix unit present);
+  the B60 (Xe2) keeps 0061's scalar gate/up. A model whose intermediate size
+  is not a multiple of 64, or whose hidden size is not a multiple of 256,
+  takes the scalar route. The kernels carry `#error` guards for the same.
+- The gate numbers (rate, logits, Prüfstand, equivalence) were measured on
+  the build before the review's guards and arch narrowing. Those are compile
+  guards and a device check; the cells re-ran on the final build.
+
 ## Hazard: the measurement tree's patch set is applied but UNCOMMITTED
 
 The dev tree the measurement plugin is built from (its path is operator-local)
