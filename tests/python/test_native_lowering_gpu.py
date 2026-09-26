@@ -221,25 +221,29 @@ def _run_ab(xml, dev, T, props, extra_env=None):
 @pytest.mark.parametrize("dev", _GPUS)
 @pytest.mark.parametrize("gate_up_fmt,down_fmt", [("IQ2_S_PACKED", "IQ3_XXS"), ("IQ3_XXS", "IQ4_NL"),
                                                   ("IQ4_XS", "Q8_0")])
-@pytest.mark.parametrize("T", [1, 6])
-def test_batched_dispatch_is_bit_identical_to_per_pair(tmp_path, dev, gate_up_fmt, down_fmt, T):
+# T=17: 34 pairs over _config()'s 4 experts, so one slot holds 9 or more -- a
+# full tile of NATIVE_TILE_M (8) and a split one; T in {1, 6} never fills one.
+@pytest.mark.parametrize("T", [1, 6, 17])
+@pytest.mark.parametrize("mode", ["batched", "grouped"])
+def test_batched_dispatch_is_bit_identical_to_per_pair(tmp_path, dev, gate_up_fmt, down_fmt, T, mode):
     """Patch 0059: every (token, expert) pair of a call in one launch per
-    stage. Each pair runs the per-pair body, so the output must be the SAME
-    BYTES as the per-pair launches (MOE_PER_PAIR_DISPATCH=1), not only inside
-    the band -- and inside the band too. Measured on the A770 (GPU.1), whose
+    stage; patch 0060: the pairs grouped by expert into tiles that decode the
+    weights once. Each pair keeps the per-pair body's own arithmetic, and the
+    output must be the SAME BYTES as the per-pair launches
+    (MOE_DISPATCH_MODE=pair), not only inside the band -- and inside it too. Measured on the A770 (GPU.1), whose
     served path is run-to-run bit-identical; on the B60 two processes differ by
     f16 ulps on their own (DESIGN 7.0.2cb), so there this cell cannot read."""
     arena, cfg = _build(tmp_path, T, gate_up_fmt, down_fmt)
     xml = str(tmp_path / "moe.xml")
     props = dict(_ROUTES["resident"], WEIGHTS_PATH=str(tmp_path / "moe.bin"), INFERENCE_PRECISION_HINT="f16")
     try:
-        _, native_b, batched = _run_ab(xml, dev, T, props)
-        _, native_p, per_pair = _run_ab(xml, dev, T, props, {"MOE_PER_PAIR_DISPATCH": "1"})
+        _, native_b, batched = _run_ab(xml, dev, T, props, {"MOE_DISPATCH_MODE": mode})
+        _, native_p, per_pair = _run_ab(xml, dev, T, props, {"MOE_DISPATCH_MODE": "pair"})
     finally:
         arena.close()
     # both runs on the native route, or equal hashes would mean nothing
     assert native_b and native_p, "the native pass did not take the block"
-    print(f"\n[batched-dispatch] {dev} {gate_up_fmt}/{down_fmt} T={T}: {batched['got_hash']} vs {per_pair['got_hash']}; "
+    print(f"\n[{mode}-dispatch] {dev} {gate_up_fmt}/{down_fmt} T={T}: {batched['got_hash']} vs {per_pair['got_hash']}; "
           f"band {batched['max_over_band']:.3f}")
     assert batched["got_hash"] and batched["got_hash"] == per_pair["got_hash"]
     assert batched["max_over_band"] <= 1.0

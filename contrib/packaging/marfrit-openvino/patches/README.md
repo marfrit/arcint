@@ -1538,6 +1538,38 @@ at depth 4 and 40. Depth 4: prefill 120.1 -> 832.2 t/s, decode 57.6 -> 86.9,
 invocations 413,760 -> 608. Full depth: prefill 12.5 -> 143.9 t/s @4096,
 decode 7.9 -> 15.2, T_boot 173 -> 95 s.
 
+## 0060 — per-expert dispatch, grouped by expert (2026-09-26)
+
+After 0059 the full-depth prefill was device-bound, and a traced 4096-token
+prefill put 77 % of the device time in the two batched per-expert kernels
+(gate/up 56.0 %, down 21.3 %): each (token, expert) pair read and decoded its
+expert's weights on its own. 0060 generalises the native body to a TILE -- one
+expert slot and up to `NATIVE_TILE_M` (8, a JIT constant) of its pairs -- with
+tile decoders that decode each weight element once and give every token's
+lane accumulator the same left-to-right product the one-token decoder
+computes. Per-pair and batched launches pass tiles of one; the new grouped
+entries take the pairs stably sorted by slot and cut into tiles. The default
+policy (`auto`) is grouped for a call of 64+ pairs and batched below (grouped
+leads at prefill, trails at decode); `MOE_DISPATCH_MODE=pair|batched|grouped|auto`
+selects. The pairs table is written through the usm_host pointer instead of a
+blocking queued copy (0059 review).
+
+MEASURED (A770): the lowering cell's block gives the same output BYTES in
+batched and grouped mode as per pair (nine format/T cases each, T in
+{1, 6, 17}; the T=1/6 hashes equal 0059's per-pair ones); a mutant dropping a
+tile member's top-k position fails all grouped cases it was run on (six, before
+T=17 was added). Review 2026-09-26: T in {1, 6} never filled a tile (four
+experts, top-2: at most six pairs a slot); T=17 forces nine or more, a full tile
+and a split one, and a mutant letting a tile take nine pairs is red at T=17 (3/3)
+and green at T=1/6. The equality is by measurement, not by construction: the
+source keeps each token's product and order, but the plugin builds with
+`-cl-mad-enable`, so contraction is the compiler's choice per kernel. Depth 4:
+prefill 922 (0060's batched mode) -> 1063 t/s (auto), decode unchanged at
+~95-107; tile 16 measured no better than 8. 0059's own depth-4 row (832.2) is
+the 0059 build; 0060 changes the batched path too (the tile-of-one body, the
+table write) and the two were not separated. Full depth: prefill 143.9 ->
+222.9 t/s @4096, decode 15.2 -> 18.0, T_boot 95 -> 75 s, the same digests.
+
 ## Hazard: the measurement tree's patch set is applied but UNCOMMITTED
 
 The dev tree the measurement plugin is built from (its path is operator-local)

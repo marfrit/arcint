@@ -501,6 +501,11 @@ them: **143.9 t/s** at 4096 (decode 15.2), the same digests; depth 4 reads 832.2
 t/s. The GDN core is therefore not yet the binding term at depth; the next
 profile decides the next lever. Row 3c (460 t/s) is not met.
 
+The next profile (a device timeline of the 0059 prefill, `measured-here`) put
+77 % of the device time in the per-expert kernels and 1.5 % in the GDN core;
+patch 0060 decodes each expert once per tile of its tokens: **222.9 t/s** at
+4096, the same digests (DESIGN §7.0.2ck).
+
 ## 5. Pipeline for the increment
 
 Recon (done, §1–3) → **this note** → red-first: the cell in §1 (landed) plus a

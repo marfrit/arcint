@@ -268,4 +268,9 @@ at the end, not many. **No measurement before the feature exists.**
   MODEL is now an open question: row 2's reference and its 2051 regime belong
   to Flash-Next, which cannot be resident on the A770; the 35B fits and serves
   84,704 tokens of context but has no 2051 boundary. **Rows 1–3 stay EMPTY.**
+- 2026-09-26, grouped-dispatch leg (`measured-here`, A770) — a device timeline
+  of the 0059 prefill put 77 % of device time in the per-expert kernels, each
+  pair decoding its expert alone; patch 0060 tiles the pairs by expert:
+  **222.9 t/s** at 4096 (decode 18.0), the same digests (DESIGN §7.0.2ck). Row 3c
+  (460 t/s) is not met. **Rows 1–3 stay EMPTY.**
 

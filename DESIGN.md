@@ -10053,6 +10053,26 @@ without dispatch the plugin sends every routed native expert to the CPU tier
 (`moe_3gemm_swiglu_opt.cpp`, the `_native_tier_only && !_per_expert_dispatch`
 branch). The refusal stays.
 
+#### 7.0.2ck The per-expert kernels read each expert once per tile: the full-depth prefill goes 143.9 -> 222.9 t/s (2026-09-26)
+
+Campaign: `docs/window-054.md` (LYON row 3c); plugin patch 0060.
+
+**The finding.** [measured-here, A770 `GPU.1`, the full-depth packed u8
+artifact, all-resident, gate configuration of §7.0.2ci] After 0059 the
+prefill was device-bound: a traced 4096-token prefill (OpenCL intercept
+layer, the card's own intervals; traced 142.6 vs untraced 143.9 t/s, the same
+digest) spent 1,472 of 1,576 ms busy per steady chunk, 56.0 % in the batched
+gate/up and 21.3 % in the batched down per-expert kernels, 9.7 % in DtoH
+copies, 2.7 % in the dense GEMMs and 1.5 % in the GDN core. [code] Each (token,
+expert) pair read and decoded its expert's weights alone. Patch 0060 groups a
+call's pairs by expert slot into tiles of up to 8 that decode each weight
+element once; every pair keeps its one-token arithmetic, and its output bytes
+equal the per-pair ones by measurement (block cell at T in {1, 6, 17}, T=17
+forcing a full and a split tile; two mutants red) -- not by construction, since
+the plugin builds with `-cl-mad-enable` and contraction is the compiler's. Full depth: **prefill 143.9
+-> 222.9 t/s @4096, decode 15.2 -> 18.0 t/s, T_boot 95 -> 75 s**, the same
+digests. Row 3c's bar (460 t/s) is not met.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

@@ -458,6 +458,12 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   12.5 -> 143.9 t/s at 4096, decode 7.9 -> 15.2 t/s. Version stamp of the
   measurement build unchanged at `+p19` (like 0054-0058); the package recipe
   applies the directory.
+- **Per-expert dispatch, grouped by expert** (plugin patch 0060, DESIGN
+  §7.0.2ck): a prefill call's pairs are tiled by expert so each expert's
+  weights are decoded once per tile; decode keeps the batched launch; the
+  same output bytes, by measurement (block cell incl. a full and a split
+  tile). Full depth on the A770: prefill 143.9 -> 222.9 t/s at
+  4096, decode 15.2 -> 18.0 t/s. Stamp unchanged at `+p19`.
 - **Instruments**: `tools/bigalloc.c` (large host allocations by call
   stack, peak-attributed), `tools/native_moe_match_probe.cpp` (the native
   matcher pass alone, device-free), `tools/native_moe_block_ab.cpp` (one
