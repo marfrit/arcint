@@ -1,0 +1,167 @@
+# Build the arcint toolbox images: a patched-OpenVINO base (tier 1) and the
+# arcint engine on top of it (tier 2), published to GHCR under whichever
+# namespace runs the workflow.
+#
+# Why two tiers: the OpenVINO patch series is the expensive, rarely-changing
+# half (a full source build of a pinned nightly), and the engine is the
+# cheap, per-commit half. Building them together would recompile OpenVINO on
+# every engine commit.
+#
+# Images produced (OWNER is the lowercase repo owner, so this works from a
+# fork without edits):
+#   ghcr.io/<OWNER>/arcint-ov:2026.4.0-ov71640275d29-ceiling0033   tier 1
+#   ghcr.io/<OWNER>/arcint:<immutable ts>                            tier 2
+#   ghcr.io/<OWNER>/arcint:edge                                      tier 2, moving
+#
+# The tier-1 tag names the OpenVINO pin and the patch CEILING rather than
+# the marfrit-pN level. That is deliberate: the level stamp is frozen at
+# p19 across several different patch sets upstream (see the disclosure in
+# contrib/packaging/marfrit-openvino/patches/README.md), so the level
+# alone does not identify a runtime. The ceiling does.
+#
+# First run must include tier 1 (tiers=all or tiers=ov,arcint) — tier 2
+# FROMs the tier-1 image from the registry.
+#
+# GHCR packages are PRIVATE on first push. To let others pull, set the
+# package visibility to public after the first push, or have them log in
+# with a PAT carrying read:packages.
+#
+# Device-free gates run here: the full unit ladder inside the tier-2 build,
+# plus a stub + /props smoke test against the final image. Card-requiring
+# acceptance cells stay out of CI by design (docs/design-0.3.1-test-ladder.md)
+# — the card test is a card test.
+
+name: Build arcint toolbox images
+
+"on":
+  workflow_dispatch:
+    inputs:
+      tiers:
+        description: 'Comma-separated tiers to build: ov, arcint, or all'
+        required: false
+        default: all
+      channel:
+        description: 'Moving channel tag for the engine image'
+        required: false
+        default: edge
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  # Single source of truth for the tier-1 tag, so tier 1 and tier 2 cannot
+  # drift apart about which base they mean.
+  OV_TAG: 2026.4.0-ov71640275d29-ceiling0033
+
+jobs:
+  # Resolve the lowercase namespace and the tier selection once, in shell,
+  # where the evaluation is visible in the log. Computing these here rather
+  # than inlining the expressions makes the decision auditable after the
+  # fact: dispatch inputs are not exposed via the API, so an inline
+  # expression that misbehaves cannot be debugged once the run is over.
+  ns:
+    runs-on: ubuntu-latest
+    outputs:
+      owner: ${{ steps.ns.outputs.owner }}
+      build_ts: ${{ steps.ns.outputs.build_ts }}
+      build_ov: ${{ steps.tiers.outputs.build_ov }}
+      build_arcint: ${{ steps.tiers.outputs.build_arcint }}
+    steps:
+      - id: ns
+        run: |
+          echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+          echo "build_ts=$(date +%Y%m%dT%H%M%S)" >> "$GITHUB_OUTPUT"
+      - id: tiers
+        run: |
+          T='${{ github.event.inputs.tiers }}'
+          bo=false; ba=false
+          case "${T,,}" in
+            all) bo=true; ba=true ;;
+            *) case "$T" in *ov*) bo=true ;; esac
+               case "$T" in *arcint*) ba=true ;; esac ;;
+          esac
+          echo "raw tiers input: '$T' -> ov=$bo arcint=$ba" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "build_ov=$bo" >> "$GITHUB_OUTPUT"
+          echo "build_arcint=$ba" >> "$GITHUB_OUTPUT"
+
+  tier1-openvino:
+    needs: ns
+    if: needs.ns.outputs.build_ov == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # The OpenVINO clone and build is large and GitHub runners are not.
+      - name: Free up runner disk space
+        run: |
+          echo "Before cleanup:" && df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune --all --force
+          docker builder prune --all --force
+          echo "After cleanup:" && df -h /
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build patched OpenVINO base
+        run: |
+          docker build \
+            -t ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:${{ env.OV_TAG }} \
+            -f docker/Dockerfile.openvino-patched .
+
+      - name: Push tier 1
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:${{ env.OV_TAG }}
+
+  tier2-engine:
+    needs: [ns, tier1-openvino]
+    # always() so a skipped tier 1 does not auto-skip this; then gate on the
+    # computed booleans and tier 1's actual result.
+    if: >-
+      ${{ always()
+          && needs.ns.result == 'success'
+          && needs.ns.outputs.build_arcint == 'true'
+          && needs.tier1-openvino.result != 'failure'
+          && needs.tier1-openvino.result != 'cancelled' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build engine image
+        run: |
+          docker build \
+            --build-arg OV_BASE=${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:${{ env.OV_TAG }} \
+            --build-arg ARCINT_GIT_SHA=${GITHUB_SHA::12} \
+            -t ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint:build-${{ needs.ns.outputs.build_ts }} \
+            -f docker/Dockerfile.arcint .
+
+      # Re-run the device-free smoke test against the FINAL image before
+      # publishing the channel tag. It must run INSIDE the container: the
+      # stub binds 127.0.0.1 in the container's network namespace, so a
+      # host-side curl has nothing to connect to.
+      - name: Smoke test
+        run: |
+          docker run --rm --entrypoint bash \
+            ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint:build-${{ needs.ns.outputs.build_ts }} \
+            -c '/usr/bin/arcint --stub --port 8090 & S=$!; sleep 2; curl -fsS http://127.0.0.1:8090/props > /dev/null; R=$?; kill $S 2>/dev/null; wait $S 2>/dev/null; exit $R'
+
+      - name: Push immutable + channel tags
+        run: |
+          IMG=${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint
+          docker tag "$IMG:build-${{ needs.ns.outputs.build_ts }}" "$IMG:${{ needs.ns.outputs.build_ts }}"
+          docker push "$IMG:${{ needs.ns.outputs.build_ts }}"
+          docker tag "$IMG:build-${{ needs.ns.outputs.build_ts }}" "$IMG:${{ github.event.inputs.channel }}"
+          docker push "$IMG:${{ github.event.inputs.channel }}"

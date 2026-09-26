@@ -1,0 +1,226 @@
+# syntax=docker/dockerfile:1
+# ---------------------------------------------------------------------------
+# Tier 1: the patched OpenVINO runtime as an image ("marfrit-openvino" in
+# container form). Built and verified in CI: the pin fetches by full SHA,
+# the patch series applies clean to it, and the shipped libopenvino carries
+# the patch-level string.
+#
+# Rebuild ONLY when contrib/packaging/marfrit-openvino/patches/** or the pin
+# changes. This is the heavy image (~35+ min build); the engine image
+# (Dockerfile.arcint) is the thin one that rebuilds per commit.
+#
+# Mirrors contrib/packaging/marfrit-openvino/build-openvino.sh (clone at the
+# pin, hard reset, apply patches, Release build) and build-deb.sh (wheel
+# layout is load-bearing; patched libs overwrite the wheel's; the version
+# string must name the patch level).
+#
+# Build from the REPO ROOT:
+#   docker build -t arcint-ov:2026.4.0-marfrit-p15 \
+#     -f docker/Dockerfile.openvino-patched .
+# ---------------------------------------------------------------------------
+
+# --- stage 1: build the pinned OpenVINO with the patch series ---------------
+FROM registry.fedoraproject.org/fedora:43 AS ov-builder
+
+RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
+      gcc gcc-c++ cmake ninja-build git patch python3 pkgconf \
+      curl which binutils \
+  && dnf clean all && rm -rf /var/cache/dnf/*
+
+# Full 40-char SHA — git fetch only serves arbitrary commits by full object
+# id; the 8-char pin from the deb recipes fails with "couldn't find remote
+# ref" (measured: run 35749870402, 2026-09-22).
+ARG OV_PIN=71640275d29692354223572e77ef717e92b891d9
+# Short form for the version string: the nightly reports itself as
+# 2026.4.0-22849-71640275d29, i.e. the 11-char short SHA. The deb recipe
+# built that as ${PIN}d29 off an 8-char pin; here it is spelled out.
+ARG OV_PIN_SHORT=71640275d29
+# The version string must parse for ov_parse_ci_build_number: the build-number
+# FIELD stays numeric, the patch level rides in the free-form tail.
+#
+# WARNING: the marfrit-pN stamp does NOT identify a patch set from 0046 on.
+# The upstream patch README discloses this four times -- "the version stamp
+# stays at marfrit-p19 (disclosed: p19 is also the 0003-0043 stamp, so the
+# 0046 build is identified by its env/parse symbols, not the stamp)". The
+# same p19 string therefore covers 0003-0043, 0003-0049 and beyond. Never
+# tag an image by patch level alone; tag by the arcint tree SHA plus the
+# explicit ceiling carried in CEILING below.
+ARG PATCHLEVEL=marfrit-p15
+# The honest identity: the highest patch actually applied. Carried into the
+# image label so a running container can say what it really contains.
+ARG CEILING=0033
+ARG OV_UPSTREAM=https://github.com/openvinotoolkit/openvino.git
+
+# Shallow fetch of the exact commit (GitHub serves reachable SHAs). If the
+# fetch-by-sha path ever breaks, fall back to a full clone — the hard reset
+# below is the same either way.
+RUN git init /opt/ov \
+  && cd /opt/ov \
+  && git remote add origin "${OV_UPSTREAM}" \
+  && git fetch --depth 1 origin "${OV_PIN}" \
+  && git checkout --force FETCH_HEAD \
+  && git submodule update --init --recursive --depth 1
+
+# The patch series comes from THIS repo, not from anywhere else.
+COPY contrib/packaging/marfrit-openvino/patches /opt/patches
+
+# Same gate as build-openvino.sh: a patch that does not apply to the pin is
+# a bug in patches/, not a reason to move the pin.
+# PATCH_MAX: apply only patches numbered up to this. The ceiling is 0033,
+# the deployed +p15 set, because 0037 as published in this tree does not
+# parse: its last hunk declares 82 new / 6 old and the hunk carries 78 / 3,
+# so `git apply` refuses it outright ("corrupt patch at line 436"). Building
+# past 0033 here would fail the same gate build-openvino.sh applies.
+#
+# The ceiling is a single build arg. When 0037 is re-exported and validates,
+# bump PATCH_MAX and the tier-1 tag's ceiling together.
+#
+# See docs/docker.md ("Known issue: patches/0037 does not apply").
+ARG PATCH_MAX=0033
+RUN cd /opt/ov && shopt -s nullglob && \
+    for p in /opt/patches/*.patch; do \
+      n=$(basename "$p" | cut -d- -f1); \
+      if [ "$((10#$n))" -gt "$((10#$PATCH_MAX))" ]; then echo "skipping $(basename "$p") (> PATCH_MAX=${PATCH_MAX})"; continue; fi; \
+      echo "applying $(basename "$p")"; \
+      git apply --check "$p" || { echo "does not apply to ${OV_PIN}: fix patches/, not the pin" >&2; exit 1; }; \
+      git apply "$p"; \
+    done; \
+    git status --porcelain
+
+# Exactly the flags from build-openvino.sh (plugin set matching the wheel,
+# debug caps OFF, no python/samples/tests/wheel).
+RUN cmake -S /opt/ov -B /opt/ov/build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCI_BUILD_NUMBER="2026.4.0-22849-${OV_PIN_SHORT}-${PATCHLEVEL}" \
+      -DENABLE_INTEL_GPU=ON -DENABLE_INTEL_CPU=ON -DENABLE_INTEL_NPU=ON \
+      -DENABLE_DEBUG_CAPS=OFF -DENABLE_GPU_DEBUG_CAPS=OFF \
+      -DENABLE_PYTHON=OFF -DENABLE_SAMPLES=OFF -DENABLE_TESTS=OFF -DENABLE_WHEEL=OFF \
+  && cmake --build /opt/ov/build -j"$(nproc)" \
+  && cmake --install /opt/ov/build --prefix /opt/ov-install
+
+# Upstream writes the libraries under the SOURCE tree at
+# bin/intel64/Release whatever the build dir (per build-deb.sh); the deb
+# takes its TBB from the install prefix. Gate: the version string must name
+# the patch level.
+RUN strings -a /opt/ov/bin/intel64/Release/libopenvino.so.2640 \
+      | grep -F -- "${PATCHLEVEL}" > /dev/null \
+  || { echo "built libopenvino does not carry ${PATCHLEVEL}" >&2; exit 1; }
+
+# --- stage 2: the upstream nightly wheels (layout + tokenizers) -------------
+FROM registry.fedoraproject.org/fedora:43 AS wheels
+
+RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
+      python3 curl ca-certificates \
+  && dnf clean all && rm -rf /var/cache/dnf/*
+
+# Exact filenames + checksums from contrib/packaging/marfrit-openvino/build-deb.sh.
+# NOT the /simple/ index path — that serves HTML (see the deb recipe comment).
+ARG INDEX=https://storage.openvinotoolkit.org/wheels/nightly
+ARG OV_WHEEL=openvino-2026.4.0.dev20260821-22849-cp313-cp313-manylinux_2_28_x86_64.whl
+ARG OV_WHEEL_SHA256=54e64b62ad0fc56ed7963992e53c871673d622643adfebcc0d5d989319fb1d5d
+ARG OV_TOK_WHEEL=openvino_tokenizers-2026.4.0.0.dev20260821-py3-none-manylinux_2_28_x86_64.whl
+ARG OV_TOK_WHEEL_SHA256=67c2f70f2f4eb860e48a8b7d3b0a6f0748fd7f132db90a3444c3fbbf0ee01dc0
+
+WORKDIR /wheels
+RUN curl --connect-timeout 10 --max-time 900 --retry 3 --retry-delay 5 -sSLfo "$OV_WHEEL" "$INDEX/openvino/$OV_WHEEL" \
+  && curl --connect-timeout 10 --max-time 900 --retry 3 --retry-delay 5 -sSLfo "$OV_TOK_WHEEL" "$INDEX/openvino-tokenizers/$OV_TOK_WHEEL" \
+  && echo "$OV_WHEEL_SHA256  $OV_WHEEL"             | sha256sum -c \
+  && echo "$OV_TOK_WHEEL_SHA256  $OV_TOK_WHEEL"     | sha256sum -c \
+  && mkdir -p unpack && python3 -m zipfile -e "$OV_WHEEL" unpack/ \
+  && python3 -m zipfile -e "$OV_TOK_WHEEL" unpack/ \
+  && rm -rf unpack/openvino/__pycache__ \
+  && find unpack -name '__pycache__' -type d -prune -exec rm -rf {} + \
+  && find unpack -name '*.py' -delete \
+  && find unpack -name '*.pyi' -delete
+
+# --- stage 3: runtime -------------------------------------------------------
+FROM registry.fedoraproject.org/fedora:43
+
+# GPU runtime stack — same family kyuz0 installs in every toolbox.
+# intel-compute-runtime provides the Level Zero driver (libze_intel_gpu) the
+# OpenVINO GPU plugin dispatches through; ocl-icd mirrors the deb's
+# Depends: ocl-icd-libopencl1 | libopencl1.
+RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
+      bash ca-certificates libatomic libstdc++ libgcc \
+      hwdata pciutils procps-ng curl python3 binutils \
+      intel-compute-runtime intel-level-zero oneapi-level-zero ocl-icd \
+  && dnf clean all && rm -rf /var/cache/dnf/*
+
+ARG PATCHLEVEL=marfrit-p15
+ARG CEILING=0033
+ARG OV_PREFIX=/usr/lib/marfrit-openvino
+
+# The stamp is ambiguous by design upstream (p19 covers several patch sets),
+# so the image records the ceiling it was actually built to. `docker inspect`
+# answers "which patch set is this"; the version string alone cannot.
+LABEL org.opencontainers.image.title="marfrit-openvino (patched)" \
+      org.opencontainers.image.source="https://github.com/marfrit/arcint" \
+      ai.arcint.ov.pin="71640275d29692354223572e77ef717e92b891d9" \
+      ai.arcint.ov.patchlevel="${PATCHLEVEL}" \
+      ai.arcint.ov.patchceiling="${CEILING}"
+
+# The wheel's INTERNAL LAYOUT IS LOAD-BEARING (OpenVINOTargets-release.cmake
+# resolves ${_IMPORT_PREFIX}/openvino/libs/<soname>). Copy openvino/ and
+# openvino_tokenizers/ verbatim under one prefix, exactly as the deb does.
+COPY --from=wheels /wheels/unpack/openvino             ${OV_PREFIX}/openvino
+COPY --from=wheels /wheels/unpack/openvino_tokenizers  ${OV_PREFIX}/openvino_tokenizers
+
+# The patched libraries replace the wheel's — every one the wheel shipped,
+# or the build fails (the deb recipe's loop, same intent).
+COPY --from=ov-builder /opt/ov/bin/intel64/Release/ /tmp/patched/
+# TBB/hwloc come from the build's install prefix (runtime/3rdparty/tbb/lib),
+# exactly where build-deb.sh takes them from.
+COPY --from=ov-builder /opt/ov-install/runtime/3rdparty/tbb/lib/ /tmp/tbb/
+RUN set -eu; cd "${OV_PREFIX}/openvino/libs"; missing=0; \
+    for f in *; do \
+      case "$f" in \
+        cache.json) continue ;; \
+        tbb.pc) src="/tmp/tbb/pkgconfig/$f" ;; \
+        libtbb*|libhwloc*) src="/tmp/tbb/$f" ;; \
+        *) src="/tmp/patched/$f" ;; \
+      esac; \
+      if [ ! -e "$src" ]; then echo "the build does not provide $f (wheel has it)" >&2; missing=1; continue; fi; \
+      cp -Lf "$src" "$f"; \
+    done; \
+    [ "$missing" = 0 ] || { echo "refusing to ship a runtime with fewer libraries than the wheel" >&2; exit 1; }
+
+RUN strip --strip-unneeded ${OV_PREFIX}/openvino/libs/*.so* 2>/dev/null || true; \
+    chmod 644 ${OV_PREFIX}/openvino/libs/*.so* 2>/dev/null || true; \
+    find ${OV_PREFIX} -type d -exec chmod 755 {} + ; \
+    # The runtime must say out loud that it is patched (deb recipe's gate;
+    # NOT grep -q — SIGPIPE under pipefail, see the deb recipe comment).
+    strings -a ${OV_PREFIX}/openvino/libs/libopenvino.so.2640 | grep -F -- "${PATCHLEVEL}" > /dev/null \
+      || { echo "shipped libopenvino does not carry ${PATCHLEVEL} — wrong build tree?" >&2; exit 1; }; \
+    # Existence gates copied from the deb recipe.
+    for f in libopenvino.so.2640 libopenvino_intel_gpu_plugin.so libtbb.so.12 \
+             libopenvino_ir_frontend.so.2640; do \
+      [ -f "${OV_PREFIX}/openvino/libs/$f" ] || { echo "MISSING: openvino/libs/$f" >&2; exit 1; }; \
+    done; \
+    [ -f "${OV_PREFIX}/openvino_tokenizers/lib/libopenvino_tokenizers.so" ] || { echo "MISSING: tokenizers .so" >&2; exit 1; }; \
+    [ -f "${OV_PREFIX}/openvino/cmake/OpenVINOConfig.cmake" ] || { echo "MISSING: OpenVINOConfig.cmake" >&2; exit 1; }; \
+    grep -q '\${_IMPORT_PREFIX}/openvino/libs/libopenvino.so' \
+      "${OV_PREFIX}/openvino/cmake/OpenVINOTargets-release.cmake" \
+      || { echo "wheel layout changed: targets no longer point at openvino/libs" >&2; exit 1; }; \
+    rm -rf /tmp/patched /tmp/tbb
+
+# ld.so.conf.d INSIDE the image — deliberately deviating from the deb's
+# "no system-wide entry" discipline here. Measured reason (pulled the pushed
+# tier-1 image layers and read the ELF dynamic tags): the wheel's original
+# libs carry DT_RPATH=$ORIGIN (self-locating), but the source build's libs
+# carry DT_RUNPATH=/opt/ov/temp/Linux_x86_64/tbb/lib (and
+# /opt/ov/bin/intel64/Release) — build-tree paths that do not exist in the
+# final image. RUNPATH is not inherited from the executable, so
+# arcint -> libopenvino -> libtbb fails at the second hop (measured: tier-2
+# ctest, run 35754012937). The deb gets away with it via load-order on the
+# host; an image must not depend on that. The deb's objection (a nightly
+# OpenVINO jumping ahead of other consumers) cannot apply inside a dedicated
+# container — nothing else links these sonames here.
+RUN echo /usr/lib/marfrit-openvino/openvino/libs > /etc/ld.so.conf.d/marfrit-openvino.conf \
+  && ldconfig \
+  && ldconfig -p | grep -F libtbb.so.12 > /dev/null \
+  || { echo "ldconfig did not pick up the OV libs dir" >&2; exit 1; }
+
+RUN ldconfig && ls /usr/lib64/libze_intel_gpu* > /dev/null 2>&1 \
+  || echo "WARN: libze_intel_gpu not found in the expected place — check the intel-compute-runtime package layout" >&2
+
+CMD ["/bin/bash"]

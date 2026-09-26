@@ -1,0 +1,55 @@
+# Run recipe for the arcint toolbox, in compose form.
+#
+# Mirrors kyuz0's device recipe: /dev/dri passthrough + video/render groups
+# + seccomp unconfined. Models are mounted read-only, never baked in.
+#
+# The flags on the command line are the engine's own; this example follows
+# contrib/packaging/arcint.service (the ExecStart shape carries over
+# verbatim because RPATH resolves the runtime inside the image exactly as
+# on the packaged host).
+services:
+  arcint:
+    image: ghcr.io/<OWNER>/arcint:edge          # your registry + namespace
+    restart: unless-stopped
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      # OpenVINO IR model directories + any GGUF files, read-only.
+      - ${MODELS_ROOT:-/models}:/models:ro
+      # The blob cache the engine writes (OV GPU kernel cache etc.). Writable,
+      # persistent: a cold cache turns every start into a recompile.
+      - arcint-cache:/var/cache/arcint
+    ports:
+      - "8080:8080"          # LAN only — no auth, no TLS (DEVELOPMENT.md)
+    environment:
+      # Keep the healthcheck pointed at the port you actually serve on.
+      ARCINT_HEALTH_URL: http://127.0.0.1:8080/props
+    command:
+      - --model
+      - /models/ov/qwen36-coder-b5-ov
+      - --model-id
+      - qwen3.6-27b-a3b-coder
+      - --served-model-name
+      - qwen3.6-coder
+      - --device
+      - GPU.0
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --n-ctx
+      - "262144"
+      - --prefix-cache-mib
+      - "8192"
+      - --cache-dir
+      - /var/cache/arcint
+      - --queue-timeout
+      - "30"
+
+volumes:
+  arcint-cache:

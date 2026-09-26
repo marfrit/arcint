@@ -1,0 +1,99 @@
+# syntax=docker/dockerfile:1
+# ---------------------------------------------------------------------------
+# Tier 2: the arcint engine image.
+#
+# FROM the tier-1 patched-OpenVINO base for BOTH stages: the base carries
+# the CMake package, headers and libopenvino_tokenizers.so, so the engine
+# build needs nothing but a compiler on top of it.
+#
+# The CMake flags are byte-for-byte contrib/packaging/arcint/build-deb.sh —
+# the image and the .deb consume the same recipe, neither forks the other.
+#
+# The tier-1 tag names the OpenVINO pin and the patch CEILING, not the patch
+# level: upstream deliberately freezes the marfrit-pN stamp across several
+# patch sets, so "p19" alone does not say what is in the runtime.
+#
+# Build from the REPO ROOT (needs the tier-1 image built or pulled):
+#   docker build -t arcint:dev \
+#     --build-arg OV_BASE=arcint-ov:2026.4.0-ov71640275d29-ceiling0033 \
+#     -f docker/Dockerfile.arcint .
+# ---------------------------------------------------------------------------
+
+ARG OV_BASE=arcint-ov:2026.4.0-ov71640275d29-ceiling0033
+
+# --- builder ---------------------------------------------------------------
+FROM ${OV_BASE} AS builder
+
+RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
+      gcc gcc-c++ cmake git which binutils \
+  && dnf clean all && rm -rf /var/cache/dnf/*
+
+ARG ARCINT_GIT_SHA=unknown
+ARG OV_PREFIX=/usr/lib/marfrit-openvino
+
+WORKDIR /src
+COPY . /src/arcint
+
+# The gates are the product (build-deb.sh's words): the device-free unit
+# ladder runs here on every image build — no card needed. --no-tests=error
+# turns "ctest found nothing to run" into a build failure.
+RUN cmake -S /src/arcint -B /src/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DARCINT_OPENVINO=ON \
+      -DARCINT_WERROR=ON \
+      -DARCINT_TESTS=ON \
+      -DARCINT_GIT_SHA="${ARCINT_GIT_SHA}" \
+      -DOpenVINO_DIR="${OV_PREFIX}/openvino/cmake" \
+      -DARCINT_TOKENIZERS_SO="${OV_PREFIX}/openvino_tokenizers/lib/libopenvino_tokenizers.so" \
+      -DCMAKE_INSTALL_PREFIX=/usr \
+      -DCMAKE_INSTALL_RPATH="${OV_PREFIX}/openvino/libs" \
+      -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+      -DCMAKE_SKIP_BUILD_RPATH=OFF \
+  && cmake --build /src/build -j"$(nproc)" \
+  && ctest --test-dir /src/build --output-on-failure --no-tests=error -L unit
+
+RUN DESTDIR=/install cmake --install /src/build > /dev/null \
+  && [ -x /install/usr/bin/arcint ] || { echo "MISSING: /usr/bin/arcint" >&2; exit 1; }
+
+# RPATH probe (from build-deb.sh — the same SIGPIPE-safe shape).
+RUN RP=$(objdump -x /install/usr/bin/arcint | awk '/RUNPATH|RPATH/ && !seen {seen=1; print $2}'); \
+    case "$RP" in *"${OV_PREFIX}/openvino/libs"*) ;; \
+      *) echo "RPATH does not point at ${OV_PREFIX}/openvino/libs (is: '$RP')" >&2; exit 1 ;; esac
+RUN LDD_OUT=$(ldd /install/usr/bin/arcint); \
+    case "$LDD_OUT" in *"not found"*) echo "unresolved libraries:" >&2; printf '%s\n' "$LDD_OUT" >&2; exit 1 ;; esac; \
+    case "$LDD_OUT" in *"${OV_PREFIX}/openvino/libs/libopenvino.so"*) ;; \
+      *) echo "libopenvino not loading from ${OV_PREFIX}" >&2; printf '%s\n' "$LDD_OUT" >&2; exit 1 ;; esac
+
+# Optional: assert the base runtime is at/above the engine's patch floor at
+# BUILD time rather than at arcint load time. The floor tracks the ceiling of
+# the tier-1 base this engine is built against; the stamp string alone is not
+# a reliable identity (see Dockerfile.openvino-patched), so check the
+# ai.arcint.ov.patchceiling label instead of the version string when the
+# base came from this toolbox.
+# RUN strings -a ${OV_PREFIX}/openvino/libs/libopenvino_intel_gpu_plugin.so \
+#     | grep -F 'marfrit-p15' > /dev/null || { echo "base runtime below engine floor" >&2; exit 1; }
+
+# --- final -----------------------------------------------------------------
+FROM ${OV_BASE}
+
+COPY --from=builder /install/usr /usr
+
+# The stub smoke test needs no GPU: the engine serves its HTTP surface
+# without a model. If /props answers, the binary, its RPATH and the
+# tokenizer .so all resolve inside the image.
+RUN /usr/bin/arcint --stub --port 8090 & STUB=$!; \
+    sleep 2; \
+    curl -fsS http://127.0.0.1:8090/props > /dev/null \
+      || { echo "stub smoke test: /props did not answer" >&2; kill $STUB 2>/dev/null; exit 1; }; \
+    kill $STUB 2>/dev/null; wait $STUB 2>/dev/null || true
+
+# LAN only: no auth, permissive CORS, no TLS (DEVELOPMENT.md). Put a
+# reverse proxy in front; do not expose this port to the internet.
+EXPOSE 8080
+
+ENV ARCINT_HEALTH_URL=http://127.0.0.1:8080/props
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5m --retries=3 \
+  CMD curl -fsS "$ARCINT_HEALTH_URL" > /dev/null || exit 1
+
+ENTRYPOINT ["/usr/bin/arcint"]
+CMD ["--help"]
