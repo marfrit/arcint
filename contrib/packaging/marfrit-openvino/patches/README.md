@@ -1512,6 +1512,32 @@ the A770, plugin 0003-0057, depth 1: 7,267 misses, 50,354 tensor reads at
 T_boot 245 -> 155 s, depth-1 decode 3.0 -> 7.3 t/s, the same digests. `bind()` now uploads only the scale/zp tensors (the kernels
 read the scale device-transposed) and marks every slot filled.
 
+## 0059 — per-expert dispatch, batched (2026-09-26)
+
+The native per-expert dispatch enqueued TWO kernels per (token, expert) pair
+-- gate/up and down, each a one-row GEMV -- so a 1,024-token prefill chunk cost
+16,384 launches per MoE layer. Measured on the full-depth 35B (A770): 3,482,240
+invocations in a 4096-token run, the host waiting ~91 ms per MoE layer call on
+the queue to drain, prefill 12.5 t/s, while the profiled device node time was
+~86 us a token. Now the pairs of a call go to a small USM-host table (slot,
+flat id, top-k position) and two batched kernels cover them in one launch per
+stage; each work-group row runs the per-pair body (factored into a `FUNC()`
+helper per compiled source), so a pair computes exactly what its own launch
+did. The table is rewritten only after the layer's blocking top-k readback,
+which on the in-order queue has already waited for every earlier launch.
+`MOE_PER_PAIR_DISPATCH=1` restores the per-pair launches.
+
+MEASURED (A770): the output BYTES of the lowering cell's block (E = 4, top-2,
+hidden 512, inter 256, with a shared expert) are identical to the per-pair
+launches for IQ2_S-packed/IQ3_XXS, IQ3_XXS/IQ4_NL and IQ4_XS/Q8_0 at T 1 and 6
+(`test_batched_dispatch_is_bit_identical_to_per_pair`; a mutant ignoring the
+top-k position fails all six). At the 35B's routing (E = 256, top-8, T 1 and
+6) the band matrix against the CPU oracle reads the same values as the
+per-pair plugin to every printed digit. Served, the same digests
+at depth 4 and 40. Depth 4: prefill 120.1 -> 832.2 t/s, decode 57.6 -> 86.9,
+invocations 413,760 -> 608. Full depth: prefill 12.5 -> 143.9 t/s @4096,
+decode 7.9 -> 15.2, T_boot 173 -> 95 s.
+
 ## Hazard: the measurement tree's patch set is applied but UNCOMMITTED
 
 The dev tree the measurement plugin is built from (its path is operator-local)

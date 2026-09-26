@@ -10027,6 +10027,32 @@ with a warmer page cache: 10,146 misses, 1.4 ms a read, 3.0 t/s); 0058 fills
 scale/zp at bind (g8 against g7): 0 misses, T_boot 245 → 155 s, depth-1 decode
 3.0 → 7.3 t/s, the same digests.
 
+#### 7.0.2cj The native per-expert dispatch was launch-bound: batched, the full-depth prefill goes 12.5 -> 143.9 t/s (2026-09-26)
+
+Campaign: `docs/window-054.md` (LYON, row 3c) and
+`docs/design-lyon-stateful-prefill.md` §4h; plugin patch 0059.
+
+**The finding.** [measured-here, A770 `GPU.1`, the full-depth packed u8
+artifact, all-resident: ratio 0 + dispatch, u8 KV, chunk 1024 -> 512,
+embeddings on the CPU, `--dyn-quant off`] A profiled 1,024-token prefill chunk
+summed 87.6 ms of node time (85.5 us a token) while the served prefill spent
+~80 ms a token. The plugin's counters named the gap: 3,482,240 per-expert
+invocations in a 4096-token run and ~91 ms of host wait per MoE layer call —
+[code] the dispatch enqueued two one-row kernels per (token, expert) pair,
+16,384 per layer for a 1,024-token chunk. Patch 0059 issues every pair of a
+call in one launch per stage. Output bytes identical to the per-pair launches
+(block cell, six format/T cases; mutant red), served digests identical at
+depth 4 and 40. Full depth: **prefill 12.5 -> 143.9 t/s @4096, decode 7.9 ->
+15.2 t/s, T_boot 173 -> 95 s**; depth 4: prefill 120.1 -> 832.2, decode 57.6 ->
+86.9.
+
+**A route that is not one** [measured-here + code]: ratio 0 with the host tier
+and NO dispatch is refused by arcint's config; lifting the refusal in a scratch
+binary served depth 4 at prefill 14.7 / decode 8.7 t/s (same digests), because
+without dispatch the plugin sends every routed native expert to the CPU tier
+(`moe_3gemm_swiglu_opt.cpp`, the `_native_tier_only && !_per_expert_dispatch`
+branch). The refusal stays.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

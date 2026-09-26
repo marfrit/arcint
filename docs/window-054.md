@@ -258,3 +258,14 @@ at the end, not many. **No measurement before the feature exists.**
   `git checkout` silently drops a patch (0005 was dropped and re-applied
   verbatim during this leg). No red-first cell, no gate run. **Rows 1–3 stay
   EMPTY (OWED).**
+- 2026-09-26, dispatch leg (`measured-here`, A770) — the full-depth Qwen3.6-35B
+  now serves all-resident on this card (DESIGN §7.0.2ci), so row 3's rate
+  question could be asked of the served path at depth: prefill **12.5 t/s** at
+  4096. The mechanism was not the GDN core: the per-expert dispatch launched two
+  kernels per (token, expert) pair (16,384 per MoE layer for a 1,024-token
+  chunk). Patch 0059 batches them — **143.9 t/s** at 4096, decode 15.2, the same
+  digests (DESIGN §7.0.2cj). Row 3c's bar (460 t/s) is not met. The rows'
+  MODEL is now an open question: row 2's reference and its 2051 regime belong
+  to Flash-Next, which cannot be resident on the A770; the 35B fits and serves
+  84,704 tokens of context but has no 2051 boundary. **Rows 1–3 stay EMPTY.**
+

@@ -11,6 +11,7 @@
 //   RUNTIME moe_typed=<n> native_nodes=<n>
 //   TYPES <runtime layer type>=<count> ...
 //   DIFF max_abs=<d> max_want=<w> max_over_band=<r> corr=<c>
+//   GOT fnv1a64=<hash of the GPU output bytes>
 //
 // The band is the cell's: 2% of the element plus 1% of its row's RMS.
 //
@@ -19,6 +20,7 @@
 // Use:   native_moe_block_ab <moe.xml> <GPU.n> <T> <seed> [KEY=VALUE ...]
 
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <map>
 #include <random>
@@ -93,6 +95,13 @@ int main(int argc, char** argv) {
     if (got_t.get_size() != n) {
         std::cout << "SHAPE_MISMATCH want=" << n << " got=" << got_t.get_size() << "\n";
         return 1;
+    }
+    // the GPU output's own bytes, FNV-1a 64: two GPU runs compare exactly
+    {
+        uint64_t h = 1469598103934665603ull;
+        const auto* b = static_cast<const unsigned char*>(got_t.data());
+        for (size_t i = 0; i < got_t.get_byte_size(); ++i) h = (h ^ b[i]) * 1099511628211ull;
+        std::cout << "GOT fnv1a64=" << std::hex << h << std::dec << "\n";
     }
     const size_t row = want.get_shape().back();
     double max_abs = 0, max_want = 0, max_ratio = 0, sw = 0, sg = 0, sww = 0, sgg = 0, swg = 0;

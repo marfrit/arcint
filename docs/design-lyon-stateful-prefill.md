@@ -360,6 +360,12 @@ instrument, not attempted here. Not fixed, per the brief.
 
 ### Localization first: the chunked+packed failure is the PACKED route, not the GDN
 
+[DATED IN PLACE 2026-09-26: the packed route's failures below — the 512 MiB
+f16 fills, the build-time `CL_OUT_OF_RESOURCES` — were the packed decode chain
+left UNFUSED by the matcher (patch 0054) and folded at compile; the chunked
+core's own verdict (§4f's rate table) is unaffected. `docs/design-fit-levers.md`
+§3.]
+
 Instrumenting `gpu_usm::fill` (`ocl_memory.cpp`:595, plugin rebuild + one short
 A770 run) shows the throw is a **fill whose kernel failed**, and the last fills
 carry **rank-5 f16 weight layouts**:
@@ -482,6 +488,18 @@ reverted and the plugin reinstalled clean (sha `f9eb7ffdc5d83ee7`).
 **Still OWED:** LYON's chunked fused primitive; the fit levers (dense-u8 form,
 the 2.903x materialisation) [DATED 2026-09-26: both closed —
 `docs/design-fit-levers.md`]. LYON-001 rows stay EMPTY.
+
+## 4h. The served rate at full depth, and the launch bound (2026-09-26)
+
+With the full-depth 35B resident on the A770 (`docs/design-fit-levers.md`), the
+row-3 rate was read on the served path itself (`measured-here`, ratio 0 +
+dispatch, u8 KV, chunk 512, embeddings on the CPU): prefill **12.5 t/s** at 4096.
+A profiled 1,024-token chunk summed 87.6 ms of node time; the plugin counters
+showed 3,482,240 per-expert kernel invocations and ~91 ms of host wait per MoE
+layer call — two launches per (token, expert) pair (`code`). Patch 0059 batches
+them: **143.9 t/s** at 4096 (decode 15.2), the same digests; depth 4 reads 832.2
+t/s. The GDN core is therefore not yet the binding term at depth; the next
+profile decides the next lever. Row 3c (460 t/s) is not met.
 
 ## 5. Pipeline for the increment
 

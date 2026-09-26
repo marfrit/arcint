@@ -452,6 +452,12 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   compressed value Constants (0057); the all-resident pool is filled at
   bind (0058). Dispatch-route readings on IQ4_NL layers taken before 0056
   are wrong and owed a re-measurement.
+- **Per-expert dispatch, batched** (plugin patch 0059, DESIGN §7.0.2cj):
+  one launch per stage for every (token, expert) pair instead of two per
+  pair; the same output bytes. The full-depth 35B on the A770: prefill
+  12.5 -> 143.9 t/s at 4096, decode 7.9 -> 15.2 t/s. Version stamp of the
+  measurement build unchanged at `+p19` (like 0054-0058); the package recipe
+  applies the directory.
 - **Instruments**: `tools/bigalloc.c` (large host allocations by call
   stack, peak-attributed), `tools/native_moe_match_probe.cpp` (the native
   matcher pass alone, device-free), `tools/native_moe_block_ab.cpp` (one

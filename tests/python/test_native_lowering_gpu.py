@@ -193,13 +193,15 @@ def _run_inprocess(xml, dev, T, cfg, props):
                                      "corr": np.corrcoef(got.ravel(), want.ravel())[0, 1]}
 
 
-def _run_ab(xml, dev, T, props):
+def _run_ab(xml, dev, T, props, extra_env=None):
     import subprocess
     env = dict(os.environ, LD_LIBRARY_PATH=_AB_LIB + os.pathsep + os.environ.get("LD_LIBRARY_PATH", ""))
+    env.update(extra_env or {})
     out = subprocess.run([_AB, xml, dev, str(T), "2"] + [f"{k}={v}" for k, v in props.items()],
                          capture_output=True, text=True, env=env, check=True).stdout
     moe_typed = native_nodes = 0
     st = {}
+    got_hash = None
     for ln in out.splitlines():
         f = ln.split()
         kv = dict(x.split("=") for x in f[1:] if "=" in x)
@@ -207,5 +209,37 @@ def _run_ab(xml, dev, T, props):
             moe_typed, native_nodes = int(kv["moe_typed"]), int(kv["native_nodes"])
         elif f and f[0] == "DIFF":
             st = {k: float(v) for k, v in kv.items()}
+        elif f and f[0] == "GOT":
+            got_hash = kv["fnv1a64"]
     assert st, out
+    st["got_hash"] = got_hash
     return moe_typed, native_nodes, st
+
+
+@_skip
+@pytest.mark.skipif(not _AB, reason="needs the C++ runner (ARCINT_NATIVE_BLOCK_AB): two GPU runs compared by bytes")
+@pytest.mark.parametrize("dev", _GPUS)
+@pytest.mark.parametrize("gate_up_fmt,down_fmt", [("IQ2_S_PACKED", "IQ3_XXS"), ("IQ3_XXS", "IQ4_NL"),
+                                                  ("IQ4_XS", "Q8_0")])
+@pytest.mark.parametrize("T", [1, 6])
+def test_batched_dispatch_is_bit_identical_to_per_pair(tmp_path, dev, gate_up_fmt, down_fmt, T):
+    """Patch 0059: every (token, expert) pair of a call in one launch per
+    stage. Each pair runs the per-pair body, so the output must be the SAME
+    BYTES as the per-pair launches (MOE_PER_PAIR_DISPATCH=1), not only inside
+    the band -- and inside the band too. Measured on the A770 (GPU.1), whose
+    served path is run-to-run bit-identical; on the B60 two processes differ by
+    f16 ulps on their own (DESIGN 7.0.2cb), so there this cell cannot read."""
+    arena, cfg = _build(tmp_path, T, gate_up_fmt, down_fmt)
+    xml = str(tmp_path / "moe.xml")
+    props = dict(_ROUTES["resident"], WEIGHTS_PATH=str(tmp_path / "moe.bin"), INFERENCE_PRECISION_HINT="f16")
+    try:
+        _, native_b, batched = _run_ab(xml, dev, T, props)
+        _, native_p, per_pair = _run_ab(xml, dev, T, props, {"MOE_PER_PAIR_DISPATCH": "1"})
+    finally:
+        arena.close()
+    # both runs on the native route, or equal hashes would mean nothing
+    assert native_b and native_p, "the native pass did not take the block"
+    print(f"\n[batched-dispatch] {dev} {gate_up_fmt}/{down_fmt} T={T}: {batched['got_hash']} vs {per_pair['got_hash']}; "
+          f"band {batched['max_over_band']:.3f}")
+    assert batched["got_hash"] and batched["got_hash"] == per_pair["got_hash"]
+    assert batched["max_over_band"] <= 1.0
