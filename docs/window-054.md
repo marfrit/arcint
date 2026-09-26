@@ -213,5 +213,17 @@ at the end, not many. **No measurement before the feature exists.**
   the standing control, and chunked + MoE fails with
   `CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST`; a depth-1 discriminator is
   refused earlier by `SDPAToPagedAttention` (0 attention layers). Not pinned
-  further; the plugin names no last primitive. No fix attempted. **Rows 1–3
-  stay EMPTY (OWED).**
+  further; the plugin names no last primitive. No fix attempted.
+- 2026-09-26, chunked-matcher leg (operator decision) — **localized and
+  BLOCKED**. Instrumenting `gpu_usm::fill` shows the throw is a **fill** with
+  rank-5 f16 weight layouts (512 MiB, the plugin's reorder of the packed u8
+  weight) — a **packed-route** issue, not the GDN. Proof by isolation: the
+  chunked core **with re-laid experts compiles and serves** on GPU.1 (t_boot
+  48.0 s, prefill 118.5 t/s at 64 tokens). The matcher itself is **infeasible
+  as stated** (`matches_linear_attention_loop`, `fuse_gated_delta_net.cpp`:62,
+  pins seq extent 1 / Squeeze(2) / ReduceSum(-2) / row-wise ScatterUpdate — the
+  token rule; a chunked body satisfies none; the fused primitive IS that rule,
+  so a **new chunked primitive + kernel** would be needed). Mechanism numbers,
+  same card/rung/32k: chunked prefill **153.5** vs sequential **161.8** t/s;
+  decode 18.0 vs **26.7** — the unfused chunked **loses** to the fused
+  sequential. **Rows 1–3 stay EMPTY (OWED).**

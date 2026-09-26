@@ -352,6 +352,73 @@ allocation, not a geometry interaction.** Localizing it needs a plugin-side
 print of the failing kernel id in `kernels_cache::build_all` — a daylight
 instrument, not attempted here. Not fixed, per the brief.
 
+## 4f. The operator's chunked-matcher leg — BLOCKED, and the viability question ANSWERED (2026-09-26)
+
+### Localization first: the chunked+packed failure is the PACKED route, not the GDN
+
+Instrumenting `gpu_usm::fill` (`ocl_memory.cpp`:595, plugin rebuild + one short
+A770 run) shows the throw is a **fill whose kernel failed**, and the last fills
+carry **rank-5 f16 weight layouts**:
+
+```
+ARCINT_FILL bytes=536870912 pattern=00 blocking=1 layout=f16:bfzyx:256x2048x16x4x8
+ARCINT_FILL bytes=536870912 pattern=00 blocking=1 layout=f16:bfzyx:256x512x64x4x8
+```
+
+512 MiB **f16** buffers whose dims are the expert geometry — the plugin's
+**reorder of the packed u8 weight into a large f16 buffer** (the packed gate
+weight is 84 MB u8; the reordered form is 512 MiB, ~6×). The same site, same
+class, as the **packed sequential** d4 that also failed. So the chunked+packed
+failure is a **packed-route memory/reorder issue**, not the chunked Loop.
+
+**Proof by isolation (`measured-here`):** the chunked core **with the re-laid
+experts** (`--expert-format native`, no `--native-packed`) **compiles and
+serves** on GPU.1 — `ready True`, t_boot 48.0 s, `device-resident 2.74 GiB`,
+prefill 118.5 t/s at 64 tokens. So the chunked body is **viable on the GPU**
+as emitted; nothing about the Loop blocks it.
+
+### The matcher's feasibility — CHECKED, and it is infeasible as stated
+
+`matches_linear_attention_loop` (`code`: `fuse_gated_delta_net.cpp`:62) pins the
+body to the **token rule**:
+
+- `query/key/value` must be `pattern::shape_matches("[?, head_num, 1, *_head_size]")`
+  — **sequence extent exactly 1**;
+- `Squeeze(key, {2})` / `Squeeze(value, {2})` require dim 2 = 1;
+- the state update is `ReduceSum(gated_state * key_unsqueeze, -2)` — an
+  **outer-product token step**;
+- the output is `ScatterUpdate(out_buffer, Unsqueeze(step_index, 0), out, 2)`
+  — **one row per iteration**.
+
+A chunked body carries **seq = CHUNK**, `cumsum`, the pairwise decay, the
+forward-substitution inverse and **matmuls** — it satisfies **none** of those,
+and the fused `ov::op::internal::GatedDeltaNet` primitive **is** that token
+rule. So "extend the matcher to a chunked Loop" is not an extension: it needs a
+**new chunked primitive and its kernel**.
+
+**VERDICT: BLOCKED.** The chunked fusion matcher is infeasible under the
+existing primitive's contract.
+
+### And the rate says the in-graph chunked path LOSES to the fused sequential
+
+Same card, same depth-4 rung, same 32k prompt, `ratio 0` + dispatch, chunk
+2048, `measured-here`:
+
+| rung | prefill tokens | prefill t/s | decode t/s | digest |
+|---|---|---|---|---|
+| **chunked + re-laid** | 23,680 | **153.5** | 18.0 | `4ecb1ca8a6b70749` |
+| **sequential + re-laid** (control, `d4n`) | 23,680 | **161.8** | **26.7** | `b283fe50f4ef0280` |
+
+The **unfused chunked core is SLOWER** than the fused token-sequential one
+(prefill −5 %, decode −33 %): the fusion is what buys the sequential path its
+kernel, and the chunked body forfeits it. So LYON's speed target needs a
+**chunked fused primitive**, not a matcher extension — a daylight
+implementation, not this leg.
+
+**LYON-001 rows 1–3 stay EMPTY.** The d4 rung's answer is degenerate (a 4-layer
+artifact is not the model), and no full-depth chunked artifact was built. No
+row is filled by inference.
+
 ## 5. Pipeline for the increment
 
 Recon (done, §1–3) → **this note** → red-first: the cell in §1 (landed) plus a
