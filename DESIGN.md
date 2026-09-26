@@ -10183,7 +10183,8 @@ there), dense GEMMs 2.7 %.
 
 The number sits above row 3c's 460 t/s. The row itself stays EMPTY, because
 which model and configuration the LYON rows gate on is an open operator
-question (`docs/window-054.md`).
+question (`docs/window-054.md`). [Superseded 2026-09-26 by the operator's ruling: row 3c reads on this
+configuration at 32k, 778.9 t/s at chunk 2048; `docs/window-054.md`.]
 
 #### 7.0.2cn The all-resident pool skips the speculative hidden-state readback: 625.7 -> 653.7 t/s (2026-09-26)
 
@@ -10265,8 +10266,9 @@ not reach the f16 output. The cell runs at both widths.
 - Gate 4, the equivalence suite (`tests/equivalence/run.sh`) at full depth: all checks passed. Two greedy runs byte-identical; the logits slice leaves the answer; warm cache byte-identical to cold (hit 192 tokens, 81.7 %), and a restored continuation matches a cold run; speculative decoding deterministic and copy-exact. Chunked prefill differs from unchunked, which the suite reports but does not gate. Stateful vs paged is skipped (the serving shape is paged only), and so is MTP (no head).
 - Gate 3, the Prüfstand (the Lua CSV task, greedy, thinking off, the full-depth artifact): **10/10** on 0064, and 10/10 on 0062 in the same window. The answers differ (663 against 529 tokens), as a changed summation order can make them. Decode while answering: 20.2 against 20.8 t/s (`measured-here`).
 
-The prefill is above row 3c's 460 t/s; the row stays EMPTY (the operator's
-model question).
+The prefill is above row 3c's 460 t/s. By the operator's ruling of the same
+day, row 3c reads on this configuration at 32k: 778.9 t/s at chunk 2048
+(`docs/window-054.md`).
 
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 

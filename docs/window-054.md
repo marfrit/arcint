@@ -1,4 +1,4 @@
-# window-054 — 0.5.4 LYON acceptance (LYON-001: every measured row EMPTY)
+# window-054 — 0.5.4 LYON acceptance (LYON-001: row 3c READ on the 35B by operator ruling; rows 1, 2, 3a, 3b EMPTY)
 
 Recorded 2026-09-26, before any LYON card window exists and before the
 compile-once/replay path is built. This file is the acceptance commit of 0.5.4
@@ -61,7 +61,7 @@ prefill.
 
 ## What LYON-001 owns
 
-Three acceptance rows, all EMPTY:
+Three acceptance rows (row 3c READ on the 35B by the operator's ruling of 2026-09-26, Status; the rest EMPTY):
 
 1. **a 32k prompt answered on-card** — multi-block prefill across the 2051
    boundary, greedy answer pasted raw, digest recorded;
@@ -150,6 +150,45 @@ Row 3 carries both halves:
 - **Report-only beside it**: the one-time compile seconds, the per-chunk wall
   time, and the amortized compile share over a 32k prompt
   (`compile_s / (compile_s + prefill_s)`).
+- **3c, READ (`RUN@bdbb0aa`, `measured-here`, 2026-09-26)**, on the model and
+  configuration of the operator's ruling below (the Qwen3.6-35B-A3B, not
+  Flash-Next): **778.9 t/s at 32,768 tokens on the A770 at the document's
+  2048 chunk, and 781.4 t/s at 1024 — PASS** against 460. Configuration:
+  - `GPU.1`; the full-depth packed u8 artifact (`qwen3.6-35b-a3b-native-d40packed-u8`);
+  - all-resident (`--offload-ratio 0 --moe-per-expert-dispatch`), `--paged-kv u8`,
+    `--n-ctx 36864`, `--emb-device CPU`, `--dyn-quant off`;
+  - plugin series 0003–0064, a prefix build: plugin sha256 prefix
+    `82bdef830e510a35`, core `868741d0da6d6321`, binary `780d2a30a862273b`
+    (no package, so no `dpkg -V`);
+  - one fresh process per chunk size, the one request each.
+  The prompt is the bench ids (23,680) extended with tokenised plugin source to
+  32,768 (ids sha256 prefix `786c9efb1079317c`); its content is not a
+  question. The fit admits chunk 2048 (0.65 GiB of activations); the 4096 gate
+  ran at 1024. Raw lines, chunk 2048:
+
+      load: activation fit: -0.026 GiB fixed + 346.0 KiB per chunk token; served chunk 2048 measured 0.65 GiB
+      load: n_ctx 36864 | device GPU.1 | prefill chunked at 2048 tok | 1 lane
+      slot 0: prefill 32768 tok in 42.07 s (778.9 t/s) | cache snapshot 0.04 s | graph 41.97 s, embed 0.06 s, pages 0.00 s, restore 0.00 s, wait 0.00 s, other 0.00 s
+      slot 0: decode     32 tok in  1.87 s ( 17.1 t/s) | graph 1.86 s, embed 0.00 s, sample 0.01 s, emit 0.00 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
+      END 2026-09-26T15:16:08+00:00 peak_anon_kb=1682296 leftover=0
+      POINT depth 32768 digest ae57cada7870736b53e34e06d415fecece5f2ab2a36b5def806900f740fed483
+
+  Chunk 1024:
+
+      load: reservation: weights+graph 13.11 GiB + drafters 0.00 + expert slots 0.13 (probe-static) + activations 0.31 (all 1 lane, chunk 1024) + margin 0.25 + 1 x (GDN rows 95.6 MiB + KV 11.3 KiB/token) of 15.11 GiB -> max ctx 112288 per lane
+      load: n_ctx 36864 | device GPU.1 | prefill chunked at 1024 tok | 1 lane
+      slot 0: prefill 32768 tok in 41.93 s (781.4 t/s) | cache snapshot 0.04 s | graph 41.81 s, embed 0.08 s, pages 0.00 s, restore 0.00 s, wait 0.00 s, other 0.00 s
+      slot 0: decode     32 tok in  1.87 s ( 17.1 t/s) | graph 1.86 s, embed 0.00 s, sample 0.01 s, emit 0.00 s, wait 0.00 s, other 0.00 s | draft accept 0.0% (0/0), propose 0.00 s, verify 0.00 s, re-forward 0.00 s, rollback 0.00 s
+      END 2026-09-26T15:09:33+00:00 peak_anon_kb=1694208 leftover=0
+      POINT depth 32768 digest f86533dc2e2b57ea2fa7fd41d11b283c584dc6fb26f6347b29409e2328d81145
+
+  The `POINT` digest is the bench runner's sha256 of the 32-token greedy
+  continuation, and `END ... peak_anon_kb` is its sampler's peak host anon.
+  The two chunk sizes give different digests, as the equivalence suite
+  reports for chunk sizes on this backend (chunked vs chunked is not gated).
+  The report-only terms of 3c (compile seconds, per-chunk wall, amortized
+  compile share) belong to the stateful graph this row was written for, and
+  are not read here.
 
 ## Scope — in / out
 
@@ -295,4 +334,20 @@ at the end, not many. **No measurement before the feature exists.**
   now runs on the matrix unit with exact operands, for every call size
   (patch 0064, DESIGN §7.0.2co): **952.1 t/s** at 4096, the 4096 digest
   unchanged, decode means 0.9–2.8 % below 0062 (inside the spread, clock confounded). **Rows 1–3 stay EMPTY.**
+- 2026-09-26, **operator ruling: split.** The operator answered a direct
+  question with "Split: 3c on the 35B". Row **3c** (served rate ≥ 460 t/s at
+  32k on the A770) reads on the **Qwen3.6-35B-A3B, full depth, packed u8,
+  all-resident** configuration. Rows **1, 2, 3a and 3b stay pinned to
+  Flash-Next**, where the stateful T-independent prefill graph they gate
+  still has to be built.
+  - The question the operator answered set out these options and premises.
+    Re-pinning every row would pass 3a/3b without exercising the feature, as
+    the 35B's paged path is already compile-once and T-independent (`code`:
+    one paged compile per process). No 35B reference capture exists for row
+    2. Keeping 3c on Flash-Next leaves it without a fast path (`code`: its
+    route runs the per-expert kernels through the host tier at ratio 99).
+  - **3c READ: 778.9 t/s at 32,768 at chunk 2048 and 781.4 at 1024 (PASS,
+    `RUN@bdbb0aa`)**; the raw output is under the row above. Rows 1, 2, 3a
+    and 3b stay EMPTY. DESIGN §7.0.2co's "row 3c stays EMPTY" is superseded
+    here.
 
