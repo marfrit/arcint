@@ -10270,6 +10270,35 @@ The prefill is above row 3c's 460 t/s. By the operator's ruling of the same
 day, row 3c reads on this configuration at 32k: 778.9 t/s at chunk 2048
 (`docs/window-054.md`).
 
+#### 7.0.2cp The CPU tier decodes a native expert once per call: Flash-Next prefill 3x on the A770 (2026-09-26)
+
+Campaign: `docs/window-054.md` (LYON rows 1, 2, 3a, 3b, pinned to Flash-Next by
+the operator's ruling); plugin patch 0065.
+
+**The forecast that set it.** [measured-here, A770 `GPU.1`, Flash-Next
+`d48n`, ratio 75 + tier + dispatch, u8 KV, chunk 512, plugin 0064]
+- Prefill read 0.86 t/s at 128 tokens and 1.04 t/s at 512; decode 0.5 t/s.
+- A 32k prompt would take at least 8.8 h (a lower bound: attention grows with
+  position), over the operator's 2 h budget for one measurement. So those rows are TO BE DETERMINED until the rate allows them.
+
+**The lever.** [code] The CPU tier received an expert's jobs together, but
+its native-format path decoded the whole expert once per job. Patch 0065 makes
+it stage-major: each row is decoded once and dotted with every job, with each
+job's own dot order and rounding, so a job's bytes do not change.
+[measured-here] Unit cells: 10/10, including the new equality cell (red on a
+mutant). An IQ2_S row cell failed as written, because its test bytes sat in
+the wrong group (`code`; no earlier run is on record); fixed.
+
+**The numbers.** [measured-here, same configuration]
+- Prefill 128 tokens 148.19 -> 77.44 s; 512 tokens 491.76 -> 163.64 s
+  (**3.13 t/s**).
+- Decode unchanged. Digests unchanged against 0064 (`eec6f2f2acb5d988`,
+  `e4b40e198c8f22a6`); the same tier pair count.
+- 32k forecast at 3.13 t/s: at least 2.9 h, still over the budget.
+- [code] The next term is the per-job dot, still scalar: it can be
+  vectorised across jobs, one job per lane, without changing any job's
+  order.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

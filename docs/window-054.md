@@ -350,4 +350,13 @@ at the end, not many. **No measurement before the feature exists.**
     `RUN@bdbb0aa`)**; the raw output is under the row above. Rows 1, 2, 3a
     and 3b stay EMPTY. DESIGN §7.0.2co's "row 3c stays EMPTY" is superseded
     here.
+- 2026-09-26, **rows 1, 2, 3a, 3b: TO BE DETERMINED** under the operator's
+  2-hour budget for a single measurement. Flash-Next on the A770 (`d48n`,
+  ratio 75 + tier + dispatch, u8 KV, chunk 512), `measured-here`:
+  - 0064: prefill 1.04 t/s at 512 tokens; a 32k prompt forecasts at least
+    ~8.8 h (the 512-token rate extrapolated; attention grows with position).
+  - 0065 (the CPU tier decodes a native expert once per call, DESIGN
+    §7.0.2cp): 3.13 t/s, same digests; the forecast is at least ~2.9 h, still
+    over.
+  The rows stay EMPTY until a lever brings the 32k forecast under 2 h.
 

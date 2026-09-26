@@ -1,0 +1,185 @@
+# CPU tier, native formats: decode each expert row once for all of the
+# expert's jobs. The per-job reference decoded the whole expert for every
+# (token, expert) pair, so a prefill chunk repeated it for every token routed
+# to the expert. Stage-major now: a row is decoded once and dotted with every
+# job, and each job keeps the per-job path's own dot (acc += x*w in k order)
+# and rounding, so a job's bytes are the per-job call's. Affine matrices keep
+# their per-job calls. The IQ2_S unit cell's bytes move to group 1's place:
+# as written, the cell failed against the correct decoder.
+#
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
+@@ -905,42 +905,75 @@
+ 
+ namespace {
+ 
++// arcint (patch 0065). One stage over all of an expert's jobs: out[j * width +
++// (n - n_begin)]. A native matrix decodes each row ONCE for every job -- the
++// per-job form decoded the whole expert per (token, expert) pair, which a
++// prefill chunk repeats for every token routed to the expert. Each job's dot is
++// compute_stage_f32's own (acc += x[k] * w[k] in k order), so a job's bytes are
++// the per-job call's. An affine matrix keeps its per-job call.
++void compute_stage_f32_jobs(const QuantMatrix& mat, const float* X, size_t n_jobs, size_t ldx, int n_begin,
++                            int n_end, float* out) {
++    const size_t width = static_cast<size_t>(n_end - n_begin);
++    if (mat.format == kQuantFormatU4Affine) {
++        for (size_t j = 0; j < n_jobs; j++)
++            compute_stage_f32(mat, X + j * ldx, n_begin, n_end, out + j * width);
++        return;
++    }
++    std::vector<float> wrow(static_cast<size_t>(mat.ic));
++    for (int n = n_begin; n < n_end; n++) {
++        decode_native_row(mat, n, wrow.data());
++        for (size_t j = 0; j < n_jobs; j++) {
++            const float* x = X + j * ldx;
++            float acc = 0.0f;
++            for (int k = 0; k < mat.ic; k++) {
++                acc += x[k] * wrow[static_cast<size_t>(k)];
++            }
++            out[j * width + static_cast<size_t>(n - n_begin)] = acc;
++        }
++    }
++}
++
+ }  // namespace
+ 
+ void moe_cpu_expert_ref(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, int col_begin, int col_end) {
+-    const int hidden = e.down.oc;
+-    const int inter = e.up.oc;
+-    std::vector<float> x_f32(static_cast<size_t>(hidden));
+-    std::vector<float> up_acc(static_cast<size_t>(inter));
+-    std::vector<float> gate_acc(static_cast<size_t>(inter));
+-    std::vector<float> h_f32(static_cast<size_t>(inter));
+-    std::vector<float> down_acc(static_cast<size_t>(col_end - col_begin));
++    const size_t hidden = static_cast<size_t>(e.down.oc);
++    const size_t inter = static_cast<size_t>(e.up.oc);
++    const size_t width = static_cast<size_t>(col_end - col_begin);
++    // arcint (patch 0065): stage-major over the expert's jobs, each stage's
++    // weights decoded once (compute_stage_f32_jobs); per job the arithmetic and
++    // the rounding at every stage boundary are the per-job form's.
++    std::vector<float> x_f32(n_jobs * hidden);
++    std::vector<float> up_acc(n_jobs * inter);
++    std::vector<float> gate_acc(n_jobs * inter);
++    std::vector<float> h_f32(n_jobs * inter);
++    std::vector<float> down_acc(n_jobs * width);
+ 
+     for (size_t j = 0; j < n_jobs; j++) {
+-        const ExpertJob& job = jobs[j];
+-        for (int k = 0; k < hidden; k++) {
+-            x_f32[static_cast<size_t>(k)] = f16_to_f32(job.x[k]);
++        for (size_t k = 0; k < hidden; k++) {
++            x_f32[j * hidden + k] = f16_to_f32(jobs[j].x[k]);
+         }
++    }
+ 
+-        compute_stage_f32(e.up, x_f32.data(), 0, inter, up_acc.data());
+-        compute_stage_f32(e.gate, x_f32.data(), 0, inter, gate_acc.data());
++    compute_stage_f32_jobs(e.up, x_f32.data(), n_jobs, hidden, 0, static_cast<int>(inter), up_acc.data());
++    compute_stage_f32_jobs(e.gate, x_f32.data(), n_jobs, hidden, 0, static_cast<int>(inter), gate_acc.data());
+ 
+-        // Rounding, matched stage by stage (§5.4):
+-        //   up_h[j] = f16(acc_up[j])
+-        //   h[j]    = f16(up_h[j] * act_f32(acc_gate[j]))
+-        for (int j2 = 0; j2 < inter; j2++) {
+-            const float up_h = f16_to_f32(f32_to_f16(up_acc[static_cast<size_t>(j2)]));
+-            const float act = apply_act(gate_acc[static_cast<size_t>(j2)], e.act);
+-            const uint16_t h_bits = f32_to_f16(up_h * act);
+-            h_f32[static_cast<size_t>(j2)] = f16_to_f32(h_bits);
+-        }
++    // Rounding, matched stage by stage (§5.4):
++    //   up_h[j] = f16(acc_up[j])
++    //   h[j]    = f16(up_h[j] * act_f32(acc_gate[j]))
++    for (size_t i = 0; i < n_jobs * inter; i++) {
++        const float up_h = f16_to_f32(f32_to_f16(up_acc[i]));
++        const float act = apply_act(gate_acc[i], e.act);
++        const uint16_t h_bits = f32_to_f16(up_h * act);
++        h_f32[i] = f16_to_f32(h_bits);
++    }
+ 
+-        compute_stage_f32(e.down, h_f32.data(), col_begin, col_end, down_acc.data());
++    compute_stage_f32_jobs(e.down, h_f32.data(), n_jobs, inter, col_begin, col_end, down_acc.data());
+ 
+-        const float w_route = f16_to_f32(job.w_route);
++    for (size_t j = 0; j < n_jobs; j++) {
++        const float w_route = f16_to_f32(jobs[j].w_route);
+         for (int n = col_begin; n < col_end; n++) {
+-            const float y_val = down_acc[static_cast<size_t>(n - col_begin)] * w_route;
+-            job.y[n] = f32_to_f16(y_val);
++            const float y_val = down_acc[j * width + static_cast<size_t>(n - col_begin)] * w_route;
++            jobs[j].y[n] = f32_to_f16(y_val);
+         }
+     }
+ }
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
+@@ -529,6 +529,55 @@
+     EXPECT_NE(affine[0], y[0]);
+ }
+ 
++// arcint (patch 0065). The tier decodes a native expert's rows once for all of
++// the expert's jobs; each job must still get the bytes a call with that job
++// alone gives. Flash-Next's formats: IQ3_XXS gate/up, IQ4_NL down, random
++// blocks. Red: a stage that read one job's activations for every job, or kept
++// the per-job loop but indexed a job's output by another's, fails the equality;
++// the jobs' outputs differ from one another, so the cell can see it.
++TEST(moe_cpu_expert_native, the_jobs_of_one_expert_get_each_job_s_own_bytes) {
++    const int H = 128, I = 64, J = 7;
++    std::mt19937 rng(7);
++    auto bytes = [&](size_t n, int mod) {
++        std::vector<uint8_t> v(n);
++        for (auto& b : v) b = static_cast<uint8_t>(rng() % static_cast<unsigned>(mod));
++        return v;
++    };
++    std::uniform_real_distribution<float> scale(0.01f, 0.05f);
++    auto scales = [&](size_t n) {
++        std::vector<uint16_t> v(n);
++        for (auto& x : v) x = f32_to_f16_bits(scale(rng));
++        return v;
++    };
++    auto gw = bytes(I * H / 4, 256), gz = bytes(I * H / 8, 128), uw = bytes(I * H / 4, 256), uz = bytes(I * H / 8, 128);
++    auto gs = scales(I * H / 32), us = scales(I * H / 32);
++    auto dw = bytes(H * I / 2, 256);
++    auto ds = scales(H * I / 32);
++    ExpertDesc e;
++    e.gate = native_matrix(kQuantFormatIq3Xxs, H, gw.data(), gz.data(), gs.data());
++    e.gate.oc = I;
++    e.up = native_matrix(kQuantFormatIq3Xxs, H, uw.data(), uz.data(), us.data());
++    e.up.oc = I;
++    e.down = native_matrix(kQuantFormatIq4Nl, I, dw.data(), nullptr, ds.data());
++    e.down.oc = H;
++
++    std::normal_distribution<float> nd(0.0f, 1.0f);
++    std::vector<std::vector<uint16_t>> x(J, std::vector<uint16_t>(H));
++    for (auto& row : x)
++        for (auto& v : row) v = f32_to_f16_bits(nd(rng));
++    std::vector<std::vector<uint16_t>> y_all(J, std::vector<uint16_t>(H, 0)), y_one(J, std::vector<uint16_t>(H, 0));
++    std::vector<ExpertJob> jobs(J);
++    for (int j = 0; j < J; j++)
++        jobs[j] = ExpertJob{x[j].data(), f32_to_f16_bits(0.1f * static_cast<float>(j + 1)), y_all[j].data()};
++    moe_cpu_expert(e, jobs.data(), J, 0, H);
++    for (int j = 0; j < J; j++) {
++        ExpertJob one{x[j].data(), jobs[j].w_route, y_one[j].data()};
++        moe_cpu_expert(e, &one, 1, 0, H);
++    }
++    for (int j = 0; j < J; j++) EXPECT_EQ(y_all[j], y_one[j]) << "job " << j;
++    EXPECT_NE(y_all[0], y_all[1]);
++}
++
+ TEST(moe_cpu_expert_native, q8_0_row_decodes_as_d_times_q) {
+     int8_t q[64];
+     for (int j = 0; j < 64; j++) q[j] = static_cast<int8_t>((j % 32) - 16);
+@@ -564,9 +613,12 @@
+     // 00 01; grid[256] = 25,25,25,25,25,8,25,8), l=1..3 index 1023 (LE bytes
+     // FF 03; grid[1023] = eight 43s), no signs, s0 = s1 = 1.0. The 10-bit
+     // index is the point: the low byte alone gives 0, the assembly gives 256.
++    // group g's four indices are w[g*8 .. g*8+7], and group 0 stays all zero.
++    // (Patch 0065: the first form wrote group 1's bytes at w[0..7], group 0's
++    // place; as written the cell failed against the correct decoder.)
+     uint8_t w[16] = {0};
+-    w[0] = 0x00; w[1] = 0x01;
+-    for (int l = 1; l < 4; l++) { w[2 * l] = 0xFF; w[2 * l + 1] = 0x03; }
++    w[8] = 0x00; w[9] = 0x01;
++    for (int l = 1; l < 4; l++) { w[8 + 2 * l] = 0xFF; w[8 + 2 * l + 1] = 0x03; }
+     uint8_t z[8] = {0}; z[0] = 0x03;
+     const uint16_t s[4] = {f32_to_f16_bits(1.0f), f32_to_f16_bits(2.0f),
+                            f32_to_f16_bits(1.0f), f32_to_f16_bits(1.0f)};

@@ -1743,6 +1743,46 @@ MEASURED (A770, 2026-09-26):
   the build before the review's guards and arch narrowing. Those are compile
   guards and a device check; the cells re-ran on the final build.
 
+## 0065 — CPU tier, native formats: each expert row decoded once per call (2026-09-26)
+
+`moe_cpu_expert()` receives all of one expert's jobs, one per (token, expert)
+pair, together. For a native format the reference path still decoded the
+expert's whole gate, up and down matrices once per job (`code`), so a prefill
+chunk repeated the decode for every token routed to the expert. That is about
+ten tokens per expert at chunk 512 for Flash-Next's top-10 of 512 experts.
+
+0065 makes the path stage-major (`compute_stage_f32_jobs`): a row is decoded
+once and dotted with every job. Each job keeps the per-job path's own dot
+(`acc += x[k] * w[k]` in k order) and the same rounding at every stage
+boundary, so its bytes are the per-job call's. Affine matrices keep their
+per-job calls.
+
+The unit cells (standalone, `-mavx2 -mfma -mf16c`):
+- **New:** a native expert (IQ3_XXS gate/up, IQ4_NL down, random blocks, seven
+  jobs) gives every job, in one call, the bytes of a call with that job
+  alone. A mutant feeding every job job 0's activations is red. Both calls
+  run the new stage-major code, so the cell checks the grouping, not the
+  pre-image. The pre-image claim rests on the code reading (the dot and the
+  rounding are the 0011/0043 text) and on the served digests. 0066 adds a
+  bitwise cell against the pre-image `compute_stage_f32`.
+- **Fixed:** the IQ2_S row cell (0050) wrote group 1's index bytes at
+  `w[0..7]`, group 0's place. The decoder, the exporter and the OpenCL
+  kernel all read group g at byte `g*8` (`code`), so as written the cell
+  failed against the correct decoder. No run of it is on record before
+  this one. Its bytes now sit at `w[8..15]`.
+- 10 of 10 pass.
+
+MEASURED (A770, Flash-Next `d48n`, ratio 75 + tier + dispatch, u8 KV, chunk
+512, 2026-09-26):
+- Prefill of 128 tokens: 148.19 s -> 77.44 s.
+- Prefill of 512 tokens: 491.76 s -> 163.64 s (1.04 -> 3.13 t/s).
+- Decode unchanged at 0.5 t/s (one job per expert).
+- Digests unchanged against 0064 at each length (`eec6f2f2acb5d988` at 128,
+  `e4b40e198c8f22a6` at 512); the same tier pair count (709,175).
+- The whole leg, load probes included: 37 min -> 14 min.
+- Series 0003–0065 (63 patches) applies byte-identical to the built tree;
+  the plugin compiles clean.
+
 ## Hazard: the measurement tree's patch set is applied but UNCOMMITTED
 
 The dev tree the measurement plugin is built from (its path is operator-local)

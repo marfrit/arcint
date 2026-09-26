@@ -497,6 +497,12 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   decode; down stays scalar. Full depth on the A770: prefill 653.7 -> 952.1
   t/s at 4096; decode means 0.9–2.8 % below 0062, inside the run-to-run spread, clock confounded. `MOE_NATIVE_GU=scalar`
   restores 0061's gate/up. Stamp unchanged at `+p19`.
+- **CPU tier decodes a native expert once per call** (plugin patch 0065,
+  DESIGN §7.0.2cp): stage-major over the expert's jobs, with the same bytes.
+  Flash-Next (`d48n`) prefill on the A770 (ratio 75 + tier + dispatch, u8
+  KV, chunk 512) 1.04 -> 3.13 t/s at 512 tokens, the same digests. A
+  mislaid IQ2_S unit cell (failing as written) is fixed. Stamp unchanged at
+  `+p19`.
 - **Instruments**: `tools/bigalloc.c` (large host allocations by call
   stack, peak-attributed), `tools/native_moe_match_probe.cpp` (the native
   matcher pass alone, device-free), `tools/native_moe_block_ab.cpp` (one
