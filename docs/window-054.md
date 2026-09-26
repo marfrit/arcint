@@ -243,3 +243,18 @@ at the end, not many. **No measurement before the feature exists.**
   needs a plugin instrument this leg did not land). No artifact byte changed,
   no gate run; plugin reinstalled clean (`f9eb7ffdc5d83ee7`). **Rows 1–3 stay
   EMPTY (OWED).**
+- 2026-09-26, packed-load leg 2 (operator time-box) — **RULE-OUT + NAMED CALL,
+  failing kernel not named**. Instruments landed (patch 0053): on a d4packed
+  A770 load, `kernels_cache::build_batch` = 5 batches / **0 exceptions** and
+  `ocl_kernel_builder::build_kernels` = 5 programs / **0 failures** → the
+  packed route's OCL kernel **build is exonerated**. The artifact is
+  **3.63 GiB** (smaller than the 3.99 GiB re-laid control that serves) → fit
+  exonerated. `ARCINT_BT` names the call instead:
+  `err=-5 msg=[GPU] clEnqueueNDRangeKernel, error code: -5 CL_OUT_OF_RESOURCES`
+  — a **kernel launch**, not a compile; the frames are unsymbolized (stripped
+  Release plugin), so the failing kernel is **not named**. Hazard recorded
+  dated in `contrib/packaging/marfrit-openvino/patches/README.md`: that OV
+  measurement tree carries the patch set **uncommitted**, so a file-level
+  `git checkout` silently drops a patch (0005 was dropped and re-applied
+  verbatim during this leg). No red-first cell, no gate run. **Rows 1–3 stay
+  EMPTY (OWED).**
