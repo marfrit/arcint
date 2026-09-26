@@ -10185,6 +10185,30 @@ The number sits above row 3c's 460 t/s. The row itself stays EMPTY, because
 which model and configuration the LYON rows gate on is an open operator
 question (`docs/window-054.md`).
 
+#### 7.0.2cn The all-resident pool skips the speculative hidden-state readback: 625.7 -> 653.7 t/s (2026-09-26)
+
+Campaign: `docs/window-054.md` (LYON row 3c); plugin patch 0062.
+
+[measured-here, A770 `GPU.1`] The 0061 timeline still held 5.1 % in
+device-to-host copies: 320 events, 345 ms per 4096-token prefill, and host
+gaps around them. [code] That was 0017's hoisted readback. Every MoE call
+copied topk_id, the whole hidden state and the routing weights to the host,
+because the CPU tier might need them. On the all-resident native pool no
+expert can miss. Patch 0062 reads topk_id alone when every expert holds a
+slot, as `MOE_OTD_READBACK_NOHOIST` does, and keeps NOHOIST's late x/rw fetch
+for a miss. [measured-here] The 0062 timeline has no device-to-host memcpy in
+the request window. Full depth, all-resident, u8 KV, chunk 1024: **prefill
+653.7 t/s @4096**, decode 21.1 / 19.9, the same digests (`5f4625c0bf7c` /
+`b1a16fbc9d4c`). The per-call topk_id read stays (a blocking read into host
+memory, never among the 320 events). The per-expert kernels are now 77.5 % of
+the window (gate/up 48.8 %, down 28.7 %), the GDN core 6.0 %. The next lever
+is the kernels' arithmetic. Gate/up does 34.4 GFLOP per 1,024-token launch
+(arithmetic from the geometry: 2 x 1024 x 8 x 2 x 512 x 2048) in 19.8 ms
+(`measured-here`), about 1.7 TFLOPS derived. [code] The 0059–0061 kernels
+run on the vector units, not the matrix engines. [code] OTD_PERF on the
+served route changes signature: `avg_cpu_x_*` read 0 and `avg_cpu_topk_id_us`
+is the blocking topk read alone, as under NOHOIST.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

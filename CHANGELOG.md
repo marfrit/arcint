@@ -479,6 +479,10 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   prefill 349.9 -> 625.7 t/s at 4096, decode 18.4 -> 19.8. Stamp unchanged at
   `+p19`. `tools/native_moe_block_ab.cpp` repeats the GPU run for timing
   (`ARCINT_BLOCK_AB_REPEAT`).
+- **No speculative hidden-state readback on the all-resident pool** (plugin
+  patch 0062, DESIGN §7.0.2cn): with every expert holding a slot, the MoE call
+  reads only its top-k ids back. Full depth on the A770: prefill 625.7 ->
+  653.7 t/s at 4096, the same digests. Stamp unchanged at `+p19`.
 - **Instruments**: `tools/bigalloc.c` (large host allocations by call
   stack, peak-attributed), `tools/native_moe_match_probe.cpp` (the native
   matcher pass alone, device-free), `tools/native_moe_block_ab.cpp` (one

@@ -1614,6 +1614,32 @@ on n0 and dropped) is correct by reading (`code`) and never exercised: N_BLOCK
 multiple of 4. `MOE_NATIVE_TILE_N=4` (gate/up 4 x 4) is run by the cell for
 bytes only, never timed.
 
+## 0062 — all-resident pool: no speculative hidden-state readback (2026-09-26)
+
+0017 hoisted the CPU tier's readback: every MoE call copied topk_id, the whole
+hidden state (T x hidden f16) and the routing weights to the host, before
+knowing whether any expert would miss. On the all-resident native pool
+(0051/0058) every expert holds a slot, and no call can miss (`code`: the
+static partition reserves min(capacity, num_expert) experts, and 0058 fills
+every slot at bind). MEASURED (A770): the 0061 prefill timeline still carried
+the copy, 320 device-to-host copies (4 chunks x 40 layers x {x, rw}) and 345
+ms of a 6.75 s window: 4 MiB per MoE layer at a 1,024-token chunk.
+
+0062 reads topk_id alone when `resident_slot_count() >= num_expert`, as
+`MOE_OTD_READBACK_NOHOIST` does. A miss there (impossible by construction,
+`code`) would still fetch x/rw after the slot upload, through NOHOIST's late
+branch. A pool smaller than the expert count keeps 0017's hoist unchanged.
+
+MEASURED (A770, 2026-09-26): the 0062 timeline has no device-to-host memcpy in
+the request window. The blocking topk_id read into host memory stays, and was
+never among the 320. OTD_PERF on this route: `avg_cpu_x_*` read 0, and
+`avg_cpu_topk_id_us` is the topk read alone (`code`). The warm-up span sums
+its two legs under NOHOIST and here alike. Full depth, all-resident, u8 KV, chunk 1024: prefill
+625.7 -> **653.7 t/s** @4096, decode 20.9 / 19.8 -> 21.1 / 19.9, the same
+digests. Lowering cells: 81 passed, 1 skipped (the tier50 route keeps the
+hoist). Series 0003–0062 (60 patches) applies byte-identical to the built
+tree; the plugin compiles clean.
+
 ## Hazard: the measurement tree's patch set is applied but UNCOMMITTED
 
 The dev tree the measurement plugin is built from (its path is operator-local)

@@ -286,4 +286,9 @@ at the end, not many. **No measurement before the feature exists.**
   **625.7 t/s** at 4096 (decode 19.8), the same digests (DESIGN §7.0.2cm). The
   rate is above row 3c's 460 t/s. **Rows 1–3 stay EMPTY**: the row's model and
   configuration are still the operator's question.
+- 2026-09-26, readback leg (`measured-here`, A770) — the all-resident pool
+  still copied every MoE call's hidden state to the host (0017's speculative
+  tier readback). Patch 0062 skips it when no expert can miss: **653.7 t/s**
+  at 4096 (decode 19.9), the same digests (DESIGN §7.0.2cn). **Rows 1–3 stay
+  EMPTY.**
 
