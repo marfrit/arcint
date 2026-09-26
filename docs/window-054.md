@@ -226,4 +226,20 @@ at the end, not many. **No measurement before the feature exists.**
   so a **new chunked primitive + kernel** would be needed). Mechanism numbers,
   same card/rung/32k: chunked prefill **153.5** vs sequential **161.8** t/s;
   decode 18.0 vs **26.7** — the unfused chunked **loses** to the fused
-  sequential. **Rows 1–3 stay EMPTY (OWED).**
+  sequential.
+- 2026-09-26, packed-reorder leg (operator instruction) — **BLOCKED, premise
+  disproven**. `KeepMOE3GemmConstPrecision` (the u4-only pass that marks MoE
+  weight Constants keep-precision) **never fires** for the packed route: 0
+  `ARCINT_PASS` lines over a full d4packed load — the packed route is not an
+  `MOECompressed`/`GEMM3_SWIGLU` at all. Extending it to any Constant changes
+  nothing; reverted (unverified). The real site is
+  `ProgramBuilder::build` → `program::build_program` →
+  `build_implementations` → `kernels_cache::build_all` →
+  `_builder->build_kernels(..., KernelFormat::SOURCE, batch.options)`: the
+  throw is the **OCL kernel compilation of a batch** (`CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST`
+  surfacing through `gpu_usm::fill`'s wait), not a reorder. **None of the three
+  candidate fixes has an object**: there is no reorder in the packed route to
+  skip, retarget or bound. **No red-first cell** (naming the failing batch
+  needs a plugin instrument this leg did not land). No artifact byte changed,
+  no gate run; plugin reinstalled clean (`f9eb7ffdc5d83ee7`). **Rows 1–3 stay
+  EMPTY (OWED).**

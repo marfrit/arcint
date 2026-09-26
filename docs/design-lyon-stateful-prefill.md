@@ -419,6 +419,65 @@ implementation, not this leg.
 artifact is not the model), and no full-depth chunked artifact was built. No
 row is filled by inference.
 
+## 4g. The packed route's reorder leg — BLOCKED: the reorder does not exist there (2026-09-26)
+
+Operator instruction: pick the smallest correct fix for the packed route's
+`f16` expansion — skip the reorder, reorder to u8/bf16, or bound it — with a
+red-first cell. **Attempted and returned BLOCKED**, because the premise does
+not hold for the packed route. Evidence, in order.
+
+**1. The suspect pass never fires** (`measured-here`). `KeepMOE3GemmConstPrecision`
+(`keep_moe_3gemm_const_precision.cpp`) matches u4 Constants and is the plugin
+pass that marks MoE weight Constants keep-precision (preventing a precision-pass
+conversion). It is the natural home of "skip the reorder". Instrumented with
+`ARCINT_PASS` prints carrying `expert_type` and the matched Constants' element
+types, then a full d4packed load on the A770:
+
+```
+ARCINT_PASS ...        (0 lines)
+```
+
+**Zero firings.** The packed route is **not** an
+`ov::op::internal::MOECompressed` with `GEMM3_SWIGLU` — its matcher path is a
+different op entirely (the `iq2sp` decode-chain matcher, which resolves on
+the arcint side). Extending the pass to `wrap_type<Constant>()` (any element
+type) therefore changes **nothing** for the packed route: measured, the d4packed
+load still fails at the same site. The pass change was **reverted** — it is
+unverified and buys nothing.
+
+**2. Where the failure actually is** (`code` + `measured-here`).
+`ProgramBuilder::build` catches at `program_builder.cpp`:168
+(`OPENVINO_ASSERT(false, "[GPU] ProgramBuilder build failed!\n", e.what())`)
+and the wrapped `e.what()` is `ocl_memory.cpp`:606 — `gpu_usm::fill`'s
+`ev_ocl.wait()` throwing `CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST`
+(-14). That is a **wait on an earlier queued kernel's failure**, not a failure
+of the fill itself. Walking the stack: `ProgramBuilder::build` →
+`cldnn::program::build_program` → `program::build_program(bool)` (line 503) →
+`apply_opt_pass<build_implementations>()` →
+`build_implementations::run` (`kernels_cache::build_all()`) →
+`kernels_cache::build_batch` → `_builder->build_kernels(combined_source,
+KernelFormat::SOURCE, batch.options)`. So the throw is the **OCL kernel
+compilation of a batch** — exactly the reviewer's prime suspect, "the new OCL
+kernel's build", **not** a Constant-precision reorder.
+
+**3. So none of the three candidate fixes has an object.** The packed route
+does not go through `MOECompressed` at all, so there is no reorder to skip,
+none to retarget to u8/bf16, and none to bound. What has to be fixed is the
+**packed OCL kernel's compilation** (build options / register or local-memory
+pressure / the kernel's own layout expectations), and the plugin names no last
+primitive — the `build_implementations`/`kernels_cache` instrument that would
+name the failing batch did not compile in this leg and was reverted with the
+rest.
+
+**BLOCKED**, per the operator's own escape clause. The reorder hypothesis is
+disproven; a red-first cell needs the failing batch named first, which needs a
+working plugin instrument that this leg did not land. **No red-first cell.**
+No artifact byte was changed; no gate was run; the diagnostic pass change was
+reverted and the plugin reinstalled clean (sha `f9eb7ffdc5d83ee7`).
+
+**Still OWED:** LYON's chunked fused primitive; the fit levers (dense-u8 form,
+the 2.903x materialisation). LYON-001 rows stay EMPTY.
+
 ## 5. Pipeline for the increment
 
 Recon (done, §1–3) → **this note** → red-first: the cell in §1 (landed) plus a
