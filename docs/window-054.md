@@ -207,5 +207,11 @@ at the end, not many. **No measurement before the feature exists.**
   build: `CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST` (`measured-here`). The
   isolated chunked GDN block compiles on GPU.1, so the Loop is fine; the full
   graph's failure is **not localized** and is the finding. The alternative — a
-  **chunked fusion matcher** — is the larger next change. **Rows 1–3 stay
-  EMPTY (OWED).**
+  **chunked fusion matcher** — is the larger next change.
+- 2026-09-26, bisect leg — the interaction is **not the Loop itself**: the
+  chunked GDN alone (no MoE) compiles on GPU.1, the sequential MoE artifact is
+  the standing control, and chunked + MoE fails with
+  `CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST`; a depth-1 discriminator is
+  refused earlier by `SDPAToPagedAttention` (0 attention layers). Not pinned
+  further; the plugin names no last primitive. No fix attempted. **Rows 1–3
+  stay EMPTY (OWED).**

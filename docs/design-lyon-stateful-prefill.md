@@ -209,6 +209,45 @@ is the **finding**: the beam-free fix landed, the load check advanced past the
 parameter error, and the full-graph build stops with
 `CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST`. LYON-001 rows stay EMPTY.
 
+## 4d. The bisect (2026-09-26, bounded leg) — the interaction is NOT the Loop itself
+
+Four small cases, each one GPU.1 compile, sampler + watchdog on the card legs;
+`measured-here`:
+
+| case | graph | GPU.1 |
+|---|---|---|
+| (a) | chunked GDN only, no MoE (pin geometry, T=64) | **compile OK** |
+| (a-control) | sequential GDN only, no MoE | compile OK |
+| (b) | MoE + sequential (`qwen36-35b-a3b-d4packed-ov`) | compile + serve OK (the standing control) |
+| (c) | chunked + MoE (`qwen36-35b-a3b-d4chunked-ov`, depth 4) | **FAIL** |
+
+So **(a) is clean and (c) fails**: the failure is an **interaction in the full
+graph**, not the chunked Loop itself. The failing site (raw line):
+
+```
+Check 'false' failed at src/plugins/intel_gpu/src/plugin/program_builder.cpp:168:
+[GPU] ProgramBuilder build failed!
+Exception from src/plugins/intel_gpu/src/runtime/ocl/ocl_memory.cpp:606:
+[GPU] clWaitForEvents, error code: -14 CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST
+```
+
+The plugin logs **no last-primitive** line before the throw, so the failing op
+is not named by the log.
+
+**Not pinned to MoE-vs-attention.** A depth-1 artifact (GDN + MoE, no
+attention) cannot discriminate: arcint refuses it **earlier and for a different
+reason** — `Check 'ov::op::util::has_op_with_type<ov::scaled_dot_product_attention>(model)'
+failed at sdpa_to_paged_attention.cpp:81` (a depth-1 `qwen3_5_moe` rung has 0
+attention layers, so the paged-attention pass has nothing to rewrite). A
+device-free Python bisect that would have built chunked+MoE at a small geometry
+segfaults **inside the MoE emitter** (`emit_moe_tiled`, both a native and a u4
+filler), so it yields no GPU answer. The interaction is therefore localised to
+**chunked-Loop × the full graph's build**, not further.
+
+**No fix in this leg**, per the brief. The next leg starts with this table; the
+likely fix remains the **chunked fusion matcher** (or a plugin-side Loop build
+fix), a daylight change.
+
 ## 5. Pipeline for the increment
 
 Recon (done, §1–3) → **this note** → red-first: the cell in §1 (landed) plus a
