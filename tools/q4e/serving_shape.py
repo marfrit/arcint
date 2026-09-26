@@ -1545,7 +1545,7 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
                     g = qgdn.emit_gdn(
                         h, conv_mask, cfg, _strip(st, "linear_attn."), None,
                         conv_emitter=stateful_short_conv(i, beam, sinks),
-                        core_emitter=stateful_gdn_core(i, beam, sinks))
+                        core_emitter=gdn_core_emitter(i, beam, sinks))
                 else:
                     g = emit_stateful_attention(
                         h, pid, cfg, _strip(st, "self_attn."), i, beam,
@@ -1865,6 +1865,200 @@ def _gdn_loop_body(HV, Dk, Dv):
                   op.result(updated), op.result(scattered)],
                  params, "gdn_delta_rule_step")
     return body, params
+
+
+def _gdn_chunk_body(HV, Dk, Dv, chunk):
+    """One CHUNK of the gated delta rule, as a Loop body: the SAME algebra the
+    chunked core emits (`q4e.gdn`'s `perchunk` branch, `gdn.py`:470-500), with
+    the recurrent state a merged Loop input instead of a Python variable.
+
+    This is what makes multi-block prefill possible: the token-sequential body
+    (`_gdn_loop_body`) advances ONE token per iteration, so a 32k prefill pays
+    32k iterations; this one advances `chunk` tokens, so it pays `ceil(T/chunk)`
+    -- 512 iterations at 32k instead of 32,768.
+
+    The algebra is reused, not re-derived. `last` is the body's `state`
+    parameter (the token-sequential core's `[1, HV, Dk, Dv]`), and the chunk's
+    output is written into the buffer at rows `step*chunk .. +chunk`.
+
+    Body results, IN THIS ORDER (the token-sequential matcher's contract, kept
+    even though a chunked Loop is NOT fused -- see `stateful_gdn_core_chunked`):
+    [execution condition, updated state, scattered output].
+    """
+    i64 = lambda v: op.constant(np.array(v, np.int64))
+    step = op.parameter([], Type.i64)
+    state = op.parameter([1, HV, Dk, Dv], Type.f32)
+    buf = op.parameter([1, HV, -1, Dv], Type.f32)
+    q = op.parameter([1, HV, chunk, Dk], Type.f32)
+    k = op.parameter([1, HV, chunk, Dk], Type.f32)
+    v = op.parameter([1, HV, chunk, Dv], Type.f32)
+    g = op.parameter([1, HV, chunk], Type.f32)
+    beta = op.parameter([1, HV, chunk], Type.f32)
+
+    beta_u = qgdn._reshape(beta, [1, HV, chunk, 1])
+    v_beta = qgdn._mul(v, beta_u)
+    k_beta = qgdn._mul(k, beta_u)
+    add_mask = qgdn._c(np.where(np.triu(np.ones((chunk, chunk), np.float32), 1) > 0,
+                                -1e30, 0.0).astype(np.float32))
+
+    cum = op.cumsum(g, i64(2))                       # [1,HV,chunk]
+    expc4 = qgdn._reshape(op.exp(cum), [1, HV, chunk, 1])
+    pd = op.exp(qgdn._add(
+        qgdn._sub(qgdn._reshape(cum, [1, HV, chunk, 1]),
+                  qgdn._reshape(cum, [1, HV, 1, chunk])), add_mask))
+    ut = qgdn._mul(qgdn._mm(k_beta, k, tb=True), pd)     # [1,HV,chunk,chunk]
+    it = qgdn._mul(qgdn._mm(q, k, tb=True), pd)
+    dkb = qgdn._mul(k_beta, expc4)
+    inv = qgdn._ut_inverse(ut, chunk, [1, HV])           # pin 355-365
+    nv = qgdn._mm(inv, v_beta)                           # pin 366
+    kcd = qgdn._mm(inv, dkb)
+
+    qd = qgdn._mul(q, expc4)
+    cum_last = qgdn._slice(cum, chunk - 1, chunk, 1, 2)  # [1,HV,1]
+    kd = qgdn._mul(k, qgdn._reshape(op.exp(qgdn._sub(cum_last, cum)),
+                                    [1, HV, chunk, 1]))
+    cd = qgdn._reshape(op.exp(cum_last), [1, HV, 1, 1])
+
+    v_new = qgdn._sub(nv, qgdn._mm(kcd, state))
+    inter = qgdn._mm(qd, state)
+    core = qgdn._add(inter, qgdn._mm(it, v_new))         # [1,HV,chunk,Dv]
+    updated = qgdn._add(qgdn._mul(state, cd),
+                        qgdn._mm(kd, v_new, ta=True))    # [1,HV,Dk,Dv]
+
+    rows = op.add(op.multiply(step, i64(chunk)),
+                  op.constant(np.arange(chunk, dtype=np.int64)))   # [chunk]
+    scattered = op.scatter_update(buf, rows, core, i64(2))
+
+    params = [step, state, buf, q, k, v, g, beta]
+    body = Model([op.result(op.constant(np.array(True))),
+                  op.result(updated), op.result(scattered)],
+                 params, "gdn_delta_rule_chunk")
+    return body, params
+
+
+def stateful_gdn_core_chunked(layer, beam, sinks, chunk=None):
+    """The gated delta rule as a CHUNKED Loop -- `stateful_gdn_core`'s drop-in
+    that advances `chunk` tokens per iteration instead of one.
+
+    THE MATCHER QUESTION, DECIDED: `FuseGDNLoop` matches only the
+    token-sequential Loop (`_gdn_loop_body`'s docstring: query/key/value rank 4
+    with a sequence extent of ONE). A chunked body carries a sequence extent of
+    `chunk`, so it is NOT rewritten into `ov::op::internal::GatedDeltaNet` and
+    `PagedGatedDeltaNetFusion` never sees it. **Decision: keep the chunked body
+    IN-GRAPH** -- the cost is that this prefill path loses the fused kernel,
+    which is the decode path's fast route; the benefit is that it still beats
+    one iteration per token by `chunk`, which is the whole point. Extending the
+    matcher to a chunked Loop is a separate, larger change (the fusion's
+    `matches_linear_attention_loop` reads a rank-4 seq-1 body and its state
+    update is the token rule) and is NOT done here. Stated, not left implicit.
+
+    The dynamic-T contract is kept: the trip count is `ceil(T/chunk)`, computed
+    from `ShapeOf`, so the graph is T-independent (LYON's compile-once property
+    survives). The inputs are zero-padded to a multiple of `chunk` before the
+    Loop and the buffer is sliced back to T after it, so a prompt whose length
+    is not a multiple of `chunk` is exact.
+    """
+    C = int(chunk or qgdn.CHUNK)
+
+    def emit(q, k, v, beta_t, decay_t, T, HV, Dk, Dv):
+        i64 = lambda val: op.constant(np.array(val, np.int64))
+
+        head_size = op.convert(
+            op.gather(op.shape_of(q, output_type="i64"), i64(3), i64(0)),
+            Type.f32)
+        q_scaled = op.divide(
+            q, op.power(head_size, op.constant(np.array(0.5, np.float32))))
+
+        info = ovutil.VariableInfo()
+        info.data_shape = ov.PartialShape([1, HV, Dk, Dv])
+        info.data_type = Type.f32
+        info.variable_id = f"cache_params.past.ssm.{layer}"
+        var = ovutil.Variable(info)
+        init = op.broadcast(op.constant(np.array(0.0, np.float32)),
+                            i64([1, HV, Dk, Dv]))
+        past = op.gather(op.read_value(init, var), beam, i64(0))
+
+        # ceil(T / chunk) and the pad to a whole chunk, from ShapeOf
+        n_tok = op.squeeze(op.gather(op.shape_of(q, output_type="i64"),
+                                     i64([2]), i64(0)), i64([0]))
+        n_chunks = op.divide(op.add(n_tok, i64(C - 1)), i64(C))
+        n_pad = op.subtract(op.multiply(n_chunks, i64(C)), n_tok)
+        pad_shape = op.concat([i64([1, HV]), op.reshape(n_pad, i64([1]), False),
+                               i64([Dk])], axis=0)
+        buf_shape = op.concat([i64([1, HV]),
+                               op.reshape(op.multiply(n_chunks, i64(C)),
+                                          i64([1]), False),
+                               i64([Dv])], axis=0)
+
+        def _pad(x, shape):
+            return op.concat([x, op.broadcast(op.constant(np.array(0.0, np.float32)),
+                                              shape)], axis=2)
+
+        q_p = _pad(q_scaled, pad_shape)
+        k_p = _pad(k, pad_shape)
+        pad_v = op.concat([i64([1, HV]), op.reshape(n_pad, i64([1]), False),
+                           i64([Dv])], axis=0)
+        v_p = _pad(v, pad_v)
+        pad_1 = op.concat([i64([1, HV]), op.reshape(n_pad, i64([1]), False)], axis=0)
+        g_p = _pad(decay_t, pad_1)
+        b_p = _pad(beta_t, pad_1)
+
+        body, (p_step, p_state, p_buf, p_q, p_k, p_v, p_g,
+               p_beta) = _gdn_chunk_body(HV, Dk, Dv, C)
+        loop = op.loop(n_chunks, op.constant(np.array(True)))
+        loop.set_function(body)
+        loop.set_special_body_ports([0, 0])
+        for param, src in ((p_q, q_p), (p_k, k_p), (p_v, v_p),
+                           (p_g, g_p), (p_beta, b_p)):
+            loop.set_sliced_input(param, src.output(0), 0, C, C, -1, 2)
+        loop.set_merged_input(p_state, past.output(0),
+                              body.get_results()[1].output(0))
+        loop.set_merged_input(
+            p_buf,
+            op.broadcast(op.constant(np.array(0.0, np.float32)),
+                         buf_shape).output(0),
+            body.get_results()[2].output(0))
+        attn_out = loop.get_iter_value(body.get_results()[2].output(0), -1)
+        state_out = loop.get_iter_value(body.get_results()[1].output(0), -1)
+        loop.validate_and_infer_types()
+
+        sinks.append(op.assign(
+            op.reshape(state_out, i64([1, HV, Dk, Dv]), special_zero=False),
+            var))
+        # the buffer is chunk-padded: cut it back to T, then the served order
+        kept = op.slice(attn_out, i64([0]), op.reshape(n_tok, i64([1]), False),
+                        i64([1]), i64([2]))
+        return op.transpose(kept,
+                            op.constant(np.array([0, 2, 1, 3], np.int32)))
+
+    return emit
+
+
+# arcint (0.5.4 LYON). The GDN core the served backbone emits.
+#
+#   "sequential"  the token-sequential Loop (`stateful_gdn_core`): one token per
+#                 iteration. This is the body `FuseGDNLoop` rewrites into
+#                 `ov::op::internal::GatedDeltaNet` and `PagedGatedDeltaNetFusion`
+#                 matches -- the decode path's fused kernel.
+#   "chunked"     the multi-block Loop (`stateful_gdn_core_chunked`): CHUNK
+#                 tokens per iteration, so a 32k prefill pays 512 iterations
+#                 instead of 32,768. NOT fused (the fusion reads a seq-1 body);
+#                 kept IN-GRAPH deliberately -- see that emitter's docstring.
+#
+# BOTH are T-independent (the trip count comes off `ShapeOf`), so LYON's
+# compile-once property holds under either. `Q4E_GDN_CORE` selects one for a
+# whole export without editing code, the discipline `Q4E_GDN_UT_MODE` uses; a
+# typo is REFUSED, so a silent default cannot report the wrong core's graph.
+GDN_CORE = os.environ.get("Q4E_GDN_CORE", "sequential").strip() or "sequential"
+GDN_CORE_CHUNK = int(os.environ.get("Q4E_GDN_CHUNK", qgdn.CHUNK))
+
+
+def gdn_core_emitter(layer, beam, sinks):
+    if GDN_CORE == "sequential":
+        return stateful_gdn_core(layer, beam, sinks)
+    if GDN_CORE == "chunked":
+        return stateful_gdn_core_chunked(layer, beam, sinks, chunk=GDN_CORE_CHUNK)
+    raise ValueError(f"unknown Q4E_GDN_CORE {GDN_CORE!r}; expected sequential or chunked")
 
 
 def stateful_gdn_core(layer, beam, sinks):
@@ -2434,7 +2628,7 @@ def build_qwen35moe_serving_shape_ir(config=None, arena=None, n_layers=None,
                     g = qgdn.emit_gdn(
                         h, conv_mask, cfg, _strip(st, "linear_attn."), None,
                         conv_emitter=stateful_short_conv(i, beam, sinks),
-                        core_emitter=stateful_gdn_core(i, beam, sinks))
+                        core_emitter=gdn_core_emitter(i, beam, sinks))
                 else:
                     g = emit_stateful_attention(
                         h, pid, cfg, _strip(st, "self_attn."), i, beam,

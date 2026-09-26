@@ -501,6 +501,104 @@ def test_the_served_prefill_graph_does_not_grow_with_the_prompt_length():
         f"the served path ({n_served} nodes) is not smaller than one perchunk "
         f"chunk ({static[64]}); the stateful route did not retire the unroll")
 
+    # 0.5.4 LYON: the MULTI-BLOCK served core must be T-invariant too -- chunk-
+    # count shaped, NOT token-count shaped. Build it dynamic and assert the
+    # node count does not move with the length asked for, and that neither
+    # served core grows one node per token (the unroll would).
+    def served_with(core_emitter):
+        s2 = []
+        h = ovop.parameter([1, -1, H], ov.Type.f32)
+        a = ovop.parameter([1, -1], ov.Type.f32)
+        o = gdn.emit_gdn(h, a, config, state, None,
+                         conv_emitter=ss.stateful_short_conv(0, beam, s2),
+                         core_emitter=core_emitter(0, beam, s2))
+        return len(ov.Model([ovop.result(o)], list(s2), [h, a], "t2").get_ordered_ops())
+
+    n_chunked = served_with(ss.stateful_gdn_core_chunked)
+    print(f"[lyon] served sequential={n_served} chunked={n_chunked} nodes "
+          f"(both T-invariant; perchunk would add {static[512] - static[64]} per 448 tokens)")
+    assert n_chunked < static[64], (
+        f"the chunked served path ({n_chunked}) must stay smaller than one "
+        f"perchunk chunk ({static[64]}) -- it must NOT be token-count shaped")
+    # neither served core may grow with prompt length: both are dynamic in T,
+    # so a node added per token is impossible unless the emitter regressed
+    for n in (n_served, n_chunked):
+        assert n < static[64] + 64, (
+            f"a served core read {n} nodes, near the per-chunk unroll's own "
+            f"size -- the stateful route is not holding")
+
+
+def test_the_chunked_stateful_core_is_the_chunked_algebra_across_boundaries():
+    """LYON: the multi-block stateful core (`stateful_gdn_core_chunked`) must
+    be the CHUNKED algebra (`gdn.py`'s `perchunk` core) with the state carried
+    across chunks -- so it is byte-exact against it -- and only f32-bounded
+    against the token-sequential core (different summation order; byte-exact is
+    impossible there and that is recorded, not weakened).
+
+    Lengths chosen to cross MULTIPLE chunk boundaries and to include a
+    non-multiple (T=192 is 3 chunks exactly; T=224 is 3.5 -> the zero-pad
+    path), not one token and not one chunk."""
+    import openvino as ov
+    from openvino import opset13 as ovop
+    from q4e import serving_shape as ss
+
+    config = _make_config()
+    ref, _ = _ref_and_pin(config)
+    state = _state_np(ref)
+    beam = ovop.constant(np.array([0], np.int64))
+    core = ov.Core()
+
+    for T in (128, 192, 224, 256):
+        x = torch.randn(1, T, config.hidden_size)
+        mask = torch.ones(1, T, dtype=torch.long)
+        with torch.no_grad():
+            ref64 = ref_gdn.Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).eval().double()
+            ref64.load_state_dict({k: v.double() for k, v in ref.state_dict().items()})
+            y_64 = ref64(x.double(), mask).numpy().astype(np.float64)
+        with torch.no_grad():
+            y_ref_inst = ref(x, mask).float().numpy().astype(np.float64)
+        floor = float(np.max(np.abs(y_ref_inst - y_64)))
+        feed = {"hidden_states": x.float().numpy(),
+                "attention_mask": mask.float().numpy()}
+
+        y_ref = np.asarray(compile_for(core, gdn.build_gdn_model(
+            config, state, seq_len=T), "CPU")(feed)[0], np.float64)
+
+        def _stateful(emitter):
+            # build_gdn_model wires only the CORE hook (its conv stays the
+            # default unroll), so one state is carried -- the same contract
+            # the existing sequential-vs-chunked parity cell uses.
+            sinks = []
+            m = gdn.build_gdn_model(
+                config, state, seq_len=T, sinks=sinks,
+                core_emitter=emitter(0, beam, sinks))
+            assert len(sinks) == 1, f"{len(sinks)} Assign(s); the core carries one state"
+            assert len(m.get_variables()) == 1, m.get_variables()
+            return np.asarray(compile_for(core, m, "CPU")(feed)[0], np.float64)
+
+        y_seq = _stateful(ss.stateful_gdn_core)
+        y_chunk = _stateful(ss.stateful_gdn_core_chunked)
+
+        d_chunk = float(np.max(np.abs(y_chunk - y_ref)))
+        d_seq = float(np.max(np.abs(y_seq - y_ref)))
+        print(f"\n[lyon-chunk] T={T:4d}  |chunked-stateful - chunked|={d_chunk:.4e}  "
+              f"|sequential - chunked|={d_seq:.4e}  floor={floor:.4e}")
+
+        # 1. the chunked stateful core IS the chunked algebra: byte-exact
+        assert np.array_equal(y_chunk, y_ref), (
+            f"T={T}: the chunked stateful core is NOT byte-exact against the "
+            f"chunked algebra (max |diff| {d_chunk:.4e}); the body reused the "
+            f"wrong ops or the state merge lost precision")
+        # 2. against the token-sequential core it is f32-bounded, NOT byte-exact
+        #    -- different summation order; recorded as the finding, not weakened
+        assert d_seq <= 20.0 * floor, (
+            f"T={T}: the token-sequential core left the bound ({d_seq:.4e} vs "
+            f"{20.0 * floor:.4e}); floor {floor:.4e}")
+        assert d_seq > 0.0, (
+            f"T={T}: the sequential and chunked cores are bitwise identical, "
+            f"which they cannot be -- the parity cell is comparing one graph "
+            f"with itself")
+
 
 def test_an_unknown_chunk_emission_mode_is_refused():
     """The mode string reaches a comparison, not a silent default. A typo that
