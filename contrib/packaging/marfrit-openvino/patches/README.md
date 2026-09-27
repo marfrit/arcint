@@ -2055,3 +2055,77 @@ The greedy text is byte-identical in all six long legs. Per token 342–343 ->
 better than seven, so the default stays at hardware_concurrency() - 1. Series
 0003–0071 (69 patches) applies to the pin with `git apply` and reproduces the
 built tree file for file.
+
+## 0072 — CPU tier: a host RAM bank for the expert bytes, filled at load (2026-09-28)
+
+The tier read every expert in place from a shared mapping of the weight file
+(`ParallelWeightReader::mapped`). Flash-Next's expert constants are 56.4 GiB;
+at ratio 78 the host tier alone is ~47 GiB against a 52 GiB host, so the page
+cache cannot hold it and every miss arrived as 128 KiB page-fault reads on the
+worker that touched it. Measured on the B60 decode: the tier's workers spend
+13–17 % of their wall in `folio_wait_bit_common`. Telling the kernel early
+(`madvise(WILLNEED)` per span at dispatch) changed nothing, because the kernel
+caps one call at `max(io_pages, ra_pages)` = 128 KiB there. A 4 MiB readahead
+made the prefetch pay but doubled the bytes read (~108 MB per token against
+~50).
+
+`moe/host_expert_bank.hpp` keeps expert records in slots of one anonymous
+`MAP_NORESERVE` mapping (`MOE_CPU_BANK_BYTES`; unset keeps the mapping path).
+- **Fill at load:** a layer's first tier call queues a fill. It takes every
+  expert the static partition does not pin to the card, in the per-layer rank
+  of `MOE_CPU_BANK_SEED` (a hot-set seed file with a `# space=layer_key` line
+  and a full ranking), at most `MOE_CPU_BANK_FILL_PER_LAYER`. Each per-tensor
+  array is read as one sequential O_DIRECT range, from the lowest to the
+  highest selected expert, and copied into the slots. That range includes the
+  card-resident experts' bytes (59.8 GiB read for 56.4 GiB of constants), so
+  `MOE_CPU_BANK_FILL_PER_LAYER` bounds the slots but not the read. The fill
+  never evicts, and runs once per layer key.
+- **Misses:** a miss takes a slot, LRU over unpinned slots of its size class.
+  Its spans are read with O_DIRECT on `MOE_CPU_BANK_IO_THREADS` (default 8).
+  `dispatch_cpu_tier` runs the experts already present, and the IO thread
+  queues a missing expert's compute when its last span lands. The join waits
+  for those experts, then for the pool; a compute that could not be queued is
+  the join's error.
+- **Fallback:** a slot counts as a hit only for the same spans. A request with
+  no slot, or for a record another caller is still reading, reads the mapping
+  as before, and so does a failed read. A file whose filesystem refuses
+  O_DIRECT is logged once and stays on the mapping.
+- **Memory:** the budget is `MAP_NORESERVE`, so a budget above the host's free
+  memory ends in an OOM kill rather than an allocation error. Each layer's
+  fill maps one transient staging range, the size of its largest per-tensor
+  range, on top of the budget.
+
+The bytes are the file's, so the output is too. Ten cells cover bytes at
+unaligned offsets and at the file end, hits, LRU and pins, short reads, size
+classes, the fill's bytes, its budget and once-per-layer run, and span
+mismatch. Each is red on a named mutant: the in-slot offset dropped, a pinned
+slot evicted, a failed read served as ready, a record being read served,
+size classes ignored, the fill's copy offset dropped, the fill evicting, the
+fill running twice, and spans compared by count only.
+
+Served on the B60: Flash-Next `d48s2`, ratio 78 + tier + per-expert
+dispatch, 12e9 device slot pool (0070), census112 resident seed, u8 paged KV,
+dev container at 16 CPUs / 52 GiB. Each leg is a fresh process serving "Hello"
+then a second prompt, 257 greedy tokens each, with text byte-identical across
+arms on both:
+
+| arm | load to READY | decode "Hello" | decode 2nd prompt | bank |
+|---|---|---|---|---|
+| mapping (no bank) | 88 s | 48.55 s | 34.62 s | — |
+| 40 GiB, 360/layer | 105 s | 40.42 s | 34.11 s | budget out at 44 of 48 layers; 4,033 demand reads |
+| 46 GiB, 370/layer | 109 s | 38.18 s | 33.77 s | 16,374 filled; 2,161 demand reads, 0 evictions |
+| 46 GiB, reviewed build | 110 s | 39.66 s | 34.72 s | 16,030 filled; 2,506 demand reads, 0 evictions |
+| 46 GiB, final build | 105 s | 38.90 s | 33.77 s | 16,136 filled; 2,399 demand reads, 0 evictions |
+
+How many experts the fill installs depends on how it races the load's own
+demand reads. The 46 GiB arms' minimum MemAvailable was 5.6–7.4 GB, which is
+the operator's margin on this host, not a property of the patch.
+
+Serving "Hello" twice in one process puts every expert it routes to in RAM
+for the second pass. That pass decodes in 28.92 s on the mapping and in
+29.48 s (32 GiB) and 30.39 s (46 GiB) with the bank. There the tier's
+decode-only compute is 1.14 ms per layer call for 7.57 experts (counter
+difference between a one-request and a two-request process), which is the
+tier bench's own figure for that many experts on 15 workers. Series
+0003–0072 (70 patches) applies to the pin with `git apply` and reproduces the
+built tree file for file.

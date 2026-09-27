@@ -52,6 +52,16 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   `MOE_CPU_TIER_SPLIT=0` keeps one task per expert. Needs a `marfrit-openvino`
   `+p22` for release.
 
+- **CPU tier: expert bytes from a host RAM bank filled at load** (plugin
+  patch 0072, `MOE_CPU_BANK_BYTES`, `MOE_CPU_BANK_SEED`,
+  `MOE_CPU_BANK_FILL_PER_LAYER`): the host tier's experts are read once at
+  load, sequentially with O_DIRECT, into anonymous memory, and misses are read
+  whole instead of page-faulting on the workers. On the B60 with Flash-Next
+  `d48s2` (ratio 78 + tier + dispatch), the first 257-token answer of a fresh
+  process decodes in 38.2–39.7 s against 48.6 s from the page cache, with
+  byte-identical text; loading takes ~21 s longer. Off unless the budget is
+  set. Needs a `marfrit-openvino` `+p23` for release.
+
 ## 0.5.0.1 — 2026-09-27
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p20` (patches 0003–0067).
