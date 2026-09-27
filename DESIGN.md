@@ -10942,21 +10942,44 @@ marfrit-openvino +p20-1, unless named.]
   - Pinned 2000: 44.0 / 44.3, 1352 / 1351, and 40.3 / 40.6.
   - Pinning costs the coder about 5 % decode and 3 % prefill; its depth-1
     decode is neutral.
-- **Per kernel** [measured-here, traced decode, depth 1, 32 tokens, one trace
-  per arm]: the 35B served pinned at 2000 MHz (installed 0.5.0.1) against
-  the default-governor trace of §7.0.2cs (plugin prefix 0003–0067, the same
-  code). Medians over steps 5–29:
-  - GDN input projection 142.6 -> **70.6 µs**; output projection 110.9 ->
-    **51.1 µs**; second projection 59.2 -> 59.2;
-  - dense GEMMs per step 15.28 -> **11.02 ms**; MoE kernels 4.51 -> 4.51 ms;
-  - device busy per step 29.2 -> 24.85 ms.
-  So the transitions carry most of §7.0.2ct's served-GEMM slowdown. What
-  remains against the isolated figures (55 / 29.8 / 31.4 µs, stock runtime,
-  default governor) is +15.6, +21.3 and +27.8 µs.
+- **Per kernel** [measured-here]. Two traced decodes of the 35B: depth 1,
+  the prompt "Hello", 32 greedy tokens, u8 KV, chunk 1024, n-ctx 8192,
+  embeddings on the CPU, dynamic quantisation off, steps split at the
+  per-step host copy, medians over steps 5–29, one trace per arm.
+  - Default governor: §7.0.2cs's trace (plugin prefix 0003–0067, repository
+    binary).
+  - Pinned at 2000 MHz: the installed 0.5.0.1 on +p20-1, which is patches
+    0003–0067 by the CHANGELOG (`code`; the plugin hashes were not compared).
+    Under the tracer it decoded 26.4 t/s (32–35 untraced).
+
+  | median | default | pinned 2000 |
+  |---|---|---|
+  | GDN input projection 8192x2048 | 142.6 µs | 70.6 µs |
+  | GDN output projection 2048x4096 | 110.9 µs | 51.1 µs |
+  | GDN second projection 4096x2048 | 59.2 µs | 59.2 µs |
+  | dense GEMMs per step | 15.28 ms | 11.02 ms |
+  | MoE kernels per step | 4.51 ms | 4.51 ms |
+  | device busy per step | 29.2 ms | 24.85 ms |
+
+  - [arithmetic] Against the isolated figures (§7.0.2ct), the pin removes
+    82 % of the input projection's excess and 74 % of the output
+    projection's, but none of the second projection's: 67 % of the three
+    together.
+  - The pinned dense-GEMM total (11.02 ms) is below §7.0.2cr's scalar-arm
+    13.5 ms.
+  - What remains is +15.7 / +21.3 / +27.8 µs against the stock isolated
+    figures (54.9 / 29.8 / 31.4 µs), or +13.4 / +21.2 / +26.0 against the
+    patched ones (57.2 / 29.9 / 33.2, the last two with the residual).
+    These compare pinned served launches with default-governor isolated
+    ones, so they are not residuals of known sign. The pin moved an
+    isolated FC as well (67.9 -> 50.4 µs, above).
+  - Pinning removes both the transitions and the 2350–2400 MHz boost. Which
+    of the two the recovery rests on is not separated.
 - **Standing.** The 35B native route transitions about 30 times as often as
-  the coder and throttles on PL4 24 times as often. Removing its transitions
-  by pinning gains 14 % decode; the coder, which runs at the top clock
-  nearly throughout, loses by being held lower. That the 35B's matrix-unit
+  the coder and throttles on PL4 24 times as often. Pinned at 2000 MHz, which
+  removes both its transitions and the boost clock, it gains 14 % decode. The
+  coder, which runs at the top clock nearly throughout, loses by being held
+  lower. That the 35B's matrix-unit
   gate/up is what drives its throttling is a hypothesis (§7.0.2ct).
   - The A770 serves the coder, so its clock stays on the default governor.
   - Pinning at 2000 MHz is the setting if the 35B native becomes that
