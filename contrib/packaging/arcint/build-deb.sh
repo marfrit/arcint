@@ -156,7 +156,9 @@ cp "$HERE/debian/copyright" "$ROOT/usr/share/doc/arcint/copyright"
 cp "$HERE/debian/changelog" "$ROOT/usr/share/doc/arcint/changelog.Debian"
 gzip -9 -n "$ROOT/usr/share/doc/arcint/changelog.Debian"
 
-INSTALLED_KB=$(du -sk "$ROOT" | cut -f1)
+# --apparent-size: on ZFS a freshly written tree reports its compressed/unflushed
+# allocation (9 KiB for ~3 MiB), and apt shows that as the installed size.
+INSTALLED_KB=$(du -sk --apparent-size "$ROOT" | cut -f1)
 cat > "$ROOT/DEBIAN/control" <<EOF
 Package: arcint
 Version: ${PKGVER}-${PKGREL}
