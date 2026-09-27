@@ -305,7 +305,27 @@ def build_embed_model(table_f32, mdl_name="qwen4_exp_embed"):
     return ov.Model([res], [ids], mdl_name)
 
 
-def main(argv=None):
+# The staging window every qwen4_exp export declares unless --ngram-pinned:
+# 2,100 tokens x 16 n-gram heads. It covers the served prefill chunk (at most
+# 2,048 tokens, the load ladder included) with margin. Measured with it on the
+# A770 (DESIGN 7.0.2cz, 2026-09-27): d48s2 gives d48p2's greedy digests
+# without per-expert dispatch and decodes 1.6-2.7x faster from the same
+# volume, with 2.9 MiB of staging per lane in place of the 26.82 GiB pin.
+NGRAM_STAGING_ROWS_DEFAULT = 33600
+
+
+def ngram_staging_rows(args):
+    """The staging bound a qwen4_exp export declares: the explicit
+    `--ngram-staging-rows`, else the default; None (whole-table ports) under
+    `--ngram-pinned`. The parser keeps None as "not given" so a family with no
+    table can refuse an explicit value."""
+    if args.ngram_pinned:
+        return None
+    return (NGRAM_STAGING_ROWS_DEFAULT if args.ngram_staging_rows is None
+            else args.ngram_staging_rows)
+
+
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--layers", type=int, required=True)
@@ -333,13 +353,19 @@ def main(argv=None):
                          "per role and decoded in standard ops (exact; served through the "
                          "plugin's native lowering, patch 0043)")
     ap.add_argument("--ngram-staging-rows", type=int, default=None,
-                    help="declare the n-gram table port as a per-forward STAGING "
-                         "WINDOW of this many rows (campaign ple-disk-backend) "
-                         "instead of ports spanning the whole table: the runtime "
-                         "then preads only the rows a forward names into a small "
-                         "USM-host buffer and the 26.82 GiB pin never happens. "
-                         "The bound is max_tokens x Hn, Hn = (ngram_size - 1) x "
-                         "heads_per_ngram; the table itself still has to be on disk")
+                    help="the n-gram table port as a per-forward STAGING WINDOW of "
+                         "this many rows (campaign ple-disk-backend; the default "
+                         f"since 2026-09-27, {NGRAM_STAGING_ROWS_DEFAULT} rows = 2,100 "
+                         "tokens x 16 heads): the runtime preads only the rows a "
+                         "forward names into a small USM-host buffer per lane, and "
+                         "the 26.82 GiB pin never happens. The bound is max_tokens x "
+                         "Hn, Hn = (ngram_size - 1) x heads_per_ngram; a forward past "
+                         "it is refused by name at serve time. The table itself "
+                         "still has to be on disk")
+    ap.add_argument("--ngram-pinned", action="store_true",
+                    help="declare ports spanning the WHOLE n-gram table instead "
+                         "(bound at load as 26.82 GiB of USM host memory); the "
+                         "pre-2026-09-27 form, kept for A/B twins")
     ap.add_argument("--native-packed", action="store_true",
                     help="with --expert-format native: carry the checkpoint's own "
                          "82-byte IQ2_S block VERBATIM (82 B/256, the GGUF size; "
@@ -369,6 +395,11 @@ def main(argv=None):
                          "hidden state as ports between them, and every "
                          "expert body as a u8 port whose bytes go to "
                          "expert_bodies.u8 with an index in the manifest")
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
     args = ap.parse_args(argv)
     if args.dense_u8:
         args.dense_fp16 = True          # the rest of the graph's f32 Constants go f16
@@ -404,7 +435,8 @@ def main(argv=None):
             say("shards", "REFUSED: qwen35moe carries IQ2_S gate/up experts; "
                           "only --expert-format native can serve them")
             return 2
-        if args.segment_layers is not None or args.ngram_staging_rows is not None:
+        if (args.segment_layers is not None or args.ngram_pinned
+                or args.ngram_staging_rows is not None):
             say("shards", "REFUSED: qwen35moe has no PLE/n-gram table; the "
                           "segmented and staging paths do not apply")
             return 2
@@ -490,7 +522,7 @@ def main(argv=None):
                 model, rep = ss.build_serving_shape_ir(
                     arena=arena, n_layers=args.layers, filler=filler, feed=feed,
                     layer_range=None if args.segment_layers is None else (lo, hi),
-                    expert_ports=sink, ngram_staging_rows=args.ngram_staging_rows)
+                    expert_ports=sink, ngram_staging_rows=ngram_staging_rows(args))
         except Exception as exc:                                  # noqa: BLE001
             say("build", f"FAIL segment {k} layers {lo}..{hi - 1}: {type(exc).__name__}: {exc}")
             arena.close()

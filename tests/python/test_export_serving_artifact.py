@@ -109,3 +109,23 @@ def test_segment_ranges_cover_the_depth_and_refuse_a_segment_without_attention()
         esa.segment_ranges(48, 6)
     with pytest.raises(ValueError, match="no full-attention"):
         esa.segment_ranges(14, 12)          # tail (12, 14) has no index 3 mod 4
+
+
+def test_a_qwen4_exp_export_stages_the_ngram_table_unless_pinned():
+    """Since 2026-09-27 the export declares the n-gram table as a per-forward
+    staging window by default (DESIGN 7.0.2cz: without per-expert dispatch the
+    staged twin gives the pinned twin's greedy digests and decodes 1.6-2.7x
+    faster, with 2.9 MiB of staging per lane instead of a 26.82 GiB pin).
+    `--ngram-pinned` keeps the whole-table ports for A/B twins.
+
+    RED before the default changed: the parser's default was None (pinned).
+    """
+    base = ["--layers", "4", "--shards", "x", "--tokenizer-from", "y", "--out", "z"]
+    parse = esa.build_parser().parse_args
+    assert esa.ngram_staging_rows(parse(base)) == esa.NGRAM_STAGING_ROWS_DEFAULT == 33600
+    assert esa.ngram_staging_rows(parse(base + ["--ngram-pinned"])) is None
+    assert esa.ngram_staging_rows(parse(base + ["--ngram-staging-rows", "8192"])) == 8192
+    # "not given" stays distinguishable, so qwen35moe can refuse an explicit value
+    assert parse(base).ngram_staging_rows is None
+    # the bound covers the served prefill chunk (2,048 tokens) x 16 n-gram heads
+    assert esa.NGRAM_STAGING_ROWS_DEFAULT >= 2048 * 16
