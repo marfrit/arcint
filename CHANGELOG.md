@@ -23,7 +23,10 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   patch 0068, DESIGN §7.0.2cx): the same f32 bits, by two bitwise cells. On
   the dev host's CPU (a standalone build with the plugin's flags) a
   Flash-Next expert's single job, a decode step, drops from 15.3 to 0.97 ms.
-  The served Flash-Next decode is not measured yet.
+  Served, the Flash-Next `d48n` hybrid on the A770 decodes 1.8–2.2x faster
+  (0.5–0.6 -> 0.9–1.3 t/s) with byte-identical greedy text (four arms,
+  alternating runtimes); the host still reads heavily from disk. Needs a
+  `marfrit-openvino` `+p21` for release.
 
 ## 0.5.0.1 — 2026-09-27
 

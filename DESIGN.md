@@ -10988,9 +10988,8 @@ marfrit-openvino +p20-1, unless named.]
 #### 7.0.2cx The CPU tier's single job: AVX2 row decode and one row per lane, same bytes (patch 0068, 2026-09-27)
 
 Campaign: `docs/campaigns/sub4bit-vram-kernel.md`; plugin patch 0068. The served
-Flash-Next measurement is OWED: it needs a host-memory window with the B60's
-served unit stopped (LYON row 1's load drew the container to 8.7 GiB
-available).
+Flash-Next measurement is the last bullet (2026-09-27, both served units
+stopped).
 
 - [measured-here, dev-host CPU, a standalone build with the plugin's per-file
   flags] Where a single job's time goes: ten Flash-Next experts (IQ3_XXS
@@ -11029,6 +11028,55 @@ available).
   0066's jobs-in-lanes dots; only its decode changed.
 - [measured-here] Series 0003–0068 (66 patches) applies byte-identical to the
   built tree.
+- [measured-here, A770 `GPU.1` pinned at 2000 MHz (§7.0.2cw), 2026-09-27]
+  **Served, 0068 speeds the Flash-Next decode 1.8–2.2x; the two 32-token
+  greedy completions are byte-identical across all four arms.**
+  - Configuration: `d48n`, `--offload-ratio 75 --moe-cpu-tier
+    --moe-per-expert-dispatch`, u8 KV, `--n-ctx 8192`, chunk 512, one lane,
+    `--ngram-gguf` (the n-gram table pinned in USM host memory). The
+    installed arcint 0.5.0.1 binary (sha256 prefix `2d565045497d2f06`). Both
+    served units were stopped for the window.
+  - Two runtimes: the installed `+p20` (series 0003–0067, `dpkg -V` clean,
+    plugin sha256 prefix `5dadc0640cc5b139`) and a prefix built with 0068
+    (plugin `06695f128d943a6d`), selected by `LD_LIBRARY_PATH`. Each arm
+    printed the plugin it had mapped.
+  - Each arm is one fresh process with two requests, greedy, `ignore_eos`,
+    32 tokens: `"Hello"` (d1), then the first 512 ids of the bench prompt
+    file (d512, file sha256 prefix `31b351d6f95c5f08`).
+  - Four arms in the order base, 0068, base, 0068, so that each runtime is
+    measured twice and neither holds only the first slot. The page cache
+    was not dropped between arms, and this order does not cancel what one
+    arm leaves to the next. Seconds for the 32 decoded tokens, and the
+    512-token prefill:
+
+    | arm | d1 decode | d512 decode | prefill 512 | load (`compile_model`) |
+    |---|---|---|---|---|
+    | +p20 (1st) | 62.14 s (0.5 t/s) | 56.89 s (0.6 t/s) | 99.47 s | 38.0 s |
+    | 0068 (2nd) | 34.49 s (0.9 t/s) | 26.76 s (1.2 t/s) | 83.76 s | 68.1 s |
+    | +p20 (3rd) | 52.42 s (0.6 t/s) | 54.62 s (0.6 t/s) | 91.36 s | 80.5 s |
+    | 0068 (4th) | 27.55 s (1.2 t/s) | 25.16 s (1.3 t/s) | 80.10 s | 40.9 s |
+
+  - Ratios of the adjacent pairs: d1 1.80x and 1.90x, d512 2.13x and 2.17x;
+    the prefill 1.19x and 1.14x.
+  - All four arms give the same text: d1 sha256 prefix `1ddebc829f218598`,
+    d512 `e4b40e198c8f22a6`.
+  - The load time moves by 2x with no pattern by runtime; it is not
+    interpreted here (§7.0.2cy).
+  - The host still reads heavily from disk during these arms. `vmstat`
+    means over the whole third and fourth arms (host-wide, 5 s samples, the
+    load included; 97 and 63 samples):
+    - +p20: 333 MiB/s read, 26 % user CPU, 54 % idle, 14 % iowait;
+    - 0068: 468 MiB/s read, 11 % user CPU, 59 % idle, 25 % iowait.
+  - During the second arm's decode, `free -g` on the hypervisor read 47 GiB
+    used, 0 free (under 1 GiB), 15 GiB buff/cache (its ZFS ARC counts as
+    used; the model files sit on an ext4 volume, in the page cache). The
+    pinned n-gram table held 26.82 GiB of USM host memory (the load's own
+    line).
+  - [not measured] Whether the decode is now limited by the disk, and which
+    file the reads hit. One reading: the pinned table crowds the host-tier
+    experts out of the page cache, so the decode reads them from disk again.
+    The staged table (`docs/campaigns/ple-disk-backend.md`, gate passed at
+    depth 4) would test it; it has no full-depth artifact yet.
 
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
