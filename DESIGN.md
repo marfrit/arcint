@@ -11105,7 +11105,10 @@ Campaign: `docs/window-054.md` (row 3b, Status 2026-09-27). The bound is
 
 [DATED IN PLACE 2026-09-27, evening: the gate failure is localised to the
 per-expert dispatch route. With dispatch off, the old-decode twins agree
-bitwise (the "Evening" bullet at the end of this section).]
+bitwise (the "Evening" bullet at the end of this section). Late evening: its
+cause on the dispatch route is the static partition's `.bin`-offset key,
+measured on the new-decode twins' 4-token forward (the "Late evening"
+bullet).]
 
 Campaign: `docs/campaigns/ple-disk-backend.md`. The staged table passed its
 gate at depth 4 on 2026-09-23 but had no full-depth artifact.
@@ -11175,7 +11178,8 @@ gate at depth 4 on 2026-09-23 but had no full-depth artifact.
   - every infer is synchronous.
 - **What causes the divergence is OPEN.** [DATED IN PLACE 2026-09-27: see
   the "Evening" bullet; the divergence appears only with
-  `--moe-per-expert-dispatch`.] The decisive measurement is the
+  `--moe-per-expert-dispatch`. Its cause there: the "Late evening"
+  bullet.] The decisive measurement is the
   gathered bytes of both arms (the Convert output) in the 4-token forward,
   compared byte for byte.
 - **A defect in the shared row decode, not shown to cause the divergence.**
@@ -11362,7 +11366,11 @@ gate at depth 4 on 2026-09-23 but had no full-depth artifact.
       decode, `d48s` 397.74 / 1064.79 / 181.90 s. `d48s` loaded from the
       pool and `d48n` from ext4, with the page cache as the earlier arms
       left it, so the two are not comparable.
-  - **What differs on the dispatch route is not identified.**
+  - **What differs on the dispatch route is not identified.** [DATED IN
+    PLACE 2026-09-27: on the new-decode twins, identified and measured on
+    the 4-token forward in the "Late evening" bullet (the resident sets,
+    through the partition's `.bin`-offset key); consistent for `d48n` /
+    `d48s`, not re-measured on them.]
     - [code] Under dispatch a resident expert runs on the GPU per-expert
       kernel and a miss on the host tier.
     - [measured-here on plugin 0047, before patch 0056, and not re-measured
@@ -11381,7 +11389,10 @@ gate at depth 4 on 2026-09-23 but had no full-depth artifact.
     - The native route without dispatch runs every routed expert on the host
       tier, so residency moves bytes, not arithmetic
       (`docs/campaigns/expert-hot-set-lru.md`, ratio 99, plugin 0046).
-  - Owed:
+  - Owed [DATED IN PLACE 2026-09-27, late evening: the first item is
+    answered at ratio 75, the second (same volume, cache not dropped, order
+    stated) and the third on the 4-token forward, in the "Late evening"
+    bullet below]:
     - the new-decode twins on the tier-only route, before calling the
       full-depth gate passed;
     - the staged tier-only speed from the same volume, with the cache state
@@ -11390,6 +11401,113 @@ gate at depth 4 on 2026-09-23 but had no full-depth artifact.
       the twins (`MOE_OTD_PERF_LOG` counters first);
     - carried from the afternoon: more than one neutral perturbation, and
       repeats; `d48s2`'s cold-cache speed.
+
+- **Late evening: the twins' resident sets differ because the static
+  partition keys on a weight-file offset; with the sets made equal, the
+  4-token dispatch-on forward agrees bitwise.** [A770 pinned at 2000 MHz;
+  the new-decode twins `d48p2` / `d48s2`; binary `b01b3185…`; one run per
+  arm; dispatch-off arms from ext4 (`d48p2` first, then `d48s2`, page cache
+  not dropped), dispatch-on arms from the pool with the Evening bullet's
+  flags (`--offload-ratio 75 --moe-cpu-tier --moe-per-expert-dispatch
+  --paged-kv u8`, chunk 512, `--n-ctx 8192`)]
+  - [measured-here] **The new-decode twins, dispatch off** (`--offload-ratio
+    75 --moe-cpu-tier --paged-kv u8`): the digests agree, d1
+    `82df3c7881cf9a6b` and d512 `c1d2077f1a845e57` in both. The d1 digest
+    is also the one both twins gave with dispatch on (the afternoon's arms);
+    d512 is not. Only digests were taken here; the bit-identical 4-token
+    logits without dispatch were the old twins'.
+
+    | dispatch off, from ext4 | d1 decode (32 tok) | d512 prefill | d512 decode (32 tok) |
+    |---|---|---|---|
+    | `d48p2` pinned (ran first) | 25.58 s | 66.10 s | 29.12 s |
+    | `d48s2` staged | 16.16 s | 37.89 s | 10.77 s |
+
+    - This dispatch-off route is ratio 75. The 2026-09-23 depth-4 gate was
+      defined at ratio 99.
+    - That the ratio does not matter without dispatch has two supports:
+      - [code] every routed expert of a native layer runs on the host tier
+        without dispatch;
+      - [measured-here] the twins' resident sets differ (below), yet their
+        dispatch-off digests agree.
+  - [code] **What keys the partition.**
+    - `layer_key()` (patch 0013) is `weight_bin_offsets[0]`: the IR `.bin`
+      offset of the fused MoE op's `weight_0` constant. It is set by stock
+      `prepare_moe_otd_params` (`src/plugin/ops/moe.cpp`) from the constant's
+      `WeightlessCacheAttribute`.
+    - That is the file OTD reads, `ov::weights_path` = the artifact's
+      language-model `.bin`.
+    - Patch 0018 ranks experts on `(seed, layer_key, expert)`. Later patches
+      use the key but do not change it.
+  - [measured-here] **The layout.** `cmp` of the twins' `.bin` files: they
+    are identical before offset 1,515,618,509 and identical with a 24-byte
+    shift after it. `d48p2` holds 24 extra bytes there, as `d48n` does
+    against `d48s`. Only layer 0's `weight_0` offset lies before them.
+  - [measured-here] **Dispatch on, `MOE_OTD_PERF_LOG=1`, unseeded:**
+    - both processes run `static_partition=1`, `seed_source=splitmix64`,
+      seed `0xf2a17c0de5eed`;
+    - the 4-token forward's logits: max |dlogit| 0.02 / 0.68 / 1.08 / 1.40
+      (`d48s2` against `d48p2`);
+    - process totals at exit, the load ladder plus that forward: GPU hits
+      3,137 / 3,033, misses 19,214 / 19,369, tensor loads 19,262 / 18,782
+      (`d48p2` / `d48s2`);
+    - the logged `resident_checksum` values share one value between the two
+      logs. The list order is construction order, which 0013 notes is a
+      permutation. Some stderr lines interleave (44 intact `cpu_tier on`
+      lines against 48 checksums in `d48p2`).
+  - [measured-here, device-free] **The recompute.** 0018's rule, run in
+    Python over each twin's 48 `weight_0` offsets read from its xml,
+    reproduces all 48 logged checksums of each twin as sets. The keys
+    differ by exactly 24 in 47 layers and are equal in layer 0 (key
+    284,636,629), the layer that carries the one common checksum.
+  - [measured-here] **The intervention.** Census seeds (patch 0046) gave
+    both twins the SAME resident sets: `d48p2`'s own splitmix64 sets, each
+    written in its twin's key space.
+    - Both processes logged `seed_source=census` in all 48 layers.
+    - [code] Under a seed, the checksum line hashes the census set in force
+      (0046). The seeded runs' checksum sets equal each other, and equal
+      the unseeded `d48p2` run's (the 46 cleanly printed values). So the
+      plugin pinned `d48p2`'s sets in both. The one apparent difference in
+      a raw grep was an interleaved line (`…4b2560`). The `census_seed_fp`
+      values differ, as the two files hold different keys.
+    - The dispatch-on 4-token logits of the two twins are then
+      bit-identical, and the seeded `d48p2` equals the unseeded `d48p2`
+      bitwise.
+  - **Measured cause, on the 4-token dispatch-on forward** [measured-here:
+    the recompute, the layout, the intervention; code: 0013/0018]:
+    - the twins part because their resident sets differ;
+    - the sets differ because the partition keys on a `.bin` offset that
+      the staging export shifts by 24 bytes;
+    - with equal sets, the staged path gives the pinned path's bits.
+    - Not shown with equal sets: the d1/d512 digests and the KLD window,
+      where the 2,735-token prefill read 0.3273 staged against 0.2757
+      pinned. Both owed.
+  - **Consistent with, not separately tested:**
+    - on the old-decode twins, `layer0/out` equal and `layer1/out`
+      different;
+    - the old twins' bit-identical dispatch-off logits.
+    - Not explained by it: the probe sets that moved the pinned logits, and
+      the afternoon's reordered FullyConnected.
+  - [code, and a measurement on plugin 0047] A resident expert runs on the
+    GPU per-expert kernel and a miss on the host tier.
+    - [measured-here] The census control shows that the residency
+      difference moves the output on the 0068 prefix.
+    - It does not re-measure the size of the GPU-versus-host difference.
+      §7.0.2ce/cf measured that on 0047, before 0056.
+  - **Fix owed, in the plugin:** a layer key independent of the file layout.
+    - The decoder index is the simplest: it is known at each impl's
+      construction.
+    - A rank of `weight_0`'s offset among the MoE layers (the sort 0048
+      added, carried by 0049) needs a global pass first. 0046's seed
+      validation and the checksum line run in each impl's constructor,
+      before the other layers exist.
+    - Not 0013's construction sequence id, which is a permutation.
+    - The change moves every static-partition resident set. With it moves
+      every recorded digest and KLD baseline on a route where residency
+      selects the arithmetic: per-expert dispatch, and 0018's non-native
+      tier path (device f16 against host f32). The native route without
+      dispatch is immune.
+    - The census seed files (`# space=layer_key`) need a new key space or
+      regeneration.
 
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 

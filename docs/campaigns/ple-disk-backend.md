@@ -451,3 +451,31 @@ campaign's numeric gate in device-free form.
       gate is called passed;
     - the staged tier-only speed from the same volume;
     - whether, and why, the dispatch route's layer-1 MoE differs.
+
+- 2026-09-27 (late evening) — **the new-decode twins agree with dispatch off
+  (ratio 75); on the dispatch route their divergence is measured, on a 4-token
+  forward, to come from the static partition's `.bin`-offset key** (DESIGN
+  §7.0.2cz, "Late evening").
+  - [measured-here; A770 at 2000 MHz, `--offload-ratio 75 --moe-cpu-tier`,
+    u8 KV; the gate was defined at ratio 99] `d48p2` and `d48s2` with
+    dispatch off, both from ext4 (`d48p2` first, page cache not dropped),
+    one run each:
+    - digests: d1 `82df3c7881cf…`, d512 `c1d2077f1a84…` in both;
+    - staged speed: d1 decode 16.16 s against 25.58 s, prefill 512 37.89 s
+      against 66.10 s, d512 decode 10.77 s against 29.12 s.
+  - [code] The static partition keys each layer on its `weight_0` constant's
+    `.bin` offset (patches 0013/0018).
+  - [measured-here] `cmp`: `d48p2` holds 24 extra bytes at offset
+    1,515,618,509, and everything after is shifted by 24. Recomputed from
+    each xml, the partition reproduces all 48 logged checksums per twin: 47
+    keys differ by 24, layer 0's is equal.
+  - [measured-here] With census seeds (0046) giving both twins `d48p2`'s own
+    resident sets (the logged checksum sets confirm it), the dispatch-on
+    4-token logits of the twins are bit-identical.
+  - [measured-here] On that forward, with equal resident sets, the staged
+    path gives the pinned path's bits.
+  - Owed:
+    - the seeded dispatch-on d1/d512 digests and KLD window;
+    - a layout-independent layer key in the plugin (it moves every baseline
+      on a residency-dependent route, and the census seed key space);
+    - the new-decode twins' KLD on the tier-only route.
