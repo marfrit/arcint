@@ -10822,6 +10822,68 @@ of it.
   recipe's own gate. It is added (e21ddf9); `ctest -L unit` is 5/5 in a
   device-free build.
 
+#### 7.0.2cv The A770's post-footprint penalty: after a large read-only kernel the next GEMM runs slower (2026-09-27, open)
+
+Continues §7.0.2ct.
+- [measured-here] Configuration:
+  - card and runtime: A770 `GPU.1`, stock Python OV (2026.4 dev); device time
+    from the intercept;
+  - the chain: an f32 model with the f16 hint, 20 pairs of u8 group-16
+    scalar-zero-point FCs (4096x2048 then 2048x4096, M = 1);
+  - timing: 20 warm and 50 timed infers; medians per position, warm infers
+    included.
+  - Before each pair runs a read-only neighbour: a plain f16 FC over its own
+    R x 2048 constant. Its [1, 1, R] output is sum-reduced and added to the
+    chain, so the neighbour writes almost nothing.
+  - The footprint column assumes the f16 weights stay f16 on the device
+    ([inference]; read as f32 they would need 639 GB/s at 16 MiB and 762 GB/s
+    at 64 MiB, above the 560 GB/s nominal, `paper`).
+
+  | neighbour footprint | runs | neighbour | FC after it | next FC |
+  |---|---|---|---|---|
+  | none | 1 | – | 33.0 | 29.8 |
+  | 16 MiB | 3 | 52.4–52.5 | 33.0 / 33.0 / 33.0 | 30.2–30.3 |
+  | 2 x 16 MiB (two distinct constants), back to back | 1 | 52.5 / 52.8 | 33.2 | 30.4 |
+  | 20 MiB | 3 | 60.7 | **96.0 / 95.5 / 95.7** | 30.3 |
+  | 24 MiB | 1 | 70.1 | 70.0 | 30.3 |
+  | 28 MiB | 1 | 80.1 | 68.1 | 30.2 |
+  | 32 MiB | 1 | 95.0 | 69.8 | 30.4 |
+  | 64 MiB | 1 | 176.2 | 68.6 | 30.4 |
+
+- Reading is enough: a read-only neighbour slows the next GEMM.
+  - The penalty lands on the FC after the neighbour. The next one reads
+    about +0.5 µs in every neighbour row.
+  - Two 16 MiB neighbours in a row cost nothing where one 20 MiB neighbour
+    costs +63 µs (three runs). So the size of the last large kernel matters,
+    not the bytes since the last FC.
+  - The FC does not run directly after the neighbour: a reduction and an
+    add sit between them.
+  - Between 16 MiB (no effect) and 20 MiB the effect appears; 17–19 MiB and
+    21–23 MiB were not measured. From 24 to 64 MiB it reads +35.1 to +37.0
+    µs (one run each).
+  - 16 MiB is 16.8 MB, already above the 16 MB L2 (`paper`), and showed no
+    effect; the L2 remains a candidate only. The mechanism is not measured.
+- §7.0.2ct's arms, set against this:
+  - its 32 MiB rows (68.4 and 63.0 µs, about +36) fit;
+  - its 16 MiB rows (+109 in three runs with the atomic kernel, +83 for the
+    output arm) are not explained. There the kernel right before the slow
+    FC was a 9.7 µs atomic reduction, which by arithmetic cannot have
+    streamed 16 MiB, so "the last large kernel" is the most these rows
+    support.
+- Served, consistent in direction only.
+  - The GDN input projection reads about 18 MiB: 16 MiB u8 plus 2 MiB of
+    group-16 scales, [arithmetic]. The second projection runs directly after
+    it, at 59.2 µs served against 31.4 isolated (+27.8).
+  - 18 MiB lies in the untested gap, and +27.8 matches neither +36 nor +63.
+    The served figure ran on the patched +p20 runtime; this rule was
+    measured on the stock one.
+  - The other slow served launches: before the input projection sits the
+    MoE block. Its decode gate/up reads the routed experts' packed weights:
+    about 5 MB for 8 experts, [arithmetic] from the IR census (9.72 GiB of
+    expert u8 over 40 layers x 256 experts, about 1.0 MB per expert across
+    three projections). The other predecessors were not sized. Whether a
+    large read precedes those launches is therefore open.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,
