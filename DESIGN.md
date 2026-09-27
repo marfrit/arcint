@@ -10942,6 +10942,17 @@ marfrit-openvino +p20-1, unless named.]
   - Pinned 2000: 44.0 / 44.3, 1352 / 1351, and 40.3 / 40.6.
   - Pinning costs the coder about 5 % decode and 3 % prefill; its depth-1
     decode is neutral.
+- **Per kernel** [measured-here, traced decode, depth 1, 32 tokens, one trace
+  per arm]: the 35B served pinned at 2000 MHz (installed 0.5.0.1) against
+  the default-governor trace of §7.0.2cs (plugin prefix 0003–0067, the same
+  code). Medians over steps 5–29:
+  - GDN input projection 142.6 -> **70.6 µs**; output projection 110.9 ->
+    **51.1 µs**; second projection 59.2 -> 59.2;
+  - dense GEMMs per step 15.28 -> **11.02 ms**; MoE kernels 4.51 -> 4.51 ms;
+  - device busy per step 29.2 -> 24.85 ms.
+  So the transitions carry most of §7.0.2ct's served-GEMM slowdown. What
+  remains against the isolated figures (55 / 29.8 / 31.4 µs, stock runtime,
+  default governor) is +15.6, +21.3 and +27.8 µs.
 - **Standing.** The 35B native route transitions about 30 times as often as
   the coder and throttles on PL4 24 times as often. Removing its transitions
   by pinning gains 14 % decode; the coder, which runs at the top clock
