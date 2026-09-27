@@ -1,0 +1,70 @@
+# Per-expert dispatch: the resident slot pool in device memory, under the
+# per-compile device budget (MOE_OTD_DEVICE_POOL_BYTES, 0 by default = the
+# old placement). Patch 0047's dispatch branch allocated the pool with the
+# lockable default, which is usm_host on our cards, and never charged the
+# budget, so MOE_OTD_DEVICE_POOL_BYTES did nothing there and the per-expert
+# kernels read every resident expert over the card's link (the A770's is
+# ~1.8 GB/s: a 1.43 MB IQ3_XXS gate/up at ~0.8 ms). This branch now charges
+# the same running budget as the ordinary OTD path below it: usm_device while
+# there is room, the lockable default after, counted in device_slot_buffers /
+# host_slot_buffers and marked otd_device_slot.
+#
+# Measured on the A770 (Flash-Next d48s2, ratio 92 + tier + dispatch, a
+# 40-slot census seed, 128 decode tokens): with a 4.6 GB budget the pool is
+# 377 device buffers and 5 host ones, device-resident 12.34 GiB against 8.06,
+# decode 291.7 against 297.9 ms per forward with the pool in host memory; the
+# GPU hit rate there is 12.2 %, so the CPU tier still carries the decode.
+#
+--- a/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.cpp
++++ b/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.cpp
+@@ -92,8 +92,40 @@
+         desc.skip_evict = true;
+ 
+         auto pool_layout = cldnn::layout(desc.upload_shape, out_dtype, const_format);
+-        auto pool_mem = p.get_engine().allocate_memory(pool_layout, false);
++        // arcint (patch 0070). The slot pool is what the per-expert kernels read
++        // for every resident expert. The lockable default puts it in usm_host
++        // on our cards, so the card streamed "resident" experts over its PCIe
++        // link (the A770's is ~1.8 GB/s: a 1.43 MB IQ3_XXS gate/up at ~0.8 ms).
++        // Charge the same per-compile device budget as the ordinary OTD path
++        // below (MOE_OTD_DEVICE_POOL_BYTES, 0 by default = the old placement):
++        // usm_device while there is room, the lockable default after.
++        if (p.moe_device_pool_remaining_bytes < 0) {
++            p.moe_device_pool_remaining_bytes = static_cast<int64_t>(p.get_config().get_moe_otd_device_pool_bytes());
++        }
++        cldnn::memory::ptr pool_mem;
++        bool used_device = false;
++        const int64_t need = static_cast<int64_t>(pool_layout.bytes_count());
++        if (p.moe_device_pool_remaining_bytes >= need) {
++            try {
++                pool_mem = p.get_engine().allocate_memory(pool_layout, cldnn::allocation_type::usm_device, false);
++                p.moe_device_pool_remaining_bytes -= need;
++                used_device = true;
++            } catch (const std::exception&) {
++                pool_mem = nullptr;
++                if (auto* perf = ocl::moe_otd::get_perf_counters())
++                    perf->alloc_fallbacks.fetch_add(1, std::memory_order_relaxed);
++            }
++        }
++        if (!pool_mem)
++            pool_mem = p.get_engine().allocate_memory(pool_layout, false);
++        if (auto* perf = ocl::moe_otd::get_perf_counters()) {
++            if (used_device)
++                perf->device_slot_buffers.fetch_add(1, std::memory_order_relaxed);
++            else
++                perf->host_slot_buffers.fetch_add(1, std::memory_order_relaxed);
++        }
+         desc.memory = p.get_engine().reinterpret_buffer(*pool_mem, const_layout);
++        desc.memory->otd_device_slot = used_device;
+         OPENVINO_ASSERT(pool_layout.bytes_count() <= const_layout.bytes_count(),
+                         "Per-expert slot pool layout (", pool_layout.bytes_count(),
+                         " bytes) exceeds full constant layout (", const_layout.bytes_count(), " bytes)");
+@@ -103,7 +135,7 @@
+                                            const_shape[0],
+                                            0,
+                                            const_layout.bytes_count(),
+-                                           "deferred");
++                                           used_device ? "deferred usm_device" : "deferred usm_host");
+         return desc;
+     }
+ 

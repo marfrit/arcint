@@ -28,6 +28,21 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   alternating runtimes); the host still reads heavily from disk. Needs a
   `marfrit-openvino` `+p21` for release.
 
+- **Native IQ3_XXS gate/up and IQ4_NL/IQ4_XS down decode whole blocks** (plugin
+  patch 0069). On the A770, a Flash-Next-geometry block with its weights in
+  device memory runs its decode kernels at 280.9 -> 79.0 us (gate/up) and
+  74.3 -> 34.3 us (down) per call, and its grouped prefill kernels at 3.1x and
+  1.6x. The bytes change inside the CPU-oracle band (a new summation order).
+  The served Flash-Next decode is unchanged (2.1 / 2.0 t/s at ratio 75): its
+  resident slots sit in host memory and are read at the card's link rate.
+  Needs a `marfrit-openvino` `+p22` for release.
+
+- **Per-expert dispatch keeps its resident slots in device memory under a
+  budget** (plugin patch 0070, `ARCINT_MOE_DEVICE_POOL_BYTES`). Before, that
+  route's slot pool sat in host memory whatever the budget. On the A770 with
+  Flash-Next at ratio 92 it moves decode 297.9 -> 291.7 ms per forward (GPU hit
+  rate 12 %). Needs a `marfrit-openvino` `+p22` for release.
+
 ## 0.5.0.1 — 2026-09-27
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p20` (patches 0003–0067).

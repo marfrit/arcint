@@ -1880,6 +1880,89 @@ with the plugin's flags). `MOE_CPU_TIER_SCALAR_DECODE` set to anything but 0
 keeps the scalar decoder. The served
 Flash-Next decode is owed. Series 0003–0068 (66 patches).
 
+## 0069 — Native IQ3_XXS gate/up and IQ4_NL/IQ4_XS down decode whole blocks (2026-09-27)
+
+(IQ4_XS down shares IQ4_NL's layout and takes the same path; no cell runs
+IQ3_XXS over an IQ4_XS down. The gate/up's rows per subgroup are compiled in
+while the launch grid is computed at run time from the same environment, so an
+OpenVINO model-cache blob imported under different MOE_NATIVE_* switches would
+pair them wrongly; arcint's served paged graph compiles with the blob cache
+off, so that path is not reachable there.)
+
+The native per-expert kernels for Flash-Next's formats (IQ3_XXS gate/up,
+IQ4_NL down) gave each lane two values of a 32-value block, each with its
+own byte load, table load and activation load: 280.9 us per decode call for
+the gate/up and 74.3 us for the down (10 pairs, weights in device memory).
+0069:
+- a lane decodes a whole block per step, the shape of llama.cpp's
+  `vec_dot_iq3_xxs_q8_1`, but against f16 activations with f32 sums (no
+  activation quantisation);
+- eight values at a time become f32 weights, which every token of a tile
+  takes (a tile decodes its weights once);
+- the IQ3_XXS grid is an f32 table in constant memory, and the signs come from
+  the 7-bit index and its parity; IQ4_NL values are picked by two selects over
+  the table held in registers;
+- a block's sum is one fma chain over its 32 values, and the block scale is
+  factored out of it.
+
+The summation order changes against 0061's per-element decoders, so the
+bytes differ from theirs, inside the CPU-oracle band. A token's bytes stay
+the same across the per-pair, batched and grouped kinds.
+`MOE_NATIVE_LEGACY_DECODE=1` keeps 0061's decoders in the same build
+(measured: its output bytes and kernel times are 0068's). The weight-rounding
+arm (0063) always takes 0061's decoders. `MOE_NATIVE_GU_ROWS=1|2|4` sets the
+gate/up rows per subgroup (default 2). The down gives each row a group of four
+lanes, so `MOE_NATIVE_TILE_N` no longer applies to the IQ4_NL down. IQ2_S,
+IQ2_S-packed, IQ4_NL gate/up, Q8_0 and the IQ3_XXS down are untouched: 24 of
+24 output hashes are equal to 0068's (three format pairs, T = 1/6/17/40, auto
+and grouped dispatch).
+
+Cells (`tests/python/test_native_lowering_gpu.py`, A770):
+- The file gives 105 passed and 1 skipped (the affine control at ratio 0) on
+  plugin `d49f3dd78cd98364`.
+- New: `test_flash_next_geometry_matches_the_cpu_plugin_and_the_per_pair_bytes`
+  runs at hidden 2560 / inter 640 and at a remainder geometry (2304 / 608), 16
+  experts, top-10, T = 1 and 8. It passes on 0068 and on 0069. Three mutants
+  are each red on two of the four cells: gate/up dropping the remainder
+  blocks, the down keeping the repeated block, the grouped gate/up walking its
+  blocks in descending order.
+- At hidden 2560, T = 8 one element sits at 1.567 of the band on 0068 and on
+  0069, with the same output bits (token 3, column 1491). The cell therefore
+  takes the per-element decoders' own excess, plus 5% of the band, as its
+  bound where they are outside the band. The cause is not measured. At T =
+  128 the same block reads 11.8 of the band on both plugins.
+
+MEASURED (A770, one block at hidden 2560 / inter 640, 16 experts, top-10,
+f16, 2026-09-27; device time per call under the OpenCL intercept, block wall
+time as the median of repeats):
+
+| | 0068 | 0069 |
+|---|---|---|
+| T=1, all-resident: gate/up | 280.9 us | 79.0 us |
+| T=1, all-resident: down | 74.3 us | 34.3 us |
+| T=1, all-resident: block wall | 0.781 ms | 0.538 ms |
+| T=128, all-resident (grouped): gate/up | 11655 us | 3797 us |
+| T=128, all-resident (grouped): down | 2222 us | 1406 us |
+| T=128, all-resident: block wall | 17.19 ms | 8.49 ms |
+| T=1, ratio 50 + tier: gate/up | 4745.6 us | 4736.3 us |
+| T=1, ratio 50 + tier: down | 3052.0 us | 3046.0 us |
+
+- Gate/up rows per subgroup at T=1: 1 row 86.8 us, 2 rows 79.0 us, 4 rows
+  85.4 us.
+
+Served, the Flash-Next `d48s2` at ratio 75 + tier + dispatch (census seed, u8
+KV, 64 greedy tokens), one run per plugin, gives decode 2.1 t/s (0068) and 2.0
+t/s (0069). The greedy text differs.
+
+Unchanged because the ratio-50/75 arms read their resident slots over the
+bus. Under per-expert dispatch the slot pool is allocated with the engine's
+lockable default (0047's branch in `moe_offload_constant.cpp`), which is
+`usm_host` on this card. The decode kernels then read the weights at the
+A770's link rate: the served gate/up's fastest call is 796 us, about one
+expert's 1.43 MB at 1.8 GB/s. That is the served Flash-Next decode's cost per
+GPU expert, and 0069 does not touch it. Series 0003–0069 (67 patches) applies
+to the pin with `git apply` and reproduces the built tree file for file.
+
 ## Hazard: the measurement tree's patch set is applied but UNCOMMITTED
 
 The dev tree the measurement plugin is built from (its path is operator-local)
@@ -1898,3 +1981,20 @@ git -C <measurement tree> diff --stat <file>
 
 and re-apply anything lost. Do not `git checkout` a file in that tree without
 checking its diff first; the patch set is the tree's only record of itself.
+
+## 0070 — Per-expert dispatch: the resident slot pool in device memory (2026-09-27)
+
+Patch 0047's dispatch branch allocated the resident slot pool with the lockable
+default (usm_host on our cards) and never charged the per-compile device budget,
+so `MOE_OTD_DEVICE_POOL_BYTES` did nothing on that route and the per-expert
+kernels read every resident expert over the card's link. 0070 charges the same
+running budget as the ordinary OTD path: usm_device while there is room, the
+lockable default after, counted and marked like that path. The default budget is
+0, so nothing moves unless a budget is set (arcint: `ARCINT_MOE_DEVICE_POOL_BYTES`).
+
+Measured on the A770, Flash-Next `d48s2`, ratio 92 + tier + dispatch, a 40-slot
+census seed, 128 decode tokens: with a 4.6 GB budget, 377 device and 5 host slot
+buffers, device-resident 12.34 GiB against 8.06; decode 291.7 against 297.9 ms
+per forward with the pool in host memory. The GPU hit rate there is 12.2 %: the
+CPU tier still carries Flash-Next's decode.
+

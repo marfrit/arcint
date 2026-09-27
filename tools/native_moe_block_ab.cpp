@@ -11,8 +11,9 @@
 //   RUNTIME moe_typed=<n> native_nodes=<n>
 //   TYPES <runtime layer type>=<count> ...
 //   DIFF max_abs=<d> max_want=<w> max_over_band=<r> corr=<c>
+//   WORST row=<r> col=<c> want=<w> got=<g> row_rms=<rms>   (the element of max_over_band)
 //   GOT fnv1a64=<hash of the GPU output bytes>
-//   REPEAT n=<N> ms_mean=<m> ms_min=<m>   (only with ARCINT_BLOCK_AB_REPEAT=N)
+//   REPEAT n=<N> ms_mean=<m> ms_min=<m> ms_median=<m>   (only with ARCINT_BLOCK_AB_REPEAT=N)
 //   HEAD rows=<k> fnv1a64=<hash of the first k output rows> (ARCINT_BLOCK_AB_HASH_ROWS=k)
 //
 // The input rows are drawn in order from one seeded stream, so row 0 is the
@@ -129,6 +130,8 @@ int main(int argc, char** argv) {
     }
     const size_t row = want.get_shape().back();
     double max_abs = 0, max_want = 0, max_ratio = 0, sw = 0, sg = 0, sww = 0, sgg = 0, swg = 0;
+    size_t worst_r = 0, worst_j = 0;
+    double worst_rms = 0;
     for (size_t r = 0; r < n / row; ++r) {
         double ss = 0;
         for (size_t j = 0; j < row; ++j) ss += at(want, r * row + j) * at(want, r * row + j);
@@ -137,24 +140,38 @@ int main(int argc, char** argv) {
             const double w = at(want, r * row + j), g = at(got_t, r * row + j), d = std::fabs(g - w);
             max_abs = std::max(max_abs, d);
             max_want = std::max(max_want, std::fabs(w));
-            max_ratio = std::max(max_ratio, d / (2e-2 * std::fabs(w) + 1e-2 * rms));
+            const double ratio = d / (2e-2 * std::fabs(w) + 1e-2 * rms);
+            if (ratio > max_ratio) {
+                max_ratio = ratio;
+                worst_r = r, worst_j = j, worst_rms = rms;
+            }
             sw += w, sg += g, sww += w * w, sgg += g * g, swg += w * g;
         }
     }
     const double corr = (n * swg - sw * sg) / std::sqrt((n * sww - sw * sw) * (n * sgg - sg * sg));
     std::cout << "DIFF max_abs=" << max_abs << " max_want=" << max_want << " max_over_band=" << max_ratio
               << " corr=" << corr << "\n";
+    std::cout << "WORST row=" << worst_r << " col=" << worst_j << " want=" << at(want, worst_r * row + worst_j)
+              << " got=" << at(got_t, worst_r * row + worst_j) << " row_rms=" << worst_rms << "\n";
     if (const char* rep = std::getenv("ARCINT_BLOCK_AB_REPEAT")) {
         const int reps = std::atoi(rep);
         double sum = 0, best = 1e300;
+        std::vector<double> all;
         for (int i = 0; i < reps; ++i) {
             const auto t0 = std::chrono::steady_clock::now();
             rq_gpu.infer();
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             sum += ms;
             best = std::min(best, ms);
+            all.push_back(ms);
         }
-        if (reps > 0) std::cout << "REPEAT n=" << reps << " ms_mean=" << sum / reps << " ms_min=" << best << "\n";
+        if (reps > 0) {
+            // the median (the upper one of an even count): a few slow runs
+            // (the first after compile, a clock step) do not move it
+            std::sort(all.begin(), all.end());
+            std::cout << "REPEAT n=" << reps << " ms_mean=" << sum / reps << " ms_min=" << best
+                      << " ms_median=" << all[all.size() / 2] << "\n";
+        }
     }
     return 0;
 }
