@@ -19,6 +19,12 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+- **CPU tier: AVX2 row decode and a row-per-lane single-job dot** (plugin
+  patch 0068, DESIGN §7.0.2cx): the same f32 bits, by two bitwise cells. On
+  the dev host's CPU (a standalone build with the plugin's flags) a
+  Flash-Next expert's single job, a decode step, drops from 15.3 to 0.97 ms.
+  The served Flash-Next decode is not measured yet.
+
 ## 0.5.0.1 — 2026-09-27
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p20` (patches 0003–0067).

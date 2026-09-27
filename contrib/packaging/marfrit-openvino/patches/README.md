@@ -1864,6 +1864,22 @@ KV, 2026-09-26), three interleaved pairs:
 - Series 0003–0067 (65 patches) applies byte-identical to the built tree;
   the plugin sha256 prefix is `730ef0292cc959ab`.
 
+## 0068 — CPU tier: AVX2 row decode, and one row per lane for a single job (2026-09-27)
+
+A decode step gives each tier expert one job, and its time was the row
+decode, about 13 of 15 ms per Flash-Next expert on the dev host's CPU. 0068:
+- decodes IQ3_XXS and IQ4_NL rows eight values per AVX2 vector (the scalar
+  `d * v` with an exact sign-bit xor);
+- runs a single job's dots one row per lane over eight decoded rows (an 8x8
+  transpose in registers; the scalar multiply-then-add in k order,
+  `fp-contract=off`).
+Both keep the scalar f32 bits for every non-NaN scale. The two new bitwise
+cells are red on their mutants, and the built routines carry no FMA. One
+job: 15.3 -> 0.97 ms per expert, on the dev host's CPU (a standalone build
+with the plugin's flags). `MOE_CPU_TIER_SCALAR_DECODE` set to anything but 0
+keeps the scalar decoder. The served
+Flash-Next decode is owed. Series 0003–0068 (66 patches).
+
 ## Hazard: the measurement tree's patch set is applied but UNCOMMITTED
 
 The dev tree the measurement plugin is built from (its path is operator-local)

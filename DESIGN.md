@@ -10985,6 +10985,51 @@ marfrit-openvino +p20-1, unless named.]
   - Pinning at 2000 MHz is the setting if the 35B native becomes that
     card's served model: a host setting, the operator's decision.
 
+#### 7.0.2cx The CPU tier's single job: AVX2 row decode and one row per lane, same bytes (patch 0068, 2026-09-27)
+
+Campaign: `docs/campaigns/sub4bit-vram-kernel.md`; plugin patch 0068. The served
+Flash-Next measurement is OWED: it needs a host-memory window with the B60's
+served unit stopped (LYON row 1's load drew the container to 8.7 GiB
+available).
+
+- [measured-here, dev-host CPU, a standalone build with the plugin's per-file
+  flags] Where a single job's time goes: ten Flash-Next experts (IQ3_XXS
+  gate/up, IQ4_NL down, hidden 2560, intermediate 640), 20 timed rounds.
+  - 1 job: 15.3 ms per expert. 2 jobs: 13.1. 8 jobs: 13.3.
+  - So, inferred from how the time scales with the job count, about 13 ms
+    is the row decode (the dequantisation), done once per expert for all its
+    jobs, and about 2 ms is one job's scalar dot.
+- [code] 0068, part 1: the IQ3_XXS and IQ4_NL rows decode eight values per
+  AVX2 vector.
+  - Each value is the scalar decoder's `d * float(v)` (one rounding) with
+    the sign applied by a sign-bit xor. Multiplying by -1.0f does exactly
+    that for every non-NaN scale, so the f32 bits are the scalar decoder's (a
+    NaN scale stays NaN; its sign bit may differ).
+  - The f16 scale converts through F16C, exactly.
+  - `MOE_CPU_TIER_SCALAR_DECODE` set to anything but 0 keeps the scalar
+    decoder (read once per process); it does not turn off part 2.
+- [code] Part 2: a single job (a decode step) runs its dots one ROW per AVX2
+  lane, over eight decoded rows. An 8x8 transpose in registers gives each
+  lane its row's k-th value; each lane is the scalar dot's multiply-then-add
+  in k order (`fp-contract=off`), so the same f32 sums. A tail pass pads
+  with zero rows.
+- [measured-here] Cells:
+  - `the_avx2_row_decoders_give_the_scalar_decoders_bits`: 64 random rows
+    per format, finite normal and subnormal scales, sign indices over all 256
+    byte values, compared bitwise. It skips without the AVX2 build or with the
+    knob set. Red on a swapped nibble interleave (IQ4_NL), on reversed sign
+    bits and on a dropped sign-index mask (IQ3_XXS).
+  - `the_single_job_stage_gives_the_scalar_sums_bitwise`: K = 2560 IQ3_XXS
+    (15 rows) and K = 640 IQ4_NL (13 rows) against the per-job scalar stage.
+    Red on an FMA in one lane step, at both widths.
+  - 13 of 13 tier cells pass. The built plugin's three routines carry 0 FMA
+    (objdump).
+- [measured-here, same benchmark] 1 job: 15.3 -> **0.97 ms per expert**
+  (15.8x). 8 jobs: 13.3 -> 1.57 ms per expert. The multi-job path keeps
+  0066's jobs-in-lanes dots; only its decode changed.
+- [measured-here] Series 0003–0068 (66 patches) applies byte-identical to the
+  built tree.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

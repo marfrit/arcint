@@ -1,0 +1,324 @@
+# CPU tier, native formats, a single job (a decode step): the IQ3_XXS and
+# IQ4_NL rows decode eight values per AVX2 vector (the scalar decoder's
+# d * v with an exact sign-bit xor, so the same f32 bits), and the job's
+# dots run one ROW per AVX2 lane over eight decoded rows (an 8x8 transpose
+# in registers; each lane the scalar dot's multiply-then-add in k order,
+# fp-contract off), so the same f32 sums. MOE_CPU_TIER_SCALAR_DECODE=1 keeps
+# the scalar decoder. Two bitwise cells, each red on its mutants. Dev-host
+# CPU, 10 Flash-Next experts, one job: 15.3 -> 0.97 ms per expert.
+#
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
+@@ -12,7 +12,9 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
++#include <string>
+ #include <vector>
+ 
+ #if defined(OV_MOE_CPU_TIER_HAVE_AVX2)
+@@ -741,7 +743,7 @@
+ // element order (even index low nibble, as the u4 packing everywhere here);
+ // IQ3_XXS grid indices u8 [oc, ic/32, 8] (4 values each) and sign-mask
+ // indices u8 [oc, ic/32, 4] (8 signs each); scales f32 [oc, ic/32].
+-inline void decode_native_row(const QuantMatrix& m, int n, float* out) {
++inline void decode_native_row_scalar(const QuantMatrix& m, int n, float* out) {
+     const int groups = m.ic / 32;
+     const uint16_t* s = m.s + static_cast<size_t>(n) * static_cast<size_t>(groups);   // f16 per 32
+     if (m.format == kQuantFormatIq4Nl) {
+@@ -849,6 +851,37 @@
+     }
+ }
+ 
++// arcint (patch 0068). The row decode the tier uses: IQ3_XXS and IQ4_NL go
++// through the AVX2 decoders (the scalar decoder's f32 bits, eight values per
++// vector) when the build and the CPU have AVX2; everything else, and
++// MOE_CPU_TIER_SCALAR_DECODE set to anything but 0 (the A/B; read once per
++// process), takes the scalar decoder. The bits are the scalar decoder's for
++// every non-NaN scale. Decoding was the tier's single-job cost, about 13 of
++// 15 ms per Flash-Next expert on the dev host's CPU (inferred from how the time
++// scales with the job count), the dot the other 2.
++inline void decode_native_row(const QuantMatrix& m, int n, float* out) {
++#if defined(OV_MOE_CPU_TIER_HAVE_AVX2)
++    static const bool avx2_decode = [] {
++        const char* v = std::getenv("MOE_CPU_TIER_SCALAR_DECODE");
++        return ov::with_cpu_x86_avx2() && (v == nullptr || std::string(v) == "0");
++    }();
++    if (avx2_decode && (m.format == kQuantFormatIq3Xxs || m.format == kQuantFormatIq4Nl)) {
++        const int groups = m.ic / 32;
++        const uint16_t* s = m.s + static_cast<size_t>(n) * static_cast<size_t>(groups);
++        if (m.format == kQuantFormatIq4Nl) {
++            decode_iq4nl_row_avx2(m.w + static_cast<size_t>(n) * (static_cast<size_t>(m.ic) / 2u), s, groups,
++                                  kIq4NlValues, out);
++        } else {
++            decode_iq3xxs_row_avx2(m.w + static_cast<size_t>(n) * static_cast<size_t>(groups) * 8u,
++                                   m.z + static_cast<size_t>(n) * static_cast<size_t>(groups) * 4u, s, groups,
++                                   kIq3xxsGrid, kIq2xsSigns, out);
++        }
++        return;
++    }
++#endif
++    decode_native_row_scalar(m, n, out);
++}
++
+ // acc[n] for n in [n_begin, n_end) = sum_g s[n,g]*(dot(x, q(n, group g)) - Sx[g]*z[n,g]).
+ // Plain scalar, f32 accumulation throughout, no intrinsics, no xe/xo split --
+ // it indexes x[k] directly and derives the nibble from k&1, so it exercises
+@@ -856,6 +889,13 @@
+ // (that independence is what makes T1's nibble-flip red case meaningful).
+ }  // namespace (arcint patch 0043: compute_stage_f32 is linkable for the unit cells)
+ 
++void decode_native_row_for_test(const QuantMatrix& m, int n, float* out, bool scalar) {
++    if (scalar)
++        decode_native_row_scalar(m, n, out);
++    else
++        decode_native_row(m, n, out);
++}
++
+ void compute_stage_f32(const QuantMatrix& mat, const float* x, int n_begin, int n_end, float* acc_out) {
+     if (mat.format != kQuantFormatU4Affine) {
+         // arcint (patch 0043): a native format decodes the row (scale folded
+@@ -945,6 +985,26 @@
+         }
+         return;
+     }
++    // arcint (patch 0068): a single job (a decode step) runs its dots one ROW
++    // per AVX2 lane, eight decoded rows per pass (native_dot_rows8_avx2), each
++    // lane the scalar dot's own sequence -- the same bytes. A tail pass pads
++    // with zero rows and keeps only the real ones.
++    if (have_avx2 && n_jobs == 1 && mat.ic % 8 == 0) {
++        const size_t ic = static_cast<size_t>(mat.ic);
++        std::vector<float> rows(8 * ic, 0.0f);
++        float o8[8];
++        for (int n = n_begin; n < n_end; n += 8) {
++            const int nrows = n_end - n < 8 ? n_end - n : 8;
++            for (int r = 0; r < nrows; r++)
++                decode_native_row(mat, n + r, rows.data() + static_cast<size_t>(r) * ic);
++            if (nrows < 8)
++                std::fill(rows.begin() + static_cast<std::ptrdiff_t>(nrows) * static_cast<std::ptrdiff_t>(ic), rows.end(), 0.0f);
++            native_dot_rows8_avx2(rows.data(), mat.ic, X, o8);
++            for (int r = 0; r < nrows; r++)
++                out[static_cast<size_t>(n - n_begin + r)] = o8[r];
++        }
++        return;
++    }
+ #endif
+     std::vector<float> wrow(static_cast<size_t>(mat.ic));
+     for (int n = n_begin; n < n_end; n++) {
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
+@@ -137,8 +137,26 @@
+ // of 8, the pad lanes zero.
+ void native_dot_jobs_avx2(const float* const* wrows, int nrows, const float* xt, size_t jpad, int ic, size_t n_jobs,
+                           float* out, size_t out_stride);
++
++// arcint (patch 0068). One row of an IQ3_XXS / IQ4_NL matrix decoded to f32,
++// eight values per vector: each value is the scalar decoder's own d * v (one
++// rounding) with the sign applied exactly (sign-bit xor), so the f32 bits are
++// the scalar decoder's for every non-NaN scale (a NaN scale keeps a NaN, whose
++// sign bit may differ). The lookup tables are the scalar file's, passed in.
++void decode_iq3xxs_row_avx2(const uint8_t* gridix, const uint8_t* signix, const uint16_t* s, int groups,
++                            const uint32_t* grid, const uint8_t* signs_tbl, float* out);
++void decode_iq4nl_row_avx2(const uint8_t* row, const uint16_t* s, int groups, const int8_t* table, float* out);
++// arcint (patch 0068). One job's dots over eight decoded rows (rows: [8][ic],
++// row-major; ic a multiple of 8), one ROW per AVX2 lane: out[r] = sum_k
++// rows[r][k] * x[k], k in order, each step a multiply then an add -- the
++// scalar dot's own sequence, so the f32 bits are the scalar dot's.
++void native_dot_rows8_avx2(const float* rows, int ic, const float* x, float* out8);
+ #endif
+ 
++// arcint (patch 0068). Row n decoded to f32 by the scalar decoder
++// (scalar = true) or by the dispatching one the tier uses; for the unit cells.
++void decode_native_row_for_test(const QuantMatrix& m, int n, float* out, bool scalar);
++
+ // arcint (patch 0043). One projection stage of the plain-scalar reference:
+ // acc_out[n - n_begin] = dot(x, row n of mat) for n in [n_begin, n_end),
+ // through the affine algebra or the native row decoders by mat.format.
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert_avx2.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert_avx2.cpp
+@@ -351,6 +351,90 @@
+     }
+ }
+ 
++// arcint (patch 0068): see moe_cpu_expert.hpp. The f16 scale converts exactly
++// (F16C); the product is the scalar decoder's d * float(v); the sign is a
++// sign-bit xor, which is what multiplying by -1.0f does exactly.
++__attribute__((optimize("fp-contract=off")))
++void decode_iq3xxs_row_avx2(const uint8_t* gridix, const uint8_t* signix, const uint16_t* s, int groups,
++                            const uint32_t* grid, const uint8_t* signs_tbl, float* out) {
++    const __m256i bits = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
++    const __m256 signbit = _mm256_castsi256_ps(_mm256_set1_epi32(static_cast<int>(0x80000000u)));
++    for (int g = 0; g < groups; g++) {
++        const __m256 d = _mm256_set1_ps(_cvtsh_ss(s[g]));
++        for (int l = 0; l < 4; l++) {
++            const int signs = signs_tbl[signix[g * 4 + l] & 127];
++            const __m128i v = _mm_set_epi32(0, 0, static_cast<int>(grid[gridix[g * 8 + 2 * l + 1]]),
++                                            static_cast<int>(grid[gridix[g * 8 + 2 * l + 0]]));
++            const __m256 f = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(v));
++            const __m256i neg = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(signs), bits), bits);
++            const __m256 y = _mm256_xor_ps(_mm256_mul_ps(d, f), _mm256_and_ps(_mm256_castsi256_ps(neg), signbit));
++            _mm256_storeu_ps(out + g * 32 + l * 8, y);
++        }
++    }
++}
++
++__attribute__((optimize("fp-contract=off")))
++void decode_iq4nl_row_avx2(const uint8_t* row, const uint16_t* s, int groups, const int8_t* table, float* out) {
++    const __m128i tbl = _mm_loadu_si128(reinterpret_cast<const __m128i*>(table));
++    const __m128i lo4 = _mm_set1_epi8(0x0F);
++    for (int g = 0; g < groups; g++) {
++        const __m256 d = _mm256_set1_ps(_cvtsh_ss(s[g]));
++        const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + g * 16));
++        const __m128i lo = _mm_and_si128(b, lo4);
++        const __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), lo4);
++        // element 2i is byte i's low nibble, 2i+1 its high nibble (linear order)
++        const __m128i c0 = _mm_unpacklo_epi8(lo, hi);
++        const __m128i c1 = _mm_unpackhi_epi8(lo, hi);
++        const __m128i v0 = _mm_shuffle_epi8(tbl, c0);
++        const __m128i v1 = _mm_shuffle_epi8(tbl, c1);
++        float* y = out + g * 32;
++        _mm256_storeu_ps(y + 0, _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v0))));
++        _mm256_storeu_ps(y + 8, _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(v0, 8)))));
++        _mm256_storeu_ps(y + 16, _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v1))));
++        _mm256_storeu_ps(y + 24, _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(v1, 8)))));
++    }
++}
++
++// arcint (patch 0068): see moe_cpu_expert.hpp. Each 8x8 block of the eight
++// rows is transposed in registers so lane r holds row r's k-th value; the
++// products are w * x (x * w in the scalar dot: the same IEEE product).
++__attribute__((optimize("fp-contract=off")))
++void native_dot_rows8_avx2(const float* rows, int ic, const float* x, float* out8) {
++    __m256 acc = _mm256_setzero_ps();
++    for (int k = 0; k < ic; k += 8) {
++        const __m256 r0 = _mm256_loadu_ps(rows + 0 * static_cast<size_t>(ic) + k);
++        const __m256 r1 = _mm256_loadu_ps(rows + 1 * static_cast<size_t>(ic) + k);
++        const __m256 r2 = _mm256_loadu_ps(rows + 2 * static_cast<size_t>(ic) + k);
++        const __m256 r3 = _mm256_loadu_ps(rows + 3 * static_cast<size_t>(ic) + k);
++        const __m256 r4 = _mm256_loadu_ps(rows + 4 * static_cast<size_t>(ic) + k);
++        const __m256 r5 = _mm256_loadu_ps(rows + 5 * static_cast<size_t>(ic) + k);
++        const __m256 r6 = _mm256_loadu_ps(rows + 6 * static_cast<size_t>(ic) + k);
++        const __m256 r7 = _mm256_loadu_ps(rows + 7 * static_cast<size_t>(ic) + k);
++        const __m256 t0 = _mm256_unpacklo_ps(r0, r1), t1 = _mm256_unpackhi_ps(r0, r1);
++        const __m256 t2 = _mm256_unpacklo_ps(r2, r3), t3 = _mm256_unpackhi_ps(r2, r3);
++        const __m256 t4 = _mm256_unpacklo_ps(r4, r5), t5 = _mm256_unpackhi_ps(r4, r5);
++        const __m256 t6 = _mm256_unpacklo_ps(r6, r7), t7 = _mm256_unpackhi_ps(r6, r7);
++        const __m256 u0 = _mm256_shuffle_ps(t0, t2, 0x44), u1 = _mm256_shuffle_ps(t0, t2, 0xEE);
++        const __m256 u2 = _mm256_shuffle_ps(t1, t3, 0x44), u3 = _mm256_shuffle_ps(t1, t3, 0xEE);
++        const __m256 u4 = _mm256_shuffle_ps(t4, t6, 0x44), u5 = _mm256_shuffle_ps(t4, t6, 0xEE);
++        const __m256 u6 = _mm256_shuffle_ps(t5, t7, 0x44), u7 = _mm256_shuffle_ps(t5, t7, 0xEE);
++        // c_i: lane r = rows[r][k + i]
++        const __m256 c0 = _mm256_permute2f128_ps(u0, u4, 0x20), c4 = _mm256_permute2f128_ps(u0, u4, 0x31);
++        const __m256 c1 = _mm256_permute2f128_ps(u1, u5, 0x20), c5 = _mm256_permute2f128_ps(u1, u5, 0x31);
++        const __m256 c2 = _mm256_permute2f128_ps(u2, u6, 0x20), c6 = _mm256_permute2f128_ps(u2, u6, 0x31);
++        const __m256 c3 = _mm256_permute2f128_ps(u3, u7, 0x20), c7 = _mm256_permute2f128_ps(u3, u7, 0x31);
++        acc = _mm256_add_ps(acc, _mm256_mul_ps(c0, _mm256_set1_ps(x[k + 0])));
++        acc = _mm256_add_ps(acc, _mm256_mul_ps(c1, _mm256_set1_ps(x[k + 1])));
++        acc = _mm256_add_ps(acc, _mm256_mul_ps(c2, _mm256_set1_ps(x[k + 2])));
++        acc = _mm256_add_ps(acc, _mm256_mul_ps(c3, _mm256_set1_ps(x[k + 3])));
++        acc = _mm256_add_ps(acc, _mm256_mul_ps(c4, _mm256_set1_ps(x[k + 4])));
++        acc = _mm256_add_ps(acc, _mm256_mul_ps(c5, _mm256_set1_ps(x[k + 5])));
++        acc = _mm256_add_ps(acc, _mm256_mul_ps(c6, _mm256_set1_ps(x[k + 6])));
++        acc = _mm256_add_ps(acc, _mm256_mul_ps(c7, _mm256_set1_ps(x[k + 7])));
++    }
++    _mm256_storeu_ps(out8, acc);
++}
++
+ }  // namespace ov::intel_gpu::ocl::moe
+ 
+ #endif  // OV_MOE_CPU_TIER_HAVE_AVX2
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
+@@ -29,9 +29,11 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <random>
++#include <string>
+ #include <vector>
+ 
+ #include "ocl_v2/moe/moe_cpu_expert.hpp"
+@@ -617,6 +619,78 @@
+     }
+ }
+ 
++// arcint (patch 0068). The AVX2 row decoders for IQ3_XXS and IQ4_NL must give
++// the scalar decoder's f32 bits for every row: random blocks, random finite
++// scales (normal and subnormal f16), sign indices over all 256 byte values,
++// both formats. Red: a sign applied to the wrong lane, the nibble order
++// swapped, or the sign-index mask dropped changes bits here.
++TEST(moe_cpu_expert_native, the_avx2_row_decoders_give_the_scalar_decoders_bits) {
++    // Without the AVX2 decoders the dispatching decoder IS the scalar one, and
++    // the comparison would be the scalar decoder against itself: skip, not pass.
++#if !defined(OV_MOE_CPU_TIER_HAVE_AVX2)
++    GTEST_SKIP() << "built without OV_MOE_CPU_TIER_HAVE_AVX2: the AVX2 decoders are not compiled";
++#else
++    if (!ov::with_cpu_x86_avx2()) GTEST_SKIP() << "no AVX2 on this CPU";
++    if (const char* v = std::getenv("MOE_CPU_TIER_SCALAR_DECODE"); v != nullptr && std::string(v) != "0")
++        GTEST_SKIP() << "MOE_CPU_TIER_SCALAR_DECODE is set: the tier takes the scalar decoder";
++#endif
++    const int H = 2560, ROWS = 64;
++    std::mt19937 rng(23);
++    auto bytes = [&](size_t n, int mod) { std::vector<uint8_t> v(n); for (auto& b : v) b = static_cast<uint8_t>(rng() % static_cast<unsigned>(mod)); return v; };
++    std::vector<uint16_t> sc((size_t)ROWS * H / 32);
++    for (size_t i = 0; i < sc.size(); i++) sc[i] = static_cast<uint16_t>((i % 7 == 0) ? (rng() % 0x03FF + 1) : (rng() % 0x7BFF + 1));
++    for (auto& v : sc) if (rng() % 2) v |= 0x8000;
++    auto gw = bytes((size_t)ROWS * H / 4, 256), gz = bytes((size_t)ROWS * H / 8, 256);
++    auto dw = bytes((size_t)ROWS * H / 2, 256);
++    QuantMatrix iq3 = native_matrix(2, H, gw.data(), gz.data(), sc.data()); iq3.oc = ROWS;
++    QuantMatrix iq4 = native_matrix(1, H, dw.data(), nullptr, sc.data()); iq4.oc = ROWS;
++    std::vector<float> a(H), b(H);
++    for (const QuantMatrix* m : {&iq3, &iq4}) {
++        for (int n = 0; n < ROWS; n++) {
++            ov::intel_gpu::ocl::moe::decode_native_row_for_test(*m, n, a.data(), true);
++            ov::intel_gpu::ocl::moe::decode_native_row_for_test(*m, n, b.data(), false);
++            ASSERT_EQ(0, std::memcmp(a.data(), b.data(), sizeof(float) * H)) << "format " << m->format << " row " << n;
++        }
++    }
++}
++
++// arcint (patch 0068). A single job's stage runs its dots one row per AVX2
++// lane (eight decoded rows per pass, an 8x8 transpose in registers); the f32
++// sums must be the per-job scalar stage's, bit for bit. Both Flash-Next widths:
++// K = 2560 (gate/up, IQ3_XXS) and K = 640 (down, IQ4_NL); N = 15 and 13 rows
++// give a full pass and a tail. Red: a lane reading the wrong row or k, an FMA,
++// or a reordered sum changes bits here.
++TEST(moe_cpu_expert_native, the_single_job_stage_gives_the_scalar_sums_bitwise) {
++    using ov::intel_gpu::ocl::moe::compute_stage_f32_jobs;
++#if !defined(OV_MOE_CPU_TIER_HAVE_AVX2)
++    GTEST_SKIP() << "built without OV_MOE_CPU_TIER_HAVE_AVX2: the AVX2 lanes are not compiled";
++#else
++    if (!ov::with_cpu_x86_avx2())
++        GTEST_SKIP() << "no AVX2 on this CPU: the stage takes the scalar loop";
++#endif
++    std::mt19937 rng(29);
++    std::uniform_real_distribution<float> scale(0.01f, 0.05f);
++    std::normal_distribution<float> nd(0.0f, 1.0f);
++    struct Case { int fmt, K, N; };
++    for (const Case c : {Case{kQuantFormatIq3Xxs, 2560, 15}, Case{kQuantFormatIq4Nl, 640, 13}}) {
++        std::vector<uint8_t> w(static_cast<size_t>(c.N) * c.K / (c.fmt == kQuantFormatIq4Nl ? 2 : 4));
++        std::vector<uint8_t> z(static_cast<size_t>(c.N) * c.K / 8);
++        for (auto& b : w) b = static_cast<uint8_t>(rng() % 256u);
++        for (auto& b : z) b = static_cast<uint8_t>(rng() % 128u);
++        std::vector<uint16_t> s(static_cast<size_t>(c.N) * c.K / 32);
++        for (auto& v : s) v = f32_to_f16_bits(scale(rng));
++        QuantMatrix m = native_matrix(c.fmt, c.K, w.data(), c.fmt == kQuantFormatIq4Nl ? nullptr : z.data(), s.data());
++        m.oc = c.N;
++        std::vector<float> x(static_cast<size_t>(c.K));
++        for (auto& v : x) v = nd(rng);
++        std::vector<float> got(static_cast<size_t>(c.N)), want(static_cast<size_t>(c.N));
++        compute_stage_f32_jobs(m, x.data(), 1, static_cast<size_t>(c.K), 0, c.N, got.data());
++        compute_stage_f32(m, x.data(), 0, c.N, want.data());
++        EXPECT_EQ(0, std::memcmp(want.data(), got.data(), sizeof(float) * c.N)) << "format " << c.fmt;
++        EXPECT_NE(got[0], got[1]);
++    }
++}
++
+ TEST(moe_cpu_expert_native, q8_0_row_decodes_as_d_times_q) {
+     int8_t q[64];
+     for (int j = 0; j < 64; j++) q[j] = static_cast<int8_t>((j % 32) - 16);
