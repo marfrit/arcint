@@ -1,0 +1,760 @@
+# CPU tier: a decode step's experts balanced over the pool. One task per
+# missed expert left the pool's last round nearly empty: the served
+# Flash-Next hybrid gives the tier 7.47 one-job experts per layer call, which
+# on 7 workers is two rounds. The binding spec's two-phase split, deferred
+# since 0012: moe_cpu_expert_gate_up (gate, up, SwiGLU over a row chunk, h to
+# a per-expert buffer) and moe_cpu_expert_down (down and the routing weight
+# over a column chunk), the same stage functions and roundings as the whole
+# call. cpu_tier_dispatch runs each expert as row-chunk tasks; the last to
+# finish queues the expert's column-chunk tasks, so pool.wait() still joins
+# all. cpu_tier_split_plan keeps one task per expert when the experts fill
+# whole rounds (a multiple of the worker count), else 4 + 2 chunks per expert
+# under four rounds (more for fewer experts, 2 + 1 above). The bytes are the
+# whole call's: four cells (both native formats and the affine u4, Flash-Next
+# geometry, 1/3/9 jobs, chunk bounds on and off the 8-row pass grid, the pool
+# schedule itself), red on eight mutants. MOE_CPU_TIER_SPLIT=0 keeps one task
+# per expert.
+#
+# Tier bench (dev-host CPU, 7 workers, Flash-Next native experts, one job,
+# rotating over 64 experts), whole-expert tasks -> split, per call:
+#   4 experts 1.205 -> 0.695 ms, 8 experts 2.003 -> 1.286, 9 2.010 -> 1.456,
+#   10 2.014 -> 1.628, 16 3.220 -> 2.553; 7 experts stay whole (1.08).
+# Served on the A770 (Flash-Next d48s2, ratio 75 + tier + per-expert
+# dispatch, u8 paged KV, 257 greedy tokens), against the 0070 plugin: decode
+# 87.83 / 88.16 -> 83.62 / 83.64 s, tier compute per layer call 3.41 / 3.45
+# -> 2.91 / 2.92 ms (decode-only counters), text byte-identical; with
+# MOE_CPU_TIER_SPLIT=0 the same plugin decodes in 87.73 s.
+#
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
+@@ -11,9 +11,11 @@
+ #include "moe_cpu_expert.hpp"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cmath>
+ #include <cstdlib>
+ #include <cstring>
++#include <memory>
+ #include <string>
+ #include <vector>
+ 
+@@ -1063,6 +1065,52 @@
+     }
+ }
+ 
++// arcint (patch 0071). moe_cpu_expert_ref's two phases (moe_cpu_expert.hpp):
++// the same stage calls restricted to a row range (phase 1) or a column range
++// (phase 2), the same roundings at the same stage boundaries. A stage's sum for
++// row n reads only row n and the activations (compute_stage_f32_jobs: one lane
++// or one scalar loop per row, whichever pass the row falls in), so the bytes do
++// not depend on the chunk bounds.
++void moe_cpu_expert_gate_up_ref(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, int row_begin, int row_end,
++                                float* h) {
++    const size_t hidden = static_cast<size_t>(e.down.oc);
++    const size_t inter = static_cast<size_t>(e.up.oc);
++    const size_t width = static_cast<size_t>(row_end - row_begin);
++    std::vector<float> x_f32(n_jobs * hidden);
++    std::vector<float> up_acc(n_jobs * width);
++    std::vector<float> gate_acc(n_jobs * width);
++    for (size_t j = 0; j < n_jobs; j++) {
++        for (size_t k = 0; k < hidden; k++) {
++            x_f32[j * hidden + k] = f16_to_f32(jobs[j].x[k]);
++        }
++    }
++    compute_stage_f32_jobs(e.up, x_f32.data(), n_jobs, hidden, row_begin, row_end, up_acc.data());
++    compute_stage_f32_jobs(e.gate, x_f32.data(), n_jobs, hidden, row_begin, row_end, gate_acc.data());
++    for (size_t j = 0; j < n_jobs; j++) {
++        for (size_t i = 0; i < width; i++) {
++            const float up_h = f16_to_f32(f32_to_f16(up_acc[j * width + i]));
++            const float act = apply_act(gate_acc[j * width + i], e.act);
++            const uint16_t h_bits = f32_to_f16(up_h * act);
++            h[j * inter + static_cast<size_t>(row_begin) + i] = f16_to_f32(h_bits);
++        }
++    }
++}
++
++void moe_cpu_expert_down_ref(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, const float* h, int col_begin,
++                             int col_end) {
++    const size_t inter = static_cast<size_t>(e.up.oc);
++    const size_t width = static_cast<size_t>(col_end - col_begin);
++    std::vector<float> down_acc(n_jobs * width);
++    compute_stage_f32_jobs(e.down, h, n_jobs, inter, col_begin, col_end, down_acc.data());
++    for (size_t j = 0; j < n_jobs; j++) {
++        const float w_route = f16_to_f32(jobs[j].w_route);
++        for (int n = col_begin; n < col_end; n++) {
++            const float y_val = down_acc[j * width + static_cast<size_t>(n - col_begin)] * w_route;
++            jobs[j].y[n] = f32_to_f16(y_val);
++        }
++    }
++}
++
+ // arcint M14 (T1c, §8). Reproduces the GPU's within-fake-group half
+ // accumulation (moe_3gemm_swiglu_mlp.cl:124-146): every branch (ELEMS_PER_LANE
+ // 2/4/8) is, per lane, a chain of exactly 2 sequential half-precision FMAs
+@@ -1164,6 +1212,43 @@
+     }
+ }
+ 
++#if defined(OV_MOE_CPU_TIER_HAVE_AVX2)
++namespace {
++// arcint (patch 0071). moe_cpu_expert's kernel choice, shared with the two
++// phase entry points below so a split expert runs the kernel the whole call
++// would; the rule and its reasons are moe_cpu_expert's (below).
++bool expert_takes_avx2(const ExpertDesc& e) {
++    static const bool have_avx2 = ov::with_cpu_x86_avx2();
++    auto avx2_ok = [](const QuantMatrix& m) {
++        return m.format == kQuantFormatU4Affine && (m.group_size < 64 || m.group_size % 64 == 0);
++    };
++    return have_avx2 && avx2_ok(e.gate) && avx2_ok(e.up) && avx2_ok(e.down);
++}
++}  // namespace
++#endif
++
++void moe_cpu_expert_gate_up(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, int row_begin, int row_end,
++                            float* h) {
++#if defined(OV_MOE_CPU_TIER_HAVE_AVX2)
++    if (expert_takes_avx2(e)) {
++        moe_cpu_expert_gate_up_avx2(e, jobs, n_jobs, row_begin, row_end, h);
++        return;
++    }
++#endif
++    moe_cpu_expert_gate_up_ref(e, jobs, n_jobs, row_begin, row_end, h);
++}
++
++void moe_cpu_expert_down(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, const float* h, int col_begin,
++                         int col_end) {
++#if defined(OV_MOE_CPU_TIER_HAVE_AVX2)
++    if (expert_takes_avx2(e)) {
++        moe_cpu_expert_down_avx2(e, jobs, n_jobs, h, col_begin, col_end);
++        return;
++    }
++#endif
++    moe_cpu_expert_down_ref(e, jobs, n_jobs, h, col_begin, col_end);
++}
++
+ void moe_cpu_expert(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, int col_begin, int col_end) {
+ #if defined(OV_MOE_CPU_TIER_HAVE_AVX2)
+     static const bool have_avx2 = ov::with_cpu_x86_avx2();
+@@ -1250,4 +1335,139 @@
+     }
+ }
+ 
++// ---------------------------------------------------------------------------
++// arcint (patch 0071). The split schedule; see moe_cpu_expert.hpp.
++
++CpuTierSplit cpu_tier_split_plan(size_t n_experts, size_t workers, int inter, int hidden) {
++    CpuTierSplit s;
++    // Whole experts when they already fill every round of the pool (a
++    // multiple of the worker count: splitting there measured 1.5-8 % slower
++    // on the tier bench at 7, 14 and 21 experts on 7 workers).
++    if (workers < 2 || n_experts == 0 || n_experts % workers == 0)
++        return s;
++    // t tasks per expert, a third of them down chunks (down is one matrix of
++    // the expert's three): at least 6 (4 gate/up + 2 down, the best of 2/1,
++    // 3/1 and 4/2 at 8 experts on 7 workers) while the call has under 4 rounds of
++    // whole experts, else 3; more when that leaves the call under 6 * workers
++    // tasks.
++    const size_t floor_t = n_experts < 4 * workers ? 6 : 3;
++    const size_t t = std::max(floor_t, (6 * workers + n_experts - 1) / n_experts);
++    size_t d = std::max<size_t>(1, t / 3);
++    size_t g = t - d;
++    g = std::min<size_t>(g, static_cast<size_t>(std::max(1, inter / 64)));
++    d = std::min<size_t>(d, static_cast<size_t>(std::max(1, hidden / 256)));
++    d = std::min(d, g);
++    s.gate_up_chunks = static_cast<int>(g);
++    s.down_chunks = static_cast<int>(d);
++    return s;
++}
++
++namespace {
++// Chunk c of `chunks` over [0, total): bounds on multiples of 8 (the stage
++// kernels' row-pass width), the last chunk ending at total.
++int chunk_bound(int total, int chunks, int c) {
++    if (c >= chunks)
++        return total;
++    return static_cast<int>((static_cast<long long>(total) * c / chunks) & ~7LL);
++}
++
++struct SplitCall {
++    CpuTierPool* pool = nullptr;
++    std::vector<CpuTierExpertWork> work;
++    CpuTierSplit split;
++    CpuTierTaskObserver observer;
++    std::vector<std::vector<float>> h;           // per expert, [n_jobs][inter]
++    std::unique_ptr<std::atomic<int>[]> left;    // per expert, phase-1 tasks still running
++};
++
++void run_observed(const SplitCall& call, size_t x, bool first, const std::function<void()>& body) {
++    if (!call.observer) {
++        body();
++        return;
++    }
++    const auto ts = std::chrono::steady_clock::now();
++    body();
++    call.observer(x, first, ts, std::chrono::steady_clock::now());
++}
++
++void dispatch_down_chunks(const std::shared_ptr<SplitCall>& call, size_t x) {
++    const CpuTierExpertWork w = call->work[x];
++    const int hidden = w.desc->down.oc;
++    std::vector<CpuTierPool::Task> tasks;
++    for (int c = 0; c < call->split.down_chunks; c++) {
++        const int b = chunk_bound(hidden, call->split.down_chunks, c);
++        const int en = chunk_bound(hidden, call->split.down_chunks, c + 1);
++        if (b >= en)
++            continue;
++        tasks.emplace_back([call, x, w, b, en]() {
++            run_observed(*call, x, false, [&] {
++                moe_cpu_expert_down(*w.desc, w.jobs, w.n_jobs, call->h[x].data(), b, en);
++            });
++        });
++    }
++    call->pool->dispatch(std::move(tasks));
++}
++}  // namespace
++
++void cpu_tier_dispatch(CpuTierPool& pool,
++                       const std::vector<CpuTierExpertWork>& work,
++                       CpuTierSplit split,
++                       const CpuTierTaskObserver& observer) {
++    std::vector<CpuTierPool::Task> tasks;
++    if (split.gate_up_chunks <= 1 && split.down_chunks <= 1) {
++        // The pre-0071 schedule: one whole-expert task per expert.
++        tasks.reserve(work.size());
++        for (size_t x = 0; x < work.size(); x++) {
++            const CpuTierExpertWork w = work[x];
++            tasks.emplace_back([w, x, observer]() {
++                const auto ts = std::chrono::steady_clock::now();
++                moe_cpu_expert(*w.desc, w.jobs, w.n_jobs, 0, w.desc->down.oc);
++                if (observer)
++                    observer(x, true, ts, std::chrono::steady_clock::now());
++            });
++        }
++        pool.dispatch(std::move(tasks));
++        return;
++    }
++    auto call = std::make_shared<SplitCall>();
++    call->pool = &pool;
++    call->work = work;
++    call->split = CpuTierSplit{std::max(1, split.gate_up_chunks), std::max(1, split.down_chunks)};
++    call->observer = observer;
++    call->h.resize(work.size());
++    call->left.reset(new std::atomic<int>[work.size()]);
++    for (size_t x = 0; x < work.size(); x++) {
++        const CpuTierExpertWork w = work[x];
++        const int inter = w.desc->up.oc;
++        call->h[x].assign(w.n_jobs * static_cast<size_t>(inter), 0.0f);
++        std::vector<std::pair<int, int>> chunks;
++        for (int c = 0; c < call->split.gate_up_chunks; c++) {
++            const int b = chunk_bound(inter, call->split.gate_up_chunks, c);
++            const int en = chunk_bound(inter, call->split.gate_up_chunks, c + 1);
++            if (b < en)
++                chunks.emplace_back(b, en);
++        }
++        call->left[x].store(static_cast<int>(chunks.size()), std::memory_order_relaxed);
++        if (chunks.empty()) {
++            dispatch_down_chunks(call, x);
++            continue;
++        }
++        for (size_t c = 0; c < chunks.size(); c++) {
++            const int b = chunks[c].first, en = chunks[c].second;
++            const bool first = (c == 0);
++            tasks.emplace_back([call, x, w, b, en, first]() {
++                run_observed(*call, x, first, [&] {
++                    moe_cpu_expert_gate_up(*w.desc, w.jobs, w.n_jobs, b, en, call->h[x].data());
++                });
++                // The expert's last phase-1 task queues its phase 2 while it
++                // is itself still outstanding, so pool.wait() cannot return
++                // in between; acq_rel publishes every chunk's h rows to it.
++                if (call->left[x].fetch_sub(1, std::memory_order_acq_rel) == 1)
++                    dispatch_down_chunks(call, x);
++            });
++        }
++    }
++    pool.dispatch(std::move(tasks));
++}
++
+ }  // namespace ov::intel_gpu::ocl::moe
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
+@@ -15,6 +15,7 @@
+ 
+ #pragma once
+ 
++#include <chrono>
+ #include <condition_variable>
+ #include <cstddef>
+ #include <cstdint>
+@@ -127,7 +128,35 @@
+ // Runtime dispatch: avx2 when the build has it AND ov::with_cpu_x86_avx2(), else ref.
+ void moe_cpu_expert(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, int col_begin, int col_end);
+ 
++// arcint (patch 0071). moe_cpu_expert in its two phases, so one expert can run
++// as several pool tasks. Phase 1 (gate, up, SwiGLU) over the intermediate rows
++// [row_begin, row_end) writes h[j * inter + i], the f16-rounded intermediate as
++// f32; phase 2 (down, routing weight) over the output columns [col_begin,
++// col_end) reads all of h and writes jobs[j].y[n]. Both run the kernel
++// moe_cpu_expert would pick (the same dispatch rule) through the same stage
++// functions and roundings, and every stage sum there depends only on its own
++// row and the activations -- so any chunking gives moe_cpu_expert's bytes. The
++// cells moe_cpu_tier_split.* compare the bytes (native IQ3_XXS/IQ4_NL and the
++// affine u4, Flash-Next geometry, one and several jobs).
++void moe_cpu_expert_gate_up(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, int row_begin, int row_end,
++                            float* h);
++void moe_cpu_expert_down(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, const float* h, int col_begin,
++                         int col_end);
++// The scalar reference's two phases (moe_cpu_expert_ref's), which the two
++// above take for the native formats and off the AVX2 route.
++void moe_cpu_expert_gate_up_ref(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, int row_begin, int row_end,
++                                float* h);
++void moe_cpu_expert_down_ref(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, const float* h, int col_begin,
++                             int col_end);
++
+ #if defined(OV_MOE_CPU_TIER_HAVE_AVX2)
++// arcint (patch 0071). moe_cpu_expert_avx2's two phases (see
++// moe_cpu_expert_gate_up / moe_cpu_expert_down above).
++void moe_cpu_expert_gate_up_avx2(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, int row_begin,
++                                 int row_end, float* h);
++void moe_cpu_expert_down_avx2(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, const float* h,
++                              int col_begin, int col_end);
++
+ // arcint (patch 0066). The dots of `nrows` (1..4) decoded native rows with
+ // every job's activations, one job per AVX2 lane: out[j * out_stride + r] =
+ // sum_k xt[k * jpad + j] * wrows[r][k], k in order, each step a multiply then
+@@ -218,4 +247,48 @@
+     bool _stop = false;
+ };
+ 
++// arcint (patch 0071). One tier call's experts on the pool. A decode step
++// gives the tier a handful of one-job experts (7.5 per layer call on the
++// served Flash-Next hybrid), and one task per expert on 7 workers is two
++// rounds with the second nearly empty. With a split, each expert runs as
++// gate_up_chunks phase-1 tasks (moe_cpu_expert_gate_up over a row chunk) and
++// down_chunks phase-2 tasks (moe_cpu_expert_down over a column chunk); the
++// last phase-1 task of an expert to finish dispatches that expert's phase-2
++// tasks, so pool.wait() still joins everything and no thread blocks on a
++// barrier. Chunk bounds are multiples of 8 rows/columns. Without a split
++// ({1, 1}) it is one moe_cpu_expert task per expert, the pre-0071 schedule.
++struct CpuTierExpertWork {
++    const ExpertDesc* desc = nullptr;
++    const ExpertJob* jobs = nullptr;
++    size_t n_jobs = 0;
++};
++
++struct CpuTierSplit {
++    int gate_up_chunks = 1;
++    int down_chunks = 1;
++};
++
++// The split for n_experts experts on `workers` pool threads: {1, 1} when the
++// experts fill every round of the pool (n_experts a multiple of workers) or
++// there is one worker; else gate/up in about twice as many chunks as down
++// (two matrices against one), at least 4 + 2 per expert under four rounds of
++// whole experts and 2 + 1 above, more while the call has fewer than
++// 6 * workers tasks, no gate/up chunk under 64 rows and no down chunk under
++// 256 columns. Measured in this patch's header (the tier bench). Cell:
++// moe_cpu_tier_split.the_plan_fills_the_pool_and_keeps_whole_experts_when_they_do.
++CpuTierSplit cpu_tier_split_plan(size_t n_experts, size_t workers, int inter, int hidden);
++
++// Called by every task with its expert index, whether it is that expert's
++// first task (phase-1 chunk 0, or the only task), and its start/end times.
++using CpuTierTaskObserver = std::function<void(size_t expert,
++                                               bool first_of_expert,
++                                               std::chrono::steady_clock::time_point start,
++                                               std::chrono::steady_clock::time_point end)>;
++
++// Returns immediately; pool.wait() joins. `work` must stay valid until then.
++void cpu_tier_dispatch(CpuTierPool& pool,
++                       const std::vector<CpuTierExpertWork>& work,
++                       CpuTierSplit split,
++                       const CpuTierTaskObserver& observer = {});
++
+ }  // namespace ov::intel_gpu::ocl::moe
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert_avx2.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert_avx2.cpp
+@@ -319,6 +319,57 @@
+     }
+ }
+ 
++// arcint (patch 0071). moe_cpu_expert_avx2's two phases (moe_cpu_expert.hpp):
++// per job the same conversion, the same compute_stage_avx2 calls restricted to
++// a row range (phase 1) or a column range (phase 2), and the same roundings.
++// compute_stage_avx2 computes each row n from row n and the whole activation
++// vector alone (compute_columns_avx2<1>), so the bytes do not depend on the
++// chunk bounds.
++void moe_cpu_expert_gate_up_avx2(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, int row_begin,
++                                 int row_end, float* h) {
++    const int hidden = e.down.oc;
++    const size_t inter = static_cast<size_t>(e.up.oc);
++    const size_t width = static_cast<size_t>(row_end - row_begin);
++    std::vector<float> x_f32(static_cast<size_t>(hidden));
++    std::vector<float> up_acc(width);
++    std::vector<float> gate_acc(width);
++
++    for (size_t j = 0; j < n_jobs; j++) {
++        const ExpertJob& job = jobs[j];
++        for (int k = 0; k < hidden; k++) {
++            x_f32[static_cast<size_t>(k)] = f16_to_f32(job.x[k]);
++        }
++
++        compute_stage_avx2(e.up, x_f32.data(), row_begin, row_end, up_acc.data());
++        compute_stage_avx2(e.gate, x_f32.data(), row_begin, row_end, gate_acc.data());
++
++        float* hj = h + j * inter + static_cast<size_t>(row_begin);
++        for (size_t i = 0; i < width; i++) {
++            const float up_h = f16_to_f32(f32_to_f16(up_acc[i]));
++            const float act = apply_act(gate_acc[i], e.act);
++            const uint16_t h_bits = f32_to_f16(up_h * act);
++            hj[i] = f16_to_f32(h_bits);
++        }
++    }
++}
++
++void moe_cpu_expert_down_avx2(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, const float* h,
++                              int col_begin, int col_end) {
++    const size_t inter = static_cast<size_t>(e.up.oc);
++    std::vector<float> down_acc(static_cast<size_t>(col_end - col_begin));
++
++    for (size_t j = 0; j < n_jobs; j++) {
++        const ExpertJob& job = jobs[j];
++        compute_stage_avx2(e.down, h + j * inter, col_begin, col_end, down_acc.data());
++
++        const float w_route = f16_to_f32(job.w_route);
++        for (int n = col_begin; n < col_end; n++) {
++            const float y_val = down_acc[static_cast<size_t>(n - col_begin)] * w_route;
++            job.y[n] = f32_to_f16(y_val);
++        }
++    }
++}
++
+ // arcint (patch 0066): see moe_cpu_expert.hpp. Four rows per pass give four
+ // independent accumulator chains per job block, so the add latency is hidden;
+ // the order along k within each chain is the scalar dot's.
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -1282,15 +1282,15 @@
+         return d;
+     }
+ 
+-    // arcint M14 (patches/0012, §4.1/§5.6). One CpuTierPool task per missed
+-    // expert (parallelism is across experts, not within one expert's down-
+-    // stage column range): moe_cpu_expert's public API (patches/0011) computes
+-    // gate+up+SwiGLU+down as one call per job, with no separate entry point
+-    // for the intermediate `h` buffer, so splitting one expert's columns
+-    // across threads would recompute gate/up per split. Not implemented here;
+-    // noted as a deviation from the binding spec's ideal two-phase split in
+-    // this patch's header. Must be called after _cpu_x_host/_cpu_rw_host are
+-    // populated and before cpu_tier_join()'s wait().
++    // arcint M14 (patches/0012, §4.1/§5.6). The missed experts on the
++    // CpuTierPool. Until patch 0071 one task per expert; since then
++    // cpu_tier_dispatch (moe_cpu_expert.hpp) runs the binding spec's two-phase
++    // split when cpu_tier_split_plan says the experts leave the pool's last
++    // round short (a decode step's handful of one-job experts): gate/up/SwiGLU
++    // in row chunks, then down in column chunks, the same bytes (cells
++    // moe_cpu_tier_split.*). MOE_CPU_TIER_SPLIT=0 keeps one task per expert.
++    // Must be called after _cpu_x_host/_cpu_rw_host are populated and before
++    // cpu_tier_join()'s wait().
+     void dispatch_cpu_tier(typed_primitive_inst<moe_3gemm_fused_compressed>& instance) {
+         // arcint M14 (patches/0017, review). Only ever called with
+         // _cpu_tier_misses non-empty, and on_before_batched_gemv fetches x/rw
+@@ -1314,8 +1314,8 @@
+         _cpu_descs.clear();
+         _cpu_descs.reserve(_cpu_tier_misses.size());
+ 
+-        std::vector<CpuTierPool::Task> tasks;
+-        tasks.reserve(_cpu_tier_misses.size());
++        std::vector<ov::intel_gpu::ocl::moe::CpuTierExpertWork> work;
++        work.reserve(_cpu_tier_misses.size());
+         size_t row = 0;
+         const int hidden = _hidden_size;
+         // arcint M14 (patches/0017, §A1). usm_host memory, not a
+@@ -1336,29 +1336,45 @@
+                 _cpu_jobs.push_back(job);
+                 ++row;
+             }
+-            const size_t job_end = _cpu_jobs.size();
+-            // desc_ptr is stable: _cpu_descs was reserved to its final size
+-            // above, so no push_back in this loop reallocates it.
+-            const ExpertDesc* desc_ptr = &_cpu_descs.back();
+-            tasks.emplace_back([this, desc_ptr, job_begin, job_end, hidden]() {
+-                const auto ts = std::chrono::steady_clock::now();
+-                ov::intel_gpu::ocl::moe::moe_cpu_expert(*desc_ptr,
+-                                                        _cpu_jobs.data() + job_begin,
+-                                                        job_end - job_begin,
+-                                                        0,
+-                                                        hidden);
++            // Pointers are stable: _cpu_descs and _cpu_jobs were reserved to
++            // their final sizes above, so no push_back in this loop
++            // reallocates them, and both live until cpu_tier_join()'s wait().
++            work.push_back(ov::intel_gpu::ocl::moe::CpuTierExpertWork{&_cpu_descs.back(),
++                                                                      _cpu_jobs.data() + job_begin,
++                                                                      _cpu_jobs.size() - job_begin});
++        }
++        // arcint (patch 0071). MOE_CPU_TIER_SPLIT=0: one whole-expert task per
++        // expert (the pre-0071 schedule), for A/B.
++        static const bool split_enabled = [] {
++            const char* v = std::getenv("MOE_CPU_TIER_SPLIT");
++            return v == nullptr || std::string(v) != "0";
++        }();
++        auto& pool = cpu_tier_pool(_cpu_tier_threads);
++        const ov::intel_gpu::ocl::moe::CpuTierSplit split =
++            split_enabled ? ov::intel_gpu::ocl::moe::cpu_tier_split_plan(work.size(),
++                                                                          pool.thread_count(),
++                                                                          static_cast<int>(_intermediate_size),
++                                                                          hidden)
++                          : ov::intel_gpu::ocl::moe::CpuTierSplit{};
++        // cpu_task_ns sums every task's time (split or not: the core time per
++        // expert); cpu_task_lag_ns counts each expert's first task only, so
++        // both stay per-expert figures (divided by cpu_tier_experts).
++        ov::intel_gpu::ocl::moe::CpuTierTaskObserver observer;
++        if (moe_otd::get_perf_counters()) {
++            observer = [this](size_t, bool first, std::chrono::steady_clock::time_point ts,
++                              std::chrono::steady_clock::time_point te) {
+                 if (auto* perf = moe_otd::get_perf_counters()) {
+-                    const auto te = std::chrono::steady_clock::now();
+                     auto ns = [](auto a, auto b) {
+                         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+                     };
+-                    perf->cpu_task_lag_ns.fetch_add(ns(_cpu_dispatch_t0, ts), std::memory_order_relaxed);
++                    if (first)
++                        perf->cpu_task_lag_ns.fetch_add(ns(_cpu_dispatch_t0, ts), std::memory_order_relaxed);
+                     perf->cpu_task_ns.fetch_add(ns(ts, te), std::memory_order_relaxed);
+                 }
+-            });
++            };
+         }
+         _cpu_dispatch_t0 = std::chrono::steady_clock::now();
+-        cpu_tier_pool(_cpu_tier_threads).dispatch(std::move(tasks));
++        ov::intel_gpu::ocl::moe::cpu_tier_dispatch(pool, work, split, observer);
+     }
+ 
+     // arcint M14 (patches/0012, §4.4). Blocks on the CPU pool, then DMAs each
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
+@@ -27,11 +27,13 @@
+ #include <gtest/gtest.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
+ #include <limits>
++#include <memory>
+ #include <random>
+ #include <string>
+ #include <vector>
+@@ -747,3 +749,211 @@
+     const auto affine = decode_row_through_stage(native_matrix(0, 64, w, z, s));
+     EXPECT_NE(affine[0], y[0]);
+ }
++
++// arcint (patch 0071). The CPU tier runs a decode step's few experts as
++// several pool tasks each: gate/up/SwiGLU over row chunks, then down over
++// column chunks (moe_cpu_expert_gate_up / moe_cpu_expert_down, scheduled by
++// cpu_tier_dispatch). The split must give moe_cpu_expert's bytes -- the
++// pre-0071 whole-expert call, unchanged by this patch -- for every chunking,
++// every job count and every format the tier serves. Flash-Next geometry
++// (hidden 2560, inter 640); the chunk bounds include ones off the 8-row pass
++// grid of the stage kernels. Red: a phase that writes h or y at a chunk-local
++// offset, drops a chunk's tail, or rounds differently changes bytes here.
++namespace {
++using ov::intel_gpu::ocl::moe::CpuTierExpertWork;
++using ov::intel_gpu::ocl::moe::CpuTierPool;
++using ov::intel_gpu::ocl::moe::CpuTierSplit;
++
++struct NativeExpertData {
++    std::vector<uint8_t> gw, gz, uw, uz, dw;
++    std::vector<uint16_t> gs, us, ds;
++    ExpertDesc e;
++};
++
++// IQ3_XXS gate/up, IQ4_NL down, random blocks and scales (the served
++// Flash-Next expert formats).
++std::unique_ptr<NativeExpertData> make_native_expert(int H, int I, std::mt19937& rng) {
++    auto d = std::make_unique<NativeExpertData>();
++    auto bytes = [&](size_t n, int mod) {
++        std::vector<uint8_t> v(n);
++        for (auto& b : v) b = static_cast<uint8_t>(rng() % static_cast<unsigned>(mod));
++        return v;
++    };
++    std::uniform_real_distribution<float> scale(0.01f, 0.05f);
++    auto scales = [&](size_t n) {
++        std::vector<uint16_t> v(n);
++        for (auto& x : v) x = f32_to_f16_bits(scale(rng));
++        return v;
++    };
++    const size_t IH = static_cast<size_t>(I) * static_cast<size_t>(H);
++    d->gw = bytes(IH / 4, 256); d->gz = bytes(IH / 8, 128); d->uw = bytes(IH / 4, 256); d->uz = bytes(IH / 8, 128);
++    d->gs = scales(IH / 32); d->us = scales(IH / 32); d->dw = bytes(IH / 2, 256); d->ds = scales(IH / 32);
++    d->e.gate = native_matrix(kQuantFormatIq3Xxs, H, d->gw.data(), d->gz.data(), d->gs.data());
++    d->e.gate.oc = I;
++    d->e.up = native_matrix(kQuantFormatIq3Xxs, H, d->uw.data(), d->uz.data(), d->us.data());
++    d->e.up.oc = I;
++    d->e.down = native_matrix(kQuantFormatIq4Nl, I, d->dw.data(), nullptr, d->ds.data());
++    d->e.down.oc = H;
++    return d;
++}
++
++struct JobSet {
++    std::vector<std::vector<uint16_t>> x, y;
++    std::vector<ExpertJob> jobs;
++    JobSet(int H, int J, std::mt19937& rng) : x(J, std::vector<uint16_t>(H)), y(J, std::vector<uint16_t>(H, 0)), jobs(J) {
++        std::normal_distribution<float> nd(0.0f, 1.0f);
++        for (auto& row : x)
++            for (auto& v : row) v = f32_to_f16_bits(nd(rng));
++        for (int j = 0; j < J; j++)
++            jobs[j] = ExpertJob{x[j].data(), f32_to_f16_bits(0.1f * static_cast<float>(j + 1)), y[j].data()};
++    }
++    void clear() {
++        for (auto& row : y) std::fill(row.begin(), row.end(), uint16_t{0});
++    }
++};
++
++// Runs the two phases over the given chunk bounds and returns every job's y.
++std::vector<std::vector<uint16_t>> run_phases(const ExpertDesc& e, JobSet& js, const std::vector<int>& rows,
++                                              const std::vector<int>& cols, bool ref) {
++    const size_t J = js.jobs.size();
++    const int inter = e.up.oc;
++    std::vector<float> h(J * static_cast<size_t>(inter), std::numeric_limits<float>::quiet_NaN());
++    js.clear();
++    for (size_t c = 0; c + 1 < rows.size(); c++) {
++        if (ref)
++            ov::intel_gpu::ocl::moe::moe_cpu_expert_gate_up_ref(e, js.jobs.data(), J, rows[c], rows[c + 1], h.data());
++        else
++            ov::intel_gpu::ocl::moe::moe_cpu_expert_gate_up(e, js.jobs.data(), J, rows[c], rows[c + 1], h.data());
++    }
++    for (size_t c = 0; c + 1 < cols.size(); c++) {
++        if (ref)
++            ov::intel_gpu::ocl::moe::moe_cpu_expert_down_ref(e, js.jobs.data(), J, h.data(), cols[c], cols[c + 1]);
++        else
++            ov::intel_gpu::ocl::moe::moe_cpu_expert_down(e, js.jobs.data(), J, h.data(), cols[c], cols[c + 1]);
++    }
++    return js.y;
++}
++
++// Checks the split against the whole-expert call for several chunkings.
++void expect_split_gives_whole_bytes(const ExpertDesc& e, int J, std::mt19937& rng, bool ref) {
++    const int H = e.down.oc, I = e.up.oc;
++    JobSet js(H, J, rng);
++    if (ref)
++        moe_cpu_expert_ref(e, js.jobs.data(), static_cast<size_t>(J), 0, H);
++    else
++        ov::intel_gpu::ocl::moe::moe_cpu_expert(e, js.jobs.data(), static_cast<size_t>(J), 0, H);
++    const auto whole = js.y;
++    for (const auto& row : whole) {
++        size_t nonzero = 0;
++        for (auto v : row) nonzero += (v & 0x7FFFu) != 0;
++        ASSERT_GT(nonzero, static_cast<size_t>(H) / 2) << "the whole-expert output is mostly zero: the cell could not see a dropped chunk";
++    }
++    const std::vector<std::vector<int>> row_splits = {{0, I}, {0, I / 4, I / 2, 3 * I / 4, I}, {0, 13, 160, 333, I}, {0, 8, 16, I - 8, I}};
++    const std::vector<std::vector<int>> col_splits = {{0, H}, {0, H / 2, H}, {0, 7, 1280, 2001, H}, {0, 256, 512, 768, H}};
++    for (size_t r = 0; r < row_splits.size(); r++)
++        for (size_t c = 0; c < col_splits.size(); c++) {
++            const auto got = run_phases(e, js, row_splits[r], col_splits[c], ref);
++            for (int j = 0; j < J; j++)
++                EXPECT_EQ(0, std::memcmp(whole[j].data(), got[j].data(), sizeof(uint16_t) * static_cast<size_t>(H)))
++                    << "jobs " << J << " job " << j << " row split " << r << " col split " << c;
++        }
++}
++}  // namespace
++
++TEST(moe_cpu_tier_split, the_phases_give_the_whole_expert_bytes_native_iq3xxs_iq4nl) {
++    std::mt19937 rng(71);
++    auto x = make_native_expert(2560, 640, rng);
++    for (int J : {1, 3, 9}) {
++        SCOPED_TRACE(J);
++        expect_split_gives_whole_bytes(x->e, J, rng, false);
++        expect_split_gives_whole_bytes(x->e, J, rng, true);
++    }
++}
++
++TEST(moe_cpu_tier_split, the_phases_give_the_whole_expert_bytes_affine_u4) {
++    // The dispatcher's affine kernel (AVX2 when present) and the scalar
++    // reference; SiLU (the served activation) and tanh-GELU.
++    std::mt19937 rng(72);
++    auto x = SyntheticExpert::make(2560, 640, 64, rng);
++    for (GateAct act : {GateAct::Silu, GateAct::GeluTanh}) {
++        x.desc.act = act;
++        for (int J : {1, 3}) {
++            SCOPED_TRACE(J);
++            expect_split_gives_whole_bytes(x.desc, J, rng, false);
++            expect_split_gives_whole_bytes(x.desc, J, rng, true);
++        }
++    }
++}
++
++// The schedule the plugin runs: cpu_tier_dispatch on a real pool, eight
++// Flash-Next experts (one to three jobs each, like a decode step's misses),
++// split and unsplit, against the whole-expert call per expert. Repeated, so a
++// phase 2 that started before its phase 1 finished (the chaining broken) would
++// show as wrong bytes rather than pass by timing.
++TEST(moe_cpu_tier_split, the_pool_schedule_gives_the_whole_expert_bytes) {
++    const int H = 2560, I = 640, E = 8;
++    std::mt19937 rng(73);
++    std::vector<std::unique_ptr<NativeExpertData>> ex;
++    std::vector<std::unique_ptr<JobSet>> js;
++    std::vector<std::vector<std::vector<uint16_t>>> whole;
++    for (int x = 0; x < E; x++) {
++        ex.push_back(make_native_expert(H, I, rng));
++        js.push_back(std::make_unique<JobSet>(H, 1 + x % 3, rng));
++        ov::intel_gpu::ocl::moe::moe_cpu_expert(ex[x]->e, js[x]->jobs.data(), js[x]->jobs.size(), 0, H);
++        whole.push_back(js[x]->y);
++    }
++    std::vector<CpuTierExpertWork> work;
++    for (int x = 0; x < E; x++)
++        work.push_back(CpuTierExpertWork{&ex[x]->e, js[x]->jobs.data(), js[x]->jobs.size()});
++    CpuTierPool pool(7);
++    const CpuTierSplit plan = ov::intel_gpu::ocl::moe::cpu_tier_split_plan(E, pool.thread_count(), I, H);
++    ASSERT_GT(plan.gate_up_chunks, 1) << "the plan does not split a decode step's experts: the cell would test nothing new";
++    for (CpuTierSplit split : {CpuTierSplit{1, 1}, plan, CpuTierSplit{10, 10}, CpuTierSplit{3, 1}, CpuTierSplit{1, 4}}) {
++        for (int rep = 0; rep < 4; rep++) {
++            for (auto& s : js) s->clear();
++            std::atomic<int> tasks{0}, firsts{0};
++            ov::intel_gpu::ocl::moe::cpu_tier_dispatch(pool, work, split,
++                [&](size_t, bool first, std::chrono::steady_clock::time_point, std::chrono::steady_clock::time_point) {
++                    tasks++;
++                    if (first) firsts++;
++                });
++            pool.wait();
++            EXPECT_EQ(firsts.load(), E);
++            EXPECT_EQ(tasks.load(), E * (split.gate_up_chunks + split.down_chunks == 2 ? 1 : split.gate_up_chunks + split.down_chunks));
++            for (int x = 0; x < E; x++)
++                for (size_t j = 0; j < js[x]->jobs.size(); j++)
++                    EXPECT_EQ(0, std::memcmp(whole[x][j].data(), js[x]->y[j].data(), sizeof(uint16_t) * H))
++                        << "split " << split.gate_up_chunks << "/" << split.down_chunks << " rep " << rep << " expert " << x << " job " << j;
++        }
++    }
++}
++
++// The plan: experts that leave the pool's last round short (a count that is
++// not a multiple of the workers) are split so the call has at least twice as
++// many tasks as workers (where the chunk floors allow that many), gate/up in
++// at least as many chunks as down, gate/up chunks at least 64 rows and down
++// chunks at least 256 columns; a whole number of rounds, or a one-thread
++// pool, keeps whole-expert tasks.
++TEST(moe_cpu_tier_split, the_plan_fills_the_pool_and_keeps_whole_experts_when_they_do) {
++    using ov::intel_gpu::ocl::moe::cpu_tier_split_plan;
++    const int H = 2560, I = 640;
++    for (size_t W : {3u, 7u, 8u, 15u}) {
++        for (size_t n = 1; n < 6 * W; n++) {
++            const CpuTierSplit s = cpu_tier_split_plan(n, W, I, H);
++            if (n % W == 0) {
++                EXPECT_EQ(s.gate_up_chunks, 1) << "W " << W << " n " << n;
++                EXPECT_EQ(s.down_chunks, 1) << "W " << W << " n " << n;
++                continue;
++            }
++            EXPECT_GE(n * static_cast<size_t>(s.gate_up_chunks + s.down_chunks), std::min(2 * W, n * (I / 64 + H / 256)))
++                << "W " << W << " n " << n;
++            EXPECT_GT(s.gate_up_chunks, 1) << "W " << W << " n " << n;
++            EXPECT_GE(I / s.gate_up_chunks, 64) << "W " << W << " n " << n;
++            EXPECT_GE(H / s.down_chunks, 256) << "W " << W << " n " << n;
++            EXPECT_GE(s.gate_up_chunks, s.down_chunks) << "W " << W << " n " << n;
++        }
++    }
++    const CpuTierSplit one = cpu_tier_split_plan(3, 1, I, H);
++    EXPECT_EQ(one.gate_up_chunks, 1);
++    EXPECT_EQ(one.down_chunks, 1);
++}

@@ -43,6 +43,15 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   Flash-Next at ratio 92 it moves decode 297.9 -> 291.7 ms per forward (GPU hit
   rate 12 %). Needs a `marfrit-openvino` `+p22` for release.
 
+- **CPU tier: a decode step's experts are spread over the pool** (plugin
+  patch 0071): each missed expert runs as gate/up row chunks and then down
+  column chunks instead of one task, the same bytes (four bitwise cells). On
+  the A770 with Flash-Next `d48s2` at ratio 75 + tier + dispatch, 257 greedy
+  tokens decode in 83.6 s against 87.8 / 88.2 s with the 0070 plugin (tier
+  time per layer call 3.4 -> 2.9 ms), with byte-identical text.
+  `MOE_CPU_TIER_SPLIT=0` keeps one task per expert. Needs a `marfrit-openvino`
+  `+p22` for release.
+
 ## 0.5.0.1 — 2026-09-27
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p20` (patches 0003–0067).

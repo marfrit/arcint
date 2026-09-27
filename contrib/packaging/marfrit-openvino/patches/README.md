@@ -1998,3 +1998,60 @@ buffers, device-resident 12.34 GiB against 8.06; decode 291.7 against 297.9 ms
 per forward with the pool in host memory. The GPU hit rate there is 12.2 %: the
 CPU tier still carries Flash-Next's decode.
 
+
+## 0071 — CPU tier: a decode step's experts balanced over the pool (2026-09-27)
+
+The tier ran one pool task per missed expert. The served Flash-Next hybrid
+gives it 7.47 one-job experts per decode layer call (A770, `d48s2`, ratio 75 +
+tier + dispatch; decode-only counters), which on the default 7 workers is two
+rounds with the second nearly empty. 0071 builds the binding spec's two-phase
+split, deferred since 0012: `moe_cpu_expert_gate_up` (gate, up and SwiGLU over
+a row chunk, into a per-expert `h`) and `moe_cpu_expert_down` (down and the
+routing weight over a column chunk), through the same stage functions and
+roundings as the whole-expert call. `cpu_tier_dispatch` runs an expert's row
+chunks as pool tasks; the last one to finish queues the expert's column
+chunks, so the join is still one `pool.wait()`. `cpu_tier_split_plan` keeps
+one task per expert when the experts fill whole rounds (a multiple of the
+worker count, where the split measured 1.5–8 % slower on the bench), else 4 + 2 chunks per
+expert under four rounds (more for fewer experts) and 2 + 1 above.
+`MOE_CPU_TIER_SPLIT=0` keeps one task per expert.
+
+The bytes are the whole call's by construction and by cell: four
+`moe_cpu_tier_split` cells (IQ3_XXS/IQ4_NL and the affine u4 through both the
+dispatching and the scalar kernels, Flash-Next geometry, 1/3/9 jobs, chunk
+bounds on and off the 8-row pass grid, the pool schedule itself, the plan),
+red first against stubs and red on eight mutants (chunk-local `h` and `y`
+offsets, phase 2 queued before phase 1 finished, a dropped down chunk, the
+`up` rounding dropped, the wrong gate matrix, the plan never splitting and
+splitting whole rounds).
+
+Tier bench, dev-host CPU, 7 workers, Flash-Next native experts, one job each,
+rotating over 64 experts; whole-expert tasks -> split, per call:
+
+| experts | whole | split |
+|---|---|---|
+| 4 | 1.205 ms | 0.695 ms (8 + 3) |
+| 7 | 1.08–1.11 ms | not split |
+| 8 | 2.003 ms | 1.286 ms (4 + 2) |
+| 9 | 2.010 ms | 1.456 ms |
+| 10 | 2.014 ms | 1.628 ms |
+| 16 | 3.220 ms | 2.553 ms |
+
+Served on the A770, Flash-Next `d48s2`, ratio 75 + tier + per-expert
+dispatch, u8 paged KV, prompt "Hello", 257 greedy tokens, one fresh process
+per leg, legs alternating:
+
+| plugin | decode (s) | tier compute per layer call | tier core time per expert |
+|---|---|---|---|
+| 0070 | 87.83, 88.16 | 3.41, 3.45 ms | 1.78, 1.81 ms |
+| 0071 | 83.62, 83.64 | 2.91, 2.92 ms | 2.07, 2.08 ms |
+| 0071, `MOE_CPU_TIER_SPLIT=0` | 87.73 | 3.20 ms | 1.50 ms |
+| 0071, 8 workers | 84.26 | 3.00 ms | 2.50 ms |
+
+The greedy text is byte-identical in all six long legs. Per token 342–343 ->
+325 ms. The split raises each expert's core time on the served host
+(1.78 -> 2.07 ms; +1.5–3.5 % on the bench at 8–10 experts), so the call lands at 2.9 ms, not at the
+~2.2 ms an even spread of that core time would give. Eight workers are no
+better than seven, so the default stays at hardware_concurrency() - 1. Series
+0003–0071 (69 patches) applies to the pin with `git apply` and reproduces the
+built tree file for file.
