@@ -10884,6 +10884,73 @@ Continues §7.0.2ct.
     three projections). The other predecessors were not sized. Whether a
     large read precedes those launches is therefore open.
 
+#### 7.0.2cw A770 frequency transitions: pinning the clock at 2000 MHz speeds the 35B's decode, and slows the coder's (2026-09-27)
+
+Continues §7.0.2cv. [measured-here, A770 `GPU.1`. The GT clock was set
+through the card's sysfs `min_freq`/`max_freq` on the host and restored to
+600/2400 MHz after every leg. Served legs run the installed arcint 0.5.0.1 on
+marfrit-openvino +p20-1, unless named.]
+- **Isolated** (stock Python OV chain, one run each). The neighbour is an f16
+  matmul of the chain vector tiled to M rows against an 8 MiB constant, then
+  a sum-reduction (a reference reduce kernel) and an add; then two u8 FCs.
+  - M = 1: reduction 20.4 µs, FC after 32.4.
+  - M = 64: reduction 928.8 µs, FC after 68.0 (67.9 in a second run).
+  - M = 256: FC after 69.2 (the reduction time was not read).
+  - The FC does not follow the long kernel directly: the add sits between.
+  - Pinned at 2000 MHz, M = 64 reads FC after 50.4 µs, reduction 1041.2.
+    Pinning removes about half of that penalty ([arithmetic] (67.9 − 50.4) /
+    (67.9 − 32.4) = 49 %, one run). Pinning also drops the boost clock, and
+    the isolated leg's clock was not sampled, so the cause of the half is
+    not measured.
+  - What these cases share with §7.0.2cv's is not settled. The long
+    reduction here, and the long neighbour there, both precede the slowed FC
+    by one small kernel. §7.0.2ct's 16 MiB rows were slowed after a 9.7 µs
+    predecessor.
+- **Served decode, the clock sampled** (13 µs sampler, 6 s of a 400-token
+  greedy decode):
+
+  | leg | GT-frequency changes | at 2400 MHz | PL4 throttle (peak current, `paper`) | power |
+  |---|---|---|---|---|
+  | 35B native, default governor (plugin prefix 0003–0067, 29.3 t/s) | 26,737 | ~10 % (2350–2400) | 12 % | 92.8 W |
+  | 35B native, pinned 2000 (33.7 t/s) | 0 at this resolution | – | 0 | 93.0 W |
+  | 35B native, pinned 2100 | 25,931 (2000 <-> 2100) | – | 0 flagged | – |
+  | coder, default governor (47.8 t/s) | 886 | 92 % | 0.5 % | 118.7 W |
+
+  Among the pins sampled, only 2000 MHz ran without transitions; 2200 and
+  2400 were not sampled.
+- **The 35B native** (packed u8, all-resident + dispatch, u8 KV, chunk 1024,
+  n-ctx 8192, embeddings on the CPU, dynamic quantisation off). A fresh
+  process per run; the requests were "Hello" then the first 4,096 bench
+  ids, 32 greedy tokens each. The first default run preceded the pinned-2000
+  and pinned-2400 runs; the other two defaults interleaved with pinned 2000.
+
+  | GT clock | runs | decode depth 1 | decode after 4096 | prefill 4096 |
+  |---|---|---|---|---|
+  | default (600–2400) | 3 | 30.2 / 30.1 / 28.1 t/s | 28.3 / 28.2 / 28.3 t/s | 962.1 / 961.5 / 959.0 t/s |
+  | pinned 2000 | 3 | 32.2 / 34.8 / 34.5 t/s | 32.2 / 32.1 / 32.1 t/s | 878.5 / 877.3 / 878.3 t/s |
+  | pinned 2100 | 1 | 31.2 | 29.1 | 897.9 |
+  | pinned 2200 | 1 | 29.8 | 29.0 | 919.2 |
+  | pinned 2400 | 1 | 28.7 | 28.3 | 962.8 |
+
+  Pinned at 2000 MHz, decode after 4096 gains 13.7 % (means) and prefill
+  loses 8.6 %. The digests were not compared.
+- **The served coder** (the unit's model on the A770, u8 KV, n-ctx 98304,
+  prefix cache off). The requests were `def add(a, b):` then 4,096 bench
+  ids, 64 greedy tokens each; two interleaved runs per arm.
+  - Default: decode after 4096 47.1 / 45.9 t/s, prefill 1398 / 1396 t/s,
+    decode at depth 1 38.3 / 42.3.
+  - Pinned 2000: 44.0 / 44.3, 1352 / 1351, and 40.3 / 40.6.
+  - Pinning costs the coder about 5 % decode and 3 % prefill; its depth-1
+    decode is neutral.
+- **Standing.** The 35B native route transitions about 30 times as often as
+  the coder and throttles on PL4 24 times as often. Removing its transitions
+  by pinning gains 14 % decode; the coder, which runs at the top clock
+  nearly throughout, loses by being held lower. That the 35B's matrix-unit
+  gate/up is what drives its throttling is a hypothesis (§7.0.2ct).
+  - The A770 serves the coder, so its clock stays on the default governor.
+  - Pinning at 2000 MHz is the setting if the 35B native becomes that
+    card's served model: a host setting, the operator's decision.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,
