@@ -11213,10 +11213,92 @@ gate at depth 4 on 2026-09-23 but had no full-depth artifact.
     activation or plateau probe, and a failed pre-warm. Each is preceded
     by a warning line.
   - [measured-here] Neither load logged a warning.
-- Owed: both twins re-exported with the new decode (`d48p2` pinned, `d48s2`
-  staged; running), their digest gate, their KLD against the same capture,
-  and the gathered-bytes comparison.
+- **Later the same day: the divergence is of the order of a neutral change;
+  its cause is not found.** [A770 pinned at 2000 MHz; `--offload-ratio 75
+  --moe-cpu-tier --moe-per-expert-dispatch --paged-kv u8 --n-ctx 8192`,
+  chunk 512 unless named; the 0068 prefix; dev-host scratch builds of the
+  tip whose scratch switches are env-gated (twins `13f4e4c9…`, the
+  plain-tensor arm and the chunk control `ae973ce3…`); single replays]
+  - [measured-here] **The new-decode twins.** Both re-exported at 0e0ef26
+    plus the new decode: `d48p2` (pinned, xml sha256 prefix `1c54b317…`,
+    18,995 nodes) and `d48s2` (staged, `08dd2c85…`, 18,941 nodes). Against
+    `d48s`, `d48s2` has one more Divide and one fewer Multiply.
+    - Digests: d1 `82df3c78…` in both (the old twins differed at d1), and
+      d512 `89c7b27d…` against `8ec28f33…`.
+    - Speed: d1 decode 28.27 s against 16.15 s, d512 prefill 54.72 s
+      against 31.01 s, d512 decode 23.13 s against 9.90 s. The page cache
+      was NOT dropped between these arms: the drop failed read-only inside
+      the container.
 
+    | window 0 | below 2051 | above | argmax |
+    |---|---|---|---|
+    | `d48p2` pinned | 0.2757 | 0.4657 | 0.8310 |
+    | `d48s2` staged | 0.3273 | 0.5273 | 0.7864 |
+
+  - [measured-here] **The gathered bytes.**
+    - Staged: in the served `d48s2` process, the request's 512-token
+      prefill forward staged every row equal to the table row its id names
+      (0 wrong of 8,192). The ids equal the Python reference hash (0
+      mismatches). The decode forwards were not checked.
+    - Pinned: `d48p2`'s gather subgraph, cut out and run on stock OpenVINO
+      via Python on the A770, fed the real table through seven USM-host
+      tensors (26.82 GiB), gathers 0 wrong of 8,192 rows over all seven
+      ports.
+    - `d48s2`'s cut gathers 0 wrong on the card at T = 1, 4 and 512, and
+      on the CPU at T = 512. So does a shared host tensor rewritten between
+      ten infers.
+    - The comparison §7.0.2cz names as decisive, the decoded (Convert and
+      decode) output of both served processes on the same forward, was not
+      done.
+  - [measured-here] **The shared buffer is not it.** With each forward
+    staged into a fresh plain tensor instead of the shared USM buffer, the
+    two KL values agree to seven digits (0.3273269 / 0.5273215) and the
+    argmax to four (0.7864).
+  - [measured-here, the runtime models of the served binary after compile]
+    **The runtime graphs.**
+    - Outside the gather they match in layer type, primitive, precision and
+      layout. Implementation choice and fused-op lists were not compared.
+    - The execution sequences differ outside the gather in three places:
+      two nodes' fan-out (the pinned Select chain), and one fused
+      FullyConnected ([1, T, 10240] to [1, T, 320]).
+    - That FullyConnected sits after 253 shared nodes in the pinned program
+      and after 255 in the staged one: it trades places with two
+      independent neighbouring projections.
+  - [measured-here] **Two depths, same 4-token forward.**
+    - The depth-4 twins (the 2026-09-23 exports, old decode) differ by a
+      per-row max |dlogit| of 0.003–0.007.
+    - `d48s` against `d48n` (old decode) differ by 0.17–1.68.
+  - [measured-here] A CPU f32 reference for the depth-4 twin was attempted.
+    The boot tool reported `peak_host_GiB` 43.29 after a 41.8 s compile.
+    The process was then OOM-killed in the 40 GiB fence (`oom_kill 1`)
+    while binding the real table.
+  - [measured-here] **The control.** `d48n` at prefill chunk 256 reads
+    0.3271 below, 0.4771 above and argmax 0.7805. Its chunk-512 reading was
+    0.2840 / 0.4583 / 0.8083, taken on the earlier block's binary
+    (`2b953a06…`), not the scratch one. Greedy digests were not taken for
+    the control.
+
+    | change | below 2051 | above | argmax |
+    |---|---|---|---|
+    | chunk 512 -> 256, `d48n` | +0.043 | +0.019 | -0.028 |
+    | staged, `d48s2` - `d48p2` | +0.052 | +0.062 | -0.045 |
+    | staged, `d48s` - `d48n` | +0.055 | +0.004 | -0.008 |
+
+    With one control and single replays, the staged gap is of the order of
+    the neutral change's, and larger on the new-decode pair. It is not
+    shown to be within it. The new decode's effect on the pinned KL
+    (`d48p2` against `d48n`) is not resolvable at this spread either.
+  - **Reading** (not measured): at depth 48, a change that alters f16
+    rounding anywhere is expected to change the greedy text. The
+    byte-identical gate then cannot tell such a change from a defect. What
+    alters the rounding here is not found: the one observed schedule
+    difference swaps independent operations, which on a card that repeats
+    forwards bit-identically should not change bits.
+  - Owed:
+    - the decoded n-gram embedding of both served processes on the same
+      forward, compared byte for byte;
+    - more than one neutral perturbation, and repeats, to size the spread;
+    - `d48s2`'s speed with a cold page cache.
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

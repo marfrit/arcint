@@ -394,3 +394,33 @@ campaign's numeric gate in device-free form.
   - [Correction, 2026-09-27] The 2026-09-23 entry above says the full-depth
     artifact declares three chunked ports. `d48n`'s `serving-shape.json`
     lists seven (`ngram_table.0`–`6`).
+
+- 2026-09-27 (afternoon) — **the gate's failure is of the order of a neutral
+  change; its cause is not found** (DESIGN §7.0.2cz, "Later the same day";
+  `measured-here` unless marked).
+  - The new-decode twins `d48p2` / `d48s2` agree at d1 (`82df3c78…`) and
+    differ at d512. On window 0 they read 0.2757 / 0.4657 / 0.8310 against
+    0.3273 / 0.5273 / 0.7864.
+  - `d48s2` decodes d512 in 9.90 s against 23.13 s. The page cache was not
+    dropped.
+  - The gathered rows are right in both paths:
+    - staged: in the served process's 512-token prefill;
+    - pinned: its gather subgraph, cut out and run on stock OpenVINO with
+      the real 26.82 GiB table.
+  - Staging into a fresh plain tensor reads the same KL as the shared USM
+    buffer.
+  - The runtime graphs match in type, primitive, precision and layout
+    outside the gather. One FullyConnected trades places with two
+    independent neighbours.
+  - On the pinned path, changing only the prefill chunk (512 to 256) moves
+    the KL by +0.043 below 2051, +0.019 above and -0.028 in argmax. The
+    staged gap is +0.052 / +0.062 / -0.045.
+  - Reading (not measured): at depth 48 any f16-rounding change is expected
+    to change greedy text, so the byte-identical gate cannot separate one
+    from a defect.
+  - Operator's decisions:
+    - replacing the gate, for example with a KL criterion sized by several
+      neutral perturbations;
+    - serving the staged artifact.
+  - Owed: the decoded embedding of both served processes compared byte for
+    byte, a wider spread, and a cold-cache speed.
