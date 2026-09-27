@@ -619,22 +619,30 @@ def ngram_chunked_gather(chunk_ids, local_ids, ports):
 def ngram_dequant_iq4nl(row_bytes_f32, head_dim):
     """`[1, T, Hn, row_bytes]` f32 (bytes 0..255) -> `[1, T, Hn, head_dim]`
     f32: ggml's IQ4_NL dequantisation, `d * kvalues[q]` per element, done
-    with ops that are EXACT on this card class (window-050 §4.7: integer
-    eltwise runs in f32, so every intermediate here is an integer below 2**24
-    or a power of two, and the codebook and the exponent are Gathers on
-    constants rather than arithmetic):
+    with ops whose every intermediate is exact in f16 as well as f32 (the
+    GPU plugin runs the served graph at f16 execution precision):
 
       * the block splits into d_lo, d_hi (the f16 scale's two bytes) and 16
         nibble bytes; nibbles come out as floor(b/16) and b - 16*floor(b/16);
       * the f16 is rebuilt from its bit fields -- sign, 5-bit exponent, 10-bit
-        mantissa, subnormals included -- as sign * 2**(e-15) * (1 + m/1024),
-        the power of two gathered from a 32-entry table, so `d` is bit-exact;
+        mantissa, subnormals included -- as sign * 2**(e-15) * (1.m or 0.m),
+        the power of two gathered from a 32-entry table. The fields come from
+        the two bytes APART (d_hi = s eeeee mm, d_lo = the mantissa's low
+        eight bits), so every intermediate is an integer <= 255, a dyadic
+        fraction of <= 11 significant bits, a table power of two, or the f16
+        scale itself -- all exact in f16;
       * kvalues[q] is a Gather on the 16-entry codebook with the nibble
         converted to i32 (Convert is exact for 0..15).
 
-    The product of an f16-exact scale and a codebook integer is exact in
-    f32, so the result equals gguf-py's `dequantize(raw, IQ4_NL)` bit for
-    bit; the contract cell asserts equality, not tolerance.
+    In f32 the product of the f16 scale and a codebook integer is exact, so
+    the result equals gguf-py's `dequantize(raw, IQ4_NL)` bit for bit (the
+    CPU contract cell). In f16 only that last product rounds: on the A770 the
+    decode returns the exact values rounded to f16, bit for bit, on 64 x 16
+    real table rows (`measured-here`, 2026-09-27, DESIGN 7.0.2cz; subnormal
+    scales not shown on the card). The first form built the
+    bit pattern as `lo + 256*hi` (up to 65,535; f16 is exact only to 2,048)
+    and came back at 1.41 % relative error on the card, 93 % of elements
+    wrong.
     """
     f32 = lambda v: op.constant(np.array(v, np.float32))
     i64 = lambda v: op.constant(np.array(v, np.int64))
@@ -650,18 +658,19 @@ def ngram_dequant_iq4nl(row_bytes_f32, head_dim):
     nibbles = op.concat([lo, hi], axis=-1)                     # [..., nb, 32]
     kv = op.gather(f32(NGRAM_IQ4NL_KVALUES), op.convert(nibbles, Type.i32),
                    i64(0))                                     # codebook
-    # the f16 scale from its bits: bits = lo + 256*hi (< 65536, exact)
-    bits = op.add(d_lo, op.multiply(d_hi, f32(256.0)))
-    sign_bit = op.floor(op.divide(bits, f32(32768.0)))         # 0 or 1
-    rest = op.subtract(bits, op.multiply(sign_bit, f32(32768.0)))
-    exp = op.floor(op.divide(rest, f32(1024.0)))               # 0..31
-    mant = op.subtract(rest, op.multiply(exp, f32(1024.0)))    # 0..1023
+    # the f16 scale from its two bytes apart: d_hi = s eeeee mm, d_lo = the
+    # mantissa's low eight bits -- every intermediate exact in f16
+    sign_bit = op.floor(op.divide(d_hi, f32(128.0)))           # 0 or 1
+    hi7 = op.subtract(d_hi, op.multiply(sign_bit, f32(128.0))) # 0..127
+    exp = op.floor(op.divide(hi7, f32(4.0)))                   # 0..31
+    mant_hi = op.subtract(hi7, op.multiply(exp, f32(4.0)))     # 0..3
     # 2**(e-15) for e = 0..31, with e = 0 (subnormal) mapped to 2**-14 and
     # the mantissa then taken WITHOUT the implicit one
     pow_table = [2.0 ** (e - 15) if e > 0 else 2.0 ** -14 for e in range(32)]
     scale = op.gather(f32(pow_table), op.convert(exp, Type.i32), i64(0))
     normal = op.convert(op.greater(exp, f32(0.0)), Type.f32)   # 1 if e > 0
-    frac = op.add(normal, op.divide(mant, f32(1024.0)))        # 1.m or 0.m
+    frac = op.add(op.add(normal, op.divide(mant_hi, f32(4.0))),
+                  op.divide(d_lo, f32(1024.0)))                # 1.m or 0.m
     sign = op.subtract(f32(1.0), op.multiply(sign_bit, f32(2.0)))
     d = op.multiply(op.multiply(sign, scale), frac)            # [..., nb]
     vals = op.multiply(kv, op.unsqueeze(d, i64(-1)))           # [..., nb, 32]

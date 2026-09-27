@@ -510,6 +510,43 @@ std::vector<ModelEntry> build_registry() {
     }
 
     {
+        // qwen3.8-flash-next-d48s (2026-09-27): d48n's twin with the n-gram
+        // table declared as ONE per-forward staging window of 33,600 rows
+        // (--ngram-staging-rows, campaign ple-disk-backend) instead of seven
+        // ports over the whole table, tree 0e0ef26. The table stays in the
+        // GGUF and is read per forward; the 26.82 GiB USM-host pin does not
+        // happen. config.json is byte-identical to d48n's; the graph differs
+        // only in the n-gram ports (18,941 nodes against 18,995). Hashes read
+        // off the export log.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-d48s";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-d48s-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // the export writes none
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 48;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};   // the registry's coarse label, as d48n's
+        e.arch_hash               = "348950ee76e341f9";
+        e.template_hash           = "12827f24b742ea4e";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 77492280649ull;
+        e.status                  = "d48n with the n-gram table staged from disk per forward (campaign "
+                                    "ple-disk-backend); its digest gate against d48n FAILED and its KLD is "
+                                    "worse (DESIGN 7.0.2cz) -- a measurement artifact, not for serving";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
         // THE NATIVE `qwen3_5_moe` SERVING-SHAPE RUNG (2026-09-25): the
         // Qwen3.6-35B-A3B serving-shape IR at DEPTH 4 of 40, emitted by
         // tools/export_serving_artifact.py --family qwen35moe --layers 4

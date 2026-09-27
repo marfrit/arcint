@@ -361,3 +361,36 @@ campaign's numeric gate in device-free form.
   (`--layers 4`), which is legitimate for this gate: the n-gram table is a
   property of the model, not of the depth, so a depth-4 staging artifact exercises
   the same mechanism and the same freed 26.82 GiB term.
+
+- 2026-09-27 — **full depth: 2.2-2.8x faster, the gate FAILED (cause
+  open), and a precision defect found in the row decode shared by both
+  paths** (DESIGN §7.0.2cz; `measured-here` unless a class is named).
+  - Setup: `d48s` (tree 0e0ef26, `--ngram-staging-rows 33600`) and `d48n`,
+    each on the A770 at ratio 75 + tier + dispatch, one binary, the 0068
+    prefix, one run each.
+  - Speed, `d48s` against `d48n`:
+    - d1 decode 16.33 s against 36.72 s;
+    - d512 prefill 30.65 s against 75.72 s, decode 9.56 s against 26.66 s.
+  - Quality: the greedy digests differ. On window 0 of the f32 capture, the
+    mean KL below 2051 is 0.3386 staged against 0.2840 pinned.
+  - The graphs differ only in the gather, and the weight files only in 24
+    bytes. One 4-token forward already differs on rows 0–3. Re-binding the
+    staging tensor every forward changes nothing.
+  - **The divergence's cause is open.** The next measurement is the
+    gathered bytes of both arms, compared byte for byte.
+  - Separately, a card probe of the emitter's own decode
+    (`ngram_dequant_iq4nl`, stock OpenVINO via Python) found 1.41 %
+    relative error on the A770 at the served f16 execution:
+    - the same with 1 port and with 3, so it does not by itself separate
+      the arms;
+    - exact at f32.
+    The scale's bit pattern `lo + 256*hi` exceeds f16's exact range.
+  - Fixed in the emitter: the fields come from the two bytes apart. The
+    card then returns the exact decode rounded to f16, bit for bit.
+  - A new cell asserts every intermediate is f16-exact; it is red on the old
+    decode.
+  - Open: both twins re-exported with the new decode (`d48p2`, `d48s2`),
+    their digest gate, their KLD and the gathered-bytes comparison.
+  - [Correction, 2026-09-27] The 2026-09-23 entry above says the full-depth
+    artifact declares three chunked ports. `d48n`'s `serving-shape.json`
+    lists seven (`ngram_table.0`–`6`).

@@ -11101,6 +11101,122 @@ Campaign: `docs/window-054.md` (row 3b, Status 2026-09-27). The bound is
   counting host fills, allocations and that `clFinish` as constant work (an
   attribution), so it is not used as a bound.
 
+#### 7.0.2cz The staged n-gram table at full depth: 2.2-2.8x faster, gate FAILED; a precision defect in the shared row decode (2026-09-27)
+
+Campaign: `docs/campaigns/ple-disk-backend.md`. The staged table passed its
+gate at depth 4 on 2026-09-23 but had no full-depth artifact.
+
+- **The artifact.** `d48s` is `d48n` re-exported with
+  `--ngram-staging-rows 33600`, at tree 0e0ef26 (`d48n`: 69dfffd).
+  - [measured-here] `config.json` is byte-identical.
+  - [measured-here] A device-free multiset of layer signatures (type,
+    attributes without offsets, port shapes) differs only in the n-gram
+    gather. `d48n` alone has seven u8 table Parameters, six Equal, twelve
+    Select, seven Gather, six Unsqueeze and eighteen scalar Consts; `d48s`
+    alone has one [33600, 90] Parameter and its Gather. Nodes: 18,941
+    against 18,995.
+  - [measured-here] The weight files are identical except 24 bytes that
+    `d48n` holds at offset 1,515,618,509 (`cmp` before it, and with a
+    24-byte shift after it).
+  - [code] Those 24 bytes are the six chunk-index constants `i32(k)`.
+- [measured-here, A770 pinned at 2000 MHz, ratio 75 + tier + dispatch, u8
+  KV, chunk 512; one binary, the tip plus a registry entry (sha256 prefix
+  `2b953a06de5f9dff`), on the 0068 prefix] **Speed.** Both artifacts were
+  served from the same ext4 volume, one run each (n = 1). The page cache
+  was dropped before `d48s`. `d48n` ran straight after an earlier arm,
+  with no drop:
+
+  | artifact | d1 decode (32 tok) | d512 prefill | d512 decode (32 tok) |
+  |---|---|---|---|
+  | `d48n` (pinned) | 36.72 s | 75.72 s | 26.66 s |
+  | `d48s` (staged) | 16.33 s | 30.65 s | 9.56 s |
+
+  - The staged load binds 2.884 MiB of USM host staging where the pinned
+    one binds 26.82 GiB.
+  - On window 0 of the KLD capture, the 2,735-token prefill ran at 22.8
+    t/s staged against 9.4 t/s pinned.
+  - [not measured] What the speed comes from. §7.0.2cx's candidate, that
+    the pinned table crowds the host-tier experts out of the page cache,
+    fits it; no read counters were taken here. Owed with a repeat.
+- [measured-here] **The gate failed.** The greedy digests differ:
+  - d1 `bbae64a8…` against `1ddebc82…`;
+  - d512 `4c8ef641…` against `e4b40e19…`.
+- [measured-here] **KLD against the model's own f32 capture.** Window 0
+  (capture sha256 prefix `c4bf184ce287de87`), the 1,367 scored rows, one
+  replay each:
+
+  | artifact | mean KL below 2051 | above | argmax agreement |
+  |---|---|---|---|
+  | `d48n` | 0.2840 | 0.4583 | 0.808 |
+  | `d48s` | 0.3386 | 0.4618 | 0.800 |
+
+  - `d48n`'s recorded reading of the same window (2026-09-19, on the
+    plugin of that day, `docs/campaigns/sub4bit-vram-kernel.md`) was 0.283
+    below, 0.455 above and argmax 0.827.
+  - All 2,735 rows of the all-row dumps differ between the two artifacts.
+  - The median per-row max |dlogit| per 512-token chunk runs from 1.38
+    (the first chunk) to 2.44.
+- [measured-here] **Present from the first forward.** One 4-token forward,
+  all rows dumped:
+  - pinned twice: bit-identical;
+  - staged against pinned: max |dlogit| 0.69, 0.17, 1.23 and 1.68 on rows
+    0–3;
+  - staged with the staging tensor re-bound before every forward:
+    bit-identical to the single-bind run.
+- [code] What the two paths share:
+  - both copy the same bytes from the same file (`GgufFile::data` = map +
+    `data_offset_` + offset, the staged `pread` base);
+  - the plugin uses a USM-host remote tensor as-is (`sync_infer_request.cpp`,
+    the `is_remote_tensor_impl` branch; u8 needs no convert);
+  - every infer is synchronous.
+- **What causes the divergence is OPEN.** The decisive measurement is the
+  gathered bytes of both arms (the Convert output) in the 4-token forward,
+  compared byte for byte.
+- **A defect in the shared row decode, not shown to cause the divergence.**
+  - [code] The served main model sets no inference-precision hint;
+    `backend_ov.cpp` sets one only for the drafters. So the GPU runs it at
+    its default, f16.
+  - [measured-here, A770, stock OpenVINO 2026.4.0-22849-71640275d29 via
+    Python, a probe built from the emitter's own functions, 64 x 16 real
+    table rows] The decode (`ngram_dequant_iq4nl`) comes back at 1.41 %
+    relative error, 152,982 of 163,840 elements wrong.
+    - It gives the same figures with one table port and with three.
+    - It is exact on the CPU plugin, and on the card at
+      `INFERENCE_PRECISION_HINT=f32`.
+  - [code] The decode built the scale's bit pattern as `lo + 256*hi`, up to
+    65,535; f16 is exact only to 2,048.
+  - Against the defect as the gate's cause: the probe's 1-port and 3-port
+    results are identical, and the depth-4 twins of 2026-09-23 carried
+    this decode and matched.
+  - [measured-here] A plain-string rt_info key `disable_fp16_compression_0`
+    had no effect on the card. The typed attribute was not tried.
+- **The fix.** The emitter now builds the sign, exponent and mantissa from
+  the two bytes apart. Every intermediate is then an integer ≤ 255, a
+  dyadic fraction of ≤ 11 significant bits, a table power of two, or the
+  f16 scale itself.
+  - [measured-here, the same probe] With 1 port and with 3, the card
+    returns the exact decode rounded to f16, bit for bit. The old decode
+    misses those values on 106,920 elements. Subnormal scales are not shown
+    on the card.
+  - [measured-here] The CPU cell `the_in_graph_iq4nl_decode_is_gguf_pys_bit_for_bit`
+    stays green (the serving-shape suite: 37 passed, 1 skipped).
+  - [measured-here] A new cell runs the decode on the CPU at f32 and
+    asserts that each of its 29 intermediates, except the last product, is
+    f16-exact. It covers all 63,488 finite scale pairs (exponent 31, inf
+    and NaN, excluded). It is red on the old decode (4 intermediates) and
+    green on the new one.
+- **A latent defect found on the way.**
+  - [code] `release_kv_pools()` and `reset_lane_request()` rebuild a lane's
+    infer request. They re-bind the state rows and the KV pools, but not
+    the n-gram table ports.
+  - [code] Three paths reach them: a second reservation pass, a failed
+    activation or plateau probe, and a failed pre-warm. Each is preceded
+    by a warning line.
+  - [measured-here] Neither load logged a warning.
+- Owed: both twins re-exported with the new decode (`d48p2` pinned, `d48s2`
+  staged; running), their digest gate, their KLD against the same capture,
+  and the gathered-bytes comparison.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

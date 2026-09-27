@@ -33,12 +33,15 @@ TEST(registry_holds_exactly_the_target_models) {
     // dense-u8 twin (2026-09-26): the ones the native matcher fuses 40 of 40.
     // Twenty-one with their depth-4 A/B rungs, f32 and u8 dense (same day).
     const auto ids = model_ids();
-    CHECK_EQ(ids.size(), 21u);   // d48n beside d48g (2026-09-18), the native qwen3_5_moe d4 rung (2026-09-25), its d40 + d40f16 (2026-09-25), the packed d40 (2026-09-25), packed2 + packed-u8 + their d4 rungs (2026-09-26)
+    CHECK_EQ(ids.size(), 22u);   // d48n beside d48g (2026-09-18), the native qwen3_5_moe d4 rung (2026-09-25), its d40 + d40f16 (2026-09-25), the packed d40 (2026-09-25), packed2 + packed-u8 + their d4 rungs (2026-09-26), d48s (2026-09-27)
     CHECK(find_model("qwen3.8-flash-next-d48g") != nullptr);
     CHECK(find_by_artifact("qwen38-flash-next-d48g-ov") == find_model("qwen3.8-flash-next-d48g"));
     CHECK(find_model("qwen3.8-flash-next-d48n") != nullptr);
     CHECK(find_by_artifact("qwen38-flash-next-d48n-ov") == find_model("qwen3.8-flash-next-d48n"));
     CHECK_EQ(find_model("qwen3.8-flash-next-d48n")->arch_hash, std::string("641fcb1863f83629"));
+    CHECK(find_model("qwen3.8-flash-next-d48s") != nullptr);
+    CHECK(find_by_artifact("qwen38-flash-next-d48s-ov") == find_model("qwen3.8-flash-next-d48s"));
+    CHECK_EQ(find_model("qwen3.8-flash-next-d48s")->arch_hash, std::string("348950ee76e341f9"));
     CHECK(find_model("qwen3.8-flash-next-d48f") == nullptr);   // superseded, not admitted
     CHECK(find_model("qwen3.8-flash-next-d12r") != nullptr);
     CHECK(find_by_artifact("qwen38-flash-next-d12r-ov") == find_model("qwen3.8-flash-next-d12r"));
