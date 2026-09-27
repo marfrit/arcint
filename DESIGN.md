@@ -11061,7 +11061,7 @@ stopped).
   - All four arms give the same text: d1 sha256 prefix `1ddebc829f218598`,
     d512 `e4b40e198c8f22a6`.
   - The load time moves by 2x with no pattern by runtime; it is not
-    interpreted here (§7.0.2cy).
+    interpreted (§7.0.2cy records four more loads with the same spread).
   - The host still reads heavily from disk during these arms. `vmstat`
     means over the whole third and fourth arms (host-wide, 5 s samples, the
     load included; 97 and 63 samples):
@@ -11077,6 +11077,29 @@ stopped).
     experts out of the page cache, so the decode reads them from disk again.
     The staged table (`docs/campaigns/ple-disk-backend.md`, gate passed at
     depth 4) would test it; it has no full-depth artifact yet.
+
+#### 7.0.2cy LYON row 3b: one Flash-Next load compiles under the 86k-node law's bound (2026-09-27)
+
+Campaign: `docs/window-054.md` (row 3b, Status 2026-09-27). The bound is
+18,995 nodes (the served xml, counted before the paged transformation) x
+2.38 ms = 45.2 s, the worst per-node rate the law recorded.
+
+- [code] The paged load's "language model ready in" line times one
+  `compile_model` call and a memory-statistics read. The xml read and
+  `SDPAToPagedAttention` come before it. The row-1 entry's "covers ... the
+  paged transformation" is corrected there.
+- [measured-here, A770 `GPU.1` pinned at 2000 MHz, `d48n`, row 1's flags,
+  installed 0.5.0.1 on `+p20`] Four fresh loads read 40.1, 70.9, 45.6 and
+  82.9 s; the last ran under the OpenCL intercept. The spread is not
+  interpreted (§7.0.2cx shows the same, 38.0 and 80.5 s).
+- [measured-here] **Row 3b passes on w1**: its whole `compile_model`,
+  40.1 s, bounds its compile-only time. The other loads are open, and this
+  method cannot fail the row.
+- [measured-here, report-only] In the intercepted load, `reorder_data`
+  kernel enqueues take 35.84 s and one `clFinish` 8.69 s. Kernel builds take
+  0.87 s of wall time. A compile-only remainder of 28.29 s depends on
+  counting host fills, allocations and that `clFinish` as constant work (an
+  attribution), so it is not used as a bound.
 
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 

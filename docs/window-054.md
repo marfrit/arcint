@@ -1,4 +1,4 @@
-# window-054 — 0.5.4 LYON acceptance (LYON-001: rows 1 and 3a READ on Flash-Next, row 3c READ on the 35B by operator ruling; rows 2 and 3b EMPTY)
+# window-054 — 0.5.4 LYON acceptance (LYON-001: rows 1 and 3a READ on Flash-Next, row 3c READ on the 35B by operator ruling; row 3b READ on Flash-Next; row 2 EMPTY)
 
 Recorded 2026-09-26, before any LYON card window exists and before the
 compile-once/replay path is built. This file is the acceptance commit of 0.5.4
@@ -61,7 +61,7 @@ prefill.
 
 ## What LYON-001 owns
 
-Three acceptance rows (rows 1 and 3a READ on Flash-Next and row 3c READ on the 35B by the operator's ruling, 2026-09-26, Status; rows 2 and 3b EMPTY):
+Three acceptance rows (rows 1 and 3a READ on Flash-Next and row 3c READ on the 35B by the operator's ruling, 2026-09-26, and row 3b READ on Flash-Next, 2026-09-27, Status; row 2 EMPTY):
 
 1. **a 32k prompt answered on-card** — multi-block prefill across the 2051
    boundary, greedy answer pasted raw, digest recorded;
@@ -144,6 +144,10 @@ Row 3 carries both halves:
   law's own per-node rate (`code`: window-050 §6). A generated node count makes
   this a number that can fail; it is deliberately the **worst recorded** per-node
   rate, not the flat 0.55, so the cell does not pass by assuming the good regime.
+  **READ (2026-09-27, `measured-here`) — PASS as an upper bound on one
+  run**: that load's whole `compile_model` took 40.1 s against 45.2 s. Two
+  more loads of the same flags took 70.9 and 45.6 s as wholes, which leaves
+  them open. See the Status entry.
 - **3c, served rate**: prefill **≥ 460 t/s** at 32k on the A770. Threshold
   source: DESIGN §7.0.2's operator prefill bar at depth (**460 t/s**, `code` —
   the bar's own arithmetic, restated there, not re-measured here). The static
@@ -431,3 +435,78 @@ at the end, not many. **No measurement before the feature exists.**
     `compile_s` is a compile-only time: the law's bound, 18,995 x 2.38 ms =
     45.2 s, needs that measurement.
   - **Row 2 stays EMPTY** (an open numerics campaign).
+- 2026-09-27, **row 3b READ — PASS as an upper bound on one run**
+  (`measured-here` unless a class is named).
+  - Leg header:
+    - Flash-Next `d48n` on the A770 `GPU.1`, GT clock pinned at 2000 MHz
+      (DESIGN §7.0.2cw);
+    - row 1's flags: `--offload-ratio 75 --moe-cpu-tier
+      --moe-per-expert-dispatch`, u8 KV, chunk 2048, `--n-ctx 36864`;
+    - the installed arcint 0.5.0.1 (binary sha256 prefix
+      `2d565045497d2f06`) on `marfrit-openvino +p20` (series 0003–0067,
+      `dpkg -V` clean, plugin `5dadc0640cc5b139`);
+    - row 1 ran a prefix build of series 0003–0066, before the pin.
+    Each load is a fresh process. The plain loads were stopped once the
+    compile line was logged.
+  - What the "ready in" line times (`code`: `src/exec/backend_ov.cpp`, the
+    paged load): `t0` is taken after the "compiling PAGED" line. The timer
+    wraps one `core_.compile_model` call and a memory-statistics read.
+    Reading the xml, opening the n-gram GGUF and `SDPAToPagedAttention` all
+    come before `t0`; the embeddings compile and the n-gram binding come
+    after the line.
+  - **Correction to the row-1 entry above.** It says the 63.2 s "covers
+    reading the model, the paged transformation and the 8.06 GiB device
+    upload". The xml read and the paged transformation are outside the
+    timer (`code`, as above). Whether the `.bin` constant reads land inside
+    it is not shown.
+  - Four loads, back to back:
+
+        w1   (plain)                      language model ready in 40.1 s (paged); device-resident 8.06 GiB
+        m2   (plain)                      language model ready in 70.9 s (paged); device-resident 8.06 GiB
+        m3   (plain)                      language model ready in 45.6 s (paged); device-resident 8.06 GiB
+        cli4 (under the OpenCL intercept) language model ready in 82.9 s (paged); device-resident 8.06 GiB
+
+    The spread is not interpreted (DESIGN §7.0.2cx's +p20 loads, 38.0 and
+    80.5 s, show the same). Host-wide `vmstat` disk reads:
+    - m2: 19.0 GiB over its 75 s;
+    - m3: 17.1 GiB over its 49 s;
+    - cli4: 23.4 GiB in its first 90 s;
+    - w1 was not sampled.
+  - **The PASS rests on w1 alone.** w1's whole `compile_model`, 40.1 s,
+    contains its compile, so its compile-only time is at most 40.1 s,
+    under 45.2 s.
+  - m2 and m3 are open: as wholes they exceed 45.2 s and were not taken
+    apart. That the compile-only time is the same from run to run is not
+    measured.
+  - An upper bound can pass this row or leave it open, but never fail it. A
+    FAIL needs a lower bound above 45.2 s, for example the wall time of
+    the calls that are only compile work. None was taken.
+  - **Report-only: where cli4's time went.** Host call timing and a chrome
+    trace. Window: from the trace's first call (3.576 s) to the first of
+    seven host allocations that each take over 150 ms after 80 s (87.725 s).
+    Those seven are identified as the n-gram table's seven ports by count,
+    and by their span (about 19 s) against the logged 22.6 s bind.
+    The window is 84.15 s over 10 host threads. Inside it:
+
+        reorder_data kernels (enqueue)            35.84 s   761 calls   (30-65 s)
+        clFinish                                   8.69 s   735 calls   (at 65 s)
+        clEnqueueMemFillINTEL( H )                 6.72 s   485 calls   (20-30 s)
+        clHostMemAllocINTEL                        3.12 s  2112 calls   (5-15 s)
+        clEnqueueMemcpyINTEL( HtoD; blocking )     1.49 s   733 calls
+        clBuildProgram                             5.46 s summed, 0.87 s wall union, 186 calls
+
+    - These five constant-path classes have a 55.86 s wall-clock union,
+      which leaves 84.15 - 55.86 = 28.29 s.
+    - Assigning those classes to constant data is an attribution, not a
+      measurement. It rests on the phase order (allocations, host fills,
+      then reorders closed by one `clFinish`) and on the kernel's name.
+    - The result depends on that attribution: without `clFinish`, MemFill
+      and the allocations (only the reorders and HtoD subtracted), the
+      remainder is 46.8 s.
+    - The window need not contain the whole call: the plugin may first
+      touch OpenCL inside `compile_model`.
+    - So 28.29 s is not used as a bound. The law's `compile_s` was a whole
+      `compile_model` on graphs holding at most 7.2 MB of constants
+      (`code`: window-050 §6); this artifact's `.bin` is 77.5 GB.
+  - The node count 18,995 is the served xml's, counted before
+    `SDPAToPagedAttention`. The transformed graph's count was not taken.
