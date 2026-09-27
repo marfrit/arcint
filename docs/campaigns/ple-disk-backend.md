@@ -424,3 +424,30 @@ campaign's numeric gate in device-free form.
     - serving the staged artifact.
   - Owed: the decoded embedding of both served processes compared byte for
     byte, a wider spread, and a cold-cache speed.
+
+- 2026-09-27 (evening) — **the digest gate passes on the old-decode twins
+  with dispatch off (the 2026-09-23 gate's route); with dispatch on the
+  twins part at layer 1's MoE** (DESIGN §7.0.2cz, "Evening").
+  - [measured-here] With `--moe-per-expert-dispatch` off (ratio 75 + CPU
+    tier, u8 KV), the twins' 4-token logits are bit-identical, and the
+    digests agree: d1 `8ec20481a399…`, d512 `eb89a675a8d2…`. One run each.
+  - [measured-here] With dispatch on:
+    - in the unperturbed program the twins agree at `layer0/out` and differ
+      from `layer2/out` on;
+    - in a probed program whose logits the probes moved, they agree through
+      the PLE block and layer 1's mixer, and part at `layer1/out`, after its
+      MoE.
+    - The divergence is fixed per artifact and program, not run-to-run
+      noise.
+  - [code + measured-here on plugin 0047, before 0056, not re-measured]
+    Under dispatch, residency decides whether an expert runs on the GPU
+    kernel or the host tier, which were not bit-identical (§7.0.2ce/cf).
+    Whether the twins' resident sets differ is not measured. Residency is
+    one candidate, a per-program kernel choice another.
+  - Reading (not measured): on the old-decode twins, on the forwards
+    measured, the staging change is byte-exact on the tier-only route.
+  - Owed:
+    - the new-decode twins on the tier-only route, before the full-depth
+      gate is called passed;
+    - the staged tier-only speed from the same volume;
+    - whether, and why, the dispatch route's layer-1 MoE differs.

@@ -11103,6 +11103,10 @@ Campaign: `docs/window-054.md` (row 3b, Status 2026-09-27). The bound is
 
 #### 7.0.2cz The staged n-gram table at full depth: 2.2-2.8x faster, gate FAILED; a precision defect in the shared row decode (2026-09-27)
 
+[DATED IN PLACE 2026-09-27, evening: the gate failure is localised to the
+per-expert dispatch route. With dispatch off, the old-decode twins agree
+bitwise (the "Evening" bullet at the end of this section).]
+
 Campaign: `docs/campaigns/ple-disk-backend.md`. The staged table passed its
 gate at depth 4 on 2026-09-23 but had no full-depth artifact.
 
@@ -11169,7 +11173,9 @@ gate at depth 4 on 2026-09-23 but had no full-depth artifact.
   - the plugin uses a USM-host remote tensor as-is (`sync_infer_request.cpp`,
     the `is_remote_tensor_impl` branch; u8 needs no convert);
   - every infer is synchronous.
-- **What causes the divergence is OPEN.** The decisive measurement is the
+- **What causes the divergence is OPEN.** [DATED IN PLACE 2026-09-27: see
+  the "Evening" bullet; the divergence appears only with
+  `--moe-per-expert-dispatch`.] The decisive measurement is the
   gathered bytes of both arms (the Convert output) in the 4-token forward,
   compared byte for byte.
 - **A defect in the shared row decode, not shown to cause the divergence.**
@@ -11299,6 +11305,92 @@ gate at depth 4 on 2026-09-23 but had no full-depth artifact.
       forward, compared byte for byte;
     - more than one neutral perturbation, and repeats, to size the spread;
     - `d48s2`'s speed with a cold page cache.
+- **Evening: with dispatch off the twins agree; with it on they part at layer
+  1's MoE.** [A770 pinned at 2000 MHz; old-decode twins `d48n` (ext4) and
+  `d48s` (the pool: the original export, of which the ext4 copy compared
+  identical); a 4-token forward [8678, 25, 1394, 513] with all-row logits;
+  one run per arm. Dispatch-on arms: `--offload-ratio 75 --moe-cpu-tier
+  --moe-per-expert-dispatch --paged-kv u8`, chunk 512, `--n-ctx 8192`.
+  Binaries: dev-host scratch builds of the tip that differ only in scratch
+  registry entries and env-gated dumps; the last probe set and every
+  dispatch-off arm ran `b01b3185…`]
+  - **Probes inside the served graph.** Dev-host copies of each twin's xml
+    gain extra Results on named nodes (weights symlinked, registry entries
+    scratch). [code] The binary dumps every `scratch_*` output after each
+    infer.
+    - [measured-here] Neutral in two sets:
+      - a probe on the PLE decode output alone;
+      - probes on layer outputs 0, 2, 3, 6, 12, 24, 36 and 47.
+      In both, the probed pinned logits equal the unprobed ones bitwise.
+    - [measured-here] Not neutral in two sets, whose pinned logits moved by
+      up to 2.08 and 1.11:
+      - a set with probes on the PLE FullyConnected's input and output;
+      - a set on layer 1's mixer nodes and output.
+    - [measured-here] A set that included `moe/mix` and `mixer_out` of
+      layers 2 and 3 failed both loads
+      (`CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST`; the kernel log shows
+      `exec queue reset detected`). The card recovered: the coder served
+      afterwards.
+    - [measured-here] The dispatch-on staged-against-pinned logits are the
+      same in the unprobed runs and in both neutral sets (max |dlogit|
+      0.6943 / 0.1725 / 1.2288 / 1.6796). The divergence is fixed per
+      artifact and program, not run-to-run noise.
+  - [measured-here] **Where the twins part, dispatch on.**
+    - The unperturbed program (the neutral layer-output set): `layer0/out`
+      is equal. From `layer2/out` on they differ (12,939 of 40,960
+      elements, max 1.2e-4), and the gap grows with depth: `layer24/out`
+      max 4.9e-3, `layer36/out` 0.035, `layer47/out` 0.26.
+    - In the probed programs, where the probes moved the logits, each
+      comparison is between the twins probed at the same points. Equal
+      bitwise:
+      - the decoded n-gram embedding (`ple/gathered`, 0 of 10,240);
+      - the PLE FullyConnected's input and output;
+      - two projections in layer 1's GDN block (`MatMul_1007`, `MatMul_1032`;
+        [code] named from the graph);
+      - the conv output;
+      - `layer1/mixer_out`.
+    - `layer1/out`, after layer 1's MoE: 1,769 elements differ (max 3.1e-5).
+      That the MoE's input is equal is derived from `layer0/out` and
+      `mixer_out`; the MoE's own input was not probed.
+    - This closes the afternoon's owed decoded-embedding comparison.
+  - [measured-here] **Without dispatch** (`--offload-ratio 75 --moe-cpu-tier
+    --paged-kv u8`):
+    - the 4-token forward's logits are bit-identical between the twins;
+    - the digest arms agree: d1 `8ec20481a399…` and d512 `eb89a675a8d2…`
+      in both;
+    - speed: `d48n` 24.84 s d1 decode / 67.51 s prefill 512 / 29.79 s d512
+      decode, `d48s` 397.74 / 1064.79 / 181.90 s. `d48s` loaded from the
+      pool and `d48n` from ext4, with the page cache as the earlier arms
+      left it, so the two are not comparable.
+  - **What differs on the dispatch route is not identified.**
+    - [code] Under dispatch a resident expert runs on the GPU per-expert
+      kernel and a miss on the host tier.
+    - [measured-here on plugin 0047, before patch 0056, and not re-measured
+      on the 0068 prefix] The two were not bit-identical (§7.0.2ce/cf, both
+      dated in place).
+    - A later qwen3_5_moe leg found the dispatch route's digests unchanged
+      across ratios 25 to 99.
+    - Whether the twins' resident sets differ is not measured; the logs
+      carry no per-expert counters. Residency is one candidate, and a
+      per-program kernel choice another.
+    - One point cuts against a wholesale difference: layer 0's MoE agreed.
+  - **Reading** (not measured): on the old-decode twins, on the forwards
+    measured, the staging change is byte-exact on the tier-only route.
+    - This is the route the 2026-09-23 depth-4 gate was defined and passed
+      on (ratio 99 + tier, no dispatch).
+    - The native route without dispatch runs every routed expert on the host
+      tier, so residency moves bytes, not arithmetic
+      (`docs/campaigns/expert-hot-set-lru.md`, ratio 99, plugin 0046).
+  - Owed:
+    - the new-decode twins on the tier-only route, before calling the
+      full-depth gate passed;
+    - the staged tier-only speed from the same volume, with the cache state
+      stated;
+    - whether, and why, the dispatch route's layer-1 MoE differs between
+      the twins (`MOE_OTD_PERF_LOG` counters first);
+    - carried from the afternoon: more than one neutral perturbation, and
+      repeats; `d48s2`'s cold-cache speed.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,
