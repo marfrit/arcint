@@ -812,6 +812,11 @@ public:
         // sequence -- carried across chunks by paged_forward itself.
         std::vector<int>     last_ids;
         std::vector<int64_t> ngram_ctx;
+        // The n-gram staging window, when the IR declares one: ONE PER LANE.
+        // feed_ngram_ports fills it outside the lane's turn, so a shared
+        // window would let one lane's rows overwrite another's before its
+        // infer (DESIGN 7.0.2cz).
+        ov::RemoteTensor     ngram_staging;
         // The MTP head carries its own attention KV over the prefix, so it
         // needs its own request per lane as well: a shared head would let one
         // sequence draft from the other's prefix, which is cross-slot bleed in
@@ -5871,9 +5876,9 @@ private:
             lane->blocks.clear();
             lane->req = {};
             lane->req = paged_model_.create_infer_request();
-            for (size_t i = 0; i < la_state_names_.size(); ++i) {
-                lane->req.set_tensor(la_state_names_[i], lane->la_tensors[i]);
-            }
+            // not the KV pools: they are released right below, and a
+            // request bound to them would keep them alive
+            rebind_lane_request(*lane, /*with_kv_pools=*/false);
         }
         kv_pool_tensors_.clear();
         const size_t after = device_resident_bytes(device);
@@ -5907,11 +5912,36 @@ private:
         // into the first real request, naming pages the BlockPool (created
         // later) still believes are free — two sequences on one KV page.
         lane.blocks.clear();
+        lane.req = {};   // release the old request first: no transient second one
         lane.req = paged_model_.create_infer_request();
+        rebind_lane_request(lane, /*with_kv_pools=*/true);
+    }
+
+    // Everything a freshly created lane request needs before its next forward.
+    // A new InferRequest holds none of the tensors the load bound to the old
+    // one: the GDN state rows, the KV pools and the n-gram table ports
+    // (DESIGN 7.0.2cz: both rebuild paths once dropped the table ports).
+    // tests/python/test_backend_request_bindings.py pins that every rebuild
+    // goes through here.
+    void rebind_lane_request(Lane& lane, bool with_kv_pools) {
         for (size_t i = 0; i < la_state_names_.size(); ++i) {
             lane.req.set_tensor(la_state_names_[i], lane.la_tensors[i]);
         }
-        bind_kv_pools(lane);
+        if (with_kv_pools) bind_kv_pools(lane);
+        bind_ngram_tables(lane);
+    }
+
+    // The n-gram table ports as bind_ngram_ports bound them: the staging
+    // window, or the pinned chunks in port order. Inert before the first bind
+    // and for an IR that declares no table port.
+    void bind_ngram_tables(Lane& lane) {
+        if (ngram_staging_active_) {
+            lane.req.set_tensor(ngram_ports_.chunks[0].name, lane.ngram_staging);
+            return;
+        }
+        for (size_t i = 0; i < ngram_table_tensors_.size(); ++i) {
+            lane.req.set_tensor(ngram_ports_.chunks[i].name, ngram_table_tensors_[i]);
+        }
     }
 
     void bind_kv_pools(Lane& lane) {
@@ -8124,7 +8154,6 @@ private:
     ngram::StagingGeometry        ngram_staging_geom_{};
     int                           ngram_staging_fd_     = -1;
     uint64_t                      ngram_staging_base_   = 0;
-    ov::RemoteTensor              ngram_staging_tensor_;
     std::optional<ngram::HashParams> ngram_hash_;
 
     // Bind the table to the ports, once, after the lanes exist. The source
@@ -8201,11 +8230,12 @@ private:
                                   static_cast<uint64_t>(t->offset);
             const ov::Shape sh{ngram_staging_geom_.staging_rows,
                                ngram_staging_geom_.row_bytes};
-            ngram_staging_tensor_ = rctx.create_tensor(
-                ov::element::u8, sh,
-                {{ov::intel_gpu::shared_mem_type.name(), ov::intel_gpu::SharedMemType::USM_HOST_BUFFER}});
-            for (auto& lane : lanes_)
-                lane->req.set_tensor(ngram_ports_.chunks[0].name, ngram_staging_tensor_);
+            for (auto& lane : lanes_) {
+                lane->ngram_staging = rctx.create_tensor(
+                    ov::element::u8, sh,
+                    {{ov::intel_gpu::shared_mem_type.name(), ov::intel_gpu::SharedMemType::USM_HOST_BUFFER}});
+                lane->req.set_tensor(ngram_ports_.chunks[0].name, lane->ngram_staging);
+            }
             ngram_staging_active_ = true;
         } else {
             const std::string why = ngram::check_table_source(*t, gguf_file_->bytes(*t), ngram_ports_);
@@ -8248,11 +8278,11 @@ private:
         if (ngram_staging_active_) {
             log::info("load",
                       "ngram table STAGED: %zu port(s) of %zu rows x %zu B = %.3f MiB of USM host "
-                      "staging from %s (the %llu-row table stays on disk, read per forward); "
-                      "id ports %s, conv_mask %s; hash ordinal 0",
+                      "staging per lane x %zu lane(s) from %s (the %llu-row table stays on disk, "
+                      "read per forward); id ports %s, conv_mask %s; hash ordinal 0",
                       ngram_ports_.chunks.size(), ngram_ports_.total_rows, ngram_ports_.row_bytes,
                       static_cast<double>(ngram_ports_.total_rows * ngram_ports_.row_bytes) / (1u << 20),
-                      ngram::kTableTensor,
+                      lanes_.size(), ngram::kTableTensor,
                       static_cast<unsigned long long>(ngram_staging_geom_.table_rows),
                       ngram_ports_.declares_ids ? "declared" : "absent",
                       ngram_ports_.declares_conv_mask ? "declared" : "absent");
@@ -8320,7 +8350,7 @@ private:
             // one staging port: fill it with exactly the rows this forward
             // names, then index it by the slot the plan assigned (local[i] = i)
             void* dst =
-                ngram_staging_tensor_.get_params().at(ov::intel_gpu::mem_handle.name()).as<void*>();
+                lane.ngram_staging.get_params().at(ov::intel_gpu::mem_handle.name()).as<void*>();
             local = ngram::stage_from_file(ngram_staging_fd_, ngram_staging_base_,
                                            ngram_staging_geom_.row_bytes, global,
                                            ngram_staging_geom_, static_cast<uint8_t*>(dst));

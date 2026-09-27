@@ -185,6 +185,63 @@
         "mtp_num_hidden_layers": 1,
         "mtp_head_exported": false
     },
+    "qwen38-flash-next-d48s-ov": {
+        "_note": "2026-09-27: d48n re-exported at tree 0e0ef26 with --ngram-staging-rows 33600: one per-forward n-gram staging window instead of seven table ports. The .bin is 24 bytes shorter than d48n's: d48n's chunk-index constants (cmp: identical before offset 1,515,618,509 and with a 24-byte shift after it). Hashes read off the export log. DESIGN 7.0.2cz.",
+        "arch": [
+            "Qwen4ExpForConditionalGeneration"
+        ],
+        "model_type": "qwen4_exp",
+        "hidden": 2560,
+        "layers": 48,
+        "experts": 512,
+        "ctx": 262144,
+        "full_attention_interval": 4,
+        "template_sha": "12827f24b742ea4e",
+        "tokenizer_sha": "87a7830d63fcf43b",
+        "lm_xml_sha": "348950ee76e341f9",
+        "lm_bin_bytes": 77492280649,
+        "status": "d48n with the n-gram table staged from disk per forward (campaign ple-disk-backend); its digest gate against d48n FAILED and its KLD is worse (DESIGN 7.0.2cz) -- a measurement artifact, not for serving",
+        "mtp_num_hidden_layers": 1,
+        "mtp_head_exported": false
+    },
+    "qwen38-flash-next-d48p2-ov": {
+        "_note": "2026-09-27: the full-depth native artifact exported at tree 0e0ef26 plus the f16-exact n-gram row decode (commit 962dfa1; the export file differed from it only in comments and docstrings, by diff), the n-gram table as seven pinned ports. The pinned twin of d48s2. Hashes read off the export log. DESIGN 7.0.2cz.",
+        "arch": [
+            "Qwen4ExpForConditionalGeneration"
+        ],
+        "model_type": "qwen4_exp",
+        "hidden": 2560,
+        "layers": 48,
+        "experts": 512,
+        "ctx": 262144,
+        "full_attention_interval": 4,
+        "template_sha": "12827f24b742ea4e",
+        "tokenizer_sha": "87a7830d63fcf43b",
+        "lm_xml_sha": "1c54b317448a6ddc",
+        "lm_bin_bytes": 77492280673,
+        "status": "full-depth native artifact with the f16-exact n-gram decode, table pinned; the pinned twin of d48s2",
+        "mtp_num_hidden_layers": 1,
+        "mtp_head_exported": false
+    },
+    "qwen38-flash-next-d48s2-ov": {
+        "_note": "2026-09-27: d48p2 with --ngram-staging-rows 33600 (the n-gram table staged from disk per forward). A770 pinned at 2000 MHz, --offload-ratio 75 --moe-cpu-tier, u8 KV, both from the same ext4 volume, one run each: with --moe-per-expert-dispatch off it gives d48p2's digests (d1 82df3c78, d512 c1d2077f) and decodes 1.6-2.7x faster; with it on the digests differ. Hashes read off the export log. DESIGN 7.0.2cz.",
+        "arch": [
+            "Qwen4ExpForConditionalGeneration"
+        ],
+        "model_type": "qwen4_exp",
+        "hidden": 2560,
+        "layers": 48,
+        "experts": 512,
+        "ctx": 262144,
+        "full_attention_interval": 4,
+        "template_sha": "12827f24b742ea4e",
+        "tokenizer_sha": "87a7830d63fcf43b",
+        "lm_xml_sha": "08dd2c858baed75f",
+        "lm_bin_bytes": 77492280649,
+        "status": "full-depth native artifact with the f16-exact n-gram decode and the table staged from disk; same greedy digests as d48p2 with --moe-per-expert-dispatch off, different with it on (DESIGN 7.0.2cz)",
+        "mtp_num_hidden_layers": 1,
+        "mtp_head_exported": false
+    },
     "qwen38-flash-next-d12-ov": {
         "_note": "2026-09-13: the serving-shape IR of Qwen3.8 Flash-Next (qwen4exp) at DEPTH 12 of 48 -- the depth ladder's first rung (docs/window-051.md row (b)), real weights from the UD-Q3_K_XL shards (tools/export_serving_artifact.py --layers 12, tree d93508c, serving-shape.json beside it). Hashes read off /models/ov/qwen38-flash-next-d12-ov on the dev host (build 1,450.9 s, peak host 30.39 GiB). A measurement artifact: 36 layers are missing, its answers are not the model's.",
         "arch": [

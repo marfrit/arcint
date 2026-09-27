@@ -547,6 +547,80 @@ std::vector<ModelEntry> build_registry() {
     }
 
     {
+        // qwen3.8-flash-next-d48p2 (2026-09-27): the full-depth native artifact
+        // exported at tree 0e0ef26 plus the f16-exact n-gram row decode (commit
+        // 962dfa1; the export file differed from it only in comments and
+        // docstrings, by diff), the
+        // n-gram table as seven pinned ports. The pinned twin of d48s2.
+        // Hashes read off the export log.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-d48p2";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-d48p2-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // the export writes none
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 48;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};   // the registry's coarse label, as d48n's
+        e.arch_hash               = "1c54b317448a6ddc";
+        e.template_hash           = "12827f24b742ea4e";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 77492280673ull;
+        e.status                  = "full-depth native artifact with the f16-exact n-gram decode, table pinned; "
+                                    "the pinned twin of d48s2";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
+        // qwen3.8-flash-next-d48s2 (2026-09-27): d48p2 with the n-gram table
+        // staged from disk per forward (--ngram-staging-rows 33600). Measured
+        // on the A770 pinned at 2000 MHz, --offload-ratio 75 --moe-cpu-tier,
+        // u8 KV, both served from the same ext4 volume, one run each: without
+        // --moe-per-expert-dispatch it gives d48p2's greedy digests and decodes
+        // 1.6-2.7x faster. With dispatch its digests differ from d48p2's, and 47
+        // of 48 per-layer resident sets differ (patch 0018 ranks on patch
+        // 0013's layer_key, the first expert weight's .bin offset, which the
+        // staging export shifts by 24 bytes); whether that residency
+        // difference causes the digest difference is measured in DESIGN
+        // 7.0.2cz. Hashes read off the export log.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-d48s2";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-d48s2-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // the export writes none
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 48;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};   // the registry's coarse label, as d48n's
+        e.arch_hash               = "08dd2c858baed75f";
+        e.template_hash           = "12827f24b742ea4e";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 77492280649ull;
+        e.status                  = "full-depth native artifact with the f16-exact n-gram decode and the table "
+                                    "staged from disk; same greedy digests as d48p2 with "
+                                    "--moe-per-expert-dispatch off, different with it on (DESIGN 7.0.2cz)";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
         // THE NATIVE `qwen3_5_moe` SERVING-SHAPE RUNG (2026-09-25): the
         // Qwen3.6-35B-A3B serving-shape IR at DEPTH 4 of 40, emitted by
         // tools/export_serving_artifact.py --family qwen35moe --layers 4

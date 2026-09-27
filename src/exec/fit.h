@@ -1954,6 +1954,8 @@ inline uint64_t ngram_table_bytes(int32_t ggml_type, uint64_t n_elements) {
 // row bytes are given directly because the port's shape is the contract
 // (`exec/ngram_ports.h` reads the partition off the compiled model, no
 // config carries it); this function does not re-derive them.
+// One window PER LANE (the backend's `Lane::ngram_staging`: each lane fills
+// its own outside its turn), so a load's host term is lanes x this.
 inline uint64_t ngram_staging_bytes(uint64_t staging_rows, uint64_t row_bytes) {
     return staging_rows * row_bytes;
 }
