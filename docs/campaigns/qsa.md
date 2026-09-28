@@ -467,6 +467,23 @@ answer must not move.
       (`gguf_pass_neutralises_awq_multipliers_and_compares_norms`) reproduces
       on a clean OV build at the same HEAD with the same runtime -- a
       pre-existing environment mismatch, not this change.
+  - 2026-09-28. **T5 landed: both artifacts are exported and registered.** The
+    Paris-cell boots are the remaining step, owed to the T6 window (the served
+    arcint must be built against the ov-0073 runtime so the T4 accept path and
+    the T3b route gate are in the binary that loads them).
+    - **Exports.** `qwen38-flash-next-d4qsa-ov` on rpool (lm_xml_sha
+      `ec98641c20277204`, .bin 8.64 GiB, peak host 27.59 GiB) and
+      `qwen38-flash-next-d48q8qsa-ov` on the NVMe (`--layers 48 --qsa
+      --dense-q8 --dense-u8`; lm_xml_sha `e248c2e11761b40e`, .bin 63.88 GiB,
+      peak host 51.41 GiB). Both carry `serving-shape.json` `qsa: true`, 1 and
+      12 QSA layers. The d48 export first ran out of space writing straight to
+      the NVMe (the 58 GiB arena plus the 64 GiB .bin against 94 GiB free); the
+      retry put the arena on rpool (`--arena`) and the artifact on the NVMe.
+    - **Registration.** `models/allowlist-raw.json` and
+      `src/core/model_registry.cpp` gain `qwen3.8-flash-next-d4qsa` and
+      `qwen3.8-flash-next-d48q8qsa`; `tests/test_registry.cpp` reads 27 ids and
+      pins both hashes. The registry ladder is green (21 cases).
+    - **Owed.** The Paris cell per artifact, in the T6 window.
   - The export flag `--qsa` (default off, so existing artifacts and the arch
     hash do not move) records `qsa` in the manifest and feeds the indexer
     tensors through `gguf_feed` (`self_attn.indexer.*`; the two norm gammas

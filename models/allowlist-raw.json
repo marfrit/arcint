@@ -128,6 +128,25 @@
         "mtp_num_hidden_layers": 1,
         "mtp_head_exported": false
     },
+    "qwen38-flash-next-d4qsa-ov": {
+        "_note": "2026-09-28: the d4 rung re-exported with --qsa (tools/export_serving_artifact.py --layers 4 --qsa, tree 4f05b21, peak host 27.59 GiB; campaign qsa step 3 T5). The one attention layer carries the model's own indexer, the served selection and the route-gate boundary (rt_info qsa_boundary 2051). lm_xml_sha ec98641c20277204, lm .bin 8.64 GiB. The indexer tensors are additive over d4-ov's checkpoint. A measurement artifact: 44 layers are missing, its answers are not the model's.",
+        "arch": [
+            "Qwen4ExpForConditionalGeneration"
+        ],
+        "model_type": "qwen4_exp",
+        "hidden": 2560,
+        "layers": 4,
+        "experts": 512,
+        "ctx": 262144,
+        "full_attention_interval": 4,
+        "template_sha": "12827f24b742ea4e",
+        "tokenizer_sha": "87a7830d63fcf43b",
+        "lm_xml_sha": "ec98641c20277204",
+        "lm_bin_bytes": 9277155421,
+        "status": "measurement artifact: depth 4 of 48 with the model's own QSA indexer (--qsa); not the model's answers",
+        "mtp_num_hidden_layers": 1,
+        "mtp_head_exported": false
+    },
     "qwen38-flash-next-ov": {
         "_note": "2026-09-13: the serving-shape IR at ALL 48 layers, real weights (tools/export_serving_artifact.py --layers 48, tree 092df69; serving-shape.json beside it). Hashes read off /models/ov/qwen38-flash-next-ov on the dev host. Built to be pointed at by the served binary; window-050 \u00a74.10 predicts and records the residency refusal (measured on the A770: the plugin stages every constant in USM host memory at compile and the host runs out first).",
         "arch": [
@@ -258,6 +277,25 @@
         "lm_xml_sha": "1b03e4e97daaa13a",
         "lm_bin_bytes": 65180065880,
         "status": "d48s2 with the dense projections in the checkpoint's Q8_0/Q6_K form; quality row owed",
+        "mtp_num_hidden_layers": 1,
+        "mtp_head_exported": false
+    },
+    "qwen38-flash-next-d48q8qsa-ov": {
+        "_note": "2026-09-28: the d48q8 artifact re-exported with --qsa (tools/export_serving_artifact.py --layers 48 --qsa --dense-q8 --dense-u8, tree 4f05b21, peak host 51.41 GiB; campaign qsa step 3 T5). The 12 full-attention layers carry the model's own indexer, the served selection and the route-gate boundary (rt_info qsa_boundary 2051). lm_xml_sha e248c2e11761b40e, lm .bin 63.88 GiB. Served from /flash-model/qwen38-flash-next-d48q8qsa-ov for the T6 windows. Hashes read off the export log.",
+        "arch": [
+            "Qwen4ExpForConditionalGeneration"
+        ],
+        "model_type": "qwen4_exp",
+        "hidden": 2560,
+        "layers": 48,
+        "experts": 512,
+        "ctx": 262144,
+        "full_attention_interval": 4,
+        "template_sha": "12827f24b742ea4e",
+        "tokenizer_sha": "87a7830d63fcf43b",
+        "lm_xml_sha": "e248c2e11761b40e",
+        "lm_bin_bytes": 68586602590,
+        "status": "d48q8 with the model's own QSA indexer (--qsa) on the 12 full-attention layers; the served step-3 arm",
         "mtp_num_hidden_layers": 1,
         "mtp_head_exported": false
     },

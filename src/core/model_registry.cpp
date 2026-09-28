@@ -274,6 +274,42 @@ std::vector<ModelEntry> build_registry() {
     }
 
     {
+        // qwen3.8-flash-next-d4qsa (campaign qsa, step 3 T5, 2026-09-28): the
+        // d4 rung re-exported with `--qsa`, so its one attention layer carries
+        // the model's own indexer, the served selection and the route-gate
+        // boundary. The indexer tensors are additive; the checkpoints are the
+        // same GGUF. Hashes read off the export log (tools/export_serving_artifact.py
+        // --layers 4 --qsa, tree 4f05b21, peak host 27.59 GiB). A measurement
+        // artifact: 44 layers are missing and nothing it says is the model's
+        // answer.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-d4qsa";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-d4qsa-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // the export writes none
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 4;      // of 48: layer 3 is the one QSA layer
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.arch_hash               = "ec98641c20277204";
+        e.template_hash           = "12827f24b742ea4e";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 9277155421ull;
+        e.status                  = "measurement artifact: depth 4 of 48 with the model's own "
+                                    "QSA indexer (--qsa); served-path boot, not the model's answers";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
         // THE 12-LAYER RUNG (0.5.1 WP3, 2026-09-13): the serving-shape IR at
         // depth 12 of 48 -- three attention layers, nine GDN -- the first rung
         // of the depth ladder docs/window-051.md row (b) prices before the
@@ -654,6 +690,42 @@ std::vector<ModelEntry> build_registry() {
         e.status                  = "d48s2 with the dense projections in the checkpoint's Q8_0/Q6_K form "
                                     "(--dense-q8 --dense-u8); text differs from d48s2's, reads coherent; "
                                     "quality row owed (campaign dense-q8-flash-next)";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
+        // qwen3.8-flash-next-d48q8qsa (campaign qsa, step 3 T5, 2026-09-28):
+        // the d48q8 artifact re-exported with `--qsa`, so its 12 full-attention
+        // layers carry the model's own indexer, the served selection and the
+        // route-gate boundary (rt_info qsa_boundary 2051). The indexer tensors
+        // are additive over the same dense-q8 checkpoint. Hashes read off the
+        // export log (tools/export_serving_artifact.py --layers 48 --qsa
+        // --dense-q8 --dense-u8, tree 4f05b21, peak host 51.41 GiB). This is
+        // the artifact the T6 card windows serve.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-d48q8qsa";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-d48q8qsa-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // the export writes none
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 48;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.arch_hash               = "e248c2e11761b40e";
+        e.template_hash           = "12827f24b742ea4e";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 68586602590ull;
+        e.status                  = "d48q8 with the model's own QSA indexer (--qsa) on the 12 "
+                                    "full-attention layers; the served step-3 arm";
         e.sampler = qwen_card_defaults();
         split_layers(e);
         r.push_back(std::move(e));
