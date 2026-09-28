@@ -35,6 +35,22 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   fixture now reads them through the feed and asserts the convention; steps
   1–2 re-measured, parity unchanged up to exact ties.
 
+- **QSA served: the model's own selection reaches PagedAttention** (plugin
+  patch 0073, qsa step 3 T2+T3). `PagedAttentionExtension` gains an optional
+  LAST input, 28, a `[T_new, past + T_new]` u8 visibility mask; absent keeps
+  the node at 28 inputs, so every existing artifact and arch hash is
+  untouched. `SDPAToPagedAttention` wires an indexer mask tagged `rt_info
+  arcint = "qsa_selection"` into it -- and drops any other (causal) mask
+  exactly as before -- and the GPU plugin's opt kernels read it (single, GQA
+  single, multi-token), setting a dropped key's score to
+  `SOFTMAX_ACCUMULATOR_VAL_MIN`. Micro-SDPA is taken away under QSA (it does
+  not read the mask) and a QSA prefill is routed through MIXED so one kernel
+  reads it. Measured: the GPU unit suite's QSA cells pass 8/8 on both cards
+  (decode 35, MIXED 128/2048, past-0 prefill 2100, GQA decode 5,001 with
+  fully masked partitions), and the whole `*paged_attention*` filter is 276
+  passed on each card, unchanged from the 28-input path. Needs a
+  `marfrit-openvino` `+p24` for release.
+
 - **CPU tier: AVX2 row decode and a row-per-lane single-job dot** (plugin
   patch 0068, DESIGN §7.0.2cx): the same f32 bits, by two bitwise cells. On
   the dev host's CPU (a standalone build with the plugin's flags) a

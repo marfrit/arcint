@@ -320,7 +320,8 @@ answer must not move.
   - 2026-09-28. **Operator decision: option A.** The indexer's raw-key
     history rides a plain state Variable per QSA layer (one lane; the prefix
     cache and KV checkpoints stay uncovered until T4's runtime work), as
-    T1a/T1b implemented.
+    T1a/T1b implemented. The position list (T7) follows for the speed; a
+    paged indexer cache (B) remains the route to multi-lane QSA if wanted.
   - 2026-09-28. **T2 landed as source + patch; the OV unit/plugin ladders
     are OWED** (`measured-here`, device-free, at the graph level; plugin
     patch `0073`).
@@ -356,39 +357,36 @@ answer must not move.
       so only the `openvino` and `openvino_intel_gpu_plugin` targets were
       rebuilt. The plugin unit ladder for the PA tests is therefore NOT run
       in this leg.
-  - 2026-09-28. **T3 in progress: the plumbing and the red-first cells are
-    done and measured; the kernel READ is the remaining work.**
-    - **Build.** The tests-enabled OpenVINO build now exists:
-      `/models/ov/ovsrc-dbg/build-prod` reconfigured with
-      `-DENABLE_TESTS=ON -DENABLE_FUNCTIONAL_TESTS=OFF`, reusing its
-      objects, and `ov_gpu_unit_tests` built (129 MB). The CPU-plugin link
-      failure was a stale `libopenvino_snippets.a`; deleting and rebuilding
-      that target fixed it (the archive grew 11.9 -> 12.7 MB).
-    - **Plumbing (measured, in the dev tree, NOT committed).** The primitive
-      accepts 28 or 29 with `has_qsa_selection`; the plugin op sets it; the
-      unit harness feeds input 28 as a `[T_new, past+T_new]` u8 visibility
-      mask and `PagedAttentionReference` applies the same selection on top of
-      the causal mask.
-    - **Red-first cells (measured on the dev host's GPU).**
-      `regression_paged_attention_qsa/paged_attention_qsa_test.selection_is_honoured`
-      with a decode (`{{1, 35}}`) and a multi-token chunk (`{{128, 2048}}`)
-      FAILED before the kernel read: the plugin compiles and runs with input
-      28 present but ignores it, so the output is dense causal and the
-      pruned reference mismatches (0.0147 at index 1, 0.0021 at index 51;
-      tolerance 0.002). The kernel dumps show `sdpa_micro` and
-      `paged_attention_opt` routes both compiled, so every route that can run
-      a QSA layer must read the mask, or refuse loudly at compile.
-    - **The remaining work.** `paged_attention_opt.cl` already has the exact
-      insertion site: `token_idx` is the absolute key position, next to the
-      existing `token_idx >= seq_len` and `HAS_QQ_BIAS` sites that set
-      `qk_acc = SOFTMAX_ACCUMULATOR_VAL_MIN`. The mask read needs the query
-      row (0 for the single-token decode; the new-token index for the
-      multi-token stage), the generator arguments and jit constants, and a
-      loud refusal in the `sdpa_micro` / any other route that cannot read it.
-      A card window was used (both resident services stopped and restored).
-      These dev-tree edits are uncommitted on purpose: without the kernel read
-      they would be a silent fallback. The position list (T7) follows for the speed; a
-    paged indexer cache (B) remains the route to multi-lane QSA if wanted.
+  - 2026-09-28. **T3 done** (`measured-here`, `ov_gpu_unit_tests` on both
+    cards; plugin patch 0073 now carries T2+T3).
+    - **Build.** `build-prod` reconfigured with `-DENABLE_TESTS=ON`
+      (objects reused); the CPU-plugin link failure was a stale
+      `libopenvino_snippets.a`, fixed by rebuilding that target
+      (11.9 -> 12.7 MB).
+    - **Kernel read.** `paged_attention_opt.cl`'s single-token, GQA
+      single-token and multi-token stages read input 28 and set a dropped
+      key's score to `SOFTMAX_ACCUMULATOR_VAL_MIN`, beside the existing
+      `token_idx >= seq_len` and `qq_bias` sites (query row = `seq_idx -
+      subsequence_begin` for multi-token, 0 for decode; width = past + new
+      / `seq_len`). `supports_micro_sdpa` returns false under QSA -- the
+      micro stages do not read the mask, so they are taken away loudly --
+      and a QSA prefill is routed through MIXED so one kernel file carries
+      the read. A one-lane refusal guards the flattened rows.
+    - **The red/green.** The cells failed before the read (dense output vs
+      the pruned reference: 0.0147 / 0.0021) and now pass:
+      `regression_paged_attention_qsa/paged_attention_qsa_test` is 8/8 on
+      the A770 and 8/8 on the B60, over decode `{{1, 35}}`, MIXED
+      `{{128, 2048}}`, past-0 prefill `{{2100, 0}}` and the GQA decode at
+      5,001 tokens (many fully masked partitions). `*paged_attention*`
+      reads 276 passed on each card, unchanged from the 28-input path.
+    - **Finding on the record (T6).** The causal-equal control is
+      byte-identical on the GENERATE params but only within a <= 1-ulp f16
+      floor on the MIXED ones (2.0e-6 at 128/2048, 3.0e-5 at 2100/0): QSA
+      changes that route (micro off, past-0 prefill -> MIXED) and the added
+      kernel block shifts f16 codegen. The DESIGN §3.4 byte-identity clause
+      below 2,051 therefore needs the served dense and QSA graphs to use the
+      SAME route; T6 must either accept the measured floor or the
+      PREFILL/micro routes must learn the mask too. Measured, not narrated.
   - The export flag `--qsa` (default off, so existing artifacts and the arch
     hash do not move) records `qsa` in the manifest and feeds the indexer
     tensors through `gguf_feed` (`self_attn.indexer.*`; the two norm gammas

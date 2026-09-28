@@ -2132,7 +2132,7 @@ built tree file for file.
 
 ### 0073-qsa-selection-paged-attention-input.patch
 
-QSA step 3 T2. `PagedAttentionExtension` gains an optional LAST input, 28:
+QSA step 3 T2 + T3. `PagedAttentionExtension` gains an optional LAST input, 28:
 `[T_new, past + T_new]` u8, 1 = keep the key, 0 = drop it (rank-1 `[0]` =
 none). Absent keeps the node at 28 inputs, so every existing model, artifact
 and arch hash is untouched. `validate_and_infer_types` and
@@ -2148,9 +2148,27 @@ compared against -0.5 (`Greater`) and converted to the u8 visibility mask
 appended at input 28. Any other mask -- every causal mask -- is dropped
 exactly as before, so no other model's mask is ever routed there.
 
-The GPU plugin's input-count check accepts 28 or 29 but REFUSES 29 by name
-(T3 lands the kernel path that reads it), never silently ignoring the
-selection. The template backend still accepts 28 only.
+The GPU plugin carries input 28 (`has_qsa_selection`) through the primitive
+and the opt kernels: `paged_attention_opt.cl`'s single-token, GQA
+single-token and multi-token stages read the mask and set a dropped key's
+score to `SOFTMAX_ACCUMULATOR_VAL_MIN`, beside the existing `token_idx >=
+seq_len` and `qq_bias` sites (the query row is `seq_idx -
+subsequence_begin` for the multi-token stage, 0 for decode, width `past +
+new` / `seq_len`). Under QSA `supports_micro_sdpa` returns false, so the
+micro stages -- which do not read the mask -- are never built (a loud
+take-away, not a silent fallback), and a QSA prefill is routed through MIXED
+so one kernel file carries the read. A one-lane refusal guards the mask's
+flattened rows. The template backend still accepts 28 only.
+
+Measured with `ov_gpu_unit_tests` built from this tree (`ENABLE_TESTS=ON`):
+`regression_paged_attention_qsa/paged_attention_qsa_test` passes 8/8 on
+BOTH cards, covering decode `{{1,35}}`, MIXED `{{128,2048}}`, past-0 prefill
+`{{2100,0}}` and the GQA decode at 5,001 tokens (many fully masked
+partitions). The causal-equal control holds byte-identity on the GENERATE
+params and a <= 1-ulp floor on the MIXED ones (2.0e-6 at 128/2048, 3.0e-5 at
+2100/0), because QSA changes that route (micro off / prefill->MIXED) and the
+added kernel block shifts f16 codegen. Whole `*paged_attention*` filter: 276
+passed on each card, unchanged from the 28-input path.
 
 Measured (device-free, the rebuilt core lib): a `--qsa` depth-4 serving-shape
 graph goes through the pass to a PagedAttentionExtension with 29 inputs,
