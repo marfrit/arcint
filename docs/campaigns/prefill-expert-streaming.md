@@ -106,3 +106,45 @@ prefill chunk above the threshold), never on history. Decode is untouched.
 ## Status
 
 - 2026-09-28. Opened with the measurements above; no code.
+- 2026-09-28. **v1 built (uncommitted) and measured: a loss as built; the
+  ceiling measured.**
+  - **v1:** the call's CPU-tier experts are planned into a streaming region
+    (`moe/prefill_stream.hpp`, two cells red on three mutants). The pool's
+    threads fill a usm_host staging copy in the slot layout from the host
+    bank, one copy per tensor moves it, and the grouped native stages run a
+    second time on the region. One region per expert geometry: Flash-Next has
+    three, 3.64 GiB of device memory in the load ledger and as much usm_host.
+  - **B60, d48q8, 4,096 tokens** (`measured-here`; bank 40 GiB, 320 experts
+    a layer, to leave host memory for the staging):
+
+    | arm | prefill |
+    |---|---|
+    | off, chunk 512 | 89.70 s |
+    | on, chunk 512 | 160.05 s (fill 204 ms a call) |
+    | on, chunk 2048 | the process crashed (a user-space segfault; not investigated) |
+    | off, chunk 2048 | 92.50 s (CPU tier 324 ms a call for 4x the tokens) |
+
+  - **Why v1 loses:** CPU writes into usm_host run at 18–20 GB/s, the same
+    as into anonymous memory (`measured-here`, microbench, 1–16 threads).
+    The fill is slow because the bank held 320 of a layer's ~384 host
+    experts, and a prefill chunk touches all of them, so every call faults
+    ~64 experts in from the disk. The pinned staging is what squeezed the
+    bank.
+  - **The ceiling** (`measured-here`, CLIntercept with streaming on, a
+    4,096- minus 16-token difference): 9.36 ms of device time a prompt token.
+    Host-to-device copies take 4.88 ms (~59 ms a call, ~7.3 GB/s) and the
+    grouped kernels computing every expert 3.64 ms (~44 ms a call).
+    - With the host fill hidden and the copies overlapping compute on a
+      second queue: ~59 ms a call against the CPU tier's ~138 ms (the off
+      arm's join wait at bank 40 GiB, a process average, `measured-here`;
+      152 ms at 46 GiB above was a decode-difference figure), about 2.3x at
+      chunk 512.
+    - Serialised on one queue: ~1.3x.
+    - At chunk 2048 the CPU tier amortises its weight reads (324 ms a call),
+      so streaming nears break-even.
+  - **What v2 needs:** a batch-sized pinned ring, so the bank holds the
+    whole host tier again; the fill pipelined with the copies; a second
+    queue with cross-queue events (FreeToken's copy stream with ready and
+    release events, `code`); and the chunk-2048 crash explained. **Parked**:
+    Qwen Sparse Attention (LYON L2, required by the operator) goes first;
+    the v1 diff is kept outside the repository.
