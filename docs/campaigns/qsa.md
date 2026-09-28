@@ -387,6 +387,12 @@ answer must not move.
       below 2,051 therefore needs the served dense and QSA graphs to use the
       SAME route; T6 must either accept the measured floor or the
       PREFILL/micro routes must learn the mask too. Measured, not narrated.
+    - **Staged.** The runtime is installed at the dev prefix `ov-0073`
+      (version `2026.4.0-22849-71640275d29-marfrit-p24`); the GPU plugin's
+      sha256 prefix is `3456feeb18edaaca`. The tests-enabled build is the
+      dev tree's `build-prod` with `ENABLE_TESTS=ON`; its `ov_gpu_unit_tests`
+      runs with `--device_suffix=1` (the deterministic card) and `=0`.
+      The host paths live in the operator-local notes.
   - The export flag `--qsa` (default off, so existing artifacts and the arch
     hash do not move) records `qsa` in the manifest and feeds the indexer
     tensors through `gguf_feed` (`self_attn.indexer.*`; the two norm gammas
