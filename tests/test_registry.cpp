@@ -35,7 +35,7 @@ TEST(registry_holds_exactly_the_target_models) {
     // Twenty-four with the staged n-gram artifact d48s and the new-decode
     // twins d48p2 (pinned) and d48s2 (staged) (2026-09-27, DESIGN 7.0.2cz).
     const auto ids = model_ids();
-    CHECK_EQ(ids.size(), 24u);   // d48n beside d48g (2026-09-18), the native qwen3_5_moe d4 rung (2026-09-25), its d40 + d40f16 (2026-09-25), the packed d40 (2026-09-25), packed2 + packed-u8 + their d4 rungs (2026-09-26), d48s + d48p2 + d48s2 (2026-09-27)
+    CHECK_EQ(ids.size(), 25u);   // d48n beside d48g (2026-09-18), the native qwen3_5_moe d4 rung (2026-09-25), its d40 + d40f16 (2026-09-25), the packed d40 (2026-09-25), packed2 + packed-u8 + their d4 rungs (2026-09-26), d48s + d48p2 + d48s2 (2026-09-27), d48q8 (2026-09-28)
     CHECK(find_model("qwen3.8-flash-next-d48g") != nullptr);
     CHECK(find_by_artifact("qwen38-flash-next-d48g-ov") == find_model("qwen3.8-flash-next-d48g"));
     CHECK(find_model("qwen3.8-flash-next-d48n") != nullptr);
@@ -47,6 +47,9 @@ TEST(registry_holds_exactly_the_target_models) {
     CHECK(find_model("qwen3.8-flash-next-d48s2") != nullptr);
     CHECK(find_by_artifact("qwen38-flash-next-d48s2-ov") == find_model("qwen3.8-flash-next-d48s2"));
     CHECK_EQ(find_model("qwen3.8-flash-next-d48s2")->arch_hash, std::string("08dd2c858baed75f"));
+    CHECK(find_by_artifact("qwen38-flash-next-d48q8-ov") == find_model("qwen3.8-flash-next-d48q8"));
+    CHECK_EQ(find_model("qwen3.8-flash-next-d48q8")->arch_hash, std::string("1b03e4e97daaa13a"));
+    CHECK_EQ(find_model("qwen3.8-flash-next-d48q8")->weights_bytes, 65180065880ull);
     CHECK(find_model("qwen3.8-flash-next-d48p2") != nullptr);
     CHECK(find_by_artifact("qwen38-flash-next-d48p2-ov") == find_model("qwen3.8-flash-next-d48p2"));
     CHECK_EQ(find_model("qwen3.8-flash-next-d48p2")->arch_hash, std::string("1c54b317448a6ddc"));

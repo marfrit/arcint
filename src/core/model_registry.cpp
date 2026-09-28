@@ -621,6 +621,45 @@ std::vector<ModelEntry> build_registry() {
     }
 
     {
+        // qwen3.8-flash-next-d48q8 (2026-09-28): d48s2 with the dense
+        // projections in their checkpoint's form (--dense-q8 --dense-u8): 328
+        // Q8_0 projections as i8 group-32 (6.17 GiB as f16 -> 3.28), the Q6_K
+        // output head as u8 group-16 (1.18 -> 0.67); the shared expert, attention
+        // k/v and the f32 routers stay plain. lm .bin 72.17 -> 60.70 GiB, device
+        // weights+graph 19.23 -> 15.82 GiB on the B60. Measured on the B60,
+        // ratio 78 + tier + dispatch, host bank (patch 0072): dense gemm device
+        // time 23.7 -> 17.2 ms a token, first answer 38.2-39.7 -> 36.6 s; the text
+        // differs from d48s2's (the compressed FC rounds differently) and reads
+        // coherent (a read, not a quality gate). Campaign dense-q8-flash-next. Hashes read off the export log.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-d48q8";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-d48q8-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // the export writes none
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 48;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};   // the registry's coarse label, as d48n's
+        e.arch_hash               = "1b03e4e97daaa13a";
+        e.template_hash           = "12827f24b742ea4e";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 65180065880ull;
+        e.status                  = "d48s2 with the dense projections in the checkpoint's Q8_0/Q6_K form "
+                                    "(--dense-q8 --dense-u8); text differs from d48s2's, reads coherent; "
+                                    "quality row owed (campaign dense-q8-flash-next)";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
         // THE NATIVE `qwen3_5_moe` SERVING-SHAPE RUNG (2026-09-25): the
         // Qwen3.6-35B-A3B serving-shape IR at DEPTH 4 of 40, emitted by
         // tools/export_serving_artifact.py --family qwen35moe --layers 4

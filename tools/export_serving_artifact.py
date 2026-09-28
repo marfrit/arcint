@@ -382,8 +382,15 @@ def build_parser():
                          "group-16 compressed form (tools/q4e/dense_u8.py): 1.125 B a value "
                          "against f16's 2; a projection that is not exactly carriable stays as it "
                          "was and is reported. Implies --dense-fp16 for everything else. "
-                         "qwen3_5_moe family only: the pass keeps attention k/v and the shared "
-                         "expert plain by the names that family's emitter gives them.")
+                         "The pass keeps attention k/v and the shared expert plain by the names "
+                         "the emitter gives them.")
+    ap.add_argument("--dense-q8", action="store_true",
+                    help="store every dense projection whose values are Q8_0-exact (d * q, q in "
+                         "[-127, 127] per 32-group, recovered from the values) in the plugin's i8 "
+                         "group-32 compressed form (tools/q4e/dense_q8.py): 1.0625 B a value, the "
+                         "checkpoint's own bytes, against f16's 2; a projection that is not exactly "
+                         "carriable stays as it was and is reported. Runs before --dense-u8 when "
+                         "both are given. Implies --dense-fp16 for everything else.")
     ap.add_argument("--skip-hash", action="store_true",
                     help="do not sha256 the written IR files (the manifest "
                          "then says so)")
@@ -401,7 +408,7 @@ def build_parser():
 def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
-    if args.dense_u8:
+    if args.dense_u8 or args.dense_q8:
         args.dense_fp16 = True          # the rest of the graph's f32 Constants go f16
     if args.segment_layers is not None and (args.segment_layers <= 0
                                             or args.segment_layers % 4):
@@ -423,13 +430,11 @@ def main(argv=None):
     feed = gf.GgufFeed(args.shards)
     family = args.family or ("qwen35moe" if str(feed.arch) in
                              ("qwen35moe", "qwen3_5_moe") else "qwen4_exp")
-    if args.dense_u8 and family != "qwen35moe":
-        # the pass keeps attention k/v plain by the names the qwen3_5_moe
-        # emitter gives them; the qwen4_exp attention leaves k/v unnamed, so
-        # there q/k/v would all be compressed -- the served-wrong case
-        say("shards", "REFUSED: --dense-u8 is scoped to the qwen35moe family "
-                      "(attention k/v are kept plain by name; this family does not name them)")
-        return 2
+    # The dense passes keep attention k/v and the shared expert plain by name.
+    # Both families emit attention through emit_stateful_attention and the
+    # shared expert through emit_shared_expert, which name them
+    # (attn{layer}/k_proj, /v_proj; shared_expert/...), so neither pass is
+    # scoped to one family any more.
     if family == "qwen35moe":
         if args.expert_format != "native":
             say("shards", "REFUSED: qwen35moe carries IQ2_S gate/up experts; "
@@ -547,24 +552,38 @@ def main(argv=None):
                          f"port(s) under cap {rep['ngram_chunk_cap_bytes']:,}")
         lm_xml = seg_dir / "openvino_language_model.xml"
         compressed_here = False
-        if args.dense_u8:
-            from q4e import dense_u8
+        if args.dense_u8 or args.dense_q8:
+            from q4e import dense_u8, dense_q8
             from openvino._offline_transformations import compress_model_transformation
             t0 = time.time()
             # plan from the exact f32 values, compress everything else to f16,
-            # THEN splice the u8 chains: save_model's own compression skips a
-            # model that already carries a compressed-weight chain
-            du_plans, du_rep = dense_u8.plan(model)
+            # THEN splice the chains: save_model's own compression skips a
+            # model that already carries a compressed-weight chain. Q8_0 first;
+            # the Q6_K pass skips what it planned.
+            passes = []
+            if args.dense_q8:
+                t1 = time.time()
+                passes.append(("dense-q8", dense_q8, dense_q8.plan(model), time.time() - t1))
+            if args.dense_u8:
+                # converted projections are unnamed (Constant_<id>, unique per
+                # node); the names that repeat across layers (shared_expert/*)
+                # are excluded by both passes before `skip` is consulted
+                done = {c[0] for _, _, (_, r), _ in passes for c in r["converted"]}
+                t1 = time.time()
+                passes.append(("dense-u8", dense_u8, dense_u8.plan(model, skip=done), time.time() - t1))
             compress_model_transformation(model)
-            dense_u8.commit(du_plans)
+            for tag, mod, (plans, _), _ in passes:
+                mod.commit(plans)
             compressed_here = True
-            say("dense-u8", dense_u8.summary(du_rep))
-            for kname, why in du_rep["kept"]:
-                say("dense-u8", f"kept {kname}: {why}")
-            dense_u8_reports.append({"converted": len(du_rep["converted"]), "kept": du_rep["kept"],
-                                     "f16_bytes": du_rep["f16_bytes"], "u8_bytes": du_rep["u8_bytes"],
-                                     "max_rel_deviation": max((c[3] for c in du_rep["converted"]), default=0.0),
-                                     "seconds": round(time.time() - t0, 1)})
+            for tag, mod, (_, rep_), plan_s in passes:
+                say(tag, mod.summary(rep_))
+                for kname, why in rep_["kept"]:
+                    say(tag, f"kept {kname}: {why}")
+                dense_u8_reports.append({"pass": tag, "converted": len(rep_["converted"]), "kept": rep_["kept"],
+                                         "f16_bytes": rep_["f16_bytes"], "compressed_bytes": rep_["compressed_bytes"],
+                                         "max_rel_deviation": max((c[3] for c in rep_["converted"]), default=0.0),
+                                         "plan_seconds": round(plan_s, 1),
+                                         "block_seconds": round(time.time() - t0, 1)})
         t0 = time.time()
         save_fp16 = args.dense_fp16 and not compressed_here
         ov.save_model(model, str(lm_xml), compress_to_fp16=save_fp16)
@@ -707,7 +726,7 @@ def main(argv=None):
         "shards": shards, "arch": feed.arch,
         "sha256": hashes if hashes else "skipped (--skip-hash)",
         "compress_to_fp16": bool(args.dense_fp16),
-        "dense_u8": dense_u8_reports if args.dense_u8 else None,
+        "dense_u8": dense_u8_reports if (args.dense_u8 or args.dense_q8) else None,
     }
     (out / "serving-shape.json").write_text(json.dumps(manifest, indent=2) + "\n")
     say("done", f"{out} peak_host_GiB={peak_rss_gib():.2f}")

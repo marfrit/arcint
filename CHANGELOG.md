@@ -62,6 +62,16 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   byte-identical text; loading takes ~21 s longer. Off unless the budget is
   set. Needs a `marfrit-openvino` `+p23` for release.
 
+- **Flash-Next exports carry the dense projections in the checkpoint's form**
+  (`tools/export_serving_artifact.py --dense-q8`, with `--dense-u8` now open
+  to the qwen4_exp family): Q8_0 projections as i8 group-32 and the Q6_K head
+  as u8 group-16, instead of f32 constants served as f16. The full-depth
+  `qwen3.8-flash-next-d48q8` is admitted: lm `.bin` 72.2 -> 60.7 GiB, device
+  weights on the B60 19.2 -> 15.8 GiB, dense GEMM device time 23.7 -> 17.2 ms
+  per decode token. On the same configuration the first answer decodes in
+  36.6 s against d48s2's 38.2–39.7 s; with the freed VRAM holding 128
+  resident experts per layer instead of 112, 35.8 s. The text differs from d48s2's; a quality row is owed.
+
 ## 0.5.0.1 — 2026-09-27
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p20` (patches 0003–0067).

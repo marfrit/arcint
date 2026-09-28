@@ -242,6 +242,25 @@
         "mtp_num_hidden_layers": 1,
         "mtp_head_exported": false
     },
+    "qwen38-flash-next-d48q8-ov": {
+        "_note": "2026-09-28: d48s2 exported with --dense-q8 --dense-u8 (tree 1b3049d plus tools/q4e/dense_q8.py): 328 Q8_0 projections as i8 group-32 with f16 scales, the Q6_K output head as u8 group-16; the shared expert, attention k/v and the f32 routers plain. B60, ratio 78 + tier + dispatch + host bank: dense gemm device time 23.7 -> 17.2 ms a token; text differs from d48s2's and reads coherent (a read, not a quality gate). Hashes read off the export log. Campaign dense-q8-flash-next.",
+        "arch": [
+            "Qwen4ExpForConditionalGeneration"
+        ],
+        "model_type": "qwen4_exp",
+        "hidden": 2560,
+        "layers": 48,
+        "experts": 512,
+        "ctx": 262144,
+        "full_attention_interval": 4,
+        "template_sha": "12827f24b742ea4e",
+        "tokenizer_sha": "87a7830d63fcf43b",
+        "lm_xml_sha": "1b03e4e97daaa13a",
+        "lm_bin_bytes": 65180065880,
+        "status": "d48s2 with the dense projections in the checkpoint's Q8_0/Q6_K form; quality row owed",
+        "mtp_num_hidden_layers": 1,
+        "mtp_head_exported": false
+    },
     "qwen38-flash-next-d12-ov": {
         "_note": "2026-09-13: the serving-shape IR of Qwen3.8 Flash-Next (qwen4exp) at DEPTH 12 of 48 -- the depth ladder's first rung (docs/window-051.md row (b)), real weights from the UD-Q3_K_XL shards (tools/export_serving_artifact.py --layers 12, tree d93508c, serving-shape.json beside it). Hashes read off /models/ov/qwen38-flash-next-d12-ov on the dev host (build 1,450.9 s, peak host 30.39 GiB). A measurement artifact: 36 layers are missing, its answers are not the model's.",
         "arch": [
