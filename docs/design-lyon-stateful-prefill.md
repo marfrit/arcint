@@ -545,3 +545,14 @@ row-3 rate.
   (§1), so the 2.2M-node static cost does not apply there; the open half is the
   **multi-block** stateful core for rate (§2). Red-first cell landed and
   mutation-verified. No card touched.
+- 2026-09-28 — **L1 is not the binding term on either model**
+  (`measured-here`). Flash-Next `d48q8` on the B60, a 4,096-token prompt,
+  CLIntercept by a 4,096- minus 16-token difference: 2.72 ms of device time
+  per prompt token, of which the GDN core (`paged_gated_delta_net_opt`) is
+  0.077 ms, **0.3 % of the prefill wall** (94.9 s for 4,096 tokens in that
+  run). The wall is the CPU tier: ~152 ms per MoE layer call, ~51 s of the
+  ~80 s a 4,096-token run adds over a 16-token one (plugin counters by
+  difference, 83.7 − 3.3 s). The 35B's GDN share was 1.5 % of prefill device
+  time (§4h). The chunked fused primitive stays owed, but the next prefill
+  lever on Flash-Next is streaming the host tier's experts to the card
+  (`docs/campaigns/prefill-expert-streaming.md`).

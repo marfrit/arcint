@@ -85,3 +85,64 @@ overlapped with the CPU tier, and *k* as a knob. Out: an LRU policy; pinning the
 ## Status
 
 - 2026-09-28. Proposed. Numbers above measured; no code.
+- 2026-09-28. **Operator decision:** the deterministic split. The LRU form's
+  numeric difference is small (the native per-expert kernels sit in the CPU
+  oracle band since patches 0056/0069), but it would make answers depend on
+  earlier requests.
+- 2026-09-28. **Built (patch 0073, uncommitted) and measured: history
+  independence holds, the speed does not.**
+  - **Code:** `moe/hybrid_split.hpp` holds the choice: first k of a decode
+    step's host-tier experts by the bank seed's rank. Four cells, red on four
+    mutants (an LRU-shaped choice among them). K transient slots follow the
+    pinned ones, sized by ONE rule in `moe_pool_slots`: the first build sized
+    the slot buffers from the ratio alone, and the first copy into a
+    transient slot took a copy-engine page fault (`-ENOENT`) and an engine
+    reset on the B60 (twice; the card recovered). The copies come from the
+    host bank after the CPU tier is dispatched.
+  - **B60 window** (`measured-here`; d48q8, ratio 75 + 15.4–15.8e9 pool,
+    census128, bank 46 GiB, the same prompt twice in one process):
+
+    | arm | first | second | text |
+    |---|---|---|---|
+    | K=0 (0073 off) | 35.76 s | 28.00 s | `e102dc17`, = 0072 |
+    | K=3, staged copies | 56.60 s | 44.22 s | `19a9b934`, both identical |
+    | K=3, weights copied straight from the bank | 51.62 s | 42.88 s | `19a9b934`, both identical |
+
+  - **Why it is slower** (`measured-here`, the plugin counters): 73,218
+    experts went to the card and 49,006 of them
+    needed a copy (the slots hold only K). Between CPU-tier dispatch and the
+    join, the main thread spends ~2.7 ms per layer call against 0.09 ms, and
+    the CPU tier's per-expert time rises (memory traffic). A non-blocking
+    copy from pageable memory costs the same host time as the explicit
+    staging, so the runtime stages it itself.
+  - **What would change it:** a pinned (usm_host) source, so the enqueue is
+    instant and the DMA overlaps. For example, a small static host-pinned set
+    per layer (the next ranks after the resident ones), with the choice
+    restricted to it: still a pure function of the routing.
+- 2026-09-28. **The pinned candidate set, built and measured: no gain.**
+  - **Code:** each layer's next 16 experts by rank after the pinned ones
+    (`MOE_HYBRID_CANDIDATES`) sit in the slot layout in one usm_host buffer,
+    and a copy is one DMA from it. Total ~1.9 GB pinned, under TTM's cap on
+    the dev host of 8,220,668 pages = 31.4 GiB (`measured-here`, the
+    `pages_limit` parameter).
+  - **B60** (`measured-here`; the configuration above except the bank, cut
+    from 46 to 44 GiB for the pinned images' host memory; both arms at 44):
+
+    | arm | first | second | text |
+    |---|---|---|---|
+    | K=0 | 36.39 s | 28.06 s | `e102dc17` |
+    | K=3, 16 pinned candidates | 43.72 s | 29.04 s | `1aab87ee`, both identical |
+
+  - **Host cost fixed:** the main-thread gap between CPU-tier dispatch and
+    the join falls from ~2.7 ms to 0.31 ms per layer call (control 0.09 ms),
+    so staging was that cost.
+  - **Too few experts moved:** 16 candidates catch only ~0.4 of a layer's
+    ~7.6 host-tier experts (10,044 moved over 514 tokens). Building the
+    images costs the first answer ~7 s (1.9 GB read once).
+  - **What it would take to pay:** covering most misses means pinning most
+    of the host tier. That is the bank itself as usm_host, capped at 31.4 GiB
+    by TTM against the 44–46 GiB bank. Even then the ceiling is bounded: the
+    link moves an expert in ~0.19 ms and the tier computes one in ~0.15 ms,
+    so a perfect overlap takes at most ~45 % of the tier's ~1.14 ms per layer.
+    **Verdict for now: not worth it on this host;** patch 0073 stays
+    uncommitted, the numbers are on the record here.
