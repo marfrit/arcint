@@ -85,7 +85,8 @@ is exported yet).
 ## Where it lives
 
 `tools/q4e/attention.py` (`_qsa_additive_mask`,
-`build_qsa_attention_model`), `tools/q4e/serving_shape.py`
+`build_qsa_attention_model`; stateful: `_qsa_mask_dynamic`,
+`build_qsa_stateful_attention_model`), `tools/q4e/serving_shape.py`
 (`emit_stateful_attention`), `tools/q4e/gguf_feed.py` (the indexer
 tensors), the plugin's `SDPAToPagedAttention` and `paged_attention_opt`,
 and `src/core/artifact.cpp` (counts the QSA layers as served dense today).
@@ -130,3 +131,24 @@ answer must not move.
   the dense mask, no key norm, the block rope at the group's last token, the
   tail dropped, the tail missing the diagonal key. Before the stable rule,
   every difference was also an exact tie (1/20/24 rows, measured).
+- 2026-09-28. **Step 2 done** (`measured-here`, CPU plugin, real blk.3
+  tensors, `test_qsa_stateful_piece_matches_the_pin_with_its_cache`).
+  `build_qsa_stateful_attention_model` keeps K, V and the indexer's raw keys
+  (128 floats a token) in Variables, dynamic in T. Every call pools the
+  blocks from the whole history and applies each query's visibility at its
+  absolute position (`_qsa_mask_dynamic`), as the pin does per query.
+  - **Against the pin with its own `DynamicCache`** (indexed layer), fed a
+    2,048-token prefill, a 40-token chunk and 12 decode steps (2,100 tokens,
+    across the 2,051 boundary). The prefill prunes no row (a query below
+    position 2,051 keeps every complete block), so the selection is tested
+    on the 49 rows past the boundary. None differs for real, 24 differ only
+    by exact ties at the cut, and the outputs sit 2–6e-8 from the pin on
+    every row without a tie.
+  - **Mutants:** the indexer without its history fails (at run time, the mask
+    no longer matches the key length); visibility by the row's relative
+    position fails by assertion.
+  - **What step 3 has to carry into the served graph:** a raw-key state per
+    attention layer (~16 MB at 32k tokens in f32, less at f16/u8), and the
+    selection into paged attention. Today `SDPAToPagedAttention` drops any
+    SDPA mask (`code`: `state_management_pattern.cpp` matches it as
+    `any_input()`).

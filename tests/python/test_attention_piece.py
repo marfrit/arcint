@@ -760,3 +760,83 @@ def test_qsa_attention_piece_selects_what_the_pin_indexer_selects(cfg, attn_stat
         f"T={T}: the emitted selection differs from the pin's beyond exact ties on rows {real_rows[:8]}")
     assert d_clean <= _YARDSTICK_CEILING, (
         f"T={T}: the emitted QSA block is {d_clean:.3e} from the pin's f32 QSA forward")
+
+
+# --------------------------------------------------------------------------- #
+# 7. QSA STATEFUL: chunked prefill and decode across the boundary (qsa step 2)
+# --------------------------------------------------------------------------- #
+@_skip_shards
+def test_qsa_stateful_piece_matches_the_pin_with_its_cache(cfg, attn_state, indexer_state):
+    """`build_qsa_stateful_attention_model` (K, V and the indexer's raw keys in
+    Variables, dynamic T) against the pin's attention with its REAL indexer and
+    its own `DynamicCache` (the indexed layer, cache_utils 321-353), fed the
+    same chunks: a 2,048-token prefill, a 40-token chunk, then 12 single-token
+    decode steps -- 2,100 tokens, across the 2,051 boundary. Per chunk: the
+    selection equal to the pin's up to exact ties at the top-k cut (the rule of
+    cell 6), and the output within the yardstick ceiling on every row without
+    a tie. CPU plugin (f32)."""
+    from transformers.cache_utils import DynamicCache
+    chunks = [2048, 40] + [1] * 12
+    N_all = sum(chunks)
+    hidden_all = _hidden(cfg, N_all)
+    state = dict(attn_state)
+    state.update(indexer_state)
+    model = qattn.build_qsa_stateful_attention_model(cfg, state, N_all, with_mask=True)
+    req = compile_for(ov.Core(), model, "CPU").create_infer_request()
+
+    m = _pin_attention(cfg, attn_state, indexer_state, False, torch.float32)
+    cache = DynamicCache(config=cfg)
+    cos_all, sin_all = _cos_sin(cfg, N_all, torch.float32)
+    ratio = int(cfg.indexer_compress_ratio)
+    block_topk = int(cfg.indexer_budget) // ratio
+    minf = np.float32(np.finfo(np.float32).min)
+    past = 0
+    ties_total = 0
+    for T in chunks:
+        N = past + T
+        h = hidden_all[:, past:N]
+        pid = np.arange(past, N, dtype=np.int64).reshape(1, T)
+        res = req.infer({0: h.numpy(), 1: pid})
+        ov_out = np.asarray(res[0])
+        ov_mask = np.asarray(res[1])[0, 0]
+        cm = np.where(np.arange(N)[None, :] <= np.arange(past, N)[:, None], np.float32(0), minf)
+        causal = torch.from_numpy(cm.reshape(1, 1, T, N).astype(np.float32))
+        cs = (cos_all[:, :N], sin_all[:, :N])
+        with torch.no_grad():
+            pin_sel = m.indexer(h, cs, causal, cache)
+            p32, _ = m(h, cs, causal, cache)
+        # the indexer call above appended this chunk's raw keys once; the full
+        # forward appends them again -- undo the first append so the cache holds
+        # each key once (the forward is the pin's own path, the direct call a probe)
+        lay = cache.layers[3]
+        lay.indexer_keys = torch.cat([lay.indexer_keys[:, :past], lay.indexer_keys[:, past + T:]], dim=1)
+        p32 = p32.numpy()
+        causal_ok = cm == 0
+        pin_allowed = (pin_sel.numpy()[0, 0] == 0) & causal_ok
+        ov_allowed = ov_mask == 0
+        differ = np.nonzero(np.any(pin_allowed != ov_allowed, axis=1))[0]
+        real = []
+        for r in differ:
+            a = past + int(r)
+            sc = _pin_block_scores(m.indexer, hidden_all[:, :a + 1], (cos_all[:, :a + 1], sin_all[:, :a + 1]), a, a + 1)
+            nblk = len(sc)
+            same_tail = np.array_equal(pin_allowed[r, nblk * ratio:], ov_allowed[r, nblk * ratio:])
+            if nblk == 0 or not same_tail:
+                real.append(a)
+                continue
+            cut = np.sort(sc)[::-1][min(block_topk, nblk) - 1]
+            pb = pin_allowed[r, :nblk * ratio].reshape(nblk, ratio).all(1)
+            ob = ov_allowed[r, :nblk * ratio].reshape(nblk, ratio).all(1)
+            dblk = np.nonzero(pb != ob)[0]
+            if not (dblk.size > 0 and np.all(sc[dblk] == cut)):
+                real.append(a)
+        ties_total += len(differ) - len(real)
+        clean = np.ones(T, bool)
+        clean[differ] = False
+        d_clean = float(np.max(np.abs(ov_out[0, clean] - p32[0, clean]))) if clean.any() else 0.0
+        sys.stdout.write(f"\n[qsa-stateful] chunk past={past} T={T}: rows differing {len(differ)} "
+                         f"(real {len(real)})  |ov-pin| on the other rows {d_clean:.3e}")
+        assert not real, f"chunk past={past} T={T}: selection differs beyond ties at {real[:8]}"
+        assert d_clean <= _YARDSTICK_CEILING, f"chunk past={past} T={T}: output {d_clean:.3e} from the pin"
+        past = N
+    sys.stdout.write(f"\n[qsa-stateful] {N_all} tokens, tie rows {ties_total}\n")

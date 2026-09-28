@@ -439,6 +439,157 @@ def build_dense_attention_model(config, state, seq_len):
     return Model([res], [hidden, pid], "qwen4_exp_dense_attention")
 
 
+def _qsa_mask_dynamic(qn, raw_full, pid, config, cosT_c, sinT_c, rotary, state):
+    """The indexer's selection over the WHOLE key history, dynamic in T and in
+    the past length: `qn` [1, T, nh, dh] the current queries (normed and roped
+    at their positions), `raw_full` [1, N, dh] every raw key so far (the pin's
+    update_indexer, cache_utils 340-353), `pid` [1, T] the queries' ABSOLUTE
+    positions. Returns the additive [1, 1, T, N] mask. The algebra is
+    `_qsa_additive_mask`'s, with a query at absolute position a seeing the
+    complete blocks b < (a+1)//ratio and the tail ratio*((a+1)//ratio)..a;
+    the blocks are pooled from the history each call, as the pin pools them
+    per query. A block's rope is gathered at its first token's INDEX (4b),
+    which is its position while text positions equal token indices -- the pin
+    assumes the same (`full_cos.index_select(group_starts)`, pin 745-749).
+    N < ratio (no complete block, TopK k = 0) runs on the CPU plugin (review
+    probe); untested on the GPU plugin."""
+    nh = int(config.indexer_n_heads)
+    dh = int(config.indexer_head_dim)
+    ratio = int(config.indexer_compress_ratio)
+    block_topk = int(config.indexer_budget) // ratio
+    eps = config.rms_norm_eps
+    minf = np.float32(np.finfo(np.float32).min)
+    i64 = lambda v: op.constant(np.array(v, np.int64))
+    n_len = op.gather(op.shape_of(raw_full, output_type="i64"), i64(1), i64(0))   # scalar N
+    nb = op.divide(n_len, i64(ratio))                                              # scalar, floor
+    nbr = op.multiply(nb, i64(ratio))
+    kb = op.slice(raw_full, i64([0]), op.unsqueeze(nbr, i64(0)), i64([1]), i64([1]))
+    kb = op.reshape(kb, op.concat([i64([1]), op.unsqueeze(nb, i64(0)), i64([ratio, dh])], 0), False)
+    kb = op.reduce_mean(kb, i64(2), keep_dims=False)                               # pin 743
+    kb = _reshape(kb, [1, -1, 1, dh])
+    kb = _rmsnorm_hd(kb, state["indexer.k_layernorm.weight"], eps, dh)            # pin 744
+    starts = op.range(i64(0), nbr, i64(ratio), Type.i64)                           # [nb]
+    cos_b = _reshape(op.gather(cosT_c, starts, i64(0)), [1, -1, 1, rotary])
+    sin_b = _reshape(op.gather(sinT_c, starts, i64(0)), [1, -1, 1, rotary])
+    kb = _reshape(_rope_last(kb, cos_b, sin_b, rotary), [-1, dh])                 # [nb, dh]
+
+    s = op.relu(op.matmul(_reshape(qn, [-1, nh, dh]), kb, False, True))           # [T, nh, nb]
+    acc = _slice(s, 0, 1, 1, 1)
+    for h in range(1, nh):
+        acc = _add(acc, _slice(s, h, h + 1, 1, 1))
+    s = op.divide(op.squeeze(acc, i64([1])), _c(np.float32(np.sqrt(dh))))          # [T, nb]
+
+    a = _reshape(pid, [-1, 1])                                                     # [T, 1] absolute
+    lim = op.divide(op.add(a, i64(1)), i64(ratio))                                 # complete blocks
+    b_idx = op.unsqueeze(op.range(i64(0), nb, i64(1), Type.i64), i64(0))           # [1, nb]
+    s = op.select(op.less(b_idx, lim), s, _c(np.float32(-np.inf)))
+    k = op.minimum(i64(block_topk), nb)
+    tk = _opset11.topk(s, k, 1, "max", "value", Type.i64, stable=True)
+    kept = op.convert(op.is_finite(tk.output(0)), Type.f32)
+    zeros = op.broadcast(_c(np.float32(0.0)), op.shape_of(s, output_type="i64"))
+    blocksel = op.scatter_elements_update(zeros, tk.output(1), kept, i64(1))      # [T, nb]
+    tokensel = op.reshape(op.concat([op.unsqueeze(blocksel, i64(2))] * ratio, axis=2), i64([0, -1]), True)
+    t_dim = op.gather(op.shape_of(s, output_type="i64"), i64([0]), i64(0))        # [1]
+    rem = op.unsqueeze(op.subtract(n_len, nbr), i64(0))                            # [1], 0..ratio-1
+    pad = op.broadcast(_c(np.float32(0.0)), op.concat([t_dim, rem], 0))
+    tokensel = op.concat([tokensel, pad], axis=1)                                  # [T, N]
+    j = op.unsqueeze(op.range(i64(0), n_len, i64(1), Type.i64), i64(0))            # [1, N]
+    tail = op.logical_and(op.greater_equal(j, op.multiply(lim, i64(ratio))), op.less_equal(j, a))
+    allowed = op.maximum(tokensel, op.convert(tail, Type.f32))
+    mask = op.select(op.greater(allowed, _c(np.float32(0.5))), _c(np.float32(0.0)), _c(minf))
+    return op.unsqueeze(mask, i64([0, 1]))                                         # [1, 1, T, N]
+
+
+def _state_var(tag, shape):
+    from openvino.op import util as ovutil
+    import openvino as _ov
+    info = ovutil.VariableInfo()
+    info.data_shape = _ov.PartialShape(shape)
+    info.data_type = Type.f32
+    info.variable_id = tag
+    return ovutil.Variable(info)
+
+
+def build_qsa_stateful_attention_model(config, state, rope_span, with_mask=False, layer=0):
+    """Step 2 of the qsa campaign: the attention block WITH its indexer, stateful
+    and UN-PAGED, dynamic in T -- K and V in Variables [1, kv, N, d], the
+    indexer's raw keys in a Variable [1, N, dh], one eager attention over the
+    whole history under the indexer's mask. The parity form for the served
+    graph's algebra (chunked prefill and decode across the 2,051 boundary);
+    the served graph itself goes through paged attention (step 3).
+    Inputs `hidden_states` [1, T, H], `position_ids` [1, T] (absolute, below
+    `rope_span`: the rope tables cover positions 0..rope_span-1); result
+    `output`, and with `with_mask` also `qsa_mask` [1, 1, T, N]. `layer` tags
+    the Variable ids, so layers built into one model do not collide."""
+    H = config.hidden_size
+    heads = config.num_attention_heads
+    kv = config.num_key_value_heads
+    d = getattr(config, "head_dim", None) or H // heads
+    eps = config.rms_norm_eps
+    nh = int(config.indexer_n_heads)
+    dh = int(config.indexer_head_dim)
+    assert int(config.indexer_kv_heads) == 1
+    cosT, sinT = _freqs_tables(config, int(rope_span))
+    rotary = cosT.shape[-1]
+    cosT_c, sinT_c = _c(cosT), _c(sinT)
+    i64 = lambda v: op.constant(np.array(v, np.int64))
+
+    hidden = op.parameter([1, -1, H], Type.f32)
+    hidden.set_friendly_name("hidden_states")
+    pid = op.parameter([1, -1], Type.i64)
+    pid.set_friendly_name("position_ids")
+
+    qg = _reshape(_mm(hidden, _c(state["q_proj.weight"]), tb=True), [1, -1, heads, 2 * d])
+    q = _slice(qg, 0, d, 1, 3)
+    gate = _reshape(_slice(qg, d, 2 * d, 1, 3), [1, -1, heads * d])
+    q = _transpose(_rmsnorm_hd(q, state["q_norm.weight"], eps, d), [0, 2, 1, 3])
+    k = _reshape(_mm(hidden, _c(state["k_proj.weight"]), tb=True), [1, -1, kv, d])
+    k = _transpose(_rmsnorm_hd(k, state["k_norm.weight"], eps, d), [0, 2, 1, 3])
+    v = _transpose(_reshape(_mm(hidden, _c(state["v_proj.weight"]), tb=True), [1, -1, kv, d]), [0, 2, 1, 3])
+    q, k = _apply_rope(q, k, cosT_c, sinT_c, pid, rotary, -1)
+
+    sinks = []
+    full = []
+    for tag, cur in (("key", k), ("value", v)):
+        var = _state_var(f"qsa.past.{tag}.{layer}", [1, kv, -1, d])
+        init = op.broadcast(_c(np.float32(0.0)), i64([1, kv, 0, d]))
+        joined = op.concat([op.read_value(init, var), cur], axis=2)
+        sinks.append(op.assign(joined, var))
+        full.append(joined)
+
+    qk = _mm(hidden, _c(state["indexer.index_qk_proj.weight"]), tb=True)
+    qi = _reshape(_slice(qk, 0, nh * dh, 1, 2), [1, -1, nh, dh])
+    raw = _slice(qk, nh * dh, (nh + 1) * dh, 1, 2)                                 # [1, T, dh]
+    qi = _rmsnorm_hd(qi, state["indexer.q_layernorm.weight"], eps, dh)
+    cq = _reshape(op.gather(cosT_c, pid, i64(0)), [1, -1, 1, rotary])
+    sq = _reshape(op.gather(sinT_c, pid, i64(0)), [1, -1, 1, rotary])
+    qi = _rope_last(qi, cq, sq, rotary)
+    rvar = _state_var(f"qsa.past.indexer_key.{layer}", [1, -1, dh])
+    rinit = op.broadcast(_c(np.float32(0.0)), i64([1, 0, dh]))
+    raw_full = op.concat([op.read_value(rinit, rvar), raw], axis=1)
+    sinks.append(op.assign(raw_full, rvar))
+    mask = _qsa_mask_dynamic(qi, raw_full, pid, config, cosT_c, sinT_c, rotary, state)
+
+    r = heads // kv
+    def rep(x):
+        x5 = op.unsqueeze(x, i64(2))                                               # [1, kv, 1, N, d]
+        shp = op.concat([i64([1, kv, r]), op.gather(op.shape_of(x, output_type="i64"), i64([2]), i64(0)), i64([d])], 0)
+        return op.reshape(op.broadcast(x5, shp), i64([1, heads, -1, d]), False)
+    scores = _mul(_mm(q, rep(full[0]), tb=True), _c(np.float32(d ** -0.5)))       # pin 807
+    att = op.softmax(_add(scores, mask), -1)                                       # pin 809-811
+    out = _reshape(_transpose(_mm(att, rep(full[1])), [0, 2, 1, 3]), [1, -1, heads * d])
+    out = _mul(out, op.sigmoid(gate))
+    out = _mm(out, _c(state["o_proj.weight"]), tb=True)
+    res = op.result(out)
+    res.set_friendly_name("output")
+    results = [res]
+    if with_mask:
+        mres = op.result(mask)
+        mres.set_friendly_name("qsa_mask")
+        results.append(mres)
+    return Model(results, sinks, [hidden, pid], "qwen4_exp_qsa_attention_stateful")
+
+
 def build_qsa_attention_model(config, state, seq_len, with_mask=False):
     """The attention block WITH its QSA indexer (static T). `state` carries the
     six attention tensors and the indexer's three (indexer.index_qk_proj.weight,
@@ -462,4 +613,5 @@ def build_qsa_attention_model(config, state, seq_len, with_mask=False):
     return Model(results, [hidden, pid], "qwen4_exp_qsa_attention")
 
 
-__all__ = ["build_dense_attention_model", "build_qsa_attention_model", "emit_dense_attention", "_freqs_tables"]
+__all__ = ["build_dense_attention_model", "build_qsa_attention_model", "build_qsa_stateful_attention_model",
+           "emit_dense_attention", "_freqs_tables"]
