@@ -317,6 +317,11 @@ answer must not move.
     `sdpa_to_paged_attention.cpp`'s `var_ids_to_remove` implies. Red first: a
     mutant gathering that Variable by `beam_idx` makes the pass refuse the
     model (`Model references undeclared parameters: beam_idx`).
+  - 2026-09-28. **Operator decision: option A.** The indexer's raw-key
+    history rides a plain state Variable per QSA layer (one lane; the prefix
+    cache and KV checkpoints stay uncovered until T4's runtime work), as
+    T1a/T1b implemented. The position list (T7) follows for the speed; a
+    paged indexer cache (B) remains the route to multi-lane QSA if wanted.
   - The export flag `--qsa` (default off, so existing artifacts and the arch
     hash do not move) records `qsa` in the manifest and feeds the indexer
     tensors through `gguf_feed` (`self_attn.indexer.*`; the two norm gammas
