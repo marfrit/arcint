@@ -62,6 +62,17 @@ llama.cpp's own median error against the f32 reference (0.0649 w0 /
 (d)'s own rule therefore fires: the row reads **UNREADABLE, not PASS** on the
 B60.
 
+[DATED 2026-09-28: the f32 reference captures (`tools/ref_forward_stream.py`,
+every capture since af465dc, 2026-09-19) ran each sparse-attention indexer on
+byte garbage: `gguf_feed` cast the BF16 indexer projections' raw bytes to f32
+until 2026-09-28 (`measured-here`). Rows below position 2,051 are valid,
+because the selection keeps every complete block whatever the scores (`code`).
+Rows at or above it are void. A capture scores rows 1,368-2,734, 684 of them
+at or above 2,051, so every whole-window mean, median or argmax against the
+reference is void as quoted, and so is any above-boundary figure, with its
+attribution to the dense-for-sparse price. The below-2,051 figures stand; the
+re-capture is owed (`docs/campaigns/qsa.md`).]
+
 ## Known against hypothesised
 
 - **KNOWN, documented in-tree:** DESIGN.md §3.2 — chunk boundaries are not

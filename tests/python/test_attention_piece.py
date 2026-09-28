@@ -53,6 +53,13 @@ EXACTLY rather than as "> 0".
     T=2052   |dense - QSA| max-abs <sampled>       rows differing    1/2052
     T=2080   |dense - QSA| max-abs 2.385560e-02    rows differing   29/2080
 
+[DATED 2026-09-28: the magnitudes above (and the 1.720381e-02 second draw
+below) were drawn at 692c0a6 with the (1 + w) fold applied twice to all four
+q/k gammas -- the main attention's (undone by the feed since c41cb39) and the
+indexer's (undone in the `indexer_state` fixture on 2026-09-28). Re-run with
+both undone: 5.082879e-05 over 1/2052 and 1.064551e-03 over 29/2080 rows. The
+row counts are structural and did not move.]
+
 The zeros are exact and input-independent -- the masks are equal, so the
 arithmetic is the same arithmetic. The T=2080 magnitude is NOT: a second draw
 (seeded differently, same geometry and weights) gave 1.720381e-02 over the same
@@ -82,7 +89,6 @@ be FREE (a resident arcint service holds all of its VRAM) and which pin
 INFERENCE_PRECISION_HINT f32 and print the precision the plugin actually used --
 see tests/python/q4e_device.py for why an unconfigured GPU compile runs f16.
 """
-import glob
 import hashlib
 import math
 import os
@@ -156,34 +162,29 @@ def attn_state(feed):
 
 
 @pytest.fixture(scope="module")
-def indexer_state():
-    """The indexer's OWN weights, read through a plain GGUFReader -- they are
-    deliberately NOT in the q4e name map (the selection branch is not emitted),
-    and they are needed only to drive the pin-side QSA oracle. The fused
-    `index_qk_proj` is the checkpoint's q_proj rows followed by its k_proj rows,
-    which is what the pin's own split (pin 707-711) takes apart again."""
-    from gguf import GGUFReader
-    from gguf import quants as gq
-    raw = {}
-    for p in sorted(glob.glob(os.path.join(_SHARDS, "*.gguf"))):
-        for t in GGUFReader(p).tensors:
-            if t.name.startswith("blk.3.indexer."):
-                raw[t.name] = t
-    missing = {"blk.3.indexer.q_proj.weight", "blk.3.indexer.k_proj.weight",
-               "blk.3.indexer.q_norm.weight", "blk.3.indexer.k_norm.weight"
-               } - set(raw)
-    assert not missing, f"indexer tensors absent from the shards: {sorted(missing)}"
+def indexer_state(feed):
+    """The indexer's OWN weights, through the name map under test. The fused
+    `index_qk_proj` is the checkpoint's q_proj rows followed by its k_proj
+    rows, which is what the pin's own split (pin 707-711) takes apart again.
 
-    def deq(name):
-        t = raw[name]
-        return np.ascontiguousarray(gq.dequantize(t.data, t.tensor_type),
-                                    dtype=np.float32)
-
-    fused = np.concatenate([deq("blk.3.indexer.q_proj.weight"),
-                            deq("blk.3.indexer.k_proj.weight")], axis=0)
-    return {"indexer.index_qk_proj.weight": fused,
-            "indexer.q_layernorm.weight": deq("blk.3.indexer.q_norm.weight"),
-            "indexer.k_layernorm.weight": deq("blk.3.indexer.k_norm.weight")}
+    The two norm gammas are gguf_feed kind `gamma1`. The converter folds them,
+    stored = 1 + w (llama.cpp `conversion/qwen4exp.py`, `data_torch + 1` on
+    `.indexer.{q,k}_layernorm.weight`), and llama.cpp applies them as a plain
+    RMSNorm (`qwen4exp.cpp` build_norm). The pin's RMSNorm adds the 1 itself
+    (pin 171). Until 2026-09-28 this fixture read the stored values raw, so
+    the pin applied the fold twice (a scale of ~1.96). Steps 1-2 held parity
+    anyway, because both sides read the same state; the convention check below
+    is what makes that regression failable."""
+    pre = "layers.3.self_attn.indexer."
+    state = {f"indexer.{k}": feed.pin_tensor(pre + k)
+             for k in ("index_qk_proj.weight", "q_layernorm.weight",
+                       "k_layernorm.weight")}
+    for k in ("indexer.q_layernorm.weight", "indexer.k_layernorm.weight"):
+        m = float(np.mean(state[k]))
+        # w sits near 0 (blk.3: -0.04); the folded 1 + w near 1 (0.96)
+        assert abs(m) < 0.5, (
+            f"{k}: mean {m:.4f} -- the pin wants w, not the stored (1 + w)")
+    return state
 
 
 class _ZeroIndexer(torch.nn.Module):

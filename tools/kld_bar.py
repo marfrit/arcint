@@ -23,6 +23,9 @@ vs 3.0905e-03), while F_ref's own per-row max (1.0533e-02) also exceeds it.
 The ACCEPTANCE candidate, printed in the report, is the floor between
 implementations: llama.cpp's error against the same f32 reference,
 median 0.0649 (w0) / 0.0283 (w1). No verdict is quotable without `F_served`.
+[2026-09-28] Those medians are whole-window figures against the f32 reference,
+whose rows at or above 2,051 ran a garbage indexer (a gguf_feed BF16 defect,
+fixed): void as quoted until the re-capture (docs/campaigns/qsa.md).
 
     kld_bar.py --rows forward_1.npy [--pair forward_2.npy] [--multiple 100]
                [--qsa-price 2.385560e-02] [--out bar.json]
@@ -44,6 +47,8 @@ import kld_served as ks  # noqa: E402
 
 INHERITED_BAR_PROVISIONAL = 0.0599      # 1.5 x another model's R0 (window-050 §7)
 QSA_PRICE_DEFAULT = 2.385560e-02        # window-050 §8, over 29/2080 rows
+# [2026-09-28] a max-abs block-output figure, not nats, drawn with the q/k gamma
+# folds applied twice; bar_above built from it is withdrawn (docs/campaigns/qsa.md).
 
 
 def f_ref(rows):
@@ -103,7 +108,9 @@ def main(argv=None):
         "median_w0_nats": 0.0649, "median_w1_nats": 0.0283,
         "mean_w0_nats": 0.3387, "mean_w1_nats": 0.4415,
         "provenance": ("window-051.md record, 2026-09-19 08:36: llama.cpp build "
-                       "56b9eb28 against the model's own f32 reference capture")}
+                       "56b9eb28 against the model's own f32 reference capture; "
+                       "void as quoted since 2026-09-28 (the reference's rows at or "
+                       "above 2,051 ran a garbage indexer; docs/campaigns/qsa.md)")}
     rep["floor_pair"] = floor_pair(rows, np.load(args.pair, mmap_mode="r")) if args.pair else None
     rep["rows_file"] = str(args.rows)
     rep["pair_file"] = str(args.pair) if args.pair else None

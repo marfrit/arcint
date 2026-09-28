@@ -156,7 +156,7 @@ answer must not move.
   | T | rows the pin prunes | rows differing | of them exact ties at the cut | output on the other rows |
   |---|---|---|---|---|
   | 2052 | 1 | 1 | 1 | 5.7e-8 |
-  | 2080 | 29 | 19 | 19 | 5.6e-8 |
+  | 2080 | 29 | 18 | 18 | 5.6e-8 |
   | 4096 | 2,045 | 23 | 23 | 6.1e-8 |
 
   Every row also keeps exactly min(512, complete blocks) blocks. A row
@@ -165,7 +165,8 @@ answer must not move.
   pass as a tie). Five mutants fail the cell by assertion, none by a crash:
   the dense mask, no key norm, the block rope at the group's last token, the
   tail dropped, the tail missing the diagonal key. Before the stable rule,
-  every difference was also an exact tie (1/20/24 rows, measured).
+  every difference was also an exact tie (1/20/24 rows, measured, with the
+  (1 + w) fold applied twice; see the correction below).
 - 2026-09-28. **Step 2 done** (`measured-here`, CPU plugin, real blk.3
   tensors, `test_qsa_stateful_piece_matches_the_pin_with_its_cache`).
   `build_qsa_stateful_attention_model` keeps K, V and the indexer's raw keys
@@ -178,7 +179,7 @@ answer must not move.
     position 2,051 keeps every complete block), so the selection is tested
     on the 49 rows past the boundary. None differs for real, 24 differ only
     by exact ties at the cut, and the outputs sit 2–6e-8 from the pin on
-    every row without a tie.
+    every row without a tie (2–7e-8 after the gamma correction below).
   - **Mutants:** the indexer without its history fails (at run time, the mask
     no longer matches the key length); visibility by the row's relative
     position fails by assertion.
@@ -187,3 +188,64 @@ answer must not move.
     selection into paged attention. Today `SDPAToPagedAttention` drops any
     SDPA mask (`code`: `state_management_pattern.cpp` matches it as
     `any_input()`).
+- 2026-09-28. **Two corrections to the indexer's weights: the norm gammas
+  in the step-1/2 cells, and the projections in the full-depth reference.**
+  - **The gammas (the cells).** The converter folds both indexer gammas,
+    stored = 1 + w (llama.cpp `conversion/qwen4exp.py`: `data_torch + 1` on
+    `.indexer.{q,k}_layernorm.weight`, `code`). llama.cpp applies them as a
+    plain RMSNorm (`qwen4exp.cpp` `build_norm`, `code`). blk.3's stored
+    values have mean 0.96 (`measured-here`). The pin adds the 1 itself
+    (pin 171), and `gguf_feed` already undoes the fold (kind `gamma1`). But
+    the cells' `indexer_state` fixture read the stored values raw, so the
+    pin applied the fold twice: a scale of ~1.96. Parity held because both
+    sides read the same state.
+    - The fixture now takes all three indexer tensors from the feed and
+      asserts the gammas' mean is near 0. That check is red when the stored
+      values are fed (`measured-here`).
+    - Re-run on the CPU plugin, 17/17 cells (`measured-here`; the
+      projections through `gguf.quants`, bit-identical to the fixed feed):
+      - Step 1: 1/18/23 differing rows at T 2052/2080/4096, all exact ties
+        at the cut (the table above; 2080 was 19). The other rows are
+        unchanged at 5.7/5.6/6.1e-8.
+      - Step 2: 24 tie rows, none real, 2–7e-8 on the other rows.
+      - Of the mutants, only no-key-norm was re-run; it still fails by
+        assertion.
+  - **The projections (the reference).** `indexer.q_proj` and
+    `indexer.k_proj` are the checkpoint's only BF16 tensors (24,
+    `measured-here`). gguf-py hands BF16 over as raw bytes (uint8, twice the
+    row width), and `gguf_feed` cast those bytes to f32 from its first
+    commit (36e0129) until 2026-09-28. Nothing fed a BF16 tensor until the
+    indexer was mapped and the reference tool landed (1271dc3, af465dc, both
+    2026-09-19). `pin_tensor` gave [640, 5120] with
+    values 0..255; `fitted` cropped it to [640, 2560] (`measured-here`, on
+    the dev host and on the reference host).
+    - The step-1/2 cells were not affected: they read the projections through
+      `gguf.quants`, which converts BF16 bit-exactly (`measured-here`).
+    - `tools/ref_forward_stream.py` feeds every parameter through `fitted`,
+      so the f32 reference captures ran every indexer on byte garbage. Below
+      position 2,051 the selection keeps every complete block whatever the
+      scores, so those rows are unaffected (`code`, the selection rule). At
+      or above it, the reference's selection is not the model's.
+    - **Consequence:** a capture scores rows 1,368–2,734, 684 of them at or
+      above 2,051. So every reading against the reference at or above 2,051
+      is void, **and so is every whole-window figure**:
+      - the served artifacts' 0.369 / 0.181 / 0.827 and 0.380 / 0.191 / 0.792;
+      - llama.cpp's 0.339 / 0.065 / 0.802 (the medians 0.0649 / 0.0283 that
+        `kld_bar.py` prints as the acceptance candidate);
+      - the "above 0.455 — the dense-for-sparse price" of
+        `sub4bit-vram-kernel.md`, the number and the attribution alike (a
+        garbage selection in the reference explains the jump equally well).
+    - The below-2,051 split stands, and can be re-read from the existing
+      captures now (`kld_vs_capture.py` / `capture_vs_capture.py` print it).
+      The rows at or above 2,051 need a re-capture with the fixed feed before
+      the gate's above-2,051 row is read. Dated notes sit at each figure.
+    - Fixed in `gguf_feed._dequant`, which now also refuses any tensor whose
+      dequantised shape differs from its header's (the check whose absence
+      let `fitted` crop), and in the same path in `expert_store` (latent: no
+      expert tensor is BF16). Two red-first cells: every real BF16 tensor
+      against an independent bit conversion, and a BF16 expert through the
+      store. Both were red on the old cast (`measured-here`).
+  - The pin's dense-vs-QSA max-abs at T 2080 is 1.064551e-03 with both folds
+    undone (`measured-here`). The 2.385560e-02 on record was drawn at
+    692c0a6 with all four q/k gammas folded twice, so the two figures do not
+    isolate either fix. The bar built on it is withdrawn anyway (above).

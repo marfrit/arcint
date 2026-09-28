@@ -76,6 +76,11 @@ ACCEPTANCE IS TWO-LEGGED (both are needed; neither substitutes for the other):
         T=2052   |dense - QSA| max-abs 2.307817e-06   rows differing    1/2052
         T=2080   |dense - QSA| max-abs 2.385560e-02   rows differing   29/2080
 
+    [DATED 2026-09-28: the magnitudes above were drawn at 692c0a6 with the
+    (1 + w) fold applied twice to the q/k gammas; with the feed's gamma1 the
+    pin reads 5.082879e-05 over 1/2052 and 1.064551e-03 over 29/2080 rows.
+    The above-2051 bar built on it is withdrawn.]
+
     THE BOUNDARY IS 2051, NOT THE BUDGET 2048 (CF-BOUNDS, measured 2026-09-12).
     Every row is dense iff T <= block_topk*ratio + ratio - 1 = 2051, and the
     pruned-row count at any T is exactly max(0, T - 2051) -- 1 at T=2052 and 29

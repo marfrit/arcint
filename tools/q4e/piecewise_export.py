@@ -92,6 +92,10 @@ shapes:
     q4e/attention.py. The emission MATH is separately floored against the pin
     with its indexer stubbed to an all-zero additive mask -- not against a
     hand-written reference, which is what shared the emitter's misreading.
+    [DATED 2026-09-28: the 2.385560e-02 above was drawn at 692c0a6 with the
+    (1 + w) fold applied twice to the q/k gammas; with the feed's gamma1 the
+    pin reads 5.082879e-05 over 1/2052 and 1.064551e-03 over 29/2080 rows.
+    The above-2051 bar built on it is withdrawn.]
   * moe_*: router gate equality with the pin's `router_gate` on fed real
     tensors (tests/python/test_moe_block.py, which also gates dense==sparse for
     the FULL graph). **THE CHUNK LEG HAS NO HOME AS OF 2026-09-12**: the only

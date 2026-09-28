@@ -86,6 +86,8 @@ F_REF_MEAN_NATS             = 3.0905e-05   # mean uint16 reconstruction error, 8
 F_REF_PER_ROW_MAX_NATS      = 1.0533e-02   # the clamp tail; EXCEEDS bar_below below 2051
 RESOLUTION_BOUND_BELOW_NATS = 3.0905e-03   # = 100 x F_REF_MEAN_NATS
 RESOLUTION_BOUND_ABOVE_NATS = 2.6946e-02   # = bound + the measured QSA price
+# [2026-09-28] WITHDRAWN: the QSA price is a max-abs block-output figure, not nats
+# (docs/campaigns/qsa.md). Kept printed for continuity; it decides nothing.
 RESOLUTION_BOUND_STATUS     = "PROVISIONAL (rows are f16-served)"
 RESOLUTION_BOUND_PROVENANCE = (
     "window-051.md clause (d), BERLIN-001 5d4dd59, measured at A.2: "
@@ -105,7 +107,9 @@ IMPLEMENTATION_FLOOR_PROVENANCE = (
     "llama.cpp (build 56b9eb28) against the model's own f32 reference capture: "
     "window 0 1,367 rows mean 0.3387 median 0.0649; window 1 mean 0.4415 "
     "median 0.0283 -- the floor between implementations, the acceptance "
-    "candidate; NOT the resolution bound")
+    "candidate; NOT the resolution bound. VOID AS QUOTED since 2026-09-28: "
+    "the reference's rows at or above 2,051 ran a garbage indexer (a gguf_feed "
+    "BF16 defect, fixed); re-capture owed (docs/campaigns/qsa.md)")
 
 
 # --------------------------------------------------------------------------

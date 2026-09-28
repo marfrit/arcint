@@ -119,6 +119,35 @@ def _layer_keys(sd_keys, layer, leaf):
 
 # --------------------------------------------------------------------------- #
 @_skip
+def test_bf16_tensors_are_fed_as_their_values_not_their_bytes(feed):
+    """gguf-py hands a BF16 tensor over as its raw bytes (uint8, twice the
+    row width): numpy has no bfloat16. Until 2026-09-28 the feed cast those
+    bytes to f32, so `indexer.q_proj` came out [512, 5120] with values
+    0..255, and `fitted` cropped it to [512, 2560] without complaint. The
+    indexer projections are the checkpoint's only BF16 tensors; the full-depth
+    reference (tools/ref_forward_stream.py) fed them that way. The oracle is
+    written test-side: a bf16 value is the high half of an f32's bits."""
+    seen = 0
+    for name, t in feed._index.items():
+        if t.tensor_type.name != "BF16":
+            continue
+        seen += 1
+        got = feed.dequant(name)
+        want = (np.ascontiguousarray(t.data).view(np.uint16).astype(np.uint32)
+                << 16).view(np.float32)
+        assert got.shape == want.shape, (name, got.shape, want.shape)
+        assert np.array_equal(got, want), name
+    assert seen, "no BF16 tensor in the shards: the cell measures nothing"
+    fused = feed.pin_tensor("layers.3.self_attn.indexer.index_qk_proj.weight")
+    q = feed.dequant("blk.3.indexer.q_proj.weight")
+    assert fused.shape[1] == q.shape[1] == feed.dequant("blk.3.attn_q.weight").shape[1], (
+        f"indexer projection {fused.shape} does not read the hidden size")
+    print(f"\n[bf16] {seen} tensors; fused indexer {fused.shape}, "
+          f"|w| max {float(np.abs(fused).max()):.4f}")
+
+
+# --------------------------------------------------------------------------- #
+@_skip
 def test_the_indexer_is_fed_fused_q_over_k_with_its_norms(feed):
     """The sparse-attention indexer (2026-09-19): the pin's one
     `index_qk_proj` is the GGUF's `indexer.q_proj` stacked over
@@ -726,8 +755,11 @@ def _raw_dequant(raw_index, name, rows=None):
     t = raw_index[name]
     data = t.data if rows is None else t.data[:rows]
     tn = t.tensor_type.name
-    if tn in ("F32", "F16", "BF16"):
+    if tn in ("F32", "F16"):
         return np.ascontiguousarray(np.asarray(data), dtype=np.float32)
+    if tn == "BF16":   # raw bytes from the reader; a bf16 is an f32's high half
+        return (np.ascontiguousarray(data).view(np.uint16).astype(np.uint32)
+                << 16).view(np.float32)
     return _Q.dequantize(data, t.tensor_type).astype(np.float32)
 
 

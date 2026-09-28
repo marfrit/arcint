@@ -19,6 +19,22 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+- **The GGUF feed read BF16 tensors as their raw bytes** (`q4e.gguf_feed`,
+  since its first commit): gguf-py hands BF16 over as uint8 at twice the row
+  width, and the feed cast the bytes to f32. In Flash-Next's GGUF that hits
+  exactly the 24 sparse-attention indexer projections. The fix goes through
+  `gguf.quants`, and the feed now refuses a tensor whose shape differs from
+  its header's. As a consequence, the full-depth f32 reference captures
+  (`tools/ref_forward_stream.py`) ran every indexer on garbage: their rows
+  at or above position 2,051, and every whole-window figure read against
+  them (the served artifact's 0.37 / 0.18 / 0.83, llama.cpp's 0.34 / 0.065 /
+  0.80, the "0.45 above the boundary" of 0.5.0.1), are void as quoted until
+  a re-capture. The rows below 2,051 stand (`docs/campaigns/qsa.md`).
+- **QSA cells: the indexer's norm gammas were applied twice** (the test
+  fixture read the GGUF's folded (1 + w) and the pin adds the 1 again). The
+  fixture now reads them through the feed and asserts the convention; steps
+  1–2 re-measured, parity unchanged up to exact ties.
+
 - **CPU tier: AVX2 row decode and a row-per-lane single-job dot** (plugin
   patch 0068, DESIGN §7.0.2cx): the same f32 bits, by two bitwise cells. On
   the dev host's CPU (a standalone build with the plugin's flags) a

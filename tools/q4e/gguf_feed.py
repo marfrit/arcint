@@ -196,12 +196,23 @@ def _dequant(reader_tensor, rows=None):
     if rows is not None:
         data = data[:rows]
     name = qt.name
-    if name in ("F32", "F16", "BF16"):
-        arr = np.asarray(data)
-        if name != "F32":
-            arr = arr.astype(np.float32)
-        return np.ascontiguousarray(arr, dtype=np.float32)
-    return _gguf_quants.dequantize(data, qt).astype(np.float32)
+    if name in ("F32", "F16"):
+        arr = np.ascontiguousarray(np.asarray(data), dtype=np.float32)
+    else:
+        # BF16 included: gguf-py hands it over as raw bytes (uint8, twice the
+        # row width; numpy has no bfloat16), and a plain cast turned those
+        # bytes into values 0..255 until 2026-09-28. gguf.quants converts it
+        # bit-exactly.
+        arr = _gguf_quants.dequantize(data, qt).astype(np.float32)
+    # The logical shape, whatever the reader's storage layout: a tensor wider
+    # than the header says is the failure `fitted` used to crop silently.
+    want = tuple(int(x) for x in reversed(reader_tensor.shape))
+    if rows is not None:
+        want = (min(int(rows), want[0]),) + want[1:]
+    if arr.shape != want:
+        raise ValueError(f"{reader_tensor.name}: {name} dequantised to {arr.shape}, "
+                         f"the header says {want}")
+    return arr
 
 
 class GgufFeed:

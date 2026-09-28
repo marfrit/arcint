@@ -37,6 +37,11 @@ set by the numpy dequant of each layer's experts (~1 min per layer on
 
   --layers N truncates the model (a smoke test at 2 layers covers the
   PLE); --dtype bf16 halves the weights and is NOT the exact reference.
+
+[2026-09-28] Captures written before this date fed the sparse-attention
+indexer's BF16 projections as their raw bytes (gguf_feed cast them to f32).
+Their rows at or above position 2,051 do not carry the model's selection;
+rows below it are unaffected. Re-capture before reading above the boundary.
 """
 import argparse
 import datetime

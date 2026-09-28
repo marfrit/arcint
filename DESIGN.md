@@ -9360,6 +9360,7 @@ precision; the f16 recurrent state, the prefill chunks and the f16
 long-context attention are the candidates. The bar of 0.06 nats is
 llama.cpp's per-token floor against the model; a serving artifact reaches
 it by matching that error shape, not by any expert format.
+[DATED 2026-09-28: the f32 reference captures (`tools/ref_forward_stream.py`, every capture since af465dc, 2026-09-19) ran each sparse-attention indexer on byte garbage: `gguf_feed` cast the BF16 indexer projections' raw bytes to f32 until 2026-09-28 (`measured-here`). Rows below position 2,051 are valid, because the selection keeps every complete block whatever the scores (`code`). Rows at or above it are void. A capture scores rows 1,368-2,734, 684 of them at or above 2,051, so every whole-window mean, median or argmax against the reference is void as quoted, and so is any above-boundary figure, with its attribution to the dense-for-sparse price. The below-2,051 figures stand; the re-capture is owed (`docs/campaigns/qsa.md`).]
 
 **Recorded beside it.** Three served attempts were killed by the host
 watchdog before the reading: the served-leg driver had not forwarded the
@@ -11162,6 +11163,17 @@ gate at depth 4 on 2026-09-23 but had no full-depth artifact.
   - `d48n`'s recorded reading of the same window (2026-09-19, on the
     plugin of that day, `docs/campaigns/sub4bit-vram-kernel.md`) was 0.283
     below, 0.455 above and argmax 0.827.
+    [DATED 2026-09-28: the f32 reference captures
+    (`tools/ref_forward_stream.py`, every capture since af465dc, 2026-09-19)
+    ran each sparse-attention indexer on byte garbage: `gguf_feed` cast the
+    BF16 indexer projections' raw bytes to f32 until 2026-09-28
+    (`measured-here`). Rows below position 2,051 are valid, because the
+    selection keeps every complete block whatever the scores (`code`). Rows at
+    or above it are void. A capture scores rows 1,368-2,734, 684 of them at or
+    above 2,051, so every whole-window mean, median or argmax against the
+    reference is void as quoted, and so is any above-boundary figure, with its
+    attribution to the dense-for-sparse price. The below-2,051 figures stand;
+    the re-capture is owed (`docs/campaigns/qsa.md`).]
   - All 2,735 rows of the all-row dumps differ between the two artifacts.
   - The median per-row max |dlogit| per 512-token chunk runs from 1.38
     (the first chunk) to 2.44.

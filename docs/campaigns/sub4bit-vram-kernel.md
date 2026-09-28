@@ -616,6 +616,17 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   submission after a long idle since boot while back-to-back legs never
   wedge — a runtime-PM resume suspect, unmeasured, recorded for the next
   boot. The control stays owed with the term it would split.
+  [DATED 2026-09-28: the f32 reference captures
+  (`tools/ref_forward_stream.py`, every capture since af465dc, 2026-09-19) ran
+  each sparse-attention indexer on byte garbage: `gguf_feed` cast the BF16
+  indexer projections' raw bytes to f32 until 2026-09-28 (`measured-here`).
+  Rows below position 2,051 are valid, because the selection keeps every
+  complete block whatever the scores (`code`). Rows at or above it are void. A
+  capture scores rows 1,368-2,734, 684 of them at or above 2,051, so every
+  whole-window mean, median or argmax against the reference is void as quoted,
+  and so is any above-boundary figure, with its attribution to the
+  dense-for-sparse price. The below-2,051 figures stand; the re-capture is
+  owed (`docs/campaigns/qsa.md`).]
 - 2026-09-19 (late morning) — **the chunks are not the term.** The
   capture's 2,735 ids in ONE forward through the native artifact (B60,
   ratio 99 + tier, KV u8, f16) read mean 0.380 / median 0.191 / argmax

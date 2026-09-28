@@ -241,6 +241,10 @@ mean 0.37 / median 0.18 / argmax 0.83 where llama.cpp itself reads 0.34 /
 not the KV precision, not the prefill chunks; the f16 recurrent state or the
 f16 attention over thousands of keys), plus the dense-for-sparse price above
 the 2,051-token sparse-attention boundary.
+[2026-09-28] Void as quoted: the reference captures ran the sparse-attention
+indexer on the BF16 projections' raw bytes (a gguf_feed defect, fixed); rows
+below position 2,051 stand, rows at or above it and every whole-window figure
+await a re-capture (docs/campaigns/qsa.md).
 
 ## Contracts
 

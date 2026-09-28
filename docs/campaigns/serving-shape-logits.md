@@ -203,6 +203,17 @@ it is mechanism, not an answer.
   `sub4bit-vram-kernel`'s status. Every instrument this campaign built
   (`llama-eval-dump`, `llama_tap_compare.py`, the cut ladder, the KLD replay
   and its position-resolved reading) stays in use.
+  [DATED 2026-09-28: the f32 reference captures
+  (`tools/ref_forward_stream.py`, every capture since af465dc, 2026-09-19) ran
+  each sparse-attention indexer on byte garbage: `gguf_feed` cast the BF16
+  indexer projections' raw bytes to f32 until 2026-09-28 (`measured-here`).
+  Rows below position 2,051 are valid, because the selection keeps every
+  complete block whatever the scores (`code`). Rows at or above it are void. A
+  capture scores rows 1,368-2,734, 684 of them at or above 2,051, so every
+  whole-window mean, median or argmax against the reference is void as quoted,
+  and so is any above-boundary figure, with its attribution to the
+  dense-for-sparse price. The below-2,051 figures stand; the re-capture is
+  owed (`docs/campaigns/qsa.md`).]
 
 ## Gate, re-read
 
@@ -210,5 +221,16 @@ The Paris line is served at depth 48. The KLD number against llama.cpp's
 capture (0.73 nats u4, 0.42 native) is bounded below by llama.cpp's own
 distance from the model (mean 0.34 on the same rows), so it is no longer the
 gate; the gate is the reading against the model's own f32 reference capture
-(`/models/ov/_kld/ref/` on the dev host), where the artifact stands at 0.37
+(on the dev host), where the artifact stands at 0.37
 / 0.18 with its long-context term named as the next work.
+
+[DATED 2026-09-28: the f32 reference captures (`tools/ref_forward_stream.py`,
+every capture since af465dc, 2026-09-19) ran each sparse-attention indexer on
+byte garbage: `gguf_feed` cast the BF16 indexer projections' raw bytes to f32
+until 2026-09-28 (`measured-here`). Rows below position 2,051 are valid,
+because the selection keeps every complete block whatever the scores (`code`).
+Rows at or above it are void. A capture scores rows 1,368-2,734, 684 of them
+at or above 2,051, so every whole-window mean, median or argmax against the
+reference is void as quoted, and so is any above-boundary figure, with its
+attribution to the dense-for-sparse price. The below-2,051 figures stand; the
+re-capture is owed (`docs/campaigns/qsa.md`).]
