@@ -1,0 +1,214 @@
+# QSA step 3 T2: an optional last PagedAttention input carrying the model's
+# own per-query key selection, and the pass that wires the tag-marked indexer
+# mask into it.
+#
+# core: PagedAttentionExtension accepts 28 inputs or 29; input 28 is
+# [T_new, past + T_new] u8 (1 = keep the key, 0 = drop it, rank 1 [0] = none),
+# and absent keeps the graph at 28 inputs, today's form byte for byte. Type
+# tests prove the accepted form and the rejected type.
+# pass: an SDPA whose attention-mask node carries rt_info arcint =
+# "qsa_selection" (set by the exporter, qsa step 3 T1a) is converted to that
+# u8 visibility mask and appended; an untagged mask -- every causal mask --
+# is dropped exactly as before, so no other model's mask is ever routed here.
+# A pass test proves both branches on a single-layer stateful model.
+# GPU plugin: input-count plumbing only; a model carrying input 28 is refused
+# by name until the kernel path that READS it lands (T3), never silently run.
+--- a/src/core/src/op/paged_attention.cpp
++++ b/src/core/src/op/paged_attention.cpp
+@@ -82,8 +82,9 @@
+     OV_OP_SCOPE(PagedAttentionExtension_validate_and_infer_types);
+ 
+     NODE_VALIDATION_CHECK(this,
+-                          get_input_size() == 28,
+-                          "PagedAttensionExtension expects 28 inputs, but it has ",
++                          get_input_size() == 28 || get_input_size() == 29,
++                          "PagedAttensionExtension expects 28 inputs, or 29 with the optional "
++                          "QSA selection mask, but it has ",
+                           get_input_size());
+ 
+     // format: Node*, input_idx, name, {rank_list}, {type_list}
+@@ -116,6 +117,9 @@
+     input_check(this, 25, "token_type_ids", {1, 2}, {element::i32});
+     input_check(this, 26, "qq_bias", {1}, {element::u8});
+     input_check(this, 27, "qq_bias_begins", {1}, {element::i32});
++    if (get_input_size() == 29) {
++        input_check(this, 28, "qsa_selection", {1, 2}, {element::u8});
++    }
+ 
+     const auto input_shapes = ov::util::get_node_input_partial_shapes(*this);
+     const auto output_shapes = shape_infer(this, input_shapes);
+--- a/src/core/shape_inference/include/paged_attention_shape_inference.hpp
++++ b/src/core/shape_inference/include/paged_attention_shape_inference.hpp
+@@ -16,7 +16,10 @@
+ std::vector<TRShape> shape_infer(const PagedAttentionExtension* op,
+                                  const std::vector<TShape>& input_shapes,
+                                  const ITensorAccessor& ta = make_tensor_accessor()) {
+-    NODE_VALIDATION_CHECK(op, input_shapes.size() == 28, "Expected 28 inputs but got ", input_shapes.size());
++    NODE_VALIDATION_CHECK(op,
++                          input_shapes.size() == 28 || input_shapes.size() == 29,
++                          "Expected 28 inputs (or 29 with the QSA selection mask) but got ",
++                          input_shapes.size());
+     auto output_shapes = std::vector<TRShape>(3);
+ 
+     // Output[0] feature dim is num_heads * v_head_size.
+--- a/src/core/dev_api/openvino/op/paged_attention.hpp
++++ b/src/core/dev_api/openvino/op/paged_attention.hpp
+@@ -55,6 +55,10 @@
+     /// 25  token_type_ids                                   [B_token] or [B_token, 1], i32  optional
+     /// 26  qq_bias                                          [total_bias_bytes], u8    optional
+     /// 27  qq_bias_begins                                   [B_seq + 1], i32          optional
++    /// 28  qsa_selection                                   [T_new, past + T_new], u8  optional
++    ///      (absent keeps the graph at 28 inputs, today's form byte for byte)
++    ///      (the model's own per-query key selection: 1 = keep the key,
++    ///       0 = drop it; absent = dense attention exactly as before)
+     explicit PagedAttentionExtension(const ov::OutputVector& args, bool write_kv_cache = true);
+ 
+     void validate_and_infer_types() override;
+--- a/src/common/transformations/src/transformations/paged_attention/state_management_pattern.cpp
++++ b/src/common/transformations/src/transformations/paged_attention/state_management_pattern.cpp
+@@ -878,7 +878,34 @@
+             pa_arguments.insert(pa_arguments.begin() + 26, v0::Constant::create(element::u8, Shape{0}, {}));
+             pa_arguments.insert(pa_arguments.begin() + 27, v0::Constant::create(element::i32, Shape{0}, {}));
+         }
+-        OPENVINO_ASSERT(pa_arguments.size() == 28);
++
++        // QSA selection (arcint, qsa step 3): the exporter tags an
++        // indexer-produced SDPA mask with rt_info arcint = "qsa_selection".
++        // ONE LANE: the paged model flattens batch into tokens, so the
++        // mask's rows are the new tokens in order. lanes > 1 is refused
++        // at load (T4) until the paged indexer cache (option B) lands.
++        // Wire THAT mask into the optional last input as a [T_new,
++        // past + T_new] u8 visibility mask (1 = keep, 0 = drop); a mask
++        // without the tag is dropped exactly as before, and a causal mask
++        // is never routed here.
++        bool qsa_selection = false;
++        if (sdpa_node->get_input_size() > 3) {
++            const auto& mask_node = sdpa_node->input_value(3).get_node_shared_ptr();
++            const auto& rt = mask_node->get_rt_info();
++            const auto it = rt.find("arcint");
++            qsa_selection = it != rt.end() && it->second.as<std::string>() == "qsa_selection";
++        }
++        if (qsa_selection) {
++            const auto mask = sdpa_node->input_value(3);
++            auto mask_2d = std::make_shared<v0::Squeeze>(mask, v0::Constant::create(element::i64, Shape{2}, {1, 2}));
++            auto visible = std::make_shared<v1::Greater>(
++                mask_2d, v0::Constant::create(mask.get_element_type(), Shape{}, {-0.5}));
++            auto visibility = std::make_shared<v0::Convert>(visible, element::u8);
++            visibility->set_friendly_name("qsa_selection");
++            pa_arguments.push_back(visibility);
++        }
++        // 28 without a selection (today's graph, byte for byte) or 29 with it.
++        OPENVINO_ASSERT(pa_arguments.size() == 28 || pa_arguments.size() == 29);
+ 
+         auto paged_attention =
+             std::make_shared<ov::op::PagedAttentionExtension>(pa_arguments, kv_params.write_kv_cache);
+--- a/src/plugins/intel_gpu/src/plugin/ops/paged_attention.cpp
++++ b/src/plugins/intel_gpu/src/plugin/ops/paged_attention.cpp
+@@ -20,7 +20,13 @@
+ namespace ov::intel_gpu {
+ 
+ static void CreatePagedAttentionExtensionOp(ProgramBuilder& p, const std::shared_ptr<ov::op::PagedAttentionExtension>& op) {
+-    validate_inputs_count(op, {28});
++    validate_inputs_count(op, {28, 29});
++    // T2 plumbing only: the kernel path that READS input 28 is T3. Until
++    // then a model carrying it is refused by name rather than silently run
++    // with the selection ignored.
++    OPENVINO_ASSERT(op->get_input_size() == 28,
++                    "PagedAttentionExtension input 28 (the QSA selection mask) is not "
++                    "honoured by the GPU plugin yet; refusing rather than ignoring it");
+     auto inputs = p.GetInputInfo(op);
+     auto prim = cldnn::paged_attention(layer_type_name_ID(op), inputs);
+ 
+--- a/src/core/tests/type_prop/paged_attention.cpp
++++ b/src/core/tests/type_prop/paged_attention.cpp
+@@ -73,6 +73,24 @@
+             qq_bias_begins};
+ }
+ }  // namespace
++
++TEST(type_prop, paged_attention_accepts_an_optional_qsa_selection_mask) {
++    auto args = make_valid_pa_args(element::f32);
++    ASSERT_EQ(args.size(), 28);
++    args.push_back(std::make_shared<op::v0::Parameter>(element::u8, PartialShape{3, 6}));
++    const auto pa = std::make_shared<op::PagedAttentionExtension>(args);
++    EXPECT_EQ(pa->get_input_size(), 29);
++    EXPECT_EQ(pa->get_input_element_type(28), element::u8);
++    EXPECT_EQ(pa->get_input_partial_shape(28), PartialShape({3, 6}));
++}
++
++TEST(type_prop, paged_attention_rejects_a_wrongly_typed_qsa_selection_mask) {
++    auto args = make_valid_pa_args(element::f32);
++    args.push_back(std::make_shared<op::v0::Parameter>(element::f32, PartialShape{3, 6}));
++    OV_EXPECT_THROW(std::make_shared<op::PagedAttentionExtension>(args),
++                    NodeValidationFailure, HasSubstr("qsa_selection"));
++}
++
+ TEST(type_prop, paged_attention_static_eviction_per_block) {
+     const auto query = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{3, 4});
+     const auto key = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{3, 4});
+--- a/src/common/transformations/tests/op_conversions/sdpa_to_paged_attention_test.cpp
++++ b/src/common/transformations/tests/op_conversions/sdpa_to_paged_attention_test.cpp
+@@ -3,6 +3,7 @@
+ //
+ 
+ #include "openvino/pass/sdpa_to_paged_attention.hpp"
++#include "openvino/pass/manager.hpp"
+ 
+ #include <gtest/gtest.h>
+ 
+@@ -7303,6 +7304,55 @@
+     return std::make_shared<ov::Model>(OutputVector{res}, SinkVector{kv_0.assign, vv_0.assign}, params);
+ }
+ 
++// QSA step 3 T2: an exporter-tagged indexer mask (rt_info arcint =
++// "qsa_selection") becomes the optional 29th PagedAttention input, a
++// [T_new, total] u8 visibility mask; an untagged mask -- every causal mask
++// -- is dropped exactly as before and the node stays at 28 inputs.
++TEST(SDPAToPA, QsaSelectionMaskIsWiredIntoTheOptionalPagedAttentionInput) {
++    auto model = make_single_layer_sdpa_model(false, false, false);
++    std::shared_ptr<ov::Node> sdpa;
++    for (const auto& op : model->get_ops()) {
++        if (ov::is_type<ov::op::v13::ScaledDotProductAttention>(op)) {
++            sdpa = op;
++            break;
++        }
++    }
++    ASSERT_NE(sdpa, nullptr);
++    sdpa->input_value(3).get_node_shared_ptr()->set_rt_info("qsa_selection", "arcint");
++    ov::pass::Manager manager;
++    manager.register_pass<ov::pass::SDPAToPagedAttention>();
++    manager.run_passes(model);
++    std::shared_ptr<ov::Node> pa;
++    for (const auto& op : model->get_ops()) {
++        if (ov::is_type<ov::op::PagedAttentionExtension>(op)) {
++            pa = op;
++            break;
++        }
++    }
++    ASSERT_NE(pa, nullptr);
++    EXPECT_EQ(pa->get_input_size(), 29u);
++    const auto mask = pa->get_input_node_shared_ptr(28);
++    EXPECT_EQ(mask->get_friendly_name(), "qsa_selection");
++    EXPECT_EQ(mask->get_output_element_type(0), element::u8);
++    EXPECT_EQ(mask->get_output_partial_shape(0).rank(), ov::Rank(2));
++}
++
++TEST(SDPAToPA, AnUntaggedSdpaMaskIsDroppedAndKeepsPagedAttentionAt28Inputs) {
++    auto model = make_single_layer_sdpa_model(false, false, false);
++    ov::pass::Manager manager;
++    manager.register_pass<ov::pass::SDPAToPagedAttention>();
++    manager.run_passes(model);
++    std::shared_ptr<ov::Node> pa;
++    for (const auto& op : model->get_ops()) {
++        if (ov::is_type<ov::op::PagedAttentionExtension>(op)) {
++            pa = op;
++            break;
++        }
++    }
++    ASSERT_NE(pa, nullptr);
++    EXPECT_EQ(pa->get_input_size(), 28u);
++}
++
+ // a8w8 (SmoothQuant) inserts a FakeQuantize after the KV-cache Concat. Without tolerating it, SDPA is
+ // not converted and beam_idx / attention_mask survive -> "Model references undeclared parameters".
+ // The FakeQuantize is preserved: re-applied on the PagedAttention K/V feed (input 1 = K, input 2 = V).

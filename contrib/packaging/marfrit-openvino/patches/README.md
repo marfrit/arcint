@@ -2127,5 +2127,33 @@ for the second pass. That pass decodes in 28.92 s on the mapping and in
 decode-only compute is 1.14 ms per layer call for 7.57 experts (counter
 difference between a one-request and a two-request process), which is the
 tier bench's own figure for that many experts on 15 workers. Series
-0003–0072 (70 patches) applies to the pin with `git apply` and reproduces the
+0003–0073 (71 patches) applies to the pin with `git apply` and reproduces the
 built tree file for file.
+
+### 0073-qsa-selection-paged-attention-input.patch
+
+QSA step 3 T2. `PagedAttentionExtension` gains an optional LAST input, 28:
+`[T_new, past + T_new]` u8, 1 = keep the key, 0 = drop it (rank-1 `[0]` =
+none). Absent keeps the node at 28 inputs, so every existing model, artifact
+and arch hash is untouched. `validate_and_infer_types` and
+`paged_attention_shape_inference.hpp` accept 28 or 29, and a type_prop cell
+proves the accepted u8 `[T, N]` form and refuses a wrong type. Two
+transformation tests prove the tagged mask is wired (29 inputs, a u8
+`Convert` named `qsa_selection`) and an untagged mask is dropped (28 inputs).
+
+`SDPAToPagedAttention`'s `StateManagementPattern` now inspects the SDPA's
+attention-mask node. When it carries `rt_info` `arcint = "qsa_selection"`
+(set by arcint's exporter, qsa T1a), the mask is squeezed to `[T, N]`,
+compared against -0.5 (`Greater`) and converted to the u8 visibility mask
+appended at input 28. Any other mask -- every causal mask -- is dropped
+exactly as before, so no other model's mask is ever routed there.
+
+The GPU plugin's input-count check accepts 28 or 29 but REFUSES 29 by name
+(T3 lands the kernel path that reads it), never silently ignoring the
+selection. The template backend still accepts 28 only.
+
+Measured (device-free, the rebuilt core lib): a `--qsa` depth-4 serving-shape
+graph goes through the pass to a PagedAttentionExtension with 29 inputs,
+input 28 a u8 `Convert` named `qsa_selection`; the same graph with `qsa=False`
+stays at 28. Red first on the pre-0073 runtime: the unpatched pass drops the
+tagged mask and yields 28 inputs.

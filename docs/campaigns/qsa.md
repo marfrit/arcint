@@ -320,7 +320,42 @@ answer must not move.
   - 2026-09-28. **Operator decision: option A.** The indexer's raw-key
     history rides a plain state Variable per QSA layer (one lane; the prefix
     cache and KV checkpoints stay uncovered until T4's runtime work), as
-    T1a/T1b implemented. The position list (T7) follows for the speed; a
+    T1a/T1b implemented.
+  - 2026-09-28. **T2 landed as source + patch; the OV unit/plugin ladders
+    are OWED** (`measured-here`, device-free, at the graph level; plugin
+    patch `0073`).
+    - **core.** `PagedAttentionExtension` accepts 28 inputs or 29; input 28
+      is `[T_new, past + T_new]` u8 (1 = keep the key, 0 = drop it; rank-1
+      `[0]` = none), and absent keeps the node at 28 -- today's form byte for
+      byte, so no existing artifact or arch hash moves.
+      `validate_and_infer_types` and `paged_attention_shape_inference.hpp`
+      accept both; type tests prove the accepted form and refuse a wrong
+      type.
+    - **pass.** `StateManagementPattern` inspects the SDPA's attention-mask
+      node; when it carries `rt_info arcint = "qsa_selection"` (the
+      exporter's marker, T1a) the mask is squeezed to `[T, N]`, compared
+      with -0.5 and converted to the u8 visibility mask appended at 28. An
+      untagged mask -- every causal mask -- is dropped exactly as before.
+      ONE LANE is implicit (the mask rows are the flattened new tokens);
+      lanes > 1 is T4's load-time refusal until option B.
+    - **red first, runtime-level.** On the pre-0073 runtime the tagged mask
+      is dropped: a `--qsa` depth-4 serving-shape graph reaches
+      PagedAttention with 28 inputs (`measured-here`). On the rebuilt core
+      lib the same graph reaches 29 inputs, input 28 a u8 `Convert` named
+      `qsa_selection`; `qsa=False` stays at 28 (`measured-here`).
+    - **patch.** `0073-qsa-selection-paged-attention-input.patch` is written
+      to `contrib/packaging/marfrit-openvino/patches/` and to the `patches/`
+      mirror; `git apply --check -R` on the series tree is clean. The GPU
+      plugin's input-count check accepts 28 or 29 and refuses 29 by name
+      until T3's kernel path lands (never a silent fallback); the GPU plugin
+      target linked clean (`measured-here`).
+    - **OWED.** The OpenVINO unit ladder (two type_prop cells and two
+      transformation tests are already in the patch) needs a tests-enabled
+      OpenVINO build, which does not exist here; the dev build's CPU plugin
+      link is broken by a stale snippets archive, unrelated to this change,
+      so only the `openvino` and `openvino_intel_gpu_plugin` targets were
+      rebuilt. The plugin unit ladder for the PA tests is therefore NOT run
+      in this leg. The position list (T7) follows for the speed; a
     paged indexer cache (B) remains the route to multi-lane QSA if wanted.
   - The export flag `--qsa` (default off, so existing artifacts and the arch
     hash do not move) records `qsa` in the manifest and feeds the indexer
