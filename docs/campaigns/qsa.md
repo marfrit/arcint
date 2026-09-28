@@ -102,6 +102,41 @@ and `src/core/artifact.cpp` (counts the QSA layers as served dense today).
    byte-exact against the un-paged stateful graph at the A770 floor.
 4. The gate's window.
 
+## Step 3 design — the served path (2026-09-28; operator decision owed)
+
+The served graph needs two things the paged path does not carry today.
+
+**1. The indexer's raw-key history per attention layer** (128 values a
+token; ~16 MB a layer at 32k tokens in f32).
+- **A. A plain state Variable in the paged model.** `SDPAToPagedAttention`
+  removes only the Assigns it matched and keeps the others (`code`,
+  `sdpa_to_paged_attention.cpp`: `var_ids_to_remove`), provided the state is
+  not gathered by `beam_idx`, whose parameter the pass deletes. It is the
+  cheapest route. But a Variable is one per infer request, not one per
+  sequence, so QSA would serve one lane only, and the prefix cache and
+  KV checkpoints would not cover the history without extra runtime code.
+- **B. A paged indexer cache** beside the key and value caches, keyed by the
+  same block tables: every serving feature kept. It is a new cache kind
+  through the pass, the plugin and arcint's cache ledger (the GDN states'
+  paged ops are the precedent).
+
+**2. The selection into paged attention.**
+- `PagedAttentionExtension` has no input for it, and no kernel reads one:
+  `qq_bias` covers only new tokens, sliding windows are contiguous, and
+  XAttention is prefill-only and xe2-only (`code`).
+- Both routes need a core-op input (an optional last input), the pass to
+  wire the indexer's output into it, and the decode (`pa_sdpa_opt`) and
+  prefill kernels to honour it.
+- **As a mask** it is correct but reads every key.
+- **As a list of the selected positions** (2,048 + the tail, a count known
+  host-side) the decode reads 2,051 keys instead of N. That is QSA's
+  long-context saving.
+
+**Recommendation:** A + the mask first, for correctness on the served path
+at one lane (Flash-Next serves one lane today), then the position list for
+the speed, then B if multi-lane QSA is wanted. Each step is a card window
+against the step-2 graph (byte-exact on the A770).
+
 ## Invariants
 
 DESIGN §3.4: the selection is a pure function of the tokens (ties included,
