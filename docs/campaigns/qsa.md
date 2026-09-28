@@ -393,6 +393,45 @@ answer must not move.
       dev tree's `build-prod` with `ENABLE_TESTS=ON`; its `ov_gpu_unit_tests`
       runs with `--device_suffix=1` (the deterministic card) and `=0`.
       The host paths live in the operator-local notes.
+  - 2026-09-28. **T3b landed: the route gate makes the below-boundary invariant
+    hold by construction** (`measured-here`, `ov_gpu_unit_tests`, both cards;
+    patch 0073 now carries T2+T3+T3b).
+    - **Why.** T3 left a route-parity risk: below 2,051 the mask is exactly
+      causal, but QSA disabled micro and routed a past-0 prefill through
+      MIXED, so the 29-input graph ran different kernels than the dense
+      28-input one -- a <=1-ulp f16 shift that compounds with depth (the B60
+      record: 0.14 nats and 10-15% argmax flips at depth 48). Accepting that
+      floor would change the campaign's own below-2,051 invariant, so it is
+      fixed by construction instead.
+    - **Mechanism.** The exporter writes the boundary
+      `block_topk * ratio + ratio - 1` (2051) as `rt_info:qsa_boundary` on the
+      marked mask; the pass copies it onto the PagedAttention node; the
+      primitive carries it. `qsa_above_boundary` reads the call's own
+      `max_context_len` from the kernel's memory deps. At or below the
+      boundary the impl keeps today's stage (PREFILL stays PREFILL) and
+      `can_use_micro_sdpa_for` leaves micro available -- the mask is a no-op
+      and the route equals the dense graph's. Above the boundary micro is
+      taken away and a QSA prefill is routed through MIXED, so the opt kernel
+      reads the mask. An unknown boundary (0) or an absent `max_context_len`
+      is treated as above (read the mask), never silently ignored.
+    - **Red first.** The prior control cell asserted a 2e-4 floor on the MIXED
+      params; T3b's cell asserts byte-identity at or below the boundary. Red
+      before the gate (measured 2.0e-6 at 128/2048, 3.0e-5 at 2100/0), green
+      now.
+    - **Measured.** `regression_paged_attention_qsa` reports 8 passed / 2
+      skipped on the A770 and the B60. `selection_is_honoured` now skips at or
+      below the boundary (a pruned mask is not a valid case there) and passes
+      above it; the causal-equal control asserts `max_delta == 0` on every
+      below-boundary param -- including the new MIXED `{{128, 1900}}` (total
+      2,028) -- and the f16 floor only on the above-boundary MIXED params,
+      where the route legitimately differs because QSA prunes.
+      `*paged_attention*` has no failures on either card. The Python cell
+      `test_qsa_route_gate_boundary_is_on_the_marked_mask` pins the rt_info
+      boundary at 2051, red when the exporter omits it.
+    - **For T6.** DESIGN §3.4's byte-identity below 2,051 now holds by
+      construction: the dense and QSA graphs take the same route there. Above
+      the boundary the comparison is KL, not bytes, which is where the gate
+      reads.
   - 2026-09-28. **T4 landed: the runtime accepts the indexer state and refuses
     what option A cannot honour** (`measured-here`: the C++ unit ladder, no
     card).

@@ -980,6 +980,35 @@ def test_qsa_served_mask_is_exactly_causal_below_the_2051_boundary(cfg):
                 f"T={T}: the first pruned row did not appear -- boundary moved")
 
 
+def test_qsa_route_gate_boundary_is_on_the_marked_mask(cfg):
+    """T3b cell: the exporter also writes the route gate's boundary on the
+    same marked mask -- block_topk * ratio + ratio - 1, 2051 for this config.
+    The pass copies it to the PagedAttention node and the GPU impl keeps
+    today's route (micro included) at or below it, reading the mask only
+    above it. Red first: without the rt_info the pass leaves the PA node at
+    boundary 0, which the impl treats as "above" and the byte-identity below
+    the boundary fails (T3's control cell measured the floor there)."""
+    from openvino import opset13 as op
+    from q4e import serving_shape as ss
+    ratio = int(cfg.indexer_compress_ratio)
+    block_topk = int(cfg.indexer_budget) // ratio
+    expected = block_topk * ratio + ratio - 1
+    H = cfg.hidden_size
+    hp = op.parameter([1, -1, H], ov.Type.f32)
+    pp = op.parameter([1, -1], ov.Type.i64)
+    cos_np, sin_np = qattn._freqs_tables(cfg, 2048)
+    rc, rs = op.constant(cos_np), op.constant(sin_np)
+    st = {"indexer.index_qk_proj.weight": np.zeros((5 * 128, H), np.float32),
+          "indexer.q_layernorm.weight": np.zeros((128,), np.float32),
+          "indexer.k_layernorm.weight": np.zeros((128,), np.float32)}
+    sinks = []
+    mask = ss._qsa_indexer_mask_served(hp, pp, cfg, st, 3, sinks, rc, rs)
+    ri = mask.get_rt_info()
+    assert "arcint" in ri and ri["arcint"].astype(str) == "qsa_selection", ri
+    assert "qsa_boundary" in ri, ri
+    assert ri["qsa_boundary"].astype(int) == expected == 2051, ri
+
+
 def test_qsa_off_leaves_the_serving_shape_graph_unchanged():
     """T1a cell 2: the qsa flag is additive. With `qsa=False` (the default)
     the serving-shape backbone carries NO indexer Variable and NO

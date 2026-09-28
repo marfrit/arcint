@@ -36,20 +36,24 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   1–2 re-measured, parity unchanged up to exact ties.
 
 - **QSA served: the model's own selection reaches PagedAttention** (plugin
-  patch 0073, qsa step 3 T2+T3). `PagedAttentionExtension` gains an optional
+  patch 0073, qsa step 3 T2+T3+T3b). `PagedAttentionExtension` gains an optional
   LAST input, 28, a `[T_new, past + T_new]` u8 visibility mask; absent keeps
   the node at 28 inputs, so every existing artifact and arch hash is
   untouched. `SDPAToPagedAttention` wires an indexer mask tagged `rt_info
   arcint = "qsa_selection"` into it -- and drops any other (causal) mask
   exactly as before -- and the GPU plugin's opt kernels read it (single, GQA
   single, multi-token), setting a dropped key's score to
-  `SOFTMAX_ACCUMULATOR_VAL_MIN`. Micro-SDPA is taken away under QSA (it does
-  not read the mask) and a QSA prefill is routed through MIXED so one kernel
-  reads it. Measured: the GPU unit suite's QSA cells pass 8/8 on both cards
-  (decode 35, MIXED 128/2048, past-0 prefill 2100, GQA decode 5,001 with
-  fully masked partitions), and the whole `*paged_attention*` filter is 276
-  passed on each card, unchanged from the 28-input path. Needs a
-  `marfrit-openvino` `+p24` for release.
+  `SOFTMAX_ACCUMULATOR_VAL_MIN`. A route gate keeps the below-2,051 invariant
+  by construction: the exporter writes the boundary `block_topk * ratio +
+  ratio - 1` (2051) on the mask, the pass copies it to the node, and at or
+  below it the impl keeps today's route (micro included, the mask a no-op), so
+  the 29-input graph is byte-identical to the dense 28-input one; above it,
+  micro is taken away and a QSA prefill is routed through MIXED. Measured: the
+  GPU unit suite's QSA cells report 8 passed / 2 skipped on both cards (the
+  below-boundary pruned-mask case is not valid and is skipped; the above
+  cases pass), the causal-equal control is byte-identical on every
+  below-boundary param, and the whole `*paged_attention*` filter has no
+  failures on either card. Needs a `marfrit-openvino` `+p24` for release.
 
 - **QSA runtime: option A accepts the indexer state and refuses what it cannot
   honour** (campaign qsa step 3 T4; arcint-side, no plugin patch). The loader

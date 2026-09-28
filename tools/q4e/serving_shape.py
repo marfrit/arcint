@@ -2260,6 +2260,17 @@ def _qsa_indexer_mask_served(hidden, pid, config, state, layer, sinks,
     # the new PagedAttention input and never another model's. `op.transpose`
     # returns the NODE here (a single-output op), so rt_info is set on it.
     mask.set_rt_info("qsa_selection", "arcint")
+    # the route gate's boundary (qsa step 3, T3b): every row is dense (the
+    # selection keeps every causal key) iff T <= block_topk * ratio + ratio - 1
+    # -- 2051 for Flash-Next (CF-BOUNDS, measured 2026-09-12; attention.py's
+    # `_qsa_mask_dynamic` docstring, pin 757/684). The pass puts it on the
+    # PagedAttention node; the GPU impl keeps today's route (micro included,
+    # the mask a no-op) at or below it and reads the mask above it. Sentinel
+    # str: rt_info round-trips through the IR as text, and a missing value
+    # means "unknown" (read the mask).
+    ratio = int(config.indexer_compress_ratio)
+    block_topk = int(config.indexer_budget) // ratio
+    mask.set_rt_info(str(block_topk * ratio + ratio - 1), "qsa_boundary")
     return mask
 
 
