@@ -479,3 +479,12 @@ campaign's numeric gate in device-free form.
     - a layout-independent layer key in the plugin (it moves every baseline
       on a residency-dependent route, and the census seed key space);
     - the new-decode twins' KLD on the tier-only route.
+
+- 2026-09-28. **Paper trail closed; the gate verdict stands.** DESIGN
+  §7.0.2cg records the depth-4 gate (PASSED, byte-identical, 26.82 GiB off
+  the ledger), and §7.0.2cz records the full-depth window (staged 2.2–2.8x
+  faster, **gate FAILED**, cause localised to the static partition's
+  `.bin`-offset key on the dispatch route). CHANGELOG carries the staged-disk
+  subsection. The owed measurement legs listed just above (seeded dispatch-on
+  digests and KLD, the layout-independent layer key, the tier-only twins' KLD)
+  stay open and are not closed by this line.

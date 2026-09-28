@@ -113,3 +113,9 @@ change. A slot is a hit only for the identical span list. Everything else
 - Review (Fable, before commit): no blockers. Should-fix items 1–3 (drain
   leftover leases and callbacks, no queue drain at exit, construction failure
   logged once) and 4–5 (doc overclaim, fill read volume, OOM note) are applied.
+- 2026-09-28. **Closed.** DESIGN §7.0.2da records the defect, the levers that
+  did not work, the mechanism, the ten cells, the B60 window table and the
+  review; CHANGELOG carries the `+p23` line. The all-in-RAM repeat where the
+  bank is slightly slower than the mapping (29.48/30.39 s against 28.92 s)
+  stays an open finding with an unmeasured mechanism, recorded rather than
+  smoothed.

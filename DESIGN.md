@@ -11523,6 +11523,88 @@ gate at depth 4 on 2026-09-23 but had no full-depth artifact.
     - The census seed files (`# space=layer_key`) need a new key space or
       regeneration.
 
+#### 7.0.2da The CPU tier's experts come from a RAM bank filled at load: Flash-Next's first answer decodes 18-21 % faster (patch 0072, 2026-09-28)
+
+Campaign: `docs/campaigns/host-expert-bank.md`; plugin patch 0072
+(`moe/host_expert_bank.hpp`), CHANGELOG "expert bytes from a host RAM bank".
+The served Flash-Next measurement is the window table below (B60, both served
+units stopped).
+
+- **The defect.** [measured-here, code] The tier read every expert in place
+  from a shared mapping of the weight file (`ParallelWeightReader::mapped`,
+  `code`). Flash-Next's expert constants are 56.4 GiB; at ratio 78 the host
+  tier alone is ~47 GiB against a 52 GiB host, so the page cache cannot hold
+  it. On the B60 decode the 7 tier workers sample R 36 % / D 15-17 % / S 47 %,
+  every D sample in `folio_wait_bit_common`, and the decode reads 170-260 MB/s
+  at 1.5-1.9k major faults/s. The NVMe (PCIe 3.0 x4) reads 3.0-3.2 GB/s
+  sequential and 1.0-1.2 GB/s at 288 KiB random, one expert's tensor span.
+  Serving the same prompt twice in one process decodes 48.5 -> 29 s, so disk
+  is ~40 % of the cold decode; the D fraction understates it because idle
+  workers wait at the join for the one in IO.
+- **The levers that did NOT work.** [measured-here] `madvise(WILLNEED)` per
+  span at dispatch: no effect, 56.04 vs 56.27 s (the kernel caps one call at
+  `max(io_pages, ra_pages)` = 128 KiB, `code`). `read_ahead_kb` 4096: the
+  prefetch pays (47.55 s) but the plain path loses (64.73 s), because fault
+  readaround pulls 4 MiB of neighbours (~108 MB read per token against ~50).
+  Raising the host to 16 CPUs / 52 GiB from 8 / 44 took 56.27 -> 48.98 s.
+- **The mechanism.** [code] `moe/host_expert_bank.hpp` keeps expert records
+  in slots of one anonymous `MAP_NORESERVE` mapping (`MOE_CPU_BANK_BYTES`;
+  unset keeps the mapping path). A layer's first tier call queues a fill:
+  every expert the static partition does not pin to the card, in the rank of
+  `MOE_CPU_BANK_SEED`, at most `MOE_CPU_BANK_FILL_PER_LAYER`, each per-tensor
+  array read as one sequential O_DIRECT range from lowest to highest selected
+  expert -- so the read includes the card-resident experts' bytes (59.8 GiB
+  read for 56.4 GiB of constants) and the fill never evicts. A miss takes a
+  slot, LRU over unpinned slots of its size class, read with O_DIRECT on
+  `MOE_CPU_BANK_IO_THREADS` (8). A slot is a hit only for the identical span
+  list; no slot, a record being read, a failed read, or a filesystem that
+  refuses O_DIRECT all fall back to the mapping. The budget is
+  `MAP_NORESERVE`, so a budget above free memory ends in an OOM kill, not an
+  allocation error; each layer's fill adds one transient staging range.
+- **Cells.** [measured-here] Ten cells cover bytes at unaligned offsets and
+  at the file end, hits, LRU and pins, short reads, size classes, the fill's
+  bytes, its budget and once-per-layer run, and span mismatch. Each is red on
+  a named mutant: in-slot offset dropped, pinned slot evicted, failed read
+  served as ready, a record being read served, size classes ignored, fill
+  copy offset dropped, fill evicting, fill running twice, spans compared by
+  count only. The bytes are the file's, so the output is too (DESIGN §3.4).
+- **Served gate.** [measured-here, B60, `d48s2`, ratio 78 + tier +
+  per-expert dispatch, 12e9 device slot pool (0070), census112 seed, u8 paged
+  KV, 16 CPUs / 52 GiB] Each leg is one fresh process serving "Hello" then a
+  second prompt, 257 greedy tokens each; text byte-identical across arms on
+  both prompts:
+
+  | arm | load to READY | decode "Hello" | decode 2nd prompt | bank |
+  |---|---|---|---|---|
+  | mapping (no bank) | 88 s | 48.55 s | 34.62 s | -- |
+  | 40 GiB, 360/layer | 105 s | 40.42 s | 34.11 s | budget out at 44 of 48 layers; 4,033 demand reads |
+  | 46 GiB, 370/layer | 109 s | 38.18 s | 33.77 s | 16,374 filled; 2,161 demand reads, 0 evictions |
+  | 46 GiB, reviewed build | 110 s | 39.66 s | 34.72 s | 16,030 filled; 2,506 demand reads, 0 evictions |
+  | 46 GiB, final build | 105 s | 38.90 s | 33.77 s | 16,136 filled; 2,399 demand reads, 0 evictions |
+
+  At 46 GiB the fill read 59.8 GiB sequentially and added ~21 s to the load;
+  the minimum MemAvailable was 5.6-7.4 GB, the operator's margin on this host
+  and not a property of the patch. **Gate met** (-18 to -21 %). How many
+  experts the fill installs depends on how it races the load's own demand
+  reads, so the filled count is a range, not a constant.
+- **The all-in-RAM repeat.** [measured-here] Serving "Hello" twice in one
+  process puts every expert it routes to in RAM for the second pass. That
+  pass decodes in 28.92 s on the mapping and 29.48 s (32 GiB) / 30.39 s
+  (46 GiB) with the bank, so the bank is slightly slower there. The tier's
+  decode-only compute is 1.14 ms per layer call for 7.57 experts (the
+  counter difference between a one-request and a two-request process) -- the
+  tier bench's figure, so the served "2x bench" gap was the disk. A token
+  now costs ~118 ms (2.46 ms per layer), about half CPU tier and half GPU
+  plus sync. [not measured] Why the bank loses in that repeat; candidates
+  are huge-page coverage of the bank and memory pressure at a 46 GiB
+  reservation.
+- **Review.** [measured-here] Review (Fable, before commit): no blockers;
+  should-fix 1-3 (drain leftover leases and callbacks, no queue drain at
+  exit, construction failure logged once) and 4-5 (doc overclaim, fill read
+  volume, OOM note) are applied. The reviewed build is the fourth table row.
+- [measured-here] Series 0003-0072 applies byte-identical to the built tree;
+  the patch needs a `marfrit-openvino` `+p23` for release.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,
