@@ -355,7 +355,39 @@ answer must not move.
       link is broken by a stale snippets archive, unrelated to this change,
       so only the `openvino` and `openvino_intel_gpu_plugin` targets were
       rebuilt. The plugin unit ladder for the PA tests is therefore NOT run
-      in this leg. The position list (T7) follows for the speed; a
+      in this leg.
+  - 2026-09-28. **T3 in progress: the plumbing and the red-first cells are
+    done and measured; the kernel READ is the remaining work.**
+    - **Build.** The tests-enabled OpenVINO build now exists:
+      `/models/ov/ovsrc-dbg/build-prod` reconfigured with
+      `-DENABLE_TESTS=ON -DENABLE_FUNCTIONAL_TESTS=OFF`, reusing its
+      objects, and `ov_gpu_unit_tests` built (129 MB). The CPU-plugin link
+      failure was a stale `libopenvino_snippets.a`; deleting and rebuilding
+      that target fixed it (the archive grew 11.9 -> 12.7 MB).
+    - **Plumbing (measured, in the dev tree, NOT committed).** The primitive
+      accepts 28 or 29 with `has_qsa_selection`; the plugin op sets it; the
+      unit harness feeds input 28 as a `[T_new, past+T_new]` u8 visibility
+      mask and `PagedAttentionReference` applies the same selection on top of
+      the causal mask.
+    - **Red-first cells (measured on the dev host's GPU).**
+      `regression_paged_attention_qsa/paged_attention_qsa_test.selection_is_honoured`
+      with a decode (`{{1, 35}}`) and a multi-token chunk (`{{128, 2048}}`)
+      FAILED before the kernel read: the plugin compiles and runs with input
+      28 present but ignores it, so the output is dense causal and the
+      pruned reference mismatches (0.0147 at index 1, 0.0021 at index 51;
+      tolerance 0.002). The kernel dumps show `sdpa_micro` and
+      `paged_attention_opt` routes both compiled, so every route that can run
+      a QSA layer must read the mask, or refuse loudly at compile.
+    - **The remaining work.** `paged_attention_opt.cl` already has the exact
+      insertion site: `token_idx` is the absolute key position, next to the
+      existing `token_idx >= seq_len` and `HAS_QQ_BIAS` sites that set
+      `qk_acc = SOFTMAX_ACCUMULATOR_VAL_MIN`. The mask read needs the query
+      row (0 for the single-token decode; the new-token index for the
+      multi-token stage), the generator arguments and jit constants, and a
+      loud refusal in the `sdpa_micro` / any other route that cannot read it.
+      A card window was used (both resident services stopped and restored).
+      These dev-tree edits are uncommitted on purpose: without the kernel read
+      they would be a silent fallback. The position list (T7) follows for the speed; a
     paged indexer cache (B) remains the route to multi-lane QSA if wanted.
   - The export flag `--qsa` (default off, so existing artifacts and the arch
     hash do not move) records `qsa` in the manifest and feeds the indexer
