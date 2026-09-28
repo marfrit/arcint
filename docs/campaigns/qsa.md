@@ -490,8 +490,13 @@ answer must not move.
       1.78 GiB (0.5 KiB/token)` beside the KV term, i.e. the T4 ledger works
       on the real artifact. The chat cell returns finite text (garbage, as
       depth 4 of 48 must). The d48q8qsa Paris cell is the T6 leg.
-    - **Owed.** The d48q8qsa boot and its Paris/T6 comparison, in the T6
-      window.
+    - **Served (d48q8qsa).** 36 GDN + 12 attn layers, `QSA served: 12 indexer
+      state layer(s), 6.0 KiB/token; one lane, no prefix cache, no paged
+      speculation`; the reservation line prints `+ QSA state 4.47 GiB (6.0
+      KiB/token)`. On the B60 with `--offload-ratio 78 --moe-cpu-tier
+      --moe-per-expert-dispatch`, the Paris cell answers **Paris**. Both T5
+      artifacts therefore boot and answer; the byte-exact T6 comparison below
+      2,051 is the next leg.
   - The export flag `--qsa` (default off, so existing artifacts and the arch
     hash do not move) records `qsa` in the manifest and feeds the indexer
     tensors through `gguf_feed` (`self_attn.indexer.*`; the two norm gammas
