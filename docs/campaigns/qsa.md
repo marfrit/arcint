@@ -483,7 +483,15 @@ answer must not move.
       `src/core/model_registry.cpp` gain `qwen3.8-flash-next-d4qsa` and
       `qwen3.8-flash-next-d48q8qsa`; `tests/test_registry.cpp` reads 27 ids and
       pins both hashes. The registry ladder is green (21 cases).
-    - **Owed.** The Paris cell per artifact, in the T6 window.
+    - **Served (d4qsa).** Built arcint from this tree against the staged
+      `ov-0073` runtime and booted the depth-4 artifact on the A770
+      (`--mtp off --ngram-gguf /flash-model/ngram/…`). `/props` reports
+      `qsa: true, n_qsa_layer: 1`; the reservation line prints `+ QSA state
+      1.78 GiB (0.5 KiB/token)` beside the KV term, i.e. the T4 ledger works
+      on the real artifact. The chat cell returns finite text (garbage, as
+      depth 4 of 48 must). The d48q8qsa Paris cell is the T6 leg.
+    - **Owed.** The d48q8qsa boot and its Paris/T6 comparison, in the T6
+      window.
   - The export flag `--qsa` (default off, so existing artifacts and the arch
     hash do not move) records `qsa` in the manifest and feeds the indexer
     tensors through `gguf_feed` (`self_attn.indexer.*`; the two norm gammas
