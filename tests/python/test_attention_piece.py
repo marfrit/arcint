@@ -84,6 +84,7 @@ see tests/python/q4e_device.py for why an unconfigured GPU compile runs f16.
 """
 import glob
 import hashlib
+import math
 import os
 import sys
 from pathlib import Path
@@ -648,3 +649,114 @@ def test_dense_attention_piece_graph_cost(cfg, attn_state, device):
         f"compile={compile_s:.2f}s\n"
         f"[attn-cost]   {', '.join(f'{k} {v}' for k, v in top)}\n")
     assert nodes > 0 and const_bytes > 0
+
+
+# --------------------------------------------------------------------------- #
+# 6. QSA EMITTED: the indexer's selection against the pin's, above the boundary
+# --------------------------------------------------------------------------- #
+def _pin_block_scores(idx, hidden, cs, row, T):
+    """The pin's own block scores for one query row (pin 707-755): its
+    projections, norms, pooling, rope and relu-sum, for the complete blocks the
+    row sees."""
+    with torch.no_grad():
+        qk = idx.index_qk_proj(hidden)
+        q, tk = torch.split(qk, [idx.index_n_heads * idx.index_head_dim, idx.index_head_dim], dim=-1)
+        q = q.reshape(1, T, -1, idx.index_head_dim)
+        raw = tk.reshape(1, T, -1, idx.index_head_dim).squeeze(2)
+        q = idx.q_layernorm(q)
+        q = pin_mod.apply_rotary_pos_emb(q, cos=cs[0], sin=cs[1], unsqueeze_dim=2)
+        nblk = (row + 1) // idx.compress_ratio
+        if nblk == 0:
+            return np.zeros(0, np.float32)
+        blocks = torch.arange(nblk * idx.compress_ratio).view(nblk, idx.compress_ratio)
+        kg = raw[0].index_select(0, blocks.flatten()).view(nblk, idx.compress_ratio, -1).float().mean(1)
+        kg = idx.k_layernorm(kg)
+        kb = pin_mod.apply_rotary_pos_emb(kg.unsqueeze(1), cos=cs[0][0].index_select(0, blocks[:, 0]),
+                                          sin=cs[1][0].index_select(0, blocks[:, 0])).squeeze(1)
+        sc = torch.matmul(q[0, row].float(), kb.float().transpose(-1, -2)).transpose(-1, -2)
+        return (torch.relu(sc).sum(-1) / math.sqrt(idx.index_head_dim)).numpy()
+
+
+@_skip_shards
+@pytest.mark.parametrize("T", [2052, 2080, 4096])
+def test_qsa_attention_piece_selects_what_the_pin_indexer_selects(cfg, attn_state,
+                                                                  indexer_state, T):
+    """The emitted indexer (`build_qsa_attention_model`, attention.py
+    `_qsa_additive_mask`) against the pin's REAL `Qwen4ExpTextQSAIndexer` on the
+    same fed blk.3 tensors, above the 2,051-token boundary where the indexer
+    prunes (max(0, T - 2051) rows; cell 3). Two gates:
+
+      * SELECTION, equality up to exact ties: the keys each query keeps -- the
+        pin's indexer mask added to the causal one (pin 857-858) against the
+        emitted mask -- differ only in rows where every differing block scores
+        EXACTLY the cut value (relu makes zero scores common; the pin leaves
+        the order among equal scores to torch.topk, unspecified; the emitter
+        keeps the lower block index). The dense emitter differs on T - 2051
+        rows with real score gaps (the red case: its mask is causal).
+      * OUTPUT: on the rows without a tie the emitted block sits within the
+        yardstick ceiling of the pin's own f32 QSA forward.
+    CPU plugin (f32)."""
+    hidden = _hidden(cfg, T)
+    pid = np.arange(T, dtype=np.int64).reshape(1, T)
+    state = dict(attn_state)
+    state.update(indexer_state)
+    model = qattn.build_qsa_attention_model(cfg, state, T, with_mask=True)
+    compiled = compile_for(ov.Core(), model, "CPU")
+    res = compiled([hidden.numpy(), pid])
+    ov_out = np.asarray(res[0])
+    ov_mask = np.asarray(res[1])[0, 0]
+
+    m = _pin_attention(cfg, attn_state, indexer_state, False, torch.float32)
+    cs = _cos_sin(cfg, T, torch.float32)
+    causal = _causal(T, torch.float32)
+    with torch.no_grad():
+        pin_sel = m.indexer(hidden, cs, causal, None)
+        p32, _ = m(hidden, cs, causal, None)
+    p32 = p32.numpy()
+    causal_ok = causal.numpy()[0, 0] == 0
+    pin_allowed = (pin_sel.numpy()[0, 0] == 0) & causal_ok
+    ov_allowed = ov_mask == 0
+    pruned = int(np.any(pin_allowed != causal_ok, axis=1).sum())
+    differ = np.nonzero(np.any(pin_allowed != ov_allowed, axis=1))[0]
+    ratio = int(cfg.indexer_compress_ratio)
+    block_topk = int(cfg.indexer_budget) // ratio
+    tie_rows, real_rows = [], []
+    for r in differ:
+        sc = _pin_block_scores(m.indexer, hidden, cs, int(r), T)
+        nblk = len(sc)
+        # a tie needs differing BLOCKS, all at the cut score, and an identical
+        # tail/remainder (tokens ratio*nblk..T-1); anything else is real
+        same_tail = np.array_equal(pin_allowed[r, nblk * ratio:], ov_allowed[r, nblk * ratio:])
+        if nblk == 0 or not same_tail:
+            real_rows.append(int(r))
+            continue
+        cut = np.sort(sc)[::-1][min(block_topk, nblk) - 1]
+        pb = pin_allowed[r, :nblk * ratio].reshape(nblk, ratio).all(1)
+        ob = ov_allowed[r, :nblk * ratio].reshape(nblk, ratio).all(1)
+        diff_blocks = np.nonzero(pb != ob)[0]
+        is_tie = diff_blocks.size > 0 and bool(np.all(sc[diff_blocks] == cut))
+        (tie_rows if is_tie else real_rows).append(int(r))
+    # the kept block count per row is the pin's min(block_topk, complete blocks)
+    # (pin 757) whatever the ties -- a mask that keeps an extra tied block (the
+    # dense one, at the first pruned row) is not a tie-order difference
+    nb_all = T // ratio
+    kept = ov_allowed[:, :nb_all * ratio].reshape(T, nb_all, ratio).all(2)
+    nblk_row = (np.arange(T) + 1) // ratio
+    kept_ok = kept.sum(1) == np.minimum(block_topk, nblk_row)
+    bad_count = np.nonzero(~kept_ok)[0]
+    clean = np.ones(T, bool)
+    clean[differ] = False
+    d_clean = float(np.max(np.abs(ov_out[0, clean] - p32[0, clean])))
+    sys.stdout.write(
+        f"\n[qsa-emitted] T={T} rows pruned by the pin {pruned} (boundary predicts "
+        f"{max(0, T - 2051)})  selection rows differing {len(differ)}/{T}: exact ties "
+        f"at the cut {len(tie_rows)}, real {len(real_rows)}  |ov-pinQSA32| on the "
+        f"other rows {d_clean:.3e}\n")
+
+    assert pruned == max(0, T - 2051), "the pin's own boundary moved -- stop"
+    assert bad_count.size == 0, (
+        f"T={T}: {bad_count.size} rows keep a block count other than min({block_topk}, blocks)")
+    assert not real_rows, (
+        f"T={T}: the emitted selection differs from the pin's beyond exact ties on rows {real_rows[:8]}")
+    assert d_clean <= _YARDSTICK_CEILING, (
+        f"T={T}: the emitted QSA block is {d_clean:.3e} from the pin's f32 QSA forward")

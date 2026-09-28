@@ -9382,6 +9382,8 @@ differ by `KL(A‖B)` mean **0.1361 (w0) / 0.1512 (w1)**, max |logit diff|
 flip their top token. The decided bound (3.0905e-03 below 2051, 2.6946e-02 at or above it)
 sits ~44x under that floor, so clause (d) of window-051 read **UNREADABLE on that card**.
 
+[DATED 2026-09-28: the "above 2051" bar 2.6946e-02 adds a max-abs block-output difference (the QSA price) to a KL bar in nats; the units do not mix and the bar is **withdrawn**. The served KL above 2051 stays owed as a measurement: `docs/campaigns/qsa.md`.]
+
 [DATED CORRECTION 2026-09-25: the card named in this section as `acm-g12` is
 **ACM-G10** (DG2-512; PCI `0x56A0`). `acm-g12` is a DIFFERENT DG2 die
 (DG2-256, 16 Xe-cores, shipped in Arc Pro A60 / A570M / A530M). Both are

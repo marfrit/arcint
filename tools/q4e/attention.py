@@ -120,6 +120,7 @@ Entry points:
 import numpy as np
 from openvino import Model, Type
 from openvino import opset13 as op
+from openvino import opset11 as _opset11   # TopK with `stable` (the QSA tie rule)
 
 from .gdn import (_add, _c, _i, _mm, _mul, _reshape, _rmean, _rsqrt_eps,  # noqa: F401
                   _slice, _transpose)
@@ -253,9 +254,108 @@ def _repeat_heads_h(x, kv_heads, heads, r, T):
                     [1, heads, T, x.shape[3]])     # pin 791
 
 
-def _attention_subgraph(hidden, pid_node, config, state, T):
+def _rope_last(x, cos, sin, rotary):
+    """pin 653-668 (apply_rotary_pos_emb) on ONE tensor whose cos/sin are
+    already broadcast-shaped: the leading `rotary` band rotated, the rest kept."""
+    d = x.get_output_partial_shape(0)[-1].get_length()
+    xr, xn = _slice(x, 0, rotary, 1, -1), _slice(x, rotary, d, 1, -1)
+    xr = _add(_mul(xr, cos), _mul(_rotate_half(xr), sin))
+    return op.concat([xr, xn], axis=-1)
+
+
+def _qsa_additive_mask(hidden, pid_node, config, state, T, cosT_c, sinT_c, rotary):
+    """The QSA indexer (pin 673-779, `Qwen4ExpTextQSAIndexer`) for one static
+    prefill of T tokens, as the additive [1, 1, T, T] mask the pin adds to the
+    causal one (pin 857-858): 0.0 where a query keeps a key, finfo(f32).min
+    elsewhere. Static T turns the pin's per-query Python loop into tensors:
+
+      * q, raw key: the fused index_qk_proj split [n_heads*d | kv*d] (pin
+        707-711); q through q_layernorm and the rope at its own position
+        (pin 712-714); the key stays RAW (pin 711; the cache keeps it raw).
+      * blocks: a query i sees tokens 0..i (causal), so its complete blocks
+        are b < (i+1)//ratio and block b is tokens ratio*b..ratio*b+ratio-1 for
+        EVERY query -- one pooled key per block serves all rows: the f32 mean
+        (pin 743), k_layernorm (pin 744), the rope at the group's first
+        position (pin 745-749).
+      * scores: relu(q_h . k_b) summed over the index heads in head order, then
+        DIVIDED by sqrt(d) (pin 750-755) -- a division, as the pin writes it.
+      * selection: topk(min(block_topk, num_complete_blocks)) (pin 757) as ONE
+        TopK over [T, blocks] with k = min(block_topk, blocks) and every block
+        a row cannot see at -inf; a -inf pick is never kept, so a row with
+        fewer complete blocks than k keeps exactly its complete blocks. Equal
+        scores at the cut keep the lower block index (the pin leaves that
+        order to torch.topk, which does not specify it).
+      * the incomplete tail (pin 762) is kept unconditionally.
+    Every row is dense iff T <= block_topk*ratio + ratio - 1 (2051 here)."""
+    nh = int(config.indexer_n_heads)
+    dh = int(config.indexer_head_dim)
+    assert int(config.indexer_kv_heads) == 1, (
+        f"the indexer emits ONE raw key per token (pin 709-711); config says "
+        f"{config.indexer_kv_heads}")
+    ratio = int(config.indexer_compress_ratio)
+    block_topk = int(config.indexer_budget) // ratio          # pin 684
+    eps = config.rms_norm_eps
+    minf = np.float32(np.finfo(np.float32).min)
+    rows = np.arange(T)
+    nblk_row = (rows + 1) // ratio                            # complete blocks per query
+    # the tail: tokens ratio*nblk_i .. i (pin 762)
+    j = np.arange(T)
+    tail = (j[None, :] >= (ratio * nblk_row)[:, None]) & (j[None, :] <= rows[:, None])
+    nb = T // ratio
+    if nb == 0:
+        m = np.where(tail, np.float32(0.0), minf).astype(np.float32)
+        return _c(m.reshape(1, 1, T, T))
+
+    qk = _mm(hidden, _c(state["indexer.index_qk_proj.weight"]), tb=True)   # [1,T,(nh+kv)*dh]
+    q = _reshape(_slice(qk, 0, nh * dh, 1, 2), [1, T, nh, dh])
+    kraw = _slice(qk, nh * dh, (nh + 1) * dh, 1, 2)                       # [1,T,dh]
+    q = _rmsnorm_hd(q, state["indexer.q_layernorm.weight"], eps, dh)      # pin 713
+    cos_q = _reshape(op.gather(cosT_c, pid_node, op.constant(np.int64(0))), [1, T, 1, rotary])
+    sin_q = _reshape(op.gather(sinT_c, pid_node, op.constant(np.int64(0))), [1, T, 1, rotary])
+    q = _rope_last(q, cos_q, sin_q, rotary)                               # pin 714
+
+    kb = _reshape(_slice(kraw, 0, nb * ratio, 1, 1), [1, nb, ratio, dh])
+    kb = op.reduce_mean(kb, op.constant(np.int64(2)), keep_dims=False)    # pin 743: f32 mean
+    kb = _reshape(kb, [1, nb, 1, dh])
+    kb = _rmsnorm_hd(kb, state["indexer.k_layernorm.weight"], eps, dh)    # pin 744
+    starts = op.gather(pid_node, op.constant(np.arange(0, nb * ratio, ratio, dtype=np.int64)),
+                       op.constant(np.int64(1)))                          # [1, nb]
+    cos_b = _reshape(op.gather(cosT_c, starts, op.constant(np.int64(0))), [1, nb, 1, rotary])
+    sin_b = _reshape(op.gather(sinT_c, starts, op.constant(np.int64(0))), [1, nb, 1, rotary])
+    kb = _reshape(_rope_last(kb, cos_b, sin_b, rotary), [nb, dh])         # pin 745-749
+
+    s = op.matmul(_reshape(q, [T, nh, dh]), kb, False, True)             # [T, nh, nb]
+    s = op.relu(s)
+    acc = _slice(s, 0, 1, 1, 1)                                           # pin 755: sum over heads
+    for h in range(1, nh):
+        acc = _add(acc, _slice(s, h, h + 1, 1, 1))
+    s = op.divide(_reshape(acc, [T, nb]), _c(np.float32(np.sqrt(dh))))   # pin 755: / sqrt(d)
+
+    visible = np.arange(nb)[None, :] < nblk_row[:, None]                  # [T, nb]
+    s = op.select(op.constant(np.ascontiguousarray(visible)), s, _c(np.float32(-np.inf)))
+    k = min(block_topk, nb)
+    # Ties: relu makes exactly-zero scores common, and when they straddle the
+    # cut the pin's torch.topk picks among them in an unspecified order
+    # (measured: every emitted-vs-pin difference at T=2052/2080/4096 is such a
+    # tie). The rule here is fixed and documented instead: among equal scores
+    # the LOWER block index is kept (TopK stable, sorted by value).
+    tk = _opset11.topk(s, op.constant(np.int64(k)), 1, "max", "value", Type.i64, stable=True)
+    kept = op.convert(op.is_finite(tk.output(0)), Type.f32)               # a -inf pick is not a block
+    blocksel = op.scatter_elements_update(_c(np.zeros((T, nb), np.float32)), tk.output(1), kept,
+                                          op.constant(np.int64(1)))       # [T, nb] 0/1
+    tokensel = _reshape(op.concat([_reshape(blocksel, [T, nb, 1])] * ratio, axis=2), [T, nb * ratio])
+    if nb * ratio < T:
+        tokensel = op.concat([tokensel, _c(np.zeros((T, T - nb * ratio), np.float32))], axis=1)
+    allowed = op.maximum(tokensel, _c(tail.astype(np.float32)))
+    mask = op.select(op.greater(allowed, _c(np.float32(0.5))), _c(np.float32(0.0)), _c(minf))
+    return _reshape(mask, [1, 1, T, T])
+
+
+def _attention_subgraph(hidden, pid_node, config, state, T, qsa=False, mask_sink=None):
     """hidden [1,T,H] f32 + position_ids [1,T] i64 -> attn_out [1,T,H]. The
-    dense-causal block: pin 864-900 minus the indexer (pin 855-860)."""
+    dense-causal block: pin 864-900 minus the indexer (pin 855-860). With
+    `qsa`, the indexer's mask (_qsa_additive_mask) replaces the causal one;
+    `mask_sink` (a list) receives it, for the cells."""
     H = config.hidden_size
     heads = config.num_attention_heads
     kv = config.num_key_value_heads
@@ -299,9 +399,17 @@ def _attention_subgraph(hidden, pid_node, config, state, T):
     # additive mask is baked: 0.0 allowed, finfo(f32).min strictly above the
     # diagonal -- the value the pin's eager path carries (it converts the bool
     # mask with torch.finfo(dtype).min).
-    causal = np.triu(np.full((T, T), np.float32(np.finfo(np.float32).min),
-                             np.float32), 1)
-    scores = _add(scores, _c(causal.reshape(1, 1, T, T)))
+    if qsa:
+        # the QSA mask already carries the causal one: it keeps only visible
+        # keys (its blocks and tail lie at or before the query)
+        mask = _qsa_additive_mask(hidden, pid_node, config, state, T, _c(cosT), _c(sinT), rotary)
+    else:
+        causal = np.triu(np.full((T, T), np.float32(np.finfo(np.float32).min),
+                                 np.float32), 1)
+        mask = _c(causal.reshape(1, 1, T, T))
+    if mask_sink is not None:
+        mask_sink.append(mask)
+    scores = _add(scores, mask)
     att = op.softmax(scores, -1)                            # pin 811 (f32)
     out = _mm(att, v)                                       # pin 813
     out = _transpose(out, [0, 2, 1, 3])                     # pin 814
@@ -331,4 +439,27 @@ def build_dense_attention_model(config, state, seq_len):
     return Model([res], [hidden, pid], "qwen4_exp_dense_attention")
 
 
-__all__ = ["build_dense_attention_model", "emit_dense_attention", "_freqs_tables"]
+def build_qsa_attention_model(config, state, seq_len, with_mask=False):
+    """The attention block WITH its QSA indexer (static T). `state` carries the
+    six attention tensors and the indexer's three (indexer.index_qk_proj.weight,
+    indexer.q_layernorm.weight, indexer.k_layernorm.weight). With `with_mask`,
+    a second result `qsa_mask` [1, 1, T, T] is the additive selection mask."""
+    T = int(seq_len)
+    H = config.hidden_size
+    hidden = op.parameter([1, T, H], Type.f32)
+    hidden.set_friendly_name("hidden_states")
+    pid = op.parameter([1, T], Type.i64)
+    pid.set_friendly_name("position_ids")
+    sink = []
+    out = _attention_subgraph(hidden, pid, config, state, T, qsa=True, mask_sink=sink)
+    res = op.result(out)
+    res.set_friendly_name("output")
+    results = [res]
+    if with_mask:
+        mres = op.result(sink[0])
+        mres.set_friendly_name("qsa_mask")
+        results.append(mres)
+    return Model(results, [hidden, pid], "qwen4_exp_qsa_attention")
+
+
+__all__ = ["build_dense_attention_model", "build_qsa_attention_model", "emit_dense_attention", "_freqs_tables"]

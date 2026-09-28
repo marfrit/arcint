@@ -150,6 +150,8 @@ f16-served. The inherited 0.0599 is SUPERSEDED BY LINEAGE and decides
 nothing here. Any KL reading must print `F_served` beside it; a bar below
 `F_served` is UNREADABLE, not PASS.
 
+[DATED 2026-09-28: the "above 2051" bar 2.6946e-02 adds a max-abs block-output difference (the QSA price) to a KL bar in nats; the units do not mix and the bar is **withdrawn**. The served KL above 2051 stays owed as a measurement: `docs/campaigns/qsa.md`.]
+
 ## Acceptance rows (EMPTY until measured)
 
 | quantity | predicted | measured |

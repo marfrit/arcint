@@ -127,6 +127,8 @@ a scale point, or the gate closes on the A770 alone.
 - **Note**: bars are PROVISIONAL on the f16-rows caveat of window-051 A.2 and
   are inherited unchanged here; this document does not re-decide them.
 
+> [DATED 2026-09-28: the "above 2051" bar adds the QSA price -- a **max-abs difference of one attention block's output** at T=2080 (window-050, `tools/q4e/attention.py`) -- to a KL bar in nats. The units do not mix, so 2.6946e-02 is not a KL quantity and is **withdrawn** as a bar; the served KL above 2051 stays owed as a measurement. See `docs/campaigns/qsa.md`.]
+
 ### Row 3 — prefill t/s against the compile physics
 
 The feature's own criterion is **structural**: the prefill graph is
