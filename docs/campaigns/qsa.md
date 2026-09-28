@@ -307,6 +307,16 @@ answer must not move.
     prefix cache, KV checkpoints or MTP rejection yet, so a `--qsa` artifact
     is safe only in a cold, one-lane run until T4 lands the refusals -- do
     not register one (T5) before the gate (T6).
+  - 2026-09-28. **T1b done, option A** (`measured-here`, device-free, the
+    pinned OpenVINO pass).
+    `test_qsa_indexer_state_survives_the_paged_attention_pass`:
+    `SDPAToPagedAttention` consumes the KV pair into `key_cache.0` /
+    `value_cache.0` and deletes `beam_idx`, while the indexer's ReadValue and
+    its Assign (`cache_params.past.indexer_key.3`) stay in place -- the
+    plain-Variable route is well-formed after the pass, as
+    `sdpa_to_paged_attention.cpp`'s `var_ids_to_remove` implies. Red first: a
+    mutant gathering that Variable by `beam_idx` makes the pass refuse the
+    model (`Model references undeclared parameters: beam_idx`).
   - The export flag `--qsa` (default off, so existing artifacts and the arch
     hash do not move) records `qsa` in the manifest and feeds the indexer
     tensors through `gguf_feed` (`self_attn.indexer.*`; the two norm gammas

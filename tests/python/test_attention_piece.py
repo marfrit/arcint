@@ -1051,3 +1051,35 @@ def test_qsa_served_attention_consumes_the_marked_mask():
     on, off = build(True), build(False)
     assert marked_spda(on) == 1, "the QSA mask is built but not consumed by the SDPA"
     assert marked_spda(off) == 0
+
+
+def test_qsa_indexer_state_survives_the_paged_attention_pass():
+    """T1b (option A): the pass `SDPAToPagedAttention` removes only the KV
+    Assigns it matched (`var_ids_to_remove`); the indexer's ReadValue and its
+    Assign must survive it, and the plain Variable must not be gathered by
+    `beam_idx` (whose Parameter the pass deletes -- a gathered Variable would
+    lose its input and the transformed graph would not be well-formed). The
+    KV pair is consumed into the paged cache ports and `beam_idx` disappears;
+    the indexer state stays. A mutant that gathers the indexer Variable by
+    `beam_idx` fails this cell (and the pass)."""
+    from openvino._offline_transformations import paged_attention_transformation
+    from q4e import serving_shape as ss
+    arena = ss.SparseArena()
+    try:
+        model, _ = ss.build_serving_shape_ir(arena=arena, n_layers=4, qsa=True)
+        paged_attention_transformation(model)
+        ops = model.get_ops()
+        var = "cache_params.past.indexer_key.3"
+        assert any(n.get_type_name() == "ReadValue" and n.get_variable_id() == var
+                   for n in ops), "the indexer ReadValue did not survive the pass"
+        assert any(n.get_type_name() == "Assign" and n.get_variable_id() == var
+                   for n in ops), "the indexer Assign did not survive the pass"
+        # the KV state is consumed into the paged caches, and beam_idx is gone
+        live = {n.get_variable_id() for n in ops if n.get_type_name() == "ReadValue"}
+        assert "cache_params.past.key.3" not in live
+        assert "cache_params.past.value.3" not in live
+        names = {p.get_node().get_friendly_name() for p in model.inputs}
+        assert "beam_idx" not in names
+        assert any(n.startswith("key_cache") for n in names)
+    finally:
+        arena.close()
