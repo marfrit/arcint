@@ -391,6 +391,16 @@ def build_parser():
                          "checkpoint's own bytes, against f16's 2; a projection that is not exactly "
                          "carriable stays as it was and is reported. Runs before --dense-u8 when "
                          "both are given. Implies --dense-fp16 for everything else.")
+    ap.add_argument("--qsa", action="store_true",
+                    help="serve Flash-Next's 12 full-attention layers with the "
+                         "model's own Qwen Sparse Attention selection (campaign "
+                         "qsa, step 3): emit the indexer beside each attention "
+                         "layer, carry its raw-key history in a plain state "
+                         "Variable, and replace the baked causal mask with the "
+                         "indexer's per-query additive mask. Off by default so "
+                         "existing artifacts do not change and the arch hash "
+                         "moves only for QSA exports. Below 2,051 tokens every "
+                         "row is dense by construction.")
     ap.add_argument("--skip-hash", action="store_true",
                     help="do not sha256 the written IR files (the manifest "
                          "then says so)")
@@ -410,6 +420,9 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.dense_u8 or args.dense_q8:
         args.dense_fp16 = True          # the rest of the graph's f32 Constants go f16
+    if args.qsa and args.family == "qwen35moe":
+        raise SystemExit("--qsa is the Flash-Next (qwen4_exp) indexer; "
+                         "qwen35moe has none")
     if args.segment_layers is not None and (args.segment_layers <= 0
                                             or args.segment_layers % 4):
         ap.error("--segment-layers must be a positive multiple of 4")
@@ -527,7 +540,8 @@ def main(argv=None):
                 model, rep = ss.build_serving_shape_ir(
                     arena=arena, n_layers=args.layers, filler=filler, feed=feed,
                     layer_range=None if args.segment_layers is None else (lo, hi),
-                    expert_ports=sink, ngram_staging_rows=ngram_staging_rows(args))
+                    expert_ports=sink, ngram_staging_rows=ngram_staging_rows(args),
+                    qsa=args.qsa)
         except Exception as exc:                                  # noqa: BLE001
             say("build", f"FAIL segment {k} layers {lo}..{hi - 1}: {type(exc).__name__}: {exc}")
             arena.close()
@@ -727,6 +741,7 @@ def main(argv=None):
         "sha256": hashes if hashes else "skipped (--skip-hash)",
         "compress_to_fp16": bool(args.dense_fp16),
         "dense_u8": dense_u8_reports if (args.dense_u8 or args.dense_q8) else None,
+        "qsa": bool(args.qsa),
     }
     (out / "serving-shape.json").write_text(json.dumps(manifest, indent=2) + "\n")
     say("done", f"{out} peak_host_GiB={peak_rss_gib():.2f}")

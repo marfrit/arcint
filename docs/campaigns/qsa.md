@@ -249,3 +249,65 @@ answer must not move.
     undone (`measured-here`). The 2.385560e-02 on record was drawn at
     692c0a6 with all four q/k gammas folded twice, so the two figures do not
     isolate either fix. The bar built on it is withdrawn anyway (above).
+- 2026-09-28. **Step-3 pre-flight (T0) and the served indexer (T1a).**
+  - **Operator decision owed; default A in force.** How the indexer's
+    raw-key history lives in the paged model -- A, a plain state Variable
+    (one lane, the prefix cache and KV checkpoints not covered without
+    runtime code), or B, a paged indexer cache beside K/V -- was asked and
+    is not yet answered, so the decision-independent work proceeded on the
+    recorded recommendation: A + the mask first. See the step-3 design note
+    above.
+  - **Upstream check** (`code`): the pinned `paged_attention.hpp`
+    (the pinned tree) and upstream OpenVINO `master` are byte-identical
+    (sha256 `ee721fc5…`, both 28 inputs); the file's last change is
+    2026-05-13 (`18742d7213`), after which nothing was added. No sparse /
+    XAttention / "selected blocks" input exists upstream beyond the pin's
+    own 17-19 (`xattention_*`) and 25 (`token_type_ids`). The selection thus
+    takes a NEW last input -- index 28 -- which is the append a later
+    upstream input would collide with; stated as such, not hidden.
+  - **T1a done.** The served emitter (`emit_stateful_attention(qsa=True)`)
+    carries the indexer through the same `q4e.attention._qsa_mask_dynamic`
+    the step-2 graph runs -- one function, not a copy -- over the whole
+    raw-key history in a PLAIN state Variable
+    (`cache_params.past.indexer_key.N`, deliberately NOT gathered by
+    `beam_idx`, whose Parameter the pass deletes), and replaces the baked
+    causal mask with the token-major selection `[T,1,1,N]`. The indexer is a
+    standalone emitter (`_qsa_indexer_mask_served`) so it can be RUN without
+    that function's token-major KV Concat, which is well-formed only after
+    `SDPAToPagedAttention` (the CPU plugin refuses the pre-pass graph; the
+    served attention core's own numerics are T2/T6's).
+    - `test_qsa_served_indexer_selects_what_the_step2_stateful_graph_selects`
+      (`measured-here`, CPU, real blk.3 tensors): 2,048 + 40 + 12x1 tokens,
+      the served mask BIT-IDENTICAL to
+      `build_qsa_stateful_attention_model`'s at every chunk (max|d| 0.0).
+      Mutant (pooled from the current chunk only, history dropped) fails by
+      assertion: shape [1,1,40,40] vs [1,1,40,2088].
+    - `test_qsa_served_mask_is_exactly_causal_below_the_2051_boundary`
+      (`measured-here`): at T=2051 the served mask equals the dense causal
+      mask exactly; at T=2052 the first pruned row appears. The boundary is
+      derived (`block_topk*ratio + ratio - 1 = 2051`), not tuned.
+    - `test_qsa_off_leaves_the_serving_shape_graph_unchanged`: `qsa=False`
+      adds no indexer Variable and no `qsa_selection` marker and matches the
+      default build's node count and constant bytes; `test_serving_shape.py`
+      stays green (37 passed, 1 skipped).
+    - C++ `artifact_counts_qsa_layers_only_when_the_manifest_declares_them`:
+      `serving-shape.json` `qsa:true` makes `n_qsa_layer == n_attn_layer`,
+      without it 0. Red first, shown by dropping the manifest read
+      (`arcint-test`: 600 cases, 1 failed).
+  - **T1a review refinements** (same day). Added
+    `test_qsa_served_attention_consumes_the_marked_mask`: the marker must
+    reach the SDPA's attention-mask input (input 3), not merely exist --
+    red-first, shown by a mutant handing the SDPA the causal mask (failed,
+    measured). The served indexer now asserts `norm_plus_one` (a
+    plus_one=False family would diverge silently from
+    `_qsa_mask_dynamic`), and `artifact.cpp` counts EVERY attention layer of
+    a QSA manifest, not only those spelled `qwen_sparse_attention`. A parser
+    cell asserts `--qsa` defaults off and is refused for qwen35moe.
+    **Caveat on the record:** option A's plain Variable is not covered by the
+    prefix cache, KV checkpoints or MTP rejection yet, so a `--qsa` artifact
+    is safe only in a cold, one-lane run until T4 lands the refusals -- do
+    not register one (T5) before the gate (T6).
+  - The export flag `--qsa` (default off, so existing artifacts and the arch
+    hash do not move) records `qsa` in the manifest and feeds the indexer
+    tensors through `gguf_feed` (`self_attn.indexer.*`; the two norm gammas
+    are kind `gamma1`, the stored (1 + w) undone, never a raw GGUFReader).

@@ -1251,10 +1251,16 @@ def _fill_dense(st, feed, prefix, census):
         census.append((prefix + key, int(buf.nbytes)))
 
 
-def _layer_state(arena, config, kind, layer=None, feed=None, census=None):
+def _layer_state(arena, config, kind, layer=None, feed=None, census=None,
+                 qsa=False):
     """Sparse-declared state for one decoder layer, at the pin's own
     module-relative keys, real shapes from `config`. With `feed` the buffers
-    are written from the real shards (`_fill_dense`)."""
+    are written from the real shards (`_fill_dense`). With `qsa`, a
+    full-attention layer also declares the indexer's three tensors (the fused
+    `index_qk_proj`, `[n_heads + 1] * head_dim` rows, and the two norm
+    gammas), filled through the feed's `self_attn.indexer.*` map (kind
+    `gamma1` for the gammas -- the stored (1 + w) undone, never a raw
+    GGUFReader)."""
     H = config.hidden_size
     hc = config.hc_count
     lr = config.hc_lowrank
@@ -1297,6 +1303,13 @@ def _layer_state(arena, config, kind, layer=None, feed=None, census=None):
         st["self_attn.o_proj.weight"] = arena.f32([H, heads * d])
         st["self_attn.q_norm.weight"] = arena.f32([d])
         st["self_attn.k_norm.weight"] = arena.f32([d])
+        if qsa:
+            nh_i = int(config.indexer_n_heads)
+            dh_i = int(config.indexer_head_dim)
+            st["self_attn.indexer.index_qk_proj.weight"] = arena.f32(
+                [(nh_i + 1) * dh_i, H])
+            st["self_attn.indexer.q_layernorm.weight"] = arena.f32([dh_i])
+            st["self_attn.indexer.k_layernorm.weight"] = arena.f32([dh_i])
 
     Is = config.shared_expert_intermediate_size
     st["mlp.gate.weight"] = arena.f32([config.num_experts, H])
@@ -1333,7 +1346,7 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
                            filler=None, feed=None,
                            ngram_chunk_cap_bytes=NGRAM_CHUNK_CAP_BYTES,
                            rope_span=None, layer_range=None, expert_ports=None,
-                           ngram_staging_rows=None):
+                           ngram_staging_rows=None, qsa=False):
     """The full-geometry serving-shape backbone as an ov::Model, DYNAMIC IN T
     (feed-the-ports increment): no port, reshape or slice carries the block
     length. `T` below is the runtime token count of a forward.
@@ -1537,7 +1550,7 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
             for i in range(lo, hi):        # GLOBAL layer indices
                 kind = "attn" if (i % 4) == 3 else "gdn"
                 kinds.append(kind)
-                st = _layer_state(ar, cfg, kind, i, feed, dense_census)
+                st = _layer_state(ar, cfg, kind, i, feed, dense_census, qsa=qsa)
 
                 if has_ple and i == ple_layer_idx:
                     # pin 1283: hidden = hidden + ple(...), ADDITIVE
@@ -1564,7 +1577,7 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
                 else:
                     g = emit_stateful_attention(
                         h, pid, cfg, _strip(st, "self_attn."), i, beam,
-                        attn_mask, sinks, rope_cos, rope_sin)
+                        attn_mask, sinks, rope_cos, rope_sin, qsa=qsa)
                 hidden = _recombine(hyper, inj, g, cfg, T)
                 # named so a card-side localiser can cut the graph here
                 # (tools/boot_serving_shape.py --cut); names only, no op
@@ -1615,6 +1628,7 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
         nodes, const_bytes, counts = pwe.graph_measures(model)
         report = {
             "n_layers": nl,
+            "qsa": bool(qsa),
             "layer_range": [lo, hi],
             "segment_first": bool(first),
             "segment_last": bool(last),
@@ -1691,6 +1705,20 @@ def _kv_variable(layer, tag, kv_heads, head_dim):
     info.data_shape = ov.PartialShape([-1, kv_heads, -1, head_dim])
     info.data_type = Type.f32
     info.variable_id = f"cache_params.past.{tag}.{layer}"
+    return ovutil.Variable(info)
+
+
+def _indexer_variable(layer, head_dim):
+    """The indexer's raw-key history as a PLAIN state Variable -- qsa step 3,
+    option A: rank 3 [1, -1, dh], one lane, deliberately NOT gathered by
+    `beam_idx` (the pass deletes that Parameter, so a gathered Variable would
+    lose its input). `SDPAToPagedAttention` removes only the KV Assigns it
+    matched (`sdpa_to_paged_attention.cpp`, `var_ids_to_remove`), so this
+    Variable and its Assign survive the transformation."""
+    info = ovutil.VariableInfo()
+    info.data_shape = ov.PartialShape([1, -1, head_dim])
+    info.data_type = Type.f32
+    info.variable_id = f"cache_params.past.indexer_key.{layer}"
     return ovutil.Variable(info)
 
 
@@ -2184,8 +2212,60 @@ def stateful_gdn_core(layer, beam, sinks):
     return emit
 
 
+def _qsa_indexer_mask_served(hidden, pid, config, state, layer, sinks,
+                             rope_cos, rope_sin):
+    """The served emitter's QSA indexer as a STANDALONE subgraph: `hidden`
+    [1, T, H] and `pid` [1, T] in, the token-major additive mask [T, 1, 1, N]
+    out, with the raw-key history assigned to a plain state Variable in
+    `sinks`. The algebra is `q4e.attention._qsa_mask_dynamic`'s, called here
+    rather than copied. It is separate from `emit_stateful_attention` so the
+    indexer can be RUN without that function's token-major KV concat, which
+    is well-formed only after `SDPAToPagedAttention`; the served attention
+    core therefore has no runtime witness before step 2's pass (T2/T6), and
+    the indexer's own selection does."""
+    nh_i = int(config.indexer_n_heads)
+    dh_i = int(config.indexer_head_dim)
+    eps = config.rms_norm_eps
+    rotary = int(rope_cos.get_output_shape(0)[-1])
+    T = -1
+    i64 = lambda v: op.constant(np.array(v, np.int64))
+    assert int(config.indexer_kv_heads) == 1, (
+        f"the indexer emits ONE raw key per token (pin 709-711); config "
+        f"says {config.indexer_kv_heads}")
+    assert getattr(config, "norm_plus_one", True), (
+        "the indexer's gammas are the folded (1 + w) RMSNorm (pin 171); a "
+        "plus_one=False family would silently diverge from "
+        "q4e.attention._qsa_mask_dynamic and is refused under qsa")
+    qk = qgdn._mm(hidden, qattn._c(state["indexer.index_qk_proj.weight"]),
+                  tb=True)                                            # [1,T,(nh+1)*dh]
+    qi = qgdn._reshape(qgdn._slice(qk, 0, nh_i * dh_i, 1, 2),
+                       [1, T, nh_i, dh_i])
+    raw = qgdn._slice(qk, nh_i * dh_i, (nh_i + 1) * dh_i, 1, 2)           # [1,T,dh]
+    qi = qattn._rmsnorm_hd(qi, state["indexer.q_layernorm.weight"], eps,
+                           dh_i, getattr(config, "norm_plus_one", True))
+    cq = qgdn._reshape(op.gather(rope_cos, pid, i64(0)), [1, T, 1, rotary])
+    sq = qgdn._reshape(op.gather(rope_sin, pid, i64(0)), [1, T, 1, rotary])
+    qi = qattn._rope_last(qi, cq, sq, rotary)
+    rvar = _indexer_variable(layer, dh_i)
+    rinit = op.broadcast(op.constant(np.array(0.0, np.float32)), i64([1, 0, dh_i]))
+    raw_full = op.concat([op.read_value(rinit, rvar), raw], axis=1)       # [1,N,dh]
+    assign = op.assign(raw_full, rvar)
+    assign.set_friendly_name(f"attn{layer}/qsa_indexer_assign")
+    sinks.append(assign)
+    mask = qattn._qsa_mask_dynamic(qi, raw_full, pid, config,
+                                   rope_cos, rope_sin, rotary, state)
+    mask = op.transpose(mask, op.constant(np.array([2, 1, 0, 3], np.int32)))
+    mask.set_friendly_name(f"attn{layer}/qsa_mask")
+    # the exporter's marker (qsa step 3, T2): the pass routes THIS mask into
+    # the new PagedAttention input and never another model's. `op.transpose`
+    # returns the NODE here (a single-output op), so rt_info is set on it.
+    mask.set_rt_info("qsa_selection", "arcint")
+    return mask
+
+
 def emit_stateful_attention(hidden, pid, config, state, layer, beam,
-                            attn_mask, sinks, rope_cos, rope_sin):
+                            attn_mask, sinks, rope_cos, rope_sin, qsa=False,
+                            mask_sink=None):
     """The full-attention layer in the STATEFUL shape the serving path's own
     transformation converts, at real geometry.
 
@@ -2262,6 +2342,27 @@ def emit_stateful_attention(hidden, pid, config, state, layer, beam,
     q.set_friendly_name(f"attn{layer}/q_rope")            # localiser cut points
     k.set_friendly_name(f"attn{layer}/k_rope")
 
+    # ------------------------------------------------------------------ QSA
+    # (window-050 §8; qsa step 3). With `qsa`, the layer carries the model's
+    # OWN selection: the indexer (pin 673-779) emits a per-query additive
+    # mask over the whole key history, and that mask replaces the baked
+    # causal one. The indexer body is `q4e.attention`'s -- `_qsa_mask_dynamic`
+    # is called, not copied, so ONE function carries the rule for the parity
+    # cells (step 2) and for the served graph here. It is a standalone
+    # emitter (`_qsa_indexer_mask_served`) so the served indexer can be built
+    # and run WITHOUT the KV concat above, which is only well-formed after
+    # `SDPAToPagedAttention`. The raw keys ride a PLAIN state Variable beside
+    # the KV pair (option A): it is not gathered by `beam_idx`, which the pass
+    # deletes, and the pass keeps Variables it did not match. The mask is
+    # [1, 1, T, N] where N is the raw-key history; transposed to the SDPA's
+    # token-major [T, 1, 1, N] here.
+    qsa_mask = None
+    if qsa:
+        qsa_mask = _qsa_indexer_mask_served(hidden, pid, config, state,
+                                            layer, sinks, rope_cos, rope_sin)
+        if mask_sink is not None:
+            mask_sink.append(qsa_mask)
+
     # TOKEN-MAJOR AT THE SDPA, and only here (increment 5, read off the
     # device and then off the pass). `SDPAToPagedAttention` flattens the SDPA's
     # q/k/v for the PagedAttentionExtension with `Reshape [0, -1]`
@@ -2319,9 +2420,12 @@ def emit_stateful_attention(hidden, pid, config, state, layer, beam,
     total = op.gather(op.shape_of(full[0], output_type="i64"), i64([2]), i64(0))
     n_vec = op.unsqueeze(n_tok, i64(0))                      # [1]: the token count
     past_len = op.subtract(total, n_vec)
-    mask = op.reshape(_additive_causal_mask(n_tok, total, past_len),
-                      op.concat([n_vec, i64([1, 1]), total], axis=0),
-                      special_zero=False)
+    if qsa:
+        mask = qsa_mask                                   # [T?, 1, 1, TOTAL]
+    else:
+        mask = op.reshape(_additive_causal_mask(n_tok, total, past_len),
+                          op.concat([n_vec, i64([1, 1]), total], axis=0),
+                          special_zero=False)
     att = op.scaled_dot_product_attention(
         q,
         _repeat_kv_broadcast(full[0], kv, heads, d),
@@ -2699,6 +2803,7 @@ def build_qwen35moe_serving_shape_ir(config=None, arena=None, n_layers=None,
         nodes, const_bytes, counts = pwe.graph_measures(model)
         report = {
             "n_layers": nl,
+            "qsa": False,          # qwen35moe has no indexer; mirror the qwen4_exp keys
             "layer_range": [0, depth],
             "segment_first": True,
             "segment_last": True,

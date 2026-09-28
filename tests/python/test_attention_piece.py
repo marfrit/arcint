@@ -841,3 +841,213 @@ def test_qsa_stateful_piece_matches_the_pin_with_its_cache(cfg, attn_state, inde
         assert d_clean <= _YARDSTICK_CEILING, f"chunk past={past} T={T}: output {d_clean:.3e} from the pin"
         past = N
     sys.stdout.write(f"\n[qsa-stateful] {N_all} tokens, tie rows {ties_total}\n")
+
+
+# --------------------------------------------------------------------------- #
+# 8. QSA ON THE SERVED PATH: the served emitter's indexer (qsa step 3, T1a)
+#
+# `q4e.serving_shape.emit_stateful_attention(qsa=True)` calls the SAME
+# `q4e.attention._qsa_mask_dynamic` the step-2 graph does, and carries the raw
+# keys in a PLAIN state Variable (`cache_params.past.indexer_key.N`, NOT
+# gathered by `beam_idx`). The served attention CORE cannot be run before the
+# paged pass: its KV Concat joins a [1, kv, past, d] history with a token-major
+# [T, kv, 1, d] current key and only `SDPAToPagedAttention` makes those leading
+# axes agree (measured: CPU shape inference refuses the pre-pass graph). So the
+# served side's own runtime witness here is the INDEXER'S SELECTION, which has
+# no KV operand; the served attention core's byte-exactness is step 2's pass
+# (T2) and the card window (T6).
+# --------------------------------------------------------------------------- #
+def _served_indexer_mask_model(cfg, attn_state, indexer_state, layer,
+                               rope_span):
+    """The served emitter's standalone indexer (`_qsa_indexer_mask_served`)
+    as an ov.Model: inputs `hidden_states` [1, T, H] f32 and `position_ids`
+    [1, T] i64, result `qsa_mask` [T, 1, 1, N], with the raw-key Assign in
+    the model's sinks."""
+    from openvino import opset13 as op
+    from q4e import serving_shape as ss
+    H = cfg.hidden_size
+    hidden = op.parameter([1, -1, H], ov.Type.f32)
+    hidden.set_friendly_name("hidden_states")
+    pid = op.parameter([1, -1], ov.Type.i64)
+    pid.set_friendly_name("position_ids")
+    cos_np, sin_np = qattn._freqs_tables(cfg, rope_span)
+    rope_cos, rope_sin = op.constant(cos_np), op.constant(sin_np)
+    state = {}
+    state.update({k: np.ascontiguousarray(v, np.float32)
+                  for k, v in attn_state.items()})
+    state.update({k: np.ascontiguousarray(v, np.float32)
+                  for k, v in indexer_state.items()})
+    sinks = []
+    mask = ss._qsa_indexer_mask_served(hidden, pid, cfg, state, layer,
+                                       sinks, rope_cos, rope_sin)
+    res = op.result(mask)
+    res.set_friendly_name("qsa_mask")
+    return ov.Model([res], sinks, [hidden, pid], "qsa_served_indexer")
+
+
+def _causal_additive(T, N, past):
+    """The dense-causal additive mask a served chunk at `past` would carry:
+    [1, 1, T, N], 0 where the key is at or before the query's absolute
+    position, finfo(f32).min above."""
+    rows = np.arange(past, past + T)[:, None]
+    cols = np.arange(N)[None, :]
+    vis = cols <= rows
+    return np.where(vis, np.float32(0.0),
+                    np.float32(np.finfo(np.float32).min))[None, None]
+
+
+@_skip_shards
+def test_qsa_served_indexer_selects_what_the_step2_stateful_graph_selects(
+        cfg, attn_state, indexer_state):
+    """T1a cell 1: the served emitter's indexer against the step-2 stateful
+    reference, same chunks ([2048, 40] + [1] x 12), across the 2,051 boundary.
+    The selection -- the additive per-query mask -- is BIT-IDENTICAL, because
+    both sides call `q4e.attention._qsa_mask_dynamic`; the served side differs
+    only in that it is token-major ([T, 1, 1, N]) and its raw keys ride
+    `cache_params.past.indexer_key.3`. A served emitter that baked the causal
+    mask, dropped the raw-key history, or transposed the wrong axes reds this
+    cell. CPU plugin (f32).
+
+    BLIND SPOT, stated rather than hidden: both sides call the same
+    `_qsa_mask_dynamic`, so a mutant INSIDE that function is invisible here;
+    it is guarded transitively by the step-1 pin cell and
+    `test_qsa_stateful_piece_matches_the_pin_with_its_cache`. This cell is a
+    wrapper check -- that the served emitter reaches the same algebra over the
+    same history -- not an algebra check."""
+    chunks = [2048, 40] + [1] * 12
+    N_all = sum(chunks)
+    hidden_all = _hidden(cfg, N_all)
+    state = dict(attn_state)
+    state.update(indexer_state)
+    ref = qattn.build_qsa_stateful_attention_model(cfg, state, N_all, with_mask=True)
+    rr = compile_for(ov.Core(), ref, "CPU").create_infer_request()
+    served = _served_indexer_mask_model(cfg, attn_state, indexer_state, 3, N_all)
+    sr = compile_for(ov.Core(), served, "CPU").create_infer_request()
+    past = 0
+    for T in chunks:
+        N = past + T
+        h = hidden_all[:, past:N]
+        pid = np.arange(past, N, dtype=np.int64).reshape(1, T)
+        ref_mask = np.asarray(rr.infer({0: h.numpy(), 1: pid})[1])       # [1,1,T,N]
+        got = np.asarray(sr.infer({0: h.numpy(), 1: pid})[0])           # [T,1,1,N]
+        got = np.transpose(got, (2, 1, 0, 3))                           # [1,1,T,N]
+        assert got.shape == ref_mask.shape, (got.shape, ref_mask.shape)
+        assert np.array_equal(got, ref_mask), (
+            f"chunk past={past} T={T}: the served mask differs from the step-2 "
+            f"stateful mask (max|d| {np.max(np.abs(got - ref_mask)):.3e})")
+        past = N
+
+
+def test_qsa_served_mask_is_exactly_causal_below_the_2051_boundary(cfg):
+    """T1a cell 3: below 2,051 tokens every row keeps every visible key, so
+    the served indexer's mask EQUALS the dense causal mask exactly -- which is
+    why the served answer must not move there (DESIGN 3.4). At T=2052 the
+    first pruned row (i=2051) appears and the masks differ. The boundary is
+    derived, not tuned: block_topk * ratio + ratio - 1 = 2048 + 4 - 1."""
+    from openvino import opset13 as op
+    from q4e import serving_shape as ss
+    cfg_dense = cfg
+    # a shared, non-degenerate hidden is not needed: equality is structural
+    g = np.random.default_rng(20260928)
+    ratio = int(cfg_dense.indexer_compress_ratio)
+    block_topk = int(cfg_dense.indexer_budget) // ratio
+    boundary = block_topk * ratio + ratio - 1
+    for T in (boundary, boundary + 1):
+        hidden = (g.standard_normal((1, T, cfg_dense.hidden_size)) * 0.02).astype(np.float32)
+        pid = np.arange(T, dtype=np.int64).reshape(1, T)
+        H = cfg_dense.hidden_size
+        hp = op.parameter([1, -1, H], ov.Type.f32)
+        pp = op.parameter([1, -1], ov.Type.i64)
+        cos_np, sin_np = qattn._freqs_tables(cfg_dense, T)
+        rc, rs = op.constant(cos_np), op.constant(sin_np)
+        # zero indexer weights are enough: the SELECTION's visibility is what
+        # is asserted, and at/below the boundary it is every visible block
+        st = {"indexer.index_qk_proj.weight": np.zeros((5 * 128, H), np.float32),
+              "indexer.q_layernorm.weight": np.zeros((128,), np.float32),
+              "indexer.k_layernorm.weight": np.zeros((128,), np.float32)}
+        sinks = []
+        mask = ss._qsa_indexer_mask_served(hp, pp, cfg_dense, st, 3, sinks, rc, rs)
+        r = op.result(mask)
+        m = ov.Model([r], sinks, [hp, pp], "boundary")
+        got = np.asarray(compile_for(ov.Core(), m, "CPU")([hidden, pid])[0])
+        got = np.transpose(got, (2, 1, 0, 3))
+        causal = _causal_additive(T, T, 0)
+        if T == boundary:
+            assert np.array_equal(got, causal), (
+                f"T={T} (the boundary): the served mask is not the causal mask")
+        else:
+            assert not np.array_equal(got, causal), (
+                f"T={T}: the first pruned row did not appear -- boundary moved")
+
+
+def test_qsa_off_leaves_the_serving_shape_graph_unchanged():
+    """T1a cell 2: the qsa flag is additive. With `qsa=False` (the default)
+    the serving-shape backbone carries NO indexer Variable and NO
+    `qsa_selection` rt_info and reports the same node count as the default
+    build -- so every existing artifact and the arch hash are untouched. With
+    `qsa=True` the indexer Variable appears per full-attention layer, the
+    marker is set, and the graph grows. The DEFAULT build's byte-shape guard
+    is the whole `test_serving_shape.py` contract suite (its structural counts
+    and the saved-graph checks), which this change leaves green; the check
+    that the marker reaches the ATTENTION CORE is
+    `test_qsa_served_attention_consumes_the_marked_mask`."""
+    from q4e import serving_shape as ss
+    def build(qsa):
+        arena = ss.SparseArena()
+        try:
+            return ss.build_serving_shape_ir(arena=arena, n_layers=4, qsa=qsa)
+        finally:
+            arena.close()
+    off, r_off = build(False)
+    default, r_def = build(False)
+    on, r_on = build(True)
+    assert r_off["nodes"] == r_def["nodes"]
+    assert r_off["graph_const_bytes"] == r_def["graph_const_bytes"]
+    assert r_off["inputs"] == r_def["inputs"]
+    assert r_off["qsa"] is False and r_on["qsa"] is True
+
+    def var_ids(model):
+        return sorted(v.get_info().variable_id for v in model.get_variables())
+    off_ids, on_ids = var_ids(off), var_ids(on)
+    assert not any("indexer_key" in i for i in off_ids), off_ids
+    assert sum("indexer_key" in i for i in on_ids) == r_on["attn_layers"] == 1, on_ids
+    assert "cache_params.past.indexer_key.3" in on_ids
+
+    def markers(model):
+        n = 0
+        for node in model.get_ops():
+            ri = node.get_rt_info()
+            if "arcint" in ri and ri["arcint"].astype(str) == "qsa_selection":
+                n += 1
+        return n
+    assert markers(off) == 0 and markers(on) == 1
+    assert r_on["nodes"] > r_off["nodes"]
+
+
+def test_qsa_served_attention_consumes_the_marked_mask():
+    """The served emitter must FEED the indexer's mask to the SDPA, not merely
+    build it: without this cell a mutant that emits the marker but hands the
+    SDPA the dense causal mask would pass every other T1a cell. Each
+    `ScaledDotProductAttention` in a qsa=True backbone has the marked mask
+    (`attn3/qsa_mask`, rt_info `arcint=qsa_selection`) as input 3 -- its
+    `attention_mask` operand; with qsa=False no SDPA carries a marked mask.
+    Depth 4 has exactly one attention layer."""
+    from q4e import serving_shape as ss
+    def build(qsa):
+        arena = ss.SparseArena()
+        try:
+            return ss.build_serving_shape_ir(arena=arena, n_layers=4, qsa=qsa)[0]
+        finally:
+            arena.close()
+    def marked_spda(model):
+        n = 0
+        for node in model.get_ops():
+            if node.get_type_name() != "ScaledDotProductAttention":
+                continue
+            ri = node.input_value(3).get_node().get_rt_info()
+            if "arcint" in ri and ri["arcint"].astype(str) == "qsa_selection":
+                n += 1
+        return n
+    on, off = build(True), build(False)
+    assert marked_spda(on) == 1, "the QSA mask is built but not consumed by the SDPA"
+    assert marked_spda(off) == 0
