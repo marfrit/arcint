@@ -435,6 +435,11 @@ json props(const Context& ctx) {
     model["n_layer"]       = maybe_int(st.n_layer);
     model["n_gdn_layer"]   = maybe_int(st.n_gdn_layer);
     model["n_attn_layer"]  = maybe_int(st.n_attn_layer);
+    // QSA (campaign qsa, step 3): whether the served graph actually bound an
+    // indexer, and how many layers carry one. `qsa` is the manifest flag
+    // resolved at load, not a Config default.
+    model["n_qsa_layer"]   = maybe_int(st.n_qsa_layer);
+    model["qsa"]           = st.qsa_enabled;
     model["weights_bytes"] = st.weights_bytes > 0 ? json(st.weights_bytes) : json(nullptr);
 
     // Keyed by the canonical id on purpose: the served name is presentation and

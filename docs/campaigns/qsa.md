@@ -393,6 +393,41 @@ answer must not move.
       dev tree's `build-prod` with `ENABLE_TESTS=ON`; its `ov_gpu_unit_tests`
       runs with `--device_suffix=1` (the deterministic card) and `=0`.
       The host paths live in the operator-local notes.
+  - 2026-09-28. **T4 landed: the runtime accepts the indexer state and refuses
+    what option A cannot honour** (`measured-here`: the C++ unit ladder, no
+    card).
+    - **Accept.** `load_paged` reads the indexer geometry off the served
+      graph's own Variables (`cache_params.past.indexer_key.<layer>`,
+      `[1, past, 128]` f32), not a config key, so the charge cannot drift:
+      12 x 128 x 4 B = 6 KiB/token (192 MiB at 32k). The ReadValue scan and
+      the `conv_proto`/`gdn_proto` classification already skip it (dynamic
+      seq dim, id not `.key.`), so the state tables keep their own shapes.
+    - **Refuse, loudly, before any compile.** `qsa_runtime.h`'s
+      `runtime_refusal` returns the message load_paged throws: lanes > 1
+      (`--parallel 1`); the prefix cache (its blob carries the KV pages and
+      the GDN rows but not the indexer Variable, so a hit would build the
+      selection from an empty/stale history); and paged speculative decoding
+      (--mtp/--dflash: a rejected draft has already appended raw keys, and
+      the paged rollback moves the committed GDN row back without trimming
+      that history).
+    - **Reset.** A paged lane's request lives across requests; the la_* port
+      tensors are zeroed per request but nothing cleared the graph Variable.
+      `generate_paged` now calls `lane.req.reset_state()` at past == 0 when
+      the model carries indexer state -- graph Variables only, so the KV
+      (ports) and the GDN/conv state (la_state_names_ tensors) are untouched.
+    - **Ledger.** `qsa_state_bytes_token_` is folded into the fit's
+      `kv_bytes_token` (never the true KV rate) and printed as
+      `+ QSA state X GiB (Y KiB/token)` beside the KV term.
+    - **/props.** `qsa` (on/off) and `n_qsa_layer`, resolved at load.
+    - **Red first.** `tests/test_qsa_runtime.cpp`: `state_bytes_per_token`
+      (6144), a synthetic graph with two indexer Variables and one KV
+      Variable (counts the indexer only), and one cell per refusal. Removing
+      the guard makes its cell fail (measured: 3/3 refusal cells red when
+      `runtime_refusal` returns nullopt); restored, 7/7 green. The whole OV
+      unit ladder reads 624 run / 1 failed, and that one failure
+      (`gguf_pass_neutralises_awq_multipliers_and_compares_norms`) reproduces
+      on a clean OV build at the same HEAD with the same runtime -- a
+      pre-existing environment mismatch, not this change.
   - The export flag `--qsa` (default off, so existing artifacts and the arch
     hash do not move) records `qsa` in the manifest and feeds the indexer
     tensors through `gguf_feed` (`self_attn.indexer.*`; the two norm gammas

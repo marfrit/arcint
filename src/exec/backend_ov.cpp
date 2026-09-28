@@ -88,6 +88,7 @@
 #include "core/sampler.h"
 #include "core/turnstile.h"
 #include "exec/backend.h"
+#include "exec/qsa_runtime.h"
 #include "exec/rope_precision.h"
 #include "util/log.h"
 
@@ -1066,6 +1067,8 @@ public:
             status_.n_layer          = artifact.n_layer;
             status_.n_gdn_layer      = artifact.n_gdn_layer;
             status_.n_attn_layer     = artifact.n_attn_layer;
+            status_.n_qsa_layer      = artifact.n_qsa_layer;
+            status_.qsa_enabled      = qsa_n_layer_ > 0;
             status_.mtp_enabled      = mtp_ready_;
             status_.weights_bytes    = artifact.weights_bytes;
             status_.sampler_defaults = artifact.sampler;
@@ -1321,6 +1324,8 @@ public:
         status_.n_layer          = artifact.n_layer;
         status_.n_gdn_layer      = artifact.n_gdn_layer;
         status_.n_attn_layer     = artifact.n_attn_layer;
+        status_.n_qsa_layer      = artifact.n_qsa_layer;
+        status_.qsa_enabled      = artifact.qsa;
         status_.mtp_enabled      = mtp_ready_;
         status_.weights_bytes    = artifact.weights_bytes;
         // What the retype above actually left in the graph, which is cfg.kv_dtype
@@ -1974,6 +1979,15 @@ private:
         // The lane's pages go back to the pool however this request ends —
         // finished, stopped, cancelled or thrown out of.
         LaneReset reset(*this, lane, stats);
+
+        // QSA option A: the indexer's raw-key history is a graph Variable, and
+        // a lane request lives across requests -- the la_* port tensors are
+        // zeroed per request (zero_paged_rows), but nothing else clears the
+        // Variable. Reset it here, at past == 0, or this sequence's selection
+        // would read the previous sequence's keys. reset_state() touches graph
+        // Variables only: the KV lives in ports and the GDN/conv state in
+        // la_state_names_ tensors, so this is exactly the new state.
+        if (qsa_n_layer_ > 0) lane.req.reset_state();
 
         // ------------------------------------------------------------ prefill
         const auto t_prefill = clock::now();
@@ -2706,6 +2720,34 @@ private:
         drafts_max_ = std::max<size_t>(draft_tokens_, want_mtp_ ? 1 : 0);
         if (want_dflash_) drafts_max_ = std::max(drafts_max_, dflash_block_ - 1);
         rows_per_lane_ = drafts_max_ + 3;
+
+        // QSA option A (campaign qsa, step 3 T4). The indexer's raw-key history
+        // is a graph Variable, not one of the la_* port tensors: read its
+        // geometry off the graph, charge it per token further down, and refuse
+        // the configurations that would corrupt it rather than serve a mask
+        // built from empty or stale raw keys. The refusal is here, before any
+        // compile, because a load that cannot honour the selection should fail
+        // fast and loud.
+        {
+            const qsa::StateGeometry qsa_geo = qsa::state_geometry(model);
+            qsa_n_layer_                   = qsa_geo.n_layer;
+            qsa_state_bytes_token_         = qsa_geo.bytes_per_token;
+            if (artifact_.qsa || qsa_n_layer_ > 0) {
+                qsa::RuntimeLimits lim;
+                lim.lanes        = lane_count_;
+                lim.prefix_cache = cfg.prefix_cache_mib > 0 || prefix_cache_ != nullptr;
+                // `speculative` is the paged path's own question: MTP and
+                // DFlash both verify drafts and can reject them, and the paged
+                // rollback moves the committed GDN row back -- it does not trim
+                // the indexer's appended raw keys.
+                lim.speculative = want_mtp_ || want_dflash_;
+                if (auto why = qsa::runtime_refusal(lim)) throw std::runtime_error(*why);
+                log::info("load",
+                          "QSA served: %zu indexer state layer(s), %.1f KiB/token; "
+                          "one lane, no prefix cache, no paged speculation",
+                          qsa_n_layer_, static_cast<double>(qsa_state_bytes_token_) / 1024.0);
+            }
+        }
         if (cfg.slice_logits) {
             const int64_t keep = static_cast<int64_t>(1 + drafts_max_);
             // Token axis 0: the paged export's hidden state is [tokens, 1, hidden].
@@ -4323,11 +4365,12 @@ private:
         fterms.activations    = static_cast<uint64_t>(std::max<long long>(activation_total, 0));
         fterms.slab_per_lane  = slab;
         // M11 §1.3: the real per-token KV-pool byte size, PLUS the MTP
-        // layer's own per-token state term when the MTP head is loaded --
+        // layer's own per-token state term when the MTP head is loaded, PLUS
+        // the QSA indexer's raw-key history when the artifact carries QSA.
         // `kv_bytes_token_` itself is left untouched (Phase E's own
         // allocation-overshoot math, further down, still needs the true
         // KV-pool rate, not this fit-only inflation).
-        fterms.kv_bytes_token = kv_bytes_token_ + mtp_state_bytes_token;
+        fterms.kv_bytes_token = kv_bytes_token_ + mtp_state_bytes_token + qsa_state_bytes_token_;
         fterms.margin         = margin;
         fterms.lanes           = lanes;
         fterms.kv_block_tokens = static_cast<int>(kv_block_tokens_);
@@ -4682,10 +4725,24 @@ private:
                               static_cast<double>(mtp_state_total_bytes) / (1u << 30),
                               static_cast<double>(mtp_state_bytes_token) / 1024.0)
                 : std::string();
+        // QSA option A: the indexer's raw-key history, folded into the fit's
+        // per-token rate above, reported here at the final `lanes * max_ctx`
+        // this line is about to print. Named next to the KV term it shares.
+        const uint64_t qsa_state_total_bytes =
+            qsa_state_bytes_token_ > 0
+                ? static_cast<uint64_t>(lanes) * static_cast<uint64_t>(max_ctx) *
+                      qsa_state_bytes_token_
+                : 0;
+        const std::string qsa_state_clause =
+            qsa_state_bytes_token_ > 0
+                ? log::format(" + QSA state %.2f GiB (%.1f KiB/token)",
+                              static_cast<double>(qsa_state_total_bytes) / (1u << 30),
+                              static_cast<double>(qsa_state_bytes_token_) / 1024.0)
+                : std::string();
         log::info("load",
                   "reservation: weights+graph %.2f GiB + drafters %.2f%s + expert slots %.2f (%s) "
                   "+ activations %.2f (all %d lane%s, chunk %zu)%s + margin %.2f + %d x (GDN "
-                  "rows %.1f MiB + KV %.1f KiB/token) of %.2f GiB -> max ctx %lld per lane",
+                  "rows %.1f MiB + KV %.1f KiB/token%s) of %.2f GiB -> max ctx %lld per lane",
                   static_cast<double>(resident_base) / (1u << 30),
                   static_cast<double>(drafter_bytes) / (1u << 30),
                   mtp_state_clause.c_str(),
@@ -4696,6 +4753,7 @@ private:
                   static_cast<double>(margin) / (1u << 30), lanes,
                   static_cast<double>(slab) / (1u << 20),
                   static_cast<double>(kv_bytes_token_) / 1024.0,
+                  qsa_state_clause.c_str(),
                   static_cast<double>(total) / (1u << 30), max_ctx);
         if (packed_values && packed_geom) {
             // Round-9 review (Opus), finding 4: `packed_values_log_per_
@@ -8032,6 +8090,13 @@ private:
     std::string                    gpu_plugin_build_;
     bool                           packed_values_mixed_stage_on_micro_ = false;
     size_t                         la_row_bytes_     = 0;
+    // QSA option A (campaign qsa, step 3 T4): the indexer's raw-key history,
+    // summarised by qsa::state_geometry from the served graph's own Variables.
+    // Zero for a non-QSA or pre-QSA artifact. Folded into the fit's per-token
+    // rate, never into kv_bytes_token_ (Phase E's allocation math still needs
+    // the true KV-pool rate).
+    size_t                         qsa_n_layer_           = 0;
+    uint64_t                       qsa_state_bytes_token_ = 0;
     size_t                         logits_keep_rows_ = 0;  // 0: unsliced
     size_t                         cache_grid_       = 0;  // paged snapshot grid; 0: the chunk
     ov::RemoteContext              usm_ctx_;              // for USM-host index inputs

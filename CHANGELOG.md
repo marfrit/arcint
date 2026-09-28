@@ -51,6 +51,16 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   passed on each card, unchanged from the 28-input path. Needs a
   `marfrit-openvino` `+p24` for release.
 
+- **QSA runtime: option A accepts the indexer state and refuses what it cannot
+  honour** (campaign qsa step 3 T4; arcint-side, no plugin patch). The loader
+  reads the indexer's raw-key geometry off the served graph (6 KiB/token at
+  Flash-Next's 12 x 128 f32) and charges it to the fit ledger next to the KV
+  term. A QSA artifact refuses, loudly, before any compile: `--parallel` > 1,
+  a prefix cache (its blob does not carry the indexer Variable), and paged
+  speculation (a rejected draft appends raw keys the rollback does not trim).
+  A paged lane now resets the graph state at `past == 0`, which is what clears
+  the new Variable; `/props` reports `qsa` and `n_qsa_layer`.
+
 - **CPU tier: AVX2 row decode and a row-per-lane single-job dot** (plugin
   patch 0068, DESIGN §7.0.2cx): the same f32 bits, by two bitwise cells. On
   the dev host's CPU (a standalone build with the plugin's flags) a
