@@ -61,6 +61,22 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   Measured 8 passed / 2 skipped on both cards and 276/276 in the PA filter;
   staged plugin sha256 prefix `ffc34950d4658cf3`. Needs a `marfrit-openvino`
   `+p24` for release.
+- **QSA prefill cost, profiled by kernel: not the attention route and not a
+  device TopK.** One 2,048-token chunk at past 20,000 (the engine's own
+  per-node capture, warm-up plus a dumped second pass, pseudo-random tokens so
+  the MoE routes like a real chunk), both artifacts, same config, `--mtp off`.
+  The QSA capture totals 790.60 ms of node time against the dense 882.40 ms;
+  attention (`paged_attention::opt__f16`, 12 nodes) is 253.02 ms against
+  302.41 ms; and no TopK row appears in the QSA capture at all, while the dense
+  one executes its 48 MoE-router TopKs as `arg_max_min_axis__f16` (14.85 ms).
+  The QSA device graph is therefore not the source of the 3.6x served-prefill
+  wall gap, and the indexer's selection is not on the device path in this
+  capture (the decode-step per-node dump lists zero TopK lines; the only topk
+  kernel compiled is the MoE router's). A micro-mixed route cannot carry the
+  selection (`code`: the micro stages ignore input 28), so today's OCL route
+  above the boundary stands. `d48q8qsa` stays non-default; dense stays the
+  artifact to serve, and the remaining candidate is the indexer's host-side
+  term, not a kernel. The full record is in `docs/campaigns/qsa.md`.
 
 - **QSA runtime: option A accepts the indexer state and refuses what it cannot
   honour** (campaign qsa step 3 T4; arcint-side, no plugin patch). The loader

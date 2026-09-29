@@ -572,3 +572,58 @@ answer must not move.
     hash do not move) records `qsa` in the manifest and feeds the indexer
     tensors through `gguf_feed` (`self_attn.indexer.*`; the two norm gammas
     are kind `gamma1`, the stored (1 + w) undone, never a raw GGUFReader).
+  - 2026-09-28. **T7 profile: the QSA prefill gap is not in the device nodes.**
+    (operator: one CLIntercept-style profile, B60, one 2,048-token chunk at
+    past ~20k, both artifacts; sum attention vs the indexer's ops; fix whichever
+    dominates)
+    - **Method** (`measured-here`). The engine's own per-node capture, which is
+      the same device-time-by-kernel surface CLIntercept gives, and already
+      carries its own retraction (`ARCINT_PROFILE` prints the PERF_COUNT
+      numerator and the denominator on the row): `ARCINT_PROFILE=2048`,
+      `ARCINT_PROFILE_SWEEP=2048`, `ARCINT_PROFILE_PAST=20000`,
+      `ARCINT_PROFILE_TOKENS=random`, on the 24 GB card, both artifacts, same
+      config (`--mtp off`, u8 KV, chunk 2048, ngram staged). `SWEEP=2048` keeps
+      the capture to the ONE chunk (the default sweep prefills to `past` once
+      per token count), `random` keeps the MoE routing from collapsing onto one
+      expert, and the capture dumps the SECOND pass so kernel warm-up is not a
+      decaying bias. The load ladder was skipped; the wall was not compared
+      arm-to-arm because the profile isolates the chunk.
+    - **Numbers** (node time for that one 2,048-token chunk at past 20,000;
+      PERF_COUNT under-reports device time ~1.8x and omits transfers, so read
+      shares, not absolutes):
+
+      | row | d48q8qsa | d48q8 (dense) |
+      |---|---|---|
+      | node total | 790.60 ms | 882.40 ms |
+      | `PagedAttentionExtension` `paged_attention::opt__f16` | 253.02 ms (12) | 302.41 ms (12) |
+      | `FullyConnectedCompressed` `jit:gemm:any__i8` | 123.60 ms (231) | 125.63 ms (231) |
+      | `PagedGatedDeltaNet` `opt` | 95.71 ms (36) | 97.19 ms (36) |
+      | `TopK` `arg_max_min_axis__f16` | **absent** | 14.85 ms (48) |
+      | `MoERouterFused` (`moe_router_fused_softmax_topk`) | 10.40 ms (48) | **absent** |
+
+      Summing the operator's two families: attention is the largest single row
+      in both captures (32.0% / 34.3%), and the indexer's selection
+      contributes **no device row** on the QSA side -- there is no TopK, no
+      score-matmul increment (the f16 `FullyConnected` row is 21.94 ms vs
+      23.34 ms), and the QSA-only deltas on Multiply/Add/Concat are **negative**.
+      The QSA device total is 92 ms LOWER than dense.
+    - **Finding** (`measured-here`, corroborated by `code`). On device the QSA
+      capture is not more expensive than dense, so neither the attention route
+      nor a device TopK dominates the served-prefill regression (2,670.75 s vs
+      746.87 s at 28,465 tokens). The indexer's selection is not on the device
+      path in this capture: the compiled QSA graph contains no TopK primitive
+      (a decode-step per-node dump lists zero TopK lines; the only topk kernel
+      compiled is the MoE router's), while the dense graph executes its 48
+      router TopKs. The emitter's own docstring already warned that the
+      indexer's TopK can leave the GPU plugin (`code`: "runs on the CPU plugin
+      (review probe)"). The gap is therefore host-side.
+    - **Fix branch.** `attention` is the largest device row, so by the operator's
+      tree the micro-mixed route would take the selection as its mask -- but it
+      cannot: the micro stages ignore input 28 (`code`, the T3b route gate), so
+      the stated fallback applies and today's OCL route above the boundary
+      stands. `TopK` does not dominate on device (it is not there), so the
+      threshold-select replacement is not taken on this evidence.
+    - **Disposition.** `d48q8qsa` stays non-default; dense remains the artifact
+      to serve. The remaining candidate is the indexer's host-side term (and a
+      per-shape compile of the larger graph), which is a host lever, not a
+      kernel -- recorded here rather than fixed blind.
