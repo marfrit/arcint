@@ -686,3 +686,16 @@ answer must not move.
       fix should be written until the marker reaches the runtime. The gate is
       not met; d48q8qsa stays non-default and dense stays the artifact to
       serve.
+  - 2026-09-29. **Void: T6's "the selection actually pruned" and T7's timing.**
+    - **T6 (2026-09-28) is void.** The served d48q8qsa applied a dense causal
+      mask -- the marker never reached the pass and the PagedAttention node
+      kept 28 inputs -- so surviving a needle past 2,051 says nothing about
+      the selection. The smoke+repeat is re-run on the fixed artifact.
+    - **T7's timing is void.** Both arms were confounded: d48q8qsa was serving
+      dense attention, and it was compared against a dense artifact from a
+      DIFFERENT exporter tree (`1b3049d+dense-q8`) with
+      `--expert-format native` (`expert_fill.format: native`, 86.6 GB filled)
+      while d48q8qsa used the default u4 (64.6 GB filled). The pair differs
+      beyond `--qsa`, so the 2,670.75 s vs 746.87 s row cannot isolate QSA.
+      Dense is re-exported with the same tree and flags and both are
+      re-measured.

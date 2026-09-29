@@ -96,6 +96,17 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   (1835 CPU-s over a 1898.8 s wall, 19.4 GiB read) against dense's 12.5 busy
   cores (6464.9 CPU-s over 516.9 s, 6.0 GiB). No fix was written: the marker
   must reach the runtime first.
+- **QSA served: the marker now reaches the runtime, and a silent drop is
+  refused.** The exporter writes `qsa = {boundary, mask_nodes}` into MODEL
+  rt_info (which the IR serializes) in addition to the node tags; `load_paged`
+  re-applies the node tags by friendly name before SDPAToPagedAttention, then
+  counts the 29-input PagedAttention nodes and refuses to load when that is
+  not the declared `n_qsa_layer`. The red-first cell
+  `test_qsa_marker_survives_serialization_and_wires_the_29_input` fails on the
+  pre-fix exporter (no model rt_info) and passes after. T6's "the selection
+  pruned" and T7's timing row are void -- the pair differed beyond `--qsa`
+  (tree and expert format) and the QSA arm was dense -- so the artifacts are
+  re-exported from one tree/flags and re-measured.
 
 - **QSA runtime: option A accepts the indexer state and refuses what it cannot
   honour** (campaign qsa step 3 T4; arcint-side, no plugin patch). The loader
