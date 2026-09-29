@@ -129,7 +129,7 @@
         "mtp_head_exported": false
     },
     "qwen38-flash-next-d4qsa-ov": {
-        "_note": "2026-09-28: the d4 rung re-exported with --qsa (tools/export_serving_artifact.py --layers 4 --qsa, tree 4f05b21, peak host 27.59 GiB; campaign qsa step 3 T5). The one attention layer carries the model's own indexer, the served selection and the route-gate boundary (rt_info qsa_boundary 2051). lm_xml_sha ec98641c20277204, lm .bin 8.64 GiB. The indexer tensors are additive over d4-ov's checkpoint. A measurement artifact: 44 layers are missing, its answers are not the model's.",
+        "_note": "2026-09-29: the d4 rung re-exported with --qsa and the model-level qsa marker (tools/export_serving_artifact.py --layers 4 --qsa --dense-q8 --dense-u8, tree 7f57d87). The one attention layer carries the model's own indexer, the served selection and the route-gate boundary (model rt_info qsa, boundary 2051; the node tags do not survive serialization). lm_xml_sha ac2768861ae100f2, lm .bin 6.09 GiB. The indexer tensors are additive over d4-ov's checkpoint. A measurement artifact: 44 layers are missing, its answers are not the model's.",
         "arch": [
             "Qwen4ExpForConditionalGeneration"
         ],
@@ -141,8 +141,8 @@
         "full_attention_interval": 4,
         "template_sha": "12827f24b742ea4e",
         "tokenizer_sha": "87a7830d63fcf43b",
-        "lm_xml_sha": "ec98641c20277204",
-        "lm_bin_bytes": 9277155421,
+        "lm_xml_sha": "ac2768861ae100f2",
+        "lm_bin_bytes": 6533163230,
         "status": "measurement artifact: depth 4 of 48 with the model's own QSA indexer (--qsa); not the model's answers",
         "mtp_num_hidden_layers": 1,
         "mtp_head_exported": false

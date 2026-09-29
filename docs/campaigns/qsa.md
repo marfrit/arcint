@@ -699,3 +699,12 @@ answer must not move.
       beyond `--qsa`, so the 2,670.75 s vs 746.87 s row cannot isolate QSA.
       Dense is re-exported with the same tree and flags and both are
       re-measured.
+  - 2026-09-29. **The marker fix verified end-to-end (d4qsa).** The depth-4
+    artifact re-exported with the model rt_info marker boots: `QSA marker
+    present: re-applied 1 selection tag(s) from model rt_info`, the load's
+    29-input count matches `n_qsa_layer` (no refusal), and the runtime model
+    shows the `PagedAttentionExtension` primitive with 11 inputs -- the
+    eleventh the pass's `Greater` visibility node. `arch_hash
+    ac2768861ae100f2`, `.bin` 6.09 GiB; registry/allowlist/test pins updated.
+    d48q8 and d48q8qsa are re-exported with the same tree (7f57d87) and flags
+    (u4 experts) so the pair differs only `--qsa`.

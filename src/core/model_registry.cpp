@@ -278,10 +278,10 @@ std::vector<ModelEntry> build_registry() {
         // d4 rung re-exported with `--qsa`, so its one attention layer carries
         // the model's own indexer, the served selection and the route-gate
         // boundary. The indexer tensors are additive; the checkpoints are the
-        // same GGUF. Hashes read off the export log (tools/export_serving_artifact.py
-        // --layers 4 --qsa, tree 4f05b21, peak host 27.59 GiB). A measurement
-        // artifact: 44 layers are missing and nothing it says is the model's
-        // answer.
+        // same GGUF. Re-exported 2026-09-29 with the model-level qsa marker
+        // (tree 7f57d87) so the selection reaches the pass; hashes read off
+        // the export log. A measurement artifact: 44 layers are missing and
+        // nothing it says is the model's answer.
         ModelEntry e;
         e.id                      = "qwen3.8-flash-next-d4qsa";
         e.family                  = "qwen3.8";
@@ -298,10 +298,10 @@ std::vector<ModelEntry> build_registry() {
         e.n_layer                 = 4;      // of 48: layer 3 is the one QSA layer
         e.n_ctx_train             = 262144;
         e.quants                  = {Quant::Q4};
-        e.arch_hash               = "ec98641c20277204";
+        e.arch_hash               = "ac2768861ae100f2";
         e.template_hash           = "12827f24b742ea4e";
         e.tokenizer_hash          = "87a7830d63fcf43b";
-        e.weights_bytes           = 9277155421ull;
+        e.weights_bytes           = 6533163230ull;
         e.status                  = "measurement artifact: depth 4 of 48 with the model's own "
                                     "QSA indexer (--qsa); served-path boot, not the model's answers";
         e.sampler = qwen_card_defaults();
