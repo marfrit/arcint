@@ -96,3 +96,17 @@ the QSA indexer (not emitted); plugin changes.
   `--dense-fp16` export) and still fuses: device weights fell by exactly the
   dense saving. **Quality row (KLD against the reference)
   owed**, as the gate says.
+
+- 2026-09-28. **The quality row's first half is closed, device-free.** The
+  depth-4 logits A/B the gate names -- the instrument that found the k/v
+  defect -- now runs on CPU: `tests/python/test_dense_q8.py::test_the_q8_chain_
+  leaves_cpu_logits_bit_identical_to_the_plain_graph` builds a small decoder
+  whose dense projection is in the checkpoint's own Q8_0 form, runs the plain
+  graph and the pass-applied graph on CPU, and asserts the logits are
+  **bit-identical** (the pass recovers `w = d*q` exactly in f32). Red first:
+  a mutant that scales the recovered f16 by 1.001 makes it fail at max|d|
+  5.44e-4; restored it passes. This gates the recovery's numerics, not the
+  plugin's fused compressed FC -- the k/v class's garbage is a plugin
+  behaviour a CPU cell cannot see. The **served** depth-4 KL/argmax row
+  therefore stays the card row, and it is **blocked** on the f32 reference
+  re-capture (`docs/campaigns/qsa.md` T8), not on this artifact.

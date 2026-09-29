@@ -149,3 +149,33 @@ def test_both_passes_split_the_projections_and_leave_no_f32_constant():
            if nd.get_type_name() == "Constant" and nd.get_output_element_type(0) == Type.f32
            and np.prod(nd.get_output_shape(0)) > 64]
     assert f32 == [], f32
+
+
+def test_the_q8_chain_leaves_cpu_logits_bit_identical_to_the_plain_graph():
+    """The dense-q8 logits A/B, device-free: a small decoder's dense projection
+    in the checkpoint's own Q8_0 form, run on CPU before and after the pass.
+    The pass recovers w = d*q exactly in f32, so the two graphs' logits are
+    bit-identical -- the row that says the compression is the same arithmetic,
+    not the k/v class's garbage (DESIGN 7.0.2ci). Red on a mis-recovered scale;
+    the recover cell above covers that mutant directly, and the depth-4 served
+    A/B (KL / argmax) stays the card row, blocked on the reference re-capture."""
+    rng = np.random.default_rng(31)
+    n, k = 64, 64
+    w, _d, _q = _q8_0_like(rng, n, k)
+    x = op.parameter([1, 4, k], ov.Type.f32)
+    x.set_friendly_name("ab_x")
+    wc = op.constant(np.ascontiguousarray(w.astype(np.float32)))
+    y = op.matmul(x, wc, False, True)
+    model = ov.Model([op.result(y)], [x], "dense_q8_ab")
+    plain = ov.Core().compile_model(model, "CPU").create_infer_request()
+    dq.apply(model, min_elems=1, log=lambda *a, **kw: None)
+    assert any("dense_q8" in nd.get_friendly_name() for nd in model.get_ordered_ops()), "the pass did not convert the Q8_0 projection"
+    comp = ov.Core().compile_model(model, "CPU").create_infer_request()
+    xv = (rng.standard_normal((1, 4, k)) * 0.1).astype(np.float32)
+    out = []
+    for req in (plain, comp):
+        req.set_tensor("ab_x", ov.Tensor(xv))
+        req.infer()
+        out.append(req.get_output_tensor(0).data.copy())
+    a, b = out
+    assert np.array_equal(a, b), f"max|d| {float(np.max(np.abs(a - b)))}"

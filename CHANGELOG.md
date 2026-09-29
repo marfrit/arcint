@@ -122,7 +122,10 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   weights on the B60 19.2 -> 15.8 GiB, dense GEMM device time 23.7 -> 17.2 ms
   per decode token. On the same configuration the first answer decodes in
   36.6 s against d48s2's 38.2–39.7 s; with the freed VRAM holding 128
-  resident experts per layer instead of 112, 35.8 s. The text differs from d48s2's; a quality row is owed.
+  resident experts per layer instead of 112, 35.8 s. The text differs from
+  d48s2's. The quality A/B row is closed device-free (a CPU logits A/B is
+  bit-identical; red on a 1.001 scale mutant); the served KL/argmax row is
+  blocked on the f32 reference re-capture.
 
 ## 0.5.0.1 — 2026-09-27
 
