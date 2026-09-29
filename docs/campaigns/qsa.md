@@ -520,12 +520,20 @@ answer must not move.
       first served exercise where the selection actually prunes (both Paris
       cells were short, below the boundary). The full byte-exact sweep and the
       KL above 2,051 move to T8.
-  - 2026-09-28. **T6 smoke BLOCKED on the dev host.** `data`
-    (192.168.88.30) and the container's `dirac` address (192.168.88.50) are
-    unreachable -- no route to host, while noether's own gateway is fine --
-    so the d48q8qsa card boot and the smoke+repeat cannot run. The ledger
-    read above (`code`, no card) and the dense-q8 logits A/B (`code`,
-    device-free) proceed meanwhile.
+  - 2026-09-28. **T6 smoke + repeat: PASS on the A770; the B60 diverges (its
+    known per-card defect).** `d48q8qsa` served a 3,832-token needle prompt
+    ("the vault passphrase is ORANGE-FALCON-77" placed past 2,051) and
+    answered `ORANGE-FALCON-77` twice with byte-identical text on the A770
+    (`GPU.1`, ratio 99 + tier + dispatch; prefill 3,832 tok in 517.16 s then
+    491.17 s, decode 62 tok in 8.90 s then 7.08 s). On the B60 the same
+    request diverged between the two runs (run A reasoned 80 tokens and
+    truncated the answer at `ORANGE-FALCON-`, run B answered
+    `ORANGE-FALCON-77`) -- the `served-prefill-determinism` Xe2 GDN
+    nondeterminism, not a QSA fault. Both runs kept the needle, so the
+    selection actually pruned past the boundary and the answer survived it.
+    The full byte-exact sweep and the KL above 2,051 stay deferred to T8.
+    (The dev host was unreachable for a stretch; this leg ran after it
+    returned.)
   - The export flag `--qsa` (default off, so existing artifacts and the arch
     hash do not move) records `qsa` in the manifest and feeds the indexer
     tensors through `gguf_feed` (`self_attn.indexer.*`; the two norm gammas
