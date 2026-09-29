@@ -552,7 +552,22 @@ answer must not move.
       whole `*paged_attention*` filter 276 passed on each card. Patch 0073
       regenerated (T2+T3+T3b+T7) and mirrored; the staged runtime's plugin
       sha256 prefix is `ffc34950d4658cf3`.
-    - **Timing (32k decode vs dense d48q8):** pending, recorded below when run.
+    - **Timing (B60 `GPU.0`, ratio 78 + tier + dispatch, n-ctx 32768, u8 KV,
+      chunk 2048, `--mtp off`, ngram staged; clock NOT pinned -- the B60 has no
+      section 7.0.2cw pin).** The same 28,465-token prompt on both artifacts:
+
+      | artifact | prefill | decode 32 tok |
+      |---|---|---|
+      | `d48q8qsa` | 2,670.75 s (10.7 t/s) | 4.32 s (**7.4 t/s**) |
+      | `d48q8` (dense) | 746.87 s (38.1 t/s) | 12.56 s (2.5 t/s) |
+
+      The decode is **2.96x** the dense rate at 28.5k tokens, so the chunk skip
+      works and attention is no longer the binding decode term -- no
+      position-list kernel is needed next. The two arms ran sequentially
+      without a clock pin, so read the QSA prefill (3.6x slower) as the
+      indexer's O(T x blocks) selection cost, a PREFILL lever (streaming v2's
+      neighbour), not a decode one. Attention device time per token was not
+      measured (CLIntercept not attached).
   - The export flag `--qsa` (default off, so existing artifacts and the arch
     hash do not move) records `qsa` in the manifest and feeds the indexer
     tensors through `gguf_feed` (`self_attn.indexer.*`; the two norm gammas
