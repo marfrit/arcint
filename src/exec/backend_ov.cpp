@@ -4728,6 +4728,12 @@ private:
         // QSA option A: the indexer's raw-key history, folded into the fit's
         // per-token rate above, reported here at the final `lanes * max_ctx`
         // this line is about to print. Named next to the KV term it shares.
+        // The multiplier is `max_ctx` -- the fit's budget CEILING, not the
+        // served n_ctx; the plugin allocates the state lazily to the actual
+        // past (VariableState, `usm_device`/`cl_mem`, sized from the Assign's
+        // output layout), so under an explicit `--n-ctx` the device holds
+        // `n_ctx` x the rate, not this figure. The clause spells the
+        // multiplier out so the ceiling is not read as the served allocation.
         const uint64_t qsa_state_total_bytes =
             qsa_state_bytes_token_ > 0
                 ? static_cast<uint64_t>(lanes) * static_cast<uint64_t>(max_ctx) *
@@ -4735,9 +4741,10 @@ private:
                 : 0;
         const std::string qsa_state_clause =
             qsa_state_bytes_token_ > 0
-                ? log::format(" + QSA state %.2f GiB (%.1f KiB/token)",
+                ? log::format(" + QSA state %.2f GiB (%.1f KiB/token x %lld tok)",
                               static_cast<double>(qsa_state_total_bytes) / (1u << 30),
-                              static_cast<double>(qsa_state_bytes_token_) / 1024.0)
+                              static_cast<double>(qsa_state_bytes_token_) / 1024.0,
+                              static_cast<long long>(max_ctx))
                 : std::string();
         log::info("load",
                   "reservation: weights+graph %.2f GiB + drafters %.2f%s + expert slots %.2f (%s) "

@@ -457,6 +457,24 @@ answer must not move.
     - **Ledger.** `qsa_state_bytes_token_` is folded into the fit's
       `kv_bytes_token` (never the true KV rate) and printed as
       `+ QSA state X GiB (Y KiB/token)` beside the KV term.
+    - **Ledger read (2026-09-28): the multiplier is the fit's budget CEILING,
+      not `n_ctx`; there is no device over-reservation to free.** The two
+      boots' figures (d4qsa 1.78 GiB = 0.5 KiB x 3,739,776; d48q8qsa 4.47 GiB
+      = 6.0 KiB x 781,872) are `lanes * max_ctx * rate`, where `max_ctx` is
+      the fit's computed maximum, not the served depth. The state is
+      **device** memory, not host: the plugin's `VariableState` allocates
+      `usm_device` when USM is in use, else `cl_mem`, and an `Assign` sets
+      that variable's layout to its own output layout (`code`:
+      `src/plugin/variable_state.cpp` `update_device_buffer`,
+      `src/graph/primitive_inst.cpp` the `assign` branch), i.e. the actual
+      `past`, allocated lazily per forward. So the charge is a correct worst
+      case at the ceiling, and exact under auto-fit (`n_ctx = max_ctx`).
+      Under an explicit `--n-ctx` the device holds `n_ctx x rate` -- 1.5 GiB
+      at 262,144, depth 48 -- not the printed 4.47 GiB; the fit's `max_ctx`
+      is never preallocated. The expert slot pool is config/probe-sized, not
+      derived from `max_ctx`, so the QSA term takes nothing from it. The line
+      now prints the multiplier (`x 781872 tok`) so the ceiling is not read as
+      the served allocation.
     - **/props.** `qsa` (on/off) and `n_qsa_layer`, resolved at load.
     - **Red first.** `tests/test_qsa_runtime.cpp`: `state_bytes_per_token`
       (6144), a synthetic graph with two indexer Variables and one KV
@@ -495,8 +513,19 @@ answer must not move.
       speculation`; the reservation line prints `+ QSA state 4.47 GiB (6.0
       KiB/token)`. On the B60 with `--offload-ratio 78 --moe-cpu-tier
       --moe-per-expert-dispatch`, the Paris cell answers **Paris**. Both T5
-      artifacts therefore boot and answer; the byte-exact T6 comparison below
-      2,051 is the next leg.
+      artifacts therefore boot and answer.
+    - **T6 as trimmed (operator, 2026-09-28).** The gate is now the
+      smoke+repeat: a needle question placed past 2,051 tokens in a 4-8k
+      prompt, answered by `d48q8qsa`, sent twice with identical text -- the
+      first served exercise where the selection actually prunes (both Paris
+      cells were short, below the boundary). The full byte-exact sweep and the
+      KL above 2,051 move to T8.
+  - 2026-09-28. **T6 smoke BLOCKED on the dev host.** `data`
+    (192.168.88.30) and the container's `dirac` address (192.168.88.50) are
+    unreachable -- no route to host, while noether's own gateway is fine --
+    so the d48q8qsa card boot and the smoke+repeat cannot run. The ledger
+    read above (`code`, no card) and the dense-q8 logits A/B (`code`,
+    device-free) proceed meanwhile.
   - The export flag `--qsa` (default off, so existing artifacts and the arch
     hash do not move) records `qsa` in the manifest and feeds the indexer
     tensors through `gguf_feed` (`self_attn.indexer.*`; the two norm gammas
