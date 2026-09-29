@@ -706,5 +706,13 @@ answer must not move.
     shows the `PagedAttentionExtension` primitive with 11 inputs -- the
     eleventh the pass's `Greater` visibility node. `arch_hash
     ac2768861ae100f2`, `.bin` 6.09 GiB; registry/allowlist/test pins updated.
-    d48q8 and d48q8qsa are re-exported with the same tree (7f57d87) and flags
-    (u4 experts) so the pair differs only `--qsa`.
+    d48q8 and d48q8qsa are re-exported with the same tree (7f57d87) and the
+    served d48q8's own flags (`--expert-format native`, `--dense-q8
+    --dense-u8`) so the pair differs only `--qsa`.
+  - 2026-09-29. **Lead, not a result: the expert-format pair.** The voided T7
+    row compared u4 against native, both serving dense attention, from
+    different trees; on the B60 at 28.5k it read u4 7.4 t/s decode / 10.7 t/s
+    prefill against native 2.5 / 38.1. The load signature agrees -- the u4
+    host tier ran on ~one core and read 3.2x more from disk. A
+    speed-versus-quality question between the two expert routes, recorded here
+    with its confounds (`measured-here`) for the operator to weigh later.
