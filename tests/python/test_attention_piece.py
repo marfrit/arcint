@@ -1112,3 +1112,54 @@ def test_qsa_indexer_state_survives_the_paged_attention_pass():
         assert any(n.startswith("key_cache") for n in names)
     finally:
         arena.close()
+
+
+def test_qsa_marker_survives_serialization_and_wires_the_29_input(tmp_path):
+    """The cell that would have caught the served-qsa bug (2026-09-29). The
+    exporter's NODE-level rt_info does not survive `ov.save_model` -- the
+    serializer writes only a fixed set of keys -- so the pass sees an untagged
+    causal mask and drops it, and the served 0.5.4 artifacts kept 28 inputs
+    while answering as if QSA were on. The marker therefore travels in MODEL
+    rt_info (`qsa = {boundary, mask_nodes}`), which the IR DOES serialize; the
+    runtime re-applies the node tags by friendly name before the pass.
+
+    RED on the exporter before the model-level marker: `get_rt_info()` has no
+    `qsa` key, nothing is re-applied, and the QSA layer's PagedAttention keeps
+    28 inputs. Depth 4 has exactly one QSA layer."""
+    import json
+    from openvino._offline_transformations import paged_attention_transformation
+    from q4e import serving_shape as ss
+    arena = ss.SparseArena()
+    try:
+        model, _ = ss.build_serving_shape_ir(arena=arena, n_layers=4, qsa=True)
+        xml = tmp_path / "d4qsa.xml"
+        ov.save_model(model, str(xml))
+    finally:
+        arena.close()
+    back = ov.Core().read_model(str(xml))
+    # (1) the marker survived serialization: on the MODEL, not the node.
+    rt = back.get_rt_info()
+    assert "qsa" in rt, list(rt.keys())
+    marker = json.loads(rt["qsa"].astype(str))
+    assert marker["boundary"] == 2051, marker
+    assert marker["mask_nodes"] == ["attn3/qsa_mask"], marker
+    # (2) the runtime re-applies the node tags from it by friendly name.
+    by_name = {n.get_friendly_name(): n for n in back.get_ops()}
+    for name in marker["mask_nodes"]:
+        node_rt = by_name[name].get_rt_info()
+        node_rt["arcint"] = "qsa_selection"
+        node_rt["qsa_boundary"] = str(marker["boundary"])
+    paged_attention_transformation(back)
+    pa = [n for n in back.get_ops() if n.get_type_name() == "PagedAttentionExtension"]
+    assert len(pa) == 1, [n.get_friendly_name() for n in pa]
+    if pa[0].get_input_size() == 28:
+        # This OpenVINO build's SDPAToPagedAttention predates the QSA selection
+        # input (plugin patch 0073), so it drops the tagged mask. The marker
+        # assertions above are the red-first part -- they fail on the exporter
+        # before the model-level marker. The 29-input assertion runs on the
+        # patched runtime (the plugin's own suite and the served boot).
+        pytest.skip("this OpenVINO build has no QSA selection input (patch 0073); "
+                    "the marker-survives assertions above are the cell")
+    assert pa[0].get_input_size() == 29, (
+        f"the QSA layer's PagedAttention has {pa[0].get_input_size()} inputs; "
+        "the selection marker did not reach the pass")

@@ -22,7 +22,10 @@
 #ifdef ARCINT_OPENVINO
 
 #include <memory>
+#include <unordered_map>
+#include <vector>
 
+#include <nlohmann/json.hpp>
 #include <openvino/openvino.hpp>
 
 #endif
@@ -69,6 +72,55 @@ inline StateGeometry state_geometry(const std::shared_ptr<ov::Model>& model) {
         ++g.n_layer;
     }
     return g;
+}
+
+// QSA step 3 (2026-09-29). The exporter writes the marker on the MODEL as
+// `qsa = {"boundary": N, "mask_nodes": ["attn3/qsa_mask", ...]}`. Node-level
+// rt_info does NOT survive `ov.save_model` (the serializer writes only a fixed
+// set of keys), which is exactly why the served 0.5.4 artifacts dropped the
+// mask. Model rt_info does serialize, so this is the transport; load_paged
+// calls it before SDPAToPagedAttention to re-apply the node tags the pass
+// reads. Returns the number of nodes tagged (0 when the marker is absent or
+// malformed).
+inline size_t reapply_selection_tags(const std::shared_ptr<ov::Model>& model) {
+    if (!model) return 0;
+    const auto& rt = model->get_rt_info();
+    const auto  it = rt.find("qsa");
+    if (it == rt.end()) return 0;
+    nlohmann::json j = nlohmann::json::parse(it->second.as<std::string>(), nullptr, false);
+    if (j.is_discarded() || !j.is_object()) return 0;
+    const int64_t boundary = j.value("boundary", static_cast<int64_t>(0));
+    if (!j.contains("mask_nodes") || !j["mask_nodes"].is_array()) return 0;
+
+    std::unordered_map<std::string, std::shared_ptr<ov::Node>> by_name;
+    for (const auto& op : model->get_ops()) by_name[op->get_friendly_name()] = op;
+
+    size_t applied = 0;
+    for (const auto& name : j["mask_nodes"]) {
+        if (!name.is_string()) continue;
+        const auto n = by_name.find(name.get<std::string>());
+        if (n == by_name.end()) continue;
+        auto& node_rt = n->second->get_rt_info();
+        node_rt["arcint"]       = std::string("qsa_selection");
+        node_rt["qsa_boundary"] = std::string(std::to_string(boundary));
+        ++applied;
+    }
+    return applied;
+}
+
+// After SDPAToPagedAttention: the number of PagedAttention nodes that carry
+// the optional selection input (29 inputs). load_paged refuses when this is
+// not the artifact's declared QSA layer count -- the very condition the served
+// 0.5.4 artifacts silently violated.
+inline size_t count_qsa_paged_attention(const std::shared_ptr<ov::Model>& model) {
+    if (!model) return 0;
+    size_t n = 0;
+    for (const auto& op : model->get_ops()) {
+        if (std::string(op->get_type_name()) == "PagedAttentionExtension" &&
+            op->get_input_size() == 29)
+            ++n;
+    }
+    return n;
 }
 
 #endif  // ARCINT_OPENVINO

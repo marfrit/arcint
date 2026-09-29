@@ -2662,11 +2662,26 @@ private:
             if (rank == 4) gdn_proto.push_back(sh);
         }
 
+        // QSA (2026-09-29). The exporter's node-level tags do not survive
+        // serialization -- the serializer writes only a fixed set of rt_info
+        // keys -- so they are lost in the artifact and the pass saw an untagged
+        // causal mask and dropped it. The marker travels in MODEL rt_info
+        // (`qsa = {"boundary": N, "mask_nodes": [...]}`), which does
+        // serialize. Re-apply the node tags by friendly name here, before
+        // SDPAToPagedAttention reads them.
+        const bool qsa_marked = model->get_rt_info().count("qsa") > 0;
+        if (qsa_marked) {
+            const size_t tagged = qsa::reapply_selection_tags(model);
+            log::info("load", "QSA marker present: re-applied %zu selection tag(s) from model rt_info",
+                      tagged);
+        }
+
         {
             ov::pass::Manager pm;
             pm.register_pass<ov::pass::SDPAToPagedAttention>();
             pm.run_passes(model);
         }
+        const size_t qsa_pa_nodes = qsa::count_qsa_paged_attention(model);
 
         want_dflash_ = !cfg.dflash.empty();
         // --dflash-select / --dflash-lambda: inert unless want_dflash_, but
@@ -2742,6 +2757,24 @@ private:
                 // the indexer's appended raw keys.
                 lim.speculative = want_mtp_ || want_dflash_;
                 if (auto why = qsa::runtime_refusal(lim)) throw std::runtime_error(*why);
+                // The refusal the served 0.5.4 artifacts silently violated: the
+                // manifest says qsa but the pass never saw the marker, so no
+                // PagedAttention node carries the selection input. Count the
+                // 29-input nodes and refuse when they are not the declared
+                // QSA layer count.
+                if (artifact_.qsa) {
+                    const size_t expected = artifact_.n_qsa_layer > 0
+                                                ? static_cast<size_t>(artifact_.n_qsa_layer)
+                                                : qsa_n_layer_;
+                    if (qsa_pa_nodes != expected) {
+                        throw std::runtime_error(log::format(
+                            "QSA artifact declares %zu QSA layer(s) but only %zu "
+                            "PagedAttention node(s) carry the selection input (29) after "
+                            "SDPAToPagedAttention: the marker did not reach the pass; "
+                            "refusing to load",
+                            expected, qsa_pa_nodes));
+                    }
+                }
                 log::info("load",
                           "QSA served: %zu indexer state layer(s), %.1f KiB/token; "
                           "one lane, no prefix cache, no paged speculation",

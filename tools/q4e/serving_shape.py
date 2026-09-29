@@ -152,6 +152,7 @@ module emits byte-identical in STRUCTURE to the ones the parity suites gate.
   side dequantises in the 0.5.0 artifact is still the frontier's decision.
 """
 import contextlib
+import json
 import os
 import tempfile
 import types
@@ -1624,6 +1625,21 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
             model = Model([res], sinks, params,
                           "qwen4_exp_serving_shape" if layer_range is None
                           else f"qwen4_exp_serving_shape_L{lo}_{hi}")
+            if qsa:
+                # qsa step 3 (2026-09-29): the node-level rt_info tags do NOT
+                # survive `ov.save_model` -- the serializer writes only a fixed
+                # set of keys -- so the runtime could not re-apply them. The
+                # model-level rt_info DOES serialize (`<qsa value=.../>`), so
+                # the marker travels here: the boundary and the friendly names
+                # of the eleven/twelve indexer masks. arcint's load re-applies
+                # the node tags from this before SDPAToPagedAttention.
+                ratio = int(cfg.indexer_compress_ratio)
+                block_topk = int(cfg.indexer_budget) // ratio
+                boundary = int(block_topk * ratio + ratio - 1)
+                mask_nodes = [f"attn{i}/qsa_mask" for i in range(lo, hi)
+                              if (i % 4) == 3]
+                model.set_rt_info(json.dumps({"boundary": boundary,
+                                              "mask_nodes": mask_nodes}), "qsa")
 
         nodes, const_bytes, counts = pwe.graph_measures(model)
         report = {
