@@ -53,7 +53,14 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   below-boundary pruned-mask case is not valid and is skipped; the above
   cases pass), the causal-equal control is byte-identical on every
   below-boundary param, and the whole `*paged_attention*` filter has no
-  failures on either card. Needs a `marfrit-openvino` `+p24` for release.
+  failures on either card. T7 adds a decode-only chunk-uniform skip: a chunk of
+  `SUBGROUP_SIZE` keys with no selected key skips both its key reads/dot
+  products and its value reads, so a long-context decode reads the selected
+  keys instead of every past key (the predicate is `sub_group_any`, so lanes
+  never diverge around the collectives; prefill/MIXED stay masked dense).
+  Measured 8 passed / 2 skipped on both cards and 276/276 in the PA filter;
+  staged plugin sha256 prefix `ffc34950d4658cf3`. Needs a `marfrit-openvino`
+  `+p24` for release.
 
 - **QSA runtime: option A accepts the indexer state and refuses what it cannot
   honour** (campaign qsa step 3 T4; arcint-side, no plugin patch). The loader

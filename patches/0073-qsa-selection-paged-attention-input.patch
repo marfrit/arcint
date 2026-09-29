@@ -1,4 +1,4 @@
-# QSA step 3 T2+T3+T3b: the served QSA selection in PagedAttention.
+# QSA step 3 T2+T3+T3b+T7: the served QSA selection in PagedAttention.
 #
 # core: PagedAttentionExtension accepts 28 inputs or 29; input 28 is the
 # model's own per-query key selection, [T_new, past + T_new] u8 (1 = keep,
@@ -28,12 +28,23 @@
 # reads KL there, not bytes. A one-lane refusal guards the mask's flattened
 # rows.
 #
+# T7 (decode-only chunk-uniform skip): in the opt kernel's DECODE path, a
+# chunk of SUBGROUP_SIZE keys with NO selected key skips its key reads and
+# dot products, and the same predicate skips the value reads. The predicate
+# is `sub_group_any`, so it is uniform across the subgroup and lanes never
+# diverge around the BLOCK_READN / broadcast collectives (a per-lane skip is
+# undefined behaviour on Xe2, where XE2_QK_MULTIPLICATION is on). When at
+# least one key is selected the chunk runs exactly as today and the per-token
+# mask drops the rest. Prefill/MIXED stay masked dense (FreeToken and
+# llama.cpp do, `code`), so T7 does not touch them.
+#
 # tests: the GPU unit harness feeds input 28 and the reference applies the
 # same selection on top of the causal mask; the cells cover decode {{1,35}},
 # MIXED {{128,2048}} and {{128,1900}} (the latter below the boundary, where
 # selection_is_honoured is skipped and the causal-equal control is
 # byte-identical), past-0 prefill {{2100,0}}, the GQA decode at 5,001 tokens
-# and the above-boundary causal-equal floor.
+# and the above-boundary causal-equal floor. Measured: 8 passed / 2 skipped
+# on both cards, and the whole *paged_attention* filter 276 passed on each.
 #
 --- a/src/core/src/op/paged_attention.cpp
 +++ b/src/core/src/op/paged_attention.cpp
@@ -360,7 +371,43 @@
  #endif
      __global OUTPUT_TYPE* output,
  #if PAGED_ATTENTION_SCORES_OUTPUT
-@@ -519,6 +522,27 @@
+@@ -333,7 +336,34 @@
+ 
+                 SOFTMAX_ACCUMULATOR_VEC_TYPE qk_acc = SOFTMAX_ACCUMULATOR_VAL_ZERO;
+ 
+-                #define KEY_VEC_SIZE SUBGROUP_SIZE
++#if HAS_QSA_SELECTION && !MULTI_TOKENS_PROCESSING
++                // QSA T7 (arcint, qsa step 3): DECODE ONLY, CHUNK-UNIFORM. Per
++                // chunk of SUBGROUP_SIZE keys, if NO lane's key is selected,
++                // skip the chunk's key reads and dot products. The predicate is
++                // `sub_group_any`, so it is uniform across the subgroup and
++                // lanes never diverge around the BLOCK_READN / broadcast
++                // collectives (the per-lane skip that diverged them was wrong
++                // on Xe2, where XE2_QK_MULTIPLICATION is on). When at least one
++                // key is selected the chunk runs exactly as today and the
++                // per-token mask below drops the rest. Prefill/MIXED keep the
++                // masked-dense route.
++                {
++                    const uint qsa_tok = swa_start_token + partition_idx * SEQ_LEN_PARTITION_SIZE
++                        + block_num * SUBGROUPS_PER_WG * SUBGROUP_SIZE + sgid * SUBGROUP_SIZE + sglid;
++                    if (!sub_group_any((int)(qsa_tok < seq_len && qsa_selection[qsa_tok] != 0))) {
++                        qk_acc = SOFTMAX_ACCUMULATOR_VAL_MIN;
++                        qk_max = SOFTMAX_ACCUMULATOR_MAX_FUNC(qk_max, TO_SOFTMAX_ACCUMULATOR_VEC_TYPE(qk_acc));
++                        unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                            slm_qk_vals[q_idx * SEQ_LEN_PARTITION_SIZE
++                                + block_num * SUBGROUPS_PER_WG * SUBGROUP_SIZE
++                                + sgid * SUBGROUP_SIZE + sglid] = GET_VECTOR_ELEMENT(qk_acc, q_idx);
++                        }
++                        continue;
++                    }
++                }
++#endif
++
++#define KEY_VEC_SIZE SUBGROUP_SIZE
+                 #define KEY_BLOCK MAKE_VECTOR_TYPE(INPUT1_TYPE, KEY_VEC_SIZE)
+ #if IS_KV_COMPRESSED
+     #ifdef IS_KEY_BY_CHANNEL
+@@ -519,6 +549,27 @@
                          if (qq_bias[qq_bias_offset] == 0) {
                              qk_acc = SOFTMAX_ACCUMULATOR_VAL_MIN;
                          }
@@ -388,6 +435,39 @@
                      }
                  }
  #endif
+@@ -831,6 +882,16 @@
+ 
+                 const uint value_offset = block_offset + head_size_idx;
+ 
++#if HAS_QSA_SELECTION && !MULTI_TOKENS_PROCESSING
++                // QSA T7: the same chunk-uniform predicate for the value
++                // accumulation, so a skipped chunk's V is never read either.
++                {
++                    const uint qsa_tok_v = swa_start_token + partition_idx * SEQ_LEN_PARTITION_SIZE
++                        + block_num * PAGED_ATTENTION_BLOCK_SIZE + sglid;
++                    if (!sub_group_any((int)(qsa_tok_v < seq_len && qsa_selection[qsa_tok_v] != 0))) continue;
++                }
++#endif
++
+ 
+ #if IS_KV_COMPRESSED
+                 const uint packed_block_offset = block_indices[start_block_idx + block_num] * KV_HEADS_NUM * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE
+@@ -947,6 +1008,15 @@
+                 const uint last_block_idx = start_block_idx + blocks_num_per_partition;
+                 const uint block_offset = block_indices[last_block_idx] * KV_HEADS_NUM * ADJUSTED_V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE + head_idx * ADJUSTED_V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
+                 const uint value_offset = block_offset + head_size_idx;
++
++#if HAS_QSA_SELECTION && !MULTI_TOKENS_PROCESSING
++                // QSA T7: the partial block, same uniform predicate.
++                {
++                    const uint qsa_tok_v = swa_start_token + partition_idx * SEQ_LEN_PARTITION_SIZE
++                        + blocks_num_per_partition * PAGED_ATTENTION_BLOCK_SIZE + sglid;
++                    if (!sub_group_any((int)(qsa_tok_v < seq_len && qsa_selection[qsa_tok_v] != 0))) continue;
++                }
++#endif
+ 
+ #ifdef USE_DUAL_NIBBLE_V_OPT
+                 const uint packed_block_offset = block_indices[last_block_idx] * KV_HEADS_NUM * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE
 --- a/src/core/tests/type_prop/paged_attention.cpp
 +++ b/src/core/tests/type_prop/paged_attention.cpp
 @@ -73,6 +73,24 @@

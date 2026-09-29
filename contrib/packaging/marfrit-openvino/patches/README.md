@@ -2170,6 +2170,17 @@ boundary (0) or an absent `max_context_len` is treated as above, so the mask
 is never silently ignored. A one-lane refusal guards the mask's flattened
 rows. The template backend still accepts 28 only.
 
+T7 (decode-only chunk-uniform skip): in the opt kernel's DECODE path a chunk
+of `SUBGROUP_SIZE` keys with NO selected key skips its key reads and dot
+products, and the same predicate skips the value reads -- so a long-context
+decode reads the selected keys instead of every past key. The predicate is
+`sub_group_any`, uniform across the subgroup, so lanes never diverge around
+the `BLOCK_READN` / `sub_group_broadcast` collectives. That divergence is why
+a per-lane skip was wrong on Xe2 (where `XE2_QK_MULTIPLICATION` is on) and
+exact on Alchemist. When at least one key is selected the chunk runs exactly
+as today and the per-token mask drops the rest. Prefill/MIXED stay masked
+dense (FreeToken and llama.cpp both do, `code`).
+
 Measured with `ov_gpu_unit_tests` built from this tree (`ENABLE_TESTS=ON`):
 `regression_paged_attention_qsa/paged_attention_qsa_test` reports 8 passed
 and 2 skipped on BOTH cards. `selection_is_honoured` is skipped at or below
@@ -2179,7 +2190,7 @@ valid case) and passes above it: MIXED `{{128,2048}}`, past-0 prefill
 causal-equal control is byte-identical on EVERY param -- decode, GQA and the
 below-boundary MIXED `{{128,1900}}` -- and only asserts the f16 floor on the
 above-boundary MIXED ones, where the route legitimately differs. Whole
-`*paged_attention*` filter: no failures on either card.
+`*paged_attention*` filter: 276 passed on each card.
 
 Measured (device-free, the rebuilt core lib): a `--qsa` depth-4 serving-shape
 graph goes through the pass to a PagedAttentionExtension with 29 inputs,

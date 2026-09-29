@@ -532,24 +532,27 @@ answer must not move.
     nondeterminism, not a QSA fault. Both runs kept the needle, so the
     selection actually pruned past the boundary and the answer survived it.
     The full byte-exact sweep and the KL above 2,051 stay deferred to T8.
-  - 2026-09-28. **T7 (position list) recon + first attempt: reverted.** The
-    decode/multi-token kernel computes the key dot BEFORE the mask check, so a
-    masked key is still read; the lever is to hoist the check and skip the key
-    load. Attempt 1 applied the skip to every stage -- the MIXED/prefill QSA
-    cells failed (max|d| 0.31), which the handoff itself predicts: FreeToken and
-    llama.cpp stay masked dense in prefill (`code`), so T7 is DECODE ONLY. Gated
-    with `!MULTI_TOKENS_PROCESSING`, the A770 QSA ladder passed (8 passed / 2
-    skipped) but the B60 `selection_is_honoured/4` (GQA decode at 5,001) failed
-    at |d| 0.0519 (index 0) against a passing A770; adding the `qk_max` update
-    did not fix it. Reverted, both cards' QSA ladder is green again (B60 8
-    passed). **[not established]** why the decode skip is exact on the A770 and
-    not on the B60 -- candidates are a device-specific GQA geometry
-    (`HEADS_PER_WI` / `PARTITIONS_PER_WG`) where the lane-to-token mapping in
-    the skip differs from `token_idx`, or the skip firing in the finalization
-    instantiation. A dump of the generated kernel on both cards is the next
-    step before T7 lands; the 32k decode device-time evidence is owed.
-    (The dev host was unreachable for a stretch; this leg ran after it
-    returned.)
+  - 2026-09-28. **T7 landed: the decode path reads only the chunks that hold
+    a selected key.** (operator ruling: chunk-uniform skip)
+    - **Cause of the reverted per-lane skip** (`code`): the key load
+      (`BLOCK_READN`) and the query `sub_group_broadcast` are subgroup
+      collectives. A per-token skip diverges lanes around them -- undefined
+      behaviour. The B60 compiles the `XE2_QK_MULTIPLICATION` branch and the
+      A770 the other one, which is why the corruption showed only on the B60.
+    - **Fix:** decode-only chunk-uniform skip. Per chunk of `SUBGROUP_SIZE`
+      keys, `any = sub_group_any(selected(token))`; if no lane's key is
+      selected, skip the chunk's key reads and dot products and set
+      `qk_acc = SOFTMAX_ACCUMULATOR_VAL_MIN` for every lane. The same uniform
+      predicate skips the value reads (the main blocks and the partial block).
+      When at least one key is selected the chunk runs exactly as today and
+      the per-token mask drops the rest. Prefill/MIXED stay masked dense
+      (FreeToken and llama.cpp both do, `code`).
+    - **Measured:** `regression_paged_attention_qsa` 8 passed / 2 skipped on
+      the A770 and the B60 (including the GQA decode at 5,001 on the B60);
+      whole `*paged_attention*` filter 276 passed on each card. Patch 0073
+      regenerated (T2+T3+T3b+T7) and mirrored; the staged runtime's plugin
+      sha256 prefix is `ffc34950d4658cf3`.
+    - **Timing (32k decode vs dense d48q8):** pending, recorded below when run.
   - The export flag `--qsa` (default off, so existing artifacts and the arch
     hash do not move) records `qsa` in the manifest and feeds the indexer
     tensors through `gguf_feed` (`self_attn.indexer.*`; the two norm gammas
