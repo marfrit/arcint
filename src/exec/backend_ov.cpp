@@ -3141,6 +3141,38 @@ private:
         log::info("load", "language model ready in %.1f s (paged); device-resident %.2f GiB",
                   seconds_since(t0), static_cast<double>(resident_base) / (1u << 30));
 
+        // ARCINT_PROFILE_RUNTIME_MODEL=<path>: dump the COMPILED graph -- every
+        // node's friendly name, op type and the plugin's own layer/exec names --
+        // so a node that vanished between the model and the runtime (a fusion
+        // that absorbed it, or a fallback) can be named rather than inferred.
+        if (const char* rm_path = std::getenv("ARCINT_PROFILE_RUNTIME_MODEL")) {
+            try {
+                const auto rm = paged_model_.get_runtime_model();
+                std::ofstream out(rm_path);
+                size_t        n = 0;
+                for (const auto& node : rm->get_ordered_ops()) {
+                    std::string layer_type;
+                    std::string exec_type;
+                    const auto& rt = node->get_rt_info();
+                    const auto  lt = rt.find("layerType");
+                    if (lt != rt.end()) layer_type = lt->second.as<std::string>();
+                    const auto et = rt.find("execType");
+                    if (et != rt.end()) exec_type = et->second.as<std::string>();
+                    out << node->get_friendly_name() << '\t' << node->get_type_name()
+                        << '\t' << layer_type << '\t' << exec_type;
+                    out << '\t' << node->get_input_size();
+                    for (const auto& iv : node->input_values()) {
+                        out << ' ' << iv.get_node_shared_ptr()->get_friendly_name();
+                    }
+                    out << '\n';
+                    ++n;
+                }
+                log::info("load", "runtime model dumped to %s (%zu nodes)", rm_path, n);
+            } catch (const std::exception& e) {
+                log::warn("load", "runtime model dump failed: %s", e.what());
+            }
+        }
+
         // One InferRequest per lane, all from the one CompiledModel. Weights are
         // NOT duplicated by this (measured 2026-08-29: a second request adds
         // activations, a second *compile* adds 0.791 GiB of weights, §7.0.2),
@@ -7039,9 +7071,18 @@ private:
             // carries kernel warm-up, and an ascending sweep turns that into a
             // decaying bias that reads as a U-shape in every op -- measured
             // 2026-08-30, and it is why an ascending single-pass sweep cannot be
-            // used to argue about scaling.
+            // used to argue about scaling. The two walls are printed separately:
+            // pass 1 pays whatever the first execution of a shape pays (kernel
+            // bucket builds on this plugin), pass 2 does not, so the difference
+            // is the per-shape first-execution cost.
+            const auto t_p1 = std::chrono::steady_clock::now();
             paged_forward(lane, embed_paged(lane, chunk), at, {0}, 0);
+            const double pass1_s = seconds_since(t_p1);
+            const auto t_p2 = std::chrono::steady_clock::now();
             paged_forward(lane, embed_paged(lane, chunk), at, {0}, 0);
+            const double pass2_s = seconds_since(t_p2);
+            log::info("profile", "prefill M=%zu past=%zu: pass1 %.2f s, pass2 %.2f s, first-shape %.2f s",
+                      m, past, pass1_s, pass2_s, pass1_s - pass2_s);
             {
                 const ov::Tensor lg = lane.req.get_tensor("logits");
                 std::ostringstream os;

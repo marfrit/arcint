@@ -627,3 +627,62 @@ answer must not move.
       to serve. The remaining candidate is the indexer's host-side term (and a
       per-shape compile of the larger graph), which is a host lever, not a
       kernel -- recorded here rather than fixed blind.
+  - 2026-09-29. **The selection never reaches the served attention: the
+    exporter's rt_info markers do not survive serialization.** (operator:
+    cold/warm, compile log, `get_runtime_model()`, perf)
+    - **Cold vs warm** (`measured-here`). The profiled 2,048-token chunk at
+      past 20,000, two passes, both artifacts, same config:
+
+      | artifact | pass 1 | pass 2 | first-shape |
+      |---|---|---|---|
+      | d48q8qsa | 188.46 s | 185.13 s | 3.33 s |
+      | d48q8     | 78.42 s | 75.78 s | 2.65 s |
+
+      Pass 1 ~= pass 2 and the first-shape term is ~3 s, so **per-shape
+      kernel compilation is ruled out**; the +110 s/chunk is steady-state.
+    - **Compile log** (`measured-here`). The plugin's `kernels_cache`
+      diagnostics (`ARCINT_KC`, patch 0053) report 143 source builds and 0
+      cached-binary hits for the QSA boot against 154 source builds for dense
+      -- the blob cache is off (`ov::cache_dir("")`), so all kernels build
+      once at load, and the per-new-shape term is the 3.33 s of the cold/warm
+      row, not 137 s.
+    - **Runtime model** (`measured-here` + `code`). `get_runtime_model()` of
+      d48q8qsa: 3,880 nodes, **0 TopK**; the `PagedAttentionExtension`
+      primitives have **10 inputs** -- q, k, v, key_cache, value_cache,
+      past_lens, subsequence_begins, block_indices, block_indices_begins,
+      max_context_len -- with **no qsa_selection**. The plugin sets
+      `has_qsa_selection = (op->get_input_size() == 29)`, so a 10-input
+      primitive means the pass dropped the mask. The artifact XML contains
+      **0** occurrences of `qsa_selection` / `qsa_boundary`.
+    - **Root cause** (`code` + `measured-here`). `ov.save_model` in the
+      exporter serializes the model, and OpenVINO's serializer writes only a
+      fixed set of rt_info keys (decompression/version), so the exporter's
+      custom tags (`mask.set_rt_info("qsa_selection", "arcint")`,
+      `qsa_boundary`) are **lost**. A serialize -> read-back round-trip of a
+      node carrying those keys returns an **empty** rt_info. The pass then
+      sees an untagged causal mask and drops it, exactly as for a dense mask.
+      **This is a correctness bug: the served d48q8qsa applies a dense causal
+      mask, not the QSA selection.** The T6 "the selection actually pruned"
+      conclusion is void -- surviving a needle does not distinguish dense
+      attention from correctly-pruned attention.
+    - **Host term** (`measured-here`). `perf` is not installed in the guest or
+      on the host and the host sets `perf_event_paranoid=4`, so `perf record`
+      cannot run; gdb was used instead. The Release plugin is stripped (the
+      0053 record's finding), so every hot frame resolves to `??` and no
+      symbol can be named. The measured signature, same ~18k-token prompt,
+      second (warm) pass:
+
+      | artifact | wall | CPU-s | cores | disk read | threads |
+      |---|---|---|---|---|---|
+      | d48q8qsa | 1898.8 s | 1835.6 | ~1 | 19.4 GiB | 60 |
+      | d48q8     | 516.9 s | 6464.9 | ~12.5 | 6.0 GiB | 82 |
+
+      The QSA path runs a **single-threaded** host workload and reads 3.2x
+      more -- the opposite of dense's parallel host tier. The symbol is owed
+      to a `-g` plugin build; the operator's rule is not to write code before
+      it is named.
+    - **Fix branch.** (1) rules out the padding fix (per-shape compile).
+      Item (3) is a correctness bug and takes precedence: no kernel or host
+      fix should be written until the marker reaches the runtime. The gate is
+      not met; d48q8qsa stays non-default and dense stays the artifact to
+      serve.

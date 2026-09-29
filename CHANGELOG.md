@@ -77,6 +77,25 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   above the boundary stands. `d48q8qsa` stays non-default; dense stays the
   artifact to serve, and the remaining candidate is the indexer's host-side
   term, not a kernel. The full record is in `docs/campaigns/qsa.md`.
+- **QSA served: the selection never reaches the attention -- a correctness
+  bug.** The exporter tags the indexer mask with custom rt_info
+  (`arcint = "qsa_selection"`, `qsa_boundary`), but OpenVINO's serializer
+  writes only a fixed set of rt_info keys, so `ov.save_model` drops them: the
+  artifact XML has zero occurrences of either, and a serialize -> read-back
+  round-trip of a node carrying them returns an empty rt_info. At load the
+  pass therefore sees an untagged causal mask and drops it, and the served
+  `PagedAttentionExtension` keeps 10 inputs (no `qsa_selection`), with zero
+  TopK in the compiled graph. `d48q8qsa` has been serving dense attention, so
+  the T6 "the selection pruned" conclusion is void. The prefill gap is not
+  per-shape compilation either: the profiled 2,048-token chunk at past 20,000
+  runs 188.46 s then 185.13 s (first-shape 3.33 s) against dense's 78.42 and
+  75.78 s (2.65 s), and the plugin reports 143 source kernel builds with no
+  cache hits. `perf` is unavailable (not installed, host
+  `perf_event_paranoid=4`), and the stripped Release plugin resolves gdb's hot
+  frames to `??`; the measured signature is a single-threaded host workload
+  (1835 CPU-s over a 1898.8 s wall, 19.4 GiB read) against dense's 12.5 busy
+  cores (6464.9 CPU-s over 516.9 s, 6.0 GiB). No fix was written: the marker
+  must reach the runtime first.
 
 - **QSA runtime: option A accepts the indexer state and refuses what it cannot
   honour** (campaign qsa step 3 T4; arcint-side, no plugin patch). The loader
