@@ -286,3 +286,48 @@ existing grouped-int4 host kernel at ~270/305 µs per expert — is not
 answered, or even attempted, by anything found in this survey. That remains
 arcint's own measurement to make, on its own hardware, with no borrowed
 number to lean on.
+
+## Flash-Next serving comparables (added 2026-09-30)
+
+Community reports for Qwen3.8-Flash-Next (125B-A6B plus the 51B n-gram
+table). These are the reporters' own numbers, not measured here. Sources were
+accessed 2026-09-30. The Reddit threads themselves were rate-limit-blocked, so
+the rows come from the GitHub and Hugging Face write-ups of the same setups.
+
+| setup | engine | expert placement | prefill | decode |
+|---|---|---|---|---|
+| 1× RTX 3090 24 GB (PCIe 4.0 x16), 77 GB DDR5-5600, 8c/16t, n-gram table on NVMe (syv-ai/HyperQwen #103) | exllamav3, EXL3 3.05 bpw, MTP ~83 % accept | 119 hot experts/layer on the card, 393/512 on 14 CPU threads with overlap | ~570 t/s (262k cold ≈ 7.5 min) | ~14–16 t/s with MTP |
+| RTX 3060 12 GB, 48 GB DDR4-3200 (unsloth GGUF discussion #48) | llama.cpp fork, UD-Q2_K_XL, q4_0 KV, `-cmoe`, `--moe-cache-slots 42` | experts on CPU with a GPU expert cache | 40–60+ t/s | ~10+ t/s |
+| 4× RTX 3090 24 GB, 31 GB RAM (tonyd2wild/Qwen38-Flash-Next-4x3090) | vLLM (W4A16 Marlin experts, FP8 n-gram table read from NVMe, 16 rows/token inside CUDA graphs); llama.cpp second lane | all experts on the cards | llama.cpp ~311 t/s | vLLM 55.8 t/s plain, 193 t/s with INT4 MTP draft (accept 0.66–0.92); llama.cpp 58.8 / 96–102 with MTP |
+| **Ryzen 7 5700X (the dev host's CPU)**, 128 GB RAM, RX 9070 XT 16 GB, ROCm 7.2.4 (r/LocalLLM, "176B on 16 GB VRAM", 2026-09-02) | upstream llama.cpp, uncensored i1-Q4_K_S (104 GB), `--cpu-moe -ngl 99`, 8 decode threads pinned to physical cores, 16 batch threads, ubatch 512, f16 KV | **all experts on the CPU** | 192 t/s at a 26k prompt | **14.6 t/s** at 26k (15.8 empty, 12.2 at 132k unpinned); no MTP |
+| Ryzen 9 5900X, 64 GB DDR4, RTX 3080 10 GB (a commenter on the same thread) | llama.cpp, 4.25 bpw, q4 KV, 99 % RAM used plus NVMe paging | experts on the CPU | 130 t/s at a 35k prompt | 13–15 t/s |
+| Strix Halo, 128 GB unified, 70 W (r/LocalLLM benchmark thread) | Halogen 0.14 / gufo / CIRU | everything in unified memory | ~800–1,150 t/s at 32k–130k | 28–40 t/s with MTP (70–85 % accept), flat with depth |
+
+Against arcint (`measured-here`, 2026-09-30, `docs/campaigns/qsa.md`): the
+B60 24 GB with 52 GiB of host RAM, d48q8 native, ratio 75 + census128 +
+30 GiB bank, 20,085-token prompt: **68.5 t/s prefill, 6.0 t/s decode, no
+MTP**.
+
+What transfers:
+- **Same CPU, stock llama.cpp, every expert on the CPU: 14.6 t/s decode and
+  192 t/s prefill, against arcint's 6.0 and 68.5 with a quarter of the experts
+  on the card.** Our in-RAM tier bench was ~8.5 t/s, so the per-expert CPU
+  path, not the hardware, is the decode gap. The thread's own explanation
+  ("L3-resident experts") is wrong. Its MTP claim is narrated, not measured,
+  but names a real risk for CPU-held experts: verify batches multiply tier
+  work. A same-host llama.cpp run is the cheap bar to set before more tier
+  machinery.
+- The closest comparable (one 24 GB card plus host RAM) prefills about **8×
+  faster**. Its host tier is the same shape (~77 % of experts on the CPU).
+  With 83 % MTP acceptance its decode is ~2.5× ours; without MTP the gap is
+  smaller but unmeasured here.
+- Prefill is the largest gap: the per-expert CPU tier caps it. That is
+  `prefill-expert-streaming`'s lever (card-side compute of host experts per
+  prefill chunk).
+- **MTP is worth 1.4–1.7× decode** in every report that has it; arcint
+  exports no Flash-Next MTP head (ROMA R1).
+- The n-gram table on NVMe through the page cache is the common practice;
+  arcint's staged-rows route is equivalent.
+- `--moe-cache-slots`-style GPU expert caches with CPU fallback are the
+  llama.cpp-fork answer at 12 GB. Compare this with arcint's per-expert
+  dispatch pool before building more tier machinery.

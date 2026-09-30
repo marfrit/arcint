@@ -298,10 +298,10 @@ std::vector<ModelEntry> build_registry() {
         e.n_layer                 = 4;      // of 48: layer 3 is the one QSA layer
         e.n_ctx_train             = 262144;
         e.quants                  = {Quant::Q4};
-        e.arch_hash               = "ac2768861ae100f2";
+        e.arch_hash               = "48e1d3b258f571fb";
         e.template_hash           = "12827f24b742ea4e";
         e.tokenizer_hash          = "87a7830d63fcf43b";
-        e.weights_bytes           = 6533163230ull;
+        e.weights_bytes           = 6537359094ull;
         e.status                  = "measurement artifact: depth 4 of 48 with the model's own "
                                     "QSA indexer (--qsa); served-path boot, not the model's answers";
         e.sampler = qwen_card_defaults();

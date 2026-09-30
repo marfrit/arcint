@@ -579,6 +579,10 @@ def _qsa_block_cache_mask(qn, new_raw, pid, config, state, cosT_c, sinT_c,
     pad = op.subtract(i64(cap), used)
     zeros = op.broadcast(cf(0.0), op.concat([op.unsqueeze(pad, i64(0)), i64([dh])], 0))
     blocks_new = op.concat([appended, zeros], axis=0)                         # [cap, dh]
+    # Force a STATIC Assign input: the GPU plugin's Assign/state path calls
+    # layout::Count() on a dynamic shape and throws (the full served graph's
+    # 'Count is called for dynamic shape', 2026-09-30).
+    blocks_new = op.reshape(blocks_new, i64([cap, dh]), False)
     blk = op.assign(blocks_new, block_var)
     blk.set_friendly_name(f"attn{layer}/qsa_block_assign")
     sinks.append(blk)
@@ -590,6 +594,7 @@ def _qsa_block_cache_mask(qn, new_raw, pid, config, state, cosT_c, sinT_c,
     pad_t = op.subtract(i64(tail_cap), leftover)
     zeros_t = op.broadcast(cf(0.0), op.concat([op.unsqueeze(pad_t, i64(0)), i64([dh])], 0))
     tail_new = op.concat([tail_pick, zeros_t], axis=0)                        # [tail_cap, dh]
+    tail_new = op.reshape(tail_new, i64([tail_cap, dh]), False)
     tasg = op.assign(tail_new, tail_var)
     tasg.set_friendly_name(f"attn{layer}/qsa_tail_assign")
     sinks.append(tasg)
@@ -608,8 +613,8 @@ def _qsa_block_cache_mask(qn, new_raw, pid, config, state, cosT_c, sinT_c,
         acc = _add(acc, _slice(s, h, h + 1, 1, 1))
     s = op.divide(op.squeeze(acc, i64([1])), sqrt_dh)                         # pin 755 / sqrt(d)
 
-    pid_s = op.squeeze(pid, i64([0]))                                         # [T]
-    lim_col = op.unsqueeze(op.divide(op.add(pid_s, i64(1)), i64(ratio)), i64(1))  # [T,1] blocks
+    pid_col = op.reshape(pid, i64([-1, 1]), False)                            # [T,1]
+    lim_col = op.divide(op.add(pid_col, i64(1)), i64(ratio))                  # [T,1] blocks
     b_idx = op.range(i64(0), i64(cap), i64(1), Type.i64)                      # [cap] constant
     visible = op.less(op.unsqueeze(b_idx, i64(0)), lim_col)                   # [T, cap]
     s = op.select(visible, s, cf(-np.inf))
@@ -627,7 +632,7 @@ def _qsa_block_cache_mask(qn, new_raw, pid, config, state, cosT_c, sinT_c,
     tokensel = op.slice(tokensel, i64([0]), op.unsqueeze(n_len, i64(0)), i64([1]), i64([1]))
     j_all = op.unsqueeze(op.range(i64(0), i64(cap * ratio), i64(1), Type.i64), i64(0))  # [1, cap*ratio]
     tail_full = op.logical_and(op.greater_equal(j_all, op.multiply(lim_col, i64(ratio))),
-                               op.less_equal(j_all, op.unsqueeze(pid_s, i64(1))))
+                               op.less_equal(j_all, pid_col))
     tail_mask = op.slice(tail_full, i64([0]), op.unsqueeze(n_len, i64(0)), i64([1]), i64([1]))
     allowed = op.maximum(tokensel, op.convert(tail_mask, Type.f32))
     mask = op.select(op.greater(allowed, cf(0.5)), cf(0.0), cf(minf))
