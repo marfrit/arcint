@@ -2751,6 +2751,7 @@ private:
             const size_t qsa_ratio = static_cast<size_t>(
                 artifact_.config.value("indexer_compress_ratio", 4));
             qsa_state_bytes_token_ =
+                qsa_geo.raw_bytes_per_token +
                 qsa_geo.n_layer * qsa_geo.block_row_bytes / std::max<size_t>(qsa_ratio, 1);
             // The block cache is a FIXED [block_cap, dh] allocation per layer,
             // charged as a fixed reservation beside the per-token rate.

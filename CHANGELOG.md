@@ -108,6 +108,18 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   (tree and expert format) and the QSA arm was dense -- so the artifacts are
   re-exported from one tree/flags and re-measured.
 
+- **QSA decode: a compressed block-key indexer cache, not yet servable.**
+  The indexer pools, norms and ropes each completed ratio-token block ONCE
+  into a fixed `[8192, dh]` state row, plus the <= 3 raw tail keys and a token
+  counter; rows past the valid count score -inf and every Range is
+  constant-bound. The CPU cell is bit-identical to the recompute path over
+  [2048, 40] + [1]x12 and the named mutants red it; T4 charges `dh*4/ratio`
+  per token with the tail/counter/capacity fixed. But the re-exported native
+  `d48q8qsa` does NOT load on the GPU plugin -- `[GPU] Count is called for
+  dynamic shape` at executor bring-up, while the standalone indexer runs on
+  GPU.0 and the recompute artifact serves -- so the registry keeps the
+  recompute artifact and the gate is not met.
+
 - **QSA runtime: option A accepts the indexer state and refuses what it cannot
   honour** (campaign qsa step 3 T4; arcint-side, no plugin patch). The loader
   reads the indexer's raw-key geometry off the served graph (6 KiB/token at

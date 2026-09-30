@@ -52,10 +52,11 @@ inline uint64_t state_bytes_per_token(size_t n_layer, size_t indexer_head_dim,
 // tail (`...indexer_tail.<layer>`, [ratio-1, head_dim]) and the token counter
 // (`...indexer_pos.<layer>`, [1] i32).
 struct StateGeometry {
-    size_t   n_layer         = 0;
-    uint64_t block_row_bytes = 0;   // per layer, per completed block
-    uint64_t fixed_bytes     = 0;   // tail + counter over every layer
-    int64_t  block_cap       = 0;   // fixed block capacity per layer (rows)
+    size_t   n_layer              = 0;
+    uint64_t block_row_bytes      = 0;   // per layer, per completed block
+    uint64_t raw_bytes_per_token  = 0;   // the pre-cache raw-key history, f32 dh/token
+    uint64_t fixed_bytes          = 0;   // tail + counter over every layer
+    int64_t  block_cap            = 0;   // fixed block capacity per layer (rows)
 };
 
 inline StateGeometry state_geometry(const std::shared_ptr<ov::Model>& model) {
@@ -79,6 +80,20 @@ inline StateGeometry state_geometry(const std::shared_ptr<ov::Model>& model) {
             if (!ok) continue;
             g.block_row_bytes = per_block * static_cast<uint64_t>(info.data_type.size());
             if (ps[0].is_static()) g.block_cap = ps[0].get_length();
+            ++g.n_layer;
+        } else if (id.rfind("cache_params.past.indexer_key.", 0) == 0) {
+            // The PRE-CACHE raw-key history [1, -1, dh]: one raw row per token.
+            // Handled so an artifact exported before the block cache still
+            // charges its state correctly.
+            if (rank < 3) continue;
+            uint64_t per_token = 1;
+            bool     ok        = true;
+            for (int64_t i = 2; i < rank; ++i) {
+                if (ps[i].is_dynamic()) { ok = false; break; }
+                per_token *= static_cast<uint64_t>(ps[i].get_length());
+            }
+            if (!ok) continue;
+            g.raw_bytes_per_token += per_token * static_cast<uint64_t>(info.data_type.size());
             ++g.n_layer;
         } else if (id.rfind("cache_params.past.indexer_tail.", 0) == 0 ||
                    id.rfind("cache_params.past.indexer_pos.", 0) == 0) {

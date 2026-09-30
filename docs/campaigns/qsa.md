@@ -716,3 +716,28 @@ answer must not move.
     host tier ran on ~one core and read 3.2x more from disk. A
     speed-versus-quality question between the two expert routes, recorded here
     with its confounds (`measured-here`) for the operator to weigh later.
+  - 2026-09-30. **Compressed block-key cache implemented; the served artifact
+    does not load on the GPU plugin.** (operator: QSA decode cache, prior art
+    `research-qsa.md`)
+    - **Built** (`code` + `measured-here`). The indexer keeps one pooled +
+      k-normed + roped f32 row per completed ratio-token block, plus the
+      <= ratio-1 raw tail keys and a token counter, in three Variables per QSA
+      layer. The block state is a FIXED [8192, dh] Variable, so every decode
+      shape is stable; rows past the valid count score -inf; every Range is
+      constant-bound (a dynamic Range is what the GPU plugin rejects). CPU
+      cells green: the cached served emitter is BIT-IDENTICAL to the recompute
+      path over [2048, 40] + [1]x12, and the three named mutants (a block
+      never appended, appended before complete, tail dropped) each change a
+      chunk's mask. T4 charges dh*4/ratio per token plus the fixed
+      tail/counter/capacity; the profiler snapshots and rewinds the indexer
+      state around its repeated passes.
+    - **Blocker** (`measured-here`). The re-exported native `d48q8qsa`
+      (`lm_xml_sha 9fe7b9e9b9e7b240`, native flags, tree c69895e) does NOT load
+      on the B60: `[GPU] Count is called for dynamic shape` at executor
+      bring-up. The standalone indexer subgraph compiles and runs on GPU.0 over
+      [2048, 40, 1, 1], and the recompute artifact loads and serves, so the
+      failure is in the full served graph with the three state Variables. The
+      gate leg's qsa arm aborted (dense: prefill 69.2 t/s, decode 6.1 t/s,
+      needle answered). Gate not met; QSA stays non-default, the registry pins
+      the recompute artifact.
+    - **Seeds** remapped to the new layer keys by layer index (45 of 48 moved).
