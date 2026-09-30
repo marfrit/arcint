@@ -293,8 +293,8 @@
         "full_attention_interval": 4,
         "template_sha": "12827f24b742ea4e",
         "tokenizer_sha": "87a7830d63fcf43b",
-        "lm_xml_sha": "7b5a05b5fd2183ef",
-        "lm_bin_bytes": 65219394096,
+        "lm_xml_sha": "b21359a42c2c8633",
+        "lm_bin_bytes": 65221492040,
         "status": "d48q8 with the model's own QSA indexer (--qsa) on the 12 full-attention layers; the served step-3 arm",
         "mtp_num_hidden_layers": 1,
         "mtp_head_exported": false

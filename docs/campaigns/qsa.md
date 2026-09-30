@@ -741,3 +741,20 @@ answer must not move.
       needle answered). Gate not met; QSA stays non-default, the registry pins
       the recompute artifact.
     - **Seeds** remapped to the new layer keys by layer index (45 of 48 moved).
+  - 2026-09-30. **The cache loads and serves; the 20k no-loss gate is missed.**
+    The load failure's mechanism was named on GPU.0: after
+    `SDPAToPagedAttention` rewrites `position_ids` to rank-1 `[-1]`, the
+    indexer's `Squeeze(pid, [0])` + `Unsqueeze(..., 1)` produces a rank-0
+    tensor and axis 1 is out of range -- shape inference fails at executor
+    bring-up. The rank-1 squeeze+unsqueeze toy FAILS; `Reshape(pid, [-1, 1])`
+    compiles and runs. With that fix (and static `[cap, dh]` / `[ratio-1, dh]`
+    Assign inputs) the re-exported native `d48q8qsa` loads
+    (`lm_xml_sha b21359a42c2c8633`, `.bin` 65,221,492,040, peak 51.05 GiB).
+    - **qsa-pair-007** (B60, one fresh process per arm, 20,085-token prompt,
+      needle answered by both): dense prefill **65.6 t/s**, decode **5.9 t/s**;
+      QSA prefill **51.6 t/s** (1.27x), decode **5.1 t/s**. The cache lifted
+      QSA decode from the recompute path's 1.7 t/s to 5.1 (3x), but it is
+      ~13.5% BELOW dense and prefill is 1.27x (the bound is 1.2x). **Gate not
+      met**; dense stays the artifact served.
+    - The block cap is a fixed [8192, dh] (32,768 tokens), so the paper's >=64k
+      payoff is out of reach without a larger or bucketed cap.

@@ -120,6 +120,18 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   GPU.0 and the recompute artifact serves -- so the registry keeps the
   recompute artifact and the gate is not met.
 
+- **QSA cache loads and serves; the 20k no-loss gate is missed.** The load
+  failure was a rank-1 `position_ids` problem: after SDPAToPagedAttention
+  rewrites `position_ids` to `[-1]`, the indexer's `Squeeze(pid,[0])` +
+  `Unsqueeze(...,1)` is out of range, so shape inference failed at executor
+  bring-up. `Reshape(pid,[-1,1])` fixes it (named on GPU.0: the rank-1
+  squeeze+unsqueeze toy fails, the reshape toy runs), and the re-exported
+  native `d48q8qsa` (`b21359a42c2c8633`) loads. Measured at 20,085 tokens on
+  the B60: dense 65.6 t/s prefill / 5.9 t/s decode; QSA 51.6 t/s prefill
+  (1.27x) / 5.1 t/s decode. The cache lifted QSA decode from 1.7 to 5.1 t/s
+  (3x), but it is below dense and prefill misses the 1.2x bound. Dense stays
+  the artifact served.
+
 - **QSA runtime: option A accepts the indexer state and refuses what it cannot
   honour** (campaign qsa step 3 T4; arcint-side, no plugin patch). The loader
   reads the indexer's raw-key geometry off the served graph (6 KiB/token at

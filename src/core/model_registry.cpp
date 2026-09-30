@@ -722,10 +722,10 @@ std::vector<ModelEntry> build_registry() {
         e.n_layer                 = 48;
         e.n_ctx_train             = 262144;
         e.quants                  = {Quant::Q4};
-        e.arch_hash               = "7b5a05b5fd2183ef";
+        e.arch_hash               = "b21359a42c2c8633";
         e.template_hash           = "12827f24b742ea4e";
         e.tokenizer_hash          = "87a7830d63fcf43b";
-        e.weights_bytes           = 65219394096ull;
+        e.weights_bytes           = 65221492040ull;
         e.status                  = "d48q8 with the model's own QSA indexer (--qsa) on the 12 "
                                     "full-attention layers; the served step-3 arm";
         e.sampler = qwen_card_defaults();
