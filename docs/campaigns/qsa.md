@@ -758,3 +758,14 @@ answer must not move.
       met**; dense stays the artifact served.
     - The block cap is a fixed [8192, dh] (32,768 tokens), so the paper's >=64k
       payoff is out of reach without a larger or bucketed cap.
+  - 2026-09-30. **QSA step 3 closed.**
+    - **Served and correct.** The native `d48q8qsa` (`b21359a42c2c8633`) loads, re-applies 12 selection tags and serves 12
+      compressed block-cache layers; the needle is answered at 20,085 tokens.
+    - **Cost** (qsa-pair-007, B60, 20,085-token prompt): decode **0.87x dense**
+      (5.1 vs 5.9 t/s), prefill **1.27x**.
+    - **Non-default.** Dense stays the artifact served.
+    - **Limit.** `n_ctx <= 32,768` until the fixed [8192, dh] block cap is
+      raised or bucketed.
+    - **Reopen triggers.** T8's quality above 2,051, or attention becoming a
+      larger share of decode after the CPU-tier work.
+    - The >=64k measurement is deferred until prefill makes it practical.

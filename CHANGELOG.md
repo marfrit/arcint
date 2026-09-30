@@ -132,6 +132,12 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   (3x), but it is below dense and prefill misses the 1.2x bound. Dense stays
   the artifact served.
 
+- **QSA step 3 closed.** Served and correct at 20,085 tokens; decode 0.87x
+  dense (5.1 vs 5.9 t/s), prefill 1.27x (qsa-pair-007, B60). Non-default;
+  `n_ctx <= 32,768` until the block cap is raised or bucketed. Reopen on T8's
+  quality above 2,051, or if attention becomes a larger share of decode after
+  the CPU-tier work; the >=64k measurement is deferred.
+
 - **QSA runtime: option A accepts the indexer state and refuses what it cannot
   honour** (campaign qsa step 3 T4; arcint-side, no plugin patch). The loader
   reads the indexer's raw-key geometry off the served graph (6 KiB/token at
