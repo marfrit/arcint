@@ -2752,7 +2752,14 @@ private:
                 artifact_.config.value("indexer_compress_ratio", 4));
             qsa_state_bytes_token_ =
                 qsa_geo.n_layer * qsa_geo.block_row_bytes / std::max<size_t>(qsa_ratio, 1);
-            qsa_state_fixed_bytes_ = qsa_geo.fixed_bytes;
+            // The block cache is a FIXED [block_cap, dh] allocation per layer,
+            // charged as a fixed reservation beside the per-token rate.
+            const uint64_t qsa_cap = qsa_geo.block_cap > 0
+                                         ? static_cast<uint64_t>(qsa_geo.block_cap)
+                                         : 0ull;
+            qsa_state_fixed_bytes_ = qsa_geo.fixed_bytes +
+                                     static_cast<uint64_t>(qsa_geo.n_layer) * qsa_cap *
+                                         qsa_geo.block_row_bytes;
             if (artifact_.qsa || qsa_n_layer_ > 0) {
                 qsa::RuntimeLimits lim;
                 lim.lanes        = lane_count_;
@@ -2763,6 +2770,23 @@ private:
                 // the indexer's appended raw keys.
                 lim.speculative = want_mtp_ || want_dflash_;
                 if (auto why = qsa::runtime_refusal(lim)) throw std::runtime_error(*why);
+                // The block cache is FIXED-shape: it covers block_cap complete
+                // blocks, so a served context longer than block_cap*ratio
+                // tokens cannot be honoured (the graph cannot grow). Refuse
+                // by name rather than run a mask that silently drops keys.
+                if (qsa_geo.block_cap > 0) {
+                    const uint64_t need_blocks =
+                        static_cast<uint64_t>(std::max(req_n_ctx, 1)) /
+                        std::max<size_t>(qsa_ratio, 1);
+                    if (need_blocks > static_cast<uint64_t>(qsa_geo.block_cap)) {
+                        throw std::runtime_error(log::format(
+                            "QSA block cache holds %ld complete blocks (%ld tokens); "
+                            "--n-ctx %d needs %llu blocks and the fixed-shape cache cannot "
+                            "grow: lower --n-ctx or re-export with a larger block cap",
+                            qsa_geo.block_cap, qsa_geo.block_cap * static_cast<int64_t>(qsa_ratio),
+                            req_n_ctx, static_cast<unsigned long long>(need_blocks)));
+                    }
+                }
                 // The refusal the served 0.5.4 artifacts silently violated: the
                 // manifest says qsa but the pass never saw the marker, so no
                 // PagedAttention node carries the selection input. Count the

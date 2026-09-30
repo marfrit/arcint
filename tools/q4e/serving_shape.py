@@ -1739,14 +1739,16 @@ def _indexer_variable(layer, head_dim):
     return ovutil.Variable(info)
 
 
-def _indexer_block_variable(layer, head_dim):
+def _indexer_block_variable(layer, head_dim, block_cap):
     """The indexer's COMPRESSED block-key cache (2026-09-30, prior art
     `docs/campaigns/research-qsa.md`): one pooled + k-normed + roped f32 row
-    per completed ratio-token block, growing in fixed 1024-block steps. Rank 2
-    [-1, dh], one lane, not gathered by `beam_idx` -- the pass's `var_ids_to_remove`
-    names only the KV Variables, so this one and its Assign survive."""
+    per completed ratio-token block, a FIXED [block_cap, head_dim] Variable so
+    every decode step's shape is stable (rows past the valid count are zeroed
+    and score -inf). Not gathered by `beam_idx` -- the pass's
+    `var_ids_to_remove` names only the KV Variables, so this one and its Assign
+    survive."""
     info = ovutil.VariableInfo()
-    info.data_shape = ov.PartialShape([-1, head_dim])
+    info.data_shape = ov.PartialShape([block_cap, head_dim])
     info.data_type = Type.f32
     info.variable_id = f"cache_params.past.indexer_block.{layer}"
     return ovutil.Variable(info)
@@ -2304,12 +2306,15 @@ def _qsa_indexer_mask_served(hidden, pid, config, state, layer, sinks,
     # art (`research-qsa.md`: llama.cpp #28699, vLLM's compressed cache) names
     # the whole-history recompute as the dominant decode cost at depth.
     ratio = int(config.indexer_compress_ratio)
-    bvar = _indexer_block_variable(layer, dh_i)
+    # A FIXED capacity covers n_ctx 32768 (8192 complete blocks); the runtime
+    # ledger charges the slack and load_paged refuses a larger served context.
+    block_cap = 8192
+    bvar = _indexer_block_variable(layer, dh_i, block_cap)
     tvar = _indexer_tail_variable(layer, dh_i, ratio - 1)
     pvar = _indexer_pos_variable(layer)
     mask = qattn._qsa_block_cache_mask(qi, raw, pid, config, state,
                                        rope_cos, rope_sin, rotary,
-                                       bvar, tvar, pvar, sinks, layer)
+                                       bvar, tvar, pvar, sinks, layer, block_cap)
     mask = op.transpose(mask, op.constant(np.array([2, 1, 0, 3], np.int32)))
     mask.set_friendly_name(f"attn{layer}/qsa_mask")
     # the exporter's marker (qsa step 3, T2): the pass routes THIS mask into

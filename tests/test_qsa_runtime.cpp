@@ -53,9 +53,9 @@ std::shared_ptr<ov::Model> build_mixed_state_model() {
     };
 
     add_state("cache_params.past.indexer_block.0", f32,
-              ov::PartialShape{-1, kIndexerHeadDim}, ov::Shape{0, kIndexerHeadDim});
+              ov::PartialShape{8, kIndexerHeadDim}, ov::Shape{8, kIndexerHeadDim});
     add_state("cache_params.past.indexer_block.1", f32,
-              ov::PartialShape{-1, kIndexerHeadDim}, ov::Shape{0, kIndexerHeadDim});
+              ov::PartialShape{8, kIndexerHeadDim}, ov::Shape{8, kIndexerHeadDim});
     add_state("cache_params.past.indexer_tail.0", f32,
               ov::PartialShape{3, kIndexerHeadDim}, ov::Shape{3, kIndexerHeadDim});
     add_state("cache_params.past.indexer_tail.1", f32,
@@ -89,6 +89,7 @@ TEST(qsa_state_geometry_counts_indexer_variables_and_not_kv) {
     // seq) must not be charged as indexer state.
     CHECK_EQ(g.n_layer, size_t{2});
     CHECK_EQ(g.block_row_bytes, uint64_t{kIndexerHeadDim} * 4u);
+    CHECK_EQ(g.block_cap, int64_t{8});
     // tails (2 x 3 x 128 x 4) + counters (2 x 1 x 4).
     CHECK_EQ(g.fixed_bytes, uint64_t{2} * 3u * kIndexerHeadDim * 4u + 2u * 4u);
 }

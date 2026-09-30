@@ -55,6 +55,7 @@ struct StateGeometry {
     size_t   n_layer         = 0;
     uint64_t block_row_bytes = 0;   // per layer, per completed block
     uint64_t fixed_bytes     = 0;   // tail + counter over every layer
+    int64_t  block_cap       = 0;   // fixed block capacity per layer (rows)
 };
 
 inline StateGeometry state_geometry(const std::shared_ptr<ov::Model>& model) {
@@ -67,7 +68,7 @@ inline StateGeometry state_geometry(const std::shared_ptr<ov::Model>& model) {
         if (ps.rank().is_dynamic()) continue;
         const int64_t rank = ps.rank().get_length();
         if (id.rfind("cache_params.past.indexer_block.", 0) == 0) {
-            // The seq dim (index 0) is dynamic and ignored; dims 1.. are the
+            // The seq dim (index 0) is the FIXED capacity; dims 1.. are the
             // per-block row.
             uint64_t per_block = 1;
             bool     ok        = true;
@@ -77,6 +78,7 @@ inline StateGeometry state_geometry(const std::shared_ptr<ov::Model>& model) {
             }
             if (!ok) continue;
             g.block_row_bytes = per_block * static_cast<uint64_t>(info.data_type.size());
+            if (ps[0].is_static()) g.block_cap = ps[0].get_length();
             ++g.n_layer;
         } else if (id.rfind("cache_params.past.indexer_tail.", 0) == 0 ||
                    id.rfind("cache_params.past.indexer_pos.", 0) == 0) {

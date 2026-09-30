@@ -506,7 +506,8 @@ def _qsa_mask_dynamic(qn, raw_full, pid, config, cosT_c, sinT_c, rotary, state):
 
 
 def _qsa_block_cache_mask(qn, new_raw, pid, config, state, cosT_c, sinT_c,
-                          rotary, block_var, tail_var, pos_var, sinks, layer):
+                          rotary, block_var, tail_var, pos_var, sinks, layer,
+                          block_cap):
     """The compressed block-key cache (2026-09-30; prior art
     `docs/campaigns/research-qsa.md`). One POOLED + k-normed + roped f32 row
     per completed `ratio`-token block, PLUS the <= ratio-1 raw keys of the
@@ -516,18 +517,21 @@ def _qsa_block_cache_mask(qn, new_raw, pid, config, state, cosT_c, sinT_c,
     complete at that query) and the stable lower-index TopK rule is unchanged.
 
     `qn` [1,T,nh,dh] is the query normed and roped at its own position;
-    `new_raw` [1,T,dh] the new raw keys (pre-norm, pre-rope). Returns the
-    additive [1,1,T,N] mask. The block Variable grows in fixed 1024-block
-    steps (4096 tokens), so a decode step's tensors are stable between steps;
-    rows past the valid count score -inf and are never selected."""
+    `new_raw` [1,T,dh] the new raw keys (pre-norm, pre-rope). The block state
+    is a FIXED [block_cap, dh] Variable -- shape-stable across every decode
+    step -- with rows past the valid count scored -inf. Every Range here has a
+    CONSTANT bound: the GPU plugin throws "Count is called for dynamic shape"
+    on a dynamically bounded Range (measured 2026-09-30 at load), so the
+    per-block positions and the token index are built over the fixed cap and
+    sliced."""
     nh = int(config.indexer_n_heads)
     dh = int(config.indexer_head_dim)
     ratio = int(config.indexer_compress_ratio)
     block_topk = int(config.indexer_budget) // ratio
     eps = config.rms_norm_eps
     minf = np.float32(np.finfo(np.float32).min)
-    bucket = 1024                 # fixed block steps, 4096 tokens
     tail_cap = ratio - 1
+    cap = int(block_cap)
     i64 = lambda v: op.constant(np.array(v, np.int64))
     cf = lambda v: _c(np.float32(v))
     sqrt_dh = cf(np.sqrt(dh))
@@ -536,8 +540,8 @@ def _qsa_block_cache_mask(qn, new_raw, pid, config, state, cosT_c, sinT_c,
         return op.squeeze(op.gather(op.shape_of(n, output_type="i64"), i64([0]), i64(0)),
                           i64(0))
 
-    # --- state
-    blocks = op.read_value(_c(np.zeros((0, dh), np.float32)), block_var)      # [cap_old, dh]
+    # --- state (fixed shapes)
+    blocks = op.read_value(_c(np.zeros((cap, dh), np.float32)), block_var)     # [cap, dh]
     tail = op.read_value(_c(np.zeros((tail_cap, dh), np.float32)), tail_var)  # [tail_cap, dh]
     pos = op.read_value(op.constant(np.array([0], np.int32)), pos_var)        # [1] i32
     pos_s = op.convert(op.squeeze(pos, i64(0)), Type.i64)                     # scalar i64
@@ -556,33 +560,36 @@ def _qsa_block_cache_mask(qn, new_raw, pid, config, state, cosT_c, sinT_c,
     pooled = op.reduce_mean(complete, i64(2), keep_dims=False)                # pin 743 f32 mean
     pooled = _reshape(pooled, [1, -1, 1, dh])
     pooled = _rmsnorm_hd(pooled, state["indexer.k_layernorm.weight"], eps, dh)  # pin 744
-    start0 = op.multiply(nb_old, i64(ratio))
-    starts = op.range(start0, op.add(start0, used_s), i64(ratio), Type.i64)   # [n_new]
-    cos_b = _reshape(op.gather(cosT_c, starts, i64(0)), [1, -1, 1, rotary])
-    sin_b = _reshape(op.gather(sinT_c, starts, i64(0)), [1, -1, 1, rotary])
+    # Rope positions for the new blocks, over a CONSTANT index range; gather
+    # the whole cap and slice to n_new (no dynamically bounded Range).
+    t_all = op.range(i64(0), i64(cap), i64(1), Type.i64)                      # [cap]
+    pos_all = op.multiply(op.add(nb_old, t_all), i64(ratio))                  # [cap]
+    cos_all = op.gather(cosT_c, pos_all, i64(0))                             # [cap, rotary]
+    sin_all = op.gather(sinT_c, pos_all, i64(0))
+    cos_b = _reshape(op.slice(cos_all, i64([0]), op.unsqueeze(n_new, i64(0)), i64([1]), i64([0])),
+                      [1, -1, 1, rotary])
+    sin_b = _reshape(op.slice(sin_all, i64([0]), op.unsqueeze(n_new, i64(0)), i64([1]), i64([0])),
+                      [1, -1, 1, rotary])
     pooled = _reshape(_rope_last(pooled, cos_b, sin_b, rotary), [-1, dh])     # pin 745-749
 
-    # --- append into the block state, bucketed to fixed steps. Keep only the
-    # valid rows (the old bucket's padding is dropped) so the bucket never
-    # shrinks below what is already written.
+    # --- append: valid rows only, then zero-pad back to the fixed cap.
     used = op.add(nb_old, n_new)
-    ceil = op.floor(op.divide(op.add(used, i64(bucket - 1)), i64(bucket)))
-    cap_new = op.multiply(ceil, i64(bucket))
     valid_old = op.slice(blocks, i64([0]), op.unsqueeze(nb_old, i64(0)), i64([1]), i64([0]))
     appended = op.concat([valid_old, pooled], axis=0)
-    pad = op.subtract(cap_new, used)
+    pad = op.subtract(i64(cap), used)
     zeros = op.broadcast(cf(0.0), op.concat([op.unsqueeze(pad, i64(0)), i64([dh])], 0))
-    blocks_new = op.concat([appended, zeros], axis=0)
+    blocks_new = op.concat([appended, zeros], axis=0)                         # [cap, dh]
     blk = op.assign(blocks_new, block_var)
     blk.set_friendly_name(f"attn{layer}/qsa_block_assign")
     sinks.append(blk)
 
-    # --- new tail = the leftover raw keys; position advances
+    # --- new tail = the leftover raw keys, zero-padded to tail_cap.
     leftover = op.subtract(stream_len, used_s)
     tail_pick = op.slice(stream, op.unsqueeze(used_s, i64(0)), op.unsqueeze(stream_len, i64(0)),
                          i64([1]), i64([0]))
-    idx = op.unsqueeze(op.range(i64(0), leftover, i64(1), Type.i64), i64(1))
-    tail_new = op.scatter_nd_update(_c(np.zeros((tail_cap, dh), np.float32)), idx, tail_pick)
+    pad_t = op.subtract(i64(tail_cap), leftover)
+    zeros_t = op.broadcast(cf(0.0), op.concat([op.unsqueeze(pad_t, i64(0)), i64([dh])], 0))
+    tail_new = op.concat([tail_pick, zeros_t], axis=0)                        # [tail_cap, dh]
     tasg = op.assign(tail_new, tail_var)
     tasg.set_friendly_name(f"attn{layer}/qsa_tail_assign")
     sinks.append(tasg)
@@ -603,7 +610,7 @@ def _qsa_block_cache_mask(qn, new_raw, pid, config, state, cosT_c, sinT_c,
 
     pid_s = op.squeeze(pid, i64([0]))                                         # [T]
     lim_col = op.unsqueeze(op.divide(op.add(pid_s, i64(1)), i64(ratio)), i64(1))  # [T,1] blocks
-    b_idx = op.range(i64(0), cap_new, i64(1), Type.i64)                       # [cap]
+    b_idx = op.range(i64(0), i64(cap), i64(1), Type.i64)                      # [cap] constant
     visible = op.less(op.unsqueeze(b_idx, i64(0)), lim_col)                   # [T, cap]
     s = op.select(visible, s, cf(-np.inf))
     tk = _opset11.topk(s, op.constant(np.int64(block_topk)), 1, "max", "value", Type.i64,
@@ -612,14 +619,16 @@ def _qsa_block_cache_mask(qn, new_raw, pid, config, state, cosT_c, sinT_c,
     zeros_s = op.broadcast(cf(0.0), op.shape_of(s, output_type="i64"))
     blocksel = op.scatter_elements_update(zeros_s, tk.output(1), kept, i64(1))  # [T, cap] 0/1
 
-    # --- expand selected blocks to tokens, then the positional tail
+    # --- expand selected blocks to tokens, then the positional tail. The token
+    # index is a CONSTANT range to cap*ratio, sliced to N.
     tokensel = op.concat([op.unsqueeze(blocksel, i64(2))] * ratio, axis=2)
     tokensel = op.reshape(tokensel, i64([0, -1]), True)                       # [T, cap*ratio]
     n_len = op.add(pos_s, t_s)                                               # N = past + T
     tokensel = op.slice(tokensel, i64([0]), op.unsqueeze(n_len, i64(0)), i64([1]), i64([1]))
-    j = op.unsqueeze(op.range(i64(0), n_len, i64(1), Type.i64), i64(0))       # [1, N]
-    tail_mask = op.logical_and(op.greater_equal(j, op.multiply(lim_col, i64(ratio))),
-                               op.less_equal(j, op.unsqueeze(pid_s, i64(1))))
+    j_all = op.unsqueeze(op.range(i64(0), i64(cap * ratio), i64(1), Type.i64), i64(0))  # [1, cap*ratio]
+    tail_full = op.logical_and(op.greater_equal(j_all, op.multiply(lim_col, i64(ratio))),
+                               op.less_equal(j_all, op.unsqueeze(pid_s, i64(1))))
+    tail_mask = op.slice(tail_full, i64([0]), op.unsqueeze(n_len, i64(0)), i64([1]), i64([1]))
     allowed = op.maximum(tokensel, op.convert(tail_mask, Type.f32))
     mask = op.select(op.greater(allowed, cf(0.5)), cf(0.0), cf(minf))
     return op.unsqueeze(mask, i64([0, 1]))                                    # [1, 1, T, N]
