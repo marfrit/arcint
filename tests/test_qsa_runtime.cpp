@@ -28,10 +28,11 @@ namespace {
 constexpr size_t kIndexerHeadDim = 128;   // Flash-Next's indexer_head_dim
 constexpr size_t kFlashNextQsa   = 12;    // its full-attention (QSA) layers
 
-// A model with two indexer Variables ([1, -1, 128] f32) and one KV Variable
+// A model with two COMPRESSED block-cache Variables ([-1, 128] f32), two raw
+// tails ([3, 128]) and two counters ([1] i32), plus one KV Variable
 // ([−1, kv, −1, 128]) whose id deliberately contains ".key." -- the loader's
 // is_kv() predicate -- so a scan that classified by id substring would count
-// it. The indexer's own id "cache_params.past.indexer_key.N" does not.
+// it. The indexer's own ids ("cache_params.past.indexer_block.N" etc.) do not.
 std::shared_ptr<ov::Model> build_mixed_state_model() {
     using ov::element::f32;
     using ov::op::util::Variable;
@@ -40,22 +41,31 @@ std::shared_ptr<ov::Model> build_mixed_state_model() {
     ov::SinkVector sinks;
     std::shared_ptr<ov::op::v6::ReadValue> first_read;
 
-    auto add_state = [&](const std::string& id, const ov::PartialShape& shape,
-                         const ov::Shape& init_shape) {
-        auto info = VariableInfo{shape, f32, id};
+    auto add_state = [&](const std::string& id, const ov::element::Type& et,
+                         const ov::PartialShape& shape, const ov::Shape& init_shape) {
+        auto info = VariableInfo{shape, et, id};
         auto var  = std::make_shared<Variable>(info);
-        auto init = std::make_shared<ov::op::v0::Constant>(f32, init_shape);
+        auto init = std::make_shared<ov::op::v0::Constant>(et, init_shape);
         auto rv   = std::make_shared<ov::op::v6::ReadValue>(init, var);
         auto as   = std::make_shared<ov::op::v6::Assign>(rv, var);
         sinks.push_back(as);
         if (!first_read) first_read = rv;
     };
 
-    add_state("cache_params.past.indexer_key.0", ov::PartialShape{1, -1, kIndexerHeadDim},
-              ov::Shape{1, 0, kIndexerHeadDim});
-    add_state("cache_params.past.indexer_key.1", ov::PartialShape{1, -1, kIndexerHeadDim},
-              ov::Shape{1, 0, kIndexerHeadDim});
-    add_state("cache_params.past.0.key", ov::PartialShape{-1, 2, -1, kIndexerHeadDim},
+    add_state("cache_params.past.indexer_block.0", f32,
+              ov::PartialShape{-1, kIndexerHeadDim}, ov::Shape{0, kIndexerHeadDim});
+    add_state("cache_params.past.indexer_block.1", f32,
+              ov::PartialShape{-1, kIndexerHeadDim}, ov::Shape{0, kIndexerHeadDim});
+    add_state("cache_params.past.indexer_tail.0", f32,
+              ov::PartialShape{3, kIndexerHeadDim}, ov::Shape{3, kIndexerHeadDim});
+    add_state("cache_params.past.indexer_tail.1", f32,
+              ov::PartialShape{3, kIndexerHeadDim}, ov::Shape{3, kIndexerHeadDim});
+    add_state("cache_params.past.indexer_pos.0", ov::element::i32, ov::PartialShape{1},
+              ov::Shape{1});
+    add_state("cache_params.past.indexer_pos.1", ov::element::i32, ov::PartialShape{1},
+              ov::Shape{1});
+    add_state("cache_params.past.0.key", f32,
+              ov::PartialShape{-1, 2, -1, kIndexerHeadDim},
               ov::Shape{0, 2, 0, kIndexerHeadDim});
 
     auto res   = std::make_shared<ov::op::v0::Result>(first_read);
@@ -67,17 +77,20 @@ std::shared_ptr<ov::Model> build_mixed_state_model() {
 }  // namespace
 
 TEST(qsa_state_bytes_per_token_is_the_flash_next_geometry) {
-    // 12 layers x 128 head_dim x 4 B = 6144 B = 6 KiB/token.
-    CHECK_EQ(qsa::state_bytes_per_token(kFlashNextQsa, kIndexerHeadDim), 6144u);
-    CHECK_EQ(qsa::state_bytes_per_token(0, kIndexerHeadDim), 0u);
+    // 12 layers x 128 head_dim x 4 B / ratio 4 = 1536 B = 1.5 KiB/token.
+    CHECK_EQ(qsa::state_bytes_per_token(kFlashNextQsa, kIndexerHeadDim, 4), 1536u);
+    CHECK_EQ(qsa::state_bytes_per_token(0, kIndexerHeadDim, 4), 0u);
+    CHECK_EQ(qsa::state_bytes_per_token(kFlashNextQsa, kIndexerHeadDim, 0), 0u);
 }
 
 TEST(qsa_state_geometry_counts_indexer_variables_and_not_kv) {
     const qsa::StateGeometry g = qsa::state_geometry(build_mixed_state_model());
-    // The two indexer Variables only; the ".key." KV Variable (rank 4, dynamic
+    // The two block caches only; the ".key." KV Variable (rank 4, dynamic
     // seq) must not be charged as indexer state.
     CHECK_EQ(g.n_layer, size_t{2});
-    CHECK_EQ(g.bytes_per_token, 2u * kIndexerHeadDim * 4u);
+    CHECK_EQ(g.block_row_bytes, uint64_t{kIndexerHeadDim} * 4u);
+    // tails (2 x 3 x 128 x 4) + counters (2 x 1 x 4).
+    CHECK_EQ(g.fixed_bytes, uint64_t{2} * 3u * kIndexerHeadDim * 4u + 2u * 4u);
 }
 
 TEST(qsa_option_a_allows_the_safe_config) {

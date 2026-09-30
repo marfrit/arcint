@@ -1730,11 +1730,47 @@ def _indexer_variable(layer, head_dim):
     `beam_idx` (the pass deletes that Parameter, so a gathered Variable would
     lose its input). `SDPAToPagedAttention` removes only the KV Assigns it
     matched (`sdpa_to_paged_attention.cpp`, `var_ids_to_remove`), so this
-    Variable and its Assign survive the transformation."""
+    Variable and its Assign survive the transformation. KEPT for the step-1/2
+    recompute path; the served emitter now uses the block cache below."""
     info = ovutil.VariableInfo()
     info.data_shape = ov.PartialShape([1, -1, head_dim])
     info.data_type = Type.f32
     info.variable_id = f"cache_params.past.indexer_key.{layer}"
+    return ovutil.Variable(info)
+
+
+def _indexer_block_variable(layer, head_dim):
+    """The indexer's COMPRESSED block-key cache (2026-09-30, prior art
+    `docs/campaigns/research-qsa.md`): one pooled + k-normed + roped f32 row
+    per completed ratio-token block, growing in fixed 1024-block steps. Rank 2
+    [-1, dh], one lane, not gathered by `beam_idx` -- the pass's `var_ids_to_remove`
+    names only the KV Variables, so this one and its Assign survive."""
+    info = ovutil.VariableInfo()
+    info.data_shape = ov.PartialShape([-1, head_dim])
+    info.data_type = Type.f32
+    info.variable_id = f"cache_params.past.indexer_block.{layer}"
+    return ovutil.Variable(info)
+
+
+def _indexer_tail_variable(layer, head_dim, tail_cap):
+    """The raw keys of the incomplete tail (<= ratio-1 rows), f32
+    [ratio-1, dh]: the staging buffer that completes the next block."""
+    info = ovutil.VariableInfo()
+    info.data_shape = ov.PartialShape([tail_cap, head_dim])
+    info.data_type = Type.f32
+    info.variable_id = f"cache_params.past.indexer_tail.{layer}"
+    return ovutil.Variable(info)
+
+
+def _indexer_pos_variable(layer):
+    """The tokens the indexer has consumed so far, i32 [1]; derives
+    tail_len = pos % ratio and nb_old = pos // ratio. i32, not i64: the CPU
+    plugin's oneDNN path refuses an i64 ReadValue (measured: "CPU plugin does
+    not support i64 for use with oneDNN")."""
+    info = ovutil.VariableInfo()
+    info.data_shape = ov.PartialShape([1])
+    info.data_type = Type.i32
+    info.variable_id = f"cache_params.past.indexer_pos.{layer}"
     return ovutil.Variable(info)
 
 
@@ -2262,14 +2298,18 @@ def _qsa_indexer_mask_served(hidden, pid, config, state, layer, sinks,
     cq = qgdn._reshape(op.gather(rope_cos, pid, i64(0)), [1, T, 1, rotary])
     sq = qgdn._reshape(op.gather(rope_sin, pid, i64(0)), [1, T, 1, rotary])
     qi = qattn._rope_last(qi, cq, sq, rotary)
-    rvar = _indexer_variable(layer, dh_i)
-    rinit = op.broadcast(op.constant(np.array(0.0, np.float32)), i64([1, 0, dh_i]))
-    raw_full = op.concat([op.read_value(rinit, rvar), raw], axis=1)       # [1,N,dh]
-    assign = op.assign(raw_full, rvar)
-    assign.set_friendly_name(f"attn{layer}/qsa_indexer_assign")
-    sinks.append(assign)
-    mask = qattn._qsa_mask_dynamic(qi, raw_full, pid, config,
-                                   rope_cos, rope_sin, rotary, state)
+    # The compressed block-key cache (2026-09-30): one pooled + k-normed +
+    # roped row per completed block, plus the <= 3 raw tail keys and a token
+    # counter. Only blocks completed by the new tokens are pooled; the prior
+    # art (`research-qsa.md`: llama.cpp #28699, vLLM's compressed cache) names
+    # the whole-history recompute as the dominant decode cost at depth.
+    ratio = int(config.indexer_compress_ratio)
+    bvar = _indexer_block_variable(layer, dh_i)
+    tvar = _indexer_tail_variable(layer, dh_i, ratio - 1)
+    pvar = _indexer_pos_variable(layer)
+    mask = qattn._qsa_block_cache_mask(qi, raw, pid, config, state,
+                                       rope_cos, rope_sin, rotary,
+                                       bvar, tvar, pvar, sinks, layer)
     mask = op.transpose(mask, op.constant(np.array([2, 1, 0, 3], np.int32)))
     mask.set_friendly_name(f"attn{layer}/qsa_mask")
     # the exporter's marker (qsa step 3, T2): the pass routes THIS mask into

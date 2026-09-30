@@ -2746,7 +2746,13 @@ private:
         {
             const qsa::StateGeometry qsa_geo = qsa::state_geometry(model);
             qsa_n_layer_                   = qsa_geo.n_layer;
-            qsa_state_bytes_token_         = qsa_geo.bytes_per_token;
+            // The compressed block cache amortises one f32 row over `ratio`
+            // tokens; the ratio is the artifact config's own value.
+            const size_t qsa_ratio = static_cast<size_t>(
+                artifact_.config.value("indexer_compress_ratio", 4));
+            qsa_state_bytes_token_ =
+                qsa_geo.n_layer * qsa_geo.block_row_bytes / std::max<size_t>(qsa_ratio, 1);
+            qsa_state_fixed_bytes_ = qsa_geo.fixed_bytes;
             if (artifact_.qsa || qsa_n_layer_ > 0) {
                 qsa::RuntimeLimits lim;
                 lim.lanes        = lane_count_;
@@ -2776,9 +2782,11 @@ private:
                     }
                 }
                 log::info("load",
-                          "QSA served: %zu indexer state layer(s), %.1f KiB/token; "
-                          "one lane, no prefix cache, no paged speculation",
-                          qsa_n_layer_, static_cast<double>(qsa_state_bytes_token_) / 1024.0);
+                          "QSA served: %zu compressed block-cache layer(s), %.1f KiB/token "
+                          "(+%.1f KiB fixed tail/counter); one lane, no prefix cache, no paged "
+                          "speculation",
+                          qsa_n_layer_, static_cast<double>(qsa_state_bytes_token_) / 1024.0,
+                          static_cast<double>(qsa_state_fixed_bytes_) / 1024.0);
             }
         }
         if (cfg.slice_logits) {
@@ -7108,9 +7116,29 @@ private:
             // pass 1 pays whatever the first execution of a shape pays (kernel
             // bucket builds on this plugin), pass 2 does not, so the difference
             // is the per-shape first-execution cost.
+            // A QSA artifact's indexer state is NOT rewound by a repeated
+            // forward: each pass appends its tokens to the block cache, so a
+            // second pass would see a doubled history (measured 2026-09-29 at
+            // 5.4 s/step of garbage). Snapshot the Variable TENSORS before pass
+            // 1 (query_state() hands live views, so they are copied) and write
+            // them back before pass 2.
+            std::vector<ov::Tensor> qsa_snaps;
+            if (qsa_n_layer_ > 0) {
+                for (auto& st : lane.req.query_state()) {
+                    ov::Tensor src = st.get_state();
+                    ov::Tensor dst(src.get_element_type(), src.get_shape());
+                    src.copy_to(dst);
+                    qsa_snaps.push_back(dst);
+                }
+            }
             const auto t_p1 = std::chrono::steady_clock::now();
             paged_forward(lane, embed_paged(lane, chunk), at, {0}, 0);
             const double pass1_s = seconds_since(t_p1);
+            if (!qsa_snaps.empty()) {
+                auto states = lane.req.query_state();
+                for (size_t i = 0; i < states.size() && i < qsa_snaps.size(); ++i)
+                    states[i].set_state(qsa_snaps[i]);
+            }
             const auto t_p2 = std::chrono::steady_clock::now();
             paged_forward(lane, embed_paged(lane, chunk), at, {0}, 0);
             const double pass2_s = seconds_since(t_p2);
@@ -8178,6 +8206,7 @@ private:
     // the true KV-pool rate).
     size_t                         qsa_n_layer_           = 0;
     uint64_t                       qsa_state_bytes_token_ = 0;
+    uint64_t                       qsa_state_fixed_bytes_ = 0;  // tail + counter, all layers
     size_t                         logits_keep_rows_ = 0;  // 0: unsliced
     size_t                         cache_grid_       = 0;  // paged snapshot grid; 0: the chunk
     ov::RemoteContext              usm_ctx_;              // for USM-host index inputs

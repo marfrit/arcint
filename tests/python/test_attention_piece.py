@@ -938,6 +938,85 @@ def test_qsa_served_indexer_selects_what_the_step2_stateful_graph_selects(
         past = N
 
 
+def _recompute_indexer_mask_model(cfg, attn_state, indexer_state, layer,
+                                  rope_span):
+    """The RECOMPUTE path (today's pre-cache emitter): the raw-key history in
+    a plain Variable and `_qsa_mask_dynamic` pooling, norming and roping the
+    whole history every call. The oracle for the cached path only."""
+    from openvino import opset13 as op
+    from q4e import gdn as qgdn
+    from q4e import serving_shape as ss
+    H = cfg.hidden_size
+    nh = int(cfg.indexer_n_heads)
+    dh = int(cfg.indexer_head_dim)
+    eps = cfg.rms_norm_eps
+    hidden = op.parameter([1, -1, H], ov.Type.f32)
+    hidden.set_friendly_name("hidden_states")
+    pid = op.parameter([1, -1], ov.Type.i64)
+    pid.set_friendly_name("position_ids")
+    cos_np, sin_np = qattn._freqs_tables(cfg, rope_span)
+    rope_cos, rope_sin = op.constant(cos_np), op.constant(sin_np)
+    rotary = int(rope_cos.get_output_shape(0)[-1])
+    state = {}
+    state.update({k: np.ascontiguousarray(v, np.float32)
+                  for k, v in attn_state.items()})
+    state.update({k: np.ascontiguousarray(v, np.float32)
+                  for k, v in indexer_state.items()})
+    i64 = lambda v: op.constant(np.array(v, np.int64))
+    qk = qgdn._mm(hidden, qattn._c(state["indexer.index_qk_proj.weight"]), tb=True)
+    qi = qgdn._reshape(qgdn._slice(qk, 0, nh * dh, 1, 2), [1, -1, nh, dh])
+    raw = qgdn._slice(qk, nh * dh, (nh + 1) * dh, 1, 2)
+    qi = qattn._rmsnorm_hd(qi, state["indexer.q_layernorm.weight"], eps, dh)
+    cq = qgdn._reshape(op.gather(rope_cos, pid, i64(0)), [1, -1, 1, rotary])
+    sq = qgdn._reshape(op.gather(rope_sin, pid, i64(0)), [1, -1, 1, rotary])
+    qi = qattn._rope_last(qi, cq, sq, rotary)
+    rvar = ss._indexer_variable(layer, dh)
+    rinit = op.broadcast(op.constant(np.array(0.0, np.float32)), i64([1, 0, dh]))
+    raw_full = op.concat([op.read_value(rinit, rvar), raw], axis=1)
+    sinks = [op.assign(raw_full, rvar)]
+    mask = qattn._qsa_mask_dynamic(qi, raw_full, pid, cfg, rope_cos, rope_sin,
+                                   rotary, state)
+    mask = op.transpose(mask, op.constant(np.array([2, 1, 0, 3], np.int32)))
+    res = op.result(mask)
+    res.set_friendly_name("qsa_mask")
+    return ov.Model([res], sinks, [hidden, pid], "qsa_recompute_indexer")
+
+
+def test_qsa_cached_block_key_path_matches_the_recompute_path(
+        cfg, attn_state, indexer_state):
+    """The compressed block-key cache cell (2026-09-30, prior art
+    `docs/campaigns/research-qsa.md`). Chunks [2048, 40] + [1] x 12, the
+    cached served emitter against the RECOMPUTE path (`_qsa_mask_dynamic`
+    pooling, norming and roping the whole history every call): the selection
+    -- the additive per-query mask -- must be BIT-IDENTICAL.
+
+    The three mutants this cell reds: a completed block never appended (the
+    scores lose a block a query can see), a block appended before it is
+    complete (a partial block enters the scores), and the tail dropped (the
+    partial-position rows lose their last keys). Each changes at least one
+    chunk's mask, and the chunks are chosen so a tail exists at past=2048
+    (T=40) and at every decode step. CPU plugin (f32)."""
+    chunks = [2048, 40] + [1] * 12
+    N_all = sum(chunks)
+    hidden_all = _hidden(cfg, N_all)
+    cached = _served_indexer_mask_model(cfg, attn_state, indexer_state, 3, N_all)
+    cr = compile_for(ov.Core(), cached, "CPU").create_infer_request()
+    recompute = _recompute_indexer_mask_model(cfg, attn_state, indexer_state, 3, N_all)
+    rr = compile_for(ov.Core(), recompute, "CPU").create_infer_request()
+    past = 0
+    for T in chunks:
+        N = past + T
+        h = hidden_all[:, past:N]
+        pid = np.arange(past, N, dtype=np.int64).reshape(1, T)
+        ref = np.asarray(rr.infer({0: h.numpy(), 1: pid})[0])       # [T,1,1,N]
+        got = np.asarray(cr.infer({0: h.numpy(), 1: pid})[0])       # [T,1,1,N]
+        assert got.shape == ref.shape, (got.shape, ref.shape)
+        assert np.array_equal(got, ref), (
+            f"chunk past={past} T={T}: the cached block-key mask differs from the "
+            f"recompute mask (max|d| {np.max(np.abs(got - ref)):.3e})")
+        past = N
+
+
 def test_qsa_served_mask_is_exactly_causal_below_the_2051_boundary(cfg):
     """T1a cell 3: below 2,051 tokens every row keeps every visible key, so
     the served indexer's mask EQUALS the dense causal mask exactly -- which is
@@ -1038,9 +1117,12 @@ def test_qsa_off_leaves_the_serving_shape_graph_unchanged():
     def var_ids(model):
         return sorted(v.get_info().variable_id for v in model.get_variables())
     off_ids, on_ids = var_ids(off), var_ids(on)
-    assert not any("indexer_key" in i for i in off_ids), off_ids
-    assert sum("indexer_key" in i for i in on_ids) == r_on["attn_layers"] == 1, on_ids
-    assert "cache_params.past.indexer_key.3" in on_ids
+    assert not any("indexer_block" in i for i in off_ids), off_ids
+    assert sum("indexer_block" in i for i in on_ids) == r_on["attn_layers"] == 1, on_ids
+    assert "cache_params.past.indexer_block.3" in on_ids
+    # the compressed block cache carries the raw tail and the token counter too
+    assert "cache_params.past.indexer_tail.3" in on_ids
+    assert "cache_params.past.indexer_pos.3" in on_ids
 
     def markers(model):
         n = 0
@@ -1098,11 +1180,13 @@ def test_qsa_indexer_state_survives_the_paged_attention_pass():
         model, _ = ss.build_serving_shape_ir(arena=arena, n_layers=4, qsa=True)
         paged_attention_transformation(model)
         ops = model.get_ops()
-        var = "cache_params.past.indexer_key.3"
-        assert any(n.get_type_name() == "ReadValue" and n.get_variable_id() == var
-                   for n in ops), "the indexer ReadValue did not survive the pass"
-        assert any(n.get_type_name() == "Assign" and n.get_variable_id() == var
-                   for n in ops), "the indexer Assign did not survive the pass"
+        for var in ("cache_params.past.indexer_block.3",
+                    "cache_params.past.indexer_tail.3",
+                    "cache_params.past.indexer_pos.3"):
+            assert any(n.get_type_name() == "ReadValue" and n.get_variable_id() == var
+                       for n in ops), f"the indexer ReadValue {var} did not survive the pass"
+            assert any(n.get_type_name() == "Assign" and n.get_variable_id() == var
+                       for n in ops), f"the indexer Assign {var} did not survive the pass"
         # the KV state is consumed into the paged caches, and beam_idx is gone
         live = {n.get_variable_id() for n in ops if n.get_type_name() == "ReadValue"}
         assert "cache_params.past.key.3" not in live

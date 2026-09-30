@@ -33,23 +33,28 @@
 namespace lgc {
 namespace qsa {
 
-// The indexer's raw-key history, per token per lane: `n_layer` layers, each
-// one f32 row of `indexer_head_dim`. Flash-Next: 12 x 128 x 4 B = 6144 B =
-// 6 KiB/token, 192 MiB at 32k.
-inline uint64_t state_bytes_per_token(size_t n_layer, size_t indexer_head_dim) {
+// The indexer's per-token state rate: the compressed block cache stores ONE
+// f32 row of `indexer_head_dim` per completed `ratio`-token block, so the
+// row AMORTISES over `ratio` tokens. Flash-Next: 12 x 128 x 4 B / 4 = 1536 B =
+// 1.5 KiB/token. This is the per-token term; the raw tail, the token counter
+// and one bucket of capacity slack are fixed and reported beside it.
+inline uint64_t state_bytes_per_token(size_t n_layer, size_t indexer_head_dim,
+                                      size_t ratio) {
+    if (ratio == 0) return 0;
     return static_cast<uint64_t>(n_layer) * static_cast<uint64_t>(indexer_head_dim) *
-           sizeof(float);
+           sizeof(float) / ratio;
 }
 
 #ifdef ARCINT_OPENVINO
 
-// One f32 [1, past, head_dim] Variable per QSA layer, id
-// "cache_params.past.indexer_key.<layer>" (tools/q4e/serving_shape.py's
-// `_indexer_variable`). The seq dim is dynamic and ignored; the trailing dims
-// are the per-token row.
+// One compressed block cache per QSA layer: a f32 [-1, head_dim] block-row
+// Variable (`cache_params.past.indexer_block.<layer>`), plus the fixed raw
+// tail (`...indexer_tail.<layer>`, [ratio-1, head_dim]) and the token counter
+// (`...indexer_pos.<layer>`, [1] i32).
 struct StateGeometry {
     size_t   n_layer         = 0;
-    uint64_t bytes_per_token = 0;
+    uint64_t block_row_bytes = 0;   // per layer, per completed block
+    uint64_t fixed_bytes     = 0;   // tail + counter over every layer
 };
 
 inline StateGeometry state_geometry(const std::shared_ptr<ov::Model>& model) {
@@ -57,19 +62,32 @@ inline StateGeometry state_geometry(const std::shared_ptr<ov::Model>& model) {
     if (!model) return g;
     for (const auto& var : model->get_variables()) {
         const ov::op::util::VariableInfo& info = var->get_info();
-        if (info.variable_id.rfind("cache_params.past.indexer_key.", 0) != 0) continue;
-        const ov::PartialShape& ps = info.data_shape;
+        const std::string&               id   = info.variable_id;
+        const ov::PartialShape&          ps   = info.data_shape;
         if (ps.rank().is_dynamic()) continue;
         const int64_t rank = ps.rank().get_length();
-        if (rank < 3) continue;
-        uint64_t per_token = 1;
-        for (int64_t i = 2; i < rank; ++i) {
-            if (ps[i].is_dynamic()) { per_token = 0; break; }
-            per_token *= static_cast<uint64_t>(ps[i].get_length());
+        if (id.rfind("cache_params.past.indexer_block.", 0) == 0) {
+            // The seq dim (index 0) is dynamic and ignored; dims 1.. are the
+            // per-block row.
+            uint64_t per_block = 1;
+            bool     ok        = true;
+            for (int64_t i = 1; i < rank; ++i) {
+                if (ps[i].is_dynamic()) { ok = false; break; }
+                per_block *= static_cast<uint64_t>(ps[i].get_length());
+            }
+            if (!ok) continue;
+            g.block_row_bytes = per_block * static_cast<uint64_t>(info.data_type.size());
+            ++g.n_layer;
+        } else if (id.rfind("cache_params.past.indexer_tail.", 0) == 0 ||
+                   id.rfind("cache_params.past.indexer_pos.", 0) == 0) {
+            uint64_t bytes = 1;
+            bool     ok    = true;
+            for (int64_t i = 0; i < rank; ++i) {
+                if (ps[i].is_dynamic()) { ok = false; break; }
+                bytes *= static_cast<uint64_t>(ps[i].get_length());
+            }
+            if (ok) g.fixed_bytes += bytes * static_cast<uint64_t>(info.data_type.size());
         }
-        if (per_token == 0) continue;
-        g.bytes_per_token += per_token * static_cast<uint64_t>(info.data_type.size());
-        ++g.n_layer;
     }
     return g;
 }
