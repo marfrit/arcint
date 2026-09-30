@@ -696,14 +696,16 @@ std::vector<ModelEntry> build_registry() {
     }
 
     {
-        // qwen3.8-flash-next-d48q8qsa (campaign qsa, step 3 T5, 2026-09-28):
-        // the d48q8 artifact re-exported with `--qsa`, so its 12 full-attention
-        // layers carry the model's own indexer, the served selection and the
-        // route-gate boundary (rt_info qsa_boundary 2051). The indexer tensors
-        // are additive over the same dense-q8 checkpoint. Hashes read off the
-        // export log (tools/export_serving_artifact.py --layers 48 --qsa
-        // --dense-q8 --dense-u8, tree 4f05b21, peak host 51.41 GiB). This is
-        // the artifact the T6 card windows serve.
+        // qwen3.8-flash-next-d48q8qsa (campaign qsa, step 3): the d48q8
+        // artifact re-exported with `--qsa`, so its 12 full-attention layers
+        // carry the model's own indexer. The selection marker lives in model
+        // rt_info; load_paged re-applies it and refuses unless 12 PagedAttention
+        // nodes take the selection. Re-exported 2026-09-30 with d48q8's own
+        // tree and flags except --qsa (tools/export_serving_artifact.py
+        // --layers 48 --qsa --expert-format native --dense-q8 --dense-u8, tree
+        // 7f57d87, peak host 51.24 GiB); supersedes the tree-4f05b21 u4 export,
+        // whose node-level marker did not survive serialization. Hashes read
+        // off the export log.
         ModelEntry e;
         e.id                      = "qwen3.8-flash-next-d48q8qsa";
         e.family                  = "qwen3.8";
@@ -720,10 +722,10 @@ std::vector<ModelEntry> build_registry() {
         e.n_layer                 = 48;
         e.n_ctx_train             = 262144;
         e.quants                  = {Quant::Q4};
-        e.arch_hash               = "e248c2e11761b40e";
+        e.arch_hash               = "7b5a05b5fd2183ef";
         e.template_hash           = "12827f24b742ea4e";
         e.tokenizer_hash          = "87a7830d63fcf43b";
-        e.weights_bytes           = 68586602590ull;
+        e.weights_bytes           = 65219394096ull;
         e.status                  = "d48q8 with the model's own QSA indexer (--qsa) on the 12 "
                                     "full-attention layers; the served step-3 arm";
         e.sampler = qwen_card_defaults();

@@ -56,8 +56,8 @@ TEST(registry_holds_exactly_the_target_models) {
     CHECK_EQ(find_model("qwen3.8-flash-next-d4qsa")->arch_hash, std::string("ac2768861ae100f2"));
     CHECK_EQ(find_model("qwen3.8-flash-next-d4qsa")->weights_bytes, 6533163230ull);
     CHECK(find_by_artifact("qwen38-flash-next-d48q8qsa-ov") == find_model("qwen3.8-flash-next-d48q8qsa"));
-    CHECK_EQ(find_model("qwen3.8-flash-next-d48q8qsa")->arch_hash, std::string("e248c2e11761b40e"));
-    CHECK_EQ(find_model("qwen3.8-flash-next-d48q8qsa")->weights_bytes, 68586602590ull);
+    CHECK_EQ(find_model("qwen3.8-flash-next-d48q8qsa")->arch_hash, std::string("7b5a05b5fd2183ef"));
+    CHECK_EQ(find_model("qwen3.8-flash-next-d48q8qsa")->weights_bytes, 65219394096ull);
     CHECK(find_model("qwen3.8-flash-next-d48p2") != nullptr);
     CHECK(find_by_artifact("qwen38-flash-next-d48p2-ov") == find_model("qwen3.8-flash-next-d48p2"));
     CHECK_EQ(find_model("qwen3.8-flash-next-d48p2")->arch_hash, std::string("1c54b317448a6ddc"));
