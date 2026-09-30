@@ -119,3 +119,16 @@ change. A slot is a hit only for the identical span list. Everything else
   bank is slightly slower than the mapping (29.48/30.39 s against 28.92 s)
   stays an open finding with an unmeasured mechanism, recorded rather than
   smoothed.
+
+- 2026-09-30. **The same-host llama.cpp bar at 20,085 tokens is not runnable
+  on this host** (`measured-here`). llama.cpp (`origin/master`,
+  `src/models/qwen4exp.cpp`) was built with Vulkan and loads the same
+  UD-Q3_K_XL GGUF. Both arms -- CPU-only (`-ngl 0`) and Vulkan with all MoE on
+  CPU (`-ngl 99 -ncmoe 99`) -- thrash the page cache: the model is 83.80 GiB
+  against the container's 52 GiB and `/models` reads at ~170 MB/s. The Vulkan
+  arm reached `read_bytes` 98.5 GB in 100 min (past the model's own 90 GB, i.e.
+  re-reading) and the CPU-only arm 81.7 GB in 48 min, both pinned in `D` state;
+  neither reached llama-bench's table. A 64-token CPU-only probe did complete:
+  pp64 4.26 t/s, tg4 0.75 t/s. The bar needs a host that can hold the model
+  resident (>= 128 GiB) or a reduced depth; page-cache pressure is the first
+  fact of any such comparison, and no per-token CPU-expert number was obtained.
