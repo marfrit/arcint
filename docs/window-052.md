@@ -321,3 +321,24 @@ above; `G = 1.10` and the V1 verdict stand. The ratio-50 point is refused on
 the A770 (16 GiB card) and did not return on the B60. Raw evidence in
 `docs/campaigns/sub4bit-vram-kernel.md`, status 2026-09-22 (rate leg). The
 stale-byte proof stays EMPTY (no engine-side host/card readback).
+
+## Acceptance commit — VENICE-001, operator-approved re-gating (2026-10-01)
+
+Appended 2026-10-01. The operator re-gated the speed row to **today's served
+native Flash-Next decode against the recorded `d48n` host-bound baseline**,
+both from the record, rather than to the residency-policy arm. Nothing here is
+a new measurement. The policy rows (stale-byte, convergence, quality) are
+unchanged and quoted from the entries above.
+
+| row | value / status | marker | evidence class | on record |
+|---|---|---|---|---|
+| speed | warm decode ≥ G × the host-bound baseline | **PASS.** Served `d48n` hybrid, **A770 `GPU.1`**, GT clock pinned 2000 MHz, patch **0068** (plugin `06695f128d943a6d`) against the installed `+p20` (series 0003–0067, plugin `5dadc0640cc5b139`), `--offload-ratio 75 --moe-cpu-tier --moe-per-expert-dispatch`, u8 KV, `--n-ctx 8192`, chunk 512, one lane; four arms base / 0068 / base / 0068, 32 greedy tokens: 0068 d1 **0.9 / 1.2 t/s**, d512 **1.2 / 1.3 t/s**; base d1 0.5 / 0.6, d512 0.6 / 0.6. Baseline `H` = the recorded `d48n` host-tier **0.5–0.8 t/s** (B60, ratio 99 + tier, KV u8, f16, chunk 512). `G = 1.10` read at the band's upper edge `0.8` → threshold **0.88 t/s**, and every 0068 arm is at or above it (the A770 same-day threshold 1.10 × 0.526 = **0.579 t/s** also passes). The four arms' greedy digests are byte-identical: d1 `1ddebc829f218598`, d512 `e4b40e198c8f22a6` | `measured-here` | `measured-here` | DESIGN §7.0.2cx; CHANGELOG Unreleased "CPU tier: AVX2 row decode and a row-per-lane single-job dot" (commit `0e0ef26`) |
+| speed (original policy arm, unchanged) | ratio-99 census seed **0.556 t/s** < 0.579 (V1 fires); ratio-75 census top-128 **0.842 t/s** against the same-config host control **0.465 t/s** = **1.81×** (`ρ = 0.073`) | `measured-here` | `measured-here` | the rate-leg entries above; `docs/campaigns/sub4bit-vram-kernel.md`, status 2026-09-22 |
+| stale-byte zero proof | **EMPTY** — needs an engine-side host/card readback that does not exist | `EMPTY` | `code` | the entries above |
+| convergence | **V3 FIRES**: `rounds_to_plateau = None`, `plateau = False` at S = 6 and S = 10, at 512 and 4,096 decode tokens | `measured-here` | `measured-here` | the entries above; `docs/campaigns/expert-hot-set-lru.md` |
+| quality under policy | **PASS on the non-dispatch path** (byte-identical digest `2169836b…336f`); **V4 FIRES (RED) on the dispatch route** (the answer depends on the resident seed; quantified 2026-09-22) | `measured-here` | `measured-here` | the entries above; DESIGN §7.0.2cf |
+
+**Verdict.** Under the operator's re-gating the **speed row reads PASS** on the
+served route. The hot-set policy's own ratio-99 arm stays V1 (recorded), and
+the stale-byte / convergence / dispatch-quality rows keep their existing
+status.
