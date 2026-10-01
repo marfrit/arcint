@@ -318,3 +318,37 @@ change. A slot is a hit only for the identical span list. Everything else
     0.7974 vs 0.7981. The B60's recorded run-to-run floor is **0.136** (nats,
     mean), so the 0074 delta is well inside it -- the adoption stands on the
     numerics too. The rows at or above 2,051 stay void until T8.
+
+- 2026-10-01. **Decode-only decomposition, uncontaminated** (CLIntercept;
+  shape-routed 0074; B60; services stopped). Short 512-token prompt (507
+  prefill), two fresh processes `max_tokens` 16 and 528 (the 528 run stopped
+  at 330 on EOS), so the delta is **314 decode tokens** with load and prefill
+  cancelled. Counts are exact; times carry the ~5 s prefill-rate variance
+  between fresh processes.
+
+  | term | per decode token |
+  |---|---|
+  | wall | 136 ms |
+  | device busy | ~73 ms (excluding the variable device `HtoH` copy) |
+  | device idle | ~63 ms (~46 %) |
+  | host syncs | 362 `clWaitForEvents` + 2 `clFinish` + blocking copies |
+  | kernel launches | 761 `gemm_kernel`, 42 batched expert gate_up, 42 down |
+  | HtoD calls | 308 |
+  | DtoM calls | 48 (one per MoE layer) |
+
+  - **Bytes** (CallLogging on a 16-vs-48 pair; the delta over 32 tokens):
+    ~368 device/shared memcpy calls and **~4.1 MB** per token, plus ~146 DtoH
+    calls and ~1.25 MB. The per-token copies are **KB-sized** (the load's
+    1.27 GB HtoD upload cancels), so host submission is ~1-2 ms/token -- not
+    the 63 ms of idle.
+  - **20k point** (20,085 tokens): wall 169 ms/token, decode 5.7 t/s.
+  - **Control**, `qwen3.8-27b` (`/models/ov/qwen38-b7c1-ov`, dense, same B60,
+    same short prompt): wall 45 ms/token, device busy ~39 ms/token ->
+    **~87 % device-bound**. Flash-Next's ~46 % idle is therefore specific to
+    the hybrid MoE path, not general to arcint's runtime.
+  - **Decision (rule as written): GPU idle while waiting on the tier
+    dominates.** The idle is ~46 % of decode wall; the host call byte volume is
+    negligible (~4 MB/token, ~1-2 ms submission); and the dense control being
+    device-bound isolates the idle to the MoE tier. Build **decode overlap**:
+    launch the host experts, run the shared expert and the following ops on the
+    GPU, and join late.

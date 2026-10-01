@@ -2735,3 +2735,10 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p2` (patches 0003–0013).
   `tools/kld_served.py --replay`), not reuse the leg's request dump. With that,
   window 0 below-2,051 mean KL is 0.3003 (base) vs 0.3186 (shape-routed 0074) on
   the B60; the floor was not measured this leg.
+
+- **Decode-only decomposition and its decision.** Short-prompt 512-token
+  decode delta (314 tokens) on the shape-routed 0074: per token wall 136 ms,
+  device busy ~73 ms, idle ~46 %, 308 HtoD + 48 DtoM calls (KB-sized, ~4 MB),
+  761 launches, 362 syncs. The dense qwen3.8-27b control is ~87 % device-bound,
+  so the idle is MoE-specific. Decision: decode overlap (tier off the critical
+  path, join late).
