@@ -17,7 +17,16 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
-## Unreleased
+## 0.5.4 — 2026-10-01
+
+The 0.5.1-0.5.4 acceptance is closed against the readable rows: BERLIN-001
+(`docs/window-051.md`), VENICE-001 (`docs/window-052.md`), LISBON
+(`docs/window-053.md`) and LYON-001 (`docs/window-054.md`). Rows that cannot
+be read on the B60 (BERLIN's original bar, a dense-`d48q8` Paris cell, LISBON's
+cold start with nothing prebound, LYON's above-2,051 KLD) are marked owed with
+their reasons. Runtime dependency: `marfrit-openvino` `+p25`, patches 0003-0074
+on the pinned nightly `71640275`. The four dots ship together in this release;
+0.5.5 ROMA is next.
 
 - **The GGUF feed read BF16 tensors as their raw bytes** (`q4e.gguf_feed`,
   since its first commit): gguf-py hands BF16 over as uint8 at twice the row

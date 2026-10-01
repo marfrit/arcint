@@ -518,16 +518,18 @@ at the end, not many. **No measurement before the feature exists.**
 Appended 2026-10-01. The operator re-gated 0.5.4 to: **one new leg** (a
 ~31k-token needle prompt at `n_ctx 32,768` on dense `d48q8`, answered), **QSA
 served non-default with `n_ctx ≤ 32,768`**, and the **above-2,051 KLD owed
-until the T8 re-capture**. The new leg is a pinned criterion, not a measured
-row — the measured column is deliberately EMPTY and must not be invented.
+until the T8 re-capture**. The new leg is a pinned criterion whose measured value was filled by the
+2026-10-01 LYON window (below), not invented.
 
 | row | value / status | marker | evidence class | on record |
 |---|---|---|---|---|
-| L1-new | the ~31k-token needle at `n_ctx 32,768` on dense `d48q8` | **pinned criterion, measured EMPTY — to be run by the operator as a separate leg.** PASS = non-empty greedy text; last-position logits finite (`absmax` printed); rope positions reach ≥ 31,000 (past 2,051 by ~15×); the answer's digest recorded. Configuration: `--paged-kv u8`, one lane, `--n-ctx 32768`, greedy (`temperature 0`), the dense `d48q8` export. **No run of this leg is on the record** (search 2026-10-01: `grep -rn needle docs/` returns only the 3,832-token A770 smoke and the 20,085-token B60 needle; `grep -rn "31k\|32,768" docs/` returns no dense-`d48q8` needle leg) | `RUN@unrecorded` | — | pinned here from the operator directive; no run on record |
+| L1-new | the ~31k-token needle at `n_ctx 32,768` on dense `d48q8` | **PASS.** B60, plugin `55c432880f2d5ed0` (patch 0074), dense `qwen38-flash-next-d48q8-ov`, `--n-ctx 32768 --paged-kv u8 --mtp off --offload-ratio 75 --moe-cpu-tier --moe-per-expert-dispatch`, one lane, greedy. The ~31k-token prompt tokenises to **27,603 tokens** (spanning the 2,051 boundary ~13x); prefill **451.29 s (61.2 t/s)**; the greedy answer stops at 80 tokens (EOS before the 256 cap) and is **`ORANGE-FALCON-77`** -- the needle is answered. Decode **6.6 t/s** (80 tok in 12.09 s); load 170 s. | `RUN@wt+cce3c946` | `measured-here` | this leg, 2026-10-01 |
 | L-QSA | QSA served, non-default, `n_ctx ≤ 32,768` | **PASS.** Native `d48q8qsa` (`b21359a42c2c8633`, `.bin` 65,221,492,040 B, peak 51.05 GiB) loads, re-applies 12 selection tags and serves 12 compressed block-cache layers; the needle is answered at **20,085 tokens**; B60, qsa-pair-007: decode **0.87× dense** (5.1 vs 5.9 t/s), prefill **1.27×** (51.6 vs 65.6 t/s). **Non-default**: dense stays the artifact served. Limit: `n_ctx ≤ 32,768` until the fixed `[8192, dh]` block cap is raised or bucketed | `measured-here` | `measured-here` | `docs/campaigns/qsa.md` 2026-09-30 "QSA step 3 closed" (commit `2f7f942`); CHANGELOG Unreleased "QSA step 3 closed" |
 | L-KLD-above | KLD above 2,051 | **owed until the T8 re-capture.** The f32 reference captures ran every sparse-attention indexer on byte garbage (`gguf_feed` cast the BF16 indexer projections' raw bytes to f32); rows below 2,051 are unaffected (the selection keeps every complete block whatever the scores), rows at or above it are **void**. T8 must re-capture **both** windows with the fixed feed (~12 min a window at full depth) before any above-2,051 KL can be read; the above-2,051 bar itself was withdrawn 2026-09-28 (a max-abs attention difference does not mix with a KL in nats) | `EMPTY` | `measured-here` / `code` | `docs/campaigns/qsa.md` T8; DESIGN §7.0.2bz and §7.0.2cy void notes; `HANDOFF-qsa-step3.local.md` (BF16 feed defect, 2026-09-28) |
 | L-existing | rows 1, 2, 3a, 3b, 3c (unchanged) | row 1 **PASS** on Flash-Next `d48n` (32,768 tokens, 15.1 t/s, digest `d5942c7f…`, `RUN@5a783b7`); row 2 **EMPTY** (open numerics campaign); row 3a **EMPTY** (the T-invariance property was read on the incumbent sequential core, not the chunked LYON core); row 3b **PASS as an upper bound on one run** (w1 load 40.1 s ≤ the 45.2 s bound; m2/m3 open, `measured-here`, 2026-09-27); row 3c **PASS on the 35B by operator ruling** (778.9 t/s at 32,768 chunk 2048, 781.4 at 1024, `RUN@bdbb0aa`) | as in this file | `measured-here` | this file's row and Status entries |
 
-**Verdict.** `L-QSA` and the existing rows read; the **new `L1-new` leg is
-`RUN@unrecorded` with an EMPTY measured value**, and `L-KLD-above` stays
-owed until the T8 re-capture with the reasons above.
+**Verdict.** `L1-new` now **PASSES** -- the ~31k-token needle is answered
+(`ORANGE-FALCON-77`) on the dense `d48q8` at `n_ctx 32,768` (27,603 prompt
+tokens, prefill 61.2 t/s, decode 6.6 t/s). `L-QSA` and the existing rows
+read, and `L-KLD-above` stays owed until the T8 re-capture with the reasons
+above.
