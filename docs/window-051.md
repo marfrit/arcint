@@ -626,3 +626,28 @@ named it.
 | C6 | F_ref lies in [2.9e-6, 1.2e-4] | it does not — the writer transcription is then re-checked against perplexity.cpp before anything else |
 | C7 | Paris: the 48-layer greedy token is `Paris` | it is not — the named-refusal fallback runs |
 | C8 | one full forward at 48 layers costs ~35 s of NVMe reads cold | measured under 15 s (page cache) or over 90 s (a mechanism other than bandwidth) |
+
+## Acceptance commit — BERLIN-001, operator-approved re-gating (2026-10-01)
+
+Appended 2026-10-01 from rows already on record, per the operator directive
+(Part B). Nothing here is a new measurement: the only new leg is LYON's 32k
+prompt, and it lives in `docs/window-054.md`. The operator re-gated 0.5.1 to
+**depth-48 service on the B60, Paris and the 20k needle answered, a
+report-only KL below 2,051, with the original bar row owed**. The markers
+follow this file's convention (`EMPTY` = no readable measurement); where a
+card run's own tree was not recorded beside it, the row carries
+`measured-here` and the recording commit rather than a fabricated `RUN@` sha.
+
+| # | row | value / status | marker | evidence class | on record |
+|---|---|---|---|---|---|
+| B1 | depth 48 served on the B60 (`d48q8`) | first answer **36.56 s** (second prompt 33.78 s), B60, ratio 78 + tier + dispatch, 12e9 device pool, census112 seed, host bank 46 GiB, 257 greedy tokens; ratio 75 + census128 with the 15.4e9 pool reads **35.83 s** (7.2 t/s) / 32.11 s (8.0 t/s) | `measured-here` | `measured-here` | `docs/campaigns/dense-q8-flash-next.md` "B60 window" (commit `e8d4110`); `HANDOFF-qsa-step3.local.md` artifact note (B60, 35.83 s / 257 tokens at ratio 75 + tier + bank) |
+| B2 | bound bytes per tier, from the load ledger | card tier: device weights+graph **15.82 GiB** (ratio 78) / **18.66 GiB** (ratio 75, 15.4e9 pool); host tier: CPU expert bank **30 GiB** (0074 gate, ratio 75 + census128) and 46 GiB at the 0072 gate | `measured-here` | `measured-here` | `docs/campaigns/dense-q8-flash-next.md` "B60 window"; `docs/campaigns/host-expert-bank.md` 2026-10-01 "0074 served gate" and the 2026-09-28 window table |
+| B3 | Paris, answered at depth 48 | ` Paris. Paris is a city in France` (cold and warm byte-identical), B60, the corrected-fill full-depth artifact, ratio 99 + tier, KV u8, f16, one lane, 2026-09-18 | `measured-here` | `measured-here` | `docs/campaigns/sub4bit-vram-kernel.md` 2026-09-18 03:53 entry; clause (e) of this file |
+| B4 | the 20k needle, answered | `ORANGE-FALCON-77` answered by dense `d48q8`, B60, ratio 75 + census128, bank 30 GiB, u8 KV, chunk 2048, a 20,085-token prompt, three fresh processes | `measured-here` | `measured-here` | `docs/campaigns/host-expert-bank.md` 2026-10-01 "0074 served gate" |
+| B5 | KL below 2,051 against the f32 reference, window 0 | base `MOE_CPU_TIER_Q8_DOT=0` **0.3003**; shape-routed 0074 **0.3186** (delta **+0.0183**); argmax 0.7974 / 0.7981; the B60's recorded run-to-run floor **0.136** sits above both, so the admissible bar is below the floor | `measured-here` | `measured-here` | `docs/campaigns/host-expert-bank.md` 2026-10-01 "KL replay harness fixed; the 0074 KL read" (commit `940d69b`) |
+| B6 | the original bar row | **owed — unreadable on the B60.** `bar_0.5.1` = 3.0905e-03 nats below / 2.6946e-02 at-or-above 2,051 (clause (d)); on the B60 `F_served` = **0.1361 / 0.1512** nats (~44x the bound), so a bar below the floor is UNREADABLE, not PASS. The above-2,051 bar was withdrawn 2026-09-28 (a max-abs attention difference does not mix with a KL in nats). Reason: the B60 is the per-card GDN-nondeterminism defect | `EMPTY` | `measured-here` (floor) / `code` (bar) | clause (d) of this file; `docs/campaigns/served-prefill-determinism.md`; DESIGN §7.0.2cb |
+| B7 | a Paris cell on the dense `d48q8` export specifically | **owed.** The Paris line on record (B3) ran on the corrected-fill full-depth artifact that precedes the `--dense-q8` export; no Paris cell on the dense `d48q8` artifact is on record. Search 2026-10-01: `grep -rn Paris docs/` returns the B3 line, the `qsa.md` T5 `d48q8qsa` Paris cell (B60, ratio 78, answers Paris), and no dense `d48q8` cell; `docs/campaigns/dense-q8-flash-next.md` records only "reads coherent on both prompts". Nearest: `d48q8qsa` answers Paris but carries the QSA indexer (`docs/campaigns/qsa.md`, T5) | `EMPTY` | `measured-here` | the search is recorded here |
+
+**Verdict.** BERLIN-001 reads **PASS on B1–B5** (the readable acceptance);
+**B6** (the original bar) and the dense-`d48q8`-specific Paris cell **B7** stay
+**owed** with the reasons above.
