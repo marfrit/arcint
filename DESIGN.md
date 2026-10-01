@@ -473,6 +473,65 @@ executor keeps running the graph as exported.
   meet it are configured out, not papered over. M6 adds the second half of the
   same claim: it holds **per lane, with the other lane active**.
 
+**Amendment (2026-10-01): §3.4 is relaxed for the MoE expert tier.**
+
+Operator decision, recorded verbatim: *"DESIGN §3.4 is relaxed for the MoE
+expert tier. Expert placement may follow the conversation. Output must stay a
+deterministic function of (request, configuration, request history since
+boot), and replaying the same request sequence gives the same bytes. The
+prefix cache stays refused with an adaptive tier."*
+
+**Scope.** The relaxation applies to **the MoE expert tier only** — the
+host-or-device placement of routed-expert FFN weights under
+`--moe-cpu-tier` and the plugin-side expert slot pool it rides. It does not
+reach the dense graph, the KV/GDN state, the paged path, the logits, or the
+prefix cache's own machinery. For every non-expert-tier configuration the
+paragraph above stands unchanged: greedy output is byte-identical to a cold
+run for any prompt and any cache state.
+
+What replaces history-independence for that one tier is the following law, in
+three clauses:
+
+1. **Placement may follow the conversation.** Under an *adaptive* tier, an
+expert's host-or-device residency may depend on the request history since
+boot — a routing census and swaps admitted between rounds, the shape Strata
+measured (`paper` §3.4; `code`
+`~/src/Strata-ref/src/program/generate.cpp`: `adapt_every = 4`,
+`adapt_swaps = 96`; the slot storage it moves into is `code`
+`~/src/Strata-ref/src/core/expert_cache.cpp`). This is a deliberate departure
+from the paragraph above, and clause 2 is its bound.
+2. **Output is a pure function of (request, configuration, request history
+since boot).** For one process, the same request with the same configuration
+and the same history since boot gives the same bytes. Replaying the *same
+request sequence* from a fresh boot reproduces the same bytes, run for run and
+request for request — a whole-sequence determinism, not a cold/warm-equality
+claim. That is weaker than the history-independent invariant above and
+stronger than "the tier is non-deterministic": it is exactly the property the
+`measured-here` §7.0.2ae measurements showed the LRU tier does **not** have
+across a differently-warmed process, and the property patch 0018's static
+partition gives *a fortiori* by making placement independent of history
+altogether (`code` `src/config.h`, `MOE_CPU_TIER_STATIC_PARTITION`; `code`
+`src/exec/fit.h`, `expert_slot_bytes_static`).
+3. **The prefix cache stays refused with an adaptive tier.** A prefix-cache
+hit restores a continuation on top of a history the adaptive tier has already
+changed, which is not the same `(request history since boot)` as the cold run
+that produced the cache entry; the pair is refused at load. §3.4's refusal
+stands and is *not* relaxed by this amendment: only the static-partition tier,
+whose placement is a pure function of configuration alone, may load together
+with `--prefix-cache-mib > 0`. The load path names the mode:
+`tier_prefix_cache_decision` (`code` `src/config.cpp`) refuses an adaptive tier
+with the prefix cache and admits the static partition.
+
+**Evidence class, per disposition.** Clauses 1–3 are the operator decision
+(2026-10-01) plus `code` (the cited arcint functions); the adaptive-tier
+precedent is `paper` + `code` (Strata — see
+`docs/campaigns/research-hybrid-expert-execution.md`, the 2026-10-01 Strata
+section); the pre-amendment state is `measured-here` (§7.0.2ae: two greedy runs
+identical in one process, a continuation forking across a differently-warmed
+process). The relaxation unblocks `expert-hot-set-lru` and
+`partition-seeding`, both of which the campaigns README held pending the
+history-independence invariant.
+
 ### 3.5 Speculative decoding (MTP)
 
 **Resolved 2026-08-28. The head exists and runs: 93.3% draft acceptance,
