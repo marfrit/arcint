@@ -2775,3 +2775,12 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p2` (patches 0003–0013).
   idle was therefore the host waiting on the tier, not the copies. Bank misses
   are **4.17 per decode token** (1.35 % of the 308 tier experts) and
   **9.55 MiB/token** read from disk.
+
+- **Adaptive expert cache + reference miss split: design and gate pinned, build
+  not started** (operator amendment 2026-10-01, house rules `b0447b8`). One
+  shared expert pool, byte-sized slots, batched decayed swaps (decay 0.7,
+  margin 1.5, up to 96 per 4 rounds), evict-at-once/admit-on-land, never wait;
+  pinned 30 GiB USM-host bank (40 GiB TTM cap); decode-built census. Miss split
+  `f = cpu/(cpu+link)` = **153/(153+172) = 0.471** CPU, 0.529 fetched, from
+  served rates (tier 153 us/expert, link ~172 us/expert at 2.34 MiB / 13 GB/s).
+  Gate is the answer-level bar (KL +0.03 nats, argmax -1 point, answers right).

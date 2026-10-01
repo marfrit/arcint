@@ -831,3 +831,44 @@ and the campaign stops. Every disposition carries an evidence class
   it). CLOSED as an intentional divergence: no plugin change to `ceil`, no
   ledger change to integer division, no code movement, and no future session
   should re-open it.
+
+- 2026-10-01. **Adaptive cache + reference miss split -- design and gate pinned
+  before the build** (operator amendment, house rules `b0447b8`; reference audit
+  `docs/campaigns/research-reference-audit.md`).
+
+  **Design (pinned).** One expert pool shared across all layers (FreeToken;
+  arcint's own replay reads 93.8 % at 16 GiB against 88.1 % per-layer),
+  byte-sized slots per layer (Strata finding 8, +13 % decode), the resident set
+  re-derived in batched swaps from decayed usage counts (Strata
+  `generate.cpp:4414-4478`: decay 0.7, margin 1.5, up to 96 swaps every 4
+  rounds), eviction at once and admission only when the copy lands -- a step
+  never waits on a copy (non-blocking admission allowed); fetched experts stay
+  cached. The bank is pinned USM-host, 30 GiB under the new 40 GiB TTM cap on
+  `data`, so swaps are DMA from it. The starting set is a **decode-built**
+  census with per-layer budgets (the prefill census underpredicts decode ~4x).
+
+  **Miss split (reference).** A layer's misses are divided between the CPU tier
+  and a DMA from the pinned bank into the shared pool, run concurrently; the
+  fetched experts stay cached. The share `f = cpu / (cpu + link)` is taken from
+  **served** rates: the tier's measured **153 us/expert in service** (not the
+  81 us microbench, which this cell now reads `pool 649.1 us / 8 experts =
+  81.1 us`) against the link's **172 us/expert** (2.34 MiB at the recorded
+  ~13 GB/s pinned rate). So `f = 153 / (153 + 172) = **0.471**` CPU share,
+  **0.529** fetched. Re-measured at load (Strata's probe) or per step
+  (FreeToken). Anchors: FreeToken `moe/offload_kernels.py:290-410`,
+  `moe/benchbw.py:538-600`; Strata `src/core/expert_source.cpp:1614-1696`,
+  `src/program/generate.cpp:1709-1724`.
+
+  **Cells.** swap determinism (same request sequence -> same cache state and
+  same bytes, kept only if free); no step blocks on an in-flight copy; evicted
+  slots are never read stale; the split share follows the measured rates; a
+  fetched expert is a hit on its next use.
+
+  **Gate (answer-level bar, per phase).** Answers stay right (needle, Paris,
+  the task battery); mean KL at most **0.03 nats** worse than the baseline arm
+  on the same card and window; argmax agreement down at most **1 point**.
+  Report the hit rate, CPU-tier experts per token, the fetched share, and
+  decode and prefill against base. Byte cells are tripwires, not vetoes.
+
+  **STATUS: design and gate pinned; build not started.** A plugin wedge stops
+  the run (netconsole capture first; rebooting `data` is the operator's call).
