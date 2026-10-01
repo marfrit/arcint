@@ -65,7 +65,8 @@ that touches a design decision, a mechanism, a milestone or a campaign:
    surveyed.
 3. If the task cites an external project, read its SOURCE, not only its
    paper (`~/src/Strata-ref`, `~/src/FreeToken-ref`, `~/src/ninfer` are
-   checked out). Where
+   checked out; NInfer serves models fully resident on one GPU, the dense
+   27Bs and the Qwen3.6-35B-A3B, with no expert offload). Where
    paper and code disagree, the code wins.
 4. State the EVIDENCE CLASS of every disposition you write — `paper`,
    `code`, or `measured-here`. A row without one is not a disposition.

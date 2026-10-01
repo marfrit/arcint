@@ -12,7 +12,8 @@ decode-shaped calls (≤ 8 jobs) as an AVX2 dot in the quantised domain
 B60, d48q8, 20,085 tokens, decode 5.9 → 6.5 t/s, prefill unchanged, window-0
 KL +0.0183 nats (`measured-here`, shipped in `+p25`). Follow-on levers:
 `tier-handoff-doorbell` (the per-layer GPU/tier hand-off),
-`kquant-host-storage` (multi-token dot), `hybrid-expert-fetch` and
-`expert-hot-set-lru` (fewer experts on the CPU).
+`kquant-host-storage` (multi-token dot), `expert-hot-set-lru` (fewer
+experts on the CPU: the adaptive cache, a link-probed share of the misses,
+and this bank pinned).
 
 Full history: `git show b0447b8:docs/campaigns/host-expert-bank.md`.

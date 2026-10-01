@@ -37,7 +37,7 @@ precision, block size, device or runtime is refused at load.
 - The prefix cache (`src/core/prefix_cache.h`) is in-process: KV pages by
   reference on the card, GDN checkpoint blobs (~32 MiB a row) in host memory;
   nothing is written to disk (`code`).
-- DESIGN §3.4 Amendment 2 (2026-10-01) lifts the refusal of the prefix cache
+- DESIGN §3.4 (amended 2026-10-01) lifts the refusal of the prefix cache
   with an adaptive expert tier; `tier_prefix_cache_decision`
   (`src/config.cpp`) still refuses the pair and is owed the change.
 - To read before building: the paged plugin's KV page layout at u8 and

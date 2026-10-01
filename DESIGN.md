@@ -41,7 +41,9 @@ engines, and their source is the design reference (operator rule,
 - **FreeToken** (`~/src/FreeToken-ref`), an edge-MoE engine: CPU-resident
   experts, one GPU LRU expert pool, bandwidth-adaptive split, double-buffered
   prefill streaming (`code`; paper arXiv 2608.16157).
-- **llama.cpp** (ggml's CPU and GPU kernels) and **NInfer** (`~/src/ninfer`).
+- **llama.cpp** (ggml's CPU and GPU kernels) and **NInfer** (`~/src/ninfer`;
+  models fully resident on one GPU, the dense 27Bs and the Qwen3.6-35B-A3B,
+  no expert offload; `code`: `README.md`, `src/ops/sparse_moe/`).
 
 An arcint measurement counts against a reference technique only if it
 tested the reference's mechanism; a conflict between a reference mechanism
@@ -86,13 +88,16 @@ The cards, measured here unless marked:
 |---|---|---|
 | silicon | ACM-G10 (DG2-512), PCI `8086:56a0`, Xe-HPG: subgroup 8 or 16 by kernel, 128 GRF, no 2D block loads | Xe2 (BMG), PCI `8086:e211`: subgroup 16 only, 2D block loads |
 | OpenVINO device | `GPU.1` | `GPU.0` |
-| host link | PCIe 3.0 x4 behind the chipset, 1.8 GB/s H2D | PCIe 4.0 x8, 14.3 GB/s |
+| host link | PCIe 3.0 x4 behind the chipset, 1.8 GB/s H2D | PCIe 4.0 x8: 13.9 GB/s H2D from pinned memory, 11.2–13.2 GB/s from pageable, for 2.46 MB expert copies (OpenCL microbench, 16–64 chunks, 2026-09-28) |
 | random-read ceiling | 414–418 GB/s (nominal 560, `paper`) | 453 GB/s (nominal 456, `paper`) |
 | run-to-run determinism of the served Flash-Next path | bit-identical | not bit-identical (GDN state output, §7.0.2cb) |
 
-- Xe KMD only. SYCL runtimes abort on memcpy under it and Vulkan is slow on
-  BMG; OpenVINO's OpenCL path is the only proven fast route on both cards
-  (`measured-here`).
+- Xe KMD only. Measured on it (`measured-here`, B60, Qwen3.8-27B Q4_K_M at
+  1k, §7.0.2bf): arcint's OpenVINO OpenCL path 309 t/s prefill and 13.4 t/s
+  decode (mixed form; 937 / 16.3 repacked), llama.cpp SYCL 249 / 14.2 (on
+  its OpenCL backend; its Level Zero path segfaulted in the container, whose
+  loader is absent), llama.cpp Vulkan 126 / 7.8. OpenVINO's OpenCL path
+  serves both cards in production.
 - The dev host is an 8-core / 16-thread AVX2 CPU (Zen 3, no AVX-512) with
   52 GiB of RAM in the development container and an NVMe store
   (`measured-here`). Host RAM is the binding resource for Flash-Next: its
@@ -137,7 +142,8 @@ The cards, measured here unless marked:
   (0/10) where AWQ-only held (7/10) (`measured-here`). Unpinned fields are
   reported as `null` on `/props`, not invented.
 - **OpenVINO IR** (optimum-intel export), one directory per model. The
-  exports are VLMs; the vision IRs are never loaded and `--vision` is refused
+  exports are VLMs; serving is text-only (`decision`, operator, undated in
+  the record): the vision IRs are never loaded and `--vision` is refused
   (`code`, §7.0.2y).
 - **GGUF on a template IR.** `--gguf FILE --model TEMPLATE_IR` opens a GGUF
   in process: the file's Q4_K/Q5_K/Q6_K/Q8_0 rows replace the template's
@@ -288,7 +294,8 @@ run is byte-identical to a cold one, per lane, with the other lane active
 
 ### 3.5 Speculative decoding
 
-- **Machinery** (`code`; `measured-here`). Greedy-only. Acceptance is the
+- **Machinery** (`code`; `measured-here`). Current scope: greedy requests
+  only; speculation for sampled requests is open (§8.3). Acceptance is the
   sampler's own decision (penalties applied first), and a drafted token clears
   the same gates as a sampled one (EOS, `max_tokens`, `n_ctx`). On the paged
   path a verify pass checkpoints the GDN state after every token into scratch
@@ -328,7 +335,9 @@ chain request > operator flags (`--temp`, `--top-p`, `--top-k`,
 `--repetition-penalty`, `--presence-penalty`,
 `--chat-template-kwarg enable_thinking=BOOL`) > artifact
 `generation_config.json` > model-card defaults; `/props` reports values and
-provenance. No `min_p` (not implemented, so no flag). `code`.
+provenance. `code`. Current scope: no `min_p` sampler and no flag for it
+(open item: llama.cpp's sampler chain offers `min_p` as `--min-p`, `paper`:
+its documentation).
 
 ### 3.7 Tokenizer, templates, tool calls
 
@@ -358,7 +367,8 @@ server-side truncation, context shift or sliding window: a server-side
 history edit changes what the model saw and breaks prefix-cache identity,
 and a GDN state cannot un-see a token, so any shift is an approximation.
 History management is the client's job. This invariant is unamended
-(`decision`; `code`: the 400 and its numbers are unit-tested).
+(`decision`, operator, undated in the record; `code`: the 400 and its
+numbers are unit-tested).
 
 ### 3.9 MoE expert execution
 
@@ -370,7 +380,7 @@ compile properties and patches. Pieces in service, with where they live:
 | OTD offload | `--offload-ratio R`: R % of experts not resident; resident slots in a pool, misses loaded on demand from the weight file | stock plugin `OFFLOAD_RATIO`; pool size `floor(E·(100−R)/100)` per layer is the served truth (the fit ledger's `ceil` is a ledger ceiling only) | `code`, `measured-here` |
 | device slot pool | slots in VRAM up to a byte budget, async batched uploads | patches 0004–0007; budget `ARCINT_MOE_DEVICE_POOL_BYTES` → `MOE_OTD_DEVICE_POOL_BYTES`; 0070 extends it to the per-expert route | `measured-here` (35B on the A770: 0.4 → 9.1 t/s, §7.0.2v) |
 | CPU tier | non-resident experts computed on the host instead of uploaded | `--moe-cpu-tier` (patches 0011/0012, 0017); `--moe-cpu-tier-threads` | `measured-here` (§7.0.2x) |
-| static partition | placement a pure function of (layer key, expert, configuration), pinned at bind; the default tier mode | patch 0018, property `MOE_CPU_TIER_STATIC_PARTITION`; the LRU mode stays available (`MOE_CPU_TIER_PARTITION=lru`) | `code` |
+| static partition | placement a pure function of (layer key, expert, configuration), pinned at bind; the default tier mode | patch 0018, property `MOE_CPU_TIER_STATIC_PARTITION`; its LRU mode (`MOE_CPU_TIER_PARTITION=lru`) is replaced by the adaptive cache of §8.1 | `code` |
 | census seed | the resident set chosen from a recorded routing census instead of a hash rank | patch 0046, `MOE_CPU_TIER_SEED=<file>` (`# space=layer_key`); tools `tools/expert_policy_compare.py`, hot-set census tools | `measured-here` (§7.0.2cc) |
 | hybrid prefill | grouped GEMM over the resident subset, host tier for the rest | patches 0037, 0042 | `measured-here` |
 | per-expert dispatch | experts computed by a per-expert GPU kernel with in-kernel dequant, bypassing the fused GEMM; misses on the host | `--moe-per-expert-dispatch`; patches 0038–0041, 0045, 0047, 0059–0061, 0064, 0069 | `measured-here` |
@@ -423,7 +433,9 @@ device-free suites.
 `--parallel N` (gated at 2). A lane is one sequence's mutable state: its own
 `InferRequest`s (language model, embeddings gather, MTP layer and head), GDN
 rows, KV block table and output buffers. Compiled models and the page pool
-are shared. Sequences are never batched into one graph execution.
+are shared. Current scope: each graph execution runs one sequence (open
+item: NInfer batches the active requests' decode steps into one forward,
+"startup-bounded batched decode", `paper`: its `README.md`).
 
 The **turnstile** (`src/core/turnstile.h`) orders graph executions FIFO. It
 is a correctness mechanism: the GPU plugin pools intermediates per compiled
@@ -606,7 +618,7 @@ admission are arcint's.
 | 0.4.0–0.4.7 | GGUF checkpoints on a template IR, the K-quant kernel series, host prefix tier | done (`+p7`…`+p15`) |
 | 0.5.0 | Flash-Next serving shape at full depth | released (0.5.0, 0.5.0.1) |
 | 0.5.1 BERLIN, 0.5.2 VENICE, 0.5.3 LISBON, 0.5.4 LYON | Flash-Next fill and quality, expert residency, NVMe/host tiers, stateful prefill and QSA | acceptance closed 2026-10-01 under the operator's re-gating, on readable rows (`docs/window-051.md`…`054.md`); 0.5.4 shipped on `+p25` |
-| 0.5.5 ROMA | speculation for Flash-Next | next (§8.3) |
+| next, in order | the adaptive expert cache with the miss split and the pinned bank (§8.1, §8.4, §8.6), the doorbell hand-off (§8.5), multi-draft MTP for Flash-Next (ROMA, §8.3), prefill on the GPU (§8.2) | open (`decision`, operator's architect, 2026-10-01) |
 
 Charters live in `docs/milestone-0.3.0.md`, `0.4.0`, `0.4.1`, `0.5.0`;
 every open defect or lever since 0.3.1 is a campaign in `docs/campaigns/`.
@@ -672,12 +684,12 @@ their text is in `git show b0447b8:DESIGN.md`.
 | 7.0.2ab | VRAM exhaustion signature under xe; the prefill-chunk belt for 4-bit values on the generic kernel | measured-here, code |
 | 7.0.2ac | patch 0015: `--paged-attention-max-partitions`; clear the model cache across it | measured-here |
 | 7.0.2ad | deep-prompt crash = direct-submission semaphore evicted under VRAM pressure + concurrent load; the reservation is the defence | measured-here |
-| 7.0.2ae | patch 0018 static partition (the default tier mode) and its load-time fixes; the LRU mode stays available; adaptive placement is admissible under §3.4 | measured-here, code |
+| 7.0.2ae | patch 0018 static partition (the default tier mode) and its load-time fixes; its LRU mode is replaced by the adaptive cache (§8.1); adaptive placement is admissible under §3.4 | measured-here, code |
 | 7.0.2af | patch 0017: the tier's 283 µs "readback" was the host waiting for the GPU to reach the layer's router; export `ARCINT_MOE_DEVICE_POOL_BYTES` | measured-here |
 | 7.0.2ag | drafters' rotary kept f32 (overflow at 65,504 zeroed acceptance); MTP state charged 8 KiB/token; at 77k DFlash 18.8, plain 15.3, MTP 4.9 t/s | measured-here |
 | 7.0.2ah | M10 re-scoped: context via u8:i4; the per-expert kernel is `sub4bit-vram-kernel` | decision 2026-09-05 |
-| 7.0.2ai | 0.3.0 gate: plateau probe under the static partition; tier ON warm decode 16.4 vs 11.3 OFF | measured-here |
-| 7.0.2aj, 7.0.2ak, 7.0.2al | acceptance runner corrections and the filled references (tier 16.4 / ratio 1.31; coder B60 66.5) | measured-here, code |
+| 7.0.2ai | 0.3.0 gate: plateau probe under the static partition; tier ON decodes faster than OFF (the current references are the generated manifest's, §5.1: `tier-reference-cell` warm 18.2 vs 12.5 t/s, ratio 1.46) | measured-here |
+| 7.0.2aj, 7.0.2ak, 7.0.2al | acceptance runner corrections and the filled references (current values in the generated manifest, §5.1: tier 18.2 t/s, ratio 1.46; coder B60 66.5) | measured-here, code |
 | 7.0.2am, 7.0.2an | turnstile tests synchronise on `issued()`; roundtrip servers probe their own ports (TIME-WAIT collisions) | measured-here |
 | 7.0.2ao | the Prüfstand cell runs through the run manifest and gates the score at 10 | code |
 | 7.0.2ap | patch 0019: the per-expert prefill weight answer is three-way | measured-here |
@@ -777,31 +789,44 @@ measured effect, and arcint's measured starting point. Where arcint built
 something differently before, the item says what to match; it does not
 carry a verdict.
 
+Build order (`decision`, operator's architect, 2026-10-01): the adaptive
+expert cache with its miss split and the pinned bank (§8.1, §8.6, §8.4: one
+mechanism in Strata, one campaign, `expert-hot-set-lru`), then the doorbell
+(§8.5), then multi-draft MTP (§8.3), then prefill on the GPU (§8.2).
+
 ### 8.1 Let the GPU expert cache learn the conversation
 
-- **Reference.** Strata: routing census per layer, every 4 rounds up to 96
-  gain-ranked swaps, the old expert evicted at once (the CPU computes it
-  meanwhile) and the new one admitted when its copy lands
-  (`src/program/generate.cpp`: `adapt_every` :358, `adapt_swaps` :380,
-  `apply_pending` :4414–4478); slot storage, residency table and the
-  byte-compare `verify_slot` in `src/core/expert_cache.cpp`
-  (`include/strata/core/expert_cache.hpp`: `open_sized` for per-layer slot
-  bytes, `set_per_layer_admission`). FreeToken: one slot pool shared by all
-  layers, flat id `layer · E + expert`, slots rewritten on the GPU
-  (`python/freetoken/moe/offload_cache.py:169–184`, `ensure_experts` :843).
+The design follows Strata alone, the reference written for this model
+(`decision`, operator's architect, 2026-10-01).
+- **Reference** (`code`, `~/src/Strata-ref`). Per-layer slot budgets fixed
+  at start, slots sized in bytes per layer, the budgets drawn from one
+  global usage profile built from decode routing (`tools/make_profile.py`;
+  the fill in `src/program/generate.cpp:2826–2845`;
+  `include/strata/core/expert_cache.hpp:72` `open_sized`). Swaps are
+  batched within each layer from decayed usage counts
+  (`generate.cpp:4413–4482`): candidates with usage ≥ 2.0, victims by least
+  usage, a swap only when the gain exceeds 1.5, the top 96 swaps by gain
+  across layers, every count decayed ×0.7 per adapt call; Strata adapts
+  every 4 verify windows (`adapt_every` :358, `adapt_swaps` :380). Admission
+  never blocks: the victim leaves the residency table at once (the CPU
+  computes it meanwhile) and the newcomer is admitted when its copy lands
+  (`pending`, `apply_pending`). Slot storage and the byte-compare
+  `verify_slot` are `src/core/expert_cache.cpp`.
 - **Effect** (`paper`, Strata §6): profile fill 0.50 → adaptive 0.72 hit
   rate (finding 4); no-wait admission 91.7 → 94.4 t/s (finding 10); slots
   sized in bytes per layer +13 % decode (finding 8).
 - **arcint now**: static partition + census seed; 36 % GPU hits, 308 tier
   experts per decode token on Flash-Next `d48q8`, B60 (`measured-here`). An
   offline replay of arcint's own routing: per-layer LRU 55.6 / 69.2 % against
-  the census partition's 21.2 / 38.5 % at 32 / 64 slots per layer; one pool
-  shared across layers 93.8 % at 16 GiB (`measured-here`,
-  `docs/campaigns/expert-hot-set-lru.md`). In progress (campaign
-  `expert-hot-set-lru`).
-- **Prerequisites owed**: a partition layer key independent of the file
-  layout (decoder index; §7.0.2cz), and the `tier_prefix_cache_decision`
-  change (§3.4).
+  the census partition's 21.2 / 38.5 % at 32 / 64 slots per layer
+  (`measured-here`, `docs/campaigns/expert-hot-set-lru.md`). In progress
+  (campaign `expert-hot-set-lru`; plugin patch 0076, replacing the
+  `MOE_CPU_TIER_PARTITION=lru` mode on the kept slot pool of 0005–0007 and
+  0070). arcint has no Flash-Next MTP yet, so the cache adapts every 12
+  decode tokens (Strata's 4 windows of 2.4–3.2 tokens) until MTP lands.
+- **Owed in the same build**: the bank pinned (§8.4) and the
+  `tier_prefix_cache_decision` change (§3.4). The partition layer key
+  (§8.10) matters only for static census seeds.
 
 ### 8.2 Read prompts on the GPU, streaming the missing experts
 
@@ -836,8 +861,12 @@ carry a verdict.
 - **Effect**: 1.6–1.8× decode with CPU-held experts, 47–57 → 82–92 t/s at
   4K (`paper`, finding 2); speculative output token-for-token equal to
   greedy (finding 3).
-- **arcint now**: no Flash-Next MTP head is exported (ROMA R1; the head is
-  in the original checkpoint's index). On the dense agent arcint drafts one
+- **arcint now**: the Flash-Next head's 31 tensors were fetched on
+  2026-09-11 (`tools/fetch_safetensors_tensors.py`, 4.856 GiB, sha-checked)
+  but never exported or served for Flash-Next (ROMA R1). Speculation serves
+  greedy requests only (§3.5); sampled requests are open (Strata's paper
+  lists temperature sampling by rejection in the verify window, `paper` §7).
+  On the dense agent arcint drafts one
   token per cycle and the MTP layer keeps f32 state over the whole prompt
   (8 KiB/token): at 77k the cycle is 390 ms against a 130 ms break-even
   (4.9 t/s against plain 15.3), and the served unit decodes 2.2 t/s at 71.7k
@@ -846,15 +875,15 @@ carry a verdict.
 
 ### 8.4 A pinned host bank
 
-- **Reference.** FreeToken fills host banks by chunked O_DIRECT and then
-  pins them (`cudaHostRegister`), and only pinned banks feed the GPU
-  movement paths (`python/freetoken/moe/host_banks.py`); Strata keeps every
-  expert in one pinned RAM arena (`include/strata/core/pinned.hpp`
-  `PinnedArena`, `src/core/pinned.cu`).
+- **Reference.** Strata keeps every expert in one pinned RAM arena, the
+  source of its swap copies and of the GPU's miss reads
+  (`include/strata/core/pinned.hpp` `PinnedArena`, `src/core/pinned.cu`;
+  `code`).
 - **arcint now**: the bank (patch 0072) is anonymous pageable memory. The
   dev host's TTM pinned cap was raised to 40 GiB on 2026-10-01 (operator), so
-  a 30 GiB pinned bank fits. Owed: allocate the bank as pinned USM-host.
-  §8.1, §8.2 and §8.6 depend on it.
+  a 30 GiB pinned bank fits. Owed in the same build as §8.1 (campaign
+  `expert-hot-set-lru`): allocate the bank as pinned USM-host. §8.1, §8.2
+  and §8.6 depend on it.
 
 ### 8.5 Take the host out of the per-layer hand-off
 
@@ -877,24 +906,23 @@ carry a verdict.
   series) removed only the writeback copies; the x/id readback hops and the
   per-layer host block remain. Build the doorbell shape on the tier route.
 
-### 8.6 Choose CPU or a copy for each miss from a measured speed comparison
+### 8.6 Split each layer's misses between the link and the CPU
 
-- **Reference.** FreeToken measures CPU-MoE kernel bandwidth against PCIe
-  gather bandwidth and picks `hybrid` only when the CPU is > 2× the link,
-  otherwise `offload`, with a per-step fetch fraction
-  (`python/freetoken/moe/benchbw.py:1–19`); fetched experts stay cached.
-  Strata issues miss DMAs from the CPU thread at plan time from the pinned
-  arena (`include/strata/core/verify.hpp`: `set_pcie_mode` :154,
-  `fetch_dma` :228).
-- **Effect** (`paper`, Strata finding 9): 55 % of misses over PCIe for
-  i-quants, IQ3_XXS 56 → 65 t/s; 20 % for the RAM-bound Q2_0.
-- **arcint now**: on the B60 the link moves an expert in ~0.19 ms and the
-  tier computes one in ~0.15 ms (`measured-here`), so FreeToken's rule
-  selects offload on this host. The campaign's build copied from pageable
-  memory into transient slots overwritten every step with a fixed K = 3;
-  match the references: pinned source (§8.4), fetched experts cached in the
-  pool (§8.1), the share set from a benchmark
-  (`docs/campaigns/hybrid-expert-fetch.md`).
+- **Reference** (`code`, Strata). A share of each layer's distinct missed
+  experts is read by the GPU over the link from the pinned arena while the
+  CPU computes the rest, concurrently; those experts are not cached (the
+  cache changes only by the swaps of §8.1)
+  (`src/core/expert_source.cpp:1614–1696`; `src/program/generate.cpp:355`
+  `pcie_mode`; `include/strata/core/verify.hpp:150`). The share for
+  native/i-quant packs is set from a link probe at load
+  (`generate.cpp:1709–1724`): `pcie_frac = min(0.55, max(0.05, 0.55 ×
+  link_GBps / 26))`, the full 0.55 from 20 GB/s up, none below 4 GB/s.
+- **Effect** (`paper`, Strata finding 9): 55 % of misses over the link for
+  i-quants on its x16 card, IQ3_XXS 56 → 65 t/s.
+- **arcint now**: the CPU tier computes every miss. At this host's pinned
+  link (13.9 GB/s, §2) the formula gives a share of about 0.29. Built in the
+  same campaign as §8.1 (`docs/campaigns/expert-hot-set-lru.md`), from the
+  pinned bank (§8.4), the link probed at load.
 
 ### 8.7 Keep conversation state between requests
 
@@ -938,8 +966,11 @@ carry a verdict.
   VRAM, not compute (finding 12) (`paper`).
 - **arcint now**: QSA serves correctly but non-default through patch 0073
   (`d48q8qsa`): decode 0.87× dense, prefill 1.27× slower, `n_ctx` ≤ 32,768
-  under a fixed block cap, speculation and the prefix cache refused with it
-  (`measured-here`; `docs/campaigns/qsa.md`).
+  under a fixed block cap (`measured-here`; `docs/campaigns/qsa.md`). Its
+  refusals of `--parallel` > 1, the prefix cache and paged speculation are
+  owed a change: Strata appends to the indexer at commit
+  (`src/core/verify.cpp:990`, `native_qsa_indexer_append`; `code`), so the
+  indexer state follows the accepted tokens.
 
 ### 8.10 Other open items
 
@@ -978,4 +1009,5 @@ carry a verdict.
   (`drm/xe` "Order ring writes before ring tail updates", in 7.1.y stable;
   `code`) on the dev host is the operator's decision.
 - **Multimodal**, an Anthropic Messages adapter and a local CLI: not
-  committed (`decision`); the request parser rejects non-text content parts.
+  committed (`decision`, operator, undated in the record); the request
+  parser rejects non-text content parts.

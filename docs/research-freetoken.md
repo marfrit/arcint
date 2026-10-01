@@ -27,7 +27,8 @@ its own.
   (`moe/offload_cache.py:108`, `:149-151`). `ensure_experts(layer_id, expert_ids)`
   (`moe/offload_cache.py:843`) takes the ids the router chose this step, makes
   those resident and rewrites the ids to slot ids in place
-  (`moe/offload_kernels.py:19-41`, flashlib's `lru_ensure`); `usage` holds the
+  (`moe/offload_kernels.py:19-41`, `lru_ensure` from the external `flashlib`
+  package, a `pyproject.toml` dependency not in the checkout); `usage` holds the
   step a slot was last used and the victim is `argmin(usage)`. `copy_missing`
   (`moe/offload_cache.py:1011`) moves only the missing rows, one fused launch
   over all banks. `code`

@@ -5,8 +5,8 @@ A deliberately narrow LLM inference engine for Intel Arc GPUs.
 arcint serves one model family, the hybrid GatedDeltaNet/attention Qwen
 models, on two cards: the Arc A770 (16 GiB) and the Arc Pro B60 (24 GB). The
 inspiration is [NInfer](https://github.com/Neroued/ninfer), a from-scratch
-engine that supports two checkpoints on one GPU and beats every generalist on
-that pair. arcint translates the idea to Intel: kernel work goes through
+engine for a closed set of checkpoints fully resident on one GPU (the dense
+27Bs and the Qwen3.6-35B-A3B) that beats every generalist on them. arcint translates the idea to Intel: kernel work goes through
 OpenVINO's compiler stack plus a published GPU-plugin patch series, and arcint
 owns everything around the compute graph: the serving loop, the scheduler,
 the KV and recurrent-state memory, prefix caching, admission by measured
@@ -56,10 +56,12 @@ patches 0059–0067).
 `--offload-ratio 75 --moe-cpu-tier`, a 128-expert-per-layer census seed, a
 30 GiB host expert bank, u8 KV, chunk 2048; at a 20,085-token prompt, prefill
 63.1 t/s and decode 6.5 t/s, the needle answered (`+p25`, patches
-0003–0074). Levers in progress, in the references' order: an adaptive GPU
-expert cache shared across layers, prompt processing on the GPU with the
-missing experts streamed from pinned memory, and multi-token drafting with
-the checkpoint's MTP head.
+0003–0074). Levers, in build order: an adaptive GPU expert cache that
+follows the conversation, with a link-probed share of each layer's misses
+read from pinned host memory (after Strata); the doorbell hand-off between
+GPU and CPU tier; multi-token drafting with the checkpoint's MTP head; and
+prompt processing on the GPU with the missing experts streamed from pinned
+memory.
 
 **Speculative decoding on the dense Qwen3.8-27B** (B60, int4, u8 KV,
 greedy, 400 tokens, prompts under 2,048 tokens, 32,768 context):

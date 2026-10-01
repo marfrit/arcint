@@ -8,7 +8,8 @@
 > recurrent-state ledger, prefix caching, admission by measured reservation,
 > MoE expert placement across card and host, speculative decoding, sampling
 > and HTTP serving. MoE-beyond-VRAM design follows the expert engines Strata
-> and FreeToken (docs/campaigns/research-reference-audit.md).
+> and FreeToken (docs/campaigns/research-reference-audit.md); the adaptive
+> expert cache and its miss split follow Strata alone.
 
 ## Status
 
@@ -16,6 +17,10 @@ Release 0.5.4 (2026-10-01). Runtime dependency: marfrit-openvino +p25, the
 pinned OpenVINO nightly 71640275 with patches 0003-0074
 (contrib/packaging/marfrit-openvino/patches/). Open work is one document per
 campaign under docs/campaigns/ (README there: rules, template, index).
+Next, in order (operator's architect, 2026-10-01): the adaptive expert cache
+with the link/CPU miss split and the pinned host bank
+(docs/campaigns/expert-hot-set-lru.md, plugin patch 0076), the doorbell
+hand-off, multi-draft MTP for Flash-Next, prefill on the GPU.
 
 ## Current numbers (measured-here; card and configuration named)
 
@@ -45,7 +50,7 @@ campaign under docs/campaigns/ (README there: rules, template, index).
   Rows below position 2051 stand; rows at or above it await a re-capture
   (docs/campaigns/qsa.md).
 
-## Correctness rule (operator, 2026-10-01; CLAUDE.md, DESIGN 3.4 Amendments 1-2)
+## Correctness rule (operator, 2026-10-01; CLAUDE.md, DESIGN 3.4 amended 2026-10-01)
 
 - Correctness is judged at the answer: the answers stay right (facts,
   needle, task battery); the candidate's mean KL against the reference is at
@@ -73,7 +78,8 @@ campaign under docs/campaigns/ (README there: rules, template, index).
 - Console: llama.cpp-style one-line state/timing prints on stderr (load,
   memory map, per-slot prefill/decode rates, cache hits, draft acceptance).
 - Context overflow is HTTP 400 with prompt_tokens/n_ctx/overflow. No
-  truncation, no context shift (GDN state cannot un-see tokens).
+  truncation, no context shift (GDN state cannot un-see tokens; operator
+  decision, undated in the record).
 - A request beyond the lanes waits --queue-timeout S, then gets a 503 with
   the reservation numbers.
 - Client disconnect aborts GPU work at the next scheduler boundary.
@@ -91,7 +97,9 @@ campaign under docs/campaigns/ (README there: rules, template, index).
   (src/core/model_registry.cpp, models/allowlist-raw.json): language model,
   text embeddings, tokenizer/detokenizer IRs, config.json, chat template.
   VLM exports: the vision tower is reported at load and never loaded
-  (--vision is refused).
+  (--vision is refused). Text-only serving, and no multimodal, Anthropic
+  Messages adapter or local CLI, is an operator decision, undated in the
+  record.
 - --gguf FILE --model DIR: a GGUF of the same architecture on the IR as
   topology template; K-quant rows (Q4_K, Q5_K, Q6_K, Q8_0) repacked into the
   runtime's compressed form or decoded natively in the plugin kernel
@@ -147,7 +155,9 @@ campaign under docs/campaigns/ (README there: rules, template, index).
   decode step's expert pair table from the router output (patch 0067).
 - Qwen Sparse Attention (Flash-Next, --qsa export, qwen3.8-flash-next-d48q8qsa):
   served with a compressed block-key indexer cache; non-default; n_ctx <=
-  32768; refuses --parallel > 1, the prefix cache and paged speculation.
+  32768. It still refuses --parallel > 1, the prefix cache and paged
+  speculation; each refusal is owed a change (Strata appends to the indexer
+  at commit, src/core/verify.cpp:990; DESIGN 8.9).
 - Compiled-blob disk cache in weightless mode with absolute weight paths
   (works around openvino#37607).
 
@@ -195,9 +205,10 @@ server
                             undone once set
   --moe-cpu-tier            compute expert FFNs that would evict a device
                             slot on the host CPU instead (needs --offload-ratio;
-                            --prefix-cache-mib > 0 is refused at load with an
-                            adaptive tier, and allowed only when the plugin
-                            reports the static residency partition, DESIGN §3.4)
+                            --prefix-cache-mib > 0 is still refused at load
+                            unless the plugin reports the static residency
+                            partition; DESIGN §3.4 (amended 2026-10-01) admits
+                            the pair, and lifting the refusal is owed)
   --moe-cpu-tier-threads N  worker threads for that tier (0 = auto)
   --moe-per-expert-dispatch dispatch routed experts via per-expert GPU
                             kernels (needs --offload-ratio + --moe-cpu-tier)

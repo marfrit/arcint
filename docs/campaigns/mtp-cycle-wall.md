@@ -45,10 +45,12 @@ KL no more than 0.03 nats above plain's, argmax down at most 1 point.
   4.9 t/s against plain 15.3 t/s, a cycle of ~390 ms; DFlash reads 18.8 t/s.
   The MTP state is charged (`kMtpStateBytesPerToken`, `src/exec/fit.h`) and
   the drafters' rotary runs in f32 (`ARCINT_DRAFT_ROPE_F16=1` reverts).
-- **Flash-Next**: no MTP head is exported; the head is in the BF16
-  checkpoint (Strata's `tools/mtp_fetch.py` reads it). The MTP layer reuses
+- **Flash-Next**: the head's 31 `mtp.*` tensors were fetched on 2026-09-11
+  (`tools/fetch_safetensors_tensors.py`, 4.856 GiB, sha-checked) but never
+  exported or served for Flash-Next; Strata's `tools/mtp_fetch.py` reads the
+  same tensors. The MTP layer reuses
   the QSA indices across draft steps (`paper`, `research-qsa.md`).
-- **Preconditions met:** DESIGN §3.4 Amendment 2 and `CLAUDE.md` judge MTP
+- **Preconditions met:** DESIGN §3.4 (amended 2026-10-01) and `CLAUDE.md` judge MTP
   on against off at the answer-level bar; byte cells stay tripwires.
 
 ## Where it lives

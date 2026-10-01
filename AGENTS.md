@@ -26,7 +26,8 @@ sections are the starting point.
 
 **3. If the task cites an external project, read its SOURCE, not only its
 paper.** Checked out here: `~/src/Strata-ref`, `~/src/FreeToken-ref`,
-`~/src/ninfer`. A paper
+`~/src/ninfer` (NInfer: models fully resident on one GPU, the dense 27Bs
+and the Qwen3.6-35B-A3B, no expert offload). A paper
 describes intent; the code is what the project does. Where they disagree,
 the code wins.
 
@@ -83,8 +84,10 @@ FreeToken-style LRU expert cache was built, ruled a violation of DESIGN §3.4,
 and replaced by a static partition without the price being put to the
 operator: a 36 % GPU hit rate (`measured-here`) against Strata's ~0.72
 (`paper`). The same audit found three more recorded negatives that had
-tested a different mechanism from the reference's, and one premise that was
-never tried (the Flash-Next MTP head). Rules 8–9 follow: follow the expert
+tested a different mechanism from the reference's, and one premise never
+carried through (the Flash-Next MTP head: the head's tensors were fetched
+(2026-09-11) but never exported or served for Flash-Next). Rules 8–9
+follow: follow the expert
 engines, settle a negative only against the reference's own mechanism, take
 every conflict between a reference mechanism and an invariant to the
 operator with the measured price of each side, and judge correctness at the

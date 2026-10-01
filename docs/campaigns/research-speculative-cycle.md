@@ -21,16 +21,20 @@ and verify stay separate graphs, not fused. Two adaptive mechanisms are
 real, merged code: "Dynamic Speculative Decoding" (length by QPS) and DSpark
 adaptive verification (PR #47808) — a confidence head scores draft-token
 survival, a per-step token budget from profiled cost tables applies on-GPU
-with no host readback; needs FULL varlen-decode CUDA graphs, currently only
-DeepSeek's SM100 sparse-attention backends qualify, not portable as-is. Best
+with no host readback, under FULL varlen-decode CUDA graphs (shipped for
+DeepSeek's SM100 sparse-attention backends); the Intel equivalent to build
+is a replayable command list (`cl_khr_command_buffer`, Level Zero command
+lists; DESIGN §8.5) with the budget applied on the device. Best
 benchmark (AMD MI300X/MI355X blog, methodology-backed) tops out at 32,768
 context: native MTP 1.7–2.7x, DFlash-style block/parallel drafters 2.3–2.9x,
 ahead of sequential MTP/EAGLE at depth; per-position acceptance decays hard
 (85–95% at position 1, 33–50% at position 7) for sequential methods, which
 block drafters avoid. No public number isolates
 cycle cost at ~77k — an open gap. Intel Arc/XPU: n-gram/EAGLE/EAGLE3 listed
-for Arc B-series (incl. B60, 24 GB), no Arc spec-decode numbers, no XPU
-equivalent of the CUDA-graph verify-batching (looks CUDA/HIP-specific).
+for Arc B-series (incl. B60, 24 GB), no Arc spec-decode numbers. The
+CUDA-graph verify batching maps on Intel to one recorded command list per
+verify size (`cl_khr_command_buffer`, Level Zero command lists; DESIGN
+§8.5).
 Sources: docs.vllm.ai/en/latest/features/speculative_decoding/{,/mtp/},
 vllm.ai/blog/2026-08-14-dspark-adaptive-verification,
 vllm.ai/blog/2026-08-23-speculative-decoding-amd-gpus,
@@ -57,8 +61,9 @@ EAGLE-3 +136%. Low-confidence third-party claims: EAGLE-3 acceptance
 degrades past ~32k context, disabled above batch 32 in some deployments;
 `LongSpec` (2502.17421, not cross-checked) targets verify-scales-with-context
 directly, 1.5–2.2x to 128k on Llama-2/Qwen. Intel Arc: no mention in
-SGLang's docs; several backends are CUDA-only, and the per-length CUDA-graph
-mechanism is CUDA-specific by construction. Sources:
+SGLang's docs. The per-length pre-captured verify graphs map on Intel to
+one recorded command list per verify length (`cl_khr_command_buffer`, Level
+Zero command lists; DESIGN §8.5). Sources:
 docs.sglang.io/advanced_features/{speculative_decoding,adaptive_speculative_decoding}.html,
 lmsys.org/blog/2026-08-17-advanced-cuda-graph, arxiv.org/pdf/2502.17421.
 
@@ -73,9 +78,10 @@ among top `relaxed_topk`; NVIDIA's "limited"/"slight" quality-impact claim is
 vendor-asserted, not quantified — marketing, as is a vendor figure of 80–90%
 second-token MTP acceptance / "1.8x TPS" with no context or hardware named.
 The whole drafting loop is captured as **a single CUDA graph** — closer to
-fused propose+verify than any other engine here — but entirely
-CUDA/Blackwell-specific; Intel Arc applicability is effectively none — the
-module-chaining idea transfers as a concept, not the implementation. Sources:
+fused propose+verify than any other engine here (CUDA, Blackwell). The
+Intel equivalent to build is the drafting loop recorded as one command list
+(`cl_khr_command_buffer`, Level Zero command lists; DESIGN §8.5); the
+module chaining is a graph-level choice and carries over as is. Sources:
 nvidia.github.io/TensorRT-LLM/1.2.0rc6/features/speculative-decoding.html,
 github.com/NVIDIA/TensorRT-LLM (blog2_DeepSeek_R1_MTP doc, LICENSE).
 

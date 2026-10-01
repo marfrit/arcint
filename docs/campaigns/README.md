@@ -35,7 +35,7 @@ exists, where, and its number; its full history is in git
   would trade one for a number records the trade, with the measured price of
   each side, and puts it to the operator. [Amended 2026-10-01. §3.4 was
   relaxed, and correctness is now judged at the answer, not at the bit
-  (DESIGN §3.4 Amendments 1–2; `CLAUDE.md`). A reference mechanism that
+  (DESIGN §3.4 (amended 2026-10-01); `CLAUDE.md`). A reference mechanism that
   conflicts with an invariant is the operator's call
   (`research-reference-audit.md`).]
 - **Status is the current state**, a few lines, rewritten as the campaign
@@ -56,16 +56,17 @@ exists, where, and its number; its full history is in git
 
 ## Open
 
-Ordered by the audit's ranking (`research-reference-audit.md` §4); the
-order is advice, not a queue.
+The first four in the build order (`decision`, operator's architect,
+2026-10-01): the cache (with its miss split and the bank pinning), the
+doorbell, multi-draft MTP, prefill on the GPU. The rest follow the audit's
+ranking (`research-reference-audit.md` §4).
 
 | campaign | state | reference to follow |
 |---|---|---|
-| [expert-hot-set-lru](expert-hot-set-lru.md) | placement is static (census seed, patch 0046); 36 % of routed experts run on the GPU at decode | Strata `src/program/generate.cpp:4395-4478` (adaptive swaps, non-blocking admission), `src/core/expert_cache.cpp`; FreeToken `moe/offload_cache.py` (one pool for all layers) |
-| [prefill-expert-streaming](prefill-expert-streaming.md) | prefill 63–68 t/s at 20k on the B60, CPU-tier-bound | Strata `src/prefill/prefill.cpp:71-104` (slot ring, chunks to 8,192, MMQ); FreeToken `moe/offload_cache.py` prefill overlap, `layers/moe.py:388-390` |
-| [mtp-cycle-wall](mtp-cycle-wall.md) | MTP drafts one token a cycle (dense agent); no Flash-Next head exported | Strata `src/core/mtp.cpp:771-820` (draft chain with `min_p`), `tools/mtp_fetch.py` |
+| [expert-hot-set-lru](expert-hot-set-lru.md) | placement is static (census seed, patch 0046); 36 % of routed experts run on the GPU at decode; the CPU tier computes every miss; the bank is pageable | Strata alone: `src/program/generate.cpp:4413-4482` (batched swaps, non-blocking admission), `:1709-1724` (link-probed miss share), `src/core/expert_source.cpp:1614-1696` (the split), `src/core/expert_cache.cpp`, `include/strata/core/pinned.hpp` |
 | [tier-handoff-doorbell](tier-handoff-doorbell.md) | B60 device idle ~46 % of a decode token, waiting on the tier hand-off | Strata `src/kernels/cuda/elementwise.cu:186-311` (doorbell), recorded pass; FreeToken `moe/cpu_executor.py` (mapped flags, pinned workers) |
-| [hybrid-expert-fetch](hybrid-expert-fetch.md) | the CPU tier computes every missed expert | FreeToken `decode_target="hybrid"`, `moe/bench_profile.py` fetch fraction; Strata `src/core/expert_source.cpp:1614-1631` (PCIe share) |
+| [mtp-cycle-wall](mtp-cycle-wall.md) | MTP drafts one token a cycle (dense agent); the Flash-Next head's tensors fetched, never exported or served | Strata `src/core/mtp.cpp:771-820` (draft chain with `min_p`), `tools/mtp_fetch.py` |
+| [prefill-expert-streaming](prefill-expert-streaming.md) | prefill 63–68 t/s at 20k on the B60, CPU-tier-bound | Strata `src/prefill/prefill.cpp:71-104` (slot ring, chunks to 8,192, MMQ); FreeToken `moe/offload_cache.py` prefill overlap, `layers/moe.py:388-390` |
 | [kquant-host-storage](kquant-host-storage.md) | native blocks on the host tier, quantised dot for decode-shaped calls (0043, 0074) | Strata `src/kernels/cpu/iq_avx2.cpp` (multi-token AVX2) |
 | [kv-checkpoint-restore](kv-checkpoint-restore.md) | backlog; the prefix cache is in-process only | Strata conversation cache (`src/core/conversation_snapshot.cpp`) |
 | [served-prefill-determinism](served-prefill-determinism.md) | B60 run-to-run variance, located in the GDN state; not gating | upstream openvinotoolkit/openvino#38099 |
@@ -94,6 +95,7 @@ paths under `~/src/Strata-ref/`.
 | [host-expert-bank](host-expert-bank.md) | patch 0072 RAM bank (`+p23`), patch 0074 quantised decode dot (`+p25`) |
 | [dense-q8-flash-next](dense-q8-flash-next.md) | `--dense-q8`, the `d48q8` artifact |
 | [qsa](qsa.md) | `--qsa` served with a compressed block-key cache, non-default |
+| [hybrid-expert-fetch](hybrid-expert-fetch.md) | merged into `expert-hot-set-lru` 2026-10-01 (the miss split) |
 
 ## Research
 

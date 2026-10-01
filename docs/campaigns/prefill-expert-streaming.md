@@ -56,9 +56,11 @@ most 1 point).
   512): the CPU tier takes ~152 ms a MoE layer call (322 host experts, 3,227
   token-expert pairs), ~51 s of the ~80 s the prompt adds; the grouped native
   kernels on the card take 1.98 ms a prompt token.
-- **Preconditions met.** The dev host's TTM pinned cap is 40 GiB, so the
-  served bank (30 GiB) can be the pinned source. DESIGN §3.4 Amendments 1–2
-  allow shape- and timing-dependent placement at the answer-level bar; gates
+- **Preconditions.** The dev host's TTM pinned cap is 40 GiB, so the served
+  bank (30 GiB) can be the pinned source; pinning it is owed by
+  `expert-hot-set-lru`, which comes first in the build order. DESIGN §3.4
+  (amended 2026-10-01) allows shape- and timing-dependent placement at the
+  answer-level bar; gates
   are per phase (`CLAUDE.md`). The grouped native kernels and the hybrid
   prefill split exist (patches 0037/0042, 0043–0058).
 - **Untested on the B60:** prefill chunks above 2,048 (`research-reference-audit.md` §2).

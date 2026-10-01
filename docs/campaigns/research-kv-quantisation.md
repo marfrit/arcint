@@ -27,7 +27,7 @@ no prefill-specific cost found for it either.
 
 ## exllamav2 / exllamav3
 
-MIT, CUDA-only, no Arc applicability. Q4/Q6/Q8 cache with a Hadamard rotation
+MIT, CUDA kernels. Q4/Q6/Q8 cache with a Hadamard rotation
 before quantisation; "calibration-free" means no per-model calibration set.
 Measured (author's `doc/qcache_eval.md`): Mistral-7B, Mixtral-8x7B, Llama2-7B
 on The Pile plus ~9-12k-token summarisation — Q4/FP8 cache perplexity within
@@ -48,9 +48,10 @@ analogue to arcint's "scratch scales with depth" reading**, and explicitly a
 Hopper-kernel workaround: Blackwell/FlashInfer skips it, no regression shown
 there. Mitigations shipped: tuned prefill tiling for head_dim 64/128, a
 per-layer dtype-skip flag, torch.compile-fused query quantisation; no
-tail-window discussion found. Not portable to Arc, but the mechanism
-generalises: a fixed-precision-recovery buffer whose need is a function of
-context length.
+tail-window discussion found. The kernel is Hopper's; the mechanism
+generalises to any attention kernel, Arc's included: a
+fixed-precision-recovery buffer whose need is a function of context
+length.
 
 **SGLang** (Apache 2.0): `--kv-cache-dtype fp8_e4m3` shipped for MLA models
 (DeepSeek V3/R1); MHA support in progress. Clearest first-party admission in
@@ -58,9 +59,11 @@ this survey (issue #10083): today's implementation quantises at store time
 and dequantises at read time for attention — "suboptimal, wastes time for
 quant/dequant" — proposed fix: fuse dequant into the attention kernel
 (borrowing TensorRT-LLM's approach) so no standalone dequant step exists. No
-tail-window or prefill/decode split published; not portable to Arc.
+tail-window or prefill/decode split published. The mechanism that carries
+over to any attention kernel, Arc's included, is the dequant fused into the
+attention kernel.
 
-**TensorRT-LLM** (Apache 2.0, NVIDIA-only, no Arc applicability): INT8/FP8 KV
+**TensorRT-LLM** (Apache 2.0, NVIDIA kernels): INT8/FP8 KV
 cache both dequantise before the attention math runs (NVIDIA docs) —
 quantisation saves bandwidth/capacity, not attention compute. Third-party
 measured (SqueezeBits' vLLM-vs-TensorRT-LLM series): up to 1.09x throughput

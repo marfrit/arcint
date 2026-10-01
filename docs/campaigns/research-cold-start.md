@@ -41,7 +41,7 @@ Two distinct mechanisms, easy to conflate.
 - What's cached / not: compiled device binaries keyed on source + included files + build options + device identity (self-invalidating on a driver bump); does not cover programs built from source strings at runtime or produced by linking multiple modules.
 - Persists: across processes and reboots, on disk, only when explicitly turned on (default off).
 - License / source: Apache 2.0 w/ LLVM exceptions. intel/llvm "A brief overview of kernel and program caching mechanism", intel.github.io/llvm.
-- Relevance to arcint: this sits in the SYCL/Level-Zero runtime, parallel to, not underneath, the OpenCL path arcint uses per this task's framing. Unless some component quietly goes through SYCL/L0 instead of OpenCL, rule this out rather than try it.
+- Relevance to arcint: this cache sits in the SYCL/Level Zero runtime, beside the OpenCL path arcint's kernels compile through, so it covers a component only if that component builds its programs through SYCL. Which components do is checkable (the `SYCL_CACHE_*` knobs are inert otherwise); that check has not been run.
 
 ## llama.cpp — Vulkan, SYCL, OpenCL backends
 
@@ -65,7 +65,7 @@ Two distinct mechanisms, easy to conflate.
 - (2) CUDA-graph capture: not persisted as a first-class artifact — re-captured per process at server start as an explicit warm-up pass over a fixed list of batch sizes.
 - Measured delta: community posts (Tensorfuse, RunPod) report cutting cold start from roughly 5 min to 90 s and 294 s to 82 s via a persistent `TORCHINDUCTOR_CACHE_DIR`, restricting captured batch sizes to the ones actually served, and a few dummy requests before accepting traffic — vendor/blog numbers on NVIDIA hardware, not peer-reviewed; read as "order of magnitude possible," marketing-adjacent, not a controlled benchmark.
 - License / source: Apache 2.0. vLLM docs "torch.compile integration", docs.vllm.ai; Tensorfuse and RunPod engineering blogs (2026).
-- Relevance: CUDA graphs have no OpenVINO-GPU/oneDNN analogue, but the pattern — explicit warm-up requests run before the server accepts traffic, at each shape class actually served — is the direct analogue of this campaign's "pre-warm" lever.
+- Relevance: the Intel equivalents of a captured CUDA graph are `cl_khr_command_buffer` and Level Zero command lists (DESIGN §8.5; the pinned plugin's runtime creates immediate lists only, so a recorded pass is plugin work). The warm-up pattern — explicit requests run before the server accepts traffic, at each shape class actually served — is the direct analogue of this campaign's "pre-warm" lever.
 
 ## SGLang — configurable warm-up functions
 

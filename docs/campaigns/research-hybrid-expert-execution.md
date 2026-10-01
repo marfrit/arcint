@@ -9,15 +9,18 @@ section.
 
 ## "ninfer" and "freetoken" — what they actually are
 
-Both names resolve to real, currently-shipping projects — not fabrications —
-but neither is what "ahead of llama.cpp" suggests for arcint's problem.
+Both names resolve to real, currently-shipping projects. FreeToken is the
+one on topic for expert offload; NInfer is a reference for models fully
+resident on one GPU.
 
-**ninfer** (github.com/Neroued/ninfer, Apache-2.0) is a from-scratch C++/CUDA
-engine for a *closed set* of dense Qwen checkpoints (Qwen3.6-27B, Qwen3.8-27B,
-Qwen3.6-35B-A3B) on a single NVIDIA RTX 5090 (community forks retarget
-4090/3090). No MoE, no CPU offload, no host compute tier anywhere in the
-README — it is single-GPU, CUDA-only, and does not run anything that
-doesn't fit the card. Not on topic for expert offload.
+**ninfer** (github.com/Neroued/ninfer, Apache-2.0; checked out at
+`~/src/ninfer`) is a from-scratch C++/CUDA engine for a *closed set* of
+Qwen checkpoints on a single NVIDIA RTX 5090: the dense Qwen3.6-27B and
+Qwen3.8-27B, and the Qwen3.6-35B-A3B MoE fully resident (`code`:
+`README.md`, `src/ops/sparse_moe/`). It has no CPU offload and no host
+expert tier, so it is not a reference for expert offload; arcint cites it for
+resident single-GPU work (its KV codec, DESIGN §8.10; batched decode,
+DESIGN §4.1).
 
 **freetoken** (github.com/FlashML-org/FreeToken, arXiv:2608.16157) is the one
 actually on-topic: an "edge-native MoE serving engine" doing "bandwidth-
@@ -225,8 +228,11 @@ The prefill rate lever the expert engines use is computing every expert on
 the GPU and streaming the non-resident ones (the OSDI'26 stream-loading
 prefill above; FreeToken and Strata, below): `prefill-expert-streaming`. The
 surveyed systems added a kernel-dispatch branch, not a new serving engine.
-The CPU-side multipliers above were measured with AMX or AVX-512; the dev
-host's CPU has AVX2.
+The CPU-side multipliers above were measured with AMX or AVX-512; the AVX2
+reference for the same work is Strata's multi-token i-quant kernel
+(`code`: `~/src/Strata-ref/src/kernels/cpu/iq_avx2.cpp`; `paper` finding 7:
+decoding once for several tokens 2.0–2.4×), which runs on the dev host's
+instruction set.
 
 ### Choosing the resident experts (b)
 
@@ -275,10 +281,10 @@ What transfers:
   192 t/s prefill, against arcint's 6.0 and 68.5 with a quarter of the experts
   on the card.** Our in-RAM tier bench was ~8.5 t/s, so the per-expert CPU
   path, not the hardware, is the decode gap. The thread's own explanation
-  ("L3-resident experts") is wrong. Its MTP claim is narrated, not measured,
-  but names a real risk for CPU-held experts: verify batches multiply tier
-  work. A same-host llama.cpp run is the cheap bar to set before more tier
-  machinery.
+  ("L3-resident experts") is wrong. Its MTP claim is narrated, not measured;
+  Strata measures MTP with CPU-held experts at 1.6–1.8× decode (`paper`
+  finding 2). A same-host llama.cpp run with every expert on the CPU is the
+  comparison row for the tier's rate.
 - The closest comparable (one 24 GB card plus host RAM) prefills about **8×
   faster**. Its host tier is the same shape (~77 % of experts on the CPU).
   With 83 % MTP acceptance its decode is ~2.5× ours; without MTP the gap is
@@ -292,8 +298,8 @@ What transfers:
 - The n-gram table on NVMe through the page cache is the common practice;
   arcint's staged-rows route is equivalent.
 - `--moe-cache-slots`-style GPU expert caches with CPU fallback are the
-  llama.cpp-fork answer at 12 GB. Compare this with arcint's per-expert
-  dispatch pool before building more tier machinery.
+  llama.cpp-fork answer at 12 GB; arcint builds the same mechanism after
+  Strata (`expert-hot-set-lru`).
 
 ## Strata (added 2026-10-01) — paper read plus code read
 
@@ -374,7 +380,7 @@ Ryzen 5 7600 — the same model *shape* arcint serves, on different silicon.
 - **what transfers.** The adaptive tier as a mode, the swap mechanism
   (census, gain-ranked candidates and victims, deferred admission with no
   waiter), `verify_slot`'s byte-compare. Campaign: `expert-hot-set-lru`; DESIGN
-  §3.4 Amendments 1–2 (2026-10-01). The hit rates are the RTX 5070's with
+  §3.4 (amended 2026-10-01). The hit rates are the RTX 5070's with
   Q2_0; 96 swaps every 4 rounds is Strata's tuned default.
 
 ### §3.5 Reading the prompt: streaming experts to the GPU
@@ -401,7 +407,7 @@ Ryzen 5 7600 — the same model *shape* arcint serves, on different silicon.
 | 4 — adaptive cache beats static by a wide margin (0.50 → ~0.72) | closed | `paper` §3.4/§6; `code` `generate.cpp` | Yes: `expert-hot-set-lru`. |
 | 5 — splitting a layer's tokens into two groups to overlap its halves is exact but ~7 % slower (85.8 vs 91.8 t/s at 4K): dense weights read twice, fewer shared experts | closed | `paper` §6; `code` `verify.hpp` `set_split` (`--spec-split`, non-default) | Yes, as Strata's own measurement of that split; its paying overlap is the copy engine (Finding 9). |
 | 7 — i-quants limited by CPU arithmetic, not RAM: ~5 GB/s per core, 23–26 GB/s on six cores; decoding once for several tokens helps 2.0–2.4× | closed | `paper` §6 (Table 5); `code` `src/kernels/cpu/iq_avx2.cpp` | Yes: the AVX2 multi-token kernel is the reference for `kquant-host-storage`. |
-| 9 — the overlap that paid: the copy engine. DMA the misses from the CPU thread when it plans the layer; the copy engine runs beside CPU and GPU work. 55 % of misses over PCIe for i-quants (arithmetic-bound), 20 % for Q2_0 (RAM-bound) | closed | `paper` §6; `code` `verify.hpp` `pcie_mode`, `expert_source.cpp:1614-1631` | Yes: `hybrid-expert-fetch`. The share follows whether the CPU tier is arithmetic- or RAM-bound. |
+| 9 — the overlap that paid: the copy engine. DMA the misses from the CPU thread when it plans the layer; the copy engine runs beside CPU and GPU work. 55 % of misses over PCIe for i-quants (arithmetic-bound), 20 % for Q2_0 (RAM-bound) | closed | `paper` §6; `code` `verify.hpp` `pcie_mode`, `expert_source.cpp:1614-1631` | Yes: the miss split of `expert-hot-set-lru`. The share follows whether the CPU tier is arithmetic- or RAM-bound and, for i-quant packs, the probed link: `min(0.55, max(0.05, 0.55 × GB/s / 26))` (`code`: `generate.cpp:1709-1724`), ~0.29 at this host's 13.9 GB/s. |
 | 10 — refill without making anyone wait: evict the old expert at once, admit the new one when its copy lands; 91.7 → 94.4 t/s at 4K | closed | `paper` §6; `code` `generate.cpp` (`pending`, `apply_pending`, `host_res[out] = kNotResident`) | Yes: the admission pattern for `expert-hot-set-lru`. |
 
 ### §7 What could make it faster (projections, `paper` only)
@@ -414,14 +420,14 @@ predicting the next layer's experts; (c) cheaper i-quant CPU arithmetic
 load); (d) a fused 8-bit grouped prompt kernel; (e) temperature sampling via
 rejection in the verify window; (f) free hardware settings. These are `paper`
 projections, not measurements. (a) is `kv-checkpoint-restore`; (b) relates
-to `hybrid-expert-fetch`; (c) is `kquant-host-storage`; (d) is the
+to the miss split of `expert-hot-set-lru`; (c) is `kquant-host-storage`; (d) is the
 prompt-path half of `prefill-expert-streaming`.
 
 ### What transfers to arcint's MoE tier
 
-The adaptive tier and its swap mechanism (`expert-hot-set-lru`), the
-doorbell and recorded pass (`tier-handoff-doorbell`), the PCIe share of the
-misses (`hybrid-expert-fetch`), prefill streaming through a slot ring
+The adaptive tier with its swap mechanism and the PCIe share of the misses
+(`expert-hot-set-lru`), the doorbell and recorded pass
+(`tier-handoff-doorbell`), prefill streaming through a slot ring
 (`prefill-expert-streaming`), multi-token CPU kernels (`kquant-host-storage`),
 multi-draft MTP (`mtp-cycle-wall`), conversation state between requests
 (`kv-checkpoint-restore`), and `verify_slot`'s byte-compare for any copied

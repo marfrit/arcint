@@ -17,6 +17,50 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## Unreleased
+
+Build order after 0.5.4 (operator's architect, 2026-10-01): the adaptive
+expert cache with its miss split and the pinned bank, then the doorbell
+hand-off, then multi-draft MTP for Flash-Next (ROMA), then prefill on the
+GPU. The 0.5.4 entry's "0.5.5 ROMA is next" is superseded by this order.
+
+- **Tier hot loop, part A (zero-copy tier I/O + hot pool): gate FAILED, not
+  adopted.** Patch 0075 compiled clean (tier suites 27 passed / 3 skips) and the
+  served A/B on dense `d48q8` (B60, 20,085 tokens) read base 62.8 / 6.4 t/s,
+  zero-copy 63.7 / 6.5, spin 66.8 / 6.4, both 64.5 / 6.2 -- the decode bar
+  (> 6.5 t/s) is not cleared, so the patch is not added to the packaging series.
+  Prefill improves with the spin (+6.4 %), but the gate is decode-first.
+
+- **Tier hot loop, part A: zero-copy took effect, decode did not move; 0075
+  dropped.** One 16-vs-80 pair per arm (dense `d48q8`, B60) shows the
+  staging-ring HtoD copies fall from **304.2 to 11.5 per decode token**
+  (-292.7), while DtoH 98, MtoH 48, MtoD 12 and DtoM 48 are unchanged; decode
+  stays flat (5.8 vs 5.2 in the pair; 6.4 vs 6.5 in the gate A/B). The copy
+  idle was therefore the host waiting on the tier, not the copies. Bank misses
+  are **4.17 per decode token** (1.35 % of the 308 tier experts) and
+  **9.55 MiB/token** read from disk. Under the per-phase gate adopted on
+  2026-10-01 (`CLAUDE.md`) the spin's +6.4 % prefill with decode unchanged
+  qualifies; it is to be re-landed on its own (DESIGN §8.8).
+
+- **Adaptive expert cache with the miss split: design and gate pinned, build
+  not started** (operator amendment 2026-10-01, house rules `b0447b8`;
+  design restated by the operator's architect the same day, following
+  Strata alone). Per-layer slot budgets fixed at start, slots sized in bytes
+  per layer, budgets from one global decode-built usage profile; swaps
+  batched within each layer from decayed counts (usage >= 2.0, gain > 1.5,
+  the top 96 by gain across layers, decay 0.7 per adapt call), every 12
+  decode tokens until Flash-Next MTP lands; evict at once, admit when the
+  copy lands, never wait. Miss split: a share of each layer's misses read by
+  the GPU directly from the pinned bank (not cached), the rest on the CPU
+  tier, concurrently; the share is Strata's link probe for i-quant packs,
+  `min(0.55, max(0.05, 0.55 x link_GBps / 26))`, about **0.29** at the B60's
+  13.9 GB/s pinned link. Pinned 30 GiB USM-host bank (40 GiB TTM cap).
+  Replaces `MOE_CPU_TIER_PARTITION=lru`; keeps the slot pool (0005-0007,
+  0070); lands as plugin patch 0076. Gate is the answer-level bar (KL +0.03
+  nats, argmax -1 point, answers right). Campaign
+  `docs/campaigns/expert-hot-set-lru.md`, which now also owns the miss split
+  (`hybrid-expert-fetch` merged into it).
+
 ## 0.5.4 — 2026-10-01
 
 The 0.5.1-0.5.4 acceptance is closed against the readable rows: BERLIN-001
@@ -226,6 +270,54 @@ on the pinned nightly `71640275`. The four dots ship together in this release;
   d48s2's. The quality A/B row is closed device-free (a CPU logits A/B is
   bit-identical; red on a 1.001 scale mutant); the served KL/argmax row is
   blocked on the f32 reference re-capture.
+
+- **Tier hot loop: the native expert dot in the quantised domain.** Patch 0074
+  replaces the tier's f16->f32 row decode + f32 dot for IQ3_XXS / IQ4_NL /
+  IQ4_XS / Q8_0 with ggml's approach -- a per-stage int8 activation (one scale
+  per 32 values) dotted against the packed weight via `maddubs`/`madd`.
+  Measured at the served shape (8 experts x one job, H=2560 I=640, pool of 7):
+  **651 us per layer call**, 1.21x llama.cpp's `mul_mat_id` (~540 us), inside
+  the 1.3x microbench bar; the old path was ~1.4 ms. Numerics are tolerance-
+  bound now, not bitwise; `MOE_CPU_TIER_Q8_DOT=0` restores the old routing.
+
+- **The 0074 served gate fails on prefill.** On the dense arm at 20,085 tokens
+  (B60, bank 30 GiB), decode improves 10 % (6.0 -> 6.6 t/s) but prefill
+  regresses 28 % (68.4 -> 49.5 t/s); 8 pinned threads are a wash. The per-row
+  quantised dot is ported, ggml's batched prefill path is not. 0074 is not
+  adopted; the served default stays the pre-0074 routing.
+
+- **Flash-Next decode decomposition (CLIntercept).** Baseline dense arm at
+  20,085 tokens on the B60: device busy is 26 % of wall (74 % idle), dominated
+  by the GPU expert GEMMs; host `clWaitForEvents` is 36 s and there are 5.8 M
+  `HtoD` expert-weight copies (326 per decode token). Decision: take the CPU
+  tier off the critical path (overlap host experts with GPU work, join late).
+
+- **0074 adopted, shape-routed.** The quantised-domain dot is now the decode
+  kernel only (tier calls of <= 8 jobs); prefill-shaped calls keep the old f32
+  path. Dense arm at 20,085 tokens on the B60: prefill 63.1 t/s (base 64.2),
+  decode 6.5 t/s (base 5.9) -- prefill back to base, decode +10 %. Served
+  runtime prefix ov-0074, plugin 55c432880f2d5ed0.
+
+- **KL replay harness fixed.** The gate must replay the capture's own window
+  through the served arm (`ARCINT_LOGITS_DUMP` + `--no-logits-slice`, then
+  `tools/kld_served.py --replay`), not reuse the leg's request dump. With that,
+  window 0 below-2,051 mean KL is 0.3003 (base) vs 0.3186 (shape-routed 0074) on
+  the B60; the floor was not measured this leg.
+
+- **Decode-only decomposition and its decision.** Short-prompt 512-token
+  decode delta (314 tokens) on the shape-routed 0074: per token wall 136 ms,
+  device busy ~73 ms, idle ~46 %, 308 HtoD + 48 DtoM calls (KB-sized, ~4 MB),
+  761 launches, 362 syncs. The dense qwen3.8-27b control is ~87 % device-bound,
+  so the idle is MoE-specific. Decision: decode overlap (tier off the critical
+  path, join late).
+
+- **Idle split on the shape-routed 0074 (decode).** Chrome trace, 18 s decode
+  phase: 50.2 % idle. Tier writeback wait 47.2 ms/token plus tier readback/
+  staging roundtrips 31.3 ms/token dominate; the post-sync gap is 1.3 ms/token
+  (~1 %). Shared-expert device time is ~132 us/layer (6.3 ms/token overlap
+  ceiling). Tier/miss split: 308 CPU-tier experts vs 170 GPU hits per token
+  (36 % hit rate). Decision: tier wait dominates -- no async restructuring;
+  work the tier time and residency.
 
 ## 0.5.0.1 — 2026-09-27
 
@@ -2711,76 +2803,3 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p2` (patches 0003–0013).
 ## 0.2.0 — 2026-08-29
 - First packaged release: amd64, trixie, strict dependency on
   `marfrit-openvino` at the pinned nightly.
-
-- **Tier hot loop: the native expert dot in the quantised domain.** Patch 0074
-  replaces the tier's f16->f32 row decode + f32 dot for IQ3_XXS / IQ4_NL /
-  IQ4_XS / Q8_0 with ggml's approach -- a per-stage int8 activation (one scale
-  per 32 values) dotted against the packed weight via `maddubs`/`madd`.
-  Measured at the served shape (8 experts x one job, H=2560 I=640, pool of 7):
-  **651 us per layer call**, 1.21x llama.cpp's `mul_mat_id` (~540 us), inside
-  the 1.3x microbench bar; the old path was ~1.4 ms. Numerics are tolerance-
-  bound now, not bitwise; `MOE_CPU_TIER_Q8_DOT=0` restores the old routing.
-
-- **The 0074 served gate fails on prefill.** On the dense arm at 20,085 tokens
-  (B60, bank 30 GiB), decode improves 10 % (6.0 -> 6.6 t/s) but prefill
-  regresses 28 % (68.4 -> 49.5 t/s); 8 pinned threads are a wash. The per-row
-  quantised dot is ported, ggml's batched prefill path is not. 0074 is not
-  adopted; the served default stays the pre-0074 routing.
-
-- **Flash-Next decode decomposition (CLIntercept).** Baseline dense arm at
-  20,085 tokens on the B60: device busy is 26 % of wall (74 % idle), dominated
-  by the GPU expert GEMMs; host `clWaitForEvents` is 36 s and there are 5.8 M
-  `HtoD` expert-weight copies (326 per decode token). Decision: take the CPU
-  tier off the critical path (overlap host experts with GPU work, join late).
-
-- **0074 adopted, shape-routed.** The quantised-domain dot is now the decode
-  kernel only (tier calls of <= 8 jobs); prefill-shaped calls keep the old f32
-  path. Dense arm at 20,085 tokens on the B60: prefill 63.1 t/s (base 64.2),
-  decode 6.5 t/s (base 5.9) -- prefill back to base, decode +10 %. Served
-  runtime prefix ov-0074, plugin 55c432880f2d5ed0.
-
-- **KL replay harness fixed.** The gate must replay the capture's own window
-  through the served arm (`ARCINT_LOGITS_DUMP` + `--no-logits-slice`, then
-  `tools/kld_served.py --replay`), not reuse the leg's request dump. With that,
-  window 0 below-2,051 mean KL is 0.3003 (base) vs 0.3186 (shape-routed 0074) on
-  the B60; the floor was not measured this leg.
-
-- **Decode-only decomposition and its decision.** Short-prompt 512-token
-  decode delta (314 tokens) on the shape-routed 0074: per token wall 136 ms,
-  device busy ~73 ms, idle ~46 %, 308 HtoD + 48 DtoM calls (KB-sized, ~4 MB),
-  761 launches, 362 syncs. The dense qwen3.8-27b control is ~87 % device-bound,
-  so the idle is MoE-specific. Decision: decode overlap (tier off the critical
-  path, join late).
-
-- **Idle split on the shape-routed 0074 (decode).** Chrome trace, 18 s decode
-  phase: 50.2 % idle. Tier writeback wait 47.2 ms/token plus tier readback/
-  staging roundtrips 31.3 ms/token dominate; the post-sync gap is 1.3 ms/token
-  (~1 %). Shared-expert device time is ~132 us/layer (6.3 ms/token overlap
-  ceiling). Tier/miss split: 308 CPU-tier experts vs 170 GPU hits per token
-  (36 % hit rate). Decision: tier wait dominates -- no async restructuring;
-  work the tier time and residency.
-
-- **Tier hot loop, part A (zero-copy tier I/O + hot pool): gate FAILED, not
-  adopted.** Patch 0075 compiled clean (tier suites 27 passed / 3 skips) and the
-  served A/B on dense `d48q8` (B60, 20,085 tokens) read base 62.8 / 6.4 t/s,
-  zero-copy 63.7 / 6.5, spin 66.8 / 6.4, both 64.5 / 6.2 -- the decode bar
-  (> 6.5 t/s) is not cleared, so the patch is not added to the packaging series.
-  Prefill improves with the spin (+6.4 %), but the gate is decode-first.
-
-- **Tier hot loop, part A: zero-copy took effect, decode did not move; 0075
-  dropped.** One 16-vs-80 pair per arm (dense `d48q8`, B60) shows the
-  staging-ring HtoD copies fall from **304.2 to 11.5 per decode token**
-  (-292.7), while DtoH 98, MtoH 48, MtoD 12 and DtoM 48 are unchanged; decode
-  stays flat (5.8 vs 5.2 in the pair; 6.4 vs 6.5 in the gate A/B). The copy
-  idle was therefore the host waiting on the tier, not the copies. Bank misses
-  are **4.17 per decode token** (1.35 % of the 308 tier experts) and
-  **9.55 MiB/token** read from disk.
-
-- **Adaptive expert cache + reference miss split: design and gate pinned, build
-  not started** (operator amendment 2026-10-01, house rules `b0447b8`). One
-  shared expert pool, byte-sized slots, batched decayed swaps (decay 0.7,
-  margin 1.5, up to 96 per 4 rounds), evict-at-once/admit-on-land, never wait;
-  pinned 30 GiB USM-host bank (40 GiB TTM cap); decode-built census. Miss split
-  `f = cpu/(cpu+link)` = **153/(153+172) = 0.471** CPU, 0.529 fetched, from
-  served rates (tier 153 us/expert, link ~172 us/expert at 2.34 MiB / 13 GB/s).
-  Gate is the answer-level bar (KL +0.03 nats, argmax -1 point, answers right).
