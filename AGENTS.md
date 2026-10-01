@@ -69,62 +69,25 @@ integrity checks on copied data stay exact. Details in `CLAUDE.md`.
 
 ## Why this file exists
 
-2026-10-01, the second time: the FreeToken-style LRU expert cache was built,
-ruled "a violation of §3.4 as written", and replaced by a static partition.
-The price was never put to the operator: a 36 % GPU hit rate and 308
-CPU-tier experts per token, against Strata's ~0.72 hit rate (paper §3.4,
-which leaves ~134 of 480 routed experts per token for the CPU before its
-PCIe share). The operator: "I requested that so many times." The same audit
-found three more recorded negatives that had tested a different mechanism
-from the reference's: hybrid-expert-fetch (pageable memory, nothing cached),
-prefill-expert-streaming v1 (staging, one queue, small chunks) and the 0075
-hand-off (half of the wait removed). It also found one premise that was never
-tried, "Flash-Next has no MTP head". Rules 8 and 9 above come from that.
+**2026-09-15, documents not read.** 0.5.1 spent five days building a
+segmented serving route whose expert bodies were whole-tensor `Parameter`s
+outside the MoE fusion, so every expert computed for every token: on the B60
+it measured 7.06× the device residency per layer and 623× the warm forward.
+The correct mechanism (route only the selected experts, split the batch by
+residency, as FreeToken's source does) was already scoped in
+`docs/campaigns/`, and the reference's source had never been read. Rules 1–6
+follow: read the record and the reference's code before the first tool call.
 
-The first time:
-
-2026-09-15. Five days of 0.5.1 built a segmented serving route whose expert
-bodies are whole-tensor u8 `Parameter`s unpacked to f32 in-graph. Measured on
-the B60: **7.06× the device residency per layer and 623× the warm forward**
-against the same graph with the bodies as `Constant`s; no 12-layer segment
-compiles at all.
-
-The cause was in this repository the whole time:
-
-- The MoE fusion matcher requires `u4` **Constants**
-  (`DESIGN.md`:4489). Leaving Constant-land leaves the fusion, and the fusion
-  is what applies the **routing** — `window-051.md` §2 says so in the design's
-  own words: "every expert computes for every token".
-- Flash-Next activates **10 of 512** experts per token.
-  `design-qwen-flash-next.md`:84 dispositioned `num_experts_per_tok` as
-  "**not read**". That one table cell is where the design stopped being
-  FreeToken-shaped; it is 51.2× the required work.
-- `docs/campaigns/research-hybrid-expert-execution.md`, dated **2026-09-05**,
-  had already scoped the fix correctly: "the missing piece is the *split* …
-  **That is a plugin change, not an engine change** — none of the surveyed
-  systems replaced their serving engine, they added a kernel-dispatch
-  branch." 0.5.1 replaced the serving engine.
-- The two campaigns that own the real fix — `sub4bit-vram-kernel` (in-kernel
-  dequant + a fusion matcher for the new element type) and
-  `static-partition-prefill` (split the batch by residency; `moe_cpu_expert`
-  already exists) — were both opened 2026-09-05 and both still read
-  **"nothing started"**.
-- `docs/research-freetoken.md` carries **10 section verdicts**, every one
-  from the paper text alone. One is disproven by the code: it declares the
-  n-gram/PLE table "Not in FreeToken … arcint-original work", while
-  `~/src/FreeToken-ref` ships `models/qwen4_exp/ple_disk.py` with
-  `ple_backend = "disk"` as the **default**. arcint pins the same table as
-  26.82 GiB of USM host for the life of the process.
-
-No instruction ever forbade checking any of this. There is no standing order
-in `CLAUDE.md`, `CLAUDE.local.md`, the fleet `CLAUDE.md`, or any agent
-definition against questioning the operator or the design premises — that was
-searched. The contract required the opposite. The documents were simply never
-opened, across roughly ten dispositions and several sessions, by more than one
-agent.
-
-Reading them costs minutes. Not reading them cost a 60 GB artifact, an 82
-minute fill, four watchdog-killed card legs, a downed dev host, and a
-mechanism that cannot work.
+**2026-10-01, a reference mechanism dropped under an invariant.** The
+FreeToken-style LRU expert cache was built, ruled a violation of DESIGN §3.4,
+and replaced by a static partition without the price being put to the
+operator: a 36 % GPU hit rate (`measured-here`) against Strata's ~0.72
+(`paper`). The same audit found three more recorded negatives that had
+tested a different mechanism from the reference's, and one premise that was
+never tried (the Flash-Next MTP head). Rules 8–9 follow: follow the expert
+engines, settle a negative only against the reference's own mechanism, take
+every conflict between a reference mechanism and an invariant to the
+operator with the measured price of each side, and judge correctness at the
+answer.
 
 **RTFM first. Every turn.**

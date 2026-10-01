@@ -146,22 +146,14 @@ per-arch format notes ([L1] L135–136, `paper`).
 
 ### Reference row — arcint's own patched plugin (`measured-here`)
 
-This is not one of the three charter runtimes. It is recorded because it
-is the only OpenVINO path that computes GGUF IQ blocks at all. Patch 0043
-admits IQ4_NL / IQ3_XXS / IQ4_XS / Q8_0 as native expert formats. Patch
-0045 decodes IQ4_NL / IQ3_XXS / Q8_0 inside the per-expert OpenCL kernel.
-The native per-expert route has served on **both** cards: the A770 at
-0.44 t/s request wall, and the B60 at 0.6 t/s decode, Paris
-(`docs/campaigns/sub4bit-vram-kernel.md`, 2026-09-21/22 entries; DESIGN
-§7.0.2ce). As of the base commit `e8b9241` (2026-09-24) the IQ2_S
-native expert block decodes bit-exact against the CPU reference (a design
-note, device-free). No served IQ2_S reading is recorded here. The fused MoE route has served on the A770: the depth-12 fused artifact
-(`d12r fused`) ran at 26.6 t/s warm at ratio 99 + tier
-(`docs/campaigns/sub4bit-vram-kernel.md` L333). That route sits behind the
-`supports_immad && use_onednn` MoE gate (L647 at the pin [O7]; L699 on
-`master` [O1]; the arcint patch series was not checked for touching it), so this is indirect
-evidence that the A770 takes the DPAS branch. The flag's runtime value was
-not read directly.
+Not one of the three charter runtimes; recorded because it is the OpenVINO
+path that computes GGUF IQ blocks. Patch 0043 admits IQ4_NL / IQ3_XXS /
+IQ4_XS / Q8_0 as native expert formats, patches 0045 and 0069 decode them
+inside the per-expert OpenCL kernels, and patch 0050 adds IQ2_S. Served on
+both cards: Flash-Next at depth 48 (B60 and A770, CPU tier + per-expert
+dispatch), and the full-depth packed Qwen3.6-35B-A3B all-resident on the A770
+at about 960 t/s prefill at 4,096 tokens and 28 t/s decode (CHANGELOG 0.5.0.1,
+DESIGN §7.0.2cs).
 
 ---
 
@@ -179,8 +171,8 @@ not read directly.
   data type (`paper`, [O6a]).
 - **llama.cpp SYCL: both archs, no gate.** MMVQ and f16-dequant kernels
   exist for both types, with no arch condition (`code`, [L4], [L5]).
-  gpt-oss-20b's MXFP4 GGUF runs at 60.95 t/s decode on an A770, but under
-  **Vulkan**, not SYCL ([L8], `paper`).
+  gpt-oss-20b's MXFP4 GGUF runs at 60.95 t/s decode on an A770 under
+  **Vulkan** ([L8], `paper`).
 - **IPEX-LLM: neither format exists** (`code`, [I1]).
 - The "Battlemage (Xe2) only, for now" quote from the llama.cpp SYCL
   discussion concerns oneDNN fused SDPA. The string is gone at
@@ -220,7 +212,7 @@ not read directly.
   - #21517: Q8_0 ~4× slower than Q4_K_M on a B70. Opened 2026-04-06,
     closed 2026-04-07.
   - No open issue was found that names an IQ format as the trigger of a
-    wrong result on Xe2. The earlier survey's "garbled output on B580
+    wrong result on Xe2. A "garbled output on B580
     with these types" issue (`docs/campaigns/research-sub4bit-weights.md`)
     was not re-located in this pass and stays **UNSOURCED** here.
 
@@ -232,7 +224,7 @@ None of them is `measured-here`.
 | model / quant | runtime | card | decode t/s | prefill t/s | who | date | source |
 |---|---|---|---|---|---|---|---|
 | gpt-oss-20b MXFP4 (GGUF) | llama.cpp **Vulkan** b7189 / b7209, `-ngl 100`, `-fa 0`, pp512/tg128 | 1× A770 | 60.95 / 54.20 | 884 / 885 | independent | 2025-11-30 | [L8] |
-| "gpt-oss-20b" (unsloth GGUF) and "Qwen3.5-35B-A3B" (lmstudio-community GGUF), quant not stated | llama.cpp **SYCL** b8157 vs **Vulkan**, Windows. b8157 still carried the SYCL IQ refusal (see the correction) | A770 (issue title); device count not stated. The same reporter runs a 4× A770 host ([L13]) | **10 (SYCL) vs 68 (Vulkan)** | 600 vs 1100 | independent | 2026-02-26 | [L7] |
+| "gpt-oss-20b" (unsloth GGUF) and "Qwen3.5-35B-A3B" (lmstudio-community GGUF), quant not stated | llama.cpp **SYCL** b8157 vs **Vulkan**, Windows. b8157 carried the SYCL IQ refusal (see "llama.cpp SYCL and the IQ types, over time") | A770 (issue title); device count not stated. The same reporter runs a 4× A770 host ([L13]) | **10 (SYCL) vs 68 (Vulkan)** | 600 vs 1100 | independent | 2026-02-26 | [L7] |
 | gpt-oss-20b int4 (OV IR) | OpenVINO GenAI / OpenArc, Windows | A770 | 13 | — | independent | 2026-04-07 | [O9] |
 | gpt-oss-20b int4 | OpenVINO GenAI 2026.2 nightly `dev20260427` | A770 | ~36 (Arc Pro B50: ~58) | — | **Intel-side** (repo contributor) | 2026-04-27 | [O9] `issuecomment-4329922747` |
 | gpt-oss-20b | OpenVINO GenAI | "A770 (8GB)" | 15 | — | Intel-side (reporter questions it: the int4 model exceeds 8 GB) | 2026-04-14 | [O9] `issuecomment-4241274382` |
@@ -246,8 +238,8 @@ Caveats:
   screenshots. It is A770 evidence for *a* 20–35B MoE on SYCL vs Vulkan;
   it is **not** A770 evidence for Qwen3.5-35B-A3B specifically.
 - **No single-A770 row names Qwen3-30B-A3B or a 35B-A3B unambiguously**,
-  in any format. That stays **UNSOURCED**. [L13] names Qwen3.5-35B-A3B,
-  but on two or three A770s.
+  in any format. That stays **UNSOURCED**. [L13] names Qwen3.5-35B-A3B on
+  two or three A770s.
 - **No IQ-format tokens/s on an A770 exists in any source found.**
   (Arc Pro B70 has one, IQ4_XS: Qwen3.5-27B dense at 17.52 t/s tg128,
   single GPU, llama.cpp SYCL, [L9]; Xe2, dense, not A770.)
@@ -258,103 +250,51 @@ Caveats:
 - Estimator pages that print tokens/s without a measurement were
   excluded.
 
----
+## llama.cpp SYCL and the IQ types, over time
 
-## Dated correction — the SYCL/IQ claim (2026-09-25)
-
-**Claim as inherited:** "IQ formats have no SYCL kernels → host/CPU
-dequant → 8–12 t/s".
-
-**Correction:** at llama.cpp `84e76d8a` (2026-09-24) the claim is
-**false**. Before 2026-03-22 it was **partly true**. Both halves are `code`.
-
-- **Today.** Every IQ type has an MMVQ kernel, including in the MoE
-  `MUL_MAT_ID` switch, plus a device f16-dequant, and `supports_op` never
-  refuses it for `MUL_MAT`/`MUL_MAT_ID` ([L2], [L4], [L5]). This holds on
-  Alchemist and Xe2 alike. The kernels themselves have been listed since
-  the doc's "2024.4 — Support data types: GGML_TYPE_IQ4_NL,
-  GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_XXS,
-  GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M"
-  ([L1] L89–90, `paper`).
-- **Until 2026-03-22.** `supports_op` returned **false** for every IQ type
-  (IQ4_NL, IQ4_XS, IQ3_XXS, IQ3_S, IQ2_*, IQ1_*) whenever
-  `b->ne[1] == 1 && ggml_nrows(b) > 1`. Such ops were scheduled off the
-  SYCL device. The dates differ by op:
-  - **`MUL_MAT`:** refused from at least b4500 (2025-01-17), the earliest
-    tag read.
-  - **`MUL_MAT_ID` (the MoE expert matmul):** refused only from
-    2025-08-12 on. Before that, its branch tested `a = op->src[2]`, the I32
-    ids tensor, so the IQ test could not fire. That was replaced by
-    `a = op->src[0]` between #15092 (`3306ceab`, 2025-08-05) and #15151
-    (`f4586ee5`, 2025-08-12).
-  - **Removal, both ops:** the refusal is present at b8157 (the build of
-    [L7]) and b8460. It was removed by ggml-org/llama.cpp#20803 "[SYCL]
-    Support bf16 and quantized type of MUL_MAT", merged 2026-03-22
-    (commit `f40a80b`), and is absent from b8480 on ([L14]).
-- **Not traced.** Which model shapes met that condition (for example, the
-  MoE `MUL_MAT_ID` at prefill against decode) was not traced, so how much
-  of a given MoE forward fell back is **UNSOURCED**.
-
-What the claim therefore gets wrong:
-- It is wrong for any build after #20803 ("no SYCL kernels" was never
-  literally true).
-- Its **8–12 t/s** has no source tying it to the fallback. The nearest
-  number, 10 t/s on an A770 under SYCL b8157 ([L7]), was measured on a
-  pre-#20803 build, with the refusal in place. No source separates the
-  refusal's share of that figure from SYCL's general speed on the A770.
-
-What remains true today:
-- IQ types get neither the reorder optimisation nor the DMMV path ([L3]).
-- MMVQ quantises activations to q8_1.
-
-Where the claim stood: the handoff for this survey names operator-local
-packets. A literal search of this tree's `*.local.md` files on 2026-09-25
-did not find the sentence, so this tracked statement is the correction of
-record. A dated pointer to it was appended to the survey's operator-local
-handoff packet.
+At `84e76d8a` every IQ type has an MMVQ kernel, in the MoE `MUL_MAT_ID`
+switch too, plus a device f16 dequant, and `supports_op` never refuses it for
+`MUL_MAT` / `MUL_MAT_ID` ([L2], [L4], [L5], `code`); the kernels have been
+listed since the doc's "2024.4" entry ([L1] L89–90, `paper`). Until
+2026-03-22 `supports_op` returned false for every IQ type whenever
+`b->ne[1] == 1 && ggml_nrows(b) > 1`, scheduling those ops off the device:
+for `MUL_MAT` from at least b4500 (2025-01-17), for `MUL_MAT_ID` from
+2025-08-12 (the branch tested the ids tensor `src[2]` until #15151,
+`f4586ee5`). ggml-org/llama.cpp#20803 (`f40a80b`, merged 2026-03-22) removed
+the refusal; it is absent from b8480 on ([L14], `code`). Which model shapes
+met the old condition is **UNSOURCED**. IQ types get neither the reorder
+optimisation nor the DMMV path, and MMVQ quantises activations to q8_1
+([L3], `code`).
 
 ---
 
-## What this changes for the A770 performance option
+## Summary for the A770
 
-1. **No off-the-shelf runtime computes IQ-class expert blocks natively on
-   the A770 inside OpenVINO.** Upstream OpenVINO refuses them at GGUF
-   read, and IPEX-LLM is archived with no IQ2_S/IQ3_XXS/IQ4_* in its
-   `ggml_tensor_qtype` path at the frozen commit.
-   arcint's patch series is the only OpenVINO path, and it serves on the
-   A770 (`measured-here`, reference row).
-2. **llama.cpp SYCL *does* compute IQ4_NL/IQ3_XXS/IQ2_S on the A770**
-   in builds after #20803 (`code`). That makes it a *candidate*
-   correctness comparand for the native route. It is not measured here
-   on the A770. It cannot be bit-exact against an f16-activation kernel
-   (MMVQ quantises activations to q8_1), and the non-fused MUL_MAT_ID path
-   copies the ids to the host and waits on the stream ([L3] L5209–5216). As a *speed* comparand
-   it is weak on the A770 (one report: 10 vs 68 t/s against Vulkan,
-   [L7]), and no IQ-format A770 number exists to anchor it. An A770 speed
-   bar for a native-format MoE has to be measured here; it cannot be
-   borrowed.
-3. **MXFP4/NVFP4 in OpenVINO: undecided on both archs.** One marker pass
-   is gated to `xe3p` (later than Xe2), while the compressed-FC and
-   dynamic-quantize paths accept f4e2m1 with no arch gate (`code`). What
-   executes on either card is **UNSOURCED**. Deciding it takes a device
-   leg, not more reading. In llama.cpp SYCL both formats have kernels on
-   both archs (`code`).
-4. **In the code read, the Alchemist/Xe2 splits are kernel-selection,
-   attention and workaround branches, not format support.** Examples, not
-   a census:
+1. Upstream OpenVINO refuses IQ-class GGUF blocks at read, and IPEX-LLM's
+   `ggml_tensor_qtype` path has no IQ2_S / IQ3_XXS / IQ4_* at its frozen
+   commit (`code`). arcint's patch series computes them on the A770
+   (reference row, `measured-here`).
+2. llama.cpp SYCL computes IQ4_NL / IQ3_XXS / IQ2_S on the A770 in builds
+   after #20803 (`code`). Its MMVQ quantises activations to q8_1, and its
+   non-fused `MUL_MAT_ID` path copies the ids to the host and waits on the
+   stream ([L3] L5209–5216, `code`). No IQ-format A770 rate is published.
+3. MXFP4 / NVFP4 in OpenVINO are **UNSOURCED** on both archs: one marker
+   pass is gated to `xe3p`, while the compressed-FC and dynamic-quantize paths
+   accept f4e2m1 with no arch gate (`code`); a device leg decides it. In
+   llama.cpp SYCL both formats have kernels on both archs (`code`).
+4. The Alchemist / Xe2 splits found in the code read are kernel-selection,
+   attention and workaround branches, not format support (`code`):
    - OpenVINO: micro-GEMM subgroup width 8 vs 16; LoRA horizontal fusion
-     off on xe2 ("Temporary disabling for BMG due to regression", [O1]
-     L1759–1761); int8 per-token dyn-quant forced to gs128 for `>= xe2`
-     ([O1] L1828); the CM bidirectional-LSTM path for xe2 only ([O1] L1087).
+     off on xe2 ([O1] L1759–1761); int8 per-token dyn-quant forced to gs128
+     for `>= xe2` ([O1] L1828); the CM bidirectional-LSTM path for xe2 only
+     ([O1] L1087).
    - llama.cpp SYCL: the Q4_0-on-`acm_g10` heuristic; the Alchemist
      head-64 oneDNN SDPA gate; the Xe2 FA TILE selector and work-group
      size; the BMG-G31 allocation cap.
    - IPEX-LLM: `bmg` excluded from the int8/K-quant batch kernel.
 
-   No weight format was found that is Xe2-only in any of the three
-   runtimes at the commits read (`code`). This negative covers the files
-   named here only. oneDNN's vendored kernels and IPEX-LLM's binary
-   wheels were not read.
+   No weight format is Xe2-only in the files read; oneDNN's vendored kernels
+   and IPEX-LLM's binary wheels were not read.
 
 ## UNSOURCED
 

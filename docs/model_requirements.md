@@ -1,230 +1,145 @@
 # Model requirements
 
-What arcint will load, and at what precision it has actually been measured
-serving. Sourced from README.md, llm.txt, DESIGN.md, CHANGELOG.md,
-`src/core/artifact.{h,cpp}`, `src/config.cpp`, `tools/export_dflash.py`,
-`contrib/packaging/`, and `patches/` headers. Numbers carry the card, depth
-and precision they were measured at; where the repository is silent, that
-is said explicitly.
+What arcint loads, and at what precision it has been measured serving.
+Sourced from `src/core/artifact.{h,cpp}`, `src/core/model_registry.cpp`,
+`src/config.cpp`, `tools/export_*.py`, `contrib/packaging/`, the `patches/`
+headers, DESIGN.md and CHANGELOG.md. Numbers carry the card, depth and
+precision they were measured at.
 
 ## 1. Artifact format
 
-An **OpenVINO IR directory** — and, since 0.4.0 stage 1, a **GGUF of the
-same architecture opened on that directory as its topology template**
-(`--gguf FILE --model DIR`, DESIGN §7.0.2ay: the file's K-quant rows
-replace the IR's projections, decoded in the plugin's kernel from `+p7`;
-the IR's embedding, norms, GDN state tensors and MTP layer stay). No
-safetensors (GPTQ, NVFP4; formats OpenVINO does not read).
-`load_artifact` (`src/core/artifact.cpp`) requires, in a directory whose
-basename matches an allowlist alias: `openvino_language_model.{xml,bin}`,
-`openvino_text_embeddings_model.xml`, `openvino_tokenizer.xml`,
-`openvino_detokenizer.xml`, `config.json`, `chat_template.jinja`,
-`tokenizer.json`; `generation_config.json`/`tokenizer_config.json` are read
-if present but not required. Read from `config.json` (or its `text_config`
-for a VLM export): `model_type`, `architectures[0]`, `num_hidden_layers`,
-`hidden_size`, `max_position_embeddings`, `num_experts` (>0 sets `moe`),
-`full_attention_interval`, `layer_types[]` (or the interval derives
-GDN/attention counts when absent), `eos_token_id`. Every served checkpoint
-is a `*ForConditionalGeneration` VLM export; its vision tower/projector
-(`openvino_vision_embeddings_model`, `..._pos_model`, `..._merger_model`,
-each `.xml`/`.bin`) are stat'd and reported at load, never compiled or
-loaded — `--vision` is reserved and refused (M13; coder: 6 files, 428.3 MiB
-on disk, no VRAM touched).
+Three kinds of input, all validated against the built-in allowlist
+(`src/core/model_registry.cpp`: an entry's id, its artifact directory aliases,
+`model_type`, `architectures[0]`, arch / template / tokenizer hashes and
+weight bytes). A directory whose basename is not an allowlisted alias is
+refused at load.
 
-The allowlist names **three models across five directory entries** (the 35B
-also has an MTP-bearing directory, the dense model also has Intel's own
-export). All are one **hybrid GatedDeltaNet (linear attention) +
-full-attention** family: `full_attention_interval = 4`, 262144 trained
-context, one shared tokenizer (`87a7830d63fcf43b`). Two are **MoE** (Qwen3.6-35B-A3B,
-256 experts; Qwen3.6-27B-A3B-Coder, 184 pruned from 256), one is **dense**
-(Qwen3.8-27B).
+- **An OpenVINO IR directory** (optimum-intel export plus NNCF weight
+  compression). `load_artifact` requires `openvino_language_model.{xml,bin}`,
+  `openvino_text_embeddings_model.xml`, `openvino_tokenizer.xml`,
+  `openvino_detokenizer.xml`, `config.json`, `chat_template.jinja` and
+  `tokenizer.json`; `generation_config.json` and `tokenizer_config.json` are
+  read when present. From `config.json` (or its `text_config`): `model_type`,
+  `architectures[0]`, `num_hidden_layers`, `hidden_size`,
+  `max_position_embeddings`, `num_experts` (> 0 sets `moe`),
+  `full_attention_interval`, `layer_types[]` (or the interval derives the
+  GDN / attention counts), `eos_token_id`. A `*ForConditionalGeneration`
+  export's vision IRs are stat'd and reported at load, never loaded;
+  `--vision` is reserved and refused.
+- **A GGUF opened on such a directory** (`--gguf FILE --model DIR`): the
+  served IR of the same architecture is the topology template and the file's
+  Q4_K / Q5_K / Q6_K / Q8_0 projections replace its own
+  (`docs/design-gguf-native.md`). The template must carry the
+  `_openvino_orig_weight` markers of optimum-intel's weight-compression
+  export; dense `qwen35` files only.
+- **A serving-shape artifact** (`tools/export_serving_artifact.py`, from the
+  checkpoint's GGUF shards): the same file set plus `serving-shape.json`, with
+  the MoE expert bodies in the checkpoint's own block formats and, for
+  Flash-Next, the n-gram table as `ngram_table.K` ports.
+  `arcint --inspect-artifact --model DIR` prints the contract device-free.
 
-## 1a. Flash-Next n-gram table (0.5.0, FIX D — updated 2026-09-10)
+Allowlisted families, all hybrid GatedDeltaNet + full attention at
+`full_attention_interval = 4` with one shared tokenizer (`87a7830d63fcf43b`):
 
-Beyond §1's keys, `load_artifact` reads the Flash-Next per-layer n-gram
-embedding (PLE) keys from `config.json`'s `text_config`: `ngram_size`,
+| id(s) | `model_type` | shape | artifact |
+|---|---|---|---|
+| `qwen3.6-27b-a3b-coder` | `qwen3_5_moe` | 40 layers, 184 experts (pruned from 256) | int4 IR `qwen36-coder-b5-ov` |
+| `qwen3.6-35b-a3b`, `-mtp` | `qwen3_5_moe` | 40 layers, 256 experts, top-8 | Intel's int4 IR; the `-mtp` directory adds the reconstructed head |
+| `qwen3.6-35b-a3b-native-*` | `qwen3_5_moe` | 40 layers | serving-shape, IQ2_S / IQ3_XXS / IQ4_XS expert bodies (packed and u8 variants) |
+| `qwen3.8-27b`, `-intel-int4` | `qwen3_5` | dense, 64 layers | int4 IR `qwen38-b7c1-ov`; Intel's int4 IR |
+| `qwen3.8-flash-next-*` | `qwen4_exp` | 48 layers, 512 experts, top-10 + 1 shared, n-gram table at layer 2, 12 full-attention layers (QSA variant: `-d48q8qsa`) | serving-shape, IQ3_XXS / IQ4_XS / IQ4_NL / Q8_0 expert bodies; `-d48q8` carries the dense projections as Q8_0 / Q6_K |
+| `qwen3.5-2b` | `qwen3_5` | dense | provisional, served through `--gguf` |
+
+## 1a. The Flash-Next n-gram table
+
+`load_artifact` reads the n-gram keys from `text_config`: `ngram_size`,
 `ngram_vocab_size_base`, `heads_per_ngram`, `ple_embed_dim`, `ple_layer_ids`,
-plus `vocab_size` and `eos_token_id` (the n-gram hash boundary). All zero means
-"no n-gram table declared" — every checkpoint currently on the allowlist (dense
-`qwen35`, the two MoE) lands there and the admission path stays cold.
+plus `vocab_size` and `eos_token_id`; all zero means no table. The table is a
+hashed-vocab store: `row_ids` (`src/exec/ngram_row_ids.h`) mixes the last n
+token ids per n-gram order, reduces them per head by a prime vocabulary size
+and offsets into a concatenated row space (16 heads x 160 on Flash-Next), as
+FreeToken's `PLETableBackend.lookup` does (`code`, `docs/research-freetoken.md`).
+The row ids are computed on the host and fed as `ngram_chunk_ids` /
+`ngram_local_ids`.
 
-When declared, the `per_layer_token_embd` table is supplied out-of-band via
-`--flash-next-ngram <path>` (it is too large to sit on either card: ~30 GiB at
-Q4_1, host-resident by design). The file carries a 24-byte `ARCINGRM` header
-(ggml_type ∈ {Q4_0, Q4_1, Q8_0}, `n_cols == 160`, `n_rows`) and is admitted by
-`admit_ngram_table_from_disk` — header, type, row width, on-disk size, a
-host-RAM fit refusal, and a **row-count lower bound**.
-
-**Corrected 2026-09-10 (`docs/research-freetoken.md` "Code-side ground truth",
-pinned FreeToken reference commit 505477ab):** the table is **not** "one row per
-token id" and its row count is **not** `ngram_vocab_size_base *
-(ple_embed_dim/160)`. It is a **hashed-vocab** store: `row_ids`
-(`src/exec/ngram_row_ids.h`) XOR-multiply mixes the last n token ids per n-gram
-order, floor-mods per a per-head prime vocab size, and offsets into a
-concatenated global row space (16 heads × 160 on Qwen3.8). The required row
-count is that global space (`ngram_required_rows`); admission checks
-`n_rows >= required` (a lower bound — the shipped size may be padded via
-`split_ngram_parts`, to be pinned against a real artifact). The load seam
-`load_ngram_lookup` (`src/exec/ngram_table.h`) admits + mmaps the table and
-exposes the reference's `PLETableBackend.lookup` contract
-(`row_ids -> gather_dequant`); `backend_ov.cpp` calls it behind the flag.
-
-No Flash-Next artifact is on the allowlist or the dev host yet: the lookup is
-proven against a synthetic table (`tests/test_ngram_lookup.cpp`), not a trained
-one, and the decode-time PLE injection into the residual stream is fork-gated
-(needs the trained backbone). The trained table is either the upstream
-`qwen4_exp` artifact or an arcint-original trained table
-(`HANDOFF-0.5.0.local.md`, checkpoint fork).
+`--ngram-gguf FILE` binds the table from the GGUF shard holding
+`per_layer_token_embd.weight`. When the artifact's port is the whole table it
+is pinned in USM host memory (26.82 GiB); when the port is a smaller window
+(the `-d48s*` / `-d48q8` exports) it is a per-forward staging buffer filled by
+`pread` of only the rows the forward names (2.884 MiB at the served geometry,
+`measured-here`; `src/exec/ngram_staging.h`, `docs/design-ple-disk-backend.md`).
+`--flash-next-ngram PATH` admits a standalone `ARCINGRM` table (Q4_0 / Q4_1 /
+Q8_0, 160 columns) with a host-RAM fit and row-count check.
 
 ## 2. Weight precisions
 
-`--quant q4|q8` is the accepted format pair (DESIGN §2); every artifact
-actually measured is **int4**:
-
-| artifact | recipe | acceptance |
+| artifact | form | acceptance |
 |---|---|---|
-| the coder int4 artifact (b5, 184/256 experts) | AWQ + scale estimation, code corpus | **10/10** greedy, 24 GB card |
-| the dense int4 artifact (Qwen3.8-27B) | AWQ-only | **7/10** greedy, provisional |
-| the dense int4 artifact, SE calibration | AWQ + scale estimation | **0/10**, degenerates — do not use |
-| Intel's 35B int4 export, as-is | Intel's own; recipe not recorded | **10/10** greedy, 3/3 tool calls, 62.7 t/s |
+| coder int4 (b5) | AWQ + scale estimation, code corpus | **10/10** greedy |
+| dense Qwen3.8-27B int4 (b7c1) | AWQ only | **10/10** greedy (paged + MTP, B60) |
+| Intel's 35B int4 IR | Intel's export | **10/10** greedy, 3/3 tool calls |
+| Intel's Qwen3.8-27B int4 IR | Intel's export | **10/10** greedy (paged + MTP, B60) |
+| dense Qwen3.8-27B Q4_K_M through `--gguf` | repack / native | **10/10** (B60) |
+| Flash-Next serving-shape | the checkpoint's native expert blocks, decoded in the plugin (patches 0043, 0045, 0069) | Paris at depth 48; quality judged by KL against the model's own f32 forward (`docs/campaigns/serving-shape-logits.md`) |
+| Qwen3.6-35B-A3B serving-shape | native IQ2_S / IQ3_XXS / IQ4_XS expert blocks (patch 0050; packed variants), dense projections f16 or u8 | 10/10 all-resident on the A770, full depth (DESIGN §7.0.2cs) |
 
-`q8` weights are accepted by the flag; no q8-weight acceptance run is
-recorded. **INT3-class expert weights are a study owed, not shipped** —
-NNCF 3.3.0 lists `INT3_SYM`/`INT2_SYM` undocumented in its public docs
-(DESIGN §7.0.2y); no published Intel/OpenVINO IR below int4 exists for
-this class, and a 3-bit kernel is scoped as an 800–1,500-line divergence,
-not built (`docs/milestone-0.3.0.md` M10).
+The dense Qwen3.8-27B with scale-estimation calibration degenerates under
+greedy (0/10, `measured-here`) and is not used. `--quant q8` is accepted by the
+flag; no q8-weight acceptance run is recorded.
 
 ## 3. KV-cache precision (paged path)
 
-`--paged-kv KEY[:VALUE]` over `{f16, u8, i8, u4, i4}`; `i8` aliases the
-plugin's u8-stored-as-signed-i8 convention. Asymmetric KEY:VALUE needs
-patches **0008** (`VALUE_CACHE_PRECISION`), **0009** (per-side kernel
-plan), **0010** (per-side decode kernels) — served: **u8:i4**.
+`--paged-kv KEY[:VALUE]` over `{f16, u8, i8, u4, i4}`. Asymmetric pairs need
+patches 0008–0010; the u8:i4 mixed prefill stage runs on micro-SDPA from patch
+0020 (`+p6`).
 
 | precision | KiB/token | measured where |
 |---|---|---|
-| f16 | 20.0 | coder, 24 GB card, §7.0.3 |
-| u8 (default) | 11.3 | coder, same card |
-| u4 (symmetric — "a tax") | 6.3 | **35B**, §7.0.2w; the +63% on `PagedAttentionExtension` at 32k is the coder, 24 GB card, §7.0.3 |
-| u8:i4 | 8.8 | **35B**, §7.0.2w; the coder's 16 GiB auto-fit gain matches this cost model to 0.1 pp, §7.0.2y; the dense 27B agent serves it at 28.2 KiB/token (u8: 36.2) on the 24 GB card, §7.0.2ax |
+| f16 | 20.0 | coder, B60 |
+| u8 (default) | 11.3 | coder, B60 |
+| u4 | 6.3 | 35B; `PagedAttentionExtension` +63 % at 32k (coder, B60) |
+| u8:i4 | 8.8 | 35B; the dense agent serves `i8:u8` |
 
-u8 leads decode by +2.5% at 32k but f16 leads by 7.8% at 53.5k (crossover
-not located); u8 costs up to 22% of prefill at 115k. u8:i4 scores 10/10 and,
-at first measurement, auto-fit +28% context (133,456→171,312 tokens on the
-16 GiB card) — but that predates an owed fix: the u8:i4 **prefill scratch
-buffer** (that micro-SDPA declines the mismatched packing, so prefill takes
-the opt-kernel path, is read off the plugin source, not measured; the buffer
-does not exist at the past-0 point the activation probe runs) grows with the
-past until the card is full, and the driver's rebind worker then fails on its
-own page tables — `-12` in the kernel log, `CL_OUT_OF_RESOURCES` at the
-runtime, root-caused with a free-VRAM sampler (§7.0.2ab). The edge sits
-between 71.7k and 119k tokens on that card at chunk 128 and moves with the
-prefill chunk and the pool depth, so it is not a token threshold; a first
-reading that named the buffer alone as the mechanism was retracted. The **belt** (`--prefill-chunk` capped under 4-bit
-values) and an honest reservation term price it on every plugin below
-`+p6`: **charged, u8:i4 auto-fit lands at 101,824 — below plain u8's
-133,456** on that shape (101,984 before the acceptance ceiling was narrowed
-by the same term). `--paged-attention-max-partitions` (plugin patch
-**0015**, in `+p4` and later) bounds the partition count to flatten the
-term past a fixed depth. The prefill price itself is measured and removed
-(DESIGN §7.0.2ar/§7.0.2as): at a held chunk the generic kernel cost
-+55 %/+90 % at 37.7k/71.7k tokens; with patch **0020** (`+p6`) the mixed
-stage runs on micro-SDPA at parity with u8 at that same held chunk (128),
-values still four-bit in VRAM.
-On that path the scratch buffer is not allocated (measured with the VRAM
-sampler, §7.0.2at: ≤ 9 MiB consumed by a 71.7k prefill against 573 MiB on
-the generic kernel), and the fit charges nothing for it when the GPU
-plugin's build number names patch level 6 or later and the pairing is
-eight-bit keys with four-bit values: **auto-fit at u8:i4 then lands at
-171,392 on the 16 GiB card**, and a 118,454-token prefill at chunk 128 ran
-on that pool without a fault. The chunk cap was then the remaining
-price: the first depth ladder against `+p6` (§7.0.2au) read 450 / 365
-t/s at 98k tokens on the 24 GB / 16 GiB card at u8:i4 against u8's 1,026
-/ 621, u8:i4 capped at chunk 128 where u8 ran the default 2,048. The
-chunk ladder (§7.0.2av) then served 118k tokens at every chunk from 128
-to 2,048 on the 16 GiB card and at 2,048 and 1,024 on the 24 GB card
-without a fault, so the microkernel path's cap is 2,048
-(the generic path's stays 128). Still owed: cold/warm prefix-cache
-byte-exactness at u8:i4.
+u8:i4 scores 10/10 on the coder; auto-fit at u8:i4 is 171,392 tokens on the
+16 GiB card, and a 118k-token prefill runs at every chunk from 128 to 2,048
+there (`measured-here`, DESIGN §7.0.2at/§7.0.2av). The micro-SDPA path's chunk
+cap is 2,048; the generic kernel's is 128. `--paged-attention-max-partitions`
+(patch 0015) bounds the generic path's partition count. Owed: cold/warm
+prefix-cache byte-identity at u8:i4.
 
 ## 4. Drafters
 
-**MTP head** (`has_mtp_head` in `artifact.cpp`; served for the dense 3.8, and
-reconstructed for the 35B MoE, where it *loses* 30% — 48–53 t/s against 71.5
-plain, §7.0.2o): needs
-`openvino_mtp_lm_head.xml` plus one of `openvino_mtp_layer.xml`
-(reconstructed, `tools/export_mtp.py`) or `openvino_mtp_model.xml`
-(optimum-intel's export); `--mtp-layer` picks between them.
+**MTP head** (`has_mtp_head` in `artifact.cpp`): `openvino_mtp_lm_head.xml`
+plus `openvino_mtp_layer.xml` (reconstructed, `tools/export_mtp.py`) or
+`openvino_mtp_model.xml` (optimum-intel's export); `--mtp-layer` picks between
+them. Model cards: `docs/mtp-head-card.md`.
 
 **DFlash2 head** (`--dflash DIR`): `openvino_dflash_draft_stateful.xml`,
 `config.json` (`dflash_config`: `block_size`, `mask_token_id`,
 `selector_top_k`), `dflash_hidden_projection.f32.bin`,
-`dflash_predecessor_codebook.f16.bin`, `dflash_successor_codebook.f16.bin`.
-`tools/export_dflash.py --compress int4`: data-free NNCF RTN, `INT4_ASYM`,
-`group_size=64`, `ratio=1.0`, `all_layers=True`, 56 MatMul weights —
-byte-identical to the served head. Its K/V state window is fixed at
-**2,048 rows**; past it an `Assign` layout mismatch silently disabled the
-drafter process-wide (measured: the failing case is a first draft that
-concatenates *exactly* the 2,048 rows; shorter prompts draft), fixed by
-plugin patch **0014** (released in `+p4`).
+`dflash_predecessor_codebook.f16.bin`, `dflash_successor_codebook.f16.bin`;
+exported by `tools/export_dflash.py --compress int4`. Its K/V state window is
+2,048 rows (plugin patch 0014 and `src/core/dflash_window.h` keep it drafting
+past the edge).
 
-At depth (dense 27B agent, 24 GB card, u8 KV, §7.0.2ag): the zero
-acceptance §7.0.2aa saw at 76.4k tokens was an f16 position overflow at
-65,504 in the drafters' rotary subgraphs, now kept f32, and the MTP layer's
-KV state is now charged against the reservation. At 77,134 tokens MTP
-accepts 90.8% again but still loses to plain (4.9 against 15.3 t/s): its
-cycle wall is about 390 ms against its own break-even near 130 ms, so even
-full acceptance cannot outrun it on this artifact. DFlash2 beats plain
-there (18.8 against 15.3 t/s, 40.6% accepted). Guidance: at depth serve
-with DFlash2 or plain, MTP off; the MTP cycle is the `mtp-cycle-wall`
-campaign (`docs/campaigns/`).
+At 77,134 tokens on the dense agent (B60, u8 KV, `measured-here`, DESIGN
+§7.0.2ag): plain 15.3 t/s, DFlash2 18.8 t/s (40.6 % accepted), MTP 4.9 t/s at
+90.8 % acceptance; the MTP cycle is the `mtp-cycle-wall` campaign.
 
 ## 5. Runtime stack
 
-`marfrit-openvino`: source build pinned at upstream commit `71640275` (the
-2026.4.0 nightly of 2026-08-21), patch series **0003–0020** applied
-(`contrib/packaging/marfrit-openvino/patches/`). Package version carries
-the patch level: **`+p4` is the 0003–0018 level** and the one 0.3.0
-requires (CHANGELOG); **`+p5` adds 0019** (the prefill fallback's
-three-way answer, DESIGN §7.0.2ap; built 2026-09-05, not deployed);
-**`+p6` adds 0020** (u8:i4 prefill on micro-SDPA at parity with u8,
-DESIGN §7.0.2as; built and deployed 2026-09-05, §7.0.2aw); **`+p7` adds
-0021** (GGUF K-quant weights decoded in the fully-connected kernel,
-§7.0.2ay; recipe bumped 2026-09-06, package not built) — `+p6` is the
-level to serve `--paged-kv u8:i4` at, since below it the format's prefill
-costs +55 % to +90 % of u8's time (§7.0.2ar). From 0.3.1 the arcint
-package depends on **`+p6` as a floor** within the pinned nightly
-(operator's decision, 2026-09-05: below it the mixed cache is possible
-but pointless); 0.3.0's floor was `+p4`. Nothing arcint drives reaches
-0019's branch, and 0020 changes the runtime's speed and the fit's
-scratch charge, not the served contract.
-At the 0.3.1 tag the dev host's coder unit serves `+p6` with `arcint
-0.3.1` (Prüfstand 10/10) and the dense agent unit serves `--paged-kv
-u8:i4` at 151,552 tokens, chunk 512, MTP on (§7.0.2aw, §7.0.2ax; its
-pre-0.3.0 context of 155,648 is refused by the fit's accounting of the
-MTP state and drafters). Compute-runtime
-**26.27** (past the fix window for USM-pool issue 916). Kernel driver:
-**xe KMD**; no version recorded.
+`marfrit-openvino`: a source build of OpenVINO at the pinned upstream commit
+`71640275` (the 2026.4.0 nightly of 2026-08-21) with the patch series in
+`contrib/packaging/marfrit-openvino/patches/` applied; the patch level is part
+of the package version. arcint 0.5.4 is built against `+p25` (patches
+0003–0074, CHANGELOG). Compute-runtime 26.27; the xe kernel driver.
 
-## 6. Not supported / not measured
+## 6. Not supported
 
-- safetensors (GPTQ, NVFP4): wrong format, not loaded. GGUF: Q4_K/Q5_K/
-  Q6_K/Q8_0 projections served from GGUF on a template IR (dense `qwen35`,
-  0.4.0 stage 1) **only when the IR carries `_openvino_orig_weight`
-  FakeQuantize markers** — produced by optimum-intel's AWQ weight-compression
-  export path (NNCF). An IR exported without weight compression (default
-  int8_asym) loads and serves, but all projections come from the template's
-  own constants; the GGUF contributes only embeddings and norms (0
-  projections repacked — measured on the 2B, 2026-09-10). MoE files and the
-  sub-4-bit types (IQ4_XS, IQ3_S, IQ3_XXS, Q3_K) are stages 2 and 3, not
-  yet served.
-- A plain-cast `q8` KV (no scales): refused as "quietly worse."
-- INT3/INT2 expert weights: study owed, no kernel, no allowlist entry.
-- `q8` weight format: accepted by the flag, no acceptance run found.
-- Vision IRs: reserved, `--vision` refused.
-- Prefix-cache byte-exactness at u8:i4: named, not yet measured (the
-  prefill price and the scratch charge are measured and closed, §3).
-- GDN context shift / server-side truncation: refused by policy — an
-  overflow is an HTTP 400 with the numbers, and a shift is not honestly
-  implementable on a recurrent state (§3.8).
+- safetensors (GPTQ, NVFP4): OpenVINO does not read them.
+- `--gguf` for MoE files and for sub-4-bit types; those formats serve through
+  serving-shape artifacts (§1).
+- A plain-cast `q8` KV without scales.
+- Vision IRs: `--vision` is refused.
+- GDN context shift or server-side truncation: an overflow is an HTTP 400 with
+  the numbers (DESIGN §3.8).

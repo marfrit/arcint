@@ -4,9 +4,8 @@
 
 Development and every published measurement ran on:
 
-- Intel Arc A770 16 GB (Xe-HPG) and Intel Arc Pro B60 24 GB (Xe2-HPG),
-  both behind the **xe** kernel driver (i915 legacy paths untested and,
-  for SYCL-era runtimes, known broken).
+- Intel Arc A770 16 GB (Xe-HPG, ACM-G10) and Intel Arc Pro B60 24 GB
+  (Xe2, BMG-G21), both behind the **xe** kernel driver. i915 is untested.
 - Intel compute-runtime / Level Zero as shipped with the OpenVINO build below.
 - Linux, x86_64 host for GPU work. The stub backend and the unit tests build
   and run on any Linux including aarch64 (ASan aborts at startup on aarch64 —
@@ -15,9 +14,12 @@ Development and every published measurement ran on:
 ## Dependencies
 
 - C++20 compiler, CMake ≥ 3.20.
-- **OpenVINO 2026.4 dev** (the pinned measurement stack) including
-  `openvino_tokenizers`. `-DARCINT_OPENVINO=ON` needs its CMake package;
-  without it only the stub backend builds.
+- **OpenVINO 2026.4 dev** at the pinned nightly `71640275`, including
+  `openvino_tokenizers`, built with the GPU-plugin patch series
+  (`marfrit-openvino` `+p25`, patches 0003–0074;
+  `contrib/packaging/marfrit-openvino/build-openvino.sh`).
+  `-DARCINT_OPENVINO=ON` needs its CMake package; without it only the stub
+  backend builds.
 - No network at build time: `third_party/` is vendored.
 
 ## Build and test
@@ -44,7 +46,7 @@ Acceptance, with a card and a model root:
     cmake -S . -B build-accept -DCMAKE_BUILD_TYPE=Release -DARCINT_OPENVINO=ON \
           -DARCINT_ACCEPTANCE=ON -DARCINT_ACCEPTANCE_MODEL_ROOT=/path/to/models/ov
     cmake --build build-accept
-    ctest --test-dir build-accept -N -L acceptance        # lists the twelve cells
+    ctest --test-dir build-accept -N -L acceptance        # lists the enumerated cells
     tests/acceptance/run.py --manifest build-accept/acceptance/run_manifest.json \
           --all --allow-skip pruefstand   # name every 77, or the run does not count
 
@@ -57,13 +59,15 @@ none yet and reports its numbers instead of gating them.
 
 `-DARCINT_ACCEPTANCE=ON` is refused at configure time without
 `-DARCINT_OPENVINO=ON`: a stub binary would "pass" a card cell by serving stub
-bytes. The equivalence suite behind several cells checks byte-equality for
-cache, chunking and speculation. [Amended 2026-10-01: those byte cells are
-tripwires, not vetoes. The contract is the answer-level bar in `CLAUDE.md`
-(the answers stay right; mean KL against the reference at most 0.03 nats
-worse than the baseline arm's; argmax agreement down by at most 1 point). A
-configuration that passes that bar may become a default with byte cells red;
-the red cells are reported.]
+bytes.
+
+Correctness is judged at the answer (`CLAUDE.md`): the answers stay right
+(facts, needle, task battery), mean KL against the reference is at most
+0.03 nats worse than the baseline arm's on the same card and window, and
+argmax agreement drops by at most 1 point. The equivalence suite's
+byte-equality cells (cache, chunking, speculation) are tripwires: a red one
+is reported, and a configuration that passes the answer-level bar may become
+a default with it red.
 
 ## Security posture
 

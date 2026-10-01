@@ -1,408 +1,165 @@
 # arcint
 
-> Narrow LLM inference engine for Intel Arc GPUs (A770 16GB, B60 24GB).
-> Serves exactly three hybrid GDN/attention Qwen models (Qwen3.6-35B-A3B,
-> Qwen3.6-27B-A3B-Coder, Qwen3.8-27B) in q4/q8. Uses OpenVINO as compiler
-> and kernel library; owns scheduling, paged KV cache, GDN recurrent-state
-> ledger, prefix caching, MTP speculative decoding, sampling, and HTTP
-> serving. NInfer philosophy (specialize, then be honest about numbers),
-> Intel substrate.
+> Narrow LLM inference engine for Intel Arc GPUs (A770 16 GiB, B60 24 GB).
+> Serves the hybrid GatedDeltaNet/attention Qwen family: Qwen3.6-27B-A3B-Coder,
+> Qwen3.6-35B-A3B, Qwen3.8-27B (dense) and Qwen3.8-Flash-Next (512-expert MoE).
+> OpenVINO is the compiler and kernel library, with a published GPU-plugin
+> patch series; arcint owns scheduling, the paged KV cache, the GDN
+> recurrent-state ledger, prefix caching, admission by measured reservation,
+> MoE expert placement across card and host, speculative decoding, sampling
+> and HTTP serving. MoE-beyond-VRAM design follows the expert engines Strata
+> and FreeToken (docs/campaigns/research-reference-audit.md).
 
 ## Status
 
-M0-M6 all meet their exit criteria, and the paged executor is the SERVED path
-(2026-08-29): coder B60 68.6 t/s decode (70.1 at 30k depth - no depth collapse),
-~1970 t/s prefill, 10/10 harness at base and 30k depth, u8 KV default (10/10
-both depths, base answer bitwise identical to f16, half the memory); dense B60
-36.2 t/s with MTP at 93.2% acceptance, 10/10 GREEDY (registry updated from the
-old 8/10). Admission by measured reservation; the activation term is probed
-upward chunk by chunk (the peak is affine, not linear from zero, and the
-plugin's buffer pool never shrinks, so an over-large probe is permanent) and
-what does not fit is refused with the numbers. Speculative
-rollback and re-forward print 0.00 s because neither exists on this path. The
-stateful executor remains behind --no-paged as the reference oracle. Serving the real models on Intel Arc
-via OpenVINO: 51.4 t/s decode and up to 2247 t/s prefill on a B60 with the 27B
-coder q4; all three target models reach 10/10 on the fleet harness.
+Release 0.5.4 (2026-10-01). Runtime dependency: marfrit-openvino +p25, the
+pinned OpenVINO nightly 71640275 with patches 0003-0074
+(contrib/packaging/marfrit-openvino/patches/). Open work is one document per
+campaign under docs/campaigns/ (README there: rules, template, index).
 
-  M0 skeleton                     done
-  M1 executor, greedy, coder/B60  done - 51.4 t/s, 10/10
-  M2 chunked prefill, ledger      done bar the paged path
-  M3 prefix caching               done - warm/cold byte-identical
-  M4 MTP                          done - 93.2% acceptance (not byte-identical)
-  M5 all three models             done; 35B fits the A770 via --offload-ratio
-  M6 two lanes per service        done - one process, byte-identical, 10/10 each
-  M7 fit pass                     done - two-ledger reservation measured; explicit --n-ctx verify-only, never lowered
-  M8 asymmetric KV --paged-kv u8:i4  done - serves, 10/10, +28% ctx (8.8 vs 11.3 KiB/token); owes prefill price, prefix byte-exactness
-  M9 expert offload v2            done - device-tier slot pool: 35B/16 GiB card 0.4 t/s (ratio 25, unpatched) -> 9.1 (ratio 50 / 8 GiB pool, 16-token probe) and 10.4 (64-token probe); plugin patch 0018's static residency partition closes §3.4 with the host tier on (a continuation restored from the prefix cache matches a cold run, 24 GB card)
-  M10 sub-4-bit expert weights    re-scoped - the context claim is discharged by --paged-kv u8:i4 (+28% on both served configurations); the sub-4-bit expert path is a new GPU-kernel milestone (the pinned runtime's MoE fusion matches u4 only), backlogged to 0.3.1
-  M11 drafting II                 measured, drafter fixes landed - free levers on the DFlash chain null or negative (§7.0.2z); at depth the MTP layer's KV state is charged against the reservation and the drafters' rotary subgraphs stay f32 (acceptance was zero past 65,504 tokens, an f16 position overflow); DFlash beats plain at 77k (18.8 vs 15.3 t/s, 40.6% accepted), MTP never beats plain at any measured depth on this artifact
-  M12 dispatch pin, tiled exporter done - --pin-dispatch measured null on a quiet host, opt-in; exporter --moe-lowering tiled
-  M13 vision reserved             done - --vision refused; vision IRs reported at load, never loaded (coder: 6 files, 428.3 MiB)
-  M14 host compute tier --moe-cpu-tier done - 35B/16 GiB card 15.0/15.5 vs 10.4/10.6 t/s at ratio 50/8 GiB; 14.1/14.8 vs 7.4/7.5 at ratio 75/5 GiB; byte-identical, 10/10. Under patch 0018's static partition (0.3.0 release gate): decode holds at 16.4 vs 11.3-11.4 tier OFF (second request), tier ON identical to itself across processes/requests (§3.4; ON==OFF on that prompt was sample-dependent, shown by 0.3.1's first acceptance run); prefill 26.6 vs 87.5 on the same request (per-expert fallback every layer) and a cold sequence's first requests take minutes -- campaigns
+## Current numbers (measured-here; card and configuration named)
 
-0.4.0 stage 1 served (2026-09-06, DESIGN §7.0.2ay): --gguf FILE opens a
-GGUF in process on the served IR of the same architecture (--model) as the
-topology template; the file's Q4_K/Q5_K/Q6_K/Q8_0 rows replace the IR's
-projections as u8 constants and plugin patch 0021 (+p7) decodes the
-super-blocks in its fully-connected kernel -- no unpack at load, no reorder
-at compile. Dense Qwen3.8-27B Q4_K_M: 10/10 on the Prüfstand through the
-GGUF-opened model. 0.4.1 (DESIGN 7.0.2ba): the rows are repacked at load into
-the runtime's own compressed form by default (u4/u8/i8, f16 scale per
-group, no zero point; Q4_K/Q5_K mins as exact extra columns with the
-activation widened by its group sums; the plugin's int8 activation
-quantization off for GGUF-opened models) -- equivalence a measured bound per
-weight (1/64 step Q4_K, 1/32 Q5_K/Q6_K, 1/16 Q8_0; 0.029 at most over the
-file), the native greedy output byte for byte; 940 / 16.2 t/s at 856 tokens
-(native rows 213 / 9.9, --gguf-native; the IR 1,609 / 23.1), 420 / 13.4 at
---gguf-mode repack|native|mixed: the form the file's projections take (mixed, the default: Q4_K repacked, the rest native rows); --gguf-embed file|template: the embedding rows from the file, dequantised on the host per token (file, the default); --gguf-check once|always: the repack's deviation verdict kept between loads (once) or re-checked (always); --gguf-q6k aligned|file: the native Q6_K rows in 224-byte dword-aligned blocks (aligned, the default: +6.7 % on that set, the decode row without shuffles) or the file's 210-byte rows; --gguf-mins exact|shared|nibble|split: how the repacked projections carry their mins (exact, the default, +12.5 % on the Q4_K set; shared: two super-blocks per augmented group under the larger dmin, +6.25 %, inexact; nibble: one nibble per group under a scale shared by 32 groups, +3.1 %, the coarsest; split: the min term a separate small MatMul on the activation's group sums added to the main one instead of augmented columns of the same fully-connected -- exact-class under a derived bound of twice the exact one, K stays the model's; measured a decode lever, -1.5 ms per step at 1k and 0.24 GiB back, prefill on the device the same) -- the inexact forms report their measured deviation at load instead of refusing it. 0.4.1; split 0.4.2 (DESIGN 7.0.2bo).
-71.7k at u8:i4 KV (the IR 552 / 16.5 at u8); resident 18.73 GiB (native
-14.94), max ctx 46k at u8. The
-template's AWQ activation scales are set to one; its norms equal the
-file's; embedding, GDN state and MTP stay the template's.
+- Coder, production: A770, qwen36-coder-b5-ov, u8 KV, n_ctx 98304, 2 GiB
+  prefix cache. Extension prefill 1379 t/s at 4096 tokens, 1209 at 16384;
+  decode 43.9 / 42.4 t/s. Task 10/10.
+- Dense agent, production: B60, qwen38-b7c1-ov, KV i8:u8, n_ctx 122880,
+  prefill chunk 512, --mtp on, --gate-pad 16. Extension prefill 1141 t/s at
+  4096, 852 at 16384; decode 24.6 / 20.2 t/s. Task 10/10 (greedy, MTP).
+- Qwen3.8-27B drafters (B60, int4, u8 KV, greedy, prompts < 2048, 32768
+  ctx): none 24.0 t/s; MTP head 33.0 t/s (76.7 % accepted); DFlash2 int4
+  44.8 t/s (3.13 tokens per verify cycle); DFlash2 drafting on the A770
+  39.8 t/s. At 77k tokens DFlash2 18.8 t/s, plain 15.3.
+- Qwen3.8-27B from a GGUF (Q4_K_M on the dense IR, B60, u8 KV, mixed form):
+  prefill 1001 t/s at 856 tokens, 464 at 71727; decode steps 54.8 / 73.7 ms.
+  Intel's int4 IR on the same card: 1609 / 552 t/s, 23.1 / 16.5 t/s decode.
+- Qwen3.6-35B-A3B, qwen3.6-35b-a3b-native-d40packed-u8 (native IQ2_S /
+  IQ3_XXS expert blocks, u8 dense projections), all resident on the A770,
+  u8 KV: prefill ~960 t/s at 4096 tokens, decode ~28 t/s.
+- Qwen3.8-Flash-Next, qwen3.8-flash-next-d48q8 on the B60: --offload-ratio
+  75 --moe-cpu-tier, census seed of 128 experts per layer, 30 GiB host
+  expert bank, u8 KV, chunk 2048. At a 20085-token prompt: prefill 63.1 t/s,
+  decode 6.5 t/s, needle answered.
+- Flash-Next quality reference: the model's own full-depth f32 forward
+  (tools/ref_forward_stream.py; tools/kld_vs_capture.py,
+  tools/capture_vs_capture.py, tools/kld_position.py read its captures).
+  Rows below position 2051 stand; rows at or above it await a re-capture
+  (docs/campaigns/qsa.md).
 
-After 0.3.0 every open defect or lever is one campaign document under
-docs/campaigns/ (README there: rules, template, index of thirteen); the
-milestone document's backlog rows are frozen and point there. Next feature
-lines: 0.4.0 = open and run GGUF checkpoints (docs/milestone-0.4.0.md; stage
-1 -- in-process open on a template IR, native K-quant blocks decoded in the
-plugin's kernel -- served and tagged as 0.4.0 on 2026-09-06; stages 2 MoE
-and 3 sub-4-bit follow); 0.4.1 = the GGUF path at the card's speed
-(docs/milestone-0.4.1.md; tagged 2026-09-07 on +p11: the mixed form 907 /
-451 t/s prefill and 54.9 / 73.3 ms decode steps at 856 / 71,727 tokens
-against the IR's 1,609 / 552 and 43.3 / 60.6 -- the gate met at depth,
-missed at 1k prefill; the native form meets decode at 15.22 GiB); 0.4.2 =
-the runtime's int4 gemm on the repacked set (tagged 2026-09-07 on +p11: the
-gemm at 88 % of the card's f16 matrix roof, int8 activations dead at 32-wide
-groups, the 1k prefill gate unreachable through it; --gguf-mins split as a
-decode lever, 53.5 / 72.2 ms steps at 1k / 71.7k, 16.30 GiB, warm prefill
-967 t/s; DESIGN 7.0.2bo); 0.4.3 = the tiled K-quant kernel's activation reads 32 rows
-per 2D message (tagged 2026-09-08 on +p12, plugin patch 0030: the gate 3.37 -> 2.86 ms,
-Q6_K down 4.40 -> 3.59 at 856 rows; served warm 1k prefill 940 -> 1,001 t/s, 71.7k 451 ->
-464, decode unchanged, byte-identical; the prefetches, 16-row reads and a mad split
-measured dead; DESIGN 7.0.2bp); 0.4.4 = the Q5_K decode rate; 0.5.0 = Qwen Flash Next
-(docs/milestone-0.5.0.md; recon pins the checkpoint and its config deltas
-first; gate: loads on both cards, Prüfstand, depth ladder, drafters measured
-against plain). 0.5.0 state 2026-09-13 (docs/window-050.md §4.9-4.11): the
-serving-shape IR (tools/q4e/serving_shape.py, real weights from the GGUF
-shards, the n-gram table as ngram_table.K USM-host PORTS bound at load from
-the shard via --ngram-gguf) is an artifact directory at depth 4 of 48
-(tools/export_serving_artifact.py; allowlist qwen3.8-flash-next-d4) and the
-served binary answers on it on both cards: "The capital of France is" ->
-"ramework..." (the probe's token; 38-47 t/s warm decode) -- not the model's
-answer, 44 layers missing (one A770 leg hung its first forward in a fence
-wait while another session held the host; re-run quiet, it boots and
-answers identically). KLD gate served half: /v1/completions takes token-id prompts,
-ARCINT_LOGITS_DUMP records every paged forward, tools/kld_served.py replays
-the pinned llama.cpp capture and reports KL below/above row 2051 (red at
-depth 4: 11.6 nats). Full depth (§4.10): the 48-layer artifact exists (76.3
-GiB .bin, 82 min fill, allowlist qwen3.8-flash-next); the served compile on
-the A770 stages every constant in USM HOST memory and the host runs out
-(page allocation failure at 37 GiB shmem, CL_OUT_OF_HOST_MEMORY on one
-expert body) -- refused as predicted, by the host rather than the card;
-France and KLD at full depth not reached; the route left is compiling
-fewer than 48 layers' experts at once (segmented forward, HANDOFF CR).
+## Correctness rule (operator, 2026-10-01; CLAUDE.md, DESIGN 3.4 Amendments 1-2)
 
-Two M2 walls came down. Slicing logits to the last token before the LM head
-removed an out-of-memory wall at ~8k tokens (the graph computed logits for
-every prompt token: 8.1 GiB at 8k). Storing the attention KV as fp16 by graph
-surgery takes 262144 context from 10.00 to 5.00 GiB - measured 20480 vs 40960
-bytes per context token - which fits the B60's 22.7 GiB alongside 12.8 GiB of
-weights. Neither changes greedy output.
-
-How much the paged path is worth is measured, and the graph must be separated
-from the pipeline. End to end GenAI's ContinuousBatchingPipeline beats arcint
-by ~10-13% on the same IR and card. But profiled directly - same card, depth
-256, steady state - the paged GRAPH costs 11.3 ms per decode step against the
-stateful graph's 19.01 ms: 1.68x. Nearly half of that is 90 Transpose nodes
-(3207 us) disappearing; the optimized paged GDN kernel is 0.64 ms more, and
-PagedAttention replaces IndirectSDPA for free. GenAI gives most of the win back
-in its own scheduler; arcint's serving loop is 2% of a decode step. arcint on
-the paged graph therefore projects to ~87 t/s on the coder against 51.1 today,
-and that projection is what the work is worth.
-
-Caution: PERF_COUNT inflates wall clock (53.6 ms for a step whose node sum is
-19.01 ms) and reports the LAST inference. A depth-64 first-step profile said the
-two paths were identical; they are not.
-
-KV precision on the paged path, measured (7.0.3): u8 is never slower, +2.5%
-at 32k depth, and halves KV memory - the default candidate pending the quality
-harness. u4 quarters memory but costs 6% at 32k; mechanism profiled, not
-narrated: PagedAttentionExtension goes 58.6 -> 95.4 ms (+63%) under u4 while
-every other kernel is unchanged. Also measured: device weights are NOT shared
-between compiled models (0.791 -> 1.582 GiB for two compiles of one graph),
-and kernel exec_type strings carry no ISA marker on either card, so the XMX
-question needs Level-Zero tracing, not PERF_COUNT.
-
-tools/paged_spec.py adds speculative decoding on the paged path (dense model,
-MTP head drafting): rollback is row promotion, zero state bytes move on
-rejection. Measured on the B60: 36.1 t/s at depth 512 and 32.1 at 4096 against
-the 19.9 t/s stateful baseline (1.81x / 1.61x), 96.7% acceptance, with bitwise
-determinism and bitwise warm-restore equality as gates. On the A770 alone the head
-does not fit beside the dense model (15.25 of 15.11 GiB, refused by
-reservation) -- but with the head and embeddings hosted on the B60 (fits beside
-coder production; only ~20 KB of activations cross per step) the A770 serves
-dense MTP at 26.6 t/s (512) / 22.4 (4096) vs 17.3 stateful: 1.54x. Paged
-without MTP runs there at 18.1 t/s.
-Found and fixed en route: state rows MUST be zeroed before first use - the
-kernels read the committed row even at past_lens 0.
-
-tools/paged_driver.py is the prototype and the oracle for the C++ port: la.*
-convention, device-resident state tensors (host tensors are re-uploaded every
-infer and silently reset the recurrent state), absolute-grid prefill, and a
-startup reservation in which every term is measured (weights+graph via
-GPU_MEMORY_STATISTICS, activation peak by running one chunk - linear in chunk
-size - GDN slab, KV at 20 KiB/token, stated margin). Admission is refused with
-the numbers, never discovered at runtime as CL_OUT_OF_RESOURCES. Result on the
-A770, where GenAI's continuous-batching path refuses the coder at startup (its
-stateful VLMPipeline served this model on this card in production before the
-B60 arrived; the refusal is the CB admission check, not the card or GenAI):
-ctx 49152 at chunk 512 serves at
-586 t/s prefill / 37.1 t/s decode, 15.09 of 15.11 GiB accounted.
-
-PCIe bandwidth does NOT govern decode of a resident model - an earlier claim
-here, retracted by measurement. Node time (19.01 ms) equals the serving step
-(19.2 ms/token), host work is 2%, and the only per-step link traffic is the
-993 KB sliced-logits readback plus an 8 KB embeddings hop = 0.06-0.32 ms, under
-2%. The bus IS the explanation for state snapshots/rollback (51-67% of decode,
-69.9-171.3 MiB per step), prefix-cache serialisation, and expert offload.
-
-What is left is OpenVINO's paged-attention path. Its decode-side block-table
-convention is undocumented and not yet reverse-engineered; prefill through it
-reproduces the stateful path exactly, decode does not. M4's measurements
-promoted it: it is the precondition for speculative decoding paying at all
-(rollback becomes block-table arithmetic instead of a 171 MiB state copy),
-worth ~2x decode on the dense model, on top of speed and real q8 KV.
-
-Known open: q8 KV, which needs per-block scales and is only reachable on the
-paged path. Two former entries are closed - tools/export_mtp.py builds the MTP
-head, and expert offload for the 35B on a 16 GB card turned out to be a native
-GPU-plugin property (OFFLOAD_RATIO), not something the fused MoE op withholds:
---offload-ratio 20 serves the 35B on the A770 at 1.8 t/s where it previously
-refused to load, against 52.2 t/s on the B60.
-
-M6: two client sessions per service, in ONE process (--parallel 2). Per-lane
-InferRequests (language model, embeddings, both MTP requests), per-lane GDN
-checkpoint rows, per-lane KV block tables out of a shared refcounted page pool
-which retired M3's single-slot pool-epoch tag. No lock on the decode loop; what
-orders the lanes is a FIFO turnstile around graph executions. That turnstile is
-a correctness mechanism first: the GPU plugin pools intermediate buffers per
-compiled MODEL, not per request (measured - a second InferRequest adds 0.00 GiB
-of activations), so two concurrent executions would overwrite each other and a
-request's output tensor is only valid until the next execution by anyone. Hence
-also the copy-out of logits/hidden inside the turn - but only where the value is
-consumed: copying every prefill chunk's logits cost 165 ms per chunk, prefill
-1644 -> 1290 t/s.
-
-Measured on the B60, coder, u8 KV, n_ctx 40960, two lanes: single-stream decode
-67.6-69.9 t/s against a pre-M6 68.8 (bar was <5%), prefill 1883 t/s at the
-chunk 2048 the new admission arithmetic makes admissible (pre-M6 silently
-shrank it to 1024). The agent+subagent scenario: a 28906-token session decoding
-beside bursts of a 309-token request gets 32.5 t/s while each burst gets
-31.1-31.3 t/s and 0.42 s TTFT - 63.7 t/s aggregate against 68.7 solo, with the
-session's inter-token stall at p95 17 ms, max 516 ms (one prefill chunk; the
-bound is structural, the turnstile is FIFO). Pruefstand: 10/10 solo AND 10/10 on
-each lane run concurrently, all three answers byte-identical.
-
-Admission: a lane is a memory reservation, and the activation term is probed
-UPWARD because the plugin's intermediate pool never shrinks - an over-large
-probe is a permanent tax (predicting straight to chunk 1024 on the A770 left a
-budget of zero). Each card lands where its memory says: B60 chunk 2048, A770
-256 at 8k and 128 at 40k ctx. Two A770 lanes of 40960 serve; two of 65536 are
-refused at startup with every term. At request time, a third concurrent request
-is a 503 carrying the same arithmetic (--queue-timeout S restores queueing).
-
-Verification: 430 unit cases device-free (438 with the OpenVINO backend), a 64-check curl round-trip, a lane-accounting
-stress (200 requests, 24-way, 8 lanes, both queueing and refusing) -- the unit
-set, what bare ctest runs; and an acceptance target of sixteen enumerated cells
-(tests/acceptance/) that runs where the cards are, fails on any skip or
-regression not named, and carries twenty-two references filled from its own
-runners' samples (three gated, nineteen report-only). Clean
-under ASan and UBSan on x86_64.
-
-0.5.1 state 2026-09-19 (DESIGN 7.0.2bz-ca, docs/campaigns/sub4bit-vram-kernel.md):
-the fill's three provenance defects are fixed (the GGUF converter's folded
-norm gammas and -exp(A_log) undone at the feed, the GDN's sigmoid output
-gate, the tiled key-head pairing; all config-driven) and the 48-layer
-serving-shape artifact serves Paris on one 24 GB card at --offload-ratio 99
---moe-cpu-tier in two expert formats: the u4 repack (qwen3.8-flash-next-d48g,
-23.6 t/s decode, marfrit-openvino +p18) and the checkpoint's own IQ3_XXS /
-IQ4_XS / IQ4_NL / Q8_0 blocks (qwen3.8-flash-next-d48n, tools/q4e/native_blocks.py,
-serving_shape._native_expert, export_serving_artifact.py --expert-format
-native; plugin patch 0043 = +p19 lowers them to MOECompressed and runs every
-routed expert on the CPU tier; 0.6 t/s until the OpenCL decode of the native
-formats lands). Quality is measured against the model's own full-depth f32
-forward (tools/ref_forward_stream.py, run on a 128 GB unified-memory host,
-writes captures in llama.cpp's format; tools/kld_vs_capture.py,
-tools/capture_vs_capture.py, tools/kld_position.py read them): the native
-artifact is exact to 0.2% through 24 layers, its short-prompt logits at KL
-0.017 nats (llama.cpp 0.053), and on the 2,735-token capture window it reads
-mean 0.37 / median 0.18 / argmax 0.83 where llama.cpp itself reads 0.34 /
-0.065 / 0.80. The remaining term is a long-context floor (not the experts,
-not the KV precision, not the prefill chunks; the f16 recurrent state or the
-f16 attention over thousands of keys), plus the dense-for-sparse price above
-the 2,051-token sparse-attention boundary.
-[2026-09-28] Void as quoted: the reference captures ran the sparse-attention
-indexer on the BF16 projections' raw bytes (a gguf_feed defect, fixed); rows
-below position 2,051 stand, rows at or above it and every whole-window figure
-await a re-capture (docs/campaigns/qsa.md).
+- Correctness is judged at the answer: the answers stay right (facts,
+  needle, task battery); the candidate's mean KL against the reference is at
+  most 0.03 nats worse than the baseline arm's on the same card and window;
+  argmax agreement drops by at most 1 point.
+- Bit-identical output across configurations, placements, timing or request
+  history is not required. Integrity checks on copied data (expert stores,
+  slots, staged tables) stay exact.
+- Byte-equality cells in the suites (cache, chunking, lanes, speculation)
+  are tripwires: a red one is reported, not a veto.
+- An adaptive expert tier together with --prefix-cache-mib > 0 is
+  admissible under this rule. The load-time refusal in code
+  (tier_prefix_cache_decision, src/config.cpp) is owed a change.
 
 ## Contracts
 
 - HTTP: POST /v1/chat/completions, POST /v1/completions (OpenAI-compatible,
-  SSE streaming), GET /health, GET /props, GET /v1/models. No UI. /health and
-  /props publish the lanes and the reservation terms; a refusal quotes them.
-- The served NAME and the served CONTEXT are contracts with a discovering proxy
-  (DESIGN 4.2). A proxy republishes whatever id it finds in /v1/models, so that
-  id is settable: --served-model-name NAME changes what /v1/models and /props
-  report and what a completion echoes back, and changes nothing else.
-  --model-id remains the allowlist assertion about which artifact is accepted
-  and still refuses anything outside it; the two are different questions.
-  model.canonical_id is always published beside model.id, model.answers_to
-  lists both recognised names, model.enforces_model_field is false. The same
-  proxy takes the context from the /v1/models entry and asks /props only for
-  template capabilities, so the model object carries n_ctx (what this process
-  is RUNNING with) and n_ctx_train (the artifact's ceiling) as separate fields,
-  plus quant, lanes and canonical_id.
-- Console: llama.cpp-style one-line state/timing prints on stderr
-  (load, mem map, per-slot prefill/decode rates, cache hits, MTP acceptance).
-- Model input: OpenVINO IR (offline export), validated against a built-in
-  allowlist; anything else is rejected at load.
-- Former hard invariant (relaxed 2026-10-01, DESIGN §3.4 Amendments 1-2):
-  greedy output byte-identical across cold/warm prefix cache (still gated in
-  CI as a tripwire). Correctness is now judged at the answer: the answers
-  stay right, and mean KL against the reference is at most 0.03 nats worse
-  than the baseline arm's. NOT across chunked/unchunked prefill or speculation on/off:
-  measured 2026-08-28, advancing the state by two tokens in one forward differs
-  from advancing it twice by one (last-row logits up to 0.013 apart, GDN scan
-  kernel), so any change to how a sequence is split can flip a near-tie. Those
-  comparisons are reported, not gated; determinism at a fixed configuration and
-  non-zero draft acceptance are gated instead.
+  SSE streaming; /v1/completions also takes token-id prompts), GET /health,
+  GET /props, GET /v1/models. No UI. /health and /props publish the lanes and
+  the reservation terms; a refusal quotes them.
+- --served-model-name NAME sets the id /v1/models and /props report and a
+  completion echoes; --model-id is the allowlist assertion about which
+  artifact is accepted. The model object carries id, canonical_id,
+  answers_to, n_ctx (running), n_ctx_train (artifact ceiling), quant, lanes.
+- Console: llama.cpp-style one-line state/timing prints on stderr (load,
+  memory map, per-slot prefill/decode rates, cache hits, draft acceptance).
+- Context overflow is HTTP 400 with prompt_tokens/n_ctx/overflow. No
+  truncation, no context shift (GDN state cannot un-see tokens).
+- A request beyond the lanes waits --queue-timeout S, then gets a 503 with
+  the reservation numbers.
+- Client disconnect aborts GPU work at the next scheduler boundary.
+- Tool calls parsed server-side into OpenAI tool_calls (JSON body and the
+  coder's <function=>/<parameter=> XML with schema-driven coercion);
+  deterministic call ids; never executed; no tools declared = raw text.
+- Sampling defaults per allowlist entry (Qwen family card); operator flags
+  override them, request fields override both; /props names the provenance.
+- Security: no authentication, permissive CORS, no TLS. LAN or a reverse
+  proxy only.
 
-## Target models (measured, models/allowlist-raw.json, 2026-08-28)
+## Model input
 
-All three: full_attention_interval 4 (one layer in four is full attention),
-ctx 262144, tokenizer sha 87a7830d63fcf43b (shared), VLM-capable exports
-(*ForConditionalGeneration).
+- OpenVINO IR directory validated against the allowlist
+  (src/core/model_registry.cpp, models/allowlist-raw.json): language model,
+  text embeddings, tokenizer/detokenizer IRs, config.json, chat template.
+  VLM exports: the vision tower is reported at load and never loaded
+  (--vision is refused).
+- --gguf FILE --model DIR: a GGUF of the same architecture on the IR as
+  topology template; K-quant rows (Q4_K, Q5_K, Q6_K, Q8_0) repacked into the
+  runtime's compressed form or decoded natively in the plugin kernel
+  (--gguf-mode mixed|repack|native). docs/design-gguf-native.md.
+- Serving-shape artifacts exported from a GGUF
+  (tools/export_serving_artifact.py, tools/q4e/): Flash-Next (qwen4_exp) and
+  Qwen3.6-35B-A3B (qwen3_5_moe) with expert bodies in the checkpoint's own
+  block formats (IQ2_S, IQ3_XXS, IQ4_NL, IQ4_XS, Q8_0) and dense projections
+  in Q8_0/Q6_K-exact u8/i8 form (--dense-q8, --dense-u8). Flash-Next's
+  n-gram embedding table is read per forward from the GGUF into a bounded
+  staging buffer (--ngram-gguf).
+- Allowlist ids: qwen3.6-27b-a3b-coder, qwen3.6-35b-a3b, qwen3.6-35b-a3b-mtp,
+  qwen3.8-27b, qwen3.8-27b-intel-int4, qwen3.5-2b, the qwen3.8-flash-next-*
+  ladder (d4, d4qsa, d12, d12r, seg12, full, d48g, d48n, d48s, d48p2, d48s2,
+  d48q8, d48q8qsa) and the qwen3.6-35b-a3b-native-* ladder (d4, d40, d40f16,
+  d40packed, d40packed2, d40packed-u8, d4packed, d4packed-u8). Each entry's
+  status string in the registry names what was measured on it.
 
-- qwen3.6-27b-a3b-coder / qwen36-coder-b5-ov: qwen3_5_moe, 40 layers
-  (30 GDN + 10 attn), n_embd 2048, 184 experts (pruned from 256),
-  12.8 GiB, production, 10/10 on the Pruefstand.
-- qwen3.6-35b-a3b / qwen36-35b-a3b-int4-ov: qwen3_5_moe, 40 layers
-  (30 GDN + 10 attn), n_embd 2048, 256 experts, 17.4 GiB, unmeasured
-  against the current harness.
-- qwen3.8-27b / qwen38-b7c1-ov: qwen3_5 dense, 64 layers (48 GDN + 16 attn),
-  n_embd 5120, 13.4 GiB, provisional 7/10 (AWQ-only; SE calibration
-  degenerates greedy - do not re-add SE).
+## Mechanisms
 
-Note: DESIGN.md section 4's original console sketch said "41 GDN + 7 attn
-layers | weights 15.9 GiB". That was illustrative and is wrong; the artifacts
-above are authoritative and the allowlist follows them.
+- Paged executor is the served path (PagedAttention + paged GDN kernels);
+  the stateful executor stays behind --no-paged as the reference.
+- Admission by measured reservation: weights and graph from
+  GPU_MEMORY_STATISTICS, the activation peak probed upward chunk by chunk,
+  GDN slab, KV per token, a stated margin (--fit-margin-mib). Omitting
+  --n-ctx adopts the auto-fit depth; an explicit --n-ctx is verified, never
+  lowered. --fit-ledger-dir persists the probed terms across starts.
+- GDN state checkpoints are block-aligned with KV pages; prefill chunks and
+  snapshots sit on an absolute grid from position 0; the prefix index is
+  keyed 128-bit block hashes verified token by token; --cache-host-mib parks
+  evicted prefixes in host RAM.
+- Lanes (--parallel N): one process, per-lane InferRequests, GDN rows and
+  block tables over a shared refcounted page pool, a FIFO turnstile around
+  graph executions (the plugin pools intermediate buffers per compiled
+  model).
+- Logits are sliced to the last token before the LM head; attention KV is
+  stored at the --paged-kv precision (u8 default; f16, i8, u4, i4, and
+  asymmetric KEY:VALUE pairs).
+- Speculative decoding (greedy): the Qwen3.8 MTP head (--mtp on;
+  tools/export_mtp.py reconstructs it from the checkpoint's mtp.* tensors),
+  the DFlash2 block drafter (--dflash, seven drafts per verify pass,
+  optionally on another card), prompt lookup (--draft N). A draft is accepted
+  only where it equals the sampler's own pick for that row; rollback on the
+  paged path is block-table and state-row arithmetic.
+- MoE expert placement beyond VRAM: --offload-ratio N keeps 100-N percent of
+  each layer's experts in device slots; --moe-cpu-tier computes the rest on
+  the host CPU (AVX2 decoders for the native formats, a quantised-domain dot
+  for decode); --moe-per-expert-dispatch runs resident experts as
+  per-expert GPU kernels; the plugin's MOE_CPU_BANK_BYTES fills a host RAM
+  bank with the tier's experts at load; MOE_CPU_TIER_SEED pins the resident
+  set from a routing census; ARCINT_MOE_DEVICE_POOL_BYTES bounds the device
+  slot pool. On a fully resident native MoE pool a device kernel writes the
+  decode step's expert pair table from the router output (patch 0067).
+- Qwen Sparse Attention (Flash-Next, --qsa export, qwen3.8-flash-next-d48q8qsa):
+  served with a compressed block-key indexer cache; non-default; n_ctx <=
+  32768; refuses --parallel > 1, the prefix cache and paged speculation.
+- Compiled-blob disk cache in weightless mode with absolute weight paths
+  (works around openvino#37607).
 
 ## Divergence policy (DESIGN 1.1)
 
-A fork of OpenVINO is not wanted: it erodes the compiler/kernels-vs-everything-
-else boundary, turns the packaged runtime from a repacked upstream wheel into
-our build, puts a rebase on the calendar every nightly, and makes every
-measurement one against our tree rather than a version anyone can obtain --
-which is the property that makes this repository's numbers checkable. But
-nobody optimises these operators for Intel, because almost nobody serves GDN
-hybrids on Arc, so waiting for upstream to want what only we need is not a plan.
-The rule is SMALLEST SUFFICIENT DIVERGENCE, in order: (1) upstream PR, written
-to their conventions from the first line so it can leave this tree; (2) a
-numbered patch series applied at build time in the packaging repo, each patch
-PR-shaped and named against its upstream discussion -- a fork only technically,
-rebased by re-applying; (3) a maintained fork, last resort, requiring a stated
-reason AND an exit condition. Whatever is carried is published, because a
-performance number depending on a patch nobody else has is an anecdote. Note the
-supply chain changes shape: the runtime package currently repacks wheels in
-seconds, while a patched build is a real x86_64 compile with no CI runner for
-that target.
+Smallest sufficient divergence from upstream OpenVINO, in order: an upstream
+PR; a numbered, PR-shaped patch series applied at build time
+(contrib/packaging/marfrit-openvino/patches/, README there names each
+patch); a maintained fork only with a stated reason and exit condition.
+Whatever is carried is published.
 
-Patch series to date (contrib/packaging/marfrit-openvino/patches/): 0001-0002
-measured and NOT carried (an instrument, and a fusion bound that produced
-wrong output); 0003-0016 applied on top of the same pinned upstream commit --
-0003 MoE per-infer expert-mask subbuffer churn, 0004 OTD perf counters, 0005
-device-resident MoE slot pool, 0006 async batched slot uploads, 0007 drop the
-redundant per-MoE-layer stream finish, 0008 VALUE_CACHE_PRECISION config
-option, 0009 asymmetric KV kernel plan, 0010 asymmetric decode kernel (u8
-keys, i4 values), 0011 MoE host compute tier kernel, 0012 MoE host tier
-decode-path redirect, 0013 per-expert routing histogram, 0014 GPU Assign
-adopts a same-type/same-rank output layout instead of asserting, 0015 paged
-attention bounded partials (f16 host sizing, PAGED_ATTENTION_MAX_PARTITIONS,
-and the argument rebind fix closing a use-after-free that appears once the
-bound makes the buffer's size plateau), 0016 paged-attention intermediate
-buffers sized from the current call. Packaged as marfrit-openvino +p3
-(patches 0003-0016).
-
-## Key design points
-
-- All target models are hybrids: GatedDeltaNet (linear attention, fixed-size
-  recurrent state) on most layers + full attention (paged KV) on few.
-- GDN state checkpoints are block-aligned with KV pages so prefix-cache hits
-  restore both sides exactly; no approximate resume, ever.
-- Prefix index: keyed 128-bit block hashes with token verification on hit.
-- Speculative decoding is implemented and gated on greedy-invariance: a draft
-  is accepted only if it equals what the sampler would have picked for that
-  logits row, so a draft is never taken on faith. Output is NOT byte-identical
-  to plain greedy - see the invariant note above. Two drafters, both off by
-  default: the
-  native Qwen3.8 MTP head (--mtp on, 93.2% acceptance) and a prompt-lookup
-  drafter (--draft N). optimum-intel drops the MTP head on export, so
-  tools/export_mtp.py reconstructs it from the checkpoint's mtp.* tensors; the
-  forward pass was recovered by measurement (zero-centred (1+w) norms,
-  per-head-interleaved q/gate, sigmoid gate) using acceptance as the oracle,
-  which is only sound because a wrong draft cannot change the output.
-  Measured a net loss as shipped, for two separable reasons. (1) Rollback:
-  copying the graph state per decode step costs 51-67% of decode time - 69.9
-  MiB/80 vars on the MoE, 171.3 MiB/128 vars on the dense model, mostly the
-  fixed-size GDN recurrent state, so it does not shrink with context. It is
-  inside OV's VariableState get_state/set_state; bypassing the prefix cache's
-  serialiser moved it 1%. (2) Amortisation: a k-token verify pass is nearly
-  free on dense (forward(5) = 1.08x forward(1)) but not on MoE (1.37x), because
-  MoE tokens route to different experts. Net of rollback, dense speculation is
-  1.76-2.07x faster and MoE is break-even. So the paged path is not an
-  optimisation for M4, it is the precondition, worth ~2x on Qwen3.8.
-  DESIGN 3.5.1.
-- Compiled-blob disk cache in weightless mode with absolute weight paths
-  (avoids openvino#37607 embedded-weights import bug).
-- Quant: q4/q8 weights, fp16/q8 KV. Single GPU, single process, Xe KMD only.
-- Tokenizer + chat template ship in the model artifact (template hash in the
-  allowlist); incremental UTF-8-safe detokenization for streaming.
-- Tool calls parsed server-side into OpenAI tool_calls; both Qwen wire forms
-  (JSON body, and the coder's <function=>/<parameter=> XML with schema-driven
-  type coercion); deterministic call ids; never executed; no tools declared =
-  parser never runs, raw text untouched.
-- Model-aware sampling defaults per allowlist entry; request fields override.
-  Still marked "provisional": allowlist-raw.json carries no sampler settings,
-  so the values are inherited from the Qwen3 family card, and /props says so.
-- Context overflow = HTTP 400 with prompt_tokens/n_ctx/overflow. No
-  truncation, no context shift (GDN recurrent state cannot un-see tokens).
-- Client disconnect aborts GPU work at next scheduler boundary.
-- Prefill throughput is a first-class regression metric per card (measured
-  pain: 58 t/s prefill on A770/Vulkan = 6 min TTFT at 21k context).
-- M7 fit pass: the paged path auto-fits --n-ctx to the measured admissible
-  depth when the flag is omitted; given explicitly it is verify-only, never
-  lowered, and a refusal trims the prefix-cache reserve pages first.
-- M8 asymmetric KV, --paged-kv KEY[:VALUE]: u8:i4 costs 8.8 KiB/token against
-  u8's 11.3 and auto-fits +28% more context; 10/10 on the acceptance task.
-  Owed: the prefill price, and prefix byte-exactness.
-- M9/M14 MoE expert offload on the host tier: --moe-cpu-tier computes
-  capacity-miss experts on the CPU instead of a PCIe upload, ahead of the
-  device-resident slot pool and async batched uploads underneath it. Refuses
-  --prefix-cache-mib > 0: expert LRU residency picks device f16 vs host f32
-  arithmetic, so a cache-restored continuation is not byte-identical to a cold
-  run (DESIGN §3.4).
-  [Relaxed 2026-10-01, DESIGN §3.4 Amendment 2: the pairing is admissible
-  at the answer-level bar; the refusal in code is owed a change.]
-- M12: --pin-dispatch pins a lane's dispatch thread (measured null on a quiet
-  host, opt-in); the exporter's --moe-lowering tiled.
-- M13: --vision is reserved and refused; a VLM checkpoint's vision tower and
-  projector IRs are reported at load and never loaded.
-- The complete flag list is the section "Command-line options" below,
-  generated from the binary's --help (src/config.cpp usage_text) at release
-  time; the source is authoritative when the two disagree.
-
-## Command-line options (arcint --help)
+## Command-line options (arcint --help, src/config.cpp usage_text)
 
 ```
 usage: arcint [options]
@@ -438,9 +195,12 @@ server
                             undone once set
   --moe-cpu-tier            compute expert FFNs that would evict a device
                             slot on the host CPU instead (needs --offload-ratio;
-                            --prefix-cache-mib > 0 is refused at load unless the
-                            plugin reports a static residency partition, DESIGN §3.4)
+                            --prefix-cache-mib > 0 is refused at load with an
+                            adaptive tier, and allowed only when the plugin
+                            reports the static residency partition, DESIGN §3.4)
   --moe-cpu-tier-threads N  worker threads for that tier (0 = auto)
+  --moe-per-expert-dispatch dispatch routed experts via per-expert GPU
+                            kernels (needs --offload-ratio + --moe-cpu-tier)
 
 memory
   --n-ctx N                 context length. Omitted: adopts whatever the
@@ -451,224 +211,10 @@ memory
                             explicitly for the model's own maximum, checked
                             against the fit like any other explicit value --
                             it can refuse where omission would have adopted
-                            a smaller number instead. Under 4-bit paged
-                            VALUES, an explicit --n-ctx equal to the depth
-                            auto-fit itself would adopt is admitted with the
-                            same served chunk and the same charges. NOT the
-                            same call for both paths (an earlier design
-                            claimed it was; retracted -- the artifact's own
-                            train maximum is not auto-fit's served depth,
-                            and evaluating the belt there alone gives an
-                            over-conservative chunk): the explicit path
-                            evaluates the belt directly at the requested
-                            depth (pure geometry, no search, no activation
-                            dependence); auto-fit instead runs the belt's
-                            own chunk-driven fixed-point SEARCH seeded from
-                            the requested/default chunk to find its own
-                            served depth, re-probing activations upward and
-                            repeating whenever the search's served chunk
-                            grows past what was already measured (valid --
-                            the plugin's pool only ever grows). Both paths
-                            price the term at their own served chunk this
-                            way, and resubmitting auto-fit's own adopted
-                            depth as an explicit request reproduces the
-                            same chunk and the same admission by
-                            construction. One KV page of slack is
-                            subtracted from the admissible ceiling before
-                            either path's check, so an explicit request
-                            equal to what auto-fit itself adopts (already
-                            inside that same margin) is admitted, not
-                            refused at Phase E's own allocation-time
-                            rounding
-
+                            a smaller number instead
   --kv-block-size 16|32     KV page size in tokens (default: 32)
   --prefill-chunk N         prefill chunk in tokens, 0 = unchunked
-                            (default: 2048; bounds activation memory).
-                            Under 4-bit paged VALUES the served chunk is
-                            capped from the pool depth (empirical belt,
-                            measured; logged when it fires) -- see
-                            exec/fit.h's prefill_chunk_cap_for_packed_values.
-                            An explicit --prefill-chunk is capped the same
-                            way, never raised; ARCINT_PREFILL_CHUNK_CAP=off in
-                            the environment keeps the requested chunk for
-                            measuring the fault line -- a FULL bypass: NO
-                            belt, NO cap, AND NO scratch-buffer reservation
-                            term (charged 0, not merely priced at the
-                            uncapped chunk -- an earlier version of this
-                            switch still charged a real, depth-scaled term
-                            there, which on its own was enough to refuse a
-                            card load the switch was supposed to let
-                            through; see the RETRACTED history below), on
-                            BOTH the auto-fit and the explicit --n-ctx path
-                            (logged loudly, never a default -- a long
-                            prefill run this way may fault or OOM with no
-                            reservation left to catch it first, which is the
-                            point: the plugin's own kernel is what faults,
-                            not this repository's own budget estimate). A
-                            SEPARATE, hard ceiling
-                            (kMaxMeasuredPackedValuesChunk, fit.h) applies
-                            after the budget-based shrink, WHEN the belt is
-                            not disabled by the switch above: 128 tokens on
-                            the generic kernel's path, the largest chunk with
-                            a passing card measurement there (the microkernel
-                            path from +p6 has its own cap, 2048, §7.0.2av) --
-                            an explicit --prefill-chunk above the path's cap
-                            under 4-bit paged VALUES is reduced at least to
-                            it, even at a served depth shallow
-                            enough that the budget check alone would leave a
-                            bigger chunk unchanged (2048, the default, has
-                            never been validated on any plugin for this
-                            scratch path at all) -- UNLESS the measurement
-                            switch is set, in which case neither this cap
-                            nor the budget check runs at all. The load-time
-                            log, at the point the chunk is actually decided
-                            (the search's own converged chunk, or the
-                            explicit path's single evaluation -- NOT the
-                            Phase E belt call site further down, which can
-                            only ever reproduce that same value and so never
-                            has anything new to report), names which of
-                            three limits fired -- budget (the 512 MiB proxy
-                            shrank it to something that fits), bound (the
-                            halving ladder ran to the KV block floor and
-                            still does not fit -- served anyway, not a
-                            refusal), or measured cap (this 128-token
-                            ceiling).
-
-                            RETRACTED history, kept rather than silently
-                            corrected (this file's own convention): the
-                            measurement switch was, for a time, a NO-OP on
-                            the auto-fit path -- the served-chunk ceiling
-                            used to compute below applied the belt
-                            unconditionally regardless of the switch, and
-                            the served-chunk seed re-applied the 128-token
-                            cap unconditionally too, so a load run with the
-                            switch set logged "belt disabled" and then
-                            served chunk 128 anyway. Fixed by gating both on
-                            the switch. The explicit --n-ctx path had the
-                            SAME class of bug a third time (the at-depth
-                            evaluation that path uses had no way to disable
-                            the belt at all) -- fixed by giving it the same
-                            belt-disable parameter the auto-fit search
-                            already had. Separately: the search's own
-                            exhaustion fallback (8 rounds without settling)
-                            used to re-seed its final evaluation from the
-                            operator's full requested chunk, which could
-                            converge to a chunk bigger than any chunk
-                            activations were ever actually probed at
-                            (under-reservation risk); it now re-seeds from
-                            the last chunk actually probed, bounding the
-                            result by construction. A FOURTH retraction on
-                            this same switch: even after belt and cap were
-                            both correctly bypassed on both paths (the two
-                            fixes above), a card run
-                            (ARCINT_PREFILL_CHUNK_CAP=off, --n-ctx 101824,
-                            --prefill-chunk 128) was still REFUSED --
-                            "prefill scratch charged 1200.2 MiB at chunk 128
-                            ... admits 32256" -- the scratch term was still
-                            being priced (just at the uncapped chunk instead
-                            of the belt-shrunk one), and that alone was
-                            enough to refuse the load before the plugin's
-                            own kernel ever ran a prefill at that chunk. The
-                            switch now charges NOTHING (see above) rather
-                            than a smaller-but-still-real term. Measured cost (16 GiB-class
-                            card, coder, u8:i4, n_ctx 131,072, 8,417-token
-                            prompt): 495 t/s prefill at chunk 128, 437 at 64
-                            (-12%), 440 at 32. Chunk 128 only fits the
-                            512 MiB proxy budget up to n_ctx 65,536 (the
-                            proxy scales with pool depth, not prompt
-                            length), so every deeper u8:i4 pool pays this
-                            price even on short prompts. The auto-fit
-                            reservation itself now charges this same buffer
-                            (exec/fit.h's packed_values_prefill_scratch_bytes /
-                            fit_context_packed_values) as a per-token term,
-                            priced at whatever chunk the belt above would pick
-                            for each candidate depth -- consistent with (16
-                            GiB card, coder, u8:i4; the sampler measured
-                            aggregate free VRAM against a proxy formula, not a
-                            direct trace of this one buffer) a 171,312-token
-                            auto-fit pool running free VRAM to 0 MiB during a
-                            119,074-token prefill (xe "VM worker error: -12",
-                            "exec queue reset detected", CL_OUT_OF_RESOURCES)
-                            because the pre-fix reservation never priced a
-                            buffer that does not exist at the past-0 point the
-                            activation probe measures; a 131,072-token pool
-                            passed the same prompt with 492 MiB free.
-                            12 KiB/token at chunk 128 on the coder's
-                            16-query-head/256-head_dim shape (more than the
-                            8.8 KiB/token u8:i4 KV itself; 6 KiB/token at
-                            chunk 64, the belt's own choice at the measured
-                            auto-fit depth below), x1.5 for the measured
-                            overlap bound (the same sampler: the buffer held
-                            for ~0.9x of the whole prefill, rounded up to
-                            1.0x; at the resize the free-VRAM trace 60 -> 562
-                            -> 56 MiB is a release then a reallocate, not two
-                            buffers held at once, so the resize's own peak
-                            stays at or below that same ~1.0x -- 1.5x is
-                            margin above that peak), plus a one-partition
-                            fixed margin; charged only under 4-bit values, at
-                            whatever chunk the belt would pick for each
-                            candidate depth, clamped at the belt's own call
-                            site (after Phase E) to the chunk the term was
-                            actually priced at -- the belt is non-increasing
-                            in depth, and every path to the served depth only
-                            ever lowers it, so a trim crossing one of the
-                            belt's own step boundaries could otherwise hand
-                            back a chunk larger than the one priced. Logged at
-                            load ("4-bit values: prefill scratch charged ...
-                            at chunk ... for n_ctx ... (per token ... +
-                            KV ...)") and folded into the one-line reservation
-                            summary ("+ prefill scratch N GiB (4-bit values,
-                            chunk C)"); deliberately excluded from the
-                            allocation-time audit's predicted_total, since the
-                            buffer is not yet resident the instant the KV pool
-                            is allocated (it grows once the first real prefill
-                            runs past this point), and including it there made
-                            the "deferred commit" log fire on every 4-bit-
-                            values load unconditionally. Phase E's own
-                            acceptance ceiling is now total - margin - scratch
-                            term, re-derived every pass at that pass's own
-                            served depth (not a bare total - margin) -- so a
-                            4-bit-values load can now log "reservation
-                            overshoot ... correcting" and trim n_ctx, or an
-                            explicit --n-ctx can be refused, where the
-                            previous binary served silently and left the
-                            scratch buffer's own later allocation to find
-                            whatever was left over; the deferred-commit
-                            comparison above still excludes the term (a
-                            different question -- "is it resident yet", not
-                            "will there be room"). MEASURED (2026-09-03,
-                            16 GiB card, coder, u8:i4, auto-fit, BEFORE the
-                            ceiling narrowed for the scratch term above): the
-                            fit lands at n_ctx 101,984 with the belt at
-                            chunk 64 -- below that card's own u8 auto-fit of
-                            133,456 (M8), i.e. u8:i4 no longer widens auto-fit
-                            context over plain u8 for this shape once the
-                            scratch is honestly charged. The ceiling fix can
-                            only pull the adopted n_ctx down further (or
-                            refuse where it used to adopt), never up, so
-                            101,984 is an upper bound, not the current number.
-                            Re-measured with the narrowed ceiling: the
-                            overshoot correction fires once at load, the
-                            served depth is 101,824, and the 97,727-token
-                            prompt prefills in 442 s (221 t/s) with a
-                            free-VRAM floor of 814 MiB, no driver fault.
-                            FROM +p6 (patch 0020, DESIGN §7.0.2at): the
-                            u8-key/4-bit-value mixed stage runs on
-                            micro-SDPA, which allocates none of these
-                            buffers (VRAM sampler: <= 9 MiB consumed by a
-                            71.7k prefill vs 573 MiB on +p4's generic
-                            kernel), so the fit charges no scratch term
-                            and keeps only the path's measured chunk cap
-                            (2048 since the §7.0.2av chunk ladder; the
-                            generic path keeps 128)
-                            when the GPU plugin's build number names
-                            marfrit-p6 or later (fit.h
-                            packed_values_mixed_stage_on_micro; the
-                            recipe's stamp is the contract, 0020 adds no
-                            property). Auto-fit at u8:i4 on the 16 GiB
-                            card: 171,392 (was 101,824); a 118,454-token
-                            prefill at chunk 128 on that pool, VRAM flat
-                            at 971-978 MiB, no fault.
+                            (default: 2048; bounds activation memory)
   --paged-kv KEY[:VALUE]    KV precision on the paged path (default: u8). KEY and
                             VALUE each one of f16, u8, i8, u4, i4; omitting :VALUE
                             applies KEY to both the key and value cache ("u8" and
@@ -683,52 +229,7 @@ memory
                             prefill and, past ~50k, on decode too. f16 also
                             costs prefix-cache reserve: the pool is sized in
                             bytes and live pages are a fixed count, so the
-                            whole difference lands there.
-                            u8:i4, deep-prompt crash on a fault-reporting
-                            card: CLOSED as a diagnosed driver/runtime
-                            interaction, not a plugin defect (DESIGN
-                            §7.0.2ad). RETRACTED: earlier notes framed this as
-                            depth-triggered ("past 98k tokens") -- wrong; the
-                            trigger is one fixed 98,147-token prompt, crash
-                            depth within its prefill is random (~3.6k/12k/40k
-                            tokens on three crashes), and the actual trigger
-                            is VRAM headroom plus concurrent host/other-card
-                            load, not depth. Mechanism: every crash is a
-                            page-fault storm at the OpenCL runtime's own
-                            direct-submission semaphore buffer (one fixed GPU
-                            address, identified in the runtime's allocation
-                            log), evicted as an ordinary user BO under VRAM
-                            pressure and never revalidated before its next
-                            wait; the plugin's kernels are exonerated (0
-                            stale bindings over 5,867 traced dispatches).
-                            Every crash on the 24 GB card on record used
-                            the ARCINT_PREFILL_CHUNK_CAP=off diagnostic
-                            bypass; with ARCINT_PREFILL_CHUNK_CAP at its
-                            default (the only default here -- the bound was
-                            set explicitly, --paged-attention-max-partitions
-                            32; the stock default, bound 0, with the term
-                            active is unmeasured at this cell), the scratch
-                            term active on the 24 GB card passed 2/2 at the
-                            same cell. NEOReadDebugKeys=1
-                            EnableDirectSubmission=0 is a documented fallback
-                            if the bound is ever violated (3/3 patched, 2/2
-                            untouched, 5/5 on the 16 GiB card at +1.4% wall)
-                            -- but its control also passes on a quiet host,
-                            so that evidence is mechanism-derived, not a rate
-                            result. Matches open upstream drm/xe item 8390
-                            (same runtime heap region, this card's
-                            generation) plus a second candidate mechanism for
-                            the SAME fault, not yet separated (a
-                            stable-branch ring-ordering fix in linux-7.1.y,
-                            absent from the dev host's kernel) -- an operator
-                            decision on the host kernel, not made. u8:i4
-                            beyond ~98k tokens under the bypass stays unsafe
-                            on fault-reporting cards; at bound 32 with the
-                            165,680-token pool the 16 GiB card passed 5/5 on
-                            a quiet host and 4/7 earlier that evening while
-                            the host was also building plugin variants (host
-                            load not recorded)
-                            (CHANGELOG "Known defects").
+                            whole difference lands there
   --cache-grid N            prefix-cache snapshot grid in tokens (default: 0 = the
                             prefill chunk). A snapshot lands on the last multiple of N
                             below the prompt length; a coarser grid re-prefills the
@@ -774,78 +275,15 @@ any of them flips the served sampler provenance to 'operator')
   --fit-margin-mib N        headroom the paged-path auto-fit budget leaves
                             unclaimed (default: 256). The only policy term in
                             the reservation; every other term is measured
+  --fit-ledger-dir PATH     persist the admission fit terms (slot pool,
+                            activation fit, chunk cap) to skip the load-time
+                            probes on subsequent starts (default: off)
   --paged-attention-max-partitions N
                             bound the GPU plugin's mixed-stage paged-attention
-                            partition count (default: 0, unbounded). Engine
-                            side of plugin patch 0015
-                            (patches/0015-paged-attention-bounded-partials.patch,
-                            carried by marfrit-openvino +p3 (built
-                            2026-09-04, not yet deployed), so the bound is
-                            inert on every plugin level before +p3): passed to a patched plugin
-                            as its own RW config key
-                            PAGED_ATTENTION_MAX_PARTITIONS on a 4-bit-values
-                            load, detected by reading the key back before
-                            compile -- an unrecognised-key throw is the
-                            ORDINARY case on every released plugin today,
-                            not the rare failure a known, typed GPU property
-                            read would be;
-                            logged ("plugin does not carry the bound; scratch
-                            term stays depth-scaled") and N is ignored, the
-                            load proceeds exactly as today. A compile failure
-                            with the key accepted names
-                            PAGED_ATTENTION_MAX_PARTITIONS explicitly (and
-                            both properties, if VALUE_CACHE_PRECISION was also
-                            set) rather than misattributing the failure.
-                            DETECTION CONTRACT: element_bytes follows the
-                            bound key's own acceptance directly, not a
-                            separate probe -- a plugin exposing the key
-                            carries the f16 host-sizing fix too, both ship
-                            together in patch 0015; a plugin with the key but
-                            without the sizing fix would be under-charged by
-                            half, and no such plugin exists in this series.
-                            When accepted: the packed-4-bit-values prefill
-                            scratch term (exec/fit.h) partitions =
-                            min(ceil(n_ctx/256), N) when N > 0 else unbounded,
-                            plus a second additive term (exp_sums +
-                            max_logits, 2 x chunk x heads x 4 B x partitions,
-                            not scaled by the 1.5x margin -- that margin
-                            covers tmp_out's own measured resize alone),
-                            charged in both the bounded and unbounded arms.
-                            2-byte elements apply to tmp_out per the
-                            detection contract above. Past N * 256 tokens the
-                            whole bounded charge stops growing with depth
-                            entirely -- charged as one flat amount, not a
-                            per-token slope, and multiplied by lanes
-                            explicitly (the buffer is per infer request, not
-                            per compiled model). Nothing here is "exact" to
-                            the byte -- the reservation always charges the
-                            1.5x margin over tmp_out's own true size; what
-                            the bound changes is that the MARGINED value
-                            stops climbing. The belt
-                            (prefill_chunk_cap_for_packed_values) prices the
-                            same bounded buffer at both call sites, or it
-                            would shrink the chunk for a buffer that no
-                            longer exists. Logged when accepted: "4-bit
-                            values: plugin bounds attention partials at N
-                            (f16 partials); scratch term X MiB at chunk C"
-                            when N > 0, "...plugin carries the bound key;
-                            N = 0 leaves partials unbounded (f16
-                            partials)..." when N = 0. Key absent: byte-for-
-                            byte identical to the pre-0015 path (verified
-                            against the engine's own arithmetic -- the bound
-                            is inert on every plugin level before +p3, which
-                            carries patch 0015; MEASURED on the
-                            patched plugin under device test, N = 32: auto-fit
-                            lands at n_ctx 165,680, chunk 128, 48.5 MiB
-                            scratch, against 101,824/chunk 64 unbounded on
-                            the same card -- see CHANGELOG.md for the full
-                            record, including that a longer-prompt run is
-                            still under investigation). The design note's
-                            own recon that the
-                            plugin's mixed-stage buffer is already f16 in the
-                            kernel (only the host-side sizing hardcodes
-                            4-byte elements) is read from the plugin source,
-                            not measured
+                            partition count (default: 0, unbounded). Passed to
+                            a patched plugin as PAGED_ATTENTION_MAX_PARTITIONS;
+                            ignored, with a log line, on a plugin that does not
+                            carry the key (0015)
   --no-logits-slice         compute logits for every prompt token (slower,
                             and runs out of memory past a few thousand)
   --kv-dtype fp16|fp32      stored KV element type (default: fp16;
@@ -859,6 +297,40 @@ any of them flips the served sampler provenance to 'operator')
   --no-paged                stateful reference path instead of the paged executor
   --emb-device DEV          run the embeddings gather elsewhere (default: --device)
   --mtp-device DEV          run the MTP head elsewhere (default: --device)
+  --gguf FILE               serve this GGUF's weights on --model's topology (the
+                            served IR of the same architecture is the template);
+                            K-quant rows go to the card as stored, decoded in the
+                            kernel. Needs --model and a plugin at +p7 or later
+  --gguf-mode repack|native|mixed
+                            how the file's projections reach the graph (default:
+                            mixed, Q4_K repacked and every other type native rows)
+  --gguf-native             alias for --gguf-mode native
+  --gguf-mins exact|shared|nibble|split
+                            the repacked projections' mins packing (default: exact,
+                            +12.5% on the Q4_K set; shared +6.25%, nibble +3.1%,
+                            both inexact; split: the min term a separate term on
+                            the group sums, K the model's, a decode lever)
+  --gguf-q6k aligned|file   native Q6_K rows in 224-byte dword-aligned blocks
+                            (default: aligned) or the file's own 210-byte rows
+  --gguf-embed file|template
+                            the token embedding rows from the file, dequantised on
+                            the host per token (default), or the template's
+  --gguf-check once|always  keep each repacked projection's deviation verdict
+                            between loads of the same file (default) or re-check
+  --ngram-gguf FILE         the GGUF shard whose per_layer_token_embd.weight binds
+                            the IR's ngram_table.K ports (a serving-shape IR that
+                            carries the n-gram table as ports). Opened for that
+                            tensor only: no template rewrite, no geometry check.
+                            Refused with --gguf, and when the IR declares no ports
+  --flash-next-ngram PATH   Flash-Next per_layer_token_embd table (24-byte
+                            ARCINGRM header + block-quantised payload). The
+                            artifact's config.json must declare an n-gram table
+                            (ngram_size, ple_embed_dim, ...) or the file is
+                            refused. Design: docs/design-qwen-flash-next.md FIX D.
+  --dyn-quant on|off        the runtime's per-token int8 activation quantization on
+                            compressed weights; default: the runtime's own for an IR,
+                            off for a GGUF-opened model (f16 activations reproduce the
+                            native path's greedy output byte for byte, at the same rate)
   --dflash DIR              DFlash2 block drafter directory (7 drafts per
                             verify pass; greedy only, like --mtp). One
                             drafter per server: conflicts with --mtp on
@@ -883,63 +355,54 @@ any of them flips the served sampler provenance to 'operator')
 
 misc
   -v, -vv                   raise console verbosity
+  --flash-next-offload-plan HIT
+                            print the Flash-Next expert-offload serving
+                            plan for the target card at measured per-layer
+                            LRU hit-rate HIT (0..1), then exit (WP7 dry-run)
+  --inspect-artifact        with --model PATH, print the artifact contract
+                            the runtime drives (geometry, segment chain,
+                            expert-body blob, the one buffer set it implies,
+                            whether the allowlist admits the directory) and
+                            exit. Device-free; the directory needs no entry
+                            yet -- reading a contract is what precedes a pin.
   --version                 print version and exit
   -h, --help                print this help and exit
 ```
 
 ## Layout
 
-- CHANGELOG.md: per-release changes and the runtime dependency (patch level)
-  each release was built against; the Debian changelogs under contrib/ are the
-  package record.
-
-- README.md: intro, building, the prefill/decode benchmark (the MoE coder on
-  the 16 GiB card, the dense agent on the 24 GB card), supported model formats.
-- FURTHER-READING.md: everything the README used to carry — the full measured
-  record, scope, artifact provenance, features, non-goals, status, deploying,
-  why-not-X — linked from the README's foot.
-- DESIGN.md: architecture (§3), caching (§3.3–3.4), MTP (§3.5), serving (§4),
-  test gates (§5), evidence against upstream pipeline layer (§6),
-  milestones M0–M5 (§7), open questions (§8).
+- README.md: what arcint is, models, current numbers, building, formats.
+- FURTHER-READING.md: the longer measured record, scope, artifact
+  provenance, features, deployment notes.
+- DESIGN.md: architecture (3), caching (3.3-3.4), MTP (3.5), serving (4),
+  test gates (5), measurement record (7).
 - DEVELOPMENT.md: hardware, dependencies, how to run the suites.
+- CHANGELOG.md: per-release changes and the runtime patch level each
+  release needs.
+- docs/campaigns/: one document per open defect or lever, plus the
+  research-*.md surveys of prior art (research-reference-audit.md first).
+- docs/: design notes, acceptance records (window-05x.md), the card-window
+  procedure (sop-card-window.md), the release checklist (generated).
 - models/allowlist-raw.json: raw IR metadata, the allowlist's provenance.
-- src/: config, util/ (log, utf8, text), core/ (model_registry, sampling,
+- src/: config, util/, core/ (model_registry, artifact, gguf, sampling,
   stop, toolcall, chat, prefix_cache, block_pool, turnstile), exec/ (backend
-  interface, stub, backend_ov), api/ (error, handlers), http/ (cpp-httplib
-  wiring).
-- tests/: two ctest label sets. `unit` (what bare ctest runs, device-free): 430
-  cases, 438 with the OpenVINO backend (hand-rolled harness, no framework; a
-  skip is a failure unless named, --max-skips 0), roundtrip.sh (64 curl checks),
-  concurrency/stress.sh (lane accounting, stub-only), and the acceptance
-  enumeration's own consistency check and runner self-test. `acceptance`
-  (registered only under -DARCINT_ACCEPTANCE=ON with the OpenVINO backend):
-  the card-requiring cells enumerated in tests/acceptance/cells.json and run by
-  tests/acceptance/run.py (an unnamed skip fails the run); equivalence/run.sh
-  and concurrency/run.py are its runners; the one external cell (the
-  Prüfstand) runs the operator's wrapper named by the run manifest's
-  `pruefstand` key and gates its score as an ordinary metric.
-  docs/release-checklist.md and the DESIGN §5.1 acceptance row are generated
-  from that enumeration.
-- third_party/: cpp-httplib 0.18.3, nlohmann/json 3.11.3, single headers.
+  interface, stub, backend_ov, fit, n-gram staging), api/, http/.
+- tools/: exporters (export_serving_artifact.py, export_mtp.py,
+  export_dflash.py, q4e/), reference and KLD tooling, probes.
+- tests/: `unit` label (bare ctest, device-free: arcint-test, roundtrip.sh,
+  concurrency/stress.sh, the acceptance enumeration's self-checks) and
+  `acceptance` label (-DARCINT_ACCEPTANCE=ON with OpenVINO: the card cells in
+  tests/acceptance/cells.json, run by tests/acceptance/run.py; every skip
+  named or the run fails). docs/release-checklist.md and the DESIGN 5.1
+  acceptance row are generated from cells.json.
+- third_party/: cpp-httplib, nlohmann/json, single headers.
 
 ## Build
 
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure -L unit
 ./build/arcint --stub --port 8090 -v
 
--DARCINT_OPENVINO=ON is reserved for the executor and refuses to configure
-until M1; --model is refused at startup meanwhile, so --stub is the only way
-in. -DARCINT_WERROR=ON is warning-clean. Clean under ASan+UBSan with
--fno-sanitize-recover, but ASan must run on x86_64: it aborts at
-startup on aarch64 containers.
-
-## Provenance
-
-Design grounded in 2026-08 fleet measurement campaigns (ARCstory B5–B14):
-OpenVINO 60 t/s vs Vulkan 7.9 t/s on B60 for the same checkpoint; SE
-calibration degenerates greedy on dense Qwen3.8; OV GenAI CB path diverges
-from stateful under greedy (upstream issue 4367, CI equality test skipped
-since 2025-02); OV model-cache import bug and workaround (upstream issue
-37607). Performance bar: beat 60 t/s (27B q4, B60) while holding the
-equivalence invariants.
+-DARCINT_OPENVINO=ON builds the serving backend against the pinned OpenVINO;
+-DARCINT_WERROR=ON is warning-clean; ASan+UBSan clean on x86_64 (ASan aborts
+at startup on aarch64).

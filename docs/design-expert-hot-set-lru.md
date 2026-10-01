@@ -1,364 +1,82 @@
-# expert-hot-set-lru — the census instrument and the policy it feeds
+# expert-hot-set-lru — a GPU expert cache that follows the conversation
 
-Campaign: `docs/campaigns/expert-hot-set-lru.md` (0.5.2 VENICE).
-Acceptance: `docs/window-052.md`.
-Gate: warm-up decode ≥ G × the host-bound baseline (G pinned before the
-speed leg); stale-byte zero proof with a red-first eviction mutation;
-rounds-to-plateau printed with the census; DESIGN §3.4 output unchanged.
-The speed leg is **HELD** for `sub4bit-vram-kernel` step 3 (the OpenCL
-decode of the native formats) per the operator decision of 2026-09-21 —
-the census instrument and the policy land on the host-tier path first.
+Campaign: `docs/campaigns/expert-hot-set-lru.md`. Lever 1 of
+`docs/campaigns/research-reference-audit.md`. Open, in progress.
 
----
+## Mechanism to build
 
-## §1 — what the census is for, and why the existing instrument is not it
+1. **One pool for all layers, sized in bytes.** The card's expert slots form a
+   single pool keyed by the flat id `layer * num_experts + expert`; any slot
+   may hold any layer's expert. Each slot is sized to its layer's expert bytes,
+   not to the largest expert. The budget is what the card has left after
+   weights, KV and activations.
+2. **Start from a profile, then adapt.** At load, fill the pool with the
+   highest-ranked `(layer, expert)` pairs of a routing profile recorded in the
+   regime that will be served (decode-heavy traffic: a decode census). While
+   serving, keep a decayed per-expert usage count; every few rounds rank the
+   swap candidates across all layers by gain (a missed expert's usage minus the
+   least-used resident one's) and swap a bounded batch.
+3. **Never wait on a swap.** The evicted expert is marked non-resident at once
+   (the CPU tier computes it meanwhile); the new one is copied from pinned host
+   memory on its own queue and becomes resident when its copy has landed.
+4. **Misses** go to the CPU tier or are fetched to the card by the split in
+   `docs/design-routing-aware-expert-execution.md`.
 
-The policy has two consumers, and they need different facts:
+## Reference implementations
 
-1. **Hot-set selection** needs a *frequency rank per `(layer, expert)`* over
-   a calibration corpus: which `S` experts per layer are worth pinning.
-2. **The LRU replay and convergence** need *ordering*: which `(token, layer)`
-   routed which experts, so the per-layer LRU's hit rate and
-   rounds-to-plateau can be replayed offline (`tools/expert_lru_replay.py`).
+- **Strata** (`~/src/Strata-ref`, written for Qwen3.8-Flash-Next on one GPU
+  plus RAM). `src/program/generate.cpp` lines 4414-4484: the `adapt` step (from line 4430)
+  keeps `drive.d.usage` per `(layer, expert)`, ranks swaps across all layers by
+  gain (candidate usage at least 2.0 and 1.5 above the victim), keeps the top
+  `adapt_swaps`, issues `cudaMemcpyAsync` from the host blob into the victim's
+  slot on `adapt_stream`, marks the victim `kNotResident` at once, admits the
+  new expert in `apply_pending` when the event has completed (lines 4414-4428),
+  and decays every count by 0.7. Defaults: `adapt_every = 4` rounds,
+  `adapt_swaps = 96` (lines 356-380). The slot store and the profile reader are
+  `src/core/expert_cache.cpp` (`ExpertCache::open_sized` takes per-layer slot
+  bytes); the profile is built by `tools/make_profile.py`. `code`
+- **Strata's measured effect** (its paper, `docs/paper/Strata-Paper.pdf`,
+  §3.4 and Lessons 4 and 8): a profile-filled cache serves 50 % of routed
+  experts from 4,500 VRAM slots; adaptive swapping raises that to about 72 %
+  (0.72 at 4K context on the 12 GB card); sizing slots per layer in bytes fits
+  3,556 experts instead of 2,673 and raised decode by 13 % at 1K. `paper`
+- **FreeToken** (`~/src/FreeToken-ref`): `python/freetoken/moe/offload_cache.py`
+  keeps one LRU slot pool shared by all layers (`slot_for_id`, `id_of_slot` over
+  the flat id, lines 169-184), makes the routed experts resident and rewrites
+  their ids to slot ids on the GPU (`ensure_experts`, line 843;
+  `moe/offload_kernels.py` lines 19-41), and copies only the missing rows
+  (`copy_missing`, line 1011). Details in `docs/research-freetoken.md` §1.
+  `code`
 
-Patch 0013 delivers (1) as an aggregate CSV and deliberately counts before
-the hit/miss split, so it is the right *counting site* (`code`, patch 0013
-header). It does not deliver (2) and its one short-corpus run left the
-distribution too sparse to threshold on (`measured-here`, DESIGN §7.0.2ah).
-This note names the storage and format for both, and the sources that
-produce them.
+## What arcint already has
 
-## §2 — the canonical per-token trace (format v1)
+- **The census instrument.** Patch 0044 (`MOE_OTD_ROUTING_TRACE=<path>`)
+  writes one line per routed call; `tools/hot_set_census.py` converts it to the
+  v1 trace (`token layer id...`, ids ascending, provenance header required) and
+  to the `layer,expert,count` census, and `select` emits a v2 seed keyed by
+  `layer_key`. Patch 0046 (`MOE_CPU_TIER_SEED=<path>`) loads such a seed into
+  the static partition and refuses a malformed or mismatched file. `code`
+- **Replay and policy tools.** `tools/expert_lru_replay.py` (per-layer and
+  global LRU) and `tools/expert_policy_compare.py` replay a trace at a budget.
+  Measured on the served Flash-Next census (A770, window 003, 512 decode tokens
+  scored after calibrating on prefill): demand-warm per-layer LRU 55.6 % at 32
+  slots per layer and 69.2 % at 64, a static census seed 21.2 % and 38.5 %. On
+  the WP6b trace a single global LRU pool reads 93.8 % at a 16 GiB resident
+  budget against 88.1 % per layer. A seed calibrated on prefill under-predicts
+  decode hotness about 4x. `measured-here`
+- **Served today**: B60, Flash-Next `d48q8`, static partition: a 36 % GPU hit
+  rate, 6.6 t/s decode at 20–27k tokens. `measured-here`
+- **Device slots under a byte budget** for the per-expert route (patch 0070,
+  `ARCINT_MOE_DEVICE_POOL_BYTES`) and a host RAM bank for the CPU tier (patch
+  0072). `code`
 
-One line per `(token, layer)`, byte-for-byte the format
-`tools/expert_lru_replay.py::load_trace` already parses, so no consumer
-changes:
+## Gate
 
-```
-# arcint routing trace v1
-# artifact_sha256=<sha256 of the served .xml/.bin pair, or the GGUF shard set>
-# capture_sha256=<sha256 of the prompt-token capture replayed>
-# card=<PCI id, e.g. 8086:E211> device=<ov device> depth=<n layers>
-# kv=<precision> f16=<on/off> chunk=<n> offload_ratio=<pct> tier=<static|lru|off>
-# run=<run id> utc=<ISO-8601> tool=<producer>
-0 0 3 17 88 210 411 455 477 501
-0 1 5 9 44 121 200 300 388 490
-1 0 2 3 8 17 88 155 210 477
-...
-```
+The answer-level bar in `CLAUDE.md` against the static partition on the same
+card and window (facts, needle, task battery; mean KL at most 0.03 nats worse;
+argmax agreement down by at most 1 point), and a decode rate above the static
+partition's at the same budget, with the GPU hit rate printed. Copied expert
+bytes stay exact: a host-versus-slot digest per resident expert, with a
+red-first mutation on the swap path.
 
-**Grammar.** `token_idx`, `layer_idx`, then `top_k` expert ids, all
-non-negative decimal integers, whitespace-separated. `#` and blank lines are
-comments and are skipped by every reader. Token indices are positions in the
-replayed window, `0`-based and contiguous; layer indices are `0`-based. Ids
-are written **ascending** (deterministic order, independent of the router's
-internal order); a repeat within one `(token, layer)` row is impossible
-because a router selects distinct experts.
-
-**Provenance.** The `#` header carries the artifact/capture digests and the
-`card/device/depth/kv/f16/chunk/offload_ratio/tier` configuration exactly as
-the measurement discipline requires ("name the card, the depth, the KV
-precision and the configuration whenever a number moves", `CLAUDE.md`). The
-trace's own sha256 is recorded wherever it is cited. A trace without a
-provenance header is not a census.
-
-**Storage.** Plain UTF-8 text; gzip is the transport (`.trace.gz`), never
-the on-disk form a reader parses. One trace per calibration corpus per
-configuration. Size estimate at Flash-Next geometry: 48 layers × `top_k` 10
-× ~10 bytes ≈ 4.9 KB/token before gzip, so a 100k-token corpus is ~0.5 GB
-raw, ~0.1 GB gzipped — acceptable on a persistent path, never `/tmp`.
-
-## §3 — the aggregate histogram (patch 0013 retained, provenance added)
-
-The existing plugin dump is **not** the census summary this campaign
-consumes, and the two must not be conflated. They are separate schemas:
-
-**The canonical census summary VENICE consumes** is derived from the trace
-by `tools/hot_set_census.py`, in the trace's own layer-index space:
-
-```
-# <the same provenance header the trace carries>
-layer,expert,count
-0,3,1482
-...
-# total,<T>
-```
-
-`layer` is the 0-based decoder-layer index of format v1, so the summary
-joins the trace directly; `expert` is ascending; the `# total,<T>` trailer
-sums `count`. The counting site is the trace's router top-k.
-
-**Patch 0013's plugin dump is a separate counter.** Its consumer contract
-(its own round-two header, `code`,
-`patches/0013-moe-otd-routing-histogram.patch:279-281`) is
-`layer,weight_offset,expert,count` ordered by `weight_offset`, where `layer`
-is the **0-based rank of the layer's weight-file offset among the layers the
-process saw** (export order), not the decoder-layer index; `#` lines are
-skipped and the trailer is `# total,<T>` (`:440`). It is emitted at process
-exit and counts before the hit/miss split. It is retained as a plugin-side
-cross-check: it can be joined to the trace on `weight_offset` once the
-offset map is exported, but it is **not a pure function of the trace** (a
-trace carries neither `weight_offset` nor the process's rank), so no
-byte-for-byte reproduction is claimed.
-
-## §4 — sources
-
-**(a) Device-free reference-router trace — built first.** The exact f32
-reference forward (`tools/ref_forward_stream.py`) runs the pin's own model,
-including every layer's router. A `--router-trace PATH` flag taps each
-layer's top-k ids and emits format v1 **on the host, with no card** — its
-provenance header records `card=none device=cpu`, the device-free placeholder
-the format allows (a card-derived trace records the PCI id). This is
-the bootstrap source and the device-free oracle: it fixes the format, the
-reader, the replay and the convergence metric before any GPU window.
-
-Its limit is stated up front: the reference router is **not** the served
-router. Quantisation and the served graph's arithmetic perturb near-tied
-routers (the campaign record puts the top-10 mass at 6–27 % with margins
-1e-4…1e-6, `measured-here`, `sub4bit-vram-kernel` status). The reference
-trace is a **proxy** for format/consumer development and an independent
-check, never the policy's calibration input.
-
-**Measured limit (2026-09-21).** The reference source **dequantises every
-expert tensor** before each layer's SparseMoeBlock runs — the pre-hook
-`ref_forward_stream.py:191-208` loads the full `[E, …]` gate/up/down tensors
-regardless of routing, while the pin's own `Qwen4ExpTextExperts` loop is
-sparse over the hit experts (`code`, transcribed in `tools/q4e/ref_moe.py`).
-A smoke run at 1 layer and T = 5 measured
-`[forward] T=5 in 119.3s (expert loads 117.8s over 1 layers)`
-(`measured-here`, `--device cpu`): the load was ~118 s in the persisted run (a
-prior run of the same smoke read ~68 s, so it is I/O-warmth dependent),
-**per layer and independent of T**, and it repeats on every forward
-call/window. The 48-layer
-long-corpus cost is therefore a **projection** (hours per window; no 48-layer
-reference run was attempted), and the reference trace is a **short-corpus**
-format/consumer oracle only. The **long-corpus census must come from the
-served emitter** (§4b), not this proxy. Smoke artifacts on a persistent path,
-for the record: trace sha256 `4659806b1544cd2d978b0ba5737c62761881efdc309a25e6915cccdc5ef449c0`,
-log sha256 `3c2404abfe4ab6e7baae9e7020e40c6276f4e1c7ac8e7f0fea79cefcb1b0fe4c`.
-
-**(b) Served-path trace — the authority.** A new opt-in dump channel
-(`MOE_OTD_ROUTING_TRACE=<path>`) beside patch 0013's histogram. Patch 0044
-(landed 2026-09-21) appends one line per `try_acquire_simultaneous` call —
-`<call_seq> <layer_key> <top_k> <expert id...>` — at the same site patch
-0013 counts (before the dedup/hit-miss split), flushes each line so a
-`SIGKILL` does not lose a window, and keys the layer by the structural
-`layer_key`, not the construction-order `layer_seq_id`. The token index is
-**not** in the row; `tools/hot_set_census.py`'s `from-call-trace`
-reconstructs it offline (§5). Use a FRESH path per window: the emitter opens
-with append and the counter restarts per process, so a reused path merges
-runs. One card window produces it; the trace is the calibration input the
-hot set is chosen from. **Card decided before the leg: the A770**
-(bit-identical served depth-48 ×8); a B60 census would inherit the B60's
-GDN nondeterminism (DESIGN §7.0.2cb) and would require a run-to-run spread
-statement beside the counts. **Owed:** the window harness must inject the
-provenance header (§2: artifact/capture digests, card, depth, kv, chunk,
-ratio, tier, run, utc) — the plugin cannot know them, so until it does the
-converted trace is not yet a census by §2's own rule. **2026-09-21: this is
-now ENFORCED in the converter** — `from-call-trace` requires `--provenance`
-and refuses a file without a NON-EMPTY `artifact_sha256=` (or `artifact=`) and
-`card=`, so a census with no artifact or card attribution cannot be written;
-the remaining §2 fields (`capture_sha256`, `kv`, `depth`, `chunk`,
-`offload_ratio`, `tier`, `run`, `utc`) stay the harness's responsibility and
-are **not** machine-checked here — the gap is narrowed, not closed. The same
-commit added **`--skip-batched`**: a served trace
-opens with the batched prefill call, which the decode converter otherwise
-refused; the skip is REPORTED (call and token counts written into the v1
-header), and an all-batched trace is still refused rather than converted to an
-empty census.
-
-**(c) Corpus.** The acceptance prompt is too short (measured). The census
-corpus is a long, fixed, published-in-digest-only document set replayed
-through the served path — one window, recorded with its token count, so the
-same corpus can be replayed after the policy lands.
-
-## §5 — consumers
-
-1. **Hot-set selection.** `tools/hot_set_census.py --trace T --slots-per-layer
-   S` ranks each layer's experts by trace count, ties broken by ascending
-   expert id, and emits the static-partition seed as `(layer, expert)`
-   membership plus the rank in **trace layer-index space**. Patch 0018 keys
-   its static partition by `layer_key` — the layer's first OTD weight-file
-   offset (`code`, patch 0018 header), the same structural key patch 0013's
-   CSV calls `weight_offset` — so the instrument also exports the
-   decoder-index→`layer_key` map (from the served graph's own layer
-   enumeration); v2 emits the membership in ONE space (the one the header
-   declares) plus that map as a header comment. `S` comes from the
-   measured device-pool budget
-   (`ARCINT_MOE_DEVICE_POOL_BYTES` / the fit's `expert_slot_bytes_static`),
-   not from a guess.
-
-   **2026-09-22: `select` emits format v2, and the plugin consumes it
-   (patch 0046).** The seed is one line per layer, `<layer_key> <expert>
-   <expert> ...`, with a MANDATORY `# space=layer_key` header.
-   `--census <layer,expert,count CSV>` is the CORPUS census (every selected
-   call's routed ids, batched prefill included), not the decode-only v1
-   rows: seeding from the regime served is the measured rule above.
-   `--layer-keys <JSON decoder-index -> layer_key>` keys the file by the
-   structural `layer_key`. A map-less seed declares `# space=layer`, and the
-   plugin parser REFUSES it -- a decoder-index seed can no longer be silently
-   consumed as a `layer_key` seed. The parser and its validation are
-   `census_seed.hpp` in patch 0046. The per-run env `MOE_CPU_TIER_SEED=<path>`
-   is READ at provider construction and this layer's entry is validated there
-   (so a mismatched file refuses the load); the validated membership is then
-   APPLIED at `bind()`. The incumbent `splitmix64` path is the default when
-   the env var is unset.
-2. **LRU replay.** The same trace feeds `tools/expert_lru_replay.py`
-   unchanged: per-layer hit rate at `S`, cross-token reuse, and the
-   **comparand** — the demand-warm LRU and patch 0018's random
-   `splitmix64` seed — so the policy's gain is a delta against a measured
-   baseline in one window, per `partition-seeding`'s gate shape.
-   **2026-09-21: the comparand is now an instrument of its own** —
-   `tools/expert_policy_compare.py` (+ 33 red-first cells), which replays all
-   three policies at one budget and refuses an in-sample frequency seed.
-   MEASURED on window 003's served census, in TWO protocols: calibrating on
-   the prefill census and scoring the held-out decode, the incumbent sits at
-   CHANCE at every budget (0.92–1.10× `slots/512`) while the census seed
-   reaches 2.79–3.39× chance (6 slots/layer: 3.658% vs 1.289%, chance 1.172%);
-   calibrating on the FIRST HALF of the decode and scoring the SECOND half —
-   same regime on both sides — the census seed reaches 12.45× chance at 6
-   slots/layer (14.591% vs 1.262%), beats the demand-warm LRU at 10 slots/layer
-   (21.659% vs 18.127%) and TIES it at 16 (29.563% vs 29.548%). **The
-   calibration REGIME decides the win**: a prefill-derived census
-   under-predicts decode hotness by ~4×, so the corpus a hot set is seeded from
-   must be the regime that will be served. The comparand — a TRUE LRU, promoted
-   on hit — is worst at the ratio-99 budget (0.219%: cold) and best above ~10
-   slots/layer IN PROTOCOL A (20.954% at 10, 69.164% at 64), where the census
-   seed is only 2.79–3.39× chance; the answer is therefore budget- and
-   protocol-dependent — static census seed at the tight budget, demand-warm LRU
-   once the budget can warm. The incumbent replica is **cross-language
-   verified**: the patch's `static_partition.hpp`, reconstructed from
-   `0018-*.patch` and compiled with `g++ -std=c++17`, prints exactly the values
-   the Python cells pin.
-3. **Rounds-to-plateau.** The replay is run over trace prefixes of length
-   `1, 2, 4, ...` tokens; plateau is the first prefix length `r` at which
-   the selected hot set per layer is **unchanged** for two consecutive
-   prefixes and the aggregate **hot-set coverage** (the fraction of routed
-   accesses in a layer's selected set -- the static-partition fraction, not
-   the LRU hit rate) moves by less than the stated epsilon. `r` is printed
-   with the census. In the served run the same quantity is observed as the
-   first forward after which the resident set stops changing.
-
-## §6 — stale-byte zero proof
-
-Two digests per hot-set expert `E`, taken in the same process:
-
-- `host_digest(E)` — the bytes the host pool hands the miss tier
-  (`ParallelWeightReader::mapped(offset, size)` over the same file
-  `positional_read()` opens, patch 0011).
-- `card_digest(E)` — the bytes read back from the device slot that E
-  occupies.
-
-Requirement: `host_digest(E) == card_digest(E)` for every `E` in the hot set.
-
-**Red-first.** Before the equality check exists, a mutation cell perturbs one
-byte on the eviction/refresh path (a wrong slot, a stale upload, an
-off-by-one copy) and asserts the digest row goes **RED**. The mutation is
-removed and the row must go green on the same input. A digest check that
-cannot fail on a deliberately wrong byte measures nothing
-(`CLAUDE.md`: a test must be able to fail).
-
-**Evidence class.** `host_digest`/`card_digest` are engine-side readbacks;
-the mutation is a test-only fault injection. When the readback path itself
-does not exist yet, the proof is **not started** — it is not asserted from
-code inspection.
-
-## §7 — red-first cells (device-free first)
-
-1. `tools/test_hot_set_census.py` (**landed 2026-09-21**, 66 cells; stdlib,
-   no card) — parser accepts format v1 and refuses a malformed row; the
-   canonical summary is sorted, total-preserving and pure of row order;
-   selection is budgeted and tie-breaks on the ASCENDING id; coverage clears
-   the random baseline; plateau returns the first stable prefix and refuses
-   one for a never-stabilising ranking; patch 0013's four-column CSV parses,
-   refuses a three-column row and a wrong `# total,`, and joins the trace on
-   `weight_offset`; `write_router_trace` emits token-major rows with ids
-   ascending. The patch-0044 converter cells pin the two silent-if-wrong
-   assumptions: a two-token call splits into the right `top_k` chunks while a
-   mis-sized call is REFUSED; the `layer_key` -> decoder-index map is a
-   bijection over the observed keys or the conversion refuses; a batched call
-   is refused by the decode converter, `skip_batched` skips and COUNTS it while
-   keeping the decode rows, an all-batched trace is refused even with the skip
-   (never an empty census), and the CLI refuses a missing, incomplete or
-   empty-valued provenance file (`artifact_sha256=`/`artifact=` and `card=`
-   required) while both §2 spellings are accepted and the stdout path still
-   emits a parseable v1 trace. The corpus-split cells pin the aggregate
-   census: `census_from_call_trace` counts EVERY id of every selected call
-   (batched prefill included), which MUST differ from the decode-only v1
-   summary on a trace carrying a batched call; `join_plugin_to_call_trace`
-   joins patch 0013's CSV on the RAW `layer_key`; `--from-call-seq` is wired
-   through the census, the converter and the join, and a floor that selects
-   none of the calls is REFUSED rather than written as an empty census. Both
-   new CLI paths (`census-from-call-trace`, `join-plugin-call-trace`) have a
-   cell.
-2. **Stale-byte digest cell — not started.** It needs the engine-side
-   host/card readback of §6, which does not exist yet; per §6 it is **not
-   asserted from code inspection**. Forcing it device-free would be measuring
-   the host against itself, not host against card.
-3. **Served-path trace cell — RUN 2026-09-21.** [measured-here; see the
-   campaign status entry of 2026-09-21 for the numbers] One card window **on
-   the A770**
-   (the B60's GDN nondeterminism would make its counts move), a fresh trace
-   path, the provenance header injected by the harness (now enforced by the
-   converter, §4b), `--skip-batched` with its skip counts read back from the v1
-   header, the trace/histogram agreement checked, and — if a B60 census is ever
-   taken — two runs with the count spread printed. **Result:** the window ran;
-   the census is derived from the call trace directly (batched included), the
-   raw-`layer_key` join against patch 0013's CSV matches exactly, the decode
-   rows convert to 512 x 48 v1 rows, and the chosen ranking does **not**
-   plateau within 512 decode tokens at S = 6 or S = 10 (V3's failing shape).
-
-4. **Policy-comparand cells — RUN 2026-09-21.** [measured-here]
-   `tools/expert_policy_compare.py` (+ 33 cells in
-   `tools/test_expert_policy_compare.py`) pins: patch 0018's rank key against
-   GOLDEN values computed from its own constants (a changed mix, layer-mix
-   constant or seed is caught, not silently accepted); the incumbent's set is
-   deterministic, ascending and edge-correct (0 slots -> empty, >= num_expert
-   -> everything, capacity clamped), with the tie-break pinned to the
-   ASCENDING expert id under a mocked constant rank; the frequency seed is the
-   top-`slots` with an ascending-id tie; the calibration census COUNTS batched
-   calls while the evaluation keeps only single-chunk decode calls and counts
-   the skipped ones; the format is read from the header marker (a v1 row's
-   third field can divide the id count and masquerade as a `top_k`, so a
-   row-guess is refused); and the honesty guard REFUSES an in-sample frequency
-   seed. The measured numbers are in the campaign status entry of 2026-09-21.
-
-5. **Census-seed parser cells — RUN 2026-09-22 (patch 0046).** [measured-here]
-   `tools/test_census_seed.py` EXTRACTS `census_seed.hpp` from
-   `patches/0046-moe-cpu-tier-census-seed.patch`, compiles it with plain g++
-   (the header has no OpenVINO dependency), and runs a driver once per case:
-   a valid v2 seed parses to the right membership; a missing `# space=layer_key`
-   header, a `# space=layer` header, a duplicate `layer_key`, a duplicate
-   expert id, a non-numeric key or id, an empty file and a key-only row are
-   each REFUSED; and `census_seed_resident_experts()` refuses an absent
-   `layer_key`, a slot-count mismatch (pool budget moved since the census),
-   and an expert id `>= num_expert`, while returning the validated set sorted
-   ascending. **14 cells**, green; each refusal was confirmed RED with its
-   check removed (a check that cannot fail measures nothing). The Python
-   side (`tools/test_hot_set_census.py`) gained the v2 emission and census
-   cells: **76 cells**, green (was 66). Verified that the S=5 corpus seed
-   passes validation at capacity 5 and the S=6 seed is refused with the
-   mismatch message.
-
-*Caveat.* `call_trace_to_v1` reconstructs token boundaries from a repeated
-`layer_key`, which is exact only if every layer's calls for one decode step
-precede the next step's. The aggregate `(layer, expert)` counts do not depend
-on the token labels; the LRU replay and rounds-to-plateau do. The emitter's
-integer ids are token-major (`code`, patch 0042 `_config.top_k` layout).
-
-## §8 — evidence classes
-
-| claim | class | source |
-|---|---|---|
-| patch 0013 counts before the hit/miss split | `code` | patch 0013 header |
-| patch 0013's CSV is `layer,weight_offset,expert,count`, ordered by `weight_offset` (`layer` a 0-based rank), trailer `# total,` | `code` | `patches/0013-…:279-281,440` |
-| the short corpus left most experts at 0–2 routings | `measured-here` | DESIGN §7.0.2ah |
-| `expert_lru_replay.py` reproduces WP6b within ~1.4 pts on the sha-pinned trace | `measured-here`/`code` | tool `--check`, docstring |
-| the served d48n host-tier rate is 0.5–0.8 t/s | `measured-here` | `sub4bit-vram-kernel` status; DESIGN §7.0.2ca |
-| every native-format expert runs on the host tier (no resident compute) | `code` | patch 0043's in-code assert `:726-731`; DESIGN §7.0.2ca |
-| the reference router is not the served router (near-tied margins) | `measured-here` | `sub4bit-vram-kernel` status |
-| the census seed beats the incumbent `splitmix64` seed on the census's own hit fraction | `measured-here` | `tools/expert_policy_compare.py`, 2026-09-21 |
-| the calibration regime decides the win (prefill-derived seed under-predicts decode hotness ~4x) | `measured-here` | `tools/expert_policy_compare.py` protocols A/B, 2026-09-21 |
-| the served static partition consumes a census seed keyed by `layer_key`, refusing malformed/mismatched files | `code`/`measured-here` | patch 0046; `tools/test_census_seed.py` 14 cells |
-| residency moves bytes, not arithmetic, under the native artifact (so a seed change should not change the greedy digest) | `code` | patch 0043's in-code assert; the quality row measures it |
-| hot set beats random seed; replay hit rate transfers to served t/s | `HYPOTHESIS` | untested |
+Full history: `git show b0447b8:docs/design-expert-hot-set-lru.md`.
