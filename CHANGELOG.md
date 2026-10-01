@@ -2742,3 +2742,11 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p2` (patches 0003–0013).
   761 launches, 362 syncs. The dense qwen3.8-27b control is ~87 % device-bound,
   so the idle is MoE-specific. Decision: decode overlap (tier off the critical
   path, join late).
+
+- **Idle split on the shape-routed 0074 (decode).** Chrome trace, 18 s decode
+  phase: 50.2 % idle. Tier writeback wait 47.2 ms/token plus tier readback/
+  staging roundtrips 31.3 ms/token dominate; the post-sync gap is 1.3 ms/token
+  (~1 %). Shared-expert device time is ~132 us/layer (6.3 ms/token overlap
+  ceiling). Tier/miss split: 308 CPU-tier experts vs 170 GPU hits per token
+  (36 % hit rate). Decision: tier wait dominates -- no async restructuring;
+  work the tier time and residency.

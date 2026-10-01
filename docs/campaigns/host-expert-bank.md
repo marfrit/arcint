@@ -352,3 +352,41 @@ change. A slot is a hit only for the identical span list. Everything else
     device-bound isolates the idle to the MoE tier. Build **decode overlap**:
     launch the host experts, run the shared expert and the following ops on the
     GPU, and join late.
+
+- 2026-10-01. **Idle split: tier wait vs post-sync.** Same short-prompt setup,
+  fresh processes, shape-routed 0074, B60, services stopped; a 16-vs-80 pair
+  with `MOE_OTD_PERF_LOG=1` and `CLI_ChromePerformanceTiming=1`. Decode 80 tok
+  in 17.19 s. The perf dump exists in the prior 16-vs-528 logs only with the
+  flag, so the pair was re-taken with it.
+
+  **Chrome trace, last 18 s (the decode phase, all device commands merged into
+  one timeline):** device busy 8.97 s, idle 9.03 s -- **50.2 % idle**. Idle
+  split by the command that ends it (>0.2 ms gaps, per decode token):
+
+  | idle bucket | per token | meaning |
+  |---|---|---|
+  | next = `HtoD` (tier writeback) | **47.2 ms** | waiting for the tier's y rows |
+  | copy -> copy | **31.3 ms** | DtoH->MtoH 1.14 s, HtoH->HtoH 0.68 s, DtoH->MtoD 0.51 s -- per-token host readback/staging roundtrips |
+  | kernel -> kernel | 5.7 ms | per-op pipeline bubbles |
+  | after a copy -> kernel | **1.3 ms** | **post-sync gap** |
+  | sub-0.2 ms gaps | 27.3 ms | scatter |
+
+  - **Post-sync is 1.3 ms/token, ~1 % of the idle.** An async-completion build
+    (non-blocking writeback, primitive-set user event) recovers ~1 ms/token.
+  - **Tier writeback wait (47.2 ms) plus the tier's readback/staging
+    roundtrips (31.3 ms) dominate.** The tier path holds ~78 ms/token of the
+    GPU idle.
+  - **Shared-expert ceiling.** `moe_3gemm_swiglu_mlp_down` 91.4 us +
+    `_gate_up` 31.3 us + `_reduce` 9.6 us = **~132 us per layer**, so hoisting
+    it ahead of the join buys at most 132 us x 48 = **6.3 ms/token**.
+  - **Tier/miss split per decode token** (fn_s80 - fn_s16 over 64 tok):
+    **308 CPU-tier experts**, **170 GPU-resident hits**, hit rate **36 %**,
+    47.8 tier layers of 48. The CPU tier is invoked on essentially every MoE
+    layer.
+  - The `avg_cpu_join_wait_us` counter is not wall-consistent (its total
+    exceeds the run wall, so it is double-counted across streams); only the
+    trace's idle is used for the decision.
+  - **Decision (rule as written): tier wait dominates -- do not restructure.**
+    Post-sync is ~1 % of the idle and the overlap ceiling is 6.3 ms/token, both
+    far below the ~78 ms/token the tier path costs. The levers are **tier time**
+    (0074 already adopted) and **residency** (raise the 36 % GPU hit share).
