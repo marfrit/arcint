@@ -680,3 +680,19 @@ paths, lock, raw output) live only in the git-ignored packet
   D3's load barrier. No tracked code; no module load/unload; the arcwell module
   was left loaded and carved; the coordinator's wake lock was left held and
   untouched; both cards left as found.
+
+## Acceptance commit — LISBON, operator-approved re-gating (2026-10-01)
+
+Appended 2026-10-01. The operator re-gated 0.5.3 to two readable rows — the
+**host bank's served gate** and **NVMe-staged serving** — with **cold start
+with nothing prebound** marked owed. Nothing here is a new measurement.
+
+| row | value / status | marker | evidence class | on record |
+|---|---|---|---|---|
+| L-host-bank | the host bank's served gate | **PASS.** B60, one fresh process per arm, 257 greedy tokens each: mapping arm **48.55 s**, bank 46 GiB **38.18 s** (the operator's "38.2 s"); greedy text **byte-identical across arms**; gate met (−18 to −21 %). At 46 GiB: ~16,000 experts filled, 2,161–2,506 demand reads, 0 evictions; the fill read 59.8 GiB sequentially and added ~21 s to the load | `measured-here` | `measured-here` | `docs/campaigns/host-expert-bank.md` 2026-09-28 window table (campaign record); `docs/campaigns/README.md` host-expert-bank row |
+| L-nvme | NVMe-staged serving | **PASS for rows 1–3 of this file.** One B60 two-arm window, ratio 86, plugin `ov-0049`, one artifact: arcwell arm cold TTFT **92.492 s** ≤ host-fed **99.679 s** ≤ `X = 139.5 s` (L1, L2 hold); prefetch depth **4 batches in flight**; `AW_IOC_STATS` arcwell delta `bytes +697,958,400`, `reads +852`, `segments +871`, `batches +4`, `via_host_bounce 0→0`, `max_inflight 220`; host-fed `bytes +0`; boot-child `wait4` `ru_maxrss` **3.697 GiB** both arms ≤ 32 GiB (L4), mid-run VmHWM prefix 3.697 ≤ wait4 (L5), physical sampler minimum 45.86 GiB, 0 watchdog trips; restart determinism on the **A770 host-fed arm**: two cold boots byte-identical `9a7e2e77…9f` (L6). The **arcwell arm's restart determinism stays OWED** (arcwell is B60-only; no bit-readable card can run it), governed by D3's load barrier | `measured-here` | `measured-here` | this file §§1–3 (rows filled 2026-09-24) |
+| L-cold | cold start with nothing prebound | **owed.** The LISBON served cell is the **load-time pinned fill** at ratio 86: the 71 slots/layer are prebound at load, and the row's "cold" drops only the page cache. There is no miss-tier path — the routing warning horizon is **zero layers** (a layer's top-k ids are host-visible only at that layer's own MoE hook), so no fetch can be hidden ahead of the 1.125 ms/expert arcwell cost, and LISBON keeps the host hop as a miss tier (`docs/campaigns/nvme-direct-expert-tier.md`, verdict 2026-09-23; `docs/design-nvme-direct-expert-tier.md`). A true nothing-prebound cold start therefore has no served number. Standing beside it: the served artifact↔store key match exists only at depth 4, and the arcwell arm's byte-identity is judged by the load barrier, not cross-boot | `EMPTY` | `code` / `measured-here` | this file §Dependencies and §3; nvme-direct-expert-tier.md verdict and status log |
+
+**Verdict.** LISBON reads **PASS on L-host-bank and L-nvme**, with the
+**arcwell-arm determinism sub-row** and **cold start with nothing prebound**
+(L-cold) owed with the reasons above.
