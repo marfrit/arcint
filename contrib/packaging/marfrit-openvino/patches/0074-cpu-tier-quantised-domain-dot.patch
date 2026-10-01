@@ -1,0 +1,452 @@
+# Tier hot loop (campaign host-expert-bank): the CPU expert dot in the
+# quantised domain, ggml's approach.
+#
+# The tier's native-format path (IQ3_XXS gate/up, IQ4_NL or Q8_0 down; IQ4_XS
+# arrives in the IQ4_NL layout) dequantised each weight row to f32 and then
+# ran a plain f32 dot -- the decode was ~13 of 15 ms per expert on the dev
+# host. ggml instead dots in the quantised domain: the activation is quantised
+# ONCE per stage to int8 with one scale per 32 values, and maddubs/madd do the
+# arithmetic on the packed bytes. This patch adds that path to the tier's
+# AVX2 file and routes the native formats onto it.
+#
+# Measured (dirac, 8 experts x one job per layer call, IQ3_XXS gate/up + IQ4_NL
+# down, H=2560 I=640, pool of 7, services stopped): 651 us per layer call on
+# the split plan {4,2}, against the pre-0074 tier's ~1.14 ms recorded all in
+# RAM and llama.cpp's own mul_mat_id at ~540 us per layer. That is 1.21x of
+# ggml's, inside the 1.3x bar. A whole-expert schedule was 1007 us: the split
+# plan matters. MOE_CPU_TIER_Q8_DOT=0 restores the pre-0074 routing (A/B).
+#
+# Numerics change: the f16-to-f32 decode is replaced by an int8 activation
+# quantisation, so the cells hold to a stated tolerance, not to bits. The
+# tolerance cell compares against the f32 tier at the served shape; the debug
+# path found the one real bug -- _mm256_sign_epi8 ZEROES the source where its
+# sign byte is 0 (PSIGNB semantics), so the IQ3_XXS sign vector must carry +1
+# for a clear bit, not 0.
+#
+# Files: moe_cpu_expert.hpp (table accessors, a test hook), moe_cpu_expert.cpp
+# (the accessors, and the AVX2 dispatch now accepts the native formats),
+# moe_cpu_expert_avx2.cpp (the quantised stage), and the unit test.
+
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
+@@ -185,6 +185,15 @@
+ // (scalar = true) or by the dispatching one the tier uses; for the unit cells.
+ void decode_native_row_for_test(const QuantMatrix& m, int n, float* out, bool scalar);
+ 
++// arcint (patch 0074, campaign host-expert-bank / tier hot loop). The native
++// lookup tables the quantised-dot path shares (they live in moe_cpu_expert.cpp).
++const uint32_t* iq3xxs_grid_table();
++const uint8_t*  iq2xs_signs_table();
++const int8_t*   iq4nl_values_table();
++
++// arcint (patch 0074). The quantised stage, exposed for the unit cells.
++void compute_stage_q8_for_test(const QuantMatrix& m, const float* x, int n_begin, int n_end, float* out);
++
+ // arcint (patch 0043). One projection stage of the plain-scalar reference:
+ // acc_out[n - n_begin] = dot(x, row n of mat) for n in [n_begin, n_end),
+ // through the affine algebra or the native row decoders by mat.format.
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
+@@ -898,6 +898,12 @@
+         decode_native_row(m, n, out);
+ }
+ 
++// arcint (patch 0074). The lookup tables the AVX2 quantised-dot path needs,
++// exported from this translation unit (they are internal-linkage constants).
++const uint32_t* iq3xxs_grid_table() { return kIq3xxsGrid; }
++const uint8_t*  iq2xs_signs_table()  { return kIq2xsSigns; }
++const int8_t*   iq4nl_values_table() { return kIq4NlValues; }
++
+ void compute_stage_f32(const QuantMatrix& mat, const float* x, int n_begin, int n_end, float* acc_out) {
+     if (mat.format != kQuantFormatU4Affine) {
+         // arcint (patch 0043): a native format decodes the row (scale folded
+@@ -1220,6 +1226,18 @@
+ bool expert_takes_avx2(const ExpertDesc& e) {
+     static const bool have_avx2 = ov::with_cpu_x86_avx2();
+     auto avx2_ok = [](const QuantMatrix& m) {
++        // arcint (patch 0074): the native formats now take the AVX2 path --
++        // compute_stage_avx2 routes IQ3_XXS / IQ4_NL (IQ4_XS) / Q8_0 to the
++        // quantised-domain dot. IQ2_S keeps the scalar reference. The env
++        // MOE_CPU_TIER_Q8_DOT=0 restores the pre-0074 routing (A/B).
++        static const bool q8_dot = [] {
++            const char* v = std::getenv("MOE_CPU_TIER_Q8_DOT");
++            return v == nullptr || std::string(v) != "0";
++        }();
++        const bool native = m.format == kQuantFormatIq3Xxs || m.format == kQuantFormatIq4Nl ||
++                            m.format == kQuantFormatQ8_0;
++        if (native)
++            return q8_dot;
+         return m.format == kQuantFormatU4Affine && (m.group_size < 64 || m.group_size % 64 == 0);
+     };
+     return have_avx2 && avx2_ok(e.gate) && avx2_ok(e.up) && avx2_ok(e.down);
+@@ -1259,8 +1277,17 @@
+     // say, 96 would start mid-block and pair lanes with the wrong elements
+     // (found in review); such shapes take the scalar reference instead.
+     auto avx2_ok = [](const QuantMatrix& m) {
+-        // arcint (patch 0043): the native formats take the scalar reference
+-        // (row decode + dot) until the AVX2 kernel learns them.
++        // arcint (patch 0074): the native formats take the AVX2 path now (the
++        // quantised-domain dot); only IQ2_S stays on the scalar reference.
++        // MOE_CPU_TIER_Q8_DOT=0 restores the pre-0074 routing (A/B).
++        static const bool q8_dot = [] {
++            const char* v = std::getenv("MOE_CPU_TIER_Q8_DOT");
++            return v == nullptr || std::string(v) != "0";
++        }();
++        const bool native = m.format == kQuantFormatIq3Xxs || m.format == kQuantFormatIq4Nl ||
++                            m.format == kQuantFormatQ8_0;
++        if (native)
++            return q8_dot;
+         return m.format == kQuantFormatU4Affine && (m.group_size < 64 || m.group_size % 64 == 0);
+     };
+     if (have_avx2 && avx2_ok(e.gate) && avx2_ok(e.up) && avx2_ok(e.down)) {
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert_avx2.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert_avx2.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert_avx2.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert_avx2.cpp
+@@ -39,7 +39,10 @@
+ #include <immintrin.h>
+ 
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <string>
+ #include <vector>
+ 
+ namespace ov::intel_gpu::ocl::moe {
+@@ -254,7 +257,131 @@
+ }
+ 
+ 
++// arcint (patch 0074, campaign host-expert-bank / tier hot loop). The
++// quantised-domain dot ggml uses: the activation is quantised ONCE per stage
++// to int8 with a per-32-value scale, and the packed weight is dotted directly
++// (no f32 row materialisation). Copied in approach -- not in code -- from
++// llama.cpp's ggml-cpu vec_dot_iq3_xxs_q8_K / vec_dot_iq4_nl_q8_0 /
++// vec_dot_q8_0_q8_0 (pinned clone 56b9eb28, MIT): maddubs of the unsigned
++// weight magnitude against the sign-flipped q8, madd to int32, one scale
++// product at the end. IQ4_XS arrives in the IQ4_NL layout (scales folded into
++// s), so it takes the IQ4_NL branch. The result is not the f32 decode+dot's
++// bits -- the activation rounding is new -- but it is deterministic.
++inline float hsum_i32_8(__m256i v) {
++    __m128i lo = _mm256_castsi256_si128(v);
++    __m128i hi = _mm256_extracti128_si256(v, 1);
++    __m128i s = _mm_add_epi32(lo, hi);
++    s = _mm_hadd_epi32(s, s);
++    s = _mm_hadd_epi32(s, s);
++    return static_cast<float>(_mm_cvtsi128_si32(s));
++}
++
++void compute_stage_q8_avx2(const QuantMatrix& mat, const float* x, int n_begin, int n_end, float* acc_out) {
++    const int ic = mat.ic;
++    const int groups = ic / 32;
++    std::vector<float> da(static_cast<size_t>(groups));
++    std::vector<int8_t> qa(static_cast<size_t>(ic));
++    for (int g = 0; g < groups; g++) {
++        const float* xb = x + g * 32;
++        float amax = 0.0f;
++        for (int j = 0; j < 32; j++) {
++            const float a = std::fabs(xb[j]);
++            if (a > amax) amax = a;
++        }
++        const float d = amax / 127.0f;
++        da[static_cast<size_t>(g)] = d;
++        if (d == 0.0f) {
++            std::memset(qa.data() + static_cast<size_t>(g) * 32, 0, 32);
++            continue;
++        }
++        const float inv = 1.0f / d;
++        for (int j = 0; j < 32; j++) {
++            float r = std::nearbyint(xb[j] * inv);
++            if (r > 127.0f) r = 127.0f;
++            else if (r < -127.0f) r = -127.0f;
++            qa[static_cast<size_t>(g) * 32 + j] = static_cast<int8_t>(r);
++        }
++    }
++
++    const bool is_iq3 = (mat.format == kQuantFormatIq3Xxs);
++    const bool is_nl  = (mat.format == kQuantFormatIq4Nl);
++    const uint32_t* grid = iq3xxs_grid_table();
++    const int8_t* nlvals = iq4nl_values_table();
++    const __m128i nl_tbl = _mm_loadu_si128(reinterpret_cast<const __m128i*>(nlvals));
++    const __m128i lo4 = _mm_set1_epi8(0x0F);
++    static uint64_t sign64[128];
++    static const bool sign64_init = [] {
++        const uint8_t* st = iq2xs_signs_table();
++        for (int i = 0; i < 128; i++) {
++            const uint8_t b = st[i];
++            uint64_t v = 0;
++            for (int j = 0; j < 8; j++)
++                // _mm256_sign_epi8 ZEROES the source where the sign byte is 0
++                // (PSIGNB semantics), so a clear bit must be +1, not 0.
++                v |= (b & (1u << j)) ? (0xFFULL << (8 * j)) : (0x01ULL << (8 * j));
++            sign64[i] = v;
++        }
++        return true;
++    }();
++    (void)sign64_init;
++
++    for (int n = n_begin; n < n_end; n++) {
++        const size_t wstride = is_iq3 ? static_cast<size_t>(groups) * 8u
++                             : is_nl ? static_cast<size_t>(ic) / 2u
++                                     : static_cast<size_t>(ic);
++        const uint8_t* row = mat.w + static_cast<size_t>(n) * wstride;
++        const uint16_t* sc = mat.s + static_cast<size_t>(n) * static_cast<size_t>(groups);
++        const uint8_t* zrow = is_iq3 ? mat.z + static_cast<size_t>(n) * static_cast<size_t>(groups) * 4u : nullptr;
++        float acc = 0.0f;
++        for (int g = 0; g < groups; g++) {
++            const __m256i q8 = _mm256_loadu_si256(
++                reinterpret_cast<const __m256i*>(qa.data() + static_cast<size_t>(g) * 32));
++            __m256i dot16;
++            if (is_nl) {
++                const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + static_cast<size_t>(g) * 16));
++                const __m128i lo = _mm_and_si128(b, lo4);
++                const __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), lo4);
++                const __m128i c0 = _mm_unpacklo_epi8(lo, hi);
++                const __m128i c1 = _mm_unpackhi_epi8(lo, hi);
++                const __m256i v = _mm256_set_m128i(_mm_shuffle_epi8(nl_tbl, c1), _mm_shuffle_epi8(nl_tbl, c0));
++                dot16 = _mm256_maddubs_epi16(_mm256_abs_epi8(v), _mm256_sign_epi8(q8, v));
++            } else if (!is_iq3) {
++                const __m256i v = _mm256_loadu_si256(
++                    reinterpret_cast<const __m256i*>(row + static_cast<size_t>(g) * 32));
++                dot16 = _mm256_maddubs_epi16(_mm256_abs_epi8(v), _mm256_sign_epi8(q8, v));
++            } else {
++                const uint8_t* gx = row + static_cast<size_t>(g) * 8u;
++                const uint8_t* sx = zrow + static_cast<size_t>(g) * 4u;
++                const __m256i gv = _mm256_set_epi32(static_cast<int>(grid[gx[7]]), static_cast<int>(grid[gx[6]]),
++                                                    static_cast<int>(grid[gx[5]]), static_cast<int>(grid[gx[4]]),
++                                                    static_cast<int>(grid[gx[3]]), static_cast<int>(grid[gx[2]]),
++                                                    static_cast<int>(grid[gx[1]]), static_cast<int>(grid[gx[0]]));
++                const __m256i sv = _mm256_set_epi64x(static_cast<long long>(sign64[sx[3] & 127]),
++                                                     static_cast<long long>(sign64[sx[2] & 127]),
++                                                     static_cast<long long>(sign64[sx[1] & 127]),
++                                                     static_cast<long long>(sign64[sx[0] & 127]));
++                dot16 = _mm256_maddubs_epi16(gv, _mm256_sign_epi8(q8, sv));
++            }
++            const __m256i p32 = _mm256_madd_epi16(dot16, _mm256_set1_epi16(1));
++            const float dot = hsum_i32_8(p32);
++            acc += f16_to_f32(sc[g]) * da[static_cast<size_t>(g)] * dot;
++        }
++        acc_out[n - n_begin] = acc;
++    }
++}
++
+ void compute_stage_avx2(const QuantMatrix& mat, const float* x, int n_begin, int n_end, float* acc_out) {
++    // arcint (patch 0074). IQ3_XXS / IQ4_NL (and IQ4_XS) / Q8_0 dot in the
++    // quantised domain; the affine form and IQ2_S keep the decode+f32 path.
++    static const bool q8_dot = [] {
++        const char* v = std::getenv("MOE_CPU_TIER_Q8_DOT");
++        return v == nullptr || std::string(v) != "0";
++    }();
++    if (q8_dot && (mat.format == kQuantFormatIq3Xxs || mat.format == kQuantFormatIq4Nl ||
++                   mat.format == kQuantFormatQ8_0)) {
++        compute_stage_q8_avx2(mat, x, n_begin, n_end, acc_out);
++        return;
++    }
+     const int group_count = mat.ic / mat.group_size;
+     std::vector<float> sx(static_cast<size_t>(group_count), 0.0f);
+     for (int g = 0; g < group_count; g++) {
+@@ -486,6 +613,11 @@
+     _mm256_storeu_ps(out8, acc);
+ }
+ 
++// arcint (patch 0074). Exposed for the unit cells.
++void compute_stage_q8_for_test(const QuantMatrix& m, const float* x, int n_begin, int n_end, float* out) {
++    compute_stage_q8_avx2(m, x, n_begin, n_end, out);
++}
++
+ }  // namespace ov::intel_gpu::ocl::moe
+ 
+ #endif  // OV_MOE_CPU_TIER_HAVE_AVX2
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
+@@ -30,6 +30,7 @@
+ #include <atomic>
+ #include <cmath>
+ #include <cstdint>
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <limits>
+@@ -957,3 +958,179 @@
+     EXPECT_EQ(one.gate_up_chunks, 1);
+     EXPECT_EQ(one.down_chunks, 1);
+ }
++
++// arcint (patch 0074). Informational: one decode layer call's CPU-expert cost
++// at the served Flash-Next shape (8 experts, one job each, IQ3_XXS gate/up +
++// IQ4_NL down, H=2560 I=640), on the plan the plugin runs. Records the value;
++// the ggml bar is ~540 us per layer. Not a gate.
++TEST(moe_cpu_expert_native, perf_one_layer_call_eight_experts) {
++    const int H = 2560, I = 640, E = 8;
++    std::mt19937 rng(99);
++    std::vector<std::unique_ptr<NativeExpertData>> ex;
++    std::vector<std::unique_ptr<JobSet>> js;
++    std::vector<CpuTierExpertWork> work;
++    for (int x = 0; x < E; x++) {
++        ex.push_back(make_native_expert(H, I, rng));
++        js.push_back(std::make_unique<JobSet>(H, 1, rng));
++        work.push_back(CpuTierExpertWork{&ex[x]->e, js[x]->jobs.data(), js[x]->jobs.size()});
++    }
++    CpuTierPool pool(7);
++    const CpuTierSplit plan = ov::intel_gpu::ocl::moe::cpu_tier_split_plan(E, pool.thread_count(), I, H);
++    for (int rep = 0; rep < 3; rep++) {
++        ov::intel_gpu::ocl::moe::cpu_tier_dispatch(pool, work, plan, {});
++        pool.wait();
++    }
++    const int reps = 200;
++    // Direct, single-threaded: one expert at a time, no pool overhead.
++    for (int x = 0; x < E; x++) ov::intel_gpu::ocl::moe::moe_cpu_expert(ex[x]->e, js[x]->jobs.data(), 1, 0, H);
++    const auto d0 = std::chrono::steady_clock::now();
++    for (int rep = 0; rep < reps; rep++)
++        for (int x = 0; x < E; x++) ov::intel_gpu::ocl::moe::moe_cpu_expert(ex[x]->e, js[x]->jobs.data(), 1, 0, H);
++    const auto d1 = std::chrono::steady_clock::now();
++    const double direct_us = std::chrono::duration<double, std::micro>(d1 - d0).count() / reps;
++    const auto t0 = std::chrono::steady_clock::now();
++    for (int rep = 0; rep < reps; rep++) {
++        ov::intel_gpu::ocl::moe::cpu_tier_dispatch(pool, work, plan, {});
++        pool.wait();
++    }
++    const auto t1 = std::chrono::steady_clock::now();
++    const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / reps;
++    // The whole-expert schedule (one task per expert), for the pool-overhead
++    // comparison.
++    const CpuTierSplit whole{1, 1};
++    for (int rep = 0; rep < 3; rep++) {
++        ov::intel_gpu::ocl::moe::cpu_tier_dispatch(pool, work, whole, {});
++        pool.wait();
++    }
++    const auto w0 = std::chrono::steady_clock::now();
++    for (int rep = 0; rep < reps; rep++) {
++        ov::intel_gpu::ocl::moe::cpu_tier_dispatch(pool, work, whole, {});
++        pool.wait();
++    }
++    const auto w1 = std::chrono::steady_clock::now();
++    const double whole_us = std::chrono::duration<double, std::micro>(w1 - w0).count() / reps;
++    std::printf("[PERF] one layer call, %d experts x 1 job: pool %.1f us (plan %d/%d) | whole-schedule %.1f us | direct "
++                "%d experts sequentially %.1f us\n",
++                E, us, plan.gate_up_chunks, plan.down_chunks, whole_us, E, direct_us);
++    RecordProperty("layer_us_eight_experts_one_job", std::to_string(us));
++    RecordProperty("direct_us_eight_experts_one_job", std::to_string(direct_us));
++    RecordProperty("whole_us_eight_experts_one_job", std::to_string(whole_us));
++}
++
++// arcint (patch 0074). The quantised-domain dot against the f32 tier at the
++// served native shape. Not bitwise: the activation is quantised to int8 with
++// one scale per 32 values (ggml's approach), so the cell holds to a stated
++// tolerance. Red-first: an IQ3_XXS sign-flip or grid/nibble mis-map moves a
++// value by O(1) times the weight scale, orders above this bound (the f32 tier
++// itself sits ~1e-3 from the double oracle); the same run twice is bit-equal.
++TEST(moe_cpu_expert_native, quantised_dot_matches_the_f32_tier_within_bound) {
++    if (!ov::with_cpu_x86_avx2()) {
++        GTEST_SKIP() << "host has no AVX2";
++    }
++    constexpr double kBound = 0.06;
++    const int H = 2560, I = 640;
++    std::mt19937 rng(0x74u);
++    auto ex = make_native_expert(H, I, rng);
++    JobSet js(H, 1, rng);
++    std::vector<uint16_t> y_ref(static_cast<size_t>(H), 0), y_avx(static_cast<size_t>(H), 0);
++    ExpertJob jr{js.x[0].data(), js.jobs[0].w_route, y_ref.data()};
++    ExpertJob ja{js.x[0].data(), js.jobs[0].w_route, y_avx.data()};
++    moe_cpu_expert_ref(ex->e, &jr, 1, 0, H);
++    moe_cpu_expert_avx2(ex->e, &ja, 1, 0, H);
++    // Pointwise RELATIVE error is meaningless here: the output has components
++    // near zero where the int8 activation's ~0.8 % error dominates the
++    // denominator. Compare the max ABSOLUTE deviation to the reference's own
++    // scale instead.
++    double ref_scale = 0.0, max_abs = 0.0;
++    size_t worst = 0;
++    for (size_t i = 0; i < static_cast<size_t>(H); i++) {
++        const double av = f16_bits_to_double(y_ref[i]);
++        const double bv = f16_bits_to_double(y_avx[i]);
++        ref_scale = std::max(ref_scale, std::fabs(av));
++        const double d = std::fabs(av - bv);
++        if (d > max_abs) { max_abs = d; worst = i; }
++    }
++    std::printf("[DBG] worst i=%zu ref=%.6f avx=%.6f\n", worst, f16_bits_to_double(y_ref[worst]),
++                f16_bits_to_double(y_avx[worst]));
++    for (size_t i = 0; i < 6; i++)
++        std::printf("[DBG] i=%zu ref=%.6f avx=%.6f\n", i, f16_bits_to_double(y_ref[i]),
++                    f16_bits_to_double(y_avx[i]));
++    const double rel = ref_scale > 0.0 ? max_abs / ref_scale : 0.0;
++    RecordProperty("quantised_dot_max_abs", std::to_string(max_abs));
++    RecordProperty("quantised_dot_ref_scale", std::to_string(ref_scale));
++    RecordProperty("quantised_dot_scale_relative", std::to_string(rel));
++    EXPECT_LE(rel, kBound) << "max_abs=" << max_abs << " ref_scale=" << ref_scale;
++    std::vector<uint16_t> y_avx_b(static_cast<size_t>(H), 0);
++    ExpertJob jb{js.x[0].data(), js.jobs[0].w_route, y_avx_b.data()};
++    moe_cpu_expert_avx2(ex->e, &jb, 1, 0, H);
++    EXPECT_EQ(0, std::memcmp(y_avx.data(), y_avx_b.data(), sizeof(uint16_t) * static_cast<size_t>(H)))
++        << "the quantised path is not deterministic across runs";
++}
++
++// arcint (patch 0074) debug scaffold: isolate the quantised stage against the
++// f32 stage for one row of each native format.
++TEST(moe_cpu_expert_native, debug_q8_stage) {
++    if (!ov::with_cpu_x86_avx2()) {
++        GTEST_SKIP() << "host has no AVX2";
++    }
++    const int K = 64;
++    std::mt19937 rng(5);
++    std::normal_distribution<float> nd(0.0f, 1.0f);
++    std::vector<float> x(static_cast<size_t>(K));
++    for (auto& v : x) v = nd(rng);
++
++    {
++        std::vector<uint8_t> w(static_cast<size_t>(K) / 2);
++        for (auto& b : w) b = static_cast<uint8_t>(rng() & 0xFF);
++        std::vector<uint16_t> s(2);
++        s[0] = f32_to_f16_bits(0.03f);
++        s[1] = f32_to_f16_bits(0.05f);
++        QuantMatrix m = native_matrix(kQuantFormatIq4Nl, K, w.data(), nullptr, s.data());
++        m.oc = 1;
++        float ref = 0.0f, q8 = 0.0f;
++        ov::intel_gpu::ocl::moe::compute_stage_f32(m, x.data(), 0, 1, &ref);
++        ov::intel_gpu::ocl::moe::compute_stage_q8_for_test(m, x.data(), 0, 1, &q8);
++        std::printf("[DBG-NL] ref=%.6f q8=%.6f\n", ref, q8);
++    }
++    {
++        std::vector<uint8_t> w(static_cast<size_t>(K) / 4);
++        for (auto& b : w) b = static_cast<uint8_t>(rng() & 0xFF);
++        std::vector<uint8_t> z(static_cast<size_t>(K) / 8);
++        for (auto& b : z) b = static_cast<uint8_t>(rng() & 0x7F);
++        std::vector<uint16_t> s(2);
++        s[0] = f32_to_f16_bits(0.03f);
++        s[1] = f32_to_f16_bits(0.05f);
++        QuantMatrix m = native_matrix(kQuantFormatIq3Xxs, K, w.data(), z.data(), s.data());
++        m.oc = 1;
++        float ref = 0.0f, q8 = 0.0f;
++        ov::intel_gpu::ocl::moe::compute_stage_f32(m, x.data(), 0, 1, &ref);
++        ov::intel_gpu::ocl::moe::compute_stage_q8_for_test(m, x.data(), 0, 1, &q8);
++        // Scalar emulation of the q8 algorithm (same tables via the accessors).
++        const uint32_t* grid = ov::intel_gpu::ocl::moe::iq3xxs_grid_table();
++        const uint8_t* signs = ov::intel_gpu::ocl::moe::iq2xs_signs_table();
++        const uint8_t mask[8] = {1, 2, 4, 8, 16, 32, 64, 128};
++        float emu = 0.0f;
++        const int groups = K / 32;
++        for (int g = 0; g < groups; g++) {
++            float amax = 0.0f;
++            for (int j = 0; j < 32; j++) amax = std::max(amax, std::fabs(x[static_cast<size_t>(g) * 32 + j]));
++            const float da = amax / 127.0f;
++            int qv[32];
++            for (int j = 0; j < 32; j++) qv[j] = static_cast<int>(std::nearbyint(x[static_cast<size_t>(g) * 32 + j] / da));
++            long long dot = 0;
++            for (int l = 0; l < 4; l++) {
++                const uint8_t sg = signs[z[static_cast<size_t>(g) * 4 + l] & 127];
++                uint8_t g1[4], g2[4];
++                std::memcpy(g1, &grid[w[static_cast<size_t>(g) * 8 + 2 * l]], 4);
++                std::memcpy(g2, &grid[w[static_cast<size_t>(g) * 8 + 2 * l + 1]], 4);
++                for (int j = 0; j < 4; j++) {
++                    dot += static_cast<long long>(g1[j]) * ((sg & mask[j]) ? -qv[l * 8 + j] : qv[l * 8 + j]);
++                    dot += static_cast<long long>(g2[j]) * ((sg & mask[j + 4]) ? -qv[l * 8 + 4 + j] : qv[l * 8 + 4 + j]);
++                }
++            }
++            emu += f16_bits_to_double(s[static_cast<size_t>(g)]) * da * static_cast<double>(dot);
++            std::printf("[EMU] G%d da=%g dot=%lld\n", g, (double)da, dot);
++        }
++        std::printf("[DBG-IQ3] ref=%.6f q8=%.6f emu=%.6f\n", ref, q8, emu);
++    }
++}

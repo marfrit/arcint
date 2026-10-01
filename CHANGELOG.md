@@ -2702,3 +2702,12 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p2` (patches 0003–0013).
 ## 0.2.0 — 2026-08-29
 - First packaged release: amd64, trixie, strict dependency on
   `marfrit-openvino` at the pinned nightly.
+
+- **Tier hot loop: the native expert dot in the quantised domain.** Patch 0074
+  replaces the tier's f16->f32 row decode + f32 dot for IQ3_XXS / IQ4_NL /
+  IQ4_XS / Q8_0 with ggml's approach -- a per-stage int8 activation (one scale
+  per 32 values) dotted against the packed weight via `maddubs`/`madd`.
+  Measured at the served shape (8 experts x one job, H=2560 I=640, pool of 7):
+  **651 us per layer call**, 1.21x llama.cpp's `mul_mat_id` (~540 us), inside
+  the 1.3x microbench bar; the old path was ~1.4 ms. Numerics are tolerance-
+  bound now, not bitwise; `MOE_CPU_TIER_Q8_DOT=0` restores the old routing.

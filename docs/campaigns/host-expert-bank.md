@@ -193,3 +193,26 @@ change. A slot is a hit only for the identical span list. Everything else
     an f32 dot. ggml dots in the quantised domain with the activation
     quantised once per token to Q8_K/Q8_0 (`vec_dot_iq3_xxs_q8_K`,
     `vec_dot_iq4_nl_q8_0`, `vec_dot_q8_0_q8_0`); that is where the gap lives.
+
+- 2026-10-01. **Tier hot loop: the native expert dot runs in the quantised
+  domain (patch 0074, `measured-here`).** ggml's approach, not its code: the
+  activation is quantised once per stage to int8 with one scale per 32 values,
+  and `maddubs`/`madd` dot the packed weight directly, so the f16-to-f32 row
+  decode (the tier's dominant cost) disappears.
+  - **Measured** (dirac, services stopped; 8 experts x one job, IQ3_XXS
+    gate/up + IQ4_NL down, H=2560 I=640): **651 us per layer call** on the
+    split plan {4,2}. The whole-expert schedule is 1007 us and the old
+    dequant path ~1.4 ms. Against llama.cpp's `mul_mat_id` at ~540 us that is
+    **1.21x**, inside the 1.3x microbench gate.
+  - **Numerics** change: the int8 activation replaces the f16->f32 decode. The
+    cell `moe_cpu_expert_native.quantised_dot_matches_the_f32_tier_within_bound`
+    holds a scale-relative bound of 0.06 against the f32 tier at the served
+    shape (achieved ~0.003) and is deterministic across runs. The one real bug
+    found and fixed: `_mm256_sign_epi8` ZEROES the source where its sign byte
+    is 0 (PSIGNB semantics), so the IQ3_XXS sign vector must carry +1 for a
+    clear bit, not 0.
+  - **Dispatch**: the AVX2 path now accepts the native formats (IQ3_XXS /
+    IQ4_NL / IQ4_XS / Q8_0); IQ2_S keeps the scalar reference.
+    `MOE_CPU_TIER_Q8_DOT=0` restores the pre-0074 routing (the A/B used here).
+  - **Open**: the served pair (dense arm; decode and prefill at 20k) and the
+    window-0 KL gate have not been run.
