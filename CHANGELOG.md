@@ -2803,3 +2803,11 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p2` (patches 0003–0013).
 ## 0.2.0 — 2026-08-29
 - First packaged release: amd64, trixie, strict dependency on
   `marfrit-openvino` at the pinned nightly.
+
+- **Adaptive expert cache, first build (patch 0076): gate FAILED, not adopted.**
+  B60 `d48q8`, 20,085 tokens: base static census128 prefill 64.1 / decode 6.0
+  t/s with the needle answered; the adaptive arm 42.9 / 0.9 t/s with no answer,
+  hit rate 22.9 % against 32.2 %, 70,916 evictions and 658,244 tensor loads
+  (422 s of disk IO against 43). The fetched share uploads from the pageable
+  reader and the swaps evict on the same pool, thrashing. Not in the packaging
+  series.

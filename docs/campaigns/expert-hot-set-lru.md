@@ -153,3 +153,29 @@ Engine: `src/exec/fit.h` (`expert_slot_bytes`), `src/exec/flash_next_offload.h`,
 `hybrid-expert-fetch` is a stub pointing here.
 
 Full history: `git show b0447b8:docs/campaigns/expert-hot-set-lru.md`.
+
+- 2026-10-01. **First build (patch 0076, not adopted): the gate FAILED.** The
+  adaptive cache, Strata's swaps every 12 decode tokens and the link-share
+  miss split, loaded and served but is a large loss on the B60 (`d48q8`,
+  ratio 75, census128, 20,085-token needle, one fresh process per arm):
+
+  | arm | prefill t/s | decode t/s | answer | gpu hit % | cpu-tier experts | evictions | tensor_loads | disk IO s |
+  |---|---|---|---|---|---|---|---|---|
+  | base (static census128) | 64.1 | 6.0 | `ORANGE-FALCON-77` | 32.2 | 131,770 | 0 | 46,816 | 43 |
+  | adaptive (`MOE_CPU_TIER_ADAPTIVE=1`) | **42.9** | **0.9** | **empty** | 22.9 | 91,937 | 70,916 | 658,244 | 422 |
+
+  - The answer-level bar fails outright (no answer at all), and prefill and
+    decode both regress hard; the hit rate **drops**, not rises.
+  - Mechanism, from the counters: the split's fetched share is uploaded from
+    the pageable weight reader, and the swaps evict on the same pool, so the
+    arm issues **14x the tensor loads** and **70,916 evictions** (10x the
+    disk IO). The static arm issues none of these: it computes every miss on
+    the CPU. The transient read (evicted at the next call's start) adds more
+    churn.
+  - **Not adopted**; patch 0076 stays out of the packaging series. The load
+    itself first crashed (the static partition pins the whole pool, leaving
+    the LRU nothing to evict); admitting the census unpinned and routing the
+    no-destination probe calls through the LRU fixed the load but not the cost.
+  - Next levers, in order: upload the fetched share from the **pinned bank**
+    (not the pageable reader) and keep it cached (Strata's copy kernel), and
+    let the swaps replace residents rather than evict-and-refetch for demand.
