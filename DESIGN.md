@@ -481,7 +481,8 @@ deterministic function of (request, configuration, request history since
 boot), and replaying the same request sequence gives the same bytes. The
 prefix cache stays refused with an adaptive tier."*
 
-**Scope.** The relaxation applies to **the MoE expert tier only** — the
+**Scope.** [Superseded in part 2026-10-01 by Amendment 2 below, which
+reaches every mechanism.] The relaxation applies to **the MoE expert tier only** — the
 host-or-device placement of routed-expert FFN weights under
 `--moe-cpu-tier` and the plugin-side expert slot pool it rides. It does not
 reach the dense graph, the KV/GDN state, the paged path, the logits, or the
@@ -520,7 +521,8 @@ stands and is *not* relaxed by this amendment: only the static-partition tier,
 whose placement is a pure function of configuration alone, may load together
 with `--prefix-cache-mib > 0`. The load path names the mode:
 `tier_prefix_cache_decision` (`code` `src/config.cpp`) refuses an adaptive tier
-with the prefix cache and admits the static partition.
+with the prefix cache and admits the static partition. [Clause 3 lifted
+2026-10-01 by Amendment 2 below; the refusal in code is owed a change.]
 
 **Evidence class, per disposition.** Clauses 1–3 are the operator decision
 (2026-10-01) plus `code` (the cited arcint functions); the adaptive-tier
@@ -531,6 +533,43 @@ identical in one process, a continuation forking across a differently-warmed
 process). The relaxation unblocks `expert-hot-set-lru` and
 `partition-seeding`, both of which the campaigns README held pending the
 history-independence invariant.
+
+**Amendment 2 (2026-10-01, later the same day): correctness is judged at the
+answer; clauses 2 and 3 are superseded.** Operator decision, verbatim: *"I do
+not care for exactness of the process (bits need to align) if the exactness of
+the higher level result (The capital of France is Paris) is not false."* It
+followed the reference audit (`docs/campaigns/research-reference-audit.md`),
+which found that Strata accepts non-bit-identical output:
+- its expert cache changes 2–5 % of top-1 picks at equal perplexity (the
+  reference author's published measurement,
+  `~/src/Strata-ref/bench/results/2026-09-27-cache-parity`);
+- its admission and PCIe share are timing-driven (`code`
+  `~/src/Strata-ref/src/program/generate.cpp:4414-4478`).
+
+The operator's decision is general, so this amendment reaches every
+mechanism, not only the expert tier. Amendment 1's Scope paragraph and its
+clause 3 refusal are superseded where they say otherwise (marked in place).
+What holds now:
+- **Clause 2 becomes a default, not a law.** Deterministic replay (the same
+  request sequence from a fresh boot giving the same bytes) is kept where it
+  is cheap: it is what makes measurements comparable. A mechanism may drop it
+  when that buys measured speed, for example non-blocking cache admission or
+  a timing-probed miss split. The bar is the answer: the right facts, the
+  needle found, the task battery passing, mean KL against the reference no
+  more than 0.03 nats worse than the baseline arm's on the same card and
+  window, and argmax agreement down by at most 1 point (`CLAUDE.md`, "The
+  answer-level bar"; the tolerances are the operator's to change).
+- **Clause 3 is lifted.** Conversation state (the prefix cache) may load
+  together with an adaptive tier, as in both references. A restored
+  continuation is held to the same answer-level bar, not to byte equality
+  with a cold run. `tier_prefix_cache_decision` (`code` `src/config.cpp`)
+  still refuses the pair and is owed a change.
+- The **Invariant (tested in CI, not aspirational)** bullet above still
+  describes the dense, non-tier configurations as they behave today. It no
+  longer gates new mechanisms on its own: a change that passes the
+  answer-level bar is admissible even if bytes move. The byte cells in §5's
+  suites stay as tripwires; a red one on such a change is reported, not a
+  veto.
 
 ### 3.5 Speculative decoding (MTP)
 
@@ -1260,6 +1299,15 @@ at the link's measured 14.25 GB/s is ~0.12 s, against the 35 s cold prefill
 it replaces.
 
 ## 5. Testing and acceptance
+
+[Amended 2026-10-01 (operator; §3.4 Amendment 2). The byte-equality cells
+below (cold/warm, chunked/unchunked, restored continuation, MTP identity,
+`tier-reference-cell`) are **tripwires, not vetoes**. A change that passes
+the answer-level bar in `CLAUDE.md` is admissible even with a byte cell red,
+and the red cell is reported. The bar: the answers stay right; mean KL
+against the reference at most 0.03 nats worse than the baseline arm's on the
+same card and window; argmax agreement down by at most 1 point. The cells
+themselves and the generated manifest are owed an update to say so.]
 
 - **Prüfstand gate**: the fleet's 10-point code-generation harness runs against
   every artifact/config combination that claims production readiness. The

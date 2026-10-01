@@ -33,10 +33,15 @@ and the DESIGN sections it cites.
   implementation → one card window at the end, not many along the way →
   review before commit → a DESIGN `§7.0.2x` record and a CHANGELOG line
   when it closes. Reviews are not skippable.
-- **Invariants stay non-negotiable:** DESIGN §3.4 (history-independent
-  greedy output) and §3.8, the §5 ladder, the measurement discipline in
-  `CLAUDE.md`. A campaign that would trade one for a number does not
-  close; it records the trade as a finding and stops.
+- **Invariants are not negotiable by an agent:** DESIGN §3.4 and §3.8, the
+  §5 ladder, the measurement discipline in `CLAUDE.md`. A campaign that
+  would trade one for a number does not trade it on its own: it records the
+  trade, with the measured price of each side, and puts it to the operator.
+  [Amended 2026-10-01. §3.4's history-independence was relaxed, and
+  correctness is now judged at the answer, not at the bit (DESIGN §3.4
+  Amendments 1–2; `CLAUDE.md`). A reference mechanism that conflicts with
+  an invariant is the operator's call
+  (`docs/campaigns/research-reference-audit.md`).]
 - **Status is a dated log at the bottom of the document**, appended, never
   rewritten. The milestone document's backlog rows point here and are not
   edited further.

@@ -267,8 +267,11 @@ await a re-capture (docs/campaigns/qsa.md).
   (load, mem map, per-slot prefill/decode rates, cache hits, MTP acceptance).
 - Model input: OpenVINO IR (offline export), validated against a built-in
   allowlist; anything else is rejected at load.
-- Hard invariant: greedy output is byte-identical across cold/warm prefix cache
-  (gated in CI). NOT across chunked/unchunked prefill or speculation on/off:
+- Former hard invariant (relaxed 2026-10-01, DESIGN §3.4 Amendments 1-2):
+  greedy output byte-identical across cold/warm prefix cache (still gated in
+  CI as a tripwire). Correctness is now judged at the answer: the answers
+  stay right, and mean KL against the reference is at most 0.03 nats worse
+  than the baseline arm's. NOT across chunked/unchunked prefill or speculation on/off:
   measured 2026-08-28, advancing the state by two tokens in one forward differs
   from advancing it twice by one (last-row logits up to 0.013 apart, GDN scan
   kernel), so any change to how a sequence is split can flip a near-tie. Those
@@ -389,6 +392,8 @@ buffers sized from the current call. Packaged as marfrit-openvino +p3
   --prefix-cache-mib > 0: expert LRU residency picks device f16 vs host f32
   arithmetic, so a cache-restored continuation is not byte-identical to a cold
   run (DESIGN §3.4).
+  [Relaxed 2026-10-01, DESIGN §3.4 Amendment 2: the pairing is admissible
+  at the answer-level bar; the refusal in code is owed a change.]
 - M12: --pin-dispatch pins a lane's dispatch thread (measured null on a quiet
   host, opt-in); the exporter's --moe-lowering tiled.
 - M13: --vision is reserved and refused; a VLM checkpoint's vision tower and

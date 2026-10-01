@@ -57,9 +57,13 @@ none yet and reports its numbers instead of gating them.
 
 `-DARCINT_ACCEPTANCE=ON` is refused at configure time without
 `-DARCINT_OPENVINO=ON`: a stub binary would "pass" a card cell by serving stub
-bytes. The equivalence suite behind several cells is the contract:
-byte-equality gates for cache, chunking, and speculation. A configuration that
-cannot pass it does not become a default.
+bytes. The equivalence suite behind several cells checks byte-equality for
+cache, chunking and speculation. [Amended 2026-10-01: those byte cells are
+tripwires, not vetoes. The contract is the answer-level bar in `CLAUDE.md`
+(the answers stay right; mean KL against the reference at most 0.03 nats
+worse than the baseline arm's; argmax agreement down by at most 1 point). A
+configuration that passes that bar may become a default with byte cells red;
+the red cells are reported.]
 
 ## Security posture
 

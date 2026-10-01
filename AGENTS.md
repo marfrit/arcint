@@ -4,8 +4,8 @@ Read by OpenCode and Pi. Claude Code reads `CLAUDE.md`, which carries the
 same mandate. All three are bound by everything below.
 
 `CLAUDE.md` is the project's rules (scope, publishing, measurement
-discipline, model selection). This file adds one thing on top of it, and it
-is not optional.
+discipline, model selection). This file adds the mandate below on top of it,
+and it is not optional.
 
 ---
 
@@ -25,7 +25,8 @@ is written to be sufficient on its own — that is the directory's stated rule.
 sections are the starting point.
 
 **3. If the task cites an external project, read its SOURCE, not only its
-paper.** Checked out here: `~/src/FreeToken-ref`, `~/src/ninfer`. A paper
+paper.** Checked out here: `~/src/Strata-ref`, `~/src/FreeToken-ref`,
+`~/src/ninfer`. A paper
 describes intent; the code is what the project does. Where they disagree,
 the code wins.
 
@@ -45,9 +46,42 @@ on the host", "no code path needs it" are claims that require an attempt.
 leg, card identity by PCI id (DRM numbering is INVERTED vs OpenVINO), zombie
 sweep by pid. Every rule there has a dated incident behind it.
 
+**8. Expert engines over our own negatives.** The references are Strata
+(`~/src/Strata-ref`, written for Qwen3.8-Flash-Next on one GPU + RAM),
+FreeToken (`~/src/FreeToken-ref`) and llama.cpp; read
+`docs/campaigns/research-reference-audit.md` first.
+- An arcint negative counts against a reference technique only if it tested
+  the same mechanism. Write down how the build differed before recording a
+  verdict.
+- A conflict between a reference mechanism and a DESIGN invariant or a
+  `CLAUDE.md` rule is the **operator's** decision, with the measured price of
+  each side. Never resolve it by dropping the mechanism, and never by
+  rewriting the rule.
+
+**9. Correctness is judged at the answer, not at the bit** (operator,
+2026-10-01): the answers stay right (facts, needle, task battery), mean KL
+against the reference no more than 0.03 nats worse than the baseline arm's on
+the same card and window, and argmax agreement down by at most 1 point.
+Bit-identical output across configurations or history is not required;
+integrity checks on copied data stay exact. Details in `CLAUDE.md`.
+
 ---
 
 ## Why this file exists
+
+2026-10-01, the second time: the FreeToken-style LRU expert cache was built,
+ruled "a violation of §3.4 as written", and replaced by a static partition.
+The price was never put to the operator: a 36 % GPU hit rate and 308
+CPU-tier experts per token, against Strata's ~0.72 hit rate (paper §3.4,
+which leaves ~134 of 480 routed experts per token for the CPU before its
+PCIe share). The operator: "I requested that so many times." The same audit
+found three more recorded negatives that had tested a different mechanism
+from the reference's: hybrid-expert-fetch (pageable memory, nothing cached),
+prefill-expert-streaming v1 (staging, one queue, small chunks) and the 0075
+hand-off (half of the wait removed). It also found one premise that was never
+tried, "Flash-Next has no MTP head". Rules 8 and 9 above come from that.
+
+The first time:
 
 2026-09-15. Five days of 0.5.1 built a segmented serving route whose expert
 bodies are whole-tensor u8 `Parameter`s unpacked to f32 in-graph. Measured on
