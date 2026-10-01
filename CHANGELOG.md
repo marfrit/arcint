@@ -2711,3 +2711,9 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p2` (patches 0003–0013).
   **651 us per layer call**, 1.21x llama.cpp's `mul_mat_id` (~540 us), inside
   the 1.3x microbench bar; the old path was ~1.4 ms. Numerics are tolerance-
   bound now, not bitwise; `MOE_CPU_TIER_Q8_DOT=0` restores the old routing.
+
+- **The 0074 served gate fails on prefill.** On the dense arm at 20,085 tokens
+  (B60, bank 30 GiB), decode improves 10 % (6.0 -> 6.6 t/s) but prefill
+  regresses 28 % (68.4 -> 49.5 t/s); 8 pinned threads are a wash. The per-row
+  quantised dot is ported, ggml's batched prefill path is not. 0074 is not
+  adopted; the served default stays the pre-0074 routing.

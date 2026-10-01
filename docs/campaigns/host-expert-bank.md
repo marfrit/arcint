@@ -216,3 +216,31 @@ change. A slot is a hit only for the identical span list. Everything else
     `MOE_CPU_TIER_Q8_DOT=0` restores the pre-0074 routing (the A/B used here).
   - **Open**: the served pair (dense arm; decode and prefill at 20k) and the
     window-0 KL gate have not been run.
+
+- 2026-10-01. **The 0074 served gate (dense arm, B60, 20,085-token prompt).**
+  Three fresh processes, runtime prefix `ov-0074` (plugin sha `35a906bf10b236e1`,
+  the 0074 build), dense `d48q8`, ratio 75 + census128, bank 30 GiB, u8 KV,
+  chunk 2048, port 8111; all three answered the needle (`ORANGE-FALCON-77`).
+
+  | arm | prefill | decode |
+  |---|---|---|
+  | base (`MOE_CPU_TIER_Q8_DOT=0`) | **68.4 t/s** | 6.0 t/s |
+  | q8 (0074, threads auto) | 49.5 t/s | **6.6 t/s** |
+  | q8t8 (0074, `--moe-cpu-tier-threads 8`, `taskset -c 0-7`) | 50.7 t/s | **6.6 t/s** |
+
+  - **Decode improves 10 % (6.0 -> 6.6 t/s); prefill regresses 28 %
+    (68.4 -> 49.5).** The gate needs both above the base, so 0074 does **not**
+    pass and is not adopted; the served default stays the pre-0074 routing.
+  - **Cause** (not yet fixed): the patch ports only the **per-row** quantised
+    dot. Prefill runs the two-phase AVX2 path over many chunks, and each chunk
+    re-quantises its activation and dots row by row; the old path decoded each
+    row once and ran one job per AVX2 lane (`compute_stage_f32_jobs` +
+    `native_dot_jobs_avx2`). ggml's **batched** prefill path (read, not ported)
+    is the missing piece.
+  - **Threads**: 8 pinned externally by `taskset -c 0-7` is a wash against auto
+    here. The tier exposes `--moe-cpu-tier-threads` but no affinity, so the arm
+    is pinned by the wrapper, not by the tier.
+  - **KL**: the window-0 read was not obtained -- `kld_vs_capture.py` finds no
+    replay whose records sum to the capture's `n_ctx` (2,735) in the served
+    dump (its records are one prefill chunk plus one per decode token). Moot
+    for this gate, which prefill already failed.
