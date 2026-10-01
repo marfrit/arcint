@@ -117,21 +117,33 @@ def _u8_chain(q_u8, scale_f16, name):
 REL_MAX = 2.0 ** -9
 
 
-def plan(model, min_elems=1 << 20):
+class Format:
+    """One compressed form a projection can be carried in: how to recover its
+    groups from f32 values, decode them as the plugin does, and build the
+    chain. dense_u8 is Q6_K's u8 group-16; q4e.dense_q8 adds Q8_0's i8
+    group-32."""
+    def __init__(self, tag, group, recover, decode, chain, qrange, shapes_env):
+        self.tag, self.group, self.recover, self.decode, self.chain = tag, group, recover, decode, chain
+        self.qrange, self.shapes_env = qrange, shapes_env
+
+
+def plan(model, min_elems=1 << 20, fmt=None, skip=()):
     """Decide and PREPARE every eligible f32 projection of `model` without
     touching the graph: returns (plans, report). A plan is (MatMul node,
-    name, q_u8, scale_f16). The graph edit is commit()'s, so a caller can run
+    name, q, scale_f16, chain). `fmt` is the compressed form (default Q6_K's
+    u8 group-16); `skip` names projections another pass already planned. The graph edit is commit()'s, so a caller can run
     another pass in between -- the exporter's f16 compression, which
     compress_model_to_f16 skips for a WHOLE model once it detects any
     compressed-weight chain (compress_float_constants.cpp,
     is_model_optimized): committing first left every other constant f32
     (measured 2026-09-26: 0.772 GiB of f32 in the u8 artifact against 0.386 as
     f16)."""
-    rep = {"converted": [], "kept": [], "f16_bytes": 0, "u8_bytes": 0}
+    fmt = fmt or Q6K
+    rep = {"converted": [], "kept": [], "f16_bytes": 0, "compressed_bytes": 0, "tag": fmt.tag}
     plans = []
     # measurement knob (bisection only): convert just the listed "NxK" shapes
     import os
-    only = {x.strip() for x in os.environ.get("ARCINT_DENSE_U8_SHAPES", "").split(",") if x.strip()}
+    only = {x.strip() for x in os.environ.get(fmt.shapes_env, "").split(",") if x.strip()}
     for node in model.get_ordered_ops():
         if node.get_type_name() != "Constant" or node.get_output_element_type(0) != Type.f32:
             continue
@@ -148,6 +160,8 @@ def plan(model, min_elems=1 << 20):
         if not attrs.get("transpose_b", False) or attrs.get("transpose_a", False):
             continue
         name = node.get_friendly_name()
+        if name in skip:
+            continue
         if name.startswith("shared_expert"):
             # FuseMOESharedExpert hands these to the MoE op as they are and its
             # kernel reads plain weights: a u8 chain there served garbage
@@ -165,27 +179,27 @@ def plan(model, min_elems=1 << 20):
             continue
         n, k = shape
         if only and f"{n}x{k}" not in only:
-            rep["kept"].append((name, f"{n}x{k} not in ARCINT_DENSE_U8_SHAPES"))
+            rep["kept"].append((name, f"{n}x{k} not in {fmt.shapes_env}"))
             continue
-        if k % GROUP:
-            rep["kept"].append((name, f"K={k} not a multiple of {GROUP}"))
+        if k % fmt.group:
+            rep["kept"].append((name, f"K={k} not a multiple of {fmt.group}"))
             continue
         w = node.get_data()
-        q, s, ok = recover_groups(w)
+        q, s, ok = fmt.recover(w)
         if not ok.all():
-            rep["kept"].append((name, f"{int((~ok).sum())} of {ok.size} groups not s*q with q in [{QMIN},{QMAX}]"))
+            rep["kept"].append((name, f"{int((~ok).sum())} of {ok.size} groups not s*q with q in {fmt.qrange}"))
             continue
         s16 = s.astype(np.float16)
-        dec = decode(q, s16)
+        dec = fmt.decode(q, s16)
         rel = float(np.max(np.abs(dec - w) / np.maximum(np.abs(w), 1e-30), initial=0.0))
         del w, dec, s
         if rel > REL_MAX:
             rep["kept"].append((name, f"f16 scale rounding {rel:.2e} over {REL_MAX:.2e}"))
             continue
-        plans.append((mm, name, q, s16))
+        plans.append((mm, name, q, s16, fmt.chain))
         rep["converted"].append((name, n, k, rel))
         rep["f16_bytes"] += n * k * 2
-        rep["u8_bytes"] += q.nbytes + s16.nbytes
+        rep["compressed_bytes"] += q.nbytes + s16.nbytes
     return plans, rep
 
 
@@ -193,21 +207,25 @@ def commit(plans):
     """Splice each plan's u8 chain into its MatMul's weight input. Whatever fed
     it before (the f32 Constant, or the f16 Constant + Convert a compression
     pass put there) loses its only consumer."""
-    for i, (mm, name, q, s16) in enumerate(plans):
-        mm.input(1).replace_source_output(_u8_chain(q, s16, name).output(0))
+    for i, (mm, name, q, s16, chain) in enumerate(plans):
+        mm.input(1).replace_source_output(chain(q, s16, name).output(0))
         plans[i] = None
 
 
 def summary(rep):
-    return (f"dense-u8: {len(rep['converted'])} projection(s) converted, {len(rep['kept'])} kept; "
-            f"{rep['f16_bytes'] / 2**30:.3f} GiB as f16 -> {rep['u8_bytes'] / 2**30:.3f} GiB as u8+scale; "
+    tag = rep.get("tag", "u8")
+    return (f"dense-{tag}: {len(rep['converted'])} projection(s) converted, {len(rep['kept'])} kept; "
+            f"{rep['f16_bytes'] / 2**30:.3f} GiB as f16 -> {rep['compressed_bytes'] / 2**30:.3f} GiB as {tag}+scale; "
             f"max rel deviation {max((c[3] for c in rep['converted']), default=0.0):.3e}")
 
 
-def apply(model, min_elems=1 << 20, log=print):
+Q6K = Format("u8", GROUP, recover_groups, decode, _u8_chain, f"[{QMIN}, {QMAX}]", "ARCINT_DENSE_U8_SHAPES")
+
+
+def apply(model, min_elems=1 << 20, log=print, fmt=None):
     """plan() then commit(), nothing between: the cells' entry point. The
     exporter runs its f16 compression between the two instead."""
-    plans, rep = plan(model, min_elems)
+    plans, rep = plan(model, min_elems, fmt=fmt)
     commit(plans)
     log(summary(rep))
     return rep

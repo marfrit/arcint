@@ -1,3 +1,32 @@
+marfrit-openvino (2026.4.0~dev20260821+p25-1) bookworm trixie; urgency=medium
+
+  * Seven more patches on top of +p20 (and +p24's QSA), same upstream commit
+    (71640275), same smallest-sufficient-divergence numbering; the series is
+    now 0003-0074 (72 patches). Flash-Next's hybrid CPU tier gets its decode
+    and prefill kernels, and the campaigns' loose ends close:
+    - patch 0068: the CPU tier decodes a native expert row once and runs one
+      row per AVX2 lane for a single-job (decode) call.
+    - patch 0069: native IQ3_XXS gate/up and IQ4_NL/IQ4_XS down decode whole
+      blocks rather than row by row.
+    - patch 0070: the resident slot pool moves into device memory.
+    - patch 0071: a decode step's experts are balanced over the pool with a
+      two-phase split (gate/up row chunks, then down column chunks).
+    - patch 0072: the tier's expert bytes come from a host RAM bank filled at
+      load by sequential O_DIRECT reads instead of page-faulting on the
+      workers. B60: first answer 48.55 -> 38.18 s, byte-identical.
+    - patch 0073: QSA's own selection reaches PagedAttention through the
+      optional input 28, so Flash-Next's 12 full-attention layers serve the
+      model's sparse selection. Non-default, n_ctx <= 32768; decode 0.87x
+      dense at 20k, prefill 1.27x.
+    - patch 0074: the tier's native dot runs in the quantised domain (ggml's
+      approach), routed by call shape -- a decode-shaped call (<= 8 jobs)
+      takes the int8 quantised dot, a prefill-shaped call keeps the f32 path.
+      B60 dense d48q8, 20,085 tokens: prefill 63.1 vs base 64.2 t/s, decode
+      6.5 vs base 5.9.
+    See patches/README.md.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Thu, 01 Oct 2026 18:00:00 +0200
+
 marfrit-openvino (2026.4.0~dev20260821+p20-1) bookworm trixie; urgency=medium
 
   * Twenty-four more patches on top of +p19, same upstream commit

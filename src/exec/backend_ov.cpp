@@ -88,6 +88,7 @@
 #include "core/sampler.h"
 #include "core/turnstile.h"
 #include "exec/backend.h"
+#include "exec/qsa_runtime.h"
 #include "exec/rope_precision.h"
 #include "util/log.h"
 
@@ -812,6 +813,11 @@ public:
         // sequence -- carried across chunks by paged_forward itself.
         std::vector<int>     last_ids;
         std::vector<int64_t> ngram_ctx;
+        // The n-gram staging window, when the IR declares one: ONE PER LANE.
+        // feed_ngram_ports fills it outside the lane's turn, so a shared
+        // window would let one lane's rows overwrite another's before its
+        // infer (DESIGN 7.0.2cz).
+        ov::RemoteTensor     ngram_staging;
         // The MTP head carries its own attention KV over the prefix, so it
         // needs its own request per lane as well: a shared head would let one
         // sequence draft from the other's prefix, which is cross-slot bleed in
@@ -1061,6 +1067,8 @@ public:
             status_.n_layer          = artifact.n_layer;
             status_.n_gdn_layer      = artifact.n_gdn_layer;
             status_.n_attn_layer     = artifact.n_attn_layer;
+            status_.n_qsa_layer      = artifact.n_qsa_layer;
+            status_.qsa_enabled      = qsa_n_layer_ > 0;
             status_.mtp_enabled      = mtp_ready_;
             status_.weights_bytes    = artifact.weights_bytes;
             status_.sampler_defaults = artifact.sampler;
@@ -1316,6 +1324,8 @@ public:
         status_.n_layer          = artifact.n_layer;
         status_.n_gdn_layer      = artifact.n_gdn_layer;
         status_.n_attn_layer     = artifact.n_attn_layer;
+        status_.n_qsa_layer      = artifact.n_qsa_layer;
+        status_.qsa_enabled      = artifact.qsa;
         status_.mtp_enabled      = mtp_ready_;
         status_.weights_bytes    = artifact.weights_bytes;
         // What the retype above actually left in the graph, which is cfg.kv_dtype
@@ -1969,6 +1979,15 @@ private:
         // The lane's pages go back to the pool however this request ends —
         // finished, stopped, cancelled or thrown out of.
         LaneReset reset(*this, lane, stats);
+
+        // QSA option A: the indexer's raw-key history is a graph Variable, and
+        // a lane request lives across requests -- the la_* port tensors are
+        // zeroed per request (zero_paged_rows), but nothing else clears the
+        // Variable. Reset it here, at past == 0, or this sequence's selection
+        // would read the previous sequence's keys. reset_state() touches graph
+        // Variables only: the KV lives in ports and the GDN/conv state in
+        // la_state_names_ tensors, so this is exactly the new state.
+        if (qsa_n_layer_ > 0) lane.req.reset_state();
 
         // ------------------------------------------------------------ prefill
         const auto t_prefill = clock::now();
@@ -2643,11 +2662,26 @@ private:
             if (rank == 4) gdn_proto.push_back(sh);
         }
 
+        // QSA (2026-09-29). The exporter's node-level tags do not survive
+        // serialization -- the serializer writes only a fixed set of rt_info
+        // keys -- so they are lost in the artifact and the pass saw an untagged
+        // causal mask and dropped it. The marker travels in MODEL rt_info
+        // (`qsa = {"boundary": N, "mask_nodes": [...]}`), which does
+        // serialize. Re-apply the node tags by friendly name here, before
+        // SDPAToPagedAttention reads them.
+        const bool qsa_marked = model->get_rt_info().count("qsa") > 0;
+        if (qsa_marked) {
+            const size_t tagged = qsa::reapply_selection_tags(model);
+            log::info("load", "QSA marker present: re-applied %zu selection tag(s) from model rt_info",
+                      tagged);
+        }
+
         {
             ov::pass::Manager pm;
             pm.register_pass<ov::pass::SDPAToPagedAttention>();
             pm.run_passes(model);
         }
+        const size_t qsa_pa_nodes = qsa::count_qsa_paged_attention(model);
 
         want_dflash_ = !cfg.dflash.empty();
         // --dflash-select / --dflash-lambda: inert unless want_dflash_, but
@@ -2701,6 +2735,85 @@ private:
         drafts_max_ = std::max<size_t>(draft_tokens_, want_mtp_ ? 1 : 0);
         if (want_dflash_) drafts_max_ = std::max(drafts_max_, dflash_block_ - 1);
         rows_per_lane_ = drafts_max_ + 3;
+
+        // QSA option A (campaign qsa, step 3 T4). The indexer's raw-key history
+        // is a graph Variable, not one of the la_* port tensors: read its
+        // geometry off the graph, charge it per token further down, and refuse
+        // the configurations that would corrupt it rather than serve a mask
+        // built from empty or stale raw keys. The refusal is here, before any
+        // compile, because a load that cannot honour the selection should fail
+        // fast and loud.
+        {
+            const qsa::StateGeometry qsa_geo = qsa::state_geometry(model);
+            qsa_n_layer_                   = qsa_geo.n_layer;
+            // The compressed block cache amortises one f32 row over `ratio`
+            // tokens; the ratio is the artifact config's own value.
+            const size_t qsa_ratio = static_cast<size_t>(
+                artifact_.config.value("indexer_compress_ratio", 4));
+            qsa_state_bytes_token_ =
+                qsa_geo.raw_bytes_per_token +
+                qsa_geo.n_layer * qsa_geo.block_row_bytes / std::max<size_t>(qsa_ratio, 1);
+            // The block cache is a FIXED [block_cap, dh] allocation per layer,
+            // charged as a fixed reservation beside the per-token rate.
+            const uint64_t qsa_cap = qsa_geo.block_cap > 0
+                                         ? static_cast<uint64_t>(qsa_geo.block_cap)
+                                         : 0ull;
+            qsa_state_fixed_bytes_ = qsa_geo.fixed_bytes +
+                                     static_cast<uint64_t>(qsa_geo.n_layer) * qsa_cap *
+                                         qsa_geo.block_row_bytes;
+            if (artifact_.qsa || qsa_n_layer_ > 0) {
+                qsa::RuntimeLimits lim;
+                lim.lanes        = lane_count_;
+                lim.prefix_cache = cfg.prefix_cache_mib > 0 || prefix_cache_ != nullptr;
+                // `speculative` is the paged path's own question: MTP and
+                // DFlash both verify drafts and can reject them, and the paged
+                // rollback moves the committed GDN row back -- it does not trim
+                // the indexer's appended raw keys.
+                lim.speculative = want_mtp_ || want_dflash_;
+                if (auto why = qsa::runtime_refusal(lim)) throw std::runtime_error(*why);
+                // The block cache is FIXED-shape: it covers block_cap complete
+                // blocks, so a served context longer than block_cap*ratio
+                // tokens cannot be honoured (the graph cannot grow). Refuse
+                // by name rather than run a mask that silently drops keys.
+                if (qsa_geo.block_cap > 0) {
+                    const uint64_t need_blocks =
+                        static_cast<uint64_t>(std::max(req_n_ctx, 1)) /
+                        std::max<size_t>(qsa_ratio, 1);
+                    if (need_blocks > static_cast<uint64_t>(qsa_geo.block_cap)) {
+                        throw std::runtime_error(log::format(
+                            "QSA block cache holds %ld complete blocks (%ld tokens); "
+                            "--n-ctx %d needs %llu blocks and the fixed-shape cache cannot "
+                            "grow: lower --n-ctx or re-export with a larger block cap",
+                            qsa_geo.block_cap, qsa_geo.block_cap * static_cast<int64_t>(qsa_ratio),
+                            req_n_ctx, static_cast<unsigned long long>(need_blocks)));
+                    }
+                }
+                // The refusal the served 0.5.4 artifacts silently violated: the
+                // manifest says qsa but the pass never saw the marker, so no
+                // PagedAttention node carries the selection input. Count the
+                // 29-input nodes and refuse when they are not the declared
+                // QSA layer count.
+                if (artifact_.qsa) {
+                    const size_t expected = artifact_.n_qsa_layer > 0
+                                                ? static_cast<size_t>(artifact_.n_qsa_layer)
+                                                : qsa_n_layer_;
+                    if (qsa_pa_nodes != expected) {
+                        throw std::runtime_error(log::format(
+                            "QSA artifact declares %zu QSA layer(s) but only %zu "
+                            "PagedAttention node(s) carry the selection input (29) after "
+                            "SDPAToPagedAttention: the marker did not reach the pass; "
+                            "refusing to load",
+                            expected, qsa_pa_nodes));
+                    }
+                }
+                log::info("load",
+                          "QSA served: %zu compressed block-cache layer(s), %.1f KiB/token "
+                          "(+%.1f KiB fixed tail/counter); one lane, no prefix cache, no paged "
+                          "speculation",
+                          qsa_n_layer_, static_cast<double>(qsa_state_bytes_token_) / 1024.0,
+                          static_cast<double>(qsa_state_fixed_bytes_) / 1024.0);
+            }
+        }
         if (cfg.slice_logits) {
             const int64_t keep = static_cast<int64_t>(1 + drafts_max_);
             // Token axis 0: the paged export's hidden state is [tokens, 1, hidden].
@@ -3093,6 +3206,38 @@ private:
         const size_t resident_base = device_resident_bytes(device);
         log::info("load", "language model ready in %.1f s (paged); device-resident %.2f GiB",
                   seconds_since(t0), static_cast<double>(resident_base) / (1u << 30));
+
+        // ARCINT_PROFILE_RUNTIME_MODEL=<path>: dump the COMPILED graph -- every
+        // node's friendly name, op type and the plugin's own layer/exec names --
+        // so a node that vanished between the model and the runtime (a fusion
+        // that absorbed it, or a fallback) can be named rather than inferred.
+        if (const char* rm_path = std::getenv("ARCINT_PROFILE_RUNTIME_MODEL")) {
+            try {
+                const auto rm = paged_model_.get_runtime_model();
+                std::ofstream out(rm_path);
+                size_t        n = 0;
+                for (const auto& node : rm->get_ordered_ops()) {
+                    std::string layer_type;
+                    std::string exec_type;
+                    const auto& rt = node->get_rt_info();
+                    const auto  lt = rt.find("layerType");
+                    if (lt != rt.end()) layer_type = lt->second.as<std::string>();
+                    const auto et = rt.find("execType");
+                    if (et != rt.end()) exec_type = et->second.as<std::string>();
+                    out << node->get_friendly_name() << '\t' << node->get_type_name()
+                        << '\t' << layer_type << '\t' << exec_type;
+                    out << '\t' << node->get_input_size();
+                    for (const auto& iv : node->input_values()) {
+                        out << ' ' << iv.get_node_shared_ptr()->get_friendly_name();
+                    }
+                    out << '\n';
+                    ++n;
+                }
+                log::info("load", "runtime model dumped to %s (%zu nodes)", rm_path, n);
+            } catch (const std::exception& e) {
+                log::warn("load", "runtime model dump failed: %s", e.what());
+            }
+        }
 
         // One InferRequest per lane, all from the one CompiledModel. Weights are
         // NOT duplicated by this (measured 2026-08-29: a second request adds
@@ -4318,11 +4463,12 @@ private:
         fterms.activations    = static_cast<uint64_t>(std::max<long long>(activation_total, 0));
         fterms.slab_per_lane  = slab;
         // M11 §1.3: the real per-token KV-pool byte size, PLUS the MTP
-        // layer's own per-token state term when the MTP head is loaded --
+        // layer's own per-token state term when the MTP head is loaded, PLUS
+        // the QSA indexer's raw-key history when the artifact carries QSA.
         // `kv_bytes_token_` itself is left untouched (Phase E's own
         // allocation-overshoot math, further down, still needs the true
         // KV-pool rate, not this fit-only inflation).
-        fterms.kv_bytes_token = kv_bytes_token_ + mtp_state_bytes_token;
+        fterms.kv_bytes_token = kv_bytes_token_ + mtp_state_bytes_token + qsa_state_bytes_token_;
         fterms.margin         = margin;
         fterms.lanes           = lanes;
         fterms.kv_block_tokens = static_cast<int>(kv_block_tokens_);
@@ -4677,10 +4823,31 @@ private:
                               static_cast<double>(mtp_state_total_bytes) / (1u << 30),
                               static_cast<double>(mtp_state_bytes_token) / 1024.0)
                 : std::string();
+        // QSA option A: the indexer's raw-key history, folded into the fit's
+        // per-token rate above, reported here at the final `lanes * max_ctx`
+        // this line is about to print. Named next to the KV term it shares.
+        // The multiplier is `max_ctx` -- the fit's budget CEILING, not the
+        // served n_ctx; the plugin allocates the state lazily to the actual
+        // past (VariableState, `usm_device`/`cl_mem`, sized from the Assign's
+        // output layout), so under an explicit `--n-ctx` the device holds
+        // `n_ctx` x the rate, not this figure. The clause spells the
+        // multiplier out so the ceiling is not read as the served allocation.
+        const uint64_t qsa_state_total_bytes =
+            qsa_state_bytes_token_ > 0
+                ? static_cast<uint64_t>(lanes) * static_cast<uint64_t>(max_ctx) *
+                      qsa_state_bytes_token_
+                : 0;
+        const std::string qsa_state_clause =
+            qsa_state_bytes_token_ > 0
+                ? log::format(" + QSA state %.2f GiB (%.1f KiB/token x %lld tok)",
+                              static_cast<double>(qsa_state_total_bytes) / (1u << 30),
+                              static_cast<double>(qsa_state_bytes_token_) / 1024.0,
+                              static_cast<long long>(max_ctx))
+                : std::string();
         log::info("load",
                   "reservation: weights+graph %.2f GiB + drafters %.2f%s + expert slots %.2f (%s) "
                   "+ activations %.2f (all %d lane%s, chunk %zu)%s + margin %.2f + %d x (GDN "
-                  "rows %.1f MiB + KV %.1f KiB/token) of %.2f GiB -> max ctx %lld per lane",
+                  "rows %.1f MiB + KV %.1f KiB/token%s) of %.2f GiB -> max ctx %lld per lane",
                   static_cast<double>(resident_base) / (1u << 30),
                   static_cast<double>(drafter_bytes) / (1u << 30),
                   mtp_state_clause.c_str(),
@@ -4691,6 +4858,7 @@ private:
                   static_cast<double>(margin) / (1u << 30), lanes,
                   static_cast<double>(slab) / (1u << 20),
                   static_cast<double>(kv_bytes_token_) / 1024.0,
+                  qsa_state_clause.c_str(),
                   static_cast<double>(total) / (1u << 30), max_ctx);
         if (packed_values && packed_geom) {
             // Round-9 review (Opus), finding 4: `packed_values_log_per_
@@ -5871,9 +6039,9 @@ private:
             lane->blocks.clear();
             lane->req = {};
             lane->req = paged_model_.create_infer_request();
-            for (size_t i = 0; i < la_state_names_.size(); ++i) {
-                lane->req.set_tensor(la_state_names_[i], lane->la_tensors[i]);
-            }
+            // not the KV pools: they are released right below, and a
+            // request bound to them would keep them alive
+            rebind_lane_request(*lane, /*with_kv_pools=*/false);
         }
         kv_pool_tensors_.clear();
         const size_t after = device_resident_bytes(device);
@@ -5907,11 +6075,36 @@ private:
         // into the first real request, naming pages the BlockPool (created
         // later) still believes are free — two sequences on one KV page.
         lane.blocks.clear();
+        lane.req = {};   // release the old request first: no transient second one
         lane.req = paged_model_.create_infer_request();
+        rebind_lane_request(lane, /*with_kv_pools=*/true);
+    }
+
+    // Everything a freshly created lane request needs before its next forward.
+    // A new InferRequest holds none of the tensors the load bound to the old
+    // one: the GDN state rows, the KV pools and the n-gram table ports
+    // (DESIGN 7.0.2cz: both rebuild paths once dropped the table ports).
+    // tests/python/test_backend_request_bindings.py pins that every rebuild
+    // goes through here.
+    void rebind_lane_request(Lane& lane, bool with_kv_pools) {
         for (size_t i = 0; i < la_state_names_.size(); ++i) {
             lane.req.set_tensor(la_state_names_[i], lane.la_tensors[i]);
         }
-        bind_kv_pools(lane);
+        if (with_kv_pools) bind_kv_pools(lane);
+        bind_ngram_tables(lane);
+    }
+
+    // The n-gram table ports as bind_ngram_ports bound them: the staging
+    // window, or the pinned chunks in port order. Inert before the first bind
+    // and for an IR that declares no table port.
+    void bind_ngram_tables(Lane& lane) {
+        if (ngram_staging_active_) {
+            lane.req.set_tensor(ngram_ports_.chunks[0].name, lane.ngram_staging);
+            return;
+        }
+        for (size_t i = 0; i < ngram_table_tensors_.size(); ++i) {
+            lane.req.set_tensor(ngram_ports_.chunks[i].name, ngram_table_tensors_[i]);
+        }
     }
 
     void bind_kv_pools(Lane& lane) {
@@ -6944,9 +7137,38 @@ private:
             // carries kernel warm-up, and an ascending sweep turns that into a
             // decaying bias that reads as a U-shape in every op -- measured
             // 2026-08-30, and it is why an ascending single-pass sweep cannot be
-            // used to argue about scaling.
+            // used to argue about scaling. The two walls are printed separately:
+            // pass 1 pays whatever the first execution of a shape pays (kernel
+            // bucket builds on this plugin), pass 2 does not, so the difference
+            // is the per-shape first-execution cost.
+            // A QSA artifact's indexer state is NOT rewound by a repeated
+            // forward: each pass appends its tokens to the block cache, so a
+            // second pass would see a doubled history (measured 2026-09-29 at
+            // 5.4 s/step of garbage). Snapshot the Variable TENSORS before pass
+            // 1 (query_state() hands live views, so they are copied) and write
+            // them back before pass 2.
+            std::vector<ov::Tensor> qsa_snaps;
+            if (qsa_n_layer_ > 0) {
+                for (auto& st : lane.req.query_state()) {
+                    ov::Tensor src = st.get_state();
+                    ov::Tensor dst(src.get_element_type(), src.get_shape());
+                    src.copy_to(dst);
+                    qsa_snaps.push_back(dst);
+                }
+            }
+            const auto t_p1 = std::chrono::steady_clock::now();
             paged_forward(lane, embed_paged(lane, chunk), at, {0}, 0);
+            const double pass1_s = seconds_since(t_p1);
+            if (!qsa_snaps.empty()) {
+                auto states = lane.req.query_state();
+                for (size_t i = 0; i < states.size() && i < qsa_snaps.size(); ++i)
+                    states[i].set_state(qsa_snaps[i]);
+            }
+            const auto t_p2 = std::chrono::steady_clock::now();
             paged_forward(lane, embed_paged(lane, chunk), at, {0}, 0);
+            const double pass2_s = seconds_since(t_p2);
+            log::info("profile", "prefill M=%zu past=%zu: pass1 %.2f s, pass2 %.2f s, first-shape %.2f s",
+                      m, past, pass1_s, pass2_s, pass1_s - pass2_s);
             {
                 const ov::Tensor lg = lane.req.get_tensor("logits");
                 std::ostringstream os;
@@ -8002,6 +8224,14 @@ private:
     std::string                    gpu_plugin_build_;
     bool                           packed_values_mixed_stage_on_micro_ = false;
     size_t                         la_row_bytes_     = 0;
+    // QSA option A (campaign qsa, step 3 T4): the indexer's raw-key history,
+    // summarised by qsa::state_geometry from the served graph's own Variables.
+    // Zero for a non-QSA or pre-QSA artifact. Folded into the fit's per-token
+    // rate, never into kv_bytes_token_ (Phase E's allocation math still needs
+    // the true KV-pool rate).
+    size_t                         qsa_n_layer_           = 0;
+    uint64_t                       qsa_state_bytes_token_ = 0;
+    uint64_t                       qsa_state_fixed_bytes_ = 0;  // tail + counter, all layers
     size_t                         logits_keep_rows_ = 0;  // 0: unsliced
     size_t                         cache_grid_       = 0;  // paged snapshot grid; 0: the chunk
     ov::RemoteContext              usm_ctx_;              // for USM-host index inputs
@@ -8124,7 +8354,6 @@ private:
     ngram::StagingGeometry        ngram_staging_geom_{};
     int                           ngram_staging_fd_     = -1;
     uint64_t                      ngram_staging_base_   = 0;
-    ov::RemoteTensor              ngram_staging_tensor_;
     std::optional<ngram::HashParams> ngram_hash_;
 
     // Bind the table to the ports, once, after the lanes exist. The source
@@ -8201,11 +8430,12 @@ private:
                                   static_cast<uint64_t>(t->offset);
             const ov::Shape sh{ngram_staging_geom_.staging_rows,
                                ngram_staging_geom_.row_bytes};
-            ngram_staging_tensor_ = rctx.create_tensor(
-                ov::element::u8, sh,
-                {{ov::intel_gpu::shared_mem_type.name(), ov::intel_gpu::SharedMemType::USM_HOST_BUFFER}});
-            for (auto& lane : lanes_)
-                lane->req.set_tensor(ngram_ports_.chunks[0].name, ngram_staging_tensor_);
+            for (auto& lane : lanes_) {
+                lane->ngram_staging = rctx.create_tensor(
+                    ov::element::u8, sh,
+                    {{ov::intel_gpu::shared_mem_type.name(), ov::intel_gpu::SharedMemType::USM_HOST_BUFFER}});
+                lane->req.set_tensor(ngram_ports_.chunks[0].name, lane->ngram_staging);
+            }
             ngram_staging_active_ = true;
         } else {
             const std::string why = ngram::check_table_source(*t, gguf_file_->bytes(*t), ngram_ports_);
@@ -8248,11 +8478,11 @@ private:
         if (ngram_staging_active_) {
             log::info("load",
                       "ngram table STAGED: %zu port(s) of %zu rows x %zu B = %.3f MiB of USM host "
-                      "staging from %s (the %llu-row table stays on disk, read per forward); "
-                      "id ports %s, conv_mask %s; hash ordinal 0",
+                      "staging per lane x %zu lane(s) from %s (the %llu-row table stays on disk, "
+                      "read per forward); id ports %s, conv_mask %s; hash ordinal 0",
                       ngram_ports_.chunks.size(), ngram_ports_.total_rows, ngram_ports_.row_bytes,
                       static_cast<double>(ngram_ports_.total_rows * ngram_ports_.row_bytes) / (1u << 20),
-                      ngram::kTableTensor,
+                      lanes_.size(), ngram::kTableTensor,
                       static_cast<unsigned long long>(ngram_staging_geom_.table_rows),
                       ngram_ports_.declares_ids ? "declared" : "absent",
                       ngram_ports_.declares_conv_mask ? "declared" : "absent");
@@ -8320,7 +8550,7 @@ private:
             // one staging port: fill it with exactly the rows this forward
             // names, then index it by the slot the plan assigned (local[i] = i)
             void* dst =
-                ngram_staging_tensor_.get_params().at(ov::intel_gpu::mem_handle.name()).as<void*>();
+                lane.ngram_staging.get_params().at(ov::intel_gpu::mem_handle.name()).as<void*>();
             local = ngram::stage_from_file(ngram_staging_fd_, ngram_staging_base_,
                                            ngram_staging_geom_.row_bytes, global,
                                            ngram_staging_geom_, static_cast<uint8_t*>(dst));

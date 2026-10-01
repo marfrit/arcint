@@ -120,6 +120,12 @@ struct ArtifactInfo {
     int         n_layer      = 0;
     int         n_gdn_layer  = 0;
     int         n_attn_layer = 0;
+    // Of `n_attn_layer`, how many are QSA-served (serving-shape.json `qsa`);
+    // zero for a dense-causal or pre-QSA artifact. `qsa` is the manifest flag
+    // itself, so a reader can tell "declared QSA" from "not declared" even at
+    // depth 0.
+    int         n_qsa_layer  = 0;
+    bool        qsa          = false;
     std::string arch_hash;
     std::string template_hash;
     std::string tokenizer_hash;

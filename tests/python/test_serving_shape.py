@@ -2636,3 +2636,76 @@ def _cpu_gather_matmuls(compiled):
         if "gathermatmul" in lt.lower():
             n += 1
     return n
+
+
+def test_every_intermediate_of_the_iq4nl_decode_is_exact_in_f16():
+    """STRUCTURAL, on CPU at f32: every f32 intermediate of
+    `ngram_dequant_iq4nl` except the last product (`kv * d`, and the Reshape
+    of it) holds a value that f16 represents exactly, for every finite f16
+    scale: all 63,488 byte pairs whose exponent is not 31. Exponent 31 is
+    inf/NaN, never a table scale, and the power table maps it to 2**16,
+    which overflows f16.
+
+    Why: the GPU plugin runs the served graph at f16 execution precision
+    (no inference-precision hint on the main model), and on the A770 the
+    decode that formed the scale's bit pattern as `lo + 256 * hi` (up to
+    65,535; f16 is exact only to 2,048) came back at 1.41 % relative error,
+    93 % of elements wrong, where f32 execution is exact
+    (`measured-here`, 2026-09-27, 64 x 16 real table rows, DESIGN 7.0.2cz).
+    Building the sign, exponent and mantissa from the two bytes apart keeps
+    every intermediate an integer <= 255, a dyadic fraction of <= 11
+    significant bits, a table power of two, or the f16 scale itself; the
+    card then returns the exact decode rounded to f16, bit for bit, in the
+    same probe.
+
+    RED on the `lo + 256 * hi` decode (`measured-here`): 4 of its 29
+    intermediates are not f16-exact (`bits` up to 64,511, `rest`, and the
+    two divides that read them).
+    """
+    head_dim, Hn = 160, 16
+    rb = ss.ngram_row_bytes(head_dim)
+    nb = head_dim // 32
+    pairs = np.arange(65536, dtype=np.uint32)
+    pairs = pairs[((pairs >> 10) & 0x1F) != 31]           # finite scales only (exponent 31 = inf/NaN)
+    assert pairs.size == 63488
+    per_step = nb * Hn                                    # scale pairs per token
+    pairs = np.concatenate([pairs, np.zeros(-pairs.size % per_step, np.uint32)])
+    n = pairs.size // nb                                  # rows covering every pair, padded with pair 0
+    raw = np.random.default_rng(3).integers(0, 256, size=(n, rb), dtype=np.uint8)
+    flat = pairs.reshape(n, nb)
+    for b in range(nb):
+        raw[:, b * 18] = (flat[:, b] & 0xFF).astype(np.uint8)
+        raw[:, b * 18 + 1] = (flat[:, b] >> 8).astype(np.uint8)
+    x = ov.opset13.parameter([1, -1, Hn, rb], ov.Type.f32)
+    out = ss.ngram_dequant_iq4nl(x, head_dim)
+    last = {out.get_instance_id(), out.input_value(0).get_node().get_instance_id()}
+    probes = []
+    seen = set()
+    stack = [out.input_value(0).get_node()]
+    while stack:                                          # every node between x and out
+        node = stack.pop()
+        if node.get_instance_id() in seen:
+            continue
+        seen.add(node.get_instance_id())
+        for inp in node.inputs():
+            stack.append(inp.get_source_output().get_node())
+        if (node.get_type_name() not in ("Parameter", "Constant")
+                and node.get_instance_id() not in last
+                and node.get_output_element_type(0) == ov.Type.f32):
+            probes.append(node)
+    assert len(probes) == 29
+    model = ov.Model([ov.opset13.result(p) for p in probes], [x], "iq4nl_decode_f16")
+    rows = n
+    req = ov.Core().compile_model(model, "CPU", {"INFERENCE_PRECISION_HINT": "f32"}).create_infer_request()
+    req.set_input_tensor(ov.Tensor(np.ascontiguousarray(
+        raw[:rows].astype(np.float32).reshape(1, rows // Hn, Hn, rb))))
+    req.infer()
+    bad = []
+    for i, p in enumerate(probes):
+        v = req.get_output_tensor(i).data
+        assert np.isfinite(v).all()
+        if not np.array_equal(v.astype(np.float16).astype(np.float32), v):
+            bad.append(f"{p.get_type_name()} max {float(np.abs(v).max()):g}")
+    print(f"\n[iq4nl-decode f16] {len(probes)} intermediates over {rows * nb} scale pairs; "
+          f"not f16-exact: {bad}")
+    assert not bad

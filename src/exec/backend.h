@@ -94,6 +94,11 @@ struct ModelStatus {
     int         n_layer      = 0;
     int         n_gdn_layer  = 0;
     int         n_attn_layer = 0;
+    // QSA (campaign qsa, step 3): of `n_attn_layer`, how many are QSA-served
+    // (the manifest's `qsa`), and whether the loader actually bound one. The
+    // raw-key history is state, not KV, which is why /props reports it apart.
+    int         n_qsa_layer  = 0;
+    bool        qsa_enabled  = false;
     bool        mtp_enabled  = false;
     uint64_t    weights_bytes = 0;
 

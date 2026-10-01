@@ -76,6 +76,11 @@ ACCEPTANCE IS TWO-LEGGED (both are needed; neither substitutes for the other):
         T=2052   |dense - QSA| max-abs 2.307817e-06   rows differing    1/2052
         T=2080   |dense - QSA| max-abs 2.385560e-02   rows differing   29/2080
 
+    [DATED 2026-09-28: the magnitudes above were drawn at 692c0a6 with the
+    (1 + w) fold applied twice to the q/k gammas; with the feed's gamma1 the
+    pin reads 5.082879e-05 over 1/2052 and 1.064551e-03 over 29/2080 rows.
+    The above-2051 bar built on it is withdrawn.]
+
     THE BOUNDARY IS 2051, NOT THE BUDGET 2048 (CF-BOUNDS, measured 2026-09-12).
     Every row is dense iff T <= block_topk*ratio + ratio - 1 = 2051, and the
     pruned-row count at any T is exactly max(0, T - 2051) -- 1 at T=2052 and 29
@@ -120,6 +125,7 @@ Entry points:
 import numpy as np
 from openvino import Model, Type
 from openvino import opset13 as op
+from openvino import opset11 as _opset11   # TopK with `stable` (the QSA tie rule)
 
 from .gdn import (_add, _c, _i, _mm, _mul, _reshape, _rmean, _rsqrt_eps,  # noqa: F401
                   _slice, _transpose)
@@ -253,9 +259,108 @@ def _repeat_heads_h(x, kv_heads, heads, r, T):
                     [1, heads, T, x.shape[3]])     # pin 791
 
 
-def _attention_subgraph(hidden, pid_node, config, state, T):
+def _rope_last(x, cos, sin, rotary):
+    """pin 653-668 (apply_rotary_pos_emb) on ONE tensor whose cos/sin are
+    already broadcast-shaped: the leading `rotary` band rotated, the rest kept."""
+    d = x.get_output_partial_shape(0)[-1].get_length()
+    xr, xn = _slice(x, 0, rotary, 1, -1), _slice(x, rotary, d, 1, -1)
+    xr = _add(_mul(xr, cos), _mul(_rotate_half(xr), sin))
+    return op.concat([xr, xn], axis=-1)
+
+
+def _qsa_additive_mask(hidden, pid_node, config, state, T, cosT_c, sinT_c, rotary):
+    """The QSA indexer (pin 673-779, `Qwen4ExpTextQSAIndexer`) for one static
+    prefill of T tokens, as the additive [1, 1, T, T] mask the pin adds to the
+    causal one (pin 857-858): 0.0 where a query keeps a key, finfo(f32).min
+    elsewhere. Static T turns the pin's per-query Python loop into tensors:
+
+      * q, raw key: the fused index_qk_proj split [n_heads*d | kv*d] (pin
+        707-711); q through q_layernorm and the rope at its own position
+        (pin 712-714); the key stays RAW (pin 711; the cache keeps it raw).
+      * blocks: a query i sees tokens 0..i (causal), so its complete blocks
+        are b < (i+1)//ratio and block b is tokens ratio*b..ratio*b+ratio-1 for
+        EVERY query -- one pooled key per block serves all rows: the f32 mean
+        (pin 743), k_layernorm (pin 744), the rope at the group's first
+        position (pin 745-749).
+      * scores: relu(q_h . k_b) summed over the index heads in head order, then
+        DIVIDED by sqrt(d) (pin 750-755) -- a division, as the pin writes it.
+      * selection: topk(min(block_topk, num_complete_blocks)) (pin 757) as ONE
+        TopK over [T, blocks] with k = min(block_topk, blocks) and every block
+        a row cannot see at -inf; a -inf pick is never kept, so a row with
+        fewer complete blocks than k keeps exactly its complete blocks. Equal
+        scores at the cut keep the lower block index (the pin leaves that
+        order to torch.topk, which does not specify it).
+      * the incomplete tail (pin 762) is kept unconditionally.
+    Every row is dense iff T <= block_topk*ratio + ratio - 1 (2051 here)."""
+    nh = int(config.indexer_n_heads)
+    dh = int(config.indexer_head_dim)
+    assert int(config.indexer_kv_heads) == 1, (
+        f"the indexer emits ONE raw key per token (pin 709-711); config says "
+        f"{config.indexer_kv_heads}")
+    ratio = int(config.indexer_compress_ratio)
+    block_topk = int(config.indexer_budget) // ratio          # pin 684
+    eps = config.rms_norm_eps
+    minf = np.float32(np.finfo(np.float32).min)
+    rows = np.arange(T)
+    nblk_row = (rows + 1) // ratio                            # complete blocks per query
+    # the tail: tokens ratio*nblk_i .. i (pin 762)
+    j = np.arange(T)
+    tail = (j[None, :] >= (ratio * nblk_row)[:, None]) & (j[None, :] <= rows[:, None])
+    nb = T // ratio
+    if nb == 0:
+        m = np.where(tail, np.float32(0.0), minf).astype(np.float32)
+        return _c(m.reshape(1, 1, T, T))
+
+    qk = _mm(hidden, _c(state["indexer.index_qk_proj.weight"]), tb=True)   # [1,T,(nh+kv)*dh]
+    q = _reshape(_slice(qk, 0, nh * dh, 1, 2), [1, T, nh, dh])
+    kraw = _slice(qk, nh * dh, (nh + 1) * dh, 1, 2)                       # [1,T,dh]
+    q = _rmsnorm_hd(q, state["indexer.q_layernorm.weight"], eps, dh)      # pin 713
+    cos_q = _reshape(op.gather(cosT_c, pid_node, op.constant(np.int64(0))), [1, T, 1, rotary])
+    sin_q = _reshape(op.gather(sinT_c, pid_node, op.constant(np.int64(0))), [1, T, 1, rotary])
+    q = _rope_last(q, cos_q, sin_q, rotary)                               # pin 714
+
+    kb = _reshape(_slice(kraw, 0, nb * ratio, 1, 1), [1, nb, ratio, dh])
+    kb = op.reduce_mean(kb, op.constant(np.int64(2)), keep_dims=False)    # pin 743: f32 mean
+    kb = _reshape(kb, [1, nb, 1, dh])
+    kb = _rmsnorm_hd(kb, state["indexer.k_layernorm.weight"], eps, dh)    # pin 744
+    starts = op.gather(pid_node, op.constant(np.arange(0, nb * ratio, ratio, dtype=np.int64)),
+                       op.constant(np.int64(1)))                          # [1, nb]
+    cos_b = _reshape(op.gather(cosT_c, starts, op.constant(np.int64(0))), [1, nb, 1, rotary])
+    sin_b = _reshape(op.gather(sinT_c, starts, op.constant(np.int64(0))), [1, nb, 1, rotary])
+    kb = _reshape(_rope_last(kb, cos_b, sin_b, rotary), [nb, dh])         # pin 745-749
+
+    s = op.matmul(_reshape(q, [T, nh, dh]), kb, False, True)             # [T, nh, nb]
+    s = op.relu(s)
+    acc = _slice(s, 0, 1, 1, 1)                                           # pin 755: sum over heads
+    for h in range(1, nh):
+        acc = _add(acc, _slice(s, h, h + 1, 1, 1))
+    s = op.divide(_reshape(acc, [T, nb]), _c(np.float32(np.sqrt(dh))))   # pin 755: / sqrt(d)
+
+    visible = np.arange(nb)[None, :] < nblk_row[:, None]                  # [T, nb]
+    s = op.select(op.constant(np.ascontiguousarray(visible)), s, _c(np.float32(-np.inf)))
+    k = min(block_topk, nb)
+    # Ties: relu makes exactly-zero scores common, and when they straddle the
+    # cut the pin's torch.topk picks among them in an unspecified order
+    # (measured: every emitted-vs-pin difference at T=2052/2080/4096 is such a
+    # tie). The rule here is fixed and documented instead: among equal scores
+    # the LOWER block index is kept (TopK stable, sorted by value).
+    tk = _opset11.topk(s, op.constant(np.int64(k)), 1, "max", "value", Type.i64, stable=True)
+    kept = op.convert(op.is_finite(tk.output(0)), Type.f32)               # a -inf pick is not a block
+    blocksel = op.scatter_elements_update(_c(np.zeros((T, nb), np.float32)), tk.output(1), kept,
+                                          op.constant(np.int64(1)))       # [T, nb] 0/1
+    tokensel = _reshape(op.concat([_reshape(blocksel, [T, nb, 1])] * ratio, axis=2), [T, nb * ratio])
+    if nb * ratio < T:
+        tokensel = op.concat([tokensel, _c(np.zeros((T, T - nb * ratio), np.float32))], axis=1)
+    allowed = op.maximum(tokensel, _c(tail.astype(np.float32)))
+    mask = op.select(op.greater(allowed, _c(np.float32(0.5))), _c(np.float32(0.0)), _c(minf))
+    return _reshape(mask, [1, 1, T, T])
+
+
+def _attention_subgraph(hidden, pid_node, config, state, T, qsa=False, mask_sink=None):
     """hidden [1,T,H] f32 + position_ids [1,T] i64 -> attn_out [1,T,H]. The
-    dense-causal block: pin 864-900 minus the indexer (pin 855-860)."""
+    dense-causal block: pin 864-900 minus the indexer (pin 855-860). With
+    `qsa`, the indexer's mask (_qsa_additive_mask) replaces the causal one;
+    `mask_sink` (a list) receives it, for the cells."""
     H = config.hidden_size
     heads = config.num_attention_heads
     kv = config.num_key_value_heads
@@ -299,9 +404,17 @@ def _attention_subgraph(hidden, pid_node, config, state, T):
     # additive mask is baked: 0.0 allowed, finfo(f32).min strictly above the
     # diagonal -- the value the pin's eager path carries (it converts the bool
     # mask with torch.finfo(dtype).min).
-    causal = np.triu(np.full((T, T), np.float32(np.finfo(np.float32).min),
-                             np.float32), 1)
-    scores = _add(scores, _c(causal.reshape(1, 1, T, T)))
+    if qsa:
+        # the QSA mask already carries the causal one: it keeps only visible
+        # keys (its blocks and tail lie at or before the query)
+        mask = _qsa_additive_mask(hidden, pid_node, config, state, T, _c(cosT), _c(sinT), rotary)
+    else:
+        causal = np.triu(np.full((T, T), np.float32(np.finfo(np.float32).min),
+                                 np.float32), 1)
+        mask = _c(causal.reshape(1, 1, T, T))
+    if mask_sink is not None:
+        mask_sink.append(mask)
+    scores = _add(scores, mask)
     att = op.softmax(scores, -1)                            # pin 811 (f32)
     out = _mm(att, v)                                       # pin 813
     out = _transpose(out, [0, 2, 1, 3])                     # pin 814
@@ -331,4 +444,313 @@ def build_dense_attention_model(config, state, seq_len):
     return Model([res], [hidden, pid], "qwen4_exp_dense_attention")
 
 
-__all__ = ["build_dense_attention_model", "emit_dense_attention", "_freqs_tables"]
+def _qsa_mask_dynamic(qn, raw_full, pid, config, cosT_c, sinT_c, rotary, state):
+    """The indexer's selection over the WHOLE key history, dynamic in T and in
+    the past length: `qn` [1, T, nh, dh] the current queries (normed and roped
+    at their positions), `raw_full` [1, N, dh] every raw key so far (the pin's
+    update_indexer, cache_utils 340-353), `pid` [1, T] the queries' ABSOLUTE
+    positions. Returns the additive [1, 1, T, N] mask. The algebra is
+    `_qsa_additive_mask`'s, with a query at absolute position a seeing the
+    complete blocks b < (a+1)//ratio and the tail ratio*((a+1)//ratio)..a;
+    the blocks are pooled from the history each call, as the pin pools them
+    per query. A block's rope is gathered at its first token's INDEX (4b),
+    which is its position while text positions equal token indices -- the pin
+    assumes the same (`full_cos.index_select(group_starts)`, pin 745-749).
+    N < ratio (no complete block, TopK k = 0) runs on the CPU plugin (review
+    probe); untested on the GPU plugin."""
+    nh = int(config.indexer_n_heads)
+    dh = int(config.indexer_head_dim)
+    ratio = int(config.indexer_compress_ratio)
+    block_topk = int(config.indexer_budget) // ratio
+    eps = config.rms_norm_eps
+    minf = np.float32(np.finfo(np.float32).min)
+    i64 = lambda v: op.constant(np.array(v, np.int64))
+    n_len = op.gather(op.shape_of(raw_full, output_type="i64"), i64(1), i64(0))   # scalar N
+    nb = op.divide(n_len, i64(ratio))                                              # scalar, floor
+    nbr = op.multiply(nb, i64(ratio))
+    kb = op.slice(raw_full, i64([0]), op.unsqueeze(nbr, i64(0)), i64([1]), i64([1]))
+    kb = op.reshape(kb, op.concat([i64([1]), op.unsqueeze(nb, i64(0)), i64([ratio, dh])], 0), False)
+    kb = op.reduce_mean(kb, i64(2), keep_dims=False)                               # pin 743
+    kb = _reshape(kb, [1, -1, 1, dh])
+    kb = _rmsnorm_hd(kb, state["indexer.k_layernorm.weight"], eps, dh)            # pin 744
+    starts = op.range(i64(0), nbr, i64(ratio), Type.i64)                           # [nb]
+    cos_b = _reshape(op.gather(cosT_c, starts, i64(0)), [1, -1, 1, rotary])
+    sin_b = _reshape(op.gather(sinT_c, starts, i64(0)), [1, -1, 1, rotary])
+    kb = _reshape(_rope_last(kb, cos_b, sin_b, rotary), [-1, dh])                 # [nb, dh]
+
+    s = op.relu(op.matmul(_reshape(qn, [-1, nh, dh]), kb, False, True))           # [T, nh, nb]
+    acc = _slice(s, 0, 1, 1, 1)
+    for h in range(1, nh):
+        acc = _add(acc, _slice(s, h, h + 1, 1, 1))
+    s = op.divide(op.squeeze(acc, i64([1])), _c(np.float32(np.sqrt(dh))))          # [T, nb]
+
+    a = _reshape(pid, [-1, 1])                                                     # [T, 1] absolute
+    lim = op.divide(op.add(a, i64(1)), i64(ratio))                                 # complete blocks
+    b_idx = op.unsqueeze(op.range(i64(0), nb, i64(1), Type.i64), i64(0))           # [1, nb]
+    s = op.select(op.less(b_idx, lim), s, _c(np.float32(-np.inf)))
+    k = op.minimum(i64(block_topk), nb)
+    tk = _opset11.topk(s, k, 1, "max", "value", Type.i64, stable=True)
+    kept = op.convert(op.is_finite(tk.output(0)), Type.f32)
+    zeros = op.broadcast(_c(np.float32(0.0)), op.shape_of(s, output_type="i64"))
+    blocksel = op.scatter_elements_update(zeros, tk.output(1), kept, i64(1))      # [T, nb]
+    tokensel = op.reshape(op.concat([op.unsqueeze(blocksel, i64(2))] * ratio, axis=2), i64([0, -1]), True)
+    t_dim = op.gather(op.shape_of(s, output_type="i64"), i64([0]), i64(0))        # [1]
+    rem = op.unsqueeze(op.subtract(n_len, nbr), i64(0))                            # [1], 0..ratio-1
+    pad = op.broadcast(_c(np.float32(0.0)), op.concat([t_dim, rem], 0))
+    tokensel = op.concat([tokensel, pad], axis=1)                                  # [T, N]
+    j = op.unsqueeze(op.range(i64(0), n_len, i64(1), Type.i64), i64(0))            # [1, N]
+    tail = op.logical_and(op.greater_equal(j, op.multiply(lim, i64(ratio))), op.less_equal(j, a))
+    allowed = op.maximum(tokensel, op.convert(tail, Type.f32))
+    mask = op.select(op.greater(allowed, _c(np.float32(0.5))), _c(np.float32(0.0)), _c(minf))
+    return op.unsqueeze(mask, i64([0, 1]))                                         # [1, 1, T, N]
+
+
+def _qsa_block_cache_mask(qn, new_raw, pid, config, state, cosT_c, sinT_c,
+                          rotary, block_var, tail_var, pos_var, sinks, layer,
+                          block_cap):
+    """The compressed block-key cache (2026-09-30; prior art
+    `docs/campaigns/research-qsa.md`). One POOLED + k-normed + roped f32 row
+    per completed `ratio`-token block, PLUS the <= ratio-1 raw keys of the
+    incomplete tail, all in state Variables. Only the blocks completed by the
+    new tokens are pooled/normed/roped; the scores run over the cached rows;
+    per-query visibility stays by ABSOLUTE position (a block counts only once
+    complete at that query) and the stable lower-index TopK rule is unchanged.
+
+    `qn` [1,T,nh,dh] is the query normed and roped at its own position;
+    `new_raw` [1,T,dh] the new raw keys (pre-norm, pre-rope). The block state
+    is a FIXED [block_cap, dh] Variable -- shape-stable across every decode
+    step -- with rows past the valid count scored -inf. Every Range here has a
+    CONSTANT bound: the GPU plugin throws "Count is called for dynamic shape"
+    on a dynamically bounded Range (measured 2026-09-30 at load), so the
+    per-block positions and the token index are built over the fixed cap and
+    sliced."""
+    nh = int(config.indexer_n_heads)
+    dh = int(config.indexer_head_dim)
+    ratio = int(config.indexer_compress_ratio)
+    block_topk = int(config.indexer_budget) // ratio
+    eps = config.rms_norm_eps
+    minf = np.float32(np.finfo(np.float32).min)
+    tail_cap = ratio - 1
+    cap = int(block_cap)
+    i64 = lambda v: op.constant(np.array(v, np.int64))
+    cf = lambda v: _c(np.float32(v))
+    sqrt_dh = cf(np.sqrt(dh))
+
+    def scalar(n):
+        return op.squeeze(op.gather(op.shape_of(n, output_type="i64"), i64([0]), i64(0)),
+                          i64(0))
+
+    # --- state (fixed shapes)
+    blocks = op.read_value(_c(np.zeros((cap, dh), np.float32)), block_var)     # [cap, dh]
+    tail = op.read_value(_c(np.zeros((tail_cap, dh), np.float32)), tail_var)  # [tail_cap, dh]
+    pos = op.read_value(op.constant(np.array([0], np.int32)), pos_var)        # [1] i32
+    pos_s = op.convert(op.squeeze(pos, i64(0)), Type.i64)                     # scalar i64
+    tail_len = op.mod(pos_s, i64(ratio))                                      # 0..ratio-1
+    nb_old = op.divide(pos_s, i64(ratio))                                     # scalar blocks
+
+    # --- the tail's raw keys, then the new raw keys; complete blocks only
+    tail_used = op.slice(tail, i64([0]), op.unsqueeze(tail_len, i64(0)), i64([1]), i64([0]))
+    stream = op.concat([tail_used, _reshape(new_raw, [-1, dh])], axis=0)      # [tail_len+T, dh]
+    stream_len = scalar(stream)
+    n_new = op.divide(stream_len, i64(ratio))                                 # scalar
+    used_s = op.multiply(n_new, i64(ratio))
+    complete = op.slice(stream, i64([0]), op.unsqueeze(used_s, i64(0)), i64([1]), i64([0]))
+    complete = op.reshape(
+        complete, op.concat([i64([1]), op.unsqueeze(n_new, i64(0)), i64([ratio, dh])], 0), False)
+    pooled = op.reduce_mean(complete, i64(2), keep_dims=False)                # pin 743 f32 mean
+    pooled = _reshape(pooled, [1, -1, 1, dh])
+    pooled = _rmsnorm_hd(pooled, state["indexer.k_layernorm.weight"], eps, dh)  # pin 744
+    # Rope positions for the new blocks, over a CONSTANT index range; gather
+    # the whole cap and slice to n_new (no dynamically bounded Range).
+    t_all = op.range(i64(0), i64(cap), i64(1), Type.i64)                      # [cap]
+    pos_all = op.multiply(op.add(nb_old, t_all), i64(ratio))                  # [cap]
+    cos_all = op.gather(cosT_c, pos_all, i64(0))                             # [cap, rotary]
+    sin_all = op.gather(sinT_c, pos_all, i64(0))
+    cos_b = _reshape(op.slice(cos_all, i64([0]), op.unsqueeze(n_new, i64(0)), i64([1]), i64([0])),
+                      [1, -1, 1, rotary])
+    sin_b = _reshape(op.slice(sin_all, i64([0]), op.unsqueeze(n_new, i64(0)), i64([1]), i64([0])),
+                      [1, -1, 1, rotary])
+    pooled = _reshape(_rope_last(pooled, cos_b, sin_b, rotary), [-1, dh])     # pin 745-749
+
+    # --- append: valid rows only, then zero-pad back to the fixed cap.
+    used = op.add(nb_old, n_new)
+    valid_old = op.slice(blocks, i64([0]), op.unsqueeze(nb_old, i64(0)), i64([1]), i64([0]))
+    appended = op.concat([valid_old, pooled], axis=0)
+    pad = op.subtract(i64(cap), used)
+    zeros = op.broadcast(cf(0.0), op.concat([op.unsqueeze(pad, i64(0)), i64([dh])], 0))
+    blocks_new = op.concat([appended, zeros], axis=0)                         # [cap, dh]
+    # Force a STATIC Assign input: the GPU plugin's Assign/state path calls
+    # layout::Count() on a dynamic shape and throws (the full served graph's
+    # 'Count is called for dynamic shape', 2026-09-30).
+    blocks_new = op.reshape(blocks_new, i64([cap, dh]), False)
+    blk = op.assign(blocks_new, block_var)
+    blk.set_friendly_name(f"attn{layer}/qsa_block_assign")
+    sinks.append(blk)
+
+    # --- new tail = the leftover raw keys, zero-padded to tail_cap.
+    leftover = op.subtract(stream_len, used_s)
+    tail_pick = op.slice(stream, op.unsqueeze(used_s, i64(0)), op.unsqueeze(stream_len, i64(0)),
+                         i64([1]), i64([0]))
+    pad_t = op.subtract(i64(tail_cap), leftover)
+    zeros_t = op.broadcast(cf(0.0), op.concat([op.unsqueeze(pad_t, i64(0)), i64([dh])], 0))
+    tail_new = op.concat([tail_pick, zeros_t], axis=0)                        # [tail_cap, dh]
+    tail_new = op.reshape(tail_new, i64([tail_cap, dh]), False)
+    tasg = op.assign(tail_new, tail_var)
+    tasg.set_friendly_name(f"attn{layer}/qsa_tail_assign")
+    sinks.append(tasg)
+    t_dim = op.gather(op.shape_of(qn, output_type="i64"), i64([1]), i64(0))   # [1] current T
+    t_s = op.squeeze(t_dim, i64(0))
+    pos_new = op.add(pos_s, t_s)
+    pasg = op.assign(op.unsqueeze(op.convert(pos_new, Type.i32), i64(0)), pos_var)
+    pasg.set_friendly_name(f"attn{layer}/qsa_pos_assign")
+    sinks.append(pasg)
+
+    # --- scores over the cached rows
+    s = op.matmul(_reshape(qn, [-1, nh, dh]), blocks_new, False, True)        # [T, nh, cap]
+    s = op.relu(s)
+    acc = _slice(s, 0, 1, 1, 1)
+    for h in range(1, nh):
+        acc = _add(acc, _slice(s, h, h + 1, 1, 1))
+    s = op.divide(op.squeeze(acc, i64([1])), sqrt_dh)                         # pin 755 / sqrt(d)
+
+    pid_col = op.reshape(pid, i64([-1, 1]), False)                            # [T,1]
+    lim_col = op.divide(op.add(pid_col, i64(1)), i64(ratio))                  # [T,1] blocks
+    b_idx = op.range(i64(0), i64(cap), i64(1), Type.i64)                      # [cap] constant
+    visible = op.less(op.unsqueeze(b_idx, i64(0)), lim_col)                   # [T, cap]
+    s = op.select(visible, s, cf(-np.inf))
+    tk = _opset11.topk(s, op.constant(np.int64(block_topk)), 1, "max", "value", Type.i64,
+                       stable=True)
+    kept = op.convert(op.is_finite(tk.output(0)), Type.f32)
+    zeros_s = op.broadcast(cf(0.0), op.shape_of(s, output_type="i64"))
+    blocksel = op.scatter_elements_update(zeros_s, tk.output(1), kept, i64(1))  # [T, cap] 0/1
+
+    # --- expand selected blocks to tokens, then the positional tail. The token
+    # index is a CONSTANT range to cap*ratio, sliced to N.
+    tokensel = op.concat([op.unsqueeze(blocksel, i64(2))] * ratio, axis=2)
+    tokensel = op.reshape(tokensel, i64([0, -1]), True)                       # [T, cap*ratio]
+    n_len = op.add(pos_s, t_s)                                               # N = past + T
+    tokensel = op.slice(tokensel, i64([0]), op.unsqueeze(n_len, i64(0)), i64([1]), i64([1]))
+    j_all = op.unsqueeze(op.range(i64(0), i64(cap * ratio), i64(1), Type.i64), i64(0))  # [1, cap*ratio]
+    tail_full = op.logical_and(op.greater_equal(j_all, op.multiply(lim_col, i64(ratio))),
+                               op.less_equal(j_all, pid_col))
+    tail_mask = op.slice(tail_full, i64([0]), op.unsqueeze(n_len, i64(0)), i64([1]), i64([1]))
+    allowed = op.maximum(tokensel, op.convert(tail_mask, Type.f32))
+    mask = op.select(op.greater(allowed, cf(0.5)), cf(0.0), cf(minf))
+    return op.unsqueeze(mask, i64([0, 1]))                                    # [1, 1, T, N]
+
+
+def _state_var(tag, shape):
+    from openvino.op import util as ovutil
+    import openvino as _ov
+    info = ovutil.VariableInfo()
+    info.data_shape = _ov.PartialShape(shape)
+    info.data_type = Type.f32
+    info.variable_id = tag
+    return ovutil.Variable(info)
+
+
+def build_qsa_stateful_attention_model(config, state, rope_span, with_mask=False, layer=0):
+    """Step 2 of the qsa campaign: the attention block WITH its indexer, stateful
+    and UN-PAGED, dynamic in T -- K and V in Variables [1, kv, N, d], the
+    indexer's raw keys in a Variable [1, N, dh], one eager attention over the
+    whole history under the indexer's mask. The parity form for the served
+    graph's algebra (chunked prefill and decode across the 2,051 boundary);
+    the served graph itself goes through paged attention (step 3).
+    Inputs `hidden_states` [1, T, H], `position_ids` [1, T] (absolute, below
+    `rope_span`: the rope tables cover positions 0..rope_span-1); result
+    `output`, and with `with_mask` also `qsa_mask` [1, 1, T, N]. `layer` tags
+    the Variable ids, so layers built into one model do not collide."""
+    H = config.hidden_size
+    heads = config.num_attention_heads
+    kv = config.num_key_value_heads
+    d = getattr(config, "head_dim", None) or H // heads
+    eps = config.rms_norm_eps
+    nh = int(config.indexer_n_heads)
+    dh = int(config.indexer_head_dim)
+    assert int(config.indexer_kv_heads) == 1
+    cosT, sinT = _freqs_tables(config, int(rope_span))
+    rotary = cosT.shape[-1]
+    cosT_c, sinT_c = _c(cosT), _c(sinT)
+    i64 = lambda v: op.constant(np.array(v, np.int64))
+
+    hidden = op.parameter([1, -1, H], Type.f32)
+    hidden.set_friendly_name("hidden_states")
+    pid = op.parameter([1, -1], Type.i64)
+    pid.set_friendly_name("position_ids")
+
+    qg = _reshape(_mm(hidden, _c(state["q_proj.weight"]), tb=True), [1, -1, heads, 2 * d])
+    q = _slice(qg, 0, d, 1, 3)
+    gate = _reshape(_slice(qg, d, 2 * d, 1, 3), [1, -1, heads * d])
+    q = _transpose(_rmsnorm_hd(q, state["q_norm.weight"], eps, d), [0, 2, 1, 3])
+    k = _reshape(_mm(hidden, _c(state["k_proj.weight"]), tb=True), [1, -1, kv, d])
+    k = _transpose(_rmsnorm_hd(k, state["k_norm.weight"], eps, d), [0, 2, 1, 3])
+    v = _transpose(_reshape(_mm(hidden, _c(state["v_proj.weight"]), tb=True), [1, -1, kv, d]), [0, 2, 1, 3])
+    q, k = _apply_rope(q, k, cosT_c, sinT_c, pid, rotary, -1)
+
+    sinks = []
+    full = []
+    for tag, cur in (("key", k), ("value", v)):
+        var = _state_var(f"qsa.past.{tag}.{layer}", [1, kv, -1, d])
+        init = op.broadcast(_c(np.float32(0.0)), i64([1, kv, 0, d]))
+        joined = op.concat([op.read_value(init, var), cur], axis=2)
+        sinks.append(op.assign(joined, var))
+        full.append(joined)
+
+    qk = _mm(hidden, _c(state["indexer.index_qk_proj.weight"]), tb=True)
+    qi = _reshape(_slice(qk, 0, nh * dh, 1, 2), [1, -1, nh, dh])
+    raw = _slice(qk, nh * dh, (nh + 1) * dh, 1, 2)                                 # [1, T, dh]
+    qi = _rmsnorm_hd(qi, state["indexer.q_layernorm.weight"], eps, dh)
+    cq = _reshape(op.gather(cosT_c, pid, i64(0)), [1, -1, 1, rotary])
+    sq = _reshape(op.gather(sinT_c, pid, i64(0)), [1, -1, 1, rotary])
+    qi = _rope_last(qi, cq, sq, rotary)
+    rvar = _state_var(f"qsa.past.indexer_key.{layer}", [1, -1, dh])
+    rinit = op.broadcast(_c(np.float32(0.0)), i64([1, 0, dh]))
+    raw_full = op.concat([op.read_value(rinit, rvar), raw], axis=1)
+    sinks.append(op.assign(raw_full, rvar))
+    mask = _qsa_mask_dynamic(qi, raw_full, pid, config, cosT_c, sinT_c, rotary, state)
+
+    r = heads // kv
+    def rep(x):
+        x5 = op.unsqueeze(x, i64(2))                                               # [1, kv, 1, N, d]
+        shp = op.concat([i64([1, kv, r]), op.gather(op.shape_of(x, output_type="i64"), i64([2]), i64(0)), i64([d])], 0)
+        return op.reshape(op.broadcast(x5, shp), i64([1, heads, -1, d]), False)
+    scores = _mul(_mm(q, rep(full[0]), tb=True), _c(np.float32(d ** -0.5)))       # pin 807
+    att = op.softmax(_add(scores, mask), -1)                                       # pin 809-811
+    out = _reshape(_transpose(_mm(att, rep(full[1])), [0, 2, 1, 3]), [1, -1, heads * d])
+    out = _mul(out, op.sigmoid(gate))
+    out = _mm(out, _c(state["o_proj.weight"]), tb=True)
+    res = op.result(out)
+    res.set_friendly_name("output")
+    results = [res]
+    if with_mask:
+        mres = op.result(mask)
+        mres.set_friendly_name("qsa_mask")
+        results.append(mres)
+    return Model(results, sinks, [hidden, pid], "qwen4_exp_qsa_attention_stateful")
+
+
+def build_qsa_attention_model(config, state, seq_len, with_mask=False):
+    """The attention block WITH its QSA indexer (static T). `state` carries the
+    six attention tensors and the indexer's three (indexer.index_qk_proj.weight,
+    indexer.q_layernorm.weight, indexer.k_layernorm.weight). With `with_mask`,
+    a second result `qsa_mask` [1, 1, T, T] is the additive selection mask."""
+    T = int(seq_len)
+    H = config.hidden_size
+    hidden = op.parameter([1, T, H], Type.f32)
+    hidden.set_friendly_name("hidden_states")
+    pid = op.parameter([1, T], Type.i64)
+    pid.set_friendly_name("position_ids")
+    sink = []
+    out = _attention_subgraph(hidden, pid, config, state, T, qsa=True, mask_sink=sink)
+    res = op.result(out)
+    res.set_friendly_name("output")
+    results = [res]
+    if with_mask:
+        mres = op.result(sink[0])
+        mres.set_friendly_name("qsa_mask")
+        results.append(mres)
+    return Model(results, [hidden, pid], "qwen4_exp_qsa_attention")
+
+
+__all__ = ["build_dense_attention_model", "build_qsa_attention_model", "build_qsa_stateful_attention_model",
+           "emit_dense_attention", "_freqs_tables"]

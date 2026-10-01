@@ -18,7 +18,215 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
-## Unreleased
+## 0.5.4 — 2026-10-01
+
+The 0.5.1-0.5.4 acceptance is closed against the readable rows: BERLIN-001
+(`docs/window-051.md`), VENICE-001 (`docs/window-052.md`), LISBON
+(`docs/window-053.md`) and LYON-001 (`docs/window-054.md`). Rows that cannot
+be read on the B60 (BERLIN's original bar, a dense-`d48q8` Paris cell, LISBON's
+cold start with nothing prebound, LYON's above-2,051 KLD) are marked owed with
+their reasons. Runtime dependency: `marfrit-openvino` `+p25`, patches 0003-0074
+on the pinned nightly `71640275`. The four dots ship together in this release;
+0.5.5 ROMA is next.
+
+- **The GGUF feed read BF16 tensors as their raw bytes** (`q4e.gguf_feed`,
+  since its first commit): gguf-py hands BF16 over as uint8 at twice the row
+  width, and the feed cast the bytes to f32. In Flash-Next's GGUF that hits
+  exactly the 24 sparse-attention indexer projections. The fix goes through
+  `gguf.quants`, and the feed now refuses a tensor whose shape differs from
+  its header's. As a consequence, the full-depth f32 reference captures
+  (`tools/ref_forward_stream.py`) ran every indexer on garbage: their rows
+  at or above position 2,051, and every whole-window figure read against
+  them (the served artifact's 0.37 / 0.18 / 0.83, llama.cpp's 0.34 / 0.065 /
+  0.80, the "0.45 above the boundary" of 0.5.0.1), are void as quoted until
+  a re-capture. The rows below 2,051 stand (`docs/campaigns/qsa.md`).
+- **QSA cells: the indexer's norm gammas were applied twice** (the test
+  fixture read the GGUF's folded (1 + w) and the pin adds the 1 again). The
+  fixture now reads them through the feed and asserts the convention; steps
+  1–2 re-measured, parity unchanged up to exact ties.
+
+- **QSA served: the model's own selection reaches PagedAttention** (plugin
+  patch 0073, qsa step 3 T2+T3+T3b). `PagedAttentionExtension` gains an optional
+  LAST input, 28, a `[T_new, past + T_new]` u8 visibility mask; absent keeps
+  the node at 28 inputs, so every existing artifact and arch hash is
+  untouched. `SDPAToPagedAttention` wires an indexer mask tagged `rt_info
+  arcint = "qsa_selection"` into it -- and drops any other (causal) mask
+  exactly as before -- and the GPU plugin's opt kernels read it (single, GQA
+  single, multi-token), setting a dropped key's score to
+  `SOFTMAX_ACCUMULATOR_VAL_MIN`. A route gate keeps the below-2,051 invariant
+  by construction: the exporter writes the boundary `block_topk * ratio +
+  ratio - 1` (2051) on the mask, the pass copies it to the node, and at or
+  below it the impl keeps today's route (micro included, the mask a no-op), so
+  the 29-input graph is byte-identical to the dense 28-input one; above it,
+  micro is taken away and a QSA prefill is routed through MIXED. Measured: the
+  GPU unit suite's QSA cells report 8 passed / 2 skipped on both cards (the
+  below-boundary pruned-mask case is not valid and is skipped; the above
+  cases pass), the causal-equal control is byte-identical on every
+  below-boundary param, and the whole `*paged_attention*` filter has no
+  failures on either card. T7 adds a decode-only chunk-uniform skip: a chunk of
+  `SUBGROUP_SIZE` keys with no selected key skips both its key reads/dot
+  products and its value reads, so a long-context decode reads the selected
+  keys instead of every past key (the predicate is `sub_group_any`, so lanes
+  never diverge around the collectives; prefill/MIXED stay masked dense).
+  Measured 8 passed / 2 skipped on both cards and 276/276 in the PA filter;
+  staged plugin sha256 prefix `ffc34950d4658cf3`. Needs a `marfrit-openvino`
+  `+p24` for release.
+- **QSA prefill cost, profiled by kernel: not the attention route and not a
+  device TopK.** One 2,048-token chunk at past 20,000 (the engine's own
+  per-node capture, warm-up plus a dumped second pass, pseudo-random tokens so
+  the MoE routes like a real chunk), both artifacts, same config, `--mtp off`.
+  The QSA capture totals 790.60 ms of node time against the dense 882.40 ms;
+  attention (`paged_attention::opt__f16`, 12 nodes) is 253.02 ms against
+  302.41 ms; and no TopK row appears in the QSA capture at all, while the dense
+  one executes its 48 MoE-router TopKs as `arg_max_min_axis__f16` (14.85 ms).
+  The QSA device graph is therefore not the source of the 3.6x served-prefill
+  wall gap, and the indexer's selection is not on the device path in this
+  capture (the decode-step per-node dump lists zero TopK lines; the only topk
+  kernel compiled is the MoE router's). A micro-mixed route cannot carry the
+  selection (`code`: the micro stages ignore input 28), so today's OCL route
+  above the boundary stands. `d48q8qsa` stays non-default; dense stays the
+  artifact to serve, and the remaining candidate is the indexer's host-side
+  term, not a kernel. The full record is in `docs/campaigns/qsa.md`.
+- **QSA served: the selection never reaches the attention -- a correctness
+  bug.** The exporter tags the indexer mask with custom rt_info
+  (`arcint = "qsa_selection"`, `qsa_boundary`), but OpenVINO's serializer
+  writes only a fixed set of rt_info keys, so `ov.save_model` drops them: the
+  artifact XML has zero occurrences of either, and a serialize -> read-back
+  round-trip of a node carrying them returns an empty rt_info. At load the
+  pass therefore sees an untagged causal mask and drops it, and the served
+  `PagedAttentionExtension` keeps 10 inputs (no `qsa_selection`), with zero
+  TopK in the compiled graph. `d48q8qsa` has been serving dense attention, so
+  the T6 "the selection pruned" conclusion is void. The prefill gap is not
+  per-shape compilation either: the profiled 2,048-token chunk at past 20,000
+  runs 188.46 s then 185.13 s (first-shape 3.33 s) against dense's 78.42 and
+  75.78 s (2.65 s), and the plugin reports 143 source kernel builds with no
+  cache hits. `perf` is unavailable (not installed, host
+  `perf_event_paranoid=4`), and the stripped Release plugin resolves gdb's hot
+  frames to `??`; the measured signature is a single-threaded host workload
+  (1835 CPU-s over a 1898.8 s wall, 19.4 GiB read) against dense's 12.5 busy
+  cores (6464.9 CPU-s over 516.9 s, 6.0 GiB). No fix was written: the marker
+  must reach the runtime first.
+- **QSA served: the marker now reaches the runtime, and a silent drop is
+  refused.** The exporter writes `qsa = {boundary, mask_nodes}` into MODEL
+  rt_info (which the IR serializes) in addition to the node tags; `load_paged`
+  re-applies the node tags by friendly name before SDPAToPagedAttention, then
+  counts the 29-input PagedAttention nodes and refuses to load when that is
+  not the declared `n_qsa_layer`. The red-first cell
+  `test_qsa_marker_survives_serialization_and_wires_the_29_input` fails on the
+  pre-fix exporter (no model rt_info) and passes after. T6's "the selection
+  pruned" and T7's timing row are void -- the pair differed beyond `--qsa`
+  (tree and expert format) and the QSA arm was dense -- so the artifacts are
+  re-exported from one tree/flags and re-measured.
+
+- **QSA decode: a compressed block-key indexer cache, not yet servable.**
+  The indexer pools, norms and ropes each completed ratio-token block ONCE
+  into a fixed `[8192, dh]` state row, plus the <= 3 raw tail keys and a token
+  counter; rows past the valid count score -inf and every Range is
+  constant-bound. The CPU cell is bit-identical to the recompute path over
+  [2048, 40] + [1]x12 and the named mutants red it; T4 charges `dh*4/ratio`
+  per token with the tail/counter/capacity fixed. But the re-exported native
+  `d48q8qsa` does NOT load on the GPU plugin -- `[GPU] Count is called for
+  dynamic shape` at executor bring-up, while the standalone indexer runs on
+  GPU.0 and the recompute artifact serves -- so the registry keeps the
+  recompute artifact and the gate is not met.
+
+- **QSA cache loads and serves; the 20k no-loss gate is missed.** The load
+  failure was a rank-1 `position_ids` problem: after SDPAToPagedAttention
+  rewrites `position_ids` to `[-1]`, the indexer's `Squeeze(pid,[0])` +
+  `Unsqueeze(...,1)` is out of range, so shape inference failed at executor
+  bring-up. `Reshape(pid,[-1,1])` fixes it (named on GPU.0: the rank-1
+  squeeze+unsqueeze toy fails, the reshape toy runs), and the re-exported
+  native `d48q8qsa` (`b21359a42c2c8633`) loads. Measured at 20,085 tokens on
+  the B60: dense 65.6 t/s prefill / 5.9 t/s decode; QSA 51.6 t/s prefill
+  (1.27x) / 5.1 t/s decode. The cache lifted QSA decode from 1.7 to 5.1 t/s
+  (3x), but it is below dense and prefill misses the 1.2x bound. Dense stays
+  the artifact served.
+
+- **QSA step 3 closed.** Served and correct at 20,085 tokens; decode 0.87x
+  dense (5.1 vs 5.9 t/s), prefill 1.27x (qsa-pair-007, B60). Non-default;
+  `n_ctx <= 32,768` until the block cap is raised or bucketed. Reopen on T8's
+  quality above 2,051, or if attention becomes a larger share of decode after
+  the CPU-tier work; the >=64k measurement is deferred.
+
+- **The tier's reference bar: llama.cpp's AVX2 CPU experts are ~2.6x faster.**
+  A microbenchmark of `ggml_mul_mat_id` at Flash-Next's decode shapes
+  (IQ3_XXS gate/up, IQ4_NL down; hidden 2560, width 640, 512 experts, 8 used,
+  one token) reads ~444 us per layer at 8 threads, against the tier's recorded
+  1.14 ms per layer all in RAM. ggml is >= 1.5x faster, so the next build is
+  the tier hot loop (ggml's `vec_dot` for those types first, then threading
+  and pinning). Pinning to physical cores buys < 6 % at this shape.
+
+- **QSA runtime: option A accepts the indexer state and refuses what it cannot
+  honour** (campaign qsa step 3 T4; arcint-side, no plugin patch). The loader
+  reads the indexer's raw-key geometry off the served graph (6 KiB/token at
+  Flash-Next's 12 x 128 f32) and charges it to the fit ledger next to the KV
+  term. A QSA artifact refuses, loudly, before any compile: `--parallel` > 1,
+  a prefix cache (its blob does not carry the indexer Variable), and paged
+  speculation (a rejected draft appends raw keys the rollback does not trim).
+  A paged lane now resets the graph state at `past == 0`, which is what clears
+  the new Variable; `/props` reports `qsa` and `n_qsa_layer`.
+
+- **QSA artifacts: the depth-4 and full-depth d48q8 `--qsa` exports** (campaign
+  qsa step 3 T5). `qwen38-flash-next-d4qsa-ov` (one QSA layer) and
+  `qwen38-flash-next-d48q8qsa-ov` (12 QSA layers, on the NVMe for the card
+  window) are registered in the allowlist and the model registry; the registry
+  ladder reads 27 ids. Their Paris-cell boots are owed to the T6 window.
+
+- **CPU tier: AVX2 row decode and a row-per-lane single-job dot** (plugin
+  patch 0068, DESIGN §7.0.2cx): the same f32 bits, by two bitwise cells. On
+  the dev host's CPU (a standalone build with the plugin's flags) a
+  Flash-Next expert's single job, a decode step, drops from 15.3 to 0.97 ms.
+  Served, the Flash-Next `d48n` hybrid on the A770 decodes 1.8–2.2x faster
+  (0.5–0.6 -> 0.9–1.3 t/s) with byte-identical greedy text (four arms,
+  alternating runtimes); the host still reads heavily from disk. Needs a
+  `marfrit-openvino` `+p21` for release.
+
+- **Native IQ3_XXS gate/up and IQ4_NL/IQ4_XS down decode whole blocks** (plugin
+  patch 0069). On the A770, a Flash-Next-geometry block with its weights in
+  device memory runs its decode kernels at 280.9 -> 79.0 us (gate/up) and
+  74.3 -> 34.3 us (down) per call, and its grouped prefill kernels at 3.1x and
+  1.6x. The bytes change inside the CPU-oracle band (a new summation order).
+  The served Flash-Next decode is unchanged (2.1 / 2.0 t/s at ratio 75): its
+  resident slots sit in host memory and are read at the card's link rate.
+  Needs a `marfrit-openvino` `+p22` for release.
+
+- **Per-expert dispatch keeps its resident slots in device memory under a
+  budget** (plugin patch 0070, `ARCINT_MOE_DEVICE_POOL_BYTES`). Before, that
+  route's slot pool sat in host memory whatever the budget. On the A770 with
+  Flash-Next at ratio 92 it moves decode 297.9 -> 291.7 ms per forward (GPU hit
+  rate 12 %). Needs a `marfrit-openvino` `+p22` for release.
+
+- **CPU tier: a decode step's experts are spread over the pool** (plugin
+  patch 0071): each missed expert runs as gate/up row chunks and then down
+  column chunks instead of one task, the same bytes (four bitwise cells). On
+  the A770 with Flash-Next `d48s2` at ratio 75 + tier + dispatch, 257 greedy
+  tokens decode in 83.6 s against 87.8 / 88.2 s with the 0070 plugin (tier
+  time per layer call 3.4 -> 2.9 ms), with byte-identical text.
+  `MOE_CPU_TIER_SPLIT=0` keeps one task per expert. Needs a `marfrit-openvino`
+  `+p22` for release.
+
+- **CPU tier: expert bytes from a host RAM bank filled at load** (plugin
+  patch 0072, `MOE_CPU_BANK_BYTES`, `MOE_CPU_BANK_SEED`,
+  `MOE_CPU_BANK_FILL_PER_LAYER`): the host tier's experts are read once at
+  load, sequentially with O_DIRECT, into anonymous memory, and misses are read
+  whole instead of page-faulting on the workers. On the B60 with Flash-Next
+  `d48s2` (ratio 78 + tier + dispatch), the first 257-token answer of a fresh
+  process decodes in 38.2–39.7 s against 48.6 s from the page cache, with
+  byte-identical text; loading takes ~21 s longer. Off unless the budget is
+  set. Needs a `marfrit-openvino` `+p23` for release.
+
+- **Flash-Next exports carry the dense projections in the checkpoint's form**
+  (`tools/export_serving_artifact.py --dense-q8`, with `--dense-u8` now open
+  to the qwen4_exp family): Q8_0 projections as i8 group-32 and the Q6_K head
+  as u8 group-16, instead of f32 constants served as f16. The full-depth
+  `qwen3.8-flash-next-d48q8` is admitted: lm `.bin` 72.2 -> 60.7 GiB, device
+  weights on the B60 19.2 -> 15.8 GiB, dense GEMM device time 23.7 -> 17.2 ms
+  per decode token. On the same configuration the first answer decodes in
+  36.6 s against d48s2's 38.2–39.7 s; with the freed VRAM holding 128
+  resident experts per layer instead of 112, 35.8 s. The text differs from
+  d48s2's. The quality A/B row is closed device-free (a CPU logits A/B is
+  bit-identical; red on a 1.001 scale mutant); the served KL/argmax row is
+  blocked on the f32 reference re-capture.
 
 ## 0.5.0.1 — 2026-09-27
 
@@ -2504,3 +2712,67 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p2` (patches 0003–0013).
 ## 0.2.0 — 2026-08-29
 - First packaged release: amd64, trixie, strict dependency on
   `marfrit-openvino` at the pinned nightly.
+
+- **Tier hot loop: the native expert dot in the quantised domain.** Patch 0074
+  replaces the tier's f16->f32 row decode + f32 dot for IQ3_XXS / IQ4_NL /
+  IQ4_XS / Q8_0 with ggml's approach -- a per-stage int8 activation (one scale
+  per 32 values) dotted against the packed weight via `maddubs`/`madd`.
+  Measured at the served shape (8 experts x one job, H=2560 I=640, pool of 7):
+  **651 us per layer call**, 1.21x llama.cpp's `mul_mat_id` (~540 us), inside
+  the 1.3x microbench bar; the old path was ~1.4 ms. Numerics are tolerance-
+  bound now, not bitwise; `MOE_CPU_TIER_Q8_DOT=0` restores the old routing.
+
+- **The 0074 served gate fails on prefill.** On the dense arm at 20,085 tokens
+  (B60, bank 30 GiB), decode improves 10 % (6.0 -> 6.6 t/s) but prefill
+  regresses 28 % (68.4 -> 49.5 t/s); 8 pinned threads are a wash. The per-row
+  quantised dot is ported, ggml's batched prefill path is not. 0074 is not
+  adopted; the served default stays the pre-0074 routing.
+
+- **Flash-Next decode decomposition (CLIntercept).** Baseline dense arm at
+  20,085 tokens on the B60: device busy is 26 % of wall (74 % idle), dominated
+  by the GPU expert GEMMs; host `clWaitForEvents` is 36 s and there are 5.8 M
+  `HtoD` expert-weight copies (326 per decode token). Decision: take the CPU
+  tier off the critical path (overlap host experts with GPU work, join late).
+
+- **0074 adopted, shape-routed.** The quantised-domain dot is now the decode
+  kernel only (tier calls of <= 8 jobs); prefill-shaped calls keep the old f32
+  path. Dense arm at 20,085 tokens on the B60: prefill 63.1 t/s (base 64.2),
+  decode 6.5 t/s (base 5.9) -- prefill back to base, decode +10 %. Served
+  runtime prefix ov-0074, plugin 55c432880f2d5ed0.
+
+- **KL replay harness fixed.** The gate must replay the capture's own window
+  through the served arm (`ARCINT_LOGITS_DUMP` + `--no-logits-slice`, then
+  `tools/kld_served.py --replay`), not reuse the leg's request dump. With that,
+  window 0 below-2,051 mean KL is 0.3003 (base) vs 0.3186 (shape-routed 0074) on
+  the B60; the floor was not measured this leg.
+
+- **Decode-only decomposition and its decision.** Short-prompt 512-token
+  decode delta (314 tokens) on the shape-routed 0074: per token wall 136 ms,
+  device busy ~73 ms, idle ~46 %, 308 HtoD + 48 DtoM calls (KB-sized, ~4 MB),
+  761 launches, 362 syncs. The dense qwen3.8-27b control is ~87 % device-bound,
+  so the idle is MoE-specific. Decision: decode overlap (tier off the critical
+  path, join late).
+
+- **Idle split on the shape-routed 0074 (decode).** Chrome trace, 18 s decode
+  phase: 50.2 % idle. Tier writeback wait 47.2 ms/token plus tier readback/
+  staging roundtrips 31.3 ms/token dominate; the post-sync gap is 1.3 ms/token
+  (~1 %). Shared-expert device time is ~132 us/layer (6.3 ms/token overlap
+  ceiling). Tier/miss split: 308 CPU-tier experts vs 170 GPU hits per token
+  (36 % hit rate). Decision: tier wait dominates -- no async restructuring;
+  work the tier time and residency.
+
+- **Tier hot loop, part A (zero-copy tier I/O + hot pool): gate FAILED, not
+  adopted.** Patch 0075 compiled clean (tier suites 27 passed / 3 skips) and the
+  served A/B on dense `d48q8` (B60, 20,085 tokens) read base 62.8 / 6.4 t/s,
+  zero-copy 63.7 / 6.5, spin 66.8 / 6.4, both 64.5 / 6.2 -- the decode bar
+  (> 6.5 t/s) is not cleared, so the patch is not added to the packaging series.
+  Prefill improves with the spin (+6.4 %), but the gate is decode-first.
+
+- **Tier hot loop, part A: zero-copy took effect, decode did not move; 0075
+  dropped.** One 16-vs-80 pair per arm (dense `d48q8`, B60) shows the
+  staging-ring HtoD copies fall from **304.2 to 11.5 per decode token**
+  (-292.7), while DtoH 98, MtoH 48, MtoD 12 and DtoM 48 are unchanged; decode
+  stays flat (5.8 vs 5.2 in the pair; 6.4 vs 6.5 in the gate A/B). The copy
+  idle was therefore the host waiting on the tier, not the copies. Bank misses
+  are **4.17 per decode token** (1.35 % of the 308 tier experts) and
+  **9.55 MiB/token** read from disk.

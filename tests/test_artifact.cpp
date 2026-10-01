@@ -49,7 +49,8 @@ public:
              {"openvino_language_model.xml", "openvino_language_model.bin",
               "openvino_text_embeddings_model.xml", "openvino_tokenizer.xml",
               "openvino_detokenizer.xml", "config.json", "chat_template.jinja",
-              "tokenizer.json", "openvino_vision_embeddings_model.xml",
+              "tokenizer.json", "serving-shape.json",
+              "openvino_vision_embeddings_model.xml",
               "openvino_vision_embeddings_model.bin", "openvino_vision_embeddings_pos_model.xml",
               "openvino_vision_embeddings_pos_model.bin", "openvino_vision_embeddings_merger_model.xml",
               "openvino_vision_embeddings_merger_model.bin"}) {
@@ -99,6 +100,37 @@ TEST(artifact_counts_qwen_sparse_attention_as_full_attention) {
     CHECK_EQ(a.n_layer, 4);
     CHECK_EQ(a.n_attn_layer, 1);
     CHECK_EQ(a.n_gdn_layer, 3);
+}
+
+// QSA (campaign qsa, step 3; 2026-09-28): a serving-shape export may now
+// carry the model's own indexer and per-query selection. The manifest's
+// top-level `qsa` is the only thing that says so -- the config's layer_types
+// are "qwen_sparse_attention" either way -- and the loader must count those
+// layers as QSA-served rather than dense causal. Red first: without the
+// manifest flag `n_qsa_layer` is 0 while `n_attn_layer` is already 1.
+TEST(artifact_counts_qsa_layers_only_when_the_manifest_declares_them) {
+    const char* cfg =
+        R"({"num_hidden_layers":4,"layer_types":["linear_attention","linear_attention",)"
+        R"("linear_attention","qwen_sparse_attention"]})";
+
+    TempArtifactDir dense;
+    dense.write("config.json", cfg);
+    Artifact a;
+    auto err = load_artifact(dense.dir(), a);
+    CHECK(!err.has_value());
+    CHECK(!a.qsa);
+    CHECK_EQ(a.n_attn_layer, 1);
+    CHECK_EQ(a.n_qsa_layer, 0);
+
+    TempArtifactDir qsa;
+    qsa.write("config.json", cfg);
+    qsa.write("serving-shape.json", R"({"qsa":true})");
+    Artifact b;
+    err = load_artifact(qsa.dir(), b);
+    CHECK(!err.has_value());
+    CHECK(b.qsa);
+    CHECK_EQ(b.n_attn_layer, 1);
+    CHECK_EQ(b.n_qsa_layer, 1);
 }
 
 // M13 (docs/milestone-0.3.0.md): a *ForConditionalGeneration export carries

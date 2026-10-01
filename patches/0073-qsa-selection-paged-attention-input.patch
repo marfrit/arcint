@@ -1,0 +1,851 @@
+# QSA step 3 T2+T3+T3b+T7: the served QSA selection in PagedAttention.
+#
+# core: PagedAttentionExtension accepts 28 inputs or 29; input 28 is the
+# model's own per-query key selection, [T_new, past + T_new] u8 (1 = keep,
+# 0 = drop, rank-1 [0] = none). Absent keeps the node at 28 -- today's form
+# byte for byte, so no existing artifact or arch hash moves. Type tests prove
+# the accepted form and refuse a wrong type.
+#
+# pass: SDPAToPagedAttention's StateManagementPattern inspects the SDPA's
+# attention-mask node; with rt_info arcint = "qsa_selection" (the exporter's
+# marker) it is squeezed to [T, N], compared with -0.5 and converted to the
+# u8 visibility mask appended at 28. The exporter also writes the route-gate
+# boundary block_topk * ratio + ratio - 1 (2051 for Flash-Next) as rt_info
+# "qsa_boundary", and the pass copies it onto the PagedAttention node. An
+# untagged mask -- every causal mask -- is dropped exactly as before. Two
+# transformation tests cover both branches.
+#
+# GPU plugin: the primitive carries has_qsa_selection, input 28 and
+# qsa_boundary; the opt kernels (paged_attention_opt.cl: single, GQA single,
+# multi-token) read the mask and set a dropped key's score to
+# SOFTMAX_ACCUMULATOR_VAL_MIN beside the existing seq_len and qq_bias sites.
+#
+# The route gate (T3b): at or below qsa_boundary the selection is exactly
+# causal, so the impl keeps today's route -- micro included, the mask a no-op
+# -- and the 29-input graph is byte-identical to the 28-input dense one. Above
+# the boundary micro is taken away and a QSA prefill is routed through MIXED,
+# so the opt kernel reads the mask. That is where QSA prunes, and T6's gate
+# reads KL there, not bytes. A one-lane refusal guards the mask's flattened
+# rows.
+#
+# T7 (decode-only chunk-uniform skip): in the opt kernel's DECODE path, a
+# chunk of SUBGROUP_SIZE keys with NO selected key skips its key reads and
+# dot products, and the same predicate skips the value reads. The predicate
+# is `sub_group_any`, so it is uniform across the subgroup and lanes never
+# diverge around the BLOCK_READN / broadcast collectives (a per-lane skip is
+# undefined behaviour on Xe2, where XE2_QK_MULTIPLICATION is on). When at
+# least one key is selected the chunk runs exactly as today and the per-token
+# mask drops the rest. Prefill/MIXED stay masked dense (FreeToken and
+# llama.cpp do, `code`), so T7 does not touch them.
+#
+# tests: the GPU unit harness feeds input 28 and the reference applies the
+# same selection on top of the causal mask; the cells cover decode {{1,35}},
+# MIXED {{128,2048}} and {{128,1900}} (the latter below the boundary, where
+# selection_is_honoured is skipped and the causal-equal control is
+# byte-identical), past-0 prefill {{2100,0}}, the GQA decode at 5,001 tokens
+# and the above-boundary causal-equal floor. Measured: 8 passed / 2 skipped
+# on both cards, and the whole *paged_attention* filter 276 passed on each.
+#
+--- a/src/core/src/op/paged_attention.cpp
++++ b/src/core/src/op/paged_attention.cpp
+@@ -82,8 +82,9 @@
+     OV_OP_SCOPE(PagedAttentionExtension_validate_and_infer_types);
+ 
+     NODE_VALIDATION_CHECK(this,
+-                          get_input_size() == 28,
+-                          "PagedAttensionExtension expects 28 inputs, but it has ",
++                          get_input_size() == 28 || get_input_size() == 29,
++                          "PagedAttensionExtension expects 28 inputs, or 29 with the optional "
++                          "QSA selection mask, but it has ",
+                           get_input_size());
+ 
+     // format: Node*, input_idx, name, {rank_list}, {type_list}
+@@ -116,6 +117,9 @@
+     input_check(this, 25, "token_type_ids", {1, 2}, {element::i32});
+     input_check(this, 26, "qq_bias", {1}, {element::u8});
+     input_check(this, 27, "qq_bias_begins", {1}, {element::i32});
++    if (get_input_size() == 29) {
++        input_check(this, 28, "qsa_selection", {1, 2}, {element::u8});
++    }
+ 
+     const auto input_shapes = ov::util::get_node_input_partial_shapes(*this);
+     const auto output_shapes = shape_infer(this, input_shapes);
+--- a/src/core/shape_inference/include/paged_attention_shape_inference.hpp
++++ b/src/core/shape_inference/include/paged_attention_shape_inference.hpp
+@@ -16,7 +16,10 @@
+ std::vector<TRShape> shape_infer(const PagedAttentionExtension* op,
+                                  const std::vector<TShape>& input_shapes,
+                                  const ITensorAccessor& ta = make_tensor_accessor()) {
+-    NODE_VALIDATION_CHECK(op, input_shapes.size() == 28, "Expected 28 inputs but got ", input_shapes.size());
++    NODE_VALIDATION_CHECK(op,
++                          input_shapes.size() == 28 || input_shapes.size() == 29,
++                          "Expected 28 inputs (or 29 with the QSA selection mask) but got ",
++                          input_shapes.size());
+     auto output_shapes = std::vector<TRShape>(3);
+ 
+     // Output[0] feature dim is num_heads * v_head_size.
+--- a/src/core/dev_api/openvino/op/paged_attention.hpp
++++ b/src/core/dev_api/openvino/op/paged_attention.hpp
+@@ -55,6 +55,10 @@
+     /// 25  token_type_ids                                   [B_token] or [B_token, 1], i32  optional
+     /// 26  qq_bias                                          [total_bias_bytes], u8    optional
+     /// 27  qq_bias_begins                                   [B_seq + 1], i32          optional
++    /// 28  qsa_selection                                   [T_new, past + T_new], u8  optional
++    ///      (absent keeps the graph at 28 inputs, today's form byte for byte)
++    ///      (the model's own per-query key selection: 1 = keep the key,
++    ///       0 = drop it; absent = dense attention exactly as before)
+     explicit PagedAttentionExtension(const ov::OutputVector& args, bool write_kv_cache = true);
+ 
+     void validate_and_infer_types() override;
+--- a/src/common/transformations/src/transformations/paged_attention/state_management_pattern.cpp
++++ b/src/common/transformations/src/transformations/paged_attention/state_management_pattern.cpp
+@@ -878,7 +878,40 @@
+             pa_arguments.insert(pa_arguments.begin() + 26, v0::Constant::create(element::u8, Shape{0}, {}));
+             pa_arguments.insert(pa_arguments.begin() + 27, v0::Constant::create(element::i32, Shape{0}, {}));
+         }
+-        OPENVINO_ASSERT(pa_arguments.size() == 28);
++
++        // QSA selection (arcint, qsa step 3): the exporter tags an
++        // indexer-produced SDPA mask with rt_info arcint = "qsa_selection".
++        // ONE LANE: the paged model flattens batch into tokens, so the
++        // mask's rows are the new tokens in order. lanes > 1 is refused
++        // at load (T4) until the paged indexer cache (option B) lands.
++        // Wire THAT mask into the optional last input as a [T_new,
++        // past + T_new] u8 visibility mask (1 = keep, 0 = drop); a mask
++        // without the tag is dropped exactly as before, and a causal mask
++        // is never routed here.
++        bool qsa_selection = false;
++        int64_t qsa_boundary = 0;
++        if (sdpa_node->get_input_size() > 3) {
++            const auto& mask_node = sdpa_node->input_value(3).get_node_shared_ptr();
++            const auto& rt = mask_node->get_rt_info();
++            const auto it = rt.find("arcint");
++            qsa_selection = it != rt.end() && it->second.as<std::string>() == "qsa_selection";
++            // QSA route gate (arcint, qsa step 3 T3b): the exporter also writes
++            // the boundary as a string. Missing means "unknown" (0): the impl
++            // then reads the mask rather than assuming no pruning.
++            const auto bit = rt.find("qsa_boundary");
++            if (bit != rt.end()) qsa_boundary = std::stoll(bit->second.as<std::string>());
++        }
++        if (qsa_selection) {
++            const auto mask = sdpa_node->input_value(3);
++            auto mask_2d = std::make_shared<v0::Squeeze>(mask, v0::Constant::create(element::i64, Shape{2}, {1, 2}));
++            auto visible = std::make_shared<v1::Greater>(
++                mask_2d, v0::Constant::create(mask.get_element_type(), Shape{}, {-0.5}));
++            auto visibility = std::make_shared<v0::Convert>(visible, element::u8);
++            visibility->set_friendly_name("qsa_selection");
++            pa_arguments.push_back(visibility);
++        }
++        // 28 without a selection (today's graph, byte for byte) or 29 with it.
++        OPENVINO_ASSERT(pa_arguments.size() == 28 || pa_arguments.size() == 29);
+ 
+         auto paged_attention =
+             std::make_shared<ov::op::PagedAttentionExtension>(pa_arguments, kv_params.write_kv_cache);
+@@ -886,6 +919,12 @@
+         paged_attention->get_rt_info()[K_HEAD_SIZE] = k_head_size;
+         paged_attention->get_rt_info()[NUM_V_HEADS] = num_v_heads;
+         paged_attention->get_rt_info()[V_HEAD_SIZE] = v_head_size;
++        if (qsa_selection) {
++            // QSA route gate (arcint, qsa step 3 T3b): the GPU impl takes
++            // today's routes -- micro included -- while max_context_len is at
++            // or below this, and reads the mask above it.
++            paged_attention->get_rt_info()["qsa_boundary"] = qsa_boundary;
++        }
+ 
+         // The output shape of PagedAttention will be converted to [batch, 1, head_num, head_size_v], the head_size_v
+         // may be different from head_size_q/head_size_k. The head_size_v could be got from the shape of value input
+--- a/src/plugins/intel_gpu/src/plugin/ops/paged_attention.cpp
++++ b/src/plugins/intel_gpu/src/plugin/ops/paged_attention.cpp
+@@ -20,7 +20,7 @@
+ namespace ov::intel_gpu {
+ 
+ static void CreatePagedAttentionExtensionOp(ProgramBuilder& p, const std::shared_ptr<ov::op::PagedAttentionExtension>& op) {
+-    validate_inputs_count(op, {28});
++    validate_inputs_count(op, {28, 29});
+     auto inputs = p.GetInputInfo(op);
+     auto prim = cldnn::paged_attention(layer_type_name_ID(op), inputs);
+ 
+@@ -125,6 +125,17 @@
+     if (qq_bias_input && qq_bias_input->get_output_partial_shape(0).is_dynamic()) {
+         prim.has_qq_bias = true;
+     }
++    // QSA selection (arcint, qsa step 3 T3): the optional 29th input, a
++    // [T_new, past + T_new] u8 visibility mask the kernels honour.
++    prim.has_qsa_selection = op->get_input_size() == 29;
++    if (prim.has_qsa_selection) {
++        // QSA route gate (arcint, qsa step 3 T3b): the pass put the token
++        // boundary on the node; absent means 0 ("unknown" -> always read).
++        const auto bit = rt_info.find("qsa_boundary");
++        if (bit != rt_info.end()) {
++            prim.qsa_boundary = static_cast<int32_t>(bit->second.as<int64_t>());
++        }
++    }
+     prim.is_key_by_channel = p.get_config().get_key_cache_quant_mode() == ov::internal::CacheQuantMode::BY_CHANNEL;
+     prim.write_kv_cache = op->get_write_kv_cache();
+     prim.num_outputs = 1;
+--- a/src/plugins/intel_gpu/include/intel_gpu/primitives/paged_attention.hpp
++++ b/src/plugins/intel_gpu/include/intel_gpu/primitives/paged_attention.hpp
+@@ -41,7 +41,8 @@
+         ADAPTIVE_RKV_DIVERSITY_BLOCK_SET_INDICES_BEGINS = 24,
+         TOKEN_TYPE_IDS = 25,
+         QQ_BIAS = 26,
+-        QQ_BIAS_BEGINS = 27
++        QQ_BIAS_BEGINS = 27,
++        QSA_SELECTION = 28
+     };
+ 
+     static constexpr size_t block_size = 16;
+@@ -52,7 +53,7 @@
+     paged_attention(const primitive_id& id,
+                     const std::vector<input_info>& inputs)
+         : primitive_base(id, inputs) {
+-        OPENVINO_ASSERT((inputs.size() == 28),
++        OPENVINO_ASSERT((inputs.size() == 28 || inputs.size() == 29),
+                         "[GPU] Unexpected inputs number for PagedAttention primitive: ",
+                         inputs.size());
+     }
+@@ -76,6 +77,8 @@
+         seed = hash_combine(seed, has_adaptive_rkv);
+         seed = hash_combine(seed, has_token_type_ids);
+         seed = hash_combine(seed, has_qq_bias);
++        seed = hash_combine(seed, has_qsa_selection);
++        seed = hash_combine(seed, qsa_boundary);
+         seed = hash_combine(seed, write_kv_cache);
+         if (scale_val.has_value()) {
+             seed = hash_combine(seed, scale_val.value());
+@@ -104,6 +107,8 @@
+                has_adaptive_rkv == rhs_casted.has_adaptive_rkv &&
+                has_token_type_ids == rhs_casted.has_token_type_ids &&
+                has_qq_bias == rhs_casted.has_qq_bias &&
++               has_qsa_selection == rhs_casted.has_qsa_selection &&
++               qsa_boundary == rhs_casted.qsa_boundary &&
+                write_kv_cache == rhs_casted.write_kv_cache &&
+                scale_val.value_or(1.0f) == rhs_casted.scale_val.value_or(1.0f) &&
+                is_key_by_channel == rhs_casted.is_key_by_channel;
+@@ -124,6 +129,8 @@
+         ob << has_adaptive_rkv;
+         ob << has_token_type_ids;
+         ob << has_qq_bias;
++        ob << has_qsa_selection;
++        ob << qsa_boundary;
+         ob << write_kv_cache;
+ 
+         if (scale_val.has_value()) {
+@@ -150,6 +157,8 @@
+         ib >> has_adaptive_rkv;
+         ib >> has_token_type_ids;
+         ib >> has_qq_bias;
++        ib >> has_qsa_selection;
++        ib >> qsa_boundary;
+         ib >> write_kv_cache;
+ 
+         bool has_scale;
+@@ -179,6 +188,11 @@
+     bool has_token_type_ids = false;
+     bool is_key_by_channel = false;
+     bool has_qq_bias = false;
++    bool has_qsa_selection = false;
++    // QSA route gate (arcint, qsa step 3 T3b): the token boundary at or below
++    // which the selection is exactly causal, block_topk * ratio + ratio - 1
++    // (2051 for Flash-Next). 0 means "unknown": the gate then reads the mask.
++    int32_t qsa_boundary = 0;
+     bool write_kv_cache = true;
+ };
+ }  // namespace cldnn
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
+@@ -209,6 +209,22 @@
+     return paged_attention_max_len;
+ }
+ 
++// QSA route gate (arcint, qsa step 3 T3b). Above `qsa_boundary`
++// (block_topk * ratio + ratio - 1) the selection actually drops keys, so the
++// mask must be read; at or below it the mask is exactly causal and today's
++// route -- micro included -- is byte-identical to the dense graph. A node with
++// no boundary (0) or no read-once max_context_len is treated as above, so the
++// mask is never silently ignored.
++bool qsa_above_boundary(const kernel_impl_params& params) {
++    const auto desc = params.typed_desc<paged_attention>();
++    if (!desc->has_qsa_selection) return false;
++    const auto& md = params.memory_deps;
++    const auto it = md.find(PagedAttentionInputIdx::MAX_CONTEXT_LEN);
++    if (it == md.end()) return true;
++    mem_lock<int32_t, mem_lock_type::read> lock(it->second, *params.strm);
++    return lock[0] > desc->qsa_boundary;
++}
++
+ size_t get_partitioning_size(const kernel_impl_params& params, size_t head_size, PagedAttentionStage stage) {
+     size_t partition_size = 0;
+     if (stage == PagedAttentionStage::PREFILL) {
+@@ -238,6 +254,13 @@
+             if (past_lens_mem_lock[i] != 0) {
+                 return PagedAttentionStage::MIXED;
+             }
++        }
++        if (qsa_above_boundary(impl_param)) {
++            // QSA (arcint, qsa step 3 T3b): above the boundary the selection
++            // prunes, so route the prefill through MIXED -- the opt kernel
++            // carries the mask. At or below it the mask is exactly causal and
++            // today's PREFILL route (micro included) is kept.
++            return PagedAttentionStage::MIXED;
+         }
+         return PagedAttentionStage::PREFILL;
+     }
+@@ -404,6 +427,13 @@
+             jit.make("SINK_DATA_T", to_ocl_type(sink_layout.data_type));
+             jit.make("HAS_SINK_INPUT", 1);
+         }
++        if (desc->has_qsa_selection) {
++            // QSA selection (arcint, qsa step 3 T3): the optional input-28 u8
++            // visibility mask; paged_attention_opt.cl reads it.
++            const auto& qsa_layout = params.input_layouts[PagedAttentionInputIdx::QSA_SELECTION];
++            jit.make("QSA_SELECTION_DATA_T", to_ocl_type(qsa_layout.data_type));
++            jit.make("HAS_QSA_SELECTION", 1);
++        }
+         if (desc->has_scores_output()) {
+             jit.make("PAGED_ATTENTION_SCORES_OUTPUT", 1);
+             if (desc->has_score_aggregation) {
+@@ -514,6 +544,10 @@
+ 
+         if (has_sink_input) {
+             args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::SINKS});  // sink
++        }
++
++        if (desc->has_qsa_selection) {
++            args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::QSA_SELECTION});  // qsa_selection
+         }
+ 
+         args.push_back({ArgumentDescriptor::Types::OUTPUT, 0});
+@@ -754,6 +788,9 @@
+         if (has_qq_bias) {
+             args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::QQ_BIAS});         // qq_bias
+             args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::QQ_BIAS_BEGINS});  // qq_bias_begins
++        }
++        if (desc->has_qsa_selection) {
++            args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::QSA_SELECTION});  // qsa_selection
+         }
+         args.push_back({ArgumentDescriptor::Types::OUTPUT, 0});
+         add_intermediate_inputs(args, has_scores_output, true, desc->has_score_aggregation);
+@@ -1458,6 +1495,11 @@
+     PagedAttentionOptImpl() : SDPAImplBase(PagedAttentionOpt::get_type_info_static()) {}
+     explicit PagedAttentionOptImpl(const kernel_impl_params& params) : PagedAttentionOptImpl() {
+         const auto desc = params.typed_desc<paged_attention>();
++        if (desc->has_qsa_selection) {
++            const auto subs = params.input_layouts[PagedAttentionInputIdx::PAST_LENS].get_partial_shape()[0];
++            OPENVINO_ASSERT(subs.is_dynamic() || subs.get_length() <= 1,
++                            "QSA selection (arcint) supports one lane only, got ", subs);
++        }
+         const bool has_scores_output = desc->has_scores_output();
+         const bool has_rotated_blocks = desc->has_rotated_blocks;
+         const bool has_adaptive_rkv = desc->has_adaptive_rkv;
+@@ -1504,12 +1546,20 @@
+         if (!supports_micro_sdpa(params) || !valid_micro_stage(stage))
+             return false;
+         const auto desc = params.typed_desc<paged_attention>();
++        // QSA (arcint, qsa step 3 T3b): the micro stages ignore input 28. Above
++        // the boundary take them away so the opt kernel reads the mask; at or
++        // below it the mask is causal and micro is the dense route.
++        if (desc->has_qsa_selection && qsa_above_boundary(params))
++            return false;
+         return !desc->has_token_type_ids || stage == PagedAttentionStage::PREFILL;
+     }
+ 
+     bool supports_micro_sdpa(const kernel_impl_params& params) const {
+         auto& engine = params.get_program().get_engine();
+         const auto desc = params.typed_desc<paged_attention>();
++        // QSA (arcint, qsa step 3 T3b): micro STAYS available -- it is the
++        // dense graph's own route below the boundary. can_use_micro_sdpa_for
++        // takes it away only when this call is above the boundary.
+ 
+         if (params.get_device_info().supports_immad) {
+             const auto supports_microkernels = cldnn::query_microkernels_supported(engine, params.get_program().get_config());
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_attention_opt.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_attention_opt.cl
+@@ -84,6 +84,9 @@
+ #if HAS_QQ_BIAS
+     const __global QQ_BIAS_DATA_T* qq_bias,
+     const __global QQ_BIAS_BEGINS_DATA_T* qq_bias_begins,
++#endif
++#if HAS_QSA_SELECTION
++    const __global QSA_SELECTION_DATA_T* qsa_selection,
+ #endif
+     __global OUTPUT_TYPE* output,
+ #if PAGED_ATTENTION_SCORES_OUTPUT
+@@ -333,7 +336,34 @@
+ 
+                 SOFTMAX_ACCUMULATOR_VEC_TYPE qk_acc = SOFTMAX_ACCUMULATOR_VAL_ZERO;
+ 
+-                #define KEY_VEC_SIZE SUBGROUP_SIZE
++#if HAS_QSA_SELECTION && !MULTI_TOKENS_PROCESSING
++                // QSA T7 (arcint, qsa step 3): DECODE ONLY, CHUNK-UNIFORM. Per
++                // chunk of SUBGROUP_SIZE keys, if NO lane's key is selected,
++                // skip the chunk's key reads and dot products. The predicate is
++                // `sub_group_any`, so it is uniform across the subgroup and
++                // lanes never diverge around the BLOCK_READN / broadcast
++                // collectives (the per-lane skip that diverged them was wrong
++                // on Xe2, where XE2_QK_MULTIPLICATION is on). When at least one
++                // key is selected the chunk runs exactly as today and the
++                // per-token mask below drops the rest. Prefill/MIXED keep the
++                // masked-dense route.
++                {
++                    const uint qsa_tok = swa_start_token + partition_idx * SEQ_LEN_PARTITION_SIZE
++                        + block_num * SUBGROUPS_PER_WG * SUBGROUP_SIZE + sgid * SUBGROUP_SIZE + sglid;
++                    if (!sub_group_any((int)(qsa_tok < seq_len && qsa_selection[qsa_tok] != 0))) {
++                        qk_acc = SOFTMAX_ACCUMULATOR_VAL_MIN;
++                        qk_max = SOFTMAX_ACCUMULATOR_MAX_FUNC(qk_max, TO_SOFTMAX_ACCUMULATOR_VEC_TYPE(qk_acc));
++                        unroll_for (uint q_idx = 0; q_idx < QUERIES_PER_WI; q_idx++) {
++                            slm_qk_vals[q_idx * SEQ_LEN_PARTITION_SIZE
++                                + block_num * SUBGROUPS_PER_WG * SUBGROUP_SIZE
++                                + sgid * SUBGROUP_SIZE + sglid] = GET_VECTOR_ELEMENT(qk_acc, q_idx);
++                        }
++                        continue;
++                    }
++                }
++#endif
++
++#define KEY_VEC_SIZE SUBGROUP_SIZE
+                 #define KEY_BLOCK MAKE_VECTOR_TYPE(INPUT1_TYPE, KEY_VEC_SIZE)
+ #if IS_KV_COMPRESSED
+     #ifdef IS_KEY_BY_CHANNEL
+@@ -519,6 +549,27 @@
+                         if (qq_bias[qq_bias_offset] == 0) {
+                             qk_acc = SOFTMAX_ACCUMULATOR_VAL_MIN;
+                         }
++                    }
++                }
++#endif
++
++#if HAS_QSA_SELECTION
++                // QSA (arcint, qsa step 3 T3): drop every key the [T_new,
++                // past + T_new] u8 mask marks 0. MULTI_TOKENS: the query row is
++                // seq_idx - subsequence_begin and the width is past + new;
++                // decode (single and GQA) has row 0 and width seq_len = past + 1.
++                // The mask is per token, shared by all heads, so the whole
++                // qk_acc vector is set.
++                {
++#if MULTI_TOKENS_PROCESSING
++                    const uint qsa_row = seq_idx - subsequence_begin;
++                    const uint qsa_width = past_lens[subsequence_idx] + (subsequence_end - subsequence_begin);
++#else
++                    const uint qsa_row = 0;
++                    const uint qsa_width = seq_len;
++#endif
++                    if (token_idx < qsa_width && qsa_selection[qsa_row * qsa_width + token_idx] == 0) {
++                        qk_acc = SOFTMAX_ACCUMULATOR_VAL_MIN;
+                     }
+                 }
+ #endif
+@@ -831,6 +882,16 @@
+ 
+                 const uint value_offset = block_offset + head_size_idx;
+ 
++#if HAS_QSA_SELECTION && !MULTI_TOKENS_PROCESSING
++                // QSA T7: the same chunk-uniform predicate for the value
++                // accumulation, so a skipped chunk's V is never read either.
++                {
++                    const uint qsa_tok_v = swa_start_token + partition_idx * SEQ_LEN_PARTITION_SIZE
++                        + block_num * PAGED_ATTENTION_BLOCK_SIZE + sglid;
++                    if (!sub_group_any((int)(qsa_tok_v < seq_len && qsa_selection[qsa_tok_v] != 0))) continue;
++                }
++#endif
++
+ 
+ #if IS_KV_COMPRESSED
+                 const uint packed_block_offset = block_indices[start_block_idx + block_num] * KV_HEADS_NUM * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE
+@@ -947,6 +1008,15 @@
+                 const uint last_block_idx = start_block_idx + blocks_num_per_partition;
+                 const uint block_offset = block_indices[last_block_idx] * KV_HEADS_NUM * ADJUSTED_V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE + head_idx * ADJUSTED_V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
+                 const uint value_offset = block_offset + head_size_idx;
++
++#if HAS_QSA_SELECTION && !MULTI_TOKENS_PROCESSING
++                // QSA T7: the partial block, same uniform predicate.
++                {
++                    const uint qsa_tok_v = swa_start_token + partition_idx * SEQ_LEN_PARTITION_SIZE
++                        + blocks_num_per_partition * PAGED_ATTENTION_BLOCK_SIZE + sglid;
++                    if (!sub_group_any((int)(qsa_tok_v < seq_len && qsa_selection[qsa_tok_v] != 0))) continue;
++                }
++#endif
+ 
+ #ifdef USE_DUAL_NIBBLE_V_OPT
+                 const uint packed_block_offset = block_indices[last_block_idx] * KV_HEADS_NUM * phys_adjusted_v_head_size * PAGED_ATTENTION_BLOCK_SIZE
+--- a/src/core/tests/type_prop/paged_attention.cpp
++++ b/src/core/tests/type_prop/paged_attention.cpp
+@@ -73,6 +73,24 @@
+             qq_bias_begins};
+ }
+ }  // namespace
++
++TEST(type_prop, paged_attention_accepts_an_optional_qsa_selection_mask) {
++    auto args = make_valid_pa_args(element::f32);
++    ASSERT_EQ(args.size(), 28);
++    args.push_back(std::make_shared<op::v0::Parameter>(element::u8, PartialShape{3, 6}));
++    const auto pa = std::make_shared<op::PagedAttentionExtension>(args);
++    EXPECT_EQ(pa->get_input_size(), 29);
++    EXPECT_EQ(pa->get_input_element_type(28), element::u8);
++    EXPECT_EQ(pa->get_input_partial_shape(28), PartialShape({3, 6}));
++}
++
++TEST(type_prop, paged_attention_rejects_a_wrongly_typed_qsa_selection_mask) {
++    auto args = make_valid_pa_args(element::f32);
++    args.push_back(std::make_shared<op::v0::Parameter>(element::f32, PartialShape{3, 6}));
++    OV_EXPECT_THROW(std::make_shared<op::PagedAttentionExtension>(args),
++                    NodeValidationFailure, HasSubstr("qsa_selection"));
++}
++
+ TEST(type_prop, paged_attention_static_eviction_per_block) {
+     const auto query = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{3, 4});
+     const auto key = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{3, 4});
+--- a/src/common/transformations/tests/op_conversions/sdpa_to_paged_attention_test.cpp
++++ b/src/common/transformations/tests/op_conversions/sdpa_to_paged_attention_test.cpp
+@@ -3,6 +3,7 @@
+ //
+ 
+ #include "openvino/pass/sdpa_to_paged_attention.hpp"
++#include "openvino/pass/manager.hpp"
+ 
+ #include <gtest/gtest.h>
+ 
+@@ -7303,6 +7304,55 @@
+     return std::make_shared<ov::Model>(OutputVector{res}, SinkVector{kv_0.assign, vv_0.assign}, params);
+ }
+ 
++// QSA step 3 T2: an exporter-tagged indexer mask (rt_info arcint =
++// "qsa_selection") becomes the optional 29th PagedAttention input, a
++// [T_new, total] u8 visibility mask; an untagged mask -- every causal mask
++// -- is dropped exactly as before and the node stays at 28 inputs.
++TEST(SDPAToPA, QsaSelectionMaskIsWiredIntoTheOptionalPagedAttentionInput) {
++    auto model = make_single_layer_sdpa_model(false, false, false);
++    std::shared_ptr<ov::Node> sdpa;
++    for (const auto& op : model->get_ops()) {
++        if (ov::is_type<ov::op::v13::ScaledDotProductAttention>(op)) {
++            sdpa = op;
++            break;
++        }
++    }
++    ASSERT_NE(sdpa, nullptr);
++    sdpa->input_value(3).get_node_shared_ptr()->set_rt_info("qsa_selection", "arcint");
++    ov::pass::Manager manager;
++    manager.register_pass<ov::pass::SDPAToPagedAttention>();
++    manager.run_passes(model);
++    std::shared_ptr<ov::Node> pa;
++    for (const auto& op : model->get_ops()) {
++        if (ov::is_type<ov::op::PagedAttentionExtension>(op)) {
++            pa = op;
++            break;
++        }
++    }
++    ASSERT_NE(pa, nullptr);
++    EXPECT_EQ(pa->get_input_size(), 29u);
++    const auto mask = pa->get_input_node_shared_ptr(28);
++    EXPECT_EQ(mask->get_friendly_name(), "qsa_selection");
++    EXPECT_EQ(mask->get_output_element_type(0), element::u8);
++    EXPECT_EQ(mask->get_output_partial_shape(0).rank(), ov::Rank(2));
++}
++
++TEST(SDPAToPA, AnUntaggedSdpaMaskIsDroppedAndKeepsPagedAttentionAt28Inputs) {
++    auto model = make_single_layer_sdpa_model(false, false, false);
++    ov::pass::Manager manager;
++    manager.register_pass<ov::pass::SDPAToPagedAttention>();
++    manager.run_passes(model);
++    std::shared_ptr<ov::Node> pa;
++    for (const auto& op : model->get_ops()) {
++        if (ov::is_type<ov::op::PagedAttentionExtension>(op)) {
++            pa = op;
++            break;
++        }
++    }
++    ASSERT_NE(pa, nullptr);
++    EXPECT_EQ(pa->get_input_size(), 28u);
++}
++
+ // a8w8 (SmoothQuant) inserts a FakeQuantize after the KV-cache Concat. Without tolerating it, SDPA is
+ // not converted and beam_idx / attention_mask survive -> "Model references undeclared parameters".
+ // The FakeQuantize is preserved: re-applied on the PagedAttention K/V feed (input 1 = K, input 2 = V).
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.h
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.h
+@@ -138,6 +138,14 @@
+ 
+     std::vector<std::vector<uint8_t>> qq_bias;
+     std::vector<int> qq_bias_begins;
++
++    // QSA selection (arcint, qsa step 3): [num_new_tokens, past + num_new_tokens],
++    // u8, 1 = keep the key, 0 = drop it. Empty = no selection input.
++    std::vector<uint8_t> qsa_selection;
++    // The route-gate boundary (T3b): block_topk * ratio + ratio - 1. Flash-Next
++    // is 2051. At or below it the impl keeps today's route and the mask is a
++    // no-op; above it the opt kernel reads the mask.
++    int qsa_boundary = 2051;
+ 
+     // optional token_type_ids; when empty, a default single-element {0} buffer is used
+     std::vector<int> token_type_ids;
+@@ -890,6 +898,19 @@
+         return get_memory_from_vec(qq_bias_begins);
+     }
+ 
++    cldnn::memory::ptr get_qsa_selection_memory() {
++        OPENVINO_ASSERT(subsequence_descs.size() == 1,
++                        "the QSA unit tests use one lane (qsa step 3, option A)");
++        const int num_new = subsequence_descs[0].num_tokens;
++        const int total = num_new + subsequence_descs[0].past_len;
++        OPENVINO_ASSERT(qsa_selection.size() == static_cast<size_t>(num_new) * static_cast<size_t>(total),
++                        "qsa_selection has the wrong size");
++        auto layout = cldnn::layout{ov::PartialShape{num_new, total}, cldnn::data_types::u8, cldnn::format::bfyx};
++        auto memory = test_engine.allocate_memory(layout);
++        tests::set_values(memory, qsa_selection);
++        return memory;
++    }
++
+     float get_default_scale() {
+         return static_cast<float>(1.f / std::sqrt(k_head_size));
+     }
+@@ -1152,6 +1173,8 @@
+                 }
+             }
+ 
++            const std::vector<uint8_t>* qsa_mask_ptr =
++                pam.qsa_selection.empty() ? nullptr : &pam.qsa_selection;
+             auto subsequence_ref_results = run_reference(has_xattention,
+                                                          pam.query_data[i],
+                                                          key_data,
+@@ -1167,7 +1190,9 @@
+                                                          pam.get_default_scale(),
+                                                          xattn_threshold,
+                                                          xattn_block_size,
+-                                                         qq_bias_ptr);
++                                                         qq_bias_ptr,
++                                                         16,
++                                                         qsa_mask_ptr);
+ 
+             // concatenate all subsequences into one vector
+             ref_data_output.insert(ref_data_output.end(), subsequence_ref_results.first.begin(), subsequence_ref_results.first.end());
+@@ -1198,7 +1223,8 @@
+                                                                                 double xattention_threshold,
+                                                                                 size_t block_size,
+                                                                                 const std::vector<uint8_t>* qq_bias = nullptr,
+-                                                                                size_t stride = 16) {
++                                                                                size_t stride = 16,
++                                                                                const std::vector<uint8_t>* qsa_mask = nullptr) {
+         auto query_shape = ov::PartialShape{1, num_queries, num_heads, k_head_size};
+         auto key_shape = ov::PartialShape{1, num_keys, num_kv_heads, k_head_size};
+         auto value_shape = ov::PartialShape{1, num_keys, num_kv_heads, v_head_size};
+@@ -1321,7 +1347,8 @@
+                                                          sliding_window_size,
+                                                          retained_blocks,
+                                                          static_cast<int>(block_size),
+-                                                         qq_bias);
++                                                         qq_bias,
++                                                         qsa_mask);
+         cldnn::topology topology;
+         if (num_heads == num_kv_heads) {
+             topology.add(
+@@ -1415,7 +1442,8 @@
+                                                         int sliding_window_size,
+                                                         const ov::reference::XAttentionRetainedBlockIndicesForAllHeads& retained_blocks,
+                                                         int block_size,
+-                                                        const std::vector<uint8_t>* qq_bias) {
++                                                        const std::vector<uint8_t>* qq_bias,
++                                                        const std::vector<uint8_t>* qsa_mask = nullptr) {
+         int heads_per_kv = num_heads / num_kv_heads;
+ 
+         ov::PartialShape mask_shape;
+@@ -1434,6 +1462,12 @@
+         size_t total_elems = mask_layout.count();
+         for (size_t i = 0; i < total_elems; ++i)
+             mem_ptr[i] = std::numeric_limits<ov::float16>::lowest();
++        // QSA (arcint, qsa step 3): the selection is an additional visibility
++        // restriction on top of the causal/sliding mask. Only the
++        // [1, 1, num_queries, num_keys] layout is supported here (the QSA
++        // tests never enable xattention); a dropped key becomes lowest().
++        OPENVINO_ASSERT(qsa_mask == nullptr || retained_blocks.empty(),
++                        "QSA reference supports only the broadcast mask layout");
+         if (retained_blocks.empty()) {
+             if (sliding_window_size == 0) {
+                 int past_len = num_keys - num_queries + 1;
+@@ -1536,6 +1570,17 @@
+             }
+         }
+ 
++        if (qsa_mask) {
++            // [1, 1, num_queries, num_keys] broadcast layout: one row per query.
++            for (int i = 0; i < num_queries; i++) {
++                for (int j = 0; j < num_keys; j++) {
++                    if (!(*qsa_mask)[static_cast<size_t>(i) * static_cast<size_t>(num_keys) + static_cast<size_t>(j)]) {
++                        mem_ptr[static_cast<size_t>(i) * static_cast<size_t>(num_keys) + static_cast<size_t>(j)] =
++                            std::numeric_limits<ov::float16>::lowest();
++                    }
++                }
++            }
++        }
+         return mask_mem;
+     }
+ 
+@@ -2030,6 +2075,12 @@
+ 
+         auto qq_bias = pam.get_qq_bias_memory();
+         auto qq_bias_begins = pam.get_qq_bias_begins_memory();
++        cldnn::memory::ptr qsa_selection_mem = nullptr;
++        cldnn::layout qsa_selection_layout;
++        if (!pam.qsa_selection.empty()) {
++            qsa_selection_mem = pam.get_qsa_selection_memory();
++            qsa_selection_layout = qsa_selection_mem->get_layout();
++        }
+         auto query_layout = query_mem->get_layout();
+         auto key_layout = key_mem->get_layout();
+         auto value_layout = value_mem->get_layout();
+@@ -2148,6 +2199,9 @@
+                                                     cldnn::input_info("token_type_ids"),
+                                                     cldnn::input_info("qq_bias"),
+                                                     cldnn::input_info("qq_bias_begins")};
++        if (qsa_selection_mem != nullptr) {
++            pa_inputs.push_back(cldnn::input_info("qsa_selection"));
++        }
+ 
+         auto pa_prim = cldnn::paged_attention("paged_attention", pa_inputs);
+ 
+@@ -2176,6 +2230,8 @@
+         }
+ 
+         pa_prim.has_qq_bias = p.has_qq_bias;
++        pa_prim.has_qsa_selection = qsa_selection_mem != nullptr;
++        pa_prim.qsa_boundary = pam.qsa_boundary;
+ 
+         cldnn::topology topology;
+ 
+@@ -2225,6 +2281,9 @@
+             topology.add(cldnn::input_layout("token_type_ids", token_type_ids_layout));
+             topology.add(cldnn::input_layout("qq_bias", qq_bias_layout));
+             topology.add(cldnn::input_layout("qq_bias_begins", qq_bias_begins_layout));
++            if (qsa_selection_mem != nullptr) {
++                topology.add(cldnn::input_layout("qsa_selection", qsa_selection_layout));
++            }
+         }
+ 
+         ov::intel_gpu::ExecutionConfig config = tests::get_test_default_config(tests::get_test_engine());
+@@ -2278,6 +2337,9 @@
+         network->set_input_data("token_type_ids", token_type_ids_mem);
+         network->set_input_data("qq_bias", qq_bias);
+         network->set_input_data("qq_bias_begins", qq_bias_begins);
++        if (qsa_selection_mem != nullptr) {
++            network->set_input_data("qsa_selection", qsa_selection_mem);
++        }
+ 
+         last_key_cache_mem = result.key_cache_mem;
+         last_block_indices = pam.block_indices;
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/paged_attention_gpu_test.cpp
+@@ -3127,3 +3127,115 @@
+     paged_attention_test_params{ {{1, 10}, {1, 14}}, 2, 2, 512, 512, 16, 0, ENABLE_CACHE_COMPRESSION, ov::internal::CacheQuantMode::BY_CHANNEL, STATIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, DISABLE_FA_V2 },
+ }));
+ 
++
++// QSA step 3 T3 (arcint, plugin patch 0073): the optional LAST PagedAttention
++// input (28) is a [T_new, past + T_new] u8 visibility mask, 1 = keep the key,
++// 0 = drop it. The reference applies the same selection on top of the causal
++// mask, so the kernel must READ it. RED before the kernel change: the plugin
++// accepts input 28 but the kernels ignore it, the output is dense causal and
++// this compare fails.
++//
++// The mask is deterministic (`make_qsa_mask`), the caches carry the harness's
++// own data, and the block tables come from `PagedAttentionManager`'s shuffle -
++// a ramp fill, not a constant, so a kernel that reads the wrong key shows up.
++// Each row keeps at least one key (the diagonal), so softmax is well defined.
++class paged_attention_qsa_test : public PagedAttentionTest<paged_attention_test_params> {};
++
++static std::vector<uint8_t> make_qsa_mask(int num_new, int past, int seed) {
++    const int total = num_new + past;
++    std::vector<uint8_t> mask(static_cast<size_t>(num_new) * static_cast<size_t>(total), 0);
++    for (int i = 0; i < num_new; ++i) {
++        for (int j = 0; j <= past + i; ++j) {  // causal bound: the query at row i sees keys 0..past+i
++            const bool drop = ((i * 7 + j * 13 + seed) % 5) == 0;
++            mask[static_cast<size_t>(i) * static_cast<size_t>(total) + static_cast<size_t>(j)] = drop ? 0 : 1;
++        }
++        // a row keeps at least its own (diagonal) key
++        mask[static_cast<size_t>(i) * static_cast<size_t>(total) + static_cast<size_t>(past + i)] = 1;
++    }
++    return mask;
++}
++
++TEST_P(paged_attention_qsa_test, selection_is_honoured) {
++    auto p = GetParam();
++    ASSERT_TRUE(this->pam.has_value());
++    auto& pam = *this->pam;
++    const auto& desc = p.subsequences[0];
++    // QSA route gate (arcint, qsa step 3 T3b): at or below `qsa_boundary` the
++    // model's own mask is exactly causal, so a pruned mask is not a valid case
++    // here -- the impl keeps the dense route and the mask is a no-op. The
++    // byte-identity is covered by causal_equal_mask_is_byte_identical_to_no_mask;
++    // this cell only asks whether a pruned mask is honoured ABOVE the boundary.
++    if (desc.num_tokens + desc.past_len <= pam.qsa_boundary) {
++        GTEST_SKIP() << "below the QSA boundary the model's mask is causal; "
++                        "causal_equal_mask_is_byte_identical_to_no_mask covers this";
++    }
++    pam.qsa_selection = make_qsa_mask(desc.num_tokens, desc.past_len, 11);
++
++    auto result = run_gpu_inference(pam, p);
++
++    const auto reference = PagedAttentionReference(pam).get_reference(result.key_cache_mem);
++    compare(result.outputs.at("output_data").get_memory(), nullptr, nullptr, reference);
++}
++
++TEST_P(paged_attention_qsa_test, causal_equal_mask_is_byte_identical_to_no_mask) {
++    auto p = GetParam();
++    ASSERT_TRUE(this->pam.has_value());
++    auto& pam = *this->pam;
++    const auto& desc = p.subsequences[0];
++    const int total = desc.num_tokens + desc.past_len;
++    std::vector<uint8_t> causal(static_cast<size_t>(desc.num_tokens) * static_cast<size_t>(total), 0);
++    for (int i = 0; i < desc.num_tokens; ++i)
++        for (int j = 0; j <= desc.past_len + i; ++j)  // keep exactly the causal keys
++            causal[static_cast<size_t>(i) * static_cast<size_t>(total) + static_cast<size_t>(j)] = 1;
++    pam.qsa_selection = causal;
++    auto with = run_gpu_inference(pam, p);
++    pam.qsa_selection.clear();
++    auto without = run_gpu_inference(pam, p);
++    auto a = with.outputs.at("output_data").get_memory();
++    auto b = without.outputs.at("output_data").get_memory();
++    ASSERT_EQ(a->count(), b->count());
++    cldnn::mem_lock<ov::float16, cldnn::mem_lock_type::read> la(a, tests::get_test_stream());
++    cldnn::mem_lock<ov::float16, cldnn::mem_lock_type::read> lb(b, tests::get_test_stream());
++    float max_delta = 0.f;
++    for (size_t i = 0; i < a->count(); ++i)
++        max_delta = std::max(max_delta, std::abs(static_cast<float>(la[i]) - static_cast<float>(lb[i])));
++    // QSA route gate (arcint, qsa step 3 T3b). At or below `qsa_boundary` the
++    // selection is exactly causal and the impl keeps today's route (micro
++    // included), so the 29-input run is byte-identical to the 28-input dense
++    // one -- this is T3b's red-first cell. Above the boundary the 29-input graph
++    // runs the mask-reading opt kernel while the 28-input graph keeps its own
++    // route, so the route itself differs and only the f16 codegen floor is
++    // asserted; that is where QSA prunes, and T6's gate reads KL there, not bytes.
++    if (total <= pam.qsa_boundary) {
++        ASSERT_EQ(max_delta, 0.f) << "causal-equal selection differs below the QSA boundary (total "
++                                  << total << " <= " << pam.qsa_boundary << ")";
++    } else {
++        ASSERT_LE(max_delta, 2e-4f) << "causal-equal selection moved the output past the f16 codegen floor";
++    }
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    regression_paged_attention_qsa,
++    paged_attention_qsa_test,
++    ::testing::Values(
++        // decode: one new token, 35 cached
++        paged_attention_test_params{{ {1, 35} }, 8, 2, 128, 128, 16, 0, DISABLE_CACHE_COMPRESSION,
++                                    ov::internal::CacheQuantMode::BY_TOKEN, DYNAMIC_INPUT_PAD, DISABLE_SCORES,
++                                    DISABLE_ROTATION, DISABLE_FA_V2, false, 0, {}, false},
++        // multi-token chunk with past > 0 (MIXED stage)
++        paged_attention_test_params{{ {128, 2048} }, 8, 2, 128, 128, 16, 0, DISABLE_CACHE_COMPRESSION,
++                                    ov::internal::CacheQuantMode::BY_TOKEN, DYNAMIC_INPUT_PAD, DISABLE_SCORES,
++                                    DISABLE_ROTATION, DISABLE_FA_V2, false, 0, {}, false},
++        // MIXED below the 2,051 boundary (total 2,028): the gate keeps today's
++        // route, so the causal-equal control is byte-identical here.
++        paged_attention_test_params{{ {128, 1900} }, 8, 2, 128, 128, 16, 0, DISABLE_CACHE_COMPRESSION,
++                                    ov::internal::CacheQuantMode::BY_TOKEN, DYNAMIC_INPUT_PAD, DISABLE_SCORES,
++                                    DISABLE_ROTATION, DISABLE_FA_V2, false, 0, {}, false},
++        // past-0 PREFILL chunk above 2,051 tokens: QSA routes it through MIXED
++        paged_attention_test_params{{ {2100, 0} }, 8, 2, 128, 128, 16, 0, DISABLE_CACHE_COMPRESSION,
++                                    ov::internal::CacheQuantMode::BY_TOKEN, DYNAMIC_INPUT_PAD, DISABLE_SCORES,
++                                    DISABLE_ROTATION, DISABLE_FA_V2, false, 0, {}, false},
++        // decode at 5,001 tokens: the GQA single-token kernel, many fully masked partitions
++        paged_attention_test_params{{ {1, 5000} }, 8, 2, 128, 128, 16, 0, DISABLE_CACHE_COMPRESSION,
++                                    ov::internal::CacheQuantMode::BY_TOKEN, DYNAMIC_INPUT_PAD, DISABLE_SCORES,
++                                    DISABLE_ROTATION, DISABLE_FA_V2, false, 0, {}, false}));

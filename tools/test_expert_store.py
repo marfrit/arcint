@@ -194,6 +194,27 @@ class _FakeFeed:
         }
 
 
+class TestBf16Source(unittest.TestCase):
+    """A BF16 expert tensor arrives from gguf-py as raw bytes (uint8, twice
+    the row width). Mutant: the pre-2026-09-28 plain cast, which returned the
+    bytes as values 0..255 at twice the width."""
+
+    def test_bf16_experts_dequantise_to_their_values(self):
+        try:
+            from gguf import GGMLQuantizationType
+        except ImportError:
+            self.skipTest("gguf-py absent")
+        want = np.array([[[1.5, -2.0, 0.25, 3.0]], [[-0.5, 8.0, 0.0, -1.0]]],
+                        np.float32)                              # [E, out, in]
+        raw = (want.view(np.uint32) >> 16).astype(np.uint16).view(np.uint8)
+        t = _FakeTensor(raw)
+        t.tensor_type = GGMLQuantizationType.BF16
+        feed = type("F", (), {"_index": {"w": t}})()
+        w = es.ExpertStoreWriter(feed, tempfile.gettempdir(), {})
+        got = w._dequant_experts("w", [1])
+        np.testing.assert_array_equal(got, want[[1]])
+
+
 class TestWriterLevel(unittest.TestCase):
     """ONE expert through the whole writer: record offsets + sidecar size.
 

@@ -84,18 +84,18 @@ class _RandomAffineFiller:
         return pack_u4(codes), pack_u4(zp), sc
 
 
-def _config(hidden_size=512):
+def _config(hidden_size=512, inter=256, experts=4, top_k=2):
     from transformers.models.qwen4_exp import configuration_qwen4_exp as pin_cfg
     return pin_cfg.Qwen4ExpTextConfig(
-        hidden_size=hidden_size, num_hidden_layers=1, num_experts=4, num_experts_per_tok=2,
-        norm_topk_prob=True, moe_intermediate_size=256, shared_expert_intermediate_size=64,
+        hidden_size=hidden_size, num_hidden_layers=1, num_experts=experts, num_experts_per_tok=top_k,
+        norm_topk_prob=True, moe_intermediate_size=inter, shared_expert_intermediate_size=64,
         hidden_act="silu", hc_count=4, hc_lowrank=8, rms_norm_eps=1e-6,
         layer_types=["linear_attention"], vocab_size=257, eos_token_id=0, pad_token_id=0,
     )
 
 
-def _build(tmp_path, T, gate_up_fmt, down_fmt, hidden_size=512):
-    cfg = _config(hidden_size)
+def _build(tmp_path, T, gate_up_fmt, down_fmt, hidden_size=512, inter=256, experts=4, top_k=2):
+    cfg = _config(hidden_size, inter, experts, top_k)
     H, I, E, Is = cfg.hidden_size, cfg.moe_intermediate_size, cfg.num_experts, cfg.shared_expert_intermediate_size
     rng = np.random.default_rng(1)
     arena = ss.SparseArena(path=str(tmp_path / "arena.bin"))
@@ -196,7 +196,11 @@ def _run_inprocess(xml, dev, T, cfg, props):
 def _run_ab(xml, dev, T, props, extra_env=None):
     import subprocess
     env = dict(os.environ, LD_LIBRARY_PATH=_AB_LIB + os.pathsep + os.environ.get("LD_LIBRARY_PATH", ""))
-    env.update(extra_env or {})
+    for k, v in (extra_env or {}).items():
+        if v is None:
+            env.pop(k, None)            # an explicit None removes the caller's value
+        else:
+            env[k] = v
     run = subprocess.run([_AB, xml, dev, str(T), "2"] + [f"{k}={v}" for k, v in props.items()],
                          capture_output=True, text=True, env=env, check=True)
     out = run.stdout
@@ -366,3 +370,61 @@ def test_decode_routed_on_the_device_gives_the_host_routes_bytes(tmp_path, dev, 
     assert on_host.get("device_routed_calls") == 0
     assert on_dev["got_hash"] and on_dev["got_hash"] == on_host["got_hash"]
     assert on_dev["max_over_band"] <= 1.0
+
+
+@_skip
+@pytest.mark.skipif(not _AB, reason="needs the C++ runner (ARCINT_NATIVE_BLOCK_AB): two GPU runs compared by bytes")
+@pytest.mark.parametrize("dev", _GPUS)
+@pytest.mark.parametrize("hidden,inter", [(2560, 640), (2304, 608)])
+@pytest.mark.parametrize("T", [1, 8])
+def test_flash_next_geometry_matches_the_cpu_plugin_and_the_per_pair_bytes(tmp_path, dev, hidden, inter, T):
+    """Patch 0069: the IQ3_XXS gate/up and the IQ4_NL down decode a whole
+    32-value block per lane -- gate/up lane i takes blocks i, i + 16, ... of a
+    row; down gives each row a group of four lanes (SIMD16, N_BLOCK 4), lane q
+    taking blocks q, q + 4, .... The cells above run at hidden 512/2048 and
+    inter 256, where both splits come out even. This one runs Flash-Next's own
+    geometry (hidden 2560: 80 blocks, 5 per lane; inter 640: 20 blocks, 5 per
+    group lane) and a remainder one (hidden 2304: 72 blocks, the last trip
+    half the lanes; inter 608: 19 blocks, the last group lane one short), at
+    16 experts and Flash-Next's top-10: T = 1 is a decode step (10 pairs, the
+    batched kernels, routed on the device), T = 8 is 80 pairs (the grouped
+    kernels under the auto dispatch). The output must be the per-pair
+    launches' bytes (MOE_DISPATCH_MODE=pair), and the gate/up's rows per
+    subgroup (MOE_NATIVE_GU_ROWS, default 2) must not move them either (4
+    rows: a different grid, the same per-row sums). Against the CPU oracle it
+    must sit in the band -- or, where the per-element decoders it replaces
+    (MOE_NATIVE_LEGACY_DECODE=1, the same build) already sit outside it, no
+    further out than they do, within 5% of the band. That case is measured:
+    at hidden 2560, T = 8 one element (token 3, column 1491: want -0.0058,
+    got 0.0952, the row's RMS 6.4) reads 1.567 of the band under both
+    decoders, with the same output bits, on the pre-0069 plugin too; its
+    cause is not measured. A decode defect moves elements by the order of
+    the row's RMS, about 100 bands (the calibration note above).
+    Measured on the A770 (GPU.1), as the cells above."""
+    arena, _ = _build(tmp_path, T, "IQ3_XXS", "IQ4_NL", hidden, inter, experts=16, top_k=10)
+    xml = str(tmp_path / "moe.xml")
+    props = dict(_ROUTES["resident"], WEIGHTS_PATH=str(tmp_path / "moe.bin"), INFERENCE_PRECISION_HINT="f16")
+    # the block decode by name, whatever the caller's shell holds (review of 0069, F1)
+    base = {"MOE_NATIVE_LEGACY_DECODE": "0", "MOE_NATIVE_W_ROUND": None, "MOE_NATIVE_GU_ROWS": "2"}
+    try:
+        _, native_a, auto = _run_ab(xml, dev, T, props, dict(base))
+        _, native_p, pair = _run_ab(xml, dev, T, props, dict(base, MOE_DISPATCH_MODE="pair"))
+        _, native_4, rows4 = _run_ab(xml, dev, T, props, dict(base, MOE_NATIVE_GU_ROWS="4"))
+        _, native_l, legacy = _run_ab(xml, dev, T, props, dict(base, MOE_NATIVE_LEGACY_DECODE="1"))
+    finally:
+        arena.close()
+    assert native_a and native_p and native_4 and native_l, "the native pass did not take the block"
+    print(f"\n[flash-next-geometry h{hidden} i{inter}] {dev} T={T}: {auto['got_hash']} vs {pair['got_hash']} vs "
+          f"{rows4['got_hash']}; band {auto['max_over_band']:.3f} / {pair['max_over_band']:.3f}, per-element "
+          f"decoders {legacy['max_over_band']:.3f} ({legacy['got_hash']}); corr {auto['corr']:.6f}")
+    # the block decode ran: its summation order differs from the per-element one
+    assert auto["got_hash"] != legacy["got_hash"], "the block decode did not run (legacy bytes)"
+    # the relaxation covers ONE measured case (hidden 2560, T = 8, 1.567 bands under
+    # both decoders); a defect the two decoders share would sit near 100 bands
+    # (review of 0069, F2)
+    assert legacy["max_over_band"] < 2.0 and auto["corr"] > 0.999, (
+        f"per-element decoders at {legacy['max_over_band']:.3f} bands, corr {auto['corr']:.6f}")
+    allowed = max(1.0, legacy["max_over_band"] + 0.05)
+    assert auto["max_over_band"] <= allowed, f"max diff/band {auto['max_over_band']:.3f} > {allowed:.3f}"
+    assert pair["max_over_band"] <= allowed, f"max diff/band {pair['max_over_band']:.3f} > {allowed:.3f}"
+    assert auto["got_hash"] and auto["got_hash"] == pair["got_hash"] == rows4["got_hash"]

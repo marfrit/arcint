@@ -274,6 +274,42 @@ std::vector<ModelEntry> build_registry() {
     }
 
     {
+        // qwen3.8-flash-next-d4qsa (campaign qsa, step 3 T5, 2026-09-28): the
+        // d4 rung re-exported with `--qsa`, so its one attention layer carries
+        // the model's own indexer, the served selection and the route-gate
+        // boundary. The indexer tensors are additive; the checkpoints are the
+        // same GGUF. Re-exported 2026-09-29 with the model-level qsa marker
+        // (tree 7f57d87) so the selection reaches the pass; hashes read off
+        // the export log. A measurement artifact: 44 layers are missing and
+        // nothing it says is the model's answer.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-d4qsa";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-d4qsa-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // the export writes none
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 4;      // of 48: layer 3 is the one QSA layer
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.arch_hash               = "48e1d3b258f571fb";
+        e.template_hash           = "12827f24b742ea4e";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 6537359094ull;
+        e.status                  = "measurement artifact: depth 4 of 48 with the model's own "
+                                    "QSA indexer (--qsa); served-path boot, not the model's answers";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
         // THE 12-LAYER RUNG (0.5.1 WP3, 2026-09-13): the serving-shape IR at
         // depth 12 of 48 -- three attention layers, nine GDN -- the first rung
         // of the depth ladder docs/window-051.md row (b) prices before the
@@ -504,6 +540,194 @@ std::vector<ModelEntry> build_registry() {
         e.status                  = "full-depth artifact with the checkpoint's native expert formats (patch 0043, "
                                     "every routed expert on the CPU tier); the KLD gate against the model's own "
                                     "capture is its acceptance";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
+        // qwen3.8-flash-next-d48s (2026-09-27): d48n's twin with the n-gram
+        // table declared as ONE per-forward staging window of 33,600 rows
+        // (--ngram-staging-rows, campaign ple-disk-backend) instead of seven
+        // ports over the whole table, tree 0e0ef26. The table stays in the
+        // GGUF and is read per forward; the 26.82 GiB USM-host pin does not
+        // happen. config.json is byte-identical to d48n's; the graph differs
+        // only in the n-gram ports (18,941 nodes against 18,995). Hashes read
+        // off the export log.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-d48s";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-d48s-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // the export writes none
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 48;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};   // the registry's coarse label, as d48n's
+        e.arch_hash               = "348950ee76e341f9";
+        e.template_hash           = "12827f24b742ea4e";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 77492280649ull;
+        e.status                  = "d48n with the n-gram table staged from disk per forward (campaign "
+                                    "ple-disk-backend); its digest gate against d48n FAILED and its KLD is "
+                                    "worse (DESIGN 7.0.2cz) -- a measurement artifact, not for serving";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
+        // qwen3.8-flash-next-d48p2 (2026-09-27): the full-depth native artifact
+        // exported at tree 0e0ef26 plus the f16-exact n-gram row decode (commit
+        // 962dfa1; the export file differed from it only in comments and
+        // docstrings, by diff), the
+        // n-gram table as seven pinned ports. The pinned twin of d48s2.
+        // Hashes read off the export log.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-d48p2";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-d48p2-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // the export writes none
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 48;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};   // the registry's coarse label, as d48n's
+        e.arch_hash               = "1c54b317448a6ddc";
+        e.template_hash           = "12827f24b742ea4e";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 77492280673ull;
+        e.status                  = "full-depth native artifact with the f16-exact n-gram decode, table pinned; "
+                                    "the pinned twin of d48s2";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
+        // qwen3.8-flash-next-d48s2 (2026-09-27): d48p2 with the n-gram table
+        // staged from disk per forward (--ngram-staging-rows 33600). Measured
+        // on the A770 pinned at 2000 MHz, --offload-ratio 75 --moe-cpu-tier,
+        // u8 KV, both served from the same ext4 volume, one run each: without
+        // --moe-per-expert-dispatch it gives d48p2's greedy digests and decodes
+        // 1.6-2.7x faster. With dispatch its digests differ from d48p2's, and 47
+        // of 48 per-layer resident sets differ (patch 0018 ranks on patch
+        // 0013's layer_key, the first expert weight's .bin offset, which the
+        // staging export shifts by 24 bytes); whether that residency
+        // difference causes the digest difference is measured in DESIGN
+        // 7.0.2cz. Hashes read off the export log.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-d48s2";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-d48s2-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // the export writes none
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 48;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};   // the registry's coarse label, as d48n's
+        e.arch_hash               = "08dd2c858baed75f";
+        e.template_hash           = "12827f24b742ea4e";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 77492280649ull;
+        e.status                  = "full-depth native artifact with the f16-exact n-gram decode and the table "
+                                    "staged from disk; same greedy digests as d48p2 with "
+                                    "--moe-per-expert-dispatch off, different with it on (DESIGN 7.0.2cz)";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
+        // qwen3.8-flash-next-d48q8 (2026-09-28): d48s2 with the dense
+        // projections in their checkpoint's form (--dense-q8 --dense-u8): 328
+        // Q8_0 projections as i8 group-32 (6.17 GiB as f16 -> 3.28), the Q6_K
+        // output head as u8 group-16 (1.18 -> 0.67); the shared expert, attention
+        // k/v and the f32 routers stay plain. lm .bin 72.17 -> 60.70 GiB, device
+        // weights+graph 19.23 -> 15.82 GiB on the B60. Measured on the B60,
+        // ratio 78 + tier + dispatch, host bank (patch 0072): dense gemm device
+        // time 23.7 -> 17.2 ms a token, first answer 38.2-39.7 -> 36.6 s; the text
+        // differs from d48s2's (the compressed FC rounds differently) and reads
+        // coherent (a read, not a quality gate). Campaign dense-q8-flash-next. Hashes read off the export log.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-d48q8";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-d48q8-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // the export writes none
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 48;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};   // the registry's coarse label, as d48n's
+        e.arch_hash               = "1b03e4e97daaa13a";
+        e.template_hash           = "12827f24b742ea4e";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 65180065880ull;
+        e.status                  = "d48s2 with the dense projections in the checkpoint's Q8_0/Q6_K form "
+                                    "(--dense-q8 --dense-u8); text differs from d48s2's, reads coherent; "
+                                    "quality row owed (campaign dense-q8-flash-next)";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
+        // qwen3.8-flash-next-d48q8qsa (campaign qsa, step 3): the d48q8
+        // artifact re-exported with `--qsa`, so its 12 full-attention layers
+        // carry the model's own indexer. The selection marker lives in model
+        // rt_info; load_paged re-applies it and refuses unless 12 PagedAttention
+        // nodes take the selection. Re-exported 2026-09-30 with d48q8's own
+        // tree and flags except --qsa (tools/export_serving_artifact.py
+        // --layers 48 --qsa --expert-format native --dense-q8 --dense-u8, tree
+        // 7f57d87, peak host 51.24 GiB); supersedes the tree-4f05b21 u4 export,
+        // whose node-level marker did not survive serialization. Hashes read
+        // off the export log.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-d48q8qsa";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-d48q8qsa-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // the export writes none
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 48;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.arch_hash               = "b21359a42c2c8633";
+        e.template_hash           = "12827f24b742ea4e";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 65221492040ull;
+        e.status                  = "d48q8 with the model's own QSA indexer (--qsa) on the 12 "
+                                    "full-attention layers; the served step-3 arm";
         e.sampler = qwen_card_defaults();
         split_layers(e);
         r.push_back(std::move(e));

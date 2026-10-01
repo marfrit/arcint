@@ -31,7 +31,7 @@ set -euo pipefail
 # tilde so that a future 2026.4.0 release sorts ABOVE this dev build.
 OV_VER=2026.4.0.dev20260821
 OV_TOK_VER=2026.4.0.0.dev20260821
-PKGVER=2026.4.0~dev20260821+p20
+PKGVER=2026.4.0~dev20260821+p25
 PKGREL=1
 # Sorts above the unpatched 2026.4.0~dev20260821-1 and still below a real
 # 2026.4.0 release, because the tilde keeps the whole thing under it.
@@ -43,7 +43,7 @@ PKGREL=1
 OV_BUILD_DIR=${OV_BUILD_DIR:-${OV_SRC:-$HOME/ovsrc-pkg}}   # OpenVINO writes bin/intel64/Release under the SOURCE tree, whatever the build dir
 OV_BIN=$OV_BUILD_DIR/bin/intel64/Release
 OV_TBB=${OV_BUILD_PREFIX:-$HOME/ovinstall}/runtime/3rdparty/tbb/lib
-PATCHLEVEL=marfrit-p20
+PATCHLEVEL=marfrit-p25
 PYTAG=cp313
 OV_WHEEL=openvino-${OV_VER}-22849-${PYTAG}-${PYTAG}-manylinux_2_28_x86_64.whl
 OV_TOK_WHEEL=openvino_tokenizers-${OV_TOK_VER}-py3-none-manylinux_2_28_x86_64.whl
@@ -185,7 +185,9 @@ cp "$HERE/debian/copyright" "$ROOT/usr/share/doc/marfrit-openvino/copyright"
 cp "$HERE/debian/changelog" "$ROOT/usr/share/doc/marfrit-openvino/changelog.Debian"
 gzip -9 -n "$ROOT/usr/share/doc/marfrit-openvino/changelog.Debian"
 
-INSTALLED_KB=$(du -sk "$ROOT" | cut -f1)
+# --apparent-size: on ZFS a freshly written tree reports its compressed/unflushed
+# allocation (9 KiB for ~3 MiB), and apt shows that as the installed size.
+INSTALLED_KB=$(du -sk --apparent-size "$ROOT" | cut -f1)
 cat > "$ROOT/DEBIAN/control" <<EOF
 Package: marfrit-openvino
 Version: ${PKGVER}-${PKGREL}

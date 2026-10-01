@@ -306,11 +306,9 @@ class ExpertStoreWriter:
         raw = np.ascontiguousarray(
             t.data[np.asarray(expert_ids, dtype=np.int64)])
         name = t.tensor_type.name
-        if name in ("F32", "F16", "BF16"):
-            arr = np.asarray(raw)
-            if name != "F32":
-                arr = arr.astype(np.float32)
-            return np.ascontiguousarray(arr, dtype=np.float32)
+        if name in ("F32", "F16"):
+            return np.ascontiguousarray(np.asarray(raw), dtype=np.float32)
+        # BF16 arrives as raw bytes; gguf.quants converts it (gguf_feed._dequant)
         from gguf import quants as _q
         return _q.dequantize(raw, t.tensor_type).astype(np.float32)
 
