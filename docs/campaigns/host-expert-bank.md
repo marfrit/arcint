@@ -390,3 +390,38 @@ change. A slot is a hit only for the identical span list. Everything else
     Post-sync is ~1 % of the idle and the overlap ceiling is 6.3 ms/token, both
     far below the ~78 ms/token the tier path costs. The levers are **tier time**
     (0074 already adopted) and **residency** (raise the 36 % GPU hit share).
+
+- 2026-10-01. **Part A attempt: zero-copy tier I/O + a hot pool (patch 0075,
+  NOT ADOPTED -- decode gate failed).** Two changes: (1) on a decode-shaped
+  call (`token_num == 1`) the down output is allocated host-lockable
+  (`usm_host`) from `get_internal_buffer_descs` and `cpu_tier_join` memcpys
+  each tier row straight into it, dropping the staging ring + HtoD copies;
+  prefill keeps the GPU-only buffer. (2) the pool workers spin for the next
+  job for a bounded 200 us before sleeping (`MOE_CPU_TIER_SPIN_US`, 0 =
+  always-block). `MOE_CPU_TIER_ZEROCOPY=0` restores the staged path. Both
+  compile on the 0003-0074 tree; `ov_gpu_unit_tests` tier suites read 27
+  passed / 3 pre-existing skips, and the new pool cell
+  `moe_cpu_tier_pool.the_spun_worker_runs_every_task_once_in_order` passes.
+
+  Served A/B (dense `d48q8`, B60, 20,085 tokens, one fresh process per arm,
+  plugin `a28bc57adb67f397`, needle `ORANGE-FALCON-77` answered in all arms):
+
+  | arm | prefill t/s | decode t/s |
+  |---|---|---|
+  | base (zero-copy off, spin off) | 62.8 | 6.4 |
+  | zero-copy only | 63.7 | 6.5 |
+  | spin only | **66.8** | 6.4 |
+  | both | 64.5 | 6.2 |
+
+  - **Gate FAILED on decode.** The bar was decode > 6.5 t/s (the adopted 0074
+    arm): the best arm reaches 6.5, a tie, and the rest sit at 6.2-6.4, all
+    inside the run-to-run spread. Prefill passes (all arms >= base; spin alone
+    +6.4 %, 62.8 -> 66.8) and the needle is answered, but the conjunctive gate
+    fails on the first criterion, so the patch is **not adopted** and is not
+    added to the packaging series. The below-2,051 KL row was not run: the gate
+    had already failed.
+  - The two items were gated together and separately; neither alone clears the
+    decode bar. The spin item is the one that helps (prefill only), but the
+    gate as written is decode-first.
+  - Working tree / runtime: the compile tree kept the patch as `a28bc57adb67f397`
+    (staged at `ov-0075`); the repo carries no patch file for it.

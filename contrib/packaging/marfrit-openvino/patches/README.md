@@ -2197,3 +2197,33 @@ graph goes through the pass to a PagedAttentionExtension with 29 inputs,
 input 28 a u8 `Convert` named `qsa_selection`; the same graph with `qsa=False`
 stays at 28. Red first on the pre-0073 runtime: the unpatched pass drops the
 tagged mask and yields 28 inputs.
+
+## 0074 — CPU tier: the native expert dot in the quantised domain (2026-09-28)
+
+The tier's native-format path (IQ3_XXS gate/up, IQ4_NL/IQ4_XS or Q8_0 down)
+dequantised each weight row to f32 before the dot. This patch carries ggml's
+approach: the activation is quantised once per stage to int8 with one scale
+per 32 values, and `maddubs`/`madd` do the arithmetic on the packed bytes.
+The route is a **pure function of the call shape**: a tier call with at most
+8 jobs (one routed token per expert) takes the quantised dot, a prefill-shaped
+call keeps the f32 decode and the one-job-per-lane AVX2 dot. `MOE_CPU_TIER_Q8_DOT=0`
+restores the pre-0074 routing.
+
+Numerics change: the int8 activation replaces the f16-to-f32 decode, so the
+cells hold to a stated tolerance, not to bits. The tolerance cell compares
+against the f32 tier at the served shape (scale-relative bound 0.06, achieved
+~0.003); the shape-routing cell asserts a decode-shaped call equals the AVX2
+path and a prefill-shaped call equals the f32 reference bitwise. The debug
+path found the one real bug: `_mm256_sign_epi8` (PSIGNB) zeroes the source
+where its sign byte is 0, so the IQ3_XXS sign vector carries +1 for a clear
+bit, not 0.
+
+Served gate (dense `d48q8`, B60, 20,085 tokens, one fresh process per arm):
+base prefill 64.2 / decode 5.9 t/s; shape-routed prefill 63.1 / decode 6.5.
+The first form (always q8) measured prefill 68.4 -> 49.5 t/s, which the shape
+routing restored. Below-2,051 KL against the f32 reference window 0 (B60):
+base mean 0.3003, q8 0.3186 (delta +0.0183, inside the card's recorded
+run-to-run floor 0.136).
+
+Series 0003-0074 applies to the pin with `git apply` and reproduces the built
+tree file for file.

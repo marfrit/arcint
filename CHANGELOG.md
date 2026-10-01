@@ -2750,3 +2750,10 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p2` (patches 0003–0013).
   ceiling). Tier/miss split: 308 CPU-tier experts vs 170 GPU hits per token
   (36 % hit rate). Decision: tier wait dominates -- no async restructuring;
   work the tier time and residency.
+
+- **Tier hot loop, part A (zero-copy tier I/O + hot pool): gate FAILED, not
+  adopted.** Patch 0075 compiled clean (tier suites 27 passed / 3 skips) and the
+  served A/B on dense `d48q8` (B60, 20,085 tokens) read base 62.8 / 6.4 t/s,
+  zero-copy 63.7 / 6.5, spin 66.8 / 6.4, both 64.5 / 6.2 -- the decode bar
+  (> 6.5 t/s) is not cleared, so the patch is not added to the packaging series.
+  Prefill improves with the spin (+6.4 %), but the gate is decode-first.
