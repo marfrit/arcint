@@ -11,7 +11,7 @@
 # It carries the CMake package, the headers and the runtime that arcint links.
 set -euo pipefail
 
-PKGVER=0.5.0.1
+PKGVER=0.5.4
 UPSTREAM_TAG=v${PKGVER}
 PKGREL=1
 # The public repository, not the fleet one. The fleet repo (still named
@@ -19,15 +19,18 @@ PKGREL=1
 # and carries operator-local notes; the published tree is the same code without
 # them, so the package is built from what anyone can check.
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
-# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v0.5.0.1.tar.gz,
+# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v0.5.4.tar.gz,
 # taken after the tag was pushed (recorded in the follow-up commit, as for every tag).
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-6152e83b33c69fb8fbffbef310e5567bc8982d34d59be7ea474769eeb863a6a8}
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-8febe8fe8824b049477e87186487c4d70e14c44b9bd36fef16b0e17a855a1641}
 OV_PREFIX=/usr/lib/marfrit-openvino
 # The ABI is the nightly, not the patch level: floor the patch level, cap at
 # the next nightly. An exact pin (Depends: = +p1-1) made apt REMOVE arcint when
 # the runtime was upgraded to +p3 on 2026-09-04; never render "=" here again.
-OV_DEP_VERSION="2026.4.0~dev20260821+p20-1"
-# The +p20 floor is 0.5.0.1's (patches 0044-0067: the native expert formats' OpenCL
+OV_DEP_VERSION="2026.4.0~dev20260821+p25-1"
+# The +p25 floor is 0.5.4's (patches 0068-0074: the CPU tier's decode and prefill
+# kernels, the host expert bank, and patch 0073's QSA selection input to
+# PagedAttention, which the served QSA route needs).
+# The +p20 floor was 0.5.0.1's (patches 0044-0067: the native expert formats' OpenCL
 # decode, the all-resident native pool and its dispatch; an older runtime has no
 # native per-expert route at all). +p18 was the floor after patch 0042 (patch 0037's hybrid prefill patch 0037's hybrid prefill
 # launched its gather over every token-expert pair while the tables held only the
@@ -40,6 +43,7 @@ OV_DEP_VERSION="2026.4.0~dev20260821+p20-1"
 # would re-issue a released version string under different Depends. Refused.
 case "$PKGVER" in 0.3.*|0.4.0|0.4.1|0.4.2|0.4.3) echo "the +p15 floor is 0.4.4's; bump PKGVER and the tarball sha at the tag" >&2; exit 1 ;; esac
 case "$PKGVER" in 0.4.*|0.5.0) echo "the +p20 floor is 0.5.0.1's; bump PKGVER and the tarball sha at the tag" >&2; exit 1 ;; esac
+case "$PKGVER" in 0.5.0.*|0.5.1|0.5.2|0.5.3) echo "the +p25 floor is 0.5.4's; bump PKGVER and the tarball sha at the tag" >&2; exit 1 ;; esac
 OV_DEP_NEXT_NIGHTLY="2026.4.0~dev20260822"
 HERE=$(dirname "$(readlink -f "$0")")
 

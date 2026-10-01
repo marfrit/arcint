@@ -1,3 +1,15 @@
+arcint (0.5.4-1) trixie; urgency=medium
+
+  * 0.5.4: the 0.5.1-0.5.4 acceptance closes against the readable rows
+    (BERLIN-001, VENICE-001, LISBON, LYON-001; unreadable rows marked owed
+    with their reasons, see CHANGELOG.md). The GGUF feed reads BF16 tensors
+    through gguf.quants instead of casting their raw bytes; the QSA indexer
+    norm gammas are applied once; QSA selection reaches PagedAttention
+    (plugin patch 0073). Runtime floor raised to marfrit-openvino +p25
+    (patches 0003-0074).
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Thu, 01 Oct 2026 22:30:00 +0200
+
 arcint (0.5.0.1-1) trixie; urgency=medium
 
   * 0.5.0.1: served-performance release on the 0.5.0 line. No 0.5.x dot's
