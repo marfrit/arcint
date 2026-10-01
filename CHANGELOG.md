@@ -2717,3 +2717,9 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p2` (patches 0003–0013).
   regresses 28 % (68.4 -> 49.5 t/s); 8 pinned threads are a wash. The per-row
   quantised dot is ported, ggml's batched prefill path is not. 0074 is not
   adopted; the served default stays the pre-0074 routing.
+
+- **Flash-Next decode decomposition (CLIntercept).** Baseline dense arm at
+  20,085 tokens on the B60: device busy is 26 % of wall (74 % idle), dominated
+  by the GPU expert GEMMs; host `clWaitForEvents` is 36 s and there are 5.8 M
+  `HtoD` expert-weight copies (326 per decode token). Decision: take the CPU
+  tier off the critical path (overlap host experts with GPU work, join late).

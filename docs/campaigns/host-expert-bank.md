@@ -244,3 +244,36 @@ change. A slot is a hit only for the identical span list. Everything else
     replay whose records sum to the capture's `n_ctx` (2,735) in the served
     dump (its records are one prefill chunk plus one per decode token). Moot
     for this gate, which prefill already failed.
+
+- 2026-10-01. **Per-token decomposition of Flash-Next decode** (`measured-here`;
+  CLIntercept, baseline plugin `MOE_CPU_TIER_Q8_DOT=0`, dense `d48q8`, B60,
+  20,085-token prompt). The decision rule, written before reading the numbers:
+  device idle >= 40 % of wall and mostly while the tier computes -> take the
+  tier off the critical path; idle mostly host runtime -> cut per-token host
+  work; device busy dominates -> the kernels are the lever.
+  - Two fresh processes, `max_tokens` 16 and 80, CLIntercept
+    `DevicePerformanceTiming` + `HostPerformanceTiming`. Whole run (load +
+    prefill + decode): wall ~565 s, **device busy 146 s (26 %)**, host OpenCL
+    total 113 s (38 s of it the instrument's own device-timing overhead). So
+    **~74 % of wall is device idle**.
+  - Device busy is the GPU expert GEMMs:
+    `moe_expert_swiglu_expert_gate_up_native_grouped` **50.7 s** and
+    `..._down_native_grouped` **19.2 s**, plus device memcpy.
+  - Host: `clWaitForEvents` **36.3 s** (5.86 M calls),
+    `clEnqueueMemcpyINTEL(HtoD)` **15.0 s** over **5.80 M calls**, `DtoM`
+    12.3 s over 4,704, `clFinish` 1.1 s.
+  - **Per decode token** (64-token difference): **+326 HtoD copies** and **+48
+    DtoM** (one per MoE layer) -- the per-expert GPU dispatch uploads each
+    routed expert's weights every token. The time difference is contaminated:
+    a one-off device `HtoH` copy (28.7 s in the 80-token run vs 2.3 s in the
+    16-token run, from 262 extra calls) and a 15 s prefill-rate difference
+    between the two fresh processes, both the size of the decode delta itself.
+  - **Decision: take the tier off the critical path.** Device idle is ~74 % of
+    wall, the host thread blocks with `clWaitForEvents` maxima of 302 ms (the
+    GPU waiting on the CPU tier inside the MoE primitive), and the per-token
+    expert uploads are host work. The next build overlaps the host experts
+    with the GPU's shared-expert and following ops and joins late
+    (prefill-expert-streaming v2), while cutting the per-token host work.
+  - The dense-27B control was not run: no dense 27B artifact is in the served
+    registry, and the run-to-run variance above would want a cleaner window
+    first.
