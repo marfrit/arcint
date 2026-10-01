@@ -277,3 +277,26 @@ change. A slot is a hit only for the identical span list. Everything else
   - The dense-27B control was not run: no dense 27B artifact is in the served
     registry, and the run-to-run variance above would want a cleaner window
     first.
+
+- 2026-10-01. **0074 adopted, routed by call shape (the served gate passes).**
+  The first 0074 form applied the quantised dot to every tier call: prefill
+  regressed 28 % (68.4 -> 49.5 t/s) while decode rose 10 % (6.0 -> 6.6). The
+  cut is a pure function of the call shape (DESIGN §3.4): calls of <= 8 jobs
+  (a decoded token, one job per routed expert) take the quantised dot; larger
+  calls (an expert with many routed tokens) keep the old f32 decode + the
+  one-job-per-lane AVX2 dot, the better prefill kernel. Dense arm, 20,085
+  tokens, B60, bank 30 GiB, port 8111:
+
+  | arm | prefill | decode |
+  |---|---|---|
+  | base (`MOE_CPU_TIER_Q8_DOT=0`) | 64.2 t/s | 5.9 t/s |
+  | shape-routed 0074 | **63.1 t/s** | **6.5 t/s** |
+
+  Prefill is the base within noise (-1.7 %); decode is +10 %. **Gate met;
+  adopted** -- served runtime prefix `ov-0074`, plugin sha
+  `55c432880f2d5ed0`. Cell
+  `moe_cpu_expert_native.shape_routing_sends_large_calls_to_the_f32_path`
+  asserts a decode-shaped call equals the AVX2 path and a prefill-shaped call
+  equals the f32 reference bitwise.
+  - Prefill's cheaper lever is still ggml's **batched** dot, not ported;
+    prefill-expert-streaming v2 stays the prefill build.

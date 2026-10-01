@@ -1,31 +1,34 @@
 # Tier hot loop (campaign host-expert-bank): the CPU expert dot in the
-# quantised domain, ggml's approach.
+# quantised domain, ggml's approach, routed by call shape.
 #
 # The tier's native-format path (IQ3_XXS gate/up, IQ4_NL or Q8_0 down; IQ4_XS
 # arrives in the IQ4_NL layout) dequantised each weight row to f32 and then
-# ran a plain f32 dot -- the decode was ~13 of 15 ms per expert on the dev
-# host. ggml instead dots in the quantised domain: the activation is quantised
-# ONCE per stage to int8 with one scale per 32 values, and maddubs/madd do the
-# arithmetic on the packed bytes. This patch adds that path to the tier's
-# AVX2 file and routes the native formats onto it.
+# ran a plain f32 dot. ggml instead dots in the quantised domain: the
+# activation is quantised ONCE per stage to int8 with one scale per 32 values,
+# and maddubs/madd do the arithmetic on the packed bytes.
 #
-# Measured (dirac, 8 experts x one job per layer call, IQ3_XXS gate/up + IQ4_NL
-# down, H=2560 I=640, pool of 7, services stopped): 651 us per layer call on
-# the split plan {4,2}, against the pre-0074 tier's ~1.14 ms recorded all in
-# RAM and llama.cpp's own mul_mat_id at ~540 us per layer. That is 1.21x of
-# ggml's, inside the 1.3x bar. A whole-expert schedule was 1007 us: the split
-# plan matters. MOE_CPU_TIER_Q8_DOT=0 restores the pre-0074 routing (A/B).
+# SHAPE ROUTING (the served gate's finding). The quantised dot is the decode
+# kernel only: a tier call with <= 8 jobs (one routed token per expert) takes
+# it; a prefill-shaped call (an expert with many routed tokens) keeps the old
+# f32 decode + the one-job-per-lane AVX2 dot, which is the better prefill
+# kernel. The first form of this patch applied the quantised dot to every
+# shape and measured prefill 68.4 -> 49.5 t/s (dense, 20,085 tokens, B60)
+# while decode rose 6.0 -> 6.6. With the shape routing: prefill 63.1 t/s
+# (base 64.2) and decode 6.5 t/s (base 5.9). The cut is a pure function of the
+# call shape (DESIGN 3.4). MOE_CPU_TIER_Q8_DOT=0 restores the pre-0074 routing
+# (A/B).
 #
-# Numerics change: the f16-to-f32 decode is replaced by an int8 activation
-# quantisation, so the cells hold to a stated tolerance, not to bits. The
-# tolerance cell compares against the f32 tier at the served shape; the debug
-# path found the one real bug -- _mm256_sign_epi8 ZEROES the source where its
-# sign byte is 0 (PSIGNB semantics), so the IQ3_XXS sign vector must carry +1
-# for a clear bit, not 0.
+# Numerics change: the int8 activation replaces the f16-to-f32 decode, so the
+# cells hold to a stated tolerance, not to bits. The tolerance cell compares
+# against the f32 tier at the served shape; the shape-routing cell asserts a
+# decode-shaped call equals the AVX2 path and a prefill-shaped call equals the
+# f32 reference bitwise. The debug path found the one real bug --
+# _mm256_sign_epi8 ZEROES the source where its sign byte is 0 (PSIGNB
+# semantics), so the IQ3_XXS sign vector carries +1 for a clear bit, not 0.
 #
 # Files: moe_cpu_expert.hpp (table accessors, a test hook), moe_cpu_expert.cpp
-# (the accessors, and the AVX2 dispatch now accepts the native formats),
-# moe_cpu_expert_avx2.cpp (the quantised stage), and the unit test.
+# (the accessors, the shape-routed AVX2 dispatch), moe_cpu_expert_avx2.cpp (the
+# quantised stage), and the unit test.
 
 diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
 --- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
@@ -62,13 +65,29 @@ diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
  void compute_stage_f32(const QuantMatrix& mat, const float* x, int n_begin, int n_end, float* acc_out) {
      if (mat.format != kQuantFormatU4Affine) {
          // arcint (patch 0043): a native format decodes the row (scale folded
-@@ -1220,6 +1226,18 @@
- bool expert_takes_avx2(const ExpertDesc& e) {
+@@ -1214,12 +1220,32 @@
+ 
+ #if defined(OV_MOE_CPU_TIER_HAVE_AVX2)
+ namespace {
++// arcint (patch 0074). Decode-shaped tier calls take the quantised-domain dot;
++// prefill-shaped calls (an expert with many routed tokens) keep the f32
++// decode + the one-job-per-lane AVX2 dot, which is the better prefill kernel
++// (the served gate measured the q8 path 28 % slower at prefill). The cut is a
++// pure function of the call shape (DESIGN §3.4): <= 8 jobs is decode.
++constexpr size_t kQ8MaxJobs = 8;
+ // arcint (patch 0071). moe_cpu_expert's kernel choice, shared with the two
+ // phase entry points below so a split expert runs the kernel the whole call
+ // would; the rule and its reasons are moe_cpu_expert's (below).
+-bool expert_takes_avx2(const ExpertDesc& e) {
++bool expert_takes_avx2(const ExpertDesc& e, size_t n_jobs) {
      static const bool have_avx2 = ov::with_cpu_x86_avx2();
-     auto avx2_ok = [](const QuantMatrix& m) {
-+        // arcint (patch 0074): the native formats now take the AVX2 path --
-+        // compute_stage_avx2 routes IQ3_XXS / IQ4_NL (IQ4_XS) / Q8_0 to the
-+        // quantised-domain dot. IQ2_S keeps the scalar reference. The env
+-    auto avx2_ok = [](const QuantMatrix& m) {
++    auto avx2_ok = [n_jobs](const QuantMatrix& m) {
++        // arcint (patch 0074): the native formats take the AVX2 path for
++        // decode-shaped calls -- compute_stage_avx2 routes IQ3_XXS / IQ4_NL
++        // (IQ4_XS) / Q8_0 to the quantised-domain dot. Larger calls fall back
++        // to the scalar reference (whose jobs path carries the AVX2 lanes).
++        // IQ2_S always keeps the scalar reference. The env
 +        // MOE_CPU_TIER_Q8_DOT=0 restores the pre-0074 routing (A/B).
 +        static const bool q8_dot = [] {
 +            const char* v = std::getenv("MOE_CPU_TIER_Q8_DOT");
@@ -77,18 +96,39 @@ diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
 +        const bool native = m.format == kQuantFormatIq3Xxs || m.format == kQuantFormatIq4Nl ||
 +                            m.format == kQuantFormatQ8_0;
 +        if (native)
-+            return q8_dot;
++            return q8_dot && n_jobs <= kQ8MaxJobs;
          return m.format == kQuantFormatU4Affine && (m.group_size < 64 || m.group_size % 64 == 0);
      };
      return have_avx2 && avx2_ok(e.gate) && avx2_ok(e.up) && avx2_ok(e.down);
-@@ -1259,8 +1277,17 @@
+@@ -1230,7 +1256,7 @@
+ void moe_cpu_expert_gate_up(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, int row_begin, int row_end,
+                             float* h) {
+ #if defined(OV_MOE_CPU_TIER_HAVE_AVX2)
+-    if (expert_takes_avx2(e)) {
++    if (expert_takes_avx2(e, n_jobs)) {
+         moe_cpu_expert_gate_up_avx2(e, jobs, n_jobs, row_begin, row_end, h);
+         return;
+     }
+@@ -1241,7 +1267,7 @@
+ void moe_cpu_expert_down(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, const float* h, int col_begin,
+                          int col_end) {
+ #if defined(OV_MOE_CPU_TIER_HAVE_AVX2)
+-    if (expert_takes_avx2(e)) {
++    if (expert_takes_avx2(e, n_jobs)) {
+         moe_cpu_expert_down_avx2(e, jobs, n_jobs, h, col_begin, col_end);
+         return;
+     }
+@@ -1258,9 +1284,19 @@
+     // smaller than one chunk (then the group is all scalar tail). A group of,
      // say, 96 would start mid-block and pair lanes with the wrong elements
      // (found in review); such shapes take the scalar reference instead.
-     auto avx2_ok = [](const QuantMatrix& m) {
+-    auto avx2_ok = [](const QuantMatrix& m) {
 -        // arcint (patch 0043): the native formats take the scalar reference
 -        // (row decode + dot) until the AVX2 kernel learns them.
-+        // arcint (patch 0074): the native formats take the AVX2 path now (the
-+        // quantised-domain dot); only IQ2_S stays on the scalar reference.
++    auto avx2_ok = [n_jobs](const QuantMatrix& m) {
++        // arcint (patch 0074): native formats take the AVX2 path for
++        // decode-shaped calls (<= kQ8MaxJobs jobs), the quantised-domain dot;
++        // larger calls stay on the scalar reference. IQ2_S always does.
 +        // MOE_CPU_TIER_Q8_DOT=0 restores the pre-0074 routing (A/B).
 +        static const bool q8_dot = [] {
 +            const char* v = std::getenv("MOE_CPU_TIER_Q8_DOT");
@@ -97,7 +137,7 @@ diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
 +        const bool native = m.format == kQuantFormatIq3Xxs || m.format == kQuantFormatIq4Nl ||
 +                            m.format == kQuantFormatQ8_0;
 +        if (native)
-+            return q8_dot;
++            return q8_dot && n_jobs <= kQ8MaxJobs;
          return m.format == kQuantFormatU4Affine && (m.group_size < 64 || m.group_size % 64 == 0);
      };
      if (have_avx2 && avx2_ok(e.gate) && avx2_ok(e.up) && avx2_ok(e.down)) {
@@ -270,7 +310,7 @@ diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
  #include <cstdlib>
  #include <cstring>
  #include <limits>
-@@ -957,3 +958,179 @@
+@@ -957,3 +958,156 @@
      EXPECT_EQ(one.gate_up_chunks, 1);
      EXPECT_EQ(one.down_chunks, 1);
  }
@@ -383,70 +423,47 @@ diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
 +        << "the quantised path is not deterministic across runs";
 +}
 +
-+// arcint (patch 0074) debug scaffold: isolate the quantised stage against the
-+// f32 stage for one row of each native format.
-+TEST(moe_cpu_expert_native, debug_q8_stage) {
++// arcint (patch 0074). Shape routing: a native expert takes the quantised-
++// domain dot for decode-shaped calls (<= 8 jobs) and the f32 reference for
++// prefill-shaped calls (more jobs). Deterministic by call shape (DESIGN 3.4).
++// Red-first: flipping the threshold, or routing both shapes one way, turns one
++// of the two assertions red.
++TEST(moe_cpu_expert_native, shape_routing_sends_large_calls_to_the_f32_path) {
 +    if (!ov::with_cpu_x86_avx2()) {
 +        GTEST_SKIP() << "host has no AVX2";
 +    }
-+    const int K = 64;
-+    std::mt19937 rng(5);
-+    std::normal_distribution<float> nd(0.0f, 1.0f);
-+    std::vector<float> x(static_cast<size_t>(K));
-+    for (auto& v : x) v = nd(rng);
-+
++    const int H = 2560, I = 640;
++    std::mt19937 rng(0x74u);
++    auto ex = make_native_expert(H, I, rng);
 +    {
-+        std::vector<uint8_t> w(static_cast<size_t>(K) / 2);
-+        for (auto& b : w) b = static_cast<uint8_t>(rng() & 0xFF);
-+        std::vector<uint16_t> s(2);
-+        s[0] = f32_to_f16_bits(0.03f);
-+        s[1] = f32_to_f16_bits(0.05f);
-+        QuantMatrix m = native_matrix(kQuantFormatIq4Nl, K, w.data(), nullptr, s.data());
-+        m.oc = 1;
-+        float ref = 0.0f, q8 = 0.0f;
-+        ov::intel_gpu::ocl::moe::compute_stage_f32(m, x.data(), 0, 1, &ref);
-+        ov::intel_gpu::ocl::moe::compute_stage_q8_for_test(m, x.data(), 0, 1, &q8);
-+        std::printf("[DBG-NL] ref=%.6f q8=%.6f\n", ref, q8);
++        // decode shape: 1 job -> the q8 AVX2 path.
++        JobSet js(H, 1, rng);
++        std::vector<uint16_t> a(static_cast<size_t>(H), 0), b(static_cast<size_t>(H), 0), c(static_cast<size_t>(H), 0);
++        ExpertJob ja{js.x[0].data(), js.jobs[0].w_route, a.data()};
++        ExpertJob jb{js.x[0].data(), js.jobs[0].w_route, b.data()};
++        ExpertJob jc{js.x[0].data(), js.jobs[0].w_route, c.data()};
++        ov::intel_gpu::ocl::moe::moe_cpu_expert(ex->e, &ja, 1, 0, H);
++        moe_cpu_expert_avx2(ex->e, &jb, 1, 0, H);
++        moe_cpu_expert_ref(ex->e, &jc, 1, 0, H);
++        EXPECT_EQ(0, std::memcmp(a.data(), b.data(), sizeof(uint16_t) * static_cast<size_t>(H)))
++            << "a decode-shaped call did not take the q8 AVX2 path";
++        EXPECT_NE(0, std::memcmp(a.data(), c.data(), sizeof(uint16_t) * static_cast<size_t>(H)))
++            << "a decode-shaped call matched the f32 reference bitwise -- it did not take the q8 path";
 +    }
 +    {
-+        std::vector<uint8_t> w(static_cast<size_t>(K) / 4);
-+        for (auto& b : w) b = static_cast<uint8_t>(rng() & 0xFF);
-+        std::vector<uint8_t> z(static_cast<size_t>(K) / 8);
-+        for (auto& b : z) b = static_cast<uint8_t>(rng() & 0x7F);
-+        std::vector<uint16_t> s(2);
-+        s[0] = f32_to_f16_bits(0.03f);
-+        s[1] = f32_to_f16_bits(0.05f);
-+        QuantMatrix m = native_matrix(kQuantFormatIq3Xxs, K, w.data(), z.data(), s.data());
-+        m.oc = 1;
-+        float ref = 0.0f, q8 = 0.0f;
-+        ov::intel_gpu::ocl::moe::compute_stage_f32(m, x.data(), 0, 1, &ref);
-+        ov::intel_gpu::ocl::moe::compute_stage_q8_for_test(m, x.data(), 0, 1, &q8);
-+        // Scalar emulation of the q8 algorithm (same tables via the accessors).
-+        const uint32_t* grid = ov::intel_gpu::ocl::moe::iq3xxs_grid_table();
-+        const uint8_t* signs = ov::intel_gpu::ocl::moe::iq2xs_signs_table();
-+        const uint8_t mask[8] = {1, 2, 4, 8, 16, 32, 64, 128};
-+        float emu = 0.0f;
-+        const int groups = K / 32;
-+        for (int g = 0; g < groups; g++) {
-+            float amax = 0.0f;
-+            for (int j = 0; j < 32; j++) amax = std::max(amax, std::fabs(x[static_cast<size_t>(g) * 32 + j]));
-+            const float da = amax / 127.0f;
-+            int qv[32];
-+            for (int j = 0; j < 32; j++) qv[j] = static_cast<int>(std::nearbyint(x[static_cast<size_t>(g) * 32 + j] / da));
-+            long long dot = 0;
-+            for (int l = 0; l < 4; l++) {
-+                const uint8_t sg = signs[z[static_cast<size_t>(g) * 4 + l] & 127];
-+                uint8_t g1[4], g2[4];
-+                std::memcpy(g1, &grid[w[static_cast<size_t>(g) * 8 + 2 * l]], 4);
-+                std::memcpy(g2, &grid[w[static_cast<size_t>(g) * 8 + 2 * l + 1]], 4);
-+                for (int j = 0; j < 4; j++) {
-+                    dot += static_cast<long long>(g1[j]) * ((sg & mask[j]) ? -qv[l * 8 + j] : qv[l * 8 + j]);
-+                    dot += static_cast<long long>(g2[j]) * ((sg & mask[j + 4]) ? -qv[l * 8 + 4 + j] : qv[l * 8 + 4 + j]);
-+                }
-+            }
-+            emu += f16_bits_to_double(s[static_cast<size_t>(g)]) * da * static_cast<double>(dot);
-+            std::printf("[EMU] G%d da=%g dot=%lld\n", g, (double)da, dot);
++        // prefill shape: 9 jobs -> the f32 reference (bitwise).
++        JobSet js(H, 9, rng);
++        std::vector<std::vector<uint16_t>> a(9, std::vector<uint16_t>(static_cast<size_t>(H), 0));
++        std::vector<std::vector<uint16_t>> c(9, std::vector<uint16_t>(static_cast<size_t>(H), 0));
++        std::vector<ExpertJob> jobs_a(9), jobs_c(9);
++        for (int j = 0; j < 9; j++) {
++            jobs_a[j] = ExpertJob{js.x[j].data(), js.jobs[j].w_route, a[j].data()};
++            jobs_c[j] = ExpertJob{js.x[j].data(), js.jobs[j].w_route, c[j].data()};
 +        }
-+        std::printf("[DBG-IQ3] ref=%.6f q8=%.6f emu=%.6f\n", ref, q8, emu);
++        ov::intel_gpu::ocl::moe::moe_cpu_expert(ex->e, jobs_a.data(), 9, 0, H);
++        moe_cpu_expert_ref(ex->e, jobs_c.data(), 9, 0, H);
++        for (int j = 0; j < 9; j++)
++            EXPECT_EQ(0, std::memcmp(a[j].data(), c[j].data(), sizeof(uint16_t) * static_cast<size_t>(H)))
++                << "a prefill-shaped call did not take the f32 path (job " << j << ")";
 +    }
 +}

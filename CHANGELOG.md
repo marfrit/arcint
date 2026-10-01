@@ -2723,3 +2723,9 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p2` (patches 0003–0013).
   by the GPU expert GEMMs; host `clWaitForEvents` is 36 s and there are 5.8 M
   `HtoD` expert-weight copies (326 per decode token). Decision: take the CPU
   tier off the critical path (overlap host experts with GPU work, join late).
+
+- **0074 adopted, shape-routed.** The quantised-domain dot is now the decode
+  kernel only (tier calls of <= 8 jobs); prefill-shaped calls keep the old f32
+  path. Dense arm at 20,085 tokens on the B60: prefill 63.1 t/s (base 64.2),
+  decode 6.5 t/s (base 5.9) -- prefill back to base, decode +10 %. Served
+  runtime prefix ov-0074, plugin 55c432880f2d5ed0.
