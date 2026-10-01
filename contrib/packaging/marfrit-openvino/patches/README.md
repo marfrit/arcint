@@ -172,7 +172,7 @@ does not target, and its correctness cells are in its own header.
   strategies out; a local split-K keeps its work-group count — the patch
   comment's wording to the contrary is wrong, its effect stands.)
 
-## Per-expert dispatch and the native expert formats (0038–0041, 0043–0067)
+## Per-expert dispatch and the native expert formats (0038–0041, 0043–0074)
 
 - **0038 — the per-expert dispatch framework** (`MOE_PER_EXPERT_DISPATCH`):
   the fused GEMV path is bypassed and only the routed experts are computed.
@@ -257,6 +257,25 @@ does not target, and its correctness cells are in its own header.
   so no layer waits on a host readback. The full-depth 35B decodes 19.3 →
   28.1 t/s after 4,096 tokens on the 16 GiB card, same digests, 10/10;
   `MOE_DEVICE_ROUTE=0` restores the host route.
+- **0068 — the CPU tier decodes a native expert row once and runs one row per
+  AVX2 lane** for a single-job (decode) call.
+- **0069 — native IQ3_XXS gate/up and IQ4_NL/IQ4_XS down decode whole blocks**,
+  not row by row.
+- **0070 — the resident slot pool moves into device memory.**
+- **0071 — a decode step's experts are balanced over the pool** with a
+  two-phase split (gate/up row chunks, then down column chunks), same bytes.
+- **0072 — the tier's expert bytes come from a host RAM bank** filled at load
+  by sequential O_DIRECT reads instead of page-faulting on the workers. Flash-Next
+  on the B60: first answer 48.55 → 38.18 s, byte-identical.
+- **0073 — QSA's own selection reaches PagedAttention** through the optional
+  input 28, so Flash-Next's 12 full-attention layers serve the model's sparse
+  selection. Non-default, `n_ctx ≤ 32768`; decode 0.87× dense at 20k, prefill
+  1.27×. The route gate keeps the below-2,051 mask byte-identical to dense.
+- **0074 — the tier's native dot runs in the quantised domain** (ggml's
+  approach), routed by call shape: a decode-shaped call (≤ 8 jobs) takes the
+  int8 quantised dot, a prefill-shaped call keeps the f32 path (DESIGN §3.4).
+  B60 dense `d48q8`, 20,085 tokens: prefill 63.1 vs base 64.2 t/s, decode 6.5
+  vs base 5.9.
 
 Standing configuration these add up to: the full-depth Qwen3.6-35B native
 artifact all-resident on the 16 GiB card at ~960 t/s prefill (4,096 tokens)

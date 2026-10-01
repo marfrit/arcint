@@ -10,10 +10,10 @@
 > NInfer philosophy (specialize, then be honest about numbers), Intel
 > substrate.
 
-## Status (0.5.0.1)
+## Status (0.5.4)
 
-Runtime floor: marfrit-openvino +p20 = OpenVINO upstream commit 71640275 (the
-2026.4.0 nightly of 2026-08-21) + patches 0003-0067
+Runtime floor: marfrit-openvino +p25 = OpenVINO upstream commit 71640275 (the
+2026.4.0 nightly of 2026-08-21) + patches 0003-0074
 (contrib/packaging/marfrit-openvino/patches/, mirrored in patches/). Every
 number below is measured-here on the named card; DESIGN.md §7 has each one's
 standing value and evidence class. The dated measurement record, campaigns

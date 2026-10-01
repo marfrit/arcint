@@ -1,6 +1,6 @@
 # arcint — Design
 
-Status: **0.5.0.1**, runtime floor `marfrit-openvino +p20` (patches 0003–0067
+Status: **0.5.4**, runtime floor `marfrit-openvino +p25` (patches 0003–0074
 on the pinned OpenVINO nightly, §1.1). This document states what arcint *is*
 today: the architecture, the invariants, the gates, and the standing measured
 value of every subsystem. It is not a diary.
