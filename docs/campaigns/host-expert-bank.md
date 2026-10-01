@@ -425,3 +425,35 @@ change. A slot is a hit only for the identical span list. Everything else
     gate as written is decode-first.
   - Working tree / runtime: the compile tree kept the patch as `a28bc57adb67f397`
     (staged at `ov-0075`); the repo carries no patch file for it.
+
+- 2026-10-01. **Zero-copy counter read + bank miss share -- 0075 dropped.**
+
+  **Zero-copy call counts** (one 16-vs-80 short-prompt pair per arm, dense
+  `d48q8`, B60, plugin `a28bc57adb67f397`; CLIntercept device counts, delta
+  over 64 decode tokens):
+
+  | memcpy | zc off /token | zc on /token | delta |
+  |---|---|---|---|
+  | HtoD | 304.2 | 11.5 | **-292.7** |
+  | DtoH | 98.0 | 98.0 | 0 |
+  | MtoH | 48.0 | 48.0 | 0 |
+  | MtoD | 12.0 | 12.0 | 0 |
+  | DtoM | 48.0 | 48.0 | 0 |
+  | HtoH | 5.7 | 7.0 | +1.3 |
+
+  The zero-copy **did take effect**: it removed the ~293 staging-ring HtoD
+  writebacks per token. The x/rw readback hops (DtoH -> MtoH 98/48, MtoD 12)
+  are unchanged -- the implementation dropped the writeback copy only. Decode
+  did not move (gate: base 6.4, zero-copy 6.5; this pair 5.8 vs 5.2 -- within
+  the run-to-run spread), so **the copy idle was the tier wait, not the
+  copies**: the 47.2 ms/token writeback wait is the host blocked in
+  `pool.wait()` for the tier's rows, which the removed enqueues do not touch.
+  Recorded; **0075 dropped** (not in the packaging series).
+
+  **Bank misses per decode token** (the existing 16-vs-80 logs' `MOE_BANK`
+  exit lines, delta over 64 tokens): hits +19,035 -> **297.4 hits/token**;
+  misses +267 -> **4.17 misses/token**; read_MiB +611 -> **9.55 MiB/token**
+  read from disk; unbanked +381 -> 5.95/token. Against the **308 tier experts
+  per token**, the bank serves 297.4, and the disk-read share is
+  **4.17 / 308 = 1.35 %** (an expert is 2.34 MiB, so 4.17 x 2.34 = 9.8 MiB,
+  matching the 9.55 MiB counted).

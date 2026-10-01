@@ -2766,3 +2766,12 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p2` (patches 0003–0013).
   zero-copy 63.7 / 6.5, spin 66.8 / 6.4, both 64.5 / 6.2 -- the decode bar
   (> 6.5 t/s) is not cleared, so the patch is not added to the packaging series.
   Prefill improves with the spin (+6.4 %), but the gate is decode-first.
+
+- **Tier hot loop, part A: zero-copy took effect, decode did not move; 0075
+  dropped.** One 16-vs-80 pair per arm (dense `d48q8`, B60) shows the
+  staging-ring HtoD copies fall from **304.2 to 11.5 per decode token**
+  (-292.7), while DtoH 98, MtoH 48, MtoD 12 and DtoM 48 are unchanged; decode
+  stays flat (5.8 vs 5.2 in the pair; 6.4 vs 6.5 in the gate A/B). The copy
+  idle was therefore the host waiting on the tier, not the copies. Bank misses
+  are **4.17 per decode token** (1.35 % of the 308 tier experts) and
+  **9.55 MiB/token** read from disk.
