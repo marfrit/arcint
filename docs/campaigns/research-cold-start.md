@@ -1,4 +1,4 @@
-# Cold start and kernel-compilation caching across engines — research for static-partition-cold-start
+# Cold start and kernel-compilation caching across engines
 
 Scope: how other GPU inference stacks separate and address first-process warming, with emphasis on the layers arcint actually sits on (OpenVINO GPU plugin over OpenCL, oneDNN for the MoE GEMMs, Intel's compute-runtime/IGC underneath). All URLs accessed 2026-09-05.
 
@@ -9,7 +9,7 @@ Scope: how other GPU inference stacks separate and address first-process warming
 - Persists: across processes and reboots, on the filesystem at `cache_dir`, keyed to the exact static graph — does not survive a graph-shape or model change.
 - Measured delta: not quantified in the docs surveyed; framed as removing the compile-pipeline cost entirely on a hit, not as a percentage.
 - License / source: Apache 2.0. OpenVINO Model Caching Overview and GPU Device docs, docs.openvino.ai/2025.
-- Not covered, load-bearing here: `cache_dir` caches the compiled-model artifact, not an oneDNN artifact — oneDNN's own primitive JIT (what `created_onednn_kernels` counts) is a separate cache one layer down (next section), and a `cache_dir` hit does not imply oneDNN's primitives were reused; it only proves the OpenVINO-level compile pipeline was skipped. arcint's paged graph already runs with `cache_dir` off by design (`backend_ov.cpp` ~2694-2697, `ov::cache_dir("")`) — this mechanism is out of scope as a lever unless that design decision is itself revisited, which is out of this campaign's scope per `static-partition-cold-start.md`.
+- Not covered, load-bearing here: `cache_dir` caches the compiled-model artifact, not an oneDNN artifact — oneDNN's own primitive JIT (what `created_onednn_kernels` counts) is a separate cache one layer down (next section), and a `cache_dir` hit does not imply oneDNN's primitives were reused; it only proves the OpenVINO-level compile pipeline was skipped. arcint's paged graph sets `ov::cache_dir("")` (`code`, `backend_ov.cpp`).
 
 ## oneDNN: primitive cache (in-memory, automatic) vs. persistent cache (on-disk, NOT automatic)
 
@@ -86,7 +86,7 @@ Two distinct mechanisms, easy to conflate.
 - Both compile ahead of time (ExecuTorch via `torch.export` to a fixed execution graph; MLC-LLM via TVM Unity to target-specific generated code) and both avoid the bulk of runtime JIT by construction.
 - Measured delta: no first-run warm-up numbers found for either in this pass.
 - License / source: ExecuTorch — BSD; MLC-LLM — Apache 2.0. llm.mlc.ai TVM install docs; secondary ML-runtime survey coverage.
-- Relevance, and the caveat: the design intent in both is that AOT export removes the need for the pre-warm pattern entirely — a different tradeoff than arcint's, since a full AOT rebuild per shape/depth/precision combination is far more build-cost than kernel-cache reuse or a runtime pre-warm pass, and a rebuild-per-configuration approach is out of scope per the campaign's own "no change to the static partition's ranking rule."
+- Relevance: the design intent in both is that AOT export removes the need for the pre-warm pattern; the price is a rebuild per shape/depth/precision combination.
 
 ## Separating JIT cost from page-cache cost — how others measure it
 
@@ -98,15 +98,15 @@ Sources: Baeldung "Dropping Page Cache in Linux", Percona blog on `fincore`, Ope
 
 ## What transfers to arcint
 
-Ordered isolation plan for the campaign's entry criterion (owner not yet separated), cheapest and most diagnostic first:
-
-1. **Confirm compute-runtime's on-disk program cache state on the test hardware** — read `NEO_CACHE_PERSISTENT`/`NEO_CACHE_DIR` at the process environment actually used to launch arcint, and check whether the cache directory has non-trivial contents and is growing after a tier-ON run. Five minutes, no code change, and it directly discriminates: if the cache is already on, populated, and growing, the recurring 325-kernel JIT cost is a cache-miss problem (hash instability per process — check whether the launch path embeds anything process-variant, e.g. a PID or timestamp, into a compile flag) rather than an absent-mechanism problem, which changes the fix from "add a cache" to "fix why the existing cache doesn't hit." If it is off or unwritable, that alone may be the whole defect. Expected move: process 2..N's load time should collapse toward tier-OFF's 30-45 s once this is confirmed on, populated, and hitting.
-
-2. **Fixed-`created_onednn_kernels`, fresh-vs-warm-page-cache process pair** — the design note's own proposed experiment: run a process, record `created_onednn_kernels=325` and load time, then immediately run a second process with the OS page cache for the weight/partition files forced cold (`drop_caches` or an equivalent eviction, checked with `vmtouch`/`fincore` rather than assumed, and via `arcstat`/timing if any of those paths are ZFS-backed) while compute-runtime's own on-disk cache from step 1 stays warm. If load time still collapses to near-fast, the page-cache-of-weights hypothesis is ruled out as the dominant term and the kernel cache is confirmed as owner; if load time stays slow, page cache of the weight/partition data is implicated and step 1's fix alone will not close the gate.
-
-3. **First-use `reserve_pinned` fills, isolated last** — only after 1 and 2 fail to fully explain the gap: instrument `bind()`'s `reserve_pinned` pass (patch 0018) with its own timer, run it standalone against a fixed-size partition with both the kernel cache and page cache pre-warmed by steps 1-2, and see what time, if any, remains unaccounted for. This is the only one of the three that requires a new counter rather than an existing one (`created_onednn_kernels` and OS-level cache tools cover the other two), which is why it is checked last.
-
-Candidate levers, once an owner is named, each evaluated against DESIGN §3.4's history-independence invariant (both are per-process/seed-independent by construction, so neither should threaten it, but confirm at the review step by checking the loaded blob or executed warm-up path does not vary with which requests a process has already served):
-
-- **Persistent kernel cache.** If step 1 shows compute-runtime's cache absent or missing hits, the fix is operational configuration at the arcint/launch-environment level (`NEO_CACHE_PERSISTENT=1` plus a stable, writable `NEO_CACHE_DIR` shared across the fleet's processes for a given card+driver+model combination) — no plugin code change implied. If instead the miss is because oneDNN's own in-memory cache is process-local by design (expected) and the OpenCL-level cache is not the whole story, the next-cheapest lever is wiring oneDNN's own persistent-cache API (`get_cache_blob`/blob-constructor) — plugin-internals work, out of arcint's own source unless the GPU plugin already exposes a hook for it, which recon should check before assuming upstream work is needed.
-- **Explicit pre-warm pass.** If the owner is first-use fills (`reserve_pinned`) or an oneDNN cache-miss not worth chasing upstream, the direct lever is a dummy-request pass run once per process at start, before the first real request is admitted — the pattern ipex-llm, vLLM, SGLang and TensorRT-LLM all converge on independently. For arcint this means one synthetic prefill+decode pass per shape class actually served (at minimum the reference cell's own prompt length and KV precision) run inside process start-up and excluded from the first-request timing the gate measures — cheap to build, adds fixed latency to every process start (including the already-fast ones) unless gated behind the tier-ON condition specifically, and does not by itself reduce total warming work, only relocates it off the first customer request.
+- **Separate the terms before choosing a lever** (the measurement practice
+  above): JIT, page cache (timed reads or `arcstat` on ZFS, not `fincore`),
+  and first-use fills, one at a time. `static-partition-cold-start` did this
+  and found the load-time probe forwards and the file cache as the owners
+  (`measured-here`, DESIGN §7.0.2aq).
+- **Persist what is recomputed** (OpenVINO `cache_dir`, NEO's on-disk program
+  cache, vLLM's compile cache): arcint persists its fit ledger
+  (`--fit-ledger-dir`), and NEO's program cache is on and populated on the
+  dev host (`measured-here`).
+- **An explicit warm-up pass before traffic** (ipex-llm, vLLM, SGLang,
+  TensorRT-LLM all do it): arcint runs a 128-token pre-warm forward on a
+  ledger hit (`code`, `load_paged()`).

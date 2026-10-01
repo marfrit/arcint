@@ -1,94 +1,108 @@
-# Campaigns — one defect, one document, one session's worth of work
+# Campaigns — one lever, one document
 
-`docs/milestone-0.3.0.md` planned 0.3.0 as fourteen milestones in one
-document, and its backlog table carried what 0.3.0 did not close as four
-rows. That shape has stopped fitting: a backlog row bundles several levers
-with different owners, and a session that picks one up has to read the
-whole record to find its edges. From 0.3.1 on, every open defect or lever
-is its own **campaign**: one document in this directory, self-contained
-enough that a fresh session can carry it with nothing but that document
-and the DESIGN sections it cites.
+Every open defect or lever is a **campaign**: one document in this
+directory, sufficient for a fresh session together with the DESIGN sections
+and reference sources it cites. A closed campaign is a stub that says what
+exists, where, and its number; its full history is in git
+(`git show b0447b8:docs/campaigns/<file>`) and in DESIGN §7.0.2x.
 
 ## Rules
 
-- **One campaign = one defect or one lever, with its own gate.** If two
-  levers have different owners or different gates, they are two campaigns,
-  even when one backlog row named both. A campaign that turns out to have
-  two problems inside is split, not stretched.
-- **The document is sufficient.** It names the measurement that defines
-  the defect (with card, depth, precision, configuration and the DESIGN
-  section that recorded it), what is known against what is hypothesised,
-  the gate, the entry criteria, the files and knobs and counters involved,
-  and the acceptance cells that prove it. Nothing operator-local: hosts,
-  paths and unit names stay in the git-ignored `*.local.md` files, as
-  `CLAUDE.md` says.
-- **The gate is on the record before the work starts**, copied from the
-  backlog row or the DESIGN section that found the defect, and it is a
-  measurement that can fail. A campaign may close as a *verdict* — the
-  defect measured and found not worth fixing, or not a defect — but only
-  with the measurement that says so.
-- **Pipeline, every time:** recon (read the cited sections and the code,
-  write down what is actually there) → design note (a short `docs/design-
-  <slug>.md` when the change is more than a fix) → red-first
-  implementation → one card window at the end, not many along the way →
-  review before commit → a DESIGN `§7.0.2x` record and a CHANGELOG line
-  when it closes. Reviews are not skippable.
+- **One campaign = one defect or one lever, with its own gate.** Two levers
+  with different owners or gates are two campaigns.
+- **References first.** An open campaign names the reference implementation
+  to follow, with source paths in `~/src/Strata-ref` or
+  `~/src/FreeToken-ref` (or llama.cpp), the reference's measured effect, and
+  its evidence class. Build the reference's mechanism, then measure it. See
+  `research-reference-audit.md` and `CLAUDE.md` ("References first").
+- **No "A but B".** A document never lists a known-working reference
+  technique beside a reason arcint did not or cannot do it. An arcint
+  deviation the operator decided is one sentence with its date.
+- **The gate is on the record before the work starts**, and it can fail.
+  Equivalence and quality gates use `CLAUDE.md`'s answer-level bar; speed
+  gates are per phase (the target phase improves, the other stays within the
+  run-to-run spread).
+- **Evidence class on every disposition:** `paper`, `code` or
+  `measured-here`.
+- **The document is sufficient, and nothing in it is operator-local:**
+  hosts, paths and unit names stay in the git-ignored `*.local.md` files.
+- **Pipeline:** recon (the cited sources and the code) → design note when the
+  change is more than a fix → red-first implementation → one card window at
+  the end → review before commit → a DESIGN §7.0.2x record and a CHANGELOG
+  line when it closes. Reviews are not skippable.
 - **Invariants are not negotiable by an agent:** DESIGN §3.4 and §3.8, the
   §5 ladder, the measurement discipline in `CLAUDE.md`. A campaign that
-  would trade one for a number does not trade it on its own: it records the
-  trade, with the measured price of each side, and puts it to the operator.
-  [Amended 2026-10-01. §3.4's history-independence was relaxed, and
-  correctness is now judged at the answer, not at the bit (DESIGN §3.4
-  Amendments 1–2; `CLAUDE.md`). A reference mechanism that conflicts with
-  an invariant is the operator's call
-  (`docs/campaigns/research-reference-audit.md`).]
-- **Status is a dated log at the bottom of the document**, appended, never
-  rewritten. The milestone document's backlog rows point here and are not
-  edited further.
-- **Releases collect closed campaigns.** A point release ships whatever
-  closed since the last tag; no release waits for a campaign, and no
-  campaign is started to fill a release.
+  would trade one for a number records the trade, with the measured price of
+  each side, and puts it to the operator. [Amended 2026-10-01. §3.4 was
+  relaxed, and correctness is now judged at the answer, not at the bit
+  (DESIGN §3.4 Amendments 1–2; `CLAUDE.md`). A reference mechanism that
+  conflicts with an invariant is the operator's call
+  (`research-reference-audit.md`).]
+- **Status is the current state**, a few lines, rewritten as the campaign
+  moves; a closed campaign becomes a stub. [Changed 2026-10-01 from an
+  appended dated log; the logs up to b0447b8 are in git.]
+- **Releases collect closed campaigns.** No release waits for a campaign,
+  and no campaign is started to fill a release.
 
 ## Template
 
     # <slug> — <one-line charter>
-    ## The defect, as measured
-    ## Known against hypothesised
-    ## Gate
-    ## Entry criteria
-    ## Scope — in / out
+    **Open** | **Closed <date>.** (one line)
+    ## Charter
+    ## Reference to follow      (source paths, measured effect, evidence class)
+    ## Gate                     (answer-level bar; per-phase speed)
+    ## Current state            (measured-here numbers with card and configuration)
     ## Where it lives
-    ## Pipeline for this campaign
-    ## Invariants
-    ## Status
 
-## The campaigns
+## Open
 
-Ordered by what unblocks what; the order is advice, not a queue.
+Ordered by the audit's ranking (`research-reference-audit.md` §4); the
+order is advice, not a queue.
 
-| campaign | charter | origin | size |
-|---|---|---|---|
-| [test-ladder-close](test-ladder-close.md) | close the 0.3.1 lead item: fill the acceptance references from the runners' own windows, record the first real run | 0.3.1 lead item, `docs/design-0.3.1-test-ladder.md` | small, closed 2026-09-05 |
-| [prefill-fallback-tristate](prefill-fallback-tristate.md) | patch 0018's overloaded `false` return in the per-expert prefill loop becomes a three-way answer | DESIGN §7.0.2ae, patch 0018 header | small, closed 2026-09-05 |
-| [static-partition-cold-start](static-partition-cold-start.md) | a cold sequence's first processes pay minutes of warming under the static partition; find the owner, then remove it | DESIGN §7.0.2ai | medium |
-| [static-partition-prefill](static-partition-prefill.md) | tier-ON prefill runs at a third of tier OFF because every layer takes the per-expert fallback; a grouped prefill on the resident subset | DESIGN §7.0.2ai | medium–large |
-| [partition-seeding](partition-seeding.md) | seed the static partition from a fixed calibration routing histogram so the pinned half is the hot half — only if decode variance survives the two above | DESIGN §7.0.2ai, patch 0013 | medium, conditional |
-| [u8i4-prefill-price](u8i4-prefill-price.md) | `--paged-kv u8:i4` costs +7/+25/+72 % prefill time with depth; measure the mechanism, then decide | DESIGN §7.0.2aa, M8 row | small–medium, closed 2026-09-05 (patch 0020: parity) |
-| [u8i4-deep-prefill-fault](u8i4-deep-prefill-fault.md) | the out-of-resources fault at deep u8:i4 prefill on the 16 GiB card; the chunk belt mitigates, the plugin-side cause is open | DESIGN §7.0.2ab, §7.0.2ac | medium |
-| [direct-submission-fault](direct-submission-fault.md) | the runtime's direct-submission semaphore evicted under VRAM pressure; diagnosed, the kernel-side fix operator-local and unmeasured on the record, not closed | DESIGN §7.0.2ad | small (measurement), external |
-| [mtp-cycle-wall](mtp-cycle-wall.md) | MTP never beats plain decoding at depth on the dense agent: a 390 ms cycle against a 130 ms break-even; cut the cycle or record the verdict as final | DESIGN §7.0.2ag | medium |
-| [turnstile-wall-time](turnstile-wall-time.md) | the turnstile test orders threads by wall-clock sleeps and flaked once under build load | 0.3.1 window | small, closed 2026-09-05 |
-| [pruefstand-cell-remote](pruefstand-cell-remote.md) | the Prüfstand acceptance cell can only skip by name where the harness does not live; make it runnable from the card window | 0.3.1 window | small, closed 2026-09-05 |
-| [sub4bit-vram-kernel](sub4bit-vram-kernel.md) | a per-expert GEMM kernel with in-kernel dequant, bypassing the MoE fusion — the mechanism that makes routing-aware expert execution (GPU LRU cache, compute only the routed experts) possible; sub-4-bit precision is one lever for cache headroom, not the gate | M10 re-scope, DESIGN §7.0.2ah, FreeToken (prior art) | large, open: the native formats serve (patch 0043, +p19), the OpenCL decode is the rate lever; the long-context f16 term is FALSIFIED at the IR level (2026-09-19/20), so the quality lever is a main-model f32-execution A/B owed on the B60, and the served-path determinism floor is a per-card defect (DESIGN §7.0.2cb; campaigns/served-prefill-determinism.md). [DATED IN PLACE 2026-09-22: the native per-expert route's rate leg ran — V1 at the ratio-99 VENICE budget, **1.81×** at ratio 75 (`ρ = 0.073`), and **V4 FIRES (RED)** on the dispatch route (the answer depends on the resident seed); see DESIGN §7.0.2ce and the campaign status. DATED IN PLACE 2026-09-22 (V4 quantification leg): the divergence is quantified — the answer branches at greedy token index 3 of 64 (61 of 64 tokens differ), each seed reproduces its digest, and a one-layer native MoE block reads **affine per-expert dispatch bit-identical to the host tier**, **native per-expert dispatch not** (12.5/37.5/75 % of elements moved with resident fraction; max |diff| up to 1.1e-2), deterministic and card-independent; see DESIGN §7.0.2cf. The 5-vs-6 slot divergence is CLOSED as intentional (plugin integer division = served truth, `ceil` = fit ledger only).] [DATED IN PLACE 2026-09-24, operator backlog: **the fully-resident NATIVE route does not exist** — the fused path's `--offload-ratio` range is `[0, 100]` (`code`: `src/config.cpp:849`), so a fully-on-GPU MoE option is there (0 or the omitted flag); but patch 0043 asserts native formats need `OFFLOAD_RATIO in (0, 100)` + `MOE_CPU_TIER=YES` (that range is the assert's own message; the in-tree-verifiable half is ratio 0, where arcint never sets the property so the provider is not offloaded), so a native-format MoE cannot serve fully resident even though patches 0045/0047 supply the OpenCL decode. Root cause is plumbing: the plugin's `OFFLOAD_RATIO` prop is set only when the ratio is `> 0` (`src/exec/backend_ov.cpp:1183`, `:1224`). Lever and gate in the campaign status log (all-resident slot pool; decode rate + repeat determinism against its own configuration, since the native route is not bit-identical to the host tier).] [DATED IN PLACE 2026-09-24 (qwen3_5_moe port leg): the emitter is ported to `qwen3_5_moe` and IQ2_S is a native plugin format (patch 0050, built clean on the pinned tree); a depth-4 artifact `qwen36-35b-a3b-d4n-ov` carries 12 native expert bodies byte-exact against the GGUF and loads (`read_model`); the four §5 conventions are measured (`code`+`measured-here`). The A770 window (the gate), the full-depth 40-layer export and the served `qwen3_5_moe` load path stay OWED; no rate or fit is claimed. See `docs/design-qwen35moe-serving-shape.md` §7 and this campaign's 2026-09-24 qwen3_5_moe port entry.] [DATED IN PLACE 2026-09-25 (served-side admission leg, device-free): the `qwen3_5_moe` native rung is admitted (`qwen3.6-35b-a3b-native-d4`, hashes/bytes off the artifact's own manifest), `weights_bytes` is now a checked contract, and the no-PLE/no-n-gram path is first-class (`bind_ngram_ports` inert, `--ngram-gguf` not needed, `feed_ngram_ports` feeds `conv_mask` independently); red-first cells mutation-tested, served binary builds clean. The A770 window (GPU load + served arm: rate, digests vs the int4 comparand, 15.1 GiB fit, V4/determinism) stays OWED.] [DATED IN PLACE 2026-09-25 (A770 window, the qwen3_5_moe/IQ2_S gate): the native IQ2_S graph loads+compiles+serves on `GPU.1` through patch 0050; the depth-4 served sweep reads decode 14.2/14.0 t/s and ext prefill 28.6/28.8 t/s at ratio 50/8 GiB tier+dispatch, and the int4 40-layer comparand 5.4/5.3 t/s (previously measured 9.1 fused/tier-off, 15.0/15.5 tier-on); the fully-resident native arm is BLOCKED (patch 0043 assert, ratio 0); V4 does NOT fire — served digests are byte-identical across ratios 25/50/75/99 while the GPU per-expert route is exercised (up to 407,480 invocations), the open question being bit-exact kernel vs a degenerate 4-layer attractor; 262144 reachable (reservation max ctx 8,397,168); full-depth export, a logits-level V4 A/B and a depth-4 int4 comparand OWED. See design note §9.] [DATED IN PLACE 2026-09-25 (redirect leg — the all-resident NATIVE speed defect, CLOSED): the three-link dead end is fixed (plugin patch `0051-native-fully-resident.patch` + arcint `offload_ratio_set`/`moe_offload_active`/`expert_fill.format` + relaxed guards; red-first cell mutation-tested, config 74/0). Gate on the A770 depth-4 rung: all-resident reads 49.9/56.8 t/s decode and 155.9 t/s ext prefill against the tiered ratio-50 arm's 4.2/14.2 and 28.6 (previously measured), digests byte-identical, `cpu_tier_pairs=0`. Sizing suspicion resolved: the artifact's experts are 14.469 GiB vs the GGUF's 10.346 GiB (1.399×, no mis-map); the manifest's `filled_bytes` overstates (~1.55×, the f32 split parts). Full-depth d40n text is COHERENT — the depth-4 degenerate text was truncation. OWED: a packed native layout, the full-depth all-resident arm (does not fit), the 16384 point, a logits-level V4 A/B. See design note §11.] [DATED IN PLACE 2026-09-25 (size lever leg): the dense/graph half is quantised (`--dense-fp16`, lm .bin 23.43 → **18.14 GiB**, expert bodies byte-identical; admitted as `qwen3.6-35b-a3b-native-d40f16`), and the dispatch form no longer carries the tier (config auto-enables it). The full-depth all-resident gate is **BLOCKED on host memory** (three measured attempts: cgroup OOM 45.9 / 50.1 GiB at caps 44/48, watchdog SIGKILL at 56); and the fit arithmetic shows packing alone is NOT enough — experts 10.35 + dense 1.84 + activations 3.40 + drafters 0.95 = 16.79 > 15.11, so the runtime terms must shrink too (chunk 1024 → ≈15.09). The expert packing is a new native `weight_format` across emitter + pattern block + matcher + CPU tier + OCL, scoped but OWED (§12.4).] |
-| [kv-checkpoint-restore](kv-checkpoint-restore.md) | a restarted server continues a long conversation from an on-disk checkpoint of its KV and GDN state instead of prefilling it again; byte-identical to cold or refused | operator question, 2026-09-05 | medium–large, backlog |
-| [nvme-direct-expert-tier](nvme-direct-expert-tier.md) | LISBON's byte path: can the host hop go? arcwell DMAs NVMe->VRAM at 2.91 GB/s but 1.125 ms/expert, so it pays as bulk residency and loses as a miss handler | 0.5.3 LISBON, github.com/marfrit/arcwell v0.0.1 | large, open: entry criteria 1–3 met (recon 2026-09-23); criterion 4 **partially met** (2026-09-23, device-free — its convergence clause is measured on Flash-Next's own served routing stream: the served static partition converges at position 0 with zero thrash, a ROLLING census does not and is excluded by design; the RED-C-02 engine plateau probe and the async-upload timing are **MEASURED on the B60 (2026-09-23)** — plateau 0.37 GiB at ratios 86/83 with evictions 0, pinned-fill batch 71/87 experts at 2.71/2.94 GB/s, `via_host_bounce` delta 0, `max_inflight` 213/261; the full-slice fill's byte-transparency is OWED on the store layout (the ext4 store is synthetic arcwell test data), and the "a consumer" integration + gate stay OWED). The gate (cold TTFT, byte-identity, decode non-regression) remains. [DATED IN PLACE 2026-09-23: the design note landed (`docs/design-nvme-direct-expert-tier.md`, device-free). **Verdict on the campaign's condition: the routing warning horizon is zero layers** — a layer's top-k ids are host-visible only at that layer's own MoE hook (`code`: patches 0012/0017/0037/0044), so a router-driven fetch cannot hide arcwell's 1.125 ms and **LISBON keeps the host hop as a miss tier**. The only path the serving loop reaches is the **load-time pinned fill** (membership fixed at `bind()`, unbounded warning); it is a projection only, decided by the gate. [DATED IN PLACE 2026-09-23: the B60 probe ran (§7 items 1–3). Device-byte plateau 0.37 GiB at ratios 86/83, `evictions=0`; pinned-fill async budget measured — 71 experts: submit 20.9 ms, batch 64.5 ms, 2.71 GB/s; 87 experts: 28.3 / 72.8 ms, 2.94 GB/s; DEPTH=4 all collect; `AW_IOC_STATS` delta `via_host_bounce=0`, `max_inflight` 213/261. Full-slice fill byte-transparency OWED (synthetic store); the gate (cold TTFT both arms in one window, byte-identity across arms and two cold boots, decode non-regression) and the consumer integration remain.] [DATED IN PLACE 2026-09-23: the 0.5.3 acceptance commit is written as `docs/window-053.md` (LISBON-001), criteria pinned with every measured row EMPTY. Scope pinned at depth 4 (mechanism, PLE precedent), full depth flagged as an operator decision; threshold `X = 139.5 s` pinned from `code` arithmetic (`T_boot 136 s + T_fill 0.387 s + T_prefill 3.08 s`); RSS bound 32 GiB via `wait4`/`ru_maxrss`; restart determinism in digest form. The gate is recorded as **BLOCKED** — the synthetic ext4 store carries no expert tensors/scales/zp, the scales/zp store-layout precondition is OWED to the artifact-format step, and the consumer integration does not exist; the three gate rows stay OPEN.] [DATED IN PLACE 2026-09-23: the artifact-format step CLEARED the store precondition — a REAL expert store now exists on the ext4 partition (3,408 files of 2,457,600 B, `8,375,500,800 B`, every file exactly ONE plain extent, `aw_fiemap` byte-verifies all 3,408 against the raw device with its `--mutate` leg failing on content); the scales/zp layout verdict is **weights-only, device order** (the 2,457,600-byte slice is the three u4 weight matrices, which are byte-identical file↔device; scales/zp are excluded from the DMA slice because adding them makes 2,553,600 B = 623.4375 pages, not page-aligned, and stay on the host path that transposes). Writer `tools/q4e/expert_store.py` + 15-cell red-first `tools/test_expert_store.py` (mutants: role order, non-fallocate, wrong transpose, short file, f32-sidecar pass-through). `docs/window-053.md` dependencies 1–2 are cleared; the gate still waits on the D2/D3 consumer integration and its three rows.] [DATED IN PLACE 2026-09-23: the D2/D3 integration schedule is built plugin-side (patch `0048`), applies on the full 0003–0048 patch series, compiles clean with the production target, and carries an 8-cell red-first ladder (3 mutants each fail their named cell) including the named synchronous-`AW_IOC_READ_BLOCKS` refusal cell. It cannot LAND: the static partition's slots are host-mapped (`device_slot_buffers=0`, B60 probe) and arcwell requires a dma-buf from an xe VRAM BO, so the arcwell transport and the per-expert dma-buf BO-backed slot destination are OWED and an enabled fill refuses the load. The gate rows stay OPEN/OWED.] [DATED IN PLACE 2026-09-24: the **byte destination is SETTLED AND PROVEN** on the B60 by a non-arcint client (`tools/arcwell_bo_dma_proof.c`) — a caller-created xe VRAM BO (raw `DRM_IOCTL_XE_GEM_CREATE` VRAM placement + `NEEDS_VISIBLE_VRAM` + `CPU_CACHING_WC`, size 64 KiB-rounded; `DRM_IOCTL_PRIME_HANDLE_TO_FD`) registered peer-to-peer, carrying one real 2,457,600 B expert from the real store, host readback **byte-identical** (sha256 `4a4bb0f9…`), `AW_IOC_STATS` delta `via_host_bounce=0`, `max_inflight > 1`. arcwell provides **no allocator/helper** — the caller creates the BO (`code`: `stub/src/arcwell.c`; `M4_API.md`; `KERNEL_FACTS.md`); OpenCL can only **import** the dma-buf (`cl_khr_external_memory_dma_buf`). Dated corrections: on the B60 the 64 KiB BO gate is not kernel-enforced; a submission-time geometry error surfaces in `out_submitted`/`out_err`, not the ioctl return; a system-memory dma-buf is refused `-ERANGE` before the `via_host_bounce` sites. `docs/window-053.md` dependency 3's destination clause is CLEARED; its consumer-integration clause (plugin transport, OpenCL slot import, overlapping-step number) stays standing and the gate rows stay OPEN.] [DATED IN PLACE 2026-09-24: the **plugin transport and the OpenCL slot import are BUILT and the mechanism is PROVEN**; dependency 3's consumer-integration clause now STANDS only on the **integrated served number**. Patch `0049` adds `moe/pinned_nvme_transport.hpp` (production `Transport`: raw xe VRAM BO + dma-buf export + `AW_IOC_MAP_BUFFER` peer-to-peer + `AW_IOC_SUBMIT_BATCH`/`AW_IOC_BATCH_WAIT`, store ordinal `dense_layer * capacity + slot`) and `moe/aw_uapi.h`, wires it into the coordinator, and replaces each layer's host-mapped `gate_w`/`up_w`/`down_w` with BO-backed memories imported via `engine.import_buffer()`; the six scale/zp tensors stay on the transposing host path (uploaded at load). It reverse-applies/re-applies on the 0048 tree and compiles clean (rc 0). B60 mechanism proof by `tools/arcwell_cl_slot_proof.c`: three per-tensor VRAM BOs, two real store experts as six requests, OpenCL import, read back **byte-identical** (sha256 `d463d1d5…`), `via_host_bounce` delta 0, `max_inflight` 6; five red legs. Dated geometry correction: one expert is THREE page-aligned requests (the store's `gate|up|down` record vs the device's three per-tensor regions), not one. **OWED:** the served overlapping-step number, the cold-TTFT/determinism/decode gate rows, and the depth-4-artifact↔store key match; the three `docs/window-053.md` rows stay OPEN.] [DATED IN PLACE 2026-09-24: **the D4 integrated served leg ran and the integrated number EXISTS; `docs/window-053.md` dependency 3 is CLEARED, the three gate rows stay OPEN.** A depth-4 store was built with the tracked writer (unchanged): 4 layers × 71 experts = 284 files of 2,457,600 B (697,958,400 B), every file one plain extent, `aw_fiemap` byte-verifies all 284 against the raw device with its `--mutate` leg failing on content, manifest mapping/sha256s exact. Its four layer keys are the served artifact's `weight_0` bin offsets (`284632533 / 2033390357 / 3650420373 / 5369067397`); the plugin's own `MOE_OTD_ROUTING_HIST` dump reproduces exactly those keys (`key_collisions=0`), and 852/852 pinned expert-role slices are byte-identical to the artifact's `weight_u4` constants. The integrated B60 run with `MOE_OTD_PINNED_NVME_FILL=1` did not refuse: boot to `/props` 97 s, `T_prefill` 1.43 s (arcwell-arm cold TTFT **98.4 s**), `AW_IOC_STATS` delta `bytes +697,958,400` exactly, `via_host_bounce 0→0`, `max_inflight 220`, 12 BOs live and released. No new tracked code; the next leg is the two-arm gate window (cold TTFT ≤ `X`, `os.wait4` RSS, two-cold-boot determinism).] [DATED IN PLACE 2026-09-24: **the LISBON-001 gate window ran and the three rows are filled; the campaign gate is MET with one OWED sub-row.** One B60 window (plugin `ov-0049`, ratio 86, `unshare -rm` CPU-view workaround, page cache dropped per arm): arcwell arm cold TTFT **92.492 s** vs host-fed **99.679 s** — the arcwell arm is at or below host-fed (L1) and both ≤ `X = 139.5 s` (L2); prefetch depth **4 batches in flight** (one per layer, `max_inflight 220`); `AW_IOC_STATS` arcwell delta `bytes +697,958,400` exactly, `via_host_bounce 0→0`, `max_inflight 220`; host-fed delta `bytes +0`; decode arcwell 4.1 t/s vs host-fed 3.4 t/s, no regression. `os.wait4` child `ru_maxrss` **3.697 GiB** both arms (≤ 32 GiB), VmHWM prefix ≤ wait4, physical sampler minimum 45.86 GiB, 0 watchdog trips; PLE term staged at 2.884 MiB. Restart determinism on the **A770 host-fed arm**: two cold boots byte-identical (`9a7e2e77…9f`), PASS; the **arcwell arm's determinism is OWED** (arcwell is B60-only, no bit-readable card can run it; governed by design rule D3's load barrier). The miss-tier verdict is unchanged: **LISBON keeps the host hop**. Record: `docs/window-053.md` rows 1–3.] |
-| [serving-shape-logits](serving-shape-logits.md) | the served Flash-Next artifact's logits carry no information about the model at any depth (KL 12.4 nats = the uniform floor at depth 48); find the layer, or the fill, that loses it | the full-depth KLD of 2026-09-18, `sub4bit-vram-kernel` status | large, closed 2026-09-19 (the fill fixed, the residual measured to its mechanism, the yardstick replaced by the model's own f32 forward) |
-| [kquant-host-storage](kquant-host-storage.md) | the host compute tier computing K-quant blocks natively, so offloaded experts are sub-4-bit on disk and in the host pool — a throughput lever for the host miss tier, not a VRAM gate | M14 extension, DESIGN §7.0.2ah | large |
-| [served-prefill-determinism](served-prefill-determinism.md) | the served Flash-Next path is not run-to-run deterministic at long context — two identical forwards differ by KL(A‖B) mean 0.136/0.151 nats and flip the argmax at 10–15 % of positions — so no KLD gate is readable on it; the decided bound sits ~44x below the floor. Warm-up, the GPU/host residency mix, chunking (D4 `--prefill-chunk 0` is WORSE: 0.0955/0.2021) and launch geometry are all exonerated, several from code. It is a **per-card defect**, but the **subgroup width** (16 on xe2/B60 vs 8 on Alchemist/A770) is a **correlate, not the mechanism**: `xe2` *requires* 16 (the one-line pin is dead) and the reduction disassembles to a fixed tree at both widths. The mechanism is **OPEN, narrowed to a WITHIN-KERNEL nondeterminism in the GDN arithmetic on Xe2** (execution level): the JIT is byte-identical, serializing all 233 enqueues changes nothing, the minimal same-shape gemm is clean, launch geometry is static, and the reduction is a fixed tree at both widths. The GDN state digest is stochastic (5 distinct hashes in one process; the first forward reproducible across cold processes) while the conv state is stable. Fingerprint: `dim0 = row 0`, heads [3,5,6,7,10,13,17,22,31,39,41,42,43,47], one f16 ulp, flip count 2423..3924. **The A770 depth-48 served floor is 0** (bit-identical r0↔r1), so BERLIN-001 clause (d) is readable on the A770 as the measurement card; the B60 stays a per-card caveat until the mechanism is found or upstream fixes it (sibling report posted to #38099 `issuecomment-5751935449`). Reproducer handoff in `docs/handoff-served-prefill-determinism.md` | the 2026-09-19 `F_served` leg, the 2026-09-20 A770/force-tier/D4/cut/state-digest arms, `docs/window-051.md` clause (d) and its cut table | medium, open (one card branch decided) |
-| [ple-disk-backend](ple-disk-backend.md) | the served path pins the Flash-Next n-gram table as 26.82 GiB of USM host for the process life (`bind_ngram_ports`); the reference ships a **disk** backend as its default (`code`: `ple_disk.py`, `config.py`:32) and arcint's port contract carries the row ids host-side, so the table becomes a bounded per-forward staging buffer (`T x heads x 90 B` — 720 KiB at T=512, H=16) filled by `pread` of only the named rows. The gate is a served window through staged vs pinned, **byte-identical**, with the 26.82 GiB PLE term off the host ledger and the load-time copy gone | the 26.82 GiB pin, `docs/research-freetoken-code.md`:110–132, FIX D; LISBON 0.5.3 | medium, **gate PASSED 2026-09-23**: served depth-4 window staged vs pinned byte-identical (`d7f998cd…`), the 26.82 GiB PLE term off the host ledger (26.82 GiB USM host → 2.884 MiB staging; physical MemAvailable min 9.89 → 32.91 GiB), load copy 37.5 s → none; DESIGN §7.0.2cg/§7.0.2cz recorded, CHANGELOG line present. **Full depth, 2026-09-27** (DESIGN §7.0.2cz): staged `d48s` decodes 2.2–2.8x `d48n` on the dispatch route but its digests differ there; with dispatch off the old-decode twins agree bitwise (4-token logits, d1/d512 digests); the new-decode twins on that route are owed |
-| [expert-hot-set-lru](expert-hot-set-lru.md) | card hot-set + host LRU for expert slots, seeded from a per-token routed-expert census: patch 0013's aggregate histogram has no per-token ordering, so the census trace/histogram **format** is the first deliverable (design note `docs/design-expert-hot-set-lru.md`); the policy (frequency rank + id tie-break, static-partition seed, demand-warm LRU comparand) replaces patch 0018's routing-frequency-free `splitmix64` seed. The native artifact runs every expert on the scalar host tier (patch 0043), so the speed half is blocked on `sub4bit-vram-kernel`'s OpenCL decode; the host-bound baseline is the measured `d48n` 0.5–0.8 t/s; G was **UNPINNED** and the speed row **HELD** until that path exists (operator decision 2026-09-21). [DATED IN PLACE 2026-09-22: the path exists (native per-expert OpenCL decode, patches 0043/0045; served prefix `ov-0047`), so **G is PINNED at 1.10** in `docs/window-052.md` and the speed leg runs. DATED IN PLACE 2026-09-22 (rate leg): the speed leg **ran and returned V1** at the ratio-99 budget (A770 0.556 t/s vs a 0.579 bar; B60 0.555 vs 0.88), the speed row stays **EMPTY**, and the residency sweep puts the win at ratio 75 (**1.81×**).] DATED IN PLACE 2026-09-22 (V4 leg): the ratio-75 point stays a **sweep point, not a gate**, and its scope is undecided pending the V4 answer; the dispatch route's quality row is scoped out of the non-dispatch PASS (V4 fires there). | 0.5.2 VENICE, `docs/window-052.md`, DESIGN §7.0.2ah/§7.0.2ae | medium, open |
-| [host-expert-bank](host-expert-bank.md) | the CPU tier's experts come from a RAM bank filled at load by sequential O_DIRECT reads instead of page-faulting on the workers; Flash-Next's host tier (~47 GiB) does not fit the page cache | operator direction 2026-09-27, the B60 thread-state sampling | medium, closed 2026-09-28: gate met (B60 first answer 48.55 -> 38.18 s, byte-identical), review applied, DESIGN §7.0.2da recorded, CHANGELOG `+p23` |
-| [hybrid-expert-fetch](hybrid-expert-fetch.md) | the GPU takes a fixed share of each decode step's host experts over PCIe (bank -> device at ~13 GB/s) so the CPU tier and the link finish together; a deterministic split keeps §3.4, an LRU one would not | the all-in-RAM decode breakdown after host-expert-bank, FreeToken's hybrid backend (code) | medium, closed 2026-09-28 as a verdict: the deterministic split holds §3.4 but loses on this host (patch 0073 uncommitted; the numbers are in the campaign) |
-| [dense-q8-flash-next](dense-q8-flash-next.md) | Flash-Next's dense projections were f32 in the IR and served as f16 (7.9 GB a token); carry them in the checkpoint's Q8_0/Q6_K form | the B60 device-time breakdown after host-expert-bank | small–medium; d48q8 exported and admitted 2026-09-28 (dense gemm 23.7 -> 17.2 ms a token, first answer 38.2–39.7 -> 36.6 s; 35.8 s with the freed VRAM as 128 slots); quality A/B row closed 2026-09-28 (CPU logits bit-identical, red on a 1.001 scale mutant), the served KL/argmax row blocked on the reference re-capture |
-| [prefill-expert-streaming](prefill-expert-streaming.md) | Flash-Next's prefill is CPU-tier-bound (~152 ms per MoE layer call at chunk 512, ~51 s of the ~80 s a 4,096-token prompt adds); stream the host tier's experts to the card per layer, as FreeToken's whole-layer prefill materialize does, and compute every expert there | the 2026-09-28 B60 prefill profile, LYON | large, parked 2026-09-28: v1 measured a loss (160 vs 90 s; the bank squeezed by the pinned staging), ceiling ~2.3x with a second queue and a pipelined fill |
-| [qsa](qsa.md) | Qwen Sparse Attention served: the indexer's per-query key selection (top 512 of 4-token blocks + tail) in Flash-Next's 12 full-attention layers, which arcint serves dense | LYON L2, operator decision 2026-09-27 | large; step 1 (static-T equality vs the pin up to exact ties at the top-k cut) done 2026-09-28 |
+| campaign | state | reference to follow |
+|---|---|---|
+| [expert-hot-set-lru](expert-hot-set-lru.md) | placement is static (census seed, patch 0046); 36 % of routed experts run on the GPU at decode | Strata `src/program/generate.cpp:4395-4478` (adaptive swaps, non-blocking admission), `src/core/expert_cache.cpp`; FreeToken `moe/offload_cache.py` (one pool for all layers) |
+| [prefill-expert-streaming](prefill-expert-streaming.md) | prefill 63–68 t/s at 20k on the B60, CPU-tier-bound | Strata `src/prefill/prefill.cpp:71-104` (slot ring, chunks to 8,192, MMQ); FreeToken `moe/offload_cache.py` prefill overlap, `layers/moe.py:388-390` |
+| [mtp-cycle-wall](mtp-cycle-wall.md) | MTP drafts one token a cycle (dense agent); no Flash-Next head exported | Strata `src/core/mtp.cpp:771-820` (draft chain with `min_p`), `tools/mtp_fetch.py` |
+| [tier-handoff-doorbell](tier-handoff-doorbell.md) | B60 device idle ~46 % of a decode token, waiting on the tier hand-off | Strata `src/kernels/cuda/elementwise.cu:186-311` (doorbell), recorded pass; FreeToken `moe/cpu_executor.py` (mapped flags, pinned workers) |
+| [hybrid-expert-fetch](hybrid-expert-fetch.md) | the CPU tier computes every missed expert | FreeToken `decode_target="hybrid"`, `moe/bench_profile.py` fetch fraction; Strata `src/core/expert_source.cpp:1614-1631` (PCIe share) |
+| [kquant-host-storage](kquant-host-storage.md) | native blocks on the host tier, quantised dot for decode-shaped calls (0043, 0074) | Strata `src/kernels/cpu/iq_avx2.cpp` (multi-token AVX2) |
+| [kv-checkpoint-restore](kv-checkpoint-restore.md) | backlog; the prefix cache is in-process only | Strata conversation cache (`src/core/conversation_snapshot.cpp`) |
+| [served-prefill-determinism](served-prefill-determinism.md) | B60 run-to-run variance, located in the GDN state; not gating | upstream openvinotoolkit/openvino#38099 |
+| [direct-submission-fault](direct-submission-fault.md) | mechanism on record; the N ≥ 5 confirmation on the current kernel owed | upstream `linux-7.1.y` ring-ordering fix |
+
+FreeToken paths are under `~/src/FreeToken-ref/python/freetoken/`; Strata
+paths under `~/src/Strata-ref/`.
+
+## Closed
+
+| campaign | what exists |
+|---|---|
+| [test-ladder-close](test-ladder-close.md) | acceptance references filled; DESIGN §7.0.2aj–al |
+| [prefill-fallback-tristate](prefill-fallback-tristate.md) | patch 0019, `ExpertWeightsSide` |
+| [turnstile-wall-time](turnstile-wall-time.md) | synchronised turnstile test, `free_port` in `roundtrip.sh` |
+| [pruefstand-cell-remote](pruefstand-cell-remote.md) | `ARCINT_ACCEPTANCE_PRUEFSTAND` manifest key, 10/10 |
+| [u8i4-prefill-price](u8i4-prefill-price.md) | patch 0020: u8:i4 on micro-SDPA at u8's prefill rate |
+| [u8i4-deep-prefill-fault](u8i4-deep-prefill-fault.md) | no fault on the micro path through 118k; generic-path belt kept |
+| [static-partition-cold-start](static-partition-cold-start.md) | `--fit-ledger-dir` and the pre-warm forward |
+| [static-partition-prefill](static-partition-prefill.md) | patches 0037/0042: grouped prefill split by residency |
+| [partition-seeding](partition-seeding.md) | patch 0046 census seed, `MOE_CPU_TIER_SEED` |
+| [sub4bit-vram-kernel](sub4bit-vram-kernel.md) | per-expert dispatch with in-kernel native decode (0038–0058, 0067); 35B fully resident on the A770 |
+| [serving-shape-logits](serving-shape-logits.md) | fill fixes; served d48 against the f32 reference |
+| [ple-disk-backend](ple-disk-backend.md) | `--ngram-staging-rows`: 26.82 GiB pin → 2.9 MiB staging |
+| [nvme-direct-expert-tier](nvme-direct-expert-tier.md) | patches 0048/0049: arcwell load-time fill, LISBON-001 |
+| [host-expert-bank](host-expert-bank.md) | patch 0072 RAM bank (`+p23`), patch 0074 quantised decode dot (`+p25`) |
+| [dense-q8-flash-next](dense-q8-flash-next.md) | `--dense-q8`, the `d48q8` artifact |
+| [qsa](qsa.md) | `--qsa` served with a compressed block-key cache, non-default |
+
+## Research
+
+| document | covers |
+|---|---|
+| [research-reference-audit](research-reference-audit.md) | Strata and FreeToken against arcint's record; the ranked levers |
+| [research-hybrid-expert-execution](research-hybrid-expert-execution.md) | CPU/GPU expert execution, Flash-Next comparables, Strata read at source |
+| [research-qsa](research-qsa.md) | serving Qwen Sparse Attention |
+| [research-speculative-cycle](research-speculative-cycle.md) | MTP and speculative cycles |
+| [research-sub4bit-weights](research-sub4bit-weights.md) | sub-4-bit weight formats and kernels |
+| [research-kv-quantisation](research-kv-quantisation.md) | KV quantisation and prefill cost |
+| [research-cold-start](research-cold-start.md) | kernel caches and warm-up |

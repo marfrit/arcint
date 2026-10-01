@@ -22,7 +22,7 @@ arcint today, measured here (B60, dense d48q8, 20–27k tokens): 6.6 t/s decode,
 
 | arcint verdict | what the reference does (`code`) | what arcint built | same mechanism? |
 |---|---|---|---|
-| LRU expert tier rejected (DESIGN §7.0.2ae) | FreeToken: one LRU pool shared by all layers, slot rewrite on the GPU (`moe/offload_cache.py:169-184`). Strata: decayed usage counts, up to 96 swaps every 4 rounds; the old expert is evicted at once and the new one admitted when its copy lands (`generate.cpp:4414-4478`). | A per-layer, per-access LRU that also chose **which device computes** (GPU f16 vs CPU f32), so output depended on history. | **No.** It was rejected under §3.4, not for speed (the tier was faster, §7.0.2x). arcint's offline replay: LRU 55.6/69.2 % vs census 21.2/38.5 % at 32/64 slots per layer; a shared pool reaches 93.8 % at 16 GiB (`expert-hot-set-lru.md:447-455`). |
+| LRU expert tier rejected (DESIGN §7.0.2ae) | FreeToken: one LRU pool shared by all layers, slot rewrite on the GPU (`moe/offload_cache.py:169-184`). Strata: decayed usage counts, up to 96 swaps every 4 rounds; the old expert is evicted at once and the new one admitted when its copy lands (`generate.cpp:4414-4478`). | A per-layer, per-access LRU that also chose **which device computes** (GPU f16 vs CPU f32), so output depended on history. | **No.** It was rejected under §3.4, not for speed (the tier was faster, §7.0.2x). arcint's offline replay: LRU 55.6/69.2 % vs census 21.2/38.5 % at 32/64 slots per layer; a shared pool reaches 93.8 % at 16 GiB (`git show b0447b8:docs/campaigns/expert-hot-set-lru.md`, lines 447-455). |
 | hybrid-expert-fetch "slower", closed as a verdict | FreeToken: miss fetches from **pinned** RAM, and **fetched experts stay cached**; the split is set by measured CPU vs link speed. Strata: the last ~20–55 % of misses go over PCIe from the pinned arena, issued at plan time. | Copies from the **pageable** bank (2.7 ms/layer stall); the pinned arm covered 16 of 512 experts (moved ~5 % of misses); **transient slots overwritten every step**, so nothing was cached; a fixed K=3. | **No.** Also, FreeToken's own rule (hybrid only when the CPU is > 2× the link; here ~1.2) would have chosen GPU "offload" mode on this host. |
 | prefill-expert-streaming v1 "a loss as built", parked | FreeToken: two buffers, the next layer copied on its own copy stream with events while the current one computes, chunk 8,192. Strata: a 384-slot ring borrowed from the cache, every expert streamed at chunk ≥ 1,024, quantised (MMQ) kernels, chunks up to 8,192. | CPU threads memcpy'd into separate staging that **squeezed the bank** (disk faults); copies and compute on one queue, in series; no prefetch; chunk 512 (2,048 crashed, not investigated). | **No.** arcint's own ceiling with overlap: ~2.3× at chunk 512. Strata: IQ3_XXS 1,745 t/s at 32K. |
 | 0075 zero-copy + spin dropped | Strata: a doorbell (a kernel writes x and the ids to mapped pinned memory with a fence; the CPU spins; a GPU wait kernel polls a host flag), and the whole pass is pre-recorded (`elementwise.cu:186-311`, `verify.cpp`). | Removed only the y-writeback copies. x readback hops and the per-layer host block remained. The spin's +6.4 % prefill was discarded by a conjunctive, decode-first gate. | **No.** arcint saw +45 % from device-side routing on the all-resident 35B (§7.0.2cr). |
@@ -66,6 +66,12 @@ These are operator decisions, never agent decisions
   references' mechanisms pay: "Out: an LRU policy; pinning the bank" and
   "Out: an LRU across calls; raising the TTM cap".
 
+[Status, 2026-10-01, later: DESIGN §3.4 Amendment 2 and `CLAUDE.md` lift the
+first four items and the conjunctive gates (correctness judged at the
+answer; deterministic replay a default; the prefix cache allowed with an
+adaptive tier, its refusal in `src/config.cpp` owed a change; gates per
+phase). The campaign rewrite of the same day dropped the scope exclusions.]
+
 ## 4. Ranked levers (plain language)
 
 1. **Let the GPU's expert cache learn the conversation.** Use one pool across
@@ -79,7 +85,7 @@ These are operator decisions, never agent decisions
    1.6–1.8× in Strata with CPU experts. The layer is in the original
    checkpoint.
 4. **Raise the pinned-memory cap on the host** (`ttm.pages_limit`). Items 1,
-   2 and 6 depend on it.
+   2 and 6 depend on it. (Done: the dev host's cap is 40 GiB.)
 5. **Stop the 48 per-token hand-offs through the driver.** The GPU gets its
    work in advance and waits on a flag in shared memory.
 6. **Choose who handles a missed expert (CPU or a copy to the GPU) from a

@@ -1,6 +1,6 @@
 # research-speculative-cycle — how other engines keep MTP/spec-decode cycles cheap at depth
 
-Feeds `mtp-cycle-wall.md`: on the dense 27B agent at 77,134 tokens, one MTP
+Written for `mtp-cycle-wall.md`: on the dense 27B agent at 77,134 tokens, one MTP
 cycle (propose = MTP-layer forward, verify = 2-token main-model forward,
 plus bookkeeping) costs ≈390 ms against a ≈130 ms break-even, with the MTP
 head capped at one predicted token/step (a 2-token ceiling) even at 90.8%
@@ -152,8 +152,7 @@ Three levers, in likely-first order:
 1. **Multi-step MTP drafting per cycle, capped by measured cycle time** — the
    mechanism every surveyed engine implements in some form (vLLM's MTP
    chaining, TensorRT-LLM's chained modules, SGLang's/vLLM's adaptive
-   draft-length work), and closest to `mtp-cycle-wall.md`'s cut-vs-verdict
-   gate: re-run the MTP head to raise tokens/cycle above the 2-token
+   draft-length work): re-run the MTP head to raise tokens/cycle above the 2-token
    ceiling, only while profiled per-step cost keeps the cycle under its own
    break-even (an `ARCINT_PROFILE_CYCLE`-driven cap, not a fixed depth).
    Plugin: nothing new, the MTP forward exists — a scheduling change around
@@ -161,10 +160,10 @@ Three levers, in likely-first order:
 2. **Fusing propose into the verify forward** — TensorRT-LLM's single-graph
    drafting loop and vLLM's size-matched verify graphs are the model; on
    OpenVINO, a fused MTP-forward-then-main-verify subgraph instead of two
-   dispatches with bookkeeping between. The one lever needing new plugin
-   work — the community NPU-draft finding suggests the payoff is real
-   (cross-call overhead, not raw FLOPs, dominates at this scale), but nobody
-   has shipped it for OpenVINO yet.
+   dispatches with bookkeeping between. It needs new plugin work; the
+   community NPU-draft finding points at cross-call overhead, not raw FLOPs,
+   as the dominant cost at this scale. Strata captures its draft and verify
+   passes as graphs (`code`: `~/src/Strata-ref/src/core/mtp.cpp`).
 3. **Cap draft length by measured cycle time, not a static value** —
    SGLang's adaptive EMA scheme and DSpark's confidence-sized verify window
    are the cleanest reference designs: track accepted length and cycle
@@ -172,9 +171,8 @@ Three levers, in likely-first order:
    oscillation. Engine: bookkeeping only (arcint already profiles via
    `ARCINT_PROFILE_CYCLE`); plugin: nothing.
 
-First profile for this campaign: lever 1 — no plugin change, answers
-`mtp-cycle-wall.md`'s "cycle cut" branch directly, with prior art at both
-the vendor level (TensorRT-LLM, vLLM) and the independent-measurement level
-(the OpenVINO NPU-draft discussion) confirming this failure mode isn't
-stack-specific. Lever 2 is the higher-ceiling, higher-risk follow-up if
-lever 1's cap still leaves the cycle above break-even at 77k.
+Lever 1 is what Strata ships for Qwen3.8-Flash-Next: a draft chain that
+continues while the last draft's probability is at least `min_p`, up to
+three drafts, verified as one window (`code`:
+`~/src/Strata-ref/src/core/mtp.cpp:771-820`; `paper` §3.3: 1.6–1.8× decode
+with CPU-resident experts). `mtp-cycle-wall` follows it.

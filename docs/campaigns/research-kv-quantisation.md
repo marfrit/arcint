@@ -1,9 +1,7 @@
 # research-kv-quantisation — how other engines quantise KV and price prefill
 
-Feeds `u8i4-prefill-price.md` (the +7/+25/+72% prefill cost of `--paged-kv
-u8:i4` at ~9k/~38k/~72k tokens, opt-attention-path scratch read as the
-mechanism, not yet measured). Literature/engine survey, not a measurement —
-nothing here closes that gate. Access date throughout: 2026-09-05.
+Written for `u8i4-prefill-price` (closed by patch 0020). Literature and
+engine survey, not a measurement. Access date throughout: 2026-09-05.
 
 ## llama.cpp / ik_llama.cpp
 
@@ -133,9 +131,7 @@ upstream OpenVINO GPU routes mixed/compressed-precision KV through a distinct
 no OpenVINO issue or doc measures prefill-time cost there or claims
 depth-scaling; a search for `exp_sums`/`max_logits`/`tmp_out` matched only a
 different pair of PRs (#28279, #28013, second-token softmax fusion), not
-confirmed as the same buffers. **Arcint's mechanism is plausible by
-kernel-naming adjacency but unverified upstream too** — the same gap the parent
-campaign names, now shown to exist in OpenVINO's own tracker as well.
+confirmed as the same buffers.
 
 A vendor blog (Medium, "INT4 KV Cache Compression... OpenVINO 2026.2," 403'd,
 summary only — mark vendor/marketing) reports Llama-3.1-8B decode-latency-
@@ -146,35 +142,16 @@ with Arc-measured numbers found — a search gap.
 
 ## What transfers to arcint
 
-Three mechanisms recur across the independently-measured sources (vLLM's FP8
+Three mechanisms recur across the independently measured sources (vLLM's FP8
 TTFT post, SGLang's #10083, TensorRT-LLM's third-party comparison, OpenVINO's
-own PR #29290) that would make u8:i4 prefill flat with depth:
+own PR #29290):
 
-1. **Fuse dequant into the attention kernel instead of a separate
-   dequant-then-attend stage** (SGLang #10083, citing TensorRT-LLM's fused
-   kernel as the model): the packing-class mismatch that makes micro-SDPA
-   decline to the opt path (DESIGN §7.0.2ab) needs a kernel reading mixed u8/i4
-   operands directly instead of materialising a scratch buffer — plugin-kernel
-   work, not an engine-layer change.
-2. **Bound the precision-recovery buffer to a fixed size instead of one scaling
-   with context length** (vLLM's own FP8 TTFT regression: extra accumulation
-   needed only past a hardware precision limit — the same shape as arcint's
-   "scratch scales with depth" reading). If arcint's opt-path scratch
-   (`exp_sums`/`max_logits`/`tmp_out`) shares that shape, size it per chunk —
-   as the VRAM belt in `packed_values_prefill_scratch_bytes_ex` already does —
-   rather than per depth; again plugin-kernel work, since the open point is
-   whether *time* cost follows chunk or depth.
-3. **A KIVI-style residual/tail window** (recent N tokens at full precision)
-   sidesteps rather than answers the question: it caps how much of the sequence
-   enters the mixed-precision path, at the cost of memory savings on that tail
-   — engine-side (a paged-KV manager policy), not a plugin-kernel change, and
-   it widens the byte-identity invariant's scope rather than changing it.
-
-Only (2) is checkable without new kernel work: whether `fit.h`'s existing
-per-chunk formula (`packed_values_prefill_scratch_bytes_per_token_ex`, sized by
-chunk for VRAM) produces a *time* cost scaling with depth rather than chunk
-size when profiled — the measurement this campaign's gate already calls for.
-This survey doesn't change that gate; it shows the reading is plausible by
-analogy to vLLM's and OpenVINO's own admitted mechanisms, not arcint-specific
-speculation, and names the first check: depth-scaling of the opt path's own
-scratch allocation against wall time.
+1. **Fuse dequant into the attention kernel** (SGLang #10083, citing
+   TensorRT-LLM's fused kernel). arcint built this: patch 0020 lets
+   micro-SDPA read u8 keys and packed i4 values in place, and u8:i4 prefills
+   at u8's rate (`measured-here`, DESIGN §7.0.2as; `u8i4-prefill-price`).
+2. **Bound the precision-recovery buffer by chunk, not by depth** (vLLM's
+   FP8 TTFT regression). On the micro path the generic path's depth-scaling
+   scratch is not allocated (`measured-here`, DESIGN §7.0.2at).
+3. **A KIVI-style residual window** (recent N tokens at full precision): a
+   paged-KV manager policy on the engine side, not a kernel change.

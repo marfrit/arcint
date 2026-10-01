@@ -34,10 +34,10 @@ Refines K/I-quant layouts (`IQ*_K`, `IQ*_KS`) and adds **trellis-coded**
 types (`IQ1_KT`…`IQ4_KT`): dequant is a procedurally generated sequence,
 not a stored codebook — better GPU throughput than LUT-based IQK at equal
 bpw, ~5x slower to produce, slower CPU decode than IQK. No IQ_KT-vs-IQK
-table found. **Disqualifying for arcint**: README states only **CPU
-(AVX2+/NEON+) and CUDA (Turing+)** are "fully functional"; SYCL, Vulkan,
-OpenCL, ROCm, Metal unmaintained. No Arc mention. License: MIT, but nothing
-ports to OpenCL/oneDNN without a rewrite — format reference only.
+table found. Platforms: the README states only **CPU (AVX2+/NEON+) and
+CUDA (Turing+)** are "fully functional"; SYCL, Vulkan, OpenCL, ROCm, Metal
+unmaintained. No Arc mention. License: MIT; the kernels are a format and
+algorithm reference for an OpenCL port.
 (github.com/ikawrakow/ik_llama.cpp)
 
 ## exllamav3's EXL3 and QTIP (trellis families)
@@ -52,12 +52,10 @@ Arc mention. License: MIT. (github.com/turboderp-org/exllamav3)
 **QTIP**, the method EXL3 derives from: Hadamard incoherence processing +
 bitshift trellis + compute-based codes, CUDA-tuned. Paper (NeurIPS 2024,
 arXiv:2406.11235) reports SOTA perplexity/size vs AQLM/QuIP# at 2–4 bpw on
-Llama-2/3 — peer-reviewed, CUDA-only. **License: GPL-3.0** — disqualifying
-for arcint's MIT/Apache/BSD rule regardless of CUDA-only status.
+Llama-2/3 — peer-reviewed, CUDA-only. **License: GPL-3.0**, outside the
+project's MIT/Apache/BSD rule for vendored code.
 
-Both CUDA-only by construction, QTIP GPL-licensed — same verdict as
-ik_llama.cpp's KT types: worth reading for the trellis idea, zero transfer
-to Arc.
+Both are CUDA implementations; the trellis idea is the readable part.
 
 ## AQLM and HQQ
 
@@ -176,41 +174,20 @@ kernel has nothing Intel-native to adapt from; new code by construction.
 
 ## What transfers to arcint
 
-- **Resident VRAM format**: only llama.cpp's K-quant/I-quant family is a
-  plausible source — simple, non-trellis, non-multi-codebook dequant
-  (bit-unpack-and-scale for Q3_K/Q2_K, small-LUT for IQ3_XXS/IQ3_S),
-  MIT-licensed, with an existing GPU dequant design (Vulkan shaders)
-  readable for structure, though none of the code is OpenVINO/oneDNN-
-  portable. Trellis families (EXL3, QTIP, ik_llama.cpp's KT types) are
-  CUDA-only by construction, QTIP GPL-licensed — none is a candidate
-  either way; their case depends on CUDA execution Arc/OpenCL lacks.
-  AQLM/HQQ's codebook/LUT approaches showed weak GPU speedup even on
-  well-supported CUDA kernels — a bad sign for a first Arc kernel that
-  needs to prove the concept cheaply. **Q3_K (3.4375 bpw, 256-weight
-  block, 6-bit scales) is the best first candidate**: closest to the
-  campaign's 3.2–3.5 bpw target, simplest math, byte layout already
-  specified in `sub4bit-vram-kernel.md`.
-- **Host K-quant kernel**: same conclusion — Q3_K/IQ3_XXS decode is
-  scalar/SIMD bit-unpack with no GPU-specific tricks, a bounded
-  AVX2/scalar port, unlike porting a trellis generator's numerics to a
-  host float pipeline. AQLM's codebook-splitting-for-cache trick (16-bit
-  codebook split into 8-bit sub-codebooks) is the one transferable idea,
-  not format, if a codebook-style grid ever needs cache residency.
-- **Fusion-matcher/oneDNN-bypass shape**: every Intel-native library
-  surveyed stops at int4 as a hard floor — none has a sub-4-bit kernel or
-  fusion pattern to adapt. ipex-llm's ported IQ2 kernel lives in its own
-  SYCL backend, outside OpenVINO's plugin architecture — it proves Arc's
-  OpenCL/SYCL path *can* do in-kernel I-quant dequant, but transfers no
-  code or pattern to `keep_moe_3gemm_const_precision.cpp`. The new fusion
-  matcher and GEMV/GEMM have no upstream analog either way; the
-  800–1,500-line estimate stays a HYPOTHESIS.
-- **Per-expert selection axis**: MC-MoE and MoPEQ both caution that
-  routing frequency alone is a weak importance proxy. Entry criterion (3)
-  — the routing histogram — is necessary, not sufficient; a coarse
-  sensitivity check on candidate experts would catch a rarely-routed but
-  high-sensitivity expert before it's committed to the sub-4-bit tier.
-- **Smallest first measurement**: the entry criterion already named — one
-  expert layer, Q3_K vs the int4 baseline, same f16 source/calibration,
-  decode correctness plus a fusion-impact profile — is the right first
-  cut: it isolates the simplest, MIT-licensed format with the clearest
-  byte-layout reference before any commitment to the larger build-out.
+- **Resident format: the checkpoint's own llama.cpp blocks.** Simple,
+  non-trellis dequant (bit-unpack-and-scale for Q2_K/Q3_K, a small LUT for
+  IQ3_XXS/IQ3_S, a 16-entry table for IQ4_NL), MIT-licensed, with GPU dequant
+  designs to read (llama.cpp's Vulkan shaders). arcint serves Flash-Next and
+  the 35B-A3B experts in their native IQ3_XXS / IQ4_NL / IQ4_XS / Q8_0 /
+  IQ2_S blocks, decoded in-kernel (patches 0043–0058; `sub4bit-vram-kernel`).
+- **Host kernel.** IQ/K-quant decode is SIMD bit-unpack with no GPU-specific
+  tricks; Strata's AVX2 multi-token kernels
+  (`~/src/Strata-ref/src/kernels/cpu/iq_avx2.cpp`, `kq_avx2.cpp`) are the
+  reference (`kquant-host-storage`). AQLM's codebook split for cache
+  residency is the transferable idea if a codebook grid ever needs it.
+- **Fusion matcher.** Intel's libraries stop at int4; ipex-llm's IQ2 kernel
+  shows in-kernel i-quant dequant runs on Arc silicon in its own SYCL
+  backend.
+- **Per-expert selection axis.** MC-MoE and MoPEQ both find routing frequency
+  alone a weak proxy for low-bit tolerance; a sensitivity check catches a
+  rarely-routed but sensitive expert.
