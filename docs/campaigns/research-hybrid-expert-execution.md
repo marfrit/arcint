@@ -331,3 +331,169 @@ What transfers:
 - `--moe-cache-slots`-style GPU expert caches with CPU fallback are the
   llama.cpp-fork answer at 12 GB. Compare this with arcint's per-expert
   dispatch pool before building more tier machinery.
+
+## Strata (added 2026-10-01) — paper read plus code read
+
+Primary source: `~/src/Strata-ref` (checked out at commit `c499bd1`,
+2026-10-01). The paper PDF `docs/paper/Strata-Paper.pdf` was read with
+`pdftotext -layout`; the code was read directly at the paths below. Unlike the
+web sections above, every row here is either **paper** or **code**, and the
+two are separated where they disagree. Strata serves Qwen3.8-Flash-Next
+(125B-A6B, 24,576 experts) from one 12 GB RTX 5070, 64 GB DDR5 and a six-core
+Ryzen 5 7600 — the same model *shape* arcint serves, on different silicon.
+
+### §3.2 One layer, three workers at once — the CUDA doorbell
+
+- **paper.** The GPU runs the mixer and router and writes the chosen expert
+  ids into a small block of pinned host memory (a "doorbell"). The CPU spins
+  on that doorbell instead of waiting on the driver, splits the experts:
+  resident→GPU, a share of misses→PCIe copy engine, the rest→CPU in place.
+  The whole 48-layer pass is one captured CUDA graph per window size, so the
+  host never makes a synchronizing driver call. One layer ≈ 0.6 ms at 4K
+  (`paper` §3.2, Figure 2).
+- **code.** `src/core/layer.cpp`: `doorbell_init` allocates `cudaHostAllocMapped`
+  host buffers (`x_f`, `ids`, `weights`, `seq`, `flag`) and takes their device
+  aliases with `cudaHostGetDevicePointer`; `moe_route` publishes through
+  `doorbell_publish(...)` then `doorbell_ring(...)`; `doorbell_reset` zeroes
+  `seq`/`flag`. The kernel side is `src/kernels/cuda/elementwise.cu`:
+  `doorbell_publish_kernel` (volatile store + `__threadfence_system()`),
+  `doorbell_ring_kernel` and `doorbell_wait_kernel`. `wait_flag_ge_kernel`
+  (`src/kernels/cuda/verify_kernels.cu:426`) is the GPU-side spin:
+  `while (*flag < value) strata_spin_pause(); __threadfence_system();`, called
+  at `:520`. All of that is `code`.
+- **evidence class: paper + code.**
+- **what transfers.** The *discipline*, not the mechanism: a host-visible
+  doorbell only works when the publishing store is fenced (`__threadfence_system`)
+  — Strata's own history records that a memory-only spin never saw the datum
+  until the fence was added (`elementwise.cu` comment block), which is the
+  same class of bug arcint met in the served-prefill / direct-submission work.
+  It does **not** grant lookahead: arcint's plugin exposes a layer's top-k ids
+  only at that layer's own MoE hook (`code`: patches 0012/0017/0037/0044; the
+  `nvme-direct-expert-tier` verdict, campaigns README — "the routing warning
+  horizon is zero layers"), and Strata's doorbell publishes at the same
+  instant. The doorbell removes the *driver-call* cost of the handoff, not the
+  one-layer warning horizon.
+- **what does not transfer.** CUDA graphs, mapped pinned memory, the copy
+  engine, cuBLAS and the 0.6 ms/layer number are CUDA/RTX-specific. arcint
+  runs OpenVINO on Intel cards behind the xe KMD and does not own the graph
+  nodes; the plugin-side tier is the analogue. This is the same "plugin change,
+  not an engine change" boundary the `static-partition-prefill` row already
+  states.
+
+### §3.3 Checking several tokens per pass — the MTP verify window
+
+- **paper.** Qwen3.8-Flash-Next's own MTP head drafts up to three tokens; the
+  last accepted token plus drafts go through all 48 layers as one *verify
+  window*; drafts are kept while the MTP layer is ≥ 50 % confident; a wrong
+  draft is rolled back. The output is exact — identical token for token to
+  plain greedy decoding — tested with forced wrong drafts (`paper` §3.3, §6
+  finding 3, §6.1).
+- **evidence class: paper.**
+- **what transfers.** The exactness claim is the same bar arcint's §3.4
+  invariant and `agent-dense` MTP gate already hold, and it is a second
+  independent engine reaching it. The structural warning transfers to
+  `prefill-expert-streaming` and any tier work: a verify window routes *each*
+  drafted token to its own experts, so window work multiplies host-tier
+  misses (the paper's Finding 2 and Table 5 price this directly). arcint
+  exports no Flash-Next MTP head yet (ROMA R1), so the speed half is not
+  importable today.
+
+### §3.4 An expert cache that follows the conversation
+
+- **paper.** Routing is uneven. Startup fills VRAM from a profile recorded on
+  *other* prompts; every four rounds up to 96 experts that the current
+  conversation keeps asking for are swapped into the least-used slots, while
+  the GPU is drafting. Hit rate: profile fill alone ≈ 0.50 at 4,500 slots on
+  the 12 GB card, adaptive swapping raises it to ≈ 0.72 at 4K (`paper` §3.4,
+  Figure 3; Finding 4).
+- **code.** The swap policy lives in `src/program/generate.cpp`, not in
+  `expert_cache.cpp`: `adapt_every = 4` (`:358`), `adapt_swaps = 96` (`:380`),
+  a per-layer `usage` routing census, candidates with usage ≥ 2.0 vs victims
+  ranked by least usage with a `+1.5` gain threshold, a global sort by gain
+  truncated to `adapt_swaps`, and `resident_stage_swaps`/`commit_exchanges`
+  (`:130`) staging the evicted blob back to RAM while the CPU computes `out`
+  and admitting `in` only after the copy lands. `src/core/expert_cache.cpp`
+  is the *storage*: `open` checks the allocation against free VRAM,
+  `admit`/`slot_of` are the `(layer, expert) → slot or -1` table, `fill_slot*`
+  and `verify_slot` (byte-compare of slot against host blob). The header
+  states its own limits: eviction policy is deliberately absent there, and
+  `set_per_layer_admission` exists because global arrival-order admission
+  measured 2.97 % hit rate by filling inside the first position.
+- **evidence class: paper + code.** `expert_cache.cpp` is `code`; the swap
+  orchestration is `code` (`generate.cpp`); the numbers are `paper`.
+- **what transfers.** Directly to the DESIGN §3.4 amendment of 2026-10-01 and
+  to `expert-hot-set-lru` / `partition-seeding`: a deterministic-per-sequence
+  adaptive tier is now the allowed mode, and Strata ships the mechanism —
+  census, gain-ranked swap, deferred admission so nobody waits. The
+  `verify_slot`/zeroed-slot discipline is also transferable: a wrong-residency
+  table that answers a plausible token is the failure arcint has paid for most.
+- **what does not transfer.** The hit-rate numbers (RTX 5070, 12 GB, Q2_0,
+  24,576 experts) are not arcint's cards or artifact; the 96-swap/4-round
+  cadence is a tuned constant; and the adaptive policy is exactly the
+  history-dependent category arcint's pre-amendment invariant *excluded*.
+  Note the code/paper split: an `expert_cache.cpp`-only reading would miss
+  the adaptive tier entirely — it is in `generate.cpp`.
+
+### §3.5 Reading the prompt: streaming experts to the GPU
+
+- **paper.** Prompts are processed in chunks of 2,048 tokens; with that many
+  tokens every expert is used many times, so the non-cached experts are copied
+  from the pinned RAM arena over PCIe while the GPU computes the previous ones,
+  dequantized to half precision and multiplied with cuBLAS; buffers are
+  borrowed from the expert cache and refilled afterwards. Prompt speed flat to
+  262K (`paper` §3.5).
+- **evidence class: paper.**
+- **what transfers.** The diagnosis transfers to `prefill-expert-streaming`:
+  at prefill batch sizes the batching unit, not CPU FLOPs, is what a
+  per-expert host loop gets wrong — batch the whole chunk's tokens per expert
+  on the card. arcint measured that campaign as a loss (160 vs 90 s) with its
+  pinned bank squeezed by the staging; Strata's design keeps *all* experts in
+  one RAM arena and refills cache slots afterwards, which is the layout
+  difference that makes its streaming pay. That comparison is worth a rerun
+  before the campaign is closed for good.
+
+### §6 findings 1, 4, 5, 7, 9, 10
+
+| finding | disposition | evidence | transfers to arcint? |
+|---|---|---|---|
+| 1 — engine balanced; CPU waits ≈ 14 ms for GPU, GPU ≈ 13 ms for CPU; speeding one side cannot help by more than ~a third | closed | `paper` (§6, Table 5) | Yes as a bar. It is the reason `hybrid-expert-fetch` closed as a verdict: a deterministic PCIe split can hold §3.4 but a one-sided split is capped near a third, and arcint's own measured split lost. |
+| 4 — adaptive cache beats static by a wide margin (0.50 → ~0.72) | closed | `paper` §3.4/§6; `code` `generate.cpp` | Yes — this is the measurement that justifies the 2026-10-01 §3.4 amendment and unblocks adaptive placement. The number itself does not transfer. |
+| 5 — overlapping the two halves inside a layer did **not** pay: two token groups are exact but ~7 % slower (85.8 vs 91.8 t/s at 4K); dense weights read twice, fewer shared experts | closed | `paper` §6; `code` `verify.hpp` `set_split` (`--spec-split`, a non-default opt-in) and the `split_` comment "exact but slower" | Yes as a **negative control**. arcint's `hybrid-expert-fetch` split is the same shape; this is independent evidence that intra-layer token-group overlap is a loss unless it moves *different* work (e.g. copy engine), not a duplicate read. |
+| 7 — i-quants limited by CPU arithmetic, not RAM: ~5 GB/s per core, 23–26 GB/s on six cores; decoding once for several tokens helps 2.0–2.4× but most experts serve one token | closed | `paper` §6 (Table 5's "CPU GB/s" and the bottleneck box) | Partly. The *diagnosis* transfers to `kquant-host-storage`: the host tier's per-expert CPU decode arithmetic is the cap, independent of RAM. The numbers are AVX-512 i-quant bytes/s on a Ryzen 5, not arcint's AVX2 host tier or its grouped-int4 kernel — not importable. |
+| 9 — the overlap that paid: the copy engine. DMA the misses from the CPU thread when it plans the layer; GPU copy engine runs beside CPU and GPU work. 55 % of misses over PCIe for i-quants (arithmetic-bound), 20 % for Q2_0 (RAM-bound) | closed | `paper` §6; `code` `verify.hpp` `pcie_mode` / `fetch_dma`, the doorbell plan | Yes as the **discriminating variable**. arcint's `hybrid-expert-fetch` lost because its CPU tier was not left with free RAM bandwidth; Strata names exactly when the PCIe share pays (CPU compute-bound) and when it does not (CPU RAM-bound) — a testable condition for any future split. |
+| 10 — refill without making anyone wait: evict the old expert at once, admit the new only when its copy lands; 91.7 → 94.4 t/s at 4K | closed | `paper` §6; `code` `generate.cpp` (`pending`, `apply_pending`, `host_res[out] = kNotResident` then `pending.emplace_back`, `adapt_live`) | Yes — the deferred-admission pattern is the concrete mechanism an arcint adaptive tier should copy, and it is compatible with the sequence-determinism law of the 2026-10-01 amendment. |
+
+### §7 What could make it faster (projections, `paper` only)
+
+The paper's own next steps: (a) keep conversation state between requests — the
+largest single improvement for agents, because today every request re-reads its
+whole prompt; (b) overlap **across** layers, not within one, by predicting the
+next layer's experts; (c) cheaper i-quant CPU arithmetic (T-MAC-style lookup,
+or converting hot experts to a CPU-friendly form at load); (d) a fused 8-bit
+grouped prompt kernel; (e) temperature sampling via rejection in the verify
+window; (f) free hardware settings. These are `paper` projections, not
+measurements. **(a) maps directly to arcint's `kv-checkpoint-restore`
+campaign** (backlog), which should treat Strata's "few hundred MB of recurrent
+state + KV" figure as the shape of the prize, not a number. (b) is the
+`hybrid-expert-fetch`/next-layer-prediction lever; (c) is
+`kquant-host-storage`; (d) is the prompt-path half of
+`prefill-expert-streaming`.
+
+### What transfers to arcint's MoE tier, and what does not
+
+- **Transfers:** (i) the adaptive tier as a *mode* — placement follows the
+  conversation, bounded by sequence-determinism and the prefix-cache refusal
+  (DESIGN §3.4 amendment, 2026-10-01); (ii) the swap mechanism — routing
+  census, gain-ranked candidates/victims, deferred admission with no waiter
+  (`generate.cpp`, `code`); (iii) the fence discipline for any host-visible
+  handoff (`code`); (iv) `verify_slot`'s byte-compare and the zeroed-slot
+  determinism; (v) Finding 9's condition for when a PCIe split pays, and
+  Finding 5's negative control against intra-layer token-group overlap; (vi)
+  Finding 1's one-third ceiling as a bar.
+- **Does not transfer:** the RTX 5070 / Ryzen 5 numbers, the CUDA-graph and
+  copy-engine mechanics, cuBLAS and ggml kernels, the 96/4 cadence, the
+  24,576-expert hit-rate curve, and the `expert_cache.cpp`-only picture of
+  the cache — the adaptive logic is in `generate.cpp`. Replacing arcint's
+  serving engine is explicitly not the transfer; the surveyed systems added a
+  kernel-dispatch branch (this file's own `static-partition-prefill` verdict,
+  restated in `AGENTS.md`).
