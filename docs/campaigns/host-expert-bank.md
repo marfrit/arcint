@@ -132,3 +132,36 @@ change. A slot is a hit only for the identical span list. Everything else
   pp64 4.26 t/s, tg4 0.75 t/s. The bar needs a host that can hold the model
   resident (>= 128 GiB) or a reduced depth; page-cache pressure is the first
   fact of any such comparison, and no per-token CPU-expert number was obtained.
+
+- 2026-10-01. **The llama.cpp CPU-expert tier as a kernel microbenchmark**
+  (`measured-here`, one <= 30 min leg, services stopped, B60 box).
+  `test-backend-ops` has no IQ3_XXS/IQ4_NL + 512-expert/8-used MUL_MAT_ID
+  case, so the exact decode shapes were run through a small standalone harness
+  on the qwen4exp build's CPU backend: `ggml_mul_mat_id`, `as` (k, m, 512),
+  `ids` view (8, 1), `b` (k, 8, 1), one token, 200 timed graph computes after
+  4 warmups. Expert types read off the shard with `GgufFeed.gguf_type`.
+  - **Types (48 layers):** `ffn_gate_exps` = 47 IQ3_XXS + 1 IQ4_XS,
+    `ffn_up_exps` = 47 IQ3_XXS + 1 IQ4_XS, `ffn_down_exps` = 43 IQ4_NL +
+    5 Q8_0.
+  - **Shapes:** hidden 2,560, expert width 640, 512 experts, 8 used, one token.
+  - **Per MUL_MAT_ID** (8 used, one token; `taskset -c 0-7` = 8 physical cores
+    vs `0-15` = 16 threads):
+
+    | op | 8 threads | 16 threads |
+    |---|---|---|
+    | gate/up IQ3_XXS (k 2560, m 640) | 166.7 / 177.7 us | 164.5 us |
+    | down IQ4_NL (k 640, m 2560) | 108.6 / 107.4 us | 102.5 us |
+
+    A layer (gate + up + down) is **~444 us** at 8 threads; 16 threads move it
+    by < 6 %. The reference's ~20 % pinning claim is not reproduced at this
+    shape -- the work is bandwidth-bound over the expert bytes.
+  - **Against the tier.** The recorded tier figure is **1.14 ms per layer call
+    for 7.57 experts, all in RAM** (2026-09-28). llama.cpp is **~2.6x faster
+    per layer** (444 us vs 1,140 us); if the tier's 1.14 ms is a single gemm
+    the gap is larger. Either way it is >= 1.5x. (Not re-taken: the tier
+    figure is the recorded all-in-RAM number; a fresh take needs a served run
+    with a full bank, outside this box.)
+  - **Decision.** The next build is the tier's hot loop: read ggml's AVX2
+    `vec_dot` for IQ3_XXS/IQ4_NL first (source read before implementing), then
+    the call's threading and pinning and its per-call overheads. The gap to
+    the reference is **compute, not RAM residency**.
