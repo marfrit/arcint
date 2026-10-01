@@ -76,10 +76,10 @@ that touches a design decision, a mechanism, a milestone or a campaign:
    leg, card identity by PCI id (DRM numbering is INVERTED vs OpenVINO),
    zombie sweep by pid.
 
-The cost of ignoring this is on the record in `AGENTS.md` and in
-`docs/research-freetoken-code.md`: a 0.5.1 serving route measured at 7.06x
-the device residency per layer and 623x the warm forward, whose root cause
-sat in `docs/campaigns/` for ten days before it was built.
+The cost of ignoring this is on the record in `AGENTS.md`: a 0.5.1 serving
+route measured at 7.06x the device residency per layer and 623x the warm
+forward, whose root cause sat in `docs/campaigns/` for ten days before it was
+built. What FreeToken does, from its code: `docs/research-freetoken.md`.
 
 ## This repository is public
 

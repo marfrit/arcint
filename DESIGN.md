@@ -851,10 +851,10 @@ carry a verdict.
   movement paths (`python/freetoken/moe/host_banks.py`); Strata keeps every
   expert in one pinned RAM arena (`include/strata/core/pinned.hpp`
   `PinnedArena`, `src/core/pinned.cu`).
-- **arcint now**: the bank (patch 0072) is anonymous pageable memory; the
-  host's TTM `pages_limit` is 8,220,668 pages = 31.4 GiB against a 44–46 GiB
-  bank (`measured-here`). Raising the TTM limit is a host setting: the
-  operator's decision. §8.1, §8.2 and §8.6 depend on it.
+- **arcint now**: the bank (patch 0072) is anonymous pageable memory. The
+  dev host's TTM pinned cap was raised to 40 GiB on 2026-10-01 (operator), so
+  a 30 GiB pinned bank fits. Owed: allocate the bank as pinned USM-host.
+  §8.1, §8.2 and §8.6 depend on it.
 
 ### 8.5 Take the host out of the per-layer hand-off
 
