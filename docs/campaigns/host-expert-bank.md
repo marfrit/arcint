@@ -314,7 +314,7 @@ change. A slot is a hit only for the identical span list. Everything else
   does not sum to the capture's `n_ctx`; the replay step is the fix.
   - Window 0 vs the f32 reference (`ref-capture-w0.dat`), B60, shape-routed
     0074 (plugin `55c432880f2d5ed0`) and base, below-2,051 mean KL:
-    base **0.3003** vs q8 **0.3186** (delta +0.0183); argmax agreement
-    0.7974 vs 0.7981. The run-to-run floor was NOT measured in this leg
-    (`--repeat 1`); the historical B60 implementation floor is the acceptance
-    candidate. The rows at or above 2,051 stay void until T8.
+    base **0.3003** vs q8 **0.3186** (delta **+0.0183**); argmax agreement
+    0.7974 vs 0.7981. The B60's recorded run-to-run floor is **0.136** (nats,
+    mean), so the 0074 delta is well inside it -- the adoption stands on the
+    numerics too. The rows at or above 2,051 stay void until T8.
