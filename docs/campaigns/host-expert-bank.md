@@ -165,3 +165,31 @@ change. A slot is a hit only for the identical span list. Everything else
     `vec_dot` for IQ3_XXS/IQ4_NL first (source read before implementing), then
     the call's threading and pinning and its per-call overheads. The gap to
     the reference is **compute, not RAM residency**.
+
+- 2026-10-01. **Harness v2: cold-DRAM decode and a prefill row.** The first
+  microbench held the same 8 expert ids every iteration, so its decode row was
+  L3-hot. Re-run with ids rotating over all 512 per iteration (coverage
+  verified 512/512) and a prefill-shaped row (512 tokens, 7 used, 322 distinct
+  experts -> 3,584 pairs vs the measured 3,227), 8 physical cores vs 16
+  threads, services stopped.
+  - **Decode** (8 used, 1 token), per MUL_MAT_ID:
+
+    | op | 8 threads | 16 threads |
+    |---|---|---|
+    | gate/up IQ3_XXS | 180.2 us | 233.7 us |
+    | down IQ4_NL | 179.2 us | 196.0 us |
+
+    Layer = **~540 us** at 8 threads. Cold DRAM makes 16 threads (SMT)
+    **10-30 % SLOWER** than 8 physical cores -- the reference's pinning claim
+    is real at cold DRAM, reversing the L3-hot reading above.
+  - **Prefill** (512 tokens, 7 used, 322 distinct), per MUL_MAT_ID:
+    IQ3_XXS 37.77 ms (8t) / 36.89 ms (16t); IQ4_NL 40.95 ms (8t) / 41.19 ms
+    (16t). Layer = **~116.5 ms** at 8 threads.
+  - **Against the tier.** Decode: 540 us vs the tier's 1.14 ms -> **2.1x**.
+    Prefill: 116.5 ms vs the recorded ~152 ms per chunk-512 call -> **1.30x**,
+    i.e. at the 1.3x gate boundary and not better.
+  - **Cause (source).** The tier's AVX2 path (`moe_cpu_expert_avx2.cpp`)
+    dequantises IQ3_XXS/IQ4_NL rows to f32 (`decode_*_row_avx2`) and then does
+    an f32 dot. ggml dots in the quantised domain with the activation
+    quantised once per token to Q8_K/Q8_0 (`vec_dot_iq3_xxs_q8_K`,
+    `vec_dot_iq4_nl_q8_0`, `vec_dot_q8_0_q8_0`); that is where the gap lives.
