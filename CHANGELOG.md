@@ -138,6 +138,14 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   quality above 2,051, or if attention becomes a larger share of decode after
   the CPU-tier work; the >=64k measurement is deferred.
 
+- **The tier's reference bar: llama.cpp's AVX2 CPU experts are ~2.6x faster.**
+  A microbenchmark of `ggml_mul_mat_id` at Flash-Next's decode shapes
+  (IQ3_XXS gate/up, IQ4_NL down; hidden 2560, width 640, 512 experts, 8 used,
+  one token) reads ~444 us per layer at 8 threads, against the tier's recorded
+  1.14 ms per layer all in RAM. ggml is >= 1.5x faster, so the next build is
+  the tier hot loop (ggml's `vec_dot` for those types first, then threading
+  and pinning). Pinning to physical cores buys < 6 % at this shape.
+
 - **QSA runtime: option A accepts the indexer state and refuses what it cannot
   honour** (campaign qsa step 3 T4; arcint-side, no plugin patch). The loader
   reads the indexer's raw-key geometry off the served graph (6 KiB/token at
