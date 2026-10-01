@@ -174,10 +174,12 @@ std::optional<std::string> tier_prefix_cache_decision(bool static_partition_repo
                                                        int prefix_cache_mib) {
     if (!tier_on || prefix_cache_mib <= 0) return std::nullopt;
     if (static_partition_reported) return std::nullopt;
-    return "--moe-cpu-tier with --prefix-cache-mib > 0 violates DESIGN §3.4: "
-           "the host tier's arithmetic depends on expert LRU residency, so a "
-           "continuation restored from the prefix cache is not byte-identical "
-           "to a cold run -- drop --prefix-cache-mib or run without the tier; "
+    return "--moe-cpu-tier with --prefix-cache-mib > 0 violates DESIGN §3.4 "
+           "(amended 2026-10-01): an ADAPTIVE tier -- expert placement follows "
+           "the conversation and depends on the request history since boot -- "
+           "is refused with the prefix cache, because a restored continuation "
+           "is not the same request history as the cold run that produced the "
+           "cache entry. Drop --prefix-cache-mib or run without the tier; "
            "the plugin does not report a static residency partition";
 }
 
@@ -238,8 +240,9 @@ std::string usage_text() {
         "                            undone once set\n"
         "  --moe-cpu-tier            compute expert FFNs that would evict a device\n"
         "                            slot on the host CPU instead (needs --offload-ratio;\n"
-        "                            --prefix-cache-mib > 0 is refused at load unless the\n"
-        "                            plugin reports a static residency partition, DESIGN §3.4)\n"
+        "                            --prefix-cache-mib > 0 is refused at load with an\n"
+        "                            adaptive tier, and allowed only when the plugin\n"
+        "                            reports the static residency partition, DESIGN §3.4)\n"
         "  --moe-cpu-tier-threads N  worker threads for that tier (0 = auto)\n"
         "  --moe-per-expert-dispatch dispatch routed experts via per-expert GPU\n"
         "                            kernels (needs --offload-ratio + --moe-cpu-tier)\n"

@@ -305,7 +305,10 @@ struct Config {
     // read-only GPU-plugin property MOE_CPU_TIER_STATIC_PARTITION, which
     // only exists once the backend's executor is up. Config parsing now accepts
     // the combination unconditionally; backend_ov.cpp's
-    // tier_prefix_cache_decision (below) makes the load-time call.
+    // tier_prefix_cache_decision (below) makes the load-time call. The
+    // history-dependent mode is the ADAPTIVE TIER (expert placement follows
+    // the conversation, DESIGN §3.4 amended 2026-10-01); it is refused with the
+    // prefix cache, while the static partition is admitted with it.
     bool moe_cpu_tier = false;   // --moe-cpu-tier
     int  moe_cpu_tier_threads = 0;  // --moe-cpu-tier-threads; 0 = plugin default
     bool moe_per_expert_dispatch = false;  // --moe-per-expert-dispatch
@@ -376,8 +379,8 @@ bool kv_precision_is_packed_four_bit(const std::string& requested, const std::st
 // with the device. The plugin exposes this as a read-only property,
 // MOE_CPU_TIER_STATIC_PARTITION, true when the served tier is that static
 // partition (false when MOE_CPU_TIER_PARTITION=lru restores the
-// history-dependent one, or the property is simply absent on a plugin
-// without 0018). That fact only exists once the backend's executor is up --
+// history-dependent adaptive tier, or the property is simply absent on a
+// plugin without 0018). That fact only exists once the backend's executor is up --
 // config parsing cannot query a GPU plugin property -- so the refusal moved
 // from config.cpp to backend_ov.cpp's load path, which probes the property
 // (mirroring the PAGED_ATTENTION_MAX_PARTITIONS probe's style) and calls

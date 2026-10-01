@@ -3905,8 +3905,8 @@ private:
                         throw std::runtime_error(*refusal);
                     }
                     log::info("load", "%s",
-                              "host tier: plugin reports a static residency partition; "
-                              "the prefix cache is allowed");
+                              "host tier: plugin reports the static-partition mode "
+                              "(history-independent expert placement); the prefix cache is allowed");
                 }
             }
 

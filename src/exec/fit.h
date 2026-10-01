@@ -105,7 +105,7 @@ inline uint64_t expert_slot_bytes(int num_expert, int ratio_pct, uint64_t per_ex
 // Patch 0018 / MOE_CPU_TIER_STATIC_PARTITION (DESIGN §7.0.2ae "F2"): under
 // the plugin's static residency partition, each expert's host-or-device
 // placement is a pure function of expert id, layer and pool configuration,
-// fixed for the life of the process. Under the LRU-mode plateau probe
+// fixed for the life of the process. Under the adaptive (LRU-mode) plateau probe
 // (backend_ov.cpp Phase B), this same arithmetic -- `expert_slot_bytes`,
 // unchanged -- only ever prices a CEILING for the host-side ledger, because
 // device residency there is history-dependent and only a probe can measure
