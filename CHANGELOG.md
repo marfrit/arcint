@@ -2729,3 +2729,9 @@ Requires `marfrit-openvino 2026.4.0~dev20260821+p2` (patches 0003–0013).
   path. Dense arm at 20,085 tokens on the B60: prefill 63.1 t/s (base 64.2),
   decode 6.5 t/s (base 5.9) -- prefill back to base, decode +10 %. Served
   runtime prefix ov-0074, plugin 55c432880f2d5ed0.
+
+- **KL replay harness fixed.** The gate must replay the capture's own window
+  through the served arm (`ARCINT_LOGITS_DUMP` + `--no-logits-slice`, then
+  `tools/kld_served.py --replay`), not reuse the leg's request dump. With that,
+  window 0 below-2,051 mean KL is 0.3003 (base) vs 0.3186 (shape-routed 0074) on
+  the B60; the floor was not measured this leg.

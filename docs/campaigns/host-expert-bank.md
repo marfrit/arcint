@@ -300,3 +300,21 @@ change. A slot is a hit only for the identical span list. Everything else
   equals the f32 reference bitwise.
   - Prefill's cheaper lever is still ggml's **batched** dot, not ported;
     prefill-expert-streaming v2 stays the prefill build.
+
+- 2026-10-01. **KL replay harness fixed; the 0074 KL read.** The harness needs
+  the served arm to REPLAY the capture's own window tokens, not the leg's
+  20,085-token request: boot with `ARCINT_LOGITS_DUMP=<path>
+  --no-logits-slice`, then `tools/kld_served.py --replay --ref <capture> --url
+  http://127.0.0.1:8111`. The tool posts the capture's window ids to
+  `/v1/completions`; `--no-logits-slice` writes one record per prefill row, so
+  a 2,735-token window at chunk 2048 gives records past=0 n=2048 and past=2048
+  n=687, which stitch to the capture's `n_ctx` 2735 and make
+  `kld_vs_capture.py <capture> <dump> 0 <label>` find its replay. The earlier
+  "no replay summing to 2,735" was the 20,085-token request dump, whose window
+  does not sum to the capture's `n_ctx`; the replay step is the fix.
+  - Window 0 vs the f32 reference (`ref-capture-w0.dat`), B60, shape-routed
+    0074 (plugin `55c432880f2d5ed0`) and base, below-2,051 mean KL:
+    base **0.3003** vs q8 **0.3186** (delta +0.0183); argmax agreement
+    0.7974 vs 0.7981. The run-to-run floor was NOT measured in this leg
+    (`--repeat 1`); the historical B60 implementation floor is the acceptance
+    candidate. The rows at or above 2,051 stay void until T8.
