@@ -63,8 +63,6 @@ ranking (`research-reference-audit.md` §4).
 
 | campaign | state | reference to follow |
 |---|---|---|
-| [expert-hot-set-lru](expert-hot-set-lru.md) | placement is static (census seed, patch 0046); 36 % of routed experts run on the GPU at decode; the CPU tier computes every miss; the bank is pageable | Strata alone: `src/program/generate.cpp:4413-4482` (batched swaps, non-blocking admission), `:1709-1724` (link-probed miss share), `src/core/expert_source.cpp:1614-1696` (the split), `src/core/expert_cache.cpp`, `include/strata/core/pinned.hpp` |
-| [tier-handoff-doorbell](tier-handoff-doorbell.md) | B60 device idle ~46 % of a decode token, waiting on the tier hand-off | Strata `src/kernels/cuda/elementwise.cu:186-311` (doorbell), recorded pass; FreeToken `moe/cpu_executor.py` (mapped flags, pinned workers) |
 | [mtp-cycle-wall](mtp-cycle-wall.md) | MTP drafts one token a cycle (dense agent); the Flash-Next head's tensors fetched, never exported or served | Strata `src/core/mtp.cpp:771-820` (draft chain with `min_p`), `tools/mtp_fetch.py` |
 | [prefill-expert-streaming](prefill-expert-streaming.md) | prefill 63–68 t/s at 20k on the B60, CPU-tier-bound | Strata `src/prefill/prefill.cpp:71-104` (slot ring, chunks to 8,192, MMQ); FreeToken `moe/offload_cache.py` prefill overlap, `layers/moe.py:388-390` |
 | [kquant-host-storage](kquant-host-storage.md) | native blocks on the host tier, quantised dot for decode-shaped calls (0043, 0074) | Strata `src/kernels/cpu/iq_avx2.cpp` (multi-token AVX2) |
@@ -79,6 +77,8 @@ paths under `~/src/Strata-ref/`.
 
 | campaign | what exists |
 |---|---|
+| [expert-hot-set-lru](expert-hot-set-lru.md) | patch 0076: adaptive expert cache, non-blocking admission, Strata's RAM exchange and RAM budget; 20k needle decode 7.5 -> 10.3 t/s (B60) |
+| [tier-handoff-doorbell](tier-handoff-doorbell.md) | patch 0077: the decode step submitted ahead, the tier fed through mapped memory; 10.7 -> 12.7 t/s needle, 14.0 -> 16.0 long answer (B60) |
 | [test-ladder-close](test-ladder-close.md) | acceptance references filled; DESIGN §7.0.2aj–al |
 | [prefill-fallback-tristate](prefill-fallback-tristate.md) | patch 0019, `ExpertWeightsSide` |
 | [turnstile-wall-time](turnstile-wall-time.md) | synchronised turnstile test, `free_port` in `roundtrip.sh` |

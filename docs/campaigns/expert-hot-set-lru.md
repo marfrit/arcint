@@ -1,6 +1,6 @@
 # expert-hot-set-lru — the GPU expert cache follows the conversation, and a share of the misses crosses the link
 
-**Open.** Lever 1 of `research-reference-audit.md` §4, together with lever 6
+**Closed 2026-10-03 (patch 0076, gate passed 2026-10-02).** Not built from Strata's mechanism: bank copies on their own queue, the victim copied back from its slot, a decode-built start profile, the miss share. Opened as Lever 1 of `research-reference-audit.md` §4, together with lever 6
 (the miss split) and the bank pinning: in Strata they are one mechanism, so
 this one campaign owns all three (`decision`, operator's architect,
 2026-10-01). DESIGN §8.1, §8.4, §8.6. First in the build order: the cache,

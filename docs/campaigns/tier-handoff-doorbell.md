@@ -1,6 +1,6 @@
 # tier-handoff-doorbell — the per-layer GPU/CPU-tier hand-off through mapped memory, not the driver
 
-**Built, gate passed 2026-10-02 (patch 0077).** Opened 2026-10-01 from
+**Closed 2026-10-03 (patch 0077, gate passed 2026-10-02).** Not built: a recorded pass (`cl_khr_command_buffer`). Opened 2026-10-01 from
 `research-reference-audit.md` §1, the "0075 hand-off" row; levers 5 and 8 of
 the audit's §4.
 
