@@ -75,6 +75,7 @@ add_library(arcint_core STATIC
   src/core/model_registry.cpp
   src/core/ngram_header.cpp
   src/exec/ngram_table.cpp
+  src/exec/ngram_reader.cpp
   src/core/prefix_cache.cpp
   src/core/reasoning.cpp
   src/core/sampler.cpp
@@ -84,6 +85,7 @@ add_library(arcint_core STATIC
   src/core/chat.cpp
   src/core/dflash_select.cpp
   src/core/drafter.cpp
+  src/core/draft_policy.cpp
   src/core/turnstile.cpp
   src/exec/backend_stub.cpp
   src/api/error.cpp

@@ -278,7 +278,8 @@
         "lm_bin_bytes": 65180065880,
         "status": "d48s2 with the dense projections in the checkpoint's Q8_0/Q6_K form; quality row owed",
         "mtp_num_hidden_layers": 1,
-        "mtp_head_exported": false
+        "mtp_head_exported": true,
+        "_mtp_note": "2026-10-02: openvino_mtp_layer.xml / openvino_mtp_lm_head.xml written beside the export by tools/export_mtp_flash_next.py (the 31 mtp.* tensors, sha256 97d31bd9...; routed experts 4-bit)"
     },
     "qwen38-flash-next-d48q8qsa-ov": {
         "_note": "2026-09-30: re-exported with the model-level QSA marker (tools/export_serving_artifact.py --layers 48 --qsa --expert-format native --dense-q8 --dense-u8, tree 7f57d87, peak host 51.24 GiB), the same tree and flags as qwen38-flash-next-d48q8-ov except --qsa. The 12 full-attention layers carry the model's own indexer; load_paged re-applies the selection tags from model rt_info and refuses unless 12 PagedAttention nodes take the selection. Supersedes the 2026-09-28 tree-4f05b21 u4 export, whose marker did not survive serialization (it served dense attention). Hashes read off the export log.",
