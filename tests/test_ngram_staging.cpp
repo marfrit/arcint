@@ -336,3 +336,28 @@ TEST(ngram_reader_reads_rows_that_share_a_page_once) {
     }
     ::unlink(path.c_str());
 }
+
+TEST(ngram_reader_fails_the_ticket_not_the_reader) {
+    const std::string path = reader_path("fail");
+    write_table(path, static_cast<uint32_t>(kTableRows), kRowBytes);
+    ngram::ReaderOptions opt;
+    opt.cache_rows = 0;
+    {
+        ngram::RowReader r(path, ngram::kHeaderBytes, kTableRows, kRowBytes, opt);
+        // the file loses its second half under the open reader
+        CHECK(::truncate(path.c_str(), static_cast<off_t>(ngram::kHeaderBytes + (kTableRows / 2) * kRowBytes)) == 0);
+        std::vector<uint8_t> out(kRowBytes);
+        bool threw = false;
+        try {
+            r.collect(r.issue({static_cast<uint64_t>(kTableRows - 1)}, out.data()));
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        CHECK(threw);
+        // the next forward reads again
+        r.collect(r.issue({5}, out.data()));
+        const auto payload = read_payload(path);
+        CHECK(std::memcmp(out.data(), payload.data() + 5 * kRowBytes, kRowBytes) == 0);
+    }
+    ::unlink(path.c_str());
+}

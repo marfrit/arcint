@@ -107,9 +107,17 @@ int DraftPolicy::choose_chain(const float* p, int n) const {
             best_k = k;
         }
     }
-    // Probe an unmeasured size while the chain is confident.
-    for (int k = n; k > best_k; --k)
-        if (cost_n_[k + 1] < kProbes && p[k - 1] >= 0.85f)
+    // Probe an unmeasured size while the chain is confident: every draft up
+    // to k at least 0.85 likely, as the lookup side asks of its rate.
+    float lo = 1.0f;
+    int   confident = 0;
+    for (int k = 1; k <= n; ++k) {
+        lo = std::min(lo, p[k - 1]);
+        if (lo < 0.85f) break;
+        confident = k;
+    }
+    for (int k = confident; k > best_k; --k)
+        if (cost_n_[k + 1] < kProbes)
             return k;
     return best_k;
 }

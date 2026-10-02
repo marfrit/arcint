@@ -162,6 +162,8 @@ uint64_t RowReader::issue(const std::vector<uint64_t>& rows, uint8_t* dst) {
 void RowReader::collect(uint64_t ticket) {
     const double t0 = now_us();
     std::unique_lock<std::mutex> lk(m_);
+    // Every read of the ticket finishes (or fails) before collect returns or
+    // throws, so no worker writes into the caller's rows afterwards.
     cv_done_.wait(lk, [&] {
         auto it = pending_.find(ticket);
         return it == pending_.end() || it->second == 0 || !error_.empty();
@@ -169,6 +171,12 @@ void RowReader::collect(uint64_t ticket) {
     pending_.erase(ticket);
     stats_.wait_us += now_us() - t0;
     if (!error_.empty()) throw std::runtime_error("ngram reader: " + error_);
+    auto f = failed_.find(ticket);
+    if (f != failed_.end()) {
+        const std::string why = f->second;
+        failed_.erase(f);
+        throw std::runtime_error("ngram reader: " + why);
+    }
 }
 
 ReaderStats RowReader::stats() const {
@@ -216,8 +224,9 @@ void RowReader::worker() {
             continue;
         }
         if (!ok) {
-            error_ = log::format("a read of %u bytes at %llu returned %u", j.length,
-                                 static_cast<unsigned long long>(j.offset), got);
+            // The ticket fails, not the reader: a later forward reads again.
+            failed_.emplace(j.ticket, log::format("a read of %u bytes at %llu returned %u", j.length,
+                                                  static_cast<unsigned long long>(j.offset), got));
         } else {
             ++stats_.reads;
             stats_.bytes += got;

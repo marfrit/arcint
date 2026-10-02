@@ -57,8 +57,10 @@ GPU. The 0.5.4 entry's "0.5.5 ROMA is next" is superseded by this order.
   30 GiB bank, 20,085-token needle, fresh process per arm): static prefill
   64.0 / needle decode 7.5 / 500-token decode 10.8 t/s; all of the above
   65.5 / **10.3** / **12.4** t/s; needle right in both; window-0 KL 0.577 vs
-  0.386, argmax 73.2 vs 81.5 % (within the card's run-to-run floor; the bar
-  is met). Also opt-in and not part of the served configuration:
+  0.386, argmax 73.2 vs 81.5 % (the adaptive arm is the better one by 0.19
+  nats and 8.3 points, so the bar is met; the gap is not the card's floor:
+  the arms split the experts differently between u4 card slots and the
+  IQ3_XXS/IQ4_NL tier, which moves KL). Also opt-in and not part of the served configuration:
   `MOE_CPU_BANK_PINNED=1` (the bank as USM-host chunks; O_DIRECT reads go
   through a bounce buffer, since they cannot target the driver's mapping) and
   `MOE_CPU_TIER_SPIN_US` (the tier pool spins before sleeping; within the

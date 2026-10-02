@@ -2792,6 +2792,17 @@ private:
         // One drafter per verify loop: an explicit --mtp on + --dflash is a
         // config error; mtp auto yields to the requested drafter.
         want_mtp_ = cfg.mtp != "off" && artifact_.has_mtp_head && !want_dflash_;
+        if (want_mtp_ && cfg.mtp != "on") {
+            // A chaining draft layer (Flash-Next, `kv_len` contract) is opt-in:
+            // on a free-form answer it decodes slower than plain on this card
+            // (11.9 against 14.6 t/s, B60), so --mtp auto leaves it off.
+            std::ifstream mx(choose_mtp_layer(artifact_, cfg.mtp_layer));
+            const std::string xml((std::istreambuf_iterator<char>(mx)), std::istreambuf_iterator<char>());
+            if (xml.find("name=\"kv_len\"") != std::string::npos) {
+                log::info("mtp", "%s", "the chaining draft layer is opt-in (--mtp on); serving without it");
+                want_mtp_ = false;
+            }
+        }
         if (want_mtp_ && !expose_hidden_state(model)) {
             log::warn("mtp", "%s", "could not expose the hidden state; MTP disabled");
             want_mtp_ = false;

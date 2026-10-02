@@ -1,6 +1,12 @@
 # tier-handoff-doorbell — the per-layer GPU/CPU-tier hand-off through mapped memory, not the driver
 
-**Closed 2026-10-03 (patch 0077, gate passed 2026-10-02).** Not built: a recorded pass (`cl_khr_command_buffer`). Opened 2026-10-01 from
+**Closed 2026-10-03 (patch 0077, gate passed 2026-10-02).** Not built: a recorded pass (`cl_khr_command_buffer`). Review (2026-10-03): `DoorbellCoordinator::rethrow()` drains the
+coordinator on every call, so the shipped patch overlaps the GPU and the tier
+within a layer but does not submit the step ahead across layers; the gate's
+numbers came from the build before that review fix (52f77927), the shipped
+build measured 11.6 / 16.2 t/s at 2k. The wait kernel's bound is a poll count,
+~1.3 s on the B60 (`measured-here`, that card only), and a slower tier call
+fails the request. Opened 2026-10-01 from
 `research-reference-audit.md` §1, the "0075 hand-off" row; levers 5 and 8 of
 the audit's §4.
 

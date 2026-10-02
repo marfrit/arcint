@@ -113,10 +113,11 @@ private:
     std::condition_variable   cv_work_, cv_done_, cv_keep_;
     std::deque<Job>           queue_;
     std::unordered_map<uint64_t, uint32_t> pending_;  // ticket -> page reads not yet done
+    std::unordered_map<uint64_t, std::string> failed_;  // ticket -> its read error
     uint64_t                  next_ticket_ = 1;
     RowCache                  cache_;
     ReaderStats               stats_;
-    std::string               error_;
+    std::string               error_;   // a failure no ticket owns (the worker's buffer)
     bool                      stop_ = false;
     double                    last_issue_us_ = 0, last_read_us_ = 0;
     uint64_t                  rng_ = 0x9E3779B97F4A7C15ull;
