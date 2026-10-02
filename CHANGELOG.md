@@ -24,6 +24,18 @@ expert cache with its miss split and the pinned bank, then the doorbell
 hand-off, then multi-draft MTP for Flash-Next (ROMA), then prefill on the
 GPU. The 0.5.4 entry's "0.5.5 ROMA is next" is superseded by this order.
 
+- **Tier hand-off doorbell (plugin patch 0077, runtime `+p27`): gate
+  passed.** `MOE_DOORBELL=1`: the decode MoE layers route on the device
+  through a residency table, publish the CPU tier's work to host memory and
+  wait for its rows with a GPU-side poll, while the tier's host half runs on
+  a coordinator thread; the enqueueing thread submits the whole decode step
+  ahead (Strata's doorbell, FreeToken's flag handshake). Dense `d48q8`, B60,
+  on top of patch 0076, 20,085-token needle: needle decode 10.7 -> 12.7 t/s,
+  500-token decode 14.0 -> 16.0, prefill 63.5 -> 60.8 (inside the spread of
+  the day's arms, 60.8-67.0), needle right, window-0 KL 0.409 vs 0.412 nats
+  over three arms each. On this card a kernel sees a host-written flag only
+  through an L1/L3-uncached LSC load with an acquire fence in the poll loop.
+
 - **Adaptive expert cache (plugin patch 0076, runtime `+p26`): gate passed.**
   Strata's mechanisms for an expert set larger than RAM, built from its
   source (`docs/campaigns/expert-hot-set-lru.md`):

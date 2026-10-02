@@ -2271,3 +2271,43 @@ Cells: `replace_pinned_*`, `pinned_residents_*`, `contains_filled_*`,
 
 Series 0003-0074 + 0076 (0075 is not in the series) applies to the pin with
 `git apply`.
+
+## 0077 — Tier hand-off doorbell (2026-10-02)
+
+`MOE_DOORBELL=1`: decode MoE layers on a partly resident pool with the CPU tier
+no longer stop the enqueueing thread (Strata's doorbell, FreeToken's flag
+handshake, on OpenCL). A route kernel maps each routed id through the layer's
+residency table to its slot or -1, writes the pair table and publishes the
+ids, slots, routing weights and x to host memory behind a release-stored
+sequence number; the batched expert kernels skip -1 rows; a wait kernel polls
+the host's done flag and merges the CPU tier's rows before the reduce. The
+host half -- count the ids for the adaptive cache, run the tier on exactly the
+-1 pairs, write the rows, ring done -- runs on a coordinator thread in layer
+order, so the whole decode step is submitted ahead.
+
+The GPU poll, measured on the B60 (host USM without concurrent access): only
+an LSC load that bypasses L1 and L3 with an acquire fence inside the loop sees
+the host's write (8 of 8, ~5 us); acquire atomics 2 of 8, volatile and RMW 0
+of 8, and the bare uncached load is hoisted. OpenCL user events were not used
+(they put NEO's queue in blocked mode).
+
+Failure handling: the poll is bounded (~1.3 s); a timeout or a failed host
+half writes NaN rows and throws on the next call; a superseded job throws;
+the enqueueing thread drains the coordinator before re-entering an impl whose
+last call has not rung, and the destructor drains it. First use (the bank,
+the lookahead's routers) happens on the enqueueing thread.
+
+Served gate (dense `d48q8`, B60, patch 0076's served configuration, 20,085-
+token needle, one fresh process per arm): prefill 63.5 / needle decode 10.7 /
+500-token decode 14.0 t/s without, 60.8 / 12.7 / 16.0 with; needle right in
+both; window-0 KL over three arms each 0.409 vs 0.412 nats mean, argmax 79.1 vs
+79.0 %. The gate ran before the review fixes (plugin `52f77927`); the final
+build (`8245174a`, the fixes change error paths, the fill of never-filled
+slots and counters) read at 2k tokens 9.8 / 13.5 t/s without and 11.6 / 16.2
+with, needle right.
+
+Cells: `doorbell_residency_table_marks_only_filled_pinned_slots` (red on a
+table that ignores the filled flag). The handshake itself is checked by the
+served runs (0 wait timeouts in 27,936 calls) and the probe.
+
+Series 0003-0074 + 0076 + 0077 applies to the pin with `git apply`.
