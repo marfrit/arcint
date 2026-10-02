@@ -2227,3 +2227,47 @@ run-to-run floor 0.136).
 
 Series 0003-0074 applies to the pin with `git apply` and reproduces the built
 tree file for file.
+
+## 0076 — Adaptive expert cache and Strata's RAM budget (2026-10-02)
+
+The GPU's pinned expert slots follow the conversation and the CPU tier's host
+bank follows Strata's RAM budget; every mechanism is ported from Strata's
+source (the patch header carries the file and line of each).
+
+- `MOE_CPU_TIER_ADAPTIVE=1`: decayed usage counts, up to 96 swaps every 12
+  decode tokens, gain > 1.5, no plan while a swap is in flight; a swap hands
+  a pinned slot to the newcomer in place (nothing is evicted); the newcomer
+  is read and transposed in the background and admitted with one
+  non-blocking copy on the in-order compute queue; the newcomer's bank slot
+  is re-keyed to the demoted expert (the RAM exchange).
+- `MOE_CPU_BANK_FIXED=1`: a bank miss reads the mapping through the page
+  cache and takes no slot.
+- `MOE_CPU_TIER_LOOKAHEAD=<file>` (`tools/export_router_lookahead.py`):
+  layer L+1's router on layer L's MoE input; `MADV_WILLNEED` on the
+  predicted experts the card and the bank do not hold.
+- Opt-in only: `MOE_CPU_BANK_PINNED=1` (usm_host chunks, O_DIRECT through a
+  bounce buffer) and `MOE_CPU_TIER_SPIN_US` (spin before sleep).
+
+Recorded deviations from Strata: the newcomer is read from the file and
+copied on the compute queue (Strata: from its pinned arena on its own
+stream); the demoted expert is read from the file into the bank (Strata:
+copied back from its GPU slot; the slot's scales are in device layout).
+
+Served gate (dense `d48q8`, B60, ratio 75 + census128, 15.4e9 device pool,
+30 GiB bank, 20,085-token needle, one fresh process per arm): static prefill
+64.0 / needle decode 7.5 / 500-token decode 10.8 t/s; adaptive + fixed bank +
+lookahead 65.5 / 10.3 / 12.4; needle right in both; window-0 KL 0.577 vs
+0.386, argmax 73.2 vs 81.5 % (inside the card's run-to-run floor). A
+confirmation at 2k tokens after the review fixes: 8.3 / 10.7 vs 9.9 / 13.9
+t/s, with the page cache warm from earlier windows (a long-running server's
+state; a cold-cache arm was not measured).
+
+Cells: `replace_pinned_*`, `pinned_residents_*`, `contains_filled_*`,
+`adaptive_split_upload_matches_fill_weights_memory` (unequal tensor sizes),
+`exchange_hands_the_promoted_slot_to_the_demoted_expert`,
+`a_fixed_bank_answers_misses_unbanked_and_keeps_its_set`,
+`external_chunks_get_the_files_bytes_through_the_bounce`, the policy cells
+`adaptive_expert_cache.*`; each was red on a mutant before it was green.
+
+Series 0003-0074 + 0076 (0075 is not in the series) applies to the pin with
+`git apply`.

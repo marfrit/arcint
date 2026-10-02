@@ -124,8 +124,11 @@ window:
   - the miss share follows the probed link;
   - an admitted slot's bytes equal the bank's (red-first on a mutated copy);
   - replay determinism, kept only if it is free.
-- **State:** design pinned; build not started. Lands as plugin patch
-  **0076** (0075 is staged, not in the series).
+- **State:** gate passed 2026-10-02 (history below): swaps with
+  non-blocking admission, the RAM exchange, the fixed bank and the router
+  lookahead, as plugin patch **0076**. Not yet built: the miss share, the
+  pinned bank as the swap source with copies on their own queue (Strata's
+  adapt stream), a decode-built start profile.
 
 ## Where it lives
 
@@ -176,6 +179,103 @@ Full history: `git show b0447b8:docs/campaigns/expert-hot-set-lru.md`.
     itself first crashed (the static partition pins the whole pool, leaving
     the LRU nothing to evict); admitting the census unpinned and routing the
     no-destination probe calls through the LRU fixed the load but not the cost.
-  - Next levers, in order: upload the fetched share from the **pinned bank**
-    (not the pageable reader) and keep it cached (Strata's copy kernel), and
-    let the swaps replace residents rather than evict-and-refetch for demand.
+  - Differences from Strata's mechanism (why this is not a verdict on it):
+    the census was admitted unpinned, so misses went to the LRU demand path
+    and evicted; the miss share was uploaded from the pageable reader and
+    cached; planning ran per layer, with rounds counted per call.
+
+- 2026-10-02. **Second build (patch 0076, in progress): the swaps work and
+  pay at decode.** Strata's adapt over the static partition, applied as
+  in-place swaps of pinned slots (`LRUCache::replace_pinned`), never as
+  evictions. Non-blocking admission: a background reader reads and
+  transposes the newcomer, the victim keeps serving until the bytes are
+  ready, then one copy is enqueued on the in-order compute queue with no
+  wait (it lands after the victim's last readers and before the newcomer's
+  first). Cells: `replace_pinned_*`, `pinned_residents_*`,
+  `adaptive_split_upload_matches_fill_weights_memory` (red on a shifted
+  slot offset). B60, `d48q8`, ratio 75 + census128, 15.4e9 device pool,
+  30 GiB host bank, fresh process per arm, a 2,076-token needle then a
+  99-token prompt with 500 decode tokens (`measured-here`, three windows
+  agree within 0.3 t/s):
+
+  | arm | prefill 2k t/s | decode 78 tok | decode 500 tok | decode GPU hit share | swaps applied | evictions | needle |
+  |---|---|---|---|---|---|---|---|
+  | static census128 | 54.9–56.1 | 8.2 | 10.7–11.0 | 35.9 % | 0 | 0 | `ORANGE-FALCON-77` |
+  | adaptive (`MOE_CPU_TIER_ADAPTIVE=1`) | 53.9–56.2 | 7.3–7.6 | 11.4–11.8 | 65.9 % | ~4,550 | 0 | `ORANGE-FALCON-77` |
+
+  - The 78-token decode is slower adaptive: the first swaps land inside it.
+  - **Run without the device pool, it loses** (9.4 → 7.4 t/s): the slot pool
+    sits in host memory (`host_slot_buffers=382`), so each added GPU "hit"
+    is a 2.46 MB read over the link (+0.54 ms GPU wait a layer). Every
+    window of this campaign sets `ARCINT_MOE_DEVICE_POOL_BYTES`.
+  - **Where a decode token goes** (decode-only tier timers): static 91 ms =
+    44 ms tier join + 47 ms GPU and hand-offs; adaptive 88 ms = 42 ms tier
+    join + 46 ms. Inside the join, layers whose CPU expert is not in the
+    host bank wait on an O_DIRECT read: 3.8 ms each against 0.5 ms (static)
+    and 0.3 ms (adaptive) without. Those stalls are ~23 ms of the static
+    token and ~30 ms of the adaptive one: the adaptive cache cut the tier's
+    compute by 40 % and its bank misses ate most of it (each demoted expert
+    was resident, so the bank fill skipped it).
+  - **Bank misses are capacity-bound.** The non-resident experts are 45.5 GiB
+    (384 a layer × 48 × 2.53 MiB) against the 30 GiB bank; Strata keeps
+    every expert in one RAM arena. Tried and not adopted: prefetching
+    demoted experts into the full bank (it evicts others: 4,054 pending
+    layers against 4,151, decode 11.2 against 11.7); filling the bank evenly
+    across layers (`MOE_CPU_BANK_FILL_PER_LAYER=248`: unchanged). A miss is
+    disk-bound: one 2.5 MiB O_DIRECT read is 2.0 ms on the model NVMe, an
+    expert's nine scattered spans 4.7 ms (synthetic). Strata stores each
+    expert as one contiguous blob; an expert-major sidecar (~62 GiB) does
+    not fit the NVMe's 32 GB free.
+  - **Pinned bank as USM-host chunks: slower** (`MOE_CPU_BANK_PINNED=1`,
+    opt-in): tier join 49.2 s against 21.9 s, decode 7.7 against 11.8. CPU
+    read bandwidth of a USM-host buffer equals the heap's (30.7 vs 28.2 GB/s,
+    sequential), so not an uncached mapping; cause unmeasured. It matters
+    only once swaps or the miss share copy from the bank.
+  - **Strata's answer for experts that exceed RAM** (`code`: `docs/DETAILS.md`
+    "A RAM budget", engine 0.1.31; `src/core/expert_source.cpp:380-390`,
+    `:814-930`; `src/program/generate.cpp:3001-3030`): a fixed RAM copy of
+    the profile-hottest experts, changed only by exchanges; every other
+    expert read through the OS page cache from a plain mapping ("retention
+    is the whole game": a random-access hint cost 14×); and a router
+    lookahead thread that applies layer L+1's router to layer L's MoE input
+    and `madvise(MADV_WILLNEED)`s the predicted experts' pages (their effect,
+    `paper`: 72 GiB of experts on a 64 GB PC, ~3 to 7–8.5 t/s). arcint's
+    bank instead admits every miss by an O_DIRECT read into LRU slots. The
+    two negatives above (prefetching demoted experts into the full bank,
+    buffered miss reads) did not test this mechanism and are not verdicts
+    on it.
+  - **Built after the reference reading, and the gate PASSED** (patch 0076,
+    `ov-0076d` plugin `3669c8e0`): the RAM exchange (each applied swap
+    re-keys the newcomer's bank slot to the demoted expert and reads it in
+    the background; the deviation: Strata copies the victim back from its
+    GPU slot, this reads the file, because the slot's scales are in device
+    layout), the fixed bank (`MOE_CPU_BANK_FIXED=1`: a miss reads the
+    mapping and takes no slot), and the router lookahead
+    (`MOE_CPU_TIER_LOOKAHEAD=<routers>`, `tools/export_router_lookahead.py`:
+    layer L+1's F32 router from the GGUF applied to layer L's MoE input,
+    top-10 per token, `MADV_WILLNEED` on the predicted pages the card and the
+    bank do not hold). Plus the review fixes: Strata's no-plan-while-pending
+    rule, a reader exception no longer ends the process, an empty plan never
+    marks a slot filled. B60, `d48q8`, ratio 75 + census128, 15.4e9 device
+    pool, 30 GiB bank, fresh process per arm (`measured-here`):
+
+    | arm | prefill 20,085 | needle decode (82 tok) | 500-tok decode | needle | window-0 KL / argmax |
+    |---|---|---|---|---|---|
+    | static census128 | 64.0 t/s | 7.5 t/s | 10.8 t/s | `ORANGE-FALCON-77` | 0.577 / 73.2 % |
+    | adaptive + fixed bank + lookahead | 65.5 t/s | **10.3 t/s** | **12.4 t/s** | `ORANGE-FALCON-77` | 0.386 / 81.5 % |
+
+    At 2k context the same arms read 8.2 / 10.7 and 8.6 / 12.9 t/s; the
+    adaptive arm with the LRU bank 7.1 / 11.6 (the bank misses and the
+    early swaps cost a short answer). Zero bank-pending layers in decode;
+    the tier's decode join 16.1 s against 26.6 s per 578 tokens. The static
+    arm's KL moved 0.474 to 0.577 between two windows on this card (its
+    run-to-run floor), so the KL difference is no finding; the bar (not
+    worse by more than 0.03, argmax not down by more than 1 point) is met.
+  - Open in this campaign, each against Strata's code: the exchange's
+    victim copied back from its GPU slot instead of read from the file
+    (`include/strata/core/expert_source.hpp:440-455`; needs the scales
+    transposed back to file layout); newcomers copied from the pinned bank on
+    their own queue instead of read from the file and copied on the compute
+    queue (`generate.cpp:4452-4482`, `adapt_stream`); a decode-built start
+    profile (`tools/make_profile.py`); the miss share (link-probed ~0.29,
+    ~3 ms a token at the measured split).

@@ -24,6 +24,34 @@ expert cache with its miss split and the pinned bank, then the doorbell
 hand-off, then multi-draft MTP for Flash-Next (ROMA), then prefill on the
 GPU. The 0.5.4 entry's "0.5.5 ROMA is next" is superseded by this order.
 
+- **Adaptive expert cache (plugin patch 0076, runtime `+p26`): gate passed.**
+  Strata's mechanisms for an expert set larger than RAM, built from its
+  source (`docs/campaigns/expert-hot-set-lru.md`):
+  - the GPU's pinned expert slots follow the conversation: decayed usage
+    counts, up to 96 swaps every 12 decode tokens, none planned while swaps
+    are in flight (`MOE_CPU_TIER_ADAPTIVE=1`);
+  - non-blocking admission: a background reader prepares the newcomer, the
+    victim serves until the bytes are ready, then one copy is enqueued on the
+    in-order compute queue with no wait;
+  - the RAM exchange: the newcomer's host-bank slot is re-keyed to the
+    demoted expert, so the bank keeps holding what the card does not;
+  - a fixed host bank (`MOE_CPU_BANK_FIXED=1`): a miss reads the mapping
+    through the page cache and takes no bank slot;
+  - the router lookahead (`MOE_CPU_TIER_LOOKAHEAD=<routers>`, written by
+    `tools/export_router_lookahead.py` from the GGUF): layer L+1's router on
+    layer L's MoE input warms the predicted experts' pages.
+
+  Served gate (dense `d48q8`, B60, ratio 75 + census128, 15.4e9 device pool,
+  30 GiB bank, 20,085-token needle, fresh process per arm): static prefill
+  64.0 / needle decode 7.5 / 500-token decode 10.8 t/s; all of the above
+  65.5 / **10.3** / **12.4** t/s; needle right in both; window-0 KL 0.577 vs
+  0.386, argmax 73.2 vs 81.5 % (within the card's run-to-run floor; the bar
+  is met). Also opt-in and not part of the served configuration:
+  `MOE_CPU_BANK_PINNED=1` (the bank as USM-host chunks; O_DIRECT reads go
+  through a bounce buffer, since they cannot target the driver's mapping) and
+  `MOE_CPU_TIER_SPIN_US` (the tier pool spins before sleeping; within the
+  spread at 2k).
+
 - **Tier hot loop, part A (zero-copy tier I/O + hot pool): gate FAILED, not
   adopted.** Patch 0075 compiled clean (tier suites 27 passed / 3 skips) and the
   served A/B on dense `d48q8` (B60, 20,085 tokens) read base 62.8 / 6.4 t/s,

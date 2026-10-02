@@ -1,0 +1,2204 @@
+# Adaptive expert cache (campaign expert-hot-set-lru): the GPU's expert slots
+# follow the conversation, and the CPU tier's host bank follows Strata's RAM
+# budget. Every mechanism is ported from Strata's source
+# (github.com/Niko1221/Strata, written for this model on one GPU + RAM).
+#
+# MOE_CPU_TIER_ADAPTIVE=1 (over the static partition, patches 0018/0046):
+#  - decode calls count each routed expert; every MOE_CPU_TIER_ADAPT_EVERY
+#    decode steps (12) one swap batch is planned across all layers: decayed
+#    counts (x0.7), candidates with usage >= 2.0, a swap only for a gain > 1.5,
+#    the top MOE_CPU_TIER_ADAPT_SWAPS (96) by gain; no plan and no decay while
+#    a swap is in flight (Strata src/program/generate.cpp:4413-4482). Policy in
+#    adaptive_expert_cache.hpp.
+#  - a swap hands the victim's pinned slot to the newcomer in place
+#    (LRUCache::replace_pinned); nothing is ever evicted.
+#  - non-blocking admission: a background reader reads and transposes the
+#    newcomer from the file; the victim keeps serving until the bytes are
+#    ready; then one copy is enqueued on the in-order compute queue with no
+#    wait (after the victim's last readers, before the newcomer's first).
+#    Deviation, recorded: Strata copies from its pinned arena on its own
+#    stream.
+#  - the RAM exchange: the newcomer's bank slot is re-keyed to the demoted
+#    expert and read in the background (HostExpertBank::exchange), so the bank
+#    keeps holding what the card does not (Strata
+#    include/strata/core/expert_source.hpp:440-455). Deviation, recorded:
+#    Strata copies the victim back from its GPU slot; this reads the file
+#    (the slot's scales are in device layout).
+#
+# The RAM budget (Strata docs/DETAILS.md, engine 0.1.31):
+#  - MOE_CPU_BANK_FIXED=1: the bank keeps its load-time set, changed only by
+#    exchanges; a miss reads the file mapping through the page cache instead
+#    of taking a slot by an O_DIRECT read.
+#  - MOE_CPU_TIER_LOOKAHEAD=<file> (tools/export_router_lookahead.py): while
+#    the tier works on layer L, a thread applies layer L+1's router to layer
+#    L's MoE input, takes each token's top-k (MOE_CPU_TIER_LOOKAHEAD_K, 10) and
+#    madvise(MADV_WILLNEED)s the predicted experts the card and the bank do
+#    not hold (Strata src/core/expert_source.cpp:814-930). Pages only; the
+#    experts computed are the same.
+#
+# Opt-in, not in the served configuration:
+#  - MOE_CPU_BANK_PINNED=1: the bank as usm_host chunks
+#    (MOE_CPU_BANK_CHUNK_MIB); O_DIRECT cannot target the driver's mapping
+#    (every read failed), so the IO threads read through a bounce buffer.
+#  - MOE_CPU_TIER_SPIN_US: the tier pool's workers and its waiter spin before
+#    sleeping (within the spread at 2k tokens).
+#
+# Counters in [OTD_PERF]: adaptive plans/swaps planned/applied/dropped, the
+# readers' time, bank exchanges, the lookahead's runs/skips/warmed experts,
+# and decode-only GPU hits and tier join split by tier expert count and by
+# bank-pending layers.
+#
+# Served gate (dense d48q8, B60, ratio 75 + census128, 15.4e9 device pool,
+# 30 GiB host bank, 20,085-token needle, one fresh process per arm): static
+# prefill 64.0 / needle decode 7.5 / 500-token decode 10.8 t/s; all of the
+# above 65.5 / 10.3 / 12.4 t/s; needle right in both; window-0 KL against
+# the f32 reference 0.577 vs 0.386, argmax 73.2 vs 81.5 % (inside the card's
+# run-to-run floor; the answer-level bar is met).
+#
+# Files: adaptive_expert_cache.hpp (new), lru_cache.{hpp,cpp},
+# expert_weight_providers.{hpp,cpp}, moe_otd_runtime.{hpp,cpp},
+# moe_otd_perf.hpp, host_expert_bank.hpp, moe_3gemm_swiglu_opt.cpp,
+# moe_cpu_expert.{hpp,cpp}, and the unit cells.
+
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/adaptive_expert_cache.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/adaptive_expert_cache.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/adaptive_expert_cache.hpp
+@@ -0,0 +1,166 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++namespace ov::intel_gpu::ocl::moe {
++
++// arcint (patch 0076, campaign expert-hot-set-lru). The adaptive expert
++// cache: the resident set follows the conversation. A port of Strata's
++// `adapt` (src/program/generate.cpp:4414-4478, `code`), which is the
++// mechanism the reference audit (docs/campaigns/research-reference-audit.md)
++// says arcint never tried. DESIGN Section 3.4's 2026-10-01 amendment permits
++// history-dependent placement for the MoE expert tier, judged at the answer
++// (CLAUDE.md). This policy is deterministic; with non-blocking admission
++// (expert_weight_providers.cpp) WHEN a swap lands depends on reader timing,
++// so which device computes an expert at a given step can vary run to run. This
++// header is OpenVINO-free like census_seed.hpp, so the unit cells exercise
++// the policy without a card.
++//
++// The policy, exactly as Strata runs it:
++//  - each layer keeps one DECAYED usage count per expert;
++//  - every `rounds_between` calls (Strata adapt_every = 4) one swap batch is
++//    planned across ALL layers (one pool, ranked globally);
++//  - candidates are non-resident experts with usage >= candidate_min (2.0);
++//    victims are resident experts, paired candidate i against victim i sorted
++//    by usage (candidates desc, victims asc), and a pair swaps only when
++//    cand.usage >= vict.usage + margin (1.5) -- the margin is Strata's
++//    hysteresis against thrash;
++//  - the batch is ordered by gain desc and capped at max_swaps (96);
++//  - after the batch, every usage is multiplied by decay (0.7).
++//
++// Residency is explicit and two-phase: `evict()` takes the victim out at
++// once (resident = -1, so a stale slot is never read) and `admit()` records
++// the candidate only when its copy has landed. Nothing in this header waits
++// on a copy; the caller drives that with its own events.
++
++struct AdaptiveCacheParams {
++    float decay = 0.7f;           // Strata generate.cpp:4478
++    float margin = 1.5f;          // Strata generate.cpp:4443
++    float candidate_min = 2.0f;   // Strata generate.cpp:4436
++    size_t rounds_between = 4;    // Strata adapt_every
++    size_t max_swaps = 96;        // Strata adapt_swaps
++};
++
++struct AdaptiveSwap {
++    int32_t layer = 0;
++    int32_t in = 0;    // expert admitted when its copy lands
++    int32_t out = 0;   // resident expert evicted at once
++    float gain = 0.0f;
++};
++
++class AdaptiveCacheState {
++public:
++    AdaptiveCacheState(size_t n_layers, size_t n_expert)
++        : _n_expert(n_expert),
++          _usage(n_layers * n_expert, 0.0f),
++          _resident(n_layers * n_expert, kNotResident),
++          _rounds(0) {}
++
++    static constexpr int32_t kNotResident = -1;
++
++    size_t n_expert() const { return _n_expert; }
++    uint64_t rounds() const { return _rounds; }
++
++    float usage(size_t l, size_t e) const { return _usage[l * _n_expert + e]; }
++    int32_t resident(size_t l, size_t e) const { return _resident[l * _n_expert + e]; }
++
++    // One routed occurrence of expert e in layer l.
++    void bump(size_t l, size_t e, float w = 1.0f) { _usage[l * _n_expert + e] += w; }
++
++    // Resident now (its copy has landed), occupying `slot`.
++    void admit(size_t l, size_t e, int32_t slot) { _resident[l * _n_expert + e] = slot; }
++    // Clear the resident set so the caller can refresh it from the live cache
++    // before planning (the pool is the source of truth; this state caches it).
++    void reset_resident() {
++        for (int32_t& r : _resident)
++            r = kNotResident;
++    }
++
++
++    // Evicted at once: the slot is retired before the replacement is copied,
++    // so an evicted slot is never read stale.
++    void evict(size_t l, size_t e) { _resident[l * _n_expert + e] = kNotResident; }
++
++    // A swap batch is due every `rounds_between` completed rounds.
++    bool due(size_t rounds_between) const {
++        return rounds_between > 0 && (_rounds + 1) % rounds_between == 0;
++    }
++
++    // Decay every usage once for the round that just completed.
++    void finish_round(float decay) {
++        for (float& v : _usage)
++            v *= decay;
++        ++_rounds;
++    }
++
++    // The swap batch for the current round: one pool ranked across all layers,
++    // ordered by gain desc, capped at max_swaps. Pure function of the state --
++    // the same request sequence reaches the same state and the same batch.
++    std::vector<AdaptiveSwap> plan(const AdaptiveCacheParams& p) const {
++        std::vector<AdaptiveSwap> swaps;
++        const size_t n_layers = _resident.size() / _n_expert;
++        std::vector<std::pair<float, int32_t>> cand, vict;
++        for (size_t l = 0; l < n_layers; ++l) {
++            cand.clear();
++            vict.clear();
++            const float* u = _usage.data() + l * _n_expert;
++            const int32_t* r = _resident.data() + l * _n_expert;
++            for (int32_t e = 0; e < static_cast<int32_t>(_n_expert); ++e) {
++                if (r[e] == kNotResident) {
++                    if (u[e] >= p.candidate_min)
++                        cand.emplace_back(u[e], e);
++                } else {
++                    vict.emplace_back(u[e], e);
++                }
++            }
++            if (cand.empty() || vict.empty())
++                continue;
++            std::sort(cand.begin(), cand.end(),
++                      [](const std::pair<float, int32_t>& a, const std::pair<float, int32_t>& b) {
++                          if (a.first != b.first)
++                              return a.first > b.first;
++                          return a.second < b.second;  // total order: id tie-break
++                      });
++            const size_t nc = std::min(cand.size(), vict.size());
++            std::partial_sort(vict.begin(), vict.begin() + static_cast<ptrdiff_t>(nc), vict.end(),
++                              [](const std::pair<float, int32_t>& a, const std::pair<float, int32_t>& b) {
++                                  if (a.first != b.first)
++                                      return a.first < b.first;
++                                  return a.second > b.second;  // total order: id tie-break
++                              });
++            for (size_t i = 0; i < nc; ++i) {
++                if (cand[i].first < vict[i].first + p.margin)
++                    break;
++                swaps.push_back(AdaptiveSwap{static_cast<int32_t>(l), cand[i].second, vict[i].second,
++                                             cand[i].first - vict[i].first});
++            }
++        }
++        std::sort(swaps.begin(), swaps.end(), [](const AdaptiveSwap& a, const AdaptiveSwap& b) {
++            if (a.gain != b.gain)
++                return a.gain > b.gain;
++            if (a.layer != b.layer)
++                return a.layer < b.layer;
++            if (a.out != b.out)
++                return a.out < b.out;
++            return a.in < b.in;  // total order
++        });
++        if (swaps.size() > p.max_swaps)
++            swaps.resize(p.max_swaps);
++        return swaps;
++    }
++
++private:
++    size_t _n_expert;
++    std::vector<float> _usage;
++    std::vector<int32_t> _resident;
++    uint64_t _rounds;
++};
++
++}  // namespace ov::intel_gpu::ocl::moe
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+@@ -5,6 +5,8 @@
+ #pragma once
+ 
+ #include <cstddef>
++#include <atomic>
++#include <array>
+ #include <cstdint>
+ #include <filesystem>
+ #include <memory>
+@@ -15,6 +17,7 @@
+ 
+ #include "expert_weight_provider.hpp"
+ #include "intel_gpu/primitives/moe_3gemm_fused_compressed.hpp"
++#include "host_expert_bank.hpp"
+ #include "lru_cache.hpp"
+ #include "moe_otd_runtime.hpp"
+ #include "pinned_nvme_fill.hpp"
+@@ -22,6 +25,11 @@
+ 
+ namespace ov::intel_gpu::ocl::moe {
+ 
++// arcint (patch 0076). For the router lookahead (moe_3gemm_swiglu_opt.cpp): the
++// file spans of `expert` in the offloaded layer `layer_key`, and whether the
++// card holds it filled. False when no such layer is registered.
++bool otd_lookahead_query(uint64_t layer_key, uint32_t expert, BankSpan* spans, int* n, bool* on_card);
++
+ // Identity provider: every expert's weights are already resident in device memory
+ // for the network lifetime. This is the behaviour of the non-offloaded (ratio=0) path.
+ class ResidentExpertWeightProvider : public IExpertWeightProvider {
+@@ -196,6 +204,28 @@
+     // partition. The CPU tier's host bank fills everything else.
+     std::vector<uint32_t> static_partition_members() const;
+ 
++    // arcint (patch 0076, campaign expert-hot-set-lru). Strata's adaptive
++    // expert cache over the static partition (MOE_CPU_TIER_ADAPTIVE=1): decode
++    // calls count each routed expert; every MOE_CPU_TIER_ADAPT_EVERY decode
++    // steps (default 12) one swap batch is planned across all layers
++    // (adaptive_expert_cache.hpp, Strata generate.cpp:4413-4482); each layer
++    // applies its share at the start of its next call by handing a pinned
++    // slot to the newcomer (LRUCache::replace_pinned). No demand loads, no
++    // eviction: the pinned set only changes by these swaps.
++    //
++    // Non-blocking admission (Strata generate.cpp:358/380): queueing a swap
++    // starts a background read of the newcomer's bytes; the victim keeps its
++    // slot and keeps serving until those bytes are ready, and the swap then
++    // enqueues one copy on the compute stream without waiting for it. No new
++    // plan is made while swaps are in flight (Strata's rule).
++    bool adaptive() const { return _adaptive; }
++    std::vector<float>& adaptive_usage() { return _adaptive_usage; }
++    void queue_adaptive_swap(uint32_t out, uint32_t in);
++    // The CPU tier's host bank (moe_3gemm_swiglu_opt.cpp): each applied swap
++    // exchanges the newcomer's bank slot for the demoted expert.
++    void set_host_bank(HostExpertBank* bank) { _host_bank = bank; }
++    bool adaptive_busy() const { return !_adaptive_pending.empty(); }
++
+     // arcint (patch 0048). The collect-time handshake the design note §3.4
+     // requires: an expert whose bytes have landed is marked filled in the
+     // shared cache, so the first-use host upload never runs on the decode
+@@ -325,6 +355,27 @@
+     // arcint nvme-direct-expert-tier (patches/0048). See
+     // set_pinned_nvme_fill() / apply_pinned_nvme_fill_slot().
+     bool _pinned_nvme_fill = false;
++    // arcint (patch 0076). See adaptive() above.
++    bool _adaptive = false;
++    std::vector<float> _adaptive_usage;
++    std::vector<std::pair<uint32_t, uint32_t>> _adaptive_pending;  // (out, in)
++    std::shared_ptr<moe_otd::AdaptivePrep> _adaptive_prep;
++    HostExpertBank* _host_bank = nullptr;
++    // See bind(): (file offset of expert 0, bytes per expert) per span.
++    std::array<std::pair<size_t, size_t>, 9> _span_base{};
++    int _span_count = 0;
++    std::atomic<bool> _spans_ready{false};
++    moe_otd::HostUploadPool _adaptive_upload;
++    void apply_ready_adaptive_swaps(cldnn::stream& stream);
++    void exchange_in_bank(uint32_t out, uint32_t in);
++
++public:
++    // The file spans of `expert` in the CPU tier's order (cpu_expert_spans in
++    // moe_3gemm_swiglu_opt.cpp): gate w, s, [z], up w, s, [z], down w, s, [z].
++    // 0 before bind().
++    int expert_file_spans(uint32_t expert, BankSpan* spans) const;
++
++private:
+     std::mutex _pinned_fill_mutex;
+ 
+     // arcint (patch 0049). One registered VRAM BO per weight tensor. The
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+@@ -6,9 +6,15 @@
+ 
+ // arcint F2 (patch 0018).
+ #include "static_partition.hpp"
++// arcint (patch 0076).
++#include "adaptive_expert_cache.hpp"
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <condition_variable>
++#include <deque>
++#include <functional>
++#include <thread>
+ #include <cstdlib>
+ #include <fstream>
+ #include <iostream>
+@@ -73,6 +79,137 @@
+     return retired;
+ }
+ 
++// arcint (patch 0076, campaign expert-hot-set-lru). The adaptive cache's
++// clock and planner. One clock for the whole model: the adaptive provider
++// with the smallest layer_key counts decode steps (it is called once per
++// step, like every layer). Every `every` steps it plans one swap batch across
++// all adaptive layers with Strata's policy (adaptive_expert_cache.hpp), queues
++// each swap on its layer, and decays every count; while any swap is still in
++// flight it does neither (Strata's rule). Layers apply a swap at the start of
++// a call once its bytes are read. The plain usage vectors are not raced
++// because the whole process runs one network forward at a time (the engine's
++// lane turnstile), not merely one stream per provider; the registry mutex
++// guards the registry walk.
++size_t env_size(const char* name, size_t dflt) {
++    const char* v = std::getenv(name);
++    return (v != nullptr && v[0] != '\0') ? static_cast<size_t>(std::strtoul(v, nullptr, 10)) : dflt;
++}
++
++// arcint (patch 0076). Reader threads for the adaptive cache's newcomers:
++// file reads and the scale/zp transpose, no device objects. Process-wide and
++// deliberately leaked (detached threads parked on the condition variable at
++// exit), so no provider or static destructor has to join them.
++class AdaptiveReadPool {
++public:
++    static AdaptiveReadPool& get() {
++        static auto* pool = new AdaptiveReadPool();
++        return *pool;
++    }
++    void submit(std::function<void()> job) {
++        {
++            std::lock_guard<std::mutex> lock(_mutex);
++            _jobs.push_back(std::move(job));
++        }
++        _cv.notify_one();
++    }
++
++private:
++    AdaptiveReadPool() {
++        const size_t n = std::max<size_t>(1, env_size("MOE_CPU_TIER_ADAPT_READERS", 2));
++        for (size_t i = 0; i < n; ++i)
++            std::thread([this] { run(); }).detach();
++    }
++    void run() {
++        for (;;) {
++            std::function<void()> job;
++            {
++                std::unique_lock<std::mutex> lock(_mutex);
++                _cv.wait(lock, [this] { return !_jobs.empty(); });
++                job = std::move(_jobs.front());
++                _jobs.pop_front();
++            }
++            // A job records its own failure; anything escaping it must not
++            // end the process from a detached thread.
++            try {
++                job();
++            } catch (...) {
++            }
++        }
++    }
++    std::mutex _mutex;
++    std::condition_variable _cv;
++    std::deque<std::function<void()>> _jobs;
++};
++
++void otd_adaptive_tick(OffloadExpertWeightProvider* caller) {
++    static const size_t every = env_size("MOE_CPU_TIER_ADAPT_EVERY", 12);
++    static const size_t max_swaps = env_size("MOE_CPU_TIER_ADAPT_SWAPS", 96);
++    static size_t clock_key = 0;
++    static bool clock_known = false;
++    static uint64_t steps = 0;
++    std::lock_guard<std::mutex> lock(otd_registry_mutex());
++    auto& reg = otd_registry();
++    if (!clock_known) {
++        bool any = false;
++        for (const auto* p : reg) {
++            if (!p->adaptive())
++                continue;
++            if (!any || p->layer_key() < clock_key)
++                clock_key = p->layer_key();
++            any = true;
++        }
++        clock_known = any;
++    }
++    if (!clock_known || caller->layer_key() != clock_key || every == 0)
++        return;
++    if (++steps % every != 0)
++        return;
++
++    std::vector<OffloadExpertWeightProvider*> layers;
++    for (auto* p : reg) {
++        if (p->adaptive() && p->config().num_expert == caller->config().num_expert)
++            layers.push_back(p);
++    }
++    // Strata's adapt returns while the previous swaps are in flight: no plan
++    // and no decay (generate.cpp:4431, `if (!pending.empty()) return true`).
++    for (const auto* p : layers)
++        if (p->adaptive_busy())
++            return;
++    std::sort(layers.begin(), layers.end(), [](const OffloadExpertWeightProvider* a, const OffloadExpertWeightProvider* b) {
++        return a->layer_key() < b->layer_key();
++    });
++    const size_t n_expert = caller->config().num_expert;
++    AdaptiveCacheState state(layers.size(), n_expert);
++    for (size_t l = 0; l < layers.size(); ++l) {
++        const auto& u = layers[l]->adaptive_usage();
++        for (size_t e = 0; e < n_expert && e < u.size(); ++e)
++            if (u[e] != 0.0f)
++                state.bump(l, e, u[e]);
++        for (const auto& [e, s] : layers[l]->cache().pinned_residents())
++            if (e < n_expert)
++                state.admit(l, e, static_cast<int32_t>(s));
++    }
++    AdaptiveCacheParams params;
++    params.max_swaps = max_swaps;
++    const auto swaps = state.plan(params);
++    for (const auto& sw : swaps)
++        layers[static_cast<size_t>(sw.layer)]->queue_adaptive_swap(static_cast<uint32_t>(sw.out),
++                                                                   static_cast<uint32_t>(sw.in));
++    for (auto* p : layers)
++        for (float& v : p->adaptive_usage())
++            v *= params.decay;
++    if (auto* perf = moe_otd::get_perf_counters()) {
++        perf->adaptive_plans.fetch_add(1, std::memory_order_relaxed);
++        perf->adaptive_swaps_planned.fetch_add(swaps.size(), std::memory_order_relaxed);
++    }
++    static bool logged = false;
++    if (!logged) {
++        logged = true;
++        std::cerr << "[MOE_ADAPT] adaptive expert cache on: layers=" << layers.size() << " every=" << every
++                  << " decode steps, max_swaps=" << max_swaps << " (Strata adapt)" << std::endl;
++    }
++}
++
+ void otd_unregister_provider(OffloadExpertWeightProvider* provider) {
+     std::lock_guard<std::mutex> lock(otd_registry_mutex());
+     auto& reg = otd_registry();
+@@ -371,7 +508,13 @@
+       // above; an empty value counts as unset. When off, every branch this
+       // patch adds is inert and the provider's code path is unchanged.
+       _pinned_nvme_fill(std::getenv("MOE_OTD_PINNED_NVME_FILL") != nullptr &&
+-                        std::getenv("MOE_OTD_PINNED_NVME_FILL")[0] != '\0') {
++                        std::getenv("MOE_OTD_PINNED_NVME_FILL")[0] != '\0'),
++      // arcint (patch 0076). Opt-in, read per provider like the switches above.
++      _adaptive(std::getenv("MOE_CPU_TIER_ADAPTIVE") != nullptr &&
++                std::getenv("MOE_CPU_TIER_ADAPTIVE")[0] != '\0' &&
++                std::getenv("MOE_CPU_TIER_ADAPTIVE")[0] != '0') {
++    if (_adaptive)
++        _adaptive_usage.assign(config.num_expert, 0.0f);
+     // Registration is unconditional and cheap (an id already assigned above,
+     // one vector push under a mutex) regardless of _routing_hist_enabled:
+     // otd_dump_routing_hist() reads MOE_OTD_ROUTING_HIST fresh at exit, so a
+@@ -406,6 +549,26 @@
+     _cache->set_initialized();
+     _bound = true;
+ 
++    // arcint (patch 0076). The per-expert file spans as plain integers, so the
++    // router lookahead's thread never touches the bound device objects (a
++    // later rebind of a tensor, e.g. the pinned NVMe pool, or teardown would
++    // race a shared_ptr copy). Order: the CPU tier's (gate, up, down; w, s, z).
++    {
++        const cldnn::memory_ptr t[9] = {resident.gate_w, resident.up_w, resident.down_w,
++                                        resident.gate_s, resident.up_s, resident.down_s,
++                                        resident.gate_z, resident.up_z, resident.down_z};
++        int n = 0;
++        for (size_t m = 0; m < 3; ++m) {
++            for (size_t k = 0; k < (_config.has_zp ? 3u : 2u); ++k) {
++                const size_t pos = m + 3 * k;
++                const auto e0 = moe_otd::expert_tensor_span(_config, _weight_bin_offsets, t[pos], pos, 0);
++                _span_base[n++] = {e0.file_offset, e0.bytes};
++            }
++        }
++        _span_count = n;
++        _spans_ready.store(true, std::memory_order_release);
++    }
++
+     // arcint F2 (patch 0018). One-time reservation of the static partition's
+     // resident set, pinned in the shared LRU pool so prefill's ordinary
+     // (non-tier) acquisitions can never evict them (DESIGN Section 7.0.2ae).
+@@ -696,6 +859,21 @@
+     const bool cpu_tier_wants = _cpu_tier && cpu_tier_misses != nullptr;
+     const bool static_partition_active = cpu_tier_wants && _static_partition;
+     const bool cpu_tier_active = cpu_tier_wants && !_static_partition;
++
++    // arcint (patch 0076). The adaptive cache over the static partition: apply
++    // this layer's queued swaps before anything is probed (a swapped-in expert
++    // then resolves to its pinned slot unfilled, and the first-use fill below
++    // is uploaded with it), then count a decode call's routing and let the
++    // clock layer plan the next batch.
++    if (static_partition_active && _adaptive) {
++        apply_ready_adaptive_swaps(stream);
++        if (experts.size() <= static_cast<size_t>(_config.top_k)) {
++            for (const uint32_t e : experts)
++                if (e < _adaptive_usage.size())
++                    _adaptive_usage[e] += 1.0f;
++            otd_adaptive_tick(this);
++        }
++    }
+     std::unordered_map<uint32_t, size_t> cpu_miss_index;  // expert -> index in *cpu_tier_misses
+     size_t slot_taking_experts = 0;
+ 
+@@ -724,6 +902,11 @@
+             auto probed = _cache->probe(expert);
+             const size_t slot = probed.first;
+             const bool filled = probed.second;
++            if (perf && experts.size() <= static_cast<size_t>(_config.top_k)) {
++                perf->decode_lookups.fetch_add(1, std::memory_order_relaxed);
++                if (slot != LRUCache::kProbeMiss && filled)
++                    perf->decode_hits.fetch_add(1, std::memory_order_relaxed);
++            }
+             if (slot != LRUCache::kProbeMiss) {
+                 if (filled) {
+                     if (perf)
+@@ -917,6 +1100,113 @@
+     return slots;
+ }
+ 
++void OffloadExpertWeightProvider::queue_adaptive_swap(uint32_t out, uint32_t in) {
++    // The spans and layouts are taken here, on the compute thread; the reader
++    // gets plain numbers and a path.
++    auto plans = _resident != nullptr ? moe_otd::plan_expert_tensors(_config, _weight_bin_offsets, *_resident, in)
++                                      : std::vector<moe_otd::ExpertTensorPlan>{};
++    if (plans.empty()) {
++        // Nothing to copy would leave the newcomer on the victim's bytes.
++        if (auto* perf = moe_otd::get_perf_counters())
++            perf->adaptive_swaps_dropped.fetch_add(1, std::memory_order_relaxed);
++        return;
++    }
++    if (!_adaptive_prep)
++        _adaptive_prep = std::make_shared<moe_otd::AdaptivePrep>();
++    _adaptive_pending.emplace_back(out, in);
++    AdaptiveReadPool::get().submit([prep = _adaptive_prep, config = _config, path = _weight_reader.path(),
++                                    plans = std::move(plans), in] {
++        std::vector<moe_otd::PreparedTensor> tensors;
++        try {
++            tensors = moe_otd::read_expert_tensors(config, path, plans);
++        } catch (...) {
++            tensors.clear();
++        }
++        std::lock_guard<std::mutex> lock(prep->mutex);
++        if (tensors.size() == plans.size())
++            prep->ready[in] = std::move(tensors);
++        else
++            prep->failed.insert(in);
++    });
++}
++
++int OffloadExpertWeightProvider::expert_file_spans(uint32_t expert, BankSpan* spans) const {
++    if (!_spans_ready.load(std::memory_order_acquire))
++        return 0;
++    // expert_tensor_span's arithmetic: tensor base + expert * per-expert bytes.
++    for (int i = 0; i < _span_count; ++i)
++        spans[i] = BankSpan{static_cast<uint64_t>(_span_base[i].first + static_cast<size_t>(expert) * _span_base[i].second),
++                            _span_base[i].second};
++    return _span_count;
++}
++
++bool otd_lookahead_query(uint64_t layer_key, uint32_t expert, BankSpan* spans, int* n, bool* on_card) {
++    std::lock_guard<std::mutex> lock(otd_registry_mutex());
++    for (auto* p : otd_registry()) {
++        if (static_cast<uint64_t>(p->layer_key()) != layer_key)
++            continue;
++        *n = p->expert_file_spans(expert, spans);
++        *on_card = p->cache().contains_filled(expert);
++        return *n > 0;
++    }
++    return false;
++}
++
++void OffloadExpertWeightProvider::exchange_in_bank(uint32_t out, uint32_t in) {
++    // A span mismatch only makes the bank answer Unbanked for `out` later.
++    BankSpan sp[HostExpertBank::kMaxSpans];
++    const int n = expert_file_spans(out, sp);
++    const bool ok = n > 0 && _host_bank->exchange(static_cast<uint64_t>(layer_key()), in, out, sp, n);
++    if (auto* perf = moe_otd::get_perf_counters())
++        (ok ? perf->adaptive_bank_exchanges : perf->adaptive_bank_exchange_misses).fetch_add(1, std::memory_order_relaxed);
++}
++
++void OffloadExpertWeightProvider::apply_ready_adaptive_swaps(cldnn::stream& stream) {
++    if (_adaptive_pending.empty() || !_adaptive_prep || _resident == nullptr)
++        return;
++    auto* perf = moe_otd::get_perf_counters();
++    std::vector<std::pair<uint32_t, uint32_t>> waiting;
++    std::lock_guard<std::mutex> lock(_adaptive_prep->mutex);
++    for (const auto& [out, in] : _adaptive_pending) {
++        auto it = _adaptive_prep->ready.find(in);
++        if (it == _adaptive_prep->ready.end()) {
++            if (_adaptive_prep->failed.erase(in) != 0) {
++                if (perf)
++                    perf->adaptive_swaps_dropped.fetch_add(1, std::memory_order_relaxed);
++            } else {
++                waiting.emplace_back(out, in);  // still reading: the victim keeps serving
++            }
++            continue;
++        }
++        auto tensors = std::move(it->second);
++        _adaptive_prep->ready.erase(it);
++        const auto slot = _cache->replace_pinned(out, in);
++        if (!slot) {
++            if (perf)
++                perf->adaptive_swaps_dropped.fetch_add(1, std::memory_order_relaxed);
++            continue;
++        }
++        // In-order queue: the copy runs after every kernel already enqueued
++        // (the victim's last readers) and before every later one. Without
++        // program order the queue is drained on both sides of the copy.
++        const bool in_order = stream.get_queue_type() == cldnn::QueueTypes::in_order;
++        if (!in_order)
++            stream.finish();
++        const bool copied = moe_otd::enqueue_expert_tensors(stream, *_resident, tensors, *slot, _adaptive_upload);
++        if (!in_order)
++            stream.finish();
++        // A swap that copied nothing leaves the slot unfilled: the first-use
++        // fill uploads the newcomer then.
++        if (copied)
++            _cache->set_filled(*slot);
++        if (_host_bank)
++            exchange_in_bank(out, in);
++        if (perf)
++            perf->adaptive_swaps_applied.fetch_add(1, std::memory_order_relaxed);
++    }
++    _adaptive_pending.swap(waiting);
++}
++
+ std::optional<size_t> OffloadExpertWeightProvider::acquire_one(uint32_t expert, cldnn::stream& stream) {
+     auto* perf = moe_otd::get_perf_counters();
+ 
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/host_expert_bank.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/host_expert_bank.hpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/host_expert_bank.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/host_expert_bank.hpp
+@@ -31,10 +31,12 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <cerrno>
+ #include <condition_variable>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <deque>
+ #include <functional>
+@@ -87,6 +89,7 @@
+         uint64_t fill_bytes_read = 0;  // bytes the layer fills read
+         uint64_t fill_layers = 0;
+         uint64_t callback_errors = 0;
++        uint64_t exchanges = 0;  // patch 0076: slots re-keyed from a promoted expert to the demoted one
+         size_t slots = 0;
+         size_t reserved_bytes = 0;
+     };
+@@ -105,9 +108,47 @@
+         }
+         _base = static_cast<uint8_t*>(m);
+         ::madvise(_base, _budget, MADV_HUGEPAGE);
+-        for (int i = 0; i < std::max(1, io_threads); i++)
+-            _io.emplace_back([this] { io_loop(); });
+-        _fill_thread = std::thread([this] { fill_loop(); });
++        _chunks.push_back({_base, _budget});
++        start_threads(io_threads);
++    }
++
++    // arcint (patch 0076, campaign expert-hot-set-lru). The same bank over
++    // caller-owned chunks -- the plugin passes usm_host allocations, so every
++    // slot is pinned memory the device can copy from by DMA (Strata pins its
++    // arena the same way, slice by slice when the whole range is refused:
++    // src/core/pinned.cu:306-340). A slot never straddles two chunks. The
++    // chunks outlive the bank; it does not free them.
++    struct Chunk {
++        uint8_t* base;
++        size_t bytes;
++    };
++    HostExpertBank(const std::string& path, std::vector<Chunk> chunks, int io_threads)
++        : _chunks(std::move(chunks)),
++          _external(true) {
++        _fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
++        if (_fd < 0)
++            throw std::runtime_error("MOE_CPU_BANK: cannot open " + path + " with O_DIRECT: " + std::strerror(errno));
++        for (const auto& c : _chunks)
++            _budget += c.bytes;
++        start_threads(io_threads);
++    }
++
++    // arcint (patch 0076). Strata's RAM budget (DETAILS.md, engine 0.1.31):
++    // the bank holds a fixed set -- the load-time fill, changed only by
++    // exchange() -- and a miss reads the mapping (the OS page cache, warmed by
++    // the router lookahead) instead of taking a slot from that set.
++    void set_fixed(bool fixed) {
++        _fixed = fixed;
++    }
++    // Whether (layer_key, expert) has a slot (Ready or being read).
++    bool holds(uint64_t layer_key, uint32_t expert) const {
++        std::lock_guard<std::mutex> lock(_m);
++        return _index.count(Key{layer_key, expert}) != 0;
++    }
++
++    // True when the slots live in caller-owned (pinned) chunks.
++    bool external() const {
++        return _external;
+     }
+ 
+     ~HostExpertBank() {
+@@ -124,7 +165,8 @@
+         _io_cv.notify_all();
+         for (auto& t : _io)
+             t.join();
+-        ::munmap(_base, _budget);
++        if (!_external)
++            ::munmap(_base, _budget);
+         ::close(_fd);
+     }
+ 
+@@ -167,7 +209,7 @@
+             return fill_lease(lease, it->second, spans, n, State::Ready);
+         }
+         uint32_t idx = 0;
+-        if (!take_slot(cls, idx))
++        if (_fixed || !take_slot(cls, idx))
+             return count_unbanked(lease);
+         Slot& s = _slots[idx];
+         s.key = key;
+@@ -203,6 +245,45 @@
+         _io_cv.notify_all();
+     }
+ 
++    // arcint (patch 0076, campaign expert-hot-set-lru). The adaptive cache's
++    // exchange: `in` has just moved onto the card and `out` off it, so `in`'s
++    // slot (when Ready and unused) is re-keyed to `out` and `out`'s bytes are
++    // read into it in the background. The bank then holds again what the
++    // card does not, as Strata's RAM copy does (expert_source.hpp:440-455);
++    // Strata copies `out` back from its GPU slot, this reads it from the file
++    // (the slot's scales are in device layout). A use of `out` before the
++    // read lands reads the mapping (the slot is Reading). False when there is
++    // nothing to exchange.
++    bool exchange(uint64_t layer_key, uint32_t in, uint32_t out, const BankSpan* out_spans, int n) {
++        if (n <= 0 || n > kMaxSpans)
++            return false;
++        uint32_t idx = 0;
++        {
++            std::lock_guard<std::mutex> lock(_m);
++            auto it = _index.find(Key{layer_key, in});
++            if (it == _index.end() || _index.count(Key{layer_key, out}))
++                return false;
++            idx = it->second;
++            Slot& s = _slots[idx];
++            const size_t rec = record_bytes(out_spans, n);
++            if (s.state != SlotState::Ready || s.pins > 0 || rec > s.cls)
++                return false;
++            _index.erase(it);
++            s.key = Key{layer_key, out};
++            s.state = SlotState::Reading;
++            s.n = n;
++            s.record = rec;
++            for (int i = 0; i < n; i++)
++                s.spans[i] = out_spans[i];
++            s.pins = 1;
++            _index[s.key] = idx;
++            touch(idx);
++            _stats.exchanges++;
++        }
++        fetch(idx, [this, idx](bool) { release(idx); });
++        return true;
++    }
++
+     // Queues a load-time fill of one layer, run on the bank's fill thread:
+     // `experts` in order (the caller's priority), expert e's span r at
+     // role0[r].file_offset + e * role0[r].bytes (the tier's per-tensor
+@@ -323,16 +404,27 @@
+     // A fresh slot of class `cls` from the unreserved budget, or none.
+     // Called under _m.
+     bool new_slot(size_t cls, uint32_t& idx) {
+-        if (_used + cls > _budget)
++        while (_chunk < _chunks.size() && _chunk_used + cls > _chunks[_chunk].bytes) {
++            ++_chunk;  // the tail of a chunk too short for this class stays unused
++            _chunk_used = 0;
++        }
++        if (_chunk >= _chunks.size())
+             return false;
+         _slots.emplace_back();
+         idx = static_cast<uint32_t>(_slots.size() - 1);
+-        _slots[idx].mem = _base + _used;
++        _slots[idx].mem = _chunks[_chunk].base + _chunk_used;
+         _slots[idx].cls = cls;
++        _chunk_used += cls;
+         _used += cls;
+         return true;
+     }
+ 
++    void start_threads(int io_threads) {
++        for (int i = 0; i < std::max(1, io_threads); i++)
++            _io.emplace_back([this] { io_loop(); });
++        _fill_thread = std::thread([this] { fill_loop(); });
++    }
++
+     void touch_back(uint32_t idx) {
+         Slot& s = _slots[idx];
+         if (s.in_lru)
+@@ -518,8 +610,25 @@
+             const size_t need = static_cast<size_t>(sp.file_offset + sp.bytes - b);
+             size_t got = 0;
+             bool ok = true;
+-            while (got < len) {
+-                const ssize_t r = ::pread(_fd, s.mem + off + got, len - got, static_cast<off_t>(b + got));
++            // arcint (patch 0076). O_DIRECT cannot target the driver's
++            // usm_host mapping (every read failed: read_errors = misses), so
++            // an external (pinned) bank reads into this thread's anonymous
++            // bounce buffer and copies into the slot.
++            uint8_t* dst = s.mem + off;
++            if (_external) {
++                thread_local std::unique_ptr<uint8_t, void (*)(void*)> bounce{nullptr, std::free};
++                thread_local size_t bounce_len = 0;
++                if (bounce_len < len) {
++                    void* p = nullptr;
++                    if (::posix_memalign(&p, kAlign, len) != 0)
++                        p = nullptr;
++                    bounce.reset(static_cast<uint8_t*>(p));
++                    bounce_len = p ? len : 0;
++                }
++                dst = bounce.get();
++            }
++            while (dst != nullptr && got < len) {
++                const ssize_t r = ::pread(_fd, dst + got, len - got, static_cast<off_t>(b + got));
+                 if (r < 0 && errno == EINTR)
+                     continue;
+                 if (r <= 0)
+@@ -530,6 +639,8 @@
+             }
+             if (got < need)
+                 ok = false;
++            if (ok && _external)
++                std::memcpy(s.mem + off, dst, got);
+             if (!ok)
+                 s.failed.store(true, std::memory_order_relaxed);
+             _bytes_read.fetch_add(got, std::memory_order_relaxed);
+@@ -576,6 +687,11 @@
+     uint8_t* _base = nullptr;
+     size_t _budget = 0;
+     size_t _used = 0;
++    std::vector<Chunk> _chunks;
++    bool _external = false;
++    bool _fixed = false;
++    size_t _chunk = 0;
++    size_t _chunk_used = 0;
+ 
+     mutable std::mutex _m;
+     // std::deque keeps element addresses stable while slots are added, so an
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.hpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.hpp
+@@ -6,6 +6,7 @@
+ #include <limits>
+ #include <list>
+ #include <mutex>
++#include <optional>
+ #include <unordered_map>
+ #include <utility>
+ #include <vector>
+@@ -74,6 +75,24 @@
+         return slot < m_pinned.size() && m_pinned[slot];
+     }
+ 
++    // arcint (patch 0076, campaign expert-hot-set-lru). Strata's adaptive swap
++    // under the static partition: the pinned slot of `old_expert` is handed to
++    // `new_expert` and marked unfilled, and it stays pinned. The existing
++    // first-use fill (try_acquire_simultaneous) then uploads the newcomer on
++    // the compute stream, after every kernel already enqueued there, so the
++    // old bytes are never read after they are replaced and the new ones are
++    // never read before they land. Returns the slot, or nothing (and changes
++    // nothing) when `old_expert` is absent or not pinned, or `new_expert` is
++    // present.
++    std::optional<size_t> replace_pinned(size_t old_expert, size_t new_expert);
++
++    // arcint (patch 0076). Whether `expert` holds a filled slot, without
++    // touching the LRU order (the router lookahead's thread asks).
++    bool contains_filled(size_t expert) const;
++
++    // arcint (patch 0076). The pinned (expert, slot) pairs, in list order.
++    std::vector<std::pair<size_t, size_t>> pinned_residents() const;
++
+ private:
+     bool m_initialized = false;
+     struct Key {
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/lru_cache.cpp
+@@ -134,4 +134,36 @@
+     return {it->second->lru_expert_no, is_hit};
+ }
+ 
++std::optional<size_t> LRUCache::replace_pinned(size_t old_expert, size_t new_expert) {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    auto it = m_map.find(Key{old_expert});
++    if (it == m_map.end() || m_map.find(Key{new_expert}) != m_map.end())
++        return std::nullopt;
++    const size_t slot = it->second->lru_expert_no;
++    if (slot >= m_pinned.size() || !m_pinned[slot])
++        return std::nullopt;
++    auto node = it->second;
++    m_map.erase(it);
++    node->expert = new_expert;
++    m_map[Key{new_expert}] = node;
++    m_filled_list[slot] = false;
++    return slot;
++}
++
++bool LRUCache::contains_filled(size_t expert) const {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    auto it = m_map.find(Key{expert});
++    return it != m_map.end() && m_filled_list[it->second->lru_expert_no];
++}
++
++std::vector<std::pair<size_t, size_t>> LRUCache::pinned_residents() const {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    std::vector<std::pair<size_t, size_t>> r;
++    for (const auto& n : m_list) {
++        if (n.lru_expert_no < m_pinned.size() && m_pinned[n.lru_expert_no])
++            r.emplace_back(n.expert, n.lru_expert_no);
++    }
++    return r;
++}
++
+ }  // namespace ov::intel_gpu::ocl::moe
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -13,6 +13,13 @@
+ #include <filesystem>
+ #include <mutex>
+ #include <condition_variable>
++#include <algorithm>
++#include <thread>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include "openvino/core/type/float16.hpp"
+ 
+ // clang-format off
+ #include "moe_3gemm_gen_micro.hpp"
+@@ -45,6 +52,7 @@
+ using ov::intel_gpu::ocl::moe::GateAct;
+ using ov::intel_gpu::ocl::moe::IExpertWeightProvider;
+ using ov::intel_gpu::ocl::moe::OffloadExpertWeightProvider;
++using ov::intel_gpu::ocl::moe::otd_lookahead_query;
+ using ov::intel_gpu::ocl::moe::QuantMatrix;
+ using ov::intel_gpu::ocl::moe::ResidentExpertWeightProvider;
+ using ov::intel_gpu::ocl::moe::static_partition_checksum;
+@@ -146,7 +154,220 @@
+ // concurrently (default 8). A bank that cannot be created (the filesystem
+ // refuses O_DIRECT) is logged once and that file stays on the mapping. Each
+ // bank prints its counters at exit.
+-HostExpertBank* cpu_tier_bank(const std::string& weights_path) {
++//
++// arcint (patch 0076). MOE_CPU_BANK_PINNED=1 builds the bank from usm_host
++// chunks of MOE_CPU_BANK_CHUNK_MIB (default 1024) instead of an anonymous
++// mapping: pinned pages, committed at creation, that the device can copy from
++// by DMA (the adaptive cache's swaps and the miss share). A chunk the driver
++// refuses ends the bank there (it runs smaller, and says so). The chunks are
++// leaked on purpose: they must outlive every bank user, and process exit
++// reclaims them.
++// arcint (patch 0076, campaign expert-hot-set-lru). Strata's routing-aware
++// prefetch of the file tier (src/program/generate.cpp:3001-3030,
++// src/core/expert_source.cpp:814-930): while the CPU tier works on layer L, a
++// thread applies layer L+1's router to layer L's MoE input, takes each
++// token's top-k, and asks the kernel (MADV_WILLNEED) for the pages of the
++// predicted experts that neither the card nor the host bank holds. It only
++// warms pages; the experts computed are the same. MOE_CPU_TIER_LOOKAHEAD=<file>
++// (tools/export_router_lookahead.py: the routers keyed by layer_key) turns it
++// on; MOE_CPU_TIER_LOOKAHEAD_K the experts per token (default 10). A submit
++// while the thread is busy is skipped, as Strata's is.
++class RouterLookahead {
++public:
++    // The first caller's weights file and shape bind the lookahead; a router
++    // file of another shape turns it off (its rows would misread x).
++    static RouterLookahead* get(const std::string& weights_path, uint32_t n_embd, uint32_t n_expert) {
++        static RouterLookahead* inst = [&]() -> RouterLookahead* {
++            const char* f = std::getenv("MOE_CPU_TIER_LOOKAHEAD");
++            if (f == nullptr || f[0] == '\0')
++                return nullptr;
++            auto* la = new RouterLookahead();  // leaked: its thread may outlive static destruction
++            std::string why;
++            bool ok = false;
++            try {
++                ok = la->load(f, weights_path, why);
++            } catch (const std::exception& e) {
++                why = e.what();
++            }
++            if (ok && (la->_n_embd != n_embd || la->_n_expert != n_expert)) {
++                why = "router file is " + std::to_string(la->_n_expert) + "x" + std::to_string(la->_n_embd) +
++                      ", the model " + std::to_string(n_expert) + "x" + std::to_string(n_embd);
++                ok = false;
++            }
++            if (!ok) {
++                std::cerr << "[MOE_LOOKAHEAD] off: " << why << std::endl;
++                return nullptr;
++            }
++            la->_thread = std::thread([la] { la->run(); });
++            la->_thread.detach();
++            std::cerr << "[MOE_LOOKAHEAD] on: " << la->_keys.size() << " routers " << la->_n_expert << "x" << la->_n_embd
++                      << ", k=" << la->_k << std::endl;
++            return la;
++        }();
++        return inst;
++    }
++
++    // x: n_tok f16 rows of `n_embd` (the tier's host copy of the MoE input).
++    void submit(uint64_t layer_key, const uint16_t* x, size_t n_tok, HostExpertBank* bank) {
++        auto* perf = moe_otd::get_perf_counters();
++        const auto it = std::upper_bound(_keys.begin(), _keys.end(), layer_key);
++        if (n_tok == 0 || n_tok > 8 || it == _keys.end() ||
++            std::find(_keys.begin(), _keys.end(), layer_key) == _keys.end())
++            return;
++        {
++            std::lock_guard<std::mutex> lock(_m);
++            if (_pending || _busy) {
++                if (perf)
++                    perf->lookahead_skipped.fetch_add(1, std::memory_order_relaxed);
++                return;
++            }
++            for (size_t i = 0; i < n_tok * _n_embd; ++i)
++                _x[i] = static_cast<float>(ov::float16::from_bits(x[i]));
++            _n_tok = n_tok;
++            _next = *it;
++            _bank = bank;
++            _pending = true;
++        }
++        _cv.notify_one();
++    }
++
++private:
++    bool load(const std::string& path, const std::string& weights_path, std::string& why) {
++        std::ifstream f(path, std::ios::binary);
++        char magic[8] = {};
++        uint32_t hdr[4] = {};
++        if (!f.read(magic, 8) || std::memcmp(magic, "ARCRLA01", 8) != 0 || !f.read(reinterpret_cast<char*>(hdr), 16)) {
++            why = path + " is not an ARCRLA01 router file";
++            return false;
++        }
++        _n_expert = hdr[1];
++        _n_embd = hdr[2];
++        if (hdr[0] == 0 || hdr[0] > 4096 || _n_expert == 0 || _n_expert > 65536 || _n_embd == 0 || _n_embd > 65536) {
++            why = path + ": implausible header";
++            return false;
++        }
++        const size_t per = static_cast<size_t>(_n_expert) * _n_embd;
++        _w.resize(static_cast<size_t>(hdr[0]) * per);
++        for (uint32_t l = 0; l < hdr[0]; ++l) {
++            uint64_t key = 0;
++            if (!f.read(reinterpret_cast<char*>(&key), 8) ||
++                !f.read(reinterpret_cast<char*>(_w.data() + l * per), static_cast<std::streamsize>(per * sizeof(float)))) {
++                why = path + " is truncated";
++                return false;
++            }
++            _row_of[key] = l;
++            _keys.push_back(key);
++        }
++        std::sort(_keys.begin(), _keys.end());
++        if (const char* k = std::getenv("MOE_CPU_TIER_LOOKAHEAD_K"))
++            _k = std::atoi(k);
++        _k = std::max(1, std::min(static_cast<int>(_n_expert), _k));
++        _x.assign(8 * static_cast<size_t>(_n_embd), 0.0f);
++        _fd = ::open(weights_path.c_str(), O_RDONLY | O_CLOEXEC);
++        struct stat st {};
++        if (_fd < 0 || ::fstat(_fd, &st) != 0) {
++            why = "cannot open " + weights_path;
++            return false;
++        }
++        _size = static_cast<size_t>(st.st_size);
++        void* m = ::mmap(nullptr, _size, PROT_READ, MAP_SHARED, _fd, 0);
++        if (m == MAP_FAILED) {
++            why = "cannot map " + weights_path;
++            return false;
++        }
++        _base = static_cast<const uint8_t*>(m);
++        return true;
++    }
++
++    void run() {
++        std::vector<float> logits(static_cast<size_t>(_n_expert));
++        std::vector<int32_t> order(static_cast<size_t>(_n_expert));
++        std::vector<uint32_t> want;
++        for (;;) {
++            uint64_t next = 0;
++            size_t nt = 0;
++            HostExpertBank* bank = nullptr;
++            {
++                std::unique_lock<std::mutex> lock(_m);
++                _cv.wait(lock, [this] { return _pending; });
++                _pending = false;
++                _busy = true;
++                next = _next;
++                nt = _n_tok;
++                bank = _bank;
++            }
++            const auto t0 = std::chrono::steady_clock::now();
++            want.clear();
++            const float* w = _w.data() + _row_of[next] * static_cast<size_t>(_n_expert) * _n_embd;
++            for (size_t t = 0; t < nt; ++t) {
++                const float* x = _x.data() + t * _n_embd;
++                for (uint32_t e = 0; e < _n_expert; ++e) {
++                    const float* r = w + static_cast<size_t>(e) * _n_embd;
++                    float acc = 0.0f;
++                    for (uint32_t i = 0; i < _n_embd; ++i)
++                        acc += r[i] * x[i];
++                    logits[e] = acc;
++                }
++                std::iota(order.begin(), order.end(), 0);
++                std::partial_sort(order.begin(), order.begin() + _k, order.end(),
++                                  [&](int32_t a, int32_t b) { return logits[a] > logits[b]; });
++                for (int j = 0; j < _k; ++j) {
++                    const uint32_t e = static_cast<uint32_t>(order[j]);
++                    if (std::find(want.begin(), want.end(), e) == want.end())
++                        want.push_back(e);
++                }
++            }
++            uint64_t warmed = 0;
++            for (const uint32_t e : want) {
++                BankSpan sp[HostExpertBank::kMaxSpans];
++                int n = 0;
++                bool on_card = false;
++                if (!otd_lookahead_query(next, e, sp, &n, &on_card) || on_card)
++                    continue;
++                if (bank != nullptr && bank->holds(next, e))
++                    continue;
++                for (int i = 0; i < n; ++i) {
++                    if (sp[i].bytes == 0 || sp[i].file_offset + sp[i].bytes > _size)
++                        continue;
++                    const uintptr_t a = reinterpret_cast<uintptr_t>(_base + sp[i].file_offset) & ~uintptr_t{4095};
++                    const uintptr_t end = reinterpret_cast<uintptr_t>(_base + sp[i].file_offset + sp[i].bytes);
++                    (void)::madvise(reinterpret_cast<void*>(a), end - a, MADV_WILLNEED);
++                }
++                ++warmed;
++            }
++            if (auto* perf = moe_otd::get_perf_counters()) {
++                perf->lookahead_runs.fetch_add(1, std::memory_order_relaxed);
++                perf->lookahead_warmed.fetch_add(warmed, std::memory_order_relaxed);
++                perf->lookahead_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                                 std::chrono::steady_clock::now() - t0).count()),
++                                             std::memory_order_relaxed);
++            }
++            {
++                std::lock_guard<std::mutex> lock(_m);
++                _busy = false;
++            }
++        }
++    }
++
++    std::vector<float> _w;
++    std::map<uint64_t, size_t> _row_of;
++    std::vector<uint64_t> _keys;
++    uint32_t _n_expert = 0, _n_embd = 0;
++    int _k = 10;
++    int _fd = -1;
++    size_t _size = 0;
++    const uint8_t* _base = nullptr;
++    std::thread _thread;
++    std::mutex _m;
++    std::condition_variable _cv;
++    bool _pending = false, _busy = false;
++    std::vector<float> _x;
++    size_t _n_tok = 0;
++    uint64_t _next = 0;
++    HostExpertBank* _bank = nullptr;
++};
++
++HostExpertBank* cpu_tier_bank(const std::string& weights_path, cldnn::engine* engine) {
+     static const size_t budget = [] {
+         const char* v = std::getenv("MOE_CPU_BANK_BYTES");
+         return v ? static_cast<size_t>(std::strtoull(v, nullptr, 10)) : size_t{0};
+@@ -166,6 +387,7 @@
+                           << " unbanked=" << st.unbanked << " evictions=" << st.evictions
+                           << " read_MiB=" << (st.bytes_read >> 20) << " read_errors=" << st.read_errors
+                           << " callback_errors=" << st.callback_errors
++                          << " exchanges=" << st.exchanges
+                           << " slots=" << st.slots << " reserved_MiB=" << (st.reserved_bytes >> 20) << std::endl;
+             }
+         }
+@@ -181,16 +403,55 @@
+     if (!bank) {
+         const char* t = std::getenv("MOE_CPU_BANK_IO_THREADS");
+         const int threads = t ? std::max(1, std::atoi(t)) : 8;
++        static const bool pinned = [] {
++            const char* v = std::getenv("MOE_CPU_BANK_PINNED");
++            return v != nullptr && v[0] != '\0' && std::string(v) != "0";
++        }();
+         try {
+-            bank = std::make_unique<HostExpertBank>(path, budget, threads);
++            if (pinned && engine != nullptr) {
++                const char* c = std::getenv("MOE_CPU_BANK_CHUNK_MIB");
++                const size_t chunk = (c ? std::max<size_t>(64, std::strtoull(c, nullptr, 10)) : size_t{1024}) << 20;
++                static auto* keep = new std::vector<cldnn::memory::ptr>();
++                std::vector<HostExpertBank::Chunk> chunks;
++                size_t got = 0;
++                std::string refused;
++                while (got < budget) {
++                    const size_t n = std::min(chunk, budget - got);
++                    try {
++                        const cldnn::layout l({1, 1, 1, static_cast<ov::Dimension::value_type>(n)}, cldnn::data_types::u8,
++                                              cldnn::format::bfyx);
++                        auto mem = engine->allocate_memory(l, cldnn::allocation_type::usm_host, false);
++                        chunks.push_back({static_cast<uint8_t*>(mem->buffer_ptr()), n});
++                        keep->push_back(std::move(mem));
++                        got += n;
++                    } catch (const std::exception& e) {
++                        refused = e.what();
++                        break;
++                    }
++                }
++                if (chunks.empty())
++                    throw std::runtime_error("no usm_host chunk could be allocated: " + refused);
++                bank = std::make_unique<HostExpertBank>(path, std::move(chunks), threads);
++                std::cerr << "[MOE_BANK] pinned usm_host chunks: " << (got >> 20) << " MiB of " << (budget >> 20)
++                          << " MiB requested, chunk_MiB=" << (chunk >> 20)
++                          << (refused.empty() ? std::string() : " (refused after that: " + refused.substr(0, 160) + ")")
++                          << std::endl;
++            } else {
++                bank = std::make_unique<HostExpertBank>(path, budget, threads);
++            }
+         } catch (const std::exception& e) {
+             banks.by_path.erase(path);
+             banks.failed[path] = true;
+             std::cerr << "[MOE_BANK] disabled for " << path << ": " << e.what() << std::endl;
+             return nullptr;
+         }
++        static const bool fixed = [] {
++            const char* v = std::getenv("MOE_CPU_BANK_FIXED");
++            return v != nullptr && v[0] != '\0' && std::string(v) != "0";
++        }();
++        bank->set_fixed(fixed);
+         std::cerr << "[MOE_BANK] " << path << " budget_MiB=" << (budget >> 20) << " io_threads=" << threads
+-                  << std::endl;
++                  << (fixed ? " fixed (misses read the mapping)" : "") << std::endl;
+     }
+     return bank.get();
+ }
+@@ -1069,6 +1330,9 @@
+     // Cleared and repopulated once per on_before_batched_gemv call; read by
+     // dispatch_cpu_tier() and cpu_tier_join() within the same exec_batched_gemv.
+     std::vector<CpuTierMiss> _cpu_tier_misses;
++    // arcint (patch 0076). Experts of the current tier call whose bank bytes
++    // were still being read at dispatch (decode join attribution).
++    size_t _cpu_dispatch_pending = 0;
+     // f16 bit patterns read back from device memory: the token(s)' hidden
+     // states and the compact routing-weight buffer (§4.1 of the binding
+     // spec). arcint M14 (patches/0017, §A1): usm_host (GTT) engine memory
+@@ -1571,7 +1835,8 @@
+         auto* otd = static_cast<OffloadExpertWeightProvider*>(_weight_provider.get());
+         drain_cpu_bank();
+         if (!_cpu_bank_resolved) {
+-            _cpu_bank = cpu_tier_bank(otd->weight_reader().path().string());
++            _cpu_bank = cpu_tier_bank(otd->weight_reader().path().string(), &instance.get_network().get_engine());
++            otd->set_host_bank(_cpu_bank);
+             _cpu_bank_resolved = true;
+         }
+         if (_cpu_bank && !_cpu_bank_fill_queued) {
+@@ -1673,6 +1938,7 @@
+             std::lock_guard<std::mutex> lock(_cpu_bank_sync->m);
+             _cpu_bank_sync->pending = pending.size();
+         }
++        _cpu_dispatch_pending = pending.size();
+         ov::intel_gpu::ocl::moe::cpu_tier_dispatch(pool, ready, split, observer);
+         for (size_t x : pending) {
+             auto sync = _cpu_bank_sync;
+@@ -1698,6 +1964,19 @@
+                     sync->cv.notify_all();
+             });
+         }
++        // arcint (patch 0076). Warm layer L+1's predicted file pages while the
++        // tier works on this layer (decode-shaped calls).
++        if (auto* la = RouterLookahead::get(otd->weight_reader().path().string(), static_cast<uint32_t>(_hidden_size),
++                                            static_cast<uint32_t>(otd->config().num_expert))) {
++            size_t n_tok = 0;
++            for (const auto& m : _cpu_tier_misses)
++                for (size_t pos : m.positions)
++                    n_tok = std::max(n_tok, pos / _max_topk + 1);
++            const auto& offs = otd->weight_bin_offsets();
++            if (!offs.empty())
++                la->submit(static_cast<uint64_t>(offs[0]), static_cast<const uint16_t*>(_cpu_x_host_mem->buffer_ptr()),
++                           n_tok, _cpu_bank);
++        }
+     }
+ 
+     // arcint M14 (patches/0012, §4.4). Blocks on the CPU pool, then DMAs each
+@@ -1726,9 +2005,11 @@
+         auto& engine = instance.get_network().get_engine();
+         const size_t row_bytes = static_cast<size_t>(_hidden_size) * sizeof(uint16_t);
+         size_t row = 0;
++        size_t max_token = 0;
+         for (const auto& m : _cpu_tier_misses) {
+             for (size_t pos : m.positions) {
+                 const size_t token = pos / _max_topk;
++                max_token = std::max(max_token, token);
+                 const size_t expert_slot = pos % _max_topk;
+                 const size_t flat_id = token * _experts_per_token + expert_slot;
+                 auto slot = _cpu_y_staging.acquire(engine, row_bytes);
+@@ -1750,6 +2031,24 @@
+             perf->cpu_compute_ns.fetch_add(ns(_cpu_dispatch_t0, t1), std::memory_order_relaxed);
+             perf->cpu_y_writeback_ns.fetch_add(ns(t1, t2), std::memory_order_relaxed);
+             perf->cpu_tier_layers.fetch_add(1, std::memory_order_relaxed);
++            // arcint (patch 0076). The same three spans for one-token calls
++            // only, so a decode token's tier cost is readable without the
++            // prefill calls folded in.
++            if (max_token == 0) {
++                perf->decode_tier_layers.fetch_add(1, std::memory_order_relaxed);
++                perf->decode_tier_experts.fetch_add(_cpu_tier_misses.size(), std::memory_order_relaxed);
++                perf->decode_tier_join_ns.fetch_add(ns(t0, t1), std::memory_order_relaxed);
++                perf->decode_tier_compute_ns.fetch_add(ns(_cpu_dispatch_t0, t1), std::memory_order_relaxed);
++                perf->decode_tier_y_ns.fetch_add(ns(t1, t2), std::memory_order_relaxed);
++                const size_t b = std::min<size_t>(_cpu_tier_misses.size(), moe_otd::OtdPerfCounters::kJoinBuckets - 1);
++                perf->decode_join_by_n_ns[b].fetch_add(ns(t0, t1), std::memory_order_relaxed);
++                perf->decode_layers_by_n[b].fetch_add(1, std::memory_order_relaxed);
++                if (_cpu_dispatch_pending > 0) {
++                    perf->decode_tier_pending_layers.fetch_add(1, std::memory_order_relaxed);
++                    perf->decode_tier_pending_experts.fetch_add(_cpu_dispatch_pending, std::memory_order_relaxed);
++                    perf->decode_tier_pending_join_ns.fetch_add(ns(t0, t1), std::memory_order_relaxed);
++                }
++            }
+         }
+         // No wait here: the in-order queue orders these copies before the
+         // reduce enqueued next (patches/0006's wait-placement argument,
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
+@@ -17,6 +17,7 @@
+ 
+ #include <chrono>
+ #include <condition_variable>
++#include <atomic>
+ #include <cstddef>
+ #include <cstdint>
+ #include <functional>
+@@ -254,6 +255,15 @@
+     std::deque<Task> _queue;
+     size_t _outstanding = 0;
+     bool _stop = false;
++    // arcint (patch 0076, campaign tier-handoff-doorbell). Lock-free mirrors
++    // of _queue.size() and _outstanding, read only by the spins: a worker
++    // spins up to MOE_CPU_TIER_SPIN_US for new work before sleeping on
++    // _cv_work, and wait() spins as long for the call to finish before
++    // sleeping on _cv_done (Strata's pool and FreeToken's flags spin before
++    // they sleep). 0, the default, keeps the condition-variable path alone.
++    std::atomic<size_t> _queued_a{0};
++    std::atomic<size_t> _outstanding_a{0};
++    std::chrono::microseconds _spin{0};
+ };
+ 
+ // arcint (patch 0071). One tier call's experts on the pool. A decode step
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
+@@ -1312,6 +1312,8 @@
+ // stream executor (§5.6). See moe_cpu_expert.hpp for the rationale.
+ 
+ CpuTierPool::CpuTierPool(size_t threads) {
++    if (const char* v = std::getenv("MOE_CPU_TIER_SPIN_US"))
++        _spin = std::chrono::microseconds(std::strtol(v, nullptr, 10));
+     size_t n = threads;
+     if (n == 0) {
+         const unsigned hw = std::thread::hardware_concurrency();
+@@ -1338,13 +1340,35 @@
+ void CpuTierPool::dispatch(std::vector<Task> tasks) {
+     std::lock_guard<std::mutex> lock(_m);
+     _outstanding += tasks.size();
++    _outstanding_a.fetch_add(tasks.size(), std::memory_order_release);
++    _queued_a.fetch_add(tasks.size(), std::memory_order_release);
+     for (auto& t : tasks) {
+         _queue.push_back(std::move(t));
+     }
+     _cv_work.notify_all();
+ }
+ 
++namespace {
++// Spins until pred() or `budget` has passed; true when pred() held.
++template <class Pred>
++bool spin_for(std::chrono::microseconds budget, Pred pred) {
++    if (budget.count() <= 0)
++        return false;
++    const auto end = std::chrono::steady_clock::now() + budget;
++    unsigned n = 0;
++    while (!pred()) {
++        if ((++n & 63u) == 0 && std::chrono::steady_clock::now() >= end)
++            return false;
++#if defined(__x86_64__) || defined(__i386__)
++        __builtin_ia32_pause();
++#endif
++    }
++    return true;
++}
++}  // namespace
++
+ void CpuTierPool::wait() {
++    spin_for(_spin, [this] { return _outstanding_a.load(std::memory_order_acquire) == 0; });
+     std::unique_lock<std::mutex> lock(_m);
+     _cv_done.wait(lock, [this] { return _outstanding == 0; });
+ }
+@@ -1352,6 +1376,7 @@
+ void CpuTierPool::worker_loop() {
+     for (;;) {
+         Task task;
++        spin_for(_spin, [this] { return _queued_a.load(std::memory_order_acquire) != 0; });
+         {
+             std::unique_lock<std::mutex> lock(_m);
+             _cv_work.wait(lock, [this] { return _stop || !_queue.empty(); });
+@@ -1359,11 +1384,13 @@
+                 return;
+             task = std::move(_queue.front());
+             _queue.pop_front();
++            _queued_a.fetch_sub(1, std::memory_order_relaxed);
+         }
+         if (task)
+             task();
+         {
+             std::lock_guard<std::mutex> lock(_m);
++            _outstanding_a.fetch_sub(1, std::memory_order_release);
+             _outstanding--;
+             if (_outstanding == 0)
+                 _cv_done.notify_all();
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
+@@ -53,6 +53,47 @@
+     // arcint M9 (patches/0004, P0 counters).
+     // LRU evictions across all OTD-offloaded MoE layers in this process.
+     std::atomic<uint64_t> evictions{0};
++    // arcint (patch 0076). The adaptive expert cache: swap batches planned,
++    // swaps planned, and swaps applied (a pinned slot handed to a newcomer).
++    std::atomic<uint64_t> adaptive_plans{0};
++    std::atomic<uint64_t> adaptive_swaps_planned{0};
++    std::atomic<uint64_t> adaptive_swaps_applied{0};
++    // Swaps dropped (the victim gone or the newcomer already resident, a
++    // read failed, or nothing to copy), and the
++    // background readers' file time (off the decode path).
++    std::atomic<uint64_t> adaptive_swaps_dropped{0};
++    std::atomic<uint64_t> adaptive_read_ns{0};
++    // Applied swaps whose newcomer's host-bank slot was handed to the demoted
++    // expert, and those with no Ready slot to hand over.
++    std::atomic<uint64_t> adaptive_bank_exchanges{0};
++    std::atomic<uint64_t> adaptive_bank_exchange_misses{0};
++    // The router lookahead (MOE_CPU_TIER_LOOKAHEAD): runs, submits skipped
++    // because a run was in progress, experts whose pages were warmed, time.
++    std::atomic<uint64_t> lookahead_runs{0};
++    std::atomic<uint64_t> lookahead_skipped{0};
++    std::atomic<uint64_t> lookahead_warmed{0};
++    std::atomic<uint64_t> lookahead_ns{0};
++    // Decode-only expert resolutions under the static partition (calls with
++    // at most top_k ids): the hit share the adaptive cache is meant to raise,
++    // without prefill diluting it.
++    std::atomic<uint64_t> decode_hits{0};
++    std::atomic<uint64_t> decode_lookups{0};
++    // One-token CPU-tier calls: count, experts, join wait (host blocked on
++    // the tier), dispatch-to-join span, y writeback.
++    std::atomic<uint64_t> decode_tier_layers{0};
++    std::atomic<uint64_t> decode_tier_experts{0};
++    std::atomic<uint64_t> decode_tier_join_ns{0};
++    std::atomic<uint64_t> decode_tier_compute_ns{0};
++    std::atomic<uint64_t> decode_tier_y_ns{0};
++    // The decode join split two ways: by the call's tier expert count
++    // (bucket n, the last one n and above), and the calls that had an expert
++    // still being read into the host bank at dispatch.
++    static constexpr size_t kJoinBuckets = 11;
++    std::atomic<uint64_t> decode_join_by_n_ns[kJoinBuckets] = {};
++    std::atomic<uint64_t> decode_layers_by_n[kJoinBuckets] = {};
++    std::atomic<uint64_t> decode_tier_pending_layers{0};
++    std::atomic<uint64_t> decode_tier_pending_experts{0};
++    std::atomic<uint64_t> decode_tier_pending_join_ns{0};
+     // Slot resolutions (hits + misses) returned by LRUCache::get_lru_item;
+     // recorded independently of gpu_hits/gpu_misses so the two accounting
+     // paths (per-slot vs per-acquire-call) can be cross-checked.
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp
+@@ -8,7 +8,10 @@
+ #include <cstdint>
+ #include <filesystem>
+ #include <memory>
++#include <mutex>
+ #include <string>
++#include <unordered_map>
++#include <unordered_set>
+ #include <vector>
+ 
+ #include "intel_gpu/primitives/moe_3gemm_fused_compressed.hpp"
+@@ -86,6 +89,73 @@
+     std::shared_ptr<ov::MappedMemory> _map;
+ };
+ 
++// arcint (patch 0076, campaign expert-hot-set-lru). fill_weights_memory split
++// in two, for the adaptive cache's swaps (Strata's non-blocking admission):
++//  - plan_expert_tensors (caller thread; needs the bound tensors' layouts):
++//    which tensors to upload for one expert, with their file spans, under the
++//    same skip rules as fill_weights_memory;
++//  - read_expert_tensors (any thread; no device objects): reads the spans with
++//    its own file handle and applies the scale/zp transpose -- the payload
++//    does not depend on the destination slot;
++//  - enqueue_expert_tensors (the compute stream): copies the payloads into a
++//    slot through a HostUploadPool buffer, non-blocking and WITHOUT the
++//    end-of-call wait fill_weights_memory has (and without StagingRing's
++//    wait-on-reuse: a busy buffer is never waited on, a new one is made). In-order execution orders the copies after
++//    every kernel already enqueued (so the slot's old bytes are never
++//    overwritten under a reader) and before every later kernel (so the new
++//    bytes are never read early).
++struct ExpertTensorPlan {
++    size_t offset_pos = 0;
++    size_t file_offset = 0;
++    size_t bytes = 0;
++    cldnn::layout layout;
++};
++struct PreparedTensor {
++    size_t offset_pos = 0;
++    std::vector<uint8_t> payload;
++};
++std::vector<ExpertTensorPlan> plan_expert_tensors(const cldnn::MOECompressed::Config& config,
++                                                  const std::vector<size_t>& weight_bin_offsets,
++                                                  cldnn::moe_weights& wei_mem,
++                                                  uint32_t expert);
++std::vector<PreparedTensor> read_expert_tensors(const cldnn::MOECompressed::Config& config,
++                                                const std::filesystem::path& weights_path,
++                                                const std::vector<ExpertTensorPlan>& plans);
++// Background-read results for one provider's queued swaps. Shared with the
++// reader threads, so it outlives the provider while a read is in flight.
++struct AdaptivePrep {
++    std::mutex mutex;
++    std::unordered_map<uint32_t, std::vector<PreparedTensor>> ready;  // newcomer -> payloads
++    std::unordered_set<uint32_t> failed;
++};
++
++// usm_host buffers for the swap copies. One buffer per swapped expert (all
++// its tensors packed), held until the copy's event is set. acquire() never
++// waits: on an in-order queue a copy's event fires only after every kernel
++// enqueued before it, so waiting would stall the host on the whole queue.
++class HostUploadPool {
++public:
++    void* acquire(cldnn::engine& engine, size_t bytes, size_t* index);
++    void retire(size_t index, cldnn::event::ptr ev);
++    size_t live_bytes() const { return _live_bytes; }
++
++private:
++    struct Entry {
++        cldnn::memory::ptr mem;
++        cldnn::event::ptr pending;
++        size_t capacity = 0;
++    };
++    std::vector<Entry> _entries;
++    size_t _live_bytes = 0;
++};
++
++// Returns false when nothing was copied (the slot must then stay unfilled).
++bool enqueue_expert_tensors(cldnn::stream& exec_stream,
++                            cldnn::moe_weights& wei_mem,
++                            const std::vector<PreparedTensor>& tensors,
++                            size_t slot,
++                            HostUploadPool& pool);
++
+ void maybe_transpose_scale_zp(const cldnn::MOECompressed::Config& config,
+                               size_t offset_pos,
+                               const cldnn::layout& layout,
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+@@ -5,6 +5,10 @@
+ #include <iostream>
+ #include "moe_otd_runtime.hpp"
+ 
++#include <fcntl.h>
++#include <unistd.h>
++
++
+ #include <array>
+ #include <chrono>
+ #include <cstdlib>
+@@ -64,6 +68,36 @@
+                    // compile-time device/host slot-tier split and its fallback count, and
+                    // the async-upload staging footprint. See moe_otd_perf.hpp.
+                    << ", evictions=" << evictions.load(std::memory_order_relaxed)
++                   << ", adaptive_plans=" << adaptive_plans.load(std::memory_order_relaxed)
++                   << ", adaptive_swaps_planned=" << adaptive_swaps_planned.load(std::memory_order_relaxed)
++                   << ", adaptive_swaps_applied=" << adaptive_swaps_applied.load(std::memory_order_relaxed)
++                   << ", adaptive_swaps_dropped=" << adaptive_swaps_dropped.load(std::memory_order_relaxed)
++                   << ", adaptive_read_ms=" << adaptive_read_ns.load(std::memory_order_relaxed) / 1000000
++                   << ", adaptive_bank_exchanges=" << adaptive_bank_exchanges.load(std::memory_order_relaxed)
++                   << ", adaptive_bank_exchange_misses=" << adaptive_bank_exchange_misses.load(std::memory_order_relaxed)
++                   << ", lookahead_runs=" << lookahead_runs.load(std::memory_order_relaxed)
++                   << ", lookahead_skipped=" << lookahead_skipped.load(std::memory_order_relaxed)
++                   << ", lookahead_warmed=" << lookahead_warmed.load(std::memory_order_relaxed)
++                   << ", lookahead_ms=" << lookahead_ns.load(std::memory_order_relaxed) / 1000000
++                   << ", decode_hits=" << decode_hits.load(std::memory_order_relaxed)
++                   << ", decode_lookups=" << decode_lookups.load(std::memory_order_relaxed)
++                   << ", decode_tier_layers=" << decode_tier_layers.load(std::memory_order_relaxed)
++                   << ", decode_tier_experts=" << decode_tier_experts.load(std::memory_order_relaxed)
++                   << ", decode_tier_join_ms=" << decode_tier_join_ns.load(std::memory_order_relaxed) / 1000000
++                   << ", decode_tier_compute_ms=" << decode_tier_compute_ns.load(std::memory_order_relaxed) / 1000000
++                   << ", decode_tier_y_ms=" << decode_tier_y_ns.load(std::memory_order_relaxed) / 1000000
++                   << ", decode_tier_pending_layers=" << decode_tier_pending_layers.load(std::memory_order_relaxed)
++                   << ", decode_tier_pending_experts=" << decode_tier_pending_experts.load(std::memory_order_relaxed)
++                   << ", decode_tier_pending_join_ms=" << decode_tier_pending_join_ns.load(std::memory_order_relaxed) / 1000000
++                   << ", decode_join_us_by_n=" << [this] {
++                          std::string s;
++                          for (size_t i = 0; i < kJoinBuckets; ++i) {
++                              const uint64_t n = decode_layers_by_n[i].load(std::memory_order_relaxed);
++                              s += (i ? "/" : "") + std::to_string(i) + ":" + std::to_string(n) + "x" +
++                                   std::to_string(n ? decode_join_by_n_ns[i].load(std::memory_order_relaxed) / 1000 / n : 0);
++                          }
++                          return s;
++                      }()
+                    << ", acquisitions=" << acquisitions.load(std::memory_order_relaxed)
+                    << ", device_slot_buffers=" << device_slot_buffers.load(std::memory_order_relaxed)
+                    << ", host_slot_buffers=" << host_slot_buffers.load(std::memory_order_relaxed)
+@@ -504,4 +538,131 @@
+     }
+ }
+ 
++namespace {
++std::array<cldnn::memory_ptr, cldnn::moe_3gemm_fused_compressed::serialized_weight_offset_count> tensors_of(
++    cldnn::moe_weights& w) {
++    return {{w.gate_w, w.up_w, w.down_w, w.gate_s, w.up_s, w.down_s, w.gate_z, w.up_z, w.down_z}};
++}
++}  // namespace
++
++std::vector<ExpertTensorPlan> plan_expert_tensors(const cldnn::MOECompressed::Config& config,
++                                                  const std::vector<size_t>& weight_bin_offsets,
++                                                  cldnn::moe_weights& wei_mem,
++                                                  uint32_t expert) {
++    const auto tensors = tensors_of(wei_mem);
++    std::vector<ExpertTensorPlan> plans;
++    for (size_t pos = 0; pos < tensors.size(); ++pos) {
++        const auto& mem = tensors[pos];
++        if (!mem)
++            continue;
++        // The same zp-aliasing skip as fill_weights_memory: a native format
++        // whose zp tensor aliases its scale tensor has nothing separate to load.
++        if (pos >= 6 && tensors[pos] == tensors[pos - 3]) {
++            const size_t fmt = (pos % 3 == 2) ? config.down_weight_format : config.gate_up_weight_format;
++            if (ov::op::internal::MOECompressed::is_native_format(fmt))
++                continue;
++        }
++        const auto span = expert_tensor_span(config, weight_bin_offsets, mem, pos, expert);
++        if (span.bytes == 0)
++            continue;
++        plans.push_back(ExpertTensorPlan{pos, span.file_offset, span.bytes, mem->get_layout()});
++    }
++    return plans;
++}
++
++std::vector<PreparedTensor> read_expert_tensors(const cldnn::MOECompressed::Config& config,
++                                                const std::filesystem::path& weights_path,
++                                                const std::vector<ExpertTensorPlan>& plans) {
++    std::vector<PreparedTensor> out;
++    const int fd = ::open(weights_path.c_str(), O_RDONLY | O_CLOEXEC);
++    if (fd < 0)
++        return out;  // the swap is dropped; the victim keeps serving
++    auto* perf = get_perf_counters();
++    for (const auto& p : plans) {
++        PreparedTensor t;
++        t.offset_pos = p.offset_pos;
++        t.payload.resize(p.bytes);
++        size_t done = 0;
++        const auto t0 = std::chrono::steady_clock::now();
++        while (done < p.bytes) {
++            const ssize_t n = ::pread(fd, t.payload.data() + done, p.bytes - done, static_cast<off_t>(p.file_offset + done));
++            if (n <= 0)
++                break;
++            done += static_cast<size_t>(n);
++        }
++        if (done != p.bytes) {
++            ::close(fd);
++            return {};  // short read: drop the swap
++        }
++        if (perf)
++            perf->adaptive_read_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                                 std::chrono::steady_clock::now() - t0).count()),
++                                             std::memory_order_relaxed);
++        maybe_transpose_scale_zp(config, p.offset_pos, p.layout, t.payload, p.bytes);
++        out.push_back(std::move(t));
++    }
++    ::close(fd);
++    return out;
++}
++
++void* HostUploadPool::acquire(cldnn::engine& engine, size_t bytes, size_t* index) {
++    for (size_t i = 0; i < _entries.size(); ++i) {
++        auto& e = _entries[i];
++        if (e.pending && !e.pending->is_set())
++            continue;
++        e.pending.reset();
++        if (e.capacity < bytes)
++            continue;
++        *index = i;
++        return e.mem->buffer_ptr();
++    }
++    auto layout = cldnn::layout({1, 1, 1, static_cast<ov::Dimension::value_type>(bytes)}, cldnn::data_types::u8, cldnn::format::bfyx);
++    Entry e;
++    e.mem = engine.allocate_memory(layout, cldnn::allocation_type::usm_host, false);
++    e.capacity = bytes;
++    _live_bytes += bytes;
++    if (auto* perf = get_perf_counters())
++        perf->staging_bytes.fetch_add(bytes, std::memory_order_relaxed);
++    _entries.push_back(std::move(e));
++    *index = _entries.size() - 1;
++    return _entries.back().mem->buffer_ptr();
++}
++
++void HostUploadPool::retire(size_t index, cldnn::event::ptr ev) {
++    _entries[index].pending = std::move(ev);
++}
++
++bool enqueue_expert_tensors(cldnn::stream& exec_stream,
++                            cldnn::moe_weights& wei_mem,
++                            const std::vector<PreparedTensor>& tensors,
++                            size_t slot,
++                            HostUploadPool& pool) {
++    const auto by_pos = tensors_of(wei_mem);
++    size_t total = 0;
++    cldnn::engine* engine = nullptr;
++    for (const auto& t : tensors) {
++        total += t.payload.size();
++        if (!engine && by_pos[t.offset_pos])
++            engine = by_pos[t.offset_pos]->get_engine();
++    }
++    if (total == 0 || engine == nullptr)
++        return false;
++    size_t index = 0;
++    auto* host = static_cast<uint8_t*>(pool.acquire(*engine, total, &index));
++    size_t off = 0;
++    cldnn::event::ptr last;
++    for (const auto& t : tensors) {
++        auto mem = by_pos[t.offset_pos];
++        const size_t bytes = t.payload.size();
++        if (!mem || bytes == 0)
++            continue;
++        std::memcpy(host + off, t.payload.data(), bytes);
++        last = mem->copy_from(exec_stream, host, off, slot * bytes, bytes, false);
++        off += bytes;
++    }
++    // In-order queue: the last copy's event covers the earlier ones.
++    pool.retire(index, last);
++    return last != nullptr;
++}
++
+ }  // namespace ov::intel_gpu::ocl::moe_otd
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
+@@ -40,6 +40,7 @@
+ #include <vector>
+ 
+ #include "ocl_v2/moe/moe_cpu_expert.hpp"
++#include "ocl_v2/moe/adaptive_expert_cache.hpp"
+ #include "openvino/runtime/system_conf.hpp"
+ 
+ using ov::intel_gpu::ocl::moe::ExpertDesc;
+@@ -1111,3 +1112,122 @@
+                 << "a prefill-shaped call did not take the f32 path (job " << j << ")";
+     }
+ }
++
++// arcint (patch 0076, campaign expert-hot-set-lru). The adaptive expert
++// cache's policy, device-free: Strata's adapt (decay 0.7, margin 1.5, at most
++// 96 swaps every 4 rounds), one pool ranked across all layers. Red under a
++// mutant that drops the margin, forgets the decay, or admits a slot before its
++// copy has landed.
++
++TEST(adaptive_expert_cache, the_swap_batch_follows_the_decayed_usage_counts) {
++    using ov::intel_gpu::ocl::moe::AdaptiveCacheParams;
++    using ov::intel_gpu::ocl::moe::AdaptiveCacheState;
++    AdaptiveCacheParams p;  // decay 0.7, margin 1.5, candidate_min 2.0, every 4, <= 96
++    AdaptiveCacheState st(2, 4);
++    st.admit(0, 0, /*slot=*/0);                 // one resident victim in layer 0
++    for (int i = 0; i < 3; ++i) st.bump(0, 2);  // one hot non-resident candidate, same layer
++    auto sw = st.plan(p);
++    ASSERT_EQ(sw.size(), 1u);
++    EXPECT_EQ(sw[0].layer, 0);
++    EXPECT_EQ(sw[0].in, 2);
++    EXPECT_EQ(sw[0].out, 0);
++
++    // The margin blocks a swap whose gain is under 1.5.
++    AdaptiveCacheState hi(1, 2);
++    hi.admit(0, 0, 0);
++    hi.bump(0, 0, 2.0f);  // victim
++    hi.bump(0, 1, 3.0f);  // candidate 3.0 < 2.0 + 1.5 = 3.5 -> no swap
++    EXPECT_TRUE(hi.plan(p).empty()) << "the margin did not block a sub-margin swap";
++    hi.bump(0, 1, 1.0f);  // candidate 4.0 >= 3.5 -> swap
++    EXPECT_EQ(hi.plan(p).size(), 1u);
++
++    // The decay: after four rounds a candidate that fell below 2.0 is gone.
++    AdaptiveCacheState dc(1, 2);
++    dc.admit(0, 0, 0);
++    dc.bump(0, 1, 3.0f);
++    EXPECT_EQ(dc.plan(p).size(), 1u);
++    for (int r = 0; r < 4; ++r) dc.finish_round(p.decay);  // 3.0 * 0.7^4 ~= 0.72
++    EXPECT_TRUE(dc.plan(p).empty()) << "the decay did not drop the candidate below the threshold";
++}
++
++TEST(adaptive_expert_cache, evicted_slots_are_never_read_stale_and_admission_lands_late) {
++    using ov::intel_gpu::ocl::moe::AdaptiveCacheState;
++    AdaptiveCacheState st(1, 2);
++    st.admit(0, 0, /*slot=*/0);
++    st.evict(0, 0);                 // evicted at once, before any copy is made
++    EXPECT_EQ(st.resident(0, 0), AdaptiveCacheState::kNotResident)
++        << "an evicted slot is still reported resident (a stale read is possible)";
++    st.admit(0, 1, /*slot=*/0);     // admitted only when the copy has landed
++    EXPECT_EQ(st.resident(0, 1), 0);
++    EXPECT_EQ(st.resident(0, 0), AdaptiveCacheState::kNotResident);
++}
++
++TEST(adaptive_expert_cache, the_round_is_due_every_n_rounds) {
++    using ov::intel_gpu::ocl::moe::AdaptiveCacheState;
++    AdaptiveCacheState st(1, 2);
++    for (uint64_t r = 0; r < 3; ++r) {
++        EXPECT_FALSE(st.due(4)) << "adaptation fired early at round " << r;
++        st.finish_round(0.7f);
++    }
++    EXPECT_TRUE(st.due(4));
++}
++
++TEST(adaptive_expert_cache, the_batch_is_one_pool_capped_and_ordered_by_gain) {
++    using ov::intel_gpu::ocl::moe::AdaptiveCacheParams;
++    using ov::intel_gpu::ocl::moe::AdaptiveCacheState;
++    AdaptiveCacheParams p;
++    // Two layers, byte-sized pools: experts 0..E-1 resident (usage 1.0), experts
++    // E..2E-1 non-resident and hot (usage 3.0 -> over the 1 + margin 1.5 bar).
++    // E = 40 gives 80 swaps, under the 96 cap, so both layers appear.
++    const int E = 40;
++    AdaptiveCacheState st(2, 2 * E);
++    for (int l = 0; l < 2; ++l) {
++        for (int e = 0; e < E; ++e) {
++            st.admit(l, e, e);
++            st.bump(l, e, 1.0f);
++        }
++        for (int e = E; e < 2 * E; ++e) st.bump(l, e, 3.0f);
++    }
++    auto sw = st.plan(p);
++    EXPECT_EQ(sw.size(), static_cast<size_t>(2 * E));
++    for (size_t i = 1; i < sw.size(); ++i)
++        EXPECT_GE(sw[i - 1].gain, sw[i].gain) << "the batch is not ordered by gain desc";
++    bool l0 = false, l1 = false;
++    for (const auto& s : sw) { l0 |= s.layer == 0; l1 |= s.layer == 1; }
++    EXPECT_TRUE(l0 && l1) << "the batch is not one pool across layers";
++    // The cap: the same shape with 120 candidates per layer exceeds 96.
++    AdaptiveCacheState big(2, 240);
++    for (int l = 0; l < 2; ++l) {
++        for (int e = 0; e < 120; ++e) { big.admit(l, e, e); big.bump(l, e, 1.0f); }
++        for (int e = 120; e < 240; ++e) big.bump(l, e, 3.0f);
++    }
++    EXPECT_EQ(big.plan(p).size(), p.max_swaps) << "the batch was not capped at adapt_swaps";
++}
++
++TEST(adaptive_expert_cache, the_same_request_sequence_gives_the_same_state_and_batch) {
++    using ov::intel_gpu::ocl::moe::AdaptiveCacheParams;
++    using ov::intel_gpu::ocl::moe::AdaptiveCacheState;
++    AdaptiveCacheParams p;
++    auto replay = [&]() {
++        AdaptiveCacheState st(3, 8);
++        for (int l = 0; l < 3; ++l)
++            for (int e = 0; e < 4; ++e) st.admit(l, e, e);
++        const int seq[12] = {5, 6, 6, 7, 5, 4, 6, 7, 5, 6, 4, 7};
++        for (int s : seq) st.bump(s % 3, s);
++        for (int r = 0; r < 4; ++r) {
++            st.plan(p);
++            st.finish_round(p.decay);
++        }
++        st.bump(0, 5);
++        return st.plan(p);
++    };
++    auto a = replay();
++    auto b = replay();
++    ASSERT_EQ(a.size(), b.size());
++    for (size_t i = 0; i < a.size(); ++i) {
++        EXPECT_EQ(a[i].layer, b[i].layer);
++        EXPECT_EQ(a[i].in, b[i].in);
++        EXPECT_EQ(a[i].out, b[i].out);
++        EXPECT_FLOAT_EQ(a[i].gain, b[i].gain);
++    }
++}
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_host_expert_bank_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/moe_host_expert_bank_test.cpp
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_host_expert_bank_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_host_expert_bank_test.cpp
+@@ -17,6 +17,7 @@
+ #include <mutex>
+ #include <random>
+ #include <string>
++#include <thread>
+ #include <vector>
+ 
+ #include <fcntl.h>
+@@ -320,3 +321,85 @@
+     auto lb = bank.acquire(3, 3, b.data(), 2);
+     EXPECT_EQ(lb.state, HostExpertBank::State::Unbanked);
+ }
++
++
++// arcint (patch 0076). A bank over caller-owned chunks (the pinned mode)
++// reads through each IO thread's bounce buffer: the slot gets the file's
++// bytes, and a record never straddles two chunks.
++TEST(moe_host_expert_bank, external_chunks_get_the_files_bytes_through_the_bounce) {
++    ScratchFile f(1 << 20);
++    REQUIRE_DIRECT(f);
++    const size_t chunk = 128 << 10;  // two 64 KiB records a chunk
++    std::vector<std::vector<uint8_t>> mem(2, std::vector<uint8_t>(chunk));
++    std::vector<HostExpertBank::Chunk> chunks{{mem[0].data(), chunk}, {mem[1].data(), chunk}};
++    HostExpertBank bank(f.path, chunks, 2);
++    ASSERT_TRUE(bank.external());
++    for (uint32_t e = 0; e < 3; ++e) {
++        const BankSpan sp[2] = {{4096 + e * 65536ull, 20000}, {300000 + e * 4096ull, 3000}};
++        const auto l = bank.acquire(9, e, sp, 2);
++        ASSERT_EQ(l.state, HostExpertBank::State::Pending);
++        ASSERT_TRUE(fetch_and_wait(bank, l.slot));
++        for (int i = 0; i < 2; ++i) {
++            ASSERT_TRUE(std::equal(f.bytes.begin() + sp[i].file_offset,
++                                   f.bytes.begin() + sp[i].file_offset + sp[i].bytes, l.ptr[i]))
++                << "expert " << e << " span " << i;
++            const bool in0 = l.ptr[i] >= mem[0].data() && l.ptr[i] + sp[i].bytes <= mem[0].data() + chunk;
++            const bool in1 = l.ptr[i] >= mem[1].data() && l.ptr[i] + sp[i].bytes <= mem[1].data() + chunk;
++            ASSERT_TRUE(in0 || in1) << "expert " << e << " span " << i << " outside the chunks";
++        }
++        bank.release(l.slot);
++    }
++}
++
++// arcint (patch 0076). exchange(): a promoted expert's Ready slot is handed
++// to the demoted one and refilled with its bytes; the promoted expert is no
++// longer banked. A pinned slot or an already-banked newcomer refuses.
++TEST(moe_host_expert_bank, exchange_hands_the_promoted_slot_to_the_demoted_expert) {
++    ScratchFile f(1 << 20);
++    REQUIRE_DIRECT(f);
++    HostExpertBank bank(f.path, 64 << 10, 1);  // one slot
++    const BankSpan in_sp[1] = {{8192, 12000}};
++    const BankSpan out_sp[1] = {{400000, 12000}};
++    auto l = bank.acquire(5, 1, in_sp, 1);
++    ASSERT_EQ(l.state, HostExpertBank::State::Pending);
++    ASSERT_TRUE(fetch_and_wait(bank, l.slot));
++    ASSERT_FALSE(bank.exchange(5, 1, 2, out_sp, 1));  // still pinned by the lease
++    bank.release(l.slot);
++    ASSERT_TRUE(bank.exchange(5, 1, 2, out_sp, 1));
++    HostExpertBank::Lease o;
++    for (int i = 0; i < 2000; ++i) {
++        o = bank.acquire(5, 2, out_sp, 1);
++        if (o.state == HostExpertBank::State::Ready)
++            break;
++        if (o.state != HostExpertBank::State::Unbanked)
++            bank.release(o.slot);
++        std::this_thread::sleep_for(std::chrono::milliseconds(5));
++    }
++    ASSERT_EQ(o.state, HostExpertBank::State::Ready);
++    ASSERT_TRUE(std::equal(f.bytes.begin() + 400000, f.bytes.begin() + 400000 + 12000, o.ptr[0]));
++    bank.release(o.slot);
++    ASSERT_FALSE(bank.exchange(5, 1, 3, out_sp, 1));  // expert 1 is no longer banked
++    ASSERT_EQ(bank.stats().exchanges, 1u);
++}
++
++// arcint (patch 0076). A fixed bank (Strata's RAM budget) answers a miss
++// Unbanked and evicts nothing: the filled set stays, holds() reports it.
++TEST(moe_host_expert_bank, a_fixed_bank_answers_misses_unbanked_and_keeps_its_set) {
++    ScratchFile f(1 << 20);
++    REQUIRE_DIRECT(f);
++    HostExpertBank bank(f.path, 64 << 10, 1);  // one slot
++    const BankSpan a[1] = {{8192, 12000}};
++    const BankSpan b[1] = {{400000, 12000}};
++    auto l = bank.acquire(3, 1, a, 1);
++    ASSERT_EQ(l.state, HostExpertBank::State::Pending);
++    ASSERT_TRUE(fetch_and_wait(bank, l.slot));
++    bank.release(l.slot);
++    bank.set_fixed(true);
++    ASSERT_EQ(bank.acquire(3, 2, b, 1).state, HostExpertBank::State::Unbanked);
++    ASSERT_TRUE(bank.holds(3, 1));
++    ASSERT_FALSE(bank.holds(3, 2));
++    auto again = bank.acquire(3, 1, a, 1);
++    ASSERT_EQ(again.state, HostExpertBank::State::Ready);
++    bank.release(again.slot);
++    ASSERT_EQ(bank.stats().evictions, 0u);
++}
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_offload_lru_cache_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/moe_offload_lru_cache_test.cpp
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_offload_lru_cache_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_offload_lru_cache_test.cpp
+@@ -332,3 +332,79 @@
+     ASSERT_LE(cache.size(), cap);
+ }
+ 
++
++// --------------------------------------------------
++// arcint (patch 0076): the adaptive cache's swap under the static partition.
++// A pinned slot is handed to a newcomer, unfilled, and stays pinned; the old
++// expert is gone at once. Red on a mutant that keeps the slot filled (the
++// newcomer would be read before its bytes land) or keeps the old key (the
++// victim would still resolve to bytes that are about to be replaced).
++// --------------------------------------------------
++
++TEST(moe_lru_cache, replace_pinned_hands_the_slot_to_the_newcomer_unfilled) {
++    LRUCache cache(4);
++    cache.reserve_pinned(/*expert=*/10, /*slot=*/0);
++    cache.reserve_pinned(/*expert=*/11, /*slot=*/1);
++    cache.set_filled(0);
++    cache.set_filled(1);
++
++    ASSERT_TRUE(cache.replace_pinned(10, 20));
++
++    auto [slot, filled] = cache.probe(20);
++    ASSERT_EQ(slot, 0U);       // the victim's slot
++    ASSERT_FALSE(filled);      // uploaded on first use, never read before
++    ASSERT_EQ(cache.probe(10).first, LRUCache::kProbeMiss);  // the victim is gone at once
++    ASSERT_TRUE(cache.is_pinned(0));                          // still pinned: never evictable
++    ASSERT_EQ(cache.size(), 2U);
++    auto [slot11, filled11] = cache.probe(11);                // the other resident is untouched
++    ASSERT_EQ(slot11, 1U);
++    ASSERT_TRUE(filled11);
++}
++
++TEST(moe_lru_cache, replace_pinned_refuses_and_changes_nothing) {
++    LRUCache cache(4);
++    cache.reserve_pinned(10, 0);
++    cache.reserve_pinned(11, 1);
++    cache.set_filled(0);
++    auto [unpinned_slot, h] = cache.get_lru_item(12);  // an ordinary, unpinned entry
++    (void)h;
++
++    ASSERT_FALSE(cache.replace_pinned(99, 20));   // the old expert is absent
++    ASSERT_FALSE(cache.replace_pinned(10, 11));   // the newcomer is already resident
++    ASSERT_FALSE(cache.replace_pinned(12, 20));   // the old expert is not pinned
++    ASSERT_EQ(cache.probe(10).first, 0U);
++    ASSERT_TRUE(cache.probe(10).second);
++    ASSERT_EQ(cache.probe(12).first, unpinned_slot);
++    ASSERT_EQ(cache.probe(20).first, LRUCache::kProbeMiss);
++    ASSERT_EQ(cache.size(), 3U);
++}
++
++TEST(moe_lru_cache, pinned_residents_lists_only_the_pinned_set) {
++    LRUCache cache(4);
++    cache.reserve_pinned(10, 0);
++    cache.reserve_pinned(11, 1);
++    cache.get_lru_item(12);
++    ASSERT_TRUE(cache.replace_pinned(11, 21));
++
++    auto r = cache.pinned_residents();
++    std::set<std::pair<size_t, size_t>> got(r.begin(), r.end());
++    std::set<std::pair<size_t, size_t>> want{{10, 0}, {21, 1}};
++    ASSERT_EQ(got, want);
++}
++
++// arcint (patch 0076). contains_filled: true only for a resident expert whose
++// slot is filled, and it does not reorder the LRU list.
++TEST(moe_lru_cache, contains_filled_reports_only_filled_residents) {
++    LRUCache cache(2);
++    const auto a = cache.get_lru_item(7);
++    ASSERT_FALSE(cache.contains_filled(7));
++    cache.set_filled(a.first);
++    ASSERT_TRUE(cache.contains_filled(7));
++    ASSERT_FALSE(cache.contains_filled(8));
++    const auto b = cache.get_lru_item(8);
++    cache.set_filled(b.first);
++    ASSERT_TRUE(cache.contains_filled(7));  // no reorder: 7 stays least recent
++    const auto c = cache.get_lru_item(9);   // evicts the least recent, 7
++    ASSERT_EQ(c.first, a.first);
++    ASSERT_FALSE(cache.contains_filled(7));
++}
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_offload_weight_provider_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/moe_offload_weight_provider_test.cpp
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_offload_weight_provider_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_offload_weight_provider_test.cpp
+@@ -2,7 +2,10 @@
+ // SPDX-License-Identifier: Apache-2.0
+ //
+ 
++#include <chrono>
+ #include <cstdlib>
++#include <cstring>
++#include <fstream>
+ 
+ #include "test_utils/test_utils.h"
+ #include "ocl_v2/moe/expert_weight_providers.hpp"
+@@ -367,3 +370,94 @@
+     OffloadExpertWeightProvider empty_provider(/*capacity=*/2, config, {}, "/nonexistent");
+     ASSERT_EQ(empty_provider.layer_key(), 0U);
+ }
++
++// arcint (patch 0076). The adaptive cache's split upload (plan on the compute
++// thread, read on a reader thread, one non-blocking enqueue) must leave a
++// slot holding the same bytes as fill_weights_memory, and those bytes must be
++// the expert's bytes from the file. Weight tensors only: the scale/zp
++// transpose is the same maybe_transpose_scale_zp call on both paths. The down
++// tensor has its own per-expert size, so a destination offset taken from
++// another tensor's size lands in the wrong place.
++TEST(moe_expert_weight_provider, adaptive_split_upload_matches_fill_weights_memory) {
++    namespace otd = ov::intel_gpu::ocl::moe_otd;
++    constexpr size_t n_expert = 4;
++    const size_t per[3] = {64, 64, 96};
++    const std::string path = ::testing::TempDir() + "adaptive_split_upload.bin";
++    const size_t off[3] = {0, n_expert * per[0], n_expert * (per[0] + per[1])};
++    std::vector<uint8_t> file(n_expert * (per[0] + per[1] + per[2]));
++    for (size_t i = 0; i < file.size(); ++i)
++        file[i] = static_cast<uint8_t>((i * 7 + 13) % 251);
++    {
++        std::ofstream f(path, std::ios::binary);
++        f.write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(file.size()));
++    }
++    MOECompressed::Config config{};
++    config.num_expert = n_expert;
++    const std::vector<size_t> offsets = {off[0], off[1], off[2], 0, 0, 0, 0, 0, 0};
++
++    auto& engine = get_test_engine();
++    auto& stream = get_test_stream();
++    auto lay = [&](size_t t) {
++        return layout({1, 1, 1, static_cast<ov::Dimension::value_type>(n_expert * per[t])}, data_types::u8, format::bfyx);
++    };
++    auto make = [&] {
++        moe_weights w{};
++        w.gate_w = engine.allocate_memory(lay(0), allocation_type::usm_device);
++        w.up_w = engine.allocate_memory(lay(1), allocation_type::usm_device);
++        w.down_w = engine.allocate_memory(lay(2), allocation_type::usm_device);
++        return w;
++    };
++    moe_weights a = make(), b = make();
++
++    otd::ParallelWeightReader reader(path);
++    otd::StagingRing staging;
++    otd::fill_weights_memory(stream, config, offsets, reader, a, {3}, {1}, staging);
++
++    const auto plans = otd::plan_expert_tensors(config, offsets, b, 3);
++    ASSERT_EQ(plans.size(), 3U);
++    const auto tensors = otd::read_expert_tensors(config, path, plans);
++    ASSERT_EQ(tensors.size(), 3U);
++    otd::HostUploadPool pool;
++    otd::enqueue_expert_tensors(stream, b, tensors, /*slot=*/1, pool);
++    stream.finish();
++
++    const memory::ptr pairs[3][2] = {{a.gate_w, b.gate_w}, {a.up_w, b.up_w}, {a.down_w, b.down_w}};
++    for (size_t t = 0; t < 3; ++t) {
++        const size_t bytes = n_expert * per[t];
++        std::vector<uint8_t> ha(bytes), hb(bytes);
++        pairs[t][0]->copy_to(stream, ha.data(), 0, 0, bytes, true);
++        pairs[t][1]->copy_to(stream, hb.data(), 0, 0, bytes, true);
++        const auto* want = file.data() + off[t] + 3 * per[t];
++        ASSERT_TRUE(std::equal(want, want + per[t], hb.begin() + per[t])) << "tensor " << t << ": slot 1 is not expert 3's bytes";
++        ASSERT_TRUE(std::equal(ha.begin() + per[t], ha.begin() + 2 * per[t], hb.begin() + per[t])) << "tensor " << t;
++    }
++    std::remove(path.c_str());
++}
++
++// arcint (patch 0076). Measurement, not a check (run by name): CPU read
++// bandwidth from a usm_host allocation against plain heap memory, the
++// question behind the pinned host bank's CPU-tier slowdown.
++TEST(moe_expert_weight_provider, DISABLED_cpu_read_bandwidth_usm_host_vs_heap) {
++    constexpr size_t bytes = size_t{512} << 20;
++    auto& engine = get_test_engine();
++    const layout l({1, 1, 1, static_cast<ov::Dimension::value_type>(bytes)}, data_types::u8, format::bfyx);
++    auto host = engine.allocate_memory(l, allocation_type::usm_host, false);
++    std::vector<uint8_t> heap(bytes);
++    auto run = [&](const uint8_t* p, const char* what) {
++        std::memset(const_cast<uint8_t*>(p), 1, bytes);
++        double best = 0;
++        for (int r = 0; r < 5; ++r) {
++            const auto t0 = std::chrono::steady_clock::now();
++            uint64_t acc = 0;
++            const auto* q = reinterpret_cast<const uint64_t*>(p);
++            for (size_t i = 0; i < bytes / 8; i += 8)
++                acc += q[i] ^ q[i + 1] ^ q[i + 2] ^ q[i + 3] ^ q[i + 4] ^ q[i + 5] ^ q[i + 6] ^ q[i + 7];
++            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++            best = std::max(best, bytes / s / 1e9);
++            ASSERT_NE(acc, 1u);
++        }
++        std::cout << "[BW] " << what << " CPU read " << best << " GB/s" << std::endl;
++    };
++    run(heap.data(), "heap");
++    run(static_cast<const uint8_t*>(host->buffer_ptr()), "usm_host");
++}
