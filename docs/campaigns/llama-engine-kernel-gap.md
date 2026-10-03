@@ -251,21 +251,57 @@ items of the fifth review are listed separately below.
    the token tiles as the fast grid dimension. Dense prefill 703 -> 816 t/s
    at 4,096 tokens, 758 -> 891 at 512, KL unchanged.
 
-   Still open from the review:
-   - weights double-buffered in registers (the first form measured slower,
-     Q4_K 1,229 -> 1,770 us);
-   - the cooperative prefetch further ahead;
-   - a half-precision decode. As written (bytes -> `convert_half16` ->
-     half16 `fma`) IGC emitted 2,034 `mov` against 664 (the byte unpack)
-     and unpacked SIMD16 half `mad`: 4,298 instructions against 3,241
-     (`code`, ISA), not tried further. A packed form needs IGC to emit
-     32-wide half operations;
-   - an int8 kernel with oneDNN's structure.
+   **0013 (2026-10-03)**, all `measured-here` on the B60 unless marked.
+   Dense prefill 816 -> 931 t/s at 4,096 tokens and 892 -> 1,030 at 512
+   (llama-bench). The steps and their numbers are in
+   `contrib/llama.cpp/README.md`, 0013. What the measurements showed:
 
-   Next:
-   - Q5_K's and Q6_K's tiles: 0029 used a 128-token tile for Q5_K and a
-     padded Q6_K layout;
-   - int8 activations with int8 DPAS (step 2).
+   - *The card's matrix rate is reachable.* A DPAS microbenchmark with
+     operands in registers and 0012's chain shape (8 accumulators, b0 pass
+     then b1 pass) runs at 98.3 TFLOPS fp16 and 196.6 TOPS int8, the
+     rated peaks, at 128 or 256 GRF and with 4, 8 or 16 accumulators. The
+     chain shape was never the limit.
+   - *The fp16 kernel at 4,096 x 512 x 14,336 is bound by its activation
+     reads.* Ablations of the Q4_K kernel (device time, avg us): real
+     1,066; without the decode 1,125; without the A reads 808; without
+     either 700. 700 us is the DPAS floor with 3.2 waves rounded to 4.
+     The 16 sub-groups of a work-group re-read the same 64 tokens, about
+     70 B/clk a core through L1.
+   - *More rows a sub-group does not pay.* Two 16-row tiles a sub-group
+     halve the A bytes a DPAS. That needs 128 GRF of accumulators: each
+     part alone is cheap (no decode 840 us, no A 814) but together 1,285,
+     the reads issued late. Slower at the endpoint at every shape tried.
+     Prefetch and register double-buffers of A did not help either (README
+     0013).
+   - *The test shape misled.* At the model's own shapes (K = 5,120) the
+     fp16 kernel already ran at ~77 TFLOPS, ~80 % of the floor. The long-K
+     down projection (K = 17,408) was the weak one, through a falling L1
+     hit rate: a barrier every 16 blocks fixed most of it (KSYNC).
+   - *"One instruction, two operations"* (the operator's question): oneDNN
+     does SIMD32 byte and half operations on packed registers, two or four
+     values a lane an instruction. OpenCL C has no way to ask IGC for that:
+     a per-lane `half2` is kept as two planar SIMD16 halves. IGC's inline
+     vISA can (`__asm__`, `.decl ... alias=<%n, 0>` to retype a register,
+     `(M1_NM, 32)` because a SIMD16 thread's dispatch mask covers only 16
+     channels). The packed decode and the int8 kernel's word-source `mad`
+     are written that way.
+   - *int8 needed a different scale path than oneDNN's.* oneDNN's u4 has
+     scales per 64 and rescales in float after each group. Q4_K's are per
+     32. The per-32 float rescale (v2-v4 attempts, 1,599-2,140 us) and a
+     split-scale form (two DPAS a sub-block) lost or tied. What worked:
+     codes as s8 (code - 8), so each sub-block's product fits 16 bits and
+     its scale is one integer `mad` on word sources. 9-15 % faster than
+     the fp16 kernel at every model shape. KL +0.0005 nats.
+
+   Open:
+   - the int8 kernel is bound by load latency, at ~44 % of the int8 rate
+     at gate/up. Without its sub-block read-ahead it is 19-30 % slower; L1
+     prefetch does not help, and 8 threads an XVE (128 GRF) does not fit;
+   - Q6_K (658 of 2,968 ms of K-quant GEMM device time in a 4,096-token
+     prefill, before KSYNC) has signed 8-bit scales per 16: no int8 form
+     found;
+   - Q5_K on int8 (the fifth bit makes codes 0..31: s8 code - 16 fits the
+     same 16-bit bound at activations of 7 bits only).
 8. **GDN conv chain and decode fusions** (dense −20 ms prefill, −4.5 ms per
    token; coder −11 / −2.5): concat + ssm_conv + silu + state copy as one
    kernel after `paged_causal_conv1d_ref.cl`; l2-norm into the GDN kernel;

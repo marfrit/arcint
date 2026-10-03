@@ -51,6 +51,14 @@ depth (0001-0008): dense 540 t/s at 512 tokens after 4,096, 590
 at 4,096 tokens, 363 at 512 after 16,384; coder 1,032 at 512 after 4,096,
 1,322 at 4,096 tokens, 889 at 4,096 after 4,096.
 
+Dense prefill on the B60 after the 2D-block GEMMs (`measured-here`,
+2026-10-03, llama-bench): 590 t/s at 4,096 tokens and 633 at 512 with
+0001-0008. Then 0011 702 / 758, 0012 816 / 892, and 0013 931 / 1,030.
+0013 decodes the weights two to an instruction (inline vISA) and runs Q4_K
+on int8 DPAS (`contrib/llama.cpp/README.md`); its int8 activations cost
++0.0005 nats of KL. The coder's prefill on the A770 is unchanged by
+0011-0013 (B60-only kernels).
+
 Decode with context (0001-0007; 0001-0006 in brackets): coder 47.3 (13.6)
 t/s at 4,096 tokens and 43.5 (4.2) at 16,384; dense 19.39 (12.8) and 17.95
 (6.4).
@@ -69,7 +77,9 @@ are in `docs/campaigns/llama-engine-kernel-gap.md`):
   Q4_K_M;
 - dense prefill: the K-quant GEMMs (Q4_K 464, Q6_K 128 ms of 983 per 512
   tokens, profiled before 0008; prefill attention was 188 ms of it, and
-  0008's kernel is 18x faster at test-backend-ops);
+  0008's kernel is 18x faster at test-backend-ops). After 0013 the int8
+  Q4_K kernel waits on load latency (~44 % of the int8 rate), and Q6_K has
+  no int8 form yet (`docs/campaigns/llama-engine-kernel-gap.md`, lever 7);
 - coder prefill: the MoE gate/up GEMM (117 ms of 389, before 0008;
   prefill attention was 97 ms);
 - decode, both: ~1,100 kernel launches a token; NEO exposes no

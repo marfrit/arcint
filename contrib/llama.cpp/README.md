@@ -578,3 +578,124 @@ Tried in the same pass and left out (`measured-here`):
 - 96-token tiles;
 - L1 prefetch of the next activation tile;
 - two-column activation reads.
+
+## 0013-opencl-intel-kquant-gemm-packed-decode-int8.patch
+
+Four changes to the B60's 2D-block GEMM (`kernels/mul_mm_kq_2d.cl`), each
+measured on its own. The diagnosis behind them is in
+`docs/campaigns/llama-engine-kernel-gap.md` (lever 7).
+
+- **Packed fp16 decode (Q4_K, Q5_K, Q6_K).** The weights were decoded one
+  value per 32-bit lane operation: shift, mask, convert, multiply-add,
+  convert to half. Five instructions a weight. Now one `bfn` masks two codes
+  into a dword as halves 1024 + q, and two 32-wide half instructions
+  subtract 1024 (exact) and scale. Those two are inline vISA (`hscale`):
+  IGC keeps a per-lane `half2` as two planar halves and moved them apart
+  and back around every operation.
+  - The pairs are codes (k, k + 2). So the f16 activations are written
+    with k permuted inside every group of four (`kernel_cvt_f32_f16_p4`,
+    P4).
+  - Q4_K's main loop: 1,640 -> 970 instructions for 128 DPAS. Q5_K:
+    2,145 -> 1,217. Q6_K: 2,386 -> 1,195.
+- **The activation conversion, eight values a work-item.** 16-byte stores
+  in place of 2-byte ones: 182 -> 139 us at 512 x 14,336.
+- **A work-group barrier every 16 blocks (`KSYNC`).** The sub-groups share
+  the activation tile through L1. Without a barrier they drift apart over
+  a long k loop. At K = 17,408 the load-store cache hit 86.5 % of reads
+  against 92 % at 5,120 (unitrace ComputeBasic), and the vector engines'
+  shared-function hold was 32.5 % against 15 %. Down projection, 512
+  tokens: Q4_K 1,496 -> 1,342 us, Q5_K 1,660 -> 1,405, Q6_K 1,960 ->
+  1,431. The K = 5,120 shapes are within 1.4 %.
+- **Q4_K on int8 DPAS (`kernel_mul_mm_kq2d_q4_K_i8`).** One i8 x i8 DPAS a
+  32-value sub-block, at twice fp16's multiply rate.
+  - The activations go in as int8 per (token, 256) (`kernel_quant_i8`),
+    with their integer sums per 32.
+  - The codes go in as s8 (code - 8). A sub-block's product is then at
+    most 32 x 127 x 8 = 32,512 in magnitude, a 16-bit value.
+  - Its 6-bit scale is applied by one integer `mad` on word sources
+    (inline vISA `mad16`) into an int32 accumulator that spans the
+    super-block. The constant part, 8 D sc - DM m, is one fp16 DPAS a
+    super-block against the sums.
+  - The activation tile and the weights are read a sub-block ahead.
+  - On by default; `GGML_OPENCL_KQ_2D_I8=0` keeps the fp16 kernel.
+  - **A deviation from the references, with its price.** llama.cpp's MMQ
+    quantizes activations per 32 (q8_1), and oneDNN, on the OpenVINO path,
+    per 64. This kernel does it per 256 so that the integer accumulation
+    spans a super-block. The per-32 forms rescale in float after every
+    sub-block, and they measured slower here (1,599-2,140 us against
+    1,229 for fp16, the first attempts in lever 7). Price on the dense
+    27B: see the KL and sampled rows below. Decode is unaffected; its
+    matvec keeps q8_1 per 32.
+
+The inline vISA shares a program with the fp16 kernels. A driver that
+rejects it loses the whole 2D path, with a warning, and prompts fall back
+to `mul_mm_kq_f16.cl`.
+
+The 2D path and the older kernels now keep the f16 activations in
+different orders, in the same buffer. Where a MoE layer's routed experts
+(natural order) and its shared expert (P4) read one input on the B60, the
+input is converted twice. None of the served models do that on this
+path.
+
+Measured (`measured-here`, B60, `GGML_OPENCL_PLATFORM=0`):
+
+Device time (unitrace), the dense model's shapes, 512 tokens, KSYNC 16 in
+both arms; fp16 plus its conversion against int8 plus its quantization:
+
+| m x k (dense projection) | fp16 | int8 |
+|---|---|---|
+| 17,408 x 5,120 (gate, up) | 1,191 + 44 us | 1,080 + 43 us |
+| 5,120 x 17,408 (down) | 1,344 + 184 us | 1,139 + 132 us |
+| 12,288 x 5,120 (q) | 902 + 50 us | 775 + 44 us |
+| 5,120 x 6,144 (out) | 440 + 57 us | 390 + 46 us |
+
+llama-bench, dense 27B Q4_K_M, `-fa 1`, two repeats, the arms interleaved:
+
+| build | prefill 512 | prefill 4,096 |
+|---|---|---|
+| 0012 | 892 t/s | 816 t/s |
+| + packed decode, Q4_K | 919 | 839 |
+| + Q5_K, Q6_K | 935 | 852 |
+| + the conversion | 941 | 857 |
+| + KSYNC 16 | 968 | 880 |
+| + int8 Q4_K (0013) | 1,029 | 930 |
+| 0013 as committed (reviewed tree) | 1,030 | 931 |
+| the same, `GGML_OPENCL_KQ_2D_I8=0` | 973 | 884 |
+
+- KL batched, against the same GGUF on the CPU: 0012 0.003559 (top-1
+  97.843 %); packed decode 0.003562 (97.843 %); 0013 with int8 0.004034
+  (97.721 %), with `GGML_OPENCL_KQ_2D_I8=0` 0.003562 (97.843 %). The int8 activations alone (fp16 kernel fed int8-per-256
+  values, an emulation): 0.004048, 97.50 %.
+- The acceptance task, served (`--engine llama`, MTP 5, the 40,960-id
+  draft head): 10/10 at temperature 0 on the dense model (B60) and the
+  coder (A770, MTP 4). Twenty sampled runs (temperature 0.7) per arm on
+  the dense model, the runs at 10/10 and the mean: 0013 14 of 20 (8.7);
+  0013 with int8 off 12 of 20 (7.7); 0012 15 of 20 (8.15). The arms do
+  not separate. The record's earlier plain arms were 10, 11 and 15 of 20.
+- The coder's prefill on the A770 (llama-bench, 512 tokens) is unchanged
+  at 1,610 t/s: none of this patch runs there.
+- `test-backend-ops -o MUL_MAT` 1,123/1,123 on both cards, int8 on and
+  off. Two injected faults failed it: the conversion without P4 (30
+  cases), the int8 kernel without its constant term (9).
+- MUL_MAT_ID on the B60: the same 74 MXFP4 failures as 0012. The pristine
+  pin `bed0a85` fails the same 74 on the B60 and passes them on the A770.
+  They are upstream's, not this series'.
+
+Measured and left out (`measured-here`, B60):
+- two 16-row weight tiles a sub-group, so each activation read feeds two
+  DPAS. Slower at every shape, fp16 and int8. Dense prefill 742-780 t/s
+  against 839 (fp16).
+- weights and scales read a step ahead in the fp16 kernel: Q4_K 1,158 ->
+  1,204 us. The activation tile read a half-sub-block ahead: 1,066 ->
+  1,273 us.
+- cooperative L1 prefetch of the activation tile, one or two blocks ahead:
+  no gain in either kernel.
+- 8-row activation reads (fp16): 1,066 -> 1,439 us.
+- a banded raster (bands of 4 token tiles): down -4 %, gate/up +6 %.
+- Q4_K int8 with the 6-bit scale split as 8 s_hi + s_lo: two i8 x u8 DPAS
+  a sub-block and no per-sub-block rescale. Correct, but slower than the
+  fp16 kernel at K = 5,120 (1,251 against 1,180 us).
+- the int8 kernel at 16 tokens a sub-group in 128-GRF mode (8 threads an
+  XVE instead of 4): spills, 37 instructions a DPAS.
+- the conversion with each column read once and held in registers: 139 ->
+  136 us, not kept.
