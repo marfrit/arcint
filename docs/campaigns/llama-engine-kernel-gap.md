@@ -200,9 +200,32 @@ items of the fifth review are listed separately below.
    - Dense prefill 594 -> 702 t/s at 4,096 tokens, 632 -> 758 at 512.
    - KL unchanged.
 
+   The 4,096-token dense prefill after 0011 (profiling build, 701.7 t/s):
+   - device time 7.06 -> 5.81 s;
+   - the GEMMs 68 % of it: Q4_K 2.90 s, Q6_K 0.81 s, Q5_K 0.25 s;
+   - prompt attention 10 %, gated delta-net 6 %, the conversion 3.5 %.
+
+   Matching the OpenVINO path's 3.59 s still needs the GEMMs about 2.5x
+   faster.
+
+   unitrace on the 2D kernel: the vector engines are active 59.5 % of the
+   time (the old kernel 29 %), scoreboard waits 33 %.
+
+   *int8, first attempt (not shipped):*
+   - the activations quantized per (token, 32), Q4_K codes as the u8 b
+     operand, one i8 x u8 DPAS a sub-block;
+   - correct (MUL_MAT 1,123/1,123) but 2.2x slower: 2,747 us against
+     1,247;
+   - unitrace: active 37.8 %, scoreboard waits 65 %. With the float decode
+     gone, nothing hides the loads, and it issues 133 load messages a
+     super-block, 16 of them a sub-block's scales and sums;
+   - needs those loads merged and the next sub-block's activations read
+     ahead. A measured shape, not a verdict on int8.
+
+   A single-pass f32 -> f16 conversion measured 0.5 % at the kernel and was
+   left out.
+
    Next:
-   - the f32 -> f16 conversion: about 250 us a call at 512 x 14,336, two
-     passes over the f32 input;
    - Q5_K's and Q6_K's tiles: 0029 used a 128-token tile for Q5_K and a
      padded Q6_K layout;
    - int8 activations with int8 DPAS (step 2).

@@ -522,7 +522,7 @@ Four alternatives measured slower or equal before this one:
 Measured (`measured-here`, B60):
 
 - test-backend-ops, 4,096 x 512 x 14,336, the activation conversion
-  included (about 250 us of it):
+  included:
 
   | type | before | after |
   |---|---|---|
