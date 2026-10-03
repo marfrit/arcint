@@ -486,3 +486,58 @@ from the catch-up batch, as Strata's does
 first chained from the wrong row: served draft acceptance fell from 78 to
 57 % on the dense 27B at 3 drafts, and from 91 to 75 % on the coder at 2
 (`measured-here`).
+
+## 0011-opencl-intel-kquant-gemm-2d-block-loads.patch
+
+The K-quant GEMM on Xe2 with both operands read by 2D block loads
+(`kernels/mul_mm_kq_2d.cl`, `cl_intel_subgroup_2d_block_io`, B60 only). It
+takes the shape of arcint's OpenVINO kernel (marfrit-openvino patch 0029),
+moved onto ggml-opencl's flat planes.
+
+- **Weights.** A lane is a weight row. One transposed 32-bit block read
+  brings 32 bytes of each of the sub-group's sixteen rows. They are decoded
+  in registers to the fp16 DPAS b operand.
+- **Activations.** The tokens are the a operand, 32 rows x 16 halves a
+  read, straight from the f16 copy of the activations. A work-group's
+  sub-groups share them through L1: no local memory, no barrier.
+- **Reuse.** The weights are decoded once per 64 tokens. A work-group has
+  16 sub-groups, so 256 weight rows.
+
+The kernel serves where every 2D surface is at least 64 bytes a row: Q5_K
+from K = 512, Q6_K from K = 1,024. It is built only where the device's base
+alignment is a multiple of 64 bytes, since the planes are sub-buffers at that
+alignment. It serves only within the extension's 2^24 limits.
+
+Why (`measured-here`, B60, docs/campaigns/llama-engine-kernel-gap.md lever
+7): `mul_mm_kq_f16.cl` was 73 % of a 4,096-token dense prefill. unitrace
+showed its threads waiting on loads 52 % of the time, with every thread
+slot full.
+
+Four alternatives measured slower or equal before this one:
+- the activations tiled for block reads;
+- taller tiles;
+- the activation loads pipelined in registers;
+- k-tiles of 64 through local memory, double-buffered.
+
+Measured (`measured-here`, B60):
+
+- test-backend-ops, 4,096 x 512 x 14,336, the activation conversion
+  included (about 250 us of it):
+
+  | type | before | after |
+  |---|---|---|
+  | Q4_K | 1,722 us | 1,262 us (47.6 TFLOPS) |
+  | Q5_K | 1,726 us | 1,511 us |
+  | Q6_K | 1,748 us | 1,557 us |
+
+- `test-backend-ops -o MUL_MAT`: 1,123/1,123 on both cards, with cases
+  this patch adds (Q5_K at K = 512, a src1 broadcast over dimension 2).
+  Three injected decode faults (Q4_K's min sign, Q6_K's
+  scale halves, Q5_K's fifth bit) each failed 8-19 of them.
+- llama-bench, dense 27B: prefill 632 -> 758 t/s at 512 tokens, 594 -> 702
+  at 4,096.
+- KL batched: 0.003559 -> 0.003559, top-1 97.84 %.
+
+Switches: `GGML_OPENCL_KQ_2D=0` keeps `mul_mm_kq_f16.cl`;
+`GGML_OPENCL_KQ_2D_SHAPE = "TM,WG,AT"` sets the token tile, the sub-groups
+and the activation read height (8 or 32).

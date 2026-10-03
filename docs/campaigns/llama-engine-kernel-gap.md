@@ -130,6 +130,82 @@ items of the fifth review are listed separately below.
    reads (B60) / a VNNI-tiled layout (A770), the dequant overlapped with the
    DPAS loop, narrow-tile variants. Already within 15-30 % of arcint's best
    XMX K-quant kernel on the B60 (patch 0029, 59 TFLOPS, `measured-here`).
+
+   **Diagnosis, 2026-10-03** (B60, all `measured-here` unless marked).
+   The lever is bigger than this entry first estimated.
+
+   *Size of the prize.* On a 4,096-token dense prefill (7.06 s,
+   ggml-opencl profiling build) the K-quant GEMMs (`mul_mm_kq_f16.cl`) are
+   73 % of device time: Q4_K 53.8 %, Q6_K 15.2 %, Q5_K 4.4 %. The rest is
+   prompt attention 8.3 %, gated delta-net 4.9 % and the f32 -> f16
+   activation conversion 2.9 %. The FFN down projection alone is 25 %. The
+   OpenVINO path takes 3.59 s for the same prefill, and our non-GEMM work is
+   already 1.86 s, so matching it needs the GEMM about 3x faster.
+
+   *What the OpenVINO path runs.* `ONEDNN_VERBOSE` on the deployed binary
+   (`arcint 0.5.4-1`, `marfrit-openvino +p25`): every dense projection is a
+   oneDNN `jit:gemm:any` matmul. The activations are `s8`, quantized per 64
+   at run time; the weights are `u4` with f16 scales and u8 zero points per
+   64. The inner loop is int8 x u4, on DPAS at twice fp16's rate.
+
+   *Where our GEMM's time goes.* Q4_K, 4,096 x 512 x 14,336:
+
+   | arm | time | TFLOPS |
+   |---|---|---|
+   | as is | 1,722 us | 34.9 |
+   | the B operand a constant | 1,212 us | 49.6 |
+   | no dequantization | 1,380 us | 43.6 |
+   | both | ~955 us | 63 |
+
+   unitrace `VectorEngineStalls` over the kernel: the vector engines are
+   active 29 % of the time with every thread slot occupied. Stall reasons:
+   scoreboard waits 52 %, barriers 6 %, instruction fetch 4 %. No spills
+   (ISA).
+
+   *Negatives, each with the mechanism it tested:*
+   - B tiled so that each B operand is one sub-group block read, in place of
+     16-address gathers: 1,722 -> 1,703 us. The gather shape was not the
+     cost.
+   - Taller tiles, for less B traffic from L2: worse at every shape tried,
+     up to 2.2x.
+   - B loads pipelined one k-step ahead in registers: 1,692 -> 2,325 us.
+   - k-tiles of 64 with A and B in local memory, double-buffered (MM2;
+     first written so a thread awaited its own staging loads, then
+     register-staged so the loads overlap the DPAS): at best 2,527 us. The
+     counters show why. At 80 KB a work-group, occupancy is 25 %. At
+     4,2,4,4 the shared functions held requests 41 % of the time: B moved
+     through local memory just moves the queue to the local-memory port.
+
+   *What follows.* The kernel's whole data path caps it near 35 % of the
+   card's fp16 peak: B from global per sub-group, A dequantized into local
+   memory, fp16 DPAS, small register tiles. The references (`code` where
+   read: the oneDNN trace above; Intel's XeTLA / sycl-tla Xe2 GEMMs, not
+   yet read here) load both operands with the hardware 2D block loads
+   (`cl_intel_subgroup_2d_block_io`, present on the B60), prefetch k-tiles
+   into L1, keep larger register tiles, and multiply in int8 where the
+   format allows. Plan, in order:
+   1. A B60 GEMM on 2D block loads with L1 prefetch, against the 63 TFLOPS
+      ceiling above.
+   2. int8 activations with int8 DPAS. An earlier int8 GEMM moved dense KL
+      by 0.0028 nats and top-1 by 0.9 points, inside the bar.
+   3. The activation conversion (2.9 %).
+
+   The few-token verify (0009) is unaffected: it is a different kernel.
+
+   **Step 1 done (0011):** patch 0029's 2D-block kernel, ported onto the
+   flat planes.
+   - Q4_K: 1,722 -> 1,262 us at the shape above, the activation conversion
+     included.
+   - Q5_K: +14 %. Q6_K: +12 %.
+   - Dense prefill 594 -> 702 t/s at 4,096 tokens, 632 -> 758 at 512.
+   - KL unchanged.
+
+   Next:
+   - the f32 -> f16 conversion: about 250 us a call at 512 x 14,336, two
+     passes over the f32 input;
+   - Q5_K's and Q6_K's tiles: 0029 used a 128-token tile for Q5_K and a
+     padded Q6_K layout;
+   - int8 activations with int8 DPAS (step 2).
 8. **GDN conv chain and decode fusions** (dense −20 ms prefill, −4.5 ms per
    token; coder −11 / −2.5): concat + ssm_conv + silu + state copy as one
    kernel after `paged_causal_conv1d_ref.cl`; l2-norm into the GDN kernel;
