@@ -318,3 +318,66 @@ GATED_DELTA_NET 42/42, MUL_MAT_ID 338/338, MUL_MAT 1,045/1,045,
 FLASH_ATTN_EXT 2,642/2,644 (the two that fail without the patches),
 SWIGLU 24/24, GEGLU 24/24, MUL 93/93; the coder 1,285.6 t/s prefill,
 47.8 / 47.4 t/s decode at 0 / 4,096 tokens.
+
+## 0008-opencl-intel-prompt-attention-dpas.patch
+
+Prompt attention (more than 8 query rows, f32 Q, f16 K/V, head size 256, an
+f16 mask, no sinks, ALiBi or softcap) on the XMX units
+(`kernels/flash_attn_dpas.cl`). ggml's `flash_attn_f32_f16.cl` computes it
+in f32 scalar code: 344 GFLOPS on the B60, 309 on the A770 (`measured-here`,
+test-backend-ops, 512 rows x 4,096 keys, 24 heads on 4), and at 4,096
+tokens of context it was 66 % of the coder's prefill.
+
+- Sub-group 16 (Xe2, B60): a work-group of 16 sub-groups takes 128 query
+  rows; per tile of 32 keys, staged in local memory for all of them (V
+  transposed), S = Q K^T by DPAS with Q in local memory in the a layout, the
+  mask added, the online softmax in f32 (row max and sum by sub-group
+  reductions), and O += P V by DPAS -- S's result layout (lane = key,
+  component = row) is P's a layout at sub-group 16. 256 GRF.
+- Sub-group 8 (Xe-HPG, A770): a pair of sub-groups shares 8 query rows,
+  each owning half of the 256 output columns (16 float8 in registers) and
+  computing S itself; P is re-laid from S by shuffles (two keys a lane).
+  The shuffles run in every lane: under a branch they read lanes the branch
+  left inactive (NaN, `measured-here`).
+- The work-group stops after the last key any of its rows sees, each row's
+  masked tail scanned backwards (llama.cpp's causal mask). Taking the last
+  row's alone failed test-backend-ops' masks with -inf blocks.
+- The row sums add the f16-rounded probabilities that P V multiplies, each
+  lane its share, reduced across the sub-group once at the end.
+- V is staged transposed with the key fastest, so neighbouring work-items
+  store neighbouring halves (key-major they all hit one bank).
+- Known cost: the masked-tail scan reads one half a step per row. For
+  llama.cpp's causal mask of one sequence the tail is at most the ubatch;
+  several sequences in one batch, or a sliding window, lengthen it.
+
+Review (a Fable pass over the first version), applied: -inf recognised by
+its f16 bit pattern rather than a threshold; no correction factor before a
+row has seen a key; the row sums deferred; the key-fastest V staging; the
+loader checks the kernel's local memory against the device's next to its
+work-group size; the dispatch also requires unit strides along dimension 0
+of Q, K and V, and a mask at least n_kv x n_q. Together, against the
+version before them at test-backend-ops (`measured-here`, the case below):
+B60 8.66 -> 8.22 ms, A770 24.1 -> 22.4 ms. With V staged key-major
+again (`GGML_OPENCL_FA_DPAS_OPTS`, a since removed define): B60 8.60, A770
+24.1-24.3 ms.
+
+Measured (`measured-here`, test-backend-ops, 512 rows x 4,096 keys, 24
+heads on 4, f16 mask, the patched tree): B60 149.9 -> 8.2 ms (6.3 TFLOPS),
+A770 167.0 -> 22.6 ms (2.3 TFLOPS), `flash_attn_f32_f16.cl` -> this
+kernel. (An earlier 6.7 ms on the B60 came from a standalone harness with
+no mask buffer and is not the figure to compare.) llama-bench prefill,
+before -> after, on the version before the review (the reviewed one is
+faster at the kernel): dense 27B (B60) 525 -> 633 t/s at 512 tokens, 145
+-> 540 at 512 tokens after 4,096, 590 at 4,096 tokens, 363 at 512 after
+16,384; coder (A770) 1,285 -> 1,608, 350 -> 1,032, 602 -> 1,322 at 4,096
+tokens (the OpenVINO path's coder: 1,379 at 4k), 262 -> 889 at 4,096 after
+4,096. `test-backend-ops -o FLASH_ATTN_EXT`: 2,643/2,644 on the B60 and
+2,642/2,644 on the A770, the failures those of the unpatched tree (a
+softcap case this kernel does not take; a head-64 case on the A770). KL,
+batched (the prompt path), against the same reference: coder 0.007059 ->
+0.007043, dense 0.003559 -> 0.003559, top-1 within 0.1 point. The coder
+10/10 on the acceptance task and the dense model 10/10 greedy, 13/20
+sampled (the version before the review).
+
+Switches: `GGML_OPENCL_FA_DPAS=0` keeps `flash_attn_f32_f16.cl`;
+`GGML_OPENCL_FA_DPAS_OPTS` adds build options to the kernel.

@@ -30,18 +30,26 @@ the weights dequantized per work-group tile, for `MUL_MAT` and `MUL_MAT_ID`
 -- and exempts the shapes these take from that rule
 (`contrib/llama.cpp/README.md`).
 
-Patches 0002-0007 add the IQ types (Flash-Next), the gated delta-net,
+Patches 0002-0008 add the IQ types (Flash-Next), the gated delta-net,
 the decode's small kernels, the few-row F32 projections, a MoE GEMM in the
-shape of arcint's OpenVINO patch 0064, and decode attention that does not
-slow with context (`contrib/llama.cpp/README.md`, one section per patch).
+shape of arcint's OpenVINO patch 0064, decode attention that does not
+slow with context, and prompt attention on the XMX units
+(`contrib/llama.cpp/README.md`, one section per patch).
 
 `measured-here`, 2026-10-03, llama-bench, one sequence (A770 GT clock pinned
 at 2000 MHz):
 
-| model, card | prefill 512: stock / 0001 / 0001-0007 | decode: stock / 0001 / 0001-0007 |
+| model, card | prefill 512: stock / 0001 / 0001-0007 / 0001-0008 | decode: stock / 0001 / 0001-0007 |
 |---|---|---|
-| Qwen3.8-27B Q4_K_M, B60 | 71.1 / 417.9 / 521 t/s | 10.3 / 18.0 / 19.75 t/s |
-| Qwen3.6-35B-A3B coder Q4_K_M, A770 | 111.2 / 605.0 / 1,292 t/s | 7.7 / 37.7 / 47.8 t/s |
+| Qwen3.8-27B Q4_K_M, B60 | 71.1 / 417.9 / 521 / 633 t/s | 10.3 / 18.0 / 19.75 t/s |
+| Qwen3.6-35B-A3B coder Q4_K_M, A770 | 111.2 / 605.0 / 1,292 / 1,608 t/s | 7.7 / 37.7 / 47.8 t/s |
+
+0008 takes only prompts (more than 8 query rows); decode is 0001-0007's.
+The 0001-0008 column and the figures below are from 0008 before its review
+(the reviewed kernel is 5-7 % faster at test-backend-ops). Prefill at
+depth (0001-0008): dense 540 t/s at 512 tokens after 4,096, 590
+at 4,096 tokens, 363 at 512 after 16,384; coder 1,032 at 512 after 4,096,
+1,322 at 4,096 tokens, 889 at 4,096 after 4,096.
 
 Decode with context (0001-0007; 0001-0006 in brackets): coder 47.3 (13.6)
 t/s at 4,096 tokens and 43.5 (4.2) at 16,384; dense 19.39 (12.8) and 17.95
@@ -60,9 +68,10 @@ are in `docs/campaigns/llama-engine-kernel-gap.md`):
   token at ~400 GB/s; the OpenVINO export's int4 is ~18 % fewer bytes than
   Q4_K_M;
 - dense prefill: the K-quant GEMMs (Q4_K 464, Q6_K 128 ms of 983 per 512
-  tokens) and prefill attention (188 ms);
-- coder prefill: the MoE gate/up GEMM (117 ms of 389), prefill attention
-  (97 ms);
+  tokens, profiled before 0008; prefill attention was 188 ms of it, and
+  0008's kernel is 18x faster at test-backend-ops);
+- coder prefill: the MoE gate/up GEMM (117 ms of 389, before 0008;
+  prefill attention was 97 ms);
 - decode, both: ~1,100 kernel launches a token; NEO exposes no
   `cl_khr_command_buffer`, so fusion is the lever.
 

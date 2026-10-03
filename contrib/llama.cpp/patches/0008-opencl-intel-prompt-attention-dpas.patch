@@ -1,0 +1,516 @@
+diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
+index a38875c..4684ece 100644
+--- a/ggml/src/ggml-opencl/CMakeLists.txt
++++ b/ggml/src/ggml-opencl/CMakeLists.txt
+@@ -219,6 +219,7 @@ set(GGML_OPENCL_KERNELS
+     ssm_scan
+     gated_delta_net
+     gated_delta_net_intel
++    flash_attn_dpas
+     sub
+     sum_rows
+     cumsum
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index bbdcb56..40f14ab 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1057,6 +1057,9 @@ struct ggml_backend_opencl_context {
+     // Intel, S_V = 128, scalar gate (gated_delta_net_intel.cl): generation
+     // (one token) and prompt kernels and their shapes
+     cl_kernel kernel_gdn_intel_tg = nullptr;
++    // Intel, prompt attention on the XMX units (flash_attn_dpas.cl; SG 16 or 8)
++    cl_kernel kernel_fa_dpas = nullptr;
++    int       fa_dpas_bq = 0, fa_dpas_nthr = 0;   // query rows and work-items a work-group
+     cl_kernel kernel_gdn_intel_pp = nullptr;
+     int gdn_intel_sg = 0, gdn_intel_r_tg = 0, gdn_intel_r_pp = 0, gdn_intel_nsg = 0;
+     cl_kernel kernel_ssm_scan_f32 = nullptr;
+@@ -3984,6 +3987,66 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+         }
+     }
+ 
++    // flash_attn_dpas: prompt attention (f32 Q, f16 K/V, head size 256) on
++    // the XMX units. SG 16 (Xe2): 128 query rows and 32 keys a step
++    // (measured-here, test-backend-ops, 512 rows x 4,096 keys, 24 heads on
++    // 4, f16 mask: B60 8.2 ms, A770 22.4 ms). SG 8 (Xe-HPG): 32 rows, a
++    // sub-group pair a row group. GGML_OPENCL_FA_DPAS=0 keeps
++    // flash_attn_f32_f16.cl; GGML_OPENCL_FA_DPAS_OPTS adds build options.
++    if (backend_ctx->gpu_family == INTEL && backend_ctx->has_intel_dpas) {
++        const char * fd_env = getenv("GGML_OPENCL_FA_DPAS");
++        size_t sg_sizes[8] = {};
++        size_t sg_bytes = 0;
++        clGetDeviceInfo(backend_ctx->device, CL_DEVICE_SUB_GROUP_SIZES_INTEL, sizeof(sg_sizes), sg_sizes, &sg_bytes);
++        bool sg8 = false, sg16 = false;
++        for (size_t i = 0; i < sg_bytes / sizeof(size_t); ++i) {
++            sg8  = sg8  || sg_sizes[i] == 8;
++            sg16 = sg16 || sg_sizes[i] == 16;
++        }
++        if ((sg8 || sg16) && (fd_env == nullptr || atoi(fd_env) != 0)) {
++#ifdef GGML_OPENCL_EMBED_KERNELS
++            const std::string kernel_src {
++                #include "flash_attn_dpas.cl.h"
++            };
++#else
++            const std::string kernel_src = read_file("flash_attn_dpas.cl");
++#endif
++            const int sg   = sg8 ? 8 : 16;
++            const int nsg  = sg8 ? 8 : 16;
++            const int nthr = nsg * sg, bq = sg8 ? nsg / 2 * 8 : nsg * 8;
++            cl_program p = build_program_from_source_optional(backend_ctx, kernel_src.c_str(),
++                compile_opts + " -cl-intel-256-GRF-per-thread -DDK=256 -DFA_SG=" + std::to_string(sg) +
++                " -DNSG=" + std::to_string(nsg) + " -DBK=32" +
++                (getenv("GGML_OPENCL_FA_DPAS_OPTS") ? std::string(" ") + getenv("GGML_OPENCL_FA_DPAS_OPTS") : std::string()));
++            if (p != nullptr) {
++                CL_CHECK((backend_ctx->kernel_fa_dpas = clCreateKernel(p, "flash_attn_f32_f16_dpas", &err), err));
++                // the kernel's own limits: work-items (a 256-GRF build halves
++                // them) and local memory against the device's
++                size_t   wg = 0;
++                cl_ulong lm = 0, lm_dev = 0;
++                CL_CHECK(clGetKernelWorkGroupInfo(backend_ctx->kernel_fa_dpas, backend_ctx->device,
++                                                  CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg), &wg, NULL));
++                CL_CHECK(clGetKernelWorkGroupInfo(backend_ctx->kernel_fa_dpas, backend_ctx->device,
++                                                  CL_KERNEL_LOCAL_MEM_SIZE, sizeof(lm), &lm, NULL));
++                CL_CHECK(clGetDeviceInfo(backend_ctx->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(lm_dev), &lm_dev, NULL));
++                if (wg < (size_t)nthr || lm > lm_dev) {
++                    CL_CHECK(clReleaseKernel(backend_ctx->kernel_fa_dpas));
++                    backend_ctx->kernel_fa_dpas = nullptr;
++                } else {
++                    backend_ctx->fa_dpas_bq   = bq;
++                    backend_ctx->fa_dpas_nthr = nthr;
++                }
++                CL_CHECK(clReleaseProgram(p));
++            }
++            if (backend_ctx->kernel_fa_dpas == nullptr) {
++                GGML_LOG_WARN("ggml_opencl: flash_attn_dpas.cl not built; flash_attn_f32_f16.cl takes the prompt\n");
++            }
++            GGML_LOG_CONT(".");
++        } else if (!sg8 && !sg16) {
++            GGML_LOG_WARN("ggml_opencl: no sub-group size 8 or 16 reported; flash_attn_f32_f16.cl takes the prompt\n");
++        }
++    }
++
+     // moe_combine (fused router-weight mul + cross-expert sum)
+     {
+     #ifdef GGML_OPENCL_EMBED_KERNELS
+@@ -18448,6 +18511,48 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     max_bias      = params[1];
+     logit_softcap = params[2];
+ 
++    // Intel, a prompt: flash_attn_dpas.cl (the XMX units)
++    if (backend_ctx->kernel_fa_dpas != nullptr && is_mixed && n_q > 8 && d_head_q == 256 && d_head_v == 256 &&
++        sinks == nullptr && max_bias == 0.0f && logit_softcap == 0.0f && !k_soa && !v_soa &&
++        q->nb[0] == sizeof(float) && k->nb[0] == sizeof(ggml_fp16_t) && v->nb[0] == sizeof(ggml_fp16_t) &&
++        (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q))) {
++        cl_kernel kd = backend_ctx->kernel_fa_dpas;
++        cl_mem    nomask = nullptr;
++        int a = 0;
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   &extra_q->data_device));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &offset_q));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   &extra_k->data_device));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &offset_k));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   &extra_v->data_device));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &offset_v));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   mask_buffer ? &mask_buffer : &nomask));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &offset_mask));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   &extra_o->data_device));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &offset_o));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(float),    &scale));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int),      &n_q));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int),      &n_kv));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int),      &n_head));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int),      &n_head_kv));
++        const cl_ulong nbs[15] = { q_nb1, q_nb2, q_nb3, k_nb1, k_nb2, k_nb3, v_nb1, v_nb2, v_nb3,
++                                   o_nb1, o_nb2, o_nb3, mask_nb1, mask_nb2, mask_nb3 };
++        for (const cl_ulong & nb : nbs) {
++            CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &nb));
++        }
++        const int mne2 = mask ? mask_ne2 : 1, mne3 = mask ? mask_ne3 : 1;
++        const int k_ne3 = (int) k->ne[3], v_ne3 = (int) v->ne[3];
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int), &mne2));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int), &mne3));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int), &n_batch));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int), &k_ne3));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int), &v_ne3));
++        const size_t bq = (size_t) backend_ctx->fa_dpas_bq, nthr = (size_t) backend_ctx->fa_dpas_nthr;
++        size_t gws[3] = { (size_t) CEIL_DIV(n_q, (int) bq) * nthr, (size_t) n_head, (size_t) n_batch };
++        size_t lws[3] = { nthr, 1, 1 };
++        backend_ctx->enqueue_ndrange_kernel(kd, 3, gws, lws, dst);
++        return;
++    }
++
+     bool use_q1_vec = false;
+     bool use_q1_vec_mq = false;
+     bool use_local_tile = false;
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
+new file mode 100644
+index 0000000..00a30ee
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
+@@ -0,0 +1,368 @@
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++#pragma OPENCL EXTENSION cl_intel_subgroups : enable
++#pragma OPENCL EXTENSION cl_intel_subgroups_short : enable
++#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
++#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
++#pragma OPENCL EXTENSION cl_intel_subgroup_local_block_io : enable
++
++// Flash attention for a prompt on the XMX units (sub-group 16 for Xe2,
++// sub-group 8 for Xe-HPG below):
++// f32 Q, f16 K/V, f16 mask. A work-group takes NSG*8 query rows of one head;
++// sub-group s rows 8s..8s+7 (the DPAS M). Per tile of BK keys, staged in
++// local memory for all sub-groups (V transposed): S = Q K^T by DPAS (lane =
++// key, component = row), the mask added, the online softmax in f32 (row max
++// and sum by sub-group reductions), and O += P V by DPAS, P being S's layout
++// read as the a operand. The work-group stops after the last key any of its
++// rows sees (from the mask; llama.cpp's causal mask leaves the upper
++// triangle out). Q and P are f16 in the products, S, O and the softmax f32:
++// GGML_PREC_F32 (which llama.cpp sets on every attention) asks for f32
++// accumulation, and the CPU reference rounds Q to f16 and accumulates P V
++// in f16. K/V broadcast over dimension 3 as ggml-cpu does
++// (k index batch / (n_batch / k_ne3)). No ALiBi, softcap or sinks (the
++// host keeps those on flash_attn_f32_f16.cl).
++
++#ifndef DK
++#define DK 256
++#endif
++#define DV DK
++#ifndef NSG
++#define NSG 16
++#endif
++#ifndef BK
++#define BK 32
++#endif
++#ifndef FA_SG
++#define FA_SG 16
++#endif
++#define SG FA_SG
++#if SG == 16
++#define BQ (NSG * 8)
++#define KC (DK / 16)
++#define NKB (BK / 16)
++#define NDC (DV / 16)
++#define NTHR (NSG * SG)
++
++#else
++// SG 8 (Xe-HPG): a pair of sub-groups shares 8 query rows, each owning half
++// of the output columns (its 128 columns of O, 16 float8, in registers) and
++// computing S itself; the a operand packs two keys a lane, so P is re-laid
++// from S (lane = key) by shuffles
++#define BQ (NSG / 2 * 8)
++#define KC (DK / 16)
++#define NKB (BK / 16)
++#define NDC (DV / 2 / 8)
++#define NTHR (NSG * SG)
++#endif
++
++#define DPAS(a, b, c) intel_sub_group_f16_f16_matrix_mad_k16(a, b, c)
++#if SG == 16
++#define LOAD_A(p) as_short8(intel_sub_group_block_read_us8((local const ushort *)(p)))
++#else
++#define LOAD_A(p) as_int8(intel_sub_group_block_read8((local const uint *)(p)))
++#endif
++#define M_INIT (-3.0e38f)
++
++#if SG == 16
++__attribute__((intel_reqd_sub_group_size(SG)))
++__attribute__((reqd_work_group_size(NTHR, 1, 1)))
++kernel void flash_attn_f32_f16_dpas(
++        global const char * q_void, ulong q_offset,
++        global const char * k_void, ulong k_offset,
++        global const char * v_void, ulong v_offset,
++        global const char * mask_void, ulong mask_offset,
++        global char * o_void, ulong o_offset,
++        float scale, int n_q, int n_kv, int n_head, int n_head_kv,
++        ulong q_nb1, ulong q_nb2, ulong q_nb3,
++        ulong k_nb1, ulong k_nb2, ulong k_nb3,
++        ulong v_nb1, ulong v_nb2, ulong v_nb3,
++        ulong o_nb1, ulong o_nb2, ulong o_nb3,
++        ulong mask_nb1, ulong mask_nb2, ulong mask_nb3, int mask_ne2, int mask_ne3,
++        int n_batch, int k_ne3, int v_ne3) {
++    local half qs[BQ * DK];     // [row group][k16 chunk][8 rows][16]
++    local half ks[BK * DK];     // [key][DK]
++    local half vt[DV * BK];     // [column][key]
++
++    const int lane = get_sub_group_local_id(), sg = get_sub_group_id(), lid = get_local_id(0);
++    const int head = get_group_id(1), batch = get_group_id(2);
++    const int hk   = head / (n_head / n_head_kv);
++    const int q0   = get_group_id(0) * BQ;
++
++    global const char * qb = q_void + q_offset + batch * q_nb3 + head * q_nb2;
++    global const char * kb = k_void + k_offset + (batch / (n_batch / k_ne3)) * k_nb3 + hk * k_nb2;
++    global const char * vb = v_void + v_offset + (batch / (n_batch / v_ne3)) * v_nb3 + hk * v_nb2;
++    global const half * mb = mask_void != 0
++        ? (global const half *)(mask_void + mask_offset + (batch % mask_ne3) * mask_nb3 + (head % mask_ne2) * mask_nb2)
++        : 0;
++
++    for (int u = lid; u < BQ * DK; u += NTHR) {
++        const int r = u / DK, d = u % DK, qr = q0 + r;
++        const float x = qr < n_q ? ((global const float *)(qb + qr * q_nb1))[d] * scale : 0.f;
++        qs[(((r >> 3) * KC + (d >> 4)) * 8 + (r & 7)) * 16 + (d & 15)] = (half) x;
++    }
++    // the last key any row of the work-group sees: a row a work-item, its
++    // masked tail scanned backwards (short for a causal mask)
++    int kv_end = n_kv;
++    if (mb != 0) {
++        int last = -1;
++        if (lid < BQ && q0 + lid < n_q) {
++            global const half * mrow = (global const half *)((global const char *) mb + (q0 + lid) * mask_nb1);
++            last = n_kv - 1;
++            while (last >= 0 && as_ushort(mrow[last]) == 0xFC00) --last;   // -inf
++        }
++        kv_end = work_group_reduce_max(last) + 1;
++    }
++
++    float8 o[NDC];
++    for (int c = 0; c < NDC; ++c) o[c] = (float8)(0.f);
++    // l: this lane's share of each row's sum, reduced once at the end
++    float m[8], l[8];
++    for (int r = 0; r < 8; ++r) { m[r] = M_INIT; l[r] = 0.f; }
++    const int q_sg = q0 + sg * 8;
++
++    for (int t0 = 0; t0 < kv_end; t0 += BK) {
++        barrier(CLK_LOCAL_MEM_FENCE);
++        for (int u = lid; u < BK * DK / 8; u += NTHR) {
++            const int key = u / (DK / 8), c8 = u % (DK / 8), kk = min(t0 + key, n_kv - 1);
++            vstore8(vload8(c8, (global const half *)(kb + kk * k_nb1)), 0, ks + key * DK + 8 * c8);
++        }
++        // V transposed with the key fastest: neighbouring lanes store
++        // neighbouring halves (key-major, they all hit one bank)
++        for (int u = lid; u < BK * DK / 8; u += NTHR) {
++            const int key = u % BK, c8 = u / BK, kk = min(t0 + key, n_kv - 1);
++            const half8 vv8 = vload8(c8, (global const half *)(vb + kk * v_nb1));
++            const half vv[8] = { vv8.s0, vv8.s1, vv8.s2, vv8.s3, vv8.s4, vv8.s5, vv8.s6, vv8.s7 };
++            for (int j = 0; j < 8; ++j) vt[(8 * c8 + j) * BK + key] = vv[j];
++        }
++        barrier(CLK_LOCAL_MEM_FENCE);
++
++        float8 s[NKB];
++        for (int g = 0; g < NKB; ++g) {
++            float8 acc = (float8)(0.f);
++            for (int c = 0; c < KC; ++c) {
++                const short8 a = LOAD_A(qs + ((sg * KC + c) * 8) * 16);
++                const int8   b = as_int8(vload8(0, (local const uint *)(ks + (g * 16 + lane) * DK + c * 16)));
++                acc = DPAS(a, b, acc);
++            }
++            s[g] = acc;
++        }
++        float mrow[8];
++        for (int r = 0; r < 8; ++r) mrow[r] = m[r];
++        for (int g = 0; g < NKB; ++g) {
++            const int key = t0 + g * 16 + lane;
++            float sv[8] = { s[g].s0, s[g].s1, s[g].s2, s[g].s3, s[g].s4, s[g].s5, s[g].s6, s[g].s7 };
++            for (int r = 0; r < 8; ++r) {
++                const int qr = min(q_sg + r, n_q - 1);
++                half mh = 0.0h;
++                if (mb != 0 && key < n_kv) mh = ((global const half *)((global const char *) mb + qr * mask_nb1))[key];
++                const float mk  = (float) mh;
++                const bool  vis = key < n_kv && q_sg + r < n_q && as_ushort(mh) != 0xFC00;   // -inf: masked
++                sv[r] = vis ? sv[r] + mk : M_INIT;
++                mrow[r] = fmax(mrow[r], sub_group_reduce_max(sv[r]));
++            }
++            s[g] = (float8)(sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7]);
++        }
++        float corr[8];
++        for (int r = 0; r < 8; ++r) {
++            corr[r] = m[r] > 0.5f * M_INIT ? native_exp(m[r] - mrow[r]) : 0.f;
++            m[r]    = mrow[r];
++            l[r]   *= corr[r];
++        }
++        const float8 cv = (float8)(corr[0], corr[1], corr[2], corr[3], corr[4], corr[5], corr[6], corr[7]);
++        for (int c = 0; c < NDC; ++c) o[c] *= cv;
++        short8 pa[NKB];
++        for (int g = 0; g < NKB; ++g) {
++            float sv[8] = { s[g].s0, s[g].s1, s[g].s2, s[g].s3, s[g].s4, s[g].s5, s[g].s6, s[g].s7 };
++            half  ph[8];
++            for (int r = 0; r < 8; ++r) {
++                // the sum of what P V multiplies: P rounded to half
++                ph[r] = (half)(sv[r] > 0.5f * M_INIT ? native_exp(sv[r] - m[r]) : 0.f);
++                l[r] += (float) ph[r];
++            }
++            pa[g] = as_short8((half8)(ph[0], ph[1], ph[2], ph[3], ph[4], ph[5], ph[6], ph[7]));
++        }
++        for (int c = 0; c < NDC; ++c) {
++            float8 acc = o[c];
++            for (int g = 0; g < NKB; ++g) {
++                const int8 b = as_int8(vload8(0, (local const uint *)(vt + (c * 16 + lane) * BK + g * 16)));
++                acc = DPAS(pa[g], b, acc);
++            }
++            o[c] = acc;
++        }
++    }
++
++    float lv[8];
++    for (int r = 0; r < 8; ++r) lv[r] = sub_group_reduce_add(l[r]);
++    for (int c = 0; c < NDC; ++c) {
++        const float ov[8] = { o[c].s0, o[c].s1, o[c].s2, o[c].s3, o[c].s4, o[c].s5, o[c].s6, o[c].s7 };
++        for (int r = 0; r < 8; ++r) {
++            const int qr = q_sg + r;
++            if (qr < n_q) {
++                global float * orow = (global float *)(o_void + o_offset + batch * o_nb3 + qr * o_nb2 + head * o_nb1);
++                orow[c * 16 + lane] = lv[r] > 0.f ? ov[r] / lv[r] : 0.f;
++            }
++        }
++    }
++}
++#endif  // SG == 16
++
++#if SG == 8
++__attribute__((intel_reqd_sub_group_size(SG)))
++__attribute__((reqd_work_group_size(NTHR, 1, 1)))
++kernel void flash_attn_f32_f16_dpas(
++        global const char * q_void, ulong q_offset,
++        global const char * k_void, ulong k_offset,
++        global const char * v_void, ulong v_offset,
++        global const char * mask_void, ulong mask_offset,
++        global char * o_void, ulong o_offset,
++        float scale, int n_q, int n_kv, int n_head, int n_head_kv,
++        ulong q_nb1, ulong q_nb2, ulong q_nb3,
++        ulong k_nb1, ulong k_nb2, ulong k_nb3,
++        ulong v_nb1, ulong v_nb2, ulong v_nb3,
++        ulong o_nb1, ulong o_nb2, ulong o_nb3,
++        ulong mask_nb1, ulong mask_nb2, ulong mask_nb3, int mask_ne2, int mask_ne3,
++        int n_batch, int k_ne3, int v_ne3) {
++    local half qs[BQ * DK];
++    local half ks[BK * DK];
++    local half vt[DV * BK];
++
++    const int lane = get_sub_group_local_id(), sg = get_sub_group_id(), lid = get_local_id(0);
++    const int rg = sg >> 1, half_dv = sg & 1;          // the pair's row group, this one's columns
++    const int head = get_group_id(1), batch = get_group_id(2);
++    const int hk   = head / (n_head / n_head_kv);
++    const int q0   = get_group_id(0) * BQ;
++
++    global const char * qb = q_void + q_offset + batch * q_nb3 + head * q_nb2;
++    global const char * kb = k_void + k_offset + (batch / (n_batch / k_ne3)) * k_nb3 + hk * k_nb2;
++    global const char * vb = v_void + v_offset + (batch / (n_batch / v_ne3)) * v_nb3 + hk * v_nb2;
++    global const half * mb = mask_void != 0
++        ? (global const half *)(mask_void + mask_offset + (batch % mask_ne3) * mask_nb3 + (head % mask_ne2) * mask_nb2)
++        : 0;
++
++    for (int u = lid; u < BQ * DK; u += NTHR) {
++        const int r = u / DK, d = u % DK, qr = q0 + r;
++        const float x = qr < n_q ? ((global const float *)(qb + qr * q_nb1))[d] * scale : 0.f;
++        qs[(((r >> 3) * KC + (d >> 4)) * 8 + (r & 7)) * 16 + (d & 15)] = (half) x;
++    }
++    int kv_end = n_kv;
++    if (mb != 0) {
++        int last = -1;
++        if (lid < BQ && q0 + lid < n_q) {
++            global const half * mrow = (global const half *)((global const char *) mb + (q0 + lid) * mask_nb1);
++            last = n_kv - 1;
++            while (last >= 0 && as_ushort(mrow[last]) == 0xFC00) --last;   // -inf
++        }
++        kv_end = work_group_reduce_max(last) + 1;
++    }
++
++    float8 o[NDC];
++    for (int c = 0; c < NDC; ++c) o[c] = (float8)(0.f);
++    // l: this lane's share of each row's sum, reduced once at the end
++    float m[8], l[8];
++    for (int r = 0; r < 8; ++r) { m[r] = M_INIT; l[r] = 0.f; }
++    const int q_sg = q0 + rg * 8;
++
++    for (int t0 = 0; t0 < kv_end; t0 += BK) {
++        barrier(CLK_LOCAL_MEM_FENCE);
++        for (int u = lid; u < BK * DK / 8; u += NTHR) {
++            const int key = u / (DK / 8), c8 = u % (DK / 8), kk = min(t0 + key, n_kv - 1);
++            vstore8(vload8(c8, (global const half *)(kb + kk * k_nb1)), 0, ks + key * DK + 8 * c8);
++        }
++        // V transposed with the key fastest: neighbouring lanes store
++        // neighbouring halves (key-major, they all hit one bank)
++        for (int u = lid; u < BK * DK / 8; u += NTHR) {
++            const int key = u % BK, c8 = u / BK, kk = min(t0 + key, n_kv - 1);
++            const half8 vv8 = vload8(c8, (global const half *)(vb + kk * v_nb1));
++            const half vv[8] = { vv8.s0, vv8.s1, vv8.s2, vv8.s3, vv8.s4, vv8.s5, vv8.s6, vv8.s7 };
++            for (int j = 0; j < 8; ++j) vt[(8 * c8 + j) * BK + key] = vv[j];
++        }
++        barrier(CLK_LOCAL_MEM_FENCE);
++
++        // S in 8-key groups: lane = key, component = row
++        float8 s[2 * NKB];
++        for (int g = 0; g < 2 * NKB; ++g) {
++            float8 acc = (float8)(0.f);
++            for (int c = 0; c < KC; ++c) {
++                const int8 a = LOAD_A(qs + ((rg * KC + c) * 8) * 16);
++                const int8 b = as_int8(vload8(0, (local const uint *)(ks + (g * 8 + lane) * DK + c * 16)));
++                acc = DPAS(a, b, acc);
++            }
++            s[g] = acc;
++        }
++        float mrow[8];
++        for (int r = 0; r < 8; ++r) mrow[r] = m[r];
++        for (int g = 0; g < 2 * NKB; ++g) {
++            const int key = t0 + g * 8 + lane;
++            float sv[8] = { s[g].s0, s[g].s1, s[g].s2, s[g].s3, s[g].s4, s[g].s5, s[g].s6, s[g].s7 };
++            for (int r = 0; r < 8; ++r) {
++                const int qr = min(q_sg + r, n_q - 1);
++                half mh = 0.0h;
++                if (mb != 0 && key < n_kv) mh = ((global const half *)((global const char *) mb + qr * mask_nb1))[key];
++                const float mk  = (float) mh;
++                const bool  vis = key < n_kv && q_sg + r < n_q && as_ushort(mh) != 0xFC00;   // -inf: masked
++                sv[r] = vis ? sv[r] + mk : M_INIT;
++                mrow[r] = fmax(mrow[r], sub_group_reduce_max(sv[r]));
++            }
++            s[g] = (float8)(sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7]);
++        }
++        float corr[8];
++        for (int r = 0; r < 8; ++r) {
++            corr[r] = m[r] > 0.5f * M_INIT ? native_exp(m[r] - mrow[r]) : 0.f;
++            m[r]    = mrow[r];
++            l[r]   *= corr[r];
++        }
++        const float8 cv = (float8)(corr[0], corr[1], corr[2], corr[3], corr[4], corr[5], corr[6], corr[7]);
++        for (int c = 0; c < NDC; ++c) o[c] *= cv;
++        // P (half), row sums; then the a operand of 16 keys: lane i holds keys
++        // 2i, 2i+1 of each row (keys 0..7 in the low group, 8..15 in the high)
++        half8 ph[2 * NKB];
++        for (int g = 0; g < 2 * NKB; ++g) {
++            float sv[8] = { s[g].s0, s[g].s1, s[g].s2, s[g].s3, s[g].s4, s[g].s5, s[g].s6, s[g].s7 };
++            half  hv[8];
++            for (int r = 0; r < 8; ++r) {
++                hv[r] = (half)(sv[r] > 0.5f * M_INIT ? native_exp(sv[r] - m[r]) : 0.f);
++                l[r] += (float) hv[r];
++            }
++            ph[g] = (half8)(hv[0], hv[1], hv[2], hv[3], hv[4], hv[5], hv[6], hv[7]);
++        }
++        int8 pa[NKB];
++        for (int g = 0; g < NKB; ++g) {
++            const int  src0 = (2 * lane) & 7, src1 = (2 * lane + 1) & 7;
++            const bool hi   = lane >= 4;
++            // the shuffles move the 8 halves as a uint4 (no half8 shuffle),
++            // all four in every lane: a shuffle in a branch reads lanes the
++            // branch left inactive
++            const uint4 lo = as_uint4(ph[2 * g]), hi4 = as_uint4(ph[2 * g + 1]);
++            const uint4 l0 = intel_sub_group_shuffle(lo, src0), h0 = intel_sub_group_shuffle(hi4, src0);
++            const uint4 l1 = intel_sub_group_shuffle(lo, src1), h1 = intel_sub_group_shuffle(hi4, src1);
++            const half8 a0 = as_half8(hi ? h0 : l0);
++            const half8 a1 = as_half8(hi ? h1 : l1);
++            pa[g] = (int8)(as_int((half2)(a0.s0, a1.s0)), as_int((half2)(a0.s1, a1.s1)),
++                           as_int((half2)(a0.s2, a1.s2)), as_int((half2)(a0.s3, a1.s3)),
++                           as_int((half2)(a0.s4, a1.s4)), as_int((half2)(a0.s5, a1.s5)),
++                           as_int((half2)(a0.s6, a1.s6)), as_int((half2)(a0.s7, a1.s7)));
++        }
++        for (int c = 0; c < NDC; ++c) {
++            const int col = half_dv * (DV / 2) + c * 8 + lane;
++            float8 acc = o[c];
++            for (int g = 0; g < NKB; ++g) {
++                const int8 b = as_int8(vload8(0, (local const uint *)(vt + col * BK + g * 16)));
++                acc = DPAS(pa[g], b, acc);
++            }
++            o[c] = acc;
++        }
++    }
++
++    float lv[8];
++    for (int r = 0; r < 8; ++r) lv[r] = sub_group_reduce_add(l[r]);
++    for (int c = 0; c < NDC; ++c) {
++        const float ov[8] = { o[c].s0, o[c].s1, o[c].s2, o[c].s3, o[c].s4, o[c].s5, o[c].s6, o[c].s7 };
++        for (int r = 0; r < 8; ++r) {
++            const int qr = q_sg + r;
++            if (qr < n_q) {
++                global float * orow = (global float *)(o_void + o_offset + batch * o_nb3 + qr * o_nb2 + head * o_nb1);
++                orow[half_dv * (DV / 2) + c * 8 + lane] = lv[r] > 0.f ? ov[r] / lv[r] : 0.f;
++            }
++        }
++    }
++}
++#endif  // SG == 8

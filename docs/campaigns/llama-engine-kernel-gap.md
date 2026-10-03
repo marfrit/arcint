@@ -2,7 +2,8 @@
 
 **Open.** Built and gated: lever 1 (gated delta-net, patch 0003), the cheap
 decode items of lever 6 (0004), lever 5 (few-row F32, 0005), lever 3 (MoE
-GEMM, 0006). Built, gate in progress: lever 2 (decode attention, 0007).
+GEMM, 0006), lever 2's split half (decode attention, 0007), lever 4 (prompt
+attention on XMX, 0008).
 Results per patch: `contrib/llama.cpp/README.md`.
 
 ## Charter
@@ -105,6 +106,14 @@ items of the fifth review are listed separately below.
    First the stock split kernel unlocked for Intel (one gate,
    `ggml-opencl.cpp` `use_split_kernel`), then a DPAS kernel after
    `sdpa_micro.cl` (Q·K and P·V on XMX, f32 softmax).
+   **Done (0008)**, the DPAS kernel directly (upstream gates the split
+   kernel off where its shuffle reduction depends on the sub-group size,
+   `use_split_kernel`, `code`; not tried here): 512 x 4,096 x 24/4 at
+   test-backend-ops B60 149.9 -> 8.2 ms, A770 167.0 -> 22.6 ms; prefill
+   (0008 before its review, which made the kernel 5-7 % faster) dense 525
+   -> 633 t/s at 512, 145 -> 540 at 512 after 4,096; coder 1,285 -> 1,608,
+   602 -> 1,322 at 4,096 (`measured-here`). KL coder 0.007059 -> 0.007043,
+   dense unchanged.
 5. **F32 small projections** (dense −84 ms prefill, −1.3 ms decode; coder
    −33 ms): split-K for ≤ 64 rows, the multi-column F32 gemv for 1-8 rows;
    alpha|beta as one weight.
