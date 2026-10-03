@@ -30,31 +30,41 @@ the weights dequantized per work-group tile, for `MUL_MAT` and `MUL_MAT_ID`
 -- and exempts the shapes these take from that rule
 (`contrib/llama.cpp/README.md`).
 
+Patches 0002-0007 add the IQ types (Flash-Next), the gated delta-net,
+the decode's small kernels, the few-row F32 projections, a MoE GEMM in the
+shape of arcint's OpenVINO patch 0064, and decode attention that does not
+slow with context (`contrib/llama.cpp/README.md`, one section per patch).
+
 `measured-here`, 2026-10-03, llama-bench, one sequence (A770 GT clock pinned
 at 2000 MHz):
 
-| model, card | prefill 512, stock -> patched | decode, stock -> patched |
+| model, card | prefill 512: stock / 0001 / 0001-0007 | decode: stock / 0001 / 0001-0007 |
 |---|---|---|
-| Qwen3.8-27B Q4_K_M, B60 | 71.1 -> 417.9 t/s | 10.3 -> 18.0 t/s |
-| Qwen3.6-35B-A3B coder Q4_K_M, A770 | 111.2 -> 605.0 t/s | 7.7 -> 37.7 t/s |
+| Qwen3.8-27B Q4_K_M, B60 | 71.1 / 417.9 / 521 t/s | 10.3 / 18.0 / 19.75 t/s |
+| Qwen3.6-35B-A3B coder Q4_K_M, A770 | 111.2 / 605.0 / 1,292 t/s | 7.7 / 37.7 / 47.8 t/s |
 
-The coder's last step, 20.9 -> 37.7 t/s decode and 527 -> 605 t/s prefill,
-is the placement fix alone: the same kernels, the 60 tensors on the card.
+Decode with context (0001-0007; 0001-0006 in brackets): coder 47.3 (13.6)
+t/s at 4,096 tokens and 43.5 (4.2) at 16,384; dense 19.39 (12.8) and 17.95
+(6.4).
 
-For scale, the OpenVINO path (README): coder 1,379 prefill / 43.9 decode,
-dense 1,141 / 24.6 (MTP on). The gap that is left (`measured-here`, profiles
-with `GGML_OPENCL_PROFILING`):
+The coder's step from 20.9 to 37.7 t/s decode in 0001 was the placement
+fix alone: the same kernels, the 60 small tensors of its gated delta-net
+layers on the card.
 
-- decode, dense on the B60: device-bound, the K-quant matvecs at ~400 GB/s
-  (16 GB of weights a token);
-- decode, both: ~2,100 kernel launches a token; OpenCL enqueue costs ~3.5 us
-  and back-to-back kernels ~3 us of device gap each on this driver (NEO
-  exposes no `cl_khr_command_buffer`), a launch-count bound of ~7 ms a token;
-- prefill, dense: the gated delta-net (268 ms per 512 tokens) and flash
-  attention (184 ms) next to the GEMMs (profile of the int8-GEMM build);
-- decode attention: ggml routes Intel to its basic per-row kernel
-  (`ggml-opencl.cpp`, "Intel goes to the basic q1 kernel"), which will
-  dominate at long contexts.
+For scale, the OpenVINO path (README): coder 1,379 prefill (4k) / 43.9
+decode, dense 1,141 / 24.6 (MTP on), 24.0 plain. What is left
+(`measured-here`, profiles with `GGML_OPENCL_PROFILING`; the ranked levers
+are in `docs/campaigns/llama-engine-kernel-gap.md`):
+
+- dense decode, B60: the K-quant matvecs, 22.7 of 26.4 ms device time a
+  token at ~400 GB/s; the OpenVINO export's int4 is ~18 % fewer bytes than
+  Q4_K_M;
+- dense prefill: the K-quant GEMMs (Q4_K 464, Q6_K 128 ms of 983 per 512
+  tokens) and prefill attention (188 ms);
+- coder prefill: the MoE gate/up GEMM (117 ms of 389), prefill attention
+  (97 ms);
+- decode, both: ~1,100 kernel launches a token; NEO exposes no
+  `cl_khr_command_buffer`, so fusion is the lever.
 
 ## Answers
 

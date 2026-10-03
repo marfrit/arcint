@@ -1,0 +1,193 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index ed28a33..45d12d0 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -732,6 +732,7 @@ struct ggml_backend_opencl_context {
+     // scratch copy of the router weights to avoid dst aliasing
+     ggml_cl_buffer prealloc_moe_combine_w;
+     ggml_cl_buffer prealloc_kq_xq;   // q8_1 activation of the K-quant matvec: int8 codes
++    ggml_cl_buffer prealloc_f32_splitk;   // K slices of the skinny F32 GEMM (ggml_cl_mul_mat_f32_skinny)
+     ggml_cl_buffer prealloc_kq_xd;   // per-32 scale (float)
+     ggml_cl_buffer prealloc_kq_xs;   // per-32 sum (float)
+     // what the activation buffers hold, and the graph count that dates it
+@@ -1084,6 +1085,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_mul_mv_id_mxfp4_f32_flat;
+     cl_kernel kernel_mul_mm_f32_f32_l4_lm;
+     cl_kernel kernel_gemv_f32_f32_mc;  // multi-column (small-N) f32 GEMV for spec/MTP verify
++    cl_kernel kernel_sum_slices_f32 = nullptr;   // split-K slices of kernel_mul_mm_f32_f32_l4_lm summed
+     cl_kernel kernel_mul_mm_f16_f32_l4_lm;
+     cl_kernel kernel_mul_mm_q1_0_f32_l4_lm;
+     cl_kernel kernel_mul_mm_q4_0_f32_l4_lm;
+@@ -2794,6 +2796,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+ 
+         CL_CHECK((backend_ctx->kernel_mul_mm_f32_f32_l4_lm = clCreateKernel(backend_ctx->program_mul_mm_f32_f32_l4_lm, "kernel_mul_mm_f32_f32_l4_lm", &err), err));
+         CL_CHECK((backend_ctx->kernel_gemv_f32_f32_mc = clCreateKernel(backend_ctx->program_mul_mm_f32_f32_l4_lm, "kernel_gemv_f32_f32_mc", &err), err));
++        CL_CHECK((backend_ctx->kernel_sum_slices_f32 = clCreateKernel(backend_ctx->program_mul_mm_f32_f32_l4_lm, "kernel_sum_slices_f32", &err), err));
+         GGML_LOG_CONT(".");
+     }
+ 
+@@ -23983,6 +23986,105 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
+ }
+ #endif // GGML_OPENCL_SOA_Q
+ 
++// Intel: F32 weights of at most 256 rows (the gated delta-net's ssm_alpha /
++// ssm_beta in F32 GGUFs: 48 x 5120 on Qwen3.8-27B; a MoE router: 256 x 2048
++// on the Qwen3.6 coder). ggml's paths give them one 64 x 64 output tile per
++// 64 columns over the whole K (8 work-groups for 48 rows and a 512-token
++// prompt) and, for one column, a matvec at 58 GB/s (measured-here, B60). Up to 8 columns: kernel_gemv_f32_f32_mc, K split
++// over a work-group; more: the tiled GEMM with K cut into slices run as its
++// batch dimension, then the slices summed. GGML_OPENCL_F32_SKINNY=0 keeps
++// ggml's paths. Returns whether it took the product.
++static bool ggml_cl_mul_mat_f32_skinny(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
++    static const char * env = getenv("GGML_OPENCL_F32_SKINNY");
++    static const bool   on  = env == nullptr || atoi(env) != 0;
++    const int ne00 = (int)src0->ne[0], ne01 = (int)src0->ne[1], ne11 = (int)src1->ne[1];
++    if (!on || backend_ctx->gpu_family != INTEL || backend_ctx->kernel_sum_slices_f32 == nullptr ||
++        src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
++        ne01 > 256 || ne00 % 64 != 0 || src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
++        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
++        return false;
++    }
++    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
++    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++    cl_ulong offset0 = extra0->offset + src0->view_offs;
++    cl_ulong offset1 = extra1->offset + src1->view_offs;
++    cl_ulong offsetd = extrad->offset + dst->view_offs;
++    if (offset0 % 16 != 0 || offset1 % 16 != 0) {
++        return false;   // both kernels read float4
++    }
++
++    if (ne11 <= 8) {
++        cl_kernel k = backend_ctx->kernel_gemv_f32_f32_mc;
++        int stride_a = ne00, stride_b = ne00, stride_d = ne01;
++        CL_CHECK(clSetKernelArg(k,  0, sizeof(cl_mem),   &extra0->data_device));
++        CL_CHECK(clSetKernelArg(k,  1, sizeof(cl_ulong), &offset0));
++        CL_CHECK(clSetKernelArg(k,  2, sizeof(cl_mem),   &extra1->data_device));
++        CL_CHECK(clSetKernelArg(k,  3, sizeof(cl_ulong), &offset1));
++        CL_CHECK(clSetKernelArg(k,  4, sizeof(cl_mem),   &extrad->data_device));
++        CL_CHECK(clSetKernelArg(k,  5, sizeof(cl_ulong), &offsetd));
++        CL_CHECK(clSetKernelArg(k,  6, sizeof(int),      &ne00));
++        CL_CHECK(clSetKernelArg(k,  7, sizeof(int),      &ne01));
++        CL_CHECK(clSetKernelArg(k,  8, sizeof(int),      &ne11));
++        CL_CHECK(clSetKernelArg(k,  9, sizeof(int),      &stride_a));
++        CL_CHECK(clSetKernelArg(k, 10, sizeof(int),      &stride_b));
++        CL_CHECK(clSetKernelArg(k, 11, sizeof(int),      &stride_d));
++        size_t gws[3] = { 64, (size_t)ne01 * (size_t)ne11, 1 };
++        size_t lws[3] = { 64, 1, 1 };
++        backend_ctx->enqueue_ndrange_kernel(k, 3, gws, lws, dst);
++        return true;
++    }
++
++    // slices of K (a multiple of 16, the GEMM's BK) until there are ~256
++    // work-groups or a slice is 256 long
++    const int tiles = CEIL_DIV(ne01, 64) * CEIL_DIV(ne11, 64);
++    int ks = 1;
++    while (tiles * ks < 256 && ne00 % (2 * ks * 16) == 0 && ne00 / (2 * ks) >= 256) {
++        ks *= 2;
++    }
++    const int kslice = ne00 / ks;
++    const int n_out  = ne01 * ne11;
++    backend_ctx->prealloc_f32_splitk.allocate(backend_ctx->context, (size_t)ks * n_out * sizeof(float));
++    cl_kernel k = backend_ctx->kernel_mul_mm_f32_f32_l4_lm;
++    const int one = 1;
++    cl_ulong zero = 0;
++    // batch b = slice b: A and B advance by kslice, the output by one slice
++    CL_CHECK(clSetKernelArg(k,  0, sizeof(cl_mem),   &extra0->data_device));
++    CL_CHECK(clSetKernelArg(k,  1, sizeof(cl_ulong), &offset0));
++    CL_CHECK(clSetKernelArg(k,  2, sizeof(cl_mem),   &extra1->data_device));
++    CL_CHECK(clSetKernelArg(k,  3, sizeof(cl_ulong), &offset1));
++    CL_CHECK(clSetKernelArg(k,  4, sizeof(cl_mem),   &backend_ctx->prealloc_f32_splitk.buffer));
++    CL_CHECK(clSetKernelArg(k,  5, sizeof(cl_ulong), &zero));
++    CL_CHECK(clSetKernelArg(k,  6, sizeof(int),      &kslice));   // ne00: K of one slice
++    CL_CHECK(clSetKernelArg(k,  7, sizeof(int),      &ne01));
++    CL_CHECK(clSetKernelArg(k,  8, sizeof(int),      &ks));       // ne02
++    CL_CHECK(clSetKernelArg(k,  9, sizeof(int),      &ne11));
++    CL_CHECK(clSetKernelArg(k, 10, sizeof(int),      &ks));       // ne12
++    CL_CHECK(clSetKernelArg(k, 11, sizeof(int),      &ne00));     // stride_a
++    CL_CHECK(clSetKernelArg(k, 12, sizeof(int),      &ne00));     // stride_b
++    CL_CHECK(clSetKernelArg(k, 13, sizeof(int),      &ne01));     // stride_d
++    CL_CHECK(clSetKernelArg(k, 14, sizeof(int),      &kslice));   // batch_stride_a
++    CL_CHECK(clSetKernelArg(k, 15, sizeof(int),      &kslice));   // batch_stride_b
++    CL_CHECK(clSetKernelArg(k, 16, sizeof(int),      &n_out));    // batch_stride_d
++    CL_CHECK(clSetKernelArg(k, 17, sizeof(int),      &one));      // r2
++    CL_CHECK(clSetKernelArg(k, 18, sizeof(int),      &one));      // r3
++    size_t gws[3] = { (size_t)CEIL_DIV(ne01, 64) * 128, (size_t)CEIL_DIV(ne11, 64), (size_t)ks };
++    size_t lws[3] = { 128, 1, 1 };
++    backend_ctx->enqueue_ndrange_kernel(k, 3, gws, lws, dst);
++
++    cl_kernel kr = backend_ctx->kernel_sum_slices_f32;
++    CL_CHECK(clSetKernelArg(kr, 0, sizeof(cl_mem),   &backend_ctx->prealloc_f32_splitk.buffer));
++    CL_CHECK(clSetKernelArg(kr, 1, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kr, 2, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(kr, 3, sizeof(int),      &n_out));
++    CL_CHECK(clSetKernelArg(kr, 4, sizeof(int),      &ks));
++    size_t rgws[1] = { (size_t)CEIL_DIV(n_out, 64) * 64 };
++    size_t rlws[1] = { 64 };
++    backend_ctx->enqueue_ndrange_kernel(kr, 1, rgws, rlws, dst);
++    return true;
++}
++
+ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+@@ -23997,6 +24099,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+ 
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+ 
++    if (ggml_cl_mul_mat_f32_skinny(backend, src0, src1, dst)) {
++        return;
++    }
++
+     // quant kv without FA
+     // used for non-contiguous src0 (the usual head-major permuted K view when n_head_kv>1)
+     // AND for the contiguous case that occurs when n_head_kv==1 (e.g. Gemma-4 E2B)
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_f32_f32_l4_lm.cl b/ggml/src/ggml-opencl/kernels/mul_mm_f32_f32_l4_lm.cl
+index 9dc9862..6990965 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mm_f32_f32_l4_lm.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_f32_f32_l4_lm.cl
+@@ -194,3 +194,23 @@ kernel void kernel_gemv_f32_f32_mc(
+     }
+     if (lane == 0) dst[(ulong)n * (uint)stride_d + m] = red[0];
+ }
++
++// The K slices of a split-K product summed: src holds nslices slices of n
++// floats, slice s at s * n; dst[i] = the sum over s.
++kernel void kernel_sum_slices_f32(
++    global const float * src,
++    global float * dst, ulong offsetd,
++    int n,
++    int nslices)
++{
++    dst = (global float*)((global char*)dst + offsetd);
++    const int i = get_global_id(0);
++    if (i >= n) {
++        return;
++    }
++    float s = 0.0f;
++    for (int k = 0; k < nslices; ++k) {
++        s += src[(ulong)k * n + i];
++    }
++    dst[i] = s;
++}
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 8497555..a23a133 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10274,6 +10274,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1, 509, 2051, {1, 1}, {1, 1}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1, 509, 2051, {1, 1}, {1, 1}));
+ 
++    // F32 weights of few rows (the gated delta-net's ssm_alpha / ssm_beta, a
++    // MoE router), one token to a prompt; a split K on some backends
++    for (int64_t n : {1, 3, 9, 100, 512}) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 48, n, 5120, {1, 1}, {1, 1}));
++    }
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 77, 1024, {1, 1}, {1, 1}));
++    for (int64_t n : {1, 512}) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 256, n, 2048, {1, 1}, {1, 1}));
++    }
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 31, 509, 2051, {1, 1}, {1, 1}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));

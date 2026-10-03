@@ -1,6 +1,7 @@
 # flash-next-llama-engine — Qwen3.8-Flash-Next served by the libllama engine on one Arc card + RAM
 
-**Open.** Stage 1 (static placement, IQ kernels) built and served; its KL leg owed.
+**Open.** Stage 1 (static placement, IQ kernels) built and served; KL leg
+passed; the baseline arm's decode rate on the B60 owed.
 
 ## Charter
 
@@ -68,7 +69,13 @@ patches 0076/0077, `measured-here` 2026-10-02) decodes 12.7 t/s after the
     10.9 t/s decode. The OpenVINO path's arms after 0076/0077: needle decode
     12.7 t/s, long answer 16.0 (`expert-hot-set-lru.md`,
     `tier-handoff-doorbell.md`).
-- Owed for the stage gate: the KL leg against the all-CPU-experts arm.
+- KL leg (`measured-here` 2026-10-03, B60, `llama-perplexity` 8 x 512
+  tokens, reference: the whole model on the CPU backend): baseline arm
+  (every expert layer on the CPU, `-ncmoe 48`) mean KL 0.0289 +- 0.0018,
+  top-1 95.54 %; stage 1 (16 expert layers on the card, `-ncmoe 32`) 0.0294
+  +- 0.0019, 95.59 %: +0.0006 nats, top-1 +0.05 points. Passes.
+- Owed for the stage gate: the baseline arm's decode at 4k and 20k on the B60
+  from NVMe (the 0.2 t/s above is the A770 from ZFS).
 - Under `--load-mode auto` the load reads the whole model into anonymous
   memory and is OOM-killed; arcint sets mmap whenever experts stay on the CPU.
 
