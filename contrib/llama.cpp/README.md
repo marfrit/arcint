@@ -541,3 +541,40 @@ Measured (`measured-here`, B60):
 Switches: `GGML_OPENCL_KQ_2D=0` keeps `mul_mm_kq_f16.cl`;
 `GGML_OPENCL_KQ_2D_SHAPE = "TM,WG,AT"` sets the token tile, the sub-groups
 and the activation read height (8 or 32).
+
+## 0012-opencl-intel-kquant-gemm-2d-order.patch
+
+Two changes to 0011's kernel. Both came from reading oneDNN's JIT GEMM,
+which the OpenVINO path runs on the same B60, beside ours. The oneDNN
+kernels were dumped with `ONEDNN_JIT_DUMP`, disassembled with IGA and
+compared line by line with IGC's dump of 0011.
+
+- **The b operand outer.** A 32-value sub-block's first b operand is
+  multiplied with every token group, then its second. A group's two
+  dependent DPAS are 8 apart instead of adjacent. Adjacent ones made IGC
+  drain the matrix unit between them. In the ISA, single and paired DPAS
+  chains became chains of 4 and 8, and the DPAS-completion waits a
+  super-block fell from 53 to 45.
+- **Token tiles the fast grid dimension.** A 256-row weight panel is read
+  by its token tiles in turn while it is in L2, not once per tile from
+  memory.
+
+Measured (`measured-here`, B60):
+
+| test | 0011 | 0012 |
+|---|---|---|
+| test-backend-ops 4,096 x 512 x 14,336, Q4_K | 1,264 us | 1,229 us |
+| the same, Q5_K | 1,509 us | 1,398 us |
+| the same, Q6_K | 1,557 us | 1,484 us |
+| llama-bench dense 27B prefill, 512 tokens | 758 t/s | 891 t/s |
+| the same, 4,096 tokens | 703 t/s | 816 t/s |
+
+- KL batched: 0.003559 -> 0.003559.
+- MUL_MAT 1,123/1,123 on both cards.
+
+Tried in the same pass and left out (`measured-here`):
+- the next super-block's weights read a super-block ahead into a second
+  register set: Q4_K 1,229 -> 1,770 us;
+- 96-token tiles;
+- L1 prefetch of the next activation tile;
+- two-column activation reads.

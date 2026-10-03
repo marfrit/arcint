@@ -225,6 +225,39 @@ items of the fifth review are listed separately below.
    A single-pass f32 -> f16 conversion measured 0.5 % at the kernel and was
    left out.
 
+   *oneDNN's kernel read at ISA.* `ONEDNN_JIT_DUMP` on the OpenVINO path,
+   disassembled with IGA built from IGC's `visa/iga`, compared with IGC's
+   dump of 0011 by a reviewer (`code`). The three main-kernel variants
+   share one loop:
+   - 64 tokens x 16 rows a thread, int8 DPAS k32, 128 k a loop body;
+   - both operands by 2D block loads, double-buffered one k-step ahead;
+   - a cooperative 2D-block L1 prefetch of the activation tile, split
+     across the 16 threads, about one super-block ahead;
+   - u4 -> s8 decode at 6 ALU per DPAS;
+   - DPAS in 8-long chains with independent int32 partials;
+   - a per-64 rescale epilogue at 12 ALU per DPAS.
+
+   So oneDNN also pays an O(tokens) epilogue per weight group. The argument
+   above that int8 cannot pay on Q4_K's per-32 scales does not hold as
+   stated: the int8 attempts lost to latency and to DPAS chains read back at
+   once, not to the epilogue count.
+
+   Ours by comparison:
+   - 11.9 ALU a DPAS (the float decode, about 5.5 ops per 16 weights);
+   - weight reads consumed 21-76 instructions after issue;
+   - DPAS chains broken by adjacent dependent pairs.
+
+   **0012**, from that reading: the b operand outer in each sub-block, and
+   the token tiles as the fast grid dimension. Dense prefill 703 -> 816 t/s
+   at 4,096 tokens, 758 -> 891 at 512, KL unchanged.
+
+   Still open from the review:
+   - weights double-buffered in registers (the first form measured slower,
+     Q4_K 1,229 -> 1,770 us);
+   - the cooperative prefetch further ahead;
+   - a half-precision decode (~3 ops per 16 weights; needs the KL gate);
+   - an int8 kernel with oneDNN's structure.
+
    Next:
    - Q5_K's and Q6_K's tiles: 0029 used a 128-token tile for Q5_K and a
      padded Q6_K layout;
