@@ -311,6 +311,12 @@ std::unique_ptr<Backend> make_stub_backend(const ModelEntry& entry, Quant quant,
                                            int delay_ms = 0,
                                            const std::string& served_name = {});
 
+#ifdef ARCINT_LLAMA
+// 0.5.3.1459: the libllama executor (ggml OpenCL), the GGUF in --gguf.
+struct Config;
+std::unique_ptr<Backend> make_llama_backend(const Config& cfg, int n_ctx);
+#endif
+
 #ifdef ARCINT_OPENVINO
 struct Artifact;
 

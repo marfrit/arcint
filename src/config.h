@@ -14,6 +14,10 @@ struct Config {
     // Exactly one of these selects what gets served.
     std::string model_path;  // OpenVINO IR directory (M1+)
     std::string gguf_path;   // --gguf: weights from this GGUF, --model as the topology template (0.4.0)
+    // --engine: "ov" (the OpenVINO executor, --model an IR directory) or
+    // "llama" (ggml's OpenCL backend through libllama; the model is --gguf).
+    // The default: "llama" for --gguf without --model, else "ov".
+    std::string engine;
     std::string flash_next_ngram_path;  // --flash-next-ngram: FIX D per_layer_token_embd table (24-byte ARCINGRM header + block-quantised payload); admitted only when the artifact's config.json declares an n-gram table (docs/design-qwen-flash-next.md FIX D Link 2)
     // --ngram-gguf: the GGUF shard whose per_layer_token_embd.weight binds a
     // serving-shape IR's `ngram_table.K` ports (backend_ov.cpp

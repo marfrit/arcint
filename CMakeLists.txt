@@ -11,6 +11,11 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(ARCINT_OPENVINO "Build the OpenVINO executor backend (M1+)" OFF)
+# 0.5.3.1459: the libllama executor -- ggml's OpenCL backend runs the GGUF.
+# ARCINT_LLAMA_DIR is a llama.cpp source tree (the pinned commit is in
+# docs/llama-engine.md); it is built as a subproject, static, OpenCL on.
+option(ARCINT_LLAMA "Build the libllama (ggml OpenCL) executor backend" OFF)
+set(ARCINT_LLAMA_DIR "" CACHE PATH "llama.cpp source tree for ARCINT_LLAMA")
 option(ARCINT_WERROR   "Treat compiler warnings as errors"         OFF)
 option(ARCINT_TESTS    "Build the test binaries"                   ON)
 
@@ -133,6 +138,26 @@ if(ARCINT_OPENVINO)
     message(WARNING "arcint: libopenvino_tokenizers.so not found; set "
                     "ARCINT_TOKENIZERS_SO at configure time or in the environment")
   endif()
+endif()
+
+if(ARCINT_LLAMA)
+  if(NOT ARCINT_LLAMA_DIR OR NOT EXISTS "${ARCINT_LLAMA_DIR}/include/llama.h")
+    message(FATAL_ERROR "ARCINT_LLAMA=ON needs ARCINT_LLAMA_DIR, a llama.cpp source tree")
+  endif()
+  set(GGML_OPENCL ON CACHE BOOL "" FORCE)
+  set(GGML_OPENCL_USE_ADRENO_KERNELS OFF CACHE BOOL "" FORCE)
+  set(GGML_OPENCL_EMBED_KERNELS ON CACHE BOOL "" FORCE)
+  set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  add_subdirectory("${ARCINT_LLAMA_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/llama.cpp" EXCLUDE_FROM_ALL)
+  find_package(OpenCL REQUIRED)
+  target_sources(arcint_core PRIVATE src/exec/backend_llama.cpp)
+  target_link_libraries(arcint_core PUBLIC llama OpenCL::OpenCL)
+  target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA=1)
 endif()
 
 # Generated last on purpose: it bakes in the tokenizers path discovered above,

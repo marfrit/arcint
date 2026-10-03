@@ -987,3 +987,30 @@ TEST(config_dflash_topk_rejects_out_of_range) {
     CHECK(run({"--stub", "--dflash", "/d", "--dflash-topk", "64"}, hi).ok);
     CHECK_EQ(hi.dflash_topk, 64);
 }
+
+// 0.5.3.1459: a GGUF alone selects the libllama engine; with an IR directory
+// it stays the OpenVINO template path.
+TEST(config_engine_follows_what_was_given) {
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf"};
+        const auto r = parse_args(3, const_cast<char**>(argv), cfg);
+        CHECK(r.ok);
+        CHECK_EQ(cfg.engine, std::string("llama"));
+    }
+#ifdef ARCINT_OPENVINO   // a build without it refuses --model at parse
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--model", "/m/ir", "--gguf", "/m/q.gguf"};
+        const auto r = parse_args(5, const_cast<char**>(argv), cfg);
+        CHECK(r.ok);
+        CHECK_EQ(cfg.engine, std::string("ov"));
+    }
+#endif
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--engine", "llama", "--model", "/m/ir"};
+        const auto r = parse_args(5, const_cast<char**>(argv), cfg);
+        CHECK(!r.ok);   // the llama engine needs its GGUF
+    }
+}

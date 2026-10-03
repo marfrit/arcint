@@ -77,6 +77,7 @@
 #include "exec/ngram_ports.h"
 #include "exec/ngram_staging.h"
 #include "exec/ngram_reader.h"
+#include "exec/chat_json.h"
 #include "exec/ngram_table.h"
 #include "core/gguf_dequant.h"
 #include "exec/kquant_op.h"
@@ -7684,41 +7685,11 @@ private:
     }
 
     static json messages_json(const ChatRequest& req, bool object_arguments) {
-        json out = json::array();
-        for (const ChatMessage& m : req.messages) {
-            json msg{{"role", m.role}, {"content", m.content}};
-            if (!m.name.empty()) msg["name"] = m.name;
-            if (!m.tool_call_id.empty()) msg["tool_call_id"] = m.tool_call_id;
-            if (!m.tool_calls.empty()) {
-                json calls = json::array();
-                for (const ToolCall& c : m.tool_calls) {
-                    calls.push_back({{"id", c.id},
-                                     {"type", "function"},
-                                     {"function",
-                                      {{"name", c.name},
-                                       {"arguments", tool_call_arguments_for_template(
-                                                         c.arguments, object_arguments)}}}});
-                }
-                msg["tool_calls"] = std::move(calls);
-                if (m.content.empty()) msg["content"] = nullptr;
-            }
-            out.push_back(std::move(msg));
-        }
-        return out;
+        return chat_messages_json(req, object_arguments);
     }
 
-    static json tools_json(const ChatRequest& req) {
-        if (req.tools.empty()) return json();
-        json out = json::array();
-        for (const ToolSpec& t : req.tools) {
-            out.push_back({{"type", "function"},
-                           {"function",
-                            {{"name", t.name},
-                             {"description", t.description},
-                             {"parameters", t.parameters}}}});
-        }
-        return out;
-    }
+    static json tools_json(const ChatRequest& req) { return chat_tools_json(req); }
+
 
     // Runs the embeddings graph then the language model for `ids`, with `past`
     // tokens already in the graph's state.

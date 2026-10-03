@@ -411,6 +411,8 @@ std::string usage_text() {
         "                            exit. Device-free; the directory needs no entry\n"
         "                            yet -- reading a contract is what precedes a pin.\n"
         "  --version                 print version and exit\n"
+        "  --engine ov|llama         the executor: OpenVINO (--model IR) or ggml OpenCL via\n"
+        "                            libllama (--gguf); default: OpenVINO when built in\n"
         "  -h, --help                print this help and exit\n";
 }
 
@@ -446,6 +448,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--model") {
             if (!value(v)) return fail("--model needs a path");
             cfg.model_path = std::string(v);
+        } else if (arg == "--engine") {
+            if (!value(v)) return fail("--engine needs ov or llama");
+            cfg.engine = std::string(v);
+            if (cfg.engine != "ov" && cfg.engine != "llama") return fail("--engine is ov or llama");
         } else if (arg == "--gguf") {
             if (!value(v)) return fail("--gguf needs a path");
             cfg.gguf_path = std::string(v);
@@ -728,8 +734,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.show_help || cfg.show_version || cfg.flash_next_offload_plan) return {};
 
     // ------------------------------------------------------------ validation
-    if (cfg.model_path.empty() && !cfg.stub) {
-        return fail("nothing to serve: pass --model PATH, or --stub for the M0 skeleton");
+    if (cfg.model_path.empty() && !cfg.stub && !(cfg.engine != "ov" && !cfg.gguf_path.empty())) {
+        return fail("nothing to serve: pass --model PATH, --engine llama --gguf FILE, or --stub for the M0 skeleton");
     }
     if (!cfg.model_path.empty() && cfg.stub) {
         return fail("--model and --stub are mutually exclusive");
@@ -891,8 +897,15 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     // decide it: this combination now parses, and backend_ov.cpp's load
     // path (tier_prefix_cache_decision, config.h) makes the call instead.
     if (cfg.prefill_chunk < 0) return fail("--prefill-chunk must be >= 0");
+    // The default follows what was given: a GGUF alone is the libllama
+    // engine's model, an IR directory the OpenVINO executor's.
+    if (cfg.engine.empty()) cfg.engine = (!cfg.gguf_path.empty() && cfg.model_path.empty()) ? "llama" : "ov";
+    if (cfg.engine == "llama") {
+        if (cfg.gguf_path.empty()) return fail("--engine llama serves a GGUF: give --gguf");
+    } else {
     if (!cfg.gguf_path.empty() && cfg.model_path.empty()) return fail("--gguf needs --model (the template IR directory)");
     if (!cfg.gguf_path.empty() && !cfg.paged) return fail("--gguf serves on the paged path only");
+    }
     if (!cfg.ngram_gguf_path.empty() && cfg.model_path.empty()) return fail("--ngram-gguf needs --model (the IR whose ngram_table.K ports it binds)");
     if (!cfg.ngram_gguf_path.empty() && !cfg.paged) return fail("--ngram-gguf serves on the paged path only (the ports are bound per lane request)");
     if (!cfg.ngram_gguf_path.empty() && !cfg.gguf_path.empty()) return fail("--ngram-gguf and --gguf both open a GGUF for the ngram_table ports; give one");
