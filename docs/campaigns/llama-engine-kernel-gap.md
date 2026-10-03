@@ -255,7 +255,11 @@ items of the fifth review are listed separately below.
    - weights double-buffered in registers (the first form measured slower,
      Q4_K 1,229 -> 1,770 us);
    - the cooperative prefetch further ahead;
-   - a half-precision decode (~3 ops per 16 weights; needs the KL gate);
+   - a half-precision decode. As written (bytes -> `convert_half16` ->
+     half16 `fma`) IGC emitted 2,034 `mov` against 664 (the byte unpack)
+     and unpacked SIMD16 half `mad`: 4,298 instructions against 3,241
+     (`code`, ISA), not tried further. A packed form needs IGC to emit
+     32-wide half operations;
    - an int8 kernel with oneDNN's structure.
 
    Next:
