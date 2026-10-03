@@ -381,3 +381,108 @@ sampled (the version before the review).
 
 Switches: `GGML_OPENCL_FA_DPAS=0` keeps `flash_attn_f32_f16.cl`;
 `GGML_OPENCL_FA_DPAS_OPTS` adds build options to the kernel.
+
+## 0009-opencl-intel-few-column-kquant-xmx.patch
+
+A K-quant weight times 2 to 16 f32 columns -- a speculative verify of 1 to
+15 drafts, a few lanes -- on the XMX units, each weight read once for all
+of them (`kernels/mul_mm_kq_few.cl`). Before it, 0001's q8_1 matvec took up
+to 4 columns and ggml's GEMM tile the rest. Neither held up at this shape
+(`measured-here`, test-backend-ops, Q4_K 4,096 x 14,336, B60). The matvec
+cost 76 / 123 / 169 us at 1 / 2 / 4 columns: every column pays two integer
+dot products per weight, and the kernel is compute-bound from 2 columns,
+not "at the cost of one", as 0001's section and loader comment have it
+(A770: 95 / 92 / 183 us). From 5 columns the GEMM took 837 us. On the dense
+27B a step of 4 tokens cost 1.6x a step of 1, a step of 8 cost 6x.
+
+- A lane is a weight row. Its code bytes (two 64-byte lines a super-block)
+  become halves 1024 + q by integer operations, as 0006 builds them: the
+  fp16 DPAS b operand. The tokens are the a operand, 8 a DPAS, read from a
+  tiled f16 copy of the columns, so one a load serves the row's 16 k.
+- `kernel_mul_mm_few_prep` writes that copy once per input (matmuls that
+  share it, q/k/v and gate/up, reuse it within the graph, like the other
+  K-quant paths): the tile, each 16 values' sum S, and each 32 values'
+  power-of-two scale (1 unless a block reaches 2^15).
+- A sub-block's DPAS chain starts at -1024 S (-1056 S for Q6_K's offset
+  codes), so it ends at sum q x. The block scale and D sc - M m S apply
+  once per sub-block.
+- S must be the sum of exactly the halves the DPAS multiplies, since the
+  chain's 1024 offset turns any difference into a thousandfold one. Under
+  ggml's `-cl-unsafe-math-optimizations -cl-finite-math-only` the compiler
+  summed the unrounded floats for `(float) h`, which put results 4-9 % off
+  in a harness at real shapes (`measured-here`). The prep therefore decodes
+  each half from its bits with integer operations. Subnormal halves go to
+  zero first, so S and the DPAS agree whether or not the XMX units flush
+  them.
+- NK sub-groups of a work-group take every NK-th super-block and add their
+  sums in local memory: 4 on Xe2, 8 on Xe-HPG. One build takes up to 8
+  columns, another up to 16.
+- The path starts at 2 columns on Xe2 and at 4 on Xe-HPG. There the q8_1
+  matvec stays ahead at 2 and 3 columns: the coder's step at 3 tokens ran
+  104.3 t/s on it against 96.3 through this path, at 4 tokens 123.9
+  against 124.4 (llama-bench, A770, `measured-here`).
+
+Measured (`measured-here`):
+
+- test-backend-ops, 4,096 x 14,336, B60:
+  - Q4_K: 111 us at 2, 4 and 8 columns, 158 at 16.
+  - Q5_K: 156 at 8.
+  - Q6_K: 191 at 8, against 902 for the GEMM.
+- The same shape on the A770 (q8_1 matvec for comparison): Q4_K 126 us at
+  8 columns.
+- llama-bench, dense 27B (B60), the step at n tokens over the 1-token step
+  (50.2 ms):
+
+  | tokens | before | 0009 |
+  |---|---|---|
+  | 2 | 1.32x | 1.15x |
+  | 4 | 1.63x | 1.17x |
+  | 8 | 6.0x | 1.21x |
+  | 16 | 6.2x | 1.51x |
+
+- `test-backend-ops -o MUL_MAT`: 1,096/1,096 on both cards. That count
+  includes cases this patch adds (2-16 columns, rows not a multiple of the
+  sub-group, 5 super-blocks, src1 broadcast over dimension 2), and 51 of
+  them failed before the sum fix.
+- KL, every matmul through this path (ubatch 4 and 8, against the same
+  reference, the baseline arm the tree without 0009):
+  - dense: 0.003560 -> 0.003558 at ubatch 4, 0.003561 -> 0.003558 at
+    ubatch 8;
+  - coder (A770, ubatch 4): 0.006986 -> 0.007035, top-1 96.18 -> 96.01 %.
+
+Served with `--llama-mtp` (acceptance task at temperature 0, 10/10 in every
+configuration):
+
+| model | drafts | before | 0009 |
+|---|---|---|---|
+| dense, B60 | 3 | 31-35 t/s | 43.5 t/s |
+| dense, B60 | 4 | | 46.2 t/s |
+| dense, B60 | 5 | | 48.0 t/s |
+| dense, B60 | 6 | | 48.0 t/s |
+| coder, A770 | 2 | 67-69 t/s | 65.2 t/s |
+| coder, A770 | 3 | | 69.2 t/s |
+| coder, A770 | 4 | | 71.7 t/s |
+
+Strata and NInfer verify with the same kind of kernel
+(`docs/campaigns/mtp-cycle-wall.md`).
+
+Switches: `GGML_OPENCL_KQ_FEW=0` keeps the q8_1 matvec and the GEMM;
+`GGML_OPENCL_KQ_FEW_MIN` sets the least column count.
+
+## 0010-mtp-masked-nextn-rows-of-the-outputs.patch
+
+The Qwen3.5/3.6 MTP graphs (`src/models/qwen35.cpp`, `qwen35moe.cpp`)
+captured the nextn row (`t_h_nextn`) before selecting the output rows.
+A context with masked nextn embeddings then copies the first `n_outputs`
+rows of all tokens (`llama-context.cpp`, the masked extraction), so a batch
+of several tokens with one output returned token 0's row in place of the
+output token's. The trunk graph selects first (`qwen35.cpp:178-213`). The
+patch does the same in both MTP graphs, and only for masked contexts.
+
+llama.cpp's own draft-mtp never hits it: its catch-up batch has no outputs
+and its drafts are single tokens. arcint's drafter does, once draft 0 comes
+from the catch-up batch, as Strata's does
+(`docs/campaigns/mtp-cycle-wall.md`). Without the patch, drafts after the
+first chained from the wrong row: served draft acceptance fell from 78 to
+57 % on the dense 27B at 3 drafts, and from 91 to 75 % on the coder at 2
+(`measured-here`).

@@ -192,7 +192,7 @@ public:
         if (cfg.llama_mtp > 0) {
             std::string err;
             spec_ = make_llama_mtp(model_, ctx_, cfg.llama_mtp, lanes_, n_batch_, static_cast<int>(cp.n_ubatch),
-                                   threads, err);
+                                   threads, cfg.gguf_path, cfg.llama_mtp_vocab, err);
             if (!spec_) throw std::runtime_error(log::format("--llama-mtp %d: %s", cfg.llama_mtp, err.c_str()));
             n_draft_ = cfg.llama_mtp;
         }
@@ -412,10 +412,9 @@ private:
             size_t common = 0;
             while (common < have.size() && common < n_pre && have[common] == prompt[common]) ++common;
             if (common < have.size()) {
-                // the drafter's carried row belongs to the old end; a rollback
-                // the target refuses (one is already pending) clears the lane
+                // a rollback the target refuses (one is already pending)
+                // clears the lane; the drafter keeps what stands below the cut
                 if (!spec_->seq_rm(seq, common)) common = 0;
-                spec_->reset(seq);
             }
             have.resize(common);
             stats.cache_hit_tokens = static_cast<int>(common);

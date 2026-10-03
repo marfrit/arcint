@@ -1,0 +1,556 @@
+diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
+index 4684ece..1a93b11 100644
+--- a/ggml/src/ggml-opencl/CMakeLists.txt
++++ b/ggml/src/ggml-opencl/CMakeLists.txt
+@@ -101,6 +101,7 @@ set(GGML_OPENCL_KERNELS
+     mul_mv_kq_q8_1
+     mul_mv_iq_q8_1
+     mul_mm_kq_f16
++    mul_mm_kq_few
+     mul_mv_q5_0_f32
+     mul_mv_q5_0_f32_flat
+     mul_mv_q5_1_f32
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 40f14ab..2c8b9f1 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -738,10 +738,13 @@ struct ggml_backend_opencl_context {
+     ggml_cl_buffer prealloc_kq_xd;   // per-32 scale (float)
+     ggml_cl_buffer prealloc_kq_xs;   // per-32 sum (float)
+     // what the activation buffers hold, and the graph count that dates it
+-    ggml_cl_kq_act kq_q8, kq_f16;
++    ggml_cl_kq_act kq_q8, kq_f16, kq_few;
+     uint64_t       graph_gen = 0;
+     ggml_cl_buffer prealloc_kq_xh;     // f16 activation of the K-quant GEMMs
+     ggml_cl_buffer prealloc_kq_xscale; // and its per-column scale
++    ggml_cl_buffer prealloc_kq_fa;     // the few-column product's tiled f16 activation (mul_mm_kq_few.cl)
++    ggml_cl_buffer prealloc_kq_fs;     // its sums per 16 values
++    ggml_cl_buffer prealloc_kq_fc;     // and scales per 32
+     ggml_cl_buffer prealloc_kq_pairs;  // MUL_MAT_ID GEMM: (token, slot) pairs sorted by expert
+     ggml_cl_buffer prealloc_kq_tiles;  // its tiles (expert, first pair, count)
+     ggml_cl_buffer prealloc_kq_ntiles; // and their number
+@@ -1008,6 +1011,11 @@ struct ggml_backend_opencl_context {
+     int             kq_mm_sg = 16;
+     ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
+     int       kq_q8_1_ndst = 4;
++    // Intel: K-quant x a few columns on the XMX units (mul_mm_kq_few.cl),
++    // [G - 1][Q4_K, Q5_K, Q6_K]: G = 1 takes up to 8 columns, G = 2 up to 16
++    cl_kernel kernel_mul_mm_few_kq[2][3] = {};
++    cl_kernel kernel_mul_mm_few_prep[2]  = {};
++    int       kq_few_sg = 16, kq_few_nk = 4, kq_few_min = 2;
+     cl_kernel kernel_mul_mv_q5_K_f32;
+     cl_kernel kernel_mul_mv_q5_K_f32_flat;
+     cl_kernel kernel_mul_mv_q6_K_f32;
+@@ -2226,6 +2234,60 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 }
+             }
+ 
++            // the few-column product (mul_mm_kq_few.cl): from 2 columns on Xe2,
++            // from 4 on Xe-HPG (where the q8_1 matvec stays ahead at 2 and 3:
++            // the coder's 3-token step 104 against 96 t/s, measured-here), up
++            // to 16; a build per token group count G. NK
++            // sub-groups split K: 4 on a B60, 8 on an A770 (measured-here).
++            // GGML_OPENCL_KQ_FEW=0 keeps the matvec and the GEMM;
++            // GGML_OPENCL_KQ_FEW_MIN overrides the least column count.
++            static const char * fw_env = getenv("GGML_OPENCL_KQ_FEW");
++            if (backend_ctx->has_intel_dpas && (fw_env == nullptr || atoi(fw_env) != 0)) {
++#ifdef GGML_OPENCL_EMBED_KERNELS
++                const std::string fw_src {
++                    #include "mul_mm_kq_few.cl.h"
++                };
++#else
++                const std::string fw_src = read_file("mul_mm_kq_few.cl");
++#endif
++                backend_ctx->kq_few_sg  = sg8 ? 8 : 16;
++                backend_ctx->kq_few_nk  = sg8 ? 8 : 4;
++                backend_ctx->kq_few_min = sg8 ? 4 : 2;
++                if (const char * fm = getenv("GGML_OPENCL_KQ_FEW_MIN")) {
++                    backend_ctx->kq_few_min = std::max(2, atoi(fm));
++                }
++                const char * fw_n[3] = { "kernel_mul_mm_few_q4_K_f16", "kernel_mul_mm_few_q5_K_f16", "kernel_mul_mm_few_q6_K_f16" };
++                for (int g = 1; g <= 2; ++g) {
++                    const std::string fw_opts = compile_opts + " -cl-intel-256-GRF-per-thread -DSG=" + std::to_string(backend_ctx->kq_few_sg) +
++                        " -DR=1 -DG=" + std::to_string(g) + " -DNK=" + std::to_string(backend_ctx->kq_few_nk);
++                    cl_program fw_prog = build_program_from_source_optional(backend_ctx, fw_src.c_str(), fw_opts);
++                    if (fw_prog == nullptr) {
++                        GGML_LOG_WARN("ggml_opencl: few-column K-quant product (G=%d) not built\n", g);
++                        continue;
++                    }
++                    bool fits = true;
++                    for (int i = 0; i < 3; ++i) {
++                        CL_CHECK((backend_ctx->kernel_mul_mm_few_kq[g - 1][i] = clCreateKernel(fw_prog, fw_n[i], &err), err));
++                        size_t wg = 0;
++                        CL_CHECK(clGetKernelWorkGroupInfo(backend_ctx->kernel_mul_mm_few_kq[g - 1][i], backend_ctx->device,
++                                                          CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg), &wg, NULL));
++                        fits = fits && wg >= (size_t)backend_ctx->kq_few_nk * backend_ctx->kq_few_sg;
++                    }
++                    CL_CHECK((backend_ctx->kernel_mul_mm_few_prep[g - 1] = clCreateKernel(fw_prog, "kernel_mul_mm_few_prep", &err), err));
++                    if (!fits) {
++                        for (int i = 0; i < 3; ++i) {
++                            CL_CHECK(clReleaseKernel(backend_ctx->kernel_mul_mm_few_kq[g - 1][i]));
++                            backend_ctx->kernel_mul_mm_few_kq[g - 1][i] = nullptr;
++                        }
++                        CL_CHECK(clReleaseKernel(backend_ctx->kernel_mul_mm_few_prep[g - 1]));
++                        backend_ctx->kernel_mul_mm_few_prep[g - 1] = nullptr;
++                        GGML_LOG_WARN("ggml_opencl: few-column K-quant product (G=%d) does not fit a work-group\n", g);
++                    }
++                    CL_CHECK(clReleaseProgram(fw_prog));
++                    GGML_LOG_CONT(".");
++                }
++            }
++
+             // the GEMM: fp16 DPAS at the device's DPAS sub-group size. Tiles
+             // (measured-here: an A770 at 2000 MHz, a B60), rows x columns per
+             // work-group: plain SG 8 32 x 512, SG 16 64 x 256; MUL_MAT_ID
+@@ -24129,6 +24191,70 @@ static bool ggml_cl_mul_mv_kq_q8_1(ggml_backend_opencl_context * backend_ctx, co
+     return true;
+ }
+ 
++// Intel: a K-quant weight times a few f32 columns (a speculative verify, a
++// few lanes): from kq_few_min to 16, the columns tiled as f16 with their
++// sums and block scales, the codes the fp16 DPAS b operand, each weight read
++// once for all of them (mul_mm_kq_few.cl). measured-here, test-backend-ops,
++// Q4_K 4096 x 14336, B60: 111 us at 2, 4 and 8 columns, 158 at 16, against
++// 123 / 169 / 837 / ~310 for the q8_1 matvec and the GEMM.
++static bool ggml_cl_mul_mm_kq_few(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src0,
++                                  const ggml_tensor * src1, ggml_tensor * dst) {
++    const int ti = ggml_cl_kq_type_index(src0->type);
++    const int ncols = (int)(src1->ne[1] * src1->ne[2] * src1->ne[3]);
++    if (ti < 0 || ti > 2 || ncols < backend_ctx->kq_few_min || ncols > 16 || !ggml_cl_kq_mul_mat_shape(src0, src1, dst)) {
++        return false;
++    }
++    const int g = ncols > 8 ? 2 : 1, tok = 8 * g;
++    cl_kernel kernel = backend_ctx->kernel_mul_mm_few_kq[g - 1][ti];
++    cl_kernel kp     = backend_ctx->kernel_mul_mm_few_prep[g - 1];
++    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
++    const cl_ulong offset1 = extra1->offset + src1->view_offs;
++    if (kernel == nullptr || kp == nullptr || offset1 % 16 != 0) {
++        return false;   // the prep reads float4
++    }
++    const int ne00 = (int)src0->ne[0];
++    const int ne01 = (int)src0->ne[1];
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++    const cl_ulong offsetd = extrad->offset + dst->view_offs;
++    const cl_ulong nb1 = dst->nb[1];
++
++    if (!ggml_cl_kq_cached(backend_ctx->kq_few, backend_ctx, src1, extra1->data_device, offset1, ne00 * ncols)) {
++        backend_ctx->prealloc_kq_fa.allocate(backend_ctx->context, (size_t)tok * ne00 * sizeof(cl_half));
++        backend_ctx->prealloc_kq_fs.allocate(backend_ctx->context, (size_t)(ne00 / 16) * tok * sizeof(float));
++        backend_ctx->prealloc_kq_fc.allocate(backend_ctx->context, (size_t)(ne00 / 32) * tok * sizeof(float));
++        const cl_ulong nbx = src1->nb[1];
++        CL_CHECK(clSetKernelArg(kp, 0, sizeof(cl_mem),   &extra1->data_device));
++        CL_CHECK(clSetKernelArg(kp, 1, sizeof(cl_ulong), &offset1));
++        CL_CHECK(clSetKernelArg(kp, 2, sizeof(cl_ulong), &nbx));
++        CL_CHECK(clSetKernelArg(kp, 3, sizeof(cl_mem),   &backend_ctx->prealloc_kq_fa.buffer));
++        CL_CHECK(clSetKernelArg(kp, 4, sizeof(cl_mem),   &backend_ctx->prealloc_kq_fs.buffer));
++        CL_CHECK(clSetKernelArg(kp, 5, sizeof(cl_mem),   &backend_ctx->prealloc_kq_fc.buffer));
++        CL_CHECK(clSetKernelArg(kp, 6, sizeof(int),      &ne00));
++        CL_CHECK(clSetKernelArg(kp, 7, sizeof(int),      &ncols));
++        size_t p_local[2]  = { (size_t)tok, 8 };
++        size_t p_global[2] = { (size_t)tok, (size_t)CEIL_DIV(ne00 / 32, 8) * 8 };
++        backend_ctx->enqueue_ndrange_kernel(kp, 2, p_global, p_local, dst);
++        backend_ctx->kq_few = { src1, extra1->data_device, offset1, ne00 * ncols, backend_ctx->graph_gen };
++    }
++
++    cl_uint a = 0;
++    ggml_cl_kq_weight_args(kernel, src0, a);
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_fa.buffer));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_fs.buffer));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_fc.buffer));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb1));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne00));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ncols));
++    const size_t sg = (size_t)backend_ctx->kq_few_sg, nk = (size_t)backend_ctx->kq_few_nk;
++    size_t global_work_size[] = { (size_t)CEIL_DIV(ne01, (int)sg) * nk * sg, 1, 1 };
++    size_t local_work_size[]  = { nk * sg, 1, 1 };
++    backend_ctx->enqueue_ndrange_kernel(kernel, 1, global_work_size, local_work_size, dst);
++    return true;
++}
++
+ // Intel: a K-quant weight times more than 4 f32 columns -- the columns as
+ // f16, the weights dequantized to f16 per work-group tile, fp16 DPAS on the
+ // XMX units (mul_mm_kq_f16.cl).
+@@ -24349,7 +24475,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+     GGML_ASSERT(ne00 == ne10);
+ 
+ #ifdef GGML_OPENCL_SOA_Q
+-    if (ggml_cl_mul_mv_kq_q8_1(backend_ctx, src0, src1, dst) || ggml_cl_mul_mm_kq_f16(backend_ctx, src0, src1, dst)) {
++    if (ggml_cl_mul_mm_kq_few(backend_ctx, src0, src1, dst) || ggml_cl_mul_mv_kq_q8_1(backend_ctx, src0, src1, dst) ||
++        ggml_cl_mul_mm_kq_f16(backend_ctx, src0, src1, dst)) {
+         return;
+     }
+ #endif
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_few.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_few.cl
+new file mode 100644
+index 0000000..3052094
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_few.cl
+@@ -0,0 +1,343 @@
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++#pragma OPENCL EXTENSION cl_intel_subgroups : enable
++#pragma OPENCL EXTENSION cl_intel_subgroups_short : enable
++#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
++#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
++
++// K-quant weights times a few f32 columns (a speculative verify, a few
++// lanes: 2 to 8 G tokens) on the XMX units, each weight read once for all of
++// them. A lane is a weight row: its codes, as halves 1024 + q built from the
++// code bytes by integer operations, are the fp16 DPAS b operand (lane =
++// column of the product); the tokens are the a operand, 8 a DPAS, read from
++// a tiled f16 copy of the activations (kernel_mul_mm_few_prep). A
++// sub-block's DPAS chain starts at -1024 S, S the tokens' sums of the f16
++// values, so it ends at sum q x; then xsc (D sc chain - M m S), xsc the
++// activations' block scale. A sub-group takes R groups of SG rows; the NK
++// sub-groups of a work-group take every NK-th super-block and add their sums
++// in local memory.
++//
++// fp16 DPAS operands (cl_intel_subgroup_matrix_multiply_accumulate):
++//   SG 8 (Xe-HPG): a = int   per row, lane i holds k = 2i, 2i+1
++//   SG 16 (Xe2):   a = short per row, lane i holds k = i
++//   b = int8 per lane: lane n is column n, its 16 k as 8 half pairs
++//   result float8: lane n is column n, component m is row m
++
++#define QK_K 256
++#ifndef SG
++#define SG 16
++#endif
++#ifndef R
++#define R 1
++#endif
++#ifndef G
++#define G 1
++#endif
++#ifndef NK
++#define NK 4
++#endif
++#define TOK (8 * G)
++
++#if SG == 8
++typedef int8 a8_t;
++#define LOAD_AG(p) as_int8(intel_sub_group_block_read8((global const uint *)(p)))
++#else
++typedef short8 a8_t;
++#define LOAD_AG(p) as_short8(intel_sub_group_block_read_us8((global const ushort *)(p)))
++#endif
++#define DPAS(a, b, c) intel_sub_group_f16_f16_matrix_mad_k16(a, b, c)
++
++static inline uint kbyte(uint3 w, int k) {
++    const uint v = k < 4 ? w.s0 : (k < 8 ? w.s1 : w.s2);
++    return (v >> (8 * (k & 3))) & 0xFFu;
++}
++
++// sub-block k's scale and min from a K-quant block's 12 scale bytes
++static inline void scale_min(uint3 w, int k, float * sc, float * m) {
++    if (k < 4) {
++        *sc = kbyte(w, k) & 63; *m = kbyte(w, k + 4) & 63;
++    } else {
++        *sc = (kbyte(w, k + 4) & 0xF) | ((kbyte(w, k - 4) >> 6) << 4);
++        *m  = (kbyte(w, k + 4) >> 4) | ((kbyte(w, k) >> 6) << 4);
++    }
++}
++
++// 16 Q4_K / Q5_K codes as halves 1024 + q: byte pairs (0, 2) and (1, 3) of
++// each word (the activations are staged with the middle two of every four
++// halves swapped to match); nibble sh, fifth bit hb of the qh bytes
++static inline int8 b16_q45_codes(uint4 w, uint4 h, int sh, int hb, const int q5) {
++    const uint wv[4] = { w.s0, w.s1, w.s2, w.s3 }, hv[4] = { h.s0, h.s1, h.s2, h.s3 };
++    uint r[8];
++    #pragma unroll
++    for (int u = 0; u < 4; ++u) {
++        uint lo = ((wv[u] >> sh) & 0x000F000Fu) | 0x64006400u;
++        uint hi = ((wv[u] >> (8 + sh)) & 0x000F000Fu) | 0x64006400u;
++        if (q5) {
++            lo |= ((hv[u] >> hb) & 0x00010001u) << 4;
++            hi |= ((hv[u] >> (8 + hb)) & 0x00010001u) << 4;
++        }
++        r[2 * u] = lo;
++        r[2 * u + 1] = hi;
++    }
++    return as_int8((uint8)(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]));
++}
++
++// 16 Q6_K codes as halves 1024 + q (q the 6-bit code, 32 above the weight)
++static inline int8 b16_q6_codes(uint4 w, uint4 h, int sh, int hb) {
++    const uint wv[4] = { w.s0, w.s1, w.s2, w.s3 }, hv[4] = { h.s0, h.s1, h.s2, h.s3 };
++    uint r[8];
++    #pragma unroll
++    for (int u = 0; u < 4; ++u) {
++        r[2 * u]     = ((wv[u] >> sh) & 0x000F000Fu) | (((hv[u] >> hb) & 0x00030003u) << 4) | 0x64006400u;
++        r[2 * u + 1] = ((wv[u] >> (8 + sh)) & 0x000F000Fu) | (((hv[u] >> (8 + hb)) & 0x00030003u) << 4) | 0x64006400u;
++    }
++    return as_int8((uint8)(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]));
++}
++
++// a half's value from its bits, by integer operations: the sums S must be
++// of exactly the halves the DPAS multiplies (the chain's 1024 offset
++// multiplies any difference by a thousand), and with ggml's
++// -cl-unsafe-math-optimizations -cl-finite-math-only the compiler sums the
++// unrounded floats for (float) h (4-9 % off, measured-here)
++static inline float half_bits_to_float(ushort h) {
++    const uint  e = (h >> 10) & 0x1F, m = h & 0x3FF;
++    const float v = e == 0 ? (float)m * 0x1p-24f : as_float(((e + 112u) << 23) | (m << 13));
++    return (h & 0x8000) ? -v : v;
++}
++
++// ---- the activations ----
++// One work-item per (token, 32-block), the token fastest. x: f32 columns of
++// k values at src + offs + t * nbx. xa: half [G][k/16][8][16] (the middle
++// two of every four swapped), xs: f32 [k/16][TOK] the sums of the f16
++// values, xsc: f32 [k/32][TOK] the block's scale, a power of two keeping it
++// below 2^15 (1 for nearly every block). Columns from ncols to TOK are
++// zero.
++kernel void kernel_mul_mm_few_prep(global const char * src, ulong offs, ulong nbx, global half * xa,
++                                   global float * xs, global float * xsc, int k, int ncols) {
++    const int t = get_global_id(0), kb = get_global_id(1);
++    if (t >= TOK || kb >= k / 32) return;
++    float v[32];
++    float amax = 0.f;
++    if (t < ncols) {
++        global const float4 * p = (global const float4 *)(src + offs + (ulong)t * nbx) + kb * 8;
++        #pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            const float4 f = p[i];
++            v[4 * i] = f.s0; v[4 * i + 1] = f.s1; v[4 * i + 2] = f.s2; v[4 * i + 3] = f.s3;
++            amax = fmax(amax, fmax(fmax(fabs(f.s0), fabs(f.s1)), fmax(fabs(f.s2), fabs(f.s3))));
++        }
++    } else {
++        #pragma unroll
++        for (int i = 0; i < 32; ++i) v[i] = 0.f;
++    }
++    // 2^e from the exponent bits, so that the block stays below 2^15
++    const int   e   = max(0, ((as_int(amax) >> 23) & 0xFF) - 127 - 14);
++    const float sc  = as_float((127 + e) << 23), isc = as_float((127 - e) << 23);
++    #pragma unroll
++    for (int hb = 0; hb < 2; ++hb) {
++        const int k16 = 2 * kb + hb;
++        half h[16];
++        float s = 0.f;
++        #pragma unroll
++        for (int i = 0; i < 16; ++i) {
++            // subnormal halves to zero, so S and the DPAS agree whether or
++            // not the XMX units flush them
++            ushort u = as_ushort(convert_half_rte(v[16 * hb + i] * isc));
++            u = ((u >> 10) & 0x1F) == 0 ? (ushort)0 : u;
++            h[i] = as_half(u);
++            s += half_bits_to_float(u);
++        }
++        global half * dst = xa + (((ulong)(t >> 3) * (k / 16) + k16) * 8 + (t & 7)) * 16;
++        #pragma unroll
++        for (int i = 0; i < 16; i += 4) {
++            dst[i] = h[i]; dst[i + 1] = h[i + 2]; dst[i + 2] = h[i + 1]; dst[i + 3] = h[i + 3];
++        }
++        xs[(ulong)k16 * TOK + t] = s;
++    }
++    xsc[(ulong)kb * TOK + t] = sc;
++}
++
++#define FEW_PROLOGUE                                                                            \
++    const int lane = get_sub_group_local_id(), sgk = get_sub_group_id();                        \
++    const int row0 = get_group_id(0) * (R * SG);                                                \
++    const int nb = ne00 / QK_K, k16 = ne00 / 16;                                                \
++    ulong rb[R];                                                                                \
++    _Pragma("unroll")                                                                           \
++    for (int rr = 0; rr < R; ++rr) rb[rr] = (ulong)min(row0 + rr * SG + lane, ne01 - 1) * nb;   \
++    float8 acc[R][G];                                                                           \
++    _Pragma("unroll")                                                                           \
++    for (int rr = 0; rr < R; ++rr)                                                              \
++        _Pragma("unroll")                                                                       \
++        for (int g = 0; g < G; ++g) acc[rr][g] = (float8)(0.f);
++
++// the NK sub-groups' partial sums added in local memory; token t of row r
++// to dst + offd + t * nb1, float r
++#define FEW_EPILOGUE                                                                            \
++    local float red[NK * R * G * 8 * SG];                                                       \
++    _Pragma("unroll")                                                                           \
++    for (int rr = 0; rr < R; ++rr)                                                              \
++        _Pragma("unroll")                                                                       \
++        for (int g = 0; g < G; ++g)                                                             \
++            vstore8(acc[rr][g], 0, red + (((sgk * R + rr) * G + g) * SG + lane) * 8);           \
++    barrier(CLK_LOCAL_MEM_FENCE);                                                               \
++    for (int u = get_local_id(0); u < R * G * 8 * SG; u += NK * SG) {                           \
++        float s = 0.f;                                                                          \
++        for (int j = 0; j < NK; ++j) s += red[j * R * G * 8 * SG + u];                          \
++        const int m = u & 7, l = (u >> 3) % SG, rg = (u >> 3) / SG, g = rg % G, rr = rg / G;    \
++        const int t = g * 8 + m, row = row0 + rr * SG + l;                                      \
++        if (t < ncols && row < ne01)                                                            \
++            ((global float *)(dst + offd + (ulong)t * nb1))[row] = s;                           \
++    }
++
++// Q4_K (Q5 = 0) and Q5_K (Q5 = 1): per super-block a lane's 128 code bytes
++// as two 64-byte lines; sub-blocks 2 c4 and 2 c4 + 1 are the low and high
++// nibbles of bytes 32 c4 .. 32 c4 + 31
++#define FEW_Q45_BODY(QH, Q5)                                                                    \
++    FEW_PROLOGUE                                                                                \
++    for (int ib = sgk; ib < nb; ib += NK) {                                                     \
++        uint3 sw[R];                                                                            \
++        float D[R], M[R];                                                                       \
++        uint16 w0[R], w1[R];                                                                    \
++        uint8 hq[R];                                                                            \
++        _Pragma("unroll")                                                                       \
++        for (int rr = 0; rr < R; ++rr) {                                                        \
++            const ulong b = rb[rr] + ib;                                                        \
++            sw[rr] = vload3(0, (global const uint *)(s + b * 12));                              \
++            D[rr]  = vload_half(0, d + b);                                                      \
++            M[rr]  = vload_half(0, dm + b);                                                     \
++            w0[rr] = vload16(0, (global const uint *)(q + b * 128));                            \
++            w1[rr] = vload16(0, (global const uint *)(q + b * 128 + 64));                       \
++            hq[rr] = Q5 ? vload8(0, (global const uint *)(QH + b * 32)) : (uint8)(0);           \
++        }                                                                                       \
++        _Pragma("unroll")                                                                       \
++        for (int c4 = 0; c4 < 4; ++c4) {                                                        \
++            float8 sl[G], sh[G], cl[G], ch[G];                                                  \
++            _Pragma("unroll")                                                                   \
++            for (int g = 0; g < G; ++g) {                                                       \
++                const int kb = ib * 16 + 4 * c4;                                                \
++                sl[g] = vload8(0, xs + (ulong)kb * TOK + 8 * g) + vload8(0, xs + (ulong)(kb + 1) * TOK + 8 * g); \
++                sh[g] = vload8(0, xs + (ulong)(kb + 2) * TOK + 8 * g) + vload8(0, xs + (ulong)(kb + 3) * TOK + 8 * g); \
++                cl[g] = vload8(0, xsc + (ulong)(kb / 2) * TOK + 8 * g);                         \
++                ch[g] = vload8(0, xsc + (ulong)(kb / 2 + 1) * TOK + 8 * g);                     \
++            }                                                                                   \
++            float8 tl[R][G], th[R][G];                                                          \
++            _Pragma("unroll")                                                                   \
++            for (int rr = 0; rr < R; ++rr)                                                      \
++                _Pragma("unroll")                                                               \
++                for (int g = 0; g < G; ++g) { tl[rr][g] = -1024.f * sl[g]; th[rr][g] = -1024.f * sh[g]; } \
++            _Pragma("unroll")                                                                   \
++            for (int hh = 0; hh < 2; ++hh) {                                                    \
++                a8_t alo[G], ahi[G];                                                            \
++                _Pragma("unroll")                                                               \
++                for (int g = 0; g < G; ++g) {                                                   \
++                    alo[g] = LOAD_AG(xa + (((ulong)g * k16 + ib * 16 + 4 * c4 + hh) * 8) * 16); \
++                    ahi[g] = LOAD_AG(xa + (((ulong)g * k16 + ib * 16 + 4 * c4 + 2 + hh) * 8) * 16); \
++                }                                                                               \
++                _Pragma("unroll")                                                               \
++                for (int rr = 0; rr < R; ++rr) {                                                \
++                    const uint16 wl = c4 < 2 ? w0[rr] : w1[rr];                                 \
++                    const int o = 2 * (c4 & 1) + hh;                                            \
++                    const uint4 w = o == 0 ? wl.s0123 : o == 1 ? wl.s4567 : o == 2 ? wl.s89ab : wl.scdef; \
++                    const uint4 h = hh == 0 ? hq[rr].s0123 : hq[rr].s4567;                      \
++                    const int8 bl = b16_q45_codes(w, h, 0, 2 * c4, Q5);                         \
++                    const int8 bh = b16_q45_codes(w, h, 4, 2 * c4 + 1, Q5);                     \
++                    _Pragma("unroll")                                                           \
++                    for (int g = 0; g < G; ++g) {                                               \
++                        tl[rr][g] = DPAS(alo[g], bl, tl[rr][g]);                                \
++                        th[rr][g] = DPAS(ahi[g], bh, th[rr][g]);                                \
++                    }                                                                           \
++                }                                                                               \
++            }                                                                                   \
++            _Pragma("unroll")                                                                   \
++            for (int rr = 0; rr < R; ++rr) {                                                    \
++                float sc0, m0, sc1, m1;                                                         \
++                scale_min(sw[rr], 2 * c4, &sc0, &m0);                                           \
++                scale_min(sw[rr], 2 * c4 + 1, &sc1, &m1);                                       \
++                const float ka0 = D[rr] * sc0, kb0 = M[rr] * m0;                                \
++                const float ka1 = D[rr] * sc1, kb1 = M[rr] * m1;                                \
++                _Pragma("unroll")                                                               \
++                for (int g = 0; g < G; ++g) {                                                   \
++                    acc[rr][g] = fma(fma(tl[rr][g], (float8)(ka0), sl[g] * -kb0), cl[g], acc[rr][g]); \
++                    acc[rr][g] = fma(fma(th[rr][g], (float8)(ka1), sh[g] * -kb1), ch[g], acc[rr][g]); \
++                }                                                                               \
++            }                                                                                   \
++        }                                                                                       \
++    }                                                                                           \
++    FEW_EPILOGUE
++
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_few_q4_K_f16(global const uchar * q, global const uchar * s, global const half * d,
++                                       global const half * dm, global const half * xa, global const float * xs,
++                                       global const float * xsc, global char * dst, ulong offd, ulong nb1,
++                                       int ne00, int ne01, int ncols) {
++    FEW_Q45_BODY(q, 0)
++}
++
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_few_q5_K_f16(global const uchar * q, global const uchar * qh, global const uchar * s,
++                                       global const half * d, global const half * dm, global const half * xa,
++                                       global const float * xs, global const float * xsc, global char * dst,
++                                       ulong offd, ulong nb1, int ne00, int ne01, int ncols) {
++    FEW_Q45_BODY(qh, 1)
++}
++
++// Q6_K: k16 step 2 (4 n + p) + hh of a super-block holds weights 128 n +
++// 32 p + 16 hh + i, from ql bytes 64 n + 32 (p & 1) + 16 hh (nibble p / 2)
++// and qh bytes 32 n + 16 hh (bits 2 p), at the int8 scale 8 n + 2 p + hh
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_few_q6_K_f16(global const uchar * ql, global const uchar * qh, global const char * s,
++                                       global const half * d, global const half * xa, global const float * xs,
++                                       global const float * xsc, global char * dst, ulong offd, ulong nb1,
++                                       int ne00, int ne01, int ncols) {
++    FEW_PROLOGUE
++    for (int ib = sgk; ib < nb; ib += NK) {
++        float D[R];
++        uint4 sc4[R];
++        _Pragma("unroll")
++        for (int rr = 0; rr < R; ++rr) {
++            D[rr]   = vload_half(0, d + rb[rr] + ib);
++            sc4[rr] = vload4(0, (global const uint *)(s + (rb[rr] + ib) * 16));
++        }
++        #pragma unroll
++        for (int n = 0; n < 2; ++n) {
++            #pragma unroll
++            for (int pl = 0; pl < 2; ++pl) {
++                #pragma unroll
++                for (int hh = 0; hh < 2; ++hh) {
++                    // p = pl (nibble 0) and p = pl + 2 (nibble 1): the same bytes
++                    const int s0 = 2 * (4 * n + pl) + hh, s1 = 2 * (4 * n + pl + 2) + hh;   // k16 steps
++                    a8_t a0[G], a1[G];
++                    float8 S0[G], S1[G], c0[G], c1[G];
++                    _Pragma("unroll")
++                    for (int g = 0; g < G; ++g) {
++                        a0[g] = LOAD_AG(xa + (((ulong)g * k16 + ib * 16 + s0) * 8) * 16);
++                        a1[g] = LOAD_AG(xa + (((ulong)g * k16 + ib * 16 + s1) * 8) * 16);
++                        S0[g] = vload8(0, xs + (ulong)(ib * 16 + s0) * TOK + 8 * g);
++                        S1[g] = vload8(0, xs + (ulong)(ib * 16 + s1) * TOK + 8 * g);
++                        c0[g] = vload8(0, xsc + (ulong)(ib * 8 + s0 / 2) * TOK + 8 * g);
++                        c1[g] = vload8(0, xsc + (ulong)(ib * 8 + s1 / 2) * TOK + 8 * g);
++                    }
++                    _Pragma("unroll")
++                    for (int rr = 0; rr < R; ++rr) {
++                        const ulong b = rb[rr] + ib;
++                        const uint4 w = vload4(0, (global const uint *)(ql + b * 128 + 64 * n + 32 * pl + 16 * hh));
++                        const uint4 h = vload4(0, (global const uint *)(qh + b * 64 + 32 * n + 16 * hh));
++                        const int8 b0 = b16_q6_codes(w, h, 0, 2 * pl);
++                        const int8 b1 = b16_q6_codes(w, h, 4, 2 * (pl + 2));
++                        const uint sv = (s0 >> 2) == 0 ? sc4[rr].s0 : (s0 >> 2) == 1 ? sc4[rr].s1 : (s0 >> 2) == 2 ? sc4[rr].s2 : sc4[rr].s3;
++                        const uint sv1 = (s1 >> 2) == 0 ? sc4[rr].s0 : (s1 >> 2) == 1 ? sc4[rr].s1 : (s1 >> 2) == 2 ? sc4[rr].s2 : sc4[rr].s3;
++                        const float ka0 = D[rr] * (float)(char)((sv >> (8 * (s0 & 3))) & 0xFF);
++                        const float ka1 = D[rr] * (float)(char)((sv1 >> (8 * (s1 & 3))) & 0xFF);
++                        _Pragma("unroll")
++                        for (int g = 0; g < G; ++g) {
++                            const float8 t0 = DPAS(a0[g], b0, -1056.f * S0[g]);
++                            const float8 t1 = DPAS(a1[g], b1, -1056.f * S1[g]);
++                            acc[rr][g] = fma(t0 * ka0, c0[g], acc[rr][g]);
++                            acc[rr][g] = fma(t1 * ka1, c1[g], acc[rr][g]);
++                        }
++                    }
++                }
++            }
++        }
++    }
++    FEW_EPILOGUE
++}
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index a23a133..221e357 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10246,6 +10246,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  8, 16*256, { 1,  1}, {1, 1}));
+     }
+ 
++    // the few-column K-quant product (OpenCL, Intel): 2 to 16 columns, rows
++    // not a multiple of the sub-group, super-block counts below and around
++    // the work-group's K split, a src1 broadcast over dimension 2
++    for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
++        for (int n : { 2, 3, 4, 7, 8, 9, 12, 16 }) {
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1023, n, 4096, { 1, 1 }, { 1, 1 }));
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 77, n, 5 * 256, { 1, 1 }, { 1, 1 }));
++        }
++        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, 4, 1024, { 1, 1 }, { 2, 1 }));
++    }
++
+     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
+     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
+         for (int n = 1; n <= 8; ++n) {

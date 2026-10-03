@@ -1033,6 +1033,17 @@ TEST(config_llama_cpu_moe_and_threads) {
     }
     {
         Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp", "4", "--llama-mtp-vocab", "/m/ids.bin"};
+        CHECK(parse_args(7, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_mtp_vocab, std::string("/m/ids.bin"));
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp-vocab", "/m/ids.bin"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // a draft vocabulary without drafts
+    }
+    {
+        Config cfg;
         const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp", "8"};
         CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // a verify of 9 rows: the decode attention takes up to 8
     }

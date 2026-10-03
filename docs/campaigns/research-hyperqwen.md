@@ -18,8 +18,12 @@ tree), `doc-measured` (its own tables, no raw output in the tree),
    98.0 -> 108.6 -> 118.8 t/s (`drafter/README.md:14-28`); an MTP step 24.8 ms
    (`optimizations.md:234`), against 21.7 ms a token in their batch-mode
    table at one request (`batch/README.md:17`, not a like-for-like plain
-   step; `doc-measured`). Same tokenizer: the id file transfers. arcint's
-   OpenVINO path already builds a draft vocabulary (`tools/draft_vocab.py`).
+   step; `doc-measured`). Same tokenizer: the id file transfers. The
+   libllama engine takes it with `--llama-mtp-vocab` (2026-10-03). On the
+   dense 27B with 4 drafts it ran 47.1 -> 50.8 t/s, draft acceptance
+   72.1 -> 68.0 % (`measured-here`, `mtp-cycle-wall.md`).
+   `tools/draft_vocab.py` is Strata's (`~/src/Strata-ref`, `code`), not
+   arcint's.
 2. **A verify that reads the weights once for up to 16 rows.** Not int8 (the
    single-user path is W4A16, `single-user/start_qwen.sh:139`): Marlin tiles
    16 token rows, so a decode step already pays for 16 (`docs/gotchas.md:252-262`);

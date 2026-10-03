@@ -158,6 +158,29 @@ llama.cpp's own loop (`llama-speculative-simple`, raw prompt) for
 reference: coder 68.1 t/s with 2 drafts, dense 31.9 with 3; four drafts
 fall to 46.0 and 10.7 (a 5-row verify leaves the 4-column K-quant matvec).
 
+Since then (2026-10-03, `docs/campaigns/mtp-cycle-wall.md` has the
+references and every number):
+
+- `contrib/llama.cpp` 0009 multiplies K-quants by 2 to 16 tokens on XMX,
+  reading each weight once. An 8-row dense step went from 6.0x to 1.21x a
+  1-row step.
+- The drafter takes draft 0 from the catch-up batch, as Strata's does. That
+  needed 0010, a masked-nextn row fix in the MTP graph.
+- `--llama-mtp-vocab FILE` drafts from a subset of the vocabulary: the
+  draft steps read those rows of the head instead of all 248k.
+
+Served, the same prompt at temperature 0, 10/10 in every run
+(`measured-here`):
+
+| model, card | drafts | decode |
+|---|---|---|
+| dense 27B, B60 | 5, 40,960-id head | 52.6 t/s |
+| coder, A770 | 4, 40,960-id head | 79.3 t/s |
+
+The dense model's 20-run sampled arm with that configuration scored 11 of
+20 at 10/10 (mean 7.4). The plain arm of the same binary scored 12 of 20
+(mean 6.9), and the record's earlier plain arms 10, 11 and 15.
+
 ## Not yet on this engine
 
 Flash-Next's MTP (`qwen4exp` is in llama.cpp at the pin), conversation

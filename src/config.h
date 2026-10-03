@@ -28,6 +28,10 @@ struct Config {
     int llama_cpu_moe = 0;
     int llama_threads = 0;
     int llama_mtp     = 0;
+    // --llama-mtp-vocab FILE: the token ids the MTP head may draft (int32,
+    // or a JSON list); the draft steps then read those rows of the output
+    // head instead of all of them
+    std::string llama_mtp_vocab;
     std::string flash_next_ngram_path;  // --flash-next-ngram: FIX D per_layer_token_embd table (24-byte ARCINGRM header + block-quantised payload); admitted only when the artifact's config.json declares an n-gram table (docs/design-qwen-flash-next.md FIX D Link 2)
     // --ngram-gguf: the GGUF shard whose per_layer_token_embd.weight binds a
     // serving-shape IR's `ngram_table.K` ports (backend_ov.cpp

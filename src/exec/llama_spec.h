@@ -38,10 +38,13 @@ public:
     virtual bool seq_rm(int seq, size_t from) = 0;
 };
 
-// model: loaded with load_mtp; ctx_tgt: n_rs_seq >= n_draft. Null with
-// `err` set when the model has no MTP layer or a context cannot be made.
+// model: loaded with load_mtp from `gguf`; ctx_tgt: n_rs_seq >= n_draft.
+// vocab: the file of token ids the drafts are drawn from (empty: all).
+// Null with `err` set when the model has no MTP layer, a context cannot be
+// made or the draft vocabulary cannot be built.
 std::unique_ptr<LlamaSpec> make_llama_mtp(llama_model* model, llama_context* ctx_tgt, int n_draft, int n_seq,
-                                          int n_batch, int n_ubatch, int threads, std::string& err);
+                                          int n_batch, int n_ubatch, int threads, const std::string& gguf,
+                                          const std::string& vocab, std::string& err);
 
 }  // namespace lgc
 
