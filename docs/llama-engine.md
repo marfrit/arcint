@@ -105,19 +105,54 @@ of patch 0002 run the rest on the card. Served on the B60 with 16 expert
 layers on the card: the needle answered, 49.2 t/s prefill at 20k, 10.9 t/s
 decode (`docs/campaigns/flash-next-llama-engine.md`).
 
+## MTP (`--llama-mtp N`)
+
+The GGUF's own MTP head drafts up to N tokens; the target verifies them in
+one decode, and arcint's sampler walks the verified rows in order, keeping
+the draft while it agrees -- the emitted tokens are what the plain loop
+would sample. The drafter is the single-head case of llama.cpp's `draft-mtp`
+(`common/speculative.cpp` at the pin) rebuilt on libllama in
+`src/exec/llama_spec.cpp`: llama.cpp's common library compiles another
+cpp-httplib (0.58) than arcint's (0.18) into the binary, and the server
+then failed to bind. A rejected draft rolls back on the device through the
+target's per-token recurrent snapshots (`n_rs_seq` = N). The logits rows
+are bounded to 1 + N per lane: unbounded, llama.cpp reserved them for a
+whole ubatch, vocabulary-wide, in both contexts, and the coder with its MTP
+layer hung the A770 (two engine resets).
+
+Served (`measured-here`, 2026-10-03, the acceptance task through arcint):
+
+| model, card, drafts | decode, plain -> MTP | accepted | acceptance task |
+|---|---|---|---|
+| dense 27B, B60, 3 | 18.0-19.5 -> 30.8-35.7 t/s | 69-88 % | 10/10 at temperature 0; 13 of 20 sampled at 10/10 (plain arms 10, 11, 15 of 20) |
+| coder, A770, 2 | 47.5 -> 67.1-68.9 t/s | 86-91 % | 10/10 at temperature 0; 9 of 9 sampled |
+
+The verify walk (`src/exec/verify_walk.h`) is a pure function with its own
+tests (`tests/test_verify_walk.cpp`: full and partial acceptance, a stop
+token, the token budget, cancellation, and seeded sampled walks that draw
+exactly what the plain loop draws; dropping its `observe()` fails them). A
+review found no blocker; its fixes are in: the lane cleared when a request
+fails mid-step, the drafter's carried row reset after a trimmed prefix, the
+context budget of the plain loop (one token more at the limit before),
+`/props` reporting MTP.
+
+The greedy text with MTP matched the plain path's for the first 2,585
+characters of the dense answer, then diverged at one line (the verify's
+batched numerics; plain builds differ from each other the same way).
+
+The coder with its MTP layer fits the A770 up to a 16,384-token context
+(prefill 1,070 t/s); at 24,576 prefill drops to 585 t/s and at 32,768 to 67
+with decode at 22 t/s: VRAM paged over the link. The dense model fits the
+B60 at 32,768.
+
+llama.cpp's own loop (`llama-speculative-simple`, raw prompt) for
+reference: coder 68.1 t/s with 2 drafts, dense 31.9 with 3; four drafts
+fall to 46.0 and 10.7 (a 5-row verify leaves the 4-column K-quant matvec).
+
 ## Not yet on this engine
 
-MTP (P4): llama.cpp at the pin carries an MTP drafter for qwen35/qwen35moe
-(`common/speculative.cpp`, `draft-mtp`). Its `speculative-simple` loop on
-patches 0001-0007 (`measured-here`, temperature 0, the acceptance prompt):
-coder 68.1 t/s with 2 drafts (92.6 % accepted) against 47.8 plain, dense
-31.9 with 3 drafts (76.3 %) against 19.75 (the OpenVINO path's MTP-1: 33.0);
-the greedy text is the same for 1, 2 and 3 drafts. arcint's server does not
-drive the drafter yet; its rollback of the recurrent state in llama.cpp's
-loop goes through host memory, and llama.cpp's recurrent memory shares a
-sequence's cell on `seq_cp`, which a rollback on the device can use. Flash-Next (`qwen4exp` is in
-llama.cpp at the pin), conversation state (P6) and GPU prefill from the
-pinned bank (P5) are open.
+Flash-Next's MTP (`qwen4exp` is in llama.cpp at the pin), conversation
+state (P6) and GPU prefill from the pinned bank (P5) are open.
 
 Open observation: on the B60, xe logged GPU page faults with compute-engine
 resets in windows where `test-backend-ops` ran (2026-10-03); a run of every

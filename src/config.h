@@ -23,8 +23,11 @@ struct Config {
     // CPU backend computes them -- a model whose experts exceed VRAM.
     // --llama-threads N: that backend's threads (0: half the hardware threads,
     // the physical cores on SMT hosts).
+    // --llama-mtp N: up to N tokens drafted per verify by the GGUF's own MTP
+    // head (llama.cpp's draft-mtp); 0 off. A verify of N + 1 rows.
     int llama_cpu_moe = 0;
     int llama_threads = 0;
+    int llama_mtp     = 0;
     std::string flash_next_ngram_path;  // --flash-next-ngram: FIX D per_layer_token_embd table (24-byte ARCINGRM header + block-quantised payload); admitted only when the artifact's config.json declares an n-gram table (docs/design-qwen-flash-next.md FIX D Link 2)
     // --ngram-gguf: the GGUF shard whose per_layer_token_embd.weight binds a
     // serving-shape IR's `ngram_table.K` ports (backend_ov.cpp

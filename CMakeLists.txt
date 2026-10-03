@@ -157,10 +157,16 @@ if(ARCINT_LLAMA)
   set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
   set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
   set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+  # not llama.cpp's common library: it compiles another cpp-httplib (0.58)
+  # than arcint's (0.18) into the same binary, and the server then fails to
+  # bind (measured-here); the MTP drafter is rebuilt in llama_spec.cpp
+  set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
   set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
   add_subdirectory("${ARCINT_LLAMA_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/llama.cpp" EXCLUDE_FROM_ALL)
   find_package(OpenCL REQUIRED)
-  target_sources(arcint_core PRIVATE src/exec/backend_llama.cpp)
+  target_sources(arcint_core PRIVATE src/exec/backend_llama.cpp src/exec/llama_spec.cpp)
+  # llama-ext.h: the pinned llama.cpp's staging API (nextn embeddings, MTP)
+  target_include_directories(arcint_core PRIVATE "${ARCINT_LLAMA_DIR}/src")
   target_link_libraries(arcint_core PUBLIC llama OpenCL::OpenCL)
   target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA=1)
 endif()
@@ -241,6 +247,7 @@ if(ARCINT_TESTS)
     tests/test_drafter.cpp
     tests/test_text.cpp
     tests/test_config.cpp
+    tests/test_verify_walk.cpp
     tests/test_props.cpp
     tests/test_artifact.cpp
     tests/test_ngram_admit.cpp

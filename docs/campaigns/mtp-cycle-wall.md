@@ -40,6 +40,20 @@ KL no more than 0.03 nats above plain's, argmax down at most 1 point.
 
 ## Current state
 
+- **libllama engine (2026-10-03), dense 27B and coder: served.**
+  `--llama-mtp N` (`docs/llama-engine.md`, MTP): llama.cpp's single-head
+  `draft-mtp` rebuilt on libllama (`src/exec/llama_spec.cpp`), the verify's
+  rows sampled by arcint's sampler, the rollback on the device through the
+  target's recurrent snapshots. `measured-here`, served, the acceptance
+  task: dense (B60, 3 drafts) 18.0-19.5 -> 30.8-35.0 t/s, 69-86 %
+  accepted, 10/10 at temperature 0, 13 of 20 sampled at 10/10 (plain arms
+  10, 11, 15 of 20); coder (A770, 2 drafts, up to a 16k context) 47.5 ->
+  68.9 t/s, 86-90 % accepted, 10/10 and 6 of 6 sampled. On the dense model
+  a cycle (3 drafts, a 4-row verify) took 102 ms -- verify 90, drafting 11.5
+  -- against a 51 ms plain step, ~2.0 steps for 3.6 tokens (the K-quant
+  matvec takes 4 columns, the decode attention up to 8 rows), against the
+  OpenVINO path's ~3.6 steps a 4-token window below. Flash-Next on this
+  engine: not yet.
 - **Dense 27B agent** (`measured-here`, 24 GB card, DESIGN §7.0.2ag): MTP
   drafts one token a cycle; at 77,134 tokens it accepts 90.8 % and decodes
   4.9 t/s against plain 15.3 t/s, a cycle of ~390 ms; DFlash reads 18.8 t/s.

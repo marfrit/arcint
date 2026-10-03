@@ -418,6 +418,8 @@ std::string usage_text() {
         "                            memory, computed by the CPU (experts beyond VRAM)\n"
         "  --llama-threads N         libllama: CPU threads (default: half the hardware\n"
         "                            threads)\n"
+        "  --llama-mtp N             libllama: draft up to N tokens a step with the\n"
+        "                            GGUF's MTP head, verified in one pass (0-7; 0 off)\n"
         "  -h, --help                print this help and exit\n";
 }
 
@@ -463,6 +465,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--llama-threads") {
             if (!value(v) || !parse_int(v, cfg.llama_threads) || cfg.llama_threads < 0)
                 return fail("--llama-threads needs a thread count >= 0");
+        } else if (arg == "--llama-mtp") {
+            if (!value(v) || !parse_int(v, cfg.llama_mtp) || cfg.llama_mtp < 0 || cfg.llama_mtp > 7)
+                return fail("--llama-mtp needs a draft count from 0 to 7 (a verify of up to 8 rows)");
         } else if (arg == "--gguf") {
             if (!value(v)) return fail("--gguf needs a path");
             cfg.gguf_path = std::string(v);
@@ -914,7 +919,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.engine == "llama") {
         if (cfg.gguf_path.empty()) return fail("--engine llama serves a GGUF: give --gguf");
     } else {
-    if (cfg.llama_cpu_moe > 0 || cfg.llama_threads > 0) return fail("--llama-cpu-moe and --llama-threads are --engine llama options");
+    if (cfg.llama_cpu_moe > 0 || cfg.llama_threads > 0 || cfg.llama_mtp > 0)
+        return fail("--llama-cpu-moe, --llama-threads and --llama-mtp are --engine llama options");
     if (!cfg.gguf_path.empty() && cfg.model_path.empty()) return fail("--gguf needs --model (the template IR directory)");
     if (!cfg.gguf_path.empty() && !cfg.paged) return fail("--gguf serves on the paged path only");
     }

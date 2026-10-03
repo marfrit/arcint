@@ -27,6 +27,8 @@
 #include "config.h"
 #include "core/sampler.h"
 #include "exec/chat_json.h"
+#include "exec/llama_spec.h"
+#include "exec/verify_walk.h"
 #include "util/log.h"
 
 namespace lgc {
@@ -127,6 +129,7 @@ public:
 
         llama_model_params mp = llama_model_default_params();
         mp.n_gpu_layers       = 999;
+        mp.load_mtp           = cfg.llama_mtp > 0;   // the GGUF's MTP layer, for --llama-mtp
         // --llama-cpu-moe: the first N layers' experts in host memory, as
         // llama.cpp's --n-cpu-moe (common/common.h llm_add_n_cpu_ffn_overrides).
         // They are memory-mapped from the GGUF: the OpenCL device declares no
@@ -174,8 +177,26 @@ public:
                                                     : std::max(1, static_cast<int>(std::thread::hardware_concurrency()) / 2);
         cp.n_threads       = threads;
         cp.n_threads_batch = threads;
+        // --llama-mtp: per-token snapshots of the recurrent state, so a
+        // rejected draft rolls back on the device (llama_memory_seq_rm)
+        if (cfg.llama_mtp > 0) cp.n_rs_seq = static_cast<uint32_t>(cfg.llama_mtp);
+        // logits rows: the last token a step, or a verify's 1 + drafts, per
+        // lane (as llama.cpp's speculative loop sets them). Unbounded,
+        // llama.cpp reserves them for a whole ubatch, vocabulary-wide: the
+        // coder with its MTP layer then no longer fit the A770 (engine
+        // resets, measured-here)
+        cp.n_outputs_max_per_seq = static_cast<uint32_t>(1 + std::max(cfg.llama_mtp, 0));
+        cp.n_outputs_max         = cp.n_outputs_max_per_seq * static_cast<uint32_t>(lanes_);
         ctx_               = llama_init_from_model(model_, cp);
         if (ctx_ == nullptr) throw std::runtime_error("llama.cpp could not create a context");
+        if (cfg.llama_mtp > 0) {
+            std::string err;
+            spec_ = make_llama_mtp(model_, ctx_, cfg.llama_mtp, lanes_, n_batch_, static_cast<int>(cp.n_ubatch),
+                                   threads, err);
+            if (!spec_) throw std::runtime_error(log::format("--llama-mtp %d: %s", cfg.llama_mtp, err.c_str()));
+            n_draft_ = cfg.llama_mtp;
+        }
+        status_.mtp_enabled = n_draft_ > 0;
         slot_tokens_.resize(static_cast<size_t>(lanes_));
 
         const char* tmpl = llama_model_chat_template(model_, nullptr);
@@ -205,12 +226,14 @@ public:
         d.provenance         = "provisional";
         if (auto err = apply_operator_defaults(cfg, d)) throw std::runtime_error(*err);
         status_.sampler_defaults = d;
-        log::info("load", "llama.cpp %s (%s, %.2f GiB) on %s, OpenCL platform %d, in %.1f s; %d lane%s x %d ctx",
+        log::info("load", "llama.cpp %s (%s, %.2f GiB) on %s, OpenCL platform %d, in %.1f s; %d lane%s x %d ctx%s",
                   desc, arch, static_cast<double>(llama_model_size(model_)) / (1u << 30), card.c_str(), platform,
-                  seconds_since(t_load), lanes_, lanes_ == 1 ? "" : "s", n_ctx_);
+                  seconds_since(t_load), lanes_, lanes_ == 1 ? "" : "s", n_ctx_,
+                  n_draft_ > 0 ? log::format("; MTP drafts up to %d", n_draft_).c_str() : "");
     }
 
     ~LlamaBackend() override {
+        spec_.reset();   // its draft context reads the target's
         if (ctx_ != nullptr) llama_free(ctx_);
         if (model_ != nullptr) llama_model_free(model_);
     }
@@ -244,6 +267,7 @@ public:
 
     FinishReason generate(const GenerationInput& in, int slot, const TokenCallback& on_piece,
                           GenerationStats& stats) override {
+        if (spec_) return generate_spec(in, slot, on_piece, stats);
         const int seq = std::min(std::max(slot, 0), lanes_ - 1);
         const std::vector<int> prompt =
             in.prompt_ids.empty() ? tokenizer_->encode(in.prompt) : in.prompt_ids;
@@ -300,11 +324,7 @@ public:
         const auto   t_s0   = clock_type::now();
         int          next   = sampler.sample(logits.data(), n_vocab_);
         stats.decode_sample_seconds += seconds_since(t_s0);
-        auto is_stop_token = [&](int tok) {
-            if (!in.sampler.ignore_eos && llama_vocab_is_eog(vocab_, tok)) return true;
-            return std::find(in.sampler.stop_token_ids.begin(), in.sampler.stop_token_ids.end(), tok) !=
-                   in.sampler.stop_token_ids.end();
-        };
+        auto is_stop_token = [&](int tok) { return is_stop(in.sampler, tok); };
         while (true) {
             if (is_stop_token(next)) break;
             if (in.sampler.max_tokens >= 0 && stats.completion_tokens >= in.sampler.max_tokens) {
@@ -342,6 +362,154 @@ public:
     }
 
 private:
+    // --llama-mtp: draft, verify [last, drafts...] in one target decode, keep
+    // what the sampler agrees with. The sampler draws every verified position
+    // in order, from the logits of the prefix it has itself accepted, so the
+    // output is what the plain loop would sample (examples/speculative-simple
+    // of the pinned llama.cpp, with arcint's sampler).
+    FinishReason generate_spec(const GenerationInput& in, int slot, const TokenCallback& on_piece,
+                               GenerationStats& stats) {
+        const int seq = std::min(std::max(slot, 0), lanes_ - 1);
+        try {
+            return generate_spec_lane(in, seq, on_piece, stats);
+        } catch (...) {
+            // a failure between the target's decode and the bookkeeping would
+            // leave the lane holding tokens `have` does not record: start over
+            std::lock_guard<std::mutex> lk(mu_);
+            slot_tokens_[static_cast<size_t>(seq)].clear();
+            spec_->seq_rm(seq, 0);
+            spec_->reset(seq);
+            throw;
+        }
+    }
+
+    FinishReason generate_spec_lane(const GenerationInput& in, int seq, const TokenCallback& on_piece,
+                                    GenerationStats& stats) {
+        const std::vector<int> prompt =
+            in.prompt_ids.empty() ? tokenizer_->encode(in.prompt) : in.prompt_ids;
+        stats.prompt_tokens = static_cast<int>(prompt.size());
+        if (prompt.empty()) return FinishReason::Stop;
+        if (static_cast<int>(prompt.size()) >= n_ctx_) {
+            log::warn("slot", "prompt of %zu tokens does not fit n_ctx %d", prompt.size(), n_ctx_);
+            return FinishReason::Length;
+        }
+        uint64_t seed = in.sampler.seed;
+        if (!in.sampler.seeded) {
+            std::random_device rd;
+            seed = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+        }
+        Sampler sampler(in.sampler, seed);
+        sampler.set_prompt(prompt);
+        std::vector<int>&  have = slot_tokens_[static_cast<size_t>(seq)];
+        std::vector<float> rows;   // the verified rows' logits
+
+        // ------------------------------------------------------------ prefill
+        // All but the last prompt token: the loop below starts from it.
+        const auto   t_prefill = clock_type::now();
+        const size_t n_pre     = prompt.size() - 1;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            size_t common = 0;
+            while (common < have.size() && common < n_pre && have[common] == prompt[common]) ++common;
+            if (common < have.size()) {
+                // the drafter's carried row belongs to the old end; a rollback
+                // the target refuses (one is already pending) clears the lane
+                if (!spec_->seq_rm(seq, common)) common = 0;
+                spec_->reset(seq);
+            }
+            have.resize(common);
+            stats.cache_hit_tokens = static_cast<int>(common);
+            for (size_t at = common; at < n_pre; at += static_cast<size_t>(n_batch_)) {
+                const size_t n = std::min(n_pre - at, static_cast<size_t>(n_batch_));
+                if (spec_->decode(prompt.data() + at, n, at, seq, false) != 0)
+                    throw std::runtime_error("llama_decode failed during prefill");
+                have.insert(have.end(), prompt.begin() + static_cast<long>(at),
+                            prompt.begin() + static_cast<long>(at + n));
+            }
+        }
+        stats.prefill_seconds = seconds_since(t_prefill);
+
+        // ------------------------------------------------------------- decode
+        const auto   t_decode = clock_type::now();
+        FinishReason reason   = FinishReason::Stop;
+        int          id_last  = prompt.back();
+        std::vector<int> batch;
+        while (true) {
+            if (static_cast<int>(have.size()) + 1 >= n_ctx_) {
+                reason = FinishReason::Length;
+                break;
+            }
+            // tokens that may still be emitted: the plain loop's max_tokens
+            // and context checks (it emits a token while have + 1 < n_ctx)
+            int budget = n_ctx_ - static_cast<int>(have.size()) - 2;
+            if (in.sampler.max_tokens >= 0) budget = std::min(budget, in.sampler.max_tokens - stats.completion_tokens);
+            const int n_max = std::max(0, std::min(n_draft_, budget - 1));
+            std::vector<int> draft;
+            {
+                const auto t_p = clock_type::now();
+                std::lock_guard<std::mutex> lk(mu_);
+                if (n_max > 0) draft = spec_->draft(seq, id_last, have.size(), n_max);
+                stats.draft_propose_seconds += seconds_since(t_p);
+            }
+            stats.draft_proposed += static_cast<int>(draft.size());
+            batch.assign(1, id_last);
+            batch.insert(batch.end(), draft.begin(), draft.end());
+            {
+                // the verified rows' logits leave the context under the lock:
+                // another lane's decode would overwrite them
+                std::lock_guard<std::mutex> lk(mu_);
+                const auto t_v = clock_type::now();
+                if (spec_->decode(batch.data(), batch.size(), have.size(), seq, true) != 0)
+                    throw std::runtime_error("llama_decode failed during verify");
+                rows.resize(batch.size() * n_vocab_);
+                for (size_t i = 0; i < batch.size(); ++i) {
+                    const float* l = llama_get_logits_ith(ctx_, static_cast<int32_t>(i));
+                    if (l == nullptr) throw std::runtime_error("llama.cpp returned no logits");
+                    std::copy(l, l + n_vocab_, rows.begin() + static_cast<long>(i * n_vocab_));
+                }
+                stats.draft_verify_seconds += seconds_since(t_v);
+            }
+            double     emit_s = 0.0;
+            const auto t_walk = clock_type::now();
+            const VerifyWalk w = walk_verify(
+                rows.data(), batch.size(), n_vocab_, draft, sampler, budget,
+                [&](int tok) { return is_stop(in.sampler, tok); },
+                [&](int tok) {
+                    const auto t_emit = clock_type::now();
+                    const Control ctl = on_piece(tokenizer_->decode_one(tok), tok);
+                    emit_s += seconds_since(t_emit);
+                    return ctl;
+                });
+            stats.decode_emit_seconds += emit_s;
+            stats.decode_sample_seconds += seconds_since(t_walk) - emit_s;
+            stats.completion_tokens += w.emitted;
+            stats.draft_accepted += w.accepted;
+            have.push_back(id_last);
+            have.insert(have.end(), draft.begin(), draft.begin() + w.accepted);
+            id_last = w.last;
+            const auto t_r = clock_type::now();
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                spec_->accept(seq, w.accepted);
+                // at most n_draft positions back: within the target's snapshots
+                if (!spec_->seq_rm(seq, have.size()))
+                    throw std::runtime_error("llama.cpp refused the draft rollback");
+            }
+            stats.draft_rollback_seconds += seconds_since(t_r);
+            if (w.done) {
+                reason = w.reason;
+                break;
+            }
+        }
+        stats.decode_seconds = seconds_since(t_decode);
+        return reason;
+    }
+
+    bool is_stop(const SamplerParams& sp, int tok) const {
+        if (!sp.ignore_eos && llama_vocab_is_eog(vocab_, tok)) return true;
+        return std::find(sp.stop_token_ids.begin(), sp.stop_token_ids.end(), tok) != sp.stop_token_ids.end();
+    }
+
     // One llama_decode of n tokens of `seq` at positions [pos, pos + n), with
     // logits for the last one when `want_last`. Caller holds mu_.
     bool decode_locked(int seq, const int* toks, size_t n, size_t pos, bool want_last) {
@@ -382,6 +550,8 @@ private:
     int                                   n_batch_ = 2048;
     std::mutex                            mu_;    // llama_context is not thread-safe: one call at a time
     std::vector<std::vector<int>>         slot_tokens_;
+    std::unique_ptr<LlamaSpec>            spec_;      // --llama-mtp
+    int                                   n_draft_ = 0;
 };
 
 }  // namespace

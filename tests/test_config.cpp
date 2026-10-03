@@ -1023,6 +1023,18 @@ TEST(config_llama_cpu_moe_and_threads) {
         CHECK(r.ok);
         CHECK_EQ(cfg.llama_cpu_moe, 31);
         CHECK_EQ(cfg.llama_threads, 8);
+        CHECK_EQ(cfg.llama_mtp, 0);
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp", "3"};
+        CHECK(parse_args(5, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_mtp, 3);
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp", "8"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // a verify of 9 rows: the decode attention takes up to 8
     }
     {
         Config cfg;
@@ -1040,5 +1052,10 @@ TEST(config_llama_cpu_moe_and_threads) {
         Config cfg;
         const char* argv[] = {"arcint", "--stub", "--llama-threads", "4"};
         CHECK(!parse_args(4, const_cast<char**>(argv), cfg).ok);   // --stub runs the OpenVINO-less skeleton, not libllama
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--stub", "--llama-mtp", "2"};
+        CHECK(!parse_args(4, const_cast<char**>(argv), cfg).ok);
     }
 }
