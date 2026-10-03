@@ -247,8 +247,8 @@ temperature 0 and 10/10 in 15 of 20 sampled runs (mean 8.6), against 11 of
 
 ## 0007-opencl-intel-decode-attention-split.patch
 
-Decode attention (one query row, f16 K/V, head size a multiple of 128) on
-Intel. ggml sends Intel to its basic q1 kernel, one sub-group per head
+Decode attention (up to 8 query rows -- a decode step, a speculative
+verify -- f16 K/V, head size a multiple of 128) on Intel. ggml sends Intel to its basic q1 kernel, one sub-group per head
 walking every key; its flash-decoding split kernel keeps all DV
 accumulators in each lane and is limited to head size 128. Both served
 models have head size 256, so their decode slowed with context
@@ -291,6 +291,18 @@ sampled runs (mean 7.0; 0001-0006 gave 15 of 20, mean 8.6, and 0001-0002 11
 of 20, mean 7.0; the largest difference, 15 against 10, has a two-sided
 Fisher p of 0.19, and the means differ by 1.6 points at a standard error of
 1.1 -- the arms do not separate, and the KL is the same to four places).
+
+Speculative verification: a 2-row MTP verify went to ggml's prefill
+kernel at 3.5 ms a call, 61 % of the device time of a speculative run on
+the coder (A770, `measured-here`); with up to 8 rows taking the split
+kernel, llama.cpp's `draft-mtp` loop (temperature 0, the acceptance prompt,
+400 tokens) gives the coder 56.9 / 68.1 / 67.6 t/s with 1 / 2 / 3 drafts
+(97.5 / 92.6 / 83.2 % accepted; 24.1 / 32.0 / 35.4 before) and the dense
+model 25.2 / 31.5 / 31.9 (91.0 / 84.0 / 76.3 %; 15.1 / 19.7 / 21.2 before),
+against 47.8 and 19.75 plain; the greedy text is the same for 1, 2 and 3
+drafts on both. Four drafts (a 5-row verify) fall to 46.0 and 10.7: the
+K-quant matvec takes at most 4 columns. The test cases with 2-8 rows pass
+(FLASH_ATTN_EXT 2,642/2,644 as before).
 
 ### Review of 0003-0007
 

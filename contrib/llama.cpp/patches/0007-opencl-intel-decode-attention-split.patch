@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 6298ce3..47dbb16 100644
+index 6298ce3..bbdcb56 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -491,6 +491,7 @@ struct ggml_opencl_fa_kernels {
@@ -42,18 +42,20 @@ index 6298ce3..47dbb16 100644
              // q1_vec decode kernel (DV-split + subgroup reduce)
              cl_kernel k_q1_vec = clCreateKernel(prog, "flash_attn_f32_f16_q1_vec", &err);
              if (err == CL_SUCCESS) {
-@@ -18780,6 +18792,19 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -18780,6 +18792,21 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
              fd_mq_wg   = 64;
          }
      }
-+    // Intel, one query row: flash_attn_f32_f16_q1_split_intel at any KV length
-+    // (the coder's decode at 4,096 keys spent 2.7 ms an attention layer in the
-+    // basic q1 kernel on an A770, measured-here); GGML_OPENCL_FA_INTEL_SPLIT=0
-+    // keeps the basic kernel, GGML_OPENCL_FA_INTEL_KV_PER_SPLIT the split size
++    // Intel, up to 8 query rows (a decode step, a speculative verify):
++    // flash_attn_f32_f16_q1_split_intel at any KV length (the coder's decode
++    // at 4,096 keys spent 2.7 ms an attention layer in the basic q1 kernel on
++    // an A770; a 2-row MTP verify 3.5 ms a call in the prefill kernel,
++    // measured-here); GGML_OPENCL_FA_INTEL_SPLIT=0 keeps ggml's kernels,
++    // GGML_OPENCL_FA_INTEL_KV_PER_SPLIT the split size
 +    static const char * fdi_env = getenv("GGML_OPENCL_FA_INTEL_SPLIT");
 +    static const bool   fdi_on  = fdi_env == nullptr || atoi(fdi_env) != 0;
 +    bool use_fd_intel = false;
-+    if (fd_k_split == NULL && fdi_on && backend_ctx->gpu_family == INTEL && n_q == 1 && is_mixed && !is_causal &&
++    if (fd_k_split == NULL && fdi_on && backend_ctx->gpu_family == INTEL && n_q >= 1 && n_q <= 8 && is_mixed && !is_causal &&
 +        n_kv >= 1 && backend_ctx->fa.f32_f16_q1_split_intel.count(dk_dv) > 0 &&
 +        backend_ctx->fa.f32_merge.count(dk_dv) > 0) {
 +        fd_k_split   = backend_ctx->fa.f32_f16_q1_split_intel.at(dk_dv);
@@ -62,7 +64,7 @@ index 6298ce3..47dbb16 100644
      if (fd_k_split == NULL &&
          n_q >= 1 && n_q <= fd_max_n_q && n_kv >= FD_MIN_N_KV && !is_causal &&
          d_head_q <= FD_MAX_DK &&
-@@ -18915,8 +18940,13 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -18915,8 +18942,13 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          int fd_max_splits   = use_fd_mq ? FD_MQ_MAX_SPLITS   : FD_MAX_SPLITS;
          if (fd_env_kv_per_split > 0) { fd_kv_per_split = fd_env_kv_per_split; }
          if (fd_env_max_splits   > 0) { fd_max_splits   = fd_env_max_splits; }
@@ -77,7 +79,7 @@ index 6298ce3..47dbb16 100644
          if (n_splits > fd_max_splits) { n_splits = fd_max_splits; }
          const int kv_per_split = (n_kv + n_splits - 1) / n_splits;
  
-@@ -18924,16 +18954,26 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -18924,16 +18956,26 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          const size_t partial_size_bytes =
              (size_t) n_batch * n_head * n_q * n_splits * fa_partial_floats * sizeof(float);
  
@@ -113,7 +115,7 @@ index 6298ce3..47dbb16 100644
  
          cl_kernel k_split = fd_k_split;
          int argi = 0;
-@@ -19007,7 +19047,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -19007,7 +19049,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
  
          // MQ split kernel uses MQ_NSG_SPLIT subgroups and one WG per (kv_head, batch, split)
          // matches Q1_WG_SIZE * NSG (MQ_GQA=4 -> 256; MQ_GQA=8 -> 192)

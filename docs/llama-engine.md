@@ -108,12 +108,14 @@ decode (`docs/campaigns/flash-next-llama-engine.md`).
 ## Not yet on this engine
 
 MTP (P4): llama.cpp at the pin carries an MTP drafter for qwen35/qwen35moe
-(`common/speculative.cpp`, `draft-mtp`); the stock `speculative-simple` loop
-measured no gain on the coder (A770, before the placement fix: 21 t/s
-plain, 13.5 / 17.5 / 20.8 t/s with 1 / 2 / 3 drafts at 100 / 92 / 86 %
-acceptance), and its rollback of the recurrent state goes through host
-memory; llama.cpp's recurrent memory shares a sequence's cell on `seq_cp`,
-which a rollback on the device can use. Flash-Next (`qwen4exp` is in
+(`common/speculative.cpp`, `draft-mtp`). Its `speculative-simple` loop on
+patches 0001-0007 (`measured-here`, temperature 0, the acceptance prompt):
+coder 68.1 t/s with 2 drafts (92.6 % accepted) against 47.8 plain, dense
+31.9 with 3 drafts (76.3 %) against 19.75 (the OpenVINO path's MTP-1: 33.0);
+the greedy text is the same for 1, 2 and 3 drafts. arcint's server does not
+drive the drafter yet; its rollback of the recurrent state in llama.cpp's
+loop goes through host memory, and llama.cpp's recurrent memory shares a
+sequence's cell on `seq_cp`, which a rollback on the device can use. Flash-Next (`qwen4exp` is in
 llama.cpp at the pin), conversation state (P6) and GPU prefill from the
 pinned bank (P5) are open.
 
