@@ -77,6 +77,7 @@ paths under `~/src/Strata-ref/`.
 
 | campaign | what exists |
 |---|---|
+| [llama-engine-kquant-kernels](llama-engine-kquant-kernels.md) | `contrib/llama.cpp` patch 0001: Intel K-quant matvec and XMX GEMM in ggml-opencl; dense 27B 10.3 -> 18.0 t/s decode (B60), coder 7.7 -> 37.7 (A770) |
 | [expert-hot-set-lru](expert-hot-set-lru.md) | patch 0076: adaptive expert cache, non-blocking admission, Strata's RAM exchange and RAM budget; 20k needle decode 7.5 -> 10.3 t/s (B60) |
 | [tier-handoff-doorbell](tier-handoff-doorbell.md) | patch 0077: the decode step submitted ahead, the tier fed through mapped memory; 10.7 -> 12.7 t/s needle, 14.0 -> 16.0 long answer (B60) |
 | [test-ladder-close](test-ladder-close.md) | acceptance references filled; DESIGN §7.0.2aj–al |

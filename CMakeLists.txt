@@ -12,8 +12,9 @@ endif()
 
 option(ARCINT_OPENVINO "Build the OpenVINO executor backend (M1+)" OFF)
 # 0.5.3.1459: the libllama executor -- ggml's OpenCL backend runs the GGUF.
-# ARCINT_LLAMA_DIR is a llama.cpp source tree (the pinned commit is in
-# docs/llama-engine.md); it is built as a subproject, static, OpenCL on.
+# ARCINT_LLAMA_DIR is a llama.cpp source tree at the pinned commit with
+# contrib/llama.cpp/patches applied (contrib/llama.cpp/README.md); it is built
+# as a subproject, static, OpenCL on.
 option(ARCINT_LLAMA "Build the libllama (ggml OpenCL) executor backend" OFF)
 set(ARCINT_LLAMA_DIR "" CACHE PATH "llama.cpp source tree for ARCINT_LLAMA")
 option(ARCINT_WERROR   "Treat compiler warnings as errors"         OFF)
@@ -143,6 +144,10 @@ endif()
 if(ARCINT_LLAMA)
   if(NOT ARCINT_LLAMA_DIR OR NOT EXISTS "${ARCINT_LLAMA_DIR}/include/llama.h")
     message(FATAL_ERROR "ARCINT_LLAMA=ON needs ARCINT_LLAMA_DIR, a llama.cpp source tree")
+  endif()
+  if(NOT EXISTS "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl")
+    message(WARNING "ARCINT_LLAMA_DIR has no contrib/llama.cpp/patches: ggml's stock OpenCL kernels, "
+                    "a K-quant MoE's experts on the CPU (contrib/llama.cpp/README.md)")
   endif()
   set(GGML_OPENCL ON CACHE BOOL "" FORCE)
   set(GGML_OPENCL_USE_ADRENO_KERNELS OFF CACHE BOOL "" FORCE)
