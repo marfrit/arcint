@@ -93,3 +93,33 @@ GGUF on the CPU backend, 16 chunks of 512 tokens of English and C++ text,
 baseline arm ggml's float kernels: prefill (batched) dense 0.003560 ->
 0.003560 nats, same top token 97.84 -> 97.82 %; coder 0.00728 -> 0.00696,
 95.93 -> 96.10 %. Decode (one token per ubatch): see `docs/llama-engine.md`.
+
+## 0002-opencl-intel-iq3xxs-iq4xs-iq4nl.patch
+
+Flash-Next's GGUF (UD-Q3_K_XL) keeps its experts in IQ3_XXS (gate, up) and
+IQ4_NL / IQ4_XS / Q8_0 (down); ggml-opencl has no IQ3_XXS or IQ4_XS kernel
+and no IQ4_NL `MUL_MAT_ID`, so every expert ran on the CPU. 0002 adds the
+three types to 0001's machinery on Intel:
+
+- matvec, 1 to 4 columns (`kernels/mul_mv_iq_q8_1.cl`): weights expanded to
+  signed int8 per 32-weight sub-block (IQ3_XXS through its grid and sign
+  tables, held in local memory; the IQ4 types through `kvalues_iq4nl`) and
+  multiplied with integer dot products against 0001's two-term activation.
+  IQ3_XXS and IQ4_XS are read as stored (98- and 136-byte blocks); IQ4_NL
+  from ggml-opencl's flat planes, with K a multiple of 32 (Flash-Next's down
+  projections have K = 640);
+- the fp16-DPAS GEMM dequantizes the three types into its local tile, and
+  takes a partial last 256-weight super-block (IQ4_NL);
+- one type index for the six types in the dispatch; `supports_op` claims a
+  K-quant or IQ op only when its kernels were built (it builds them on first
+  ask), and declines IQ shapes no kernel takes, so their weights stay on the
+  CPU instead of reaching a missing kernel.
+
+Measured here (`measured-here`, A770, standalone harness, device time):
+IQ4_XS / IQ4_NL matvec ~200 GB/s on 5120 x 2560, IQ3_XXS 82 GB/s (its
+98-byte blocks are read with 16-bit loads); an expert's 640 x 2560 matrix in
+13-20 us. `test-backend-ops` MUL_MAT and MUL_MAT_ID pass for all three types
+on both cards; a mutant of the IQ4 expansion fails the matvec cases and one
+of the IQ3_XXS signs the GEMM cases. Reviewed: no blockers; the should-fix
+(a declined dispatch falling into ggml's `default: abort` for the IQ types)
+is the `supports_op` rule above.

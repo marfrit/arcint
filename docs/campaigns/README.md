@@ -63,6 +63,7 @@ ranking (`research-reference-audit.md` §4).
 
 | campaign | state | reference to follow |
 |---|---|---|
+| [flash-next-llama-engine](flash-next-llama-engine.md) | Flash-Next answers on the libllama engine at 0.2 t/s (experts paged from disk); stage 1: IQ kernels on Intel, layers' experts split card/RAM | Strata `src/core/expert_cache.cpp`, `generate.cpp:4413-4482`, `expert_source.cpp:1614-1696`; llama.cpp `--n-cpu-moe`, CPU `MUL_MAT_ID` |
 | [mtp-cycle-wall](mtp-cycle-wall.md) | MTP drafts one token a cycle (dense agent); the Flash-Next head's tensors fetched, never exported or served | Strata `src/core/mtp.cpp:771-820` (draft chain with `min_p`), `tools/mtp_fetch.py` |
 | [prefill-expert-streaming](prefill-expert-streaming.md) | prefill 63–68 t/s at 20k on the B60, CPU-tier-bound | Strata `src/prefill/prefill.cpp:71-104` (slot ring, chunks to 8,192, MMQ); FreeToken `moe/offload_cache.py` prefill overlap, `layers/moe.py:388-390` |
 | [kquant-host-storage](kquant-host-storage.md) | native blocks on the host tier, quantised dot for decode-shaped calls (0043, 0074) | Strata `src/kernels/cpu/iq_avx2.cpp` (multi-token AVX2) |

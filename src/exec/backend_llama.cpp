@@ -21,6 +21,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "config.h"
@@ -126,6 +127,20 @@ public:
 
         llama_model_params mp = llama_model_default_params();
         mp.n_gpu_layers       = 999;
+        // --llama-cpu-moe: the first N layers' experts in host memory, as
+        // llama.cpp's --n-cpu-moe (common/common.h llm_add_n_cpu_ffn_overrides).
+        // They are memory-mapped from the GGUF: the OpenCL device declares no
+        // mmap support, and the default load mode would read the whole model
+        // into anonymous memory (OOM for Flash-Next's 84 GiB).
+        for (int i = 0; i < cfg.llama_cpu_moe; ++i)
+            cpu_moe_patterns_.push_back(log::format("blk\\.%d\\.ffn_(up|down|gate|gate_up)_(ch|)exps", i));
+        for (const std::string& pat : cpu_moe_patterns_)
+            buft_overrides_.push_back({ pat.c_str(), ggml_backend_cpu_buffer_type() });
+        if (!buft_overrides_.empty()) {
+            buft_overrides_.push_back({ nullptr, nullptr });
+            mp.tensor_buft_overrides = buft_overrides_.data();
+            mp.load_mode             = LLAMA_LOAD_MODE_MMAP;
+        }
         const auto t_load     = clock_type::now();
         model_                = llama_model_load_from_file(cfg.gguf_path.c_str(), mp);
         if (model_ == nullptr)
@@ -136,8 +151,8 @@ public:
         char arch[64] = {};
         llama_model_meta_val_str(model_, "general.architecture", arch, sizeof(arch));
         const std::string a(arch);
-        if (a != "qwen35" && a != "qwen35moe")
-            throw std::runtime_error(log::format("%s is a '%s' model; --engine llama serves qwen35 and qwen35moe",
+        if (a != "qwen35" && a != "qwen35moe" && a != "qwen4exp")
+            throw std::runtime_error(log::format("%s is a '%s' model; --engine llama serves qwen35, qwen35moe and qwen4exp",
                                                  cfg.gguf_path.c_str(), arch));
         vocab_     = llama_model_get_vocab(model_);
         tokenizer_ = std::make_unique<LlamaTokenizer>(vocab_);
@@ -152,6 +167,13 @@ public:
         cp.n_batch         = static_cast<uint32_t>(n_batch_);
         cp.n_ubatch        = static_cast<uint32_t>(std::min(n_batch_, 512));
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        // CPU threads: the CPU-side experts' decode is memory-bound, and the
+        // physical cores beat the SMT threads (measured-here, Flash-Next on a
+        // 8-core/16-thread host: 11.4 t/s at 8 threads, 9.0 at 16)
+        const int threads  = cfg.llama_threads > 0 ? cfg.llama_threads
+                                                    : std::max(1, static_cast<int>(std::thread::hardware_concurrency()) / 2);
+        cp.n_threads       = threads;
+        cp.n_threads_batch = threads;
         ctx_               = llama_init_from_model(model_, cp);
         if (ctx_ == nullptr) throw std::runtime_error("llama.cpp could not create a context");
         slot_tokens_.resize(static_cast<size_t>(lanes_));
@@ -344,6 +366,9 @@ private:
         std::copy(l, l + n_vocab_, out.begin());
     }
 
+    // --llama-cpu-moe's tensor patterns, alive for the load
+    std::vector<std::string>                       cpu_moe_patterns_;
+    std::vector<llama_model_tensor_buft_override> buft_overrides_;
     llama_model*                          model_ = nullptr;
     llama_context*                        ctx_   = nullptr;
     const llama_vocab*                    vocab_ = nullptr;

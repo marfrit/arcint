@@ -18,6 +18,13 @@ struct Config {
     // "llama" (ggml's OpenCL backend through libllama; the model is --gguf).
     // The default: "llama" for --gguf without --model, else "ov".
     std::string engine;
+    // --llama-cpu-moe N: on the libllama engine, the experts of the first N
+    // layers stay in host memory (memory-mapped from the GGUF) and llama.cpp's
+    // CPU backend computes them -- a model whose experts exceed VRAM.
+    // --llama-threads N: that backend's threads (0: half the hardware threads,
+    // the physical cores on SMT hosts).
+    int llama_cpu_moe = 0;
+    int llama_threads = 0;
     std::string flash_next_ngram_path;  // --flash-next-ngram: FIX D per_layer_token_embd table (24-byte ARCINGRM header + block-quantised payload); admitted only when the artifact's config.json declares an n-gram table (docs/design-qwen-flash-next.md FIX D Link 2)
     // --ngram-gguf: the GGUF shard whose per_layer_token_embd.weight binds a
     // serving-shape IR's `ngram_table.K` ports (backend_ov.cpp

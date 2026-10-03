@@ -1014,3 +1014,31 @@ TEST(config_engine_follows_what_was_given) {
         CHECK(!r.ok);   // the llama engine needs its GGUF
     }
 }
+
+TEST(config_llama_cpu_moe_and_threads) {
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-cpu-moe", "31", "--llama-threads", "8"};
+        const auto r = parse_args(7, const_cast<char**>(argv), cfg);
+        CHECK(r.ok);
+        CHECK_EQ(cfg.llama_cpu_moe, 31);
+        CHECK_EQ(cfg.llama_threads, 8);
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-cpu-moe", "-1"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // a count, not a sign
+    }
+#ifdef ARCINT_OPENVINO
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--model", "/m/ir", "--llama-cpu-moe", "4"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // an option of the libllama engine only
+    }
+#endif
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--stub", "--llama-threads", "4"};
+        CHECK(!parse_args(4, const_cast<char**>(argv), cfg).ok);   // --stub runs the OpenVINO-less skeleton, not libllama
+    }
+}

@@ -62,7 +62,9 @@ Served (`--engine llama`, one lane, n_ctx 32,768, arcint's sampler,
 `measured-here`, final build): the acceptance task at temperature 0 scores
 10/10 on both models. Sampled at the card temperature 0.7, six runs per arm:
 coder 6/6 at 10/10; dense 9, 0, 10, 10, 0, 10 against 10, 10, 8, 10, 9, 10
-with ggml's float kernels. The two zeros are slips of the sampled answer --
+with ggml's float kernels; twenty runs per arm, 11 of 20 at 10/10 against
+10 of 20 (mean 7.0 against 7.4, a standard error of ~1.3 on the difference:
+the arms do not separate). The two zeros of the six are slips of the sampled answer --
 a `local function` declared below its first use, and an answer that rewrote
 itself into a second code block (the scorer reads the first) -- and six
 runs do not separate the arms (one-sided Fisher p ~ 0.25 for 0-2 point
@@ -84,6 +86,14 @@ and C++), baseline arm ggml's float kernels on the same card:
 The single-term q8_1 activation of the first matvec moved the dense decode
 by 0.0026 nats and 0.93 points of top-1 agreement; the two-term activation
 replaced it at no measured decode cost on either card.
+
+## Flash-Next
+
+`qwen4exp` with `--llama-cpu-moe N`: the first N layers' experts stay in host
+memory, memory-mapped, computed by llama.cpp's CPU backend; the IQ kernels
+of patch 0002 run the rest on the card. Served on the B60 with 16 expert
+layers on the card: the needle answered, 49.2 t/s prefill at 20k, 10.9 t/s
+decode (`docs/campaigns/flash-next-llama-engine.md`).
 
 ## Not yet on this engine
 

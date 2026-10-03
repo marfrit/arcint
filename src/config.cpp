@@ -412,7 +412,12 @@ std::string usage_text() {
         "                            yet -- reading a contract is what precedes a pin.\n"
         "  --version                 print version and exit\n"
         "  --engine ov|llama         the executor: OpenVINO (--model IR) or ggml OpenCL via\n"
-        "                            libllama (--gguf); default: OpenVINO when built in\n"
+        "                            libllama (--gguf); default: libllama for --gguf\n"
+        "                            without --model, else OpenVINO\n"
+        "  --llama-cpu-moe N         libllama: the first N layers' experts stay in host\n"
+        "                            memory, computed by the CPU (experts beyond VRAM)\n"
+        "  --llama-threads N         libllama: CPU threads (default: half the hardware\n"
+        "                            threads)\n"
         "  -h, --help                print this help and exit\n";
 }
 
@@ -452,6 +457,12 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v)) return fail("--engine needs ov or llama");
             cfg.engine = std::string(v);
             if (cfg.engine != "ov" && cfg.engine != "llama") return fail("--engine is ov or llama");
+        } else if (arg == "--llama-cpu-moe") {
+            if (!value(v) || !parse_int(v, cfg.llama_cpu_moe) || cfg.llama_cpu_moe < 0)
+                return fail("--llama-cpu-moe needs a layer count >= 0");
+        } else if (arg == "--llama-threads") {
+            if (!value(v) || !parse_int(v, cfg.llama_threads) || cfg.llama_threads < 0)
+                return fail("--llama-threads needs a thread count >= 0");
         } else if (arg == "--gguf") {
             if (!value(v)) return fail("--gguf needs a path");
             cfg.gguf_path = std::string(v);
@@ -903,6 +914,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.engine == "llama") {
         if (cfg.gguf_path.empty()) return fail("--engine llama serves a GGUF: give --gguf");
     } else {
+    if (cfg.llama_cpu_moe > 0 || cfg.llama_threads > 0) return fail("--llama-cpu-moe and --llama-threads are --engine llama options");
     if (!cfg.gguf_path.empty() && cfg.model_path.empty()) return fail("--gguf needs --model (the template IR directory)");
     if (!cfg.gguf_path.empty() && !cfg.paged) return fail("--gguf serves on the paged path only");
     }
