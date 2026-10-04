@@ -160,8 +160,9 @@ public:
         // 'llama' is admitted at one geometry only, the Mistral Small 24B
         // family's: served for creative writing with Mistral Small 3.2's
         // finetune Cydonia 24B (operator, 2026-10-04). Others of the family
-        // load too; their [THINK] blocks are not split and their tool calls
-        // not parsed (Qwen formats only, src/core/toolcall.h)
+        // load too; their tool calls are not parsed (Qwen formats only,
+        // src/core/toolcall.h). Their think blocks are split: <thinking>
+        // (Cydonia) and [THINK] (Magistral), see ModelStatus::think_tags_extended
         char arch[64] = {};
         llama_model_meta_val_str(model_, "general.architecture", arch, sizeof(arch));
         const std::string a(arch);
@@ -171,6 +172,7 @@ public:
         const bool mistral_small_24b = a == "llama" && llama_model_n_layer(model_) == 40 && llama_model_n_embd(model_) == 5120 &&
                                        llama_model_n_head(model_) == 32 && llama_model_n_head_kv(model_) == 8 &&
                                        std::string(head_dim) == "128" && llama_vocab_n_tokens(vocab_) == 131072;
+        mistral_small_24b_ = mistral_small_24b;
         if (a != "qwen35" && a != "qwen35moe" && a != "qwen4exp" && !mistral_small_24b)
             throw std::runtime_error(log::format("%s is a '%s' model; --engine llama serves qwen35, qwen35moe, qwen4exp "
                                                  "and Mistral Small 3.2 24B ('llama', 40 x 5120, 32/8 heads)",
@@ -236,6 +238,7 @@ public:
         status_.n_layer     = llama_model_n_layer(model_);
         status_.weights_bytes = llama_model_size(model_);
         status_.kv_precision  = "f16";
+        status_.think_tags_extended = mistral_small_24b_;
         SamplerDefaults d;
         d.temperature        = 0.7f;
         d.top_p              = 0.8f;
@@ -570,6 +573,7 @@ private:
     llama_context*                        ctx_   = nullptr;
     const llama_vocab*                    vocab_ = nullptr;
     std::unique_ptr<LlamaTokenizer>       tokenizer_;
+    bool mistral_small_24b_ = false;   // the admitted llama geometry (think tags, BOS)
     std::unique_ptr<minja::chat_template> template_;
     std::string                           template_src_;
     ModelStatus                           status_;

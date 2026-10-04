@@ -501,12 +501,13 @@ TEST(config_mtp_layer_choice) {
 TEST(config_operator_sampler_flags) {
     Config cfg;
     CHECK(run({"--stub", "--temp", "0", "--top-p", "0.9", "--top-k", "40",
-               "--repetition-penalty", "1.0", "--presence-penalty", "1.5"}, cfg).ok);
+               "--repetition-penalty", "1.0", "--presence-penalty", "1.5", "--min-p", "0.05"}, cfg).ok);
     CHECK(cfg.temp && *cfg.temp == 0.0f);
     CHECK(cfg.top_p && *cfg.top_p == 0.9f);
     CHECK(cfg.top_k && *cfg.top_k == 40);
     CHECK(cfg.repetition_penalty && *cfg.repetition_penalty == 1.0f);
     CHECK(cfg.presence_penalty && *cfg.presence_penalty == 1.5f);
+    CHECK(cfg.min_p && *cfg.min_p == 0.05f);
 }
 
 TEST(config_operator_flags_default_unset) {

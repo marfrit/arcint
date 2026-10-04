@@ -18,6 +18,27 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.5.9 — 2026-10-04
+
+**Runtime:** `marfrit-openvino +p25` remains the floor.
+
+- **min-p sampling** (operator, for role play): request field `min_p`, flag
+  `--min-p`, reported on `/props`. It follows llama.cpp: keep p >= min_p ·
+  p_max on the logits before temperature, after top-p. DESIGN §3.6
+  amended.
+- **Think blocks of the Mistral Small 24B family:** `<thinking>` (Cydonia
+  24B) and `[THINK]` (Magistral tunes) go to `reasoning_content` like
+  `<think>`, each closed only by its own closer. The Qwens keep `<think>`
+  alone.
+- **Sampler fix:** with top-k 0 (off), top-p was normalised over the
+  2,048-token probe instead of the vocabulary. It cut earlier than asked,
+  and the full-sort fallback never fired. A fallback also stayed on for the
+  rest of the request. Both are fixed. The services' defaults (top-k 20)
+  never took that path.
+- The writer unit serves bartowski's imatrix Q4_K_M of Cydonia 24B v4.3.
+  Against the model's own Q8_0, KL is 0.016918 against the static quant's
+  0.020316 (q8_0 KV), top-1 equal (`measured-here`, B60).
+
 ## 0.5.8 — 2026-10-04
 
 **Runtime:** `marfrit-openvino +p25` remains the floor.

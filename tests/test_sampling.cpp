@@ -138,3 +138,22 @@ TEST(sampling_operator_layer_validates_like_a_request) {
     o.temperature = 3.0f;  // out of [0, 2], same rule a request gets
     CHECK(sampler_defaults_apply(d, o).has_value());
 }
+
+TEST(sampling_min_p_range_and_apply) {
+    SamplerParams    p;
+    SamplerOverrides o;
+    o.min_p = 0.05f;
+    CHECK(!sampler_apply(p, o).has_value());
+    CHECK(p.min_p == 0.05f);
+    SamplerOverrides bad;
+    bad.min_p = 1.5f;
+    CHECK(sampler_apply(p, bad).has_value());
+    bad.min_p = -0.1f;
+    CHECK(sampler_apply(p, bad).has_value());
+    SamplerDefaults d;
+    SamplerOverrides op;
+    op.min_p = 0.1f;
+    CHECK(!sampler_defaults_apply(d, op).has_value());
+    CHECK(sampler_from_defaults(d).min_p == 0.1f);
+    CHECK_EQ(d.provenance, std::string("operator"));
+}

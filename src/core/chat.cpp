@@ -125,6 +125,7 @@ std::optional<std::string> read_sampler(const json& b, SamplerOverrides& s) {
 
     if (auto e = num("temperature", s.temperature)) return e;
     if (auto e = num("top_p", s.top_p)) return e;
+    if (auto e = num("min_p", s.min_p)) return e;
     if (auto e = num("repetition_penalty", s.repetition_penalty)) return e;
     if (auto e = num("presence_penalty", s.presence_penalty)) return e;
     if (auto e = num("frequency_penalty", s.frequency_penalty)) return e;

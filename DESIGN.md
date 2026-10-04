@@ -1,6 +1,6 @@
 # arcint — Design
 
-Status: **0.5.8**, runtime floor `marfrit-openvino +p25` (patches 0003–0074
+Status: **0.5.9**, runtime floor `marfrit-openvino +p25` (patches 0003–0074
 on the pinned OpenVINO nightly, §1.1; `+p27` for the Flash-Next tier's opt-in
 switches of patches 0076–0077). Since 0.5.5 a second executor serves GGUFs
 through libllama (§7.11); from 0.5.6 it serves the agent. This document states what arcint *is*
@@ -337,16 +337,16 @@ the MTP layer's unpaged per-token state is charged against the reservation
 
 ### 3.6 Sampling
 
-Greedy, temperature, top-k, top-p, repetition, presence and frequency
+Greedy, temperature, top-k, top-p, min-p, repetition, presence and frequency
 penalties, host-side (`core/sampler.cpp`). Penalties apply *before* the greedy
 decision. Seeded and reproducible: an unseeded request is given a seed and the
 seed is logged. Defaults come in four layers — request fields over operator
-flags (`--temp`, `--top-p`, `--top-k`, `--repetition-penalty`,
+flags (`--temp`, `--top-p`, `--top-k`, `--min-p`, `--repetition-penalty`,
 `--presence-penalty`, `--chat-template-kwarg enable_thinking=BOOL`) over the
 artifact's `generation_config.json` over the model card — and `/props` reports
-the resulting defaults with their provenance. There is no `--min-p`: the
-sampler does not implement it, and a flag for an unimplemented knob would be a
-lie. `usage.completion_tokens_details` reports accepted and rejected
+the resulting defaults with their provenance. min-p (since 0.5.9) follows
+llama.cpp: it keeps p >= min_p · p_max on the logits before temperature, after
+top-p. `usage.completion_tokens_details` reports accepted and rejected
 prediction tokens per response.
 
 ### 3.7 Tokenizer, templates, tool calls

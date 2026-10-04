@@ -498,6 +498,7 @@ json props(const Context& ctx) {
          {{"temperature", sd.temperature},
           {"top_p", sd.top_p},
           {"top_k", sd.top_k},
+          {"min_p", sd.min_p},
           {"repetition_penalty", sd.repetition_penalty},
           {"presence_penalty", sd.presence_penalty},
           {"provenance", sd.provenance}}},
@@ -581,6 +582,7 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     // The template decides whether the answer starts inside a think block; the
     // split of reasoning from content below follows that, not a guess.
     prep.think_open = prompt.ends_with("<think>\n");
+    prep.think_tags_extended = ctx.backend->status().think_tags_extended;
     // The rendered prompt is the one thing that decides what the model saw.
     // When an answer differs from a reference run this is the first question,
     // and reconstructing it after the fact is guesswork (§3.7).
@@ -627,7 +629,7 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
               [](std::string_view, const std::string&) { return true; }, stats, raw);
     log_stats(slot, stats, reason);
 
-    const ReasoningSplit  split   = split_reasoning(raw, prep.think_open);
+    const ReasoningSplit  split   = split_reasoning(raw, prep.think_open, prep.think_tags_extended);
     std::string           content = split.content;
     std::vector<ToolCall> calls;
     if (prep.parse_tool_calls) {
@@ -712,7 +714,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     // Reasoning goes out as reasoning_content deltas until the think block
     // closes; from there `content` accumulates the answer and the tool-call
     // logic below sees only that.
-    ReasoningStreamer   reasoning(prep.think_open);
+    ReasoningStreamer   reasoning(prep.think_open, prep.think_tags_extended);
     std::string         content;       // the answer part of the output so far
     auto emit_reasoning = [&](std::string_view bytes) {
         if (bytes.empty()) return true;

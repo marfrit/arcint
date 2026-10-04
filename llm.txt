@@ -10,7 +10,7 @@
 > NInfer philosophy (specialize, then be honest about numbers), Intel
 > substrate.
 
-## Status (0.5.8)
+## Status (0.5.9)
 
 Runtime floor: marfrit-openvino +p25 = OpenVINO upstream commit 71640275 (the
 2026.4.0 nightly of 2026-08-21) + patches 0003-0074
@@ -290,6 +290,8 @@ any of them flips the served sampler provenance to 'operator')
                             lets the MTP drafter engage)
   --top-p X                 default nucleus mass
   --top-k N                 default top-k (0 disables)
+  --min-p X                 default min-p: keep p >= X * p_max, before
+                            temperature, as llama.cpp (0 disables)
   --repetition-penalty X    default repetition penalty
   --presence-penalty X      default presence penalty
   --chat-template-kwarg enable_thinking=BOOL

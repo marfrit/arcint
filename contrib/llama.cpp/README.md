@@ -960,5 +960,11 @@ the 0016 build, where head size 128 took the upstream kernels):
   then decode at 8.4 t/s at that depth.
 - KL against the model's own Q8_0 on the CPU: 0.019742 (0016) -> 0.019850
   (0017), top-1 94.76 -> 94.83 %; with q8_0 KV 0.020316, 94.85 %.
+- The quant (0.5.9): bartowski's imatrix Q4_K_M of the same model (also
+  14.33 GB), same corpus, window and reference, 0017. It gives KL 0.016792
+  (top-1 94.73 %) with f16 KV and 0.016918 (94.90 %) with q8_0 KV, against
+  the static quant's 0.019850 / 0.020316. Prefill 1,223 t/s at 4,096 tokens
+  and decode 25.0 t/s, as the static quant. The writer serves the imatrix
+  quant since 0.5.9. The corpus is general text, not role play.
 - A770 (its sub-group-8 build of the prompt kernel): FLASH_ATTN_EXT 2,804
   of 2,806, the same two f16 failures as before 0017.

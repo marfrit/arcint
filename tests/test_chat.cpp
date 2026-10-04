@@ -135,6 +135,7 @@ TEST(chat_reads_sampler_fields) {
     json body            = minimal_chat();
     body["temperature"]  = 0.2;
     body["top_k"]        = 5;
+    body["min_p"]        = 0.05;
     body["max_tokens"]   = 64;
     body["stop"]         = json::array({"\n\n", "END"});
     body["seed"]         = 11;
@@ -143,6 +144,7 @@ TEST(chat_reads_sampler_fields) {
     CHECK(!parse_chat_request(body, req).has_value());
     CHECK(req.sampler.temperature.has_value());
     CHECK_EQ(*req.sampler.top_k, 5);
+    CHECK(req.sampler.min_p && *req.sampler.min_p == 0.05f);
     CHECK_EQ(*req.sampler.max_tokens, 64);
     CHECK_EQ(req.sampler.stop->size(), 2u);
     CHECK_EQ(static_cast<int>(*req.sampler.seed), 11);

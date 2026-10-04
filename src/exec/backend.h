@@ -117,6 +117,11 @@ struct ModelStatus {
     // paths -- kept here rather than re-derived at /props time so a future
     // load path that decides differently cannot drift from what /props says.
     bool prefix_cache_enabled = false;
+    // The model may open a think block with "<thinking>" or "[THINK]" as well
+    // as "<think>": set by the llama engine for the Mistral Small 24B family
+    // (Cydonia 24B, Magistral tunes). The Qwens keep "<think>" alone, so an
+    // answer of theirs that merely starts with such text stays content.
+    bool think_tags_extended = false;
 
     Reservation     reservation;
     SamplerDefaults sampler_defaults;
