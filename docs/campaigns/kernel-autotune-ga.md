@@ -130,8 +130,20 @@ Open:
 - the decode kernels (matvecs, decode attention), with decode t/s as
   fitness;
 - the IQ kernels on Flash-Next;
-- code-level mutations (structural variants as genes), once parameters are
-  saturated.
+- **code-level genetic optimization (priority, operator 2026-10-04):** genes
+  are structural variants of the kernel source, not only its parameters:
+  - load paths per operand (direct, staged in local memory, 2D block);
+  - staging tiles, prefetch depth, barrier placement;
+  - which products run on XMX, and row/column ownership per sub-group.
+
+  They sit behind compile-time switches and are recombined by the GA. Later,
+  source mutations are proposed by an editor model and admitted only after
+  FLASH_ATTN_EXT / MUL_MAT pass on the card. The first target is the
+  decode/verify attention of `gqa-small-t-decode.md`, whose hand ablation
+  already has this form (K and V staged or direct, BK, the products), with a
+  measured cost per switch. Reference to read before building: program
+  search for kernels (AlphaEvolve-style evolution, `paper`); Kernel Tuner's
+  structural tunables (`code`).
 
 ## Where it lives
 
