@@ -380,13 +380,13 @@ index 0000000..b9ca909
 +    }
 +}
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 37ea953..bab3756 100644
+index 37ea953..0140cb8 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11196,6 +11196,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11195,6 +11195,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             }
          }
      }
-     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
 +    // verify-row counts at a dense 27B's geometry (24 query heads on 4): 24-42
 +    // (head, token) rows, partial 8-row tiles, a partial key tile
 +    for (auto kv_t : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},
@@ -398,9 +398,9 @@ index 37ea953..bab3756 100644
 +            }
 +        }
 +    }
+     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
      test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 @@ -11504,6 +11515,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      std::vector<std::unique_ptr<test_case>> test_cases;

@@ -150,7 +150,8 @@ prompt:
 - greedy task 10/10;
 - sampled 10 runs mean 7.6 (0.5.6: 7.2-7.4).
 
-- FLASH_ATTN_EXT 2,757 of 2,758 at threshold 4, with 24 cases at 4-7 rows.
+- FLASH_ATTN_EXT 2,757 of 2,758 with the 4-row route, with 24 cases at 4-7
+  rows.
 - Red (BK=24) fails all 42 cases at 4-8 rows.
 - KL through the kernel (q8_0, a 6-token ubatch): 0.003589 against 0015's
   0.003593.
@@ -158,7 +159,8 @@ prompt:
 Gate:
 - the 6-row cost is 2.5x the 1-row call at 131k (bar 2x): not met;
 - 1 row is unchanged (it stays on 0015);
-- served decode at depth +42 %, within the bar;
+- served decode with MTP: +42 % at 62,597 tokens of depth (11.0 -> 15.6
+  t/s); the gate's 128k row is not re-measured (0.5.6: 7.5 t/s);
 - the answers hold: greedy task 10/10, sampled within the noise, KL equal.
 
 Open: overlap of staging and products (prefetch into registers), S computed
@@ -168,6 +170,6 @@ code-level GA (`kernel-autotune-ga.md`).
 ## Where it lives
 
 `contrib/llama.cpp` patch 0016:
-- `kernels/flash_attn_f32_f16.cl` or a kernel file of its own;
+- `kernels/flash_attn_gqa_dpas.cl`;
 - the decode route in `ggml-opencl.cpp`;
-- the depth perf cases in test-backend-ops.
+- the verify-row cases and the depth perf cases in test-backend-ops.

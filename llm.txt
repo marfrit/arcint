@@ -23,7 +23,8 @@ llama.cpp bed0a85 with contrib/llama.cpp/patches 0001-0016, ggml's OpenCL
 backend). The libllama engine decodes faster with the GGUF's MTP head.
 --llama-kv q8_0 (or q8_0:q4_0) quantizes its KV cache on arcint's
 attention kernels (0015). With MTP and an 8:8 cache the dense model serves
-131,072 tokens on the B60 (measured-here). The coder's Q4_K_M weights leave
+131,072 tokens on the B60; 0.5.7's verify attention (patch 0016) takes its
+decode at 62,597 tokens of depth from 11.0 to 15.6 t/s (measured-here). The coder's Q4_K_M weights leave
 it ~16k on the A770. The libllama engine has no shared prefix cache yet
 (README "Two engines"). Open work is one document per campaign under
 docs/campaigns/ (README there: rules, template, index). Next: a smaller
