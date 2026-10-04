@@ -36,7 +36,9 @@ What it buys (`measured-here`): the dense 27B serves 131,072 tokens with MTP
 on the B60 with an 8:8 cache:
 - peak VRAM 23.06 of 25.7 GB;
 - a 128,133-token prompt in 772 s, then decode at 7.5 t/s at that depth;
-- the acceptance task 10/10.
+- the acceptance task 10/10 in the probe's one greedy run. The deployed
+  unit scores 8/10 greedy. Sampled (30 runs, 65,536 tokens) q8_0 averages
+  7.4 against f16's 8.13, within the noise (`docs/llama-engine.md`).
 
 KL against the CPU reference:
 - 8:8 is unchanged within the noise: 0.003966 against f16's 0.004034;
