@@ -79,7 +79,8 @@ arcint's attention kernels (`contrib/llama.cpp` 0015). `--n-ctx` defaults to
   - peak VRAM 23.06 GB;
   - a 128,133-token prompt in 772 s (166 t/s), then decode at 7.5 t/s at
     that depth;
-  - the acceptance task 10/10.
+  - the acceptance task 8/10 at temperature 0 as deployed; sampled, q8_0
+    within the noise of f16 (`docs/llama-engine.md`).
 
   f16 KV with MTP at 131,072 overcommits the card.
 - **Coder, A770:** bound by its weights, not its KV. The Q4_K_M GGUF is
