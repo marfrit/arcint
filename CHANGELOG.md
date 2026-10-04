@@ -18,6 +18,27 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.5.7 — 2026-10-04
+
+**Runtime:** `marfrit-openvino +p25` remains the floor.
+
+**Verify attention in one pass per KV head on the B60** (`contrib/llama.cpp`
+0016; campaign `docs/campaigns/gqa-small-t-decode.md`, after NInfer's small-T
+kernel). Calls of 4-8 query rows (MTP verifies) go to a kernel that takes a
+KV head's query heads and rows together, on the XMX units. Calls of 1-3 rows
+stay on 0015's split kernel. The A770 is unchanged. Measured on the B60
+(`measured-here`), dense 27B:
+- one attention layer at 131k keys, 6 rows: 10.3 -> 4.83 ms (f16);
+- served with the agent's flags (131,072 tokens, q8_0, MTP 5) at 62,597
+  tokens of depth: decode 11.0 -> 15.6 t/s, identical draft statistics,
+  prefill and shallow decode unchanged;
+- KL through the kernel (q8_0, 6-token ubatches) 0.003593 -> 0.003589;
+- the acceptance task 10/10 greedy, sampled mean 7.6 over 10.
+
+Still open: a 6-row call costs 2.5x a 1-row call at 131k (the campaign's
+bar is 2x). Code-level genetic search over the kernel's structure is the
+next lever (`docs/campaigns/kernel-autotune-ga.md`).
+
 ## 0.5.6 — 2026-10-04
 
 **Runtime:** `marfrit-openvino +p25` remains the floor.

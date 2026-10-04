@@ -10,7 +10,7 @@
 > NInfer philosophy (specialize, then be honest about numbers), Intel
 > substrate.
 
-## Status (0.5.6)
+## Status (0.5.7)
 
 Runtime floor: marfrit-openvino +p25 = OpenVINO upstream commit 71640275 (the
 2026.4.0 nightly of 2026-08-21) + patches 0003-0074
@@ -20,7 +20,7 @@ and MOE_DOORBELL.
 
 Two engines (README "Two engines"): OpenVINO (default; the coder service)
 and libllama (--engine llama --gguf, the agent service from 0.5.6: llama.cpp
-bed0a85 with contrib/llama.cpp/patches 0001-0015, ggml's OpenCL backend,
+bed0a85 with contrib/llama.cpp/patches 0001-0016, ggml's OpenCL backend,
 arcint's Intel kernels; MTP from the GGUF's own head; --llama-kv q8_0 or
 q8_0:q4_0 quantizes its KV cache). libllama, measured-here:
 - coder (A770): decode 79.3 t/s with 4 drafts, prefill 1,431 t/s at 4k;
@@ -43,7 +43,8 @@ Served configurations:
   --llama-kv q8_0, --n-ctx 131072, MTP 5 drafts from a 40,960-id head.
   Acceptance task 8/10 greedy, sampled mean 7.4 over 30 (f16: 8.13, within
   the noise); decode 47.1 t/s on its prompt; a 128,133-token
-  prompt prefills at 166 t/s, then decodes at 7.5 t/s. Before 0.5.6:
+  prompt prefills at 166 t/s, then decodes at 7.5 t/s (0.5.6); at 62,597
+  tokens of depth 0.5.7 decodes at 15.6 t/s (0.5.6: 11.0). Before 0.5.6:
   qwen38-b7c1-ov on OpenVINO, i8:u8 KV, 122,880 tokens, DFlash2 drafter,
   prefix cache 8 GiB, host KV tier 4 GiB.
 

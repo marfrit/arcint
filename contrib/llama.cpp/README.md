@@ -854,3 +854,75 @@ Measured (`measured-here`, llama-bench `-fa 1 -r 2`; t/s):
 
   With an f16 cache and MTP, 131,072 overcommits the card: the copy engine
   was reset.
+
+## 0016-opencl-intel-gqa-decode-attention.patch
+
+Decode and MTP-verify attention on Xe2 (the B60) in one pass over K and V
+per KV head (`docs/campaigns/gqa-small-t-decode.md`), after NInfer's small-T
+kernel (`src/ops/attention/causal_softmax/small_t_bf16.cuh`, `code`).
+
+0007/0015's split kernel gives every (query head, row, split) its own
+sub-group. Every verify row re-reads the whole KV, so 6 rows cost 5.4x one
+row at 131k keys.
+
+`flash_attn_gqa_dpas.cl` takes a KV head's query heads and rows together:
+- One work-group per (KV head, split). Row m of the tile is (head m mod G,
+  token m div G); 8 rows a DPAS M, two sub-groups each, one per half of the
+  output columns.
+- QKᵀ and PV on the XMX units.
+- V staged in local memory as f16 per 32 keys, transposed. K read straight
+  from the cache when it is f16, staged too when it is quantized.
+- The partial records of `flash_attn_f32_merge`, which is reused.
+- f16, q8_0 / q8_0, q8_0 / q4_0, q4_0 / q4_0. Head size 256, no ALiBi or
+  softcap.
+- Built only where the device has sub-group 16 and not 8 (Xe2). The A770
+  keeps 0015's kernels.
+- Routed from 4 rows (`GGML_OPENCL_FA_GQA_MIN_ROWS`); 1-3 rows stay on the
+  split kernel. `GGML_OPENCL_FA_GQA=0` turns it off.
+- `GQA_K_STAGED` / `GQA_K_DIRECT` and `BK` are compile-time switches
+  (`GGML_OPENCL_FA_GQA_OPTS`). The sides (1, 2 or 4) come from
+  `GGML_OPENCL_FA_GQA_SIDES`, used for the build and the dispatch alike.
+  These are the genes of a structural search
+  (`docs/campaigns/kernel-autotune-ga.md`).
+
+Measured (`measured-here`, B60, dense 27B geometry: 24 query heads on 4,
+head size 256):
+
+- **One attention layer, f16, test-backend-ops perf:**
+
+  | keys | rows | 0015 | 0016 |
+  |---|---|---|---|
+  | 8k | 6 | 0.67 ms | 0.48 ms |
+  | 32k | 6 | 2.75 ms | 1.79 ms |
+  | 131k | 6 | 10.3 ms | 4.83 ms |
+
+  One row stays on 0015 (1.91 ms at 131k).
+- **The forms tried** (131k keys, 6 rows, f16): no local memory 8.86 ms;
+  K and V staged 5.27; K direct, V staged 4.83. One side per tile 10.6, four
+  sides 6.96; BK 16: 4.91, BK 64: 9.67.
+- **q8_0 KV, llama-bench at 32k depth:**
+  - a 6-row forward 47.7 -> 52.6 t/s with K staged; direct K 30.7 (every
+    sub-group converting the same blocks);
+  - a 3-row forward 29.2 -> 27.7, hence the 4-row threshold.
+- **Served, the agent's flags** (131,072 tokens, q8_0, MTP 5 drafts), a
+  62,597-token prompt:
+  - decode at that depth 11.0 -> 15.6 t/s (+42 %);
+  - verify time 9.78 -> 6.65 s;
+  - identical draft statistics (72 of 235 accepted);
+  - prefill unchanged (286.9 t/s).
+- **Answers:**
+  - greedy acceptance task 10/10 with 0.5.6 and with 0016;
+  - its decode 47.5 -> 47.6 t/s;
+  - sampled 10 runs mean 7.6 (0.5.6: 7.2-7.4);
+  - KL through this kernel: llama-perplexity with q8_0 KV and a 6-token
+    ubatch, so every attention call is a verify-shaped call. 0015 0.003593
+    (top-1 97.82 %), 0016 0.003589 (97.79 %).
+- **Tests:** FLASH_ATTN_EXT 2,757 of 2,758 at the shipped threshold, the
+  failure being the pin's own f16 softcap case. 0016 adds 24 cases at the
+  dense geometry with 4-7 rows (partial row tiles), KV 1,013 and 4,096,
+  f16, q8_0 and q8_0 / q4_0.
+- **Red:** `GGML_OPENCL_FA_GQA_OPTS=-DBK=24` (a third of each tile's keys
+  skipped) fails every case at 4-8 rows (42).
+- **Open:** a 6-row call at 131k is still 2.5x a 1-row call (the gate's
+  bar is 2x). Staging and the products do not overlap, and both sides
+  compute S.

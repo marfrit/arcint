@@ -204,6 +204,54 @@ The prices, KL and speed are in the 0015 section of
   against the context size (the verify rows run through the quantized
   split decode).
 
+**The deployed agent (0.5.6, 2026-10-04, `measured-here`).** The unit as
+shipped (`--llama-kv q8_0`, 131,072 tokens, MTP 5) scores 8/10 at
+temperature 0, four runs out of four. The two lost cases are CRLF and LF
+row handling. The probe with the same flags had scored 10/10 once.
+
+Greedy runs at `--n-ctx 65536` on the same binary and prompt, two each:
+
+| KV | MTP 5 | plain |
+|---|---|---|
+| q8_0 | 10, 10 | 2, 2 |
+| f16 | 10, 10 | 10, 10 |
+
+A greedy score is one trajectory. It repeats within a configuration and
+flips between configurations (KV type, MTP's verify batches, context
+size). It cannot separate the KV types. The sampled task can, 30 runs
+each, MTP 5, `--n-ctx 65536`:
+
+| KV | mean | runs at 10/10 |
+|---|---|---|
+| q8_0 | 7.4 | 15 of 30 |
+| f16 | 8.13 | 19 of 30 |
+
+- The gap of 0.73 is under one standard error (0.87, per-run spread
+  ±3.4).
+- The second batch of 20 alone is reversed: q8_0 8.3, f16 8.0.
+- The earlier f16 arm at 32,768 had a mean of 7.4.
+
+With KL equal (0.003966 against 0.004034), 8:8 holds the answer-level bar,
+and the agent stays on this configuration. The deployed unit's own sampled
+runs: mean 7.2 over 10.
+
+**DFlash on this engine.** The pinned llama.cpp carries DFlash and DFlash2
+drafting (`code`):
+- `common/speculative.cpp`, type `draft-dflash`, which turns DFlash2 on when
+  the draft GGUF has a selector top-k;
+- `src/models/dflash.cpp`;
+- the converter in `convert_hf_to_gguf.py`.
+
+arcint's engine wires only the GGUF's MTP head (`src/exec/llama_spec.cpp`).
+DFlash2 runs on the OpenVINO engine (`--dflash`). Wiring llama.cpp's
+DFlash2 into this engine is open and unmeasured.
+
+**Verify attention at depth (0.5.7, `contrib/llama.cpp` 0016).** On the
+B60, MTP verify calls (4-8 rows) take a kernel that reads K/V once per KV
+head for all its query heads and rows. With the agent's flags at 62,597
+tokens of depth, decode went from 11.0 to 15.6 t/s (`measured-here`); the
+campaign is `docs/campaigns/gqa-small-t-decode.md`.
+
 **Coder, A770: smaller GGUFs for its context** (`measured-here`,
 2026-10-04). Its Q4_K_M weights (16.06 GB) leave ~16k tokens with MTP. Two
 mixes were made from the F16 GGUF with the model's imatrix. Expert gate/up
