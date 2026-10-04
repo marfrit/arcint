@@ -246,6 +246,12 @@ arcint's engine wires only the GGUF's MTP head (`src/exec/llama_spec.cpp`).
 DFlash2 runs on the OpenVINO engine (`--dflash`). Wiring llama.cpp's
 DFlash2 into this engine is open and unmeasured.
 
+**Verify attention at depth (0.5.7, `contrib/llama.cpp` 0016).** On the
+B60, MTP verify calls (4-8 rows) take a kernel that reads K/V once per KV
+head for all its query heads and rows. With the agent's flags at 62,597
+tokens of depth, decode went from 11.0 to 15.6 t/s (`measured-here`); the
+campaign is `docs/campaigns/gqa-small-t-decode.md`.
+
 **Coder, A770: smaller GGUFs for its context** (`measured-here`,
 2026-10-04). Its Q4_K_M weights (16.06 GB) leave ~16k tokens with MTP. Two
 mixes were made from the F16 GGUF with the model's imatrix. Expert gate/up

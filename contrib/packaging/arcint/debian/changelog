@@ -1,3 +1,12 @@
+arcint (0.5.7-1) trixie; urgency=medium
+
+  * 0.5.7: decode and MTP-verify attention in one pass over K/V per KV head
+    on the B60 (contrib/llama.cpp/patches 0016): the agent's decode at
+    62,597 tokens of depth 11.0 -> 15.6 t/s. Runtime floor unchanged at
+    marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 04 Oct 2026 20:00:00 +0200
+
 arcint (0.5.6-1) trixie; urgency=medium
 
   * 0.5.6: quantized KV on the libllama engine (--llama-kv q8_0 or
