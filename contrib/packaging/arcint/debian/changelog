@@ -1,3 +1,12 @@
+arcint (0.5.9-1) trixie; urgency=medium
+
+  * 0.5.9: min-p sampling (--min-p, request field min_p); <thinking> and
+    [THINK] blocks split as reasoning for the Mistral Small 24B family; top-p
+    with top-k off normalised over the whole vocabulary (it cut early).
+    Runtime floor unchanged at marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 04 Oct 2026 23:00:00 +0200
+
 arcint (0.5.8-1) trixie; urgency=medium
 
   * 0.5.8: the libllama engine serves Mistral Small 3.2 24B and its
