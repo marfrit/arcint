@@ -258,7 +258,10 @@ B60.** The engine admits the `llama` architecture at that geometry only.
 The README section of 0017 and the CHANGELOG have the numbers. The model has
 no MTP head, so decode is plain: 25.2 t/s short, 18.2 at 16k and 8.4 at 89k
 depth (`measured-here`). All 40 layers keep KV (85 KiB a
-token at q8_0), which puts the ceiling at 98,304 tokens on the B60.
+token at q8_0), which puts the ceiling at 98,304 tokens on the B60. Since 0.5.9 the writer
+serves bartowski's imatrix Q4_K_M: KL against the model's Q8_0 is 0.016918
+with q8_0 KV, against the static quant's 0.020316, top-1 equal
+(`measured-here`; the 0017 section of `contrib/llama.cpp/README.md`).
 
 **Coder, A770: smaller GGUFs for its context** (`measured-here`,
 2026-10-04). Its Q4_K_M weights (16.06 GB) leave ~16k tokens with MTP. Two
