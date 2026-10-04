@@ -699,3 +699,48 @@ Measured and left out (`measured-here`, B60):
   XVE instead of 4): spills, 37 instructions a DPAS.
 - the conversion with each column read once and held in registers: 139 ->
   136 us, not kept.
+
+## 0014-opencl-intel-searched-tiles.patch
+
+Defaults found by a genetic search, and the hooks to repeat it
+(`docs/campaigns/kernel-autotune-ga.md`, `tools/kq_tune/`).
+
+- **A770 (SG 8):**
+  - the tokens-as-a MUL_MAT_ID kernel (ID2) off by default;
+  - the tile kernel's tile 2,4,1,1 -> 2,4,2,2;
+  - the plain GEMM's tile 4,4,1,16 -> 4,4,2,8 (as on the B60).
+
+  ID2 had replaced the tile kernel at the tile kernel's old tile. With its
+  tile searched, the tile kernel is faster, and faster than ID2's best shape
+  too (1,702 t/s at 24 x 32). `GGML_OPENCL_KQ_MM_ID2=1` turns ID2 back on;
+  the B60 keeps it on.
+- **B60:** the int8 Q4_K kernel's work-group barrier every 32 blocks
+  (`KSYNC_I8`), the fp16 kernels' every 16.
+- **Hooks, inert when unset:**
+  - `GGML_OPENCL_KQ_2D_T<i>` = "TM,WG,AT,KSYNC" builds the 2D GEMM of type
+    i (0 Q4_K with its int8 kernel, 1 Q5_K, 2 Q6_K) from a program of its
+    own. A shape that does not build or fit is ignored, with a warning;
+  - `GGML_OPENCL_KQ_2D_OPTS` passes defines to the 2D program;
+  - test-backend-ops perf gains a dense 27B's prompt GEMM shapes (Q4_K,
+    Q5_K, Q6_K at 512 tokens).
+
+Measured (`measured-here`, llama-bench, `-fa 1`, two interleaved repeats
+each):
+
+| model, card | prefill 512: 0013 -> 0014 | prefill 4,096: 0013 -> 0014 |
+|---|---|---|
+| coder, A770 | 1,613 -> 1,739-1,742 t/s (+7.9 %) | 1,345-1,346 -> 1,431-1,432 (+6.4 %) |
+| dense 27B, B60 | 1,028 -> 1,033-1,034 (+0.5 %) | 930 -> 934.5-934.8 (+0.5 %) |
+
+- The coder at 2,048 tokens with ubatch 1,024, a GEMM shape the search
+  never saw (on the search harness, the tiles set through the environment):
+  1,659 -> 1,882 t/s (+13.4 %).
+- The acceptance task, served: the coder 10/10 at temperature 0 and 3 of 3
+  sampled; the dense model 10/10 at temperature 0.
+- `GGML_OPENCL_KQ_2D_OPTS` also reaches the per-type programs. It must not
+  set `TMM`: the host dispatches the int8 kernel for 32 tokens a sub-group.
+- The coder's KL: 0.007043 -> 0.007040, top-1 95.88 -> 96.08 %. The B60
+  change is a barrier interval: no arithmetic changes (`code`: the 2D
+  kernels use no local memory).
+- MUL_MAT 1,123/1,123 on both cards; MUL_MAT_ID 338/338 on the A770. On the
+  B60 MUL_MAT_ID shows the pin's own 74 MXFP4 failures (0013).

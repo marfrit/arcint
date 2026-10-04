@@ -59,6 +59,12 @@ on int8 DPAS (`contrib/llama.cpp/README.md`); its int8 activations cost
 +0.0005 nats of KL. The coder's prefill on the A770 is unchanged by
 0011-0013 (B60-only kernels).
 
+0014 sets tiles found by a genetic search scored at the endpoint
+(`docs/campaigns/kernel-autotune-ga.md`, `measured-here`, llama-bench):
+- coder, A770: 1,613 -> 1,740 t/s at 512 tokens, 1,345 -> 1,431 at 4,096,
+  KL unchanged;
+- dense, B60: 930 -> 935 at 4,096 (the same build pair, interleaved).
+
 Decode with context (0001-0007; 0001-0006 in brackets): coder 47.3 (13.6)
 t/s at 4,096 tokens and 43.5 (4.2) at 16,384; dense 19.39 (12.8) and 17.95
 (6.4).
