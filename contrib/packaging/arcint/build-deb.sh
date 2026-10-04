@@ -9,9 +9,12 @@
 #
 # Build dependency: marfrit-openvino must be INSTALLED, not merely available.
 # It carries the CMake package, the headers and the runtime that arcint links.
+# Since 0.5.5 also the second engine's: opencl-headers, ocl-icd-opencl-dev,
+# git (applies contrib/llama.cpp/patches) and python3 (embeds the OpenCL
+# kernels).
 set -euo pipefail
 
-PKGVER=0.5.4
+PKGVER=0.5.5
 UPSTREAM_TAG=v${PKGVER}
 PKGREL=1
 # The public repository, not the fleet one. The fleet repo (still named
@@ -19,14 +22,24 @@ PKGREL=1
 # and carries operator-local notes; the published tree is the same code without
 # them, so the package is built from what anyone can check.
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
-# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v0.5.4.tar.gz,
+# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v0.5.5.tar.gz,
 # taken after the tag was pushed (recorded in the follow-up commit, as for every tag).
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-8febe8fe8824b049477e87186487c4d70e14c44b9bd36fef16b0e17a855a1641}
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-}
+# The libllama engine (--engine llama) builds against llama.cpp at this pin
+# with contrib/llama.cpp/patches applied (contrib/llama.cpp/README.md): the
+# GitHub tarball of the commit, checked by sha256.
+LLAMA_COMMIT=bed0a856606ee4a24a164066f73d2379447033f5
+LLAMA_URL="https://github.com/ggml-org/llama.cpp/archive/${LLAMA_COMMIT}.tar.gz"
+LLAMA_TARBALL_SHA256=0984123c33b7e959f8003f9169e9109897112d9448b681737813911083eca4cc
 OV_PREFIX=/usr/lib/marfrit-openvino
 # The ABI is the nightly, not the patch level: floor the patch level, cap at
 # the next nightly. An exact pin (Depends: = +p1-1) made apt REMOVE arcint when
 # the runtime was upgraded to +p3 on 2026-09-04; never render "=" here again.
 OV_DEP_VERSION="2026.4.0~dev20260821+p25-1"
+# 0.5.5 keeps the +p25 floor: what 0.5.5 adds over 0.5.4 needs no newer runtime
+# by default. Patches 0076 (+p26) and 0077 (+p27) serve opt-in switches of the
+# Flash-Next CPU tier (MOE_CPU_TIER_ADAPTIVE=1, MOE_DOORBELL=1); those need a
+# +p27 runtime built from marfrit-openvino/.
 # The +p25 floor is 0.5.4's (patches 0068-0074: the CPU tier's decode and prefill
 # kernels, the host expert bank, and patch 0073's QSA selection input to
 # PagedAttention, which the served QSA route needs).
@@ -49,6 +62,14 @@ HERE=$(dirname "$(readlink -f "$0")")
 
 export SOURCE_DATE_EPOCH=1787990400
 
+# Fail in a second, not after the downloads: the tools and the second
+# engine's build dependencies.
+for t in curl git python3 cmake; do
+    command -v "$t" >/dev/null || { echo "$t fehlt (Build-Abhaengigkeit)" >&2; exit 1; }
+done
+[ -f /usr/include/CL/cl.h ] || { echo "opencl-headers fehlen (/usr/include/CL/cl.h)" >&2; exit 1; }
+[ -n "${ARCINT_GIT_SHA:-}" ] || { echo "ARCINT_GIT_SHA fehlt — /props wuerde 'unknown' melden" >&2; exit 1; }
+
 work=$(mktemp -d)
 trap "rm -rf $work" EXIT
 cd "$work"
@@ -70,6 +91,20 @@ tar xzf arcint.tar.gz
 SRC=$(find . -maxdepth 1 -mindepth 1 -type d | head -1)
 [ -f "$SRC/CMakeLists.txt" ] || { echo "Tarball-Layout unerwartet: kein CMakeLists.txt" >&2; exit 1; }
 
+# The second engine: llama.cpp at the pin, the patches from the arcint tarball
+# itself, so the package and its source agree on them by construction.
+mkdir llama && cd llama
+curl --connect-timeout 10 --max-time 600 --retry 3 --retry-delay 5 -sSLfo llama.tar.gz "$LLAMA_URL"
+echo "$LLAMA_TARBALL_SHA256  llama.tar.gz" | sha256sum -c
+tar xzf llama.tar.gz
+LLAMA_DIR="$work/llama/llama.cpp-${LLAMA_COMMIT}"
+cd "$LLAMA_DIR"
+for p in "$work/$SRC"/contrib/llama.cpp/patches/*.patch; do
+    [ -e "$p" ] || { echo "no contrib/llama.cpp/patches in the source tarball" >&2; exit 1; }
+    git apply --whitespace=nowarn "$p" || { echo "patch does not apply to the pin: $p" >&2; exit 1; }
+done
+cd "$work"
+
 # The build must be able to say which commit it is. The tarball has no .git, so
 # the sha is handed in; without it the binary would report "unknown" and every
 # /props answer would be unattributable.
@@ -82,6 +117,8 @@ GIT_SHA=${ARCINT_GIT_SHA:-}
 cmake -S "$SRC" -B build \
     -DCMAKE_BUILD_TYPE=Release \
     -DARCINT_OPENVINO=ON \
+    -DARCINT_LLAMA=ON \
+    -DARCINT_LLAMA_DIR="$LLAMA_DIR" \
     -DARCINT_WERROR=ON \
     -DARCINT_TESTS=ON \
     -DARCINT_GIT_SHA="$GIT_SHA" \
@@ -106,6 +143,15 @@ mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/share/doc/arcint" "$ROOT/usr/share/arcint"
 DESTDIR="$ROOT" cmake --install build >/dev/null
 
 [ -x "$ROOT/usr/bin/arcint" ] || { echo "FEHLT: /usr/bin/arcint" >&2; exit 1; }
+# llama.cpp is a static subproject: none of its install rules may land in the
+# package (headers, static libraries, CMake and pkg-config files).
+STRAY=$(cd "$ROOT" && find . -path ./usr/include -prune -print -o \( -name '*.a' -o -name '*.pc' -o -path '*/cmake/*' -o -name 'libggml*' -o -name 'libllama*' \) -print)
+[ -z "$STRAY" ] || { echo "llama.cpp-Installationsreste im Paket:" >&2; echo "$STRAY" >&2; exit 1; }
+# The binary carries the second engine (its OpenCL kernels are embedded).
+# No pipe: `strings | grep -q` takes SIGPIPE under pipefail (see the RPATH
+# probe below).
+grep -qa kernel_mul_mm_kq2d_q4_K_i8 "$ROOT/usr/bin/arcint" || {
+    echo "die libllama-Engine fehlt im Binary (ARCINT_LLAMA?)" >&2; exit 1; }
 
 # RPATH-Probe. This is the whole reason the unit file carries no
 # LD_LIBRARY_PATH: if the binary cannot find its runtime by itself, the failure
@@ -170,7 +216,7 @@ Section: misc
 Priority: optional
 Architecture: amd64
 Installed-Size: ${INSTALLED_KB}
-Depends: libc6 (>= 2.34), libstdc++6 (>= 13), marfrit-openvino (>= ${OV_DEP_VERSION}), marfrit-openvino (<< ${OV_DEP_NEXT_NIGHTLY})
+Depends: libc6 (>= 2.34), libstdc++6 (>= 13), ocl-icd-libopencl1, marfrit-openvino (>= ${OV_DEP_VERSION}), marfrit-openvino (<< ${OV_DEP_NEXT_NIGHTLY})
 Recommends: intel-opencl-icd
 Maintainer: Markus Fritsche <mfritsche@reauktion.de>
 Homepage: https://github.com/marfrit/arcint
@@ -178,7 +224,8 @@ Description: Narrow LLM inference engine for Intel Arc GPUs
  arcint serves exactly three Qwen models on exactly two Intel Arc cards over an
  OpenAI-compatible HTTP surface. It owns its scheduler, paged KV cache, GDN
  ledger, exact prefix cache, speculation and sampling; OpenVINO supplies the
- compiler and kernels.
+ compiler and kernels. A second engine (--engine llama) runs GGUF models
+ through libllama with ggml's OpenCL backend and arcint's Intel kernels.
  .
  LAN use only: no authentication, permissive CORS — the same warning class
  llama-server prints.

@@ -1,4 +1,4 @@
-# The libllama engine (0.5.3.1459)
+# The libllama engine (since 0.5.5)
 
 arcint serves without OpenVINO: `--engine llama --gguf FILE` runs the GGUF
 through libllama with ggml's OpenCL backend on the Arc card
@@ -167,8 +167,11 @@ batched numerics; plain builds differ from each other the same way).
 
 The coder with its MTP layer fits the A770 up to a 16,384-token context
 (prefill 1,070 t/s); at 24,576 prefill drops to 585 t/s and at 32,768 to 67
-with decode at 22 t/s: VRAM paged over the link. The dense model fits the
-B60 at 32,768.
+with decode at 22 t/s: VRAM paged over the link. The dense model serves
+122,880 tokens on the B60 with f16 KV (`--n-ctx 122880`, 2026-10-04,
+`measured-here`). 24.4 of 25.7 GB of VRAM are in use. A 30,065-token prompt
+prefills at 528 t/s at both 122,880 and 32,768, and a 120,945-token prompt
+in 579 s. MTP at that depth is not measured.
 
 llama.cpp's own loop (`llama-speculative-simple`, raw prompt) for
 reference: coder 68.1 t/s with 2 drafts, dense 31.9 with 3; four drafts

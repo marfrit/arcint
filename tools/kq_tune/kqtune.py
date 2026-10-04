@@ -2,7 +2,7 @@
 """Parameter search for the B60 2D K-quant GEMMs (contrib/llama.cpp 0013, hooks of 0014).
 
   kqtune.py exhaustive <type> <out.json>
-  kqtune.py ga <type> <out.json> [--seed S] [--budget N] [--pop P]
+  kqtune.py ga <type> <out.json> [--seed S] [--budget N] [--pop P] [--noseed]
 
 Genome: TM (fp16 token tile), WG (sub-groups a work-group), AT (activation
 read rows), KSYNC (blocks between work-group barriers), and for q4_K I8 (the
@@ -197,5 +197,7 @@ if __name__ == '__main__':
         exhaustive(ev)
     else:
         ga(ev, opt('--seed', 1), opt('--budget', 60), opt('--pop', 10), '--noseed' in args)
-    best = min((e for e in ev.db['evals'] if e['norm'] is not None), key=lambda e: e['norm'])
-    print('BEST', best['key'], best['norm'], 'evals', ev.n)
+    good = [e for e in ev.db['evals'] if e['norm'] is not None]
+    if good:
+        best = min(good, key=lambda e: e['norm'])
+        print('BEST', best['key'], best['norm'], 'evals', ev.n)

@@ -17,12 +17,55 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
-## Unreleased
+## 0.5.5 — 2026-10-04
 
-Build order after 0.5.4 (operator's architect, 2026-10-01): the adaptive
-expert cache with its miss split and the pinned bank, then the doorbell
-hand-off, then multi-draft MTP for Flash-Next (ROMA), then prefill on the
-GPU. The 0.5.4 entry's "0.5.5 ROMA is next" is superseded by this order.
+**Runtime:** `marfrit-openvino +p25` remains the floor; nothing 0.5.5 does by
+default needs more. Plugin patches 0076 (`+p26`) and 0077 (`+p27`) serve the
+Flash-Next tier's opt-in switches `MOE_CPU_TIER_ADAPTIVE` and
+`MOE_DOORBELL`, which need a `+p27` runtime built from
+`contrib/packaging/marfrit-openvino/`.
+
+**A second engine: libllama (`--engine llama --gguf FILE`).** arcint serves
+a GGUF through llama.cpp, pinned at `bed0a85`, with ggml's OpenCL backend
+and Intel kernels of its own, carried as `contrib/llama.cpp/patches`
+0001-0014:
+- K-quant matvec and XMX GEMMs;
+- the IQ types, the gated delta-net and the MoE GEMMs;
+- decode and prompt attention;
+- the few-token verify;
+- a 2D-block GEMM on the B60 with packed decode and int8 DPAS;
+- tiles found by a genetic search (`tools/kq_tune`).
+
+It drafts with the GGUF's own MTP head (`--llama-mtp N`), optionally from a
+vocabulary subset (`--llama-mtp-vocab`). Served (`measured-here`, the
+acceptance task 10/10 at temperature 0 on both):
+
+| | decode, MTP | prefill, 4,096 tokens (llama-bench) |
+|---|---|---|
+| coder, A770 | 79.3 t/s | 1,431 t/s |
+| dense 27B, B60 | 52.6 t/s | 935 t/s |
+
+The OpenVINO services: coder 43.9 / 1,379 t/s, agent 24.6 / 1,141 t/s, on
+their own int4 IRs.
+
+Context, with f16 KV (`--n-ctx`, default 32,768):
+- the dense model serves 122,880 tokens on the B60 without paging;
+- the coder's 14.9 GiB of weights on the A770 leave it ~16k before VRAM
+  pages.
+
+The libllama engine has no shared prefix cache yet. **The services stay on
+OpenVINO** (operator, 2026-10-04; README "Two engines"). The .deb carries
+both engines.
+`docs/llama-engine.md`, `docs/campaigns/llama-engine-kernel-gap.md`,
+`docs/campaigns/mtp-cycle-wall.md`, `docs/campaigns/kernel-autotune-ga.md`.
+
+The build order after 0.5.4 (operator's architect, 2026-10-01) and its
+first two items, landed in this release:
+- the adaptive expert cache with its miss split and the pinned bank;
+- the doorbell hand-off.
+
+Multi-draft MTP for Flash-Next (ROMA) and prefill on the GPU are still
+open.
 
 - **Tier hand-off doorbell (plugin patch 0077, runtime `+p27`): gate
   passed.** `MOE_DOORBELL=1`: the decode MoE layers route on the device

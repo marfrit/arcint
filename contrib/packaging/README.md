@@ -21,8 +21,13 @@ instruction, which is the one thing this directory exists to prevent.
 
     arcint/
       build-deb.sh          builds arcint from a GitHub release tarball with a
-                            pinned sha256, then gates: unit tests, a RUNPATH
-                            probe, ldd resolution, a unit-template assertion
+                            pinned sha256, with both engines: the libllama
+                            engine against llama.cpp's tarball at the pinned
+                            commit (sha256-checked), with the release's own
+                            contrib/llama.cpp/patches applied. Then gates:
+                            unit tests, a RUNPATH probe, ldd resolution, a
+                            unit-template assertion, no llama.cpp install
+                            residue, the engine's kernels in the binary
       debian/               control, copyright, changelog
 
     marfrit-openvino/

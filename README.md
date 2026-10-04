@@ -30,6 +30,63 @@ expert engines [Strata](https://github.com/Niko1221/Strata) and
 | Qwen3.6-35B-A3B | `qwen3_5_moe`, 40 layers, 256 experts | the checkpoint's own IQ2_S/IQ3_XXS expert blocks, all resident | A770 |
 | Qwen3.8-Flash-Next | `qwen4_exp`, 48 layers, 512 experts (10 routed + 1 shared), n-gram embedding table | the checkpoint's own expert blocks, Q8_0 dense projections, experts split between card and a host RAM bank | B60 |
 
+## Two engines
+
+arcint has two inference backends behind the same HTTP surface, sampler,
+lanes and chat templates. Production runs on the first.
+
+**OpenVINO (the default).** The model is an OpenVINO IR, or a GGUF fed
+through it. Runs on the patched `marfrit-openvino` runtime. arcint owns the
+whole memory picture here:
+- paged KV in u8 or i8:u8;
+- the exact prefix cache, in VRAM and in host RAM;
+- admission by measured reservation;
+- the Flash-Next expert tier between card and RAM;
+- DFlash and MTP drafting.
+
+That is what carries the long contexts the services run at (98,304 tokens
+for the coder, 122,880 for the agent) and Flash-Next at depth.
+
+**libllama (`--engine llama --gguf FILE`).** llama.cpp at a pinned commit
+with ggml's OpenCL backend and arcint's Intel kernels
+(`contrib/llama.cpp/patches`: K-quant matvec and XMX GEMMs, int8 DPAS,
+gated delta-net, decode and prompt attention). It takes the GGUF as it is,
+with no export step, and drafts with the GGUF's own MTP head (`--llama-mtp
+N`, `--llama-mtp-vocab`). Its numbers (`measured-here`, 2026-10-04; the
+acceptance task 10/10 at temperature 0 on both):
+
+| | coder, A770 | dense 27B, B60 |
+|---|---|---|
+| decode, MTP | 79.3 t/s (4 drafts) | 52.6 t/s (5 drafts) |
+| prefill, 4,096 tokens | 1,431 t/s | 935 t/s |
+| OpenVINO service, decode / prefill at 4k (table below) | 43.9 / 1,379 t/s | 24.6 / 1,141 t/s |
+
+The two engines run different weights: the services' int4 IRs are ~18 %
+fewer bytes than the GGUFs' Q4_K_M. The llama-engine figures are
+llama-bench prefill and served decode on the acceptance prompt, so they are
+not the services' long-context conditions.
+
+Context on the llama engine (`measured-here`, 2026-10-04). Its KV cache is
+f16, and `--n-ctx` defaults to 32,768.
+- **Dense 27B, B60:** serves the agent's 122,880 tokens. 24.4 of 25.7 GB of
+  VRAM in use. A 30,065-token prompt prefills at 528 t/s at `--n-ctx 122880`
+  and at `--n-ctx 32768` alike, so nothing pages. A 120,945-token prompt
+  took 579 s (209 t/s on average). Decode at 30k depth is 16.7 t/s
+  without MTP; MTP at that depth is not measured.
+- **Coder, A770:** bound by its weights, not its KV. The Q4_K_M GGUF is
+  14.9 GiB on the 16 GB card, while 98,304 tokens of its KV would be
+  1.9 GiB. With MTP, VRAM pages over the card's x4 link beyond ~16,384
+  tokens (prefill 585 t/s at 24,576).
+
+What keeps production on OpenVINO for now (operator, 2026-10-04):
+- the coder's context: a smaller GGUF (an IQ3_XXS mix) and 8-bit / 8:4 KV
+  in arcint's OpenCL attention kernels are the next steps;
+- a shared prefix cache: a lane reuses only the prefix it still holds;
+- Flash-Next at speed: experts not on the card run on llama.cpp's CPU
+  backend (`--llama-cpu-moe`).
+
+`docs/llama-engine.md` has the details.
+
 ## Current numbers
 
 Every number names the card and configuration; all are `measured-here`.
@@ -119,6 +176,16 @@ A build that serves a model needs OpenVINO:
     cmake --build build-ov -j"$(nproc)"
     cmake --install build-ov --prefix ~/.local
 
+The libllama engine needs a llama.cpp tree at the pinned commit (`bed0a85`)
+with `contrib/llama.cpp/patches` applied, plus the OpenCL headers and ICD
+loader:
+
+    git -C <llama.cpp> apply <arcint>/contrib/llama.cpp/patches/*.patch
+    cmake -S . -B build-ov -DARCINT_OPENVINO=ON -DARCINT_LLAMA=ON \
+          -DARCINT_LLAMA_DIR=<llama.cpp> -DCMAKE_BUILD_TYPE=Release
+
+The Debian recipe does exactly this (`contrib/packaging/arcint/build-deb.sh`).
+
 `-DARCINT_WERROR=ON` gives the warning-clean build CI should use. Pass
 `-DARCINT_GIT_SHA` whenever the build tree has no `.git`; without it
 `--version` and `/props` report `unknown`.
@@ -126,7 +193,10 @@ A build that serves a model needs OpenVINO:
 **Packaging.** `contrib/packaging/` holds the Debian recipes this project is
 deployed with, including `marfrit-openvino/build-openvino.sh`, which builds
 the pinned OpenVINO nightly with the patch series the measurements depend on
-(`+p25`, patches 0003–0074). No `.deb` is published anywhere; the directory
+(`+p25`, patches 0003–0074; `+p27` adds 0076-0077 for the Flash-Next tier's
+opt-in switches), and `arcint/build-deb.sh`, which builds both engines
+from the release tarball and the llama.cpp pin. No `.deb` is published
+anywhere; the directory
 contains everything needed to build the same thing, and it is the shortest
 path to reproducing a number.
 

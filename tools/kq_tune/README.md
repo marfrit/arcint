@@ -40,8 +40,11 @@ How it searches:
   before any run (A770: local memory, work-group size, ID2 divisibility;
   B60: TM divisible by AT). Whatever the host still refuses, a shape that
   does not build or fit, is caught in its log and scores nothing.
-- **Drift:** a reference genome (the shipping defaults) is re-measured
-  every 8 evaluations; each score is a ratio to the preceding re-measure.
+- **Drift:** a reference genome is re-measured every 8 evaluations; each
+  score is a ratio to the preceding re-measure. The end-to-end drivers use
+  the shipping defaults (0014). kqtune.py uses 0013's, because its one
+  KSYNC gene cannot express 0014's split (16 for the fp16 kernels, 32 for
+  the int8 one).
 - **Failures:** a run that fails or times out scores nothing; 5 in a row
   abort.
 
