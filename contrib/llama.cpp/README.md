@@ -744,3 +744,113 @@ each):
   kernels use no local memory).
 - MUL_MAT 1,123/1,123 on both cards; MUL_MAT_ID 338/338 on the A770. On the
   B60 MUL_MAT_ID shows the pin's own 74 MXFP4 failures (0013).
+
+## 0015-opencl-intel-quantized-kv-attention.patch
+
+Attention over a quantized KV cache on the Intel kernels: K and V as q8_0
+or q4_0, the pairs 8:8, 8:4 and 4:4. arcint offers 8:8 and 8:4 with
+`--llama-kv` (`q8_0`, `q8_0:q4_0`): 4:4 misses the answer-level bar on the
+dense 27B (below). q8_0 takes the cache to 53 % of f16, 8:4 to 41 %.
+
+Upstream (`code`):
+- a symmetric q8_0 or q4_0 cache takes the pin's q8_0 / q4_0 attention
+  kernels, and on an Intel card a decode row takes the basic per-row one;
+- an asymmetric pair (8:4) has no kernel: every call dequantizes all of K
+  and V to f32 on the GPU (`ggml_cl_flash_attn_dequant_kv_gpu`), then runs
+  the f32 kernels.
+
+On the dense 27B (B60), q8_0 with the stock kernels (`measured-here`):
+- prefill 201 t/s at 4,096 tokens and 27 t/s at 16k depth;
+- decode 4.65 t/s at 16k.
+
+- **Prompt (`flash_attn_dpas.cl`):** the same kernel, built three more
+  times with `-DKT -DVT` (0 f16, 1 q8_0, 2 q4_0). Only the staging load
+  changes: the tiles go to local memory as f16 either way, so the DPAS
+  part is the f16 kernel's. Both sub-group sizes (B60 16, A770 8).
+- **Decode and verify rows, up to 8 (`flash_attn_f32_f16.cl`):** the three
+  quantized kernels are 0007's K-split decode with a loader in place of the
+  f16 row read. The loader reads lane l's values of a row from the blocks:
+  one byte a lane for q8_0, a nibble for q4_0, the block scale broadcast.
+  The f16 kernel keeps its own body: built from the shared one, it decoded
+  4 % slower on the A770 (below). It is built for sub-group 16 and a head size that is a
+  multiple of 32 (both cards serve it at 16).
+- **Host:** both routes come after the SoA-to-AoS reconstruction, so a
+  quantized tensor uploaded as SoA (test-backend-ops) is read as blocks
+  too. The f16 prompt route moved with them. The dequantization block
+  (GPU, or host for a strided view) is skipped when the decode kernel
+  takes the call; the review checked that the kernel is then always the one
+  dispatched (`code`).
+- **Switches:**
+  - `GGML_OPENCL_FA_DPAS_Q=0` (read at load) leaves a quantized prompt to
+    the upstream kernels;
+  - `GGML_OPENCL_FA_INTEL_SPLIT=0` leaves decode to them, the f16 split
+    decode (0007) included.
+- **Tests:** test-backend-ops gains 90 FLASH_ATTN_EXT cases at the hybrid
+  Qwens' geometry:
+  - head size 256, 24 heads on 4 and 16 on 2;
+  - batch 1, 3, 8, 64 and 512;
+  - KV 512, 1,013 (a partial key tile and split) and 4,096;
+  - for each pair.
+
+  test-backend-ops uploads K/V with `set_tensor`, which stores a q8_0 /
+  q4_0 tensor as SoA, so every case goes through the reconstruction.
+  Served, the cache is filled by SET_ROWS and stays AoS. That path is
+  covered by the KL runs and the acceptance task below, not by these
+  cases.
+- **Test results:**
+  - FLASH_ATTN_EXT: B60 2,733 of 2,734, A770 2,732 of 2,734. All three
+    failures are the pin's own f16 K/V cases (head size 256 with logit
+    softcap; on the A770 also one at head size 64), and they fail before
+    0015 too.
+  - **Red:** two faults injected, a q8_0 decode lane reading the block's
+    upper half and q4_0 prompt staging with offset 7. Then 2,653 of 2,704
+    pass on the B60 (before the tail cases were added). Of the 51
+    failures, 50 come from the faults: the q8 cases at batch 1, 3 and 8,
+    and the q4 cases at batch 32, 64 and 512. The 51st is the softcap
+    case.
+- **f16 decode, 0014 against 0015**, llama-bench tg128, same card,
+  interleaved:
+  - with the f16 kernel built from the shared body: dense B60 19.70 ->
+    19.71 t/s at depth 0 and 17.94 -> 17.94 at 16k, but coder A770
+    47.83-47.84 -> 45.81-46.03 at depth 0 and 43.49-43.62 -> 42.90-43.07
+    at 16k;
+  - with its own body back (as shipped): coder A770 47.84-47.85 ->
+    47.85-47.86 at depth 0, 43.66-43.68 -> 43.64-43.65 at 16k.
+
+Measured (`measured-here`, llama-bench `-fa 1 -r 2`; t/s):
+
+| model, card, KV | prefill 4,096 | decode | prefill at 16k | decode at 16k |
+|---|---|---|---|---|
+| dense 27B, B60, f16 | 934 | 19.7 | 474 | 17.95 |
+| dense 27B, B60, 8:8 | 896 | 18.9 | 435 | 17.1 |
+| dense 27B, B60, 8:4 | 893 | 18.9 | 432 | 17.1 |
+| coder, A770, f16 | 1,435 | 47.85 | 493 | 43.65 |
+| coder, A770, 8:4 | 1,361 | 42.0 | 446 | 38.0 |
+
+(llama-bench decode, no MTP: the served decode with MTP is higher.)
+
+- **KL against the CPU reference** (perplexity window, f16 KV as the
+  baseline arm):
+
+  | model | KV | KL | top-1 |
+  |---|---|---|---|
+  | dense 27B | f16 | 0.004034 | 97.72 % |
+  | dense 27B | 8:8 | 0.003966 | 97.65 % |
+  | dense 27B | 8:4 | 0.005756 | 97.33 % |
+  | dense 27B | 4:4 | 0.007800 | 96.52 % |
+  | coder | f16 | 0.007040 | 96.08 % |
+  | coder | 8:8 | 0.006996 | 95.98 % |
+  | coder | 8:4 | 0.009245 | 95.54 % |
+  | coder | 4:4 | 0.011329 | 95.03 % |
+
+  8:8 and 8:4 are within the answer-level bar. 4:4 is not: top-1 drops by
+  1.2 points on the dense model and 1.05 on the coder.
+- **Context:** the dense 27B served on the B60 with MTP (5 drafts, the
+  40,960-id draft head) at 131,072 tokens of context and an 8:8 cache:
+  - peak VRAM 23.06 GB;
+  - a 128,133-token prompt prefilled at 166 t/s, then decoded at 7.5 t/s
+    at that depth;
+  - the acceptance task 10/10 at temperature 0 (decode 47.1 t/s).
+
+  With an f16 cache and MTP, 131,072 overcommits the card: the copy engine
+  was reset.

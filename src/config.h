@@ -32,6 +32,11 @@ struct Config {
     // or a JSON list); the draft steps then read those rows of the output
     // head instead of all of them
     std::string llama_mtp_vocab;
+    // --llama-kv K[:V]: the libllama engine's attention cache types, f16,
+    // q8_0 or q8_0:q4_0 (V defaults to K). Quantized K/V run on the Intel
+    // attention kernels of contrib/llama.cpp 0015.
+    std::string llama_kv_k = "f16";
+    std::string llama_kv_v = "f16";
     std::string flash_next_ngram_path;  // --flash-next-ngram: FIX D per_layer_token_embd table (24-byte ARCINGRM header + block-quantised payload); admitted only when the artifact's config.json declares an n-gram table (docs/design-qwen-flash-next.md FIX D Link 2)
     // --ngram-gguf: the GGUF shard whose per_layer_token_embd.weight binds a
     // serving-shape IR's `ngram_table.K` ports (backend_ov.cpp

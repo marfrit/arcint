@@ -1015,6 +1015,50 @@ TEST(config_engine_follows_what_was_given) {
     }
 }
 
+TEST(config_llama_kv) {
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf"};
+        CHECK(parse_args(3, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_kv_k, std::string("f16"));
+        CHECK_EQ(cfg.llama_kv_v, std::string("f16"));
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-kv", "q8_0"};
+        CHECK(parse_args(5, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_kv_k, std::string("q8_0"));
+        CHECK_EQ(cfg.llama_kv_v, std::string("q8_0"));   // V defaults to K
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-kv", "q8_0:q4_0"};
+        CHECK(parse_args(5, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_kv_k, std::string("q8_0"));
+        CHECK_EQ(cfg.llama_kv_v, std::string("q4_0"));
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-kv", "q5_0"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // not a type the kernels take
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-kv", "q4_0:q8_0"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // a pair without a kernel
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-kv", "q4_0"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // 4:4 misses the answer-level bar
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--model", "/m/ir", "--llama-kv", "q8_0"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // an --engine llama option
+    }
+}
+
 TEST(config_llama_cpu_moe_and_threads) {
     {
         Config cfg;

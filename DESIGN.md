@@ -1,9 +1,9 @@
 # arcint — Design
 
-Status: **0.5.5**, runtime floor `marfrit-openvino +p25` (patches 0003–0074
+Status: **0.5.6**, runtime floor `marfrit-openvino +p25` (patches 0003–0074
 on the pinned OpenVINO nightly, §1.1; `+p27` for the Flash-Next tier's opt-in
 switches of patches 0076–0077). Since 0.5.5 a second executor serves GGUFs
-through libllama (§7.11). This document states what arcint *is*
+through libllama (§7.11); from 0.5.6 it serves the agent. This document states what arcint *is*
 today: the architecture, the invariants, the gates, and the standing measured
 value of every subsystem. It is not a diary.
 
@@ -1113,10 +1113,12 @@ units with operator-local detail removed):
 
 `src/exec/backend_llama.cpp` runs a GGUF through llama.cpp, pinned at
 `bed0a85`, with ggml's OpenCL backend. arcint's Intel kernels are carried as
-`contrib/llama.cpp/patches` 0001–0014 (`contrib/llama.cpp/README.md`, one
+`contrib/llama.cpp/patches` 0001–0015 (`contrib/llama.cpp/README.md`, one
 section per patch): K-quant and IQ matvecs and XMX GEMMs, the gated
 delta-net, decode and prompt attention, the few-token verify, the B60's
-2D-block GEMM with packed decode and int8 DPAS, and searched tiles.
+2D-block GEMM with packed decode and int8 DPAS, searched tiles, and
+attention over a quantized KV cache (`--llama-kv q8_0` or `q8_0:q4_0`; 4:4
+misses the top-1 bar and is refused).
 
 arcint keeps the HTTP surface, the chat template, the sampler, stop handling
 and the lanes. llama.cpp keeps the weights, the tokenizer, the attention KV
@@ -1128,15 +1130,20 @@ Standing values (`measured-here`, 2026-10-04):
 - **Coder, A770:** decode 79.3 t/s with 4 drafts; prefill 1,431 t/s at
   4,096 tokens.
 - **Dense 27B, B60:** decode 52.6 t/s with 5 drafts; prefill 935 t/s at
-  4,096 tokens; 122,880 tokens of f16 KV without paging.
+  4,096 tokens; 122,880 tokens of f16 KV without paging. The agent service
+  runs it at 131,072 tokens with MTP and an 8:8 cache: peak VRAM 23.06 GB,
+  a 128,133-token prompt at 166 t/s then decode at 7.5 t/s, task 10/10. KL
+  0.003966 with the 8:8 cache.
 - **Answers:** the acceptance task 10/10 at temperature 0 on both. Dense
   KL 0.004034 nats against the CPU reference, against 0.003559 for ggml's
   float kernels on the same card.
 
-Open, and why the services stay on the OpenVINO executor:
-- the coder's context: its Q4_K_M weights leave ~16k on the A770;
-- quantized KV in the attention kernels;
-- a shared prefix cache.
+Open, and why the coder service stays on the OpenVINO executor:
+- the coder's context: its Q4_K_M weights leave ~16k on the A770. Two
+  IQ3_XXS mixes fit 98,304 tokens and pass the task, but miss the top-1 bar
+  by 3.2 and 2.6 points (KL against Q8_0 logits);
+- a shared prefix cache: the agent gave up OpenVINO's 8 GiB prefix cache and
+  4 GiB host KV tier for the switch (operator, 2026-10-04).
 
 `docs/llama-engine.md` has the details.
 

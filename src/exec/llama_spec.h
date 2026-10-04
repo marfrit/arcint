@@ -6,6 +6,7 @@
 #ifdef ARCINT_LLAMA
 
 #include <cstddef>
+#include <ggml.h>
 #include <memory>
 #include <string>
 #include <vector>
@@ -44,7 +45,8 @@ public:
 // made or the draft vocabulary cannot be built.
 std::unique_ptr<LlamaSpec> make_llama_mtp(llama_model* model, llama_context* ctx_tgt, int n_draft, int n_seq,
                                           int n_batch, int n_ubatch, int threads, const std::string& gguf,
-                                          const std::string& vocab, std::string& err);
+                                          const std::string& vocab, ggml_type type_k, ggml_type type_v,
+                                          std::string& err);
 
 }  // namespace lgc
 

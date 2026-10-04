@@ -423,6 +423,9 @@ std::string usage_text() {
         "  --llama-mtp-vocab FILE    libllama: the token ids the MTP head may draft\n"
         "                            (int32, or a JSON list): a draft step reads only\n"
         "                            those rows of the output head\n"
+        "  --llama-kv K[:V]          libllama: the attention cache types, f16, q8_0 or\n"
+        "                            q8_0:q4_0 (default f16): q8_0 takes the cache to\n"
+        "                            53 %, q8_0:q4_0 to 41 %\n"
         "  -h, --help                print this help and exit\n";
 }
 
@@ -474,6 +477,20 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--llama-mtp-vocab") {
             if (!value(v)) return fail("--llama-mtp-vocab needs a file of token ids");
             cfg.llama_mtp_vocab = std::string(v);
+        } else if (arg == "--llama-kv") {
+            if (!value(v)) return fail("--llama-kv needs K[:V] (f16, q8_0 or q8_0:q4_0)");
+            const std::string kv(v);
+            const size_t colon = kv.find(':');
+            cfg.llama_kv_k = kv.substr(0, colon);
+            cfg.llama_kv_v = colon == std::string::npos ? cfg.llama_kv_k : kv.substr(colon + 1);
+            // the pairs contrib/llama.cpp 0015 has Intel attention kernels for
+            // and that pass the answer-level bar: any other pair dequantizes all
+            // of K and V to f32 on every call, and 4:4 drops the dense 27B's
+            // top-1 agreement by 1.2 points (contrib/llama.cpp/README.md)
+            const std::string& k = cfg.llama_kv_k;
+            const std::string& vt = cfg.llama_kv_v;
+            if (!(k == vt && (k == "f16" || k == "q8_0")) && !(k == "q8_0" && vt == "q4_0"))
+                return fail("--llama-kv takes f16, q8_0 or q8_0:q4_0");
         } else if (arg == "--gguf") {
             if (!value(v)) return fail("--gguf needs a path");
             cfg.gguf_path = std::string(v);
@@ -926,8 +943,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         if (cfg.gguf_path.empty()) return fail("--engine llama serves a GGUF: give --gguf");
         if (!cfg.llama_mtp_vocab.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-vocab needs --llama-mtp");
     } else {
-    if (cfg.llama_cpu_moe > 0 || cfg.llama_threads > 0 || cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty())
-        return fail("--llama-cpu-moe, --llama-threads, --llama-mtp and --llama-mtp-vocab are --engine llama options");
+    if (cfg.llama_cpu_moe > 0 || cfg.llama_threads > 0 || cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty() ||
+        cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16")
+        return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab and --llama-kv are --engine llama options");
     if (!cfg.gguf_path.empty() && cfg.model_path.empty()) return fail("--gguf needs --model (the template IR directory)");
     if (!cfg.gguf_path.empty() && !cfg.paged) return fail("--gguf serves on the paged path only");
     }

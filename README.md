@@ -23,7 +23,8 @@ and the runtime each release depends on.
 ## Two engines
 
 arcint has two inference backends behind the same HTTP surface, sampler,
-lanes and chat templates. Production runs on the first.
+lanes and chat templates. The coder service runs on the first; from 0.5.6 the
+agent service runs on the second.
 
 **OpenVINO (the default).** The model is an OpenVINO IR, or a GGUF fed
 through it. Runs on the patched `marfrit-openvino` runtime. arcint owns the
@@ -34,8 +35,8 @@ whole memory picture here:
 - the Flash-Next expert tier between card and RAM;
 - DFlash and MTP drafting.
 
-That is what carries the long contexts the services run at (98,304 tokens
-for the coder, 122,880 for the agent) and Flash-Next at depth.
+That is what carries the coder service's 98,304 tokens (and the agent's
+122,880 before 0.5.6) and Flash-Next at depth.
 
 **libllama (`--engine llama --gguf FILE`).** llama.cpp at a pinned commit
 with ggml's OpenCL backend and arcint's Intel kernels
@@ -56,22 +57,39 @@ fewer bytes than the GGUFs' Q4_K_M. The llama-engine figures are
 llama-bench prefill and served decode on the acceptance prompt, so they are
 not the services' long-context conditions.
 
-Context on the llama engine (`measured-here`, 2026-10-04). Its KV cache is
-f16, and `--n-ctx` defaults to 32,768.
-- **Dense 27B, B60:** serves the agent's 122,880 tokens. 24.4 of 25.7 GB of
-  VRAM in use. A 30,065-token prompt prefills at 528 t/s at `--n-ctx 122880`
-  and at `--n-ctx 32768` alike, so nothing pages. A 120,945-token prompt
-  took 579 s (209 t/s on average). Decode at 30k depth is 16.7 t/s
-  without MTP; MTP at that depth is not measured.
+Context on the llama engine (`measured-here`, 2026-10-04). The KV cache is
+f16 by default; `--llama-kv q8_0` (or `q8_0:q4_0`) quantizes it, on
+arcint's attention kernels (`contrib/llama.cpp` 0015). `--n-ctx` defaults to
+32,768.
+- **Dense 27B, B60:** with f16 KV, 122,880 tokens without MTP: 24.4 of
+  25.7 GB of VRAM in use. A 30,065-token prompt prefills at 528 t/s at
+  `--n-ctx 122880` and at `--n-ctx 32768` alike, so nothing pages. A
+  120,945-token prompt took 579 s (209 t/s on average). With MTP (5 drafts)
+  and `--llama-kv q8_0`, 131,072 tokens:
+  - peak VRAM 23.06 GB;
+  - a 128,133-token prompt in 772 s (166 t/s), then decode at 7.5 t/s at
+    that depth;
+  - the acceptance task 10/10.
+
+  f16 KV with MTP at 131,072 overcommits the card.
 - **Coder, A770:** bound by its weights, not its KV. The Q4_K_M GGUF is
   14.9 GiB on the 16 GB card, while 98,304 tokens of its KV would be
   1.9 GiB. With MTP, VRAM pages over the card's x4 link beyond ~16,384
   tokens (prefill 585 t/s at 24,576).
 
-What keeps production on OpenVINO for now (operator, 2026-10-04):
-- the coder's context: a smaller GGUF (an IQ3_XXS mix) and 8-bit / 8:4 KV
-  in arcint's OpenCL attention kernels are the next steps;
-- a shared prefix cache: a lane reuses only the prefix it still holds;
+Production (operator, 2026-10-04):
+- **The agent (dense 27B, B60) runs the libllama engine from 0.5.6**, at
+  131,072 tokens with MTP and `--llama-kv q8_0`. Measured on llama-bench
+  against the OpenVINO service's extension prefill:
+  - decode with MTP is about twice the OpenVINO service's (47 against 24.6
+    t/s on the acceptance prompt);
+  - prefill is slower: 896 t/s at 4k (OpenVINO 1,141) and 435 at 16k
+    depth (852).
+- **The coder stays on OpenVINO.**
+  - Context: its Q4_K_M GGUF leaves ~16k tokens with MTP on the A770, and
+    the two IQ3_XXS mixes that fit 98,304 miss the top-1 bar.
+  - Prefix cache: the libllama engine has no shared one; a lane reuses only
+    the prefix it still holds.
 - Flash-Next at speed: experts not on the card run on llama.cpp's CPU
   backend (`--llama-cpu-moe`).
 
