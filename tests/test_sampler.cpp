@@ -220,3 +220,68 @@ TEST(sampler_large_vocabulary_top_p_still_finds_the_mass) {
     CHECK(id >= 0);
     CHECK(id < 8000);
 }
+
+TEST(sampler_respects_min_p) {
+    // llama.cpp's min-p: keep p >= min_p * p_max on the logits before
+    // temperature. Logits 0, -1, -3, -8: ratios to the top 1, 0.37, 0.05,
+    // 0.0003. min_p 0.1 keeps tokens 0 and 1 only, whatever the temperature.
+    auto           l = logits({0.0f, -1.0f, -3.0f, -8.0f});
+    std::map<int, int> seen;
+    SamplerParams  p = sampling_params(2.0f, 0, 1.0f);
+    p.min_p          = 0.1f;
+    Sampler        s(p, 7);
+    for (int i = 0; i < 400; ++i) {
+        auto c = l;
+        ++seen[s.sample(c.data(), c.size())];
+    }
+    CHECK(seen.count(0) && seen.count(1));
+    CHECK(!seen.count(2) && !seen.count(3));
+}
+
+TEST(sampler_min_p_over_a_large_vocabulary_without_top_k) {
+    // top_k 0 samples from a probe of the largest logits; min-p closes the
+    // set inside the probe, so tokens far down the vocabulary never appear
+    std::vector<float> l(200000, -20.0f);
+    l[5] = 0.0f;
+    l[9] = -0.5f;
+    SamplerParams p = sampling_params(1.5f, 0, 1.0f);
+    p.min_p         = 0.05f;
+    Sampler s(p, 3);
+    for (int i = 0; i < 200; ++i) {
+        auto c = l;
+        const int t = s.sample(c.data(), c.size());
+        CHECK(t == 5 || t == 9);
+    }
+}
+
+TEST(sampler_top_p_on_the_probe_uses_the_whole_vocabulary) {
+    // top_k 0 takes a probe of the largest logits. 4000 equal logits: the
+    // probe holds about half the mass, so top_p 0.9 needs tokens beyond it.
+    // Normalised within the probe alone, the nucleus would stop inside it.
+    std::vector<float> l(4000, 0.0f);
+    SamplerParams p = sampling_params(1.0f, 0, 0.9f);
+    Sampler s(p, 5);
+    int beyond = 0;
+    for (int i = 0; i < 400; ++i) {
+        auto c = l;
+        if (s.sample(c.data(), c.size()) >= 2048) ++beyond;
+    }
+    CHECK(beyond > 100);
+}
+
+TEST(sampler_min_p_with_top_p) {
+    // both cuts keep a prefix of the sorted order: the result is the shorter
+    // one. Logits 0, -0.1, -0.2, -5: min_p 0.5 keeps three, top_p 0.5 keeps
+    // the first two (each about a third of the mass)
+    auto           l = logits({0.0f, -0.1f, -0.2f, -5.0f});
+    std::map<int, int> seen;
+    SamplerParams  p = sampling_params(1.0f, 0, 0.5f);
+    p.min_p          = 0.5f;
+    Sampler        s(p, 9);
+    for (int i = 0; i < 400; ++i) {
+        auto c = l;
+        ++seen[s.sample(c.data(), c.size())];
+    }
+    CHECK(seen.count(0) && seen.count(1));
+    CHECK(!seen.count(2) && !seen.count(3));
+}

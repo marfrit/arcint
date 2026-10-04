@@ -2,6 +2,10 @@
 
 #include "harness.h"
 
+#include <string>
+#include <utility>
+#include <vector>
+
 using namespace lgc;
 
 TEST(reasoning_split_when_the_template_opened_the_block) {
@@ -61,4 +65,77 @@ TEST(reasoning_streamer_undecided_start_resolves_both_ways) {
     for (std::string_view p : {"<thi", "nk>\nplan</think>\n", "go"}) { auto s = self_opened.push(p); r += s.reasoning; c += s.content; }
     CHECK_EQ(r, std::string("\nplan"));
     CHECK_EQ(c, std::string("go"));
+}
+
+TEST(reasoning_split_other_think_tags) {
+    // Cydonia 24B (Mistral Small 3.2) thinks in <thinking>, Magistral tunes in [THINK]
+    const auto a = split_reasoning("<thinking>\nplot first\n</thinking>\n\nThe storm broke.", false, true);
+    CHECK(a.closed);
+    CHECK_EQ(a.reasoning, std::string("plot first"));
+    CHECK_EQ(a.content, std::string("The storm broke."));
+    const auto b = split_reasoning("[THINK]weigh it[/THINK]Answer.", false, true);
+    CHECK_EQ(b.reasoning, std::string("weigh it"));
+    CHECK_EQ(b.content, std::string("Answer."));
+    // a closer of another pair does not close the block
+    const auto c = split_reasoning("<thinking>a </think> b</thinking>c", false, true);
+    CHECK_EQ(c.reasoning, std::string("a </think> b"));
+    CHECK_EQ(c.content, std::string("c"));
+}
+
+TEST(reasoning_streamer_other_think_tags) {
+    ReasoningStreamer st(false, true);
+    std::string r, c;
+    for (std::string_view p : {"<thi", "nking>\nplot", " first</think", "ing>\n\nThe storm", " broke."}) {
+        auto s = st.push(p); r += s.reasoning; c += s.content;
+    }
+    const auto t = st.flush(); r += t.reasoning; c += t.content;
+    CHECK_EQ(r, std::string("\nplot first"));
+    CHECK_EQ(c, std::string("The storm broke."));
+    ReasoningStreamer m(false, true);
+    std::string r2, c2;
+    for (std::string_view p : {"[TH", "INK]x[/TH", "INK]y"}) { auto s = m.push(p); r2 += s.reasoning; c2 += s.content; }
+    CHECK_EQ(r2, std::string("x"));
+    CHECK_EQ(c2, std::string("y"));
+}
+
+TEST(reasoning_other_tags_only_when_extended) {
+    // the Qwens keep <think> alone: an answer that merely starts with the
+    // other tags stays content (a swallowed answer would lose tool calls)
+    const auto a = split_reasoning("<thinking>x</thinking>y", false);
+    CHECK(!a.closed);
+    CHECK_EQ(a.content, std::string("<thinking>x</thinking>y"));
+    ReasoningStreamer q(false);
+    std::string r, c;
+    for (std::string_view p : {"[THI", "NK]x[/THINK]y"}) { auto s = q.push(p); r += s.reasoning; c += s.content; }
+    const auto t = q.flush(); r += t.reasoning; c += t.content;
+    CHECK(r.empty());
+    CHECK_EQ(c, std::string("[THINK]x[/THINK]y"));
+}
+
+TEST(reasoning_extended_edges) {
+    // the <think> / <thinking> boundary across pieces
+    auto run = [](std::vector<std::string_view> pieces) {
+        ReasoningStreamer st(false, true);
+        std::pair<std::string, std::string> rc;
+        for (auto p : pieces) { auto s = st.push(p); rc.first += s.reasoning; rc.second += s.content; }
+        auto t = st.flush(); rc.first += t.reasoning; rc.second += t.content;
+        return rc;
+    };
+    CHECK(run({"<think", ">x</think>y"}) == std::make_pair(std::string("x"), std::string("y")));
+    CHECK(run({"<think", "ing>x</thinking>y"}) == std::make_pair(std::string("x"), std::string("y")));
+    CHECK(run({"<think>", "ing>a</think>b"}) == std::make_pair(std::string("ing>a"), std::string("b")));
+    // unclosed: all reasoning
+    const auto u = split_reasoning("[THINK]still going", false, true);
+    CHECK(!u.closed);
+    CHECK_EQ(u.reasoning, std::string("still going"));
+    CHECK(u.content.empty());
+    // a pre-opened <think> is closed only by </think>
+    const auto o = split_reasoning("a</thinking>b[/THINK]c</think>d", true, true);
+    CHECK_EQ(o.reasoning, std::string("a</thinking>b[/THINK]c"));
+    CHECK_EQ(o.content, std::string("d"));
+    // leading whitespace, near misses, case
+    CHECK_EQ(split_reasoning("\n [THINK]p[/THINK]q", false, true).content, std::string("q"));
+    CHECK_EQ(split_reasoning("<thinkpad> is a laptop", false, true).content, std::string("<thinkpad> is a laptop"));
+    CHECK_EQ(split_reasoning("[THINKING] no", false, true).content, std::string("[THINKING] no"));
+    CHECK_EQ(split_reasoning("[think]x[/think]y", false, true).content, std::string("[think]x[/think]y"));
 }

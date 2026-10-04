@@ -328,16 +328,19 @@ run is byte-identical to a cold one, per lane, with the other lane active
 
 ### 3.6 Sampling
 
-Greedy, temperature, top-k, top-p, repetition, presence and frequency
+Greedy, temperature, top-k, top-p, min-p, repetition, presence and frequency
 penalties, host-side (`src/core/sampler.cpp`). Penalties apply before the
-greedy decision. Seeded; an unseeded request gets a logged seed. Defaults
-chain request > operator flags (`--temp`, `--top-p`, `--top-k`,
-`--repetition-penalty`, `--presence-penalty`,
-`--chat-template-kwarg enable_thinking=BOOL`) > artifact
-`generation_config.json` > model-card defaults; `/props` reports values and
-provenance. `code`. Current scope: no `min_p` sampler and no flag for it
-(open item: llama.cpp's sampler chain offers `min_p` as `--min-p`, `paper`:
-its documentation).
+greedy decision. min-p (since 0.5.9, for role play, operator 2026-10-04)
+follows llama.cpp (`src/llama-sampler.cpp` `llama_sampler_min_p_apply`,
+`code`): it keeps p >= min_p · p_max on the logits before temperature, after
+top-p; both cuts keep a prefix of the sorted candidates. Top-p is taken on
+the tempered probabilities, normalised over the whole vocabulary also when
+only a probe of the largest logits was sorted. Seeded; an unseeded request
+gets a logged seed. Defaults chain request > operator flags (`--temp`,
+`--top-p`, `--top-k`, `--min-p`, `--repetition-penalty`,
+`--presence-penalty`, `--chat-template-kwarg enable_thinking=BOOL`) >
+artifact `generation_config.json` > model-card defaults; `/props` reports
+values and provenance. `code`.
 
 ### 3.7 Tokenizer, templates, tool calls
 

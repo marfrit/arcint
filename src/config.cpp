@@ -305,6 +305,8 @@ std::string usage_text() {
         "                            lets the MTP drafter engage)\n"
         "  --top-p X                 default nucleus mass\n"
         "  --top-k N                 default top-k (0 disables)\n"
+        "  --min-p X                 default min-p: keep p >= X * p_max, before\n"
+        "                            temperature, as llama.cpp (0 disables)\n"
         "  --repetition-penalty X    default repetition penalty\n"
         "  --presence-penalty X      default presence penalty\n"
         "  --chat-template-kwarg enable_thinking=BOOL\n"
@@ -599,6 +601,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             double d = 0.0;
             if (!value(v) || !parse_double(v, d)) return fail("--top-p needs a number");
             cfg.top_p = static_cast<float>(d);
+        } else if (arg == "--min-p") {
+            double d = 0.0;
+            if (!value(v) || !parse_double(v, d)) return fail("--min-p needs a number");
+            cfg.min_p = static_cast<float>(d);
         } else if (arg == "--top-k") {
             int k = 0;
             if (!value(v) || !parse_int(v, k)) return fail("--top-k needs an integer");
@@ -1020,6 +1026,7 @@ std::optional<std::string> apply_operator_defaults(const Config& cfg, SamplerDef
     o.temperature        = cfg.temp;
     o.top_p              = cfg.top_p;
     o.top_k              = cfg.top_k;
+    o.min_p              = cfg.min_p;
     o.repetition_penalty = cfg.repetition_penalty;
     o.presence_penalty   = cfg.presence_penalty;
     return sampler_defaults_apply(d, o);

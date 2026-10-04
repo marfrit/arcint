@@ -196,6 +196,7 @@ struct Config {
     // regime came from. Unset means "the artifact decides", exactly as before.
     std::optional<float> temp;
     std::optional<float> top_p;
+    std::optional<float> min_p;
     std::optional<int>   top_k;
     std::optional<float> repetition_penalty;
     std::optional<float> presence_penalty;

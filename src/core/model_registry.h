@@ -44,6 +44,7 @@ struct SamplerDefaults {
     float temperature        = 0.7f;
     float top_p              = 0.8f;
     int   top_k              = 20;
+    float min_p              = 0.0f;
     float repetition_penalty = 1.05f;
     float presence_penalty   = 0.0f;
 

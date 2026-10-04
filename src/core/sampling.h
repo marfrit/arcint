@@ -7,8 +7,8 @@
 
 #include "core/model_registry.h"
 
-// DESIGN.md §3.6. Greedy, temperature, top-k, top-p, repetition penalty —
-// nothing else in v1. Model-aware defaults come from the allowlist entry;
+// DESIGN.md §3.6. Greedy, temperature, top-k, top-p, min-p, repetition
+// penalty (min-p since 0.5.9, for role play: operator, 2026-10-04). Model-aware defaults come from the allowlist entry;
 // explicit request fields always win.
 namespace lgc {
 
@@ -16,6 +16,9 @@ struct SamplerParams {
     float    temperature        = 0.7f;
     float    top_p              = 0.8f;
     int      top_k              = 20;
+    // llama.cpp's min-p: keep the tokens with p >= min_p * p_max, on the
+    // logits before temperature (0 disables)
+    float    min_p              = 0.0f;
     float    repetition_penalty = 1.05f;
     float    presence_penalty   = 0.0f;
     float    frequency_penalty  = 0.0f;
@@ -36,6 +39,7 @@ struct SamplerOverrides {
     std::optional<float>                    temperature;
     std::optional<float>                    top_p;
     std::optional<int>                      top_k;
+    std::optional<float>                    min_p;
     std::optional<float>                    repetition_penalty;
     std::optional<float>                    presence_penalty;
     std::optional<float>                    frequency_penalty;
