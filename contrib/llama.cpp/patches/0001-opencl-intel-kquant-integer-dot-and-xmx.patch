@@ -1,0 +1,1337 @@
+diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
+index 97b862a..cfe16bd 100644
+--- a/ggml/src/ggml-opencl/CMakeLists.txt
++++ b/ggml/src/ggml-opencl/CMakeLists.txt
+@@ -98,6 +98,8 @@ set(GGML_OPENCL_KERNELS
+     mul_mv_q4_1_f32_flat
+     mul_mv_q4_k_f32
+     mul_mv_q4_k_f32_flat
++    mul_mv_kq_q8_1
++    mul_mm_kq_f16
+     mul_mv_q5_0_f32
+     mul_mv_q5_0_f32_flat
+     mul_mv_q5_1_f32
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 4f1f937..658f2df 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -628,6 +628,23 @@ struct ggml_cl_adreno_xmem_attn_state {
+ #endif
+ 
+ // backend context
++// Intel K-quant kernels: which activation a conversion buffer holds
++struct ggml_cl_kq_act {
++    const ggml_tensor * src1 = nullptr;
++    cl_mem              mem  = nullptr;
++    cl_ulong            off  = 0;
++    int                 n    = 0;
++    uint64_t            gen  = 0;
++};
++
++// a K-quant fp16-DPAS GEMM tile: NSGM x NSGN sub-groups of RG*8 rows x TG*SG columns
++struct ggml_cl_kq_tile {
++    int rg = 4, tg = 4, nsgm = 2, nsgn = 8;
++    int mt() const { return nsgm * rg * 8; }
++    int nt(int sg) const { return nsgn * tg * sg; }
++    int nsg() const { return nsgm * nsgn; }
++};
++
+ struct ggml_backend_opencl_context {
+     int ref_count;
+ 
+@@ -656,6 +673,7 @@ struct ggml_backend_opencl_context {
+     bool has_vector_subgroup_broadcast;
+     bool has_subgroup_shuffle = false;       // cl_khr_subgroup_shuffle or cl_qcom_subgroup_shuffle
+     bool has_integer_dot      = false;       // cl_khr_integer_dot_product or cl_qcom_dot_product8
++    bool has_intel_dpas       = false;       // cl_intel_subgroup_matrix_multiply_accumulate
+     bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
+     bool disable_fusion;
+     bool fuse_mm_glu = true;                     // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
+@@ -713,6 +731,17 @@ struct ggml_backend_opencl_context {
+     ggml_cl_buffer prealloc_moe_sa;   // per-block s  [tok_slots * ne00/32] (half)
+     // scratch copy of the router weights to avoid dst aliasing
+     ggml_cl_buffer prealloc_moe_combine_w;
++    ggml_cl_buffer prealloc_kq_xq;   // q8_1 activation of the K-quant matvec: int8 codes
++    ggml_cl_buffer prealloc_kq_xd;   // per-32 scale (float)
++    ggml_cl_buffer prealloc_kq_xs;   // per-32 sum (float)
++    // what the activation buffers hold, and the graph count that dates it
++    ggml_cl_kq_act kq_q8, kq_f16;
++    uint64_t       graph_gen = 0;
++    ggml_cl_buffer prealloc_kq_xh;     // f16 activation of the K-quant GEMMs
++    ggml_cl_buffer prealloc_kq_xscale; // and its per-column scale
++    ggml_cl_buffer prealloc_kq_pairs;  // MUL_MAT_ID GEMM: (token, slot) pairs sorted by expert
++    ggml_cl_buffer prealloc_kq_tiles;  // its tiles (expert, first pair, count)
++    ggml_cl_buffer prealloc_kq_ntiles; // and their number
+     ggml_cl_buffer prealloc_splitk_partial;  // [ksplit * M] partials for split-K GEMV
+ 
+     // pool of persistent image1d_buffer views over kv-cache layers, keyed by
+@@ -946,6 +975,22 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_mul_mv_q5_1_f32_flat;
+     cl_kernel kernel_mul_mv_q4_K_f32;
+     cl_kernel kernel_mul_mv_q4_K_f32_flat;
++    // Intel: K-quant x q8_1 matvec with integer dot products (mul_mv_kq_q8_1.cl)
++    cl_kernel kernel_kq_quantize_q8_1 = nullptr;
++    // [columns - 1][Q4_K, Q5_K, Q6_K]: one build per column count, 1 to 4
++    cl_kernel kernel_mul_mv_kq_q8_1[4][3] = {};
++    cl_kernel kernel_mul_mv_id_q4_K_q8_1 = nullptr;
++    cl_kernel kernel_mul_mv_id_q5_K_q8_1 = nullptr;
++    cl_kernel kernel_mul_mv_id_q6_K_q8_1 = nullptr;
++    // Intel: K-quant x f16 GEMM on the XMX units (mul_mm_kq_f16.cl), per type
++    // (Q4_K, Q5_K, Q6_K), plain and MUL_MAT_ID; the sub-group size and tiles
++    cl_kernel kernel_kq_cvt_f32_f16 = nullptr;
++    cl_kernel kernel_mul_mm_kq_f16[3]    = { nullptr, nullptr, nullptr };
++    cl_kernel kernel_mul_mm_id_kq_f16[3] = { nullptr, nullptr, nullptr };
++    cl_kernel kernel_moe_route_tiles = nullptr;
++    int             kq_mm_sg = 16;
++    ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
++    int       kq_q8_1_ndst = 4;
+     cl_kernel kernel_mul_mv_q5_K_f32;
+     cl_kernel kernel_mul_mv_q5_K_f32_flat;
+     cl_kernel kernel_mul_mv_q6_K_f32;
+@@ -1405,6 +1450,22 @@ static cl_program build_program_from_source(ggml_backend_opencl_context * backen
+     return p;
+ }
+ 
++// As build_program_from_source, but a failed build returns nullptr (logged)
++// instead of exiting: for optional, device-specific kernels.
++static cl_program build_program_from_source_optional(ggml_backend_opencl_context * backend_ctx, const char * program_buffer,
++                                                     const std::string & compile_opts) {
++    cl_program p = cl_program_cache_try_load(backend_ctx->program_cache, backend_ctx->context, backend_ctx->device,
++                                             program_buffer, compile_opts);
++    if (p != nullptr) {
++        return p;
++    }
++    p = build_program_from_source_ex(backend_ctx->context, backend_ctx->device, program_buffer, compile_opts, /*fatal=*/false);
++    if (p != nullptr) {
++        cl_program_cache_try_save(backend_ctx->program_cache, p, backend_ctx->device, program_buffer, compile_opts);
++    }
++    return p;
++}
++
+ static cl_program build_program_from_binary(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, size_t bin_size = 0) {
+     cl_program p;
+     char *program_log;
+@@ -1469,6 +1530,19 @@ static bool use_adreno_bin_kernels(ggml_backend_opencl_context * backend_ctx) {
+ #endif // GGML_OPENCL_USE_ADRENO_BIN_KERNELS
+ }
+ 
++#ifndef CL_DEVICE_SUB_GROUP_SIZES_INTEL
++#define CL_DEVICE_SUB_GROUP_SIZES_INTEL 0x4108   // cl_intel_required_subgroup_size
++#endif
++
++// Intel with integer dot products: the K-quant x q8_1 kernels (mul_mv_kq_q8_1.cl)
++// take K-quant MUL_MAT columns and K-quant MUL_MAT_ID. GGML_OPENCL_KQ_Q8_1=0
++// keeps the float kernels (and the experts of a K-quant MoE off the device).
++static bool kq_q8_1_enabled(const ggml_backend_opencl_context * backend_ctx) {
++    static const char * kq_env = getenv("GGML_OPENCL_KQ_Q8_1");
++    static const bool   kq_on  = kq_env == nullptr || atoi(kq_env) != 0;
++    return kq_on && backend_ctx->gpu_family == INTEL && backend_ctx->has_integer_dot;
++}
++
+ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+     if (backend_ctx->kernels_loaded) {
+         return;
+@@ -2019,6 +2093,120 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+         GGML_LOG_CONT(".");
+     }
+ 
++    // mul_mv_kq_q8_1: Intel K-quant matvec on integer dot products. Rows per
++    // subgroup: 2 on Alchemist (A-series), 4 on Battlemage (measured on an
++    // A770 and a B60); GGML_OPENCL_KQ_Q8_1=0 keeps the float kernels.
++    {
++        if (kq_q8_1_enabled(backend_ctx)) {
++#ifdef GGML_OPENCL_EMBED_KERNELS
++            const std::string kernel_src {
++                #include "mul_mv_kq_q8_1.cl.h"
++            };
++#else
++            const std::string kernel_src = read_file("mul_mv_kq_q8_1.cl");
++#endif
++            // Xe-HPG (Alchemist) runs DPAS at sub-group size 8 and is the
++            // one with size 8 among the DPAS devices (Xe2 and Xe-HPC: 16, 32)
++            size_t sg_sizes[8] = {};
++            size_t sg_bytes = 0;
++            clGetDeviceInfo(backend_ctx->device, CL_DEVICE_SUB_GROUP_SIZES_INTEL, sizeof(sg_sizes), sg_sizes, &sg_bytes);
++            bool sg8 = false;
++            for (size_t i = 0; i < sg_bytes / sizeof(size_t); ++i) {
++                sg8 = sg8 || sg_sizes[i] == 8;
++            }
++            const char * nd_env = getenv("GGML_OPENCL_KQ_Q8_1_NDST");
++            backend_ctx->kq_q8_1_ndst = std::max(1, nd_env ? atoi(nd_env) : (sg8 ? 2 : 4));
++            // one build per column count; 2 to 4 columns keep their per-column
++            // values in registers only with 256 GRF (measured-here, A770: 4
++            // columns 106 -> 355 GB/s on Q4_K, the cost of one column). A build
++            // the device refuses leaves its kernels null: ggml's path then.
++            const char * mv_n[3] = { "kernel_mul_mv_q4_K_q8_1", "kernel_mul_mv_q5_K_q8_1", "kernel_mul_mv_q6_K_q8_1" };
++            for (int nc = 1; nc <= 4; ++nc) {
++                const std::string opts = compile_opts + " -DN_DST=" + std::to_string(backend_ctx->kq_q8_1_ndst) +
++                    " -DN_SIMDGROUP=4 -DNCOLS=" + std::to_string(nc) + (nc > 1 ? " -cl-intel-256-GRF-per-thread" : "");
++                cl_program prog = build_program_from_source_optional(backend_ctx, kernel_src.c_str(), opts);
++                if (prog == nullptr) {
++                    GGML_LOG_WARN("ggml_opencl: K-quant matvec for %d column(s) not built; ggml's kernels take it\n", nc);
++                    continue;
++                }
++                for (int i = 0; i < 3; ++i) {
++                    CL_CHECK((backend_ctx->kernel_mul_mv_kq_q8_1[nc - 1][i] = clCreateKernel(prog, mv_n[i], &err), err));
++                }
++                if (nc == 1) {
++                    CL_CHECK((backend_ctx->kernel_kq_quantize_q8_1 = clCreateKernel(prog, "kernel_quantize_q8_1", &err), err));
++                    CL_CHECK((backend_ctx->kernel_mul_mv_id_q4_K_q8_1 = clCreateKernel(prog, "kernel_mul_mv_id_q4_K_q8_1", &err), err));
++                    CL_CHECK((backend_ctx->kernel_mul_mv_id_q5_K_q8_1 = clCreateKernel(prog, "kernel_mul_mv_id_q5_K_q8_1", &err), err));
++                    CL_CHECK((backend_ctx->kernel_mul_mv_id_q6_K_q8_1 = clCreateKernel(prog, "kernel_mul_mv_id_q6_K_q8_1", &err), err));
++                }
++                CL_CHECK(clReleaseProgram(prog));
++                GGML_LOG_CONT(".");
++            }
++
++            // the GEMM: fp16 DPAS at the device's DPAS sub-group size. Tiles
++            // (measured-here: an A770 at 2000 MHz, a B60), rows x columns per
++            // work-group: plain SG 8 32 x 512, SG 16 64 x 256; MUL_MAT_ID
++            // (tiles of one expert's pairs) 16 x 32 on both.
++            // GGML_OPENCL_KQ_MM=0 keeps ggml's GEMM; GGML_OPENCL_KQ_MM_TILE /
++            // GGML_OPENCL_KQ_MM_ID_TILE = "RG,TG,NSGM,NSGN" override.
++            static const char * mm_env = getenv("GGML_OPENCL_KQ_MM");
++            if (backend_ctx->has_intel_dpas && backend_ctx->kernel_kq_quantize_q8_1 != nullptr &&
++                (mm_env == nullptr || atoi(mm_env) != 0)) {
++#ifdef GGML_OPENCL_EMBED_KERNELS
++                const std::string mm_src {
++                    #include "mul_mm_kq_f16.cl.h"
++                };
++#else
++                const std::string mm_src = read_file("mul_mm_kq_f16.cl");
++#endif
++                cl_ulong local_mem = 0;
++                clGetDeviceInfo(backend_ctx->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(local_mem), &local_mem, NULL);
++                backend_ctx->kq_mm_sg = sg8 ? 8 : 16;
++                backend_ctx->kq_mm_plain = sg8 ? ggml_cl_kq_tile{ 4, 4, 1, 16 } : ggml_cl_kq_tile{ 4, 4, 2, 8 };
++                backend_ctx->kq_mm_id    = sg8 ? ggml_cl_kq_tile{ 2, 4, 1, 1 }  : ggml_cl_kq_tile{ 2, 2, 1, 1 };
++                for (auto [env, tile] : { std::pair<const char *, ggml_cl_kq_tile *>{ "GGML_OPENCL_KQ_MM_TILE", &backend_ctx->kq_mm_plain },
++                                          std::pair<const char *, ggml_cl_kq_tile *>{ "GGML_OPENCL_KQ_MM_ID_TILE", &backend_ctx->kq_mm_id } }) {
++                    if (const char * t = getenv(env)) {
++                        ggml_cl_kq_tile v;
++                        const bool ok = sscanf(t, "%d,%d,%d,%d", &v.rg, &v.tg, &v.nsgm, &v.nsgn) == 4 &&
++                                        v.rg > 0 && v.tg > 0 && v.nsgm > 0 && v.nsgn > 0 &&
++                                        (cl_ulong)v.mt() * 256 * sizeof(cl_half) <= local_mem &&
++                                        (size_t)v.nsg() * backend_ctx->kq_mm_sg <= backend_ctx->max_workgroup_size;
++                        if (ok) {
++                            *tile = v;
++                        } else {
++                            GGML_LOG_WARN("ggml_opencl: %s=%s ignored (tile does not fit the device)\n", env, t);
++                        }
++                    }
++                }
++                const char * mm_n[3] = { "kernel_mul_mm_q4_K_f16", "kernel_mul_mm_q5_K_f16", "kernel_mul_mm_q6_K_f16" };
++                const char * id_n[3] = { "kernel_mul_mm_id_q4_K_f16", "kernel_mul_mm_id_q5_K_f16", "kernel_mul_mm_id_q6_K_f16" };
++                for (int pass = 0; pass < 2; ++pass) {
++                    const ggml_cl_kq_tile & t = pass == 0 ? backend_ctx->kq_mm_plain : backend_ctx->kq_mm_id;
++                    const std::string mm_opts = compile_opts + " -cl-intel-256-GRF-per-thread" +
++                        " -DSG=" + std::to_string(backend_ctx->kq_mm_sg) + " -DRG=" + std::to_string(t.rg) +
++                        " -DTG=" + std::to_string(t.tg) + " -DNSGM=" + std::to_string(t.nsgm) + " -DNSGN=" + std::to_string(t.nsgn);
++                    cl_program mm_prog = build_program_from_source_optional(backend_ctx, mm_src.c_str(), mm_opts);
++                    if (mm_prog == nullptr) {
++                        GGML_LOG_WARN("ggml_opencl: K-quant XMX GEMM (%s) not built; ggml's kernels take it\n", pass == 0 ? "MUL_MAT" : "MUL_MAT_ID");
++                        continue;
++                    }
++                    if (pass == 0) {
++                        CL_CHECK((backend_ctx->kernel_kq_cvt_f32_f16 = clCreateKernel(mm_prog, "kernel_cvt_f32_f16", &err), err));
++                        CL_CHECK((backend_ctx->kernel_moe_route_tiles = clCreateKernel(mm_prog, "kernel_moe_route_tiles", &err), err));
++                    }
++                    if (backend_ctx->kernel_kq_cvt_f32_f16 != nullptr) {
++                        for (int i = 0; i < 3; ++i) {
++                            cl_kernel & k = pass == 0 ? backend_ctx->kernel_mul_mm_kq_f16[i] : backend_ctx->kernel_mul_mm_id_kq_f16[i];
++                            CL_CHECK((k = clCreateKernel(mm_prog, pass == 0 ? mm_n[i] : id_n[i], &err), err));
++                        }
++                    }
++                    CL_CHECK(clReleaseProgram(mm_prog));
++                    GGML_LOG_CONT(".");
++                }
++            }
++        }
++    }
++
+     // mul_mv_q5_0_f32
+     {
+ #ifdef GGML_OPENCL_EMBED_KERNELS
+@@ -6741,6 +6929,10 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+     // while cl_khr_integer_dot_product uses signed * signed -- we stick with khr for now
+     backend_ctx->has_integer_dot =
+         strstr(ext_buffer.data(), "cl_khr_integer_dot_product") != NULL;
++    backend_ctx->has_intel_dpas =
++        strstr(ext_buffer.data(), "cl_intel_subgroup_matrix_multiply_accumulate") != NULL &&
++        strstr(ext_buffer.data(), "cl_intel_subgroup_local_block_io") != NULL &&
++        strstr(ext_buffer.data(), "cl_intel_subgroups_short") != NULL;
+ 
+     cl_uint base_align_in_bits;
+     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(cl_uint), &base_align_in_bits, NULL));
+@@ -8417,6 +8609,7 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
+ 
+ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
++    backend_ctx->graph_gen++;
+ 
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
+@@ -9084,6 +9277,16 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                 // trans-weight GEMM, which needs both a GEMM kernel for the type and
+                 // use_adreno_kernels(). Decline the large-N shapes that would otherwise
+                 // fall through to the GEMV.
++#ifdef GGML_OPENCL_SOA_Q
++                // Intel's K-quant XMX GEMM takes any column count (ggml_cl_mul_mm_kq_f16)
++                if ((op->src[0]->type == GGML_TYPE_Q4_K || op->src[0]->type == GGML_TYPE_Q5_K ||
++                     op->src[0]->type == GGML_TYPE_Q6_K) && kq_q8_1_enabled(backend_ctx) && backend_ctx->has_intel_dpas &&
++                    op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 256 == 0 &&
++                    op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 && op->src[0]->view_offs == 0 &&
++                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op)) {
++                    return true;
++                }
++#endif
+                 {
+                     const ggml_type t = op->src[0]->type;
+                     const bool type_has_gemm = (t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 ||
+@@ -9113,6 +9316,13 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                     return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+                 }
+             }
++#ifdef GGML_OPENCL_SOA_Q
++            if ((op->src[0]->type == GGML_TYPE_Q4_K || op->src[0]->type == GGML_TYPE_Q5_K ||
++                 op->src[0]->type == GGML_TYPE_Q6_K) && kq_q8_1_enabled(backend_ctx)) {
++                return op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 256 == 0 && op->src[0]->view_offs == 0 &&
++                       ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
++            }
++#endif
+             // q4_0, q8_0 and mxfp4 have general MUL_MAT_ID support,
+             // the quantizations here currently do not - they are only supported by Adreno with certain shapes
+             if (op->src[0]->type == GGML_TYPE_Q4_1 ||
+@@ -23384,6 +23594,195 @@ static cl_mem ggml_cl_img_pool_get_or_create(
+     return img;
+ }
+ 
++
++#ifdef GGML_OPENCL_SOA_Q
++// The activation of the Intel K-quant kernels: src1 (n_vals contiguous f32)
++// as q8_1 in prealloc_kq_{xq,xd,xs} (the matvecs) or as f16 in
++// prealloc_kq_xh (the GEMMs), unless the buffer already holds it from this
++// graph -- within one graph a computed tensor does not change before its last
++// consumer (ggml-alloc reuses memory in place only for a single child), so
++// matmuls that share an input (q/k/v, gate/up) convert it once. The key is the
++// tensor, its buffer, offset and size, and the graph count; a graph that wrote
++// into a view of a matmul input between two of its consumers would defeat it
++// (llama.cpp's graphs do not).
++// GGML_OPENCL_KQ_DEDUP=0 converts every time.
++static bool ggml_cl_kq_cached(const ggml_cl_kq_act & c, const ggml_backend_opencl_context * backend_ctx,
++                              const ggml_tensor * src1, cl_mem mem, cl_ulong off, int n_vals) {
++    static const char * dd_env = getenv("GGML_OPENCL_KQ_DEDUP");
++    static const bool   dd_on  = dd_env == nullptr || atoi(dd_env) != 0;
++    return dd_on && c.src1 == src1 && c.gen == backend_ctx->graph_gen && c.mem == mem && c.off == off && c.n == n_vals;
++}
++
++static void ggml_cl_kq_quantize_src1(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src1,
++                                     int n_vals, const ggml_tensor * dst) {
++    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
++    const cl_ulong offset1 = extra1->offset + src1->view_offs;
++    if (ggml_cl_kq_cached(backend_ctx->kq_q8, backend_ctx, src1, extra1->data_device, offset1, n_vals)) {
++        return;
++    }
++    // codes and residual codes, scales and residual scales (mul_mv_kq_q8_1.cl)
++    const int n32 = n_vals / 32;
++    backend_ctx->prealloc_kq_xq.allocate(backend_ctx->context, (size_t)n_vals * 2);
++    backend_ctx->prealloc_kq_xd.allocate(backend_ctx->context, (size_t)n32 * 2 * sizeof(float));
++    backend_ctx->prealloc_kq_xs.allocate(backend_ctx->context, (size_t)n32 * sizeof(float));
++    cl_kernel kq = backend_ctx->kernel_kq_quantize_q8_1;
++    CL_CHECK(clSetKernelArg(kq, 0, sizeof(cl_mem),   &extra1->data_device));
++    CL_CHECK(clSetKernelArg(kq, 1, sizeof(cl_ulong), &offset1));
++    CL_CHECK(clSetKernelArg(kq, 2, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xq.buffer));
++    CL_CHECK(clSetKernelArg(kq, 3, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xd.buffer));
++    CL_CHECK(clSetKernelArg(kq, 4, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xs.buffer));
++    CL_CHECK(clSetKernelArg(kq, 5, sizeof(int),      &n_vals));
++    size_t q_local[1]  = { 64 };
++    size_t q_global[1] = { (size_t)CEIL_DIV(n32, 64) * 64 };
++    backend_ctx->enqueue_ndrange_kernel(kq, 1, q_global, q_local, dst);
++    backend_ctx->kq_q8 = { src1, extra1->data_device, offset1, n_vals, backend_ctx->graph_gen };
++}
++
++static void ggml_cl_kq_convert_src1_f16(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src1,
++                                        int k, int ncols, const ggml_tensor * dst) {
++    const int n_vals = k * ncols;
++    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
++    const cl_ulong offset1 = extra1->offset + src1->view_offs;
++    if (ggml_cl_kq_cached(backend_ctx->kq_f16, backend_ctx, src1, extra1->data_device, offset1, n_vals)) {
++        return;
++    }
++    backend_ctx->prealloc_kq_xh.allocate(backend_ctx->context, (size_t)n_vals * sizeof(cl_half));
++    backend_ctx->prealloc_kq_xscale.allocate(backend_ctx->context, (size_t)ncols * sizeof(float));
++    cl_kernel kc = backend_ctx->kernel_kq_cvt_f32_f16;
++    CL_CHECK(clSetKernelArg(kc, 0, sizeof(cl_mem),   &extra1->data_device));
++    CL_CHECK(clSetKernelArg(kc, 1, sizeof(cl_ulong), &offset1));
++    CL_CHECK(clSetKernelArg(kc, 2, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xh.buffer));
++    CL_CHECK(clSetKernelArg(kc, 3, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xscale.buffer));
++    CL_CHECK(clSetKernelArg(kc, 4, sizeof(int),      &k));
++    size_t c_local[1]  = { 256 };
++    size_t c_global[1] = { (size_t)ncols * 256 };
++    backend_ctx->enqueue_ndrange_kernel(kc, 1, c_global, c_local, dst);
++    backend_ctx->kq_f16 = { src1, extra1->data_device, offset1, n_vals, backend_ctx->graph_gen };
++}
++
++// the flat planes of a K-quant weight, in the kernels' argument order
++static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, cl_uint & a) {
++    const ggml_tensor * soa0 = src0->view_src != nullptr ? src0->view_src : src0;
++    if (src0->type == GGML_TYPE_Q4_K) {
++        ggml_tensor_extra_cl_q4_K * e = (ggml_tensor_extra_cl_q4_K *)soa0->extra;
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &e->q));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &e->s));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &e->d));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &e->dm));
++    } else if (src0->type == GGML_TYPE_Q5_K) {
++        ggml_tensor_extra_cl_q5_K * e = (ggml_tensor_extra_cl_q5_K *)soa0->extra;
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &e->q));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &e->qh));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &e->s));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &e->d));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &e->dm));
++    } else {
++        ggml_tensor_extra_cl_q6_K * e = (ggml_tensor_extra_cl_q6_K *)soa0->extra;
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &e->ql));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &e->qh));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &e->s));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &e->d));
++    }
++}
++
++static int ggml_cl_kq_type_index(ggml_type t) {
++    return t == GGML_TYPE_Q4_K ? 0 : (t == GGML_TYPE_Q5_K ? 1 : (t == GGML_TYPE_Q6_K ? 2 : -1));
++}
++
++// K-quant MUL_MAT the Intel kernels take: a contiguous 2-D weight (a weight
++// broadcast over src1's dims 2 and 3 is one matrix of ne11*ne12*ne13
++// columns), packed f32 src1 and dst
++static bool ggml_cl_kq_mul_mat_shape(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++    return ggml_cl_kq_type_index(src0->type) >= 0 && src1->type == GGML_TYPE_F32 && src0->ne[0] % 256 == 0 &&
++           src0->ne[2] == 1 && src0->ne[3] == 1 && ggml_is_contiguous(src0) && src0->view_offs == 0 &&
++           ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
++}
++
++// Intel: a K-quant weight times up to 4 f32 columns (a decode step, a short
++// speculative verify) -- the columns quantized to q8_1, then integer dot
++// products, each weight read once for all of them (mul_mv_kq_q8_1.cl).
++static bool ggml_cl_mul_mv_kq_q8_1(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src0,
++                                   const ggml_tensor * src1, ggml_tensor * dst) {
++    // GGML_OPENCL_KQ_MV=0 leaves short batches to ggml's float kernels
++    static const char * mv_env = getenv("GGML_OPENCL_KQ_MV");
++    static const bool   mv_on  = mv_env == nullptr || atoi(mv_env) != 0;
++    const int ti = ggml_cl_kq_type_index(src0->type);
++    const int ncols = (int)(src1->ne[1] * src1->ne[2] * src1->ne[3]);
++    if (!mv_on || ti < 0 || ncols > 4 || !ggml_cl_kq_mul_mat_shape(src0, src1, dst)) {
++        return false;
++    }
++    cl_kernel kernel = backend_ctx->kernel_mul_mv_kq_q8_1[ncols - 1][ti];
++    if (kernel == nullptr) {
++        return false;
++    }
++    const int ne00 = (int)src0->ne[0];
++    const int ne01 = (int)src0->ne[1];
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++    const cl_ulong offsetd = extrad->offset + dst->view_offs;
++
++    const cl_ulong nb1 = dst->nb[1];
++    ggml_cl_kq_quantize_src1(backend_ctx, src1, ne00 * ncols, dst);
++
++    cl_uint a = 0;
++    ggml_cl_kq_weight_args(kernel, src0, a);
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_xq.buffer));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_xd.buffer));
++    if (src0->type != GGML_TYPE_Q6_K) {
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_xs.buffer));
++    }
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb1));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne00));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
++    const int rows_per_wg = backend_ctx->kq_q8_1_ndst * 4;
++    size_t global_work_size[] = { (size_t)CEIL_DIV(ne01, rows_per_wg) * 16, 4, 1 };
++    size_t local_work_size[]  = { 16, 4, 1 };
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++    return true;
++}
++
++// Intel: a K-quant weight times more than 4 f32 columns -- the columns as
++// f16, the weights dequantized to f16 per work-group tile, fp16 DPAS on the
++// XMX units (mul_mm_kq_f16.cl).
++static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src0,
++                                  const ggml_tensor * src1, ggml_tensor * dst) {
++    const int ti = ggml_cl_kq_type_index(src0->type);
++    const int ncols = (int)(src1->ne[1] * src1->ne[2] * src1->ne[3]);
++    if (ti < 0 || ncols <= 4 || !ggml_cl_kq_mul_mat_shape(src0, src1, dst)) {
++        return false;
++    }
++    cl_kernel kernel = backend_ctx->kernel_mul_mm_kq_f16[ti];
++    if (kernel == nullptr) {
++        return false;
++    }
++    const int ne00 = (int)src0->ne[0];
++    const int ne01 = (int)src0->ne[1];
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++    const cl_ulong offsetd = extrad->offset + dst->view_offs;
++    const cl_ulong nb1 = dst->nb[1];
++
++    ggml_cl_kq_convert_src1_f16(backend_ctx, src1, ne00, ncols, dst);
++
++    cl_uint a = 0;
++    ggml_cl_kq_weight_args(kernel, src0, a);
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xh.buffer));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xscale.buffer));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb1));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne00));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ncols));
++    const ggml_cl_kq_tile & t = backend_ctx->kq_mm_plain;
++    const int sg = backend_ctx->kq_mm_sg;
++    size_t global_work_size[] = { (size_t)CEIL_DIV(ncols, t.nt(sg)) * sg, (size_t)CEIL_DIV(ne01, t.mt()) * t.nsg(), 1 };
++    size_t local_work_size[]  = { (size_t)sg, (size_t)t.nsg(), 1 };
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++    return true;
++}
++#endif // GGML_OPENCL_SOA_Q
++
+ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+@@ -23459,6 +23858,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+ 
+     GGML_ASSERT(ne00 == ne10);
+ 
++#ifdef GGML_OPENCL_SOA_Q
++    if (ggml_cl_mul_mv_kq_q8_1(backend_ctx, src0, src1, dst) || ggml_cl_mul_mm_kq_f16(backend_ctx, src0, src1, dst)) {
++        return;
++    }
++#endif
++
+ #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+     // adreno GEMM/GEMV kernels do not support broadcast, assuming ne2 and ne3 are 1 for src1
+     // so we handle broadcast here
+@@ -25793,6 +26198,127 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
+     CL_CHECK(clReleaseMemObject(emap_buf));
+ }
+ 
++#ifdef GGML_OPENCL_SOA_Q
++// Intel: MUL_MAT_ID with K-quant experts (src0 [ne00, ne01, n_expert], src1
++// [ne00, ne11, n_tok], ids [n_used, n_tok] read on the device). One token:
++// every (slot, token) column quantized to q8_1, one matvec per pair
++// (mul_mv_kq_q8_1.cl). More: the columns as f16, the pairs sorted by expert
++// into tiles on the device, one fp16-DPAS tile per work-group
++// (mul_mm_kq_f16.cl).
++static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src0,
++                                  const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
++    const int ti = ggml_cl_kq_type_index(src0->type);
++    if (ti < 0 || src1->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) {
++        return false;
++    }
++    const int ne00 = (int)src0->ne[0];
++    const int ne01 = (int)src0->ne[1];
++    const int ne11 = (int)src1->ne[1];
++    const int ne12 = (int)src1->ne[2];
++    const int n_used = (int)ids->ne[0];
++    const int n_tok  = (int)ids->ne[1];
++    const int n_expert = (int)src0->ne[2];
++    // short batches (a decode step, a speculative verify) stay on the matvec:
++    // a GEMM tile of an expert with one or two pairs still dequantizes the
++    // expert's whole slice. GGML_OPENCL_KQ_MM_ID_MIN_TOK overrides the 16.
++    static const char * mt_env = getenv("GGML_OPENCL_KQ_MM_ID_MIN_TOK");
++    static const int    mm_id_min_tok = mt_env ? atoi(mt_env) : 16;
++    const bool gemm = n_tok >= mm_id_min_tok && backend_ctx->kernel_mul_mm_id_kq_f16[ti] != nullptr && n_expert <= 512;
++    const cl_kernel mv[3] = { backend_ctx->kernel_mul_mv_id_q4_K_q8_1, backend_ctx->kernel_mul_mv_id_q5_K_q8_1,
++                              backend_ctx->kernel_mul_mv_id_q6_K_q8_1 };
++    cl_kernel kernel = gemm ? backend_ctx->kernel_mul_mm_id_kq_f16[ti] : mv[ti];
++    if (kernel == nullptr) {
++        return false;
++    }
++    GGML_ASSERT(ne12 == n_tok && src1->ne[3] == 1 && src0->ne[3] == 1);
++    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ne00 % 256 == 0 && src0->view_offs == 0);
++
++    ggml_tensor_extra_cl * extra2 = (ggml_tensor_extra_cl *)ids->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++    const cl_ulong offseti = extra2->offset + ids->view_offs;
++    const cl_ulong offsetd = extrad->offset + dst->view_offs;
++    const cl_ulong nbi1 = ids->nb[1];
++    const cl_ulong nb1  = dst->nb[1];
++    const cl_ulong nb2  = dst->nb[2];
++    const int n_vals = ne00 * ne11 * ne12;
++
++    cl_uint a = 0;
++    if (!gemm) {
++        ggml_cl_kq_quantize_src1(backend_ctx, src1, n_vals, dst);
++        ggml_cl_kq_weight_args(kernel, src0, a);
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_xq.buffer));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_xd.buffer));
++        if (src0->type != GGML_TYPE_Q6_K) {
++            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_xs.buffer));
++        }
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extra2->data_device));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offseti));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nbi1));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &n_used));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne11));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extrad->data_device));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offsetd));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb1));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb2));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne00));
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
++        const cl_ulong res = (cl_ulong)n_vals;
++        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &res));
++        const int rows_per_wg = backend_ctx->kq_q8_1_ndst * 4;
++        size_t global_work_size[] = { (size_t)CEIL_DIV(ne01, rows_per_wg) * 16, 4, (size_t)n_used * n_tok };
++        size_t local_work_size[]  = { 16, 4, 1 };
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++        return true;
++    }
++
++    ggml_cl_kq_convert_src1_f16(backend_ctx, src1, ne00, ne11 * ne12, dst);
++
++    // sort the pairs by expert into tiles of the kernel's width
++    const ggml_cl_kq_tile & t = backend_ctx->kq_mm_id;
++    const int sg        = backend_ctx->kq_mm_sg;
++    const int n_pairs   = n_used * n_tok;
++    const int tile      = t.nt(sg);
++    const int max_tiles = CEIL_DIV(n_pairs, tile) + std::min(n_expert, n_pairs);
++    backend_ctx->prealloc_kq_pairs.allocate(backend_ctx->context, (size_t)n_pairs * sizeof(cl_int));
++    backend_ctx->prealloc_kq_tiles.allocate(backend_ctx->context, (size_t)max_tiles * sizeof(cl_int4));
++    backend_ctx->prealloc_kq_ntiles.allocate(backend_ctx->context, sizeof(cl_int));
++    cl_mem pairs = backend_ctx->prealloc_kq_pairs.buffer, tiles = backend_ctx->prealloc_kq_tiles.buffer,
++           ntiles = backend_ctx->prealloc_kq_ntiles.buffer;
++    cl_kernel kr = backend_ctx->kernel_moe_route_tiles;
++    CL_CHECK(clSetKernelArg(kr, 0, sizeof(cl_mem),   &extra2->data_device));
++    CL_CHECK(clSetKernelArg(kr, 1, sizeof(cl_ulong), &offseti));
++    CL_CHECK(clSetKernelArg(kr, 2, sizeof(cl_ulong), &nbi1));
++    CL_CHECK(clSetKernelArg(kr, 3, sizeof(int),      &n_used));
++    CL_CHECK(clSetKernelArg(kr, 4, sizeof(int),      &n_tok));
++    CL_CHECK(clSetKernelArg(kr, 5, sizeof(int),      &n_expert));
++    CL_CHECK(clSetKernelArg(kr, 6, sizeof(int),      &tile));
++    CL_CHECK(clSetKernelArg(kr, 7, sizeof(cl_mem),   &pairs));
++    CL_CHECK(clSetKernelArg(kr, 8, sizeof(cl_mem),   &tiles));
++    CL_CHECK(clSetKernelArg(kr, 9, sizeof(cl_mem),   &ntiles));
++    size_t r_local[1] = { 256 }, r_global[1] = { 256 };
++    backend_ctx->enqueue_ndrange_kernel(kr, 1, r_global, r_local, dst);
++
++    ggml_cl_kq_weight_args(kernel, src0, a);
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xh.buffer));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xscale.buffer));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &pairs));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &tiles));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ntiles));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &n_used));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne11));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb1));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb2));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne00));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
++    size_t global_work_size[] = { (size_t)max_tiles * sg, (size_t)CEIL_DIV(ne01, t.mt()) * t.nsg(), 1 };
++    size_t local_work_size[]  = { (size_t)sg, (size_t)t.nsg(), 1 };
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++    return true;
++}
++#endif // GGML_OPENCL_SOA_Q
++
+ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+@@ -25877,6 +26403,12 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
+ 
+     const int r2 = ne12/ne02;
+     const int r3 = ne13/ne03;
++
++#ifdef GGML_OPENCL_SOA_Q
++    if (ggml_cl_mul_mat_id_kq(backend_ctx, src0, src1, src2, dst)) {
++        return;
++    }
++#endif
+     const int dst_rows = ne20*ne21; // ne20 = n_used_experts, ne21 = n_rows
+ 
+     GGML_ASSERT(ne00 == ne10);
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
+new file mode 100644
+index 0000000..d1f504d
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
+@@ -0,0 +1,336 @@
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++#pragma OPENCL EXTENSION cl_intel_subgroups : enable
++#pragma OPENCL EXTENSION cl_intel_subgroups_short : enable
++#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
++#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
++#pragma OPENCL EXTENSION cl_intel_subgroup_local_block_io : enable
++
++// K-quant x f16 matrix-matrix products on the XMX units (fp16 DPAS): a
++// work-group dequantizes a tile of weight rows, one 256-weight super-block at
++// a time, to f16 in local memory, laid out so that one sub-group block read
++// is one DPAS a operand; the activations are f16 columns (converted from f32
++// by kernel_cvt_f32_f16, with a power-of-two scale per column). The accumulation is f32 in the DPAS, with no
++// per-sub-block scaling in the inner loop: the scales are applied once, in
++// the dequantization -- the cuBLAS-style dequantize-then-GEMM of llama.cpp's
++// CUDA backend, tiled through local memory.
++//
++// fp16 DPAS operands (cl_intel_subgroup_matrix_multiply_accumulate; the
++// emulation in bashbaug/SimpleOpenCLSamples 20_matrixexperiments-bf16):
++//   SG 8 (Alchemist): a = int   per row, lane i holds k = 2i, 2i+1
++//   SG 16 (Xe2):      a = short per row, lane i holds k = i
++//   b = int8 per lane: lane n is column n, its 16 k as 8 half pairs
++//   result float8: lane n is column n, component m is row m
++// Local layout: [row group][k16 block][row m][k 0..15] halves, so the a
++// operand of (row group, k16 block) is 128 consecutive halves.
++//
++// A work-group is NSGM x NSGN sub-groups; each takes RG*8 rows x TG*SG
++// columns; the work-group tile is MT = NSGM*RG*8 rows x NT = NSGN*TG*SG.
++
++#define QK_K 256
++#ifndef SG
++#define SG 16
++#endif
++#ifndef RG
++#define RG 4
++#endif
++#ifndef TG
++#define TG 2
++#endif
++#ifndef NSGM
++#define NSGM 2
++#endif
++#ifndef NSGN
++#define NSGN 2
++#endif
++#define MT (NSGM * RG * 8)
++#define NT (NSGN * TG * SG)
++#define NTHR (NSGM * NSGN * SG)
++
++#if SG == 8
++typedef int8 a8_t;
++#define LOAD_A(p) as_int8(intel_sub_group_block_read8((local const uint *)(p)))
++#else
++typedef short8 a8_t;
++#define LOAD_A(p) as_short8(intel_sub_group_block_read_us8((local const ushort *)(p)))
++#endif
++#define DPAS(a, b, c) intel_sub_group_f16_f16_matrix_mad_k16(a, b, c)
++
++// f32 -> f16 by columns of k values, one work-group per column. A column
++// whose largest magnitude exceeds 16384 is stored divided by a power of two
++// (exact) that brings it under, and the GEMM multiplies its outputs back:
++// f16 overflows at 65504 (ggml's MUL_MAT_ID cells use activations of 1e5).
++kernel void kernel_cvt_f32_f16(global const char * src, ulong offs, global half * dst, global float * scale, int k) {
++    const int col = get_group_id(0);
++    global const float * x = (global const float *)(src + offs) + (ulong)col * k;
++    global half * y = dst + (ulong)col * k;
++    float amax = 0.f;
++    for (int i = get_local_id(0); i < k; i += get_local_size(0)) amax = fmax(amax, fabs(x[i]));
++    amax = work_group_reduce_max(amax);
++    const float sc = amax > 16384.f ? ldexp(1.f, (int)ceil(log2(amax / 16384.f))) : 1.f;
++    const float isc = 1.f / sc;
++    for (int i = get_local_id(0); i < k; i += get_local_size(0)) vstore_half_rte(x[i] * isc, 0, y + i);
++    if (get_local_id(0) == 0) scale[col] = sc;
++}
++
++static inline uint kbyte(uint3 w, int k) {
++    const uint v = k < 4 ? w.s0 : (k < 8 ? w.s1 : w.s2);
++    return (v >> (8 * (k & 3))) & 0xFFu;
++}
++
++static inline void scale_min(uint3 w, int k, float * sc, float * m) {
++    if (k < 4) {
++        *sc = kbyte(w, k) & 63; *m = kbyte(w, k + 4) & 63;
++    } else {
++        *sc = (kbyte(w, k + 4) & 0xF) | ((kbyte(w, k - 4) >> 6) << 4);
++        *m  = (kbyte(w, k + 4) >> 4) | ((kbyte(w, k) >> 6) << 4);
++    }
++}
++
++// weight (row r of the tile, k) in the local tile
++#define LOFF(r, k) (((((r) >> 3) * 16 + ((k) >> 4)) * 8 + ((r) & 7)) * 16 + ((k) & 15))
++
++// 16 consecutive weights k0 .. k0+15 (k0 % 16 == 0) of tile row r
++static inline void put16(local half * wt, int r, int k0, float16 v) {
++    vstore_half16(v, 0, wt + LOFF(r, k0));
++}
++
++static inline float16 nib16(uint4 w, int hi, float a, float b, uint4 h, int hbit) {
++    // 16 4-bit codes (low or high nibbles of 16 bytes), plus an optional 5th
++    // bit from h (bit hbit of each byte; hbit < 0: none): a * q - b
++    const uint4 q = hi ? (w >> 4) & 0x0F0F0F0Fu : w & 0x0F0F0F0Fu;
++    uint4 q5 = q;
++    if (hbit >= 0) q5 |= ((h >> hbit) & 0x01010101u) << 4;
++    const uchar16 c = as_uchar16(q5);
++    return a * convert_float16(c) - b;
++}
++
++// ---- dequantization of the tile's super-block ib into local memory ----
++
++// Q4_K / Q5_K: unit (row r, pair j) = 64 weights, sub-blocks 2j and 2j+1
++static inline void deq_q45_K(local half * wt, global const uchar * q, global const uchar * qh, global const uchar * s,
++                             global const half * d, global const half * dm, const int q5,
++                             ulong wrow0, int row0, int ne01, int nb, int ib) {
++    for (int u = get_local_linear_id(); u < MT * 4; u += NTHR) {
++        const int rr = u >> 2, j = u & 3;
++        const int r = min(row0 + rr, ne01 - 1);
++        const ulong b = (wrow0 + r) * nb + ib;
++        const uint3 sw = vload3(0, (global const uint *)(s + b * 12));
++        float sc0, m0, sc1, m1;
++        scale_min(sw, 2 * j, &sc0, &m0);
++        scale_min(sw, 2 * j + 1, &sc1, &m1);
++        const float D = vload_half(0, d + b), M = vload_half(0, dm + b);
++        const float a0 = D * sc0, b0 = M * m0, a1 = D * sc1, b1 = M * m1;
++        const uint4 w0 = vload4(0, (global const uint *)(q + b * 128 + 32 * j));
++        const uint4 w1 = vload4(0, (global const uint *)(q + b * 128 + 32 * j + 16));
++        uint4 h0 = (uint4)(0), h1 = (uint4)(0);
++        if (q5) {
++            h0 = vload4(0, (global const uint *)(qh + b * 32));
++            h1 = vload4(0, (global const uint *)(qh + b * 32 + 16));
++        }
++        put16(wt, rr, 64 * j,      nib16(w0, 0, a0, b0, h0, q5 ? 2 * j : -1));
++        put16(wt, rr, 64 * j + 16, nib16(w1, 0, a0, b0, h1, q5 ? 2 * j : -1));
++        put16(wt, rr, 64 * j + 32, nib16(w0, 1, a1, b1, h0, q5 ? 2 * j + 1 : -1));
++        put16(wt, rr, 64 * j + 48, nib16(w1, 1, a1, b1, h1, q5 ? 2 * j + 1 : -1));
++    }
++}
++
++// Q6_K: unit (row r, 32-block kb = part p of half n) = 32 weights
++static inline void deq_q6_K(local half * wt, global const uchar * ql, global const uchar * qh, global const char * s,
++                            global const half * d, ulong wrow0, int row0, int ne01, int nb, int ib) {
++    for (int u = get_local_linear_id(); u < MT * 8; u += NTHR) {
++        const int rr = u >> 3, kb = u & 7;
++        const int n = kb >> 2, p = kb & 3;
++        const int r = min(row0 + rr, ne01 - 1);
++        const ulong b = (wrow0 + r) * nb + ib;
++        const float D = vload_half(0, d + b);
++        const int is = 8 * n + 2 * p;
++        const float a0 = D * (float)s[b * 16 + is], a1 = D * (float)s[b * 16 + is + 1];
++        for (int hh = 0; hh < 2; ++hh) {
++            const uint4 w = vload4(0, (global const uint *)(ql + b * 128 + 64 * n + 32 * (p & 1) + 16 * hh));
++            const uint4 h = vload4(0, (global const uint *)(qh + b * 64 + 32 * n + 16 * hh));
++            const uint4 c = ((w >> (4 * (p >> 1))) & 0x0F0F0F0Fu) | (((h >> (2 * p)) & 0x03030303u) << 4);
++            const float16 v = (hh ? a1 : a0) * (convert_float16(as_uchar16(c)) - 32.f);
++            put16(wt, rr, 32 * kb + 16 * hh, v);
++        }
++    }
++}
++
++// ---- the GEMM body. Per token group: the lane's column `tok` (an f16
++// column of xh, any valid one when the lane has none) and its output byte
++// offset in dst (`outp`, negative: none); `wrow0` is the weight matrix's
++// first row (an expert's, for MUL_MAT_ID). ----
++
++#define MM_BODY(DEQ)                                                                            \
++    local half wt[MT * QK_K];                                                                   \
++    const int sgid = get_sub_group_id();                                                        \
++    const int sm = sgid % NSGM;                                                                 \
++    const int nb = ne00 / QK_K;                                                                 \
++    float8 acc[RG][TG];                                                                         \
++    _Pragma("unroll")                                                                           \
++    for (int rg = 0; rg < RG; ++rg)                                                             \
++        _Pragma("unroll")                                                                       \
++        for (int tg = 0; tg < TG; ++tg) acc[rg][tg] = (float8)(0.f);                            \
++    for (int ib = 0; ib < nb; ++ib) {                                                           \
++        barrier(CLK_LOCAL_MEM_FENCE);                                                           \
++        DEQ;                                                                                    \
++        barrier(CLK_LOCAL_MEM_FENCE);                                                           \
++        if (!active) continue;                                                                  \
++        _Pragma("unroll 4")                                                                     \
++        for (int kk = 0; kk < 16; ++kk) {                                                       \
++            int8 bv[TG];                                                                        \
++            _Pragma("unroll")                                                                   \
++            for (int tg = 0; tg < TG; ++tg)                                                     \
++                bv[tg] = as_int8(vload8(0, (global const uint *)(xh + (ulong)tok[tg] * ne00 + ib * QK_K + kk * 16))); \
++            _Pragma("unroll")                                                                   \
++            for (int rg = 0; rg < RG; ++rg) {                                                   \
++                const a8_t a = LOAD_A(wt + ((sm * RG + rg) * 16 + kk) * 128);                   \
++                _Pragma("unroll")                                                               \
++                for (int tg = 0; tg < TG; ++tg) acc[rg][tg] = DPAS(a, bv[tg], acc[rg][tg]);     \
++            }                                                                                   \
++        }                                                                                       \
++    }                                                                                           \
++    const int r_sg = row0 + sm * RG * 8;                                                        \
++    _Pragma("unroll")                                                                           \
++    for (int tg = 0; tg < TG; ++tg) {                                                           \
++        if (outp[tg] < 0) continue;                                                             \
++        global float * out = (global float *)(dst + outp[tg]);                                  \
++        const float csc = xscale[tok[tg]];                                                      \
++        _Pragma("unroll")                                                                       \
++        for (int rg = 0; rg < RG; ++rg) {                                                       \
++            const int r = r_sg + rg * 8;                                                        \
++            const float8 v = acc[rg][tg] * csc;                                                 \
++            if (r + 8 <= ne01) {                                                                \
++                vstore8(v, 0, out + r);                                                         \
++            } else {                                                                            \
++                const float vv[8] = { v.s0, v.s1, v.s2, v.s3, v.s4, v.s5, v.s6, v.s7 };         \
++                for (int m = 0; m < 8; ++m) if (r + m < ne01) out[r + m] = vv[m];               \
++            }                                                                                   \
++        }                                                                                       \
++    }
++
++// ---- MUL_MAT: dst [ne01, ne11], column t at t * nb1 ----
++
++#define PLAIN_COLS                                                                    \
++    const int row0 = get_group_id(1) * MT;                                            \
++    const int sn = get_sub_group_id() / NSGM;                                         \
++    const int tok0 = get_group_id(0) * NT + sn * TG * SG;                             \
++    int  tok[TG];                                                                     \
++    long outp[TG];                                                                    \
++    _Pragma("unroll")                                                                 \
++    for (int tg = 0; tg < TG; ++tg) {                                                 \
++        const int t = tok0 + tg * SG + get_sub_group_local_id();                      \
++        tok[tg]  = min(t, ne11 - 1);                                                  \
++        outp[tg] = t < ne11 ? (long)(offd + (ulong)t * nb1) : -1;                     \
++    }                                                                                 \
++    const ulong wrow0 = 0;                                                            \
++    const bool active = tok0 < ne11;  /* a sub-group with no column only dequantizes */
++
++#define PLAIN_ARGS global const half * xh, global const float * xscale, global char * dst, ulong offd, ulong nb1, int ne00, int ne01, int ne11
++
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_q4_K_f16(global const uchar * q, global const uchar * s, global const half * d,
++                                   global const half * dm, PLAIN_ARGS) {
++    PLAIN_COLS
++    MM_BODY(deq_q45_K(wt, q, q, s, d, dm, 0, wrow0, row0, ne01, nb, ib))
++}
++
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_q5_K_f16(global const uchar * q, global const uchar * qh, global const uchar * s,
++                                   global const half * d, global const half * dm, PLAIN_ARGS) {
++    PLAIN_COLS
++    MM_BODY(deq_q45_K(wt, q, qh, s, d, dm, 1, wrow0, row0, ne01, nb, ib))
++}
++
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_q6_K_f16(global const uchar * ql, global const uchar * qh, global const char * s,
++                                   global const half * d, PLAIN_ARGS) {
++    PLAIN_COLS
++    MM_BODY(deq_q6_K(wt, ql, qh, s, d, wrow0, row0, ne01, nb, ib))
++}
++
++// ---- MUL_MAT_ID routing: the (token, slot) pairs sorted by expert and cut
++// into tiles of `tile` pairs of one expert (expert, first pair, count); one
++// work-group. ----
++
++#ifndef MAX_EXPERT
++#define MAX_EXPERT 512
++#endif
++
++// one work-group
++kernel void kernel_moe_route_tiles(global const char * ids, ulong offi, ulong nbi1, int n_used, int n_tok, int n_expert,
++                                   int tile, global int * pairs, global int4 * tiles, global int * n_tiles) {
++    local int cnt[MAX_EXPERT], base[MAX_EXPERT];
++    const int lid = get_local_id(0), lsz = get_local_size(0);
++    const int n_pairs = n_used * n_tok;
++    for (int e = lid; e < n_expert; e += lsz) cnt[e] = 0;
++    barrier(CLK_LOCAL_MEM_FENCE);
++    for (int p = lid; p < n_pairs; p += lsz) {
++        const int e = clamp(((global const int *)(ids + offi + (p / n_used) * nbi1))[p % n_used], 0, n_expert - 1);
++        atomic_inc(&cnt[e]);
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++    if (lid == 0) {
++        int acc = 0, nt = 0;
++        for (int e = 0; e < n_expert; ++e) {
++            base[e] = acc;
++            for (int s0 = 0; s0 < cnt[e]; s0 += tile) tiles[nt++] = (int4)(e, acc + s0, min(tile, cnt[e] - s0), 0);
++            acc += cnt[e];
++            cnt[e] = 0;
++        }
++        *n_tiles = nt;
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++    for (int p = lid; p < n_pairs; p += lsz) {
++        const int e = clamp(((global const int *)(ids + offi + (p / n_used) * nbi1))[p % n_used], 0, n_expert - 1);
++        pairs[base[e] + atomic_inc(&cnt[e])] = p;
++    }
++}
++
++// ---- MUL_MAT_ID: experts [ne00, ne01, n_expert]; activation columns
++// [ne00, ne11, n_tok] in f16; dst [ne01, n_used, n_tok]. Tiles of NT pairs
++// of one expert from kernel_moe_route_tiles; pair
++// p = t * n_used + i has column (i % ne11) + t * ne11 and output
++// dst + t * nb2 + i * nb1. ----
++
++#define ID_COLS                                                                       \
++    const int row0 = get_group_id(1) * MT;                                            \
++    const int ti = get_group_id(0);                                                   \
++    if (ti >= *n_tiles) return;                                                       \
++    const int4 te = tiles[ti];                                                        \
++    const int sn = get_sub_group_id() / NSGM;                                         \
++    int  tok[TG];                                                                     \
++    long outp[TG];                                                                    \
++    _Pragma("unroll")                                                                 \
++    for (int tg = 0; tg < TG; ++tg) {                                                 \
++        const int k = sn * TG * SG + tg * SG + get_sub_group_local_id();              \
++        const int p = pairs[te.y + min(k, te.z - 1)];                                 \
++        const int t = p / n_used, i = p % n_used;                                     \
++        tok[tg]  = (i % ne11) + t * ne11;                                             \
++        outp[tg] = k < te.z ? (long)(offd + (ulong)t * nb2 + (ulong)i * nb1) : -1;    \
++    }                                                                                 \
++    const ulong wrow0 = (ulong)te.x * ne01;                                           \
++    const bool active = sn * TG * SG < te.z;
++
++#define ID_ARGS global const half * xh, global const float * xscale, global const int * pairs, global const int4 * tiles, global const int * n_tiles, \
++    int n_used, int ne11, global char * dst, ulong offd, ulong nb1, ulong nb2, int ne00, int ne01
++
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_id_q4_K_f16(global const uchar * q, global const uchar * s, global const half * d,
++                                      global const half * dm, ID_ARGS) {
++    ID_COLS
++    MM_BODY(deq_q45_K(wt, q, q, s, d, dm, 0, wrow0, row0, ne01, nb, ib))
++}
++
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_id_q5_K_f16(global const uchar * q, global const uchar * qh, global const uchar * s,
++                                      global const half * d, global const half * dm, ID_ARGS) {
++    ID_COLS
++    MM_BODY(deq_q45_K(wt, q, qh, s, d, dm, 1, wrow0, row0, ne01, nb, ib))
++}
++
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_id_q6_K_f16(global const uchar * ql, global const uchar * qh, global const char * s,
++                                      global const half * d, ID_ARGS) {
++    ID_COLS
++    MM_BODY(deq_q6_K(wt, ql, qh, s, d, wrow0, row0, ne01, nb, ib))
++}
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl
+new file mode 100644
+index 0000000..3302bc2
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl
+@@ -0,0 +1,335 @@
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++#pragma OPENCL EXTENSION cl_intel_subgroups : enable
++#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
++#pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
++
++// K-quant x q8_1 matrix-vector products for Intel Arc: the activation is
++// quantized once to int8 blocks of 32 (llama.cpp's q8_1: codes, the block's
++// scale and the sum of its float values), and the weights are multiplied with
++// 4x8-bit integer dot products (cl_khr_integer_dot_product), the way
++// llama.cpp's CUDA MMVQ path does it (vec_dot_q4_K_q8_1 and its siblings).
++// The weights are ggml's flat planes (kernel_convert_block_q{4,5,6}_K).
++//
++// A subgroup of 16 takes N_DST rows; 8 lanes cover one 256-weight block, so
++// the subgroup walks two blocks of each row per step. The *_id kernels are
++// MUL_MAT_ID: work-group dimension 2 is one (expert slot, token) pair, whose
++// expert is read from `ids` on the device.
++
++#define QK_K 256
++#ifndef N_DST
++#define N_DST 4
++#endif
++#ifndef N_SIMDGROUP
++#define N_SIMDGROUP 4
++#endif
++
++// One work-item per block of 32; `n` values (any number of contiguous
++// columns, each a multiple of 32 long). A block is two int8 terms: codes q
++// at scale d, and the codes q2 of what q leaves (at scale d2 <= d / 254),
++// at xq + n and xd + n / 32 -- x = d q + d2 q2, so the integer dot products
++// carry the activation to about 1/32000 of its block maximum instead of
++// 1/254 (q8_1 alone moved the dense 27B's decode KL by 0.0026 nats).
++kernel void kernel_quantize_q8_1(global const char * src, ulong offs, global char * xq, global float * xd,
++                                 global float * xs, int n) {
++    const int b = get_global_id(0);
++    if (b * 32 >= n) return;
++    global const float * v = (global const float *)(src + offs) + b * 32;
++    float amax = 0.f, sum = 0.f;
++    for (int i = 0; i < 32; ++i) { amax = fmax(amax, fabs(v[i])); sum += v[i]; }
++    const float d = amax / 127.f;
++    const float id = d > 0.f ? 1.f / d : 0.f;
++    float rmax = 0.f;
++    for (int i = 0; i < 32; ++i) {
++        const char q = convert_char_sat_rte(v[i] * id);
++        xq[b * 32 + i] = q;
++        rmax = fmax(rmax, fabs(v[i] - d * (float)q));
++    }
++    const float d2 = rmax / 127.f;
++    const float id2 = d2 > 0.f ? 1.f / d2 : 0.f;
++    for (int i = 0; i < 32; ++i) xq[n + b * 32 + i] = convert_char_sat_rte((v[i] - d * (float)xq[b * 32 + i]) * id2);
++    xd[b] = d;
++    xd[n / 32 + b] = d2;
++    xs[b] = sum;
++}
++
++// The scales and mins of sub-blocks 2j and 2j+1 from the block's 12 scale
++// bytes, read as three words (get_scale_min_k4 in ggml).
++static inline uint kbyte(uint3 w, int k) {
++    const uint v = k < 4 ? w.s0 : (k < 8 ? w.s1 : w.s2);
++    return (v >> (8 * (k & 3))) & 0xFFu;
++}
++
++static inline void scale_min_pair(global const uchar * s, int j, float * sc0, float * m0, float * sc1, float * m1) {
++    const uint3 w = vload3(0, (global const uint *)s);
++    const int k0 = 2 * j, k1 = 2 * j + 1;
++    if (j < 2) {
++        *sc0 = kbyte(w, k0) & 63; *m0 = kbyte(w, k0 + 4) & 63;
++        *sc1 = kbyte(w, k1) & 63; *m1 = kbyte(w, k1 + 4) & 63;
++    } else {
++        *sc0 = (kbyte(w, k0 + 4) & 0xF) | ((kbyte(w, k0 - 4) >> 6) << 4);  *m0 = (kbyte(w, k0 + 4) >> 4) | ((kbyte(w, k0) >> 6) << 4);
++        *sc1 = (kbyte(w, k1 + 4) & 0xF) | ((kbyte(w, k1 - 4) >> 6) << 4);  *m1 = (kbyte(w, k1 + 4) >> 4) | ((kbyte(w, k1) >> 6) << 4);
++    }
++}
++
++static inline int dot4_us(uint4 w, uint4 x) {
++    int a = 0;
++    a = dot_acc_sat_4x8packed_us_int(w.s0, x.s0, a);
++    a = dot_acc_sat_4x8packed_us_int(w.s1, x.s1, a);
++    a = dot_acc_sat_4x8packed_us_int(w.s2, x.s2, a);
++    a = dot_acc_sat_4x8packed_us_int(w.s3, x.s3, a);
++    return a;
++}
++
++// NCOLS columns per pass (a compile-time constant: the per-column values
++// must stay in registers), so a short batch (a speculative verify, a few
++// lanes) reads each weight once for all of them, as llama.cpp's CUDA MMVQ
++// does for up to 8. Column c's activation is at c * ne00 codes (c * ne00/32
++// scales and sums), its output at out + c * ostride. The MUL_MAT_ID kernels
++// are used from the NCOLS = 1 build.
++#ifndef NCOLS
++#define NCOLS 1
++#endif
++#define MAXC NCOLS
++
++static inline void reduce_store(float acc[N_DST][MAXC], global float * out, ulong ostride, int first_row, int ne01) {
++    const int lane = get_sub_group_local_id();
++    #pragma unroll
++    for (int c = 0; c < MAXC; ++c) {
++        #pragma unroll
++        for (int r = 0; r < N_DST; ++r) {
++            const float t = sub_group_reduce_add(acc[r][c]);
++            if (lane == 0 && first_row + r < ne01) out[c * ostride + first_row + r] = t;
++        }
++    }
++}
++
++// Q4_K (q5 = 0) and Q5_K (q5 = 1). Lane l covers bytes [16 (l%8), +16) of
++// its block: the low nibbles of word i are the weights 16h + 4i .. +3 of
++// sub-block 2j, the high ones the same positions of sub-block 2j+1
++// (j = (l%8)/2, h = l%2). Q5_K's fifth bits are bit 2j (low) and 2j+1 (high)
++// of the qh bytes 16h .. 16h+15. `blk0`: the first row's first block.
++static inline void mv_q45_K(
++    global const uchar * q, global const uchar * qhp, global const uchar * sp, global const half * dp, global const half * dmp,
++    const int q5, ulong blk0, int nb, int first_row, int ne01,
++    global const char * xq, global const float * xd, global const float * xs, global float * out,
++    ulong ostride, ulong res) {
++    const int lane = get_sub_group_local_id();
++    const int p = lane & 7, j = p >> 1, h = p & 1;
++    global const char  * xq2 = xq + res;       // the residual codes and scales
++    global const float * xd2 = xd + res / 32;
++    const int ne00 = nb * QK_K, n32 = nb * 8;
++
++    float acc[N_DST][MAXC];
++    #pragma unroll
++    for (int r = 0; r < N_DST; ++r) for (int c = 0; c < MAXC; ++c) acc[r][c] = 0.f;
++
++    for (int ib = lane >> 3; ib < nb; ib += 2) {
++        const int b32lo = ib * 8 + 2 * j, b32hi = b32lo + 1;
++        uint4 xl[MAXC], xh[MAXC], xl2[MAXC], xh2[MAXC];
++        float dl[MAXC], dh[MAXC], sl[MAXC], sh[MAXC], dl2[MAXC], dh2[MAXC];
++        #pragma unroll
++        for (int c = 0; c < MAXC; ++c) {
++                xl[c] = vload4(0, (global const uint *)(xq + c * ne00 + b32lo * 32 + 16 * h));
++            xh[c] = vload4(0, (global const uint *)(xq + c * ne00 + b32hi * 32 + 16 * h));
++            xl2[c] = vload4(0, (global const uint *)(xq2 + c * ne00 + b32lo * 32 + 16 * h));
++            xh2[c] = vload4(0, (global const uint *)(xq2 + c * ne00 + b32hi * 32 + 16 * h));
++            dl[c] = xd[c * n32 + b32lo]; dh[c] = xd[c * n32 + b32hi];
++            dl2[c] = xd2[c * n32 + b32lo]; dh2[c] = xd2[c * n32 + b32hi];
++            sl[c] = xs[c * n32 + b32lo]; sh[c] = xs[c * n32 + b32hi];
++        }
++        #pragma unroll
++        for (int r = 0; r < N_DST; ++r) {
++            if (first_row + r >= ne01) break;
++            const ulong b = blk0 + (ulong)r * nb + ib;
++            const uint4 w = vload4(0, (global const uint *)(q + b * 128 + 16 * p));
++            uint4 wl = w & 0x0F0F0F0Fu;
++            uint4 wh = (w >> 4) & 0x0F0F0F0Fu;
++            if (q5) {
++                const uint4 qh = vload4(0, (global const uint *)(qhp + b * 32 + 16 * h));
++                wl |= ((qh >> (2 * j)) & 0x01010101u) << 4;
++                wh |= ((qh >> (2 * j + 1)) & 0x01010101u) << 4;
++            }
++            float sc0, m0, sc1, m1;
++            scale_min_pair(sp + b * 12, j, &sc0, &m0, &sc1, &m1);
++            const float d  = vload_half(0, dp + b);
++            const float dm = vload_half(0, dmp + b);
++            #pragma unroll
++            for (int c = 0; c < MAXC; ++c) {
++                        const int il = dot4_us(wl, xl[c]),  ih = dot4_us(wh, xh[c]);
++                const int il2 = dot4_us(wl, xl2[c]), ih2 = dot4_us(wh, xh2[c]);
++                // each sub-block's sum is split over two lanes (h = 0, 1): half each
++                acc[r][c] += d * (sc0 * (dl[c] * (float)il + dl2[c] * (float)il2) + sc1 * (dh[c] * (float)ih + dh2[c] * (float)ih2))
++                           - dm * 0.5f * (m0 * sl[c] + m1 * sh[c]);
++            }
++        }
++    }
++    reduce_store(acc, out, ostride, first_row, ne01);
++}
++
++// Q6_K. Lane l: half n = (l%8)/4 of its block, positions t0 .. t0+7 with
++// t0 = 8 (l%4). ql[64n + t] holds weights 128n + t (low nibble) and +64
++// (high), ql[64n + 32 + t] weights +32 and +96, qh[32n + t] the two top bits
++// of all four. The codes are 6-bit unsigned with an offset of 32, taken off
++// per byte so the dot product is signed x signed.
++static inline int dot2_ss(uint2 w, uint2 x) {
++    const uint2 q = as_uint2(as_char8(w) - (char8)(32));
++    int a = 0;
++    a = dot_acc_sat_4x8packed_ss_int(q.s0, x.s0, a);
++    a = dot_acc_sat_4x8packed_ss_int(q.s1, x.s1, a);
++    return a;
++}
++
++static inline void mv_q6_K(
++    global const uchar * ql, global const uchar * qhp, global const char * sp, global const half * dp,
++    ulong blk0, int nb, int first_row, int ne01,
++    global const char * xq, global const float * xd, global float * out, ulong ostride, ulong res) {
++    global const char  * xq2 = xq + res;       // the residual codes and scales
++    global const float * xd2 = xd + res / 32;
++    const int lane = get_sub_group_local_id();
++    const int p = lane & 7, n = p >> 2, t0 = (p & 3) * 8;
++    const int is = 8 * n + (t0 >> 4);   // scale of weight 128n + t0; +2 per 32 further
++    const int ne00 = nb * QK_K, n32 = nb * 8;
++
++    float acc[N_DST][MAXC];
++    #pragma unroll
++    for (int r = 0; r < N_DST; ++r) for (int c = 0; c < MAXC; ++c) acc[r][c] = 0.f;
++
++    for (int ib = lane >> 3; ib < nb; ib += 2) {
++        const int b32 = ib * 8 + 4 * n;   // the activation's 32-blocks b32 .. b32+3
++        uint2 x0[MAXC], x1[MAXC], x2[MAXC], x3[MAXC], y0[MAXC], y1[MAXC], y2[MAXC], y3[MAXC];
++        float d0[MAXC], d1[MAXC], d2[MAXC], d3[MAXC], e0[MAXC], e1[MAXC], e2[MAXC], e3[MAXC];
++        #pragma unroll
++        for (int c = 0; c < MAXC; ++c) {
++                global const char * xc = xq + c * ne00;
++            x0[c] = vload2(0, (global const uint *)(xc + (b32 + 0) * 32 + t0));
++            x1[c] = vload2(0, (global const uint *)(xc + (b32 + 1) * 32 + t0));
++            x2[c] = vload2(0, (global const uint *)(xc + (b32 + 2) * 32 + t0));
++            x3[c] = vload2(0, (global const uint *)(xc + (b32 + 3) * 32 + t0));
++            d0[c] = xd[c * n32 + b32]; d1[c] = xd[c * n32 + b32 + 1]; d2[c] = xd[c * n32 + b32 + 2]; d3[c] = xd[c * n32 + b32 + 3];
++            global const char * yc = xq2 + c * ne00;
++            y0[c] = vload2(0, (global const uint *)(yc + (b32 + 0) * 32 + t0));
++            y1[c] = vload2(0, (global const uint *)(yc + (b32 + 1) * 32 + t0));
++            y2[c] = vload2(0, (global const uint *)(yc + (b32 + 2) * 32 + t0));
++            y3[c] = vload2(0, (global const uint *)(yc + (b32 + 3) * 32 + t0));
++            e0[c] = xd2[c * n32 + b32]; e1[c] = xd2[c * n32 + b32 + 1]; e2[c] = xd2[c * n32 + b32 + 2]; e3[c] = xd2[c * n32 + b32 + 3];
++        }
++        #pragma unroll
++        for (int r = 0; r < N_DST; ++r) {
++            if (first_row + r >= ne01) break;
++            const ulong b = blk0 + (ulong)r * nb + ib;
++            const uint2 a  = vload2(0, (global const uint *)(ql + b * 128 + 64 * n + t0));
++            const uint2 c  = vload2(0, (global const uint *)(ql + b * 128 + 64 * n + 32 + t0));
++            const uint2 hb = vload2(0, (global const uint *)(qhp + b * 64 + 32 * n + t0));
++            const uint2 w0 = (a & 0x0F0F0F0Fu)        | ((hb & 0x03030303u) << 4);
++            const uint2 w1 = (c & 0x0F0F0F0Fu)        | (((hb >> 2) & 0x03030303u) << 4);
++            const uint2 w2 = ((a >> 4) & 0x0F0F0F0Fu) | (((hb >> 4) & 0x03030303u) << 4);
++            const uint2 w3 = ((c >> 4) & 0x0F0F0F0Fu) | (((hb >> 6) & 0x03030303u) << 4);
++            // the four scales: bytes is, is+2, is+4, is+6 of the 8 at 8n
++            const uint2 sw = vload2(0, (global const uint *)(sp + b * 16 + 8 * n));
++            const int sh = 8 * (is & 1);
++            const float s0 = (float)(char)((sw.s0 >> sh) & 0xFF), s1 = (float)(char)((sw.s0 >> (sh + 16)) & 0xFF);
++            const float s2 = (float)(char)((sw.s1 >> sh) & 0xFF), s3 = (float)(char)((sw.s1 >> (sh + 16)) & 0xFF);
++            const float d = vload_half(0, dp + b);
++            #pragma unroll
++            for (int cc = 0; cc < MAXC; ++cc) {
++                const int i0 = dot2_ss(w0, x0[cc]), i1 = dot2_ss(w1, x1[cc]);
++                const int i2 = dot2_ss(w2, x2[cc]), i3 = dot2_ss(w3, x3[cc]);
++                const int k0 = dot2_ss(w0, y0[cc]), k1 = dot2_ss(w1, y1[cc]);
++                const int k2 = dot2_ss(w2, y2[cc]), k3 = dot2_ss(w3, y3[cc]);
++                acc[r][cc] += d * (s0 * (d0[cc] * (float)i0 + e0[cc] * (float)k0) + s1 * (d1[cc] * (float)i1 + e1[cc] * (float)k1) +
++                                   s2 * (d2[cc] * (float)i2 + e2[cc] * (float)k2) + s3 * (d3[cc] * (float)i3 + e3[cc] * (float)k3));
++            }
++        }
++    }
++    reduce_store(acc, out, ostride, first_row, ne01);
++}
++
++#define FIRST_ROW (int)((get_group_id(0) * N_SIMDGROUP + get_sub_group_id()) * N_DST)
++
++// ---- one weight matrix times NCOLS packed columns; dst column c at
++// offd + c * nb1 ----
++
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_mul_mv_q4_K_q8_1(
++    global const uchar * q, global const uchar * s, global const half * d, global const half * dm,
++    global const char * xq, global const float * xd, global const float * xs,
++    global char * dst, ulong offd, ulong nb1, int ne00, int ne01) {
++    const int first_row = FIRST_ROW;
++    if (first_row >= ne01) return;
++    const int nb = ne00 / QK_K;
++    mv_q45_K(q, q, s, d, dm, 0, (ulong)first_row * nb, nb, first_row, ne01, xq, xd, xs, (global float *)(dst + offd),
++             nb1 / sizeof(float), (ulong)ne00 * NCOLS);
++}
++
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_mul_mv_q5_K_q8_1(
++    global const uchar * q, global const uchar * qh, global const uchar * s, global const half * d, global const half * dm,
++    global const char * xq, global const float * xd, global const float * xs,
++    global char * dst, ulong offd, ulong nb1, int ne00, int ne01) {
++    const int first_row = FIRST_ROW;
++    if (first_row >= ne01) return;
++    const int nb = ne00 / QK_K;
++    mv_q45_K(q, qh, s, d, dm, 1, (ulong)first_row * nb, nb, first_row, ne01, xq, xd, xs, (global float *)(dst + offd),
++             nb1 / sizeof(float), (ulong)ne00 * NCOLS);
++}
++
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_mul_mv_q6_K_q8_1(
++    global const uchar * ql, global const uchar * qh, global const char * s, global const half * d,
++    global const char * xq, global const float * xd,
++    global char * dst, ulong offd, ulong nb1, int ne00, int ne01) {
++    const int first_row = FIRST_ROW;
++    if (first_row >= ne01) return;
++    const int nb = ne00 / QK_K;
++    mv_q6_K(ql, qh, s, d, (ulong)first_row * nb, nb, first_row, ne01, xq, xd, (global float *)(dst + offd),
++            nb1 / sizeof(float), (ulong)ne00 * NCOLS);
++}
++
++// ---- MUL_MAT_ID: expert matrices [ne00, ne01, n_expert], activations
++// [ne00, ne11, n_tokens] quantized contiguously, ids [n_used, n_tokens] ----
++// Pair k = get_group_id(2): slot i = k % n_used, token t = k / n_used; its
++// expert is ids[t][i], its column (i % ne11) + t * ne11, its output
++// dst + t * nb2 + i * nb1.
++
++#define ID_PROLOGUE                                                                         \
++    const int first_row = FIRST_ROW;                                                        \
++    if (first_row >= ne01) return;                                                          \
++    const int nb = ne00 / QK_K;                                                             \
++    const int k = get_group_id(2);                                                          \
++    const int i = k % n_used, t = k / n_used;                                               \
++    const int e = ((global const int *)((global const char *)ids + offi + t * nbi1))[i];    \
++    const int col = (i % ne11) + t * ne11;                                                  \
++    const ulong blk0 = ((ulong)e * ne01 + first_row) * nb;                                  \
++    global const char * cxq = xq + (ulong)col * ne00;                                       \
++    global const float * cxd = xd + (ulong)col * (ne00 / 32);                               \
++    global float * out = (global float *)(dst + offd + t * nb2 + i * nb1);
++
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_mul_mv_id_q4_K_q8_1(
++    global const uchar * q, global const uchar * s, global const half * d, global const half * dm,
++    global const char * xq, global const float * xd, global const float * xs,
++    global const char * ids, ulong offi, ulong nbi1, int n_used, int ne11,
++    global char * dst, ulong offd, ulong nb1, ulong nb2, int ne00, int ne01, ulong res) {
++    ID_PROLOGUE
++    mv_q45_K(q, q, s, d, dm, 0, blk0, nb, first_row, ne01, cxq, cxd, xs + (ulong)col * (ne00 / 32), out, 0, res);
++}
++
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_mul_mv_id_q5_K_q8_1(
++    global const uchar * q, global const uchar * qh, global const uchar * s, global const half * d, global const half * dm,
++    global const char * xq, global const float * xd, global const float * xs,
++    global const char * ids, ulong offi, ulong nbi1, int n_used, int ne11,
++    global char * dst, ulong offd, ulong nb1, ulong nb2, int ne00, int ne01, ulong res) {
++    ID_PROLOGUE
++    mv_q45_K(q, qh, s, d, dm, 1, blk0, nb, first_row, ne01, cxq, cxd, xs + (ulong)col * (ne00 / 32), out, 0, res);
++}
++
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_mul_mv_id_q6_K_q8_1(
++    global const uchar * ql, global const uchar * qh, global const char * s, global const half * d,
++    global const char * xq, global const float * xd,
++    global const char * ids, ulong offi, ulong nbi1, int n_used, int ne11,
++    global char * dst, ulong offd, ulong nb1, ulong nb2, int ne00, int ne01, ulong res) {
++    ID_PROLOGUE
++    mv_q6_K(ql, qh, s, d, blk0, nb, first_row, ne01, cxq, cxd, out, 0, res);
++}

@@ -79,5 +79,7 @@ sglang-jax (#1675), Megatron-LM (trainable QSA with TileLang, #7060).
   llama.cpp #28699 in arcint's option-A form.
 - Keep the state's shapes stable (bucketed capacity), so the plugin doesn't
   redo shape inference and allocation per token.
-- Hold selection bit-identical to the step-1/2 cells (#28699 and #28213 both
-  report bit- or byte-identical greedy output against the recompute path).
+- Hold the cache path to the answer-level bar (`CLAUDE.md`) against the
+  step-1/2 recompute path: answers right, mean KL at most 0.03 nats worse,
+  argmax agreement down at most 1 point (#28699 and #28213 both report bit-
+  or byte-identical greedy output against their recompute paths).

@@ -277,6 +277,23 @@ does not target, and its correctness cells are in its own header.
   B60 dense `d48q8`, 20,085 tokens: prefill 63.1 vs base 64.2 t/s, decode 6.5
   vs base 5.9.
 
+- **0076 — adaptive expert cache and Strata's RAM budget** (`+p26`): the
+  card's expert slots follow the conversation (decayed usage counts,
+  non-blocking admission), the host bank's RAM exchange, a fixed bank, and
+  the router lookahead. Opt-in: `MOE_CPU_TIER_ADAPTIVE=1`,
+  `MOE_CPU_BANK_FIXED=1`, `MOE_CPU_TIER_LOOKAHEAD`. B60 dense `d48q8`,
+  20,085 tokens: needle decode 7.5 -> 10.3 t/s, 500-token decode 10.8 ->
+  12.4, needle right.
+- **0077 — the tier hand-off doorbell** (`+p27`): the decode MoE layers
+  route on the device, publish the CPU tier's work to host memory and poll
+  for its rows. The enqueueing thread submits the whole decode step ahead.
+  Opt-in: `MOE_DOORBELL=1`. Over 0076: needle decode 10.7 -> 12.7 t/s,
+  500-token decode 14.0 -> 16.0. On the B60 a kernel sees a host-written
+  flag only through an L1/L3-uncached load.
+
+(0075 is not in the series.) The shipped runtime floor stays `+p25`; 0076
+and 0077 serve opt-in switches only.
+
 Standing configuration these add up to: the full-depth Qwen3.6-35B native
 artifact all-resident on the 16 GiB card at ~960 t/s prefill (4,096 tokens)
 and 28.1 t/s decode, max context 112,288 at u8 KV.

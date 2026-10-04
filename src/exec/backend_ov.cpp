@@ -76,6 +76,8 @@
 #include "exec/graph_rewrites.h"
 #include "exec/ngram_ports.h"
 #include "exec/ngram_staging.h"
+#include "exec/ngram_reader.h"
+#include "exec/chat_json.h"
 #include "exec/ngram_table.h"
 #include "core/gguf_dequant.h"
 #include "exec/kquant_op.h"
@@ -84,6 +86,7 @@
 #include "core/dflash_select.h"
 #include "core/dflash_window.h"
 #include "core/drafter.h"
+#include "core/draft_policy.h"
 #include "core/prefix_cache.h"
 #include "core/sampler.h"
 #include "core/turnstile.h"
@@ -715,6 +718,34 @@ int64_t paged_logits_token_axis(const std::shared_ptr<ov::Model>& model) {
 }
 
 bool expose_hidden_state(const std::shared_ptr<ov::Model>& model) {
+    // A hyper-connection backbone (Flash-Next, q4e serving shape): the MTP
+    // draft layer reads the last layer's multi-stream residual
+    // (`layer{N-1}/out`, hc*H wide), not the head's input after the final
+    // mixer (Strata: "the main model's final multi-stream residual",
+    // include/strata/core/mtp.hpp:4).
+    {
+        std::shared_ptr<ov::Node> last;
+        long                      best = -1;
+        for (const auto& op : model->get_ops()) {
+            const std::string& n = op->get_friendly_name();
+            if (n.size() > 9 && n.compare(0, 5, "layer") == 0 && n.compare(n.size() - 4, 4, "/out") == 0) {
+                char*      end = nullptr;
+                const long i   = std::strtol(n.c_str() + 5, &end, 10);
+                if (end == n.c_str() + n.size() - 4 && i > best) {
+                    best = i;
+                    last = op;
+                }
+            }
+        }
+        if (last) {
+            const auto res = std::make_shared<ov::op::v0::Result>(last->output(0));
+            res->get_output_tensor(0).set_names({"hidden_states"});
+            model->add_results({res});
+            model->validate_nodes_and_infer_types();
+            log::info("mtp", "hidden state for the draft layer: layer%ld/out (the multi-stream residual)", best);
+            return true;
+        }
+    }
     auto node = find_projection_head(model);
     if (!node) {
         log::warn("mtp", "could not find the projection head; hidden state not exposed");
@@ -804,6 +835,10 @@ public:
     // by another lane, so the decode loop needs no lock of its own.
     struct Lane {
         int              index = 0;
+        // The prompt-lookup cost policy (core/draft_policy.h): learned per
+        // lane over its requests; the current round's lookup match length.
+        lgc::DraftPolicy draft_policy;
+        int              policy_match = -1;  // -1: this round's drafts are not a policy-gated lookup
         ov::InferRequest req;        // the paged language model; unused on --no-paged
         ov::InferRequest embed;      // the embeddings gather
         // FEED-THE-PORTS: the ids `embed_paged` last embedded for this lane
@@ -818,6 +853,7 @@ public:
         // window would let one lane's rows overwrite another's before its
         // infer (DESIGN 7.0.2cz).
         ov::RemoteTensor     ngram_staging;
+        uint64_t             ngram_ticket = 0;   // rows issued, not yet collected
         // The MTP head carries its own attention KV over the prefix, so it
         // needs its own request per lane as well: a shared head would let one
         // sequence draft from the other's prefix, which is cross-slot bleed in
@@ -829,6 +865,13 @@ public:
         bool             mtp_has_pending = false;
         size_t           mtp_len = 0;      // positions in the head's KV
         size_t           mtp_pos = 0;      // true position, for rope
+        // The chaining draft layer (Flash-Next, tools/export_mtp_flash_next.py):
+        // the last step's own residual, the input of the next draft step, and
+        // the last draft's probability under the layer (Strata's min_p gate).
+        ov::Tensor       mtp_chain_R;
+        float            mtp_last_p = 0.0f;
+        std::vector<float> mtp_probs;      // this round's drafts' probabilities
+        bool             policy_mtp = false;  // this round's window was the policy's MTP pick
 
         // DFlash2 (docs/dflash-pairing-probe.md). The draft's context KV lives
         // in dflash_req's graph state and only ever receives ACCEPTED
@@ -1340,6 +1383,16 @@ public:
     // into a destroyed BlockPool is undefined behaviour that happens to look
     // like a clean shutdown most of the time.
     ~OvBackend() override {
+        if (depth_proposed_[0].load() > 0) {
+            std::string line;
+            for (size_t k = 0; k < kDepthBuckets && depth_proposed_[k].load() > 0; ++k) {
+                const uint64_t pr = depth_proposed_[k].load(), ac = depth_accepted_[k].load();
+                line += log::format("%sdepth %zu: %llu/%llu (%.1f %%)", k ? ", " : "", k + 1,
+                                    static_cast<unsigned long long>(ac), static_cast<unsigned long long>(pr),
+                                    100.0 * static_cast<double>(ac) / static_cast<double>(pr));
+            }
+            log::info("draft", "acceptance by draft depth: %s", line.c_str());
+        }
         for (auto& lane : lanes_) {
             if (lane != nullptr) release_lane(*lane);
         }
@@ -2221,10 +2274,39 @@ private:
                 used_dflash = dflash_active(lane);
             } else if (mtp_ready_ && in.sampler.greedy()) {
                 const int d = mtp_feed(lane, next, true);
-                if (d >= 0) drafts.push_back(d);
+                lane.policy_mtp = false;
+                if (d >= 0) {
+                    drafts.push_back(d);
+                    lane.mtp_probs.assign(1, lane.mtp_last_p);
+                    mtp_chain(lane, drafts);
+                    // The cost policy's MTP side (core/draft_policy.h): verify
+                    // the chain only as far as it pays at this window cost;
+                    // ARCINT_DRAFT_POLICY=0 verifies every draft.
+                    if (mtp_chain_ && draft_policy_on()) {
+                        const int k = lane.draft_policy.choose_chain(lane.mtp_probs.data(),
+                                                                      static_cast<int>(drafts.size()));
+                        drafts.resize(static_cast<size_t>(k));
+                        lane.mtp_probs.resize(static_cast<size_t>(k));
+                        lane.policy_mtp = true;
+                    }
+                }
             } else if (drafting_.load() && in.sampler.greedy()) {
                 drafts = drafter_->draft(history, draft_tokens_);
                 if (drafts.size() > drafts_max_) drafts.resize(drafts_max_);
+                // The cost policy (core/draft_policy.h, Strata's): verify the
+                // lookup window only when its expected tokens per ms beat a
+                // plain step; ARCINT_DRAFT_POLICY=0 verifies every proposal.
+                lane.policy_match = -1;
+                if (draft_policy_on()) {
+                    const auto* ng = dynamic_cast<const lgc::NgramDrafter*>(drafter_.get());
+                    const int match = ng ? static_cast<int>(ng->last_match()) : 0;
+                    const auto pk = lane.draft_policy.choose(1, static_cast<int>(drafts.size()), match);
+                    if (!pk.lookup)
+                        drafts.clear();
+                    else if (drafts.size() > static_cast<size_t>(pk.t - 1))
+                        drafts.resize(static_cast<size_t>(pk.t - 1));
+                    lane.policy_match = match;
+                }
             }
             const double propose_ms =
                 1000.0 * (seconds_since_tp(t_propose) - (lane.stall_accum - propose_waited));
@@ -2272,6 +2354,9 @@ private:
                 if (mtp_ready_) {
                     mtp_set_pending(lane, lane.hidden, 0);
                 }
+                // The policy's other side: what a plain step costs here.
+                if (lane.policy_match >= 0 || lane.policy_mtp)
+                    lane.draft_policy.observe(false, 1, 0, 0, 1000.0 * seconds_since_tp(t_propose));
                 // ARCINT_PROFILE_CYCLE on the plain decode step (no drafter): the
                 // host-side split of one served token -- the cycle line below is
                 // the drafting loop's and this branch leaves before it. index/
@@ -2403,6 +2488,13 @@ private:
                     ? std::chrono::duration<double, std::milli>(clock::now() - t_accept0).count()
                     : 0.0;
             stats.draft_accepted += static_cast<int>(accepted);
+            // Acceptance by draft depth (the P4 gate prints it): depth k was
+            // proposed when the window had more than k drafts, accepted when
+            // the first k+1 drafts all matched.
+            for (size_t k = 0; k < drafts.size() && k < kDepthBuckets; ++k) {
+                depth_proposed_[k].fetch_add(1, std::memory_order_relaxed);
+                if (k < accepted) depth_accepted_[k].fetch_add(1, std::memory_order_relaxed);
+            }
 
             // M11 dump instrument: dflash_dump_realized (computed above,
             // before any commit() in this cycle) already covers every draft
@@ -2438,6 +2530,14 @@ private:
                 rec["realized"]        = dflash_dump_realized;
                 dflash_dump_write(std::move(rec));
             }
+
+            if (lane.policy_match >= 0)
+                lane.draft_policy.observe(true, static_cast<int>(1 + drafts.size()), static_cast<int>(accepted),
+                                          lane.policy_match, 1000.0 * seconds_since_tp(t_propose));
+            if (lane.policy_mtp)
+                lane.draft_policy.observe_chain(static_cast<int>(1 + drafts.size()), lane.mtp_probs.data(),
+                                                static_cast<int>(drafts.size()), static_cast<int>(accepted),
+                                                1000.0 * seconds_since_tp(t_propose));
 
             if (stop) {
                 c = static_cast<size_t>(la_rows[1 + accepted]);
@@ -2693,6 +2793,17 @@ private:
         // One drafter per verify loop: an explicit --mtp on + --dflash is a
         // config error; mtp auto yields to the requested drafter.
         want_mtp_ = cfg.mtp != "off" && artifact_.has_mtp_head && !want_dflash_;
+        if (want_mtp_ && cfg.mtp != "on") {
+            // A chaining draft layer (Flash-Next, `kv_len` contract) is opt-in:
+            // on a free-form answer it decodes slower than plain on this card
+            // (11.9 against 14.6 t/s, B60), so --mtp auto leaves it off.
+            std::ifstream mx(choose_mtp_layer(artifact_, cfg.mtp_layer));
+            const std::string xml((std::istreambuf_iterator<char>(mx)), std::istreambuf_iterator<char>());
+            if (xml.find("name=\"kv_len\"") != std::string::npos) {
+                log::info("mtp", "%s", "the chaining draft layer is opt-in (--mtp on); serving without it");
+                want_mtp_ = false;
+            }
+        }
         if (want_mtp_ && !expose_hidden_state(model)) {
             log::warn("mtp", "%s", "could not expose the hidden state; MTP disabled");
             want_mtp_ = false;
@@ -2732,7 +2843,19 @@ private:
                 want_dflash_ = false;
             }
         }
-        drafts_max_ = std::max<size_t>(draft_tokens_, want_mtp_ ? 1 : 0);
+        if (want_mtp_) {
+            // A chaining draft layer declares `kv_len` (its xml says so before
+            // anything compiles); the window it drafts sizes the checkpoint rows.
+            std::ifstream mx(choose_mtp_layer(artifact_, cfg.mtp_layer));
+            const std::string xml((std::istreambuf_iterator<char>(mx)), std::istreambuf_iterator<char>());
+            if (xml.find("name=\"kv_len\"") != std::string::npos) {
+                const char* d = std::getenv("ARCINT_MTP_DRAFTS");
+                const char* p = std::getenv("ARCINT_MTP_MIN_P");
+                mtp_max_drafts_ = std::clamp<size_t>(d ? std::strtoul(d, nullptr, 10) : 3, 1, 8);
+                mtp_min_p_      = p ? static_cast<float>(std::atof(p)) : 0.5f;
+            }
+        }
+        drafts_max_ = std::max<size_t>(draft_tokens_, want_mtp_ ? mtp_max_drafts_ : 0);
         if (want_dflash_) drafts_max_ = std::max(drafts_max_, dflash_block_ - 1);
         rows_per_lane_ = drafts_max_ + 3;
 
@@ -3291,9 +3414,9 @@ private:
                 }
                 mtp_ready_ = true;
                 log::info("mtp",
-                          "head on %s, drafting one token per step%s; rope kept f32 on %zu "
+                          "head on %s, drafting %zu token(s) per step%s; rope kept f32 on %zu "
                           "node(s)%s",
-                          mtp_dev.c_str(),
+                          mtp_dev.c_str(), mtp_chain_ ? mtp_max_drafts_ : size_t{1},
                           draft_f32 ? " (ARCINT_DRAFT_F32: f32 inference precision)" : "",
                           mtp_rope_marked,
                           apply_rope_fix ? "" : " (ARCINT_DRAFT_ROPE_F16: fix disabled)");
@@ -3905,8 +4028,8 @@ private:
                         throw std::runtime_error(*refusal);
                     }
                     log::info("load", "%s",
-                              "host tier: plugin reports a static residency partition; "
-                              "the prefix cache is allowed");
+                              "host tier: plugin reports the static-partition mode "
+                              "(history-independent expert placement); the prefix cache is allowed");
                 }
             }
 
@@ -6520,6 +6643,10 @@ private:
         const size_t n   = embeds.get_shape()[0];
         const size_t tot = past + n;
         const size_t nblk = (tot + kv_block_tokens_ - 1) / kv_block_tokens_;
+        // The n-gram rows go out first (Strata issues them as soon as the
+        // token is known, exec/ngram_reader.h) and are collected just before
+        // the infer, so the reads run under the rest of this setup.
+        feed_ngram_ports(lane, past, n);
 
         auto i32 = [](std::vector<int32_t> v) {
             ov::Tensor t(ov::element::i32, ov::Shape{v.size()});
@@ -6583,7 +6710,6 @@ private:
         set_i32("la.block_indices_begins", {0, static_cast<int32_t>(la_rows.size())});
         set_i32("la.past_lens", {static_cast<int32_t>(past)});
         set_i32("la.cache_interval", {interval});
-        feed_ngram_ports(lane, past, n);
         // ARCINT_FORWARD_SPLIT=1: wall clock of the three parts of a paged
         // forward, averaged over 64 forwards and logged, so a served step's
         // cost can be attributed to the graph, the logits readback or the
@@ -6613,6 +6739,11 @@ private:
             // std::chrono::steady_clock::now() costs tens of nanoseconds,
             // negligible against a forward measured in milliseconds -- an
             // always-on read here is not a measurable tax.
+            if (lane.ngram_ticket != 0) {
+                const uint64_t t = lane.ngram_ticket;
+                lane.ngram_ticket = 0;
+                ngram_reader_->collect(t);
+            }
             const auto t0 = std::chrono::steady_clock::now();
             lane.req.infer();
             const auto t1 = std::chrono::steady_clock::now();
@@ -6720,6 +6851,13 @@ private:
     void read_mtp_contract(const ov::CompiledModel& layer, const std::string& path) {
         mtp_embeds_name_ = "input_embeds";
         mtp_mask_2d_     = false;
+        mtp_kv_len_      = false;
+        mtp_chain_       = false;
+        for (const auto& port : layer.inputs())
+            if (port.get_any_name() == "kv_len") mtp_kv_len_ = true;
+        for (const auto& port : layer.outputs())
+            if (port.get_names().count("mtp_residual")) mtp_chain_ = true;
+        mtp_chain_ = mtp_chain_ && mtp_kv_len_;
         for (const auto& port : layer.inputs()) {
             const std::string name = port.get_any_name();
             if (name == "inputs_embeds") mtp_embeds_name_ = name;
@@ -6728,6 +6866,12 @@ private:
                 mtp_mask_type_ = port.get_element_type();
             }
             if (name == "position_ids") mtp_pos_type_ = port.get_element_type();
+        }
+        if (mtp_kv_len_) {
+            log::info("mtp", "layer %s: kv_len state contract, %s, chaining %zu draft(s) while p >= %.2f",
+                      path.c_str(), mtp_chain_ ? "residual output" : "no residual output",
+                      mtp_chain_ ? mtp_max_drafts_ : size_t{1}, mtp_min_p_);
+            return;
         }
         log::info("mtp", "layer %s: %s, %s mask, %s positions",
                   path.find("openvino_mtp_model") != std::string::npos ? "(optimum-intel export)"
@@ -6765,19 +6909,120 @@ private:
         return m;
     }
 
+    static bool draft_policy_on() {
+        static const bool on = [] {
+            const char* v = std::getenv("ARCINT_DRAFT_POLICY");
+            return v == nullptr || std::string(v) != "0";
+        }();
+        return on;
+    }
+
+    ov::Tensor mtp_kv_len_tensor(size_t n) const {
+        ov::Tensor t(ov::element::i64, ov::Shape{1});
+        t.data<int64_t>()[0] = static_cast<int64_t>(n);
+        return t;
+    }
+
+    // One token's embedding as [1, 1, H]: the file's own rows on the host
+    // when the backbone embeds there (embed_paged), else the embed model.
+    ov::Tensor mtp_embed_token(Lane& lane, int token) {
+        if (gguf_embed_.t != nullptr) {
+            if (token < 0 || static_cast<size_t>(token) >= gguf_embed_.vocab)
+                throw std::runtime_error(log::format("mtp: token id %d outside the embedding", token));
+            ov::Tensor out(ov::element::f32, ov::Shape{1, 1, gguf_embed_.width});
+            gguf::dequantize_row(gguf_embed_.t->ggml_type,
+                                 gguf_embed_.bytes.data() + static_cast<size_t>(token) * gguf_embed_.row_bytes,
+                                 gguf_embed_.width, out.data<float>());
+            return out;
+        }
+        ov::Tensor ids(ov::element::i64, ov::Shape{1, 1});
+        ids.data<int64_t>()[0] = token;
+        lane.embed.set_input_tensor(ids);
+        lane.embed.infer();
+        const ov::Tensor src = lane.embed.get_output_tensor(0);
+        ov::Tensor       emb(src.get_element_type(), src.get_shape());
+        std::memcpy(emb.data(), src.data(), src.get_byte_size());
+        return emb;
+    }
+
+    // The head's argmax over the last row of its logits and that token's
+    // probability (a softmax over the row: Strata's row_top_prob).
+    int mtp_head_pick(Lane& lane, float* prob) {
+        lane.mtp_head.set_input_tensor(lane.mtp_layer.get_output_tensor(0));
+        lane.mtp_head.infer();
+        const ov::Tensor lg   = lane.mtp_head.get_output_tensor(0);
+        const size_t     v    = lg.get_shape().back();
+        const size_t     rows = v ? lg.get_size() / v : 0;
+        if (rows == 0) return -1;
+        const float* row = lg.data<const float>() + (rows - 1) * v;
+        const int    id  = Sampler::argmax(row, v);
+        if (prob) {
+            const float mx  = row[id];
+            double      sum = 0.0;
+            for (size_t i = 0; i < v; ++i) sum += std::exp(static_cast<double>(row[i] - mx));
+            *prob = static_cast<float>(1.0 / sum);
+        }
+        return id;
+    }
+
+    // The draft layer's own residual of its last row, kept for the next step.
+    void mtp_keep_residual(Lane& lane) {
+        const ov::Tensor r     = lane.mtp_layer.get_tensor("mtp_residual");
+        const size_t     width = r.get_shape().back();
+        const size_t     rows  = r.get_size() / width;
+        if (!lane.mtp_chain_R || lane.mtp_chain_R.get_shape() != ov::Shape{1, 1, width})
+            lane.mtp_chain_R = ov::Tensor(ov::element::f32, ov::Shape{1, 1, width});
+        std::memcpy(lane.mtp_chain_R.data(), r.data<const float>() + (rows - 1) * width, width * 4);
+    }
+
+    // Strata's draft chain (src/core/mtp.cpp:771-820): after the anchor step
+    // drafted d0 with probability p0, each further step pairs the layer's own
+    // residual with the last draft at the next cell, while the last draft is
+    // at least min_p likely, up to the window's drafts. The cells it writes
+    // are speculative: they sit past `mtp_len`, and the next committed feed
+    // (kv_len = mtp_len) drops them.
+    void mtp_chain(Lane& lane, std::vector<int>& drafts) {
+        if (!mtp_chain_ || drafts.empty()) return;
+        with_turn(lane, [&] {
+            try {
+                for (size_t j = 1; j < mtp_max_drafts_ && lane.mtp_last_p >= mtp_min_p_; ++j) {
+                    const ov::Tensor emb = mtp_embed_token(lane, drafts.back());
+                    lane.mtp_layer.set_tensor("hidden_states", lane.mtp_chain_R);
+                    lane.mtp_layer.set_tensor(mtp_embeds_name_, emb);
+                    lane.mtp_layer.set_tensor("position_ids", mtp_positions(lane.mtp_pos + j - 1, 1));
+                    lane.mtp_layer.set_tensor("kv_len", mtp_kv_len_tensor(lane.mtp_len + j - 1));
+                    lane.mtp_layer.infer();
+                    float      p = 0.0f;
+                    const int  d = mtp_head_pick(lane, &p);
+                    if (d < 0) break;
+                    mtp_keep_residual(lane);
+                    drafts.push_back(d);
+                    lane.mtp_probs.push_back(p);
+                    lane.mtp_last_p = p;
+                }
+            } catch (const std::exception& e) {
+                log::warn("mtp", "draft chain failed, disabling the head: %s", e.what());
+                mtp_ready_ = false;
+            }
+        });
+    }
+
     // Batched head priming over one prefill chunk: pairs (h_t, x_{t+1}) within
     // the chunk, the chunk-boundary pair carried through the lane's pending row.
     void mtp_prime_paged(Lane& lane, const ov::Tensor& hidden, const ov::Tensor& embeds,
                          size_t take) {
         if (!mtp_ready_ || take == 0) return;
         try {
+            // The hidden row and the embedding differ in width on a
+            // hyper-connection backbone (hc*H against H).
             const size_t width  = hidden.get_shape().back();
+            const size_t ewidth = embeds.get_shape().back();
             const bool   carry  = lane.mtp_has_pending;
             const size_t pairs  = (take - 1) + (carry ? 1 : 0);
             if (pairs == 0) { mtp_set_pending(lane, hidden, take - 1); return; }
 
             ov::Tensor h(ov::element::f32, ov::Shape{1, pairs, width});
-            ov::Tensor e(ov::element::f32, ov::Shape{1, pairs, width});
+            ov::Tensor e(ov::element::f32, ov::Shape{1, pairs, ewidth});
             float* hp = h.data<float>();
             float* ep = e.data<float>();
             const float* hv = hidden.data<const float>();
@@ -6785,12 +7030,12 @@ private:
             size_t r = 0;
             if (carry) {
                 std::memcpy(hp, lane.mtp_pending.data(), width * 4);
-                std::memcpy(ep, ev, width * 4);
+                std::memcpy(ep, ev, ewidth * 4);
                 ++r;
             }
             for (size_t i = 0; i + 1 < take; ++i, ++r) {
                 std::memcpy(hp + r * width, hv + i * width, width * 4);
-                std::memcpy(ep + r * width, ev + (i + 1) * width, width * 4);
+                std::memcpy(ep + r * ewidth, ev + (i + 1) * ewidth, ewidth * 4);
             }
 
             // In slices: an MoE head (Qwen3.6) computes every expert for every
@@ -6802,16 +7047,20 @@ private:
             for (size_t at = 0; at < pairs; at += kPrimeSlice) {
                 const size_t n = std::min(kPrimeSlice, pairs - at);
                 ov::Tensor hs(ov::element::f32, ov::Shape{1, n, width}, hp + at * width);
-                ov::Tensor es(ov::element::f32, ov::Shape{1, n, width}, ep + at * width);
+                ov::Tensor es(ov::element::f32, ov::Shape{1, n, ewidth}, ep + at * ewidth);
                 const ov::Tensor pos  = mtp_positions(lane.mtp_pos, n);
-                const ov::Tensor mask = mtp_mask(lane.mtp_len, n);
+                const ov::Tensor mask = mtp_kv_len_ ? ov::Tensor() : mtp_mask(lane.mtp_len, n);
                 ov::Tensor beam(ov::element::i32, ov::Shape{1});
                 beam.data<int32_t>()[0] = 0;
                 lane.mtp_layer.set_tensor("hidden_states", hs);
                 lane.mtp_layer.set_tensor(mtp_embeds_name_, es);
                 lane.mtp_layer.set_tensor("position_ids", pos);
-                lane.mtp_layer.set_tensor("attention_mask", mask);
-                lane.mtp_layer.set_tensor("beam_idx", beam);
+                if (mtp_kv_len_) {
+                    lane.mtp_layer.set_tensor("kv_len", mtp_kv_len_tensor(lane.mtp_len));
+                } else {
+                    lane.mtp_layer.set_tensor("attention_mask", mask);
+                    lane.mtp_layer.set_tensor("beam_idx", beam);
+                }
                 with_turn(lane, [&] { lane.mtp_layer.infer(); });
                 lane.mtp_len += n;
                 lane.mtp_pos += n;
@@ -7436,41 +7685,11 @@ private:
     }
 
     static json messages_json(const ChatRequest& req, bool object_arguments) {
-        json out = json::array();
-        for (const ChatMessage& m : req.messages) {
-            json msg{{"role", m.role}, {"content", m.content}};
-            if (!m.name.empty()) msg["name"] = m.name;
-            if (!m.tool_call_id.empty()) msg["tool_call_id"] = m.tool_call_id;
-            if (!m.tool_calls.empty()) {
-                json calls = json::array();
-                for (const ToolCall& c : m.tool_calls) {
-                    calls.push_back({{"id", c.id},
-                                     {"type", "function"},
-                                     {"function",
-                                      {{"name", c.name},
-                                       {"arguments", tool_call_arguments_for_template(
-                                                         c.arguments, object_arguments)}}}});
-                }
-                msg["tool_calls"] = std::move(calls);
-                if (m.content.empty()) msg["content"] = nullptr;
-            }
-            out.push_back(std::move(msg));
-        }
-        return out;
+        return chat_messages_json(req, object_arguments);
     }
 
-    static json tools_json(const ChatRequest& req) {
-        if (req.tools.empty()) return json();
-        json out = json::array();
-        for (const ToolSpec& t : req.tools) {
-            out.push_back({{"type", "function"},
-                           {"function",
-                            {{"name", t.name},
-                             {"description", t.description},
-                             {"parameters", t.parameters}}}});
-        }
-        return out;
-    }
+    static json tools_json(const ChatRequest& req) { return chat_tools_json(req); }
+
 
     // Runs the embeddings graph then the language model for `ids`, with `past`
     // tokens already in the graph's state.
@@ -7593,38 +7812,38 @@ private:
     }
 
     int mtp_feed_locked(Lane& lane, int next, bool want_draft) {
+        const char* stage = "embed";
         try {
             // M11 step profile: four steady_clock::now() reads per head step,
             // unconditional, on the same "tens of nanoseconds against a
             // forward measured in milliseconds" argument paged_forward
             // already makes for its own t0..t3.
-            const auto pt0 = std::chrono::steady_clock::now();
-            ov::Tensor ids(ov::element::i64, ov::Shape{1, 1});
-            ids.data<int64_t>()[0] = next;
-            lane.embed.set_input_tensor(ids);
-            lane.embed.infer();
-            const ov::Tensor src = lane.embed.get_output_tensor(0);
-            ov::Tensor       emb(src.get_element_type(), src.get_shape());
-            std::memcpy(emb.data(), src.data(), src.get_byte_size());
-            const auto pt1 = std::chrono::steady_clock::now();
+            const auto       pt0 = std::chrono::steady_clock::now();
+            const ov::Tensor emb = mtp_embed_token(lane, next);
+            const auto       pt1 = std::chrono::steady_clock::now();
             lane.mtp_step_ms_embed =
                 std::chrono::duration<double, std::milli>(pt1 - pt0).count();
 
-            const ov::Tensor pos  = mtp_positions(lane.mtp_pos, 1);
-            // Nothing is masked: the head attends to its whole committed prefix.
-            const ov::Tensor mask = mtp_mask(lane.mtp_len, 1);
+            const ov::Tensor pos = mtp_positions(lane.mtp_pos, 1);
+            stage = "set hidden_states";
+            lane.mtp_layer.set_tensor("hidden_states", lane.mtp_pending);
+            stage = "set inputs";
+            lane.mtp_layer.set_tensor(mtp_embeds_name_, emb);
+            lane.mtp_layer.set_tensor("position_ids", pos);
+            if (mtp_kv_len_) {
+                // the committed cells only: speculative chain cells drop here
+                lane.mtp_layer.set_tensor("kv_len", mtp_kv_len_tensor(lane.mtp_len));
+            } else {
+                // Nothing is masked: the head attends to its whole committed prefix.
+                lane.mtp_layer.set_tensor("attention_mask", mtp_mask(lane.mtp_len, 1));
+                ov::Tensor beam(ov::element::i32, ov::Shape{1});
+                beam.data<int32_t>()[0] = 0;
+                lane.mtp_layer.set_tensor("beam_idx", beam);
+            }
             const auto pt2 = std::chrono::steady_clock::now();
             lane.mtp_step_ms_mask =
                 std::chrono::duration<double, std::milli>(pt2 - pt1).count();
-
-            ov::Tensor beam(ov::element::i32, ov::Shape{1});
-            beam.data<int32_t>()[0] = 0;
-
-            lane.mtp_layer.set_tensor("hidden_states", lane.mtp_pending);
-            lane.mtp_layer.set_tensor(mtp_embeds_name_, emb);
-            lane.mtp_layer.set_tensor("position_ids", pos);
-            lane.mtp_layer.set_tensor("attention_mask", mask);
-            lane.mtp_layer.set_tensor("beam_idx", beam);
+            stage = "layer infer";
             lane.mtp_layer.infer();
             const auto pt3 = std::chrono::steady_clock::now();
             lane.mtp_step_ms_layer =
@@ -7637,26 +7856,20 @@ private:
                 lane.mtp_step_ms_head = 0.0;
                 return -1;
             }
-
-            lane.mtp_head.set_input_tensor(lane.mtp_layer.get_output_tensor(0));
-            lane.mtp_head.infer();
-            const ov::Tensor lg   = lane.mtp_head.get_output_tensor(0);
-            const size_t     v    = lg.get_shape().back();
-            const size_t     rows = v ? lg.get_size() / v : 0;
-            if (rows == 0) {
-                lane.mtp_step_ms_head =
-                    std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - pt3)
-                        .count();
-                return -1;
+            float     p       = 0.0f;
+            stage = "head";
+            const int drafted = mtp_head_pick(lane, mtp_chain_ ? &p : nullptr);
+            if (mtp_chain_ && drafted >= 0) {
+                stage = "keep residual";
+                mtp_keep_residual(lane);
+                lane.mtp_last_p = p;
             }
-            const int drafted = Sampler::argmax(lg.data<const float>() + (rows - 1) * v, v);
             lane.mtp_step_ms_head =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pt3)
                     .count();
             return drafted;
         } catch (const std::exception& e) {
-            log::warn("mtp", "head failed, disabling it for this process: %s", e.what());
+            log::warn("mtp", "head failed at %s, disabling it for this process: %s", stage, e.what());
             mtp_ready_ = false;
             return -1;
         }
@@ -8244,6 +8457,20 @@ private:
     bool                           mtp_mask_2d_      = false;
     ov::element::Type              mtp_mask_type_    = ov::element::f32;
     ov::element::Type              mtp_pos_type_     = ov::element::f32;
+    // The chaining contract (tools/export_mtp_flash_next.py): a `kv_len` input
+    // that keeps the first kv_len cells of the layer's state, so speculative
+    // cells are dropped by the next call, and a `mtp_residual` output that
+    // feeds the next draft step. ARCINT_MTP_DRAFTS (default 3) drafts a
+    // window at most; ARCINT_MTP_MIN_P (default 0.5) continues the chain only
+    // while the last draft is at least that likely (Strata
+    // src/core/mtp.cpp:771-820; the roadmap's P4 gate).
+    static constexpr size_t        kDepthBuckets     = 8;
+    std::atomic<uint64_t>          depth_proposed_[kDepthBuckets] = {};
+    std::atomic<uint64_t>          depth_accepted_[kDepthBuckets] = {};
+    bool                           mtp_kv_len_       = false;
+    bool                           mtp_chain_        = false;
+    size_t                         mtp_max_drafts_   = 1;
+    float                          mtp_min_p_        = 0.5f;
     int                            paged_n_ctx_      = 0;
     size_t                         paged_sections_   = 4;    // position_ids dim 0
     bool                           paged_pos_flat_   = false;  // position_ids is the pass's flat [-1]
@@ -8353,6 +8580,10 @@ private:
     bool                          ngram_staging_active_ = false;
     ngram::StagingGeometry        ngram_staging_geom_{};
     int                           ngram_staging_fd_     = -1;
+    // Strata's PLE reader (exec/ngram_reader.h): O_DIRECT page reads on an I/O
+    // pool, a row cache, issue/collect around the forward's setup.
+    // ARCINT_NGRAM_READER=0 keeps the synchronous pread (A/B arm).
+    std::unique_ptr<ngram::RowReader> ngram_reader_;
     uint64_t                      ngram_staging_base_   = 0;
     std::optional<ngram::HashParams> ngram_hash_;
 
@@ -8428,6 +8659,16 @@ private:
                     gguf_path_.c_str()));
             ngram_staging_base_ = static_cast<uint64_t>(gguf_file_->data_offset()) +
                                   static_cast<uint64_t>(t->offset);
+            {
+                const char* v = std::getenv("ARCINT_NGRAM_READER");
+                if (v == nullptr || std::string(v) != "0") {
+                    ngram_reader_ = std::make_unique<ngram::RowReader>(
+                        gguf_path_, ngram_staging_base_, ngram_staging_geom_.table_rows,
+                        ngram_staging_geom_.row_bytes);
+                    log::info("ngram", "staged rows read by the I/O pool (%s, row cache, keep-alive)",
+                              ngram_reader_->direct() ? "O_DIRECT" : "buffered");
+                }
+            }
             const ov::Shape sh{ngram_staging_geom_.staging_rows,
                                ngram_staging_geom_.row_bytes};
             for (auto& lane : lanes_) {
@@ -8551,9 +8792,22 @@ private:
             // names, then index it by the slot the plan assigned (local[i] = i)
             void* dst =
                 lane.ngram_staging.get_params().at(ov::intel_gpu::mem_handle.name()).as<void*>();
-            local = ngram::stage_from_file(ngram_staging_fd_, ngram_staging_base_,
-                                           ngram_staging_geom_.row_bytes, global,
-                                           ngram_staging_geom_, static_cast<uint8_t*>(dst));
+            if (ngram_reader_) {
+                // A ticket a thrown forward left behind still writes into
+                // this lane's window: finish it before reusing the window.
+                if (lane.ngram_ticket != 0) {
+                    const uint64_t old = lane.ngram_ticket;
+                    lane.ngram_ticket = 0;
+                    ngram_reader_->collect(old);
+                }
+                std::vector<uint64_t> rows;
+                ngram::plan_staging_fill(global, ngram_staging_geom_, local, rows);
+                lane.ngram_ticket = ngram_reader_->issue(rows, static_cast<uint8_t*>(dst));
+            } else {
+                local = ngram::stage_from_file(ngram_staging_fd_, ngram_staging_base_,
+                                               ngram_staging_geom_.row_bytes, global,
+                                               ngram_staging_geom_, static_cast<uint8_t*>(dst));
+            }
             chunk.assign(local.size(), 0);
         } else {
             ngram::split_by_partition(global, ngram_ports_, chunk, local);

@@ -14,6 +14,24 @@ struct Config {
     // Exactly one of these selects what gets served.
     std::string model_path;  // OpenVINO IR directory (M1+)
     std::string gguf_path;   // --gguf: weights from this GGUF, --model as the topology template (0.4.0)
+    // --engine: "ov" (the OpenVINO executor, --model an IR directory) or
+    // "llama" (ggml's OpenCL backend through libllama; the model is --gguf).
+    // The default: "llama" for --gguf without --model, else "ov".
+    std::string engine;
+    // --llama-cpu-moe N: on the libllama engine, the experts of the first N
+    // layers stay in host memory (memory-mapped from the GGUF) and llama.cpp's
+    // CPU backend computes them -- a model whose experts exceed VRAM.
+    // --llama-threads N: that backend's threads (0: half the hardware threads,
+    // the physical cores on SMT hosts).
+    // --llama-mtp N: up to N tokens drafted per verify by the GGUF's own MTP
+    // head (llama.cpp's draft-mtp); 0 off. A verify of N + 1 rows.
+    int llama_cpu_moe = 0;
+    int llama_threads = 0;
+    int llama_mtp     = 0;
+    // --llama-mtp-vocab FILE: the token ids the MTP head may draft (int32,
+    // or a JSON list); the draft steps then read those rows of the output
+    // head instead of all of them
+    std::string llama_mtp_vocab;
     std::string flash_next_ngram_path;  // --flash-next-ngram: FIX D per_layer_token_embd table (24-byte ARCINGRM header + block-quantised payload); admitted only when the artifact's config.json declares an n-gram table (docs/design-qwen-flash-next.md FIX D Link 2)
     // --ngram-gguf: the GGUF shard whose per_layer_token_embd.weight binds a
     // serving-shape IR's `ngram_table.K` ports (backend_ov.cpp
@@ -305,7 +323,10 @@ struct Config {
     // read-only GPU-plugin property MOE_CPU_TIER_STATIC_PARTITION, which
     // only exists once the backend's executor is up. Config parsing now accepts
     // the combination unconditionally; backend_ov.cpp's
-    // tier_prefix_cache_decision (below) makes the load-time call.
+    // tier_prefix_cache_decision (below) makes the load-time call. The
+    // history-dependent mode is the ADAPTIVE TIER (expert placement follows
+    // the conversation, DESIGN §3.4 amended 2026-10-01); it is refused with the
+    // prefix cache, while the static partition is admitted with it.
     bool moe_cpu_tier = false;   // --moe-cpu-tier
     int  moe_cpu_tier_threads = 0;  // --moe-cpu-tier-threads; 0 = plugin default
     bool moe_per_expert_dispatch = false;  // --moe-per-expert-dispatch
@@ -376,8 +397,8 @@ bool kv_precision_is_packed_four_bit(const std::string& requested, const std::st
 // with the device. The plugin exposes this as a read-only property,
 // MOE_CPU_TIER_STATIC_PARTITION, true when the served tier is that static
 // partition (false when MOE_CPU_TIER_PARTITION=lru restores the
-// history-dependent one, or the property is simply absent on a plugin
-// without 0018). That fact only exists once the backend's executor is up --
+// history-dependent adaptive tier, or the property is simply absent on a
+// plugin without 0018). That fact only exists once the backend's executor is up --
 // config parsing cannot query a GPU plugin property -- so the refusal moved
 // from config.cpp to backend_ov.cpp's load path, which probes the property
 // (mirroring the PAGED_ATTENTION_MAX_PARTITIONS probe's style) and calls

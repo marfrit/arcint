@@ -23,6 +23,7 @@
 #include "exec/ngram_gather.h"
 #include "exec/ngram_ports.h"
 #include "exec/ngram_staging.h"
+#include "exec/ngram_reader.h"
 #include "harness.h"
 
 #include <fcntl.h>
@@ -246,4 +247,117 @@ TEST(ngram_staging_bytes_is_the_forward_not_the_table) {
     constexpr uint64_t kPool = 30ULL << 30;
     CHECK(host_ram_fit_must_refuse(full, kPool, 0, kHost, 0));
     CHECK(!host_ram_fit_must_refuse(staging, kPool, 0, kHost, 0));
+}
+
+// Strata's PLE reader (exec/ngram_reader.h): O_DIRECT page reads on an I/O
+// pool, page dedupe, a row cache. The staged bytes must be the synchronous
+// pread's, byte for byte, for the fixture's edges, its duplicate and the last
+// row of the file (a short last page). The file lives in the working
+// directory, not /tmp: tmpfs refuses O_DIRECT, and the reader falls back to
+// buffered reads there.
+namespace {
+std::string reader_path(const char* stem) {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "arcint-ngram-reader-%s-%d.bin", stem, ::getpid());
+    return std::string(buf);
+}
+
+std::vector<uint8_t> stage_by_pread(const std::string& path, const std::vector<int64_t>& ids) {
+    const auto g = geometry();
+    std::vector<uint8_t> out(static_cast<size_t>(g.staging_rows) * g.row_bytes, 0);
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    CHECK(fd >= 0);
+    ngram::stage_from_file(fd, ngram::kHeaderBytes, kRowBytes, ids, g, out.data());
+    ::close(fd);
+    return out;
+}
+
+std::vector<uint8_t> stage_by_reader(ngram::RowReader& r, const std::vector<int64_t>& ids) {
+    const auto g = geometry();
+    std::vector<uint8_t> out(static_cast<size_t>(g.staging_rows) * g.row_bytes, 0);
+    std::vector<int64_t>  local;
+    std::vector<uint64_t> rows;
+    ngram::plan_staging_fill(ids, g, local, rows);
+    r.collect(r.issue(rows, out.data()));
+    return out;
+}
+}  // namespace
+
+TEST(ngram_reader_stages_the_preads_bytes) {
+    const std::string path = reader_path("bytes");
+    write_table(path, static_cast<uint32_t>(kTableRows), kRowBytes);
+    const auto ids = forward_ids();
+    const auto want = stage_by_pread(path, ids);
+    ngram::ReaderOptions opt;
+    opt.cache_rows = 0;  // every row from the file
+    {
+        ngram::RowReader r(path, ngram::kHeaderBytes, kTableRows, kRowBytes, opt);
+        CHECK(stage_by_reader(r, ids) == want);
+        const auto s = r.stats();
+        CHECK_EQ(s.requests, static_cast<uint64_t>(ids.size()));
+        CHECK_EQ(s.cache_hits, static_cast<uint64_t>(0));
+    }
+    ::unlink(path.c_str());
+}
+
+TEST(ngram_reader_serves_a_repeated_forward_from_its_row_cache) {
+    const std::string path = reader_path("cache");
+    write_table(path, static_cast<uint32_t>(kTableRows), kRowBytes);
+    const auto ids = forward_ids();
+    const auto want = stage_by_pread(path, ids);
+    {
+        ngram::RowReader r(path, ngram::kHeaderBytes, kTableRows, kRowBytes);
+        CHECK(stage_by_reader(r, ids) == want);
+        const uint64_t reads = r.stats().reads;
+        CHECK(stage_by_reader(r, ids) == want);
+        const auto s = r.stats();
+        CHECK_EQ(s.reads, reads);                                   // no new page read
+        CHECK(s.cache_hits >= static_cast<uint64_t>(ids.size()));  // the second forward, all hits
+    }
+    ::unlink(path.c_str());
+}
+
+TEST(ngram_reader_reads_rows_that_share_a_page_once) {
+    const std::string path = reader_path("dedup");
+    write_table(path, static_cast<uint32_t>(kTableRows), kRowBytes);
+    // 64 consecutive rows of 90 B from row 1000 (file bytes 90,024-95,783)
+    // touch three pages: at most three page reads, not 64.
+    std::vector<int64_t> ids;
+    for (int64_t i = 1000; i < 1064; ++i) ids.push_back(i);
+    const auto want = stage_by_pread(path, ids);
+    ngram::ReaderOptions opt;
+    opt.cache_rows = 0;
+    {
+        ngram::RowReader r(path, ngram::kHeaderBytes, kTableRows, kRowBytes, opt);
+        CHECK(stage_by_reader(r, ids) == want);
+        const auto s = r.stats();
+        CHECK(s.reads <= 3);
+        CHECK_EQ(s.reads + s.dedup_rows, static_cast<uint64_t>(ids.size()));
+    }
+    ::unlink(path.c_str());
+}
+
+TEST(ngram_reader_fails_the_ticket_not_the_reader) {
+    const std::string path = reader_path("fail");
+    write_table(path, static_cast<uint32_t>(kTableRows), kRowBytes);
+    ngram::ReaderOptions opt;
+    opt.cache_rows = 0;
+    {
+        ngram::RowReader r(path, ngram::kHeaderBytes, kTableRows, kRowBytes, opt);
+        // the file loses its second half under the open reader
+        CHECK(::truncate(path.c_str(), static_cast<off_t>(ngram::kHeaderBytes + (kTableRows / 2) * kRowBytes)) == 0);
+        std::vector<uint8_t> out(kRowBytes);
+        bool threw = false;
+        try {
+            r.collect(r.issue({static_cast<uint64_t>(kTableRows - 1)}, out.data()));
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        CHECK(threw);
+        // the next forward reads again
+        r.collect(r.issue({5}, out.data()));
+        const auto payload = read_payload(path);
+        CHECK(std::memcmp(out.data(), payload.data() + 5 * kRowBytes, kRowBytes) == 0);
+    }
+    ::unlink(path.c_str());
 }

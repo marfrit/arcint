@@ -987,3 +987,86 @@ TEST(config_dflash_topk_rejects_out_of_range) {
     CHECK(run({"--stub", "--dflash", "/d", "--dflash-topk", "64"}, hi).ok);
     CHECK_EQ(hi.dflash_topk, 64);
 }
+
+// 0.5.3.1459: a GGUF alone selects the libllama engine; with an IR directory
+// it stays the OpenVINO template path.
+TEST(config_engine_follows_what_was_given) {
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf"};
+        const auto r = parse_args(3, const_cast<char**>(argv), cfg);
+        CHECK(r.ok);
+        CHECK_EQ(cfg.engine, std::string("llama"));
+    }
+#ifdef ARCINT_OPENVINO   // a build without it refuses --model at parse
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--model", "/m/ir", "--gguf", "/m/q.gguf"};
+        const auto r = parse_args(5, const_cast<char**>(argv), cfg);
+        CHECK(r.ok);
+        CHECK_EQ(cfg.engine, std::string("ov"));
+    }
+#endif
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--engine", "llama", "--model", "/m/ir"};
+        const auto r = parse_args(5, const_cast<char**>(argv), cfg);
+        CHECK(!r.ok);   // the llama engine needs its GGUF
+    }
+}
+
+TEST(config_llama_cpu_moe_and_threads) {
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-cpu-moe", "31", "--llama-threads", "8"};
+        const auto r = parse_args(7, const_cast<char**>(argv), cfg);
+        CHECK(r.ok);
+        CHECK_EQ(cfg.llama_cpu_moe, 31);
+        CHECK_EQ(cfg.llama_threads, 8);
+        CHECK_EQ(cfg.llama_mtp, 0);
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp", "3"};
+        CHECK(parse_args(5, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_mtp, 3);
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp", "4", "--llama-mtp-vocab", "/m/ids.bin"};
+        CHECK(parse_args(7, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_mtp_vocab, std::string("/m/ids.bin"));
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp-vocab", "/m/ids.bin"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // a draft vocabulary without drafts
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp", "8"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // a verify of 9 rows: the decode attention takes up to 8
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-cpu-moe", "-1"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // a count, not a sign
+    }
+#ifdef ARCINT_OPENVINO
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--model", "/m/ir", "--llama-cpu-moe", "4"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // an option of the libllama engine only
+    }
+#endif
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--stub", "--llama-threads", "4"};
+        CHECK(!parse_args(4, const_cast<char**>(argv), cfg).ok);   // --stub runs the OpenVINO-less skeleton, not libllama
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--stub", "--llama-mtp", "2"};
+        CHECK(!parse_args(4, const_cast<char**>(argv), cfg).ok);
+    }
+}

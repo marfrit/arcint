@@ -1,0 +1,255 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 8414b16..ed28a33 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -977,6 +977,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_mul_mv_q4_K_f32_flat;
+     // Intel: K-quant x q8_1 matvec with integer dot products (mul_mv_kq_q8_1.cl)
+     cl_kernel kernel_kq_quantize_q8_1 = nullptr;
++    int       kq_quantize_sg = 0;   // > 0: kernel_kq_quantize_q8_1 is the sub-group kernel of that size
+     // per type, ggml_cl_kq_type_index: Q4_K, Q5_K, Q6_K (mul_mv_kq_q8_1.cl),
+     // IQ3_XXS, IQ4_XS, IQ4_NL (mul_mv_iq_q8_1.cl); [columns - 1][type], one
+     // build per column count, 1 to 4
+@@ -2150,7 +2151,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+             const char * mv_n[3] = { "kernel_mul_mv_q4_K_q8_1", "kernel_mul_mv_q5_K_q8_1", "kernel_mul_mv_q6_K_q8_1" };
+             for (int nc = 1; nc <= 4; ++nc) {
+                 const std::string opts = compile_opts + " -DN_DST=" + std::to_string(backend_ctx->kq_q8_1_ndst) +
+-                    " -DN_SIMDGROUP=4 -DNCOLS=" + std::to_string(nc) + (nc > 1 ? " -cl-intel-256-GRF-per-thread" : "");
++                    " -DN_SIMDGROUP=4 -DNCOLS=" + std::to_string(nc) + (nc > 1 ? " -cl-intel-256-GRF-per-thread" : "") +
++                    " -DQSG=" + std::to_string(sg8 ? 8 : 16);
+                 cl_program prog = build_program_from_source_optional(backend_ctx, kernel_src.c_str(), opts);
+                 if (prog == nullptr) {
+                     GGML_LOG_WARN("ggml_opencl: K-quant matvec for %d column(s) not built; ggml's kernels take it\n", nc);
+@@ -2161,7 +2163,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 }
+                 if (nc == 1) {
+                     const char * id_n[3] = { "kernel_mul_mv_id_q4_K_q8_1", "kernel_mul_mv_id_q5_K_q8_1", "kernel_mul_mv_id_q6_K_q8_1" };
+-                    CL_CHECK((backend_ctx->kernel_kq_quantize_q8_1 = clCreateKernel(prog, "kernel_quantize_q8_1", &err), err));
++                    // GGML_OPENCL_KQ_QUANT_SG=0: one work-item per block
++                    static const char * qsg_env = getenv("GGML_OPENCL_KQ_QUANT_SG");
++                    const bool qsg = qsg_env == nullptr || atoi(qsg_env) != 0;
++                    CL_CHECK((backend_ctx->kernel_kq_quantize_q8_1 =
++                        clCreateKernel(prog, qsg ? "kernel_quantize_q8_1_sg" : "kernel_quantize_q8_1", &err), err));
++                    backend_ctx->kq_quantize_sg = qsg ? (sg8 ? 8 : 16) : 0;
+                     for (int i = 0; i < 3; ++i) {
+                         CL_CHECK((backend_ctx->kernel_mul_mv_id_kq_q8_1[i] = clCreateKernel(prog, id_n[i], &err), err));
+                     }
+@@ -14337,7 +14344,10 @@ static void ggml_cl_mul(ggml_backend_t backend, const ggml_tensor * src0, const
+ 
+         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
+     } else {
+-        unsigned int nth = MIN(64, ne0);
++        // Intel: 256 work-items a row (a 2048-wide single row, the coder's
++        // gated shared expert at decode, took 14.5 us at 64, measured-here)
++        const unsigned int nth_max = backend_ctx->gpu_family == INTEL ? (unsigned int)MIN(backend_ctx->max_workgroup_size, (size_t)256) : 64;
++        unsigned int nth = MIN(nth_max, (unsigned int)ne0);
+         size_t global_work_size[] = {ne01*nth, (size_t)ne02, (size_t)ne03};
+         size_t local_work_size[] = {nth, 1, 1};
+ 
+@@ -23785,8 +23795,10 @@ static void ggml_cl_kq_quantize_src1(ggml_backend_opencl_context * backend_ctx,
+     CL_CHECK(clSetKernelArg(kq, 3, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xd.buffer));
+     CL_CHECK(clSetKernelArg(kq, 4, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xs.buffer));
+     CL_CHECK(clSetKernelArg(kq, 5, sizeof(int),      &n_vals));
++    // a work-item per block, or a sub-group per block
++    const size_t per_block = backend_ctx->kq_quantize_sg > 0 ? (size_t)backend_ctx->kq_quantize_sg : 1;
+     size_t q_local[1]  = { 64 };
+-    size_t q_global[1] = { (size_t)CEIL_DIV(n32, 64) * 64 };
++    size_t q_global[1] = { CEIL_DIV((size_t)n32 * per_block, 64) * 64 };
+     backend_ctx->enqueue_ndrange_kernel(kq, 1, q_global, q_local, dst);
+     backend_ctx->kq_q8 = { src1, extra1->data_device, offset1, n_vals, backend_ctx->graph_gen };
+ }
+@@ -30125,9 +30137,15 @@ static void ggml_cl_glu(ggml_backend_t backend, const ggml_tensor * src0, const
+         CL_CHECK(clSetKernelArg(kernel, 13, sizeof(float), &alpha));
+     }
+ 
++    // Intel: rows along dimension 0, each row's elements split over dimension
++    // 1 (one work-group a row ran a 17,408-wide decode row in 15 us,
++    // measured-here); elsewhere one work-group of up to 512 a row
+     const size_t nrows = ggml_nrows(src0);
+-    size_t nth = backend_ctx->max_workgroup_size < 512 ? backend_ctx->max_workgroup_size : 512;
+-    size_t global_work_size[] = {nrows*nth, 1, 1};
++    const bool   split = backend_ctx->gpu_family == INTEL;
++    const size_t nth_max = split ? 256 : 512;
++    size_t nth = backend_ctx->max_workgroup_size < nth_max ? backend_ctx->max_workgroup_size : nth_max;
++    const size_t nchunks = split ? std::min<size_t>(CEIL_DIV((size_t)ne0, nth), 64) : 1;
++    size_t global_work_size[] = {nrows*nth, nchunks, 1};
+     size_t local_work_size[] = {nth, 1, 1};
+ 
+     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+diff --git a/ggml/src/ggml-opencl/kernels/glu.cl b/ggml/src/ggml-opencl/kernels/glu.cl
+index 30bad00..be91ba2 100644
+--- a/ggml/src/ggml-opencl/kernels/glu.cl
++++ b/ggml/src/ggml-opencl/kernels/glu.cl
+@@ -30,7 +30,7 @@ kernel void kernel_geglu(
+     global float * src1_row = (global float *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
+     global float * dst_row  = (global float *) ((global char *) dst  + get_group_id(0)*nb1);
+ 
+-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
++    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
+         const float x0 = src0_row[i0];
+         const float x1 = src1_row[i0];
+ 
+@@ -62,7 +62,7 @@ kernel void kernel_geglu_f16(
+     global half * src1_row = (global half *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
+     global half * dst_row  = (global half *) ((global char *) dst  + get_group_id(0)*nb1);
+ 
+-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
++    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
+         const half x0 = src0_row[i0];
+         const half x1 = src1_row[i0];
+ 
+@@ -97,7 +97,7 @@ kernel void kernel_reglu(
+     global float * src1_row = (global float *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
+     global float * dst_row  = (global float *) ((global char *) dst  + get_group_id(0)*nb1);
+ 
+-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
++    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
+         const float x0 = src0_row[i0];
+         const float x1 = src1_row[i0];
+ 
+@@ -127,7 +127,7 @@ kernel void kernel_reglu_f16(
+     global half * src1_row = (global half *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
+     global half * dst_row  = (global half *) ((global char *) dst  + get_group_id(0)*nb1);
+ 
+-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
++    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
+         const half x0 = src0_row[i0];
+         const half x1 = src1_row[i0];
+ 
+@@ -160,7 +160,7 @@ kernel void kernel_swiglu(
+     global float * src1_row = (global float *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
+     global float * dst_row  = (global float *) ((global char *) dst  + get_group_id(0)*nb1);
+ 
+-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
++    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
+         const float x0 = src0_row[i0];
+         const float x1 = src1_row[i0];
+ 
+@@ -192,7 +192,7 @@ kernel void kernel_swiglu_f16(
+     global half * src1_row = (global half *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
+     global half * dst_row  = (global half *) ((global char *) dst  + get_group_id(0)*nb1);
+ 
+-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
++    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
+         const half x0 = src0_row[i0];
+         const half x1 = src1_row[i0];
+ 
+@@ -229,7 +229,7 @@ kernel void kernel_swiglu_oai(
+     global float * src1_row = (global float *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
+     global float * dst_row  = (global float *) ((global char *) dst  + get_group_id(0)*nb1);
+ 
+-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
++    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
+         float x0 = src0_row[i0];
+         float x1 = src1_row[i0];
+ 
+@@ -269,7 +269,7 @@ kernel void kernel_swiglu_clamp(
+     global float * src1_row = (global float *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
+     global float * dst_row  = (global float *) ((global char *) dst  + get_group_id(0)*nb1);
+ 
+-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
++    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
+         const float gate = min(src0_row[i0], limit);
+         const float up = clamp(src1_row[i0], -limit, limit);
+ 
+@@ -300,7 +300,7 @@ kernel void kernel_swiglu_clamp_f16(
+     global half * src1_row = (global half *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
+     global half * dst_row  = (global half *) ((global char *) dst  + get_group_id(0)*nb1);
+ 
+-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
++    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
+         const float gate = min((float) src0_row[i0], limit);
+         const float up = clamp((float) src1_row[i0], -limit, limit);
+ 
+@@ -333,7 +333,7 @@ kernel void kernel_geglu_erf(
+     global float * src1_row = (global float *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
+     global float * dst_row  = (global float *) ((global char *) dst  + get_group_id(0)*nb1);
+ 
+-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
++    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
+         const float x0 = src0_row[i0];
+         const float x1 = src1_row[i0];
+ 
+@@ -365,7 +365,7 @@ kernel void kernel_geglu_erf_f16(
+     global half * src1_row = (global half *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
+     global half * dst_row  = (global half *) ((global char *) dst  + get_group_id(0)*nb1);
+ 
+-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
++    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
+         const half x0 = src0_row[i0];
+         const half x1 = src1_row[i0];
+ 
+@@ -400,7 +400,7 @@ kernel void kernel_geglu_quick(
+     global float * src1_row = (global float *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
+     global float * dst_row  = (global float *) ((global char *) dst  + get_group_id(0)*nb1);
+ 
+-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
++    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
+         const float x0 = src0_row[i0];
+         const float x1 = src1_row[i0];
+ 
+@@ -432,7 +432,7 @@ kernel void kernel_geglu_quick_f16(
+     global half * src1_row = (global half *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
+     global half * dst_row  = (global half *) ((global char *) dst  + get_group_id(0)*nb1);
+ 
+-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
++    for (int i0 = get_group_id(1)*get_local_size(0) + get_local_id(0); i0 < ne0; i0 += get_local_size(0)*get_num_groups(1)) {
+         const half x0 = src0_row[i0];
+         const half x1 = src1_row[i0];
+ 
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl
+index 3302bc2..454d62b 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl
+@@ -52,6 +52,51 @@ kernel void kernel_quantize_q8_1(global const char * src, ulong offs, global cha
+     xs[b] = sum;
+ }
+ 
++// The same, a sub-group of QSG lanes per block (32 / QSG values a lane, read
++// coalesced), the block's maxima and sum by sub-group reductions: one
++// work-item per block left 64 work-items for a 2048-wide row (7.4 us on a
++// B60, 10 on an A770, measured-here). The sum is added in another order.
++#ifdef QSG
++__attribute__((intel_reqd_sub_group_size(QSG)))
++kernel void kernel_quantize_q8_1_sg(global const char * src, ulong offs, global char * xq, global float * xd,
++                                    global float * xs, int n) {
++    const int b = get_group_id(0) * (get_local_size(0) / QSG) + get_sub_group_id();
++    if (b * 32 >= n) return;   // uniform over the sub-group
++    const int lane = get_sub_group_local_id();
++    global const float * p = (global const float *)(src + offs) + b * 32;
++    float v[32 / QSG];
++    float amax = 0.f, sum = 0.f;
++    #pragma unroll
++    for (int i = 0; i < 32 / QSG; ++i) {
++        v[i] = p[i * QSG + lane];
++        amax = fmax(amax, fabs(v[i]));
++        sum += v[i];
++    }
++    amax = sub_group_reduce_max(amax);
++    sum  = sub_group_reduce_add(sum);
++    const float d = amax / 127.f;
++    const float id = d > 0.f ? 1.f / d : 0.f;
++    char q[32 / QSG];
++    float rmax = 0.f;
++    #pragma unroll
++    for (int i = 0; i < 32 / QSG; ++i) {
++        q[i] = convert_char_sat_rte(v[i] * id);
++        xq[b * 32 + i * QSG + lane] = q[i];
++        rmax = fmax(rmax, fabs(v[i] - d * (float)q[i]));
++    }
++    rmax = sub_group_reduce_max(rmax);
++    const float d2 = rmax / 127.f;
++    const float id2 = d2 > 0.f ? 1.f / d2 : 0.f;
++    #pragma unroll
++    for (int i = 0; i < 32 / QSG; ++i) xq[n + b * 32 + i * QSG + lane] = convert_char_sat_rte((v[i] - d * (float)q[i]) * id2);
++    if (lane == 0) {
++        xd[b] = d;
++        xd[n / 32 + b] = d2;
++        xs[b] = sum;
++    }
++}
++#endif
++
+ // The scales and mins of sub-blocks 2j and 2j+1 from the block's 12 scale
+ // bytes, read as three words (get_scale_min_k4 in ggml).
+ static inline uint kbyte(uint3 w, int k) {

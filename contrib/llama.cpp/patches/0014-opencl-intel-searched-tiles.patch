@@ -1,0 +1,193 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index ecc826b..9e59b0c 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1004,6 +1004,7 @@ struct ggml_backend_opencl_context {
+     // Q5_K, Q6_K; its token tile and sub-groups a work-group
+     cl_kernel kernel_mul_mm_kq2d[3] = {};
+     int       kq2d_tm = 64, kq2d_wg = 16;
++    int       kq2d_tm_t[3] = { 64, 64, 64 }, kq2d_wg_t[3] = { 16, 16, 16 };   // per type (GGML_OPENCL_KQ_2D_T<i>)
+     cl_kernel kernel_mul_mm_kq_f16[6]    = {};
+     cl_kernel kernel_mul_mm_id_kq_f16[6] = {};
+     // MUL_MAT_ID with the tokens as the DPAS a operand (kernel_mul_mm_id2_*):
+@@ -2328,7 +2329,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                     }
+                 }
+                 const std::string k2_opts = compile_opts + " -cl-intel-256-GRF-per-thread -DTM=" + std::to_string(tm) +
+-                    " -DWG=" + std::to_string(wg) + " -DAT=" + std::to_string(at);
++                    " -DWG=" + std::to_string(wg) + " -DAT=" + std::to_string(at) +
++                    (getenv("GGML_OPENCL_KQ_2D_OPTS") ? std::string(" ") + getenv("GGML_OPENCL_KQ_2D_OPTS") : std::string());
+                 cl_program k2_prog = build_program_from_source_optional(backend_ctx, k2_src.c_str(), k2_opts);
+                 if (k2_prog != nullptr) {
+                     const char * k2_n[3] = { "kernel_mul_mm_kq2d_q4_K", "kernel_mul_mm_kq2d_q5_K", "kernel_mul_mm_kq2d_q6_K" };
+@@ -2366,6 +2368,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                             if (err2 == CL_SUCCESS) CL_CHECK(clReleaseKernel(backend_ctx->kernel_kq_quant_i8));
+                             backend_ctx->kernel_mul_mm_kq2d_q4_K_i8 = nullptr;
+                             backend_ctx->kernel_kq_quant_i8 = nullptr;
++                            GGML_LOG_WARN("ggml_opencl: Q4_K int8 2D GEMM not built or does not fit a work-group; the fp16 kernel takes Q4_K\n");
+                         }
+                     }
+                     if (!fits) {
+@@ -2381,7 +2384,48 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                     }
+                     backend_ctx->kq2d_tm = tm;
+                     backend_ctx->kq2d_wg = wg;
++                    for (int i = 0; i < 3; ++i) { backend_ctx->kq2d_tm_t[i] = tm; backend_ctx->kq2d_wg_t[i] = wg; }
+                     CL_CHECK(clReleaseProgram(k2_prog));
++                    // tuning (tools/kq_tune in arcint): GGML_OPENCL_KQ_2D_T<i> = "TM,WG,AT,KSYNC"
++                    // builds type i (0 Q4_K with its int8 kernel, 1 Q5_K, 2 Q6_K) from a
++                    // program of its own; a shape that does not build or fit is ignored
++                    const char * k2_ti[3] = { "kernel_mul_mm_kq2d_q4_K", "kernel_mul_mm_kq2d_q5_K", "kernel_mul_mm_kq2d_q6_K" };
++                    for (int i = 0; i < 3 && fits; ++i) {
++                        const std::string en = "GGML_OPENCL_KQ_2D_T" + std::to_string(i);
++                        const char * tv = getenv(en.c_str());
++                        int a = 0, b = 0, c = 0, d = 0;
++                        if (tv == nullptr) continue;
++                        if (sscanf(tv, "%d,%d,%d,%d", &a, &b, &c, &d) != 4 || a <= 0 || b <= 0 || d <= 0 || (c != 8 && c != 32) || a % c != 0) {
++                            GGML_LOG_WARN("ggml_opencl: %s=%s ignored\n", en.c_str(), tv);
++                            continue;
++                        }
++                        const std::string o = compile_opts + " -cl-intel-256-GRF-per-thread -DTM=" + std::to_string(a) +
++                            " -DWG=" + std::to_string(b) + " -DAT=" + std::to_string(c) + " -DKSYNC=" + std::to_string(d) +
++                            " -DKSYNC_I8=" + std::to_string(d) +
++                            (getenv("GGML_OPENCL_KQ_2D_OPTS") ? std::string(" ") + getenv("GGML_OPENCL_KQ_2D_OPTS") : std::string());
++                        cl_program pi = build_program_from_source_optional(backend_ctx, k2_src.c_str(), o);
++                        cl_kernel ki = pi ? clCreateKernel(pi, k2_ti[i], &err) : nullptr;
++                        cl_kernel k8 = pi && i == 0 && backend_ctx->kernel_mul_mm_kq2d_q4_K_i8 ? clCreateKernel(pi, "kernel_mul_mm_kq2d_q4_K_i8", &err) : nullptr;
++                        size_t wgs = 0, wg8 = (size_t)b * 16;
++                        if (ki) CL_CHECK(clGetKernelWorkGroupInfo(ki, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wgs), &wgs, NULL));
++                        if (k8) CL_CHECK(clGetKernelWorkGroupInfo(k8, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg8), &wg8, NULL));
++                        if (!ki || wgs < (size_t)b * 16 || wg8 < (size_t)b * 16 ||
++                            (i == 0 && backend_ctx->kernel_mul_mm_kq2d_q4_K_i8 && !k8)) {
++                            if (ki) CL_CHECK(clReleaseKernel(ki));
++                            if (k8) CL_CHECK(clReleaseKernel(k8));
++                            if (pi) CL_CHECK(clReleaseProgram(pi));
++                            GGML_LOG_WARN("ggml_opencl: %s=%s ignored (does not build or fit)\n", en.c_str(), tv);
++                            continue;
++                        }
++                        CL_CHECK(clReleaseKernel(backend_ctx->kernel_mul_mm_kq2d[i]));
++                        backend_ctx->kernel_mul_mm_kq2d[i] = ki;
++                        if (k8) {
++                            CL_CHECK(clReleaseKernel(backend_ctx->kernel_mul_mm_kq2d_q4_K_i8));
++                            backend_ctx->kernel_mul_mm_kq2d_q4_K_i8 = k8;
++                        }
++                        backend_ctx->kq2d_tm_t[i] = a; backend_ctx->kq2d_wg_t[i] = b;
++                        CL_CHECK(clReleaseProgram(pi));
++                    }
+                 } else {
+                     GGML_LOG_WARN("ggml_opencl: K-quant 2D GEMM not built; mul_mm_kq_f16.cl takes the prompts\n");
+                 }
+@@ -2389,9 +2433,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+             }
+ 
+             // the GEMM: fp16 DPAS at the device's DPAS sub-group size. Tiles
+-            // (measured-here: an A770 at 2000 MHz, a B60), rows x columns per
+-            // work-group: plain SG 8 32 x 512, SG 16 64 x 256; MUL_MAT_ID
+-            // (tiles of one expert's pairs) 16 x 32 on both.
++            // (measured-here: an A770 at 2000 MHz, a B60), as RG,TG,NSGM,NSGN:
++            // plain 4,4,2,8 on both; MUL_MAT_ID (tiles of one expert's pairs)
++            // SG 8 2,4,2,2, SG 16 2,2,1,1.
+             // GGML_OPENCL_KQ_MM=0 keeps ggml's GEMM; GGML_OPENCL_KQ_MM_TILE /
+             // GGML_OPENCL_KQ_MM_ID_TILE = "RG,TG,NSGM,NSGN" override.
+             static const char * mm_env = getenv("GGML_OPENCL_KQ_MM");
+@@ -2407,8 +2451,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 cl_ulong local_mem = 0;
+                 clGetDeviceInfo(backend_ctx->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(local_mem), &local_mem, NULL);
+                 backend_ctx->kq_mm_sg = sg8 ? 8 : 16;
+-                backend_ctx->kq_mm_plain = sg8 ? ggml_cl_kq_tile{ 4, 4, 1, 16 } : ggml_cl_kq_tile{ 4, 4, 2, 8 };
+-                backend_ctx->kq_mm_id    = sg8 ? ggml_cl_kq_tile{ 2, 4, 1, 1 }  : ggml_cl_kq_tile{ 2, 2, 1, 1 };
++                // SG 8 (A770): plain 4,4,2,8 and MUL_MAT_ID 2,4,2,2, from a genetic
++                // search over the tiles and the ID2 switch scored by the coder's
++                // prefill (measured-here: 1,613 -> 1,740 t/s at 512 tokens,
++                // 1,345 -> 1,431 at 4,096; KL unchanged)
++                backend_ctx->kq_mm_plain = ggml_cl_kq_tile{ 4, 4, 2, 8 };
++                backend_ctx->kq_mm_id    = sg8 ? ggml_cl_kq_tile{ 2, 4, 2, 2 }  : ggml_cl_kq_tile{ 2, 2, 1, 1 };
+                 for (auto [env, tile] : { std::pair<const char *, ggml_cl_kq_tile *>{ "GGML_OPENCL_KQ_MM_TILE", &backend_ctx->kq_mm_plain },
+                                           std::pair<const char *, ggml_cl_kq_tile *>{ "GGML_OPENCL_KQ_MM_ID_TILE", &backend_ctx->kq_mm_id } }) {
+                     if (const char * t = getenv(env)) {
+@@ -24420,7 +24468,7 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
+                 CL_CHECK(clSetKernelArg(ki, a++, sizeof(int),      &ne01));
+                 CL_CHECK(clSetKernelArg(ki, a++, sizeof(int),      &ncols));
+                 CL_CHECK(clSetKernelArg(ki, a++, sizeof(int),      &tp));
+-                const size_t wgn = (size_t)backend_ctx->kq2d_wg * 16;
++                const size_t wgn = (size_t)backend_ctx->kq2d_wg_t[0] * 16;
+                 size_t gws[] = { (size_t)(tp / tmi) * wgn, (size_t)CEIL_DIV(ne01, (int)wgn), 1 };
+                 size_t lws[] = { wgn, 1, 1 };
+                 backend_ctx->enqueue_ndrange_kernel(ki, 3, gws, lws, dst);
+@@ -24437,8 +24485,8 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
+             CL_CHECK(clSetKernelArg(k2, a++, sizeof(int),      &ne00));
+             CL_CHECK(clSetKernelArg(k2, a++, sizeof(int),      &ne01));
+             CL_CHECK(clSetKernelArg(k2, a++, sizeof(int),      &ncols));
+-            const size_t wgn = (size_t)backend_ctx->kq2d_wg * 16;
+-            size_t global_work_size[] = { (size_t)CEIL_DIV(ncols, backend_ctx->kq2d_tm) * wgn, (size_t)CEIL_DIV(ne01, (int)wgn), 1 };
++            const size_t wgn = (size_t)backend_ctx->kq2d_wg_t[ti] * 16;
++            size_t global_work_size[] = { (size_t)CEIL_DIV(ncols, backend_ctx->kq2d_tm_t[ti]) * wgn, (size_t)CEIL_DIV(ne01, (int)wgn), 1 };
+             size_t local_work_size[]  = { wgn, 1, 1 };
+             backend_ctx->enqueue_ndrange_kernel(k2, 3, global_work_size, local_work_size, dst);
+             return true;
+@@ -27020,11 +27068,16 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+     static const char * mt_env = getenv("GGML_OPENCL_KQ_MM_ID_MIN_TOK");
+     static const int    mm_id_min_tok = mt_env ? atoi(mt_env) : 16;
+     const bool gemm = n_tok >= mm_id_min_tok && backend_ctx->kernel_mul_mm_id_kq_f16[ti] != nullptr && n_expert <= 512;
+-    // the tokens-as-a kernel (kernel_mul_mm_id2_*): the coder's prefill on an
+-    // A770 1,032 -> 1,231 t/s at 512 tokens (measured-here);
+-    // GGML_OPENCL_KQ_MM_ID2=0 keeps kernel_mul_mm_id_*
++    // the tokens-as-a kernel (kernel_mul_mm_id2_*) beat the tile kernel at its
++    // old tile (the coder's prefill on an A770 1,032 -> 1,231 t/s at 512
++    // tokens). With its tile searched (2,4,2,2) the tile kernel is faster than
++    // ID2's best shape there (1,740 against 1,702 t/s at 24 x 32;
++    // measured-here), so ID2 is the default on SG 16 only, where no MoE was
++    // measured against it. GGML_OPENCL_KQ_MM_ID2=1 / =0 forces it on / off (on
++    // SG 8 at XT x XSG = GGML_OPENCL_KQ_MM_ID2_SHAPE, default 32 x 16).
+     static const char * id2_env = getenv("GGML_OPENCL_KQ_MM_ID2");
+-    const bool id2 = gemm && (id2_env == nullptr || atoi(id2_env) != 0) && backend_ctx->kernel_mul_mm_id2_kq_f16[ti] != nullptr;
++    const bool id2_default = backend_ctx->kq_mm_sg != 8;
++    const bool id2 = gemm && (id2_env == nullptr ? id2_default : atoi(id2_env) != 0) && backend_ctx->kernel_mul_mm_id2_kq_f16[ti] != nullptr;
+     cl_kernel kernel = id2 ? backend_ctx->kernel_mul_mm_id2_kq_f16[ti] :
+                        gemm ? backend_ctx->kernel_mul_mm_id_kq_f16[ti] : backend_ctx->kernel_mul_mv_id_kq_q8_1[ti];
+     if (kernel == nullptr) {
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
+index 98fcb37..c1f9428 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
+@@ -154,6 +154,11 @@ kernel void kernel_cvt_f32_f16_p4(global const char * src, ulong offs, global ha
+ #define KSYNC 16
+ #endif
+ #define KB_SYNC(kb) if ((kb) % KSYNC == 0) barrier(CLK_LOCAL_MEM_FENCE);
++// the int8 kernel's interval: 32 (a genetic search over the tiles and the
++// intervals, scored by the dense prefill: +0.5 % against 16, measured-here)
++#ifndef KSYNC_I8
++#define KSYNC_I8 32
++#endif
+ 
+ #define PROLOGUE                                                                            \
+     const int lane = get_sub_group_local_id(), sg = get_sub_group_id();                     \
+@@ -426,7 +431,7 @@ kernel void kernel_mul_mm_kq2d_q4_K_i8(global const uchar * q, global const ucha
+     uint qn[8];
+     WREAD(q, 128, qn, 0, 0);
+     for (int kb = 0; kb < nb; ++kb) {
+-        KB_SYNC(kb)
++        if (kb % KSYNC_I8 == 0) barrier(CLK_LOCAL_MEM_FENCE);
+         const ulong b = (ulong)n * nb + kb;
+         const uint3 sw = vload3(0, (global const uint *)(s + b * 12));
+         const float D = vload_half(0, d + b), DM = vload_half(0, dm + b);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 7e3535c..1fffe51 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11668,6 +11668,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
+ 
++    // a dense 27B's prompt GEMMs (Qwen3.8-27B, 512 tokens): arcint's
++    // tools/kq_tune scores the Intel 2D K-quant kernels on these
++    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
++        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 17408}, {6144, 5120}, {10240, 5120},
++                                                                {12288, 5120}, {5120, 6144}, {1024, 5120}}) {
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk.first, 512, mk.second, {1, 1}, {1, 1}));
++        }
++    }
++
+     // Q4_K multi-column mat-vec
+     for (int64_t m : {4096, 6144, 6272, 14336}) {
+         for (int bs : {1, 2, 3, 4, 8}) {

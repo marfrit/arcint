@@ -1,7 +1,9 @@
 # arcint — Design
 
-Status: **0.5.4**, runtime floor `marfrit-openvino +p25` (patches 0003–0074
-on the pinned OpenVINO nightly, §1.1). This document states what arcint *is*
+Status: **0.5.5**, runtime floor `marfrit-openvino +p25` (patches 0003–0074
+on the pinned OpenVINO nightly, §1.1; `+p27` for the Flash-Next tier's opt-in
+switches of patches 0076–0077). Since 0.5.5 a second executor serves GGUFs
+through libllama (§7.11). This document states what arcint *is*
 today: the architecture, the invariants, the gates, and the standing measured
 value of every subsystem. It is not a diary.
 
@@ -1106,6 +1108,37 @@ units with operator-local detail removed):
 - **A two-text alternation at 85 tokens on the GGUF path** (both forms, not the
   IR) is unattributed.
 - **Flash-Next's rate** (§7.8) and its long-context KLD floor.
+
+### 7.11 The libllama executor (`--engine llama`)
+
+`src/exec/backend_llama.cpp` runs a GGUF through llama.cpp, pinned at
+`bed0a85`, with ggml's OpenCL backend. arcint's Intel kernels are carried as
+`contrib/llama.cpp/patches` 0001–0014 (`contrib/llama.cpp/README.md`, one
+section per patch): K-quant and IQ matvecs and XMX GEMMs, the gated
+delta-net, decode and prompt attention, the few-token verify, the B60's
+2D-block GEMM with packed decode and int8 DPAS, and searched tiles.
+
+arcint keeps the HTTP surface, the chat template, the sampler, stop handling
+and the lanes. llama.cpp keeps the weights, the tokenizer, the attention KV
+and the recurrent state, one sequence per lane. MTP drafts with the GGUF's
+own head (`src/exec/llama_spec.cpp`); the verify walk is
+`src/exec/verify_walk.h`.
+
+Standing values (`measured-here`, 2026-10-04):
+- **Coder, A770:** decode 79.3 t/s with 4 drafts; prefill 1,431 t/s at
+  4,096 tokens.
+- **Dense 27B, B60:** decode 52.6 t/s with 5 drafts; prefill 935 t/s at
+  4,096 tokens; 122,880 tokens of f16 KV without paging.
+- **Answers:** the acceptance task 10/10 at temperature 0 on both. Dense
+  KL 0.004034 nats against the CPU reference, against 0.003559 for ggml's
+  float kernels on the same card.
+
+Open, and why the services stay on the OpenVINO executor:
+- the coder's context: its Q4_K_M weights leave ~16k on the A770;
+- quantized KV in the attention kernels;
+- a shared prefix cache.
+
+`docs/llama-engine.md` has the details.
 
 ## 8. Open questions and deliberate deferrals
 

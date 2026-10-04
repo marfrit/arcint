@@ -1,0 +1,517 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 45d12d0..6298ce3 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -989,6 +989,19 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_kq_cvt_f32_f16 = nullptr;
+     cl_kernel kernel_mul_mm_kq_f16[6]    = {};
+     cl_kernel kernel_mul_mm_id_kq_f16[6] = {};
++    // MUL_MAT_ID with the tokens as the DPAS a operand (kernel_mul_mm_id2_*):
++    // KQ_ID2_XT pairs x KQ_ID2_XSG sub-groups of rows per work-group
++    cl_kernel kernel_mul_mm_id2_kq_f16[6] = {};
++    int       kq_id2_xt = 32, kq_id2_xsg = 16;
++    // the route in prealloc_kq_pairs / _tiles / _ntiles: a MoE layer's gate,
++    // up and down share their ids tensor, so it is computed once a layer
++    struct {
++        const ggml_tensor * ids = nullptr;
++        cl_mem   mem = nullptr, pairs = nullptr, tiles = nullptr, ntiles = nullptr;
++        cl_ulong off = 0;
++        int      tile = 0, n_expert = 0, n_used = 0, n_tok = 0;
++        uint64_t gen = 0;
++    } kq_route;
+     cl_kernel kernel_moe_route_tiles = nullptr;
+     int             kq_mm_sg = 16;
+     ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
+@@ -2248,9 +2261,28 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                                          "kernel_mul_mm_iq3_xxs_f16", "kernel_mul_mm_iq4_xs_f16", "kernel_mul_mm_iq4_nl_f16" };
+                 const char * id_n[6] = { "kernel_mul_mm_id_q4_K_f16", "kernel_mul_mm_id_q5_K_f16", "kernel_mul_mm_id_q6_K_f16",
+                                          "kernel_mul_mm_id_iq3_xxs_f16", "kernel_mul_mm_id_iq4_xs_f16", "kernel_mul_mm_id_iq4_nl_f16" };
++                // the tokens-as-a MUL_MAT_ID kernel: pairs per tile, sub-groups per
++                // work-group, 32 x 16 on SG 8 (measured-here, the coder's prefill on
++                // an A770: 32 x 16, 32 x 32 and 16 x 32 within 3 %, 64 x 16 1.7x
++                // slower), 32 x 8 on SG 16 (the same 128 rows); overridden by
++                // GGML_OPENCL_KQ_MM_ID2_SHAPE = "XT,XSG"
++                backend_ctx->kq_id2_xsg = sg8 ? 16 : 8;
++                if (const char * xs = getenv("GGML_OPENCL_KQ_MM_ID2_SHAPE")) {
++                    int xt = 0, xsg = 0;
++                    if (sscanf(xs, "%d,%d", &xt, &xsg) == 2 && xt > 0 && xt % 8 == 0 && xsg > 0 &&
++                        (xt * 32) % (xsg * backend_ctx->kq_mm_sg) == 0 &&
++                        (size_t)xsg * backend_ctx->kq_mm_sg <= backend_ctx->max_workgroup_size &&
++                        (cl_ulong)xt * (256 * sizeof(cl_half) + 16 * sizeof(float)) <= local_mem) {
++                        backend_ctx->kq_id2_xt = xt;
++                        backend_ctx->kq_id2_xsg = xsg;
++                    } else {
++                        GGML_LOG_WARN("ggml_opencl: GGML_OPENCL_KQ_MM_ID2_SHAPE=%s ignored\n", xs);
++                    }
++                }
+                 for (int pass = 0; pass < 2; ++pass) {
+                     const ggml_cl_kq_tile & t = pass == 0 ? backend_ctx->kq_mm_plain : backend_ctx->kq_mm_id;
+                     const std::string mm_opts = compile_opts + " -cl-intel-256-GRF-per-thread" +
++                        " -DXT=" + std::to_string(backend_ctx->kq_id2_xt) + " -DXSG=" + std::to_string(backend_ctx->kq_id2_xsg) +
+                         " -DSG=" + std::to_string(backend_ctx->kq_mm_sg) + " -DRG=" + std::to_string(t.rg) +
+                         " -DTG=" + std::to_string(t.tg) + " -DNSGM=" + std::to_string(t.nsgm) + " -DNSGN=" + std::to_string(t.nsgn);
+                     cl_program mm_prog = build_program_from_source_optional(backend_ctx, mm_src.c_str(), mm_opts);
+@@ -2266,6 +2298,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         for (int i = 0; i < 6; ++i) {
+                             cl_kernel & k = pass == 0 ? backend_ctx->kernel_mul_mm_kq_f16[i] : backend_ctx->kernel_mul_mm_id_kq_f16[i];
+                             CL_CHECK((k = clCreateKernel(mm_prog, pass == 0 ? mm_n[i] : id_n[i], &err), err));
++                            if (pass == 1) {
++                                std::string id2 = id_n[i];
++                                id2.replace(id2.find("_id_"), 4, "_id2_");
++                                CL_CHECK((backend_ctx->kernel_mul_mm_id2_kq_f16[i] = clCreateKernel(mm_prog, id2.c_str(), &err), err));
++                            }
+                         }
+                     }
+                     CL_CHECK(clReleaseProgram(mm_prog));
+@@ -26530,7 +26567,13 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+     static const char * mt_env = getenv("GGML_OPENCL_KQ_MM_ID_MIN_TOK");
+     static const int    mm_id_min_tok = mt_env ? atoi(mt_env) : 16;
+     const bool gemm = n_tok >= mm_id_min_tok && backend_ctx->kernel_mul_mm_id_kq_f16[ti] != nullptr && n_expert <= 512;
+-    cl_kernel kernel = gemm ? backend_ctx->kernel_mul_mm_id_kq_f16[ti] : backend_ctx->kernel_mul_mv_id_kq_q8_1[ti];
++    // the tokens-as-a kernel (kernel_mul_mm_id2_*): the coder's prefill on an
++    // A770 1,032 -> 1,231 t/s at 512 tokens (measured-here);
++    // GGML_OPENCL_KQ_MM_ID2=0 keeps kernel_mul_mm_id_*
++    static const char * id2_env = getenv("GGML_OPENCL_KQ_MM_ID2");
++    const bool id2 = gemm && (id2_env == nullptr || atoi(id2_env) != 0) && backend_ctx->kernel_mul_mm_id2_kq_f16[ti] != nullptr;
++    cl_kernel kernel = id2 ? backend_ctx->kernel_mul_mm_id2_kq_f16[ti] :
++                       gemm ? backend_ctx->kernel_mul_mm_id_kq_f16[ti] : backend_ctx->kernel_mul_mv_id_kq_q8_1[ti];
+     if (kernel == nullptr) {
+         return false;
+     }
+@@ -26582,26 +26625,38 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+     const ggml_cl_kq_tile & t = backend_ctx->kq_mm_id;
+     const int sg        = backend_ctx->kq_mm_sg;
+     const int n_pairs   = n_used * n_tok;
+-    const int tile      = t.nt(sg);
++    const int id2_xt = backend_ctx->kq_id2_xt, id2_xsg = backend_ctx->kq_id2_xsg;   // XT, XSG of mul_mm_kq_f16.cl
++    const int tile      = id2 ? id2_xt : t.nt(sg);
+     const int max_tiles = CEIL_DIV(n_pairs, tile) + std::min(n_expert, n_pairs);
+     backend_ctx->prealloc_kq_pairs.allocate(backend_ctx->context, (size_t)n_pairs * sizeof(cl_int));
+     backend_ctx->prealloc_kq_tiles.allocate(backend_ctx->context, (size_t)max_tiles * sizeof(cl_int4));
+     backend_ctx->prealloc_kq_ntiles.allocate(backend_ctx->context, sizeof(cl_int));
+     cl_mem pairs = backend_ctx->prealloc_kq_pairs.buffer, tiles = backend_ctx->prealloc_kq_tiles.buffer,
+            ntiles = backend_ctx->prealloc_kq_ntiles.buffer;
+-    cl_kernel kr = backend_ctx->kernel_moe_route_tiles;
+-    CL_CHECK(clSetKernelArg(kr, 0, sizeof(cl_mem),   &extra2->data_device));
+-    CL_CHECK(clSetKernelArg(kr, 1, sizeof(cl_ulong), &offseti));
+-    CL_CHECK(clSetKernelArg(kr, 2, sizeof(cl_ulong), &nbi1));
+-    CL_CHECK(clSetKernelArg(kr, 3, sizeof(int),      &n_used));
+-    CL_CHECK(clSetKernelArg(kr, 4, sizeof(int),      &n_tok));
+-    CL_CHECK(clSetKernelArg(kr, 5, sizeof(int),      &n_expert));
+-    CL_CHECK(clSetKernelArg(kr, 6, sizeof(int),      &tile));
+-    CL_CHECK(clSetKernelArg(kr, 7, sizeof(cl_mem),   &pairs));
+-    CL_CHECK(clSetKernelArg(kr, 8, sizeof(cl_mem),   &tiles));
+-    CL_CHECK(clSetKernelArg(kr, 9, sizeof(cl_mem),   &ntiles));
+-    size_t r_local[1] = { 256 }, r_global[1] = { 256 };
+-    backend_ctx->enqueue_ndrange_kernel(kr, 1, r_global, r_local, dst);
++    static const char * rc_env = getenv("GGML_OPENCL_KQ_ROUTE_CACHE");
++    static const bool   rc_on  = rc_env == nullptr || atoi(rc_env) != 0;
++    auto & rc = backend_ctx->kq_route;
++    const bool routed = rc_on && rc.ids == ids && rc.gen == backend_ctx->graph_gen && rc.mem == extra2->data_device &&
++                        rc.off == offseti && rc.tile == tile && rc.pairs == pairs && rc.tiles == tiles && rc.ntiles == ntiles &&
++                        rc.n_expert == n_expert && rc.n_used == n_used && rc.n_tok == n_tok;
++    if (!routed) {
++        cl_kernel kr = backend_ctx->kernel_moe_route_tiles;
++        CL_CHECK(clSetKernelArg(kr, 0, sizeof(cl_mem),   &extra2->data_device));
++        CL_CHECK(clSetKernelArg(kr, 1, sizeof(cl_ulong), &offseti));
++        CL_CHECK(clSetKernelArg(kr, 2, sizeof(cl_ulong), &nbi1));
++        CL_CHECK(clSetKernelArg(kr, 3, sizeof(int),      &n_used));
++        CL_CHECK(clSetKernelArg(kr, 4, sizeof(int),      &n_tok));
++        CL_CHECK(clSetKernelArg(kr, 5, sizeof(int),      &n_expert));
++        CL_CHECK(clSetKernelArg(kr, 6, sizeof(int),      &tile));
++        CL_CHECK(clSetKernelArg(kr, 7, sizeof(cl_mem),   &pairs));
++        CL_CHECK(clSetKernelArg(kr, 8, sizeof(cl_mem),   &tiles));
++        CL_CHECK(clSetKernelArg(kr, 9, sizeof(cl_mem),   &ntiles));
++        size_t r_local[1] = { 256 }, r_global[1] = { 256 };
++        backend_ctx->enqueue_ndrange_kernel(kr, 1, r_global, r_local, dst);
++        rc.ids = ids; rc.gen = backend_ctx->graph_gen; rc.mem = extra2->data_device; rc.off = offseti;
++        rc.tile = tile; rc.pairs = pairs; rc.tiles = tiles; rc.ntiles = ntiles;
++        rc.n_expert = n_expert; rc.n_used = n_used; rc.n_tok = n_tok;
++    }
+ 
+     ggml_cl_kq_weight_args(kernel, src0, a);
+     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xh.buffer));
+@@ -26617,6 +26672,12 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb2));
+     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne00));
+     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
++    if (id2) {
++        size_t global_work_size[] = { (size_t)max_tiles * sg, (size_t)CEIL_DIV(ne01, id2_xsg * sg) * id2_xsg, 1 };
++        size_t local_work_size[]  = { (size_t)sg, (size_t)id2_xsg, 1 };
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++        return true;
++    }
+     size_t global_work_size[] = { (size_t)max_tiles * sg, (size_t)CEIL_DIV(ne01, t.mt()) * t.nsg(), 1 };
+     size_t local_work_size[]  = { (size_t)sg, (size_t)t.nsg(), 1 };
+     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
+index a796787..ffa87e7 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
+@@ -500,3 +500,366 @@ kernel void kernel_mul_mm_id_iq4_nl_f16(global const uchar * q, ulong offq, glob
+     ID_COLS
+     MM_BODY(deq_iq4_nl(wt, q + offq, dp, wrow0, row0, ne01, ne00 / 32, ib))
+ }
++
++// ---- MUL_MAT_ID with the tokens as the a operand (the shape of arcint's
++// OpenVINO patch 0064): a work-group takes up to XT pairs of one expert (a
++// tile of kernel_moe_route_tiles) and XSG * SG weight rows, one row per lane.
++// Per 256-weight super-block the tile's activation columns are staged in
++// local memory in the a layout (LOFF, rows = pairs) once for all sub-groups;
++// each lane dequantizes its row's 16 weights of a k16 step into registers as
++// the b operand. The weights are read once per tile and never pass through
++// local memory; the result is lane = row, component m = pair. ----
++
++#ifndef XT
++#define XT 16
++#endif
++#ifndef XSG
++#define XSG 8
++#endif
++#define XGR (XT / 8)
++#define XTHR (XSG * SG)
++#define XSTAGE (XT * 32 / XTHR)   /* 8-half units of the staged block per work-item */
++#if XSTAGE * XTHR != XT * 32
++#error "mul_mm_kq_f16.cl: XT * 32 must be a multiple of the work-group size"
++#endif
++
++static inline int8 b16_pack(float16 v) {
++    return as_int8(convert_half16(v));
++}
++
++static inline int8 b16_iq4(uint4 qw, int hi, float a) {
++    const uchar16 c = as_uchar16(qw);
++    float v[16];
++    #pragma unroll
++    for (int j = 0; j < 16; ++j) v[j] = a * kvalues_iq4nl[hi ? c[j] >> 4 : c[j] & 0xF];
++    return b16_pack(vload16(0, v));
++}
++
++static inline int8 b16_iq4_xs(global const uchar * q, ulong b, int sl) {
++    global const uchar * bp = q + b * 136;
++    const int kb = sl >> 1;
++    const uint sh = ((global const ushort *)bp)[1];
++    const int ls = ((bp[4 + kb / 2] >> (4 * (kb & 1))) & 0xF) | (((sh >> (2 * kb)) & 3) << 4);
++    return b16_iq4(vload4(0, (global const uint *)(bp + 8 + 16 * kb)), sl & 1,
++                   vload_half(0, (global const half *)bp) * (float)(ls - 32));
++}
++
++// IQ4_NL: blk = the row's 32-block (flat planes)
++static inline int8 b16_iq4_nl(global const uchar * q, global const half * dp, ulong blk, int sl) {
++    return b16_iq4(vload4(0, (global const uint *)(q + blk * 16)), sl & 1, vload_half(blk, dp));
++}
++
++static inline int8 b16_iq3_xxs(global const uchar * q, ulong b, int sl) {
++    global const uchar * bp = q + b * 98;
++    global const ushort * h = (global const ushort *)bp;
++    const int kb = sl >> 1, l0 = 2 * (sl & 1);   /* 8-weight groups l0, l0 + 1 of 32-block kb */
++    const float d = vload_half(0, (global const half *)bp);
++    const uint aux = (uint)h[1 + 32 + 2 * kb] | ((uint)h[1 + 32 + 2 * kb + 1] << 16);
++    const float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
++    float v[16];
++    #pragma unroll
++    for (int ll = 0; ll < 2; ++ll) {
++        const int l = l0 + ll;
++        const ulong m = ksigns64[(aux >> (7 * l)) & 127];
++        const uchar8 mb = as_uchar8(m);
++        const ushort gw = h[1 + 4 * kb + l];
++        const uchar4 g1 = as_uchar4(iq3xxs_grid[gw & 0xFF]), g2 = as_uchar4(iq3xxs_grid[gw >> 8]);
++        v[8 * ll + 0] = (mb.s0 ? -db : db) * g1.s0; v[8 * ll + 1] = (mb.s1 ? -db : db) * g1.s1;
++        v[8 * ll + 2] = (mb.s2 ? -db : db) * g1.s2; v[8 * ll + 3] = (mb.s3 ? -db : db) * g1.s3;
++        v[8 * ll + 4] = (mb.s4 ? -db : db) * g2.s0; v[8 * ll + 5] = (mb.s5 ? -db : db) * g2.s1;
++        v[8 * ll + 6] = (mb.s6 ? -db : db) * g2.s2; v[8 * ll + 7] = (mb.s7 ? -db : db) * g2.s3;
++    }
++    return b16_pack(vload16(0, v));
++}
++
++// Q4_K / Q5_K without dequantizing: the b operand is the codes themselves as
++// halves 1024 + q, built from the code words by integer operations (0x6400
++// | q, two halves an instruction), byte pairs (0, 2) and (1, 3) of each word
++// (the activations are staged with the middle two of every four halves
++// swapped to match, ID2_PERM). Each 32-weight sub-block j is its own DPAS
++// chain, applied in f32: sum_k a_k w_k = D sc_j (chain - 1024 S_j) - M m_j S_j,
++// with S_j the sub-block's activation sum (staged with the activations).
++static inline int8 b16_q45_codes(uint4 w, uint4 h, int sh, int hb, const int q5) {
++    const uint wv[4] = { w.s0, w.s1, w.s2, w.s3 }, hv[4] = { h.s0, h.s1, h.s2, h.s3 };
++    uint r[8];
++    #pragma unroll
++    for (int u = 0; u < 4; ++u) {
++        uint lo = ((wv[u] >> sh) & 0x000F000Fu) | 0x64006400u;
++        uint hi = ((wv[u] >> (8 + sh)) & 0x000F000Fu) | 0x64006400u;
++        if (q5) {
++            lo |= ((hv[u] >> hb) & 0x00010001u) << 4;
++            hi |= ((hv[u] >> (8 + hb)) & 0x00010001u) << 4;
++        }
++        r[2 * u] = lo;
++        r[2 * u + 1] = hi;
++    }
++    return as_int8((uint8)(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]));
++}
++
++// staged 8 halves: as read (PERM 0), or the middle two of every four swapped
++static inline uint4 id2_perm(uint4 v, const int perm) {
++    if (!perm) return v;
++    return (uint4)((v.s0 & 0xFFFFu) | (v.s1 << 16), (v.s0 >> 16) | (v.s1 & 0xFFFF0000u),
++                   (v.s2 & 0xFFFFu) | (v.s3 << 16), (v.s2 >> 16) | (v.s3 & 0xFFFF0000u));
++}
++
++// PREP: per super-block ib, per lane (row `wr`, the expert's row of this lane,
++// clamped); B16: the lane's b operand for step sl; SCALE: the factor of the
++// super-block's chain; PERM: the activations' order (id2_perm)
++#define ID2_BODY(PERM, PREP, B16, SCALE)                                                        \
++    local half xs[XT * QK_K];                                                                   \
++    const int ti = get_group_id(0);                                                             \
++    if (ti >= *n_tiles) return;                                                                 \
++    const int4 te = tiles[ti];                                                                  \
++    const int lane = get_sub_group_local_id(), lid = get_local_linear_id();                     \
++    const int r = get_group_id(1) * XTHR + get_sub_group_id() * SG + lane;                      \
++    const ulong wr = (ulong)te.x * ne01 + min(r, ne01 - 1);                                     \
++    const int nb = (ne00 + QK_K - 1) / QK_K;                                                    \
++    long src[XSTAGE];                                                                           \
++    int  dsto[XSTAGE];                                                                          \
++    _Pragma("unroll")                                                                           \
++    for (int j = 0; j < XSTAGE; ++j) {                                                          \
++        const int u = lid + j * XTHR, t = u >> 5, o8 = u & 31;                                  \
++        const int p = pairs[te.y + min(t, te.z - 1)];                                           \
++        src[j]  = (long)((p % n_used) % ne11 + (p / n_used) * ne11) * ne00 + 8 * o8;            \
++        dsto[j] = LOFF(t, 8 * o8);                                                              \
++    }                                                                                           \
++    float8 acc[XGR];                                                                            \
++    _Pragma("unroll")                                                                           \
++    for (int g = 0; g < XGR; ++g) acc[g] = (float8)(0.f);                                       \
++    for (int ib = 0; ib < nb; ++ib) {                                                           \
++        barrier(CLK_LOCAL_MEM_FENCE);                                                           \
++        const int kleft = ne00 - ib * QK_K;                                                     \
++        _Pragma("unroll")                                                                       \
++        for (int j = 0; j < XSTAGE; ++j) {                                                      \
++            const int o = (lid + j * XTHR) & 31;                                                \
++            const uint4 v = 8 * o < kleft ? vload4(0, (global const uint *)(xh + src[j] + ib * QK_K)) : (uint4)(0); \
++            vstore4(id2_perm(v, PERM), 0, (local uint *)(xs + dsto[j]));                        \
++        }                                                                                       \
++        PREP;                                                                                   \
++        barrier(CLK_LOCAL_MEM_FENCE);                                                           \
++        const int kmax = min(16, kleft / 16);                                                   \
++        float8 tg[XGR];                                                                         \
++        _Pragma("unroll")                                                                       \
++        for (int g = 0; g < XGR; ++g) tg[g] = (float8)(0.f);                                    \
++        for (int sl = 0; sl < kmax; ++sl) {                                                     \
++            const int8 bw = B16;                                                                \
++            _Pragma("unroll")                                                                   \
++            for (int g = 0; g < XGR; ++g) tg[g] = DPAS(LOAD_A(xs + (g * 16 + sl) * 128), bw, tg[g]); \
++        }                                                                                       \
++        _Pragma("unroll")                                                                       \
++        for (int g = 0; g < XGR; ++g) acc[g] = fma(tg[g], (float8)(SCALE), acc[g]);            \
++    }                                                                                           \
++    if (r >= ne01) return;                                                                      \
++    _Pragma("unroll")                                                                           \
++    for (int g = 0; g < XGR; ++g) {                                                             \
++        const float vv[8] = { acc[g].s0, acc[g].s1, acc[g].s2, acc[g].s3,                       \
++                              acc[g].s4, acc[g].s5, acc[g].s6, acc[g].s7 };                     \
++        _Pragma("unroll")                                                                       \
++        for (int m = 0; m < 8; ++m) {                                                           \
++            const int k = g * 8 + m;                                                            \
++            if (k >= te.z) continue;                                                            \
++            const int p = pairs[te.y + k], t = p / n_used, i = p % n_used;                      \
++            global float * out = (global float *)(dst + offd + (ulong)t * nb2 + (ulong)i * nb1); \
++            out[r] = vv[m] * xscale[(i % ne11) + t * ne11];                                     \
++        }                                                                                       \
++    }
++
++// the Q4_K / Q5_K form of ID2_BODY (b16_q45_codes): the activations staged
++// permuted, with their 32-sums xsum[j][pair]; one DPAS chain per sub-block
++#define ID2_Q45_BODY(QH, Q5)                                                                    \
++    local half  xs[XT * QK_K];                                                                  \
++    local float xsum[8 * XT];                                                                   \
++    const int ti = get_group_id(0);                                                             \
++    if (ti >= *n_tiles) return;                                                                 \
++    const int4 te = tiles[ti];                                                                  \
++    const int lane = get_sub_group_local_id(), lid = get_local_linear_id();                     \
++    const int r = get_group_id(1) * XTHR + get_sub_group_id() * SG + lane;                      \
++    const ulong wr = (ulong)te.x * ne01 + min(r, ne01 - 1);                                     \
++    const int nb = ne00 / QK_K;                                                                 \
++    long src[XSTAGE];                                                                           \
++    int  dsto[XSTAGE];                                                                          \
++    _Pragma("unroll")                                                                           \
++    for (int j = 0; j < XSTAGE; ++j) {                                                          \
++        const int u = lid + j * XTHR, t = u >> 5, o8 = u & 31;                                  \
++        const int p = pairs[te.y + min(t, te.z - 1)];                                           \
++        src[j]  = (long)((p % n_used) % ne11 + (p / n_used) * ne11) * ne00 + 8 * o8;            \
++        dsto[j] = LOFF(t, 8 * o8);                                                              \
++    }                                                                                           \
++    float8 acc[XGR];                                                                            \
++    _Pragma("unroll")                                                                           \
++    for (int g = 0; g < XGR; ++g) acc[g] = (float8)(0.f);                                       \
++    for (int ib = 0; ib < nb; ++ib) {                                                           \
++        barrier(CLK_LOCAL_MEM_FENCE);                                                           \
++        _Pragma("unroll")                                                                       \
++        for (int j = 0; j < XSTAGE; ++j) {                                                      \
++            const int u = lid + j * XTHR;                                                       \
++            const uint4 v = vload4(0, (global const uint *)(xh + src[j] + ib * QK_K));          \
++            vstore4(id2_perm(v, 1), 0, (local uint *)(xs + dsto[j]));                           \
++            const half8 hv = as_half8(v);                                                       \
++            float sm = (float)hv.s0 + (float)hv.s1 + (float)hv.s2 + (float)hv.s3 +              \
++                       (float)hv.s4 + (float)hv.s5 + (float)hv.s6 + (float)hv.s7;               \
++            sm += intel_sub_group_shuffle_xor(sm, 1);                                           \
++            sm += intel_sub_group_shuffle_xor(sm, 2);                                           \
++            if ((u & 3) == 0) xsum[((u & 31) >> 2) * XT + (u >> 5)] = sm;                       \
++        }                                                                                       \
++        const ulong b = wr * nb + ib;                                                           \
++        const uint3 sw = vload3(0, (global const uint *)(s + b * 12));                          \
++        const float D = vload_half(0, d + b), M = vload_half(0, dm + b);                        \
++        barrier(CLK_LOCAL_MEM_FENCE);                                                           \
++        _Pragma("unroll")                                                                       \
++        for (int sb = 0; sb < 8; ++sb) {                                                        \
++            float sc, m;                                                                        \
++            scale_min(sw, sb, &sc, &m);                                                         \
++            const float ka = D * sc, kb = 1024.f * ka + M * m;                                  \
++            const int c4 = sb >> 1, hi = sb & 1;                                                \
++            float8 tg[XGR];                                                                     \
++            _Pragma("unroll")                                                                   \
++            for (int g = 0; g < XGR; ++g) tg[g] = (float8)(0.f);                                \
++            _Pragma("unroll")                                                                   \
++            for (int hh = 0; hh < 2; ++hh) {                                                    \
++                const uint4 w = vload4(0, (global const uint *)(q + b * 128 + 32 * c4 + 16 * hh)); \
++                const uint4 h = Q5 ? vload4(0, (global const uint *)(QH + b * 32 + 16 * hh)) : (uint4)(0); \
++                const int8 bw = b16_q45_codes(w, h, 4 * hi, 2 * c4 + hi, Q5);                   \
++                _Pragma("unroll")                                                               \
++                for (int g = 0; g < XGR; ++g)                                                   \
++                    tg[g] = DPAS(LOAD_A(xs + (g * 16 + 2 * sb + hh) * 128), bw, tg[g]);         \
++            }                                                                                   \
++            _Pragma("unroll")                                                                   \
++            for (int g = 0; g < XGR; ++g) {                                                     \
++                const float8 sx = vload8(0, xsum + sb * XT + g * 8);                            \
++                acc[g] = fma(tg[g], (float8)(ka), acc[g]);                                      \
++                acc[g] = fma(sx, (float8)(-kb), acc[g]);                                        \
++            }                                                                                   \
++        }                                                                                       \
++    }                                                                                           \
++    if (r >= ne01) return;                                                                      \
++    _Pragma("unroll")                                                                           \
++    for (int g = 0; g < XGR; ++g) {                                                             \
++        const float vv[8] = { acc[g].s0, acc[g].s1, acc[g].s2, acc[g].s3,                       \
++                              acc[g].s4, acc[g].s5, acc[g].s6, acc[g].s7 };                     \
++        _Pragma("unroll")                                                                       \
++        for (int m = 0; m < 8; ++m) {                                                           \
++            const int k = g * 8 + m;                                                            \
++            if (k >= te.z) continue;                                                            \
++            const int p = pairs[te.y + k], t = p / n_used, i = p % n_used;                      \
++            global float * out = (global float *)(dst + offd + (ulong)t * nb2 + (ulong)i * nb1); \
++            out[r] = vv[m] * xscale[(i % ne11) + t * ne11];                                     \
++        }                                                                                       \
++    }
++
++// Q6_K the same way: the codes 1024 + q (6 bits from ql and qh), one DPAS
++// chain per k16 step (its own int8 scale s): D s (chain - 1056 S) with S the
++// step's activation sum, xsum[step][pair]
++static inline int8 b16_q6_codes(uint4 w, uint4 h, int sh, int hb) {
++    const uint wv[4] = { w.s0, w.s1, w.s2, w.s3 }, hv[4] = { h.s0, h.s1, h.s2, h.s3 };
++    uint r[8];
++    #pragma unroll
++    for (int u = 0; u < 4; ++u) {
++        r[2 * u]     = ((wv[u] >> sh) & 0x000F000Fu) | (((hv[u] >> hb) & 0x00030003u) << 4) | 0x64006400u;
++        r[2 * u + 1] = ((wv[u] >> (8 + sh)) & 0x000F000Fu) | (((hv[u] >> (8 + hb)) & 0x00030003u) << 4) | 0x64006400u;
++    }
++    return as_int8((uint8)(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]));
++}
++
++#define ID2_Q6_BODY                                                                             \
++    local half  xs[XT * QK_K];                                                                  \
++    local float xsum[16 * XT];                                                                  \
++    const int ti = get_group_id(0);                                                             \
++    if (ti >= *n_tiles) return;                                                                 \
++    const int4 te = tiles[ti];                                                                  \
++    const int lane = get_sub_group_local_id(), lid = get_local_linear_id();                     \
++    const int r = get_group_id(1) * XTHR + get_sub_group_id() * SG + lane;                      \
++    const ulong wr = (ulong)te.x * ne01 + min(r, ne01 - 1);                                     \
++    const int nb = ne00 / QK_K;                                                                 \
++    long src[XSTAGE];                                                                           \
++    int  dsto[XSTAGE];                                                                          \
++    _Pragma("unroll")                                                                           \
++    for (int j = 0; j < XSTAGE; ++j) {                                                          \
++        const int u = lid + j * XTHR, t = u >> 5, o8 = u & 31;                                  \
++        const int p = pairs[te.y + min(t, te.z - 1)];                                           \
++        src[j]  = (long)((p % n_used) % ne11 + (p / n_used) * ne11) * ne00 + 8 * o8;            \
++        dsto[j] = LOFF(t, 8 * o8);                                                              \
++    }                                                                                           \
++    float8 acc[XGR];                                                                            \
++    _Pragma("unroll")                                                                           \
++    for (int g = 0; g < XGR; ++g) acc[g] = (float8)(0.f);                                       \
++    for (int ib = 0; ib < nb; ++ib) {                                                           \
++        barrier(CLK_LOCAL_MEM_FENCE);                                                           \
++        _Pragma("unroll")                                                                       \
++        for (int j = 0; j < XSTAGE; ++j) {                                                      \
++            const int u = lid + j * XTHR;                                                       \
++            const uint4 v = vload4(0, (global const uint *)(xh + src[j] + ib * QK_K));          \
++            vstore4(id2_perm(v, 1), 0, (local uint *)(xs + dsto[j]));                           \
++            const half8 hv = as_half8(v);                                                       \
++            float sm = (float)hv.s0 + (float)hv.s1 + (float)hv.s2 + (float)hv.s3 +              \
++                       (float)hv.s4 + (float)hv.s5 + (float)hv.s6 + (float)hv.s7;               \
++            sm += intel_sub_group_shuffle_xor(sm, 1);                                           \
++            if ((u & 1) == 0) xsum[((u & 31) >> 1) * XT + (u >> 5)] = sm;                       \
++        }                                                                                       \
++        const ulong b = wr * nb + ib;                                                           \
++        const float D = vload_half(0, d + b);                                                   \
++        barrier(CLK_LOCAL_MEM_FENCE);                                                           \
++        _Pragma("unroll")                                                                       \
++        for (int sl = 0; sl < 16; ++sl) {                                                       \
++            const int kb = sl >> 1, hh = sl & 1, n = kb >> 2, p = kb & 3;                       \
++            const float ka = D * (float)s[b * 16 + 8 * n + 2 * p + hh], kc = 1056.f * ka;       \
++            const uint4 w = vload4(0, (global const uint *)(ql + b * 128 + 64 * n + 32 * (p & 1) + 16 * hh)); \
++            const uint4 h = vload4(0, (global const uint *)(qh + b * 64 + 32 * n + 16 * hh));   \
++            const int8 bw = b16_q6_codes(w, h, 4 * (p >> 1), 2 * p);                            \
++            _Pragma("unroll")                                                                   \
++            for (int g = 0; g < XGR; ++g) {                                                     \
++                const float8 tg = DPAS(LOAD_A(xs + (g * 16 + sl) * 128), bw, (float8)(0.f));    \
++                const float8 sx = vload8(0, xsum + sl * XT + g * 8);                            \
++                acc[g] = fma(tg, (float8)(ka), acc[g]);                                         \
++                acc[g] = fma(sx, (float8)(-kc), acc[g]);                                        \
++            }                                                                                   \
++        }                                                                                       \
++    }                                                                                           \
++    if (r >= ne01) return;                                                                      \
++    _Pragma("unroll")                                                                           \
++    for (int g = 0; g < XGR; ++g) {                                                             \
++        const float vv[8] = { acc[g].s0, acc[g].s1, acc[g].s2, acc[g].s3,                       \
++                              acc[g].s4, acc[g].s5, acc[g].s6, acc[g].s7 };                     \
++        _Pragma("unroll")                                                                       \
++        for (int m = 0; m < 8; ++m) {                                                           \
++            const int k = g * 8 + m;                                                            \
++            if (k >= te.z) continue;                                                            \
++            const int pp = pairs[te.y + k], t = pp / n_used, i = pp % n_used;                   \
++            global float * out = (global float *)(dst + offd + (ulong)t * nb2 + (ulong)i * nb1); \
++            out[r] = vv[m] * xscale[(i % ne11) + t * ne11];                                     \
++        }                                                                                       \
++    }
++
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_id2_q4_K_f16(global const uchar * q, global const uchar * s, global const half * d,
++                                       global const half * dm, ID_ARGS) {
++    ID2_Q45_BODY(q, 0)
++}
++
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_id2_q5_K_f16(global const uchar * q, global const uchar * qh, global const uchar * s,
++                                       global const half * d, global const half * dm, ID_ARGS) {
++    ID2_Q45_BODY(qh, 1)
++}
++
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_id2_q6_K_f16(global const uchar * ql, global const uchar * qh, global const char * s,
++                                       global const half * d, ID_ARGS) {
++    ID2_Q6_BODY
++}
++
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_id2_iq3_xxs_f16(global const uchar * q, ulong offq, global const half * dp, ID_ARGS) {
++    ID2_BODY(0, (void)0, b16_iq3_xxs(q + offq, wr * nb + ib, sl), 1.f)
++}
++
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_id2_iq4_xs_f16(global const uchar * q, ulong offq, global const half * dp, ID_ARGS) {
++    ID2_BODY(0, (void)0, b16_iq4_xs(q + offq, wr * nb + ib, sl), 1.f)
++}
++
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_mul_mm_id2_iq4_nl_f16(global const uchar * q, ulong offq, global const half * dp, ID_ARGS) {
++    ID2_BODY(0, (void)0, b16_iq4_nl(q + offq, dp, wr * (ne00 / 32) + ib * 8 + (sl >> 1), sl), 1.f)
++}

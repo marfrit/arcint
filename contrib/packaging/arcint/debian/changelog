@@ -1,3 +1,15 @@
+arcint (0.5.5-1) trixie; urgency=medium
+
+  * 0.5.5: a second engine, libllama (--engine llama --gguf): llama.cpp
+    bed0a85 with contrib/llama.cpp/patches 0001-0014 (Intel kernels for
+    ggml's OpenCL backend), built into the binary. MTP from the GGUF's
+    own head. The services stay on OpenVINO (the coder's context on the A770,
+    no shared prefix cache yet on the new engine). New dependency: ocl-icd-libopencl1. Runtime
+    floor unchanged at marfrit-openvino +p25; the Flash-Next tier's opt-in
+    switches of plugin patches 0076-0077 need +p27.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 04 Oct 2026 12:00:00 +0200
+
 arcint (0.5.4-1) trixie; urgency=medium
 
   * 0.5.4: the 0.5.1-0.5.4 acceptance closes against the readable rows

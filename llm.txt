@@ -10,11 +10,24 @@
 > NInfer philosophy (specialize, then be honest about numbers), Intel
 > substrate.
 
-## Status (0.5.4)
+## Status (0.5.5)
 
 Runtime floor: marfrit-openvino +p25 = OpenVINO upstream commit 71640275 (the
 2026.4.0 nightly of 2026-08-21) + patches 0003-0074
-(contrib/packaging/marfrit-openvino/patches/, mirrored in patches/). Every
+(contrib/packaging/marfrit-openvino/patches/, mirrored in patches/); +p27
+(0076-0077) for the Flash-Next tier's opt-in switches MOE_CPU_TIER_ADAPTIVE
+and MOE_DOORBELL.
+
+Two engines (README "Two engines"): OpenVINO (default, the served
+configurations below) and libllama (--engine llama --gguf: llama.cpp bed0a85
+with contrib/llama.cpp/patches 0001-0014, ggml's OpenCL backend, arcint's
+Intel kernels; MTP from the GGUF's own head). libllama, measured-here:
+- coder (A770): decode 79.3 t/s with 4 drafts, prefill 1,431 t/s at 4k;
+- dense 27B (B60): decode 52.6 t/s with 5 drafts, prefill 935 t/s at 4k.
+
+With f16 KV the dense model serves 122,880 tokens on the B60; the coder's
+Q4_K_M weights leave it ~16k on the A770. There is no shared prefix cache
+yet, so the services stay on OpenVINO. Every
 number below is measured-here on the named card; DESIGN.md §7 has each one's
 standing value and evidence class. The dated measurement record, campaigns
 and design notes live on the development branch `qfndev`, not on `main`.
@@ -200,8 +213,10 @@ server
                             undone once set
   --moe-cpu-tier            compute expert FFNs that would evict a device
                             slot on the host CPU instead (needs --offload-ratio;
-                            --prefix-cache-mib > 0 is refused at load unless the
-                            plugin reports a static residency partition, DESIGN §3.4)
+                            --prefix-cache-mib > 0 is still refused at load
+                            unless the plugin reports the static residency
+                            partition; DESIGN §3.4 (amended 2026-10-01) admits
+                            the pair, and lifting the refusal is owed)
   --moe-cpu-tier-threads N  worker threads for that tier (0 = auto)
   --moe-per-expert-dispatch dispatch routed experts via per-expert GPU
                             kernels (needs --offload-ratio + --moe-cpu-tier)
@@ -370,6 +385,18 @@ misc
                             exit. Device-free; the directory needs no entry
                             yet -- reading a contract is what precedes a pin.
   --version                 print version and exit
+  --engine ov|llama         the executor: OpenVINO (--model IR) or ggml OpenCL via
+                            libllama (--gguf); default: libllama for --gguf
+                            without --model, else OpenVINO
+  --llama-cpu-moe N         libllama: the first N layers' experts stay in host
+                            memory, computed by the CPU (experts beyond VRAM)
+  --llama-threads N         libllama: CPU threads (default: half the hardware
+                            threads)
+  --llama-mtp N             libllama: draft up to N tokens a step with the
+                            GGUF's MTP head, verified in one pass (0-7; 0 off)
+  --llama-mtp-vocab FILE    libllama: the token ids the MTP head may draft
+                            (int32, or a JSON list): a draft step reads only
+                            those rows of the output head
   -h, --help                print this help and exit
 ```
 

@@ -6,6 +6,7 @@ namespace lgc {
 
 std::vector<int> NgramDrafter::draft(const std::vector<int>& tokens, size_t max_tokens) {
     const size_t n = std::min(max_tokens, max_draft_);
+    last_match_ = 0;
     if (n == 0 || ngram_ == 0 || tokens.size() <= ngram_) return {};
 
     const size_t tail = tokens.size() - ngram_;
@@ -22,6 +23,11 @@ std::vector<int> NgramDrafter::draft(const std::vector<int>& tokens, size_t max_
         // token after the match to copy.
         const size_t after = start + ngram_;
         const size_t take = std::min(n, tokens.size() - after);
+        size_t m = ngram_;
+        while (m < 64 && start >= m - ngram_ + 1 && tail >= m - ngram_ + 1 &&
+               tokens[start - (m - ngram_ + 1)] == tokens[tail - (m - ngram_ + 1)])
+            ++m;
+        last_match_ = m;
         return {tokens.begin() + static_cast<long>(after),
                 tokens.begin() + static_cast<long>(after + take)};
     }

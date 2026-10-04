@@ -674,8 +674,11 @@ std::vector<ModelEntry> build_registry() {
         e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
         e.model_type              = "qwen4_exp";
         e.moe                     = true;
-        e.has_mtp_head            = false;
-        e.mtp_head_pinned         = true;   // the export writes none
+        // The MTP draft layer, written beside the export by
+        // tools/export_mtp_flash_next.py from the checkpoint's 31 mtp.*
+        // tensors (P4, 2026-10-02).
+        e.has_mtp_head            = true;
+        e.mtp_head_pinned         = true;
         e.mtp_in_checkpoint       = true;
         e.n_embd                  = 2560;
         e.n_expert                = 512;

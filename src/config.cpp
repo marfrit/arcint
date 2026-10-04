@@ -174,11 +174,12 @@ std::optional<std::string> tier_prefix_cache_decision(bool static_partition_repo
                                                        int prefix_cache_mib) {
     if (!tier_on || prefix_cache_mib <= 0) return std::nullopt;
     if (static_partition_reported) return std::nullopt;
-    return "--moe-cpu-tier with --prefix-cache-mib > 0 violates DESIGN §3.4: "
-           "the host tier's arithmetic depends on expert LRU residency, so a "
-           "continuation restored from the prefix cache is not byte-identical "
-           "to a cold run -- drop --prefix-cache-mib or run without the tier; "
-           "the plugin does not report a static residency partition";
+    return "--moe-cpu-tier with --prefix-cache-mib > 0 is refused at load: "
+           "the plugin does not report a static residency partition, so "
+           "expert placement follows the conversation (an ADAPTIVE tier). "
+           "DESIGN §3.4 (amended 2026-10-01) admits the pair at the "
+           "answer-level bar; lifting this refusal is owed. Until then, drop "
+           "--prefix-cache-mib or run without the tier";
 }
 
 bool parse_u64_strict(const std::string& s, uint64_t& out) {
@@ -238,8 +239,10 @@ std::string usage_text() {
         "                            undone once set\n"
         "  --moe-cpu-tier            compute expert FFNs that would evict a device\n"
         "                            slot on the host CPU instead (needs --offload-ratio;\n"
-        "                            --prefix-cache-mib > 0 is refused at load unless the\n"
-        "                            plugin reports a static residency partition, DESIGN §3.4)\n"
+        "                            --prefix-cache-mib > 0 is still refused at load\n"
+        "                            unless the plugin reports the static residency\n"
+        "                            partition; DESIGN §3.4 (amended 2026-10-01) admits\n"
+        "                            the pair, and lifting the refusal is owed)\n"
         "  --moe-cpu-tier-threads N  worker threads for that tier (0 = auto)\n"
         "  --moe-per-expert-dispatch dispatch routed experts via per-expert GPU\n"
         "                            kernels (needs --offload-ratio + --moe-cpu-tier)\n"
@@ -408,6 +411,18 @@ std::string usage_text() {
         "                            exit. Device-free; the directory needs no entry\n"
         "                            yet -- reading a contract is what precedes a pin.\n"
         "  --version                 print version and exit\n"
+        "  --engine ov|llama         the executor: OpenVINO (--model IR) or ggml OpenCL via\n"
+        "                            libllama (--gguf); default: libllama for --gguf\n"
+        "                            without --model, else OpenVINO\n"
+        "  --llama-cpu-moe N         libllama: the first N layers' experts stay in host\n"
+        "                            memory, computed by the CPU (experts beyond VRAM)\n"
+        "  --llama-threads N         libllama: CPU threads (default: half the hardware\n"
+        "                            threads)\n"
+        "  --llama-mtp N             libllama: draft up to N tokens a step with the\n"
+        "                            GGUF's MTP head, verified in one pass (0-7; 0 off)\n"
+        "  --llama-mtp-vocab FILE    libllama: the token ids the MTP head may draft\n"
+        "                            (int32, or a JSON list): a draft step reads only\n"
+        "                            those rows of the output head\n"
         "  -h, --help                print this help and exit\n";
 }
 
@@ -443,6 +458,22 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--model") {
             if (!value(v)) return fail("--model needs a path");
             cfg.model_path = std::string(v);
+        } else if (arg == "--engine") {
+            if (!value(v)) return fail("--engine needs ov or llama");
+            cfg.engine = std::string(v);
+            if (cfg.engine != "ov" && cfg.engine != "llama") return fail("--engine is ov or llama");
+        } else if (arg == "--llama-cpu-moe") {
+            if (!value(v) || !parse_int(v, cfg.llama_cpu_moe) || cfg.llama_cpu_moe < 0)
+                return fail("--llama-cpu-moe needs a layer count >= 0");
+        } else if (arg == "--llama-threads") {
+            if (!value(v) || !parse_int(v, cfg.llama_threads) || cfg.llama_threads < 0)
+                return fail("--llama-threads needs a thread count >= 0");
+        } else if (arg == "--llama-mtp") {
+            if (!value(v) || !parse_int(v, cfg.llama_mtp) || cfg.llama_mtp < 0 || cfg.llama_mtp > 7)
+                return fail("--llama-mtp needs a draft count from 0 to 7 (a verify of up to 8 rows)");
+        } else if (arg == "--llama-mtp-vocab") {
+            if (!value(v)) return fail("--llama-mtp-vocab needs a file of token ids");
+            cfg.llama_mtp_vocab = std::string(v);
         } else if (arg == "--gguf") {
             if (!value(v)) return fail("--gguf needs a path");
             cfg.gguf_path = std::string(v);
@@ -725,8 +756,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.show_help || cfg.show_version || cfg.flash_next_offload_plan) return {};
 
     // ------------------------------------------------------------ validation
-    if (cfg.model_path.empty() && !cfg.stub) {
-        return fail("nothing to serve: pass --model PATH, or --stub for the M0 skeleton");
+    if (cfg.model_path.empty() && !cfg.stub && !(cfg.engine != "ov" && !cfg.gguf_path.empty())) {
+        return fail("nothing to serve: pass --model PATH, --engine llama --gguf FILE, or --stub for the M0 skeleton");
     }
     if (!cfg.model_path.empty() && cfg.stub) {
         return fail("--model and --stub are mutually exclusive");
@@ -888,8 +919,18 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     // decide it: this combination now parses, and backend_ov.cpp's load
     // path (tier_prefix_cache_decision, config.h) makes the call instead.
     if (cfg.prefill_chunk < 0) return fail("--prefill-chunk must be >= 0");
+    // The default follows what was given: a GGUF alone is the libllama
+    // engine's model, an IR directory the OpenVINO executor's.
+    if (cfg.engine.empty()) cfg.engine = (!cfg.gguf_path.empty() && cfg.model_path.empty()) ? "llama" : "ov";
+    if (cfg.engine == "llama") {
+        if (cfg.gguf_path.empty()) return fail("--engine llama serves a GGUF: give --gguf");
+        if (!cfg.llama_mtp_vocab.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-vocab needs --llama-mtp");
+    } else {
+    if (cfg.llama_cpu_moe > 0 || cfg.llama_threads > 0 || cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty())
+        return fail("--llama-cpu-moe, --llama-threads, --llama-mtp and --llama-mtp-vocab are --engine llama options");
     if (!cfg.gguf_path.empty() && cfg.model_path.empty()) return fail("--gguf needs --model (the template IR directory)");
     if (!cfg.gguf_path.empty() && !cfg.paged) return fail("--gguf serves on the paged path only");
+    }
     if (!cfg.ngram_gguf_path.empty() && cfg.model_path.empty()) return fail("--ngram-gguf needs --model (the IR whose ngram_table.K ports it binds)");
     if (!cfg.ngram_gguf_path.empty() && !cfg.paged) return fail("--ngram-gguf serves on the paged path only (the ports are bound per lane request)");
     if (!cfg.ngram_gguf_path.empty() && !cfg.gguf_path.empty()) return fail("--ngram-gguf and --gguf both open a GGUF for the ngram_table ports; give one");
