@@ -18,6 +18,37 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.5.8 — 2026-10-04
+
+**Runtime:** `marfrit-openvino +p25` remains the floor.
+
+**Mistral Small 3.2 24B on the libllama engine** (operator, 2026-10-04: for
+creative writing; tool calls and speculation out of scope).
+- The engine admits the `llama` architecture at that model's geometry only:
+  40 layers × 5120, 32 query heads on 8, head size 128, vocabulary 131,072.
+  Cydonia 24B v4.3, a finetune of it, is the served artifact. Others of
+  that family load too; their `[THINK]` blocks are not split and their tool
+  calls are not parsed. A prompt whose template wrote no BOS gets one when
+  the vocabulary asks for it.
+- `contrib/llama.cpp` 0017 builds the XMX prompt-attention kernel (0008)
+  and the verify kernel (0016) at head size 128 as well. All 40 layers
+  attend, so prompt attention dominates long prompts.
+
+Measured (`measured-here`, B60, Cydonia 24B v4.3 Q4_K_M):
+- llama-bench prefill:
+  - 1,099 -> 1,407 t/s at 512 tokens;
+  - 472 -> 1,225 at 4,096;
+  - 168 -> 451 at 16k depth (q8_0 KV);
+- decode 25.2 t/s, unchanged;
+- served at `--n-ctx 98304` with q8_0 KV: an 89,265-token prompt in 404 s
+  (221 t/s), then decode at 8.4 t/s at that depth;
+- KL against the model's own Q8_0 on the CPU: 0.019742 before, 0.019850
+  with 0017, 0.020316 with q8_0 KV (top-1 94.76, 94.83, 94.85 %);
+- FLASH_ATTN_EXT 2,805 of 2,806 on the B60 and 2,804 of 2,806 on the
+  A770, with 48 cases added at that geometry;
+- a red case (BK=24 in both kernels) fails every case those kernels serve
+  at that geometry.
+
 ## 0.5.7 — 2026-10-04
 
 **Runtime:** `marfrit-openvino +p25` remains the floor.

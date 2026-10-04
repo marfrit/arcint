@@ -157,13 +157,24 @@ public:
 
         // The models this engine serves, by the GGUF's own architecture; the
         // allowlist rule (DESIGN §3.1) holds here as on the OpenVINO path.
+        // 'llama' is admitted at one geometry only, the Mistral Small 24B
+        // family's: served for creative writing with Mistral Small 3.2's
+        // finetune Cydonia 24B (operator, 2026-10-04). Others of the family
+        // load too; their [THINK] blocks are not split and their tool calls
+        // not parsed (Qwen formats only, src/core/toolcall.h)
         char arch[64] = {};
         llama_model_meta_val_str(model_, "general.architecture", arch, sizeof(arch));
         const std::string a(arch);
-        if (a != "qwen35" && a != "qwen35moe" && a != "qwen4exp")
-            throw std::runtime_error(log::format("%s is a '%s' model; --engine llama serves qwen35, qwen35moe and qwen4exp",
-                                                 cfg.gguf_path.c_str(), arch));
         vocab_     = llama_model_get_vocab(model_);
+        char head_dim[16] = {};
+        llama_model_meta_val_str(model_, "llama.attention.key_length", head_dim, sizeof(head_dim));
+        const bool mistral_small_24b = a == "llama" && llama_model_n_layer(model_) == 40 && llama_model_n_embd(model_) == 5120 &&
+                                       llama_model_n_head(model_) == 32 && llama_model_n_head_kv(model_) == 8 &&
+                                       std::string(head_dim) == "128" && llama_vocab_n_tokens(vocab_) == 131072;
+        if (a != "qwen35" && a != "qwen35moe" && a != "qwen4exp" && !mistral_small_24b)
+            throw std::runtime_error(log::format("%s is a '%s' model; --engine llama serves qwen35, qwen35moe, qwen4exp "
+                                                 "and Mistral Small 3.2 24B ('llama', 40 x 5120, 32/8 heads)",
+                                                 cfg.gguf_path.c_str(), arch));
         tokenizer_ = std::make_unique<LlamaTokenizer>(vocab_);
         n_vocab_   = static_cast<size_t>(llama_vocab_n_tokens(vocab_));
 
@@ -277,8 +288,7 @@ public:
                           GenerationStats& stats) override {
         if (spec_) return generate_spec(in, slot, on_piece, stats);
         const int seq = std::min(std::max(slot, 0), lanes_ - 1);
-        const std::vector<int> prompt =
-            in.prompt_ids.empty() ? tokenizer_->encode(in.prompt) : in.prompt_ids;
+        const std::vector<int> prompt = prompt_tokens(in);
         stats.prompt_tokens = static_cast<int>(prompt.size());
         if (prompt.empty()) return FinishReason::Stop;
         if (static_cast<int>(prompt.size()) >= n_ctx_) {
@@ -391,10 +401,22 @@ private:
         }
     }
 
+    // The prompt's ids. A vocabulary that wants BOS (Mistral's Tekken) gets it
+    // when the rendered template did not write it: encode() adds no special
+    // tokens, so a finetune's template without {{ bos_token }} would otherwise
+    // run without BOS
+    std::vector<int> prompt_tokens(const GenerationInput& in) const {
+        std::vector<int> ids = in.prompt_ids.empty() ? tokenizer_->encode(in.prompt) : in.prompt_ids;
+        const llama_token bos = llama_vocab_bos(vocab_);
+        if (in.prompt_ids.empty() && llama_vocab_get_add_bos(vocab_) && bos != LLAMA_TOKEN_NULL &&
+            (ids.empty() || ids.front() != bos))
+            ids.insert(ids.begin(), bos);
+        return ids;
+    }
+
     FinishReason generate_spec_lane(const GenerationInput& in, int seq, const TokenCallback& on_piece,
                                     GenerationStats& stats) {
-        const std::vector<int> prompt =
-            in.prompt_ids.empty() ? tokenizer_->encode(in.prompt) : in.prompt_ids;
+        const std::vector<int> prompt = prompt_tokens(in);
         stats.prompt_tokens = static_cast<int>(prompt.size());
         if (prompt.empty()) return FinishReason::Stop;
         if (static_cast<int>(prompt.size()) >= n_ctx_) {

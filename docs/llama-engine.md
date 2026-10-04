@@ -252,6 +252,14 @@ head for all its query heads and rows. With the agent's flags at 62,597
 tokens of depth, decode went from 11.0 to 15.6 t/s (`measured-here`); the
 campaign is `docs/campaigns/gqa-small-t-decode.md`.
 
+**Mistral Small 3.2 24B / Cydonia 24B (0.5.8), creative writing on the
+B60.** The engine admits the `llama` architecture at that geometry only.
+`contrib/llama.cpp` 0017 builds the XMX attention kernels at head size 128.
+The README section of 0017 and the CHANGELOG have the numbers. The model has
+no MTP head, so decode is plain: 25.2 t/s short, 18.2 at 16k and 8.4 at 89k
+depth (`measured-here`). All 40 layers keep KV (85 KiB a
+token at q8_0), which puts the ceiling at 98,304 tokens on the B60.
+
 **Coder, A770: smaller GGUFs for its context** (`measured-here`,
 2026-10-04). Its Q4_K_M weights (16.06 GB) leave ~16k tokens with MTP. Two
 mixes were made from the F16 GGUF with the model's imatrix. Expert gate/up

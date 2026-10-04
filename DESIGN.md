@@ -1,6 +1,6 @@
 # arcint — Design
 
-Status: **0.5.7**, runtime floor `marfrit-openvino +p25` (patches 0003–0074
+Status: **0.5.8**, runtime floor `marfrit-openvino +p25` (patches 0003–0074
 on the pinned OpenVINO nightly, §1.1; `+p27` for the Flash-Next tier's opt-in
 switches of patches 0076–0077). Since 0.5.5 a second executor serves GGUFs
 through libllama (§7.11); from 0.5.6 it serves the agent. This document states what arcint *is*
@@ -1113,14 +1113,16 @@ units with operator-local detail removed):
 
 `src/exec/backend_llama.cpp` runs a GGUF through llama.cpp, pinned at
 `bed0a85`, with ggml's OpenCL backend. arcint's Intel kernels are carried as
-`contrib/llama.cpp/patches` 0001–0016 (`contrib/llama.cpp/README.md`, one
+`contrib/llama.cpp/patches` 0001–0017 (`contrib/llama.cpp/README.md`, one
 section per patch): K-quant and IQ matvecs and XMX GEMMs, the gated
 delta-net, decode and prompt attention, the few-token verify, the B60's
 2D-block GEMM with packed decode and int8 DPAS, searched tiles, and
 attention over a quantized KV cache (`--llama-kv q8_0` or `q8_0:q4_0`; 4:4
 misses the top-1 bar and is refused), and on the B60 MTP-verify attention in
 one pass over K/V per KV head (0016: the agent's decode at 62,597 tokens of
-depth 11.0 -> 15.6 t/s).
+depth 11.0 -> 15.6 t/s), and both XMX attention kernels at head size 128
+(0017). Besides the Qwens the engine admits one `llama` geometry, the
+Mistral Small 24B family's, for creative writing (Cydonia 24B, 0.5.8).
 
 arcint keeps the HTTP surface, the chat template, the sampler, stop handling
 and the lanes. llama.cpp keeps the weights, the tokenizer, the attention KV

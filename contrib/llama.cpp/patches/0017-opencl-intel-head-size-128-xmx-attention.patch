@@ -1,0 +1,282 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 28bfc64..bdec375 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1081,11 +1081,12 @@ struct ggml_backend_opencl_context {
+     // (one token) and prompt kernels and their shapes
+     cl_kernel kernel_gdn_intel_tg = nullptr;
+     // Intel, prompt attention on the XMX units (flash_attn_dpas.cl; SG 16 or 8)
+-    cl_kernel kernel_fa_dpas = nullptr;
+-    cl_kernel kernel_fa_dpas_q[3] = {};           // quantized K/V: q8_0/q8_0, q8_0/q4_0, q4_0/q4_0
++    // [0] head size 256, [1] 128
++    cl_kernel kernel_fa_dpas_dk[2] = {};
++    cl_kernel kernel_fa_dpas_q_dk[2][3] = {};     // quantized K/V: q8_0/q8_0, q8_0/q4_0, q4_0/q4_0
+     // Intel Xe2, decode / verify rows on the XMX units, a KV head's query
+     // heads and rows in one pass (flash_attn_gqa_dpas.cl): f16, q8q8, q8q4, q4q4
+-    cl_kernel kernel_fa_gqa[4] = {};
++    cl_kernel kernel_fa_gqa_dk[2][4] = {};        // [0] head size 256, [1] 128
+     int       fa_gqa_sides = 2;                   // sub-groups per 8 rows the kernels were built for
+     int       fa_dpas_bq = 0, fa_dpas_nthr = 0;   // query rows and work-items a work-group
+     cl_kernel kernel_gdn_intel_pp = nullptr;
+@@ -4231,59 +4232,65 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+             const int sg   = sg8 ? 8 : 16;
+             const int nsg  = sg8 ? 8 : 16;
+             const int nthr = nsg * sg, bq = sg8 ? nsg / 2 * 8 : nsg * 8;
+-            cl_program p = build_program_from_source_optional(backend_ctx, kernel_src.c_str(),
+-                compile_opts + " -cl-intel-256-GRF-per-thread -DDK=256 -DFA_SG=" + std::to_string(sg) +
+-                " -DNSG=" + std::to_string(nsg) + " -DBK=32" +
+-                (getenv("GGML_OPENCL_FA_DPAS_OPTS") ? std::string(" ") + getenv("GGML_OPENCL_FA_DPAS_OPTS") : std::string()));
+-            if (p != nullptr) {
+-                CL_CHECK((backend_ctx->kernel_fa_dpas = clCreateKernel(p, "flash_attn_f32_f16_dpas", &err), err));
+-                // the kernel's own limits: work-items (a 256-GRF build halves
+-                // them) and local memory against the device's
+-                size_t   wg = 0;
+-                cl_ulong lm = 0, lm_dev = 0;
+-                CL_CHECK(clGetKernelWorkGroupInfo(backend_ctx->kernel_fa_dpas, backend_ctx->device,
+-                                                  CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg), &wg, NULL));
+-                CL_CHECK(clGetKernelWorkGroupInfo(backend_ctx->kernel_fa_dpas, backend_ctx->device,
+-                                                  CL_KERNEL_LOCAL_MEM_SIZE, sizeof(lm), &lm, NULL));
+-                CL_CHECK(clGetDeviceInfo(backend_ctx->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(lm_dev), &lm_dev, NULL));
+-                if (wg < (size_t)nthr || lm > lm_dev) {
+-                    CL_CHECK(clReleaseKernel(backend_ctx->kernel_fa_dpas));
+-                    backend_ctx->kernel_fa_dpas = nullptr;
+-                } else {
+-                    backend_ctx->fa_dpas_bq   = bq;
+-                    backend_ctx->fa_dpas_nthr = nthr;
+-                }
+-                CL_CHECK(clReleaseProgram(p));
+-            }
+-            // the same with quantized K/V (KT/VT: 1 q8_0, 2 q4_0), staged to
+-            // f16 in local memory; GGML_OPENCL_FA_DPAS_Q=0 leaves quantized
+-            // caches to flash_attn_f32_q8_0.cl / the host dequantization
+-            const char * fq_env = getenv("GGML_OPENCL_FA_DPAS_Q");
+-            const int kvt[3][2] = { {1, 1}, {1, 2}, {2, 2} };
+-            for (int i = 0; i < 3 && backend_ctx->kernel_fa_dpas != nullptr && (fq_env == nullptr || atoi(fq_env) != 0); ++i) {
+-                cl_program pq = build_program_from_source_optional(backend_ctx, kernel_src.c_str(),
+-                    compile_opts + " -cl-intel-256-GRF-per-thread -DDK=256 -DFA_SG=" + std::to_string(sg) +
+-                    " -DNSG=" + std::to_string(nsg) + " -DBK=32 -DKT=" + std::to_string(kvt[i][0]) +
+-                    " -DVT=" + std::to_string(kvt[i][1]) +
++            // head sizes 256 (the Qwens) and 128 (Mistral Small 24B)
++            for (int di = 0; di < 2; ++di) {
++                const int dk = di == 0 ? 256 : 128;
++                cl_program p = build_program_from_source_optional(backend_ctx, kernel_src.c_str(),
++                    compile_opts + " -cl-intel-256-GRF-per-thread -DDK=" + std::to_string(dk) + " -DFA_SG=" + std::to_string(sg) +
++                    " -DNSG=" + std::to_string(nsg) + " -DBK=32" +
+                     (getenv("GGML_OPENCL_FA_DPAS_OPTS") ? std::string(" ") + getenv("GGML_OPENCL_FA_DPAS_OPTS") : std::string()));
+-                if (pq == nullptr) continue;
+-                cl_kernel kq = clCreateKernel(pq, "flash_attn_f32_f16_dpas", &err);
+-                size_t   wg = 0;
+-                cl_ulong lm = 0, lm_dev = 0;
+-                if (err == CL_SUCCESS) {
+-                    CL_CHECK(clGetKernelWorkGroupInfo(kq, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg), &wg, NULL));
+-                    CL_CHECK(clGetKernelWorkGroupInfo(kq, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE, sizeof(lm), &lm, NULL));
++                if (p != nullptr) {
++                    CL_CHECK((backend_ctx->kernel_fa_dpas_dk[di] = clCreateKernel(p, "flash_attn_f32_f16_dpas", &err), err));
++                    // the kernel's own limits: work-items (a 256-GRF build halves
++                    // them) and local memory against the device's
++                    size_t   wg = 0;
++                    cl_ulong lm = 0, lm_dev = 0;
++                    CL_CHECK(clGetKernelWorkGroupInfo(backend_ctx->kernel_fa_dpas_dk[di], backend_ctx->device,
++                                                      CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg), &wg, NULL));
++                    CL_CHECK(clGetKernelWorkGroupInfo(backend_ctx->kernel_fa_dpas_dk[di], backend_ctx->device,
++                                                      CL_KERNEL_LOCAL_MEM_SIZE, sizeof(lm), &lm, NULL));
+                     CL_CHECK(clGetDeviceInfo(backend_ctx->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(lm_dev), &lm_dev, NULL));
+-                    if (wg >= (size_t)nthr && lm <= lm_dev) {
+-                        backend_ctx->kernel_fa_dpas_q[i] = kq;
++                    if (wg < (size_t)nthr || lm > lm_dev) {
++                        CL_CHECK(clReleaseKernel(backend_ctx->kernel_fa_dpas_dk[di]));
++                        backend_ctx->kernel_fa_dpas_dk[di] = nullptr;
+                     } else {
+-                        CL_CHECK(clReleaseKernel(kq));
++                        backend_ctx->fa_dpas_bq   = bq;
++                        backend_ctx->fa_dpas_nthr = nthr;
++                    }
++                    CL_CHECK(clReleaseProgram(p));
++                }
++                // the same with quantized K/V (KT/VT: 1 q8_0, 2 q4_0), staged to
++                // f16 in local memory; GGML_OPENCL_FA_DPAS_Q=0 leaves quantized
++                // caches to flash_attn_f32_q8_0.cl / the host dequantization
++                const char * fq_env = getenv("GGML_OPENCL_FA_DPAS_Q");
++                const int kvt[3][2] = { {1, 1}, {1, 2}, {2, 2} };
++                for (int i = 0; i < 3 && backend_ctx->kernel_fa_dpas_dk[di] != nullptr && (fq_env == nullptr || atoi(fq_env) != 0); ++i) {
++                    cl_program pq = build_program_from_source_optional(backend_ctx, kernel_src.c_str(),
++                        compile_opts + " -cl-intel-256-GRF-per-thread -DDK=" + std::to_string(dk) + " -DFA_SG=" + std::to_string(sg) +
++                        " -DNSG=" + std::to_string(nsg) + " -DBK=32 -DKT=" + std::to_string(kvt[i][0]) +
++                        " -DVT=" + std::to_string(kvt[i][1]) +
++                        (getenv("GGML_OPENCL_FA_DPAS_OPTS") ? std::string(" ") + getenv("GGML_OPENCL_FA_DPAS_OPTS") : std::string()));
++                    if (pq == nullptr) continue;
++                    cl_kernel kq = clCreateKernel(pq, "flash_attn_f32_f16_dpas", &err);
++                    size_t   wg = 0;
++                    cl_ulong lm = 0, lm_dev = 0;
++                    if (err == CL_SUCCESS) {
++                        CL_CHECK(clGetKernelWorkGroupInfo(kq, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg), &wg, NULL));
++                        CL_CHECK(clGetKernelWorkGroupInfo(kq, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE, sizeof(lm), &lm, NULL));
++                        CL_CHECK(clGetDeviceInfo(backend_ctx->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(lm_dev), &lm_dev, NULL));
++                        if (wg >= (size_t)nthr && lm <= lm_dev) {
++                            backend_ctx->kernel_fa_dpas_q_dk[di][i] = kq;
++                        } else {
++                            CL_CHECK(clReleaseKernel(kq));
++                        }
+                     }
++                    CL_CHECK(clReleaseProgram(pq));
+                 }
+-                CL_CHECK(clReleaseProgram(pq));
+             }
+-            if (backend_ctx->kernel_fa_dpas == nullptr) {
++            if (backend_ctx->kernel_fa_dpas_dk[0] == nullptr) {
+                 GGML_LOG_WARN("ggml_opencl: flash_attn_dpas.cl not built; flash_attn_f32_f16.cl takes the prompt\n");
++            } else if (backend_ctx->kernel_fa_dpas_dk[1] == nullptr) {
++                GGML_LOG_WARN("ggml_opencl: flash_attn_dpas.cl not built at head size 128; flash_attn_f32_f16.cl takes those prompts\n");
+             }
+             // decode / verify rows, a KV head's query heads and rows in one
+             // pass (Xe2 only: sub-group 16 without 8); GGML_OPENCL_FA_GQA=0
+@@ -4303,29 +4310,32 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 const std::string gqa_src = read_file("flash_attn_gqa_dpas.cl");
+ #endif
+                 const int gkv[4][2] = { {0, 0}, {1, 1}, {1, 2}, {2, 2} };
+-                for (int i = 0; i < 4; ++i) {
+-                    cl_program pg = build_program_from_source_optional(backend_ctx, gqa_src.c_str(),
+-                        compile_opts + " -cl-intel-256-GRF-per-thread -DGQA_SIDES=" + std::to_string(fg_sides) +
+-                        " -DKT=" + std::to_string(gkv[i][0]) +
+-                        " -DVT=" + std::to_string(gkv[i][1]) +
+-                        (getenv("GGML_OPENCL_FA_GQA_OPTS") ? std::string(" ") + getenv("GGML_OPENCL_FA_GQA_OPTS") : std::string()));
+-                    if (pg == nullptr) continue;
+-                    cl_kernel kg = clCreateKernel(pg, "flash_attn_gqa_dpas", &err);
+-                    if (err == CL_SUCCESS) {
+-                        size_t   wg = 0;
+-                        cl_ulong lm = 0, lm_dev = 0;
+-                        CL_CHECK(clGetKernelWorkGroupInfo(kg, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg), &wg, NULL));
+-                        CL_CHECK(clGetKernelWorkGroupInfo(kg, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE, sizeof(lm), &lm, NULL));
+-                        CL_CHECK(clGetDeviceInfo(backend_ctx->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(lm_dev), &lm_dev, NULL));
+-                        if (wg >= (size_t) fg_sides * 8 * 16 && lm <= lm_dev) {   // up to 8 row tiles
+-                            backend_ctx->kernel_fa_gqa[i] = kg;
+-                        } else {
+-                            CL_CHECK(clReleaseKernel(kg));
++                for (int di = 0; di < 2; ++di) {
++                    const int dk = di == 0 ? 256 : 128;
++                    for (int i = 0; i < 4; ++i) {
++                        cl_program pg = build_program_from_source_optional(backend_ctx, gqa_src.c_str(),
++                            compile_opts + " -cl-intel-256-GRF-per-thread -DDK=" + std::to_string(dk) + " -DGQA_SIDES=" + std::to_string(fg_sides) +
++                            " -DKT=" + std::to_string(gkv[i][0]) +
++                            " -DVT=" + std::to_string(gkv[i][1]) +
++                            (getenv("GGML_OPENCL_FA_GQA_OPTS") ? std::string(" ") + getenv("GGML_OPENCL_FA_GQA_OPTS") : std::string()));
++                        if (pg == nullptr) continue;
++                        cl_kernel kg = clCreateKernel(pg, "flash_attn_gqa_dpas", &err);
++                        if (err == CL_SUCCESS) {
++                            size_t   wg = 0;
++                            cl_ulong lm = 0, lm_dev = 0;
++                            CL_CHECK(clGetKernelWorkGroupInfo(kg, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg), &wg, NULL));
++                            CL_CHECK(clGetKernelWorkGroupInfo(kg, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE, sizeof(lm), &lm, NULL));
++                            CL_CHECK(clGetDeviceInfo(backend_ctx->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(lm_dev), &lm_dev, NULL));
++                            if (wg >= (size_t) fg_sides * 8 * 16 && lm <= lm_dev) {   // up to 8 row tiles
++                                backend_ctx->kernel_fa_gqa_dk[di][i] = kg;
++                            } else {
++                                CL_CHECK(clReleaseKernel(kg));
++                            }
+                         }
++                        CL_CHECK(clReleaseProgram(pg));
+                     }
+-                    CL_CHECK(clReleaseProgram(pg));
+                 }
+-                if (backend_ctx->kernel_fa_gqa[0] == nullptr) {
++                if (backend_ctx->kernel_fa_gqa_dk[0][0] == nullptr) {
+                     GGML_LOG_WARN("ggml_opencl: flash_attn_gqa_dpas.cl not built; flash_attn_f32_f16.cl takes decode\n");
+                 }
+             }
+@@ -18938,8 +18948,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     // A prompt goes to flash_attn_dpas.cl here; up to 8 rows with quantized
+     // K/V to flash_attn_*_q1_split_intel further down.
+     // Intel, a prompt: flash_attn_dpas.cl (the XMX units), f16 or quantized K/V
+-    cl_kernel kd_sel = is_mixed ? backend_ctx->kernel_fa_dpas : kvq >= 0 ? backend_ctx->kernel_fa_dpas_q[kvq] : nullptr;
+-    if (kd_sel != nullptr && n_q > 8 && d_head_q == 256 && d_head_v == 256 &&
++    // head size 256 or 128 (index 0 / 1 of the kernel arrays)
++    const int fa_dki = d_head_q == 256 && d_head_v == 256 ? 0 : d_head_q == 128 && d_head_v == 128 ? 1 : -1;
++    cl_kernel kd_sel = fa_dki < 0 ? nullptr : is_mixed ? backend_ctx->kernel_fa_dpas_dk[fa_dki]
++                                            : kvq >= 0 ? backend_ctx->kernel_fa_dpas_q_dk[fa_dki][kvq] : nullptr;
++    if (kd_sel != nullptr && n_q > 8 &&
+         sinks == nullptr && max_bias == 0.0f && logit_softcap == 0.0f &&
+         q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
+         (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q))) {
+@@ -19247,11 +19260,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     static const char * fgr_env = getenv("GGML_OPENCL_FA_GQA_MIN_ROWS");
+     static const int    fg_min_rows = fgr_env ? atoi(fgr_env) : 4;
+     bool use_fd_gqa = false;
+-    if (use_fd_intel && n_q >= fg_min_rows && d_head_q == 256 && d_head_v == 256 && max_bias == 0.0f && logit_softcap == 0.0f &&
++    if (use_fd_intel && n_q >= fg_min_rows && fa_dki >= 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
+         n_head_kv > 0 && n_head % n_head_kv == 0 && (n_head / n_head_kv) * n_q <= 64) {
+         const int gi = is_mixed ? 0 : kvq >= 0 ? kvq + 1 : -1;
+-        if (gi >= 0 && backend_ctx->kernel_fa_gqa[gi] != nullptr) {
+-            fd_k_split = backend_ctx->kernel_fa_gqa[gi];
++        if (gi >= 0 && backend_ctx->kernel_fa_gqa_dk[fa_dki][gi] != nullptr) {
++            fd_k_split = backend_ctx->kernel_fa_gqa_dk[fa_dki][gi];
+             use_fd_gqa = true;
+         }
+     }
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
+index f40702b..5fc1740 100644
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
+@@ -44,7 +44,7 @@
+ 
+ #else
+ // SG 8 (Xe-HPG): a pair of sub-groups shares 8 query rows, each owning half
+-// of the output columns (its 128 columns of O, 16 float8, in registers) and
++// of the output columns (its DV / 2 columns of O, DV / 16 float8, in registers) and
+ // computing S itself; the a operand packs two keys a lane, so P is re-laid
+ // from S (lane = key) by shuffles
+ #define BQ (NSG / 2 * 8)
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
+index b9ca909..137789e 100644
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
+@@ -28,11 +28,13 @@
+ // BK are the switches a structural search varies (docs/campaigns/
+ // kernel-autotune-ga.md).
+ //
+-// K and V as f16 (0), q8_0 (1) or q4_0 (2) (KT, VT). DK = DV = 256. No ALiBi
++// K and V as f16 (0), q8_0 (1) or q4_0 (2) (KT, VT). DK = DV, 256 or 128. No ALiBi
+ // or softcap (the host keeps those on flash_attn_f32_f16_q1_split_intel).
+ 
++#ifndef DK
+ #define DK 256
+-#define DV 256
++#endif
++#define DV DK
+ #define KC (DK / 16)            // k chunks of the Q K^T product
+ #ifndef GQA_SIDES
+ #define GQA_SIDES 2             // sub-groups sharing 8 rows, each a column range
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 0140cb8..7a58fd2 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11206,6 +11206,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             }
+         }
+     }
++    // Mistral Small 24B's geometry (head size 128, 32 query heads on 8):
++    // decode, verify rows, prompts; f16 and quantized K/V
++    for (auto kv_t : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},
++                                                                  {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}}) {
++        for (int64_t nb : {1, 3, 5, 6, 7, 8, 64, 512}) {
++            for (int64_t kv : {1013, 4096}) {
++                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, nb, true, false, 0, 0,
++                                                                GGML_PREC_F32, kv_t.first, kv_t.second));
++            }
++        }
++    }
+     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
+     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+@@ -11515,6 +11526,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // prompt attention at depth, Mistral Small 24B's geometry (head size 128,
++    // 32 query heads on 8)
++    for (int64_t kv : {4096, 16384}) {
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32,
++                                                        GGML_TYPE_F16, GGML_TYPE_F16));
++    }
+     // decode (1 row) and MTP verify (6 rows) attention at depth, a dense
+     // 27B's geometry (head size 256, 24 query heads on 4)
+     for (auto kt : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {

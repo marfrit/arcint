@@ -10,7 +10,7 @@
 > NInfer philosophy (specialize, then be honest about numbers), Intel
 > substrate.
 
-## Status (0.5.7)
+## Status (0.5.8)
 
 Runtime floor: marfrit-openvino +p25 = OpenVINO upstream commit 71640275 (the
 2026.4.0 nightly of 2026-08-21) + patches 0003-0074
@@ -20,7 +20,7 @@ and MOE_DOORBELL.
 
 Two engines (README "Two engines"): OpenVINO (default; the coder service)
 and libllama (--engine llama --gguf, the agent service from 0.5.6: llama.cpp
-bed0a85 with contrib/llama.cpp/patches 0001-0016, ggml's OpenCL backend,
+bed0a85 with contrib/llama.cpp/patches 0001-0017, ggml's OpenCL backend,
 arcint's Intel kernels; MTP from the GGUF's own head; --llama-kv q8_0 or
 q8_0:q4_0 quantizes its KV cache). libllama, measured-here:
 - coder (A770): decode 79.3 t/s with 4 drafts, prefill 1,431 t/s at 4k;
@@ -47,6 +47,11 @@ Served configurations:
   tokens of depth 0.5.7 decodes at 15.6 t/s (0.5.6: 11.0). Before 0.5.6:
   qwen38-b7c1-ov on OpenVINO, i8:u8 KV, 122,880 tokens, DFlash2 drafter,
   prefix cache 8 GiB, host KV tier 4 GiB.
+
+- writer (from 0.5.8, on demand on the B60): Cydonia 24B v4.3 (Mistral Small
+  3.2 finetune) Q4_K_M GGUF on the libllama engine, q8_0 KV, 98,304 tokens;
+  prefill 1,225 t/s at 4k, decode 25.2 t/s short and 8.4 at 89k; KL against
+  its Q8_0 0.0199.
 
 Other measured configurations:
 - Qwen3.6-35B-A3B all-resident on the A770: native-format artifact
