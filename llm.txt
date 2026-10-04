@@ -41,7 +41,8 @@ Served configurations:
   on the B60: 66.5 t/s decode, 2,821 t/s prefill at ~1k (the >= 60 t/s bar).
 - agent (from 0.5.6): Qwen3.8-27B Q4_K_M GGUF on the libllama engine, B60,
   --llama-kv q8_0, --n-ctx 131072, MTP 5 drafts from a 40,960-id head.
-  Acceptance task 10/10, decode 47.1 t/s on its prompt; a 128,133-token
+  Acceptance task 8/10 greedy, sampled mean 7.4 over 30 (f16: 8.13, within
+  the noise); decode 47.1 t/s on its prompt; a 128,133-token
   prompt prefills at 166 t/s, then decodes at 7.5 t/s. Before 0.5.6:
   qwen38-b7c1-ov on OpenVINO, i8:u8 KV, 122,880 tokens, DFlash2 drafter,
   prefix cache 8 GiB, host KV tier 4 GiB.

@@ -1132,7 +1132,9 @@ Standing values (`measured-here`, 2026-10-04):
 - **Dense 27B, B60:** decode 52.6 t/s with 5 drafts; prefill 935 t/s at
   4,096 tokens; 122,880 tokens of f16 KV without paging. The agent service
   runs it at 131,072 tokens with MTP and an 8:8 cache: peak VRAM 23.06 GB,
-  a 128,133-token prompt at 166 t/s then decode at 7.5 t/s, task 10/10. KL
+  a 128,133-token prompt at 166 t/s then decode at 7.5 t/s; the task 8/10
+  greedy, sampled mean 7.4 over 30 runs against f16's 8.13 (within the
+  noise). KL
   0.003966 with the 8:8 cache.
 - **Answers:** the acceptance task 10/10 at temperature 0 on both. Dense
   KL 0.004034 nats against the CPU reference, against 0.003559 for ggml's
