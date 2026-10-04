@@ -27,7 +27,7 @@ attention kernels (0015). With MTP and an 8:8 cache the dense model serves
 decode at 62,597 tokens of depth from 11.0 to 15.6 t/s (measured-here).
 0.5.8 adds Mistral Small 3.2 24B (Cydonia 24B) for creative writing on the
 B60, on demand: 98,304 tokens with q8_0 KV, prefill 1,225 t/s at 4k, decode
-22-25 t/s. The coder's Q4_K_M weights leave
+25.2 t/s short, 18.2 at 16k and 8.4 at 89k depth. The coder's Q4_K_M weights leave
 it ~16k on the A770. The libllama engine has no shared prefix cache yet
 (README "Two engines"). Open work is one document per campaign under
 docs/campaigns/ (README there: rules, template, index). Next: a smaller

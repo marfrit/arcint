@@ -936,8 +936,8 @@ query heads on 8 KV heads.
   `-DDK=128`, for f16 and the quantized pairs. Routing is by head size; the
   gates are as before.
 - Decode at head size 128 already ran on 0007/0015's split kernel.
-- test-backend-ops gains 36 cases at that geometry: batch 1, 3, 6, 8, 64 and
-  512, KV 1,013 and 4,096, f16, q8_0, q8_0 / q4_0. Also two prompt perf
+- test-backend-ops gains 48 cases at that geometry: batch 1, 3, 5, 6, 7, 8,
+  64 and 512, KV 1,013 and 4,096, f16, q8_0, q8_0 / q4_0. Also two prompt perf
   cases at depth.
 
 Measured (`measured-here`, B60, Cydonia 24B v4.3 Q4_K_M, llama-bench against
@@ -950,13 +950,15 @@ the 0016 build, where head size 128 took the upstream kernels):
 | q8_0, 0016 | | | 168 | 18.2 at 16k |
 | q8_0, 0017 | | | 451 | 18.2 at 16k |
 
-- FLASH_ATTN_EXT 2,793 of 2,794 (the pin's own f16 softcap case at head
+- FLASH_ATTN_EXT 2,805 of 2,806 (the pin's own f16 softcap case at head
   size 256).
 - Red: BK=24 in both kernels (`GGML_OPENCL_FA_DPAS_OPTS`,
-  `GGML_OPENCL_FA_GQA_OPTS`) fails 41 of the 53 head-size-128 cases.
+  `GGML_OPENCL_FA_GQA_OPTS`) fails 41 of the 53 cases at that geometry. That
+  is the 36 added before the 5- and 7-row ones, plus the pin's 17. The 12
+  still passing are batch 1 and 3, which stay on the split kernel.
 - Served at `--n-ctx 98304` with q8_0 KV: an 89,265-token prompt at 221 t/s,
   then decode at 8.4 t/s at that depth.
 - KL against the model's own Q8_0 on the CPU: 0.019742 (0016) -> 0.019850
   (0017), top-1 94.76 -> 94.83 %; with q8_0 KV 0.020316, 94.85 %.
-- A770 (its sub-group-8 build of the prompt kernel): FLASH_ATTN_EXT 2,792
-  of 2,794, the same two f16 failures as before 0017.
+- A770 (its sub-group-8 build of the prompt kernel): FLASH_ATTN_EXT 2,804
+  of 2,806, the same two f16 failures as before 0017.

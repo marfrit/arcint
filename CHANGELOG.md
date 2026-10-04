@@ -43,8 +43,10 @@ Measured (`measured-here`, B60, Cydonia 24B v4.3 Q4_K_M):
   (221 t/s), then decode at 8.4 t/s at that depth;
 - KL against the model's own Q8_0 on the CPU: 0.019742 before, 0.019850
   with 0017, 0.020316 with q8_0 KV (top-1 94.76, 94.83, 94.85 %);
-- FLASH_ATTN_EXT 2,793 of 2,794 with 36 cases at that geometry. A red case
-  (BK=24 in both kernels) fails 41 of them.
+- FLASH_ATTN_EXT 2,805 of 2,806 on the B60 and 2,804 of 2,806 on the
+  A770, with 48 cases added at that geometry;
+- a red case (BK=24 in both kernels) fails every case those kernels serve
+  at that geometry.
 
 ## 0.5.7 — 2026-10-04
 
