@@ -1,0 +1,451 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 9e59b0c..e4023f1 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -43,6 +43,7 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
+ #include <string>
+ #include <cmath>
+ #include <map>
++#include <array>
+ #include <memory>
+ #include <charconv>
+ #include <mutex>
+@@ -492,6 +493,7 @@ struct ggml_opencl_fa_kernels {
+     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1;
+     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_split;       // flash-decoding K-split
+     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_split_intel; // the same, lanes along the head dimension
++    std::map<std::pair<int, int>, std::array<cl_kernel, 3>> q_q1_split_intel; // quantized K/V: q8q8, q8q4, q4q4
+     // vec decode
+     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec;
+     // kv-head-coalesced vec decode
+@@ -1080,6 +1082,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_gdn_intel_tg = nullptr;
+     // Intel, prompt attention on the XMX units (flash_attn_dpas.cl; SG 16 or 8)
+     cl_kernel kernel_fa_dpas = nullptr;
++    cl_kernel kernel_fa_dpas_q[3] = {};           // quantized K/V: q8_0/q8_0, q8_0/q4_0, q4_0/q4_0
+     int       fa_dpas_bq = 0, fa_dpas_nthr = 0;   // query rows and work-items a work-group
+     cl_kernel kernel_gdn_intel_pp = nullptr;
+     int gdn_intel_sg = 0, gdn_intel_r_tg = 0, gdn_intel_r_pp = 0, gdn_intel_nsg = 0;
+@@ -4248,6 +4251,33 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 }
+                 CL_CHECK(clReleaseProgram(p));
+             }
++            // the same with quantized K/V (KT/VT: 1 q8_0, 2 q4_0), staged to
++            // f16 in local memory; GGML_OPENCL_FA_DPAS_Q=0 leaves quantized
++            // caches to flash_attn_f32_q8_0.cl / the host dequantization
++            const char * fq_env = getenv("GGML_OPENCL_FA_DPAS_Q");
++            const int kvt[3][2] = { {1, 1}, {1, 2}, {2, 2} };
++            for (int i = 0; i < 3 && backend_ctx->kernel_fa_dpas != nullptr && (fq_env == nullptr || atoi(fq_env) != 0); ++i) {
++                cl_program pq = build_program_from_source_optional(backend_ctx, kernel_src.c_str(),
++                    compile_opts + " -cl-intel-256-GRF-per-thread -DDK=256 -DFA_SG=" + std::to_string(sg) +
++                    " -DNSG=" + std::to_string(nsg) + " -DBK=32 -DKT=" + std::to_string(kvt[i][0]) +
++                    " -DVT=" + std::to_string(kvt[i][1]) +
++                    (getenv("GGML_OPENCL_FA_DPAS_OPTS") ? std::string(" ") + getenv("GGML_OPENCL_FA_DPAS_OPTS") : std::string()));
++                if (pq == nullptr) continue;
++                cl_kernel kq = clCreateKernel(pq, "flash_attn_f32_f16_dpas", &err);
++                size_t   wg = 0;
++                cl_ulong lm = 0, lm_dev = 0;
++                if (err == CL_SUCCESS) {
++                    CL_CHECK(clGetKernelWorkGroupInfo(kq, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg), &wg, NULL));
++                    CL_CHECK(clGetKernelWorkGroupInfo(kq, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE, sizeof(lm), &lm, NULL));
++                    CL_CHECK(clGetDeviceInfo(backend_ctx->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(lm_dev), &lm_dev, NULL));
++                    if (wg >= (size_t)nthr && lm <= lm_dev) {
++                        backend_ctx->kernel_fa_dpas_q[i] = kq;
++                    } else {
++                        CL_CHECK(clReleaseKernel(kq));
++                    }
++                }
++                CL_CHECK(clReleaseProgram(pq));
++            }
+             if (backend_ctx->kernel_fa_dpas == nullptr) {
+                 GGML_LOG_WARN("ggml_opencl: flash_attn_dpas.cl not built; flash_attn_f32_f16.cl takes the prompt\n");
+             }
+@@ -6462,6 +6492,15 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
+                 if (err == CL_SUCCESS) {
+                     backend_ctx->fa.f32_f16_q1_split_intel[{dk, dv}] = k_si;
+                     ggml_opencl_log_fa_kernel_spill(backend_ctx, k_si, "flash_attn_f32_f16_q1_split_intel", dk, dv);
++                    // the same with quantized K/V (built for SG 16 and DK % 32 == 0)
++                    const char * qn[3] = { "flash_attn_q8q8_q1_split_intel", "flash_attn_q8q4_q1_split_intel",
++                                           "flash_attn_q4q4_q1_split_intel" };
++                    std::array<cl_kernel, 3> kq = {};
++                    for (int i = 0; i < 3; ++i) {
++                        kq[i] = clCreateKernel(prog, qn[i], &err);
++                        if (err != CL_SUCCESS) kq[i] = nullptr;
++                    }
++                    backend_ctx->fa.q_q1_split_intel[{dk, dv}] = kq;
+                 }
+             }
+             // q1_vec decode kernel (DV-split + subgroup reduce)
+@@ -18588,6 +18627,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     const bool is_mixed = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
+     const bool is_q8_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0;
+     const bool is_q4_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_Q4_0;
++    // Intel kernels with quantized K/V: 0 q8_0/q8_0, 1 q8_0/q4_0, 2 q4_0/q4_0, -1 none
++    const int kvq = q->type != GGML_TYPE_F32 ? -1 :
++                    k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 ? 0 :
++                    k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q4_0 ? 1 :
++                    k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_Q4_0 ? 2 : -1;
++    // their decode kernels live in the f32_f16 program (with the merge)
++    if (kvq >= 0 && backend_ctx->gpu_family == INTEL) {
++        ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_F32_F16);
++    }
+ 
+ #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+     if (use_fa_bin_kernels_prefill(backend_ctx, q, k, v)) {
+@@ -18723,47 +18771,6 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     max_bias      = params[1];
+     logit_softcap = params[2];
+ 
+-    // Intel, a prompt: flash_attn_dpas.cl (the XMX units)
+-    if (backend_ctx->kernel_fa_dpas != nullptr && is_mixed && n_q > 8 && d_head_q == 256 && d_head_v == 256 &&
+-        sinks == nullptr && max_bias == 0.0f && logit_softcap == 0.0f && !k_soa && !v_soa &&
+-        q->nb[0] == sizeof(float) && k->nb[0] == sizeof(ggml_fp16_t) && v->nb[0] == sizeof(ggml_fp16_t) &&
+-        (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q))) {
+-        cl_kernel kd = backend_ctx->kernel_fa_dpas;
+-        cl_mem    nomask = nullptr;
+-        int a = 0;
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   &extra_q->data_device));
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &offset_q));
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   &extra_k->data_device));
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &offset_k));
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   &extra_v->data_device));
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &offset_v));
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   mask_buffer ? &mask_buffer : &nomask));
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &offset_mask));
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   &extra_o->data_device));
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &offset_o));
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(float),    &scale));
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int),      &n_q));
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int),      &n_kv));
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int),      &n_head));
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int),      &n_head_kv));
+-        const cl_ulong nbs[15] = { q_nb1, q_nb2, q_nb3, k_nb1, k_nb2, k_nb3, v_nb1, v_nb2, v_nb3,
+-                                   o_nb1, o_nb2, o_nb3, mask_nb1, mask_nb2, mask_nb3 };
+-        for (const cl_ulong & nb : nbs) {
+-            CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &nb));
+-        }
+-        const int mne2 = mask ? mask_ne2 : 1, mne3 = mask ? mask_ne3 : 1;
+-        const int k_ne3 = (int) k->ne[3], v_ne3 = (int) v->ne[3];
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int), &mne2));
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int), &mne3));
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int), &n_batch));
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int), &k_ne3));
+-        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int), &v_ne3));
+-        const size_t bq = (size_t) backend_ctx->fa_dpas_bq, nthr = (size_t) backend_ctx->fa_dpas_nthr;
+-        size_t gws[3] = { (size_t) CEIL_DIV(n_q, (int) bq) * nthr, (size_t) n_head, (size_t) n_batch };
+-        size_t lws[3] = { nthr, 1, 1 };
+-        backend_ctx->enqueue_ndrange_kernel(kd, 3, gws, lws, dst);
+-        return;
+-    }
+ 
+     bool use_q1_vec = false;
+     bool use_q1_vec_mq = false;
+@@ -18877,6 +18884,58 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     ggml_cl_flash_attn_reconstruct_aos(backend_ctx, v, temp_v_aos,
+                                        v_data_device, offset_v, v_nb1, v_nb2, v_nb3);
+ 
++    // The Intel kernels read K/V as they are (f16, or q8_0 / q4_0 blocks:
++    // after the reconstruction above a SoA tensor is a block copy too), so
++    // the dequantization below is skipped when one of them takes the call.
++    // A prompt goes to flash_attn_dpas.cl here; up to 8 rows with quantized
++    // K/V to flash_attn_*_q1_split_intel further down.
++    // Intel, a prompt: flash_attn_dpas.cl (the XMX units), f16 or quantized K/V
++    cl_kernel kd_sel = is_mixed ? backend_ctx->kernel_fa_dpas : kvq >= 0 ? backend_ctx->kernel_fa_dpas_q[kvq] : nullptr;
++    if (kd_sel != nullptr && n_q > 8 && d_head_q == 256 && d_head_v == 256 &&
++        sinks == nullptr && max_bias == 0.0f && logit_softcap == 0.0f &&
++        q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
++        (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q))) {
++        cl_kernel kd = kd_sel;
++        cl_mem    nomask = nullptr;
++        int a = 0;
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   &extra_q->data_device));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &offset_q));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   &k_data_device));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &offset_k));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   &v_data_device));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &offset_v));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   mask_buffer ? &mask_buffer : &nomask));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &offset_mask));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   &extra_o->data_device));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &offset_o));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(float),    &scale));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int),      &n_q));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int),      &n_kv));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int),      &n_head));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int),      &n_head_kv));
++        const cl_ulong nbs[15] = { q_nb1, q_nb2, q_nb3, k_nb1, k_nb2, k_nb3, v_nb1, v_nb2, v_nb3,
++                                   o_nb1, o_nb2, o_nb3, mask_nb1, mask_nb2, mask_nb3 };
++        for (const cl_ulong & nb : nbs) {
++            CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &nb));
++        }
++        const int mne2 = mask ? mask_ne2 : 1, mne3 = mask ? mask_ne3 : 1;
++        const int k_ne3 = (int) k->ne[3], v_ne3 = (int) v->ne[3];
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int), &mne2));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int), &mne3));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int), &n_batch));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int), &k_ne3));
++        CL_CHECK(clSetKernelArg(kd, a++, sizeof(int), &v_ne3));
++        const size_t bq = (size_t) backend_ctx->fa_dpas_bq, nthr = (size_t) backend_ctx->fa_dpas_nthr;
++        size_t gws[3] = { (size_t) CEIL_DIV(n_q, (int) bq) * nthr, (size_t) n_head, (size_t) n_batch };
++        size_t lws[3] = { nthr, 1, 1 };
++        backend_ctx->enqueue_ndrange_kernel(kd, 3, gws, lws, dst);
++        return;
++    }
++    static const char * fdiq_env = getenv("GGML_OPENCL_FA_INTEL_SPLIT");
++    const bool intel_q_decode = (fdiq_env == nullptr || atoi(fdiq_env) != 0) && backend_ctx->gpu_family == INTEL &&
++        n_q >= 1 && n_q <= 8 && kvq >= 0 && n_kv >= 1 && backend_ctx->fa.q_q1_split_intel.count(dk_dv) > 0 &&
++        backend_ctx->fa.q_q1_split_intel.at(dk_dv)[kvq] != nullptr && backend_ctx->fa.f32_merge.count(dk_dv) > 0;
++
+     // currently FA kernels support KV cache with f16, f32, q4_0 and q8_0.
+     // there two cases that these kernels cannot cover,
+     //   1. KV cache types are q4_0 or q8_0, but the FA kernels fail to compile
+@@ -18886,7 +18945,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     // For q4_0 or q8_0 cases that fail kernel compilation, dequant happens in GPU;
+     // for types that do not have FA kernels, dequant happens on host.
+     if (!use_native_q8_0_q1 && !use_native_q8_0 &&
+-        !use_native_q4_0_q1 && !use_native_q4_0) {
++        !use_native_q4_0_q1 && !use_native_q4_0 && !intel_q_decode) {
+         // for q4_0, q8_0 FA kernels that fail to compile
+         bool k_done = false;
+         bool v_done = false;
+@@ -19124,6 +19183,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         fd_k_split   = backend_ctx->fa.f32_f16_q1_split_intel.at(dk_dv);
+         use_fd_intel = true;
+     }
++    // the same with quantized K/V (decided above, before the dequantization)
++    if (fd_k_split == NULL && intel_q_decode && !is_causal) {
++        fd_k_split   = backend_ctx->fa.q_q1_split_intel.at(dk_dv)[kvq];
++        use_fd_intel = true;
++    }
+     if (fd_k_split == NULL &&
+         n_q >= 1 && n_q <= fd_max_n_q && n_kv >= FD_MIN_N_KV && !is_causal &&
+         d_head_q <= FD_MAX_DK &&
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
+index 00a30ee..f40702b 100644
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
+@@ -55,6 +55,26 @@
+ #endif
+ 
+ #define DPAS(a, b, c) intel_sub_group_f16_f16_matrix_mad_k16(a, b, c)
++
++// K and V as f16 (0), q8_0 (1) or q4_0 (2), ggml's block layouts (34 / 18
++// bytes for 32 values). The tiles are staged in local memory as f16 either
++// way, so only the staging load changes: values 8 c8 .. 8 c8 + 7 of a row.
++#ifndef KT
++#define KT 0
++#endif
++#ifndef VT
++#define VT 0
++#endif
++static inline half8 load8(const int t, const global char * row, const int c8) {
++    if (t == 0) return vload8(c8, (const global half *) row);
++    const global char * blk = row + (c8 >> 2) * (t == 1 ? 34 : 18);
++    const float d = vload_half(0, (const global half *) blk);
++    if (t == 1) return convert_half8(convert_float8(vload8(0, blk + 2 + (c8 & 3) * 8)) * d);
++    // q4_0: values 0..15 the low nibbles of qs[0..15], 16..31 the high ones
++    const uchar8 q = vload8(0, (const global uchar *) blk + 2 + (c8 & 1) * 8);
++    const uchar8 n = (c8 & 2) ? (q >> (uchar8)(4)) : (q & (uchar8)(15));
++    return convert_half8((convert_float8(n) - 8.f) * d);
++}
+ #if SG == 16
+ #define LOAD_A(p) as_short8(intel_sub_group_block_read_us8((local const ushort *)(p)))
+ #else
+@@ -123,13 +143,13 @@ kernel void flash_attn_f32_f16_dpas(
+         barrier(CLK_LOCAL_MEM_FENCE);
+         for (int u = lid; u < BK * DK / 8; u += NTHR) {
+             const int key = u / (DK / 8), c8 = u % (DK / 8), kk = min(t0 + key, n_kv - 1);
+-            vstore8(vload8(c8, (global const half *)(kb + kk * k_nb1)), 0, ks + key * DK + 8 * c8);
++            vstore8(load8(KT, kb + kk * k_nb1, c8), 0, ks + key * DK + 8 * c8);
+         }
+         // V transposed with the key fastest: neighbouring lanes store
+         // neighbouring halves (key-major, they all hit one bank)
+         for (int u = lid; u < BK * DK / 8; u += NTHR) {
+             const int key = u % BK, c8 = u / BK, kk = min(t0 + key, n_kv - 1);
+-            const half8 vv8 = vload8(c8, (global const half *)(vb + kk * v_nb1));
++            const half8 vv8 = load8(VT, vb + kk * v_nb1, c8);
+             const half vv[8] = { vv8.s0, vv8.s1, vv8.s2, vv8.s3, vv8.s4, vv8.s5, vv8.s6, vv8.s7 };
+             for (int j = 0; j < 8; ++j) vt[(8 * c8 + j) * BK + key] = vv[j];
+         }
+@@ -265,13 +285,13 @@ kernel void flash_attn_f32_f16_dpas(
+         barrier(CLK_LOCAL_MEM_FENCE);
+         for (int u = lid; u < BK * DK / 8; u += NTHR) {
+             const int key = u / (DK / 8), c8 = u % (DK / 8), kk = min(t0 + key, n_kv - 1);
+-            vstore8(vload8(c8, (global const half *)(kb + kk * k_nb1)), 0, ks + key * DK + 8 * c8);
++            vstore8(load8(KT, kb + kk * k_nb1, c8), 0, ks + key * DK + 8 * c8);
+         }
+         // V transposed with the key fastest: neighbouring lanes store
+         // neighbouring halves (key-major, they all hit one bank)
+         for (int u = lid; u < BK * DK / 8; u += NTHR) {
+             const int key = u % BK, c8 = u / BK, kk = min(t0 + key, n_kv - 1);
+-            const half8 vv8 = vload8(c8, (global const half *)(vb + kk * v_nb1));
++            const half8 vv8 = load8(VT, vb + kk * v_nb1, c8);
+             const half vv[8] = { vv8.s0, vv8.s1, vv8.s2, vv8.s3, vv8.s4, vv8.s5, vv8.s6, vv8.s7 };
+             for (int j = 0; j < 8; ++j) vt[(8 * c8 + j) * BK + key] = vv[j];
+         }
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_f32_f16.cl b/ggml/src/ggml-opencl/kernels/flash_attn_f32_f16.cl
+index 846ca51..70cab84 100644
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_f32_f16.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_f32_f16.cl
+@@ -2679,6 +2679,119 @@ static inline void fdi_row(const global half * p, float * out) {
+         out[8 * b + 4] = f.s4; out[8 * b + 5] = f.s5; out[8 * b + 6] = f.s6; out[8 * b + 7] = f.s7;
+     }
+ }
++// K / V as f16 (0), q8_0 (1) or q4_0 (2), ggml's block layouts (34 / 18
++// bytes for 32 values): lane l's values i * FDI_SG + l of a row, i < FDI_E.
++// For the quantized types value i * 16 + l sits in block i / 2 at position
++// (i % 2) * 16 + l: one byte a lane for q8_0, the low or high nibble of byte
++// l for q4_0, the block's f16 scale broadcast. (FDI_SG 16 only.)
++static inline void fdi_load(const int t, const global char * p, float * out) {
++    if (t == 0) {
++        fdi_row((const global half *) p, out);
++    } else if (t == 1) {
++        #pragma unroll
++        for (int b = 0; b < FDI_E / 2; ++b) {
++            const global char * blk = p + b * 34;
++            const float d = vload_half(0, (const global half *) blk);
++            out[2 * b]     = d * (float) blk[2 + get_sub_group_local_id()];
++            out[2 * b + 1] = d * (float) blk[2 + 16 + get_sub_group_local_id()];
++        }
++    } else {
++        #pragma unroll
++        for (int b = 0; b < FDI_E / 2; ++b) {
++            const global uchar * blk = (const global uchar *) (p + b * 18);
++            const float d = vload_half(0, (const global half *) blk);
++            const uint  q = blk[2 + get_sub_group_local_id()];
++            out[2 * b]     = d * (float) ((int) (q & 15u) - 8);
++            out[2 * b + 1] = d * (float) ((int) (q >> 4) - 8);
++        }
++    }
++}
++#define FDI_PARAMS const global void * q_void, ulong q_offset, const global void * k_void, ulong k_offset, const global void * v_void, ulong v_offset, const float scale, const int n_q, const int n_kv, const int n_head, const ulong q_nb1, const ulong q_nb2, const ulong q_nb3, const ulong k_nb1, const ulong k_nb2, const ulong k_nb3, const ulong v_nb1, const ulong v_nb2, const ulong v_nb3, const float max_bias, const float m0, const float m1, const int n_head_log2, const float logit_softcap, const int n_head_kv, const global void * mask_void, const ulong mask_offset, const ulong mask_nb1, const ulong mask_nb2, const ulong mask_nb3, const int mask_ne2, const int mask_ne3, global float * partial_void, const int n_splits, const int kv_per_split
++#define FDI_PASS q_void, q_offset, k_void, k_offset, v_void, v_offset, scale, n_q, n_kv, n_head, q_nb1, q_nb2, q_nb3, k_nb1, k_nb2, k_nb3, v_nb1, v_nb2, v_nb3, max_bias, m0, m1, n_head_log2, logit_softcap, n_head_kv, mask_void, mask_offset, mask_nb1, mask_nb2, mask_nb3, mask_ne2, mask_ne3, partial_void, n_splits, kv_per_split
++static inline void fdi_split_body(FDI_PARAMS, const int KT, const int VT) {
++    const int lane           = get_sub_group_local_id();
++    const int head_batch_idx = get_group_id(1);
++    const int split_q_idx    = get_group_id(2);
++    const int split_idx      = split_q_idx % n_splits;
++    const int q_idx          = split_q_idx / n_splits;
++    const int batch_idx      = head_batch_idx / n_head;
++    const int head_idx       = head_batch_idx % n_head;
++    const int head_kv_idx    = head_idx / (n_head / n_head_kv);
++
++    const int kv_start = split_idx * kv_per_split;
++    const int kv_end   = min(kv_start + kv_per_split, n_kv);
++
++    const ulong record_idx = (((ulong) batch_idx * n_head + head_idx) * n_q + q_idx) * n_splits + split_idx;
++    global float * rec = partial_void + record_idx * (ulong) FA_PARTIAL_FLOATS;
++
++    float o[FDI_E];
++    #pragma unroll
++    for (int i = 0; i < FDI_E; ++i) o[i] = 0.0f;
++    float m = FA_M_INIT, l = 0.0f;
++
++    if (kv_start < kv_end) {
++        const global float * qp = (const global float *) ((const global char *) q_void + q_offset +
++                                   batch_idx * q_nb3 + head_idx * q_nb2 + (ulong) q_idx * q_nb1);
++        float q[FDI_E];
++        #pragma unroll
++        for (int i = 0; i < FDI_E; ++i) q[i] = qp[i * FDI_SG + lane] * scale;
++
++        const global char * k_base = (const global char *) k_void + k_offset + batch_idx * k_nb3 + head_kv_idx * k_nb2;
++        const global char * v_base = (const global char *) v_void + v_offset + batch_idx * v_nb3 + head_kv_idx * v_nb2;
++        const global half * mask_ptr = NULL;
++        if (mask_void != NULL) {
++            mask_ptr = (const global half *) ((const global char *) mask_void + mask_offset +
++                       (batch_idx % mask_ne3) * mask_nb3 + (head_idx % mask_ne2) * mask_nb2 + (ulong) q_idx * mask_nb1);
++        }
++        const float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
++
++        for (int k0 = kv_start; k0 < kv_end; k0 += FDI_KB) {
++            float s[FDI_KB];
++            #pragma unroll
++            for (int j = 0; j < FDI_KB; ++j) {
++                const int kj = min(k0 + j, kv_end - 1);
++                float kr[FDI_E];
++                fdi_load(KT, k_base + (ulong) kj * k_nb1, kr);
++                float d = 0.0f;
++                #pragma unroll
++                for (int i = 0; i < FDI_E; ++i) d = fma(q[i], kr[i], d);
++                s[j] = sub_group_reduce_add(d);
++            }
++            float m_new = m;
++            #pragma unroll
++            for (int j = 0; j < FDI_KB; ++j) {
++                // softcap, then the mask (ggml-cpu's order); clamped so that
++                // exp() never sees -inf under -cl-finite-math-only
++                if (logit_softcap > 0.0f) s[j] = logit_softcap * tanh(s[j] / logit_softcap);
++                if (mask_ptr != NULL) s[j] += slope * vload_half(min(k0 + j, kv_end - 1), mask_ptr);
++                s[j] = fmax(s[j], FA_M_INIT);
++                if (k0 + j < kv_end) m_new = fmax(m_new, s[j]);
++            }
++            const float c = exp(m - m_new);
++            l *= c;
++            #pragma unroll
++            for (int i = 0; i < FDI_E; ++i) o[i] *= c;
++            #pragma unroll
++            for (int j = 0; j < FDI_KB; ++j) {
++                const float p = k0 + j < kv_end ? exp(s[j] - m_new) : 0.0f;
++                float vr[FDI_E];
++                fdi_load(VT, v_base + (ulong) min(k0 + j, kv_end - 1) * v_nb1, vr);
++                l += p;
++                #pragma unroll
++                for (int i = 0; i < FDI_E; ++i) o[i] = fma(p, vr[i], o[i]);
++            }
++            m = m_new;
++        }
++    }
++    if (lane == 0) {
++        rec[0] = m;
++        rec[1] = l;
++    }
++    #pragma unroll
++    for (int i = 0; i < FDI_E; ++i) rec[2 + i * FDI_SG + lane] = o[i];
++}
++// the f16 kernel keeps its own body: as a call of the shared one below with
++// KT = VT = 0 it decoded 4 % slower on the A770 (measured-here)
+ __attribute__((intel_reqd_sub_group_size(FDI_SG)))
+ __kernel void flash_attn_f32_f16_q1_split_intel(
+     const global void * q_void, ulong q_offset,
+@@ -2789,6 +2902,15 @@ __kernel void flash_attn_f32_f16_q1_split_intel(
+     #pragma unroll
+     for (int i = 0; i < FDI_E; ++i) rec[2 + i * FDI_SG + lane] = o[i];
+ }
++#if FDI_SG == 16 && DK % 32 == 0
++// the same with quantized K / V: 8:8, 8:4, 4:4
++__attribute__((intel_reqd_sub_group_size(FDI_SG)))
++__kernel void flash_attn_q8q8_q1_split_intel(FDI_PARAMS) { fdi_split_body(FDI_PASS, 1, 1); }
++__attribute__((intel_reqd_sub_group_size(FDI_SG)))
++__kernel void flash_attn_q8q4_q1_split_intel(FDI_PARAMS) { fdi_split_body(FDI_PASS, 1, 2); }
++__attribute__((intel_reqd_sub_group_size(FDI_SG)))
++__kernel void flash_attn_q4q4_q1_split_intel(FDI_PARAMS) { fdi_split_body(FDI_PASS, 2, 2); }
++#endif
+ #endif
+ 
+ #endif  // !FA_MQ_ONLY (q1_split + merge)
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 1fffe51..37ea953 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11180,6 +11180,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // quantized KV at the hybrid Qwens' attention geometry (head size 256;
++    // 24 heads on 4, 16 on 2): K and V of their own types, decode / verify
++    // rows and prompts; a KV length of 1013 leaves a partial key tile and
++    // split
++    for (auto kv_t : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0},
++                                                                  {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}}) {
++        for (auto h : std::vector<std::pair<int64_t, int64_t>>{{4, 6}, {2, 8}}) {
++            for (int64_t nb : {1, 3, 8, 64, 512}) {
++                for (int64_t kv : {512, 1013, 4096}) {
++                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, h.first, {h.second, 1}, kv, nb, true, false, 0, 0,
++                                                                    GGML_PREC_F32, kv_t.first, kv_t.second));
++                }
++            }
++        }
++    }
+     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
+     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

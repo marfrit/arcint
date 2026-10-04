@@ -204,7 +204,8 @@ private:
 class LlamaMtp final : public LlamaSpec {
 public:
     LlamaMtp(llama_model* model, llama_context* ctx_tgt, int n_draft, int n_seq, int n_batch, int n_ubatch,
-             int threads, const std::string& gguf, const std::string& vocab, std::string& err)
+             int threads, const std::string& gguf, const std::string& vocab, ggml_type type_k, ggml_type type_v,
+             std::string& err)
         : ctx_tgt_(ctx_tgt), n_draft_(n_draft) {
         const int n_heads = llama_model_n_layer_nextn(model);
         if (n_heads <= 0) {
@@ -231,6 +232,8 @@ public:
         cp.n_outputs_max         = static_cast<uint32_t>(n_seq);
         cp.ctx_other       = ctx_tgt;
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        cp.type_k          = type_k;   // the target's cache types (--llama-kv)
+        cp.type_v          = type_v;
         cp.n_threads       = threads;
         cp.n_threads_batch = threads;
         ctx_dft_           = llama_init_from_model(model, cp);
@@ -451,8 +454,10 @@ private:
 
 std::unique_ptr<LlamaSpec> make_llama_mtp(llama_model* model, llama_context* ctx_tgt, int n_draft, int n_seq,
                                           int n_batch, int n_ubatch, int threads, const std::string& gguf,
-                                          const std::string& vocab, std::string& err) {
-    auto s = std::make_unique<LlamaMtp>(model, ctx_tgt, n_draft, n_seq, n_batch, n_ubatch, threads, gguf, vocab, err);
+                                          const std::string& vocab, ggml_type type_k, ggml_type type_v,
+                                          std::string& err) {
+    auto s = std::make_unique<LlamaMtp>(model, ctx_tgt, n_draft, n_seq, n_batch, n_ubatch, threads, gguf, vocab,
+                                        type_k, type_v, err);
     if (!s->ok() || !err.empty()) return nullptr;
     if (s->head_rows() > 0) log::info("mtp", "draft head: %zu token rows", s->head_rows());
     return s;

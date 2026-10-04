@@ -171,7 +171,63 @@ with decode at 22 t/s: VRAM paged over the link. The dense model serves
 122,880 tokens on the B60 with f16 KV (`--n-ctx 122880`, 2026-10-04,
 `measured-here`). 24.4 of 25.7 GB of VRAM are in use. A 30,065-token prompt
 prefills at 528 t/s at both 122,880 and 32,768, and a 120,945-token prompt
-in 579 s. MTP at that depth is not measured.
+in 579 s.
+
+## Quantized KV (`--llama-kv K[:V]`)
+
+`q8_0` and `q8_0:q4_0` run on the Intel attention kernels of
+`contrib/llama.cpp` 0015. 0015 also has a 4:4 kernel; arcint refuses 4:4
+because it drops the dense 27B's top-1 agreement by 1.2 points, past the
+answer-level bar. Any other pair has no kernel and would dequantize
+all of K and V to f32 on every call, so arcint refuses it. A quantized V
+makes llama.cpp force flash attention on (no automatic fallback). A layer
+whose head size the OpenCL backend does not take then runs its attention
+on the CPU. Measured on the head-size-256 Qwens only (the dense 27B and the
+coder). The MTP draft context takes the same types.
+
+The prices, KL and speed are in the 0015 section of
+`contrib/llama.cpp/README.md`. On the dense 27B:
+- 8:8 costs 4 % of prefill at 4k, 8 % at 16k depth;
+- it costs 4-5 % of decode;
+- its KL is within the noise of f16's.
+
+**Dense 27B, B60, with MTP** (5 drafts, the 40,960-id head) and
+`--llama-kv q8_0`:
+- serves `--n-ctx 131072` (peak VRAM 23.06 of 25.7 GB). With f16 KV, MTP
+  at 131,072 overcommitted the card: a copy-engine reset;
+- a 128,133-token prompt prefills in 772 s (166 t/s), and decodes at
+  7.5 t/s at that depth (38 % draft acceptance, a repetitive prompt);
+- the acceptance task scores 10/10 at temperature 0, decode 47.1 t/s.
+  The 52.6 t/s in the table above is the same prompt and drafts with f16 KV
+  at the default 32,768 context. The difference, 10 %, is more than
+  llama-bench's 4-5 % for 8:8. The cause is not separated: the KV type
+  against the context size (the verify rows run through the quantized
+  split decode).
+
+**Coder, A770: smaller GGUFs for its context** (`measured-here`,
+2026-10-04). Its Q4_K_M weights (16.06 GB) leave ~16k tokens with MTP. Two
+mixes were made from the F16 GGUF with the model's imatrix. Expert gate/up
+went to IQ3_XXS and expert down to IQ4_XS; the rest, the MTP layer
+included, stayed as Q4_K_M has them. In mix2, layers 0-5 and 34-39 keep
+gate/up at IQ4_XS.
+
+KL is against Q8_0 logits on the CPU. A Q4_K_M reference would favour
+Q4_K_M itself.
+
+| GGUF | size | KL | top-1 |
+|---|---|---|---|
+| Q4_K_M (baseline arm) | 16.06 GB | 0.0212 | 93.43 % |
+| IQ3_XXS mix | 9.92 GB | 0.0488 | 90.22 % |
+| mix2 | 12.69 GB | 0.0402 | 90.86 % |
+
+Both mixes serve `--n-ctx 98304` with MTP (4 drafts) and
+`--llama-kv q8_0:q4_0` (14.2 GB of VRAM for the IQ3_XXS mix):
+- a 95,323-token prompt prefills at 177-178 t/s;
+- decode is 20.7-22.1 t/s at that depth and ~55 t/s shallow;
+- the acceptance task scores 10/10 at temperature 0 and 3 of 3 sampled.
+
+Both pass the KL bar and miss the top-1 bar, by 3.2 and 2.6 points against
+1. Neither is adopted.
 
 llama.cpp's own loop (`llama-speculative-simple`, raw prompt) for
 reference: coder 68.1 t/s with 2 drafts, dense 31.9 with 3; four drafts

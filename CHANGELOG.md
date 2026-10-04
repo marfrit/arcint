@@ -17,6 +17,44 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.5.6 — 2026-10-04
+
+**Runtime:** `marfrit-openvino +p25` remains the floor.
+
+**Quantized KV on the libllama engine (`--llama-kv K[:V]`).** `q8_0`,
+`q8_0:q4_0` for the attention cache, on Intel attention kernels of
+arcint's own (`contrib/llama.cpp` 0015): prompt attention on the XMX units
+and the K-split decode both read the blocks directly.
+- Upstream, a q8_0 cache on these cards decodes on the basic per-row
+  kernel. On the dense 27B (B60, `measured-here`) that is 4.65 t/s at 16k
+  depth; with 0015 it is 17.1 (f16: 17.95).
+- The MTP draft context takes the same types.
+- Pairs without a kernel are refused: they would dequantize all of K and V
+  to f32 on every call.
+
+What it buys (`measured-here`): the dense 27B serves 131,072 tokens with MTP
+on the B60 with an 8:8 cache:
+- peak VRAM 23.06 of 25.7 GB;
+- a 128,133-token prompt in 772 s, then decode at 7.5 t/s at that depth;
+- the acceptance task 10/10.
+
+KL against the CPU reference:
+- 8:8 is unchanged within the noise: 0.003966 against f16's 0.004034;
+- 8:4 is within the answer-level bar;
+- 4:4 drops top-1 by 1.2 points (dense) and 1.05 (coder), and arcint
+  refuses it.
+
+8:8 costs 4 % of prefill at 4k, 8 % at 16k, and 4-5 % of decode.
+
+**The agent service moves to the libllama engine** (operator, 2026-10-04):
+the dense 27B at 131,072 tokens, MTP and an 8:8 cache. Its prefill is
+slower than the OpenVINO service's (896 against 1,141 t/s at 4k), and its
+MTP decode about twice as fast.
+
+The coder stays on OpenVINO. Two IQ3_XXS-mixed coder GGUFs fit 98,304 tokens
+with MTP on the A770 and pass the acceptance task, but miss the top-1 bar
+by 3.2 and 2.6 points (`docs/llama-engine.md`).
+
 ## 0.5.5 — 2026-10-04
 
 **Runtime:** `marfrit-openvino +p25` remains the floor; nothing 0.5.5 does by

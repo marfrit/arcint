@@ -1,3 +1,12 @@
+arcint (0.5.6-1) trixie; urgency=medium
+
+  * 0.5.6: quantized KV on the libllama engine (--llama-kv q8_0 or
+    q8_0:q4_0), on arcint's Intel attention kernels (contrib/llama.cpp/patches
+    0015): the dense 27B serves 131,072 tokens with MTP on the B60 with an
+    8:8 cache. Runtime floor unchanged at marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 04 Oct 2026 18:00:00 +0200
+
 arcint (0.5.5-1) trixie; urgency=medium
 
   * 0.5.5: a second engine, libllama (--engine llama --gguf): llama.cpp

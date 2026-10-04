@@ -35,6 +35,12 @@ namespace lgc {
 namespace {
 
 using json = nlohmann::json;
+
+// --llama-kv's names (config.cpp admits only these)
+ggml_type kv_type(const std::string& t) {
+    return t == "q8_0" ? GGML_TYPE_Q8_0 : t == "q4_0" ? GGML_TYPE_Q4_0 : GGML_TYPE_F16;   // q4_0: V only
+}
+
 using clock_type = std::chrono::steady_clock;
 
 double seconds_since(clock_type::time_point t0) {
@@ -170,6 +176,8 @@ public:
         cp.n_batch         = static_cast<uint32_t>(n_batch_);
         cp.n_ubatch        = static_cast<uint32_t>(std::min(n_batch_, 512));
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        cp.type_k          = kv_type(cfg.llama_kv_k);
+        cp.type_v          = kv_type(cfg.llama_kv_v);
         // CPU threads: the CPU-side experts' decode is memory-bound, and the
         // physical cores beat the SMT threads (measured-here, Flash-Next on a
         // 8-core/16-thread host: 11.4 t/s at 8 threads, 9.0 at 16)
@@ -192,7 +200,7 @@ public:
         if (cfg.llama_mtp > 0) {
             std::string err;
             spec_ = make_llama_mtp(model_, ctx_, cfg.llama_mtp, lanes_, n_batch_, static_cast<int>(cp.n_ubatch),
-                                   threads, cfg.gguf_path, cfg.llama_mtp_vocab, err);
+                                   threads, cfg.gguf_path, cfg.llama_mtp_vocab, cp.type_k, cp.type_v, err);
             if (!spec_) throw std::runtime_error(log::format("--llama-mtp %d: %s", cfg.llama_mtp, err.c_str()));
             n_draft_ = cfg.llama_mtp;
         }
