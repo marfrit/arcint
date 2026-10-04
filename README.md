@@ -126,8 +126,10 @@ From 0.5.6 the agent runs the libllama engine (2026-10-04, a different
 protocol: llama-bench and the served acceptance prompt):
 - Q4_K_M GGUF, `--llama-kv q8_0`, 131,072 ctx, MTP 5 drafts;
 - prefill 896 t/s at 4k and 435 at 16k depth (llama-bench, no MTP);
-- decode 47.1 t/s on the acceptance prompt (10/10), 7.5 t/s at 128k
-  depth.
+- decode 47.1 t/s on the acceptance prompt, 7.5 t/s at 128k depth;
+- the acceptance task 8/10 at temperature 0 on the deployed unit; sampled,
+  30 runs, mean 7.4 against f16's 8.1, within the noise
+  (`docs/llama-engine.md`).
 
 **Qwen3.6-35B-A3B**, full depth, native expert blocks with u8 dense
 projections, all resident on the A770, u8 KV: prefill about 960 t/s at 4,096
