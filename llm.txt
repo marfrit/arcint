@@ -13,18 +13,21 @@
 
 ## Status
 
-Release 0.5.7 (2026-10-04). Runtime dependency: marfrit-openvino +p25, the
+Release 0.5.8 (2026-10-04). Runtime dependency: marfrit-openvino +p25, the
 pinned OpenVINO nightly 71640275 with patches 0003-0074
 (contrib/packaging/marfrit-openvino/patches/); +p27 (0076-0077) for the
 Flash-Next tier's opt-in switches MOE_CPU_TIER_ADAPTIVE and MOE_DOORBELL.
 Two engines: OpenVINO (default; the coder service) and libllama (the agent
 service; --engine llama --gguf,
-llama.cpp bed0a85 with contrib/llama.cpp/patches 0001-0016, ggml's OpenCL
+llama.cpp bed0a85 with contrib/llama.cpp/patches 0001-0017, ggml's OpenCL
 backend). The libllama engine decodes faster with the GGUF's MTP head.
 --llama-kv q8_0 (or q8_0:q4_0) quantizes its KV cache on arcint's
 attention kernels (0015). With MTP and an 8:8 cache the dense model serves
 131,072 tokens on the B60; 0.5.7's verify attention (patch 0016) takes its
-decode at 62,597 tokens of depth from 11.0 to 15.6 t/s (measured-here). The coder's Q4_K_M weights leave
+decode at 62,597 tokens of depth from 11.0 to 15.6 t/s (measured-here).
+0.5.8 adds Mistral Small 3.2 24B (Cydonia 24B) for creative writing on the
+B60, on demand: 98,304 tokens with q8_0 KV, prefill 1,225 t/s at 4k, decode
+22-25 t/s. The coder's Q4_K_M weights leave
 it ~16k on the A770. The libllama engine has no shared prefix cache yet
 (README "Two engines"). Open work is one document per campaign under
 docs/campaigns/ (README there: rules, template, index). Next: a smaller

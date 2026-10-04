@@ -28,6 +28,7 @@ expert engines [Strata](https://github.com/Niko1221/Strata) and
 | Qwen3.6-27B-A3B-Coder | `qwen3_5_moe`, 40 layers, 184 experts (pruned from 256) | int4 AWQ IR | A770 (production) |
 | Qwen3.8-27B | `qwen3_5` dense, 64 layers, MTP head | Q4_K_M GGUF on the libllama engine (production since 0.5.6); int4 IR, or a GGUF on that IR | B60 (production) |
 | Qwen3.6-35B-A3B | `qwen3_5_moe`, 40 layers, 256 experts | the checkpoint's own IQ2_S/IQ3_XXS expert blocks, all resident | A770 |
+| Cydonia 24B v4.3 (Mistral Small 3.2 finetune) | `llama`, 40 layers, all full attention, 32 query heads on 8, head size 128 | Q4_K_M GGUF on the libllama engine, q8_0 KV, 98,304 ctx | B60, on demand (creative writing, since 0.5.8) |
 | Qwen3.8-Flash-Next | `qwen4_exp`, 48 layers, 512 experts (10 routed + 1 shared), n-gram embedding table | the checkpoint's own expert blocks, Q8_0 dense projections, experts split between card and a host RAM bank | B60 |
 
 ## Two engines
