@@ -145,6 +145,51 @@ Open:
   search for kernels (AlphaEvolve-style evolution, `paper`); Kernel Tuner's
   structural tunables (`code`).
 
+## Code-level search: the decode/verify attention kernel (2026-10-04, `measured-here`)
+
+The first structural search (operator's priority, 2026-10-04). Target:
+0016/0017's `flash_attn_gqa_dpas.cl` on the B60. Driver:
+`tools/kq_tune/fagqa.py`.
+
+The genes are source alternatives behind compile-time switches, plus one
+host knob:
+- SIDES: sub-groups sharing an 8-row tile;
+- KMODE: K read direct or staged;
+- BK: keys a staged tile;
+- KVPS: the kernel's own split size, `GGML_OPENCL_FA_GQA_KV_PER_SPLIT`;
+- two genes written for the search:
+  - SSPLIT (`GQA_S_SPLIT`): the sides of a tile split QKᵀ by key group and
+    exchange S through local memory;
+  - PF (`GQA_PF`): the next V tile prefetched into registers.
+
+Fitness: the geometric mean of one attention layer at 4, 6 and 8 rows and
+32k and 131k keys (dense 27B geometry, f16), against the shipped genome,
+re-measured every 8 evaluations (drift under 0.4 %).
+
+- **Exhaustive, 90 genomes** (SIDES × KMODE × BK × KVPS 64-1,024):
+  - best 0.8626, the shipped structure at KVPS 512;
+  - median 1.356, worst 3.53;
+  - the shipped KVPS 128 scores 0.9997.
+- **GA with SSPLIT** (216 genomes, budget 70, 59 evaluated): best 0.7834,
+  KVPS 512 with SSPLIT, found at evaluation 45.
+- **GA with prefetch** (60 evaluated): best 0.798, prefetch 8 without
+  S-split.
+- **Local enumeration of S-split × prefetch × split** (18 genomes):
+  - S-split 0.784, prefetch 8 0.798;
+  - both together 2.44, prefetch 4 about 2.0. IGC compiles those into a
+    rolled form of a third the length (3,181-3,383 assembly lines against
+    10,176-12,453) that keeps the per-tile arrays in memory (ocloc dumps).
+- **Gate:** FLASH_ATTN_EXT at head sizes 256 and 128 with the kernel taking
+  every row count, 860 of 861 (the pin's softcap case) for the exhaustive
+  best, the three best S-split genomes and the local enumeration's two best.
+- **End to end** (0018 = S-split + split 512; q8_0 KV, 32k depth): dense 27B
+  6 rows 52.6 -> 64.2 t/s, 8 rows 62.1 -> 78.5. Cydonia 6 rows 42.3 -> 58.8.
+  Served agent at 62.6k depth 15.6 -> 16.4 t/s. KL 0.003589 -> 0.003587.
+- **Reproducing:** the exhaustive run used the first four genes with KVPS
+  64-1,024. `fagqa.py` has since grown KVPS 2,048, SSPLIT and PF, so
+  `exhaustive` now enumerates 648 genomes. The results files hold no binary
+  sha: start a new file after a rebuild.
+
 ## Where it lives
 
 `tools/kq_tune/` (the drivers and the analyses). The search hooks are in

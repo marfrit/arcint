@@ -968,3 +968,56 @@ the 0016 build, where head size 128 took the upstream kernels):
   quant since 0.5.9. The corpus is general text, not role play.
 - A770 (its sub-group-8 build of the prompt kernel): FLASH_ATTN_EXT 2,804
   of 2,806, the same two f16 failures as before 0017.
+
+## 0018-opencl-intel-gqa-decode-searched.patch
+
+The verify kernel of 0016/0017 as a structural search found it
+(`tools/kq_tune/fagqa.py`, `docs/campaigns/kernel-autotune-ga.md`, "code-level
+search"). Two changes of default and two new switches:
+- **`GQA_S_SPLIT` (default with two or more sides):** the sides of an 8-row
+  tile split QKᵀ by 16-key group and exchange S through local memory (one
+  barrier more per tile). Before, both sides computed all of S.
+  `GQA_NO_S_SPLIT` turns it off.
+- **The kernel's own split size, 512 keys** (`GGML_OPENCL_FA_GQA_KV_PER_SPLIT`;
+  the per-head split kernel keeps 128). A work-group covers a whole KV head,
+  so longer splits mean fewer partials. It changes nothing from 131,072 keys
+  on: the 256-split cap already made the splits 512 keys long there, so the
+  gain at 131k is S-split's (`code`).
+- **`GQA_PF` (off):** the next V tile prefetched into registers. 8 alone
+  gains 7 %, but with `GQA_S_SPLIT`, or at 4, IGC falls back to a rolled
+  form (3,181-3,383 assembly lines against 10,176-12,453) at 2-2.5x the time.
+- The test-backend-ops perf cases gain 4 and 8 rows.
+
+The search (`measured-here`, B60, one attention layer at the dense 27B's
+geometry, f16, the geometric mean over 4, 6 and 8 rows at 32k and 131k keys,
+against 0.5.9's kernel re-measured every 8 evaluations, drift under 0.4 %):
+- exhaustive over sides, K mode, tile and split size (90 genomes): best 0.863
+  (split 512), median 1.356;
+- GA adding S-split (59 of 216 evaluated): best 0.783 (S-split, split 512);
+- GA adding prefetch (60 evaluated): best 0.798 (prefetch 8, no S-split);
+- the local enumeration of S-split × prefetch × split (18): 0.784 for
+  S-split and split 512; both genes together 2.44.
+
+End to end (`measured-here`, B60, q8_0 KV, the same binaries with the
+switches set by environment):
+
+| model | rows at 32k depth | 0.5.9 | 0018 |
+|---|---|---|---|
+| dense 27B | 4 / 6 / 8 | 36.7 / 52.6 / 62.1 t/s | 39.4 / 64.2 / 78.5 |
+| Cydonia 24B | 4 / 6 / 8 | 29.2 / 42.3 / 58.6 | 36.1 / 58.8 / 76.8 |
+
+- Served, the agent's flags, a 62,597-token prompt: decode at that depth
+  15.6 -> 16.4 t/s, identical draft statistics, the acceptance task 10/10
+  in both.
+- KL through the kernel (dense 27B, q8_0, 6-token ubatches): 0.003589 ->
+  0.003587, top-1 97.79 -> 97.87 %.
+- Gate: FLASH_ATTN_EXT at head sizes 256 and 128 with the kernel taking
+  every row count, 860 of 861 (the failure is the pin's softcap case) for:
+  - the exhaustive best;
+  - the three best S-split genomes;
+  - the two best of the local enumeration (S-split; prefetch 8).
+  Prefetch has no failing-first test of its own; it is off.
+- 0018's defaults: FLASH_ATTN_EXT 2,805 of 2,806 on the B60. A fault in the S
+  exchange (a side reads the other group's S) fails 68 cases, all at 4-8
+  rows. The A770 (2,804 of 2,806) does not build this kernel; its run shows
+  only that nothing else changed.
