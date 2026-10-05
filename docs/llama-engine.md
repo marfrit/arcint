@@ -410,6 +410,19 @@ Both mutants were run first, and both fail:
   thinking left the reference at character 49 of 193 and 100 of 369. This
   test sees a wrong state; the answers alone would not.
 
+**The acceptance task with and without them** (`measured-here`, 0.5.12,
+the coder shq8 on the A770, the production flags). This is a single-turn
+prompt, so the only difference between the arms is where the prefill
+batches break:
+
+| arm | T=0 | 30 runs at 0.7 | mean |
+|---|---|---|---|
+| checkpoints on (the unit) | 9 | 27 at 10/10, 2 at 9, 1 at 5 | 9.77 |
+| `--llama-checkpoints 0` | 10 | 27 at 10/10, 3 at 9 | 9.90 |
+
+The same count of perfect runs; the arms differ by the one 5/10 run. The
+T=0 cell is one case flipping with the batch layout.
+
 ## Not yet on this engine
 
 Flash-Next's MTP (`qwen4exp` is in llama.cpp at the pin), conversation
