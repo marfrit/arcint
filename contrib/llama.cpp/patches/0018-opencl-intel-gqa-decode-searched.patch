@@ -1,0 +1,148 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index bdec375..9c3baa2 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -19408,6 +19408,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+             fd_kv_per_split = kps_env && atoi(kps_env) > 0 ? atoi(kps_env) : 128;
+             fd_max_splits   = 256;
+         }
++        if (use_fd_gqa) {
++            // the GQA kernel's own split size: a work-group covers a whole KV
++            // head, so it wants longer splits than the per-head kernel (512
++            // against 128: the structural search's best, docs/campaigns/
++            // kernel-autotune-ga.md); GGML_OPENCL_FA_GQA_KV_PER_SPLIT
++            static const char * gkps_env = getenv("GGML_OPENCL_FA_GQA_KV_PER_SPLIT");
++            fd_kv_per_split = gkps_env && atoi(gkps_env) > 0 ? atoi(gkps_env) : 512;
++        }
+         int n_splits = (n_kv + fd_kv_per_split - 1) / fd_kv_per_split;
+         if (n_splits < (use_fd_intel ? 1 : FD_MIN_SPLITS)) { n_splits = use_fd_intel ? 1 : FD_MIN_SPLITS; }
+         if (n_splits > fd_max_splits) { n_splits = fd_max_splits; }
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
+index 137789e..f938712 100644
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
+@@ -39,6 +39,15 @@
+ #ifndef GQA_SIDES
+ #define GQA_SIDES 2             // sub-groups sharing 8 rows, each a column range
+ #endif
++// The sides of a tile split Q K^T by 16-key group and exchange S through
++// local memory (GQA_S_SPLIT, default with two or more sides; GQA_NO_S_SPLIT
++// turns it off). Found by the structural search (tools/kq_tune/fagqa.py,
++// docs/campaigns/kernel-autotune-ga.md): one attention layer at the dense
++// 27B's geometry, 4-8 rows, 32k and 131k keys, f16, 0.78x 0.5.9's time with
++// the host's split of 512 keys, measured-here.
++#if GQA_SIDES > 1 && !defined(GQA_NO_S_SPLIT) && !defined(GQA_S_SPLIT)
++#define GQA_S_SPLIT
++#endif
+ #if GQA_SIDES < 1 || DV % (16 * GQA_SIDES) != 0
+ #error "GQA_SIDES must split DV into 16-column tiles"
+ #endif
+@@ -119,6 +128,11 @@ kernel void flash_attn_gqa_dpas(
+     local half ks[BK * DK];     // [key][DK]
+ #endif
+     local half vt[DV * BK];     // [column][key]
++#ifdef GQA_S_SPLIT
++    // the sides of a tile split Q K^T by 16-key group and exchange S here:
++    // [tile][group][row][key], up to 8 tiles
++    local float sx[8 * NKB * 8 * 16];
++#endif
+ 
+     const int lane  = get_sub_group_local_id();
+     const int sg    = get_sub_group_id();
+@@ -169,6 +183,21 @@ kernel void flash_attn_gqa_dpas(
+             : 0;
+     }
+ 
++#if defined(GQA_PF) && GQA_PF > 0
++    // (off by default: 8 gains 7 % alone, but with GQA_S_SPLIT, or at 4,
++    // IGC falls back to a rolled, spilling form at 2-2.5x the time,
++    // measured-here.)
++    // V prefetch: a work-item's first GQA_PF staging units of the next tile
++    // are loaded into registers right after the staging barrier, so the
++    // loads are in flight while the products run; the rest of the tile (a
++    // small work-group) is loaded at staging time as before
++    half8 pv[GQA_PF];
++    for (int i = 0; i < GQA_PF; ++i) {
++        const int u = lid + i * nthr;
++        if (u < BK * DV / 8 && kv_start < kv_end)
++            pv[i] = load8(VT, vb + min(kv_start + u % BK, kv_end - 1) * v_nb1, u / BK);
++    }
++#endif
+     for (int k0 = kv_start; k0 < kv_end; k0 += BK) {
+         barrier(CLK_LOCAL_MEM_FENCE);
+ #ifdef GQA_K_STAGED
+@@ -179,16 +208,40 @@ kernel void flash_attn_gqa_dpas(
+ #endif
+         // V transposed with the key fastest: neighbouring lanes store
+         // neighbouring halves
++#if defined(GQA_PF) && GQA_PF > 0
++        for (int i = 0; i < GQA_PF; ++i) {
++            const int u = lid + i * nthr;
++            if (u < BK * DV / 8) {
++                const int  key = u % BK, c8 = u / BK;
++                const half vv[8] = { pv[i].s0, pv[i].s1, pv[i].s2, pv[i].s3, pv[i].s4, pv[i].s5, pv[i].s6, pv[i].s7 };
++                for (int j = 0; j < 8; ++j) vt[(8 * c8 + j) * BK + key] = vv[j];
++            }
++        }
++        for (int u = lid + GQA_PF * nthr; u < BK * DV / 8; u += nthr) {
++#else
+         for (int u = lid; u < BK * DV / 8; u += nthr) {
++#endif
+             const int key = u % BK, c8 = u / BK, kk = min(k0 + key, kv_end - 1);
+             const half8 vv8 = load8(VT, vb + kk * v_nb1, c8);
+             const half vv[8] = { vv8.s0, vv8.s1, vv8.s2, vv8.s3, vv8.s4, vv8.s5, vv8.s6, vv8.s7 };
+             for (int j = 0; j < 8; ++j) vt[(8 * c8 + j) * BK + key] = vv[j];
+         }
+         barrier(CLK_LOCAL_MEM_FENCE);
++#if defined(GQA_PF) && GQA_PF > 0
++        if (k0 + BK < kv_end) {
++            for (int i = 0; i < GQA_PF; ++i) {
++                const int u = lid + i * nthr;
++                if (u < BK * DV / 8)
++                    pv[i] = load8(VT, vb + min(k0 + BK + u % BK, kv_end - 1) * v_nb1, u / BK);
++            }
++        }
++#endif
+ 
+         float8 s[NKB];
+         for (int g = 0; g < NKB; ++g) {
++#ifdef GQA_S_SPLIT
++            if (g % GQA_SIDES != side) continue;   // another side of this tile computes it
++#endif
+             float8 acc = (float8)(0.f);
+             for (int c = 0; c < KC; ++c) {
+ #ifndef GQA_K_STAGED
+@@ -199,7 +252,20 @@ kernel void flash_attn_gqa_dpas(
+                 acc = DPAS(qa[c], b, acc);
+             }
+             s[g] = acc;
++#ifdef GQA_S_SPLIT
++            const float sv[8] = { acc.s0, acc.s1, acc.s2, acc.s3, acc.s4, acc.s5, acc.s6, acc.s7 };
++            for (int r = 0; r < 8; ++r) sx[((tile * NKB + g) * 8 + r) * 16 + lane] = sv[r];
++#endif
+         }
++#ifdef GQA_S_SPLIT
++        barrier(CLK_LOCAL_MEM_FENCE);
++        for (int g = 0; g < NKB; ++g) {
++            if (g % GQA_SIDES == side) continue;
++            float sv[8];
++            for (int r = 0; r < 8; ++r) sv[r] = sx[((tile * NKB + g) * 8 + r) * 16 + lane];
++            s[g] = (float8)(sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7]);
++        }
++#endif
+         float mnew[8];
+         for (int r = 0; r < 8; ++r) mnew[r] = m[r];
+         for (int g = 0; g < NKB; ++g) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 7a58fd2..7fba62b 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11536,7 +11536,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     // 27B's geometry (head size 256, 24 query heads on 4)
+     for (auto kt : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+         for (int64_t kv : {8192, 32768, 131072}) {
+-            for (int64_t nb : {1, 6}) {
++            for (int64_t nb : {1, 4, 6, 8}) {
+                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, kt, kt));
+             }
+         }

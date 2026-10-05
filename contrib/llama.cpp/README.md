@@ -968,3 +968,135 @@ the 0016 build, where head size 128 took the upstream kernels):
   quant since 0.5.9. The corpus is general text, not role play.
 - A770 (its sub-group-8 build of the prompt kernel): FLASH_ATTN_EXT 2,804
   of 2,806, the same two f16 failures as before 0017.
+
+## 0018-opencl-intel-gqa-decode-searched.patch
+
+The verify kernel of 0016/0017 as a structural search found it
+(`tools/kq_tune/fagqa.py`, `docs/campaigns/kernel-autotune-ga.md`, "code-level
+search"). Two changes of default and two new switches:
+- **`GQA_S_SPLIT` (default with two or more sides):** the sides of an 8-row
+  tile split QKᵀ by 16-key group and exchange S through local memory (one
+  barrier more per tile). Before, both sides computed all of S.
+  `GQA_NO_S_SPLIT` turns it off.
+- **The kernel's own split size, 512 keys** (`GGML_OPENCL_FA_GQA_KV_PER_SPLIT`;
+  the per-head split kernel keeps 128). A work-group covers a whole KV head,
+  so longer splits mean fewer partials. It changes nothing from 131,072 keys
+  on: the 256-split cap already made the splits 512 keys long there, so the
+  gain at 131k is S-split's (`code`).
+- **`GQA_PF` (off):** the next V tile prefetched into registers. 8 alone
+  gains 7 %, but with `GQA_S_SPLIT`, or at 4, IGC falls back to a rolled
+  form (3,181-3,383 assembly lines against 10,176-12,453) at 2-2.5x the time.
+  Removed again by 0019, whose 64-value V staging it no longer matched.
+- The test-backend-ops perf cases gain 4 and 8 rows.
+
+The search (`measured-here`, B60, one attention layer at the dense 27B's
+geometry, f16, the geometric mean over 4, 6 and 8 rows at 32k and 131k keys,
+against 0.5.9's kernel re-measured every 8 evaluations, drift under 0.4 %):
+- exhaustive over sides, K mode, tile and split size (90 genomes): best 0.863
+  (split 512), median 1.356;
+- GA adding S-split (59 of 216 evaluated): best 0.783 (S-split, split 512);
+- GA adding prefetch (60 evaluated): best 0.798 (prefetch 8, no S-split);
+- the local enumeration of S-split × prefetch × split (18): 0.784 for
+  S-split and split 512; both genes together 2.44.
+
+End to end (`measured-here`, B60, q8_0 KV, the same binaries with the
+switches set by environment):
+
+| model | rows at 32k depth | 0.5.9 | 0018 |
+|---|---|---|---|
+| dense 27B | 4 / 6 / 8 | 36.7 / 52.6 / 62.1 t/s | 39.4 / 64.2 / 78.5 |
+| Cydonia 24B | 4 / 6 / 8 | 29.2 / 42.3 / 58.6 | 36.1 / 58.8 / 76.8 |
+
+- Served, the agent's flags, a 62,597-token prompt: decode at that depth
+  15.6 -> 16.4 t/s, identical draft statistics, the acceptance task 10/10
+  in both.
+- KL through the kernel (dense 27B, q8_0, 6-token ubatches): 0.003589 ->
+  0.003587, top-1 97.79 -> 97.87 %.
+- Gate: FLASH_ATTN_EXT at head sizes 256 and 128 with the kernel taking
+  every row count, 860 of 861 (the failure is the pin's softcap case) for:
+  - the exhaustive best;
+  - the three best S-split genomes;
+  - the two best of the local enumeration (S-split; prefetch 8).
+  Prefetch has no failing-first test of its own; it is off.
+- 0018's defaults: FLASH_ATTN_EXT 2,805 of 2,806 on the B60. A fault in the S
+  exchange (a side reads the other group's S) fails 68 cases, all at 4-8
+  rows. The A770 (2,804 of 2,806) does not build this kernel; its run shows
+  only that nothing else changed.
+
+## 0019-opencl-intel-attention-agent-searched.patch
+
+The prompt kernel (0008's `flash_attn_dpas.cl`, the sub-group-16 build only)
+and the decode / verify kernel (0016's `flash_attn_gqa_dpas.cl`) as two LLM
+mutation agents rewrote them overnight, one kernel each, every candidate
+compiled, tested and timed on the B60 before the next
+(`docs/campaigns/kernel-autotune-ga.md`, "LLM mutation search"). Kernel
+source only; the host is unchanged.
+
+Prompt kernel:
+- **Q in registers, not local memory.** The DPAS a-operand of every 16-column
+  chunk is built once from global memory (lane = column, component = row) and
+  kept for the whole key loop; the Q staging loop and its 64 KB buffer go.
+- **K and V share one local buffer** (`BK * DK` halves, 16 KB at head size
+  256): K is staged, S computed, the buffer rewritten as transposed V, P V
+  computed, then the next K staged. 96 KB of local memory a work-group
+  becomes 16 KB (`code`), which leaves room for more work-groups an Xe core
+  (the occupancy itself is not measured); the extra barriers are paid for
+  on purpose.
+- Loads issued early into registers: the first K tile while the Q
+  registers are built, each tile's V before the loop-top barrier.
+- Q K^T as two DPAS chains a key group over the halves of the head
+  dimension (four independent chains at BK 32).
+- One row maximum across the key groups before the sub-group reduction, and
+  one sub-group vote that skips the eight row reductions and the rescale of
+  O and l when no row's running maximum can rise (the common case away from
+  the diagonal; exact, the skipped correction factor is 1).
+- Compile-time guards: four staging units a work-item, an even chunk count.
+
+Decode / verify kernel:
+- **Wider staging units:** quantized K and all V staged 64 values a
+  work-item (V: four 16-value loads before the stores; K: four load-store
+  pairs) instead of 8.
+  This is the q8_0 path the agent serves (`GQA_K_STAGED`); f16 K stays direct.
+- Q K^T before the V staging, so one barrier covers the V tile and the
+  S exchange; the S exchange laid out lane-major ([tile][group][lane][row]),
+  one `vstore8` / `vload8` a group.
+- Masking as `fmax(s + mask, M_INIT)`, one sub-group maximum per row across
+  the groups, P and l as float8 vectors. l is now the sum of the f32 P,
+  where P V multiplies P rounded to half (before: the sum of the rounded P);
+  the KL below includes it.
+- `GQA_PF` removed (see 0018). Guard: head sizes a multiple of 64.
+
+Measured (`measured-here`, B60, the dense 27B Q4_K_M, q8_0 KV, 32k keys deep,
+llama-bench with both arms running the same tests in the same order; the
+shipped arm is 0018):
+
+| | 0018 | 0019 |
+|---|---|---|
+| pp512 (prompt) | 297.5 t/s | 428.7 (+44.1 %) |
+| pp6 (MTP-5 verify) | 64.2 | 71.2 (+10.9 %) |
+| pp8 | 78.5 | 87.3 (+11.2 %) |
+
+- KL against the f16 reference (16 chunks of 512, q8_0): prompt path
+  (ubatch 512) 0.003966 -> 0.004099, same top-1 97.647 -> 97.745 %; verify
+  path (ubatch 6) 0.003587 -> 0.003588, 97.868 -> 97.843 %.
+- FLASH_ATTN_EXT at head sizes 256 and 128: 860 of 861 on the B60 for both
+  kernels (the failure is the pin's softcap case). On the A770 the same run
+  passes 860 of 861 but exercises neither change: the A770 builds the
+  sub-group-8 prompt kernel, which 0019 does not touch, and not the GQA
+  kernel at all. Its four sub-group-8 builds compile to byte-identical
+  binaries before and after (ocloc, dg2).
+- Served (arcint on libllama, the agent's flags, two arcint builds of one
+  source with the series to 0018 and to 0019, two rounds each): a
+  62,597-token prompt prefills at 287.2 / 286.8 -> 408.1 / 407.7 t/s
+  (+42 %), and the answer after it decodes at 18.7 / 18.7 -> 21.6 / 21.6 t/s
+  (+15.5 %, MTP 5). Both answers coherent and on the prompt's task, each
+  build's text the same in both rounds. The acceptance task at T=0 with
+  thinking off (the agent's protocol): 8/10 for both. The 0018 section's
+  16.4 t/s and 10/10 came from another arcint working tree with the switches
+  set by environment; across the two windows the absolute numbers do not
+  compare, within each the arms do. A greedy score is one trajectory and
+  flips between 8 and 10 with the configuration (`docs/llama-engine.md`).
+- One review fix was dropped again: a guard around the rescale's
+  `native_exp` put 896 bytes of spill into the q8_0 prompt build and took
+  15 % of pp512 (`measured-here`); the kernel comment says why it is not
+  there.
