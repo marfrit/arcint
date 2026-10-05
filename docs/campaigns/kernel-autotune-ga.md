@@ -187,8 +187,68 @@ re-measured every 8 evaluations (drift under 0.4 %).
   Served agent at 62.6k depth 15.6 -> 16.4 t/s. KL 0.003589 -> 0.003587.
 - **Reproducing:** the exhaustive run used the first four genes with KVPS
   64-1,024. `fagqa.py` has since grown KVPS 2,048, SSPLIT and PF, so
-  `exhaustive` now enumerates 648 genomes. The results files hold no binary
-  sha: start a new file after a rebuild.
+  `exhaustive` enumerated 648 genomes until 0019 removed the prefetch gene;
+  without it, and without the 36 duplicates (S-split at one side), 180.
+  The results files hold no binary sha: start a new file after a rebuild.
+
+
+## LLM mutation search: both attention kernels (2026-10-04/05, `measured-here`)
+
+The structural search above varies switches someone already wrote. Here the
+genome is the kernel source itself: two coding agents (pi with a local
+DeepSeek-V4.1-Flash, one agent a kernel) edited `flash_attn_dpas.cl` (prompt)
+and `flash_attn_gqa_dpas.cl` (decode / MTP verify) for seven hours,
+unattended, each candidate scored by one evaluator before the next edit.
+
+The evaluator, for one candidate on the B60, under a lock:
+1. ocloc compile; the spill size and assembly length of the SIMD16 build
+   reported back (IGC's rolled fallback shows as a third of the length);
+2. a FLASH_ATTN_EXT subset at head sizes 256 and 128 on the candidate (a
+   non-embedded build reads the `.cl` from its working directory);
+3. fitness: test-backend-ops perf at the dense 27B's geometry, f16 K/V, as a
+   ratio to the shipped kernel re-measured every 6 evaluations;
+4. from the night's second half, the served case as well: llama-bench, q8_0
+   KV, 32k deep (gqa: 6 rows, every evaluation; dpas: a 512-token chunk, new
+   bests), the shipped kernel measured back to back in the same way.
+Every new best was then gated outside the agents' loop: all variants compiled
+(both head sizes, f16 / q8_0 / q4_0, the A770's sub-group-8 build of the
+prompt kernel), the full FLASH_ATTN_EXT at head sizes 256 and 128, KL against
+the f16 reference, llama-bench against the shipped kernel.
+
+Result: about 60 evaluations a lane; 0019 carries the best of each (README,
+0019). llama-bench 32k deep: pp512 +44 %, 6 and 8 rows +11 %; served through
+arcint at 62.6k: prefill +42 %, decode +15.5 %; KL within 0.00014 nats of the
+shipped kernel's, the acceptance task unchanged.
+
+What the night taught about the method:
+- **The fitness has to be the served case.** The gqa lane's f16 fitness
+  improved to 0.79 of the shipped kernel while the served q8_0 verify did
+  not move: q8_0 K takes the staged path, the f16 fitness the direct one.
+  Measuring the served case on every evaluation turned the lane to the
+  staged path (wider staging units), where the served gain showed; 0019's
+  other changes (S-exchange layout, masking, float8 P) run on both paths,
+  and no ablation separates them.
+- **Pair the measurement, and keep the order.** A pp6 run that is the first
+  test of a llama-bench process is slower than one after a pp512 test, for
+  both kernels measured (shipped 60.4 against 64.2, the verify lane's
+  best at the time, an earlier version of 0019's, 68.8 against 70.2;
+  alternating runs, twice). Comparing a candidate's first-test number with
+  the shipped kernel's after-pp512 number produced a "regression" that was
+  not there, and a stale shipped number misled the agent for an hour.
+- **A gate must fail on a fallback, including a silent one.** A type or
+  head-size variant that fails to compile is dropped by the host without a
+  fallback warning (only the compiler log shows it) and its tests pass on
+  the split kernel; the gate counts `kernel compile error` as a failure.
+- **Review fixes are mutations too.** A one-line guard restored on review
+  (a select around `native_exp`) put 896 bytes of spill into the q8_0 prompt
+  build and took 15 % of pp512; checking the compiled form of every review
+  fix against the gated one caught it.
+- What the agents tried and dropped, as they reported it from their own
+  evaluator runs (not re-gated; the notes are not in the repository): a
+  register array prefetching the next tile across the loop (IGC rolls the
+  loop; 0019's early loads are single registers within one tile), padded
+  local strides, double buffers (local memory costs occupancy), four-way
+  split reductions, a fused quantized decode (wrong results).
 
 ## Where it lives
 

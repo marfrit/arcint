@@ -22,7 +22,7 @@ grows switches (GENES below).
 Fitness (TUNE set): one attention layer at the dense 27B's geometry (24 query
 heads on 4, head size 256), f16 K/V, test-backend-ops perf us/run, at 4, 6
 and 8 query rows and 32k and 131k keys; the geometric mean of the six. A
-fixed reference genome (the shipped defaults) is re-measured every REF_EVERY
+fixed reference genome (REF: 0016/0017's structure) is re-measured every REF_EVERY
 evaluations and each result divided by the latest reference. Lower is
 better.
 
@@ -45,12 +45,13 @@ GENES = {
     'BK':    [16, 32, 64],
     'KVPS':  [64, 128, 256, 512, 1024, 2048],
     'SSPLIT': [0, 1],   # GQA_S_SPLIT: the sides of a tile split Q K^T and exchange S
-    'PF':    [0, 4, 8],  # GQA_PF: staging units of the next V tile prefetched into registers
-}
-REF = {'SIDES': 2, 'KMODE': 'direct', 'BK': 32, 'KVPS': 128, 'SSPLIT': 0, 'PF': 0}   # 0.5.9's kernel (0016/0017), f16 defaults
+}   # GQA_PF (V prefetch, a gene of the 2026-10-04 search) was removed from the kernel by 0019
+REF = {'SIDES': 2, 'KMODE': 'direct', 'BK': 32, 'KVPS': 128, 'SSPLIT': 0}   # 0016/0017's structure (the 2026-10-04 reference); the shipped defaults are 0018's
 CASES = [(kv, nb) for kv in (32768, 131072) for nb in (4, 6, 8)]
 REF_EVERY, MAX_FAILS, TIMEOUT = 8, 5, 600
-FALLBACK = re.compile(r'ggml_opencl: [^\n]*(ignored|not built|does not fit)')
+# 'kernel compile error': a type or head-size variant that fails to build is dropped
+# silently and its cases run on the split kernel
+FALLBACK = re.compile(r'ggml_opencl: [^\n]*(ignored|not built|does not fit|kernel compile error)')
 
 def clean_env(**over):
     """The caller's environment without any GGML_OPENCL_FA_* switch, plus `over`."""
@@ -61,13 +62,15 @@ def clean_env(**over):
 def genome_env(g):
     opts = ('-DGQA_K_DIRECT' if g['KMODE'] == 'direct' else '-DGQA_K_STAGED') + f" -DBK={g['BK']}"
     opts += ' -DGQA_S_SPLIT' if g.get('SSPLIT') else ' -DGQA_NO_S_SPLIT'   # explicit: 0018 made it the default
-    if g.get('PF'):
-        opts += f" -DGQA_PF={g['PF']}"
     return clean_env(GGML_OPENCL_PLATFORM=PLATFORM, GGML_OPENCL_FA_GQA_SIDES=str(g['SIDES']),
                      GGML_OPENCL_FA_GQA_OPTS=opts, GGML_OPENCL_FA_GQA_KV_PER_SPLIT=str(g['KVPS']))
 
+def norm(g):
+    """One side has nothing to split: SSPLIT is meaningless at SIDES 1."""
+    return dict(g, SSPLIT=0) if g['SIDES'] == 1 else g
+
 def key(g):
-    return ','.join(str(g.get(n, REF[n])) for n in GENES)
+    return ','.join(str(norm(g).get(n, REF[n])) for n in GENES)
 
 def measure(g):
     rx = '|'.join(f'kv={kv},nb={nb},' for kv, nb in CASES)
@@ -130,6 +133,7 @@ class Evaluator:
             self.db['refs'].append({'at': self.n, 'us': r, 'time': time.time()})
 
     def __call__(self, g):
+        g = norm(g)   # the key, the measured build and the stored genome agree
         k = key(g)
         if k in self.seen:
             return self.seen[k]['norm']
@@ -149,8 +153,12 @@ class Evaluator:
         return e['norm']
 
 def space():
+    seen = set()
     for vals in itertools.product(*GENES.values()):
-        yield dict(zip(GENES, vals))
+        g = norm(dict(zip(GENES, vals)))
+        if key(g) not in seen:
+            seen.add(key(g))
+            yield g
 
 def ga(ev, seed, budget, pop_n, noseed=False):
     rng = random.Random(seed)
@@ -169,8 +177,8 @@ def ga(ev, seed, budget, pop_n, noseed=False):
     pop = ([] if noseed else [dict(REF)]) + [{n: rng.choice(v) for n, v in GENES.items()}
                                              for _ in range(pop_n - (0 if noseed else 1))]
     scored = [(fit(g), g) for g in pop]
-    gen = 0
-    while ev.n < budget and gen < 3 * budget // pop_n:
+    gen, n0 = 0, ev.n   # the budget counts this run's evaluations, also on a resumed file
+    while ev.n - n0 < budget and gen < 3 * budget // pop_n:
         gen += 1
         scored.sort(key=lambda x: x[0])
         nxt = [g for _, g in scored[:2]]
