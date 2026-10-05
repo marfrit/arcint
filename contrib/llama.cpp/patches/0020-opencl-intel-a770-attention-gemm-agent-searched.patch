@@ -1,0 +1,693 @@
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
+index a5703eb..d0d852b 100644
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
+@@ -77,7 +77,11 @@ static inline half8 load8(const int t, const global char * row, const int c8) {
+     if (t == 0) return vload8(c8, (const global half *) row);
+     const global char * blk = row + (c8 >> 2) * (t == 1 ? 34 : 18);
+     const float d = vload_half(0, (const global half *) blk);
++#if SG == 8
++    if (t == 1) return convert_half8(convert_int8(vload8(0, blk + 2 + (c8 & 3) * 8))) * (half8)(d);
++#else
+     if (t == 1) return convert_half8(convert_float8(vload8(0, blk + 2 + (c8 & 3) * 8)) * d);
++#endif
+     // q4_0: values 0..15 the low nibbles of qs[0..15], 16..31 the high ones
+     const uchar8 q = vload8(0, (const global uchar *) blk + 2 + (c8 & 1) * 8);
+     const uchar8 n = (c8 & 2) ? (q >> (uchar8)(4)) : (q & (uchar8)(15));
+@@ -347,8 +351,8 @@ kernel void flash_attn_f32_f16_dpas(
+         ulong mask_nb1, ulong mask_nb2, ulong mask_nb3, int mask_ne2, int mask_ne3,
+         int n_batch, int k_ne3, int v_ne3) {
+     local half qs[BQ * DK];
+-    local half ks[BK * DK];
+-    local half vt[DV * BK];
++    local half ks[BK * (DK + 16)];
++    local half vt[DV * (BK + 16)];
+ 
+     const int lane = get_sub_group_local_id(), sg = get_sub_group_id(), lid = get_local_id(0);
+     const int rg = sg >> 1, half_dv = sg & 1;          // the pair's row group, this one's columns
+@@ -363,10 +367,12 @@ kernel void flash_attn_f32_f16_dpas(
+         ? (global const half *)(mask_void + mask_offset + (batch % mask_ne3) * mask_nb3 + (head % mask_ne2) * mask_nb2)
+         : 0;
+ 
+-    for (int u = lid; u < BQ * DK; u += NTHR) {
+-        const int r = u / DK, d = u % DK, qr = q0 + r;
+-        const float x = qr < n_q ? ((global const float *)(qb + qr * q_nb1))[d] * scale : 0.f;
+-        qs[(((r >> 3) * KC + (d >> 4)) * 8 + (r & 7)) * 16 + (d & 15)] = (half) x;
++    for (int u = lid; u < BQ * (DK / 8); u += NTHR) {
++        const int r = u / (DK / 8), c8 = u % (DK / 8), qr = q0 + r;
++        const float8 x = qr < n_q ? vload8(0, (const global float *)(qb + qr * q_nb1) + c8 * 8) : (float8)(0.f);
++        const half8 h = convert_half8(x * scale);
++        // block layout: ((r>>3)*KC + (c8>>1))*128 + (r&7)*16 + (c8&1)*8
++        vstore8(h, 0, qs + ((r >> 3) * KC + (c8 >> 1)) * 128 + (r & 7) * 16 + (c8 & 1) * 8);
+     }
+     int kv_end = n_kv;
+     if (mb != 0) {
+@@ -385,61 +391,109 @@ kernel void flash_attn_f32_f16_dpas(
+     float m[8], l[8];
+     for (int r = 0; r < 8; ++r) { m[r] = M_INIT; l[r] = 0.f; }
+     const int q_sg = q0 + rg * 8;
++    ulong qroff[8];
++    for (int r = 0; r < 8; ++r) qroff[r] = (ulong)min(q_sg + r, n_q - 1) * mask_nb1;
+ 
+     for (int t0 = 0; t0 < kv_end; t0 += BK) {
+         barrier(CLK_LOCAL_MEM_FENCE);
++#pragma unroll
+         for (int u = lid; u < BK * DK / 8; u += NTHR) {
+             const int key = u / (DK / 8), c8 = u % (DK / 8), kk = min(t0 + key, n_kv - 1);
+-            vstore8(load8(KT, kb + kk * k_nb1, c8), 0, ks + key * DK + 8 * c8);
+-        }
+-        // V transposed with the key fastest: neighbouring lanes store
+-        // neighbouring halves (key-major, they all hit one bank)
+-        for (int u = lid; u < BK * DK / 8; u += NTHR) {
+-            const int key = u % BK, c8 = u / BK, kk = min(t0 + key, n_kv - 1);
+-            const half8 vv8 = load8(VT, vb + kk * v_nb1, c8);
++            vstore8(load8(KT, kb + kk * k_nb1, c8), 0, ks + key * (DK + 16) + 8 * c8);
++            // V transposed with the key fastest: neighbouring lanes store
++            // neighbouring halves (key-major, they all hit one bank)
++            const int keyv = u % BK, c8v = u / BK, kkv = min(t0 + keyv, n_kv - 1);
++            const half8 vv8 = load8(VT, vb + kkv * v_nb1, c8v);
+             const half vv[8] = { vv8.s0, vv8.s1, vv8.s2, vv8.s3, vv8.s4, vv8.s5, vv8.s6, vv8.s7 };
+-            for (int j = 0; j < 8; ++j) vt[(8 * c8 + j) * BK + key] = vv[j];
++            for (int j = 0; j < 8; ++j) vt[(8 * c8v + j) * (BK + 16) + keyv] = vv[j];
+         }
+         barrier(CLK_LOCAL_MEM_FENCE);
+ 
+         // S in 8-key groups: lane = key, component = row
+         float8 s[2 * NKB];
++#if NKB == 2
++        // c outer with explicit accumulators: the Q a-operand block read
++        // happens once per c (16x) instead of once per (g,c) (64x)
++        {
++            float8 s0 = (float8)(0.f), s1 = (float8)(0.f), s2 = (float8)(0.f), s3 = (float8)(0.f);
++#pragma unroll
++            for (int c = 0; c < KC; ++c) {
++                const int8 a = LOAD_A(qs + ((rg * KC + c) * 8) * 16);
++                s0 = DPAS(a, as_int8(vload8(0, (local const uint *)(ks + lane * (DK + 16) + c * 16))), s0);
++                s1 = DPAS(a, as_int8(vload8(0, (local const uint *)(ks + (8 + lane) * (DK + 16) + c * 16))), s1);
++                s2 = DPAS(a, as_int8(vload8(0, (local const uint *)(ks + (16 + lane) * (DK + 16) + c * 16))), s2);
++                s3 = DPAS(a, as_int8(vload8(0, (local const uint *)(ks + (24 + lane) * (DK + 16) + c * 16))), s3);
++            }
++            s[0] = s0; s[1] = s1; s[2] = s2; s[3] = s3;
++        }
++#else
+         for (int g = 0; g < 2 * NKB; ++g) {
+             float8 acc = (float8)(0.f);
+             for (int c = 0; c < KC; ++c) {
+                 const int8 a = LOAD_A(qs + ((rg * KC + c) * 8) * 16);
+-                const int8 b = as_int8(vload8(0, (local const uint *)(ks + (g * 8 + lane) * DK + c * 16)));
++                const int8 b = as_int8(vload8(0, (local const uint *)(ks + (g * 8 + lane) * (DK + 16) + c * 16)));
+                 acc = DPAS(a, b, acc);
+             }
+             s[g] = acc;
+         }
+-        float mrow[8];
+-        for (int r = 0; r < 8; ++r) mrow[r] = m[r];
+-        for (int g = 0; g < 2 * NKB; ++g) {
+-            const int key = t0 + g * 8 + lane;
+-            float sv[8] = { s[g].s0, s[g].s1, s[g].s2, s[g].s3, s[g].s4, s[g].s5, s[g].s6, s[g].s7 };
+-            for (int r = 0; r < 8; ++r) {
+-                const int qr = min(q_sg + r, n_q - 1);
+-                half mh = 0.0h;
+-                if (mb != 0 && key < n_kv) mh = ((global const half *)((global const char *) mb + qr * mask_nb1))[key];
+-                const float mk  = (float) mh;
+-                const bool  vis = key < n_kv && q_sg + r < n_q && as_ushort(mh) != 0xFC00;   // -inf: masked
+-                sv[r] = vis ? sv[r] + mk : M_INIT;
+-                mrow[r] = fmax(mrow[r], sub_group_reduce_max(sv[r]));
++#endif
++        // mask every group, then elementwise max across the groups, then
++        // ONE sub-group vote decides whether any row's running max rises;
++        // the common case past the diagonal skips the reductions and rescale
++        if (mb != 0) {
++#pragma unroll
++            for (int g = 0; g < 2 * NKB; ++g) {
++                const int key = t0 + g * 8 + lane;
++                float sv[8] = { s[g].s0, s[g].s1, s[g].s2, s[g].s3, s[g].s4, s[g].s5, s[g].s6, s[g].s7 };
++                for (int r = 0; r < 8; ++r) {
++                    half mh = ((global const half *)((global const char *) mb + qroff[r]))[min(key, n_kv - 1)];
++                    const float mk  = (float) mh;
++                    const bool  vis = key < n_kv && q_sg + r < n_q && as_ushort(mh) != 0xFC00;   // -inf: masked
++                    sv[r] = vis ? sv[r] + mk : M_INIT;
++                }
++                s[g] = (float8)(sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7]);
+             }
+-            s[g] = (float8)(sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7]);
++        } else {
++#pragma unroll
++            for (int g = 0; g < 2 * NKB; ++g) {
++                const int key = t0 + g * 8 + lane;
++                float sv[8] = { s[g].s0, s[g].s1, s[g].s2, s[g].s3, s[g].s4, s[g].s5, s[g].s6, s[g].s7 };
++                for (int r = 0; r < 8; ++r) {
++                    const bool vis = key < n_kv && q_sg + r < n_q;
++                    sv[r] = vis ? sv[r] : M_INIT;
++                }
++                s[g] = (float8)(sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7]);
++            }
++        }
++        float smax[8];
++        {
++            const float sv[8] = { s[0].s0, s[0].s1, s[0].s2, s[0].s3, s[0].s4, s[0].s5, s[0].s6, s[0].s7 };
++            for (int r = 0; r < 8; ++r) smax[r] = sv[r];
++        }
++        for (int g = 1; g < 2 * NKB; ++g) {
++            const float sv[8] = { s[g].s0, s[g].s1, s[g].s2, s[g].s3, s[g].s4, s[g].s5, s[g].s6, s[g].s7 };
++            for (int r = 0; r < 8; ++r) smax[r] = fmax(smax[r], sv[r]);
+         }
++        float dmax = -3.0e38f;
++        for (int r = 0; r < 8; ++r) dmax = fmax(dmax, smax[r] - m[r]);
++        const int anyg = (sub_group_reduce_max(dmax) > 0.f) ? 1 : 0;
+         float corr[8];
+-        for (int r = 0; r < 8; ++r) {
+-            corr[r] = m[r] > 0.5f * M_INIT ? native_exp(m[r] - mrow[r]) : 0.f;
+-            m[r]    = mrow[r];
+-            l[r]   *= corr[r];
++        if (anyg) {
++            for (int r = 0; r < 8; ++r) {
++                const float mrow = fmax(m[r], sub_group_reduce_max(smax[r]));
++                corr[r] = m[r] > 0.5f * M_INIT ? native_exp(m[r] - mrow) : 0.f;
++                m[r]    = mrow;
++                l[r]   *= corr[r];
++            }
++            const float8 cv = (float8)(corr[0], corr[1], corr[2], corr[3], corr[4], corr[5], corr[6], corr[7]);
++            for (int c = 0; c < NDC; ++c) o[c] *= cv;
++        } else {
++            for (int r = 0; r < 8; ++r) corr[r] = 1.0f;
+         }
+-        const float8 cv = (float8)(corr[0], corr[1], corr[2], corr[3], corr[4], corr[5], corr[6], corr[7]);
+-        for (int c = 0; c < NDC; ++c) o[c] *= cv;
+         // P (half), row sums; then the a operand of 16 keys: lane i holds keys
+         // 2i, 2i+1 of each row (keys 0..7 in the low group, 8..15 in the high)
+         half8 ph[2 * NKB];
++#pragma unroll
+         for (int g = 0; g < 2 * NKB; ++g) {
+             float sv[8] = { s[g].s0, s[g].s1, s[g].s2, s[g].s3, s[g].s4, s[g].s5, s[g].s6, s[g].s7 };
+             half  hv[8];
+@@ -450,6 +504,7 @@ kernel void flash_attn_f32_f16_dpas(
+             ph[g] = (half8)(hv[0], hv[1], hv[2], hv[3], hv[4], hv[5], hv[6], hv[7]);
+         }
+         int8 pa[NKB];
++#pragma unroll
+         for (int g = 0; g < NKB; ++g) {
+             const int  src0 = (2 * lane) & 7, src1 = (2 * lane + 1) & 7;
+             const bool hi   = lane >= 4;
+@@ -466,26 +521,27 @@ kernel void flash_attn_f32_f16_dpas(
+                            as_int((half2)(a0.s4, a1.s4)), as_int((half2)(a0.s5, a1.s5)),
+                            as_int((half2)(a0.s6, a1.s6)), as_int((half2)(a0.s7, a1.s7)));
+         }
++#pragma unroll
+         for (int c = 0; c < NDC; ++c) {
+             const int col = half_dv * (DV / 2) + c * 8 + lane;
+             float8 acc = o[c];
+             for (int g = 0; g < NKB; ++g) {
+-                const int8 b = as_int8(vload8(0, (local const uint *)(vt + col * BK + g * 16)));
++                const int8 b = as_int8(vload8(0, (local const uint *)(vt + col * (BK + 16) + g * 16)));
+                 acc = DPAS(pa[g], b, acc);
+             }
+             o[c] = acc;
+         }
+     }
+ 
+-    float lv[8];
+-    for (int r = 0; r < 8; ++r) lv[r] = sub_group_reduce_add(l[r]);
++    float lv[8], linv[8];
++    for (int r = 0; r < 8; ++r) { lv[r] = sub_group_reduce_add(l[r]); linv[r] = lv[r] > 0.f ? 1.f / lv[r] : 0.f; }
+     for (int c = 0; c < NDC; ++c) {
+         const float ov[8] = { o[c].s0, o[c].s1, o[c].s2, o[c].s3, o[c].s4, o[c].s5, o[c].s6, o[c].s7 };
+         for (int r = 0; r < 8; ++r) {
+             const int qr = q_sg + r;
+             if (qr < n_q) {
+                 global float * orow = (global float *)(o_void + o_offset + batch * o_nb3 + qr * o_nb2 + head * o_nb1);
+-                orow[half_dv * (DV / 2) + c * 8 + lane] = lv[r] > 0.f ? ov[r] / lv[r] : 0.f;
++                orow[half_dv * (DV / 2) + c * 8 + lane] = ov[r] * linv[r];
+             }
+         }
+     }
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
+index ffa87e7..39707f9 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
+@@ -119,6 +119,35 @@ constant char kvalues_iq4nl[16] = {
+ // (exact) that brings it under, and the GEMM multiplies its outputs back:
+ // f16 overflows at 65504 (ggml's MUL_MAT_ID cells use activations of 1e5).
+ kernel void kernel_cvt_f32_f16(global const char * src, ulong offs, global half * dst, global float * scale, int k) {
++#if SG == 8
++    const int col = get_group_id(0);
++    global const float * x = (global const float *)(src + offs) + (ulong)col * k;
++    global half * y = dst + (ulong)col * k;
++    const int lid = get_local_id(0), lsz = get_local_size(0);
++    /* float4 only where the 16-byte load and 8-byte store are aligned */
++    const bool vec = ((offs & 15ul) == 0ul) && ((k & 3) == 0);
++    float amax = 0.f;
++    if (vec) {
++        for (int i = lid * 4; i < k; i += lsz * 4) {
++            const float4 v = vload4(0, x + i);
++            amax = fmax(amax, fmax(fmax(fabs(v.s0), fabs(v.s1)), fmax(fabs(v.s2), fabs(v.s3))));
++        }
++    } else {
++        for (int i = lid; i < k; i += lsz) amax = fmax(amax, fabs(x[i]));
++    }
++    amax = work_group_reduce_max(amax);
++    const float sc = amax > 16384.f ? ldexp(1.f, (int)ceil(log2(amax / 16384.f))) : 1.f;
++    const float isc = 1.f / sc;
++    if (vec) {
++        for (int i = lid * 4; i < k; i += lsz * 4) {
++            const float4 v = vload4(0, x + i) * isc;
++            vstore4(convert_half4(v), 0, y + i);
++        }
++    } else {
++        for (int i = lid; i < k; i += lsz) vstore_half_rte(x[i] * isc, 0, y + i);
++    }
++    if (lid == 0) scale[col] = sc;
++#else
+     const int col = get_group_id(0);
+     global const float * x = (global const float *)(src + offs) + (ulong)col * k;
+     global half * y = dst + (ulong)col * k;
+@@ -129,6 +158,7 @@ kernel void kernel_cvt_f32_f16(global const char * src, ulong offs, global half
+     const float isc = 1.f / sc;
+     for (int i = get_local_id(0); i < k; i += get_local_size(0)) vstore_half_rte(x[i] * isc, 0, y + i);
+     if (get_local_id(0) == 0) scale[col] = sc;
++#endif
+ }
+ 
+ static inline uint kbyte(uint3 w, int k) {
+@@ -147,24 +177,112 @@ static inline void scale_min(uint3 w, int k, float * sc, float * m) {
+ 
+ // weight (row r of the tile, k) in the local tile
+ #define LOFF(r, k) (((((r) >> 3) * 16 + ((k) >> 4)) * 8 + ((r) & 7)) * 16 + ((k) & 15))
++// weight (row r of the tile, chunk-local k in 0..127) in a half-super-block
++// buffer: [row group][k16 0..7][row m][k 0..15]
++#define LOFFC(r, k) (((((r) >> 3) * 8 + ((k) >> 4)) * 8 + ((r) & 7)) * 16 + ((k) & 15))
+ 
+ // 16 consecutive weights k0 .. k0+15 (k0 % 16 == 0) of tile row r
+ static inline void put16(local half * wt, int r, int k0, float16 v) {
++#if SG == 8
++    vstore_half16(v, 0, wt + LOFFC(r, k0));
++#else
+     vstore_half16(v, 0, wt + LOFF(r, k0));
++#endif
+ }
+ 
+-static inline float16 nib16(uint4 w, int hi, float a, float b, uint4 h, int hbit) {
++#if SG == 8
++static inline float16 nib16(uint4 w, int hi, half a, half nb, uint4 h, int hbit) {
+     // 16 4-bit codes (low or high nibbles of 16 bytes), plus an optional 5th
+-    // bit from h (bit hbit of each byte; hbit < 0: none): a * q - b
++    // bit from h (bit hbit of each byte; hbit < 0: none): a * q - b as one
++    // f32 fma, the coefficients a and nb = -b rounded to half first
++    const uint4 q = hi ? (w >> 4) & 0x0F0F0F0Fu : w & 0x0F0F0F0Fu;
++    uint4 q5 = q;
++    if (hbit >= 0) q5 |= ((h >> hbit) & 0x01010101u) << 4;
++    const uchar16 c = as_uchar16(q5);
++    return fma(convert_float16(c), (float16)(a), (float16)(nb));
++}
++#else
++static inline float16 nib16(uint4 w, int hi, float a, float b, uint4 h, int hbit) {
+     const uint4 q = hi ? (w >> 4) & 0x0F0F0F0Fu : w & 0x0F0F0F0Fu;
+     uint4 q5 = q;
+     if (hbit >= 0) q5 |= ((h >> hbit) & 0x01010101u) << 4;
+     const uchar16 c = as_uchar16(q5);
+     return a * convert_float16(c) - b;
+ }
++#endif
+ 
+ // ---- dequantization of the tile's super-block ib into local memory ----
+ 
++#if SG == 8
++// Q4_K / Q5_K: unit (row r, pair j of the chunk) = 64 weights, sub-blocks 2j
++// and 2j+1; the chunk holds sub-blocks 4*ch..4*ch+3
++static inline void deq_q45_K(local half * wt, global const uchar * q, global const uchar * qh, global const uchar * s,
++                             global const half * d, global const half * dm, const int q5,
++                             ulong wrow0, int row0, int ne01, int nb, int ib) {
++#if MT <= 32
++    const int sb = ib >> 1, ch = ib & 1;
++    for (int rr = get_local_linear_id(); rr < MT; rr += NTHR) {
++        const int r = min(row0 + rr, ne01 - 1);
++        const ulong b = (wrow0 + r) * nb + sb;
++        const uint3 sw = vload3(0, (global const uint *)(s + b * 12));
++        float sc[4], mm[4];
++        #pragma unroll
++        for (int t = 0; t < 4; ++t) scale_min(sw, 4 * ch + t, &sc[t], &mm[t]);
++        const float D = vload_half(0, d + b), M = vload_half(0, dm + b);
++        half ha[4], nbv[4];
++        #pragma unroll
++        for (int t = 0; t < 4; ++t) { ha[t] = convert_half(D * sc[t]); nbv[t] = convert_half(-M * mm[t]); }
++        uint4 h0 = (uint4)(0), h1 = (uint4)(0);
++        if (q5) {
++            const uint8 hw = vload8(0, (global const uint *)(qh + b * 32));
++            h0 = (uint4)(hw.s0, hw.s1, hw.s2, hw.s3);
++            h1 = (uint4)(hw.s4, hw.s5, hw.s6, hw.s7);
++        }
++        #pragma unroll
++        for (int jj = 0; jj < 2; ++jj) {
++            const int j = 2 * ch + jj;
++            const uint8 ww = vload8(0, (global const uint *)(q + b * 128 + 32 * j));
++            const uint4 w0 = (uint4)(ww.s0, ww.s1, ww.s2, ww.s3);
++            const uint4 w1 = (uint4)(ww.s4, ww.s5, ww.s6, ww.s7);
++            const int k0 = 64 * jj;
++            put16(wt, rr, k0,      nib16(w0, 0, ha[2 * jj],     nbv[2 * jj],     h0, q5 ? 4 * ch + 2 * jj : -1));
++            put16(wt, rr, k0 + 16, nib16(w1, 0, ha[2 * jj],     nbv[2 * jj],     h1, q5 ? 4 * ch + 2 * jj : -1));
++            put16(wt, rr, k0 + 32, nib16(w0, 1, ha[2 * jj + 1], nbv[2 * jj + 1], h0, q5 ? 4 * ch + 2 * jj + 1 : -1));
++            put16(wt, rr, k0 + 48, nib16(w1, 1, ha[2 * jj + 1], nbv[2 * jj + 1], h1, q5 ? 4 * ch + 2 * jj + 1 : -1));
++        }
++    }
++#else
++    for (int u = get_local_linear_id(); u < MT * 2; u += NTHR) {
++        const int sb = ib >> 1, ch = ib & 1;
++        const int rr = u >> 1, jj = u & 1, j = 2 * ch + jj;
++        const int r = min(row0 + rr, ne01 - 1);
++        const ulong b = (wrow0 + r) * nb + sb;
++        const uint3 sw = vload3(0, (global const uint *)(s + b * 12));
++        float sc0, m0, sc1, m1;
++        scale_min(sw, 2 * j, &sc0, &m0);
++        scale_min(sw, 2 * j + 1, &sc1, &m1);
++        const float D = vload_half(0, d + b), M = vload_half(0, dm + b);
++        const float a0 = D * sc0, b0 = M * m0, a1 = D * sc1, b1 = M * m1;
++        const half ha0 = convert_half(a0), nb0 = convert_half(-b0);
++        const half ha1 = convert_half(a1), nb1 = convert_half(-b1);
++        const uint8 ww = vload8(0, (global const uint *)(q + b * 128 + 32 * j));
++        const uint4 w0 = (uint4)(ww.s0, ww.s1, ww.s2, ww.s3);
++        const uint4 w1 = (uint4)(ww.s4, ww.s5, ww.s6, ww.s7);
++        uint4 h0 = (uint4)(0), h1 = (uint4)(0);
++        if (q5) {
++            const uint8 hw = vload8(0, (global const uint *)(qh + b * 32));
++            h0 = (uint4)(hw.s0, hw.s1, hw.s2, hw.s3);
++            h1 = (uint4)(hw.s4, hw.s5, hw.s6, hw.s7);
++        }
++        const int k0 = 64 * jj;
++        put16(wt, rr, k0,      nib16(w0, 0, ha0, nb0, h0, q5 ? 2 * j : -1));
++        put16(wt, rr, k0 + 16, nib16(w1, 0, ha0, nb0, h1, q5 ? 2 * j : -1));
++        put16(wt, rr, k0 + 32, nib16(w0, 1, ha1, nb1, h0, q5 ? 2 * j + 1 : -1));
++        put16(wt, rr, k0 + 48, nib16(w1, 1, ha1, nb1, h1, q5 ? 2 * j + 1 : -1));
++    }
++#endif
++}
++#else
+ // Q4_K / Q5_K: unit (row r, pair j) = 64 weights, sub-blocks 2j and 2j+1
+ static inline void deq_q45_K(local half * wt, global const uchar * q, global const uchar * qh, global const uchar * s,
+                              global const half * d, global const half * dm, const int q5,
+@@ -192,8 +310,61 @@ static inline void deq_q45_K(local half * wt, global const uchar * q, global con
+         put16(wt, rr, 64 * j + 48, nib16(w1, 1, a1, b1, h1, q5 ? 2 * j + 1 : -1));
+     }
+ }
++#endif
+ 
+-// Q6_K: unit (row r, 32-block kb = part p of half n) = 32 weights
++// Q6_K: unit (row r, 32-block kb = part p of half n) = 32 weights; the chunk
++// holds blocks 4*ch..4*ch+3
++#if SG == 8
++static inline void deq_q6_K(local half * wt, global const uchar * ql, global const uchar * qh, global const char * s,
++                            global const half * d, ulong wrow0, int row0, int ne01, int nb, int ib) {
++#if MT <= 32
++    const int sb = ib >> 1, ch = ib & 1;
++    for (int rr = get_local_linear_id(); rr < MT; rr += NTHR) {
++        const int r = min(row0 + rr, ne01 - 1);
++        const ulong b = (wrow0 + r) * nb + sb;
++        const float D = vload_half(0, d + b);
++        #pragma unroll
++        for (int uu = 0; uu < 4; ++uu) {
++            const int kb = 4 * ch + uu;
++            const int n = kb >> 2, p = kb & 3;
++            const int is = 8 * n + 2 * p;
++            const float a0 = D * (float)s[b * 16 + is], a1 = D * (float)s[b * 16 + is + 1];
++            const half ha0 = convert_half(a0), off0 = convert_half(-32.f * a0);
++            const half ha1 = convert_half(a1), off1 = convert_half(-32.f * a1);
++            for (int hh = 0; hh < 2; ++hh) {
++                const uint4 w = vload4(0, (global const uint *)(ql + b * 128 + 64 * n + 32 * (p & 1) + 16 * hh));
++                const uint4 h = vload4(0, (global const uint *)(qh + b * 64 + 32 * n + 16 * hh));
++                const uint4 c = ((w >> (4 * (p >> 1))) & 0x0F0F0F0Fu) | (((h >> (2 * p)) & 0x03030303u) << 4);
++                const float16 v = fma(convert_float16(as_uchar16(c)),
++                                      (float16)(hh ? ha1 : ha0), (float16)(hh ? off1 : off0));
++                put16(wt, rr, 32 * uu + 16 * hh, v);
++            }
++        }
++    }
++#else
++    for (int u = get_local_linear_id(); u < MT * 4; u += NTHR) {
++        const int sb = ib >> 1, ch = ib & 1;
++        const int rr = u >> 2, kb = 4 * ch + (u & 3);
++        const int n = kb >> 2, p = kb & 3;
++        const int r = min(row0 + rr, ne01 - 1);
++        const ulong b = (wrow0 + r) * nb + sb;
++        const float D = vload_half(0, d + b);
++        const int is = 8 * n + 2 * p;
++        const float a0 = D * (float)s[b * 16 + is], a1 = D * (float)s[b * 16 + is + 1];
++        const half ha0 = convert_half(a0), off0 = convert_half(-32.f * a0);
++        const half ha1 = convert_half(a1), off1 = convert_half(-32.f * a1);
++        for (int hh = 0; hh < 2; ++hh) {
++            const uint4 w = vload4(0, (global const uint *)(ql + b * 128 + 64 * n + 32 * (p & 1) + 16 * hh));
++            const uint4 h = vload4(0, (global const uint *)(qh + b * 64 + 32 * n + 16 * hh));
++            const uint4 c = ((w >> (4 * (p >> 1))) & 0x0F0F0F0Fu) | (((h >> (2 * p)) & 0x03030303u) << 4);
++            const float16 v = fma(convert_float16(as_uchar16(c)),
++                                  (float16)(hh ? ha1 : ha0), (float16)(hh ? off1 : off0));
++            put16(wt, rr, 32 * (u & 3) + 16 * hh, v);
++        }
++    }
++#endif
++}
++#else
+ static inline void deq_q6_K(local half * wt, global const uchar * ql, global const uchar * qh, global const char * s,
+                             global const half * d, ulong wrow0, int row0, int ne01, int nb, int ib) {
+     for (int u = get_local_linear_id(); u < MT * 8; u += NTHR) {
+@@ -213,9 +384,40 @@ static inline void deq_q6_K(local half * wt, global const uchar * ql, global con
+         }
+     }
+ }
++#endif
+ 
+ // IQ3_XXS (98-byte blocks, 2-byte aligned at q + off): unit (row r, 32-block
+ // kb) = 32 weights (dequantize_row_iq3_xxs)
++#if SG == 8
++static inline void deq_iq3_xxs(local half * wt, global const uchar * q, ulong wrow0, int row0, int ne01, int nb, int ib) {
++    for (int u = get_local_linear_id(); u < MT * 4; u += NTHR) {
++        const int sb = ib >> 1, ch = ib & 1;
++        const int rr = u >> 2, kb = 4 * ch + (u & 3);
++        const int r = min(row0 + rr, ne01 - 1);
++        global const uchar * bp = q + ((wrow0 + r) * nb + sb) * 98;
++        global const ushort * h = (global const ushort *)bp;
++        const float d = vload_half(0, (global const half *)bp);
++        const ushort4 gi = vload4(0, h + 1 + 4 * kb);
++        const uint aux = (uint)h[1 + 32 + 2 * kb] | ((uint)h[1 + 32 + 2 * kb + 1] << 16);
++        const float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
++        const uchar idx[8] = { gi.s0 & 0xFF, gi.s0 >> 8, gi.s1 & 0xFF, gi.s1 >> 8,
++                               gi.s2 & 0xFF, gi.s2 >> 8, gi.s3 & 0xFF, gi.s3 >> 8 };
++        float v[32];
++        #pragma unroll
++        for (int l = 0; l < 4; ++l) {
++            const ulong m = ksigns64[(aux >> (7 * l)) & 127];
++            const uchar4 g1 = as_uchar4(iq3xxs_grid[idx[2 * l]]), g2 = as_uchar4(iq3xxs_grid[idx[2 * l + 1]]);
++            const uchar8 mb = as_uchar8(m);
++            v[8 * l + 0] = (mb.s0 ? -db : db) * g1.s0; v[8 * l + 1] = (mb.s1 ? -db : db) * g1.s1;
++            v[8 * l + 2] = (mb.s2 ? -db : db) * g1.s2; v[8 * l + 3] = (mb.s3 ? -db : db) * g1.s3;
++            v[8 * l + 4] = (mb.s4 ? -db : db) * g2.s0; v[8 * l + 5] = (mb.s5 ? -db : db) * g2.s1;
++            v[8 * l + 6] = (mb.s6 ? -db : db) * g2.s2; v[8 * l + 7] = (mb.s7 ? -db : db) * g2.s3;
++        }
++        put16(wt, rr, 32 * (u & 3),      vload16(0, v));
++        put16(wt, rr, 32 * (u & 3) + 16, vload16(1, v));
++    }
++}
++#else
+ static inline void deq_iq3_xxs(local half * wt, global const uchar * q, ulong wrow0, int row0, int ne01, int nb, int ib) {
+     for (int u = get_local_linear_id(); u < MT * 8; u += NTHR) {
+         const int rr = u >> 3, kb = u & 7;
+@@ -243,6 +445,7 @@ static inline void deq_iq3_xxs(local half * wt, global const uchar * q, ulong wr
+         put16(wt, rr, 32 * kb + 16, vload16(1, v));
+     }
+ }
++#endif
+ 
+ // 16 code bytes -> 32 values a * kvalue (low nibbles 0..15, high 16..31)
+ static inline void iq4_put32(local half * wt, int rr, int k0, uint4 qw, float a) {
+@@ -255,6 +458,20 @@ static inline void iq4_put32(local half * wt, int rr, int k0, uint4 qw, float a)
+ }
+ 
+ // IQ4_XS (136-byte blocks at q + off): unit (row r, 32-block kb)
++#if SG == 8
++static inline void deq_iq4_xs(local half * wt, global const uchar * q, ulong wrow0, int row0, int ne01, int nb, int ib) {
++    for (int u = get_local_linear_id(); u < MT * 4; u += NTHR) {
++        const int sb = ib >> 1, ch = ib & 1;
++        const int rr = u >> 2, kb = 4 * ch + (u & 3);
++        const int r = min(row0 + rr, ne01 - 1);
++        global const uchar * bp = q + ((wrow0 + r) * nb + sb) * 136;
++        const float d = vload_half(0, (global const half *)bp);
++        const uint sh = ((global const ushort *)bp)[1];
++        const int ls = ((bp[4 + kb / 2] >> (4 * (kb & 1))) & 0xF) | (((sh >> (2 * kb)) & 3) << 4);
++        iq4_put32(wt, rr, 32 * (u & 3), vload4(0, (global const uint *)(bp + 8 + 16 * kb)), d * (float)(ls - 32));
++    }
++}
++#else
+ static inline void deq_iq4_xs(local half * wt, global const uchar * q, ulong wrow0, int row0, int ne01, int nb, int ib) {
+     for (int u = get_local_linear_id(); u < MT * 8; u += NTHR) {
+         const int rr = u >> 3, kb = u & 7;
+@@ -266,9 +483,22 @@ static inline void deq_iq4_xs(local half * wt, global const uchar * q, ulong wro
+         iq4_put32(wt, rr, 32 * kb, vload4(0, (global const uint *)(bp + 8 + 16 * kb)), d * (float)(ls - 32));
+     }
+ }
++#endif
+ 
+ // IQ4_NL flat planes (16 code bytes, one half per 32 weights), rows of n32
+ // blocks: unit (row r, 32-block kb of super-block ib), those past K skipped
++#if SG == 8
++static inline void deq_iq4_nl(local half * wt, global const uchar * q, global const half * dp, ulong wrow0, int row0, int ne01, int n32, int ib) {
++    for (int u = get_local_linear_id(); u < MT * 4; u += NTHR) {
++        const int sb = ib >> 1, ch = ib & 1;
++        const int rr = u >> 2, kb = 4 * ch + (u & 3);
++        if (sb * 8 + kb >= n32) continue;
++        const int r = min(row0 + rr, ne01 - 1);
++        const ulong blk = (wrow0 + r) * n32 + sb * 8 + kb;
++        iq4_put32(wt, rr, 32 * (u & 3), vload4(0, (global const uint *)(q + blk * 16)), vload_half(blk, dp));
++    }
++}
++#else
+ static inline void deq_iq4_nl(local half * wt, global const uchar * q, global const half * dp, ulong wrow0, int row0, int ne01, int n32, int ib) {
+     for (int u = get_local_linear_id(); u < MT * 8; u += NTHR) {
+         const int rr = u >> 3, kb = u & 7;
+@@ -278,13 +508,55 @@ static inline void deq_iq4_nl(local half * wt, global const uchar * q, global co
+         iq4_put32(wt, rr, 32 * kb, vload4(0, (global const uint *)(q + blk * 16)), vload_half(blk, dp));
+     }
+ }
++#endif
+ 
+ // ---- the GEMM body. Per token group: the lane's column `tok` (an f16
+ // column of xh, any valid one when the lane has none) and its output byte
+ // offset in dst (`outp`, negative: none); `wrow0` is the weight matrix's
+ // first row (an expert's, for MUL_MAT_ID). ----
+ 
+-#define MM_BODY(DEQ)                                                                            \
++#if SG == 8
++#define MM_GEMM(DEQ)                                                                            \
++    local half wtbuf[2][MT * (QK_K / 2)];                                                       \
++    local half *wt;                                                                             \
++    const int sgid = get_sub_group_id();                                                        \
++    const int sm = sgid % NSGM;                                                                 \
++    /* super-blocks of 256, each in two 128-weight chunks */                                     \
++    const int nb = (ne00 + QK_K - 1) / QK_K;                                                    \
++    const int nch = 2 * nb;                                                                     \
++    float8 acc[RG][TG];                                                                         \
++    _Pragma("unroll")                                                                           \
++    for (int rg = 0; rg < RG; ++rg)                                                             \
++        _Pragma("unroll")                                                                       \
++        for (int tg = 0; tg < TG; ++tg) acc[rg][tg] = (float8)(0.f);                            \
++    wt = wtbuf[0];                                                                              \
++    { const int ib = 0; DEQ; }                                                                  \
++    for (int c = 0; c < nch; ++c) {                                                             \
++        const int sb = c >> 1, ch = c & 1;                                                      \
++        barrier(CLK_LOCAL_MEM_FENCE);                                                           \
++        wt = wtbuf[c & 1];                                                                      \
++        if (active) {                                                                           \
++            const int kbase = ch * (QK_K / 2);                                                  \
++            const int kmax = min(8, (ne00 - sb * QK_K - kbase) / 16);                           \
++            _Pragma("unroll 4")                                                                 \
++            for (int kk = 0; kk < kmax; ++kk) {                                                 \
++                int8 bv[TG];                                                                    \
++                _Pragma("unroll")                                                               \
++                for (int tg = 0; tg < TG; ++tg)                                                 \
++                    bv[tg] = as_int8(vload8(0, (global const uint *)(xh + (ulong)tok[tg] * ne00 + sb * QK_K + kbase + kk * 16))); \
++                _Pragma("unroll")                                                               \
++                for (int rg = 0; rg < RG; ++rg) {                                               \
++                    const a8_t a = LOAD_A(wt + ((sm * RG + rg) * 8 + kk) * 128);                \
++                    _Pragma("unroll")                                                           \
++                    for (int tg = 0; tg < TG; ++tg) acc[rg][tg] = DPAS(a, bv[tg], acc[rg][tg]); \
++                }                                                                               \
++            }                                                                                   \
++        }                                                                                       \
++        if (c + 1 < nch) { const int ib = c + 1; wt = wtbuf[(c + 1) & 1]; DEQ; }                \
++    }                                                                                           \
++    const int r_sg = row0 + sm * RG * 8;
++#else
++#define MM_GEMM(DEQ)                                                                            \
+     local half wt[MT * QK_K];                                                                   \
+     const int sgid = get_sub_group_id();                                                        \
+     const int sm = sgid % NSGM;                                                                 \
+@@ -316,7 +588,10 @@ static inline void deq_iq4_nl(local half * wt, global const uchar * q, global co
+             }                                                                                   \
+         }                                                                                       \
+     }                                                                                           \
+-    const int r_sg = row0 + sm * RG * 8;                                                        \
++    const int r_sg = row0 + sm * RG * 8;
++#endif
++#define MM_BODY(DEQ)                                                                            \
++    MM_GEMM(DEQ)                                                                                \
+     _Pragma("unroll")                                                                           \
+     for (int tg = 0; tg < TG; ++tg) {                                                           \
+         if (outp[tg] < 0) continue;                                                             \
+@@ -358,21 +633,21 @@ __attribute__((intel_reqd_sub_group_size(SG)))
+ kernel void kernel_mul_mm_q4_K_f16(global const uchar * q, global const uchar * s, global const half * d,
+                                    global const half * dm, PLAIN_ARGS) {
+     PLAIN_COLS
+-    MM_BODY(deq_q45_K(wt, q, q, s, d, dm, 0, wrow0, row0, ne01, nb, ib))
++    MM_BODY(deq_q45_K(wt, q, q, s, d, dm, 0, wrow0, row0, ne01 , nb, ib))
+ }
+ 
+ __attribute__((intel_reqd_sub_group_size(SG)))
+ kernel void kernel_mul_mm_q5_K_f16(global const uchar * q, global const uchar * qh, global const uchar * s,
+                                    global const half * d, global const half * dm, PLAIN_ARGS) {
+     PLAIN_COLS
+-    MM_BODY(deq_q45_K(wt, q, qh, s, d, dm, 1, wrow0, row0, ne01, nb, ib))
++    MM_BODY(deq_q45_K(wt, q, qh, s, d, dm, 1, wrow0, row0, ne01 , nb, ib))
+ }
+ 
+ __attribute__((intel_reqd_sub_group_size(SG)))
+ kernel void kernel_mul_mm_q6_K_f16(global const uchar * ql, global const uchar * qh, global const char * s,
+                                    global const half * d, PLAIN_ARGS) {
+     PLAIN_COLS
+-    MM_BODY(deq_q6_K(wt, ql, qh, s, d, wrow0, row0, ne01, nb, ib))
++    MM_BODY(deq_q6_K(wt, ql, qh, s, d, wrow0, row0, ne01 , nb, ib))
+ }
+ 
+ // ---- MUL_MAT_ID routing: the (token, slot) pairs sorted by expert and cut
+@@ -445,21 +720,21 @@ __attribute__((intel_reqd_sub_group_size(SG)))
+ kernel void kernel_mul_mm_id_q4_K_f16(global const uchar * q, global const uchar * s, global const half * d,
+                                       global const half * dm, ID_ARGS) {
+     ID_COLS
+-    MM_BODY(deq_q45_K(wt, q, q, s, d, dm, 0, wrow0, row0, ne01, nb, ib))
++    MM_BODY(deq_q45_K(wt, q, q, s, d, dm, 0, wrow0, row0, ne01 , nb, ib))
+ }
+ 
+ __attribute__((intel_reqd_sub_group_size(SG)))
+ kernel void kernel_mul_mm_id_q5_K_f16(global const uchar * q, global const uchar * qh, global const uchar * s,
+                                       global const half * d, global const half * dm, ID_ARGS) {
+     ID_COLS
+-    MM_BODY(deq_q45_K(wt, q, qh, s, d, dm, 1, wrow0, row0, ne01, nb, ib))
++    MM_BODY(deq_q45_K(wt, q, qh, s, d, dm, 1, wrow0, row0, ne01 , nb, ib))
+ }
+ 
+ __attribute__((intel_reqd_sub_group_size(SG)))
+ kernel void kernel_mul_mm_id_q6_K_f16(global const uchar * ql, global const uchar * qh, global const char * s,
+                                       global const half * d, ID_ARGS) {
+     ID_COLS
+-    MM_BODY(deq_q6_K(wt, ql, qh, s, d, wrow0, row0, ne01, nb, ib))
++    MM_BODY(deq_q6_K(wt, ql, qh, s, d, wrow0, row0, ne01 , nb, ib))
+ }
+ 
+ // ---- IQ3_XXS, IQ4_XS (blocks as stored, at q + offq) and IQ4_NL (flat
+@@ -468,13 +743,13 @@ kernel void kernel_mul_mm_id_q6_K_f16(global const uchar * ql, global const ucha
+ __attribute__((intel_reqd_sub_group_size(SG)))
+ kernel void kernel_mul_mm_iq3_xxs_f16(global const uchar * q, ulong offq, global const half * dp, PLAIN_ARGS) {
+     PLAIN_COLS
+-    MM_BODY(deq_iq3_xxs(wt, q + offq, wrow0, row0, ne01, nb, ib))
++    MM_BODY(deq_iq3_xxs(wt, q + offq, wrow0, row0, ne01 , nb, ib))
+ }
+ 
+ __attribute__((intel_reqd_sub_group_size(SG)))
+ kernel void kernel_mul_mm_iq4_xs_f16(global const uchar * q, ulong offq, global const half * dp, PLAIN_ARGS) {
+     PLAIN_COLS
+-    MM_BODY(deq_iq4_xs(wt, q + offq, wrow0, row0, ne01, nb, ib))
++    MM_BODY(deq_iq4_xs(wt, q + offq, wrow0, row0, ne01 , nb, ib))
+ }
+ 
+ __attribute__((intel_reqd_sub_group_size(SG)))
+@@ -486,13 +761,13 @@ kernel void kernel_mul_mm_iq4_nl_f16(global const uchar * q, ulong offq, global
+ __attribute__((intel_reqd_sub_group_size(SG)))
+ kernel void kernel_mul_mm_id_iq3_xxs_f16(global const uchar * q, ulong offq, global const half * dp, ID_ARGS) {
+     ID_COLS
+-    MM_BODY(deq_iq3_xxs(wt, q + offq, wrow0, row0, ne01, nb, ib))
++    MM_BODY(deq_iq3_xxs(wt, q + offq, wrow0, row0, ne01 , nb, ib))
+ }
+ 
+ __attribute__((intel_reqd_sub_group_size(SG)))
+ kernel void kernel_mul_mm_id_iq4_xs_f16(global const uchar * q, ulong offq, global const half * dp, ID_ARGS) {
+     ID_COLS
+-    MM_BODY(deq_iq4_xs(wt, q + offq, wrow0, row0, ne01, nb, ib))
++    MM_BODY(deq_iq4_xs(wt, q + offq, wrow0, row0, ne01 , nb, ib))
+ }
+ 
+ __attribute__((intel_reqd_sub_group_size(SG)))

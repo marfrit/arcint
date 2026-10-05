@@ -10,7 +10,7 @@
 > NInfer philosophy (specialize, then be honest about numbers), Intel
 > substrate.
 
-## Status (0.5.10)
+## Status (0.5.11)
 
 Runtime floor: marfrit-openvino +p25 = OpenVINO upstream commit 71640275 (the
 2026.4.0 nightly of 2026-08-21) + patches 0003-0074
