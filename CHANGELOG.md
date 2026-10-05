@@ -17,6 +17,34 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.5.12 — 2026-10-05
+
+**Runtime:** `marfrit-openvino +p25` remains the floor.
+
+Context checkpoints on the libllama engine (`--llama-checkpoints N`,
+`--llama-checkpoint-step T`, defaults 32 and 8192; `docs/llama-engine.md`).
+A hybrid model's recurrent state cannot be cut back, so a request sharing
+only part of a lane's tokens used to re-prefill from 0. Two common cases:
+a follow-up after a thinking turn (the template drops the reply's think
+block) and an edited message. Lanes now keep checkpoints where llama.cpp's
+server takes them: at the last user message, and 4 and 4 + n_ubatch tokens
+before the prompt's end. Only hybrid and recurrent models take them.
+
+Measured on a 24.3k-token conversation, thinking on, T=0 (`measured-here`):
+- **Dense 27B, B60, MTP:** a follow-up prefills in 0.61 s instead of
+  38.75 s, an edited question in 0.48 s instead of 38.73 s. Taking the
+  checkpoints costs about 2 % on the first turn.
+- **Coder, A770, the production flags:** 34.06 -> 0.54 s and 34.06 ->
+  0.48 s.
+- **Memory:** a checkpoint is 149.6 MiB on the dense 27B, 62.8 MiB on the
+  coder, in host RAM; at most 32 a lane.
+- **Quality:** the answers were right in every arm. Against a full re-prefill
+  with the same batch layout, the thinking and answer text were
+  byte-identical. A mutant that restored the wrong state diverged.
+
+The coder service now runs this engine with a searched GGUF (98,304 tokens
+on the A770, acceptance 10/10; `docs/llama-engine.md`).
+
 ## 0.5.11 — 2026-10-05
 
 **Runtime:** `marfrit-openvino +p25` remains the floor.

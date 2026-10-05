@@ -1,3 +1,13 @@
+arcint (0.5.12-1) trixie; urgency=medium
+
+  * 0.5.12: llama.cpp server's context checkpoints on the libllama engine
+    (--llama-checkpoints, on by default for hybrid models): a follow-up
+    after a thinking turn or an edited message resumes instead of
+    re-prefilling (24.3k tokens: 38.75 -> 0.61 s on the B60, 34.06 ->
+    0.54 s on the A770). Runtime floor unchanged at marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Mon, 05 Oct 2026 21:30:00 +0200
+
 arcint (0.5.11-1) trixie; urgency=medium
 
   * 0.5.11: the libllama engine's prompt attention and K-quant GEMM on the

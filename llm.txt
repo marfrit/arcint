@@ -13,7 +13,7 @@
 
 ## Status
 
-Release 0.5.11 (2026-10-05). Runtime dependency: marfrit-openvino +p25, the
+Release 0.5.12 (2026-10-05). Runtime dependency: marfrit-openvino +p25, the
 pinned OpenVINO nightly 71640275 with patches 0003-0074
 (contrib/packaging/marfrit-openvino/patches/); +p27 (0076-0077) for the
 Flash-Next tier's opt-in switches MOE_CPU_TIER_ADAPTIVE and MOE_DOORBELL.
