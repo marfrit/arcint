@@ -17,6 +17,35 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.5.10 — 2026-10-05
+
+**Runtime:** `marfrit-openvino +p25` remains the floor.
+
+The libllama engine's attention on the Arc Pro B60 (`contrib/llama.cpp`,
+patches 0018 and 0019; `docs/campaigns/kernel-autotune-ga.md`). Measured on
+the B60 with the dense 27B Q4_K_M and q8_0 KV (`measured-here`):
+
+- **0018, decode / MTP verify, from a structural search:** the two sides
+  of an 8-row tile split Q K^T and exchange S through local memory. The
+  kernel's own split size is 512 keys.
+- **0019, both kernels as two LLM mutation agents rewrote them overnight:**
+  - the prompt kernel keeps Q in registers and shares one local buffer
+    between K and V (96 KB -> 16 KB a work-group);
+  - the verify kernel stages quantized K and V 64 values a work-item.
+- **Gains, each pair measured in one run** (32k deep, llama-bench):
+  - prompt chunk pp512: 297 -> 429 t/s. 0018 leaves it unchanged, so this
+    is 0019's gain;
+  - 6 rows, 0.5.9 -> 0018: 52.6 -> 64.2 t/s;
+  - 6 rows, 0018 -> 0019: 64.2 -> 71.2 t/s;
+  - 8 rows: 62.1 -> 78.5 -> 87.3 t/s.
+- **Served, 0018 -> 0019:** a 62.6k-token prompt prefills at 287 -> 408
+  t/s, and the answer decodes at 18.7 -> 21.6 t/s.
+- **Quality:** KL is within 0.00014 nats of the previous kernels'. The
+  acceptance task gives the same score on both arms of each A/B (8/10 at T=0
+  in the 0019 window).
+- On the A770 nothing changes: its sub-group-8 prompt kernel builds
+  byte-identical binaries, and it does not build the GQA kernel.
+
 ## 0.5.9 — 2026-10-04
 
 **Runtime:** `marfrit-openvino +p25` remains the floor.

@@ -1,3 +1,14 @@
+arcint (0.5.10-1) trixie; urgency=medium
+
+  * 0.5.10: the libllama engine's attention kernels on the Arc Pro B60
+    (llama.cpp patches 0018, 0019): the decode / MTP-verify kernel splits
+    QK^T across the sides of a tile and stages quantized K and V 64 values a
+    work-item; the prompt kernel keeps Q in registers and shares one local
+    buffer between K and V. Served at 62.6k tokens: prefill 287 -> 408 t/s,
+    decode 18.7 -> 21.6 t/s. Runtime floor unchanged at marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Mon, 05 Oct 2026 08:00:00 +0200
+
 arcint (0.5.9-1) trixie; urgency=medium
 
   * 0.5.9: min-p sampling (--min-p, request field min_p); <thinking> and
