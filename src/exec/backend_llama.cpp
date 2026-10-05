@@ -13,7 +13,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <minja/chat-template.hpp>
@@ -122,6 +124,15 @@ private:
 };
 
 class LlamaBackend final : public Backend {
+    // A context checkpoint (--llama-checkpoints): what a lane holds after
+    // n_tokens tokens
+    struct Checkpoint {
+        size_t               n_tokens = 0;
+        uint64_t             req      = 0;   // the prefill that made it
+        std::vector<uint8_t> state;          // the memory's PARTIAL_ONLY state
+        std::vector<float>   dft_row;        // the drafter's carried row, --llama-mtp
+    };
+
 public:
     LlamaBackend(const Config& cfg, int n_ctx) {
         std::string card;
@@ -219,6 +230,15 @@ public:
         }
         status_.mtp_enabled = n_draft_ > 0;
         slot_tokens_.resize(static_cast<size_t>(lanes_));
+        // context checkpoints only where llama.cpp makes them: a memory that
+        // cannot remove a partial sequence (recurrent, or the recurrent part
+        // of a hybrid). An attention-only cache trims, and its PARTIAL_ONLY
+        // state would be the whole KV
+        ckpt_max_  = cfg.llama_checkpoints;
+        ckpt_step_ = static_cast<size_t>(std::max(cfg.llama_checkpoint_step, 1));
+        ckpt_on_   = ckpt_max_ > 0 && (llama_model_is_hybrid(model_) || llama_model_is_recurrent(model_));
+        n_ubatch_  = static_cast<int>(cp.n_ubatch);
+        ckpts_.resize(static_cast<size_t>(lanes_));
 
         const char* tmpl = llama_model_chat_template(model_, nullptr);
         if (tmpl == nullptr) throw std::runtime_error(log::format("%s carries no chat template", cfg.gguf_path.c_str()));
@@ -226,6 +246,11 @@ public:
         const char* bos = llama_vocab_get_text(vocab_, llama_vocab_bos(vocab_));
         const char* eos = llama_vocab_get_text(vocab_, llama_vocab_eos(vocab_));
         template_ = std::make_unique<minja::chat_template>(template_src_, bos ? bos : "", eos ? eos : "");
+        if (ckpt_on_) {
+            user_start_ = tokenizer_->encode(user_start_text());
+            log::info("load", "context checkpoints: up to %d a lane, %zu tokens apart, user messages %s", ckpt_max_,
+                      ckpt_step_, user_start_.empty() ? "not found in the template" : "found");
+        }
 
         char desc[128] = {};
         llama_model_desc(model_, desc, sizeof(desc));
@@ -315,26 +340,34 @@ public:
         {
             std::lock_guard<std::mutex> lk(mu_);
             // The longest prefix this lane still holds is reused; one token is
-            // always run, for its logits. A recurrent state cannot step back,
-            // so where llama.cpp refuses the partial removal the lane starts over.
+            // always run, for its logits. A recurrent state cannot step back:
+            // where llama.cpp refuses the partial removal the lane resumes from
+            // its newest checkpoint inside the prefix, else it starts over.
             size_t common = 0;
             while (common < have.size() && common < prompt.size() && have[common] == prompt[common]) ++common;
             if (common == prompt.size()) --common;
             llama_memory_t mem = llama_get_memory(ctx_);
             if (common < have.size() && !llama_memory_seq_rm(mem, seq, static_cast<llama_pos>(common), -1)) {
-                llama_memory_seq_rm(mem, seq, -1, -1);
-                common = 0;
+                const Checkpoint* c = restore_ckpt_locked(seq, common);
+                if (c != nullptr && llama_memory_seq_rm(mem, seq, static_cast<llama_pos>(c->n_tokens), -1)) {
+                    common = c->n_tokens;
+                } else {
+                    llama_memory_seq_rm(mem, seq, -1, -1);
+                    common = 0;
+                }
             }
+            drop_ckpts_after_locked(seq, common);
             have.resize(common);
             stats.cache_hit_tokens = static_cast<int>(common);
-            for (size_t at = common; at < prompt.size(); at += static_cast<size_t>(n_batch_)) {
-                const size_t n    = std::min(prompt.size() - at, static_cast<size_t>(n_batch_));
-                const bool   last = at + n == prompt.size();
-                if (!decode_locked(seq, prompt.data() + at, n, at, last))
-                    throw std::runtime_error("llama_decode failed during prefill");
-                have.insert(have.end(), prompt.begin() + static_cast<long>(at),
-                            prompt.begin() + static_cast<long>(at + n));
-            }
+            // all but the last token, checkpointed along the way; the last
+            // runs alone, for its logits
+            const size_t n_pre = prompt.size() - 1;
+            prefill_locked(seq, prompt, common, n_pre, have, [&](const int* t, size_t n, size_t at) {
+                return decode_locked(seq, t, n, at, false);
+            });
+            if (!decode_locked(seq, &prompt.back(), 1, n_pre, true))
+                throw std::runtime_error("llama_decode failed during prefill");
+            have.push_back(prompt.back());
             copy_logits_locked(logits);
         }
         stats.prefill_seconds = seconds_since(t_prefill);
@@ -398,9 +431,46 @@ private:
             // leave the lane holding tokens `have` does not record: start over
             std::lock_guard<std::mutex> lk(mu_);
             slot_tokens_[static_cast<size_t>(seq)].clear();
+            ckpts_[static_cast<size_t>(seq)].clear();
             spec_->seq_rm(seq, 0);
             spec_->reset(seq);
             throw;
+        }
+    }
+
+    // The text that opens a user message after an assistant reply (ChatML:
+    // "<|im_start|>user"), from the template by difference, as llama.cpp's
+    // autoparser finds its user_start: what stands between a reply and the
+    // next user message, less what ends a reply. Empty when the template
+    // renders neither.
+    std::string user_start_text() const {
+        static const char* u1 = "ARCINTPROBEUSERONE";
+        static const char* a1 = "ARCINTPROBEREPLYONE";
+        static const char* u2 = "ARCINTPROBEUSERTWO";
+        try {
+            minja::chat_template_options opts;
+            opts.apply_polyfills = false;
+            const json m_u1{{"role", "user"}, {"content", u1}}, m_a1{{"role", "assistant"}, {"content", a1}};
+            minja::chat_template_inputs two, three;
+            two.messages              = json::array({m_u1, m_a1});
+            three.messages            = json::array({m_u1, m_a1, json{{"role", "user"}, {"content", u2}}});
+            two.add_generation_prompt = three.add_generation_prompt = false;
+            const std::string r2 = template_->apply(two, opts), r3 = template_->apply(three, opts);
+            const size_t e2 = r2.rfind(a1), e3 = r3.find(a1), s3 = r3.rfind(u2);
+            if (e2 == std::string::npos || e3 == std::string::npos || s3 == std::string::npos) return {};
+            const std::string end = r2.substr(e2 + std::strlen(a1));
+            std::string       mid = r3.substr(e3 + std::strlen(a1), s3 - e3 - std::strlen(a1));
+            size_t k = 0;
+            while (k < end.size() && k < mid.size() && end[k] == mid[k]) ++k;
+            mid.erase(0, k);
+            // trimmed, as llama.cpp's detect_user_start_marker: a trailing
+            // newline or space would tokenize with the message's first
+            // characters and miss it
+            const auto ws = " \t\r\n";
+            const size_t a = mid.find_first_not_of(ws), b = mid.find_last_not_of(ws);
+            return a == std::string::npos ? std::string{} : mid.substr(a, b - a + 1);
+        } catch (const std::exception&) {
+            return {};
         }
     }
 
@@ -445,19 +515,25 @@ private:
             size_t common = 0;
             while (common < have.size() && common < n_pre && have[common] == prompt[common]) ++common;
             if (common < have.size()) {
-                // a rollback the target refuses (one is already pending)
-                // clears the lane; the drafter keeps what stands below the cut
+                // where the target's recurrent state cannot step back to the
+                // cut, it resumes from its newest checkpoint inside the prefix
+                // (llama.cpp leaves the memory untouched when it refuses);
+                // without one, or if the drafter's cut is refused, the lane
+                // clears. The drafter keeps what stands below the cut.
+                const Checkpoint* c = nullptr;
+                if (!llama_memory_seq_rm(llama_get_memory(ctx_), seq, static_cast<llama_pos>(common), -1)) {
+                    c      = restore_ckpt_locked(seq, common);
+                    common = c != nullptr ? c->n_tokens : 0;
+                }
                 if (!spec_->seq_rm(seq, common)) common = 0;
+                else if (c != nullptr) spec_->set_carried_row(seq, common, c->dft_row);
             }
+            drop_ckpts_after_locked(seq, common);
             have.resize(common);
             stats.cache_hit_tokens = static_cast<int>(common);
-            for (size_t at = common; at < n_pre; at += static_cast<size_t>(n_batch_)) {
-                const size_t n = std::min(n_pre - at, static_cast<size_t>(n_batch_));
-                if (spec_->decode(prompt.data() + at, n, at, seq, false) != 0)
-                    throw std::runtime_error("llama_decode failed during prefill");
-                have.insert(have.end(), prompt.begin() + static_cast<long>(at),
-                            prompt.begin() + static_cast<long>(at + n));
-            }
+            prefill_locked(seq, prompt, common, n_pre, have, [&](const int* t, size_t n, size_t at) {
+                return spec_->decode(t, n, at, seq, false) == 0;
+            });
         }
         stats.prefill_seconds = seconds_since(t_prefill);
 
@@ -537,6 +613,134 @@ private:
         return reason;
     }
 
+    // Prompt tokens [from, to) of `seq` in batches, appended to `have`, with
+    // checkpoints where llama.cpp's server makes them
+    // (tools/server/server-context.cpp at the pin): at the start of a batch
+    // that begins the last user message, a user message more than
+    // --llama-checkpoint-step tokens past the lane's newest checkpoint, or
+    // 4 + n_ubatch and 4 tokens before the prompt's end, the batches broken
+    // there. A follow-up whose template re-renders the reply (the generation
+    // prompt's think block dropped) shares the prompt up to a few tokens
+    // before its end; an edited message, up to that message's start. Caller
+    // holds mu_.
+    template <class Decode>
+    void prefill_locked(int seq, const std::vector<int>& prompt, size_t from, size_t to, std::vector<int>& have,
+                        Decode&& decode) {
+        const bool   ckpt = ckpt_on_;
+        const size_t P    = prompt.size();
+        const size_t nub  = static_cast<size_t>(n_ubatch_);
+        ++ckpt_req_;
+        std::vector<size_t> users;   // the user messages' first tokens
+        if (ckpt && !user_start_.empty())
+            for (size_t i = 0; i + user_start_.size() <= P; ++i)
+                if (std::equal(user_start_.begin(), user_start_.end(), prompt.begin() + static_cast<long>(i)))
+                    users.push_back(i);
+        const size_t last_user = users.empty() ? SIZE_MAX : users.back();
+        std::vector<size_t> ends;    // 4 + n_ubatch and 4 before the end (llama.cpp's checkpoint_offsets)
+        for (size_t off : {4 + nub, size_t{4}}) {
+            const size_t n_last = std::min(static_cast<size_t>(n_batch_), off);
+            if (P > n_last) ends.push_back(P - n_last);
+        }
+        const auto& list   = ckpts_[static_cast<size_t>(seq)];
+        auto newest        = [&] { return list.empty() ? size_t{0} : list.back().n_tokens; };
+        auto is_user       = [&](size_t at) { return std::binary_search(users.begin(), users.end(), at); };
+        // where a batch stops early: a user start the checkpoint rule takes, or an end offset
+        auto breaks_at     = [&](size_t at) {
+            if (!ckpt) return false;
+            if (is_user(at) && (at == last_user || list.empty() || at > newest() + ckpt_step_)) return true;
+            return std::find(ends.begin(), ends.end(), at) != ends.end();
+        };
+        for (size_t at = from; at < to;) {
+            size_t e = std::min(to, at + static_cast<size_t>(n_batch_));
+            for (size_t i = at + 1; i < e; ++i)
+                if (breaks_at(i)) {
+                    e = i;
+                    break;
+                }
+            if (ckpt && at > 0) {
+                // llama.cpp: a mid-prompt batch only when it starts a user
+                // message or ends within a ubatch of the prompt's end; then
+                // not within the step of the newest, unless it is the last
+                // user message or near the end
+                const bool near_end = P < e + nub;
+                const bool last_one = e == to;
+                bool       take     = last_one || is_user(at) || near_end;
+                take = take && (list.empty() || at == last_user || near_end || at > newest() + ckpt_step_);
+                if (take) save_ckpt_locked(seq, at);
+            }
+            if (!decode(prompt.data() + at, e - at, at))
+                throw std::runtime_error("llama_decode failed during prefill");
+            have.insert(have.end(), prompt.begin() + static_cast<long>(at), prompt.begin() + static_cast<long>(e));
+            at = e;
+        }
+    }
+
+    // A checkpoint of what `seq` holds after n_tokens tokens: only the part of
+    // the memory llama.cpp cannot roll back (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY:
+    // a hybrid model's recurrent state), in host memory, with the drafter's
+    // carried row. At most --llama-checkpoints; when full, llama.cpp's
+    // eviction: first the ones within the step of an earlier one that an
+    // earlier request made, then the oldest. One already at n_tokens is kept
+    // (the lane's tokens below it are unchanged, so is its state). Caller
+    // holds mu_.
+    void save_ckpt_locked(int seq, size_t n_tokens) {
+        auto& list = ckpts_[static_cast<size_t>(seq)];
+        while (!list.empty() && list.back().n_tokens > n_tokens) list.pop_back();
+        if (!list.empty() && list.back().n_tokens == n_tokens) {
+            list.back().req = ckpt_req_;   // as llama.cpp's supersede: the current request's now
+            return;
+        }
+        Checkpoint c;
+        c.n_tokens = n_tokens;
+        c.req      = ckpt_req_;
+        const size_t size = llama_state_seq_get_size_ext(ctx_, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (size == 0) return;
+        c.state.resize(size);
+        if (llama_state_seq_get_data_ext(ctx_, c.state.data(), size, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != size) {
+            log::warn("slot", "lane %d: checkpoint at %zu tokens failed", seq, n_tokens);
+            return;
+        }
+        if (spec_) c.dft_row = spec_->carried_row(seq, n_tokens);
+        size_t last = SIZE_MAX;   // the condition re-checked each step: only as many as make room
+        for (auto it = list.begin(); list.size() + 1 >= static_cast<size_t>(ckpt_max_) && it != list.end();) {
+            if (it->req != ckpt_req_ && last != SIZE_MAX && it->n_tokens <= last + ckpt_step_) {
+                it = list.erase(it);
+                continue;
+            }
+            last = it->n_tokens;
+            ++it;
+        }
+        while (!list.empty() && list.size() >= static_cast<size_t>(ckpt_max_)) list.erase(list.begin());
+        log::verbose("slot", "lane %d: checkpoint at %zu tokens (%.1f MiB), %zu kept", seq, n_tokens,
+                     static_cast<double>(size) / (1u << 20), list.size() + 1);
+        list.push_back(std::move(c));
+    }
+
+    // Loads the newest checkpoint of `seq` at or below `limit` tokens; null
+    // when there is none or loading failed (the state is then undefined and
+    // the caller clears the sequence). Caller holds mu_.
+    const Checkpoint* restore_ckpt_locked(int seq, size_t limit) {
+        const auto& list = ckpts_[static_cast<size_t>(seq)];
+        for (auto it = list.rbegin(); it != list.rend(); ++it) {
+            if (it->n_tokens > limit) continue;
+            if (llama_state_seq_set_data_ext(ctx_, it->state.data(), it->state.size(), seq,
+                                             LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != it->state.size()) {
+                log::warn("slot", "lane %d: loading the checkpoint at %zu tokens failed", seq, it->n_tokens);
+                return nullptr;
+            }
+            log::info("slot", "lane %d resumes from its checkpoint at %zu tokens (%.1f MiB)", seq, it->n_tokens,
+                      static_cast<double>(it->state.size()) / (1u << 20));
+            return &*it;
+        }
+        return nullptr;
+    }
+
+    // Checkpoints past `n` tokens no longer describe the lane. Caller holds mu_.
+    void drop_ckpts_after_locked(int seq, size_t n) {
+        auto& list = ckpts_[static_cast<size_t>(seq)];
+        while (!list.empty() && list.back().n_tokens > n) list.pop_back();
+    }
+
     bool is_stop(const SamplerParams& sp, int tok) const {
         if (!sp.ignore_eos && llama_vocab_is_eog(vocab_, tok)) return true;
         return std::find(sp.stop_token_ids.begin(), sp.stop_token_ids.end(), tok) != sp.stop_token_ids.end();
@@ -585,6 +789,15 @@ private:
     std::vector<std::vector<int>>         slot_tokens_;
     std::unique_ptr<LlamaSpec>            spec_;      // --llama-mtp
     int                                   n_draft_ = 0;
+    // --llama-checkpoints: per lane, the recurrent state at token counts the
+    // lane's tokens still match, oldest first
+    std::vector<std::vector<Checkpoint>>  ckpts_;
+    bool                                  ckpt_on_   = false;   // a hybrid or recurrent model, N > 0
+    int                                   ckpt_max_  = 32;
+    size_t                                ckpt_step_ = 8192;
+    uint64_t                              ckpt_req_  = 0;
+    std::vector<int>                      user_start_;   // a user message's first tokens
+    int                                   n_ubatch_  = 512;
 };
 
 }  // namespace

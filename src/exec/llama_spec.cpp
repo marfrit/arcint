@@ -388,6 +388,22 @@ public:
         return true;
     }
 
+    std::vector<float> carried_row(int seq, size_t n) const override {
+        const Lane& ln = lanes_[static_cast<size_t>(seq)];
+        if (ln.pending <= 0 || ln.base + static_cast<size_t>(ln.pending) != n) return {};
+        const auto at = ln.rows.begin() + static_cast<long>(static_cast<size_t>(ln.pending - 1) * static_cast<size_t>(n_embd_));
+        return std::vector<float>(at, at + n_embd_);
+    }
+
+    void set_carried_row(int seq, size_t n, const std::vector<float>& row) override {
+        if (n == 0 || row.size() != static_cast<size_t>(n_embd_)) return;
+        Lane& ln   = lanes_[static_cast<size_t>(seq)];
+        ln.rows    = row;
+        ln.next.clear();
+        ln.base    = n - 1;
+        ln.pending = 1;
+    }
+
 private:
     // per sequence: target rows waiting for the tokens that follow them --
     // row i of position base + i, followed by next[i] (the last by the token

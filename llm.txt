@@ -10,7 +10,7 @@
 > NInfer philosophy (specialize, then be honest about numbers), Intel
 > substrate.
 
-## Status (0.5.11)
+## Status (0.5.12)
 
 Runtime floor: marfrit-openvino +p25 = OpenVINO upstream commit 71640275 (the
 2026.4.0 nightly of 2026-08-21) + patches 0003-0074
@@ -18,8 +18,9 @@ Runtime floor: marfrit-openvino +p25 = OpenVINO upstream commit 71640275 (the
 (0076-0077) for the Flash-Next tier's opt-in switches MOE_CPU_TIER_ADAPTIVE
 and MOE_DOORBELL.
 
-Two engines (README "Two engines"): OpenVINO (default; the coder service)
-and libllama (--engine llama --gguf, the agent service from 0.5.6: llama.cpp
+Two engines (README "Two engines"): OpenVINO (default; Flash-Next, the
+coder's way back) and libllama (--engine llama --gguf, the agent service
+from 0.5.6, the coder service from 2026-10-05: llama.cpp
 bed0a85 with contrib/llama.cpp/patches 0001-0017, ggml's OpenCL backend,
 arcint's Intel kernels; MTP from the GGUF's own head; --llama-kv q8_0 or
 q8_0:q4_0 quantizes its KV cache). libllama, measured-here:
@@ -27,16 +28,26 @@ q8_0:q4_0 quantizes its KV cache). libllama, measured-here:
 - dense 27B (B60): decode 52.6 t/s with 5 drafts, prefill 935 t/s at 4k.
 
 With MTP and an 8:8 KV cache the dense model serves 131,072 tokens on the
-B60. The coder's Q4_K_M weights leave it ~16k on the A770, and two IQ3_XXS
-coder mixes that fit 98,304 miss the top-1 bar, so the coder stays on
-OpenVINO. The libllama engine has no shared prefix cache yet. Every
+B60. The coder serves 98,304 tokens on the A770 from a searched GGUF
+(per-layer expert types, 14.6 GB; top-1 -0.10 points against Q4_K_M,
+acceptance 10/10). 0.5.12 adds llama.cpp server's context checkpoints
+(--llama-checkpoints): a follow-up after a thinking turn or an edited
+message resumes instead of re-prefilling (24.3k tokens: 38.75 -> 0.61 s on
+the B60, 34.06 -> 0.54 s on the A770); no prefix cache shared across lanes
+yet. Every
 number below is measured-here on the named card; DESIGN.md §7 has each one's
 standing value and evidence class. The dated measurement record, campaigns
 and design notes live on the development branch `qfndev`, not on `main`.
 
 Served configurations:
-- coder: Qwen3.6-27B-A3B-Coder b5 int4 (184 experts), A770, u8 KV, prefix
-  cache 2 GiB. Acceptance task 10/10. Decode 47.6 t/s warm at ~1k tokens,
+- coder (from 2026-10-05): Qwen3.6-27B-A3B-Coder, the searched GGUF
+  c5f495ac shq8 on the libllama engine, A770, --llama-kv q8_0:q4_0,
+  --n-ctx 98304, MTP 4 drafts. Acceptance task 10/10 greedy, 10 of 10
+  sampled; decode 57.5 t/s on its prompt, 19.5 t/s at 95k; prefill 285 t/s
+  on a 94,926-token prompt.
+- coder until 2026-10-05, now the way back: Qwen3.6-27B-A3B-Coder b5 int4
+  (184 experts) on OpenVINO, A770, u8 KV, prefix cache 2 GiB. Acceptance
+  task 10/10. Decode 47.6 t/s warm at ~1k tokens,
   40.3 t/s at 71.7k; prefill ~510 t/s at ~1k, 621 t/s at 98k. Same artifact
   on the B60: 66.5 t/s decode, 2,821 t/s prefill at ~1k (the >= 60 t/s bar).
 - agent (from 0.5.6): Qwen3.8-27B Q4_K_M GGUF on the libllama engine, B60,

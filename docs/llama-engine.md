@@ -288,6 +288,32 @@ Both mixes serve `--n-ctx 98304` with MTP (4 drafts) and
 Both pass the KL bar and miss the top-1 bar, by 3.2 and 2.6 points against
 1. Neither is adopted.
 
+**The coder on this engine at 98,304 tokens (2026-10-05, `measured-here`).**
+The per-layer expert types were then searched instead of chosen. An
+evolutionary search took one gene per layer for expert gate/up and one for
+expert down: 80 genes over IQ3_XXS, IQ4_XS, IQ4_NL, Q4_K and Q5_K, built
+with the imatrix from the F16 GGUF. Fitness was top-1 agreement with the
+Q8_0 logits first, KL second, within the byte budget that fits 98,304 tokens
+with MTP. The winner, genome `c5f495ac`, is 14.60 GB. `shq8` is the same
+genome with every layer's shared expert (`ffn_{gate,up,down}_shexp`) at
+Q8_0 instead of Q4_K/Q6_K. Layer 36's expert gate/up go from IQ4_XS to
+IQ3_XXS to pay for it, so the size stays the same.
+
+Judged on the A770 through its own kernels (KL is 64 x 512 against the Q8_0
+logits, a larger slice than the table above). Served with `--n-ctx 98304
+--llama-mtp 4 --llama-kv q8_0:q4_0`:
+
+| GGUF | KL | top-1 | VRAM peak, 94,926-token prompt | prefill there | decode there / shallow | acceptance task, T=0 / 10 sampled at 0.7 |
+|---|---|---|---|---|---|---|
+| Q4_K_M (baseline arm) | 0.02374 | 95.53 % | does not fit | | | 10/10 |
+| c5f495ac | 0.02305 | 95.33 % | 16.67 of 17.08 GB | 292.5 t/s | 21.5 / 58.6 t/s | 9/10 / all 10/10 |
+| c5f495ac shq8 | 0.02367 | 95.43 % | 16.67 of 17.08 GB | 285.1 t/s | 19.5 / 57.5 t/s | 10/10 / all 10/10 |
+
+Both pass the answer-level bar against Q4_K_M (top-1 -0.20 and -0.10
+points, KL lower). The operator moved the coder service to this engine with
+`c5f495ac` on 2026-10-05, and to `shq8` the same evening. The OpenVINO
+service stays as the way back.
+
 llama.cpp's own loop (`llama-speculative-simple`, raw prompt) for
 reference: coder 68.1 t/s with 2 drafts, dense 31.9 with 3; four drafts
 fall to 46.0 and 10.7 (a 5-row verify leaves the 4-column K-quant matvec).
@@ -315,10 +341,80 @@ The dense model's 20-run sampled arm with that configuration scored 11 of
 20 at 10/10 (mean 7.4). The plain arm of the same binary scored 12 of 20
 (mean 6.9), and the record's earlier plain arms 10, 11 and 15.
 
+## Context checkpoints (`--llama-checkpoints N`, `--llama-checkpoint-step T`)
+
+The Qwen 3.x models are hybrid: their GatedDeltaNet layers carry a recurrent
+state that llama.cpp cannot cut back to an earlier token (it refuses the
+partial `seq_rm`). A lane always reused a follow-up that only appends to what
+it holds (thinking off, 24,387 of 24,418 tokens, `measured-here`). A request
+that shares less re-prefilled from 0. That is a thinking turn, whose reply
+the template re-renders without its think block, or an edited message.
+
+The lane now keeps checkpoints of that state. This is llama.cpp server's
+mechanism (`tools/server/server-context.cpp` at the pin, `code`):
+- **where**: at the start of a batch that begins the last user message, a
+  user message more than T (8192) tokens past the newest checkpoint, or
+  4 + n_ubatch and 4 tokens before the prompt's end. The batches break
+  there;
+- **what**: the `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` state (the recurrent
+  part), in host memory, with the MTP drafter's carried row (llama.cpp
+  stashes the draft state with each, `common_speculative_get_state`);
+- **how many**: at most N (32) a lane. When full, llama.cpp's eviction
+  applies: first those within T of an earlier one that an earlier request
+  made, then the oldest;
+- **restore**: the newest at or below the shared prefix. The attention KV
+  is then trimmed there;
+- **which models**: only hybrid and recurrent ones. An attention-only cache
+  trims instead, and its partial state would be the whole KV (Cydonia: none
+  taken, its follow-up reused 5,346 of 5,353 tokens by trimming).
+
+User messages are found by the text that opens one, derived from the GGUF's
+template by rendering it twice (ChatML: `<|im_start|>user`, trimmed as llama.cpp trims it). llama.cpp's
+autoparser finds the same delimiter; arcint renders with minja, so it derives
+the delimiter itself.
+
+Two deviations from the reference:
+- llama.cpp supersedes a checkpoint at the same token count, while arcint
+  keeps the existing one. The tokens below it are unchanged, so is its
+  state, and keeping it saves a 150 MiB copy.
+- llama.cpp also checkpoints sliding-window models; arcint serves none on
+  this engine, so that case is not built.
+
+Measured (`measured-here`, 2026-10-05). Each run is a 24.3k-token
+conversation at temperature 0 with thinking on: t1 asks a question, t2
+follows up on t1's reply, t3 edits t1's question. Arcint 0.5.11 + this
+change, one sample a cell:
+
+| model, card, lane | t2 prefill, cold -> warm | t3 prefill, cold -> warm | resumed at | t1 prefill, cost of taking them |
+|---|---|---|---|---|
+| dense 27B, B60, MTP 5, q8_0 KV | 38.75 -> 0.61 s | 38.73 -> 0.48 s | 24,341 (prompt end - 4), 24,321 (last user message) | 39.05 -> 39.89 s |
+| dense 27B, B60, plain | 38.7 -> 3.4 s wall | 39.3 -> 4.6 s wall | the same | 80.8 -> 81.4 s wall |
+| coder (iwolucion c5f495ac), A770, MTP 4, q8_0:q4_0, 98,304 ctx | 34.06 -> 0.54 s | 34.06 -> 0.48 s | 24,299 (prompt end - 4), 24,279 | 34.25 -> 35.04 s |
+
+A checkpoint is 149.6 MiB on the dense 27B and 62.8 MiB on the coder. That
+conversation kept 4-6 of them: 0.6-0.9 GiB of host memory a lane on the dense
+27B. At the 32-checkpoint limit that is 4.7 GiB (dense 27B) and 2.0 GiB
+(coder).
+
+The answers were right in every arm. On the coder, the cold arm's t2 spent
+its 700-token budget thinking and gave no answer, where the warm arm
+answered. Warm against a full re-prefill with the
+same batch breaks, the thinking and answer text were identical (193/193 and
+209/209 characters). Against the cold arm, t3 differs from the first
+character: the batch layout moves the numerics (`CMake` against `cmake`).
+Both mutants were run first, and both fail:
+- **The state not loaded**: llama.cpp refuses the cut, and the lane
+  re-prefills from 0 (39.8 s; answers right). The memory catches it.
+- **An older checkpoint's state under a newer one's count**: 20 and 492
+  tokens of state missing. The answers still came out right, but the
+  thinking left the reference at character 49 of 193 and 100 of 369. This
+  test sees a wrong state; the answers alone would not.
+
 ## Not yet on this engine
 
 Flash-Next's MTP (`qwen4exp` is in llama.cpp at the pin), conversation
-state (P6) and GPU prefill from the pinned bank (P5) are open.
+state kept across a restart (P6; in process it is the context checkpoints
+above) and GPU prefill from the pinned bank (P5) are open.
 
 Open observation: on the B60, xe logged GPU page faults with compute-engine
 resets in windows where `test-backend-ops` ran (2026-10-03); a run of every
