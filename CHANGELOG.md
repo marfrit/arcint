@@ -17,6 +17,27 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.5.11 — 2026-10-05
+
+**Runtime:** `marfrit-openvino +p25` remains the floor.
+
+The libllama engine on the Arc A770 (`contrib/llama.cpp` patch 0020,
+`docs/campaigns/kernel-autotune-ga.md`). The A770's prompt attention and
+K-quant GEMM were rewritten by two LLM mutation agents over a day, every
+candidate measured on the served case. Every change sits under
+`#if SG == 8`: the B60's kernels compile byte-identical.
+
+Measured on the A770 with the coder (Q4_K_M) and q8_0 KV (`measured-here`):
+- **Prompt attention:** pp512 after 16k 496 -> 692 t/s (+39.5 %), after 4k
+  1,116 -> 1,347 (+20.7 %). The GEMM adds +3-4 %.
+- **Served at a 15k-token prompt:** prefill 762 -> 1,008 t/s. The OpenVINO
+  path reached 1,025 t/s the same day.
+- **Decode:** each draft-verify cycle costs the same as before. On the one
+  answer measured, decode was 41.5 -> 39.5 t/s, from lower draft
+  acceptance.
+- **Quality:** the acceptance task scores 10/10 on both arms. KL is within
+  0.00007 nats.
+
 ## 0.5.10 — 2026-10-05
 
 **Runtime:** `marfrit-openvino +p25` remains the floor.
