@@ -938,7 +938,9 @@ The design follows Strata alone, the reference written for this model
 - **Effect**: the largest single improvement for agents (`paper`, Strata §7:
   a 30-second re-read of a long chat becomes a fraction of a second).
 - **arcint now**: the prefix cache and its host tier exist (§3.4, §4.4); with
-  the CPU tier the code still refuses the pair; restart persistence is the
+  the CPU tier the code still refuses the pair. The libllama engine keeps
+  llama.cpp server's context checkpoints of the recurrent state in process
+  (`docs/llama-engine.md`, 2026-10-05). Restart persistence is the
   `kv-checkpoint-restore` campaign (backlog).
 
 ### 8.8 The CPU tier's arithmetic

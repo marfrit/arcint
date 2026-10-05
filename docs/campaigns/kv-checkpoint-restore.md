@@ -1,6 +1,6 @@
 # kv-checkpoint-restore — conversation state kept between requests and across a restart
 
-**Open (backlog).** Lever 7 of `research-reference-audit.md` §4.
+**Open: across a restart** (in process on the libllama engine since 2026-10-05). Lever 7 of `research-reference-audit.md` §4.
 
 ## Charter
 
@@ -34,6 +34,13 @@ precision, block size, device or runtime is refused at load.
 
 ## Current state
 
+- **libllama engine, in process (2026-10-05):** llama.cpp server's context
+  checkpoints, rebuilt in `src/exec/backend_llama.cpp`
+  (`--llama-checkpoints`, `docs/llama-engine.md`): the recurrent state of a
+  hybrid model at the last user message and 4 / 4 + n_ubatch tokens before
+  the prompt's end, in host memory. A 24.3k-token follow-up after a thinking
+  turn re-prefills in 0.61 s instead of 38.75 s on the B60 (`measured-here`).
+  Not across a restart: that is still this campaign's open half.
 - The prefix cache (`src/core/prefix_cache.h`) is in-process: KV pages by
   reference on the card, GDN checkpoint blobs (~32 MiB a row) in host memory;
   nothing is written to disk (`code`).

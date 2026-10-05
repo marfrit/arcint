@@ -37,6 +37,13 @@ public:
     // memory refuses (beyond its recurrent snapshots), and then both are
     // cleared for the sequence.
     virtual bool seq_rm(int seq, size_t from) = 0;
+    // The carried hidden row of a sequence that holds exactly n tokens (the
+    // target's row of position n - 1), empty when the drafter carries none
+    // there; stored with a context checkpoint and set back after its restore
+    // and the cut to n, as llama.cpp's server stashes the draft state with
+    // each checkpoint (common_speculative_get_state).
+    virtual std::vector<float> carried_row(int seq, size_t n) const = 0;
+    virtual void               set_carried_row(int seq, size_t n, const std::vector<float>& row) = 0;
 };
 
 // model: loaded with load_mtp from `gguf`; ctx_tgt: n_rs_seq >= n_draft.

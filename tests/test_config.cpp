@@ -1115,3 +1115,36 @@ TEST(config_llama_cpu_moe_and_threads) {
         CHECK(!parse_args(4, const_cast<char**>(argv), cfg).ok);
     }
 }
+
+TEST(config_llama_checkpoints) {
+    {
+        // the reference's defaults (llama.cpp server: 32 a slot, 8192 apart)
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf"};
+        CHECK(parse_args(3, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_checkpoints, 32);
+        CHECK_EQ(cfg.llama_checkpoint_step, 8192);
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-checkpoints", "0", "--llama-checkpoint-step", "4096"};
+        CHECK(parse_args(7, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_checkpoints, 0);   // off: a hybrid lane re-prefills when it cannot trim
+        CHECK_EQ(cfg.llama_checkpoint_step, 4096);
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-checkpoints", "-1"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-checkpoint-step", "0"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // a spacing, at least one token
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--stub", "--llama-checkpoints", "0"};
+        CHECK(!parse_args(4, const_cast<char**>(argv), cfg).ok);   // an option of the libllama engine only
+    }
+}

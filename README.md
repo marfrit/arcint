@@ -34,8 +34,9 @@ expert engines [Strata](https://github.com/Niko1221/Strata) and
 ## Two engines
 
 arcint has two inference backends behind the same HTTP surface, sampler,
-lanes and chat templates. The coder service runs on the first; from 0.5.6 the
-agent service runs on the second.
+lanes and chat templates. Both services run on the second: the agent from
+0.5.6, the coder from 2026-10-05. The first carries Flash-Next and stays as
+the coder's way back.
 
 **OpenVINO (the default).** The model is an OpenVINO IR, or a GGUF fed
 through it. Runs on the patched `marfrit-openvino` runtime. arcint owns the
@@ -46,8 +47,8 @@ whole memory picture here:
 - the Flash-Next expert tier between card and RAM;
 - DFlash and MTP drafting.
 
-That is what carries the coder service's 98,304 tokens (and the agent's
-122,880 before 0.5.6) and Flash-Next at depth.
+That is what carried the coder service's 98,304 tokens until 2026-10-05
+(and the agent's 122,880 before 0.5.6), and it carries Flash-Next at depth.
 
 **libllama (`--engine llama --gguf FILE`).** llama.cpp at a pinned commit
 with ggml's OpenCL backend and arcint's Intel kernels
@@ -97,11 +98,16 @@ Production (operator, 2026-10-04):
     t/s on the acceptance prompt);
   - prefill is slower: 896 t/s at 4k (OpenVINO 1,141) and 435 at 16k
     depth (852).
-- **The coder stays on OpenVINO.**
-  - Context: its Q4_K_M GGUF leaves ~16k tokens with MTP on the A770, and
-    the two IQ3_XXS mixes that fit 98,304 miss the top-1 bar.
-  - Prefix cache: the libllama engine has no shared one; a lane reuses only
-    the prefix it still holds.
+- **The coder moved to libllama on 2026-10-05**, with a searched GGUF.
+  - Context: the Q4_K_M GGUF leaves ~16k tokens with MTP on the A770. An
+    evolutionary search over per-layer expert types found one that serves
+    98,304 tokens and passes the answer-level bar (top-1 -0.10 points
+    against Q4_K_M, KL lower). It scores 10/10 on the acceptance task
+    (`docs/llama-engine.md`). The OpenVINO service stays as the way back.
+  - Prefix reuse: the libllama engine has no shared prefix cache. A lane
+    reuses the prefix it holds, and llama.cpp's context checkpoints let a
+    hybrid model resume a follow-up or an edited message
+    (`--llama-checkpoints`).
 - Flash-Next at speed: experts not on the card run on llama.cpp's CPU
   backend (`--llama-cpu-moe`).
 
@@ -118,7 +124,7 @@ tokens after the prompt; extension prefill excludes prefix-cache hits):
 
 | service | card | configuration | prefill @ 4k / 16k | decode @ 4k / 16k |
 |---|---|---|---|---|
-| coder | A770 | u8 KV, 98,304 ctx, 2 GiB prefix cache | 1,379 / 1,209 t/s | 43.9 / 42.4 t/s |
+| coder, until 2026-10-05 | A770 | u8 KV, 98,304 ctx, 2 GiB prefix cache | 1,379 / 1,209 t/s | 43.9 / 42.4 t/s |
 | dense agent, until 0.5.5 | B60 | `i8:u8` KV, 122,880 ctx, MTP on, `--gate-pad 16`, prefill chunk 512 | 1,141 / 852 t/s | 24.6 / 20.2 t/s |
 
 Both artifacts score 10/10 on the task (greedy; the dense model with MTP
@@ -132,6 +138,15 @@ protocol: llama-bench and the served acceptance prompt):
 - the acceptance task 8/10 at temperature 0 on the deployed unit; sampled,
   30 runs, mean 7.4 against f16's 8.1, within the noise
   (`docs/llama-engine.md`).
+
+From 2026-10-05 the coder runs it too (the served acceptance prompt and long
+prompts through arcint):
+- the searched `c5f495ac shq8` GGUF (14.6 GB), `--llama-kv q8_0:q4_0`,
+  98,304 ctx, MTP 4 drafts;
+- prefill 285 t/s on a 94,926-token prompt;
+- decode 57.5 t/s on the acceptance prompt, 19.5 t/s at 95k depth;
+- the acceptance task 10/10 at temperature 0, 10 of 10 sampled runs at
+  10/10.
 
 **Qwen3.6-35B-A3B**, full depth, native expert blocks with u8 dense
 projections, all resident on the A770, u8 KV: prefill about 960 t/s at 4,096

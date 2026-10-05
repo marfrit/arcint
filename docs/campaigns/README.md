@@ -70,7 +70,7 @@ ranking (`research-reference-audit.md` §4).
 | [mtp-cycle-wall](mtp-cycle-wall.md) | libllama engine: `--llama-mtp` served, dense 18-19.5 -> 31-35 t/s, coder 47.5 -> 69 t/s at the answer-level bar; OpenVINO path: dense drafts one token a cycle, Flash-Next served with 3 drafts at ~3.6 plain steps a window | Strata `src/core/mtp.cpp:771-820` (draft chain with `min_p`), `tools/mtp_fetch.py` |
 | [prefill-expert-streaming](prefill-expert-streaming.md) | prefill 63–68 t/s at 20k on the B60, CPU-tier-bound | Strata `src/prefill/prefill.cpp:71-104` (slot ring, chunks to 8,192, MMQ); FreeToken `moe/offload_cache.py` prefill overlap, `layers/moe.py:388-390` |
 | [kquant-host-storage](kquant-host-storage.md) | native blocks on the host tier, quantised dot for decode-shaped calls (0043, 0074) | Strata `src/kernels/cpu/iq_avx2.cpp` (multi-token AVX2) |
-| [kv-checkpoint-restore](kv-checkpoint-restore.md) | backlog; the prefix cache is in-process only | Strata conversation cache (`src/core/conversation_snapshot.cpp`) |
+| [kv-checkpoint-restore](kv-checkpoint-restore.md) | in process on both engines (libllama: context checkpoints, 2026-10-05); across a restart open | Strata conversation cache (`src/core/conversation_snapshot.cpp`) |
 | [served-prefill-determinism](served-prefill-determinism.md) | B60 run-to-run variance, located in the GDN state; not gating | upstream openvinotoolkit/openvino#38099 |
 | [direct-submission-fault](direct-submission-fault.md) | mechanism on record; the N ≥ 5 confirmation on the current kernel owed | upstream `linux-7.1.y` ring-ordering fix |
 

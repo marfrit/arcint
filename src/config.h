@@ -37,6 +37,15 @@ struct Config {
     // attention kernels of contrib/llama.cpp 0015.
     std::string llama_kv_k = "f16";
     std::string llama_kv_v = "f16";
+    // --llama-checkpoints N / --llama-checkpoint-step T: per lane, up to N
+    // snapshots of the state llama.cpp cannot roll back (a hybrid model's
+    // recurrent layers), taken where llama.cpp's server takes its context
+    // checkpoints (near the prompt's end, at the last user message, at
+    // earlier user messages T apart; 32 a slot, 8192), so a request sharing
+    // a prefix with an earlier one resumes from the newest snapshot inside it
+    // instead of prefilling from token 0. 0 off.
+    int llama_checkpoints     = 32;
+    int llama_checkpoint_step = 8192;
     std::string flash_next_ngram_path;  // --flash-next-ngram: FIX D per_layer_token_embd table (24-byte ARCINGRM header + block-quantised payload); admitted only when the artifact's config.json declares an n-gram table (docs/design-qwen-flash-next.md FIX D Link 2)
     // --ngram-gguf: the GGUF shard whose per_layer_token_embd.weight binds a
     // serving-shape IR's `ngram_table.K` ports (backend_ov.cpp

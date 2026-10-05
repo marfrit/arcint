@@ -425,6 +425,13 @@ std::string usage_text() {
         "  --llama-mtp-vocab FILE    libllama: the token ids the MTP head may draft\n"
         "                            (int32, or a JSON list): a draft step reads only\n"
         "                            those rows of the output head\n"
+        "  --llama-checkpoints N     libllama: per lane, up to N snapshots of a hybrid\n"
+        "                            model's recurrent state (near the prompt's end,\n"
+        "                            at user messages), so a follow-up or an edited\n"
+        "                            message resumes instead of re-prefilling\n"
+        "                            (default 32; 0 off)\n"
+        "  --llama-checkpoint-step T libllama: the least spacing of snapshots at\n"
+        "                            earlier user messages (default 8192)\n"
         "  --llama-kv K[:V]          libllama: the attention cache types, f16, q8_0 or\n"
         "                            q8_0:q4_0 (default f16): q8_0 takes the cache to\n"
         "                            53 %, q8_0:q4_0 to 41 %\n"
@@ -476,6 +483,12 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--llama-mtp") {
             if (!value(v) || !parse_int(v, cfg.llama_mtp) || cfg.llama_mtp < 0 || cfg.llama_mtp > 7)
                 return fail("--llama-mtp needs a draft count from 0 to 7 (a verify of up to 8 rows)");
+        } else if (arg == "--llama-checkpoints") {
+            if (!value(v) || !parse_int(v, cfg.llama_checkpoints) || cfg.llama_checkpoints < 0)
+                return fail("--llama-checkpoints needs a count >= 0 (0: off)");
+        } else if (arg == "--llama-checkpoint-step") {
+            if (!value(v) || !parse_int(v, cfg.llama_checkpoint_step) || cfg.llama_checkpoint_step < 1)
+                return fail("--llama-checkpoint-step needs a token count >= 1");
         } else if (arg == "--llama-mtp-vocab") {
             if (!value(v)) return fail("--llama-mtp-vocab needs a file of token ids");
             cfg.llama_mtp_vocab = std::string(v);
@@ -950,8 +963,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         if (!cfg.llama_mtp_vocab.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-vocab needs --llama-mtp");
     } else {
     if (cfg.llama_cpu_moe > 0 || cfg.llama_threads > 0 || cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty() ||
-        cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16")
-        return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab and --llama-kv are --engine llama options");
+        cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192)
+        return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab, --llama-kv and --llama-checkpoints/-step "
+                    "are --engine llama options");
     if (!cfg.gguf_path.empty() && cfg.model_path.empty()) return fail("--gguf needs --model (the template IR directory)");
     if (!cfg.gguf_path.empty() && !cfg.paged) return fail("--gguf serves on the paged path only");
     }
