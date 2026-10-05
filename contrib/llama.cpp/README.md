@@ -1100,3 +1100,67 @@ shipped arm is 0018):
   `native_exp` put 896 bytes of spill into the q8_0 prompt build and took
   15 % of pp512 (`measured-here`); the kernel comment says why it is not
   there.
+
+## 0020-opencl-intel-a770-attention-gemm-agent-searched.patch
+
+The Arc A770's (sub-group 8) prompt-attention kernel and K-quant GEMM tiles,
+as two LLM mutation agents rewrote them in one day
+(`docs/campaigns/kernel-autotune-ga.md`, "A770"). Kernel source only, every
+change under `#if SG == 8`: the Arc Pro B60's sub-group-16 builds compile
+to byte-identical binaries (ocloc, both files, `measured-here`).
+
+Prompt attention (`flash_attn_dpas.cl`, the SG 8 kernel):
+- the sub-group vote of 0019 (skip the row reductions and the rescale when
+  no row maximum rises);
+- Q staged as vectors; K's leading dimension and V's rows padded by 16 halves
+  against local-memory bank conflicts (local memory a work-group at head
+  size 256: 49,152 -> 58,368 B, within the 64 KB the host checks);
+- S in four explicit accumulators (two key groups), the mask branch hoisted,
+  the mask load clamped and unconditional, per-row mask offsets;
+- the reciprocal of l precomputed for the final scale. This step moved
+  IGC's register allocation as a whole (12,093 -> 9,744 assembly lines,
+  pp512 at 16k +14 % in one step): an allocation effect, which a compiler
+  change can move again;
+- K and V staging in one merged loop, their global loads interleaved
+  (spill 2,336 -> 0 bytes);
+- in the shared `load8` helper, under `#if SG == 8`: q8_0 scaled in half
+  (bit-identical to the float path unless f16 denormals are flushed,
+  `code`).
+
+K-quant GEMM tiles (`mul_mm_kq_f16.cl`, SG 8; MUL_MAT_ID for the MoE
+experts and MUL_MAT):
+- the weight tile as a double buffer of two 128-weight chunks in the same
+  local memory as before (`MT * 256` halves, the host's check unchanged):
+  the DPAS of one chunk is issued before the next chunk is dequantized, one
+  barrier a chunk;
+- q4_K / q5_K weights read 32 bytes at a time; a * q - b as one f32 fma on
+  coefficients rounded to half first;
+- `kernel_cvt_f32_f16` as float4 where aligned; a lane owning a tile row in
+  the q4_K/q5_K dequant when the tile is at most 32 rows.
+
+Measured (`measured-here`, A770, the coder GGUF Q4_K_M, q8_0 KV):
+
+| | 0019 | 0020 |
+|---|---|---|
+| pp512 after 16,384 (llama-bench, paired, 2 runs) | 496.2 t/s | 692.3 (+39.5 %) |
+| pp512 after 4,096 | 1,116.2 | 1,346.8 (+20.7 %) |
+| pp512 after 0 | 1,691.9 | 1,744.6 (+3.1 %) |
+
+Those are the attention kernel alone; the GEMM alone: pp512 after 4,096
+1,116 -> 1,149 (+2.9 %), after 0 1,694 -> 1,769 (+4.4 %).
+
+- Served (arcint, MTP 4, q8_0 KV, 16k context, two arcint builds of one
+  source, two rounds): a 15,004-token prompt prefills at 761.8 / 762.4 ->
+  1,008.6 / 1,008.1 t/s (+32 %). OpenVINO's path served the same prompt at
+  1,025 t/s that morning. Decode 41.5 -> 39.5 t/s in both rounds: the same
+  cost a draft-verify cycle (verify 54 -> 55 ms, propose 23 ms), a lower
+  draft acceptance on this one greedy answer (55.6 -> 51.3 %); 0020 changes
+  no decode kernel on the A770.
+- The coder's acceptance task (T=0, thinking off): 10/10 in both arms.
+- KL against the coder's reference (16 x 512, ubatch 512): attention
+  0.006996 -> 0.007062, same top-1 95.980 % in both; the GEMM bit-equal
+  (0.006996).
+- FLASH_ATTN_EXT at head sizes 256 and 128: 860 of 861 on the A770 (the
+  pin's softcap case); MUL_MAT_ID 338/338, MUL_MAT 1,055/1,055. Not in
+  test-backend-ops: q4_0/q4_0 attention at head size 128, plain MUL_MAT
+  IQ4_NL with K not a multiple of 256 at more than 4 columns.

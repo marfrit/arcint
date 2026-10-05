@@ -250,6 +250,39 @@ What the night taught about the method:
   local strides, double buffers (local memory costs occupancy), four-way
   split reductions, a fused quantized decode (wrong results).
 
+## LLM mutation search on the A770 (2026-10-05, `measured-here`)
+
+The same method on the Arc A770 (sub-group 8), aimed at the gap to
+OpenVINO's path on the coder. That morning, on a 15,004-token prompt,
+OpenVINO prefilled at 1,025 t/s and libllama 0.5.10 at 763 (−26 %). A
+device profile of libllama on the coder (pp512 after 4k) put the MoE Q4_K
+GEMM at 32 % of prefill device time, prompt attention at 24 % (growing
+with depth), the dense Q4_K GEMM at 13 %.
+
+Two lanes, one kernel file each, the served case the objective from the
+start (llama-bench pp512 after 16k for attention, after 4k for the GEMM,
+the shipped kernel and the candidate each alone in its own process,
+paired every evaluation), about 60 evaluations each over five hours.
+0020 carries the gated bests (README, 0020): prompt attention +39.5 % at
+16k, +20.7 % at 4k; the GEMM +2.9 % at 4k. Served, the 15k prompt now
+prefills at 1,008 t/s, level with OpenVINO's path.
+
+What the day added to the method:
+- **A harness must count failures from the pass count.** A per-line FAIL
+  grep missed the MUL_MAT output format and passed a candidate at 2 of 22;
+  the evaluator now takes failing = total − passed − the pin's softcap
+  cases.
+- **The other card's build is part of the gate.** An agent sped up a
+  helper both cards compile; the evaluator now compiles the B60's build of
+  every candidate and reports whether it changed, and A770-only changes go
+  under `#if SG == 8`.
+- **An allocation step is a step.** One small edit (a reciprocal hoisted
+  out of the final scale) reorganised IGC's register allocation and gave
+  +14 % at once; the agents found it by measuring, not by reasoning.
+- **The GEMM is DPAS-bound at the served tile.** Replacing the dequant with
+  a constant moved the proxy 25 % and the served case 0.5 % (the agent's
+  ablation); the gains came from overlapping dequant and DPAS.
+
 ## Where it lives
 
 `tools/kq_tune/` (the drivers and the analyses). The search hooks are in
