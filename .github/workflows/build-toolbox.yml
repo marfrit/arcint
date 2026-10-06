@@ -9,15 +9,19 @@
 #
 # Images produced (OWNER is the lowercase repo owner, so this works from a
 # fork without edits):
-#   ghcr.io/<OWNER>/arcint-ov:2026.4.0-ov71640275d29-ceiling0033   tier 1
+#   ghcr.io/<OWNER>/arcint-ov:2026.4.0-ov71640275d29-marfrit-p27   tier 1
 #   ghcr.io/<OWNER>/arcint:<immutable ts>                            tier 2
 #   ghcr.io/<OWNER>/arcint:edge                                      tier 2, moving
 #
-# The tier-1 tag names the OpenVINO pin and the patch CEILING rather than
-# the marfrit-pN level. That is deliberate: the level stamp is frozen at
-# p19 across several different patch sets upstream (see the disclosure in
-# contrib/packaging/marfrit-openvino/patches/README.md), so the level
-# alone does not identify a runtime. The ceiling does.
+# The tier-1 tag is DERIVED, not written down: the job below reads the pin
+# and the package level out of
+# contrib/packaging/marfrit-openvino/build-openvino.sh and names the tag
+# from them. The Dockerfile gates its own build args against the same recipe,
+# so a tag and a runtime cannot disagree -- if the recipe moves and the
+# Dockerfile does not, tier 1 fails in seconds instead of publishing a
+# mislabelled base. The patch ceiling rides along as an OCI label
+# (ai.arcint.ov.patchceiling); the level itself has been a real identity
+# since the +p20 package.
 #
 # First run must include tier 1 (tiers=all or tiers=ov,arcint) — tier 2
 # FROMs the tier-1 image from the registry.
@@ -30,6 +34,11 @@
 # plus a stub + /props smoke test against the final image. Card-requiring
 # acceptance cells stay out of CI by design (docs/design-0.3.1-test-ladder.md)
 # — the card test is a card test.
+#
+# Tier 2 builds BOTH engines (OpenVINO and libllama), the way
+# contrib/packaging/arcint/build-deb.sh does: since 0.5.5 the served units
+# run --engine llama, so an image with the OpenVINO path alone would not be
+# the thing the project ships.
 
 name: Build arcint toolbox images
 
@@ -51,28 +60,39 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  # Single source of truth for the tier-1 tag, so tier 1 and tier 2 cannot
-  # drift apart about which base they mean.
-  OV_TAG: 2026.4.0-ov71640275d29-ceiling0033
 
 jobs:
-  # Resolve the lowercase namespace and the tier selection once, in shell,
-  # where the evaluation is visible in the log. Computing these here rather
-  # than inlining the expressions makes the decision auditable after the
-  # fact: dispatch inputs are not exposed via the API, so an inline
-  # expression that misbehaves cannot be debugged once the run is over.
+  # Resolve the lowercase namespace, the tier selection and the tier-1 tag
+  # once, in shell, where the evaluation is visible in the log. Computing
+  # these here rather than inlining the expressions makes the decision
+  # auditable after the fact: dispatch inputs are not exposed via the API,
+  # so an inline expression that misbehaves cannot be debugged once the run
+  # is over. The tier-1 tag is read from the deb recipe here so tier 1 and
+  # tier 2 cannot drift apart about which base they mean.
   ns:
     runs-on: ubuntu-latest
     outputs:
       owner: ${{ steps.ns.outputs.owner }}
       build_ts: ${{ steps.ns.outputs.build_ts }}
+      ov_tag: ${{ steps.ov.outputs.ov_tag }}
       build_ov: ${{ steps.tiers.outputs.build_ov }}
       build_arcint: ${{ steps.tiers.outputs.build_arcint }}
     steps:
+      - uses: actions/checkout@v4
       - id: ns
         run: |
           echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
           echo "build_ts=$(date +%Y%m%dT%H%M%S)" >> "$GITHUB_OUTPUT"
+      - id: ov
+        run: |
+          set -euo pipefail
+          recipe=contrib/packaging/marfrit-openvino/build-openvino.sh
+          pin=$(sed -n 's/^PIN=\([0-9a-f]\{7,\}\).*/\1/p' "$recipe" | head -1)
+          lvl=$(sed -n 's/^PATCHLEVEL=\(marfrit-p[0-9]\+\).*/\1/p' "$recipe" | head -1)
+          [ -n "$pin" ] && [ -n "$lvl" ] || { echo "could not read PIN/PATCHLEVEL from $recipe" >&2; exit 1; }
+          tag="2026.4.0-ov${pin}-${lvl}"
+          echo "tier 1 tag from the deb recipe: $tag" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "ov_tag=$tag" >> "$GITHUB_OUTPUT"
       - id: tiers
         run: |
           T='${{ github.event.inputs.tiers }}'
@@ -112,12 +132,12 @@ jobs:
       - name: Build patched OpenVINO base
         run: |
           docker build \
-            -t ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:${{ env.OV_TAG }} \
+            -t ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:${{ needs.ns.outputs.ov_tag }} \
             -f docker/Dockerfile.openvino-patched .
 
       - name: Push tier 1
         run: |
-          docker push ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:${{ env.OV_TAG }}
+          docker push ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:${{ needs.ns.outputs.ov_tag }}
 
   tier2-engine:
     needs: [ns, tier1-openvino]
@@ -130,7 +150,7 @@ jobs:
           && needs.tier1-openvino.result != 'failure'
           && needs.tier1-openvino.result != 'cancelled' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
 
@@ -143,7 +163,7 @@ jobs:
       - name: Build engine image
         run: |
           docker build \
-            --build-arg OV_BASE=${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:${{ env.OV_TAG }} \
+            --build-arg OV_BASE=${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:${{ needs.ns.outputs.ov_tag }} \
             --build-arg ARCINT_GIT_SHA=${GITHUB_SHA::12} \
             -t ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint:build-${{ needs.ns.outputs.build_ts }} \
             -f docker/Dockerfile.arcint .

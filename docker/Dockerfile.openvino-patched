@@ -14,8 +14,13 @@
 # layout is load-bearing; patched libs overwrite the wheel's; the version
 # string must name the patch level).
 #
+# The whole series 0003-0077 is applied, and the tag names the package
+# level the recipe is at (marfrit-p27). The ceiling this file used to build
+# to -- 0033, with 0037 unappliable -- is gone: 0037 was re-exported in
+# ab19b09 and the whole series parses clean now.
+#
 # Build from the REPO ROOT:
-#   docker build -t arcint-ov:2026.4.0-marfrit-p15 \
+#   docker build -t arcint-ov:2026.4.0-ov71640275d29-marfrit-p27 \
 #     -f docker/Dockerfile.openvino-patched .
 # ---------------------------------------------------------------------------
 
@@ -38,17 +43,20 @@ ARG OV_PIN_SHORT=71640275d29
 # The version string must parse for ov_parse_ci_build_number: the build-number
 # FIELD stays numeric, the patch level rides in the free-form tail.
 #
-# WARNING: the marfrit-pN stamp does NOT identify a patch set from 0046 on.
-# The upstream patch README discloses this four times -- "the version stamp
-# stays at marfrit-p19 (disclosed: p19 is also the 0003-0043 stamp, so the
-# 0046 build is identified by its env/parse symbols, not the stamp)". The
-# same p19 string therefore covers 0003-0043, 0003-0049 and beyond. Never
-# tag an image by patch level alone; tag by the arcint tree SHA plus the
-# explicit ceiling carried in CEILING below.
-ARG PATCHLEVEL=marfrit-p15
-# The honest identity: the highest patch actually applied. Carried into the
-# image label so a running container can say what it really contains.
-ARG CEILING=0033
+# The level is taggable again. The frozen-stamp era is over: patches/README.md
+# now reads "Measurement builds of 0044-0067 before the +p20 package kept the
+# marfrit-p19 stamp (which is also 0003-0043's); such a build is identified
+# by its symbols ... A release names its package level." So marfrit-p27 means
+# the +p27 package and nothing else.
+#
+# Both values are GATED against contrib/packaging/marfrit-openvino/build-openvino.sh
+# below: this image does not get its own opinion about the pin or the level.
+# The one time it had one (p15 while the recipe was at p27) this PR went stale.
+ARG PATCHLEVEL=marfrit-p27
+# Highest patch in the series actually applied, carried as an extra OCI label
+# (ai.arcint.ov.patchceiling) so a running container can be asked what it
+# contains without opening it. Also gated: it must be the top of patches/.
+ARG CEILING=0077
 ARG OV_UPSTREAM=https://github.com/openvinotoolkit/openvino.git
 
 # Shallow fetch of the exact commit (GitHub serves reachable SHAs). If the
@@ -61,26 +69,37 @@ RUN git init /opt/ov \
   && git checkout --force FETCH_HEAD \
   && git submodule update --init --recursive --depth 1
 
-# The patch series comes from THIS repo, not from anywhere else.
+# The patch series comes from THIS repo, not from anywhere else, and so does
+# the recipe whose pin and level this image claims.
 COPY contrib/packaging/marfrit-openvino/patches /opt/patches
+COPY contrib/packaging/marfrit-openvino/build-openvino.sh /opt/recipe-build-openvino.sh
+
+# Drift gate. The build args above are defaults, not truth: the truth is the
+# deb recipe. If the recipe moves its pin or its level and this file does not,
+# fail here in seconds rather than shipping an image whose tag and version
+# string describe a runtime nobody built.
+RUN set -eu; \
+    r_pin=$(sed -n 's/^PIN=\([0-9a-f]\{7,\}\).*/\1/p' /opt/recipe-build-openvino.sh | head -1); \
+    r_lvl=$(sed -n 's/^PATCHLEVEL=\(marfrit-p[0-9]\+\).*/\1/p' /opt/recipe-build-openvino.sh | head -1); \
+    r_top=$(ls /opt/patches/*.patch | xargs -n1 basename | cut -d- -f1 | sort -n | tail -1); \
+    [ -n "$r_pin" ] && [ -n "$r_lvl" ] \
+      || { echo "could not read PIN/PATCHLEVEL from build-openvino.sh" >&2; exit 1; }; \
+    case "${OV_PIN}" in "${r_pin}"*) ;; *) \
+      echo "OV_PIN=${OV_PIN} is not the recipe's pin ${r_pin}" >&2; exit 1 ;; esac; \
+    [ "${PATCHLEVEL}" = "$r_lvl" ] \
+      || { echo "PATCHLEVEL=${PATCHLEVEL} != ${r_lvl} in contrib/packaging/marfrit-openvino/build-openvino.sh" >&2; exit 1; }; \
+    [ "$((10#$CEILING))" -eq "$((10#$r_top))" ] \
+      || { echo "CEILING=${CEILING} != top of the series in patches/ (${r_top})" >&2; exit 1; }; \
+    echo "tier 1 agrees with the deb recipe: pin ${r_pin}, level ${r_lvl}, series top ${r_top}"
 
 # Same gate as build-openvino.sh: a patch that does not apply to the pin is
-# a bug in patches/, not a reason to move the pin.
-# PATCH_MAX: apply only patches numbered up to this. The ceiling is 0033,
-# the deployed +p15 set, because 0037 as published in this tree does not
-# parse: its last hunk declares 82 new / 6 old and the hunk carries 78 / 3,
-# so `git apply` refuses it outright ("corrupt patch at line 436"). Building
-# past 0033 here would fail the same gate build-openvino.sh applies.
-#
-# The ceiling is a single build arg. When 0037 is re-exported and validates,
-# bump PATCH_MAX and the tier-1 tag's ceiling together.
-#
-# See docs/docker.md ("Known issue: patches/0037 does not apply").
-ARG PATCH_MAX=0033
+# a bug in patches/, not a reason to move the pin. The WHOLE series is
+# applied -- no ceiling arg. The ceiling this file carried while 0037 was
+# corrupt (PATCH_MAX=0033, because that file's last hunk declared 82 new /
+# 6 old and carried 78 / 3: "corrupt patch at line 436") went away when the
+# patch was re-exported in ab19b09.
 RUN cd /opt/ov && shopt -s nullglob && \
     for p in /opt/patches/*.patch; do \
-      n=$(basename "$p" | cut -d- -f1); \
-      if [ "$((10#$n))" -gt "$((10#$PATCH_MAX))" ]; then echo "skipping $(basename "$p") (> PATCH_MAX=${PATCH_MAX})"; continue; fi; \
       echo "applying $(basename "$p")"; \
       git apply --check "$p" || { echo "does not apply to ${OV_PIN}: fix patches/, not the pin" >&2; exit 1; }; \
       git apply "$p"; \
@@ -146,13 +165,13 @@ RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
       intel-compute-runtime intel-level-zero oneapi-level-zero ocl-icd \
   && dnf clean all && rm -rf /var/cache/dnf/*
 
-ARG PATCHLEVEL=marfrit-p15
-ARG CEILING=0033
+ARG PATCHLEVEL=marfrit-p27
+ARG CEILING=0077
 ARG OV_PREFIX=/usr/lib/marfrit-openvino
 
-# The stamp is ambiguous by design upstream (p19 covers several patch sets),
-# so the image records the ceiling it was actually built to. `docker inspect`
-# answers "which patch set is this"; the version string alone cannot.
+# The level names the package (true since the +p20 package); the ceiling is
+# kept alongside it so `docker inspect` answers "which patch set" without
+# reading the version string, and so the label survives a future level freeze.
 LABEL org.opencontainers.image.title="marfrit-openvino (patched)" \
       org.opencontainers.image.source="https://github.com/marfrit/arcint" \
       ai.arcint.ov.pin="71640275d29692354223572e77ef717e92b891d9" \
