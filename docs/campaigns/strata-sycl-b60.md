@@ -1,6 +1,7 @@
 # strata-sycl-b60 — Strata's own engine (its SYCL port) on the B60, as the measured reference for Flash-Next
 
-**Open** (2026-10-06, operator).
+**Open** (2026-10-06, operator). The reference ran on the B60: 620.5 t/s
+prefill at 20k, 37.2-37.8 t/s decode, answers right (`measured-here`).
 
 ## Charter
 
@@ -20,7 +21,10 @@ an estimate until the reference runs here.
 
 ## Reference to follow
 
-Strata upstream `6f32ec0` (engine 0.1.39, `code`), github.com/Niko1221/Strata:
+Strata upstream `7ba023e` (the port's 0.1.39 sync, `code`), github.com/Niko1221/Strata.
+Later `main` (`6f32ec0`) does not build for SYCL: 86 upstream commits changed
+shared headers (`ThreadAffinity`, `NativeDense::load`) that the `sycl/` copies
+have not taken yet.
 - `sycl/`: the CUDA engine migrated with SYCLomatic plus
   `sycl/tools/fixups.py`; AOT device code (`STRATA_SYCL_AOT`, upstream
   builds `bmg-g31` for the B70; this campaign builds `bmg-g21`).
@@ -60,11 +64,42 @@ not part of this measurement.
 
 ## Current state
 
-- Strata `6f32ec0` staged on the dev host from `git archive`; ggml from
-  llama.cpp `3cf03257` (Strata's pin); oneAPI 2026.1.1 native (no container).
-  Build for `bmg-g21` started.
-- IQ2_XS shards downloaded from the pinned revision
-  (`ed59f920`), sha256 against the Hub's LFS ids.
+Built and measured 2026-10-06 (`measured-here`). The B60 (PCI 8086:E211,
+PCIe 4.0 x8). Strata `7ba023e`, AOT `bmg-g21`, oneAPI 2026.1.1 native, the
+Level Zero loader 1.34.0: the system's 1.20.6 makes every SYCL program
+segfault in the UR adapter's device enumeration. The ISTA-DASLab IQ2_XS
+(revision `ed59f920`, sha256 against the Hub). Shard 2, the PLE table, on
+NVMe; shard 1 on ZFS (read once at load). The configuration is
+`sycl/setup_intel.py`'s for 32K: `--expert-cache auto --stream-experts
+--vram-reserve-mib 1024 --prefill auto --spec 4 --spec-min-p 0.5 --mtp
+--kv int8`, `STRATA_VERIFY_DEVICE_PLAN=1 STRATA_VERIFY_NO_HOST=1`, served
+through its `serve/server.py` with the same requests as
+`flash-next-llama-engine.md`'s gate, greedy, thinking off.
+
+| | Strata SYCL, IQ2_XS | arcint libllama, UD-Q3_K_XL (patch 0021) |
+|---|---|---|
+| prefill, the 20,045-token needle | **620.5 t/s** (32.3 s) | 235 t/s |
+| decode, the 500-token long answer | **37.2 / 37.8 t/s** (two runs) | 12.5-13.0 t/s |
+| answers | Paris; ORANGE-FALCON-77; the long answer | the same |
+| experts on the card | 12,332 slots, 16.53 GiB (50 %), placed by the profile, no eviction | 31 % of the bytes, adapted every 6 tokens |
+| experts over the link | 12,244 in a pinned host mirror, 16.49 GiB, read by the GPU's expert kernels | the rest in a USM bank, gathered into VRAM |
+| speculative decoding | MTP draft layer: 288 of 433 drafts accepted, ~2.36 tokens a round | none |
+| VRAM free with everything loaded | 1,559 MiB | |
+
+What decode spends: 212 verify rounds for 500 tokens in 13.4 s, 63 ms a
+round, each verifying ~3 tokens (2.04 drafts offered a round). arcint
+spends 77 ms on one token. So the gap is about 2.4x from the drafts, times
+about 1.2x per forward pass, where Strata's model is smaller (IQ2_XS, 35.5
+GB of experts against 52 GiB) and half of it is on the card. A
+no-speculation arm was not measured: the serve mode refuses to start
+without `--mtp`, and a native pack refuses `--spec` below 2.
+
+Load: 495 s, almost all of it the slot fill and the mirror read from ZFS
+(0.11 GB/s), which is a load cost only.
+
+Owed: the quality of IQ2_XS against UD-Q3_K_XL at the answer-level bar
+(the existing KL reference is the UD-Q3_K_XL GGUF on the CPU, so it cannot
+judge a different quant); the task battery on Strata's answers.
 
 ## Where it lives
 
