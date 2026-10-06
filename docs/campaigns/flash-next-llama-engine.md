@@ -1,9 +1,11 @@
 # flash-next-llama-engine — Qwen3.8-Flash-Next served by the libllama engine on one Arc card + RAM
 
-**Open.** Stage 1 (static placement, IQ kernels) built and served. Stage 2b
-(per-expert slots on the card, a bank in USM host memory, Strata's adaptive
-swaps) passed its gate 2026-10-06: prefill 81.9 -> 149.6 t/s at 20k, decode
-at parity, needle answered.
+**Open.** Stage 2b (expert cache: slots on the card, a USM bank) passed
+2026-10-06: prefill 235 t/s at 20k, decode 12.4-13.0 (UD-Q3_K_XL). Stage 3
+(2026-10-06): the GSQ-RCO IQ2_XS file runs (patch 0022), 337 t/s prefill and
+16.0 t/s decode, answers right; MTP from an MTP-only file runs but does not
+pay yet (13.8 t/s): a verify costs ~3 plain steps. Strata on the same card
+reads 620.5 / 37.2-37.8 (`strata-sycl-b60.md`).
 
 ## Charter
 
@@ -222,6 +224,54 @@ Measured (`measured-here`, B60, the GGUF on NVMe, 12,800 MiB of slots:
   codes read directly; correct, 22/22 `test-backend-ops` cases). Served decode
   12.6 t/s without it, 12.5 with it; on the 4096 x 14336 test shape 162 us
   against ggml's 154 (~400 GB/s already). Not shipped (`measured-here`, B60).
+
+### Stage 3 — the IQ2_XS file and MTP (2026-10-06)
+
+Strata's own engine on this card (`strata-sycl-b60.md`, `measured-here`)
+serves Flash-Next IQ2_XS (ISTA-DASLab GSQ-RCO) with its MTP draft layer at
+620.5 t/s prefill (20,045 tokens) and 37.2-37.8 t/s decode. This stage puts
+the same two inputs into arcint: the IQ2_XS file (contrib/llama.cpp patch
+0022: IQ2_S / IQ2_XXS / IQ1_M / Q2_0 / IQ3_S kernels on Intel, and F16 x 2-8
+columns) and the MTP head from an MTP-only GGUF (`--llama-mtp-gguf`, the
+pin's converter `--mtp` over the 31 `mtp.*` tensors plus the checkpoint's
+embedding and LM head; experts Q4_K, the rest Q8_0, embedding and head
+Q6_K: 2.54 GiB on the card).
+
+`measured-here`, B60, one window per row group, the gate's requests (capital,
+the 20,045-token needle, the 500-token long answer), greedy:
+
+| arm | slots | prefill 20k | decode 500 | drafts accepted | verify / round | answers |
+|---|---|---|---|---|---|---|
+| UD-Q3_K_XL, no MTP (a0) | 10,200 MiB | 230.9 t/s | 11.7 t/s (71.7 % on the card) | | | right |
+| UD-Q3_K_XL, MTP 3 (b3) | 10,200 MiB | 201.1 | 10.7 | 64.8 % | 257 ms (3.0 steps) | right |
+| UD-Q3_K_XL, MTP 2 (b2) | 10,200 MiB | 200.7 | 11.2 | 76.0 % | 211 ms (2.5 steps) | right |
+| IQ2_XS, no MTP (c0) | 12,500 MiB | **337.0** | **16.0** (88.2 %) | | | right |
+| IQ2_XS, MTP 3, before the F16 fix (c3) | 12,500 MiB | 275.0 | 5.1 | 62.5 % | 545 ms | right |
+| IQ2_XS, MTP 3 (d3) | 12,500 MiB | 278.5 | 13.8 | 62.5 % | 191 ms (3.1 steps) | right |
+| IQ2_XS, MTP 2 (d2) | 12,500 MiB | 277.7 | 13.8 | 71.7 % | 163 ms (2.6 steps) | right |
+
+`--llama-mtp-vocab` does not apply to Flash-Next: its draft head reads
+`output.weight` at `n_embd_out` (the four hyper-connection streams, 10,240),
+the LM head takes the mixed 2,560 (refused at load, arms a3/a2).
+
+Where an IQ2_XS decode token goes (`measured-here`, a profiling build of
+llama-bench, tg32 from a cold cache, so ~55 % hits, not served decode's 88 %):
+4,938 kernels a token, 62.0 ms of kernel time in an 87.3 ms span (5.1 us of
+gap a kernel); the gathers of bank experts 18.0 ms (they scale with the
+misses: ~5 ms at 88 %), the expert matvecs 11 ms at 40-77 GB/s of weights
+(IQ2_XXS 111 us, IQ2_S 68 us, Q2_0 74 us a call), the hyper-connection ops
+~6 ms.
+
+Why MTP does not pay here, against Strata (`code`, `src/core/verify.cpp:854-905`):
+Strata's verify groups a window's (token, expert) pairs per expert, copies a
+missed expert over the link once (`fetch_blobs`), and computes each expert's
+tokens in one kernel (`native_expert_grouped`). This engine's decode path
+gathers per pair (a repeated expert copied again) and computes per pair (an
+expert's weights read once per token): a 4-row verify costs ~3 plain steps,
+Strata's ~2. Next, in that order: the grouped verify (tile the window's pairs
+by expert with `kernel_moe_route_tiles`, gather unique experts, a matvec over
+an expert's columns); the low-bit kernels' rate (local-memory grids, wide
+aligned loads, as Strata's port did for IQ4_XS / Q6_K); fewer launches.
 
 Deviations from the references:
 - No share of the misses on the CPU (Strata computes the rest concurrently):

@@ -86,6 +86,10 @@ through its `serve/server.py` with the same requests as
 | speculative decoding | MTP draft layer: 288 of 433 drafts accepted, ~2.36 tokens a round | none |
 | VRAM free with everything loaded | 1,559 MiB | |
 
+arcint on the same IQ2_XS file (patch 0022, 12,500 MiB of slots,
+`flash-next-llama-engine.md` stage 3, `measured-here`): prefill 337.0 t/s,
+decode 16.0 t/s without MTP, 13.8 with it; answers right.
+
 What decode spends: 212 verify rounds for 500 tokens in 13.4 s, 63 ms a
 round, each verifying ~3 tokens (2.04 drafts offered a round). arcint
 spends 77 ms on one token. So the gap is about 2.4x from the drafts, times

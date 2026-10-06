@@ -1214,3 +1214,43 @@ Measured on the Arc Pro B60 with Qwen3.8-Flash-Next UD-Q3_K_XL from NVMe
   experts on the card after adaptation;
 - KL against the CPU reference 0.029634 / 95.784 % same top-1, stage 1
   0.029206 / 95.931 %.
+
+## 0022-opencl-intel-low-bit-iq-and-f16-small-n.patch
+
+The ISTA-DASLab GSQ-RCO quantisations of Qwen3.8-Flash-Next (the files
+Strata serves) store their experts in types ggml-opencl had no kernel for:
+gate/up IQ2_S, IQ2_XXS or IQ1_M, down Q2_0; their dense projections add
+IQ3_S. llama.cpp then left those layers to the CPU. The patch adds them to the
+Intel kq path of 0001/0021 as kq type indices 6-10, blocks as stored:
+- **Matrix-vector, 1 to 4 columns, and `MUL_MAT_ID`** (`mul_mv_iq_q8_1.cl`):
+  one 32-weight sub-block per lane, expanded to int8 and two scales (IQ2_S
+  and IQ1_M scale half sub-blocks; IQ1_M's values are 8 (g + delta), exact in
+  int8, the 1/8 in the scale); Q2_0's K need only be a multiple of 64, so its
+  640-wide down projections run. The grids are ggml's tables
+  (`ggml-common.h`), in constant memory.
+- **GEMM** (`mul_mm_kq_f16.cl`): the same expansion per (row, 32-block)
+  unit into the f16 tile, plain and `MUL_MAT_ID`; no tokens-as-a variant
+  (their `kernel_mul_mm_id2_kq_f16` entries stay null).
+- **The expert cache** (0021) takes these types; Q2_0 down projections go
+  through the kq path with the -1 skip, not the Q8_0 zero tables.
+- **F16 times 2 to 8 columns** (BF16 is stored as F16): one read of each
+  weight row for all columns (`kernel_mul_mv_f16_f32_nc`). The tiled GEMM
+  computed a 64-column tile for them: 4096 x 14336 took 2.80 ms at 2, 4 or
+  8 columns against 0.29 ms at one; now 0.70 / 0.75 / 0.89 ms. The GSQ-RCO
+  files keep their hyper-connection projections, routers and indexers in
+  BF16, so every MTP verify paid this.
+
+`test-backend-ops` against the CPU on the B60 (`measured-here`): `MUL_MAT`
+81/81 for the five types (1-10, 16 and 64 columns), `MUL_MAT_ID` 170/170,
+`MUL_MAT` f16/bf16 434/434.
+
+Measured on the Arc Pro B60, Flash-Next IQ2_XS (GSQ-RCO, 33.3 GiB of experts;
+`measured-here`, 2026-10-06; 12,500 MiB of slots, 9,069 experts on the card,
+20.94 GiB of bank): the 20,045-token needle prefills at 337.0 t/s and
+answers; decode 16.0 t/s on the 500-token answer, 88 % of decode's routed
+experts on the card. UD-Q3_K_XL on the same build and card: 230.9 / 11.7 t/s
+at 10,200 MiB of slots.
+
+The kernels' weight rate is low (one column, 4096 x 14336: IQ2_S ~112 GB/s,
+Q2_0 ~92, IQ2_XXS ~56, against IQ4_XS ~241): byte loads and constant-memory
+grid gathers, open.

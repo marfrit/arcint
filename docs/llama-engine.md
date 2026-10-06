@@ -346,6 +346,12 @@ references and every number):
   needed 0010, a masked-nextn row fix in the MTP graph.
 - `--llama-mtp-vocab FILE` drafts from a subset of the vocabulary: the
   draft steps read those rows of the head instead of all 248k.
+- `--llama-mtp-gguf FILE` takes the MTP layer from a separate MTP-only GGUF
+  (the pin's `convert_hf_to_gguf.py --mtp`: the MTP block, the embedding and
+  the LM head), loaded as a second model on the card, as llama.cpp's
+  draft-mtp loads one. Flash-Next's GGUFs carry no MTP layer; its head comes
+  from the checkpoint's 31 `mtp.*` tensors. `--llama-mtp-vocab` does not
+  apply to Flash-Next (its draft head reads the hyper-connection-wide row).
 
 Served, the same prompt at temperature 0, 10/10 in every run
 (`measured-here`):

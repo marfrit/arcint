@@ -131,7 +131,10 @@ KL no more than 0.03 nats above plain's, argmax down at most 1 point.
   -- against a 51 ms plain step, ~2.0 steps for 3.6 tokens (the K-quant
   matvec takes 4 columns, the decode attention up to 8 rows), against the
   OpenVINO path's ~3.6 steps a 4-token window below. Flash-Next on this
-  engine: not yet.
+  engine (2026-10-06, `--llama-mtp-gguf`, an MTP-only file from the pin's
+  converter): served and right, but no gain yet: IQ2_XS 16.0 t/s plain,
+  13.8 with 2 or 3 drafts (62-72 % accepted), a verify ~3 plain steps
+  (`flash-next-llama-engine.md`, stage 3).
 - **Dense 27B agent** (`measured-here`, 24 GB card, DESIGN §7.0.2ag): MTP
   drafts one token a cycle; at 77,134 tokens it accepts 90.8 % and decodes
   4.9 t/s against plain 15.3 t/s, a cycle of ~390 ms; DFlash reads 18.8 t/s.
