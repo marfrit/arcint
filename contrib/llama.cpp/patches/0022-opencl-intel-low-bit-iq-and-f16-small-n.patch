@@ -1,7 +1,7 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -994,10 +994,21 @@
+@@ -994,10 +994,23 @@
      cl_kernel kernel_kq_quantize_q8_1 = nullptr;
      int       kq_quantize_sg = 0;   // > 0: kernel_kq_quantize_q8_1 is the sub-group kernel of that size
      // per type, ggml_cl_kq_type_index: Q4_K, Q5_K, Q6_K (mul_mv_kq_q8_1.cl),
@@ -24,10 +24,12 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
 +    cl_kernel kernel_dsv4_hc_pre = nullptr, kernel_dsv4_hc_post = nullptr;
 +    // the MoE router's softmax + top-k + normalized weights in one kernel, Intel
 +    cl_kernel kernel_topk_moe = nullptr;
++    // SCALE -> SILU / SCALE -> SIGMOID -> SCALE fused, Intel
++    cl_kernel kernel_scale_act = nullptr;
      // Intel: x f16 GEMM on the XMX units (mul_mm_kq_f16.cl), per type, plain
      // and MUL_MAT_ID; the sub-group size and tiles
      cl_kernel kernel_kq_cvt_f32_f16 = nullptr;
-@@ -1009,11 +1020,11 @@
+@@ -1009,11 +1022,11 @@
      cl_kernel kernel_mul_mm_kq2d[3] = {};
      int       kq2d_tm = 64, kq2d_wg = 16;
      int       kq2d_tm_t[3] = { 64, 64, 64 }, kq2d_wg_t[3] = { 16, 16, 16 };   // per type (GGML_OPENCL_KQ_2D_T<i>)
@@ -42,7 +44,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      int       kq_id2_xt = 32, kq_id2_xsg = 16;
      // the route in prealloc_kq_pairs / _tiles / _ntiles: a MoE layer's gate,
      // up and down share their ids tensor, so it is computed once a layer
-@@ -2240,22 +2251,40 @@
+@@ -2240,22 +2253,41 @@
  #else
                  const std::string iq_src = read_file("mul_mv_iq_q8_1.cl");
  #endif
@@ -78,6 +80,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
 +                        CL_CHECK((backend_ctx->kernel_dsv4_hc_pre  = clCreateKernel(prog, "kernel_dsv4_hc_pre",  &err), err));
 +                        CL_CHECK((backend_ctx->kernel_dsv4_hc_post = clCreateKernel(prog, "kernel_dsv4_hc_post", &err), err));
 +                        CL_CHECK((backend_ctx->kernel_topk_moe = clCreateKernel(prog, "kernel_topk_moe_softmax_norm", &err), err));
++                        CL_CHECK((backend_ctx->kernel_scale_act = clCreateKernel(prog, "kernel_scale_act_f32", &err), err));
 +                        for (int i = 0; i < 8; ++i) {
 +                            std::string g = iq_id_n[i];
 +                            g.replace(g.find("_id_"), 4, "_idg_");
@@ -87,7 +90,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                      CL_CHECK(clReleaseProgram(prog));
                      GGML_LOG_CONT(".");
                  }
-@@ -2486,10 +2515,14 @@
+@@ -2486,10 +2518,14 @@
                          }
                      }
                  }
@@ -106,7 +109,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                  // the tokens-as-a MUL_MAT_ID kernel: pairs per tile, sub-groups per
                  // work-group, 32 x 16 on SG 8 (measured-here, the coder's prefill on
                  // an A770: 32 x 16, 32 x 32 and 16 x 32 within 3 %, 64 x 16 1.7x
-@@ -2526,10 +2559,10 @@
+@@ -2526,10 +2562,10 @@
                          CL_CHECK((backend_ctx->kernel_moe_gather_pairs   = clCreateKernel(mm_prog, "kernel_moe_gather_pairs", &err), err));
                      }
                      if (backend_ctx->kernel_kq_cvt_f32_f16 != nullptr) {
@@ -119,7 +122,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                                  std::string id2 = id_n[i];
                                  id2.replace(id2.find("_id_"), 4, "_id2_");
                                  CL_CHECK((backend_ctx->kernel_mul_mm_id2_kq_f16[i] = clCreateKernel(mm_prog, id2.c_str(), &err), err));
-@@ -9192,6 +9225,77 @@
+@@ -9192,6 +9228,144 @@
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
  }
  
@@ -194,13 +197,89 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
 +    backend_ctx->enqueue_ndrange_kernel(kk, 1, gws, lws, n[8]);
 +}
 +
++// SCALE (s, bias b) -> SILU, or SCALE -> SIGMOID [-> SCALE (s2, no bias)], on
++// contiguous f32 of one shape: the count of nodes fused (0: none)
++static int ggml_opencl_can_fuse_scale_act(const ggml_backend_opencl_context * backend_ctx, const ggml_cgraph * cgraph, int i,
++                                          int * act, float * s2) {
++    static const char * env = getenv("GGML_OPENCL_FUSE_SCALE_ACT");
++    if (backend_ctx->kernel_scale_act == nullptr || (env != nullptr && atoi(env) == 0) || i + 1 >= cgraph->n_nodes) {
++        return 0;
++    }
++    ggml_tensor ** n = cgraph->nodes + i;
++    if (n[0]->op != GGML_OP_SCALE || n[0]->type != GGML_TYPE_F32 || n[0]->src[0]->type != GGML_TYPE_F32 ||
++        !ggml_is_contiguous(n[0]) || !ggml_is_contiguous(n[0]->src[0]) || n[1]->op != GGML_OP_UNARY || n[1]->src[0] != n[0] ||
++        n[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(n[1]) || !ggml_are_same_shape(n[0], n[1])) {
++        return 0;
++    }
++    const ggml_unary_op u = ggml_get_unary_op(n[1]);
++    if (u == GGML_UNARY_OP_SILU) {
++        static const enum ggml_op ops[2] = { GGML_OP_SCALE, GGML_OP_UNARY };
++        const int outs[1] = { i + 1 };
++        if (!ggml_can_fuse_subgraph(cgraph, i, 2, ops, outs, 1)) return 0;
++        *act = 0; *s2 = 1.0f;
++        return 2;
++    }
++    if (u != GGML_UNARY_OP_SIGMOID) {
++        return 0;
++    }
++    if (i + 2 < cgraph->n_nodes && n[2]->op == GGML_OP_SCALE && n[2]->src[0] == n[1] && n[2]->type == GGML_TYPE_F32 &&
++        ggml_is_contiguous(n[2]) && ggml_are_same_shape(n[1], n[2]) && ((const float *) n[2]->op_params)[1] == 0.0f) {
++        static const enum ggml_op ops[3] = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE };
++        const int outs[1] = { i + 2 };
++        if (ggml_can_fuse_subgraph(cgraph, i, 3, ops, outs, 1)) {
++            *act = 1; memcpy(s2, (const float *) n[2]->op_params, sizeof(float));
++            return 3;
++        }
++    }
++    static const enum ggml_op ops[2] = { GGML_OP_SCALE, GGML_OP_UNARY };
++    const int outs[1] = { i + 1 };
++    if (!ggml_can_fuse_subgraph(cgraph, i, 2, ops, outs, 1)) return 0;
++    *act = 1; *s2 = 1.0f;
++    return 2;
++}
++
++static void ggml_cl_scale_act_fused(ggml_backend_t backend, ggml_cgraph * cgraph, int i, int nf, int act, float s2) {
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
++    const ggml_tensor * x = cgraph->nodes[i]->src[0];
++    const ggml_tensor * d = cgraph->nodes[i + nf - 1];
++    ggml_tensor_extra_cl * ex = (ggml_tensor_extra_cl *) x->extra;
++    ggml_tensor_extra_cl * ed = (ggml_tensor_extra_cl *) d->extra;
++    const cl_ulong offx = ex->offset + x->view_offs, offd = ed->offset + d->view_offs;
++    float s1 = 1.0f, b1 = 0.0f;
++    memcpy(&s1, (const float *) cgraph->nodes[i]->op_params + 0, sizeof(float));
++    memcpy(&b1, (const float *) cgraph->nodes[i]->op_params + 1, sizeof(float));
++    const int n = (int) ggml_nelements(d);
++    cl_kernel k = backend_ctx->kernel_scale_act;
++    int a = 0;
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &ex->data_device));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offx));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &ed->data_device));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offd));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &n));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(float),    &s1));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(float),    &b1));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(float),    &s2));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &act));
++    size_t lws[1] = { 64 }, gws[1] = { (size_t) CEIL_DIV(n, 64) * 64 };
++    backend_ctx->enqueue_ndrange_kernel(k, 1, gws, lws, d);
++}
++
  static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
      backend_ctx->graph_gen++;
-@@ -9212,6 +9316,11 @@
+@@ -9212,6 +9386,20 @@
              continue;
          }
  
++        if (!backend_ctx->disable_fusion) {
++            int act = 0; float s2 = 1.0f;
++            const int nf = ggml_opencl_can_fuse_scale_act(backend_ctx, cgraph, i, &act, &s2);
++            if (nf > 0) {
++                ggml_cl_scale_act_fused(backend, cgraph, i, nf, act, s2);
++                i += nf - 1;
++                continue;
++            }
++        }
 +        if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse_topk_moe(backend_ctx, cgraph, i)) {
 +            ggml_cl_topk_moe_fused(backend, cgraph, i);
 +            i += 9;
@@ -209,7 +288,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
              ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
              i += 2;
-@@ -9824,6 +9933,14 @@
+@@ -9824,6 +10012,14 @@
              }
          case GGML_OP_TIMESTEP_EMBEDDING:
              return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
@@ -224,7 +303,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          case GGML_OP_GROUP_NORM:
              return ggml_is_contiguous(op->src[0]);
          case GGML_OP_MUL_MAT:
-@@ -9832,6 +9949,11 @@
+@@ -9832,6 +10028,11 @@
              // (ggml_cl_mul_mv_kq_q8_1, ggml_cl_mul_mm_kq_f16), and are the only
              // path for IQ3_XXS / IQ4_XS; ahead of the Adreno rule below that
              // declines 512 or more columns without the Adreno GEMM
@@ -236,7 +315,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              if (ggml_cl_kq_type_index(op->src[0]->type) >= 0 && kq_q8_1_enabled(backend_ctx) &&
                  op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % ggml_cl_kq_k_unit(op->src[0]->type) == 0 &&
                  op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 && op->src[0]->view_offs == 0 &&
-@@ -9910,6 +10032,10 @@
+@@ -9910,6 +10111,10 @@
                  }
              }
  #ifdef GGML_OPENCL_SOA_Q
@@ -247,7 +326,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              if (ggml_cl_kq_type_index(op->src[0]->type) >= 0 && kq_q8_1_enabled(backend_ctx)) {
                  return op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % ggml_cl_kq_k_unit(op->src[0]->type) == 0 &&
                         op->src[0]->view_offs == 0 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
-@@ -10710,6 +10836,49 @@
+@@ -10710,6 +10915,49 @@
  
  // USM host buffers: bytes by memcpy; IQ4_NL whole tensors split into scales
  // and quants (as kernel_convert_block_iq4_nl lays them out), each 128-aligned
@@ -297,7 +376,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  static void ggml_cl_usm_set_tensor(ggml_backend_opencl_buffer_context * ctx, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
      ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
      char * base = (char *) ctx->usm + e->offset + tensor->view_offs;
-@@ -10727,6 +10896,11 @@
+@@ -10727,6 +10975,11 @@
          ctx->usm_split[tensor] = { d, q };
          return;
      }
@@ -309,7 +388,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      memcpy(base + offset, data, size);
  }
  
-@@ -10741,6 +10915,16 @@
+@@ -10741,6 +10994,16 @@
      cl_context context = backend_ctx->context;
      cl_command_queue queue = backend_ctx->queue;
  
@@ -326,7 +405,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  #ifdef GGML_OPENCL_SOA_Q
      if (tensor->type == GGML_TYPE_Q1_0) {
          ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
-@@ -12401,6 +12585,21 @@
+@@ -12401,6 +12664,21 @@
  
  static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
      GGML_ASSERT(tensor->extra);
@@ -348,7 +427,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
      ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer->buft->device->context;
      ggml_backend_opencl_context *backend_ctx = dev_ctx->backend_ctx;
-@@ -14360,6 +14559,9 @@
+@@ -14360,6 +14638,9 @@
                      memcpy(dst + b * blk, dq.first + (i2 * bps + b) * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
                      memcpy(dst + b * blk + sizeof(ggml_fp16_t), dq.second + (i2 * bps + b) * qb, qb);
                  }
@@ -358,7 +437,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              } else {
                  ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
                  memcpy(data, (const char *) bctx->usm + e->offset + (size_t) i2 * tensor->nb[2], (size_t) n * tensor->nb[2]);
-@@ -14492,6 +14694,9 @@
+@@ -14492,6 +14773,9 @@
                      memcpy(dq.first + (i2 * bps + b) * sizeof(ggml_fp16_t), src + b * blk, sizeof(ggml_fp16_t));
                      memcpy(dq.second + (i2 * bps + b) * qb, src + b * blk + sizeof(ggml_fp16_t), qb);
                  }
@@ -368,7 +447,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              } else {
                  ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
                  memcpy((char *) bctx->usm + e->offset + (size_t) i2 * tensor->nb[2], data, (size_t) n * tensor->nb[2]);
-@@ -14537,6 +14742,10 @@
+@@ -14537,6 +14821,10 @@
          return;
      }
  #endif
@@ -379,7 +458,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      {
          // a plain tensor: a non-blocking write; the caller keeps `data` until the
          // next synchronization (llama_expert_cache's tables live in the layer)
-@@ -14779,9 +14988,17 @@
+@@ -14779,9 +15067,17 @@
  
      cl_kernel kernel;
  
@@ -399,7 +478,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          GGML_ASSERT(ggml_is_contiguous(src0));
          GGML_ASSERT(ne11 == 1);
      }
-@@ -14790,7 +15007,7 @@
+@@ -14790,7 +15086,7 @@
          GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
          if (bcast_row) {
              kernel = backend_ctx->kernel_add_row;
@@ -408,7 +487,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
              CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
              CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra1->data_device));
-@@ -17577,6 +17794,70 @@
+@@ -17577,6 +17873,70 @@
      }
  }
  
@@ -479,7 +558,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  static void ggml_cl_timestep_embedding(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -24733,6 +25014,14 @@
+@@ -24733,6 +25093,14 @@
  // the single branch: the mirror for the matvec's trailing arguments
  static cl_mem g_kq_single_q = nullptr, g_kq_single_d = nullptr;
  static int    g_kq_single_split = 0;
@@ -494,7 +573,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
  static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, cl_uint & a) {
      const ggml_tensor * soa0 = src0->view_src != nullptr ? src0->view_src : src0;
-@@ -24748,7 +25037,7 @@
+@@ -24748,7 +25116,7 @@
          // base and the offset, or IQ4_NL's scales and quants)
          auto * bctx = (ggml_backend_opencl_buffer_context *) soa0->buffer->context;
          if (bctx->usm) {
@@ -503,7 +582,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                  ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *)src0->extra;
                  const cl_ulong off = e->offset + src0->view_offs;
                  CL_CHECK(g_cl_set_arg_ptr(kernel, a++, bctx->usm));
-@@ -24756,7 +25045,7 @@
+@@ -24756,7 +25124,7 @@
                  CL_CHECK(g_cl_set_arg_ptr(kernel, a++, bctx->usm));
                  return;
              }
@@ -512,7 +591,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              const auto & dq = bctx->usm_split.at(soa0);
              const cl_ulong off = 0;
              CL_CHECK(g_cl_set_arg_ptr(kernel, a++, dq.second));
-@@ -24765,7 +25054,7 @@
+@@ -24765,7 +25133,7 @@
              return;
          }
      }
@@ -521,7 +600,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *)src0->extra;
          const cl_ulong off = e->offset + src0->view_offs;
          CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &e->data_device));
-@@ -24807,13 +25096,19 @@
+@@ -24807,13 +25175,19 @@
          case GGML_TYPE_IQ3_XXS: return 3;
          case GGML_TYPE_IQ4_XS:  return 4;
          case GGML_TYPE_IQ4_NL:  return 5;
@@ -543,7 +622,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  }
  
  // Q4_K and Q5_K subtract a min per sub-block: their kernels read the
-@@ -25171,6 +25466,46 @@
+@@ -25171,6 +25545,46 @@
          return;
      }
  
@@ -590,7 +669,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      // quant kv without FA
      // used for non-contiguous src0 (the usual head-major permuted K view when n_head_kv>1)
      // AND for the contiguous case that occurs when n_head_kv==1 (e.g. Gemma-4 E2B)
-@@ -27611,6 +27946,17 @@
+@@ -27611,6 +28025,17 @@
      const bool id2 = gemm && (id2_env == nullptr ? id2_default : atoi(id2_env) != 0) && backend_ctx->kernel_mul_mm_id2_kq_f16[ti] != nullptr;
      cl_kernel kernel = id2 ? backend_ctx->kernel_mul_mm_id2_kq_f16[ti] :
                         gemm ? backend_ctx->kernel_mul_mm_id_kq_f16[ti] : backend_ctx->kernel_mul_mv_id_kq_q8_1[ti];
@@ -608,7 +687,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      if (kernel == nullptr) {
          return false;
      }
-@@ -27656,9 +28002,18 @@
+@@ -27656,9 +28081,18 @@
                  GGML_ASSERT(per_expert % 16 == 0);
                  stage.allocate(backend_ctx->context, per_expert * (size_t) n_expert);
                  const cl_ulong n16 = per_expert / 16;
@@ -630,7 +709,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                      cl_kernel kg = backend_ctx->kernel_moe_gather_pairs;
                      CL_CHECK(g_cl_set_arg_ptr(kg, 0, src));
                      CL_CHECK(clSetKernelArg(kg, 1, sizeof(cl_mem),   &stage.buffer));
-@@ -27669,7 +28024,7 @@
+@@ -27669,7 +28103,7 @@
                      CL_CHECK(clSetKernelArg(kg, 6, sizeof(int),      &n_used));
                      CL_CHECK(clSetKernelArg(kg, 7, sizeof(int),      &n_split));
                      size_t g_local[2]  = { 256, 1 };
@@ -639,7 +718,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                      backend_ctx->enqueue_ndrange_kernel(kg, 2, g_global, g_local, dst);
                      return stage.buffer;
                  }
-@@ -27682,8 +28037,10 @@
+@@ -27682,8 +28116,10 @@
                  CL_CHECK(clSetKernelArg(kg, 5, sizeof(cl_ulong), &nbi1));
                  CL_CHECK(clSetKernelArg(kg, 6, sizeof(int),      &n_used));
                  CL_CHECK(clSetKernelArg(kg, 7, sizeof(int),      &n_tok));
@@ -651,7 +730,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                  backend_ctx->enqueue_ndrange_kernel(kg, 2, g_global, g_local, dst);
                  return stage.buffer;
              };
-@@ -27701,11 +28058,12 @@
+@@ -27701,11 +28137,12 @@
                  // goes in the matvec's trailing ones (below)
                  g_kq_single_q = g_kq_stage_q; g_kq_single_d = g_kq_stage_d != nullptr ? g_kq_stage_d : g_kq_stage_q;
                  g_kq_single_split = n_split;
@@ -665,7 +744,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
      cl_uint a = 0;
      if (!gemm) {
-@@ -27740,6 +28098,49 @@
+@@ -27740,6 +28177,49 @@
              CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),    &ns));
          }
          const int rows_per_wg = backend_ctx->kq_q8_1_ndst * 4;
@@ -715,7 +794,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          size_t global_work_size[] = { (size_t)CEIL_DIV(ne01, rows_per_wg) * 16, 4, (size_t)n_used * n_tok };
          size_t local_work_size[]  = { 16, 4, 1 };
          backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
-@@ -31955,6 +32356,18 @@
+@@ -31955,6 +32435,18 @@
              }
              ggml_cl_timestep_embedding(backend, tensor->src[0], tensor);
              return true;
@@ -3264,7 +3343,7 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
      if ((TYPE) == 2) {                                                                         \
          mv_iq4_nl(q + offq, dp, ((ulong)e * ne01 + first_row) * (ne00 / 32), ne00 / 32, first_row, ne01, \
                    xq + (ulong)col * ne00, xd + (ulong)col * (ne00 / 32), res,                  \
-@@ -337,3 +1537,306 @@
+@@ -337,3 +1537,318 @@
  MV_ID_KERNEL(kernel_mul_mv_id_iq3_xxs_q8_1, 0)
  MV_ID_KERNEL(kernel_mul_mv_id_iq4_xs_q8_1, 1)
  MV_ID_KERNEL(kernel_mul_mv_id_iq4_nl_q8_1, 2)
@@ -3570,6 +3649,18 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
 +        global float * wo = (global float *)(w + offw + (ulong)t * nbw1);
 +        for (int j = 0; j < k; ++j) wo[j] = wt[j] / sum;
 +    }
++}
++
++// ---- SCALE -> SILU and SCALE -> SIGMOID -> SCALE in one pass (contiguous
++// f32): the hyper-connection mixer's silu(x / hc) and combine's
++// 2 sigmoid(x / hc), ~290 small kernels a Flash-Next graph ----
++kernel void kernel_scale_act_f32(global const char * x, ulong offx, global char * d, ulong offd, int n,
++                                 float s1, float b1, float s2, int act) {
++    const int i = get_global_id(0);
++    if (i >= n) return;
++    const float v = ((global const float *)(x + offx))[i] * s1 + b1;
++    const float r = act == 0 ? v / (1.0f + exp(-v)) : s2 / (1.0f + exp(-v));
++    ((global float *)(d + offd))[i] = r;
 +}
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 --- a/src/llama-expert-cache.cpp

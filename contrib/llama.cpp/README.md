@@ -1260,6 +1260,14 @@ the decode-path work Flash-Next and its MTP verify needed on Intel:
 - **IQ4 codebook per card**: register selects where the device has 8-wide
   sub-groups (A770: MV_ID 34 -> 28 us), constant gathers elsewhere (B60:
   130 vs 146 us dense).
+- **SCALE -> SILU and SCALE -> SIGMOID [-> SCALE] fused** into one
+  elementwise kernel (`kernel_scale_act_f32`, `GGML_OPENCL_FUSE_SCALE_ACT=0`
+  turns it off): fewer launches a step, the served text identical; no
+  decode change measurable above the run-to-run spread.
+- The gather's shape for 2+ tokens is switchable for measurement:
+  `GGML_OPENCL_GATHER_PAIRS_MULTI=1` takes the per-pair grid back,
+  `GGML_OPENCL_GATHER_CHUNKS` sets the per-expert split. Served, the shape
+  did not move the gathers' time (their bytes over the link do).
 - A matvec grouped by expert for 2-15 tokens (`kernel_mul_mv_idg_*`), opt-in
   only (`GGML_OPENCL_KQ_IDG=1`): slower than a pair a work-group where the
   matvec is not bandwidth-bound (the coder's verify 7.85 -> 9.18 s, A770).
