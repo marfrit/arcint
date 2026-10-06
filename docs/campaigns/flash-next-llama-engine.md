@@ -197,6 +197,12 @@ Measured (`measured-here`, B60, the GGUF on NVMe, 12,800 MiB of slots:
   slot corrupted, `LLAMA_EXPERT_CACHE_MUTATE=1`) reports 1 of 6.
 - The gate (per phase): prefill +83 %, decode at or above stage 1's range, the
   answer-level bar met. **Passed.**
+- **One ubatch per prefill chunk** (arcint sets `n_ubatch = n_batch` with the
+  cache): a ubatch gathers each layer's routed bank experts once, so 2,048
+  tokens a ubatch read the link a quarter as often as 512. The needle
+  prefills at **235.0 t/s** (2,048, the default chunk) and 258.4 t/s
+  (`--prefill-chunk 4096`), decode 12.2 / 12.0 t/s, answered both times
+  (`measured-here`, B60, 32,768 context).
 
 Deviations from the references:
 - No share of the misses on the CPU (Strata computes the rest concurrently):

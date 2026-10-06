@@ -137,8 +137,10 @@ Strata's decode profile and swapped as decode's usage moves. The rest sit in a
 bank in USM host memory, and the routed ones are gathered over the link before
 their kernels run. On the B60 with 12,800 MiB of slots
 (`measured-here`, the same window):
-- the 20,045-token needle prefills at 149.6 t/s, against 81.9 with 16 expert
-  layers on the card, and is answered;
+- the 20,045-token needle prefills at 235.0 t/s with one ubatch per
+  2,048-token chunk (149.6 with 512-token ubatches; 258.4 with
+  `--prefill-chunk 4096`), against 81.9 with 16 expert layers on the card,
+  and is answered;
 - decode 12.2-12.3 t/s, against 10.5-12.4; 75 % of decode's routed experts
   on the card after adaptation;
 - KL against the CPU reference +0.0004 nats, same top-1 -0.15 points.

@@ -1205,7 +1205,8 @@ and IQ4_NL experts, Q8_0 down projections, nothing else).
 Measured on the Arc Pro B60 with Qwen3.8-Flash-Next UD-Q3_K_XL from NVMe
 (`measured-here`, 2026-10-06; 12,800 MiB of slots, 36.5 GiB of bank):
 - the 20,045-token needle prefills at 149.6 t/s against stage 1's 81.9 (16
-  expert layers on the card), answered;
+  expert layers on the card), answered; 235.0 t/s with 2,048-token ubatches
+  (arcint's default with the cache);
 - decode 12.2-12.3 t/s against stage 1's 10.5-12.4; 75 % of decode's routed
   experts on the card after adaptation;
 - KL against the CPU reference 0.029634 / 95.784 % same top-1, stage 1
