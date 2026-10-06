@@ -131,6 +131,49 @@ ggml's OpenCL backend, which is why the image carries the ICD loader and
 the Intel compute-runtime driver (`ocl-icd`, `intel-compute-runtime`).
 See `docs/llama-engine.md` for that engine's own flags.
 
+## CPU baseline: the image is portable, and that costs something
+
+A container is built once and run anywhere, so the CPU instruction set has to
+be chosen at build time for a machine that is not present. The engine image
+is built at the **x86-64-v3** baseline:
+
+| enabled | disabled |
+|---|---|
+| SSE4.2, AVX, AVX2, BMI2, FMA, F16C | AVX-512 (F/CD/BW/DQ/VL), AVX512-VBMI, AVX512-VNNI, AVX512-BF16, AVX-VNNI, AMX |
+
+That covers essentially every x86 server CPU from Haswell (2013) and Zen 1
+(2017) onward. It is **not** the bare SSE2 baseline — AVX2 and FMA are on.
+
+**What is left on the table:** on a host that *does* have AVX-512 or AMX —
+Skylake-SP and later Xeon, EPYC 9004 and later — ggml has wider kernels for
+the CPU-side work and this image will not use them. How much that matters
+here is **not measured**. The served workload is GPU-resident: the CPU
+backend carries tokenisation, sampling, any op without an OpenCL kernel, and
+tensors the planner did not place on the device. So the expected cost is
+small, but it is a real cost and it has not been quantified against a
+native-tuned build on the same host.
+
+**Why not build every variant and dispatch at runtime.** `GGML_CPU_ALL_VARIANTS=ON`
+is the portable-and-fast option, but it requires `GGML_BACKEND_DL=ON` —
+without it CMake fails outright — and that makes the CPU backend a
+dynamically loaded shared library. arcint links llama.cpp statically as a
+subproject (`CMakeLists.txt:165`, `target_link_libraries(arcint_core PUBLIC
+llama OpenCL::OpenCL)`), so DL backends do not fit the current link model
+without rework. The floor was the cheap correct answer; all-variants is a
+possible follow-up.
+
+**The `.deb` does not have this problem, and that is the distinction worth
+keeping.** `contrib/packaging/arcint/build-deb.sh` is run by hand on the
+target trixie host, so `-march=native` there optimises for the machine that
+will actually run it. The package and the image differ in *who owns the ISA
+decision*: the packager, or the image. If you need the last of the CPU-side
+performance on a specific host, build the `.deb` there.
+
+The build asserts the baseline rather than trusting the flag: `objdump` over
+the installed binary must show **no `zmm`** registers (AVX-512 would SIGILL
+elsewhere) and **must show `ymm`** (their absence means the build fell back
+to SSE-only, which would be a silent performance cliff of its own).
+
 ## What CI covers, and what it cannot
 
 Covered, no GPU required:

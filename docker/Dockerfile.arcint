@@ -150,7 +150,11 @@ RUN if objdump -d /install/usr/bin/arcint 2>/dev/null | grep -qE '%zmm[0-9]+'; t
       echo "AVX-512 (zmm) in the binary -- this image SIGILLs on pre-AVX512 CPUs (Zen <=3, pre-Skylake Xeon). GGML_NATIVE did not take." >&2; \
       exit 1; \
     fi; \
-    echo "portability gate: no AVX-512 in the binary (x86-64-v3 baseline)"
+    if ! objdump -d /install/usr/bin/arcint 2>/dev/null | grep -qE '%ymm[0-9]+'; then \
+      echo "no AVX2 (ymm) in the binary either -- the build fell back to the SSE baseline, not x86-64-v3. GGML_NATIVE=OFF should leave INS_ENB=ON." >&2; \
+      exit 1; \
+    fi; \
+    echo "portability gate: no AVX-512 (zmm), AVX2 (ymm) present -- x86-64-v3 baseline confirmed"
 
 # --- final -----------------------------------------------------------------
 FROM ${OV_BASE}
