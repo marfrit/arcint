@@ -89,6 +89,7 @@ RUN cmake -S /src/arcint -B /src/build \
       -DARCINT_OPENVINO=ON \
       -DARCINT_LLAMA=ON \
       -DARCINT_LLAMA_DIR="/src/llama/llama.cpp-${LLAMA_COMMIT}" \
+      -DGGML_NATIVE=OFF \
       -DARCINT_WERROR=ON \
       -DARCINT_TESTS=ON \
       -DARCINT_GIT_SHA="${ARCINT_GIT_SHA}" \
@@ -134,6 +135,22 @@ RUN nm -C /install/usr/bin/arcint 2>/dev/null | grep -qE '\bllama_(backend_init|
 RUN strings -a /install/usr/bin/arcint | grep -qF 'mul_mv_kq_q8_1' \
   || { echo "the patched Intel K-quant kernels are not embedded -- contrib/llama.cpp/patches did not reach the build" >&2; exit 1; }; \
     echo "both engines linked: $(nm -C /install/usr/bin/arcint | grep -cE '\bllama_[a-z_]+\b') libllama symbols, patched OpenCL kernels embedded"
+
+# Portability gate. GGML_NATIVE defaults ON, which compiles ggml-cpu with
+# -march=native ON THE BUILD RUNNER -- so the image inherits the runner's
+# instruction set and SIGILLs (exit 132) on any CPU that lacks it. Measured
+# here: the first build of this tier ran the OpenVINO path fine on an EPYC
+# 7402 (Zen 2: SSE4.2/AVX/AVX2/FMA/BMI2, no AVX-512, no AMX) and died in
+# llama_model_load_from_file with no log line at all, because the illegal
+# instruction kills the process before anything can report. -DGGML_NATIVE=OFF
+# makes ggml build x86-64-v3 instead (INS_ENB=ON at ggml/CMakeLists.txt:139,
+# every GGML_AVX512* defaulting OFF at :159-162). Assert it rather than
+# trusting the flag: zmm registers in the binary mean AVX-512 got in.
+RUN if objdump -d /install/usr/bin/arcint 2>/dev/null | grep -qE '%zmm[0-9]+'; then \
+      echo "AVX-512 (zmm) in the binary -- this image SIGILLs on pre-AVX512 CPUs (Zen <=3, pre-Skylake Xeon). GGML_NATIVE did not take." >&2; \
+      exit 1; \
+    fi; \
+    echo "portability gate: no AVX-512 in the binary (x86-64-v3 baseline)"
 
 # --- final -----------------------------------------------------------------
 FROM ${OV_BASE}
