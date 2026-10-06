@@ -3325,3 +3325,12 @@ TEST(fit_ledger_path_empty_dir_returns_empty) {
 TEST(fit_ledger_path_empty_hash_returns_empty) {
     CHECK_EQ(fit_ledger_path("/cache", ""), std::string(""));
 }
+
+// DESIGN §7.0.2cl: a CPU embedding device reads the table into host memory
+// (no first-use faults from the mapped .bin); a GPU one keeps the mapping.
+TEST(embeddings_read_into_host_memory_only_on_a_cpu_device) {
+    CHECK(embeddings_read_into_host_memory("CPU"));
+    CHECK(!embeddings_read_into_host_memory("GPU.1"));
+    CHECK(!embeddings_read_into_host_memory("GPU"));
+    CHECK(!embeddings_read_into_host_memory(""));
+}

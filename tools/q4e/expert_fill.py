@@ -298,6 +298,64 @@ class ExpertFiller:
         }
 
 
+class NativeExpertFiller:
+    """Serves the CHECKPOINT'S OWN BLOCKS to `serving_shape._native_expert`,
+    re-laid per role by q4e.native_blocks -- no quantisation, a byte
+    re-arrangement plus the per-block scales (DESIGN 7.0.2bz). `native(layer,
+    kind, e, out, inn)` returns (format, parts) where format is the GGUF's
+    tensor type for that expert tensor (read, not assumed: the shipped
+    checkpoint mixes IQ3_XXS / IQ4_XS gate/up over IQ4_NL / Q8_0 downs per
+    layer, `native_blocks.BLOCK_BYTES`) and parts are the per-role arrays
+    over e*out rows. `layer_of` maps an IR layer to a GGUF
+    block as in `gguf_expert_source`. The census matches ExpertFiller's."""
+
+    def __init__(self, feed, layer_of=None, packed=False):
+        self._feed = feed
+        self._layer_of = layer_of
+        # arcint (patch 0052): carry the checkpoint's own 82-byte IQ2_S block
+        # VERBATIM (82 B/256, the GGUF size) instead of re-laying it into the
+        # split form (128 B/256); the emitter's _native_packed_expert reads it.
+        self._packed = packed
+        self.served = []
+        self._seen = {}
+
+    def native(self, layer, kind, e, out, inn):
+        from q4e import native_blocks as nb
+        key = (layer, kind)
+        self._seen[key] = self._seen.get(key, 0) + 1
+        blk = self._layer_of(layer) if self._layer_of else layer
+        gname = f"blk.{blk}.ffn_{kind}_exps.weight"
+        fmt = self._feed.gguf_type(gname)
+        if fmt not in nb.SPLIT:
+            raise ValueError(f"{gname}: {fmt} is not a native expert format this fill carries "
+                             f"({sorted(nb.SPLIT)})")
+        raw = self._feed.raw_rows(gname, rows=e)                     # [e, out, row_bytes]
+        assert raw.shape[0] == e and raw.shape[1] == out, (
+            f"{gname}: shard rows {raw.shape} vs the IR's ({e}, {out}, {inn})")
+        block, nbytes = nb.BLOCK_BYTES[fmt]
+        assert raw.shape[2] == inn // block * nbytes, (
+            f"{gname}: {raw.shape[2]} B per row is not {inn} values of {fmt}")
+        if self._packed and fmt in nb.PACKED:
+            parts = nb.PACKED[fmt](raw.reshape(e * out, raw.shape[2]))
+            self.served.append((layer, kind, (e, out, inn), int(sum(p.nbytes for p in parts))))
+            return fmt + "_PACKED", parts
+        parts = nb.SPLIT[fmt](raw.reshape(e * out, raw.shape[2]))
+        self.served.append((layer, kind, (e, out, inn), int(sum(p.nbytes for p in parts))))
+        return fmt, parts
+
+    def census(self):
+        doubles = {k: n for k, n in self._seen.items() if n != 1}
+        return {
+            "bodies": len(self.served),
+            "layers": sorted({l for l, _ in self._seen}),
+            "kinds": sorted({k for _, k in self._seen}),
+            "double_written": doubles,
+            "filled_bytes": sum(n for _, _, _, n in self.served),
+            "experts": sorted({s[0] for _, _, s, _ in self.served}),
+            "format": "native",
+        }
+
+
 def gguf_expert_source(feed, layer_of=None):
     """An `ExpertFiller` source reading the shipped shards.
 
@@ -324,5 +382,5 @@ def gguf_expert_source(feed, layer_of=None):
 __all__ = [
     "U4_EVEN_INDEX_IS_LOW_NIBBLE", "U4_LEVELS", "U4_STEPS",
     "pack_u4", "unpack_u4", "quantise_group_affine", "dequantise_affine",
-    "quantisation_step_bound", "ExpertFiller", "gguf_expert_source",
+    "quantisation_step_bound", "ExpertFiller", "NativeExpertFiller", "gguf_expert_source",
 ]

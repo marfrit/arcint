@@ -1,0 +1,85 @@
+# Native per-expert dispatch: the slot-pool buffer must be resident-sized, not
+# a 1-expert placeholder (campaign: sub4bit-vram-kernel).
+#
+# Design:   docs/design-routing-aware-expert-execution.md 2.3b / 3.2
+# Campaign: docs/campaigns/sub4bit-vram-kernel.md
+#
+# The defect (measured-here, 24 GB card): patch 0041 gave every routed-expert
+# constant a 1-expert placeholder while per-expert dispatch is on.  But the
+# per-expert dispatch path stores its weights in that same buffer: the provider
+# builds an LRU pool of `lru_expert_num` slots in it and fill_weights_memory()
+# copies each resident expert to dst_offset = slot * (tensor bytes /
+# num_expert); the per-expert OpenCL kernels (patch 0045) then index it by
+# slot_index.  The first slot with index >= 1 therefore ran past the 1-expert
+# allocation -- a host memcpy past the buffer end (libc, reached via the OCL
+# runtime) plus a blit-engine page fault.  Reproduced on the 24 GB card at
+# ratio 99 and ratio 80 (the 0045 leg) and again at ratio 75 (the
+# discriminating run): at ratio 75 the engine's ceil and the plugin's integer
+# division both give 128, so the fault does not track the engine/plugin
+# rounding divergence; it is the placeholder size, not an off-by-one between
+# the two slot-count formulas.  On the 16 GB card the served path reaches the
+# plateau probe and then stalls instead of faulting -- the stall is measured,
+# the 1-expert-overflow attribution there is a code inference, not a measured
+# fault.
+#
+# Fix: allocate the full resident slot pool exactly as the ordinary OTD path
+# does, while keeping patch 0041's compile-time behaviour -- the constant data
+# is still skipped (upload_bytes = 0, no host->device memcpy), hint_evict stays
+# suppressed (no mmap page faulting / VMA churn) and no device pool budget is
+# charged.  The pool is host-mapped on these cards, as the two-ledger shape
+# reports; the weights arrive from the weight file at runtime.
+#
+# Prerequisite patches:
+#   0005 - partial upload mechanism (try_prepare_partial_upload)
+#   0041 - skip expert constants per-expert dispatch
+#
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on
+# top of patches/0003-0046.
+
+diff --git a/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.cpp b/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.cpp
+--- a/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.cpp
++++ b/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.cpp
+@@ -68,18 +68,38 @@
+     // minimal 1-element placeholder so the data primitive exists (fusions
+     // still match), but fault no mmap pages and charge no device pool budget.
+     if (p.get_config().get_moe_per_expert_dispatch()) {
++        // arcint (patch 0047). The per-expert dispatch path does NOT store the
++        // experts in the compiled constant pool: the provider builds an LRU
++        // pool of `lru_expert_num` slots inside this buffer, and
++        // fill_weights_memory() copies each routed/resident expert to
++        // dst_offset = slot * (tensor bytes / num_expert) (moe_otd_runtime.cpp);
++        // the per-expert OpenCL kernels index the same buffer by slot_index.
++        // Patch 0041's 1-expert placeholder therefore made the FIRST slot with
++        // index >= 1 run past the allocation -- a host memcpy past the end (in
++        // libc, reached through the OCL runtime) and a blit-engine page fault,
++        // measured on the 24 GB card at ratio 99 and ratio 75 (where the
++        // engine's ceil and the plugin's integer division agree), and the same
++        // on the 16 GB card as a stall. Allocate the full resident slot pool
++        // exactly as the ordinary OTD path does, while still skipping the
++        // constant data: upload_bytes stays 0 (deferred to runtime), skip_evict
++        // stays true (no mmap page faulting, no VMA churn), and no device pool
++        // budget is charged.
++        const size_t resident_expert_num = std::max<size_t>(1, const_shape[0] * (100 - otd_ratio) / 100);
+         desc.enabled = true;
+         desc.upload_shape = const_shape;
+-        desc.upload_shape[0] = 1;
++        desc.upload_shape[0] = std::min<size_t>(const_shape[0], resident_expert_num);
+         desc.upload_bytes = 0;
+         desc.skip_evict = true;
+ 
+-        auto min_layout = cldnn::layout(desc.upload_shape, out_dtype, const_format);
+-        auto min_mem = p.get_engine().allocate_memory(min_layout, false);
+-        desc.memory = p.get_engine().reinterpret_buffer(*min_mem, const_layout);
++        auto pool_layout = cldnn::layout(desc.upload_shape, out_dtype, const_format);
++        auto pool_mem = p.get_engine().allocate_memory(pool_layout, false);
++        desc.memory = p.get_engine().reinterpret_buffer(*pool_mem, const_layout);
++        OPENVINO_ASSERT(pool_layout.bytes_count() <= const_layout.bytes_count(),
++                        "Per-expert slot pool layout (", pool_layout.bytes_count(),
++                        " bytes) exceeds full constant layout (", const_layout.bytes_count(), " bytes)");
+ 
+         get_partial_upload_log_state().log(op->get_friendly_name(),
+-                                           0,
++                                           desc.upload_shape[0],
+                                            const_shape[0],
+                                            0,
+                                            const_layout.bytes_count(),

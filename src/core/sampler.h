@@ -43,7 +43,7 @@ public:
 
 private:
     void   apply_penalties(float* logits, size_t vocab) const;
-    size_t collect_candidates(const float* logits, size_t vocab);
+    size_t collect_candidates(const float* logits, size_t vocab, bool full);
 
     SamplerParams   params_;
     uint64_t        seed_;

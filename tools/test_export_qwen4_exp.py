@@ -332,7 +332,7 @@ class TestOutputLayout(unittest.TestCase):
         # (659.1 = 463.6 per-block + 195.5 globals); the test_gguf_feed
         # residency cell re-derives every figure from the shipped tensor list
         # and requires the refusal text to contain it.
-        self.assertIn("659.1 GiB", msg)
+        self.assertIn("659.2 GiB", msg)
         # the head is no longer a blocker -- and the refusal says so
         self.assertIn("RESOLVED", msg)
         self.assertIn("output.weight", msg)

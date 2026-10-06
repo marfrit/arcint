@@ -1,0 +1,537 @@
+diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
+index ae0e3e4..a38875c 100644
+--- a/ggml/src/ggml-opencl/CMakeLists.txt
++++ b/ggml/src/ggml-opencl/CMakeLists.txt
+@@ -218,6 +218,7 @@ set(GGML_OPENCL_KERNELS
+     ssm_conv
+     ssm_scan
+     gated_delta_net
++    gated_delta_net_intel
+     sub
+     sum_rows
+     cumsum
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index eb8f617..8414b16 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1037,6 +1037,11 @@ struct ggml_backend_opencl_context {
+     // [size_idx][kda][tgpp] where size_idx: 0=S_V=16, 1=32, 2=64, 3=128; kda: 0 or 1.
+     // tgpp 0 = TG variant (COLS_PER_LANE_GROUP=1), tgpp 1 = prefill variant (COLS_PER_LANE_GROUP=4).
+     cl_kernel kernel_gated_delta_net_f32[4][2][2] = {};
++    // Intel, S_V = 128, scalar gate (gated_delta_net_intel.cl): generation
++    // (one token) and prompt kernels and their shapes
++    cl_kernel kernel_gdn_intel_tg = nullptr;
++    cl_kernel kernel_gdn_intel_pp = nullptr;
++    int gdn_intel_sg = 0, gdn_intel_r_tg = 0, gdn_intel_r_pp = 0, gdn_intel_nsg = 0;
+     cl_kernel kernel_ssm_scan_f32 = nullptr;
+     cl_kernel kernel_ssm_scan_f32_mamba2_d128 = nullptr;
+     cl_kernel kernel_ssm_scan_f32_mamba2_d256 = nullptr;
+@@ -3843,6 +3848,93 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+         GGML_LOG_CONT(".");
+     }
+ 
++    // gated_delta_net_intel: the state in registers, lanes along the key
++    // dimension (OpenVINO's paged_gated_delta_net_opt.cl). Shapes, rows per
++    // sub-group (R) for one token and for a prompt, sub-groups per prompt
++    // work-group, tokens per staged chunk (measured-here, 512 tokens): SG 8
++    // (A770, 32 heads) 2, 2 x 64, 16 at 256 GRF: 451 us against 12,042 for
++    // gated_delta_net.cl; SG 16 (B60, 48 heads) 4, 4 x 32, 8 at 128 GRF: 875
++    // against 5,692. GGML_OPENCL_GDN_INTEL=0 keeps gated_delta_net.cl,
++    // "Rtg,Rpp,NSG,TC" overrides the shape. A build the device refuses leaves
++    // the kernels null: gated_delta_net.cl then.
++    if (backend_ctx->gpu_family == INTEL) {
++        const char * gdn_env = getenv("GGML_OPENCL_GDN_INTEL");
++        int r_tg = 0, r_pp = 0, nsg = 0, tc = 0;
++        size_t sg_sizes[8] = {};
++        size_t sg_bytes = 0;
++        clGetDeviceInfo(backend_ctx->device, CL_DEVICE_SUB_GROUP_SIZES_INTEL, sizeof(sg_sizes), sg_sizes, &sg_bytes);
++        bool sg8 = false, sg16 = false;
++        for (size_t i = 0; i < sg_bytes / sizeof(size_t); ++i) {
++            sg8  = sg8  || sg_sizes[i] == 8;
++            sg16 = sg16 || sg_sizes[i] == 16;
++        }
++        const int sg = sg8 ? 8 : 16;
++        const auto defaults = [&]() {
++            r_tg = sg8 ? 2 : 4; r_pp = sg8 ? 2 : 4; nsg = sg8 ? 64 : 32; tc = sg8 ? 16 : 8;
++        };
++        defaults();
++        bool on = (sg8 || sg16) && (gdn_env == nullptr || atoi(gdn_env) != 0);
++        if (on && gdn_env != nullptr && strchr(gdn_env, ',') != nullptr) {
++            if (sscanf(gdn_env, "%d,%d,%d,%d", &r_tg, &r_pp, &nsg, &tc) != 4) {
++                r_tg = 0;   // not a shape: warned below, the defaults taken
++            }
++        }
++        cl_ulong local_mem = 0;
++        clGetDeviceInfo(backend_ctx->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(local_mem), &local_mem, NULL);
++        const auto fits = [&](int r) { return r > 0 && 128 % r == 0 && r <= sg; };
++        const bool shape_ok = fits(r_tg) && fits(r_pp) && nsg > 0 && tc > 0 && 128 % (r_pp * nsg) == 0 &&
++                              (size_t)nsg * sg <= backend_ctx->max_workgroup_size &&
++                              (cl_ulong)2 * tc * (2 * 128 + nsg * r_pp + 2) * sizeof(float) <= local_mem;
++        if (on && !shape_ok) {
++            GGML_LOG_WARN("ggml_opencl: GGML_OPENCL_GDN_INTEL=%s ignored (shape does not fit the device)\n", gdn_env);
++            defaults();
++        }
++        if (on) {
++#ifdef GGML_OPENCL_EMBED_KERNELS
++            const std::string kernel_src {
++                #include "gated_delta_net_intel.cl.h"
++            };
++#else
++            const std::string kernel_src = read_file("gated_delta_net_intel.cl");
++#endif
++            const std::string base = compile_opts + " -DS_V=128 -DSG=" + std::to_string(sg);
++            const std::string grf  = " -cl-intel-256-GRF-per-thread";
++            cl_program tg = build_program_from_source_optional(backend_ctx, kernel_src.c_str(), base + grf + " -DR=" + std::to_string(r_tg));
++            cl_program pp = build_program_from_source_optional(backend_ctx, kernel_src.c_str(),
++                base + (sg8 ? grf : "") + " -DGDN_PP -DR=" + std::to_string(r_pp) + " -DNSG=" + std::to_string(nsg) + " -DTC=" + std::to_string(tc));
++            if (tg != nullptr && pp != nullptr) {
++                CL_CHECK((backend_ctx->kernel_gdn_intel_tg = clCreateKernel(tg, "kernel_gated_delta_net_tg", &err), err));
++                CL_CHECK((backend_ctx->kernel_gdn_intel_pp = clCreateKernel(pp, "kernel_gated_delta_net_pp", &err), err));
++                // the kernel's own limit (a 256-GRF build halves the threads a
++                // work-group may have): a shape it does not take falls back
++                size_t wg_pp = 0;
++                CL_CHECK(clGetKernelWorkGroupInfo(backend_ctx->kernel_gdn_intel_pp, backend_ctx->device,
++                                                  CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg_pp), &wg_pp, NULL));
++                if (wg_pp < (size_t)nsg * sg) {
++                    GGML_LOG_WARN("ggml_opencl: gated_delta_net_intel.cl takes %zu work-items, the shape needs %d; gated_delta_net.cl takes the op\n",
++                                  wg_pp, nsg * sg);
++                    CL_CHECK(clReleaseKernel(backend_ctx->kernel_gdn_intel_tg));
++                    CL_CHECK(clReleaseKernel(backend_ctx->kernel_gdn_intel_pp));
++                    backend_ctx->kernel_gdn_intel_tg = nullptr;
++                    backend_ctx->kernel_gdn_intel_pp = nullptr;
++                }
++                backend_ctx->gdn_intel_sg   = sg;
++                backend_ctx->gdn_intel_r_tg = r_tg;
++                backend_ctx->gdn_intel_r_pp = r_pp;
++                backend_ctx->gdn_intel_nsg  = nsg;
++            } else {
++                GGML_LOG_WARN("ggml_opencl: gated_delta_net_intel.cl not built; gated_delta_net.cl takes the op\n");
++            }
++            if (tg != nullptr) {
++                CL_CHECK(clReleaseProgram(tg));
++            }
++            if (pp != nullptr) {
++                CL_CHECK(clReleaseProgram(pp));
++            }
++            GGML_LOG_CONT(".");
++        }
++    }
++
+     // moe_combine (fused router-weight mul + cross-expert sum)
+     {
+     #ifdef GGML_OPENCL_EMBED_KERNELS
+@@ -30100,6 +30192,10 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
+     const int spw  = (tgpp == 0) ? 1 : 1;
+ 
+     cl_kernel kernel = backend_ctx->kernel_gated_delta_net_f32[si][kda][tgpp];
++    const bool gdn_intel = S_v == 128 && kda == 0 && backend_ctx->kernel_gdn_intel_tg != nullptr;
++    if (gdn_intel) {
++        kernel = tgpp == 0 ? backend_ctx->kernel_gdn_intel_tg : backend_ctx->kernel_gdn_intel_pp;
++    }
+     GGML_ASSERT(kernel != nullptr);
+ 
+     const cl_uint s_off = S_v * H_v * n_tokens * n_seqs;
+@@ -30168,6 +30264,18 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
+     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(float),    &scale));
+     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),    &K));
+ 
++    if (gdn_intel) {
++        // gated_delta_net_intel.cl: the work-group's sub-groups, R rows each
++        const bool   pp   = kernel == backend_ctx->kernel_gdn_intel_pp;
++        const size_t sg   = backend_ctx->gdn_intel_sg;
++        const size_t nsg  = pp ? backend_ctx->gdn_intel_nsg : 1;
++        const size_t rows = nsg * (pp ? backend_ctx->gdn_intel_r_pp : backend_ctx->gdn_intel_r_tg);
++        size_t global_work_size[3] = { (size_t) H_v * sg, (size_t) n_seqs * nsg, (size_t) S_v / rows };
++        size_t local_work_size[3]  = { sg, nsg, 1 };
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++        return;
++    }
++
+     // Subgroup size is 64 for Adreno and 32 for Intel
+     const int sg_size = backend_ctx->gpu_family == GPU_FAMILY::ADRENO ? 64 : backend_ctx->gpu_family == GPU_FAMILY::INTEL ? 32 : -1;
+     if (sg_size < 0) {
+diff --git a/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl b/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
+new file mode 100644
+index 0000000..7256709
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/gated_delta_net_intel.cl
+@@ -0,0 +1,359 @@
++#pragma OPENCL EXTENSION cl_intel_subgroups : enable
++#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
++#pragma OPENCL EXTENSION cl_intel_subgroup_local_block_io : enable
++
++// Gated delta net (GGML_OP_GATED_DELTA_NET, scalar gate) for Intel, in the
++// shape of OpenVINO's paged_gated_delta_net_opt.cl: lanes along the key
++// dimension, each sub-group holding R state rows in registers (lane l keeps
++// keys m*SG + l, m = 0..KL-1, the order sub-group block reads give);
++// reductions by sub-group shuffles. Same arguments and output as
++// kernel_gated_delta_net (gated_delta_net.cl).
++//
++// State row j (a value index) holds keys i = 0..S_V-1 contiguously. Per token
++// (ggml-cpu ops.cpp): S *= exp(g); delta_j = (v_j - S_j.k) beta;
++// S_j += k delta_j; out_j = S_j.q / sqrt(S_V).
++//
++// GDN_PP (prompt): a work-group of NSG sub-groups per (head, sequence,
++// NSG*R rows); q/k/v/g/beta come in chunks of TC tokens staged in local
++// memory, the next chunk loaded into registers while the current one is
++// computed, so the global latency is paid once per chunk and q/k are read
++// once per work-group. Otherwise (generation): one sub-group per (head,
++// sequence, R rows), the next token's inputs fetched while the current one is
++// computed (Strata's gdn_rec_cols_pipe_kernel).
++
++#ifndef S_V
++#define S_V 128
++#endif
++#ifndef SG
++#define SG 16
++#endif
++#ifndef R
++#define R 2
++#endif
++#define KL (S_V / SG)
++
++#define BLOCK_READ_F(p)     as_float(intel_sub_group_block_read((global const uint *)(p)))
++#define BLOCK_WRITE_F(p, v) intel_sub_group_block_write((global uint *)(p), as_uint(v))
++#define LBLOCK_READ_F(p)    as_float(intel_sub_group_block_read((local const uint *)(p)))
++
++#ifdef GDN_PP
++
++#ifndef NSG
++#define NSG 32
++#endif
++#ifndef TC
++#define TC 16
++#endif
++#define ROWS (NSG * R)
++#define NTHR (NSG * SG)
++// one chunk: q[TC][S_V], k[TC][S_V], v[TC][ROWS], g[TC], beta[TC]
++#define CH_FLOATS (TC * (2 * S_V + ROWS + 2))
++#define PER_THR ((CH_FLOATS + NTHR - 1) / NTHR)
++
++// element e of a chunk (0 <= e < CH_FLOATS): where it comes from in global
++// memory. Layout in local memory: q, k, v, g, beta, each token-major.
++static inline float chunk_load(int e, uint t0, uint n_tokens,
++        global const float * dq, global const float * dk, global const float * dv,
++        global const float * dg, global const float * db,
++        ulong q_base, ulong v_base, ulong gb_base, uint sq2, uint sv2, uint sb2, uint row0) {
++    int t, x;
++    if (e < TC * S_V)                 { t = e / S_V; x = e % S_V;
++        return t0 + t < n_tokens ? dq[q_base + (ulong)(t0 + t) * sq2 + x] : 0.f; }
++    e -= TC * S_V;
++    if (e < TC * S_V)                 { t = e / S_V; x = e % S_V;
++        return t0 + t < n_tokens ? dk[q_base + (ulong)(t0 + t) * sq2 + x] : 0.f; }
++    e -= TC * S_V;
++    if (e < TC * ROWS)                { t = e / ROWS; x = e % ROWS;
++        return t0 + t < n_tokens ? dv[v_base + (ulong)(t0 + t) * sv2 + row0 + x] : 0.f; }
++    e -= TC * ROWS;
++    if (e < TC)                       { return t0 + e < n_tokens ? dg[gb_base + (ulong)(t0 + e) * sb2] : 0.f; }
++    e -= TC;
++    if (e < TC)                       { return t0 + e < n_tokens ? db[gb_base + (ulong)(t0 + e) * sb2] : 0.f; }
++    return 0.f;
++}
++
++__attribute__((intel_reqd_sub_group_size(SG)))
++__attribute__((reqd_work_group_size(SG, NSG, 1)))
++kernel void kernel_gated_delta_net_pp(
++        global const char * q_buf,     ulong off_q,
++        global const char * k_buf,     ulong off_k,
++        global const char * v_buf,     ulong off_v,
++        global const char * g_buf,     ulong off_g,
++        global const char * beta_buf,  ulong off_beta,
++        global const char * state_buf, ulong off_state,
++        global       char * dst_buf,   ulong off_dst,
++        uint  H_v,
++        uint  n_tokens,
++        uint  n_seqs,
++        uint  s_off,
++        uint  sq1, uint sq2, uint sq3,
++        uint  sv1, uint sv2, uint sv3,
++        uint  sb1, uint sb2, uint sb3,
++        uint  H_k,
++        uint  rq3,
++        float scale,
++        uint K) {
++    global const float * data_q     = (global const float *)(q_buf     + off_q);
++    global const float * data_k     = (global const float *)(k_buf     + off_k);
++    global const float * data_v     = (global const float *)(v_buf     + off_v);
++    global const float * data_g     = (global const float *)(g_buf     + off_g);
++    global const float * data_beta  = (global const float *)(beta_buf  + off_beta);
++    global const float * data_state = (global const float *)(state_buf + off_state);
++    global       float * data_dst   = (global       float *)(dst_buf   + off_dst);
++
++    local float buf[2][CH_FLOATS];
++
++    const uint head = get_group_id(0);
++    const uint seq  = get_group_id(1);
++    const uint wrow = get_group_id(2) * ROWS;         // the work-group's first row
++    const uint sg   = get_sub_group_id();
++    const uint row0 = wrow + sg * R;                  // this sub-group's first row
++    const uint lane = get_sub_group_local_id();
++    const uint tid  = get_local_linear_id();
++
++    const uint iq1 = head % H_k;
++    const uint iq3 = seq / rq3;
++    const ulong state_size = (ulong)S_V * S_V;
++    const ulong state_base = ((ulong)seq * H_v + head) * state_size;
++    const ulong snap_size  = state_size * H_v * n_seqs;
++    const ulong q_base  = (ulong)iq3 * sq3 + (ulong)iq1 * sq1;
++    const ulong v_base  = (ulong)seq * sv3 + (ulong)head * sv1;
++    const ulong gb_base = (ulong)seq * sb3 + (ulong)head * sb1;
++
++    float S[R][KL];
++    #pragma unroll
++    for (int r = 0; r < R; ++r)
++        #pragma unroll
++        for (int m = 0; m < KL; ++m)
++            S[r][m] = BLOCK_READ_F(data_state + state_base + (ulong)(row0 + r) * S_V + m * SG);
++
++    // chunk 0 straight into buffer 0
++    #pragma unroll
++    for (int i = 0; i < PER_THR; ++i) {
++        const int e = tid + i * NTHR;
++        if (e < CH_FLOATS) buf[0][e] = chunk_load(e, 0, n_tokens, data_q, data_k, data_v, data_g, data_beta,
++                                                  q_base, v_base, gb_base, sq2, sv2, sb2, wrow);
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++
++    const uint n_chunks = (n_tokens + TC - 1) / TC;
++    ulong attn_off = ((ulong)seq * n_tokens * H_v + head) * S_V;
++    for (uint c = 0; c < n_chunks; ++c) {
++        local const float * cb = buf[c & 1];
++        // the next chunk's share, into registers (its loads overlap this chunk)
++        float nxt[PER_THR];
++        const uint t1 = (c + 1) * TC;
++        #pragma unroll
++        for (int i = 0; i < PER_THR; ++i) {
++            const int e = tid + i * NTHR;
++            nxt[i] = (c + 1 < n_chunks && e < CH_FLOATS)
++                ? chunk_load(e, t1, n_tokens, data_q, data_k, data_v, data_g, data_beta, q_base, v_base, gb_base, sq2, sv2, sb2, wrow)
++                : 0.f;
++        }
++
++        const uint tn = min((uint)TC, n_tokens - c * TC);
++        for (uint tt = 0; tt < tn; ++tt) {
++            float k[KL], q[KL];
++            #pragma unroll
++            for (int m = 0; m < KL; ++m) {
++                q[m] = LBLOCK_READ_F(cb + tt * S_V + m * SG);
++                k[m] = LBLOCK_READ_F(cb + TC * S_V + tt * S_V + m * SG);
++            }
++            const float g    = exp(cb[2 * TC * S_V + TC * ROWS + tt]);
++            const float beta = cb[2 * TC * S_V + TC * ROWS + TC + tt];
++
++            float kv[R];
++            #pragma unroll
++            for (int r = 0; r < R; ++r) {
++                float p = 0.f;
++                #pragma unroll
++                for (int m = 0; m < KL; ++m) p = fma(S[r][m], k[m], p);
++                kv[r] = sub_group_reduce_add(p) * g;
++            }
++            float out[R];
++            #pragma unroll
++            for (int r = 0; r < R; ++r) {
++                const float d = (cb[2 * TC * S_V + tt * ROWS + sg * R + r] - kv[r]) * beta;
++                float p = 0.f;
++                #pragma unroll
++                for (int m = 0; m < KL; ++m) {
++                    S[r][m] = fma(k[m], d, g * S[r][m]);
++                    p = fma(S[r][m], q[m], p);
++                }
++                out[r] = sub_group_reduce_add(p);
++            }
++            float mine = 0.f;
++            #pragma unroll
++            for (int r = 0; r < R; ++r) mine = (lane == r) ? out[r] : mine;
++            if (lane < R) data_dst[attn_off + row0 + lane] = mine * scale;
++            attn_off += (ulong)S_V * H_v;
++
++            if (K > 1u) {
++                const int slot = (int)n_tokens - 1 - (int)(c * TC + tt);
++                if (slot >= 0 && slot < (int)K) {
++                    global float * sb = data_dst + s_off + (ulong)slot * snap_size + state_base;
++                    #pragma unroll
++                    for (int r = 0; r < R; ++r)
++                        #pragma unroll
++                        for (int m = 0; m < KL; ++m) BLOCK_WRITE_F(sb + (ulong)(row0 + r) * S_V + m * SG, S[r][m]);
++                }
++            }
++        }
++
++        if (c + 1 < n_chunks) {
++            #pragma unroll
++            for (int i = 0; i < PER_THR; ++i) {
++                const int e = tid + i * NTHR;
++                if (e < CH_FLOATS) buf[(c + 1) & 1][e] = nxt[i];
++            }
++        }
++        barrier(CLK_LOCAL_MEM_FENCE);
++    }
++
++    if (K == 1u) {
++        global float * sb = data_dst + s_off + state_base;
++        #pragma unroll
++        for (int r = 0; r < R; ++r)
++            #pragma unroll
++            for (int m = 0; m < KL; ++m) BLOCK_WRITE_F(sb + (ulong)(row0 + r) * S_V + m * SG, S[r][m]);
++    }
++}
++
++#else // generation
++
++__attribute__((intel_reqd_sub_group_size(SG)))
++kernel void kernel_gated_delta_net_tg(
++        global const char * q_buf,     ulong off_q,
++        global const char * k_buf,     ulong off_k,
++        global const char * v_buf,     ulong off_v,
++        global const char * g_buf,     ulong off_g,
++        global const char * beta_buf,  ulong off_beta,
++        global const char * state_buf, ulong off_state,
++        global       char * dst_buf,   ulong off_dst,
++        uint  H_v,
++        uint  n_tokens,
++        uint  n_seqs,
++        uint  s_off,
++        uint  sq1, uint sq2, uint sq3,
++        uint  sv1, uint sv2, uint sv3,
++        uint  sb1, uint sb2, uint sb3,
++        uint  H_k,
++        uint  rq3,
++        float scale,
++        uint K) {
++    global const float * data_q     = (global const float *)(q_buf     + off_q);
++    global const float * data_k     = (global const float *)(k_buf     + off_k);
++    global const float * data_v     = (global const float *)(v_buf     + off_v);
++    global const float * data_g     = (global const float *)(g_buf     + off_g);
++    global const float * data_beta  = (global const float *)(beta_buf  + off_beta);
++    global const float * data_state = (global const float *)(state_buf + off_state);
++    global       float * data_dst   = (global       float *)(dst_buf   + off_dst);
++
++    const uint head = get_group_id(0);
++    const uint seq  = get_group_id(1);
++    const uint row0 = get_group_id(2) * R;
++    const uint lane = get_sub_group_local_id();
++
++    const uint iq1 = head % H_k;
++    const uint iq3 = seq / rq3;
++    const ulong state_size = (ulong)S_V * S_V;
++    const ulong state_base = ((ulong)seq * H_v + head) * state_size;
++    const ulong snap_size  = state_size * H_v * n_seqs;
++    const ulong q_base  = (ulong)iq3 * sq3 + (ulong)iq1 * sq1;   // q and k share strides
++    const ulong v_base  = (ulong)seq * sv3 + (ulong)head * sv1;
++    const ulong gb_base = (ulong)seq * sb3 + (ulong)head * sb1;
++
++    float S[R][KL];
++    #pragma unroll
++    for (int r = 0; r < R; ++r)
++        #pragma unroll
++        for (int m = 0; m < KL; ++m)
++            S[r][m] = BLOCK_READ_F(data_state + state_base + (ulong)(row0 + r) * S_V + m * SG);
++
++    // token 0's inputs; then each step fetches the next token's first
++    float kn[KL], qn[KL], vn[R], gn = 0.f, bn = 0.f;
++    if (n_tokens > 0) {
++        #pragma unroll
++        for (int m = 0; m < KL; ++m) {
++            kn[m] = BLOCK_READ_F(data_k + q_base + m * SG);
++            qn[m] = BLOCK_READ_F(data_q + q_base + m * SG);
++        }
++        #pragma unroll
++        for (int r = 0; r < R; ++r) vn[r] = data_v[v_base + row0 + r];
++        gn = data_g[gb_base];
++        bn = data_beta[gb_base];
++    }
++
++    ulong attn_off = ((ulong)seq * n_tokens * H_v + head) * S_V;
++    for (uint t = 0; t < n_tokens; ++t) {
++        float k[KL], q[KL], v[R];
++        #pragma unroll
++        for (int m = 0; m < KL; ++m) { k[m] = kn[m]; q[m] = qn[m]; }
++        #pragma unroll
++        for (int r = 0; r < R; ++r) v[r] = vn[r];
++        const float g = exp(gn), beta = bn;
++        if (t + 1 < n_tokens) {
++            const ulong qo = q_base + (ulong)(t + 1) * sq2;
++            #pragma unroll
++            for (int m = 0; m < KL; ++m) {
++                kn[m] = BLOCK_READ_F(data_k + qo + m * SG);
++                qn[m] = BLOCK_READ_F(data_q + qo + m * SG);
++            }
++            const ulong vo = v_base + (ulong)(t + 1) * sv2;
++            #pragma unroll
++            for (int r = 0; r < R; ++r) vn[r] = data_v[vo + row0 + r];
++            const ulong go = gb_base + (ulong)(t + 1) * sb2;
++            gn = data_g[go];
++            bn = data_beta[go];
++        }
++
++        // kv_r = (g S_r).k: the R reductions are independent and interleave
++        float kv[R];
++        #pragma unroll
++        for (int r = 0; r < R; ++r) {
++            float p = 0.f;
++            #pragma unroll
++            for (int m = 0; m < KL; ++m) p = fma(S[r][m], k[m], p);
++            kv[r] = sub_group_reduce_add(p) * g;
++        }
++        float out[R];
++        #pragma unroll
++        for (int r = 0; r < R; ++r) {
++            const float d = (v[r] - kv[r]) * beta;
++            float p = 0.f;
++            #pragma unroll
++            for (int m = 0; m < KL; ++m) {
++                S[r][m] = fma(k[m], d, g * S[r][m]);
++                p = fma(S[r][m], q[m], p);
++            }
++            out[r] = sub_group_reduce_add(p);
++        }
++        // lane r < R writes row r's output
++        float mine = 0.f;
++        #pragma unroll
++        for (int r = 0; r < R; ++r) mine = (lane == r) ? out[r] : mine;
++        if (lane < R) data_dst[attn_off + row0 + lane] = mine * scale;
++        attn_off += (ulong)S_V * H_v;
++
++        if (K > 1u) {
++            const int slot = (int)n_tokens - 1 - (int)t;
++            if (slot >= 0 && slot < (int)K) {
++                global float * sb = data_dst + s_off + (ulong)slot * snap_size + state_base;
++                #pragma unroll
++                for (int r = 0; r < R; ++r)
++                    #pragma unroll
++                    for (int m = 0; m < KL; ++m) BLOCK_WRITE_F(sb + (ulong)(row0 + r) * S_V + m * SG, S[r][m]);
++            }
++        }
++    }
++
++    if (K == 1u) {
++        global float * sb = data_dst + s_off + state_base;
++        #pragma unroll
++        for (int r = 0; r < R; ++r)
++            #pragma unroll
++            for (int m = 0; m < KL; ++m) BLOCK_WRITE_F(sb + (ulong)(row0 + r) * S_V + m * SG, S[r][m]);
++    }
++}
++
++#endif // GDN_PP
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 98ce061..8497555 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11398,6 +11398,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+ 
++    // head size 128 at the Qwen3.5/3.6 shapes (16 q/k heads, 32 or 48 v heads):
++    // the prompt path in chunks, a partial last chunk, two sequences, strided inputs
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 2));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  37, 2, 3));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  37, 2, 2, true));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   1, 2, 3));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   2, 1, 2, false, false, /*K=*/2));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128, 100, 2, 1, false, false, /*K=*/4));
++
+     // gdn + cache cpy fusion (K > 1)
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));

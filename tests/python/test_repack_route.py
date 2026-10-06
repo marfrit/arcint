@@ -58,7 +58,7 @@ more above it:
       IQ4_NL half is measured -- but it was NOT established by the citations
       originally given, which were `design-gguf-native.md:52` (a sub-4-bit list
       that does not contain IQ4_NL; the string does not occur in that document
-      at all) and `serving_shape.py:173` (which says IQ4_NL has no OpenVINO
+      at all) and `serving_shape.py:174` (which says IQ4_NL has no OpenVINO
       ELEMENT TYPE -- a different proposition). The 43 IQ4_NL bodies were, and
       remain, closed independently by C1 (type refused) and C2 (rank refused);
       the verdict never depended on C4 for them, and this cell does not pad
@@ -344,7 +344,7 @@ def test_iq4nl_levels_are_non_uniform_so_no_affine_chain_carries_them():
     H3 (REVIEW f8229d8). This cell exists because C4's IQ4_NL half used to be
     cited to `design-gguf-native.md`, whose codebook sentence lists the
     SUB-4-BIT set and does not mention IQ4_NL at all (the string does not occur
-    in that document) -- and to `serving_shape.py:173`, which says IQ4_NL has
+    in that document) -- and to `serving_shape.py:174`, which says IQ4_NL has
     no OpenVINO ELEMENT TYPE, a different proposition from "non-uniform
     codebook". The claim was true and its citations did not reach it, on the
     second-largest group of bodies in the file.

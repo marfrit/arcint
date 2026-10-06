@@ -174,11 +174,12 @@ std::optional<std::string> tier_prefix_cache_decision(bool static_partition_repo
                                                        int prefix_cache_mib) {
     if (!tier_on || prefix_cache_mib <= 0) return std::nullopt;
     if (static_partition_reported) return std::nullopt;
-    return "--moe-cpu-tier with --prefix-cache-mib > 0 violates DESIGN §3.4: "
-           "the host tier's arithmetic depends on expert LRU residency, so a "
-           "continuation restored from the prefix cache is not byte-identical "
-           "to a cold run -- drop --prefix-cache-mib or run without the tier; "
-           "the plugin does not report a static residency partition";
+    return "--moe-cpu-tier with --prefix-cache-mib > 0 is refused at load: "
+           "the plugin does not report a static residency partition, so "
+           "expert placement follows the conversation (an ADAPTIVE tier). "
+           "DESIGN §3.4 (amended 2026-10-01) admits the pair at the "
+           "answer-level bar; lifting this refusal is owed. Until then, drop "
+           "--prefix-cache-mib or run without the tier";
 }
 
 bool parse_u64_strict(const std::string& s, uint64_t& out) {
@@ -238,9 +239,13 @@ std::string usage_text() {
         "                            undone once set\n"
         "  --moe-cpu-tier            compute expert FFNs that would evict a device\n"
         "                            slot on the host CPU instead (needs --offload-ratio;\n"
-        "                            --prefix-cache-mib > 0 is refused at load unless the\n"
-        "                            plugin reports a static residency partition, DESIGN §3.4)\n"
+        "                            --prefix-cache-mib > 0 is still refused at load\n"
+        "                            unless the plugin reports the static residency\n"
+        "                            partition; DESIGN §3.4 (amended 2026-10-01) admits\n"
+        "                            the pair, and lifting the refusal is owed)\n"
         "  --moe-cpu-tier-threads N  worker threads for that tier (0 = auto)\n"
+        "  --moe-per-expert-dispatch dispatch routed experts via per-expert GPU\n"
+        "                            kernels (needs --offload-ratio + --moe-cpu-tier)\n"
         "\n"
         "memory\n"
         "  --n-ctx N                 context length. Omitted: adopts whatever the\n"
@@ -300,6 +305,8 @@ std::string usage_text() {
         "                            lets the MTP drafter engage)\n"
         "  --top-p X                 default nucleus mass\n"
         "  --top-k N                 default top-k (0 disables)\n"
+        "  --min-p X                 default min-p: keep p >= X * p_max, before\n"
+        "                            temperature, as llama.cpp (0 disables)\n"
         "  --repetition-penalty X    default repetition penalty\n"
         "  --presence-penalty X      default presence penalty\n"
         "  --chat-template-kwarg enable_thinking=BOOL\n"
@@ -406,6 +413,28 @@ std::string usage_text() {
         "                            exit. Device-free; the directory needs no entry\n"
         "                            yet -- reading a contract is what precedes a pin.\n"
         "  --version                 print version and exit\n"
+        "  --engine ov|llama         the executor: OpenVINO (--model IR) or ggml OpenCL via\n"
+        "                            libllama (--gguf); default: libllama for --gguf\n"
+        "                            without --model, else OpenVINO\n"
+        "  --llama-cpu-moe N         libllama: the first N layers' experts stay in host\n"
+        "                            memory, computed by the CPU (experts beyond VRAM)\n"
+        "  --llama-threads N         libllama: CPU threads (default: half the hardware\n"
+        "                            threads)\n"
+        "  --llama-mtp N             libllama: draft up to N tokens a step with the\n"
+        "                            GGUF's MTP head, verified in one pass (0-7; 0 off)\n"
+        "  --llama-mtp-vocab FILE    libllama: the token ids the MTP head may draft\n"
+        "                            (int32, or a JSON list): a draft step reads only\n"
+        "                            those rows of the output head\n"
+        "  --llama-checkpoints N     libllama: per lane, up to N snapshots of a hybrid\n"
+        "                            model's recurrent state (near the prompt's end,\n"
+        "                            at user messages), so a follow-up or an edited\n"
+        "                            message resumes instead of re-prefilling\n"
+        "                            (default 32; 0 off)\n"
+        "  --llama-checkpoint-step T libllama: the least spacing of snapshots at\n"
+        "                            earlier user messages (default 8192)\n"
+        "  --llama-kv K[:V]          libllama: the attention cache types, f16, q8_0 or\n"
+        "                            q8_0:q4_0 (default f16): q8_0 takes the cache to\n"
+        "                            53 %, q8_0:q4_0 to 41 %\n"
         "  -h, --help                print this help and exit\n";
 }
 
@@ -441,6 +470,42 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--model") {
             if (!value(v)) return fail("--model needs a path");
             cfg.model_path = std::string(v);
+        } else if (arg == "--engine") {
+            if (!value(v)) return fail("--engine needs ov or llama");
+            cfg.engine = std::string(v);
+            if (cfg.engine != "ov" && cfg.engine != "llama") return fail("--engine is ov or llama");
+        } else if (arg == "--llama-cpu-moe") {
+            if (!value(v) || !parse_int(v, cfg.llama_cpu_moe) || cfg.llama_cpu_moe < 0)
+                return fail("--llama-cpu-moe needs a layer count >= 0");
+        } else if (arg == "--llama-threads") {
+            if (!value(v) || !parse_int(v, cfg.llama_threads) || cfg.llama_threads < 0)
+                return fail("--llama-threads needs a thread count >= 0");
+        } else if (arg == "--llama-mtp") {
+            if (!value(v) || !parse_int(v, cfg.llama_mtp) || cfg.llama_mtp < 0 || cfg.llama_mtp > 7)
+                return fail("--llama-mtp needs a draft count from 0 to 7 (a verify of up to 8 rows)");
+        } else if (arg == "--llama-checkpoints") {
+            if (!value(v) || !parse_int(v, cfg.llama_checkpoints) || cfg.llama_checkpoints < 0)
+                return fail("--llama-checkpoints needs a count >= 0 (0: off)");
+        } else if (arg == "--llama-checkpoint-step") {
+            if (!value(v) || !parse_int(v, cfg.llama_checkpoint_step) || cfg.llama_checkpoint_step < 1)
+                return fail("--llama-checkpoint-step needs a token count >= 1");
+        } else if (arg == "--llama-mtp-vocab") {
+            if (!value(v)) return fail("--llama-mtp-vocab needs a file of token ids");
+            cfg.llama_mtp_vocab = std::string(v);
+        } else if (arg == "--llama-kv") {
+            if (!value(v)) return fail("--llama-kv needs K[:V] (f16, q8_0 or q8_0:q4_0)");
+            const std::string kv(v);
+            const size_t colon = kv.find(':');
+            cfg.llama_kv_k = kv.substr(0, colon);
+            cfg.llama_kv_v = colon == std::string::npos ? cfg.llama_kv_k : kv.substr(colon + 1);
+            // the pairs contrib/llama.cpp 0015 has Intel attention kernels for
+            // and that pass the answer-level bar: any other pair dequantizes all
+            // of K and V to f32 on every call, and 4:4 drops the dense 27B's
+            // top-1 agreement by 1.2 points (contrib/llama.cpp/README.md)
+            const std::string& k = cfg.llama_kv_k;
+            const std::string& vt = cfg.llama_kv_v;
+            if (!(k == vt && (k == "f16" || k == "q8_0")) && !(k == "q8_0" && vt == "q4_0"))
+                return fail("--llama-kv takes f16, q8_0 or q8_0:q4_0");
         } else if (arg == "--gguf") {
             if (!value(v)) return fail("--gguf needs a path");
             cfg.gguf_path = std::string(v);
@@ -549,6 +614,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             double d = 0.0;
             if (!value(v) || !parse_double(v, d)) return fail("--top-p needs a number");
             cfg.top_p = static_cast<float>(d);
+        } else if (arg == "--min-p") {
+            double d = 0.0;
+            if (!value(v) || !parse_double(v, d)) return fail("--min-p needs a number");
+            cfg.min_p = static_cast<float>(d);
         } else if (arg == "--top-k") {
             int k = 0;
             if (!value(v) || !parse_int(v, k)) return fail("--top-k needs an integer");
@@ -698,6 +767,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.offload_ratio)) {
                 return fail("--offload-ratio needs an integer");
             }
+            cfg.offload_ratio_set = true;
         } else if (arg == "--mtp") {
             if (!value(v)) return fail("--mtp needs a value");
             cfg.mtp = std::string(v);
@@ -707,6 +777,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             }
         } else if (arg == "--moe-cpu-tier") {
             cfg.moe_cpu_tier = true;
+        } else if (arg == "--moe-per-expert-dispatch") {
+            cfg.moe_per_expert_dispatch = true;
         } else if (arg == "--moe-cpu-tier-threads") {
             if (!value(v) || !parse_int(v, cfg.moe_cpu_tier_threads)) {
                 return fail("--moe-cpu-tier-threads needs an integer");
@@ -720,8 +792,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.show_help || cfg.show_version || cfg.flash_next_offload_plan) return {};
 
     // ------------------------------------------------------------ validation
-    if (cfg.model_path.empty() && !cfg.stub) {
-        return fail("nothing to serve: pass --model PATH, or --stub for the M0 skeleton");
+    if (cfg.model_path.empty() && !cfg.stub && !(cfg.engine != "ov" && !cfg.gguf_path.empty())) {
+        return fail("nothing to serve: pass --model PATH, --engine llama --gguf FILE, or --stub for the M0 skeleton");
     }
     if (!cfg.model_path.empty() && cfg.stub) {
         return fail("--model and --stub are mutually exclusive");
@@ -855,9 +927,26 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         return fail("--moe-cpu-tier-threads needs --moe-cpu-tier: without the tier "
                     "there is no pool to size");
     }
-    if (cfg.moe_cpu_tier && cfg.offload_ratio == 0) {
-        return fail("--moe-cpu-tier needs --offload-ratio > 0: with every expert "
-                    "resident there is nothing for the host tier to compute");
+    if (cfg.moe_cpu_tier && cfg.offload_ratio == 0 && !cfg.moe_per_expert_dispatch) {
+        return fail("--moe-cpu-tier needs --offload-ratio > 0 (or an explicit 0 with "
+                    "--moe-per-expert-dispatch, the all-resident native route): with "
+                    "every expert resident and no dispatch there is nothing for the "
+                    "host tier to compute");
+    }
+    if (cfg.moe_per_expert_dispatch && !cfg.moe_cpu_tier && cfg.offload_ratio > 0) {
+        return fail("--moe-per-expert-dispatch needs --moe-cpu-tier while experts are "
+                    "offloaded: non-resident experts fall back to the CPU tier");
+    }
+    if (cfg.moe_per_expert_dispatch && cfg.offload_ratio == 0) {
+        // Ergonomics (operator 2026-09-25). The all-resident native route is
+        // reachable as `--offload-ratio 0 --moe-per-expert-dispatch`; the
+        // plugin's dispatch path hoists the tier's x/routing-weight host
+        // buffers (moe_3gemm_swiglu_opt.cpp:1141), so the tier must be ON
+        // internally even though, with every expert resident, it computes
+        // nothing (measured: cpu_tier_pairs=0). Enable it here rather than
+        // making the operator pass a flag that does no work. Stated, not
+        // silent: backend_ov.cpp logs "MoE host compute tier enabled".
+        cfg.moe_cpu_tier = true;
     }
     // The --moe-cpu-tier / --prefix-cache-mib refusal USED to live here
     // (DESIGN §7.0.2ae's F0). Since plugin patch 0018 the answer depends on
@@ -866,8 +955,20 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     // decide it: this combination now parses, and backend_ov.cpp's load
     // path (tier_prefix_cache_decision, config.h) makes the call instead.
     if (cfg.prefill_chunk < 0) return fail("--prefill-chunk must be >= 0");
+    // The default follows what was given: a GGUF alone is the libllama
+    // engine's model, an IR directory the OpenVINO executor's.
+    if (cfg.engine.empty()) cfg.engine = (!cfg.gguf_path.empty() && cfg.model_path.empty()) ? "llama" : "ov";
+    if (cfg.engine == "llama") {
+        if (cfg.gguf_path.empty()) return fail("--engine llama serves a GGUF: give --gguf");
+        if (!cfg.llama_mtp_vocab.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-vocab needs --llama-mtp");
+    } else {
+    if (cfg.llama_cpu_moe > 0 || cfg.llama_threads > 0 || cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty() ||
+        cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192)
+        return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab, --llama-kv and --llama-checkpoints/-step "
+                    "are --engine llama options");
     if (!cfg.gguf_path.empty() && cfg.model_path.empty()) return fail("--gguf needs --model (the template IR directory)");
     if (!cfg.gguf_path.empty() && !cfg.paged) return fail("--gguf serves on the paged path only");
+    }
     if (!cfg.ngram_gguf_path.empty() && cfg.model_path.empty()) return fail("--ngram-gguf needs --model (the IR whose ngram_table.K ports it binds)");
     if (!cfg.ngram_gguf_path.empty() && !cfg.paged) return fail("--ngram-gguf serves on the paged path only (the ports are bound per lane request)");
     if (!cfg.ngram_gguf_path.empty() && !cfg.gguf_path.empty()) return fail("--ngram-gguf and --gguf both open a GGUF for the ngram_table ports; give one");
@@ -939,6 +1040,7 @@ std::optional<std::string> apply_operator_defaults(const Config& cfg, SamplerDef
     o.temperature        = cfg.temp;
     o.top_p              = cfg.top_p;
     o.top_k              = cfg.top_k;
+    o.min_p              = cfg.min_p;
     o.repetition_penalty = cfg.repetition_penalty;
     o.presence_penalty   = cfg.presence_penalty;
     return sampler_defaults_apply(d, o);

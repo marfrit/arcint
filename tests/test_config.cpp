@@ -501,12 +501,13 @@ TEST(config_mtp_layer_choice) {
 TEST(config_operator_sampler_flags) {
     Config cfg;
     CHECK(run({"--stub", "--temp", "0", "--top-p", "0.9", "--top-k", "40",
-               "--repetition-penalty", "1.0", "--presence-penalty", "1.5"}, cfg).ok);
+               "--repetition-penalty", "1.0", "--presence-penalty", "1.5", "--min-p", "0.05"}, cfg).ok);
     CHECK(cfg.temp && *cfg.temp == 0.0f);
     CHECK(cfg.top_p && *cfg.top_p == 0.9f);
     CHECK(cfg.top_k && *cfg.top_k == 40);
     CHECK(cfg.repetition_penalty && *cfg.repetition_penalty == 1.0f);
     CHECK(cfg.presence_penalty && *cfg.presence_penalty == 1.5f);
+    CHECK(cfg.min_p && *cfg.min_p == 0.05f);
 }
 
 TEST(config_operator_flags_default_unset) {
@@ -600,6 +601,58 @@ TEST(config_moe_cpu_tier_accepts_with_offload_ratio) {
 
 TEST(config_moe_cpu_tier_needs_offload_ratio) {
     CHECK(rejected({"--stub", "--moe-cpu-tier"}));
+}
+
+TEST(config_offload_ratio_zero_is_distinguishable_from_unset) {
+    // plugin patch 0051: an explicit 0 is the all-resident native pool, and it
+    // must be distinguishable from "offload off".
+    Config cfg;
+    CHECK(run({"--stub"}, cfg).ok);
+    CHECK(!cfg.offload_ratio_set);
+    CHECK_EQ(cfg.offload_ratio, 0);
+
+    Config cfg2;
+    CHECK(run({"--stub", "--offload-ratio", "0"}, cfg2).ok);
+    CHECK(cfg2.offload_ratio_set);
+    CHECK_EQ(cfg2.offload_ratio, 0);
+}
+
+TEST(config_all_resident_native_dispatch_is_accepted) {
+    // The all-resident native route: an explicit 0 plus per-expert dispatch,
+    // with or without the tier.
+    Config cfg;
+    CHECK(run({"--stub", "--offload-ratio", "0", "--moe-per-expert-dispatch"}, cfg).ok);
+    CHECK(cfg.offload_ratio_set);
+    CHECK(cfg.moe_per_expert_dispatch);
+    // Ergonomics: the dispatch form auto-enables the tier (the plugin hoists
+    // the tier's host buffers at moe_3gemm_swiglu_opt.cpp:1141 even when no
+    // expert misses), so the operator does not pass an otherwise no-op flag.
+    // Red-first: removing the auto-enable fails this line.
+    CHECK(cfg.moe_cpu_tier);
+
+    Config cfg2;
+    CHECK(run({"--stub", "--offload-ratio", "0", "--moe-cpu-tier",
+               "--moe-per-expert-dispatch"}, cfg2).ok);
+    CHECK(cfg2.moe_cpu_tier);
+}
+
+TEST(config_dispatch_still_needs_tier_while_offloaded) {
+    // The guard protects a real fallback: while experts are offloaded, a
+    // dispatched miss needs the tier.
+    CHECK(rejected({"--stub", "--offload-ratio", "20", "--moe-per-expert-dispatch"}));
+    // ratio 0, tier, no dispatch: still nothing for the tier to compute.
+    CHECK(rejected({"--stub", "--moe-cpu-tier"}));
+}
+
+TEST(config_offload_active_covers_the_all_resident_native_case) {
+    // Red-first for the swallowed-property defect: reverting backend_ov.cpp to
+    // `ratio > 0` (or dropping the explicit-0 plumbing) makes the
+    // explicit-0-native case below fail.
+    CHECK(!moe_offload_active(0, false, "native"));  // unset -> no offload
+    CHECK( moe_offload_active(0, true,  "native"));  // explicit 0 + native -> all-resident pool
+    CHECK(!moe_offload_active(0, true,  "u4"));      // affine explicit 0 -> unchanged path
+    CHECK( moe_offload_active(50, false, ""));       // ratio > 0 -> offload
+    CHECK(!moe_offload_active(0, true,  ""));        // no declared format -> no offload
 }
 
 TEST(config_moe_cpu_tier_threads_needs_tier) {
@@ -934,4 +987,164 @@ TEST(config_dflash_topk_rejects_out_of_range) {
     Config hi;
     CHECK(run({"--stub", "--dflash", "/d", "--dflash-topk", "64"}, hi).ok);
     CHECK_EQ(hi.dflash_topk, 64);
+}
+
+// 0.5.3.1459: a GGUF alone selects the libllama engine; with an IR directory
+// it stays the OpenVINO template path.
+TEST(config_engine_follows_what_was_given) {
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf"};
+        const auto r = parse_args(3, const_cast<char**>(argv), cfg);
+        CHECK(r.ok);
+        CHECK_EQ(cfg.engine, std::string("llama"));
+    }
+#ifdef ARCINT_OPENVINO   // a build without it refuses --model at parse
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--model", "/m/ir", "--gguf", "/m/q.gguf"};
+        const auto r = parse_args(5, const_cast<char**>(argv), cfg);
+        CHECK(r.ok);
+        CHECK_EQ(cfg.engine, std::string("ov"));
+    }
+#endif
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--engine", "llama", "--model", "/m/ir"};
+        const auto r = parse_args(5, const_cast<char**>(argv), cfg);
+        CHECK(!r.ok);   // the llama engine needs its GGUF
+    }
+}
+
+TEST(config_llama_kv) {
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf"};
+        CHECK(parse_args(3, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_kv_k, std::string("f16"));
+        CHECK_EQ(cfg.llama_kv_v, std::string("f16"));
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-kv", "q8_0"};
+        CHECK(parse_args(5, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_kv_k, std::string("q8_0"));
+        CHECK_EQ(cfg.llama_kv_v, std::string("q8_0"));   // V defaults to K
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-kv", "q8_0:q4_0"};
+        CHECK(parse_args(5, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_kv_k, std::string("q8_0"));
+        CHECK_EQ(cfg.llama_kv_v, std::string("q4_0"));
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-kv", "q5_0"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // not a type the kernels take
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-kv", "q4_0:q8_0"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // a pair without a kernel
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-kv", "q4_0"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // 4:4 misses the answer-level bar
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--model", "/m/ir", "--llama-kv", "q8_0"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // an --engine llama option
+    }
+}
+
+TEST(config_llama_cpu_moe_and_threads) {
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-cpu-moe", "31", "--llama-threads", "8"};
+        const auto r = parse_args(7, const_cast<char**>(argv), cfg);
+        CHECK(r.ok);
+        CHECK_EQ(cfg.llama_cpu_moe, 31);
+        CHECK_EQ(cfg.llama_threads, 8);
+        CHECK_EQ(cfg.llama_mtp, 0);
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp", "3"};
+        CHECK(parse_args(5, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_mtp, 3);
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp", "4", "--llama-mtp-vocab", "/m/ids.bin"};
+        CHECK(parse_args(7, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_mtp_vocab, std::string("/m/ids.bin"));
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp-vocab", "/m/ids.bin"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // a draft vocabulary without drafts
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp", "8"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // a verify of 9 rows: the decode attention takes up to 8
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-cpu-moe", "-1"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // a count, not a sign
+    }
+#ifdef ARCINT_OPENVINO
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--model", "/m/ir", "--llama-cpu-moe", "4"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // an option of the libllama engine only
+    }
+#endif
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--stub", "--llama-threads", "4"};
+        CHECK(!parse_args(4, const_cast<char**>(argv), cfg).ok);   // --stub runs the OpenVINO-less skeleton, not libllama
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--stub", "--llama-mtp", "2"};
+        CHECK(!parse_args(4, const_cast<char**>(argv), cfg).ok);
+    }
+}
+
+TEST(config_llama_checkpoints) {
+    {
+        // the reference's defaults (llama.cpp server: 32 a slot, 8192 apart)
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf"};
+        CHECK(parse_args(3, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_checkpoints, 32);
+        CHECK_EQ(cfg.llama_checkpoint_step, 8192);
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-checkpoints", "0", "--llama-checkpoint-step", "4096"};
+        CHECK(parse_args(7, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_checkpoints, 0);   // off: a hybrid lane re-prefills when it cannot trim
+        CHECK_EQ(cfg.llama_checkpoint_step, 4096);
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-checkpoints", "-1"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-checkpoint-step", "0"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // a spacing, at least one token
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--stub", "--llama-checkpoints", "0"};
+        CHECK(!parse_args(4, const_cast<char**>(argv), cfg).ok);   // an option of the libllama engine only
+    }
 }

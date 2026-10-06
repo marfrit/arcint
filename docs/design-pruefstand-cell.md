@@ -1,3 +1,7 @@
+> Kept on `main` because the acceptance tooling or its tests cite this note by
+> path. It is a dated design record, not current state (DESIGN.md is). Other
+> `docs/` documents it links to live on the development branch, `qfndev`.
+
 <!-- Campaign pruefstand-cell-remote (docs/campaigns/pruefstand-cell-remote.md),
 design pass 2026-09-05. Changes the run manifest's schema and the external
 cell's contract; short, because the mechanism it reuses already exists. -->

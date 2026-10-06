@@ -94,6 +94,11 @@ struct ModelStatus {
     int         n_layer      = 0;
     int         n_gdn_layer  = 0;
     int         n_attn_layer = 0;
+    // QSA (campaign qsa, step 3): of `n_attn_layer`, how many are QSA-served
+    // (the manifest's `qsa`), and whether the loader actually bound one. The
+    // raw-key history is state, not KV, which is why /props reports it apart.
+    int         n_qsa_layer  = 0;
+    bool        qsa_enabled  = false;
     bool        mtp_enabled  = false;
     uint64_t    weights_bytes = 0;
 
@@ -112,6 +117,11 @@ struct ModelStatus {
     // paths -- kept here rather than re-derived at /props time so a future
     // load path that decides differently cannot drift from what /props says.
     bool prefix_cache_enabled = false;
+    // The model may open a think block with "<thinking>" or "[THINK]" as well
+    // as "<think>": set by the llama engine for the Mistral Small 24B family
+    // (Cydonia 24B, Magistral tunes). The Qwens keep "<think>" alone, so an
+    // answer of theirs that merely starts with such text stays content.
+    bool think_tags_extended = false;
 
     Reservation     reservation;
     SamplerDefaults sampler_defaults;
@@ -305,6 +315,12 @@ public:
 std::unique_ptr<Backend> make_stub_backend(const ModelEntry& entry, Quant quant, int n_ctx,
                                            int delay_ms = 0,
                                            const std::string& served_name = {});
+
+#ifdef ARCINT_LLAMA
+// 0.5.3.1459: the libllama executor (ggml OpenCL), the GGUF in --gguf.
+struct Config;
+std::unique_ptr<Backend> make_llama_backend(const Config& cfg, int n_ctx);
+#endif
 
 #ifdef ARCINT_OPENVINO
 struct Artifact;

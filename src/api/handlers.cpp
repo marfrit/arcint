@@ -435,6 +435,11 @@ json props(const Context& ctx) {
     model["n_layer"]       = maybe_int(st.n_layer);
     model["n_gdn_layer"]   = maybe_int(st.n_gdn_layer);
     model["n_attn_layer"]  = maybe_int(st.n_attn_layer);
+    // QSA (campaign qsa, step 3): whether the served graph actually bound an
+    // indexer, and how many layers carry one. `qsa` is the manifest flag
+    // resolved at load, not a Config default.
+    model["n_qsa_layer"]   = maybe_int(st.n_qsa_layer);
+    model["qsa"]           = st.qsa_enabled;
     model["weights_bytes"] = st.weights_bytes > 0 ? json(st.weights_bytes) : json(nullptr);
 
     // Keyed by the canonical id on purpose: the served name is presentation and
@@ -487,11 +492,13 @@ json props(const Context& ctx) {
           {"prefix_cache", st.prefix_cache_enabled},
           {"prefix_cache_mib", cfg.prefix_cache_mib},
           {"gdn_checkpoint_budget_mib", cfg.gdn_checkpoint_budget_mib}}},
-        {"mtp", {{"requested", cfg.mtp}, {"enabled", st.mtp_enabled}}},
+        {"mtp", {{"requested", cfg.engine == "llama" ? std::string(cfg.llama_mtp > 0 ? "on" : "off") : cfg.mtp},
+                 {"enabled", st.mtp_enabled}}},
         {"sampler_defaults",
          {{"temperature", sd.temperature},
           {"top_p", sd.top_p},
           {"top_k", sd.top_k},
+          {"min_p", sd.min_p},
           {"repetition_penalty", sd.repetition_penalty},
           {"presence_penalty", sd.presence_penalty},
           {"provenance", sd.provenance}}},
@@ -575,6 +582,7 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     // The template decides whether the answer starts inside a think block; the
     // split of reasoning from content below follows that, not a guess.
     prep.think_open = prompt.ends_with("<think>\n");
+    prep.think_tags_extended = ctx.backend->status().think_tags_extended;
     // The rendered prompt is the one thing that decides what the model saw.
     // When an answer differs from a reference run this is the first question,
     // and reconstructing it after the fact is guesswork (§3.7).
@@ -621,7 +629,7 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
               [](std::string_view, const std::string&) { return true; }, stats, raw);
     log_stats(slot, stats, reason);
 
-    const ReasoningSplit  split   = split_reasoning(raw, prep.think_open);
+    const ReasoningSplit  split   = split_reasoning(raw, prep.think_open, prep.think_tags_extended);
     std::string           content = split.content;
     std::vector<ToolCall> calls;
     if (prep.parse_tool_calls) {
@@ -706,7 +714,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     // Reasoning goes out as reasoning_content deltas until the think block
     // closes; from there `content` accumulates the answer and the tool-call
     // logic below sees only that.
-    ReasoningStreamer   reasoning(prep.think_open);
+    ReasoningStreamer   reasoning(prep.think_open, prep.think_tags_extended);
     std::string         content;       // the answer part of the output so far
     auto emit_reasoning = [&](std::string_view bytes) {
         if (bytes.empty()) return true;

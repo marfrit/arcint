@@ -175,9 +175,12 @@ ArtifactInfo Artifact::to_info(Quant quant) const {
     info.n_layer        = n_layer;
     info.n_gdn_layer    = n_gdn_layer;
     info.n_attn_layer   = n_attn_layer;
+    info.n_qsa_layer    = n_qsa_layer;
+    info.qsa            = qsa;
     info.arch_hash      = arch_hash;
     info.template_hash  = template_hash;
     info.tokenizer_hash = tokenizer_hash;
+    info.weights_bytes  = weights_bytes;
     info.has_mtp_head   = has_mtp_head;
     return info;
 }
@@ -259,6 +262,24 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out,
     // about segments (the compile, the allowlist check, the load-time log).
     a.language_model_xml = a.segments.front().language_model_xml;
     a.language_model_bin = a.segments.front().language_model_bin;
+
+    // ------------------------------------------- the declared expert format
+    // serving-shape.json's `expert_fill.format`, read so the backend can tell a
+    // native artifact (the checkpoint's own blocks; the all-resident pool at
+    // ratio 0 needs the offload provider's native reader) from an affine one
+    // (direct resident Constants; an explicit ratio 0 keeps the old path).
+    if (shape.is_object() && shape.contains("expert_fill") &&
+        shape.at("expert_fill").is_object()) {
+        a.expert_format = shape.at("expert_fill").value("format", std::string());
+    }
+
+    // ------------------------------------------- QSA (campaign qsa, step 3)
+    // serving-shape.json's top-level `qsa`: the export carried the model's own
+    // Qwen Sparse Attention indexer and its per-query selection. Absent on
+    // every pre-QSA artifact, so it defaults off and nothing moves.
+    if (shape.is_object() && shape.contains("qsa") && shape.at("qsa").is_boolean()) {
+        a.qsa = shape.at("qsa").get<bool>();
+    }
 
     // ------------------------------------------- expert bodies (window-051 §2)
     // The blob the runtime refills one segment at a time from. Its `entries[]`
@@ -346,12 +367,21 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out,
         }
         // "full_attention" is the qwen3.5/3.6 exports' name; "qwen_sparse_
         // attention" is the Flash-Next pin's (layer_types at layer_idx % 4 ==
-        // 3), served dense-causal -- the selection branch is the indexer,
-        // which is not emitted (window-050 §8: price 0.0 to T=2051). Either
-        // way the layer carries a KV cache and one ScaledDotProductAttention,
-        // which is what n_attn_layer counts.
+        // 3). Either way the layer carries a KV cache and one
+        // ScaledDotProductAttention, which is what n_attn_layer counts. With
+        // `qsa` those layers are QSA-SERVED -- the emitted graph carries the
+        // model's own indexer and selection -- so they are additionally
+        // counted as such, and a reader that must not mistake them for dense
+        // causal has n_qsa_layer.
         for (const std::string& t : a.layer_types) {
-            if (t == "full_attention" || t == "qwen_sparse_attention") ++a.n_attn_layer;
+            if (t == "full_attention" || t == "qwen_sparse_attention") {
+                ++a.n_attn_layer;
+                // Every attention layer of a QSA manifest is QSA-served: the
+                // flag is the manifest's own statement and does not depend on
+                // the layer_types spelling. (Today --qsa emits the name
+                // "qwen_sparse_attention" either way, so the two coincide.)
+                if (a.qsa) ++a.n_qsa_layer;
+            }
         }
         a.n_gdn_layer = static_cast<int>(a.layer_types.size()) - a.n_attn_layer;
         if (!a.layer_types.empty() && static_cast<int>(a.layer_types.size()) != a.n_layer) {
@@ -363,6 +393,7 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out,
         // Derived, and only when the explicit list is absent.
         a.n_attn_layer = a.n_layer / a.full_attention_interval;
         a.n_gdn_layer  = a.n_layer - a.n_attn_layer;
+        a.n_qsa_layer  = a.qsa ? a.n_attn_layer : 0;
     }
 
     // ------------------------------------------------------ n-gram (FIX D)

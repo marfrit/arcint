@@ -78,6 +78,14 @@ not just a hedge. Known gaps, most to least likely to matter:
       typed input -- zero_point, scale, activations, indices -- has its
       dtype checked anywhere in this walker.
 
+  (g) ARGUMENT COUNT -- CLOSED 2026-09-17. `Matcher::match_arguments`
+      rejects a node whose input count differs from the pattern node's.
+      `op.swish(x)` from the Python binding carries a beta Constant as a
+      second input; the pattern's Swish has one. This walker reported FULL
+      MATCH on a depth-12 IR that compiled to 0 MoE primitives with the
+      Reshapes in place (the fusion census of that day); `require_inputs`
+      now runs at every pattern node.
+
   (f) THE keep_dims=true REDUCESUM VARIANT IS NOT WALKED. R1 only follows
       the keep_dims=false direct path; a candidate whose ReduceSum has
       keep_dims=true (needing a following Squeeze, the ARM workaround shape
@@ -129,6 +137,18 @@ def require_type(node, allowed, constraint):
 
 def require_consumers(output, n, constraint):
     c = consumers(output)
+    if c != n:
+        raise Fail(constraint, c, n)
+
+
+def require_inputs(node, n, constraint):
+    """The C++ Matcher rejects a node whose ARGUMENT COUNT differs from the
+    pattern node's (`Matcher::match_arguments`: pattern_args.size() !=
+    args.size() -> false), independent of what the extra input is. Found
+    2026-09-17: `op.swish(x)` from the Python binding carries a beta
+    Constant as a second input, the pattern declares Swish with one, and a
+    graph this walker reported FULL MATCH on compiled to 0 MoE primitives."""
+    c = node.get_input_size()
     if c != n:
         raise Fail(constraint, c, n)
 
@@ -313,6 +333,7 @@ def check_3gemm_from_reduce_sum(reduce_sum_node, log):
     attrs = attrs_of(reduce_sum_node)
     keep_dims = str(attrs.get("keep_dims", "false")).lower() == "true"
     require_consumers(reduce_sum_node.output(0), 1, "R1.reduce_sum.consumers_count")
+    require_inputs(reduce_sum_node, 2, "R1.reduce_sum.input_count")
     if keep_dims:
         raise Fail("R1.reduce_sum.keep_dims_true_needs_squeeze_next",
                   "not walked (script only follows the common keep_dims=false path)", "n/a")
@@ -320,6 +341,7 @@ def check_3gemm_from_reduce_sum(reduce_sum_node, log):
 
     mul3 = reduce_sum_node.input_value(0).get_node()
     require_type(mul3, {"Multiply"}, "R2.mul3.type")
+    require_inputs(mul3, 2, "R2.mul3.input_count")
     log(f"R2 mul3 = Multiply: PASS ({mul3.get_friendly_name()})")
 
     end_reshape, router_side = resolve_mul3_operands(mul3)
@@ -332,18 +354,22 @@ def check_3gemm_from_reduce_sum(reduce_sum_node, log):
         log("R3 optional_unsqueeze: absent")
         router_reshape = router_side
     require_type(router_reshape, {"Reshape"}, "R4.router_reshape.type")
+    require_inputs(router_reshape, 2, "R4.router_reshape.input_count")
     log(f"R4 router_reshape = Reshape: PASS ({router_reshape.get_friendly_name()})")
 
     router_transpose = router_reshape.input_value(0).get_node()
     require_type(router_transpose, {"Transpose"}, "R5.router_transpose.type")
+    require_inputs(router_transpose, 2, "R5.router_transpose.input_count")
     log(f"R5 router_transpose = Transpose: PASS ({router_transpose.get_friendly_name()})")
 
     scatter = router_transpose.input_value(0).get_node()
     require_type(scatter, {"ScatterElementsUpdate"}, "R6.scatter_elements_update.type")
+    require_inputs(scatter, 4, "R6.scatter_elements_update.input_count")
     log(f"R6 scatter_elements_update: PASS ({scatter.get_friendly_name()})")
 
     # E1: end_reshape
     require_type(end_reshape, {"Reshape"}, "E1.end_reshape.type")
+    require_inputs(end_reshape, 2, "E1.end_reshape.input_count")
     require_consumers(end_reshape.output(0), 1, "E1.end_reshape.consumers_count")
     end_ps = end_reshape.output(0).get_partial_shape()
     log(f"E1 end_reshape = Reshape, consumers=1, out_shape={end_ps}, "
@@ -351,6 +377,7 @@ def check_3gemm_from_reduce_sum(reduce_sum_node, log):
 
     down_matmul = end_reshape.input_value(0).get_node()
     require_type(down_matmul, {"MatMul"}, "E2.down_matmul.type")
+    require_inputs(down_matmul, 2, "E2.down_matmul.input_count")
     require_consumers(down_matmul.output(0), 1, "E2.down_matmul.consumers_count")
     require_attrs(down_matmul, {"transpose_a": False, "transpose_b": True}, "E2.down_matmul.attrs")
     log(f"E2 down_matmul: PASS ({down_matmul.get_friendly_name()})")
@@ -358,15 +385,18 @@ def check_3gemm_from_reduce_sum(reduce_sum_node, log):
 
     swiglu = down_matmul.input_value(0).get_node()
     require_type(swiglu, {"Multiply"}, "E3.swiglu.type")
+    require_inputs(swiglu, 2, "E3.swiglu.input_count")
     require_consumers(swiglu.output(0), 1, "E3.swiglu.consumers_count")
     log(f"E3 swiglu = Multiply, consumers=1: PASS ({swiglu.get_friendly_name()})")
 
     swish, up_matmul = resolve_swiglu_operands(swiglu)
     require_type(swish, {"Swish", "Gelu"}, "E4.swish.type")
     require_consumers(swish.output(0), 1, "E4.swish.consumers_count")
+    require_inputs(swish, 1, "E4.swish.input_count")
     log(f"E4 swish/gelu, consumers=1: PASS ({swish.get_friendly_name()}, type={type_of(swish)})")
 
     require_type(up_matmul, {"MatMul"}, "E5.up_matmul.type")
+    require_inputs(up_matmul, 2, "E5.up_matmul.input_count")
     require_consumers(up_matmul.output(0), 1, "E5.up_matmul.consumers_count")
     require_attrs(up_matmul, {"transpose_a": False, "transpose_b": True}, "E5.up_matmul.attrs")
     log(f"E5 up_matmul: PASS ({up_matmul.get_friendly_name()})")
@@ -374,6 +404,7 @@ def check_3gemm_from_reduce_sum(reduce_sum_node, log):
 
     gate_matmul = swish.input_value(0).get_node()
     require_type(gate_matmul, {"MatMul"}, "E6.gate_matmul.type")
+    require_inputs(gate_matmul, 2, "E6.gate_matmul.input_count")
     require_consumers(gate_matmul.output(0), 1, "E6.gate_matmul.consumers_count")
     require_attrs(gate_matmul, {"transpose_a": False, "transpose_b": True}, "E6.gate_matmul.attrs")
     log(f"E6 gate_matmul: PASS ({gate_matmul.get_friendly_name()})")
@@ -388,12 +419,14 @@ def check_3gemm_from_reduce_sum(reduce_sum_node, log):
                   "the SAME node feeding both gate_matmul and up_matmul")
     after_tile_reshape = after_tile_gate
     require_type(after_tile_reshape, {"Reshape"}, "E7.after_tile_reshape.type")
+    require_inputs(after_tile_reshape, 2, "E7.after_tile_reshape.input_count")
     require_consumers(after_tile_reshape.output(0), 2, "E7.after_tile_reshape.consumers_count")
     log(f"E7 after_tile_reshape = Reshape, consumers=2 (shared by gate+up): PASS "
         f"({after_tile_reshape.get_friendly_name()})")
 
     tile = after_tile_reshape.input_value(0).get_node()
     require_type(tile, {"Tile"}, "E8.tile.type")
+    require_inputs(tile, 2, "E8.tile.input_count")
     require_consumers(tile.output(0), 1, "E8.tile.consumers_count")
     log(f"E8 tile = Tile, consumers=1: PASS ({tile.get_friendly_name()})")
 

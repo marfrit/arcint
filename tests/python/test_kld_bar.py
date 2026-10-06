@@ -106,3 +106,41 @@ def test_the_bar_is_a_stated_multiple_of_f_ref_with_the_qsa_price_above(tmp_path
     assert rep["floor_pair"]["kl_ab_mean"] == 0.0
     assert rep["multiple"] == 100 and rep["inherited_bar_provisional"] == 0.0599
     assert rep["status"] == "PROVISIONAL until the dated leg names its rows"
+
+
+def test_the_bound_is_marked_not_an_acceptance_bar_and_the_tail_is_flagged(tmp_path):
+    """The 2026-09-19 honest fix: bar_below/bar_above are an
+    instrument-resolution bound, not an acceptance bar; the acceptance
+    candidate (the between-implementations floor) is carried; and the
+    per-row clamp tail is flagged against the bound.
+
+    The documented fact is pinned from the HARNESS constants, because it is a
+    measured property of the REAL served rows (F_ref mean 3.0905e-05, per-row
+    max 1.0533e-02 -> the max exceeds bar_below = 100 x mean by ~3.4x); a
+    synthetic all-wide fixture does not reproduce that ratio, since its own
+    tail inflates the mean. The flag's arithmetic is pinned on the report.
+    Red first: the previous report had none of these fields."""
+    import json
+    import math
+    import kld_harness as kh
+    wide = _rows(4, 248_320, seed=5, sharp=4.0)      # spans >16 nats -> clamp tail
+    x = tmp_path / "rows.npy"
+    np.save(x, wide)
+    out = tmp_path / "bar.json"
+    assert kld_bar.main(["--rows", str(x), "--out", str(out)]) == 0
+    rep = json.loads(out.read_text())
+    assert rep["bound_is_acceptance"] is False
+    assert "instrument-resolution" in rep["bound_kind"]
+    assert rep["acceptance_candidate"]["median_w0_nats"] == 0.0649
+    assert rep["acceptance_candidate"]["median_w1_nats"] == 0.0283
+    assert rep["inherited_bar_provisional"] == kld_bar.INHERITED_BAR_PROVISIONAL
+    # the flag is the report's own arithmetic ...
+    assert rep["per_row_clamp_tail_exceeds_bound"] == (
+        rep["f_ref_max"] > rep["bar_below_2051"])
+    # ... and on the REAL rows the tail DOES exceed the bound (documented fact)
+    assert kh.F_REF_PER_ROW_MAX_NATS > kh.RESOLUTION_BOUND_BELOW_NATS
+    # the bound is 100 x F_ref to float precision (window-051's own decimal
+    # 3.0905e-03 is 100 x 3.0905e-05 rounded to five significant figures)
+    assert math.isclose(kh.RESOLUTION_BOUND_BELOW_NATS,
+                        kh.RESOLUTION_BOUND_MULTIPLE * kh.F_REF_MEAN_NATS,
+                        rel_tol=1e-6)

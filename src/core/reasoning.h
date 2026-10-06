@@ -14,19 +14,22 @@ namespace lgc {
 struct ReasoningSplit {
     std::string reasoning;
     std::string content;
-    bool        closed = false;   // a "</think>" was seen; false = the model never left the block
+    bool        closed = false;   // the block's closer was seen; false = the model never left the block
 };
 
-// `think_open`: the rendered prompt ended inside a think block. When it did
-// not, a "<think>" the model emits itself at the very start is honoured too.
-ReasoningSplit split_reasoning(std::string_view raw, bool think_open);
+// `think_open`: the rendered prompt ended inside a think block ("<think>").
+// When it did not, a block the model opens itself at the very start is
+// honoured too: "<think>", and with `extended_tags` (ModelStatus::
+// think_tags_extended) also "<thinking>" (Cydonia 24B) or "[THINK]"
+// (Magistral tunes), each closed only by its own closer.
+ReasoningSplit split_reasoning(std::string_view raw, bool think_open, bool extended_tags = false);
 
 // The streaming form: pieces in, (reasoning delta, content delta) out, with a
 // hold-back for a close tag that straddles two pieces. Once the block closes
 // every further byte is content and goes straight through.
 class ReasoningStreamer {
 public:
-    explicit ReasoningStreamer(bool think_open);
+    explicit ReasoningStreamer(bool think_open, bool extended_tags = false);
     struct Step {
         std::string reasoning;
         std::string content;
@@ -36,9 +39,11 @@ public:
     bool in_reasoning() const { return in_reasoning_; }
 
 private:
-    bool        in_reasoning_;
-    bool        undecided_;      // not opened by the template: wait for the first bytes
-    std::string buffer_;
+    bool             in_reasoning_;
+    bool             undecided_;      // not opened by the template: wait for the first bytes
+    std::string      buffer_;
+    std::string_view close_ = "</think>";   // the closer of the block that is open
+    bool             extended_;
 };
 
 }  // namespace lgc

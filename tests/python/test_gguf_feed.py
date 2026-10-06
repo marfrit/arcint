@@ -119,6 +119,54 @@ def _layer_keys(sd_keys, layer, leaf):
 
 # --------------------------------------------------------------------------- #
 @_skip
+def test_bf16_tensors_are_fed_as_their_values_not_their_bytes(feed):
+    """gguf-py hands a BF16 tensor over as its raw bytes (uint8, twice the
+    row width): numpy has no bfloat16. Until 2026-09-28 the feed cast those
+    bytes to f32, so `indexer.q_proj` came out [512, 5120] with values
+    0..255, and `fitted` cropped it to [512, 2560] without complaint. The
+    indexer projections are the checkpoint's only BF16 tensors; the full-depth
+    reference (tools/ref_forward_stream.py) fed them that way. The oracle is
+    written test-side: a bf16 value is the high half of an f32's bits."""
+    seen = 0
+    for name, t in feed._index.items():
+        if t.tensor_type.name != "BF16":
+            continue
+        seen += 1
+        got = feed.dequant(name)
+        want = (np.ascontiguousarray(t.data).view(np.uint16).astype(np.uint32)
+                << 16).view(np.float32)
+        assert got.shape == want.shape, (name, got.shape, want.shape)
+        assert np.array_equal(got, want), name
+    assert seen, "no BF16 tensor in the shards: the cell measures nothing"
+    fused = feed.pin_tensor("layers.3.self_attn.indexer.index_qk_proj.weight")
+    q = feed.dequant("blk.3.indexer.q_proj.weight")
+    assert fused.shape[1] == q.shape[1] == feed.dequant("blk.3.attn_q.weight").shape[1], (
+        f"indexer projection {fused.shape} does not read the hidden size")
+    print(f"\n[bf16] {seen} tensors; fused indexer {fused.shape}, "
+          f"|w| max {float(np.abs(fused).max()):.4f}")
+
+
+# --------------------------------------------------------------------------- #
+@_skip
+def test_the_indexer_is_fed_fused_q_over_k_with_its_norms(feed):
+    """The sparse-attention indexer (2026-09-19): the pin's one
+    `index_qk_proj` is the GGUF's `indexer.q_proj` stacked over
+    `indexer.k_proj` on the output axis (the pin splits q first), and its
+    two norms are (1 + w) gammas. Red first: the three keys raised
+    "no GGUF map entry" and the full-depth reference could not build."""
+    q = feed.dequant("blk.3.indexer.q_proj.weight")
+    k = feed.dequant("blk.3.indexer.k_proj.weight")
+    fused = feed.pin_tensor("layers.3.self_attn.indexer.index_qk_proj.weight")
+    assert fused.shape == (q.shape[0] + k.shape[0], q.shape[1]), (fused.shape, q.shape, k.shape)
+    assert np.array_equal(fused[:q.shape[0]], q) and np.array_equal(fused[q.shape[0]:], k)
+    for suffix, gname in (("q_layernorm", "indexer.q_norm"), ("k_layernorm", "indexer.k_norm")):
+        g = feed.pin_tensor(f"layers.3.self_attn.indexer.{suffix}.weight")
+        stored = feed.dequant(f"blk.3.{gname}.weight")
+        assert g.shape == stored.shape and np.allclose(g, stored - 1.0), suffix   # gamma1: stored (1 + w) -> w
+    print(f"\n[indexer] fused {fused.shape}: q rows {q.shape[0]}, k rows {k.shape[0]}; norms {g.shape}")
+
+
+@_skip
 def test_map_covers_causal_keys(feed):
     """Every tiny-config pin key the causal backbone consumes resolves to a
     GGUF tensor that exists in the file (or is a derived buffer we do not feed).
@@ -606,7 +654,7 @@ _EXPECTED_LAYER = {
     "linear_attn.in_proj_z.weight": ("attn_gate.weight", "direct2d"),
     "linear_attn.in_proj_a.weight": ("ssm_alpha.weight", "direct2d"),
     "linear_attn.in_proj_b.weight": ("ssm_beta.weight", "direct2d"),
-    "linear_attn.A_log": ("ssm_a", "vec"),
+    "linear_attn.A_log": ("ssm_a", "neglog"),
     "linear_attn.dt_bias": ("ssm_dt.bias", "vec"),
     "linear_attn.conv1d.weight": ("ssm_conv1d.weight", "conv"),
     "linear_attn.norm.weight": ("ssm_norm.weight", "vec"),
@@ -621,11 +669,11 @@ _EXPECTED_LAYER = {
     "mlp.shared_expert.down_proj.weight": ("ffn_down_shexp.weight", "direct2d"),
     "mlp.shared_expert_gate.weight": ("ffn_gate_inp_shexp.weight", "row"),
     # hyper-connection mixers -- attn and mlp members are pairwise degenerate
-    "attn_hyper_connection.hc_norm.weight": ("hc_attn_norm.weight", "vec"),
+    "attn_hyper_connection.hc_norm.weight": ("hc_attn_norm.weight", "gamma1"),
     "attn_hyper_connection.input_mix_weight_down.weight": ("hc_attn_down.weight", "direct2d"),
     "attn_hyper_connection.input_mix_weight_up.weight": ("hc_attn_up.weight", "direct2d"),
     "attn_hyper_connection.block_inject_weight.weight": ("hc_attn_inject.weight", "direct2d"),
-    "mlp_hyper_connection.hc_norm.weight": ("hc_ffn_norm.weight", "vec"),
+    "mlp_hyper_connection.hc_norm.weight": ("hc_ffn_norm.weight", "gamma1"),
     "mlp_hyper_connection.input_mix_weight_down.weight": ("hc_ffn_down.weight", "direct2d"),
     "mlp_hyper_connection.input_mix_weight_up.weight": ("hc_ffn_up.weight", "direct2d"),
     "mlp_hyper_connection.block_inject_weight.weight": ("hc_ffn_inject.weight", "direct2d"),
@@ -636,14 +684,19 @@ _EXPECTED_LAYER = {
     "self_attn.k_proj.weight": ("attn_k.weight", "direct2d"),
     "self_attn.v_proj.weight": ("attn_v.weight", "direct2d"),
     "self_attn.o_proj.weight": ("attn_output.weight", "direct2d"),
-    "self_attn.q_norm.weight": ("attn_q_norm.weight", "vec"),
-    "self_attn.k_norm.weight": ("attn_k_norm.weight", "vec"),
+    # the sparse-attention indexer (2026-09-19, for the full-depth exact
+    # reference): the pin's fused q|k projection and its two (1 + w) norms
+    "self_attn.indexer.index_qk_proj.weight": (("indexer.q_proj.weight", "indexer.k_proj.weight"), "fuse_qk"),
+    "self_attn.indexer.q_layernorm.weight": ("indexer.q_norm.weight", "gamma1"),
+    "self_attn.indexer.k_layernorm.weight": ("indexer.k_norm.weight", "gamma1"),
+    "self_attn.q_norm.weight": ("attn_q_norm.weight", "gamma1"),
+    "self_attn.k_norm.weight": ("attn_k_norm.weight", "gamma1"),
     # PLE
     "ple.key_proj.weight": ("ple_key.weight", "direct2d"),
     "ple.value_proj.weight": ("ple_value.weight", "direct2d"),
-    "ple.norm_key.weight": ("ple_norm_key.weight", "vec"),
-    "ple.norm_query.weight": ("ple_norm_query.weight", "vec"),
-    "ple.norm_conv.weight": ("ple_norm_conv.weight", "vec"),
+    "ple.norm_key.weight": ("ple_norm_key.weight", "gamma1"),
+    "ple.norm_query.weight": ("ple_norm_query.weight", "gamma1"),
+    "ple.norm_conv.weight": ("ple_norm_conv.weight", "gamma1"),
     "ple.conv1d.weight": ("ple_conv1d.weight", "conv"),
 }
 
@@ -653,7 +706,7 @@ _EXPECTED_GLOBAL = {
     # ties and this checkpoint does not (FIX B). A swap between the two is
     # exactly the degeneracy this gate exists for.
     "lm_head.weight": ("output.weight", "direct2d"),
-    "hyper_connection_mixer.hc_norm.weight": ("output_hc_norm.weight", "vec"),
+    "hyper_connection_mixer.hc_norm.weight": ("output_hc_norm.weight", "gamma1"),
     "hyper_connection_mixer.input_mix_weight_down.weight": ("output_hc_down.weight", "direct2d"),
     "hyper_connection_mixer.input_mix_weight_up.weight": ("output_hc_up.weight", "direct2d"),
 }
@@ -674,7 +727,7 @@ def _blk_of(suffix):
     return 0
 
 
-_ROW_KINDS = ("direct2d", "expert3d", "fuse_gate_up")
+_ROW_KINDS = ("direct2d", "expert3d", "fuse_gate_up", "fuse_qk")
 _GATE_ROWS = 2   # leading-axis rows to compare; enough to separate any two tensors
 
 
@@ -702,8 +755,11 @@ def _raw_dequant(raw_index, name, rows=None):
     t = raw_index[name]
     data = t.data if rows is None else t.data[:rows]
     tn = t.tensor_type.name
-    if tn in ("F32", "F16", "BF16"):
+    if tn in ("F32", "F16"):
         return np.ascontiguousarray(np.asarray(data), dtype=np.float32)
+    if tn == "BF16":   # raw bytes from the reader; a bf16 is an f32's high half
+        return (np.ascontiguousarray(data).view(np.uint16).astype(np.uint32)
+                << 16).view(np.float32)
     return _Q.dequantize(data, t.tensor_type).astype(np.float32)
 
 
@@ -715,9 +771,19 @@ def _expected_array(raw_index, gname, kind, rows):
         gate = _raw_dequant(raw_index, gname[0], rows=r)
         up = _raw_dequant(raw_index, gname[1], rows=r)
         return np.concatenate([gate, up], axis=1)
+    if kind == "fuse_qk":                # q rows over k rows on the output axis (pin torch.split order)
+        q = _raw_dequant(raw_index, gname[0])
+        k = _raw_dequant(raw_index, gname[1])
+        fused = np.concatenate([q, k], axis=0)
+        return fused if r is None else fused[:r]
     arr = _raw_dequant(raw_index, gname, rows=r)
     if kind in ("direct2d", "vec", "expert3d"):
         return arr
+    if kind == "gamma1":                 # stored (1 + w), the pin wants w
+        return arr - 1.0
+    if kind == "neglog":                 # stored -exp(A_log), the pin wants A_log
+        assert bool((arr < 0).all())
+        return np.log(-arr)
     if kind == "row":
         return arr.reshape(1, -1)
     if kind == "conv":
@@ -853,6 +919,50 @@ def test_name_map_entry_content_global(feed, raw_index, key):
     assert g_sha == w_sha, (
         f"{key}: map read a DIFFERENT tensor than {gname} "
         f"(got {g_sha[:16]}, want {w_sha[:16]})")
+
+
+# --- the converter's folds, undone at the feed (2026-09-18) ---------------- #
+#
+# The GGUF was written by a converter that stores two families TRANSFORMED,
+# the way llama.cpp's graph consumes them (`src/models/qwen4exp.cpp`, `code`:
+# "the converter folded each gamma to (1 + w)" at build_hc_mix, and
+# `gate = alpha_softplus * ssm_a  // -A_log.exp() * softplus` in the GDN):
+#   * every plain `Qwen4ExpTextRMSNorm` gamma (the hyper-connection norms, the
+#     PLE norms, the attention q/k norms) is stored as (1 + w) -- the pin
+#     applies (1 + w) itself (pin 171, zero-init weight), so feeding the stored
+#     value doubles the "+1";
+#   * `ssm_a` is stored as -exp(A_log) -- the pin computes -exp(A_log) itself.
+# `Qwen4ExpTextRMSNormGated` (ssm_norm) is ones-init and multiplies by its
+# weight directly: NOT folded, and unfolding it is wrong (measured: the GDN
+# output's correlation with llama.cpp fell from +0.81 to -0.62).
+# Measured on the dev host, the France ids, depth 1: with the two folds undone
+# the pin's own hyper-connection mix matches llama.cpp's to 0.0036 on values of
+# ~0.6 (corr 1.0000); fed as stored, the mix was 1.69x too large and the served
+# logits sat at KL 12.4 nats against the model's own.
+
+
+@_skip
+def test_the_converter_folds_are_undone_at_the_feed(feed, raw_index):
+    """Red first: fed as stored, `hc_norm.weight` has a median near 1 and
+    `A_log` equals `ssm_a`. Unfolded, the gamma sits near 0 (the pin's
+    zero-init convention) and A_log = log(-ssm_a) with every ssm_a negative."""
+    raw_hc = _raw_dequant(raw_index, "blk.0.hc_attn_norm.weight")
+    fed_hc = feed.pin_tensor("layers.0.attn_hyper_connection.hc_norm.weight")
+    assert 0.9 < float(np.median(raw_hc)) < 1.1, "the stored gamma is not (1 + w)-shaped any more"
+    assert abs(float(np.median(fed_hc))) < 0.2, f"fed hc_norm median {float(np.median(fed_hc)):.4f}: still the stored (1 + w)"
+    assert np.allclose(fed_hc, raw_hc - 1.0, atol=0, rtol=0), "the unfold is not exactly raw - 1"
+    for key, gname in [("layers.1.ple.norm_key.weight", "blk.1.ple_norm_key.weight"),
+                       ("layers.3.self_attn.q_norm.weight", "blk.3.attn_q_norm.weight"),
+                       ("hyper_connection_mixer.hc_norm.weight", "output_hc_norm.weight")]:
+        assert np.array_equal(feed.pin_tensor(key), _raw_dequant(raw_index, gname) - 1.0), key
+    raw_a = _raw_dequant(raw_index, "blk.0.ssm_a")
+    assert bool((raw_a < 0).all()), "ssm_a is not all-negative: not a -exp(A_log) fold"
+    fed_a = feed.pin_tensor("layers.0.linear_attn.A_log")
+    assert np.allclose(fed_a, np.log(-raw_a), rtol=1e-6, atol=0), "A_log is not log(-ssm_a)"
+    assert np.allclose(-np.exp(fed_a), raw_a, rtol=1e-5, atol=0)
+    # the gated norm stays as stored (ones-init, multiplied directly)
+    assert np.array_equal(feed.pin_tensor("layers.0.linear_attn.norm.weight"),
+                          _raw_dequant(raw_index, "blk.0.ssm_norm.weight"))
 
 
 # --- FIX C's residency figures, promoted from literals to facts ------------ #

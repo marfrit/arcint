@@ -1,0 +1,568 @@
+# Native per-expert OpenCL decode: the per-expert kernel reads the checkpoint's
+# own expert blocks in the K-loop, so routing-aware expert execution computes
+# resident experts on the card (campaign: sub4bit-vram-kernel).
+#
+# Design:   docs/design-routing-aware-expert-execution.md 2.3a-2.3d, step 3
+# Campaign: docs/campaigns/sub4bit-vram-kernel.md
+# Gate:     a model with >= 512 experts serves on one card with routing-aware
+#           expert execution: only the routed experts computed per token.
+#
+# Prerequisite patches:
+#   0039 — per-expert OCL kernel (moe_expert_swiglu.cl, moe_expert_kernel.patch)
+#   0040 — per-expert kernel dispatch integration
+#   0043 — native expert formats through the CPU tier
+#
+# Patch 0043 carried the checkpoint's own IQ3_XXS / IQ4_NL / Q8_0 blocks
+# into the fused op and ran every routed expert on the scalar CPU tier, with
+# an in-code assert that did so "until the OpenCL decode exists". This patch
+# is that decode:
+#
+#   * moe_expert_swiglu.cl gains the native decode tables (the ones of
+#     src/core/gguf_dequant.cpp / tools/q4e/native_blocks.py, llama.cpp
+#     ggml-common.h pinned clone 56b9eb28) and two entry points,
+#     expert_gate_up_native and expert_down_native, with the same dispatch
+#     geometry and argument list as expert_gate_up / expert_down. The weight
+#     bytes are decoded per element inside the K-loop; no dequantised row is
+#     ever written.
+#   * moe_3gemm_swiglu_opt.cpp compiles those stages for a native config,
+#     lifts 0043's "native + per-expert dispatch not combined" refusal, and
+#     dispatches the native stages for the resident experts while the misses
+#     keep going to the CPU tier (patch 0011/0012) exactly as before.
+#
+# Device-free correctness of the same arithmetic is pinned by
+# tools/q4e/native_expert.py + tests/python/test_native_expert_gemv.py in the
+# arcint repository (block-scale application, partial-block refusal,
+# unknown-format refusal, and a deliberately wrong decode that must be caught).
+#
+# The native slots' per-tensor strides are the tensor bytes divided by the
+# expert count (moe_otd_runtime.cpp expert_tensor_span), so the kernel's
+# offsets are INTERMEDIATE_SIZE*HIDDEN_SIZE/{2,4,1,8} by role and format.
+# Scales reach the device transposed to [groups, oc] by
+# maybe_transpose_scale_zp, exactly as the affine path's scales do; the IQ3_XXS
+# sign indices are copied row-major (0043 skips the native zp transpose).
+#
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on
+# top of patches/0003-0044.
+
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
+@@ -68,6 +68,17 @@
+ #    define DEQUANT_4BIT_HI(v) convert_half((v) >> 4)
+ #endif
+ 
++// The plugin builds the kernels of one primitive into ONE program
++// (KernelGenerator::build_code -> batch compilation), so this .cl body appears
++// once per kernel (gate_up and down) in that program. Every file-scope helper
++// below -- the affine GEMV pairs, load_x_interleaved, the native tables and
++// helpers -- must be defined once, not twice; the guard persists across the
++// concatenated copies (the per-kernel JIT undef loop only removes the JIT
++// constants). Patch 0039 shipped without this, so the per-expert kernel never
++// compiled on a card; patch 0045 fixes it.
++#ifndef ARCINT_PER_EXPERT_CL_HELPERS_DEFINED
++#define ARCINT_PER_EXPERT_CL_HELPERS_DEFINED
++
+ // ---------------------------------------------------------------------------
+ // Gate/up GEMV inner loop: 2 output rows, u4 packed weights.
+ // Identical to moe_3gemm_swiglu_mlp.cl gate_up_gemv_n2x_u4.
+@@ -387,6 +398,185 @@
+     }
+ }
+ 
++// ===========================================================================
++// arcint (patch 0045). Native per-expert in-kernel decode.
++//
++// The checkpoint's own expert blocks (design note 2.3a-2.3d), decoded inside
++// the K-loop exactly as the tier's row decoders do (patch 0043), but fused
++// with the dot so no dequantised row is ever written to memory. Three formats:
++//   IQ4_NL  (weight_format 1): packed u4 codes, 16-entry table, per-32 scale
++//   IQ3_XXS (weight_format 2): u8 grid indices + u8 sign-mask indices, per-32
++//           scale (d*(0.5+s)*0.5 precomputed at fill)
++//   Q8_0    (weight_format 3): i8 codes, per-32 scale
++//
++// Layouts on the device, per expert slot (row-major weights, and the scales
++// transposed to [groups, oc] by maybe_transpose_scale_zp exactly as the affine
++// path's scales are):
++//   IQ4_NL  weight n*K/2 + g*16 bytes; scale S[g*N + n]
++//   IQ3_XXS weight n*K/4 + g*8; signix n*K/8 + g*4; scale S[g*N + n]
++//   Q8_0    weight n*K + g*32; scale S[g*N + n]
++// where N is the output row count and K the reduction length.
++//
++// The tables are the ones of tools/q4e/native_blocks.py / src/core/
++// gguf_dequant.cpp (llama.cpp ggml-common.h, pinned clone 56b9eb28, MIT),
++// transcribed here as __constant arrays. The grid is stored as little-endian
++// bytes (the u32 entry's four magnitudes in order).
++// ===========================================================================
++#if defined(NATIVE_GATE_UP_ENABLE) || defined(NATIVE_DOWN_ENABLE)
++// The plugin builds the kernels of one primitive into ONE program
++// (KernelGenerator::build_code -> batch compilation), so the .cl body appears
++// once per native kernel (gate_up and down) in that program. Define the tables
++// and helpers once, not twice: the guard persists across the concatenated
++// copies (the per-kernel JIT undef loop only removes the JIT constants).
++#ifndef ARCINT_NATIVE_DECODE_DEFINED
++#define ARCINT_NATIVE_DECODE_DEFINED
++__constant char NATIVE_IQ4NL_TABLE[16] = {
++    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
++};
++__constant uchar NATIVE_IQ2XS_MASK[8] = {
++    1, 2, 4, 8, 16, 32, 64, 128,
++};
++__constant uchar NATIVE_IQ2XS_SIGNS[128] = {
++    0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15,
++    144, 17, 18, 147, 20, 149, 150, 23, 24, 153, 154, 27, 156, 29, 30, 159,
++    160, 33, 34, 163, 36, 165, 166, 39, 40, 169, 170, 43, 172, 45, 46, 175,
++    48, 177, 178, 51, 180, 53, 54, 183, 184, 57, 58, 187, 60, 189, 190, 63,
++    192, 65, 66, 195, 68, 197, 198, 71, 72, 201, 202, 75, 204, 77, 78, 207,
++    80, 209, 210, 83, 212, 85, 86, 215, 216, 89, 90, 219, 92, 221, 222, 95,
++    96, 225, 226, 99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
++    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
++};
++__constant uchar NATIVE_IQ3XXS_GRID[1024] = {
++    4, 4, 4, 4, 20, 4, 4, 4, 36, 4, 4, 4, 12, 12, 4, 4,
++    28, 12, 4, 4, 62, 12, 4, 4, 4, 20, 4, 4, 20, 20, 4, 4,
++    12, 28, 4, 4, 20, 36, 4, 4, 28, 62, 4, 4, 44, 62, 4, 4,
++    12, 4, 12, 4, 28, 4, 12, 4, 4, 12, 12, 4, 20, 12, 12, 4,
++    12, 20, 12, 4, 44, 20, 12, 4, 4, 28, 12, 4, 20, 28, 12, 4,
++    12, 36, 12, 4, 36, 44, 12, 4, 4, 62, 12, 4, 4, 4, 20, 4,
++    20, 4, 20, 4, 36, 4, 20, 4, 12, 12, 20, 4, 4, 20, 20, 4,
++    20, 20, 20, 4, 12, 28, 20, 4, 28, 28, 20, 4, 62, 28, 20, 4,
++    12, 44, 20, 4, 62, 44, 20, 4, 44, 62, 20, 4, 12, 4, 28, 4,
++    62, 4, 28, 4, 4, 12, 28, 4, 20, 12, 28, 4, 44, 20, 28, 4,
++    4, 62, 28, 4, 28, 12, 36, 4, 62, 28, 36, 4, 36, 36, 36, 4,
++    62, 44, 36, 4, 28, 62, 36, 4, 44, 62, 36, 4, 12, 4, 44, 4,
++    62, 4, 44, 4, 20, 28, 44, 4, 20, 44, 44, 4, 44, 28, 52, 4,
++    36, 52, 52, 4, 4, 12, 62, 4, 36, 12, 62, 4, 52, 12, 62, 4,
++    28, 36, 62, 4, 12, 52, 62, 4, 12, 4, 4, 12, 28, 4, 4, 12,
++    4, 12, 4, 12, 20, 12, 4, 12, 12, 20, 4, 12, 28, 20, 4, 12,
++    4, 28, 4, 12, 20, 28, 4, 12, 36, 28, 4, 12, 62, 36, 4, 12,
++    4, 44, 4, 12, 4, 4, 12, 12, 20, 4, 12, 12, 12, 12, 12, 12,
++    4, 20, 12, 12, 20, 20, 12, 12, 12, 4, 20, 12, 28, 4, 20, 12,
++    4, 12, 20, 12, 20, 12, 20, 12, 12, 20, 20, 12, 4, 28, 20, 12,
++    20, 62, 20, 12, 4, 4, 28, 12, 20, 4, 28, 12, 4, 20, 28, 12,
++    12, 28, 28, 12, 52, 36, 28, 12, 52, 52, 28, 12, 12, 4, 36, 12,
++    44, 4, 36, 12, 4, 44, 36, 12, 4, 20, 44, 12, 36, 20, 44, 12,
++    52, 36, 44, 12, 12, 62, 44, 12, 44, 4, 52, 12, 20, 20, 62, 12,
++    4, 36, 62, 12, 4, 4, 4, 20, 20, 4, 4, 20, 12, 12, 4, 20,
++    28, 12, 4, 20, 4, 20, 4, 20, 20, 20, 4, 20, 52, 20, 4, 20,
++    12, 28, 4, 20, 20, 36, 4, 20, 12, 4, 12, 20, 28, 4, 12, 20,
++    44, 4, 12, 20, 4, 12, 12, 20, 20, 12, 12, 20, 12, 20, 12, 20,
++    4, 28, 12, 20, 28, 52, 12, 20, 62, 52, 12, 20, 4, 62, 12, 20,
++    4, 4, 20, 20, 20, 4, 20, 20, 12, 12, 20, 20, 62, 12, 20, 20,
++    4, 20, 20, 20, 20, 20, 20, 20, 62, 28, 20, 20, 4, 36, 20, 20,
++    44, 44, 20, 20, 12, 4, 28, 20, 4, 12, 28, 20, 36, 12, 28, 20,
++    4, 62, 28, 20, 36, 62, 28, 20, 44, 28, 36, 20, 28, 44, 36, 20,
++    28, 4, 44, 20, 62, 20, 44, 20, 12, 36, 44, 20, 36, 62, 44, 20,
++    12, 4, 62, 20, 28, 4, 62, 20, 52, 12, 62, 20, 44, 36, 62, 20,
++    12, 4, 4, 28, 4, 12, 4, 28, 20, 12, 4, 28, 12, 20, 4, 28,
++    28, 20, 4, 28, 4, 44, 4, 28, 44, 52, 4, 28, 20, 62, 4, 28,
++    4, 4, 12, 28, 20, 4, 12, 28, 4, 20, 12, 28, 12, 28, 12, 28,
++    36, 36, 12, 28, 52, 36, 12, 28, 12, 4, 20, 28, 28, 4, 20, 28,
++    4, 12, 20, 28, 44, 20, 20, 28, 20, 44, 20, 28, 20, 62, 20, 28,
++    12, 12, 28, 28, 28, 28, 28, 28, 4, 28, 36, 28, 62, 36, 36, 28,
++    20, 62, 36, 28, 4, 4, 44, 28, 52, 4, 44, 28, 20, 20, 44, 28,
++    44, 44, 44, 28, 36, 12, 52, 28, 52, 28, 52, 28, 28, 52, 52, 28,
++    28, 28, 62, 28, 4, 52, 62, 28, 36, 4, 4, 36, 62, 12, 4, 36,
++    44, 28, 4, 36, 62, 28, 4, 36, 28, 44, 4, 36, 62, 44, 4, 36,
++    36, 62, 12, 36, 4, 20, 20, 36, 62, 28, 20, 36, 4, 36, 20, 36,
++    4, 52, 20, 36, 52, 52, 20, 36, 62, 4, 28, 36, 44, 36, 28, 36,
++    36, 4, 36, 36, 12, 44, 36, 36, 36, 52, 36, 36, 44, 20, 44, 36,
++    28, 36, 44, 36, 4, 62, 44, 36, 44, 4, 62, 36, 4, 12, 62, 36,
++    20, 12, 62, 36, 4, 28, 62, 36, 20, 12, 4, 44, 12, 36, 4, 44,
++    4, 62, 4, 44, 4, 4, 12, 44, 52, 4, 12, 44, 52, 20, 12, 44,
++    44, 44, 12, 44, 36, 12, 20, 44, 20, 28, 20, 44, 20, 62, 20, 44,
++    20, 4, 28, 44, 28, 44, 28, 44, 4, 12, 36, 44, 28, 20, 36, 44,
++    62, 20, 36, 44, 20, 62, 36, 44, 20, 4, 44, 44, 12, 28, 44, 44,
++    4, 44, 52, 44, 36, 20, 62, 44, 20, 36, 62, 44, 36, 20, 4, 52,
++    36, 36, 4, 52, 52, 36, 4, 52, 36, 52, 4, 52, 12, 20, 12, 52,
++    12, 52, 12, 52, 62, 12, 20, 52, 36, 52, 20, 52, 4, 28, 28, 52,
++    52, 28, 28, 52, 36, 36, 36, 52, 44, 4, 44, 52, 20, 44, 44, 52,
++    28, 28, 52, 52, 28, 4, 62, 52, 12, 20, 62, 52, 28, 4, 4, 62,
++    44, 4, 4, 62, 62, 4, 4, 62, 4, 12, 4, 62, 20, 28, 4, 62,
++    20, 44, 4, 62, 52, 20, 12, 62, 4, 36, 12, 62, 20, 12, 20, 62,
++    44, 36, 20, 62, 20, 44, 20, 62, 4, 4, 28, 62, 44, 12, 28, 62,
++    28, 28, 28, 62, 4, 52, 28, 62, 12, 20, 36, 62, 12, 36, 36, 62,
++    4, 4, 44, 62, 20, 4, 44, 62, 36, 20, 44, 62, 4, 28, 52, 62,
++};
++
++inline float native_dot_iq4nl(const __global uchar* W,
++                              const __global half* S,
++                              int n, int N, int K,
++                              const __global half* x, int x_base,
++                              int id_local) {
++    float acc = 0.0f;
++    for (int g = 0; g < K / 32; g++) {
++        half s = S[g * N + n];  // scales are device-transposed to [groups, oc]
++        const __global uchar* codes = W + n * (K / 2) + g * 16;
++        for (int j = id_local; j < 32; j += SUBGROUP_SIZE) {
++            uchar byte = codes[j >> 1];
++            int code = (j & 1) ? (byte >> 4) : (byte & 0x0F);
++            acc += convert_float(x[x_base + g * 32 + j]) * convert_float(s)
++                   * convert_float(NATIVE_IQ4NL_TABLE[code]);
++        }
++    }
++    return sub_group_reduce_add(acc);
++}
++
++inline float native_dot_iq3xxs(const __global uchar* W,
++                               const __global uchar* Z,
++                               const __global half* S,
++                               int n, int N, int K,
++                               const __global half* x, int x_base,
++                               int id_local) {
++    float acc = 0.0f;
++    for (int g = 0; g < K / 32; g++) {
++        half s = S[g * N + n];
++        const __global uchar* gridix = W + n * (K / 4) + g * 8;
++        const __global uchar* signix = Z + n * (K / 8) + g * 4;
++        for (int j = id_local; j < 32; j += SUBGROUP_SIZE) {
++            int l = j >> 3;         // the 8-value sub-block
++            int m = j & 7;
++            uchar gi = (m < 4) ? gridix[2 * l] : gridix[2 * l + 1];
++            float mag = convert_float(NATIVE_IQ3XXS_GRID[gi * 4 + (m & 3)]);
++            uchar signs = NATIVE_IQ2XS_SIGNS[signix[l] & 127];
++            float sign = (signs & NATIVE_IQ2XS_MASK[m]) ? -1.0f : 1.0f;
++            acc += convert_float(x[x_base + g * 32 + j]) * convert_float(s) * mag * sign;
++        }
++    }
++    return sub_group_reduce_add(acc);
++}
++
++inline float native_dot_q8_0(const __global uchar* W,
++                             const __global half* S,
++                             int n, int N, int K,
++                             const __global half* x, int x_base,
++                             int id_local) {
++    float acc = 0.0f;
++    for (int g = 0; g < K / 32; g++) {
++        half s = S[g * N + n];
++        const __global char* codes = (const __global char*)(W + n * K + g * 32);
++        for (int j = id_local; j < 32; j += SUBGROUP_SIZE) {
++            acc += convert_float(x[x_base + g * 32 + j]) * convert_float(s)
++                   * convert_float(codes[j]);
++        }
++    }
++    return sub_group_reduce_add(acc);
++}
++#endif  // ARCINT_NATIVE_DECODE_DEFINED
++#endif  // NATIVE_GATE_UP_ENABLE || NATIVE_DOWN_ENABLE
++#endif  // ARCINT_PER_EXPERT_CL_HELPERS_DEFINED
++
++
+ #ifdef GATE_UP_ENABLE
+ // ===========================================================================
+ // Stage 1: gate + up for a single expert.
+@@ -505,3 +695,139 @@
+ #endif
+ }
+ #endif  // DOWN_ENABLE
++
++// ===========================================================================
++// arcint (patch 0045). Native per-expert kernels.
++//
++// Same dispatch geometry and argument list as expert_gate_up / expert_down
++// (patch 0040): one workgroup per (token, expert) pair, dim 2 tiles the output
++// rows by N_BLOCK, the subgroup's lanes share one output row's K reduction.
++// What differs is only the decode: no interleaved SLM x, no packed-u4 block
++// reads -- the weight bytes are decoded per element inside the K-loop and the
++// scale is read from the device-transposed [groups, oc] array.
++// ===========================================================================
++#ifdef NATIVE_GATE_UP_ENABLE
++__attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE)))
++KERNEL(expert_gate_up_native)(
++    const __global MOE_WEI_DT*   gate_weight,
++    const __global MOE_SCALE_DT* gate_scale,
++    const __global MOE_ZP_DT*    gate_zp,
++    const __global MOE_WEI_DT*   up_weight,
++    const __global MOE_SCALE_DT* up_scale,
++    const __global MOE_ZP_DT*    up_zp,
++    const __global MOE_DTYPE*    x,
++    __global MOE_DTYPE*          y,
++    int slot_index,
++    int x_base_elem,
++    int y_base_elem)
++{
++    const int id_local = get_sub_group_local_id();
++    const int token_idx = get_global_id(0);
++    const int n_start = get_global_id(2) * N_BLOCK;
++
++    // per-expert strides of the native slots (bytes; the slot fill writes one
++    // expert's tensor bytes at lru_expert_no * (tensor bytes / num_expert))
++#if NATIVE_GU_FORMAT == 2  // IQ3_XXS: u8 grid indices (K/4) + u8 sign indices (K/8)
++    gate_weight += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 4);
++    gate_zp     += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 8);
++    up_weight   += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 4);
++    up_zp       += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 8);
++#else                      // IQ4_NL: packed u4 codes (K/2)
++    gate_weight += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 2);
++    up_weight   += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 2);
++#endif
++    gate_scale += (long)slot_index * ((long)(HIDDEN_SIZE / GATE_UP_GROUP_SIZE) * INTERMEDIATE_SIZE);
++    up_scale   += (long)slot_index * ((long)(HIDDEN_SIZE / GATE_UP_GROUP_SIZE) * INTERMEDIATE_SIZE);
++
++    const int x_base = x_base_elem + token_idx * HIDDEN_SIZE;
++    __global MOE_DTYPE* yrow = y + y_base_elem + token_idx * INTERMEDIATE_SIZE;
++
++    const int n_end = min(n_start + N_BLOCK, INTERMEDIATE_SIZE);
++    for (int n = n_start; n < n_end; n++) {
++        float su, sg;
++#if NATIVE_GU_FORMAT == 2
++        su = native_dot_iq3xxs((const __global uchar*)up_weight,
++                               (const __global uchar*)up_zp,
++                               (const __global half*)up_scale,
++                               n, INTERMEDIATE_SIZE, HIDDEN_SIZE,
++                               (const __global half*)x, x_base, id_local);
++        sg = native_dot_iq3xxs((const __global uchar*)gate_weight,
++                               (const __global uchar*)gate_zp,
++                               (const __global half*)gate_scale,
++                               n, INTERMEDIATE_SIZE, HIDDEN_SIZE,
++                               (const __global half*)x, x_base, id_local);
++#else
++        su = native_dot_iq4nl((const __global uchar*)up_weight,
++                              (const __global half*)up_scale,
++                              n, INTERMEDIATE_SIZE, HIDDEN_SIZE,
++                              (const __global half*)x, x_base, id_local);
++        sg = native_dot_iq4nl((const __global uchar*)gate_weight,
++                              (const __global half*)gate_scale,
++                              n, INTERMEDIATE_SIZE, HIDDEN_SIZE,
++                              (const __global half*)x, x_base, id_local);
++#endif
++        if (id_local == 0) {
++            yrow[n] = (MOE_DTYPE)(su * MOE_GATE_ACT(sg));
++        }
++    }
++}
++#endif  // NATIVE_GATE_UP_ENABLE
++
++#ifdef NATIVE_DOWN_ENABLE
++__attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE)))
++KERNEL(expert_down_native)(
++    const __global MOE_WEI_DT*   weight,
++    const __global MOE_SCALE_DT* scales,
++    const __global MOE_ZP_DT*    zps,
++    const __global MOE_DTYPE*    x,
++    const __global half*         routing_weights,
++    __global MOE_DTYPE*          y,
++    int slot_index,
++    int x_base_elem,
++    int rw_base_elem,
++    int y_base_elem)
++{
++    const int id_local = get_sub_group_local_id();
++    const int token_idx = get_global_id(0);
++    const int n_start = get_global_id(2) * N_BLOCK;
++    const half routing_weight_val = routing_weights[rw_base_elem + token_idx];
++
++#if NATIVE_DOWN_FORMAT == 2   // IQ3_XXS: u8 grid indices (K/4) + u8 sign indices (K/8)
++    weight += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE / 4);
++    zps    += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE / 8);
++#elif NATIVE_DOWN_FORMAT == 3 // Q8_0: i8 codes (K)
++    weight += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE);
++#else                        // IQ4_NL: packed u4 codes (K/2)
++    weight += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE / 2);
++#endif
++    scales += (long)slot_index * ((long)(INTERMEDIATE_SIZE / DOWN_GROUP_SIZE) * HIDDEN_SIZE);
++
++    const int x_base = x_base_elem + token_idx * INTERMEDIATE_SIZE;
++    __global MOE_DTYPE* yrow = y + y_base_elem + token_idx * HIDDEN_SIZE;
++
++    const int n_end = min(n_start + N_BLOCK, HIDDEN_SIZE);
++    for (int n = n_start; n < n_end; n++) {
++        float acc;
++#if NATIVE_DOWN_FORMAT == 2
++        acc = native_dot_iq3xxs((const __global uchar*)weight,
++                                (const __global uchar*)zps,
++                                (const __global half*)scales,
++                                n, HIDDEN_SIZE, INTERMEDIATE_SIZE,
++                                (const __global half*)x, x_base, id_local);
++#elif NATIVE_DOWN_FORMAT == 3
++        acc = native_dot_q8_0((const __global uchar*)weight,
++                              (const __global half*)scales,
++                              n, HIDDEN_SIZE, INTERMEDIATE_SIZE,
++                              (const __global half*)x, x_base, id_local);
++#else
++        acc = native_dot_iq4nl((const __global uchar*)weight,
++                               (const __global half*)scales,
++                               n, HIDDEN_SIZE, INTERMEDIATE_SIZE,
++                               (const __global half*)x, x_base, id_local);
++#endif
++        if (id_local == 0) {
++            yrow[n] = (MOE_DTYPE)(acc * convert_float(routing_weight_val));
++        }
++    }
++}
++#endif  // NATIVE_DOWN_ENABLE
+
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -456,6 +456,19 @@
+                         ". Use a larger quantization group size.");
+     }
+ 
++    // arcint (patch 0045): the native per-expert kernels read the format to
++    // pick their decode (1 = IQ4_NL, 2 = IQ3_XXS, 3 = Q8_0; patch 0043's
++    // Config values). A native weight holds one 32-value block per group row
++    // (0043 sets group_size = 32), and the kernels' decode blocks are 32, so
++    // a different group_size would silently mis-stride the scale slot.
++    if (native_format) {
++        OPENVINO_ASSERT(desc->_config.group_size == 32,
++                        "native expert formats use 32-value blocks; got group_size=",
++                        desc->_config.group_size);
++        jit.make("NATIVE_GU_FORMAT", desc->_config.gate_up_weight_format);
++        jit.make("NATIVE_DOWN_FORMAT", desc->_config.down_weight_format);
++    }
++
+     jit.make("MAX_TOPK", desc->_config.top_k);
+     jit.make("EXPERT_NUM", desc->_config.num_expert);
+     jit.make("HIDDEN_SIZE", desc->_config.hidden_size);
+@@ -538,6 +551,67 @@
+     }
+ };
+ 
++// arcint (patch 0045). Native-format per-expert kernels: the same dispatch
++// geometry and argument list as MoEExpertGateUp/MoEExpertDown, but the
++// expert weights are the checkpoint's own blocks (IQ4_NL / IQ3_XXS / Q8_0),
++// decoded in the K-loop. The kernels are compiled only when per-expert
++// dispatch is on and the config carries a native weight format.
++class MoEExpertGateUpNative : public KernelGenerator {
++public:
++    MoEExpertGateUpNative()
++        : KernelGenerator("moe_expert_swiglu", "expert_gate_up_native") {}
++protected:
++    JitConstants get_jit_constants(const RuntimeParams& params) const override {
++        auto jit = KernelGenerator::get_jit_constants(params);
++        add_common_consts(params, jit);
++        jit.make("NATIVE_GATE_UP_ENABLE", 1);
++        auto desc = params.typed_desc<moe_3gemm_fused_compressed>();
++        // A gate/up projection is IQ3_XXS (2) or IQ4_XS-in-the-IQ4_NL-layout
++        // (1); Q8_0 is a down format in this checkpoint. Refuse a decode the
++        // kernel does not have rather than run the IQ4_NL path over Q8_0
++        // bytes (the "wrong dequant rejected" rule of 0045's test ladder).
++        OPENVINO_ASSERT(desc->_config.gate_up_weight_format == 1 ||
++                            desc->_config.gate_up_weight_format == 2,
++                        "native per-expert gate/up kernel supports IQ4_NL (1) and IQ3_XXS (2); got format ",
++                        desc->_config.gate_up_weight_format);
++        if (desc->_config.activation_type == ov::op::internal::MOE::Activation_type::GEGLU_TANH)
++            jit.make("GATE_ACT_GELU_TANH", 1);
++        else if (desc->_config.activation_type == ov::op::internal::MOE::Activation_type::GEGLU_ERF)
++            jit.make("GATE_ACT_GELU_ERF", 1);
++        return jit;
++    }
++    Arguments get_arguments_desc(const RuntimeParams&) const override { return {}; }
++    DispatchDataFunc get_dispatch_data_func() const override {
++        return DispatchDataFunc{[](const RuntimeParams&, KernelData&, ImplRuntimeParams*) {}};
++    }
++};
++
++class MoEExpertDownNative : public KernelGenerator {
++public:
++    MoEExpertDownNative()
++        : KernelGenerator("moe_expert_swiglu", "expert_down_native") {}
++protected:
++    JitConstants get_jit_constants(const RuntimeParams& params) const override {
++        auto jit = KernelGenerator::get_jit_constants(params);
++        add_common_consts(params, jit);
++        jit.make("NATIVE_DOWN_ENABLE", 1);
++        auto desc = params.typed_desc<moe_3gemm_fused_compressed>();
++        // Native down formats in this checkpoint: IQ4_NL (1; IQ4_XS shares the
++        // layout), IQ3_XXS (2), Q8_0 (3). The .cl's #else branch is IQ4_NL, so
++        // refuse anything else rather than silently decode it as IQ4_NL.
++        OPENVINO_ASSERT(desc->_config.down_weight_format == 1 ||
++                            desc->_config.down_weight_format == 2 ||
++                            desc->_config.down_weight_format == 3,
++                        "native per-expert down kernel supports IQ4_NL (1), IQ3_XXS (2) and Q8_0 (3); got format ",
++                        desc->_config.down_weight_format);
++        return jit;
++    }
++    Arguments get_arguments_desc(const RuntimeParams&) const override { return {}; }
++    DispatchDataFunc get_dispatch_data_func() const override {
++        return DispatchDataFunc{[](const RuntimeParams&, KernelData&, ImplRuntimeParams*) {}};
++    }
++};
++
+ class MoE3GemmSwigluMLPGateUp : public KernelGenerator {
+ public:
+     MoE3GemmSwigluMLPGateUp(bool disable_shared_experts = false)
+@@ -815,6 +889,9 @@
+     bool _per_expert_dispatch = false;
+     Stage::Ptr _expert_gate_up_stage = make_stage<MoEExpertGateUp>();
+     Stage::Ptr _expert_down_stage = make_stage<MoEExpertDown>();
++    // arcint (patch 0045): native-format counterparts.
++    Stage::Ptr _expert_gate_up_native_stage = make_stage<MoEExpertGateUpNative>();
++    Stage::Ptr _expert_down_native_stage = make_stage<MoEExpertDownNative>();
+     struct PerExpertGpuDispatch {
+         size_t slot_index;
+         int topk_position;
+@@ -1319,11 +1396,13 @@
+             for (size_t i = 0; i < lease->size(); i++)
+                 slots_u32[i] = static_cast<uint32_t>((*lease)[i]);
+         }
+-        if (_native_tier_only) {
++        if (_native_tier_only && !_per_expert_dispatch) {
+             // arcint (patch 0043): the fused GEMV kernels cannot read a native
+-            // format; every routed expert -- resident or not -- is a tier miss
+-            // and every slot a sentinel. The provider's lease (the static
+-            // partition's residents) stays as it is; nothing reads it.
++            // format; without per-expert dispatch every routed expert --
++            // resident or not -- is a tier miss and every slot a sentinel.
++            // arcint (patch 0045): with per-expert dispatch on, the resident
++            // experts keep their real slots and compute through the native
++            // per-expert kernel; only the misses go to the tier.
+             std::fill(slots_u32.begin(), slots_u32.end(), static_cast<uint32_t>(kCpuTierSentinelSlot));
+             _cpu_tier_misses.clear();
+             std::unordered_map<uint32_t, size_t> where;
+@@ -1854,13 +1933,21 @@
+                 static_cast<OffloadExpertWeightProvider*>(_weight_provider.get())->set_per_expert_dispatch(true);
+             }
+ 
+-            OPENVINO_ASSERT(!(_native_tier_only && _per_expert_dispatch),
+-                            "native expert formats and per-expert dispatch are not combined (patch 0043)");
++            // arcint (patch 0045): native formats now have an OpenCL decode,
++            // so the combination 0043 refused is the one that serves: resident
++            // experts compute on the card through the native per-expert kernel,
++            // and only the misses take the CPU tier.
+             if (_per_expert_dispatch) {
+-                OPENVINO_ASSERT(wdt == ov::element::u4,
+-                    "per-expert dispatch requires u4 weights; got ", wdt);
+-                add_stage(_expert_gate_up_stage, params);
+-                add_stage(_expert_down_stage, params);
++                OPENVINO_ASSERT(wdt == ov::element::u4 ||
++                                    (_native_tier_only && (wdt == ov::element::u8 || wdt == ov::element::i8)),
++                    "per-expert dispatch requires u4 weights or a native u8/i8 format; got ", wdt);
++                if (_native_tier_only) {
++                    add_stage(_expert_gate_up_native_stage, params);
++                    add_stage(_expert_down_native_stage, params);
++                } else {
++                    add_stage(_expert_gate_up_stage, params);
++                    add_stage(_expert_down_stage, params);
++                }
+             }
+ 
+             // Discharges §10 R1 on the first load of the window: the config
+@@ -2564,12 +2651,16 @@
+             if (_per_expert_dispatch && !_gpu_dispatches.empty()) {
+                 auto hs_mem = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
+                 const auto& w = instance._weights;
++                // arcint (patch 0045): native formats dispatch the native
++                // kernels; the affine ones keep 0040's stages.
++                Stage* gu_stage = _native_tier_only ? _expert_gate_up_native_stage.get() : _expert_gate_up_stage.get();
++                Stage* dn_stage = _native_tier_only ? _expert_down_native_stage.get() : _expert_down_stage.get();
+                 for (const auto& d : _gpu_dispatches) {
+                     const int x_base = static_cast<int>(d.flat_id / static_cast<int>(_experts_per_token)) * _hidden_size;
+                     const int y_gu_base = d.flat_id * _intermediate_size;
+                     execute_stage({ret_event},
+                                   instance,
+-                                  *_expert_gate_up_stage,
++                                  *gu_stage,
+                                   {w.gate_w, w.gate_s, w.gate_z,
+                                    w.up_w, w.up_s, w.up_z,
+                                    hs_mem},
+@@ -2584,7 +2675,7 @@
+                     const int y_dn_base = d.flat_id * _hidden_size;
+                     execute_stage({ret_event},
+                                   instance,
+-                                  *_expert_down_stage,
++                                  *dn_stage,
+                                   {w.down_w, w.down_s, w.down_z,
+                                    scratch.up, routing_mem_ptr},
+                                   {scratch.y},

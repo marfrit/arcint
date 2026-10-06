@@ -1,0 +1,496 @@
+# Native per-expert kernels for Flash-Next's formats, IQ3_XXS gate/up and
+# IQ4_NL down (IQ4_XS down shares the layout and the path): a lane decodes a whole 32-value block per step (the shape of
+# llama.cpp's vec_dot_iq3_xxs_q8_1), eight values at a time into f32 weights
+# that every token of a tile takes, against f16 activations with f32 sums (no
+# activation quantisation). The IQ3_XXS grid is an f32 table in constant
+# memory and its signs come from the 7-bit index and its parity; IQ4_NL
+# values are picked by two selects over the table held in registers. A
+# block's sum is one fma chain over its 32 values, its scale factored out
+# (acc = fma(scale, block sum, acc)). The summation order changes against
+# 0061's per-element decoders, so the bytes differ from theirs, inside the
+# CPU-oracle band; a token's bytes stay the same across the per-pair, batched
+# and grouped kinds. Gate/up runs 2 rows per subgroup (MOE_NATIVE_GU_ROWS=
+# 1|2|4); the down gives each row a group of 4 lanes. MOE_NATIVE_LEGACY_DECODE
+# =1 keeps 0061's decoders in the same build; the weight-rounding arm always
+# does. IQ2_S, IQ2_S-packed, IQ4_NL gate/up, Q8_0 and the IQ3_XXS down are
+# untouched. A770, one block at hidden 2560 / inter 640, 16 experts, top-10,
+# weights in device memory: T=1 gate/up 280.9 -> 79.0 us, down 74.3 -> 34.3
+# us per call; T=128 (grouped) gate/up 11655 -> 3797 us, down 2222 -> 1406 us.
+#
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
+@@ -1478,6 +1478,154 @@
+ }
+ #endif  // NATIVE_DOWN_TILE_N > 1
+ 
++// arcint (patch 0069): whole-block decoders for the IQ3_XXS gate/up and the
++// IQ4_NL down (the Flash-Next formats). The per-element decoders above give
++// each lane two values of a 32-block, each with its own byte load, table load
++// and activation load. Here a lane decodes a whole 32-value block from one
++// 8-byte grid-index load (IQ3_XXS) or one 16-byte code load (IQ4_NL), as
++// llama.cpp's vec_dot_iq3_xxs_q8_1 does, but the activations stay f16 -> f32
++// and the sums f32: no activation quantisation. A block is decoded eight
++// values at a time into f32 weights (the IQ3_XXS grid is held as f32, so a
++// lookup is one vector load and no byte unpacking), and every token of a tile
++// takes the same decoded weights. A block's sum is ONE fma chain over its 32
++// values in order (s = fma(x_k, w_k, s) from s = 0), and the block's scale is
++// factored out of it (acc = fma(scale, s, acc)), so the summation order
++// differs from the per-element decoders' (x * scale * magnitude * sign per
++// element, lane-strided): the bytes differ from theirs, inside the CPU-oracle
++// band. Every sum is written with explicit fma, so -cl-mad-enable has no
++// contraction left to choose per kernel variant; that a token's bytes do not
++// depend on the variant is measured by the cells of
++// tests/python/test_native_lowering_gpu.py (batched and grouped == per pair; a
++// token's bytes do not depend on its call). These helpers read no JIT
++// constant: they are compiled once per program whatever formats its sources
++// carry.
++//
++// The IQ3_XXS grid as f32: entry gi's four magnitudes, generated from
++// NATIVE_IQ3XXS_GRID above (itself llama.cpp's iq3xxs_grid as bytes).
++__constant float4 NATIVE_IQ3XXS_GRID_F4[256] = {
++    (float4)(4.0f, 4.0f, 4.0f, 4.0f), (float4)(20.0f, 4.0f, 4.0f, 4.0f), (float4)(36.0f, 4.0f, 4.0f, 4.0f), (float4)(12.0f, 12.0f, 4.0f, 4.0f),
++    (float4)(28.0f, 12.0f, 4.0f, 4.0f), (float4)(62.0f, 12.0f, 4.0f, 4.0f), (float4)(4.0f, 20.0f, 4.0f, 4.0f), (float4)(20.0f, 20.0f, 4.0f, 4.0f),
++    (float4)(12.0f, 28.0f, 4.0f, 4.0f), (float4)(20.0f, 36.0f, 4.0f, 4.0f), (float4)(28.0f, 62.0f, 4.0f, 4.0f), (float4)(44.0f, 62.0f, 4.0f, 4.0f),
++    (float4)(12.0f, 4.0f, 12.0f, 4.0f), (float4)(28.0f, 4.0f, 12.0f, 4.0f), (float4)(4.0f, 12.0f, 12.0f, 4.0f), (float4)(20.0f, 12.0f, 12.0f, 4.0f),
++    (float4)(12.0f, 20.0f, 12.0f, 4.0f), (float4)(44.0f, 20.0f, 12.0f, 4.0f), (float4)(4.0f, 28.0f, 12.0f, 4.0f), (float4)(20.0f, 28.0f, 12.0f, 4.0f),
++    (float4)(12.0f, 36.0f, 12.0f, 4.0f), (float4)(36.0f, 44.0f, 12.0f, 4.0f), (float4)(4.0f, 62.0f, 12.0f, 4.0f), (float4)(4.0f, 4.0f, 20.0f, 4.0f),
++    (float4)(20.0f, 4.0f, 20.0f, 4.0f), (float4)(36.0f, 4.0f, 20.0f, 4.0f), (float4)(12.0f, 12.0f, 20.0f, 4.0f), (float4)(4.0f, 20.0f, 20.0f, 4.0f),
++    (float4)(20.0f, 20.0f, 20.0f, 4.0f), (float4)(12.0f, 28.0f, 20.0f, 4.0f), (float4)(28.0f, 28.0f, 20.0f, 4.0f), (float4)(62.0f, 28.0f, 20.0f, 4.0f),
++    (float4)(12.0f, 44.0f, 20.0f, 4.0f), (float4)(62.0f, 44.0f, 20.0f, 4.0f), (float4)(44.0f, 62.0f, 20.0f, 4.0f), (float4)(12.0f, 4.0f, 28.0f, 4.0f),
++    (float4)(62.0f, 4.0f, 28.0f, 4.0f), (float4)(4.0f, 12.0f, 28.0f, 4.0f), (float4)(20.0f, 12.0f, 28.0f, 4.0f), (float4)(44.0f, 20.0f, 28.0f, 4.0f),
++    (float4)(4.0f, 62.0f, 28.0f, 4.0f), (float4)(28.0f, 12.0f, 36.0f, 4.0f), (float4)(62.0f, 28.0f, 36.0f, 4.0f), (float4)(36.0f, 36.0f, 36.0f, 4.0f),
++    (float4)(62.0f, 44.0f, 36.0f, 4.0f), (float4)(28.0f, 62.0f, 36.0f, 4.0f), (float4)(44.0f, 62.0f, 36.0f, 4.0f), (float4)(12.0f, 4.0f, 44.0f, 4.0f),
++    (float4)(62.0f, 4.0f, 44.0f, 4.0f), (float4)(20.0f, 28.0f, 44.0f, 4.0f), (float4)(20.0f, 44.0f, 44.0f, 4.0f), (float4)(44.0f, 28.0f, 52.0f, 4.0f),
++    (float4)(36.0f, 52.0f, 52.0f, 4.0f), (float4)(4.0f, 12.0f, 62.0f, 4.0f), (float4)(36.0f, 12.0f, 62.0f, 4.0f), (float4)(52.0f, 12.0f, 62.0f, 4.0f),
++    (float4)(28.0f, 36.0f, 62.0f, 4.0f), (float4)(12.0f, 52.0f, 62.0f, 4.0f), (float4)(12.0f, 4.0f, 4.0f, 12.0f), (float4)(28.0f, 4.0f, 4.0f, 12.0f),
++    (float4)(4.0f, 12.0f, 4.0f, 12.0f), (float4)(20.0f, 12.0f, 4.0f, 12.0f), (float4)(12.0f, 20.0f, 4.0f, 12.0f), (float4)(28.0f, 20.0f, 4.0f, 12.0f),
++    (float4)(4.0f, 28.0f, 4.0f, 12.0f), (float4)(20.0f, 28.0f, 4.0f, 12.0f), (float4)(36.0f, 28.0f, 4.0f, 12.0f), (float4)(62.0f, 36.0f, 4.0f, 12.0f),
++    (float4)(4.0f, 44.0f, 4.0f, 12.0f), (float4)(4.0f, 4.0f, 12.0f, 12.0f), (float4)(20.0f, 4.0f, 12.0f, 12.0f), (float4)(12.0f, 12.0f, 12.0f, 12.0f),
++    (float4)(4.0f, 20.0f, 12.0f, 12.0f), (float4)(20.0f, 20.0f, 12.0f, 12.0f), (float4)(12.0f, 4.0f, 20.0f, 12.0f), (float4)(28.0f, 4.0f, 20.0f, 12.0f),
++    (float4)(4.0f, 12.0f, 20.0f, 12.0f), (float4)(20.0f, 12.0f, 20.0f, 12.0f), (float4)(12.0f, 20.0f, 20.0f, 12.0f), (float4)(4.0f, 28.0f, 20.0f, 12.0f),
++    (float4)(20.0f, 62.0f, 20.0f, 12.0f), (float4)(4.0f, 4.0f, 28.0f, 12.0f), (float4)(20.0f, 4.0f, 28.0f, 12.0f), (float4)(4.0f, 20.0f, 28.0f, 12.0f),
++    (float4)(12.0f, 28.0f, 28.0f, 12.0f), (float4)(52.0f, 36.0f, 28.0f, 12.0f), (float4)(52.0f, 52.0f, 28.0f, 12.0f), (float4)(12.0f, 4.0f, 36.0f, 12.0f),
++    (float4)(44.0f, 4.0f, 36.0f, 12.0f), (float4)(4.0f, 44.0f, 36.0f, 12.0f), (float4)(4.0f, 20.0f, 44.0f, 12.0f), (float4)(36.0f, 20.0f, 44.0f, 12.0f),
++    (float4)(52.0f, 36.0f, 44.0f, 12.0f), (float4)(12.0f, 62.0f, 44.0f, 12.0f), (float4)(44.0f, 4.0f, 52.0f, 12.0f), (float4)(20.0f, 20.0f, 62.0f, 12.0f),
++    (float4)(4.0f, 36.0f, 62.0f, 12.0f), (float4)(4.0f, 4.0f, 4.0f, 20.0f), (float4)(20.0f, 4.0f, 4.0f, 20.0f), (float4)(12.0f, 12.0f, 4.0f, 20.0f),
++    (float4)(28.0f, 12.0f, 4.0f, 20.0f), (float4)(4.0f, 20.0f, 4.0f, 20.0f), (float4)(20.0f, 20.0f, 4.0f, 20.0f), (float4)(52.0f, 20.0f, 4.0f, 20.0f),
++    (float4)(12.0f, 28.0f, 4.0f, 20.0f), (float4)(20.0f, 36.0f, 4.0f, 20.0f), (float4)(12.0f, 4.0f, 12.0f, 20.0f), (float4)(28.0f, 4.0f, 12.0f, 20.0f),
++    (float4)(44.0f, 4.0f, 12.0f, 20.0f), (float4)(4.0f, 12.0f, 12.0f, 20.0f), (float4)(20.0f, 12.0f, 12.0f, 20.0f), (float4)(12.0f, 20.0f, 12.0f, 20.0f),
++    (float4)(4.0f, 28.0f, 12.0f, 20.0f), (float4)(28.0f, 52.0f, 12.0f, 20.0f), (float4)(62.0f, 52.0f, 12.0f, 20.0f), (float4)(4.0f, 62.0f, 12.0f, 20.0f),
++    (float4)(4.0f, 4.0f, 20.0f, 20.0f), (float4)(20.0f, 4.0f, 20.0f, 20.0f), (float4)(12.0f, 12.0f, 20.0f, 20.0f), (float4)(62.0f, 12.0f, 20.0f, 20.0f),
++    (float4)(4.0f, 20.0f, 20.0f, 20.0f), (float4)(20.0f, 20.0f, 20.0f, 20.0f), (float4)(62.0f, 28.0f, 20.0f, 20.0f), (float4)(4.0f, 36.0f, 20.0f, 20.0f),
++    (float4)(44.0f, 44.0f, 20.0f, 20.0f), (float4)(12.0f, 4.0f, 28.0f, 20.0f), (float4)(4.0f, 12.0f, 28.0f, 20.0f), (float4)(36.0f, 12.0f, 28.0f, 20.0f),
++    (float4)(4.0f, 62.0f, 28.0f, 20.0f), (float4)(36.0f, 62.0f, 28.0f, 20.0f), (float4)(44.0f, 28.0f, 36.0f, 20.0f), (float4)(28.0f, 44.0f, 36.0f, 20.0f),
++    (float4)(28.0f, 4.0f, 44.0f, 20.0f), (float4)(62.0f, 20.0f, 44.0f, 20.0f), (float4)(12.0f, 36.0f, 44.0f, 20.0f), (float4)(36.0f, 62.0f, 44.0f, 20.0f),
++    (float4)(12.0f, 4.0f, 62.0f, 20.0f), (float4)(28.0f, 4.0f, 62.0f, 20.0f), (float4)(52.0f, 12.0f, 62.0f, 20.0f), (float4)(44.0f, 36.0f, 62.0f, 20.0f),
++    (float4)(12.0f, 4.0f, 4.0f, 28.0f), (float4)(4.0f, 12.0f, 4.0f, 28.0f), (float4)(20.0f, 12.0f, 4.0f, 28.0f), (float4)(12.0f, 20.0f, 4.0f, 28.0f),
++    (float4)(28.0f, 20.0f, 4.0f, 28.0f), (float4)(4.0f, 44.0f, 4.0f, 28.0f), (float4)(44.0f, 52.0f, 4.0f, 28.0f), (float4)(20.0f, 62.0f, 4.0f, 28.0f),
++    (float4)(4.0f, 4.0f, 12.0f, 28.0f), (float4)(20.0f, 4.0f, 12.0f, 28.0f), (float4)(4.0f, 20.0f, 12.0f, 28.0f), (float4)(12.0f, 28.0f, 12.0f, 28.0f),
++    (float4)(36.0f, 36.0f, 12.0f, 28.0f), (float4)(52.0f, 36.0f, 12.0f, 28.0f), (float4)(12.0f, 4.0f, 20.0f, 28.0f), (float4)(28.0f, 4.0f, 20.0f, 28.0f),
++    (float4)(4.0f, 12.0f, 20.0f, 28.0f), (float4)(44.0f, 20.0f, 20.0f, 28.0f), (float4)(20.0f, 44.0f, 20.0f, 28.0f), (float4)(20.0f, 62.0f, 20.0f, 28.0f),
++    (float4)(12.0f, 12.0f, 28.0f, 28.0f), (float4)(28.0f, 28.0f, 28.0f, 28.0f), (float4)(4.0f, 28.0f, 36.0f, 28.0f), (float4)(62.0f, 36.0f, 36.0f, 28.0f),
++    (float4)(20.0f, 62.0f, 36.0f, 28.0f), (float4)(4.0f, 4.0f, 44.0f, 28.0f), (float4)(52.0f, 4.0f, 44.0f, 28.0f), (float4)(20.0f, 20.0f, 44.0f, 28.0f),
++    (float4)(44.0f, 44.0f, 44.0f, 28.0f), (float4)(36.0f, 12.0f, 52.0f, 28.0f), (float4)(52.0f, 28.0f, 52.0f, 28.0f), (float4)(28.0f, 52.0f, 52.0f, 28.0f),
++    (float4)(28.0f, 28.0f, 62.0f, 28.0f), (float4)(4.0f, 52.0f, 62.0f, 28.0f), (float4)(36.0f, 4.0f, 4.0f, 36.0f), (float4)(62.0f, 12.0f, 4.0f, 36.0f),
++    (float4)(44.0f, 28.0f, 4.0f, 36.0f), (float4)(62.0f, 28.0f, 4.0f, 36.0f), (float4)(28.0f, 44.0f, 4.0f, 36.0f), (float4)(62.0f, 44.0f, 4.0f, 36.0f),
++    (float4)(36.0f, 62.0f, 12.0f, 36.0f), (float4)(4.0f, 20.0f, 20.0f, 36.0f), (float4)(62.0f, 28.0f, 20.0f, 36.0f), (float4)(4.0f, 36.0f, 20.0f, 36.0f),
++    (float4)(4.0f, 52.0f, 20.0f, 36.0f), (float4)(52.0f, 52.0f, 20.0f, 36.0f), (float4)(62.0f, 4.0f, 28.0f, 36.0f), (float4)(44.0f, 36.0f, 28.0f, 36.0f),
++    (float4)(36.0f, 4.0f, 36.0f, 36.0f), (float4)(12.0f, 44.0f, 36.0f, 36.0f), (float4)(36.0f, 52.0f, 36.0f, 36.0f), (float4)(44.0f, 20.0f, 44.0f, 36.0f),
++    (float4)(28.0f, 36.0f, 44.0f, 36.0f), (float4)(4.0f, 62.0f, 44.0f, 36.0f), (float4)(44.0f, 4.0f, 62.0f, 36.0f), (float4)(4.0f, 12.0f, 62.0f, 36.0f),
++    (float4)(20.0f, 12.0f, 62.0f, 36.0f), (float4)(4.0f, 28.0f, 62.0f, 36.0f), (float4)(20.0f, 12.0f, 4.0f, 44.0f), (float4)(12.0f, 36.0f, 4.0f, 44.0f),
++    (float4)(4.0f, 62.0f, 4.0f, 44.0f), (float4)(4.0f, 4.0f, 12.0f, 44.0f), (float4)(52.0f, 4.0f, 12.0f, 44.0f), (float4)(52.0f, 20.0f, 12.0f, 44.0f),
++    (float4)(44.0f, 44.0f, 12.0f, 44.0f), (float4)(36.0f, 12.0f, 20.0f, 44.0f), (float4)(20.0f, 28.0f, 20.0f, 44.0f), (float4)(20.0f, 62.0f, 20.0f, 44.0f),
++    (float4)(20.0f, 4.0f, 28.0f, 44.0f), (float4)(28.0f, 44.0f, 28.0f, 44.0f), (float4)(4.0f, 12.0f, 36.0f, 44.0f), (float4)(28.0f, 20.0f, 36.0f, 44.0f),
++    (float4)(62.0f, 20.0f, 36.0f, 44.0f), (float4)(20.0f, 62.0f, 36.0f, 44.0f), (float4)(20.0f, 4.0f, 44.0f, 44.0f), (float4)(12.0f, 28.0f, 44.0f, 44.0f),
++    (float4)(4.0f, 44.0f, 52.0f, 44.0f), (float4)(36.0f, 20.0f, 62.0f, 44.0f), (float4)(20.0f, 36.0f, 62.0f, 44.0f), (float4)(36.0f, 20.0f, 4.0f, 52.0f),
++    (float4)(36.0f, 36.0f, 4.0f, 52.0f), (float4)(52.0f, 36.0f, 4.0f, 52.0f), (float4)(36.0f, 52.0f, 4.0f, 52.0f), (float4)(12.0f, 20.0f, 12.0f, 52.0f),
++    (float4)(12.0f, 52.0f, 12.0f, 52.0f), (float4)(62.0f, 12.0f, 20.0f, 52.0f), (float4)(36.0f, 52.0f, 20.0f, 52.0f), (float4)(4.0f, 28.0f, 28.0f, 52.0f),
++    (float4)(52.0f, 28.0f, 28.0f, 52.0f), (float4)(36.0f, 36.0f, 36.0f, 52.0f), (float4)(44.0f, 4.0f, 44.0f, 52.0f), (float4)(20.0f, 44.0f, 44.0f, 52.0f),
++    (float4)(28.0f, 28.0f, 52.0f, 52.0f), (float4)(28.0f, 4.0f, 62.0f, 52.0f), (float4)(12.0f, 20.0f, 62.0f, 52.0f), (float4)(28.0f, 4.0f, 4.0f, 62.0f),
++    (float4)(44.0f, 4.0f, 4.0f, 62.0f), (float4)(62.0f, 4.0f, 4.0f, 62.0f), (float4)(4.0f, 12.0f, 4.0f, 62.0f), (float4)(20.0f, 28.0f, 4.0f, 62.0f),
++    (float4)(20.0f, 44.0f, 4.0f, 62.0f), (float4)(52.0f, 20.0f, 12.0f, 62.0f), (float4)(4.0f, 36.0f, 12.0f, 62.0f), (float4)(20.0f, 12.0f, 20.0f, 62.0f),
++    (float4)(44.0f, 36.0f, 20.0f, 62.0f), (float4)(20.0f, 44.0f, 20.0f, 62.0f), (float4)(4.0f, 4.0f, 28.0f, 62.0f), (float4)(44.0f, 12.0f, 28.0f, 62.0f),
++    (float4)(28.0f, 28.0f, 28.0f, 62.0f), (float4)(4.0f, 52.0f, 28.0f, 62.0f), (float4)(12.0f, 20.0f, 36.0f, 62.0f), (float4)(12.0f, 36.0f, 36.0f, 62.0f),
++    (float4)(4.0f, 4.0f, 44.0f, 62.0f), (float4)(20.0f, 4.0f, 44.0f, 62.0f), (float4)(36.0f, 20.0f, 44.0f, 62.0f), (float4)(4.0f, 28.0f, 52.0f, 62.0f),
++};
++
++// Activations l*8 .. l*8+7 of a 32-value block (f16, 64-byte aligned) as f32:
++// one 16-byte load.
++inline float8 native_x8(const __global half* xp, int l) {
++    return convert_float8(as_half8(vload4(l, (const __global uint*)xp)));
++}
++
++// s continued over eight products, in order, each rounded once by its fma.
++inline float native_dot8(float s, float8 x, float8 w) {
++    s = fma(x.s0, w.s0, s);
++    s = fma(x.s1, w.s1, s);
++    s = fma(x.s2, w.s2, s);
++    s = fma(x.s3, w.s3, s);
++    s = fma(x.s4, w.s4, s);
++    s = fma(x.s5, w.s5, s);
++    s = fma(x.s6, w.s6, s);
++    s = fma(x.s7, w.s7, s);
++    return s;
++}
++
++// IQ3_XXS values l*8 .. l*8+7 of a block as signed f32 weights (without the
++// block scale): gq = the block's eight grid indices (bytes 2l, 2l+1 for
++// sub-block l), sg = its four sign indices (byte l for sub-block l, bit 7
++// ignored as in the per-element decoder). The sign byte is the 7-bit index
++// with its parity in bit 7 (NATIVE_IQ2XS_SIGNS[s7], computed); a sign sets the
++// magnitude's sign bit. The magnitudes are small integers, exact in f32, so a
++// product x * w is x * sign * magnitude exactly.
++inline float8 native_iq3xxs_w8(uint2 gq, uint sg, int l) {
++    const uint g2 = (l < 2 ? gq.x : gq.y) >> ((l & 1) * 16);
++    const float4 m0 = NATIVE_IQ3XXS_GRID_F4[g2 & 0xffu];
++    const float4 m1 = NATIVE_IQ3XXS_GRID_F4[(g2 >> 8) & 0xffu];
++    const uint s7 = (sg >> (8 * l)) & 127u;
++    const uint sb = s7 | ((popcount(s7) & 1u) << 7);
++    const uint8 neg = ((uint8)(sb) << (uint8)(31u, 30u, 29u, 28u, 27u, 26u, 25u, 24u)) & (uint8)(0x80000000u);
++    return as_float8(as_uint8((float8)(m0, m1)) | neg);
++}
++
++// One IQ4_NL value from its 4-bit code: NATIVE_IQ4NL_TABLE as four
++// little-endian words held in registers (byte c of the 16 is value c), picked
++// by two selects and a byte shift -- no memory access. (Measured on the A770
++// against a subgroup-shuffle lookup and a 256-entry f32 byte-pair table in
++// constant memory: this is the fastest of the three.)
++inline float native_iq4nl_val(uint c) {
++    const uint lo = (c & 4u) ? 0xf6eaddcfu : 0xbfad9881u;  // values 4..7 : 0..3
++    const uint hi = (c & 4u) ? 0x71594535u : 0x26190d01u;  // values 12..15 : 8..11
++    return convert_float((char)(((c & 8u) ? hi : lo) >> ((c & 3u) * 8u)));
++}
++
++// Eight IQ4_NL values as f32 weights (without the block scale): w = four code
++// bytes, value 2b in the low nibble of byte b and 2b+1 in the high one (the u4
++// packing everywhere here), so nibble i is value i.
++inline float8 native_iq4nl_w8(uint w) {
++    return (float8)(native_iq4nl_val(w & 15u), native_iq4nl_val((w >> 4) & 15u),
++                    native_iq4nl_val((w >> 8) & 15u), native_iq4nl_val((w >> 12) & 15u),
++                    native_iq4nl_val((w >> 16) & 15u), native_iq4nl_val((w >> 20) & 15u),
++                    native_iq4nl_val((w >> 24) & 15u), native_iq4nl_val(w >> 28));
++}
++
+ // arcint (patch 0064): the IQ2_S grid as f16 pairs (entry gi's eight values as
+ // four half2), for the matrix-unit gate/up kernel's B operand. Generated from
+ // NATIVE_IQ2S_GRID above; its values (8, 25, 43) are exact in f16.
+@@ -2232,6 +2380,136 @@
+                     if (r < nr && t < cnt) y[yb[t] + n + r] = (MOE_DTYPE)(su[r][t] * MOE_GATE_ACT(sg[r][t]));
+         }
+     }
++#elif NATIVE_GU_FORMAT == 2 && NATIVE_BLOCK_DECODE && NATIVE_W_ROUND == 0
++    // arcint (patch 0069): IQ3_XXS gate and up by whole blocks, lane i taking
++    // blocks i, i + SUBGROUP_SIZE, ... of a row, over NATIVE_GU_ROWS rows per
++    // subgroup (the host sizes the grid by it). Per lane, a row's gate (and
++    // up) sum is acc = fma(scale_g, block_g, acc) over its blocks in
++    // increasing g, block_g the fma chain over the block's 32 values; then the
++    // subgroup sum -- in both loop orders below, so a token's bytes are the
++    // same whichever kernel kind runs it.
++    const int r_start = sub_group_broadcast((int)get_global_id(2), 0) * NATIVE_GU_ROWS;
++    const int r_end = min(r_start + NATIVE_GU_ROWS, INTERMEDIATE_SIZE);
++    const int ng = HIDDEN_SIZE / 32;
++    const __global uchar* uw = (const __global uchar*)up_weight;    // grid indices [INTER, HIDDEN / 4]
++    const __global uchar* uz = (const __global uchar*)up_zp;        // sign indices [INTER, HIDDEN / 8]
++    const __global half*  us = (const __global half*)up_scale;      // f16 [HIDDEN / 32, INTER]
++    const __global uchar* gw = (const __global uchar*)gate_weight;
++    const __global uchar* gz = (const __global uchar*)gate_zp;
++    const __global half*  gs = (const __global half*)gate_scale;
++    const __global half*  xh = (const __global half*)x;
++#if NATIVE_DISPATCH_KIND == 2
++    // grouped (a tile of up to NATIVE_TILE_M tokens of one expert): one row at a
++    // time; each eight weights are decoded once and taken by every token
++    for (int n = r_start; n < r_end; n++) {
++        float au[NATIVE_TILE_M], ag[NATIVE_TILE_M];
++        __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) {
++            au[t] = 0.0f;
++            ag[t] = 0.0f;
++        }
++        for (int g = id_local; g < ng; g += SUBGROUP_SIZE) {
++            const uint2 gqu = vload2(0, (const __global uint*)(uw + (long)n * (HIDDEN_SIZE / 4) + g * 8));
++            const uint2 gqg = vload2(0, (const __global uint*)(gw + (long)n * (HIDDEN_SIZE / 4) + g * 8));
++            const uint squ = *(const __global uint*)(uz + (long)n * (HIDDEN_SIZE / 8) + g * 4);
++            const uint sqg = *(const __global uint*)(gz + (long)n * (HIDDEN_SIZE / 8) + g * 4);
++            float bu[NATIVE_TILE_M], bg[NATIVE_TILE_M];
++            __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) {
++                bu[t] = 0.0f;
++                bg[t] = 0.0f;
++            }
++            __attribute__((opencl_unroll_hint)) for (int l = 0; l < 4; l++) {
++                const float8 wu = native_iq3xxs_w8(gqu, squ, l);
++                const float8 wg = native_iq3xxs_w8(gqg, sqg, l);
++                __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) {
++                    if (t < cnt) {
++                        const float8 xv = native_x8(xh + xb[t] + g * 32, l);
++                        bu[t] = native_dot8(bu[t], xv, wu);
++                        bg[t] = native_dot8(bg[t], xv, wg);
++                    }
++                }
++            }
++            const float fsu = convert_float(us[g * INTERMEDIATE_SIZE + n]);
++            const float fsg = convert_float(gs[g * INTERMEDIATE_SIZE + n]);
++            __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) {
++                au[t] = fma(fsu, bu[t], au[t]);
++                ag[t] = fma(fsg, bg[t], ag[t]);
++            }
++        }
++        __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) {
++            if (t < cnt) {
++                const float su = sub_group_reduce_add(au[t]);
++                const float sg = sub_group_reduce_add(ag[t]);
++                if (id_local == 0) y[yb[t] + n] = (MOE_DTYPE)(su * MOE_GATE_ACT(sg));
++            }
++        }
++    }
++#else
++    // one token (per-pair and batched kinds; cnt == 1): each eight of its
++    // activations are loaded once and feed the gate and up weights of all
++    // NATIVE_GU_ROWS rows
++    float au[NATIVE_GU_ROWS], ag[NATIVE_GU_ROWS];
++    __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_GU_ROWS; r++) {
++        au[r] = 0.0f;
++        ag[r] = 0.0f;
++    }
++    for (int g = id_local; g < ng; g += SUBGROUP_SIZE) {
++        uint2 gqu[NATIVE_GU_ROWS], gqg[NATIVE_GU_ROWS];
++        uint squ[NATIVE_GU_ROWS], sqg[NATIVE_GU_ROWS];
++        float bu[NATIVE_GU_ROWS], bg[NATIVE_GU_ROWS];
++        __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_GU_ROWS; r++) {
++            const int n = min(r_start + r, INTERMEDIATE_SIZE - 1);  // rows past the end are dropped below
++            gqu[r] = vload2(0, (const __global uint*)(uw + (long)n * (HIDDEN_SIZE / 4) + g * 8));
++            gqg[r] = vload2(0, (const __global uint*)(gw + (long)n * (HIDDEN_SIZE / 4) + g * 8));
++            squ[r] = *(const __global uint*)(uz + (long)n * (HIDDEN_SIZE / 8) + g * 4);
++            sqg[r] = *(const __global uint*)(gz + (long)n * (HIDDEN_SIZE / 8) + g * 4);
++            bu[r] = 0.0f;
++            bg[r] = 0.0f;
++        }
++        __attribute__((opencl_unroll_hint)) for (int l = 0; l < 4; l++) {
++            const float8 xv = native_x8(xh + xb[0] + g * 32, l);
++            __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_GU_ROWS; r++) {
++                bu[r] = native_dot8(bu[r], xv, native_iq3xxs_w8(gqu[r], squ[r], l));
++                bg[r] = native_dot8(bg[r], xv, native_iq3xxs_w8(gqg[r], sqg[r], l));
++            }
++        }
++        // the block's scales of all the subgroup's rows, adjacent in the
++        // [HIDDEN / 32, INTER] scale array: one load per projection, not one
++        // per row (a lane's g differs from its neighbours', so each of these
++        // loads touches a cache line per lane)
++        float fsu[NATIVE_GU_ROWS], fsg[NATIVE_GU_ROWS];
++#if NATIVE_GU_ROWS == 4 && INTERMEDIATE_SIZE % 4 == 0
++        {
++            const float4 u4 = convert_float4(as_half4(vload2(0, (const __global uint*)(us + g * INTERMEDIATE_SIZE + r_start))));
++            const float4 g4 = convert_float4(as_half4(vload2(0, (const __global uint*)(gs + g * INTERMEDIATE_SIZE + r_start))));
++            fsu[0] = u4.s0; fsu[1] = u4.s1; fsu[2] = u4.s2; fsu[3] = u4.s3;
++            fsg[0] = g4.s0; fsg[1] = g4.s1; fsg[2] = g4.s2; fsg[3] = g4.s3;
++        }
++#elif NATIVE_GU_ROWS == 2 && INTERMEDIATE_SIZE % 2 == 0
++        {
++            const float2 u2 = convert_float2(as_half2(*(const __global uint*)(us + g * INTERMEDIATE_SIZE + r_start)));
++            const float2 g2 = convert_float2(as_half2(*(const __global uint*)(gs + g * INTERMEDIATE_SIZE + r_start)));
++            fsu[0] = u2.s0; fsu[1] = u2.s1;
++            fsg[0] = g2.s0; fsg[1] = g2.s1;
++        }
++#else
++        __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_GU_ROWS; r++) {
++            fsu[r] = convert_float(us[g * INTERMEDIATE_SIZE + min(r_start + r, INTERMEDIATE_SIZE - 1)]);
++            fsg[r] = convert_float(gs[g * INTERMEDIATE_SIZE + min(r_start + r, INTERMEDIATE_SIZE - 1)]);
++        }
++#endif
++        __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_GU_ROWS; r++) {
++            au[r] = fma(fsu[r], bu[r], au[r]);
++            ag[r] = fma(fsg[r], bg[r], ag[r]);
++        }
++    }
++    __attribute__((opencl_unroll_hint)) for (int r = 0; r < NATIVE_GU_ROWS; r++) {
++        if (r_start + r < r_end) {
++            const float su = sub_group_reduce_add(au[r]);
++            const float sg = sub_group_reduce_add(ag[r]);
++            if (id_local == 0) y[yb[0] + r_start + r] = (MOE_DTYPE)(su * MOE_GATE_ACT(sg));
++        }
++    }
++#endif  // NATIVE_DISPATCH_KIND == 2
+ #else
+     for (int n = n_start; n < n_end; n++) {
+         float su[NATIVE_TILE_M], sg[NATIVE_TILE_M];
+@@ -2253,7 +2531,7 @@
+                 if (t < cnt) y[yb[t] + n] = (MOE_DTYPE)(su[t] * MOE_GATE_ACT(sg[t]));
+         }
+     }
+-#endif  // NATIVE_GU_FORMAT == 5 && NATIVE_GU_TILE_N > 1
++#endif  // NATIVE_GU_FORMAT == 5 && NATIVE_GU_TILE_N > 1 / 2 && NATIVE_BLOCK_DECODE / else
+ }
+ 
+ // KERNEL() names the generator's own entry point, so a source carries exactly
+@@ -2553,7 +2831,57 @@
+ 
+ 
+     const int n_end = min(n_start + N_BLOCK, HIDDEN_SIZE);
+-#if (NATIVE_DOWN_FORMAT == 2 || NATIVE_DOWN_FORMAT == 1) && NATIVE_DOWN_TILE_N > 1
++#if NATIVE_DOWN_FORMAT == 1 && NATIVE_BLOCK_DECODE && NATIVE_W_ROUND == 0
++    // arcint (patch 0069): IQ4_NL down by whole blocks. The subgroup's lanes
++    // split into N_BLOCK groups of SUBGROUP_SIZE / N_BLOCK, one output row per
++    // group; lane q of a group takes blocks q, q + SUBGROUP_SIZE / N_BLOCK, ...
++    // of its row (at K = 640, 20 blocks: five per lane on SIMD16), acc =
++    // fma(scale_g, block_g, acc) in increasing g, block_g the fma chain over
++    // the block's 32 values, each eight weights decoded once for every token
++    // of a tile; the group's lanes are summed by an xor butterfly after the
++    // loop. Every lane runs the same trip count; a lane past its row's last
++    // block reads that block again and drops it. NATIVE_DOWN_TILE_N does not
++    // apply: the rows are the lane groups.
++#if SUBGROUP_SIZE % N_BLOCK != 0
++#error "patch 0069: the IQ4_NL block decode needs N_BLOCK to divide SUBGROUP_SIZE"
++#endif
++    {
++        const int lpr = SUBGROUP_SIZE / N_BLOCK;  // lanes per row, a power of two
++        const int q = id_local % lpr;
++        const int n_row = n_start + id_local / lpr;
++        const int n = min(n_row, HIDDEN_SIZE - 1);  // a row past the end is computed on the last and dropped
++        const int ng = INTERMEDIATE_SIZE / 32;
++        const int trips = (ng + lpr - 1) / lpr;
++        const __global uchar* wr = (const __global uchar*)weight + (long)n * (INTERMEDIATE_SIZE / 2);  // codes [HIDDEN, INTER / 2]
++        const __global half*  sc = (const __global half*)scales;  // f16 [INTER / 32, HIDDEN]
++        const __global half*  xh = (const __global half*)x;
++        float acc[NATIVE_TILE_M];
++        __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) acc[t] = 0.0f;
++        for (int it = 0; it < trips; it++) {
++            const int g_want = q + it * lpr;
++            const int g = min(g_want, ng - 1);
++            const uint4 cw = vload4(0, (const __global uint*)(wr + g * 16));
++            float b[NATIVE_TILE_M];
++            __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) b[t] = 0.0f;
++            __attribute__((opencl_unroll_hint)) for (int l = 0; l < 4; l++) {
++                const float8 wv = native_iq4nl_w8(l == 0 ? cw.x : l == 1 ? cw.y : l == 2 ? cw.z : cw.w);
++                __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
++                    if (t < cnt) b[t] = native_dot8(b[t], native_x8(xh + xb[t] + g * 32, l), wv);
++            }
++            const float fs = convert_float(sc[g * HIDDEN_SIZE + n]);
++            if (g_want < ng) {
++                __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) acc[t] = fma(fs, b[t], acc[t]);
++            }
++        }
++        __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) {
++            if (t < cnt) {
++                float v = acc[t];
++                for (int o = 1; o < lpr; o <<= 1) v += intel_sub_group_shuffle_xor(v, (uint)o);
++                if (q == 0 && n_row < n_end) y[yb[t] + n] = (MOE_DTYPE)(v * convert_float(routing_weights[rwb[t]]));
++            }
++        }
++    }
++#elif (NATIVE_DOWN_FORMAT == 2 || NATIVE_DOWN_FORMAT == 1) && NATIVE_DOWN_TILE_N > 1
+     // arcint (patch 0061): NATIVE_DOWN_TILE_N rows per pass (IQ3_XXS, IQ4_NL).
+     for (int n = n_start; n < n_end; n += NATIVE_DOWN_TILE_N) {
+         const int nr = min(NATIVE_DOWN_TILE_N, n_end - n);
+@@ -2588,7 +2916,7 @@
+                 if (t < cnt) y[yb[t] + n] = (MOE_DTYPE)(acc[t] * convert_float(routing_weights[rwb[t]]));
+         }
+     }
+-#endif  // (NATIVE_DOWN_FORMAT == 2 || NATIVE_DOWN_FORMAT == 1) && NATIVE_DOWN_TILE_N > 1
++#endif  // NATIVE_DOWN_FORMAT == 1 && NATIVE_BLOCK_DECODE / row-blocked / row at a time
+ }
+ 
+ #if !defined(NATIVE_DISPATCH_KIND) || NATIVE_DISPATCH_KIND == 0
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -642,6 +642,43 @@
+     }();
+     return r;
+ }
++// arcint (patch 0069): the IQ3_XXS gate/up and IQ4_NL down kernels decode whole
++// 32-value blocks per lane (moe_expert_swiglu.cl NATIVE_BLOCK_DECODE). Set
++// MOE_NATIVE_LEGACY_DECODE to anything but 0 for the 0061 per-element decoders
++// in the same build (the A/B; read once per process). The weight-rounding arm
++// (MOE_NATIVE_W_ROUND) always takes the per-element decoders. Every native
++// generator emits it: the bodies are per source, but the value must be one per
++// program.
++static int native_block_decode() {
++    static const int on = [] {
++        const char* v = std::getenv("MOE_NATIVE_LEGACY_DECODE");
++        return (v != nullptr && std::string(v) != "0") ? 0 : 1;
++    }();
++    return on;
++}
++// arcint (patch 0069): output rows per subgroup of the IQ3_XXS block-decode
++// gate/up (moe_expert_swiglu.cl NATIVE_GU_ROWS; the per-element kernels keep
++// N_BLOCK). The default is the faster of 2 and 4 on the A770 at Flash-Next's
++// geometry (the rows measured per call in the patch README's 0069 entry). The
++// rows do not change a token's arithmetic (the Flash-Next-geometry cell of
++// tests/python/test_native_lowering_gpu.py compares 2 with 4 by bytes).
++// MOE_NATIVE_GU_ROWS=1|2|4 sets it, read once per process.
++constexpr int kNativeGuRowsIq3 = 2;
++static int native_gu_rows_iq3() {
++    static const int n = [] {
++        const char* v = std::getenv("MOE_NATIVE_GU_ROWS");
++        if (v == nullptr) return kNativeGuRowsIq3;
++        const std::string s(v);
++        OPENVINO_ASSERT(s == "1" || s == "2" || s == "4", "MOE_NATIVE_GU_ROWS must be 1, 2 or 4; got ", s);
++        return std::stoi(s);
++    }();
++    return n;
++}
++// The rows per subgroup a native gate/up kernel of this format runs: the grid's
++// third dimension is INTERMEDIATE_SIZE over it.
++static int native_gu_rows(size_t gate_up_format) {
++    return (gate_up_format == 2 && native_block_decode() != 0 && native_w_round() == 0) ? native_gu_rows_iq3() : N_BLOCK;
++}
+ constexpr int kNativeTileNDown = 4;
+ static int native_tile_n(int dflt) {
+     static const int n = [] {
+@@ -665,6 +702,7 @@
+         auto jit = KernelGenerator::get_jit_constants(params);
+         add_common_consts(params, jit);
+         jit.make("NATIVE_GATE_UP_ENABLE", 1);
++        jit.make("NATIVE_GU_ROWS", native_gu_rows(params.typed_desc<moe_3gemm_fused_compressed>()->_config.gate_up_weight_format));
+         jit.make("NATIVE_DISPATCH_KIND", _kind);
+         jit.make("NATIVE_DPAS_TM", kNativeDpasTm);
+         jit.make("NATIVE_DPAS_NSG", kNativeDpasNsg);
+@@ -672,6 +710,7 @@
+         jit.make("NATIVE_GU_TILE_N", native_tile_n(kNativeTileNGateUp));
+         jit.make("NATIVE_DOWN_TILE_N", native_tile_n(kNativeTileNDown));
+         jit.make("NATIVE_W_ROUND", native_w_round());
++        jit.make("NATIVE_BLOCK_DECODE", native_block_decode());
+         auto desc = params.typed_desc<moe_3gemm_fused_compressed>();
+         // A gate/up projection is IQ3_XXS (2) or IQ4_XS-in-the-IQ4_NL-layout
+         // (1); Q8_0 is a down format in this checkpoint. Refuse a decode the
+@@ -711,6 +750,7 @@
+         jit.make("NATIVE_GU_TILE_N", native_tile_n(kNativeTileNGateUp));
+         jit.make("NATIVE_DOWN_TILE_N", native_tile_n(kNativeTileNDown));
+         jit.make("NATIVE_W_ROUND", native_w_round());
++        jit.make("NATIVE_BLOCK_DECODE", native_block_decode());
+         auto desc = params.typed_desc<moe_3gemm_fused_compressed>();
+         // Native down formats in this checkpoint: IQ4_NL (1; IQ4_XS shares the
+         // layout), IQ3_XXS (2), Q8_0 (3). The .cl's #else branch is IQ4_NL, so
+@@ -3029,7 +3069,7 @@
+                                   *_expert_gate_up_native_batched_stage,
+                                   {w.gate_w, w.gate_s, w.gate_z, w.up_w, w.up_s, w.up_z, hs_mem, _route_pairs},
+                                   {scratch.up},
+-                                  {route_pairs, subgroup_size, static_cast<size_t>(_intermediate_size / N_BLOCK)},
++                                  {route_pairs, subgroup_size, static_cast<size_t>(_intermediate_size / native_gu_rows(_cpu_native_gate_up))},
+                                   {1, subgroup_size, SUBGROUP_NUM},
+                                   false,
+                                   {static_cast<int>(_experts_per_token)});
+@@ -3104,7 +3144,7 @@
+                                   *_expert_gate_up_native_grouped_stage,
+                                   {w.gate_w, w.gate_s, w.gate_z, w.up_w, w.up_s, w.up_z, hs_mem, _dispatch_pairs},
+                                   {scratch.up},
+-                                  {n_tiles, subgroup_size, static_cast<size_t>(_intermediate_size / N_BLOCK)},
++                                  {n_tiles, subgroup_size, static_cast<size_t>(_intermediate_size / native_gu_rows(_cpu_native_gate_up))},
+                                   {1, subgroup_size, SUBGROUP_NUM},
+                                   false,
+                                   {static_cast<int>(_experts_per_token)});
+@@ -3137,7 +3177,7 @@
+                                   *_expert_gate_up_native_batched_stage,
+                                   {w.gate_w, w.gate_s, w.gate_z, w.up_w, w.up_s, w.up_z, hs_mem, _dispatch_pairs},
+                                   {scratch.up},
+-                                  {n_pairs, subgroup_size, static_cast<size_t>(_intermediate_size / N_BLOCK)},
++                                  {n_pairs, subgroup_size, static_cast<size_t>(_intermediate_size / native_gu_rows(_cpu_native_gate_up))},
+                                   {1, subgroup_size, SUBGROUP_NUM},
+                                   false,
+                                   {static_cast<int>(_experts_per_token)});
+@@ -3171,7 +3211,7 @@
+                                    w.up_w, w.up_s, w.up_z,
+                                    hs_mem},
+                                   {scratch.up},
+-                                  {1, subgroup_size, static_cast<size_t>(_intermediate_size / N_BLOCK)},
++                                  {1, subgroup_size, static_cast<size_t>(_intermediate_size / native_gu_rows(_cpu_native_gate_up))},
+                                   {1, subgroup_size, SUBGROUP_NUM},
+                                   false,
+                                   {static_cast<int>(d.slot_index), x_base, y_gu_base});

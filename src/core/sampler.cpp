@@ -8,8 +8,9 @@ namespace {
 
 // How many candidates to pull before falling back to a full sort. Softmax mass
 // concentrates hard on a 248k vocabulary, so this covers top_p in practice
-// while avoiding a quarter-million-element sort per token; correctness does not
-// depend on it, because a shortfall falls back.
+// while avoiding a quarter-million-element sort per token. Correctness does not
+// depend on it: the probe's probabilities are normalised over the whole
+// vocabulary, so a probe short of the top_p mass is seen and falls back.
 constexpr size_t kCandidateProbe = 2048;
 
 }  // namespace
@@ -71,8 +72,9 @@ void Sampler::apply_penalties(float* logits, size_t vocab) const {
 
 // Fills scratch_ with the candidates worth considering, largest logit first.
 // Returns how many are usable.
-size_t Sampler::collect_candidates(const float* logits, size_t vocab) {
-    const size_t want = params_.top_k > 0
+size_t Sampler::collect_candidates(const float* logits, size_t vocab, bool full) {
+    const size_t want = full ? vocab
+                        : params_.top_k > 0
                             ? std::min(static_cast<size_t>(params_.top_k), vocab)
                             : std::min(kCandidateProbe, vocab);
 
@@ -101,7 +103,7 @@ int Sampler::sample(float* logits, size_t vocab) {
 
     for (int attempt = 0; attempt < 2; ++attempt) {
         const bool   probing = attempt == 0 && params_.top_k <= 0 && kCandidateProbe < vocab;
-        const size_t n       = collect_candidates(logits, vocab);
+        const size_t n       = collect_candidates(logits, vocab, attempt > 0);
         if (n == 0) return argmax(logits, vocab);
 
         const float temp = params_.temperature > 0.0f ? params_.temperature : 1.0f;
@@ -113,7 +115,28 @@ int Sampler::sample(float* logits, size_t vocab) {
             probs[i] = std::exp(static_cast<double>(scratch_[i].first - max) / temp);
             sum += probs[i];
         }
+        // A probe holds part of the vocabulary: normalise over all of it, so
+        // top_p measures the true mass and a short probe is noticed
+        if (probing) {
+            sum = 0.0;
+            for (size_t i = 0; i < vocab; ++i) sum += std::exp(static_cast<double>(logits[i] - max) / temp);
+        }
         for (double& p : probs) p /= sum;
+
+        // min-p as llama.cpp applies it (src/llama-sampler.cpp,
+        // llama_sampler_min_p_apply): keep the logits at or above
+        // max + ln(min_p), i.e. p >= min_p * p_max before temperature. The
+        // candidates are sorted, so it keeps a prefix; once a candidate falls
+        // below the floor, so does the rest of the vocabulary, and the probe
+        // needs no full sort.
+        size_t min_p_cut    = probs.size();
+        bool   min_p_closed = false;
+        if (params_.min_p > 0.0f) {
+            const float floor = max + std::log(params_.min_p);
+            min_p_cut         = 1;
+            while (min_p_cut < scratch_.size() && scratch_[min_p_cut].first >= floor) ++min_p_cut;
+            min_p_closed = min_p_cut < scratch_.size();
+        }
 
         // top-p over the already-sorted order. At least one candidate always
         // survives, so a tiny top_p degenerates to greedy rather than nothing.
@@ -131,15 +154,13 @@ int Sampler::sample(float* logits, size_t vocab) {
             }
             // The probe held less mass than top_p asked for; only then is the
             // full sort actually needed.
-            if (acc < static_cast<double>(params_.top_p) && probing) short_of_mass = true;
-        } else if (probing && scratch_.size() < vocab) {
+            if (acc < static_cast<double>(params_.top_p) && probing && !min_p_closed) short_of_mass = true;
+        } else if (probing && scratch_.size() < vocab && !min_p_closed) {
             short_of_mass = true;
         }
+        cutoff = std::min(cutoff, min_p_cut);
 
-        if (short_of_mass) {
-            params_.top_k = static_cast<int>(vocab);  // force the full set next pass
-            continue;
-        }
+        if (short_of_mass) continue;   // the full set next pass (this token only)
 
         double renorm = 0.0;
         for (size_t i = 0; i < cutoff; ++i) renorm += probs[i];

@@ -56,6 +56,26 @@ struct PortPlan {
     bool empty() const { return chunks.empty(); }
 };
 
+// A graph that declares NO ngram_table.K port is the qwen3_5_moe family's
+// case: it carries no PLE and no n-gram table, and its n-gram binding must be
+// INERT rather than required (--ngram-gguf must not be needed). But an
+// artifact whose config DECLARES a table and whose IR declares no port is a
+// mismatch: the PLE is silently absent and a table nothing reads may be
+// admitted and held. Name that refusal here (the device-free half owns it) so
+// the OpenVINO bind in backend_ov.cpp does not have to re-derive it, and so a
+// unit cell can pin it. Returns "" when the pair is consistent.
+inline std::string check_declared_table(int ngram_size, int ple_embed_dim,
+                                        const PortPlan& plan) {
+    if (!plan.empty()) return {};
+    const bool declared = ngram_size >= 2 || ple_embed_dim > 0;
+    if (!declared) return {};
+    return log::format(
+        "the artifact's config declares an n-gram table (ngram_size=%d ple_embed_dim=%d) but "
+        "the IR declares no %s port to carry it; the PLE would be silently absent. Either the "
+        "artifact is not the family its config says, or the table was dropped at export",
+        ngram_size, ple_embed_dim, kTablePortPrefix);
+}
+
 // One compiled-model input as (name, dims), -1 for a dynamic dimension.
 using PortDims = std::pair<std::string, std::vector<int64_t>>;
 

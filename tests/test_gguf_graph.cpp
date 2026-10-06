@@ -29,6 +29,7 @@
 #include <openvino/op/parameter.hpp>
 #include <openvino/op/reshape.hpp>
 #include <openvino/op/result.hpp>
+#include <openvino/op/slice.hpp>
 #include <openvino/op/subtract.hpp>
 #include <openvino/op/subtract.hpp>
 
@@ -486,6 +487,42 @@ TEST(gguf_pass_slices_the_logits_at_a_kquant_lm_head) {
         CHECK_EQ(head->input_value(1).get_node_shared_ptr().get(), static_cast<ov::Node*>(w.get()));  // the weights untouched
         CHECK_EQ(model->output(0).get_partial_shape()[2].get_length(), n);
     }
+}
+
+// The paged slice's token axis (backend_ov.cpp, paged_logits_token_axis). A
+// serving-shape IR keeps its batch of one through SDPAToPagedAttention, so its
+// LM-head input is [1, tokens, hidden]; the paged export's is [tokens, 1,
+// hidden] with both leading axes dynamic. Sliced on axis 0, the serving shape
+// kept every row and the load refused ("logits slice did not take: 128
+// row(s) ... shape [1,128,248320]"), which is why its served runs carried
+// --no-logits-slice and copied [M, vocab] f32 logits every prefill chunk.
+TEST(paged_logits_token_axis_follows_the_head_layout) {
+    const int64_t k = 64, n = 16;
+    auto head_model = [&](ov::PartialShape in) {
+        auto x = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, in);
+        auto w = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{size_t(n), size_t(k)}, std::vector<float>(size_t(n * k), 0.f));
+        auto mm = std::make_shared<ov::op::v0::MatMul>(x, w, false, true);
+        return std::make_shared<ov::Model>(ov::ResultVector{std::make_shared<ov::op::v0::Result>(mm)}, ov::ParameterVector{x}, "head");
+    };
+    auto sliced_axis = [](const std::shared_ptr<ov::Model>& m) -> int64_t {
+        const auto head = m->get_results()[0]->input_value(0).get_node_shared_ptr();
+        const auto sl = ov::as_type_ptr<ov::op::v8::Slice>(head->input_value(0).get_node_shared_ptr());
+        if (!sl) return -1;
+        const auto ax = ov::as_type_ptr<ov::op::v0::Constant>(sl->input_value(4).get_node_shared_ptr());
+        return ax ? ax->cast_vector<int64_t>()[0] : -1;
+    };
+    // serving shape: [1, tokens, hidden] -> axis 1, and the slice lands there
+    {
+        auto m = head_model(ov::PartialShape{1, -1, k});
+        CHECK_EQ(paged_logits_token_axis(m), int64_t{1});
+        CHECK(slice_logits_to_last_token(m, 1, paged_logits_token_axis(m)));
+        CHECK_EQ(sliced_axis(m), int64_t{1});
+    }
+    // paged export: [tokens, 1, hidden] and the fully dynamic declaration -> axis 0
+    CHECK_EQ(paged_logits_token_axis(head_model(ov::PartialShape{-1, 1, k})), int64_t{0});
+    CHECK_EQ(paged_logits_token_axis(head_model(ov::PartialShape{-1, -1, k})), int64_t{0});
+    // a static one-token graph [1, 1, hidden] is not the serving shape's signature
+    CHECK_EQ(paged_logits_token_axis(head_model(ov::PartialShape{1, 1, k})), int64_t{0});
 }
 
 // expose_hidden_state (backend_ov.cpp, primes the MTP head, DESIGN's MTP

@@ -1,0 +1,528 @@
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+@@ -8,6 +8,7 @@
+ #include <cstdint>
+ #include <filesystem>
+ #include <memory>
++#include <mutex>
+ #include <string>
+ #include <utility>
+ #include <vector>
+@@ -16,6 +17,7 @@
+ #include "intel_gpu/primitives/moe_3gemm_fused_compressed.hpp"
+ #include "lru_cache.hpp"
+ #include "moe_otd_runtime.hpp"
++#include "pinned_nvme_fill.hpp"
+ 
+ namespace ov::intel_gpu::ocl::moe {
+ 
+@@ -157,6 +159,44 @@
+     }
+     bool census_seed_active() const {
+         return _census_seed_active;
++    }
++
++    // arcint nvme-direct-expert-tier (patches/0048, design note D2/D3). Opt-in
++    // per provider from MOE_OTD_PINNED_NVME_FILL, read once at construction
++    // like the other OTD switches. When on, the process-global load-time fill
++    // schedule fetches this layer's pinned set over arcwell's batch surface
++    // (one batch per layer, four in flight) BEFORE the first routed call, and
++    // marks the whole set filled at the load barrier, so the existing
++    // first-use fill branch never fires on the decode path. The membership is
++    // exactly the static partition's (patch 0018 / patch 0046), fixed once.
++    void set_pinned_nvme_fill(bool on) {
++        _pinned_nvme_fill = on;
++    }
++    bool pinned_nvme_fill_enabled() const {
++        return _pinned_nvme_fill;
++    }
++
++    // arcint (patch 0048). The static partition's reservation, factored out of
++    // bind() so the fill coordinator can reserve every layer's slots before it
++    // marks them filled -- a layer whose bind() has not yet run has no reserved
++    // slot to fill. Pure function of (seed/census, layer_key, num_expert,
++    // capacity); idempotent, guarded by _static_partition_reserved.
++    void reserve_static_partition();
++
++    // arcint (patch 0048). This layer's pinned set as one batch. `layer_index`
++    // is the coordinator's dense index (the batch's position in layer_key
++    // order), so the collect callback can find the owning provider. The
++    // transport resolves each member's file->LBA at open; this batch carries
++    // only identity (layer/expert/slot).
++    lgc::nvme_fill::FillBatch pinned_nvme_fill_batch(std::uint32_t layer_index) const;
++
++    // arcint (patch 0048). The collect-time handshake the design note §3.4
++    // requires: an expert whose bytes have landed is marked filled in the
++    // shared cache, so the first-use host upload never runs on the decode
++    // path. Called only for a fully collected batch.
++    void apply_pinned_nvme_fill_slot(size_t slot) {
++        std::lock_guard<std::mutex> lock(_pinned_fill_mutex);
++        _cache->set_filled(slot);
+     }
+ 
+     // arcint M10 (patches/0013). Per-expert routing histogram: one counter per
+@@ -244,6 +284,11 @@
+     // process-wide.
+     bool _routing_trace_enabled = false;
+     std::string _routing_trace_path;
++
++    // arcint nvme-direct-expert-tier (patches/0048). See
++    // set_pinned_nvme_fill() / apply_pinned_nvme_fill_slot().
++    bool _pinned_nvme_fill = false;
++    std::mutex _pinned_fill_mutex;
+ };
+ 
+ }  // namespace ov::intel_gpu::ocl::moe
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+@@ -14,6 +14,7 @@
+ #include <iostream>
+ #include <map>
+ #include <mutex>
++#include <stdexcept>
+ #include <unordered_map>
+ #include <utility>
+ 
+@@ -88,6 +89,94 @@
+         otd_key_collisions()++;
+         for (size_t i = 0; i < hist.size() && i < slot.size(); ++i)
+             slot[i] += hist[i];
++    }
++}
++
++// arcint nvme-direct-expert-tier (patches/0048, design note D2/D3). The
++// process-global load-time pinned-fill coordinator. Membership is fixed once
++// at bind() -- the static partition's own pure function of (seed/census,
++// layer_key, num_expert, capacity), never re-derived from live traffic -- and
++// handed to lgc::nvme_fill::Scheduler, the plugin twin of
++// src/exec/pinned_nvme_fill.h, the header the campaign's device-free ladder
++// tests. The schedule is one batch per MoE layer, four batches in flight over
++// the arcwell batch surface, collected and marked filled before the first
++// routed call; there is no fetch on the decode path.
++//
++// The transport is injected. Today there is no transport that can land bytes
++// without a host bounce: under the static partition the slot pool is
++// host-mapped (MOE_OTD_PERF_LOG reports device_slot_buffers=0), and arcwell
++// requires a dma-buf from an xe VRAM BO. The per-expert dma-buf BO the
++// artifact-format step named as the D2/D3 contract therefore has no wiring
++// yet, so an ENABLED fill refuses the load with the reason below -- the design
++// note's own "arcwell cannot be set up at all is a load failure" rule, and
++// never a silent demotion to the host tier (D3). Supplying the transport is
++// OWED with that BO-backed destination.
++struct PinnedNvmeFillCoordinator {
++    bool                       started = false;
++    lgc::nvme_fill::Transport* transport = nullptr;
++};
++
++PinnedNvmeFillCoordinator& pinned_nvme_fill() {
++    static PinnedNvmeFillCoordinator coordinator;
++    return coordinator;
++}
++
++// The load barrier. Called from the first layer's bind(); by then every layer's
++// provider has been constructed, so the whole pinned set is known. A failure
++// here is a LOAD FAILURE (a throw), never a fallback.
++void start_pinned_nvme_fill() {
++    auto& coordinator = pinned_nvme_fill();
++    if (coordinator.started) return;
++    coordinator.started = true;
++
++    if (coordinator.transport == nullptr) {
++        throw std::runtime_error(
++            "MOE_OTD_PINNED_NVME_FILL is set but no arcwell batch transport is linked: "
++            "the static partition's slots are host-mapped (device_slot_buffers=0), so there "
++            "is no dma-buf VRAM destination for a byte-transparent fill -- refusing the load "
++            "rather than demoting pinned experts to the host tier (design note D3)");
++    }
++
++    std::vector<OffloadExpertWeightProvider*> providers;
++    {
++        std::lock_guard<std::mutex> lock(otd_registry_mutex());
++        providers = otd_registry();
++    }
++    // Deterministic layer order: the structural layer_key, not the
++    // construction sequence (a run-to-run permutation).
++    std::sort(providers.begin(), providers.end(),
++              [](const OffloadExpertWeightProvider* a, const OffloadExpertWeightProvider* b) {
++                  return a->layer_key() < b->layer_key();
++              });
++
++    lgc::nvme_fill::Scheduler scheduler(coordinator.transport, /*depth=*/4);
++    std::string why;
++    if (!scheduler.begin(&why))
++        throw std::runtime_error("pinned NVMe fill setup failed: " + why);
++
++    std::vector<OffloadExpertWeightProvider*> owner;  // dense layer index -> provider
++    for (auto* provider : providers) {
++        if (!provider->pinned_nvme_fill_enabled()) continue;
++        if (!provider->static_partition_active()) {
++            throw std::runtime_error(
++                "MOE_OTD_PINNED_NVME_FILL requires the static partition "
++                "(MOE_CPU_TIER_PARTITION=lru has no pinned set to fill)");
++        }
++        // Reserve before filling: a layer whose own bind() has not yet run has
++        // no pinned slot for set_filled() to mark.
++        provider->reserve_static_partition();
++        const std::uint32_t index = static_cast<std::uint32_t>(owner.size());
++        owner.push_back(provider);
++        if (!scheduler.enqueue(provider->pinned_nvme_fill_batch(index), &why))
++            throw std::runtime_error("pinned NVMe fill enqueue failed: " + why);
++    }
++
++    if (!scheduler.barrier(
++            [&](const lgc::nvme_fill::FillRequest& request) {
++                owner.at(request.layer)->apply_pinned_nvme_fill_slot(request.slot);
++            },
++            &why)) {
++        throw std::runtime_error("pinned NVMe fill load barrier refused: " + why);
+     }
+ }
+ 
+@@ -248,7 +337,13 @@
+       // provider under test. An empty value counts as unset.
+       _routing_trace_enabled(std::getenv("MOE_OTD_ROUTING_TRACE") != nullptr &&
+                              std::getenv("MOE_OTD_ROUTING_TRACE")[0] != '\0'),
+-      _routing_trace_path(_routing_trace_enabled ? std::getenv("MOE_OTD_ROUTING_TRACE") : "") {
++      _routing_trace_path(_routing_trace_enabled ? std::getenv("MOE_OTD_ROUTING_TRACE") : ""),
++      // arcint nvme-direct-expert-tier (patches/0048). Opt-in load-time pinned
++      // NVMe fill. Same per-provider, construction-time read as the switches
++      // above; an empty value counts as unset. When off, every branch this
++      // patch adds is inert and the provider's code path is unchanged.
++      _pinned_nvme_fill(std::getenv("MOE_OTD_PINNED_NVME_FILL") != nullptr &&
++                        std::getenv("MOE_OTD_PINNED_NVME_FILL")[0] != '\0') {
+     // Registration is unconditional and cheap (an id already assigned above,
+     // one vector push under a mutex) regardless of _routing_hist_enabled:
+     // otd_dump_routing_hist() reads MOE_OTD_ROUTING_HIST fresh at exit, so a
+@@ -289,21 +384,53 @@
+     // Runs before this provider serves its first real request: bind() is
+     // called once on first execution, strictly before try_acquire_
+     // simultaneous/acquire_one see live traffic.
+-    if (_static_partition && !_static_partition_reserved) {
+-        // arcint VENICE (patch 0046). When a census seed is active for this
+-        // layer, pin the census-ranked set; otherwise keep patch 0018's
+-        // frequency-free splitmix64 rank. Both are pure functions of the
+-        // layer's recorded inputs, so bind() stays history-independent.
+-        const auto resident_experts =
+-            _census_seed_active
+-                ? _census_seed
+-                : static_partition_resident_experts(_static_seed, layer_key(), _config.num_expert, _capacity);
+-        for (size_t slot = 0; slot < resident_experts.size(); ++slot)
+-            _cache->reserve_pinned(resident_experts[slot], slot);
+-        _static_partition_reserved = true;
+-    }
++    if (_static_partition) reserve_static_partition();
++
++    // arcint nvme-direct-expert-tier (patches/0048). The first layer to bind
++    // runs the whole load barrier: every registered layer's pinned set is
++    // fetched over the arcwell batch surface, four batches in flight, and
++    // marked filled before this layer's own experts are consumed. Enabled
++    // without a transport is a load failure (see start_pinned_nvme_fill()).
++    if (_pinned_nvme_fill) start_pinned_nvme_fill();
++
+     GPU_DEBUG_TRACE << "MOE OTD bind: resident_slots=" << _capacity << " total_experts=" << _config.num_expert
+                     << " shared_expert=" << (_config.num_shared_expert > 0 ? 1 : 0) << std::endl;
++}
++
++void OffloadExpertWeightProvider::reserve_static_partition() {
++    if (!_static_partition || _static_partition_reserved) return;
++    // arcint VENICE (patch 0046). When a census seed is active for this layer,
++    // pin the census-ranked set; otherwise keep patch 0018's frequency-free
++    // splitmix64 rank. Both are pure functions of the layer's recorded inputs,
++    // so bind() stays history-independent.
++    const auto resident_experts =
++        _census_seed_active
++            ? _census_seed
++            : static_partition_resident_experts(_static_seed, layer_key(), _config.num_expert, _capacity);
++    for (size_t slot = 0; slot < resident_experts.size(); ++slot)
++        _cache->reserve_pinned(resident_experts[slot], slot);
++    _static_partition_reserved = true;
++}
++
++lgc::nvme_fill::FillBatch OffloadExpertWeightProvider::pinned_nvme_fill_batch(std::uint32_t layer_index) const {
++    lgc::nvme_fill::FillBatch batch;
++    batch.layer = layer_index;
++    if (!_static_partition) return batch;
++    // The same membership reserve_static_partition() pinned, so a slot index in
++    // this batch is exactly the slot set_filled() will mark.
++    const auto resident_experts =
++        _census_seed_active
++            ? _census_seed
++            : static_partition_resident_experts(_static_seed, layer_key(), _config.num_expert, _capacity);
++    batch.requests.reserve(resident_experts.size());
++    for (std::size_t slot = 0; slot < resident_experts.size(); ++slot) {
++        lgc::nvme_fill::FillRequest request;
++        request.layer  = layer_index;
++        request.expert = resident_experts[slot];
++        request.slot   = static_cast<std::uint32_t>(slot);
++        batch.requests.push_back(request);
++    }
++    return batch;
+ }
+ 
+ void OffloadExpertWeightProvider::fill_routed_weight_views(cldnn::moe_weights& /*weights*/, RoutedWeightViews& views) {
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/pinned_nvme_fill.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/pinned_nvme_fill.hpp
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/pinned_nvme_fill.hpp
+@@ -0,0 +1,258 @@
++#pragma once
++
++// nvme-direct-expert-tier (0.5.3 LISBON), design note D2/D3 -- the load-time
++// pinned fill's schedule, kept pure and device-free so it builds and is tested
++// on any host. `docs/design-nvme-direct-expert-tier.md` §3 fixes the shape:
++//
++//   * membership is the static partition's pinned set, computed ONCE from
++//     configuration at bind() and never re-derived from live traffic
++//     (patch 0018; patch 0046). This header does not compute membership --
++//     the caller hands it the batches -- so it cannot grow a traffic input.
++//   * one batch per layer (ratio 86 -> 71 requests, ratio 75 -> 128; both
++//     under AW_BATCH_MAX = 256).
++//   * FOUR batches in flight over AW_IOC_SUBMIT_BATCH / AW_IOC_BATCH_WAIT,
++//     collecting the oldest (the note's measured shape: four batches overlap
++//     and all collect).
++//   * on collect, every landed expert is marked filled -- the caller's
++//     callback is the cache's set_filled(slot), so the existing first-use
++//     fill branch never fires on the decode path.
++//   * NO fetch on the decode path. The transport interface deliberately has
++//     no synchronous read primitive; `require_no_sync_read` is the guard that
++//     refuses a would-be synchronous AW_IOC_READ_BLOCKS once serving has
++//     begun (the campaign's Out).
++//
++// D3, the load barrier: a pinned expert whose fetch has not landed is a LOAD
++// FAILURE -- retried at the barrier, then refused. It is never silently
++// demoted to the host tier: host and device are different arithmetic, so a
++// demotion would make this boot's residency differ from a clean boot and break
++// the byte-identity the gate measures across two cold boots. The scheduler has
++// exactly one retry per batch and only ever reports success for a fully
++// collected batch; a shortfall is a refusal, never a partial fill.
++//
++// The transport is injected. The production implementation, WHEN SUPPLIED,
++// will drive arcwell's batch ioctls (`~/src/arcwell`, `stub/include/aw_uapi.h`);
++// it is not part of this header, so the schedule is testable with a fake and
++// does not link against the module. No production transport is wired yet: the
++// static partition's pinned slots are host-mapped and arcwell needs a dma-buf
++// from an xe VRAM BO, so the destination is OWED (campaign
++// nvme-direct-expert-tier, D2/D3). `Transport::begin` is the whole-configuration
++// setup: a failure there (MAP_BUFFER refuses, out_flags lacks
++// AW_MAP_F_REQUIRE_P2P, the BO cannot be registered, the batch ioctl is
++// unavailable) is a load failure for the configuration -- there is no
++// host-bounce fallback path.
++
++#include <cstddef>
++#include <cstdint>
++#include <deque>
++#include <functional>
++#include <map>
++#include <stdexcept>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace lgc::nvme_fill {
++
++// One pinned expert to fetch. `lba`/`bytes` are the file's absolute NVMe block
++// range, translated once at open (FIEMAP + partition start); `slot` is the
++// fixed device slot the static partition assigned at bind(); `layer` and
++// `expert` identify the member for accounting and refusal messages.
++struct FillRequest {
++    uint32_t layer = 0;
++    uint32_t expert = 0;
++    uint32_t slot = 0;
++    uint64_t lba = 0;
++    uint64_t bytes = 0;
++};
++
++// One batch = one layer's pinned set, submitted as a single
++// AW_IOC_SUBMIT_BATCH. The note's ratio-86 set is 71 requests; AW_BATCH_MAX is
++// 256, so one batch per layer always fits.
++struct FillBatch {
++    uint32_t layer = 0;
++    std::vector<FillRequest> requests;
++};
++
++// Whether the fill is still at load (the only phase a fetch may run in),
++// serving (the decode path, where it must not), or terminally refused (a load
++// failure; nothing else may run).
++enum class Phase { kCreated, kLoading, kServing, kRefused };
++
++struct CollectOutcome {
++    bool        ok = false;
++    std::size_t completed = 0;
++    std::size_t requested = 0;
++    std::string error;
++};
++
++// The arcwell transport the scheduler drives. It exposes ONLY the batch
++// surface (submit + collect) plus setup/teardown: there is no synchronous
++// read, so a losing configuration cannot be reached through this interface.
++// A single collector per batch id is the module's own contract (a second
++// concurrent wait returns -EBUSY); this scheduler collects each id once.
++class Transport {
++public:
++    virtual ~Transport() = default;
++
++    // Whole-configuration setup. Returns false (with `reason`) when arcwell
++    // cannot be set up at all -- a load failure for the configuration.
++    virtual bool begin(std::string* reason) = 0;
++
++    // Queue one batch. Returns false only for a submission-time failure;
++    // transfer errors surface at collect.
++    virtual bool submit(const FillBatch& batch, std::uint64_t* batch_id,
++                        std::string* reason) = 0;
++
++    // Collect a batch, blocking until it is done. `outcome.completed` is the
++    // number of requests that landed; `outcome.requested` the number
++    // submitted. A shortfall is reported, not hidden.
++    virtual bool collect(std::uint64_t batch_id, CollectOutcome* outcome,
++                         std::string* reason) = 0;
++
++    virtual void end() {}
++};
++
++// The load-time schedule. Constructed at bind() with the transport and the
++// note's depth (4); fed one batch per layer; run once at the load barrier.
++class Scheduler {
++public:
++    using FilledCallback = std::function<void(const FillRequest&)>;
++
++    explicit Scheduler(Transport* transport, std::size_t depth = 4)
++        : transport_(transport), depth_(depth == 0 ? 1 : depth) {}
++
++    Scheduler(const Scheduler&)            = delete;
++    Scheduler& operator=(const Scheduler&) = delete;
++
++    Phase phase() const { return phase_; }
++
++    // Set the transport up. A false return is a load failure; nothing else in
++    // the schedule may run.
++    bool begin(std::string* reason) {
++        if (phase_ != Phase::kCreated) {
++            if (reason) *reason = "pinned fill begin() called twice";
++            return false;
++        }
++        if (transport_ == nullptr) {
++            if (reason) *reason = "pinned fill has no transport";
++            return false;
++        }
++        if (!transport_->begin(reason)) return false;
++        phase_ = Phase::kLoading;
++        return true;
++    }
++
++    // One batch per layer. May only be called before the barrier.
++    bool enqueue(FillBatch batch, std::string* reason) {
++        if (phase_ != Phase::kLoading) {
++            if (reason) *reason = "pinned fill enqueue() outside the load phase";
++            return false;
++        }
++        pending_.push_back(std::move(batch));
++        return true;
++    }
++
++    // The load barrier. Drives the batches four at a time, collects the oldest,
++    // marks every landed expert filled via `on_filled`, retries a short batch
++    // once, and REFUSES -- with `reason` -- if any pinned expert is still not
++    // landed. A refusal is TERMINAL (phase kRefused): a second call refuses too,
++    // so a partially filled configuration can never resume into serving. On
++    // success the phase becomes kServing. No fetch runs after this.
++    bool barrier(const FilledCallback& on_filled, std::string* reason) {
++        if (phase_ == Phase::kCreated) {
++            if (reason) *reason = "pinned fill barrier() before begin()";
++            return false;
++        }
++        if (phase_ == Phase::kRefused) {
++            if (reason) *reason = "pinned fill already refused the load";
++            return false;
++        }
++        if (phase_ == Phase::kServing) {
++            if (reason) *reason = "pinned fill barrier() already run";
++            return false;
++        }
++
++        std::map<std::uint64_t, FillBatch> inflight;
++        std::deque<std::uint64_t>         order;
++        std::map<std::uint32_t, bool>     retried;  // one retry per layer, see below
++
++        auto submit_one = [&](const FillBatch& batch) -> bool {
++            std::uint64_t id = 0;
++            if (!transport_->submit(batch, &id, reason)) return false;
++            inflight.emplace(id, batch);
++            order.push_back(id);
++            return true;
++        };
++
++        while (!pending_.empty() || !inflight.empty()) {
++            // Fill the in-flight window to `depth_` before collecting, so the
++            // NVMe queue depth is actually used (the note's four-overlap
++            // shape).
++            while (inflight.size() < depth_ && !pending_.empty()) {
++                FillBatch next = std::move(pending_.front());
++                pending_.pop_front();
++                if (!submit_one(next)) return false;
++            }
++            if (inflight.empty()) {
++                if (reason) *reason = "pinned fill stalled with no batch in flight";
++                return false;
++            }
++
++            const std::uint64_t oldest = order.front();
++            order.pop_front();
++            FillBatch batch = std::move(inflight.at(oldest));
++            inflight.erase(oldest);
++
++            CollectOutcome outcome;
++            if (!transport_->collect(oldest, &outcome, reason)) return false;
++
++            if (outcome.ok && outcome.completed == batch.requests.size()) {
++                for (const auto& request : batch.requests) on_filled(request);
++                continue;
++            }
++
++            // A short batch: retry it once, in full. Partial completion does
++            // not name which requests landed, so re-issuing the whole batch is
++            // the only way to keep "filled" honest -- and re-fetching an
++            // already-landed expert is idempotent. One retry per layer; a
++            // second shortfall is a refusal.
++            if (retried.find(batch.layer) == retried.end()) {
++                retried.emplace(batch.layer, true);
++                if (!submit_one(batch)) return false;
++                continue;
++            }
++
++            if (reason) {
++                *reason = "load failed: pinned expert set for layer " +
++                          std::to_string(batch.layer) + " did not land after a retry (" +
++                          std::to_string(outcome.completed) + " of " +
++                          std::to_string(batch.requests.size()) +
++                          "); refusing the load rather than demoting to the host tier";
++            }
++            phase_ = Phase::kRefused;
++            return false;
++        }
++
++        phase_ = Phase::kServing;
++        return true;
++    }
++
++    // The losing configuration guard. Any code path that would issue a
++    // synchronous AW_IOC_READ_BLOCKS must come through here; once the load
++    // barrier has passed, the decode path is serving and the read is refused.
++    void require_no_sync_read(const char* what) const {
++        if (phase_ == Phase::kServing) {
++            throw std::logic_error(
++                std::string("synchronous arcwell read forbidden on the decode path: ") +
++                (what != nullptr ? what : "AW_IOC_READ_BLOCKS"));
++        }
++    }
++
++private:
++    Transport*                 transport_ = nullptr;
++    std::size_t                depth_     = 4;
++    Phase                      phase_     = Phase::kCreated;
++    std::deque<FillBatch>      pending_;
++};
++
++}  // namespace lgc::nvme_fill

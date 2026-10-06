@@ -1,0 +1,410 @@
+# Per-expert kernel dispatch integration: wire moe_expert_swiglu.cl into
+# the live dispatch path (campaign: sub4bit-vram-kernel).
+#
+# Design:   docs/design-routing-aware-expert-execution.md §2, §2.5
+# Campaign: docs/campaigns/sub4bit-vram-kernel.md
+# Gate:     a model with >= 512 experts serves on one card with routing-aware
+#           expert execution: only the routed experts computed per token.
+#
+# Prerequisite patches:
+#   0038 — per-expert dispatch framework (blanket sentinel, CPU-tier redirect)
+#   0039 — per-expert OCL kernel (moe_expert_swiglu.cl)
+#
+# This patch wires them together: GPU-resident experts are dispatched to the
+# per-expert OCL kernel (expert_gate_up, expert_down), non-resident experts
+# go to the CPU tier (patch 0011), and the fused GEMV path is bypassed for
+# all top-k experts via sentinels.
+#
+# The mechanism, step by step:
+#   1. try_acquire_simultaneous runs NORMALLY (patch 0038's blanket-sentinel
+#      block is removed). GPU LRU cache residents get real slot indices;
+#      non-residents get kCpuTierSentinelSlot + cpu_tier_misses.
+#   2. on_before_batched_gemv builds a _gpu_dispatches vector from the lease:
+#      each non-sentinel entry becomes {slot_index, topk_position, flat_id}.
+#   3. ALL top-k positions in expert_index_buffer are written as sentinels,
+#      so the fused GEMV kernels (mlp_gate_up, mlp_down) skip every top-k
+#      expert. The shared expert (if any) is NOT sentineled and still runs
+#      through the fused path.
+#   4. For each GPU dispatch, exec_batched_gemv launches expert_gate_up then
+#      expert_down via execute_stage, passing the slot pool buffers plus
+#      scalar {slot_index, element_offsets}. The kernel offsets weight/scale/zp
+#      pointers by slot_index * per_expert_stride (computed from JIT
+#      constants).
+#   5. CPU tier: non-resident misses still go through dispatch_cpu_tier /
+#      cpu_tier_join (patch 0012), exactly as before.
+#   6. mlp_reduce runs unchanged over all EXPERTS_PER_TOKEN rows of scratch.y,
+#      which now contain: GPU kernel results for residents, CPU tier results
+#      for non-residents, shared expert result from the fused path.
+#
+# Kernel changes (moe_expert_swiglu.cl):
+#   FAKE_GROUP_SIZE is derived from JIT constants (GATE_UP_GROUP_SIZE,
+#   DOWN_GROUP_SIZE) using the same min(group_sizes, 128) logic as the fused
+#   kernel. Both entry points are guarded by #ifdef GATE_UP_ENABLE / DOWN_ENABLE
+#   so a single compilation unit produces only one kernel (C3 fix).
+#
+#   expert_gate_up gains three scalar parameters: slot_index (int),
+#   x_base_elem (int), y_base_elem (int). The kernel offsets each weight/
+#   scale/zp pointer by slot_index * per_expert_stride (long arithmetic to
+#   avoid overflow at 512 slots), reads input at x[x_base_elem + ...], and
+#   writes output at y[y_base_elem + token_idx * INTERMEDIATE_SIZE]. gws[0]=1
+#   because each dispatch handles one (token, expert) pair (C4 fix).
+#
+#   expert_down gains four scalar parameters: slot_index (int), x_base_elem,
+#   rw_base_elem, y_base_elem (all int). Same pointer offsetting. Reads input
+#   at x[x_base_elem + ...], routing weight at routing_weights[rw_base_elem +
+#   token_idx], writes at y[y_base_elem + ...].
+#
+# Per-expert strides, all computable from JIT constants:
+#   gate/up weight (uchar): INTERMEDIATE_SIZE * HIDDEN_SIZE / 2
+#   gate/up scale  (half):  (HIDDEN_SIZE / GATE_UP_GROUP_SIZE) * INTERMEDIATE_SIZE
+#   gate/up zp     (uchar): (HIDDEN_SIZE / GATE_UP_GROUP_SIZE) * INTERMEDIATE_SIZE / 2
+#   down weight    (uchar): HIDDEN_SIZE * INTERMEDIATE_SIZE / 2
+#   down scale     (half):  (INTERMEDIATE_SIZE / DOWN_GROUP_SIZE) * HIDDEN_SIZE
+#   down zp        (uchar): (INTERMEDIATE_SIZE / DOWN_GROUP_SIZE) * HIDDEN_SIZE / 2
+#
+# Maximum byte offset at 512 slots: 511 * 819200 = 418 MB, fits in signed
+# int32 (max 2.1 GB). Long cast in the kernel is for the multiplication
+# intermediate, not the final offset.
+#
+# Perf counter: per_expert_gpu_invocations += 2 * gpu_dispatches.size()
+# (one gate_up + one down per resident expert). Distinguishes GPU kernel use
+# from CPU-tier fallback (per_expert_dispatches counts both).
+#
+# Event ordering: in-order OCL queue (execution_config.cpp forces in_order
+# whenever use_onednn is set). All per-expert kernels are enqueued after the
+# fused stages (which no-op via sentinels) and before cpu_tier_join / reduce.
+# Program order on the in-order queue is sufficient.
+#
+# KernelGenerator stages (MoEExpertGateUp, MoEExpertDown) are member-
+# initialized at class scope, so make_deep_copy correctly creates fresh
+# stages in the clone (M1 fix). u4 weight type assertion at init time
+# guards against untested dtype paths (M2 fix). Memory pointers use
+# auto (not auto*) for shared_ptr returns (C2 fix).
+#
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on
+# top of patches/0003-0039.
+
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+index 2b458ba..98752c5 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+@@ -331,35 +331,6 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
+     std::vector<uint32_t> missed_experts;
+     std::vector<size_t> missed_slots;
+ 
+-    // arcint (patch 0038, campaign: sub4bit-vram-kernel). Per-expert dispatch
+-    // mode: ALL routed experts are treated as CPU-tier misses. No expert
+-    // reaches the fused GEMV path. The slot pool is not consulted.
+-    if (_per_expert_dispatch && cpu_tier_misses != nullptr) {
+-        OPENVINO_ASSERT(cpu_tier_misses->empty(),
+-            "per-expert dispatch: cpu_tier_misses must be empty on entry");
+-        std::unordered_map<uint32_t, size_t> miss_index;
+-        miss_index.reserve(experts.size());
+-        ExpertSlotLease lease(experts.size(), kCpuTierSentinelSlot);
+-        for (size_t i = 0; i < experts.size(); i++) {
+-            const uint32_t expert = experts[i];
+-            auto it = miss_index.find(expert);
+-            if (it != miss_index.end()) {
+-                (*cpu_tier_misses)[it->second].positions.push_back(i);
+-            } else {
+-                auto& m = cpu_tier_misses->emplace_back();
+-                m.expert = expert;
+-                m.positions.push_back(i);
+-                miss_index[expert] = cpu_tier_misses->size() - 1;
+-            }
+-        }
+-        if (auto* perf = moe_otd::get_perf_counters()) {
+-            perf->per_expert_dispatches.fetch_add(
+-                static_cast<uint64_t>(miss_index.size()),
+-                std::memory_order_relaxed);
+-        }
+-        return lease;
+-    }
+-
+     // arcint M14. Active only when the caller passed a destination for CPU-tier
+     // misses AND this provider was told the tier is on (set_cpu_tier(true), wired
+     // from the impl constructor - moe_3gemm_swiglu_opt.cpp). With either false,
+@@ -585,6 +556,14 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
+     if (uploads_enqueued)
+         *uploads_enqueued = !missed_experts.empty();
+ 
++    if (_per_expert_dispatch) {
++        if (auto* perf = moe_otd::get_perf_counters()) {
++            perf->per_expert_dispatches.fetch_add(
++                static_cast<uint64_t>(expert_to_slot.size()),
++                std::memory_order_relaxed);
++        }
++    }
++
+     return slots;
+ }
+ 
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+index 9c36d94..4da6af4 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -491,6 +491,45 @@ static void add_common_consts(const RuntimeParams& params, JitConstants& jit) {
+         jit.make("MOE_CPU_TIER_ENABLE", 1);
+ }
+ 
++class MoEExpertGateUp : public KernelGenerator {
++public:
++    MoEExpertGateUp()
++        : KernelGenerator("moe_expert_swiglu", "expert_gate_up") {}
++protected:
++    JitConstants get_jit_constants(const RuntimeParams& params) const override {
++        auto jit = KernelGenerator::get_jit_constants(params);
++        add_common_consts(params, jit);
++        jit.make("GATE_UP_ENABLE", 1);
++        auto desc = params.typed_desc<moe_3gemm_fused_compressed>();
++        if (desc->_config.activation_type == ov::op::internal::MOE::Activation_type::GEGLU_TANH)
++            jit.make("GATE_ACT_GELU_TANH", 1);
++        else if (desc->_config.activation_type == ov::op::internal::MOE::Activation_type::GEGLU_ERF)
++            jit.make("GATE_ACT_GELU_ERF", 1);
++        return jit;
++    }
++    Arguments get_arguments_desc(const RuntimeParams&) const override { return {}; }
++    DispatchDataFunc get_dispatch_data_func() const override {
++        return DispatchDataFunc{[](const RuntimeParams&, KernelData&, ImplRuntimeParams*) {}};
++    }
++};
++
++class MoEExpertDown : public KernelGenerator {
++public:
++    MoEExpertDown()
++        : KernelGenerator("moe_expert_swiglu", "expert_down") {}
++protected:
++    JitConstants get_jit_constants(const RuntimeParams& params) const override {
++        auto jit = KernelGenerator::get_jit_constants(params);
++        add_common_consts(params, jit);
++        jit.make("DOWN_ENABLE", 1);
++        return jit;
++    }
++    Arguments get_arguments_desc(const RuntimeParams&) const override { return {}; }
++    DispatchDataFunc get_dispatch_data_func() const override {
++        return DispatchDataFunc{[](const RuntimeParams&, KernelData&, ImplRuntimeParams*) {}};
++    }
++};
++
+ class MoE3GemmSwigluMLPGateUp : public KernelGenerator {
+ public:
+     MoE3GemmSwigluMLPGateUp(bool disable_shared_experts = false)
+@@ -760,6 +799,14 @@ public:
+ 
+     // arcint (patch 0038). Per-expert dispatch: all experts bypass the fusion.
+     bool _per_expert_dispatch = false;
++    Stage::Ptr _expert_gate_up_stage = make_stage<MoEExpertGateUp>();
++    Stage::Ptr _expert_down_stage = make_stage<MoEExpertDown>();
++    struct PerExpertGpuDispatch {
++        size_t slot_index;
++        int topk_position;
++        int flat_id;
++    };
++    std::vector<PerExpertGpuDispatch> _gpu_dispatches;
+ 
+     // --- OTD helper methods (used when _weight_provider->is_offloaded()) ---
+ 
+@@ -1235,8 +1282,22 @@ public:
+             scratch._expert_index_buffer = engine.allocate_memory(layout, allocation_type::usm_host, false);
+         }
+         std::vector<uint32_t> slots_u32(lease->size());
+-        for (size_t i = 0; i < lease->size(); i++)
+-            slots_u32[i] = static_cast<uint32_t>((*lease)[i]);
++        if (_per_expert_dispatch) {
++            _gpu_dispatches.clear();
++            for (size_t i = 0; i < lease->size(); i++) {
++                const size_t slot = (*lease)[i];
++                if (slot != kCpuTierSentinelSlot) {
++                    const int topk_pos = static_cast<int>(i % _max_topk);
++                    const int token = static_cast<int>(i / _max_topk);
++                    const int flat = token * static_cast<int>(_experts_per_token) + topk_pos;
++                    _gpu_dispatches.push_back({slot, topk_pos, flat});
++                }
++                slots_u32[i] = static_cast<uint32_t>(kCpuTierSentinelSlot);
++            }
++        } else {
++            for (size_t i = 0; i < lease->size(); i++)
++                slots_u32[i] = static_cast<uint32_t>((*lease)[i]);
++        }
+         scratch._expert_index_buffer->copy_from(stream, slots_u32.data(), 0, 0, topk_bytes, true);
+ 
+         // arcint M14 (patches/0017). MOE_OTD_READBACK_NOHOIST-only: x/rw,
+@@ -1708,6 +1769,13 @@ public:
+                 static_cast<OffloadExpertWeightProvider*>(_weight_provider.get())->set_per_expert_dispatch(true);
+             }
+ 
++            if (_per_expert_dispatch) {
++                OPENVINO_ASSERT(wdt == ov::element::u4,
++                    "per-expert dispatch requires u4 weights; got ", wdt);
++                add_stage(_expert_gate_up_stage, params);
++                add_stage(_expert_down_stage, params);
++            }
++
+             // Discharges §10 R1 on the first load of the window: the config
+             // values the kernel actually sees, read once here rather than
+             // assumed from the IR.
+@@ -2399,6 +2467,45 @@ public:
+                                       {token_num * compute_experts, subgroup_size, static_cast<size_t>(_hidden_size / N_BLOCK)},
+                                       {1, subgroup_size, SUBGROUP_NUM});
+ 
++            if (_per_expert_dispatch && !_gpu_dispatches.empty()) {
++                auto hs_mem = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
++                const auto& w = instance._weights;
++                for (const auto& d : _gpu_dispatches) {
++                    const int x_base = static_cast<int>(d.flat_id / static_cast<int>(_experts_per_token)) * _hidden_size;
++                    const int y_gu_base = d.flat_id * _intermediate_size;
++                    execute_stage({ret_event},
++                                  instance,
++                                  *_expert_gate_up_stage,
++                                  {w.gate_w, w.gate_s, w.gate_z,
++                                   w.up_w, w.up_s, w.up_z,
++                                   hs_mem},
++                                  {scratch.up},
++                                  {1, subgroup_size, static_cast<size_t>(_intermediate_size / N_BLOCK)},
++                                  {1, subgroup_size, SUBGROUP_NUM},
++                                  false,
++                                  {static_cast<int>(d.slot_index), x_base, y_gu_base});
++                    const int x_dn_base = d.flat_id * _intermediate_size;
++                    const int token = d.flat_id / static_cast<int>(_experts_per_token);
++                    const int rw_base = token * static_cast<int>(_max_topk) + d.topk_position;
++                    const int y_dn_base = d.flat_id * _hidden_size;
++                    execute_stage({ret_event},
++                                  instance,
++                                  *_expert_down_stage,
++                                  {w.down_w, w.down_s, w.down_z,
++                                   scratch.up, routing_mem_ptr},
++                                  {scratch.y},
++                                  {1, subgroup_size, static_cast<size_t>(_hidden_size / N_BLOCK)},
++                                  {1, subgroup_size, SUBGROUP_NUM},
++                                  false,
++                                  {static_cast<int>(d.slot_index), x_dn_base, rw_base, y_dn_base});
++                }
++                if (auto* perf = moe_otd::get_perf_counters()) {
++                    perf->per_expert_gpu_invocations.fetch_add(
++                        static_cast<uint64_t>(_gpu_dispatches.size()) * 2,
++                        std::memory_order_relaxed);
++                }
++            }
++
+             // arcint M14 (patches/0012, §4.4). Between `down` and `reduce`: the
+             // sentinel skip (moe_3gemm_swiglu_mlp.cl) left the CPU-tier rows of
+             // scratch.y stale after `down`; this fills them in before `reduce`
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
+index 2a9b672..d9567a1 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
+@@ -23,6 +23,21 @@
+ 
+ #include "include/batch_headers/sub_group_block_read.cl"
+ 
++#if defined(GATE_UP_GROUP_SIZE) && defined(DOWN_GROUP_SIZE)
++#    if GATE_UP_GROUP_SIZE < DOWN_GROUP_SIZE
++#        define MOE_MIN_GROUP_SIZE GATE_UP_GROUP_SIZE
++#    else
++#        define MOE_MIN_GROUP_SIZE DOWN_GROUP_SIZE
++#    endif
++#    if MOE_MIN_GROUP_SIZE < 128
++#        define FAKE_GROUP_SIZE MOE_MIN_GROUP_SIZE
++#    else
++#        define FAKE_GROUP_SIZE 128
++#    endif
++#else
++#    define FAKE_GROUP_SIZE 128
++#endif
++
+ #define ELEMS_PER_LANE (FAKE_GROUP_SIZE / SUBGROUP_SIZE)
+ 
+ #ifdef GATE_ACT_GELU_ERF
+@@ -372,6 +387,7 @@ inline void load_x_interleaved(__local half* x2,
+     }
+ }
+ 
++#ifdef GATE_UP_ENABLE
+ // ===========================================================================
+ // Stage 1: gate + up for a single expert.
+ //   y[n] = up(x)[n] * SiLU(gate(x)[n])
+@@ -391,10 +407,13 @@ KERNEL(expert_gate_up)(
+     const __global MOE_SCALE_DT* up_scale,
+     const __global MOE_ZP_DT*    up_zp,
+     const __global MOE_DTYPE*    x,
+-    __global MOE_DTYPE*          y)
++    __global MOE_DTYPE*          y,
++    int slot_index,
++    int x_base_elem,
++    int y_base_elem)
+ {
+     int token_idx = get_global_id(0);
+-    y += token_idx * INTERMEDIATE_SIZE;
++    y += y_base_elem + token_idx * INTERMEDIATE_SIZE;
+ 
+     __local half x2[HIDDEN_SIZE];
+ #if HAS_ZP
+@@ -403,9 +422,18 @@ KERNEL(expert_gate_up)(
+     __local float xg_sum[1];
+ #endif
+ 
+-    load_x_interleaved(x2, xg_sum, x + token_idx * HIDDEN_SIZE, HIDDEN_SIZE);
++    load_x_interleaved(x2, xg_sum, x + x_base_elem + token_idx * HIDDEN_SIZE, HIDDEN_SIZE);
+     barrier(CLK_LOCAL_MEM_FENCE);
+ 
++    gate_weight += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 2);
++    gate_scale  += (long)slot_index * ((long)(HIDDEN_SIZE / GATE_UP_GROUP_SIZE) * INTERMEDIATE_SIZE);
++    up_weight   += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 2);
++    up_scale    += (long)slot_index * ((long)(HIDDEN_SIZE / GATE_UP_GROUP_SIZE) * INTERMEDIATE_SIZE);
++#if HAS_ZP
++    gate_zp     += (long)slot_index * ((long)(HIDDEN_SIZE / GATE_UP_GROUP_SIZE) * INTERMEDIATE_SIZE / 2);
++    up_zp       += (long)slot_index * ((long)(HIDDEN_SIZE / GATE_UP_GROUP_SIZE) * INTERMEDIATE_SIZE / 2);
++#endif
++
+ #if WEIGHT_COMPRESSEION_DT == 0
+     expert_gate_up_gemv_u4((__global uchar*)up_weight,
+                            (__global half*)up_scale,
+@@ -420,7 +448,9 @@ KERNEL(expert_gate_up)(
+                            (half*)x2, (float*)xg_sum, true);
+ #endif
+ }
++#endif  // GATE_UP_ENABLE
+ 
++#ifdef DOWN_ENABLE
+ // ===========================================================================
+ // Stage 2: down projection for a single expert.
+ //   y[n] = down(intermediate)[n] * routing_weight
+@@ -438,12 +468,16 @@ KERNEL(expert_down)(
+     const __global MOE_ZP_DT*    zps,
+     const __global MOE_DTYPE*    x,
+     const __global half*         routing_weights,
+-    __global MOE_DTYPE*          y)
++    __global MOE_DTYPE*          y,
++    int slot_index,
++    int x_base_elem,
++    int rw_base_elem,
++    int y_base_elem)
+ {
+     int token_idx = get_global_id(0);
+-    x += token_idx * INTERMEDIATE_SIZE;
+-    y += token_idx * HIDDEN_SIZE;
+-    half routing_weight_val = routing_weights[token_idx];
++    x += x_base_elem + token_idx * INTERMEDIATE_SIZE;
++    y += y_base_elem + token_idx * HIDDEN_SIZE;
++    half routing_weight_val = routing_weights[rw_base_elem + token_idx];
+ 
+     __local half x2[INTERMEDIATE_SIZE];
+ #if HAS_ZP
+@@ -455,6 +489,12 @@ KERNEL(expert_down)(
+     load_x_interleaved(x2, xg_sum, x, INTERMEDIATE_SIZE);
+     barrier(CLK_LOCAL_MEM_FENCE);
+ 
++    weight += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE / 2);
++    scales += (long)slot_index * ((long)(INTERMEDIATE_SIZE / DOWN_GROUP_SIZE) * HIDDEN_SIZE);
++#if HAS_ZP
++    zps    += (long)slot_index * ((long)(INTERMEDIATE_SIZE / DOWN_GROUP_SIZE) * HIDDEN_SIZE / 2);
++#endif
++
+ #if WEIGHT_COMPRESSEION_DT == 0
+     expert_down_gemv_u4((__global uchar*)weight,
+                         (__global half*)scales,
+@@ -464,3 +504,4 @@ KERNEL(expert_down)(
+                         (half*)x2, (float*)xg_sum);
+ #endif
+ }
++#endif  // DOWN_ENABLE

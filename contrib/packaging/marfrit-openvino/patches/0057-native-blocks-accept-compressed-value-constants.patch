@@ -1,0 +1,90 @@
+# Native expert pattern blocks accept a value Constant behind the f16->f32
+# Convert that save_model(compress_to_fp16=True) inserts, so a --dense-fp16
+# artifact's decode chains fuse instead of being constant-folded.
+#
+--- a/src/common/transformations/src/transformations/pattern_blocks/native_expert_block.cpp
++++ b/src/common/transformations/src/transformations/pattern_blocks/native_expert_block.cpp
+@@ -35,11 +35,28 @@
+ namespace v8 = ov::op::v8;
+ namespace v13 = ov::op::v13;
+ 
++namespace {
++// arcint (patch 0057): a value Constant of the decode chain, bare or behind
++// the f16->f32 Convert that ov::save_model(compress_to_fp16=True) inserts.
++// The exporter's --dense-fp16 compresses EVERY f32 Constant, including the
++// chain's grids, tables, +-1 and divisors (all exact in f16); a bare
++// wrap_type<Constant> then matched no layer of a --dense-fp16 artifact
++// (measured 2026-09-26: MOE_COMPRESSED 0 of 40 on the full-depth packed IR,
++// 4 of 4 on the uncompressed depth-4 one) and the GPU compile constant-folded
++// every chain. The kernels carry their own tables and read only the anchors.
++std::shared_ptr<ov::Node> value_const(const std::shared_ptr<ov::Node>& c) {
++    return ov::pass::pattern::optional<v0::Convert>({c});
++}
++std::shared_ptr<ov::Node> value_const() {
++    return value_const(wrap_type<v0::Constant>());
++}
++}  // namespace
++
+ // arcint (patch 0052): the IQ2_S-packed decode, the chain
+ // tools/q4e/serving_shape.py _native_packed_expert writes. See the header.
+ ov::pass::pattern::op::NativeIq2sPackedWeightsBlock::NativeIq2sPackedWeightsBlock()
+     : Block({}, {}, "NativeIq2sPackedWeightsBlock") {
+-    auto C = []() { return wrap_type<v0::Constant>(); };
++    auto C = []() { return value_const(); };
+     auto weight = wrap_type<v0::Constant>(ov::pass::pattern::type_matches(ov::element::u8));
+     // one field of the 80-byte block, carved out of the last axis
+     auto field = [&]() { return wrap_type<v8::Slice>({weight, C(), C(), C(), C()}); };
+@@ -97,7 +114,7 @@
+     auto convert = wrap_type<v0::Convert>({codes});
+     auto table = wrap_type<v0::Constant>();
+     auto axis = wrap_type<v0::Constant>();
+-    auto gather = wrap_type<v8::Gather>({table, convert, axis});
++    auto gather = wrap_type<v8::Gather>({value_const(table), convert, axis});
+     auto scale = wrap_type<v0::Constant>();
+     auto scale_f32 = ov::pass::pattern::optional<v0::Convert>({scale});  // f16 scale, f32 chain
+     auto mul = wrap_type<v1::Multiply>({gather, scale_f32});
+@@ -116,7 +133,7 @@
+     auto gridix_convert = wrap_type<v0::Convert>({gridix});
+     auto grid = wrap_type<v0::Constant>();
+     auto grid_axis = wrap_type<v0::Constant>();
+-    auto grid_gather = wrap_type<v8::Gather>({grid, gridix_convert, grid_axis});
++    auto grid_gather = wrap_type<v8::Gather>({value_const(grid), gridix_convert, grid_axis});
+     auto mag_reshape_const = wrap_type<v0::Constant>();
+     auto mag = wrap_type<v1::Reshape>({grid_gather, mag_reshape_const});
+     // the signs
+@@ -124,7 +141,7 @@
+     auto signix_convert = wrap_type<v0::Convert>({signix});
+     auto ksigns = wrap_type<v0::Constant>();
+     auto ksigns_axis = wrap_type<v0::Constant>();
+-    auto ksigns_gather = wrap_type<v8::Gather>({ksigns, signix_convert, ksigns_axis});
++    auto ksigns_gather = wrap_type<v8::Gather>({value_const(ksigns), signix_convert, ksigns_axis});
+     auto unsq_axis = wrap_type<v0::Constant>();
+     auto unsq = wrap_type<v0::Unsqueeze>({ksigns_gather, unsq_axis});
+     auto masks = wrap_type<v0::Constant>();
+@@ -133,7 +150,7 @@
+     auto neg = wrap_type<v1::Greater>({bits, zero});
+     auto minus_one = wrap_type<v0::Constant>();
+     auto plus_one = wrap_type<v0::Constant>();
+-    auto select = wrap_type<v1::Select>({neg, minus_one, plus_one});
++    auto select = wrap_type<v1::Select>({neg, value_const(minus_one), value_const(plus_one)});
+     auto sign_reshape_const = wrap_type<v0::Constant>();
+     auto sign = wrap_type<v1::Reshape>({select, sign_reshape_const});
+     // magnitudes * signs * scale
+@@ -183,7 +200,7 @@
+     auto index = wrap_type<v1::Add>({lo_conv, hi_shift});
+     auto grid = wrap_type<v0::Constant>();
+     auto grid_axis = wrap_type<v0::Constant>();
+-    auto grid_gather = wrap_type<v8::Gather>({grid, index, grid_axis});
++    auto grid_gather = wrap_type<v8::Gather>({value_const(grid), index, grid_axis});
+     auto mag_target = wrap_type<v0::Constant>();
+     auto mag = wrap_type<v1::Reshape>({grid_gather, mag_target});
+     // RAW sign bytes (bit j flips value j)
+@@ -197,7 +214,7 @@
+     auto neg = wrap_type<v1::Greater>({bits, zero});
+     auto minus_one = wrap_type<v0::Constant>();
+     auto plus_one = wrap_type<v0::Constant>();
+-    auto select = wrap_type<v1::Select>({neg, minus_one, plus_one});
++    auto select = wrap_type<v1::Select>({neg, value_const(minus_one), value_const(plus_one)});
+     auto sign_target = wrap_type<v0::Constant>();
+     auto sign = wrap_type<v1::Reshape>({select, sign_target});
+     auto mag_sign = wrap_type<v1::Multiply>({mag, sign});

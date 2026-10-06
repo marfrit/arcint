@@ -1,0 +1,679 @@
+# Per-expert dispatch, native formats: the pairs of a call grouped by expert
+# slot into tiles of up to NATIVE_TILE_M (8); one work-group row per tile
+# decodes the expert's weights once for all its pairs. Each pair keeps the
+# one-token arithmetic; its output bytes equal the per-pair and batched
+# kernels' by measurement on the A770, not by construction. The
+# default policy is grouped for calls of 64+ pairs and batched below; the
+# pairs table is written through the usm_host pointer. MOE_DISPATCH_MODE
+# selects pair|batched|grouped|auto.
+#
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
+@@ -1163,6 +1163,139 @@
+     }
+     return sub_group_reduce_add(acc);
+ }
++
++// arcint (patch 0060): the same decoders over a TILE of up to NATIVE_TILE_M
++// tokens that share one expert: each weight element is decoded once and every
++// token's lane accumulator takes the same left-to-right product, in the same
++// order, as the one-token decoder above (x * scale * magnitude * sign, per
++// format). The source does not GUARANTEE equal bytes: the plugin builds with
++// -cl-mad-enable, so contraction is the compiler's choice per kernel. That a
++// token's value does not depend on which tokens share its tile is MEASURED
++// (the dispatch cell, the served digests). out[t] for t < cnt. NATIVE_TILE_M
++// is the native generators' JIT constant (kNativeTileM on the host).
++
++inline void native_dot_iq4nl_tile(const __global uchar* W, const __global half* S, int n, int N, int K,
++                                  const __global half* x, __private const int* xb, int cnt, int id_local,
++                                  __private float* out) {
++    float acc[NATIVE_TILE_M];
++    __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) acc[t] = 0.0f;
++    for (int g = 0; g < K / 32; g++) {
++        half s = S[g * N + n];
++        const __global uchar* codes = W + n * (K / 2) + g * 16;
++        for (int j = id_local; j < 32; j += SUBGROUP_SIZE) {
++            uchar byte = codes[j >> 1];
++            int code = (j & 1) ? (byte >> 4) : (byte & 0x0F);
++            const float fs = convert_float(s);
++            const float fv = convert_float(NATIVE_IQ4NL_TABLE[code]);
++            __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
++                if (t < cnt) acc[t] += convert_float(x[xb[t] + g * 32 + j]) * fs * fv;
++        }
++    }
++    __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
++        if (t < cnt) out[t] = sub_group_reduce_add(acc[t]);
++}
++
++inline void native_dot_iq3xxs_tile(const __global uchar* W, const __global uchar* Z, const __global half* S,
++                                   int n, int N, int K, const __global half* x, __private const int* xb, int cnt,
++                                   int id_local, __private float* out) {
++    float acc[NATIVE_TILE_M];
++    __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) acc[t] = 0.0f;
++    for (int g = 0; g < K / 32; g++) {
++        half s = S[g * N + n];
++        const __global uchar* gridix = W + n * (K / 4) + g * 8;
++        const __global uchar* signix = Z + n * (K / 8) + g * 4;
++        for (int j = id_local; j < 32; j += SUBGROUP_SIZE) {
++            int l = j >> 3;
++            int m = j & 7;
++            uchar gi = (m < 4) ? gridix[2 * l] : gridix[2 * l + 1];
++            float mag = convert_float(NATIVE_IQ3XXS_GRID[gi * 4 + (m & 3)]);
++            uchar signs = NATIVE_IQ2XS_SIGNS[signix[l] & 127];
++            float sign = (signs & NATIVE_IQ2XS_MASK[m]) ? -1.0f : 1.0f;
++            const float fs = convert_float(s);
++            __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
++                if (t < cnt) acc[t] += convert_float(x[xb[t] + g * 32 + j]) * fs * mag * sign;
++        }
++    }
++    __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
++        if (t < cnt) out[t] = sub_group_reduce_add(acc[t]);
++}
++
++inline void native_dot_iq2s_tile(const __global uchar* W, const __global uchar* Z, const __global half* S,
++                                 int n, int N, int K, const __global half* x, __private const int* xb, int cnt,
++                                 int id_local, __private float* out) {
++    float acc[NATIVE_TILE_M];
++    __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) acc[t] = 0.0f;
++    for (int g = 0; g < K / 32; g++) {
++        half s0 = S[(long)n * (K / 32) * 2 + g * 2 + 0];
++        half s1 = S[(long)n * (K / 32) * 2 + g * 2 + 1];
++        const __global uchar* wrow = W + (long)n * (K / 4) + g * 8;
++        const __global uchar* zrow = Z + (long)n * (K / 8) + g * 4;
++        for (int j = id_local; j < 32; j += SUBGROUP_SIZE) {
++            int l = j >> 3;
++            int m = j & 7;
++            ushort gi = (ushort)wrow[2 * l] | ((ushort)wrow[2 * l + 1] << 8);
++            float mag = convert_float(NATIVE_IQ2S_GRID[gi * 8 + m]);
++            uchar signs = zrow[l];
++            float sign = (signs & NATIVE_IQ2XS_MASK[m]) ? -1.0f : 1.0f;
++            float s = convert_float((l < 2) ? s0 : s1);
++            __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
++                if (t < cnt) acc[t] += convert_float(x[xb[t] + g * 32 + j]) * s * mag * sign;
++        }
++    }
++    __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
++        if (t < cnt) out[t] = sub_group_reduce_add(acc[t]);
++}
++
++inline void native_dot_iq2s_packed_tile(const __global uchar* W, const __global half* S, int n, int N, int K,
++                                        const __global half* x, __private const int* xb, int cnt, int id_local,
++                                        __private float* out) {
++    float acc[NATIVE_TILE_M];
++    __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) acc[t] = 0.0f;
++    const int nblk = K / 256;
++    const __global uchar* brow = W + (long)n * nblk * 80;
++    for (int ib = 0; ib < nblk; ib++) {
++        const __global uchar* blk = brow + (long)ib * 80;
++        float d = convert_float(S[(long)n * nblk + ib]);
++        for (int ib32 = 0; ib32 < 8; ib32++) {
++            uchar scb = blk[72 + ib32];
++            float dlo = d * (0.5f + convert_float(scb & 0x0F)) * 0.25f;
++            float dhi = d * (0.5f + convert_float(scb >> 4)) * 0.25f;
++            uchar qhb = blk[64 + ib32];
++            for (int j = id_local; j < 32; j += SUBGROUP_SIZE) {
++                int l = j >> 3;
++                int m = j & 7;
++                ushort gi = (ushort)blk[ib32 * 4 + l] | ((ushort)((qhb >> (2 * l)) & 3) << 8);
++                float mag = convert_float(NATIVE_IQ2S_GRID[gi * 8 + m]);
++                uchar signs = blk[32 + ib32 * 4 + l];
++                float sign = (signs & NATIVE_IQ2XS_MASK[m]) ? -1.0f : 1.0f;
++                float dd = (l < 2) ? dlo : dhi;
++                __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
++                    if (t < cnt) acc[t] += convert_float(x[xb[t] + ib * 256 + ib32 * 32 + j]) * dd * mag * sign;
++            }
++        }
++    }
++    __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
++        if (t < cnt) out[t] = sub_group_reduce_add(acc[t]);
++}
++
++inline void native_dot_q8_0_tile(const __global uchar* W, const __global half* S, int n, int N, int K,
++                                 const __global half* x, __private const int* xb, int cnt, int id_local,
++                                 __private float* out) {
++    float acc[NATIVE_TILE_M];
++    __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) acc[t] = 0.0f;
++    for (int g = 0; g < K / 32; g++) {
++        half s = S[g * N + n];
++        const __global char* codes = (const __global char*)(W + n * K + g * 32);
++        for (int j = id_local; j < 32; j += SUBGROUP_SIZE) {
++            const float fs = convert_float(s);
++            const float fc = convert_float(codes[j]);
++            __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
++                if (t < cnt) acc[t] += convert_float(x[xb[t] + g * 32 + j]) * fs * fc;
++        }
++    }
++    __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
++        if (t < cnt) out[t] = sub_group_reduce_add(acc[t]);
++}
+ #endif  // ARCINT_NATIVE_DECODE_DEFINED
+ #endif  // NATIVE_GATE_UP_ENABLE || NATIVE_DOWN_ENABLE
+ #endif  // ARCINT_PER_EXPERT_CL_HELPERS_DEFINED
+@@ -1298,9 +1431,13 @@
+ // scale is read from the device-transposed [groups, oc] array.
+ // ===========================================================================
+ #ifdef NATIVE_GATE_UP_ENABLE
+-// arcint (patch 0059): the body of one (token, expert) pair, shared by the
+-// per-pair kernel and the batched one; FUNC() names it per compiled source
+-// (the kernel cache batches several sources, whose native formats differ).
++// arcint (patches 0059/0060): the body over a TILE -- one expert slot and up to
++// NATIVE_TILE_M (token, expert) pairs of it. xb[t] / yb[t] are pair t's x and y
++// element bases. The per-pair and batched entries pass a tile of one, which is
++// the one-token arithmetic exactly; the grouped entry passes the pairs of one
++// expert together, so the weights are read and decoded once for all of them.
++// FUNC() names the body per compiled source (the kernel cache batches sources
++// whose native formats differ).
+ inline void FUNC(expert_gate_up_native_body)(
+     const __global MOE_WEI_DT*   gate_weight,
+     const __global MOE_SCALE_DT* gate_scale,
+@@ -1311,9 +1448,9 @@
+     const __global MOE_DTYPE*    x,
+     __global MOE_DTYPE*          y,
+     int slot_index,
+-    int x_base_elem,
+-    int y_base_elem,
+-    int token_idx)
++    __private const int*         xb,
++    __private const int*         yb,
++    int cnt)
+ {
+     const int id_local = get_sub_group_local_id();
+     const int n_start = get_global_id(2) * N_BLOCK;
+@@ -1350,62 +1487,34 @@
+     up_scale   += (long)slot_index * ((long)(HIDDEN_SIZE / GATE_UP_GROUP_SIZE) * INTERMEDIATE_SIZE);
+ #endif
+ 
+-    const int x_base = x_base_elem + token_idx * HIDDEN_SIZE;
+-    __global MOE_DTYPE* yrow = y + y_base_elem + token_idx * INTERMEDIATE_SIZE;
+ 
+     const int n_end = min(n_start + N_BLOCK, INTERMEDIATE_SIZE);
+     for (int n = n_start; n < n_end; n++) {
+-        float su, sg;
++        float su[NATIVE_TILE_M], sg[NATIVE_TILE_M];
+ #if NATIVE_GU_FORMAT == 2
+-        su = native_dot_iq3xxs((const __global uchar*)up_weight,
+-                               (const __global uchar*)up_zp,
+-                               (const __global half*)up_scale,
+-                               n, INTERMEDIATE_SIZE, HIDDEN_SIZE,
+-                               (const __global half*)x, x_base, id_local);
+-        sg = native_dot_iq3xxs((const __global uchar*)gate_weight,
+-                               (const __global uchar*)gate_zp,
+-                               (const __global half*)gate_scale,
+-                               n, INTERMEDIATE_SIZE, HIDDEN_SIZE,
+-                               (const __global half*)x, x_base, id_local);
++        native_dot_iq3xxs_tile((const __global uchar*)up_weight, (const __global uchar*)up_zp, (const __global half*)up_scale, n, INTERMEDIATE_SIZE, HIDDEN_SIZE, (const __global half*)x, xb, cnt, id_local, su);
++        native_dot_iq3xxs_tile((const __global uchar*)gate_weight, (const __global uchar*)gate_zp, (const __global half*)gate_scale, n, INTERMEDIATE_SIZE, HIDDEN_SIZE, (const __global half*)x, xb, cnt, id_local, sg);
+ #elif NATIVE_GU_FORMAT == 5
+-        su = native_dot_iq2s_packed((const __global uchar*)up_weight,
+-                                    (const __global half*)up_scale,
+-                                    n, INTERMEDIATE_SIZE, HIDDEN_SIZE,
+-                                    (const __global half*)x, x_base, id_local);
+-        sg = native_dot_iq2s_packed((const __global uchar*)gate_weight,
+-                                    (const __global half*)gate_scale,
+-                                    n, INTERMEDIATE_SIZE, HIDDEN_SIZE,
+-                                    (const __global half*)x, x_base, id_local);
++        native_dot_iq2s_packed_tile((const __global uchar*)up_weight, (const __global half*)up_scale, n, INTERMEDIATE_SIZE, HIDDEN_SIZE, (const __global half*)x, xb, cnt, id_local, su);
++        native_dot_iq2s_packed_tile((const __global uchar*)gate_weight, (const __global half*)gate_scale, n, INTERMEDIATE_SIZE, HIDDEN_SIZE, (const __global half*)x, xb, cnt, id_local, sg);
+ #elif NATIVE_GU_FORMAT == 4
+-        su = native_dot_iq2s((const __global uchar*)up_weight,
+-                             (const __global uchar*)up_zp,
+-                             (const __global half*)up_scale,
+-                             n, INTERMEDIATE_SIZE, HIDDEN_SIZE,
+-                             (const __global half*)x, x_base, id_local);
+-        sg = native_dot_iq2s((const __global uchar*)gate_weight,
+-                             (const __global uchar*)gate_zp,
+-                             (const __global half*)gate_scale,
+-                             n, INTERMEDIATE_SIZE, HIDDEN_SIZE,
+-                             (const __global half*)x, x_base, id_local);
++        native_dot_iq2s_tile((const __global uchar*)up_weight, (const __global uchar*)up_zp, (const __global half*)up_scale, n, INTERMEDIATE_SIZE, HIDDEN_SIZE, (const __global half*)x, xb, cnt, id_local, su);
++        native_dot_iq2s_tile((const __global uchar*)gate_weight, (const __global uchar*)gate_zp, (const __global half*)gate_scale, n, INTERMEDIATE_SIZE, HIDDEN_SIZE, (const __global half*)x, xb, cnt, id_local, sg);
+ #else
+-        su = native_dot_iq4nl((const __global uchar*)up_weight,
+-                              (const __global half*)up_scale,
+-                              n, INTERMEDIATE_SIZE, HIDDEN_SIZE,
+-                              (const __global half*)x, x_base, id_local);
+-        sg = native_dot_iq4nl((const __global uchar*)gate_weight,
+-                              (const __global half*)gate_scale,
+-                              n, INTERMEDIATE_SIZE, HIDDEN_SIZE,
+-                              (const __global half*)x, x_base, id_local);
++        native_dot_iq4nl_tile((const __global uchar*)up_weight, (const __global half*)up_scale, n, INTERMEDIATE_SIZE, HIDDEN_SIZE, (const __global half*)x, xb, cnt, id_local, su);
++        native_dot_iq4nl_tile((const __global uchar*)gate_weight, (const __global half*)gate_scale, n, INTERMEDIATE_SIZE, HIDDEN_SIZE, (const __global half*)x, xb, cnt, id_local, sg);
+ #endif
+         if (id_local == 0) {
+-            yrow[n] = (MOE_DTYPE)(su * MOE_GATE_ACT(sg));
++            __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
++                if (t < cnt) y[yb[t] + n] = (MOE_DTYPE)(su[t] * MOE_GATE_ACT(sg[t]));
+         }
+     }
+ }
+ 
+ // KERNEL() names the generator's own entry point, so a source carries exactly
+-// one of the two entries: NATIVE_BATCHED selects the batched one (patch 0059).
+-#ifndef NATIVE_BATCHED
++// one entry: NATIVE_DISPATCH_KIND 0 = per pair, 1 = batched (0059), 2 = grouped
++// by expert (0060).
++#if !defined(NATIVE_DISPATCH_KIND) || NATIVE_DISPATCH_KIND == 0
+ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE)))
+ KERNEL(expert_gate_up_native)(
+     const __global MOE_WEI_DT*   gate_weight,
+@@ -1420,16 +1529,14 @@
+     int x_base_elem,
+     int y_base_elem)
+ {
+-    FUNC_CALL(expert_gate_up_native_body)(gate_weight, gate_scale, gate_zp, up_weight, up_scale, up_zp, x, y, slot_index, x_base_elem, y_base_elem,
+-                                          get_global_id(0));
++    const int token_idx = get_global_id(0);
++    int xb[NATIVE_TILE_M] = {x_base_elem + token_idx * HIDDEN_SIZE};
++    int yb[NATIVE_TILE_M] = {y_base_elem + token_idx * INTERMEDIATE_SIZE};
++    FUNC_CALL(expert_gate_up_native_body)(gate_weight, gate_scale, gate_zp, up_weight, up_scale, up_zp, x, y, slot_index, xb, yb, 1);
+ }
+-
+-#else
+-// arcint (patch 0059): every (token, expert) pair of a call in ONE launch.
+-// Work-group row p reads its pair from `pairs` (slot, flat id, top-k
+-// position, 3 ints a pair); the per-pair arithmetic is the body above, so a
+-// pair computes exactly what the per-pair launch computed. The per-pair form
+-// cost two launches a pair -- 16,384 per MoE layer for a 1,024-token chunk.
++#elif NATIVE_DISPATCH_KIND == 1
++// arcint (patch 0059): every (token, expert) pair of a call in ONE launch; row
++// p reads its pair (slot, flat id, top-k position) from `pairs`.
+ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE)))
+ KERNEL(expert_gate_up_native_batched)(
+     const __global MOE_WEI_DT*   gate_weight,
+@@ -1444,13 +1551,39 @@
+     int experts_per_token)
+ {
+     const int p = get_global_id(0);
+-    const int slot = pairs[3 * p];
+     const int flat = pairs[3 * p + 1];
+-    FUNC_CALL(expert_gate_up_native_body)(gate_weight, gate_scale, gate_zp, up_weight, up_scale, up_zp, x, y, slot,
+-                                          (flat / experts_per_token) * HIDDEN_SIZE,
+-                                          flat * INTERMEDIATE_SIZE, 0);
++    int xb[NATIVE_TILE_M] = {(flat / experts_per_token) * HIDDEN_SIZE};
++    int yb[NATIVE_TILE_M] = {flat * INTERMEDIATE_SIZE};
++    FUNC_CALL(expert_gate_up_native_body)(gate_weight, gate_scale, gate_zp, up_weight, up_scale, up_zp, x, y, pairs[3 * p], xb, yb, 1);
++}
++#else
++// arcint (patch 0060): one work-group row per TILE -- a slot and up to
++// NATIVE_TILE_M of its pairs: tiles[(2 + 2*TILE_M) * p] = slot, count, then
++// (flat id, top-k position) per member.
++__attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE)))
++KERNEL(expert_gate_up_native_grouped)(
++    const __global MOE_WEI_DT*   gate_weight,
++    const __global MOE_SCALE_DT* gate_scale,
++    const __global MOE_ZP_DT*    gate_zp,
++    const __global MOE_WEI_DT*   up_weight,
++    const __global MOE_SCALE_DT* up_scale,
++    const __global MOE_ZP_DT*    up_zp,
++    const __global MOE_DTYPE*    x,
++    const __global int*          tiles,     // an INPUT: bound before the output
++    __global MOE_DTYPE*          y,
++    int experts_per_token)
++{
++    const __global int* tile = tiles + (2 + 2 * NATIVE_TILE_M) * get_global_id(0);
++    const int cnt = tile[1];
++    int xb[NATIVE_TILE_M], yb[NATIVE_TILE_M];
++    __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) {
++        const int flat = t < cnt ? tile[2 + 2 * t] : 0;
++        xb[t] = (flat / experts_per_token) * HIDDEN_SIZE;
++        yb[t] = flat * INTERMEDIATE_SIZE;
++    }
++    FUNC_CALL(expert_gate_up_native_body)(gate_weight, gate_scale, gate_zp, up_weight, up_scale, up_zp, x, y, tile[0], xb, yb, cnt);
+ }
+-#endif  // NATIVE_BATCHED
++#endif  // NATIVE_DISPATCH_KIND
+ #endif  // NATIVE_GATE_UP_ENABLE
+ 
+ #ifdef NATIVE_DOWN_ENABLE
+@@ -1462,14 +1595,13 @@
+     const __global half*         routing_weights,
+     __global MOE_DTYPE*          y,
+     int slot_index,
+-    int x_base_elem,
+-    int rw_base_elem,
+-    int y_base_elem,
+-    int token_idx)
++    __private const int*         xb,
++    __private const int*         rwb,
++    __private const int*         yb,
++    int cnt)
+ {
+     const int id_local = get_sub_group_local_id();
+     const int n_start = get_global_id(2) * N_BLOCK;
+-    const half routing_weight_val = routing_weights[rw_base_elem + token_idx];
+ 
+ #if NATIVE_DOWN_FORMAT == 2   // IQ3_XXS: u8 grid indices (K/4) + u8 sign indices (K/8)
+     weight += (long)slot_index * ((long)HIDDEN_SIZE * INTERMEDIATE_SIZE / 4);
+@@ -1497,47 +1629,29 @@
+     scales += (long)slot_index * ((long)(INTERMEDIATE_SIZE / DOWN_GROUP_SIZE) * HIDDEN_SIZE);
+ #endif
+ 
+-    const int x_base = x_base_elem + token_idx * INTERMEDIATE_SIZE;
+-    __global MOE_DTYPE* yrow = y + y_base_elem + token_idx * HIDDEN_SIZE;
+ 
+     const int n_end = min(n_start + N_BLOCK, HIDDEN_SIZE);
+     for (int n = n_start; n < n_end; n++) {
+-        float acc;
++        float acc[NATIVE_TILE_M];
+ #if NATIVE_DOWN_FORMAT == 2
+-        acc = native_dot_iq3xxs((const __global uchar*)weight,
+-                                (const __global uchar*)zps,
+-                                (const __global half*)scales,
+-                                n, HIDDEN_SIZE, INTERMEDIATE_SIZE,
+-                                (const __global half*)x, x_base, id_local);
++        native_dot_iq3xxs_tile((const __global uchar*)weight, (const __global uchar*)zps, (const __global half*)scales, n, HIDDEN_SIZE, INTERMEDIATE_SIZE, (const __global half*)x, xb, cnt, id_local, acc);
+ #elif NATIVE_DOWN_FORMAT == 5
+-        acc = native_dot_iq2s_packed((const __global uchar*)weight,
+-                                     (const __global half*)scales,
+-                                     n, HIDDEN_SIZE, INTERMEDIATE_SIZE,
+-                                     (const __global half*)x, x_base, id_local);
++        native_dot_iq2s_packed_tile((const __global uchar*)weight, (const __global half*)scales, n, HIDDEN_SIZE, INTERMEDIATE_SIZE, (const __global half*)x, xb, cnt, id_local, acc);
+ #elif NATIVE_DOWN_FORMAT == 4
+-        acc = native_dot_iq2s((const __global uchar*)weight,
+-                              (const __global uchar*)zps,
+-                              (const __global half*)scales,
+-                              n, HIDDEN_SIZE, INTERMEDIATE_SIZE,
+-                              (const __global half*)x, x_base, id_local);
++        native_dot_iq2s_tile((const __global uchar*)weight, (const __global uchar*)zps, (const __global half*)scales, n, HIDDEN_SIZE, INTERMEDIATE_SIZE, (const __global half*)x, xb, cnt, id_local, acc);
+ #elif NATIVE_DOWN_FORMAT == 3
+-        acc = native_dot_q8_0((const __global uchar*)weight,
+-                              (const __global half*)scales,
+-                              n, HIDDEN_SIZE, INTERMEDIATE_SIZE,
+-                              (const __global half*)x, x_base, id_local);
++        native_dot_q8_0_tile((const __global uchar*)weight, (const __global half*)scales, n, HIDDEN_SIZE, INTERMEDIATE_SIZE, (const __global half*)x, xb, cnt, id_local, acc);
+ #else
+-        acc = native_dot_iq4nl((const __global uchar*)weight,
+-                               (const __global half*)scales,
+-                               n, HIDDEN_SIZE, INTERMEDIATE_SIZE,
+-                               (const __global half*)x, x_base, id_local);
++        native_dot_iq4nl_tile((const __global uchar*)weight, (const __global half*)scales, n, HIDDEN_SIZE, INTERMEDIATE_SIZE, (const __global half*)x, xb, cnt, id_local, acc);
+ #endif
+         if (id_local == 0) {
+-            yrow[n] = (MOE_DTYPE)(acc * convert_float(routing_weight_val));
++            __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++)
++                if (t < cnt) y[yb[t] + n] = (MOE_DTYPE)(acc[t] * convert_float(routing_weights[rwb[t]]));
+         }
+     }
+ }
+ 
+-#ifndef NATIVE_BATCHED
++#if !defined(NATIVE_DISPATCH_KIND) || NATIVE_DISPATCH_KIND == 0
+ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE)))
+ KERNEL(expert_down_native)(
+     const __global MOE_WEI_DT*   weight,
+@@ -1551,12 +1665,13 @@
+     int rw_base_elem,
+     int y_base_elem)
+ {
+-    FUNC_CALL(expert_down_native_body)(weight, scales, zps, x, routing_weights, y, slot_index, x_base_elem, rw_base_elem,
+-                                       y_base_elem, get_global_id(0));
++    const int token_idx = get_global_id(0);
++    int xb[NATIVE_TILE_M] = {x_base_elem + token_idx * INTERMEDIATE_SIZE};
++    int rwb[NATIVE_TILE_M] = {rw_base_elem + token_idx};
++    int yb[NATIVE_TILE_M] = {y_base_elem + token_idx * HIDDEN_SIZE};
++    FUNC_CALL(expert_down_native_body)(weight, scales, zps, x, routing_weights, y, slot_index, xb, rwb, yb, 1);
+ }
+-
+-#else
+-// arcint (patch 0059): the batched down, as the batched gate/up above.
++#elif NATIVE_DISPATCH_KIND == 1
+ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE)))
+ KERNEL(expert_down_native_batched)(
+     const __global MOE_WEI_DT*   weight,
+@@ -1570,12 +1685,36 @@
+     int max_topk)
+ {
+     const int p = get_global_id(0);
+-    const int slot = pairs[3 * p];
+     const int flat = pairs[3 * p + 1];
+-    const int topk_pos = pairs[3 * p + 2];
+-    const int token = flat / experts_per_token;
+-    FUNC_CALL(expert_down_native_body)(weight, scales, zps, x, routing_weights, y, slot, flat * INTERMEDIATE_SIZE,
+-                                       token * max_topk + topk_pos, flat * HIDDEN_SIZE, 0);
++    int xb[NATIVE_TILE_M] = {flat * INTERMEDIATE_SIZE};
++    int rwb[NATIVE_TILE_M] = {(flat / experts_per_token) * max_topk + pairs[3 * p + 2]};
++    int yb[NATIVE_TILE_M] = {flat * HIDDEN_SIZE};
++    FUNC_CALL(expert_down_native_body)(weight, scales, zps, x, routing_weights, y, pairs[3 * p], xb, rwb, yb, 1);
++}
++#else
++__attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE)))
++KERNEL(expert_down_native_grouped)(
++    const __global MOE_WEI_DT*   weight,
++    const __global MOE_SCALE_DT* scales,
++    const __global MOE_ZP_DT*    zps,
++    const __global MOE_DTYPE*    x,
++    const __global half*         routing_weights,
++    const __global int*          tiles,     // an INPUT: bound before the output
++    __global MOE_DTYPE*          y,
++    int experts_per_token,
++    int max_topk)
++{
++    const __global int* tile = tiles + (2 + 2 * NATIVE_TILE_M) * get_global_id(0);
++    const int cnt = tile[1];
++    int xb[NATIVE_TILE_M], rwb[NATIVE_TILE_M], yb[NATIVE_TILE_M];
++    __attribute__((opencl_unroll_hint)) for (int t = 0; t < NATIVE_TILE_M; t++) {
++        const int flat = t < cnt ? tile[2 + 2 * t] : 0;
++        const int topk = t < cnt ? tile[3 + 2 * t] : 0;
++        xb[t] = flat * INTERMEDIATE_SIZE;
++        rwb[t] = (flat / experts_per_token) * max_topk + topk;
++        yb[t] = flat * HIDDEN_SIZE;
++    }
++    FUNC_CALL(expert_down_native_body)(weight, scales, zps, x, routing_weights, y, tile[0], xb, rwb, yb, cnt);
+ }
+-#endif  // NATIVE_BATCHED
++#endif  // NATIVE_DISPATCH_KIND
+ #endif  // NATIVE_DOWN_ENABLE
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -5,6 +5,7 @@
+ #include <chrono>
+ #include <iostream>
+ #include <cstdlib>
++#include <numeric>  // std::iota for the grouped dispatch (arcint 0060)
+ #include <cstring>
+ #include <fstream>
+ #include <map>
+@@ -591,20 +592,33 @@
+ // expert weights are the checkpoint's own blocks (IQ4_NL / IQ3_XXS / Q8_0),
+ // decoded in the K-loop. The kernels are compiled only when per-expert
+ // dispatch is on and the config carries a native weight format.
++// arcint (patches 0059/0060): the native per-expert entries by dispatch kind --
++// 0 one (token, expert) pair per launch, 1 every pair in one launch, 2 the
++// pairs grouped by expert into tiles. One entry per compiled source: KERNEL()
++// names the generator's entry point.
++inline const char* native_entry(const char* base, int kind) {
++    static const char* const gu[] = {"expert_gate_up_native", "expert_gate_up_native_batched",
++                                     "expert_gate_up_native_grouped"};
++    static const char* const dn[] = {"expert_down_native", "expert_down_native_batched",
++                                     "expert_down_native_grouped"};
++    return (std::string(base) == "gate_up" ? gu : dn)[kind];
++}
++// Pairs per tile of the grouped kernels; moe_expert_swiglu.cl NATIVE_TILE_M.
++constexpr int kNativeTileM = 8;
++
+ class MoEExpertGateUpNative : public KernelGenerator {
+-    bool _batched = false;
++    int _kind = 0;
+ public:
+-    // arcint (patch 0059): the batched entry shares this generator's JIT
+-    explicit MoEExpertGateUpNative(bool batched = false)
+-        : KernelGenerator("moe_expert_swiglu", batched ? "expert_gate_up_native_batched" : "expert_gate_up_native"),
+-          _batched(batched) {}
++    explicit MoEExpertGateUpNative(int kind = 0)
++        : KernelGenerator("moe_expert_swiglu", native_entry("gate_up", kind)),
++          _kind(kind) {}
+ protected:
+     JitConstants get_jit_constants(const RuntimeParams& params) const override {
+         auto jit = KernelGenerator::get_jit_constants(params);
+         add_common_consts(params, jit);
+         jit.make("NATIVE_GATE_UP_ENABLE", 1);
+-        if (_batched)
+-            jit.make("NATIVE_BATCHED", 1);
++        jit.make("NATIVE_DISPATCH_KIND", _kind);
++        jit.make("NATIVE_TILE_M", kNativeTileM);
+         auto desc = params.typed_desc<moe_3gemm_fused_compressed>();
+         // A gate/up projection is IQ3_XXS (2) or IQ4_XS-in-the-IQ4_NL-layout
+         // (1); Q8_0 is a down format in this checkpoint. Refuse a decode the
+@@ -629,18 +643,18 @@
+ };
+ 
+ class MoEExpertDownNative : public KernelGenerator {
+-    bool _batched = false;
++    int _kind = 0;
+ public:
+-    explicit MoEExpertDownNative(bool batched = false)
+-        : KernelGenerator("moe_expert_swiglu", batched ? "expert_down_native_batched" : "expert_down_native"),
+-          _batched(batched) {}
++    explicit MoEExpertDownNative(int kind = 0)
++        : KernelGenerator("moe_expert_swiglu", native_entry("down", kind)),
++          _kind(kind) {}
+ protected:
+     JitConstants get_jit_constants(const RuntimeParams& params) const override {
+         auto jit = KernelGenerator::get_jit_constants(params);
+         add_common_consts(params, jit);
+         jit.make("NATIVE_DOWN_ENABLE", 1);
+-        if (_batched)
+-            jit.make("NATIVE_BATCHED", 1);
++        jit.make("NATIVE_DISPATCH_KIND", _kind);
++        jit.make("NATIVE_TILE_M", kNativeTileM);
+         auto desc = params.typed_desc<moe_3gemm_fused_compressed>();
+         // Native down formats in this checkpoint: IQ4_NL (1; IQ4_XS shares the
+         // layout), IQ3_XXS (2), Q8_0 (3). The .cl's #else branch is IQ4_NL, so
+@@ -942,8 +956,12 @@
+     // arcint (patch 0059): every (token, expert) pair of a call in one launch
+     // per stage, the pairs read from _dispatch_pairs.
+     Stage::Ptr _expert_gate_up_native_batched_stage =
+-        make_stage<MoEExpertGateUpNative>(true);
+-    Stage::Ptr _expert_down_native_batched_stage = make_stage<MoEExpertDownNative>(true);
++        make_stage<MoEExpertGateUpNative>(1);
++    Stage::Ptr _expert_down_native_batched_stage = make_stage<MoEExpertDownNative>(1);
++    // arcint (patch 0060): the pairs grouped by expert, the weights decoded once
++    // per tile of up to kNativeTileM pairs
++    Stage::Ptr _expert_gate_up_native_grouped_stage = make_stage<MoEExpertGateUpNative>(2);
++    Stage::Ptr _expert_down_native_grouped_stage = make_stage<MoEExpertDownNative>(2);
+     memory::ptr _dispatch_pairs;
+     struct PerExpertGpuDispatch {
+         size_t slot_index;
+@@ -2033,6 +2051,8 @@
+                     add_stage(_expert_down_native_stage, params);
+                     add_stage(_expert_gate_up_native_batched_stage, params);
+                     add_stage(_expert_down_native_batched_stage, params);
++                    add_stage(_expert_gate_up_native_grouped_stage, params);
++                    add_stage(_expert_down_native_grouped_stage, params);
+                 } else {
+                     add_stage(_expert_gate_up_stage, params);
+                     add_stage(_expert_down_stage, params);
+@@ -2752,9 +2772,95 @@
+             // on them). The table is rewritten only after this layer's blocking
+             // top-k readback, which on the in-order queue has already waited for
+             // every earlier launch -- so no kernel still reads it.
+-            // MOE_PER_PAIR_DISPATCH=1 restores the per-pair launches (the A/B).
+-            static const bool per_pair_dispatch = std::getenv("MOE_PER_PAIR_DISPATCH") != nullptr;
+-            if (_per_expert_dispatch && !_gpu_dispatches.empty() && _native_tier_only && !per_pair_dispatch) {
++            // MOE_DISPATCH_MODE=pair|batched|grouped|auto selects the launch form
++            // (the A/B); MOE_PER_PAIR_DISPATCH=1 is pair, as in 0059. auto, the
++            // default (patch 0060): grouped for a call with at least
++            // kGroupedMinPairs pairs (a prefill chunk), batched below it (a
++            // decode step) -- measured on the A770, grouped leads at prefill and
++            // trails at decode. Every mode computes a pair's output with the same
++            // arithmetic; the same bytes by measurement (see the .cl tile
++            // comment), so on the A770 the choice has not moved an answer.
++            constexpr size_t kGroupedMinPairs = 64;
++            static const int dispatch_setting = [] {
++                if (std::getenv("MOE_PER_PAIR_DISPATCH") != nullptr) return 0;
++                const char* m = std::getenv("MOE_DISPATCH_MODE");
++                if (m == nullptr) return 3;
++                const std::string v(m);
++                OPENVINO_ASSERT(v == "pair" || v == "batched" || v == "grouped" || v == "auto",
++                                "MOE_DISPATCH_MODE must be pair, batched, grouped or auto; got ", v);
++                return v == "pair" ? 0 : v == "batched" ? 1 : v == "grouped" ? 2 : 3;
++            }();
++            const int dispatch_mode = dispatch_setting != 3 ? dispatch_setting
++                                                            : (_gpu_dispatches.size() >= kGroupedMinPairs ? 2 : 1);
++            // arcint (patch 0060): the table is written through the usm_host
++            // pointer, not a queued copy (a blocking copy_from on the in-order
++            // queue waited for this call's own earlier launches first).
++            auto write_table = [&](const std::vector<int32_t>& table) {
++                const size_t bytes = table.size() * sizeof(int32_t);
++                if (!_dispatch_pairs || _dispatch_pairs->size() < bytes) {
++                    auto layout = cldnn::layout({1, 1, 1, static_cast<ov::Dimension::value_type>(bytes)},
++                                                ov::element::i8, cldnn::format::bfyx);
++                    _dispatch_pairs = instance.get_network().get_engine().allocate_memory(layout, allocation_type::usm_host, false);
++                }
++                cldnn::mem_lock<int32_t, mem_lock_type::write> lock(_dispatch_pairs, stream);
++                std::memcpy(lock.data(), table.data(), bytes);
++            };
++            if (_per_expert_dispatch && !_gpu_dispatches.empty() && _native_tier_only && dispatch_mode == 2) {
++                // arcint (patch 0060). The pairs grouped by expert slot (stable,
++                // so a slot's pairs keep their order) and cut into tiles of up to
++                // kNativeTileM; one work-group row per tile decodes the expert's
++                // weights once for all its pairs. A pair's own arithmetic is the
++                // one-token body's, whichever pairs share its tile.
++                auto hs_mem = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
++                const auto& w = instance._weights;
++                std::vector<uint32_t> order(_gpu_dispatches.size());
++                std::iota(order.begin(), order.end(), 0u);
++                std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
++                    return _gpu_dispatches[a].slot_index < _gpu_dispatches[b].slot_index;
++                });
++                const size_t stride = 2 + 2 * kNativeTileM;
++                std::vector<int32_t> tiles;
++                tiles.reserve((order.size() + 1) * stride);
++                for (size_t i = 0; i < order.size();) {
++                    const size_t slot = _gpu_dispatches[order[i]].slot_index;
++                    size_t j = i;
++                    while (j < order.size() && j - i < static_cast<size_t>(kNativeTileM) &&
++                           _gpu_dispatches[order[j]].slot_index == slot)
++                        ++j;
++                    const size_t at = tiles.size();
++                    tiles.resize(at + stride, 0);
++                    tiles[at] = static_cast<int32_t>(slot);
++                    tiles[at + 1] = static_cast<int32_t>(j - i);
++                    for (size_t k = i; k < j; ++k) {
++                        tiles[at + 2 + 2 * (k - i)] = _gpu_dispatches[order[k]].flat_id;
++                        tiles[at + 3 + 2 * (k - i)] = _gpu_dispatches[order[k]].topk_position;
++                    }
++                    i = j;
++                }
++                write_table(tiles);
++                const size_t n_tiles = tiles.size() / stride;
++                execute_stage({ret_event},
++                              instance,
++                              *_expert_gate_up_native_grouped_stage,
++                              {w.gate_w, w.gate_s, w.gate_z, w.up_w, w.up_s, w.up_z, hs_mem, _dispatch_pairs},
++                              {scratch.up},
++                              {n_tiles, subgroup_size, static_cast<size_t>(_intermediate_size / N_BLOCK)},
++                              {1, subgroup_size, SUBGROUP_NUM},
++                              false,
++                              {static_cast<int>(_experts_per_token)});
++                execute_stage({ret_event},
++                              instance,
++                              *_expert_down_native_grouped_stage,
++                              {w.down_w, w.down_s, w.down_z, scratch.up, routing_mem_ptr, _dispatch_pairs},
++                              {scratch.y},
++                              {n_tiles, subgroup_size, static_cast<size_t>(_hidden_size / N_BLOCK)},
++                              {1, subgroup_size, SUBGROUP_NUM},
++                              false,
++                              {static_cast<int>(_experts_per_token), static_cast<int>(_max_topk)});
++                if (auto* perf = moe_otd::get_perf_counters()) {
++                    perf->per_expert_gpu_invocations.fetch_add(2, std::memory_order_relaxed);
++                }
++            } else if (_per_expert_dispatch && !_gpu_dispatches.empty() && _native_tier_only && dispatch_mode == 1) {
+                 auto hs_mem = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
+                 const auto& w = instance._weights;
+                 std::vector<int32_t> pairs(_gpu_dispatches.size() * 3);
+@@ -2763,13 +2869,7 @@
+                     pairs[3 * i + 1] = _gpu_dispatches[i].flat_id;
+                     pairs[3 * i + 2] = _gpu_dispatches[i].topk_position;
+                 }
+-                const size_t table_bytes = pairs.size() * sizeof(int32_t);
+-                if (!_dispatch_pairs || _dispatch_pairs->size() < table_bytes) {
+-                    auto layout = cldnn::layout({1, 1, 1, static_cast<ov::Dimension::value_type>(table_bytes)},
+-                                                ov::element::i8, cldnn::format::bfyx);
+-                    _dispatch_pairs = instance.get_network().get_engine().allocate_memory(layout, allocation_type::usm_host, false);
+-                }
+-                _dispatch_pairs->copy_from(stream, pairs.data(), 0, 0, table_bytes, true);
++                write_table(pairs);
+                 const size_t n_pairs = _gpu_dispatches.size();
+                 execute_stage({ret_event},
+                               instance,

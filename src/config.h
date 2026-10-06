@@ -14,6 +14,38 @@ struct Config {
     // Exactly one of these selects what gets served.
     std::string model_path;  // OpenVINO IR directory (M1+)
     std::string gguf_path;   // --gguf: weights from this GGUF, --model as the topology template (0.4.0)
+    // --engine: "ov" (the OpenVINO executor, --model an IR directory) or
+    // "llama" (ggml's OpenCL backend through libllama; the model is --gguf).
+    // The default: "llama" for --gguf without --model, else "ov".
+    std::string engine;
+    // --llama-cpu-moe N: on the libllama engine, the experts of the first N
+    // layers stay in host memory (memory-mapped from the GGUF) and llama.cpp's
+    // CPU backend computes them -- a model whose experts exceed VRAM.
+    // --llama-threads N: that backend's threads (0: half the hardware threads,
+    // the physical cores on SMT hosts).
+    // --llama-mtp N: up to N tokens drafted per verify by the GGUF's own MTP
+    // head (llama.cpp's draft-mtp); 0 off. A verify of N + 1 rows.
+    int llama_cpu_moe = 0;
+    int llama_threads = 0;
+    int llama_mtp     = 0;
+    // --llama-mtp-vocab FILE: the token ids the MTP head may draft (int32,
+    // or a JSON list); the draft steps then read those rows of the output
+    // head instead of all of them
+    std::string llama_mtp_vocab;
+    // --llama-kv K[:V]: the libllama engine's attention cache types, f16,
+    // q8_0 or q8_0:q4_0 (V defaults to K). Quantized K/V run on the Intel
+    // attention kernels of contrib/llama.cpp 0015.
+    std::string llama_kv_k = "f16";
+    std::string llama_kv_v = "f16";
+    // --llama-checkpoints N / --llama-checkpoint-step T: per lane, up to N
+    // snapshots of the state llama.cpp cannot roll back (a hybrid model's
+    // recurrent layers), taken where llama.cpp's server takes its context
+    // checkpoints (near the prompt's end, at the last user message, at
+    // earlier user messages T apart; 32 a slot, 8192), so a request sharing
+    // a prefix with an earlier one resumes from the newest snapshot inside it
+    // instead of prefilling from token 0. 0 off.
+    int llama_checkpoints     = 32;
+    int llama_checkpoint_step = 8192;
     std::string flash_next_ngram_path;  // --flash-next-ngram: FIX D per_layer_token_embd table (24-byte ARCINGRM header + block-quantised payload); admitted only when the artifact's config.json declares an n-gram table (docs/design-qwen-flash-next.md FIX D Link 2)
     // --ngram-gguf: the GGUF shard whose per_layer_token_embd.weight binds a
     // serving-shape IR's `ngram_table.K` ports (backend_ov.cpp
@@ -147,6 +179,11 @@ struct Config {
     // stream on demand. 0 = everything resident. This is what lets a model that
     // does not fit a card run on it at all; it is not free (§7).
     int offload_ratio = 0;
+    // True iff --offload-ratio was given explicitly, so an explicit 0 (the
+    // fully-resident native pool) is distinguishable from "offload off". The
+    // backend forwards the property in that case; for an affine artifact an
+    // explicit 0 still leaves the plugin on the direct resident Constants.
+    bool offload_ratio_set = false;
 
     // The paged execution path (DESIGN §3.5.3, §7.0): arcint-owned block
     // tables and LA state rows, speculative rollback as row promotion,
@@ -168,6 +205,7 @@ struct Config {
     // regime came from. Unset means "the artifact decides", exactly as before.
     std::optional<float> temp;
     std::optional<float> top_p;
+    std::optional<float> min_p;
     std::optional<int>   top_k;
     std::optional<float> repetition_penalty;
     std::optional<float> presence_penalty;
@@ -300,9 +338,13 @@ struct Config {
     // read-only GPU-plugin property MOE_CPU_TIER_STATIC_PARTITION, which
     // only exists once the backend's executor is up. Config parsing now accepts
     // the combination unconditionally; backend_ov.cpp's
-    // tier_prefix_cache_decision (below) makes the load-time call.
+    // tier_prefix_cache_decision (below) makes the load-time call. The
+    // history-dependent mode is the ADAPTIVE TIER (expert placement follows
+    // the conversation, DESIGN §3.4 amended 2026-10-01); it is refused with the
+    // prefix cache, while the static partition is admitted with it.
     bool moe_cpu_tier = false;   // --moe-cpu-tier
     int  moe_cpu_tier_threads = 0;  // --moe-cpu-tier-threads; 0 = plugin default
+    bool moe_per_expert_dispatch = false;  // --moe-per-expert-dispatch
 
     bool show_help    = false;
     bool show_version = false;
@@ -370,8 +412,8 @@ bool kv_precision_is_packed_four_bit(const std::string& requested, const std::st
 // with the device. The plugin exposes this as a read-only property,
 // MOE_CPU_TIER_STATIC_PARTITION, true when the served tier is that static
 // partition (false when MOE_CPU_TIER_PARTITION=lru restores the
-// history-dependent one, or the property is simply absent on a plugin
-// without 0018). That fact only exists once the backend's executor is up --
+// history-dependent adaptive tier, or the property is simply absent on a
+// plugin without 0018). That fact only exists once the backend's executor is up --
 // config parsing cannot query a GPU plugin property -- so the refusal moved
 // from config.cpp to backend_ov.cpp's load path, which probes the property
 // (mirroring the PAGED_ATTENTION_MAX_PARTITIONS probe's style) and calls
@@ -383,6 +425,18 @@ bool kv_precision_is_packed_four_bit(const std::string& requested, const std::st
 // report) to refuse.
 std::optional<std::string> tier_prefix_cache_decision(bool static_partition_reported, bool tier_on,
                                                        int prefix_cache_mib);
+
+// Whether the MoE expert-offload machinery is active for a load (plugin patch
+// 0051). True when the ratio is > 0, OR when an explicit 0 was given for a
+// NATIVE artifact: the offload provider owns the only native reader, so an
+// all-resident native pool rides it. An affine artifact at an explicit 0 keeps
+// the direct resident Constants -- the pre-0051 behaviour, unchanged. This is
+// the pure decision backend_ov.cpp's load path calls; it is separated from the
+// member so a red-first cell can pin it without a GPU.
+inline bool moe_offload_active(int offload_ratio, bool offload_ratio_set,
+                               const std::string& expert_format) {
+    return offload_ratio > 0 || (offload_ratio_set && expert_format == "native");
+}
 
 // Strict base-10 uint64 parse: refuses empty input and trailing garbage
 // (strtoull alone happily parses "8e9" as 8 and ignores "e9"), and refuses

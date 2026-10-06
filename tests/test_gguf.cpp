@@ -378,6 +378,142 @@ TEST(gguf_refuses_unknown_tensor_type) {
     CHECK(throws_containing(tmp.path(), "9999"));
 }
 
+// ------------------------------------------------- the I-quant decoders (FIX F)
+//
+// IQ4_NL and IQ3_XXS are the formats the Flash-Next checkpoint ships its
+// experts in (down / gate+up). The u4 grouped-affine repack of them costs
+// 0.10-0.13 relative RMS per expert tensor and 0.73 nats at depth 48 (DESIGN
+// 7.0.2bz; docs/design-routing-aware-expert-execution.md 2.3a), so the
+// experts are computed from these blocks directly, and the host decoder is
+// the first piece: the kernel's reference emulation and the host tier's
+// decoder. Formulas transcribed from ggml-quants.c dequantize_row_iq4_nl /
+// dequantize_row_iq3_xxs (pinned llama.cpp 56b9eb28).
+//
+// Red first: before the decoders existed, dequantize_row threw "not
+// implemented" for both types and these cells failed on the throw.
+TEST(gguf_iq4_nl_block_decodes_through_the_16_entry_table) {
+    // one 32-value block: d = 1.0 (f16 0x3C00), nibble j in the low half of
+    // byte j and 15-j in the high half, so y[j] = table[j], y[j+16] = table[15-j]
+    static const int kTable[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
+                                   1, 13, 25, 38, 53, 69, 89, 113};
+    uint8_t block[18];
+    block[0] = 0x00; block[1] = 0x3C;
+    for (int j = 0; j < 16; ++j) block[2 + j] = static_cast<uint8_t>((j & 0xF) | ((15 - j) << 4));
+    float y[32];
+    gguf::dequantize_row(static_cast<int32_t>(gguf::GgmlType::IQ4_NL), block, 32, y);
+    for (int j = 0; j < 16; ++j) {
+        CHECK_EQ(y[j], static_cast<float>(kTable[j]));
+        CHECK_EQ(y[j + 16], static_cast<float>(kTable[15 - j]));
+    }
+    // a second block with d = 0.5 (f16 0x3800) scales the same table by half
+    uint8_t two[36];
+    std::memcpy(two, block, 18);
+    std::memcpy(two + 18, block, 18);
+    two[18] = 0x00; two[19] = 0x38;
+    float y2[64];
+    gguf::dequantize_row(static_cast<int32_t>(gguf::GgmlType::IQ4_NL), two, 64, y2);
+    CHECK_EQ(y2[32], -63.5f);
+    CHECK_EQ(y2[63], static_cast<float>(kTable[0]) * 0.5f);
+}
+
+TEST(gguf_iq3_xxs_block_decodes_through_the_grid_and_the_sign_masks) {
+    // one 256-value block (98 B): d = 1.0; the first 32-value sub-block's
+    // four index pairs all point at grid entry 0 (0x04040404 -> 4,4,4,4)
+    // except qs[0] = 1 (0x04040414 -> bytes 20,4,4,4); its scales-and-signs
+    // word carries scale 3 (bits 28..31) and sign index 5 for l = 0 (bits
+    // 0..6): ksigns[5] = 5 = 0b101 flips values 0 and 2 of the first eight.
+    // db = d * (0.5 + 3) * 0.5 = 1.75, so the first eight values are
+    // [-35, 7, -7, 7, 7, 7, 7, 7]; every other sub-block has scale 0 (db =
+    // 0.25), index 0 and sign 0: all 1.0.
+    uint8_t block[98];
+    std::memset(block, 0, sizeof block);
+    block[0] = 0x00; block[1] = 0x3C;
+    uint8_t* qs = block + 2;
+    qs[0] = 1;
+    const uint32_t aux = (3u << 28) | 5u;
+    std::memcpy(qs + 64, &aux, 4);
+    float y[256];
+    gguf::dequantize_row(static_cast<int32_t>(gguf::GgmlType::IQ3_XXS), block, 256, y);
+    const float want[8] = {-35.f, 7.f, -7.f, 7.f, 7.f, 7.f, 7.f, 7.f};
+    for (int j = 0; j < 8; ++j) CHECK_EQ(y[j], want[j]);
+    for (int j = 8; j < 32; ++j) CHECK_EQ(y[j], 7.f);      // same sub-block scale, grid 0, no sign
+    for (int j = 32; j < 256; ++j) CHECK_EQ(y[j], 1.f);    // scale 0 -> db 0.25, grid 0 -> 4
+}
+
+// IQ4_XS: layer 2's gate/up (the checkpoint mixes formats per layer; the
+// census is in docs/design-routing-aware-expert-execution.md 2.3d). One
+// 256-value block: d = 1.0; sub-block ib carries the 6-bit scale ls = ib + 30
+// (low nibble in scales_l[ib/2], the two high bits in scales_h) so its scale
+// is d * (ls - 32) = ib - 2; the nibbles as in the IQ4_NL cell. Red first:
+// dequantize_row threw "not implemented" for IQ4_XS.
+TEST(gguf_iq4_xs_block_decodes_with_its_six_bit_sub_block_scales) {
+    uint8_t block[136] = {0};
+    block[0] = 0x00; block[1] = 0x3C;                       // d = 1.0
+    uint16_t scales_h = 0;
+    for (int ib = 0; ib < 8; ++ib) {
+        const int ls = ib + 30;
+        block[4 + ib / 2] |= static_cast<uint8_t>((ls & 0xF) << (4 * (ib % 2)));
+        scales_h |= static_cast<uint16_t>(((ls >> 4) & 3) << (2 * ib));
+    }
+    block[2] = static_cast<uint8_t>(scales_h & 0xFF);
+    block[3] = static_cast<uint8_t>(scales_h >> 8);
+    for (int ib = 0; ib < 8; ++ib)
+        for (int j = 0; j < 16; ++j)
+            block[8 + ib * 16 + j] = static_cast<uint8_t>((j & 0xF) | ((15 - j) << 4));
+    static const int8_t T[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+    float y[256];
+    gguf::dequantize_row(static_cast<int32_t>(gguf::GgmlType::IQ4_XS), block, 256, y);
+    for (int ib = 0; ib < 8; ++ib) {
+        const float dl = static_cast<float>(ib - 2);
+        for (int j = 0; j < 16; ++j) {
+            CHECK_EQ(y[ib * 32 + j], dl * static_cast<float>(T[j]));
+            CHECK_EQ(y[ib * 32 + 16 + j], dl * static_cast<float>(T[15 - j]));
+        }
+    }
+}
+
+// The real shard: expert 0, row 0 of the two expert tensors, pinned to
+// llama.cpp's own gguf-py dequantisation (`gguf.quants.dequantize`, read on
+// the dev host 2026-09-18, the shard that carries blk.0's experts). The
+// values are printed at 7 decimals there, the sums at 6.
+TEST(gguf_iq_decoders_match_gguf_py_on_the_real_shard) {
+    const char* path = std::getenv("ARCINT_GGUF_REAL");
+    SKIP_UNLESS(path != nullptr && *path != '\0', "ARCINT_GGUF_REAL not set");
+    gguf::GgufFile f = gguf::GgufFile::open(path);
+    struct Pin { const char* name; gguf::GgmlType type; size_t row; double first8[8]; double sum; double abs_sum; };
+    const Pin pins[] = {
+        {"blk.0.ffn_down_exps.weight", gguf::GgmlType::IQ4_NL, 640,
+         {-0.0030777, 0.0023675, -0.0267527, 0.0082862, 0.0023675, -0.0163357, -0.0089965, -0.0002367},
+         -0.060845, 6.830881},
+        {"blk.0.ffn_gate_exps.weight", gguf::GgmlType::IQ3_XXS, 2560,
+         {-0.041832, 0.0134942, -0.0296872, 0.0134942, -0.0242895, -0.0188919, 0.0026988, 0.0080965},
+         0.044130, 29.625160},
+        // layer 2, the checkpoint's IQ4_XS gate over a Q8_0 down (2026-09-18)
+        {"blk.2.ffn_gate_exps.weight", gguf::GgmlType::IQ4_XS, 2560,
+         {-0.0013936, -0.0013936, -0.0030658, 0.0052955, 0.0001394, -0.0090581, 0.0018116, 0.0157472},
+         0.092474, 26.058311},
+        {"blk.2.ffn_down_exps.weight", gguf::GgmlType::Q8_0, 640,
+         {-0.0019727, 0.0223570, -0.0032878, 0.0177541, -0.0065756, -0.0170965, -0.0003288, -0.0049317},
+         0.155361, 6.580421},
+    };
+    int seen = 0;
+    for (const Pin& pin : pins) {
+        const gguf::TensorInfo* t = f.tensor(pin.name);
+        if (t == nullptr) continue;                    // another shard
+        ++seen;
+        CHECK_EQ(t->ggml_type, static_cast<int32_t>(pin.type));
+        std::vector<float> y(pin.row);
+        gguf::dequantize_row(t->ggml_type, f.data(*t), pin.row, y.data());   // expert 0, row 0
+        for (int j = 0; j < 8; ++j) CHECK_NEAR(static_cast<double>(y[j]), pin.first8[j], 2e-6);
+        double sum = 0.0, abs_sum = 0.0;
+        for (float v : y) { sum += v; abs_sum += std::fabs(v); }
+        CHECK_NEAR(sum, pin.sum, 1e-5);
+        CHECK_NEAR(abs_sum, pin.abs_sum, 1e-4);
+        std::fprintf(stderr, "  %s: row 0 of expert 0 matches gguf-py (sum %.6f)\n", pin.name, sum);
+    }
+    SKIP_UNLESS(seen > 0, "this shard carries none of the pinned expert tensors");
+}
+
 // ------------------------------------------------------------- real-file check
 //
 // ARCINT_GGUF_REAL=<path> gates a spot check against a real GGUF on disk

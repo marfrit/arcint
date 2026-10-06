@@ -27,8 +27,14 @@ sits beside it wherever it appears (BAR_PROVENANCE); (2) nothing calls
 anything "passing against" it; (3) the 0.5.1 acceptance commit re-derives it
 from THIS model's own reference round-trip -- the pair decided and stated,
 its run-to-run floor measured -- as a stated multiple of that reference's own
-rounding error, never an imported multiplier. Until that commit lands the
-harness gates on the inherited number and every verdict says PROVISIONAL.
+rounding error, never an imported multiplier. **THAT COMMIT HAS LANDED**
+(BERLIN-001 `5d4dd59`, `docs/window-051.md` clause (d)): `bar_0.5.1 = 100 x
+F_ref`, measured at A.2 and defined below as `RESOLUTION_BOUND_*`. The
+inherited literal below is therefore **SUPERSEDED BY LINEAGE and decides
+nothing**; it stays pinned for continuity. This module's `gate()` still gates
+on it and is **not an acceptance bar**: the readable numbers are the
+resolution bound (an instrument-resolution MEAN bound, whose per-row clamp
+tail exceeds it) and the between-implementations floor, both defined below.
 
 THE INSTRUMENT MUST BE ABLE TO GO RED. An acceptance check that cannot fail
 measures nothing. ``--self-test`` drives the KL core with synthetic
@@ -65,8 +71,45 @@ THRESHOLD_NATS = 0.0599
 BAR_STATUS = "PROVISIONAL"
 BAR_PROVENANCE = ("PROVISIONAL: 0.0599 nats = 1.5 x 0.0399, the R0 measured "
                   "2026-08-11 on Qwen3.6-35B-A3B (UD-Q3_K_XL vs BF16, wikitext-2) "
-                  "-- another model's number; the 0.5.1 acceptance commit "
-                  "re-derives it from this model's own reference round-trip")
+                  "-- another model's number, SUPERSEDED BY LINEAGE: BERLIN-001 "
+                  "(5d4dd59) decided bar_0.5.1 = 100 x F_ref (window-051 clause "
+                  "(d)); this literal stays for continuity and decides nothing")
+
+
+# THE DECIDED BOUND (window-051.md clause (d), BERLIN-001 5d4dd59, measured at
+# A.2). It is the INSTRUMENT-RESOLUTION BOUND, NOT an acceptance bar: it asks
+# the served path to reproduce the reference within 100 x the capture's own
+# uint16 transcription error. The reference implementation itself reads ~110 x
+# above it, and its own per-row clamp tail exceeds it -- both recorded below.
+RESOLUTION_BOUND_MULTIPLE   = 100
+F_REF_MEAN_NATS             = 3.0905e-05   # mean uint16 reconstruction error, 816 served rows
+F_REF_PER_ROW_MAX_NATS      = 1.0533e-02   # the clamp tail; EXCEEDS bar_below below 2051
+RESOLUTION_BOUND_BELOW_NATS = 3.0905e-03   # = 100 x F_REF_MEAN_NATS
+RESOLUTION_BOUND_ABOVE_NATS = 2.6946e-02   # = bound + the measured QSA price
+# [2026-09-28] WITHDRAWN: the QSA price is a max-abs block-output figure, not nats
+# (docs/campaigns/qsa.md). Kept printed for continuity; it decides nothing.
+RESOLUTION_BOUND_STATUS     = "PROVISIONAL (rows are f16-served)"
+RESOLUTION_BOUND_PROVENANCE = (
+    "window-051.md clause (d), BERLIN-001 5d4dd59, measured at A.2: "
+    "F_ref 3.0905e-05 mean over 816 served f16 rows, bound = 100 x F_ref. "
+    "A MEAN bound only -- its per-row clamp tail 1.0533e-02 exceeds bar_below, "
+    "and llama.cpp's own error against the same f32 reference (mean 0.3387) "
+    "is ~110x above it, so it bounds the instrument, not an implementation")
+
+# THE BETWEEN-IMPLEMENTATIONS FLOOR: the readable acceptance candidate, from
+# the 2026-09-19 re-run of cap_vs_cap.py / kld_vs_ref.py against the f32
+# reference captures (window-051.md record, the 08:36 floor entry).
+IMPLEMENTATION_FLOOR_MEDIAN_W0_NATS = 0.0649
+IMPLEMENTATION_FLOOR_MEDIAN_W1_NATS = 0.0283
+IMPLEMENTATION_FLOOR_MEAN_W0_NATS   = 0.3387
+IMPLEMENTATION_FLOOR_MEAN_W1_NATS   = 0.4415
+IMPLEMENTATION_FLOOR_PROVENANCE = (
+    "llama.cpp (build 56b9eb28) against the model's own f32 reference capture: "
+    "window 0 1,367 rows mean 0.3387 median 0.0649; window 1 mean 0.4415 "
+    "median 0.0283 -- the floor between implementations, the acceptance "
+    "candidate; NOT the resolution bound. VOID AS QUOTED since 2026-09-28: "
+    "the reference's rows at or above 2,051 ran a garbage indexer (a gguf_feed "
+    "BF16 defect, fixed); re-capture owed (docs/campaigns/qsa.md)")
 
 
 # --------------------------------------------------------------------------
@@ -119,7 +162,13 @@ def summarize_kl(per_token):
 def gate(summary, threshold=THRESHOLD_NATS):
     """PASS when mean per-token KL <= threshold. Returns (passed, verdict);
     the verdict names the bar's status, because the bar is inherited (see
-    BAR_PROVENANCE) and a bare PASS would read as more than it is."""
+    BAR_PROVENANCE) and a bare PASS would read as more than it is.
+
+    NOT an acceptance bar: it gates on the INHERITED, SUPERSEDED literal.
+    window-051 clause (d) decided the resolution bound
+    (RESOLUTION_BOUND_*), and the acceptance candidate is the
+    between-implementations floor (IMPLEMENTATION_FLOOR_*). Kept for
+    continuity and pinned by tools/test_kld_harness.py."""
     passed = summary["mean"] <= threshold
     verdict = ("PASS" if passed else "RED") + f" (bar {threshold} nats, {BAR_STATUS})"
     return passed, verdict

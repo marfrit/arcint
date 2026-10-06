@@ -1,0 +1,92 @@
+# Skip expert constant processing at compile time when per-expert dispatch
+# is active (campaign: sub4bit-vram-kernel).
+#
+# Campaign: docs/campaigns/sub4bit-vram-kernel.md
+#
+# Problem: compile_model walks all ~73,728 expert constants (512 experts ×
+# 48 layers × 3 kinds), each triggering hint_evict (mprotect + madvise on
+# the mmap'd region). With per-expert dispatch, expert constants are loaded
+# at runtime through the slot pool — none of this compile-time work is
+# needed.  On a host where the mmap'd weights exceed physical RAM, the
+# VMA churn from 73k hint_evict calls and the slot buffer allocations
+# saturate I/O and prevent the compilation from completing.
+#
+# Fix: when MOE_PER_EXPERT_DISPATCH is set, try_prepare_partial_upload
+# returns a deferred descriptor — a minimal 1-element allocation
+# reinterpreted as the full constant layout, with upload_bytes=0 and
+# skip_evict=true.  constant.cpp already skips the full memcpy for
+# partial_upload.enabled; the new skip_evict flag also suppresses the
+# hint_evict syscalls.  Result: expert constants are registered in the
+# compiled program (fusions still match) but no mmap pages are faulted,
+# no slot buffers are allocated, and no VMA splits occur.
+#
+# Prerequisite patches:
+#   0005 — partial upload mechanism (try_prepare_partial_upload)
+#   0038 — per-expert dispatch framework (MOE_PER_EXPERT_DISPATCH property)
+#
+# Files changed:
+#   moe_offload_constant.hpp   skip_evict field on PartialUploadDesc.
+#   moe_offload_constant.cpp   Early return for per-expert dispatch:
+#                               1-element placeholder, no device pool charge.
+#   constant.cpp               Guard hint_evict on !partial_upload.skip_evict.
+#
+# Reviewed by: (pending)
+
+diff -u a/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.hpp b/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.hpp
+--- a/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.hpp
++++ b/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.hpp
+@@ -27,6 +27,7 @@ struct PartialUploadDesc {
+     cldnn::memory::ptr memory = nullptr;
+     ov::Shape upload_shape;
+     size_t upload_bytes = 0;
++    bool skip_evict = false;
+ };
+ 
+ bool is_moe_related_constant(const std::shared_ptr<ov::op::v0::Constant>& op);
+diff -u a/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.cpp b/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.cpp
+--- a/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.cpp
++++ b/src/plugins/intel_gpu/src/plugin/ops/moe_offload_constant.cpp
+@@ -58,6 +58,30 @@ PartialUploadDesc try_prepare_partial_upload(ProgramBuilder& p,
+         return desc;
+     }
+ 
++    // Per-expert dispatch: expert constants are loaded at runtime through the
++    // slot pool, not through the compiled model's constant pool.  Allocate a
++    // minimal 1-element placeholder so the data primitive exists (fusions
++    // still match), but fault no mmap pages and charge no device pool budget.
++    if (p.get_config().get_moe_per_expert_dispatch()) {
++        desc.enabled = true;
++        desc.upload_shape = const_shape;
++        desc.upload_shape[0] = 1;
++        desc.upload_bytes = 0;
++        desc.skip_evict = true;
++
++        auto min_layout = cldnn::layout(desc.upload_shape, out_dtype, const_format);
++        auto min_mem = p.get_engine().allocate_memory(min_layout, false);
++        desc.memory = p.get_engine().reinterpret_buffer(*min_mem, const_layout);
++
++        get_partial_upload_log_state().log(op->get_friendly_name(),
++                                           0,
++                                           const_shape[0],
++                                           0,
++                                           const_layout.bytes_count(),
++                                           "deferred");
++        return desc;
++    }
++
+     // otd_ratio is the % on disk; GPU-resident experts = total * (100 - ratio) / 100
+     const size_t resident_expert_num = std::max<size_t>(1, const_shape[0] * (100 - otd_ratio) / 100);
+ 
+diff -u a/src/plugins/intel_gpu/src/plugin/ops/constant.cpp b/src/plugins/intel_gpu/src/plugin/ops/constant.cpp
+--- a/src/plugins/intel_gpu/src/plugin/ops/constant.cpp
++++ b/src/plugins/intel_gpu/src/plugin/ops/constant.cpp
+@@ -162,7 +162,8 @@ static void create_data(ProgramBuilder& p, const ov::Shape& const_shape, const s
+                 std::memcpy(&buf[0], &data[0], bufSize);
+             }
+         }
+-        ov::wsh::Extension::hint_evict(*op);
++        if (!partial_upload.skip_evict)
++            ov::wsh::Extension::hint_evict(*op);
+         auto data_prim = cldnn::data(initialconstPrimID, mem, partial_upload.enabled);
+         p.add_primitive(*op, data_prim);
+         p.blobMemCache[cache_key] = initialconstPrimID;

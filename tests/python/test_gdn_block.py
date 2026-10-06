@@ -284,6 +284,72 @@ def test_gdn_ov_parity(device, T):
         f"that forced the doctrine")
 
 
+def test_the_emitter_follows_the_configured_output_gate(device="CPU", T=64):
+    """The output gate's activation is the config's `output_gate_type` (the
+    pin: `output_gate_type or hidden_act`, RMSNormGated line 14). The shipped
+    Flash-Next checkpoint gates with a SIGMOID -- llama.cpp hard-codes it for
+    this architecture ("the one numerical difference from Qwen3.5's GDN:
+    sigmoid output gate, not silu", `src/models/qwen4exp.cpp`, `code`) and
+    the HF config carries no `output_gate_type` in the GGUF's metadata, so our
+    real-geometry config had defaulted to silu. Measured on the dev host
+    (France ids, depth 1, campaign serving-shape-logits): with the silu gate
+    the pin's gated-norm output correlates 0.81 with llama.cpp's; see the
+    campaign record for the sigmoid reading. Red first: the emitter emitted
+    silu unconditionally, so a sigmoid-configured reference differs from it."""
+    config = _make_config()
+    config.output_gate_type = "sigmoid"
+    ref, pin = _ref_and_pin(config)
+    state = _state_np(ref)
+    x = torch.randn(1, T, config.hidden_size)
+    mask = torch.ones(1, T, dtype=torch.long)
+    with torch.no_grad():
+        y_ref = ref(x, mask).float().numpy()
+        y_pin = pin(x, cache_params=None, attention_mask=mask.float()).float().numpy()
+    assert float(np.max(np.abs(y_ref - y_pin))) == 0.0, "transcription != pin under sigmoid"
+    model = gdn.build_gdn_model(config, state, seq_len=T)
+    compiled = compile_for(ov.Core(), model, device)
+    y_ov = compiled({"hidden_states": x.float().numpy(),
+                     "attention_mask": mask.float().numpy()})[compiled.output(0)]
+    max_abs = float(np.max(np.abs(y_ref - y_ov)))
+    print(f"\n[gate-sigmoid] T={T} |ov-ref|={max_abs:.3e}")
+    assert max_abs < 1e-5, f"emitter vs sigmoid-gated reference: {max_abs:.3e}"
+    config.output_gate_type = "swish"
+    with pytest.raises(ValueError):
+        gdn.build_gdn_model(config, state, seq_len=T)
+
+
+def test_the_emitter_follows_the_configured_key_head_pairing(device="CPU", T=64):
+    """`gdn_key_head_map` (2026-09-18, campaign serving-shape-logits): how the
+    HK key heads serve the HV value heads. The pin interleaves (value head h
+    <- key head h // r); the shipped GGUF is computed TILED by llama.cpp
+    (h <- h % HK), and only tiled does the real model's layer 0 agree with
+    llama.cpp's whole tensors (48/48 core heads; interleaved, 4/48). The
+    transcription carries the option as a documented deviation; the emitter
+    must follow it. Red first: the emitter interleaved regardless, so a
+    tiled reference differed from it by O(1)."""
+    config = _make_config()
+    config.gdn_key_head_map = "tiled"
+    ref, pin = _ref_and_pin(config)
+    state = _state_np(ref)
+    x = torch.randn(1, T, config.hidden_size)
+    mask = torch.ones(1, T, dtype=torch.long)
+    with torch.no_grad():
+        y_ref = ref(x, mask).float().numpy()
+        y_pin = pin(x, cache_params=None, attention_mask=mask.float()).float().numpy()
+    # the option changes the computation (r = 2 at this geometry)
+    assert float(np.max(np.abs(y_ref - y_pin))) > 1e-3, "tiled == interleaved: the option is inert"
+    model = gdn.build_gdn_model(config, state, seq_len=T)
+    compiled = compile_for(ov.Core(), model, device)
+    y_ov = compiled({"hidden_states": x.float().numpy(),
+                     "attention_mask": mask.float().numpy()})[compiled.output(0)]
+    max_abs = float(np.max(np.abs(y_ref - y_ov)))
+    print(f"\n[key-head-map tiled] T={T} |ov-ref|={max_abs:.3e} |ref-pin|={float(np.max(np.abs(y_ref - y_pin))):.3e}")
+    assert max_abs < 1e-5, f"emitter vs tiled reference: {max_abs:.3e}"
+    config.gdn_key_head_map = "shuffled"
+    with pytest.raises(ValueError):
+        gdn.build_gdn_model(config, state, seq_len=T)
+
+
 # ---------------------------------------------------------------------------
 # THE CHUNK-AXIS EMISSION MODES (the de-batch spike, 2026-09-12)
 # ---------------------------------------------------------------------------
@@ -387,6 +453,198 @@ def test_the_chunk_emission_modes_agree_on_cpu_and_differ_in_node_count():
         f"later chunk; it should be exactly one larger (the chunk `concat` that "
         f"C == 1 does not emit). A different gap means the C == 1 path and the "
         f"C > 1 path have diverged by more than that concat.")
+
+
+def test_the_served_prefill_graph_does_not_grow_with_the_prompt_length():
+    """LYON's compile-once property (0.5.4). The served prefill graph carries
+    its GDN state in Variables and its chunk axis is dynamic, so ONE compile is
+    replayed across every prompt length. The static `perchunk` form unrolls
+    ~1,900 ops PER CHUNK (`code`: docs/window-050.md §4.2) -- 2,198,232 nodes at
+    T=2048 over the 48-layer stack -- which is the 2.2M-node cost LYON retires.
+
+    Red-first: the `perchunk` control asserts the static form GROWS with T (the
+    incumbent red); the served path asserts it does not. This cell fails if the
+    served emitter stops being dynamic/stateful, or if `perchunk` stops
+    unrolling (i.e. the defect's reproducer silently changed)."""
+    from openvino import opset13 as ovop
+    from q4e import serving_shape as ss
+
+    config = _make_config()
+    ref, _ = _ref_and_pin(config)
+    state = _state_np(ref)
+    H = config.hidden_size
+    beam = ovop.constant(np.array([0], np.int64))
+
+    # the served path: dynamic in T, stateful conv + stateful (Loop) core
+    sinks = []
+    hidden = ovop.parameter([1, -1, H], ov.Type.f32)
+    amask = ovop.parameter([1, -1], ov.Type.f32)
+    out = gdn.emit_gdn(hidden, amask, config, state, None,
+                       conv_emitter=ss.stateful_short_conv(0, beam, sinks),
+                       core_emitter=ss.stateful_gdn_core(0, beam, sinks))
+    served = ov.Model([ovop.result(out)], list(sinks), [hidden, amask], "served")
+    n_served = len(served.get_ordered_ops())
+    types = {n.get_type_name() for n in served.get_ordered_ops()}
+    assert "Loop" in types and "Assign" in types and "ReadValue" in types, types
+    assert len(sinks) == 2, f"{len(sinks)} Assign(s); the two stateful hooks carry two states"
+
+    # the incumbent static form: grows ~1,900 ops per chunk
+    static = {T: len(gdn.build_gdn_model(config, state, seq_len=T,
+                                         ut_mode="perchunk").get_ordered_ops())
+              for T in (64, 256, 512)}
+    print(f"\n[lyon] served(dynamic T) nodes={n_served}  "
+          f"static perchunk nodes={static}  "
+          f"per-chunk growth={static[512] - static[64]} over 448 tokens")
+    assert static[512] > static[256] > static[64], (
+        f"the perchunk control no longer unrolls per chunk: {static}")
+    assert n_served < static[64], (
+        f"the served path ({n_served} nodes) is not smaller than one perchunk "
+        f"chunk ({static[64]}); the stateful route did not retire the unroll")
+
+    # 0.5.4 LYON: the MULTI-BLOCK served core must be T-invariant too -- chunk-
+    # count shaped, NOT token-count shaped. Build it dynamic and assert the
+    # node count does not move with the length asked for, and that neither
+    # served core grows one node per token (the unroll would).
+    def served_with(core_emitter):
+        s2 = []
+        h = ovop.parameter([1, -1, H], ov.Type.f32)
+        a = ovop.parameter([1, -1], ov.Type.f32)
+        o = gdn.emit_gdn(h, a, config, state, None,
+                         conv_emitter=ss.stateful_short_conv(0, beam, s2),
+                         core_emitter=core_emitter(0, beam, s2))
+        return len(ov.Model([ovop.result(o)], list(s2), [h, a], "t2").get_ordered_ops())
+
+    n_chunked = served_with(ss.stateful_gdn_core_chunked)
+    print(f"[lyon] served sequential={n_served} chunked={n_chunked} nodes "
+          f"(both T-invariant; perchunk would add {static[512] - static[64]} per 448 tokens)")
+    assert n_chunked < static[64], (
+        f"the chunked served path ({n_chunked}) must stay smaller than one "
+        f"perchunk chunk ({static[64]}) -- it must NOT be token-count shaped")
+    # neither served core may grow with prompt length: both are dynamic in T,
+    # so a node added per token is impossible unless the emitter regressed
+    for n in (n_served, n_chunked):
+        assert n < static[64] + 64, (
+            f"a served core read {n} nodes, near the per-chunk unroll's own "
+            f"size -- the stateful route is not holding")
+
+
+def test_the_chunked_stateful_core_is_the_chunked_algebra_across_boundaries():
+    """LYON: the multi-block stateful core (`stateful_gdn_core_chunked`) must
+    be the CHUNKED algebra (`gdn.py`'s `perchunk` core) with the state carried
+    across chunks -- so it is byte-exact against it -- and only f32-bounded
+    against the token-sequential core (different summation order; byte-exact is
+    impossible there and that is recorded, not weakened).
+
+    Lengths chosen to cross MULTIPLE chunk boundaries and to include a
+    non-multiple (T=192 is 3 chunks exactly; T=224 is 3.5 -> the zero-pad
+    path), not one token and not one chunk."""
+    import openvino as ov
+    from openvino import opset13 as ovop
+    from q4e import serving_shape as ss
+
+    config = _make_config()
+    ref, _ = _ref_and_pin(config)
+    state = _state_np(ref)
+    beam = ovop.constant(np.array([0], np.int64))
+    core = ov.Core()
+
+    for T in (128, 192, 224, 256):
+        x = torch.randn(1, T, config.hidden_size)
+        mask = torch.ones(1, T, dtype=torch.long)
+        with torch.no_grad():
+            ref64 = ref_gdn.Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).eval().double()
+            ref64.load_state_dict({k: v.double() for k, v in ref.state_dict().items()})
+            y_64 = ref64(x.double(), mask).numpy().astype(np.float64)
+        with torch.no_grad():
+            y_ref_inst = ref(x, mask).float().numpy().astype(np.float64)
+        floor = float(np.max(np.abs(y_ref_inst - y_64)))
+        feed = {"hidden_states": x.float().numpy(),
+                "attention_mask": mask.float().numpy()}
+
+        y_ref = np.asarray(compile_for(core, gdn.build_gdn_model(
+            config, state, seq_len=T), "CPU")(feed)[0], np.float64)
+
+        def _stateful(emitter):
+            # build_gdn_model wires only the CORE hook (its conv stays the
+            # default unroll), so one state is carried -- the same contract
+            # the existing sequential-vs-chunked parity cell uses.
+            sinks = []
+            m = gdn.build_gdn_model(
+                config, state, seq_len=T, sinks=sinks,
+                core_emitter=emitter(0, beam, sinks))
+            assert len(sinks) == 1, f"{len(sinks)} Assign(s); the core carries one state"
+            assert len(m.get_variables()) == 1, m.get_variables()
+            return np.asarray(compile_for(core, m, "CPU")(feed)[0], np.float64)
+
+        y_seq = _stateful(ss.stateful_gdn_core)
+        y_chunk = _stateful(ss.stateful_gdn_core_chunked)
+
+        d_chunk = float(np.max(np.abs(y_chunk - y_ref)))
+        d_seq = float(np.max(np.abs(y_seq - y_ref)))
+        print(f"\n[lyon-chunk] T={T:4d}  |chunked-stateful - chunked|={d_chunk:.4e}  "
+              f"|sequential - chunked|={d_seq:.4e}  floor={floor:.4e}")
+
+        # 1. the chunked stateful core IS the chunked algebra: byte-exact
+        assert np.array_equal(y_chunk, y_ref), (
+            f"T={T}: the chunked stateful core is NOT byte-exact against the "
+            f"chunked algebra (max |diff| {d_chunk:.4e}); the body reused the "
+            f"wrong ops or the state merge lost precision")
+        # 2. against the token-sequential core it is f32-bounded, NOT byte-exact
+        #    -- different summation order; recorded as the finding, not weakened
+        assert d_seq <= 20.0 * floor, (
+            f"T={T}: the token-sequential core left the bound ({d_seq:.4e} vs "
+            f"{20.0 * floor:.4e}); floor {floor:.4e}")
+        assert d_seq > 0.0, (
+            f"T={T}: the sequential and chunked cores are bitwise identical, "
+            f"which they cannot be -- the parity cell is comparing one graph "
+            f"with itself")
+
+
+def test_the_chunked_served_core_leaves_no_dangling_beam_idx():
+    """LYON beam-free fix, artifact-level. Measured on the A770 (2026-09-26):
+    the chunked artifact was REFUSED with `Model references undeclared
+    parameters: beam_idx` -- the unfused chunked Loop kept its
+    `ReadValue -> Gather(beam_idx)` chain into the paged-attention rewrite,
+    which drops the declaration (`backend_ov.cpp`:2637). The chunked served
+    core must therefore reference `beam_idx` NOWHERE, so the rewrite has
+    nothing to dangle. Red-first: fails if the reference returns.
+
+    Built with the default (beam-free) conv so the `beam_idx` Parameter has no
+    OTHER consumer: any consumer found here is the GDN core's own."""
+    from openvino import opset13 as ovop
+    from q4e import serving_shape as ss
+
+    config = _make_config()
+    ref, _ = _ref_and_pin(config)
+    state = _state_np(ref)
+    beam = ovop.parameter([-1], ov.Type.i32)
+    beam.set_friendly_name("beam_idx")
+
+    def consumers(emitter):
+        # static T + CORE hook only: the default conv carries no beam, so every
+        # consumer found is the core's own, and `beam_idx` can be declared
+        # without the model becoming unregistered either way
+        sinks = []
+        h = ovop.parameter([1, 128, config.hidden_size], ov.Type.f32)
+        a = ovop.parameter([1, 128], ov.Type.f32)
+        o = gdn.emit_gdn(h, a, config, state, 128,
+                         core_emitter=emitter(0, beam, sinks))
+        m = ov.Model([ovop.result(o)], list(sinks), [h, a, beam], "gdn_core")
+        # the consumers of the beam OUTPUT are the ops that take it as input
+        return sorted(i.get_node().get_type_name()
+                      for i in beam.output(0).get_target_inputs())
+
+    c_cons = consumers(ss.stateful_gdn_core_chunked)
+    s_cons = consumers(ss.stateful_gdn_core)
+    print(f"\n[lyon-beam] chunked beam_idx consumers={c_cons}  "
+          f"sequential beam_idx consumers={s_cons}")
+    assert c_cons == [], (
+        f"the chunked served core still references beam_idx via {c_cons}; the "
+        f"unfused Loop leaves that chain alive and the paged-attention rewrite "
+        f"drops the declaration, refusing the artifact")
+    assert s_cons == ["Gather"], (
+        f"the sequential control's beam_idx consumers moved to {s_cons}; the "
+        f"cell can no longer tell the two paths apart and is vacuous")
 
 
 def test_an_unknown_chunk_emission_mode_is_refused():

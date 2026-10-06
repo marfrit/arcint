@@ -1,0 +1,1441 @@
+# CPU tier: a host RAM bank for the expert bytes, filled at load by
+# sequential reads. The tier read every expert in place from a shared mapping
+# of the weight file; when the host-tier experts do not fit in the page cache
+# (Flash-Next: 56.4 GiB of expert constants on a 52 GiB host), the misses
+# arrive as 128 KiB page-fault reads on the workers (measured: 13-17 % of the
+# workers' wall in folio_wait_bit_common; an madvise(WILLNEED) prefetch did
+# nothing, a 4 MiB readahead doubled the bytes read).
+#
+# moe/host_expert_bank.hpp: slots in one anonymous MAP_NORESERVE mapping
+# (MOE_CPU_BANK_BYTES; unset = off, the mapping path unchanged). A layer's
+# first tier call queues a fill: every expert the static partition does not
+# pin to the card, in MOE_CPU_BANK_SEED's per-layer rank (a hot-set seed file,
+# `# space=layer_key`), at most MOE_CPU_BANK_FILL_PER_LAYER, each per-tensor
+# array read as ONE sequential O_DIRECT range and copied into the slots; the
+# fill never evicts. A miss takes a slot (LRU over unpinned slots of its size
+# class) and its spans are read with O_DIRECT on MOE_CPU_BANK_IO_THREADS
+# (default 8); dispatch_cpu_tier runs the experts already present and the IO
+# thread queues a missing expert's compute when its last span lands; the join
+# waits for those before the pool. A slot is a hit only for the same spans;
+# anything else (no slot, a record being read) reads the mapping as before,
+# as does a failed read. The bytes are the file's, so the output is too.
+# Ten cells (bytes at unaligned offsets and at the file end, hits, LRU and
+# pins, short reads, size classes, the fill's bytes, budget, once-per-layer,
+# span mismatch), red on nine mutants.
+#
+# The fill reads each per-tensor array from its lowest to its highest
+# selected expert, card-resident bytes included (59.8 GiB for 56.4 GiB of
+# constants); MOE_CPU_BANK_FILL_PER_LAYER bounds the slots, not that read.
+# The budget is MAP_NORESERVE: set above the host's free memory it ends in an
+# OOM kill. Each layer's fill maps one transient staging range on top.
+#
+# Served on the B60 (Flash-Next d48s2, ratio 78 + tier + per-expert dispatch,
+# 12e9 device slot pool, census112 seed, u8 paged KV, 16 host CPUs, 52 GiB),
+# a fresh process, "Hello" then a second prompt, 257 greedy tokens each, text
+# byte-identical to the mapping arm on both: decode 48.55 / 34.62 s ->
+# 40.42 / 34.11 s at a 40 GiB bank (360 per layer; the budget ran out at 44
+# of 48 layers) and 38.18 / 33.77 s, 39.66 / 34.72 s at 46 GiB (370 per
+# layer, all 48 layers, ~16,000 experts, ~21 s added to the load). With every
+# expert in RAM (the same prompt again in one process) the tier's decode-only
+# compute is 1.14 ms per layer call for 7.57 experts, the tier bench's figure.
+#
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -10,6 +10,9 @@
+ #include <fstream>
+ #include <map>
+ #include <sstream>
++#include <filesystem>
++#include <mutex>
++#include <condition_variable>
+ 
+ // clang-format off
+ #include "moe_3gemm_gen_micro.hpp"
+@@ -24,6 +27,9 @@
+ // CpuTierPool/moe_cpu_expert(). No cldnn/OpenVINO deps of its own (see that
+ // header's comment), so including it unconditionally here is harmless.
+ #include "moe_cpu_expert.hpp"
++// arcint (patch 0072). The CPU tier's host expert bank: O_DIRECT reads of a
++// tier expert's spans into anonymous memory (header-only, no cldnn deps).
++#include "host_expert_bank.hpp"
+ 
+ #include <cstring>  // std::memcpy in cpu_tier_join
+ #include <unordered_map>  // arcint (patch 0043) native tier-only miss list
+@@ -32,7 +38,9 @@
+ 
+ using ov::intel_gpu::ocl::moe::CpuTierMiss;
+ using ov::intel_gpu::ocl::moe::CpuTierPool;
++using ov::intel_gpu::ocl::moe::BankSpan;
+ using ov::intel_gpu::ocl::moe::ExpertDesc;
++using ov::intel_gpu::ocl::moe::HostExpertBank;
+ using ov::intel_gpu::ocl::moe::ExpertJob;
+ using ov::intel_gpu::ocl::moe::GateAct;
+ using ov::intel_gpu::ocl::moe::IExpertWeightProvider;
+@@ -130,6 +138,63 @@
+     return pool;
+ }
+ 
++// arcint (patch 0072). The CPU tier's host expert bank, one per weight file
++// (by canonical path), created on first use when MOE_CPU_BANK_BYTES (bytes)
++// is set; unset or 0 keeps the tier on the file mapping. Each bank reserves
++// the whole budget (MAP_NORESERVE: a budget above the host's free memory ends
++// in an OOM kill, not an allocation error). MOE_CPU_BANK_IO_THREADS reads
++// concurrently (default 8). A bank that cannot be created (the filesystem
++// refuses O_DIRECT) is logged once and that file stays on the mapping. Each
++// bank prints its counters at exit.
++HostExpertBank* cpu_tier_bank(const std::string& weights_path) {
++    static const size_t budget = [] {
++        const char* v = std::getenv("MOE_CPU_BANK_BYTES");
++        return v ? static_cast<size_t>(std::strtoull(v, nullptr, 10)) : size_t{0};
++    }();
++    if (budget == 0)
++        return nullptr;
++    struct Banks {
++        std::mutex m;
++        std::map<std::string, std::unique_ptr<HostExpertBank>> by_path;
++        std::map<std::string, bool> failed;
++        ~Banks() {
++            for (auto& [path, bank] : by_path) {
++                const auto st = bank->stats();
++                std::cerr << "[MOE_BANK] " << path << " filled=" << st.filled << " fill_layers=" << st.fill_layers
++                          << " fill_read_MiB=" << (st.fill_bytes_read >> 20) << " hits=" << st.hits
++                          << " misses=" << st.misses
++                          << " unbanked=" << st.unbanked << " evictions=" << st.evictions
++                          << " read_MiB=" << (st.bytes_read >> 20) << " read_errors=" << st.read_errors
++                          << " callback_errors=" << st.callback_errors
++                          << " slots=" << st.slots << " reserved_MiB=" << (st.reserved_bytes >> 20) << std::endl;
++            }
++        }
++    };
++    static Banks banks;
++    std::error_code ec;
++    auto canonical = std::filesystem::weakly_canonical(std::filesystem::path(weights_path), ec);
++    const std::string path = ec ? weights_path : canonical.string();
++    std::lock_guard<std::mutex> lock(banks.m);
++    if (banks.failed.count(path))
++        return nullptr;
++    auto& bank = banks.by_path[path];
++    if (!bank) {
++        const char* t = std::getenv("MOE_CPU_BANK_IO_THREADS");
++        const int threads = t ? std::max(1, std::atoi(t)) : 8;
++        try {
++            bank = std::make_unique<HostExpertBank>(path, budget, threads);
++        } catch (const std::exception& e) {
++            banks.by_path.erase(path);
++            banks.failed[path] = true;
++            std::cerr << "[MOE_BANK] disabled for " << path << ": " << e.what() << std::endl;
++            return nullptr;
++        }
++        std::cerr << "[MOE_BANK] " << path << " budget_MiB=" << (budget >> 20) << " io_threads=" << threads
++                  << std::endl;
++    }
++    return bank.get();
++}
++
+ // Bring shared onednn matmul wrappers into this anonymous namespace so existing call sites
+ // that reference `onednn_matmul`, `onednn_linear`, etc. unqualified continue to compile after
+ // the definitions moved to impls/onednn/grouped_matmul_helper.hpp.
+@@ -1029,6 +1094,31 @@
+     std::vector<uint16_t> _cpu_out_rows;
+     std::vector<ExpertJob> _cpu_jobs;
+     std::vector<ExpertDesc> _cpu_descs;
++    // arcint (patch 0072). Per tier expert of the current call (parallel to
++    // _cpu_descs): its bank lease, released in cpu_tier_join(), and the desc
++    // as the mapping gives it, which a failed bank read falls back to. The
++    // sync counts the call's experts whose bytes are still being read; their
++    // compute is queued by the bank's IO thread when they land.
++    struct CpuBankUse {
++        HostExpertBank::State state = HostExpertBank::State::Unbanked;
++        uint32_t slot = 0;
++        ExpertDesc mapped;
++    };
++    struct CpuBankSync {
++        std::mutex m;
++        std::condition_variable cv;
++        size_t pending = 0;
++        bool error = false;  // a pending expert's compute could not be queued
++    };
++    std::vector<CpuBankUse> _cpu_bank_use;
++    HostExpertBank* _cpu_bank = nullptr;
++    std::shared_ptr<CpuBankSync> _cpu_bank_sync;
++    // Set when this impl has queued its layer's bank fill (the bank itself
++    // runs one fill per layer_key, so a second impl of the layer is a no-op).
++    bool _cpu_bank_fill_queued = false;
++    // Set once this impl has looked its bank up (default false, so a clone
++    // looks again); the lookup canonicalises a path, not a per-call cost.
++    bool _cpu_bank_resolved = false;
+     // Wall clock at dispatch_cpu_tier(); cpu_tier_join() charges wait-end minus
+     // this to cpu_compute_ns (moe_otd_perf.hpp's definition of that counter).
+     std::chrono::steady_clock::time_point _cpu_dispatch_t0{};
+@@ -1201,10 +1291,161 @@
+     // not want that form and never see it. (An earlier version of this
+     // comment claimed file layout == device layout; the code was right and
+     // the comment was not - fixed in review.)
++    // arcint (patch 0072). An expert's byte spans in build_cpu_expert_desc's
++    // order (gate, up, down; each weight, scale, then zero point when the
++    // config has one). Only the bank fill uses it; a span list that does not
++    // match the desc's is refused by the bank (Unbanked), never mixed up.
++    int cpu_expert_spans(uint32_t expert,
++                         typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
++                         OffloadExpertWeightProvider& otd,
++                         BankSpan* out) {
++        const auto& config = otd.config();
++        const auto& offsets = otd.weight_bin_offsets();
++        int n = 0;
++        auto add = [&](size_t pos, const memory::ptr& tensor) {
++            const auto sp = moe_otd::expert_tensor_span(config, offsets, tensor, pos, expert);
++            out[n++] = BankSpan{static_cast<uint64_t>(sp.file_offset), sp.bytes};
++        };
++        const auto& w = instance._weights;
++        add(0, w.gate_w);
++        add(3, w.gate_s);
++        if (config.has_zp)
++            add(6, w.gate_z);
++        add(1, w.up_w);
++        add(4, w.up_s);
++        if (config.has_zp)
++            add(7, w.up_z);
++        add(2, w.down_w);
++        add(5, w.down_s);
++        if (config.has_zp)
++            add(8, w.down_z);
++        return n;
++    }
++
++    // arcint (patch 0072). The layer's load-time bank fill: every expert the
++    // static partition does not keep on the card, in the order of
++    // MOE_CPU_BANK_SEED (a hot-set seed file with a full per-layer ranking,
++    // `# space=layer_key`; experts it does not list follow in id order), at
++    // most MOE_CPU_BANK_FILL_PER_LAYER of them (unset: all; 0: no fill).
++    void queue_cpu_bank_fill(typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
++                             OffloadExpertWeightProvider& otd) {
++        static const long per_layer = [] {
++            const char* v = std::getenv("MOE_CPU_BANK_FILL_PER_LAYER");
++            return v ? std::atol(v) : -1L;
++        }();
++        if (per_layer == 0)
++            return;
++        static const std::map<uint64_t, std::vector<uint32_t>> rank = [] {
++            std::map<uint64_t, std::vector<uint32_t>> r;
++            const char* path = std::getenv("MOE_CPU_BANK_SEED");
++            if (!path)
++                return r;
++            std::ifstream f(path);
++            OPENVINO_ASSERT(f.good(), "MOE_CPU_BANK_SEED: cannot read ", path);
++            std::string line;
++            bool keyed = false;
++            while (std::getline(f, line)) {
++                if (line.rfind("# space=layer_key", 0) == 0)
++                    keyed = true;
++                if (line.empty() || line[0] == '#')
++                    continue;
++                OPENVINO_ASSERT(keyed, "MOE_CPU_BANK_SEED: ", path, " is not keyed by layer_key (no '# space=layer_key' line before the data)");
++                std::istringstream ls(line);
++                uint64_t key = 0;
++                ls >> key;
++                uint32_t e = 0;
++                while (ls >> e)
++                    r[key].push_back(e);
++            }
++            return r;
++        }();
++        const auto& offsets = otd.weight_bin_offsets();
++        const uint64_t layer_key = offsets.empty() ? 0 : static_cast<uint64_t>(offsets[0]);
++        const auto num_expert = static_cast<uint32_t>(otd.config().num_expert);
++        std::vector<bool> skip(num_expert, false);
++        for (uint32_t e : otd.static_partition_members()) {
++            if (e < num_expert)
++                skip[e] = true;
++        }
++        std::vector<uint32_t> experts;
++        experts.reserve(num_expert);
++        auto take = [&](uint32_t e) {
++            if (e < num_expert && !skip[e]) {
++                skip[e] = true;
++                experts.push_back(e);
++            }
++        };
++        if (auto it = rank.find(layer_key); it != rank.end()) {
++            for (uint32_t e : it->second)
++                take(e);
++        }
++        for (uint32_t e = 0; e < num_expert; e++)
++            take(e);
++        if (per_layer > 0 && experts.size() > static_cast<size_t>(per_layer))
++            experts.resize(static_cast<size_t>(per_layer));
++        BankSpan role0[HostExpertBank::kMaxSpans];
++        const int n = cpu_expert_spans(0, instance, otd, role0);
++        _cpu_bank->fill_layer(layer_key, std::move(experts), std::vector<BankSpan>(role0, role0 + n));
++    }
++
++    // arcint (patch 0072). Ends the previous tier call's bank work: waits for
++    // its pending experts (their IO callbacks point into _cpu_descs), then,
++    // if any lease is still held (a call that threw before its join), for
++    // the pool, and releases the leases. A no-op after a normal join. Returns
++    // whether a pending expert's compute failed to queue.
++    bool drain_cpu_bank() {
++        bool error = false;
++        if (_cpu_bank_sync) {
++            std::unique_lock<std::mutex> lock(_cpu_bank_sync->m);
++            _cpu_bank_sync->cv.wait(lock, [&] {
++                return _cpu_bank_sync->pending == 0;
++            });
++            error = _cpu_bank_sync->error;
++            _cpu_bank_sync->error = false;
++        }
++        if (!_cpu_bank_use.empty()) {
++            cpu_tier_pool(_cpu_tier_threads).wait();
++            if (_cpu_bank) {
++                for (const auto& u : _cpu_bank_use) {
++                    if (u.state != HostExpertBank::State::Unbanked)
++                        _cpu_bank->release(u.slot);
++                }
++            }
++            _cpu_bank_use.clear();
++        }
++        return error;
++    }
++
++    // The mapping's pointers (the prefill paths).
+     ExpertDesc build_cpu_expert_desc(uint32_t expert,
+                                      typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
+                                      OffloadExpertWeightProvider& otd) {
++        CpuBankUse unused;
++        return build_cpu_expert_desc(expert, instance, otd, nullptr, unused);
++    }
++
++    // arcint (patch 0072): with a bank, the pointers are the bank slot's
++    // (Ready or Pending, see `use`); without one, or Unbanked, the mapping's.
++    ExpertDesc build_cpu_expert_desc(uint32_t expert,
++                                     typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
++                                     OffloadExpertWeightProvider& otd,
++                                     HostExpertBank* bank,
++                                     CpuBankUse& use) {
+         ExpertDesc d;
++        BankSpan spans[HostExpertBank::kMaxSpans];
++        struct Target {
++            QuantMatrix* qm;
++            int field;  // 0 w, 1 s, 2 z
++        };
++        Target targets[HostExpertBank::kMaxSpans];
++        int n_spans = 0;
++        auto note = [&](QuantMatrix& qm, int field, const moe_otd::ExpertTensorSpan& sp) {
++            if (n_spans < HostExpertBank::kMaxSpans) {
++                spans[n_spans] = BankSpan{static_cast<uint64_t>(sp.file_offset), sp.bytes};
++                targets[n_spans] = Target{&qm, field};
++            }
++            n_spans++;
++        };
+         d.act = _cpu_gate_act;
+         const auto& config = otd.config();
+         const auto& offsets = otd.weight_bin_offsets();
+@@ -1225,12 +1466,15 @@
+             auto s_span = moe_otd::expert_tensor_span(config, offsets, s_tensor, s_pos, expert);
+             qm.w = reader.mapped(w_span.file_offset, w_span.bytes);
+             const uint8_t* s_bytes = reader.mapped(s_span.file_offset, s_span.bytes);
++            note(qm, 0, w_span);
++            note(qm, 1, s_span);
+             qm.s = reinterpret_cast<const uint16_t*>(s_bytes);
+             // arcint (patch 0043): a native format's scales are f16 per 32-block, read through qm.s
+             qm.format = static_cast<int>(native_format);
+             if (config.has_zp) {
+                 auto z_span = moe_otd::expert_tensor_span(config, offsets, z_tensor, z_pos, expert);
+                 qm.z = reader.mapped(z_span.file_offset, z_span.bytes);
++                note(qm, 2, z_span);
+             }
+             qm.oc = oc;
+             qm.ic = ic;
+@@ -1279,6 +1523,27 @@
+             _intermediate_size,
+             _down_group_size,
+             _cpu_native_down);
++        use = CpuBankUse{};
++        use.mapped = d;
++        if (bank && n_spans <= HostExpertBank::kMaxSpans) {
++            // The layer's key is its weight_0 .bin offset, as the static
++            // partition's (patch 0013); an expert's spans are fixed by it.
++            const uint64_t layer_key = offsets.empty() ? 0 : static_cast<uint64_t>(offsets[0]);
++            const auto lease = bank->acquire(layer_key, expert, spans, n_spans);
++            use.state = lease.state;
++            use.slot = lease.slot;
++            if (lease.state != HostExpertBank::State::Unbanked) {
++                for (int i = 0; i < n_spans; i++) {
++                    QuantMatrix& qm = *targets[i].qm;
++                    if (targets[i].field == 0)
++                        qm.w = lease.ptr[i];
++                    else if (targets[i].field == 1)
++                        qm.s = reinterpret_cast<const uint16_t*>(lease.ptr[i]);
++                    else
++                        qm.z = lease.ptr[i];
++                }
++            }
++        }
+         return d;
+     }
+ 
+@@ -1304,6 +1569,19 @@
+         OPENVINO_ASSERT(_cpu_x_host_mem && _cpu_rw_host_mem,
+                         "dispatch_cpu_tier: x/routing-weight usm_host buffers not populated");
+         auto* otd = static_cast<OffloadExpertWeightProvider*>(_weight_provider.get());
++        drain_cpu_bank();
++        if (!_cpu_bank_resolved) {
++            _cpu_bank = cpu_tier_bank(otd->weight_reader().path().string());
++            _cpu_bank_resolved = true;
++        }
++        if (_cpu_bank && !_cpu_bank_fill_queued) {
++            // Marked only once queued: a bad MOE_CPU_BANK_SEED throws here on
++            // every call instead of once and then silently running unfilled.
++            queue_cpu_bank_fill(instance, *otd);
++            _cpu_bank_fill_queued = true;
++        }
++        _cpu_bank_use.clear();
++        _cpu_bank_use.resize(_cpu_tier_misses.size());
+ 
+         size_t total_positions = 0;
+         for (const auto& m : _cpu_tier_misses)
+@@ -1326,7 +1604,8 @@
+         auto* x_host = static_cast<const uint16_t*>(_cpu_x_host_mem->buffer_ptr());
+         auto* rw_host = static_cast<const uint16_t*>(_cpu_rw_host_mem->buffer_ptr());
+         for (const auto& m : _cpu_tier_misses) {
+-            _cpu_descs.push_back(build_cpu_expert_desc(m.expert, instance, *otd));
++            const size_t xi = _cpu_descs.size();
++            _cpu_descs.push_back(build_cpu_expert_desc(m.expert, instance, *otd, _cpu_bank, _cpu_bank_use[xi]));
+             const size_t job_begin = _cpu_jobs.size();
+             for (size_t pos : m.positions) {
+                 ExpertJob job;
+@@ -1374,7 +1653,51 @@
+             };
+         }
+         _cpu_dispatch_t0 = std::chrono::steady_clock::now();
+-        ov::intel_gpu::ocl::moe::cpu_tier_dispatch(pool, work, split, observer);
++        // arcint (patch 0072). The experts whose bytes are present run now;
++        // each one still being read is queued by the bank's IO thread when
++        // its last span lands (with the mapping's pointers if the read
++        // failed). The schedule changes, the bytes do not: every expert
++        // writes only its own rows of _cpu_out_rows.
++        std::vector<ov::intel_gpu::ocl::moe::CpuTierExpertWork> ready;
++        std::vector<size_t> pending;
++        ready.reserve(work.size());
++        for (size_t x = 0; x < work.size(); x++) {
++            if (_cpu_bank_use[x].state == HostExpertBank::State::Pending)
++                pending.push_back(x);
++            else
++                ready.push_back(work[x]);
++        }
++        if (!_cpu_bank_sync)
++            _cpu_bank_sync = std::make_shared<CpuBankSync>();
++        {
++            std::lock_guard<std::mutex> lock(_cpu_bank_sync->m);
++            _cpu_bank_sync->pending = pending.size();
++        }
++        ov::intel_gpu::ocl::moe::cpu_tier_dispatch(pool, ready, split, observer);
++        for (size_t x : pending) {
++            auto sync = _cpu_bank_sync;
++            const ov::intel_gpu::ocl::moe::CpuTierExpertWork w = work[x];
++            ExpertDesc* desc = &_cpu_descs[x];
++            const ExpertDesc mapped = _cpu_bank_use[x].mapped;
++            _cpu_bank->fetch(_cpu_bank_use[x].slot, [&pool, w, desc, mapped, split, observer, sync](bool ok) {
++                bool queued = true;
++                try {
++                    if (!ok)
++                        *desc = mapped;
++                    ov::intel_gpu::ocl::moe::cpu_tier_dispatch(pool, {w}, split, observer);
++                } catch (...) {
++                    queued = false;
++                }
++                // Counted down whatever happened, so the join never hangs; a
++                // compute that did not queue is the join's error, not a
++                // silently missing row.
++                std::lock_guard<std::mutex> lock(sync->m);
++                if (!queued)
++                    sync->error = true;
++                if (--sync->pending == 0)
++                    sync->cv.notify_all();
++            });
++        }
+     }
+ 
+     // arcint M14 (patches/0012, §4.4). Blocks on the CPU pool, then DMAs each
+@@ -1390,8 +1713,16 @@
+             return;
+         auto* perf = moe_otd::get_perf_counters();
+         const auto t0 = std::chrono::steady_clock::now();
++        // arcint (patch 0072). The bank's IO threads queue the compute of the
++        // experts they read before they count down, so once nothing is
++        // pending the pool's wait covers every expert of the call;
++        // drain_cpu_bank() waits for both and releases the leases.
++        const bool bank_error = drain_cpu_bank();
++        // Already waited inside drain_cpu_bank() whenever this call had
++        // experts; kept so the join never depends on that.
+         cpu_tier_pool(_cpu_tier_threads).wait();
+         const auto t1 = std::chrono::steady_clock::now();
++        OPENVINO_ASSERT(!bank_error, "MOE_CPU_BANK: a CPU-tier expert read into the bank could not be queued");
+         auto& engine = instance.get_network().get_engine();
+         const size_t row_bytes = static_cast<size_t>(_hidden_size) * sizeof(uint16_t);
+         size_t row = 0;
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+@@ -191,6 +191,11 @@
+     // only identity (layer/expert/slot).
+     lgc::nvme_fill::FillBatch pinned_nvme_fill_batch(std::uint32_t layer_index) const;
+ 
++    // arcint (patch 0072). The static partition's resident experts (the
++    // membership reserve_static_partition() pins), empty without a static
++    // partition. The CPU tier's host bank fills everything else.
++    std::vector<uint32_t> static_partition_members() const;
++
+     // arcint (patch 0048). The collect-time handshake the design note §3.4
+     // requires: an expert whose bytes have landed is marked filled in the
+     // shared cache, so the first-use host upload never runs on the decode
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+@@ -474,6 +474,13 @@
+     _static_partition_reserved = true;
+ }
+ 
++std::vector<uint32_t> OffloadExpertWeightProvider::static_partition_members() const {
++    if (!_static_partition) return {};
++    return _census_seed_active
++               ? _census_seed
++               : static_partition_resident_experts(_static_seed, layer_key(), _config.num_expert, _capacity);
++}
++
+ lgc::nvme_fill::FillBatch OffloadExpertWeightProvider::pinned_nvme_fill_batch(std::uint32_t layer_index) const {
+     lgc::nvme_fill::FillBatch batch;
+     batch.layer = layer_index;
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/host_expert_bank.hpp
+@@ -0,0 +1,608 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++#pragma once
++
++// arcint (patch 0072). A host RAM bank for the CPU tier's expert bytes.
++//
++// Before this patch the CPU tier read every expert in place from a shared
++// read-only mapping of the weight file (ParallelWeightReader::mapped). When
++// the host-tier experts do not fit in the page cache (Flash-Next: 56.4 GiB of
++// expert constants against a 44-52 GiB host), each miss arrives as a series
++// of 128 KiB page-fault reads on the worker that touches it: measured on the
++// served decode, the tier's workers spend 13-17 % of the wall in
++// folio_wait_bit_common. An madvise(WILLNEED) prefetch did not help (the
++// kernel caps one call at max(io_pages, ra_pages) = 128 KiB there), and a
++// 4 MiB readahead doubled the bytes read.
++//
++// The bank reads one expert's spans whole, with O_DIRECT, into slots of an
++// anonymous mapping, on its own IO threads, issued when the tier call is
++// dispatched; the caller computes the experts already present first and
++// queues a missing expert's compute when its last span has landed. The bytes
++// are the file's bytes (the same ones the mapping shows), so the tier's
++// output is unchanged. Eviction is LRU over slots not pinned by a running
++// call; a request that finds no free or evictable slot, or whose bytes are
++// being read for another caller, is answered Unbanked and the caller reads
++// the mapping as before.
++//
++// Header-only so the unit cells (moe_host_expert_bank_test.cpp) build
++// without the plugin. Linux only (O_DIRECT, mmap/madvise), like the tier.
++
++#include <algorithm>
++#include <atomic>
++#include <cerrno>
++#include <condition_variable>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <deque>
++#include <functional>
++#include <iterator>
++#include <list>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <vector>
++
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <unistd.h>
++#include <unordered_set>
++
++namespace ov::intel_gpu::ocl::moe {
++
++struct BankSpan {
++    uint64_t file_offset = 0;
++    size_t bytes = 0;
++};
++
++class HostExpertBank {
++public:
++    static constexpr int kMaxSpans = 12;
++    static constexpr size_t kAlign = 4096;       // O_DIRECT offset/length/buffer alignment
++    static constexpr size_t kSlotRound = 65536;  // slot sizes are rounded to this (size classes)
++
++    enum class State { Ready, Pending, Unbanked };
++
++    struct Lease {
++        State state = State::Unbanked;
++        uint32_t slot = 0;
++        int n = 0;
++        const uint8_t* ptr[kMaxSpans] = {};
++    };
++
++    struct Stats {
++        uint64_t hits = 0;
++        uint64_t misses = 0;
++        uint64_t unbanked = 0;
++        uint64_t evictions = 0;
++        uint64_t bytes_read = 0;
++        uint64_t read_errors = 0;
++        uint64_t filled = 0;           // experts installed by fill_layer
++        uint64_t fill_bytes_read = 0;  // bytes the layer fills read
++        uint64_t fill_layers = 0;
++        uint64_t callback_errors = 0;
++        size_t slots = 0;
++        size_t reserved_bytes = 0;
++    };
++
++    // Opens `path` with O_DIRECT (throws when it cannot) and reserves
++    // `budget_bytes` of address space (MAP_NORESERVE; pages exist once read
++    // into). io_threads read spans concurrently.
++    HostExpertBank(const std::string& path, size_t budget_bytes, int io_threads) : _budget(budget_bytes) {
++        _fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
++        if (_fd < 0)
++            throw std::runtime_error("MOE_CPU_BANK: cannot open " + path + " with O_DIRECT: " + std::strerror(errno));
++        void* m = ::mmap(nullptr, _budget, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++        if (m == MAP_FAILED) {
++            ::close(_fd);
++            throw std::runtime_error("MOE_CPU_BANK: cannot reserve " + std::to_string(_budget) + " bytes");
++        }
++        _base = static_cast<uint8_t*>(m);
++        ::madvise(_base, _budget, MADV_HUGEPAGE);
++        for (int i = 0; i < std::max(1, io_threads); i++)
++            _io.emplace_back([this] { io_loop(); });
++        _fill_thread = std::thread([this] { fill_loop(); });
++    }
++
++    ~HostExpertBank() {
++        {
++            std::lock_guard<std::mutex> lock(_fill_m);
++            _fill_stop = true;
++        }
++        _fill_cv.notify_all();
++        _fill_thread.join();
++        {
++            std::lock_guard<std::mutex> lock(_io_m);
++            _stop = true;
++        }
++        _io_cv.notify_all();
++        for (auto& t : _io)
++            t.join();
++        ::munmap(_base, _budget);
++        ::close(_fd);
++    }
++
++    HostExpertBank(const HostExpertBank&) = delete;
++    HostExpertBank& operator=(const HostExpertBank&) = delete;
++
++    // The bytes a record of these spans occupies in a slot: each span read
++    // as its 4 KiB-aligned superset, back to back.
++    static size_t record_bytes(const BankSpan* spans, int n) {
++        size_t total = 0;
++        for (int i = 0; i < n; i++)
++            total += aligned_len(spans[i]);
++        return total;
++    }
++
++    // Pins the slot of (layer_key, expert) until release(). Ready: the bytes
++    // are in the bank. Pending: they are not, and this caller must call
++    // fetch(lease.slot, ...) exactly once. Unbanked: no slot (the caller reads
++    // the mapping); nothing to release. The pointers are valid for Ready and
++    // Pending (the latter's bytes land before fetch's callback runs).
++    Lease acquire(uint64_t layer_key, uint32_t expert, const BankSpan* spans, int n) {
++        Lease lease;
++        if (n <= 0 || n > kMaxSpans)
++            return count_unbanked(lease);
++        const size_t rec = record_bytes(spans, n);
++        const size_t cls = (rec + kSlotRound - 1) / kSlotRound * kSlotRound;
++        std::lock_guard<std::mutex> lock(_m);
++        const Key key{layer_key, expert};
++        auto it = _index.find(key);
++        if (it != _index.end()) {
++            Slot& s = _slots[it->second];
++            if (s.state == SlotState::Reading || !same_spans(s, spans, n)) {
++                // Being read for another caller (or a key reused with other
++                // spans, which the tier never does): read the mapping.
++                return count_unbanked(lease);
++            }
++            s.pins++;
++            touch(it->second);
++            _stats.hits++;
++            return fill_lease(lease, it->second, spans, n, State::Ready);
++        }
++        uint32_t idx = 0;
++        if (!take_slot(cls, idx))
++            return count_unbanked(lease);
++        Slot& s = _slots[idx];
++        s.key = key;
++        s.state = SlotState::Reading;
++        s.n = n;
++        s.record = rec;
++        for (int i = 0; i < n; i++)
++            s.spans[i] = spans[i];
++        s.pins = 1;
++        _index[key] = idx;
++        touch(idx);
++        _stats.misses++;
++        return fill_lease(lease, idx, spans, n, State::Pending);
++    }
++
++    // Reads a Pending slot's spans on the IO threads. done(ok) runs once, on
++    // an IO thread, after the last span has landed; ok=false after a read
++    // error (the slot is dropped, the caller must read the mapping).
++    void fetch(uint32_t slot, std::function<void(bool)> done) {
++        Slot* s = nullptr;
++        {
++            std::lock_guard<std::mutex> lock(_m);
++            s = &_slots[slot];
++            s->left.store(s->n, std::memory_order_relaxed);
++            s->failed.store(false, std::memory_order_relaxed);
++            s->done = std::move(done);
++        }
++        {
++            std::lock_guard<std::mutex> lock(_io_m);
++            for (int i = 0; i < s->n; i++)
++                _io_q.push_back(IoJob{slot, i});
++        }
++        _io_cv.notify_all();
++    }
++
++    // Queues a load-time fill of one layer, run on the bank's fill thread:
++    // `experts` in order (the caller's priority), expert e's span r at
++    // role0[r].file_offset + e * role0[r].bytes (the tier's per-tensor
++    // arrays), each role read as ONE sequential range and copied into the
++    // slots. It takes only new slots while the budget has room (it never
++    // evicts), skips experts already present, and runs once per layer_key.
++    // Acquires of an expert being filled answer Unbanked meanwhile.
++    void fill_layer(uint64_t layer_key, std::vector<uint32_t> experts, std::vector<BankSpan> role0) {
++        if (role0.empty() || role0.size() > static_cast<size_t>(kMaxSpans))
++            return;
++        {
++            std::lock_guard<std::mutex> lock(_fill_m);
++            if (!_fill_keys.insert(layer_key).second)
++                return;
++            _fill_q.push_back(FillJob{layer_key, std::move(experts), std::move(role0)});
++        }
++        _fill_cv.notify_all();
++    }
++
++    // Blocks until every queued layer fill has run.
++    void wait_fill_idle() {
++        std::unique_lock<std::mutex> lock(_fill_m);
++        _fill_cv.wait(lock, [this] { return _fill_q.empty() && !_fill_busy; });
++    }
++
++    void release(uint32_t slot) {
++        std::lock_guard<std::mutex> lock(_m);
++        Slot& s = _slots[slot];
++        if (s.pins > 0)
++            s.pins--;
++    }
++
++    Stats stats() const {
++        std::lock_guard<std::mutex> lock(_m);
++        Stats st = _stats;
++        st.unbanked = _unbanked.load(std::memory_order_relaxed);
++        st.bytes_read = _bytes_read.load(std::memory_order_relaxed);
++        st.callback_errors = _callback_errors.load(std::memory_order_relaxed);
++        st.slots = _slots.size();
++        st.reserved_bytes = _used;
++        return st;
++    }
++
++private:
++    enum class SlotState { Empty, Reading, Ready };
++
++    struct Key {
++        uint64_t layer_key;
++        uint32_t expert;
++        bool operator==(const Key& o) const {
++            return layer_key == o.layer_key && expert == o.expert;
++        }
++    };
++    struct KeyHash {
++        size_t operator()(const Key& k) const {
++            return std::hash<uint64_t>()(k.layer_key * 0x9E3779B97F4A7C15ull ^ k.expert);
++        }
++    };
++
++    struct Slot {
++        uint8_t* mem = nullptr;
++        size_t cls = 0;
++        Key key{0, 0};
++        SlotState state = SlotState::Empty;
++        int n = 0;
++        size_t record = 0;
++        BankSpan spans[kMaxSpans];
++        int pins = 0;
++        std::list<uint32_t>::iterator lru;
++        bool in_lru = false;
++        std::atomic<int> left{0};
++        std::atomic<bool> failed{false};
++        std::function<void(bool)> done;
++    };
++
++    struct IoJob {
++        uint32_t slot;
++        int span;
++    };
++
++    static uint64_t align_down(uint64_t v) {
++        return v / kAlign * kAlign;
++    }
++    static size_t aligned_len(const BankSpan& sp) {
++        const uint64_t b = align_down(sp.file_offset);
++        const uint64_t e = (sp.file_offset + sp.bytes + kAlign - 1) / kAlign * kAlign;
++        return static_cast<size_t>(e - b);
++    }
++
++    Lease& count_unbanked(Lease& lease) {
++        _unbanked.fetch_add(1, std::memory_order_relaxed);
++        lease.state = State::Unbanked;
++        return lease;
++    }
++
++    Lease& fill_lease(Lease& lease, uint32_t idx, const BankSpan* spans, int n, State st) {
++        lease.state = st;
++        lease.slot = idx;
++        lease.n = n;
++        size_t off = 0;
++        for (int i = 0; i < n; i++) {
++            lease.ptr[i] = _slots[idx].mem + off + (spans[i].file_offset - align_down(spans[i].file_offset));
++            off += aligned_len(spans[i]);
++        }
++        return lease;
++    }
++
++    static bool same_spans(const Slot& s, const BankSpan* spans, int n) {
++        if (s.n != n)
++            return false;
++        for (int i = 0; i < n; i++) {
++            if (s.spans[i].file_offset != spans[i].file_offset || s.spans[i].bytes != spans[i].bytes)
++                return false;
++        }
++        return true;
++    }
++
++    // A fresh slot of class `cls` from the unreserved budget, or none.
++    // Called under _m.
++    bool new_slot(size_t cls, uint32_t& idx) {
++        if (_used + cls > _budget)
++            return false;
++        _slots.emplace_back();
++        idx = static_cast<uint32_t>(_slots.size() - 1);
++        _slots[idx].mem = _base + _used;
++        _slots[idx].cls = cls;
++        _used += cls;
++        return true;
++    }
++
++    void touch_back(uint32_t idx) {
++        Slot& s = _slots[idx];
++        if (s.in_lru)
++            _lru.erase(s.lru);
++        _lru.push_back(idx);
++        s.lru = std::prev(_lru.end());
++        s.in_lru = true;
++    }
++
++    struct FillJob {
++        uint64_t layer_key;
++        std::vector<uint32_t> experts;
++        std::vector<BankSpan> role0;
++    };
++
++    void fill_loop() {
++        for (;;) {
++            FillJob job;
++            {
++                std::unique_lock<std::mutex> lock(_fill_m);
++                _fill_cv.wait(lock, [this] { return _fill_stop || !_fill_q.empty(); });
++                if (_fill_stop)
++                    return;
++                job = std::move(_fill_q.front());
++                _fill_q.pop_front();
++                _fill_busy = true;
++            }
++            run_fill(job);
++            {
++                std::lock_guard<std::mutex> lock(_fill_m);
++                _fill_busy = false;
++            }
++            _fill_cv.notify_all();
++        }
++    }
++
++    void run_fill(const FillJob& job) {
++        const int n = static_cast<int>(job.role0.size());
++        struct Item {
++            uint32_t slot;
++            BankSpan sp[kMaxSpans];
++        };
++        std::vector<Item> items;
++        {
++            std::lock_guard<std::mutex> lock(_m);
++            for (uint32_t e : job.experts) {
++                Item it{};
++                for (int r = 0; r < n; r++)
++                    it.sp[r] = BankSpan{job.role0[r].file_offset + static_cast<uint64_t>(e) * job.role0[r].bytes,
++                                        job.role0[r].bytes};
++                const Key key{job.layer_key, e};
++                if (_index.count(key))
++                    continue;
++                const size_t rec = record_bytes(it.sp, n);
++                const size_t cls = (rec + kSlotRound - 1) / kSlotRound * kSlotRound;
++                if (!new_slot(cls, it.slot))
++                    break;
++                Slot& s = _slots[it.slot];
++                s.key = key;
++                s.state = SlotState::Reading;
++                s.n = n;
++                s.record = rec;
++                for (int r = 0; r < n; r++)
++                    s.spans[r] = it.sp[r];
++                s.pins = 1;
++                _index[key] = it.slot;
++                touch_back(it.slot);
++                items.push_back(it);
++            }
++        }
++        if (items.empty())
++            return;
++        std::vector<bool> ok(items.size(), true);
++        uint64_t read_total = 0;
++        for (int r = 0; r < n; r++) {
++            if (job.role0[r].bytes == 0)
++                continue;
++            uint64_t lo = UINT64_MAX, hi = 0;
++            for (const auto& it : items) {
++                lo = std::min(lo, align_down(it.sp[r].file_offset));
++                hi = std::max(hi, align_down(it.sp[r].file_offset) + aligned_len(it.sp[r]));
++            }
++            const size_t len = static_cast<size_t>(hi - lo);
++            void* m = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++            if (m == MAP_FAILED) {
++                std::fill(ok.begin(), ok.end(), false);
++                break;
++            }
++            auto* buf = static_cast<uint8_t*>(m);
++            size_t got = 0;
++            while (got < len) {
++                const size_t want = std::min(len - got, size_t{64} << 20);
++                const ssize_t rd = ::pread(_fd, buf + got, want, static_cast<off_t>(lo + got));
++                if (rd < 0 && errno == EINTR)
++                    continue;
++                if (rd <= 0)
++                    break;
++                got += static_cast<size_t>(rd);
++            }
++            read_total += got;
++            for (size_t k = 0; k < items.size(); k++) {
++                const BankSpan& sp = items[k].sp[r];
++                const uint64_t b = align_down(sp.file_offset);
++                if (sp.file_offset + sp.bytes - lo > got) {
++                    ok[k] = false;
++                    continue;
++                }
++                size_t off = 0;
++                for (int i = 0; i < r; i++)
++                    off += aligned_len(items[k].sp[i]);
++                const size_t avail = std::min(aligned_len(sp), static_cast<size_t>(got - (b - lo)));
++                std::memcpy(_slots_at(items[k].slot).mem + off, buf + (b - lo), avail);
++            }
++            ::munmap(m, len);
++        }
++        std::lock_guard<std::mutex> lock(_m);
++        for (size_t k = 0; k < items.size(); k++) {
++            Slot& s = _slots[items[k].slot];
++            s.pins = 0;
++            if (ok[k]) {
++                s.state = SlotState::Ready;
++                _stats.filled++;
++            } else {
++                _index.erase(s.key);
++                s.state = SlotState::Empty;
++                _stats.read_errors++;
++            }
++        }
++        _stats.fill_bytes_read += read_total;
++        _stats.fill_layers++;
++    }
++
++    void touch(uint32_t idx) {
++        Slot& s = _slots[idx];
++        if (s.in_lru)
++            _lru.erase(s.lru);
++        _lru.push_front(idx);
++        s.lru = _lru.begin();
++        s.in_lru = true;
++    }
++
++    // A slot of size class `cls`: a new one while the budget has room, else
++    // the least recently used slot of that class that is neither pinned nor
++    // being read. Called under _m.
++    bool take_slot(size_t cls, uint32_t& idx) {
++        if (new_slot(cls, idx))
++            return true;
++        for (auto it = _lru.rbegin(); it != _lru.rend(); ++it) {
++            Slot& s = _slots[*it];
++            if (s.cls == cls && s.pins == 0 && s.state != SlotState::Reading) {
++                idx = *it;
++                if (s.state == SlotState::Ready) {
++                    _index.erase(s.key);
++                    _stats.evictions++;
++                }
++                s.state = SlotState::Empty;
++                return true;
++            }
++        }
++        return false;
++    }
++
++    void io_loop() {
++        for (;;) {
++            IoJob job;
++            {
++                std::unique_lock<std::mutex> lock(_io_m);
++                _io_cv.wait(lock, [this] { return _stop || !_io_q.empty(); });
++                // At stop the queue is dropped, not drained: its callbacks
++                // may point into objects already destroyed at process exit.
++                if (_stop)
++                    return;
++                job = _io_q.front();
++                _io_q.pop_front();
++            }
++            Slot& s = _slots_at(job.slot);
++            const BankSpan sp = s.spans[job.span];
++            size_t off = 0;
++            for (int i = 0; i < job.span; i++)
++                off += aligned_len(s.spans[i]);
++            const uint64_t b = align_down(sp.file_offset);
++            const size_t len = aligned_len(sp);
++            const size_t need = static_cast<size_t>(sp.file_offset + sp.bytes - b);
++            size_t got = 0;
++            bool ok = true;
++            while (got < len) {
++                const ssize_t r = ::pread(_fd, s.mem + off + got, len - got, static_cast<off_t>(b + got));
++                if (r < 0 && errno == EINTR)
++                    continue;
++                if (r <= 0)
++                    break;  // an error, or EOF exactly at an aligned boundary
++                got += static_cast<size_t>(r);
++                if (static_cast<size_t>(r) < len - (got - static_cast<size_t>(r)))
++                    break;  // a short read on a regular file is the file's end
++            }
++            if (got < need)
++                ok = false;
++            if (!ok)
++                s.failed.store(true, std::memory_order_relaxed);
++            _bytes_read.fetch_add(got, std::memory_order_relaxed);
++            if (s.left.fetch_sub(1, std::memory_order_acq_rel) == 1)
++                finish(job.slot);
++        }
++    }
++
++    Slot& _slots_at(uint32_t idx) {
++        std::lock_guard<std::mutex> lock(_m);
++        return _slots[idx];
++    }
++
++    void finish(uint32_t idx) {
++        std::function<void(bool)> done;
++        bool ok = true;
++        {
++            std::lock_guard<std::mutex> lock(_m);
++            Slot& s = _slots[idx];
++            ok = !s.failed.load(std::memory_order_relaxed);
++            if (ok) {
++                s.state = SlotState::Ready;
++            } else {
++                _index.erase(s.key);
++                s.state = SlotState::Empty;
++                _stats.read_errors++;
++            }
++            done = std::move(s.done);
++            s.done = nullptr;
++        }
++        if (done) {
++            // The callback is the caller's; an exception must not end the
++            // IO thread (std::terminate). It is counted, and the caller's
++            // own bookkeeping (patch 0072's dispatch) catches its errors.
++            try {
++                done(ok);
++            } catch (...) {
++                _callback_errors.fetch_add(1, std::memory_order_relaxed);
++            }
++        }
++    }
++
++    int _fd = -1;
++    uint8_t* _base = nullptr;
++    size_t _budget = 0;
++    size_t _used = 0;
++
++    mutable std::mutex _m;
++    // std::deque keeps element addresses stable while slots are added, so an
++    // IO thread may hold a Slot& across a concurrent acquire().
++    std::deque<Slot> _slots;
++    std::unordered_map<Key, uint32_t, KeyHash> _index;
++    std::list<uint32_t> _lru;
++    Stats _stats;
++
++    std::atomic<uint64_t> _unbanked{0};
++    std::atomic<uint64_t> _bytes_read{0};
++    std::atomic<uint64_t> _callback_errors{0};
++
++    std::mutex _io_m;
++    std::condition_variable _io_cv;
++    std::deque<IoJob> _io_q;
++    bool _stop = false;
++    std::vector<std::thread> _io;
++
++    std::mutex _fill_m;
++    std::condition_variable _fill_cv;
++    std::deque<FillJob> _fill_q;
++    std::unordered_set<uint64_t> _fill_keys;
++    bool _fill_busy = false;
++    bool _fill_stop = false;
++    std::thread _fill_thread;
++
++};
++
++}  // namespace ov::intel_gpu::ocl::moe
+--- /dev/null
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_host_expert_bank_test.cpp
+@@ -0,0 +1,322 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++// arcint (patch 0072). Cells for the CPU tier's host expert bank
++// (moe/host_expert_bank.hpp). They read a scratch file with O_DIRECT, so it
++// lives on a filesystem that takes O_DIRECT: MOE_BANK_TEST_DIR, default
++// /var/tmp.
++
++#include <gtest/gtest.h>
++
++#include <chrono>
++#include <condition_variable>
++#include <cstdlib>
++#include <fstream>
++#include <memory>
++#include <mutex>
++#include <random>
++#include <string>
++#include <vector>
++
++#include <fcntl.h>
++#include <unistd.h>
++
++#include "ocl_v2/moe/host_expert_bank.hpp"
++
++using ov::intel_gpu::ocl::moe::BankSpan;
++using ov::intel_gpu::ocl::moe::HostExpertBank;
++
++namespace {
++
++struct ScratchFile {
++    std::string path;
++    std::vector<uint8_t> bytes;
++    explicit ScratchFile(size_t size) {
++        const char* dir = std::getenv("MOE_BANK_TEST_DIR");
++        path = std::string(dir ? dir : "/var/tmp") + "/moe_bank_test_" + std::to_string(::getpid()) + ".bin";
++        std::mt19937 rng(7);
++        bytes.resize(size);
++        for (auto& b : bytes)
++            b = static_cast<uint8_t>(rng());
++        {
++            std::ofstream f(path, std::ios::binary);
++            f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
++        }
++        const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
++        direct_ok = fd >= 0;
++        if (fd >= 0)
++            ::close(fd);
++    }
++    bool direct_ok = false;
++    ~ScratchFile() {
++        ::unlink(path.c_str());
++    }
++};
++
++// The bank opens its file with O_DIRECT; a filesystem that refuses it
++// (tmpfs) skips the cell by name rather than failing it.
++#define REQUIRE_DIRECT(f) \
++    if (!(f).direct_ok) \
++    GTEST_SKIP() << "O_DIRECT refused under " << (f).path << "; set MOE_BANK_TEST_DIR"
++
++// fetch() and a wait for its callback. The state is shared with the
++// callback, so a timed-out wait leaves nothing dangling behind it.
++bool fetch_and_wait(HostExpertBank& bank, uint32_t slot) {
++    struct State {
++        std::mutex m;
++        std::condition_variable cv;
++        bool fired = false, ok = false;
++    };
++    auto st = std::make_shared<State>();
++    bank.fetch(slot, [st](bool r) {
++        std::lock_guard<std::mutex> lock(st->m);
++        st->ok = r;
++        st->fired = true;
++        st->cv.notify_all();
++    });
++    std::unique_lock<std::mutex> lock(st->m);
++    EXPECT_TRUE(st->cv.wait_for(lock, std::chrono::seconds(20), [&] { return st->fired; }));
++    return st->ok;
++}
++
++void expect_span_bytes(const ScratchFile& f, const HostExpertBank::Lease& lease, const BankSpan* spans, int n) {
++    ASSERT_EQ(lease.n, n);
++    for (int i = 0; i < n; i++) {
++        ASSERT_NE(lease.ptr[i], nullptr);
++        EXPECT_EQ(0, std::memcmp(lease.ptr[i], f.bytes.data() + spans[i].file_offset, spans[i].bytes)) << "span " << i;
++    }
++}
++
++// An expert's record: unaligned spans of the tier's sizes, the last one
++// ending at the (unaligned) end of the file.
++std::vector<BankSpan> spans_of(size_t file_size, uint64_t first) {
++    std::vector<BankSpan> s = {{first + 17, 409600}, {first + 409617 + 300, 204800}, {first + 1000001, 102400}};
++    s.push_back({file_size - 81931, 81931});
++    return s;
++}
++
++constexpr size_t kFile = 6 * 1024 * 1024 + 4321;
++constexpr size_t MiB = 1024 * 1024;
++
++}  // namespace
++
++TEST(moe_host_expert_bank, every_span_holds_the_file_bytes_at_its_unaligned_offset) {
++    ScratchFile f(kFile);
++    REQUIRE_DIRECT(f);
++    HostExpertBank bank(f.path, 64 * MiB, 4);
++    auto sp = spans_of(kFile, 0);
++    auto lease = bank.acquire(11, 3, sp.data(), static_cast<int>(sp.size()));
++    ASSERT_EQ(lease.state, HostExpertBank::State::Pending);
++    ASSERT_TRUE(fetch_and_wait(bank, lease.slot));
++    expect_span_bytes(f, lease, sp.data(), static_cast<int>(sp.size()));
++    bank.release(lease.slot);
++    EXPECT_EQ(bank.stats().read_errors, 0u);
++}
++
++TEST(moe_host_expert_bank, a_second_acquire_is_a_hit_that_reads_nothing) {
++    ScratchFile f(kFile);
++    REQUIRE_DIRECT(f);
++    HostExpertBank bank(f.path, 64 * MiB, 4);
++    auto sp = spans_of(kFile, 4096);
++    auto a = bank.acquire(11, 3, sp.data(), static_cast<int>(sp.size()));
++    ASSERT_EQ(a.state, HostExpertBank::State::Pending);
++    ASSERT_TRUE(fetch_and_wait(bank, a.slot));
++    bank.release(a.slot);
++    const uint64_t read = bank.stats().bytes_read;
++    auto b = bank.acquire(11, 3, sp.data(), static_cast<int>(sp.size()));
++    ASSERT_EQ(b.state, HostExpertBank::State::Ready);
++    EXPECT_EQ(b.slot, a.slot);
++    expect_span_bytes(f, b, sp.data(), static_cast<int>(sp.size()));
++    bank.release(b.slot);
++    EXPECT_EQ(bank.stats().bytes_read, read);
++    EXPECT_EQ(bank.stats().hits, 1u);
++    EXPECT_EQ(bank.stats().misses, 1u);
++}
++
++TEST(moe_host_expert_bank, lru_evicts_the_least_recent_unpinned_slot_and_never_a_pinned_one) {
++    ScratchFile f(kFile);
++    REQUIRE_DIRECT(f);
++    auto sp = spans_of(kFile, 0);
++    const int n = static_cast<int>(sp.size());
++    const size_t cls = (HostExpertBank::record_bytes(sp.data(), n) + HostExpertBank::kSlotRound - 1) /
++                       HostExpertBank::kSlotRound * HostExpertBank::kSlotRound;
++    HostExpertBank bank(f.path, 2 * cls, 2);  // room for two slots
++    for (uint32_t e : {1u, 2u}) {
++        auto l = bank.acquire(5, e, sp.data(), n);
++        ASSERT_EQ(l.state, HostExpertBank::State::Pending);
++        ASSERT_TRUE(fetch_and_wait(bank, l.slot));
++        bank.release(l.slot);
++    }
++    auto t = bank.acquire(5, 1, sp.data(), n);  // expert 1 becomes the most recent
++    ASSERT_EQ(t.state, HostExpertBank::State::Ready);
++    bank.release(t.slot);
++    auto c = bank.acquire(5, 3, sp.data(), n);  // evicts expert 2
++    ASSERT_EQ(c.state, HostExpertBank::State::Pending);
++    ASSERT_TRUE(fetch_and_wait(bank, c.slot));
++    expect_span_bytes(f, c, sp.data(), n);
++    EXPECT_EQ(bank.stats().evictions, 1u);
++    auto one = bank.acquire(5, 1, sp.data(), n);
++    EXPECT_EQ(one.state, HostExpertBank::State::Ready);
++    // Both slots pinned now (expert 3 and expert 1): a fourth expert has no
++    // slot, and expert 2 is gone.
++    auto d = bank.acquire(5, 4, sp.data(), n);
++    EXPECT_EQ(d.state, HostExpertBank::State::Unbanked);
++    auto two = bank.acquire(5, 2, sp.data(), n);
++    EXPECT_EQ(two.state, HostExpertBank::State::Unbanked);
++    expect_span_bytes(f, one, sp.data(), n);
++    bank.release(one.slot);
++    bank.release(c.slot);
++    EXPECT_EQ(bank.stats().evictions, 1u);
++}
++
++TEST(moe_host_expert_bank, a_short_read_fails_the_fetch_and_drops_the_slot) {
++    ScratchFile f(kFile);
++    REQUIRE_DIRECT(f);
++    HostExpertBank bank(f.path, 64 * MiB, 2);
++    std::vector<BankSpan> sp = {{4096, 8192}, {kFile - 100, 4096}};  // the second runs past the end
++    auto l = bank.acquire(9, 0, sp.data(), 2);
++    ASSERT_EQ(l.state, HostExpertBank::State::Pending);
++    EXPECT_FALSE(fetch_and_wait(bank, l.slot));
++    bank.release(l.slot);
++    EXPECT_EQ(bank.stats().read_errors, 1u);
++    auto again = bank.acquire(9, 0, sp.data(), 2);
++    EXPECT_EQ(again.state, HostExpertBank::State::Pending);  // not Ready: the failed bytes are not served
++    ASSERT_FALSE(fetch_and_wait(bank, again.slot));
++    bank.release(again.slot);
++}
++
++TEST(moe_host_expert_bank, a_record_being_read_is_unbanked_for_a_second_caller) {
++    ScratchFile f(kFile);
++    REQUIRE_DIRECT(f);
++    HostExpertBank bank(f.path, 64 * MiB, 2);
++    auto sp = spans_of(kFile, 0);
++    const int n = static_cast<int>(sp.size());
++    auto a = bank.acquire(2, 7, sp.data(), n);
++    ASSERT_EQ(a.state, HostExpertBank::State::Pending);
++    auto b = bank.acquire(2, 7, sp.data(), n);
++    EXPECT_EQ(b.state, HostExpertBank::State::Unbanked);
++    ASSERT_TRUE(fetch_and_wait(bank, a.slot));
++    bank.release(a.slot);
++    auto c = bank.acquire(2, 7, sp.data(), n);
++    EXPECT_EQ(c.state, HostExpertBank::State::Ready);
++    bank.release(c.slot);
++    EXPECT_EQ(bank.stats().unbanked, 1u);
++}
++
++TEST(moe_host_expert_bank, a_full_bank_of_one_size_class_does_not_evict_for_another) {
++    ScratchFile f(kFile);
++    REQUIRE_DIRECT(f);
++    auto big = spans_of(kFile, 0);
++    const int nb = static_cast<int>(big.size());
++    const size_t cls = (HostExpertBank::record_bytes(big.data(), nb) + HostExpertBank::kSlotRound - 1) /
++                       HostExpertBank::kSlotRound * HostExpertBank::kSlotRound;
++    HostExpertBank bank(f.path, cls, 2);  // one big slot
++    auto a = bank.acquire(1, 1, big.data(), nb);
++    ASSERT_EQ(a.state, HostExpertBank::State::Pending);
++    ASSERT_TRUE(fetch_and_wait(bank, a.slot));
++    bank.release(a.slot);
++    std::vector<BankSpan> small = {{8192, 4096}};
++    auto s = bank.acquire(1, 2, small.data(), 1);
++    EXPECT_EQ(s.state, HostExpertBank::State::Unbanked);
++    EXPECT_EQ(bank.stats().evictions, 0u);
++    auto again = bank.acquire(1, 1, big.data(), nb);
++    EXPECT_EQ(again.state, HostExpertBank::State::Ready);
++    bank.release(again.slot);
++}
++
++namespace {
++
++// Three per-tensor arrays of 8 experts at unaligned bases, as the tier's
++// weight file lays them out (expert e of role r at base_r + e * bytes_r).
++std::vector<BankSpan> role0_of() {
++    return {{4096 * 3 + 17, 40960 + 17}, {4096 * 3 + 17 + 8 * (40960 + 17) + 100, 20000}, {5 * 1024 * 1024 + 5, 8192}};
++}
++std::vector<BankSpan> expert_spans(const std::vector<BankSpan>& role0, uint32_t e) {
++    std::vector<BankSpan> s;
++    for (const auto& r : role0)
++        s.push_back({r.file_offset + e * r.bytes, r.bytes});
++    return s;
++}
++
++}  // namespace
++
++TEST(moe_host_expert_bank, a_layer_fill_installs_the_listed_experts_with_their_file_bytes) {
++    ScratchFile f(kFile);
++    REQUIRE_DIRECT(f);
++    HostExpertBank bank(f.path, 64 * MiB, 2);
++    const auto role0 = role0_of();
++    bank.fill_layer(77, {5, 1, 6}, role0);
++    bank.wait_fill_idle();
++    EXPECT_EQ(bank.stats().filled, 3u);
++    EXPECT_GT(bank.stats().fill_bytes_read, 0u);
++    for (uint32_t e : {5u, 1u, 6u}) {
++        const auto sp = expert_spans(role0, e);
++        auto l = bank.acquire(77, e, sp.data(), 3);
++        ASSERT_EQ(l.state, HostExpertBank::State::Ready) << "expert " << e;
++        expect_span_bytes(f, l, sp.data(), 3);
++        bank.release(l.slot);
++    }
++    const auto sp2 = expert_spans(role0, 2);
++    auto two = bank.acquire(77, 2, sp2.data(), 3);
++    EXPECT_EQ(two.state, HostExpertBank::State::Pending);  // not listed, not filled
++    ASSERT_TRUE(fetch_and_wait(bank, two.slot));
++    bank.release(two.slot);
++    EXPECT_EQ(bank.stats().bytes_read > 0, true);
++}
++
++TEST(moe_host_expert_bank, a_layer_fill_stops_at_the_budget_and_never_evicts) {
++    ScratchFile f(kFile);
++    REQUIRE_DIRECT(f);
++    const auto role0 = role0_of();
++    const auto sp0 = expert_spans(role0, 0);
++    const size_t cls = (HostExpertBank::record_bytes(sp0.data(), 3) + HostExpertBank::kSlotRound - 1) /
++                       HostExpertBank::kSlotRound * HostExpertBank::kSlotRound;
++    HostExpertBank bank(f.path, 2 * cls + cls / 2, 2);  // two slots and a half
++    auto d = bank.acquire(78, 7, expert_spans(role0, 7).data(), 3);  // a demand slot, released
++    ASSERT_EQ(d.state, HostExpertBank::State::Pending);
++    ASSERT_TRUE(fetch_and_wait(bank, d.slot));
++    bank.release(d.slot);
++    bank.fill_layer(78, {0, 1, 2}, role0);
++    bank.wait_fill_idle();
++    EXPECT_EQ(bank.stats().filled, 1u);  // one fresh slot was left
++    EXPECT_EQ(bank.stats().evictions, 0u);
++    auto seven = bank.acquire(78, 7, expert_spans(role0, 7).data(), 3);
++    EXPECT_EQ(seven.state, HostExpertBank::State::Ready);  // the demand slot survived the fill
++    bank.release(seven.slot);
++}
++
++TEST(moe_host_expert_bank, a_layer_fill_skips_present_experts_and_runs_once_per_layer) {
++    ScratchFile f(kFile);
++    REQUIRE_DIRECT(f);
++    HostExpertBank bank(f.path, 64 * MiB, 2);
++    const auto role0 = role0_of();
++    auto one = bank.acquire(79, 1, expert_spans(role0, 1).data(), 3);
++    ASSERT_EQ(one.state, HostExpertBank::State::Pending);
++    ASSERT_TRUE(fetch_and_wait(bank, one.slot));
++    bank.release(one.slot);
++    bank.fill_layer(79, {1, 2}, role0);
++    bank.wait_fill_idle();
++    EXPECT_EQ(bank.stats().filled, 1u);
++    const uint64_t read = bank.stats().fill_bytes_read;
++    bank.fill_layer(79, {3, 4}, role0);  // the same layer again: nothing runs
++    bank.wait_fill_idle();
++    EXPECT_EQ(bank.stats().filled, 1u);
++    EXPECT_EQ(bank.stats().fill_bytes_read, read);
++    EXPECT_EQ(bank.stats().fill_layers, 1u);
++}
++
++TEST(moe_host_expert_bank, a_key_asked_for_with_other_spans_is_unbanked) {
++    ScratchFile f(kFile);
++    REQUIRE_DIRECT(f);
++    HostExpertBank bank(f.path, 64 * MiB, 2);
++    std::vector<BankSpan> a = {{8192 + 5, 30000}, {65536, 4096}};
++    std::vector<BankSpan> b = {{8192 + 5, 30000}, {65536 + 4096, 4096}};  // same count and record size
++    ASSERT_EQ(HostExpertBank::record_bytes(a.data(), 2), HostExpertBank::record_bytes(b.data(), 2));
++    auto la = bank.acquire(3, 3, a.data(), 2);
++    ASSERT_EQ(la.state, HostExpertBank::State::Pending);
++    ASSERT_TRUE(fetch_and_wait(bank, la.slot));
++    bank.release(la.slot);
++    auto lb = bank.acquire(3, 3, b.data(), 2);
++    EXPECT_EQ(lb.state, HostExpertBank::State::Unbanked);
++}

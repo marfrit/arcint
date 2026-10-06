@@ -75,6 +75,23 @@ _LM_HEAD = "output.weight"
 
 # --- pin-key-suffix -> (gguf name / names, reshape kind) ---------------------
 # Per-decoder-layer keys, relative to "layers.{i}." ; {i} -> blk.{i} in GGUF.
+# THE CONVERTER'S FOLDS (2026-09-18, campaign serving-shape-logits). The GGUF
+# stores two families TRANSFORMED into the form llama.cpp's graph multiplies
+# directly (`src/models/qwen4exp.cpp`, `code`: "the converter folded each
+# gamma to (1 + w)" at build_hc_mix; `gate = alpha_softplus * ssm_a  //
+# -A_log.exp() * softplus` in the GDN). The pin applies both transforms
+# ITSELF -- `Qwen4ExpTextRMSNorm` multiplies by (1 + w) with a zero-init w
+# (pin 171), the GDN computes -exp(A_log) -- so a feed that hands the stored
+# value over doubles them, and every parity leg against the pin still reads
+# 0.0 because both sides hold the same wrong number. The kinds below undo the
+# folds: `gamma1` = stored - 1 for every plain-RMSNorm gamma (hyper-connection,
+# PLE, attention q/k), `neglog` = log(-stored) for A_log. `ssm_norm` is the
+# GATED norm (ones-init, multiplied as is): stored unfolded, fed as `vec`.
+# Measured on the dev host (France ids, depth 1, the pin's modules fed here
+# against llama.cpp's per-tensor tap of the same GGUF): with the folds undone
+# the hyper-connection mix matches to 0.0036 on values of ~0.6 (corr 1.0000);
+# fed as stored it was 1.69x too large, and the served logits at depth 48 sat
+# at KL 12.4 nats against the model's own capture.
 _LAYER_MAP = {
     # GatedDeltaNet (linear_attn). in_proj_qkv/z land on the GGUF attn_qkv/attn_gate
     # names (QWEN35 convention -- these are the GDN input projections, NOT a QSA
@@ -86,7 +103,7 @@ _LAYER_MAP = {
     "linear_attn.in_proj_z.weight": ("attn_gate.weight", "direct2d"),
     "linear_attn.in_proj_a.weight": ("ssm_alpha.weight", "direct2d"),
     "linear_attn.in_proj_b.weight": ("ssm_beta.weight", "direct2d"),
-    "linear_attn.A_log": ("ssm_a", "vec"),
+    "linear_attn.A_log": ("ssm_a", "neglog"),      # stored -exp(A_log)
     "linear_attn.dt_bias": ("ssm_dt.bias", "vec"),
     "linear_attn.conv1d.weight": ("ssm_conv1d.weight", "conv"),
     "linear_attn.norm.weight": ("ssm_norm.weight", "vec"),
@@ -101,11 +118,11 @@ _LAYER_MAP = {
     "mlp.shared_expert.down_proj.weight": ("ffn_down_shexp.weight", "direct2d"),
     "mlp.shared_expert_gate.weight": ("ffn_gate_inp_shexp.weight", "row"),
     # GatedResidual hyper-connection mixers (qwen4exp-only; mapped by name/shape).
-    "attn_hyper_connection.hc_norm.weight": ("hc_attn_norm.weight", "vec"),
+    "attn_hyper_connection.hc_norm.weight": ("hc_attn_norm.weight", "gamma1"),
     "attn_hyper_connection.input_mix_weight_down.weight": ("hc_attn_down.weight", "direct2d"),
     "attn_hyper_connection.input_mix_weight_up.weight": ("hc_attn_up.weight", "direct2d"),
     "attn_hyper_connection.block_inject_weight.weight": ("hc_attn_inject.weight", "direct2d"),
-    "mlp_hyper_connection.hc_norm.weight": ("hc_ffn_norm.weight", "vec"),
+    "mlp_hyper_connection.hc_norm.weight": ("hc_ffn_norm.weight", "gamma1"),
     "mlp_hyper_connection.input_mix_weight_down.weight": ("hc_ffn_down.weight", "direct2d"),
     "mlp_hyper_connection.input_mix_weight_up.weight": ("hc_ffn_up.weight", "direct2d"),
     "mlp_hyper_connection.block_inject_weight.weight": ("hc_ffn_inject.weight", "direct2d"),
@@ -115,30 +132,37 @@ _LAYER_MAP = {
     # the pin recomputes them from config, so they are not fed.
     "ple.key_proj.weight": ("ple_key.weight", "direct2d"),
     "ple.value_proj.weight": ("ple_value.weight", "direct2d"),
-    "ple.norm_key.weight": ("ple_norm_key.weight", "vec"),
-    "ple.norm_query.weight": ("ple_norm_query.weight", "vec"),
-    "ple.norm_conv.weight": ("ple_norm_conv.weight", "vec"),
+    "ple.norm_key.weight": ("ple_norm_key.weight", "gamma1"),
+    "ple.norm_query.weight": ("ple_norm_query.weight", "gamma1"),
+    "ple.norm_conv.weight": ("ple_norm_conv.weight", "gamma1"),
     "ple.conv1d.weight": ("ple_conv1d.weight", "conv"),
     # DENSE-CAUSAL full-attention layer (CORRECTION 2026-09-12: the QSA
     # selection branch lives in the INDEXER sub-module and is the only ruled-out
     # part; the dense projections below feed the emitted attention block
     # tools/q4e/attention.py on the pin's own GGUF attn_q/k/v/output names,
     # reached via the `self_attn.` prefix (distinct from the GDN input
-    # projections, which land on attn_qkv/attn_gate). The indexer's weights
-    # (indexer.q_proj/k_proj/q_norm/k_norm) are deliberately NOT mapped: the
-    # selection branch is not emitted.
+    # projections, which land on attn_qkv/attn_gate). The indexer -- the
+    # sparse-attention selection branch -- is NOT emitted by the serving-shape
+    # graph (dense attention), but the full-depth exact reference
+    # (tools/ref_forward_stream.py) runs the pin's own sparse path past the
+    # QSA boundary and needs it (2026-09-19): the pin fuses q|k into one
+    # `index_qk_proj` (q rows first, pin `torch.split`), its two norms are
+    # the (1 + w) RMSNorm like every other gamma.
+    "self_attn.indexer.index_qk_proj.weight": (("indexer.q_proj.weight", "indexer.k_proj.weight"), "fuse_qk"),
+    "self_attn.indexer.q_layernorm.weight": ("indexer.q_norm.weight", "gamma1"),
+    "self_attn.indexer.k_layernorm.weight": ("indexer.k_norm.weight", "gamma1"),
     "self_attn.q_proj.weight": ("attn_q.weight", "direct2d"),
     "self_attn.k_proj.weight": ("attn_k.weight", "direct2d"),
     "self_attn.v_proj.weight": ("attn_v.weight", "direct2d"),
     "self_attn.o_proj.weight": ("attn_output.weight", "direct2d"),
-    "self_attn.q_norm.weight": ("attn_q_norm.weight", "vec"),
-    "self_attn.k_norm.weight": ("attn_k_norm.weight", "vec"),
+    "self_attn.q_norm.weight": ("attn_q_norm.weight", "gamma1"),
+    "self_attn.k_norm.weight": ("attn_k_norm.weight", "gamma1"),
 }
 
 # Global (non-per-layer) keys.
 _GLOBAL_MAP = {
     "embed_tokens.weight": ("token_embd.weight", "direct2d"),
-    "hyper_connection_mixer.hc_norm.weight": ("output_hc_norm.weight", "vec"),
+    "hyper_connection_mixer.hc_norm.weight": ("output_hc_norm.weight", "gamma1"),
     "hyper_connection_mixer.input_mix_weight_down.weight": ("output_hc_down.weight", "direct2d"),
     "hyper_connection_mixer.input_mix_weight_up.weight": ("output_hc_up.weight", "direct2d"),
     # The LM head. PIN-vs-CHECKPOINT DIVERGENCE (measured; module header): the
@@ -172,12 +196,23 @@ def _dequant(reader_tensor, rows=None):
     if rows is not None:
         data = data[:rows]
     name = qt.name
-    if name in ("F32", "F16", "BF16"):
-        arr = np.asarray(data)
-        if name != "F32":
-            arr = arr.astype(np.float32)
-        return np.ascontiguousarray(arr, dtype=np.float32)
-    return _gguf_quants.dequantize(data, qt).astype(np.float32)
+    if name in ("F32", "F16"):
+        arr = np.ascontiguousarray(np.asarray(data), dtype=np.float32)
+    else:
+        # BF16 included: gguf-py hands it over as raw bytes (uint8, twice the
+        # row width; numpy has no bfloat16), and a plain cast turned those
+        # bytes into values 0..255 until 2026-09-28. gguf.quants converts it
+        # bit-exactly.
+        arr = _gguf_quants.dequantize(data, qt).astype(np.float32)
+    # The logical shape, whatever the reader's storage layout: a tensor wider
+    # than the header says is the failure `fitted` used to crop silently.
+    want = tuple(int(x) for x in reversed(reader_tensor.shape))
+    if rows is not None:
+        want = (min(int(rows), want[0]),) + want[1:]
+    if arr.shape != want:
+        raise ValueError(f"{reader_tensor.name}: {name} dequantised to {arr.shape}, "
+                         f"the header says {want}")
+    return arr
 
 
 class GgufFeed:
@@ -247,6 +282,31 @@ class GgufFeed:
         if gguf_name not in self._index:
             raise KeyError(f"GGUF tensor {gguf_name!r} not in any shard")
         return _dequant(self._index[gguf_name], rows=rows)
+
+    def mapped(self, gguf_name, kind, rows=None, fuse_ff=None):
+        """One GGUF tensor by its OWN name through a reshape kind (the kinds
+        of `_LAYER_MAP` / `_GLOBAL_MAP`), without the qwen4_exp pin-key map.
+
+        The `qwen3_5_moe` serving-shape emitter (`serving_shape.
+        build_qwen35moe_serving_shape_ir`) carries its own module-relative key
+        table and reads the GGUF directly; routing it through `pin_tensor`
+        would need a second pin map whose only consumer is that emitter. This
+        exposes the same `_materialise` those maps run on, so a fed tensor is
+        reshaped/folded exactly as everywhere else (FIX D applies to
+        `fuse_gate_up`, `neglog` refuses a non-negative stored `ssm_a`)."""
+        return self._materialise(gguf_name, kind, rows=rows, fuse_ff=fuse_ff)
+
+    def raw_rows(self, gguf_name, rows=None):
+        """The tensor's BLOCK BYTES as the shard holds them, u8 with the
+        reader's own leading axes (an expert tensor: [E, out, row_bytes]),
+        the leading axis cut to `rows`. Nothing is dequantised: this is what
+        q4e.native_blocks re-lays per role, so the experts stay the
+        checkpoint's own numbers (DESIGN 7.0.2bz)."""
+        if gguf_name not in self._index:
+            raise KeyError(f"GGUF tensor {gguf_name!r} not in any shard")
+        t = self._index[gguf_name]
+        data = t.data if rows is None else t.data[:rows]
+        return np.ascontiguousarray(data, dtype=np.uint8)
 
     # -- name-mapped ---------------------------------------------------------
     def _split_key(self, pin_key):
@@ -345,8 +405,15 @@ class GgufFeed:
         # rows slices the leading axis only for kinds whose pin leading axis IS
         # the GGUF leading axis; vec/row/conv are small and their leading axes
         # differ, so they dequant whole.
-        row_kinds = ("direct2d", "expert3d", "fuse_gate_up")
+        row_kinds = ("direct2d", "expert3d", "fuse_gate_up", "fuse_qk")
         r = rows if kind in row_kinds else None
+        if kind == "fuse_qk":                          # [q_out, H] ++ [k_out, H] -> [(q+k)_out, H]
+            qname, kname = gname
+            q = _dequant(self._index[qname]); k = _dequant(self._index[kname])
+            if q.ndim != 2 or k.ndim != 2 or q.shape[1] != k.shape[1]:
+                raise ValueError(f"fuse_qk: {qname} {q.shape} and {kname} {k.shape} do not stack on axis 0")
+            fused = np.concatenate([q, k], axis=0)
+            return np.ascontiguousarray(fused if r is None else fused[:r])
         if kind == "fuse_gate_up":
             gate = self.dequant(gname[0], rows=r)      # [E, ff, in]
             up = self.dequant(gname[1], rows=r)        # [E, ff, in]
@@ -366,6 +433,14 @@ class GgufFeed:
         arr = self.dequant(gname, rows=r)
         if kind in ("direct2d", "vec", "expert3d"):
             return arr
+        if kind == "gamma1":                           # stored (1 + w) -> w
+            return (arr - np.float32(1.0)).astype(np.float32)
+        if kind == "neglog":                           # stored -exp(A_log) -> A_log
+            if not bool((arr < 0).all()):
+                raise ValueError(
+                    f"{gname}: expected every stored value negative (-exp(A_log)), "
+                    f"min {float(arr.min())} max {float(arr.max())}")
+            return np.log(-arr).astype(np.float32)
         if kind == "row":                              # 1D [H] -> [1, H]
             return arr.reshape(1, -1)
         if kind == "conv":                             # [C, K] -> [C, 1, K]

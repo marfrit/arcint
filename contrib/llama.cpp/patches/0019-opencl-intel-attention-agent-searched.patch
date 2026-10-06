@@ -1,0 +1,526 @@
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
+index 5fc1740..a5703eb 100644
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
+@@ -41,6 +41,14 @@
+ #define NKB (BK / 16)
+ #define NDC (DV / 16)
+ #define NTHR (NSG * SG)
++// the SG 16 kernel stages a K or V tile with at most four 8-value units a
++// work-item (unrolled; the host builds NSG 16 with BK 32)
++#if BK * DK / 8 > 4 * NTHR
++#error "flash_attn_dpas.cl (SG 16): a K / V tile needs more than four units a work-item"
++#endif
++#if KC % 2 != 0
++#error "flash_attn_dpas.cl (SG 16): Q K^T runs as two chains over halves of DK / 16"
++#endif
+ 
+ #else
+ // SG 8 (Xe-HPG): a pair of sub-groups shares 8 query rows, each owning half
+@@ -75,9 +83,7 @@ static inline half8 load8(const int t, const global char * row, const int c8) {
+     const uchar8 n = (c8 & 2) ? (q >> (uchar8)(4)) : (q & (uchar8)(15));
+     return convert_half8((convert_float8(n) - 8.f) * d);
+ }
+-#if SG == 16
+-#define LOAD_A(p) as_short8(intel_sub_group_block_read_us8((local const ushort *)(p)))
+-#else
++#if SG == 8
+ #define LOAD_A(p) as_int8(intel_sub_group_block_read8((local const uint *)(p)))
+ #endif
+ #define M_INIT (-3.0e38f)
+@@ -98,9 +104,7 @@ kernel void flash_attn_f32_f16_dpas(
+         ulong o_nb1, ulong o_nb2, ulong o_nb3,
+         ulong mask_nb1, ulong mask_nb2, ulong mask_nb3, int mask_ne2, int mask_ne3,
+         int n_batch, int k_ne3, int v_ne3) {
+-    local half qs[BQ * DK];     // [row group][k16 chunk][8 rows][16]
+-    local half ks[BK * DK];     // [key][DK]
+-    local half vt[DV * BK];     // [column][key]
++    local half kv[BK * DK];     // one buffer (16 KB at DK 256): K, then rewritten as V
+ 
+     const int lane = get_sub_group_local_id(), sg = get_sub_group_id(), lid = get_local_id(0);
+     const int head = get_group_id(1), batch = get_group_id(2);
+@@ -114,11 +118,6 @@ kernel void flash_attn_f32_f16_dpas(
+         ? (global const half *)(mask_void + mask_offset + (batch % mask_ne3) * mask_nb3 + (head % mask_ne2) * mask_nb2)
+         : 0;
+ 
+-    for (int u = lid; u < BQ * DK; u += NTHR) {
+-        const int r = u / DK, d = u % DK, qr = q0 + r;
+-        const float x = qr < n_q ? ((global const float *)(qb + qr * q_nb1))[d] * scale : 0.f;
+-        qs[(((r >> 3) * KC + (d >> 4)) * 8 + (r & 7)) * 16 + (d & 15)] = (half) x;
+-    }
+     // the last key any row of the work-group sees: a row a work-item, its
+     // masked tail scanned backwards (short for a causal mask)
+     int kv_end = n_kv;
+@@ -138,35 +137,101 @@ kernel void flash_attn_f32_f16_dpas(
+     float m[8], l[8];
+     for (int r = 0; r < 8; ++r) { m[r] = M_INIT; l[r] = 0.f; }
+     const int q_sg = q0 + sg * 8;
++    // prefetch the first K tile while the Q registers are built, so the Q
++    // loop hides the K global-load latency
++    half8 kp0, kp1, kp2, kp3;
++    {
++        int u = lid;
++        if (u < BK * DK / 8) { const int key = u / (DK / 8), c8 = u % (DK / 8); kp0 = load8(KT, kb + min(key, n_kv - 1) * k_nb1, c8); }
++        u += NTHR;
++        if (u < BK * DK / 8) { const int key = u / (DK / 8), c8 = u % (DK / 8); kp1 = load8(KT, kb + min(key, n_kv - 1) * k_nb1, c8); }
++        u += NTHR;
++        if (u < BK * DK / 8) { const int key = u / (DK / 8), c8 = u % (DK / 8); kp2 = load8(KT, kb + min(key, n_kv - 1) * k_nb1, c8); }
++        u += NTHR;
++        if (u < BK * DK / 8) { const int key = u / (DK / 8), c8 = u % (DK / 8); kp3 = load8(KT, kb + min(key, n_kv - 1) * k_nb1, c8); }
++    }
++    // Q is constant across every key tile, so the DPAS a-operand registers
++    // are built once straight from global memory: no local staging of Q, no
++    // qs buffer, no barrier. The a operand (M=8 rows, K=16) is distributed
++    // lane = K-element (column), component = M row, so lane i holds column
++    // c*16+i of all 8 rows.
++    short8 qreg[KC];
++    {
++        const int d0 = lane;
++        for (int c = 0; c < KC; ++c) {
++            half hv[8];
++            for (int j = 0; j < 8; ++j) {
++                const int qr = q_sg + j;
++                const float xv = qr < n_q ? ((global const float *)(qb + qr * q_nb1))[c * 16 + d0] * scale : 0.f;
++                hv[j] = (half) xv;
++            }
++            qreg[c] = as_short8((half8)(hv[0], hv[1], hv[2], hv[3], hv[4], hv[5], hv[6], hv[7]));
++        }
++    }
++
++    // K is staged in the single buffer, S runs from the K layout, the buffer
++    // is then rewritten transposed as V and PV runs. Halving local memory is
++    // what buys resident work-groups on this card, so the extra barriers are
++    // paid for on purpose.
++    {
++        int u = lid;
++        if (u < BK * DK / 8) { const int key = u / (DK / 8), c8 = u % (DK / 8); vstore8(kp0, 0, kv + key * DK + 8 * c8); }
++        u += NTHR;
++        if (u < BK * DK / 8) { const int key = u / (DK / 8), c8 = u % (DK / 8); vstore8(kp1, 0, kv + key * DK + 8 * c8); }
++        u += NTHR;
++        if (u < BK * DK / 8) { const int key = u / (DK / 8), c8 = u % (DK / 8); vstore8(kp2, 0, kv + key * DK + 8 * c8); }
++        u += NTHR;
++        if (u < BK * DK / 8) { const int key = u / (DK / 8), c8 = u % (DK / 8); vstore8(kp3, 0, kv + key * DK + 8 * c8); }
++    }
+ 
+     for (int t0 = 0; t0 < kv_end; t0 += BK) {
++        // prefetch this tile's V into registers before the barrier, so the
++        // loads are already in flight while the work-group syncs
++        half8 vp0, vp1, vp2, vp3;
++        {
++            int u = lid;
++            if (u < BK * DK / 8) { const int key = u % BK, c8 = u / BK; vp0 = load8(VT, vb + min(t0 + key, n_kv - 1) * v_nb1, c8); }
++            u += NTHR;
++            if (u < BK * DK / 8) { const int key = u % BK, c8 = u / BK; vp1 = load8(VT, vb + min(t0 + key, n_kv - 1) * v_nb1, c8); }
++            u += NTHR;
++            if (u < BK * DK / 8) { const int key = u % BK, c8 = u / BK; vp2 = load8(VT, vb + min(t0 + key, n_kv - 1) * v_nb1, c8); }
++            u += NTHR;
++            if (u < BK * DK / 8) { const int key = u % BK, c8 = u / BK; vp3 = load8(VT, vb + min(t0 + key, n_kv - 1) * v_nb1, c8); }
++        }
+         barrier(CLK_LOCAL_MEM_FENCE);
+-        for (int u = lid; u < BK * DK / 8; u += NTHR) {
+-            const int key = u / (DK / 8), c8 = u % (DK / 8), kk = min(t0 + key, n_kv - 1);
+-            vstore8(load8(KT, kb + kk * k_nb1, c8), 0, ks + key * DK + 8 * c8);
++        // c outer, g inner: Q a-operand reused across key groups; the K
++        // reduction is split in two so four independent DPAS chains overlap
++        float8 s0[NKB], s1[NKB];
++        for (int g = 0; g < NKB; ++g) { s0[g] = (float8)(0.f); s1[g] = (float8)(0.f); }
++        for (int c = 0; c < KC / 2; ++c) {
++            const short8 a0 = qreg[c];
++            const short8 a1 = qreg[c + KC / 2];
++            for (int g = 0; g < NKB; ++g) {
++                const int8 b0 = as_int8(vload8(0, (local const uint *)(kv + (g * 16 + lane) * DK + c * 16)));
++                s0[g] = DPAS(a0, b0, s0[g]);
++                const int8 b1 = as_int8(vload8(0, (local const uint *)(kv + (g * 16 + lane) * DK + (c + KC / 2) * 16)));
++                s1[g] = DPAS(a1, b1, s1[g]);
++            }
+         }
++        float8 s[NKB];
++        for (int g = 0; g < NKB; ++g) s[g] = s0[g] + s1[g];
++        barrier(CLK_LOCAL_MEM_FENCE);   // S reads done: kv may be overwritten
+         // V transposed with the key fastest: neighbouring lanes store
+         // neighbouring halves (key-major, they all hit one bank)
+-        for (int u = lid; u < BK * DK / 8; u += NTHR) {
+-            const int key = u % BK, c8 = u / BK, kk = min(t0 + key, n_kv - 1);
+-            const half8 vv8 = load8(VT, vb + kk * v_nb1, c8);
+-            const half vv[8] = { vv8.s0, vv8.s1, vv8.s2, vv8.s3, vv8.s4, vv8.s5, vv8.s6, vv8.s7 };
+-            for (int j = 0; j < 8; ++j) vt[(8 * c8 + j) * BK + key] = vv[j];
++        {
++            int u = lid;
++            if (u < BK * DK / 8) { const int key = u % BK, c8 = u / BK; const half vv[8] = { vp0.s0, vp0.s1, vp0.s2, vp0.s3, vp0.s4, vp0.s5, vp0.s6, vp0.s7 }; for (int j = 0; j < 8; ++j) kv[(8 * c8 + j) * BK + key] = vv[j]; }
++            u += NTHR;
++            if (u < BK * DK / 8) { const int key = u % BK, c8 = u / BK; const half vv[8] = { vp1.s0, vp1.s1, vp1.s2, vp1.s3, vp1.s4, vp1.s5, vp1.s6, vp1.s7 }; for (int j = 0; j < 8; ++j) kv[(8 * c8 + j) * BK + key] = vv[j]; }
++            u += NTHR;
++            if (u < BK * DK / 8) { const int key = u % BK, c8 = u / BK; const half vv[8] = { vp2.s0, vp2.s1, vp2.s2, vp2.s3, vp2.s4, vp2.s5, vp2.s6, vp2.s7 }; for (int j = 0; j < 8; ++j) kv[(8 * c8 + j) * BK + key] = vv[j]; }
++            u += NTHR;
++            if (u < BK * DK / 8) { const int key = u % BK, c8 = u / BK; const half vv[8] = { vp3.s0, vp3.s1, vp3.s2, vp3.s3, vp3.s4, vp3.s5, vp3.s6, vp3.s7 }; for (int j = 0; j < 8; ++j) kv[(8 * c8 + j) * BK + key] = vv[j]; }
+         }
+-        barrier(CLK_LOCAL_MEM_FENCE);
+-
+-        float8 s[NKB];
+-        for (int g = 0; g < NKB; ++g) {
+-            float8 acc = (float8)(0.f);
+-            for (int c = 0; c < KC; ++c) {
+-                const short8 a = LOAD_A(qs + ((sg * KC + c) * 8) * 16);
+-                const int8   b = as_int8(vload8(0, (local const uint *)(ks + (g * 16 + lane) * DK + c * 16)));
+-                acc = DPAS(a, b, acc);
+-            }
+-            s[g] = acc;
+-        }
+-        float mrow[8];
+-        for (int r = 0; r < 8; ++r) mrow[r] = m[r];
++        barrier(CLK_LOCAL_MEM_FENCE);   // V ready
++        // mask all groups first, then one row-max reduction per row: the
++        // elementwise max over the NKB key groups is taken before the
++        // sub-group reduction, so 8 reductions replace NKB * 8
+         for (int g = 0; g < NKB; ++g) {
+             const int key = t0 + g * 16 + lane;
+             float sv[8] = { s[g].s0, s[g].s1, s[g].s2, s[g].s3, s[g].s4, s[g].s5, s[g].s6, s[g].s7 };
+@@ -177,18 +242,49 @@ kernel void flash_attn_f32_f16_dpas(
+                 const float mk  = (float) mh;
+                 const bool  vis = key < n_kv && q_sg + r < n_q && as_ushort(mh) != 0xFC00;   // -inf: masked
+                 sv[r] = vis ? sv[r] + mk : M_INIT;
+-                mrow[r] = fmax(mrow[r], sub_group_reduce_max(sv[r]));
+             }
+             s[g] = (float8)(sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7]);
+         }
++        float smax[8];
++        {
++            const float sv[8] = { s[0].s0, s[0].s1, s[0].s2, s[0].s3, s[0].s4, s[0].s5, s[0].s6, s[0].s7 };
++            for (int r = 0; r < 8; ++r) smax[r] = sv[r];
++        }
++        for (int g = 1; g < NKB; ++g) {
++            const float sv[8] = { s[g].s0, s[g].s1, s[g].s2, s[g].s3, s[g].s4, s[g].s5, s[g].s6, s[g].s7 };
++            for (int r = 0; r < 8; ++r) smax[r] = fmax(smax[r], sv[r]);
++        }
++        // ONE reduction decides whether any row's running max can move: when
++        // it cannot (the common case past the diagonal) the 8 row reductions
++        // and the whole rescale are skipped
++        float dmax = -3.0e38f;
++        for (int r = 0; r < 8; ++r) dmax = fmax(dmax, smax[r] - m[r]);
++        int anyg = (dmax > 0.f) ? 1 : 0;
++        anyg |= intel_sub_group_shuffle_xor(anyg, 8);
++        anyg |= intel_sub_group_shuffle_xor(anyg, 4);
++        anyg |= intel_sub_group_shuffle_xor(anyg, 2);
++        anyg |= intel_sub_group_shuffle_xor(anyg, 1);
+         float corr[8];
+-        for (int r = 0; r < 8; ++r) {
+-            corr[r] = m[r] > 0.5f * M_INIT ? native_exp(m[r] - mrow[r]) : 0.f;
+-            m[r]    = mrow[r];
+-            l[r]   *= corr[r];
++        if (anyg) {
++            for (int r = 0; r < 8; ++r) {
++                const float mrow = fmax(m[r], sub_group_reduce_max(smax[r]));
++                if (mrow > m[r]) {
++                    // no M_INIT guard: on a row's first visible tile m - mrow
++                    // is about -3e38, which native_exp takes to 0; the guard's
++                    // select costs the q8_0 build 896 bytes of spill and 15 %
++                    // of pp512 (measured-here)
++                    corr[r] = native_exp(m[r] - mrow);
++                    l[r]   *= corr[r];
++                } else {
++                    corr[r] = 1.0f;
++                }
++                m[r] = mrow;
++            }
++            const float8 cv = (float8)(corr[0], corr[1], corr[2], corr[3], corr[4], corr[5], corr[6], corr[7]);
++            for (int c = 0; c < NDC; ++c) o[c] *= cv;
++        } else {
++            for (int r = 0; r < 8; ++r) corr[r] = 1.0f;
+         }
+-        const float8 cv = (float8)(corr[0], corr[1], corr[2], corr[3], corr[4], corr[5], corr[6], corr[7]);
+-        for (int c = 0; c < NDC; ++c) o[c] *= cv;
+         short8 pa[NKB];
+         for (int g = 0; g < NKB; ++g) {
+             float sv[8] = { s[g].s0, s[g].s1, s[g].s2, s[g].s3, s[g].s4, s[g].s5, s[g].s6, s[g].s7 };
+@@ -201,13 +297,22 @@ kernel void flash_attn_f32_f16_dpas(
+             pa[g] = as_short8((half8)(ph[0], ph[1], ph[2], ph[3], ph[4], ph[5], ph[6], ph[7]));
+         }
+         for (int c = 0; c < NDC; ++c) {
++            const local half * vrow = kv + (c * 16 + lane) * BK;
+             float8 acc = o[c];
+             for (int g = 0; g < NKB; ++g) {
+-                const int8 b = as_int8(vload8(0, (local const uint *)(vt + (c * 16 + lane) * BK + g * 16)));
++                const int8 b = as_int8(vload8(0, (local const uint *)(vrow + g * 16)));
+                 acc = DPAS(pa[g], b, acc);
+             }
+             o[c] = acc;
+         }
++        barrier(CLK_LOCAL_MEM_FENCE);   // PV reads done: kv may be overwritten
++        const int t1 = t0 + BK;
++        if (t1 < kv_end) {
++            for (int u = lid; u < BK * DK / 8; u += NTHR) {
++                const int key = u / (DK / 8), c8 = u % (DK / 8), kk = min(t1 + key, n_kv - 1);
++                vstore8(load8(KT, kb + kk * k_nb1, c8), 0, kv + key * DK + 8 * c8);
++            }
++        }
+     }
+ 
+     float lv[8];
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
+index f938712..f175e14 100644
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
+@@ -12,13 +12,14 @@
+ //
+ // Query "rows" are (head, token) pairs: row m is query head hk * G + m % G,
+ // token m / G, G = n_head / n_head_kv. GQA_SIDES sub-groups own 8 rows (the
+-// DPAS M), each a range of the output columns, each computing S itself. Per
+-// BK keys the work-group stages V in local memory as f16, transposed with
+-// the key fastest and converted from its cache type once (flash_attn_dpas.cl's
+-// staging). Then per 16 keys: S = Q K^T by DPAS (Q the a operand, kept in
+-// registers; K the b operand read straight from the cache by its key's lane,
+-// or staged too with GQA_K_STAGED), the mask added, the online softmax in
+-// f32, and O += P V by DPAS (P is S's layout read as the a operand). The
++// DPAS M), each a range of the output columns; with GQA_S_SPLIT they split S
++// by 16-key group and exchange it through local memory. Per BK keys: S =
++// Q K^T by DPAS (Q the a operand, kept in registers; K the b operand read
++// straight from the cache by its key's lane, or staged with GQA_K_STAGED),
++// then V staged in local memory as f16, transposed with the key fastest and
++// converted from its cache type once (flash_attn_dpas.cl's staging), one
++// barrier covering V and the S exchange; the mask added, the online softmax
++// in f32, and O += P V by DPAS (P is S's layout read as the a operand). The
+ // result is flash_attn_f32_merge's partial record (m, l and the unnormalized
+ // O of each (head, token) and split).
+ //
+@@ -56,6 +57,9 @@
+ #define BK 32                   // keys a staged tile
+ #endif
+ #define NKB (BK / 16)
++#if DK % 64 != 0 || DV % 64 != 0
++#error "flash_attn_gqa_dpas.cl stages K and V rows in 64-value units"
++#endif
+ #define M_INIT (-3.0e38f)
+ #define PARTIAL (2 + DV)
+ #ifndef KT
+@@ -101,6 +105,16 @@ static inline int8 kb16(const int t, const global char * row, const int c) {
+ }
+ #endif
+ 
++// 16 consecutive values (two 8-value units); for f16 one 32-byte load, so the
++// staging load uses a whole 32-byte sector rather than half of one
++static inline half16 load16(const int t, const global char * row, const int c16) {
++    if (t == 0) return vload16(c16, (const global half *) row);
++    const half8 a = load8(t, row, 2 * c16);
++    const half8 b = load8(t, row, 2 * c16 + 1);
++    return (half16)(a.s0, a.s1, a.s2, a.s3, a.s4, a.s5, a.s6, a.s7,
++                    b.s0, b.s1, b.s2, b.s3, b.s4, b.s5, b.s6, b.s7);
++}
++
+ __attribute__((intel_reqd_sub_group_size(16)))
+ kernel void flash_attn_gqa_dpas(
+     const global void * q_void, ulong q_offset,
+@@ -129,9 +143,10 @@ kernel void flash_attn_gqa_dpas(
+ #endif
+     local half vt[DV * BK];     // [column][key]
+ #ifdef GQA_S_SPLIT
+-    // the sides of a tile split Q K^T by 16-key group and exchange S here:
+-    // [tile][group][row][key], up to 8 tiles
+-    local float sx[8 * NKB * 8 * 16];
++    // the sides of a tile split Q K^T by 16-key group and exchange S here,
++    // up to 8 tiles: [tile][group][lane][row], rows contiguous per lane, so
++    // the exchange is one vstore8 / vload8
++    local float sx[8 * NKB * 16 * 8];
+ #endif
+ 
+     const int lane  = get_sub_group_local_id();
+@@ -157,8 +172,9 @@ kernel void flash_attn_gqa_dpas(
+         rt[r] = rv[r] ? m / G : 0;
+     }
+ 
+-    float m[8], l[8];
+-    for (int r = 0; r < 8; ++r) { m[r] = M_INIT; l[r] = 0.f; }
++    float m[8];
++    float8 lv = (float8)(0.f);
++    for (int r = 0; r < 8; ++r) m[r] = M_INIT;
+     float8 o[NDH];
+     for (int i = 0; i < NDH; ++i) o[i] = (float8)(0.f);
+ 
+@@ -183,64 +199,26 @@ kernel void flash_attn_gqa_dpas(
+             : 0;
+     }
+ 
+-#if defined(GQA_PF) && GQA_PF > 0
+-    // (off by default: 8 gains 7 % alone, but with GQA_S_SPLIT, or at 4,
+-    // IGC falls back to a rolled, spilling form at 2-2.5x the time,
+-    // measured-here.)
+-    // V prefetch: a work-item's first GQA_PF staging units of the next tile
+-    // are loaded into registers right after the staging barrier, so the
+-    // loads are in flight while the products run; the rest of the tile (a
+-    // small work-group) is loaded at staging time as before
+-    half8 pv[GQA_PF];
+-    for (int i = 0; i < GQA_PF; ++i) {
+-        const int u = lid + i * nthr;
+-        if (u < BK * DV / 8 && kv_start < kv_end)
+-            pv[i] = load8(VT, vb + min(kv_start + u % BK, kv_end - 1) * v_nb1, u / BK);
+-    }
+-#endif
+     for (int k0 = kv_start; k0 < kv_end; k0 += BK) {
+         barrier(CLK_LOCAL_MEM_FENCE);
+ #ifdef GQA_K_STAGED
+-        for (int u = lid; u < BK * DK / 8; u += nthr) {
+-            const int key = u / (DK / 8), c8 = u % (DK / 8), kk = min(k0 + key, kv_end - 1);
+-            vstore8(load8(KT, kb + kk * k_nb1, c8), 0, ks + key * DK + 8 * c8);
+-        }
+-#endif
+-        // V transposed with the key fastest: neighbouring lanes store
+-        // neighbouring halves
+-#if defined(GQA_PF) && GQA_PF > 0
+-        for (int i = 0; i < GQA_PF; ++i) {
+-            const int u = lid + i * nthr;
+-            if (u < BK * DV / 8) {
+-                const int  key = u % BK, c8 = u / BK;
+-                const half vv[8] = { pv[i].s0, pv[i].s1, pv[i].s2, pv[i].s3, pv[i].s4, pv[i].s5, pv[i].s6, pv[i].s7 };
+-                for (int j = 0; j < 8; ++j) vt[(8 * c8 + j) * BK + key] = vv[j];
+-            }
+-        }
+-        for (int u = lid + GQA_PF * nthr; u < BK * DV / 8; u += nthr) {
+-#else
+-        for (int u = lid; u < BK * DV / 8; u += nthr) {
+-#endif
+-            const int key = u % BK, c8 = u / BK, kk = min(k0 + key, kv_end - 1);
+-            const half8 vv8 = load8(VT, vb + kk * v_nb1, c8);
+-            const half vv[8] = { vv8.s0, vv8.s1, vv8.s2, vv8.s3, vv8.s4, vv8.s5, vv8.s6, vv8.s7 };
+-            for (int j = 0; j < 8; ++j) vt[(8 * c8 + j) * BK + key] = vv[j];
++        for (int u = lid; u < BK * DK / 64; u += nthr) {
++            const int key = u / (DK / 64), c64 = u % (DK / 64), kk = min(k0 + key, kv_end - 1);
++            const global char * krow = kb + kk * k_nb1;
++            vstore16(load16(KT, krow, 4 * c64), 0, ks + key * DK + 64 * c64);
++            vstore16(load16(KT, krow, 4 * c64 + 1), 0, ks + key * DK + 64 * c64 + 16);
++            vstore16(load16(KT, krow, 4 * c64 + 2), 0, ks + key * DK + 64 * c64 + 32);
++            vstore16(load16(KT, krow, 4 * c64 + 3), 0, ks + key * DK + 64 * c64 + 48);
+         }
++        // staged K is read through local memory, so it needs a barrier before
++        // QK^T; K direct (f16) reads global and needs none
+         barrier(CLK_LOCAL_MEM_FENCE);
+-#if defined(GQA_PF) && GQA_PF > 0
+-        if (k0 + BK < kv_end) {
+-            for (int i = 0; i < GQA_PF; ++i) {
+-                const int u = lid + i * nthr;
+-                if (u < BK * DV / 8)
+-                    pv[i] = load8(VT, vb + min(k0 + BK + u % BK, kv_end - 1) * v_nb1, u / BK);
+-            }
+-        }
+ #endif
+-
++        // QK^T
+         float8 s[NKB];
+         for (int g = 0; g < NKB; ++g) {
+ #ifdef GQA_S_SPLIT
+-            if (g % GQA_SIDES != side) continue;   // another side of this tile computes it
++            if (g % GQA_SIDES != side) continue;
+ #endif
+             float8 acc = (float8)(0.f);
+             for (int c = 0; c < KC; ++c) {
+@@ -253,51 +231,79 @@ kernel void flash_attn_gqa_dpas(
+             }
+             s[g] = acc;
+ #ifdef GQA_S_SPLIT
+-            const float sv[8] = { acc.s0, acc.s1, acc.s2, acc.s3, acc.s4, acc.s5, acc.s6, acc.s7 };
+-            for (int r = 0; r < 8; ++r) sx[((tile * NKB + g) * 8 + r) * 16 + lane] = sv[r];
++            vstore8(acc, 0, sx + ((tile * NKB + g) * 16 + lane) * 8);
+ #endif
+         }
+-#ifdef GQA_S_SPLIT
++        // QK^T ran before the V staging, so the one barrier below covers both
++        // the V tile and the S exchange
++        // V transposed with the key fastest: neighbouring lanes store
++        // neighbouring halves
++        for (int u = lid; u < BK * DV / 64; u += nthr) {
++            const int key = u % BK, c64 = u / BK, kk = min(k0 + key, kv_end - 1);
++            const global char * vrow = vb + kk * v_nb1;
++            const half16 v0 = load16(VT, vrow, 4 * c64);
++            const half16 v1 = load16(VT, vrow, 4 * c64 + 1);
++            const half16 v2 = load16(VT, vrow, 4 * c64 + 2);
++            const half16 v3 = load16(VT, vrow, 4 * c64 + 3);
++            const half vv[64] = { v0.s0, v0.s1, v0.s2, v0.s3, v0.s4, v0.s5, v0.s6, v0.s7,
++                                  v0.s8, v0.s9, v0.sa, v0.sb, v0.sc, v0.sd, v0.se, v0.sf,
++                                  v1.s0, v1.s1, v1.s2, v1.s3, v1.s4, v1.s5, v1.s6, v1.s7,
++                                  v1.s8, v1.s9, v1.sa, v1.sb, v1.sc, v1.sd, v1.se, v1.sf,
++                                  v2.s0, v2.s1, v2.s2, v2.s3, v2.s4, v2.s5, v2.s6, v2.s7,
++                                  v2.s8, v2.s9, v2.sa, v2.sb, v2.sc, v2.sd, v2.se, v2.sf,
++                                  v3.s0, v3.s1, v3.s2, v3.s3, v3.s4, v3.s5, v3.s6, v3.s7,
++                                  v3.s8, v3.s9, v3.sa, v3.sb, v3.sc, v3.sd, v3.se, v3.sf };
++            for (int j = 0; j < 64; ++j) vt[(64 * c64 + j) * BK + key] = vv[j];
++        }
+         barrier(CLK_LOCAL_MEM_FENCE);
++#ifdef GQA_S_SPLIT
+         for (int g = 0; g < NKB; ++g) {
+             if (g % GQA_SIDES == side) continue;
+-            float sv[8];
+-            for (int r = 0; r < 8; ++r) sv[r] = sx[((tile * NKB + g) * 8 + r) * 16 + lane];
+-            s[g] = (float8)(sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7]);
++            s[g] = vload8(0, sx + ((tile * NKB + g) * 16 + lane) * 8);
+         }
+ #endif
+         float mnew[8];
+         for (int r = 0; r < 8; ++r) mnew[r] = m[r];
+         for (int g = 0; g < NKB; ++g) {
+             const int key = k0 + g * 16 + lane;
+-            float sv[8] = { s[g].s0, s[g].s1, s[g].s2, s[g].s3, s[g].s4, s[g].s5, s[g].s6, s[g].s7 };
++            const bool kvis = key < kv_end;
++            float mk[8];
+             for (int r = 0; r < 8; ++r) {
+-                half mh = 0.0h;
+-                if (mrow[r] != 0 && key < kv_end) mh = mrow[r][key];
+-                const bool vis = rv[r] && key < kv_end && as_ushort(mh) != 0xFC00;   // -inf: masked
+-                sv[r] = vis ? fmax(sv[r] + (float) mh, M_INIT) : M_INIT;
+-                mnew[r] = fmax(mnew[r], sub_group_reduce_max(sv[r]));
++                if (kvis && rv[r]) mk[r] = mrow[r] != 0 ? (float) mrow[r][key] : 0.f;
++                else mk[r] = M_INIT;
+             }
+-            s[g] = (float8)(sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7]);
++            // -inf (masked) gives s + -inf = -inf, clamped below to M_INIT; no
++            // per-element -inf test needed
++            const float8 m8 = (float8)(mk[0], mk[1], mk[2], mk[3], mk[4], mk[5], mk[6], mk[7]);
++            s[g] = fmax(s[g] + m8, (float8)(M_INIT));
++        }
++        // one reduction per row over all groups instead of one per (row, group)
++        float8 mx8 = s[0];
++        for (int g = 1; g < NKB; ++g) mx8 = fmax(mx8, s[g]);
++        {
++            const float mv[8] = { mx8.s0, mx8.s1, mx8.s2, mx8.s3, mx8.s4, mx8.s5, mx8.s6, mx8.s7 };
++            for (int r = 0; r < 8; ++r) mnew[r] = fmax(mnew[r], sub_group_reduce_max(mv[r]));
+         }
+         float corr[8];
+         for (int r = 0; r < 8; ++r) {
+             corr[r] = m[r] > 0.5f * M_INIT ? exp(m[r] - mnew[r]) : 0.f;
+             m[r]  = mnew[r];
+-            l[r] *= corr[r];
+         }
+         const float8 cv = (float8)(corr[0], corr[1], corr[2], corr[3], corr[4], corr[5], corr[6], corr[7]);
+         for (int i = 0; i < NDH; ++i) o[i] *= cv;
++        lv *= cv;
+         short8 pa[NKB];
+-        for (int g = 0; g < NKB; ++g) {
+-            float sv[8] = { s[g].s0, s[g].s1, s[g].s2, s[g].s3, s[g].s4, s[g].s5, s[g].s6, s[g].s7 };
+-            half  ph[8];
+-            for (int r = 0; r < 8; ++r) {
+-                // the sum of what P V multiplies: P rounded to half
+-                ph[r] = (half)(sv[r] > 0.5f * M_INIT ? native_exp(sv[r] - m[r]) : 0.f);
+-                l[r] += (float) ph[r];
++        {
++            // P for both key groups at once, as float8 vectors
++            const float8 m8 = (float8)(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
++            const float8 mcut = (float8)(0.5f * M_INIT);
++            for (int g = 0; g < NKB; ++g) {
++                float8 e = native_exp(s[g] - m8);
++                e = select((float8)(0.f), e, s[g] > mcut);   // M_INIT entries -> 0
++                const half8 ph = convert_half8(e);
++                lv += e;
++                pa[g] = as_short8(ph);
+             }
+-            pa[g] = as_short8((half8)(ph[0], ph[1], ph[2], ph[3], ph[4], ph[5], ph[6], ph[7]));
+         }
+         for (int i = 0; i < NDH; ++i) {
+             const int col = side * (DV / GQA_SIDES) + i * 16 + lane;
+@@ -311,8 +317,9 @@ kernel void flash_attn_gqa_dpas(
+     }
+ 
+     // the partial records: m and l by the left half's lane 0, O by column
++    const float larr[8] = { lv.s0, lv.s1, lv.s2, lv.s3, lv.s4, lv.s5, lv.s6, lv.s7 };
+     for (int r = 0; r < 8; ++r) {
+-        const float lr = sub_group_reduce_add(l[r]);
++        const float lr = sub_group_reduce_add(larr[r]);
+         if (!rv[r]) continue;
+         const ulong rec_idx = (((ulong) batch * n_head + rh[r]) * n_q + rt[r]) * n_splits + split;
+         global float * rec = partial_void + rec_idx * (ulong) PARTIAL;

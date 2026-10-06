@@ -17,11 +17,66 @@ TEST(registry_holds_exactly_the_target_models) {
     // measured step between 4 and 48).
     // Ten with the segmented 48-layer chain (0.5.1 B.1) -- admitted by its
     // CHAIN hash, because it has no single language-model file to hash.
+    // Eleven with the fused-MoE rewrite of the 12-layer rung (2026-09-17,
+    // campaign sub4bit-vram-kernel): the same rung in the shape the GPU
+    // plugin's tiled MoE matcher accepts, pinned by its own xml hash.
+    // Twelve with the full-depth artifact in that shape: first d48f (the
+    // same day; it served noise -- its fill was wrong, DESIGN 7.0.2bz), then
+    // d48g in its slot (2026-09-18, the re-export through the corrected
+    // fill, which serves the Paris line), pinned by its own xml hash.
+    // Sixteen with the native qwen3_5_moe d4 rung and its full-depth d40
+    // (2026-09-25), and the dense-f16 d40 the same day.
+    // Seventeen with the IQ2_S-PACKED d40 (2026-09-25): the checkpoint's own
+    // 82-byte expert block through plugin weight_format 5, the A770
+    // all-resident rate arm.
+    // Nineteen with the packed d40 re-exported on the rank-5 chain and its
+    // dense-u8 twin (2026-09-26): the ones the native matcher fuses 40 of 40.
+    // Twenty-one with their depth-4 A/B rungs, f32 and u8 dense (same day).
+    // Twenty-four with the staged n-gram artifact d48s and the new-decode
+    // twins d48p2 (pinned) and d48s2 (staged) (2026-09-27, DESIGN 7.0.2cz).
+    // Twenty-five with d48q8 (2026-09-28). Twenty-seven with the QSA twins
+    // d4qsa and d48q8qsa (campaign qsa step 3 T5, 2026-09-28).
     const auto ids = model_ids();
-    CHECK_EQ(ids.size(), 10u);
+    CHECK_EQ(ids.size(), 27u);   // d48n beside d48g (2026-09-18), the native qwen3_5_moe d4 rung (2026-09-25), its d40 + d40f16 (2026-09-25), the packed d40 (2026-09-25), packed2 + packed-u8 + their d4 rungs (2026-09-26), d48s + d48p2 + d48s2 (2026-09-27), d48q8 + d4qsa + d48q8qsa (2026-09-28)
+    CHECK(find_model("qwen3.8-flash-next-d48g") != nullptr);
+    CHECK(find_by_artifact("qwen38-flash-next-d48g-ov") == find_model("qwen3.8-flash-next-d48g"));
+    CHECK(find_model("qwen3.8-flash-next-d48n") != nullptr);
+    CHECK(find_by_artifact("qwen38-flash-next-d48n-ov") == find_model("qwen3.8-flash-next-d48n"));
+    CHECK_EQ(find_model("qwen3.8-flash-next-d48n")->arch_hash, std::string("641fcb1863f83629"));
+    CHECK(find_model("qwen3.8-flash-next-d48s") != nullptr);
+    CHECK(find_by_artifact("qwen38-flash-next-d48s-ov") == find_model("qwen3.8-flash-next-d48s"));
+    CHECK_EQ(find_model("qwen3.8-flash-next-d48s")->arch_hash, std::string("348950ee76e341f9"));
+    CHECK(find_model("qwen3.8-flash-next-d48s2") != nullptr);
+    CHECK(find_by_artifact("qwen38-flash-next-d48s2-ov") == find_model("qwen3.8-flash-next-d48s2"));
+    CHECK_EQ(find_model("qwen3.8-flash-next-d48s2")->arch_hash, std::string("08dd2c858baed75f"));
+    CHECK(find_by_artifact("qwen38-flash-next-d48q8-ov") == find_model("qwen3.8-flash-next-d48q8"));
+    CHECK_EQ(find_model("qwen3.8-flash-next-d48q8")->arch_hash, std::string("1b03e4e97daaa13a"));
+    CHECK_EQ(find_model("qwen3.8-flash-next-d48q8")->weights_bytes, 65180065880ull);
+    CHECK(find_by_artifact("qwen38-flash-next-d4qsa-ov") == find_model("qwen3.8-flash-next-d4qsa"));
+    CHECK_EQ(find_model("qwen3.8-flash-next-d4qsa")->arch_hash, std::string("48e1d3b258f571fb"));
+    CHECK_EQ(find_model("qwen3.8-flash-next-d4qsa")->weights_bytes, 6537359094ull);
+    CHECK(find_by_artifact("qwen38-flash-next-d48q8qsa-ov") == find_model("qwen3.8-flash-next-d48q8qsa"));
+    CHECK_EQ(find_model("qwen3.8-flash-next-d48q8qsa")->arch_hash, std::string("b21359a42c2c8633"));
+    CHECK_EQ(find_model("qwen3.8-flash-next-d48q8qsa")->weights_bytes, 65221492040ull);
+    CHECK(find_model("qwen3.8-flash-next-d48p2") != nullptr);
+    CHECK(find_by_artifact("qwen38-flash-next-d48p2-ov") == find_model("qwen3.8-flash-next-d48p2"));
+    CHECK_EQ(find_model("qwen3.8-flash-next-d48p2")->arch_hash, std::string("1c54b317448a6ddc"));
+    CHECK(find_model("qwen3.8-flash-next-d48f") == nullptr);   // superseded, not admitted
+    CHECK(find_model("qwen3.8-flash-next-d12r") != nullptr);
+    CHECK(find_by_artifact("qwen38-flash-next-d12r-ov") == find_model("qwen3.8-flash-next-d12r"));
     CHECK(find_model("qwen3.8-flash-next-d12") != nullptr);
     CHECK(find_model("qwen3.8-flash-next-seg12") != nullptr);
     CHECK(find_model("qwen3.8-flash-next") != nullptr);
+    CHECK(find_model("qwen3.6-35b-a3b-native-d4") != nullptr);
+    CHECK(find_model("qwen3.6-35b-a3b-native-d40") != nullptr);
+    CHECK(find_model("qwen3.6-35b-a3b-native-d40f16") != nullptr);
+    CHECK(find_model("qwen3.6-35b-a3b-native-d40packed") != nullptr);
+    CHECK(find_model("qwen3.6-35b-a3b-native-d40packed2") != nullptr);
+    CHECK(find_by_artifact("qwen36-35b-a3b-d40packed2-ov") == find_model("qwen3.6-35b-a3b-native-d40packed2"));
+    CHECK(find_model("qwen3.6-35b-a3b-native-d40packed-u8") != nullptr);
+    CHECK(find_model("qwen3.6-35b-a3b-native-d4packed") != nullptr);
+    CHECK(find_model("qwen3.6-35b-a3b-native-d4packed-u8") != nullptr);
+    CHECK(find_by_artifact("qwen36-35b-a3b-d40packed-u8-ov") == find_model("qwen3.6-35b-a3b-native-d40packed-u8"));
     CHECK(find_model("qwen3.6-27b-a3b-coder") != nullptr);
     CHECK(find_model("qwen3.6-35b-a3b") != nullptr);
     CHECK(find_model("qwen3.8-27b") != nullptr);
@@ -108,6 +163,7 @@ TEST(registry_the_segmented_entry_is_admitted_by_its_chain_hash_not_a_file_diges
     a.arch_hash      = e->arch_hash;
     a.template_hash  = e->template_hash;
     a.tokenizer_hash = e->tokenizer_hash;
+    a.weights_bytes  = e->weights_bytes;
     a.has_mtp_head   = false;
     CHECK(validate_artifact(*e, a).ok);
 
@@ -116,6 +172,162 @@ TEST(registry_the_segmented_entry_is_admitted_by_its_chain_hash_not_a_file_diges
     const ValidationResult res = validate_artifact(*e, bent);
     CHECK(!res.ok);
     CHECK(!res.errors.empty());
+}
+
+TEST(registry_the_native_qwen35moe_rung_is_admitted_without_a_ple) {
+    // 2026-09-25: the qwen3_5_moe serving-shape rung at depth 4, the first
+    // admitted artifact of this family that is NOT an HF export. It carries the
+    // checkpoint's own IQ2_S/IQ3_XXS experts and NO PLE / n-gram table, which
+    // is why its n-gram binding is inert and --ngram-gguf is not needed.
+    const ModelEntry* e = find_model("qwen3.6-35b-a3b-native-d4");
+    CHECK(e != nullptr);
+    if (e == nullptr) return;
+    CHECK(find_by_artifact("qwen36-35b-a3b-d4n-ov") == e);
+    CHECK(find_by_artifact("qwen36-35b-a3b-d4n-ov") !=
+          find_by_artifact("qwen36-35b-a3b-int4-ov"));
+    CHECK(e->moe);
+    CHECK_EQ(e->model_type, std::string("qwen3_5_moe"));
+    CHECK_EQ(e->ov_arch, std::string("Qwen3_5MoeForConditionalGeneration"));
+    CHECK_EQ(e->n_expert, 256);
+    CHECK_EQ(e->n_embd, 2048);
+    CHECK_EQ(e->n_layer, 4);  // of 40
+    CHECK_EQ(e->n_attn_layer, 1);
+    CHECK_EQ(e->n_gdn_layer, 3);
+    CHECK(!e->has_mtp_head);
+    CHECK_EQ(e->arch_hash, std::string("391bd21db6368d57"));
+    CHECK_EQ(e->template_hash, std::string("55d4931433fe502b"));
+    CHECK_EQ(e->weights_bytes, 4284499713ull);
+
+    // The accepting control: an artifact matching the entry in every respect.
+    ArtifactInfo a;
+    a.id             = e->id;
+    a.quant          = Quant::Q4;
+    a.n_ctx_train    = e->n_ctx_train;
+    a.n_layer        = e->n_layer;
+    a.n_gdn_layer    = e->n_gdn_layer;
+    a.n_attn_layer   = e->n_attn_layer;
+    a.arch_hash      = e->arch_hash;
+    a.template_hash  = e->template_hash;
+    a.tokenizer_hash = e->tokenizer_hash;
+    a.weights_bytes  = e->weights_bytes;
+    a.has_mtp_head   = false;
+    CHECK(validate_artifact(*e, a).ok);
+
+    // RED FIRST: each pinned field, flipped alone, refuses. The weights_bytes
+    // cell is the one this leg added -- before it, the allowlist pinned the
+    // number and nothing read it, so a re-exported .bin passed on its xml hash.
+    ArtifactInfo bad_arch = a;
+    bad_arch.arch_hash    = "0000000000000000";
+    CHECK(!validate_artifact(*e, bad_arch).ok);
+
+    ArtifactInfo bad_bytes = a;
+    bad_bytes.weights_bytes = e->weights_bytes + 1;
+    CHECK(!validate_artifact(*e, bad_bytes).ok);
+
+    ArtifactInfo missing_bytes = a;
+    missing_bytes.weights_bytes = 0;  // an artifact that reports nothing
+    CHECK(!validate_artifact(*e, missing_bytes).ok);
+
+    ArtifactInfo bad_layers = a;  // the full-depth geometry, under a depth-4 pin
+    bad_layers.n_layer      = 40;
+    bad_layers.n_gdn_layer  = 30;
+    bad_layers.n_attn_layer = 10;
+    CHECK(!validate_artifact(*e, bad_layers).ok);
+}
+
+TEST(registry_the_full_depth_native_qwen35moe_rung_is_admitted) {
+    // 2026-09-25: the 40-layer native rung, exported after the depth-4 window
+    // to answer whether the depth-4 text was truncation or an emitter defect.
+    // Hashes/bytes read off its own serving-shape.json; the 120 expert bodies
+    // are the GGUF's own blocks.
+    const ModelEntry* e = find_model("qwen3.6-35b-a3b-native-d40");
+    CHECK(e != nullptr);
+    if (e == nullptr) return;
+    CHECK(find_by_artifact("qwen36-35b-a3b-d40n-ov") == e);
+    CHECK(e->moe);
+    CHECK_EQ(e->model_type, std::string("qwen3_5_moe"));
+    CHECK_EQ(e->ov_arch, std::string("Qwen3_5MoeForConditionalGeneration"));
+    CHECK_EQ(e->n_expert, 256);
+    CHECK_EQ(e->n_embd, 2048);
+    CHECK_EQ(e->n_layer, 40);
+    CHECK_EQ(e->n_attn_layer, 10);
+    CHECK_EQ(e->n_gdn_layer, 30);
+    CHECK(!e->has_mtp_head);
+    CHECK_EQ(e->arch_hash, std::string("b94ecc6ab6b200ac"));
+    CHECK_EQ(e->template_hash, std::string("55d4931433fe502b"));
+    CHECK_EQ(e->weights_bytes, 23429144641ull);
+
+    ArtifactInfo a;
+    a.id             = e->id;
+    a.quant          = Quant::Q4;
+    a.n_ctx_train    = e->n_ctx_train;
+    a.n_layer        = e->n_layer;
+    a.n_gdn_layer    = e->n_gdn_layer;
+    a.n_attn_layer   = e->n_attn_layer;
+    a.arch_hash      = e->arch_hash;
+    a.template_hash  = e->template_hash;
+    a.tokenizer_hash = e->tokenizer_hash;
+    a.weights_bytes  = e->weights_bytes;
+    a.has_mtp_head   = false;
+    CHECK(validate_artifact(*e, a).ok);
+
+    // RED FIRST: each pinned field, flipped alone, refuses.
+    ArtifactInfo bad_arch = a;
+    bad_arch.arch_hash    = "0000000000000000";
+    CHECK(!validate_artifact(*e, bad_arch).ok);
+
+    ArtifactInfo bad_bytes = a;
+    bad_bytes.weights_bytes = e->weights_bytes + 1;
+    CHECK(!validate_artifact(*e, bad_bytes).ok);
+
+    ArtifactInfo missing_bytes = a;
+    missing_bytes.weights_bytes = 0;  // an artifact that reports nothing
+    CHECK(!validate_artifact(*e, missing_bytes).ok);
+
+    ArtifactInfo bad_layers = a;  // the depth-4 geometry, under a full-depth pin
+    bad_layers.n_layer      = 4;
+    bad_layers.n_gdn_layer  = 3;
+    bad_layers.n_attn_layer = 1;
+    CHECK(!validate_artifact(*e, bad_layers).ok);
+}
+
+TEST(registry_the_f16_dense_full_depth_rung_is_admitted_by_its_own_hashes) {
+    // 2026-09-25: the same 40-layer artifact with the dense/graph part stored
+    // f16 (lm .bin 19,482,424,091 against the f32 form's 23,429,144,641). The
+    // native expert bodies are u8/f16 already and byte-identical, so only the
+    // dense half moved; the entry pins the f16 artifact's own xml hash and
+    // byte count, never the f32 one's.
+    const ModelEntry* e = find_model("qwen3.6-35b-a3b-native-d40f16");
+    CHECK(e != nullptr);
+    if (e == nullptr) return;
+    CHECK(find_by_artifact("qwen36-35b-a3b-d40f16-ov") == e);
+    CHECK(find_by_artifact("qwen36-35b-a3b-d40f16-ov") !=
+          find_by_artifact("qwen36-35b-a3b-d40n-ov"));
+    CHECK_EQ(e->n_layer, 40);
+    CHECK_EQ(e->n_attn_layer, 10);
+    CHECK_EQ(e->n_gdn_layer, 30);
+    CHECK_EQ(e->arch_hash, std::string("43d2e607941c77ea"));
+    CHECK_EQ(e->weights_bytes, 19482424091ull);
+
+    ArtifactInfo a;
+    a.id             = e->id;
+    a.quant          = Quant::Q4;
+    a.n_ctx_train    = e->n_ctx_train;
+    a.n_layer        = e->n_layer;
+    a.n_gdn_layer    = e->n_gdn_layer;
+    a.n_attn_layer   = e->n_attn_layer;
+    a.arch_hash      = e->arch_hash;
+    a.template_hash  = e->template_hash;
+    a.tokenizer_hash = e->tokenizer_hash;
+    a.weights_bytes  = e->weights_bytes;
+    a.has_mtp_head   = false;
+    CHECK(validate_artifact(*e, a).ok);
+
+    // RED FIRST: the f32 form's hash/bytes must NOT admit the f16 entry.
+    ArtifactInfo f32 = a;
+    f32.arch_hash     = "b94ecc6ab6b200ac";
+    f32.weights_bytes = 23429144641ull;
+    CHECK(!validate_artifact(*e, f32).ok);
 }
 
 TEST(registry_rejects_everything_else) {
@@ -219,6 +431,7 @@ ArtifactInfo good_coder_artifact() {
     a.arch_hash      = "6745cfe3d57e3f0f";
     a.template_hash  = "e84f32a23fdda276";
     a.tokenizer_hash = "87a7830d63fcf43b";
+    a.weights_bytes  = 13760293946ull;
     a.has_mtp_head   = false;
     return a;
 }
@@ -293,6 +506,7 @@ ArtifactInfo good_dense_artifact() {
     a.arch_hash      = e->arch_hash;
     a.template_hash  = e->template_hash;
     a.tokenizer_hash = e->tokenizer_hash;
+    a.weights_bytes  = e->weights_bytes;
     a.has_mtp_head   = e->has_mtp_head;
     return a;
 }

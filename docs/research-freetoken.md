@@ -1,3 +1,7 @@
+> Kept on `main` because the acceptance tooling or its tests cite this note by
+> path. It is a dated design record, not current state (DESIGN.md is). Other
+> `docs/` documents it links to live on the development branch, `qfndev`.
+
 # Research: FreeToken (arXiv 2608.16157) — mapped to arcint
 
 Paper: Yang et al., "FreeToken: Efficient Edge-Native MoE Serving with

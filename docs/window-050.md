@@ -1,5 +1,9 @@
 # window-050 — the 0.5.0 prediction window, operating manifest
 
+> Kept on `main` because a test reads this manifest by path. It is a dated
+> record of the 0.5.0 window, not current state (DESIGN.md is). Other
+> `docs/` documents it links to live on the development branch, `qfndev`.
+
 Recorded 2026-09-12. This file is the manifest a window operator executes: the
 holds, the stop order, where the logs go, which suites run on which device with
 which compile config, and the PREDICTION TEMPLATE that must be filled in BEFORE
@@ -263,6 +267,7 @@ five coordinates, now enumerated and held by
 | `Q4E_GGUF_SHARDS` | unset → every real-weight cell skips **by name** |
 | `Q4E_SERVING_FULL` | `1` → runs the 48-layer keystone build (off by default on purpose) |
 | `Q4E_GDN_UT_MODE` | read by `tools/q4e/gdn.py`, so it is a switch the suite obeys through an imported module rather than through a test file; its effect on the split is a row of the close-out matrix like any other |
+| `Q4E_GDN_CORE`, `Q4E_GDN_CHUNK` | *[added 2026-09-27]* read by `tools/q4e/serving_shape.py` (the LYON chunked GDN core and its chunk); unset, the sequential core, as served |
 | **a git work tree** | *not* an env var: a `git archive` extract has no `.git`, so the two cells gated on `git ls-files` (`test_citations` LEG 2 and `test_window_manifest`'s sha resolution) skip |
 
 So a clone and a tarball of the same commit differ by exactly **two** passes,
@@ -1477,7 +1482,7 @@ first two were measured on the probe before the branch existed):
 4. The allowlist: `qwen3.8-flash-next-d4` / `qwen38-flash-next-d4-ov`, hashes
    read off the directory above; the registry cells went from 6 to 7 entries.
 
-Ladder on the exact tree, dirac, `ARCINT_GGUF_REAL` = shard 2: **532 cases
+Ladder on the exact tree, the dev host, `ARCINT_GGUF_REAL` = shard 2: **532 cases
 run, 0 failed, 0 skipped** (`RUN@wt+6743ffb`, ladder-1.log).
 
 ### The command, one card per process

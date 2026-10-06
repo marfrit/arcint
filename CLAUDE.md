@@ -1,7 +1,8 @@
 # arcint — session rules
 
 Source of truth: README.md (scope), DESIGN.md (architecture, invariants,
-milestones), llm.txt (machine summary). Read DESIGN.md before touching
+the current measured state), llm.txt (machine summary); the dated record
+behind DESIGN.md is on the `qfndev` branch. Read DESIGN.md before touching
 anything; the invariants in §3.4/§3.8 and the gates in §5 are not negotiable.
 
 ## RTFM MANDATE — first, every turn
@@ -10,8 +11,10 @@ anything; the invariants in §3.4/§3.8 and the gates in §5 are not negotiable.
 Claude Code identically. Before the first substantive tool call of any turn
 that touches a design decision, a mechanism, a milestone or a campaign:
 
-1. Read `docs/campaigns/README.md`, and the campaign document covering the
-   work. Each is written to be sufficient on its own.
+1. Read `docs/campaigns/README.md` (on `qfndev`), and the campaign document covering the
+   work. Each is written to be sufficient on its own. (The campaign, design,
+   milestone and window documents live on the development branch, `qfndev`;
+   `main` carries the current state only — work from `qfndev`.)
 2. Check `docs/campaigns/research-*.md` — the prior art may already be
    surveyed.
 3. If the task cites an external project, read its SOURCE, not only its
@@ -27,7 +30,7 @@ that touches a design decision, a mechanism, a milestone or a campaign:
    zombie sweep by pid.
 
 The cost of ignoring this is on the record in `AGENTS.md` and in
-`docs/research-freetoken-code.md`: a 0.5.1 serving route measured at 7.06x
+`docs/research-freetoken-code.md` (on `qfndev`): a 0.5.1 serving route measured at 7.06x
 the device residency per layer and 623x the warm forward, whose root cause
 sat in `docs/campaigns/` for ten days before it was built.
 

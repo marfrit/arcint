@@ -103,6 +103,7 @@ struct PreparedChat {
     ToolSchemas     schemas;
     bool            parse_tool_calls = false;
     bool            think_open       = false;  // the prompt ended inside a think block
+    bool            think_tags_extended = false;  // also <thinking> / [THINK] (ModelStatus)
     std::string     id;
     int64_t         created       = 0;
     int             prompt_tokens = 0;

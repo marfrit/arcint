@@ -660,7 +660,7 @@ if __name__ == "__main__":                                  # pragma: no cover
 #                      census could not see. "Measured count-harmless today" is
 #                      a date, not a property.
 _COUNT_GATES = frozenset({"Q4E_GPU", "Q4E_GGUF_SHARDS", "Q4E_SERVING_FULL",
-                          "Q4E_GDN_UT_MODE"})
+                          "Q4E_GDN_UT_MODE", "Q4E_GDN_CORE", "Q4E_GDN_CHUNK"})
 
 # The files whose CELLS are scanned for checkout-shaped gates: the suite's own
 # test modules, plus any conftest (a fixture there gates every cell under it).

@@ -1,3 +1,8 @@
+> Kept on `main` because the acceptance tooling or its tests cite this note by
+> path. It is a dated design record, not current state (DESIGN.md is). Other
+> `docs/` documents it links to live on the development branch, `qfndev`; its
+> `DESIGN.md:<line>` citations refer to the DESIGN.md of that date, on `qfndev`.
+
 <!-- 0.3.1, lead item. Produced by the campaign's design pass on 2026-09-05
 against docs/milestone-0.3.0.md's backlog row "Unit tests and acceptance
 tests differentiated" and DESIGN §5.1; accepted for implementation in the

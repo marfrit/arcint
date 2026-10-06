@@ -4,7 +4,14 @@
 
 Does writing our own compute kernels yield a more efficient solution — in RAM
 or in speed? Measured on a B60 with the 27B coder q4, in the real model, not a
-microbenchmark.
+microbenchmark, on 2026-08-28 against the stateful executor.
+
+Standing context: the served paged executor replaces the GDN transposes this
+kernel targets (the paged GDN and conv kernels take their place), so the
+switch below is a measurement instrument, not a pending optimisation. Kernel
+work that did ship went into OpenVINO's own kernel selection as the patch
+series under `contrib/packaging/marfrit-openvino/patches/` — which is the
+conclusion this page reaches.
 
 **The kernel: yes, by 8.6×. The mechanism for getting it into the graph: no.**
 

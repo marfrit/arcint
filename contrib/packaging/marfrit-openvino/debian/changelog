@@ -1,3 +1,131 @@
+marfrit-openvino (2026.4.0~dev20260821+p25-1) bookworm trixie; urgency=medium
+
+  * Seven more patches on top of +p20 (and +p24's QSA), same upstream commit
+    (71640275), same smallest-sufficient-divergence numbering; the series is
+    now 0003-0074 (72 patches). Flash-Next's hybrid CPU tier gets its decode
+    and prefill kernels, and the campaigns' loose ends close:
+    - patch 0068: the CPU tier decodes a native expert row once and runs one
+      row per AVX2 lane for a single-job (decode) call.
+    - patch 0069: native IQ3_XXS gate/up and IQ4_NL/IQ4_XS down decode whole
+      blocks rather than row by row.
+    - patch 0070: the resident slot pool moves into device memory.
+    - patch 0071: a decode step's experts are balanced over the pool with a
+      two-phase split (gate/up row chunks, then down column chunks).
+    - patch 0072: the tier's expert bytes come from a host RAM bank filled at
+      load by sequential O_DIRECT reads instead of page-faulting on the
+      workers. B60: first answer 48.55 -> 38.18 s, byte-identical.
+    - patch 0073: QSA's own selection reaches PagedAttention through the
+      optional input 28, so Flash-Next's 12 full-attention layers serve the
+      model's sparse selection. Non-default, n_ctx <= 32768; decode 0.87x
+      dense at 20k, prefill 1.27x.
+    - patch 0074: the tier's native dot runs in the quantised domain (ggml's
+      approach), routed by call shape -- a decode-shaped call (<= 8 jobs)
+      takes the int8 quantised dot, a prefill-shaped call keeps the f32 path.
+      B60 dense d48q8, 20,085 tokens: prefill 63.1 vs base 64.2 t/s, decode
+      6.5 vs base 5.9.
+    See patches/README.md.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Thu, 01 Oct 2026 18:00:00 +0200
+
+marfrit-openvino (2026.4.0~dev20260821+p20-1) bookworm trixie; urgency=medium
+
+  * Twenty-four more patches on top of +p19, same upstream commit
+    (71640275), same smallest-sufficient-divergence numbering; the series
+    is now 0003-0067 (65 patches). The native expert formats get their
+    OpenCL decode and the all-resident pool its fast paths:
+    - patches/0044-0058: the routing trace (0044) and census seed (0046);
+      the native experts' OpenCL decode (0045); the per-expert slot pool
+      size (0047); the pinned NVMe fill and its transport (0048-0049); the
+      IQ2_S format, its packed layout and their decode fixes (0050, 0052,
+      0054, 0055); the fully resident native pool (0051), filled at bind
+      (0058); OpenCL load diagnostics (0053); the dispatch's scale alias and
+      down strides (0056); native blocks accepting compressed value
+      constants (0057).
+    - patches/0059-0062: per-expert dispatch batched, then grouped by
+      expert; several output rows per activation load; no speculative
+      readback on the all-resident pool.
+    - patches/0063-0064: a weight-rounding emulation arm, and IQ2_S-packed
+      gate/up on the matrix unit with exact operands.
+    - patches/0065-0066: the CPU tier decodes a native expert once per
+      call and runs its dots one job per AVX2 lane (same bytes).
+    - patch 0067: decode on the all-resident pool routes on the device (no
+      per-layer top-k readback).
+    Full depth on the A770 (the 35B native packed u8, all-resident): prefill
+    12.5 -> 960 t/s at 4096, decode about 20 -> 28 t/s; the fused
+    (non-native) route is unchanged. See patches/README.md.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 26 Sep 2026 23:00:00 +0200
+
+marfrit-openvino (2026.4.0~dev20260821+p19-1) bookworm trixie; urgency=medium
+
+  * One more patch on top of +p18, same upstream commit (71640275), same
+    smallest-sufficient-divergence numbering:
+    - patches/0043: the checkpoint's own expert formats (IQ4_NL, IQ4_XS,
+      IQ3_XXS, Q8_0) lowered from the serving-shape emitter's standard-op
+      decode chains straight to MOECompressed (a weight_format per
+      projection in the config) and executed on the CPU tier with three
+      row decoders; the fused kernels are never launched under a native
+      format (the OpenCL decode is the next patch). Replaces the u4
+      grouped-affine repack of the experts, the measured residual of the
+      Flash-Next serving artifact (0.73 nats at depth 48). The new source
+      is listed in the transformations library's sources.cmake. The
+      on-card cell is owed: the first attempt reached the op translation
+      (the pass fires), the second wedged the B60 at its first job before
+      any of this patch's device code ran.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Fri, 18 Sep 2026 17:00:00 +0200
+
+marfrit-openvino (2026.4.0~dev20260821+p18-1) bookworm trixie; urgency=medium
+
+  * Five more patches on top of +p16, same upstream commit (71640275), same
+    smallest-sufficient-divergence numbering (+p17 shipped 0038-0040 without
+    an entry here; this one records them):
+    - patches/0038-0040: the per-expert dispatch framework, its OpenCL
+      kernel and the dispatch integration (campaign sub4bit-vram-kernel),
+      behind the MOE_PER_EXPERT_DISPATCH property, default off.
+    - patches/0041: skip expert-constant processing at compile time under
+      per-expert dispatch; measured inert on the fused offload route.
+    - patches/0042: THE FIX for 0037's page fault on the Arc Pro B60. Under
+      the hybrid prefill split the grouped-GEMM tables hold only the
+      resident (token, k) pairs and the rest of tokens_per_expert_cpu stays
+      -1, but the gather kernel was launched over token_num * max_topk
+      work-groups; every one past the fill read input[-HIDDEN_SIZE], one
+      row before the activation buffer -- unmapped on Xe2 (xe page fault,
+      device coredump, CL_OUT_OF_RESOURCES), mapped by luck on Xe-HPG. The
+      gather and the stages it sizes now run over the filled count, and a
+      batch with no resident expert takes the per-expert path as before
+      0037. Bisected and measured 2026-09-17: the 35B at --offload-ratio 99
+      --moe-cpu-tier serves on the B60, 23.6 t/s decode (KV u8, f16).
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Thu, 17 Sep 2026 20:05:00 +0200
+
+marfrit-openvino (2026.4.0~dev20260821+p16-1) bookworm trixie; urgency=medium
+
+  * One more patch applied on top of +p15, same upstream commit (71640275),
+    same smallest-sufficient-divergence numbering:
+    - patches/0037: under a static half-partition every MoE layer's routed
+      batch contains at least one non-resident expert, and the two
+      grouped-GEMM callers (on_before_prefill, build_grouped_mask_otd) called
+      try_acquire_simultaneous without a cpu_tier_misses destination -- so
+      the first non-resident entry returned nullopt and the WHOLE layer fell
+      back to exec_prefill_onednn's per-expert loop: ~5,520 kernel launches
+      where the grouped path needs ~120, on all 40 layers
+      (grouped_fallbacks=400 per process). The fix wires cpu_tier_misses into
+      both callers; non-resident entries take a sentinel slot id (num_expert)
+      that the mask-gen kernels already exclude and scatter_reduce's
+      UINT_MAX skip already handles, and the host tier runs them after the
+      grouped GEMM completes. New OTD perf counter: hybrid_prefill_layers
+      (arcint DESIGN 7.0.2bx).
+    - MEASURED: grouped_fallbacks 400 -> 0, decode 18.2 t/s against a gate of
+      14.8, 3.4 identity and E2 pass. The campaign's prefill gate (tier ON
+      within 25 % of tier OFF) is NOT met -- the host dispatch for the
+      non-resident experts serialises through ~128 experts per layer and
+      dominates prefill -- and static-partition-prefill stays open. This
+      level ships because the coding defect is gone, not because the
+      campaign closed.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Wed, 16 Sep 2026 13:00:00 +0200
+
 marfrit-openvino (2026.4.0~dev20260821+p15-1) bookworm trixie; urgency=medium
 
   * One more patch applied on top of +p14, same upstream commit (71640275),

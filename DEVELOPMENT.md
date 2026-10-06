@@ -17,7 +17,10 @@ Development and every published measurement ran on:
 - C++20 compiler, CMake ≥ 3.20.
 - **OpenVINO 2026.4 dev** (the pinned measurement stack) including
   `openvino_tokenizers`. `-DARCINT_OPENVINO=ON` needs its CMake package;
-  without it only the stub backend builds.
+  without it only the stub backend builds. The served numbers need the
+  patched build of it, `marfrit-openvino +p20` (upstream commit `71640275` +
+  patches 0003–0067; recipe and per-patch record under
+  `contrib/packaging/marfrit-openvino/`).
 - No network at build time: `third_party/` is vendored.
 
 ## Build and test
@@ -44,7 +47,7 @@ Acceptance, with a card and a model root:
     cmake -S . -B build-accept -DCMAKE_BUILD_TYPE=Release -DARCINT_OPENVINO=ON \
           -DARCINT_ACCEPTANCE=ON -DARCINT_ACCEPTANCE_MODEL_ROOT=/path/to/models/ov
     cmake --build build-accept
-    ctest --test-dir build-accept -N -L acceptance        # lists the twelve cells
+    ctest --test-dir build-accept -N -L acceptance        # lists the enumerated cells
     tests/acceptance/run.py --manifest build-accept/acceptance/run_manifest.json \
           --all --allow-skip pruefstand   # name every 77, or the run does not count
 

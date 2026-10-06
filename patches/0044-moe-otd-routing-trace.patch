@@ -1,0 +1,94 @@
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+@@ -211,6 +211,18 @@
+     std::vector<uint32_t> _routing_hist;
+     bool _routing_hist_enabled = false;
+     size_t _layer_seq_id = 0;
++
++    // arcint VENICE (patches/0044). Opt-in per-call routing TRACE. Unlike the
++    // aggregate histogram above (one count per expert id), this records every
++    // call's routed ids IN ORDER, so a per-token census can be reconstructed
++    // offline (layer_key identifies the layer structurally, the call sequence
++    // gives the order). When MOE_OTD_ROUTING_TRACE was set at this provider's
++    // construction, each try_acquire_simultaneous appends one line
++    //   <call_seq> <layer_key> <top_k> <expert id...>
++    // (see the .cpp). The path is cached per provider; the call counter is
++    // process-wide.
++    bool _routing_trace_enabled = false;
++    std::string _routing_trace_path;
+ };
+ 
+ }  // namespace ov::intel_gpu::ocl::moe
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+@@ -161,6 +161,37 @@
+                << " total=" << total << " path=" << path << std::endl;
+ }
+ 
++// arcint VENICE (patches/0044). Per-call routing trace. The counter is
++// process-wide so <call_seq> orders every layer's calls in one file even
++// though providers are driven by different streams; the mutex serializes the
++// appends. One line per call, flushed immediately so a SIGKILL'd window keeps
++// every record already written (the aggregate dump above only runs at exit).
++std::atomic<size_t>& otd_trace_seq_counter() {
++    static std::atomic<size_t> counter{0};
++    return counter;
++}
++
++std::mutex& otd_trace_mutex() {
++    static std::mutex m;
++    return m;
++}
++
++void otd_trace_append(const std::string& path, size_t layer_key, size_t top_k,
++                      const std::vector<uint32_t>& experts) {
++    std::lock_guard<std::mutex> lock(otd_trace_mutex());
++    const size_t seq = otd_trace_seq_counter().fetch_add(1, std::memory_order_relaxed);
++    std::ofstream out(path, std::ios::app);
++    if (!out.is_open()) {
++        std::cerr << "[OTD_PERF] routing_trace: failed to open " << path << " for writing" << std::endl;
++        return;
++    }
++    out << seq << ' ' << layer_key << ' ' << top_k;
++    for (const uint32_t expert : experts)
++        out << ' ' << expert;
++    out << '\n';
++    out.flush();
++}
++
+ }  // namespace
+ 
+ std::optional<ExpertSlotLease> ResidentExpertWeightProvider::try_acquire_simultaneous(const std::vector<uint32_t>& experts,
+@@ -209,7 +240,15 @@
+       // An empty value counts as unset, matching the dump's own test.
+       _routing_hist_enabled(std::getenv("MOE_OTD_ROUTING_HIST") != nullptr &&
+                             std::getenv("MOE_OTD_ROUTING_HIST")[0] != '\0'),
+-      _layer_seq_id(otd_layer_seq_counter().fetch_add(1, std::memory_order_relaxed)) {
++      _layer_seq_id(otd_layer_seq_counter().fetch_add(1, std::memory_order_relaxed)),
++      // arcint VENICE (patches/0044). Same per-provider, construction-time
++      // read as MOE_OTD_ROUTING_HIST above, and for the same reason: every
++      // production provider is built after the run's env is fixed, so all
++      // layers agree; a unit test can setenv() before constructing the one
++      // provider under test. An empty value counts as unset.
++      _routing_trace_enabled(std::getenv("MOE_OTD_ROUTING_TRACE") != nullptr &&
++                             std::getenv("MOE_OTD_ROUTING_TRACE")[0] != '\0'),
++      _routing_trace_path(_routing_trace_enabled ? std::getenv("MOE_OTD_ROUTING_TRACE") : "") {
+     // Registration is unconditional and cheap (an id already assigned above,
+     // one vector push under a mutex) regardless of _routing_hist_enabled:
+     // otd_dump_routing_hist() reads MOE_OTD_ROUTING_HIST fresh at exit, so a
+@@ -309,6 +348,15 @@
+     // already relies on for its own non-atomic-across-calls sequencing (see
+     // the comment on that function, lru_cache.cpp) - a provider has no
+     // concurrent caller to race this loop against.
++    // arcint VENICE (patches/0044). Per-call routing trace, one record per
++    // call in call order, BESIDE the aggregate histogram below (not instead
++    // of it). Recorded at the same point and for the same reason: this is
++    // what the router picked, before any dedup/hit-miss logic. `top_k` comes
++    // from the config, so a consumer can split a batched call's flattened ids
++    // into per-token chunks.
++    if (_routing_trace_enabled)
++        otd_trace_append(_routing_trace_path, layer_key(), _config.top_k, experts);
++
+     if (_routing_hist_enabled) {
+         for (const uint32_t expert : experts) {
+             if (expert < _routing_hist.size())

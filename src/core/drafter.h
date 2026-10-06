@@ -39,10 +39,15 @@ public:
     const char*      name() const override { return "ngram"; }
 
     size_t ngram() const { return ngram_; }
+    // The last proposal's match length: how many trailing tokens agree with
+    // the earlier occurrence it copied from (at least ngram(), capped at 64;
+    // 0 when there was no proposal). DraftPolicy buckets its confidence by it.
+    size_t last_match() const { return last_match_; }
 
 private:
     size_t ngram_;
     size_t max_draft_;
+    size_t last_match_ = 0;
 };
 
 }  // namespace lgc

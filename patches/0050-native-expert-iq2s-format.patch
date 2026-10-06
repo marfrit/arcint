@@ -1,0 +1,1520 @@
+# A fourth native expert weight format: IQ2_S (Qwen3.6-35B-A3B), through the
+# pattern, validation, CPU tier and per-expert OpenCL kernels.
+#
+# Design:   docs/design-qwen35moe-serving-shape.md (patch 0050, 2026-09-24)
+# Campaign: docs/campaigns/sub4bit-vram-kernel.md
+#
+# Prerequisite patches: 0039/0040 (per-expert kernel + dispatch), 0043 (native
+# formats through the tier), 0045 (native per-expert OpenCL decode), 0047
+# (resident slot pool), 0049 (pinned NVMe transport).
+#
+# `Qwen3.6-35B-A3B` (`general.architecture = qwen35moe`) carries its experts as
+# IQ2_S (ggml type 22) gate/up on all 40 layers over IQ3_XXS (37 layers) /
+# IQ4_XS (3 layers) down. IQ2_S is not one of patch 0043's three formats:
+#   - the weight is one 10-bit grid index per EIGHT values (four per 32),
+#     packed as little-endian u16 in a u8 slot [E, out, K/32, 8];
+#   - the sign byte is RAW (bit j flips value j; no 7-bit table index);
+#   - there are TWO 4-bit sub-block scales per 32 values (the low nibble's for
+#     values 0..15, the high nibble's for 16..31), stored as f16
+#     [E, out, K/32, 2].
+# IQ4_XS needs no new format: its split folds the 6-bit sub-block scales into
+# the per-32 f32 scale and lands on the IQ4_NL layout patch 0043 already
+# carries (tools/q4e/native_blocks.py iq4_xs_split -> iq4_nl_decode; measured
+# 2026-09-24 on blk.34/38/39.ffn_down_exps, max|diff| 0.0 vs gguf-py), so the
+# three IQ4_XS down tensors ride kWeightFormatIq4Nl unchanged.
+#
+# What this patch adds:
+#   * MOECompressed::kWeightFormatIq2S = 4 + is_native_format, and the
+#     [E, ofm, K/32, 8] weight-shape branch in validate_and_infer_types.
+#   * NativeIq2sWeightsBlock (pattern_blocks/native_expert_block.{hpp,cpp}) and
+#     its resolution in ConvertTiledMoeBlockNativeToMoeCompressed: the weight
+#     u8 Constant is the 10-bit grid indices, the zero-point u8 Constant the
+#     raw sign bytes, the f16 [.,2] scale the two sub-block scales.
+#   * the CPU tier row decoder (moe_cpu_expert.cpp decode_native_row, format 4)
+#     and kIq2sGrid[8192] transcribed from llama.cpp ggml-common.h.
+#   * the OpenCL decode (native_dot_iq2s in moe_expert_swiglu.cl) and its
+#     dispatch for the gate/up native kernels; the down kernel keeps IQ4_NL /
+#     IQ3_XXS / Q8_0 (this checkpoint has no IQ2_S down).
+#   * moe_otd_runtime.cpp skips the device scale transpose for IQ2_S (its two
+#     sub-scales are read row-major) and a red-first unit cell for the decoder.
+#
+# Built clean on the pinned OpenVINO tree 2026-09-24: `ninja -j6
+# openvino_intel_gpu_plugin` in the production build dir, rc 0 (47
+# targets, the plugin links). The plugin unit cell
+# `moe_cpu_expert_native.iq2_s_row_decodes_...` compiles to an object with the
+# plugin's own flags and the vendored gtest headers (that build dir has no unit
+# test target configured). The emitter side is tools/q4e/serving_shape.py's
+# IQ2_S branch and build_qwen35moe_serving_shape_ir; byte-exactness of the
+# emitted blocks against the GGUF is pinned by tests/python. A walker PASS is
+# not a compile and no card compile is claimed: the A770 window is the next leg.
+
+diff --git a/src/common/transformations/include/ov_ops/moe_compressed.hpp b/src/common/transformations/include/ov_ops/moe_compressed.hpp
+index 8d29fb2..ba0a67d 100644
+--- a/src/common/transformations/include/ov_ops/moe_compressed.hpp
++++ b/src/common/transformations/include/ov_ops/moe_compressed.hpp
+@@ -41,10 +41,15 @@ public:
+         // 2 = IQ3_XXS (weight = u8 grid indices [E, out, K/32, 8], scale = f16
+         // d*(0.5+s)*0.5 per 32, zero-point slot = u8 sign-mask indices
+         // [E, out, K/32, 4]); 3 = Q8_0 (weight = i8 codes [E, out, K/32, 32],
+-        // scale = f16 d per 32, zero-point slot unused). IQ4_XS lands on the
+-        // IQ4_NL layout (its sub-block scales folded into the f32 scale by
+-        // the exporter). The checkpoint's own blocks, re-laid per role
+-        // (design-routing-aware-expert-execution 2.3a-2.3d).
++        // scale = f16 d per 32, zero-point slot unused); 4 = IQ2_S (weight = u8
++        // [E, out, K/32, 8] holding four 10-bit grid indices per 32 values as
++        // little-endian u16, scale = f16 [E, out, K/32, 2] -- the low nibble's
++        // sub-block scale for values 0..15 and the high nibble's for 16..31,
++        // zero-point slot = u8 [E, out, K/32, 4] RAW sign bytes). IQ4_XS lands
++        // on the IQ4_NL layout (its sub-block scales folded into the f32 scale
++        // by the exporter). The checkpoint's own blocks, re-laid per role
++        // (design-routing-aware-expert-execution 2.3a-2.3d; IQ2_S added
++        // 2026-09-24 for Qwen3.6-35B-A3B, patch 0050).
+         size_t gate_up_weight_format = 0;
+         size_t down_weight_format = 0;
+     };
+@@ -53,8 +58,10 @@ public:
+     static constexpr size_t kWeightFormatIq4Nl = 1;
+     static constexpr size_t kWeightFormatIq3Xxs = 2;
+     static constexpr size_t kWeightFormatQ8_0 = 3;
++    static constexpr size_t kWeightFormatIq2S = 4;
+     static bool is_native_format(size_t f) {
+-        return f == kWeightFormatIq4Nl || f == kWeightFormatIq3Xxs || f == kWeightFormatQ8_0;
++        return f == kWeightFormatIq4Nl || f == kWeightFormatIq3Xxs ||
++               f == kWeightFormatQ8_0 || f == kWeightFormatIq2S;
+     }
+ 
+     /// \brief Constructs a MOECompressed operation with config only
+diff --git a/src/common/transformations/src/ov_ops/moe_compressed.cpp b/src/common/transformations/src/ov_ops/moe_compressed.cpp
+index cb1261d..2ad7ca4 100644
+--- a/src/common/transformations/src/ov_ops/moe_compressed.cpp
++++ b/src/common/transformations/src/ov_ops/moe_compressed.cpp
+@@ -116,6 +116,10 @@ void MOECompressed::validate_and_infer_types() {
+             OPENVINO_ASSERT(s.size() == 4 && s[3].get_length() == 8,
+                             "MOECompressed ", name, " IQ3_XXS weight must be [E, ofm, K/32, 8], got ", s);
+             actual_K = static_cast<size_t>(s[2].get_length()) * 32;
++        } else if (weight_format == kWeightFormatIq2S) {
++            OPENVINO_ASSERT(s.size() == 4 && s[3].get_length() == 8,
++                            "MOECompressed ", name, " IQ2_S weight must be [E, ofm, K/32, 8], got ", s);
++            actual_K = static_cast<size_t>(s[2].get_length()) * 32;
+         } else if (weight_format == kWeightFormatIq4Nl || weight_format == kWeightFormatQ8_0) {
+             OPENVINO_ASSERT(s.size() == 4 && s[3].get_length() == 32,
+                             "MOECompressed ", name, " IQ4_NL/Q8_0 weight must be [E, ofm, K/32, 32], got ", s);
+diff --git a/src/common/transformations/include/transformations/pattern_blocks/native_expert_block.hpp b/src/common/transformations/include/transformations/pattern_blocks/native_expert_block.hpp
+index c366323..b03cede 100644
+--- a/src/common/transformations/include/transformations/pattern_blocks/native_expert_block.hpp
++++ b/src/common/transformations/include/transformations/pattern_blocks/native_expert_block.hpp
+@@ -20,6 +20,7 @@ namespace ov::pass::pattern::op {
+ class TRANSFORMATIONS_API NativeIq4nlWeightsBlock;
+ class TRANSFORMATIONS_API NativeIq3xxsWeightsBlock;
+ class TRANSFORMATIONS_API NativeQ8WeightsBlock;
++class TRANSFORMATIONS_API NativeIq2sWeightsBlock;
+ 
+ }  // namespace ov::pass::pattern::op
+ 
+@@ -50,3 +51,18 @@ class ov::pass::pattern::op::NativeQ8WeightsBlock : public ov::pass::pattern::op
+ public:
+     NativeQ8WeightsBlock();
+ };
++
++/// IQ2_S (patch 0050, Qwen3.6-35B-A3B): the weight Constant is u8
++/// [E, out, K/32, 8] holding four 10-bit grid indices per 32 values as
++/// little-endian u16. Assembly: Reshape -> Gather(lo,hi) -> Convert ->
++/// Add(lo, hi<<8) -> Gather(iq2s_grid f32 [1024, 8]) -> Reshape [.,32]. Signs:
++/// the zero-point Constant is u8 [E, out, K/32, 4] RAW bytes (bit j flips
++/// value j) -> Convert -> Unsqueeze -> BitwiseAnd(masks) -> Greater(0) ->
++/// Select(-1, +1) -> Reshape. The scale is f16 [E, out, K/32, 2] the low
++/// nibble's value for 0..15 and the high nibble's for 16..31, expanded in-graph
++/// to [.,32] (Broadcast) before the final Multiply -> Reshape [E, out, K].
++/// anchors: gridix (the u8 weight), signix, scale, reshape
++class ov::pass::pattern::op::NativeIq2sWeightsBlock : public ov::pass::pattern::op::Block {
++public:
++    NativeIq2sWeightsBlock();
++};
+diff --git a/src/common/transformations/src/transformations/pattern_blocks/native_expert_block.cpp b/src/common/transformations/src/transformations/pattern_blocks/native_expert_block.cpp
+index 3ccea39..3da0333 100644
+--- a/src/common/transformations/src/transformations/pattern_blocks/native_expert_block.cpp
++++ b/src/common/transformations/src/transformations/pattern_blocks/native_expert_block.cpp
+@@ -8,7 +8,9 @@
+ #include <memory>
+ 
+ #include "openvino/core/type/element_type.hpp"
++#include "openvino/op/add.hpp"
+ #include "openvino/op/bitwise_and.hpp"
++#include "openvino/op/broadcast.hpp"
+ #include "openvino/op/constant.hpp"
+ #include "openvino/op/convert.hpp"
+ #include "openvino/op/gather.hpp"
+@@ -25,6 +27,7 @@ using ov::pass::pattern::wrap_type;
+ 
+ namespace v0 = ov::op::v0;
+ namespace v1 = ov::op::v1;
++namespace v3 = ov::op::v3;
+ namespace v8 = ov::op::v8;
+ namespace v13 = ov::op::v13;
+ 
+@@ -100,3 +103,58 @@ ov::pass::pattern::op::NativeQ8WeightsBlock::NativeQ8WeightsBlock() : Block({},
+     m_outputs = ov::OutputVector{weights_input};
+     REGISTER_ANCHORS(this, codes, scale, reshape);
+ }
++
++ov::pass::pattern::op::NativeIq2sWeightsBlock::NativeIq2sWeightsBlock() : Block({}, {}, "NativeIq2sWeightsBlock") {
++    // four 10-bit grid indices, little-endian u16, in a u8 weight op-constant
++    auto gridix = wrap_type<v0::Constant>(ov::pass::pattern::type_matches(ov::element::u8));
++    auto w5_target = wrap_type<v0::Constant>();
++    auto w5 = wrap_type<v1::Reshape>({gridix, w5_target});
++    auto lo_idx = wrap_type<v0::Constant>();
++    auto lo_axis = wrap_type<v0::Constant>();
++    auto lo = wrap_type<v8::Gather>({w5, lo_idx, lo_axis});
++    auto hi_idx = wrap_type<v0::Constant>();
++    auto hi_axis = wrap_type<v0::Constant>();
++    auto hi = wrap_type<v8::Gather>({w5, hi_idx, hi_axis});
++    auto hi_conv = wrap_type<v0::Convert>({hi});
++    auto hi_shift_const = wrap_type<v0::Constant>();
++    auto hi_shift = wrap_type<v1::Multiply>({hi_conv, hi_shift_const});
++    auto lo_conv = wrap_type<v0::Convert>({lo});
++    auto index = wrap_type<v1::Add>({lo_conv, hi_shift});
++    auto grid = wrap_type<v0::Constant>();
++    auto grid_axis = wrap_type<v0::Constant>();
++    auto grid_gather = wrap_type<v8::Gather>({grid, index, grid_axis});
++    auto mag_target = wrap_type<v0::Constant>();
++    auto mag = wrap_type<v1::Reshape>({grid_gather, mag_target});
++    // RAW sign bytes (bit j flips value j)
++    auto signix = wrap_type<v0::Constant>(ov::pass::pattern::type_matches(ov::element::u8));
++    auto signix_convert = wrap_type<v0::Convert>({signix});
++    auto sign_unsq_axis = wrap_type<v0::Constant>();
++    auto sign_unsq = wrap_type<v0::Unsqueeze>({signix_convert, sign_unsq_axis});
++    auto masks = wrap_type<v0::Constant>();
++    auto bits = wrap_type<v13::BitwiseAnd>({sign_unsq, masks});
++    auto zero = wrap_type<v0::Constant>();
++    auto neg = wrap_type<v1::Greater>({bits, zero});
++    auto minus_one = wrap_type<v0::Constant>();
++    auto plus_one = wrap_type<v0::Constant>();
++    auto select = wrap_type<v1::Select>({neg, minus_one, plus_one});
++    auto sign_target = wrap_type<v0::Constant>();
++    auto sign = wrap_type<v1::Reshape>({select, sign_target});
++    auto mag_sign = wrap_type<v1::Multiply>({mag, sign});
++    // the two sub-block scales [E,out,g,2] expanded to [E,out,g,32]
++    auto scale = wrap_type<v0::Constant>();
++    auto scale_f32 = ov::pass::pattern::optional<v0::Convert>({scale});
++    auto scale5_target = wrap_type<v0::Constant>();
++    auto scale5 = wrap_type<v1::Reshape>({scale_f32, scale5_target});
++    auto scale_target = wrap_type<v0::Constant>();
++    auto scale_bcast = wrap_type<v3::Broadcast>({scale5, scale_target});
++    auto scale32_target = wrap_type<v0::Constant>();
++    auto scale32 = wrap_type<v1::Reshape>({scale_bcast, scale32_target});
++    auto mul = wrap_type<v1::Multiply>({mag_sign, scale32});
++    auto reshape_target = wrap_type<v0::Constant>();
++    auto reshape = wrap_type<v1::Reshape>({mul, reshape_target});
++    auto weights_input = ov::pass::pattern::optional<v0::Convert>({reshape});
++
++    m_inputs = ov::OutputVector{gridix, signix};
++    m_outputs = ov::OutputVector{weights_input};
++    REGISTER_ANCHORS(this, gridix, signix, scale, reshape);
++}
+diff --git a/src/common/transformations/src/transformations/common_optimizations/convert_tiled_moe_block_to_gather_matmuls.cpp b/src/common/transformations/src/transformations/common_optimizations/convert_tiled_moe_block_to_gather_matmuls.cpp
+index f07ae97..0938e9c 100644
+--- a/src/common/transformations/src/transformations/common_optimizations/convert_tiled_moe_block_to_gather_matmuls.cpp
++++ b/src/common/transformations/src/transformations/common_optimizations/convert_tiled_moe_block_to_gather_matmuls.cpp
+@@ -221,6 +221,7 @@ struct NativeWeightPattern {
+     std::shared_ptr<pattern::op::NativeIq4nlWeightsBlock> iq4nl;
+     std::shared_ptr<pattern::op::NativeIq3xxsWeightsBlock> iq3xxs;
+     std::shared_ptr<pattern::op::NativeQ8WeightsBlock> q8;
++    std::shared_ptr<pattern::op::NativeIq2sWeightsBlock> iq2s;
+     std::shared_ptr<ov::Node> either;
+ };
+ 
+@@ -229,7 +230,8 @@ NativeWeightPattern make_native_weight_pattern() {
+     w.iq4nl = std::make_shared<pattern::op::NativeIq4nlWeightsBlock>();
+     w.iq3xxs = std::make_shared<pattern::op::NativeIq3xxsWeightsBlock>();
+     w.q8 = std::make_shared<pattern::op::NativeQ8WeightsBlock>();
+-    w.either = std::make_shared<pattern::op::Or>(ov::OutputVector{w.iq4nl, w.iq3xxs, w.q8});
++    w.iq2s = std::make_shared<pattern::op::NativeIq2sWeightsBlock>();
++    w.either = std::make_shared<pattern::op::Or>(ov::OutputVector{w.iq4nl, w.iq3xxs, w.q8, w.iq2s});
+     return w;
+ }
+ 
+@@ -500,6 +502,13 @@ ConvertTiledMoeBlockNativeToMoeCompressed::ConvertTiledMoeBlockNativeToMoeCompre
+                 r.zp = r.scale;  // no zero-point, as IQ4_NL
+                 return true;
+             }
++            if (auto gridix = w.iq2s->get_anchor("gridix", pm)) {
++                r.format = MOECompressed::kWeightFormatIq2S;
++                r.weight = gridix.value();
++                r.scale = w.iq2s->get_anchor("scale", pm).value();
++                r.zp = w.iq2s->get_anchor("signix", pm).value();
++                return true;
++            }
+             return false;
+         };
+         Resolved gate, up, down;
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+index a35e35f..13bd14a 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -606,8 +606,9 @@ protected:
+         // kernel does not have rather than run the IQ4_NL path over Q8_0
+         // bytes (the "wrong dequant rejected" rule of 0045's test ladder).
+         OPENVINO_ASSERT(desc->_config.gate_up_weight_format == 1 ||
+-                            desc->_config.gate_up_weight_format == 2,
+-                        "native per-expert gate/up kernel supports IQ4_NL (1) and IQ3_XXS (2); got format ",
++                            desc->_config.gate_up_weight_format == 2 ||
++                            desc->_config.gate_up_weight_format == 4,
++                        "native per-expert gate/up kernel supports IQ4_NL (1), IQ3_XXS (2) and IQ2_S (4); got format ",
+                         desc->_config.gate_up_weight_format);
+         if (desc->_config.activation_type == ov::op::internal::MOE::Activation_type::GEGLU_TANH)
+             jit.make("GATE_ACT_GELU_TANH", 1);
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
+index d4fb561..6683aa7 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
+@@ -51,7 +51,12 @@ struct QuantMatrix {
+     // linear element order, s = f16 d per 32 values, z unused); 2 = IQ3_XXS
+     // (w = u8 grid indices, 8 per 32 values; z = u8 sign-mask indices, 4 per
+     // 32 values; s = f16 d*(0.5+s)*0.5 per 32 values); 3 = Q8_0 (w = i8
+-    // codes in linear element order, s = f16 d per 32 values, z unused).
++    // codes in linear element order, s = f16 d per 32 values, z unused);
++    // 4 = IQ2_S (patch 0050: w = u8 [oc, K/32, 8] holding four 10-bit grid
++    // indices per 32 values as little-endian u16; z = u8 [oc, K/32, 4] RAW
++    // sign bytes, bit j flips value j; s = f16 [oc, K/32, 2], the low
++    // nibble's sub-block scale for values 0..15 and the high nibble's for
++    // 16..31).
+     // IQ4_XS arrives in the IQ4_NL layout (its sub-block scales folded into
+     // s by the exporter). The scale is f16 like the affine form's (an f32
+     // scale Constant is wrapped by the plugin's precision pass and refused by
+@@ -66,6 +71,7 @@ constexpr int kQuantFormatU4Affine = 0;
+ constexpr int kQuantFormatIq4Nl = 1;
+ constexpr int kQuantFormatIq3Xxs = 2;
+ constexpr int kQuantFormatQ8_0 = 3;
++constexpr int kQuantFormatIq2S = 4;
+ 
+ enum class GateAct { Silu, GeluTanh, GeluErf };   // mirrors MOE_GATE_ACT, mlp.cl:46-65
+ 
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
+index 0a67576..4120edb 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
+@@ -215,6 +215,525 @@ static const uint32_t kIq3xxsGrid[256] = {
+     0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c, 0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04,
+ };
+ 
++// arcint (patch 0050, Qwen3.6-35B-A3B). IQ2_S grid, 1024 entries x 8
++// magnitudes (three values: 8, 25, 43), verbatim from llama.cpp's
++// ggml-common.h iq2s_grid[1024] (pinned clone 56b9eb28, MIT) and bit-exact
++// vs tools/q4e/native_blocks.py::IQ2S_GRID.
++static const uint8_t kIq2sGrid[8192] = {
++    8, 8, 8, 8, 8, 8, 8, 8, 43, 8, 8, 8, 8, 8, 8, 8,
++    25, 25, 8, 8, 8, 8, 8, 8, 8, 43, 8, 8, 8, 8, 8, 8,
++    43, 43, 8, 8, 8, 8, 8, 8, 25, 8, 25, 8, 8, 8, 8, 8,
++    8, 25, 25, 8, 8, 8, 8, 8, 43, 25, 25, 8, 8, 8, 8, 8,
++    25, 43, 25, 8, 8, 8, 8, 8, 8, 8, 43, 8, 8, 8, 8, 8,
++    43, 8, 43, 8, 8, 8, 8, 8, 25, 25, 43, 8, 8, 8, 8, 8,
++    8, 43, 43, 8, 8, 8, 8, 8, 25, 8, 8, 25, 8, 8, 8, 8,
++    8, 25, 8, 25, 8, 8, 8, 8, 43, 25, 8, 25, 8, 8, 8, 8,
++    25, 43, 8, 25, 8, 8, 8, 8, 8, 8, 25, 25, 8, 8, 8, 8,
++    43, 8, 25, 25, 8, 8, 8, 8, 25, 25, 25, 25, 8, 8, 8, 8,
++    8, 43, 25, 25, 8, 8, 8, 8, 25, 8, 43, 25, 8, 8, 8, 8,
++    8, 25, 43, 25, 8, 8, 8, 8, 43, 25, 43, 25, 8, 8, 8, 8,
++    25, 43, 43, 25, 8, 8, 8, 8, 8, 8, 8, 43, 8, 8, 8, 8,
++    43, 8, 8, 43, 8, 8, 8, 8, 25, 25, 8, 43, 8, 8, 8, 8,
++    8, 43, 8, 43, 8, 8, 8, 8, 25, 8, 25, 43, 8, 8, 8, 8,
++    8, 25, 25, 43, 8, 8, 8, 8, 8, 8, 43, 43, 8, 8, 8, 8,
++    25, 25, 43, 43, 8, 8, 8, 8, 43, 43, 43, 43, 8, 8, 8, 8,
++    25, 8, 8, 8, 25, 8, 8, 8, 8, 25, 8, 8, 25, 8, 8, 8,
++    43, 25, 8, 8, 25, 8, 8, 8, 25, 43, 8, 8, 25, 8, 8, 8,
++    8, 8, 25, 8, 25, 8, 8, 8, 43, 8, 25, 8, 25, 8, 8, 8,
++    25, 25, 25, 8, 25, 8, 8, 8, 8, 43, 25, 8, 25, 8, 8, 8,
++    25, 8, 43, 8, 25, 8, 8, 8, 8, 25, 43, 8, 25, 8, 8, 8,
++    8, 8, 8, 25, 25, 8, 8, 8, 43, 8, 8, 25, 25, 8, 8, 8,
++    25, 25, 8, 25, 25, 8, 8, 8, 8, 43, 8, 25, 25, 8, 8, 8,
++    25, 8, 25, 25, 25, 8, 8, 8, 8, 25, 25, 25, 25, 8, 8, 8,
++    43, 25, 25, 25, 25, 8, 8, 8, 25, 43, 25, 25, 25, 8, 8, 8,
++    8, 8, 43, 25, 25, 8, 8, 8, 25, 25, 43, 25, 25, 8, 8, 8,
++    8, 43, 43, 25, 25, 8, 8, 8, 25, 8, 8, 43, 25, 8, 8, 8,
++    8, 25, 8, 43, 25, 8, 8, 8, 8, 8, 25, 43, 25, 8, 8, 8,
++    43, 8, 25, 43, 25, 8, 8, 8, 25, 25, 25, 43, 25, 8, 8, 8,
++    25, 8, 43, 43, 25, 8, 8, 8, 8, 25, 43, 43, 25, 8, 8, 8,
++    8, 8, 8, 8, 43, 8, 8, 8, 43, 8, 8, 8, 43, 8, 8, 8,
++    25, 25, 8, 8, 43, 8, 8, 8, 8, 43, 8, 8, 43, 8, 8, 8,
++    25, 8, 25, 8, 43, 8, 8, 8, 8, 25, 25, 8, 43, 8, 8, 8,
++    8, 8, 43, 8, 43, 8, 8, 8, 43, 43, 43, 8, 43, 8, 8, 8,
++    25, 8, 8, 25, 43, 8, 8, 8, 8, 25, 8, 25, 43, 8, 8, 8,
++    43, 25, 8, 25, 43, 8, 8, 8, 25, 43, 8, 25, 43, 8, 8, 8,
++    8, 8, 25, 25, 43, 8, 8, 8, 25, 25, 25, 25, 43, 8, 8, 8,
++    8, 8, 8, 43, 43, 8, 8, 8, 25, 25, 8, 43, 43, 8, 8, 8,
++    43, 43, 8, 43, 43, 8, 8, 8, 8, 25, 25, 43, 43, 8, 8, 8,
++    43, 8, 43, 43, 43, 8, 8, 8, 25, 8, 8, 8, 8, 25, 8, 8,
++    8, 25, 8, 8, 8, 25, 8, 8, 43, 25, 8, 8, 8, 25, 8, 8,
++    25, 43, 8, 8, 8, 25, 8, 8, 8, 8, 25, 8, 8, 25, 8, 8,
++    43, 8, 25, 8, 8, 25, 8, 8, 25, 25, 25, 8, 8, 25, 8, 8,
++    8, 43, 25, 8, 8, 25, 8, 8, 25, 8, 43, 8, 8, 25, 8, 8,
++    8, 25, 43, 8, 8, 25, 8, 8, 43, 25, 43, 8, 8, 25, 8, 8,
++    25, 43, 43, 8, 8, 25, 8, 8, 8, 8, 8, 25, 8, 25, 8, 8,
++    43, 8, 8, 25, 8, 25, 8, 8, 25, 25, 8, 25, 8, 25, 8, 8,
++    8, 43, 8, 25, 8, 25, 8, 8, 43, 43, 8, 25, 8, 25, 8, 8,
++    25, 8, 25, 25, 8, 25, 8, 8, 8, 25, 25, 25, 8, 25, 8, 8,
++    43, 25, 25, 25, 8, 25, 8, 8, 25, 43, 25, 25, 8, 25, 8, 8,
++    8, 8, 43, 25, 8, 25, 8, 8, 43, 8, 43, 25, 8, 25, 8, 8,
++    25, 25, 43, 25, 8, 25, 8, 8, 25, 8, 8, 43, 8, 25, 8, 8,
++    8, 25, 8, 43, 8, 25, 8, 8, 43, 25, 8, 43, 8, 25, 8, 8,
++    25, 43, 8, 43, 8, 25, 8, 8, 8, 8, 25, 43, 8, 25, 8, 8,
++    25, 25, 25, 43, 8, 25, 8, 8, 8, 43, 25, 43, 8, 25, 8, 8,
++    25, 8, 43, 43, 8, 25, 8, 8, 8, 25, 43, 43, 8, 25, 8, 8,
++    8, 8, 8, 8, 25, 25, 8, 8, 43, 8, 8, 8, 25, 25, 8, 8,
++    25, 25, 8, 8, 25, 25, 8, 8, 8, 43, 8, 8, 25, 25, 8, 8,
++    43, 43, 8, 8, 25, 25, 8, 8, 25, 8, 25, 8, 25, 25, 8, 8,
++    8, 25, 25, 8, 25, 25, 8, 8, 43, 25, 25, 8, 25, 25, 8, 8,
++    25, 43, 25, 8, 25, 25, 8, 8, 8, 8, 43, 8, 25, 25, 8, 8,
++    25, 25, 43, 8, 25, 25, 8, 8, 8, 43, 43, 8, 25, 25, 8, 8,
++    25, 8, 8, 25, 25, 25, 8, 8, 8, 25, 8, 25, 25, 25, 8, 8,
++    43, 25, 8, 25, 25, 25, 8, 8, 25, 43, 8, 25, 25, 25, 8, 8,
++    8, 8, 25, 25, 25, 25, 8, 8, 43, 8, 25, 25, 25, 25, 8, 8,
++    25, 25, 25, 25, 25, 25, 8, 8, 8, 43, 25, 25, 25, 25, 8, 8,
++    25, 8, 43, 25, 25, 25, 8, 8, 8, 25, 43, 25, 25, 25, 8, 8,
++    8, 8, 8, 43, 25, 25, 8, 8, 43, 8, 8, 43, 25, 25, 8, 8,
++    25, 25, 8, 43, 25, 25, 8, 8, 8, 43, 8, 43, 25, 25, 8, 8,
++    25, 8, 25, 43, 25, 25, 8, 8, 8, 25, 25, 43, 25, 25, 8, 8,
++    8, 8, 43, 43, 25, 25, 8, 8, 25, 8, 8, 8, 43, 25, 8, 8,
++    8, 25, 8, 8, 43, 25, 8, 8, 43, 25, 8, 8, 43, 25, 8, 8,
++    25, 43, 8, 8, 43, 25, 8, 8, 8, 8, 25, 8, 43, 25, 8, 8,
++    25, 25, 25, 8, 43, 25, 8, 8, 8, 8, 8, 25, 43, 25, 8, 8,
++    25, 25, 8, 25, 43, 25, 8, 8, 8, 43, 8, 25, 43, 25, 8, 8,
++    25, 8, 25, 25, 43, 25, 8, 8, 8, 25, 25, 25, 43, 25, 8, 8,
++    8, 8, 43, 25, 43, 25, 8, 8, 25, 8, 8, 43, 43, 25, 8, 8,
++    8, 25, 8, 43, 43, 25, 8, 8, 8, 8, 25, 43, 43, 25, 8, 8,
++    8, 8, 8, 8, 8, 43, 8, 8, 43, 8, 8, 8, 8, 43, 8, 8,
++    25, 25, 8, 8, 8, 43, 8, 8, 8, 43, 8, 8, 8, 43, 8, 8,
++    25, 8, 25, 8, 8, 43, 8, 8, 8, 25, 25, 8, 8, 43, 8, 8,
++    43, 25, 25, 8, 8, 43, 8, 8, 25, 43, 25, 8, 8, 43, 8, 8,
++    8, 8, 43, 8, 8, 43, 8, 8, 25, 25, 43, 8, 8, 43, 8, 8,
++    43, 43, 43, 8, 8, 43, 8, 8, 25, 8, 8, 25, 8, 43, 8, 8,
++    8, 25, 8, 25, 8, 43, 8, 8, 43, 25, 8, 25, 8, 43, 8, 8,
++    25, 43, 8, 25, 8, 43, 8, 8, 8, 8, 25, 25, 8, 43, 8, 8,
++    43, 8, 25, 25, 8, 43, 8, 8, 25, 25, 25, 25, 8, 43, 8, 8,
++    8, 43, 25, 25, 8, 43, 8, 8, 25, 8, 43, 25, 8, 43, 8, 8,
++    8, 25, 43, 25, 8, 43, 8, 8, 8, 8, 8, 43, 8, 43, 8, 8,
++    25, 25, 8, 43, 8, 43, 8, 8, 8, 25, 25, 43, 8, 43, 8, 8,
++    43, 43, 43, 43, 8, 43, 8, 8, 25, 8, 8, 8, 25, 43, 8, 8,
++    8, 25, 8, 8, 25, 43, 8, 8, 8, 8, 25, 8, 25, 43, 8, 8,
++    43, 8, 25, 8, 25, 43, 8, 8, 25, 25, 25, 8, 25, 43, 8, 8,
++    8, 43, 25, 8, 25, 43, 8, 8, 25, 8, 43, 8, 25, 43, 8, 8,
++    8, 8, 8, 25, 25, 43, 8, 8, 25, 25, 8, 25, 25, 43, 8, 8,
++    8, 43, 8, 25, 25, 43, 8, 8, 25, 8, 25, 25, 25, 43, 8, 8,
++    8, 25, 25, 25, 25, 43, 8, 8, 8, 8, 43, 25, 25, 43, 8, 8,
++    25, 8, 8, 43, 25, 43, 8, 8, 8, 8, 25, 43, 25, 43, 8, 8,
++    8, 8, 8, 8, 43, 43, 8, 8, 25, 8, 25, 8, 43, 43, 8, 8,
++    8, 25, 25, 8, 43, 43, 8, 8, 43, 8, 43, 8, 43, 43, 8, 8,
++    8, 43, 43, 8, 43, 43, 8, 8, 43, 43, 43, 8, 43, 43, 8, 8,
++    8, 8, 25, 25, 43, 43, 8, 8, 25, 43, 25, 43, 43, 43, 8, 8,
++    25, 8, 8, 8, 8, 8, 25, 8, 8, 25, 8, 8, 8, 8, 25, 8,
++    43, 25, 8, 8, 8, 8, 25, 8, 25, 43, 8, 8, 8, 8, 25, 8,
++    8, 8, 25, 8, 8, 8, 25, 8, 43, 8, 25, 8, 8, 8, 25, 8,
++    25, 25, 25, 8, 8, 8, 25, 8, 8, 43, 25, 8, 8, 8, 25, 8,
++    25, 8, 43, 8, 8, 8, 25, 8, 8, 25, 43, 8, 8, 8, 25, 8,
++    43, 25, 43, 8, 8, 8, 25, 8, 8, 8, 8, 25, 8, 8, 25, 8,
++    43, 8, 8, 25, 8, 8, 25, 8, 25, 25, 8, 25, 8, 8, 25, 8,
++    8, 43, 8, 25, 8, 8, 25, 8, 25, 8, 25, 25, 8, 8, 25, 8,
++    8, 25, 25, 25, 8, 8, 25, 8, 43, 25, 25, 25, 8, 8, 25, 8,
++    25, 43, 25, 25, 8, 8, 25, 8, 8, 8, 43, 25, 8, 8, 25, 8,
++    43, 8, 43, 25, 8, 8, 25, 8, 25, 25, 43, 25, 8, 8, 25, 8,
++    8, 43, 43, 25, 8, 8, 25, 8, 25, 8, 8, 43, 8, 8, 25, 8,
++    8, 25, 8, 43, 8, 8, 25, 8, 43, 25, 8, 43, 8, 8, 25, 8,
++    8, 8, 25, 43, 8, 8, 25, 8, 25, 25, 25, 43, 8, 8, 25, 8,
++    8, 43, 25, 43, 8, 8, 25, 8, 25, 8, 43, 43, 8, 8, 25, 8,
++    8, 25, 43, 43, 8, 8, 25, 8, 8, 8, 8, 8, 25, 8, 25, 8,
++    43, 8, 8, 8, 25, 8, 25, 8, 25, 25, 8, 8, 25, 8, 25, 8,
++    8, 43, 8, 8, 25, 8, 25, 8, 43, 43, 8, 8, 25, 8, 25, 8,
++    25, 8, 25, 8, 25, 8, 25, 8, 8, 25, 25, 8, 25, 8, 25, 8,
++    43, 25, 25, 8, 25, 8, 25, 8, 25, 43, 25, 8, 25, 8, 25, 8,
++    8, 8, 43, 8, 25, 8, 25, 8, 43, 8, 43, 8, 25, 8, 25, 8,
++    25, 25, 43, 8, 25, 8, 25, 8, 8, 43, 43, 8, 25, 8, 25, 8,
++    25, 8, 8, 25, 25, 8, 25, 8, 8, 25, 8, 25, 25, 8, 25, 8,
++    43, 25, 8, 25, 25, 8, 25, 8, 25, 43, 8, 25, 25, 8, 25, 8,
++    8, 8, 25, 25, 25, 8, 25, 8, 43, 8, 25, 25, 25, 8, 25, 8,
++    25, 25, 25, 25, 25, 8, 25, 8, 8, 43, 25, 25, 25, 8, 25, 8,
++    25, 8, 43, 25, 25, 8, 25, 8, 8, 25, 43, 25, 25, 8, 25, 8,
++    8, 8, 8, 43, 25, 8, 25, 8, 43, 8, 8, 43, 25, 8, 25, 8,
++    25, 25, 8, 43, 25, 8, 25, 8, 8, 43, 8, 43, 25, 8, 25, 8,
++    25, 8, 25, 43, 25, 8, 25, 8, 8, 25, 25, 43, 25, 8, 25, 8,
++    25, 8, 8, 8, 43, 8, 25, 8, 8, 25, 8, 8, 43, 8, 25, 8,
++    25, 43, 8, 8, 43, 8, 25, 8, 8, 8, 25, 8, 43, 8, 25, 8,
++    25, 25, 25, 8, 43, 8, 25, 8, 25, 8, 43, 8, 43, 8, 25, 8,
++    8, 25, 43, 8, 43, 8, 25, 8, 8, 8, 8, 25, 43, 8, 25, 8,
++    25, 25, 8, 25, 43, 8, 25, 8, 25, 8, 25, 25, 43, 8, 25, 8,
++    8, 25, 25, 25, 43, 8, 25, 8, 25, 8, 8, 43, 43, 8, 25, 8,
++    8, 25, 8, 43, 43, 8, 25, 8, 8, 8, 25, 43, 43, 8, 25, 8,
++    8, 8, 8, 8, 8, 25, 25, 8, 43, 8, 8, 8, 8, 25, 25, 8,
++    25, 25, 8, 8, 8, 25, 25, 8, 8, 43, 8, 8, 8, 25, 25, 8,
++    25, 8, 25, 8, 8, 25, 25, 8, 8, 25, 25, 8, 8, 25, 25, 8,
++    43, 25, 25, 8, 8, 25, 25, 8, 25, 43, 25, 8, 8, 25, 25, 8,
++    8, 8, 43, 8, 8, 25, 25, 8, 25, 25, 43, 8, 8, 25, 25, 8,
++    8, 43, 43, 8, 8, 25, 25, 8, 25, 8, 8, 25, 8, 25, 25, 8,
++    8, 25, 8, 25, 8, 25, 25, 8, 43, 25, 8, 25, 8, 25, 25, 8,
++    25, 43, 8, 25, 8, 25, 25, 8, 8, 8, 25, 25, 8, 25, 25, 8,
++    43, 8, 25, 25, 8, 25, 25, 8, 25, 25, 25, 25, 8, 25, 25, 8,
++    8, 43, 25, 25, 8, 25, 25, 8, 25, 8, 43, 25, 8, 25, 25, 8,
++    8, 25, 43, 25, 8, 25, 25, 8, 8, 8, 8, 43, 8, 25, 25, 8,
++    43, 8, 8, 43, 8, 25, 25, 8, 25, 25, 8, 43, 8, 25, 25, 8,
++    8, 43, 8, 43, 8, 25, 25, 8, 25, 8, 25, 43, 8, 25, 25, 8,
++    8, 25, 25, 43, 8, 25, 25, 8, 8, 8, 43, 43, 8, 25, 25, 8,
++    25, 8, 8, 8, 25, 25, 25, 8, 8, 25, 8, 8, 25, 25, 25, 8,
++    43, 25, 8, 8, 25, 25, 25, 8, 25, 43, 8, 8, 25, 25, 25, 8,
++    8, 8, 25, 8, 25, 25, 25, 8, 43, 8, 25, 8, 25, 25, 25, 8,
++    25, 25, 25, 8, 25, 25, 25, 8, 8, 43, 25, 8, 25, 25, 25, 8,
++    25, 8, 43, 8, 25, 25, 25, 8, 8, 25, 43, 8, 25, 25, 25, 8,
++    8, 8, 8, 25, 25, 25, 25, 8, 43, 8, 8, 25, 25, 25, 25, 8,
++    25, 25, 8, 25, 25, 25, 25, 8, 8, 43, 8, 25, 25, 25, 25, 8,
++    25, 8, 25, 25, 25, 25, 25, 8, 8, 25, 25, 25, 25, 25, 25, 8,
++    8, 8, 43, 25, 25, 25, 25, 8, 25, 8, 8, 43, 25, 25, 25, 8,
++    8, 25, 8, 43, 25, 25, 25, 8, 8, 8, 25, 43, 25, 25, 25, 8,
++    8, 8, 8, 8, 43, 25, 25, 8, 25, 25, 8, 8, 43, 25, 25, 8,
++    8, 43, 8, 8, 43, 25, 25, 8, 25, 8, 25, 8, 43, 25, 25, 8,
++    8, 25, 25, 8, 43, 25, 25, 8, 8, 8, 43, 8, 43, 25, 25, 8,
++    25, 8, 8, 25, 43, 25, 25, 8, 8, 25, 8, 25, 43, 25, 25, 8,
++    8, 8, 25, 25, 43, 25, 25, 8, 8, 8, 8, 43, 43, 25, 25, 8,
++    43, 43, 43, 43, 43, 25, 25, 8, 25, 8, 8, 8, 8, 43, 25, 8,
++    8, 25, 8, 8, 8, 43, 25, 8, 43, 25, 8, 8, 8, 43, 25, 8,
++    25, 43, 8, 8, 8, 43, 25, 8, 8, 8, 25, 8, 8, 43, 25, 8,
++    25, 25, 25, 8, 8, 43, 25, 8, 8, 43, 25, 8, 8, 43, 25, 8,
++    25, 8, 43, 8, 8, 43, 25, 8, 8, 8, 8, 25, 8, 43, 25, 8,
++    43, 8, 8, 25, 8, 43, 25, 8, 25, 25, 8, 25, 8, 43, 25, 8,
++    8, 43, 8, 25, 8, 43, 25, 8, 25, 8, 25, 25, 8, 43, 25, 8,
++    8, 25, 25, 25, 8, 43, 25, 8, 8, 8, 43, 25, 8, 43, 25, 8,
++    25, 8, 8, 43, 8, 43, 25, 8, 8, 25, 8, 43, 8, 43, 25, 8,
++    8, 8, 8, 8, 25, 43, 25, 8, 43, 8, 8, 8, 25, 43, 25, 8,
++    25, 25, 8, 8, 25, 43, 25, 8, 8, 43, 8, 8, 25, 43, 25, 8,
++    25, 8, 25, 8, 25, 43, 25, 8, 8, 25, 25, 8, 25, 43, 25, 8,
++    8, 8, 43, 8, 25, 43, 25, 8, 25, 8, 8, 25, 25, 43, 25, 8,
++    8, 25, 8, 25, 25, 43, 25, 8, 8, 8, 25, 25, 25, 43, 25, 8,
++    25, 43, 43, 25, 25, 43, 25, 8, 43, 8, 43, 43, 25, 43, 25, 8,
++    8, 25, 8, 8, 43, 43, 25, 8, 8, 8, 25, 8, 43, 43, 25, 8,
++    8, 8, 8, 25, 43, 43, 25, 8, 43, 25, 25, 25, 43, 43, 25, 8,
++    8, 8, 8, 8, 8, 8, 43, 8, 43, 8, 8, 8, 8, 8, 43, 8,
++    25, 25, 8, 8, 8, 8, 43, 8, 8, 43, 8, 8, 8, 8, 43, 8,
++    25, 8, 25, 8, 8, 8, 43, 8, 8, 25, 25, 8, 8, 8, 43, 8,
++    43, 25, 25, 8, 8, 8, 43, 8, 25, 43, 25, 8, 8, 8, 43, 8,
++    8, 8, 43, 8, 8, 8, 43, 8, 25, 25, 43, 8, 8, 8, 43, 8,
++    43, 43, 43, 8, 8, 8, 43, 8, 25, 8, 8, 25, 8, 8, 43, 8,
++    8, 25, 8, 25, 8, 8, 43, 8, 8, 8, 25, 25, 8, 8, 43, 8,
++    43, 8, 25, 25, 8, 8, 43, 8, 25, 25, 25, 25, 8, 8, 43, 8,
++    8, 25, 43, 25, 8, 8, 43, 8, 8, 8, 8, 43, 8, 8, 43, 8,
++    43, 43, 8, 43, 8, 8, 43, 8, 8, 25, 25, 43, 8, 8, 43, 8,
++    43, 43, 43, 43, 8, 8, 43, 8, 25, 8, 8, 8, 25, 8, 43, 8,
++    8, 25, 8, 8, 25, 8, 43, 8, 8, 8, 25, 8, 25, 8, 43, 8,
++    43, 8, 25, 8, 25, 8, 43, 8, 25, 25, 25, 8, 25, 8, 43, 8,
++    25, 8, 43, 8, 25, 8, 43, 8, 8, 8, 8, 25, 25, 8, 43, 8,
++    43, 8, 8, 25, 25, 8, 43, 8, 25, 25, 8, 25, 25, 8, 43, 8,
++    25, 8, 25, 25, 25, 8, 43, 8, 8, 25, 25, 25, 25, 8, 43, 8,
++    8, 8, 43, 25, 25, 8, 43, 8, 25, 8, 8, 43, 25, 8, 43, 8,
++    8, 25, 8, 43, 25, 8, 43, 8, 8, 8, 25, 43, 25, 8, 43, 8,
++    8, 8, 8, 8, 43, 8, 43, 8, 43, 43, 8, 8, 43, 8, 43, 8,
++    43, 8, 43, 8, 43, 8, 43, 8, 8, 43, 43, 8, 43, 8, 43, 8,
++    43, 43, 43, 8, 43, 8, 43, 8, 8, 25, 8, 25, 43, 8, 43, 8,
++    8, 8, 25, 25, 43, 8, 43, 8, 8, 43, 8, 43, 43, 8, 43, 8,
++    43, 43, 8, 43, 43, 8, 43, 8, 8, 43, 43, 43, 43, 8, 43, 8,
++    25, 8, 8, 8, 8, 25, 43, 8, 8, 25, 8, 8, 8, 25, 43, 8,
++    43, 25, 8, 8, 8, 25, 43, 8, 25, 43, 8, 8, 8, 25, 43, 8,
++    8, 8, 25, 8, 8, 25, 43, 8, 25, 25, 25, 8, 8, 25, 43, 8,
++    8, 43, 25, 8, 8, 25, 43, 8, 25, 8, 43, 8, 8, 25, 43, 8,
++    8, 25, 43, 8, 8, 25, 43, 8, 8, 8, 8, 25, 8, 25, 43, 8,
++    43, 8, 8, 25, 8, 25, 43, 8, 25, 25, 8, 25, 8, 25, 43, 8,
++    8, 43, 8, 25, 8, 25, 43, 8, 25, 8, 25, 25, 8, 25, 43, 8,
++    8, 25, 25, 25, 8, 25, 43, 8, 8, 8, 43, 25, 8, 25, 43, 8,
++    25, 8, 8, 43, 8, 25, 43, 8, 8, 25, 8, 43, 8, 25, 43, 8,
++    8, 8, 25, 43, 8, 25, 43, 8, 8, 8, 8, 8, 25, 25, 43, 8,
++    25, 25, 8, 8, 25, 25, 43, 8, 8, 43, 8, 8, 25, 25, 43, 8,
++    25, 8, 25, 8, 25, 25, 43, 8, 8, 25, 25, 8, 25, 25, 43, 8,
++    8, 8, 43, 8, 25, 25, 43, 8, 25, 8, 8, 25, 25, 25, 43, 8,
++    8, 25, 8, 25, 25, 25, 43, 8, 8, 8, 25, 25, 25, 25, 43, 8,
++    43, 25, 43, 25, 25, 25, 43, 8, 8, 8, 8, 43, 25, 25, 43, 8,
++    25, 8, 8, 8, 43, 25, 43, 8, 8, 25, 8, 8, 43, 25, 43, 8,
++    8, 8, 25, 8, 43, 25, 43, 8, 8, 8, 8, 25, 43, 25, 43, 8,
++    25, 43, 25, 25, 43, 25, 43, 8, 8, 8, 8, 8, 8, 43, 43, 8,
++    25, 25, 8, 8, 8, 43, 43, 8, 25, 8, 25, 8, 8, 43, 43, 8,
++    8, 25, 25, 8, 8, 43, 43, 8, 25, 8, 8, 25, 8, 43, 43, 8,
++    8, 25, 8, 25, 8, 43, 43, 8, 8, 8, 25, 25, 8, 43, 43, 8,
++    43, 43, 8, 43, 8, 43, 43, 8, 43, 43, 43, 43, 8, 43, 43, 8,
++    25, 8, 8, 8, 25, 43, 43, 8, 8, 25, 8, 8, 25, 43, 43, 8,
++    8, 8, 25, 8, 25, 43, 43, 8, 25, 25, 25, 43, 25, 43, 43, 8,
++    43, 43, 8, 8, 43, 43, 43, 8, 43, 8, 43, 8, 43, 43, 43, 8,
++    8, 25, 43, 25, 43, 43, 43, 8, 8, 43, 8, 43, 43, 43, 43, 8,
++    43, 43, 8, 43, 43, 43, 43, 8, 25, 8, 8, 8, 8, 8, 8, 25,
++    8, 25, 8, 8, 8, 8, 8, 25, 43, 25, 8, 8, 8, 8, 8, 25,
++    25, 43, 8, 8, 8, 8, 8, 25, 8, 8, 25, 8, 8, 8, 8, 25,
++    43, 8, 25, 8, 8, 8, 8, 25, 25, 25, 25, 8, 8, 8, 8, 25,
++    8, 43, 25, 8, 8, 8, 8, 25, 43, 43, 25, 8, 8, 8, 8, 25,
++    25, 8, 43, 8, 8, 8, 8, 25, 8, 25, 43, 8, 8, 8, 8, 25,
++    43, 25, 43, 8, 8, 8, 8, 25, 8, 8, 8, 25, 8, 8, 8, 25,
++    43, 8, 8, 25, 8, 8, 8, 25, 25, 25, 8, 25, 8, 8, 8, 25,
++    8, 43, 8, 25, 8, 8, 8, 25, 43, 43, 8, 25, 8, 8, 8, 25,
++    25, 8, 25, 25, 8, 8, 8, 25, 8, 25, 25, 25, 8, 8, 8, 25,
++    43, 25, 25, 25, 8, 8, 8, 25, 25, 43, 25, 25, 8, 8, 8, 25,
++    8, 8, 43, 25, 8, 8, 8, 25, 43, 8, 43, 25, 8, 8, 8, 25,
++    25, 25, 43, 25, 8, 8, 8, 25, 25, 8, 8, 43, 8, 8, 8, 25,
++    8, 25, 8, 43, 8, 8, 8, 25, 8, 8, 25, 43, 8, 8, 8, 25,
++    25, 25, 25, 43, 8, 8, 8, 25, 8, 43, 25, 43, 8, 8, 8, 25,
++    25, 8, 43, 43, 8, 8, 8, 25, 8, 25, 43, 43, 8, 8, 8, 25,
++    8, 8, 8, 8, 25, 8, 8, 25, 43, 8, 8, 8, 25, 8, 8, 25,
++    25, 25, 8, 8, 25, 8, 8, 25, 8, 43, 8, 8, 25, 8, 8, 25,
++    25, 8, 25, 8, 25, 8, 8, 25, 8, 25, 25, 8, 25, 8, 8, 25,
++    43, 25, 25, 8, 25, 8, 8, 25, 25, 43, 25, 8, 25, 8, 8, 25,
++    8, 8, 43, 8, 25, 8, 8, 25, 43, 8, 43, 8, 25, 8, 8, 25,
++    25, 25, 43, 8, 25, 8, 8, 25, 25, 8, 8, 25, 25, 8, 8, 25,
++    8, 25, 8, 25, 25, 8, 8, 25, 43, 25, 8, 25, 25, 8, 8, 25,
++    25, 43, 8, 25, 25, 8, 8, 25, 8, 8, 25, 25, 25, 8, 8, 25,
++    43, 8, 25, 25, 25, 8, 8, 25, 25, 25, 25, 25, 25, 8, 8, 25,
++    8, 43, 25, 25, 25, 8, 8, 25, 25, 8, 43, 25, 25, 8, 8, 25,
++    8, 25, 43, 25, 25, 8, 8, 25, 8, 8, 8, 43, 25, 8, 8, 25,
++    43, 8, 8, 43, 25, 8, 8, 25, 25, 25, 8, 43, 25, 8, 8, 25,
++    8, 43, 8, 43, 25, 8, 8, 25, 25, 8, 25, 43, 25, 8, 8, 25,
++    8, 25, 25, 43, 25, 8, 8, 25, 8, 8, 43, 43, 25, 8, 8, 25,
++    25, 8, 8, 8, 43, 8, 8, 25, 8, 25, 8, 8, 43, 8, 8, 25,
++    8, 8, 25, 8, 43, 8, 8, 25, 43, 8, 25, 8, 43, 8, 8, 25,
++    25, 25, 25, 8, 43, 8, 8, 25, 8, 43, 25, 8, 43, 8, 8, 25,
++    8, 25, 43, 8, 43, 8, 8, 25, 8, 8, 8, 25, 43, 8, 8, 25,
++    25, 25, 8, 25, 43, 8, 8, 25, 8, 43, 8, 25, 43, 8, 8, 25,
++    25, 8, 25, 25, 43, 8, 8, 25, 8, 25, 25, 25, 43, 8, 8, 25,
++    8, 8, 43, 25, 43, 8, 8, 25, 25, 8, 8, 43, 43, 8, 8, 25,
++    8, 25, 8, 43, 43, 8, 8, 25, 8, 8, 8, 8, 8, 25, 8, 25,
++    43, 8, 8, 8, 8, 25, 8, 25, 25, 25, 8, 8, 8, 25, 8, 25,
++    8, 43, 8, 8, 8, 25, 8, 25, 43, 43, 8, 8, 8, 25, 8, 25,
++    25, 8, 25, 8, 8, 25, 8, 25, 8, 25, 25, 8, 8, 25, 8, 25,
++    43, 25, 25, 8, 8, 25, 8, 25, 25, 43, 25, 8, 8, 25, 8, 25,
++    8, 8, 43, 8, 8, 25, 8, 25, 43, 8, 43, 8, 8, 25, 8, 25,
++    25, 25, 43, 8, 8, 25, 8, 25, 8, 43, 43, 8, 8, 25, 8, 25,
++    25, 8, 8, 25, 8, 25, 8, 25, 8, 25, 8, 25, 8, 25, 8, 25,
++    43, 25, 8, 25, 8, 25, 8, 25, 25, 43, 8, 25, 8, 25, 8, 25,
++    8, 8, 25, 25, 8, 25, 8, 25, 43, 8, 25, 25, 8, 25, 8, 25,
++    25, 25, 25, 25, 8, 25, 8, 25, 8, 43, 25, 25, 8, 25, 8, 25,
++    25, 8, 43, 25, 8, 25, 8, 25, 8, 25, 43, 25, 8, 25, 8, 25,
++    8, 8, 8, 43, 8, 25, 8, 25, 43, 8, 8, 43, 8, 25, 8, 25,
++    25, 25, 8, 43, 8, 25, 8, 25, 8, 43, 8, 43, 8, 25, 8, 25,
++    25, 8, 25, 43, 8, 25, 8, 25, 8, 25, 25, 43, 8, 25, 8, 25,
++    8, 8, 43, 43, 8, 25, 8, 25, 25, 8, 8, 8, 25, 25, 8, 25,
++    8, 25, 8, 8, 25, 25, 8, 25, 43, 25, 8, 8, 25, 25, 8, 25,
++    25, 43, 8, 8, 25, 25, 8, 25, 8, 8, 25, 8, 25, 25, 8, 25,
++    43, 8, 25, 8, 25, 25, 8, 25, 25, 25, 25, 8, 25, 25, 8, 25,
++    8, 43, 25, 8, 25, 25, 8, 25, 25, 8, 43, 8, 25, 25, 8, 25,
++    8, 25, 43, 8, 25, 25, 8, 25, 8, 8, 8, 25, 25, 25, 8, 25,
++    43, 8, 8, 25, 25, 25, 8, 25, 25, 25, 8, 25, 25, 25, 8, 25,
++    8, 43, 8, 25, 25, 25, 8, 25, 25, 8, 25, 25, 25, 25, 8, 25,
++    8, 25, 25, 25, 25, 25, 8, 25, 8, 8, 43, 25, 25, 25, 8, 25,
++    43, 43, 43, 25, 25, 25, 8, 25, 25, 8, 8, 43, 25, 25, 8, 25,
++    8, 25, 8, 43, 25, 25, 8, 25, 8, 8, 25, 43, 25, 25, 8, 25,
++    8, 8, 8, 8, 43, 25, 8, 25, 43, 8, 8, 8, 43, 25, 8, 25,
++    25, 25, 8, 8, 43, 25, 8, 25, 8, 43, 8, 8, 43, 25, 8, 25,
++    25, 8, 25, 8, 43, 25, 8, 25, 8, 25, 25, 8, 43, 25, 8, 25,
++    8, 8, 43, 8, 43, 25, 8, 25, 25, 8, 8, 25, 43, 25, 8, 25,
++    8, 25, 8, 25, 43, 25, 8, 25, 8, 8, 25, 25, 43, 25, 8, 25,
++    8, 8, 8, 43, 43, 25, 8, 25, 25, 25, 43, 43, 43, 25, 8, 25,
++    25, 8, 8, 8, 8, 43, 8, 25, 8, 25, 8, 8, 8, 43, 8, 25,
++    25, 43, 8, 8, 8, 43, 8, 25, 8, 8, 25, 8, 8, 43, 8, 25,
++    43, 8, 25, 8, 8, 43, 8, 25, 25, 25, 25, 8, 8, 43, 8, 25,
++    8, 43, 25, 8, 8, 43, 8, 25, 25, 8, 43, 8, 8, 43, 8, 25,
++    8, 25, 43, 8, 8, 43, 8, 25, 8, 8, 8, 25, 8, 43, 8, 25,
++    43, 8, 8, 25, 8, 43, 8, 25, 25, 25, 8, 25, 8, 43, 8, 25,
++    8, 43, 8, 25, 8, 43, 8, 25, 25, 8, 25, 25, 8, 43, 8, 25,
++    8, 25, 25, 25, 8, 43, 8, 25, 8, 8, 43, 25, 8, 43, 8, 25,
++    8, 25, 8, 43, 8, 43, 8, 25, 8, 8, 25, 43, 8, 43, 8, 25,
++    8, 8, 8, 8, 25, 43, 8, 25, 43, 8, 8, 8, 25, 43, 8, 25,
++    25, 25, 8, 8, 25, 43, 8, 25, 8, 43, 8, 8, 25, 43, 8, 25,
++    25, 8, 25, 8, 25, 43, 8, 25, 8, 25, 25, 8, 25, 43, 8, 25,
++    8, 8, 43, 8, 25, 43, 8, 25, 25, 8, 8, 25, 25, 43, 8, 25,
++    8, 25, 8, 25, 25, 43, 8, 25, 8, 8, 25, 25, 25, 43, 8, 25,
++    8, 8, 8, 43, 25, 43, 8, 25, 43, 25, 25, 43, 25, 43, 8, 25,
++    25, 8, 8, 8, 43, 43, 8, 25, 8, 25, 8, 8, 43, 43, 8, 25,
++    8, 8, 25, 8, 43, 43, 8, 25, 8, 8, 8, 25, 43, 43, 8, 25,
++    8, 8, 8, 8, 8, 8, 25, 25, 43, 8, 8, 8, 8, 8, 25, 25,
++    25, 25, 8, 8, 8, 8, 25, 25, 8, 43, 8, 8, 8, 8, 25, 25,
++    25, 8, 25, 8, 8, 8, 25, 25, 8, 25, 25, 8, 8, 8, 25, 25,
++    43, 25, 25, 8, 8, 8, 25, 25, 25, 43, 25, 8, 8, 8, 25, 25,
++    8, 8, 43, 8, 8, 8, 25, 25, 43, 8, 43, 8, 8, 8, 25, 25,
++    25, 25, 43, 8, 8, 8, 25, 25, 8, 43, 43, 8, 8, 8, 25, 25,
++    25, 8, 8, 25, 8, 8, 25, 25, 8, 25, 8, 25, 8, 8, 25, 25,
++    43, 25, 8, 25, 8, 8, 25, 25, 25, 43, 8, 25, 8, 8, 25, 25,
++    8, 8, 25, 25, 8, 8, 25, 25, 43, 8, 25, 25, 8, 8, 25, 25,
++    25, 25, 25, 25, 8, 8, 25, 25, 8, 43, 25, 25, 8, 8, 25, 25,
++    25, 8, 43, 25, 8, 8, 25, 25, 8, 25, 43, 25, 8, 8, 25, 25,
++    8, 8, 8, 43, 8, 8, 25, 25, 43, 8, 8, 43, 8, 8, 25, 25,
++    25, 25, 8, 43, 8, 8, 25, 25, 8, 43, 8, 43, 8, 8, 25, 25,
++    25, 8, 25, 43, 8, 8, 25, 25, 8, 25, 25, 43, 8, 8, 25, 25,
++    25, 8, 8, 8, 25, 8, 25, 25, 8, 25, 8, 8, 25, 8, 25, 25,
++    43, 25, 8, 8, 25, 8, 25, 25, 25, 43, 8, 8, 25, 8, 25, 25,
++    8, 8, 25, 8, 25, 8, 25, 25, 43, 8, 25, 8, 25, 8, 25, 25,
++    25, 25, 25, 8, 25, 8, 25, 25, 8, 43, 25, 8, 25, 8, 25, 25,
++    25, 8, 43, 8, 25, 8, 25, 25, 8, 25, 43, 8, 25, 8, 25, 25,
++    8, 8, 8, 25, 25, 8, 25, 25, 43, 8, 8, 25, 25, 8, 25, 25,
++    25, 25, 8, 25, 25, 8, 25, 25, 8, 43, 8, 25, 25, 8, 25, 25,
++    25, 8, 25, 25, 25, 8, 25, 25, 8, 25, 25, 25, 25, 8, 25, 25,
++    8, 8, 43, 25, 25, 8, 25, 25, 25, 8, 8, 43, 25, 8, 25, 25,
++    8, 25, 8, 43, 25, 8, 25, 25, 8, 8, 25, 43, 25, 8, 25, 25,
++    8, 8, 8, 8, 43, 8, 25, 25, 25, 25, 8, 8, 43, 8, 25, 25,
++    8, 43, 8, 8, 43, 8, 25, 25, 25, 8, 25, 8, 43, 8, 25, 25,
++    8, 25, 25, 8, 43, 8, 25, 25, 8, 8, 43, 8, 43, 8, 25, 25,
++    25, 8, 8, 25, 43, 8, 25, 25, 8, 25, 8, 25, 43, 8, 25, 25,
++    8, 8, 25, 25, 43, 8, 25, 25, 25, 43, 43, 25, 43, 8, 25, 25,
++    8, 8, 8, 43, 43, 8, 25, 25, 25, 8, 8, 8, 8, 25, 25, 25,
++    8, 25, 8, 8, 8, 25, 25, 25, 43, 25, 8, 8, 8, 25, 25, 25,
++    25, 43, 8, 8, 8, 25, 25, 25, 8, 8, 25, 8, 8, 25, 25, 25,
++    43, 8, 25, 8, 8, 25, 25, 25, 25, 25, 25, 8, 8, 25, 25, 25,
++    8, 43, 25, 8, 8, 25, 25, 25, 25, 8, 43, 8, 8, 25, 25, 25,
++    8, 25, 43, 8, 8, 25, 25, 25, 8, 8, 8, 25, 8, 25, 25, 25,
++    43, 8, 8, 25, 8, 25, 25, 25, 25, 25, 8, 25, 8, 25, 25, 25,
++    8, 43, 8, 25, 8, 25, 25, 25, 25, 8, 25, 25, 8, 25, 25, 25,
++    8, 25, 25, 25, 8, 25, 25, 25, 8, 8, 43, 25, 8, 25, 25, 25,
++    25, 8, 8, 43, 8, 25, 25, 25, 8, 25, 8, 43, 8, 25, 25, 25,
++    8, 8, 25, 43, 8, 25, 25, 25, 8, 8, 8, 8, 25, 25, 25, 25,
++    43, 8, 8, 8, 25, 25, 25, 25, 25, 25, 8, 8, 25, 25, 25, 25,
++    8, 43, 8, 8, 25, 25, 25, 25, 25, 8, 25, 8, 25, 25, 25, 25,
++    8, 25, 25, 8, 25, 25, 25, 25, 8, 8, 43, 8, 25, 25, 25, 25,
++    25, 8, 8, 25, 25, 25, 25, 25, 8, 25, 8, 25, 25, 25, 25, 25,
++    8, 8, 25, 25, 25, 25, 25, 25, 8, 8, 8, 43, 25, 25, 25, 25,
++    25, 8, 8, 8, 43, 25, 25, 25, 8, 25, 8, 8, 43, 25, 25, 25,
++    8, 8, 25, 8, 43, 25, 25, 25, 43, 25, 43, 8, 43, 25, 25, 25,
++    8, 8, 8, 25, 43, 25, 25, 25, 8, 8, 8, 8, 8, 43, 25, 25,
++    43, 8, 8, 8, 8, 43, 25, 25, 25, 25, 8, 8, 8, 43, 25, 25,
++    8, 43, 8, 8, 8, 43, 25, 25, 25, 8, 25, 8, 8, 43, 25, 25,
++    8, 25, 25, 8, 8, 43, 25, 25, 8, 8, 43, 8, 8, 43, 25, 25,
++    25, 8, 8, 25, 8, 43, 25, 25, 8, 25, 8, 25, 8, 43, 25, 25,
++    8, 8, 25, 25, 8, 43, 25, 25, 43, 43, 25, 25, 8, 43, 25, 25,
++    8, 8, 8, 43, 8, 43, 25, 25, 25, 8, 8, 8, 25, 43, 25, 25,
++    8, 25, 8, 8, 25, 43, 25, 25, 8, 8, 25, 8, 25, 43, 25, 25,
++    8, 8, 8, 25, 25, 43, 25, 25, 8, 8, 8, 8, 43, 43, 25, 25,
++    25, 43, 25, 8, 43, 43, 25, 25, 25, 25, 8, 43, 43, 43, 25, 25,
++    8, 43, 43, 43, 43, 43, 25, 25, 25, 8, 8, 8, 8, 8, 43, 25,
++    8, 25, 8, 8, 8, 8, 43, 25, 43, 25, 8, 8, 8, 8, 43, 25,
++    8, 8, 25, 8, 8, 8, 43, 25, 43, 8, 25, 8, 8, 8, 43, 25,
++    25, 25, 25, 8, 8, 8, 43, 25, 8, 43, 25, 8, 8, 8, 43, 25,
++    25, 8, 43, 8, 8, 8, 43, 25, 8, 25, 43, 8, 8, 8, 43, 25,
++    8, 8, 8, 25, 8, 8, 43, 25, 25, 25, 8, 25, 8, 8, 43, 25,
++    8, 43, 8, 25, 8, 8, 43, 25, 25, 8, 25, 25, 8, 8, 43, 25,
++    8, 25, 25, 25, 8, 8, 43, 25, 8, 8, 43, 25, 8, 8, 43, 25,
++    8, 25, 8, 43, 8, 8, 43, 25, 8, 8, 25, 43, 8, 8, 43, 25,
++    8, 8, 8, 8, 25, 8, 43, 25, 43, 8, 8, 8, 25, 8, 43, 25,
++    25, 25, 8, 8, 25, 8, 43, 25, 8, 43, 8, 8, 25, 8, 43, 25,
++    25, 8, 25, 8, 25, 8, 43, 25, 8, 25, 25, 8, 25, 8, 43, 25,
++    8, 8, 43, 8, 25, 8, 43, 25, 25, 8, 8, 25, 25, 8, 43, 25,
++    8, 25, 8, 25, 25, 8, 43, 25, 8, 8, 25, 25, 25, 8, 43, 25,
++    8, 8, 8, 43, 25, 8, 43, 25, 25, 43, 25, 43, 25, 8, 43, 25,
++    8, 25, 8, 8, 43, 8, 43, 25, 8, 8, 25, 8, 43, 8, 43, 25,
++    8, 8, 8, 25, 43, 8, 43, 25, 43, 25, 25, 25, 43, 8, 43, 25,
++    25, 8, 43, 43, 43, 8, 43, 25, 8, 8, 8, 8, 8, 25, 43, 25,
++    25, 25, 8, 8, 8, 25, 43, 25, 8, 43, 8, 8, 8, 25, 43, 25,
++    25, 8, 25, 8, 8, 25, 43, 25, 8, 25, 25, 8, 8, 25, 43, 25,
++    8, 8, 43, 8, 8, 25, 43, 25, 25, 8, 8, 25, 8, 25, 43, 25,
++    8, 25, 8, 25, 8, 25, 43, 25, 8, 8, 25, 25, 8, 25, 43, 25,
++    8, 8, 8, 43, 8, 25, 43, 25, 25, 8, 8, 8, 25, 25, 43, 25,
++    8, 25, 8, 8, 25, 25, 43, 25, 8, 8, 25, 8, 25, 25, 43, 25,
++    8, 8, 8, 25, 25, 25, 43, 25, 43, 43, 8, 25, 25, 25, 43, 25,
++    8, 43, 43, 25, 25, 25, 43, 25, 43, 8, 25, 43, 25, 25, 43, 25,
++    8, 8, 8, 8, 43, 25, 43, 25, 8, 25, 25, 43, 43, 25, 43, 25,
++    25, 8, 8, 8, 8, 43, 43, 25, 8, 25, 8, 8, 8, 43, 43, 25,
++    8, 8, 25, 8, 8, 43, 43, 25, 25, 25, 43, 25, 8, 43, 43, 25,
++    8, 43, 25, 43, 8, 43, 43, 25, 8, 8, 8, 8, 25, 43, 43, 25,
++    43, 43, 43, 8, 25, 43, 43, 25, 43, 8, 8, 25, 43, 43, 43, 25,
++    25, 8, 43, 43, 43, 43, 43, 25, 8, 8, 8, 8, 8, 8, 8, 43,
++    43, 8, 8, 8, 8, 8, 8, 43, 25, 25, 8, 8, 8, 8, 8, 43,
++    8, 43, 8, 8, 8, 8, 8, 43, 25, 8, 25, 8, 8, 8, 8, 43,
++    8, 25, 25, 8, 8, 8, 8, 43, 25, 43, 25, 8, 8, 8, 8, 43,
++    8, 8, 43, 8, 8, 8, 8, 43, 25, 25, 43, 8, 8, 8, 8, 43,
++    25, 8, 8, 25, 8, 8, 8, 43, 8, 25, 8, 25, 8, 8, 8, 43,
++    8, 8, 25, 25, 8, 8, 8, 43, 43, 8, 25, 25, 8, 8, 8, 43,
++    25, 25, 25, 25, 8, 8, 8, 43, 8, 43, 25, 25, 8, 8, 8, 43,
++    25, 8, 43, 25, 8, 8, 8, 43, 8, 8, 8, 43, 8, 8, 8, 43,
++    25, 25, 8, 43, 8, 8, 8, 43, 25, 8, 25, 43, 8, 8, 8, 43,
++    8, 25, 25, 43, 8, 8, 8, 43, 25, 8, 8, 8, 25, 8, 8, 43,
++    8, 25, 8, 8, 25, 8, 8, 43, 25, 43, 8, 8, 25, 8, 8, 43,
++    8, 8, 25, 8, 25, 8, 8, 43, 43, 8, 25, 8, 25, 8, 8, 43,
++    25, 25, 25, 8, 25, 8, 8, 43, 8, 43, 25, 8, 25, 8, 8, 43,
++    25, 8, 43, 8, 25, 8, 8, 43, 8, 25, 43, 8, 25, 8, 8, 43,
++    8, 8, 8, 25, 25, 8, 8, 43, 43, 8, 8, 25, 25, 8, 8, 43,
++    25, 25, 8, 25, 25, 8, 8, 43, 8, 43, 8, 25, 25, 8, 8, 43,
++    25, 8, 25, 25, 25, 8, 8, 43, 8, 25, 25, 25, 25, 8, 8, 43,
++    25, 8, 8, 43, 25, 8, 8, 43, 8, 25, 8, 43, 25, 8, 8, 43,
++    8, 8, 25, 43, 25, 8, 8, 43, 25, 43, 43, 43, 25, 8, 8, 43,
++    8, 8, 8, 8, 43, 8, 8, 43, 25, 25, 8, 8, 43, 8, 8, 43,
++    43, 43, 8, 8, 43, 8, 8, 43, 25, 8, 25, 8, 43, 8, 8, 43,
++    8, 25, 25, 8, 43, 8, 8, 43, 25, 8, 8, 25, 43, 8, 8, 43,
++    8, 25, 8, 25, 43, 8, 8, 43, 8, 8, 25, 25, 43, 8, 8, 43,
++    25, 8, 8, 8, 8, 25, 8, 43, 8, 25, 8, 8, 8, 25, 8, 43,
++    43, 25, 8, 8, 8, 25, 8, 43, 25, 43, 8, 8, 8, 25, 8, 43,
++    8, 8, 25, 8, 8, 25, 8, 43, 43, 8, 25, 8, 8, 25, 8, 43,
++    25, 25, 25, 8, 8, 25, 8, 43, 8, 43, 25, 8, 8, 25, 8, 43,
++    25, 8, 43, 8, 8, 25, 8, 43, 8, 8, 8, 25, 8, 25, 8, 43,
++    43, 8, 8, 25, 8, 25, 8, 43, 25, 25, 8, 25, 8, 25, 8, 43,
++    8, 43, 8, 25, 8, 25, 8, 43, 25, 8, 25, 25, 8, 25, 8, 43,
++    8, 25, 25, 25, 8, 25, 8, 43, 8, 8, 43, 25, 8, 25, 8, 43,
++    25, 8, 8, 43, 8, 25, 8, 43, 8, 25, 8, 43, 8, 25, 8, 43,
++    8, 8, 25, 43, 8, 25, 8, 43, 8, 8, 8, 8, 25, 25, 8, 43,
++    43, 8, 8, 8, 25, 25, 8, 43, 25, 25, 8, 8, 25, 25, 8, 43,
++    8, 43, 8, 8, 25, 25, 8, 43, 25, 8, 25, 8, 25, 25, 8, 43,
++    8, 25, 25, 8, 25, 25, 8, 43, 8, 8, 43, 8, 25, 25, 8, 43,
++    25, 8, 8, 25, 25, 25, 8, 43, 8, 25, 8, 25, 25, 25, 8, 43,
++    8, 8, 25, 25, 25, 25, 8, 43, 8, 8, 8, 43, 25, 25, 8, 43,
++    43, 43, 8, 43, 25, 25, 8, 43, 25, 8, 8, 8, 43, 25, 8, 43,
++    8, 25, 8, 8, 43, 25, 8, 43, 8, 8, 25, 8, 43, 25, 8, 43,
++    25, 43, 43, 8, 43, 25, 8, 43, 8, 8, 8, 25, 43, 25, 8, 43,
++    8, 8, 8, 8, 8, 43, 8, 43, 25, 25, 8, 8, 8, 43, 8, 43,
++    25, 8, 25, 8, 8, 43, 8, 43, 8, 25, 25, 8, 8, 43, 8, 43,
++    25, 8, 8, 25, 8, 43, 8, 43, 8, 25, 8, 25, 8, 43, 8, 43,
++    8, 8, 25, 25, 8, 43, 8, 43, 43, 8, 43, 43, 8, 43, 8, 43,
++    25, 8, 8, 8, 25, 43, 8, 43, 8, 25, 8, 8, 25, 43, 8, 43,
++    8, 8, 8, 25, 25, 43, 8, 43, 25, 25, 43, 25, 25, 43, 8, 43,
++    43, 8, 43, 8, 43, 43, 8, 43, 8, 43, 25, 25, 43, 43, 8, 43,
++    43, 43, 25, 25, 43, 43, 8, 43, 43, 8, 8, 43, 43, 43, 8, 43,
++    43, 8, 43, 43, 43, 43, 8, 43, 25, 8, 8, 8, 8, 8, 25, 43,
++    8, 25, 8, 8, 8, 8, 25, 43, 25, 43, 8, 8, 8, 8, 25, 43,
++    8, 8, 25, 8, 8, 8, 25, 43, 43, 8, 25, 8, 8, 8, 25, 43,
++    25, 25, 25, 8, 8, 8, 25, 43, 8, 43, 25, 8, 8, 8, 25, 43,
++    8, 25, 43, 8, 8, 8, 25, 43, 8, 8, 8, 25, 8, 8, 25, 43,
++    43, 8, 8, 25, 8, 8, 25, 43, 25, 25, 8, 25, 8, 8, 25, 43,
++    8, 43, 8, 25, 8, 8, 25, 43, 25, 8, 25, 25, 8, 8, 25, 43,
++    8, 25, 25, 25, 8, 8, 25, 43, 8, 8, 43, 25, 8, 8, 25, 43,
++    25, 8, 8, 43, 8, 8, 25, 43, 8, 25, 8, 43, 8, 8, 25, 43,
++    8, 8, 25, 43, 8, 8, 25, 43, 8, 8, 8, 8, 25, 8, 25, 43,
++    25, 25, 8, 8, 25, 8, 25, 43, 25, 8, 25, 8, 25, 8, 25, 43,
++    8, 25, 25, 8, 25, 8, 25, 43, 25, 8, 8, 25, 25, 8, 25, 43,
++    8, 25, 8, 25, 25, 8, 25, 43, 8, 8, 25, 25, 25, 8, 25, 43,
++    43, 43, 25, 25, 25, 8, 25, 43, 25, 8, 8, 8, 43, 8, 25, 43,
++    8, 25, 8, 8, 43, 8, 25, 43, 8, 8, 25, 8, 43, 8, 25, 43,
++    8, 8, 8, 25, 43, 8, 25, 43, 43, 25, 43, 43, 43, 8, 25, 43,
++    8, 8, 8, 8, 8, 25, 25, 43, 43, 8, 8, 8, 8, 25, 25, 43,
++    25, 25, 8, 8, 8, 25, 25, 43, 8, 43, 8, 8, 8, 25, 25, 43,
++    25, 8, 25, 8, 8, 25, 25, 43, 8, 25, 25, 8, 8, 25, 25, 43,
++    8, 8, 43, 8, 8, 25, 25, 43, 25, 8, 8, 25, 8, 25, 25, 43,
++    8, 25, 8, 25, 8, 25, 25, 43, 8, 8, 25, 25, 8, 25, 25, 43,
++    8, 8, 8, 43, 8, 25, 25, 43, 43, 25, 25, 43, 8, 25, 25, 43,
++    25, 8, 8, 8, 25, 25, 25, 43, 8, 25, 8, 8, 25, 25, 25, 43,
++    8, 8, 25, 8, 25, 25, 25, 43, 8, 8, 8, 25, 25, 25, 25, 43,
++    8, 43, 25, 43, 25, 25, 25, 43, 25, 8, 43, 43, 25, 25, 25, 43,
++    8, 8, 8, 8, 43, 25, 25, 43, 43, 25, 8, 25, 43, 25, 25, 43,
++    8, 25, 43, 25, 43, 25, 25, 43, 25, 8, 8, 8, 8, 43, 25, 43,
++    8, 25, 8, 8, 8, 43, 25, 43, 8, 8, 25, 8, 8, 43, 25, 43,
++    43, 25, 43, 8, 8, 43, 25, 43, 8, 8, 8, 25, 8, 43, 25, 43,
++    25, 43, 43, 43, 8, 43, 25, 43, 8, 8, 8, 8, 25, 43, 25, 43,
++    25, 43, 8, 25, 25, 43, 25, 43, 43, 8, 25, 25, 25, 43, 25, 43,
++    8, 8, 25, 43, 43, 43, 25, 43, 8, 8, 8, 8, 8, 8, 43, 43,
++    25, 25, 8, 8, 8, 8, 43, 43, 43, 43, 8, 8, 8, 8, 43, 43,
++    8, 25, 25, 8, 8, 8, 43, 43, 43, 8, 43, 8, 8, 8, 43, 43,
++    43, 43, 43, 8, 8, 8, 43, 43, 25, 8, 8, 25, 8, 8, 43, 43,
++    8, 25, 8, 25, 8, 8, 43, 43, 8, 8, 25, 25, 8, 8, 43, 43,
++    43, 8, 43, 43, 8, 8, 43, 43, 43, 43, 43, 43, 8, 8, 43, 43,
++    8, 8, 8, 25, 25, 8, 43, 43, 25, 25, 43, 25, 25, 8, 43, 43,
++    43, 8, 8, 8, 43, 8, 43, 43, 43, 43, 8, 8, 43, 8, 43, 43,
++    43, 8, 43, 8, 43, 8, 43, 43, 8, 43, 43, 8, 43, 8, 43, 43,
++    43, 43, 43, 8, 43, 8, 43, 43, 43, 8, 8, 43, 43, 8, 43, 43,
++    8, 43, 8, 43, 43, 8, 43, 43, 43, 43, 8, 43, 43, 8, 43, 43,
++    8, 43, 43, 43, 43, 8, 43, 43, 25, 8, 8, 8, 8, 25, 43, 43,
++    8, 25, 8, 8, 8, 25, 43, 43, 8, 8, 25, 8, 8, 25, 43, 43,
++    8, 8, 8, 25, 8, 25, 43, 43, 25, 43, 8, 43, 8, 25, 43, 43,
++    8, 25, 43, 43, 8, 25, 43, 43, 8, 8, 8, 8, 25, 25, 43, 43,
++    25, 43, 25, 8, 25, 25, 43, 43, 25, 8, 25, 25, 43, 25, 43, 43,
++    43, 43, 8, 8, 8, 43, 43, 43, 8, 43, 43, 8, 8, 43, 43, 43,
++    43, 8, 43, 43, 8, 43, 43, 43, 8, 25, 25, 25, 25, 43, 43, 43,
++    43, 25, 8, 43, 25, 43, 43, 43, 8, 43, 8, 8, 43, 43, 43, 43,
++    43, 43, 8, 8, 43, 43, 43, 43, 8, 8, 43, 8, 43, 43, 43, 43,
++    43, 8, 43, 8, 43, 43, 43, 43, 8, 43, 43, 8, 43, 43, 43, 43,
++    8, 43, 8, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43,
++};
++
+ // arcint (patch 0043). Row n of a native-format matrix, decoded to f32 with
+ // the block scale folded in: ic values into `out`. The layouts are the
+ // per-role tensors of design-routing-aware-expert-execution 2.3c, one
+@@ -248,6 +767,31 @@ inline void decode_native_row(const QuantMatrix& m, int n, float* out) {
+         }
+         return;
+     }
++    if (m.format == kQuantFormatIq2S) {
++        // patch 0050: four 10-bit grid indices per 32 values, packed as
++        // little-endian u16 in w; RAW sign bytes in z; TWO f16 sub-block
++        // scales per 32 in s (low nibble's for values 0..15, high nibble's
++        // for 16..31).
++        const uint8_t* wrow = m.w + static_cast<size_t>(n) * static_cast<size_t>(groups) * 8u;
++        const uint8_t* zrow = m.z + static_cast<size_t>(n) * static_cast<size_t>(groups) * 4u;
++        const uint16_t* srow = m.s + static_cast<size_t>(n) * static_cast<size_t>(groups) * 2u;
++        for (int g = 0; g < groups; g++) {
++            const float s0 = f16_to_f32(srow[g * 2 + 0]);
++            const float s1 = f16_to_f32(srow[g * 2 + 1]);
++            for (int l = 0; l < 4; l++) {
++                const uint16_t gi = static_cast<uint16_t>(wrow[g * 8 + 2 * l]) |
++                                    (static_cast<uint16_t>(wrow[g * 8 + 2 * l + 1]) << 8);
++                const uint8_t signs = zrow[g * 4 + l];
++                const float d = (l < 2) ? s0 : s1;
++                const uint8_t* gr = &kIq2sGrid[static_cast<size_t>(gi) * 8u];
++                float* y = out + g * 32 + l * 8;
++                for (int j = 0; j < 8; j++) {
++                    y[j] = d * static_cast<float>(gr[j]) * ((signs & kIq2xsMask[j]) ? -1.0f : 1.0f);
++                }
++            }
++        }
++        return;
++    }
+     // IQ3_XXS
+     const uint8_t* gridix = m.w + static_cast<size_t>(n) * static_cast<size_t>(groups) * 8u;
+     const uint8_t* signix = m.z + static_cast<size_t>(n) * static_cast<size_t>(groups) * 4u;
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+index 30ecb39..00e4445 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+@@ -141,6 +141,18 @@ void maybe_transpose_scale_zp(const cldnn::MOECompressed::Config& config,
+             return;
+         }
+     }
++    // arcint (patch 0050). IQ2_S carries TWO f16 sub-block scales per 32-value
++    // group (4 B a group, twice the affine [oc, groups] shape), and the native
++    // per-expert kernel reads them ROW-MAJOR (s[n*groups*2 + g*2 + j]) rather
++    // than device-transposed. The size assert below assumes one element per
++    // group and would refuse the payload, so the transpose is skipped here
++    // exactly as it is for the native zero-point slot.
++    if (is_scale) {
++        const size_t fmt = is_down ? config.down_weight_format : config.gate_up_weight_format;
++        if (fmt == ov::op::internal::MOECompressed::kWeightFormatIq2S) {
++            return;
++        }
++    }
+     size_t oc = 0;
+     size_t ic = 0;
+     if (is_down) {
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
+index b39532e..2bfadc2 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
+@@ -556,6 +556,556 @@ inline float native_dot_iq3xxs(const __global uchar* W,
+     return sub_group_reduce_add(acc);
+ }
+ 
++// arcint (patch 0050). IQ2_S grid, 1024 entries x 8 magnitudes (8, 25, 43),
++// verbatim from llama.cpp's ggml-common.h iq2s_grid[1024] (pinned clone
++// 56b9eb28, MIT) and bit-exact vs tools/q4e/native_blocks.py::IQ2S_GRID.
++__constant uchar NATIVE_IQ2S_GRID[8192] = {
++    8, 8, 8, 8, 8, 8, 8, 8, 43, 8, 8, 8, 8, 8, 8, 8,
++    25, 25, 8, 8, 8, 8, 8, 8, 8, 43, 8, 8, 8, 8, 8, 8,
++    43, 43, 8, 8, 8, 8, 8, 8, 25, 8, 25, 8, 8, 8, 8, 8,
++    8, 25, 25, 8, 8, 8, 8, 8, 43, 25, 25, 8, 8, 8, 8, 8,
++    25, 43, 25, 8, 8, 8, 8, 8, 8, 8, 43, 8, 8, 8, 8, 8,
++    43, 8, 43, 8, 8, 8, 8, 8, 25, 25, 43, 8, 8, 8, 8, 8,
++    8, 43, 43, 8, 8, 8, 8, 8, 25, 8, 8, 25, 8, 8, 8, 8,
++    8, 25, 8, 25, 8, 8, 8, 8, 43, 25, 8, 25, 8, 8, 8, 8,
++    25, 43, 8, 25, 8, 8, 8, 8, 8, 8, 25, 25, 8, 8, 8, 8,
++    43, 8, 25, 25, 8, 8, 8, 8, 25, 25, 25, 25, 8, 8, 8, 8,
++    8, 43, 25, 25, 8, 8, 8, 8, 25, 8, 43, 25, 8, 8, 8, 8,
++    8, 25, 43, 25, 8, 8, 8, 8, 43, 25, 43, 25, 8, 8, 8, 8,
++    25, 43, 43, 25, 8, 8, 8, 8, 8, 8, 8, 43, 8, 8, 8, 8,
++    43, 8, 8, 43, 8, 8, 8, 8, 25, 25, 8, 43, 8, 8, 8, 8,
++    8, 43, 8, 43, 8, 8, 8, 8, 25, 8, 25, 43, 8, 8, 8, 8,
++    8, 25, 25, 43, 8, 8, 8, 8, 8, 8, 43, 43, 8, 8, 8, 8,
++    25, 25, 43, 43, 8, 8, 8, 8, 43, 43, 43, 43, 8, 8, 8, 8,
++    25, 8, 8, 8, 25, 8, 8, 8, 8, 25, 8, 8, 25, 8, 8, 8,
++    43, 25, 8, 8, 25, 8, 8, 8, 25, 43, 8, 8, 25, 8, 8, 8,
++    8, 8, 25, 8, 25, 8, 8, 8, 43, 8, 25, 8, 25, 8, 8, 8,
++    25, 25, 25, 8, 25, 8, 8, 8, 8, 43, 25, 8, 25, 8, 8, 8,
++    25, 8, 43, 8, 25, 8, 8, 8, 8, 25, 43, 8, 25, 8, 8, 8,
++    8, 8, 8, 25, 25, 8, 8, 8, 43, 8, 8, 25, 25, 8, 8, 8,
++    25, 25, 8, 25, 25, 8, 8, 8, 8, 43, 8, 25, 25, 8, 8, 8,
++    25, 8, 25, 25, 25, 8, 8, 8, 8, 25, 25, 25, 25, 8, 8, 8,
++    43, 25, 25, 25, 25, 8, 8, 8, 25, 43, 25, 25, 25, 8, 8, 8,
++    8, 8, 43, 25, 25, 8, 8, 8, 25, 25, 43, 25, 25, 8, 8, 8,
++    8, 43, 43, 25, 25, 8, 8, 8, 25, 8, 8, 43, 25, 8, 8, 8,
++    8, 25, 8, 43, 25, 8, 8, 8, 8, 8, 25, 43, 25, 8, 8, 8,
++    43, 8, 25, 43, 25, 8, 8, 8, 25, 25, 25, 43, 25, 8, 8, 8,
++    25, 8, 43, 43, 25, 8, 8, 8, 8, 25, 43, 43, 25, 8, 8, 8,
++    8, 8, 8, 8, 43, 8, 8, 8, 43, 8, 8, 8, 43, 8, 8, 8,
++    25, 25, 8, 8, 43, 8, 8, 8, 8, 43, 8, 8, 43, 8, 8, 8,
++    25, 8, 25, 8, 43, 8, 8, 8, 8, 25, 25, 8, 43, 8, 8, 8,
++    8, 8, 43, 8, 43, 8, 8, 8, 43, 43, 43, 8, 43, 8, 8, 8,
++    25, 8, 8, 25, 43, 8, 8, 8, 8, 25, 8, 25, 43, 8, 8, 8,
++    43, 25, 8, 25, 43, 8, 8, 8, 25, 43, 8, 25, 43, 8, 8, 8,
++    8, 8, 25, 25, 43, 8, 8, 8, 25, 25, 25, 25, 43, 8, 8, 8,
++    8, 8, 8, 43, 43, 8, 8, 8, 25, 25, 8, 43, 43, 8, 8, 8,
++    43, 43, 8, 43, 43, 8, 8, 8, 8, 25, 25, 43, 43, 8, 8, 8,
++    43, 8, 43, 43, 43, 8, 8, 8, 25, 8, 8, 8, 8, 25, 8, 8,
++    8, 25, 8, 8, 8, 25, 8, 8, 43, 25, 8, 8, 8, 25, 8, 8,
++    25, 43, 8, 8, 8, 25, 8, 8, 8, 8, 25, 8, 8, 25, 8, 8,
++    43, 8, 25, 8, 8, 25, 8, 8, 25, 25, 25, 8, 8, 25, 8, 8,
++    8, 43, 25, 8, 8, 25, 8, 8, 25, 8, 43, 8, 8, 25, 8, 8,
++    8, 25, 43, 8, 8, 25, 8, 8, 43, 25, 43, 8, 8, 25, 8, 8,
++    25, 43, 43, 8, 8, 25, 8, 8, 8, 8, 8, 25, 8, 25, 8, 8,
++    43, 8, 8, 25, 8, 25, 8, 8, 25, 25, 8, 25, 8, 25, 8, 8,
++    8, 43, 8, 25, 8, 25, 8, 8, 43, 43, 8, 25, 8, 25, 8, 8,
++    25, 8, 25, 25, 8, 25, 8, 8, 8, 25, 25, 25, 8, 25, 8, 8,
++    43, 25, 25, 25, 8, 25, 8, 8, 25, 43, 25, 25, 8, 25, 8, 8,
++    8, 8, 43, 25, 8, 25, 8, 8, 43, 8, 43, 25, 8, 25, 8, 8,
++    25, 25, 43, 25, 8, 25, 8, 8, 25, 8, 8, 43, 8, 25, 8, 8,
++    8, 25, 8, 43, 8, 25, 8, 8, 43, 25, 8, 43, 8, 25, 8, 8,
++    25, 43, 8, 43, 8, 25, 8, 8, 8, 8, 25, 43, 8, 25, 8, 8,
++    25, 25, 25, 43, 8, 25, 8, 8, 8, 43, 25, 43, 8, 25, 8, 8,
++    25, 8, 43, 43, 8, 25, 8, 8, 8, 25, 43, 43, 8, 25, 8, 8,
++    8, 8, 8, 8, 25, 25, 8, 8, 43, 8, 8, 8, 25, 25, 8, 8,
++    25, 25, 8, 8, 25, 25, 8, 8, 8, 43, 8, 8, 25, 25, 8, 8,
++    43, 43, 8, 8, 25, 25, 8, 8, 25, 8, 25, 8, 25, 25, 8, 8,
++    8, 25, 25, 8, 25, 25, 8, 8, 43, 25, 25, 8, 25, 25, 8, 8,
++    25, 43, 25, 8, 25, 25, 8, 8, 8, 8, 43, 8, 25, 25, 8, 8,
++    25, 25, 43, 8, 25, 25, 8, 8, 8, 43, 43, 8, 25, 25, 8, 8,
++    25, 8, 8, 25, 25, 25, 8, 8, 8, 25, 8, 25, 25, 25, 8, 8,
++    43, 25, 8, 25, 25, 25, 8, 8, 25, 43, 8, 25, 25, 25, 8, 8,
++    8, 8, 25, 25, 25, 25, 8, 8, 43, 8, 25, 25, 25, 25, 8, 8,
++    25, 25, 25, 25, 25, 25, 8, 8, 8, 43, 25, 25, 25, 25, 8, 8,
++    25, 8, 43, 25, 25, 25, 8, 8, 8, 25, 43, 25, 25, 25, 8, 8,
++    8, 8, 8, 43, 25, 25, 8, 8, 43, 8, 8, 43, 25, 25, 8, 8,
++    25, 25, 8, 43, 25, 25, 8, 8, 8, 43, 8, 43, 25, 25, 8, 8,
++    25, 8, 25, 43, 25, 25, 8, 8, 8, 25, 25, 43, 25, 25, 8, 8,
++    8, 8, 43, 43, 25, 25, 8, 8, 25, 8, 8, 8, 43, 25, 8, 8,
++    8, 25, 8, 8, 43, 25, 8, 8, 43, 25, 8, 8, 43, 25, 8, 8,
++    25, 43, 8, 8, 43, 25, 8, 8, 8, 8, 25, 8, 43, 25, 8, 8,
++    25, 25, 25, 8, 43, 25, 8, 8, 8, 8, 8, 25, 43, 25, 8, 8,
++    25, 25, 8, 25, 43, 25, 8, 8, 8, 43, 8, 25, 43, 25, 8, 8,
++    25, 8, 25, 25, 43, 25, 8, 8, 8, 25, 25, 25, 43, 25, 8, 8,
++    8, 8, 43, 25, 43, 25, 8, 8, 25, 8, 8, 43, 43, 25, 8, 8,
++    8, 25, 8, 43, 43, 25, 8, 8, 8, 8, 25, 43, 43, 25, 8, 8,
++    8, 8, 8, 8, 8, 43, 8, 8, 43, 8, 8, 8, 8, 43, 8, 8,
++    25, 25, 8, 8, 8, 43, 8, 8, 8, 43, 8, 8, 8, 43, 8, 8,
++    25, 8, 25, 8, 8, 43, 8, 8, 8, 25, 25, 8, 8, 43, 8, 8,
++    43, 25, 25, 8, 8, 43, 8, 8, 25, 43, 25, 8, 8, 43, 8, 8,
++    8, 8, 43, 8, 8, 43, 8, 8, 25, 25, 43, 8, 8, 43, 8, 8,
++    43, 43, 43, 8, 8, 43, 8, 8, 25, 8, 8, 25, 8, 43, 8, 8,
++    8, 25, 8, 25, 8, 43, 8, 8, 43, 25, 8, 25, 8, 43, 8, 8,
++    25, 43, 8, 25, 8, 43, 8, 8, 8, 8, 25, 25, 8, 43, 8, 8,
++    43, 8, 25, 25, 8, 43, 8, 8, 25, 25, 25, 25, 8, 43, 8, 8,
++    8, 43, 25, 25, 8, 43, 8, 8, 25, 8, 43, 25, 8, 43, 8, 8,
++    8, 25, 43, 25, 8, 43, 8, 8, 8, 8, 8, 43, 8, 43, 8, 8,
++    25, 25, 8, 43, 8, 43, 8, 8, 8, 25, 25, 43, 8, 43, 8, 8,
++    43, 43, 43, 43, 8, 43, 8, 8, 25, 8, 8, 8, 25, 43, 8, 8,
++    8, 25, 8, 8, 25, 43, 8, 8, 8, 8, 25, 8, 25, 43, 8, 8,
++    43, 8, 25, 8, 25, 43, 8, 8, 25, 25, 25, 8, 25, 43, 8, 8,
++    8, 43, 25, 8, 25, 43, 8, 8, 25, 8, 43, 8, 25, 43, 8, 8,
++    8, 8, 8, 25, 25, 43, 8, 8, 25, 25, 8, 25, 25, 43, 8, 8,
++    8, 43, 8, 25, 25, 43, 8, 8, 25, 8, 25, 25, 25, 43, 8, 8,
++    8, 25, 25, 25, 25, 43, 8, 8, 8, 8, 43, 25, 25, 43, 8, 8,
++    25, 8, 8, 43, 25, 43, 8, 8, 8, 8, 25, 43, 25, 43, 8, 8,
++    8, 8, 8, 8, 43, 43, 8, 8, 25, 8, 25, 8, 43, 43, 8, 8,
++    8, 25, 25, 8, 43, 43, 8, 8, 43, 8, 43, 8, 43, 43, 8, 8,
++    8, 43, 43, 8, 43, 43, 8, 8, 43, 43, 43, 8, 43, 43, 8, 8,
++    8, 8, 25, 25, 43, 43, 8, 8, 25, 43, 25, 43, 43, 43, 8, 8,
++    25, 8, 8, 8, 8, 8, 25, 8, 8, 25, 8, 8, 8, 8, 25, 8,
++    43, 25, 8, 8, 8, 8, 25, 8, 25, 43, 8, 8, 8, 8, 25, 8,
++    8, 8, 25, 8, 8, 8, 25, 8, 43, 8, 25, 8, 8, 8, 25, 8,
++    25, 25, 25, 8, 8, 8, 25, 8, 8, 43, 25, 8, 8, 8, 25, 8,
++    25, 8, 43, 8, 8, 8, 25, 8, 8, 25, 43, 8, 8, 8, 25, 8,
++    43, 25, 43, 8, 8, 8, 25, 8, 8, 8, 8, 25, 8, 8, 25, 8,
++    43, 8, 8, 25, 8, 8, 25, 8, 25, 25, 8, 25, 8, 8, 25, 8,
++    8, 43, 8, 25, 8, 8, 25, 8, 25, 8, 25, 25, 8, 8, 25, 8,
++    8, 25, 25, 25, 8, 8, 25, 8, 43, 25, 25, 25, 8, 8, 25, 8,
++    25, 43, 25, 25, 8, 8, 25, 8, 8, 8, 43, 25, 8, 8, 25, 8,
++    43, 8, 43, 25, 8, 8, 25, 8, 25, 25, 43, 25, 8, 8, 25, 8,
++    8, 43, 43, 25, 8, 8, 25, 8, 25, 8, 8, 43, 8, 8, 25, 8,
++    8, 25, 8, 43, 8, 8, 25, 8, 43, 25, 8, 43, 8, 8, 25, 8,
++    8, 8, 25, 43, 8, 8, 25, 8, 25, 25, 25, 43, 8, 8, 25, 8,
++    8, 43, 25, 43, 8, 8, 25, 8, 25, 8, 43, 43, 8, 8, 25, 8,
++    8, 25, 43, 43, 8, 8, 25, 8, 8, 8, 8, 8, 25, 8, 25, 8,
++    43, 8, 8, 8, 25, 8, 25, 8, 25, 25, 8, 8, 25, 8, 25, 8,
++    8, 43, 8, 8, 25, 8, 25, 8, 43, 43, 8, 8, 25, 8, 25, 8,
++    25, 8, 25, 8, 25, 8, 25, 8, 8, 25, 25, 8, 25, 8, 25, 8,
++    43, 25, 25, 8, 25, 8, 25, 8, 25, 43, 25, 8, 25, 8, 25, 8,
++    8, 8, 43, 8, 25, 8, 25, 8, 43, 8, 43, 8, 25, 8, 25, 8,
++    25, 25, 43, 8, 25, 8, 25, 8, 8, 43, 43, 8, 25, 8, 25, 8,
++    25, 8, 8, 25, 25, 8, 25, 8, 8, 25, 8, 25, 25, 8, 25, 8,
++    43, 25, 8, 25, 25, 8, 25, 8, 25, 43, 8, 25, 25, 8, 25, 8,
++    8, 8, 25, 25, 25, 8, 25, 8, 43, 8, 25, 25, 25, 8, 25, 8,
++    25, 25, 25, 25, 25, 8, 25, 8, 8, 43, 25, 25, 25, 8, 25, 8,
++    25, 8, 43, 25, 25, 8, 25, 8, 8, 25, 43, 25, 25, 8, 25, 8,
++    8, 8, 8, 43, 25, 8, 25, 8, 43, 8, 8, 43, 25, 8, 25, 8,
++    25, 25, 8, 43, 25, 8, 25, 8, 8, 43, 8, 43, 25, 8, 25, 8,
++    25, 8, 25, 43, 25, 8, 25, 8, 8, 25, 25, 43, 25, 8, 25, 8,
++    25, 8, 8, 8, 43, 8, 25, 8, 8, 25, 8, 8, 43, 8, 25, 8,
++    25, 43, 8, 8, 43, 8, 25, 8, 8, 8, 25, 8, 43, 8, 25, 8,
++    25, 25, 25, 8, 43, 8, 25, 8, 25, 8, 43, 8, 43, 8, 25, 8,
++    8, 25, 43, 8, 43, 8, 25, 8, 8, 8, 8, 25, 43, 8, 25, 8,
++    25, 25, 8, 25, 43, 8, 25, 8, 25, 8, 25, 25, 43, 8, 25, 8,
++    8, 25, 25, 25, 43, 8, 25, 8, 25, 8, 8, 43, 43, 8, 25, 8,
++    8, 25, 8, 43, 43, 8, 25, 8, 8, 8, 25, 43, 43, 8, 25, 8,
++    8, 8, 8, 8, 8, 25, 25, 8, 43, 8, 8, 8, 8, 25, 25, 8,
++    25, 25, 8, 8, 8, 25, 25, 8, 8, 43, 8, 8, 8, 25, 25, 8,
++    25, 8, 25, 8, 8, 25, 25, 8, 8, 25, 25, 8, 8, 25, 25, 8,
++    43, 25, 25, 8, 8, 25, 25, 8, 25, 43, 25, 8, 8, 25, 25, 8,
++    8, 8, 43, 8, 8, 25, 25, 8, 25, 25, 43, 8, 8, 25, 25, 8,
++    8, 43, 43, 8, 8, 25, 25, 8, 25, 8, 8, 25, 8, 25, 25, 8,
++    8, 25, 8, 25, 8, 25, 25, 8, 43, 25, 8, 25, 8, 25, 25, 8,
++    25, 43, 8, 25, 8, 25, 25, 8, 8, 8, 25, 25, 8, 25, 25, 8,
++    43, 8, 25, 25, 8, 25, 25, 8, 25, 25, 25, 25, 8, 25, 25, 8,
++    8, 43, 25, 25, 8, 25, 25, 8, 25, 8, 43, 25, 8, 25, 25, 8,
++    8, 25, 43, 25, 8, 25, 25, 8, 8, 8, 8, 43, 8, 25, 25, 8,
++    43, 8, 8, 43, 8, 25, 25, 8, 25, 25, 8, 43, 8, 25, 25, 8,
++    8, 43, 8, 43, 8, 25, 25, 8, 25, 8, 25, 43, 8, 25, 25, 8,
++    8, 25, 25, 43, 8, 25, 25, 8, 8, 8, 43, 43, 8, 25, 25, 8,
++    25, 8, 8, 8, 25, 25, 25, 8, 8, 25, 8, 8, 25, 25, 25, 8,
++    43, 25, 8, 8, 25, 25, 25, 8, 25, 43, 8, 8, 25, 25, 25, 8,
++    8, 8, 25, 8, 25, 25, 25, 8, 43, 8, 25, 8, 25, 25, 25, 8,
++    25, 25, 25, 8, 25, 25, 25, 8, 8, 43, 25, 8, 25, 25, 25, 8,
++    25, 8, 43, 8, 25, 25, 25, 8, 8, 25, 43, 8, 25, 25, 25, 8,
++    8, 8, 8, 25, 25, 25, 25, 8, 43, 8, 8, 25, 25, 25, 25, 8,
++    25, 25, 8, 25, 25, 25, 25, 8, 8, 43, 8, 25, 25, 25, 25, 8,
++    25, 8, 25, 25, 25, 25, 25, 8, 8, 25, 25, 25, 25, 25, 25, 8,
++    8, 8, 43, 25, 25, 25, 25, 8, 25, 8, 8, 43, 25, 25, 25, 8,
++    8, 25, 8, 43, 25, 25, 25, 8, 8, 8, 25, 43, 25, 25, 25, 8,
++    8, 8, 8, 8, 43, 25, 25, 8, 25, 25, 8, 8, 43, 25, 25, 8,
++    8, 43, 8, 8, 43, 25, 25, 8, 25, 8, 25, 8, 43, 25, 25, 8,
++    8, 25, 25, 8, 43, 25, 25, 8, 8, 8, 43, 8, 43, 25, 25, 8,
++    25, 8, 8, 25, 43, 25, 25, 8, 8, 25, 8, 25, 43, 25, 25, 8,
++    8, 8, 25, 25, 43, 25, 25, 8, 8, 8, 8, 43, 43, 25, 25, 8,
++    43, 43, 43, 43, 43, 25, 25, 8, 25, 8, 8, 8, 8, 43, 25, 8,
++    8, 25, 8, 8, 8, 43, 25, 8, 43, 25, 8, 8, 8, 43, 25, 8,
++    25, 43, 8, 8, 8, 43, 25, 8, 8, 8, 25, 8, 8, 43, 25, 8,
++    25, 25, 25, 8, 8, 43, 25, 8, 8, 43, 25, 8, 8, 43, 25, 8,
++    25, 8, 43, 8, 8, 43, 25, 8, 8, 8, 8, 25, 8, 43, 25, 8,
++    43, 8, 8, 25, 8, 43, 25, 8, 25, 25, 8, 25, 8, 43, 25, 8,
++    8, 43, 8, 25, 8, 43, 25, 8, 25, 8, 25, 25, 8, 43, 25, 8,
++    8, 25, 25, 25, 8, 43, 25, 8, 8, 8, 43, 25, 8, 43, 25, 8,
++    25, 8, 8, 43, 8, 43, 25, 8, 8, 25, 8, 43, 8, 43, 25, 8,
++    8, 8, 8, 8, 25, 43, 25, 8, 43, 8, 8, 8, 25, 43, 25, 8,
++    25, 25, 8, 8, 25, 43, 25, 8, 8, 43, 8, 8, 25, 43, 25, 8,
++    25, 8, 25, 8, 25, 43, 25, 8, 8, 25, 25, 8, 25, 43, 25, 8,
++    8, 8, 43, 8, 25, 43, 25, 8, 25, 8, 8, 25, 25, 43, 25, 8,
++    8, 25, 8, 25, 25, 43, 25, 8, 8, 8, 25, 25, 25, 43, 25, 8,
++    25, 43, 43, 25, 25, 43, 25, 8, 43, 8, 43, 43, 25, 43, 25, 8,
++    8, 25, 8, 8, 43, 43, 25, 8, 8, 8, 25, 8, 43, 43, 25, 8,
++    8, 8, 8, 25, 43, 43, 25, 8, 43, 25, 25, 25, 43, 43, 25, 8,
++    8, 8, 8, 8, 8, 8, 43, 8, 43, 8, 8, 8, 8, 8, 43, 8,
++    25, 25, 8, 8, 8, 8, 43, 8, 8, 43, 8, 8, 8, 8, 43, 8,
++    25, 8, 25, 8, 8, 8, 43, 8, 8, 25, 25, 8, 8, 8, 43, 8,
++    43, 25, 25, 8, 8, 8, 43, 8, 25, 43, 25, 8, 8, 8, 43, 8,
++    8, 8, 43, 8, 8, 8, 43, 8, 25, 25, 43, 8, 8, 8, 43, 8,
++    43, 43, 43, 8, 8, 8, 43, 8, 25, 8, 8, 25, 8, 8, 43, 8,
++    8, 25, 8, 25, 8, 8, 43, 8, 8, 8, 25, 25, 8, 8, 43, 8,
++    43, 8, 25, 25, 8, 8, 43, 8, 25, 25, 25, 25, 8, 8, 43, 8,
++    8, 25, 43, 25, 8, 8, 43, 8, 8, 8, 8, 43, 8, 8, 43, 8,
++    43, 43, 8, 43, 8, 8, 43, 8, 8, 25, 25, 43, 8, 8, 43, 8,
++    43, 43, 43, 43, 8, 8, 43, 8, 25, 8, 8, 8, 25, 8, 43, 8,
++    8, 25, 8, 8, 25, 8, 43, 8, 8, 8, 25, 8, 25, 8, 43, 8,
++    43, 8, 25, 8, 25, 8, 43, 8, 25, 25, 25, 8, 25, 8, 43, 8,
++    25, 8, 43, 8, 25, 8, 43, 8, 8, 8, 8, 25, 25, 8, 43, 8,
++    43, 8, 8, 25, 25, 8, 43, 8, 25, 25, 8, 25, 25, 8, 43, 8,
++    25, 8, 25, 25, 25, 8, 43, 8, 8, 25, 25, 25, 25, 8, 43, 8,
++    8, 8, 43, 25, 25, 8, 43, 8, 25, 8, 8, 43, 25, 8, 43, 8,
++    8, 25, 8, 43, 25, 8, 43, 8, 8, 8, 25, 43, 25, 8, 43, 8,
++    8, 8, 8, 8, 43, 8, 43, 8, 43, 43, 8, 8, 43, 8, 43, 8,
++    43, 8, 43, 8, 43, 8, 43, 8, 8, 43, 43, 8, 43, 8, 43, 8,
++    43, 43, 43, 8, 43, 8, 43, 8, 8, 25, 8, 25, 43, 8, 43, 8,
++    8, 8, 25, 25, 43, 8, 43, 8, 8, 43, 8, 43, 43, 8, 43, 8,
++    43, 43, 8, 43, 43, 8, 43, 8, 8, 43, 43, 43, 43, 8, 43, 8,
++    25, 8, 8, 8, 8, 25, 43, 8, 8, 25, 8, 8, 8, 25, 43, 8,
++    43, 25, 8, 8, 8, 25, 43, 8, 25, 43, 8, 8, 8, 25, 43, 8,
++    8, 8, 25, 8, 8, 25, 43, 8, 25, 25, 25, 8, 8, 25, 43, 8,
++    8, 43, 25, 8, 8, 25, 43, 8, 25, 8, 43, 8, 8, 25, 43, 8,
++    8, 25, 43, 8, 8, 25, 43, 8, 8, 8, 8, 25, 8, 25, 43, 8,
++    43, 8, 8, 25, 8, 25, 43, 8, 25, 25, 8, 25, 8, 25, 43, 8,
++    8, 43, 8, 25, 8, 25, 43, 8, 25, 8, 25, 25, 8, 25, 43, 8,
++    8, 25, 25, 25, 8, 25, 43, 8, 8, 8, 43, 25, 8, 25, 43, 8,
++    25, 8, 8, 43, 8, 25, 43, 8, 8, 25, 8, 43, 8, 25, 43, 8,
++    8, 8, 25, 43, 8, 25, 43, 8, 8, 8, 8, 8, 25, 25, 43, 8,
++    25, 25, 8, 8, 25, 25, 43, 8, 8, 43, 8, 8, 25, 25, 43, 8,
++    25, 8, 25, 8, 25, 25, 43, 8, 8, 25, 25, 8, 25, 25, 43, 8,
++    8, 8, 43, 8, 25, 25, 43, 8, 25, 8, 8, 25, 25, 25, 43, 8,
++    8, 25, 8, 25, 25, 25, 43, 8, 8, 8, 25, 25, 25, 25, 43, 8,
++    43, 25, 43, 25, 25, 25, 43, 8, 8, 8, 8, 43, 25, 25, 43, 8,
++    25, 8, 8, 8, 43, 25, 43, 8, 8, 25, 8, 8, 43, 25, 43, 8,
++    8, 8, 25, 8, 43, 25, 43, 8, 8, 8, 8, 25, 43, 25, 43, 8,
++    25, 43, 25, 25, 43, 25, 43, 8, 8, 8, 8, 8, 8, 43, 43, 8,
++    25, 25, 8, 8, 8, 43, 43, 8, 25, 8, 25, 8, 8, 43, 43, 8,
++    8, 25, 25, 8, 8, 43, 43, 8, 25, 8, 8, 25, 8, 43, 43, 8,
++    8, 25, 8, 25, 8, 43, 43, 8, 8, 8, 25, 25, 8, 43, 43, 8,
++    43, 43, 8, 43, 8, 43, 43, 8, 43, 43, 43, 43, 8, 43, 43, 8,
++    25, 8, 8, 8, 25, 43, 43, 8, 8, 25, 8, 8, 25, 43, 43, 8,
++    8, 8, 25, 8, 25, 43, 43, 8, 25, 25, 25, 43, 25, 43, 43, 8,
++    43, 43, 8, 8, 43, 43, 43, 8, 43, 8, 43, 8, 43, 43, 43, 8,
++    8, 25, 43, 25, 43, 43, 43, 8, 8, 43, 8, 43, 43, 43, 43, 8,
++    43, 43, 8, 43, 43, 43, 43, 8, 25, 8, 8, 8, 8, 8, 8, 25,
++    8, 25, 8, 8, 8, 8, 8, 25, 43, 25, 8, 8, 8, 8, 8, 25,
++    25, 43, 8, 8, 8, 8, 8, 25, 8, 8, 25, 8, 8, 8, 8, 25,
++    43, 8, 25, 8, 8, 8, 8, 25, 25, 25, 25, 8, 8, 8, 8, 25,
++    8, 43, 25, 8, 8, 8, 8, 25, 43, 43, 25, 8, 8, 8, 8, 25,
++    25, 8, 43, 8, 8, 8, 8, 25, 8, 25, 43, 8, 8, 8, 8, 25,
++    43, 25, 43, 8, 8, 8, 8, 25, 8, 8, 8, 25, 8, 8, 8, 25,
++    43, 8, 8, 25, 8, 8, 8, 25, 25, 25, 8, 25, 8, 8, 8, 25,
++    8, 43, 8, 25, 8, 8, 8, 25, 43, 43, 8, 25, 8, 8, 8, 25,
++    25, 8, 25, 25, 8, 8, 8, 25, 8, 25, 25, 25, 8, 8, 8, 25,
++    43, 25, 25, 25, 8, 8, 8, 25, 25, 43, 25, 25, 8, 8, 8, 25,
++    8, 8, 43, 25, 8, 8, 8, 25, 43, 8, 43, 25, 8, 8, 8, 25,
++    25, 25, 43, 25, 8, 8, 8, 25, 25, 8, 8, 43, 8, 8, 8, 25,
++    8, 25, 8, 43, 8, 8, 8, 25, 8, 8, 25, 43, 8, 8, 8, 25,
++    25, 25, 25, 43, 8, 8, 8, 25, 8, 43, 25, 43, 8, 8, 8, 25,
++    25, 8, 43, 43, 8, 8, 8, 25, 8, 25, 43, 43, 8, 8, 8, 25,
++    8, 8, 8, 8, 25, 8, 8, 25, 43, 8, 8, 8, 25, 8, 8, 25,
++    25, 25, 8, 8, 25, 8, 8, 25, 8, 43, 8, 8, 25, 8, 8, 25,
++    25, 8, 25, 8, 25, 8, 8, 25, 8, 25, 25, 8, 25, 8, 8, 25,
++    43, 25, 25, 8, 25, 8, 8, 25, 25, 43, 25, 8, 25, 8, 8, 25,
++    8, 8, 43, 8, 25, 8, 8, 25, 43, 8, 43, 8, 25, 8, 8, 25,
++    25, 25, 43, 8, 25, 8, 8, 25, 25, 8, 8, 25, 25, 8, 8, 25,
++    8, 25, 8, 25, 25, 8, 8, 25, 43, 25, 8, 25, 25, 8, 8, 25,
++    25, 43, 8, 25, 25, 8, 8, 25, 8, 8, 25, 25, 25, 8, 8, 25,
++    43, 8, 25, 25, 25, 8, 8, 25, 25, 25, 25, 25, 25, 8, 8, 25,
++    8, 43, 25, 25, 25, 8, 8, 25, 25, 8, 43, 25, 25, 8, 8, 25,
++    8, 25, 43, 25, 25, 8, 8, 25, 8, 8, 8, 43, 25, 8, 8, 25,
++    43, 8, 8, 43, 25, 8, 8, 25, 25, 25, 8, 43, 25, 8, 8, 25,
++    8, 43, 8, 43, 25, 8, 8, 25, 25, 8, 25, 43, 25, 8, 8, 25,
++    8, 25, 25, 43, 25, 8, 8, 25, 8, 8, 43, 43, 25, 8, 8, 25,
++    25, 8, 8, 8, 43, 8, 8, 25, 8, 25, 8, 8, 43, 8, 8, 25,
++    8, 8, 25, 8, 43, 8, 8, 25, 43, 8, 25, 8, 43, 8, 8, 25,
++    25, 25, 25, 8, 43, 8, 8, 25, 8, 43, 25, 8, 43, 8, 8, 25,
++    8, 25, 43, 8, 43, 8, 8, 25, 8, 8, 8, 25, 43, 8, 8, 25,
++    25, 25, 8, 25, 43, 8, 8, 25, 8, 43, 8, 25, 43, 8, 8, 25,
++    25, 8, 25, 25, 43, 8, 8, 25, 8, 25, 25, 25, 43, 8, 8, 25,
++    8, 8, 43, 25, 43, 8, 8, 25, 25, 8, 8, 43, 43, 8, 8, 25,
++    8, 25, 8, 43, 43, 8, 8, 25, 8, 8, 8, 8, 8, 25, 8, 25,
++    43, 8, 8, 8, 8, 25, 8, 25, 25, 25, 8, 8, 8, 25, 8, 25,
++    8, 43, 8, 8, 8, 25, 8, 25, 43, 43, 8, 8, 8, 25, 8, 25,
++    25, 8, 25, 8, 8, 25, 8, 25, 8, 25, 25, 8, 8, 25, 8, 25,
++    43, 25, 25, 8, 8, 25, 8, 25, 25, 43, 25, 8, 8, 25, 8, 25,
++    8, 8, 43, 8, 8, 25, 8, 25, 43, 8, 43, 8, 8, 25, 8, 25,
++    25, 25, 43, 8, 8, 25, 8, 25, 8, 43, 43, 8, 8, 25, 8, 25,
++    25, 8, 8, 25, 8, 25, 8, 25, 8, 25, 8, 25, 8, 25, 8, 25,
++    43, 25, 8, 25, 8, 25, 8, 25, 25, 43, 8, 25, 8, 25, 8, 25,
++    8, 8, 25, 25, 8, 25, 8, 25, 43, 8, 25, 25, 8, 25, 8, 25,
++    25, 25, 25, 25, 8, 25, 8, 25, 8, 43, 25, 25, 8, 25, 8, 25,
++    25, 8, 43, 25, 8, 25, 8, 25, 8, 25, 43, 25, 8, 25, 8, 25,
++    8, 8, 8, 43, 8, 25, 8, 25, 43, 8, 8, 43, 8, 25, 8, 25,
++    25, 25, 8, 43, 8, 25, 8, 25, 8, 43, 8, 43, 8, 25, 8, 25,
++    25, 8, 25, 43, 8, 25, 8, 25, 8, 25, 25, 43, 8, 25, 8, 25,
++    8, 8, 43, 43, 8, 25, 8, 25, 25, 8, 8, 8, 25, 25, 8, 25,
++    8, 25, 8, 8, 25, 25, 8, 25, 43, 25, 8, 8, 25, 25, 8, 25,
++    25, 43, 8, 8, 25, 25, 8, 25, 8, 8, 25, 8, 25, 25, 8, 25,
++    43, 8, 25, 8, 25, 25, 8, 25, 25, 25, 25, 8, 25, 25, 8, 25,
++    8, 43, 25, 8, 25, 25, 8, 25, 25, 8, 43, 8, 25, 25, 8, 25,
++    8, 25, 43, 8, 25, 25, 8, 25, 8, 8, 8, 25, 25, 25, 8, 25,
++    43, 8, 8, 25, 25, 25, 8, 25, 25, 25, 8, 25, 25, 25, 8, 25,
++    8, 43, 8, 25, 25, 25, 8, 25, 25, 8, 25, 25, 25, 25, 8, 25,
++    8, 25, 25, 25, 25, 25, 8, 25, 8, 8, 43, 25, 25, 25, 8, 25,
++    43, 43, 43, 25, 25, 25, 8, 25, 25, 8, 8, 43, 25, 25, 8, 25,
++    8, 25, 8, 43, 25, 25, 8, 25, 8, 8, 25, 43, 25, 25, 8, 25,
++    8, 8, 8, 8, 43, 25, 8, 25, 43, 8, 8, 8, 43, 25, 8, 25,
++    25, 25, 8, 8, 43, 25, 8, 25, 8, 43, 8, 8, 43, 25, 8, 25,
++    25, 8, 25, 8, 43, 25, 8, 25, 8, 25, 25, 8, 43, 25, 8, 25,
++    8, 8, 43, 8, 43, 25, 8, 25, 25, 8, 8, 25, 43, 25, 8, 25,
++    8, 25, 8, 25, 43, 25, 8, 25, 8, 8, 25, 25, 43, 25, 8, 25,
++    8, 8, 8, 43, 43, 25, 8, 25, 25, 25, 43, 43, 43, 25, 8, 25,
++    25, 8, 8, 8, 8, 43, 8, 25, 8, 25, 8, 8, 8, 43, 8, 25,
++    25, 43, 8, 8, 8, 43, 8, 25, 8, 8, 25, 8, 8, 43, 8, 25,
++    43, 8, 25, 8, 8, 43, 8, 25, 25, 25, 25, 8, 8, 43, 8, 25,
++    8, 43, 25, 8, 8, 43, 8, 25, 25, 8, 43, 8, 8, 43, 8, 25,
++    8, 25, 43, 8, 8, 43, 8, 25, 8, 8, 8, 25, 8, 43, 8, 25,
++    43, 8, 8, 25, 8, 43, 8, 25, 25, 25, 8, 25, 8, 43, 8, 25,
++    8, 43, 8, 25, 8, 43, 8, 25, 25, 8, 25, 25, 8, 43, 8, 25,
++    8, 25, 25, 25, 8, 43, 8, 25, 8, 8, 43, 25, 8, 43, 8, 25,
++    8, 25, 8, 43, 8, 43, 8, 25, 8, 8, 25, 43, 8, 43, 8, 25,
++    8, 8, 8, 8, 25, 43, 8, 25, 43, 8, 8, 8, 25, 43, 8, 25,
++    25, 25, 8, 8, 25, 43, 8, 25, 8, 43, 8, 8, 25, 43, 8, 25,
++    25, 8, 25, 8, 25, 43, 8, 25, 8, 25, 25, 8, 25, 43, 8, 25,
++    8, 8, 43, 8, 25, 43, 8, 25, 25, 8, 8, 25, 25, 43, 8, 25,
++    8, 25, 8, 25, 25, 43, 8, 25, 8, 8, 25, 25, 25, 43, 8, 25,
++    8, 8, 8, 43, 25, 43, 8, 25, 43, 25, 25, 43, 25, 43, 8, 25,
++    25, 8, 8, 8, 43, 43, 8, 25, 8, 25, 8, 8, 43, 43, 8, 25,
++    8, 8, 25, 8, 43, 43, 8, 25, 8, 8, 8, 25, 43, 43, 8, 25,
++    8, 8, 8, 8, 8, 8, 25, 25, 43, 8, 8, 8, 8, 8, 25, 25,
++    25, 25, 8, 8, 8, 8, 25, 25, 8, 43, 8, 8, 8, 8, 25, 25,
++    25, 8, 25, 8, 8, 8, 25, 25, 8, 25, 25, 8, 8, 8, 25, 25,
++    43, 25, 25, 8, 8, 8, 25, 25, 25, 43, 25, 8, 8, 8, 25, 25,
++    8, 8, 43, 8, 8, 8, 25, 25, 43, 8, 43, 8, 8, 8, 25, 25,
++    25, 25, 43, 8, 8, 8, 25, 25, 8, 43, 43, 8, 8, 8, 25, 25,
++    25, 8, 8, 25, 8, 8, 25, 25, 8, 25, 8, 25, 8, 8, 25, 25,
++    43, 25, 8, 25, 8, 8, 25, 25, 25, 43, 8, 25, 8, 8, 25, 25,
++    8, 8, 25, 25, 8, 8, 25, 25, 43, 8, 25, 25, 8, 8, 25, 25,
++    25, 25, 25, 25, 8, 8, 25, 25, 8, 43, 25, 25, 8, 8, 25, 25,
++    25, 8, 43, 25, 8, 8, 25, 25, 8, 25, 43, 25, 8, 8, 25, 25,
++    8, 8, 8, 43, 8, 8, 25, 25, 43, 8, 8, 43, 8, 8, 25, 25,
++    25, 25, 8, 43, 8, 8, 25, 25, 8, 43, 8, 43, 8, 8, 25, 25,
++    25, 8, 25, 43, 8, 8, 25, 25, 8, 25, 25, 43, 8, 8, 25, 25,
++    25, 8, 8, 8, 25, 8, 25, 25, 8, 25, 8, 8, 25, 8, 25, 25,
++    43, 25, 8, 8, 25, 8, 25, 25, 25, 43, 8, 8, 25, 8, 25, 25,
++    8, 8, 25, 8, 25, 8, 25, 25, 43, 8, 25, 8, 25, 8, 25, 25,
++    25, 25, 25, 8, 25, 8, 25, 25, 8, 43, 25, 8, 25, 8, 25, 25,
++    25, 8, 43, 8, 25, 8, 25, 25, 8, 25, 43, 8, 25, 8, 25, 25,
++    8, 8, 8, 25, 25, 8, 25, 25, 43, 8, 8, 25, 25, 8, 25, 25,
++    25, 25, 8, 25, 25, 8, 25, 25, 8, 43, 8, 25, 25, 8, 25, 25,
++    25, 8, 25, 25, 25, 8, 25, 25, 8, 25, 25, 25, 25, 8, 25, 25,
++    8, 8, 43, 25, 25, 8, 25, 25, 25, 8, 8, 43, 25, 8, 25, 25,
++    8, 25, 8, 43, 25, 8, 25, 25, 8, 8, 25, 43, 25, 8, 25, 25,
++    8, 8, 8, 8, 43, 8, 25, 25, 25, 25, 8, 8, 43, 8, 25, 25,
++    8, 43, 8, 8, 43, 8, 25, 25, 25, 8, 25, 8, 43, 8, 25, 25,
++    8, 25, 25, 8, 43, 8, 25, 25, 8, 8, 43, 8, 43, 8, 25, 25,
++    25, 8, 8, 25, 43, 8, 25, 25, 8, 25, 8, 25, 43, 8, 25, 25,
++    8, 8, 25, 25, 43, 8, 25, 25, 25, 43, 43, 25, 43, 8, 25, 25,
++    8, 8, 8, 43, 43, 8, 25, 25, 25, 8, 8, 8, 8, 25, 25, 25,
++    8, 25, 8, 8, 8, 25, 25, 25, 43, 25, 8, 8, 8, 25, 25, 25,
++    25, 43, 8, 8, 8, 25, 25, 25, 8, 8, 25, 8, 8, 25, 25, 25,
++    43, 8, 25, 8, 8, 25, 25, 25, 25, 25, 25, 8, 8, 25, 25, 25,
++    8, 43, 25, 8, 8, 25, 25, 25, 25, 8, 43, 8, 8, 25, 25, 25,
++    8, 25, 43, 8, 8, 25, 25, 25, 8, 8, 8, 25, 8, 25, 25, 25,
++    43, 8, 8, 25, 8, 25, 25, 25, 25, 25, 8, 25, 8, 25, 25, 25,
++    8, 43, 8, 25, 8, 25, 25, 25, 25, 8, 25, 25, 8, 25, 25, 25,
++    8, 25, 25, 25, 8, 25, 25, 25, 8, 8, 43, 25, 8, 25, 25, 25,
++    25, 8, 8, 43, 8, 25, 25, 25, 8, 25, 8, 43, 8, 25, 25, 25,
++    8, 8, 25, 43, 8, 25, 25, 25, 8, 8, 8, 8, 25, 25, 25, 25,
++    43, 8, 8, 8, 25, 25, 25, 25, 25, 25, 8, 8, 25, 25, 25, 25,
++    8, 43, 8, 8, 25, 25, 25, 25, 25, 8, 25, 8, 25, 25, 25, 25,
++    8, 25, 25, 8, 25, 25, 25, 25, 8, 8, 43, 8, 25, 25, 25, 25,
++    25, 8, 8, 25, 25, 25, 25, 25, 8, 25, 8, 25, 25, 25, 25, 25,
++    8, 8, 25, 25, 25, 25, 25, 25, 8, 8, 8, 43, 25, 25, 25, 25,
++    25, 8, 8, 8, 43, 25, 25, 25, 8, 25, 8, 8, 43, 25, 25, 25,
++    8, 8, 25, 8, 43, 25, 25, 25, 43, 25, 43, 8, 43, 25, 25, 25,
++    8, 8, 8, 25, 43, 25, 25, 25, 8, 8, 8, 8, 8, 43, 25, 25,
++    43, 8, 8, 8, 8, 43, 25, 25, 25, 25, 8, 8, 8, 43, 25, 25,
++    8, 43, 8, 8, 8, 43, 25, 25, 25, 8, 25, 8, 8, 43, 25, 25,
++    8, 25, 25, 8, 8, 43, 25, 25, 8, 8, 43, 8, 8, 43, 25, 25,
++    25, 8, 8, 25, 8, 43, 25, 25, 8, 25, 8, 25, 8, 43, 25, 25,
++    8, 8, 25, 25, 8, 43, 25, 25, 43, 43, 25, 25, 8, 43, 25, 25,
++    8, 8, 8, 43, 8, 43, 25, 25, 25, 8, 8, 8, 25, 43, 25, 25,
++    8, 25, 8, 8, 25, 43, 25, 25, 8, 8, 25, 8, 25, 43, 25, 25,
++    8, 8, 8, 25, 25, 43, 25, 25, 8, 8, 8, 8, 43, 43, 25, 25,
++    25, 43, 25, 8, 43, 43, 25, 25, 25, 25, 8, 43, 43, 43, 25, 25,
++    8, 43, 43, 43, 43, 43, 25, 25, 25, 8, 8, 8, 8, 8, 43, 25,
++    8, 25, 8, 8, 8, 8, 43, 25, 43, 25, 8, 8, 8, 8, 43, 25,
++    8, 8, 25, 8, 8, 8, 43, 25, 43, 8, 25, 8, 8, 8, 43, 25,
++    25, 25, 25, 8, 8, 8, 43, 25, 8, 43, 25, 8, 8, 8, 43, 25,
++    25, 8, 43, 8, 8, 8, 43, 25, 8, 25, 43, 8, 8, 8, 43, 25,
++    8, 8, 8, 25, 8, 8, 43, 25, 25, 25, 8, 25, 8, 8, 43, 25,
++    8, 43, 8, 25, 8, 8, 43, 25, 25, 8, 25, 25, 8, 8, 43, 25,
++    8, 25, 25, 25, 8, 8, 43, 25, 8, 8, 43, 25, 8, 8, 43, 25,
++    8, 25, 8, 43, 8, 8, 43, 25, 8, 8, 25, 43, 8, 8, 43, 25,
++    8, 8, 8, 8, 25, 8, 43, 25, 43, 8, 8, 8, 25, 8, 43, 25,
++    25, 25, 8, 8, 25, 8, 43, 25, 8, 43, 8, 8, 25, 8, 43, 25,
++    25, 8, 25, 8, 25, 8, 43, 25, 8, 25, 25, 8, 25, 8, 43, 25,
++    8, 8, 43, 8, 25, 8, 43, 25, 25, 8, 8, 25, 25, 8, 43, 25,
++    8, 25, 8, 25, 25, 8, 43, 25, 8, 8, 25, 25, 25, 8, 43, 25,
++    8, 8, 8, 43, 25, 8, 43, 25, 25, 43, 25, 43, 25, 8, 43, 25,
++    8, 25, 8, 8, 43, 8, 43, 25, 8, 8, 25, 8, 43, 8, 43, 25,
++    8, 8, 8, 25, 43, 8, 43, 25, 43, 25, 25, 25, 43, 8, 43, 25,
++    25, 8, 43, 43, 43, 8, 43, 25, 8, 8, 8, 8, 8, 25, 43, 25,
++    25, 25, 8, 8, 8, 25, 43, 25, 8, 43, 8, 8, 8, 25, 43, 25,
++    25, 8, 25, 8, 8, 25, 43, 25, 8, 25, 25, 8, 8, 25, 43, 25,
++    8, 8, 43, 8, 8, 25, 43, 25, 25, 8, 8, 25, 8, 25, 43, 25,
++    8, 25, 8, 25, 8, 25, 43, 25, 8, 8, 25, 25, 8, 25, 43, 25,
++    8, 8, 8, 43, 8, 25, 43, 25, 25, 8, 8, 8, 25, 25, 43, 25,
++    8, 25, 8, 8, 25, 25, 43, 25, 8, 8, 25, 8, 25, 25, 43, 25,
++    8, 8, 8, 25, 25, 25, 43, 25, 43, 43, 8, 25, 25, 25, 43, 25,
++    8, 43, 43, 25, 25, 25, 43, 25, 43, 8, 25, 43, 25, 25, 43, 25,
++    8, 8, 8, 8, 43, 25, 43, 25, 8, 25, 25, 43, 43, 25, 43, 25,
++    25, 8, 8, 8, 8, 43, 43, 25, 8, 25, 8, 8, 8, 43, 43, 25,
++    8, 8, 25, 8, 8, 43, 43, 25, 25, 25, 43, 25, 8, 43, 43, 25,
++    8, 43, 25, 43, 8, 43, 43, 25, 8, 8, 8, 8, 25, 43, 43, 25,
++    43, 43, 43, 8, 25, 43, 43, 25, 43, 8, 8, 25, 43, 43, 43, 25,
++    25, 8, 43, 43, 43, 43, 43, 25, 8, 8, 8, 8, 8, 8, 8, 43,
++    43, 8, 8, 8, 8, 8, 8, 43, 25, 25, 8, 8, 8, 8, 8, 43,
++    8, 43, 8, 8, 8, 8, 8, 43, 25, 8, 25, 8, 8, 8, 8, 43,
++    8, 25, 25, 8, 8, 8, 8, 43, 25, 43, 25, 8, 8, 8, 8, 43,
++    8, 8, 43, 8, 8, 8, 8, 43, 25, 25, 43, 8, 8, 8, 8, 43,
++    25, 8, 8, 25, 8, 8, 8, 43, 8, 25, 8, 25, 8, 8, 8, 43,
++    8, 8, 25, 25, 8, 8, 8, 43, 43, 8, 25, 25, 8, 8, 8, 43,
++    25, 25, 25, 25, 8, 8, 8, 43, 8, 43, 25, 25, 8, 8, 8, 43,
++    25, 8, 43, 25, 8, 8, 8, 43, 8, 8, 8, 43, 8, 8, 8, 43,
++    25, 25, 8, 43, 8, 8, 8, 43, 25, 8, 25, 43, 8, 8, 8, 43,
++    8, 25, 25, 43, 8, 8, 8, 43, 25, 8, 8, 8, 25, 8, 8, 43,
++    8, 25, 8, 8, 25, 8, 8, 43, 25, 43, 8, 8, 25, 8, 8, 43,
++    8, 8, 25, 8, 25, 8, 8, 43, 43, 8, 25, 8, 25, 8, 8, 43,
++    25, 25, 25, 8, 25, 8, 8, 43, 8, 43, 25, 8, 25, 8, 8, 43,
++    25, 8, 43, 8, 25, 8, 8, 43, 8, 25, 43, 8, 25, 8, 8, 43,
++    8, 8, 8, 25, 25, 8, 8, 43, 43, 8, 8, 25, 25, 8, 8, 43,
++    25, 25, 8, 25, 25, 8, 8, 43, 8, 43, 8, 25, 25, 8, 8, 43,
++    25, 8, 25, 25, 25, 8, 8, 43, 8, 25, 25, 25, 25, 8, 8, 43,
++    25, 8, 8, 43, 25, 8, 8, 43, 8, 25, 8, 43, 25, 8, 8, 43,
++    8, 8, 25, 43, 25, 8, 8, 43, 25, 43, 43, 43, 25, 8, 8, 43,
++    8, 8, 8, 8, 43, 8, 8, 43, 25, 25, 8, 8, 43, 8, 8, 43,
++    43, 43, 8, 8, 43, 8, 8, 43, 25, 8, 25, 8, 43, 8, 8, 43,
++    8, 25, 25, 8, 43, 8, 8, 43, 25, 8, 8, 25, 43, 8, 8, 43,
++    8, 25, 8, 25, 43, 8, 8, 43, 8, 8, 25, 25, 43, 8, 8, 43,
++    25, 8, 8, 8, 8, 25, 8, 43, 8, 25, 8, 8, 8, 25, 8, 43,
++    43, 25, 8, 8, 8, 25, 8, 43, 25, 43, 8, 8, 8, 25, 8, 43,
++    8, 8, 25, 8, 8, 25, 8, 43, 43, 8, 25, 8, 8, 25, 8, 43,
++    25, 25, 25, 8, 8, 25, 8, 43, 8, 43, 25, 8, 8, 25, 8, 43,
++    25, 8, 43, 8, 8, 25, 8, 43, 8, 8, 8, 25, 8, 25, 8, 43,
++    43, 8, 8, 25, 8, 25, 8, 43, 25, 25, 8, 25, 8, 25, 8, 43,
++    8, 43, 8, 25, 8, 25, 8, 43, 25, 8, 25, 25, 8, 25, 8, 43,
++    8, 25, 25, 25, 8, 25, 8, 43, 8, 8, 43, 25, 8, 25, 8, 43,
++    25, 8, 8, 43, 8, 25, 8, 43, 8, 25, 8, 43, 8, 25, 8, 43,
++    8, 8, 25, 43, 8, 25, 8, 43, 8, 8, 8, 8, 25, 25, 8, 43,
++    43, 8, 8, 8, 25, 25, 8, 43, 25, 25, 8, 8, 25, 25, 8, 43,
++    8, 43, 8, 8, 25, 25, 8, 43, 25, 8, 25, 8, 25, 25, 8, 43,
++    8, 25, 25, 8, 25, 25, 8, 43, 8, 8, 43, 8, 25, 25, 8, 43,
++    25, 8, 8, 25, 25, 25, 8, 43, 8, 25, 8, 25, 25, 25, 8, 43,
++    8, 8, 25, 25, 25, 25, 8, 43, 8, 8, 8, 43, 25, 25, 8, 43,
++    43, 43, 8, 43, 25, 25, 8, 43, 25, 8, 8, 8, 43, 25, 8, 43,
++    8, 25, 8, 8, 43, 25, 8, 43, 8, 8, 25, 8, 43, 25, 8, 43,
++    25, 43, 43, 8, 43, 25, 8, 43, 8, 8, 8, 25, 43, 25, 8, 43,
++    8, 8, 8, 8, 8, 43, 8, 43, 25, 25, 8, 8, 8, 43, 8, 43,
++    25, 8, 25, 8, 8, 43, 8, 43, 8, 25, 25, 8, 8, 43, 8, 43,
++    25, 8, 8, 25, 8, 43, 8, 43, 8, 25, 8, 25, 8, 43, 8, 43,
++    8, 8, 25, 25, 8, 43, 8, 43, 43, 8, 43, 43, 8, 43, 8, 43,
++    25, 8, 8, 8, 25, 43, 8, 43, 8, 25, 8, 8, 25, 43, 8, 43,
++    8, 8, 8, 25, 25, 43, 8, 43, 25, 25, 43, 25, 25, 43, 8, 43,
++    43, 8, 43, 8, 43, 43, 8, 43, 8, 43, 25, 25, 43, 43, 8, 43,
++    43, 43, 25, 25, 43, 43, 8, 43, 43, 8, 8, 43, 43, 43, 8, 43,
++    43, 8, 43, 43, 43, 43, 8, 43, 25, 8, 8, 8, 8, 8, 25, 43,
++    8, 25, 8, 8, 8, 8, 25, 43, 25, 43, 8, 8, 8, 8, 25, 43,
++    8, 8, 25, 8, 8, 8, 25, 43, 43, 8, 25, 8, 8, 8, 25, 43,
++    25, 25, 25, 8, 8, 8, 25, 43, 8, 43, 25, 8, 8, 8, 25, 43,
++    8, 25, 43, 8, 8, 8, 25, 43, 8, 8, 8, 25, 8, 8, 25, 43,
++    43, 8, 8, 25, 8, 8, 25, 43, 25, 25, 8, 25, 8, 8, 25, 43,
++    8, 43, 8, 25, 8, 8, 25, 43, 25, 8, 25, 25, 8, 8, 25, 43,
++    8, 25, 25, 25, 8, 8, 25, 43, 8, 8, 43, 25, 8, 8, 25, 43,
++    25, 8, 8, 43, 8, 8, 25, 43, 8, 25, 8, 43, 8, 8, 25, 43,
++    8, 8, 25, 43, 8, 8, 25, 43, 8, 8, 8, 8, 25, 8, 25, 43,
++    25, 25, 8, 8, 25, 8, 25, 43, 25, 8, 25, 8, 25, 8, 25, 43,
++    8, 25, 25, 8, 25, 8, 25, 43, 25, 8, 8, 25, 25, 8, 25, 43,
++    8, 25, 8, 25, 25, 8, 25, 43, 8, 8, 25, 25, 25, 8, 25, 43,
++    43, 43, 25, 25, 25, 8, 25, 43, 25, 8, 8, 8, 43, 8, 25, 43,
++    8, 25, 8, 8, 43, 8, 25, 43, 8, 8, 25, 8, 43, 8, 25, 43,
++    8, 8, 8, 25, 43, 8, 25, 43, 43, 25, 43, 43, 43, 8, 25, 43,
++    8, 8, 8, 8, 8, 25, 25, 43, 43, 8, 8, 8, 8, 25, 25, 43,
++    25, 25, 8, 8, 8, 25, 25, 43, 8, 43, 8, 8, 8, 25, 25, 43,
++    25, 8, 25, 8, 8, 25, 25, 43, 8, 25, 25, 8, 8, 25, 25, 43,
++    8, 8, 43, 8, 8, 25, 25, 43, 25, 8, 8, 25, 8, 25, 25, 43,
++    8, 25, 8, 25, 8, 25, 25, 43, 8, 8, 25, 25, 8, 25, 25, 43,
++    8, 8, 8, 43, 8, 25, 25, 43, 43, 25, 25, 43, 8, 25, 25, 43,
++    25, 8, 8, 8, 25, 25, 25, 43, 8, 25, 8, 8, 25, 25, 25, 43,
++    8, 8, 25, 8, 25, 25, 25, 43, 8, 8, 8, 25, 25, 25, 25, 43,
++    8, 43, 25, 43, 25, 25, 25, 43, 25, 8, 43, 43, 25, 25, 25, 43,
++    8, 8, 8, 8, 43, 25, 25, 43, 43, 25, 8, 25, 43, 25, 25, 43,
++    8, 25, 43, 25, 43, 25, 25, 43, 25, 8, 8, 8, 8, 43, 25, 43,
++    8, 25, 8, 8, 8, 43, 25, 43, 8, 8, 25, 8, 8, 43, 25, 43,
++    43, 25, 43, 8, 8, 43, 25, 43, 8, 8, 8, 25, 8, 43, 25, 43,
++    25, 43, 43, 43, 8, 43, 25, 43, 8, 8, 8, 8, 25, 43, 25, 43,
++    25, 43, 8, 25, 25, 43, 25, 43, 43, 8, 25, 25, 25, 43, 25, 43,
++    8, 8, 25, 43, 43, 43, 25, 43, 8, 8, 8, 8, 8, 8, 43, 43,
++    25, 25, 8, 8, 8, 8, 43, 43, 43, 43, 8, 8, 8, 8, 43, 43,
++    8, 25, 25, 8, 8, 8, 43, 43, 43, 8, 43, 8, 8, 8, 43, 43,
++    43, 43, 43, 8, 8, 8, 43, 43, 25, 8, 8, 25, 8, 8, 43, 43,
++    8, 25, 8, 25, 8, 8, 43, 43, 8, 8, 25, 25, 8, 8, 43, 43,
++    43, 8, 43, 43, 8, 8, 43, 43, 43, 43, 43, 43, 8, 8, 43, 43,
++    8, 8, 8, 25, 25, 8, 43, 43, 25, 25, 43, 25, 25, 8, 43, 43,
++    43, 8, 8, 8, 43, 8, 43, 43, 43, 43, 8, 8, 43, 8, 43, 43,
++    43, 8, 43, 8, 43, 8, 43, 43, 8, 43, 43, 8, 43, 8, 43, 43,
++    43, 43, 43, 8, 43, 8, 43, 43, 43, 8, 8, 43, 43, 8, 43, 43,
++    8, 43, 8, 43, 43, 8, 43, 43, 43, 43, 8, 43, 43, 8, 43, 43,
++    8, 43, 43, 43, 43, 8, 43, 43, 25, 8, 8, 8, 8, 25, 43, 43,
++    8, 25, 8, 8, 8, 25, 43, 43, 8, 8, 25, 8, 8, 25, 43, 43,
++    8, 8, 8, 25, 8, 25, 43, 43, 25, 43, 8, 43, 8, 25, 43, 43,
++    8, 25, 43, 43, 8, 25, 43, 43, 8, 8, 8, 8, 25, 25, 43, 43,
++    25, 43, 25, 8, 25, 25, 43, 43, 25, 8, 25, 25, 43, 25, 43, 43,
++    43, 43, 8, 8, 8, 43, 43, 43, 8, 43, 43, 8, 8, 43, 43, 43,
++    43, 8, 43, 43, 8, 43, 43, 43, 8, 25, 25, 25, 25, 43, 43, 43,
++    43, 25, 8, 43, 25, 43, 43, 43, 8, 43, 8, 8, 43, 43, 43, 43,
++    43, 43, 8, 8, 43, 43, 43, 43, 8, 8, 43, 8, 43, 43, 43, 43,
++    43, 8, 43, 8, 43, 43, 43, 43, 8, 43, 43, 8, 43, 43, 43, 43,
++    8, 43, 8, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43,
++};
++
++
++inline float native_dot_iq2s(const __global uchar* W,
++                             const __global uchar* Z,
++                             const __global half* S,
++                             int n, int N, int K,
++                             const __global half* x, int x_base,
++                             int id_local) {
++    // IQ2_S: four 10-bit grid indices per 32 values (little-endian u16 in W),
++    // RAW sign bytes in Z, and TWO f16 sub-block scales per 32 in S. S is
++    // ROW-MAJOR [oc, groups, 2] (moe_otd_runtime.cpp skips the transpose for
++    // IQ2_S), so the read is S[n*(K/32)*2 + g*2 + j] -- not the affine
++    // [groups, oc] layout the other native formats use.
++    float acc = 0.0f;
++    for (int g = 0; g < K / 32; g++) {
++        half s0 = S[(long)n * (K / 32) * 2 + g * 2 + 0];
++        half s1 = S[(long)n * (K / 32) * 2 + g * 2 + 1];
++        const __global uchar* wrow = W + (long)n * (K / 4) + g * 8;
++        const __global uchar* zrow = Z + (long)n * (K / 8) + g * 4;
++        for (int j = id_local; j < 32; j += SUBGROUP_SIZE) {
++            int l = j >> 3;         // the 8-value sub-block
++            int m = j & 7;
++            ushort gi = (ushort)wrow[2 * l] | ((ushort)wrow[2 * l + 1] << 8);
++            float mag = convert_float(NATIVE_IQ2S_GRID[gi * 8 + m]);
++            uchar signs = zrow[l];
++            float sign = (signs & NATIVE_IQ2XS_MASK[m]) ? -1.0f : 1.0f;
++            float s = convert_float((l < 2) ? s0 : s1);
++            acc += convert_float(x[x_base + g * 32 + j]) * s * mag * sign;
++        }
++    }
++    return sub_group_reduce_add(acc);
++}
++
+ inline float native_dot_q8_0(const __global uchar* W,
+                              const __global half* S,
+                              int n, int N, int K,
+@@ -732,12 +1282,22 @@ KERNEL(expert_gate_up_native)(
+     gate_zp     += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 8);
+     up_weight   += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 4);
+     up_zp       += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 8);
++#elif NATIVE_GU_FORMAT == 4  // IQ2_S: u8 [out, K/32, 8] indices + u8 [out, K/32, 4] signs
++    gate_weight += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 4);
++    gate_zp     += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 8);
++    up_weight   += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 4);
++    up_zp       += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 8);
+ #else                      // IQ4_NL: packed u4 codes (K/2)
+     gate_weight += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 2);
+     up_weight   += (long)slot_index * ((long)INTERMEDIATE_SIZE * HIDDEN_SIZE / 2);
+ #endif
++#if NATIVE_GU_FORMAT == 4  // IQ2_S: TWO f16 sub-block scales per group row
++    gate_scale += (long)slot_index * ((long)(HIDDEN_SIZE / GATE_UP_GROUP_SIZE) * INTERMEDIATE_SIZE * 2);
++    up_scale   += (long)slot_index * ((long)(HIDDEN_SIZE / GATE_UP_GROUP_SIZE) * INTERMEDIATE_SIZE * 2);
++#else
+     gate_scale += (long)slot_index * ((long)(HIDDEN_SIZE / GATE_UP_GROUP_SIZE) * INTERMEDIATE_SIZE);
+     up_scale   += (long)slot_index * ((long)(HIDDEN_SIZE / GATE_UP_GROUP_SIZE) * INTERMEDIATE_SIZE);
++#endif
+ 
+     const int x_base = x_base_elem + token_idx * HIDDEN_SIZE;
+     __global MOE_DTYPE* yrow = y + y_base_elem + token_idx * INTERMEDIATE_SIZE;
+@@ -756,6 +1316,17 @@ KERNEL(expert_gate_up_native)(
+                                (const __global half*)gate_scale,
+                                n, INTERMEDIATE_SIZE, HIDDEN_SIZE,
+                                (const __global half*)x, x_base, id_local);
++#elif NATIVE_GU_FORMAT == 4
++        su = native_dot_iq2s((const __global uchar*)up_weight,
++                             (const __global uchar*)up_zp,
++                             (const __global half*)up_scale,
++                             n, INTERMEDIATE_SIZE, HIDDEN_SIZE,
++                             (const __global half*)x, x_base, id_local);
++        sg = native_dot_iq2s((const __global uchar*)gate_weight,
++                             (const __global uchar*)gate_zp,
++                             (const __global half*)gate_scale,
++                             n, INTERMEDIATE_SIZE, HIDDEN_SIZE,
++                             (const __global half*)x, x_base, id_local);
+ #else
+         su = native_dot_iq4nl((const __global uchar*)up_weight,
+                               (const __global half*)up_scale,
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
+index 2b0b09f..68d0ec9 100644
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
+@@ -474,6 +474,7 @@ TEST(moe_cpu_expert, gpu_emul_prediction_is_finite_and_recorded) {
+ // mat.format left at the affine 0 the same bytes decode to other numbers.
+ namespace {
+ using ov::intel_gpu::ocl::moe::compute_stage_f32;
++using ov::intel_gpu::ocl::moe::kQuantFormatIq2S;
+ using ov::intel_gpu::ocl::moe::kQuantFormatIq3Xxs;
+ using ov::intel_gpu::ocl::moe::kQuantFormatIq4Nl;
+ using ov::intel_gpu::ocl::moe::kQuantFormatQ8_0;
+@@ -555,3 +556,29 @@ TEST(moe_cpu_expert_native, iq3_xxs_row_decodes_through_the_grid_and_the_sign_ma
+     for (int j = 8; j < 32; j++) EXPECT_EQ(y[j], 7.0f);
+     for (int j = 32; j < 64; j++) EXPECT_EQ(y[j], 1.0f);
+ }
++
++TEST(moe_cpu_expert_native, iq2_s_row_decodes_through_the_10_bit_grid_and_the_two_scales) {
++    // patch 0050. ic=64, two 32-value groups. Group 0: all four grid indices 0
++    // (grid[0] = eight 8s), sign byte 0x03 flips values 0 and 1, s0 = 1.0 for
++    // values 0..15, s1 = 2.0 for 16..31. Group 1: l=0 index 256 (LE bytes
++    // 00 01; grid[256] = 25,25,25,25,25,8,25,8), l=1..3 index 1023 (LE bytes
++    // FF 03; grid[1023] = eight 43s), no signs, s0 = s1 = 1.0. The 10-bit
++    // index is the point: the low byte alone gives 0, the assembly gives 256.
++    uint8_t w[16] = {0};
++    w[0] = 0x00; w[1] = 0x01;
++    for (int l = 1; l < 4; l++) { w[2 * l] = 0xFF; w[2 * l + 1] = 0x03; }
++    uint8_t z[8] = {0}; z[0] = 0x03;
++    const uint16_t s[4] = {f32_to_f16_bits(1.0f), f32_to_f16_bits(2.0f),
++                           f32_to_f16_bits(1.0f), f32_to_f16_bits(1.0f)};
++    const auto y = decode_row_through_stage(native_matrix(kQuantFormatIq2S, 64, w, z, s));
++    for (int j = 0; j < 2; j++) EXPECT_EQ(y[j], -8.0f);
++    for (int j = 2; j < 8; j++) EXPECT_EQ(y[j], 8.0f);
++    for (int j = 8; j < 16; j++) EXPECT_EQ(y[j], 8.0f);
++    for (int j = 16; j < 32; j++) EXPECT_EQ(y[j], 16.0f);
++    const float g256[8] = {25, 25, 25, 25, 25, 8, 25, 8};
++    for (int j = 0; j < 8; j++) EXPECT_EQ(y[32 + j], g256[j]);
++    for (int j = 8; j < 32; j++) EXPECT_EQ(y[32 + j], 43.0f);
++    // red case: the affine reading of the same bytes is a different row
++    const auto affine = decode_row_through_stage(native_matrix(0, 64, w, z, s));
++    EXPECT_NE(affine[0], y[0]);
++}

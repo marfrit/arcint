@@ -123,6 +123,38 @@ def test_a_cut_builds_and_compiles_device_free_up_to_the_request():
     assert re.search(r"key_cache\.\d+\[-1, -1, -1, -1\]:dynamic", out), out[-1500:]
 
 
+def test_a_pruned_cut_declares_only_the_ports_the_cut_graph_reaches():
+    """`--cut-prune` (2026-09-18, campaign serving-shape-logits): the cut
+    keeps only the Parameters the cut node reaches. Opt-in, so the reviewed
+    default above stays what it was. Why it exists: on the full-depth artifact
+    a `layer0/out` cut still DECLARED the seven `ngram_table.K` ports (the PLE
+    sits at layer 1, after the cut), the driver bound the real 26.8 GiB table
+    for a graph that never reads it, the container swapped and the next tiny
+    device allocation failed with `[GPU] out of GPU resources` (measured on
+    the dev host, `~/wp/logs/cut48b/l0.log`). At `layer0/out` the reachable
+    ports are the embedding, the positions, the mask and layer 0's own state
+    rows; the tables, the KV pools and every later layer's state are gone.
+    Red first: `--cut-prune` unknown."""
+    out = run("--stage", "compile", "--cut", "layer0/out", "--cut-prune")
+    m = re.search(r"LOCALISER: graph cut after 'layer0/out' .*; (\d+) unreachable "
+                  r"parameter\(s\) pruned, (\d+) kept", out)
+    assert m and int(m.group(1)) > 0, out[-2000:]
+    ports = re.search(r"BOOT \[compile\] ports: (.*)", out)
+    assert ports, out[-2000:]
+    names = re.findall(r"([A-Za-z_][\w.]*)\[", ports.group(1))   # shapes carry ", " too
+    assert "inputs_embeds" in names and "conv_mask" in names, names
+    assert not [n for n in names if n.startswith(("ngram_table.", "key_cache.", "value_cache."))], names
+    assert len(names) == int(m.group(2)), (names, m.group(2))
+    assert "BOOT [compile] OK" in out, out[-2000:]
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "since the emitter matches the tiled MoE pattern (2026-09-17) the CPU "
+    "plugin's own ConvertTiledMoeBlockToGatherMatmuls fires on the ported "
+    "build too (it accepts any weight producer) and its GatherMatmul refuses "
+    "Parameter weights: 'Only constant weights are supported for GatherMatmul "
+    "operation'. The ported route is dead since window-051 B.3; the cell is "
+    "kept as the record of what it proved and of why it no longer runs."))
 def test_expert_ports_bind_every_body_and_the_forward_repeats_bit_identically():
     """`--expert-ports` (the segmented route's expert bodies as u8 PORTS with
     the in-graph unpack): every body the sink declares is bound by name --
@@ -137,3 +169,21 @@ def test_expert_ports_bind_every_body_and_the_forward_repeats_bit_identically():
     assert "declared by the sink, not by the compiled model" not in out
     assert "BOOT [forward] INFER OK" in out
     assert re.search(r"#2 \(same request\) INFER OK [\d.]+s: BIT-IDENTICAL to #1", out), out[-2000:]
+
+
+def test_the_rewrite_flag_is_idempotent_on_a_fixed_build_and_the_census_prints():
+    """`--rewrite-tiled-moe` on the fixed emitter's build rewrites nothing and
+    the walker matches every MoE layer; `--census` prints the runtime graph's
+    primitive types (on the CPU plugin no MoE-typed primitive exists, and the
+    line must say so rather than stay silent -- that silence is the defect
+    class the flag was written for)."""
+    out = run("--stage", "compile", "--rewrite-tiled-moe", "--census")
+    m = re.search(r"BOOT \[rewrite\] tiled MoE blocks rewritten (\d+) \(swish (\d+), "
+                  r"chains (\d+)\); walker matched (\d+)", out)
+    assert m and tuple(int(g) for g in m.groups()) == (0, 0, 0, 4), out[-2000:]
+    assert "BOOT [compile] OK" in out, out[-2000:]
+    # the moe-typed field is `NONE` or a dict repr (with spaces) on a device
+    # where the MoE fuses; match either, assert the CPU plugin's NONE
+    c = re.search(r"BOOT \[census\] exec nodes (\d+); moe-typed (.+?); top \[", out)
+    assert c and int(c.group(1)) > 0, out[-2000:]
+    assert c.group(2).strip() == "NONE", c.group(2)

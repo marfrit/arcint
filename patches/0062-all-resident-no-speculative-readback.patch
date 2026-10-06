@@ -1,0 +1,72 @@
+# All-resident native pool: no speculative hidden-state readback. With every
+# expert holding a slot no call can miss, so the hoisted x/rw copy of 0017
+# (the whole T x hidden f16 hidden state, per MoE layer) is skipped and
+# topk_id is read alone, as under MOE_OTD_READBACK_NOHOIST; a miss would
+# still fetch x/rw after the slot upload.
+#
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -1195,8 +1195,9 @@
+         // _cpu_tier_misses non-empty, and on_before_batched_gemv fetches x/rw
+         // (populating these two buffers) exactly when that condition holds,
+         // in both the default hoisted path (always, whenever _cpu_tier) and
+-        // under MOE_OTD_READBACK_NOHOIST=1 (miss-gated, same condition this
+-        // function is called under) -- so a null buffer here is a caller
++        // under MOE_OTD_READBACK_NOHOIST=1 or the all-resident pool (patch
++        // 0062; miss-gated, same condition this function is called under)
++        // -- so a null buffer here is a caller
+         // wiring bug, not a reachable runtime state, and is loud rather than
+         // a silent null-pointer read inside the job loop below.
+         OPENVINO_ASSERT(_cpu_x_host_mem && _cpu_rw_host_mem,
+@@ -1387,6 +1388,15 @@
+         std::chrono::steady_clock::time_point t_wait_done{};
+         bool have_xrw_timing = false;
+         static const bool nohoist = std::getenv("MOE_OTD_READBACK_NOHOIST") != nullptr;
++        // arcint (patch 0062): every expert holds a slot (the all-resident
++        // native pool, 0051/0058), so no call can miss, and the speculative
++        // x/rw read below would copy the whole hidden state to the host for
++        // nothing: 4 MiB per MoE layer at a 1,024-token chunk, over a link
++        // measured at about 2 GB/s on the A770. topk_id is read alone, as
++        // under NOHOIST; a miss would still fetch x/rw after the slot upload.
++        const bool all_resident =
++            resident_slot_count() >=
++            static_cast<size_t>(instance.get_typed_desc<moe_3gemm_fused_compressed>()->_config.num_expert);
+         if (_cpu_tier) {
+             // arcint M14 (patches/0017). Decisive discriminator for H2
+             // (design doc §1): a full queue drain timed immediately before
+@@ -1418,7 +1428,7 @@
+             // from the steady one.
+             tx0 = std::chrono::steady_clock::now();
+ 
+-            if (!nohoist) {
++            if (!nohoist && !all_resident) {
+                 auto& engine = instance.get_network().get_engine();
+                 auto hs_mem = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
+                 const size_t x_bytes = token_num * static_cast<size_t>(_hidden_size) * sizeof(uint16_t);
+@@ -1516,11 +1526,12 @@
+         }
+         scratch._expert_index_buffer->copy_from(stream, slots_u32.data(), 0, 0, topk_bytes, true);
+ 
+-        // arcint M14 (patches/0017). MOE_OTD_READBACK_NOHOIST-only: x/rw,
+-        // miss-gated, in the exact position patches/0012 had them -- after
+-        // the slot-index upload, before dispatch_cpu_tier(). Hoisted, x/rw
+-        // were already fetched above (have_xrw_timing already true).
+-        if (_cpu_tier && nohoist && !_cpu_tier_misses.empty()) {
++        // arcint M14 (patches/0017). MOE_OTD_READBACK_NOHOIST, and since
++        // patch 0062 the all-resident pool: x/rw, miss-gated, in the exact
++        // position patches/0012 had them -- after the slot-index upload,
++        // before dispatch_cpu_tier(). Hoisted, x/rw were already fetched
++        // above (have_xrw_timing already true).
++        if (_cpu_tier && (nohoist || all_resident) && !_cpu_tier_misses.empty()) {
+             auto hs_mem = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
+             const size_t x_bytes = token_num * static_cast<size_t>(_hidden_size) * sizeof(uint16_t);
+             const size_t rw_bytes = topk_count * sizeof(uint16_t);
+@@ -1561,7 +1572,7 @@
+                     // warm-but-miss-free call) and are summed.
+                     uint64_t warm_span = ns(tx0, t_topk_done);
+                     if (have_xrw_timing) {
+-                        if (nohoist)
++                        if (nohoist || all_resident)  // two separate legs (patch 0062)
+                             warm_span += ns(tx0_xrw, t_wait_done);
+                         else
+                             warm_span = ns(tx0_xrw, t_wait_done);  // same span as the topk leg; replace, don't double

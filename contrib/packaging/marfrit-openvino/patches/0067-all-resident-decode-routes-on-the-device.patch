@@ -1,0 +1,295 @@
+# All-resident pool, decode: the pair table the batched native kernels read is
+# written on the device from the router's topk_id (a new expert_route_native
+# kernel), so the host neither reads the ids back nor builds the table; the
+# fused kernels read a constant all-sentinel slot list, as under per-expert
+# dispatch before. Applies when the pool is the identity (slot i = expert i,
+# asserted at bind by 0058) and no routing trace or histogram needs the ids,
+# to calls below the grouped threshold (64 pairs) under the auto dispatch.
+# MOE_DEVICE_ROUTE=0 keeps the host route. A device_routed_calls counter
+# joins the OTD perf log. The route kernel's source skips the per-expert
+# helper section (it must not set its guard), and the guard keeps the bare
+# #ifndef/#define form the kernel-db generator exempts from its #undef list.
+#
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
+@@ -76,6 +76,12 @@
+ // concatenated copies (the per-kernel JIT undef loop only removes the JIT
+ // constants). Patch 0039 shipped without this, so the per-expert kernel never
+ // compiled on a card; patch 0045 fixes it.
++// arcint (patch 0067): the route kernel's source needs none of the helpers and
++// must not set the guard -- landing first in the program, it would leave the
++// native kernels' copies without their tables (CL_BUILD_PROGRAM_FAILURE). The
++// guard keeps the bare #ifndef/#define form: the kernel-db generator exempts
++// only that pattern from the per-source #undef list.
++#ifndef NATIVE_ROUTE_ENABLE
+ #ifndef ARCINT_PER_EXPERT_CL_HELPERS_DEFINED
+ #define ARCINT_PER_EXPERT_CL_HELPERS_DEFINED
+ 
+@@ -2018,6 +2024,7 @@
+ #endif  // ARCINT_NATIVE_DECODE_DEFINED
+ #endif  // NATIVE_GATE_UP_ENABLE || NATIVE_DOWN_ENABLE
+ #endif  // ARCINT_PER_EXPERT_CL_HELPERS_DEFINED
++#endif  // !NATIVE_ROUTE_ENABLE (patch 0067)
+ 
+ 
+ #ifdef GATE_UP_ENABLE
+@@ -2651,3 +2658,23 @@
+ }
+ #endif  // NATIVE_DISPATCH_KIND
+ #endif  // NATIVE_DOWN_ENABLE
++
++#ifdef NATIVE_ROUTE_ENABLE
++// arcint (patch 0067). Decode on the all-resident pool, where slot i is
++// expert i: the pair table the batched kinds read (slot, flat id, top-k
++// position; 3 ints a pair), written on the device from the router's topk_id
++// so the host does not read the ids back. Row i is the row the host path
++// writes for routed position i: flat = token * experts_per_token + position.
++KERNEL(expert_route_native)(
++    const __global int* topk_id,
++    __global int*       pairs,
++    int experts_per_token,
++    int max_topk)
++{
++    const int i = get_global_id(0);
++    const int pos = i % max_topk;
++    pairs[3 * i + 0] = topk_id[i];
++    pairs[3 * i + 1] = (i / max_topk) * experts_per_token + pos;
++    pairs[3 * i + 2] = pos;
++}
++#endif  // NATIVE_ROUTE_ENABLE
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+@@ -261,6 +261,12 @@
+     void set_per_expert_dispatch(bool on) { _per_expert_dispatch = on; }
+     bool per_expert_dispatch() const { return _per_expert_dispatch; }
+ 
++    // arcint (patch 0067). True once bind() filled the all-resident pool, whose
++    // slot i IS expert i (asserted there), and no routing trace or histogram
++    // needs the host to see the ids: a decode call may then route on the device
++    // (exec_batched_gemv, moe_3gemm_swiglu_opt.cpp).
++    bool identity_pool() const { return _identity_pool && !_routing_trace_enabled && !_routing_hist_enabled; }
++
+ private:
+     size_t _capacity = 0;
+     cldnn::MOECompressed::Config _config{};
+@@ -270,6 +276,8 @@
+     moe_otd::ParallelWeightReader _weight_reader;
+     cldnn::moe_weights* _resident = nullptr;
+     bool _bound = false;
++    // arcint (patch 0067). See identity_pool().
++    bool _identity_pool = false;
+     // arcint M14. See set_cpu_tier().
+     bool _cpu_tier = false;
+     // arcint F2 (patch 0018). See set_static_partition().
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+@@ -439,6 +439,7 @@
+             _cache->set_filled(slot);
+         }
+         service_stream.finish();
++        _identity_pool = true;  // arcint (patch 0067)
+     }
+ 
+     // arcint nvme-direct-expert-tier (patches/0048/0049). The first layer to
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
+@@ -46,6 +46,9 @@
+     // GPU kernel invocations (expert_gate_up + expert_down = 2 per expert).
+     // Distinguishes GPU kernel use from CPU-tier fallback.
+     std::atomic<uint64_t> per_expert_gpu_invocations{0};
++    // arcint (patch 0067). MoE calls whose pair table the device wrote (decode
++    // on the all-resident pool, no topk_id readback).
++    std::atomic<uint64_t> device_routed_calls{0};
+ 
+     // arcint M9 (patches/0004, P0 counters).
+     // LRU evictions across all OTD-offloaded MoE layers in this process.
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+@@ -58,6 +58,7 @@
+                    << ", hybrid_prefill_layers=" << hybrid_prefill_layers.load(std::memory_order_relaxed)
+                    << ", per_expert_dispatches=" << per_expert_dispatches.load(std::memory_order_relaxed)
+                    << ", per_expert_gpu_invocations=" << per_expert_gpu_invocations.load(std::memory_order_relaxed)
++                   << ", device_routed_calls=" << device_routed_calls.load(std::memory_order_relaxed)
+                    << ", created_onednn_kernels=" << created_onednn_kernels.load(std::memory_order_relaxed)
+                    // arcint M9 (patches/0004-0006): eviction/acquisition accounting, the
+                    // compile-time device/host slot-tier split and its fallback count, and
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -608,6 +608,11 @@
+ // 8 in 0060; 4 since 0061, where the row-blocked gate/up fits the registers
+ // only at 4 x 2 (NATIVE_GU_TILE_N below).
+ constexpr int kNativeTileM = 4;
++// arcint (patch 0067, hoisted from 0060's dispatch block): a call with this
++// many (token, expert) pairs or more is grouped by expert under the auto
++// dispatch; below it the batched kinds run, and on the all-resident pool
++// their pair table is written on the device.
++constexpr size_t kGroupedMinPairs = 64;
+ // Output rows per pass of the native per-expert kernels (patch 0061), per
+ // projection: moe_expert_swiglu.cl NATIVE_GU_TILE_N and NATIVE_DOWN_TILE_N,
+ // divisors of N_BLOCK (4). Measured on the A770 (one real-geometry block, 1,024
+@@ -724,6 +729,24 @@
+     }
+ };
+ 
++// arcint (patch 0067): the device-written pair table for decode on the
++// all-resident pool (expert_route_native in the .cl).
++class MoEExpertRouteNative : public KernelGenerator {
++public:
++    MoEExpertRouteNative() : KernelGenerator("moe_expert_swiglu", "expert_route_native") {}
++protected:
++    JitConstants get_jit_constants(const RuntimeParams& params) const override {
++        auto jit = KernelGenerator::get_jit_constants(params);
++        add_common_consts(params, jit);
++        jit.make("NATIVE_ROUTE_ENABLE", 1);
++        return jit;
++    }
++    Arguments get_arguments_desc(const RuntimeParams&) const override { return {}; }
++    DispatchDataFunc get_dispatch_data_func() const override {
++        return DispatchDataFunc{[](const RuntimeParams&, KernelData&, ImplRuntimeParams*) {}};
++    }
++};
++
+ class MoE3GemmSwigluMLPGateUp : public KernelGenerator {
+ public:
+     MoE3GemmSwigluMLPGateUp(bool disable_shared_experts = false)
+@@ -1019,6 +1042,13 @@
+     Stage::Ptr _expert_gate_up_native_dpas_stage = make_stage<MoEExpertGateUpNative>(3);
+     Stage::Ptr _expert_gate_up_native_dpas1_stage = make_stage<MoEExpertGateUpNative>(4);
+     memory::ptr _dispatch_tiles_dpas;
++    // arcint (patch 0067): decode routes on the device on the all-resident pool.
++    Stage::Ptr _expert_route_native_stage = make_stage<MoEExpertRouteNative>();
++    // Both sized once for the largest device-routed call (kGroupedMinPairs - 1
++    // pairs) and never regrown: no queue drain precedes a device-routed call, so
++    // a buffer an earlier call's kernels still read must not be released.
++    memory::ptr _route_pairs;      // usm_device, written by the route kernel
++    memory::ptr _route_sentinels;  // usm_host, every routed slot a sentinel (the fused kernels' list)
+     bool _gu_dpas = false;
+     struct PerExpertGpuDispatch {
+         size_t slot_index;
+@@ -2121,6 +2151,7 @@
+                     add_stage(_expert_down_native_batched_stage, params);
+                     add_stage(_expert_gate_up_native_grouped_stage, params);
+                     add_stage(_expert_down_native_grouped_stage, params);
++                    add_stage(_expert_route_native_stage, params);  // arcint (patch 0067)
+                     // arcint (patch 0064): the matrix-unit gate/up. The kernel is
+                     // Xe-HPG's (subgroup 8), for IQ2_S-packed gate/up only; it runs
+                     // for EVERY call size, so a pair's bytes do not depend on the
+@@ -2762,7 +2793,39 @@
+         const size_t subgroup_size = instance.get_impl_params()->get_device_info().arch >= gpu_arch::xe2 ? 32 : 16;
+         const size_t max_work_group_size = instance.get_impl_params()->get_device_info().max_work_group_size;
+ 
+-        {
++        // arcint (patch 0067). Decode on the all-resident pool routes on the
++        // device. Slot i IS expert i there (asserted at bind, patch 0058) and no
++        // call can miss, so the blocking topk_id readback, the host slot list and
++        // the host pair table are not needed: the route kernel writes the table
++        // the batched kinds read (the rows the host writes), and the fused
++        // kernels read a constant all-sentinel slot list, as the host path gives
++        // them under per-expert dispatch. The readback left the device idle at
++        // every MoE layer (DESIGN 7.0.2cr). A call the auto dispatch would group
++        // (kGroupedMinPairs pairs or more), or a dispatch mode forced to other than auto, keeps the
++        // host path. MOE_DEVICE_ROUTE=0 keeps it everywhere (the A/B).
++        static const bool device_route_on = [] {
++            const char* v = std::getenv("MOE_DEVICE_ROUTE");
++            const char* m = std::getenv("MOE_DISPATCH_MODE");
++            return (v == nullptr || std::string(v) != "0") && (m == nullptr || std::string(m) == "auto") &&
++                   std::getenv("MOE_PER_PAIR_DISPATCH") == nullptr;
++        }();
++        const size_t route_pairs = token_num * static_cast<size_t>(max_topk);
++        const bool device_route = device_route_on && _per_expert_dispatch && _native_tier_only &&
++                                  route_pairs < kGroupedMinPairs && _weight_provider->is_offloaded() &&
++                                  static_cast<OffloadExpertWeightProvider*>(_weight_provider.get())->identity_pool();
++        if (device_route) {
++            _cpu_tier_misses.clear();
++            _gpu_dispatches.clear();  // the host-built branches below stay off
++            if (!_route_sentinels) {
++                const size_t max_pairs = kGroupedMinPairs - 1;
++                const size_t bytes = max_pairs * sizeof(uint32_t);
++                auto layout = cldnn::layout({1, 1, 1, static_cast<ov::Dimension::value_type>(bytes)},
++                                            ov::element::i8, cldnn::format::bfyx);
++                _route_sentinels = cur_net.get_engine().allocate_memory(layout, allocation_type::usm_host, false);
++                cldnn::mem_lock<uint32_t, mem_lock_type::write> lock(_route_sentinels, stream);
++                std::fill(lock.data(), lock.data() + max_pairs, static_cast<uint32_t>(kCpuTierSentinelSlot));
++            }
++        } else {
+             const size_t topk_count = token_num * static_cast<size_t>(max_topk);
+             bool needs_fallback = false;
+             on_before_batched_gemv(stream, instance, scratch, token_num, topk_count, needs_fallback);
+@@ -2778,6 +2841,8 @@
+         if (scratch._expert_index_buffer) {
+             batch_mem_ptr = scratch._expert_index_buffer;
+         }
++        if (device_route)
++            batch_mem_ptr = _route_sentinels;  // arcint (patch 0067)
+ 
+         // gate
+         const auto& mlp_gate_wei_mem = scratch.moe_fusion_wei_addr.weight[0];
+@@ -2872,7 +2937,6 @@
+             // trails at decode. Every mode computes a pair's output with the same
+             // arithmetic; the same bytes by measurement (see the .cl tile
+             // comment), so on the A770 the choice has not moved an answer.
+-            constexpr size_t kGroupedMinPairs = 64;
+             static const int dispatch_setting = [] {
+                 if (std::getenv("MOE_PER_PAIR_DISPATCH") != nullptr) return 0;
+                 const char* m = std::getenv("MOE_DISPATCH_MODE");
+@@ -2929,6 +2993,60 @@
+                 }
+                 return tiles;
+             };
++            if (device_route) {
++                // arcint (patch 0067): the table from topk_id on the device, then
++                // the decode kernels the host path runs for this call size.
++                auto hs_mem = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
++                const auto& w = instance._weights;
++                if (!_route_pairs) {
++                    const size_t bytes = (kGroupedMinPairs - 1) * 3 * sizeof(int32_t);
++                    auto layout = cldnn::layout({1, 1, 1, static_cast<ov::Dimension::value_type>(bytes)},
++                                                ov::element::i8, cldnn::format::bfyx);
++                    _route_pairs = cur_net.get_engine().allocate_memory(layout, allocation_type::usm_device, false);
++                }
++                execute_stage({ret_event},
++                              instance,
++                              *_expert_route_native_stage,
++                              {scratch.topk_id},
++                              {_route_pairs},
++                              {route_pairs, 1, 1},
++                              {1, 1, 1},
++                              false,
++                              {static_cast<int>(_experts_per_token), static_cast<int>(_max_topk)});
++                if (_gu_dpas)
++                    execute_stage({ret_event},
++                                  instance,
++                                  *_expert_gate_up_native_dpas1_stage,
++                                  {w.gate_w, w.gate_s, w.gate_z, w.up_w, w.up_s, w.up_z, hs_mem, _route_pairs},
++                                  {scratch.up},
++                                  {route_pairs, static_cast<size_t>(_intermediate_size / 8 * (_hidden_size / 256) * 8), 1},
++                                  {1, static_cast<size_t>(_hidden_size / 256 * 8), 1},
++                                  false,
++                                  {static_cast<int>(_experts_per_token)});
++                else
++                    execute_stage({ret_event},
++                                  instance,
++                                  *_expert_gate_up_native_batched_stage,
++                                  {w.gate_w, w.gate_s, w.gate_z, w.up_w, w.up_s, w.up_z, hs_mem, _route_pairs},
++                                  {scratch.up},
++                                  {route_pairs, subgroup_size, static_cast<size_t>(_intermediate_size / N_BLOCK)},
++                                  {1, subgroup_size, SUBGROUP_NUM},
++                                  false,
++                                  {static_cast<int>(_experts_per_token)});
++                execute_stage({ret_event},
++                              instance,
++                              *_expert_down_native_batched_stage,
++                              {w.down_w, w.down_s, w.down_z, scratch.up, routing_mem_ptr, _route_pairs},
++                              {scratch.y},
++                              {route_pairs, subgroup_size, static_cast<size_t>(_hidden_size / N_BLOCK)},
++                              {1, subgroup_size, SUBGROUP_NUM},
++                              false,
++                              {static_cast<int>(_experts_per_token), static_cast<int>(_max_topk)});
++                if (auto* perf = moe_otd::get_perf_counters()) {
++                    perf->per_expert_gpu_invocations.fetch_add(2, std::memory_order_relaxed);
++                    perf->device_routed_calls.fetch_add(1, std::memory_order_relaxed);
++                }
++            }
+             // arcint (patch 0064): gate/up on the matrix unit, whatever the mode.
+             const bool gu_dpas = _gu_dpas && _per_expert_dispatch && !_gpu_dispatches.empty() && _native_tier_only;
+             if (gu_dpas) {

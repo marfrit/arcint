@@ -1,0 +1,1170 @@
+diff --git a/src/common/transformations/include/ov_ops/moe_compressed.hpp b/src/common/transformations/include/ov_ops/moe_compressed.hpp
+index 2075ac20bc..8d29fb2d5f 100644
+--- a/src/common/transformations/include/ov_ops/moe_compressed.hpp
++++ b/src/common/transformations/include/ov_ops/moe_compressed.hpp
+@@ -34,8 +34,29 @@ public:
+         bool has_zp = false;
+         ov::element::Type out_type = ov::element::dynamic;
+         std::optional<float> scale_factor;
++        // arcint (patch 0043, campaign sub4bit-vram-kernel). The expert weight
++        // format per projection: 0 = the u4/i4/u8 grouped-affine form above;
++        // 1 = IQ4_NL (weight = u4 codes [E, out, K/32, 32] indexing a fixed
++        // 16-entry table, scale = f16 d per 32, zero-point slot unused);
++        // 2 = IQ3_XXS (weight = u8 grid indices [E, out, K/32, 8], scale = f16
++        // d*(0.5+s)*0.5 per 32, zero-point slot = u8 sign-mask indices
++        // [E, out, K/32, 4]); 3 = Q8_0 (weight = i8 codes [E, out, K/32, 32],
++        // scale = f16 d per 32, zero-point slot unused). IQ4_XS lands on the
++        // IQ4_NL layout (its sub-block scales folded into the f32 scale by
++        // the exporter). The checkpoint's own blocks, re-laid per role
++        // (design-routing-aware-expert-execution 2.3a-2.3d).
++        size_t gate_up_weight_format = 0;
++        size_t down_weight_format = 0;
+     };
+ 
++    static constexpr size_t kWeightFormatU4Affine = 0;
++    static constexpr size_t kWeightFormatIq4Nl = 1;
++    static constexpr size_t kWeightFormatIq3Xxs = 2;
++    static constexpr size_t kWeightFormatQ8_0 = 3;
++    static bool is_native_format(size_t f) {
++        return f == kWeightFormatIq4Nl || f == kWeightFormatIq3Xxs || f == kWeightFormatQ8_0;
++    }
++
+     /// \brief Constructs a MOECompressed operation with config only
+     /// \param args The input tensors, in the following order:
+     ///   0: hidden_states - input tensor with hidden representations
+diff --git a/src/common/transformations/include/sources.cmake b/src/common/transformations/include/sources.cmake
+index 0ba6da3506..3a12e120af 100644
+--- a/src/common/transformations/include/sources.cmake
++++ b/src/common/transformations/include/sources.cmake
+@@ -296,6 +296,7 @@ set(PAGED_ATTENTION_HEADERS
+ 
+ set(PATTERN_BLOCKS_HEADERS
+     ${CMAKE_CURRENT_LIST_DIR}/transformations/pattern_blocks/compressed_weights_block.hpp
++    ${CMAKE_CURRENT_LIST_DIR}/transformations/pattern_blocks/native_expert_block.hpp
+ )
+ 
+ set(RT_INFO_HEADERS
+diff --git a/src/common/transformations/include/transformations/common_optimizations/convert_tiled_moe_block_to_gather_matmuls.hpp b/src/common/transformations/include/transformations/common_optimizations/convert_tiled_moe_block_to_gather_matmuls.hpp
+index 7e262e5638..905af09473 100644
+--- a/src/common/transformations/include/transformations/common_optimizations/convert_tiled_moe_block_to_gather_matmuls.hpp
++++ b/src/common/transformations/include/transformations/common_optimizations/convert_tiled_moe_block_to_gather_matmuls.hpp
+@@ -18,6 +18,7 @@ class TRANSFORMATIONS_API ConvertTiledMoeBlockTo2GatherMatmuls;
+ class TRANSFORMATIONS_API ConvertTiledMoeBlockTo3GatherMatmuls;
+ 
+ class TRANSFORMATIONS_API ConvertTiledMoeBlockToGatherMatmuls;
++class TRANSFORMATIONS_API ConvertTiledMoeBlockNativeToMoeCompressed;
+ 
+ }  // namespace ov::pass
+ 
+@@ -162,3 +163,16 @@ public:
+         add_matcher<ov::pass::ConvertTiledMoeBlockTo3GatherMatmuls>(supported_weights_types);
+     }
+ };
++
++// arcint (patch 0043, campaign sub4bit-vram-kernel). The tiled 3-GEMM MoE
++// block whose expert weights are the checkpoint's own IQ4_NL / IQ3_XXS blocks
++// decoded in standard ops (transformations/pattern_blocks/native_expert_block.hpp),
++// lowered DIRECTLY to MOECompressed with the per-role Constants as the op's
++// weight / scale / zero-point inputs and the formats in its config
++// (gate_up_weight_format, down_weight_format). No GatherMatmul in between:
++// the compressed GatherMatmul path exists for the affine chain only.
++class ov::pass::ConvertTiledMoeBlockNativeToMoeCompressed : public ov::pass::MatcherPass {
++public:
++    OPENVINO_MATCHER_PASS_RTTI("ConvertTiledMoeBlockNativeToMoeCompressed");
++    explicit ConvertTiledMoeBlockNativeToMoeCompressed(bool has_batch_dim = false);
++};
+diff --git a/src/common/transformations/include/transformations/pattern_blocks/native_expert_block.hpp b/src/common/transformations/include/transformations/pattern_blocks/native_expert_block.hpp
+new file mode 100644
+index 0000000000..c3663238bb
+--- /dev/null
++++ b/src/common/transformations/include/transformations/pattern_blocks/native_expert_block.hpp
+@@ -0,0 +1,52 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++// arcint (patch 0043, campaign sub4bit-vram-kernel). Pattern blocks for the
++// two NATIVE expert weight formats of the Flash-Next checkpoint, as the
++// serving-shape emitter writes them (tools/q4e/serving_shape.py
++// _native_expert): the checkpoint's own IQ4_NL / IQ3_XXS blocks re-laid per
++// role and decoded in standard ops. The blocks expose the per-role Constants
++// as anchors so the native MoE lowering can hand them to MOECompressed as
++// they are (design-routing-aware-expert-execution 2.3b/2.3c).
++
++#pragma once
++
++#include "openvino/pass/matcher_pass.hpp"
++#include "openvino/pass/pattern/op/block.hpp"
++#include "transformations_visibility.hpp"
++
++namespace ov::pass::pattern::op {
++
++class TRANSFORMATIONS_API NativeIq4nlWeightsBlock;
++class TRANSFORMATIONS_API NativeIq3xxsWeightsBlock;
++class TRANSFORMATIONS_API NativeQ8WeightsBlock;
++
++}  // namespace ov::pass::pattern::op
++
++/// IQ4_NL: codes u4 [E, out, K/32, 32] -> Convert(i32) -> Gather(table f32 [16], ., axis)
++///         -> Multiply(scale f32 [E, out, K/32, 1]) -> Reshape [E, out, K] -> optional Convert
++/// anchors: codes, table, scale, reshape
++class ov::pass::pattern::op::NativeIq4nlWeightsBlock : public ov::pass::pattern::op::Block {
++public:
++    NativeIq4nlWeightsBlock();
++};
++
++/// IQ3_XXS: magnitudes = Reshape(Gather(grid f32 [256, 4], Convert(gridix u8 [E, out, K/32, 8]), axis))
++///          signs = Reshape(Select(Greater(BitwiseAnd(Unsqueeze(Gather(ksigns i32 [128],
++///                  Convert(signix u8 [E, out, K/32, 4]), axis), axis), masks i32 [8]), 0), -1, +1))
++///          Multiply(Multiply(magnitudes, signs), scale f32 [E, out, K/32, 1]) -> Reshape [E, out, K]
++///          -> optional Convert
++/// anchors: gridix, grid, signix, ksigns, masks, scale, reshape
++class ov::pass::pattern::op::NativeIq3xxsWeightsBlock : public ov::pass::pattern::op::Block {
++public:
++    NativeIq3xxsWeightsBlock();
++};
++
++// Q8_0: i8 codes [E, out, K/32, 32] -> Convert -> Multiply(optional
++// Convert(f16 scale [E, out, K/32, 1])) -> Reshape [E, out, K] -> optional
++// Convert. Every block's scale is an f16 Constant behind an optional Convert
++// (the emitter keeps the decode arithmetic in f32).
++class ov::pass::pattern::op::NativeQ8WeightsBlock : public ov::pass::pattern::op::Block {
++public:
++    NativeQ8WeightsBlock();
++};
+diff --git a/src/common/transformations/src/ov_ops/moe_compressed.cpp b/src/common/transformations/src/ov_ops/moe_compressed.cpp
+index c59a4bfc58..cb1261dee6 100644
+--- a/src/common/transformations/src/ov_ops/moe_compressed.cpp
++++ b/src/common/transformations/src/ov_ops/moe_compressed.cpp
+@@ -98,7 +98,7 @@ void MOECompressed::validate_and_infer_types() {
+     };
+ 
+     // Cross-check config K/num_expert against weight shapes (scale check only proves config-internal coherence).
+-    auto check_weight_K = [&](size_t weight_idx, size_t expected_K, const char* name) {
++    auto check_weight_K = [&](size_t weight_idx, size_t expected_K, const char* name, size_t weight_format) {
+         if (weight_idx >= get_input_size())
+             return;
+         const auto& s = get_input_partial_shape(weight_idx);
+@@ -108,9 +108,23 @@ void MOECompressed::validate_and_infer_types() {
+             name,
+             " weight shape must be static rank-3 [E, ofm, K] or rank-4 [E, ofm, K_groups, group_size], got ",
+             s);
+-        const size_t actual_K = (s.size() == 4)
+-                                    ? static_cast<size_t>(s[2].get_length()) * static_cast<size_t>(s[3].get_length())
+-                                    : static_cast<size_t>(s[2].get_length());
++        // arcint (patch 0043): a native format's weight tensor holds one
++        // 32-value block per group row -- IQ4_NL 32 codes, IQ3_XXS 8 grid
++        // indices -- so K is the group count times 32, not the last dim.
++        size_t actual_K = 0;
++        if (weight_format == kWeightFormatIq3Xxs) {
++            OPENVINO_ASSERT(s.size() == 4 && s[3].get_length() == 8,
++                            "MOECompressed ", name, " IQ3_XXS weight must be [E, ofm, K/32, 8], got ", s);
++            actual_K = static_cast<size_t>(s[2].get_length()) * 32;
++        } else if (weight_format == kWeightFormatIq4Nl || weight_format == kWeightFormatQ8_0) {
++            OPENVINO_ASSERT(s.size() == 4 && s[3].get_length() == 32,
++                            "MOECompressed ", name, " IQ4_NL/Q8_0 weight must be [E, ofm, K/32, 32], got ", s);
++            actual_K = static_cast<size_t>(s[2].get_length()) * 32;
++        } else {
++            actual_K = (s.size() == 4)
++                           ? static_cast<size_t>(s[2].get_length()) * static_cast<size_t>(s[3].get_length())
++                           : static_cast<size_t>(s[2].get_length());
++        }
+         OPENVINO_ASSERT(actual_K == expected_K,
+                         "MOECompressed ",
+                         name,
+@@ -141,9 +155,9 @@ void MOECompressed::validate_and_infer_types() {
+     if (m_config.expert_type == ov::op::internal::MOE::Expert_type::GEMM3_SWIGLU &&
+         get_input_size() == expected_gemm3_inputs) {
+         // hidden, routing, topk, gate_{w,scale,zp}, up_{w,scale,zp}, down_{w,scale,zp} [, shared...]
+-        check_weight_K(3, m_config.hidden_size, "GEMM3 gate");
+-        check_weight_K(6, m_config.hidden_size, "GEMM3 up");
+-        check_weight_K(9, m_config.inter_size, "GEMM3 down");
++        check_weight_K(3, m_config.hidden_size, "GEMM3 gate", m_config.gate_up_weight_format);
++        check_weight_K(6, m_config.hidden_size, "GEMM3 up", m_config.gate_up_weight_format);
++        check_weight_K(9, m_config.inter_size, "GEMM3 down", m_config.down_weight_format);
+         check_scale(4, m_config.hidden_size, "GEMM3 gate");
+         check_scale(7, m_config.hidden_size, "GEMM3 up");
+         check_scale(10, m_config.inter_size, "GEMM3 down");
+@@ -160,8 +174,8 @@ void MOECompressed::validate_and_infer_types() {
+         const size_t down_w_idx = m_config.has_zp ? 7 : 6;
+         const size_t down_scale_idx = m_config.has_zp ? 8 : 7;
+         const size_t down_zp_idx = m_config.has_zp ? 9 : SIZE_MAX;
+-        check_weight_K(gate_up_w_idx, m_config.hidden_size, "GEMM2 gate_up");
+-        check_weight_K(down_w_idx, m_config.inter_size / 2, "GEMM2 down");
++        check_weight_K(gate_up_w_idx, m_config.hidden_size, "GEMM2 gate_up", kWeightFormatU4Affine);
++        check_weight_K(down_w_idx, m_config.inter_size / 2, "GEMM2 down", kWeightFormatU4Affine);
+         check_scale(gate_up_scale_idx, m_config.hidden_size, "GEMM2 gate_up");
+         check_scale(down_scale_idx, m_config.inter_size / 2, "GEMM2 down");
+         check_zp(gate_up_zp_idx, "GEMM2 gate_up");
+@@ -180,6 +194,8 @@ bool MOECompressed::visit_attributes(ov::AttributeVisitor& visitor) {
+     visitor.on_attribute("has_batch_dim", m_config.has_batch_dim);
+     visitor.on_attribute("has_zp", m_config.has_zp);
+     visitor.on_attribute("out_type", m_config.out_type);
++    visitor.on_attribute("gate_up_weight_format", m_config.gate_up_weight_format);
++    visitor.on_attribute("down_weight_format", m_config.down_weight_format);
+     if (m_config.scale_factor.has_value())
+         visitor.on_attribute("scale_factor", m_config.scale_factor.value());
+     return true;
+diff --git a/src/common/transformations/src/sources.cmake b/src/common/transformations/src/sources.cmake
+index 58edf81977..f39b94d38f 100644
+--- a/src/common/transformations/src/sources.cmake
++++ b/src/common/transformations/src/sources.cmake
+@@ -259,6 +259,7 @@ set(PAGED_ATTENTION_SOURCES
+ 
+ set(PATTERN_BLOCKS_SOURCES
+     ${CMAKE_CURRENT_LIST_DIR}/transformations/pattern_blocks/compressed_weights_block.cpp
++    ${CMAKE_CURRENT_LIST_DIR}/transformations/pattern_blocks/native_expert_block.cpp
+ )
+ 
+ set(RT_INFO_SOURCES
+diff --git a/src/common/transformations/src/transformations/common_optimizations/convert_tiled_moe_block_to_gather_matmuls.cpp b/src/common/transformations/src/transformations/common_optimizations/convert_tiled_moe_block_to_gather_matmuls.cpp
+index c3276ccdd9..f07ae970db 100644
+--- a/src/common/transformations/src/transformations/common_optimizations/convert_tiled_moe_block_to_gather_matmuls.cpp
++++ b/src/common/transformations/src/transformations/common_optimizations/convert_tiled_moe_block_to_gather_matmuls.cpp
+@@ -12,6 +12,7 @@
+ #include "openvino/op/add.hpp"
+ #include "openvino/op/clamp.hpp"
+ #include "openvino/op/constant.hpp"
++#include "openvino/op/convert.hpp"
+ #include "openvino/op/gelu.hpp"
+ #include "openvino/op/matmul.hpp"
+ #include "openvino/op/minimum.hpp"
+@@ -29,7 +30,11 @@
+ #include "openvino/pass/pattern/op/optional.hpp"
+ #include "openvino/pass/pattern/op/wrap_type.hpp"
+ #include "ov_ops/gather_matmul.hpp"
++#include "ov_ops/moe_compressed.hpp"
+ #include "transformations/pattern_blocks/compressed_weights_block.hpp"
++#include "transformations/pattern_blocks/native_expert_block.hpp"
++
++#include <functional>
+ 
+ namespace {
+ using namespace ov::pass;
+@@ -154,7 +159,7 @@ struct MOE3GEMMPatternNodes {
+     std::shared_ptr<ov::Node> reduce_sum;
+ };
+ 
+-MOE3GEMMPatternNodes build_3gemm_pattern(const std::vector<ov::element::Type>& supported_weights_types) {
++MOE3GEMMPatternNodes build_3gemm_pattern_impl(const std::function<std::shared_ptr<ov::Node>()>& make_weight) {
+     MOE3GEMMPatternNodes p;
+ 
+     p.experts_input = pattern::any_input();
+@@ -163,19 +168,19 @@ MOE3GEMMPatternNodes build_3gemm_pattern(const std::vector<ov::element::Type>& s
+ 
+     // First GEMM (activation gate)
+     p.gate_matmul = pattern::wrap_type<v0::MatMul>(
+-        {p.after_tile_reshape, make_expert_weight_pattern(supported_weights_types)},
++        {p.after_tile_reshape, make_weight()},
+         pattern::consumers_count(1) && pattern::attrs_match({{"transpose_a", false}, {"transpose_b", true}}));
+     p.swish = pattern::wrap_type<v4::Swish, v7::Gelu>({p.gate_matmul}, pattern::consumers_count(1));
+     // Second GEMM (up_projection)
+     p.up_matmul = pattern::wrap_type<v0::MatMul>(
+-        {p.after_tile_reshape, make_expert_weight_pattern(supported_weights_types)},
++        {p.after_tile_reshape, make_weight()},
+         pattern::consumers_count(1) && pattern::attrs_match({{"transpose_a", false}, {"transpose_b", true}}));
+     // Join: Multiply (SwiGLU)
+     p.swiglu = pattern::wrap_type<v1::Multiply>({p.swish, p.up_matmul}, pattern::consumers_count(1));
+ 
+     // Third GEMM (down_projection)
+     p.down_matmul = pattern::wrap_type<v0::MatMul>(
+-        {p.swiglu, make_expert_weight_pattern(supported_weights_types)},
++        {p.swiglu, make_weight()},
+         pattern::consumers_count(1) && pattern::attrs_match({{"transpose_a", false}, {"transpose_b", true}}));
+     p.end_reshape_target_shape = pattern::any_input();
+     p.end_reshape =
+@@ -204,6 +209,31 @@ MOE3GEMMPatternNodes build_3gemm_pattern(const std::vector<ov::element::Type>& s
+     return p;
+ }
+ 
++MOE3GEMMPatternNodes build_3gemm_pattern(const std::vector<ov::element::Type>& supported_weights_types) {
++    return build_3gemm_pattern_impl([&]() {
++        return make_expert_weight_pattern(supported_weights_types);
++    });
++}
++
++// arcint (patch 0043). One native weight pattern per projection: either
++// block; which one matched is read off the block anchors in the callback.
++struct NativeWeightPattern {
++    std::shared_ptr<pattern::op::NativeIq4nlWeightsBlock> iq4nl;
++    std::shared_ptr<pattern::op::NativeIq3xxsWeightsBlock> iq3xxs;
++    std::shared_ptr<pattern::op::NativeQ8WeightsBlock> q8;
++    std::shared_ptr<ov::Node> either;
++};
++
++NativeWeightPattern make_native_weight_pattern() {
++    NativeWeightPattern w;
++    w.iq4nl = std::make_shared<pattern::op::NativeIq4nlWeightsBlock>();
++    w.iq3xxs = std::make_shared<pattern::op::NativeIq3xxsWeightsBlock>();
++    w.q8 = std::make_shared<pattern::op::NativeQ8WeightsBlock>();
++    w.either = std::make_shared<pattern::op::Or>(ov::OutputVector{w.iq4nl, w.iq3xxs, w.q8});
++    return w;
++}
++
++
+ }  // namespace
+ 
+ namespace ov::pass {
+@@ -423,4 +453,158 @@ ConvertTiledMoeBlockTo3GatherMatmuls::ConvertTiledMoeBlockTo3GatherMatmuls(
+     this->register_matcher(matcher, callback);
+ }
+ 
++// arcint (patch 0043, campaign sub4bit-vram-kernel). See the header.
++ConvertTiledMoeBlockNativeToMoeCompressed::ConvertTiledMoeBlockNativeToMoeCompressed(bool has_batch_dim) {
++    MATCHER_SCOPE(ConvertTiledMoeBlockNativeToMoeCompressed);
++    using ov::op::internal::MOECompressed;
++
++    auto weights = std::make_shared<std::vector<NativeWeightPattern>>();
++    auto p = build_3gemm_pattern_impl([weights]() {
++        weights->push_back(make_native_weight_pattern());
++        return weights->back().either;
++    });
++    OPENVINO_ASSERT(weights->size() == 3, "the 3-GEMM tiled pattern creates exactly three expert weight patterns");
++
++    matcher_pass_callback callback = [=](pattern::Matcher& m) {
++        auto& pm = m.get_pattern_value_map();
++        if (transformation_callback(m.get_match_root())) {
++            return false;
++        }
++
++        struct Resolved {
++            size_t format = 0;
++            ov::Output<ov::Node> weight, scale, zp;
++        };
++        auto resolve = [&](const NativeWeightPattern& w, Resolved& r) -> bool {
++            if (auto codes = w.iq4nl->get_anchor("codes", pm)) {
++                r.format = MOECompressed::kWeightFormatIq4Nl;
++                r.weight = codes.value();
++                r.scale = w.iq4nl->get_anchor("scale", pm).value();
++                // IQ4_NL has no zero-point: the scale Constant fills the slot
++                // (the op's has_zp is per op; the kernels never read it for
++                // this format; the offload path copies a few extra bytes)
++                r.zp = r.scale;
++                return true;
++            }
++            if (auto gridix = w.iq3xxs->get_anchor("gridix", pm)) {
++                r.format = MOECompressed::kWeightFormatIq3Xxs;
++                r.weight = gridix.value();
++                r.scale = w.iq3xxs->get_anchor("scale", pm).value();
++                r.zp = w.iq3xxs->get_anchor("signix", pm).value();
++                return true;
++            }
++            if (auto codes = w.q8->get_anchor("codes", pm)) {
++                r.format = MOECompressed::kWeightFormatQ8_0;
++                r.weight = codes.value();
++                r.scale = w.q8->get_anchor("scale", pm).value();
++                r.zp = r.scale;  // no zero-point, as IQ4_NL
++                return true;
++            }
++            return false;
++        };
++        Resolved gate, up, down;
++        if (!resolve((*weights)[0], gate) || !resolve((*weights)[1], up) || !resolve((*weights)[2], down)) {
++            return false;
++        }
++        if (gate.format != up.format) {
++            return false;  // one format per projection pair, as the config carries it
++        }
++        for (const Resolved* r : {&gate, &up, &down}) {
++            if (!ov::as_type_ptr<v0::Constant>(r->weight.get_node_shared_ptr()) ||
++                !ov::as_type_ptr<v0::Constant>(r->scale.get_node_shared_ptr()) ||
++                !ov::as_type_ptr<v0::Constant>(r->zp.get_node_shared_ptr())) {
++                return false;
++            }
++        }
++
++        const auto& hidden_states = pm.at(p.experts_input);
++        const auto& routing = pm.at(p.chosen_experts);
++        const auto& topk_indices = pm.at(p.router_topk_indices);
++
++        float expert_beta = 1.0f;
++        auto activation_type = ov::op::internal::MOE::Activation_type::SWIGLU;
++        const auto activation_node = pm.at(p.swish).get_node_shared_ptr();
++        if (auto swish_op = ov::as_type_ptr<v4::Swish>(activation_node)) {
++            if (swish_op->get_input_size() > 1) {
++                if (auto beta_const = ov::as_type_ptr<v0::Constant>(swish_op->get_input_node_shared_ptr(1))) {
++                    expert_beta = beta_const->cast_vector<float>()[0];
++                }
++            }
++        } else if (auto gelu_op = ov::as_type_ptr<v7::Gelu>(activation_node)) {
++            if (gelu_op->get_approximation_mode() == ov::op::GeluApproximationMode::TANH) {
++                activation_type = ov::op::internal::MOE::Activation_type::GEGLU_TANH;
++            } else if (gelu_op->get_approximation_mode() == ov::op::GeluApproximationMode::ERF) {
++                activation_type = ov::op::internal::MOE::Activation_type::GEGLU_ERF;
++            } else {
++                return false;
++            }
++        } else {
++            return false;
++        }
++
++        const auto gate_shape = gate.weight.get_partial_shape();
++        const auto down_shape = down.weight.get_partial_shape();
++        if (!gate_shape.is_static() || !down_shape.is_static() || gate_shape.size() != 4 || down_shape.size() != 4) {
++            return false;
++        }
++        const auto topk_shape = topk_indices.get_partial_shape();
++        if (topk_shape.rank().is_dynamic() || topk_shape.size() < 2 || !topk_shape[1].is_static()) {
++            return false;
++        }
++        // a native weight holds one 32-value block per group row (2.3c)
++        const size_t hidden_size = static_cast<size_t>(gate_shape[2].get_length()) * 32;
++        const size_t inter_size = static_cast<size_t>(gate_shape[1].get_length());
++        const size_t num_expert = static_cast<size_t>(gate_shape[0].get_length());
++
++        MOECompressed::Config config{
++            {ov::op::internal::MOE::Expert_type::GEMM3_SWIGLU, 0.0f, expert_beta, 0, activation_type},
++            hidden_size,
++            inter_size,
++            num_expert,
++            0,  // num_shared_expert
++            static_cast<size_t>(topk_shape[1].get_length()),
++            32,  // group_size: one block per group row
++            has_batch_dim,
++            true,  // has_zp: the zero-point slot carries the sign indices (IQ3_XXS) or the scale (IQ4_NL)
++            ov::element::f16,
++        };
++        config.gate_up_weight_format = gate.format;
++        config.down_weight_format = down.format;
++
++        ov::OutputVector moe_inputs = {hidden_states, routing,   topk_indices, gate.weight, gate.scale, gate.zp,
++                                       up.weight,     up.scale,  up.zp,        down.weight, down.scale, down.zp};
++        auto moe = std::make_shared<MOECompressed>(moe_inputs, config);
++        moe->set_friendly_name(m.get_match_root()->get_friendly_name() + "/MOECompressedNative");
++        ov::NodeVector new_nodes{moe};
++        ov::Output<ov::Node> moe_out = moe->output(0);
++        if (moe->get_output_element_type(0) != hidden_states.get_element_type()) {
++            auto convert = std::make_shared<v0::Convert>(moe_out, hidden_states.get_element_type());
++            new_nodes.push_back(convert);
++            moe_out = convert->output(0);
++        }
++
++        // the tiled block's tail, as ConvertTiledMoeBlockTo3GatherMatmuls
++        // rebuilds it: the n_all_experts dim is cut off the end-reshape target
++        const auto& end_reshape_out = pm.at(p.end_reshape);
++        const auto end_reshape_rank = end_reshape_out.get_partial_shape().rank();
++        const auto& end_reshape_shape = pm.at(p.end_reshape_target_shape);
++        const auto shape_slice = std::make_shared<v8::Slice>(
++            end_reshape_shape,
++            v0::Constant::create(ov::element::i32, ov::Shape{1}, {1}),
++            v0::Constant::create(ov::element::i32, ov::Shape{1}, {end_reshape_rank.get_length()}),
++            v0::Constant::create(ov::element::i32, ov::Shape{1}, {1}),
++            v0::Constant::create(ov::element::i32, ov::Shape{1}, {0}));
++        const auto reshape = std::make_shared<v1::Reshape>(moe_out, shape_slice, true);
++        new_nodes.push_back(shape_slice);
++        new_nodes.push_back(reshape);
++        ov::copy_runtime_info(m.get_matched_nodes(), new_nodes);
++        ov::replace_output_update_name(pm.at(p.reduce_sum), reshape->output(0));
++        reshape->set_friendly_name(reshape->get_friendly_name() + "_Reshape");
++        return true;
++    };
++
++    auto matcher = std::make_shared<pattern::Matcher>(p.reduce_sum, matcher_name);
++    this->register_matcher(matcher, callback);
++}
++
+ }  // namespace ov::pass
+diff --git a/src/common/transformations/src/transformations/pattern_blocks/native_expert_block.cpp b/src/common/transformations/src/transformations/pattern_blocks/native_expert_block.cpp
+new file mode 100644
+index 0000000000..3ccea39dec
+--- /dev/null
++++ b/src/common/transformations/src/transformations/pattern_blocks/native_expert_block.cpp
+@@ -0,0 +1,102 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++// arcint (patch 0043). See native_expert_block.hpp.
++
++#include "transformations/pattern_blocks/native_expert_block.hpp"
++
++#include <memory>
++
++#include "openvino/core/type/element_type.hpp"
++#include "openvino/op/bitwise_and.hpp"
++#include "openvino/op/constant.hpp"
++#include "openvino/op/convert.hpp"
++#include "openvino/op/gather.hpp"
++#include "openvino/op/greater.hpp"
++#include "openvino/op/multiply.hpp"
++#include "openvino/op/reshape.hpp"
++#include "openvino/op/select.hpp"
++#include "openvino/op/unsqueeze.hpp"
++#include "openvino/pass/pattern/op/optional.hpp"
++#include "openvino/pass/pattern/op/pattern.hpp"
++#include "openvino/pass/pattern/op/wrap_type.hpp"
++
++using ov::pass::pattern::wrap_type;
++
++namespace v0 = ov::op::v0;
++namespace v1 = ov::op::v1;
++namespace v8 = ov::op::v8;
++namespace v13 = ov::op::v13;
++
++ov::pass::pattern::op::NativeIq4nlWeightsBlock::NativeIq4nlWeightsBlock() : Block({}, {}, "NativeIq4nlWeightsBlock") {
++    auto codes = wrap_type<v0::Constant>(ov::pass::pattern::type_matches(ov::element::u4));
++    auto convert = wrap_type<v0::Convert>({codes});
++    auto table = wrap_type<v0::Constant>();
++    auto axis = wrap_type<v0::Constant>();
++    auto gather = wrap_type<v8::Gather>({table, convert, axis});
++    auto scale = wrap_type<v0::Constant>();
++    auto scale_f32 = ov::pass::pattern::optional<v0::Convert>({scale});  // f16 scale, f32 chain
++    auto mul = wrap_type<v1::Multiply>({gather, scale_f32});
++    auto reshape_const = wrap_type<v0::Constant>();
++    auto reshape = wrap_type<v1::Reshape>({mul, reshape_const});
++    auto weights_input = ov::pass::pattern::optional<v0::Convert>({reshape});
++
++    m_inputs = ov::OutputVector{codes};
++    m_outputs = ov::OutputVector{weights_input};
++    REGISTER_ANCHORS(this, codes, table, scale, reshape);
++}
++
++ov::pass::pattern::op::NativeIq3xxsWeightsBlock::NativeIq3xxsWeightsBlock() : Block({}, {}, "NativeIq3xxsWeightsBlock") {
++    // the magnitudes
++    auto gridix = wrap_type<v0::Constant>(ov::pass::pattern::type_matches(ov::element::u8));
++    auto gridix_convert = wrap_type<v0::Convert>({gridix});
++    auto grid = wrap_type<v0::Constant>();
++    auto grid_axis = wrap_type<v0::Constant>();
++    auto grid_gather = wrap_type<v8::Gather>({grid, gridix_convert, grid_axis});
++    auto mag_reshape_const = wrap_type<v0::Constant>();
++    auto mag = wrap_type<v1::Reshape>({grid_gather, mag_reshape_const});
++    // the signs
++    auto signix = wrap_type<v0::Constant>(ov::pass::pattern::type_matches(ov::element::u8));
++    auto signix_convert = wrap_type<v0::Convert>({signix});
++    auto ksigns = wrap_type<v0::Constant>();
++    auto ksigns_axis = wrap_type<v0::Constant>();
++    auto ksigns_gather = wrap_type<v8::Gather>({ksigns, signix_convert, ksigns_axis});
++    auto unsq_axis = wrap_type<v0::Constant>();
++    auto unsq = wrap_type<v0::Unsqueeze>({ksigns_gather, unsq_axis});
++    auto masks = wrap_type<v0::Constant>();
++    auto bits = wrap_type<v13::BitwiseAnd>({unsq, masks});
++    auto zero = wrap_type<v0::Constant>();
++    auto neg = wrap_type<v1::Greater>({bits, zero});
++    auto minus_one = wrap_type<v0::Constant>();
++    auto plus_one = wrap_type<v0::Constant>();
++    auto select = wrap_type<v1::Select>({neg, minus_one, plus_one});
++    auto sign_reshape_const = wrap_type<v0::Constant>();
++    auto sign = wrap_type<v1::Reshape>({select, sign_reshape_const});
++    // magnitudes * signs * scale
++    auto mag_sign = wrap_type<v1::Multiply>({mag, sign});
++    auto scale = wrap_type<v0::Constant>();
++    auto scale_f32 = ov::pass::pattern::optional<v0::Convert>({scale});
++    auto mul = wrap_type<v1::Multiply>({mag_sign, scale_f32});
++    auto reshape_const = wrap_type<v0::Constant>();
++    auto reshape = wrap_type<v1::Reshape>({mul, reshape_const});
++    auto weights_input = ov::pass::pattern::optional<v0::Convert>({reshape});
++
++    m_inputs = ov::OutputVector{gridix, signix};
++    m_outputs = ov::OutputVector{weights_input};
++    REGISTER_ANCHORS(this, gridix, grid, signix, ksigns, masks, scale, reshape);
++}
++
++ov::pass::pattern::op::NativeQ8WeightsBlock::NativeQ8WeightsBlock() : Block({}, {}, "NativeQ8WeightsBlock") {
++    auto codes = wrap_type<v0::Constant>(ov::pass::pattern::type_matches(ov::element::i8));
++    auto convert = wrap_type<v0::Convert>({codes});
++    auto scale = wrap_type<v0::Constant>();
++    auto scale_f32 = ov::pass::pattern::optional<v0::Convert>({scale});
++    auto mul = wrap_type<v1::Multiply>({convert, scale_f32});
++    auto reshape_const = wrap_type<v0::Constant>();
++    auto reshape = wrap_type<v1::Reshape>({mul, reshape_const});
++    auto weights_input = ov::pass::pattern::optional<v0::Convert>({reshape});
++
++    m_inputs = ov::OutputVector{codes};
++    m_outputs = ov::OutputVector{weights_input};
++    REGISTER_ANCHORS(this, codes, scale, reshape);
++}
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+index f0ef5675e8..72f1973be4 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -21,6 +21,8 @@
+ #include "moe_cpu_expert.hpp"
+ 
+ #include <cstring>  // std::memcpy in cpu_tier_join
++#include <unordered_map>  // arcint (patch 0043) native tier-only miss list
++#include "ov_ops/moe_compressed.hpp"
+ // clang-format on
+ 
+ using ov::intel_gpu::ocl::moe::CpuTierMiss;
+@@ -433,9 +435,15 @@ static void add_common_consts(const RuntimeParams& params, JitConstants& jit) {
+     GPU_DEBUG_TRACE_DETAIL << "[DEBUG] moe_3gemm_swiglu_opt: group_size=" << desc->_config.group_size << ", gate_up_group_size=" << gate_up_group_size
+                            << ", down_group_size=" << down_group_size << std::endl;
+ 
++    // arcint (patch 0043): a native expert format (IQ4_NL / IQ3_XXS) runs every
++    // routed expert on the CPU tier; the GEMV kernels are built but never
++    // launched for it, so their group-size floor does not apply.
++    const bool native_format =
++        ov::op::internal::MOECompressed::is_native_format(desc->_config.gate_up_weight_format) ||
++        ov::op::internal::MOECompressed::is_native_format(desc->_config.down_weight_format);
+     // Validate GEMV kernel compatibility: ELEMS_PER_LANE = FAKE_GROUP_SIZE / SUBGROUP_SIZE must be >= 2.
+     // Smaller values have no kernel branch and would silently produce wrong results.
+-    {
++    if (!native_format) {
+         const size_t sg = (info.arch >= gpu_arch::xe2) ? 32u : 16u;
+         const size_t fake_gs = std::min(gate_up_group_size, size_t{128});
+         OPENVINO_ASSERT(fake_gs >= 2 * sg,
+@@ -791,6 +799,12 @@ public:
+     bool _cpu_weight_signed = false;
+     bool _cpu_zp_is_u8 = false;
+     GateAct _cpu_gate_act = GateAct::Silu;
++    // arcint (patch 0043). Native expert formats (MOECompressed::Config
++    // gate_up_weight_format / down_weight_format): every routed expert goes
++    // to the CPU tier, at any token count, until the OpenCL decode exists.
++    bool _native_tier_only = false;
++    size_t _cpu_native_gate_up = 0;
++    size_t _cpu_native_down = 0;
+ 
+     // arcint (patch 0037). Stashed by on_before_prefill for
+     // exec_prefill_micro_gemm's post-scatter host dispatch. Cleared after
+@@ -930,11 +944,15 @@ public:
+                        const memory::ptr& z_tensor,
+                        int oc,
+                        int ic,
+-                       int group_size) {
++                       int group_size,
++                       size_t native_format) {
+             auto w_span = moe_otd::expert_tensor_span(config, offsets, w_tensor, w_pos, expert);
+             auto s_span = moe_otd::expert_tensor_span(config, offsets, s_tensor, s_pos, expert);
+             qm.w = reader.mapped(w_span.file_offset, w_span.bytes);
+-            qm.s = reinterpret_cast<const uint16_t*>(reader.mapped(s_span.file_offset, s_span.bytes));
++            const uint8_t* s_bytes = reader.mapped(s_span.file_offset, s_span.bytes);
++            qm.s = reinterpret_cast<const uint16_t*>(s_bytes);
++            // arcint (patch 0043): a native format's scales are f16 per 32-block, read through qm.s
++            qm.format = static_cast<int>(native_format);
+             if (config.has_zp) {
+                 auto z_span = moe_otd::expert_tensor_span(config, offsets, z_tensor, z_pos, expert);
+                 qm.z = reader.mapped(z_span.file_offset, z_span.bytes);
+@@ -962,7 +980,8 @@ public:
+             instance._weights.gate_z,
+             _intermediate_size,
+             _hidden_size,
+-            _gate_up_group_size);
++            _gate_up_group_size,
++            _cpu_native_gate_up);
+         fill(d.up,
+             1,
+             4,
+@@ -972,7 +991,8 @@ public:
+             instance._weights.up_z,
+             _intermediate_size,
+             _hidden_size,
+-            _gate_up_group_size);
++            _gate_up_group_size,
++            _cpu_native_gate_up);
+         fill(d.down,
+             2,
+             5,
+@@ -982,7 +1002,8 @@ public:
+             instance._weights.down_z,
+             _hidden_size,
+             _intermediate_size,
+-            _down_group_size);
++            _down_group_size,
++            _cpu_native_down);
+         return d;
+     }
+ 
+@@ -1298,6 +1319,25 @@ public:
+             for (size_t i = 0; i < lease->size(); i++)
+                 slots_u32[i] = static_cast<uint32_t>((*lease)[i]);
+         }
++        if (_native_tier_only) {
++            // arcint (patch 0043): the fused GEMV kernels cannot read a native
++            // format; every routed expert -- resident or not -- is a tier miss
++            // and every slot a sentinel. The provider's lease (the static
++            // partition's residents) stays as it is; nothing reads it.
++            std::fill(slots_u32.begin(), slots_u32.end(), static_cast<uint32_t>(kCpuTierSentinelSlot));
++            _cpu_tier_misses.clear();
++            std::unordered_map<uint32_t, size_t> where;
++            for (size_t i = 0; i < expert_ids.size(); i++) {
++                const uint32_t e = expert_ids[i];
++                auto it = where.find(e);
++                if (it == where.end()) {
++                    where.emplace(e, _cpu_tier_misses.size());
++                    _cpu_tier_misses.push_back(CpuTierMiss{e, {i}});
++                } else {
++                    _cpu_tier_misses[it->second].positions.push_back(i);
++                }
++            }
++        }
+         scratch._expert_index_buffer->copy_from(stream, slots_u32.data(), 0, 0, topk_bytes, true);
+ 
+         // arcint M14 (patches/0017). MOE_OTD_READBACK_NOHOIST-only: x/rw,
+@@ -1685,6 +1725,26 @@ public:
+         if (batched_gemv_threshold == 0) {
+             batched_gemv_threshold = 1;
+         }
++        // arcint (patch 0043): the native format is CONFIGURATION, read off the
++        // primitive here, before anything below consults it (review 2026-09-18:
++        // the first form set it inside the tier block ~70 lines further down,
++        // after the prefill-path choice had already read it as false), and
++        // copied to the clone in clone() below (the executing impl).
++        {
++            const auto& native_cfg = node.as<moe_3gemm_fused_compressed>().get_primitive()->_config;
++            _cpu_native_gate_up = native_cfg.gate_up_weight_format;
++            _cpu_native_down = native_cfg.down_weight_format;
++            _native_tier_only = ov::op::internal::MOECompressed::is_native_format(_cpu_native_gate_up) ||
++                                ov::op::internal::MOECompressed::is_native_format(_cpu_native_down);
++        }
++        if (_native_tier_only) {
++            // arcint (patch 0043): the prefill GEMM paths read the affine u4
++            // form; a native format takes the batched GEMV path at every token
++            // count, where the tier computes every routed expert.
++            use_micro_gemm_prefill = false;
++            use_grouped_gemm_prefill = false;
++            batched_gemv_threshold = std::numeric_limits<size_t>::max();
++        }
+         GPU_DEBUG_TRACE_DETAIL << "[DEBUG] moe_3gemm_swiglu_opt_impl(): batched_gemv_threshold=" << batched_gemv_threshold << std::endl;
+ 
+         // Weight provider: select based on OTD configuration.
+@@ -1704,6 +1764,15 @@ public:
+         // default (config.get_moe_cpu_tier() defaults false), so an unpatched
+         // load, or a load that never set the property, is provably unaffected.
+         _cpu_tier = config.get_moe_cpu_tier();
++        {
++            const auto& nc = cur_moe->_config;
++            const bool native = ov::op::internal::MOECompressed::is_native_format(nc.gate_up_weight_format) ||
++                                ov::op::internal::MOECompressed::is_native_format(nc.down_weight_format);
++            OPENVINO_ASSERT(!native || (_cpu_tier && _weight_provider->is_offloaded()),
++                            "native expert formats (IQ4_NL / IQ3_XXS) need OFFLOAD_RATIO in (0, 100) and "
++                            "MOE_CPU_TIER=YES: every routed expert is computed on the CPU tier until the "
++                            "OpenCL decode exists (patch 0043)");
++        }
+         if (_cpu_tier && _weight_provider->is_offloaded()) {
+             static_cast<OffloadExpertWeightProvider*>(_weight_provider.get())->set_cpu_tier(true);
+             // arcint F2 (patch 0018). config.get_moe_cpu_tier_static_partition()
+@@ -1735,21 +1804,26 @@ public:
+                             "MOE_CPU_TIER supports f16 activations only (MOE_DTYPE=half); got ",
+                             params.get_input_layout(0).data_type);
+             const auto wdt = params.get_input_layout(static_cast<size_t>(MOE3GemmInputIndex::WEIGHT_0)).data_type;
++            // arcint (patch 0043): a native format's tensors are u4/u8/i8
++            // weights, f16 per-32 scales and a u8 (or the scale's f16)
++            // zero-point slot -- read by the tier's row decoders, never by the
++            // affine path. _native_tier_only and the two formats were read off
++            // the primitive at the top of this constructor.
+             // 4-bit only. The host kernels carry an 8-bit scalar path, but no
+             // T1 fixture exercises it (found in review); until one does, an
+             // 8-bit artifact is refused here rather than served on an
+             // untested numeric path.
+-            OPENVINO_ASSERT(wdt == ov::element::u4 || wdt == ov::element::i4,
++            OPENVINO_ASSERT(wdt == ov::element::u4 || wdt == ov::element::i4 ||
++                                (_native_tier_only && (wdt == ov::element::u8 || wdt == ov::element::i8)),
+                             "MOE_CPU_TIER supports 4-bit compressed expert weights only (u4/i4); got ",
+                             wdt);
+             _cpu_weight_bits = 4;
+             _cpu_weight_signed = (wdt == ov::element::i4);
+             const auto sdt = params.get_input_layout(static_cast<size_t>(MOE3GemmInputIndex::SCALE_0)).data_type;
+-            OPENVINO_ASSERT(sdt == ov::element::f16,
+-                            "MOE_CPU_TIER supports f16 expert scales only; got ", sdt);
++            OPENVINO_ASSERT(sdt == ov::element::f16, "MOE_CPU_TIER supports f16 expert scales only; got ", sdt);
+             if (cur_moe->_config.has_zp) {
+                 const auto zdt = params.get_input_layout(static_cast<size_t>(MOE3GemmInputIndex::ZP_0)).data_type;
+-                OPENVINO_ASSERT(zdt == ov::element::u4 || zdt == ov::element::u8,
++                OPENVINO_ASSERT(zdt == ov::element::u4 || zdt == ov::element::u8 || _native_tier_only,
+                                 "MOE_CPU_TIER supports u4/u8 expert zero points only; got ", zdt);
+                 _cpu_zp_is_u8 = (zdt == ov::element::u8);
+             } else {
+@@ -1780,6 +1854,8 @@ public:
+                 static_cast<OffloadExpertWeightProvider*>(_weight_provider.get())->set_per_expert_dispatch(true);
+             }
+ 
++            OPENVINO_ASSERT(!(_native_tier_only && _per_expert_dispatch),
++                            "native expert formats and per-expert dispatch are not combined (patch 0043)");
+             if (_per_expert_dispatch) {
+                 OPENVINO_ASSERT(wdt == ov::element::u4,
+                     "per-expert dispatch requires u4 weights; got ", wdt);
+@@ -2118,6 +2194,11 @@ public:
+         cur_moe->_cpu_zp_is_u8 = _cpu_zp_is_u8;
+         cur_moe->_cpu_gate_act = _cpu_gate_act;
+         cur_moe->_per_expert_dispatch = _per_expert_dispatch;
++        // arcint (patch 0043): the native format is configuration; without
++        // these three the executing impl runs affine (found in review).
++        cur_moe->_native_tier_only = _native_tier_only;
++        cur_moe->_cpu_native_gate_up = _cpu_native_gate_up;
++        cur_moe->_cpu_native_down = _cpu_native_down;
+         if (_cpu_tier)
+             cur_moe->_cpu_y_staging = moe_otd::StagingRing(_max_topk * 2);
+         return cur_moe;
+@@ -2392,6 +2473,8 @@ public:
+             bool needs_fallback = false;
+             on_before_batched_gemv(stream, instance, scratch, token_num, topk_count, needs_fallback);
+             if (needs_fallback) {
++                OPENVINO_ASSERT(!_native_tier_only,
++                                "native expert formats have no fused fallback: the lease failed (patch 0043)");
+                 // Cannot fit all experts simultaneously → fall back to per-expert onednn loop
+                 instance.output_memory_ptr(0)->fill(stream, 0u);
+                 return exec_prefill_onednn(events, stream, instance, scratch);
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.hpp
+index e527bdb485..f1a231ac34 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.hpp
+@@ -13,6 +13,7 @@
+ #include "moe_3gemm_base.hpp"
+ #include "program_node.h"
+ #include "registry/implementation_manager.hpp"
++#include "ov_ops/moe_compressed.hpp"
+ 
+ using namespace cldnn;  // TODO: Remove once namespaces are aligned
+ namespace ov::intel_gpu::ocl {
+@@ -64,7 +65,14 @@ struct moe_3gemm_swiglu_opt : public ImplementationManager {
+ 
+         // Only support zp: u4, i4, u8, i8 (skip check for symmetric quantization where ZP is element::dynamic placeholder)
+         const auto& config = std::static_pointer_cast<const moe_3gemm_fused_compressed>(node.get_primitive())->_config;
+-        if (config.has_zp) {
++        // arcint (patch 0043): under a native gate/up format the zero-point
++        // slot carries the u8 sign indices (IQ3_XXS) or the f16 scale again
++        // (IQ4_NL, Q8_0); the tier's row decoders read it, the affine type
++        // rule does not apply (measured 2026-09-18, GPU.1: an IQ4_XS layer's
++        // f16 slot left the primitive without an impl -- "No layout format
++        // available for moecompressed").
++        const bool native_gate_up = ov::op::internal::MOECompressed::is_native_format(config.gate_up_weight_format);
++        if (config.has_zp && !native_gate_up) {
+             static constexpr std::array supported_zp_type = {
+                 ov::element::u4,  // asym-quant type
+                 ov::element::i4,  // sym-quant type
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
+index 90b9f1de58..0a67576c61 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
+@@ -163,12 +163,133 @@ inline float scale_at(const QuantMatrix& m, int n, int g, int group_count) {
+     return f16_to_f32(m.s[idx]);
+ }
+ 
++// arcint (patch 0043). The native formats' tables, verbatim from llama.cpp's
++// ggml-common.h (pinned clone 56b9eb28, MIT): the IQ4_NL 16-entry value table,
++// the IQ2/IQ3 sign-mask table and its bit masks, the IQ3_XXS 256-entry grid
++// (four magnitudes per entry, the uint32's little-endian bytes).
++static const int8_t kIq4NlValues[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
++                                        1,    13,   25,  38,  53,  69,  89,  113};
++static const uint8_t kIq2xsMask[8] = {1, 2, 4, 8, 16, 32, 64, 128};
++static const uint8_t kIq2xsSigns[128] = {
++      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
++    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
++    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
++     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
++    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
++     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
++     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
++    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
++};
++static const uint32_t kIq3xxsGrid[256] = {
++    0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
++    0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14,
++    0x040c140c, 0x040c142c, 0x040c1c04, 0x040c1c14, 0x040c240c, 0x040c2c24, 0x040c3e04, 0x04140404,
++    0x04140414, 0x04140424, 0x04140c0c, 0x04141404, 0x04141414, 0x04141c0c, 0x04141c1c, 0x04141c3e,
++    0x04142c0c, 0x04142c3e, 0x04143e2c, 0x041c040c, 0x041c043e, 0x041c0c04, 0x041c0c14, 0x041c142c,
++    0x041c3e04, 0x04240c1c, 0x04241c3e, 0x04242424, 0x04242c3e, 0x04243e1c, 0x04243e2c, 0x042c040c,
++    0x042c043e, 0x042c1c14, 0x042c2c14, 0x04341c2c, 0x04343424, 0x043e0c04, 0x043e0c24, 0x043e0c34,
++    0x043e241c, 0x043e340c, 0x0c04040c, 0x0c04041c, 0x0c040c04, 0x0c040c14, 0x0c04140c, 0x0c04141c,
++    0x0c041c04, 0x0c041c14, 0x0c041c24, 0x0c04243e, 0x0c042c04, 0x0c0c0404, 0x0c0c0414, 0x0c0c0c0c,
++    0x0c0c1404, 0x0c0c1414, 0x0c14040c, 0x0c14041c, 0x0c140c04, 0x0c140c14, 0x0c14140c, 0x0c141c04,
++    0x0c143e14, 0x0c1c0404, 0x0c1c0414, 0x0c1c1404, 0x0c1c1c0c, 0x0c1c2434, 0x0c1c3434, 0x0c24040c,
++    0x0c24042c, 0x0c242c04, 0x0c2c1404, 0x0c2c1424, 0x0c2c2434, 0x0c2c3e0c, 0x0c34042c, 0x0c3e1414,
++    0x0c3e2404, 0x14040404, 0x14040414, 0x14040c0c, 0x14040c1c, 0x14041404, 0x14041414, 0x14041434,
++    0x14041c0c, 0x14042414, 0x140c040c, 0x140c041c, 0x140c042c, 0x140c0c04, 0x140c0c14, 0x140c140c,
++    0x140c1c04, 0x140c341c, 0x140c343e, 0x140c3e04, 0x14140404, 0x14140414, 0x14140c0c, 0x14140c3e,
++    0x14141404, 0x14141414, 0x14141c3e, 0x14142404, 0x14142c2c, 0x141c040c, 0x141c0c04, 0x141c0c24,
++    0x141c3e04, 0x141c3e24, 0x14241c2c, 0x14242c1c, 0x142c041c, 0x142c143e, 0x142c240c, 0x142c3e24,
++    0x143e040c, 0x143e041c, 0x143e0c34, 0x143e242c, 0x1c04040c, 0x1c040c04, 0x1c040c14, 0x1c04140c,
++    0x1c04141c, 0x1c042c04, 0x1c04342c, 0x1c043e14, 0x1c0c0404, 0x1c0c0414, 0x1c0c1404, 0x1c0c1c0c,
++    0x1c0c2424, 0x1c0c2434, 0x1c14040c, 0x1c14041c, 0x1c140c04, 0x1c14142c, 0x1c142c14, 0x1c143e14,
++    0x1c1c0c0c, 0x1c1c1c1c, 0x1c241c04, 0x1c24243e, 0x1c243e14, 0x1c2c0404, 0x1c2c0434, 0x1c2c1414,
++    0x1c2c2c2c, 0x1c340c24, 0x1c341c34, 0x1c34341c, 0x1c3e1c1c, 0x1c3e3404, 0x24040424, 0x24040c3e,
++    0x24041c2c, 0x24041c3e, 0x24042c1c, 0x24042c3e, 0x240c3e24, 0x24141404, 0x24141c3e, 0x24142404,
++    0x24143404, 0x24143434, 0x241c043e, 0x241c242c, 0x24240424, 0x24242c0c, 0x24243424, 0x242c142c,
++    0x242c241c, 0x242c3e04, 0x243e042c, 0x243e0c04, 0x243e0c14, 0x243e1c04, 0x2c040c14, 0x2c04240c,
++    0x2c043e04, 0x2c0c0404, 0x2c0c0434, 0x2c0c1434, 0x2c0c2c2c, 0x2c140c24, 0x2c141c14, 0x2c143e14,
++    0x2c1c0414, 0x2c1c2c1c, 0x2c240c04, 0x2c24141c, 0x2c24143e, 0x2c243e14, 0x2c2c0414, 0x2c2c1c0c,
++    0x2c342c04, 0x2c3e1424, 0x2c3e2414, 0x34041424, 0x34042424, 0x34042434, 0x34043424, 0x340c140c,
++    0x340c340c, 0x34140c3e, 0x34143424, 0x341c1c04, 0x341c1c34, 0x34242424, 0x342c042c, 0x342c2c14,
++    0x34341c1c, 0x343e041c, 0x343e140c, 0x3e04041c, 0x3e04042c, 0x3e04043e, 0x3e040c04, 0x3e041c14,
++    0x3e042c14, 0x3e0c1434, 0x3e0c2404, 0x3e140c14, 0x3e14242c, 0x3e142c14, 0x3e1c0404, 0x3e1c0c2c,
++    0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c, 0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04,
++};
++
++// arcint (patch 0043). Row n of a native-format matrix, decoded to f32 with
++// the block scale folded in: ic values into `out`. The layouts are the
++// per-role tensors of design-routing-aware-expert-execution 2.3c, one
++// 32-value block per group row: IQ4_NL codes u4 [oc, ic/32, 32] in linear
++// element order (even index low nibble, as the u4 packing everywhere here);
++// IQ3_XXS grid indices u8 [oc, ic/32, 8] (4 values each) and sign-mask
++// indices u8 [oc, ic/32, 4] (8 signs each); scales f32 [oc, ic/32].
++inline void decode_native_row(const QuantMatrix& m, int n, float* out) {
++    const int groups = m.ic / 32;
++    const uint16_t* s = m.s + static_cast<size_t>(n) * static_cast<size_t>(groups);   // f16 per 32
++    if (m.format == kQuantFormatIq4Nl) {
++        const uint8_t* row = m.w + static_cast<size_t>(n) * (static_cast<size_t>(m.ic) / 2u);
++        for (int g = 0; g < groups; g++) {
++            const float d = f16_to_f32(s[g]);
++            for (int j = 0; j < 32; j++) {
++                const int k = g * 32 + j;
++                const uint8_t byte = row[k >> 1];
++                const int code = (k & 1) ? (byte >> 4) : (byte & 0x0F);
++                out[k] = d * static_cast<float>(kIq4NlValues[code]);
++            }
++        }
++        return;
++    }
++    if (m.format == kQuantFormatQ8_0) {
++        const int8_t* row = reinterpret_cast<const int8_t*>(m.w) + static_cast<size_t>(n) * static_cast<size_t>(m.ic);
++        for (int g = 0; g < groups; g++) {
++            const float d = f16_to_f32(s[g]);
++            for (int j = 0; j < 32; j++) {
++                out[g * 32 + j] = d * static_cast<float>(row[g * 32 + j]);
++            }
++        }
++        return;
++    }
++    // IQ3_XXS
++    const uint8_t* gridix = m.w + static_cast<size_t>(n) * static_cast<size_t>(groups) * 8u;
++    const uint8_t* signix = m.z + static_cast<size_t>(n) * static_cast<size_t>(groups) * 4u;
++    for (int g = 0; g < groups; g++) {
++        const float d = f16_to_f32(s[g]);
++        for (int l = 0; l < 4; l++) {                 // 8 values per sign index
++            const uint8_t signs = kIq2xsSigns[signix[g * 4 + l] & 127];
++            uint8_t g1[4], g2[4];
++            std::memcpy(g1, &kIq3xxsGrid[gridix[g * 8 + 2 * l + 0]], 4);
++            std::memcpy(g2, &kIq3xxsGrid[gridix[g * 8 + 2 * l + 1]], 4);
++            float* y = out + g * 32 + l * 8;
++            for (int j = 0; j < 4; j++) {
++                y[j]     = d * static_cast<float>(g1[j]) * ((signs & kIq2xsMask[j]) ? -1.0f : 1.0f);
++                y[j + 4] = d * static_cast<float>(g2[j]) * ((signs & kIq2xsMask[j + 4]) ? -1.0f : 1.0f);
++            }
++        }
++    }
++}
++
+ // acc[n] for n in [n_begin, n_end) = sum_g s[n,g]*(dot(x, q(n, group g)) - Sx[g]*z[n,g]).
+ // Plain scalar, f32 accumulation throughout, no intrinsics, no xe/xo split --
+ // it indexes x[k] directly and derives the nibble from k&1, so it exercises
+ // the packing rule independently of the AVX2 kernel's interpretation of it
+ // (that independence is what makes T1's nibble-flip red case meaningful).
++}  // namespace (arcint patch 0043: compute_stage_f32 is linkable for the unit cells)
++
+ void compute_stage_f32(const QuantMatrix& mat, const float* x, int n_begin, int n_end, float* acc_out) {
++    if (mat.format != kQuantFormatU4Affine) {
++        // arcint (patch 0043): a native format decodes the row (scale folded
++        // in) and takes a plain f32 dot; the affine group algebra below does
++        // not apply. Bandwidth-bound like the rest of the tier.
++        std::vector<float> wrow(static_cast<size_t>(mat.ic));
++        for (int n = n_begin; n < n_end; n++) {
++            decode_native_row(mat, n, wrow.data());
++            float acc = 0.0f;
++            for (int k = 0; k < mat.ic; k++) {
++                acc += x[k] * wrow[static_cast<size_t>(k)];
++            }
++            acc_out[n - n_begin] = acc;
++        }
++        return;
++    }
+     const int group_count = mat.ic / mat.group_size;
+     std::vector<float> sx(static_cast<size_t>(group_count), 0.0f);
+     for (int g = 0; g < group_count; g++) {
+@@ -200,6 +321,8 @@ void compute_stage_f32(const QuantMatrix& mat, const float* x, int n_begin, int
+     }
+ }
+ 
++namespace {
++
+ }  // namespace
+ 
+ void moe_cpu_expert_ref(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, int col_begin, int col_end) {
+@@ -351,7 +474,9 @@ void moe_cpu_expert(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, i
+     // say, 96 would start mid-block and pair lanes with the wrong elements
+     // (found in review); such shapes take the scalar reference instead.
+     auto avx2_ok = [](const QuantMatrix& m) {
+-        return m.group_size < 64 || m.group_size % 64 == 0;
++        // arcint (patch 0043): the native formats take the scalar reference
++        // (row decode + dot) until the AVX2 kernel learns them.
++        return m.format == kQuantFormatU4Affine && (m.group_size < 64 || m.group_size % 64 == 0);
+     };
+     if (have_avx2 && avx2_ok(e.gate) && avx2_ok(e.up) && avx2_ok(e.down)) {
+         moe_cpu_expert_avx2(e, jobs, n_jobs, col_begin, col_end);
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
+index bb67d9c95a..d4fb56199c 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
+@@ -45,8 +45,28 @@ struct QuantMatrix {
+     bool weight_signed = false;
+     bool has_zp = true;
+     bool zp_is_u8 = false;
++    // arcint (patch 0043, campaign sub4bit-vram-kernel). The checkpoint's own
++    // expert formats, re-laid per role (design-routing-aware-expert-execution
++    // 2.3a-2.3c): 0 = the affine form above; 1 = IQ4_NL (w = u4 codes in
++    // linear element order, s = f16 d per 32 values, z unused); 2 = IQ3_XXS
++    // (w = u8 grid indices, 8 per 32 values; z = u8 sign-mask indices, 4 per
++    // 32 values; s = f16 d*(0.5+s)*0.5 per 32 values); 3 = Q8_0 (w = i8
++    // codes in linear element order, s = f16 d per 32 values, z unused).
++    // IQ4_XS arrives in the IQ4_NL layout (its sub-block scales folded into
++    // s by the exporter). The scale is f16 like the affine form's (an f32
++    // scale Constant is wrapped by the plugin's precision pass and refused by
++    // the op translation). Decoded row by row
++    // in compute_stage_f32 (moe_cpu_expert.cpp) from the same tables llama.cpp
++    // uses (ggml-common.h), the transcription pinned in arcint's
++    // src/core/gguf_dequant.cpp against gguf-py on the real shards.
++    int format = 0;
+ };
+ 
++constexpr int kQuantFormatU4Affine = 0;
++constexpr int kQuantFormatIq4Nl = 1;
++constexpr int kQuantFormatIq3Xxs = 2;
++constexpr int kQuantFormatQ8_0 = 3;
++
+ enum class GateAct { Silu, GeluTanh, GeluErf };   // mirrors MOE_GATE_ACT, mlp.cl:46-65
+ 
+ struct ExpertDesc {
+@@ -98,6 +118,12 @@ void moe_cpu_expert_ref_gpu_emul(const ExpertDesc& e,
+ // Runtime dispatch: avx2 when the build has it AND ov::with_cpu_x86_avx2(), else ref.
+ void moe_cpu_expert(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, int col_begin, int col_end);
+ 
++// arcint (patch 0043). One projection stage of the plain-scalar reference:
++// acc_out[n - n_begin] = dot(x, row n of mat) for n in [n_begin, n_end),
++// through the affine algebra or the native row decoders by mat.format.
++// Declared for the unit cells that pin the decoders to hand-built blocks.
++void compute_stage_f32(const QuantMatrix& mat, const float* x, int n_begin, int n_end, float* acc_out);
++
+ // arcint M14 (patches/0012 wires this up; declared here so T1 can exercise it
+ // standalone). Plain std::thread + condvar pool, independent of whatever
+ // executor the plugin's streams use -- it runs *inside* an infer request
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+index d6edc9794a..dc15bdceb7 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+@@ -12,6 +12,7 @@
+ #include <limits>
+ 
+ #include "intel_gpu/runtime/debug_configuration.hpp"
++#include "ov_ops/moe_compressed.hpp"
+ 
+ namespace ov::intel_gpu::ocl::moe_otd {
+ 
+@@ -127,6 +128,19 @@ void maybe_transpose_scale_zp(const cldnn::MOECompressed::Config& config,
+     }
+ 
+     const bool is_down = (offset_pos % 3 == 2);
++    // arcint (patch 0043): under a native expert format the zero-point slot
++    // carries the IQ3_XXS sign indices (4 bytes per 32-value group) or the
++    // scale again (IQ4_NL, Q8_0); only the CPU tier reads it, from the file,
++    // in the exporter's [oc, groups, k] order. The device copy is never read
++    // by a kernel, so it is neither size-checked nor transposed here
++    // (measured 2026-09-18, GPU.1: "Unexpected zp payload size for
++    // offset_pos=6, expected=4096, got=16384" on an IQ3_XXS gate).
++    if (is_zp) {
++        const size_t fmt = is_down ? config.down_weight_format : config.gate_up_weight_format;
++        if (ov::op::internal::MOECompressed::is_native_format(fmt)) {
++            return;
++        }
++    }
+     size_t oc = 0;
+     size_t ic = 0;
+     if (is_down) {
+diff --git a/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp b/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
+index cc64807cff..6dd5367d6b 100644
+--- a/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
++++ b/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
+@@ -667,6 +667,8 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
+                 // oneDNN, which requires an in-order OCL queue.  If oneDNN is
+                 // disabled (e.g. via OV_GPU_USE_ONEDNN=0 on an IMMAD GPU), the
+                 // queue stays out-of-order and the oneDNN stream creation may assert.
++                // arcint (patch 0043): native expert formats, straight to MOECompressed
++                manager.register_pass<ov::pass::ConvertTiledMoeBlockNativeToMoeCompressed>(has_batch_dim);
+                 manager.register_pass<ov::pass::MoeOpFusion>(has_batch_dim);
+                 manager.register_pass<ov::intel_gpu::FuseMoERouterScale>();
+                 manager.register_pass<ov::intel_gpu::FuseMOESharedExpert>();
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
+index 9fc3f9df14..2b0b09f2bb 100644
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
+@@ -464,3 +464,94 @@ TEST(moe_cpu_expert, gpu_emul_prediction_is_finite_and_recorded) {
+         EXPECT_GT(max_err, 0.0) << "shape=" << cfg.card << " -- a zero diff means the half-accumulation emulation is a no-op";
+     }
+ }
++
++// arcint (patch 0043, campaign sub4bit-vram-kernel). The native row decoders,
++// pinned to hand-built blocks whose expected values follow from the format's
++// definition (ggml-quants.c), not from the code under test; the same three
++// blocks the exporter's python cells use (tests/python/test_native_blocks.py
++// in arcint). Read through compute_stage_f32 with unit vectors, so the value
++// at every k is the decoder's, not a summed one. Red first: with
++// mat.format left at the affine 0 the same bytes decode to other numbers.
++namespace {
++using ov::intel_gpu::ocl::moe::compute_stage_f32;
++using ov::intel_gpu::ocl::moe::kQuantFormatIq3Xxs;
++using ov::intel_gpu::ocl::moe::kQuantFormatIq4Nl;
++using ov::intel_gpu::ocl::moe::kQuantFormatQ8_0;
++
++std::vector<float> decode_row_through_stage(const QuantMatrix& m) {
++    std::vector<float> out(static_cast<size_t>(m.ic)), x(static_cast<size_t>(m.ic), 0.0f);
++    for (int k = 0; k < m.ic; k++) {
++        x[static_cast<size_t>(k)] = 1.0f;
++        float acc = 0.0f;
++        compute_stage_f32(m, x.data(), 0, 1, &acc);
++        out[static_cast<size_t>(k)] = acc;
++        x[static_cast<size_t>(k)] = 0.0f;
++    }
++    return out;
++}
++
++QuantMatrix native_matrix(int format, int ic, const uint8_t* w, const uint8_t* z, const uint16_t* s) {
++    QuantMatrix m;
++    m.w = w; m.z = z; m.s = s;
++    m.oc = 1; m.ic = ic; m.group_size = 32;
++    m.weight_bits = 4; m.weight_signed = false; m.has_zp = (z != nullptr); m.zp_is_u8 = true;
++    m.format = format;
++    return m;
++}
++}  // namespace
++
++TEST(moe_cpu_expert_native, iq4_nl_row_decodes_through_the_16_entry_table) {
++    // two 32-value blocks of codes in LINEAR element order (the exporter's
++    // split re-lays the GGUF block's nibbles, native_blocks.iq4_nl_split, and
++    // pack_u4 packs element k into byte k/2, even index low): y[j] = T[j],
++    // y[j+16] = T[15-j]; d = 1.0 then 0.5. (The first form of this cell built
++    // the GGUF's own nibble layout and failed against the correct decoder.)
++    static const int8_t T[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
++    uint8_t codes[64];
++    for (int b = 0; b < 2; b++)
++        for (int j = 0; j < 16; j++) {
++            codes[b * 32 + j] = static_cast<uint8_t>(j);
++            codes[b * 32 + 16 + j] = static_cast<uint8_t>(15 - j);
++        }
++    uint8_t w[32];
++    for (int m = 0; m < 32; m++) w[m] = static_cast<uint8_t>(codes[2 * m] | (codes[2 * m + 1] << 4));
++    const uint16_t s[2] = {f32_to_f16_bits(1.0f), f32_to_f16_bits(0.5f)};
++    const auto y = decode_row_through_stage(native_matrix(kQuantFormatIq4Nl, 64, w, nullptr, s));
++    for (int j = 0; j < 16; j++) {
++        EXPECT_EQ(y[j], static_cast<float>(T[j]));
++        EXPECT_EQ(y[16 + j], static_cast<float>(T[15 - j]));
++        EXPECT_EQ(y[32 + j], 0.5f * static_cast<float>(T[j]));
++        EXPECT_EQ(y[48 + j], 0.5f * static_cast<float>(T[15 - j]));
++    }
++    // the affine reading of the same bytes is a different row (the cell can fail)
++    const auto affine = decode_row_through_stage(native_matrix(0, 64, w, nullptr, s));
++    EXPECT_NE(affine[0], y[0]);
++}
++
++TEST(moe_cpu_expert_native, q8_0_row_decodes_as_d_times_q) {
++    int8_t q[64];
++    for (int j = 0; j < 64; j++) q[j] = static_cast<int8_t>((j % 32) - 16);
++    const uint16_t s[2] = {f32_to_f16_bits(0.5f), f32_to_f16_bits(-2.0f)};
++    const auto y = decode_row_through_stage(
++        native_matrix(kQuantFormatQ8_0, 64, reinterpret_cast<const uint8_t*>(q), nullptr, s));
++    for (int j = 0; j < 32; j++) {
++        EXPECT_EQ(y[j], 0.5f * static_cast<float>(j - 16));
++        EXPECT_EQ(y[32 + j], -2.0f * static_cast<float>(j - 16));
++    }
++}
++
++TEST(moe_cpu_expert_native, iq3_xxs_row_decodes_through_the_grid_and_the_sign_masks) {
++    // one 32-value sub-block: grid index pair (1, 0) for the first 8 values
++    // (grid[1] = 0x04040414 -> magnitudes 20,4,4,4; grid[0] -> 4,4,4,4), sign
++    // index 5 (= 0b101: values 0 and 2 negative), scale d*(0.5+3)*0.5 = 1.75
++    // -> [-35, 7, -7, 7, 7, 7, 7, 7]; the remaining 24 values grid 0, sign 0
++    // -> 7. A second sub-block at scale 0.25 (s = 0) -> 1.0 everywhere.
++    uint8_t gridix[16] = {0}; gridix[0] = 1;
++    uint8_t signix[8] = {0}; signix[0] = 5;
++    const uint16_t s[2] = {f32_to_f16_bits(1.75f), f32_to_f16_bits(0.25f)};
++    const auto y = decode_row_through_stage(native_matrix(kQuantFormatIq3Xxs, 64, gridix, signix, s));
++    const float want[8] = {-35, 7, -7, 7, 7, 7, 7, 7};
++    for (int j = 0; j < 8; j++) EXPECT_EQ(y[j], want[j]);
++    for (int j = 8; j < 32; j++) EXPECT_EQ(y[j], 7.0f);
++    for (int j = 32; j < 64; j++) EXPECT_EQ(y[j], 1.0f);
++}

@@ -120,13 +120,44 @@ def _causal_conv_silu(x, conv_w, T, conv_dim, K):
     return _silu(acc)
 
 
-def _repeat_interleave_heads(x, T, n_heads, dim, r):
-    """[1,T,n_heads,dim] -> [1,T,n_heads*r,dim], each head repeated r times."""
+def _key_head_map(config):
+    """HOW the HK key heads serve the HV value heads (HV = r * HK):
+    `interleave` -- value head h reads key head h // r (the pin's
+    `repeat_interleave`, pin line 583; HF's qwen3_5 files alike); `tiled` --
+    value head h reads key head h % HK (llama.cpp's qwen35 / qwen4exp:
+    `ggml_repeat_4d` on the non-fused path and the fused GATED_DELTA_NET op
+    alike). The shipped Flash-Next GGUF computes the model TILED: measured
+    2026-09-18 on the dev host against llama.cpp's whole tensors (France ids,
+    layer 0) -- interleaved, 4 of 48 core heads agree (exactly the heads where
+    h // 3 == h % 16) and no permutation of the pin's heads matches the rest;
+    tiled, 48 of 48 agree at token 0 and the layer's output lands at corr
+    0.9999 (campaign serving-shape-logits). Whether HF's order or a converter
+    permutation of the value side explains the difference is unverified and
+    moot for a fill that reads the GGUF. The real geometry says `tiled`
+    (piecewise_export.REAL_GEOMETRY); the tiny parity configs keep the pin's
+    `interleave`."""
+    mode = getattr(config, "gdn_key_head_map", None) or "interleave"
+    if mode not in ("interleave", "tiled"):
+        raise ValueError(f"unsupported gdn_key_head_map {mode!r} (interleave or tiled)")
+    return mode
+
+
+def _expand_heads(x, T, n_heads, dim, r, mode="interleave"):
+    """[1,T,n_heads,dim] -> [1,T,n_heads*r,dim]. `interleave`: each head
+    repeated r times in place (head h*r+j <- h); `tiled`: the block of heads
+    repeated r times (head c*n_heads+h <- h)."""
     if r == 1:
         return x
+    if mode == "tiled":
+        return op.concat([x] * r, axis=2)                   # [1,T,r*n_heads,dim]
     x5 = _reshape(x, [1, T, n_heads, 1, dim])
     xr = op.concat([x5] * r, axis=3)  # [1,T,n_heads,r,dim]
     return _reshape(xr, [1, T, n_heads * r, dim])
+
+
+def _repeat_interleave_heads(x, T, n_heads, dim, r):
+    """Kept for callers of the old name: the pin's interleave."""
+    return _expand_heads(x, T, n_heads, dim, r, "interleave")
 
 
 def _l2norm_last(x, last_axis):
@@ -268,11 +299,26 @@ def _ut_inverse(ut_orig, chunk, lead):
     return _add(acc, eye)                   # pin 365
 
 
-def _rmsnorm_gated(core, z, weight_vec, eps, last_axis):
-    """Qwen4ExpTextRMSNormGated over the last axis (reference lines 31-47)."""
+def _gate_activation(config):
+    """The output gate's activation, the pin's rule (`output_gate_type or
+    hidden_act`). The shipped Flash-Next checkpoint gates with a SIGMOID --
+    llama.cpp hard-codes it for the architecture (qwen4exp.cpp: "sigmoid
+    output gate, not silu") and the GGUF carries no key for it; the pin's
+    default is hidden_act = silu, which is what every artifact before
+    2026-09-18 was exported with (campaign serving-shape-logits)."""
+    act = getattr(config, "output_gate_type", None) or config.hidden_act
+    if act not in ("sigmoid", "silu"):
+        raise ValueError(f"unsupported GDN output gate activation {act!r} "
+                         "(sigmoid or silu)")
+    return act
+
+
+def _rmsnorm_gated(core, z, weight_vec, eps, last_axis, gate_act="silu"):
+    """Qwen4ExpTextRMSNormGated over the last axis (reference lines 31-47):
+    norm, weight, then the gate `ACT2FN[activation](z)`."""
     h = _mul(core, _rsqrt_eps(_rmean(_mul(core, core), last_axis), eps))
     h = _mul(_c(weight_vec.reshape([1] * last_axis + [-1])), h)
-    return _mul(h, _silu(z))
+    return _mul(h, op.sigmoid(z) if gate_act == "sigmoid" else _silu(z))
 
 
 # --- top-level emitter -----------------------------------------------------
@@ -350,8 +396,9 @@ def _gdn_subgraph(hidden, amask, config, state, T, ut_mode=None,
     )                                                     # [1,T,HV]
 
     if ratio > 1:
-        query = _repeat_interleave_heads(query, T, HK, Dk, ratio)
-        key = _repeat_interleave_heads(key, T, HK, Dk, ratio)
+        khm = _key_head_map(config)
+        query = _expand_heads(query, T, HK, Dk, ratio, khm)
+        key = _expand_heads(key, T, HK, Dk, ratio, khm)
 
     # ---- chunked gated delta rule (transpose to [1,HV,T,*]) ----
     q = _transpose(query, [0, 2, 1, 3])                   # [1,HV,T,Dk]
@@ -377,7 +424,8 @@ def _gdn_subgraph(hidden, amask, config, state, T, ut_mode=None,
         with the same operands, and the node-count assertions in
         `test_the_chunk_emission_modes_agree_on_cpu_and_differ_in_node_count`
         would move if they were not."""
-        normed = _rmsnorm_gated(core_bthd, z, w("norm.weight"), eps, 3)
+        normed = _rmsnorm_gated(core_bthd, z, w("norm.weight"), eps, 3,
+                                _gate_activation(config))
         return _mm(_reshape(normed, [1, T, value_dim]),
                    _c(w("out_proj.weight")), tb=True)      # [1,T,H]
 

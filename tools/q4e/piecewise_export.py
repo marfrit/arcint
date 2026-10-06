@@ -92,6 +92,10 @@ shapes:
     q4e/attention.py. The emission MATH is separately floored against the pin
     with its indexer stubbed to an all-zero additive mask -- not against a
     hand-written reference, which is what shared the emitter's misreading.
+    [DATED 2026-09-28: the 2.385560e-02 above was drawn at 692c0a6 with the
+    (1 + w) fold applied twice to the q/k gammas; with the feed's gamma1 the
+    pin reads 5.082879e-05 over 1/2052 and 1.064551e-03 over 29/2080 rows.
+    The above-2051 bar built on it is withdrawn.]
   * moe_*: router gate equality with the pin's `router_gate` on fed real
     tensors (tests/python/test_moe_block.py, which also gates dense==sparse for
     the FULL graph). **THE CHUNK LEG HAS NO HOME AS OF 2026-09-12**: the only
@@ -151,6 +155,12 @@ REAL_GEOMETRY = {
     "ple_conv_kernel_size": 4, "ngram_size": 3, "heads_per_ngram": 8,
     "ngram_vocab_size_base": 20_000_000, "make_ngram_vocab_size_divisible_by": 128,
     "eos_token_id": 248044,
+    # the GDN's output gate: SIGMOID for this checkpoint (llama.cpp hard-codes
+    # it for qwen4exp; the GGUF carries no key; the pin's default is silu)
+    "output_gate_type": "sigmoid",
+    # the GDN's key-head pairing: value head h <- key head h % 16, as llama.cpp
+    # computes this GGUF (measured against its whole tensors; q4e.gdn._key_head_map)
+    "gdn_key_head_map": "tiled",
     # full-attention / sparse: 12 QSA layers at layer_idx % 4 == 3, from
     # `qwen4exp.attention.compress_ratios` = 4 at exactly blk 3,7,...,47.
     # The indexer: `qwen4exp.attention.indexer.head_count` = 4 QUERY heads
@@ -186,7 +196,7 @@ def real_config(transformers_config_cls=None):
         "qwen_sparse_attention" if i % 4 == 3 else "linear_attention"
         for i in range(g["num_hidden_layers"])
     ]
-    return transformers_config_cls(
+    cfg = transformers_config_cls(
         vocab_size=g["vocab_size"],
         hidden_size=g["hidden_size"],
         num_hidden_layers=g["num_hidden_layers"],
@@ -220,6 +230,7 @@ def real_config(transformers_config_cls=None):
         indexer_budget=g["indexer_budget"],
         indexer_compress_ratio=g["indexer_compress_ratio"],
         layer_types=layer_types,
+        output_gate_type=g["output_gate_type"],
         tie_word_embeddings=g["tie_word_embeddings"],
         rope_parameters={
             "rope_type": "default",
@@ -228,6 +239,8 @@ def real_config(transformers_config_cls=None):
             "mrope_section": g["mrope_section"],
         },
     )
+    cfg.gdn_key_head_map = g["gdn_key_head_map"]   # not a pin field; the emitter reads it
+    return cfg
 
 
 # ---------------------------------------------------------------------------

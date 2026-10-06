@@ -5,7 +5,7 @@
 namespace lgc {
 
 bool SamplerOverrides::any() const {
-    return temperature || top_p || top_k || repetition_penalty || presence_penalty ||
+    return temperature || top_p || top_k || min_p || repetition_penalty || presence_penalty ||
            frequency_penalty || seed || max_tokens || ignore_eos || stop || stop_token_ids;
 }
 
@@ -14,6 +14,7 @@ SamplerParams sampler_from_defaults(const SamplerDefaults& d) {
     p.temperature        = d.temperature;
     p.top_p              = d.top_p;
     p.top_k              = d.top_k;
+    p.min_p              = d.min_p;
     p.repetition_penalty = d.repetition_penalty;
     p.presence_penalty   = d.presence_penalty;
     return p;
@@ -32,6 +33,9 @@ std::optional<std::string> sampler_validate(const SamplerOverrides& o) {
     }
     if (o.top_k && *o.top_k < 0) {
         return log::format("top_k must be >= 0 (0 disables), got %d", *o.top_k);
+    }
+    if (o.min_p && (*o.min_p < 0.0f || *o.min_p > 1.0f)) {
+        return log::format("min_p must be in [0, 1] (0 disables), got %g", *o.min_p);
     }
     if (o.repetition_penalty && *o.repetition_penalty <= 0.0f) {
         return log::format("repetition_penalty must be > 0, got %g", *o.repetition_penalty);
@@ -58,6 +62,7 @@ std::optional<std::string> sampler_apply(SamplerParams& p, const SamplerOverride
     if (o.temperature)        p.temperature        = *o.temperature;
     if (o.top_p)              p.top_p              = *o.top_p;
     if (o.top_k)              p.top_k              = *o.top_k;
+    if (o.min_p)              p.min_p              = *o.min_p;
     if (o.repetition_penalty) p.repetition_penalty = *o.repetition_penalty;
     if (o.presence_penalty)   p.presence_penalty   = *o.presence_penalty;
     if (o.frequency_penalty)  p.frequency_penalty  = *o.frequency_penalty;
@@ -79,9 +84,10 @@ std::optional<std::string> sampler_defaults_apply(SamplerDefaults& d, const Samp
     if (o.temperature)        d.temperature        = *o.temperature;
     if (o.top_p)              d.top_p              = *o.top_p;
     if (o.top_k)              d.top_k              = *o.top_k;
+    if (o.min_p)              d.min_p              = *o.min_p;
     if (o.repetition_penalty) d.repetition_penalty = *o.repetition_penalty;
     if (o.presence_penalty)   d.presence_penalty   = *o.presence_penalty;
-    if (o.temperature || o.top_p || o.top_k || o.repetition_penalty || o.presence_penalty) {
+    if (o.temperature || o.top_p || o.top_k || o.min_p || o.repetition_penalty || o.presence_penalty) {
         d.provenance = "operator";
     }
     return std::nullopt;

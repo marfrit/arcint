@@ -44,6 +44,7 @@ struct SamplerDefaults {
     float temperature        = 0.7f;
     float top_p              = 0.8f;
     int   top_k              = 20;
+    float min_p              = 0.0f;
     float repetition_penalty = 1.05f;
     float presence_penalty   = 0.0f;
 
@@ -120,9 +121,16 @@ struct ArtifactInfo {
     int         n_layer      = 0;
     int         n_gdn_layer  = 0;
     int         n_attn_layer = 0;
+    // Of `n_attn_layer`, how many are QSA-served (serving-shape.json `qsa`);
+    // zero for a dense-causal or pre-QSA artifact. `qsa` is the manifest flag
+    // itself, so a reader can tell "declared QSA" from "not declared" even at
+    // depth 0.
+    int         n_qsa_layer  = 0;
+    bool        qsa          = false;
     std::string arch_hash;
     std::string template_hash;
     std::string tokenizer_hash;
+    uint64_t    weights_bytes = 0;  // the .bin bytes the load charged (segment SUM)
     bool        has_mtp_head = false;
 };
 

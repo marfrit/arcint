@@ -1,0 +1,281 @@
+# Per-expert dispatch, native formats: every (token, expert) pair of a call in
+# ONE launch per stage (a small pairs table read by the batched kernels)
+# instead of two launches per pair -- 16,384 per MoE layer for a 1,024-token
+# chunk. Each pair runs the per-pair body: the output bytes are the same.
+# MOE_PER_PAIR_DISPATCH=1 restores the per-pair launches.
+#
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
+@@ -1298,8 +1298,10 @@
+ // scale is read from the device-transposed [groups, oc] array.
+ // ===========================================================================
+ #ifdef NATIVE_GATE_UP_ENABLE
+-__attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE)))
+-KERNEL(expert_gate_up_native)(
++// arcint (patch 0059): the body of one (token, expert) pair, shared by the
++// per-pair kernel and the batched one; FUNC() names it per compiled source
++// (the kernel cache batches several sources, whose native formats differ).
++inline void FUNC(expert_gate_up_native_body)(
+     const __global MOE_WEI_DT*   gate_weight,
+     const __global MOE_SCALE_DT* gate_scale,
+     const __global MOE_ZP_DT*    gate_zp,
+@@ -1310,10 +1312,10 @@
+     __global MOE_DTYPE*          y,
+     int slot_index,
+     int x_base_elem,
+-    int y_base_elem)
++    int y_base_elem,
++    int token_idx)
+ {
+     const int id_local = get_sub_group_local_id();
+-    const int token_idx = get_global_id(0);
+     const int n_start = get_global_id(2) * N_BLOCK;
+ 
+     // per-expert strides of the native slots (bytes; the slot fill writes one
+@@ -1400,11 +1402,59 @@
+         }
+     }
+ }
++
++// KERNEL() names the generator's own entry point, so a source carries exactly
++// one of the two entries: NATIVE_BATCHED selects the batched one (patch 0059).
++#ifndef NATIVE_BATCHED
++__attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE)))
++KERNEL(expert_gate_up_native)(
++    const __global MOE_WEI_DT*   gate_weight,
++    const __global MOE_SCALE_DT* gate_scale,
++    const __global MOE_ZP_DT*    gate_zp,
++    const __global MOE_WEI_DT*   up_weight,
++    const __global MOE_SCALE_DT* up_scale,
++    const __global MOE_ZP_DT*    up_zp,
++    const __global MOE_DTYPE*    x,
++    __global MOE_DTYPE*          y,
++    int slot_index,
++    int x_base_elem,
++    int y_base_elem)
++{
++    FUNC_CALL(expert_gate_up_native_body)(gate_weight, gate_scale, gate_zp, up_weight, up_scale, up_zp, x, y, slot_index, x_base_elem, y_base_elem,
++                                          get_global_id(0));
++}
++
++#else
++// arcint (patch 0059): every (token, expert) pair of a call in ONE launch.
++// Work-group row p reads its pair from `pairs` (slot, flat id, top-k
++// position, 3 ints a pair); the per-pair arithmetic is the body above, so a
++// pair computes exactly what the per-pair launch computed. The per-pair form
++// cost two launches a pair -- 16,384 per MoE layer for a 1,024-token chunk.
++__attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE)))
++KERNEL(expert_gate_up_native_batched)(
++    const __global MOE_WEI_DT*   gate_weight,
++    const __global MOE_SCALE_DT* gate_scale,
++    const __global MOE_ZP_DT*    gate_zp,
++    const __global MOE_WEI_DT*   up_weight,
++    const __global MOE_SCALE_DT* up_scale,
++    const __global MOE_ZP_DT*    up_zp,
++    const __global MOE_DTYPE*    x,
++    const __global int*          pairs,     // an INPUT: bound before the output
++    __global MOE_DTYPE*          y,
++    int experts_per_token)
++{
++    const int p = get_global_id(0);
++    const int slot = pairs[3 * p];
++    const int flat = pairs[3 * p + 1];
++    FUNC_CALL(expert_gate_up_native_body)(gate_weight, gate_scale, gate_zp, up_weight, up_scale, up_zp, x, y, slot,
++                                          (flat / experts_per_token) * HIDDEN_SIZE,
++                                          flat * INTERMEDIATE_SIZE, 0);
++}
++#endif  // NATIVE_BATCHED
+ #endif  // NATIVE_GATE_UP_ENABLE
+ 
+ #ifdef NATIVE_DOWN_ENABLE
+-__attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE)))
+-KERNEL(expert_down_native)(
++inline void FUNC(expert_down_native_body)(
+     const __global MOE_WEI_DT*   weight,
+     const __global MOE_SCALE_DT* scales,
+     const __global MOE_ZP_DT*    zps,
+@@ -1414,10 +1464,10 @@
+     int slot_index,
+     int x_base_elem,
+     int rw_base_elem,
+-    int y_base_elem)
++    int y_base_elem,
++    int token_idx)
+ {
+     const int id_local = get_sub_group_local_id();
+-    const int token_idx = get_global_id(0);
+     const int n_start = get_global_id(2) * N_BLOCK;
+     const half routing_weight_val = routing_weights[rw_base_elem + token_idx];
+ 
+@@ -1486,4 +1536,46 @@
+         }
+     }
+ }
++
++#ifndef NATIVE_BATCHED
++__attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE)))
++KERNEL(expert_down_native)(
++    const __global MOE_WEI_DT*   weight,
++    const __global MOE_SCALE_DT* scales,
++    const __global MOE_ZP_DT*    zps,
++    const __global MOE_DTYPE*    x,
++    const __global half*         routing_weights,
++    __global MOE_DTYPE*          y,
++    int slot_index,
++    int x_base_elem,
++    int rw_base_elem,
++    int y_base_elem)
++{
++    FUNC_CALL(expert_down_native_body)(weight, scales, zps, x, routing_weights, y, slot_index, x_base_elem, rw_base_elem,
++                                       y_base_elem, get_global_id(0));
++}
++
++#else
++// arcint (patch 0059): the batched down, as the batched gate/up above.
++__attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE)))
++KERNEL(expert_down_native_batched)(
++    const __global MOE_WEI_DT*   weight,
++    const __global MOE_SCALE_DT* scales,
++    const __global MOE_ZP_DT*    zps,
++    const __global MOE_DTYPE*    x,
++    const __global half*         routing_weights,
++    const __global int*          pairs,     // an INPUT: bound before the output
++    __global MOE_DTYPE*          y,
++    int experts_per_token,
++    int max_topk)
++{
++    const int p = get_global_id(0);
++    const int slot = pairs[3 * p];
++    const int flat = pairs[3 * p + 1];
++    const int topk_pos = pairs[3 * p + 2];
++    const int token = flat / experts_per_token;
++    FUNC_CALL(expert_down_native_body)(weight, scales, zps, x, routing_weights, y, slot, flat * INTERMEDIATE_SIZE,
++                                       token * max_topk + topk_pos, flat * HIDDEN_SIZE, 0);
++}
++#endif  // NATIVE_BATCHED
+ #endif  // NATIVE_DOWN_ENABLE
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -592,14 +592,19 @@
+ // decoded in the K-loop. The kernels are compiled only when per-expert
+ // dispatch is on and the config carries a native weight format.
+ class MoEExpertGateUpNative : public KernelGenerator {
++    bool _batched = false;
+ public:
+-    MoEExpertGateUpNative()
+-        : KernelGenerator("moe_expert_swiglu", "expert_gate_up_native") {}
++    // arcint (patch 0059): the batched entry shares this generator's JIT
++    explicit MoEExpertGateUpNative(bool batched = false)
++        : KernelGenerator("moe_expert_swiglu", batched ? "expert_gate_up_native_batched" : "expert_gate_up_native"),
++          _batched(batched) {}
+ protected:
+     JitConstants get_jit_constants(const RuntimeParams& params) const override {
+         auto jit = KernelGenerator::get_jit_constants(params);
+         add_common_consts(params, jit);
+         jit.make("NATIVE_GATE_UP_ENABLE", 1);
++        if (_batched)
++            jit.make("NATIVE_BATCHED", 1);
+         auto desc = params.typed_desc<moe_3gemm_fused_compressed>();
+         // A gate/up projection is IQ3_XXS (2) or IQ4_XS-in-the-IQ4_NL-layout
+         // (1); Q8_0 is a down format in this checkpoint. Refuse a decode the
+@@ -624,14 +629,18 @@
+ };
+ 
+ class MoEExpertDownNative : public KernelGenerator {
++    bool _batched = false;
+ public:
+-    MoEExpertDownNative()
+-        : KernelGenerator("moe_expert_swiglu", "expert_down_native") {}
++    explicit MoEExpertDownNative(bool batched = false)
++        : KernelGenerator("moe_expert_swiglu", batched ? "expert_down_native_batched" : "expert_down_native"),
++          _batched(batched) {}
+ protected:
+     JitConstants get_jit_constants(const RuntimeParams& params) const override {
+         auto jit = KernelGenerator::get_jit_constants(params);
+         add_common_consts(params, jit);
+         jit.make("NATIVE_DOWN_ENABLE", 1);
++        if (_batched)
++            jit.make("NATIVE_BATCHED", 1);
+         auto desc = params.typed_desc<moe_3gemm_fused_compressed>();
+         // Native down formats in this checkpoint: IQ4_NL (1; IQ4_XS shares the
+         // layout), IQ3_XXS (2), Q8_0 (3). The .cl's #else branch is IQ4_NL, so
+@@ -930,6 +939,12 @@
+     // arcint (patch 0045): native-format counterparts.
+     Stage::Ptr _expert_gate_up_native_stage = make_stage<MoEExpertGateUpNative>();
+     Stage::Ptr _expert_down_native_stage = make_stage<MoEExpertDownNative>();
++    // arcint (patch 0059): every (token, expert) pair of a call in one launch
++    // per stage, the pairs read from _dispatch_pairs.
++    Stage::Ptr _expert_gate_up_native_batched_stage =
++        make_stage<MoEExpertGateUpNative>(true);
++    Stage::Ptr _expert_down_native_batched_stage = make_stage<MoEExpertDownNative>(true);
++    memory::ptr _dispatch_pairs;
+     struct PerExpertGpuDispatch {
+         size_t slot_index;
+         int topk_position;
+@@ -2016,6 +2031,8 @@
+                 if (_native_tier_only) {
+                     add_stage(_expert_gate_up_native_stage, params);
+                     add_stage(_expert_down_native_stage, params);
++                    add_stage(_expert_gate_up_native_batched_stage, params);
++                    add_stage(_expert_down_native_batched_stage, params);
+                 } else {
+                     add_stage(_expert_gate_up_stage, params);
+                     add_stage(_expert_down_stage, params);
+@@ -2726,7 +2743,56 @@
+                                       {token_num * compute_experts, subgroup_size, static_cast<size_t>(_hidden_size / N_BLOCK)},
+                                       {1, subgroup_size, SUBGROUP_NUM});
+ 
+-            if (_per_expert_dispatch && !_gpu_dispatches.empty()) {
++            // arcint (patch 0059). The native route issues every (token, expert)
++            // pair of the call as ONE launch per stage: the pairs go to a small
++            // table and the batched kernels read their row's pair from it. Each
++            // pair runs the same body as the per-pair launch below, which cost
++            // two launches a pair (16,384 per MoE layer for a 1,024-token chunk;
++            // measured, the served prefill spent ~91 ms per layer call waiting
++            // on them). The table is rewritten only after this layer's blocking
++            // top-k readback, which on the in-order queue has already waited for
++            // every earlier launch -- so no kernel still reads it.
++            // MOE_PER_PAIR_DISPATCH=1 restores the per-pair launches (the A/B).
++            static const bool per_pair_dispatch = std::getenv("MOE_PER_PAIR_DISPATCH") != nullptr;
++            if (_per_expert_dispatch && !_gpu_dispatches.empty() && _native_tier_only && !per_pair_dispatch) {
++                auto hs_mem = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
++                const auto& w = instance._weights;
++                std::vector<int32_t> pairs(_gpu_dispatches.size() * 3);
++                for (size_t i = 0; i < _gpu_dispatches.size(); ++i) {
++                    pairs[3 * i + 0] = static_cast<int32_t>(_gpu_dispatches[i].slot_index);
++                    pairs[3 * i + 1] = _gpu_dispatches[i].flat_id;
++                    pairs[3 * i + 2] = _gpu_dispatches[i].topk_position;
++                }
++                const size_t table_bytes = pairs.size() * sizeof(int32_t);
++                if (!_dispatch_pairs || _dispatch_pairs->size() < table_bytes) {
++                    auto layout = cldnn::layout({1, 1, 1, static_cast<ov::Dimension::value_type>(table_bytes)},
++                                                ov::element::i8, cldnn::format::bfyx);
++                    _dispatch_pairs = instance.get_network().get_engine().allocate_memory(layout, allocation_type::usm_host, false);
++                }
++                _dispatch_pairs->copy_from(stream, pairs.data(), 0, 0, table_bytes, true);
++                const size_t n_pairs = _gpu_dispatches.size();
++                execute_stage({ret_event},
++                              instance,
++                              *_expert_gate_up_native_batched_stage,
++                              {w.gate_w, w.gate_s, w.gate_z, w.up_w, w.up_s, w.up_z, hs_mem, _dispatch_pairs},
++                              {scratch.up},
++                              {n_pairs, subgroup_size, static_cast<size_t>(_intermediate_size / N_BLOCK)},
++                              {1, subgroup_size, SUBGROUP_NUM},
++                              false,
++                              {static_cast<int>(_experts_per_token)});
++                execute_stage({ret_event},
++                              instance,
++                              *_expert_down_native_batched_stage,
++                              {w.down_w, w.down_s, w.down_z, scratch.up, routing_mem_ptr, _dispatch_pairs},
++                              {scratch.y},
++                              {n_pairs, subgroup_size, static_cast<size_t>(_hidden_size / N_BLOCK)},
++                              {1, subgroup_size, SUBGROUP_NUM},
++                              false,
++                              {static_cast<int>(_experts_per_token), static_cast<int>(_max_topk)});
++                if (auto* perf = moe_otd::get_perf_counters()) {
++                    perf->per_expert_gpu_invocations.fetch_add(2, std::memory_order_relaxed);
++                }
++            } else if (_per_expert_dispatch && !_gpu_dispatches.empty()) {
+                 auto hs_mem = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
+                 const auto& w = instance._weights;
+                 // arcint (patch 0045): native formats dispatch the native

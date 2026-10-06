@@ -1,0 +1,560 @@
+# Per-expert SwiGLU GEMV with in-kernel u4 dequant: the OCL kernel for
+# routing-aware expert execution (campaign: sub4bit-vram-kernel).
+#
+# Design:   docs/design-routing-aware-expert-execution.md §2
+# Campaign: docs/campaigns/sub4bit-vram-kernel.md
+# Gate:     a model with >= 512 experts serves on one card with routing-aware
+#           expert execution: only the routed experts computed per token.
+#
+# This is the KERNEL itself — the .cl file and the perf counter for GPU
+# per-expert invocations. The dispatch integration (connecting the kernel to
+# the live path in moe_3gemm_swiglu_opt.cpp) is a separate patch; it needs
+# per-expert cache slots to feed the kernel weight pointers.
+#
+# The kernel is a single-expert counterpart of moe_3gemm_swiglu_mlp.cl:
+# same subgroup tiling (SUBGROUP_SIZE=32 on Xe-HPG/Xe2), same u4 dequant
+# (DEQUANT_4BIT_LO/HI), same SwiGLU activation (SiLU default, GeGLU-Tanh
+# and GeGLU-ERF variants). What changes:
+#   - No expert_list lookup: takes one expert's weight pointers directly.
+#   - No stacked [num_slots,...] tensor: pointers pre-offset by the host.
+#   - Workgroup dim 0 is token index, not token×expert_slot.
+#   - Down stage applies routing weight per token.
+#
+# Two kernel entry points:
+#   expert_gate_up(gate_w, gate_s, gate_z, up_w, up_s, up_z, x, y)
+#     — SwiGLU intermediate: y[n] = up(x)[n] * SiLU(gate(x)[n])
+#   expert_down(weight, scales, zps, x, routing_weights, y)
+#     — down projection: y[n] = down(x)[n] * routing_weight
+#
+# Inner GEMV loop is identical to moe_3gemm_swiglu_mlp.cl's
+# gate_up_gemv_n2x_u4 / down_gemv_n2x_u4:
+#   - x loaded into SLM with even/odd interleaving for block reads
+#   - Weights read via intel_sub_group_block_read_ucN (u4 packed)
+#   - Dequant in-register: DEQUANT_4BIT_LO/HI + scale - zp*sum_x
+#   - FMA accumulation in half, sub_group_reduce_add for final sum
+#   - ELEMS_PER_LANE variants: 2, 4, 8 (selected by FAKE_GROUP_SIZE / SG)
+#
+# The .cl file is auto-discovered by the build system (CMakeLists.txt uses
+# file(GLOB_RECURSE *.cl) in the ocl_v2 directory).
+#
+# Flash-Next dimensions (docs/design-routing-aware-expert-execution.md §5):
+#   hidden_size=2560, moe_intermediate_size=640, group_size=128
+#   SUBGROUP_SIZE=32, FAKE_GROUP_SIZE=128, ELEMS_PER_LANE=4
+#   gate/up: [640, 2560] — K=2560, N=640
+#   down:    [2560, 640]  — K=640,  N=2560
+#
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on
+# top of patches/0003-0038.
+#
+# Fable review (2 findings, 1 fixed):
+#   1. CONFIRMED: spurious barrier(CLK_LOCAL_MEM_FENCE) between up and gate
+#      GEMV calls in expert_gate_up. SLM is read-only in both calls; the
+#      fused kernel has no barrier here. Fixed: barrier removed.
+#   2. PLAUSIBLE: routing_weights pointer contract (host must offset to
+#      expert_slot). Not a kernel bug — documented in the interface comment.
+#      No code change needed.
+
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
+new file mode 100644
+index 0000000..2a9b672
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
+@@ -0,0 +1,466 @@
++// Copyright (C) 2026 arcint contributors
++// SPDX-License-Identifier: Apache-2.0
++//
++// Per-expert SwiGLU GEMV with in-kernel u4 dequant.
++// Campaign: sub4bit-vram-kernel
++// Design: docs/design-routing-aware-expert-execution.md §2
++//
++// Single-expert counterpart of moe_3gemm_swiglu_mlp.cl. Takes one expert's
++// weight pointers directly (no stacked [num_slots,...] tensor, no expert_list
++// lookup). The inner GEMV loop and u4 dequant are identical to the fused
++// kernel's gate_up_gemv_n2x_u4 / down_gemv_n2x_u4; only the dispatch
++// (workgroup -> token, not workgroup -> token x expert_slot) differs.
++//
++// Two kernel entry points:
++//   expert_gate_up -- gate(x)*SiLU + up(x), writes SwiGLU intermediate
++//   expert_down    -- down(intermediate) * routing_weight, writes output
++//
++// JIT constants (set by moe_3gemm_swiglu_opt.cpp):
++//   HIDDEN_SIZE, INTERMEDIATE_SIZE, SUBGROUP_SIZE, N_BLOCK, SUBGROUP_NUM
++//   FAKE_GROUP_SIZE, GATE_UP_GROUP_SIZE, DOWN_GROUP_SIZE
++//   HAS_ZP, WEIGHT_IS_SIGNED, WEIGHT_COMPRESSEION_DT (0 = 4-bit packed)
++//   MOE_WEI_DT, MOE_SCALE_DT, MOE_ZP_DT, MOE_DTYPE
++
++#include "include/batch_headers/sub_group_block_read.cl"
++
++#define ELEMS_PER_LANE (FAKE_GROUP_SIZE / SUBGROUP_SIZE)
++
++#ifdef GATE_ACT_GELU_ERF
++inline float moe_mlp_fast_erf(float x) {
++    const float p  = 0.3275911f;
++    const float a1 = 0.254829592f;
++    const float a2 = -0.284496736f;
++    const float a3 = 1.421413741f;
++    const float a4 = -1.453152027f;
++    const float a5 = 1.061405429f;
++    float z = fabs(x);
++    float t = 1.0f / (1.0f + p * z);
++    float y = 1.0f - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * exp(-(z * z));
++    return (x >= 0.0f) ? y : -y;
++}
++#    define MOE_GATE_ACT(x) (0.5f * (x) * (1.0f + moe_mlp_fast_erf((x) * 0.7071067811865475f)))
++#elif defined(GATE_ACT_GELU_TANH)
++#    define MOE_GATE_ACT(x) (0.5f * (x) * (1.0f + (tanh(0.79788458347320556640625f * (x) * (1.0f + 0.044715f * (x) * (x))))))
++#else
++#    define MOE_GATE_ACT(x) ((x) / (1.0f + exp(-(x))))
++#endif
++
++#if WEIGHT_IS_SIGNED
++#    define DEQUANT_4BIT_LO(v) convert_half((char)(((v) & 0x08) ? ((v) | 0xF0) : ((v) & 0x0F)))
++#    define DEQUANT_4BIT_HI(v) convert_half((char)((((v) >> 4) & 0x08) ? (((v) >> 4) | 0xF0) : (((v) >> 4) & 0x0F)))
++#else
++#    define DEQUANT_4BIT_LO(v) convert_half((v) & 0x0F)
++#    define DEQUANT_4BIT_HI(v) convert_half((v) >> 4)
++#endif
++
++// ---------------------------------------------------------------------------
++// Gate/up GEMV inner loop: 2 output rows, u4 packed weights.
++// Identical to moe_3gemm_swiglu_mlp.cl gate_up_gemv_n2x_u4.
++// ---------------------------------------------------------------------------
++#if WEIGHT_COMPRESSEION_DT == 0
++inline void expert_gate_up_gemv_u4(const __global uchar* weight,
++                                   __global half* scales,
++                                   __global uchar* zps,
++                                   __global half* y,
++                                   int N,
++                                   int K,
++                                   half* x2,
++                                   float* xg_sum,
++                                   const bool silu) {
++    int id_local = get_sub_group_local_id();
++    int n_start = get_global_id(2) * N_BLOCK;
++    int n_end = n_start + N_BLOCK;
++
++    unroll_for(int n = n_start; n < n_end; n += 2) {
++        const __global uchar* B = weight + n * K / 2;
++        float sum_all0 = 0;
++        float sum_all1 = 0;
++        __global half* S = scales + n;
++#if HAS_ZP
++        __global uchar* Z = zps + n / 2;
++#endif
++        unroll_for(int gk = 0; gk < K / FAKE_GROUP_SIZE; gk++) {
++            int scale_offset = (gk * FAKE_GROUP_SIZE / GATE_UP_GROUP_SIZE) * N;
++            half s0 = S[scale_offset];
++            half s1 = S[scale_offset + 1];
++#if HAS_ZP
++            int zp_offset = (gk * FAKE_GROUP_SIZE / GATE_UP_GROUP_SIZE) * N / 2;
++            uchar z = Z[zp_offset];
++            half z_hf0 = convert_half(z & 0xf);
++            half z_hf1 = convert_half(z >> 4);
++#endif
++
++#    if ELEMS_PER_LANE == 4
++            half2 sum0;
++            half2 sum1;
++            half4 a = as_half4(_sub_group_block_read_slm_us4(
++                (const __local ushort*)x2 + gk * FAKE_GROUP_SIZE));
++            uchar2 b = intel_sub_group_block_read_uc2(
++                (const __global uchar*)B + gk * FAKE_GROUP_SIZE / 2);
++            uchar2 b2 = intel_sub_group_block_read_uc2(
++                (const __global uchar*)(B + (K / 2) + gk * FAKE_GROUP_SIZE / 2));
++
++            sum0.s0 = fma(a.s0, (DEQUANT_4BIT_LO(b.s0)), 0);
++            sum0.s1 = fma(a.s1, (DEQUANT_4BIT_LO(b.s1)), 0);
++            sum0.s0 = fma(a.s2, (DEQUANT_4BIT_HI(b.s0)), sum0.s0);
++            sum0.s1 = fma(a.s3, (DEQUANT_4BIT_HI(b.s1)), sum0.s1);
++
++            sum1.s0 = fma(a.s0, (DEQUANT_4BIT_LO(b2.s0)), 0);
++            sum1.s1 = fma(a.s1, (DEQUANT_4BIT_LO(b2.s1)), 0);
++            sum1.s0 = fma(a.s2, (DEQUANT_4BIT_HI(b2.s0)), sum1.s0);
++            sum1.s1 = fma(a.s3, (DEQUANT_4BIT_HI(b2.s1)), sum1.s1);
++
++#if HAS_ZP
++            sum_all0 += (sum0[0] + sum0[1] - xg_sum[gk] * z_hf0) * s0;
++            sum_all1 += (sum1[0] + sum1[1] - xg_sum[gk] * z_hf1) * s1;
++#else
++            sum_all0 += (sum0[0] + sum0[1]) * s0;
++            sum_all1 += (sum1[0] + sum1[1]) * s1;
++#endif
++#    elif ELEMS_PER_LANE == 2
++            half sum0;
++            half sum1;
++            half2 a = as_half2(_sub_group_block_read_slm_us2(
++                (const __local ushort*)x2 + gk * FAKE_GROUP_SIZE));
++            uchar b = intel_sub_group_block_read_uc(
++                (const __global uchar*)B + gk * FAKE_GROUP_SIZE / 2);
++            uchar b2 = intel_sub_group_block_read_uc(
++                (const __global uchar*)(B + (K / 2) + gk * FAKE_GROUP_SIZE / 2));
++
++            sum0 = fma(a.s0, (DEQUANT_4BIT_LO(b)), (half)0);
++            sum0 = fma(a.s1, (DEQUANT_4BIT_HI(b)), sum0);
++
++            sum1 = fma(a.s0, (DEQUANT_4BIT_LO(b2)), (half)0);
++            sum1 = fma(a.s1, (DEQUANT_4BIT_HI(b2)), sum1);
++
++#if HAS_ZP
++            sum_all0 += (sum0 - xg_sum[gk] * z_hf0) * s0;
++            sum_all1 += (sum1 - xg_sum[gk] * z_hf1) * s1;
++#else
++            sum_all0 += sum0 * s0;
++            sum_all1 += sum1 * s1;
++#endif
++#    else
++            half4 sum0;
++            half4 sum1;
++            half8 a = as_half8(_sub_group_block_read_slm_us8(
++                (const __local ushort*)x2 + gk * FAKE_GROUP_SIZE));
++            uchar4 b = intel_sub_group_block_read_uc4(
++                (const __global uchar*)B + gk * FAKE_GROUP_SIZE / 2);
++            uchar4 b2 = intel_sub_group_block_read_uc4(
++                (const __global uchar*)(B + (K / 2) + gk * FAKE_GROUP_SIZE / 2));
++
++            sum0.s0 = fma(a.s0, (DEQUANT_4BIT_LO(b.s0)), 0);
++            sum0.s1 = fma(a.s1, (DEQUANT_4BIT_LO(b.s1)), 0);
++            sum0.s2 = fma(a.s2, (DEQUANT_4BIT_LO(b.s2)), 0);
++            sum0.s3 = fma(a.s3, (DEQUANT_4BIT_LO(b.s3)), 0);
++
++            sum0.s0 = fma(a.s4, (DEQUANT_4BIT_HI(b.s0)), sum0.s0);
++            sum0.s1 = fma(a.s5, (DEQUANT_4BIT_HI(b.s1)), sum0.s1);
++            sum0.s2 = fma(a.s6, (DEQUANT_4BIT_HI(b.s2)), sum0.s2);
++            sum0.s3 = fma(a.s7, (DEQUANT_4BIT_HI(b.s3)), sum0.s3);
++
++            sum1.s0 = fma(a.s0, (DEQUANT_4BIT_LO(b2.s0)), 0);
++            sum1.s1 = fma(a.s1, (DEQUANT_4BIT_LO(b2.s1)), 0);
++            sum1.s2 = fma(a.s2, (DEQUANT_4BIT_LO(b2.s2)), 0);
++            sum1.s3 = fma(a.s3, (DEQUANT_4BIT_LO(b2.s3)), 0);
++
++            sum1.s0 = fma(a.s4, (DEQUANT_4BIT_HI(b2.s0)), sum1.s0);
++            sum1.s1 = fma(a.s5, (DEQUANT_4BIT_HI(b2.s1)), sum1.s1);
++            sum1.s2 = fma(a.s6, (DEQUANT_4BIT_HI(b2.s2)), sum1.s2);
++            sum1.s3 = fma(a.s7, (DEQUANT_4BIT_HI(b2.s3)), sum1.s3);
++
++#if HAS_ZP
++            sum_all0 += (sum0[0] + sum0[1] + sum0[2] + sum0[3]
++                         - xg_sum[gk] * z_hf0) * s0;
++            sum_all1 += (sum1[0] + sum1[1] + sum1[2] + sum1[3]
++                         - xg_sum[gk] * z_hf1) * s1;
++#else
++            sum_all0 += (sum0[0] + sum0[1] + sum0[2] + sum0[3]) * s0;
++            sum_all1 += (sum1[0] + sum1[1] + sum1[2] + sum1[3]) * s1;
++#endif
++#    endif
++        }
++
++        sum_all0 = sub_group_reduce_add(sum_all0);
++        sum_all1 = sub_group_reduce_add(sum_all1);
++        if (id_local == 0) {
++            if (silu) {
++                y[n] *= MOE_GATE_ACT(sum_all0);
++                y[n + 1] *= MOE_GATE_ACT(sum_all1);
++            } else {
++                y[n] = sum_all0;
++                y[n + 1] = sum_all1;
++            }
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Down GEMV inner loop: 2 output rows, u4 packed weights, routing weight.
++// Identical to moe_3gemm_swiglu_mlp.cl down_gemv_n2x_u4.
++// ---------------------------------------------------------------------------
++inline void expert_down_gemv_u4(const __global uchar* weight,
++                                __global half* scales,
++                                __global uchar* zps,
++                                MOE_DTYPE routing_weight_val,
++                                __global half* y,
++                                int N,
++                                int K,
++                                half* x2,
++                                float* xg_sum) {
++    int id_local = get_sub_group_local_id();
++    int n_start = get_global_id(2) * N_BLOCK;
++    int n_end = n_start + N_BLOCK;
++
++    unroll_for(int n = n_start; n < n_end; n += 2) {
++        const __global uchar* B = weight + n * K / 2;
++        float sum_all0 = 0;
++        float sum_all1 = 0;
++        __global half* S = scales + n;
++#if HAS_ZP
++        __global uchar* Z = zps + n / 2;
++#endif
++        unroll_for(int gk = 0; gk < K / FAKE_GROUP_SIZE; gk++) {
++            int scale_offset = (gk * FAKE_GROUP_SIZE / DOWN_GROUP_SIZE) * N;
++            half s0 = S[scale_offset];
++            half s1 = S[scale_offset + 1];
++#if HAS_ZP
++            int zp_offset = (gk * FAKE_GROUP_SIZE / DOWN_GROUP_SIZE) * N / 2;
++            uchar z = Z[zp_offset];
++            half z_hf0 = convert_half(z & 0xf);
++            half z_hf1 = convert_half(z >> 4);
++#endif
++
++#    if ELEMS_PER_LANE == 4
++            half2 sum0;
++            half2 sum1;
++            half4 a = as_half4(_sub_group_block_read_slm_us4(
++                (const __local ushort*)x2 + gk * FAKE_GROUP_SIZE));
++            uchar2 b = intel_sub_group_block_read_uc2(
++                (const __global uchar*)B + gk * FAKE_GROUP_SIZE / 2);
++            uchar2 b2 = intel_sub_group_block_read_uc2(
++                (const __global uchar*)(B + (K / 2) + gk * FAKE_GROUP_SIZE / 2));
++
++            sum0.s0 = fma(a.s0, (DEQUANT_4BIT_LO(b.s0)), 0);
++            sum0.s1 = fma(a.s1, (DEQUANT_4BIT_LO(b.s1)), 0);
++            sum0.s0 = fma(a.s2, (DEQUANT_4BIT_HI(b.s0)), sum0.s0);
++            sum0.s1 = fma(a.s3, (DEQUANT_4BIT_HI(b.s1)), sum0.s1);
++
++            sum1.s0 = fma(a.s0, (DEQUANT_4BIT_LO(b2.s0)), 0);
++            sum1.s1 = fma(a.s1, (DEQUANT_4BIT_LO(b2.s1)), 0);
++            sum1.s0 = fma(a.s2, (DEQUANT_4BIT_HI(b2.s0)), sum1.s0);
++            sum1.s1 = fma(a.s3, (DEQUANT_4BIT_HI(b2.s1)), sum1.s1);
++
++#if HAS_ZP
++            sum_all0 += (sum0[0] + sum0[1] - xg_sum[gk] * z_hf0) * s0;
++            sum_all1 += (sum1[0] + sum1[1] - xg_sum[gk] * z_hf1) * s1;
++#else
++            sum_all0 += (sum0[0] + sum0[1]) * s0;
++            sum_all1 += (sum1[0] + sum1[1]) * s1;
++#endif
++#    elif ELEMS_PER_LANE == 2
++            half sum0;
++            half sum1;
++            half2 a = as_half2(_sub_group_block_read_slm_us2(
++                (const __local ushort*)x2 + gk * FAKE_GROUP_SIZE));
++            uchar b = intel_sub_group_block_read_uc(
++                (const __global uchar*)B + gk * FAKE_GROUP_SIZE / 2);
++            uchar b2 = intel_sub_group_block_read_uc(
++                (const __global uchar*)(B + (K / 2) + gk * FAKE_GROUP_SIZE / 2));
++
++            sum0 = fma(a.s0, (DEQUANT_4BIT_LO(b)), (half)0);
++            sum0 = fma(a.s1, (DEQUANT_4BIT_HI(b)), sum0);
++
++            sum1 = fma(a.s0, (DEQUANT_4BIT_LO(b2)), (half)0);
++            sum1 = fma(a.s1, (DEQUANT_4BIT_HI(b2)), sum1);
++
++#if HAS_ZP
++            sum_all0 += (sum0 - xg_sum[gk] * z_hf0) * s0;
++            sum_all1 += (sum1 - xg_sum[gk] * z_hf1) * s1;
++#else
++            sum_all0 += sum0 * s0;
++            sum_all1 += sum1 * s1;
++#endif
++#    else
++            half4 sum0;
++            half4 sum1;
++            half8 a = as_half8(_sub_group_block_read_slm_us8(
++                (const __local ushort*)x2 + gk * FAKE_GROUP_SIZE));
++            uchar4 b = intel_sub_group_block_read_uc4(
++                (const __global uchar*)B + gk * FAKE_GROUP_SIZE / 2);
++            uchar4 b2 = intel_sub_group_block_read_uc4(
++                (const __global uchar*)(B + (K / 2) + gk * FAKE_GROUP_SIZE / 2));
++
++            sum0.s0 = fma(a.s0, (DEQUANT_4BIT_LO(b.s0)), 0);
++            sum0.s1 = fma(a.s1, (DEQUANT_4BIT_LO(b.s1)), 0);
++            sum0.s2 = fma(a.s2, (DEQUANT_4BIT_LO(b.s2)), 0);
++            sum0.s3 = fma(a.s3, (DEQUANT_4BIT_LO(b.s3)), 0);
++
++            sum0.s0 = fma(a.s4, (DEQUANT_4BIT_HI(b.s0)), sum0.s0);
++            sum0.s1 = fma(a.s5, (DEQUANT_4BIT_HI(b.s1)), sum0.s1);
++            sum0.s2 = fma(a.s6, (DEQUANT_4BIT_HI(b.s2)), sum0.s2);
++            sum0.s3 = fma(a.s7, (DEQUANT_4BIT_HI(b.s3)), sum0.s3);
++
++            sum1.s0 = fma(a.s0, (DEQUANT_4BIT_LO(b2.s0)), 0);
++            sum1.s1 = fma(a.s1, (DEQUANT_4BIT_LO(b2.s1)), 0);
++            sum1.s2 = fma(a.s2, (DEQUANT_4BIT_LO(b2.s2)), 0);
++            sum1.s3 = fma(a.s3, (DEQUANT_4BIT_LO(b2.s3)), 0);
++
++            sum1.s0 = fma(a.s4, (DEQUANT_4BIT_HI(b2.s0)), sum1.s0);
++            sum1.s1 = fma(a.s5, (DEQUANT_4BIT_HI(b2.s1)), sum1.s1);
++            sum1.s2 = fma(a.s6, (DEQUANT_4BIT_HI(b2.s2)), sum1.s2);
++            sum1.s3 = fma(a.s7, (DEQUANT_4BIT_HI(b2.s3)), sum1.s3);
++
++#if HAS_ZP
++            sum_all0 += (sum0[0] + sum0[1] + sum0[2] + sum0[3]
++                         - xg_sum[gk] * z_hf0) * s0;
++            sum_all1 += (sum1[0] + sum1[1] + sum1[2] + sum1[3]
++                         - xg_sum[gk] * z_hf1) * s1;
++#else
++            sum_all0 += (sum0[0] + sum0[1] + sum0[2] + sum0[3]) * s0;
++            sum_all1 += (sum1[0] + sum1[1] + sum1[2] + sum1[3]) * s1;
++#endif
++#    endif
++        }
++
++        sum_all0 = sub_group_reduce_add(sum_all0);
++        sum_all1 = sub_group_reduce_add(sum_all1);
++        if (id_local == 0) {
++            y[n] = sum_all0 * routing_weight_val;
++            y[n + 1] = sum_all1 * routing_weight_val;
++        }
++    }
++}
++#endif  // WEIGHT_COMPRESSEION_DT == 0
++
++// ---------------------------------------------------------------------------
++// SLM interleave: load K-elements into SLM with even/odd split for block
++// reads. Identical to moe_3gemm_swiglu_mlp.cl's x-interleaving code.
++// ---------------------------------------------------------------------------
++inline void load_x_interleaved(__local half* x2,
++                               __local float* xg_sum,
++                               const __global half* x_src,
++                               int K) {
++    int id_sg = get_sub_group_id();
++    int num_sg = get_num_sub_groups();
++    int id_local = get_sub_group_local_id();
++    const __global half* px = x_src + id_sg * FAKE_GROUP_SIZE;
++    __local half* px2 = x2 + id_sg * FAKE_GROUP_SIZE;
++
++    unroll_for(int i = id_sg; i < K / FAKE_GROUP_SIZE; i += num_sg,
++               px += num_sg * FAKE_GROUP_SIZE,
++               px2 += num_sg * FAKE_GROUP_SIZE) {
++#if HAS_ZP
++        float x_group_sum = 0;
++#endif
++        unroll_for(int j = id_local; j < FAKE_GROUP_SIZE / 2; j += SUBGROUP_SIZE) {
++            half even = px[2 * j];
++            half odd  = px[2 * j + 1];
++            px2[j] = even;
++            px2[j + FAKE_GROUP_SIZE / 2] = odd;
++#if HAS_ZP
++            x_group_sum += even + odd;
++#endif
++        }
++#if HAS_ZP
++        x_group_sum = sub_group_reduce_add(x_group_sum);
++        if (id_local == 0) {
++            xg_sum[i] = x_group_sum / SUBGROUP_SIZE;
++        }
++#endif
++    }
++}
++
++// ===========================================================================
++// Stage 1: gate + up for a single expert.
++//   y[n] = up(x)[n] * SiLU(gate(x)[n])
++//
++// Workgroup decomposition (same tiling as the fused kernel per token):
++//   dim 0: token index [0, TOKEN_COUNT)
++//   dim 1: subgroup lanes [0, SUBGROUP_SIZE)
++//   dim 2: output row tile [0, INTERMEDIATE_SIZE / N_BLOCK)
++//   lws:   {1, SUBGROUP_SIZE, SUBGROUP_NUM}
++// ===========================================================================
++__attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE)))
++KERNEL(expert_gate_up)(
++    const __global MOE_WEI_DT*   gate_weight,
++    const __global MOE_SCALE_DT* gate_scale,
++    const __global MOE_ZP_DT*    gate_zp,
++    const __global MOE_WEI_DT*   up_weight,
++    const __global MOE_SCALE_DT* up_scale,
++    const __global MOE_ZP_DT*    up_zp,
++    const __global MOE_DTYPE*    x,
++    __global MOE_DTYPE*          y)
++{
++    int token_idx = get_global_id(0);
++    y += token_idx * INTERMEDIATE_SIZE;
++
++    __local half x2[HIDDEN_SIZE];
++#if HAS_ZP
++    __local float xg_sum[HIDDEN_SIZE / FAKE_GROUP_SIZE];
++#else
++    __local float xg_sum[1];
++#endif
++
++    load_x_interleaved(x2, xg_sum, x + token_idx * HIDDEN_SIZE, HIDDEN_SIZE);
++    barrier(CLK_LOCAL_MEM_FENCE);
++
++#if WEIGHT_COMPRESSEION_DT == 0
++    expert_gate_up_gemv_u4((__global uchar*)up_weight,
++                           (__global half*)up_scale,
++                           (__global uchar*)up_zp,
++                           y, INTERMEDIATE_SIZE, HIDDEN_SIZE,
++                           (half*)x2, (float*)xg_sum, false);
++
++    expert_gate_up_gemv_u4((__global uchar*)gate_weight,
++                           (__global half*)gate_scale,
++                           (__global uchar*)gate_zp,
++                           y, INTERMEDIATE_SIZE, HIDDEN_SIZE,
++                           (half*)x2, (float*)xg_sum, true);
++#endif
++}
++
++// ===========================================================================
++// Stage 2: down projection for a single expert.
++//   y[n] = down(intermediate)[n] * routing_weight
++//
++// Workgroup decomposition:
++//   dim 0: token index [0, TOKEN_COUNT)
++//   dim 1: subgroup lanes [0, SUBGROUP_SIZE)
++//   dim 2: output row tile [0, HIDDEN_SIZE / N_BLOCK)
++//   lws:   {1, SUBGROUP_SIZE, SUBGROUP_NUM}
++// ===========================================================================
++__attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE)))
++KERNEL(expert_down)(
++    const __global MOE_WEI_DT*   weight,
++    const __global MOE_SCALE_DT* scales,
++    const __global MOE_ZP_DT*    zps,
++    const __global MOE_DTYPE*    x,
++    const __global half*         routing_weights,
++    __global MOE_DTYPE*          y)
++{
++    int token_idx = get_global_id(0);
++    x += token_idx * INTERMEDIATE_SIZE;
++    y += token_idx * HIDDEN_SIZE;
++    half routing_weight_val = routing_weights[token_idx];
++
++    __local half x2[INTERMEDIATE_SIZE];
++#if HAS_ZP
++    __local float xg_sum[INTERMEDIATE_SIZE / FAKE_GROUP_SIZE];
++#else
++    __local float xg_sum[1];
++#endif
++
++    load_x_interleaved(x2, xg_sum, x, INTERMEDIATE_SIZE);
++    barrier(CLK_LOCAL_MEM_FENCE);
++
++#if WEIGHT_COMPRESSEION_DT == 0
++    expert_down_gemv_u4((__global uchar*)weight,
++                        (__global half*)scales,
++                        (__global uchar*)zps,
++                        routing_weight_val,
++                        y, HIDDEN_SIZE, INTERMEDIATE_SIZE,
++                        (half*)x2, (float*)xg_sum);
++#endif
++}
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
+index d1a5a6eee8..b3c6efa760 100644
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
+@@ -1665,6 +1665,27 @@ TEST(moe_per_expert_dispatch, perf_counter_exists_and_increments) {
+     ASSERT_EQ(perf.per_expert_dispatches.load(), 15u);
+ }
+ 
++// ----- arcint (patch 0039). Per-expert GPU kernel counter -----
++// Campaign: sub4bit-vram-kernel. The per_expert_gpu_invocations counter tracks
++// GPU kernel launches (expert_gate_up + expert_down) for per-expert dispatch.
++// Host-only test: validates the counter exists, increments correctly, and can
++// distinguish GPU per-expert invocations from CPU-tier fallback.
++//
++// The actual GPU kernel correctness test requires the dispatch integration
++// (patch 0040) to compile and launch moe_expert_swiglu.cl's entry points
++// against device-resident expert weights. This test proves the counter
++// plumbing is ready for that integration.
++
++TEST(moe_per_expert_dispatch, gpu_kernel_counter_exists_and_increments) {
++    using ov::intel_gpu::ocl::moe_otd::OtdPerfCounters;
++    OtdPerfCounters perf;
++    ASSERT_EQ(perf.per_expert_gpu_invocations.load(), 0u);
++    perf.per_expert_gpu_invocations.fetch_add(2, std::memory_order_relaxed);
++    ASSERT_EQ(perf.per_expert_gpu_invocations.load(), 2u);
++    perf.per_expert_gpu_invocations.fetch_add(20, std::memory_order_relaxed);
++    ASSERT_EQ(perf.per_expert_gpu_invocations.load(), 22u);
++}
++
+ // arcint M14 (patches/0012, §8 T2). The kernel sentinel skip, tested in
+ // isolation from the redirect policy (§2) and the CPU compute tier (§4/§5):
+ // no OTD/LRU provider is involved here at all. The provider is RESIDENT

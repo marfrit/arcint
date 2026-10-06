@@ -1,0 +1,1095 @@
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+@@ -18,6 +18,7 @@
+ #include "lru_cache.hpp"
+ #include "moe_otd_runtime.hpp"
+ #include "pinned_nvme_fill.hpp"
++#include "pinned_nvme_transport.hpp"
+ 
+ namespace ov::intel_gpu::ocl::moe {
+ 
+@@ -198,6 +199,29 @@
+         std::lock_guard<std::mutex> lock(_pinned_fill_mutex);
+         _cache->set_filled(slot);
+     }
++
++    // arcint (patch 0049, design note D2/D3). Create this layer's three
++    // per-tensor xe VRAM BOs, export their dma-bufs, and register them with
++    // arcwell peer-to-peer. The coordinator calls this for EVERY layer before
++    // the load barrier, so every destination exists before any transfer; the
++    // BO's OpenCL import is deferred to bind_pinned_nvme_pool(), where the
++    // engine and this layer's full-layout resident buffer are known.
++    bool create_pinned_nvme_pool(lgc::nvme_fill::ArcwellTransport& transport, std::string* reason);
++
++    // arcint (patch 0049). This layer's registered geometry, for the
++    // transport's per-(layer,slot) request arithmetic.
++    lgc::nvme_fill::PinnedLayerGeometry pinned_nvme_geometry(std::uint32_t dense_index) const;
++
++    // arcint (patch 0049). Import the registered dma-bufs into OpenCL and make
++    // the BO-backed slots the destination the resident expert is read from:
++    // this layer's host-mapped gate_w/up_w/down_w are REPLACED by
++    // reinterpretations of the imported pool, so the fused GEMV kernel reads
++    // the controller-DMA'd bytes directly. The scales/zp are NOT in the DMA
++    // slice (page-alignment and the [oc][group] -> [group][oc] transpose), so
++    // they stay on the existing host path and are uploaded here, at load, on
++    // the service stream, completing each pinned slot before the first routed
++    // call. Called once from bind().
++    void bind_pinned_nvme_pool(cldnn::engine& engine);
+ 
+     // arcint M10 (patches/0013). Per-expert routing histogram: one counter per
+     // expert id in [0, config.num_expert), incremented once per (call,
+@@ -289,6 +313,20 @@
+     // set_pinned_nvme_fill() / apply_pinned_nvme_fill_slot().
+     bool _pinned_nvme_fill = false;
+     std::mutex _pinned_fill_mutex;
++
++    // arcint (patch 0049). One registered VRAM BO per weight tensor. The
++    // prime fd is consumed by bind_pinned_nvme_pool()'s OpenCL import (arcwell
++    // holds its own dma_buf reference, so the fd may be closed after a
++    // successful map; see the transport header). `tensor_bytes` is the
++    // per-expert byte count of each weight tensor, computed from the u4
++    // config; `ready` gates the whole path.
++    struct PinnedNvmePool {
++        std::uint32_t aw_handle[3] = {0, 0, 0};
++        int           prime_fd[3]  = {-1, -1, -1};
++        std::uint64_t tensor_bytes[3] = {0, 0, 0};
++        bool          ready = false;
++    };
++    PinnedNvmePool _pinned_pool;
+ };
+ 
+ }  // namespace ov::intel_gpu::ocl::moe
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+@@ -102,18 +102,26 @@
+ // the arcwell batch surface, collected and marked filled before the first
+ // routed call; there is no fetch on the decode path.
+ //
+-// The transport is injected. Today there is no transport that can land bytes
+-// without a host bounce: under the static partition the slot pool is
+-// host-mapped (MOE_OTD_PERF_LOG reports device_slot_buffers=0), and arcwell
+-// requires a dma-buf from an xe VRAM BO. The per-expert dma-buf BO the
+-// artifact-format step named as the D2/D3 contract therefore has no wiring
+-// yet, so an ENABLED fill refuses the load with the reason below -- the design
+-// note's own "arcwell cannot be set up at all is a load failure" rule, and
+-// never a silent demotion to the host tier (D3). Supplying the transport is
+-// OWED with that BO-backed destination.
++// [DATED IN PLACE 2026-09-24, patch 0049 leg] The transport is no longer
++// injected-empty. The coordinator now constructs lgc::nvme_fill::
++// ArcwellTransport, which owns the /dev/arcwell fd and the render-node fd and
++// creates one 64 KiB-rounded xe VRAM BO per (layer, tensor), exports the
++// dma-buf and registers it peer-to-peer. Every registered layer's pool is
++// created BEFORE the barrier (create_pinned_nvme_pool), so every destination
++// exists before any transfer; each layer's BO is imported into OpenCL and
++// replaces the host-mapped weight slots in its own bind() (bind_pinned_nvme_
++// pool). A failure at any step is a LOAD FAILURE for the configuration -- the
++// design note's own "arcwell cannot be set up at all is a load failure" rule,
++// and never a silent demotion to the host tier (D3).
++//
++// Configuration (operator-set, all read fresh at the first bind):
++//   MOE_OTD_PINNED_NVME_DRM        the Arc render node (PCI id, not number)
++//   MOE_OTD_PINNED_NVME_STORE      the one-file-per-expert ext4 store dir
++//   MOE_OTD_PINNED_NVME_PART_START the ext4 partition's start sector
+ struct PinnedNvmeFillCoordinator {
+     bool                       started = false;
+     lgc::nvme_fill::Transport* transport = nullptr;
++    std::shared_ptr<lgc::nvme_fill::ArcwellTransport> owned_transport;
+ };
+ 
+ PinnedNvmeFillCoordinator& pinned_nvme_fill() {
+@@ -129,13 +137,17 @@
+     if (coordinator.started) return;
+     coordinator.started = true;
+ 
+-    if (coordinator.transport == nullptr) {
++    const char* drm_env = std::getenv("MOE_OTD_PINNED_NVME_DRM");
++    const char* store_env = std::getenv("MOE_OTD_PINNED_NVME_STORE");
++    const char* part_env = std::getenv("MOE_OTD_PINNED_NVME_PART_START");
++    if (drm_env == nullptr || drm_env[0] == '\0' || store_env == nullptr || store_env[0] == '\0') {
+         throw std::runtime_error(
+-            "MOE_OTD_PINNED_NVME_FILL is set but no arcwell batch transport is linked: "
+-            "the static partition's slots are host-mapped (device_slot_buffers=0), so there "
+-            "is no dma-buf VRAM destination for a byte-transparent fill -- refusing the load "
+-            "rather than demoting pinned experts to the host tier (design note D3)");
+-    }
++            "MOE_OTD_PINNED_NVME_FILL is set but MOE_OTD_PINNED_NVME_DRM / "
++            "MOE_OTD_PINNED_NVME_STORE are not: the transport has no render node "
++            "or expert store to work from -- refusing the load rather than "
++            "demoting pinned experts to the host tier (design note D3)");
++    }
++    const std::uint64_t part_start = part_env != nullptr ? std::strtoull(part_env, nullptr, 10) : 0;
+ 
+     std::vector<OffloadExpertWeightProvider*> providers;
+     {
+@@ -149,12 +161,17 @@
+                   return a->layer_key() < b->layer_key();
+               });
+ 
+-    lgc::nvme_fill::Scheduler scheduler(coordinator.transport, /*depth=*/4);
++    coordinator.owned_transport = std::make_shared<lgc::nvme_fill::ArcwellTransport>(
++        std::string(drm_env), std::string("/dev/arcwell"), std::string(store_env), part_start);
++    if (!coordinator.owned_transport->ok()) {
++        throw std::runtime_error("pinned NVMe fill setup failed: " +
++                                 coordinator.owned_transport->reason());
++    }
++    coordinator.transport = coordinator.owned_transport.get();
++
++    std::vector<OffloadExpertWeightProvider*> owner;  // dense layer index -> provider
++    std::vector<lgc::nvme_fill::PinnedLayerGeometry> geometries;
+     std::string why;
+-    if (!scheduler.begin(&why))
+-        throw std::runtime_error("pinned NVMe fill setup failed: " + why);
+-
+-    std::vector<OffloadExpertWeightProvider*> owner;  // dense layer index -> provider
+     for (auto* provider : providers) {
+         if (!provider->pinned_nvme_fill_enabled()) continue;
+         if (!provider->static_partition_active()) {
+@@ -166,8 +183,19 @@
+         // no pinned slot for set_filled() to mark.
+         provider->reserve_static_partition();
+         const std::uint32_t index = static_cast<std::uint32_t>(owner.size());
++        if (!provider->create_pinned_nvme_pool(*coordinator.owned_transport, &why))
++            throw std::runtime_error("pinned NVMe fill pool creation failed: " + why);
+         owner.push_back(provider);
+-        if (!scheduler.enqueue(provider->pinned_nvme_fill_batch(index), &why))
++        geometries.push_back(provider->pinned_nvme_geometry(index));
++    }
++    coordinator.owned_transport->set_layers(std::move(geometries));
++
++    lgc::nvme_fill::Scheduler scheduler(coordinator.transport, /*depth=*/4);
++    if (!scheduler.begin(&why))
++        throw std::runtime_error("pinned NVMe fill setup failed: " + why);
++
++    for (std::size_t index = 0; index < owner.size(); ++index) {
++        if (!scheduler.enqueue(owner[index]->pinned_nvme_fill_batch(static_cast<std::uint32_t>(index)), &why))
+             throw std::runtime_error("pinned NVMe fill enqueue failed: " + why);
+     }
+ 
+@@ -386,12 +414,18 @@
+     // simultaneous/acquire_one see live traffic.
+     if (_static_partition) reserve_static_partition();
+ 
+-    // arcint nvme-direct-expert-tier (patches/0048). The first layer to bind
+-    // runs the whole load barrier: every registered layer's pinned set is
++    // arcint nvme-direct-expert-tier (patches/0048/0049). The first layer to
++    // bind runs the whole load barrier: every registered layer's pinned set is
+     // fetched over the arcwell batch surface, four batches in flight, and
+-    // marked filled before this layer's own experts are consumed. Enabled
+-    // without a transport is a load failure (see start_pinned_nvme_fill()).
+-    if (_pinned_nvme_fill) start_pinned_nvme_fill();
++    // marked filled before this layer's own experts are consumed. Each layer
++    // then imports its BO into OpenCL and replaces its host-mapped weight slots
++    // (bind_pinned_nvme_pool), and host-uploads the scales/zp the DMA slice
++    // excludes. A setup failure is a load failure (see start_pinned_nvme_fill()).
++    if (_pinned_nvme_fill) {
++        start_pinned_nvme_fill();
++        if (_resident->gate_w != nullptr)
++            bind_pinned_nvme_pool(*_resident->gate_w->get_engine());
++    }
+ 
+     GPU_DEBUG_TRACE << "MOE OTD bind: resident_slots=" << _capacity << " total_experts=" << _config.num_expert
+                     << " shared_expert=" << (_config.num_shared_expert > 0 ? 1 : 0) << std::endl;
+@@ -431,6 +465,106 @@
+         batch.requests.push_back(request);
+     }
+     return batch;
++}
++
++bool OffloadExpertWeightProvider::create_pinned_nvme_pool(lgc::nvme_fill::ArcwellTransport& transport,
++                                                          std::string* reason) {
++    if (_pinned_pool.ready) return true;
++    // The store is the three packed u4 weight matrices in device order. A
++    // native expert format (patch 0043) has a different, non-page-aligned
++    // layout, so the byte-transparent fill is u4-only in this patch; refuse
++    // rather than DMA the wrong bytes.
++    if (_config.gate_up_weight_format != 0 || _config.down_weight_format != 0) {
++        if (reason) {
++            *reason = "pinned NVMe fill is u4-only in this patch: layer " +
++                      std::to_string(layer_key()) + " carries a native expert format";
++        }
++        return false;
++    }
++    const std::uint64_t gu = static_cast<std::uint64_t>(_config.inter_size) * _config.hidden_size / 2;
++    const std::uint64_t dn = static_cast<std::uint64_t>(_config.hidden_size) * _config.inter_size / 2;
++    const std::uint64_t tensor_bytes[3] = {gu, gu, dn};
++    for (int t = 0; t < 3; ++t) {
++        if (tensor_bytes[t] == 0 || (tensor_bytes[t] % 4096) != 0) {
++            if (reason) *reason = "pinned NVMe fill: tensor byte size is not page-aligned";
++            return false;
++        }
++        const std::uint64_t pool_bytes = static_cast<std::uint64_t>(_capacity) * tensor_bytes[t];
++        std::uint64_t bo_size = 0;
++        if (!transport.register_bo(pool_bytes, &_pinned_pool.aw_handle[t], &_pinned_pool.prime_fd[t],
++                                  &bo_size, reason)) {
++            return false;
++        }
++        _pinned_pool.tensor_bytes[t] = tensor_bytes[t];
++    }
++    _pinned_pool.ready = true;
++    return true;
++}
++
++lgc::nvme_fill::PinnedLayerGeometry OffloadExpertWeightProvider::pinned_nvme_geometry(std::uint32_t dense_index) const {
++    lgc::nvme_fill::PinnedLayerGeometry geometry;
++    geometry.capacity = _capacity;
++    geometry.dense_index = dense_index;
++    for (int t = 0; t < 3; ++t) {
++        geometry.aw_handle[t] = _pinned_pool.aw_handle[t];
++        geometry.tensor_bytes[t] = _pinned_pool.tensor_bytes[t];
++    }
++    return geometry;
++}
++
++void OffloadExpertWeightProvider::bind_pinned_nvme_pool(cldnn::engine& engine) {
++    if (!_pinned_pool.ready || _resident == nullptr) return;
++
++    // Import each registered dma-buf into OpenCL and REPLACE this layer's
++    // host-mapped weight slot buffer with a reinterpretation of the imported
++    // pool. The fused GEMV kernel indexes `gate_weight_addr + expert_id *
++    // expert_wei_size` (moe_3gemm_swiglu_mlp.cl), so the pool layout keeps the
++    // per-tensor stride and the full-layout wrapper keeps
++    // expert_tensor_span()'s total_bytes/num_expert arithmetic correct.
++    auto import_and_replace = [&](cldnn::memory::ptr& dst, int t) {
++        if (_pinned_pool.prime_fd[t] < 0) return;
++        const std::uint64_t pool_bytes =
++            static_cast<std::uint64_t>(_capacity) * _pinned_pool.tensor_bytes[t];
++        const auto full_layout = dst->get_layout();
++        // The store's per-tensor stride must equal the device's
++        // full_layout.bytes_count()/num_expert, or expert_tensor_span() and the
++        // GEMV stride would disagree. Assert it rather than assume.
++        OPENVINO_ASSERT(_config.num_expert > 0, "pinned NVMe fill: num_expert is zero");
++        OPENVINO_ASSERT(full_layout.bytes_count() / _config.num_expert == _pinned_pool.tensor_bytes[t],
++                        "pinned NVMe fill: tensor stride mismatch for tensor ", t, ": device ",
++                        full_layout.bytes_count() / _config.num_expert, " vs store ", _pinned_pool.tensor_bytes[t]);
++        OPENVINO_ASSERT(pool_bytes <= full_layout.bytes_count(),
++                        "pinned NVMe fill: slot pool exceeds the full constant layout for tensor ", t);
++        cldnn::layout pool_layout({1, 1, 1, static_cast<ov::Dimension::value_type>(pool_bytes)},
++                                  cldnn::data_types::u8, cldnn::format::bfyx);
++        auto pool_mem = engine.import_buffer(pool_layout, _pinned_pool.prime_fd[t]);
++        OPENVINO_ASSERT(pool_mem != nullptr, "pinned NVMe fill: engine.import_buffer returned null for tensor ", t);
++        // arcwell took its own dma_buf_get at MAP_BUFFER; the exported fd may
++        // be closed now (the transport header records the ownership).
++        ::close(_pinned_pool.prime_fd[t]);
++        _pinned_pool.prime_fd[t] = -1;
++        dst = engine.reinterpret_buffer(*pool_mem, full_layout);
++    };
++    import_and_replace(_resident->gate_w, 0);
++    import_and_replace(_resident->up_w, 1);
++    import_and_replace(_resident->down_w, 2);
++
++    // Scales/zp are NOT in the DMA slice: adding them makes 2,553,600 B = 623.4375
++    // pages (not page-aligned), and the device wants [group][oc] while the file
++    // carries [oc][group]. They stay on the existing transposing host path and
++    // are uploaded here, at load, on the engine's service stream, so every
++    // pinned slot is complete before the first routed call and set_filled()
++    // (already set at the barrier) never races an unwritten scale.
++    auto& service_stream = engine.get_service_stream();
++    const auto resident_experts =
++        _census_seed_active
++            ? _census_seed
++            : static_partition_resident_experts(_static_seed, layer_key(), _config.num_expert, _capacity);
++    for (std::size_t slot = 0; slot < resident_experts.size(); ++slot) {
++        moe_otd::fill_weights_memory(service_stream, _config, _weight_bin_offsets, _weight_reader, *_resident,
++                                     {resident_experts[slot]}, {slot}, _staging, /*include_weights=*/false);
++        _cache->set_filled(slot);
++    }
+ }
+ 
+ void OffloadExpertWeightProvider::fill_routed_weight_views(cldnn::moe_weights& /*weights*/, RoutedWeightViews& views) {
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.hpp
+@@ -165,6 +165,13 @@
+                          cldnn::moe_weights& wei_mem,
+                          const std::vector<uint32_t>& experts_list,
+                          const std::vector<size_t>& lru_experts,
+-                         StagingRing& staging);
++                         StagingRing& staging,
++                         // arcint (patch 0049). When false, the three weight
++                         // tensors (offset_pos 0..2) are skipped and only the
++                         // six scale/zp tensors are uploaded. The pinned NVMe
++                         // fill uses this to complete a BO-backed pinned slot:
++                         // the weights arrived by controller DMA, the small
++                         // scales/zp stay on the existing transposing host path.
++                         bool include_weights = true);
+ 
+ }  // namespace ov::intel_gpu::ocl::moe_otd
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+@@ -299,7 +299,8 @@
+                          cldnn::moe_weights& wei_mem,
+                          const std::vector<uint32_t>& experts_list,
+                          const std::vector<size_t>& lru_experts,
+-                         StagingRing& staging) {
++                         StagingRing& staging,
++                         bool include_weights) {
+     struct tensor_fill_plan {
+         size_t per_expert_size = 0;
+         size_t src_offset = 0;
+@@ -378,6 +379,11 @@
+         };
+ 
+         for (size_t offset_pos = 0; offset_pos < static_cast<size_t>(cldnn::moe_3gemm_fused_compressed::serialized_weight_offset_count); offset_pos++) {
++            // arcint (patch 0049): offset_pos 0..2 are the three weight tensors;
++            // a BO-backed pinned slot already holds them from the arcwell DMA,
++            // so only the scale/zp tensors (3..8) are uploaded on this path.
++            if (!include_weights && offset_pos < 3)
++                continue;
+             auto plan = make_tensor_fill_plan(offset_pos, tensors_by_offset[offset_pos], expert, lru_experts[index]);
+             std::vector<uint8_t> payload;
+ 
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/pinned_nvme_transport.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/pinned_nvme_transport.hpp
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/pinned_nvme_transport.hpp
+@@ -0,0 +1,448 @@
++#pragma once
++
++// nvme-direct-expert-tier (0.5.3 LISBON), design note D2/D3 -- the production
++// arcwell transport for the load-time pinned fill.
++//
++// `pinned_nvme_fill.hpp` (patch 0048) carries the schedule only; its Transport
++// interface is injected. This header supplies the production implementation:
++//
++//   1. ONE xe VRAM BO per (MoE layer, tensor), 64 KiB-rounded, created with the
++//      raw DRM ioctls exactly as arcwell's own stub/test/aw_expert_test.c and
++//      tools/arcwell_cl_slot_proof.c do (DRM_IOCTL_XE_GEM_CREATE with VRAM
++//      placement + NEEDS_VISIBLE_VRAM + CPU_CACHING_WC, then
++//      DRM_IOCTL_PRIME_HANDLE_TO_FD).
++//   2. AW_IOC_MAP_BUFFER registration, asserting AW_MAP_F_REQUIRE_P2P. A
++//      system-memory BO is refused by the module (-ERANGE); there is no
++//      host-bounce fallback.
++//   3. AW_IOC_SUBMIT_BATCH / AW_IOC_BATCH_WAIT driving, four batches in flight
++//      (the Scheduler owns the depth), with out_submitted/out_err checked --
++//      the ioctl return alone is not enough (observed: an unaligned geometry
++//      returns 0 with submitted=0, err=-22).
++//   4. Correct lifetime: the BO's GEM handle is owned by the render-node fd;
++//      the exported dma-buf is a separate reference; arcwell takes its own
++//      dma_buf_get, so the caller may close the exported fd after a successful
++//      map; a registration is released by AW_IOC_UNMAP_BUFFER or fd close, and
++//      in-flight batches hold the buffer until collected.
++//
++// GEOMETRY. The plugin's device layout is three per-tensor slot regions per
++// layer (the fused GEMV kernel indexes each by `expert_id * per_tensor_bytes`,
++// moe_3gemm_swiglu_mlp.cl). The ext4 store's record is `gate|up|down`
++// concatenated for one expert, so ONE expert becomes THREE page-aligned
++// requests (each `per_tensor_bytes` = 200 pages at the served shape), not one
++// -- a dated correction to the design note's "one expert = one request", which
++// held only for the synthetic store whose whole file mapped to one
++// destination. The store ordinal is layer-major (verified 0 mismatches against
++// the store manifest): ordinal = dense_layer_index * capacity + slot, file
++// `expert_%04u.bin`. FIEMAP runs once per file and the absolute LBA is
++// `fe_physical/512 + partition_start` (docs/USING_ARCWELL.md section 5).
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <cerrno>
++#include <limits>
++#include <map>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++#include <fcntl.h>
++#include <sys/ioctl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <linux/fs.h>
++#include <linux/fiemap.h>
++#include <drm/xe_drm.h>
++
++#include "aw_uapi.h"
++#include "pinned_nvme_fill.hpp"
++
++namespace lgc::nvme_fill {
++
++// Per-(layer,tensor) registration the caller built. The transport owns only
++// the arcwell handles and the transfer arithmetic; it does not own the BO's
++// OpenCL import (the provider does that, because the import needs the engine).
++struct PinnedLayerGeometry {
++    std::uint32_t aw_handle[3] = {0, 0, 0};
++    std::uint64_t tensor_bytes[3] = {0, 0, 0};
++    std::uint64_t capacity = 0;
++    std::uint32_t dense_index = 0;
++};
++
++// One plain extent -> absolute LBA, the once-at-open translation. `out_len` is
++// the whole file size; the caller splits it into per-tensor requests.
++inline bool pinned_file_lba(const std::string& path,
++                            std::uint64_t partition_start_sectors,
++                            std::uint64_t* out_lba,
++                            std::uint64_t* out_len,
++                            std::string* reason) {
++    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
++    if (fd < 0) {
++        if (reason) *reason = "open expert file failed: " + path + ": " + std::strerror(errno);
++        return false;
++    }
++    struct stat st;
++    if (fstat(fd, &st) < 0) {
++        if (reason) *reason = std::string("fstat expert file failed: ") + std::strerror(errno);
++        ::close(fd);
++        return false;
++    }
++    union {
++        struct fiemap fm;
++        char raw[sizeof(struct fiemap) + 8 * sizeof(struct fiemap_extent)];
++    } u;
++    std::memset(&u, 0, sizeof u);
++    u.fm.fm_start = 0;
++    u.fm.fm_length = static_cast<std::uint64_t>(st.st_size);
++    u.fm.fm_flags = FIEMAP_FLAG_SYNC;
++    u.fm.fm_extent_count = 8;
++    if (ioctl(fd, FS_IOC_FIEMAP, &u.fm) < 0) {
++        if (reason) *reason = "FS_IOC_FIEMAP failed: " + path + ": " + std::strerror(errno);
++        ::close(fd);
++        return false;
++    }
++    ::close(fd);
++    if (u.fm.fm_mapped_extents != 1) {
++        if (reason) {
++            *reason = "expert file is not one plain extent: " + path + " extents=" +
++                      std::to_string(u.fm.fm_mapped_extents);
++        }
++        return false;
++    }
++    const struct fiemap_extent* ex = &u.fm.fm_extents[0];
++    if (ex->fe_flags & (FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_DELALLOC |
++                        FIEMAP_EXTENT_ENCODED | FIEMAP_EXTENT_DATA_INLINE |
++                        FIEMAP_EXTENT_UNWRITTEN)) {
++        if (reason) {
++            *reason = "expert file extent not plain: " + path + " flags=" +
++                      std::to_string(ex->fe_flags);
++        }
++        return false;
++    }
++    *out_lba = ex->fe_physical / 512 + partition_start_sectors;
++    *out_len = static_cast<std::uint64_t>(st.st_size);
++    return true;
++}
++
++// The production transport. Construct once per process (the coordinator does);
++// `register_bo` is called by each provider while it builds its slot pool, then
++// `set_layers`, then the Scheduler runs `begin`/`submit`/`collect`.
++class ArcwellTransport : public Transport {
++public:
++    ArcwellTransport(std::string drm_path,
++                     std::string arcwell_path,
++                     std::string store_dir,
++                     std::uint64_t partition_start_sectors)
++        : drm_path_(std::move(drm_path)),
++          arcwell_path_(std::move(arcwell_path)),
++          store_dir_(std::move(store_dir)),
++          part_start_(partition_start_sectors),
++          drm_fd_(::open(drm_path_.c_str(), O_RDWR | O_CLOEXEC)),
++          aw_fd_(::open(arcwell_path_.c_str(), O_RDWR | O_CLOEXEC)) {
++        if (drm_fd_ < 0 || aw_fd_ < 0) {
++            reason_ = std::string("open device failed: drm=") + drm_path_ + " arcwell=" + arcwell_path_ +
++                      " (" + std::strerror(errno) + ")";
++            return;
++        }
++        struct aw_ioc_stats st;
++        std::memset(&st, 0, sizeof st);
++        if (ioctl(aw_fd_, AW_IOC_STATS, &st) < 0) {
++            reason_ = std::string("AW_IOC_STATS baseline failed: ") + std::strerror(errno);
++            return;
++        }
++        base_stats_ = st;
++        ok_ = true;
++    }
++
++    ~ArcwellTransport() override { end(); }
++
++    bool ok() const { return ok_; }
++    const std::string& reason() const { return reason_; }
++
++    // Create one 64 KiB-rounded xe VRAM BO, export its dma-buf, and register it
++    // peer-to-peer. The caller imports `prime_fd` with the engine and may then
++    // close it. On any failure `reason` names the step.
++    bool register_bo(std::uint64_t bytes,
++                     std::uint32_t* aw_handle,
++                     int* prime_fd,
++                     std::uint64_t* bo_size,
++                     std::string* reason) {
++        if (!ok_) {
++            if (reason) *reason = reason_;
++            return false;
++        }
++        const std::uint64_t rounded = (bytes + 65535ULL) & ~65535ULL;
++        struct drm_xe_gem_create gc;
++        std::memset(&gc, 0, sizeof gc);
++        gc.size = rounded;
++        gc.placement = 1u << DRM_XE_MEM_REGION_CLASS_VRAM;
++        gc.flags = DRM_XE_GEM_CREATE_FLAG_NEEDS_VISIBLE_VRAM;
++        gc.cpu_caching = DRM_XE_GEM_CPU_CACHING_WC;
++        if (ioctl(drm_fd_, DRM_IOCTL_XE_GEM_CREATE, &gc) < 0) {
++            if (reason) *reason = std::string("DRM_IOCTL_XE_GEM_CREATE failed: ") + std::strerror(errno);
++            return false;
++        }
++        struct drm_prime_handle pr;
++        std::memset(&pr, 0, sizeof pr);
++        pr.handle = gc.handle;
++        pr.flags = O_RDWR | O_CLOEXEC;
++        if (ioctl(drm_fd_, DRM_IOCTL_PRIME_HANDLE_TO_FD, &pr) < 0) {
++            if (reason) *reason = std::string("DRM_IOCTL_PRIME_HANDLE_TO_FD failed: ") + std::strerror(errno);
++            return false;
++        }
++        struct aw_ioc_map_buffer mb;
++        std::memset(&mb, 0, sizeof mb);
++        mb.in_handle = static_cast<std::uint64_t>(pr.fd);
++        mb.in_source = AW_BUF_DMABUF;
++        mb.in_length = static_cast<std::uint32_t>(rounded);
++        if (ioctl(aw_fd_, AW_IOC_MAP_BUFFER, &mb) < 0) {
++            const int saved = errno;
++            ::close(pr.fd);
++            if (reason) {
++                *reason = std::string("AW_IOC_MAP_BUFFER refused the BO: ") + std::strerror(saved) +
++                          " (a system-memory BO is refused; there is no host-bounce fallback)";
++            }
++            return false;
++        }
++        if (!(mb.out_flags & AW_MAP_F_REQUIRE_P2P)) {
++            // The map itself succeeded; release that registration before
++            // dropping the fd, or the handle would leak (it is never stored).
++            std::uint32_t h = mb.out_handle;
++            ioctl(aw_fd_, AW_IOC_UNMAP_BUFFER, &h);
++            ::close(pr.fd);
++            if (reason) *reason = "AW_IOC_MAP_BUFFER returned without AW_MAP_F_REQUIRE_P2P";
++            return false;
++        }
++        *aw_handle = mb.out_handle;
++        *prime_fd = pr.fd;
++        *bo_size = rounded;
++        return true;
++    }
++
++    void set_layers(std::vector<PinnedLayerGeometry> layers) { layers_ = std::move(layers); }
++
++    const aw_ioc_stats& stats() const { return base_stats_; }
++    aw_ioc_stats current_stats() const {
++        aw_ioc_stats st;
++        std::memset(&st, 0, sizeof st);
++        if (aw_fd_ >= 0) ioctl(aw_fd_, AW_IOC_STATS, &st);
++        return st;
++    }
++
++    bool begin(std::string* reason) override {
++        if (!ok_) {
++            if (reason) *reason = reason_;
++            return false;
++        }
++        if (layers_.empty()) {
++            if (reason) *reason = "pinned NVMe transport has no registered layers";
++            return false;
++        }
++        return true;
++    }
++
++    bool submit(const FillBatch& batch, std::uint64_t* batch_id, std::string* reason) override {
++        if (!ok_) {
++            if (reason) *reason = reason_;
++            return false;
++        }
++        if (batch.requests.empty()) {
++            if (reason) *reason = "pinned NVMe fill: empty batch";
++            return false;
++        }
++        const PinnedLayerGeometry* geom = geometry_for(batch.layer);
++        if (geom == nullptr) {
++            if (reason) *reason = "pinned NVMe fill: no registered geometry for layer " +
++                                  std::to_string(batch.layer);
++            return false;
++        }
++
++        std::vector<aw_ioc_read_blocks> reqs;
++        reqs.reserve(batch.requests.size() * 3);
++        for (const auto& r : batch.requests) {
++            std::uint64_t lba = 0;
++            std::uint64_t len = 0;
++            if (!file_lba(batch.layer, r.slot, &lba, &len, reason)) return false;
++            std::uint64_t record = 0;
++            for (int t = 0; t < 3; ++t) record += geom->tensor_bytes[t];
++            if (len != record) {
++                if (reason) {
++                    *reason = "pinned NVMe fill: store file length " + std::to_string(len) +
++                              " != the layer's concatenated record " + std::to_string(record);
++                }
++                return false;
++            }
++            for (int t = 0; t < 3; ++t) {
++                const std::uint64_t tb = geom->tensor_bytes[t];
++                if (tb == 0 || (tb % 512) != 0 || (tb % 4096) != 0) {
++                    if (reason) *reason = "pinned NVMe fill: tensor bytes not page/block aligned for layer " +
++                                          std::to_string(batch.layer);
++                    return false;
++                }
++                aw_ioc_read_blocks rr;
++                std::memset(&rr, 0, sizeof rr);
++                rr.in_buffer_handle = geom->aw_handle[t];
++                rr.in_start_block = lba + static_cast<std::uint64_t>(t) * (tb / 512);
++                rr.in_block_count = tb / 512;
++                rr.in_dest_offset = static_cast<std::uint64_t>(r.slot) * tb;
++                // in_flags stays 0: AW_READ_F_REVALIDATE is unnecessary for a
++                // fallocated one-plain-extent ext4 store whose block map is
++                // fixed at open (docs/USING_ARCWELL.md section 5).
++                reqs.push_back(rr);
++            }
++        }
++
++        Pending pending;
++        pending.logical = batch.requests.size();
++        const std::size_t kPerBatch = 85;  // 85 * 3 = 255 <= AW_BATCH_MAX
++        for (std::size_t start = 0; start < reqs.size(); start += kPerBatch * 3) {
++            const std::size_t end = std::min(reqs.size(), start + kPerBatch * 3);
++            aw_ioc_batch_submit sb;
++            std::memset(&sb, 0, sizeof sb);
++            sb.in_requests = reinterpret_cast<std::uint64_t>(reqs.data() + start);
++            sb.in_count = static_cast<std::uint32_t>(end - start);
++            if (ioctl(aw_fd_, AW_IOC_SUBMIT_BATCH, &sb) < 0) {
++                drain(pending);
++                if (reason) *reason = std::string("AW_IOC_SUBMIT_BATCH failed: ") + std::strerror(errno);
++                return false;
++            }
++            if (sb.out_err != 0 || sb.out_submitted != sb.in_count) {
++                drain(pending);
++                if (reason) {
++                    *reason = "AW_IOC_SUBMIT_BATCH refused the batch: submitted=" +
++                              std::to_string(sb.out_submitted) + " of " + std::to_string(sb.in_count) +
++                              ", err=" + std::to_string(sb.out_err);
++                }
++                return false;
++            }
++            pending.arcwell_ids.push_back(sb.out_batch_id);
++            pending.expected += sb.in_count;
++        }
++        const std::uint64_t id = next_id_++;
++        inflight_.emplace(id, std::move(pending));
++        *batch_id = id;
++        return true;
++    }
++
++    bool collect(std::uint64_t batch_id, CollectOutcome* outcome, std::string* reason) override {
++        auto it = inflight_.find(batch_id);
++        if (it == inflight_.end()) {
++            if (reason) *reason = "pinned NVMe fill: unknown batch id";
++            return false;
++        }
++        Pending pending = std::move(it->second);
++        inflight_.erase(it);
++
++        std::uint64_t completed = 0;
++        std::uint64_t bytes = 0;
++        std::uint32_t segments = 0;
++        std::int32_t err = 0;
++        for (std::uint64_t id : pending.arcwell_ids) {
++            aw_ioc_batch_wait bw;
++            std::memset(&bw, 0, sizeof bw);
++            bw.in_batch_id = id;
++            bw.in_timeout_us = std::numeric_limits<std::uint64_t>::max();
++            if (ioctl(aw_fd_, AW_IOC_BATCH_WAIT, &bw) < 0) {
++                if (reason) *reason = std::string("AW_IOC_BATCH_WAIT failed: ") + std::strerror(errno);
++                return false;
++            }
++            completed += bw.out_completed;
++            bytes += bw.out_bytes;
++            segments += bw.out_segments;
++            if (bw.out_err != 0 && err == 0) err = bw.out_err;
++        }
++        outcome->requested = pending.logical;
++        outcome->completed = static_cast<std::size_t>(completed / 3);
++        outcome->ok = (completed == pending.expected) && (err == 0);
++        outcome->error = err != 0 ? ("arcwell transfer error " + std::to_string(err)) : "";
++        last_bytes_ = bytes;
++        last_segments_ = segments;
++        return true;
++    }
++
++    void end() override {
++        for (auto& l : layers_) {
++            for (int t = 0; t < 3; ++t) {
++                if (l.aw_handle[t] != 0 && aw_fd_ >= 0) {
++                    std::uint32_t h = l.aw_handle[t];
++                    ioctl(aw_fd_, AW_IOC_UNMAP_BUFFER, &h);
++                    l.aw_handle[t] = 0;
++                }
++            }
++        }
++        if (aw_fd_ >= 0) { ::close(aw_fd_); aw_fd_ = -1; }
++        if (drm_fd_ >= 0) { ::close(drm_fd_); drm_fd_ = -1; }
++    }
++
++    std::uint64_t last_bytes() const { return last_bytes_; }
++    std::uint32_t last_segments() const { return last_segments_; }
++
++private:
++    struct Pending {
++        std::vector<std::uint64_t> arcwell_ids;
++        std::uint64_t expected = 0;
++        std::size_t logical = 0;
++    };
++
++    const PinnedLayerGeometry* geometry_for(std::uint32_t dense_index) const {
++        for (const auto& l : layers_) {
++            if (l.dense_index == dense_index) return &l;
++        }
++        return nullptr;
++    }
++
++    bool file_lba(std::uint32_t dense_index, std::uint32_t slot,
++                  std::uint64_t* lba, std::uint64_t* len, std::string* reason) {
++        const PinnedLayerGeometry* geom = geometry_for(dense_index);
++        if (geom == nullptr) {
++            if (reason) *reason = "pinned NVMe fill: layer geometry missing";
++            return false;
++        }
++        const std::uint64_t ordinal = geom->capacity * dense_index + slot;
++        auto it = lba_cache_.find(ordinal);
++        if (it != lba_cache_.end()) {
++            *lba = it->second.first;
++            *len = it->second.second;
++            return true;
++        }
++        char path[1024];
++        std::snprintf(path, sizeof path, "%s/expert_%04llu.bin", store_dir_.c_str(),
++                      static_cast<unsigned long long>(ordinal));
++        std::uint64_t got_lba = 0, got_len = 0;
++        if (!pinned_file_lba(path, part_start_, &got_lba, &got_len, reason)) return false;
++        lba_cache_.emplace(ordinal, std::make_pair(got_lba, got_len));
++        *lba = got_lba;
++        *len = got_len;
++        return true;
++    }
++
++    void drain(Pending& pending) {
++        for (std::uint64_t id : pending.arcwell_ids) {
++            aw_ioc_batch_wait bw;
++            std::memset(&bw, 0, sizeof bw);
++            bw.in_batch_id = id;
++            bw.in_timeout_us = std::numeric_limits<std::uint64_t>::max();
++            ioctl(aw_fd_, AW_IOC_BATCH_WAIT, &bw);
++        }
++        pending.arcwell_ids.clear();
++    }
++
++    std::string drm_path_;
++    std::string arcwell_path_;
++    std::string store_dir_;
++    std::uint64_t part_start_ = 0;
++    int drm_fd_ = -1;
++    int aw_fd_ = -1;
++    bool ok_ = false;
++    std::string reason_;
++    aw_ioc_stats base_stats_{};
++    std::vector<PinnedLayerGeometry> layers_;
++    std::map<std::uint64_t, Pending> inflight_;
++    std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> lba_cache_;
++    std::uint64_t next_id_ = 1;
++    std::uint64_t last_bytes_ = 0;
++    std::uint32_t last_segments_ = 0;
++};
++
++}  // namespace lgc::nvme_fill
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/aw_uapi.h b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/aw_uapi.h
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/aw_uapi.h
+@@ -0,0 +1,292 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/* aw_uapi.h — arcwell kernel-module uAPI.
++ *
++ * arcwell is a KERNEL MODULE project. The card's core is real NVMe bytes
++ * landing in Arc VRAM with nothing else in the loop, which requires a
++ * kernel-side DMA path; a userspace data path cannot provide it (see
++ * KERNEL_FACTS.md, "Architecture"). The prior art in refs/ssd-gpu-dma is
++ * likewise a Linux kernel module.
++ *
++ * Contract source: M4_API.md. The API's shape is one call, storage -> VRAM,
++ * mimicking cuFile's SHAPE with no CUDA naming or dependency. Per that record,
++ * the module's custom surface is the DMA-mapping/registration path:
++ *
++ *   AW_IOC_MAP_BUFFER    register a VRAM buffer as a DMA target for the NVMe
++ *                        controller
++ *   AW_IOC_READ_BLOCKS   issue storage -> VRAM DMA over a raw block range
++ *
++ * FIEMAP is NOT part of this surface. It is the standard FS_IOC_FIEMAP ioctl
++ * and, where experts are addressed as files, it runs once at open as a
++ * file->block-range translation. It never appears in the streaming loop, and
++ * there is no aw_set_fiemap ioctl (M4_API.md, held by tests/test_m4_api.py).
++ *
++ * STATUS at 0.0.1: BUILT and measured. stub/src/arcwell.c serves this surface;
++ * results/ carries the raw output, red case included.
++ *
++ * The blockers this header once listed are resolved, and two of them were never
++ * real (KERNEL_FACTS.md has the disproofs):
++ *   B1 "pci_p2pdma_add_resource deadlocks on Arc BAR2" -- an ABI bug in a
++ *      locally-declared extern, not a kernel limit. Returns 0 in 9 ms.
++ *   B2 "a BAR dma_addr is refused by the NVMe path" -- never actually tested.
++ *      dma_map_resource() returns a valid IOMMU-translated address.
++ *   B3 host-visible VRAM BOs work on stock xe. Unchanged, and still the recipe.
++ *
++ * What remains unproven is stated in docs/USING_ARCWELL.md §8, not hidden here.
++ */
++#ifndef AW_UAPI_H
++#define AW_UAPI_H
++
++#include <linux/types.h>
++#include <linux/ioctl.h>
++
++#define AW_DEVICE_NAME	"arcwell"
++#define AW_IOC_MAGIC	'W'
++
++/* How the caller describes the destination, and how the module obtained it.
++ * The module must not accept a bare user pointer as a DMA target, and must not
++ * accept a host page as a device destination: a host buffer wearing a VRAM
++ * label is how a zero-copy claim becomes false without anyone deciding it. */
++enum aw_buffer_source {
++	AW_BUF_NONE = 0,
++	/* an xe GEM handle, mapped and pinned by the module */
++	AW_BUF_XE_GEM = 1,
++	/* a dma-buf fd exported by xe; the module attaches and maps it and uses
++	 * the exporter's sg dma addresses (BAR2 + offset) */
++	AW_BUF_DMABUF = 2,
++};
++
++/* Flags for aw_ioc_map_buffer.flags */
++#define AW_MAP_F_REQUIRE_P2P	(1u << 0)	/* refuse to register unless the
++						 * mapping really is peer-to-peer
++						 * DMA-capable; never silently
++						 * fall back to a host bounce */
++
++/**
++ * struct aw_ioc_map_buffer - AW_IOC_MAP_BUFFER
++ * @in_handle:	xe GEM handle or dma-buf fd, per @in_source
++ * @in_source:	enum aw_buffer_source
++ * @in_length:	bytes to register; must be a multiple of the NVMe logical block
++ * @out_handle:	module handle used by AW_IOC_READ_BLOCKS
++ * @out_flags:	AW_MAP_F_* bits the module actually honours. If the mapping is
++ *		not peer-capable the ioctl FAILS; it does not report a weaker
++ *		mapping as success.
++ *
++ * Returns 0, or -EOPNOTSUPP when the direct DMA path is not available (with
++ * the reason in dmesg naming which blocker was hit), or -EINVAL.
++ */
++struct aw_ioc_map_buffer {
++	__u64 in_handle;
++	__u32 in_source;
++	__u32 in_length;
++	__u32 out_handle;
++	__u32 out_flags;
++};
++
++/* Flags for aw_ioc_read_blocks.flags */
++#define AW_READ_F_REVALIDATE	(1u << 0)	/* re-derive block map before the
++						 * DMA; a COW filesystem can move
++						 * blocks under a cached map */
++
++/**
++ * struct aw_ioc_read_blocks - AW_IOC_READ_BLOCKS
++ * @in_buffer_handle:	from AW_IOC_MAP_BUFFER
++ * @in_start_block:	NVMe logical block number (512 B units unless the
++ *			namespace reports otherwise)
++ * @in_block_count:	logical blocks to transfer into the registered buffer
++ * @in_dest_offset:	byte offset within the registered buffer
++ * @in_flags:		AW_READ_F_*
++ * @out_bytes:		bytes actually transferred by the controller
++ * @out_segments:	SGL/PRP segments used; nonzero count means the extents
++ *			were gathered, because contiguity is best-effort and is
++ *			never assumed (M4_STORAGE_ZFS)
++ *
++ * This is the primary call: one expert weight buffer per call. Returns bytes
++ * transferred or negative errno. -ESTALE if @AW_READ_F_REVALIDATE found the
++ * block map moved; -EOPNOTSUPP if the registered buffer is not DMA-attached.
++ */
++struct aw_ioc_read_blocks {
++	__u64 in_buffer_handle;
++	__u64 in_start_block;
++	__u64 in_block_count;
++	__u64 in_dest_offset;
++	__u32 in_flags;
++	__u32 _pad;
++	__u64 out_bytes;
++	__u32 out_segments;
++	__u32 _pad2;
++};
++
++/* Upper bound on one batch, so a client cannot make the kernel allocate without
++ * limit. Chosen to comfortably exceed a MoE layer's active expert count. */
++#define AW_BATCH_MAX 256
++
++/**
++ * struct aw_ioc_read_batch - AW_IOC_READ_BATCH
++ * @in_requests:  user pointer to @in_count struct aw_ioc_read_blocks
++ * @in_count:     number of requests, 1..AW_BATCH_MAX
++ * @out_bytes:    total bytes transferred across the batch
++ * @out_completed: requests that completed without error
++ * @out_err_index: index of the first failing request, when @out_err is nonzero
++ * @out_err:      0, or the negative errno of the first failure
++ *
++ * WHY THIS EXISTS. M4_API.md states the inference pattern plainly: "A batch of
++ * experts is the inference pattern, not a single bulk read." AW_IOC_READ_BLOCKS
++ * issues one transfer and waits for it, so a batch of N experts costs N
++ * round-trips end to end and the NVMe queue never holds more than one request.
++ * This call submits the whole batch and then waits, so the controller sees the
++ * requests concurrently and its queue depth is actually used.
++ *
++ * Every request is still one expert buffer; this changes how they are submitted,
++ * not what a transfer is. Per-request semantics, including the peer-to-peer
++ * requirement, are unchanged.
++ *
++ * Returns 0 if every request succeeded, or a negative errno. A partial failure
++ * still returns the counts, so the caller can tell what landed.
++ */
++struct aw_ioc_read_batch {
++	__u64 in_requests;
++	__u32 in_count;
++	__u32 in_flags;
++	__u64 out_bytes;
++	__u32 out_completed;
++	__u32 out_err_index;
++	__s32 out_err;
++	__u32 _pad;
++};
++
++#define AW_IOC_READ_BATCH _IOWR(AW_IOC_MAGIC, 5, struct aw_ioc_read_batch)
++
++/**
++ * struct aw_ioc_batch_submit - AW_IOC_SUBMIT_BATCH
++ * @in_requests:  user pointer to @in_count struct aw_ioc_read_blocks
++ * @in_count:     1..AW_BATCH_MAX
++ * @out_batch_id: opaque id, passed to AW_IOC_BATCH_WAIT
++ * @out_submitted: requests whose transfers were queued
++ * @out_err:      submission-time error only; transfer errors surface at wait
++ *
++ * WHY THIS EXISTS, AND WHY AW_IOC_READ_BATCH IS NOT ENOUGH. Measured on this
++ * hardware (results/LATENCY_2026-09-15.txt): one expert fetched synchronously
++ * costs **1.125 ms**, against 198 us to compute that expert on the host CPU
++ * (docs/milestone-0.3.0.md M14) and ~45 us of critical path for an overlapped
++ * upload (M9). On the decode hot path, unprefetched, a synchronous fetch loses.
++ *
++ * arcwell's advantages are throughput ones — 1.84x the cold host path's bandwidth
++ * and 16.3x less CPU per GiB — and throughput advantages only pay off when the
++ * latency is hidden. That requires issuing fetches AHEAD of the layer that needs
++ * them, which a blocking call cannot express.
++ *
++ * This is cuFile's shape: cuFileBatchIOSubmit returns as soon as the I/O is
++ * queued and cuFileBatchIOGetStatus collects it. GPUDirect split them for the
++ * same reason.
++ *
++ * Returns 0 once the batch is queued. Buffer references are held until the batch
++ * is collected, so a buffer cannot be unmapped out from under an in-flight
++ * transfer. Outstanding batches are drained when the file descriptor closes.
++ */
++struct aw_ioc_batch_submit {
++	__u64 in_requests;
++	__u32 in_count;
++	__u32 in_flags;
++	__u64 out_batch_id;
++	__u32 out_submitted;
++	__s32 out_err;
++};
++
++#define AW_IOC_SUBMIT_BATCH _IOWR(AW_IOC_MAGIC, 6, struct aw_ioc_batch_submit)
++
++/**
++ * struct aw_ioc_batch_wait - AW_IOC_BATCH_WAIT
++ * @in_batch_id:  from AW_IOC_SUBMIT_BATCH
++ * @in_timeout_us: 0 = poll and return -EAGAIN if not finished;
++ *                 UINT64_MAX = block until done; otherwise wait that long
++ * @out_bytes:    bytes transferred
++ * @out_completed: requests that completed
++ * @out_segments: bios the transfers were split into (gather made visible)
++ * @out_err:      0, or the first transfer error
++ *
++ * On success the batch is collected and its id becomes invalid. On -EAGAIN the
++ * batch is still in flight and the id remains valid.
++ *
++ * ONE COLLECTOR AT A TIME. A batch id may be waited on by only one thread at
++ * once; a second concurrent call for the same id returns -EBUSY immediately and
++ * does not wait. This is a contract, not an implementation detail: the second
++ * caller cannot be allowed to park on a batch the first is about to collect and
++ * free. Sharing one id across threads means serialising them yourself, or
++ * treating -EBUSY as "someone else has it" and moving on.
++ *
++ * -EINVAL means the id is unknown -- never submitted, or already collected.
++ */
++struct aw_ioc_batch_wait {
++	__u64 in_batch_id;
++	__u64 in_timeout_us;
++	__u64 out_bytes;
++	__u32 out_completed;
++	__u32 out_segments;
++	__s32 out_err;
++	__u32 _pad;
++};
++
++#define AW_IOC_BATCH_WAIT _IOWR(AW_IOC_MAGIC, 7, struct aw_ioc_batch_wait)
++
++/**
++ * AW_IOC_UNMAP_BUFFER - release a buffer registered by AW_IOC_MAP_BUFFER
++ * @arg: the out_handle returned by AW_IOC_MAP_BUFFER
++ *
++ * Unpins and detaches the dma-buf and drops the module's reference to it. The
++ * caller's own dma-buf fd is unaffected.
++ *
++ * ADDED AFTER THE ORIGINAL CONTRACT. M4_API.md specified map + read + stats and
++ * no release call. That was an omission, not a design: a registration surface
++ * with no way to unregister leaks a pinned VRAM buffer per call, and expert
++ * streaming registers continuously. Buffers are also released automatically when
++ * the file descriptor is closed, so a crashing client cannot strand VRAM.
++ *
++ * Returns 0, or -EINVAL if the handle is not registered to this open file, or
++ * -EBUSY if a transfer against it is still in flight.
++ */
++#define AW_IOC_UNMAP_BUFFER _IOW(AW_IOC_MAGIC, 4, __u32)
++
++/* Observability, so a slow path cannot hide behind a working-looking call. */
++struct aw_ioc_stats {
++	/* --- original layout, DO NOT REORDER. New fields are APPENDED below.
++	 * AW_IOC_STATS is _IOR(..., struct aw_ioc_stats), so the struct size is
++	 * encoded in the ioctl number: changing the size changes the command, and a
++	 * client built against an older header gets -ENOTTY rather than silently
++	 * misreading fields. That is the desired failure, but it still breaks the
++	 * client, so grow this struct only at the end and rebuild callers. --- */
++	__u64 reads;
++	__u64 bytes;
++	__u64 us_total;
++	__u32 via_host_bounce;	/* Counts transfers that WOULD have gone through
++				 * system RAM and were refused. MUST stay 0.
++				 * Nonzero means a caller asked for something the
++				 * module could only have served by bouncing --
++				 * the request failed, but the configuration that
++				 * produced it is wrong.
++				 * Incremented at two sites in arcwell.c: the
++				 * exporter clearing attach->peer2peer, and an sg
++				 * whose pages are not P2PDMA pages. There is no
++				 * path that bounces WITHOUT incrementing this,
++				 * because there is no path that bounces at all --
++				 * both sites return an error. */
++	__u32 segments;
++
++	/* --- appended 2026-09-15: buffer lifecycle --- */
++	__u32 buffers_live;	/* registered right now by this open file */
++	__u32 buffers_peak;	/* high-water mark; if this only ever grows, the
++				 * client is leaking registrations */
++
++	/* --- appended 2026-09-15: batched submission --- */
++	__u64 batches;		/* AW_IOC_READ_BATCH calls */
++	__u64 batch_reads;	/* requests submitted through batches */
++	__u32 max_inflight;	/* largest number of bios in flight at once; if this
++				 * stays at 1 the queue depth is not being used */
++	__u32 batches_inflight;	/* submitted but not yet collected */
++};
++
++#define AW_IOC_MAP_BUFFER   _IOWR(AW_IOC_MAGIC, 1, struct aw_ioc_map_buffer)
++#define AW_IOC_READ_BLOCKS  _IOWR(AW_IOC_MAGIC, 2, struct aw_ioc_read_blocks)
++#define AW_IOC_STATS        _IOR(AW_IOC_MAGIC,  3, struct aw_ioc_stats)
++/* AW_IOC_UNMAP_BUFFER is defined above, next to its documentation. */
++
++#endif /* AW_UAPI_H */

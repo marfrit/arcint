@@ -96,6 +96,13 @@ struct Artifact {
     std::string expert_bodies_path;
     uint64_t    expert_bodies_bytes = 0;
     std::vector<ExpertBodyEntry> expert_bodies;
+    // The emitter's declared expert format from serving-shape.json's
+    // `expert_fill.format` ("native" for the checkpoint's own blocks, "u4"
+    // for the grouped-affine repack); empty when the manifest omits it (an
+    // HF export, or an artifact with no serving-shape.json). The all-resident
+    // native pool at --offload-ratio 0 is only meaningful for "native": an
+    // affine model stays on the direct resident Constants.
+    std::string expert_format;
 
     // True iff serving-shape.json declared segment_layers != null, i.e. the
     // artifact was produced (and must be driven) as a chain of segments,
@@ -106,12 +113,21 @@ struct Artifact {
     bool from_segmented_manifest = false;
     bool segmented() const { return segments.size() > 1 || from_segmented_manifest; }
 
+    // True iff serving-shape.json declared `qsa: true`: the emitter carried the
+    // model's own Qwen Sparse Attention indexer and its per-query selection
+    // into every full-attention layer (campaign qsa, step 3). The layers are
+    // still one KV pair and one attention each; this flag is what tells the
+    // runtime to expect the indexer's raw-key state beside them, and it is
+    // what lets the loader count the layers as QSA-served rather than dense.
+    bool qsa = false;
+
     // Geometry, from config.json (text_config when the export is a VLM).
     std::string model_type;
     std::string ov_arch;
     int n_layer                 = 0;
     int n_gdn_layer             = 0;
     int n_attn_layer            = 0;
+    int n_qsa_layer             = 0;
     int full_attention_interval = 0;
     int n_embd                  = 0;
     // The hyper-connection width term: the hidden state carried between two

@@ -17,7 +17,7 @@ TWO KINDS OF CELL, and the distinction is the point:
 WHAT THIS FILE FOUND, on its first run (2026-09-12), and it is a finding about
 the C++ and not about the export:
 
-`slot_pool_from_ir` (backend_ov.cpp:578-624) identifies a MoE layer by
+`slot_pool_from_ir` (backend_ov.cpp:580-626) identifies a MoE layer by
     std::string tname = node->get_type_name();  ... tolower ...
     if (tname.find("moe") == std::string::npos) continue;      // :585
 NO ARCINT-EXPORTED IR CARRIES AN OP WHOSE TYPE NAME CONTAINS "moe". Measured
@@ -259,6 +259,48 @@ def test_the_ngram_table_travels_as_ports_that_partition_the_vocabulary(built):
     assert not baked, f"the table is still a constant: {baked}"
 
 
+def test_a_staging_bound_turns_the_table_into_one_small_port():
+    """campaign `ple-disk-backend`: with `ngram_staging_rows`, the IR declares
+    ONE `ngram_table.0` port sized to a FORWARD (max_tokens x Hn rows), not to
+    the table. Being SMALLER than the source tensor is exactly how
+    `bind_ngram_ports` recognises a staging window -- a per-forward `pread`
+    instead of the 26.82 GiB USM-host pin.
+
+    RED before the parameter existed: the port covered the whole table.
+    """
+    cfg = pwe.real_config()
+    heads = (cfg.ngram_size - 1) * cfg.heads_per_ngram
+    staging = 512 * heads
+    V = pwe.REAL_GEOMETRY["ngram_total_vocab"]
+    assert staging < V, (staging, V)
+    arena = ss.SparseArena()
+    try:
+        model, report = ss.build_serving_shape_ir(arena=arena, n_layers=_CONTRACT_LAYERS,
+                                                  ngram_staging_rows=staging)
+        ports = {p.get_node().get_friendly_name(): p for p in model.inputs
+                 if p.get_node().get_friendly_name().startswith("ngram_table.")}
+        assert list(ports) == ["ngram_table.0"], sorted(ports)
+        shape = [d.get_length() for d in ports["ngram_table.0"].get_partial_shape()]
+        assert shape == [staging, _NGRAM_ROW_BYTES], shape
+        assert shape[0] < V, (shape[0], V)
+        assert report["ngram_staging_rows"] == staging, report["ngram_staging_rows"]
+        assert report["ngram_table_rows"] == V, report["ngram_table_rows"]
+    finally:
+        arena.close()
+
+
+def test_without_a_staging_bound_the_ports_still_cover_the_whole_table(built):
+    """The regression half: with no staging bound the port partition is
+    unchanged -- the pinned path's contract must not move."""
+    model, report, _ = built
+    assert report["ngram_staging_rows"] is None
+    V = pwe.REAL_GEOMETRY["ngram_total_vocab"]
+    rows = [d[0].get_length() for p in model.inputs
+            if p.get_node().get_friendly_name().startswith("ngram_table.")
+            for d in [p.get_partial_shape()]]
+    assert sum(rows) == V, (rows, V)
+
+
 def test_the_chunked_gather_is_the_whole_table_gather():
     """NUMERIC, on CPU, at a toy width: gathering through the chunked ports
     produces exactly the rows a Gather over the un-chunked table produces --
@@ -392,7 +434,7 @@ def test_the_input_ports_are_the_names_and_shapes_the_serving_path_feeds(built):
     `HashParams::num_ngram_heads() = (ngram_size - 1) * heads_per_ngram`
     (src/exec/ngram_row_ids.h:59), which the same file's header states at :21
     as "16 on Qwen3.8: 8 x 2-gram + 8 x 3-gram", and each head gathers one
-    160-wide row (:22). `position_ids` is the name backend_ov.cpp:99 declares
+    160-wide row (:22). `position_ids` is the name backend_ov.cpp:101 declares
     (`kPositionIds`). `conv_mask` is the port q4e.backbone already declares
     (backbone.py:105-106).
     """
@@ -587,8 +629,8 @@ def slot_pool_from_tiled_ir(model, num_expert, ratio_pct):
     exports instead of a type name: the Constants with leading dim
     `num_expert` that feed a dequant chain, grouped per MoE layer.
 
-    Same per-expert arithmetic as backend_ov.cpp:601-605 (product of dims[1:]
-    times the CEILED element size) and the same slot ceiling as fit.h:95.
+    Same per-expert arithmetic as backend_ov.cpp:603-607 (product of dims[1:]
+    times the CEILED element size) and the same slot ceiling as fit.h:96.
     """
     per_layer = {}
     for node in model.get_ordered_ops():
@@ -623,7 +665,7 @@ def slot_pool_from_tiled_ir(model, num_expert, ratio_pct):
 def test_the_cpp_type_name_matcher_finds_nothing_and_the_line_is_named(built):
     """THE HANDSHAKE FAILURE, named exactly.
 
-    `slot_pool_from_ir`'s gate is backend_ov.cpp:586
+    `slot_pool_from_ir`'s gate is backend_ov.cpp:588
 
         if (tname.find("moe") == std::string::npos) continue;
 
@@ -673,7 +715,7 @@ def test_the_cpp_type_name_matcher_finds_nothing_and_the_line_is_named(built):
     typed = sorted({n.get_type_name() for n in model.get_ordered_ops()
                     if "moe" in n.get_type_name().lower()})
     print(f"\n[contract-otd] moe-typed ops in the serving-shape IR: {typed}")
-    print(f"[contract-otd] slot_pool_from_ir(backend_ov.cpp:578) -> {got}")
+    print(f"[contract-otd] slot_pool_from_ir(backend_ov.cpp:580) -> {got}")
     print(f"[contract-otd] dev-host model store, 2026-09-12: "
           f"{FLEET_IRS_WITH_MOE_TYPED_OP} of {FLEET_IRS_ALL} IRs carry one "
           f"({FLEET_IRS_SIZE_FILTERED} of them over 100k)")
@@ -697,7 +739,7 @@ def test_the_pattern_matcher_prices_the_expert_pool_and_lands_on_the_cpp_constan
     gate+up+down at real geometry = 2*(640*2560) + 2560*640 = 4,915,200 int4
     values = 2,457,600 bytes. The IR walk cannot reproduce that figure, and the
     reason is structural rather than a bug in either side:
-    backend_ov.cpp:605 uses `element_type().size()`, which CEILS a 4-bit width
+    backend_ov.cpp:607 uses `element_type().size()`, which CEILS a 4-bit width
     to one whole byte -- so it reads 4,915,200 B per expert, EXACTLY 2x. The
     C++ comment at :610-615 anticipates over-reservation ("this over-reserves
     rather than under-reserves, pending an on-card audit"); this cell measures
@@ -733,7 +775,7 @@ def test_the_pattern_matcher_prices_the_expert_pool_and_lands_on_the_cpp_constan
 
 
 def test_the_slot_arithmetic_transcription_matches_the_cpp_ceiling():
-    """fit.h:95, `ceil(num_expert * (100 - ratio) / 100)` slots per layer.
+    """fit.h:96, `ceil(num_expert * (100 - ratio) / 100)` slots per layer.
     Checked at the boundaries a ceiling gets wrong."""
     cases = [(512, 0, 512), (512, 50, 256), (512, 100, 0),
              (512, 1, 507), (512, 99, 6), (10, 33, 7), (3, 50, 2)]
@@ -2279,7 +2321,24 @@ def test_expert_port_bodies_unpack_bit_exact_against_the_shipped_codes(tmp_path)
         rq.infer()
         assert not np.array_equal(want_codes, np.array(rq.get_output_tensor(0).data))
 
-        # (2) the dequant: port vs constant, one ulp, counted
+        # (2) the dequant, each path against ITS OWN reference (2026-09-17:
+        # the Constant chain is f16 with a trailing Convert -- the fusing
+        # control's shape -- while the ported chain stays f32 arithmetic)
+        _, pzp, sc32 = ef.ExpertFiller(_RowsSource(small, seed=11), gs).body(0, "gate", E, I, H)
+        zp_codes = ef.unpack_u4(pzp, E * I * (H // gs)).reshape(E, I, H // gs, 1).astype(np.float32)
+        q = want_codes.reshape(E, I, H // gs, gs)
+        ref32 = ((q - zp_codes) * sc32.astype(np.float32)).reshape(E, I, H)
+        # f16 chain: (q - zp) * f16(s) is exact in f32 (4 + 11 bits). Measured
+        # 2026-09-17 on the CPU plugin: the folded chain, trailing Convert
+        # included, returns exactly that f32 product (0 of 262,144 differ);
+        # rounding the reference to f16 first made 42,280 differ. The bound
+        # stays one f16 ulp of the larger product so that a plugin folding
+        # the chain in f16 arithmetic (two roundings, a cancellation) is still
+        # inside it, and the count is printed.
+        sc16 = sc32.astype(np.float16)
+        ref16 = ((q - zp_codes) * sc16.astype(np.float32)).reshape(E, I, H)
+        bound16 = np.broadcast_to(np.spacing(np.float16(16) * np.abs(sc16)).astype(np.float32),
+                                  (E, I, H // gs, gs)).reshape(E, I, H)
         ref = _compile_cpu(const_model).create_infer_request()
         ref.infer()
         want = np.array(ref.get_output_tensor(0).data, dtype=np.float32, copy=True)
@@ -2288,19 +2347,26 @@ def test_expert_port_bodies_unpack_bit_exact_against_the_shipped_codes(tmp_path)
         req.infer()
         got = np.array(req.get_output_tensor(0).data, dtype=np.float32, copy=True)
         assert want.shape == got.shape == (E, I, H) and np.abs(want).max() > 0
-        diff = np.abs(want - got)
+        diff16 = np.abs(want - ref16)
+        n16 = int((diff16 > 0).sum())
+        diff = np.abs(ref32 - got)
         # the bound is one ulp of the PRODUCTS (q * s, zp * s, |q|, |zp| <= 15),
         # not of the result: the fused runtime eltwise evaluates x * s - zp * s
         # (two roundings, then a cancellation), so the absolute error is an
         # ulp of the larger product and can be many ulps of a small result
-        sc = arena.scales["cell/experts_gate/scale"]                  # [E, I, groups, 1]
-        bound = np.broadcast_to(np.spacing(np.float32(16) * np.abs(sc)).astype(np.float32),
+        bound = np.broadcast_to(np.spacing(np.float32(16) * np.abs(sc32)).astype(np.float32),
                                 (E, I, H // gs, gs)).reshape(E, I, H)
         n_diff = int((diff > 0).sum())
-        print(f"[unpack-cell] dequant: port vs constant max |diff| {diff.max():.3e}, "
-              f"{n_diff} of {diff.size} elements differ, all within one ulp of the "
-              f"products: {bool((diff <= bound).all())}")
+        print(f"[unpack-cell] dequant: Constant (f16) chain vs f16 reference max |diff| "
+              f"{diff16.max():.3e}, {n16} of {want.size} differ, within one f16 ulp of the "
+              f"products: {bool((diff16 <= bound16).all())}; port (f32) chain vs f32 "
+              f"reference max |diff| {diff.max():.3e}, {n_diff} differ, within one ulp of "
+              f"the products: {bool((diff <= bound).all())}")
+        assert (diff16 <= bound16).all()
         assert (diff <= bound).all()
+        # and the two COMPILED chains against each other, directly: within
+        # the f16 product ulp on both sides (the f32 ulp is 2^13 smaller)
+        assert (np.abs(want - got) <= 2 * bound16).all(), float(np.abs(want - got).max())
     finally:
         arena.close()
 
@@ -2329,3 +2395,317 @@ def test_expert_ports_are_declared_per_body_of_the_segment_and_the_constants_are
         assert all(n.endswith("/zero_point") for n in u4_consts) and len(u4_consts) == 12
     finally:
         arena.close()
+
+
+# ---------------------------------------------------------------------------
+# THE FUSION CONTRACT (sub4bit-vram-kernel, 2026-09-17): the emitted MoE block
+# must be the shape the GPU plugin's ConvertTiledMoeBlockTo3GatherMatmuls
+# matcher accepts, or nothing downstream of it -- MOECompressed, the slot
+# pool, the CPU tier, per-expert dispatch -- ever exists in the compiled graph
+# ---------------------------------------------------------------------------
+
+def _walk_tiled_moe_pattern(model):
+    """Every ReduceSum of `model`, walked backward against the plugin's
+    3-GEMM tiled-MoE constraint list by `tools/check_tiled_pattern.py` (a
+    Python re-implementation of the C++ matcher, transcribed from the plugin
+    source). Returns (matched names, {reduce_sum name: (constraint, observed,
+    expected)} for the rest). A walker PASS is not a compile: its docstring
+    lists the blind spots. A walker FAIL on a named constraint is a real
+    non-match at the serialised stage."""
+    import check_tiled_pattern as ctp
+    matched, failures = [], {}
+    for rs in model.get_ordered_ops():
+        if rs.get_type_name() != "ReduceSum":
+            continue
+        try:
+            ctp.check_3gemm_from_reduce_sum(rs, lambda s: None)
+            matched.append(rs.get_friendly_name())
+        except ctp.Fail as f:
+            failures[rs.get_friendly_name()] = (f.constraint, f.observed, f.expected)
+    return matched, failures
+
+
+def test_every_moe_layer_walks_the_plugins_tiled_3gemm_pattern(tmp_path):
+    """One full walker match per MoE layer, on the LIVE model and on the
+    save -> read_model round trip (the stage the plugin reads).
+
+    RED FIRST, measured 2026-09-17 on the real depth-12 artifact (12 MoE
+    layers, 43 ReduceSum candidates, 0 matched): every MoE candidate failed
+    at R4.router_reshape.type, observed Transpose, expected Reshape -- and the
+    same walk on this emitter's output fails identically. The compiled graph
+    of that artifact carried 0 MoE-typed primitives and 230 FullyConnected,
+    17.73 GiB device-resident (B60, stock 2026.4.0 + p17), against
+    moe_3gemm_fused_compressed x40 at 1.2 GiB for the HF-exported 35B control
+    on the same plugin and props.
+
+    The cause is in `emit_moe_tiled`: it names `export_mtp.py:401
+    moe_block_tiled` as its source and drops the two Reshapes that function
+    carries and the matcher anchors on -- `end_reshape` (the down-projection
+    output split back to [E,B,-1,H] BEFORE the router-weight Multiply) and
+    `router_reshape` (Transpose -> Reshape [E,B,-1] -> Unsqueeze). Pattern:
+    build_3gemm_pattern() in the plugin's
+    convert_tiled_moe_block_to_gather_matmuls.cpp (`code`).
+
+    Scope: the Constant build only. A ported build (`expert_ports`) carries
+    the bodies as Parameters and the matcher's CompressedWeightsBlock anchors
+    on a Constant, so it cannot match by construction; that route is priced
+    out anyway (window-051 B.3). And a walker PASS is the serialised stage:
+    the plugin's own passes run before the matcher, so the compile's
+    primitive census is the proof, not this cell.
+    """
+    small = _tiny_config(4)
+    arena = ss.SparseArena(capacity_bytes=1 << 32)
+    try:
+        # rope_span=64: the shared rope tables are the bulk of the .bin this
+        # cell writes and no node the walker inspects depends on them
+        model, rep = ss.build_serving_shape_ir(config=small, arena=arena, n_layers=4,
+                                               rope_span=64)
+        n_moe = rep["n_layers"]
+        live_ok, live_fail = _walk_tiled_moe_pattern(model)
+        xml = tmp_path / "tiled.xml"
+        ov.save_model(model, str(xml), compress_to_fp16=False)
+        back = ov.Core().read_model(str(xml))
+        back_ok, back_fail = _walk_tiled_moe_pattern(back)
+        # the device-free fusion oracle (see the rewrite cell): the CPU plugin
+        # runs the same tiled pass, three GatherMatmul primitives per block
+        from openvino._offline_transformations import paged_attention_transformation
+        paged_attention_transformation(back)
+        gm = _cpu_gather_matmuls(_compile_cpu(back))
+    finally:
+        arena.close()
+    print(f"\n[fusion-contract] CPU exec graph GatherMatmul primitives {gm} for {n_moe} MoE layers")
+    assert gm == 3 * n_moe, (gm, n_moe)
+    first_live = sorted(set(v[0] for v in live_fail.values()))
+    first_back = sorted(set(v[0] for v in back_fail.values()))
+    print(f"\n[fusion-contract] {n_moe} MoE layers: live {len(live_ok)} matched, "
+          f"round-trip {len(back_ok)} matched; failing constraints live "
+          f"{first_live}, round-trip {first_back}")
+    # the MoE roots are named `layer<i>/moe/mix`; every other ReduceSum (the
+    # router renorm, the norms) is auto-named and fails at R1 by design
+    moe_fail = {k: v for k, v in live_fail.items() if k.endswith("/moe/mix")}
+    assert len(live_ok) == n_moe, (
+        f"{len(live_ok)} of {n_moe} MoE blocks walk the tiled 3-GEMM pattern on "
+        f"the live model. MoE roots failing: {moe_fail or live_fail}")
+    assert len(back_ok) == n_moe, (
+        f"{len(back_ok)} of {n_moe} MoE blocks survive save -> read_model: "
+        f"{back_fail}. A Reshape the optimiser can prove redundant is folded "
+        f"at save (export_mtp.py:515-531 records the mechanism); the target "
+        f"shape must carry a runtime -1.")
+
+
+def _old_style_tiled_moe(small, arena, seed=3):
+    """One MoE block as `emit_moe_tiled` wrote it BEFORE 2026-09-17 (e50148f):
+    the down MatMul feeding the router-weight Multiply directly, the router
+    side Transpose -> Unsqueeze. Real-valued experts through `ExpertFiller`
+    so a forward through it is not all zeros. Returns (model, E, H)."""
+    from openvino import opset13 as op
+    from q4e import expert_fill as ef
+    E, H, I = small.num_experts, small.hidden_size, small.moe_intermediate_size
+    k = small.num_experts_per_tok
+    i32 = lambda v: op.constant(np.array(v, np.int32))
+    i32v = lambda v: op.constant(np.array([v], np.int32))
+    rng = np.random.default_rng(seed)
+    filler = ef.ExpertFiller(_RowsSource(small, seed=seed), ss.EXPERT_GROUP_SIZE)
+    hidden = op.parameter([1, -1, H], ov.Type.f32)
+    hidden.set_friendly_name("hidden")
+    y_flat = op.reshape(hidden, op.constant(np.array([-1, H], np.int32)), special_zero=False)
+    logits = op.matmul(y_flat, op.constant(rng.standard_normal((E, H)).astype(np.float32) * 0.1),
+                       transpose_a=False, transpose_b=True)
+    probs = op.softmax(logits, axis=-1)
+    tk = op.topk(probs, i32(k), axis=-1, mode="max", sort="value", index_element_type="i32")
+    vals, idx = tk.output(0), tk.output(1)
+    vals = op.divide(vals, op.reduce_sum(vals, i32v(-1), keep_dims=True))
+    vals = op.slice(vals, op.constant(np.array([0, 0], np.int32)),
+                    op.shape_of(vals, output_type="i32"),
+                    op.constant(np.array([1, 1], np.int32)), op.constant(np.array([0, 1], np.int32)))
+    zeros = op.multiply(probs, op.constant(np.array([0.0], np.float32)))
+    weights = op.scatter_elements_update(zeros, idx, vals, i32(-1))
+    tiled = op.tile(y_flat, op.constant(np.array([E, 1], np.int32)))
+    m_h3 = op.reshape(tiled, op.constant(np.array([E, -1, H], np.int32)), special_zero=False)
+    gs = ss.EXPERT_GROUP_SIZE
+
+    def old_chain(out, inn, kind):
+        # the PRE-FIX dequant chain, f32 throughout, no trailing Convert:
+        # built here from the filler's own outputs, not through the emitter
+        pw, pzp, sc = filler.body(0, kind, E, out, inn)
+        groups = inn // gs
+        with ss.shared_constants():
+            w = arena.constant([E, out, groups, gs], ss.EXPERT_DECLARED_TYPE, fill=pw,
+                               name=f"old/experts_{kind}/weight_u4")
+            zp = arena.constant([E, out, groups, 1], ss.EXPERT_DECLARED_TYPE, fill=pzp,
+                                name=f"old/experts_{kind}/zero_point")
+        x = op.subtract(op.convert(w, ov.Type.f32), op.convert(zp, ov.Type.f32))
+        x = op.multiply(x, op.constant(np.ascontiguousarray(sc, dtype=np.float32)))
+        return op.reshape(x, op.constant(np.array([E, out, inn], np.int64)), special_zero=False)
+
+    gate_w, up_w, down_w = old_chain(I, H, "gate"), old_chain(I, H, "up"), old_chain(H, I, "down")
+    g = op.swish(op.matmul(m_h3, gate_w, transpose_a=False, transpose_b=True))
+    u = op.matmul(m_h3, up_w, transpose_a=False, transpose_b=True)
+    outs = op.matmul(op.multiply(g, u), down_w, transpose_a=False, transpose_b=True)
+    wt = op.transpose(weights, op.constant(np.array([1, 0], np.int32)))
+    wt = op.unsqueeze(wt, i32(-1))                                       # the OLD tail
+    mixed = op.reduce_sum(op.multiply(outs, wt), i32v(0), keep_dims=False)
+    out = op.reshape(mixed, op.constant(np.array([1, -1, H], np.int64)), special_zero=False)
+    res = op.result(out)
+    res.set_friendly_name("out")
+    return ov.Model([res], [hidden], "old_style_tiled_moe"), E, H
+
+
+def test_the_tiled_rewrite_makes_an_old_artifact_match_and_keeps_its_values(tmp_path):
+    """`tools/moe_tiled_rewrite.py`: an artifact exported BEFORE the emitter
+    fix is made matcher-conformant in memory, so the compile-time census can
+    run on the measured depth-12 artifact without re-exporting it (the GGUF
+    shards it would need are not on the dev host, 2026-09-17).
+
+    Red first, on the old-style block (its own f32 chain, two-input Swish,
+    no Reshapes -- built here, not through the emitter): walker 0 matched.
+    After the rewrite: 1 block, 1 Swish, 3 chains rewritten, walker 1
+    matched, live and after save -> read_model, and the CPU plugin compiles
+    it to three GatherMatmul primitives. Idempotent on the fixed emitter's
+    4-layer build (0/0/0, 4/4 stay). Values: the CPU plugin's forward through
+    the old and the rewritten graph agree to allclose(rtol 1e-4, atol 1e-5)
+    at T=5 -- fused, the routed experts are summed in another order, and the
+    rewritten chain's scales are f16 against the old chain's exact f32 --
+    not bit for bit (measured 4.3e-4 max).
+    """
+    import moe_tiled_rewrite as mtr
+    small = _tiny_config(4)
+    arena = ss.SparseArena(capacity_bytes=1 << 32)
+    try:
+        old, E, H = _old_style_tiled_moe(small, arena)
+        ok0, fail0 = mtr.walk(old)
+        # the router renorm's ReduceSum(keep_dims=true) is a candidate too and
+        # fails at R1 by design; the MoE root fails at the router Reshape
+        assert ok0 == [] and "R4.router_reshape.type" in set(fail0.values()), (ok0, fail0)
+        x = np.random.default_rng(9).standard_normal((1, 5, H)).astype(np.float32)
+        rq = _compile_cpu(old).create_infer_request()
+        rq.set_tensor("hidden", ov.Tensor(x))
+        rq.infer()
+        want = np.array(rq.get_output_tensor(0).data, dtype=np.float32, copy=True)
+        assert want.shape == (1, 5, H) and np.abs(want).max() > 0
+
+        r = mtr.rewrite_tiled_moe(old)
+        ok1, fail1 = mtr.walk(old)
+        # one block: its Reshapes, its two-input Swish, its three f32 chains
+        assert (r["blocks"], r["swish"], r["chains"]) == (1, 1, 3), (r, ok1, fail1)
+        assert len(ok1) == 1, (ok1, fail1)
+        xml = tmp_path / "old_rewritten.xml"
+        ov.save_model(old, str(xml), compress_to_fp16=False)
+        back = ov.Core().read_model(str(xml))
+        ok2, fail2 = mtr.walk(back)
+        assert len(ok2) == 1, (ok2, fail2)
+        assert mtr.rewrite_tiled_moe(back) == {"blocks": 0, "swish": 0, "chains": 0}   # idempotent
+        cm = _compile_cpu(back)
+        rq = cm.create_infer_request()
+        rq.set_tensor("hidden", ov.Tensor(x))
+        rq.infer()
+        got = np.array(rq.get_output_tensor(0).data, dtype=np.float32, copy=True)
+        diff = float(np.abs(want - got).max())
+        gm_old, gm_new = _cpu_gather_matmuls(_compile_cpu(_old_style_tiled_moe(small, arena)[0])), _cpu_gather_matmuls(cm)
+        print(f"\n[tiled-rewrite] old block: walker 0 -> {len(ok1)} live, {len(ok2)} after "
+              f"round-trip; CPU exec graph GatherMatmul old {gm_old} -> rewritten {gm_new}; "
+              f"forward max |diff| {diff:.3e} over {want.size} elements")
+        # THE DEVICE-FREE FUSION ORACLE: the CPU plugin runs the same
+        # ConvertTiledMoeBlockToGatherMatmuls pass (with any weight producer
+        # accepted), so a matched block compiles to GatherMatmul primitives
+        # there -- three per block (gate, up, down) -- and an unmatched one
+        # to none. The GPU's second stage (MoeOpFusion -> MOECompressed) is
+        # not exercised here; the card census is.
+        assert gm_old == 0 and gm_new == 3, (gm_old, gm_new)
+        # fused, the routed experts are summed in another order AND the
+        # rewrite carries the scales as f16 (the old chain's are exact f32):
+        # the same values to ~2^-11 relative, not bit for bit (measured
+        # 4.3e-4 max at T=5; a mis-wired Reshape is off by O(1))
+        assert got.shape == want.shape and np.allclose(want, got, rtol=2e-3, atol=1e-3), diff
+
+        fixed, rep = ss.build_serving_shape_ir(config=small, arena=arena, n_layers=4,
+                                               rope_span=64)
+        assert mtr.rewrite_tiled_moe(fixed) == {"blocks": 0, "swish": 0, "chains": 0}
+        ok3, _ = mtr.walk(fixed)
+        assert len(ok3) == rep["n_layers"]
+    finally:
+        arena.close()
+
+
+def _cpu_gather_matmuls(compiled):
+    """GatherMatmul-typed primitives in a CPU-compiled model's runtime graph."""
+    n = 0
+    for node in compiled.get_runtime_model().get_ops():
+        ri = node.get_rt_info()
+        lt = ri["layerType"].astype(str) if "layerType" in ri else ""
+        if "gathermatmul" in lt.lower():
+            n += 1
+    return n
+
+
+def test_every_intermediate_of_the_iq4nl_decode_is_exact_in_f16():
+    """STRUCTURAL, on CPU at f32: every f32 intermediate of
+    `ngram_dequant_iq4nl` except the last product (`kv * d`, and the Reshape
+    of it) holds a value that f16 represents exactly, for every finite f16
+    scale: all 63,488 byte pairs whose exponent is not 31. Exponent 31 is
+    inf/NaN, never a table scale, and the power table maps it to 2**16,
+    which overflows f16.
+
+    Why: the GPU plugin runs the served graph at f16 execution precision
+    (no inference-precision hint on the main model), and on the A770 the
+    decode that formed the scale's bit pattern as `lo + 256 * hi` (up to
+    65,535; f16 is exact only to 2,048) came back at 1.41 % relative error,
+    93 % of elements wrong, where f32 execution is exact
+    (`measured-here`, 2026-09-27, 64 x 16 real table rows, DESIGN 7.0.2cz).
+    Building the sign, exponent and mantissa from the two bytes apart keeps
+    every intermediate an integer <= 255, a dyadic fraction of <= 11
+    significant bits, a table power of two, or the f16 scale itself; the
+    card then returns the exact decode rounded to f16, bit for bit, in the
+    same probe.
+
+    RED on the `lo + 256 * hi` decode (`measured-here`): 4 of its 29
+    intermediates are not f16-exact (`bits` up to 64,511, `rest`, and the
+    two divides that read them).
+    """
+    head_dim, Hn = 160, 16
+    rb = ss.ngram_row_bytes(head_dim)
+    nb = head_dim // 32
+    pairs = np.arange(65536, dtype=np.uint32)
+    pairs = pairs[((pairs >> 10) & 0x1F) != 31]           # finite scales only (exponent 31 = inf/NaN)
+    assert pairs.size == 63488
+    per_step = nb * Hn                                    # scale pairs per token
+    pairs = np.concatenate([pairs, np.zeros(-pairs.size % per_step, np.uint32)])
+    n = pairs.size // nb                                  # rows covering every pair, padded with pair 0
+    raw = np.random.default_rng(3).integers(0, 256, size=(n, rb), dtype=np.uint8)
+    flat = pairs.reshape(n, nb)
+    for b in range(nb):
+        raw[:, b * 18] = (flat[:, b] & 0xFF).astype(np.uint8)
+        raw[:, b * 18 + 1] = (flat[:, b] >> 8).astype(np.uint8)
+    x = ov.opset13.parameter([1, -1, Hn, rb], ov.Type.f32)
+    out = ss.ngram_dequant_iq4nl(x, head_dim)
+    last = {out.get_instance_id(), out.input_value(0).get_node().get_instance_id()}
+    probes = []
+    seen = set()
+    stack = [out.input_value(0).get_node()]
+    while stack:                                          # every node between x and out
+        node = stack.pop()
+        if node.get_instance_id() in seen:
+            continue
+        seen.add(node.get_instance_id())
+        for inp in node.inputs():
+            stack.append(inp.get_source_output().get_node())
+        if (node.get_type_name() not in ("Parameter", "Constant")
+                and node.get_instance_id() not in last
+                and node.get_output_element_type(0) == ov.Type.f32):
+            probes.append(node)
+    assert len(probes) == 29
+    model = ov.Model([ov.opset13.result(p) for p in probes], [x], "iq4nl_decode_f16")
+    rows = n
+    req = ov.Core().compile_model(model, "CPU", {"INFERENCE_PRECISION_HINT": "f32"}).create_infer_request()
+    req.set_input_tensor(ov.Tensor(np.ascontiguousarray(
+        raw[:rows].astype(np.float32).reshape(1, rows // Hn, Hn, rb))))
+    req.infer()
+    bad = []
+    for i, p in enumerate(probes):
+        v = req.get_output_tensor(i).data
+        assert np.isfinite(v).all()
+        if not np.array_equal(v.astype(np.float16).astype(np.float32), v):
+            bad.append(f"{p.get_type_name()} max {float(np.abs(v).max()):g}")
+    print(f"\n[iq4nl-decode f16] {len(probes)} intermediates over {rows * nb} scale pairs; "
+          f"not f16-exact: {bad}")
+    assert not bad

@@ -1,0 +1,59 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 17ba18b..fa1c275 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -24351,7 +24351,7 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
+             CL_CHECK(clSetKernelArg(k2, a++, sizeof(int),      &ne01));
+             CL_CHECK(clSetKernelArg(k2, a++, sizeof(int),      &ncols));
+             const size_t wgn = (size_t)backend_ctx->kq2d_wg * 16;
+-            size_t global_work_size[] = { (size_t)CEIL_DIV(ne01, (int)wgn) * wgn, (size_t)CEIL_DIV(ncols, backend_ctx->kq2d_tm), 1 };
++            size_t global_work_size[] = { (size_t)CEIL_DIV(ncols, backend_ctx->kq2d_tm) * wgn, (size_t)CEIL_DIV(ne01, (int)wgn), 1 };
+             size_t local_work_size[]  = { wgn, 1, 1 };
+             backend_ctx->enqueue_ndrange_kernel(k2, 3, global_work_size, local_work_size, dst);
+             return true;
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
+index 19cfa91..10f06a6 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
+@@ -75,24 +75,33 @@ static inline void put_b(const float * y, int8 * b0, int8 * b1) {
+ }
+ 
+ // the multiply of one 32-k sub-block at k0 for the work-group's TM tokens
++// b0 against every token group, then b1: a group's two dependent DPAS are
++// TM / 8 apart, not adjacent (adjacent ones made IGC drain the matrix unit
++// between them, 22 completion waits a super-block in the ISA)
+ #define MUL32(k0)                                                                           \
+     _Pragma("unroll")                                                                       \
+     for (int gb = 0; gb < TM / AT; ++gb) {                                                  \
+-        ushort a0[AT], a1[AT];                                                              \
++        ushort a0[AT];                                                                      \
+         AREAD(a0, (k0), t0 + gb * AT);                                                      \
++        _Pragma("unroll")                                                                   \
++        for (int u = 0; u < AT / 8; ++u)                                                    \
++            acc[gb * (AT / 8) + u] = DPAS(as_short8(vload8(0, a0 + 8 * u)), b0, acc[gb * (AT / 8) + u]); \
++    }                                                                                       \
++    _Pragma("unroll")                                                                       \
++    for (int gb = 0; gb < TM / AT; ++gb) {                                                  \
++        ushort a1[AT];                                                                      \
+         AREAD(a1, (k0) + 16, t0 + gb * AT);                                                 \
+         _Pragma("unroll")                                                                   \
+-        for (int u = 0; u < AT / 8; ++u) {                                                  \
+-            const int g = gb * (AT / 8) + u;                                                \
+-            acc[g] = DPAS(as_short8(vload8(0, a0 + 8 * u)), b0, acc[g]);                    \
+-            acc[g] = DPAS(as_short8(vload8(0, a1 + 8 * u)), b1, acc[g]);                    \
+-        }                                                                                   \
++        for (int u = 0; u < AT / 8; ++u)                                                    \
++            acc[gb * (AT / 8) + u] = DPAS(as_short8(vload8(0, a1 + 8 * u)), b1, acc[gb * (AT / 8) + u]); \
+     }
+ 
+ #define PROLOGUE                                                                            \
+     const int lane = get_sub_group_local_id(), sg = get_sub_group_id();                     \
+-    const int r0 = (get_group_id(0) * WG + sg) * 16;                                        \
+-    const int t0 = get_group_id(1) * TM;                                                    \
++    /* token tiles the fast grid dimension: a weight panel is read by its */                \
++    /* token tiles in turn while it is in L2, not once per tile from memory */              \
++    const int r0 = (get_group_id(1) * WG + sg) * 16;                                        \
++    const int t0 = get_group_id(0) * TM;                                                    \
+     const int nb = ne00 / QK_K;                                                             \
+     const int n  = min(r0 + lane, ne01 - 1);                                                \
+     float8 acc[NG];                                                                         \

@@ -338,11 +338,20 @@ def emit_shared_expert(hidden_bth, config, state, seq_len):
     I = config.shared_expert_intermediate_size
     T = -1 if seq_len is None else int(seq_len)   # -1: dynamic in T
     h2d = _reshape(hidden_bth, [T, H])
-    sg = _mm(h2d, _c(state["shared_expert.gate_proj.weight"]), tb=True)
-    su = _mm(h2d, _c(state["shared_expert.up_proj.weight"]), tb=True)
+
+    # named, so an export pass can tell them apart: the GPU plugin fuses this
+    # MLP INTO the MoE op (FuseMOESharedExpert takes the four weights as they
+    # are), and its kernel reads plain weights -- q4e.dense_u8 keeps them
+    def w(key):
+        c = _c(state[key])
+        c.set_friendly_name(key.replace("shared_expert.", "shared_expert/").replace(".weight", ""))
+        return c
+
+    sg = _mm(h2d, w("shared_expert.gate_proj.weight"), tb=True)
+    su = _mm(h2d, w("shared_expert.up_proj.weight"), tb=True)
     sinter = _mul(_silu(sg), su)
-    sout = _mm(sinter, _c(state["shared_expert.down_proj.weight"]), tb=True)
-    sgate = op.sigmoid(_mm(h2d, _c(state["shared_expert_gate.weight"]), tb=True))
+    sout = _mm(sinter, w("shared_expert.down_proj.weight"), tb=True)
+    sgate = op.sigmoid(_mm(h2d, w("shared_expert_gate.weight"), tb=True))
     return _mul(sgate, sout)
 
 

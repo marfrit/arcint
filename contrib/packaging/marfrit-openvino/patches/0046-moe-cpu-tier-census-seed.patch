@@ -1,0 +1,434 @@
+# MoE host CPU compute tier VENICE: census-seeded static partition (patch 0046)
+
+# Applied on top of patches/0003-0045, against the pinned runtime build
+# 2026.4.0-22849-71640275d29. Mechanism (campaign docs/campaigns/expert-hot-
+# set-lru.md, design docs/design-expert-hot-set-lru.md Section 5.1): patch
+# 0018 chooses a layer's resident expert set with a frequency-FREE
+# splitmix64(seed, layer_key, expert) rank, measured (tools/
+# expert_policy_compare.py) to sit at CHANCE at every budget (0.92-1.10x
+# slots/512). VENICE replaces that ranking with a measured-frequency rank
+# from a served-routing census, so the pinned half is the hot half.
+#
+# Where it lives:
+#   src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/census_seed.hpp  (new)
+#     a dependency-free parser for the "hot-set seed v2" format, one line per
+#     layer `<layer_key> <expert> <expert> ...`, with a MANDATORY
+#     `# space=layer_key` header. Malformed lines, duplicate layer_keys,
+#     duplicate expert ids, a missing/wrong space header and an empty file are
+#     REFUSED (std::runtime_error), not defaulted.
+#     census_seed_resident_experts() validates one layer against the model:
+#     the layer_key must be present, the expert count must equal the pool
+#     capacity (a budget that moved since the census is a mismatch), and every
+#     expert id must be < num_expert.
+#   .../expert_weight_providers.hpp/.cpp
+#     OffloadExpertWeightProvider gains set_census_seed()/census_seed_active()
+#     and bind() pins the census set when active, else patch 0018's splitmix64
+#     rank. Both are pure functions of the layer's recorded inputs, so DESIGN
+#     Section 3.4 (history-independent greedy output) is untouched.
+#   .../moe_3gemm_swiglu_opt.cpp
+#     the impl constructor reads the per-run env var MOE_CPU_TIER_SEED (a path)
+#     once per process (cached across the 48 layers), validates this layer's
+#     entry at construction -- so a mismatched seed REFUSES THE LOAD before any
+#     request is served -- and logs `seed_source=census|census_seed_fp=0x...`
+#     beside the existing seed/resident_checksum fields. Unset env = patch
+#     0018 behaviour, byte-for-byte.
+#
+# Invariant: the seed is a pure function of the RECORDED census (the corpus
+# census, tools/hot_set_census.py select --census), not of run history, so
+# DESIGN Section 3.4 still holds. The seed does not change the arithmetic a
+# non-resident expert runs: residency only decides WHICH arithmetic (device
+# f16 vs host f32) an expert takes, and patch 0018 makes that set history-free.
+#
+# Evidence class: this header is `code`. Its device-free refusal cells are in
+# tools/test_census_seed.py (compile the header with g++ and exercise each
+# malformed/mismatched case). The served quality row is measured on the A770.
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/census_seed.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/census_seed.hpp
+new file mode 100644
+index 0000000..b760fb2
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/census_seed.hpp
+@@ -0,0 +1,188 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++// arcint VENICE (patch 0046). Census-seeded static partition for the MoE host
++// compute tier.
++//
++// Patch 0018 chooses a layer's resident expert set with a frequency-FREE
++// splitmix64 rank over (seed, layer_key, expert). The VENICE campaign replaces
++// that ranking with a measured-frequency rank: a seed file emitted by
++// tools/hot_set_census.py select, keyed by the structural layer_key (the
++// layer's first OTD weight-file offset -- the same key patch 0018 and patch
++// 0044's routing trace already use). The set membership is still a pure
++// function of the recorded census, so DESIGN Section 3.4 (history-independent
++// greedy output) is untouched: the seed does not depend on run history, and a
++// layer's set is fixed once at bind().
++//
++// Format ("hot-set seed v2"), one data line per layer:
++//   <layer_key> <expert> <expert> ...
++// `#` lines are comments; the header MUST declare `# space=layer_key`, so a
++// seed keyed by the decoder-layer index cannot be silently consumed as a
++// layer_key seed. Expert ids must be distinct; they may appear in any order
++// (frequency rank order is preserved in the file, and the caller re-sorts
++// ascending for slot assignment).
++//
++// This header is deliberately free of OpenVINO dependencies: it is pure
++// <algorithm>/<cstdint>/<map>/<stdexcept>/<string>/<vector>, so the parser and
++// its red-first refusal cells compile and run device-free with a plain g++
++// (see tools/test_census_seed.py).
++
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <map>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace ov::intel_gpu::ocl::moe {
++
++struct CensusSeed {
++    // decoder-layer layer_key -> the experts the census ranked resident.
++    std::map<size_t, std::vector<uint32_t>> by_layer_key;
++};
++
++namespace census_seed_detail {
++inline bool parse_ull(const std::string& tok, unsigned long long& out) {
++    if (tok.empty())
++        return false;
++    for (char c : tok)
++        if (c < '0' || c > '9')
++            return false;
++    try {
++        size_t pos = 0;
++        out = std::stoull(tok, &pos);
++        return pos == tok.size();
++    } catch (...) {
++        return false;
++    }
++}
++}  // namespace census_seed_detail
++
++// Parse format v2. Throws std::runtime_error on any malformed line, a
++// duplicate layer_key, a duplicate expert id, a missing or wrong `space=`
++// header, or no data rows at all. The strictness is the point: a seed that
++// cannot be attributed to the layer_key space is a mismatch, not a default.
++inline CensusSeed parse_census_seed(const std::string& text) {
++    CensusSeed seed;
++    bool space_declared = false;
++    bool space_is_layer_key = false;
++    size_t lineno = 0;
++    size_t start = 0;
++    while (start <= text.size()) {
++        const size_t nl = text.find('\n', start);
++        std::string line = (nl == std::string::npos) ? text.substr(start)
++                                                     : text.substr(start, nl - start);
++        start = (nl == std::string::npos) ? text.size() + 1 : nl + 1;
++        ++lineno;
++        auto fail = [&](const std::string& why) -> void {
++            throw std::runtime_error("census seed line " + std::to_string(lineno) + ": " + why);
++        };
++        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
++            line.pop_back();
++        if (line.empty())
++            continue;
++        if (line[0] == '#') {
++            const size_t pos = line.find("space=");
++            if (pos != std::string::npos) {
++                std::string val;
++                for (char c : line.substr(pos + 6)) {
++                    if (c == ' ' || c == '\t' || c == '\r')
++                        break;
++                    val.push_back(c);
++                }
++                space_declared = true;
++                space_is_layer_key = (val == "layer_key");
++            }
++            continue;
++        }
++        std::vector<std::string> toks;
++        std::string tok;
++        for (char c : line) {
++            if (c == ' ' || c == '\t' || c == '\r') {
++                if (!tok.empty()) {
++                    toks.push_back(tok);
++                    tok.clear();
++                }
++            } else {
++                tok.push_back(c);
++            }
++        }
++        if (!tok.empty())
++            toks.push_back(tok);
++        if (toks.size() < 2)
++            fail("data line needs a layer_key and at least one expert id");
++        unsigned long long layer_key = 0;
++        if (!census_seed_detail::parse_ull(toks[0], layer_key))
++            fail("layer_key is not a non-negative integer: " + toks[0]);
++        if (seed.by_layer_key.count(static_cast<size_t>(layer_key)))
++            fail("duplicate layer_key " + toks[0]);
++        std::vector<uint32_t> experts;
++        for (size_t i = 1; i < toks.size(); ++i) {
++            unsigned long long e = 0;
++            if (!census_seed_detail::parse_ull(toks[i], e))
++                fail("expert id is not a non-negative integer: " + toks[i]);
++            if (e > 0xFFFFFFFFULL)
++                fail("expert id does not fit uint32: " + toks[i]);
++            experts.push_back(static_cast<uint32_t>(e));
++        }
++        std::vector<uint32_t> sorted = experts;
++        std::sort(sorted.begin(), sorted.end());
++        for (size_t i = 1; i < sorted.size(); ++i)
++            if (sorted[i] == sorted[i - 1])
++                fail("duplicate expert id " + std::to_string(sorted[i]));
++        seed.by_layer_key[static_cast<size_t>(layer_key)] = experts;
++    }
++    if (!space_declared)
++        throw std::runtime_error("census seed: missing `# space=layer_key` header");
++    if (!space_is_layer_key)
++        throw std::runtime_error(
++            "census seed: declared space is not `layer_key` -- a decoder-index seed "
++            "cannot be consumed as a static-partition seed");
++    if (seed.by_layer_key.empty())
++        throw std::runtime_error("census seed: no data rows");
++    return seed;
++}
++
++// The validated resident set for one layer: its seed entry, sorted ascending
++// for slot assignment. Throws on a layer absent from the seed (the file and
++// the model disagree), a slot-count mismatch (the pool budget changed since
++// the census was taken), or an expert id outside [0, num_expert).
++inline std::vector<uint32_t> census_seed_resident_experts(const CensusSeed& seed,
++                                                          size_t layer_key,
++                                                          size_t num_expert,
++                                                          size_t capacity) {
++    auto it = seed.by_layer_key.find(layer_key);
++    if (it == seed.by_layer_key.end())
++        throw std::runtime_error("census seed: layer_key " + std::to_string(layer_key) +
++                                 " is absent from the seed (mismatched model/seed)");
++    if (it->second.size() != capacity)
++        throw std::runtime_error("census seed: layer_key " + std::to_string(layer_key) +
++                                 " lists " + std::to_string(it->second.size()) +
++                                 " experts but the pool has " + std::to_string(capacity) +
++                                 " slots (mismatched budget)");
++    for (uint32_t e : it->second)
++        if (e >= num_expert)
++            throw std::runtime_error("census seed: expert " + std::to_string(e) +
++                                     " is out of range [0, " + std::to_string(num_expert) +
++                                     ") for layer_key " + std::to_string(layer_key));
++    std::vector<uint32_t> sorted = it->second;
++    std::sort(sorted.begin(), sorted.end());
++    return sorted;
++}
++
++// FNV-1a over the seed TEXT, for the `cpu_tier on:` log line: a fingerprint of
++// the file two runs were seeded from, so residency agreement can be diffed
++// without dumping the whole set. Not a cryptographic digest.
++inline uint64_t census_seed_fingerprint(const std::string& text) {
++    uint64_t h = 0xCBF29CE484222325ULL;
++    for (unsigned char c : text) {
++        h ^= static_cast<uint64_t>(c);
++        h *= 0x100000001B3ULL;
++    }
++    return h;
++}
++
++}  // namespace ov::intel_gpu::ocl::moe
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+index ab2f20e..3436196 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+@@ -290,8 +290,14 @@ void OffloadExpertWeightProvider::bind(cldnn::moe_weights& resident) {
+     // called once on first execution, strictly before try_acquire_
+     // simultaneous/acquire_one see live traffic.
+     if (_static_partition && !_static_partition_reserved) {
++        // arcint VENICE (patch 0046). When a census seed is active for this
++        // layer, pin the census-ranked set; otherwise keep patch 0018's
++        // frequency-free splitmix64 rank. Both are pure functions of the
++        // layer's recorded inputs, so bind() stays history-independent.
+         const auto resident_experts =
+-            static_partition_resident_experts(_static_seed, layer_key(), _config.num_expert, _capacity);
++            _census_seed_active
++                ? _census_seed
++                : static_partition_resident_experts(_static_seed, layer_key(), _config.num_expert, _capacity);
+         for (size_t slot = 0; slot < resident_experts.size(); ++slot)
+             _cache->reserve_pinned(resident_experts[slot], slot);
+         _static_partition_reserved = true;
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+index a28125e..f9d1b5f 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+@@ -9,6 +9,7 @@
+ #include <filesystem>
+ #include <memory>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ #include "expert_weight_provider.hpp"
+@@ -141,6 +142,23 @@ public:
+         return _static_seed;
+     }
+ 
++    // arcint VENICE (patch 0046). Set once from the impl constructor when
++    // MOE_CPU_TIER_SEED names a census seed file and THIS layer's layer_key
++    // resolves to a validated resident set (census_seed_resident_experts()
++    // already threw at construction if the file and the model disagreed).
++    // When active, bind() pins THIS set instead of patch 0018's frequency-free
++    // splitmix64 rank; the set is still a pure function of the recorded
++    // census, so DESIGN Section 3.4 is untouched. The vector is the seed's
++    // own membership, sorted ascending, and its length was validated against
++    // _capacity at construction.
++    void set_census_seed(std::vector<uint32_t> experts) {
++        _census_seed = std::move(experts);
++        _census_seed_active = true;
++    }
++    bool census_seed_active() const {
++        return _census_seed_active;
++    }
++
+     // arcint M10 (patches/0013). Per-expert routing histogram: one counter per
+     // expert id in [0, config.num_expert), incremented once per (call,
+     // occurrence) in try_acquire_simultaneous BEFORE the hit/miss split (see
+@@ -193,6 +211,9 @@ private:
+     // arcint F2 (patch 0018). See set_static_partition().
+     bool _static_partition = false;
+     uint64_t _static_seed = 0;
++    // arcint VENICE (patch 0046). See set_census_seed().
++    std::vector<uint32_t> _census_seed;
++    bool _census_seed_active = false;
+     // arcint F2. Guards bind()'s one-time reserve_pinned() pass; bind() is
+     // documented ("called once on first execution") but this makes the
+     // reservation idempotent-safe rather than trusting that unconditionally.
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+index 75d29a8..a35e35f 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -6,6 +6,9 @@
+ #include <iostream>
+ #include <cstdlib>
+ #include <cstring>
++#include <fstream>
++#include <map>
++#include <sstream>
+ 
+ // clang-format off
+ #include "moe_3gemm_gen_micro.hpp"
+@@ -15,6 +18,7 @@
+ #include "lru_cache.hpp"
+ #include "expert_weight_providers.hpp"
+ #include "static_partition.hpp"
++#include "census_seed.hpp"
+ // arcint M14 (patches/0011). Host CPU compute tier: ExpertDesc/ExpertJob/
+ // CpuTierPool/moe_cpu_expert(). No cldnn/OpenVINO deps of its own (see that
+ // header's comment), so including it unconditionally here is harmless.
+@@ -38,6 +42,37 @@ using ov::intel_gpu::ocl::moe::static_partition_checksum;
+ using ov::intel_gpu::ocl::moe::kCpuTierSentinelSlot;
+ using ov::intel_gpu::ocl::moe::static_partition_resident_experts;
+ 
++namespace {
++// arcint VENICE (patch 0046). The census seed file is per-RUN, not per-layer,
++// so parse it once and share the result across all MoE layers' constructors.
++// Any failure -- cannot open, malformed line, missing/wrong space header --
++// throws here and refuses the load, rather than silently falling back to the
++// frequency-free seed. The fingerprint is FNV-1a over the file text, for the
++// `cpu_tier on:` log line.
++struct LoadedCensusSeed {
++    ov::intel_gpu::ocl::moe::CensusSeed seed;
++    uint64_t fingerprint = 0;
++};
++
++const LoadedCensusSeed& cached_census_seed(const char* path) {
++    static std::map<std::string, LoadedCensusSeed> cache;
++    auto it = cache.find(path);
++    if (it == cache.end()) {
++        std::ifstream in(path);
++        if (!in)
++            OPENVINO_THROW("MOE_CPU_TIER_SEED: cannot open census seed file ", path);
++        std::stringstream ss;
++        ss << in.rdbuf();
++        const std::string text = ss.str();
++        LoadedCensusSeed loaded;
++        loaded.seed = ov::intel_gpu::ocl::moe::parse_census_seed(text);
++        loaded.fingerprint = ov::intel_gpu::ocl::moe::census_seed_fingerprint(text);
++        it = cache.emplace(path, std::move(loaded)).first;
++    }
++    return it->second;
++}
++}  // namespace
++
+ #define DEBUG_MOE_LOG 0
+ 
+ #ifdef ENABLE_ONEDNN_FOR_GPU
+@@ -1867,8 +1902,35 @@ public:
+                     static_partition = false;
+             }
+             static constexpr uint64_t kStaticPartitionSeed = 0xF2A17C0DE5EEDULL;
++            // arcint VENICE (patch 0046). When MOE_CPU_TIER_SEED names a
++            // census seed file, this layer's resident set is the census's
++            // frequency-ranked top-slots set keyed by the layer's structural
++            // layer_key -- validated against num_expert and the pool budget
++            // HERE, at construction, so a mismatched seed refuses the load
++            // before any request is served. With the env var unset, nothing
++            // changes: patch 0018's splitmix64 rank stays in effect.
++            bool census_seed_active = false;
++            uint64_t census_seed_fingerprint_value = 0;
++            std::vector<uint32_t> census_resident_experts;
++            if (static_partition) {
++                if (const char* seed_env = std::getenv("MOE_CPU_TIER_SEED")) {
++                    if (seed_env[0] != '\0') {
++                        const size_t this_layer_key = cur_moe->_otd.weight_bin_offsets.empty()
++                                                          ? 0
++                                                          : cur_moe->_otd.weight_bin_offsets[0];
++                        const auto& loaded = cached_census_seed(seed_env);
++                        census_resident_experts = ov::intel_gpu::ocl::moe::census_seed_resident_experts(
++                            loaded.seed, this_layer_key, cur_moe->_config.num_expert, resident_slot_count());
++                        census_seed_active = true;
++                        census_seed_fingerprint_value = loaded.fingerprint;
++                    }
++                }
++            }
+             static_cast<OffloadExpertWeightProvider*>(_weight_provider.get())
+                 ->set_static_partition(static_partition, kStaticPartitionSeed);
++            if (census_seed_active)
++                static_cast<OffloadExpertWeightProvider*>(_weight_provider.get())
++                    ->set_census_seed(census_resident_experts);
+             _cpu_tier_threads = config.get_moe_cpu_tier_threads();
+             _max_topk = cur_moe->_config.top_k;
+             _experts_per_token = cur_moe->_config.top_k + (cur_moe->_config.num_shared_expert > 0 ? 1 : 0);
+@@ -1960,11 +2022,14 @@ public:
+                 // checksum).
+                 const uint64_t resident_checksum =
+                     static_partition
+-                        ? static_partition_checksum(static_partition_resident_experts(
+-                              kStaticPartitionSeed,
+-                              cur_moe->_otd.weight_bin_offsets.empty() ? 0 : cur_moe->_otd.weight_bin_offsets[0],
+-                              cur_moe->_config.num_expert,
+-                              resident_slot_count()))
++                        ? static_partition_checksum(
++                              census_seed_active
++                                  ? census_resident_experts
++                                  : static_partition_resident_experts(
++                                        kStaticPartitionSeed,
++                                        cur_moe->_otd.weight_bin_offsets.empty() ? 0 : cur_moe->_otd.weight_bin_offsets[0],
++                                        cur_moe->_config.num_expert,
++                                        resident_slot_count()))
+                         : 0;
+                 std::cerr << "[OTD_PERF] cpu_tier on: hidden=" << cur_moe->_config.hidden_size
+                            << " inter=" << cur_moe->_config.inter_size << " group=" << cur_moe->_config.group_size
+@@ -1972,8 +2037,11 @@ public:
+                            << " wdt=" << wdt << " has_zp=" << cur_moe->_config.has_zp
+                            << " shared=" << cur_moe->_config.num_shared_expert
+                            << " slots=" << resident_slot_count()
+-                           << " static_partition=" << (static_partition ? 1 : 0) << " seed=0x" << std::hex
+-                           << kStaticPartitionSeed << " resident_checksum=0x" << resident_checksum << std::dec
++                           << " static_partition=" << (static_partition ? 1 : 0)
++                           << " seed_source=" << (census_seed_active ? "census" : "splitmix64")
++                           << " seed=0x" << std::hex << kStaticPartitionSeed
++                           << " census_seed_fp=0x" << census_seed_fingerprint_value
++                           << " resident_checksum=0x" << resident_checksum << std::dec
+                            << std::endl;
+             }
+         } else {

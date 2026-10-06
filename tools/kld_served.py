@@ -21,9 +21,10 @@ capture's own token ids in its header. This tool is the other half:
      llama.cpp's tools/perplexity/perplexity.cpp), log-softmax the served
      rows, and report mean per-token KL(P_ref || P_served) over the
      recorded rows, split at the boundary: rows at 0-based index < 2051 and
-     rows >= 2051. The bar (tools/kld_harness.py THRESHOLD_NATS, 0.0599
-     nats, PROVISIONAL) is printed beside both means with its provenance;
-     nothing here decides.
+     rows >= 2051. The DECIDED bound (window-051 clause (d): 3.0905e-03 below
+     2051, 2.6946e-02 above) is printed beside both means with its provenance,
+     together with the SUPERSEDED inherited 0.0599 literal, which decides
+     nothing.
 
 What the capture records (kld_capture.py's correction, measured): the SECOND
 HALF of each window only -- rows `n_ctx/2 .. n_ctx-2` (0-based), which is
@@ -43,8 +44,9 @@ measurement: forty-four layers are missing and the KL must be far above the
 bar. A full-depth artifact is the measurement.
 
 THE INSTRUMENT'S OWN FLOOR (REVIEW ba2d5de F1): served logits at 2,735
-tokens are not run-to-run deterministic on this backend (chunked prefill,
-f16 kernels), so a reading needs its noise floor beside it. `--replay
+tokens are not run-to-run deterministic on the **B60/Xe2** (chunked prefill,
+f16 kernels; the A770 is bit-identical, so the floor is per CARD), so a
+reading needs its noise floor beside it. `--replay
 --repeat N` posts every window N times; `--compare` then pairs every earlier
 replay with the last one and reports KL(A||B) mean/max, argmax agreement and
 max |logit diff| over the same recorded rows -- the floor the gate's means
@@ -53,14 +55,14 @@ the bar makes the bar unreadable; a floor far below it does not make a
 reading pass. The floor's mechanism is measured by
 tools/boot_serving_shape.py --repeat/--cut (the per-node bisect), not here.
 
-THE BAR (REVIEW ba2d5de F2; PROVISIONAL): 0.0599 nats is NOT derived from
+THE SUPERSEDED LITERAL (REVIEW ba2d5de F2): 0.0599 nats is NOT derived from
 Flash-Next. It is kld_harness.THRESHOLD_NATS = 1.5 x 0.0399, the R0 of a
 DIFFERENT model (Qwen3.6-35B-A3B, UD-Q3_K_XL against BF16 on wikitext-2,
--c 512, 64 chunks, 2026-08-11); the derivation and its three conditions live
-in that module and its provenance sentence is printed beside every reading
-here. The 0.5.1 acceptance commit re-derives the bar from this model's own
-reference round-trip; until then this tool prints the inherited number,
-tagged, and decides nothing.
+-c 512, 64 chunks, 2026-08-11). [2026-09-20: the 0.5.1 acceptance commit HAS
+LANDED -- window-051 clause (d) decided `bar_0.5.1` = 100 x F_ref (3.0905e-03
+below 2051 / 2.6946e-02 above) and BERLIN-001 `5d4dd59` landed it -- so this
+tool prints the DECIDED bound above and keeps the 0.0599 literal beside every
+reading for continuity only, tagged SUPERSEDED, deciding nothing.]
 """
 import argparse
 import json
@@ -74,7 +76,15 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 
-from kld_harness import BAR_PROVENANCE, BAR_STATUS, THRESHOLD_NATS  # noqa: E402
+from kld_harness import (  # noqa: E402
+    BAR_PROVENANCE, BAR_STATUS, THRESHOLD_NATS,
+    RESOLUTION_BOUND_BELOW_NATS, RESOLUTION_BOUND_ABOVE_NATS,
+    RESOLUTION_BOUND_STATUS, RESOLUTION_BOUND_PROVENANCE,
+    F_REF_PER_ROW_MAX_NATS,
+    IMPLEMENTATION_FLOOR_MEDIAN_W0_NATS, IMPLEMENTATION_FLOOR_MEDIAN_W1_NATS,
+    IMPLEMENTATION_FLOOR_MEAN_W0_NATS, IMPLEMENTATION_FLOOR_MEAN_W1_NATS,
+    IMPLEMENTATION_FLOOR_PROVENANCE,
+)
 
 QSA_BOUNDARY_TOKENS = 2051
 DUMP_MAGIC = b"ARCLGT01"
@@ -250,13 +260,35 @@ def compare(args):
           f"records in {len(all_windows)} window(s), {len(replays)} of them {n_ctx}-token "
           f"replays (the rest: the server's load-time probes)", flush=True)
     if len(windows) != n_chunk:
-        raise ValueError(f"dump holds {len(replays)} replayed window(s) of {n_ctx} tokens, "
-                         f"the capture has {n_chunk}")
+        if args.partial and 0 < len(replays) < n_chunk:
+            # a replay cut short (2026-09-18: the native tier's first serve
+            # finished window 0 of 2 in 58 min before the leg's own hour ran
+            # out): read the windows that are there, in capture order, and
+            # say so in the report -- never a floor, never the full reading
+            print(f"PARTIAL: {len(replays)} of {n_chunk} windows replayed; comparing those "
+                  f"(--partial)", flush=True)
+            n_chunk = len(replays)
+            windows = replays[-n_chunk:]
+        else:
+            raise ValueError(f"dump holds {len(replays)} replayed window(s) of {n_ctx} tokens, "
+                             f"the capture has {n_chunk}")
     first = n_ctx // 2
     n_rows = n_ctx - 1 - first
     report = {"ref": args.ref, "dump": args.dump, "n_ctx": n_ctx, "n_vocab": n_vocab,
               "boundary": QSA_BOUNDARY_TOKENS, "threshold_nats": THRESHOLD_NATS,
               "threshold_status": BAR_STATUS, "threshold_provenance": BAR_PROVENANCE,
+              # The DECIDED bound and the readable acceptance candidate, so no
+              # reader sees only the SUPERSEDED inherited literal above.
+              "resolution_bound_below_nats": RESOLUTION_BOUND_BELOW_NATS,
+              "resolution_bound_above_nats": RESOLUTION_BOUND_ABOVE_NATS,
+              "resolution_bound_status": RESOLUTION_BOUND_STATUS,
+              "resolution_bound_provenance": RESOLUTION_BOUND_PROVENANCE,
+              "f_ref_per_row_max_nats": F_REF_PER_ROW_MAX_NATS,
+              "implementation_floor_median_w0_nats": IMPLEMENTATION_FLOOR_MEDIAN_W0_NATS,
+              "implementation_floor_median_w1_nats": IMPLEMENTATION_FLOOR_MEDIAN_W1_NATS,
+              "implementation_floor_mean_w0_nats": IMPLEMENTATION_FLOOR_MEAN_W0_NATS,
+              "implementation_floor_mean_w1_nats": IMPLEMENTATION_FLOOR_MEAN_W1_NATS,
+              "implementation_floor_provenance": IMPLEMENTATION_FLOOR_PROVENANCE,
               "windows": []}
     all_below, all_above = [], []
     for w, win in enumerate(windows[:n_chunk]):
@@ -285,6 +317,7 @@ def compare(args):
               f"{entry['mean_kl_above'] if entry['mean_kl_above'] is None else format(entry['mean_kl_above'], '.6e')}; "
               f"max {entry['max_kl']:.4e}; argmax agreement {entry['argmax_agreement']:.4f}",
               flush=True)
+    report["partial"] = bool(len(windows) < len(rows))
     report["mean_kl_below"] = float(np.mean(all_below)) if all_below else None
     report["mean_kl_above"] = float(np.mean(all_above)) if all_above else None
     # THE FLOOR: every earlier replay (A) against the last one (B), same rows.
@@ -331,10 +364,20 @@ def compare(args):
               f"read against this", flush=True)
     else:
         print("FLOOR: not measured (one replay; --replay --repeat 2 gives it)", flush=True)
-    print(f"ALL: mean KL below {report['mean_kl_below']:.6e} above "
-          f"{report['mean_kl_above'] if report['mean_kl_above'] is None else format(report['mean_kl_above'], '.6e')} "
-          f"(bar {THRESHOLD_NATS} nats, {BAR_STATUS} -- {BAR_PROVENANCE}; REPORT ONLY)",
-          flush=True)
+    _above = (report["mean_kl_above"] if report["mean_kl_above"] is None
+              else format(report["mean_kl_above"], ".6e"))
+    print(f"ALL: mean KL below {report['mean_kl_below']:.6e} above {_above} "
+          f"-- REPORT ONLY; no verdict is quotable without F_served.", flush=True)
+    print(f"     read against the DECIDED bound: {RESOLUTION_BOUND_BELOW_NATS:.6e} "
+          f"below / {RESOLUTION_BOUND_ABOVE_NATS:.6e} above "
+          f"({RESOLUTION_BOUND_STATUS}); it is an instrument-resolution MEAN "
+          f"bound -- its per-row clamp tail {F_REF_PER_ROW_MAX_NATS:.4e} exceeds "
+          f"it, and the acceptance candidate is the between-implementations "
+          f"floor (llama.cpp vs the same f32 reference): median "
+          f"{IMPLEMENTATION_FLOOR_MEDIAN_W0_NATS} w0 / "
+          f"{IMPLEMENTATION_FLOOR_MEDIAN_W1_NATS} w1.", flush=True)
+    print(f"     SUPERSEDED for continuity, decides nothing: the inherited "
+          f"{THRESHOLD_NATS} nats ({BAR_STATUS}) -- {BAR_PROVENANCE}", flush=True)
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=2) + "\n")
     return 0
@@ -359,6 +402,9 @@ def main(argv=None):
                          "during the warmups shows in the earlier pairs")
     ap.add_argument("--timeout", type=float, default=3600.0)
     ap.add_argument("--dump", default=None, help="the ARCINT_LOGITS_DUMP file")
+    ap.add_argument("--partial", action="store_true",
+                    help="compare: accept a dump with fewer replayed windows than the capture "
+                         "(a replay cut short); the report names the windows it read")
     ap.add_argument("--out", default=None, help="write the report JSON here")
     args = ap.parse_args(argv)
     if args.replay:

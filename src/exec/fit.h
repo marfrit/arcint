@@ -105,7 +105,7 @@ inline uint64_t expert_slot_bytes(int num_expert, int ratio_pct, uint64_t per_ex
 // Patch 0018 / MOE_CPU_TIER_STATIC_PARTITION (DESIGN §7.0.2ae "F2"): under
 // the plugin's static residency partition, each expert's host-or-device
 // placement is a pure function of expert id, layer and pool configuration,
-// fixed for the life of the process. Under the LRU-mode plateau probe
+// fixed for the life of the process. Under the adaptive (LRU-mode) plateau probe
 // (backend_ov.cpp Phase B), this same arithmetic -- `expert_slot_bytes`,
 // unchanged -- only ever prices a CEILING for the host-side ledger, because
 // device residency there is history-dependent and only a probe can measure
@@ -137,6 +137,22 @@ inline uint64_t expert_slot_bytes_static(int num_expert, int ratio_pct, uint64_t
 // returns `tokens` rows and is not this function's claim.
 inline size_t logits_slice_rows_expected(size_t keep_rows, size_t tokens) {
     return std::min(keep_rows, tokens);
+}
+
+// Where the embeddings model's table lives on the host (backend_ov.cpp, both
+// load paths). On a CPU embedding device the plugin serves the Gather from the
+// .bin it maps, so a prompt's rows are faulted in from the file at first use;
+// after a full-depth load has streamed 14 GB of weights through the host, they
+// are cold: 250-400 major faults per 1024-token chunk, 3.8 s of a 15.5 s
+// 4096-token prefill spent in "embed" against 5 ms for the same gather warm
+// (DESIGN §7.0.2cl, measured 2026-09-26). Read into host memory instead, the
+// table costs its size in resident host RAM (1 GiB f16 at vocab 248,320 x 2,048)
+// and no faults. A GPU embedding device copies the table to the card at
+// compile, so the mapping is only a staging path there and stays. Composite
+// devices (AUTO, HETERO:CPU, MULTI:CPU) keep the mapping too: not measured,
+// and not a configuration this repository serves.
+inline bool embeddings_read_into_host_memory(const std::string& device) {
+    return device.rfind("CPU", 0) == 0;
 }
 
 // M11 §1.3 (DESIGN §7.0.2ag, "the fix design: MTP's verify cost and zero
@@ -1897,6 +1913,20 @@ inline PackedValuesFitTerm fit_context_packed_values_at_depth(
 // arithmetic is deliberately separate from `fit_context` above rather than
 // folded into it.
 //
+// **DATED IN PLACE 2026-09-22: "stays host-resident" is one configuration,
+// not a requirement.** The 26.82 GiB term above prices the PINNED path
+// (`bind_ngram_ports` copies the whole table into USM host at load). The
+// reference ships a DISK backend as its default (`code`:
+// `~/src/FreeToken-ref/python/freetoken/engine/config.py`:32
+// `ple_backend: str = "disk"`; `models/qwen4_exp/ple_disk.py`
+// `DiskRowTable`, staging `max_graph_rows`/`max_extend_tokens` rows per
+// fill), and arcint's port contract already carries the hashed row ids
+// host-side, so only the rows a forward names need to be resident.
+// `ngram_staging_bytes` below prices that path; the full table still has to
+// exist on disk, but it no longer has to be in host RAM. Campaign:
+// `docs/campaigns/ple-disk-backend.md`; design note
+// `docs/design-ple-disk-backend.md`.
+//
 // `ngram_table_bytes` mirrors `FullyConnectedKQuant::row_bytes` above's
 // shape (ceil to a whole block, block size and bytes/block from the type's
 // own layout) but is NOT K-quant-specific: `lgc::gguf::type_info` already
@@ -1912,6 +1942,22 @@ inline uint64_t ngram_table_bytes(int32_t ggml_type, uint64_t n_elements) {
     if (info.block_size == 0) return 0;
     const uint64_t blocks = (n_elements + info.block_size - 1) / info.block_size;
     return blocks * info.type_size;
+}
+
+// The STAGED path's resident term (campaign `ple-disk-backend`, 2026-09-22):
+// the bounded USM host staging buffer a forward fills with only the rows it
+// names, `staging_rows x row_bytes`. `staging_rows` is the port's static row
+// count (`T_max x num_ngram_heads`), not the table's; for the served
+// geometry this is kilobytes to a few MB where `ngram_table_bytes` is
+// tens of GiB. The table still must exist on disk at full size -- that is
+// admission's business (`artifact.cpp`), not host RAM's. Staging rows and
+// row bytes are given directly because the port's shape is the contract
+// (`exec/ngram_ports.h` reads the partition off the compiled model, no
+// config carries it); this function does not re-derive them.
+// One window PER LANE (the backend's `Lane::ngram_staging`: each lane fills
+// its own outside its turn), so a load's host term is lanes x this.
+inline uint64_t ngram_staging_bytes(uint64_t staging_rows, uint64_t row_bytes) {
+    return staging_rows * row_bytes;
 }
 
 // The Flash-Next checkpoint's own n-gram element count, derived (not
@@ -1953,6 +1999,11 @@ constexpr uint64_t kFlashNextNgramElements =
 // the actual load-time refusal-by-name belongs at the backend_ov.cpp call
 // site that has a real host to report, per this repository's stance that a
 // budget check here is pure and testable without a host at all).
+//
+// **DATED IN PLACE 2026-09-22:** `ngram_bytes` is whichever n-gram term the
+// served configuration pins -- `ngram_table_bytes` for the pinned path,
+// `ngram_staging_bytes` for the staged path (`campaign ple-disk-backend`).
+// The function is unchanged; only what the caller passes moves.
 inline bool host_ram_fit_must_refuse(uint64_t ngram_bytes, uint64_t expert_pool_bytes,
                                      uint64_t other_resident_bytes, uint64_t host_ram_bytes,
                                      uint64_t margin_bytes) {

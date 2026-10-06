@@ -53,6 +53,13 @@ EXACTLY rather than as "> 0".
     T=2052   |dense - QSA| max-abs <sampled>       rows differing    1/2052
     T=2080   |dense - QSA| max-abs 2.385560e-02    rows differing   29/2080
 
+[DATED 2026-09-28: the magnitudes above (and the 1.720381e-02 second draw
+below) were drawn at 692c0a6 with the (1 + w) fold applied twice to all four
+q/k gammas -- the main attention's (undone by the feed since c41cb39) and the
+indexer's (undone in the `indexer_state` fixture on 2026-09-28). Re-run with
+both undone: 5.082879e-05 over 1/2052 and 1.064551e-03 over 29/2080 rows. The
+row counts are structural and did not move.]
+
 The zeros are exact and input-independent -- the masks are equal, so the
 arithmetic is the same arithmetic. The T=2080 magnitude is NOT: a second draw
 (seeded differently, same geometry and weights) gave 1.720381e-02 over the same
@@ -82,8 +89,8 @@ be FREE (a resident arcint service holds all of its VRAM) and which pin
 INFERENCE_PRECISION_HINT f32 and print the precision the plugin actually used --
 see tests/python/q4e_device.py for why an unconfigured GPU compile runs f16.
 """
-import glob
 import hashlib
+import math
 import os
 import sys
 from pathlib import Path
@@ -155,34 +162,29 @@ def attn_state(feed):
 
 
 @pytest.fixture(scope="module")
-def indexer_state():
-    """The indexer's OWN weights, read through a plain GGUFReader -- they are
-    deliberately NOT in the q4e name map (the selection branch is not emitted),
-    and they are needed only to drive the pin-side QSA oracle. The fused
-    `index_qk_proj` is the checkpoint's q_proj rows followed by its k_proj rows,
-    which is what the pin's own split (pin 707-711) takes apart again."""
-    from gguf import GGUFReader
-    from gguf import quants as gq
-    raw = {}
-    for p in sorted(glob.glob(os.path.join(_SHARDS, "*.gguf"))):
-        for t in GGUFReader(p).tensors:
-            if t.name.startswith("blk.3.indexer."):
-                raw[t.name] = t
-    missing = {"blk.3.indexer.q_proj.weight", "blk.3.indexer.k_proj.weight",
-               "blk.3.indexer.q_norm.weight", "blk.3.indexer.k_norm.weight"
-               } - set(raw)
-    assert not missing, f"indexer tensors absent from the shards: {sorted(missing)}"
+def indexer_state(feed):
+    """The indexer's OWN weights, through the name map under test. The fused
+    `index_qk_proj` is the checkpoint's q_proj rows followed by its k_proj
+    rows, which is what the pin's own split (pin 707-711) takes apart again.
 
-    def deq(name):
-        t = raw[name]
-        return np.ascontiguousarray(gq.dequantize(t.data, t.tensor_type),
-                                    dtype=np.float32)
-
-    fused = np.concatenate([deq("blk.3.indexer.q_proj.weight"),
-                            deq("blk.3.indexer.k_proj.weight")], axis=0)
-    return {"indexer.index_qk_proj.weight": fused,
-            "indexer.q_layernorm.weight": deq("blk.3.indexer.q_norm.weight"),
-            "indexer.k_layernorm.weight": deq("blk.3.indexer.k_norm.weight")}
+    The two norm gammas are gguf_feed kind `gamma1`. The converter folds them,
+    stored = 1 + w (llama.cpp `conversion/qwen4exp.py`, `data_torch + 1` on
+    `.indexer.{q,k}_layernorm.weight`), and llama.cpp applies them as a plain
+    RMSNorm (`qwen4exp.cpp` build_norm). The pin's RMSNorm adds the 1 itself
+    (pin 171). Until 2026-09-28 this fixture read the stored values raw, so
+    the pin applied the fold twice (a scale of ~1.96). Steps 1-2 held parity
+    anyway, because both sides read the same state; the convention check below
+    is what makes that regression failable."""
+    pre = "layers.3.self_attn.indexer."
+    state = {f"indexer.{k}": feed.pin_tensor(pre + k)
+             for k in ("index_qk_proj.weight", "q_layernorm.weight",
+                       "k_layernorm.weight")}
+    for k in ("indexer.q_layernorm.weight", "indexer.k_layernorm.weight"):
+        m = float(np.mean(state[k]))
+        # w sits near 0 (blk.3: -0.04); the folded 1 + w near 1 (0.96)
+        assert abs(m) < 0.5, (
+            f"{k}: mean {m:.4f} -- the pin wants w, not the stored (1 + w)")
+    return state
 
 
 class _ZeroIndexer(torch.nn.Module):
@@ -552,7 +554,19 @@ def test_each_ab69ea9_defect_is_attributed_on_its_own(cfg, attn_state,
     ratio must land on the archived orphan's own measured figure (964999.3x at
     T=64, 469606.6x at T=96, re-measured at 692c0a6 with the orphan file
     swapped in), which is what makes the permutation a faithful stand-in for a
-    file this repository does not track."""
+    file this repository does not track.
+
+    ARCHIVAL CONVENTION (2026-09-18): those two ratios were measured while
+    the feed handed the q/k norm gammas over as the GGUF stores them, (1 + w)
+    -- a converter fold the feed undoes since gguf_feed's kind `gamma1`
+    (DESIGN 7.0.2bz). The cross-check against the archived figures needs the
+    same numbers, so this cell re-folds the two gammas for every row; the
+    attribution itself (each defect alone catastrophic, the clean emitter at
+    the floor) does not depend on the convention -- both the pin and the
+    emitter read the same state."""
+    attn_state = dict(attn_state)
+    for k in ("q_norm.weight", "k_norm.weight"):
+        attn_state[k] = np.asarray(attn_state[k], np.float32) + np.float32(1.0)
     hidden = _hidden(cfg, T)
     pid = np.arange(T, dtype=np.int64).reshape(1, T)
     heads = cfg.num_attention_heads
@@ -636,3 +650,600 @@ def test_dense_attention_piece_graph_cost(cfg, attn_state, device):
         f"compile={compile_s:.2f}s\n"
         f"[attn-cost]   {', '.join(f'{k} {v}' for k, v in top)}\n")
     assert nodes > 0 and const_bytes > 0
+
+
+# --------------------------------------------------------------------------- #
+# 6. QSA EMITTED: the indexer's selection against the pin's, above the boundary
+# --------------------------------------------------------------------------- #
+def _pin_block_scores(idx, hidden, cs, row, T):
+    """The pin's own block scores for one query row (pin 707-755): its
+    projections, norms, pooling, rope and relu-sum, for the complete blocks the
+    row sees."""
+    with torch.no_grad():
+        qk = idx.index_qk_proj(hidden)
+        q, tk = torch.split(qk, [idx.index_n_heads * idx.index_head_dim, idx.index_head_dim], dim=-1)
+        q = q.reshape(1, T, -1, idx.index_head_dim)
+        raw = tk.reshape(1, T, -1, idx.index_head_dim).squeeze(2)
+        q = idx.q_layernorm(q)
+        q = pin_mod.apply_rotary_pos_emb(q, cos=cs[0], sin=cs[1], unsqueeze_dim=2)
+        nblk = (row + 1) // idx.compress_ratio
+        if nblk == 0:
+            return np.zeros(0, np.float32)
+        blocks = torch.arange(nblk * idx.compress_ratio).view(nblk, idx.compress_ratio)
+        kg = raw[0].index_select(0, blocks.flatten()).view(nblk, idx.compress_ratio, -1).float().mean(1)
+        kg = idx.k_layernorm(kg)
+        kb = pin_mod.apply_rotary_pos_emb(kg.unsqueeze(1), cos=cs[0][0].index_select(0, blocks[:, 0]),
+                                          sin=cs[1][0].index_select(0, blocks[:, 0])).squeeze(1)
+        sc = torch.matmul(q[0, row].float(), kb.float().transpose(-1, -2)).transpose(-1, -2)
+        return (torch.relu(sc).sum(-1) / math.sqrt(idx.index_head_dim)).numpy()
+
+
+@_skip_shards
+@pytest.mark.parametrize("T", [2052, 2080, 4096])
+def test_qsa_attention_piece_selects_what_the_pin_indexer_selects(cfg, attn_state,
+                                                                  indexer_state, T):
+    """The emitted indexer (`build_qsa_attention_model`, attention.py
+    `_qsa_additive_mask`) against the pin's REAL `Qwen4ExpTextQSAIndexer` on the
+    same fed blk.3 tensors, above the 2,051-token boundary where the indexer
+    prunes (max(0, T - 2051) rows; cell 3). Two gates:
+
+      * SELECTION, equality up to exact ties: the keys each query keeps -- the
+        pin's indexer mask added to the causal one (pin 857-858) against the
+        emitted mask -- differ only in rows where every differing block scores
+        EXACTLY the cut value (relu makes zero scores common; the pin leaves
+        the order among equal scores to torch.topk, unspecified; the emitter
+        keeps the lower block index). The dense emitter differs on T - 2051
+        rows with real score gaps (the red case: its mask is causal).
+      * OUTPUT: on the rows without a tie the emitted block sits within the
+        yardstick ceiling of the pin's own f32 QSA forward.
+    CPU plugin (f32)."""
+    hidden = _hidden(cfg, T)
+    pid = np.arange(T, dtype=np.int64).reshape(1, T)
+    state = dict(attn_state)
+    state.update(indexer_state)
+    model = qattn.build_qsa_attention_model(cfg, state, T, with_mask=True)
+    compiled = compile_for(ov.Core(), model, "CPU")
+    res = compiled([hidden.numpy(), pid])
+    ov_out = np.asarray(res[0])
+    ov_mask = np.asarray(res[1])[0, 0]
+
+    m = _pin_attention(cfg, attn_state, indexer_state, False, torch.float32)
+    cs = _cos_sin(cfg, T, torch.float32)
+    causal = _causal(T, torch.float32)
+    with torch.no_grad():
+        pin_sel = m.indexer(hidden, cs, causal, None)
+        p32, _ = m(hidden, cs, causal, None)
+    p32 = p32.numpy()
+    causal_ok = causal.numpy()[0, 0] == 0
+    pin_allowed = (pin_sel.numpy()[0, 0] == 0) & causal_ok
+    ov_allowed = ov_mask == 0
+    pruned = int(np.any(pin_allowed != causal_ok, axis=1).sum())
+    differ = np.nonzero(np.any(pin_allowed != ov_allowed, axis=1))[0]
+    ratio = int(cfg.indexer_compress_ratio)
+    block_topk = int(cfg.indexer_budget) // ratio
+    tie_rows, real_rows = [], []
+    for r in differ:
+        sc = _pin_block_scores(m.indexer, hidden, cs, int(r), T)
+        nblk = len(sc)
+        # a tie needs differing BLOCKS, all at the cut score, and an identical
+        # tail/remainder (tokens ratio*nblk..T-1); anything else is real
+        same_tail = np.array_equal(pin_allowed[r, nblk * ratio:], ov_allowed[r, nblk * ratio:])
+        if nblk == 0 or not same_tail:
+            real_rows.append(int(r))
+            continue
+        cut = np.sort(sc)[::-1][min(block_topk, nblk) - 1]
+        pb = pin_allowed[r, :nblk * ratio].reshape(nblk, ratio).all(1)
+        ob = ov_allowed[r, :nblk * ratio].reshape(nblk, ratio).all(1)
+        diff_blocks = np.nonzero(pb != ob)[0]
+        is_tie = diff_blocks.size > 0 and bool(np.all(sc[diff_blocks] == cut))
+        (tie_rows if is_tie else real_rows).append(int(r))
+    # the kept block count per row is the pin's min(block_topk, complete blocks)
+    # (pin 757) whatever the ties -- a mask that keeps an extra tied block (the
+    # dense one, at the first pruned row) is not a tie-order difference
+    nb_all = T // ratio
+    kept = ov_allowed[:, :nb_all * ratio].reshape(T, nb_all, ratio).all(2)
+    nblk_row = (np.arange(T) + 1) // ratio
+    kept_ok = kept.sum(1) == np.minimum(block_topk, nblk_row)
+    bad_count = np.nonzero(~kept_ok)[0]
+    clean = np.ones(T, bool)
+    clean[differ] = False
+    d_clean = float(np.max(np.abs(ov_out[0, clean] - p32[0, clean])))
+    sys.stdout.write(
+        f"\n[qsa-emitted] T={T} rows pruned by the pin {pruned} (boundary predicts "
+        f"{max(0, T - 2051)})  selection rows differing {len(differ)}/{T}: exact ties "
+        f"at the cut {len(tie_rows)}, real {len(real_rows)}  |ov-pinQSA32| on the "
+        f"other rows {d_clean:.3e}\n")
+
+    assert pruned == max(0, T - 2051), "the pin's own boundary moved -- stop"
+    assert bad_count.size == 0, (
+        f"T={T}: {bad_count.size} rows keep a block count other than min({block_topk}, blocks)")
+    assert not real_rows, (
+        f"T={T}: the emitted selection differs from the pin's beyond exact ties on rows {real_rows[:8]}")
+    assert d_clean <= _YARDSTICK_CEILING, (
+        f"T={T}: the emitted QSA block is {d_clean:.3e} from the pin's f32 QSA forward")
+
+
+# --------------------------------------------------------------------------- #
+# 7. QSA STATEFUL: chunked prefill and decode across the boundary (qsa step 2)
+# --------------------------------------------------------------------------- #
+@_skip_shards
+def test_qsa_stateful_piece_matches_the_pin_with_its_cache(cfg, attn_state, indexer_state):
+    """`build_qsa_stateful_attention_model` (K, V and the indexer's raw keys in
+    Variables, dynamic T) against the pin's attention with its REAL indexer and
+    its own `DynamicCache` (the indexed layer, cache_utils 321-353), fed the
+    same chunks: a 2,048-token prefill, a 40-token chunk, then 12 single-token
+    decode steps -- 2,100 tokens, across the 2,051 boundary. Per chunk: the
+    selection equal to the pin's up to exact ties at the top-k cut (the rule of
+    cell 6), and the output within the yardstick ceiling on every row without
+    a tie. CPU plugin (f32)."""
+    from transformers.cache_utils import DynamicCache
+    chunks = [2048, 40] + [1] * 12
+    N_all = sum(chunks)
+    hidden_all = _hidden(cfg, N_all)
+    state = dict(attn_state)
+    state.update(indexer_state)
+    model = qattn.build_qsa_stateful_attention_model(cfg, state, N_all, with_mask=True)
+    req = compile_for(ov.Core(), model, "CPU").create_infer_request()
+
+    m = _pin_attention(cfg, attn_state, indexer_state, False, torch.float32)
+    cache = DynamicCache(config=cfg)
+    cos_all, sin_all = _cos_sin(cfg, N_all, torch.float32)
+    ratio = int(cfg.indexer_compress_ratio)
+    block_topk = int(cfg.indexer_budget) // ratio
+    minf = np.float32(np.finfo(np.float32).min)
+    past = 0
+    ties_total = 0
+    for T in chunks:
+        N = past + T
+        h = hidden_all[:, past:N]
+        pid = np.arange(past, N, dtype=np.int64).reshape(1, T)
+        res = req.infer({0: h.numpy(), 1: pid})
+        ov_out = np.asarray(res[0])
+        ov_mask = np.asarray(res[1])[0, 0]
+        cm = np.where(np.arange(N)[None, :] <= np.arange(past, N)[:, None], np.float32(0), minf)
+        causal = torch.from_numpy(cm.reshape(1, 1, T, N).astype(np.float32))
+        cs = (cos_all[:, :N], sin_all[:, :N])
+        with torch.no_grad():
+            pin_sel = m.indexer(h, cs, causal, cache)
+            p32, _ = m(h, cs, causal, cache)
+        # the indexer call above appended this chunk's raw keys once; the full
+        # forward appends them again -- undo the first append so the cache holds
+        # each key once (the forward is the pin's own path, the direct call a probe)
+        lay = cache.layers[3]
+        lay.indexer_keys = torch.cat([lay.indexer_keys[:, :past], lay.indexer_keys[:, past + T:]], dim=1)
+        p32 = p32.numpy()
+        causal_ok = cm == 0
+        pin_allowed = (pin_sel.numpy()[0, 0] == 0) & causal_ok
+        ov_allowed = ov_mask == 0
+        differ = np.nonzero(np.any(pin_allowed != ov_allowed, axis=1))[0]
+        real = []
+        for r in differ:
+            a = past + int(r)
+            sc = _pin_block_scores(m.indexer, hidden_all[:, :a + 1], (cos_all[:, :a + 1], sin_all[:, :a + 1]), a, a + 1)
+            nblk = len(sc)
+            same_tail = np.array_equal(pin_allowed[r, nblk * ratio:], ov_allowed[r, nblk * ratio:])
+            if nblk == 0 or not same_tail:
+                real.append(a)
+                continue
+            cut = np.sort(sc)[::-1][min(block_topk, nblk) - 1]
+            pb = pin_allowed[r, :nblk * ratio].reshape(nblk, ratio).all(1)
+            ob = ov_allowed[r, :nblk * ratio].reshape(nblk, ratio).all(1)
+            dblk = np.nonzero(pb != ob)[0]
+            if not (dblk.size > 0 and np.all(sc[dblk] == cut)):
+                real.append(a)
+        ties_total += len(differ) - len(real)
+        clean = np.ones(T, bool)
+        clean[differ] = False
+        d_clean = float(np.max(np.abs(ov_out[0, clean] - p32[0, clean]))) if clean.any() else 0.0
+        sys.stdout.write(f"\n[qsa-stateful] chunk past={past} T={T}: rows differing {len(differ)} "
+                         f"(real {len(real)})  |ov-pin| on the other rows {d_clean:.3e}")
+        assert not real, f"chunk past={past} T={T}: selection differs beyond ties at {real[:8]}"
+        assert d_clean <= _YARDSTICK_CEILING, f"chunk past={past} T={T}: output {d_clean:.3e} from the pin"
+        past = N
+    sys.stdout.write(f"\n[qsa-stateful] {N_all} tokens, tie rows {ties_total}\n")
+
+
+# --------------------------------------------------------------------------- #
+# 8. QSA ON THE SERVED PATH: the served emitter's indexer (qsa step 3, T1a)
+#
+# `q4e.serving_shape.emit_stateful_attention(qsa=True)` calls the SAME
+# `q4e.attention._qsa_mask_dynamic` the step-2 graph does, and carries the raw
+# keys in a PLAIN state Variable (`cache_params.past.indexer_key.N`, NOT
+# gathered by `beam_idx`). The served attention CORE cannot be run before the
+# paged pass: its KV Concat joins a [1, kv, past, d] history with a token-major
+# [T, kv, 1, d] current key and only `SDPAToPagedAttention` makes those leading
+# axes agree (measured: CPU shape inference refuses the pre-pass graph). So the
+# served side's own runtime witness here is the INDEXER'S SELECTION, which has
+# no KV operand; the served attention core's byte-exactness is step 2's pass
+# (T2) and the card window (T6).
+# --------------------------------------------------------------------------- #
+def _served_indexer_mask_model(cfg, attn_state, indexer_state, layer,
+                               rope_span):
+    """The served emitter's standalone indexer (`_qsa_indexer_mask_served`)
+    as an ov.Model: inputs `hidden_states` [1, T, H] f32 and `position_ids`
+    [1, T] i64, result `qsa_mask` [T, 1, 1, N], with the raw-key Assign in
+    the model's sinks."""
+    from openvino import opset13 as op
+    from q4e import serving_shape as ss
+    H = cfg.hidden_size
+    hidden = op.parameter([1, -1, H], ov.Type.f32)
+    hidden.set_friendly_name("hidden_states")
+    pid = op.parameter([1, -1], ov.Type.i64)
+    pid.set_friendly_name("position_ids")
+    cos_np, sin_np = qattn._freqs_tables(cfg, rope_span)
+    rope_cos, rope_sin = op.constant(cos_np), op.constant(sin_np)
+    state = {}
+    state.update({k: np.ascontiguousarray(v, np.float32)
+                  for k, v in attn_state.items()})
+    state.update({k: np.ascontiguousarray(v, np.float32)
+                  for k, v in indexer_state.items()})
+    sinks = []
+    mask = ss._qsa_indexer_mask_served(hidden, pid, cfg, state, layer,
+                                       sinks, rope_cos, rope_sin)
+    res = op.result(mask)
+    res.set_friendly_name("qsa_mask")
+    return ov.Model([res], sinks, [hidden, pid], "qsa_served_indexer")
+
+
+def _causal_additive(T, N, past):
+    """The dense-causal additive mask a served chunk at `past` would carry:
+    [1, 1, T, N], 0 where the key is at or before the query's absolute
+    position, finfo(f32).min above."""
+    rows = np.arange(past, past + T)[:, None]
+    cols = np.arange(N)[None, :]
+    vis = cols <= rows
+    return np.where(vis, np.float32(0.0),
+                    np.float32(np.finfo(np.float32).min))[None, None]
+
+
+@_skip_shards
+def test_qsa_served_indexer_selects_what_the_step2_stateful_graph_selects(
+        cfg, attn_state, indexer_state):
+    """T1a cell 1: the served emitter's indexer against the step-2 stateful
+    reference, same chunks ([2048, 40] + [1] x 12), across the 2,051 boundary.
+    The selection -- the additive per-query mask -- is BIT-IDENTICAL, because
+    both sides call `q4e.attention._qsa_mask_dynamic`; the served side differs
+    only in that it is token-major ([T, 1, 1, N]) and its raw keys ride
+    `cache_params.past.indexer_key.3`. A served emitter that baked the causal
+    mask, dropped the raw-key history, or transposed the wrong axes reds this
+    cell. CPU plugin (f32).
+
+    BLIND SPOT, stated rather than hidden: both sides call the same
+    `_qsa_mask_dynamic`, so a mutant INSIDE that function is invisible here;
+    it is guarded transitively by the step-1 pin cell and
+    `test_qsa_stateful_piece_matches_the_pin_with_its_cache`. This cell is a
+    wrapper check -- that the served emitter reaches the same algebra over the
+    same history -- not an algebra check."""
+    chunks = [2048, 40] + [1] * 12
+    N_all = sum(chunks)
+    hidden_all = _hidden(cfg, N_all)
+    state = dict(attn_state)
+    state.update(indexer_state)
+    ref = qattn.build_qsa_stateful_attention_model(cfg, state, N_all, with_mask=True)
+    rr = compile_for(ov.Core(), ref, "CPU").create_infer_request()
+    served = _served_indexer_mask_model(cfg, attn_state, indexer_state, 3, N_all)
+    sr = compile_for(ov.Core(), served, "CPU").create_infer_request()
+    past = 0
+    for T in chunks:
+        N = past + T
+        h = hidden_all[:, past:N]
+        pid = np.arange(past, N, dtype=np.int64).reshape(1, T)
+        ref_mask = np.asarray(rr.infer({0: h.numpy(), 1: pid})[1])       # [1,1,T,N]
+        got = np.asarray(sr.infer({0: h.numpy(), 1: pid})[0])           # [T,1,1,N]
+        got = np.transpose(got, (2, 1, 0, 3))                           # [1,1,T,N]
+        assert got.shape == ref_mask.shape, (got.shape, ref_mask.shape)
+        assert np.array_equal(got, ref_mask), (
+            f"chunk past={past} T={T}: the served mask differs from the step-2 "
+            f"stateful mask (max|d| {np.max(np.abs(got - ref_mask)):.3e})")
+        past = N
+
+
+def _recompute_indexer_mask_model(cfg, attn_state, indexer_state, layer,
+                                  rope_span):
+    """The RECOMPUTE path (today's pre-cache emitter): the raw-key history in
+    a plain Variable and `_qsa_mask_dynamic` pooling, norming and roping the
+    whole history every call. The oracle for the cached path only."""
+    from openvino import opset13 as op
+    from q4e import gdn as qgdn
+    from q4e import serving_shape as ss
+    H = cfg.hidden_size
+    nh = int(cfg.indexer_n_heads)
+    dh = int(cfg.indexer_head_dim)
+    eps = cfg.rms_norm_eps
+    hidden = op.parameter([1, -1, H], ov.Type.f32)
+    hidden.set_friendly_name("hidden_states")
+    pid = op.parameter([1, -1], ov.Type.i64)
+    pid.set_friendly_name("position_ids")
+    cos_np, sin_np = qattn._freqs_tables(cfg, rope_span)
+    rope_cos, rope_sin = op.constant(cos_np), op.constant(sin_np)
+    rotary = int(rope_cos.get_output_shape(0)[-1])
+    state = {}
+    state.update({k: np.ascontiguousarray(v, np.float32)
+                  for k, v in attn_state.items()})
+    state.update({k: np.ascontiguousarray(v, np.float32)
+                  for k, v in indexer_state.items()})
+    i64 = lambda v: op.constant(np.array(v, np.int64))
+    qk = qgdn._mm(hidden, qattn._c(state["indexer.index_qk_proj.weight"]), tb=True)
+    qi = qgdn._reshape(qgdn._slice(qk, 0, nh * dh, 1, 2), [1, -1, nh, dh])
+    raw = qgdn._slice(qk, nh * dh, (nh + 1) * dh, 1, 2)
+    qi = qattn._rmsnorm_hd(qi, state["indexer.q_layernorm.weight"], eps, dh)
+    cq = qgdn._reshape(op.gather(rope_cos, pid, i64(0)), [1, -1, 1, rotary])
+    sq = qgdn._reshape(op.gather(rope_sin, pid, i64(0)), [1, -1, 1, rotary])
+    qi = qattn._rope_last(qi, cq, sq, rotary)
+    rvar = ss._indexer_variable(layer, dh)
+    rinit = op.broadcast(op.constant(np.array(0.0, np.float32)), i64([1, 0, dh]))
+    raw_full = op.concat([op.read_value(rinit, rvar), raw], axis=1)
+    sinks = [op.assign(raw_full, rvar)]
+    mask = qattn._qsa_mask_dynamic(qi, raw_full, pid, cfg, rope_cos, rope_sin,
+                                   rotary, state)
+    mask = op.transpose(mask, op.constant(np.array([2, 1, 0, 3], np.int32)))
+    res = op.result(mask)
+    res.set_friendly_name("qsa_mask")
+    return ov.Model([res], sinks, [hidden, pid], "qsa_recompute_indexer")
+
+
+def test_qsa_cached_block_key_path_matches_the_recompute_path(
+        cfg, attn_state, indexer_state):
+    """The compressed block-key cache cell (2026-09-30, prior art
+    `docs/campaigns/research-qsa.md`). Chunks [2048, 40] + [1] x 12, the
+    cached served emitter against the RECOMPUTE path (`_qsa_mask_dynamic`
+    pooling, norming and roping the whole history every call): the selection
+    -- the additive per-query mask -- must be BIT-IDENTICAL.
+
+    The three mutants this cell reds: a completed block never appended (the
+    scores lose a block a query can see), a block appended before it is
+    complete (a partial block enters the scores), and the tail dropped (the
+    partial-position rows lose their last keys). Each changes at least one
+    chunk's mask, and the chunks are chosen so a tail exists at past=2048
+    (T=40) and at every decode step. CPU plugin (f32)."""
+    chunks = [2048, 40] + [1] * 12
+    N_all = sum(chunks)
+    hidden_all = _hidden(cfg, N_all)
+    cached = _served_indexer_mask_model(cfg, attn_state, indexer_state, 3, N_all)
+    cr = compile_for(ov.Core(), cached, "CPU").create_infer_request()
+    recompute = _recompute_indexer_mask_model(cfg, attn_state, indexer_state, 3, N_all)
+    rr = compile_for(ov.Core(), recompute, "CPU").create_infer_request()
+    past = 0
+    for T in chunks:
+        N = past + T
+        h = hidden_all[:, past:N]
+        pid = np.arange(past, N, dtype=np.int64).reshape(1, T)
+        ref = np.asarray(rr.infer({0: h.numpy(), 1: pid})[0])       # [T,1,1,N]
+        got = np.asarray(cr.infer({0: h.numpy(), 1: pid})[0])       # [T,1,1,N]
+        assert got.shape == ref.shape, (got.shape, ref.shape)
+        assert np.array_equal(got, ref), (
+            f"chunk past={past} T={T}: the cached block-key mask differs from the "
+            f"recompute mask (max|d| {np.max(np.abs(got - ref)):.3e})")
+        past = N
+
+
+def test_qsa_served_mask_is_exactly_causal_below_the_2051_boundary(cfg):
+    """T1a cell 3: below 2,051 tokens every row keeps every visible key, so
+    the served indexer's mask EQUALS the dense causal mask exactly -- which is
+    why the served answer must not move there (DESIGN 3.4). At T=2052 the
+    first pruned row (i=2051) appears and the masks differ. The boundary is
+    derived, not tuned: block_topk * ratio + ratio - 1 = 2048 + 4 - 1."""
+    from openvino import opset13 as op
+    from q4e import serving_shape as ss
+    cfg_dense = cfg
+    # a shared, non-degenerate hidden is not needed: equality is structural
+    g = np.random.default_rng(20260928)
+    ratio = int(cfg_dense.indexer_compress_ratio)
+    block_topk = int(cfg_dense.indexer_budget) // ratio
+    boundary = block_topk * ratio + ratio - 1
+    for T in (boundary, boundary + 1):
+        hidden = (g.standard_normal((1, T, cfg_dense.hidden_size)) * 0.02).astype(np.float32)
+        pid = np.arange(T, dtype=np.int64).reshape(1, T)
+        H = cfg_dense.hidden_size
+        hp = op.parameter([1, -1, H], ov.Type.f32)
+        pp = op.parameter([1, -1], ov.Type.i64)
+        cos_np, sin_np = qattn._freqs_tables(cfg_dense, T)
+        rc, rs = op.constant(cos_np), op.constant(sin_np)
+        # zero indexer weights are enough: the SELECTION's visibility is what
+        # is asserted, and at/below the boundary it is every visible block
+        st = {"indexer.index_qk_proj.weight": np.zeros((5 * 128, H), np.float32),
+              "indexer.q_layernorm.weight": np.zeros((128,), np.float32),
+              "indexer.k_layernorm.weight": np.zeros((128,), np.float32)}
+        sinks = []
+        mask = ss._qsa_indexer_mask_served(hp, pp, cfg_dense, st, 3, sinks, rc, rs)
+        r = op.result(mask)
+        m = ov.Model([r], sinks, [hp, pp], "boundary")
+        got = np.asarray(compile_for(ov.Core(), m, "CPU")([hidden, pid])[0])
+        got = np.transpose(got, (2, 1, 0, 3))
+        causal = _causal_additive(T, T, 0)
+        if T == boundary:
+            assert np.array_equal(got, causal), (
+                f"T={T} (the boundary): the served mask is not the causal mask")
+        else:
+            assert not np.array_equal(got, causal), (
+                f"T={T}: the first pruned row did not appear -- boundary moved")
+
+
+def test_qsa_route_gate_boundary_is_on_the_marked_mask(cfg):
+    """T3b cell: the exporter also writes the route gate's boundary on the
+    same marked mask -- block_topk * ratio + ratio - 1, 2051 for this config.
+    The pass copies it to the PagedAttention node and the GPU impl keeps
+    today's route (micro included) at or below it, reading the mask only
+    above it. Red first: without the rt_info the pass leaves the PA node at
+    boundary 0, which the impl treats as "above" and the byte-identity below
+    the boundary fails (T3's control cell measured the floor there)."""
+    from openvino import opset13 as op
+    from q4e import serving_shape as ss
+    ratio = int(cfg.indexer_compress_ratio)
+    block_topk = int(cfg.indexer_budget) // ratio
+    expected = block_topk * ratio + ratio - 1
+    H = cfg.hidden_size
+    hp = op.parameter([1, -1, H], ov.Type.f32)
+    pp = op.parameter([1, -1], ov.Type.i64)
+    cos_np, sin_np = qattn._freqs_tables(cfg, 2048)
+    rc, rs = op.constant(cos_np), op.constant(sin_np)
+    st = {"indexer.index_qk_proj.weight": np.zeros((5 * 128, H), np.float32),
+          "indexer.q_layernorm.weight": np.zeros((128,), np.float32),
+          "indexer.k_layernorm.weight": np.zeros((128,), np.float32)}
+    sinks = []
+    mask = ss._qsa_indexer_mask_served(hp, pp, cfg, st, 3, sinks, rc, rs)
+    ri = mask.get_rt_info()
+    assert "arcint" in ri and ri["arcint"].astype(str) == "qsa_selection", ri
+    assert "qsa_boundary" in ri, ri
+    assert ri["qsa_boundary"].astype(int) == expected == 2051, ri
+
+
+def test_qsa_off_leaves_the_serving_shape_graph_unchanged():
+    """T1a cell 2: the qsa flag is additive. With `qsa=False` (the default)
+    the serving-shape backbone carries NO indexer Variable and NO
+    `qsa_selection` rt_info and reports the same node count as the default
+    build -- so every existing artifact and the arch hash are untouched. With
+    `qsa=True` the indexer Variable appears per full-attention layer, the
+    marker is set, and the graph grows. The DEFAULT build's byte-shape guard
+    is the whole `test_serving_shape.py` contract suite (its structural counts
+    and the saved-graph checks), which this change leaves green; the check
+    that the marker reaches the ATTENTION CORE is
+    `test_qsa_served_attention_consumes_the_marked_mask`."""
+    from q4e import serving_shape as ss
+    def build(qsa):
+        arena = ss.SparseArena()
+        try:
+            return ss.build_serving_shape_ir(arena=arena, n_layers=4, qsa=qsa)
+        finally:
+            arena.close()
+    off, r_off = build(False)
+    default, r_def = build(False)
+    on, r_on = build(True)
+    assert r_off["nodes"] == r_def["nodes"]
+    assert r_off["graph_const_bytes"] == r_def["graph_const_bytes"]
+    assert r_off["inputs"] == r_def["inputs"]
+    assert r_off["qsa"] is False and r_on["qsa"] is True
+
+    def var_ids(model):
+        return sorted(v.get_info().variable_id for v in model.get_variables())
+    off_ids, on_ids = var_ids(off), var_ids(on)
+    assert not any("indexer_block" in i for i in off_ids), off_ids
+    assert sum("indexer_block" in i for i in on_ids) == r_on["attn_layers"] == 1, on_ids
+    assert "cache_params.past.indexer_block.3" in on_ids
+    # the compressed block cache carries the raw tail and the token counter too
+    assert "cache_params.past.indexer_tail.3" in on_ids
+    assert "cache_params.past.indexer_pos.3" in on_ids
+
+    def markers(model):
+        n = 0
+        for node in model.get_ops():
+            ri = node.get_rt_info()
+            if "arcint" in ri and ri["arcint"].astype(str) == "qsa_selection":
+                n += 1
+        return n
+    assert markers(off) == 0 and markers(on) == 1
+    assert r_on["nodes"] > r_off["nodes"]
+
+
+def test_qsa_served_attention_consumes_the_marked_mask():
+    """The served emitter must FEED the indexer's mask to the SDPA, not merely
+    build it: without this cell a mutant that emits the marker but hands the
+    SDPA the dense causal mask would pass every other T1a cell. Each
+    `ScaledDotProductAttention` in a qsa=True backbone has the marked mask
+    (`attn3/qsa_mask`, rt_info `arcint=qsa_selection`) as input 3 -- its
+    `attention_mask` operand; with qsa=False no SDPA carries a marked mask.
+    Depth 4 has exactly one attention layer."""
+    from q4e import serving_shape as ss
+    def build(qsa):
+        arena = ss.SparseArena()
+        try:
+            return ss.build_serving_shape_ir(arena=arena, n_layers=4, qsa=qsa)[0]
+        finally:
+            arena.close()
+    def marked_spda(model):
+        n = 0
+        for node in model.get_ops():
+            if node.get_type_name() != "ScaledDotProductAttention":
+                continue
+            ri = node.input_value(3).get_node().get_rt_info()
+            if "arcint" in ri and ri["arcint"].astype(str) == "qsa_selection":
+                n += 1
+        return n
+    on, off = build(True), build(False)
+    assert marked_spda(on) == 1, "the QSA mask is built but not consumed by the SDPA"
+    assert marked_spda(off) == 0
+
+
+def test_qsa_indexer_state_survives_the_paged_attention_pass():
+    """T1b (option A): the pass `SDPAToPagedAttention` removes only the KV
+    Assigns it matched (`var_ids_to_remove`); the indexer's ReadValue and its
+    Assign must survive it, and the plain Variable must not be gathered by
+    `beam_idx` (whose Parameter the pass deletes -- a gathered Variable would
+    lose its input and the transformed graph would not be well-formed). The
+    KV pair is consumed into the paged cache ports and `beam_idx` disappears;
+    the indexer state stays. A mutant that gathers the indexer Variable by
+    `beam_idx` fails this cell (and the pass)."""
+    from openvino._offline_transformations import paged_attention_transformation
+    from q4e import serving_shape as ss
+    arena = ss.SparseArena()
+    try:
+        model, _ = ss.build_serving_shape_ir(arena=arena, n_layers=4, qsa=True)
+        paged_attention_transformation(model)
+        ops = model.get_ops()
+        for var in ("cache_params.past.indexer_block.3",
+                    "cache_params.past.indexer_tail.3",
+                    "cache_params.past.indexer_pos.3"):
+            assert any(n.get_type_name() == "ReadValue" and n.get_variable_id() == var
+                       for n in ops), f"the indexer ReadValue {var} did not survive the pass"
+            assert any(n.get_type_name() == "Assign" and n.get_variable_id() == var
+                       for n in ops), f"the indexer Assign {var} did not survive the pass"
+        # the KV state is consumed into the paged caches, and beam_idx is gone
+        live = {n.get_variable_id() for n in ops if n.get_type_name() == "ReadValue"}
+        assert "cache_params.past.key.3" not in live
+        assert "cache_params.past.value.3" not in live
+        names = {p.get_node().get_friendly_name() for p in model.inputs}
+        assert "beam_idx" not in names
+        assert any(n.startswith("key_cache") for n in names)
+    finally:
+        arena.close()
+
+
+def test_qsa_marker_survives_serialization_and_wires_the_29_input(tmp_path):
+    """The cell that would have caught the served-qsa bug (2026-09-29). The
+    exporter's NODE-level rt_info does not survive `ov.save_model` -- the
+    serializer writes only a fixed set of keys -- so the pass sees an untagged
+    causal mask and drops it, and the served 0.5.4 artifacts kept 28 inputs
+    while answering as if QSA were on. The marker therefore travels in MODEL
+    rt_info (`qsa = {boundary, mask_nodes}`), which the IR DOES serialize; the
+    runtime re-applies the node tags by friendly name before the pass.
+
+    RED on the exporter before the model-level marker: `get_rt_info()` has no
+    `qsa` key, nothing is re-applied, and the QSA layer's PagedAttention keeps
+    28 inputs. Depth 4 has exactly one QSA layer."""
+    import json
+    from openvino._offline_transformations import paged_attention_transformation
+    from q4e import serving_shape as ss
+    arena = ss.SparseArena()
+    try:
+        model, _ = ss.build_serving_shape_ir(arena=arena, n_layers=4, qsa=True)
+        xml = tmp_path / "d4qsa.xml"
+        ov.save_model(model, str(xml))
+    finally:
+        arena.close()
+    back = ov.Core().read_model(str(xml))
+    # (1) the marker survived serialization: on the MODEL, not the node.
+    rt = back.get_rt_info()
+    assert "qsa" in rt, list(rt.keys())
+    marker = json.loads(rt["qsa"].astype(str))
+    assert marker["boundary"] == 2051, marker
+    assert marker["mask_nodes"] == ["attn3/qsa_mask"], marker
+    # (2) the runtime re-applies the node tags from it by friendly name.
+    by_name = {n.get_friendly_name(): n for n in back.get_ops()}
+    for name in marker["mask_nodes"]:
+        node_rt = by_name[name].get_rt_info()
+        node_rt["arcint"] = "qsa_selection"
+        node_rt["qsa_boundary"] = str(marker["boundary"])
+    paged_attention_transformation(back)
+    pa = [n for n in back.get_ops() if n.get_type_name() == "PagedAttentionExtension"]
+    assert len(pa) == 1, [n.get_friendly_name() for n in pa]
+    if pa[0].get_input_size() == 28:
+        # This OpenVINO build's SDPAToPagedAttention predates the QSA selection
+        # input (plugin patch 0073), so it drops the tagged mask. The marker
+        # assertions above are the red-first part -- they fail on the exporter
+        # before the model-level marker. The 29-input assertion runs on the
+        # patched runtime (the plugin's own suite and the served boot).
+        pytest.skip("this OpenVINO build has no QSA selection input (patch 0073); "
+                    "the marker-survives assertions above are the cell")
+    assert pa[0].get_input_size() == 29, (
+        f"the QSA layer's PagedAttention has {pa[0].get_input_size()} inputs; "
+        "the selection marker did not reach the pass")

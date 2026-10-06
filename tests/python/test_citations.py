@@ -94,17 +94,17 @@ _FOREIGN_CITATION_FILES = {
 # with a test around it.
 _ANCHORED = [
     # -- the OTD / expert-slot handshake, both sides ------------------------
-    ("tools/q4e/serving_shape.py", "backend_ov.cpp:578",
+    ("tools/q4e/serving_shape.py", "backend_ov.cpp:580",
      "src/exec/backend_ov.cpp", "std::optional<SlotPoolIr> slot_pool_from_ir"),
-    ("tools/q4e/serving_shape.py", "backend_ov.cpp:567-570",
+    ("tools/q4e/serving_shape.py", "backend_ov.cpp:569-572",
      "src/exec/backend_ov.cpp", "this function never guesses"),
-    ("tests/python/test_serving_shape.py", "backend_ov.cpp:586",
+    ("tests/python/test_serving_shape.py", "backend_ov.cpp:588",
      "src/exec/backend_ov.cpp",
      'if (tname.find("moe") == std::string::npos) continue;'),
-    ("tests/python/test_serving_shape.py", "backend_ov.cpp:605",
+    ("tests/python/test_serving_shape.py", "backend_ov.cpp:607",
      "src/exec/backend_ov.cpp",
      "per_expert_bytes += elems * konst->get_element_type().size();"),
-    ("tools/q4e/serving_shape.py", "backend_ov.cpp:601-605",
+    ("tools/q4e/serving_shape.py", "backend_ov.cpp:603-607",
      "src/exec/backend_ov.cpp",
      "per_expert_bytes += elems * konst->get_element_type().size();"),
     # -- the constants the residency arithmetic is checked against ----------
@@ -112,12 +112,12 @@ _ANCHORED = [
      "src/exec/flash_next_offload.h", "kFlashNextSliceBytes  = 2'457'600"),
     ("tools/q4e/serving_shape.py", "exec/flash_next_offload.h:45",
      "src/exec/flash_next_offload.h", "kFlashNextSliceBytes  = 2'457'600"),
-    ("tests/python/test_serving_shape.py", "fit.h:95",
+    ("tests/python/test_serving_shape.py", "fit.h:96",
      "src/exec/fit.h", "inline uint64_t expert_slot_bytes("),
-    ("tools/q4e/serving_shape.py", "src/exec/fit.h:95",
+    ("tools/q4e/serving_shape.py", "src/exec/fit.h:96",
      "src/exec/fit.h", "inline uint64_t expert_slot_bytes("),
     # -- the port names the serving path declares and feeds -----------------
-    ("tests/python/test_serving_shape.py", "backend_ov.cpp:99",
+    ("tests/python/test_serving_shape.py", "backend_ov.cpp:101",
      "src/exec/backend_ov.cpp", 'kPositionIds   = "position_ids"'),
     ("tests/python/test_serving_shape.py", "src/exec/ngram_row_ids.h:59",
      "src/exec/ngram_row_ids.h", "int num_ngram_heads() const"),
@@ -134,7 +134,7 @@ _ANCHORED = [
      "src/core/gguf_repack.cpp", "double repack_bound_steps(int32_t ggml_type)"),
     ("tests/python/test_repack_route.py", "design-gguf-native.md:52",
      "docs/design-gguf-native.md", "uses codebooks and sign tables"),
-    ("tests/python/test_repack_route.py", "serving_shape.py:173",
+    ("tests/python/test_repack_route.py", "serving_shape.py:174",
      "tools/q4e/serving_shape.py",
      "shipped tensor is IQ4_NL, which OpenVINO has no element type for"),
 ]

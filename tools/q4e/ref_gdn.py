@@ -69,6 +69,7 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
 
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_idx = layer_idx
+        self.key_head_map = getattr(config, "gdn_key_head_map", None) or "interleave"
         self.activation = config.hidden_act
         self.layer_norm_epsilon = config.rms_norm_eps
 
@@ -147,9 +148,17 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
         beta = b.sigmoid()
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+        r = self.num_v_heads // self.num_k_heads
+        if r > 1:
+            if self.key_head_map == "tiled":
+                # DEVIATION from the pin (line 583 repeat_interleave), by
+                # measurement: the shipped GGUF pairs value head h with key
+                # head h % HK, as llama.cpp does (see q4e.gdn._key_head_map)
+                query = query.repeat(1, 1, r, 1)
+                key = key.repeat(1, 1, r, 1)
+            else:
+                query = query.repeat_interleave(r, dim=2)
+                key = key.repeat_interleave(r, dim=2)
 
         core_attn_out, _ = _pin.torch_chunk_gated_delta_rule(
             query,

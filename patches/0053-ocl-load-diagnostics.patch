@@ -1,0 +1,148 @@
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl/kernels_cache.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl/kernels_cache.cpp
+index 6e52d7a4c5..72eaa7c49c 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl/kernels_cache.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl/kernels_cache.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ //
+ 
++#include <iostream>
+ #include "kernels_cache.hpp"
+ #include <regex>
+ 
+@@ -313,10 +314,44 @@ void kernels_cache::build_batch(const batch_program& batch, compiled_kernels& co
+     }
+     std::vector<kernel::ptr> kernels;
+     if (!precompiled.empty()) {
++        {
++            std::string eps;
++            for (const auto& kv : batch.entry_point_to_id) eps += kv.first + " ";
++            std::cerr << "ARCINT_KC start-bin hash=" << batch.hash_value << " bucket=" << batch.bucket_id
++                      << " batch=" << batch.batch_id << " count=" << batch.kernels_counter
++                      << " lang=" << (int)batch.language << " opts=[" << batch.options << "] eps=[" << eps << "]"
++                      << std::endl;
++        }
++        try {
+         _builder->build_kernels(precompiled.data(), precompiled.size(), KernelFormat::NATIVE_BIN, "", kernels);
++        } catch (std::exception& e) {
++            std::string eps;
++            for (const auto& kv : batch.entry_point_to_id) eps += kv.first + " ";
++            std::cerr << "ARCINT_KC EXC hash=" << batch.hash_value << " bucket=" << batch.bucket_id
++                      << " batch=" << batch.batch_id << " count=" << batch.kernels_counter
++                      << " opts=[" << batch.options << "] eps=[" << eps << "] what=" << e.what() << std::endl;
++            throw;
++        }
+     } else {
+         auto combined_source = join_strings(batch.source);
++        {
++            std::string eps;
++            for (const auto& kv : batch.entry_point_to_id) eps += kv.first + " ";
++            std::cerr << "ARCINT_KC start-src hash=" << batch.hash_value << " bucket=" << batch.bucket_id
++                      << " batch=" << batch.batch_id << " count=" << batch.kernels_counter
++                      << " lang=" << (int)batch.language << " opts=[" << batch.options << "] eps=[" << eps << "]"
++                      << std::endl;
++        }
++        try {
+         _builder->build_kernels(combined_source.data(), combined_source.size(), KernelFormat::SOURCE, batch.options, kernels);
++        } catch (std::exception& e) {
++            std::string eps;
++            for (const auto& kv : batch.entry_point_to_id) eps += kv.first + " ";
++            std::cerr << "ARCINT_KC EXC hash=" << batch.hash_value << " bucket=" << batch.bucket_id
++                      << " batch=" << batch.batch_id << " count=" << batch.kernels_counter
++                      << " opts=[" << batch.options << "] eps=[" << eps << "] what=" << e.what() << std::endl;
++            throw;
++        }
+         OPENVINO_ASSERT(!kernels.empty(), "[GPU] Expected to compile more than 0 kernels in the batch");
+         OPENVINO_ASSERT(kernels.size() == batch.kernels_counter, "[GPU] Number of compiled kernels is different than kernel batch size");
+         if (dump_sources && dump_file.good()) {
+diff --git a/src/plugins/intel_gpu/src/runtime/ocl/ocl_common.hpp b/src/plugins/intel_gpu/src/runtime/ocl/ocl_common.hpp
+index 3ee7b10d36..a8e579e475 100644
+--- a/src/plugins/intel_gpu/src/runtime/ocl/ocl_common.hpp
++++ b/src/plugins/intel_gpu/src/runtime/ocl/ocl_common.hpp
+@@ -7,6 +7,8 @@
+ #include "ocl/ocl_device_detector.hpp"
+ #include "openvino/core/except.hpp"
+ 
++#include <execinfo.h>
++#include <iostream>
+ #include <vector>
+ 
+ namespace cldnn {
+@@ -59,6 +61,14 @@ inline void rethrow(std::string message, cl_int error, const device_info& info)
+            << "\tFor case 2 (Out-of-Bounds Access):\n"
+            << "\t  - Please submit a bug report to the OpenVINO team.\n"
+            << "\tAdditionally, please try updating the driver to the latest version.\n";
++        {
++            void* bt[24];
++            int nbt = backtrace(bt, 24);
++            char** syms = backtrace_symbols(bt, nbt);
++            std::cerr << "ARCINT_BT err=" << error << " msg=" << message << std::endl;
++            for (int i = 0; i < nbt; i++) std::cerr << "ARCINT_BT   " << syms[i] << std::endl;
++            free(syms);
++        }
+         OPENVINO_THROW(ss.str());
+     } else {
+         OPENVINO_THROW(message);
+diff --git a/src/plugins/intel_gpu/src/runtime/ocl/ocl_kernel_builder.hpp b/src/plugins/intel_gpu/src/runtime/ocl/ocl_kernel_builder.hpp
+index e5c6dd3d39..3f8582e996 100644
+--- a/src/plugins/intel_gpu/src/runtime/ocl/ocl_kernel_builder.hpp
++++ b/src/plugins/intel_gpu/src/runtime/ocl/ocl_kernel_builder.hpp
+@@ -8,6 +8,7 @@
+ #include "intel_gpu/runtime/device.hpp"
+ 
+ #include "ocl_device.hpp"
++#include <iostream>
+ #include "ocl_kernel.hpp"
+ 
+ #ifndef CL_HPP_ENABLE_EXCEPTIONS
+@@ -59,6 +60,22 @@ class ocl_kernel_builder : public kernel_builder{
+             }
+             cl::Program program(program_handle);
+             cl::vector<cl::Kernel> kernels;
++            {
++                std::string head;
++                if (src_format == KernelFormat::SOURCE && src_bytes > 0) {
++                    std::string all(reinterpret_cast<const char*>(src), std::min<size_t>(src_bytes, 4000));
++                    size_t p0 = 0;
++                    while (head.size() < 400 && p0 < all.size()) {
++                        size_t k = all.find("__kernel", p0);
++                        if (k == std::string::npos) break;
++                        size_t e = all.find('(', k);
++                        head += all.substr(k, (e == std::string::npos ? k + 40 : e) - k) + " | ";
++                        p0 = k + 8;
++                    }
++                }
++                std::cerr << "ARCINT_KB fmt=" << (int)src_format << " bytes=" << src_bytes
++                          << " opts=[" << options << "] kernels=[" << head << "]" << std::endl;
++            }
+             try {
+                 // We can safely ignore return values here as those function should throw in case of errors
+                 DISCARD_RETURN(program.build({m_device.get_device()}, options.c_str()));
+@@ -70,6 +87,13 @@ class ocl_kernel_builder : public kernel_builder{
+                     GPU_DEBUG_INFO << e.second;
+                 }
+                 GPU_DEBUG_INFO << "-------- End of Kernel build error" << std::endl;
++                {
++                    std::cerr << "ARCINT_KB FAIL opts=[" << options << "] what=" << err.what() << std::endl;
++                    try {
++                        auto blog = program.getBuildInfo<CL_PROGRAM_BUILD_LOG>();
++                        for (auto& e : blog) std::cerr << "ARCINT_KB LOG " << e.second.substr(0, 2000) << std::endl;
++                    } catch (...) { std::cerr << "ARCINT_KB LOG unavailable" << std::endl; }
++                }
+                 OPENVINO_THROW(OCL_ERR_MSG_FMT(err));
+             } catch (const cl::Error& err) {
+                 // cl::Program::build only throws cl::BuildError for CL_BUILD_PROGRAM_FAILURE.
+@@ -86,6 +110,13 @@ class ocl_kernel_builder : public kernel_builder{
+                     GPU_DEBUG_INFO << "Failed to retrieve program build log" << std::endl;
+                 }
+                 GPU_DEBUG_INFO << "-------- End of Kernel build error" << std::endl;
++                {
++                    std::cerr << "ARCINT_KB FAIL opts=[" << options << "] what=" << err.what() << std::endl;
++                    try {
++                        auto blog = program.getBuildInfo<CL_PROGRAM_BUILD_LOG>();
++                        for (auto& e : blog) std::cerr << "ARCINT_KB LOG " << e.second.substr(0, 2000) << std::endl;
++                    } catch (...) { std::cerr << "ARCINT_KB LOG unavailable" << std::endl; }
++                }
+                 OPENVINO_THROW(OCL_ERR_MSG_FMT(err));
+             } catch (...) {
+                 // We should never hit this catch block

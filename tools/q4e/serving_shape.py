@@ -6,7 +6,7 @@ refusal, which reads:
 
     "(3) RESIDENCY, and only then: this emitter materialises every weight as an
      f32 ov Constant. Measured over the shipped tensor list at that assumption,
-     the mapped set is 659.1 GiB ... No local card holds that and neither does
+     the mapped set is 659.2 GiB ... No local card holds that and neither does
      the export host's RAM -- so full-size needs a different weight strategy
      (quantised constants, and a gather for the n-gram table), not a bigger
      window."
@@ -31,14 +31,14 @@ So "shape and element type, no data" is not a degraded artifact from the
 serving runtime's point of view -- for the slot-pool decision it is the WHOLE
 artifact. This module emits exactly that, and the contract test
 (`tests/python/test_serving_shape.py`) checks it against a Python transcription
-of `slot_pool_from_ir` (`backend_ov.cpp:578-624`) rather than against a
+of `slot_pool_from_ir` (`backend_ov.cpp:580-626`) rather than against a
 description of it.
 
 --------------------------------------------------------------------------
 2. THE EXPERT-SLOT (OTD) CONTRACT, BOTH SIDES, CITED
 --------------------------------------------------------------------------
 
-C++ side, `src/exec/backend_ov.cpp:578-624` `slot_pool_from_ir`:
+C++ side, `src/exec/backend_ov.cpp:580-626` `slot_pool_from_ir`:
 
   * a MoE op is any node whose OpenVINO TYPE NAME contains "moe",
     case-insensitively                                    (backend_ov.cpp:582-586)
@@ -46,9 +46,9 @@ C++ side, `src/exec/backend_ov.cpp:578-624` `slot_pool_from_ir`:
     exactly ONE Convert, whose LEADING DIMENSION equals `num_expert`
                                                           (backend_ov.cpp:589-605)
   * per-expert bytes = product of dims[1:] x element_type().size()
-                                                          (backend_ov.cpp:601-605)
+                                                          (backend_ov.cpp:603-607)
   * an unmatched graph returns nullopt and the caller falls back to the
-    plateau probe -- "this function never guesses"        (backend_ov.cpp:567-570)
+    plateau probe -- "this function never guesses"        (backend_ov.cpp:569-572)
 
 Export side, the shape that was MEASURED to fuse on the card is the TILED
 lowering, described in `tools/verify_moe_lowering.py:26-45` and emitted by
@@ -152,8 +152,10 @@ module emits byte-identical in STRUCTURE to the ones the parity suites gate.
   side dequantises in the 0.5.0 artifact is still the frontier's decision.
 """
 import contextlib
+import json
 import os
 import tempfile
+import types
 
 import numpy as np
 import openvino as ov
@@ -618,22 +620,30 @@ def ngram_chunked_gather(chunk_ids, local_ids, ports):
 def ngram_dequant_iq4nl(row_bytes_f32, head_dim):
     """`[1, T, Hn, row_bytes]` f32 (bytes 0..255) -> `[1, T, Hn, head_dim]`
     f32: ggml's IQ4_NL dequantisation, `d * kvalues[q]` per element, done
-    with ops that are EXACT on this card class (window-050 §4.7: integer
-    eltwise runs in f32, so every intermediate here is an integer below 2**24
-    or a power of two, and the codebook and the exponent are Gathers on
-    constants rather than arithmetic):
+    with ops whose every intermediate is exact in f16 as well as f32 (the
+    GPU plugin runs the served graph at f16 execution precision):
 
       * the block splits into d_lo, d_hi (the f16 scale's two bytes) and 16
         nibble bytes; nibbles come out as floor(b/16) and b - 16*floor(b/16);
       * the f16 is rebuilt from its bit fields -- sign, 5-bit exponent, 10-bit
-        mantissa, subnormals included -- as sign * 2**(e-15) * (1 + m/1024),
-        the power of two gathered from a 32-entry table, so `d` is bit-exact;
+        mantissa, subnormals included -- as sign * 2**(e-15) * (1.m or 0.m),
+        the power of two gathered from a 32-entry table. The fields come from
+        the two bytes APART (d_hi = s eeeee mm, d_lo = the mantissa's low
+        eight bits), so every intermediate is an integer <= 255, a dyadic
+        fraction of <= 11 significant bits, a table power of two, or the f16
+        scale itself -- all exact in f16;
       * kvalues[q] is a Gather on the 16-entry codebook with the nibble
         converted to i32 (Convert is exact for 0..15).
 
-    The product of an f16-exact scale and a codebook integer is exact in
-    f32, so the result equals gguf-py's `dequantize(raw, IQ4_NL)` bit for
-    bit; the contract cell asserts equality, not tolerance.
+    In f32 the product of the f16 scale and a codebook integer is exact, so
+    the result equals gguf-py's `dequantize(raw, IQ4_NL)` bit for bit (the
+    CPU contract cell). In f16 only that last product rounds: on the A770 the
+    decode returns the exact values rounded to f16, bit for bit, on 64 x 16
+    real table rows (`measured-here`, 2026-09-27, DESIGN 7.0.2cz; subnormal
+    scales not shown on the card). The first form built the
+    bit pattern as `lo + 256*hi` (up to 65,535; f16 is exact only to 2,048)
+    and came back at 1.41 % relative error on the card, 93 % of elements
+    wrong.
     """
     f32 = lambda v: op.constant(np.array(v, np.float32))
     i64 = lambda v: op.constant(np.array(v, np.int64))
@@ -649,18 +659,19 @@ def ngram_dequant_iq4nl(row_bytes_f32, head_dim):
     nibbles = op.concat([lo, hi], axis=-1)                     # [..., nb, 32]
     kv = op.gather(f32(NGRAM_IQ4NL_KVALUES), op.convert(nibbles, Type.i32),
                    i64(0))                                     # codebook
-    # the f16 scale from its bits: bits = lo + 256*hi (< 65536, exact)
-    bits = op.add(d_lo, op.multiply(d_hi, f32(256.0)))
-    sign_bit = op.floor(op.divide(bits, f32(32768.0)))         # 0 or 1
-    rest = op.subtract(bits, op.multiply(sign_bit, f32(32768.0)))
-    exp = op.floor(op.divide(rest, f32(1024.0)))               # 0..31
-    mant = op.subtract(rest, op.multiply(exp, f32(1024.0)))    # 0..1023
+    # the f16 scale from its two bytes apart: d_hi = s eeeee mm, d_lo = the
+    # mantissa's low eight bits -- every intermediate exact in f16
+    sign_bit = op.floor(op.divide(d_hi, f32(128.0)))           # 0 or 1
+    hi7 = op.subtract(d_hi, op.multiply(sign_bit, f32(128.0))) # 0..127
+    exp = op.floor(op.divide(hi7, f32(4.0)))                   # 0..31
+    mant_hi = op.subtract(hi7, op.multiply(exp, f32(4.0)))     # 0..3
     # 2**(e-15) for e = 0..31, with e = 0 (subnormal) mapped to 2**-14 and
     # the mantissa then taken WITHOUT the implicit one
     pow_table = [2.0 ** (e - 15) if e > 0 else 2.0 ** -14 for e in range(32)]
     scale = op.gather(f32(pow_table), op.convert(exp, Type.i32), i64(0))
     normal = op.convert(op.greater(exp, f32(0.0)), Type.f32)   # 1 if e > 0
-    frac = op.add(normal, op.divide(mant, f32(1024.0)))        # 1.m or 0.m
+    frac = op.add(op.add(normal, op.divide(mant_hi, f32(4.0))),
+                  op.divide(d_lo, f32(1024.0)))                # 1.m or 0.m
     sign = op.subtract(f32(1.0), op.multiply(sign_bit, f32(2.0)))
     d = op.multiply(op.multiply(sign, scale), frac)            # [..., nb]
     vals = op.multiply(kv, op.unsqueeze(d, i64(-1)))           # [..., nb, 32]
@@ -733,8 +744,11 @@ def _compressed_expert(arena, e, out, inn, name, filler=None,
     """One expert-stacked weight in the tiled lowering's shape.
 
     rank-4 [E, out, groups, group_size] u4 Constant
-      -> Convert(f32) -> Subtract(zero_point) -> Multiply(scale)
-      -> Reshape(rank 4 -> 3)  [E, out, inn]
+      -> Convert(f16) -> Subtract(Convert(u4 zero_point -> f16))
+      -> Multiply(f16 scale Constant) -> Reshape(rank 4 -> 3) [E, out, inn]
+      -> Convert(f32)
+    (the fusing control's chain, since 2026-09-17; the PORTED route below
+    keeps the f32 arithmetic it was measured with, and no trailing Convert)
 
     The trailing Reshape is not cosmetic: verify_moe_lowering.py:33-42 records
     a real GPU compile crashing inside the fusing pass's own rewrite when it
@@ -746,8 +760,9 @@ def _compressed_expert(arena, e, out, inn, name, filler=None,
 
     WITH a `filler` (q4e.expert_fill.ExpertFiller) the same shapes carry the
     real checkpoint: the filler returns packed u4 codes, packed u4
-    zero-points and f32 scales for (layer, kind), and each of the three
-    constants is built OVER pages written first. The graph is structurally
+    zero-points and f32 scales for (layer, kind) -- the scales are carried
+    as f16 Constants, the exact f32 stays in `arena.scales` -- and each of
+    the three constants is built OVER pages written first. The graph is structurally
     identical either way -- same ops, shapes and element types -- which is
     what lets the empty build's contract test speak for the filled one.
     """
@@ -760,6 +775,17 @@ def _compressed_expert(arena, e, out, inn, name, filler=None,
         assert sc.shape == (e, out, groups, 1), (
             f"{name}: filler returned scales {sc.shape}, the constant is "
             f"{(e, out, groups, 1)}")
+    # THE DEQUANT CHAIN'S TYPE IS f16 WITH A TRAILING Convert TO f32 -- the
+    # fusing 35B control's exact shape (walked node by node 2026-09-17), and
+    # not a cosmetic choice: under the plugin's f16 inference precision an
+    # f32 scale Constant feeding the fused MOECompressed gets a Convert
+    # inserted by KeepConstantsPrecisionAndAddConverts, and the offload
+    # series' OTD resolver (moe.cpp, patch 0005 on) demands direct Constants:
+    # "Expected constant input for MOE3GemmFusedCompressed, got: Convert"
+    # (census 2, B60, 2026-09-17). An f16 scale needs no Convert. The PORTED
+    # chain (dead route) keeps its f32 arithmetic; the unpack cell compares
+    # each against its own reference.
+    ct = Type.f32 if port_sink is not None else Type.f16
     if port_sink is not None:
         # SEGMENTED: the codes are a u8 PORT, bound by the runtime; only the
         # zero-points and scales are constants of this segment's graph
@@ -768,35 +794,347 @@ def _compressed_expert(arena, e, out, inn, name, filler=None,
     elif filler is None:
         w = arena.constant([e, out, groups, gs], EXPERT_DECLARED_TYPE)
         w.set_friendly_name(name + "/weight_u4")
-        x = op.convert(w, Type.f32)
+        x = op.convert(w, ct)
     else:
         w = arena.constant([e, out, groups, gs], EXPERT_DECLARED_TYPE,
                            fill=pw, name=name + "/weight_u4")
         w.set_friendly_name(name + "/weight_u4")
-        x = op.convert(w, Type.f32)
+        x = op.convert(w, ct)
     if filler is None:
         zp = arena.constant([e, out, groups, 1], EXPERT_DECLARED_TYPE)
-        scale = op.constant(np.ones((e, out, groups, 1), np.float32))
+        scale = op.constant(np.ones((e, out, groups, 1),
+                                    np.float32 if ct == Type.f32 else np.float16))
     else:
         zp = arena.constant([e, out, groups, 1], EXPERT_DECLARED_TYPE,
                             fill=pzp, name=name + "/zero_point")
-        scale = arena.f32_filled(sc)
-        arena.scales[name + "/scale"] = sc
+        if ct == Type.f32:
+            scale = arena.f32_filled(sc)
+            arena.scales[name + "/scale"] = sc
+        else:
+            sc16 = np.ascontiguousarray(sc, dtype=np.float16)
+            scale = arena.constant(list(sc16.shape), Type.f16, fill=sc16,
+                                   name=name + "/scale")
+            # the EXACT scale the filler quantised with (tests dequantise the
+            # codes against it); the artifact carries its f16 rounding
+            arena.scales[name + "/scale"] = sc
     zp.set_friendly_name(name + "/zero_point")
     scale.set_friendly_name(name + "/scale")
-    x = op.subtract(x, op.convert(zp, Type.f32))
+    x = op.subtract(x, op.convert(zp, ct))
     x = op.multiply(x, scale)
     x = op.reshape(x, op.constant(np.array([e, out, inn], np.int64)),
                    special_zero=False)
     x.set_friendly_name(name + "/dequant_reshape")
+    if ct != Type.f32:
+        x = op.convert(x, Type.f32)
+        x.set_friendly_name(name + "/dequant_f32")
+    return x
+
+
+def swish1(x):
+    """Swish with ONE input. The Python binding's `op.swish(x)` appends a
+    beta Constant (1.0) as a second input; the plugin's tiled MoE matcher
+    declares `Swish({gate_matmul})` with one input and the C++ Matcher
+    rejects a node whose argument count differs (measured 2026-09-17: the
+    fusing 35B control carries Swish/opset4 in=1, this emitter carried in=2,
+    and the census stayed at 0 MoE primitives with the Reshapes in place)."""
+    s = op.swish(x)
+    s.set_arguments([s.input_value(0)])          # drop the beta the binding added
+    s.validate_and_infer_types()
+    return s
+
+
+def _native_expert(arena, e, out, inn, name, fmt, parts):
+    """One expert-stacked weight as the CHECKPOINT'S OWN BLOCKS, decoded in
+    standard ops (design-routing-aware-expert-execution 2.3a/2.3b, DESIGN
+    7.0.2bz): the u4 grouped-affine repack of the IQ3_XXS / IQ4_NL experts
+    costs 0.10-0.13 relative RMS per tensor and 0.73 nats at depth 48, so the
+    experts are carried as q4e.native_blocks lays them out per role, and the
+    decode is expressed in ops the CPU plugin runs exactly (the suite's
+    oracle) and the GPU plugin's matcher will lower to native kernels:
+
+      IQ4_NL   codes u4 [E,out,inn/32,32] -> Convert(i32) -> Gather(table[16] f32)
+               * Convert(f32)(scales f16 [E,out,inn/32,1]) -> Reshape [E,out,inn]
+      IQ4_XS   the IQ4_NL chain over the IQ4_NL layout (sub-block scales folded
+               into the f32 scale by the split)
+      Q8_0     codes i8 [E,out,inn/32,32] -> Convert(f32)
+               * Convert(f32)(scales f16) -> Reshape [E,out,inn]
+      IQ3_XXS  gridix u8 [E,out,inn/32,8] -> Convert(i32) -> Gather(grid[256,4])
+               -> Reshape [E,out,inn/32,32]  (the magnitudes)
+               signix u8 [E,out,inn/32,4] -> Convert(i32) -> Gather(ksigns[128])
+               -> Unsqueeze -> BitwiseAnd(masks[8]) -> Greater(0)
+               -> Select(-1, +1) -> Reshape [E,out,inn/32,32]  (the signs)
+               magnitudes * signs * Convert(f32)(scales f16) -> Reshape [E,out,inn]
+
+    THE CONSTANTS' SHAPES ARE THE FUSED OP'S OWN (design note 2.3c): the
+    plugin's MOECompressed takes every expert weight as rank-4 [E, out,
+    groups, group_size] with a scale [E, out, groups, 1] and an optional
+    zero-point [E, out, groups, 1]. Both formats fit at group 32 -- IQ4_NL
+    as u4 codes plus a table and no zero-point; IQ3_XXS as 8 grid indices
+    per 32 values in the weight slot, 4 sign indices per 32 values in the
+    zero-point slot, and the per-32 scale -- so the plugin patch lowers
+    these Constants as they are, and the offload path copies one expert's
+    bytes exactly as it does for the u4 route.
+
+    The arithmetic is f32 (exact against numpy's decode); the fusing u4 chain
+    is f16 with a trailing Convert because its matcher demands direct f16
+    Constants, and the native matcher variants are the plugin patch's to
+    define. Until that patch, the GPU plugin would constant-fold these
+    chains into dense f16 weights (10 GiB per layer), so a native artifact
+    is measured on the CPU plugin at small geometry and, at depth, through
+    the served binary once the patch exists.
+
+    `parts` are q4e.native_blocks' per-role arrays over [e*out, ...] rows.
+    Returns the [E,out,inn] f32 node.
+    """
+    from q4e import native_blocks as nb
+    from q4e.expert_fill import pack_u4
+    rows = e * out
+    groups = inn // 32
+    g4 = op.constant(np.array([e, out, groups, 32], np.int64))
+    if fmt == "IQ2_S_PACKED":
+        w80, d = parts
+        return _native_packed_expert(arena, e, out, inn, name, w80, d)
+    if fmt in ("IQ4_NL", "IQ4_XS"):
+        # IQ4_XS splits to the IQ4_NL layout (its 6-bit sub-block scales are
+        # folded into the per-32 f32 scale, native_blocks.iq4_xs_split), so
+        # the chain -- and the plugin's lowering -- are the IQ4_NL ones
+        codes, scales = parts
+        assert codes.shape == (rows, inn) and scales.shape == (rows, groups), (codes.shape, scales.shape)
+        w = arena.constant([e, out, groups, 32], Type.u4, fill=pack_u4(codes), name=name + "/codes_u4")
+        w.set_friendly_name(name + "/codes_u4")
+        table = op.constant(nb.KVALUES_IQ4NL.astype(np.float32))
+        x = op.gather(table, op.convert(w, Type.i32), op.constant(np.int64(0)))     # [E,out,groups,32]
+        x.set_friendly_name(name + "/iq4nl_table")
+    elif fmt == "IQ3_XXS":
+        gridix, signix, scales = parts
+        assert gridix.shape == (rows, inn // 4) and signix.shape == (rows, inn // 8), (gridix.shape, signix.shape)
+        assert scales.shape == (rows, groups), scales.shape
+        gi = arena.constant([e, out, groups, 8], Type.u8, fill=np.ascontiguousarray(gridix, np.uint8),
+                            name=name + "/gridix_u8")
+        gi.set_friendly_name(name + "/gridix_u8")
+        grid = op.constant(nb.IQ3XXS_GRID.astype(np.float32))                      # [256, 4]
+        mag = op.gather(grid, op.convert(gi, Type.i32), op.constant(np.int64(0)))    # [E,out,groups,8,4]
+        mag = op.reshape(mag, g4, special_zero=False)
+        mag.set_friendly_name(name + "/iq3xxs_grid")
+        si = arena.constant([e, out, groups, 4], Type.u8, fill=np.ascontiguousarray(signix, np.uint8),
+                            name=name + "/signix_u8")
+        si.set_friendly_name(name + "/signix_u8")
+        ks = op.constant(nb.KSIGNS_IQ2XS.astype(np.int32))                          # [128]
+        masks = op.gather(ks, op.convert(si, Type.i32), op.constant(np.int64(0)))    # [E,out,groups,4]
+        bits = op.bitwise_and(op.unsqueeze(masks, op.constant(np.int64(-1))),
+                              op.constant(nb.KMASK_IQ2XS.astype(np.int32)))         # [E,out,groups,4,8]
+        neg = op.greater(bits, op.constant(np.int32(0)))
+        sign = op.select(neg, op.constant(np.float32(-1.0)), op.constant(np.float32(1.0)))
+        sign = op.reshape(sign, g4, special_zero=False)
+        sign.set_friendly_name(name + "/iq3xxs_sign")
+        x = op.multiply(mag, sign)
+    elif fmt == "IQ2_S":
+        # IQ2_S (ggml type 22): four 10-bit grid indices per 32 values, one raw
+        # sign byte per 8 values, and TWO 4-bit sub-block scales per 32 (the low
+        # nibble serves values 0..15, the high nibble 16..31). The weight slot is
+        # the u8 [E,out,K/32,8] patch 0043/0045's fourth format reads: the four
+        # indices as little-endian u16, two bytes each. The scale slot is the
+        # compact [E,out,K/32,2] and is EXPANDED in-graph to [E,out,K/32,32] (lo
+        # repeated 16, hi repeated 16) -- the constant stays 4 B per 32 values,
+        # not the 64 B an expanded constant would cost.
+        gridix, signix, scales8 = parts
+        assert gridix.shape == (rows, inn // 8) and gridix.dtype == np.uint16, (
+            gridix.shape, gridix.dtype)
+        assert signix.shape == (rows, inn // 8) and scales8.shape == (rows, inn // 8), (
+            signix.shape, scales8.shape)
+        gi = np.ascontiguousarray(
+            gridix.reshape(e, out, groups, 4).astype("<u2")).view(np.uint8).reshape(
+            e, out, groups, 8)
+        w = arena.constant([e, out, groups, 8], Type.u8, fill=gi, name=name + "/gridix_u8")
+        w.set_friendly_name(name + "/gridix_u8")
+        w5 = op.reshape(w, op.constant(np.array([e, out, groups, 4, 2], np.int64)),
+                        special_zero=False)
+        lo = op.gather(w5, op.constant(np.array(0, np.int64)), op.constant(np.int64(-1)))
+        hi = op.gather(w5, op.constant(np.array(1, np.int64)), op.constant(np.int64(-1)))
+        idx = op.add(op.convert(lo, Type.i32),
+                     op.multiply(op.convert(hi, Type.i32),
+                                 op.constant(np.array(256, np.int32))))
+        idx.set_friendly_name(name + "/iq2s_index")
+        grid = op.constant(nb.IQ2S_GRID.astype(np.float32))                        # [1024, 8]
+        mag = op.gather(grid, idx, op.constant(np.int64(0)))                       # [E,out,g,4,8]
+        mag = op.reshape(mag, g4, special_zero=False)
+        mag.set_friendly_name(name + "/iq2s_grid")
+        # IQ2_S signs are the RAW byte: bit j flips value j (no 7-bit table
+        # index, unlike IQ3_XXS)
+        si = arena.constant([e, out, groups, 4], Type.u8,
+                            fill=np.ascontiguousarray(signix.reshape(e, out, groups, 4)),
+                            name=name + "/signix_u8")
+        si.set_friendly_name(name + "/signix_u8")
+        bits = op.bitwise_and(op.unsqueeze(op.convert(si, Type.i32), op.constant(np.int64(-1))),
+                              op.constant(nb.KMASK_IQ2XS.astype(np.int32)))        # [E,out,g,4,8]
+        neg = op.greater(bits, op.constant(np.int32(0)))
+        sign = op.reshape(op.select(neg, op.constant(np.float32(-1.0)),
+                                    op.constant(np.float32(1.0))),
+                          g4, special_zero=False)
+        sign.set_friendly_name(name + "/iq2s_sign")
+        x = op.multiply(mag, sign)
+        s4 = scales8.reshape(e, out, groups, 4)
+        sc2_f32 = np.stack([s4[..., 0], s4[..., 2]], axis=-1).astype(np.float32)   # lo, hi
+        sc2 = arena.constant([e, out, groups, 2], Type.f16,
+                             fill=np.ascontiguousarray(sc2_f32, np.float16),
+                             name=name + "/block_scale")
+        sc2.set_friendly_name(name + "/block_scale")
+        arena.scales[name + "/block_scale"] = sc2_f32
+        # lo serves values 0..15 and hi 16..31, so the pair is the OUTER axis
+        # of the 32: [.,2,1] -> [.,2,16]. (Corrected 2026-09-26: the first form
+        # broadcast [.,1,2] -> [.,16,2], which interleaves lo/hi value by value;
+        # the fused GPU kernels read the compact Constant in ggml's order and
+        # were unaffected, the CPU-plugin decode of this chain was wrong by up
+        # to 27 on a 30 weight -- test_native_expert_chain did not carry IQ2_S.)
+        sc5 = op.reshape(op.convert(sc2, Type.f32),
+                         op.constant(np.array([e, out, groups, 2, 1], np.int64)),
+                         special_zero=False)
+        sc_rep = op.broadcast(sc5,
+                              op.constant(np.array([e, out, groups, 2, 16], np.int64)))
+        sc32 = op.reshape(sc_rep, g4, special_zero=False)
+        sc32.set_friendly_name(name + "/iq2s_scale32")
+        x = op.multiply(x, sc32)
+        x = op.reshape(x, op.constant(np.array([e, out, inn], np.int64)), special_zero=False)
+        x.set_friendly_name(name + "/native_f32")
+        return x
+    elif fmt == "Q8_0":
+        codes, scales = parts
+        assert codes.shape == (rows, inn) and codes.dtype == np.int8 and scales.shape == (rows, groups), (
+            codes.shape, codes.dtype, scales.shape)
+        w = arena.constant([e, out, groups, 32], Type.i8, fill=np.ascontiguousarray(codes, np.int8),
+                           name=name + "/codes_i8")
+        w.set_friendly_name(name + "/codes_i8")
+        x = op.convert(w, Type.f32)
+    else:
+        raise ValueError(f"{name}: unsupported native expert format {fmt!r} "
+                         f"({sorted(nb.SPLIT)})")
+    # the block scale is an f16 Constant like every stock scale: an f32 scale
+    # Constant is wrapped in a Convert(f16) by the plugin's precision pass,
+    # which the offload series cannot fold (file-backed Constants), and the
+    # op translation then refuses the non-Constant input (measured on GPU.0,
+    # 2026-09-18). IQ4_NL's and Q8_0's d IS an f16, so those stay exact;
+    # IQ3_XXS's d*(0.5+s)*0.5 and IQ4_XS's d*(ls-32) round once to f16
+    # (<= 2^-11 relative, test_native_expert_chain). The exact f32 stays in
+    # arena.scales; the chain's arithmetic stays f32 (Convert after the
+    # Constant), which the plugin's pattern accepts as an optional Convert.
+    sc16 = np.ascontiguousarray(scales, np.float16).reshape(e, out, groups, 1)
+    sc = arena.constant([e, out, groups, 1], Type.f16, fill=sc16, name=name + "/block_scale")
+    sc.set_friendly_name(name + "/block_scale")
+    arena.scales[name + "/block_scale"] = np.ascontiguousarray(scales, np.float32)
+    x = op.multiply(x, op.convert(sc, Type.f32))
+    x = op.reshape(x, op.constant(np.array([e, out, inn], np.int64)), special_zero=False)
+    x.set_friendly_name(name + "/native_f32")
+    return x
+
+
+def _native_packed_expert(arena, e, out, inn, name, w80, d):
+    """IQ2_S-PACKED (patch 0052). The checkpoint's own 82-byte ggml block per
+    256 values, kept VERBATIM: 32 B qs (four 2-bit low index bytes per ib32) |
+    32 B RAW sign masks | 8 B qh (two high index bits per l) | 8 B four-bit
+    sub-block scales, with the f16 d lifted into the scale slot. The weight
+    Constant is [E, out, K/256, 80] u8 -- 82 B per 256 against the re-laid
+    IQ2_S's 128 B and the u4 repack's 144 B, the GGUF's own size (design note
+    12.4: 10.35 GiB of experts against 14.47 re-laid). The decode is
+    arithmetic in f32 (the same style as _unpack_u8_to_u4_f32): idx =
+    qs + 256*((qh >> 2l) & 3), y = d*(0.5+nib)*0.25 * grid[idx] * sign, the
+    low nibble for l<2 and the high for l>=2. Bit-exact against
+    native_blocks.iq2_s_decode.
+
+    The arithmetic is the CPU oracle; the plugin's matcher replaces the whole
+    chain, reading only the two Constants (the packed u8 weight and the f16 d).
+    """
+    from q4e import native_blocks as nb
+    rows = e * out
+    nblk = inn // 256
+    assert inn % 256 == 0, (inn, "IQ2_S-packed needs a multiple of 256")
+    assert w80.shape == (rows, nblk * 80) and d.shape == (rows, nblk), (w80.shape, d.shape)
+    f32 = lambda v: op.constant(np.array(v, np.float32))
+    i64 = lambda v: op.constant(np.array(v, np.int64))
+
+    w = arena.constant([e, out, nblk, 80], Type.u8,
+                       fill=np.ascontiguousarray(w80.reshape(e, out, nblk, 80)),
+                       name=name + "/iq2s_packed_u8")
+    w.set_friendly_name(name + "/iq2s_packed_u8")
+
+    def sl(a, b):
+        return op.slice(w, i64([a]), i64([b]), i64([1]), i64([-1]))
+
+    qs = op.convert(op.reshape(sl(0, 32), i64([e, out, nblk, 8, 4]), special_zero=False), Type.f32)
+    # the sign bytes carry (nblk, ib32) fused into ONE axis: the IQ2_S chain's
+    # signs Select is rank 5 [.,4,8] and the GPU plugin's layout optimizer has
+    # no layout for a rank-6 one (measured 2026-09-26, add_required_reorders
+    # :342 on packed shape [256,512,8,8,4,8]). The fused axis flattens to the
+    # SAME element order (nblk*256 + ib32*32 + l*8 + m), so the bytes and the
+    # decode are unchanged.
+    sg = op.convert(op.reshape(sl(32, 64), i64([e, out, nblk * 8, 4]), special_zero=False), Type.f32)
+    qh = op.convert(op.reshape(sl(64, 72), i64([e, out, nblk, 8]), special_zero=False), Type.f32)
+    scb = op.convert(op.reshape(sl(72, 80), i64([e, out, nblk, 8]), special_zero=False), Type.f32)
+
+    # high_l = (qh >> 2l) & 3 in f32 arithmetic: a per-l divisor broadcasts
+    # over the last axis, so no shifts and no Concat -- floor(qh/[1,4,16,64])
+    # then mod 4 (floor(f/4) subtracted back)
+    qh_u = op.unsqueeze(qh, i64([-1]))                              # [E,out,nblk,8,1]
+    qh_f = op.floor(op.divide(qh_u, f32([1.0, 4.0, 16.0, 64.0])))
+    high = op.subtract(qh_f, op.multiply(op.floor(op.divide(qh_f, f32(4.0))), f32(4.0)))
+    idx = op.add(qs, op.multiply(high, f32(256.0)))
+    idx.set_friendly_name(name + "/iq2s_packed_index")
+
+    grid = op.constant(nb.IQ2S_GRID.astype(np.float32))            # [1024,8]
+    mag = op.gather(grid, op.convert(idx, Type.i32), i64(0))       # [E,out,nblk,8,4,8]
+    mag = op.reshape(mag, i64([e, out, nblk, 256]), special_zero=False)
+    mag.set_friendly_name(name + "/iq2s_packed_grid")
+
+    # IQ2_S signs are the RAW byte: bit j flips value j
+    bits = op.bitwise_and(op.unsqueeze(op.convert(sg, Type.i32), i64([-1])),
+                          op.constant(nb.KMASK_IQ2XS.astype(np.int32)))   # [E,out,nblk*8,4,8] rank 5
+    neg = op.greater(bits, op.constant(np.int32(0)))
+    sign = op.reshape(op.select(neg, f32(-1.0), f32(1.0)),
+                      i64([e, out, nblk, 256]), special_zero=False)
+    sign.set_friendly_name(name + "/iq2s_packed_sign")
+    x = op.multiply(mag, sign)
+
+    # a 32-value group carries two 4-bit scales: the low nibble for l=0,1 and
+    # the high for l=2,3 (ggml-quants.c dequantize_row_iq2_s). Same trick: the
+    # per-l divisor [1,1,16,16] broadcasts, then mod 16.
+    scb_u = op.unsqueeze(scb, i64([-1]))                            # [E,out,nblk,8,1]
+    sc_f = op.floor(op.divide(scb_u, f32([1.0, 1.0, 16.0, 16.0])))
+    nib = op.subtract(sc_f, op.multiply(op.floor(op.divide(sc_f, f32(16.0))), f32(16.0)))
+    sc32 = op.reshape(op.broadcast(op.reshape(nib, i64([e, out, nblk, 8, 4, 1]), special_zero=False),
+                                   i64([e, out, nblk, 8, 4, 8])),
+                      i64([e, out, nblk, 256]), special_zero=False)
+    sc32.set_friendly_name(name + "/iq2s_packed_scale32")
+
+    dd16 = np.ascontiguousarray(d, np.float16).reshape(e, out, nblk, 1)
+    dd = arena.constant([e, out, nblk, 1], Type.f16, fill=dd16, name=name + "/block_scale")
+    dd.set_friendly_name(name + "/block_scale")
+    arena.scales[name + "/block_scale"] = np.ascontiguousarray(d, np.float32).reshape(e, out, nblk)
+    # ggml's own association: d * (0.5 + s) * 0.25, left to right
+    scale = op.multiply(op.multiply(op.convert(dd, Type.f32), op.add(f32(0.5), sc32)),
+                        f32(0.25))
+    x = op.multiply(x, scale)
+    x = op.reshape(x, i64([e, out, inn]), special_zero=False)
+    x.set_friendly_name(name + "/native_f32")
     return x
 
 
 def emit_moe_tiled(hidden_bth, config, state, arena, T, tag, filler=None,
                    layer=None, port_sink=None):
-    """The MoE layer in the shape measured to fuse on the card
-    (export_mtp.py:401 moe_block_tiled), at real geometry, expert bodies
-    slot-referenced. Returns a [1,T,H] node."""
+    """The MoE layer in the shape the GPU plugin's
+    ConvertTiledMoeBlockTo3GatherMatmuls matcher accepts (export_mtp.py:401
+    moe_block_tiled, walked node by node against the pattern source), at real
+    geometry, expert bodies slot-referenced. Returns a [1,T,H] node.
+
+    "Measured to fuse" was inherited from the MTP exporter, not re-measured
+    here, and until 2026-09-17 this function deviated from it in the two
+    Reshapes the matcher anchors on (see the comment at the mixing stage).
+    The contract cell is `test_every_moe_layer_walks_the_plugins_tiled_3gemm_pattern`;
+    the compile that proves it is a card window.
+
+    Contract: `hidden_bth` is rank 3 with dim 0 the batch, statically 1 (the
+    mixing stage reads B off its ShapeOf and the shared-expert Add relies on
+    it). With a `port_sink` the expert bodies are Parameters, and the matcher's
+    CompressedWeightsBlock anchors on a Constant: a ported build cannot fuse
+    by construction, and the contract cell covers the Constant build only."""
     H = config.hidden_size
     E = config.num_experts
     I = config.moe_intermediate_size
@@ -830,21 +1168,52 @@ def emit_moe_tiled(hidden_bth, config, state, arena, T, tag, filler=None,
     m_h3 = op.reshape(tiled, op.constant(np.array([E, -1, H], np.int32)),
                       special_zero=False)                              # [E,M,H]
 
-    gate_w = _compressed_expert(arena, E, I, H, f"{tag}/experts_gate",
-                                filler, layer, "gate", port_sink)
-    up_w = _compressed_expert(arena, E, I, H, f"{tag}/experts_up",
-                              filler, layer, "up", port_sink)
-    down_w = _compressed_expert(arena, E, H, I, f"{tag}/experts_down",
-                                filler, layer, "down", port_sink)
+    def _expert(kind, out_, inn_):
+        nm = f"{tag}/experts_{kind}"
+        if filler is not None and hasattr(filler, "native"):
+            # the checkpoint's own blocks, decoded in ops (2026-09-18)
+            fmt, parts = filler.native(layer, kind, E, out_, inn_)
+            return _native_expert(arena, E, out_, inn_, nm, fmt, parts)
+        return _compressed_expert(arena, E, out_, inn_, nm, filler, layer, kind, port_sink)
 
-    g = op.swish(op.matmul(m_h3, gate_w, transpose_a=False, transpose_b=True))
+    gate_w = _expert("gate", I, H)
+    up_w = _expert("up", I, H)
+    down_w = _expert("down", H, I)
+
+    g = swish1(op.matmul(m_h3, gate_w, transpose_a=False, transpose_b=True))
     u = op.matmul(m_h3, up_w, transpose_a=False, transpose_b=True)
     outs = op.matmul(op.multiply(g, u), down_w,
                      transpose_a=False, transpose_b=True)              # [E,M,H]
 
+    # THE TWO RESHAPES THE MATCHER ANCHORS ON. build_3gemm_pattern() in the
+    # plugin's convert_tiled_moe_block_to_gather_matmuls.cpp wants
+    # `end_reshape` = Reshape(down_matmul) and `router_reshape` =
+    # Reshape(Transpose(scatter)) -> optional Unsqueeze, both feeding the
+    # router-weight Multiply. This emitter dropped both until 2026-09-17: the
+    # constraint walker (tools/check_tiled_pattern.py) failed every MoE
+    # candidate of the depth-12 artifact at R4.router_reshape.type and its
+    # compiled graph carried 0 MoE-typed primitives, 230 FullyConnected, every
+    # expert computed for every token. Construction as export_mtp.py:532-537:
+    # B read from ShapeOf, S a runtime -1 -- a target whose every dim is known
+    # is folded away at validate/save on 2026.4.0 (export_mtp.py:515-531).
+    # Here B is statically 1 (asserted), so the targets are the LITERALS
+    # [E,1,-1,H] and [E,1,-1] -- the same construction tools/
+    # moe_tiled_rewrite.py used for every card census on the record (12
+    # fused primitives, 3.00 GiB, the served legs of 2026-09-17); the -1
+    # alone keeps the Reshape alive (M stays dynamic). export_mtp's B is a
+    # genuine runtime value and stays a ShapeOf there.
+    ps = hidden_bth.output(0).get_partial_shape()
+    assert (ps.rank.is_static and ps.rank.get_length() == 3
+            and ps[0].is_static and ps[0].get_length() == 1), (
+        f"{tag}: emit_moe_tiled wants [1,T,H], got {ps}")
+    outs4 = op.reshape(outs, op.constant(np.array([E, 1, -1, H], np.int32)),
+                       special_zero=False)                               # [E,1,S,H]
     wt = op.transpose(weights, op.constant(np.array([1, 0], np.int32)))  # [E,M]
-    wt = op.unsqueeze(wt, i32(-1))                                       # [E,M,1]
-    mixed = op.reduce_sum(op.multiply(outs, wt), i32v(0), keep_dims=False)  # [M,H]
+    wr = op.reshape(wt, op.constant(np.array([E, 1, -1], np.int32)),
+                    special_zero=False)                                  # [E,1,S]
+    wu = op.unsqueeze(wr, i32v(-1))                                      # [E,B,S,1]
+    mixed = op.reduce_sum(op.multiply(outs4, wu), i32v(0), keep_dims=False)  # [B,S,H]
+    mixed.set_friendly_name(f"{tag}/mix")      # the matcher's root, addressable
 
     # the shared expert (pin 986-996) stays dense f32 -- it is one MLP per
     # layer, 0.0183 GiB, and it is CARD tier in the size ledger
@@ -883,10 +1252,16 @@ def _fill_dense(st, feed, prefix, census):
         census.append((prefix + key, int(buf.nbytes)))
 
 
-def _layer_state(arena, config, kind, layer=None, feed=None, census=None):
+def _layer_state(arena, config, kind, layer=None, feed=None, census=None,
+                 qsa=False):
     """Sparse-declared state for one decoder layer, at the pin's own
     module-relative keys, real shapes from `config`. With `feed` the buffers
-    are written from the real shards (`_fill_dense`)."""
+    are written from the real shards (`_fill_dense`). With `qsa`, a
+    full-attention layer also declares the indexer's three tensors (the fused
+    `index_qk_proj`, `[n_heads + 1] * head_dim` rows, and the two norm
+    gammas), filled through the feed's `self_attn.indexer.*` map (kind
+    `gamma1` for the gammas -- the stored (1 + w) undone, never a raw
+    GGUFReader)."""
     H = config.hidden_size
     hc = config.hc_count
     lr = config.hc_lowrank
@@ -929,6 +1304,13 @@ def _layer_state(arena, config, kind, layer=None, feed=None, census=None):
         st["self_attn.o_proj.weight"] = arena.f32([H, heads * d])
         st["self_attn.q_norm.weight"] = arena.f32([d])
         st["self_attn.k_norm.weight"] = arena.f32([d])
+        if qsa:
+            nh_i = int(config.indexer_n_heads)
+            dh_i = int(config.indexer_head_dim)
+            st["self_attn.indexer.index_qk_proj.weight"] = arena.f32(
+                [(nh_i + 1) * dh_i, H])
+            st["self_attn.indexer.q_layernorm.weight"] = arena.f32([dh_i])
+            st["self_attn.indexer.k_layernorm.weight"] = arena.f32([dh_i])
 
     Is = config.shared_expert_intermediate_size
     st["mlp.gate.weight"] = arena.f32([config.num_experts, H])
@@ -964,7 +1346,8 @@ def _ple_state(arena, config, layer=None, feed=None, census=None):
 def build_serving_shape_ir(config=None, arena=None, n_layers=None,
                            filler=None, feed=None,
                            ngram_chunk_cap_bytes=NGRAM_CHUNK_CAP_BYTES,
-                           rope_span=None, layer_range=None, expert_ports=None):
+                           rope_span=None, layer_range=None, expert_ports=None,
+                           ngram_staging_rows=None, qsa=False):
     """The full-geometry serving-shape backbone as an ov::Model, DYNAMIC IN T
     (feed-the-ports increment): no port, reshape or slice carries the block
     length. `T` below is the runtime token count of a forward.
@@ -1138,7 +1521,16 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
                           if hasattr(cfg, "ngram_total_vocab")
                           else pwe.REAL_GEOMETRY["ngram_total_vocab"])
             row_bytes = ngram_row_bytes(head_dim)
-            table_ports = (ngram_table_ports(ngram_rows, row_bytes,
+            # The port's row count is the STAGING BOUND when the caller asks for
+            # the disk-backed path (campaign `ple-disk-backend`): one port of
+            # `max_tokens x Hn` rows that the runtime fills per forward by
+            # `pread`, instead of one port spanning the whole table. The source
+            # tensor still has to be the full table -- that is admission's
+            # business -- so the port is deliberately SMALLER than the source,
+            # which is exactly how `bind_ngram_ports` recognises staging.
+            port_rows = (int(ngram_staging_rows) if ngram_staging_rows
+                         else ngram_rows)
+            table_ports = (ngram_table_ports(port_rows, row_bytes,
                                              ngram_chunk_cap_bytes)
                            if has_ple else [])
 
@@ -1159,7 +1551,7 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
             for i in range(lo, hi):        # GLOBAL layer indices
                 kind = "attn" if (i % 4) == 3 else "gdn"
                 kinds.append(kind)
-                st = _layer_state(ar, cfg, kind, i, feed, dense_census)
+                st = _layer_state(ar, cfg, kind, i, feed, dense_census, qsa=qsa)
 
                 if has_ple and i == ple_layer_idx:
                     # pin 1283: hidden = hidden + ple(...), ADDITIVE
@@ -1182,11 +1574,11 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
                     g = qgdn.emit_gdn(
                         h, conv_mask, cfg, _strip(st, "linear_attn."), None,
                         conv_emitter=stateful_short_conv(i, beam, sinks),
-                        core_emitter=stateful_gdn_core(i, beam, sinks))
+                        core_emitter=gdn_core_emitter(i, beam, sinks))
                 else:
                     g = emit_stateful_attention(
                         h, pid, cfg, _strip(st, "self_attn."), i, beam,
-                        attn_mask, sinks, rope_cos, rope_sin)
+                        attn_mask, sinks, rope_cos, rope_sin, qsa=qsa)
                 hidden = _recombine(hyper, inj, g, cfg, T)
                 # named so a card-side localiser can cut the graph here
                 # (tools/boot_serving_shape.py --cut); names only, no op
@@ -1233,10 +1625,26 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
             model = Model([res], sinks, params,
                           "qwen4_exp_serving_shape" if layer_range is None
                           else f"qwen4_exp_serving_shape_L{lo}_{hi}")
+            if qsa:
+                # qsa step 3 (2026-09-29): the node-level rt_info tags do NOT
+                # survive `ov.save_model` -- the serializer writes only a fixed
+                # set of keys -- so the runtime could not re-apply them. The
+                # model-level rt_info DOES serialize (`<qsa value=.../>`), so
+                # the marker travels here: the boundary and the friendly names
+                # of the eleven/twelve indexer masks. arcint's load re-applies
+                # the node tags from this before SDPAToPagedAttention.
+                ratio = int(cfg.indexer_compress_ratio)
+                block_topk = int(cfg.indexer_budget) // ratio
+                boundary = int(block_topk * ratio + ratio - 1)
+                mask_nodes = [f"attn{i}/qsa_mask" for i in range(lo, hi)
+                              if (i % 4) == 3]
+                model.set_rt_info(json.dumps({"boundary": boundary,
+                                              "mask_nodes": mask_nodes}), "qsa")
 
         nodes, const_bytes, counts = pwe.graph_measures(model)
         report = {
             "n_layers": nl,
+            "qsa": bool(qsa),
             "layer_range": [lo, hi],
             "segment_first": bool(first),
             "segment_last": bool(last),
@@ -1256,6 +1664,8 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
             # the cap they were cut under. Not counted in graph_const_bytes --
             # it is not a constant any more, which is the point.
             "ngram_table_rows": int(ngram_rows),
+            "ngram_staging_rows": (int(ngram_staging_rows)
+                                   if ngram_staging_rows else None),
             "ngram_row_bytes": int(row_bytes),
             "ngram_chunk_cap_bytes": int(ngram_chunk_cap_bytes),
             "ngram_table_ports": [
@@ -1311,6 +1721,58 @@ def _kv_variable(layer, tag, kv_heads, head_dim):
     info.data_shape = ov.PartialShape([-1, kv_heads, -1, head_dim])
     info.data_type = Type.f32
     info.variable_id = f"cache_params.past.{tag}.{layer}"
+    return ovutil.Variable(info)
+
+
+def _indexer_variable(layer, head_dim):
+    """The indexer's raw-key history as a PLAIN state Variable -- qsa step 3,
+    option A: rank 3 [1, -1, dh], one lane, deliberately NOT gathered by
+    `beam_idx` (the pass deletes that Parameter, so a gathered Variable would
+    lose its input). `SDPAToPagedAttention` removes only the KV Assigns it
+    matched (`sdpa_to_paged_attention.cpp`, `var_ids_to_remove`), so this
+    Variable and its Assign survive the transformation. KEPT for the step-1/2
+    recompute path; the served emitter now uses the block cache below."""
+    info = ovutil.VariableInfo()
+    info.data_shape = ov.PartialShape([1, -1, head_dim])
+    info.data_type = Type.f32
+    info.variable_id = f"cache_params.past.indexer_key.{layer}"
+    return ovutil.Variable(info)
+
+
+def _indexer_block_variable(layer, head_dim, block_cap):
+    """The indexer's COMPRESSED block-key cache (2026-09-30, prior art
+    `docs/campaigns/research-qsa.md`): one pooled + k-normed + roped f32 row
+    per completed ratio-token block, a FIXED [block_cap, head_dim] Variable so
+    every decode step's shape is stable (rows past the valid count are zeroed
+    and score -inf). Not gathered by `beam_idx` -- the pass's
+    `var_ids_to_remove` names only the KV Variables, so this one and its Assign
+    survive."""
+    info = ovutil.VariableInfo()
+    info.data_shape = ov.PartialShape([block_cap, head_dim])
+    info.data_type = Type.f32
+    info.variable_id = f"cache_params.past.indexer_block.{layer}"
+    return ovutil.Variable(info)
+
+
+def _indexer_tail_variable(layer, head_dim, tail_cap):
+    """The raw keys of the incomplete tail (<= ratio-1 rows), f32
+    [ratio-1, dh]: the staging buffer that completes the next block."""
+    info = ovutil.VariableInfo()
+    info.data_shape = ov.PartialShape([tail_cap, head_dim])
+    info.data_type = Type.f32
+    info.variable_id = f"cache_params.past.indexer_tail.{layer}"
+    return ovutil.Variable(info)
+
+
+def _indexer_pos_variable(layer):
+    """The tokens the indexer has consumed so far, i32 [1]; derives
+    tail_len = pos % ratio and nb_old = pos // ratio. i32, not i64: the CPU
+    plugin's oneDNN path refuses an i64 ReadValue (measured: "CPU plugin does
+    not support i64 for use with oneDNN")."""
+    info = ovutil.VariableInfo()
+    info.data_shape = ov.PartialShape([1])
+    info.data_type = Type.i32
+    info.variable_id = f"cache_params.past.indexer_pos.{layer}"
     return ovutil.Variable(info)
 
 
@@ -1502,6 +1964,211 @@ def _gdn_loop_body(HV, Dk, Dv):
     return body, params
 
 
+def _gdn_chunk_body(HV, Dk, Dv, chunk):
+    """One CHUNK of the gated delta rule, as a Loop body: the SAME algebra the
+    chunked core emits (`q4e.gdn`'s `perchunk` branch, `gdn.py`:470-500), with
+    the recurrent state a merged Loop input instead of a Python variable.
+
+    This is what makes multi-block prefill possible: the token-sequential body
+    (`_gdn_loop_body`) advances ONE token per iteration, so a 32k prefill pays
+    32k iterations; this one advances `chunk` tokens, so it pays `ceil(T/chunk)`
+    -- 512 iterations at 32k instead of 32,768.
+
+    The algebra is reused, not re-derived. `last` is the body's `state`
+    parameter (the token-sequential core's `[1, HV, Dk, Dv]`), and the chunk's
+    output is written into the buffer at rows `step*chunk .. +chunk`.
+
+    Body results, IN THIS ORDER (the token-sequential matcher's contract, kept
+    even though a chunked Loop is NOT fused -- see `stateful_gdn_core_chunked`):
+    [execution condition, updated state, scattered output].
+    """
+    i64 = lambda v: op.constant(np.array(v, np.int64))
+    step = op.parameter([], Type.i64)
+    state = op.parameter([1, HV, Dk, Dv], Type.f32)
+    buf = op.parameter([1, HV, -1, Dv], Type.f32)
+    q = op.parameter([1, HV, chunk, Dk], Type.f32)
+    k = op.parameter([1, HV, chunk, Dk], Type.f32)
+    v = op.parameter([1, HV, chunk, Dv], Type.f32)
+    g = op.parameter([1, HV, chunk], Type.f32)
+    beta = op.parameter([1, HV, chunk], Type.f32)
+
+    beta_u = qgdn._reshape(beta, [1, HV, chunk, 1])
+    v_beta = qgdn._mul(v, beta_u)
+    k_beta = qgdn._mul(k, beta_u)
+    add_mask = qgdn._c(np.where(np.triu(np.ones((chunk, chunk), np.float32), 1) > 0,
+                                -1e30, 0.0).astype(np.float32))
+
+    cum = op.cumsum(g, i64(2))                       # [1,HV,chunk]
+    expc4 = qgdn._reshape(op.exp(cum), [1, HV, chunk, 1])
+    pd = op.exp(qgdn._add(
+        qgdn._sub(qgdn._reshape(cum, [1, HV, chunk, 1]),
+                  qgdn._reshape(cum, [1, HV, 1, chunk])), add_mask))
+    ut = qgdn._mul(qgdn._mm(k_beta, k, tb=True), pd)     # [1,HV,chunk,chunk]
+    it = qgdn._mul(qgdn._mm(q, k, tb=True), pd)
+    dkb = qgdn._mul(k_beta, expc4)
+    inv = qgdn._ut_inverse(ut, chunk, [1, HV])           # pin 355-365
+    nv = qgdn._mm(inv, v_beta)                           # pin 366
+    kcd = qgdn._mm(inv, dkb)
+
+    qd = qgdn._mul(q, expc4)
+    cum_last = qgdn._slice(cum, chunk - 1, chunk, 1, 2)  # [1,HV,1]
+    kd = qgdn._mul(k, qgdn._reshape(op.exp(qgdn._sub(cum_last, cum)),
+                                    [1, HV, chunk, 1]))
+    cd = qgdn._reshape(op.exp(cum_last), [1, HV, 1, 1])
+
+    v_new = qgdn._sub(nv, qgdn._mm(kcd, state))
+    inter = qgdn._mm(qd, state)
+    core = qgdn._add(inter, qgdn._mm(it, v_new))         # [1,HV,chunk,Dv]
+    updated = qgdn._add(qgdn._mul(state, cd),
+                        qgdn._mm(kd, v_new, ta=True))    # [1,HV,Dk,Dv]
+
+    rows = op.add(op.multiply(step, i64(chunk)),
+                  op.constant(np.arange(chunk, dtype=np.int64)))   # [chunk]
+    scattered = op.scatter_update(buf, rows, core, i64(2))
+
+    params = [step, state, buf, q, k, v, g, beta]
+    body = Model([op.result(op.constant(np.array(True))),
+                  op.result(updated), op.result(scattered)],
+                 params, "gdn_delta_rule_chunk")
+    return body, params
+
+
+def stateful_gdn_core_chunked(layer, beam, sinks, chunk=None):
+    """The gated delta rule as a CHUNKED Loop -- `stateful_gdn_core`'s drop-in
+    that advances `chunk` tokens per iteration instead of one.
+
+    THE MATCHER QUESTION, DECIDED: `FuseGDNLoop` matches only the
+    token-sequential Loop (`_gdn_loop_body`'s docstring: query/key/value rank 4
+    with a sequence extent of ONE). A chunked body carries a sequence extent of
+    `chunk`, so it is NOT rewritten into `ov::op::internal::GatedDeltaNet` and
+    `PagedGatedDeltaNetFusion` never sees it. **Decision: keep the chunked body
+    IN-GRAPH** -- the cost is that this prefill path loses the fused kernel,
+    which is the decode path's fast route; the benefit is that it still beats
+    one iteration per token by `chunk`, which is the whole point. Extending the
+    matcher to a chunked Loop is a separate, larger change (the fusion's
+    `matches_linear_attention_loop` reads a rank-4 seq-1 body and its state
+    update is the token rule) and is NOT done here. Stated, not left implicit.
+
+    The dynamic-T contract is kept: the trip count is `ceil(T/chunk)`, computed
+    from `ShapeOf`, so the graph is T-independent (LYON's compile-once property
+    survives). The inputs are zero-padded to a multiple of `chunk` before the
+    Loop and the buffer is sliced back to T after it, so a prompt whose length
+    is not a multiple of `chunk` is exact.
+    """
+    C = int(chunk or qgdn.CHUNK)
+
+    def emit(q, k, v, beta_t, decay_t, T, HV, Dk, Dv):
+        i64 = lambda val: op.constant(np.array(val, np.int64))
+
+        head_size = op.convert(
+            op.gather(op.shape_of(q, output_type="i64"), i64(3), i64(0)),
+            Type.f32)
+        q_scaled = op.divide(
+            q, op.power(head_size, op.constant(np.array(0.5, np.float32))))
+
+        info = ovutil.VariableInfo()
+        info.data_shape = ov.PartialShape([1, HV, Dk, Dv])
+        info.data_type = Type.f32
+        info.variable_id = f"cache_params.past.ssm.{layer}"
+        var = ovutil.Variable(info)
+        init = op.broadcast(op.constant(np.array(0.0, np.float32)),
+                            i64([1, HV, Dk, Dv]))
+        # BEAM-FREE (arcint 0.5.4 LYON, 2026-09-26). The token-sequential core
+        # gathers the state with the `beam_idx` PARAMETER, and the fusion
+        # CONSUMES that chain -- so the parameter's declaration and its use
+        # disappear together. An unfused chunked Loop leaves the chain alive,
+        # and `SDPAToPagedAttention` then drops the declaration while the
+        # Gather still references it (`backend_ov.cpp`:2637), refusing the
+        # artifact: "Model references undeclared parameters: beam_idx". The
+        # served path is ONE LANE, so the gather is a constant row 0 -- no
+        # `beam_idx` reference survives to dangle. (`beam` is kept in the
+        # signature for the hook contract and deliberately unused.)
+        past = op.gather(op.read_value(init, var),
+                         op.constant(np.array([0], np.int64)), i64(0))
+
+        # ceil(T / chunk) and the pad to a whole chunk, from ShapeOf
+        n_tok = op.squeeze(op.gather(op.shape_of(q, output_type="i64"),
+                                     i64([2]), i64(0)), i64([0]))
+        n_chunks = op.divide(op.add(n_tok, i64(C - 1)), i64(C))
+        n_pad = op.subtract(op.multiply(n_chunks, i64(C)), n_tok)
+        pad_shape = op.concat([i64([1, HV]), op.reshape(n_pad, i64([1]), False),
+                               i64([Dk])], axis=0)
+        buf_shape = op.concat([i64([1, HV]),
+                               op.reshape(op.multiply(n_chunks, i64(C)),
+                                          i64([1]), False),
+                               i64([Dv])], axis=0)
+
+        def _pad(x, shape):
+            return op.concat([x, op.broadcast(op.constant(np.array(0.0, np.float32)),
+                                              shape)], axis=2)
+
+        q_p = _pad(q_scaled, pad_shape)
+        k_p = _pad(k, pad_shape)
+        pad_v = op.concat([i64([1, HV]), op.reshape(n_pad, i64([1]), False),
+                           i64([Dv])], axis=0)
+        v_p = _pad(v, pad_v)
+        pad_1 = op.concat([i64([1, HV]), op.reshape(n_pad, i64([1]), False)], axis=0)
+        g_p = _pad(decay_t, pad_1)
+        b_p = _pad(beta_t, pad_1)
+
+        body, (p_step, p_state, p_buf, p_q, p_k, p_v, p_g,
+               p_beta) = _gdn_chunk_body(HV, Dk, Dv, C)
+        loop = op.loop(n_chunks, op.constant(np.array(True)))
+        loop.set_function(body)
+        loop.set_special_body_ports([0, 0])
+        for param, src in ((p_q, q_p), (p_k, k_p), (p_v, v_p),
+                           (p_g, g_p), (p_beta, b_p)):
+            loop.set_sliced_input(param, src.output(0), 0, C, C, -1, 2)
+        loop.set_merged_input(p_state, past.output(0),
+                              body.get_results()[1].output(0))
+        loop.set_merged_input(
+            p_buf,
+            op.broadcast(op.constant(np.array(0.0, np.float32)),
+                         buf_shape).output(0),
+            body.get_results()[2].output(0))
+        attn_out = loop.get_iter_value(body.get_results()[2].output(0), -1)
+        state_out = loop.get_iter_value(body.get_results()[1].output(0), -1)
+        loop.validate_and_infer_types()
+
+        sinks.append(op.assign(
+            op.reshape(state_out, i64([1, HV, Dk, Dv]), special_zero=False),
+            var))
+        # the buffer is chunk-padded: cut it back to T, then the served order
+        kept = op.slice(attn_out, i64([0]), op.reshape(n_tok, i64([1]), False),
+                        i64([1]), i64([2]))
+        return op.transpose(kept,
+                            op.constant(np.array([0, 2, 1, 3], np.int32)))
+
+    return emit
+
+
+# arcint (0.5.4 LYON). The GDN core the served backbone emits.
+#
+#   "sequential"  the token-sequential Loop (`stateful_gdn_core`): one token per
+#                 iteration. This is the body `FuseGDNLoop` rewrites into
+#                 `ov::op::internal::GatedDeltaNet` and `PagedGatedDeltaNetFusion`
+#                 matches -- the decode path's fused kernel.
+#   "chunked"     the multi-block Loop (`stateful_gdn_core_chunked`): CHUNK
+#                 tokens per iteration, so a 32k prefill pays 512 iterations
+#                 instead of 32,768. NOT fused (the fusion reads a seq-1 body);
+#                 kept IN-GRAPH deliberately -- see that emitter's docstring.
+#
+# BOTH are T-independent (the trip count comes off `ShapeOf`), so LYON's
+# compile-once property holds under either. `Q4E_GDN_CORE` selects one for a
+# whole export without editing code, the discipline `Q4E_GDN_UT_MODE` uses; a
+# typo is REFUSED, so a silent default cannot report the wrong core's graph.
+GDN_CORE = os.environ.get("Q4E_GDN_CORE", "sequential").strip() or "sequential"
+GDN_CORE_CHUNK = int(os.environ.get("Q4E_GDN_CHUNK", qgdn.CHUNK))
+
+
+def gdn_core_emitter(layer, beam, sinks):
+    if GDN_CORE == "sequential":
+        return stateful_gdn_core(layer, beam, sinks)
+    if GDN_CORE == "chunked":
+        return stateful_gdn_core_chunked(layer, beam, sinks, chunk=GDN_CORE_CHUNK)
+    raise ValueError(f"unknown Q4E_GDN_CORE {GDN_CORE!r}; expected sequential or chunked")
+
+
 def stateful_gdn_core(layer, beam, sinks):
     """The gated delta rule as the token-sequential Loop the fusion chain wants.
 
@@ -1599,8 +2266,78 @@ def stateful_gdn_core(layer, beam, sinks):
     return emit
 
 
+def _qsa_indexer_mask_served(hidden, pid, config, state, layer, sinks,
+                             rope_cos, rope_sin):
+    """The served emitter's QSA indexer as a STANDALONE subgraph: `hidden`
+    [1, T, H] and `pid` [1, T] in, the token-major additive mask [T, 1, 1, N]
+    out, with the raw-key history assigned to a plain state Variable in
+    `sinks`. The algebra is `q4e.attention._qsa_mask_dynamic`'s, called here
+    rather than copied. It is separate from `emit_stateful_attention` so the
+    indexer can be RUN without that function's token-major KV concat, which
+    is well-formed only after `SDPAToPagedAttention`; the served attention
+    core therefore has no runtime witness before step 2's pass (T2/T6), and
+    the indexer's own selection does."""
+    nh_i = int(config.indexer_n_heads)
+    dh_i = int(config.indexer_head_dim)
+    eps = config.rms_norm_eps
+    rotary = int(rope_cos.get_output_shape(0)[-1])
+    T = -1
+    i64 = lambda v: op.constant(np.array(v, np.int64))
+    assert int(config.indexer_kv_heads) == 1, (
+        f"the indexer emits ONE raw key per token (pin 709-711); config "
+        f"says {config.indexer_kv_heads}")
+    assert getattr(config, "norm_plus_one", True), (
+        "the indexer's gammas are the folded (1 + w) RMSNorm (pin 171); a "
+        "plus_one=False family would silently diverge from "
+        "q4e.attention._qsa_mask_dynamic and is refused under qsa")
+    qk = qgdn._mm(hidden, qattn._c(state["indexer.index_qk_proj.weight"]),
+                  tb=True)                                            # [1,T,(nh+1)*dh]
+    qi = qgdn._reshape(qgdn._slice(qk, 0, nh_i * dh_i, 1, 2),
+                       [1, T, nh_i, dh_i])
+    raw = qgdn._slice(qk, nh_i * dh_i, (nh_i + 1) * dh_i, 1, 2)           # [1,T,dh]
+    qi = qattn._rmsnorm_hd(qi, state["indexer.q_layernorm.weight"], eps,
+                           dh_i, getattr(config, "norm_plus_one", True))
+    cq = qgdn._reshape(op.gather(rope_cos, pid, i64(0)), [1, T, 1, rotary])
+    sq = qgdn._reshape(op.gather(rope_sin, pid, i64(0)), [1, T, 1, rotary])
+    qi = qattn._rope_last(qi, cq, sq, rotary)
+    # The compressed block-key cache (2026-09-30): one pooled + k-normed +
+    # roped row per completed block, plus the <= 3 raw tail keys and a token
+    # counter. Only blocks completed by the new tokens are pooled; the prior
+    # art (`research-qsa.md`: llama.cpp #28699, vLLM's compressed cache) names
+    # the whole-history recompute as the dominant decode cost at depth.
+    ratio = int(config.indexer_compress_ratio)
+    # A FIXED capacity covers n_ctx 32768 (8192 complete blocks); the runtime
+    # ledger charges the slack and load_paged refuses a larger served context.
+    block_cap = 8192
+    bvar = _indexer_block_variable(layer, dh_i, block_cap)
+    tvar = _indexer_tail_variable(layer, dh_i, ratio - 1)
+    pvar = _indexer_pos_variable(layer)
+    mask = qattn._qsa_block_cache_mask(qi, raw, pid, config, state,
+                                       rope_cos, rope_sin, rotary,
+                                       bvar, tvar, pvar, sinks, layer, block_cap)
+    mask = op.transpose(mask, op.constant(np.array([2, 1, 0, 3], np.int32)))
+    mask.set_friendly_name(f"attn{layer}/qsa_mask")
+    # the exporter's marker (qsa step 3, T2): the pass routes THIS mask into
+    # the new PagedAttention input and never another model's. `op.transpose`
+    # returns the NODE here (a single-output op), so rt_info is set on it.
+    mask.set_rt_info("qsa_selection", "arcint")
+    # the route gate's boundary (qsa step 3, T3b): every row is dense (the
+    # selection keeps every causal key) iff T <= block_topk * ratio + ratio - 1
+    # -- 2051 for Flash-Next (CF-BOUNDS, measured 2026-09-12; attention.py's
+    # `_qsa_mask_dynamic` docstring, pin 757/684). The pass puts it on the
+    # PagedAttention node; the GPU impl keeps today's route (micro included,
+    # the mask a no-op) at or below it and reads the mask above it. Sentinel
+    # str: rt_info round-trips through the IR as text, and a missing value
+    # means "unknown" (read the mask).
+    ratio = int(config.indexer_compress_ratio)
+    block_topk = int(config.indexer_budget) // ratio
+    mask.set_rt_info(str(block_topk * ratio + ratio - 1), "qsa_boundary")
+    return mask
+
+
 def emit_stateful_attention(hidden, pid, config, state, layer, beam,
-                            attn_mask, sinks, rope_cos, rope_sin):
+                            attn_mask, sinks, rope_cos, rope_sin, qsa=False,
+                            mask_sink=None):
     """The full-attention layer in the STATEFUL shape the serving path's own
     transformation converts, at real geometry.
 
@@ -1655,17 +2392,48 @@ def emit_stateful_attention(hidden, pid, config, state, layer, beam,
     gate = qgdn._reshape(qgdn._slice(qg, d, 2 * d, 1, 3), [1, T, heads * d])
 
     q = qgdn._transpose(
-        qattn._rmsnorm_hd(q, state["q_norm.weight"], eps, d), [0, 2, 1, 3])
+        qattn._rmsnorm_hd(q, state["q_norm.weight"], eps, d,
+                          getattr(config, "norm_plus_one", True)), [0, 2, 1, 3])
+    # k/v named: q4e.dense_u8 keeps them plain. With q, k AND v all compressed
+    # the GPU plugin fuses the three horizontally and the served paged graph
+    # read garbage (measured 2026-09-26, depth-4 logits A/B: argmax 7/1000);
+    # either one left plain served clean.
+    k_w = qattn._c(state["k_proj.weight"])
+    k_w.set_friendly_name(f"attn{layer}/k_proj")
+    v_w = qattn._c(state["v_proj.weight"])
+    v_w.set_friendly_name(f"attn{layer}/v_proj")
     k = qgdn._reshape(
-        qgdn._mm(hidden, qattn._c(state["k_proj.weight"]), tb=True), [1, T, kv, d])
+        qgdn._mm(hidden, k_w, tb=True), [1, T, kv, d])
     k = qgdn._transpose(
-        qattn._rmsnorm_hd(k, state["k_norm.weight"], eps, d), [0, 2, 1, 3])
+        qattn._rmsnorm_hd(k, state["k_norm.weight"], eps, d,
+                          getattr(config, "norm_plus_one", True)), [0, 2, 1, 3])
     v = qgdn._transpose(
-        qgdn._reshape(qgdn._mm(hidden, qattn._c(state["v_proj.weight"]), tb=True),
+        qgdn._reshape(qgdn._mm(hidden, v_w, tb=True),
                       [1, T, kv, d]), [0, 2, 1, 3])
     q, k = qattn._apply_rope(q, k, rope_cos, rope_sin, pid, rotary, T)
     q.set_friendly_name(f"attn{layer}/q_rope")            # localiser cut points
     k.set_friendly_name(f"attn{layer}/k_rope")
+
+    # ------------------------------------------------------------------ QSA
+    # (window-050 §8; qsa step 3). With `qsa`, the layer carries the model's
+    # OWN selection: the indexer (pin 673-779) emits a per-query additive
+    # mask over the whole key history, and that mask replaces the baked
+    # causal one. The indexer body is `q4e.attention`'s -- `_qsa_mask_dynamic`
+    # is called, not copied, so ONE function carries the rule for the parity
+    # cells (step 2) and for the served graph here. It is a standalone
+    # emitter (`_qsa_indexer_mask_served`) so the served indexer can be built
+    # and run WITHOUT the KV concat above, which is only well-formed after
+    # `SDPAToPagedAttention`. The raw keys ride a PLAIN state Variable beside
+    # the KV pair (option A): it is not gathered by `beam_idx`, which the pass
+    # deletes, and the pass keeps Variables it did not match. The mask is
+    # [1, 1, T, N] where N is the raw-key history; transposed to the SDPA's
+    # token-major [T, 1, 1, N] here.
+    qsa_mask = None
+    if qsa:
+        qsa_mask = _qsa_indexer_mask_served(hidden, pid, config, state,
+                                            layer, sinks, rope_cos, rope_sin)
+        if mask_sink is not None:
+            mask_sink.append(qsa_mask)
 
     # TOKEN-MAJOR AT THE SDPA, and only here (increment 5, read off the
     # device and then off the pass). `SDPAToPagedAttention` flattens the SDPA's
@@ -1724,9 +2492,12 @@ def emit_stateful_attention(hidden, pid, config, state, layer, beam,
     total = op.gather(op.shape_of(full[0], output_type="i64"), i64([2]), i64(0))
     n_vec = op.unsqueeze(n_tok, i64(0))                      # [1]: the token count
     past_len = op.subtract(total, n_vec)
-    mask = op.reshape(_additive_causal_mask(n_tok, total, past_len),
-                      op.concat([n_vec, i64([1, 1]), total], axis=0),
-                      special_zero=False)
+    if qsa:
+        mask = qsa_mask                                   # [T?, 1, 1, TOTAL]
+    else:
+        mask = op.reshape(_additive_causal_mask(n_tok, total, past_len),
+                          op.concat([n_vec, i64([1, 1]), total], axis=0),
+                          special_zero=False)
     att = op.scaled_dot_product_attention(
         q,
         _repeat_kv_broadcast(full[0], kv, heads, d),
@@ -1804,12 +2575,348 @@ def _ple_tail(hidden, emb, config, state, T, conv_mask=None):
     return qgdn._add(gv_flat, conv_out)
 
 
+
+# --------------------------------------------------------------------------
+# THE `qwen3_5_moe` SERVING SHAPE (design-qwen35moe-serving-shape, 2026-09-24)
+# --------------------------------------------------------------------------
+#
+# The native route emits ONE graph family today -- the Flash-Next `qwen4_exp`
+# backbone, whose layer is a HYPER-CONNECTION mixer around every sublayer and
+# whose PLE gathers an n-gram table. `Qwen3.6-35B-A3B` (`general.architecture
+# = qwen35moe`) has neither: 40 layers, 256 experts top-8, one shared expert,
+# and a PLAIN PRE-NORM RESIDUAL layer. The four conventions below are measured
+# (design note §5), not assumed; each cites its oracle.
+#
+#   1. GDN output gate = SILU, applied as a gated RMSNorm on the z projection
+#      (`code`: llama.cpp src/models/qwen35moe.cpp build_norm_gated ->
+#      ggml_silu; `measured-here`: the served int4 IR's linear_attn.norm chain
+#      carries `aten::silu/Swish`, the only Sigmoid in linear_attn sits on
+#      in_proj_b/beta).
+#   2. value/key head map = TILED (`measured-here`: every value-head-indexed
+#      GDN tensor in the GGUF is the HF interleave order re-laid into llama's
+#      tiled order -- qkv v sigma-map max|diff| 0.012 vs identity 0.395;
+#      attn_gate 0.012 vs 0.297; ssm_out 0.036 vs 0.413; ssm_alpha 0.0069 vs
+#      0.171; ssm_beta 0.0043 vs 0.085; `code`: llama.cpp ggml_repeat_4d).
+#   3. norms = PLAIN RMSNorm, no (1 + w), pre-norm residual (`measured-here`:
+#      GGUF attn_norm / post_attention_norm / ssm_norm / attn_q_norm /
+#      attn_k_norm all equal the served IR's Constants to max|diff| 0.0; the IR
+#      chain is Power -> ReduceMean -> Add(eps) -> Sqrt -> Divide -> Multiply(x)
+#      -> Multiply(weight), no +1). `_rmsnorm_hd` therefore takes
+#      `norm_plus_one=False` for this family.
+#   4. the tiled MoE lowering is E-agnostic (`measured-here`: a 256-expert
+#      top-8 tiled block compiles to 3 GatherMatmul primitives on the CPU
+#      plugin exactly as 512/top-10 does).
+
+QWEN35MOE_LM = {
+    "vocab_size": 248320,
+    "hidden_size": 2048,
+    "num_hidden_layers": 40,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "max_position_embeddings": 262144,
+    "rms_norm_eps": 1e-6,
+    "linear_key_head_dim": 128,
+    "linear_num_key_heads": 16,
+    "linear_value_head_dim": 128,
+    "linear_num_value_heads": 32,
+    "linear_conv_kernel_dim": 4,
+    "num_experts": 256,
+    "num_experts_per_tok": 8,
+    "moe_intermediate_size": 512,
+    "shared_expert_intermediate_size": 512,
+}
+
+
+def qwen35moe_real_config(n_layers=None):
+    """The `Qwen3.6-35B-A3B` geometry as a config object for the emitters,
+    read from the shard's own metadata (gguf-py) and the served int4 IR's
+    config.json. `rope_parameters` carries the text-degenerate mrope keys
+    `q4e.attention._freqs_tables` reads: partial rotary 0.25 of head_dim 256 =
+    64, theta 1e7, sections [11, 11, 10]. For TEXT all three mrope axes carry
+    the same position, so the recomposition is the identity and the tables are
+    the standard rope ones (`code`: qwen35moe.cpp ggml_rope_multi).
+
+    `norm_plus_one=False`: this converter's gammas are PLAIN (measured, §3).
+    `gdn_key_head_map="tiled"`: the GGUF's value heads are in llama's tiled
+    order (measured, §2). `output_gate_type="silu"` (measured, §1)."""
+    g = dict(QWEN35MOE_LM)
+    nl = int(n_layers if n_layers is not None else g["num_hidden_layers"])
+    c = types.SimpleNamespace(
+        vocab_size=g["vocab_size"], hidden_size=g["hidden_size"],
+        num_hidden_layers=nl, num_attention_heads=g["num_attention_heads"],
+        num_key_value_heads=g["num_key_value_heads"], head_dim=g["head_dim"],
+        max_position_embeddings=g["max_position_embeddings"],
+        rms_norm_eps=g["rms_norm_eps"],
+        linear_key_head_dim=g["linear_key_head_dim"],
+        linear_num_key_heads=g["linear_num_key_heads"],
+        linear_value_head_dim=g["linear_value_head_dim"],
+        linear_num_value_heads=g["linear_num_value_heads"],
+        linear_conv_kernel_dim=g["linear_conv_kernel_dim"],
+        num_experts=g["num_experts"], num_experts_per_tok=g["num_experts_per_tok"],
+        moe_intermediate_size=g["moe_intermediate_size"],
+        shared_expert_intermediate_size=g["shared_expert_intermediate_size"],
+        hidden_act="silu", output_gate_type="silu", norm_plus_one=False,
+        gdn_key_head_map="tiled", norm_topk_prob=True, full_attention_interval=4,
+        rope_parameters={"rope_type": "default", "rope_theta": 1e7,
+                         "partial_rotary_factor": 0.25, "mrope_section": [11, 11, 10]},
+        layer_types=["full_attention" if (i % 4) == 3 else "linear_attention"
+                     for i in range(nl)],
+    )
+    return c
+
+
+# module-relative key -> (GGUF tensor suffix under blk.{i}., reshape kind).
+# Kinds are `q4e.gguf_feed._materialise`'s; every gamma is `vec` (plain, §3),
+# `ssm_a` is `neglog` (stored -exp(A_log), the GDN computes -exp(A_log)), and
+# `ssm_conv1d` is `conv` ([K, C] -> [C, 1, K]).
+_QWEN35MOE_TENSORS = {
+    "input_norm.weight": ("attn_norm.weight", "vec"),
+    "post_attention_norm.weight": ("post_attention_norm.weight", "vec"),
+    "linear_attn.in_proj_qkv.weight": ("attn_qkv.weight", "direct2d"),
+    "linear_attn.in_proj_z.weight": ("attn_gate.weight", "direct2d"),
+    "linear_attn.in_proj_a.weight": ("ssm_alpha.weight", "direct2d"),
+    "linear_attn.in_proj_b.weight": ("ssm_beta.weight", "direct2d"),
+    "linear_attn.A_log": ("ssm_a", "neglog"),
+    "linear_attn.dt_bias": ("ssm_dt.bias", "vec"),
+    "linear_attn.conv1d.weight": ("ssm_conv1d.weight", "conv"),
+    "linear_attn.norm.weight": ("ssm_norm.weight", "vec"),
+    "linear_attn.out_proj.weight": ("ssm_out.weight", "direct2d"),
+    "self_attn.q_proj.weight": ("attn_q.weight", "direct2d"),
+    "self_attn.k_proj.weight": ("attn_k.weight", "direct2d"),
+    "self_attn.v_proj.weight": ("attn_v.weight", "direct2d"),
+    "self_attn.o_proj.weight": ("attn_output.weight", "direct2d"),
+    "self_attn.q_norm.weight": ("attn_q_norm.weight", "vec"),
+    "self_attn.k_norm.weight": ("attn_k_norm.weight", "vec"),
+    "mlp.gate.weight": ("ffn_gate_inp.weight", "direct2d"),
+    "mlp.shared_expert.gate_proj.weight": ("ffn_gate_shexp.weight", "direct2d"),
+    "mlp.shared_expert.up_proj.weight": ("ffn_up_shexp.weight", "direct2d"),
+    "mlp.shared_expert.down_proj.weight": ("ffn_down_shexp.weight", "direct2d"),
+    "mlp.shared_expert_gate.weight": ("ffn_gate_inp_shexp.weight", "row"),
+}
+
+
+def _qwen35_rmsnorm(x, weight, eps):
+    """Plain RMSNorm over the LAST axis, no (1 + w) -- the qwen35moe
+    convention (measured, §3). `x` [1, T, H]; `weight` the f32 memmap the
+    state dict holds."""
+    var = qgdn._rmean(qgdn._mul(x, x), -1)
+    xn = qgdn._mul(x, qgdn._rsqrt_eps(var, eps))
+    return qgdn._mul(qgdn._c(np.ascontiguousarray(weight, np.float32).reshape(1, 1, -1)), xn)
+
+
+def _qwen35_layer_state(ar, cfg, kind, layer, feed=None, census=None):
+    """Sparse-declared state for one `qwen35moe` decoder layer at the module-
+    relative keys `q4e.gdn` / `emit_stateful_attention` / `emit_moe_tiled`
+    consume. With `feed` the buffers are written from the real shards."""
+    H = cfg.hidden_size
+    st = {"input_norm.weight": ar.f32([H]),
+          "post_attention_norm.weight": ar.f32([H])}
+    if kind == "gdn":
+        kd, kh = cfg.linear_key_head_dim, cfg.linear_num_key_heads
+        vd, vh = cfg.linear_value_head_dim, cfg.linear_num_value_heads
+        conv_dim = kd * kh * 2 + vd * vh
+        st["linear_attn.in_proj_qkv.weight"] = ar.f32([conv_dim, H])
+        st["linear_attn.in_proj_z.weight"] = ar.f32([vd * vh, H])
+        st["linear_attn.in_proj_a.weight"] = ar.f32([vh, H])
+        st["linear_attn.in_proj_b.weight"] = ar.f32([vh, H])
+        st["linear_attn.A_log"] = ar.f32([vh])
+        st["linear_attn.dt_bias"] = ar.f32([vh])
+        st["linear_attn.conv1d.weight"] = ar.f32([conv_dim, 1, cfg.linear_conv_kernel_dim])
+        st["linear_attn.norm.weight"] = ar.f32([vd])
+        st["linear_attn.out_proj.weight"] = ar.f32([H, vd * vh])
+    else:
+        heads, kv, d = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
+        st["self_attn.q_proj.weight"] = ar.f32([heads * 2 * d, H])
+        st["self_attn.k_proj.weight"] = ar.f32([kv * d, H])
+        st["self_attn.v_proj.weight"] = ar.f32([kv * d, H])
+        st["self_attn.o_proj.weight"] = ar.f32([H, heads * d])
+        st["self_attn.q_norm.weight"] = ar.f32([d])
+        st["self_attn.k_norm.weight"] = ar.f32([d])
+    Is = cfg.shared_expert_intermediate_size
+    st["mlp.gate.weight"] = ar.f32([cfg.num_experts, H])
+    st["mlp.shared_expert.gate_proj.weight"] = ar.f32([Is, H])
+    st["mlp.shared_expert.up_proj.weight"] = ar.f32([Is, H])
+    st["mlp.shared_expert.down_proj.weight"] = ar.f32([H, Is])
+    st["mlp.shared_expert_gate.weight"] = ar.f32([1, H])
+    if feed is not None:
+        _fill_qwen35_layer(st, feed, layer, census)
+    return st
+
+
+def _fill_qwen35_layer(st, feed, layer, census):
+    """Write the real GGUF rows into the layer's arena buffers. Each axis is a
+    leading slice to the buffer's shape; no fused axis is narrowed here (`FIX
+    D` applies only to the fused `gate_up_proj`, which this emitter does not
+    use -- the routed experts are filled by `NativeExpertFiller`)."""
+    for key, buf in st.items():
+        suffix, kind = _QWEN35MOE_TENSORS[key]
+        gname = f"blk.{layer}.{suffix}"
+        arr = feed.mapped(gname, kind)
+        arr = np.ascontiguousarray(arr[tuple(slice(0, int(s)) for s in buf.shape)])
+        assert arr.shape == tuple(int(s) for s in buf.shape), (
+            f"{gname}: fed {arr.shape} != buffer {tuple(buf.shape)}")
+        buf[...] = arr
+        if census is not None:
+            census.append((gname, int(buf.nbytes)))
+
+
+def build_qwen35moe_serving_shape_ir(config=None, arena=None, n_layers=None,
+                                     filler=None, feed=None, rope_span=None):
+    """The `Qwen3.6-35B-A3B` (`qwen35moe`) serving-shape backbone as an
+    ov::Model, DYNAMIC IN T, with a PLAIN PRE-NORM RESIDUAL layer (no
+    hyper-connection, no PLE):
+
+        hidden = hidden + mixer(rmsnorm(hidden, attn_norm))
+        hidden = hidden + moe(rmsnorm(hidden, post_attention_norm))
+
+    Mixers: `q4e.gdn` (30 linear-attention layers, tiled key-head map,
+    stateful conv + token-sequential core) and `emit_stateful_attention` (10
+    full-attention layers at i % 4 == 3, fused q|gate split, silu output gate,
+    shared rope tables). The MoE layer is `emit_moe_tiled` with the native
+    filler, so the expert bodies carry the checkpoint's own IQ2_S (gate/up) and
+    IQ3_XXS / IQ4_XS (down) blocks.
+
+    Ports: `inputs_embeds`, `position_ids`, `conv_mask`, `attention_mask`,
+    `beam_idx`; state via the same Variables `stateful_short_conv` /
+    `stateful_gdn_core` / `emit_stateful_attention` carry. The embedding is NOT
+    in this graph (`tools/export_serving_artifact.py` emits it separately).
+
+    Returns (model, report); the report keys mirror `build_serving_shape_ir`'s
+    so the exporter can share its manifest path.
+    """
+    cfg = config if config is not None else qwen35moe_real_config()
+    T = -1
+    own_arena = arena is None
+    ar = arena if arena is not None else SparseArena()
+    n_total = int(cfg.num_hidden_layers)
+    depth = int(n_layers if n_layers is not None else n_total)
+    if not (1 <= depth <= n_total):
+        raise ValueError(f"n_layers {depth} outside 1..{n_total}")
+    nl = depth
+    H = cfg.hidden_size
+    V = cfg.vocab_size
+    sinks = []
+    dense_census = []
+    try:
+        with shared_constants():
+            inputs_embeds = op.parameter([1, T, H], Type.f32)
+            inputs_embeds.set_friendly_name("inputs_embeds")
+            inputs_embeds.output(0).set_names({"inputs_embeds"})
+            pid = op.parameter([1, T], Type.i64)
+            pid.set_friendly_name("position_ids")
+            pid.output(0).set_names({"position_ids"})
+            conv_mask = op.parameter([1, T], Type.f32)
+            conv_mask.set_friendly_name("conv_mask")
+            attn_mask = op.parameter([1, -1], Type.i64)
+            attn_mask.set_friendly_name("attention_mask")
+            attn_mask.output(0).set_names({"attention_mask"})
+            beam = op.parameter([-1], Type.i32)
+            beam.set_friendly_name("beam_idx")
+            beam.output(0).set_names({"beam_idx"})
+
+            span = int(rope_span if rope_span is not None
+                       else cfg.max_position_embeddings)
+            cos_np, sin_np = qattn._freqs_tables(cfg, span)
+            rope_cos = op.constant(cos_np)
+            rope_cos.set_friendly_name("rope/cos")
+            rope_sin = op.constant(sin_np)
+            rope_sin.set_friendly_name("rope/sin")
+
+            hidden = op.reshape(inputs_embeds,
+                                op.constant(np.array([1, -1, H], np.int64)),
+                                special_zero=False)
+            hidden.set_friendly_name("embed/out")
+            kinds = []
+            for i in range(depth):
+                kind = "attn" if (i % 4) == 3 else "gdn"
+                kinds.append(kind)
+                st = _qwen35_layer_state(ar, cfg, kind, i, feed, dense_census)
+                h = _qwen35_rmsnorm(hidden, st["input_norm.weight"], cfg.rms_norm_eps)
+                h.set_friendly_name(f"layer{i}/attn_norm")
+                if kind == "gdn":
+                    g = qgdn.emit_gdn(
+                        h, conv_mask, cfg, _strip(st, "linear_attn."), None,
+                        conv_emitter=stateful_short_conv(i, beam, sinks),
+                        core_emitter=gdn_core_emitter(i, beam, sinks))
+                else:
+                    g = emit_stateful_attention(
+                        h, pid, cfg, _strip(st, "self_attn."), i, beam,
+                        attn_mask, sinks, rope_cos, rope_sin)
+                hidden = op.add(hidden, g)
+                hidden.set_friendly_name(f"layer{i}/mixer_out")
+                h2 = _qwen35_rmsnorm(hidden, st["post_attention_norm.weight"],
+                                     cfg.rms_norm_eps)
+                h2.set_friendly_name(f"layer{i}/post_norm")
+                m = emit_moe_tiled(h2, cfg, st, ar, T, f"layer{i}/moe",
+                                   filler=filler, layer=i)
+                hidden = op.add(hidden, m)
+                hidden.set_friendly_name(f"layer{i}/out")
+
+            final_norm_w = ar.f32([H])
+            if feed is not None:
+                arr = feed.mapped("output_norm.weight", "vec")[:H]
+                final_norm_w[...] = np.ascontiguousarray(arr, np.float32)
+                dense_census.append(("output_norm.weight", int(final_norm_w.nbytes)))
+            fin = _qwen35_rmsnorm(hidden, final_norm_w, cfg.rms_norm_eps)
+            fin.set_friendly_name("final_norm")
+            head_w = ar.f32([V, H])
+            if feed is not None:
+                arr = feed.mapped("output.weight", "direct2d")[:V, :H]
+                head_w[...] = np.ascontiguousarray(arr, np.float32)
+                dense_census.append(("output.weight", int(head_w.nbytes)))
+            logits = op.matmul(fin, qgdn._c(head_w), transpose_a=False, transpose_b=True)
+            res = op.result(logits)
+            res.set_friendly_name("logits")
+            res.output(0).set_names({"logits"})
+            model = Model([res], sinks, [inputs_embeds, pid, conv_mask, attn_mask, beam],
+                          "qwen3_5_moe_serving_shape")
+
+        nodes, const_bytes, counts = pwe.graph_measures(model)
+        report = {
+            "n_layers": nl,
+            "qsa": False,          # qwen35moe has no indexer; mirror the qwen4_exp keys
+            "layer_range": [0, depth],
+            "segment_first": True,
+            "segment_last": True,
+            "inputs_embeds_width": int(H),
+            "has_ple": False,
+            "expert_ports": [],
+            "gdn_layers": kinds.count("gdn"),
+            "attn_layers": kinds.count("attn"),
+            "seq_len": None,
+            "rope_span": span,
+            "nodes": nodes,
+            "graph_const_bytes": const_bytes,
+            "op_histogram": counts,
+            "ngram_table_rows": 0,
+            "ngram_staging_rows": None,
+            "ngram_row_bytes": 0,
+            "ngram_chunk_cap_bytes": int(NGRAM_CHUNK_CAP_BYTES),
+            "ngram_table_ports": [],
+            "dense_fill_census": dense_census,
+            "arena_declared_bytes": ar.declared_bytes,
+            "arena_written_bytes": ar.written_bytes,
+            "arena_disk_kib": ar.disk_kib(),
+            "fill_census": filler.census() if filler is not None else None,
+            "inputs": [(p.get_node().get_friendly_name(), _dims(p),
+                        str(p.get_element_type())) for p in model.inputs],
+            "outputs": [(r.get_node().get_friendly_name(), _dims(r),
+                         str(r.get_element_type())) for r in model.outputs],
+        }
+        return model, report
+    except BaseException:
+        if own_arena:
+            ar.close()
+        raise
+
+
 # --------------------------------------------------------------------------
 # The OTD contract, transcribed from the C++ so the test checks code, not prose
 # --------------------------------------------------------------------------
 
 def slot_pool_from_ir(model, num_expert, ratio_pct):
-    """Python transcription of `slot_pool_from_ir`, src/exec/backend_ov.cpp:578-624.
+    """Python transcription of `slot_pool_from_ir`, src/exec/backend_ov.cpp:580-626.
 
     Line-for-line, with the C++ line numbers on each step. Returns None where
     the C++ returns nullopt.
@@ -1853,7 +2960,7 @@ def slot_pool_from_ir(model, num_expert, ratio_pct):
 
 
 def _expert_slot_bytes(num_expert, ratio_pct, per_expert_bytes, moe_layers):
-    """src/exec/fit.h:95 -- ceil(num_expert * (100 - ratio) / 100) slots per
+    """src/exec/fit.h:96 -- ceil(num_expert * (100 - ratio) / 100) slots per
     layer, times per-expert bytes, times layers."""
     slots = -((-num_expert * (100 - ratio_pct)) // 100)
     return slots * per_expert_bytes * moe_layers
@@ -1861,6 +2968,7 @@ def _expert_slot_bytes(num_expert, ratio_pct, per_expert_bytes, moe_layers):
 
 __all__ = [
     "SparseArena", "shared_constants", "build_serving_shape_ir",
+    "build_qwen35moe_serving_shape_ir", "qwen35moe_real_config", "QWEN35MOE_LM",
     "emit_moe_tiled", "emit_stateful_attention", "stateful_short_conv",
     "stateful_gdn_core", "slot_pool_from_ir",
     "ngram_table_chunks", "ngram_table_ports", "ngram_chunked_gather",

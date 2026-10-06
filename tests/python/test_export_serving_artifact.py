@@ -45,6 +45,11 @@ def test_the_config_carries_every_key_the_loader_reads_at_depth_4():
     assert cfg["ngram_vocab_size_base"] == 20_000_000
     assert cfg["ple_embed_dim"] == 2560 and cfg["vocab_size"] == 248320
     assert cfg["model_type"] == "qwen4_exp"
+    # the GDN's output gate: sigmoid for this checkpoint (llama.cpp hard-codes
+    # it for the architecture; the pin defaults to hidden_act = silu when the
+    # key is absent, which is how the first artifacts were exported)
+    assert cfg["output_gate_type"] == "sigmoid"
+    assert cfg["gdn_key_head_map"] == "tiled"
     json.dumps(cfg)                                    # serialisable as written
 
 
@@ -104,3 +109,39 @@ def test_segment_ranges_cover_the_depth_and_refuse_a_segment_without_attention()
         esa.segment_ranges(48, 6)
     with pytest.raises(ValueError, match="no full-attention"):
         esa.segment_ranges(14, 12)          # tail (12, 14) has no index 3 mod 4
+
+
+def test_a_qwen4_exp_export_stages_the_ngram_table_unless_pinned():
+    """Since 2026-09-27 the export declares the n-gram table as a per-forward
+    staging window by default (DESIGN 7.0.2cz: without per-expert dispatch the
+    staged twin gives the pinned twin's greedy digests and decodes 1.6-2.7x
+    faster, with 2.9 MiB of staging per lane instead of a 26.82 GiB pin).
+    `--ngram-pinned` keeps the whole-table ports for A/B twins.
+
+    RED before the default changed: the parser's default was None (pinned).
+    """
+    base = ["--layers", "4", "--shards", "x", "--tokenizer-from", "y", "--out", "z"]
+    parse = esa.build_parser().parse_args
+    assert esa.ngram_staging_rows(parse(base)) == esa.NGRAM_STAGING_ROWS_DEFAULT == 33600
+    assert esa.ngram_staging_rows(parse(base + ["--ngram-pinned"])) is None
+    assert esa.ngram_staging_rows(parse(base + ["--ngram-staging-rows", "8192"])) == 8192
+    # "not given" stays distinguishable, so qwen35moe can refuse an explicit value
+    assert parse(base).ngram_staging_rows is None
+    # the bound covers the served prefill chunk (2,048 tokens) x 16 n-gram heads
+    assert esa.NGRAM_STAGING_ROWS_DEFAULT >= 2048 * 16
+
+
+def test_qsa_is_off_by_default_and_refused_for_qwen35moe():
+    """Campaign qsa, step 3: `--qsa` defaults off so every existing artifact
+    and its arch hash are untouched, and the flag carries the Flash-Next
+    indexer into the export. qwen35moe has no indexer, so an explicit --qsa
+    with that family is refused before any shard is read.
+
+    RED before the flag existed: the parser had no `qsa` attribute.
+    """
+    base = ["--layers", "4", "--shards", "x", "--tokenizer-from", "y", "--out", "z"]
+    parse = esa.build_parser().parse_args
+    assert parse(base).qsa is False
+    assert parse(base + ["--qsa"]).qsa is True
+    with pytest.raises(SystemExit):
+        esa.main(base + ["--qsa", "--family", "qwen35moe"])

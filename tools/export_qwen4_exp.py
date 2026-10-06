@@ -384,10 +384,11 @@ def build_backbone_ir(out_dir, geometry, shards, seq_len=64, tiny=False):
             "  (2) SCOPE: RETIRED as an assembly gap, RETAINED as a priced "
             "approximation. The checkpoint ships 12 of its 48 blocks as QSA "
             "full-attention (blk 3,7,...,47), and all of them now ASSEMBLE, "
-            "as dense causal, per the frontier ruling. What stays unmapped is "
-            "the indexer.* families alone -- 48 tensors, 0.07 GiB at f32 -- "
-            "because the QSA indexer's per-query nonzero is not statically "
-            "opset-13-emittable (E1.5 finding 7). The price is measured per "
+            "as dense causal, per the frontier ruling. Nothing stays unmapped "
+            "(0 tensors, 0.00 GiB): the indexer.* families are mapped since "
+            "2026-09-19 for the full-depth exact reference, and still NOT "
+            "emitted here, because the QSA indexer's per-query nonzero is not "
+            "statically opset-13-emittable (E1.5 finding 7). The price is measured per "
             "shape in tests/python/test_attention_piece.py and is EXACTLY 0.0 "
             "for every prefill up to T=2051 (the boundary is block_topk*ratio"
             "+ratio-1, not the budget 2048 -- CF-BOUNDS 2026-09-12), rising to "
@@ -396,7 +397,7 @@ def build_backbone_ir(out_dir, geometry, shards, seq_len=64, tiny=False):
             "  (3) RESIDENCY: the old figure was correct FOR ITS STATED "
             "ASSUMPTION -- 'this emitter materialises every weight as an f32 ov "
             "Constant'. Recomputed from the shipped tensor list at that "
-            "assumption it is 659.1 GiB: 463.6 GiB of per-block tensors across "
+            "assumption it is 659.2 GiB: 463.7 GiB of per-block tensors across "
             "48 blocks + 195.5 GiB of globals, of which the PLE n-gram table "
             "(320,001,536 x 160, IQ4_NL in the file) alone is 190.7 GiB. Every "
             "one of those numbers still holds -- and the assumption was a "
@@ -570,7 +571,7 @@ def verify_serving_shape(n_layers=None):
               f"port(s) under {rep['ngram_chunk_cap_bytes']:,} B each "
               f"(not a constant; bound from host memory per request)")
         sp = ss.slot_pool_from_ir(model, cfg.num_experts, 0)
-        print(f"  slot_pool_from_ir (backend_ov.cpp:578) -> {sp}")
+        print(f"  slot_pool_from_ir (backend_ov.cpp:580) -> {sp}")
         if sp is None:
             print("    nullopt: no op type contains 'moe'. The MoE fusion is a "
                   "GPU-plugin COMPILE-time pass and this walk runs on "

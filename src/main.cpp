@@ -234,6 +234,21 @@ int main(int argc, char** argv) {
                                  .c_str()
                            : "layer split not pinned",
                        n_ctx, n_ctx_source);
+    } else if (cfg.engine == "llama") {
+#ifdef ARCINT_LLAMA
+        const int n_ctx = cfg.n_ctx;
+        try {
+            backend = lgc::make_llama_backend(cfg, n_ctx);
+        } catch (const std::exception& e) {
+            lgc::log::error("load", "could not bring up the llama.cpp executor: %s", e.what());
+            return 1;
+        }
+        lgc::log::info("load", "n_ctx %d | device %s | %d lane%s", backend->status().n_ctx, cfg.device.c_str(),
+                       cfg.parallel, cfg.parallel == 1 ? "" : "s");
+#else
+        lgc::log::error("boot", "%s", "this build carries no llama.cpp executor (configure with -DARCINT_LLAMA=ON)");
+        return 2;
+#endif
     } else {
 #ifdef ARCINT_OPENVINO
         lgc::Artifact artifact;

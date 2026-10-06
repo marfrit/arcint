@@ -1,0 +1,385 @@
+diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
+index 1a93b11..e4f6d08 100644
+--- a/ggml/src/ggml-opencl/CMakeLists.txt
++++ b/ggml/src/ggml-opencl/CMakeLists.txt
+@@ -102,6 +102,7 @@ set(GGML_OPENCL_KERNELS
+     mul_mv_iq_q8_1
+     mul_mm_kq_f16
+     mul_mm_kq_few
++    mul_mm_kq_2d
+     mul_mv_q5_0_f32
+     mul_mv_q5_0_f32_flat
+     mul_mv_q5_1_f32
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 2c8b9f1..17ba18b 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -675,6 +675,7 @@ struct ggml_backend_opencl_context {
+     bool has_subgroup_shuffle = false;       // cl_khr_subgroup_shuffle or cl_qcom_subgroup_shuffle
+     bool has_integer_dot      = false;       // cl_khr_integer_dot_product or cl_qcom_dot_product8
+     bool has_intel_dpas       = false;       // cl_intel_subgroup_matrix_multiply_accumulate
++    bool has_intel_2d_block   = false;       // cl_intel_subgroup_2d_block_io (Xe2)
+     bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
+     bool disable_fusion;
+     bool fuse_mm_glu = true;                     // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
+@@ -992,6 +993,10 @@ struct ggml_backend_opencl_context {
+     // Intel: x f16 GEMM on the XMX units (mul_mm_kq_f16.cl), per type, plain
+     // and MUL_MAT_ID; the sub-group size and tiles
+     cl_kernel kernel_kq_cvt_f32_f16 = nullptr;
++    // Intel Xe2: the K-quant GEMM on 2D block loads (mul_mm_kq_2d.cl), Q4_K,
++    // Q5_K, Q6_K; its token tile and sub-groups a work-group
++    cl_kernel kernel_mul_mm_kq2d[3] = {};
++    int       kq2d_tm = 64, kq2d_wg = 16;
+     cl_kernel kernel_mul_mm_kq_f16[6]    = {};
+     cl_kernel kernel_mul_mm_id_kq_f16[6] = {};
+     // MUL_MAT_ID with the tokens as the DPAS a operand (kernel_mul_mm_id2_*):
+@@ -2288,6 +2293,62 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 }
+             }
+ 
++            // the GEMM on 2D block loads (mul_mm_kq_2d.cl), Xe2 only: a lane per
++            // weight row, the tokens read straight from global memory as the a
++            // operand, no local memory -- marfrit-openvino patch 0029's shape,
++            // 64 tokens x 16 sub-groups with 32-row reads as measured there on a
++            // B60. GGML_OPENCL_KQ_2D=0 keeps mul_mm_kq_f16.cl;
++            // GGML_OPENCL_KQ_2D_SHAPE = "TM,WG,AT" overrides the shape.
++            static const char * k2_env = getenv("GGML_OPENCL_KQ_2D");
++            // (the planes are sub-buffers at the device's base alignment; a 2D
++            // block surface wants 64 bytes)
++            if (backend_ctx->has_intel_dpas && backend_ctx->has_intel_2d_block && !sg8 &&
++                backend_ctx->alignment % 64 == 0 && (k2_env == nullptr || atoi(k2_env) != 0)) {
++#ifdef GGML_OPENCL_EMBED_KERNELS
++                const std::string k2_src {
++                    #include "mul_mm_kq_2d.cl.h"
++                };
++#else
++                const std::string k2_src = read_file("mul_mm_kq_2d.cl");
++#endif
++                int tm = 64, wg = 16, at = 32;
++                if (const char * sh = getenv("GGML_OPENCL_KQ_2D_SHAPE")) {
++                    int a = 0, b = 0, c = 0;
++                    if (sscanf(sh, "%d,%d,%d", &a, &b, &c) == 3 && a > 0 && b > 0 && (c == 8 || c == 32) && a % c == 0) {
++                        tm = a; wg = b; at = c;
++                    } else {
++                        GGML_LOG_WARN("ggml_opencl: GGML_OPENCL_KQ_2D_SHAPE=%s ignored\n", sh);
++                    }
++                }
++                const std::string k2_opts = compile_opts + " -cl-intel-256-GRF-per-thread -DTM=" + std::to_string(tm) +
++                    " -DWG=" + std::to_string(wg) + " -DAT=" + std::to_string(at);
++                cl_program k2_prog = build_program_from_source_optional(backend_ctx, k2_src.c_str(), k2_opts);
++                if (k2_prog != nullptr) {
++                    const char * k2_n[3] = { "kernel_mul_mm_kq2d_q4_K", "kernel_mul_mm_kq2d_q5_K", "kernel_mul_mm_kq2d_q6_K" };
++                    bool fits = true;
++                    for (int i = 0; i < 3; ++i) {
++                        CL_CHECK((backend_ctx->kernel_mul_mm_kq2d[i] = clCreateKernel(k2_prog, k2_n[i], &err), err));
++                        size_t wgs = 0;
++                        CL_CHECK(clGetKernelWorkGroupInfo(backend_ctx->kernel_mul_mm_kq2d[i], backend_ctx->device,
++                                                          CL_KERNEL_WORK_GROUP_SIZE, sizeof(wgs), &wgs, NULL));
++                        fits = fits && wgs >= (size_t)wg * 16;
++                    }
++                    if (!fits) {
++                        for (int i = 0; i < 3; ++i) {
++                            CL_CHECK(clReleaseKernel(backend_ctx->kernel_mul_mm_kq2d[i]));
++                            backend_ctx->kernel_mul_mm_kq2d[i] = nullptr;
++                        }
++                        GGML_LOG_WARN("ggml_opencl: K-quant 2D GEMM does not fit a work-group\n");
++                    }
++                    backend_ctx->kq2d_tm = tm;
++                    backend_ctx->kq2d_wg = wg;
++                    CL_CHECK(clReleaseProgram(k2_prog));
++                } else {
++                    GGML_LOG_WARN("ggml_opencl: K-quant 2D GEMM not built; mul_mm_kq_f16.cl takes the prompts\n");
++                }
++                GGML_LOG_CONT(".");
++            }
++
+             // the GEMM: fp16 DPAS at the device's DPAS sub-group size. Tiles
+             // (measured-here: an A770 at 2000 MHz, a B60), rows x columns per
+             // work-group: plain SG 8 32 x 512, SG 16 64 x 256; MUL_MAT_ID
+@@ -7263,6 +7324,8 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+         strstr(ext_buffer.data(), "cl_intel_subgroup_matrix_multiply_accumulate") != NULL &&
+         strstr(ext_buffer.data(), "cl_intel_subgroup_local_block_io") != NULL &&
+         strstr(ext_buffer.data(), "cl_intel_subgroups_short") != NULL;
++    backend_ctx->has_intel_2d_block =
++        strstr(ext_buffer.data(), "cl_intel_subgroup_2d_block_io") != NULL;
+ 
+     cl_uint base_align_in_bits;
+     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(cl_uint), &base_align_in_bits, NULL));
+@@ -24265,6 +24328,35 @@ static bool ggml_cl_mul_mm_kq_f16(ggml_backend_opencl_context * backend_ctx, con
+     if (ti < 0 || ncols <= 4 || !ggml_cl_kq_mul_mat_shape(src0, src1, dst)) {
+         return false;
+     }
++    // Xe2: the 2D-block GEMM where its surfaces are wide enough (a 2D block
++    // read wants at least 64 bytes a row: Q5_K's high bits are 32 bytes a
++    // block, Q6_K's scales 16)
++    if (ti <= 2 && backend_ctx->kernel_mul_mm_kq2d[ti] != nullptr) {
++        const int ne00 = (int)src0->ne[0], ne01 = (int)src0->ne[1], nbk = ne00 / 256;
++        const int narrow = ti == 0 ? 128 : ti == 1 ? 32 : 16;   // the narrowest plane's bytes a block
++        if (nbk * narrow >= 64 && ne00 * 2 >= 64 && ncols < (1 << 24) && ne01 < (1 << 24) && ne00 < (1 << 23)) {
++            cl_kernel k2 = backend_ctx->kernel_mul_mm_kq2d[ti];
++            ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++            const cl_ulong offsetd = extrad->offset + dst->view_offs;
++            const cl_ulong nb1 = dst->nb[1];
++            ggml_cl_kq_convert_src1_f16(backend_ctx, src1, ne00, ncols, dst);
++            cl_uint a = 0;
++            ggml_cl_kq_weight_args(k2, src0, a);
++            CL_CHECK(clSetKernelArg(k2, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xh.buffer));
++            CL_CHECK(clSetKernelArg(k2, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xscale.buffer));
++            CL_CHECK(clSetKernelArg(k2, a++, sizeof(cl_mem),   &extrad->data_device));
++            CL_CHECK(clSetKernelArg(k2, a++, sizeof(cl_ulong), &offsetd));
++            CL_CHECK(clSetKernelArg(k2, a++, sizeof(cl_ulong), &nb1));
++            CL_CHECK(clSetKernelArg(k2, a++, sizeof(int),      &ne00));
++            CL_CHECK(clSetKernelArg(k2, a++, sizeof(int),      &ne01));
++            CL_CHECK(clSetKernelArg(k2, a++, sizeof(int),      &ncols));
++            const size_t wgn = (size_t)backend_ctx->kq2d_wg * 16;
++            size_t global_work_size[] = { (size_t)CEIL_DIV(ne01, (int)wgn) * wgn, (size_t)CEIL_DIV(ncols, backend_ctx->kq2d_tm), 1 };
++            size_t local_work_size[]  = { wgn, 1, 1 };
++            backend_ctx->enqueue_ndrange_kernel(k2, 3, global_work_size, local_work_size, dst);
++            return true;
++        }
++    }
+     cl_kernel kernel = backend_ctx->kernel_mul_mm_kq_f16[ti];
+     if (kernel == nullptr) {
+         return false;
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
+new file mode 100644
+index 0000000..19cfa91
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
+@@ -0,0 +1,208 @@
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++#pragma OPENCL EXTENSION cl_intel_subgroups : enable
++#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
++#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
++#pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable
++
++// K-quant x f16 matrix-matrix products on Xe2 with both operands read by
++// 2D block loads (cl_intel_subgroup_2d_block_io), the shape of arcint's
++// OpenVINO kernel (marfrit-openvino patch 0029, fully_connected_gpu_kquant.cl),
++// moved onto ggml-opencl's flat planes:
++//   - a lane is a weight row: the sub-group's sixteen rows are read by
++//     transposed 32-bit block reads, one message bringing 32 bytes of each
++//     row (lane l its own row's eight dwords), decoded in registers to the
++//     fp16 DPAS b operand (lane = output column);
++//   - the tokens are the a operand: blocks of 32 (or 8) activation rows x
++//     16 halves read straight from global memory in the matrix unit's
++//     layout, shared by the work-group's sub-groups through L1. No local
++//     memory, no barrier.
++// The weights are decoded once per TM tokens. f32 accumulation.
++//
++// The super-block loop of mul_mm_kq_f16.cl (dequantization into local
++// memory, the activations gathered per lane) kept its threads waiting on
++// loads 52 % of the time on a B60 (unitrace VectorEngineStalls,
++// measured-here); 0029 reached 58 TFLOPS on the same card and shapes.
++//
++// Rows past the matrix and tokens past the last read as zeros (the block
++// loads clamp to the surface) and their results are dropped.
++
++#define QK_K 256
++#ifndef TM
++#define TM 64                 // tokens a work-group
++#endif
++#ifndef WG
++#define WG 16                 // sub-groups a work-group, 16 weight rows each
++#endif
++#ifndef AT
++#define AT 32                 // activation rows a block read: 32 or 8
++#endif
++#define NG (TM / 8)           // 8-token groups
++#define DPAS(a, b, c) intel_sub_group_f16_f16_matrix_mad_k16(a, b, c)
++
++// a plane of nb blocks of `bb` bytes per row, ne01 rows: dwords dw .. dw + 7
++// of block kb of the sub-group's sixteen rows, lane l row r0 + l
++#define WREAD(plane, bb, dst, kb, dw) \
++    intel_sub_group_2d_block_read_transpose_32b_16r8x1c((const global void *)(plane), nb * (bb), ne01, nb * (bb), \
++        (int2)((int)((kb) * ((bb) / 4) + (dw)), r0), (dst))
++
++// AT activation rows from row `row`, halves k .. k + 15
++#if AT == 32
++#define AREAD(dst, k, row) intel_sub_group_2d_block_read_16b_32r16x1c((const global void *)xh, ne00 * 2, ne11, ne00 * 2, (int2)((int)(k), (int)(row)), (dst))
++#else
++#define AREAD(dst, k, row) intel_sub_group_2d_block_read_16b_8r16x1c((const global void *)xh, ne00 * 2, ne11, ne00 * 2, (int2)((int)(k), (int)(row)), (dst))
++#endif
++
++// get_scale_min_k4 of ggml: the scale and min of sub-block j from the 12
++// scale bytes, read as three dwords
++static inline void scale_min_k4(int j, uint3 w, float * sc, float * m) {
++    if (j < 4) {
++        *sc = (float)((w.s0 >> (8 * j)) & 63);
++        *m  = (float)((w.s1 >> (8 * j)) & 63);
++    } else {
++        const int jj = j - 4;
++        const uint q8 = (w.s2 >> (8 * jj)) & 0xFF;   // scales[j + 4]
++        const uint lo = (w.s0 >> (8 * jj)) & 0xFF;   // scales[j - 4]
++        const uint hi = (w.s1 >> (8 * jj)) & 0xFF;   // scales[j]
++        *sc = (float)((q8 & 0xF) | ((lo >> 6) << 4));
++        *m  = (float)((q8 >> 4) | ((hi >> 6) << 4));
++    }
++}
++
++// 32 decoded weights as two b operands (k 0..15, 16..31)
++static inline void put_b(const float * y, int8 * b0, int8 * b1) {
++    *b0 = as_int8(convert_half16(vload16(0, y)));
++    *b1 = as_int8(convert_half16(vload16(0, y + 16)));
++}
++
++// the multiply of one 32-k sub-block at k0 for the work-group's TM tokens
++#define MUL32(k0)                                                                           \
++    _Pragma("unroll")                                                                       \
++    for (int gb = 0; gb < TM / AT; ++gb) {                                                  \
++        ushort a0[AT], a1[AT];                                                              \
++        AREAD(a0, (k0), t0 + gb * AT);                                                      \
++        AREAD(a1, (k0) + 16, t0 + gb * AT);                                                 \
++        _Pragma("unroll")                                                                   \
++        for (int u = 0; u < AT / 8; ++u) {                                                  \
++            const int g = gb * (AT / 8) + u;                                                \
++            acc[g] = DPAS(as_short8(vload8(0, a0 + 8 * u)), b0, acc[g]);                    \
++            acc[g] = DPAS(as_short8(vload8(0, a1 + 8 * u)), b1, acc[g]);                    \
++        }                                                                                   \
++    }
++
++#define PROLOGUE                                                                            \
++    const int lane = get_sub_group_local_id(), sg = get_sub_group_id();                     \
++    const int r0 = (get_group_id(0) * WG + sg) * 16;                                        \
++    const int t0 = get_group_id(1) * TM;                                                    \
++    const int nb = ne00 / QK_K;                                                             \
++    const int n  = min(r0 + lane, ne01 - 1);                                                \
++    float8 acc[NG];                                                                         \
++    _Pragma("unroll")                                                                       \
++    for (int g = 0; g < NG; ++g) acc[g] = (float8)(0.f);
++
++// token t0 + 8 g + m of output row r0 + lane at dst + t * nb1
++#define EPILOGUE                                                                            \
++    if (r0 + lane < ne01) {                                                                 \
++        _Pragma("unroll")                                                                   \
++        for (int g = 0; g < NG; ++g) {                                                      \
++            const float v[8] = { acc[g].s0, acc[g].s1, acc[g].s2, acc[g].s3,                \
++                                 acc[g].s4, acc[g].s5, acc[g].s6, acc[g].s7 };              \
++            _Pragma("unroll")                                                               \
++            for (int m = 0; m < 8; ++m) {                                                   \
++                const int t = t0 + 8 * g + m;                                               \
++                if (t < ne11) ((global float *)(dst + offd + (ulong)t * nb1))[r0 + lane] = v[m] * xscale[t]; \
++            }                                                                               \
++        }                                                                                   \
++    }
++
++#define ARGS global const half * xh, global const float * xscale, global char * dst, ulong offd, ulong nb1, \
++             int ne00, int ne01, int ne11
++
++// Q4_K (Q5 = 0) / Q5_K (Q5 = 1): codes 128 bytes a block, high bits 32
++#define Q45_BODY(Q5)                                                                        \
++    PROLOGUE                                                                                \
++    for (int kb = 0; kb < nb; ++kb) {                                                       \
++        const ulong b = (ulong)n * nb + kb;                                                 \
++        const uint3 sw = vload3(0, (global const uint *)(s + b * 12));                      \
++        const float D = vload_half(0, d + b), DM = vload_half(0, dm + b);                   \
++        uint qhw[8];                                                                        \
++        if (Q5) WREAD(qh, 32, qhw, kb, 0);                                                  \
++        _Pragma("unroll")                                                                   \
++        for (int j = 0; j < 4; ++j) {                                                       \
++            uint qw[8];                                                                     \
++            WREAD(q, 128, qw, kb, 8 * j);                                                   \
++            _Pragma("unroll")                                                               \
++            for (int hi = 0; hi < 2; ++hi) {                                                \
++                const int sb = 2 * j + hi;                                                  \
++                float sc, mn;                                                               \
++                scale_min_k4(sb, sw, &sc, &mn);                                             \
++                const float dl = D * sc, ml = DM * mn;                                      \
++                float y[32];                                                                \
++                _Pragma("unroll")                                                           \
++                for (int l = 0; l < 32; ++l) {                                              \
++                    uint c = (qw[l >> 2] >> ((l & 3) * 8 + 4 * hi)) & 0xFu;                 \
++                    if (Q5) c |= ((qhw[l >> 2] >> ((l & 3) * 8 + sb)) & 1u) << 4;           \
++                    y[l] = dl * (float)c - ml;                                              \
++                }                                                                           \
++                int8 b0, b1;                                                                \
++                put_b(y, &b0, &b1);                                                         \
++                MUL32(kb * QK_K + 32 * sb)                                                  \
++            }                                                                               \
++        }                                                                                   \
++    }                                                                                       \
++    EPILOGUE
++
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_mul_mm_kq2d_q4_K(global const uchar * q, global const uchar * s, global const half * d,
++                                    global const half * dm, ARGS) {
++    global const uchar * qh = q;
++    Q45_BODY(0)
++}
++
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_mul_mm_kq2d_q5_K(global const uchar * q, global const uchar * qh, global const uchar * s,
++                                    global const half * d, global const half * dm, ARGS) {
++    Q45_BODY(1)
++}
++
++// Q6_K: ql 128 bytes a block, qh 64, scales 16 (int8), d. Sub-block sb
++// (32 weights at 32 sb) = half n = sb / 4, part p = sb % 4: low/high
++// nibble p / 2 of ql bytes 64 n + 32 (p & 1) .. + 31, two bits 2 p of qh
++// bytes 32 n .. + 31, scales 8 n + 2 p (weights 0..15) and + 1 (16..31)
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_mul_mm_kq2d_q6_K(global const uchar * ql, global const uchar * qh, global const char * s,
++                                    global const half * d, ARGS) {
++    PROLOGUE
++    for (int kb = 0; kb < nb; ++kb) {
++        const ulong b = (ulong)n * nb + kb;
++        const float D = vload_half(0, d + b);
++        uint scw[8];
++        WREAD(s, 16, scw, kb, 0);   // the 16 scale bytes are dwords 0..3 (4..7 read past, unused)
++        _Pragma("unroll")
++        for (int nn = 0; nn < 2; ++nn) {
++            uint qhw[8];
++            WREAD(qh, 64, qhw, kb, 8 * nn);
++            _Pragma("unroll")
++            for (int pl = 0; pl < 2; ++pl) {
++                uint qlw[8];
++                WREAD(ql, 128, qlw, kb, 16 * nn + 8 * pl);
++                _Pragma("unroll")
++                for (int ph = 0; ph < 2; ++ph) {
++                    const int p = pl + 2 * ph, sb = 4 * nn + p, is = 8 * nn + 2 * p;
++                    const float s0 = D * (float)(char)((scw[is >> 2] >> (8 * (is & 3))) & 0xFF);
++                    const float s1 = D * (float)(char)((scw[(is + 1) >> 2] >> (8 * ((is + 1) & 3))) & 0xFF);
++                    float y[32];
++                    _Pragma("unroll")
++                    for (int l = 0; l < 32; ++l) {
++                        const uint lo = (qlw[l >> 2] >> ((l & 3) * 8 + 4 * ph)) & 0xFu;
++                        const uint h2 = (qhw[l >> 2] >> ((l & 3) * 8 + 2 * p)) & 3u;
++                        y[l] = (l < 16 ? s0 : s1) * (float)((int)(lo | (h2 << 4)) - 32);
++                    }
++                    int8 b0, b1;
++                    put_b(y, &b0, &b1);
++                    MUL32(kb * QK_K + 32 * sb)
++                }
++            }
++        }
++    }
++    EPILOGUE
++}
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 221e357..7e3535c 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10246,6 +10246,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  8, 16*256, { 1,  1}, {1, 1}));
+     }
+ 
++    // the K-quant GEMM on 2D block loads (OpenCL, Intel Xe2): Q5_K at its
++    // 512 threshold, a src1 broadcast over dimension 2
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 300, 40, 512, { 1, 1 }, { 1, 1 }));
++    for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
++        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 300, 20, 1024, { 1, 1 }, { 2, 1 }));
++    }
++    // the K-quant GEMM on 2D block loads (OpenCL, Intel Xe2): more than 16
++    // columns, rows not a multiple of the 256-row work-group, token counts
++    // that leave partial 32-row reads and 64-token tiles, K at the narrowest
++    // plane's 64-byte threshold (Q6_K: 1,024) and above
++    for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
++        for (int n : { 17, 40, 64, 100 }) {
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 300, n, 1024, { 1, 1 }, { 1, 1 }));
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1023, n, 4096, { 1, 1 }, { 1, 1 }));
++        }
++    }
++
+     // the few-column K-quant product (OpenCL, Intel): 2 to 16 columns, rows
+     // not a multiple of the sub-group, super-block counts below and around
+     // the work-group's K split, a src1 broadcast over dimension 2

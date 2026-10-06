@@ -1,0 +1,156 @@
+# Hybrid prefill (0037): the grouped-GEMM gather runs over the FILLED pair
+# count, the token tables are zero-initialised on both prefill paths, and a
+# zero-resident batch takes the per-expert path
+# (campaign: sub4bit-vram-kernel; the defect is in static-partition-prefill's
+# patch 0037).
+#
+# Campaign: docs/campaigns/static-partition-prefill.md (status 2026-09-17)
+#           docs/campaigns/sub4bit-vram-kernel.md (status 2026-09-17, night)
+# Record:   DESIGN.md section 7.0.2by (the correction to 7.0.2bx)
+#
+# The defect (measured, bisected): with the CPU tier under the static
+# partition, the first prefill through exec_prefill_grouped_gemm page-faults
+# on the Arc Pro B60 (Xe2): xe "Faulted Address 0x1f0f5e000, Fault response:
+# Unsuccessful -ENOENT", a device coredump ("Timedout job", compute engine),
+# CL_OUT_OF_RESOURCES from the runtime. Bisect on the served binary, the
+# 35B at --offload-ratio 99 --moe-cpu-tier, one fresh process per cell:
+# +p13 (through 0031) serves; +p16 (through 0037) faults; +p16 without 0037
+# serves; +p17 with MOE_CPU_TIER_PARTITION=lru (0037's branch is
+# static-partition-only) serves; the A770 (Xe-HPG) serves with 0037. Within
+# 0037: disabling the post-GEMM host dispatch still faults; disabling the
+# micro-GEMM remap still faults; disabling the grouped-GEMM remap serves; a
+# zero-group guard alone still faults; a stream.finish() after every stage
+# of the grouped path shows the first synchronisation, right after the
+# gather, already throwing.
+#
+# Mechanism (code): tokens_per_expert_cpu was created as token_num * max_topk
+# entries of -1. Under 0037 only the RESIDENT (token, k) pairs are filled --
+# the non-resident pairs carry the sentinel and are skipped -- and the tail
+# stayed -1. The gather kernel (moe_gather_ref.cl) was still launched over
+# total_gathered_tokens = token_num * max_topk, so every work-group past the
+# fill computed token_index = -1 * HIDDEN_SIZE and added it to the kernel's
+# uint offset: ~2^32 elements, ~8 GiB PAST the activation buffer. The B60's
+# faulted address (~8.2 GiB) is consistent with that; why the A770 never
+# faulted on the same read is not explained on the record. Before 0037 the
+# static partition returned nullopt for any non-resident pair, so the fill
+# was always complete and the launch size right by accident. The same
+# over-sized launch exists on the micro-GEMM prefill path (CPU mask-gen
+# fills only resident pairs; GPU mask-gen never writes the tail) -- latent
+# for arcint (grouped on), live for any consumer with the grouped path off.
+#
+# The fix:
+#   - exec_prefill_grouped_gemm: total_gathered_tokens is the filled count
+#     (grouped_offsets_cpu[num_grouped_experts-1], the last slot's exclusive
+#     end), which also sizes the swiglu stage and the GEMM hint.
+#   - both prefill paths: the token tables are zero-initialised (an
+#     over-sized launch then names row 0, never a wrapped index), and the
+#     GPU mask-gen's device table is zeroed before the kernel.
+#   - build_grouped_mask_otd: a batch whose routed experts are ALL
+#     non-resident (ratio 99: 6 of 128 slots) returns to the per-expert
+#     path and counts as a grouped fallback, as before 0037.
+#
+# MEASURED (2026-09-17, B60, KV u8, f16 inference, prefill chunk 512, one
+# lane; the served reproducer; plugin f26a3bf3 = pin + 0003-0037 + this
+# patch as it stands): the 35B serves Paris at ratio 99 with the tier, warm
+# repeat identical, decode 23.8 t/s, prefill on the hybrid path; no fault,
+# no coredump. NOT measured on a card: the micro-GEMM path's zero-init
+# (code-class), and the 0003-0042 series exactly as +p18 packages it (0038
+# and 0040 also touch this file; MOE_PER_EXPERT_DISPATCH defaults off) --
+# the packaged plugin's own cell is the acceptance of +p18.
+#
+# KNOWN, NOT FIXED HERE: total_gathered_tokens is also the key of the
+# per-layer oneDNN grouped-primitive cache and the M of its descriptors; as
+# the filled count it is routing-dependent, so under the static-partition
+# hybrid a new prompt can rebuild three grouped primitives per MoE layer.
+# Not observable in same-prompt validation; a red case needs two prompts
+# of equal length. Mitigation designed, owed: bucket M and the key to a
+# multiple of 64 with the last group padded and the padding never
+# scattered. Also owed: the unit-ladder cell that builds the tables with
+# sentinel entries and asserts the filled count against the launch size.
+#
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on
+# top of patches/0003-0041.
+#
+# What changes:
+#   moe_3gemm_swiglu_opt.cpp    build_grouped_mask_otd: zero-resident batch
+#                                returns false, counted as grouped_fallbacks.
+#                                exec_prefill_micro_gemm: token table
+#                                zero-initialised (CPU mask-gen); device
+#                                table zeroed before the GPU mask-gen.
+#                                exec_prefill_grouped_gemm: token table
+#                                zero-initialised; total_gathered_tokens is
+#                                the filled count.
+#
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -1573,6 +1573,17 @@
+             }
+         }
+ 
++        // arcint (patch 0042). Under the static partition a batch can route to
++        // NO resident expert (ratio 99: 6 of 128 slots); the pre-0037 code
++        // returned nullopt for it and took the per-expert path, 0037 carried it
++        // into a grouped GEMM over ZERO groups, which page-faults on Xe2
++        // (bisected 2026-09-17, B60). Hand such a batch to the per-expert path.
++        if (num_actually_used_experts == 0) {
++            if (auto* perf = moe_otd::get_perf_counters())
++                perf->grouped_fallbacks.fetch_add(1, std::memory_order_relaxed);
++            return false;
++        }
++
+         // Upload remapped topk_ids to GPU for scatter_reduce kernel
+         auto& engine = instance.get_network().get_engine();
+         size_t topk_bytes = topk_count * sizeof(uint32_t);
+@@ -2580,6 +2591,11 @@
+         //   mask 4: actual activated expert num, shape = [1]
+         if (use_gpu_mask_gen) {
+             auto token_size = token_num;
++            // arcint (patch 0042). The GPU mask-gen writes only the pairs it
++            // matches; under the hybrid split (0037) the sentinel pairs stay
++            // unwritten and the gather runs over every pair. Zero the table so
++            // an unwritten entry names row 0, not a stale index.
++            intermediates_memories[MOE_INTERNAL_BUFFER_TOKEN_IDX_PER_EXPERT]->fill(stream, 0u);
+             ret_event = execute_stage(events,
+                                       instance,
+                                       *prefill_mask_gen,
+@@ -2608,7 +2624,11 @@
+ 
+             auto token_size = token_num;
+             auto max_topk = static_cast<int>(cur_moe->_config.top_k);
+-            std::vector<int32_t> tokens_per_expert_cpu(token_size * max_topk, -1);
++            // arcint (patch 0042). Zero, not -1: under the hybrid split (0037)
++            // only the resident pairs are filled and the gather runs over every
++            // pair; an unfilled entry must name a row that exists (row 0), never
++            // -1 * HIDDEN_SIZE wrapped through the kernel's uint offset.
++            std::vector<int32_t> tokens_per_expert_cpu(token_size * max_topk, 0);
+             std::vector<int32_t> tokens_lens_per_expert_cpu(num_total_experts, -1);
+             std::vector<int32_t> experts_info_start_idx_cpu(num_total_experts, -1);
+             std::vector<int32_t> experts_id_cpu(num_total_experts, -1);
+@@ -3298,7 +3318,10 @@
+         // ----------------------------------------------------------------
+         cldnn::event::ptr ret_event = events.empty() ? nullptr : events[0];
+         // Flat list of source token indices per expert – input for prefill_gather
+-        std::vector<int32_t> tokens_per_expert_cpu(static_cast<size_t>(token_num) * max_topk, -1);
++        // arcint (patch 0042). Zero, not -1 (see the micro-GEMM path): the
++        // grouped gather is sized by the filled count below, this is the belt
++        // to that brace.
++        std::vector<int32_t> tokens_per_expert_cpu(static_cast<size_t>(token_num) * max_topk, 0);
+         // Compact per-activated-expert metadata reused by scatter_reduce
+         std::vector<int32_t> tokens_lens_per_expert_cpu(num_grouped_experts, 0);
+         std::vector<int32_t> experts_id_cpu(num_grouped_experts, -1);
+@@ -3350,7 +3373,14 @@
+             }
+         }
+ 
+-        int total_gathered_tokens = static_cast<int>(token_num) * max_topk;
++        // arcint (patch 0042). Under the hybrid split (0037) the tables hold
++        // only the RESIDENT (token, k) pairs; the gather, and everything sized
++        // by it, runs over the FILLED count, not token_num * max_topk. Until
++        // this patch the table was -1-initialised and the launch covered every
++        // pair: a work-group past the fill computed -1 * HIDDEN_SIZE, added it
++        // to the kernel's uint offset and read ~8 GiB past the buffer -- a
++        // page fault on Xe2 (bisected and stage-synchronised 2026-09-17, B60).
++        int total_gathered_tokens = num_grouped_experts > 0 ? grouped_offsets_cpu[num_grouped_experts - 1] : 0;
+ 
+         // Compute actual max tokens assigned to any single expert.
+         int max_tokens_per_expert = 0;

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 0.5.0 LANGUAGES CXX)
+project(arcint VERSION 0.5.12 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,6 +11,12 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(ARCINT_OPENVINO "Build the OpenVINO executor backend (M1+)" OFF)
+# 0.5.3.1459: the libllama executor -- ggml's OpenCL backend runs the GGUF.
+# ARCINT_LLAMA_DIR is a llama.cpp source tree at the pinned commit with
+# contrib/llama.cpp/patches applied (contrib/llama.cpp/README.md); it is built
+# as a subproject, static, OpenCL on.
+option(ARCINT_LLAMA "Build the libllama (ggml OpenCL) executor backend" OFF)
+set(ARCINT_LLAMA_DIR "" CACHE PATH "llama.cpp source tree for ARCINT_LLAMA")
 option(ARCINT_WERROR   "Treat compiler warnings as errors"         OFF)
 option(ARCINT_TESTS    "Build the test binaries"                   ON)
 
@@ -75,6 +81,7 @@ add_library(arcint_core STATIC
   src/core/model_registry.cpp
   src/core/ngram_header.cpp
   src/exec/ngram_table.cpp
+  src/exec/ngram_reader.cpp
   src/core/prefix_cache.cpp
   src/core/reasoning.cpp
   src/core/sampler.cpp
@@ -84,6 +91,7 @@ add_library(arcint_core STATIC
   src/core/chat.cpp
   src/core/dflash_select.cpp
   src/core/drafter.cpp
+  src/core/draft_policy.cpp
   src/core/turnstile.cpp
   src/exec/backend_stub.cpp
   src/api/error.cpp
@@ -131,6 +139,36 @@ if(ARCINT_OPENVINO)
     message(WARNING "arcint: libopenvino_tokenizers.so not found; set "
                     "ARCINT_TOKENIZERS_SO at configure time or in the environment")
   endif()
+endif()
+
+if(ARCINT_LLAMA)
+  if(NOT ARCINT_LLAMA_DIR OR NOT EXISTS "${ARCINT_LLAMA_DIR}/include/llama.h")
+    message(FATAL_ERROR "ARCINT_LLAMA=ON needs ARCINT_LLAMA_DIR, a llama.cpp source tree")
+  endif()
+  if(NOT EXISTS "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl")
+    message(WARNING "ARCINT_LLAMA_DIR has no contrib/llama.cpp/patches: ggml's stock OpenCL kernels, "
+                    "a K-quant MoE's experts on the CPU (contrib/llama.cpp/README.md)")
+  endif()
+  set(GGML_OPENCL ON CACHE BOOL "" FORCE)
+  set(GGML_OPENCL_USE_ADRENO_KERNELS OFF CACHE BOOL "" FORCE)
+  set(GGML_OPENCL_EMBED_KERNELS ON CACHE BOOL "" FORCE)
+  set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+  # not llama.cpp's common library: it compiles another cpp-httplib (0.58)
+  # than arcint's (0.18) into the same binary, and the server then fails to
+  # bind (measured-here); the MTP drafter is rebuilt in llama_spec.cpp
+  set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  add_subdirectory("${ARCINT_LLAMA_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/llama.cpp" EXCLUDE_FROM_ALL)
+  find_package(OpenCL REQUIRED)
+  target_sources(arcint_core PRIVATE src/exec/backend_llama.cpp src/exec/llama_spec.cpp)
+  # llama-ext.h: the pinned llama.cpp's staging API (nextn embeddings, MTP)
+  target_include_directories(arcint_core PRIVATE "${ARCINT_LLAMA_DIR}/src")
+  target_link_libraries(arcint_core PUBLIC llama OpenCL::OpenCL)
+  target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA=1)
 endif()
 
 # Generated last on purpose: it bakes in the tokenizers path discovered above,
@@ -209,6 +247,8 @@ if(ARCINT_TESTS)
     tests/test_drafter.cpp
     tests/test_text.cpp
     tests/test_config.cpp
+    tests/test_verify_walk.cpp
+    tests/test_token_ids.cpp
     tests/test_props.cpp
     tests/test_artifact.cpp
     tests/test_ngram_admit.cpp
@@ -229,11 +269,14 @@ if(ARCINT_TESTS)
     tests/test_ngram_row_ids.cpp
     tests/test_ngram_lookup.cpp
     tests/test_ngram_ports.cpp
+    tests/test_ngram_staging.cpp
     tests/test_decode_stats.cpp
     tests/test_profile_cycle.cpp
     tests/test_rope_precision.cpp
     tests/test_segments.cpp
     tests/test_segment_runtime.cpp
+    tests/test_pinned_nvme_fill.cpp
+    tests/test_qsa_runtime.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
@@ -246,11 +289,15 @@ if(ARCINT_TESTS)
   # --allow-skip <case> (tests/harness.h's SKIP_UNLESS). Local, filtered runs
   # (`./build/arcint-test some_filter`) are unaffected; this only binds ctest's
   # own invocation.
-  # gguf_real_file_spot_check (docs/design-gguf-native.md stage 0) is the one
-  # named exception: it only runs with ARCINT_GGUF_REAL=<path> set to a real
-  # GGUF file not shipped with the repo, so it skips in every default build.
+  # gguf_real_file_spot_check (docs/design-gguf-native.md stage 0) and
+  # gguf_iq_decoders_match_gguf_py_on_the_real_shard are the named exceptions:
+  # both run only with ARCINT_GGUF_REAL=<path> set to a real GGUF file not
+  # shipped with the repo, so they skip in every default build. (The second
+  # was added without its name here, so `ctest -L unit` failed in every build
+  # without the shard -- found by the 0.5.0.1 acceptance's sanitizer cell.)
   add_test(NAME unit COMMAND arcint-test --max-skips 0
-           --allow-skip gguf_real_file_spot_check)
+           --allow-skip gguf_real_file_spot_check
+           --allow-skip gguf_iq_decoders_match_gguf_py_on_the_real_shard)
   set_tests_properties(unit PROPERTIES LABELS unit)
 
   add_test(NAME roundtrip

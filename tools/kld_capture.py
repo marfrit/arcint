@@ -42,6 +42,11 @@ measured facts, not settings:
     T == 2052   2.307817e-06 over 1/2052 rows
     T == 2080   2.385560e-02 over 29/2080 rows = T - 2051
 
+[DATED 2026-09-28: the magnitudes above were drawn at 692c0a6 with the (1 + w)
+fold applied twice to the q/k gammas; with the feed's gamma1 the pin reads
+5.082879e-05 over 1/2052 and 1.064551e-03 over 29/2080 rows. The above-2051
+bar built on it is withdrawn.]
+
 The count of touched rows is `T - 2051`, and it is DERIVED FROM THOSE TWO
 MEASURED POINTS rather than from reasoning about position indices -- which is
 how the first draft of this file got it wrong, by one, in both the arithmetic

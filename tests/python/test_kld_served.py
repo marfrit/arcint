@@ -236,3 +236,37 @@ def test_warmup_posts_extra_windows_before_the_counted_replays(monkeypatch, tmp_
                     "--url", "http://x"]) == 0
     assert len(posted) == (3 + 2) * 2                    # 5 passes x 2 windows
     assert posted[0] == list(range(6)) and posted[1] == list(range(6, 12))
+
+
+def test_the_report_also_carries_the_decided_bound_and_the_readable_candidate(tmp_path):
+    """The 2026-09-19 honest fix: no reader may see only the SUPERSEDED
+    inherited literal. The report carries the DECIDED instrument-resolution
+    bound (window-051 clause (d)) with its MEAN/per-row caveat, and the
+    between-implementations floor as the acceptance candidate. Red first:
+    the previous report had none of these keys."""
+    import json
+    import kld_harness as kh
+    n_ctx, vocab = 10, 7
+    rng = np.random.default_rng(11)
+    w0 = rng.normal(size=(n_ctx, vocab)).astype(np.float32)
+    cap = tmp_path / "ref.dat"
+    write_capture(cap, n_ctx, vocab, [w0], np.arange(n_ctx))
+    dump = tmp_path / "dump.bin"
+    out = tmp_path / "rep.json"
+    write_dump(dump, [(0, 0, n_ctx, w0)])
+    assert ks.main(["--ref", str(cap), "--compare", "--dump", str(dump), "--out", str(out)]) == 0
+    rep = json.loads(out.read_text())
+
+    # the decided bound is present and equals the harness's own constants
+    assert rep["resolution_bound_below_nats"] == kh.RESOLUTION_BOUND_BELOW_NATS
+    assert rep["resolution_bound_above_nats"] == kh.RESOLUTION_BOUND_ABOVE_NATS
+    # and it is priced as a MEAN bound: its own per-row tail exceeds it
+    assert rep["f_ref_per_row_max_nats"] > kh.RESOLUTION_BOUND_BELOW_NATS
+    # the acceptance candidate is the between-implementations floor
+    assert rep["implementation_floor_median_w0_nats"] == kh.IMPLEMENTATION_FLOOR_MEDIAN_W0_NATS
+    assert rep["implementation_floor_median_w1_nats"] == kh.IMPLEMENTATION_FLOOR_MEDIAN_W1_NATS
+    assert "not an acceptance bar" in rep["resolution_bound_provenance"].lower() or \
+           "instrument" in rep["resolution_bound_provenance"].lower()
+    # continuity: the inherited literal is still carried, and is marked SUPERSEDED
+    assert rep["threshold_nats"] == kh.THRESHOLD_NATS
+    assert "SUPERSEDED" in kh.BAR_PROVENANCE

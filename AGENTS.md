@@ -15,7 +15,12 @@ Any turn that touches a design decision, a mechanism, a milestone, or a
 campaign STARTS by reading the repository's own record. Not after the
 measurement. Not after the implementation. First.
 
-**1. Read the campaign index.** `docs/campaigns/README.md` lists every open
+The documents named below — `docs/campaigns/`, the design notes, the
+milestone and window records, DESIGN.md's full dated §7.0.x entries — live on
+the development branch, `qfndev`. `main` carries the current state only; work
+happens on `qfndev`.
+
+**1. Read the campaign index.** `docs/campaigns/README.md` (on `qfndev`) lists every open
 defect and lever, each with a charter, a gate, and a status. If a campaign
 covers the work, read that campaign document before touching code. Each one
 is written to be sufficient on its own — that is the directory's stated rule.
@@ -58,14 +63,14 @@ compiles at all.
 The cause was in this repository the whole time:
 
 - The MoE fusion matcher requires `u4` **Constants**
-  (`DESIGN.md`:4489). Leaving Constant-land leaves the fusion, and the fusion
-  is what applies the **routing** — `window-051.md` §2 says so in the design's
+  (DESIGN §7.0.2ah, the full entry on `qfndev`). Leaving Constant-land leaves the fusion, and the fusion
+  is what applies the **routing** — `window-051.md` (on `qfndev`) §2 says so in the design's
   own words: "every expert computes for every token".
 - Flash-Next activates **10 of 512** experts per token.
   `design-qwen-flash-next.md`:84 dispositioned `num_experts_per_tok` as
   "**not read**". That one table cell is where the design stopped being
   FreeToken-shaped; it is 51.2× the required work.
-- `docs/campaigns/research-hybrid-expert-execution.md`, dated **2026-09-05**,
+- `docs/campaigns/research-hybrid-expert-execution.md` (on `qfndev`), dated **2026-09-05**,
   had already scoped the fix correctly: "the missing piece is the *split* …
   **That is a plugin change, not an engine change** — none of the surveyed
   systems replaced their serving engine, they added a kernel-dispatch

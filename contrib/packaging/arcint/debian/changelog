@@ -1,3 +1,108 @@
+arcint (0.5.12-1) trixie; urgency=medium
+
+  * 0.5.12: llama.cpp server's context checkpoints on the libllama engine
+    (--llama-checkpoints, on by default for hybrid models): a follow-up
+    after a thinking turn or an edited message resumes instead of
+    re-prefilling (24.3k tokens: 38.75 -> 0.61 s on the B60, 34.06 ->
+    0.54 s on the A770). Runtime floor unchanged at marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Mon, 05 Oct 2026 21:30:00 +0200
+
+arcint (0.5.11-1) trixie; urgency=medium
+
+  * 0.5.11: the libllama engine's prompt attention and K-quant GEMM on the
+    Arc A770 (llama.cpp patch 0020; the B60's kernels byte-identical). The
+    coder at 15k tokens prefills at 762 -> 1,008 t/s, level with the
+    OpenVINO path. Runtime floor unchanged at marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Mon, 05 Oct 2026 15:00:00 +0200
+
+arcint (0.5.10-1) trixie; urgency=medium
+
+  * 0.5.10: the libllama engine's attention kernels on the Arc Pro B60
+    (llama.cpp patches 0018, 0019): the decode / MTP-verify kernel splits
+    QK^T across the sides of a tile and stages quantized K and V 64 values a
+    work-item; the prompt kernel keeps Q in registers and shares one local
+    buffer between K and V. Served at 62.6k tokens: prefill 287 -> 408 t/s,
+    decode 18.7 -> 21.6 t/s. Runtime floor unchanged at marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Mon, 05 Oct 2026 08:00:00 +0200
+
+arcint (0.5.9-1) trixie; urgency=medium
+
+  * 0.5.9: min-p sampling (--min-p, request field min_p); <thinking> and
+    [THINK] blocks split as reasoning for the Mistral Small 24B family; top-p
+    with top-k off normalised over the whole vocabulary (it cut early).
+    Runtime floor unchanged at marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 04 Oct 2026 23:00:00 +0200
+
+arcint (0.5.8-1) trixie; urgency=medium
+
+  * 0.5.8: the libllama engine serves Mistral Small 3.2 24B and its
+    finetunes (Cydonia 24B) for creative writing; the XMX attention kernels
+    at head size 128 (contrib/llama.cpp/patches 0017). Runtime floor
+    unchanged at marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 04 Oct 2026 22:00:00 +0200
+
+arcint (0.5.7-1) trixie; urgency=medium
+
+  * 0.5.7: decode and MTP-verify attention in one pass over K/V per KV head
+    on the B60 (contrib/llama.cpp/patches 0016): the agent's decode at
+    62,597 tokens of depth 11.0 -> 15.6 t/s. Runtime floor unchanged at
+    marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 04 Oct 2026 20:00:00 +0200
+
+arcint (0.5.6-1) trixie; urgency=medium
+
+  * 0.5.6: quantized KV on the libllama engine (--llama-kv q8_0 or
+    q8_0:q4_0), on arcint's Intel attention kernels (contrib/llama.cpp/patches
+    0015): the dense 27B serves 131,072 tokens with MTP on the B60 with an
+    8:8 cache. Runtime floor unchanged at marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 04 Oct 2026 18:00:00 +0200
+
+arcint (0.5.5-1) trixie; urgency=medium
+
+  * 0.5.5: a second engine, libllama (--engine llama --gguf): llama.cpp
+    bed0a85 with contrib/llama.cpp/patches 0001-0014 (Intel kernels for
+    ggml's OpenCL backend), built into the binary. MTP from the GGUF's
+    own head. The services stay on OpenVINO (the coder's context on the A770,
+    no shared prefix cache yet on the new engine). New dependency: ocl-icd-libopencl1. Runtime
+    floor unchanged at marfrit-openvino +p25; the Flash-Next tier's opt-in
+    switches of plugin patches 0076-0077 need +p27.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 04 Oct 2026 12:00:00 +0200
+
+arcint (0.5.4-1) trixie; urgency=medium
+
+  * 0.5.4: the 0.5.1-0.5.4 acceptance closes against the readable rows
+    (BERLIN-001, VENICE-001, LISBON, LYON-001; unreadable rows marked owed
+    with their reasons, see CHANGELOG.md). The GGUF feed reads BF16 tensors
+    through gguf.quants instead of casting their raw bytes; the QSA indexer
+    norm gammas are applied once; QSA selection reaches PagedAttention
+    (plugin patch 0073). Runtime floor raised to marfrit-openvino +p25
+    (patches 0003-0074).
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Thu, 01 Oct 2026 22:30:00 +0200
+
+arcint (0.5.0.1-1) trixie; urgency=medium
+
+  * 0.5.0.1: served-performance release on the 0.5.0 line. No 0.5.x dot's
+    acceptance gate closes here; the dots keep their numbers. The native
+    per-expert route of the MoE artifacts, fed by marfrit-openvino +p20
+    (patches 0003-0067), is fast now: the full-depth Qwen3.6-35B-A3B native
+    packed u8 artifact serves all-resident on the 16 GiB card at about
+    960 t/s prefill (4096 tokens) and 28 t/s decode; Flash-Next's hybrid
+    route (ratio 75 + CPU tier) prefills 32k tokens in 36 min. arcint
+    itself: the logits slice finds a serving-shape IR's token axis, and the
+    CPU embedding table is read into host memory at load. The fused int4
+    route and the dense path are unchanged. Runtime floor raised to +p20.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 27 Sep 2026 09:00:00 +0200
+
 arcint (0.5.0-1) trixie; urgency=medium
 
   * 0.5.0: the MECHANISM release of the Qwen3.8 Flash-Next (qwen4_exp)

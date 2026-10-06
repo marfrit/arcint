@@ -1,0 +1,1068 @@
+# Tier hand-off doorbell (campaign tier-handoff-doorbell): decode MoE layers
+# no longer stop the enqueueing thread. Strata's doorbell
+# (src/kernels/cuda/elementwise.cu:186-311) and FreeToken's flag handshake
+# (python/freetoken/moe/cpu_executor.py:31-49), on OpenCL.
+#
+# MOE_DOORBELL=1, decode calls of up to 63 pairs and 8 tokens on a partly
+# resident pool with the CPU tier (patch 0076's served configuration):
+#  - the enqueueing thread applies the ready swaps, fills a few never-filled
+#    pinned slots, rewrites the layer's residency table (device memory, by an
+#    enqueued copy, only when it changed), then enqueues without blocking:
+#    doorbell_route (pair table from topk_id through the table: slot, or -1
+#    for the CPU tier; publishes the ids, the slots it chose, the routing
+#    weights and x to host memory, then release-stores the call's sequence
+#    number), the batched expert kernels (which now skip -1 rows), the
+#    shared-expert stages, doorbell_wait (polls the host's done flag, merges
+#    the CPU rows into y), and the reduce. Then it pushes the host half to a
+#    coordinator thread and returns: the whole decode step is submitted ahead.
+#  - the coordinator (one thread, FIFO = layer order) spins on the published
+#    sequence number, counts the ids for the adaptive cache, runs the CPU tier
+#    on exactly the pairs the device marked -1, writes their rows and the row
+#    list to host memory, and rings done as its last write.
+#
+# The GPU-side poll, measured on the B60 (xe, NEO; host USM reports no
+# concurrent access): only an LSC load that bypasses L1 and L3
+# (__builtin_IB_lsc_load_global_uint, L1UC_L3UC) WITH an acquire fence inside
+# the loop sees the host's write (8 of 8, 4.5-5.4 us); acquire atomics 2 of 8,
+# volatile and RMW loads 0 of 8, and the bare uncached load is hoisted out of
+# the loop. OpenCL user events were not used: a command waiting on one puts
+# the queue in blocked mode and moves later submissions onto the thread that
+# sets it.
+#
+# Failure handling: the poll is bounded (~1.3 s); a timeout, or a host half
+# that throws (it still rings done, with a poison word), makes the wait kernel
+# write NaN rows instead of merging, and the error is thrown on the next call.
+# A coordinator job for a layer superseded by a later published call throws.
+# The enqueueing thread drains the coordinator before touching an impl whose
+# last call has not rung, and the impl's destructor drains it. First use
+# (the host bank, its fill, the lookahead's routers, host scratch) happens on
+# the enqueueing thread, never inside a job the GPU waits on.
+#
+# Served gate (dense d48q8, B60, ratio 75 + census128, 15.4e9 device pool,
+# 30 GiB fixed bank, adaptive cache, router lookahead; 20,085-token needle;
+# one fresh process per arm): without the doorbell prefill 63.5 / needle
+# decode 10.7 / 500-token decode 14.0 t/s; with it 60.8 / 12.7 / 16.0; needle
+# right in both. Window-0 KL over three arms each: 0.409 vs 0.412 nats mean,
+# argmax 79.1 vs 79.0 % (one arm pair alone read +0.038, inside the control's
+# own 0.041 spread). Device timeline before (CLIntercept, 2k): busy 32.6 ms
+# of ~70 ms a decode token.
+#
+# Files: moe_expert_swiglu.cl (the two kernels, the -1 skips),
+# moe_3gemm_swiglu_opt.cpp (stages, coordinator, host half, wiring),
+# expert_weight_providers.{hpp,cpp} (swap apply, table, fill, counting, the
+# swap-list mutex), moe_otd_perf.hpp / moe_otd_runtime.cpp (counters), and the
+# unit cell.
+
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
+@@ -81,7 +81,7 @@
+ // native kernels' copies without their tables (CL_BUILD_PROGRAM_FAILURE). The
+ // guard keeps the bare #ifndef/#define form: the kernel-db generator exempts
+ // only that pattern from the per-source #undef list.
+-#ifndef NATIVE_ROUTE_ENABLE
++#if !defined(NATIVE_ROUTE_ENABLE) && !defined(DOORBELL_ROUTE_ENABLE) && !defined(DOORBELL_WAIT_ENABLE)
+ #ifndef ARCINT_PER_EXPERT_CL_HELPERS_DEFINED
+ #define ARCINT_PER_EXPERT_CL_HELPERS_DEFINED
+ 
+@@ -2172,7 +2172,7 @@
+ #endif  // ARCINT_NATIVE_DECODE_DEFINED
+ #endif  // NATIVE_GATE_UP_ENABLE || NATIVE_DOWN_ENABLE
+ #endif  // ARCINT_PER_EXPERT_CL_HELPERS_DEFINED
+-#endif  // !NATIVE_ROUTE_ENABLE (patch 0067)
++#endif  // !NATIVE_ROUTE_ENABLE && !DOORBELL_* (patches 0067, 0077)
+ 
+ 
+ #ifdef GATE_UP_ENABLE
+@@ -2574,6 +2574,8 @@
+     int experts_per_token)
+ {
+     const int p = sub_group_broadcast((int)get_global_id(0), 0);  // patch 0061: uniform
++    if (pairs[3 * p] < 0)
++        return;  // patch 0077: the doorbell's route marks a CPU-tier pair (whole work-group)
+     const int flat = pairs[3 * p + 1];
+     int xb[NATIVE_TILE_M] = {(flat / experts_per_token) * HIDDEN_SIZE};
+     int yb[NATIVE_TILE_M] = {flat * INTERMEDIATE_SIZE};
+@@ -2748,6 +2750,8 @@
+ {
+     const int p = get_group_id(0);
+     const int slot = pairs[3 * p];
++    if (slot < 0)
++        return;  // patch 0077: a CPU-tier pair (whole work-group)
+     const int flat = pairs[3 * p + 1];
+     const int kb = get_sub_group_id();
+     const int lane = get_sub_group_local_id();
+@@ -2953,6 +2957,8 @@
+     int max_topk)
+ {
+     const int p = sub_group_broadcast((int)get_global_id(0), 0);  // patch 0061: uniform
++    if (pairs[3 * p] < 0)
++        return;  // patch 0077: a CPU-tier pair (whole work-group)
+     const int flat = pairs[3 * p + 1];
+     int xb[NATIVE_TILE_M] = {flat * INTERMEDIATE_SIZE};
+     int rwb[NATIVE_TILE_M] = {(flat / experts_per_token) * max_topk + pairs[3 * p + 2]};
+@@ -3006,3 +3012,127 @@
+     pairs[3 * i + 2] = pos;
+ }
+ #endif  // NATIVE_ROUTE_ENABLE
++
++#if defined(DOORBELL_ROUTE_ENABLE) || defined(DOORBELL_WAIT_ENABLE)
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++#endif
++#ifdef DOORBELL_ROUTE_ENABLE
++// arcint (patch 0077, campaign tier-handoff-doorbell). Strata's doorbell
++// publish (src/kernels/cuda/elementwise.cu:186-311): the decode pair table
++// from topk_id through the layer's residency table (slot, or -1 for an expert
++// the card does not hold: the batched kinds skip that row and the CPU tier
++// computes it), and the published copy of what the tier needs -- the ids, the
++// slots the device chose, the routing weights and x -- in host memory, then
++// `seq` with a release store. One work-group.
++// pub layout (ints): ids[DOORBELL_PMAX], slots[DOORBELL_PMAX], then halves:
++// rw[DOORBELL_PMAX], x[DOORBELL_TMAX * HIDDEN_SIZE].
++KERNEL(doorbell_route)(
++    const __global int*  topk_id,
++    const __global half* topk_w,
++    const __global half* x,
++    const __global int*  table,
++    __global int*        pairs,
++    __global int*        pub,
++    __global uint*       flags,
++    int experts_per_token,
++    int max_topk,
++    int route_pairs,
++    int n_tok,
++    uint seq)
++{
++    const int lid = get_local_id(0);
++    const int lsz = get_local_size(0);
++    __global int* pub_ids = pub;
++    __global int* pub_slots = pub + DOORBELL_PMAX;
++    __global half* pub_rw = (__global half*)(pub + 2 * DOORBELL_PMAX);
++    __global half* pub_x = pub_rw + DOORBELL_PMAX;
++    for (int i = lid; i < route_pairs; i += lsz) {
++        const int e = topk_id[i];
++        const int slot = table[e];
++        const int pos = i % max_topk;
++        pairs[3 * i + 0] = slot;
++        pairs[3 * i + 1] = (i / max_topk) * experts_per_token + pos;
++        pairs[3 * i + 2] = pos;
++        pub_ids[i] = e;
++        pub_slots[i] = slot;
++        pub_rw[i] = topk_w[i];
++    }
++    for (int i = lid; i < n_tok * HIDDEN_SIZE; i += lsz)
++        pub_x[i] = x[i];
++    atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_release, memory_scope_all_svm_devices);
++    barrier(CLK_GLOBAL_MEM_FENCE);
++    if (lid == 0) {
++        atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_release, memory_scope_all_svm_devices);
++        atomic_store_explicit((__global atomic_uint*)flags, seq, memory_order_release, memory_scope_all_svm_devices);
++    }
++}
++#endif  // DOORBELL_ROUTE_ENABLE
++
++#ifdef DOORBELL_WAIT_ENABLE
++// arcint (patch 0077). Strata's doorbell wait: one work-item polls the host's
++// `done` flag (flags[16], its own cache line) until it reaches `seq`, then the
++// work-group copies the CPU tier's rows (host: rows[0] = count, rows[1..] the
++// flat ids; yhost the rows in that order) into y. Host memory is read with
++// LSC loads that bypass L1 and L3: on this driver host USM is not concurrent,
++// and atomic or volatile loads of a host-written flag were measured to miss
++// the write (acquire atomics 2 of 8 rounds, volatile and RMW 0 of 8; the
++// uncached load with an acquire fence in the loop 8 of 8, ~5 us). The poll is bounded: on a timeout flags-side
++// status (rows are not merged) is left to the host's own check, so the queue
++// never hangs on a lost flag.
++#if HIDDEN_SIZE % 2
++#  error "moe_expert_swiglu.cl: the doorbell merge copies two halves a word"
++#endif
++#ifndef ARCINT_DOORBELL_LSC_DECLARED
++#define ARCINT_DOORBELL_LSC_DECLARED
++enum DOORBELL_LDCC { DOORBELL_LDCC_DEFAULT = 0, DOORBELL_L1UC_L3UC = 1 };
++extern uint __builtin_IB_lsc_load_global_uint(const __global uint* base, int immElemOff, enum DOORBELL_LDCC cacheOpt);
++#endif
++// flags[17] == seq: the host's half failed for this call. A timeout or a
++// failed call writes NaN into the call's y rows (y_rows rows) instead of
++// merging, so a wrong token cannot pass for a right one; the host throws on
++// its next call.
++KERNEL(doorbell_wait)(
++    const __global uint* flags,
++    const __global uint* rows,
++    const __global uint* yhost,
++    __global uint*       y,
++    __global uint*       status,
++    uint seq,
++    uint limit,
++    uint y_rows)
++{
++    __local uint seen;
++    const int lid = get_local_id(0);
++    const int lsz = get_local_size(0);
++    if (lid == 0) {
++        uint polls = 0, ok = 0;
++        while (polls < limit) {
++            if (__builtin_IB_lsc_load_global_uint(flags + 16, 0, DOORBELL_L1UC_L3UC) >= seq) { ok = 1; break; }
++            // Without a fence in the loop the compiler hoists the load and
++            // the poll never sees the host's write (measured: 3M polls in
++            // ~110 ms, every round a timeout); with it, 4.5-5.4 us.
++            atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_acquire, memory_scope_all_svm_devices);
++            ++polls;
++        }
++        atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_acquire, memory_scope_all_svm_devices);
++        const uint failed = ok && __builtin_IB_lsc_load_global_uint(flags + 17, 0, DOORBELL_L1UC_L3UC) == seq;
++        seen = ok && !failed;
++        if (!ok)
++            status[0] = seq;  // a timeout, for the host to read
++    }
++    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
++    if (!seen) {
++        const int words = HIDDEN_SIZE / 2;
++        for (uint w = lid; w < y_rows * words; w += lsz)
++            y[w] = 0x7E007E00u;  // two half NaNs
++        return;
++    }
++    const uint n = __builtin_IB_lsc_load_global_uint(rows, 0, DOORBELL_L1UC_L3UC);
++    const int words = HIDDEN_SIZE / 2;  // two halves a uint
++    for (uint r = 0; r < n; ++r) {
++        const uint flat = __builtin_IB_lsc_load_global_uint(rows + 1 + r, 0, DOORBELL_L1UC_L3UC);
++        for (int w = lid; w < words; w += lsz)
++            y[(long)flat * words + w] = __builtin_IB_lsc_load_global_uint(yhost + (long)r * words + w, 0, DOORBELL_L1UC_L3UC);
++    }
++}
++#endif  // DOORBELL_WAIT_ENABLE
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -13,6 +13,9 @@
+ #include <filesystem>
+ #include <mutex>
+ #include <condition_variable>
++#include <deque>
++#include <functional>
++#include <exception>
+ #include <algorithm>
+ #include <thread>
+ #include <fcntl.h>
+@@ -162,6 +165,76 @@
+ // refuses ends the bank there (it runs smaller, and says so). The chunks are
+ // leaked on purpose: they must outlive every bank user, and process exit
+ // reclaims them.
++// arcint (patch 0077, campaign tier-handoff-doorbell). The doorbell's host
++// half runs here, off the thread that enqueues the network, so that thread
++// submits the whole decode step ahead (Strata records the pass; FreeToken's
++// coordinator polls the ready flag). One thread, calls in FIFO order, which
++// is the GPU's layer order. A call that throws still rings its `done` (the
++// job does that) and the error surfaces on the enqueueing thread's next MoE
++// call. Leaked on purpose: no static destructor joins a thread mid-call.
++class DoorbellCoordinator {
++public:
++    static DoorbellCoordinator& get() {
++        static auto* inst = new DoorbellCoordinator();
++        return *inst;
++    }
++    void push(std::function<void()> job) {
++        {
++            std::lock_guard<std::mutex> lock(_m);
++            _q.push_back(std::move(job));
++        }
++        _cv.notify_one();
++    }
++    // Blocks until every pushed call has finished.
++    void drain() {
++        std::unique_lock<std::mutex> lock(_m);
++        _idle.wait(lock, [this] { return _q.empty() && !_busy; });
++    }
++    void fail(std::exception_ptr e) {
++        std::lock_guard<std::mutex> lock(_m);
++        if (!_error)
++            _error = e;
++    }
++    void rethrow() {
++        drain();
++        std::exception_ptr e;
++        {
++            std::lock_guard<std::mutex> lock(_m);
++            std::swap(e, _error);
++        }
++        if (e)
++            std::rethrow_exception(e);
++    }
++
++private:
++    DoorbellCoordinator() {
++        std::thread([this] { run(); }).detach();
++    }
++    void run() {
++        for (;;) {
++            std::function<void()> job;
++            {
++                std::unique_lock<std::mutex> lock(_m);
++                _cv.wait(lock, [this] { return !_q.empty(); });
++                job = std::move(_q.front());
++                _q.pop_front();
++                _busy = true;
++            }
++            job();
++            {
++                std::lock_guard<std::mutex> lock(_m);
++                _busy = false;
++            }
++            _idle.notify_all();
++        }
++    }
++    std::mutex _m;
++    std::condition_variable _cv, _idle;
++    std::deque<std::function<void()>> _q;
++    bool _busy = false;
++    std::exception_ptr _error;
++};
++
+ // arcint (patch 0076, campaign expert-hot-set-lru). Strata's routing-aware
+ // prefetch of the file tier (src/program/generate.cpp:3001-3030,
+ // src/core/expert_source.cpp:814-930): while the CPU tier works on layer L, a
+@@ -1113,6 +1186,43 @@
+     }
+ };
+ 
++// arcint (patch 0077, campaign tier-handoff-doorbell). The doorbell's two
++// kernels (moe_expert_swiglu.cl): route + publish, and wait + merge.
++constexpr int kDoorbellPMax = static_cast<int>(kGroupedMinPairs) - 1;  // pairs a decode call can carry
++constexpr int kDoorbellTMax = 8;                                        // tokens a decode call can carry
++class MoEDoorbellRoute : public KernelGenerator {
++public:
++    MoEDoorbellRoute() : KernelGenerator("moe_expert_swiglu", "doorbell_route") {}
++protected:
++    JitConstants get_jit_constants(const RuntimeParams& params) const override {
++        auto jit = KernelGenerator::get_jit_constants(params);
++        add_common_consts(params, jit);
++        jit.make("DOORBELL_ROUTE_ENABLE", 1);
++        jit.make("DOORBELL_PMAX", kDoorbellPMax);
++        jit.make("DOORBELL_TMAX", kDoorbellTMax);
++        return jit;
++    }
++    Arguments get_arguments_desc(const RuntimeParams&) const override { return {}; }
++    DispatchDataFunc get_dispatch_data_func() const override {
++        return DispatchDataFunc{[](const RuntimeParams&, KernelData&, ImplRuntimeParams*) {}};
++    }
++};
++class MoEDoorbellWait : public KernelGenerator {
++public:
++    MoEDoorbellWait() : KernelGenerator("moe_expert_swiglu", "doorbell_wait") {}
++protected:
++    JitConstants get_jit_constants(const RuntimeParams& params) const override {
++        auto jit = KernelGenerator::get_jit_constants(params);
++        add_common_consts(params, jit);
++        jit.make("DOORBELL_WAIT_ENABLE", 1);
++        return jit;
++    }
++    Arguments get_arguments_desc(const RuntimeParams&) const override { return {}; }
++    DispatchDataFunc get_dispatch_data_func() const override {
++        return DispatchDataFunc{[](const RuntimeParams&, KernelData&, ImplRuntimeParams*) {}};
++    }
++};
++
+ class MoE3GemmSwigluMLPGateUp : public KernelGenerator {
+ public:
+     MoE3GemmSwigluMLPGateUp(bool disable_shared_experts = false)
+@@ -1233,6 +1343,12 @@
+ 
+ class moe_3gemm_swiglu_opt_impl : public PrimitiveImplOCL {
+ public:
++    // arcint (patch 0077): no doorbell job may outlive the impl it points into.
++    ~moe_3gemm_swiglu_opt_impl() override {
++        if (_db_flags)
++            DoorbellCoordinator::get().drain();
++    }
++public:
+     DECLARE_OBJECT_TYPE_SERIALIZATION(ov::intel_gpu::ocl::MoE3GemmSwigluImpl)
+     Stage::Ptr gather = make_stage<MoE3GemmSwigluGather>();
+     Stage::Ptr scatter = make_stage<MoE3GemmSwigluScatter>();
+@@ -1438,6 +1554,16 @@
+     memory::ptr _dispatch_tiles_dpas;
+     // arcint (patch 0067): decode routes on the device on the all-resident pool.
+     Stage::Ptr _expert_route_native_stage = make_stage<MoEExpertRouteNative>();
++    // arcint (patch 0077). The doorbell's stages and its per-layer buffers:
++    // the residency table (device; host staging), the publish area, the flags
++    // (seq at [0], done at [16], each its own cache line), the CPU tier's rows
++    // (count, flat ids) and their values, the wait's timeout status.
++    Stage::Ptr _doorbell_route_stage = make_stage<MoEDoorbellRoute>();
++    Stage::Ptr _doorbell_wait_stage = make_stage<MoEDoorbellWait>();
++    memory::ptr _db_table, _db_table_host, _db_pub, _db_flags, _db_rows, _db_yhost, _db_status;
++    scratch_buffers _db_no_scratch;  // cpu_tier_join's to_host path reads none of it
++    std::vector<int32_t> _db_table_last;
++    uint32_t _db_seq = 0;
+     // Both sized once for the largest device-routed call (kGroupedMinPairs - 1
+     // pairs) and never regrown: no queue drain precedes a device-routed call, so
+     // a buffer an earlier call's kernels still read must not be released.
+@@ -1985,9 +2111,13 @@
+     // this DMA lands after `down` and before `reduce`; both hold by program
+     // order on the in-order queue (the same guarantee patches 0006/0007 lean
+     // on) - see this patch's header for the full event-ordering argument.
++    // arcint (patch 0077). to_host: the rows go to the doorbell's host buffers
++    // (_db_yhost, _db_rows), which the wait kernel merges into scratch.y,
++    // instead of one copy per row on the stream.
+     void cpu_tier_join(cldnn::stream& stream,
+                        scratch_buffers& scratch,
+-                       typed_primitive_inst<moe_3gemm_fused_compressed>& instance) {
++                       typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
++                       bool to_host = false) {
+         if (_cpu_tier_misses.empty())
+             return;
+         auto* perf = moe_otd::get_perf_counters();
+@@ -2012,6 +2142,14 @@
+                 max_token = std::max(max_token, token);
+                 const size_t expert_slot = pos % _max_topk;
+                 const size_t flat_id = token * _experts_per_token + expert_slot;
++                if (to_host) {
++                    auto* rows = static_cast<uint32_t*>(_db_rows->buffer_ptr());
++                    std::memcpy(static_cast<uint8_t*>(_db_yhost->buffer_ptr()) + row * row_bytes,
++                                _cpu_out_rows.data() + row * static_cast<size_t>(_hidden_size), row_bytes);
++                    rows[1 + row] = static_cast<uint32_t>(flat_id);
++                    ++row;
++                    continue;
++                }
+                 auto slot = _cpu_y_staging.acquire(engine, row_bytes);
+                 std::memcpy(slot.host_ptr, _cpu_out_rows.data() + row * static_cast<size_t>(_hidden_size), row_bytes);
+                 auto ev = scratch.y->copy_from(stream, slot.host_ptr, 0, flat_id * row_bytes, row_bytes, false);
+@@ -2019,6 +2157,8 @@
+                 ++row;
+             }
+         }
++        if (to_host)
++            static_cast<uint32_t*>(_db_rows->buffer_ptr())[0] = static_cast<uint32_t>(row);
+         if (perf) {
+             // Host-side cost of the y writeback: staging memcpy + enqueue of the
+             // non-blocking DMAs (not their completion, which the in-order queue
+@@ -2838,6 +2978,8 @@
+                     add_stage(_expert_gate_up_native_grouped_stage, params);
+                     add_stage(_expert_down_native_grouped_stage, params);
+                     add_stage(_expert_route_native_stage, params);  // arcint (patch 0067)
++                    add_stage(_doorbell_route_stage, params);       // arcint (patch 0077)
++                    add_stage(_doorbell_wait_stage, params);
+                     // arcint (patch 0064): the matrix-unit gate/up. The kernel is
+                     // Xe-HPG's (subgroup 8), for IQ2_S-packed gate/up only; it runs
+                     // for EVERY call size, so a pair's bytes do not depend on the
+@@ -3457,6 +3599,123 @@
+         return std::make_tuple(mem, layout);
+     }
+ 
++    // arcint (patch 0077, campaign tier-handoff-doorbell). The host's half of
++    // a doorbell call, run after the call's whole GPU sequence is enqueued:
++    // spin until the route kernel has published this call (no driver wait),
++    // count the routed ids for the adaptive cache, give the CPU tier exactly
++    // the pairs the device marked -1, write their rows to host memory and
++    // ring `done`, which the wait kernel is polling.
++    void doorbell_host(typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
++                       size_t token_num,
++                       size_t route_pairs,
++                       uint32_t seq) {
++        auto* otd = static_cast<OffloadExpertWeightProvider*>(_weight_provider.get());
++        auto* perf = moe_otd::get_perf_counters();
++        auto* flags = static_cast<uint32_t*>(_db_flags->buffer_ptr());
++        // The wait kernel leaves the seq of a call it gave up on here.
++        auto* status = static_cast<uint32_t*>(_db_status->buffer_ptr());
++        if (const uint32_t lost = __atomic_load_n(&status[0], __ATOMIC_ACQUIRE)) {
++            __atomic_store_n(&status[0], 0u, __ATOMIC_RELEASE);
++            if (perf)
++                perf->doorbell_wait_timeouts.fetch_add(1, std::memory_order_relaxed);
++            OPENVINO_THROW("MOE_DOORBELL: layer ", otd->layer_key(), ": the wait kernel timed out on call ", lost,
++                           " and wrote NaN rows");
++        }
++        const auto t0 = std::chrono::steady_clock::now();
++        for (uint64_t spins = 0;; ++spins) {
++            const uint32_t pub_seq = __atomic_load_n(&flags[0], __ATOMIC_ACQUIRE);
++            if (pub_seq == seq)
++                break;
++            // The GPU already published a later call of this layer: this one
++            // was given up on (a timeout); its job is stale.
++            if (pub_seq > seq)
++                OPENVINO_THROW("MOE_DOORBELL: layer ", otd->layer_key(), ": call ", seq, " superseded by ", pub_seq);
++            if ((spins & 4095u) == 0 &&
++                std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60))
++                OPENVINO_THROW("MOE_DOORBELL: the route kernel did not publish call ", seq);
++#if defined(__x86_64__) || defined(__i386__)
++            __builtin_ia32_pause();
++#endif
++        }
++        const auto t1 = std::chrono::steady_clock::now();
++        const auto* pub = static_cast<const int32_t*>(_db_pub->buffer_ptr());
++        const int32_t* ids = pub;
++        const int32_t* slots = pub + kDoorbellPMax;
++        const auto* rw = reinterpret_cast<const uint16_t*>(pub + 2 * kDoorbellPMax);
++        const uint16_t* x = rw + kDoorbellPMax;
++        otd->doorbell_count(ids, route_pairs);
++
++        _cpu_tier_misses.clear();
++        std::unordered_map<uint32_t, size_t> at;
++        std::unordered_map<uint32_t, bool> seen;  // expert -> on the card
++        for (size_t i = 0; i < route_pairs; ++i) {
++            seen.emplace(static_cast<uint32_t>(ids[i]), slots[i] >= 0);
++            if (slots[i] >= 0)
++                continue;
++            const uint32_t e = static_cast<uint32_t>(ids[i]);
++            auto it = at.find(e);
++            if (it == at.end()) {
++                at.emplace(e, _cpu_tier_misses.size());
++                auto& m = _cpu_tier_misses.emplace_back();
++                m.expert = e;
++                m.positions.push_back(i);
++            } else {
++                _cpu_tier_misses[it->second].positions.push_back(i);
++            }
++        }
++        if (perf) {
++            // The host path's units: one resolution per distinct expert, and
++            // the decode counters for one-token calls only.
++            uint64_t hits = 0;
++            for (const auto& [e, on_card] : seen)
++                hits += on_card ? 1 : 0;
++            perf->doorbell_calls.fetch_add(1, std::memory_order_relaxed);
++            perf->doorbell_publish_wait_ns.fetch_add(
++                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()),
++                std::memory_order_relaxed);
++            perf->gpu_hits.fetch_add(hits, std::memory_order_relaxed);
++            perf->gpu_misses.fetch_add(seen.size() - hits, std::memory_order_relaxed);
++            if (token_num == 1) {
++                perf->decode_lookups.fetch_add(seen.size(), std::memory_order_relaxed);
++                perf->decode_hits.fetch_add(hits, std::memory_order_relaxed);
++            }
++            size_t pairs = 0;
++            for (const auto& m : _cpu_tier_misses)
++                pairs += m.positions.size();
++            perf->cpu_tier_experts.fetch_add(_cpu_tier_misses.size(), std::memory_order_relaxed);
++            perf->cpu_tier_pairs.fetch_add(pairs, std::memory_order_relaxed);
++        }
++        auto* rows = static_cast<uint32_t*>(_db_rows->buffer_ptr());
++        if (!_cpu_tier_misses.empty()) {
++            auto& engine = instance.get_network().get_engine();
++            const size_t x_bytes = token_num * static_cast<size_t>(_hidden_size) * sizeof(uint16_t);
++            const size_t rw_bytes = route_pairs * sizeof(uint16_t);
++            std::memcpy(ensure_cpu_host_scratch(engine, _cpu_x_host_mem, _cpu_x_host_capacity, x_bytes), x, x_bytes);
++            std::memcpy(ensure_cpu_host_scratch(engine, _cpu_rw_host_mem, _cpu_rw_host_capacity, rw_bytes), rw, rw_bytes);
++            dispatch_cpu_tier(instance);
++            cpu_tier_join(instance.get_network().get_stream(), _db_no_scratch, instance, /*to_host=*/true);
++        } else {
++            rows[0] = 0;
++        }
++        const auto t2 = std::chrono::steady_clock::now();
++        static int slow_logged = 0;
++        if (t2 - t0 > std::chrono::milliseconds(100) && slow_logged < 20) {
++            ++slow_logged;
++            std::cerr << "[MOE_DOORBELL] slow call " << seq << " layer " << otd->layer_key() << ": publish wait "
++                      << std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() << " us, cpu "
++                      << std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count() << " us, "
++                      << _cpu_tier_misses.size() << " tier experts" << std::endl;
++        }
++        // The last write of the call: once `done` is up the enqueueing thread
++        // may reach this layer again (the next step), so nothing of this
++        // impl is touched after it. The fence orders the row writes before it
++        // whatever the host mapping's memory type.
++#if defined(__x86_64__) || defined(__i386__)
++        __builtin_ia32_sfence();
++#endif
++        __atomic_store_n(&flags[16], seq, __ATOMIC_RELEASE);
++    }
++
+     // Batched GEMV path: handles token_num >= 1 with optimized GEMV kernels.
+     // Each workgroup processes one (token, expert) pair. Avoids gather/scatter/CPU-sync overhead of prefill paths.
+     // Supports shared expert: EXPERTS_PER_TOKEN = MAX_TOPK + 1 when shared expert is enabled.
+@@ -3499,8 +3758,89 @@
+         const bool device_route = device_route_on && _per_expert_dispatch && _native_tier_only &&
+                                   route_pairs < kGroupedMinPairs && _weight_provider->is_offloaded() &&
+                                   static_cast<OffloadExpertWeightProvider*>(_weight_provider.get())->identity_pool();
+-        if (device_route) {
+-            _cpu_tier_misses.clear();
++        // arcint (patch 0077, campaign tier-handoff-doorbell). MOE_DOORBELL=1:
++        // decode on a partly resident pool (the static partition, adaptive or
++        // not, with the CPU tier) routes on the device as 0067 does, through
++        // the layer's residency table, and the tier is handed its pairs
++        // through host memory and two flags instead of the blocking readback
++        // and one copy per row (Strata's doorbell; FreeToken's flag handshake).
++        static const bool doorbell_on = [] {
++            const char* v = std::getenv("MOE_DOORBELL");
++            return v != nullptr && v[0] != '\0' && std::string(v) != "0";
++        }();
++        auto* otd_db = _weight_provider->is_offloaded() ? static_cast<OffloadExpertWeightProvider*>(_weight_provider.get())
++                                                         : nullptr;
++        const bool doorbell = doorbell_on && device_route_on && !device_route && _per_expert_dispatch &&
++                              _native_tier_only && _cpu_tier && otd_db != nullptr && otd_db->static_partition() &&
++                              route_pairs <= static_cast<size_t>(kDoorbellPMax) &&
++                              token_num <= static_cast<size_t>(kDoorbellTMax);
++        uint32_t db_seq = 0;
++        if (doorbell_on) {
++            // A host half that failed on the coordinator surfaces here; a call
++            // that runs the tier on this thread waits for the coordinator first.
++            DoorbellCoordinator::get().rethrow();
++            if (!doorbell)
++                DoorbellCoordinator::get().drain();
++        }
++        if (doorbell) {
++            auto& engine = cur_net.get_engine();
++            auto host_buf = [&](memory::ptr& m, size_t bytes, allocation_type t) {
++                if (!m) {
++                    auto layout = cldnn::layout({1, 1, 1, static_cast<ov::Dimension::value_type>(bytes)},
++                                                ov::element::i8, cldnn::format::bfyx);
++                    m = engine.allocate_memory(layout, t, false);
++                    if (t == allocation_type::usm_host)
++                        std::memset(m->buffer_ptr(), 0, bytes);
++                }
++            };
++            const size_t ne = static_cast<size_t>(cur_moe->_config.num_expert);
++            host_buf(_db_table, ne * sizeof(int32_t), allocation_type::usm_device);
++            host_buf(_db_table_host, ne * sizeof(int32_t), allocation_type::usm_host);
++            host_buf(_db_pub, (2 * kDoorbellPMax) * sizeof(int32_t) +
++                                  (kDoorbellPMax + static_cast<size_t>(kDoorbellTMax) * _hidden_size) * sizeof(uint16_t),
++                     allocation_type::usm_host);
++            host_buf(_db_flags, 32 * sizeof(uint32_t), allocation_type::usm_host);
++            host_buf(_db_rows, (1 + kDoorbellPMax) * sizeof(uint32_t), allocation_type::usm_host);
++            host_buf(_db_yhost, static_cast<size_t>(kDoorbellPMax) * _hidden_size * sizeof(uint16_t),
++                     allocation_type::usm_host);
++            host_buf(_db_status, 16 * sizeof(uint32_t), allocation_type::usm_host);
++            // First use on this thread, not inside a job the GPU is waiting
++            // on: the bank (it may allocate its whole budget), its fill, the
++            // lookahead's router file, the tier's host scratch.
++            if (!_cpu_bank_resolved) {
++                _cpu_bank = cpu_tier_bank(otd_db->weight_reader().path().string(), &engine);
++                otd_db->set_host_bank(_cpu_bank);
++                _cpu_bank_resolved = true;
++            }
++            if (_cpu_bank && !_cpu_bank_fill_queued) {
++                queue_cpu_bank_fill(instance, *otd_db);
++                _cpu_bank_fill_queued = true;
++            }
++            (void)RouterLookahead::get(otd_db->weight_reader().path().string(), static_cast<uint32_t>(_hidden_size),
++                                       static_cast<uint32_t>(cur_moe->_config.num_expert));
++            ensure_cpu_host_scratch(engine, _cpu_x_host_mem, _cpu_x_host_capacity,
++                                    static_cast<size_t>(kDoorbellTMax) * _hidden_size * sizeof(uint16_t));
++            ensure_cpu_host_scratch(engine, _cpu_rw_host_mem, _cpu_rw_host_capacity, kDoorbellPMax * sizeof(uint16_t));
++            // The swaps first, on this stream, then the table they leave; the
++            // copy is ordered before the route kernel by the in-order queue.
++            // Pinned slots never filled (native formats fill on first use,
++            // which the doorbell's decode does not reach) are read in the
++            // background, at most 8 at a time a layer, and copied in when
++            // ready.
++            otd_db->doorbell_apply_swaps(stream);
++            otd_db->doorbell_fill_unfilled(stream, 8);
++            std::vector<int32_t> table;
++            otd_db->residency_table(table);
++            if (table != _db_table_last) {
++                std::memcpy(_db_table_host->buffer_ptr(), table.data(), table.size() * sizeof(int32_t));
++                _db_table->copy_from(stream, _db_table_host->buffer_ptr(), 0, 0, table.size() * sizeof(int32_t), false);
++                _db_table_last = std::move(table);
++            }
++            db_seq = ++_db_seq;
++        }
++        if (device_route || doorbell) {
++            if (!doorbell)
++                _cpu_tier_misses.clear();  // under the doorbell the coordinator owns it
+             _gpu_dispatches.clear();  // the host-built branches below stay off
+             if (!_route_sentinels) {
+                 const size_t max_pairs = kGroupedMinPairs - 1;
+@@ -3527,8 +3867,8 @@
+         if (scratch._expert_index_buffer) {
+             batch_mem_ptr = scratch._expert_index_buffer;
+         }
+-        if (device_route)
+-            batch_mem_ptr = _route_sentinels;  // arcint (patch 0067)
++        if (device_route || doorbell)
++            batch_mem_ptr = _route_sentinels;  // arcint (patches 0067, 0077)
+ 
+         // gate
+         const auto& mlp_gate_wei_mem = scratch.moe_fusion_wei_addr.weight[0];
+@@ -3679,9 +4019,11 @@
+                 }
+                 return tiles;
+             };
+-            if (device_route) {
++            if (device_route || doorbell) {
+                 // arcint (patch 0067): the table from topk_id on the device, then
+                 // the decode kernels the host path runs for this call size.
++                // arcint (patch 0077): under the doorbell the route reads the
++                // residency table and publishes the call to host memory.
+                 auto hs_mem = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
+                 const auto& w = instance._weights;
+                 if (!_route_pairs) {
+@@ -3690,15 +4032,27 @@
+                                                 ov::element::i8, cldnn::format::bfyx);
+                     _route_pairs = cur_net.get_engine().allocate_memory(layout, allocation_type::usm_device, false);
+                 }
+-                execute_stage({ret_event},
+-                              instance,
+-                              *_expert_route_native_stage,
+-                              {scratch.topk_id},
+-                              {_route_pairs},
+-                              {route_pairs, 1, 1},
+-                              {1, 1, 1},
+-                              false,
+-                              {static_cast<int>(_experts_per_token), static_cast<int>(_max_topk)});
++                if (doorbell)
++                    execute_stage({ret_event},
++                                  instance,
++                                  *_doorbell_route_stage,
++                                  {scratch.topk_id, routing_mem_ptr, hs_mem, _db_table},
++                                  {_route_pairs, _db_pub, _db_flags},
++                                  {256, 1, 1},
++                                  {256, 1, 1},
++                                  false,
++                                  {static_cast<int>(_experts_per_token), static_cast<int>(_max_topk),
++                                   static_cast<int>(route_pairs), static_cast<int>(token_num), static_cast<int>(db_seq)});
++                else
++                    execute_stage({ret_event},
++                                  instance,
++                                  *_expert_route_native_stage,
++                                  {scratch.topk_id},
++                                  {_route_pairs},
++                                  {route_pairs, 1, 1},
++                                  {1, 1, 1},
++                                  false,
++                                  {static_cast<int>(_experts_per_token), static_cast<int>(_max_topk)});
+                 if (_gu_dpas)
+                     execute_stage({ret_event},
+                                   instance,
+@@ -3730,7 +4084,8 @@
+                               {static_cast<int>(_experts_per_token), static_cast<int>(_max_topk)});
+                 if (auto* perf = moe_otd::get_perf_counters()) {
+                     perf->per_expert_gpu_invocations.fetch_add(2, std::memory_order_relaxed);
+-                    perf->device_routed_calls.fetch_add(1, std::memory_order_relaxed);
++                    if (device_route)
++                        perf->device_routed_calls.fetch_add(1, std::memory_order_relaxed);
+                 }
+             }
+             // arcint (patch 0064): gate/up on the matrix unit, whatever the mode.
+@@ -3889,7 +4244,20 @@
+             // sums all EXPERTS_PER_TOKEN rows. No-op (returns immediately) when
+             // _cpu_tier_misses is empty, which is every step until a capacity
+             // miss actually occurs.
+-            cpu_tier_join(stream, scratch, instance);
++            if (!doorbell)
++                cpu_tier_join(stream, scratch, instance);
++            // arcint (patch 0077): the CPU tier's rows, once the host rings.
++            if (doorbell)
++                execute_stage({ret_event},
++                              instance,
++                              *_doorbell_wait_stage,
++                              {_db_flags, _db_rows, _db_yhost},
++                              {scratch.y, _db_status},
++                              {256, 1, 1},
++                              {256, 1, 1},
++                              false,
++                              {static_cast<int>(db_seq), 1000000,
++                               static_cast<int>(token_num * static_cast<size_t>(_experts_per_token))});
+ 
+             // Per-token reduction: final[t] = sum(scratch.y[t * REDUCE_COUNT .. (t+1) * REDUCE_COUNT - 1])
+             ret = execute_stage({ret_event},
+@@ -3900,6 +4268,25 @@
+                                 {token_num, static_cast<size_t>(_hidden_size)},
+                                 {1, std::min(max_work_group_size, size_t{1024})},
+                                 instance.needs_completion_event());
++            // arcint (patch 0077): the whole call is on the queue; now the
++            // host's half, while the GPU runs its experts.
++            if (doorbell) {
++                stream.flush();
++                auto* flags = static_cast<uint32_t*>(_db_flags->buffer_ptr());
++                void* rows_ptr = _db_rows->buffer_ptr();
++                DoorbellCoordinator::get().push([this, &instance, token_num, route_pairs, seq = db_seq, flags, rows_ptr] {
++                    try {
++                        doorbell_host(instance, token_num, route_pairs, seq);
++                    } catch (...) {
++                        DoorbellCoordinator::get().fail(std::current_exception());
++                        // No rows, and the poison word: the wait kernel writes
++                        // NaN rows for this call instead of merging stale ones.
++                        static_cast<uint32_t*>(rows_ptr)[0] = 0;
++                        __atomic_store_n(&flags[17], seq, __ATOMIC_RELEASE);
++                        __atomic_store_n(&flags[16], seq, __ATOMIC_RELEASE);  // never leave the GPU waiting
++                    }
++                });
++            }
+         }
+         return ret;
+     }
+@@ -4944,6 +5331,13 @@
+         auto& stream = cur_net.get_stream();
+ 
+         OPENVINO_ASSERT(_weight_provider, "expert weight provider not initialized");
++        // arcint (patch 0077). A failed doorbell job surfaces here, and this
++        // impl's previous job must have rung before its state is touched.
++        if (_db_flags) {
++            DoorbellCoordinator::get().rethrow();
++            if (__atomic_load_n(&static_cast<uint32_t*>(_db_flags->buffer_ptr())[16], __ATOMIC_ACQUIRE) < _db_seq)
++                DoorbellCoordinator::get().drain();
++        }
+ 
+         cldnn::event::ptr ret_env = nullptr;
+         _has_shared_expert = (config.num_shared_expert > 0);
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+@@ -221,10 +221,29 @@
+     bool adaptive() const { return _adaptive; }
+     std::vector<float>& adaptive_usage() { return _adaptive_usage; }
+     void queue_adaptive_swap(uint32_t out, uint32_t in);
++    // arcint (patch 0077, campaign tier-handoff-doorbell). The doorbell's
++    // decode path decides each pair's device on the GPU, so the host's part
++    // is split out of try_acquire_simultaneous: apply the ready swaps (before
++    // the route kernel is enqueued, on the compute stream), write the
++    // residency table the route reads (expert -> slot for a filled pinned
++    // slot, -1 otherwise), and count the routed ids (decode usage, the
++    // adaptive tick).
++    void doorbell_apply_swaps(cldnn::stream& stream) {
++        if (_adaptive && _static_partition)
++            apply_ready_adaptive_swaps(stream);
++    }
++    void residency_table(std::vector<int32_t>& table) const;
++    // Fills up to `max` pinned slots that hold no bytes yet (on `stream`).
++    void doorbell_fill_unfilled(cldnn::stream& stream, size_t max);
++    void doorbell_count(const int32_t* ids, size_t n);
++
+     // The CPU tier's host bank (moe_3gemm_swiglu_opt.cpp): each applied swap
+     // exchanges the newcomer's bank slot for the demoted expert.
+     void set_host_bank(HostExpertBank* bank) { _host_bank = bank; }
+-    bool adaptive_busy() const { return !_adaptive_pending.empty(); }
++    bool adaptive_busy() const {
++        std::lock_guard<std::mutex> lock(_adaptive_mutex);
++        return !_adaptive_pending.empty() || _adaptive_applying;
++    }
+ 
+     // arcint (patch 0048). The collect-time handshake the design note §3.4
+     // requires: an expert whose bytes have landed is marked filled in the
+@@ -301,6 +320,7 @@
+     // needs the host to see the ids: a decode call may then route on the device
+     // (exec_batched_gemv, moe_3gemm_swiglu_opt.cpp).
+     bool identity_pool() const { return _identity_pool && !_routing_trace_enabled && !_routing_hist_enabled; }
++    bool static_partition() const { return _static_partition; }
+ 
+ private:
+     size_t _capacity = 0;
+@@ -359,6 +379,11 @@
+     bool _adaptive = false;
+     std::vector<float> _adaptive_usage;
+     std::vector<std::pair<uint32_t, uint32_t>> _adaptive_pending;  // (out, in)
++    // patch 0077: under the doorbell the coordinator thread queues swaps
++    // (the tick) while the enqueueing thread applies them.
++    mutable std::mutex _adaptive_mutex;
++    bool _adaptive_applying = false;  // apply_ready_adaptive_swaps holds the list
++    std::vector<uint32_t> _fill_pending;  // never-filled pinned experts being read (enqueueing thread only)
+     std::shared_ptr<moe_otd::AdaptivePrep> _adaptive_prep;
+     HostExpertBank* _host_bank = nullptr;
+     // See bind(): (file offset of expert 0, bytes per expert) per span.
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+@@ -1111,9 +1111,15 @@
+             perf->adaptive_swaps_dropped.fetch_add(1, std::memory_order_relaxed);
+         return;
+     }
+-    if (!_adaptive_prep)
+-        _adaptive_prep = std::make_shared<moe_otd::AdaptivePrep>();
+-    _adaptive_pending.emplace_back(out, in);
++    {
++        std::lock_guard<std::mutex> lock(_adaptive_mutex);
++        for (const auto& p : _adaptive_pending)
++            if (p.second == in)
++                return;  // already on its way in
++        if (!_adaptive_prep)
++            _adaptive_prep = std::make_shared<moe_otd::AdaptivePrep>();
++        _adaptive_pending.emplace_back(out, in);
++    }
+     AdaptiveReadPool::get().submit([prep = _adaptive_prep, config = _config, path = _weight_reader.path(),
+                                     plans = std::move(plans), in] {
+         std::vector<moe_otd::PreparedTensor> tensors;
+@@ -1130,6 +1136,86 @@
+     });
+ }
+ 
++void OffloadExpertWeightProvider::residency_table(std::vector<int32_t>& table) const {
++    table.assign(_config.num_expert, -1);
++    for (const auto& [e, slot] : _cache->pinned_residents())
++        if (e < table.size() && _cache->contains_filled(e))
++            table[e] = static_cast<int32_t>(slot);
++}
++
++void OffloadExpertWeightProvider::doorbell_fill_unfilled(cldnn::stream& stream, size_t max) {
++    // The same non-blocking path as a swap's newcomer: the readers prepare the
++    // bytes, and a slot is copied (no wait) and marked filled only once they
++    // are ready. Measured: filling synchronously here cost the first decode
++    // tokens 7 s (2,372 tensor loads) on the B60. Until then the expert stays
++    // on the CPU tier, as the residency table says.
++    if (_resident == nullptr || max == 0)
++        return;
++    if (!_adaptive_prep)
++        _adaptive_prep = std::make_shared<moe_otd::AdaptivePrep>();
++    auto prep = _adaptive_prep;
++    {
++        std::lock_guard<std::mutex> lock(prep->mutex);
++        for (auto it = _fill_pending.begin(); it != _fill_pending.end();) {
++            auto r = prep->ready.find(*it);
++            if (r != prep->ready.end()) {
++                const auto probed = _cache->probe(*it);
++                if (probed.first != LRUCache::kProbeMiss && !probed.second &&
++                    moe_otd::enqueue_expert_tensors(stream, *_resident, r->second, probed.first, _adaptive_upload))
++                    _cache->set_filled(probed.first);
++                prep->ready.erase(r);
++                it = _fill_pending.erase(it);
++            } else if (prep->failed.erase(*it) != 0) {
++                it = _fill_pending.erase(it);
++            } else {
++                ++it;
++            }
++        }
++    }
++    for (const auto& [e, slot] : _cache->pinned_residents()) {
++        if (_fill_pending.size() >= max)
++            break;
++        const uint32_t ex = static_cast<uint32_t>(e);
++        if (_cache->contains_filled(e) ||
++            std::find(_fill_pending.begin(), _fill_pending.end(), ex) != _fill_pending.end())
++            continue;
++        auto plans = moe_otd::plan_expert_tensors(_config, _weight_bin_offsets, *_resident, ex);
++        if (plans.empty())
++            continue;
++        _fill_pending.push_back(ex);
++        AdaptiveReadPool::get().submit([prep, config = _config, path = _weight_reader.path(), plans = std::move(plans), ex] {
++            std::vector<moe_otd::PreparedTensor> tensors;
++            try {
++                tensors = moe_otd::read_expert_tensors(config, path, plans);
++            } catch (...) {
++                tensors.clear();
++            }
++            std::lock_guard<std::mutex> lock(prep->mutex);
++            if (tensors.size() == plans.size())
++                prep->ready[ex] = std::move(tensors);
++            else
++                prep->failed.insert(ex);
++        });
++    }
++}
++
++void OffloadExpertWeightProvider::doorbell_count(const int32_t* ids, size_t n) {
++    if (_routing_trace_enabled) {
++        std::vector<uint32_t> v(ids, ids + n);
++        otd_trace_append(_routing_trace_path, layer_key(), _config.top_k, v);
++    }
++    if (_routing_hist_enabled)
++        for (size_t i = 0; i < n; ++i)
++            if (ids[i] >= 0 && static_cast<size_t>(ids[i]) < _routing_hist.size())
++                ++_routing_hist[ids[i]];
++    if (!(_adaptive && _static_partition) || n > static_cast<size_t>(_config.top_k))
++        return;
++    for (size_t i = 0; i < n; ++i)
++        if (ids[i] >= 0 && static_cast<size_t>(ids[i]) < _adaptive_usage.size())
++            _adaptive_usage[ids[i]] += 1.0f;
++    otd_adaptive_tick(this);
++}
++
+ int OffloadExpertWeightProvider::expert_file_spans(uint32_t expert, BankSpan* spans) const {
+     if (!_spans_ready.load(std::memory_order_acquire))
+         return 0;
+@@ -1162,15 +1248,28 @@
+ }
+ 
+ void OffloadExpertWeightProvider::apply_ready_adaptive_swaps(cldnn::stream& stream) {
+-    if (_adaptive_pending.empty() || !_adaptive_prep || _resident == nullptr)
++    std::vector<std::pair<uint32_t, uint32_t>> pending;
++    std::shared_ptr<moe_otd::AdaptivePrep> prep;
++    {
++        std::lock_guard<std::mutex> lock(_adaptive_mutex);
++        pending.swap(_adaptive_pending);
++        prep = _adaptive_prep;
++        _adaptive_applying = true;  // the tick must not plan meanwhile (Strata's rule)
++    }
++    if (pending.empty() || !prep || _resident == nullptr) {
++        std::lock_guard<std::mutex> lock(_adaptive_mutex);
++        pending.insert(pending.end(), _adaptive_pending.begin(), _adaptive_pending.end());
++        _adaptive_pending.swap(pending);
++        _adaptive_applying = false;
+         return;
++    }
+     auto* perf = moe_otd::get_perf_counters();
+     std::vector<std::pair<uint32_t, uint32_t>> waiting;
+-    std::lock_guard<std::mutex> lock(_adaptive_prep->mutex);
+-    for (const auto& [out, in] : _adaptive_pending) {
+-        auto it = _adaptive_prep->ready.find(in);
+-        if (it == _adaptive_prep->ready.end()) {
+-            if (_adaptive_prep->failed.erase(in) != 0) {
++    std::lock_guard<std::mutex> lock(prep->mutex);
++    for (const auto& [out, in] : pending) {
++        auto it = prep->ready.find(in);
++        if (it == prep->ready.end()) {
++            if (prep->failed.erase(in) != 0) {
+                 if (perf)
+                     perf->adaptive_swaps_dropped.fetch_add(1, std::memory_order_relaxed);
+             } else {
+@@ -1179,7 +1278,7 @@
+             continue;
+         }
+         auto tensors = std::move(it->second);
+-        _adaptive_prep->ready.erase(it);
++        prep->ready.erase(it);
+         const auto slot = _cache->replace_pinned(out, in);
+         if (!slot) {
+             if (perf)
+@@ -1204,7 +1303,11 @@
+         if (perf)
+             perf->adaptive_swaps_applied.fetch_add(1, std::memory_order_relaxed);
+     }
++    // Swaps still being read go back in front of any queued meanwhile.
++    std::lock_guard<std::mutex> plock(_adaptive_mutex);
++    waiting.insert(waiting.end(), _adaptive_pending.begin(), _adaptive_pending.end());
+     _adaptive_pending.swap(waiting);
++    _adaptive_applying = false;
+ }
+ 
+ std::optional<size_t> OffloadExpertWeightProvider::acquire_one(uint32_t expert, cldnn::stream& stream) {
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
+@@ -73,6 +73,11 @@
+     std::atomic<uint64_t> lookahead_skipped{0};
+     std::atomic<uint64_t> lookahead_warmed{0};
+     std::atomic<uint64_t> lookahead_ns{0};
++    // arcint (patch 0077). Doorbell calls and the host's spin until the route
++    // kernel published (the GPU's lead over the host, or its lag).
++    std::atomic<uint64_t> doorbell_calls{0};
++    std::atomic<uint64_t> doorbell_publish_wait_ns{0};
++    std::atomic<uint64_t> doorbell_wait_timeouts{0};
+     // Decode-only expert resolutions under the static partition (calls with
+     // at most top_k ids): the hit share the adaptive cache is meant to raise,
+     // without prefill diluting it.
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+@@ -79,6 +79,9 @@
+                    << ", lookahead_skipped=" << lookahead_skipped.load(std::memory_order_relaxed)
+                    << ", lookahead_warmed=" << lookahead_warmed.load(std::memory_order_relaxed)
+                    << ", lookahead_ms=" << lookahead_ns.load(std::memory_order_relaxed) / 1000000
++                   << ", doorbell_calls=" << doorbell_calls.load(std::memory_order_relaxed)
++                   << ", doorbell_publish_wait_ms=" << doorbell_publish_wait_ns.load(std::memory_order_relaxed) / 1000000
++                   << ", doorbell_wait_timeouts=" << doorbell_wait_timeouts.load(std::memory_order_relaxed)
+                    << ", decode_hits=" << decode_hits.load(std::memory_order_relaxed)
+                    << ", decode_lookups=" << decode_lookups.load(std::memory_order_relaxed)
+                    << ", decode_tier_layers=" << decode_tier_layers.load(std::memory_order_relaxed)
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_offload_weight_provider_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/moe_offload_weight_provider_test.cpp
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_offload_weight_provider_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_offload_weight_provider_test.cpp
+@@ -461,3 +461,25 @@
+     run(heap.data(), "heap");
+     run(static_cast<const uint8_t*>(host->buffer_ptr()), "usm_host");
+ }
++
++// arcint (patch 0077). The doorbell's residency table: a filled pinned slot
++// maps its expert to the slot, an unfilled one and a non-resident expert to
++// -1 (the route kernel's CPU-tier mark).
++TEST(moe_expert_weight_provider, doorbell_residency_table_marks_only_filled_pinned_slots) {
++    MOECompressed::Config config{};
++    config.num_expert = 8;
++    OffloadExpertWeightProvider provider(/*capacity=*/3, config, {0, 100, 200, 300}, "/nonexistent");
++    cldnn::moe_weights resident{};
++    provider.bind(resident);
++    auto& cache = provider.cache();
++    cache.reserve_pinned(5, 0);
++    cache.reserve_pinned(2, 1);
++    cache.reserve_pinned(7, 2);
++    cache.set_filled(0);  // expert 5
++    cache.set_filled(2);  // expert 7; expert 2's slot 1 stays unfilled
++    std::vector<int32_t> table;
++    provider.residency_table(table);
++    ASSERT_EQ(table.size(), 8u);
++    const std::vector<int32_t> want = {-1, -1, -1, -1, -1, 0, -1, 2};
++    ASSERT_EQ(table, want);
++}
