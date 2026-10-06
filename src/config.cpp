@@ -425,6 +425,9 @@ std::string usage_text() {
         "  --llama-mtp-vocab FILE    libllama: the token ids the MTP head may draft\n"
         "                            (int32, or a JSON list): a draft step reads only\n"
         "                            those rows of the output head\n"
+        "  --llama-mtp-gguf FILE     libllama: the MTP layer from this MTP-only GGUF\n"
+        "                            (llama.cpp's converter --mtp) instead of the\n"
+        "                            model's own file\n"
         "  --llama-checkpoints N     libllama: per lane, up to N snapshots of a hybrid\n"
         "                            model's recurrent state (near the prompt's end,\n"
         "                            at user messages), so a follow-up or an edited\n"
@@ -504,6 +507,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--llama-expert-profile") {
             if (!value(v)) return fail("--llama-expert-profile needs a profile file");
             cfg.llama_expert_profile = std::string(v);
+        } else if (arg == "--llama-mtp-gguf") {
+            if (!value(v)) return fail("--llama-mtp-gguf needs an MTP-only GGUF");
+            cfg.llama_mtp_gguf = std::string(v);
         } else if (arg == "--llama-mtp-vocab") {
             if (!value(v)) return fail("--llama-mtp-vocab needs a file of token ids");
             cfg.llama_mtp_vocab = std::string(v);
@@ -976,15 +982,17 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.engine == "llama") {
         if (cfg.gguf_path.empty()) return fail("--engine llama serves a GGUF: give --gguf");
         if (!cfg.llama_mtp_vocab.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-vocab needs --llama-mtp");
+        if (!cfg.llama_mtp_gguf.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-gguf needs --llama-mtp");
         if (cfg.llama_expert_cache_mib > 0 && cfg.llama_cpu_moe <= 0)
             return fail("--llama-expert-cache caches experts --llama-cpu-moe keeps in host memory: give --llama-cpu-moe");
         if (!cfg.llama_expert_profile.empty() && cfg.llama_expert_cache_mib <= 0)
             return fail("--llama-expert-profile needs --llama-expert-cache");
     } else {
     if (cfg.llama_cpu_moe > 0 || cfg.llama_threads > 0 || cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty() ||
+        !cfg.llama_mtp_gguf.empty() ||
         cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192 ||
         cfg.llama_expert_cache_mib > 0 || !cfg.llama_expert_profile.empty())
-        return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab, --llama-kv, --llama-checkpoints/-step "
+        return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab/-gguf, --llama-kv, --llama-checkpoints/-step "
                     "and --llama-expert-cache/-profile are --engine llama options");
     if (!cfg.gguf_path.empty() && cfg.model_path.empty()) return fail("--gguf needs --model (the template IR directory)");
     if (!cfg.gguf_path.empty() && !cfg.paged) return fail("--gguf serves on the paged path only");

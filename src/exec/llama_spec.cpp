@@ -218,6 +218,16 @@ public:
         }
         n_embd_  = llama_model_n_embd_out(model);
         n_vocab_ = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        // an MTP-only file (--llama-mtp-gguf) must take the target's rows and
+        // speak its vocabulary (llama.cpp asserts the same, common/speculative.cpp)
+        const llama_model* tgt = llama_get_model(ctx_tgt);
+        if (n_embd_ != llama_model_n_embd_out(tgt) ||
+            n_vocab_ != llama_vocab_n_tokens(llama_model_get_vocab(tgt))) {
+            err = log::format("the MTP layer (rows %d, vocabulary %d) does not match the model (rows %d, vocabulary %d)",
+                              n_embd_, n_vocab_, llama_model_n_embd_out(tgt),
+                              llama_vocab_n_tokens(llama_model_get_vocab(tgt)));
+            return;
+        }
         llama_context_params cp = llama_context_default_params();
         cp.ctx_type        = LLAMA_CONTEXT_TYPE_MTP;
         cp.n_ctx           = llama_n_ctx(ctx_tgt);

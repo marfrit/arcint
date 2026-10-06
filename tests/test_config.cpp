@@ -1089,6 +1089,17 @@ TEST(config_llama_cpu_moe_and_threads) {
     }
     {
         Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp", "3", "--llama-mtp-gguf", "/m/mtp.gguf"};
+        CHECK(parse_args(7, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_mtp_gguf, std::string("/m/mtp.gguf"));
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp-gguf", "/m/mtp.gguf"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // an MTP file without drafts
+    }
+    {
+        Config cfg;
         const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp", "8"};
         CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // a verify of 9 rows: the decode attention takes up to 8
     }

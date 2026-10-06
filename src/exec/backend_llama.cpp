@@ -146,7 +146,8 @@ public:
 
         llama_model_params mp = llama_model_default_params();
         mp.n_gpu_layers       = 999;
-        mp.load_mtp           = cfg.llama_mtp > 0;   // the GGUF's MTP layer, for --llama-mtp
+        // the GGUF's MTP layer, for --llama-mtp (unless --llama-mtp-gguf brings it)
+        mp.load_mtp           = cfg.llama_mtp > 0 && cfg.llama_mtp_gguf.empty();
         // --llama-expert-cache: slots on the card for the experts --llama-cpu-moe
         // keeps in host memory (contrib/llama.cpp patch 0021)
 #ifdef ARCINT_LLAMA_EXPERT_CACHE
@@ -248,9 +249,24 @@ public:
         ctx_               = llama_init_from_model(model_, cp);
         if (ctx_ == nullptr) throw std::runtime_error("llama.cpp could not create a context");
         if (cfg.llama_mtp > 0) {
+            // --llama-mtp-gguf: the MTP block (with its own embeddings and LM
+            // head) as a second model, as llama.cpp loads an MTP-only file
+            // for draft-mtp (common/arg.cpp, speculative.draft.mparams);
+            // every tensor on the card
+            llama_model* mtp_model = model_;
+            if (!cfg.llama_mtp_gguf.empty()) {
+                llama_model_params dp = llama_model_default_params();
+                dp.n_gpu_layers       = 999;
+                dp.load_mtp           = true;
+                mtp_model_            = llama_model_load_from_file(cfg.llama_mtp_gguf.c_str(), dp);
+                if (mtp_model_ == nullptr)
+                    throw std::runtime_error(log::format("llama.cpp could not load %s", cfg.llama_mtp_gguf.c_str()));
+                mtp_model = mtp_model_;
+            }
             std::string err;
-            spec_ = make_llama_mtp(model_, ctx_, cfg.llama_mtp, lanes_, n_batch_, static_cast<int>(cp.n_ubatch),
-                                   threads, cfg.gguf_path, cfg.llama_mtp_vocab, cp.type_k, cp.type_v, err);
+            spec_ = make_llama_mtp(mtp_model, ctx_, cfg.llama_mtp, lanes_, n_batch_, static_cast<int>(cp.n_ubatch),
+                                   threads, cfg.llama_mtp_gguf.empty() ? cfg.gguf_path : cfg.llama_mtp_gguf,
+                                   cfg.llama_mtp_vocab, cp.type_k, cp.type_v, err);
             if (!spec_) throw std::runtime_error(log::format("--llama-mtp %d: %s", cfg.llama_mtp, err.c_str()));
             n_draft_ = cfg.llama_mtp;
         }
@@ -308,6 +324,7 @@ public:
     ~LlamaBackend() override {
         spec_.reset();   // its draft context reads the target's
         if (ctx_ != nullptr) llama_free(ctx_);
+        if (mtp_model_ != nullptr) llama_model_free(mtp_model_);
         if (model_ != nullptr) llama_model_free(model_);
     }
 
@@ -827,6 +844,7 @@ private:
     std::vector<std::string>                       cpu_moe_patterns_;
     std::vector<llama_model_tensor_buft_override> buft_overrides_;
     llama_model*                          model_ = nullptr;
+    llama_model*                          mtp_model_ = nullptr;   // --llama-mtp-gguf
     llama_context*                        ctx_   = nullptr;
     const llama_vocab*                    vocab_ = nullptr;
     std::unique_ptr<LlamaTokenizer>       tokenizer_;

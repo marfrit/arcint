@@ -32,6 +32,10 @@ struct Config {
     // or a JSON list); the draft steps then read those rows of the output
     // head instead of all of them
     std::string llama_mtp_vocab;
+    // --llama-mtp-gguf FILE: the MTP layer from a separate MTP-only GGUF
+    // (llama.cpp's converter --mtp: the MTP block, the embeddings and the
+    // LM head) instead of the model's own file
+    std::string llama_mtp_gguf;
     // --llama-kv K[:V]: the libllama engine's attention cache types, f16,
     // q8_0 or q8_0:q4_0 (V defaults to K). Quantized K/V run on the Intel
     // attention kernels of contrib/llama.cpp 0015.
