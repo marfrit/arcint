@@ -18,11 +18,11 @@
 #
 # Build from the REPO ROOT (needs the tier-1 image built or pulled):
 #   docker build -t arcint:dev \
-#     --build-arg OV_BASE=arcint-ov:2026.4.0-ov71640275d29-marfrit-p27 \
+#     --build-arg OV_BASE=arcint-ov:2026.4.0-ov71640275-marfrit-p27 \
 #     -f docker/Dockerfile.arcint .
 # ---------------------------------------------------------------------------
 
-ARG OV_BASE=arcint-ov:2026.4.0-ov71640275d29-marfrit-p27
+ARG OV_BASE=arcint-ov:2026.4.0-ov71640275-marfrit-p27
 
 # --- builder ---------------------------------------------------------------
 FROM ${OV_BASE} AS builder

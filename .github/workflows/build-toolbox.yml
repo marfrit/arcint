@@ -9,7 +9,7 @@
 #
 # Images produced (OWNER is the lowercase repo owner, so this works from a
 # fork without edits):
-#   ghcr.io/<OWNER>/arcint-ov:2026.4.0-ov71640275d29-marfrit-p27   tier 1
+#   ghcr.io/<OWNER>/arcint-ov:2026.4.0-ov71640275-marfrit-p27   tier 1
 #   ghcr.io/<OWNER>/arcint:<immutable ts>                            tier 2
 #   ghcr.io/<OWNER>/arcint:edge                                      tier 2, moving
 #

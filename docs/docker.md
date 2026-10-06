@@ -29,12 +29,12 @@ From the repo root:
 
 ```bash
 # tier 1 — the patched OpenVINO base
-docker build -t arcint-ov:2026.4.0-ov71640275d29-marfrit-p27 \
+docker build -t arcint-ov:2026.4.0-ov71640275-marfrit-p27 \
   -f docker/Dockerfile.openvino-patched .
 
 # tier 2 — the engine on top of it
 docker build -t arcint:local \
-  --build-arg OV_BASE=arcint-ov:2026.4.0-ov71640275d29-marfrit-p27 \
+  --build-arg OV_BASE=arcint-ov:2026.4.0-ov71640275-marfrit-p27 \
   -f docker/Dockerfile.arcint .
 ```
 
@@ -49,8 +49,12 @@ from `GITHUB_REPOSITORY_OWNER`.
 The tier-1 tag is the OpenVINO pin plus the package level the recipe is at:
 
 ```
-2026.4.0-ov71640275d29-marfrit-p27
+2026.4.0-ov71640275-marfrit-p27
 ```
+
+The `ov71640275` component is the recipe's `PIN` verbatim — eight hex
+characters, as `build-openvino.sh` names it. The full 40-char commit the
+image was actually built from is in the `ai.arcint.ov.pin` label.
 
 The level is a usable identity. It was not for a while — builds of
 0044–0067 kept the `marfrit-p19` stamp, which is also 0003–0043's, so one

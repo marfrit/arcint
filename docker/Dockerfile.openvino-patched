@@ -20,7 +20,7 @@
 # ab19b09 and the whole series parses clean now.
 #
 # Build from the REPO ROOT:
-#   docker build -t arcint-ov:2026.4.0-ov71640275d29-marfrit-p27 \
+#   docker build -t arcint-ov:2026.4.0-ov71640275-marfrit-p27 \
 #     -f docker/Dockerfile.openvino-patched .
 # ---------------------------------------------------------------------------
 
