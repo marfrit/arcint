@@ -203,6 +203,15 @@ Measured (`measured-here`, B60, the GGUF on NVMe, 12,800 MiB of slots:
   prefills at **235.0 t/s** (2,048, the default chunk) and 258.4 t/s
   (`--prefill-chunk 4096`), decode 12.2 / 12.0 t/s, answered both times
   (`measured-here`, B60, 32,768 context).
+- **One branch in decode**: a decode ubatch (up to 8 tokens) runs the slot
+  tensors alone. One table maps an expert to its slot, or to n_slots + its
+  bank entry. The backend gathers the bank experts into the mirror, and the
+  IQ matvec reads an id at or above n_slots there. The two-branch graph
+  stays for prefill (the GEMM path) and for the Q8_0 down projections. Decode
+  12.2 -> 12.4-12.6 t/s, prefill 233.9 t/s, answered (`measured-here`).
+  What decode spends now is mostly the ~25 % of routed experts read over the
+  link (~120 a token, ~264 MB): more slots (the Q8_0 banks off the card: 3.2
+  GB) or a better hit rate are the next levers.
 
 Deviations from the references:
 - No share of the misses on the CPU (Strata computes the rest concurrently):

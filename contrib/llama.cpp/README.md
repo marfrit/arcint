@@ -1195,7 +1195,10 @@ ggml-opencl:
 - the kq MoE kernels skip a pair whose id is -1 (the matvec writes its zeros,
   the GEMM's tile router drops it after a zero fill of a cache tensor's
   output); a gather kernel copies the routed experts from a USM bank into a
-  card-side mirror before the kernels run.
+  card-side mirror before the kernels run;
+- the IQ matvec's trailing arguments (a mirror and a split): for a slot
+  tensor paired with its bank, ids at or above the split read the mirror, so
+  a decode step runs one branch (INT_MAX: off).
 
 ggml-cpu: `MUL_MAT_ID` leaves a row zero for a negative id (both grouping
 loops); unused by 0021's final design, kept for a CPU branch. The K-quant

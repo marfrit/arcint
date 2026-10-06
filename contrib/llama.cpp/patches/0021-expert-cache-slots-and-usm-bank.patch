@@ -35,18 +35,19 @@ index 2632ae3..8ceec1c 100644
  
                      MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = { id, iid1 };
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 9c3baa2..362dff4 100644
+index 9c3baa2..62accdf 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -40,6 +40,7 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
+@@ -40,6 +40,8 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
  #include <cstdint>
  #include <fstream>
  #include <vector>
++#include <climits>
 +#include <unordered_map>
  #include <string>
  #include <cmath>
  #include <map>
-@@ -897,7 +898,7 @@ struct ggml_backend_opencl_context {
+@@ -897,7 +899,7 @@ struct ggml_backend_opencl_context {
  #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
      ggml_cl_adreno_xmem_attn_state adreno_xmem_attn;
  #endif
@@ -55,7 +56,7 @@ index 9c3baa2..362dff4 100644
      cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
      cl_kernel kernel_set_rows_q8_0_i64, kernel_set_rows_q8_0_i32;
      cl_kernel kernel_set_rows_q8_0_soa_i64, kernel_set_rows_q8_0_soa_i32;
-@@ -1023,6 +1024,9 @@ struct ggml_backend_opencl_context {
+@@ -1023,6 +1025,9 @@ struct ggml_backend_opencl_context {
          uint64_t gen = 0;
      } kq_route;
      cl_kernel kernel_moe_route_tiles = nullptr;
@@ -65,7 +66,7 @@ index 9c3baa2..362dff4 100644
      int             kq_mm_sg = 16;
      ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
      int       kq_q8_1_ndst = 4;
-@@ -1961,6 +1965,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -1961,6 +1966,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
          CL_CHECK((backend_ctx->kernel_get_rows_f32  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_f32", &err), err));
          CL_CHECK((backend_ctx->kernel_get_rows_f16  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_f16", &err), err));
          CL_CHECK((backend_ctx->kernel_get_rows_q4_0 = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_q4_0", &err), err));
@@ -73,7 +74,7 @@ index 9c3baa2..362dff4 100644
          GGML_LOG_CONT(".");
      }
  
-@@ -2516,6 +2521,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2516,6 +2522,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                      if (pass == 0) {
                          CL_CHECK((backend_ctx->kernel_kq_cvt_f32_f16 = clCreateKernel(mm_prog, "kernel_cvt_f32_f16", &err), err));
                          CL_CHECK((backend_ctx->kernel_moe_route_tiles = clCreateKernel(mm_prog, "kernel_moe_route_tiles", &err), err));
@@ -82,7 +83,7 @@ index 9c3baa2..362dff4 100644
                      }
                      if (backend_ctx->kernel_kq_cvt_f32_f16 != nullptr) {
                          for (int i = 0; i < 6; ++i) {
-@@ -9620,6 +9627,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -9620,6 +9628,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
              switch (op->src[0]->type) {
                  case GGML_TYPE_F32:
                  case GGML_TYPE_F16:
@@ -90,7 +91,7 @@ index 9c3baa2..362dff4 100644
                      return true;
                  case GGML_TYPE_Q4_0:
  #ifdef GGML_OPENCL_SOA_Q
-@@ -10138,6 +10146,17 @@ bool ggml_backend_is_opencl(ggml_backend_t backend) {
+@@ -10138,6 +10147,20 @@ bool ggml_backend_is_opencl(ggml_backend_t backend) {
  //
  // buffer
  //
@@ -104,11 +105,14 @@ index 9c3baa2..362dff4 100644
 +static ggml_cl_host_alloc_t  g_cl_host_alloc  = nullptr;
 +static ggml_cl_mem_free_t    g_cl_mem_free    = nullptr;
 +static ggml_cl_set_arg_ptr_t g_cl_set_arg_ptr = nullptr;
++// an expert cache's single branch (decode): slot tensor -> its bank and the
++// split (ids at or above it are the bank's, gathered into the mirror)
++static std::unordered_map<const ggml_tensor *, std::pair<const ggml_tensor *, int>> g_cache_pairs;
 +
  struct ggml_backend_opencl_buffer_context {
      // A buffer context can hold multiple cl_mem objects. This is for flattening
      // quantized weights and should be used with GGML_OPENCL_SMALL_ALLOC where
-@@ -10149,7 +10168,17 @@ struct ggml_backend_opencl_buffer_context {
+@@ -10149,7 +10172,17 @@ struct ggml_backend_opencl_buffer_context {
          buffer.push_back(buf);
      }
  
@@ -126,7 +130,7 @@ index 9c3baa2..362dff4 100644
          for (cl_mem buf : buffer) {
              CL_CHECK(clReleaseMemObject(buf));
          }
-@@ -10675,7 +10704,33 @@ static cl_mem ggml_cl_create_temp_download_buffer(
+@@ -10675,7 +10708,33 @@ static cl_mem ggml_cl_create_temp_download_buffer(
      return buf;
  }
  
@@ -160,7 +164,7 @@ index 9c3baa2..362dff4 100644
      ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer->buft->device->context;
      ggml_backend_opencl_context * backend_ctx = dev_ctx->backend_ctx;
  
-@@ -13580,6 +13635,11 @@ static const char * ggml_backend_opencl_buffer_type_get_name(ggml_backend_buffer
+@@ -13580,6 +13639,11 @@ static const char * ggml_backend_opencl_buffer_type_get_name(ggml_backend_buffer
      GGML_UNUSED(buffer_type);
  }
  
@@ -172,7 +176,7 @@ index 9c3baa2..362dff4 100644
  static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buffer_type, size_t size) {
      ggml_backend_opencl_context *backend_ctx = ggml_cl_init(buffer_type->device);
  
-@@ -13593,7 +13653,28 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
+@@ -13593,7 +13657,28 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
      size = std::max(size, (size_t)1);
  
      cl_int err;
@@ -202,7 +206,7 @@ index 9c3baa2..362dff4 100644
      // On Adreno X1-85 the device pool intermittently fails at hundreds of MB
      // once the heap fragments (e.g. graph-allocator compute-buffer reserve
      // after model load). Four-step retry:
-@@ -13838,11 +13919,48 @@ static ggml_backend_dev_t ggml_backend_opencl_reg_device_get(ggml_backend_reg_t
+@@ -13838,11 +13923,55 @@ static ggml_backend_dev_t ggml_backend_opencl_reg_device_get(ggml_backend_reg_t
      GGML_UNUSED(index);
  }
  
@@ -211,6 +215,10 @@ index 9c3baa2..362dff4 100644
 +static void ggml_backend_opencl_get_tensors(const ggml_tensor * const * tensors, void * const * dsts, int n);
 +static void ggml_backend_opencl_get_tensor_slices(const ggml_tensor * tensor, void * data, int64_t i2, int64_t n);
 +static void ggml_backend_opencl_exchange_slices(ggml_tensor * a, int64_t sa, ggml_tensor * b, int64_t sb);
++
++static void ggml_backend_opencl_pair_bank(const ggml_tensor * slot, const ggml_tensor * bank, int n_split) {
++    g_cache_pairs[slot] = { bank, n_split };
++}
 +
 +// an expert cache's gather mirror, allocated at load (not inside a request)
 +static void ggml_backend_opencl_reserve_gather(ggml_backend_dev_t dev, size_t q, size_t d) {
@@ -238,6 +246,9 @@ index 9c3baa2..362dff4 100644
 +    if (strcmp(name, "ggml_backend_opencl_reserve_gather") == 0) {
 +        return (void *) ggml_backend_opencl_reserve_gather;
 +    }
++    if (strcmp(name, "ggml_backend_opencl_pair_bank") == 0) {
++        return (void *) ggml_backend_opencl_pair_bank;
++    }
 +    return NULL;
 +
 +    GGML_UNUSED(reg);
@@ -252,7 +263,7 @@ index 9c3baa2..362dff4 100644
  };
  
  ggml_backend_reg_t ggml_backend_opencl_reg(void) {
-@@ -14156,6 +14274,9 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
+@@ -14156,6 +14285,9 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
          case GGML_TYPE_Q4_0:
              kernel = backend_ctx->kernel_get_rows_q4_0;
              break;
@@ -262,7 +273,7 @@ index 9c3baa2..362dff4 100644
          default:
              GGML_ASSERT(false && "not implemented");
      }
-@@ -14185,7 +14306,7 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
+@@ -14185,7 +14317,7 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
      }
  
      int nchunks = 1;
@@ -271,7 +282,7 @@ index 9c3baa2..362dff4 100644
          const int chunk_target = nth * 4;
          nchunks = (ne00 + chunk_target - 1) / chunk_target;
          nchunks = MAX(1, MIN(nchunks, 64));
-@@ -14211,6 +14332,210 @@ static bool ggml_cl_is_q8_0_soa(const ggml_tensor * tensor) {
+@@ -14211,6 +14343,210 @@ static bool ggml_cl_is_q8_0_soa(const ggml_tensor * tensor) {
      return ctx->q8_0_soa_tensors.count(key) > 0;
  }
  
@@ -482,13 +493,16 @@ index 9c3baa2..362dff4 100644
  // check if a Q4_0 tensor has been SOA'ed in set_tensor
  // we store SOA'ed tensors in a map in set_tensor, check against that map
  static bool ggml_cl_is_q4_0_soa(const ggml_tensor * tensor) {
-@@ -24391,8 +24716,41 @@ static void ggml_cl_kq_convert_src1_f16(ggml_backend_opencl_context * backend_ct
+@@ -24391,8 +24727,44 @@ static void ggml_cl_kq_convert_src1_f16(ggml_backend_opencl_context * backend_ct
  // the weight's planes in the kernels' argument order: a K-quant's flat
  // planes; IQ3_XXS / IQ4_XS as stored (buffer, byte offset, an unused scale
  // plane); IQ4_NL's flat code and scale planes
 +// set by ggml_cl_mul_mat_id_kq around a bank tensor's kernels: its experts
 +// gathered into these card-side mirrors (q, and IQ4_NL's scales in d)
 +static cl_mem g_kq_stage_q = nullptr, g_kq_stage_d = nullptr;
++// the single branch: the mirror for the matvec's trailing arguments
++static cl_mem g_kq_single_q = nullptr, g_kq_single_d = nullptr;
++static int    g_kq_single_split = 0;
 +
  static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, cl_uint & a) {
      const ggml_tensor * soa0 = src0->view_src != nullptr ? src0->view_src : src0;
@@ -524,7 +538,7 @@ index 9c3baa2..362dff4 100644
      if (src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ4_XS) {
          ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *)src0->extra;
          const cl_ulong off = e->offset + src0->view_offs;
-@@ -27255,6 +27613,68 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -27255,6 +27627,86 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
      const cl_ulong nb2  = dst->nb[2];
      const int n_vals = ne00 * ne11 * ne12;
  
@@ -542,14 +556,24 @@ index 9c3baa2..362dff4 100644
 +    // a bank in USM host memory: the routed experts into card-side mirrors first
 +    g_kq_stage_q = g_kq_stage_d = nullptr;
 +    {
-+        auto * bctx0 = (ggml_backend_opencl_buffer_context *) src0->buffer->context;
++        // the bank tensor to gather from: src0 itself (the two-branch bank), or the
++        // bank paired with a slot tensor (the single branch, decode)
++        const ggml_tensor * bank0 = src0;
++        int n_split = 0;
++        bool single = false;
++        if (!gemm) {
++            auto it = g_cache_pairs.find(src0);
++            if (it != g_cache_pairs.end()) { bank0 = it->second.first; n_split = it->second.second; single = true; }
++        }
++        auto * bctx0 = (ggml_backend_opencl_buffer_context *) bank0->buffer->context;
 +        if (bctx0->usm && backend_ctx->kernel_moe_gather_experts != nullptr) {
-+            auto gather = [&](const void * src, ggml_cl_buffer & stage, size_t per_expert) {
++            auto gather = [&](const void * src, ggml_cl_buffer & stage, size_t per_expert, int n_split) {
 +                GGML_ASSERT(per_expert % 16 == 0);
 +                stage.allocate(backend_ctx->context, per_expert * (size_t) n_expert);
 +                const cl_ulong n16 = per_expert / 16;
-+                if (n_tok == 1 && backend_ctx->kernel_moe_gather_pairs != nullptr) {
-+                    // one token: its pairs are distinct experts, a grid over the pairs
++                if (!gemm && backend_ctx->kernel_moe_gather_pairs != nullptr) {
++                    // a few tokens (a decode step, a verify): a grid over the pairs (a
++                    // repeated expert is copied twice, the same bytes)
 +                    cl_kernel kg = backend_ctx->kernel_moe_gather_pairs;
 +                    CL_CHECK(g_cl_set_arg_ptr(kg, 0, src));
 +                    CL_CHECK(clSetKernelArg(kg, 1, sizeof(cl_mem),   &stage.buffer));
@@ -558,8 +582,9 @@ index 9c3baa2..362dff4 100644
 +                    CL_CHECK(clSetKernelArg(kg, 4, sizeof(cl_ulong), &offseti));
 +                    CL_CHECK(clSetKernelArg(kg, 5, sizeof(cl_ulong), &nbi1));
 +                    CL_CHECK(clSetKernelArg(kg, 6, sizeof(int),      &n_used));
++                    CL_CHECK(clSetKernelArg(kg, 7, sizeof(int),      &n_split));
 +                    size_t g_local[2]  = { 256, 1 };
-+                    size_t g_global[2] = { 256 * 16, (size_t) n_used };
++                    size_t g_global[2] = { 256 * 16, (size_t) n_used * n_tok };
 +                    backend_ctx->enqueue_ndrange_kernel(kg, 2, g_global, g_local, dst);
 +                    return stage.buffer;
 +                }
@@ -577,22 +602,46 @@ index 9c3baa2..362dff4 100644
 +                backend_ctx->enqueue_ndrange_kernel(kg, 2, g_global, g_local, dst);
 +                return stage.buffer;
 +            };
-+            if (src0->type == GGML_TYPE_IQ4_NL) {
-+                const auto &  dq  = bctx0->usm_split.at(src0);
++            if (bank0->type == GGML_TYPE_IQ4_NL) {
++                const auto &  dq  = bctx0->usm_split.at(bank0);
 +                const size_t  bps = (size_t) ne00 * ne01 / 32;
-+                g_kq_stage_q = gather(dq.second, backend_ctx->prealloc_kq_stage_q, bps * 16);
-+                g_kq_stage_d = gather(dq.first,  backend_ctx->prealloc_kq_stage_d, bps * sizeof(ggml_fp16_t));
++                g_kq_stage_q = gather(dq.second, backend_ctx->prealloc_kq_stage_q, bps * 16, n_split);
++                g_kq_stage_d = gather(dq.first,  backend_ctx->prealloc_kq_stage_d, bps * sizeof(ggml_fp16_t), n_split);
 +            } else {
-+                ggml_tensor_extra_cl * e0 = (ggml_tensor_extra_cl *) src0->extra;
-+                g_kq_stage_q = gather((const char *) bctx0->usm + e0->offset + src0->view_offs, backend_ctx->prealloc_kq_stage_q, src0->nb[2]);
++                ggml_tensor_extra_cl * e0 = (ggml_tensor_extra_cl *) bank0->extra;
++                g_kq_stage_q = gather((const char *) bctx0->usm + e0->offset + bank0->view_offs, backend_ctx->prealloc_kq_stage_q, bank0->nb[2], n_split);
++            }
++            if (single) {
++                // the slot tensor's own weights stay the main arguments; the mirror
++                // goes in the matvec's trailing ones (below)
++                g_kq_single_q = g_kq_stage_q; g_kq_single_d = g_kq_stage_d != nullptr ? g_kq_stage_d : g_kq_stage_q;
++                g_kq_single_split = n_split;
++                g_kq_stage_q = g_kq_stage_d = nullptr;
 +            }
 +        }
 +    }
-+    struct kq_stage_reset { ~kq_stage_reset() { g_kq_stage_q = g_kq_stage_d = nullptr; } } kq_stage_reset_;
++    struct kq_stage_reset { ~kq_stage_reset() { g_kq_stage_q = g_kq_stage_d = g_kq_single_q = g_kq_single_d = nullptr; g_kq_single_split = 0; } } kq_stage_reset_;
 +
      cl_uint a = 0;
      if (!gemm) {
          ggml_cl_kq_quantize_src1(backend_ctx, src1, n_vals, dst);
+@@ -27277,6 +27729,16 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+         CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
+         const cl_ulong res = (cl_ulong)n_vals;
+         CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &res));
++        if (ti >= 3) {
++            // the IQ matvec's expert-cache arguments: the mirror and the split
++            // (INT_MAX: no single branch, the mirror never read)
++            const cl_mem q2 = g_kq_single_q != nullptr ? g_kq_single_q : extrad->data_device;
++            const cl_mem d2 = g_kq_single_d != nullptr ? g_kq_single_d : extrad->data_device;
++            const int    ns = g_kq_single_q != nullptr ? g_kq_single_split : INT_MAX;
++            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &q2));
++            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &d2));
++            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),    &ns));
++        }
+         const int rows_per_wg = backend_ctx->kq_q8_1_ndst * 4;
+         size_t global_work_size[] = { (size_t)CEIL_DIV(ne01, rows_per_wg) * 16, 4, (size_t)n_used * n_tok };
+         size_t local_work_size[]  = { 16, 4, 1 };
 diff --git a/ggml/src/ggml-opencl/kernels/get_rows.cl b/ggml/src/ggml-opencl/kernels/get_rows.cl
 index 9ae4fff..d7ab0b7 100644
 --- a/ggml/src/ggml-opencl/kernels/get_rows.cl
@@ -650,7 +699,7 @@ index 9ae4fff..d7ab0b7 100644
          global void * src0,
          ulong offset0,
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
-index 53fd3c2..806b7d5 100644
+index 53fd3c2..6e09444 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 @@ -667,7 +667,9 @@ kernel void kernel_moe_route_tiles(global const char * ids, ulong offi, ulong nb
@@ -664,7 +713,7 @@ index 53fd3c2..806b7d5 100644
          atomic_inc(&cnt[e]);
      }
      barrier(CLK_LOCAL_MEM_FENCE);
-@@ -683,11 +685,54 @@ kernel void kernel_moe_route_tiles(global const char * ids, ulong offi, ulong nb
+@@ -683,11 +685,56 @@ kernel void kernel_moe_route_tiles(global const char * ids, ulong offi, ulong nb
      }
      barrier(CLK_LOCAL_MEM_FENCE);
      for (int p = lid; p < n_pairs; p += lsz) {
@@ -704,10 +753,12 @@ index 53fd3c2..806b7d5 100644
 +// one token's routed pairs are distinct experts: group (c, p) copies chunk c of
 +// pair p's expert (a decode step; no scan of the experts)
 +kernel void kernel_moe_gather_pairs(global const uint4 * src, global uint4 * dst, ulong n16,
-+                                    global const char * ids, ulong offi, ulong nbi1, int n_used) {
++                                    global const char * ids, ulong offi, ulong nbi1, int n_used, int n_split) {
++    // ids below n_split are not the bank's (slots, or -1); the bank's at id - n_split
 +    const int p = get_group_id(1);
-+    const int e = ((global const int *)(ids + offi + (p / n_used) * nbi1))[p % n_used];
-+    if (e < 0) return;
++    int e = ((global const int *)(ids + offi + (p / n_used) * nbi1))[p % n_used];
++    if (e < n_split) return;
++    e -= n_split;
 +    // chunk c: a contiguous slice, streamed by the group (page by page)
 +    const ulong base = (ulong) e * n16;
 +    const ulong len  = (n16 + get_num_groups(0) - 1) / get_num_groups(0);
@@ -721,13 +772,27 @@ index 53fd3c2..806b7d5 100644
  // [ne00, ne11, n_tok] in f16; dst [ne01, n_used, n_tok]. Tiles of NT pairs
  // of one expert from kernel_moe_route_tiles; pair
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
-index 127ee84..5f82362 100644
+index 127ee84..22e8eee 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
-@@ -312,6 +312,13 @@ kernel void NAME(global const uchar * q, ulong offq, global const half * dp,
+@@ -304,14 +304,25 @@ __attribute__((intel_reqd_sub_group_size(16)))
+ kernel void NAME(global const uchar * q, ulong offq, global const half * dp,                   \
+                  global const char * xq, global const float * xd,                              \
+                  global const char * ids, ulong offi, ulong nbi1, int n_used, int ne11,        \
+-                 global char * dst, ulong offd, ulong nb1, ulong nb2, int ne00, int ne01, ulong res) { \
++                 global char * dst, ulong offd, ulong nb1, ulong nb2, int ne00, int ne01, ulong res, \
++                 global const uchar * q2, global const half * dp2, int n_split) {               \
+     LOCAL_TABLES(TYPE)                                                                         \
+     const int first_row = FIRST_ROW;                                                           \
+     if (first_row >= ne01) return;                                                             \
+     const int nb = ne00 / QK_K;                                                                \
      const int k = get_group_id(2);                                                             \
      const int i = k % n_used, t = k / n_used;                                                  \
-     const int e = ((global const int *)(ids + offi + t * nbi1))[i];                            \
+-    const int e = ((global const int *)(ids + offi + t * nbi1))[i];                            \
++    int e = ((global const int *)(ids + offi + t * nbi1))[i];                                  \
++    /* an expert cache's single branch: ids >= n_split are bank experts, gathered into the     \
++       mirror q2 / dp2 at e - n_split */                                                       \
++    if (e >= n_split) { q = q2; offq = 0; dp = dp2; e -= n_split; }                            \
 +    if (e < 0) {   /* an expert cache's other branch: this pair's rows are zero */            \
 +        global float * zo = (global float *)(dst + offd + t * nb2 + i * nb1);                 \
 +        if (get_sub_group_local_id() == 0)                                                     \
@@ -826,10 +891,10 @@ index 4f04db0..a3650a3 100644
          if (!res) {
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 new file mode 100644
-index 0000000..a491141
+index 0000000..5e585d4
 --- /dev/null
 +++ b/src/llama-expert-cache.cpp
-@@ -0,0 +1,589 @@
+@@ -0,0 +1,606 @@
 +#include "llama-expert-cache.h"
 +
 +#include "llama-impl.h"
@@ -968,6 +1033,12 @@ index 0000000..a491141
 +    }
 +    write_slices(L.tab_slot, 0, (const uint8_t *) ts.data(), ts.size() * sizeof(int32_t));
 +    write_slices(L.tab_bank, 0, (const uint8_t *) tb.data(), tb.size() * sizeof(int32_t));
++    auto & tc = L.tab_host[4];
++    tc.resize(L.n_expert);
++    for (int e = 0; e < L.n_expert; ++e) {
++        tc[e] = L.slot_of[e] >= 0 ? L.slot_of[e] : L.n_slots + L.bank_of[e];
++    }
++    write_slices(L.tab_comb, 0, (const uint8_t *) tc.data(), tc.size() * sizeof(int32_t));
 +    if (L.tab_slot_dn) {
 +        auto & ts2 = L.tab_host[2], & tb2 = L.tab_host[3];
 +        ts2.resize(L.n_expert); tb2.resize(L.n_expert);
@@ -1067,7 +1138,8 @@ index 0000000..a491141
 +    exchange    = (decltype(exchange)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_exchange_slices");
 +    auto set_alloc_host = (void (*)(bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_set_alloc_host");
 +    auto reserve_gather = (void (*)(ggml_backend_dev_t, size_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_reserve_gather");
-+    if (!set_slices || !get_tensors || !get_slices || !exchange || !set_alloc_host || !reserve_gather) {
++    auto pair_bank      = (void (*)(const ggml_tensor *, const ggml_tensor *, int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_pair_bank");
++    if (!set_slices || !get_tensors || !get_slices || !exchange || !set_alloc_host || !reserve_gather || !pair_bank) {
 +        LLAMA_LOG_WARN("%s: %s lacks the expert cache's entry points (contrib/llama.cpp patch 0021)\n", __func__, ggml_backend_dev_name(dev));
 +        return false;
 +    }
@@ -1155,6 +1227,8 @@ index 0000000..a491141
 +        }
 +        L.tab_slot = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, L.n_expert);
 +        L.tab_bank = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, L.n_expert);
++        L.tab_comb = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, L.n_expert);
++        ggml_format_name(L.tab_comb, "blk.%d.expert_slot_or_bank", L.il);
 +        if (L.src[2]->type == GGML_TYPE_Q8_0) {
 +            L.tab_slot_dn = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, L.n_expert);
 +            L.tab_bank_dn = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, L.n_expert);
@@ -1202,6 +1276,14 @@ index 0000000..a491141
 +        }
 +        reserve_gather(dev, q, d);
 +        n_bytes += q + d;
++    }
++    // the single branch: each kq slot tensor knows its bank and the split
++    for (auto & L : layers) {
++        for (int k = 0; k < 3; ++k) {
++            if (L.slot[k]->type != GGML_TYPE_Q8_0) {
++                pair_bank(L.slot[k], L.bank[k], L.n_slots);
++            }
++        }
 +    }
 +
 +    // fill: each tensor whole (a converted layout is set up by its first write)
@@ -1421,10 +1503,10 @@ index 0000000..a491141
 +}
 diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
 new file mode 100644
-index 0000000..1cf5f5e
+index 0000000..2ea44c8
 --- /dev/null
 +++ b/src/llama-expert-cache.h
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,127 @@
 +#pragma once
 +
 +// A per-expert GPU cache for MoE layers whose expert tensors stay in host
@@ -1469,6 +1551,9 @@ index 0000000..1cf5f5e
 +    // which cannot skip a pair) reads the zero slot / zero entry instead of -1
 +    ggml_tensor * tab_slot_dn = nullptr;
 +    ggml_tensor * tab_bank_dn = nullptr;
++    // the single branch (decode): slot, or n_slots + bank entry; the slot
++    // tensors' kernels read a bank expert from the gathered mirror
++    ggml_tensor * tab_comb = nullptr;
 +    int      file_idx [3] = {};
 +    size_t   file_offs[3] = {};         // the tensor's data in its GGUF file
 +    size_t   nb2      [3] = {};         // one expert's bytes
@@ -1478,7 +1563,7 @@ index 0000000..1cf5f5e
 +    std::vector<int32_t> bexpert_of;    // bank entry -> expert
 +    std::vector<float>   usage;         // decode routing counts, decayed each adapt
 +    ggml_tensor * ids_out = nullptr;    // the last graph's routed ids (a copy, marked output)
-+    std::vector<int32_t> tab_host[4];   // the tables' bytes, alive until their non-blocking write lands
++    std::vector<int32_t> tab_host[5];   // the tables' bytes, alive until their non-blocking write lands
 +    llama_expert_cache * owner = nullptr;
 +};
 +
@@ -1550,7 +1635,7 @@ index 0000000..1cf5f5e
 +llama_expert_cache_layer * llama_expert_cache_lookup(const ggml_tensor * down_exps);
 +llama_expert_cache * llama_expert_cache_owner(const llama_expert_cache_layer * layer);
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index ae477c0..8866347 100644
+index ae477c0..9fd35f3 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -1,4 +1,5 @@
@@ -1559,7 +1644,7 @@ index ae477c0..8866347 100644
  
  #include "llama-impl.h"
  #include "llama-model.h"
-@@ -2185,158 +2186,198 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2185,158 +2186,213 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          cb(cur, "ffn_moe_weighted", il);
      }
  
@@ -1567,7 +1652,8 @@ index ae477c0..8866347 100644
 -    ggml_tensor * experts = nullptr;
 +    // the experts' FFN over `ids`: [n_embd, n_expert_used, n_tokens]
 +    auto build_experts = [&](ggml_tensor * x, ggml_tensor * up_t, ggml_tensor * gate_t, ggml_tensor * gate_up_t,
-+                             ggml_tensor * down_t, ggml_tensor * ids, ggml_tensor * ids_dn = nullptr) -> ggml_tensor * {
++                             ggml_tensor * down_t, ggml_tensor * ids, ggml_tensor * ids_dn = nullptr,
++                             ggml_tensor * down_t2 = nullptr, ggml_tensor * ids_dn2 = nullptr) -> ggml_tensor * {
 +        ggml_tensor * up = nullptr;
 +        ggml_tensor * experts = nullptr;
 +        ggml_tensor * cur = x;
@@ -1834,6 +1920,11 @@ index ae477c0..8866347 100644
 -    }
 -    cb(experts, "ffn_moe_down", il);
 +        experts = build_lora_mm_id(down_t, cur, ids_dn ? ids_dn : ids, down_exps_s); // [n_embd, n_expert_used, n_tokens]
++        if (down_t2) {
++            // a second down projection over the same rows (an expert cache's Q8_0
++            // bank beside its slots), each row non-zero in one of the two
++            experts = ggml_add(ctx0, experts, build_lora_mm_id(down_t2, cur, ids_dn2, down_exps_s));
++        }
 +        if (arch == LLM_ARCH_MISTRAL4) {
 +            // src1 can exceed F16 range
 +            ggml_prec_set_src(experts, GGML_PREC_F32, 1);
@@ -1846,17 +1937,17 @@ index ae477c0..8866347 100644
 +        if (down_exps_s) {
 +            cb(experts, "ffn_moe_down_scaled", il);
 +        }
- 
--    if (down_exps_b) {
--        experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
--        cb(experts, "ffn_moe_down_biased", il);
++
 +        if (down_exps_b) {
 +            experts = ggml_add_id(ctx0, experts, down_exps_b, ids);
 +            cb(experts, "ffn_moe_down_biased", il);
 +        }
 +        return experts;
 +    };
-+
+ 
+-    if (down_exps_b) {
+-        experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
+-        cb(experts, "ffn_moe_down_biased", il);
 +    // an expert cache (llama-expert-cache.h): the experts in the layer's slots
 +    // on the card, the rest from its bank in host memory, both read by the
 +    // GPU and summed per row (each (expert, token) row is non-zero in exactly
@@ -1883,9 +1974,18 @@ index ae477c0..8866347 100644
 +            ids_slot_dn = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ecl->tab_slot_dn, ids_flat), n_used, n_tokens);
 +            ids_bank_dn = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ecl->tab_bank_dn, ids_flat), n_used, n_tokens);
 +        }
-+        ggml_tensor * e_slot = build_experts(cur, ecl->slot[1], ecl->slot[0], nullptr, ecl->slot[2], ids_slot, ids_slot_dn);
-+        ggml_tensor * e_bank = build_experts(cur, ecl->bank[1], ecl->bank[0], nullptr, ecl->bank[2], ids_bank, ids_bank_dn);
-+        experts = ggml_add(ctx0, e_slot, e_bank);
++        if (n_tokens <= 8) {
++            // a decode step: one branch over the slot tensors; the backend gathers
++            // the routed bank experts into a mirror and the matvec reads them there
++            ggml_tensor * ids_comb = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ecl->tab_comb, ids_flat), n_used, n_tokens);
++            experts = ecl->tab_slot_dn
++                ? build_experts(cur, ecl->slot[1], ecl->slot[0], nullptr, ecl->slot[2], ids_comb, ids_slot_dn, ecl->bank[2], ids_bank_dn)
++                : build_experts(cur, ecl->slot[1], ecl->slot[0], nullptr, ecl->slot[2], ids_comb);
++        } else {
++            ggml_tensor * e_slot = build_experts(cur, ecl->slot[1], ecl->slot[0], nullptr, ecl->slot[2], ids_slot, ids_slot_dn);
++            ggml_tensor * e_bank = build_experts(cur, ecl->bank[1], ecl->bank[0], nullptr, ecl->bank[2], ids_bank, ids_bank_dn);
++            experts = ggml_add(ctx0, e_slot, e_bank);
++        }
 +        cb(experts, "ffn_moe_down_cached", il);
 +    } else {
 +        experts = build_experts(cur, up_exps, gate_exps, gate_up_exps, down_exps, selected_experts);
