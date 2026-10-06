@@ -44,6 +44,23 @@ publishes to GHCR under the running repo's own namespace. It takes a
 configuration is needed to run it from a fork — the namespace is derived
 from `GITHUB_REPOSITORY_OWNER`.
 
+### Operational notes
+
+**First run must include tier 1.** Tier 2 takes its base with `FROM` on the
+registry, so a `tiers=arcint` dispatch with no tier-1 image published yet
+fails at the first `FROM`. Use `tiers=all` (or `ov,arcint`) the first time.
+
+**GHCR packages are private on first push.** To let others pull the images,
+set the package visibility to public after the first push, or have them log
+in with a PAT carrying `read:packages`.
+
+**Tier 1 needs runner disk space freed first.** The OpenVINO clone and build
+is larger than a GitHub runner ships with, so the tier-1 job removes the
+unused SDK trees (`dotnet`, `android`, `ghc`, `CodeQL`) and prunes the
+Docker image and builder caches before building. A tier-1 build on a
+runner that has not been cleaned can fail partway with no space left on the
+device.
+
 ## Tagging: the tag names the pin and the package level
 
 The tier-1 tag is the OpenVINO pin plus the package level the recipe is at:
@@ -56,11 +73,8 @@ The `ov71640275` component is the recipe's `PIN` verbatim — eight hex
 characters, as `build-openvino.sh` names it. The full 40-char commit the
 image was actually built from is in the `ai.arcint.ov.pin` label.
 
-The level is a usable identity. It was not for a while — builds of
-0044–0067 kept the `marfrit-p19` stamp, which is also 0003–0043's, so one
-string covered several patch sets. `contrib/packaging/marfrit-openvino/patches/README.md`
-discloses that era and closes it: *"A release names its package level."*
-Since `+p20` the level in the tag is the package.
+The level is a usable identity: since the `+p20` package, a release names
+its package level (`contrib/packaging/marfrit-openvino/patches/README.md`).
 
 The **patch ceiling** — the highest patch actually applied — is still
 recorded, as an OCI label, so a running container can be asked without
@@ -85,10 +99,9 @@ same recipes — tier 1 checks `OV_PIN`/`PATCHLEVEL`/`CEILING` against
 `contrib/packaging/arcint/build-deb.sh` and the base image's version string
 against the level it expects.
 
-That is deliberate. This toolbox spent a review cycle carrying its own
-`p15`/`ceiling0033` while the recipes had moved to `p27`; the gate means the
-next time that happens the build fails in seconds instead of publishing a
-base whose tag describes a runtime nobody built.
+That is deliberate: if the recipe and the image ever disagree, the build
+fails in seconds instead of publishing a base whose tag describes a
+runtime nobody built.
 
 ## Running
 
@@ -174,6 +187,26 @@ the installed binary must show **no `zmm`** registers (AVX-512 would SIGILL
 elsewhere) and **must show `ymm`** (their absence means the build fell back
 to SSE-only, which would be a silent performance cliff of its own).
 
+## The patched runtime is on `ld.so.conf.d` inside the image
+
+Tier 1 writes `/etc/ld.so.conf.d/marfrit-openvino.conf` and runs `ldconfig`.
+This is a deliberate deviation from the deb recipe, which avoids a
+system-wide entry.
+
+The reason is the difference between the two build trees. The upstream
+wheel's libraries are self-locating (`DT_RPATH=$ORIGIN`). The source build's
+libraries carry a `DT_RUNPATH` pointing at build-tree paths
+(`/opt/ov/temp/Linux_x86_64/tbb/lib`, `/opt/ov/bin/intel64/Release`) that
+do not exist in the final image — and unlike `DT_RPATH`, `DT_RUNPATH` is not
+inherited by the executable's own lookups, so a second hop
+(`arcint -> libopenvino -> libtbb`) fails to resolve.
+
+On the host the deb gets past this through load order. An image must not
+depend on load order, because nothing else in the container links these
+sonames — the deb's objection, that a nightly OpenVINO could jump ahead of
+other consumers, cannot apply inside a dedicated image. The build asserts
+`ldconfig` picked the directory up rather than trusting the write.
+
 ## What CI covers, and what it cannot
 
 Covered, no GPU required:
@@ -195,21 +228,3 @@ acceptance cells live in the test ladder (`docs/design-0.3.1-test-ladder.md`)
 and need a card. A green container build means the engine compiles against
 the patched runtime and serves without one. It is not a claim about served
 quality or throughput.
-
-## Known issue resolved: `patches/0037`
-
-An earlier revision of this toolbox refused to build past patch `0033`,
-because `0037-moe-hybrid-prefill-split.patch` on `main` was corrupt: its
-last hunk declared 82 new / 6 old and carried 78 / 3, with the empty
-context lines stripped of their leading space — `git apply` refused the file
-outright (`corrupt patch at line 436`).
-
-That was fixed upstream in `ab19b09`, an hour after the base this PR was cut
-from. The toolbox now applies the whole series with no ceiling arg. Checked
-here rather than assumed: `git apply --summary` over every patch in
-`contrib/packaging/marfrit-openvino/patches/` and
-`contrib/llama.cpp/patches/` parses clean, and the same command against the
-old base's `0037` still reports the corruption. What that check does **not**
-cover is whether each patch applies to the pinned OpenVINO *tree* — that is
-`git apply --check` inside the tier-1 build, which CI runs.
-

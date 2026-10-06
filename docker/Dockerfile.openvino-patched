@@ -14,10 +14,8 @@
 # layout is load-bearing; patched libs overwrite the wheel's; the version
 # string must name the patch level).
 #
-# The whole series 0003-0077 is applied, and the tag names the package
-# level the recipe is at (marfrit-p27). The ceiling this file used to build
-# to -- 0033, with 0037 unappliable -- is gone: 0037 was re-exported in
-# ab19b09 and the whole series parses clean now.
+# The whole series is applied, and the tag names the package level the recipe
+# is at. Design, tagging and the CI scope: docs/docker.md.
 #
 # Build from the REPO ROOT:
 #   docker build -t arcint-ov:2026.4.0-ov71640275-marfrit-p27 \
@@ -32,26 +30,20 @@ RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
       curl which binutils \
   && dnf clean all && rm -rf /var/cache/dnf/*
 
-# Full 40-char SHA — git fetch only serves arbitrary commits by full object
+# Full 40-char SHA -- git fetch serves arbitrary commits only by full object
 # id; the 8-char pin from the deb recipes fails with "couldn't find remote
-# ref" (measured: run 35749870402, 2026-09-22).
+# ref".
 ARG OV_PIN=71640275d29692354223572e77ef717e92b891d9
 # Short form for the version string: the nightly reports itself as
-# 2026.4.0-22849-71640275d29, i.e. the 11-char short SHA. The deb recipe
-# built that as ${PIN}d29 off an 8-char pin; here it is spelled out.
+# 2026.4.0-22849-71640275d29, i.e. the 11-char short SHA.
 ARG OV_PIN_SHORT=71640275d29
 # The version string must parse for ov_parse_ci_build_number: the build-number
-# FIELD stays numeric, the patch level rides in the free-form tail.
+# FIELD stays numeric, the patch level rides in the free-form tail. The level
+# is a usable identity -- since the +p20 package a release names its package
+# level (docs/docker.md, Tagging).
 #
-# The level is taggable again. The frozen-stamp era is over: patches/README.md
-# now reads "Measurement builds of 0044-0067 before the +p20 package kept the
-# marfrit-p19 stamp (which is also 0003-0043's); such a build is identified
-# by its symbols ... A release names its package level." So marfrit-p27 means
-# the +p27 package and nothing else.
-#
-# Both values are GATED against contrib/packaging/marfrit-openvino/build-openvino.sh
+# Both values are gated against contrib/packaging/marfrit-openvino/build-openvino.sh
 # below: this image does not get its own opinion about the pin or the level.
-# The one time it had one (p15 while the recipe was at p27) this PR went stale.
 ARG PATCHLEVEL=marfrit-p27
 # Highest patch in the series actually applied, carried as an extra OCI label
 # (ai.arcint.ov.patchceiling) so a running container can be asked what it
@@ -92,12 +84,9 @@ RUN set -eu; \
       || { echo "CEILING=${CEILING} != top of the series in patches/ (${r_top})" >&2; exit 1; }; \
     echo "tier 1 agrees with the deb recipe: pin ${r_pin}, level ${r_lvl}, series top ${r_top}"
 
-# Same gate as build-openvino.sh: a patch that does not apply to the pin is
-# a bug in patches/, not a reason to move the pin. The WHOLE series is
-# applied -- no ceiling arg. The ceiling this file carried while 0037 was
-# corrupt (PATCH_MAX=0033, because that file's last hunk declared 82 new /
-# 6 old and carried 78 / 3: "corrupt patch at line 436") went away when the
-# patch was re-exported in ab19b09.
+# Same gate as build-openvino.sh: a patch that does not apply to the pin is a
+# bug in patches/, not a reason to move the pin. The WHOLE series is applied
+# -- no ceiling arg.
 RUN cd /opt/ov && shopt -s nullglob && \
     for p in /opt/patches/*.patch; do \
       echo "applying $(basename "$p")"; \
@@ -169,9 +158,8 @@ ARG PATCHLEVEL=marfrit-p27
 ARG CEILING=0077
 ARG OV_PREFIX=/usr/lib/marfrit-openvino
 
-# The level names the package (true since the +p20 package); the ceiling is
-# kept alongside it so `docker inspect` answers "which patch set" without
-# reading the version string, and so the label survives a future level freeze.
+# The ceiling is kept alongside the level so `docker inspect` answers "which
+# patch set" without reading the version string.
 LABEL org.opencontainers.image.title="marfrit-openvino (patched)" \
       org.opencontainers.image.source="https://github.com/marfrit/arcint" \
       ai.arcint.ov.pin="71640275d29692354223572e77ef717e92b891d9" \
@@ -222,18 +210,13 @@ RUN strip --strip-unneeded ${OV_PREFIX}/openvino/libs/*.so* 2>/dev/null || true;
       || { echo "wheel layout changed: targets no longer point at openvino/libs" >&2; exit 1; }; \
     rm -rf /tmp/patched /tmp/tbb
 
-# ld.so.conf.d INSIDE the image — deliberately deviating from the deb's
-# "no system-wide entry" discipline here. Measured reason (pulled the pushed
-# tier-1 image layers and read the ELF dynamic tags): the wheel's original
-# libs carry DT_RPATH=$ORIGIN (self-locating), but the source build's libs
-# carry DT_RUNPATH=/opt/ov/temp/Linux_x86_64/tbb/lib (and
-# /opt/ov/bin/intel64/Release) — build-tree paths that do not exist in the
-# final image. RUNPATH is not inherited from the executable, so
-# arcint -> libopenvino -> libtbb fails at the second hop (measured: tier-2
-# ctest, run 35754012937). The deb gets away with it via load-order on the
-# host; an image must not depend on that. The deb's objection (a nightly
-# OpenVINO jumping ahead of other consumers) cannot apply inside a dedicated
-# container — nothing else links these sonames here.
+# ld.so.conf.d INSIDE the image -- a deliberate deviation from the deb's
+# "no system-wide entry" discipline. The source build's libs carry a
+# DT_RUNPATH pointing at build-tree paths that do not exist here, and
+# RUNPATH is not inherited by the executable's own lookups, so the second
+# hop (arcint -> libopenvino -> libtbb) would not resolve. The deb gets
+# away with it via load order on the host; an image must not depend on that.
+# Full rationale: docs/docker.md, "The patched runtime is on ld.so.conf.d".
 RUN echo /usr/lib/marfrit-openvino/openvino/libs > /etc/ld.so.conf.d/marfrit-openvino.conf \
   && ldconfig \
   && ldconfig -p | grep -F libtbb.so.12 > /dev/null \

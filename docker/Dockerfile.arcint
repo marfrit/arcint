@@ -1,20 +1,15 @@
 # syntax=docker/dockerfile:1
 # ---------------------------------------------------------------------------
-# Tier 2: the arcint engine image -- BOTH engines.
+# Tier 2: the arcint engine image -- BOTH engines (OpenVINO and libllama).
 #
-# FROM the tier-1 patched-OpenVINO base for BOTH stages: the base carries
-# the CMake package, headers and libopenvino_tokenizers.so, so the engine
-# build needs nothing but a compiler and the OpenCL dev packages on top of it.
+# FROM the tier-1 patched-OpenVINO base for both stages: the base carries the
+# CMake package, headers and libopenvino_tokenizers.so, so the engine build
+# needs only a compiler and the OpenCL dev packages on top of it.
 #
 # The CMake flags are byte-for-byte contrib/packaging/arcint/build-deb.sh --
 # the image and the .deb consume the same recipe, neither forks the other.
-# That includes the second engine: since 0.5.5 arcint carries libllama
-# (llama.cpp at a pinned commit with contrib/llama.cpp/patches applied), and
-# both units the project serves today run `--engine llama`. An image built
-# with ARCINT_OPENVINO alone would serve the wrong path.
 #
-# The tier-1 tag names the OpenVINO pin and the package level; the level is a
-# real identity since the +p20 package (see Dockerfile.openvino-patched).
+# Design, caveats and the CPU-baseline rationale: docs/docker.md.
 #
 # Build from the REPO ROOT (needs the tier-1 image built or pulled):
 #   docker build -t arcint:dev \
@@ -43,14 +38,12 @@ ARG OV_PREFIX=/usr/lib/marfrit-openvino
 WORKDIR /src
 COPY . /src/arcint
 
-# The second engine: llama.cpp at the pin, the patches from this repo, the
-# same way build-deb.sh does it -- GitHub tarball of the commit, checked by
-# sha256, then contrib/llama.cpp/patches/*.patch applied in order with
-# `git apply --whitespace=nowarn`. A patch that does not apply to the pin is
-# a bug in contrib/llama.cpp/patches, not a reason to move the pin.
-#
-# The pin and the checksum are GATED against contrib/packaging/arcint/build-deb.sh
-# below, so the image cannot claim an engine the recipe does not build.
+# The second engine: llama.cpp at the pin, fetched as a GitHub tarball of the
+# commit and checked by sha256, then contrib/llama.cpp/patches/*.patch applied
+# in order -- the same way build-deb.sh does it. A patch that does not apply
+# to the pin is a bug in contrib/llama.cpp/patches, not a reason to move the
+# pin. The pin and checksum are gated against the recipe below, so the image
+# cannot claim an engine the recipe does not build.
 ARG LLAMA_COMMIT=bed0a856606ee4a24a164066f73d2379447033f5
 ARG LLAMA_TARBALL_SHA256=0984123c33b7e959f8003f9169e9109897112d9448b681737813911083eca4cc
 ARG LLAMA_URL=https://github.com/ggml-org/llama.cpp/archive
@@ -114,38 +107,29 @@ RUN LDD_OUT=$(ldd /install/usr/bin/arcint); \
     case "$LDD_OUT" in *"${OV_PREFIX}/openvino/libs/libopenvino.so"*) ;; \
       *) echo "libopenvino not loading from ${OV_PREFIX}" >&2; printf '%s\n' "$LDD_OUT" >&2; exit 1 ;; esac
 
-# The base runtime must be the level this engine was built against. Since the
-# +p20 package a release names its package level, so the version string is a
-# usable identity here (contrib/packaging/marfrit-openvino/patches/README.md:
-# "A release names its package level"). Checking at build time beats finding
-# out at load time that the base was an older tier-1 tag.
+# The base runtime must be the level this engine was built against -- checking
+# at build time beats finding out at load time that the base was an older
+# tier-1 tag. The level string is a usable identity (docs/docker.md, Tagging).
 ARG OV_LEVEL=marfrit-p27
 RUN strings -a ${OV_PREFIX}/openvino/libs/libopenvino.so.2640 \
       | grep -F -- "${OV_LEVEL}" > /dev/null \
   || { echo "base runtime is not ${OV_LEVEL} — wrong tier-1 base image?" >&2; exit 1; }
 
-# Both engines must be in the binary. `--engine llama` is what the served
-# units run, and the help text advertises it whether or not the backend was
-# compiled in, so check the linked artifacts, not the usage string: the
-# libllama symbols, and -- with GGML_OPENCL_EMBED_KERNELS=ON (CMakeLists.txt:154)
-# -- one of the Intel kernel names this repo's own patches introduce, which
-# stock llama.cpp cannot produce.
+# Both engines must be in the binary. The `--help` text advertises
+# `--engine llama` whether or not the backend was compiled in, so check the
+# linked artifacts instead: the libllama symbols, and -- with
+# GGML_OPENCL_EMBED_KERNELS=ON (CMakeLists.txt:154) -- one of the Intel
+# kernel names this repo's own patches introduce, which stock llama.cpp
+# cannot produce.
 RUN nm -C /install/usr/bin/arcint 2>/dev/null | grep -qE '\bllama_(backend_init|init_from_model|model_load_from_file)\b' \
   || { echo "binary carries no libllama symbols -- ARCINT_LLAMA did not link" >&2; exit 1; };
 RUN strings -a /install/usr/bin/arcint | grep -qF 'mul_mv_kq_q8_1' \
   || { echo "the patched Intel K-quant kernels are not embedded -- contrib/llama.cpp/patches did not reach the build" >&2; exit 1; }; \
     echo "both engines linked: $(nm -C /install/usr/bin/arcint | grep -cE '\bllama_[a-z_]+\b') libllama symbols, patched OpenCL kernels embedded"
 
-# Portability gate. GGML_NATIVE defaults ON, which compiles ggml-cpu with
-# -march=native ON THE BUILD RUNNER -- so the image inherits the runner's
-# instruction set and SIGILLs (exit 132) on any CPU that lacks it. Measured
-# here: the first build of this tier ran the OpenVINO path fine on an EPYC
-# 7402 (Zen 2: SSE4.2/AVX/AVX2/FMA/BMI2, no AVX-512, no AMX) and died in
-# llama_model_load_from_file with no log line at all, because the illegal
-# instruction kills the process before anything can report. -DGGML_NATIVE=OFF
-# makes ggml build x86-64-v3 instead (INS_ENB=ON at ggml/CMakeLists.txt:139,
-# every GGML_AVX512* defaulting OFF at :159-162). Assert it rather than
-# trusting the flag: zmm registers in the binary mean AVX-512 got in.
+# Portability gate: assert the x86-64-v3 baseline rather than trusting
+# -DGGML_NATIVE=OFF. zmm registers mean AVX-512 got in; their total absence
+# means the build fell back to SSE. Rationale: docs/docker.md, CPU baseline.
 RUN if objdump -d /install/usr/bin/arcint 2>/dev/null | grep -qE '%zmm[0-9]+'; then \
       echo "AVX-512 (zmm) in the binary -- this image SIGILLs on pre-AVX512 CPUs (Zen <=3, pre-Skylake Xeon). GGML_NATIVE did not take." >&2; \
       exit 1; \
