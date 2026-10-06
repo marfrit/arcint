@@ -3,7 +3,7 @@
 **Open.** Stage 2b (expert cache: slots on the card, a USM bank) passed
 2026-10-06: prefill 235 t/s at 20k, decode 12.4-13.0 (UD-Q3_K_XL). Stage 3
 (2026-10-06): the GSQ-RCO IQ2_XS file runs (patch 0022), 326 t/s prefill;
-decode 18.4 t/s plain and 22.5 with MTP 2 after stage 3b, answers right. Strata on the same card
+decode 21.3 t/s plain and 27.0 with MTP 2 after stage 3b, answers right. Strata on the same card
 reads 620.5 / 37.2-37.8 (`strata-sycl-b60.md`).
 
 ## Charter
@@ -286,7 +286,8 @@ its state of each window. Between loads the same binary varies by about
 | + fused hyper-connection ops (DSV4_HC_PRE / POST) | 17.8 | | | |
 | + a verify's bank experts gathered once each, 13,500-14,500 MiB of slots | 17.9 | 22.0 | 38.7 | |
 | + the IQ4 codebook per card | 17.8 | 20.9-22.0 | 38.7 | 43.2 |
-| + the MoE router fused (topk_moe) | **18.4** | **22.5** | 38.7 | **43.3** |
+| + the MoE router fused (topk_moe) | 18.4 | 22.5 | 38.7 | **43.3** |
+| + the low-bit types in planes on the card (prefill 371 t/s at 20k) | **21.3** | **27.0** | | |
 
 Strata's SYCL engine on the same card and file: 37.2-37.8 t/s
 (`strata-sycl-b60.md`).

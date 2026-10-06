@@ -1232,6 +1232,15 @@ the decode-path work Flash-Next and its MTP verify needed on Intel:
   IQ2_S 168 -> 146 us, IQ3_S 284 -> 255 at 4096 x 14336, B60); IQ2_XXS and
   IQ1_M read their grids from local memory, IQ2_S and IQ3_S from constant
   memory (a local copy per work-group cost more there).
+- **IQ2_XXS, IQ2_S, Q2_0 and IQ3_S in planes on the card**, per weight slice
+  (an expert): each field of every block back to back, so a lane reads
+  aligned 32-bit words where the 18-, 66-, 82- and 110-byte GGUF blocks left
+  fields at 2-byte offsets (single-byte loads). A slice keeps its size and
+  place: the expert cache's slot / bank copies and gathers stay byte copies;
+  `set_tensor`, `get_tensor`, the slice procs and the USM bank convert GGUF
+  blocks <-> planes (`ggml_cl_lb_convert`); an odd block count a slice stays
+  in blocks and its ops go to the CPU. 4096 x 14336, one column (B60): Q2_0
+  184 -> 99 us, IQ2_XXS 211 -> 111, IQ3_S 255 -> 156, IQ2_S 146 -> 142.
 - **F16 / BF16 (stored as F16) times 2 to 8 columns** in one read of each
   weight row (`kernel_mul_mv_f16_f32_nc`): the tiled GEMM took 2.80 ms for
   4096 x 14336 at 2, 4 or 8 columns against 0.29 ms at one; now 0.70-0.89.
@@ -1263,9 +1272,10 @@ so does the 0021 tree's own build (0/74, `measured-here`): a defect of the
 MXFP4 MoE path on Xe2 that predates this patch, not a type it touches.
 
 Served, B60, Qwen3.8-Flash-Next IQ2_XS from the expert cache, the gate's
-requests (`measured-here`, 2026-10-06): decode 18.4 t/s plain (14,500 MiB of
-slots), 22.5 t/s with MTP 2 from an MTP-only file (13,500 MiB), prefill
-326.6 t/s at 20k; answers right. Before the patch's decode work: 16.0 and
+requests (`measured-here`, 2026-10-06): decode 21.3 t/s plain (14,500 MiB of
+slots), 27.0 t/s with MTP 2 from an MTP-only file (13,500 MiB), prefill
+371.1 t/s at 20k; answers right; the cache's file check 0 of 6 copies
+differ. Before the patch's decode work: 16.0 and
 13.8. The resident models on the same build: the dense 27B agent (B60, MTP 5)
 35.9 -> 38.7 t/s, the coder (A770, MTP 4) 40.1 -> 43.3 t/s, the long answer
 greedy.

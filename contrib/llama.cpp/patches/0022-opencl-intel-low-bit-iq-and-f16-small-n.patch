@@ -224,7 +224,162 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          case GGML_OP_GROUP_NORM:
              return ggml_is_contiguous(op->src[0]);
          case GGML_OP_MUL_MAT:
-@@ -14779,9 +14896,17 @@
+@@ -9832,6 +9949,11 @@
+             // (ggml_cl_mul_mv_kq_q8_1, ggml_cl_mul_mm_kq_f16), and are the only
+             // path for IQ3_XXS / IQ4_XS; ahead of the Adreno rule below that
+             // declines 512 or more columns without the Adreno GEMM
++            // the low-bit types in planes need an even block count a slice (ggml_cl_lb_planar)
++            if (ggml_cl_kq_type_index(op->src[0]->type) >= 6 && ggml_cl_kq_type_index(op->src[0]->type) != 8 &&
++                (op->src[0]->ne[0] * op->src[0]->ne[1] / ggml_blck_size(op->src[0]->type)) % 2 != 0) {
++                return false;
++            }
+             if (ggml_cl_kq_type_index(op->src[0]->type) >= 0 && kq_q8_1_enabled(backend_ctx) &&
+                 op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % ggml_cl_kq_k_unit(op->src[0]->type) == 0 &&
+                 op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 && op->src[0]->view_offs == 0 &&
+@@ -9910,6 +10032,10 @@
+                 }
+             }
+ #ifdef GGML_OPENCL_SOA_Q
++            if (ggml_cl_kq_type_index(op->src[0]->type) >= 6 && ggml_cl_kq_type_index(op->src[0]->type) != 8 &&
++                (op->src[0]->ne[0] * op->src[0]->ne[1] / ggml_blck_size(op->src[0]->type)) % 2 != 0) {
++                return false;
++            }
+             if (ggml_cl_kq_type_index(op->src[0]->type) >= 0 && kq_q8_1_enabled(backend_ctx)) {
+                 return op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % ggml_cl_kq_k_unit(op->src[0]->type) == 0 &&
+                        op->src[0]->view_offs == 0 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+@@ -10710,6 +10836,49 @@
+ 
+ // USM host buffers: bytes by memcpy; IQ4_NL whole tensors split into scales
+ // and quants (as kernel_convert_block_iq4_nl lays them out), each 128-aligned
++// patch 0022: the low-bit types IQ2_XXS, IQ2_S, Q2_0 and IQ3_S live on the card
++// in planes, per weight slice (one 2-D matrix: an expert): each field of every
++// block back to back (mul_mv_iq_q8_1.cl, lb_expand), so a lane reads aligned
++// 32-bit words. A slice keeps its size and place, so slot / bank copies and
++// gathers stay byte copies; reads and writes of GGUF bytes convert here.
++struct ggml_cl_lb_field { int off, size; };
++static int ggml_cl_lb_fields(ggml_type t, ggml_cl_lb_field f[5]) {
++    switch (t) {
++        case GGML_TYPE_IQ2_XXS: f[0] = { 0, 2 }; f[1] = { 2, 64 }; return 2;
++        case GGML_TYPE_IQ2_S:   f[0] = { 0, 2 }; f[1] = { 2, 32 }; f[2] = { 34, 32 }; f[3] = { 66, 8 }; f[4] = { 74, 8 }; return 5;
++        case GGML_TYPE_Q2_0:    f[0] = { 0, 2 }; f[1] = { 2, 16 }; return 2;
++        case GGML_TYPE_IQ3_S:   f[0] = { 0, 2 }; f[1] = { 2, 64 }; f[2] = { 66, 8 }; f[3] = { 74, 32 }; f[4] = { 106, 4 }; return 5;
++        default:                return 0;
++    }
++}
++// planes need an even block count a slice (32-bit fields aligned); an odd one
++// stays in GGUF blocks and its ops go to the CPU (supports_op)
++static bool ggml_cl_lb_planar(const ggml_tensor * t) {
++    ggml_cl_lb_field f[5];
++    return ggml_cl_lb_fields(t->type, f) > 0 && (t->ne[0] * t->ne[1] / ggml_blck_size(t->type)) % 2 == 0;
++}
++// n_slices slices of a tensor, GGUF blocks <-> planes (to_planes)
++static void ggml_cl_lb_convert(const ggml_tensor * t, const uint8_t * src, uint8_t * dst, int64_t n_slices, bool to_planes) {
++    ggml_cl_lb_field f[5];
++    const int     nf   = ggml_cl_lb_fields(t->type, f);
++    const size_t  blk  = ggml_type_size(t->type);
++    const int64_t nblk = t->ne[0] * t->ne[1] / ggml_blck_size(t->type);
++    GGML_ASSERT(nf > 0 && nblk % 2 == 0);
++    const size_t  sb   = (size_t) nblk * blk;
++    for (int64_t sl = 0; sl < n_slices; ++sl) {
++        const uint8_t * a = src + sl * sb;
++        uint8_t       * b = dst + sl * sb;
++        size_t plane = 0;
++        for (int k = 0; k < nf; ++k) {
++            for (int64_t i = 0; i < nblk; ++i) {
++                if (to_planes) memcpy(b + plane + i * f[k].size, a + i * blk + f[k].off, f[k].size);
++                else           memcpy(b + i * blk + f[k].off, a + plane + i * f[k].size, f[k].size);
++            }
++            plane += (size_t) nblk * f[k].size;
++        }
++    }
++}
++
+ static void ggml_cl_usm_set_tensor(ggml_backend_opencl_buffer_context * ctx, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
+     char * base = (char *) ctx->usm + e->offset + tensor->view_offs;
+@@ -10727,6 +10896,11 @@
+         ctx->usm_split[tensor] = { d, q };
+         return;
+     }
++    if (ggml_cl_lb_planar(tensor)) {
++        GGML_ASSERT(offset % tensor->nb[2] == 0 && size % tensor->nb[2] == 0 && tensor->view_src == nullptr);
++        ggml_cl_lb_convert(tensor, (const uint8_t *) data, (uint8_t *) base + offset, (int64_t) (size / tensor->nb[2]), true);
++        return;
++    }
+     memcpy(base + offset, data, size);
+ }
+ 
+@@ -10741,6 +10915,16 @@
+     cl_context context = backend_ctx->context;
+     cl_command_queue queue = backend_ctx->queue;
+ 
++    if (ggml_cl_lb_planar(tensor)) {
++        // whole slices, GGUF blocks -> planes
++        GGML_ASSERT(offset % tensor->nb[2] == 0 && size % tensor->nb[2] == 0);
++        std::vector<uint8_t> planes(size);
++        ggml_cl_lb_convert(tensor, (const uint8_t *) data, planes.data(), (int64_t) (size / tensor->nb[2]), true);
++        ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
++        CL_CHECK(clEnqueueWriteBuffer(queue, e->data_device, CL_TRUE, e->offset + tensor->view_offs + offset, size, planes.data(), 0, NULL, NULL));
++        return;
++    }
++
+ #ifdef GGML_OPENCL_SOA_Q
+     if (tensor->type == GGML_TYPE_Q1_0) {
+         ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
+@@ -12401,6 +12585,21 @@
+ 
+ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+     GGML_ASSERT(tensor->extra);
++    if (ggml_cl_lb_planar(tensor) && offset % tensor->nb[2] == 0 && size % tensor->nb[2] == 0) {
++        // whole slices, planes -> GGUF blocks
++        std::vector<uint8_t> planes(size);
++        ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
++        auto * bctx = (ggml_backend_opencl_buffer_context *) buffer->context;
++        if (bctx->usm) {
++            memcpy(planes.data(), (const char *) bctx->usm + e->offset + tensor->view_offs + offset, size);
++        } else {
++            ggml_backend_opencl_device_context * dctx = (ggml_backend_opencl_device_context *) buffer->buft->device->context;
++            CL_CHECK(clEnqueueReadBuffer(dctx->backend_ctx->queue, e->data_device, CL_TRUE, e->offset + tensor->view_offs + offset,
++                                         size, planes.data(), 0, NULL, NULL));
++        }
++        ggml_cl_lb_convert(tensor, planes.data(), (uint8_t *) data, (int64_t) (size / tensor->nb[2]), false);
++        return;
++    }
+ 
+     ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer->buft->device->context;
+     ggml_backend_opencl_context *backend_ctx = dev_ctx->backend_ctx;
+@@ -14360,6 +14559,9 @@
+                     memcpy(dst + b * blk, dq.first + (i2 * bps + b) * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
+                     memcpy(dst + b * blk + sizeof(ggml_fp16_t), dq.second + (i2 * bps + b) * qb, qb);
+                 }
++            } else if (ggml_cl_lb_planar(tensor)) {
++                ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
++                ggml_cl_lb_convert(tensor, (const uint8_t *) bctx->usm + e->offset + (size_t) i2 * tensor->nb[2], (uint8_t *) data, n, false);
+             } else {
+                 ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
+                 memcpy(data, (const char *) bctx->usm + e->offset + (size_t) i2 * tensor->nb[2], (size_t) n * tensor->nb[2]);
+@@ -14492,6 +14694,9 @@
+                     memcpy(dq.first + (i2 * bps + b) * sizeof(ggml_fp16_t), src + b * blk, sizeof(ggml_fp16_t));
+                     memcpy(dq.second + (i2 * bps + b) * qb, src + b * blk + sizeof(ggml_fp16_t), qb);
+                 }
++            } else if (ggml_cl_lb_planar(tensor)) {
++                ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
++                ggml_cl_lb_convert(tensor, (const uint8_t *) data, (uint8_t *) bctx->usm + e->offset + (size_t) i2 * tensor->nb[2], n, true);
+             } else {
+                 ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
+                 memcpy((char *) bctx->usm + e->offset + (size_t) i2 * tensor->nb[2], data, (size_t) n * tensor->nb[2]);
+@@ -14537,6 +14742,10 @@
+         return;
+     }
+ #endif
++    if (ggml_cl_lb_planar(tensor)) {
++        ggml_backend_tensor_set(tensor, data, (size_t) i2 * tensor->nb[2], (size_t) n * tensor->nb[2]);   // converts
++        return;
++    }
+     {
+         // a plain tensor: a non-blocking write; the caller keeps `data` until the
+         // next synchronization (llama_expert_cache's tables live in the layer)
+@@ -14779,9 +14988,17 @@
  
      cl_kernel kernel;
  
@@ -244,7 +399,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          GGML_ASSERT(ggml_is_contiguous(src0));
          GGML_ASSERT(ne11 == 1);
      }
-@@ -14790,7 +14915,7 @@
+@@ -14790,7 +15007,7 @@
          GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
          if (bcast_row) {
              kernel = backend_ctx->kernel_add_row;
@@ -253,7 +408,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
              CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
              CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra1->data_device));
-@@ -17577,6 +17702,70 @@
+@@ -17577,6 +17794,70 @@
      }
  }
  
@@ -324,7 +479,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  static void ggml_cl_timestep_embedding(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -24733,6 +24922,14 @@
+@@ -24733,6 +25014,14 @@
  // the single branch: the mirror for the matvec's trailing arguments
  static cl_mem g_kq_single_q = nullptr, g_kq_single_d = nullptr;
  static int    g_kq_single_split = 0;
@@ -339,7 +494,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
  static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, cl_uint & a) {
      const ggml_tensor * soa0 = src0->view_src != nullptr ? src0->view_src : src0;
-@@ -24748,7 +24945,7 @@
+@@ -24748,7 +25037,7 @@
          // base and the offset, or IQ4_NL's scales and quants)
          auto * bctx = (ggml_backend_opencl_buffer_context *) soa0->buffer->context;
          if (bctx->usm) {
@@ -348,7 +503,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                  ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *)src0->extra;
                  const cl_ulong off = e->offset + src0->view_offs;
                  CL_CHECK(g_cl_set_arg_ptr(kernel, a++, bctx->usm));
-@@ -24756,7 +24953,7 @@
+@@ -24756,7 +25045,7 @@
                  CL_CHECK(g_cl_set_arg_ptr(kernel, a++, bctx->usm));
                  return;
              }
@@ -357,7 +512,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              const auto & dq = bctx->usm_split.at(soa0);
              const cl_ulong off = 0;
              CL_CHECK(g_cl_set_arg_ptr(kernel, a++, dq.second));
-@@ -24765,7 +24962,7 @@
+@@ -24765,7 +25054,7 @@
              return;
          }
      }
@@ -366,7 +521,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *)src0->extra;
          const cl_ulong off = e->offset + src0->view_offs;
          CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &e->data_device));
-@@ -24807,13 +25004,19 @@
+@@ -24807,13 +25096,19 @@
          case GGML_TYPE_IQ3_XXS: return 3;
          case GGML_TYPE_IQ4_XS:  return 4;
          case GGML_TYPE_IQ4_NL:  return 5;
@@ -388,7 +543,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  }
  
  // Q4_K and Q5_K subtract a min per sub-block: their kernels read the
-@@ -25171,6 +25374,46 @@
+@@ -25171,6 +25466,46 @@
          return;
      }
  
@@ -435,7 +590,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      // quant kv without FA
      // used for non-contiguous src0 (the usual head-major permuted K view when n_head_kv>1)
      // AND for the contiguous case that occurs when n_head_kv==1 (e.g. Gemma-4 E2B)
-@@ -27611,6 +27854,17 @@
+@@ -27611,6 +27946,17 @@
      const bool id2 = gemm && (id2_env == nullptr ? id2_default : atoi(id2_env) != 0) && backend_ctx->kernel_mul_mm_id2_kq_f16[ti] != nullptr;
      cl_kernel kernel = id2 ? backend_ctx->kernel_mul_mm_id2_kq_f16[ti] :
                         gemm ? backend_ctx->kernel_mul_mm_id_kq_f16[ti] : backend_ctx->kernel_mul_mv_id_kq_q8_1[ti];
@@ -453,14 +608,21 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      if (kernel == nullptr) {
          return false;
      }
-@@ -27656,9 +27910,11 @@
+@@ -27656,9 +28002,18 @@
                  GGML_ASSERT(per_expert % 16 == 0);
                  stage.allocate(backend_ctx->context, per_expert * (size_t) n_expert);
                  const cl_ulong n16 = per_expert / 16;
 -                if (!gemm && backend_ctx->kernel_moe_gather_pairs != nullptr) {
 -                    // a few tokens (a decode step, a verify): a grid over the pairs (a
 -                    // repeated expert is copied twice, the same bytes)
-+                if (!gemm && n_tok == 1 && backend_ctx->kernel_moe_gather_pairs != nullptr) {
++                // GGML_OPENCL_GATHER_PAIRS_MULTI=1: the pair grid (an expert two pairs
++                // share copied by the first) for a few tokens too; GGML_OPENCL_GATHER_CHUNKS:
++                // the work-groups an expert's bytes are cut into (16)
++                static const char * gpm_env = getenv("GGML_OPENCL_GATHER_PAIRS_MULTI");
++                static const bool   gpm     = gpm_env != nullptr && atoi(gpm_env) != 0;
++                static const char * gch_env = getenv("GGML_OPENCL_GATHER_CHUNKS");
++                static const size_t gch     = gch_env != nullptr && atoi(gch_env) > 0 ? (size_t) atoi(gch_env) : 16;
++                if (!gemm && (n_tok == 1 || gpm) && backend_ctx->kernel_moe_gather_pairs != nullptr) {
 +                    // one token (a decode step): a grid over its pairs, distinct experts.
 +                    // Several (a verify window) take the per-expert grid below: an
 +                    // expert two tokens route to is copied once (the pair grid spent
@@ -468,7 +630,16 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                      cl_kernel kg = backend_ctx->kernel_moe_gather_pairs;
                      CL_CHECK(g_cl_set_arg_ptr(kg, 0, src));
                      CL_CHECK(clSetKernelArg(kg, 1, sizeof(cl_mem),   &stage.buffer));
-@@ -27682,8 +27938,10 @@
+@@ -27669,7 +28024,7 @@
+                     CL_CHECK(clSetKernelArg(kg, 6, sizeof(int),      &n_used));
+                     CL_CHECK(clSetKernelArg(kg, 7, sizeof(int),      &n_split));
+                     size_t g_local[2]  = { 256, 1 };
+-                    size_t g_global[2] = { 256 * 16, (size_t) n_used * n_tok };
++                    size_t g_global[2] = { 256 * gch, (size_t) n_used * n_tok };
+                     backend_ctx->enqueue_ndrange_kernel(kg, 2, g_global, g_local, dst);
+                     return stage.buffer;
+                 }
+@@ -27682,8 +28037,10 @@
                  CL_CHECK(clSetKernelArg(kg, 5, sizeof(cl_ulong), &nbi1));
                  CL_CHECK(clSetKernelArg(kg, 6, sizeof(int),      &n_used));
                  CL_CHECK(clSetKernelArg(kg, 7, sizeof(int),      &n_tok));
@@ -476,11 +647,11 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
 +                // a group per bank entry (the single branch's bank: its own count)
                  size_t g_local[2]  = { 256, 1 };
 -                size_t g_global[2] = { 256 * 16, (size_t) n_expert };
-+                size_t g_global[2] = { 256 * 16, (size_t) (single ? bank0->ne[2] : n_expert) };
++                size_t g_global[2] = { 256 * (gemm ? 16 : gch), (size_t) (single ? bank0->ne[2] : n_expert) };
                  backend_ctx->enqueue_ndrange_kernel(kg, 2, g_global, g_local, dst);
                  return stage.buffer;
              };
-@@ -27701,11 +27959,12 @@
+@@ -27701,11 +28058,12 @@
                  // goes in the matvec's trailing ones (below)
                  g_kq_single_q = g_kq_stage_q; g_kq_single_d = g_kq_stage_d != nullptr ? g_kq_stage_d : g_kq_stage_q;
                  g_kq_single_split = n_split;
@@ -494,7 +665,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
      cl_uint a = 0;
      if (!gemm) {
-@@ -27740,6 +27999,49 @@
+@@ -27740,6 +28098,49 @@
              CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),    &ns));
          }
          const int rows_per_wg = backend_ctx->kq_q8_1_ndst * 4;
@@ -544,7 +715,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          size_t global_work_size[] = { (size_t)CEIL_DIV(ne01, rows_per_wg) * 16, 4, (size_t)n_used * n_tok };
          size_t local_work_size[]  = { 16, 4, 1 };
          backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
-@@ -31955,6 +32257,18 @@
+@@ -31955,6 +32356,18 @@
              }
              ggml_cl_timestep_embedding(backend, tensor->src[0], tensor);
              return true;
@@ -566,7 +737,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 --- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
-@@ -510,6 +510,1137 @@
+@@ -510,6 +510,1149 @@
  }
  #endif
  
@@ -1575,27 +1746,36 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-openc
 +    return (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24);
 +}
 +
-+static inline void lb_expand(const int TYPE, global const uchar * row, int j32, uint * w, float * s0, float * s1) {
-+    if (TYPE == 6) {          // IQ2_XXS: d, qs[32] as u16
-+        global const uchar * bp = row + (ulong)(j32 >> 3) * 66;
-+        const int p = j32 & 7;
-+        const float d = vload_half(0, (global const half *)bp);
-+        const ushort4 h4 = vload4(0, (global const ushort *)(bp + 2 + 8 * p));
-+        const uint a0 = (uint)h4.s0 | ((uint)h4.s1 << 16), a1 = (uint)h4.s2 | ((uint)h4.s3 << 16);
++#define LB_LT_PARAM
++#define LB_GRID_XXS(i) LB_TAB2(iq2xxs_grid, (i))
++#define LB_SIGNS_XXS(i) LB_TAB2(ksigns64, (i))
++#define LB_GRID_1M(i) LB_TAB2(iq1s_grid, (i))
++// A low-bit slice (one weight matrix, nblk blocks) is kept in planes on the
++// card (ggml-opencl's ggml_cl_lb_planes): IQ2_XXS d | qs[64]; IQ2_S d | qs[32]
++// | signs[32] | qh[8] | scales[8]; Q2_0 d | qs[16]; IQ3_S d | qs[64] | qh[8] |
++// signs[32] | scales[4], each field of every block back to back, so a lane's
++// sub-block fields are aligned 32-bit words (the GGUF blocks of 18, 66, 82 or
++// 110 bytes left them at 2-byte offsets: single-byte loads). IQ1_M stays as
++// stored (its fields are aligned). Block bi of the slice, sub-block p (Q2_0: half).
++static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk, ulong bi, int p,
++                             uint * w, float * s0, float * s1 LB_LT_PARAM) {
++    if (TYPE == 6) {          // IQ2_XXS
++        const float d = vload_half(bi, (global const half *)S);
++        const uint2 a = vload2(bi * 8 + p, (global const uint *)(S + nblk * 2));
++        const uint a0 = a.s0, a1 = a.s1;
 +        #pragma unroll
 +        for (int l = 0; l < 4; ++l) {
-+            const uint2 g = LB_TAB2(iq2xxs_grid, (a0 >> (8 * l)) & 0xFF);
-+            const uint2 m = LB_TAB2(ksigns64, (a1 >> (7 * l)) & 127);
++            const uint2 g = LB_GRID_XXS((a0 >> (8 * l)) & 0xFF);
++            const uint2 m = LB_SIGNS_XXS((a1 >> (7 * l)) & 127);
 +            w[2 * l]     = lb_sgn4(g.s0, m.s0);
 +            w[2 * l + 1] = lb_sgn4(g.s1, m.s1);
 +        }
 +        *s0 = *s1 = d * (0.5f + (float)(a1 >> 28)) * 0.25f;
-+    } else if (TYPE == 7) {   // IQ2_S: d, qs[32], signs[32], qh[8], scales[8]
-+        global const uchar * bp = row + (ulong)(j32 >> 3) * 82;
-+        const int p = j32 & 7;
-+        const float d = vload_half(0, (global const half *)bp);
-+        const uint qh = bp[66 + p], sc = bp[74 + p];
-+        const uint qw = lb_u32(bp + 2 + 4 * p), sw = lb_u32(bp + 34 + 4 * p);
++    } else if (TYPE == 7) {   // IQ2_S
++        const float d = vload_half(bi, (global const half *)S);
++        const uint qw = ((global const uint *)(S + nblk * 2))[bi * 8 + p];
++        const uint sw = ((global const uint *)(S + nblk * 34))[bi * 8 + p];
++        const uint qh = S[nblk * 66 + bi * 8 + p], sc = S[nblk * 74 + bi * 8 + p];
 +        #pragma unroll
 +        for (int l = 0; l < 4; ++l) {
 +            const uint2 g = LB_TAB2(iq2s_grid, ((qw >> (8 * l)) & 0xFF) | ((qh << (8 - 2 * l)) & 0x300));
@@ -1605,9 +1785,8 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-openc
 +        }
 +        *s0 = d * (0.5f + (float)(sc & 0xF)) * 0.25f;
 +        *s1 = d * (0.5f + (float)(sc >> 4)) * 0.25f;
-+    } else if (TYPE == 8) {   // IQ1_M: qs[32], qh[16], scales[8] (the block scale in their top nibbles)
-+        global const uchar * bp = row + (ulong)(j32 >> 3) * 56;
-+        const int p = j32 & 7;
++    } else if (TYPE == 8) {   // IQ1_M, as stored: qs[32], qh[16], scales[8]
++        global const uchar * bp = S + bi * 56;
 +        global const ushort * sc = (global const ushort *)(bp + 48);
 +        const ushort u = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
 +        const float d = convert_float(as_half(u));
@@ -1620,16 +1799,16 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-openc
 +        const int dl[4] = { (qh0 & 0x08) ? -1 : 1, (qh0 & 0x80) ? -1 : 1, (qh1 & 0x08) ? -1 : 1, (qh1 & 0x80) ? -1 : 1 };
 +        #pragma unroll
 +        for (int l = 0; l < 4; ++l) {
-+            const uint2 g = LB_TAB2(iq1s_grid, idx[l]);
++            const uint2 g = LB_GRID_1M(idx[l]);
 +            w[2 * l]     = as_uint(as_char4(g.s0) * (char4)(8) + (char4)(dl[l]));
 +            w[2 * l + 1] = as_uint(as_char4(g.s1) * (char4)(8) + (char4)(dl[l]));
 +        }
 +        *s0 = d * (float)(2 * (s & 7) + 1) * 0.125f;
 +        *s1 = d * (float)(2 * ((s >> 3) & 7) + 1) * 0.125f;
-+    } else if (TYPE == 9) {   // Q2_0: d, qs[16] for 64 weights, four 2-bit codes a byte, value q - 1
-+        global const uchar * bp = row + (ulong)(j32 >> 1) * 18;
-+        const float d = vload_half(0, (global const half *)bp);
-+        const uint cw[2] = { lb_u32(bp + 2 + 8 * (j32 & 1)), lb_u32(bp + 6 + 8 * (j32 & 1)) };
++    } else if (TYPE == 9) {   // Q2_0: p is the half of the 64-weight block
++        const float d = vload_half(bi, (global const half *)S);
++        const uint2 c = vload2(bi * 2 + p, (global const uint *)(S + nblk * 2));
++        const uint cw[2] = { c.s0, c.s1 };
 +        #pragma unroll
 +        for (int i = 0; i < 8; ++i) {
 +            const uint b = (cw[i >> 2] >> (8 * (i & 3))) & 0xFF;
@@ -1637,15 +1816,13 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-openc
 +            w[i] = as_uint(as_char4(v) - (char4)(1));
 +        }
 +        *s0 = *s1 = d;
-+    } else {                  // IQ3_S: d, qs[64], qh[8], signs[32], scales[4]
-+        global const uchar * bp = row + (ulong)(j32 >> 3) * 110;
-+        const int p = j32 & 7;
-+        const float d = vload_half(0, (global const half *)bp);
-+        const uint qh = bp[66 + p];
-+        const uint sc = (bp[106 + p / 2] >> (4 * (p & 1))) & 0xF;
-+        const uint qa = lb_u32(bp + 2 + 8 * p), qb = lb_u32(bp + 6 + 8 * p);
-+        const uint qv[4] = { qa & 0xFFFF, qa >> 16, qb & 0xFFFF, qb >> 16 };
-+        const uint sw = lb_u32(bp + 74 + 4 * p);
++    } else {                  // IQ3_S
++        const float d = vload_half(bi, (global const half *)S);
++        const uint2 q = vload2(bi * 8 + p, (global const uint *)(S + nblk * 2));
++        const uint qv[4] = { q.s0 & 0xFFFF, q.s0 >> 16, q.s1 & 0xFFFF, q.s1 >> 16 };
++        const uint qh = S[nblk * 66 + bi * 8 + p];
++        const uint sw = ((global const uint *)(S + nblk * 74))[bi * 8 + p];
++        const uint sc = (S[nblk * 106 + bi * 4 + p / 2] >> (4 * (p & 1))) & 0xF;
 +        #pragma unroll
 +        for (int l = 0; l < 4; ++l) {
 +            const uint g1 = iq3s_grid[(qv[l] & 0xFF) | ((qh << (8 - 2 * l)) & 256)];
@@ -1658,23 +1835,29 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-openc
 +    }
 +}
 +
-+// the 32 weights of sub-block j32 as floats
-+static inline void lb_v32(const int TYPE, global const uchar * row, int j32, float * v) {
++// sub-block j32 of row r: its block in the slice, and p
++#define LB_BI(T, r, nbr, j32) ((ulong)(r) * (nbr) + (ulong)((j32) / LB_SUBS(T)))
++#define LB_P(T, j32)          ((j32) % LB_SUBS(T))
++
++// the 32 weights of sub-block j32 of global row g (expert g / ne01's slice) as floats
++static inline void lb_v32(const int TYPE, global const uchar * q, ulong g, int ne01, int n32, int j32, float * v) {
++    const int   nbr  = n32 / LB_SUBS(TYPE);
++    const ulong nblk = (ulong)ne01 * nbr;
++    global const uchar * S = q + (g / ne01) * nblk * LB_BYTES(TYPE);
 +    uint w[8];
 +    float s0, s1;
-+    lb_expand(TYPE, row, j32, w, &s0, &s1);
++    lb_expand(TYPE, S, nblk, LB_BI(TYPE, g % ne01, nbr, j32), LB_P(TYPE, j32), w, &s0, &s1);
 +    #pragma unroll
 +    for (int i = 0; i < 8; ++i) {
 +        const char4 c = as_char4(w[i]);
-+        const float s = i < 4 ? s0 : s1;
-+        v[4 * i] = s * c.s0; v[4 * i + 1] = s * c.s1; v[4 * i + 2] = s * c.s2; v[4 * i + 3] = s * c.s3;
++        const float sc = i < 4 ? s0 : s1;
++        v[4 * i] = sc * c.s0; v[4 * i + 1] = sc * c.s1; v[4 * i + 2] = sc * c.s2; v[4 * i + 3] = sc * c.s3;
 +    }
 +}
 +
 +// the low-bit types (kq type index 6..10, iq_low): unit (row r, 32-block j32),
 +// those past K skipped (Q2_0's K need only be a multiple of 64)
 +static inline void deq_lb(const int TYPE, local half * wt, global const uchar * q, ulong wrow0, int row0, int ne01, int n32, int ib) {
-+    const ulong rb = LB_ROW_BYTES(TYPE, n32);
 +#if SG == 8
 +    for (int u = get_local_linear_id(); u < MT * 4; u += NTHR) {
 +        const int sb = ib >> 1, ch = ib & 1;
@@ -1683,7 +1866,7 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-openc
 +        if (j32 >= n32) continue;
 +        const int r = min(row0 + rr, ne01 - 1);
 +        float v[32];
-+        lb_v32(TYPE, q + (wrow0 + r) * rb, j32, v);
++        lb_v32(TYPE, q, wrow0 + r, ne01, n32, j32, v);
 +        put16(wt, rr, 32 * (u & 3),      vload16(0, v));
 +        put16(wt, rr, 32 * (u & 3) + 16, vload16(1, v));
 +    }
@@ -1694,7 +1877,7 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-openc
 +        if (j32 >= n32) continue;
 +        const int r = min(row0 + rr, ne01 - 1);
 +        float v[32];
-+        lb_v32(TYPE, q + (wrow0 + r) * rb, j32, v);
++        lb_v32(TYPE, q, wrow0 + r, ne01, n32, j32, v);
 +        put16(wt, rr, 32 * kb,      vload16(0, v));
 +        put16(wt, rr, 32 * kb + 16, vload16(1, v));
 +    }
@@ -1704,7 +1887,7 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-openc
  // ---- the GEMM body. Per token group: the lane's column `tok` (an f16
  // column of xh, any valid one when the lane has none) and its output byte
  // offset in dst (`outp`, negative: none); `wrow0` is the weight matrix's
-@@ -655,7 +1786,9 @@
+@@ -655,7 +1798,9 @@
  // work-group. ----
  
  #ifndef MAX_EXPERT
@@ -1715,7 +1898,7 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-openc
  #endif
  
  // one work-group
-@@ -696,15 +1829,18 @@
+@@ -696,15 +1841,18 @@
  // copied into a card-side mirror at the same offsets with 16-byte loads (the
  // link's rate; the MoE kernels' own loads reach a tenth of it over the link).
  // Group (c, e): expert e, chunk c of its bytes. ----
@@ -1736,7 +1919,7 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-openc
      }
      barrier(CLK_LOCAL_MEM_FENCE);
      if (!used) return;
-@@ -725,6 +1861,10 @@
+@@ -725,6 +1873,10 @@
      const int p = get_group_id(1);
      int e = ((global const int *)(ids + offi + (p / n_used) * nbi1))[p % n_used];
      if (e < n_split) return;
@@ -1747,7 +1930,7 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-openc
      e -= n_split;
      // chunk c: a contiguous slice, streamed by the group (page by page)
      const ulong base = (ulong) e * n16;
-@@ -823,6 +1963,66 @@
+@@ -823,6 +1975,66 @@
      MM_BODY(deq_iq4_nl(wt, q + offq, dp, wrow0, row0, ne01, ne00 / 32, ib))
  }
  
@@ -1817,7 +2000,7 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-openc
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
 --- a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
-@@ -86,6 +86,1096 @@
+@@ -86,6 +86,1105 @@
      -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
  };
  
@@ -2826,28 +3009,36 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
 +    return (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24);
 +}
 +
-+static inline void lb_expand(const int TYPE, global const uchar * row, int j32, uint * w, float * s0, float * s1,
-+                             local const uint * lt) {
-+    if (TYPE == 6) {          // IQ2_XXS: d, qs[32] as u16
-+        global const uchar * bp = row + (ulong)(j32 >> 3) * 66;
-+        const int p = j32 & 7;
-+        const float d = vload_half(0, (global const half *)bp);
-+        const ushort4 h4 = vload4(0, (global const ushort *)(bp + 2 + 8 * p));
-+        const uint a0 = (uint)h4.s0 | ((uint)h4.s1 << 16), a1 = (uint)h4.s2 | ((uint)h4.s3 << 16);
++#define LB_LT_PARAM , local const uint * lt
++#define LB_GRID_XXS(i) vload2((i), lt)
++#define LB_SIGNS_XXS(i) vload2(256 + (i), lt)
++#define LB_GRID_1M(i) vload2((i), lt)
++// A low-bit slice (one weight matrix, nblk blocks) is kept in planes on the
++// card (ggml-opencl's ggml_cl_lb_planes): IQ2_XXS d | qs[64]; IQ2_S d | qs[32]
++// | signs[32] | qh[8] | scales[8]; Q2_0 d | qs[16]; IQ3_S d | qs[64] | qh[8] |
++// signs[32] | scales[4], each field of every block back to back, so a lane's
++// sub-block fields are aligned 32-bit words (the GGUF blocks of 18, 66, 82 or
++// 110 bytes left them at 2-byte offsets: single-byte loads). IQ1_M stays as
++// stored (its fields are aligned). Block bi of the slice, sub-block p (Q2_0: half).
++static inline void lb_expand(const int TYPE, global const uchar * S, ulong nblk, ulong bi, int p,
++                             uint * w, float * s0, float * s1 LB_LT_PARAM) {
++    if (TYPE == 6) {          // IQ2_XXS
++        const float d = vload_half(bi, (global const half *)S);
++        const uint2 a = vload2(bi * 8 + p, (global const uint *)(S + nblk * 2));
++        const uint a0 = a.s0, a1 = a.s1;
 +        #pragma unroll
 +        for (int l = 0; l < 4; ++l) {
-+            const uint2 g = vload2((a0 >> (8 * l)) & 0xFF, lt);
-+            const uint2 m = vload2(256 + ((a1 >> (7 * l)) & 127), lt);
++            const uint2 g = LB_GRID_XXS((a0 >> (8 * l)) & 0xFF);
++            const uint2 m = LB_SIGNS_XXS((a1 >> (7 * l)) & 127);
 +            w[2 * l]     = lb_sgn4(g.s0, m.s0);
 +            w[2 * l + 1] = lb_sgn4(g.s1, m.s1);
 +        }
 +        *s0 = *s1 = d * (0.5f + (float)(a1 >> 28)) * 0.25f;
-+    } else if (TYPE == 7) {   // IQ2_S: d, qs[32], signs[32], qh[8], scales[8]
-+        global const uchar * bp = row + (ulong)(j32 >> 3) * 82;
-+        const int p = j32 & 7;
-+        const float d = vload_half(0, (global const half *)bp);
-+        const uint qh = bp[66 + p], sc = bp[74 + p];
-+        const uint qw = lb_u32(bp + 2 + 4 * p), sw = lb_u32(bp + 34 + 4 * p);
++    } else if (TYPE == 7) {   // IQ2_S
++        const float d = vload_half(bi, (global const half *)S);
++        const uint qw = ((global const uint *)(S + nblk * 2))[bi * 8 + p];
++        const uint sw = ((global const uint *)(S + nblk * 34))[bi * 8 + p];
++        const uint qh = S[nblk * 66 + bi * 8 + p], sc = S[nblk * 74 + bi * 8 + p];
 +        #pragma unroll
 +        for (int l = 0; l < 4; ++l) {
 +            const uint2 g = LB_TAB2(iq2s_grid, ((qw >> (8 * l)) & 0xFF) | ((qh << (8 - 2 * l)) & 0x300));
@@ -2857,9 +3048,8 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
 +        }
 +        *s0 = d * (0.5f + (float)(sc & 0xF)) * 0.25f;
 +        *s1 = d * (0.5f + (float)(sc >> 4)) * 0.25f;
-+    } else if (TYPE == 8) {   // IQ1_M: qs[32], qh[16], scales[8] (the block scale in their top nibbles)
-+        global const uchar * bp = row + (ulong)(j32 >> 3) * 56;
-+        const int p = j32 & 7;
++    } else if (TYPE == 8) {   // IQ1_M, as stored: qs[32], qh[16], scales[8]
++        global const uchar * bp = S + bi * 56;
 +        global const ushort * sc = (global const ushort *)(bp + 48);
 +        const ushort u = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
 +        const float d = convert_float(as_half(u));
@@ -2872,16 +3062,16 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
 +        const int dl[4] = { (qh0 & 0x08) ? -1 : 1, (qh0 & 0x80) ? -1 : 1, (qh1 & 0x08) ? -1 : 1, (qh1 & 0x80) ? -1 : 1 };
 +        #pragma unroll
 +        for (int l = 0; l < 4; ++l) {
-+            const uint2 g = vload2(idx[l], lt);
++            const uint2 g = LB_GRID_1M(idx[l]);
 +            w[2 * l]     = as_uint(as_char4(g.s0) * (char4)(8) + (char4)(dl[l]));
 +            w[2 * l + 1] = as_uint(as_char4(g.s1) * (char4)(8) + (char4)(dl[l]));
 +        }
 +        *s0 = d * (float)(2 * (s & 7) + 1) * 0.125f;
 +        *s1 = d * (float)(2 * ((s >> 3) & 7) + 1) * 0.125f;
-+    } else if (TYPE == 9) {   // Q2_0: d, qs[16] for 64 weights, four 2-bit codes a byte, value q - 1
-+        global const uchar * bp = row + (ulong)(j32 >> 1) * 18;
-+        const float d = vload_half(0, (global const half *)bp);
-+        const uint cw[2] = { lb_u32(bp + 2 + 8 * (j32 & 1)), lb_u32(bp + 6 + 8 * (j32 & 1)) };
++    } else if (TYPE == 9) {   // Q2_0: p is the half of the 64-weight block
++        const float d = vload_half(bi, (global const half *)S);
++        const uint2 c = vload2(bi * 2 + p, (global const uint *)(S + nblk * 2));
++        const uint cw[2] = { c.s0, c.s1 };
 +        #pragma unroll
 +        for (int i = 0; i < 8; ++i) {
 +            const uint b = (cw[i >> 2] >> (8 * (i & 3))) & 0xFF;
@@ -2889,15 +3079,13 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
 +            w[i] = as_uint(as_char4(v) - (char4)(1));
 +        }
 +        *s0 = *s1 = d;
-+    } else {                  // IQ3_S: d, qs[64], qh[8], signs[32], scales[4]
-+        global const uchar * bp = row + (ulong)(j32 >> 3) * 110;
-+        const int p = j32 & 7;
-+        const float d = vload_half(0, (global const half *)bp);
-+        const uint qh = bp[66 + p];
-+        const uint sc = (bp[106 + p / 2] >> (4 * (p & 1))) & 0xF;
-+        const uint qa = lb_u32(bp + 2 + 8 * p), qb = lb_u32(bp + 6 + 8 * p);
-+        const uint qv[4] = { qa & 0xFFFF, qa >> 16, qb & 0xFFFF, qb >> 16 };
-+        const uint sw = lb_u32(bp + 74 + 4 * p);
++    } else {                  // IQ3_S
++        const float d = vload_half(bi, (global const half *)S);
++        const uint2 q = vload2(bi * 8 + p, (global const uint *)(S + nblk * 2));
++        const uint qv[4] = { q.s0 & 0xFFFF, q.s0 >> 16, q.s1 & 0xFFFF, q.s1 >> 16 };
++        const uint qh = S[nblk * 66 + bi * 8 + p];
++        const uint sw = ((global const uint *)(S + nblk * 74))[bi * 8 + p];
++        const uint sc = (S[nblk * 106 + bi * 4 + p / 2] >> (4 * (p & 1))) & 0xF;
 +        #pragma unroll
 +        for (int l = 0; l < 4; ++l) {
 +            const uint g1 = iq3s_grid[(qv[l] & 0xFF) | ((qh << (8 - 2 * l)) & 256)];
@@ -2910,11 +3098,15 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
 +    }
 +}
 +
++// sub-block j32 of row r: its block in the slice, and p
++#define LB_BI(T, r, nbr, j32) ((ulong)(r) * (nbr) + (ulong)((j32) / LB_SUBS(T)))
++#define LB_P(T, j32)          ((j32) % LB_SUBS(T))
++
 +
  static inline int dot8_ss(const uint * w, uint4 x0, uint4 x1) {
      int a = 0;
      a = dot_acc_sat_4x8packed_ss_int(w[0], x0.s0, a);
-@@ -107,6 +1197,18 @@
+@@ -107,6 +1206,18 @@
  
  // 16 code bytes -> the 32 weights' int8 values: low nibbles are weights
  // 0..15, high nibbles 16..31 (dequantize_row_iq4_nl / _iq4_xs)
@@ -2933,7 +3125,7 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
  static inline void iq4_expand(uint4 q, uint * w) {
      w[0] = kv4(q.s0 & 0x0F0F0F0Fu);        w[1] = kv4(q.s1 & 0x0F0F0F0Fu);
      w[2] = kv4(q.s2 & 0x0F0F0F0Fu);        w[3] = kv4(q.s3 & 0x0F0F0F0Fu);
-@@ -158,6 +1260,59 @@
+@@ -158,6 +1269,61 @@
      }
  }
  
@@ -2948,12 +3140,14 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
 +
 +// the low-bit types (6..10): one 32-weight sub-block per lane, 16 lanes a
 +// step, rows of n32 sub-blocks (Q2_0's K need only be a multiple of 64)
-+static inline void mv_lb(const int TYPE, global const uchar * q, ulong row0_off, int n32, int first_row, int ne01,
++// S: the weight slice (its planes), first_row: the first of the rows taken
++static inline void mv_lb(const int TYPE, global const uchar * S, int n32, int first_row, int ne01,
 +                         global const char * xq, global const float * xd, ulong res,
 +                         global float * out, ulong ostride, local const uint * lt) {
 +    const int lane = get_sub_group_local_id();
 +    const int ne00 = n32 * 32;
-+    const ulong row_bytes = LB_ROW_BYTES(TYPE, n32);
++    const int   nbr  = n32 / LB_SUBS(TYPE);            // blocks a row
++    const ulong nblk = (ulong)ne01 * nbr;             // blocks in the slice
 +    global const char  * xq2 = xq + res;
 +    global const float * xd2 = xd + res / 32;
 +
@@ -2979,7 +3173,7 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
 +            if (first_row + r >= ne01) break;
 +            uint w[8];
 +            float s0, s1;
-+            lb_expand(TYPE, q + row0_off + (ulong)r * row_bytes, b32, w, &s0, &s1, lt);
++            lb_expand(TYPE, S, nblk, LB_BI(TYPE, first_row + r, nbr, b32), LB_P(TYPE, b32), w, &s0, &s1, lt);
 +            #pragma unroll
 +            for (int c = 0; c < NCOLS; ++c) {
 +                acc[r][c] += s0 * (dx[c] * (float)dot4_ss(w, xa[c]) + dy[c] * (float)dot4_ss(w, ya[c])) +
@@ -2993,7 +3187,7 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
  // TYPE 0: IQ3_XXS, 1: IQ4_XS (row_bytes: the row stride in bytes), 2: IQ4_NL
  // flat (q: code plane, dp: scale plane, rows of nb*8 blocks). xq/xd: column
  // 0's codes and scales, the residual term at + res.
-@@ -256,15 +1411,32 @@
+@@ -256,15 +1422,32 @@
  // IQ3_XXS reads its grid and sign tables from local memory: each lane looks
  // up its own entries, and gathers from constant memory measured 74 GB/s
  // against 200 for the IQ4 types (A770).
@@ -3032,12 +3226,12 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
      }
  
  // row byte strides of the blocked types: IQ3_XXS nb*98, IQ4_XS nb*136
-@@ -282,6 +1454,12 @@
+@@ -282,6 +1465,12 @@
      const int first_row = FIRST_ROW;                                                           \
      if (first_row >= ne01) return;                                                             \
      const int nb = ne00 / QK_K;                                                                \
 +    if ((TYPE) >= 6) {                                                                         \
-+        mv_lb(TYPE, q + offq, (ulong)first_row * LB_ROW_BYTES(TYPE, ne00 / 32), ne00 / 32,     \
++        mv_lb(TYPE, q + offq, ne00 / 32,                                                       \
 +              first_row, ne01, xq, xd, (ulong)ne00 * NCOLS, (global float *)(dst + offd), nb1 / sizeof(float), \
 +              (local const uint *)lsigns);                                                     \
 +        return;                                                                                \
@@ -3045,7 +3239,7 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
      if ((TYPE) == 2) {                                                                         \
          mv_iq4_nl(q + offq, dp, (ulong)first_row * (ne00 / 32), ne00 / 32, first_row, ne01,    \
                    xq, xd, (ulong)ne00 * NCOLS, (global float *)(dst + offd), nb1 / sizeof(float)); \
-@@ -294,6 +1472,11 @@
+@@ -294,6 +1483,11 @@
  MV_KERNEL(kernel_mul_mv_iq3_xxs_q8_1, 0)
  MV_KERNEL(kernel_mul_mv_iq4_xs_q8_1, 1)
  MV_KERNEL(kernel_mul_mv_iq4_nl_q8_1, 2)
@@ -3057,12 +3251,12 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
  
  // ---- MUL_MAT_ID (NCOLS = 1 builds): pair k = get_group_id(2), slot
  // i = k % n_used, token t = k / n_used; expert ids[t][i], column
-@@ -324,6 +1507,12 @@
+@@ -324,6 +1518,12 @@
          return;                                                                                \
      }                                                                                          \
      const int col = (i % ne11) + t * ne11;                                                     \
 +    if ((TYPE) >= 6) {                                                                         \
-+        mv_lb(TYPE, q + offq, ((ulong)e * ne01 + first_row) * LB_ROW_BYTES(TYPE, ne00 / 32), ne00 / 32, \
++        mv_lb(TYPE, q + offq + (ulong)e * ne01 * LB_ROW_BYTES(TYPE, ne00 / 32), ne00 / 32,     \
 +              first_row, ne01, xq + (ulong)col * ne00, xd + (ulong)col * (ne00 / 32), res,     \
 +              (global float *)(dst + offd + t * nb2 + i * nb1), 0, (local const uint *)lsigns);   \
 +        return;                                                                                \
@@ -3070,7 +3264,7 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
      if ((TYPE) == 2) {                                                                         \
          mv_iq4_nl(q + offq, dp, ((ulong)e * ne01 + first_row) * (ne00 / 32), ne00 / 32, first_row, ne01, \
                    xq + (ulong)col * ne00, xd + (ulong)col * (ne00 / 32), res,                  \
-@@ -337,3 +1526,301 @@
+@@ -337,3 +1537,306 @@
  MV_ID_KERNEL(kernel_mul_mv_id_iq3_xxs_q8_1, 0)
  MV_ID_KERNEL(kernel_mul_mv_id_iq4_xs_q8_1, 1)
  MV_ID_KERNEL(kernel_mul_mv_id_iq4_nl_q8_1, 2)
@@ -3175,6 +3369,10 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
 +    const int n32 = ne00 / 32;
 +    const ulong rb = TYPE == 0 ? (ulong)(ne00 / QK_K) * 98 : TYPE == 1 ? (ulong)(ne00 / QK_K) * 136 :
 +                     TYPE >= 6 ? LB_ROW_BYTES(TYPE, n32) : 0;
++    // the low-bit types: expert row0 / ne01's slice, in planes
++    const int   lb_nbr  = TYPE >= 6 ? n32 / LB_SUBS(TYPE) : 1;
++    const ulong lb_nblk = (ulong)ne01 * lb_nbr;
++    global const uchar * lb_S = q + (row0 / ne01) * ne01 * rb;
 +    int colk[IDG_MAX], tk[IDG_MAX], ik[IDG_MAX];
 +    #pragma unroll
 +    for (int k = 0; k < IDG_MAX; ++k) {
@@ -3205,7 +3403,8 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
 +                iq4_expand(vload4(0, (global const uint *)(q + blk * 16)), w[r]);
 +                s0[r] = s1[r] = vload_half(blk, dp);
 +            } else {
-+                lb_expand(TYPE, q + row * rb, b32, w[r], &s0[r], &s1[r], (local const uint *)signs);
++                lb_expand(TYPE, lb_S, lb_nblk, LB_BI(TYPE, row % ne01, lb_nbr, b32), LB_P(TYPE, b32), w[r], &s0[r], &s1[r],
++                          (local const uint *)signs);
 +            }
 +        }
 +        #pragma unroll
