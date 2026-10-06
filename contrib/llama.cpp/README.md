@@ -1271,13 +1271,49 @@ the decode-path work Flash-Next and its MTP verify needed on Intel:
 - A matvec grouped by expert for 2-15 tokens (`kernel_mul_mv_idg_*`), opt-in
   only (`GGML_OPENCL_KQ_IDG=1`): slower than a pair a work-group where the
   matvec is not bandwidth-bound (the coder's verify 7.85 -> 9.18 s, A770).
+- **The expert cache's decode matvec reads a missed expert where it lies**
+  (USM host memory, by pointer argument; Strata's expert kernels read its
+  pinned host mirror the same way): no gather into the card-side mirror
+  first (`GGML_OPENCL_BANK_DIRECT=0` gathers). Flash-Next MTP 2: 26.0 ->
+  28.2 t/s.
+- **The order of a verify's expert pairs**: a permutation computed once per
+  layer (`kernel_moe_pair_perm`, the three projections share the ids) puts
+  the pairs read over the link first (`GGML_OPENCL_PAIR_ORDER`, 1 by
+  default): 29.8 -> 30.7 t/s; bank pairs last 29.3.
+- **Q2_0 rows of 20 sub-blocks** (Flash-Next's 2560 x 640 down projections)
+  take 4 lanes a row instead of 16: 135 -> 89 us at 3 tokens, 47 -> 32 at
+  one.
+- **A 2D weight times columns lying back to back** (an MTP step's [K, 4,
+  tokens]) runs as one few-column product; the F32 GEMV takes up to 1,024
+  rows (an MTP layer's F32 router).
+- **F16 / BF16 weights times 16+ columns on the XMX tiles** of the K-quant
+  GEMM (`kernel_mul_mm_f16w_f16`; `GGML_OPENCL_F16_XMX=0` keeps the tiled
+  GEMM): Flash-Next's prompt-side hyper-connection products 4-5x faster
+  (320 x 10240 at 512 tokens 1,907 -> 468 us); the needle's prefill 342.8 ->
+  383.4 t/s.
+- Opt-in, measured no faster served: the hyper-connection read fused into
+  two kernels (`GGML_OPENCL_FUSE_HC_MIX=1`, after Strata's `fused_gr`;
+  31.2 t/s off, 30.8 on), a projection's matvec copying the next
+  projection's misses into a card-side mirror (`GGML_OPENCL_MOE_PREFETCH=1`,
+  31.4 -> 31.6), the K-split F16 kernel with 4 rows a work-group
+  (`GGML_OPENCL_F16_KSPLIT4=1`). `GGML_OPENCL_IQ_OPTS` adds defines to the IQ
+  matvec builds. Measured slower and removed: the IQ4 codebook by byte
+  pairs and per lane in local memory, a per-work-group scan for the pair
+  order.
 
 `test-backend-ops` against the CPU (`measured-here`, B60 and A770): MUL_MAT
 557/557 and MUL_MAT_ID 181/181 for the IQ, low-bit, F16 and BF16 types,
 DSV4_HC_PRE 18/18, DSV4_HC_POST 4/4, ADD 103/103, TOPK_MOE 416/416, SOFT_MAX
 214/214. An unfiltered MUL_MAT_ID run fails the 74 MXFP4 cases on the B60 only, and
 so does the 0021 tree's own build (0/74, `measured-here`): a defect of the
-MXFP4 MoE path on Xe2 that predates this patch, not a type it touches.
+MXFP4 MoE path on Xe2 that predates this patch, not a type it touches. The
+final tree (B60): MUL_MAT f16/bf16 434/434 (the XMX path's red case, K cut
+by 16, fails 7), MUL_MAT_ID IQ/low-bit 193/193 (with Q2_0 at K 640, 384 and
+320; the 4-lane path's red case fails 47 of 87), HC_MIX 10/10 fused (its red
+case, the mix 5 % off, fails 9 of 10), MUL_MAT IQ4_XS/Q4_K 94/94. Run
+`test-backend-ops` from its own `bin/` when the kernels are not embedded,
+and with `-b GPUOpenCL`: a wrong backend name skips everything and still
+prints OK.
 
 Served, B60, Qwen3.8-Flash-Next IQ2_XS from the expert cache, the gate's
 requests (`measured-here`, 2026-10-06): decode 21.3 t/s plain (14,500 MiB of
@@ -1286,4 +1322,6 @@ slots), 27.0 t/s with MTP 2 from an MTP-only file (13,500 MiB), prefill
 differ. Before the patch's decode work: 16.0 and
 13.8. The resident models on the same build: the dense 27B agent (B60, MTP 5)
 35.9 -> 38.7 t/s, the coder (A770, MTP 4) 40.1 -> 43.3 t/s, the long answer
-greedy.
+greedy. With the rest of the patch (2026-10-07): MTP 2 30.7-31.6 t/s
+(13,500-14,500 MiB), MTP 3 with arcint's `--llama-mtp-min-p 0.5` 31.3, the
+needle's prefill 383 t/s; the residents unchanged (38.2 / 43.5).

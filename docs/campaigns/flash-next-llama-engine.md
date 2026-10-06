@@ -425,8 +425,54 @@ The constant-memory gathers stay the fastest IQ4 decode found on the B60
   down rows and stream with the rms scale applied afterwards; a group per 32
   output columns), 1-4 tokens, F16/BF16 weights. test-backend-ops HC_MIX
   10/10 against the CPU at NMSE 1e-5; the red case (the mix 5 % off) fails
-  9 of 10 (the tenth is the 5-token case it does not take). In the served
-  graph it did not fuse yet (being diagnosed).
+  9 of 10 (the tenth is the 5-token case it does not take). Served it fires
+  (the target's 96 sites; the MTP layer's Q8_0 weights are not taken) and
+  pays nothing: 31.2 t/s off, 30.8 on, one binary. Profiled: the down kernel
+  50 us and the up kernel 35 us a site against ~75 us for the five kernels
+  (and 288 fewer launches a verify, 3,679 -> 3,391): the down kernel's 80
+  work-groups, each staging its stream's activations, are slower than the
+  K-split product's 320. Opt-in (`GGML_OPENCL_FUSE_HC_MIX=1`); Strata's
+  answer to the same limit is its v3 split by stream and K half
+  (`fused_gr.cu:300`, `code`), not built here.
+
+- **The order of a verify's expert pairs**, from a permutation computed once
+  per layer (`kernel_moe_pair_perm`, one work-group; the three projections
+  share the ids). One binary, the long text identical across orders
+  (`measured-here`): bank pairs first 30.7 t/s (verify 14.92 s), token order
+  29.8 (15.40), bank pairs last 29.3 (15.68). The link reads that start first
+  overlap more of the slot pairs' work; bank-first is the default
+  (`GGML_OPENCL_PAIR_ORDER`). The earlier bank-first attempt that lost (below)
+  scanned the ids in every work-group.
+- **Where the expert matvecs spend it** (window 25, a profiling build): 456 to
+  953 us a layer averaged over 207 verifies (the gate's, up's and down's
+  together), ~330 us with every expert on the card: the misses cost ~12 ms
+  of an ~80 ms round, concentrated in some layers and some verifies (layer 3
+  once took 1.7 ms).
+- **More slots**: the MTP context's buffer and the direct read left room for
+  14,500 MiB of slots with MTP 2 (10,522 slots, 14.34 GiB): 31.6 t/s, verify
+  14.45 s, answers right. VRAM (`-v`): the target's weights 3,264 MiB, KV
+  768 + 192, recurrent state 338, compute 1,024; the MTP model 1,944 (521 of
+  it its own Q6_K head), KV 80, compute 197.
+
+- **The next projection's misses copied by the current one's matvec**
+  (`GGML_OPENCL_MOE_PREFETCH=1`: gate's work-groups copy up's missed experts
+  into a card-side mirror, up's copy down's; the long text identical): 31.4
+  -> 31.6 t/s, verify 14.54 -> 14.46 s, one binary. The link is the bound,
+  not where its reads sit: a layer's misses are ~3 experts x 3 projections x
+  ~0.5 MB, ~14 ms a verify at 14.3 GB/s, and a layer has no other work for
+  them to overlap after its router. Off by default. Fewer misses (more slots)
+  or fewer bytes per miss are what is left.
+
+- **Prefill: the F16 / BF16 products on XMX.** A 2,048-token chunk spent
+  ~0.9 s of its ~5.1 s of kernels in the hyper-connection products, routers
+  and injects through ggml's generic tiled GEMM (no XMX; the 4-row inject
+  1.9 ms for 84 MFLOP). They now take the K-quant GEMM's XMX tiles with an
+  F16 dequantizer (16+ columns): 320 x 10240 at 512 tokens 1,907 -> 468 us,
+  the inject 1,769 -> 416, 10240 x 320 786 -> 161 (test-backend-ops perf);
+  the needle 342.8 -> 383.4 t/s on one binary, answers right. Strata
+  prefills it at 620.5. What the chunk spends besides (window 25): the
+  expert GEMMs of both branches ~1.5 s, the bank gathers 0.81 s (the link),
+  attention 0.37 s.
 
 Tried and measured slower (`measured-here`, B60, MTP 2, one binary, the long
 text identical): the bank's pairs first in the expert matvec (each
