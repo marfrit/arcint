@@ -212,6 +212,11 @@ Measured (`measured-here`, B60, the GGUF on NVMe, 12,800 MiB of slots:
   What decode spends now is mostly the ~25 % of routed experts read over the
   link (~120 a token, ~264 MB): more slots (the Q8_0 banks off the card: 3.2
   GB) or a better hit rate are the next levers.
+- **Adapt cadence**: every 6 decode tokens instead of Strata's ~13 (every 4
+  verify windows): 78 % of decode's experts on the card and 13.0 t/s against
+  75 % / 12.4-12.6 at 12, 12.8 at 4, 10.0 at 3 (planning cost), 12.4 at 24
+  (short runs; the gate run after the needle 12.5 t/s, prefill 233.8,
+  answered; `measured-here`). A deviation from Strata's cadence, measured.
 - **Tried, no gain**: an integer-dot Q8_0 matvec for the dense Q8_0 weights
   (activations quantized to q8_1 as for the kq path, the IQ4_NL loop with the
   codes read directly; correct, 22/22 `test-backend-ops` cases). Served decode

@@ -1503,10 +1503,10 @@ index 0000000..5e585d4
 +}
 diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
 new file mode 100644
-index 0000000..2ea44c8
+index 0000000..0ae85b9
 --- /dev/null
 +++ b/src/llama-expert-cache.h
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,130 @@
 +#pragma once
 +
 +// A per-expert GPU cache for MoE layers whose expert tensors stay in host
@@ -1603,7 +1603,10 @@ index 0000000..2ea44c8
 +    float    min_gain    = 1.5f;
 +    int      max_swaps   = 96;
 +    float    decay       = 0.7f;
-+    uint32_t adapt_every = 12;          // decode tokens; Strata: every 4 verify windows of ~3 tokens
++    // decode tokens between adapts. Strata: every 4 verify windows of ~3 tokens
++    // (~13); here 6 measured best (B60, Flash-Next: 13.0 t/s, 78 % on the card,
++    // against 12.4-12.6 / 75 % at 12, 12.8 at 4, 10.0 at 3)
++    uint32_t adapt_every = 6;
 +    uint32_t decode_max  = 8;           // a ubatch up to this many tokens counts as decode (Strata MAXT 8)
 +
 +private:
