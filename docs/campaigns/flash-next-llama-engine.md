@@ -212,6 +212,11 @@ Measured (`measured-here`, B60, the GGUF on NVMe, 12,800 MiB of slots:
   What decode spends now is mostly the ~25 % of routed experts read over the
   link (~120 a token, ~264 MB): more slots (the Q8_0 banks off the card: 3.2
   GB) or a better hit rate are the next levers.
+- **Tried, no gain**: an integer-dot Q8_0 matvec for the dense Q8_0 weights
+  (activations quantized to q8_1 as for the kq path, the IQ4_NL loop with the
+  codes read directly; correct, 22/22 `test-backend-ops` cases). Served decode
+  12.6 t/s without it, 12.5 with it; on the 4096 x 14336 test shape 162 us
+  against ggml's 154 (~400 GB/s already). Not shipped (`measured-here`, B60).
 
 Deviations from the references:
 - No share of the misses on the CPU (Strata computes the rest concurrently):
