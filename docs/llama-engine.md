@@ -350,8 +350,17 @@ references and every number):
   (the pin's `convert_hf_to_gguf.py --mtp`: the MTP block, the embedding and
   the LM head), loaded as a second model on the card, as llama.cpp's
   draft-mtp loads one. Flash-Next's GGUFs carry no MTP layer; its head comes
-  from the checkpoint's 31 `mtp.*` tensors. `--llama-mtp-vocab` does not
-  apply to Flash-Next (its draft head reads the hyper-connection-wide row).
+  from the checkpoint's 31 `mtp.*` tensors. With `--llama-mtp-vocab` a
+  hyper-connection model's draft head first mixes the four streams the MTP
+  layer returns (the file's `nextn.hc_head_*` weights, as the model's graph
+  does); on Flash-Next Strata's 106,299-token subset drafted 6 points fewer
+  accepted tokens than the full head and decoded slower (30.6 -> 29.7 t/s).
+- `--llama-mtp-min-p P` stops drafting at a token the MTP head gives less
+  than P and leaves it out of the verify (Strata's `--spec-min-p`); off by
+  default. On Flash-Next IQ2_XS 3 drafts with 0.5 matched 2 without it
+  (30.3 t/s), 4 drafts lost (24.3).
+- The MTP context runs ubatches of at most 512 rows: its compute buffer
+  follows the ubatch (Flash-Next: 774 -> 197 MiB on the card).
 
 Served, the same prompt at temperature 0, 10/10 in every run
 (`measured-here`):

@@ -324,6 +324,126 @@ lookups). Next: one MUL_MAT_ID per projection reading slots and the gathered
 mirror by two base pointers; the Q8_0 path with pointer arguments (3.2 GB more
 slots); prefill gathers overlapped with the previous layer's compute.
 
+### Stage 3c — the misses read where they lie, the draft layer on the card (2026-10-06)
+
+`measured-here`, B60, IQ2_XS, MTP 2 from the MTP-only file, 13,500 MiB of
+slots, the gate's requests, greedy; answers right in every arm (Paris,
+ORANGE-FALCON-77, the long answer), and the long text identical between the
+two window-22 arms.
+
+| change (cumulative) | MTP 2 decode | propose / verify (500 tokens) | accepted | needle prefill |
+|---|---|---|---|---|
+| stage 3b, gather (window 22, same binary as the next row) | 26.0 | 2.28 / 16.87 s | 73.5 % | 296.6 |
+| the expert matvec reads a missed expert from the USM bank itself | 28.2 | 2.29 / 15.40 s | 73.5 % | 295.8 |
+| + a 2D weight times columns lying back to back (an MTP step's [K, 4, tokens]) as one few-column product; the F32 GEMV up to 1,024 rows | 29.9 | 1.56 / 15.11 s | 73.5 % | 324.7 |
+| + the MTP file's routed down experts IQ4_NL instead of Q5_0 | **31.0** | 1.34 / 14.73 s | 74.8 % | 339.5 |
+
+Plain decode with the direct read: 21.9 t/s (21.4 with the gather in
+window 20).
+
+- **The direct read** is Strata's mechanism (the expert kernels read the
+  pinned host mirror, `strata-sycl-b60.md`; `code`): ids at or above the
+  split index the bank in USM host memory by pointer argument instead of the
+  gathered card-side mirror (`GGML_OPENCL_BANK_DIRECT=1`, the decode branch
+  only; prefill's GEMMs still gather). The earlier record of "the MoE
+  kernels' own loads reach ~1.5 GB/s over the link" was taken on the blocks
+  as stored, before the planes gave each lane aligned 32-bit words; it was
+  not a verdict on the mechanism. The verify spends 7.3 ms less a round.
+- **The MTP file's down experts ran on the CPU.** llama-quantize's Q4_K
+  override cannot take K = 640 and fell back to Q5_0, which ggml-opencl has
+  no MUL_MAT_ID for: every draft pass split GPU -> CPU -> GPU
+  (`ggml_vec_dot_q5_0_q8_0` was 7 % of the host's samples during decode,
+  `perf` on the served process). Re-quantized with
+  `--tensor-type ffn_down_exps=iq4_nl` (450 MiB):
+  `mtp-flash-next-q8e4n.gguf`.
+- **The draft pass's batched products** ([K, 4 streams, tokens] against a 2D
+  weight) went to the tiled GEMM through the F16 dequant (Q8_0 `eh_proj`
+  0.96 ms at 2 tokens against 0.06 at one), the F32 router (512 rows) to the
+  tiled GEMM (0.37 ms). Profiled at window 21.
+
+- **The Q2_0 down projections, 4 lanes a row**: a 2560 x 640 row is 20
+  sub-blocks, so the matvec's 16 lanes a row left 12 idle in their second
+  pass. 4 lanes a row with the sub-group's 4 rows side by side (two xor
+  shuffles to reduce): 135 -> 89.4 us at 3 tokens, 46.9 -> 32.0 us at one
+  (test-backend-ops perf, VRAM); served 29.9 -> 30.6 t/s, verify 15.31 ->
+  14.93 s, one binary (`-DLB_NO_LB4` for the off arm). The test's red case
+  (one reduction step dropped) fails 47 of 87 cases; green 193/193.
+
+Kernel microbenchmarks (test-backend-ops perf, B60, weights in VRAM):
+
+| kernel, shape | as built | variant | |
+|---|---|---|---|
+| IQ4_XS dense, 6144 x 2560, 1 / 3 columns | 44.2 / 49.6 us | codebook by byte pairs (256 x ushort, constant): 61.1 / 64.7 | slower |
+| the same | | codebook in local memory, a 16-byte copy per lane: 59.5 / 58.7 | slower |
+| IQ2_S MUL_MAT_ID, 640 x 2560, 30 pairs (random ids) | 120 us | grouped by expert (`idg`): 219 | slower |
+| BF16 320 x 10240, 3 columns | 17.9 us | 4 rows a K-split work-group (`GGML_OPENCL_F16_KSPLIT4=1`): 12.7 | faster in isolation (weights in L2); off by default |
+
+The constant-memory gathers stay the fastest IQ4 decode found on the B60
+(register selects were slower too, stage 3b).
+
+- **The draft head over Strata's 106,299-token subset** (its
+  `data/draft_vocab.bin`, `--llama-mtp-vocab`, now also for hyper-connection
+  models: DraftHead mixes the four streams with the MTP file's
+  `nextn.hc_head_*` weights as `build_hc_mix` does, `code`): propose 1.33 ->
+  1.07 s, but 74.8 -> 68.8 % of drafts accepted: 30.6 -> 29.7 t/s on one
+  binary. Strata drafts from the same subset (`code`, `mtp.cpp:389-403`,
+  "+143 MiB for the draft head" in its log here).
+
+- **Strata's draft stop** (`--llama-mtp-min-p P`, `code`: `mtp.cpp:804`,
+  `generate.cpp:5297`: drafting goes on while a draft's probability under
+  the MTP head is at least P; a draft below P is not verified). Strata ran
+  `--spec 4 --spec-min-p 0.5` here. One binary, 0.5 (`measured-here`):
+
+  | drafts | decode | accepted | propose / verify |
+  |---|---|---|---|
+  | 2, no stop | 30.3-30.6 | 73.5-74.1 % | 1.33 / 14.9-15.1 s |
+  | 2, stop at 0.5 | 29.1 | 84.3 % of 343 | 1.67 / 15.48 s |
+  | 3, stop at 0.5 | 30.3 | 79.4 % of 403 | 1.95 / 14.49 s |
+  | 4, stop at 0.5 | 24.3 | 73.6 % of 454 | 2.19 / 18.33 s |
+
+  The probability was a double-precision softmax over all 248,320 logits on
+  the host, ~0.8 ms a draft; now summed in float over the logits within 16
+  of the top.
+- **The gap between kernels** (a chain of 4096-wide ADDs, test-backend-ops
+  perf): 3.03 us a kernel. compute-runtime debug keys: skipping the walker's
+  post-sync 2.91 us, optimized in-order barriers, L3 prefetch, relaxed
+  ordering, queue drain mode, no cache flush after the walker, no
+  PIPE_CONTROL before the post-sync: 3.00-3.10 us; direct submission off
+  4.38 us. The ~3,900 kernels of a round pay ~11 ms of it: only fewer
+  kernels move it (Strata measured the same on the B70 and cut nodes).
+
+- **The resident models** (`measured-here`, the 500-token long answer twice,
+  each unit's own arguments, the same text across builds): the agent (dense
+  27B, B60, MTP 5) 35.5 / 35.6 t/s on the installed 0.5.12 (patch 0021),
+  38.2 / 38.3 on 0022 as of stage 3b, 38.2 / 38.3 with all of stage 3c; the
+  coder (A770, MTP 4) 40.4 / 40.5, 43.5 / 43.5, 43.5 / 43.4. 0022's general
+  kernels pay for both (+7.6 %, +7.4 %); the Flash-Next-specific work since
+  leaves them unchanged.
+- **A hyper-connection read fused** (Strata's `fused_gr.cu` `gr_down` /
+  `gr_up`, `code`): RMS_NORM, the w_norm MUL, the down product, SCALE, SILU,
+  the up product and the gated DSV4_HC_PRE in two kernels (a group per 16
+  down rows and stream with the rms scale applied afterwards; a group per 32
+  output columns), 1-4 tokens, F16/BF16 weights. test-backend-ops HC_MIX
+  10/10 against the CPU at NMSE 1e-5; the red case (the mix 5 % off) fails
+  9 of 10 (the tenth is the 5-token case it does not take). In the served
+  graph it did not fuse yet (being diagnosed).
+
+Tried and measured slower (`measured-here`, B60, MTP 2, one binary, the long
+text identical): the bank's pairs first in the expert matvec (each
+work-group maps its index so the pairs read over the link start first, to
+overlap them with the slot pairs' work): 30.3 -> 26.5 t/s, verify 15.11 ->
+17.49 s. Kept behind `-DLB_BANK_FIRST`.
+
+With the direct read the expert matvecs take 204-207 us a call (IQ2_S,
+Q2_0; 135 and 122 us reading the card-side mirror), 28.3 of the target
+verify's 60.1 ms of kernels (window 25, a profiling build): the misses' link
+time adds to the slot pairs' instead of overlapping it.
+
+Where the host spends a verify: spinning in `clFinish` (60 % of samples),
+so the host is ahead and the GPU-side gaps between ~3,800 kernels are what
+the wall time adds to the kernel time (82.5 ms a verify against 65.4 ms of
+kernels at window 21).
+
 ## Where it lives
 
 `contrib/llama.cpp/patches/` (ggml-opencl kernels, later the expert tier);

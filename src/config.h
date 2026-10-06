@@ -36,6 +36,10 @@ struct Config {
     // (llama.cpp's converter --mtp: the MTP block, the embeddings and the
     // LM head) instead of the model's own file
     std::string llama_mtp_gguf;
+    // --llama-mtp-min-p P: a draft step continues while its token's
+    // probability under the MTP head is at least P, and a draft below P is
+    // not verified (Strata's --spec-min-p); 0 drafts --llama-mtp tokens always
+    double llama_mtp_min_p = 0.0;
     // --llama-kv K[:V]: the libllama engine's attention cache types, f16,
     // q8_0 or q8_0:q4_0 (V defaults to K). Quantized K/V run on the Intel
     // attention kernels of contrib/llama.cpp 0015.

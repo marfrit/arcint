@@ -1100,6 +1100,22 @@ TEST(config_llama_cpu_moe_and_threads) {
     }
     {
         Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp", "4", "--llama-mtp-min-p", "0.5"};
+        CHECK(parse_args(7, const_cast<char**>(argv), cfg).ok);
+        CHECK(cfg.llama_mtp_min_p == 0.5);
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp-min-p", "0.5"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // a draft threshold without drafts
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp", "4", "--llama-mtp-min-p", "1.5"};
+        CHECK(!parse_args(7, const_cast<char**>(argv), cfg).ok);   // a probability
+    }
+    {
+        Config cfg;
         const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-mtp", "8"};
         CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);   // a verify of 9 rows: the decode attention takes up to 8
     }

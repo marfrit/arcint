@@ -24,6 +24,9 @@
 // those token rows of the output head only, on the model's device: Strata
 // (mtp.hpp:156, 106,299 rows), NInfer (131,072) and HyperQwen (40,960) draft
 // from such a subset, where llama.cpp reads all 248,320 rows a draft step.
+// A hyper-connection model (Qwen3.8-Flash-Next: four streams of 2,560) returns
+// the streams; the head takes their mix (qwen4exp.cpp's build_hc_mix with the
+// nextn.hc_head_* weights), which DraftHead computes before the rows.
 #include "exec/llama_spec.h"
 
 #ifdef ARCINT_LLAMA
@@ -38,6 +41,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -61,7 +65,9 @@ public:
         if (be_ != nullptr) ggml_backend_free(be_);
     }
 
-    bool init(const std::string& gguf, const std::string& ids_path, int n_embd, int n_vocab, std::string& err) {
+    // n_in: the row the MTP context returns (n_embd_out), n_embd: the head's
+    // input (n_embd); they differ by the hyper-connection streams
+    bool init(const std::string& gguf, const std::string& ids_path, int n_in, int n_embd, int n_vocab, std::string& err) {
         std::ifstream f(ids_path, std::ios::binary);
         if (!f) {
             err = "cannot read " + ids_path;
@@ -109,6 +115,43 @@ public:
             return false;
         }
 
+        // the stream mix's weights, from the file that holds output.weight
+        const int hc = n_in / n_embd;
+        std::vector<uint8_t> hc_norm, hc_down, hc_up;
+        ggml_type            t_norm = GGML_TYPE_F32, t_down = GGML_TYPE_F32, t_up = GGML_TYPE_F32;
+        int64_t              hc_lr  = 0;
+        float                eps    = 0.0f;
+        if (n_in != n_embd) {
+            if (n_in % n_embd != 0) {
+                err = "the MTP rows (" + std::to_string(n_in) + ") are not streams of the head's " + std::to_string(n_embd);
+                return false;
+            }
+            int64_t lr_down = 0, lr_up = 0;
+            if (!read_suffix(file, "nextn.hc_head_norm.weight", static_cast<size_t>(n_in), t_norm, hc_norm, nullptr, err) ||
+                !read_suffix(file, "nextn.hc_head_down.weight", static_cast<size_t>(n_in), t_down, hc_down, &lr_down, err) ||
+                !read_suffix(file, "nextn.hc_head_up.weight", 0, t_up, hc_up, &lr_up, err)) {
+                return false;
+            }
+            hc_lr = lr_down;
+            if (t_norm != GGML_TYPE_F32 || hc_lr <= 0 || static_cast<size_t>(hc_up.size()) != ggml_row_size(t_up, hc_lr) * n_in) {
+                err = "unexpected nextn.hc_head_* shapes or types in " + file;
+                return false;
+            }
+            gguf_context* gm = gguf_init_from_file(file.c_str(), gguf_init_params{ true, nullptr });
+            if (gm != nullptr) {
+                const int64_t ka = gguf_find_key(gm, "general.architecture");
+                if (ka >= 0) {
+                    const int64_t ke = gguf_find_key(gm, (std::string(gguf_get_val_str(gm, ka)) + ".attention.layer_norm_rms_epsilon").c_str());
+                    if (ke >= 0) eps = gguf_get_val_f32(gm, ke);
+                }
+                gguf_free(gm);
+            }
+            if (eps <= 0.0f) {
+                err = "no attention.layer_norm_rms_epsilon in " + file;
+                return false;
+            }
+        }
+
         // the model's card: the build's one GPU backend is OpenCL, and the
         // engine pins its platform and device before the model loads
         // (backend_llama.cpp); a second GPU backend would need the model's
@@ -118,11 +161,28 @@ public:
             err = "no GPU backend for the draft head";
             return false;
         }
-        ggml_init_params ip{ ggml_tensor_overhead() * 4 + ggml_graph_overhead(), nullptr, /*no_alloc=*/true };
+        ggml_init_params ip{ ggml_tensor_overhead() * 32 + ggml_graph_overhead(), nullptr, /*no_alloc=*/true };
         ctx_ = ggml_init(ip);
         w_   = ggml_new_tensor_2d(ctx_, type, n_embd, static_cast<int64_t>(ids_.size()));
-        h_   = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, n_embd);
-        out_ = ggml_mul_mat(ctx_, w_, h_);
+        h_   = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, n_in);
+        ggml_tensor* x = h_;
+        ggml_tensor *wn = nullptr, *wd = nullptr, *wu = nullptr;
+        if (hc > 1) {
+            // build_hc_mix (inject none): grouped RMS norm, down, silu(x / hc), up,
+            // the sigmoid gate, the mean over the streams; the same op order
+            wn = ggml_new_tensor_2d(ctx_, GGML_TYPE_F32, n_embd, hc);
+            wd = ggml_new_tensor_2d(ctx_, t_down, n_in, hc_lr);
+            wu = ggml_new_tensor_2d(ctx_, t_up, hc_lr, n_in);
+            ggml_tensor* xn = ggml_mul(ctx_, ggml_rms_norm(ctx_, ggml_reshape_2d(ctx_, h_, n_embd, hc), eps), wn);
+            xn              = ggml_reshape_1d(ctx_, xn, n_in);
+            ggml_tensor* lo = ggml_silu(ctx_, ggml_scale(ctx_, ggml_mul_mat(ctx_, wd, xn), 1.0f / static_cast<float>(hc)));
+            ggml_tensor* g  = ggml_mul(ctx_, xn, ggml_sigmoid(ctx_, ggml_mul_mat(ctx_, wu, lo)));
+            ggml_tensor* m  = ggml_cont(ctx_, ggml_view_1d(ctx_, g, n_embd, 0));
+            for (int c = 1; c < hc; ++c)
+                m = ggml_add(ctx_, m, ggml_view_1d(ctx_, g, n_embd, static_cast<size_t>(c) * n_embd * sizeof(float)));
+            x = ggml_scale(ctx_, m, 1.0f / static_cast<float>(hc));
+        }
+        out_ = ggml_mul_mat(ctx_, w_, x);
         gf_  = ggml_new_graph(ctx_);
         ggml_build_forward_expand(gf_, out_);
         buf_ = ggml_backend_alloc_ctx_tensors(ctx_, be_);
@@ -131,8 +191,13 @@ public:
             return false;
         }
         ggml_backend_tensor_set(w_, rows.data(), 0, rows.size());
+        if (hc > 1) {
+            ggml_backend_tensor_set(wn, hc_norm.data(), 0, hc_norm.size());
+            ggml_backend_tensor_set(wd, hc_down.data(), 0, hc_down.size());
+            ggml_backend_tensor_set(wu, hc_up.data(), 0, hc_up.size());
+        }
         logits_.resize(ids_.size());
-        n_embd_ = n_embd;
+        n_embd_ = n_in;
         return true;
     }
 
@@ -180,12 +245,67 @@ public:
         return false;
     }
 
-    // the token the head input `h` drafts, -1 when the device refuses
-    int pick(const float* h) {
+    // the tensor of `file` whose name ends with `suffix`: its type, its bytes,
+    // and (2D) its row count in `ne1`; `ne0` checked when nonzero
+    static bool read_suffix(const std::string& file, const char* suffix, size_t ne0, ggml_type& type,
+                            std::vector<uint8_t>& data, int64_t* ne1, std::string& err) {
+        ggml_context*    meta = nullptr;
+        gguf_context*    g    = gguf_init_from_file(file.c_str(), gguf_init_params{ /*no_alloc=*/true, &meta });
+        if (g == nullptr) {
+            err = "cannot open " + file;
+            return false;
+        }
+        const size_t ls = std::strlen(suffix);
+        int64_t      ti = -1;
+        for (int64_t i = 0; i < gguf_get_n_tensors(g) && ti < 0; ++i) {
+            const char*  nm = gguf_get_tensor_name(g, i);
+            const size_t ln = std::strlen(nm);
+            if (ln >= ls && std::strcmp(nm + ln - ls, suffix) == 0) ti = i;
+        }
+        bool ok = ti >= 0;
+        if (!ok) err = std::string("no *") + suffix + " in " + file;
+        if (ok) {
+            const ggml_tensor* t = ggml_get_tensor(meta, gguf_get_tensor_name(g, ti));
+            type = gguf_get_tensor_type(g, ti);
+            if (ne0 != 0 && static_cast<size_t>(t->ne[0]) != ne0) {
+                err = std::string(suffix) + ": " + std::to_string(t->ne[0]) + " columns, " + std::to_string(ne0) + " expected";
+                ok  = false;
+            }
+            if (ne1 != nullptr) *ne1 = t->ne[1];
+        }
+        if (ok) {
+            const size_t off = gguf_get_data_offset(g) + gguf_get_tensor_offset(g, ti);
+            data.resize(gguf_get_tensor_size(g, ti));
+            const int fd = ::open(file.c_str(), O_RDONLY);
+            ok = fd >= 0 && ::pread(fd, data.data(), data.size(), static_cast<off_t>(off)) == static_cast<ssize_t>(data.size());
+            if (fd >= 0) ::close(fd);
+            if (!ok) err = std::string("short read of *") + suffix + " from " + file;
+        }
+        gguf_free(g);
+        if (meta != nullptr) ggml_free(meta);
+        return ok;
+    }
+
+    // the token the head input `h` drafts, -1 when the device refuses; with
+    // `prob`, its probability over the subset's rows
+    int pick(const float* h, float* prob = nullptr) {
         ggml_backend_tensor_set(h_, h, 0, static_cast<size_t>(n_embd_) * sizeof(float));
         if (ggml_backend_graph_compute(be_, gf_) != GGML_STATUS_SUCCESS) return -1;
         ggml_backend_tensor_get(out_, logits_.data(), 0, logits_.size() * sizeof(float));
-        return ids_[static_cast<size_t>(std::max_element(logits_.begin(), logits_.end()) - logits_.begin())];
+        const size_t i = static_cast<size_t>(std::max_element(logits_.begin(), logits_.end()) - logits_.begin());
+        if (prob != nullptr) *prob = top_prob(logits_.data(), logits_.size(), logits_[i]);
+        return ids_[i];
+    }
+
+    // the softmax probability of the largest logit `lmax`, for a threshold
+    // test: terms below lmax - 16 (under 1.2e-7 each) are left out, the rest
+    // summed in float (a double exp over 248,320 logits took ~0.8 ms a draft)
+    static float top_prob(const float* l, size_t n, float lmax) {
+        const float cut = lmax - 16.0f;
+        float sum = 0.0f;
+        for (size_t i = 0; i < n; ++i)
+            if (l[i] > cut) sum += std::exp(l[i] - lmax);
+        return 1.0f / sum;
     }
 
 private:
@@ -204,9 +324,9 @@ private:
 class LlamaMtp final : public LlamaSpec {
 public:
     LlamaMtp(llama_model* model, llama_context* ctx_tgt, int n_draft, int n_seq, int n_batch, int n_ubatch,
-             int threads, const std::string& gguf, const std::string& vocab, ggml_type type_k, ggml_type type_v,
-             std::string& err)
-        : ctx_tgt_(ctx_tgt), n_draft_(n_draft) {
+             int threads, const std::string& gguf, const std::string& vocab, double min_p, ggml_type type_k,
+             ggml_type type_v, std::string& err)
+        : ctx_tgt_(ctx_tgt), n_draft_(n_draft), min_p_(static_cast<float>(min_p)) {
         const int n_heads = llama_model_n_layer_nextn(model);
         if (n_heads <= 0) {
             err = "the GGUF has no MTP layer";
@@ -235,7 +355,11 @@ public:
         // n_draft + 1: a follow-up turn continues where the last verify
         // stopped), and a sequence's first (zero-row) entry
         cp.n_batch         = static_cast<uint32_t>(n_batch + n_draft + 2);
-        cp.n_ubatch        = static_cast<uint32_t>(n_ubatch);
+        // the compute buffer follows the ubatch: a prompt's catch-up is the only
+        // large batch, and one MTP layer runs it in 512-row ubatches about as
+        // fast (Flash-Next: 774 MiB of buffer at the target's 2,048, on the card
+        // the expert slots compete for)
+        cp.n_ubatch        = static_cast<uint32_t>(std::min(n_ubatch, 512));
         cp.n_seq_max       = static_cast<uint32_t>(n_seq);
         cp.n_rs_seq        = 0;
         cp.n_outputs_max_per_seq = 1;   // one drafted token a step
@@ -253,7 +377,7 @@ public:
         }
         if (!vocab.empty()) {
             head_ = std::make_unique<DraftHead>();
-            if (!head_->init(gguf, vocab, n_embd_, n_vocab_, err)) return;
+            if (!head_->init(gguf, vocab, n_embd_, llama_model_n_embd(model), n_vocab_, err)) return;
         }
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked=*/false);   // a row for every token
         // rows for the output tokens; with the draft head, every token's (the
@@ -342,16 +466,21 @@ public:
             }
             if (i == 0) ln.mtp_end = pos0 + 1;
             int tok = -1;
+            float prob = 1.0f;
             const float* h = nullptr;
             if (head_) {
                 h   = llama_get_embeddings_nextn_ith(ctx_dft_, nd_ - 1);   // unmasked: the batch index
-                tok = h != nullptr ? head_->pick(h) : -1;
+                tok = h != nullptr ? head_->pick(h, min_p_ > 0.0f ? &prob : nullptr) : -1;
             } else {
                 const float* l = llama_get_logits_ith(ctx_dft_, -1);
                 h   = llama_get_embeddings_nextn_ith(ctx_dft_, -1);
                 tok = l != nullptr ? static_cast<int>(std::max_element(l, l + n_vocab_) - l) : -1;
+                if (tok >= 0 && min_p_ > 0.0f) prob = DraftHead::top_prob(l, static_cast<size_t>(n_vocab_), l[tok]);
             }
             if (h == nullptr || tok < 0) break;
+            // Strata's spec-min-p (src/core/mtp.cpp:804): the chain goes on while
+            // the drafts are likely enough to be verified; one below stays out
+            if (prob < min_p_) break;
             out.push_back(tok);
             std::memcpy(h_step_.data(), h, static_cast<size_t>(n_embd_) * sizeof(float));
             row = h_step_.data();
@@ -467,6 +596,7 @@ private:
     llama_batch_ext*   bt_      = nullptr;
     llama_batch_ext*   bd_      = nullptr;
     int                n_draft_ = 0;
+    float              min_p_   = 0.0f;
     int                n_embd_  = 0;
     int                n_vocab_ = 0;
     int                nd_      = 0;   // entries in bd_
@@ -480,10 +610,10 @@ private:
 
 std::unique_ptr<LlamaSpec> make_llama_mtp(llama_model* model, llama_context* ctx_tgt, int n_draft, int n_seq,
                                           int n_batch, int n_ubatch, int threads, const std::string& gguf,
-                                          const std::string& vocab, ggml_type type_k, ggml_type type_v,
+                                          const std::string& vocab, double min_p, ggml_type type_k, ggml_type type_v,
                                           std::string& err) {
     auto s = std::make_unique<LlamaMtp>(model, ctx_tgt, n_draft, n_seq, n_batch, n_ubatch, threads, gguf, vocab,
-                                        type_k, type_v, err);
+                                        min_p, type_k, type_v, err);
     if (!s->ok() || !err.empty()) return nullptr;
     if (s->head_rows() > 0) log::info("mtp", "draft head: %zu token rows", s->head_rows());
     return s;
