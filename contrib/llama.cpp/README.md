@@ -1258,8 +1258,9 @@ the decode-path work Flash-Next and its MTP verify needed on Intel:
 `test-backend-ops` against the CPU (`measured-here`, B60 and A770): MUL_MAT
 557/557 and MUL_MAT_ID 181/181 for the IQ, low-bit, F16 and BF16 types,
 DSV4_HC_PRE 18/18, DSV4_HC_POST 4/4, ADD 103/103, TOPK_MOE 416/416, SOFT_MAX
-214/214. An unfiltered MUL_MAT_ID run fails 74 MXFP4 cases on the B60 only
-(not a type this patch touches; to be checked against 0021).
+214/214. An unfiltered MUL_MAT_ID run fails the 74 MXFP4 cases on the B60 only, and
+so does the 0021 tree's own build (0/74, `measured-here`): a defect of the
+MXFP4 MoE path on Xe2 that predates this patch, not a type it touches.
 
 Served, B60, Qwen3.8-Flash-Next IQ2_XS from the expert cache, the gate's
 requests (`measured-here`, 2026-10-06): decode 18.4 t/s plain (14,500 MiB of
