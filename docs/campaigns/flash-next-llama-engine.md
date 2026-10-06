@@ -2,9 +2,8 @@
 
 **Open.** Stage 2b (expert cache: slots on the card, a USM bank) passed
 2026-10-06: prefill 235 t/s at 20k, decode 12.4-13.0 (UD-Q3_K_XL). Stage 3
-(2026-10-06): the GSQ-RCO IQ2_XS file runs (patch 0022), 337 t/s prefill and
-16.0 t/s decode, answers right; MTP from an MTP-only file runs but does not
-pay yet (13.8 t/s): a verify costs ~3 plain steps. Strata on the same card
+(2026-10-06): the GSQ-RCO IQ2_XS file runs (patch 0022), 326 t/s prefill;
+decode 18.4 t/s plain and 22.5 with MTP 2 after stage 3b, answers right. Strata on the same card
 reads 620.5 / 37.2-37.8 (`strata-sycl-b60.md`).
 
 ## Charter
@@ -272,6 +271,42 @@ Strata's ~2. Next, in that order: the grouped verify (tile the window's pairs
 by expert with `kernel_moe_route_tiles`, gather unique experts, a matvec over
 an expert's columns); the low-bit kernels' rate (local-memory grids, wide
 aligned loads, as Strata's port did for IQ4_XS / Q6_K); fewer launches.
+
+### Stage 3b — closing the gap to Strata on the same card (2026-10-06, operator: speed first, quality later)
+
+Every arm `measured-here`, B60 (the residents' coder on the A770), the gate's
+requests, greedy, answers right in every row; contrib/llama.cpp patch 0022 at
+its state of each window. Between loads the same binary varies by about
++-0.5-1 t/s on Flash-Next (one 500-token sample a load).
+
+| change (cumulative) | IQ2_XS plain | IQ2_XS MTP 2 | agent (B60, MTP 5) | coder (A770, MTP 4) |
+|---|---|---|---|---|
+| 0022 kernels only | 16.0 | 13.8 | 35.9 | 40.1 |
+| + F16 x 2-8 columns, K-split for few rows, flat ADD, 32-bit low-bit expanders | 17.5 | 17.8 | 38.7 | 43.1 |
+| + fused hyper-connection ops (DSV4_HC_PRE / POST) | 17.8 | | | |
+| + a verify's bank experts gathered once each, 13,500-14,500 MiB of slots | 17.9 | 22.0 | 38.7 | |
+| + the IQ4 codebook per card | 17.8 | 20.9-22.0 | 38.7 | 43.2 |
+| + the MoE router fused (topk_moe) | **18.4** | **22.5** | 38.7 | **43.3** |
+
+Strata's SYCL engine on the same card and file: 37.2-37.8 t/s
+(`strata-sycl-b60.md`).
+
+Tried and measured slower, not kept as defaults (`measured-here`, B60 unless
+named): the matvec grouped by expert for a verify (the coder's verify 7.85 ->
+9.18 s on the A770; Flash-Next 125 -> 131 ms a verify), local-memory grids
+for IQ2_S / IQ3_S (146 -> 245, 255 -> 335 us), u16-vector loads for IQ2_S /
+IQ3_S / Q2_0 (146 -> 229, 255 -> 353, 184 -> 195 us), the IQ4 codebook by
+vector shuffle from registers (129 -> 504 us), by register selects on the B60
+(130 -> 146 us; faster on the A770, where it is kept), 2 or 8 rows a
+sub-group instead of 4 for the kq / IQ matvecs (mixed: IQ4_XS MV_ID 36.6 ->
+27.7 us at 8, Q4_K 77 -> 129 us).
+
+Where a Flash-Next token goes (profiles, `llama-bench` with OpenCL
+profiling): ~4,000 kernels a token at ~5 us of gap each (Strata measured the
+same gap on the B70 and cut nodes); dense IQ4_XS ~8 ms, BF16 ~6 ms, the
+expert matvecs ~11 ms at 60-110 GB/s of weights (the K-quant kernels reach
+377-410 GB/s on their struct-of-arrays planes; the IQ and low-bit kernels
+read blocks as stored), the gathers of missed experts ~5 ms.
 
 Deviations from the references:
 - No share of the misses on the CPU (Strata computes the rest concurrently):
