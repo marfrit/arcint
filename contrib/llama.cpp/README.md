@@ -1164,3 +1164,49 @@ Those are the attention kernel alone; the GEMM alone: pp512 after 4,096
   pin's softcap case); MUL_MAT_ID 338/338, MUL_MAT 1,055/1,055. Not in
   test-backend-ops: q4_0/q4_0 attention at head size 128, plain MUL_MAT
   IQ4_NL with K not a multiple of 256 at more than 4 columns.
+
+## 0021-expert-cache-slots-and-usm-bank.patch
+
+A per-expert cache for MoE layers whose experts stay in host memory
+(`src/llama-expert-cache.{h,cpp}`, `docs/campaigns/flash-next-llama-engine.md`
+"Stage 2b"), after Strata's expert cache and adapt step and FreeToken's
+gather of missing experts (`code`, both). Off unless
+`llama_model_params.expert_cache_bytes` (or `LLAMA_EXPERT_CACHE_MIB`) is set
+and the experts are placed on the CPU (`--n-cpu-moe` / `-cmoe`).
+
+libllama:
+- `llama_model_params.expert_cache_bytes`, `.expert_cache_profile` (Strata's
+  STRP decode profile) and `llama_model_expert_cache_info`; the loader keeps
+  each GGUF shard's path;
+- per layer: slot tensors on the card (the hot experts, sized in bytes), a
+  bank of the other experts in USM host memory, residency tables;
+  `build_moe_ffn` looks the router's ids up in the tables and sums the slot
+  and bank branches; decode's ids are read back once a step for the usage
+  counts; every 12 decode tokens hot bank experts exchange with cold slots
+  on the card's queue.
+
+ggml-opencl:
+- USM host buffers (`clHostMemAllocINTEL`) behind `get_proc_address`
+  ("ggml_backend_opencl_set_alloc_host"), their tensors passed to the kq
+  kernels as pointers; a `cl_mem` over host memory is migrated to the card by
+  the driver (`measured-here`, B60);
+- `get_rows` for I32; slice writes, reads and exchanges of weight tensors in
+  their card layout (Q8_0 and IQ4_NL as scales, then quants); batched reads;
+- the kq MoE kernels skip a pair whose id is -1 (the matvec writes its zeros,
+  the GEMM's tile router drops it after a zero fill of a cache tensor's
+  output); a gather kernel copies the routed experts from a USM bank into a
+  card-side mirror before the kernels run.
+
+ggml-cpu: `MUL_MAT_ID` leaves a row zero for a negative id (both grouping
+loops); unused by 0021's final design, kept for a CPU branch. The K-quant
+matvec returns on a negative id (defensive: the cache takes IQ3_XXS, IQ4_XS
+and IQ4_NL experts, Q8_0 down projections, nothing else).
+
+Measured on the Arc Pro B60 with Qwen3.8-Flash-Next UD-Q3_K_XL from NVMe
+(`measured-here`, 2026-10-06; 12,800 MiB of slots, 36.5 GiB of bank):
+- the 20,045-token needle prefills at 149.6 t/s against stage 1's 81.9 (16
+  expert layers on the card), answered;
+- decode 12.2-12.3 t/s against stage 1's 10.5-12.4; 75 % of decode's routed
+  experts on the card after adaptation;
+- KL against the CPU reference 0.029634 / 95.784 % same top-1, stage 1
+  0.029206 / 95.931 %.

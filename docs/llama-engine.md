@@ -130,6 +130,22 @@ of patch 0002 run the rest on the card. Served on the B60 with 16 expert
 layers on the card: the needle answered, 49.2 t/s prefill at 20k, 10.9 t/s
 decode (`docs/campaigns/flash-next-llama-engine.md`).
 
+**The expert cache** (`--llama-expert-cache MIB --llama-expert-profile FILE`
+with `--llama-cpu-moe 48`; `contrib/llama.cpp` 0021, 2026-10-06). Every
+expert runs on the card. The hot ones sit in slots in VRAM, filled from
+Strata's decode profile and swapped as decode's usage moves. The rest sit in a
+bank in USM host memory, and the routed ones are gathered over the link before
+their kernels run. On the B60 with 12,800 MiB of slots
+(`measured-here`, the same window):
+- the 20,045-token needle prefills at 149.6 t/s, against 81.9 with 16 expert
+  layers on the card, and is answered;
+- decode 12.2-12.3 t/s, against 10.5-12.4; 75 % of decode's routed experts
+  on the card after adaptation;
+- KL against the CPU reference +0.0004 nats, same top-1 -0.15 points.
+
+The bank takes 36.5 GiB of host memory, pinned: the host needs that much
+free beside the page cache.
+
 ## MTP (`--llama-mtp N`)
 
 The GGUF's own MTP head drafts up to N tokens; the target verifies them in

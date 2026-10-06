@@ -45,6 +45,14 @@ struct Config {
     // a prefix with an earlier one resumes from the newest snapshot inside it
     // instead of prefilling from token 0. 0 off.
     int llama_checkpoints     = 32;
+    // --llama-expert-cache MIB / --llama-expert-profile FILE: a per-expert GPU
+    // cache of this many MiB for the MoE layers whose experts --llama-cpu-moe
+    // keeps in host memory, ranked by a Strata STRP profile (empty: round
+    // robin); the other experts in a bank in pinned host memory the card reads
+    // over the link, hot ones swapped in during decode (contrib/llama.cpp
+    // patch 0021). 0 off.
+    int         llama_expert_cache_mib = 0;
+    std::string llama_expert_profile;
     int llama_checkpoint_step = 8192;
     std::string flash_next_ngram_path;  // --flash-next-ngram: FIX D per_layer_token_embd table (24-byte ARCINGRM header + block-quantised payload); admitted only when the artifact's config.json declares an n-gram table (docs/design-qwen-flash-next.md FIX D Link 2)
     // --ngram-gguf: the GGUF shard whose per_layer_token_embd.weight binds a

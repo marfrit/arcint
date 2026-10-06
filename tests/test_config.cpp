@@ -1148,3 +1148,42 @@ TEST(config_llama_checkpoints) {
         CHECK(!parse_args(4, const_cast<char**>(argv), cfg).ok);   // an option of the libllama engine only
     }
 }
+
+TEST(config_llama_expert_cache) {
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf"};
+        CHECK(parse_args(3, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_expert_cache_mib, 0);   // off by default
+        CHECK(cfg.llama_expert_profile.empty());
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-cpu-moe", "48", "--llama-expert-cache", "16384",
+                              "--llama-expert-profile", "/p/expert-profile.bin"};
+        CHECK(parse_args(9, const_cast<char**>(argv), cfg).ok);
+        CHECK_EQ(cfg.llama_expert_cache_mib, 16384);
+        CHECK_EQ(cfg.llama_expert_profile, std::string("/p/expert-profile.bin"));
+    }
+    {
+        // the cache holds experts --llama-cpu-moe keeps in host memory
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-expert-cache", "16384"};
+        CHECK(!parse_args(5, const_cast<char**>(argv), cfg).ok);
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-cpu-moe", "48", "--llama-expert-profile", "/p/x.bin"};
+        CHECK(!parse_args(7, const_cast<char**>(argv), cfg).ok);   // a profile without a cache
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--gguf", "/m/q.gguf", "--llama-cpu-moe", "48", "--llama-expert-cache", "-1"};
+        CHECK(!parse_args(7, const_cast<char**>(argv), cfg).ok);
+    }
+    {
+        Config cfg;
+        const char* argv[] = {"arcint", "--stub", "--llama-expert-cache", "64"};
+        CHECK(!parse_args(4, const_cast<char**>(argv), cfg).ok);   // an option of the libllama engine only
+    }
+}
