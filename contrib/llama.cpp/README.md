@@ -1291,6 +1291,11 @@ the decode-path work Flash-Next and its MTP verify needed on Intel:
   GEMM): Flash-Next's prompt-side hyper-connection products 4-5x faster
   (320 x 10240 at 512 tokens 1,907 -> 468 us); the needle's prefill 342.8 ->
   383.4 t/s.
+- **The QSA indexer's ops on the card**: TOP_K (a radix select a row),
+  CPY F32 <-> I32, FILL / REPEAT / SET_ROWS for F16. Without them the
+  scheduler ran four CPU islands per attention layer (98 splits a Flash-Next
+  verify graph), each draining the queue: decode 32.0 -> 33.0-34.2 t/s,
+  the needle 381 -> 422-425 t/s, the long text identical.
 - Opt-in, measured no faster served: the hyper-connection read fused into
   three kernels (`GGML_OPENCL_FUSE_HC_MIX=1`, after Strata's `fused_gr` v3
   split by stream and K half; 30.8 t/s off, 30.4 on), a projection's matvec copying the next

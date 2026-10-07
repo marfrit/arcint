@@ -562,6 +562,59 @@ the expert matvecs read ~131 GB/s (IQ2_S) to ~173 GB/s (Q2_0, whose decode
 is shifts only) at 3 tokens, against 400-430 GB/s for the dense Q4_K/Q6_K
 products, so the low-bit decode is not bounded by the codebook alone.
 
+### Stage 3e — where a round's time went: the host, and the indexer on the CPU (2026-10-07)
+
+**Strata's kernels on this card** (`measured-here`: its CLI greedy run of the
+long-answer prompt, 500 tokens, the served flags, under `unitrace -d`; 34.1
+t/s traced, 211 rounds of 2.38 tokens): about 64 ms of device time and
+~3,140 kernels a round against arcint's 64.5 ms (60.1 target, 4.4 drafts)
+and ~3,735. Its IQ2_S/IQ2_XXS/IQ1_M gate-up and Q2_0 down kernels take ~27
+ms a round (arcint ~26.6), its GR read ~8 ms (arcint ~8.4). The kernels are
+not the gap; a round is (69.4 ms traced against ~79).
+
+**The gap between kernels is the host's.** A chain of 2,000 tiny dependent
+kernels on the B60 (`measured-here`, a standalone probe): 2.64 us a kernel
+on an OpenCL in-order queue, which is exactly the host's enqueue time (2.62
+us); 0.72 us a kernel, the kernel included, when a 440 ms kernel lets the
+host queue all 2,000 first. SYCL: 2.36 us direct, 1.07 us replaying a
+recorded graph (Strata's "window graphs captured at load"). The driver
+offers no `cl_khr_command_buffer` (`clGetExtensionFunctionAddressForPlatform`
+returns null). Stage 3c's "3.03 us a kernel" and its driver knobs measured
+the host, not the GPU.
+
+**Where the GPU waited** (the profiling build's `cl_trace.json`, host
+enqueue and device start/end per kernel; that build runs at 26.5 t/s): the
+last draft's head to the next verify 8.8 ms a round, the target's head to
+the first draft 1.6 ms, between the drafts 0.6 ms, all with the host late.
+`perf` on the served process: 70 % of its samples wait in
+`ggml_backend_opencl_synchronize`, and the scheduler copies split inputs
+(`ggml_backend_sched_compute_splits`). `GGML_SCHED_DEBUG=2`: a verify graph
+has 98 splits, a draft graph 10. Per attention layer, the QSA indexer's TOP_K,
+its F32<->I32 casts and the F16 FILL / REPEAT / SET_ROWS that build its mask
+had no OpenCL kernel, so the scheduler ran them on the CPU: four round trips
+a layer, each draining the queue.
+
+**Those ops on the card** (0022): TOP_K (a radix select a row, the indices
+unordered as ggml-cpu leaves them), CPY F32->I32 and I32->F32, FILL, REPEAT
+and SET_ROWS for F16. test-backend-ops against the CPU (B60): CPY 144/144,
+FILL 6/6 (two F16 cases added), REPEAT 12/12, SET_ROWS 91/91, TOP_K 525/525;
+the red kernels (each new path broken) fail 2, 2, 2, 16 and abort. Served,
+one session, the long text identical across the arms (`measured-here`):
+
+| build | decode | needle prefill |
+|---|---|---|
+| with the ops (run 1) | 34.2 | 422.4 |
+| without (src-fn31) | 32.0 | 381.4 |
+| with the ops (run 2) | 33.0 | 425.0 |
+
+Answers right in every arm. The residents do not take the indexer: the
+agent 38.2 / 38.3, the coder 43.4 / 43.4, unchanged.
+
+A second long answer right after the first, the cache adapted to that very
+text, decoded at 37.0 t/s (verify 14.42 -> 12.16 s, the same drafts): the
+misses cost ~11 ms a round on this text. Strata's profile placement does not
+adapt, so that run is no comparison; it prices the slot count.
+
 ### Stage 4 (closed 2026-10-07, not built) — Strata's CPU share of the misses
 
 **Retracted premise.** The reference measured here does not use a CPU share

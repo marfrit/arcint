@@ -9,7 +9,31 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      ggml_cl_buffer prealloc_kq_tiles;  // its tiles (expert, first pair, count)
      ggml_cl_buffer prealloc_kq_ntiles; // and their number
      ggml_cl_buffer prealloc_splitk_partial;  // [ksplit * M] partials for split-K GEMV
-@@ -994,10 +995,38 @@
+@@ -882,6 +883,7 @@
+     cl_kernel kernel_sigmoid_f32, kernel_sigmoid_f16;
+     cl_kernel kernel_tri;
+     cl_kernel kernel_fill;
++    cl_kernel kernel_fill_f16 = nullptr;
+     cl_kernel kernel_clamp;
+     cl_kernel kernel_geglu, kernel_reglu, kernel_swiglu, kernel_swiglu_oai, kernel_swiglu_clamp, kernel_geglu_erf,
+               kernel_geglu_quick, kernel_geglu_f16, kernel_reglu_f16, kernel_swiglu_f16, kernel_swiglu_clamp_f16,
+@@ -901,6 +903,7 @@
+ #endif
+     cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0, kernel_get_rows_i32;
+     cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
++    cl_kernel kernel_set_rows_h16_i64 = nullptr, kernel_set_rows_h16_i32 = nullptr;   // F16 rows into F16
+     cl_kernel kernel_set_rows_q8_0_i64, kernel_set_rows_q8_0_i32;
+     cl_kernel kernel_set_rows_q8_0_soa_i64, kernel_set_rows_q8_0_soa_i32;
+     cl_kernel kernel_set_rows_q4_0_i64, kernel_set_rows_q4_0_i32;
+@@ -908,6 +911,7 @@
+     cl_kernel kernel_rope_norm_f32, kernel_rope_norm_f16, kernel_rope_neox_f32, kernel_rope_neox_f16;
+     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
+     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_f32_f32_pack, kernel_cpy_i32_i32;
++    cl_kernel kernel_cpy_f32_i32 = nullptr, kernel_cpy_i32_f32 = nullptr;   // the casts
+     cl_kernel kernel_cpy_f32_f32_flat = nullptr;
+     cl_kernel kernel_mul_mat_f32_f32;
+     cl_kernel kernel_mul_mat_f16_f16;
+@@ -994,10 +998,38 @@
      cl_kernel kernel_kq_quantize_q8_1 = nullptr;
      int       kq_quantize_sg = 0;   // > 0: kernel_kq_quantize_q8_1 is the sub-group kernel of that size
      // per type, ggml_cl_kq_type_index: Q4_K, Q5_K, Q6_K (mul_mv_kq_q8_1.cl),
@@ -52,7 +76,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      // Intel: x f16 GEMM on the XMX units (mul_mm_kq_f16.cl), per type, plain
      // and MUL_MAT_ID; the sub-group size and tiles
      cl_kernel kernel_kq_cvt_f32_f16 = nullptr;
-@@ -1009,11 +1038,12 @@
+@@ -1009,11 +1041,12 @@
      cl_kernel kernel_mul_mm_kq2d[3] = {};
      int       kq2d_tm = 64, kq2d_wg = 16;
      int       kq2d_tm_t[3] = { 64, 64, 64 }, kq2d_wg_t[3] = { 16, 16, 16 };   // per type (GGML_OPENCL_KQ_2D_T<i>)
@@ -68,7 +92,45 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      int       kq_id2_xt = 32, kq_id2_xsg = 16;
      // the route in prealloc_kq_pairs / _tiles / _ntiles: a MoE layer's gate,
      // up and down share their ids tensor, so it is computed once a layer
-@@ -2204,10 +2234,14 @@
+@@ -1046,10 +1079,12 @@
+     cl_kernel kernel_mul_mv_iq4_nl_f32_flat;
+     cl_kernel kernel_solve_tri_f32;
+     cl_kernel kernel_im2col_f32, kernel_im2col_f16;
++    cl_kernel kernel_top_k_f32 = nullptr;   // argsort.cl
+     cl_kernel kernel_argsort_f32_i32;
+     cl_kernel kernel_sum_rows_f32, kernel_sum_rows_f32_4;
+     cl_kernel kernel_cumsum_blk, kernel_cumsum_add;
+     cl_kernel kernel_repeat_f32;
++    cl_kernel kernel_repeat_f16 = nullptr;
+     cl_kernel kernel_pad;
+     cl_kernel kernel_tanh_f32, kernel_tanh_f32_4, kernel_tanh_f32_nc;
+     cl_kernel kernel_tanh_f16, kernel_tanh_f16_4, kernel_tanh_f16_nc;
+@@ -1574,6 +1609,7 @@
+             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+ 
+         CL_CHECK((backend_ctx->kernel_argsort_f32_i32 = clCreateKernel(backend_ctx->program_argsort_f32_i32, "kernel_argsort_f32_i32", &err), err));
++        CL_CHECK((backend_ctx->kernel_top_k_f32 = clCreateKernel(backend_ctx->program_argsort_f32_i32, "kernel_top_k_f32", &err), err));
+         backend_ctx->kernels_loaded_argsort = true;
+     }
+ }
+@@ -1730,6 +1766,7 @@
+             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+ 
+         CL_CHECK((backend_ctx->kernel_fill = clCreateKernel(prog, "kernel_fill_f32", &err), err));
++        CL_CHECK((backend_ctx->kernel_fill_f16 = clCreateKernel(prog, "kernel_fill_f16", &err), err));
+         GGML_LOG_CONT(".");
+ 
+         CL_CHECK(clReleaseProgram(prog));
+@@ -1776,6 +1813,8 @@
+             }
+         }
+         CL_CHECK((backend_ctx->kernel_cpy_i32_i32 = clCreateKernel(prog, "kernel_cpy_i32_i32", &err), err));
++        CL_CHECK((backend_ctx->kernel_cpy_f32_i32 = clCreateKernel(prog, "kernel_cpy_f32_i32", &err), err));
++        CL_CHECK((backend_ctx->kernel_cpy_i32_f32 = clCreateKernel(prog, "kernel_cpy_i32_f32", &err), err));
+         GGML_LOG_CONT(".");
+     }
+ 
+@@ -2204,10 +2243,14 @@
              // columns 106 -> 355 GB/s on Q4_K, the cost of one column). A build
              // the device refuses leaves its kernels null: ggml's path then.
              const char * mv_n[3] = { "kernel_mul_mv_q4_K_q8_1", "kernel_mul_mv_q5_K_q8_1", "kernel_mul_mv_q6_K_q8_1" };
@@ -84,7 +146,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                  cl_program prog = build_program_from_source_optional(backend_ctx, kernel_src.c_str(), opts);
                  if (prog == nullptr) {
                      GGML_LOG_WARN("ggml_opencl: K-quant matvec for %d column(s) not built; ggml's kernels take it\n", nc);
-@@ -2240,22 +2274,55 @@
+@@ -2240,22 +2283,55 @@
  #else
                  const std::string iq_src = read_file("mul_mv_iq_q8_1.cl");
  #endif
@@ -144,7 +206,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                      CL_CHECK(clReleaseProgram(prog));
                      GGML_LOG_CONT(".");
                  }
-@@ -2486,10 +2553,14 @@
+@@ -2486,10 +2562,14 @@
                          }
                      }
                  }
@@ -163,7 +225,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                  // the tokens-as-a MUL_MAT_ID kernel: pairs per tile, sub-groups per
                  // work-group, 32 x 16 on SG 8 (measured-here, the coder's prefill on
                  // an A770: 32 x 16, 32 x 32 and 16 x 32 within 3 %, 64 x 16 1.7x
-@@ -2524,12 +2595,15 @@
+@@ -2524,12 +2604,15 @@
                          CL_CHECK((backend_ctx->kernel_moe_route_tiles = clCreateKernel(mm_prog, "kernel_moe_route_tiles", &err), err));
                          CL_CHECK((backend_ctx->kernel_moe_gather_experts = clCreateKernel(mm_prog, "kernel_moe_gather_experts", &err), err));
                          CL_CHECK((backend_ctx->kernel_moe_gather_pairs   = clCreateKernel(mm_prog, "kernel_moe_gather_pairs", &err), err));
@@ -181,7 +243,24 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                                  std::string id2 = id_n[i];
                                  id2.replace(id2.find("_id_"), 4, "_id2_");
                                  CL_CHECK((backend_ctx->kernel_mul_mm_id2_kq_f16[i] = clCreateKernel(mm_prog, id2.c_str(), &err), err));
-@@ -9192,9 +9266,323 @@
+@@ -3660,6 +3743,7 @@
+         cl_program prog =
+             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+         CL_CHECK((backend_ctx->kernel_repeat_f32 = clCreateKernel(prog, "kernel_repeat_f32", &err), err));
++        CL_CHECK((backend_ctx->kernel_repeat_f16 = clCreateKernel(prog, "kernel_repeat_f16", &err), err));
+         CL_CHECK(clReleaseProgram(prog));
+         GGML_LOG_CONT(".");
+     }
+@@ -3933,6 +4017,8 @@
+         CL_CHECK((backend_ctx->kernel_set_rows_f32_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f32_i32", &err), err));
+         CL_CHECK((backend_ctx->kernel_set_rows_f16_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f16_i64", &err), err));
+         CL_CHECK((backend_ctx->kernel_set_rows_f16_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f16_i32", &err), err));
++        CL_CHECK((backend_ctx->kernel_set_rows_h16_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_h16_i64", &err), err));
++        CL_CHECK((backend_ctx->kernel_set_rows_h16_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_h16_i32", &err), err));
+         CL_CHECK((backend_ctx->kernel_set_rows_q8_0_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_q8_0_i64", &err), err));
+         CL_CHECK((backend_ctx->kernel_set_rows_q8_0_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_q8_0_i32", &err), err));
+         CL_CHECK((backend_ctx->kernel_set_rows_q8_0_soa_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_q8_0_soa_i64", &err), err));
+@@ -9192,9 +9278,323 @@
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
  }
  
@@ -505,7 +584,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
-@@ -9212,6 +9600,25 @@
+@@ -9212,6 +9612,25 @@
              continue;
          }
  
@@ -531,7 +610,54 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
              ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
              i += 2;
-@@ -9824,6 +10231,14 @@
+@@ -9645,6 +10064,9 @@
+                 // TODO: add support
+                 // ref: https://github.com/ggml-org/llama.cpp/pull/14274
+ #pragma message("TODO: implement BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL support (https://github.com/ggml-org/llama.cpp/pull/14661)")
++                if (op->src[0]->type == GGML_TYPE_F16) {   // F16 rows into F16 (a QSA mask's zeros)
++                    return op->type == GGML_TYPE_F16 && (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
++                }
+                 if (op->src[0]->type != GGML_TYPE_F32) {
+                     return false;
+                 }
+@@ -9667,6 +10089,8 @@
+                         case GGML_TYPE_F16:
+                         case GGML_TYPE_F32:
+                             return true;
++                        case GGML_TYPE_I32:   // the cast (ggml_cast), as CPY only
++                            return op->op == GGML_OP_CPY;
+                         default:
+                             return false;
+                     }
+@@ -9682,6 +10106,8 @@
+                     switch (op->type) {
+                         case GGML_TYPE_I32:
+                             return true;
++                        case GGML_TYPE_F32:
++                            return op->op == GGML_OP_CPY;
+                         default:
+                             return false;
+                     }
+@@ -9764,7 +10190,7 @@
+         case GGML_OP_TRI:
+             return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
+         case GGML_OP_FILL:
+-            return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
++            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) && ggml_is_contiguous(op);
+         case GGML_OP_CLAMP:
+             return op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_SOFT_MAX:
+@@ -9775,7 +10201,8 @@
+         case GGML_OP_L2_NORM:
+             return ggml_is_contiguous_rows(op->src[0]);
+         case GGML_OP_REPEAT:
+-            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32; // Assuming F32 for now, can be expanded
++            return (op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) ||
++                   (op->src[0]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16);
+         case GGML_OP_PAD:
+             // TODO: add circular padding support for opencl, see https://github.com/ggml-org/llama.cpp/pull/16985
+             if (ggml_get_op_params_i32(op, 8) != 0) {
+@@ -9824,6 +10251,14 @@
              }
          case GGML_OP_TIMESTEP_EMBEDDING:
              return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
@@ -546,7 +672,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          case GGML_OP_GROUP_NORM:
              return ggml_is_contiguous(op->src[0]);
          case GGML_OP_MUL_MAT:
-@@ -9832,6 +10247,11 @@
+@@ -9832,6 +10267,11 @@
              // (ggml_cl_mul_mv_kq_q8_1, ggml_cl_mul_mm_kq_f16), and are the only
              // path for IQ3_XXS / IQ4_XS; ahead of the Adreno rule below that
              // declines 512 or more columns without the Adreno GEMM
@@ -558,7 +684,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              if (ggml_cl_kq_type_index(op->src[0]->type) >= 0 && kq_q8_1_enabled(backend_ctx) &&
                  op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % ggml_cl_kq_k_unit(op->src[0]->type) == 0 &&
                  op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 && op->src[0]->view_offs == 0 &&
-@@ -9910,6 +10330,10 @@
+@@ -9910,6 +10350,10 @@
                  }
              }
  #ifdef GGML_OPENCL_SOA_Q
@@ -569,7 +695,18 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              if (ggml_cl_kq_type_index(op->src[0]->type) >= 0 && kq_q8_1_enabled(backend_ctx)) {
                  return op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % ggml_cl_kq_k_unit(op->src[0]->type) == 0 &&
                         op->src[0]->view_offs == 0 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
-@@ -10710,6 +11134,49 @@
+@@ -9980,6 +10424,10 @@
+ 
+             return cols <= max_workgroup_size && op->src[0]->type == GGML_TYPE_F32;
+         }
++        case GGML_OP_TOP_K:
++            // F32 rows -> the I32 indices of their k largest (a QSA indexer's block selection)
++            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32 &&
++                   op->src[0]->nb[0] == sizeof(float) && ggml_is_contiguous(op);
+         case GGML_OP_SUM_ROWS:
+         case GGML_OP_CUMSUM:
+             return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
+@@ -10710,6 +11158,49 @@
  
  // USM host buffers: bytes by memcpy; IQ4_NL whole tensors split into scales
  // and quants (as kernel_convert_block_iq4_nl lays them out), each 128-aligned
@@ -619,7 +756,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  static void ggml_cl_usm_set_tensor(ggml_backend_opencl_buffer_context * ctx, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
      ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
      char * base = (char *) ctx->usm + e->offset + tensor->view_offs;
-@@ -10727,6 +11194,11 @@
+@@ -10727,6 +11218,11 @@
          ctx->usm_split[tensor] = { d, q };
          return;
      }
@@ -631,7 +768,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      memcpy(base + offset, data, size);
  }
  
-@@ -10741,6 +11213,16 @@
+@@ -10741,6 +11237,16 @@
      cl_context context = backend_ctx->context;
      cl_command_queue queue = backend_ctx->queue;
  
@@ -648,7 +785,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  #ifdef GGML_OPENCL_SOA_Q
      if (tensor->type == GGML_TYPE_Q1_0) {
          ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
-@@ -12401,6 +12883,21 @@
+@@ -12401,6 +12907,21 @@
  
  static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
      GGML_ASSERT(tensor->extra);
@@ -670,7 +807,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
      ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer->buft->device->context;
      ggml_backend_opencl_context *backend_ctx = dev_ctx->backend_ctx;
-@@ -13933,11 +14430,18 @@
+@@ -13933,11 +14454,18 @@
      g_cache_pairs[slot] = { bank, n_split };
  }
  
@@ -689,7 +826,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  }
  
  static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
-@@ -13959,6 +14463,9 @@
+@@ -13959,6 +14487,9 @@
      if (strcmp(name, "ggml_backend_opencl_reserve_gather") == 0) {
          return (void *) ggml_backend_opencl_reserve_gather;
      }
@@ -699,7 +836,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      if (strcmp(name, "ggml_backend_opencl_pair_bank") == 0) {
          return (void *) ggml_backend_opencl_pair_bank;
      }
-@@ -14360,6 +14867,9 @@
+@@ -14360,6 +14891,9 @@
                      memcpy(dst + b * blk, dq.first + (i2 * bps + b) * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
                      memcpy(dst + b * blk + sizeof(ggml_fp16_t), dq.second + (i2 * bps + b) * qb, qb);
                  }
@@ -709,7 +846,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              } else {
                  ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
                  memcpy(data, (const char *) bctx->usm + e->offset + (size_t) i2 * tensor->nb[2], (size_t) n * tensor->nb[2]);
-@@ -14492,6 +15002,9 @@
+@@ -14492,6 +15026,9 @@
                      memcpy(dq.first + (i2 * bps + b) * sizeof(ggml_fp16_t), src + b * blk, sizeof(ggml_fp16_t));
                      memcpy(dq.second + (i2 * bps + b) * qb, src + b * blk + sizeof(ggml_fp16_t), qb);
                  }
@@ -719,7 +856,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              } else {
                  ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
                  memcpy((char *) bctx->usm + e->offset + (size_t) i2 * tensor->nb[2], data, (size_t) n * tensor->nb[2]);
-@@ -14537,6 +15050,10 @@
+@@ -14537,6 +15074,10 @@
          return;
      }
  #endif
@@ -730,7 +867,20 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      {
          // a plain tensor: a non-blocking write; the caller keeps `data` until the
          // next synchronization (llama_expert_cache's tables live in the layer)
-@@ -14779,9 +15296,17 @@
+@@ -14615,6 +15156,12 @@
+                             : backend_ctx->kernel_set_rows_f32_i32;
+                 break;
+             case GGML_TYPE_F16:
++                if (src0->type == GGML_TYPE_F16) {   // F16 rows (a QSA mask's zeros)
++                    kernel = (src1->type == GGML_TYPE_I64)
++                                ? backend_ctx->kernel_set_rows_h16_i64
++                                : backend_ctx->kernel_set_rows_h16_i32;
++                    break;
++                }
+                 kernel = (src1->type == GGML_TYPE_I64)
+                             ? backend_ctx->kernel_set_rows_f16_i64
+                             : backend_ctx->kernel_set_rows_f16_i32;
+@@ -14779,9 +15326,17 @@
  
      cl_kernel kernel;
  
@@ -750,7 +900,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          GGML_ASSERT(ggml_is_contiguous(src0));
          GGML_ASSERT(ne11 == 1);
      }
-@@ -14790,7 +15315,7 @@
+@@ -14790,7 +15345,7 @@
          GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
          if (bcast_row) {
              kernel = backend_ctx->kernel_add_row;
@@ -759,7 +909,41 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
              CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
              CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra1->data_device));
-@@ -17577,6 +18102,70 @@
+@@ -16014,13 +16569,21 @@
+     memcpy(&v, ((int32_t *) dst->op_params), sizeof(float));
+ 
+     const int64_t n = ggml_nelements(dst);
++    const int     ni = (int) n;
+ 
+-    cl_kernel kernel = backend_ctx->kernel_fill;
++    cl_kernel kernel = dst->type == GGML_TYPE_F16 ? backend_ctx->kernel_fill_f16 : backend_ctx->kernel_fill;
+ 
+     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extrad->data_device));
+     CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offsetd));
+-    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(float),    &v));
+-    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(float),    &n));
++    if (dst->type == GGML_TYPE_F16) {
++        // the half's bits from here: the kernels build with -cl-finite-math-only
++        const ggml_fp16_t h = ggml_fp32_to_fp16(v);
++        cl_ushort hb; memcpy(&hb, &h, sizeof(hb));
++        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_ushort), &hb));
++    } else {
++        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(float),    &v));
++    }
++    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(int),      &ni));
+ 
+     size_t local_work_size[1] = { 256 };
+     size_t global_work_size[1] = { ((size_t)n + local_work_size[0] - 1) / local_work_size[0] * local_work_size[0] };
+@@ -17225,7 +17788,7 @@
+     const cl_ulong nb2 = dst->nb[2];
+     const cl_ulong nb3 = dst->nb[3];
+ 
+-    cl_kernel kernel = backend_ctx->kernel_repeat_f32;
++    cl_kernel kernel = dst->type == GGML_TYPE_F16 ? backend_ctx->kernel_repeat_f16 : backend_ctx->kernel_repeat_f32;
+ 
+     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+     CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+@@ -17577,6 +18140,70 @@
      }
  }
  
@@ -830,7 +1014,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  static void ggml_cl_timestep_embedding(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -24733,6 +25322,21 @@
+@@ -24733,6 +25360,21 @@
  // the single branch: the mirror for the matvec's trailing arguments
  static cl_mem g_kq_single_q = nullptr, g_kq_single_d = nullptr;
  static int    g_kq_single_split = 0;
@@ -852,7 +1036,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
  static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, cl_uint & a) {
      const ggml_tensor * soa0 = src0->view_src != nullptr ? src0->view_src : src0;
-@@ -24748,7 +25352,7 @@
+@@ -24748,7 +25390,7 @@
          // base and the offset, or IQ4_NL's scales and quants)
          auto * bctx = (ggml_backend_opencl_buffer_context *) soa0->buffer->context;
          if (bctx->usm) {
@@ -861,7 +1045,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                  ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *)src0->extra;
                  const cl_ulong off = e->offset + src0->view_offs;
                  CL_CHECK(g_cl_set_arg_ptr(kernel, a++, bctx->usm));
-@@ -24756,7 +25360,7 @@
+@@ -24756,7 +25398,7 @@
                  CL_CHECK(g_cl_set_arg_ptr(kernel, a++, bctx->usm));
                  return;
              }
@@ -870,7 +1054,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              const auto & dq = bctx->usm_split.at(soa0);
              const cl_ulong off = 0;
              CL_CHECK(g_cl_set_arg_ptr(kernel, a++, dq.second));
-@@ -24765,7 +25369,7 @@
+@@ -24765,7 +25407,7 @@
              return;
          }
      }
@@ -879,7 +1063,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *)src0->extra;
          const cl_ulong off = e->offset + src0->view_offs;
          CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &e->data_device));
-@@ -24807,13 +25411,19 @@
+@@ -24807,13 +25449,19 @@
          case GGML_TYPE_IQ3_XXS: return 3;
          case GGML_TYPE_IQ4_XS:  return 4;
          case GGML_TYPE_IQ4_NL:  return 5;
@@ -901,7 +1085,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  }
  
  // Q4_K and Q5_K subtract a min per sub-block: their kernels read the
-@@ -25062,14 +25672,28 @@
+@@ -25062,14 +25710,28 @@
  // over a work-group; more: the tiled GEMM with K cut into slices run as its
  // batch dimension, then the slices summed. GGML_OPENCL_F32_SKINNY=0 keeps
  // ggml's paths. Returns whether it took the product.
@@ -931,7 +1115,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
          return false;
      }
-@@ -25167,10 +25791,111 @@
+@@ -25167,10 +25829,111 @@
  
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
  
@@ -1043,7 +1227,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      // quant kv without FA
      // used for non-contiguous src0 (the usual head-major permuted K view when n_head_kv>1)
      // AND for the contiguous case that occurs when n_head_kv==1 (e.g. Gemma-4 E2B)
-@@ -27611,6 +28336,27 @@
+@@ -27611,6 +28374,27 @@
      const bool id2 = gemm && (id2_env == nullptr ? id2_default : atoi(id2_env) != 0) && backend_ctx->kernel_mul_mm_id2_kq_f16[ti] != nullptr;
      cl_kernel kernel = id2 ? backend_ctx->kernel_mul_mm_id2_kq_f16[ti] :
                         gemm ? backend_ctx->kernel_mul_mm_id_kq_f16[ti] : backend_ctx->kernel_mul_mv_id_kq_q8_1[ti];
@@ -1071,7 +1255,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      if (kernel == nullptr) {
          return false;
      }
-@@ -27651,14 +28397,62 @@
+@@ -27651,14 +28435,62 @@
              if (it != g_cache_pairs.end()) { bank0 = it->second.first; n_split = it->second.second; single = true; }
          }
          auto * bctx0 = (ggml_backend_opencl_buffer_context *) bank0->buffer->context;
@@ -1138,7 +1322,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                      cl_kernel kg = backend_ctx->kernel_moe_gather_pairs;
                      CL_CHECK(g_cl_set_arg_ptr(kg, 0, src));
                      CL_CHECK(clSetKernelArg(kg, 1, sizeof(cl_mem),   &stage.buffer));
-@@ -27669,7 +28463,7 @@
+@@ -27669,7 +28501,7 @@
                      CL_CHECK(clSetKernelArg(kg, 6, sizeof(int),      &n_used));
                      CL_CHECK(clSetKernelArg(kg, 7, sizeof(int),      &n_split));
                      size_t g_local[2]  = { 256, 1 };
@@ -1147,7 +1331,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                      backend_ctx->enqueue_ndrange_kernel(kg, 2, g_global, g_local, dst);
                      return stage.buffer;
                  }
-@@ -27682,8 +28476,10 @@
+@@ -27682,8 +28514,10 @@
                  CL_CHECK(clSetKernelArg(kg, 5, sizeof(cl_ulong), &nbi1));
                  CL_CHECK(clSetKernelArg(kg, 6, sizeof(int),      &n_used));
                  CL_CHECK(clSetKernelArg(kg, 7, sizeof(int),      &n_tok));
@@ -1159,7 +1343,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                  backend_ctx->enqueue_ndrange_kernel(kg, 2, g_global, g_local, dst);
                  return stage.buffer;
              };
-@@ -27701,11 +28497,12 @@
+@@ -27701,11 +28535,12 @@
                  // goes in the matvec's trailing ones (below)
                  g_kq_single_q = g_kq_stage_q; g_kq_single_d = g_kq_stage_d != nullptr ? g_kq_stage_d : g_kq_stage_q;
                  g_kq_single_split = n_split;
@@ -1173,7 +1357,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
      cl_uint a = 0;
      if (!gemm) {
-@@ -27735,11 +28532,132 @@
+@@ -27735,11 +28570,132 @@
              const cl_mem q2 = g_kq_single_q != nullptr ? g_kq_single_q : extrad->data_device;
              const cl_mem d2 = g_kq_single_d != nullptr ? g_kq_single_d : extrad->data_device;
              const int    ns = g_kq_single_q != nullptr ? g_kq_single_split : INT_MAX;
@@ -1308,7 +1492,77 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          size_t global_work_size[] = { (size_t)CEIL_DIV(ne01, rows_per_wg) * 16, 4, (size_t)n_used * n_tok };
          size_t local_work_size[]  = { 16, 4, 1 };
          backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
-@@ -31955,6 +32873,18 @@
+@@ -30361,6 +31317,9 @@
+                     kernel = ne00 < 32 ? backend_ctx->kernel_cpy_f32_f32_pack
+                                        : backend_ctx->kernel_cpy_f32_f32;
+                     break;
++                case GGML_TYPE_I32:
++                    kernel = backend_ctx->kernel_cpy_f32_i32;
++                    break;
+                 default:
+                     GGML_ASSERT(false && "not implemented");
+             }
+@@ -30382,6 +31341,9 @@
+                 case GGML_TYPE_I32:
+                     kernel = backend_ctx->kernel_cpy_i32_i32;
+                     break;
++                case GGML_TYPE_F32:
++                    kernel = backend_ctx->kernel_cpy_i32_f32;
++                    break;
+                 default:
+                     GGML_ASSERT(false && "not implemented");
+             }
+@@ -31095,6 +32057,49 @@
+     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+ }
+ 
++// TOP_K (argsort.cl, kernel_top_k_f32): a work-group of 256 per row; the k
++// indices land in the row of dst unordered, as ggml-cpu leaves them
++static void ggml_cl_top_k(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    GGML_ASSERT(src0);
++    GGML_ASSERT(src0->extra);
++    GGML_ASSERT(dst);
++    GGML_ASSERT(dst->extra);
++    GGML_UNUSED(src1);
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_I32);
++
++    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
++    load_cl_kernels_argsort(backend_ctx);
++
++    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++    const cl_ulong offset0 = extra0->offset + src0->view_offs;
++    const cl_ulong offsetd = extrad->offset + dst->view_offs;
++
++    const int      ne00 = (int) src0->ne[0];
++    const cl_ulong nb01 = src0->nb[1], nb02 = src0->nb[2], nb03 = src0->nb[3];
++    const int      k    = (int) dst->ne[0];
++    const cl_ulong nb1  = dst->nb[1], nb2 = dst->nb[2], nb3 = dst->nb[3];
++    GGML_ASSERT(k <= ne00);
++
++    cl_kernel kernel = backend_ctx->kernel_top_k_f32;
++    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
++    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
++    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(int),      &ne00));
++    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &nb01));
++    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_ulong), &nb02));
++    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &nb03));
++    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &k));
++    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nb1));
++    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb2));
++    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb3));
++
++    size_t global_work_size[] = { (size_t) src0->ne[1] * 256, (size_t) src0->ne[2], (size_t) src0->ne[3] };
++    size_t local_work_size[]  = { 256, 1, 1 };
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++}
++
+ static void ggml_cl_argsort(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+@@ -31955,6 +32960,18 @@
              }
              ggml_cl_timestep_embedding(backend, tensor->src[0], tensor);
              return true;
@@ -1327,6 +1581,208 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          case GGML_OP_MUL_MAT:
              if (!any_on_device && !ggml_cl_can_mul_mat(tensor->src[0], tensor->src[1], tensor)) {
                  return false;
+@@ -32024,6 +33041,12 @@
+             }
+             func = ggml_cl_argsort;
+             break;
++        case GGML_OP_TOP_K:
++            if (!any_on_device) {
++                return false;
++            }
++            func = ggml_cl_top_k;
++            break;
+         case GGML_OP_SUM_ROWS:
+             if (!any_on_device) {
+                 return false;
+diff --git a/ggml/src/ggml-opencl/kernels/argsort.cl b/ggml/src/ggml-opencl/kernels/argsort.cl
+--- a/ggml/src/ggml-opencl/kernels/argsort.cl
++++ b/ggml/src/ggml-opencl/kernels/argsort.cl
+@@ -84,3 +84,67 @@
+         dst[row * ne00 + col] = dst_row[col];
+     }
+ }
++
++// TOP_K: the indices of the k largest values of each F32 row, unordered (ggml's
++// GGML_OP_TOP_K). A work-group per row: four 8-bit radix passes over an
++// order-preserving integer key find the k-th largest key T exactly, then the
++// keys above T and enough of the keys equal to T are written. Integer keys,
++// because these programs build with -cl-finite-math-only and -inf is common.
++#define TOPK_WG 256
++static inline uint topk_key(float f) {
++    const uint u = as_uint(f);
++    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
++}
++kernel void kernel_top_k_f32(
++        global const char * src0, ulong offset0,
++        global       char * dst,  ulong offsetd,
++        int ne00, ulong nb01, ulong nb02, ulong nb03,
++        int k,    ulong nb1,  ulong nb2,  ulong nb3) {
++    local int hist[256];
++    local uint s_prefix;
++    local int  s_need;
++    local int  s_gt, s_eq;
++    const int lid = get_local_id(0);
++    const int i1 = get_group_id(0), i2 = get_group_id(1), i3 = get_group_id(2);
++    global const float * x = (global const float *)(src0 + offset0 + i1*nb01 + i2*nb02 + i3*nb03);
++    global int * y = (global int *)(dst + offsetd + i1*nb1 + i2*nb2 + i3*nb3);
++    if (lid == 0) { s_prefix = 0; s_need = k; }
++    barrier(CLK_LOCAL_MEM_FENCE);
++    for (int pass = 0; pass < 4; ++pass) {
++        const int shift = 24 - 8 * pass;
++        const uint mask = pass == 0 ? 0u : (0xFFFFFFFFu << (shift + 8));
++        for (int b = lid; b < 256; b += TOPK_WG) hist[b] = 0;
++        barrier(CLK_LOCAL_MEM_FENCE);
++        const uint prefix = s_prefix;
++        for (int j = lid; j < ne00; j += TOPK_WG) {
++            const uint key = topk_key(x[j]);
++            if ((key & mask) == prefix) atomic_inc(&hist[(key >> shift) & 0xFF]);
++        }
++        barrier(CLK_LOCAL_MEM_FENCE);
++        if (lid == 0) {
++            // the bin, from the top, where the k-th largest lies
++            int need = s_need, b = 255;
++            for (; b > 0; --b) {
++                if (hist[b] >= need) break;
++                need -= hist[b];
++            }
++            s_prefix = prefix | ((uint)b << shift);
++            s_need = need;
++        }
++        barrier(CLK_LOCAL_MEM_FENCE);
++    }
++    const uint T = s_prefix;
++    const int n_eq = s_need;   // keys equal to T to take
++    if (lid == 0) { s_gt = 0; s_eq = 0; }
++    barrier(CLK_LOCAL_MEM_FENCE);
++    const int n_gt = k - n_eq;
++    for (int j = lid; j < ne00; j += TOPK_WG) {
++        const uint key = topk_key(x[j]);
++        if (key > T) {
++            y[atomic_inc(&s_gt)] = j;
++        } else if (key == T) {
++            const int e = atomic_inc(&s_eq);
++            if (e < n_eq) y[n_gt + e] = j;
++        }
++    }
++}
+diff --git a/ggml/src/ggml-opencl/kernels/cpy.cl b/ggml/src/ggml-opencl/kernels/cpy.cl
+--- a/ggml/src/ggml-opencl/kernels/cpy.cl
++++ b/ggml/src/ggml-opencl/kernels/cpy.cl
+@@ -311,3 +311,94 @@
+         }
+     }
+ }
++
++// the casts F32 -> I32 (truncation, as ggml-cpu) and I32 -> F32, laid out as kernel_cpy_i32_i32
++kernel void kernel_cpy_f32_i32(
++        global float * src0,
++        ulong offset0,
++        global int * dst,
++        ulong offsetd,
++        int ne00,
++        int ne01,
++        int ne02,
++        int ne03,
++        ulong nb00,
++        ulong nb01,
++        ulong nb02,
++        ulong nb03,
++        int ne0,
++        int ne1,
++        int ne2,
++        int ne3,
++        ulong nb0,
++        ulong nb1,
++        ulong nb2,
++        ulong nb3
++) {
++    src0 = (global float*)((global char*)src0 + offset0);
++    dst = (global int*)((global char*)dst + offsetd);
++
++    int i03 = get_group_id(2);
++    int i02 = get_group_id(1);
++    int i01 = get_group_id(0);
++
++    int n = i03*ne02*ne01*ne00 + i02*ne01*ne00 + i01*ne00;
++
++    int i3 = n / (ne2*ne1*ne0);
++    int i2 = (n - i3*ne2*ne1*ne0) / (ne1*ne0);
++    int i1 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0) / ne0;
++    int i0 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0 - i1*ne0);
++
++    global int * dst_data = (global int *) ((global char *) dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
++
++    for (int i00 = get_local_id(0); i00 < ne00; i00 += get_local_size(0)) {
++        global const float * src = (global float *)((global char *) src0 + i03*nb03 + i02*nb02 + i01*nb01 + i00*nb00);
++
++        dst_data[i00] = (int) src[0];   // truncation, as ggml-cpu casts
++    }
++}
++
++kernel void kernel_cpy_i32_f32(
++        global int * src0,
++        ulong offset0,
++        global float * dst,
++        ulong offsetd,
++        int ne00,
++        int ne01,
++        int ne02,
++        int ne03,
++        ulong nb00,
++        ulong nb01,
++        ulong nb02,
++        ulong nb03,
++        int ne0,
++        int ne1,
++        int ne2,
++        int ne3,
++        ulong nb0,
++        ulong nb1,
++        ulong nb2,
++        ulong nb3
++) {
++    src0 = (global int*)((global char*)src0 + offset0);
++    dst = (global float*)((global char*)dst + offsetd);
++
++    int i03 = get_group_id(2);
++    int i02 = get_group_id(1);
++    int i01 = get_group_id(0);
++
++    int n = i03*ne02*ne01*ne00 + i02*ne01*ne00 + i01*ne00;
++
++    int i3 = n / (ne2*ne1*ne0);
++    int i2 = (n - i3*ne2*ne1*ne0) / (ne1*ne0);
++    int i1 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0) / ne0;
++    int i0 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0 - i1*ne0);
++
++    global float * dst_data = (global float *) ((global char *) dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
++
++    for (int i00 = get_local_id(0); i00 < ne00; i00 += get_local_size(0)) {
++        global const int * src = (global int *)((global char *) src0 + i03*nb03 + i02*nb02 + i01*nb01 + i00*nb00);
++
++        dst_data[i00] = (float) src[0];
++    }
++}
+diff --git a/ggml/src/ggml-opencl/kernels/fill.cl b/ggml/src/ggml-opencl/kernels/fill.cl
+--- a/ggml/src/ggml-opencl/kernels/fill.cl
++++ b/ggml/src/ggml-opencl/kernels/fill.cl
+@@ -15,3 +15,16 @@
+         dst[get_global_id(0)] = v;
+     }
+ }
++
++// F16: the value's half bits from the host
++__kernel void kernel_fill_f16(
++        __global ushort *dst,
++        ulong offsetd,
++        ushort v,
++        int n
++) {
++    dst = (global ushort*)((global char*)dst + offsetd);
++    if(get_global_id(0) < n){
++        dst[get_global_id(0)] = v;
++    }
++}
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 --- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl
@@ -4722,6 +5178,159 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl b/ggml/src/ggml-open
              }
          }
      }
+diff --git a/ggml/src/ggml-opencl/kernels/repeat.cl b/ggml/src/ggml-opencl/kernels/repeat.cl
+--- a/ggml/src/ggml-opencl/kernels/repeat.cl
++++ b/ggml/src/ggml-opencl/kernels/repeat.cl
+@@ -36,3 +36,42 @@
+         *((global float *)(dst_ptr + i0*nb0)) = *((global float *)(src0_ptr + i00*nb00));
+     }
+ }
++
++kernel void kernel_repeat_f16(
++        global const char * src0,
++        ulong               offset0,
++        global       char * dst,
++        ulong               offsetd,
++        int     ne00,
++        int     ne01,
++        int     ne02,
++        int     ne03,
++        ulong   nb00,
++        ulong   nb01,
++        ulong   nb02,
++        ulong   nb03,
++        int     ne0,
++        ulong   nb0,
++        ulong   nb1,
++        ulong   nb2,
++        ulong   nb3
++) {
++    src0 = src0 + offset0;
++    dst  = dst  + offsetd;
++
++    const int i3 = get_group_id(2);
++    const int i2 = get_group_id(1);
++    const int i1 = get_group_id(0);
++
++    const int i03 = i3%ne03;
++    const int i02 = i2%ne02;
++    const int i01 = i1%ne01;
++
++    global const char * src0_ptr = src0 + i03*nb03 + i02*nb02 + i01*nb01;
++    global       char * dst_ptr  = dst  +  i3*nb3  +  i2*nb2  +  i1*nb1;
++
++    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
++        const int i00 = i0%ne00;
++        *((global ushort *)(dst_ptr + i0*nb0)) = *((global const ushort *)(src0_ptr + i00*nb00));
++    }
++}
+diff --git a/ggml/src/ggml-opencl/kernels/set_rows.cl b/ggml/src/ggml-opencl/kernels/set_rows.cl
+--- a/ggml/src/ggml-opencl/kernels/set_rows.cl
++++ b/ggml/src/ggml-opencl/kernels/set_rows.cl
+@@ -706,3 +706,103 @@
+         quantize_q4_0_block(x, qs, d_bk);
+     }
+ }
++
++// F16 rows into an F16 tensor
++kernel void kernel_set_rows_h16_i32(
++        global char * src0,
++        ulong         offset0,
++        global char * src1,
++        ulong         offset1,
++        global char * dst,
++        ulong         offsetd,
++        int           ne01,
++        ulong         nb01,
++        ulong         nb02,
++        ulong         nb03,
++        uint4         ne11,
++        uint4         ne12,
++        ulong         nb10,
++        ulong         nb11,
++        ulong         nb12,
++        int           nblk0,
++        ulong         nb1,
++        ulong         nb2,
++        ulong         nb3
++) {
++    src0 = src0 + offset0;
++    src1 = src1 + offset1;
++    dst  = dst  + offsetd;
++
++    int i03 = get_group_id(2);
++    int i02 = get_group_id(1);
++    int i01 = get_group_id(0)*get_local_size(1) + get_local_id(1);
++
++    if (i01 >= ne01) {
++        return;
++    }
++
++    //int i12 = i03%ne12;
++    //int i11 = i02%ne11;
++    int i12 = fastmod(i03, ne12);
++    int i11 = fastmod(i02, ne11);
++
++    int i10 = i01;
++    int i1  = ((global int *)(src1 + i10*nb10 + i11*nb11 + i12*nb12))[0];
++
++    global half  * dst_row = (global half  *) (dst  +  i1*nb1  + i02*nb2  + i03*nb3);
++    global half  * src_row = (global half  *) (src0 + i01*nb01 + i02*nb02 + i03*nb03);
++
++    for (int ind = get_local_id(0); ind < nblk0; ind += get_local_size(0)) {
++        dst_row[ind] = src_row[ind];
++    }
++}
++
++// F16 rows into an F16 tensor
++kernel void kernel_set_rows_h16_i64(
++        global char * src0,
++        ulong         offset0,
++        global char * src1,
++        ulong         offset1,
++        global char * dst,
++        ulong         offsetd,
++        int           ne01,
++        ulong         nb01,
++        ulong         nb02,
++        ulong         nb03,
++        uint4         ne11,
++        uint4         ne12,
++        ulong         nb10,
++        ulong         nb11,
++        ulong         nb12,
++        int           nblk0,
++        ulong         nb1,
++        ulong         nb2,
++        ulong         nb3
++) {
++    src0 = src0 + offset0;
++    src1 = src1 + offset1;
++    dst  = dst  + offsetd;
++
++    int i03 = get_group_id(2);
++    int i02 = get_group_id(1);
++    int i01 = get_group_id(0)*get_local_size(1) + get_local_id(1);
++
++    if (i01 >= ne01) {
++        return;
++    }
++
++    //int i12 = i03%ne12;
++    //int i11 = i02%ne11;
++    int i12 = fastmod(i03, ne12);
++    int i11 = fastmod(i02, ne11);
++
++    int i10 = i01;
++    long i1 = ((global long *)(src1 + i10*nb10 + i11*nb11 + i12*nb12))[0];
++
++    global half  * dst_row = (global half  *) (dst  +  i1*nb1  + i02*nb2  + i03*nb3);
++    global half  * src_row = (global half  *) (src0 + i01*nb01 + i02*nb02 + i03*nb03);
++
++    for (int ind = get_local_id(0); ind < nblk0; ind += get_local_size(0)) {
++        dst_row[ind] = src_row[ind];
++    }
++}
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp
@@ -4935,7 +5544,16 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
      for (ggml_type type_a : other_types) {
          for (ggml_type type_b : {GGML_TYPE_F32}) {
              if (ggml_blck_size(type_a) != 256) {
-@@ -11737,6 +11827,33 @@
+@@ -11075,6 +11165,8 @@
+     test_cases.emplace_back(new test_fill(2.0f, GGML_TYPE_F32, { 303, 207, 11, 3 }));
+     test_cases.emplace_back(new test_fill(-152.0f, GGML_TYPE_F32, { 800, 600, 4, 4 }));
+     test_cases.emplace_back(new test_fill(3.5f, GGML_TYPE_F32, { 2048, 512, 2, 2 }));
++    test_cases.emplace_back(new test_fill(-152.0f, GGML_TYPE_F16, { 800, 600, 4, 4 }));
++    test_cases.emplace_back(new test_fill(0.0f, GGML_TYPE_F16, { 259, 3, 1, 1 }));
+ 
+     test_cases.emplace_back(new test_diag());
+     test_cases.emplace_back(new test_diag(GGML_TYPE_F32, { 79, 1, 19, 13 }));
+@@ -11737,6 +11829,33 @@
          }
      }
  
