@@ -146,7 +146,21 @@ public:
 
         llama_model_params mp = llama_model_default_params();
         mp.n_gpu_layers       = 999;
-        mp.load_mtp           = cfg.llama_mtp > 0;   // the GGUF's MTP layer, for --llama-mtp
+        // the GGUF's MTP layer, for --llama-mtp (unless --llama-mtp-gguf brings it)
+        mp.load_mtp           = cfg.llama_mtp > 0 && cfg.llama_mtp_gguf.empty();
+        // --llama-expert-cache: slots on the card for the experts --llama-cpu-moe
+        // keeps in host memory (contrib/llama.cpp patch 0021)
+#ifdef ARCINT_LLAMA_EXPERT_CACHE
+        expert_profile_          = cfg.llama_expert_profile;
+        mp.expert_cache_bytes    = static_cast<size_t>(cfg.llama_expert_cache_mib) << 20;
+        mp.expert_cache_profile  = expert_profile_.empty() ? nullptr : expert_profile_.c_str();
+        // the experts are computed on the card (slots) and read by it from the
+        // bank: the CPU's repacked copies would only cost host memory
+        if (cfg.llama_expert_cache_mib > 0) mp.use_extra_bufts = false;
+#else
+        if (cfg.llama_expert_cache_mib > 0)
+            throw std::runtime_error("--llama-expert-cache: this build's llama.cpp lacks contrib/llama.cpp patch 0021");
+#endif
         // --llama-cpu-moe: the first N layers' experts in host memory, as
         // llama.cpp's --n-cpu-moe (common/common.h llm_add_n_cpu_ffn_overrides).
         // They are memory-mapped from the GGUF: the OpenCL device declares no
@@ -165,6 +179,16 @@ public:
         model_                = llama_model_load_from_file(cfg.gguf_path.c_str(), mp);
         if (model_ == nullptr)
             throw std::runtime_error(log::format("llama.cpp could not load %s", cfg.gguf_path.c_str()));
+#ifdef ARCINT_LLAMA_EXPERT_CACHE
+        if (cfg.llama_expert_cache_mib > 0) {
+            llama_expert_cache_info ec{};
+            if (!llama_model_expert_cache_info(model_, &ec))
+                throw std::runtime_error("--llama-expert-cache: llama.cpp built no expert cache (no MoE layer in host memory?)");
+            log::info("load", "expert cache: %lld slots, %.2f GiB on the card, the other experts %.2f GiB in host memory",
+                      static_cast<long long>(ec.slots), static_cast<double>(ec.bytes) / (1u << 30),
+                      static_cast<double>(ec.bank_bytes) / (1u << 30));
+        }
+#endif
 
         // The models this engine serves, by the GGUF's own architecture; the
         // allowlist rule (DESIGN §3.1) holds here as on the OpenVINO path.
@@ -198,7 +222,10 @@ public:
         cp.n_ctx           = static_cast<uint32_t>(n_ctx_) * static_cast<uint32_t>(lanes_);
         cp.n_seq_max       = static_cast<uint32_t>(lanes_);
         cp.n_batch         = static_cast<uint32_t>(n_batch_);
-        cp.n_ubatch        = static_cast<uint32_t>(std::min(n_batch_, 512));
+        // with the expert cache a prefill ubatch gathers the bank's routed experts
+        // over the link once: the whole batch in one ubatch reads them once per
+        // n_batch tokens instead of per 512
+        cp.n_ubatch        = static_cast<uint32_t>(cfg.llama_expert_cache_mib > 0 ? n_batch_ : std::min(n_batch_, 512));
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
         cp.type_k          = kv_type(cfg.llama_kv_k);
         cp.type_v          = kv_type(cfg.llama_kv_v);
@@ -222,9 +249,24 @@ public:
         ctx_               = llama_init_from_model(model_, cp);
         if (ctx_ == nullptr) throw std::runtime_error("llama.cpp could not create a context");
         if (cfg.llama_mtp > 0) {
+            // --llama-mtp-gguf: the MTP block (with its own embeddings and LM
+            // head) as a second model, as llama.cpp loads an MTP-only file
+            // for draft-mtp (common/arg.cpp, speculative.draft.mparams);
+            // every tensor on the card
+            llama_model* mtp_model = model_;
+            if (!cfg.llama_mtp_gguf.empty()) {
+                llama_model_params dp = llama_model_default_params();
+                dp.n_gpu_layers       = 999;
+                dp.load_mtp           = true;
+                mtp_model_            = llama_model_load_from_file(cfg.llama_mtp_gguf.c_str(), dp);
+                if (mtp_model_ == nullptr)
+                    throw std::runtime_error(log::format("llama.cpp could not load %s", cfg.llama_mtp_gguf.c_str()));
+                mtp_model = mtp_model_;
+            }
             std::string err;
-            spec_ = make_llama_mtp(model_, ctx_, cfg.llama_mtp, lanes_, n_batch_, static_cast<int>(cp.n_ubatch),
-                                   threads, cfg.gguf_path, cfg.llama_mtp_vocab, cp.type_k, cp.type_v, err);
+            spec_ = make_llama_mtp(mtp_model, ctx_, cfg.llama_mtp, lanes_, n_batch_, static_cast<int>(cp.n_ubatch),
+                                   threads, cfg.llama_mtp_gguf.empty() ? cfg.gguf_path : cfg.llama_mtp_gguf,
+                                   cfg.llama_mtp_vocab, cfg.llama_mtp_min_p, cp.type_k, cp.type_v, err);
             if (!spec_) throw std::runtime_error(log::format("--llama-mtp %d: %s", cfg.llama_mtp, err.c_str()));
             n_draft_ = cfg.llama_mtp;
         }
@@ -282,6 +324,7 @@ public:
     ~LlamaBackend() override {
         spec_.reset();   // its draft context reads the target's
         if (ctx_ != nullptr) llama_free(ctx_);
+        if (mtp_model_ != nullptr) llama_model_free(mtp_model_);
         if (model_ != nullptr) llama_model_free(model_);
     }
 
@@ -412,6 +455,7 @@ public:
             stats.decode_sample_seconds += seconds_since(t_s);
         }
         stats.decode_seconds = seconds_since(t_decode);
+        log_expert_cache(seq);
         return reason;
     }
 
@@ -473,6 +517,27 @@ private:
             return {};
         }
     }
+
+    // The expert cache's counters since the previous request: the share of
+    // decode's routed experts served from a slot, and the swaps
+    void log_expert_cache(int seq) {
+#ifndef ARCINT_LLAMA_EXPERT_CACHE
+        (void) seq;
+    }
+#else
+        std::lock_guard<std::mutex> lk(mu_);   // the counters move inside llama_decode
+        llama_expert_cache_info ec{};
+        if (!llama_model_expert_cache_info(model_, &ec)) return;
+        const uint64_t h = ec.decode_hits - ec_prev_.decode_hits, m = ec.decode_misses - ec_prev_.decode_misses;
+        if (h + m > 0)
+            log::info("slot", "lane %d: expert cache: %.1f %% of decode's routed experts on the card (%llu / %llu), %llu swaps in %llu adapts, %.2f s writing them",
+                      seq, 100.0 * static_cast<double>(h) / static_cast<double>(h + m), static_cast<unsigned long long>(h),
+                      static_cast<unsigned long long>(h + m), static_cast<unsigned long long>(ec.swaps - ec_prev_.swaps),
+                      static_cast<unsigned long long>(ec.adapts - ec_prev_.adapts),
+                      static_cast<double>(ec.apply_us - ec_prev_.apply_us) / 1e6);
+        ec_prev_ = ec;
+    }
+#endif
 
     // The prompt's ids. A vocabulary that wants BOS (Mistral's Tekken) gets it
     // when the rendered template did not write it: encode() adds no special
@@ -610,6 +675,7 @@ private:
             }
         }
         stats.decode_seconds = seconds_since(t_decode);
+        log_expert_cache(seq);
         return reason;
     }
 
@@ -770,10 +836,15 @@ private:
         std::copy(l, l + n_vocab_, out.begin());
     }
 
+    std::string             expert_profile_;   // --llama-expert-profile, alive for the load
+#ifdef ARCINT_LLAMA_EXPERT_CACHE
+    llama_expert_cache_info ec_prev_{};        // the counters at the previous request's end
+#endif
     // --llama-cpu-moe's tensor patterns, alive for the load
     std::vector<std::string>                       cpu_moe_patterns_;
     std::vector<llama_model_tensor_buft_override> buft_overrides_;
     llama_model*                          model_ = nullptr;
+    llama_model*                          mtp_model_ = nullptr;   // --llama-mtp-gguf
     llama_context*                        ctx_   = nullptr;
     const llama_vocab*                    vocab_ = nullptr;
     std::unique_ptr<LlamaTokenizer>       tokenizer_;

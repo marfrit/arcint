@@ -124,11 +124,46 @@ replaced it at no measured decode cost on either card.
 
 ## Flash-Next
 
-`qwen4exp` with `--llama-cpu-moe N`: the first N layers' experts stay in host
-memory, memory-mapped, computed by llama.cpp's CPU backend; the IQ kernels
-of patch 0002 run the rest on the card. Served on the B60 with 16 expert
-layers on the card: the needle answered, 49.2 t/s prefill at 20k, 10.9 t/s
-decode (`docs/campaigns/flash-next-llama-engine.md` (on the `qfndev` branch)).
+Qwen3.8-Flash-Next (`qwen4exp`) serves on the B60 from ISTA-DASLab's IQ2_XS
+GGUF (`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`, revision `ed59f920`),
+with every expert computed on the card and its MTP layer drafting:
+
+    arcint --engine llama --gguf Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+        --device GPU.0 --n-ctx 32768 --llama-cpu-moe 48 \
+        --llama-expert-cache 14500 --llama-expert-profile expert-profile.bin \
+        --llama-mtp 2 --llama-mtp-gguf mtp-flash-next-q8e4n.gguf
+
+- `expert-profile.bin` is Strata's decode profile (`data/expert-profile.bin`
+  in github.com/Niko1221/Strata, MIT; it fills the slots in rank order).
+- `mtp-flash-next-q8e4n.gguf` is built by `tools/flash_next_mtp_gguf.sh`
+  from the checkpoint's 31 `mtp.*` tensors (the GGUFs carry no MTP layer).
+
+Measured on the B60 (`measured-here`, 2026-10-07, the 20,045-token needle,
+then the 500-token long answer, greedy, thinking off): prefill 421-431 t/s,
+decode 33.0-34.8 t/s with 72-74 % of the drafts accepted; the capital, the
+needle and the long answer right. Strata's own engine (its SYCL port, 37.2-37.8
+t/s decode, 620 t/s prefill on this card) is the reference
+(`docs/campaigns/strata-sycl-b60.md` (on the `qfndev` branch)). The KL of IQ2_XS against a reference
+is owed (the existing CPU reference is the UD-Q3_K_XL file).
+
+**The expert cache** (`--llama-expert-cache MIB --llama-expert-profile FILE`
+with `--llama-cpu-moe 48`; `contrib/llama.cpp` 0021 and 0022). The hot
+experts sit in slots in VRAM, filled from the profile and swapped as decode's
+usage moves; the rest sit in a bank in USM host memory (pinned: the host needs
+its size free beside the page cache). A decode step runs one branch: the
+matvec reads a missed expert from the bank by pointer over the link, as
+Strata's kernels read its pinned mirror; prefill gathers the routed bank
+experts into a card-side mirror first. Its constants take
+`LLAMA_EXPERT_CACHE_{ADAPT_EVERY,MAX_SWAPS,MIN_GAIN,MIN_USAGE,DECAY}`.
+
+What 0022 adds for it (`contrib/llama.cpp/README.md`): the low-bit IQ and
+Q2_0 kernels in planes, F16/BF16 products on XMX, and the QSA indexer's ops
+on the card (TOP_K, F32<->I32 casts, F16 FILL/REPEAT/SET_ROWS) -- without
+them the scheduler ran four CPU islands per attention layer, each draining
+the queue (decode 32.0 -> 33.0-34.2, prefill 381 -> 422).
+
+The UD-Q3_K_XL file (52 GiB of experts) serves the same way at 235 t/s
+prefill and 12-13 t/s decode without MTP (2026-10-06).
 
 ## MTP (`--llama-mtp N`)
 
@@ -250,7 +285,7 @@ DFlash2 into this engine is open and unmeasured.
 B60, MTP verify calls (4-8 rows) take a kernel that reads K/V once per KV
 head for all its query heads and rows. With the agent's flags at 62,597
 tokens of depth, decode went from 11.0 to 15.6 t/s (`measured-here`); the
-campaign is `docs/campaigns/gqa-small-t-decode.md`.
+campaign is `docs/campaigns/gqa-small-t-decode.md` (on the `qfndev` branch).
 
 **Mistral Small 3.2 24B / Cydonia 24B (0.5.8), creative writing on the
 B60.** The engine admits the `llama` architecture at that geometry only.
@@ -328,6 +363,21 @@ references and every number):
   needed 0010, a masked-nextn row fix in the MTP graph.
 - `--llama-mtp-vocab FILE` drafts from a subset of the vocabulary: the
   draft steps read those rows of the head instead of all 248k.
+- `--llama-mtp-gguf FILE` takes the MTP layer from a separate MTP-only GGUF
+  (the pin's `convert_hf_to_gguf.py --mtp`: the MTP block, the embedding and
+  the LM head), loaded as a second model on the card, as llama.cpp's
+  draft-mtp loads one. Flash-Next's GGUFs carry no MTP layer; its head comes
+  from the checkpoint's 31 `mtp.*` tensors. With `--llama-mtp-vocab` a
+  hyper-connection model's draft head first mixes the four streams the MTP
+  layer returns (the file's `nextn.hc_head_*` weights, as the model's graph
+  does); on Flash-Next Strata's 106,299-token subset drafted 6 points fewer
+  accepted tokens than the full head and decoded slower (30.6 -> 29.7 t/s).
+- `--llama-mtp-min-p P` stops drafting at a token the MTP head gives less
+  than P and leaves it out of the verify (Strata's `--spec-min-p`); off by
+  default. On Flash-Next IQ2_XS 3 drafts with 0.5 matched 2 without it
+  (30.3 t/s), 4 drafts lost (24.3).
+- The MTP context runs ubatches of at most 512 rows: its compute buffer
+  follows the ubatch (Flash-Next: 774 -> 197 MiB on the card).
 
 Served, the same prompt at temperature 0, 10/10 in every run
 (`measured-here`):
@@ -410,11 +460,23 @@ Both mutants were run first, and both fail:
   thinking left the reference at character 49 of 193 and 100 of 369. This
   test sees a wrong state; the answers alone would not.
 
+**The acceptance task with and without them** (`measured-here`, 0.5.12,
+the coder shq8 on the A770, the production flags). This is a single-turn
+prompt, so the only difference between the arms is where the prefill
+batches break:
+
+| arm | T=0 | 30 runs at 0.7 | mean |
+|---|---|---|---|
+| checkpoints on (the unit) | 9 | 27 at 10/10, 2 at 9, 1 at 5 | 9.77 |
+| `--llama-checkpoints 0` | 10 | 27 at 10/10, 3 at 9 | 9.90 |
+
+The same count of perfect runs; the arms differ by the one 5/10 run. The
+T=0 cell is one case flipping with the batch layout.
+
 ## Not yet on this engine
 
-Flash-Next's MTP (`qwen4exp` is in llama.cpp at the pin), conversation
-state kept across a restart (P6; in process it is the context checkpoints
-above) and GPU prefill from the pinned bank (P5) are open.
+Conversation state kept across a restart (P6; in process it is the context
+checkpoints above) and GPU prefill from the pinned bank (P5) are open.
 
 Open observation: on the B60, xe logged GPU page faults with compute-engine
 resets in windows where `test-backend-ops` ran (2026-10-03); a run of every

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 0.5.12 LANGUAGES CXX)
+project(arcint VERSION 0.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -169,6 +169,14 @@ if(ARCINT_LLAMA)
   target_include_directories(arcint_core PRIVATE "${ARCINT_LLAMA_DIR}/src")
   target_link_libraries(arcint_core PUBLIC llama OpenCL::OpenCL)
   target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA=1)
+  # contrib/llama.cpp 0021 (the expert cache) adds llama_model_params fields;
+  # without it --llama-expert-cache is refused at load
+  file(READ "${ARCINT_LLAMA_DIR}/include/llama.h" ARCINT_LLAMA_H)
+  if(ARCINT_LLAMA_H MATCHES "expert_cache_bytes")
+    target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_EXPERT_CACHE=1)
+  else()
+    message(WARNING "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0021: --llama-expert-cache is refused")
+  endif()
 endif()
 
 # Generated last on purpose: it bakes in the tokenizers path discovered above,

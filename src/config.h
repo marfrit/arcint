@@ -32,6 +32,14 @@ struct Config {
     // or a JSON list); the draft steps then read those rows of the output
     // head instead of all of them
     std::string llama_mtp_vocab;
+    // --llama-mtp-gguf FILE: the MTP layer from a separate MTP-only GGUF
+    // (llama.cpp's converter --mtp: the MTP block, the embeddings and the
+    // LM head) instead of the model's own file
+    std::string llama_mtp_gguf;
+    // --llama-mtp-min-p P: a draft step continues while its token's
+    // probability under the MTP head is at least P, and a draft below P is
+    // not verified (Strata's --spec-min-p); 0 drafts --llama-mtp tokens always
+    double llama_mtp_min_p = 0.0;
     // --llama-kv K[:V]: the libllama engine's attention cache types, f16,
     // q8_0 or q8_0:q4_0 (V defaults to K). Quantized K/V run on the Intel
     // attention kernels of contrib/llama.cpp 0015.
@@ -45,6 +53,14 @@ struct Config {
     // a prefix with an earlier one resumes from the newest snapshot inside it
     // instead of prefilling from token 0. 0 off.
     int llama_checkpoints     = 32;
+    // --llama-expert-cache MIB / --llama-expert-profile FILE: a per-expert GPU
+    // cache of this many MiB for the MoE layers whose experts --llama-cpu-moe
+    // keeps in host memory, ranked by a Strata STRP profile (empty: round
+    // robin); the other experts in a bank in pinned host memory the card reads
+    // over the link, hot ones swapped in during decode (contrib/llama.cpp
+    // patch 0021). 0 off.
+    int         llama_expert_cache_mib = 0;
+    std::string llama_expert_profile;
     int llama_checkpoint_step = 8192;
     std::string flash_next_ngram_path;  // --flash-next-ngram: FIX D per_layer_token_embd table (24-byte ARCINGRM header + block-quantised payload); admitted only when the artifact's config.json declares an n-gram table (docs/design-qwen-flash-next.md FIX D Link 2)
     // --ngram-gguf: the GGUF shard whose per_layer_token_embd.weight binds a

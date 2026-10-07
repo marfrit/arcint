@@ -425,6 +425,12 @@ std::string usage_text() {
         "  --llama-mtp-vocab FILE    libllama: the token ids the MTP head may draft\n"
         "                            (int32, or a JSON list): a draft step reads only\n"
         "                            those rows of the output head\n"
+        "  --llama-mtp-gguf FILE     libllama: the MTP layer from this MTP-only GGUF\n"
+        "                            (llama.cpp's converter --mtp) instead of the\n"
+        "                            model's own file\n"
+        "  --llama-mtp-min-p P       libllama: stop drafting at a token the MTP head\n"
+        "                            gives less than P, and leave it out of the verify\n"
+        "                            (0-1; 0 off: always --llama-mtp drafts)\n"
         "  --llama-checkpoints N     libllama: per lane, up to N snapshots of a hybrid\n"
         "                            model's recurrent state (near the prompt's end,\n"
         "                            at user messages), so a follow-up or an edited\n"
@@ -432,6 +438,15 @@ std::string usage_text() {
         "                            (default 32; 0 off)\n"
         "  --llama-checkpoint-step T libllama: the least spacing of snapshots at\n"
         "                            earlier user messages (default 8192)\n"
+        "  --llama-expert-cache MIB  libllama: MIB of expert slots on the card for the\n"
+        "                            MoE layers --llama-cpu-moe keeps in host memory;\n"
+        "                            the other experts in a bank in host memory (pinned)\n"
+        "                            read by the card over the link; hot experts swapped\n"
+        "                            in during decode. The card also holds a Q8_0 down\n"
+        "                            projection's bank and a gather mirror beyond MIB\n"
+        "                            (default 0, off; contrib/llama.cpp 0021)\n"
+        "  --llama-expert-profile F  libllama: the expert ranking that fills the cache\n"
+        "                            (Strata's STRP profile; default round robin)\n"
         "  --llama-kv K[:V]          libllama: the attention cache types, f16, q8_0 or\n"
         "                            q8_0:q4_0 (default f16): q8_0 takes the cache to\n"
         "                            53 %, q8_0:q4_0 to 41 %\n"
@@ -489,6 +504,18 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--llama-checkpoint-step") {
             if (!value(v) || !parse_int(v, cfg.llama_checkpoint_step) || cfg.llama_checkpoint_step < 1)
                 return fail("--llama-checkpoint-step needs a token count >= 1");
+        } else if (arg == "--llama-expert-cache") {
+            if (!value(v) || !parse_int(v, cfg.llama_expert_cache_mib) || cfg.llama_expert_cache_mib < 0)
+                return fail("--llama-expert-cache needs a size in MiB >= 0 (0: off)");
+        } else if (arg == "--llama-expert-profile") {
+            if (!value(v)) return fail("--llama-expert-profile needs a profile file");
+            cfg.llama_expert_profile = std::string(v);
+        } else if (arg == "--llama-mtp-gguf") {
+            if (!value(v)) return fail("--llama-mtp-gguf needs an MTP-only GGUF");
+            cfg.llama_mtp_gguf = std::string(v);
+        } else if (arg == "--llama-mtp-min-p") {
+            if (!value(v) || !parse_double(v, cfg.llama_mtp_min_p) || cfg.llama_mtp_min_p < 0.0 || cfg.llama_mtp_min_p > 1.0)
+                return fail("--llama-mtp-min-p needs a probability from 0 to 1");
         } else if (arg == "--llama-mtp-vocab") {
             if (!value(v)) return fail("--llama-mtp-vocab needs a file of token ids");
             cfg.llama_mtp_vocab = std::string(v);
@@ -961,11 +988,19 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.engine == "llama") {
         if (cfg.gguf_path.empty()) return fail("--engine llama serves a GGUF: give --gguf");
         if (!cfg.llama_mtp_vocab.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-vocab needs --llama-mtp");
+        if (!cfg.llama_mtp_gguf.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-gguf needs --llama-mtp");
+        if (cfg.llama_mtp_min_p > 0.0 && cfg.llama_mtp <= 0) return fail("--llama-mtp-min-p needs --llama-mtp");
+        if (cfg.llama_expert_cache_mib > 0 && cfg.llama_cpu_moe <= 0)
+            return fail("--llama-expert-cache caches experts --llama-cpu-moe keeps in host memory: give --llama-cpu-moe");
+        if (!cfg.llama_expert_profile.empty() && cfg.llama_expert_cache_mib <= 0)
+            return fail("--llama-expert-profile needs --llama-expert-cache");
     } else {
     if (cfg.llama_cpu_moe > 0 || cfg.llama_threads > 0 || cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty() ||
-        cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192)
-        return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab, --llama-kv and --llama-checkpoints/-step "
-                    "are --engine llama options");
+        !cfg.llama_mtp_gguf.empty() || cfg.llama_mtp_min_p > 0.0 ||
+        cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192 ||
+        cfg.llama_expert_cache_mib > 0 || !cfg.llama_expert_profile.empty())
+        return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab/-gguf/-min-p, --llama-kv, --llama-checkpoints/-step "
+                    "and --llama-expert-cache/-profile are --engine llama options");
     if (!cfg.gguf_path.empty() && cfg.model_path.empty()) return fail("--gguf needs --model (the template IR directory)");
     if (!cfg.gguf_path.empty() && !cfg.paged) return fail("--gguf serves on the paged path only");
     }
