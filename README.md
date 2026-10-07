@@ -239,6 +239,15 @@ loader:
 
 The Debian recipe does exactly this (`contrib/packaging/arcint/build-deb.sh`).
 
+**The GPU runtime on a fresh host.** Debian trixie ships no Intel compute
+runtime (`intel-opencl-icd`, `libze-intel-gpu1`) in any component; install
+Intel's release `.deb`s from
+[intel/compute-runtime](https://github.com/intel/compute-runtime/releases)
+with the IGC and gmmlib versions its release notes name. Every number here
+was measured on compute-runtime 26.27.39122.11 with IGC 2.38.2; a fresh
+trixie container with those, the `.deb`s from these recipes and the cards
+bound in served the coder at the measured speed (0.6.0, `measured-here`).
+
 `-DARCINT_WERROR=ON` gives the warning-clean build CI should use. Pass
 `-DARCINT_GIT_SHA` whenever the build tree has no `.git`; without it
 `--version` and `/props` report `unknown`.
