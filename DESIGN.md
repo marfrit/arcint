@@ -462,6 +462,13 @@ stall p95 17 ms, max one chunk; Prüfstand 10/10 on each lane concurrently
 - The `/v1/models` entry carries `n_ctx` (what this process runs with),
   `n_ctx_train`, `quant` and `lanes`, because a discovering proxy reads
   context only from there (`code`; both learned by breaking a proxy).
+- [Amended 2026-10-07, operator.] Named lanes on the libllama engine
+  (`--served-model-name A,B --lane-ctx CA,CB`) make the `model` field
+  binding: a lane's name picks that lane. An empty name goes to the first
+  lane, and an unknown name gets a 404. `/v1/models` carries one entry per
+  lane name with that lane's `n_ctx`, and `/props` reports
+  `enforces_model_field: true` there. One name keeps the behaviour above.
+  `docs/campaigns/lanes-agent-subagent.md`.
 
 ### 4.3 Admission: a lane is a memory reservation
 
