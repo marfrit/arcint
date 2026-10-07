@@ -130,6 +130,21 @@ done
 # difference is about a quarter of the package.
 find "$ROOT$PREFIX/openvino/libs" -name '*.so*' -type f -exec strip --strip-unneeded {} + 2>/dev/null || true
 
+# The build tree's libraries carry its RUNPATH (<build>/temp/.../tbb/lib,
+# <build>/bin/intel64/Release); the package keeps them side by side in
+# openvino/libs, so $ORIGIN is the whole lookup. Without this the runtime works
+# only on the host it was built on (+p25-1, found on a fresh trixie install).
+command -v patchelf >/dev/null || { echo "patchelf fehlt (Build-Abhaengigkeit)" >&2; exit 1; }
+for f in "$ROOT$PREFIX"/openvino/libs/*.so*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    if readelf -d "$f" 2>/dev/null | grep -E '\((RUNPATH|RPATH)\)' >/dev/null; then
+        patchelf --set-rpath '$ORIGIN' "$f"
+    fi
+done
+bad=$(find "$ROOT$PREFIX" -type f -name '*.so*' -exec sh -c \
+      'readelf -d "$1" 2>/dev/null | grep -E "\((RUNPATH|RPATH)\)" | grep -v "\$ORIGIN" | sed "s|^|$1: |"' _ {} \;)
+[ -z "$bad" ] || { echo "a library points outside the package:" >&2; echo "$bad" >&2; exit 1; }
+
 # The shipped runtime must say out loud that it is patched, so that any log line
 # naming an OpenVINO version answers "which one" without a detour.
 # NOT `| grep -q`: under `set -o pipefail` grep -q exits at the first match,

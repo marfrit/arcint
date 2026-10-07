@@ -16,7 +16,7 @@ set -euo pipefail
 
 PKGVER=0.6.0
 UPSTREAM_TAG=v${PKGVER}
-PKGREL=1
+PKGREL=2
 # The public repository, not the fleet one. The fleet repo (still named
 # "ligence", arcint's working title before the ligence.io collision) is private
 # and carries operator-local notes; the published tree is the same code without
@@ -35,7 +35,9 @@ OV_PREFIX=/usr/lib/marfrit-openvino
 # The ABI is the nightly, not the patch level: floor the patch level, cap at
 # the next nightly. An exact pin (Depends: = +p1-1) made apt REMOVE arcint when
 # the runtime was upgraded to +p3 on 2026-09-04; never render "=" here again.
-OV_DEP_VERSION="2026.4.0~dev20260821+p25-1"
+# +p25-2: the same +p25 binaries with their RUNPATH set to $ORIGIN (+p25-1 found its
+# own libtbb.so.12 and plugins only on the host it was built on; fresh trixie, 2026-10-07).
+OV_DEP_VERSION="2026.4.0~dev20260821+p25-2"
 # 0.5.5 to 0.6.0 keep the +p25 floor: what they add over 0.5.4 needs no newer
 # runtime by default. Patches 0076 (+p26) and 0077 (+p27) serve opt-in switches of the
 # Flash-Next CPU tier (MOE_CPU_TIER_ADAPTIVE=1, MOE_DOORBELL=1); those need a
@@ -216,7 +218,7 @@ Section: misc
 Priority: optional
 Architecture: amd64
 Installed-Size: ${INSTALLED_KB}
-Depends: libc6 (>= 2.34), libstdc++6 (>= 13), ocl-icd-libopencl1, marfrit-openvino (>= ${OV_DEP_VERSION}), marfrit-openvino (<< ${OV_DEP_NEXT_NIGHTLY})
+Depends: libc6 (>= 2.34), libstdc++6 (>= 13), libgomp1, ocl-icd-libopencl1, marfrit-openvino (>= ${OV_DEP_VERSION}), marfrit-openvino (<< ${OV_DEP_NEXT_NIGHTLY})
 Recommends: intel-opencl-icd
 Maintainer: Markus Fritsche <mfritsche@reauktion.de>
 Homepage: https://github.com/marfrit/arcint
