@@ -187,25 +187,31 @@ the installed binary must show **no `zmm`** registers (AVX-512 would SIGILL
 elsewhere) and **must show `ymm`** (their absence means the build fell back
 to SSE-only, which would be a silent performance cliff of its own).
 
-## The patched runtime is on `ld.so.conf.d` inside the image
+## The patched runtime finds itself through `$ORIGIN`
 
-Tier 1 writes `/etc/ld.so.conf.d/marfrit-openvino.conf` and runs `ldconfig`.
-This is a deliberate deviation from the deb recipe, which avoids a
-system-wide entry.
+The upstream wheel's libraries are self-locating (`$ORIGIN`). The source
+build's libraries carry the build tree as `DT_RUNPATH`
+(`/opt/ov/temp/Linux_x86_64/tbb/lib`, `/opt/ov/bin/intel64/Release`), paths
+that do not exist in the final image, so `libopenvino` would not find its
+bundled `libtbb.so.12` or the plugins each other. Tier 1 sets the RUNPATH of
+every patched library to `$ORIGIN` with `patchelf` -- they sit side by side in
+`openvino/libs`, so that is the whole lookup -- and fails the build if any
+library under the prefix still points outside it. No `ld.so.conf.d` entry is
+needed, which keeps the image on the deb's discipline: the nightly runtime
+never shadows anything on the system's search path.
 
-The reason is the difference between the two build trees. The upstream
-wheel's libraries are self-locating (`DT_RPATH=$ORIGIN`). The source build's
-libraries carry a `DT_RUNPATH` pointing at build-tree paths
-(`/opt/ov/temp/Linux_x86_64/tbb/lib`, `/opt/ov/bin/intel64/Release`) that
-do not exist in the final image — and unlike `DT_RPATH`, `DT_RUNPATH` is not
-inherited by the executable's own lookups, so a second hop
-(`arcint -> libopenvino -> libtbb`) fails to resolve.
+The `.deb` had the same defect until `marfrit-openvino +p25-2` (2026-10-07):
+it worked on the host that built it, where the build tree exists, and nowhere
+else. Its recipe now sets `$ORIGIN` the same way.
 
-On the host the deb gets past this through load order. An image must not
-depend on load order, because nothing else in the container links these
-sonames — the deb's objection, that a nightly OpenVINO could jump ahead of
-other consumers, cannot apply inside a dedicated image. The build asserts
-`ldconfig` picked the directory up rather than trusting the write.
+## The GPU runtime
+
+The image takes Fedora's `intel-compute-runtime`. The numbers in this
+repository were measured on compute-runtime 26.27.39122.11 with IGC 2.38.2
+(Intel's release packages, on Debian trixie); a different driver version is
+a different measurement, not a different result by default. Debian trixie
+ships no Intel compute runtime at all, which is one reason the image is
+Fedora-based.
 
 ## What CI covers, and what it cannot
 

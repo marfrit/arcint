@@ -145,6 +145,13 @@ FROM ${OV_BASE}
 
 COPY --from=builder /install/usr /usr
 
+# The builder resolved everything with a compiler installed; the image the
+# user runs has none. Resolve here, where it counts (a fresh trixie install
+# of the .deb lacked libgomp exactly this way, fixed in arcint 0.6.0-2).
+RUN LDD_OUT=$(ldd /usr/bin/arcint); \
+    case "$LDD_OUT" in *"not found"*) echo "unresolved in the final image:" >&2; printf '%s\n' "$LDD_OUT" >&2; exit 1 ;; esac; \
+    /usr/bin/arcint --version
+
 # The stub smoke test needs no GPU: the engine serves its HTTP surface
 # without a model. If /props answers, the binary, its RPATH and the
 # tokenizer .so all resolve inside the image.

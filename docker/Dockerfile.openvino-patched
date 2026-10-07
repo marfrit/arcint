@@ -148,9 +148,12 @@ FROM registry.fedoraproject.org/fedora:43
 # intel-compute-runtime provides the Level Zero driver (libze_intel_gpu) the
 # OpenVINO GPU plugin dispatches through; ocl-icd mirrors the deb's
 # Depends: ocl-icd-libopencl1 | libopencl1.
+# libgomp: the libllama engine's CPU backend links OpenMP; the builder stage has
+# it through gcc, the runtime does not (the .deb missed it the same way until
+# arcint 0.6.0-2). patchelf rewrites the patched libraries' RUNPATH below.
 RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
-      bash ca-certificates libatomic libstdc++ libgcc \
-      hwdata pciutils procps-ng curl python3 binutils \
+      bash ca-certificates libatomic libstdc++ libgcc libgomp \
+      hwdata pciutils procps-ng curl python3 binutils patchelf \
       intel-compute-runtime intel-level-zero oneapi-level-zero ocl-icd \
   && dnf clean all && rm -rf /var/cache/dnf/*
 
@@ -210,17 +213,24 @@ RUN strip --strip-unneeded ${OV_PREFIX}/openvino/libs/*.so* 2>/dev/null || true;
       || { echo "wheel layout changed: targets no longer point at openvino/libs" >&2; exit 1; }; \
     rm -rf /tmp/patched /tmp/tbb
 
-# ld.so.conf.d INSIDE the image -- a deliberate deviation from the deb's
-# "no system-wide entry" discipline. The source build's libs carry a
-# DT_RUNPATH pointing at build-tree paths that do not exist here, and
-# RUNPATH is not inherited by the executable's own lookups, so the second
-# hop (arcint -> libopenvino -> libtbb) would not resolve. The deb gets
-# away with it via load order on the host; an image must not depend on that.
-# Full rationale: docs/docker.md, "The patched runtime is on ld.so.conf.d".
-RUN echo /usr/lib/marfrit-openvino/openvino/libs > /etc/ld.so.conf.d/marfrit-openvino.conf \
-  && ldconfig \
-  && ldconfig -p | grep -F libtbb.so.12 > /dev/null \
-  || { echo "ldconfig did not pick up the OV libs dir" >&2; exit 1; }
+# The source build's libraries carry the build tree as RUNPATH
+# (/opt/ov/temp/Linux_x86_64/tbb/lib, /opt/ov/bin/intel64/Release), paths that
+# do not exist here; the wheel's are self-locating. Set $ORIGIN, as
+# contrib/packaging/marfrit-openvino/build-deb.sh does since +p25-2: the libs
+# sit side by side in openvino/libs, so that is the whole lookup, with no
+# system-wide ld.so.conf.d entry. Gate: no library may still point outside.
+RUN set -eu; \
+    for f in ${OV_PREFIX}/openvino/libs/*.so*; do \
+      [ -f "$f" ] && [ ! -L "$f" ] || continue; \
+      if readelf -d "$f" 2>/dev/null | grep -E '\((RUNPATH|RPATH)\)' > /dev/null; then \
+        patchelf --set-rpath '$ORIGIN' "$f"; \
+      fi; \
+    done; \
+    bad=$(find ${OV_PREFIX} -type f -name '*.so*' -exec sh -c \
+          'readelf -d "$1" 2>/dev/null | grep -E "\((RUNPATH|RPATH)\)" | grep -v "\$ORIGIN" | sed "s|^|$1: |"' _ {} \;); \
+    [ -z "$bad" ] || { echo "a library points outside the runtime:" >&2; echo "$bad" >&2; exit 1; }; \
+    ldd ${OV_PREFIX}/openvino/libs/libopenvino.so.2640 | grep -F "not found" >&2 \
+      && { echo "libopenvino does not resolve inside the image" >&2; exit 1; } || true
 
 RUN ldconfig && ls /usr/lib64/libze_intel_gpu* > /dev/null 2>&1 \
   || echo "WARN: libze_intel_gpu not found in the expected place — check the intel-compute-runtime package layout" >&2
