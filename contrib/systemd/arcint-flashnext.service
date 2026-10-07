@@ -29,7 +29,7 @@
 Description=arcint-flashnext — Qwen3.8-Flash-Next IQ2_XS on libllama, expert cache + MTP, GPU.0, :8089
 Documentation=https://github.com/marfrit/arcint
 After=default.target
-Conflicts=arcint-agent.service
+Conflicts=arcint-agent.service arcint-writer.service
 
 [Service]
 Type=simple

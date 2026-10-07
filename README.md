@@ -162,6 +162,22 @@ B60, 14,500 MiB of expert slots, MTP 2: the 20,045-token needle prefills at
 answered (0.6.0; Strata's own engine: 620 / 37.2-37.8 t/s on the same card).
 The KL of IQ2_XS against a reference is owed.
 
+**One model across two different Arc cards** (in progress on `qfndev`;
+`docs/campaigns/layer-split-two-cards.md`): Flash-Next split by layers
+across the Arc Pro B60 (Xe2) and the Arc A770 (Xe-HPG).
+- **How:** each card runs its own layer range with its own KV and its own
+  expert cache, after Strata's layer split. Strata itself lists Intel GPUs as
+  unsupported for its split.
+- **Two OpenCL platforms:** Intel's runtime lists the two generations as two
+  platforms. `contrib/llama.cpp` 0023 gives each its own context and builds
+  every kernel for its own card.
+- **Measured** at 131,072 tokens of context (`measured-here`): every expert
+  of the A770's eight layers is held on the A770, and 90 % of all routed
+  experts are on a card, against 84 % on the B60 alone.
+  - The split decodes at 18.6 t/s against the B60 alone's 19.8.
+  - The A770's PCIe 3.0 x4 link and its slower MTP drafting are the gap.
+    Moving the draft to the B60 is the next measurement.
+
 **Qwen3.8-Flash-Next**, full depth (`qwen3.8-flash-next-d48q8`) on the B60:
 `--offload-ratio 75 --moe-cpu-tier`, a 128-expert-per-layer census seed, a
 30 GiB host expert bank, u8 KV, chunk 2048; at a 20,085-token prompt, prefill

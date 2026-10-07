@@ -8,10 +8,20 @@ and a journal can both read the port, the served name and the context there.
 
 | unit | card | model | port |
 |---|---|---|---|
-| `arcint-agent.service` | GPU.0 (Arc Pro B60, 24 GB) | Qwen3.8-27B dense, Intel's public int4 IR, MTP on | 8087 |
-| `arcint-coder.service` | GPU.1 (Arc A770, 16 GB) | Qwen3.6-27B-A3B coder (the b5 export) | 8080 |
-| `arcint-qwen38-mtp.service` | GPU.0 | Qwen3.8-27B, Intel's public int4 IR with the reconstructed MTP head | 8088 — an example, not deployed |
+| `arcint-agent.service` | GPU.0 (Arc Pro B60, 24 GB) | Qwen3.8-27B dense, Q4_K_M GGUF on the libllama engine, q8_0 KV, 131,072 tokens, MTP 5 | 8087 |
+| `arcint-writer.service` | GPU.0, on demand | Cydonia 24B v4.3 (Mistral Small 3.2 finetune), Q4_K_M GGUF on the libllama engine, 98,304 tokens | 8088 |
 | `arcint-flashnext.service` | GPU.0, on demand | Qwen3.8-Flash-Next IQ2_XS on the libllama engine: expert cache (9,500 MiB of slots, the rest in pinned host memory), MTP 2, 131,072 tokens | 8089 |
+| `arcint-coder.service` | GPU.1 (Arc A770, 16 GB) | Qwen3.6-27B-A3B coder, the searched `c5f495ac shq8` GGUF on the libllama engine, q8_0:q4_0 KV, 98,304 tokens, MTP 4 | 8080 |
+| `arcint-coder-openvino.service` | GPU.1 | the coder's OpenVINO export (the b5 IR); the coder until 2026-10-05, kept as its rollback | 8080 |
+| `arcint-agent-openvino.service` | GPU.0 | Qwen3.8-27B dense, Intel's public int4 IR on the OpenVINO engine, MTP on; the agent until 0.5.5 | 8087 |
+| `arcint-qwen38-mtp.service` | GPU.0 | Qwen3.8-27B, Intel's public int4 IR with the reconstructed MTP head | 8088 — an example, not deployed |
+
+The three GPU.0 units take turns on one card (`Conflicts=`); on the host
+they come from, a unit manager switches between them on demand. The
+OpenVINO units' notes below (`--paged-kv`, `--prefill-chunk`,
+`--cache-host-mib`, the reservation) apply to the `-openvino` units; the
+libllama units take their context from `--n-ctx` and their KV type from
+`--llama-kv`.
 
 Things worth copying rather than re-learning:
 
