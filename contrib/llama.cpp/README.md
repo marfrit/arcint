@@ -858,7 +858,7 @@ Measured (`measured-here`, llama-bench `-fa 1 -r 2`; t/s):
 ## 0016-opencl-intel-gqa-decode-attention.patch
 
 Decode and MTP-verify attention on Xe2 (the B60) in one pass over K and V
-per KV head (`docs/campaigns/gqa-small-t-decode.md`), after NInfer's small-T
+per KV head (`docs/campaigns/gqa-small-t-decode.md` (on the `qfndev` branch)), after NInfer's small-T
 kernel (`src/ops/attention/causal_softmax/small_t_bf16.cuh`, `code`).
 
 0007/0015's split kernel gives every (query head, row, split) its own
@@ -883,7 +883,7 @@ row at 131k keys.
   (`GGML_OPENCL_FA_GQA_OPTS`). The sides (1, 2 or 4) come from
   `GGML_OPENCL_FA_GQA_SIDES`, used for the build and the dispatch alike.
   These are the genes of a structural search
-  (`docs/campaigns/kernel-autotune-ga.md`).
+  (`docs/campaigns/kernel-autotune-ga.md` (on the `qfndev` branch)).
 
 Measured (`measured-here`, B60, dense 27B geometry: 24 query heads on 4,
 head size 256):
@@ -972,7 +972,7 @@ the 0016 build, where head size 128 took the upstream kernels):
 ## 0018-opencl-intel-gqa-decode-searched.patch
 
 The verify kernel of 0016/0017 as a structural search found it
-(`tools/kq_tune/fagqa.py`, `docs/campaigns/kernel-autotune-ga.md`, "code-level
+(`tools/kq_tune/fagqa.py`, `docs/campaigns/kernel-autotune-ga.md` (on the `qfndev` branch), "code-level
 search"). Two changes of default and two new switches:
 - **`GQA_S_SPLIT` (default with two or more sides):** the sides of an 8-row
   tile split QKᵀ by 16-key group and exchange S through local memory (one
@@ -1029,7 +1029,7 @@ The prompt kernel (0008's `flash_attn_dpas.cl`, the sub-group-16 build only)
 and the decode / verify kernel (0016's `flash_attn_gqa_dpas.cl`) as two LLM
 mutation agents rewrote them overnight, one kernel each, every candidate
 compiled, tested and timed on the B60 before the next
-(`docs/campaigns/kernel-autotune-ga.md`, "LLM mutation search"). Kernel
+(`docs/campaigns/kernel-autotune-ga.md` (on the `qfndev` branch), "LLM mutation search"). Kernel
 source only; the host is unchanged.
 
 Prompt kernel:
@@ -1105,7 +1105,7 @@ shipped arm is 0018):
 
 The Arc A770's (sub-group 8) prompt-attention kernel and K-quant GEMM tiles,
 as two LLM mutation agents rewrote them in one day
-(`docs/campaigns/kernel-autotune-ga.md`, "A770"). Kernel source only, every
+(`docs/campaigns/kernel-autotune-ga.md` (on the `qfndev` branch), "A770"). Kernel source only, every
 change under `#if SG == 8`: the Arc Pro B60's sub-group-16 builds compile
 to byte-identical binaries (ocloc, both files, `measured-here`).
 
@@ -1164,3 +1164,178 @@ Those are the attention kernel alone; the GEMM alone: pp512 after 4,096
   pin's softcap case); MUL_MAT_ID 338/338, MUL_MAT 1,055/1,055. Not in
   test-backend-ops: q4_0/q4_0 attention at head size 128, plain MUL_MAT
   IQ4_NL with K not a multiple of 256 at more than 4 columns.
+
+## 0021-expert-cache-slots-and-usm-bank.patch
+
+A per-expert cache for MoE layers whose experts stay in host memory
+(`src/llama-expert-cache.{h,cpp}`, `docs/campaigns/flash-next-llama-engine.md` (on the `qfndev` branch)
+"Stage 2b"), after Strata's expert cache and adapt step and FreeToken's
+gather of missing experts (`code`, both). Off unless
+`llama_model_params.expert_cache_bytes` (or `LLAMA_EXPERT_CACHE_MIB`) is set
+and the experts are placed on the CPU (`--n-cpu-moe` / `-cmoe`).
+
+libllama:
+- `llama_model_params.expert_cache_bytes`, `.expert_cache_profile` (Strata's
+  STRP decode profile) and `llama_model_expert_cache_info`; the loader keeps
+  each GGUF shard's path;
+- per layer: slot tensors on the card (the hot experts, sized in bytes), a
+  bank of the other experts in USM host memory, residency tables;
+  `build_moe_ffn` looks the router's ids up in the tables and sums the slot
+  and bank branches; decode's ids are read back once a step for the usage
+  counts; every 12 decode tokens hot bank experts exchange with cold slots
+  on the card's queue.
+
+ggml-opencl:
+- USM host buffers (`clHostMemAllocINTEL`) behind `get_proc_address`
+  ("ggml_backend_opencl_set_alloc_host"), their tensors passed to the kq
+  kernels as pointers; a `cl_mem` over host memory is migrated to the card by
+  the driver (`measured-here`, B60);
+- `get_rows` for I32; slice writes, reads and exchanges of weight tensors in
+  their card layout (Q8_0 and IQ4_NL as scales, then quants); batched reads;
+- the kq MoE kernels skip a pair whose id is -1 (the matvec writes its zeros,
+  the GEMM's tile router drops it after a zero fill of a cache tensor's
+  output); a gather kernel copies the routed experts from a USM bank into a
+  card-side mirror before the kernels run;
+- the IQ matvec's trailing arguments (a mirror and a split): for a slot
+  tensor paired with its bank, ids at or above the split read the mirror, so
+  a decode step runs one branch (INT_MAX: off).
+
+ggml-cpu: `MUL_MAT_ID` leaves a row zero for a negative id (both grouping
+loops); unused by 0021's final design, kept for a CPU branch. The K-quant
+matvec returns on a negative id (defensive: the cache takes IQ3_XXS, IQ4_XS
+and IQ4_NL experts, Q8_0 down projections, nothing else).
+
+Measured on the Arc Pro B60 with Qwen3.8-Flash-Next UD-Q3_K_XL from NVMe
+(`measured-here`, 2026-10-06; 12,800 MiB of slots, 36.5 GiB of bank):
+- the 20,045-token needle prefills at 149.6 t/s against stage 1's 81.9 (16
+  expert layers on the card), answered; 235.0 t/s with 2,048-token ubatches
+  (arcint's default with the cache);
+- decode 12.2-12.3 t/s against stage 1's 10.5-12.4; 75 % of decode's routed
+  experts on the card after adaptation;
+- KL against the CPU reference 0.029634 / 95.784 % same top-1, stage 1
+  0.029206 / 95.931 %.
+
+## 0022-opencl-intel-low-bit-iq-and-f16-small-n.patch
+
+The ISTA-DASLab GSQ-RCO quantisations of Qwen3.8-Flash-Next (the files
+Strata serves) store their experts in types ggml-opencl had no kernel for:
+gate/up IQ2_S, IQ2_XXS or IQ1_M, down Q2_0; their dense projections add
+IQ3_S. llama.cpp then left those layers to the CPU. The patch adds them, and
+the decode-path work Flash-Next and its MTP verify needed on Intel:
+
+- **Low-bit kq types** (kq type index 6-10, blocks as stored): matrix-vector
+  for 1 to 4 columns and `MUL_MAT_ID` (`mul_mv_iq_q8_1.cl`, one 32-weight
+  sub-block a lane expanded to int8 and two scales; IQ1_M's values are
+  8 (g + delta), exact in int8), the f16-tile GEMM (`mul_mm_kq_f16.cl`), the
+  expert cache (0021) taking them; Q2_0's K need only be a multiple of 64.
+  The expanders run in 32-bit only (64-bit integer arithmetic is emulated:
+  IQ2_S 168 -> 146 us, IQ3_S 284 -> 255 at 4096 x 14336, B60); IQ2_XXS and
+  IQ1_M read their grids from local memory, IQ2_S and IQ3_S from constant
+  memory (a local copy per work-group cost more there).
+- **IQ2_XXS, IQ2_S, Q2_0 and IQ3_S in planes on the card**, per weight slice
+  (an expert): each field of every block back to back, so a lane reads
+  aligned 32-bit words where the 18-, 66-, 82- and 110-byte GGUF blocks left
+  fields at 2-byte offsets (single-byte loads). A slice keeps its size and
+  place: the expert cache's slot / bank copies and gathers stay byte copies;
+  `set_tensor`, `get_tensor`, the slice procs and the USM bank convert GGUF
+  blocks <-> planes (`ggml_cl_lb_convert`); an odd block count a slice stays
+  in blocks and its ops go to the CPU. 4096 x 14336, one column (B60): Q2_0
+  184 -> 99 us, IQ2_XXS 211 -> 111, IQ3_S 255 -> 156, IQ2_S 146 -> 142.
+- **F16 / BF16 (stored as F16) times 2 to 8 columns** in one read of each
+  weight row (`kernel_mul_mv_f16_f32_nc`): the tiled GEMM took 2.80 ms for
+  4096 x 14336 at 2, 4 or 8 columns against 0.29 ms at one; now 0.70-0.89.
+  Few rows and a long K (a hyper-connection inject, a router at 2+ columns)
+  take a work-group a row (`kernel_mul_mv_f16_f32_ksplit`).
+- **ADD** of two contiguous same-shape F32 tensors on the flat kernel (the
+  row kernel gave a [2560 x 4] add one 64-wide work-group a row: ~23 us).
+- **GGML_OP_DSV4_HC_PRE / _POST** (identity comb), as ggml-sycl computes
+  them: llama.cpp's fusion probe then builds Qwen3.8-Flash-Next's
+  hyper-connection mixers fused.
+- **The MoE router fused** (SOFT_MAX .. ARGSORT .. GET_ROWS .. SUM_ROWS,
+  CLAMP, DIV -> one kernel, as ggml-cuda's topk_moe; `GGML_OPENCL_FUSE_TOPK_MOE=0`
+  turns it off).
+- **The expert cache's gather for 2+ tokens** copies each routed bank expert
+  once (the per-pair grid copied an expert two tokens share twice and spent
+  ~650 us a projection on a 4-token step, profiled).
+- **IQ4 codebook per card**: register selects where the device has 8-wide
+  sub-groups (A770: MV_ID 34 -> 28 us), constant gathers elsewhere (B60:
+  130 vs 146 us dense).
+- **SCALE -> SILU and SCALE -> SIGMOID [-> SCALE] fused** into one
+  elementwise kernel (`kernel_scale_act_f32`, `GGML_OPENCL_FUSE_SCALE_ACT=0`
+  turns it off): fewer launches a step, the served text identical; no
+  decode change measurable above the run-to-run spread.
+- The gather's shape for 2+ tokens is switchable for measurement:
+  `GGML_OPENCL_GATHER_PAIRS_MULTI=1` takes the per-pair grid back,
+  `GGML_OPENCL_GATHER_CHUNKS` sets the per-expert split. Served, the shape
+  did not move the gathers' time (their bytes over the link do).
+- A matvec grouped by expert for 2-15 tokens (`kernel_mul_mv_idg_*`), opt-in
+  only (`GGML_OPENCL_KQ_IDG=1`): slower than a pair a work-group where the
+  matvec is not bandwidth-bound (the coder's verify 7.85 -> 9.18 s, A770).
+- **The expert cache's decode matvec reads a missed expert where it lies**
+  (USM host memory, by pointer argument; Strata's expert kernels read its
+  pinned host mirror the same way): no gather into the card-side mirror
+  first (`GGML_OPENCL_BANK_DIRECT=0` gathers). Flash-Next MTP 2: 26.0 ->
+  28.2 t/s.
+- **The order of a verify's expert pairs**: a permutation computed once per
+  layer (`kernel_moe_pair_perm`, the three projections share the ids) puts
+  the pairs read over the link first (`GGML_OPENCL_PAIR_ORDER`, 1 by
+  default): 29.8 -> 30.7 t/s; bank pairs last 29.3.
+- **Q2_0 rows of 20 sub-blocks** (Flash-Next's 2560 x 640 down projections)
+  take 4 lanes a row instead of 16: 135 -> 89 us at 3 tokens, 47 -> 32 at
+  one.
+- **A 2D weight times columns lying back to back** (an MTP step's [K, 4,
+  tokens]) runs as one few-column product; the F32 GEMV takes up to 1,024
+  rows (an MTP layer's F32 router).
+- **F16 / BF16 weights times 16+ columns on the XMX tiles** of the K-quant
+  GEMM (`kernel_mul_mm_f16w_f16`; `GGML_OPENCL_F16_XMX=0` keeps the tiled
+  GEMM): Flash-Next's prompt-side hyper-connection products 4-5x faster
+  (320 x 10240 at 512 tokens 1,907 -> 468 us); the needle's prefill 342.8 ->
+  383.4 t/s.
+- **The QSA indexer's ops on the card**: TOP_K (a radix select a row),
+  CPY F32 <-> I32, FILL / REPEAT / SET_ROWS for F16. Without them the
+  scheduler ran four CPU islands per attention layer (98 splits a Flash-Next
+  verify graph), each draining the queue: decode 32.0 -> 33.0-34.2 t/s,
+  the needle 381 -> 422-425 t/s, the long text identical.
+- Opt-in, measured no faster served: the hyper-connection read fused into
+  three kernels (`GGML_OPENCL_FUSE_HC_MIX=1`, after Strata's `fused_gr` v3
+  split by stream and K half; 30.8 t/s off, 30.4 on), a projection's matvec copying the next
+  projection's misses into a card-side mirror (`GGML_OPENCL_MOE_PREFETCH=1`,
+  31.4 -> 31.6), the K-split F16 kernel with 4 rows a work-group
+  (`GGML_OPENCL_F16_KSPLIT4=1`); measured slower and kept opt-in: a verify's
+  pairs grouped by expert and decoded once (`GGML_OPENCL_KQ_GROUPED=1`,
+  30.5 -> 29.5); the activation as one int8 term in the K-quant and IQ
+  matvecs (`GGML_OPENCL_KQ_ONE_TERM=1`, llama.cpp's and Strata's single
+  q8_1 instead of codes plus residual codes): IQ4_XS 49.6 -> 43.9 us at 3
+  columns, Flash-Next 31.0 -> 31.6-31.8 t/s, but the coder 43.3 -> 40.7 (its
+  MTP drafts accepted 42.7 -> 38.2 %). The expert cache's adaptation constants take
+  `LLAMA_EXPERT_CACHE_{ADAPT_EVERY,MAX_SWAPS,MIN_GAIN,MIN_USAGE,DECAY}`
+  (the hit rate stayed at 89.9-90.7 % across them), and it counts a
+  verify's distinct experts (logged every 200 steps). `GGML_OPENCL_IQ_OPTS` adds defines to the IQ
+  matvec builds. Measured slower and removed: the IQ4 codebook by byte
+  pairs and per lane in local memory, a per-work-group scan for the pair
+  order.
+
+`test-backend-ops` against the CPU (`measured-here`, B60 and A770): MUL_MAT
+557/557 and MUL_MAT_ID 181/181 for the IQ, low-bit, F16 and BF16 types,
+DSV4_HC_PRE 18/18, DSV4_HC_POST 4/4, ADD 103/103, TOPK_MOE 416/416, SOFT_MAX
+214/214. An unfiltered MUL_MAT_ID run fails the 74 MXFP4 cases on the B60 only, and
+so does the 0021 tree's own build (0/74, `measured-here`): a defect of the
+MXFP4 MoE path on Xe2 that predates this patch, not a type it touches. The
+final tree (B60): MUL_MAT f16/bf16 434/434 (the XMX path's red case, K cut
+by 16, fails 7), MUL_MAT_ID IQ/low-bit 193/193 (with Q2_0 at K 640, 384 and
+320; the 4-lane path's red case fails 47 of 87), HC_MIX 10/10 fused (its red
+case, the mix 5 % off, fails 9 of 10), MUL_MAT IQ4_XS/Q4_K 94/94. Run
+`test-backend-ops` from its own `bin/` when the kernels are not embedded,
+and with `-b GPUOpenCL`: a wrong backend name skips everything and still
+prints OK.
+
+Served, B60, Qwen3.8-Flash-Next IQ2_XS from the expert cache, the gate's
+requests (`measured-here`, 2026-10-06): decode 21.3 t/s plain (14,500 MiB of
+slots), 27.0 t/s with MTP 2 from an MTP-only file (13,500 MiB), prefill
+371.1 t/s at 20k; answers right; the cache's file check 0 of 6 copies
+differ. Before the patch's decode work: 16.0 and
+13.8. The resident models on the same build: the dense 27B agent (B60, MTP 5)
+35.9 -> 38.7 t/s, the coder (A770, MTP 4) 40.1 -> 43.3 t/s, the long answer
+greedy. With the rest of the patch (2026-10-07): MTP 2 30.7-31.6 t/s
+(13,500-14,500 MiB), MTP 3 with arcint's `--llama-mtp-min-p 0.5` 31.3, the
+needle's prefill 383 t/s; the residents unchanged (38.2 / 43.5).

@@ -18,6 +18,50 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.6.0 — 2026-10-07
+
+**Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine
+builds llama.cpp `bed0a85` with `contrib/llama.cpp/patches` 0001-0022.
+
+Qwen3.8-Flash-Next on the libllama engine (`docs/llama-engine.md`,
+"Flash-Next"). It serves on the B60 from ISTA-DASLab's IQ2_XS GGUF, with
+every expert computed on the card and the checkpoint's MTP layer drafting.
+0.6 opens the line of 2-bit expert builds.
+
+- **The expert cache** (`--llama-expert-cache MIB`, `--llama-expert-profile`,
+  patch 0021): hot experts in VRAM slots filled from Strata's decode profile
+  and swapped as decode's usage moves; the rest in a USM bank in host memory,
+  read by pointer over the link in a decode step.
+- **MTP from a separate MTP-only GGUF** (`--llama-mtp-gguf`), built by
+  `tools/flash_next_mtp_gguf.sh` from the checkpoint's 31 `mtp.*` tensors;
+  `--llama-mtp-min-p` stops drafting below a probability (Strata's
+  `--spec-min-p`).
+- **Patch 0022**, Intel kernels for the low-bit IQ types and Q2_0 (planes
+  per slice), F16/BF16 products on XMX, the hyper-connection and router
+  fusions, and the QSA indexer's ops on the card (without them a verify
+  graph ran 48 CPU islands).
+
+Measured on the B60 (`measured-here`, the release tree, 2026-10-07): the
+20,045-token needle prefills at 422 t/s, the 500-token long answer decodes
+at 33.0-34.8 t/s with MTP 2 (72-74 % of drafts accepted); the capital, the
+needle and the long answer right. Strata's own engine reaches 37.2-37.8 /
+620 t/s on the same card. The KL of IQ2_XS against a reference is owed
+(the existing CPU reference is the UD-Q3_K_XL file).
+
+The residents gain from 0022's general kernels (the release tree against
+the installed 0.5.12, one window, `measured-here`): the agent (dense 27B,
+B60, MTP 5) 35.5 -> 38.3 t/s with an identical long answer; the coder
+(A770, MTP 4) 40.5 -> 43.3 t/s, the acceptance task 9/10 in both (the same
+case, LF-only input, over its instruction budget), and the
+answer-level bar met: mean KL 0.0236 against 0.0234 nats, the same top-1
+95.50 against 95.43 % (64 chunks against the Q8 reference, A770).
+
+Opt-in switches measured and left off: `GGML_OPENCL_KQ_ONE_TERM=1` (the
+activation as one int8 term: Flash-Next +2 %, the coder -6 %),
+`GGML_OPENCL_FUSE_HC_MIX`, `GGML_OPENCL_MOE_PREFETCH`,
+`GGML_OPENCL_KQ_GROUPED`; measurement timers `LLAMA_DECODE_TIMING`,
+`GGML_SCHED_TIMING`.
+
 ## 0.5.12 — 2026-10-05
 
 **Runtime:** `marfrit-openvino +p25` remains the floor.

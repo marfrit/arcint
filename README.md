@@ -24,8 +24,9 @@ and the runtime each release depends on.
 
 arcint has two inference backends behind the same HTTP surface, sampler,
 lanes and chat templates. Both services run on the second: the agent from
-0.5.6, the coder from 2026-10-05. The first carries Flash-Next and stays as
-the coder's way back.
+0.5.6, the coder from 2026-10-05, and Flash-Next from 0.6.0. The first
+carries Flash-Next's full-depth checkpoint blocks and stays as the coder's
+way back.
 
 **OpenVINO (the default).** The model is an OpenVINO IR, or a GGUF fed
 through it. Runs on the patched `marfrit-openvino` runtime. arcint owns the
@@ -97,8 +98,13 @@ Production (operator, 2026-10-04):
     reuses the prefix it holds, and llama.cpp's context checkpoints let a
     hybrid model resume a follow-up or an edited message
     (`--llama-checkpoints`).
-- Flash-Next at speed: experts not on the card run on llama.cpp's CPU
-  backend (`--llama-cpu-moe`).
+- Flash-Next (since 0.6.0): ISTA-DASLab's IQ2_XS GGUF with an expert cache
+  that keeps the hot experts in VRAM slots and the rest in a USM bank in
+  host memory, every expert computed on the card (`--llama-expert-cache`,
+  `--llama-expert-profile`); the checkpoint's MTP layer drafts from a
+  separate GGUF (`--llama-mtp-gguf`, `tools/flash_next_mtp_gguf.sh`). On the
+  B60: 422 t/s prefill at 20k tokens, 33-35 t/s decode with MTP 2
+  (`measured-here`; Strata's own engine: 620 / 37.5 on the same card).
 
 `docs/llama-engine.md` has the details.
 
@@ -142,6 +148,15 @@ loader:
           -DARCINT_LLAMA_DIR=<llama.cpp> -DCMAKE_BUILD_TYPE=Release
 
 The Debian recipe does exactly this (`contrib/packaging/arcint/build-deb.sh`).
+
+**The GPU runtime on a fresh host.** Debian trixie ships no Intel compute
+runtime (`intel-opencl-icd`, `libze-intel-gpu1`) in any component; install
+Intel's release `.deb`s from
+[intel/compute-runtime](https://github.com/intel/compute-runtime/releases)
+with the IGC and gmmlib versions its release notes name. Every number here
+was measured on compute-runtime 26.27.39122.11 with IGC 2.38.2; a fresh
+trixie container with those, the `.deb`s from these recipes and the cards
+bound in served the coder at the measured speed (0.6.0, `measured-here`).
 
 `-DARCINT_WERROR=ON` gives the warning-clean build CI should use. Pass
 `-DARCINT_GIT_SHA` whenever the build tree has no `.git`; without it
@@ -247,7 +262,7 @@ match an allowlist entry. GPTQ or NVFP4 safetensors will not load.
 |---|---|---|
 | `qwen3_5_moe` | Qwen3.6-27B-A3B-Coder, Qwen3.6-35B-A3B | int4 IRs (the 35B via expert offload on the 16 GiB card); the 35B's native-format artifact all-resident |
 | `qwen3_5` dense | Qwen3.8-27B | our AWQ export and Intel's int4 IR (MTP head reconstructed with `tools/export_mtp.py`); its GGUF through `--gguf` |
-| `qwen4_exp` | Qwen3.8 Flash-Next (512 experts) | serving-shape artifacts built from the GGUF with `tools/export_serving_artifact.py`; full depth serves on one card with part of the experts on the CPU tier, slowly |
+| `qwen4_exp` | Qwen3.8 Flash-Next (512 experts) | ISTA-DASLab's IQ2_XS GGUF on the libllama engine with the expert cache and MTP (since 0.6.0, B60); or serving-shape artifacts built from the GGUF with `tools/export_serving_artifact.py`, full depth on one card with part of the experts on the CPU tier, slowly |
 
 **A GGUF opens on top of an IR directory**: `--gguf FILE --model DIR` takes
 the served IR of the same architecture as the topology template and replaces

@@ -1,3 +1,13 @@
+marfrit-openvino (2026.4.0~dev20260821+p25-2) bookworm trixie; urgency=medium
+
+  * The same +p25 binaries with their RUNPATH set to $ORIGIN
+    (repack-runpath.sh): +p25-1 carried the build tree's paths, so on a host
+    without that tree libopenvino and the plugins found neither their bundled
+    libtbb.so.12 nor each other. build-deb.sh now sets the RUNPATH itself and
+    refuses a library that points outside the package.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Wed, 07 Oct 2026 14:00:00 +0200
+
 marfrit-openvino (2026.4.0~dev20260821+p25-1) bookworm trixie; urgency=medium
 
   * Seven more patches on top of +p20 (and +p24's QSA), same upstream commit

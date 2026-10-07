@@ -14,17 +14,17 @@
 # kernels).
 set -euo pipefail
 
-PKGVER=0.5.12
+PKGVER=0.6.0
 UPSTREAM_TAG=v${PKGVER}
-PKGREL=1
+PKGREL=2
 # The public repository, not the fleet one. The fleet repo (still named
 # "ligence", arcint's working title before the ligence.io collision) is private
 # and carries operator-local notes; the published tree is the same code without
 # them, so the package is built from what anyone can check.
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
-# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v0.5.12.tar.gz,
+# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v0.6.0.tar.gz,
 # taken after the tag was pushed (recorded in the follow-up commit, as for every tag).
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-a9012148a96501866b97ea6e462466a9a237f07e36668f339f55a31d2605a2e1}
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-ffd02f1bd1bf0f0adf33a3a2c0f3775212a17807d93fbb394bf894ef6a397e5b}
 # The libllama engine (--engine llama) builds against llama.cpp at this pin
 # with contrib/llama.cpp/patches applied (contrib/llama.cpp/README.md): the
 # GitHub tarball of the commit, checked by sha256.
@@ -35,8 +35,10 @@ OV_PREFIX=/usr/lib/marfrit-openvino
 # The ABI is the nightly, not the patch level: floor the patch level, cap at
 # the next nightly. An exact pin (Depends: = +p1-1) made apt REMOVE arcint when
 # the runtime was upgraded to +p3 on 2026-09-04; never render "=" here again.
-OV_DEP_VERSION="2026.4.0~dev20260821+p25-1"
-# 0.5.5 to 0.5.12 keep the +p25 floor: what they add over 0.5.4 needs no newer
+# +p25-2: the same +p25 binaries with their RUNPATH set to $ORIGIN (+p25-1 found its
+# own libtbb.so.12 and plugins only on the host it was built on; fresh trixie, 2026-10-07).
+OV_DEP_VERSION="2026.4.0~dev20260821+p25-2"
+# 0.5.5 to 0.6.0 keep the +p25 floor: what they add over 0.5.4 needs no newer
 # runtime by default. Patches 0076 (+p26) and 0077 (+p27) serve opt-in switches of the
 # Flash-Next CPU tier (MOE_CPU_TIER_ADAPTIVE=1, MOE_DOORBELL=1); those need a
 # +p27 runtime built from marfrit-openvino/.
@@ -216,7 +218,7 @@ Section: misc
 Priority: optional
 Architecture: amd64
 Installed-Size: ${INSTALLED_KB}
-Depends: libc6 (>= 2.34), libstdc++6 (>= 13), ocl-icd-libopencl1, marfrit-openvino (>= ${OV_DEP_VERSION}), marfrit-openvino (<< ${OV_DEP_NEXT_NIGHTLY})
+Depends: libc6 (>= 2.34), libstdc++6 (>= 13), libgomp1, ocl-icd-libopencl1, marfrit-openvino (>= ${OV_DEP_VERSION}), marfrit-openvino (<< ${OV_DEP_NEXT_NIGHTLY})
 Recommends: intel-opencl-icd
 Maintainer: Markus Fritsche <mfritsche@reauktion.de>
 Homepage: https://github.com/marfrit/arcint
