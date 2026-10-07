@@ -206,12 +206,18 @@ else. Its recipe now sets `$ORIGIN` the same way.
 
 ## The GPU runtime
 
-The image takes Fedora's `intel-compute-runtime`. The numbers in this
-repository were measured on compute-runtime 26.27.39122.11 with IGC 2.38.2
-(Intel's release packages, on Debian trixie); a different driver version is
-a different measurement, not a different result by default. Debian trixie
-ships no Intel compute runtime at all, which is one reason the image is
-Fedora-based.
+The image takes Fedora's `intel-compute-runtime` (26.18.38308.4 with IGC
+2.34.4 in Fedora 43, 2026-10-07). The numbers in this repository were
+measured on compute-runtime 26.27.39122.11 with IGC 2.38.2 (Intel's release
+packages, on Debian trixie). Debian trixie ships no Intel compute runtime at
+all, which is one reason the image is Fedora-based.
+
+Served from these images (`measured-here`, 2026-10-07, tier 1 and tier 2
+built from this tree in a privileged Debian container with podman, the A770
+bound in): the coder (`--engine llama`, its production GGUF, MTP 4, q8_0:q4_0
+KV) answered the capital check and decoded the 500-token long answer at
+43.4 t/s with 42.7 % of drafts accepted -- the same as the `.deb` on the
+host (43.3-43.5 t/s, 42.7 %).
 
 ## What CI covers, and what it cannot
 
