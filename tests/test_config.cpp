@@ -3,6 +3,7 @@
 #include "exec/llama_layer_split.h"
 #include "harness.h"
 
+#include <cstdio>
 #include <vector>
 
 using namespace lgc;
@@ -1350,4 +1351,100 @@ TEST(llama_layer_split_fractions_place_k_exactly) {
     // the proportional {K, n - K} is not exact: layer 24 of 48 stays on the first card
     const float naive[2] = { 24.0f, 24.0f };
     CHECK_EQ(llama_layer_split_device(naive, 2, 48, 24), 0);
+}
+
+// Named lanes (DESIGN §4.2, amended 2026-10-07;
+// docs/campaigns/lanes-agent-subagent.md): --served-model-name A,B with
+// --lane-ctx CA,CB on the libllama engine, paired by index; the lane count is
+// the number of names.
+namespace {
+// The refusal, and that it is the lanes' refusal and not some earlier one.
+bool refused_for(std::vector<const char*> args, const char* needle) {
+    Config         cfg;
+    const ArgParse r = run(std::move(args), cfg);
+    if (r.ok) return false;
+    if (r.error.find(needle) == std::string::npos) {
+        std::fprintf(stderr, "    (refused, but for: %s)\n", r.error.c_str());
+        return false;
+    }
+    return true;
+}
+}  // namespace
+
+TEST(config_named_lanes_pair_names_with_contexts) {
+    Config cfg;
+    CHECK(run({"--gguf", "/m/q.gguf", "--served-model-name", "qwen3.8-agent,qwen3.8-subagent",
+               "--lane-ctx", "131072,32768"}, cfg).ok);
+    CHECK(cfg.named_lanes());
+    CHECK_EQ(cfg.lane_names, (std::vector<std::string>{"qwen3.8-agent", "qwen3.8-subagent"}));
+    CHECK_EQ(cfg.lane_ctx, (std::vector<int>{131072, 32768}));
+    CHECK_EQ(cfg.parallel, 2);   // the lane count is the number of names
+    // the first name is the served one (where an unnamed request goes)
+    CHECK_EQ(cfg.served_model_name, std::string("qwen3.8-agent"));
+
+    // --parallel that agrees is accepted, one that disagrees is refused
+    Config agree;
+    CHECK(run({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "512,256",
+               "--parallel", "2"}, agree).ok);
+    CHECK_EQ(agree.parallel, 2);
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "512,256",
+                       "--parallel", "1"}, "--parallel"));
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "512,256",
+                       "--parallel", "3"}, "--parallel"));
+
+    // the stub serves them too, for the device-free suites
+    Config stub;
+    CHECK(run({"--stub", "--served-model-name", "a,b", "--lane-ctx", "512,256"}, stub).ok);
+    CHECK_EQ(stub.parallel, 2);
+}
+
+TEST(config_named_lanes_refusals) {
+    // a name with whitespace ("a, b" in a unit file) would make a lane named " b"
+    // that its proxy name never reaches
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a, b", "--lane-ctx", "512,256"}, "whitespace"));
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a ,b", "--lane-ctx", "512,256"}, "whitespace"));
+    // named lanes are the libllama engine's
+    CHECK(rejected({"--model", "/m/ir", "--served-model-name", "a,b", "--lane-ctx", "512,256"}));
+    // lists of different lengths
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "512"}, "--lane-ctx"));
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b,c", "--lane-ctx", "512,256"}, "--lane-ctx"));
+    // a cap that is not a multiple of 256 (llama.cpp pads the pool to 256)
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "512,1000"}, "256"));
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "0,256"}, "256"));
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "-256,256"}, "256"));
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "512,x"}, "--lane-ctx"));
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "512,"}, "--lane-ctx"));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx"}));
+    // --lane-ctx without names, or with one: one lane's context is --n-ctx
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--lane-ctx", "512,256"}, "--served-model-name"));
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a", "--lane-ctx", "512"}, "--n-ctx"));
+    // names without contexts
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b"}, "--lane-ctx"));
+    // an empty or blank name, and the same name twice (a name picks one lane)
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--served-model-name", "a,,b", "--lane-ctx", "512,256,256"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--served-model-name", "a, ", "--lane-ctx", "512,256"}));
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,a", "--lane-ctx", "512,256"}, "twice"));
+    // more than four lanes
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b,c,d,e",
+                       "--lane-ctx", "256,256,256,256,256"}, "4"));
+    Config four;
+    CHECK(run({"--gguf", "/m/q.gguf", "--served-model-name", "a,b,c,d", "--lane-ctx", "256,256,256,256"}, four).ok);
+    CHECK_EQ(four.parallel, 4);
+    // --n-ctx alongside: the lanes' contexts are the context
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "512,256",
+                       "--n-ctx", "768"}, "--n-ctx"));
+}
+
+TEST(config_one_name_is_unchanged) {
+    Config cfg;
+    CHECK(run({"--gguf", "/m/q.gguf", "--served-model-name", "qwen3.8-agent"}, cfg).ok);
+    CHECK(!cfg.named_lanes());
+    CHECK(cfg.lane_names.empty());
+    CHECK_EQ(cfg.served_model_name, std::string("qwen3.8-agent"));
+    CHECK_EQ(cfg.parallel, 1);
+    // --parallel N alone: equal lanes, no names
+    Config eq;
+    CHECK(run({"--gguf", "/m/q.gguf", "--parallel", "2"}, eq).ok);
+    CHECK(!eq.named_lanes());
+    CHECK_EQ(eq.parallel, 2);
 }

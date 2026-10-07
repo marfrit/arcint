@@ -499,6 +499,42 @@ batches break:
 The same count of perfect runs; the arms differ by the one 5/10 run. The
 T=0 cell is one case flipping with the batch layout.
 
+## Two lanes (`--served-model-name A,B --lane-ctx CA,CB`)
+
+One process and one copy of the weights serve lanes of different context:
+`--served-model-name qwen3.8-agent,qwen3.8-subagent --lane-ctx 131072,32768`
+pairs each name with its context, by index; the lane count is the number of
+names (`--parallel`, if given, must agree; `--n-ctx` is refused alongside).
+A context is a multiple of 256, at most the model's trained context, at most
+4 lanes. One name without `--lane-ctx` is the server as before.
+
+- **Routing**: the request's `model` picks the lane (DESIGN §4.2, amended
+  2026-10-07). An empty name, or the GGUF's canonical id, goes to the first
+  lane; any other name gets a 404 (`model_not_found`). The name is resolved
+  before the prompt is counted, so the §3.8 400 quotes that lane's context.
+  Each lane has its own slot pool: a busy lane waits `--queue-timeout` or
+  answers 503 for itself, and never takes another lane. `/v1/models` lists
+  one entry per name at its `n_ctx`; `/props` answers to every name with
+  `enforces_model_field: true`; `/health` and the 503 carry each lane's
+  free count.
+- **The pool**: the lanes share one KV pool of the sum of their contexts
+  (llama.cpp's `kv_unified`, as its server's `--kv-unified`; `code`:
+  `llama-context.cpp:293-294`, `llama-kv-cache.cpp:84`), so a lane's caps
+  are what keep it in its share: a prompt, the generation and an MTP verify
+  stay below the lane's context. The MTP draft context takes the same
+  layout, else a sequence's stream there would be the pool divided by the
+  lanes, under the agent lane's context. Recurrent state and checkpoints
+  stay per lane. Equal lanes (`--parallel N` alone) keep a stream each.
+- **The cost, to be measured**: in one stream, `n_kv` follows the highest
+  used cell of the pool (`llama-kv-cache.cpp:1260-1270`), so a lane's
+  attention (and on Flash-Next the indexer's scoring) runs over the other
+  lane's cells too, masked. The gate is the subagent lane's decode at 20 t/s
+  or more while the agent lane holds 0, 64k and 120k cells; below it, the
+  fallback is a stream per lane at the largest context
+  (`docs/campaigns/lanes-agent-subagent.md`). The expert cache's counters
+  are the model's: with more than one lane its per-request line is labelled
+  process-wide.
+
 ## Not yet on this engine
 
 Conversation state kept across a restart (P6; in process it is the context

@@ -36,7 +36,7 @@ LOG="${WORK}/server.log"
 
 cleanup() {
   local pid
-  for pid in "${SRV_PID:-}" "${CANCEL_PID:-}" "${ALIAS_PID:-}" "${OP_PID:-}"; do
+  for pid in "${SRV_PID:-}" "${CANCEL_PID:-}" "${ALIAS_PID:-}" "${OP_PID:-}" "${HOLD_PID:-}" "${LANES_PID:-}"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null
       wait "$pid" 2>/dev/null
@@ -424,6 +424,82 @@ grep -q "serving 'qwen3.6-coder'" "$ALIAS_LOG"
 check "the console says which name is served" $?
 
 kill -TERM "$ALIAS_PID" 2>/dev/null; wait "$ALIAS_PID" 2>/dev/null; ALIAS_PID=""
+
+# ------------------------------------------------------------- named lanes
+#
+# DESIGN §4.2 (amended 2026-10-07), docs/campaigns/lanes-agent-subagent.md:
+# --served-model-name A,B --lane-ctx CA,CB. The model field picks the lane;
+# what is gated here is the HTTP wiring the unit cases cannot reach: the
+# 404, the 400 at the lane's cap, and a busy lane refused on its own while
+# the other one serves.
+LANES_PORT=$(free_port); need_port "$LANES_PORT"
+LANES_LOG="${WORK}/lanes.log"
+"$BIN" --stub --host 127.0.0.1 --port "$LANES_PORT" --stub-delay-ms 40 \
+       --served-model-name agent,sub --lane-ctx 512,256 >"$LANES_LOG" 2>&1 &
+LANES_PID=$!
+LANES_BASE="http://127.0.0.1:${LANES_PORT}"
+for _ in $(seq 1 100); do
+  curl -fsS "${LANES_BASE}/health" -o /dev/null 2>/dev/null && break
+  kill -0 "$LANES_PID" 2>/dev/null || { echo "lanes server died:"; tail -20 "$LANES_LOG"; break; }
+  sleep 0.1
+done
+
+curl -sS "${LANES_BASE}/v1/models" -o "${WORK}/lanes-models.json"
+jassert "${WORK}/lanes-models.json" \
+  '[e["id"] for e in d["data"]]==["agent","sub"] and [e["n_ctx"] for e in d["data"]]==[512,256] and all(e["lanes"]==1 for e in d["data"])'
+check "named lanes: /v1/models lists each name at its own context" $?
+curl -sS "${LANES_BASE}/props" -o "${WORK}/lanes-props.json"
+jassert "${WORK}/lanes-props.json" \
+  'd["model"]["enforces_model_field"] is True and {"agent","sub"} <= set(d["model"]["answers_to"])'
+check "named lanes: /props enforces the model field and lists the names" $?
+
+lanes_post() {  # lanes_post <endpoint> <body> <out>; prints the status
+  curl -sS -o "$3" -w '%{http_code}' "${LANES_BASE}$1" -H 'Content-Type: application/json' -d "$2"
+}
+code=$(lanes_post /v1/chat/completions '{"model":"sub","messages":[{"role":"user","content":"hallo"}],"max_tokens":4}' "${WORK}/lanes-sub.json")
+jassert "${WORK}/lanes-sub.json" 'd["model"]=="sub"'
+r=$?; check "named lanes: a request for the subagent lane is served and echoes its name" "$([[ $code == 200 && $r == 0 ]] && echo 0 || echo 1)"
+code=$(lanes_post /v1/chat/completions '{"messages":[{"role":"user","content":"hallo"}],"max_tokens":4}' "${WORK}/lanes-noname.json")
+jassert "${WORK}/lanes-noname.json" 'd["model"]=="agent"'
+r=$?; check "named lanes: a request without a name goes to the first lane" "$([[ $code == 200 && $r == 0 ]] && echo 0 || echo 1)"
+code=$(lanes_post /v1/chat/completions '{"model":"nope","messages":[{"role":"user","content":"hallo"}]}' "${WORK}/lanes-404.json")
+jassert "${WORK}/lanes-404.json" 'd["error"]["code"]=="model_not_found" and d["error"]["param"]=="model"'
+r=$?; check "named lanes: an unknown name is a 404" "$([[ $code == 404 && $r == 0 ]] && echo 0 || echo 1)"
+# 300 tokens (the stub counts words and single bytes): inside the agent
+# lane's 512, over the subagent lane's 256
+LONG=$(python3 -c 'print("x " * 150, end="")')
+code=$(lanes_post /v1/completions "{\"model\":\"sub\",\"prompt\":\"${LONG}\",\"max_tokens\":1}" "${WORK}/lanes-400.json")
+jassert "${WORK}/lanes-400.json" 'd["error"]["n_ctx"]==256 and d["error"]["prompt_tokens"]==300'
+r=$?; check "named lanes: the overflow 400 quotes the subagent lane's cap" "$([[ $code == 400 && $r == 0 ]] && echo 0 || echo 1)"
+code=$(lanes_post /v1/completions "{\"model\":\"agent\",\"prompt\":\"${LONG}\",\"max_tokens\":1}" "${WORK}/lanes-agent-long.json")
+check "named lanes: the same prompt fits the agent lane" "$([[ $code == 200 ]] && echo 0 || echo 1)"
+
+# Hold the subagent lane with a slow stream, then ask for it again: a 503
+# for that lane, while the agent lane still serves.
+curl -sN --max-time 8 "${LANES_BASE}/v1/chat/completions" -H 'Content-Type: application/json' \
+  -d '{"model":"sub","messages":[{"role":"user","content":"x"}],"stream":true,"max_tokens":200}' \
+  -o /dev/null >/dev/null 2>&1 &
+HOLD_PID=$!
+for _ in $(seq 1 50); do
+  curl -sS "${LANES_BASE}/health" -o "${WORK}/lanes-health.json"
+  jassert "${WORK}/lanes-health.json" 'd["lanes"][1]["slots_free"]==0' && break
+  sleep 0.1
+done
+jassert "${WORK}/lanes-health.json" \
+  'd["slots_total"]==2 and d["slots_free"]==1 and [l["name"] for l in d["lanes"]]==["agent","sub"] and d["lanes"][0]["slots_free"]==1 and d["lanes"][1]["slots_free"]==0'
+check "named lanes: /health reports each lane's free count" $?
+code=$(lanes_post /v1/chat/completions '{"model":"sub","messages":[{"role":"user","content":"hallo"}],"max_tokens":4}' "${WORK}/lanes-503.json")
+jassert "${WORK}/lanes-503.json" 'd["slots"]["lane"]=="sub" and d["slots"]["free"]==0 and [l["slots_free"] for l in d["lanes"]]==[1,0]'
+r=$?; check "named lanes: a busy subagent lane is a 503 for that lane" "$([[ $code == 503 && $r == 0 ]] && echo 0 || echo 1)"
+code=$(lanes_post /v1/chat/completions '{"model":"agent","messages":[{"role":"user","content":"hallo"}],"max_tokens":4}' "${WORK}/lanes-agent.json")
+jassert "${WORK}/lanes-agent.json" 'd["model"]=="agent"'
+r=$?; check "named lanes: the agent lane serves while the subagent lane is busy" "$([[ $code == 200 && $r == 0 ]] && echo 0 || echo 1)"
+kill "$HOLD_PID" 2>/dev/null; wait "$HOLD_PID" 2>/dev/null; HOLD_PID=""
+
+grep -q "lane 1 'sub': n_ctx 256" "$LANES_LOG"
+check "named lanes: the console names each lane and its context" $?
+
+kill -TERM "$LANES_PID" 2>/dev/null; wait "$LANES_PID" 2>/dev/null; LANES_PID=""
 
 # ------------------------------------------------- operator serving defaults
 # A third server, because the operator layer is fixed at startup. What is

@@ -464,8 +464,9 @@ stall p95 17 ms, max one chunk; Prüfstand 10/10 on each lane concurrently
   context only from there (`code`; both learned by breaking a proxy).
 - [Amended 2026-10-07, operator.] Named lanes on the libllama engine
   (`--served-model-name A,B --lane-ctx CA,CB`) make the `model` field
-  binding: a lane's name picks that lane. An empty name goes to the first
-  lane, and an unknown name gets a 404. `/v1/models` carries one entry per
+  binding: a lane's name picks that lane. An empty name and the artifact's
+  canonical id go to the first lane, and an unknown name gets a 404.
+  `/health` adds a `lanes` array with each lane's free count. `/v1/models` carries one entry per
   lane name with that lane's `n_ctx`, and `/props` reports
   `enforces_model_field: true` there. One name keeps the behaviour above.
   `docs/campaigns/lanes-agent-subagent.md`.

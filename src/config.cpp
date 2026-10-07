@@ -243,6 +243,14 @@ std::string usage_text() {
         "                            artifact's allowlist id). Presentation\n"
         "                            only: --model-id still decides which\n"
         "                            artifact is accepted\n"
+        "                            A,B (libllama, with --lane-ctx): named lanes,\n"
+        "                            one per name; the request's model field picks\n"
+        "                            the lane (empty: the first; unknown: 404)\n"
+        "  --lane-ctx CA,CB          libllama: each named lane's context, paired with\n"
+        "                            --served-model-name A,B by index; multiples of\n"
+        "                            256, at most 4 lanes. The lanes share one KV pool\n"
+        "                            of their sum (llama.cpp's kv_unified); --parallel\n"
+        "                            and --n-ctx follow from them\n"
         "  --parallel N              number of lanes (default: 1)\n"
         "  --queue-timeout S         seconds a request waits for a lane before a\n"
         "                            503 with the reservation numbers (default: 0)\n"
@@ -663,6 +671,19 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.parallel)) {
                 return fail("--parallel needs an integer");
             }
+            cfg.parallel_explicit = true;
+        } else if (arg == "--lane-ctx") {
+            // one context per --served-model-name, paired by index; checked
+            // against the names below
+            std::vector<std::string> items;
+            if (!value(v) || !split_list(v, items))
+                return fail("--lane-ctx needs a context per named lane (CA,CB in tokens)");
+            cfg.lane_ctx.clear();
+            for (const std::string& it : items) {
+                int c = 0;
+                if (!parse_int(it, c)) return fail("--lane-ctx needs a context per named lane (CA,CB in tokens), not '" + it + "'");
+                cfg.lane_ctx.push_back(c);
+            }
         } else if (arg == "--cache-grid") {
             if (!value(v) || !parse_int(v, cfg.cache_grid)) return fail("--cache-grid needs an integer");
         } else if (arg == "--cache-host-mib") {
@@ -898,6 +919,23 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         return fail("--served-model-name cannot be blank");
     }
     if (cfg.parallel < 1) return fail("--parallel must be >= 1");
+    // --served-model-name A,B: named lanes (a single name, as before, may not
+    // contain a comma). The first name is the served one.
+    if (cfg.served_model_name.find(',') != std::string::npos) {
+        std::vector<std::string> names;
+        if (!split_list(cfg.served_model_name, names))
+            return fail("--served-model-name A,B: a list of names, none empty");
+        for (size_t i = 0; i < names.size(); ++i) {
+            if (names[i].find_first_not_of(" \t\r\n") == std::string::npos)
+                return fail("--served-model-name A,B: a name cannot be blank");
+            if (names[i].find_first_of(" \t\r\n") != std::string::npos)
+                return fail("--served-model-name A,B: '" + names[i] + "' contains whitespace (a request's model field would not reach it)");
+            for (size_t j = 0; j < i; ++j)
+                if (names[i] == names[j]) return fail("--served-model-name names " + names[i] + " twice: a name picks one lane");
+        }
+        cfg.served_model_name = names[0];
+        cfg.lane_names        = std::move(names);
+    }
     if (!(cfg.queue_timeout_s >= 0.0 && cfg.queue_timeout_s <= 3600.0)) {
         return fail("--queue-timeout must be between 0 and 3600 seconds");
     }
@@ -1021,6 +1059,40 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     // The default follows what was given: a GGUF alone is the libllama
     // engine's model, an IR directory the OpenVINO executor's.
     if (cfg.engine.empty()) cfg.engine = (!cfg.gguf_path.empty() && cfg.model_path.empty()) ? "llama" : "ov";
+    // Named lanes (DESIGN §4.2, amended 2026-10-07): the libllama engine's
+    // shared KV pool (docs/campaigns/lanes-agent-subagent.md), and the stub's
+    // admission for the device-free suites
+    if (!cfg.lane_names.empty() || !cfg.lane_ctx.empty()) {
+        constexpr size_t kMaxLanes = 4;
+        if (cfg.lane_ctx.empty())
+            return fail("--served-model-name A,B names lanes: give each its context with --lane-ctx CA,CB");
+        if (cfg.lane_names.empty())
+            return fail(cfg.served_model_name.empty()
+                            ? "--lane-ctx needs the lanes' names: --served-model-name A,B"
+                            : "--lane-ctx with one name: one lane's context is --n-ctx (named lanes are two or more)");
+        if (cfg.lane_names.size() != cfg.lane_ctx.size())
+            return fail(log::format("--served-model-name lists %zu names and --lane-ctx %zu contexts: they pair by index",
+                                    cfg.lane_names.size(), cfg.lane_ctx.size()));
+        if (cfg.lane_names.size() > kMaxLanes)
+            return fail(log::format("%zu named lanes: at most %zu", cfg.lane_names.size(), kMaxLanes));
+        long long sum = 0;
+        for (int c : cfg.lane_ctx) {
+            // llama.cpp pads the context to 256 (llama-context.cpp:291): a cap
+            // off that grid would make the pool larger than the lanes' sum
+            if (c <= 0 || c % 256 != 0)
+                return fail(log::format("--lane-ctx %d: a lane's context is a positive multiple of 256", c));
+            sum += c;
+        }
+        if (sum > INT32_MAX) return fail("--lane-ctx: the lanes' contexts sum past 2^31 tokens");
+        if (cfg.n_ctx_explicit)
+            return fail("--n-ctx and --lane-ctx: the lanes' contexts are the context; give --lane-ctx alone");
+        if (cfg.parallel_explicit && cfg.parallel != static_cast<int>(cfg.lane_names.size()))
+            return fail(log::format("--parallel %d disagrees with %zu named lanes (the lane count is the number of names)",
+                                    cfg.parallel, cfg.lane_names.size()));
+        if (!cfg.stub && cfg.engine != "llama")
+            return fail("--served-model-name A,B --lane-ctx CA,CB: named lanes are the libllama engine's (--engine llama --gguf)");
+        cfg.parallel = static_cast<int>(cfg.lane_names.size());
+    }
     if (cfg.engine == "llama") {
         if (cfg.gguf_path.empty()) return fail("--engine llama serves a GGUF: give --gguf");
         if (!cfg.llama_mtp_vocab.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-vocab needs --llama-mtp");

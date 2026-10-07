@@ -262,6 +262,7 @@ if(ARCINT_TESTS)
     tests/test_verify_walk.cpp
     tests/test_token_ids.cpp
     tests/test_props.cpp
+    tests/test_lanes.cpp
     tests/test_artifact.cpp
     tests/test_ngram_admit.cpp
     tests/test_prefix_cache.cpp

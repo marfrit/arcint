@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "api/handlers.h"
 #include "build_info.h"
@@ -211,6 +212,21 @@ int main(int argc, char** argv) {
         }
         const char* n_ctx_source = "requested";
         int         n_ctx        = cfg.n_ctx;
+        if (cfg.named_lanes()) {
+            // the first lane's cap is the served context; a cap over the
+            // artifact's trained context is refused here, as the libllama
+            // engine refuses it at load
+            for (size_t i = 0; i < cfg.lane_ctx.size(); ++i) {
+                if (entry->n_ctx_train > 0 && cfg.lane_ctx[i] > entry->n_ctx_train) {
+                    lgc::log::error("boot", "--lane-ctx %d (lane '%s') exceeds %s's trained context %d",
+                                    cfg.lane_ctx[i], cfg.lane_names[i].c_str(), entry->id.c_str(),
+                                    entry->n_ctx_train);
+                    return 2;
+                }
+            }
+            n_ctx        = cfg.lane_ctx[0];
+            n_ctx_source = "--lane-ctx, the first lane";
+        }
         if (n_ctx <= 0) {
             n_ctx        = entry->n_ctx_train > 0 ? entry->n_ctx_train : kStubDefaultNCtx;
             n_ctx_source = entry->n_ctx_train > 0 ? "allowlist" : "stub fallback";
@@ -221,7 +237,7 @@ int main(int argc, char** argv) {
             return 2;
         }
         backend = lgc::make_stub_backend(stub_entry, cfg.quant, n_ctx, cfg.stub_delay_ms,
-                                         cfg.served_model_name);
+                                         cfg.served_model_name, cfg.lane_ctx);
 
         lgc::log::warn("boot", "%s",
                        "stub backend: no model, no OpenVINO, synthetic output. "
@@ -243,8 +259,15 @@ int main(int argc, char** argv) {
             lgc::log::error("load", "could not bring up the llama.cpp executor: %s", e.what());
             return 1;
         }
-        lgc::log::info("load", "n_ctx %d | device %s | %d lane%s", backend->status().n_ctx, cfg.device.c_str(),
-                       cfg.parallel, cfg.parallel == 1 ? "" : "s");
+        if (cfg.named_lanes()) {
+            std::string ls;
+            for (size_t i = 0; i < cfg.lane_names.size(); ++i)
+                ls += (i ? ", " : "") + cfg.lane_names[i] + " " + std::to_string(cfg.lane_ctx[i]);
+            lgc::log::info("load", "device %s | %zu named lanes: %s", cfg.device.c_str(), cfg.lane_names.size(), ls.c_str());
+        } else {
+            lgc::log::info("load", "n_ctx %d | device %s | %d lane%s", backend->status().n_ctx, cfg.device.c_str(),
+                           cfg.parallel, cfg.parallel == 1 ? "" : "s");
+        }
 #else
         lgc::log::error("boot", "%s", "this build carries no llama.cpp executor (configure with -DARCINT_LLAMA=ON)");
         return 2;
@@ -375,7 +398,13 @@ int main(int argc, char** argv) {
         lgc::log::info("mem", "%s", "kv pool and GDN ledger are not allocated before M2");
     }
 
-    if (!cfg.served_model_name.empty()) {
+    if (cfg.named_lanes()) {
+        lgc::log::info("load", "%zu named lanes; the model field picks the lane, an empty one or '%s' the "
+                               "first, any other name a 404 (DESIGN 4.2):",
+                       cfg.lane_names.size(), backend->status().id.c_str());
+        for (size_t i = 0; i < cfg.lane_names.size(); ++i)
+            lgc::log::info("load", "  lane %zu '%s': n_ctx %d", i, cfg.lane_names[i].c_str(), cfg.lane_ctx[i]);
+    } else if (!cfg.served_model_name.empty()) {
         lgc::log::info("load", "served as '%s' (--served-model-name); the artifact is '%s' and "
                                "the allowlist assertion is unchanged",
                        backend->status().served_id.c_str(), backend->status().id.c_str());
@@ -383,6 +412,9 @@ int main(int argc, char** argv) {
 
     lgc::api::SlotPool slots(cfg.parallel);
     lgc::api::Context  ctx{&cfg, backend.get(), &slots};
+    // named lanes: a pool each, admitting by name
+    std::vector<std::unique_ptr<lgc::api::SlotPool>> lane_pools;
+    ctx.lanes = lgc::api::make_lanes(cfg, lane_pools);
 
     lgc::HttpServer server(cfg, ctx);
     g_server.store(&server);
@@ -394,9 +426,14 @@ int main(int argc, char** argv) {
     // answers to. A journal that does not say which name is served is no help
     // when a roster discovered one from /v1/models and a client is using
     // another.
-    lgc::log::info("http", "listening on %s:%d | %d slot%s | serving '%s'", cfg.host.c_str(),
-                   cfg.port, slots.total(), slots.total() == 1 ? "" : "s",
-                   backend->status().served_id.c_str());
+    std::string serving = "'" + backend->status().served_id + "'";
+    if (!ctx.lanes.empty()) {
+        serving.clear();
+        for (const lgc::api::Lane& l : ctx.lanes)
+            serving += lgc::log::format("%s'%s' (%d)", serving.empty() ? "" : ", ", l.name.c_str(), l.n_ctx);
+    }
+    lgc::log::info("http", "listening on %s:%d | %d slot%s | serving %s", cfg.host.c_str(),
+                   cfg.port, slots.total(), slots.total() == 1 ? "" : "s", serving.c_str());
 
     if (!server.listen()) {
         lgc::log::error("http", "could not bind %s:%d", cfg.host.c_str(), cfg.port);

@@ -370,12 +370,36 @@ public:
         tokenizer_ = std::make_unique<LlamaTokenizer>(vocab_);
         n_vocab_   = static_cast<size_t>(llama_vocab_n_tokens(vocab_));
 
-        lanes_      = std::max(1, cfg.parallel);
-        n_ctx_      = n_ctx > 0 ? n_ctx : std::min(llama_model_n_ctx_train(model_), 32768);
+        // Named lanes (--served-model-name A,B --lane-ctx CA,CB; DESIGN 4.2,
+        // docs/campaigns/lanes-agent-subagent.md): a cap per lane, one KV
+        // pool of their sum that every lane's cells live in (llama.cpp's
+        // kv_unified, its server's --kv-unified; a sequence can use the whole
+        // pool, llama-context.cpp:293-294, so the caps below are what keeps
+        // each lane in its share). Equal lanes (--parallel N alone) keep a
+        // stream of n_ctx each, as before.
+        named_      = cfg.named_lanes();
+        lanes_      = named_ ? static_cast<int>(cfg.lane_ctx.size()) : std::max(1, cfg.parallel);
+        const int n_ctx_train = llama_model_n_ctx_train(model_);
+        int64_t   pool        = 0;
+        if (named_) {
+            for (size_t i = 0; i < cfg.lane_ctx.size(); ++i) {
+                if (n_ctx_train > 0 && cfg.lane_ctx[i] > n_ctx_train)
+                    throw std::runtime_error(log::format("--lane-ctx %d (lane '%s'): %s was trained for %d", cfg.lane_ctx[i],
+                                                         cfg.lane_names[i].c_str(), cfg.gguf_path.c_str(), n_ctx_train));
+                pool += cfg.lane_ctx[i];
+            }
+            cap_   = cfg.lane_ctx;
+            n_ctx_ = cap_[0];   // the first lane's: what an unnamed request gets
+        } else {
+            n_ctx_ = n_ctx > 0 ? n_ctx : std::min(n_ctx_train, 32768);
+            cap_.assign(static_cast<size_t>(lanes_), n_ctx_);
+            pool   = static_cast<int64_t>(n_ctx_) * lanes_;
+        }
         n_batch_    = cfg.prefill_chunk > 0 ? cfg.prefill_chunk : 2048;
         llama_context_params cp = llama_context_default_params();
-        cp.n_ctx           = static_cast<uint32_t>(n_ctx_) * static_cast<uint32_t>(lanes_);
+        cp.n_ctx           = static_cast<uint32_t>(pool);
         cp.n_seq_max       = static_cast<uint32_t>(lanes_);
+        cp.kv_unified      = named_;
         cp.n_batch         = static_cast<uint32_t>(n_batch_);
         // with the expert cache a prefill ubatch gathers the bank's routed experts
         // over the link once: the whole batch in one ubatch reads them once per
@@ -403,6 +427,12 @@ public:
         cp.n_outputs_max         = cp.n_outputs_max_per_seq * static_cast<uint32_t>(lanes_);
         ctx_               = llama_init_from_model(model_, cp);
         if (ctx_ == nullptr) throw std::runtime_error("llama.cpp could not create a context");
+        // llama.cpp pads the context to 256 (llama-context.cpp:291); the caps
+        // are multiples of 256 (config.cpp), so a pool of any other size is a
+        // context this engine did not ask for
+        if (named_ && static_cast<int64_t>(llama_n_ctx(ctx_)) != pool)
+            throw std::runtime_error(log::format("named lanes: llama.cpp made a KV pool of %u tokens, not the lanes' %lld",
+                                                 llama_n_ctx(ctx_), static_cast<long long>(pool)));
         if (cfg.llama_mtp > 0) {
             // --llama-mtp-gguf: the MTP block (with its own embeddings and LM
             // head) as a second model, as llama.cpp loads an MTP-only file
@@ -431,7 +461,7 @@ public:
             std::string err;
             spec_ = make_llama_mtp(mtp_model, ctx_, cfg.llama_mtp, lanes_, n_batch_, static_cast<int>(cp.n_ubatch),
                                    threads, cfg.llama_mtp_gguf.empty() ? cfg.gguf_path : cfg.llama_mtp_gguf,
-                                   cfg.llama_mtp_vocab, cfg.llama_mtp_min_p, cp.type_k, cp.type_v, err);
+                                   cfg.llama_mtp_vocab, cfg.llama_mtp_min_p, cp.type_k, cp.type_v, cp.kv_unified, err);
             if (!spec_) throw std::runtime_error(log::format("--llama-mtp %d: %s", cfg.llama_mtp, err.c_str()));
             n_draft_ = cfg.llama_mtp;
         }
@@ -480,11 +510,26 @@ public:
         d.provenance         = "provisional";
         if (auto err = apply_operator_defaults(cfg, d)) throw std::runtime_error(*err);
         status_.sampler_defaults = d;
-        log::info("load", "llama.cpp %s (%s, %.2f GiB) on %s, OpenCL %s %s, in %.1f s; %d lane%s x %d ctx%s",
+        std::string lane_desc = log::format("%d lane%s x %d ctx", lanes_, lanes_ == 1 ? "" : "s", n_ctx_);
+        if (named_) {
+            lane_desc = log::format("%d named lanes,", lanes_);
+            for (int i = 0; i < lanes_; ++i) lane_desc += log::format(" %s%d", i == 0 ? "" : "+ ", cap_[static_cast<size_t>(i)]);
+            lane_desc += log::format(" = %lld ctx in one pool", static_cast<long long>(pool));
+        }
+        log::info("load", "llama.cpp %s (%s, %.2f GiB) on %s, OpenCL %s %s, in %.1f s; %s%s",
                   desc, arch, static_cast<double>(llama_model_size(model_)) / (1u << 30), card_names.c_str(),
                   split ? "devices" : "platform", split ? cl_ids.c_str() : std::to_string(cards[0].platform).c_str(),
-                  seconds_since(t_load), lanes_, lanes_ == 1 ? "" : "s", n_ctx_,
+                  seconds_since(t_load), lane_desc.c_str(),
                   n_draft_ > 0 ? log::format("; MTP drafts up to %d", n_draft_).c_str() : "");
+        if (named_) {
+            // one line per lane, and the pool they share
+            for (int i = 0; i < lanes_; ++i)
+                log::info("load", "lane %d '%s': cap %d tokens", i, cfg.lane_names[static_cast<size_t>(i)].c_str(),
+                          cap_[static_cast<size_t>(i)]);
+            log::info("load", "KV pool: %u tokens shared by %d lanes (kv_unified: a lane's attention runs over the "
+                              "pool's used cells, masked)%s",
+                      llama_n_ctx(ctx_), lanes_, spec_ ? "; the MTP draft context likewise" : "");
+        }
         if (split)
             log::info("load", "layer split: layers 0-%d on %s, %d-%d and the output on %s (tensor_split %.1f/%.1f)%s",
                       cfg.llama_layer_split - 1, cards[0].name.c_str(), cfg.llama_layer_split, n_layer_gguf - 1,
@@ -530,11 +575,12 @@ public:
                           GenerationStats& stats) override {
         if (spec_) return generate_spec(in, slot, on_piece, stats);
         const int seq = std::min(std::max(slot, 0), lanes_ - 1);
+        const int cap = cap_[static_cast<size_t>(seq)];   // the lane's context
         const std::vector<int> prompt = prompt_tokens(in);
         stats.prompt_tokens = static_cast<int>(prompt.size());
         if (prompt.empty()) return FinishReason::Stop;
-        if (static_cast<int>(prompt.size()) >= n_ctx_) {
-            log::warn("slot", "prompt of %zu tokens does not fit n_ctx %d", prompt.size(), n_ctx_);
+        if (static_cast<int>(prompt.size()) >= cap) {
+            log::warn("slot", "lane %d: prompt of %zu tokens does not fit n_ctx %d", seq, prompt.size(), cap);
             return FinishReason::Length;
         }
 
@@ -599,7 +645,7 @@ public:
                 reason = FinishReason::Length;
                 break;
             }
-            if (static_cast<int>(have.size()) + 1 >= n_ctx_) {
+            if (static_cast<int>(have.size()) + 1 >= cap) {
                 reason = FinishReason::Length;
                 break;
             }
@@ -700,9 +746,15 @@ private:
         llama_expert_cache_info ec{};
         if (!llama_model_expert_cache_info(model_, &ec)) return;
         const uint64_t h = ec.decode_hits - ec_prev_.decode_hits, m = ec.decode_misses - ec_prev_.decode_misses;
+        // The counters are the model's, not a sequence's: with more than one
+        // lane they count every lane's decode since the previous line (any
+        // lane's), so the line says so rather than passing for this request's
+        // (snapshotting around each locked decode would put two counter reads
+        // on every token's critical path for a log line)
+        const char* scope = lanes_ > 1 ? " (process-wide, all lanes since the previous line)" : "";
         if (h + m > 0)
-            log::info("slot", "lane %d: expert cache: %.1f %% of decode's routed experts on the card (%llu / %llu), %llu swaps in %llu adapts, %.2f s writing them",
-                      seq, 100.0 * static_cast<double>(h) / static_cast<double>(h + m), static_cast<unsigned long long>(h),
+            log::info("slot", "lane %d: expert cache%s: %.1f %% of decode's routed experts on the card (%llu / %llu), %llu swaps in %llu adapts, %.2f s writing them",
+                      seq, scope, 100.0 * static_cast<double>(h) / static_cast<double>(h + m), static_cast<unsigned long long>(h),
                       static_cast<unsigned long long>(h + m), static_cast<unsigned long long>(ec.swaps - ec_prev_.swaps),
                       static_cast<unsigned long long>(ec.adapts - ec_prev_.adapts),
                       static_cast<double>(ec.apply_us - ec_prev_.apply_us) / 1e6);
@@ -718,8 +770,8 @@ private:
             const char*    dn = card_desc(llama_model_expert_cache_device(model_, i));
             // every card, also one that counted nothing (its ids not read)
             {
-                log::info("slot", "lane %d: expert cache %s: %.1f %% of decode's routed experts on the card (%llu / %llu), %llu swaps",
-                          seq, dn ? dn : "?", hi + mi > 0 ? 100.0 * static_cast<double>(hi) / static_cast<double>(hi + mi) : 0.0,
+                log::info("slot", "lane %d: expert cache %s%s: %.1f %% of decode's routed experts on the card (%llu / %llu), %llu swaps",
+                          seq, dn ? dn : "?", lanes_ > 1 ? " (process-wide)" : "", hi + mi > 0 ? 100.0 * static_cast<double>(hi) / static_cast<double>(hi + mi) : 0.0,
                           static_cast<unsigned long long>(hi), static_cast<unsigned long long>(hi + mi),
                           static_cast<unsigned long long>(ei.swaps - p.swaps));
             }
@@ -744,11 +796,12 @@ private:
 
     FinishReason generate_spec_lane(const GenerationInput& in, int seq, const TokenCallback& on_piece,
                                     GenerationStats& stats) {
+        const int              cap    = cap_[static_cast<size_t>(seq)];   // the lane's context
         const std::vector<int> prompt = prompt_tokens(in);
         stats.prompt_tokens = static_cast<int>(prompt.size());
         if (prompt.empty()) return FinishReason::Stop;
-        if (static_cast<int>(prompt.size()) >= n_ctx_) {
-            log::warn("slot", "prompt of %zu tokens does not fit n_ctx %d", prompt.size(), n_ctx_);
+        if (static_cast<int>(prompt.size()) >= cap) {
+            log::warn("slot", "lane %d: prompt of %zu tokens does not fit n_ctx %d", seq, prompt.size(), cap);
             return FinishReason::Length;
         }
         uint64_t seed = in.sampler.seed;
@@ -798,13 +851,15 @@ private:
         int          id_last  = prompt.back();
         std::vector<int> batch;
         while (true) {
-            if (static_cast<int>(have.size()) + 1 >= n_ctx_) {
+            if (static_cast<int>(have.size()) + 1 >= cap) {
                 reason = FinishReason::Length;
                 break;
             }
             // tokens that may still be emitted: the plain loop's max_tokens
-            // and context checks (it emits a token while have + 1 < n_ctx)
-            int budget = n_ctx_ - static_cast<int>(have.size()) - 2;
+            // and context checks (it emits a token while have + 1 < cap); the
+            // verify of 1 + n_max then ends below the lane's cap, so a lane's
+            // cells never reach into the other lanes' share of the pool
+            int budget = cap - static_cast<int>(have.size()) - 2;
             if (in.sampler.max_tokens >= 0) budget = std::min(budget, in.sampler.max_tokens - stats.completion_tokens);
             const int n_max = std::max(0, std::min(n_draft_, budget - 1));
             std::vector<int> draft;
@@ -1053,7 +1108,9 @@ private:
     ModelStatus                           status_;
     size_t                                n_vocab_ = 0;
     int                                   lanes_   = 1;
-    int                                   n_ctx_   = 0;
+    int                                   n_ctx_   = 0;   // the first lane's cap (status, the load line)
+    bool                                  named_   = false;   // --lane-ctx: kv_unified, a cap per lane
+    std::vector<int>                      cap_;       // per lane (seq): its context
     int                                   n_batch_ = 2048;
     std::mutex                            mu_;    // llama_context is not thread-safe: one call at a time
     std::vector<std::vector<int>>         slot_tokens_;

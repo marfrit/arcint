@@ -1,5 +1,6 @@
 #include "api/handlers.h"
 
+#include <stdexcept>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -316,6 +317,8 @@ json reservation_json(const Reservation& r) {
 }  // namespace
 
 std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out) {
+    // under named lanes every request is admitted on its lane's own pool
+    if (!ctx.lanes.empty()) throw std::logic_error("acquire_slot without a lane under named lanes");
     const double timeout = ctx.cfg != nullptr ? ctx.cfg->queue_timeout_s : 0.0;
     out = ctx.slots->acquire_for(timeout);
     if (out.index() >= 0) return std::nullopt;
@@ -371,6 +374,116 @@ std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out)
     return HttpResult{503, std::move(body)};
 }
 
+// ------------------------------------------------------------- named lanes
+std::vector<Lane> make_lanes(const Config& cfg, std::vector<std::unique_ptr<SlotPool>>& pools) {
+    std::vector<Lane> lanes;
+    if (!cfg.named_lanes()) return lanes;
+    for (size_t i = 0; i < cfg.lane_names.size() && i < cfg.lane_ctx.size(); ++i) {
+        pools.push_back(std::make_unique<SlotPool>(1));
+        lanes.push_back(Lane{cfg.lane_names[i], cfg.lane_ctx[i], static_cast<int>(i), pools.back().get()});
+    }
+    return lanes;
+}
+
+std::optional<HttpResult> resolve_lane(const Context& ctx, const std::string& model, int& lane) {
+    lane = -1;
+    if (ctx.lanes.empty()) return std::nullopt;
+    for (size_t i = 0; i < ctx.lanes.size(); ++i) {
+        if (ctx.lanes[i].name == model) {
+            lane = static_cast<int>(i);
+            return std::nullopt;
+        }
+    }
+    // No name, or the artifact's own: the first lane. Every lane serves that
+    // artifact, and a client that took the canonical id from /v1/models
+    // should land where an unnamed request does, not on a 404.
+    if (model.empty() || model == ctx.backend->status().id) {
+        lane = 0;
+        return std::nullopt;
+    }
+    std::string served;
+    for (const Lane& l : ctx.lanes) served += (served.empty() ? "" : ", ") + l.name;
+    return HttpResult{404, error_body(log::format("The model '%s' does not exist: this server's lanes are %s "
+                                                  "(the model field picks the lane)",
+                                                  model.c_str(), served.c_str()),
+                                      "invalid_request_error", "model_not_found", "model")};
+}
+
+int lane_n_ctx(const Context& ctx, int lane) {
+    if (lane >= 0 && static_cast<size_t>(lane) < ctx.lanes.size()) return ctx.lanes[static_cast<size_t>(lane)].n_ctx;
+    return effective_n_ctx(ctx);
+}
+
+namespace {
+
+// Every lane's admission state, for /health and the 503
+json lanes_json(const Context& ctx) {
+    json out = json::array();
+    for (const Lane& l : ctx.lanes) {
+        out.push_back(json{{"name", l.name},
+                           {"n_ctx", l.n_ctx},
+                           {"slots_total", l.pool->total()},
+                           {"slots_free", l.pool->free()},
+                           {"queue_depth", l.pool->queue_depth()}});
+    }
+    return out;
+}
+
+int slots_total(const Context& ctx) {
+    if (ctx.lanes.empty()) return ctx.slots->total();
+    int n = 0;
+    for (const Lane& l : ctx.lanes) n += l.pool->total();
+    return n;
+}
+
+int slots_free(const Context& ctx) {
+    if (ctx.lanes.empty()) return ctx.slots->free();
+    int n = 0;
+    for (const Lane& l : ctx.lanes) n += l.pool->free();
+    return n;
+}
+
+int queue_depth(const Context& ctx) {
+    if (ctx.lanes.empty()) return ctx.slots->queue_depth();
+    int n = 0;
+    for (const Lane& l : ctx.lanes) n += l.pool->queue_depth();
+    return n;
+}
+
+}  // namespace
+
+std::optional<HttpResult> acquire_slot(const Context& ctx, int lane, SlotPool::Lease& out, int& slot) {
+    if (lane < 0 || static_cast<size_t>(lane) >= ctx.lanes.size()) {
+        auto err = acquire_slot(ctx, out);
+        slot     = out.index();
+        return err;
+    }
+    // The lane's own pool: a busy lane waits (--queue-timeout) or is refused
+    // by itself, and another lane is never taken instead (a lane is a memory
+    // reservation of its own size, DESIGN §4.3)
+    const Lane&  l       = ctx.lanes[static_cast<size_t>(lane)];
+    const double timeout = ctx.cfg != nullptr ? ctx.cfg->queue_timeout_s : 0.0;
+    out                  = l.pool->acquire_for(timeout);
+    slot                 = out.index() >= 0 ? l.seq : -1;
+    if (out.index() >= 0) return std::nullopt;
+
+    std::string why = log::format("lane '%s' (n_ctx %d) is busy", l.name.c_str(), l.n_ctx);
+    why += timeout > 0.0 ? log::format("; waited %.1f s. Retry, or use another lane's name if its "
+                                       "context suits the request.", timeout)
+                         : "; no wait configured. Retry, raise --queue-timeout to wait, or use another "
+                           "lane's name if its context suits the request.";
+    json body     = error_body(why, "server_error", "no_slot_available");
+    body["slots"] = {{"lane", l.name},
+                     {"total", l.pool->total()},
+                     {"free", l.pool->free()},
+                     {"queue_depth", l.pool->queue_depth()},
+                     {"queue_timeout_s", timeout}};
+    body["lanes"]          = lanes_json(ctx);   // as /health has them
+    body["reservation"]    = reservation_json(ctx.backend->status().reservation);
+    body["kv_blocks_free"] = ctx.backend->free_blocks();
+    return HttpResult{503, std::move(body)};
+}
+
 // The prefix cache as the operator sees it: how many prefixes it holds, how
 // many of those are parked on the host, and what it has served. Tokens from
 // cache against tokens looked up is the number DESIGN 7.0.2j had no value for.
@@ -389,16 +502,19 @@ json cache_json(const PrefixCacheStats& c) {
 // ----------------------------------------------------------------- /health
 json health(const Context& ctx) {
     const ModelStatus& st = ctx.backend->status();
-    return json{{"status", st.loaded ? "ok" : "loading"},
+    json h = json{{"status", st.loaded ? "ok" : "loading"},
                 {"model", st.served_id},
                 {"loaded", st.loaded},
                 {"stub", st.stub},
-                {"slots_free", ctx.slots->free()},
-                {"slots_total", ctx.slots->total()},
-                {"queue_depth", ctx.slots->queue_depth()},
+                {"slots_free", slots_free(ctx)},
+                {"slots_total", slots_total(ctx)},
+                {"queue_depth", queue_depth(ctx)},
                 {"kv_blocks_free", ctx.backend->free_blocks()},
                 {"kv_blocks_total", st.reservation.pool_blocks},
                 {"cache", cache_json(ctx.backend->cache_stats())}};
+    // named lanes: each lane's own counts (the totals above sum them)
+    if (!ctx.lanes.empty()) h["lanes"] = lanes_json(ctx);
+    return h;
 }
 
 // ------------------------------------------------------------------ /props
@@ -423,11 +539,19 @@ json props(const Context& ctx) {
     // Which names a request may put in its `model` field. Both of these are
     // recognised; anything else is served anyway and noted at -v, because one
     // process serves exactly one model and there is nothing else it could mean.
-    // Said out loud rather than left to be inferred from the list.
-    json answers_to = json::array({st.served_id});
-    if (st.id != st.served_id) answers_to.push_back(st.id);
+    // Said out loud rather than left to be inferred from the list. Named lanes
+    // (§4.2, amended 2026-10-07) make the field binding: each lane's name
+    // picks it, the canonical id (and an empty name) the first lane, and any
+    // other name is a 404.
+    json answers_to = json::array();
+    if (ctx.lanes.empty()) {
+        answers_to.push_back(st.served_id);
+    } else {
+        for (const Lane& l : ctx.lanes) answers_to.push_back(l.name);
+    }
+    if (std::find(answers_to.begin(), answers_to.end(), json(st.id)) == answers_to.end()) answers_to.push_back(st.id);
     model["answers_to"]             = std::move(answers_to);
-    model["enforces_model_field"]   = false;
+    model["enforces_model_field"]   = !ctx.lanes.empty();
 
     // Zero means "not pinned in the allowlist and not reported by the artifact"
     // — null says that; 0 would be a lie.
@@ -466,7 +590,7 @@ json props(const Context& ctx) {
             entry->weights_bytes > 0 ? json(entry->weights_bytes) : json(nullptr);
     }
 
-    return json{
+    json p = json{
         {"model", std::move(model)},
         {"chat_template_caps", ctx.backend->template_caps()},
         // What is actually served, not a Config default the load path may
@@ -503,7 +627,7 @@ json props(const Context& ctx) {
           {"presence_penalty", sd.presence_penalty},
           {"provenance", sd.provenance}}},
         {"slots",
-         {{"total", ctx.slots->total()},
+         {{"total", slots_total(ctx)},
           {"queue_timeout_s", cfg.queue_timeout_s}}},
         {"reservation", reservation_json(st.reservation)},
         {"build",
@@ -514,12 +638,59 @@ json props(const Context& ctx) {
         {"endpoints",
          json::array({"/health", "/props", "/v1/chat/completions", "/v1/completions",
                       "/v1/models"})}};
+    if (!ctx.lanes.empty()) {
+        json lanes = json::array();
+        for (const Lane& l : ctx.lanes) lanes.push_back(json{{"name", l.name}, {"n_ctx", l.n_ctx}, {"seq", l.seq}});
+        p["lanes"] = std::move(lanes);
+    }
+    return p;
+}
+
+// ------------------------------------------------------------- /v1/models
+json models(const Context& ctx) {
+    // One process serves one model (§2). The list has one entry (one per
+    // named lane) so that OpenAI clients which probe this endpoint keep
+    // working.
+    //
+    // It carries the context length because this is the only place a
+    // discovering proxy looks: it reads n_ctx (among a few spellings) from
+    // the model object here and asks /props for nothing but the template
+    // capabilities. A context published on /props alone reaches no client,
+    // and a client with no context falls back to its own default against a
+    // server configured for 262144. `n_ctx` is what this process is
+    // actually running with; `n_ctx_train` is the artifact's ceiling, so a
+    // caller can see both and tell them apart.
+    //
+    // Named lanes (§4.2, amended 2026-10-07): one entry per lane name, with
+    // that lane's context, so a proxy sees the subagent lane at its size.
+    const ModelStatus& st = ctx.backend->status();
+    auto maybe_int = [](int v) { return v > 0 ? json(v) : json(nullptr); };
+    auto entry     = [&](const std::string& id, int n_ctx, int lanes) {
+        json e{{"id", id},
+               {"object", "model"},
+               {"owned_by", "arcint"},
+               {"n_ctx", maybe_int(n_ctx)},
+               {"n_ctx_train", maybe_int(st.n_ctx_train)},
+               {"quant", quant_name(st.quant)},
+               {"lanes", lanes}};
+        // The artifact this endpoint actually serves, which --served-model-name
+        // may have renamed. Always present, so a rename never hides identity.
+        e["canonical_id"] = st.id;
+        return e;
+    };
+    json data = json::array();
+    if (ctx.lanes.empty()) {
+        data.push_back(entry(st.served_id, st.n_ctx, ctx.slots->total()));
+    } else {
+        for (const Lane& l : ctx.lanes) data.push_back(entry(l.name, l.n_ctx, l.pool->total()));
+    }
+    return json{{"object", "list"}, {"data", std::move(data)}};
 }
 
 // ---------------------------------------------------------------- prepare
 namespace {
 
-std::optional<HttpResult> finish_prepare(const Context& ctx, const std::string& prompt,
+std::optional<HttpResult> finish_prepare(const Context& ctx, int lane, const std::string& prompt,
                                          const SamplerOverrides& overrides,
                                          GenerationInput& input, int& prompt_tokens,
                                          const std::vector<int>& prompt_ids = {}) {
@@ -535,7 +706,9 @@ std::optional<HttpResult> finish_prepare(const Context& ctx, const std::string& 
                         : static_cast<int>(prompt_ids.size());
 
     // DESIGN.md §3.8 — reject, with the numbers. No truncation, no shift.
-    const int n_ctx = effective_n_ctx(ctx);
+    // Against the request's lane: a subagent lane's prompt over its cap is
+    // refused at that cap, even where the agent lane would hold it.
+    const int n_ctx = lane_n_ctx(ctx, lane);
     if (n_ctx > 0 && prompt_tokens >= n_ctx) {
         return HttpResult{400, context_overflow(prompt_tokens, n_ctx)};
     }
@@ -554,14 +727,19 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
         return HttpResult{400, invalid_request(*err)};
     }
 
+    // The lane first: its name may be a 404, and its cap is the 400's
+    int lane = -1;
+    if (auto err = resolve_lane(ctx, req.model, lane)) return err;
     const ModelStatus& st = ctx.backend->status();
-    if (!req.model.empty() && req.model != st.served_id && req.model != st.id) {
+    if (lane < 0 && !req.model.empty() && req.model != st.served_id && req.model != st.id) {
         log::verbose("req", "request names model '%s'; this process serves '%s'",
                      req.model.c_str(), st.served_id.c_str());
     }
 
     PreparedChat prep;
-    prep.req = std::move(req);
+    prep.req   = std::move(req);
+    prep.lane  = lane;
+    prep.model = lane >= 0 ? ctx.lanes[static_cast<size_t>(lane)].name : st.served_id;
 
     // The operator's template default. Applied only when the request said
     // nothing itself (neither chat_template_kwargs.enable_thinking nor
@@ -589,7 +767,7 @@ std::optional<HttpResult> prepare_chat(const Context& ctx, const json& body, Pre
     if (log::enabled(log::Level::Debug)) {
         log::debug("prompt", "%zu bytes:\n%s", prompt.size(), prompt.c_str());
     }
-    if (auto err = finish_prepare(ctx, prompt, prep.req.sampler, prep.input, prep.prompt_tokens)) {
+    if (auto err = finish_prepare(ctx, lane, prompt, prep.req.sampler, prep.input, prep.prompt_tokens)) {
         return err;
     }
 
@@ -606,10 +784,15 @@ std::optional<HttpResult> prepare_completion(const Context& ctx, const json& bod
         return HttpResult{400, invalid_request(*err)};
     }
 
+    int lane = -1;
+    if (auto err = resolve_lane(ctx, req.model, lane)) return err;
+
     PreparedCompletion prep;
-    prep.req = std::move(req);
+    prep.req   = std::move(req);
+    prep.lane  = lane;
+    prep.model = lane >= 0 ? ctx.lanes[static_cast<size_t>(lane)].name : ctx.backend->status().served_id;
     if (auto err =
-            finish_prepare(ctx, prep.req.prompt, prep.req.sampler, prep.input, prep.prompt_tokens,
+            finish_prepare(ctx, lane, prep.req.prompt, prep.req.sampler, prep.input, prep.prompt_tokens,
                            prep.req.prompt_ids)) {
         return err;
     }
@@ -656,7 +839,7 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     json body = {{"id", prep.id},
                  {"object", "chat.completion"},
                  {"created", prep.created},
-                 {"model", ctx.backend->status().served_id},
+                 {"model", prep.model},
                  {"choices", json::array({{{"index", 0},
                                            {"message", std::move(message)},
                                            {"finish_reason", finish}}})},
@@ -677,7 +860,7 @@ HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, in
     json body = {{"id", prep.id},
                  {"object", "text_completion"},
                  {"created", prep.created},
-                 {"model", ctx.backend->status().served_id},
+                 {"model", prep.model},
                  {"choices", json::array({{{"index", 0},
                                            {"text", text},
                                            {"logprobs", nullptr},
@@ -689,7 +872,7 @@ HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, in
 // ----------------------------------------------------------------- streaming
 void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
                  const SseWriter& write) {
-    const std::string& model = ctx.backend->status().served_id;
+    const std::string& model = prep.model;
     auto               chunk = [&](json choices, json extra = json::object()) {
         json c = {{"id", prep.id},
                                 {"object", "chat.completion.chunk"},
@@ -836,7 +1019,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
 
 void stream_completion(const Context& ctx, const PreparedCompletion& prep, int slot,
                        const SseWriter& write) {
-    const std::string& model = ctx.backend->status().served_id;
+    const std::string& model = prep.model;
     auto               chunk = [&](json choices, json extra = json::object()) {
         json c = {{"id", prep.id},
                                 {"object", "text_completion"},

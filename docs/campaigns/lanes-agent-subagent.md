@@ -106,7 +106,18 @@ On the record before the work starts.
 ## Current state
 
 - Recon done (2026-10-07).
-- Implementation: next.
+- Implementation written (2026-10-07), red-first on the device-free suites:
+  the flags and their refusals (`tests/test_config.cpp`), lane resolution,
+  the per-lane 400/404/503 and the endpoints (`tests/test_lanes.cpp`), the
+  HTTP wiring (`tests/roundtrip.sh`, named lanes on the stub). The libllama
+  side (`kv_unified`, the pool assert, `cap[seq]`, the MTP draft context) is
+  syntax-checked only: nothing measured, no card touched.
+- Decisions taken in the implementation, for review: `--lane-ctx` with one
+  name is refused (one lane's context is `--n-ctx`); `--n-ctx` alongside is
+  refused; a name given twice is refused; at most 4 lanes; the canonical id
+  resolves to the first lane, as an empty name does; `--stub` accepts named
+  lanes (the device-free suites).
+- Next: the gate's window on the B60.
 
 ## Where it lives
 

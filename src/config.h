@@ -124,6 +124,16 @@ struct Config {
     // --model-id, which is about artifact identity and keeps refusing a wrong
     // artifact either way (DESIGN.md §4.2).
     std::string served_model_name;
+    // Named lanes (DESIGN.md §4.2, amended 2026-10-07;
+    // docs/campaigns/lanes-agent-subagent.md): --served-model-name A,B with
+    // --lane-ctx CA,CB, paired by index. A lane's name picks it, and its cap
+    // is its context. lane_names is empty unless the name list has two or
+    // more entries; served_model_name is then the first (the agent lane, where
+    // a request without a name goes). parallel is set to the lane count.
+    // The libllama engine (and --stub, for the device-free suites) only.
+    std::vector<std::string> lane_names;
+    std::vector<int>         lane_ctx;
+    bool named_lanes() const { return !lane_ctx.empty(); }
     Quant       quant = Quant::Q4;
 
     // OpenVINO device string. GPU.0 is the B60 and GPU.1 the A770 on the dev host;
@@ -145,6 +155,7 @@ struct Config {
     // rather than being silently lowered.
     bool n_ctx_explicit = false;
     int parallel = 1;  // lanes (DESIGN.md §4 /health reports free/total)
+    bool parallel_explicit = false;  // --parallel was given (named lanes refuse a disagreeing one)
 
     // How long a request waits for a lane before it is refused with the
     // reservation numbers (DESIGN.md §4.3). Zero refuses immediately, which is

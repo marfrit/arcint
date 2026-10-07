@@ -101,6 +101,12 @@ multi-draft MTP for Flash-Next; prefill on the GPU.
   completion echoes; --model-id is the allowlist assertion about which
   artifact is accepted. The model object carries id, canonical_id,
   answers_to, n_ctx (running), n_ctx_train (artifact ceiling), quant, lanes.
+- Named lanes (libllama engine): --served-model-name A,B --lane-ctx CA,CB
+  serves lanes of different context from one process, one KV pool of their
+  sum (kv_unified). The model field picks the lane (empty or the canonical
+  id: the first; unknown: 404), the 400 is at that lane's context, a busy
+  lane is a 503 for itself; /v1/models has one entry per name with its n_ctx
+  (DESIGN 4.2, amended 2026-10-07; docs/llama-engine.md "Two lanes").
 - Console: llama.cpp-style one-line state/timing prints on stderr (load,
   memory map, per-slot prefill/decode rates, cache hits, draft acceptance).
 - Context overflow is HTTP 400 with prompt_tokens/n_ctx/overflow. No
@@ -221,6 +227,14 @@ server
                             artifact's allowlist id). Presentation
                             only: --model-id still decides which
                             artifact is accepted
+                            A,B (libllama, with --lane-ctx): named lanes,
+                            one per name; the request's model field picks
+                            the lane (empty: the first; unknown: 404)
+  --lane-ctx CA,CB          libllama: each named lane's context, paired with
+                            --served-model-name A,B by index; multiples of
+                            256, at most 4 lanes. The lanes share one KV pool
+                            of their sum (llama.cpp's kv_unified); --parallel
+                            and --n-ctx follow from them
   --parallel N              number of lanes (default: 1)
   --queue-timeout S         seconds a request waits for a lane before a
                             503 with the reservation numbers (default: 0)

@@ -71,7 +71,10 @@ void HttpServer::Impl::route() {
         });
 
     svr.set_error_handler([](const httplib::Request& req, httplib::Response& res) {
-        if (res.status == 404) {
+        // httplib calls this for every status >= 400, a handler's own 404 (a
+        // named lane's unknown model, §4.2) included: only a 404 without a
+        // body is a missing route
+        if (res.status == 404 && res.body.empty()) {
             send_json(res, 404,
                       api::error_body(log::format("no route for %s %s", req.method.c_str(),
                                                   req.path.c_str()),
@@ -88,30 +91,7 @@ void HttpServer::Impl::route() {
     });
 
     svr.Get("/v1/models", [this](const httplib::Request&, httplib::Response& res) {
-        // One process serves one model (§2). The list has exactly one entry so
-        // that OpenAI clients which probe this endpoint keep working.
-        //
-        // It carries the context length because this is the only place a
-        // discovering proxy looks: it reads n_ctx (among a few spellings) from
-        // the model object here and asks /props for nothing but the template
-        // capabilities. A context published on /props alone reaches no client,
-        // and a client with no context falls back to its own default against a
-        // server configured for 262144. `n_ctx` is what this process is
-        // actually running with; `n_ctx_train` is the artifact's ceiling, so a
-        // caller can see both and tell them apart.
-        const ModelStatus& st = ctx.backend->status();
-        auto maybe_int = [](int v) { return v > 0 ? json(v) : json(nullptr); };
-        json entry{{"id", st.served_id},
-                   {"object", "model"},
-                   {"owned_by", "arcint"},
-                   {"n_ctx", maybe_int(st.n_ctx)},
-                   {"n_ctx_train", maybe_int(st.n_ctx_train)},
-                   {"quant", quant_name(st.quant)},
-                   {"lanes", ctx.slots->total()}};
-        // The artifact this endpoint actually serves, which --served-model-name
-        // may have renamed. Always present, so a rename never hides identity.
-        entry["canonical_id"] = st.id;
-        send_json(res, 200, json{{"object", "list"}, {"data", json::array({std::move(entry)})}});
+        send_json(res, 200, api::models(ctx));
     });
 
     svr.Post("/v1/chat/completions", [this](const httplib::Request& req, httplib::Response& res) {
@@ -126,13 +106,14 @@ void HttpServer::Impl::route() {
 
         // The lane is taken here, before a single response byte is committed —
         // a 503 has to be a status code, and once the SSE body has started it
-        // can only be a message inside a 200.
+        // can only be a message inside a 200. Named lanes: the lane prepare
+        // resolved from the model field, and only that one.
         auto lease = std::make_shared<api::SlotPool::Lease>();
-        if (auto err = api::acquire_slot(ctx, *lease)) {
+        int  slot  = -1;
+        if (auto err = api::acquire_slot(ctx, prep->lane, *lease, slot)) {
             send_json(res, err->status, err->body);
             return;
         }
-        const int slot = lease->index();
 
         if (!prep->req.stream) {
             const api::HttpResult r = api::run_chat(ctx, *prep, slot);
@@ -168,11 +149,11 @@ void HttpServer::Impl::route() {
         }
 
         auto lease = std::make_shared<api::SlotPool::Lease>();
-        if (auto err = api::acquire_slot(ctx, *lease)) {
+        int  slot  = -1;
+        if (auto err = api::acquire_slot(ctx, prep->lane, *lease, slot)) {
             send_json(res, err->status, err->body);
             return;
         }
-        const int slot = lease->index();
 
         if (!prep->req.stream) {
             const api::HttpResult r = api::run_completion(ctx, *prep, slot);

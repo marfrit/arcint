@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
@@ -87,8 +88,8 @@ private:
 class StubBackend final : public Backend {
 public:
     StubBackend(const ModelEntry& entry, Quant quant, int n_ctx, int delay_ms,
-                const std::string& served_name)
-        : delay_ms_(delay_ms) {
+                const std::string& served_name, const std::vector<int>& lane_ctx)
+        : delay_ms_(delay_ms), lane_ctx_(lane_ctx) {
         status_.id               = entry.id;
         status_.served_id        = served_name.empty() ? entry.id : served_name;
         status_.n_ctx_train      = entry.n_ctx_train;
@@ -117,8 +118,11 @@ public:
     // backend in CI, where there is no card.
     FinishReason generate(const GenerationInput& in, int slot, const TokenCallback& on_piece,
                           GenerationStats& stats) override {
-        (void)slot;
         using clock = std::chrono::steady_clock;
+        // a named lane stops at its own cap (--lane-ctx)
+        const int n_ctx = lane_ctx_.empty()
+                              ? status_.n_ctx
+                              : lane_ctx_[static_cast<size_t>(std::clamp(slot, 0, static_cast<int>(lane_ctx_.size()) - 1))];
 
         const auto prefill_start = clock::now();
         const auto prompt_ids    = in.prompt_ids.empty() ? tokenizer_.encode(in.prompt) : in.prompt_ids;
@@ -138,8 +142,8 @@ public:
                 reason = FinishReason::Length;
                 break;
             }
-            if (status_.n_ctx > 0 &&
-                stats.prompt_tokens + stats.completion_tokens >= status_.n_ctx) {
+            if (n_ctx > 0 &&
+                stats.prompt_tokens + stats.completion_tokens >= n_ctx) {
                 reason = FinishReason::Length;
                 break;
             }
@@ -204,6 +208,7 @@ private:
     }
 
     int           delay_ms_ = 0;
+    std::vector<int> lane_ctx_;   // --lane-ctx, by slot
     ModelStatus   status_;
     StubTokenizer tokenizer_;
 };
@@ -242,8 +247,9 @@ std::string format_profile_cycle_line(size_t past, size_t n, size_t accepted, do
 }
 
 std::unique_ptr<Backend> make_stub_backend(const ModelEntry& entry, Quant quant, int n_ctx,
-                                           int delay_ms, const std::string& served_name) {
-    return std::make_unique<StubBackend>(entry, quant, n_ctx, delay_ms, served_name);
+                                           int delay_ms, const std::string& served_name,
+                                           const std::vector<int>& lane_ctx) {
+    return std::make_unique<StubBackend>(entry, quant, n_ctx, delay_ms, served_name, lane_ctx);
 }
 
 }  // namespace lgc
