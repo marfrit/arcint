@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <optional>
+#include <vector>
 
 #include "core/model_registry.h"
 
@@ -59,8 +60,29 @@ struct Config {
     // robin); the other experts in a bank in pinned host memory the card reads
     // over the link, hot ones swapped in during decode (contrib/llama.cpp
     // patch 0021). 0 off.
+    // Under a layer split, --llama-expert-cache A,B: a cache per card, in
+    // --device order (patch 0024); 0 keeps none on that card. One value is
+    // the one card's. llama_expert_cache_mib is the first entry.
     int         llama_expert_cache_mib = 0;
+    std::vector<int> llama_expert_cache_mib_dev;
     std::string llama_expert_profile;
+    // --device GPU.0,GPU.1 with --engine llama: the cards of a layer split,
+    // in layer order (filled from --device by parse_args; one entry for one
+    // card). --llama-layer-split K: layers [0, K) on the first card, [K,
+    // n_layer) and the output head (and the MTP layer) on the second
+    // (llama.cpp's LLAMA_SPLIT_MODE_LAYER over two OpenCL platforms, patch
+    // 0023). Two cards need K: there is no automatic split.
+    std::vector<std::string> llama_devices;
+    int llama_layer_split = 0;
+    // --llama-mtp-card N: the card (index into llama_devices) that runs the
+    // --llama-mtp-gguf model under the split; it reads only the last
+    // layer's rows, through host memory. -1: unset, the first card.
+    int llama_mtp_card = -1;
+    bool llama_expert_cache_on() const {
+        for (int m : llama_expert_cache_mib_dev)
+            if (m > 0) return true;
+        return llama_expert_cache_mib > 0;
+    }
     int llama_checkpoint_step = 8192;
     std::string flash_next_ngram_path;  // --flash-next-ngram: FIX D per_layer_token_embd table (24-byte ARCINGRM header + block-quantised payload); admitted only when the artifact's config.json declares an n-gram table (docs/design-qwen-flash-next.md FIX D Link 2)
     // --ngram-gguf: the GGUF shard whose per_layer_token_embd.weight binds a

@@ -1398,3 +1398,37 @@ own platforms):
   This model fits on the B60 alone, so a split costs decode: the A770 runs
   its layers slower, and every token crosses once.
 - **Answer:** the capital question across both cards is right ("Paris").
+
+## 0024-expert-cache-per-device.patch
+
+The expert cache of 0021, one per GPU under llama.cpp's layer split (0023):
+each card keeps slots, tables and a USM bank for the layers it runs, in its
+own context, with its own budget and counters.
+
+- **API:**
+  - `llama_model_params.expert_cache_bytes_dev` /
+    `n_expert_cache_bytes_dev` give a budget per device, in device order;
+    without them `expert_cache_bytes` goes to the first card with cached
+    layers, as before. `LLAMA_EXPERT_CACHE_MIB` takes `A,B`.
+  - `llama_model_expert_cache_count`, `_info_dev` and `_device` report each
+    cache. `llama_model_expert_cache_info` sums them; `adapts` counts the
+    shared plan once.
+- **Swap planning:** one plan over every cache, with one cap. The largest
+  gains win wherever they are, and each swap runs on the queue of the card
+  that owns its layer, as Strata's adapt does across its stages
+  (`code`: generate.cpp:4430-4471).
+- **The profile:** each cache ranks only its own layers' pairs.
+- **Single card unchanged:** the same layers, budget, plan order and logs
+  (the log lines now name the device and the layer range).
+
+Measured on the B60 + A770 (`measured-here`, 2026-10-07; Flash-Next IQ2_XS,
+MTP 2, 131,072 tokens of context):
+
+- **Copy checks:** 0 differences on both cards.
+- **Answers:** right in every arm.
+- **Eviction:** none (each process's GTT stayed at its bank).
+- **Split at layer 40:** the A770 holds every expert of its 8 layers, 90.4 %
+  of the routed experts are on a card, prefill 378 t/s, decode 18.6 t/s.
+  The B60 alone: 84.4 %, 408 and 19.8. The campaign gate (decode above the
+  one-card arm) is not met yet:
+  `docs/campaigns/layer-split-two-cards.md`.

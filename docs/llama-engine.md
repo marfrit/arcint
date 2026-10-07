@@ -13,7 +13,8 @@ commit `bed0a85` (ggml-org/llama.cpp, 2026-10-02) with
 warns when they are missing). It builds as a static subproject with
 `GGML_OPENCL=ON`, Adreno kernels off, kernels embedded. `--device GPU.N` is
 the N-th GPU in OpenCL's enumeration, or a substring of the device name
-(`B60`, `A770`).
+(`B60`, `A770`). Two cards, `--device GPU.0,GPU.1`, run a layer split
+(`--llama-layer-split K`, below).
 
 ## Kernels
 
@@ -164,6 +165,31 @@ the queue (decode 32.0 -> 33.0-34.2, prefill 381 -> 422).
 
 The UD-Q3_K_XL file (52 GiB of experts) serves the same way at 235 t/s
 prefill and 12-13 t/s decode without MTP (2026-10-06).
+
+**Two cards** (`--device GPU.0,GPU.1 --llama-layer-split K`;
+`contrib/llama.cpp` 0023 and 0024, `docs/campaigns/layer-split-two-cards.md`).
+llama.cpp's layer split runs layers [0, K) on the
+first card and [K, n_layer) with the output head on the second; each card
+keeps the KV and recurrent state of its own layers. The cards are named as
+above, each by its own OpenCL platform (`GGML_OPENCL_DEVICES`); two cards
+need K, there is no automatic split. arcint reads n_layer from the GGUF
+(`<arch>.block_count`, MTP layers included) and sets `tensor_split` to
+{K - 0.5, n_layer + 1 - (K - 0.5)}, which places the boundary at K exactly
+(`src/exec/llama_layer_split.h`); K runs from 1 to n_layer - 1.
+
+- `--llama-expert-cache A,B`: one expert cache per card, over its own layers,
+  in `--device` order (MiB; 0 keeps none on that card): its own slots, its
+  own bank in USM host memory of that card's context, its own tables, swaps
+  on its own queue and its own counters, ranked from its layers' share of
+  the profile. Each card's budget leaves room for what a request allocates
+  late (the campaign's eviction note).
+- The MTP model of `--llama-mtp-gguf` runs on `--llama-mtp-card N`
+  (default 0, the first card). It reads only the last layer's rows, through
+  host memory, so any card can run it. On the B60 + A770 it proposes in
+  about half the time on the B60. The draft head of `--llama-mtp-vocab`
+  sits on the second card, next to the output head.
+- The load log has an `expert cache:` line per card, and after each request
+  a line per card next to the summed one.
 
 ## MTP (`--llama-mtp N`)
 

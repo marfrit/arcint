@@ -9,6 +9,7 @@
 #ifdef ARCINT_LLAMA
 
 #include <CL/cl.h>
+#include <gguf.h>
 #include <llama.h>
 
 #include <algorithm>
@@ -29,6 +30,7 @@
 #include "config.h"
 #include "core/sampler.h"
 #include "exec/chat_json.h"
+#include "exec/llama_layer_split.h"
 #include "exec/llama_spec.h"
 #include "exec/verify_walk.h"
 #include "util/log.h"
@@ -49,12 +51,23 @@ double seconds_since(clock_type::time_point t0) {
     return std::chrono::duration<double>(clock_type::now() - t0).count();
 }
 
-// The OpenCL platform holding the requested card: "GPU.N" is the N-th GPU in
-// OpenCL's enumeration, anything else a substring of the device name ("B60",
-// "A770"). -1 when nothing matches.
-int opencl_platform_for(const std::string& want, std::string& name_out) {
+// The OpenCL card --device names: its platform, its index among the
+// platform's devices as ggml-opencl numbers them (every device type, as
+// GGML_OPENCL_DEVICES takes it), and its name. "GPU.N" is the N-th platform
+// with a GPU in OpenCL's enumeration (the NEO driver lists each Arc card as
+// its own platform), anything else a substring of the device name ("B60",
+// "A770"); the platform's first GPU either way. platform -1 when nothing
+// matches.
+struct ClCard {
+    int         platform = -1;
+    int         device   = 0;
+    std::string name;
+};
+
+ClCard opencl_card_for(const std::string& want) {
+    ClCard  c;
     cl_uint np = 0;
-    if (clGetPlatformIDs(0, nullptr, &np) != CL_SUCCESS || np == 0) return -1;
+    if (clGetPlatformIDs(0, nullptr, &np) != CL_SUCCESS || np == 0) return c;
     std::vector<cl_platform_id> ps(np);
     clGetPlatformIDs(np, ps.data(), nullptr);
     int ordinal = -1;
@@ -65,19 +78,64 @@ int opencl_platform_for(const std::string& want, std::string& name_out) {
     int seen = 0;
     for (cl_uint i = 0; i < np; ++i) {
         cl_uint nd = 0;
-        if (clGetDeviceIDs(ps[i], CL_DEVICE_TYPE_GPU, 0, nullptr, &nd) != CL_SUCCESS || nd == 0) continue;
-        cl_device_id d = nullptr;
-        clGetDeviceIDs(ps[i], CL_DEVICE_TYPE_GPU, 1, &d, nullptr);
+        if (clGetDeviceIDs(ps[i], CL_DEVICE_TYPE_ALL, 0, nullptr, &nd) != CL_SUCCESS || nd == 0) continue;
+        std::vector<cl_device_id> ds(nd);
+        clGetDeviceIDs(ps[i], CL_DEVICE_TYPE_ALL, nd, ds.data(), nullptr);
+        int gpu = -1;
+        for (cl_uint j = 0; j < nd && gpu < 0; ++j) {
+            cl_device_type t = 0;
+            clGetDeviceInfo(ds[j], CL_DEVICE_TYPE, sizeof(t), &t, nullptr);
+            if (t & CL_DEVICE_TYPE_GPU) gpu = static_cast<int>(j);
+        }
+        if (gpu < 0) continue;
         char name[256] = {};
-        clGetDeviceInfo(d, CL_DEVICE_NAME, sizeof(name) - 1, name, nullptr);
+        clGetDeviceInfo(ds[static_cast<size_t>(gpu)], CL_DEVICE_NAME, sizeof(name) - 1, name, nullptr);
         const bool hit = ordinal >= 0 ? seen == ordinal : std::string(name).find(want) != std::string::npos;
         if (hit) {
-            name_out = name;
-            return static_cast<int>(i);
+            c.platform = static_cast<int>(i);
+            c.device   = gpu;
+            c.name     = name;
+            return c;
         }
         ++seen;
     }
-    return -1;
+    return c;
+}
+
+// llama.cpp names OpenCL devices GPUOpenCL, GPUOpenCL1, ...; the logs name
+// the card (its description) instead
+const char* card_desc(const char* dev_name) {
+    ggml_backend_dev_t d = dev_name != nullptr ? ggml_backend_dev_by_name(dev_name) : nullptr;
+    return d != nullptr ? ggml_backend_dev_description(d) : (dev_name != nullptr ? dev_name : "?");
+}
+
+// The GGUF's <arch>.block_count (MTP layers included): llama.cpp's layer
+// split places that many layers and the output; -1 when unreadable. `nextn`
+// gets <arch>.nextn_predict_layers (0 when absent).
+int gguf_block_count(const std::string& path, int* nextn = nullptr) {
+    gguf_context* g = gguf_init_from_file(path.c_str(), gguf_init_params{ /*no_alloc=*/true, nullptr });
+    if (g == nullptr) return -1;
+    int           n  = -1;
+    const int64_t ka = gguf_find_key(g, "general.architecture");
+    if (ka >= 0 && gguf_get_kv_type(g, ka) == GGUF_TYPE_STRING) {
+        const std::string arch = gguf_get_val_str(g, ka);
+        auto int_of = [g](int64_t k) {
+            switch (gguf_get_kv_type(g, k)) {
+                case GGUF_TYPE_UINT32: return static_cast<int>(gguf_get_val_u32(g, k));
+                case GGUF_TYPE_INT32:  return static_cast<int>(gguf_get_val_i32(g, k));
+                case GGUF_TYPE_UINT64: return static_cast<int>(gguf_get_val_u64(g, k));
+                default:               return -1;
+            }
+        };
+        const int64_t kb = gguf_find_key(g, (arch + ".block_count").c_str());
+        if (kb >= 0) n = int_of(kb);
+        if (nextn != nullptr) {
+            const int64_t kn = gguf_find_key(g, (arch + ".nextn_predict_layers").c_str());
+            *nextn           = kn >= 0 ? std::max(0, int_of(kn)) : 0;
+        }
+    }
+    gguf_free(g);
+    return n;
 }
 
 void route_llama_log(ggml_log_level level, const char* text, void*) {
@@ -135,12 +193,33 @@ class LlamaBackend final : public Backend {
 
 public:
     LlamaBackend(const Config& cfg, int n_ctx) {
-        std::string card;
-        const int platform = opencl_platform_for(cfg.device, card);
-        if (platform < 0)
-            throw std::runtime_error(log::format("no OpenCL GPU matches --device %s", cfg.device.c_str()));
-        setenv("GGML_OPENCL_PLATFORM", std::to_string(platform).c_str(), 1);
-        setenv("GGML_OPENCL_DEVICE", "0", 1);
+        // --device: one card, or the two cards of --llama-layer-split in layer order
+        const std::vector<std::string> wanted = cfg.llama_devices.empty() ? std::vector<std::string>{ cfg.device } : cfg.llama_devices;
+        std::vector<ClCard> cards;
+        for (const std::string& w : wanted) {
+            ClCard c = opencl_card_for(w);
+            if (c.platform < 0) throw std::runtime_error(log::format("no OpenCL GPU matches --device %s", w.c_str()));
+            for (const ClCard& o : cards)
+                if (o.platform == c.platform && o.device == c.device)
+                    throw std::runtime_error(log::format("--device %s: %s names one card twice", cfg.device.c_str(), c.name.c_str()));
+            cards.push_back(c);
+        }
+        const bool split = cards.size() > 1;
+        if (split && cfg.llama_layer_split <= 0)
+            throw std::runtime_error("two cards need --llama-layer-split K");
+        std::string card_names, cl_ids;
+        for (const ClCard& c : cards) {
+            card_names += (card_names.empty() ? "" : " + ") + c.name;
+            cl_ids += (cl_ids.empty() ? "" : ",") + log::format("%d:%d", c.platform, c.device);
+        }
+        if (!split) {
+            setenv("GGML_OPENCL_PLATFORM", std::to_string(cards[0].platform).c_str(), 1);
+            setenv("GGML_OPENCL_DEVICE", "0", 1);
+            unsetenv("GGML_OPENCL_DEVICES");   // it would win over the two above (0023)
+        } else {
+            // one context per card's platform, the cards in this order (0023)
+            setenv("GGML_OPENCL_DEVICES", cl_ids.c_str(), 1);
+        }
         llama_log_set(route_llama_log, nullptr);
         llama_backend_init();
 
@@ -148,17 +227,69 @@ public:
         mp.n_gpu_layers       = 999;
         // the GGUF's MTP layer, for --llama-mtp (unless --llama-mtp-gguf brings it)
         mp.load_mtp           = cfg.llama_mtp > 0 && cfg.llama_mtp_gguf.empty();
+        int n_layer_gguf      = 0;
+        if (split) {
+            // the GPU devices ggml lists are the cards GGML_OPENCL_DEVICES
+            // selected, in its order (the build's one GPU backend is OpenCL);
+            // a llama.cpp without 0023 lists one
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) devs_.push_back(d);
+            }
+            if (devs_.size() != cards.size())
+                throw std::runtime_error(log::format("--device %s: llama.cpp lists %zu GPU devices for GGML_OPENCL_DEVICES=%s, not %zu "
+                                                     "(contrib/llama.cpp patch 0023)", cfg.device.c_str(), devs_.size(), cl_ids.c_str(),
+                                                     cards.size()));
+            for (size_t i = 0; i < cards.size(); ++i)
+                if (cards[i].name != ggml_backend_dev_description(devs_[i]))
+                    log::warn("load", "--device %s: llama.cpp's device %zu is %s (%s), OpenCL's %s", cfg.device.c_str(), i,
+                              ggml_backend_dev_name(devs_[i]), ggml_backend_dev_description(devs_[i]), cards[i].name.c_str());
+            devs_.push_back(nullptr);
+            // --llama-layer-split K: layers [0, K) on the first card, the rest
+            // and the output on the second, exactly (exec/llama_layer_split.h)
+            int nextn    = 0;
+            n_layer_gguf = gguf_block_count(cfg.gguf_path, &nextn);
+            if (n_layer_gguf < 0)
+                throw std::runtime_error(log::format("--llama-layer-split: no <arch>.block_count in %s", cfg.gguf_path.c_str()));
+            // the placement counts every block (llama.cpp's n_layer_all), but
+            // an MTP block not loaded from this file (--llama-mtp-gguf, or no
+            // --llama-mtp) runs nothing: K must leave the second card a block
+            // that does
+            const int n_run = mp.load_mtp ? n_layer_gguf : n_layer_gguf - nextn;
+            if (!llama_layer_split_valid(n_run, cfg.llama_layer_split))
+                throw std::runtime_error(log::format("--llama-layer-split %d: %s runs %d layers; K from 1 to %d puts layers on both cards",
+                                                     cfg.llama_layer_split, cfg.gguf_path.c_str(), n_run, n_run - 1));
+            const auto fr = llama_layer_split_fractions(n_layer_gguf, cfg.llama_layer_split);
+            tensor_split_.assign(std::max<size_t>(llama_max_devices(), 2), 0.0f);
+            tensor_split_[0] = fr[0];
+            tensor_split_[1] = fr[1];
+            mp.devices       = devs_.data();
+            mp.split_mode    = LLAMA_SPLIT_MODE_LAYER;
+            mp.tensor_split  = tensor_split_.data();
+        }
         // --llama-expert-cache: slots on the card for the experts --llama-cpu-moe
-        // keeps in host memory (contrib/llama.cpp patch 0021)
+        // keeps in host memory (contrib/llama.cpp patch 0021); under the layer
+        // split a cache per card for its own layers (0024)
+        const bool ec_on = cfg.llama_expert_cache_on();
 #ifdef ARCINT_LLAMA_EXPERT_CACHE
         expert_profile_          = cfg.llama_expert_profile;
         mp.expert_cache_bytes    = static_cast<size_t>(cfg.llama_expert_cache_mib) << 20;
         mp.expert_cache_profile  = expert_profile_.empty() ? nullptr : expert_profile_.c_str();
+        if (split && ec_on) {
+#ifdef ARCINT_LLAMA_EXPERT_CACHE_DEV
+            for (int mib : cfg.llama_expert_cache_mib_dev) expert_cache_bytes_dev_.push_back(static_cast<size_t>(mib) << 20);
+            mp.expert_cache_bytes          = 0;
+            mp.expert_cache_bytes_dev      = expert_cache_bytes_dev_.data();
+            mp.n_expert_cache_bytes_dev    = expert_cache_bytes_dev_.size();
+#else
+            throw std::runtime_error("--llama-expert-cache on two cards: this build's llama.cpp lacks contrib/llama.cpp patch 0024");
+#endif
+        }
         // the experts are computed on the card (slots) and read by it from the
         // bank: the CPU's repacked copies would only cost host memory
-        if (cfg.llama_expert_cache_mib > 0) mp.use_extra_bufts = false;
+        if (ec_on) mp.use_extra_bufts = false;
 #else
-        if (cfg.llama_expert_cache_mib > 0)
+        if (ec_on)
             throw std::runtime_error("--llama-expert-cache: this build's llama.cpp lacks contrib/llama.cpp patch 0021");
 #endif
         // --llama-cpu-moe: the first N layers' experts in host memory, as
@@ -180,13 +311,37 @@ public:
         if (model_ == nullptr)
             throw std::runtime_error(log::format("llama.cpp could not load %s", cfg.gguf_path.c_str()));
 #ifdef ARCINT_LLAMA_EXPERT_CACHE
-        if (cfg.llama_expert_cache_mib > 0) {
+        if (ec_on) {
             llama_expert_cache_info ec{};
             if (!llama_model_expert_cache_info(model_, &ec))
                 throw std::runtime_error("--llama-expert-cache: llama.cpp built no expert cache (no MoE layer in host memory?)");
+#ifdef ARCINT_LLAMA_EXPERT_CACHE_DEV
+            // one line per card's cache (the device names are llama.cpp's,
+            // in --device order)
+            const int n_ec = llama_model_expert_cache_count(model_);
+            for (int i = 0; i < n_ec; ++i) {
+                llama_expert_cache_info ei{};
+                if (!llama_model_expert_cache_info_dev(model_, i, &ei)) continue;
+                const char* dn = card_desc(llama_model_expert_cache_device(model_, i));
+                log::info("load", "expert cache: %lld slots, %.2f GiB on the card %s, the other experts of its layers %.2f GiB in host memory",
+                          static_cast<long long>(ei.slots), static_cast<double>(ei.bytes) / (1u << 30), dn ? dn : "?",
+                          static_cast<double>(ei.bank_bytes) / (1u << 30));
+            }
+            if (split) {
+                // a card given a budget that built no cache (no MoE layer of
+                // its range in host memory, or no memory) would run its
+                // experts from host buffers: refused, as one card is
+                int want = 0;
+                for (int mib : cfg.llama_expert_cache_mib_dev) want += mib > 0;
+                if (n_ec != want)
+                    throw std::runtime_error(log::format("--llama-expert-cache: %d of the %d cards given a budget built a cache (llama.cpp's log says why)", n_ec, want));
+            }
+            ec_prev_dev_.assign(static_cast<size_t>(n_ec), llama_expert_cache_info{});
+#else
             log::info("load", "expert cache: %lld slots, %.2f GiB on the card, the other experts %.2f GiB in host memory",
                       static_cast<long long>(ec.slots), static_cast<double>(ec.bytes) / (1u << 30),
                       static_cast<double>(ec.bank_bytes) / (1u << 30));
+#endif
         }
 #endif
 
@@ -225,7 +380,7 @@ public:
         // with the expert cache a prefill ubatch gathers the bank's routed experts
         // over the link once: the whole batch in one ubatch reads them once per
         // n_batch tokens instead of per 512
-        cp.n_ubatch        = static_cast<uint32_t>(cfg.llama_expert_cache_mib > 0 ? n_batch_ : std::min(n_batch_, 512));
+        cp.n_ubatch        = static_cast<uint32_t>(ec_on ? n_batch_ : std::min(n_batch_, 512));
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
         cp.type_k          = kv_type(cfg.llama_kv_k);
         cp.type_v          = kv_type(cfg.llama_kv_v);
@@ -252,12 +407,22 @@ public:
             // --llama-mtp-gguf: the MTP block (with its own embeddings and LM
             // head) as a second model, as llama.cpp loads an MTP-only file
             // for draft-mtp (common/arg.cpp, speculative.draft.mparams);
-            // every tensor on the card
+            // every tensor on the card. Under the layer split, on
+            // --llama-mtp-card (default the first): it reads only the last
+            // layer's rows, through host memory, so any card can run it.
+            // Strata keeps its drafter on the last stage
+            // (generate.cpp:2498-2500); here the A770, the last card, drafted
+            // in 1.95 s a request against the B60's 0.94 (measured-here). The
+            // GGUF's own MTP layer is its last layer, on the last card
             llama_model* mtp_model = model_;
             if (!cfg.llama_mtp_gguf.empty()) {
                 llama_model_params dp = llama_model_default_params();
                 dp.n_gpu_layers       = 999;
                 dp.load_mtp           = true;
+                if (split) {
+                    mtp_devs_     = { devs_[static_cast<size_t>(std::max(0, cfg.llama_mtp_card))], nullptr };
+                    dp.devices    = mtp_devs_.data();
+                }
                 mtp_model_            = llama_model_load_from_file(cfg.llama_mtp_gguf.c_str(), dp);
                 if (mtp_model_ == nullptr)
                     throw std::runtime_error(log::format("llama.cpp could not load %s", cfg.llama_mtp_gguf.c_str()));
@@ -315,10 +480,16 @@ public:
         d.provenance         = "provisional";
         if (auto err = apply_operator_defaults(cfg, d)) throw std::runtime_error(*err);
         status_.sampler_defaults = d;
-        log::info("load", "llama.cpp %s (%s, %.2f GiB) on %s, OpenCL platform %d, in %.1f s; %d lane%s x %d ctx%s",
-                  desc, arch, static_cast<double>(llama_model_size(model_)) / (1u << 30), card.c_str(), platform,
+        log::info("load", "llama.cpp %s (%s, %.2f GiB) on %s, OpenCL %s %s, in %.1f s; %d lane%s x %d ctx%s",
+                  desc, arch, static_cast<double>(llama_model_size(model_)) / (1u << 30), card_names.c_str(),
+                  split ? "devices" : "platform", split ? cl_ids.c_str() : std::to_string(cards[0].platform).c_str(),
                   seconds_since(t_load), lanes_, lanes_ == 1 ? "" : "s", n_ctx_,
                   n_draft_ > 0 ? log::format("; MTP drafts up to %d", n_draft_).c_str() : "");
+        if (split)
+            log::info("load", "layer split: layers 0-%d on %s, %d-%d and the output on %s (tensor_split %.1f/%.1f)%s",
+                      cfg.llama_layer_split - 1, cards[0].name.c_str(), cfg.llama_layer_split, n_layer_gguf - 1,
+                      cards[1].name.c_str(), static_cast<double>(tensor_split_[0]), static_cast<double>(tensor_split_[1]),
+                      mtp_model_ != nullptr ? log::format("; the MTP model on %s", cards[static_cast<size_t>(std::max(0, cfg.llama_mtp_card))].name.c_str()).c_str() : "");
     }
 
     ~LlamaBackend() override {
@@ -536,6 +707,25 @@ private:
                       static_cast<unsigned long long>(ec.adapts - ec_prev_.adapts),
                       static_cast<double>(ec.apply_us - ec_prev_.apply_us) / 1e6);
         ec_prev_ = ec;
+#ifdef ARCINT_LLAMA_EXPERT_CACHE_DEV
+        // under the layer split, each card's share too (the line above sums them)
+        const int n_ec = llama_model_expert_cache_count(model_);
+        for (int i = 0; n_ec > 1 && i < n_ec && i < static_cast<int>(ec_prev_dev_.size()); ++i) {
+            llama_expert_cache_info ei{};
+            if (!llama_model_expert_cache_info_dev(model_, i, &ei)) continue;
+            llama_expert_cache_info& p = ec_prev_dev_[static_cast<size_t>(i)];
+            const uint64_t hi = ei.decode_hits - p.decode_hits, mi = ei.decode_misses - p.decode_misses;
+            const char*    dn = card_desc(llama_model_expert_cache_device(model_, i));
+            // every card, also one that counted nothing (its ids not read)
+            {
+                log::info("slot", "lane %d: expert cache %s: %.1f %% of decode's routed experts on the card (%llu / %llu), %llu swaps",
+                          seq, dn ? dn : "?", hi + mi > 0 ? 100.0 * static_cast<double>(hi) / static_cast<double>(hi + mi) : 0.0,
+                          static_cast<unsigned long long>(hi), static_cast<unsigned long long>(hi + mi),
+                          static_cast<unsigned long long>(ei.swaps - p.swaps));
+            }
+            p = ei;
+        }
+#endif
     }
 #endif
 
@@ -839,7 +1029,16 @@ private:
     std::string             expert_profile_;   // --llama-expert-profile, alive for the load
 #ifdef ARCINT_LLAMA_EXPERT_CACHE
     llama_expert_cache_info ec_prev_{};        // the counters at the previous request's end
+    std::vector<size_t>     expert_cache_bytes_dev_;   // --llama-expert-cache A,B, alive for the load
 #endif
+#ifdef ARCINT_LLAMA_EXPERT_CACHE_DEV
+    std::vector<llama_expert_cache_info> ec_prev_dev_;   // per card's cache, the same
+#endif
+    // --device GPU.0,GPU.1 --llama-layer-split K: the cards (null-terminated),
+    // the MTP model's card, the split; alive for the load
+    std::vector<ggml_backend_dev_t> devs_;
+    std::vector<ggml_backend_dev_t> mtp_devs_;
+    std::vector<float>              tensor_split_;
     // --llama-cpu-moe's tensor patterns, alive for the load
     std::vector<std::string>                       cpu_moe_patterns_;
     std::vector<llama_model_tensor_buft_override> buft_overrides_;

@@ -53,8 +53,8 @@
 namespace lgc {
 namespace {
 
-// The output head's rows of a token subset, on the device the model runs on
-// (the OpenCL backend exposes the one card GGML_OPENCL_PLATFORM selected):
+// The output head's rows of a token subset, on the device the output head
+// runs on (the one card, or a layer split's last):
 // read from the GGUF in its own quantization, multiplied with a draft step's
 // head input, the subset's argmax mapped back to a token id.
 class DraftHead {
@@ -152,11 +152,14 @@ public:
             }
         }
 
-        // the model's card: the build's one GPU backend is OpenCL, and the
-        // engine pins its platform and device before the model loads
-        // (backend_llama.cpp); a second GPU backend would need the model's
-        // device named here
-        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        // the output head's card: the build's one GPU backend is OpenCL, and
+        // the engine pins its devices before the model loads
+        // (backend_llama.cpp). With one card it is that card; under
+        // --llama-layer-split the last, where the output head and the MTP
+        // model run
+        ggml_backend_dev_t dev = nullptr;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i)
+            if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) dev = ggml_backend_dev_get(i);
         if (dev == nullptr || (be_ = ggml_backend_dev_init(dev, nullptr)) == nullptr) {
             err = "no GPU backend for the draft head";
             return false;

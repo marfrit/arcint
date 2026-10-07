@@ -1,0 +1,645 @@
+diff --git a/include/llama.h b/include/llama.h
+index 4e3e760..9433013 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -350,8 +350,16 @@ extern "C" {
+         // memory (src/llama-expert-cache.h): this many bytes of slots on the
+         // card, ranked by expert_cache_profile (Strata's STRP file; NULL:
+         // round robin). 0 off.
++        // Under a layer split every GPU that runs such layers keeps its own
++        // cache of its own layers. expert_cache_bytes is the budget of the
++        // first of them (in the model's device order) and the others get
++        // none; expert_cache_bytes_dev[i] (n_expert_cache_bytes_dev > 0)
++        // overrides it with one budget per device of the model, in the order
++        // of `devices` (or of the default selection), 0 for no cache there.
+         size_t       expert_cache_bytes;
+         const char * expert_cache_profile;
++        const size_t * expert_cache_bytes_dev;
++        size_t         n_expert_cache_bytes_dev;
+ 
+         // Keep the booleans together to avoid misalignment during copy-by-value.
+         bool vocab_only;      // only load the vocabulary, no weights
+@@ -571,8 +579,9 @@ extern "C" {
+     LLAMA_API size_t llama_max_parallel_sequences(void);
+     LLAMA_API size_t llama_max_tensor_buft_overrides(void);
+ 
+-    // the expert cache's counters (llama_model_params.expert_cache_bytes);
+-    // false when the model has none
++    // the expert caches' counters (llama_model_params.expert_cache_bytes),
++    // summed over the caches (one per GPU under a layer split); false when
++    // the model has none
+     struct llama_expert_cache_info {
+         uint64_t decode_hits;     // routed (token, expert) pairs of decode ubatches served from a slot
+         uint64_t decode_misses;   // ... read from the bank in host memory
+@@ -584,6 +593,11 @@ extern "C" {
+         size_t   bank_bytes;      // the other experts in GPU-visible host memory
+     };
+     LLAMA_API bool llama_model_expert_cache_info(const struct llama_model * model, struct llama_expert_cache_info * info);
++    // the number of expert caches (one per GPU that keeps one), and cache i's
++    // counters and its device's name (NULL / false when i is out of range)
++    LLAMA_API int          llama_model_expert_cache_count (const struct llama_model * model);
++    LLAMA_API bool         llama_model_expert_cache_info_dev(const struct llama_model * model, int i, struct llama_expert_cache_info * info);
++    LLAMA_API const char * llama_model_expert_cache_device(const struct llama_model * model, int i);
+ 
+     LLAMA_API bool llama_supports_mmap       (void);
+     LLAMA_API bool llama_supports_mlock      (void);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 49fb982..07ab52b 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1933,14 +1933,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         // graphs; decode tokens are counted toward the next adapt
+         if (dt && n_outputs_prev == 0) dt->t_pre += ggml_time_us() - dt_t0;   // the first ubatch: everything before it
+         const int64_t dt_s0 = dt ? ggml_time_us() : 0;
+-        if (model.expert_cache) {
+-            model.expert_cache->step(sched.get(), ubatch.n_tokens);
+-        }
++        // one cache per card under a layer split: each counts its own layers'
++        // ids and swaps on its own queue; the first context to decode drives
++        // them all (each keeps that context's scheduler as its owner)
++        llama_expert_cache::step(model.expert_caches, sched.get(), ubatch.n_tokens);
+         if (dt) dt->t_step += ggml_time_us() - dt_s0;
+ 
+         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+-        if (res && model.expert_cache) {
+-            model.expert_cache->after_graph(sched.get(), ubatch.n_tokens);
++        if (res) {
++            for (const auto & ec : model.expert_caches) {
++                ec->after_graph(sched.get(), ubatch.n_tokens);
++            }
+         }
+         const int64_t dt_p0 = dt ? ggml_time_us() : 0;
+         struct dt_post_t { decode_timing * dt; int64_t t0; ~dt_post_t() { if (dt) dt->t_post += ggml_time_us() - t0; } } dt_post_ { dt, dt_p0 };
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+index 1343a3e..d5d4097 100644
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -66,8 +66,8 @@ static bool read_profile(const char * path, int n_layers, int n_expert, std::vec
+ 
+ llama_expert_cache::~llama_expert_cache() {
+     if (n_multi_steps > 0) {
+-        LLAMA_LOG_INFO("%s: %llu multi-token decode steps: %.1f routed pairs, %.1f distinct experts (%.1f in the bank) a step over the layers\n",
+-                       __func__, (unsigned long long) n_multi_steps, (double) n_multi_pairs / n_multi_steps,
++        LLAMA_LOG_INFO("%s: %s: %llu multi-token decode steps: %.1f routed pairs, %.1f distinct experts (%.1f in the bank) a step over its layers\n",
++                       __func__, dev_ ? ggml_backend_dev_name(dev_) : "-", (unsigned long long) n_multi_steps, (double) n_multi_pairs / n_multi_steps,
+                        (double) n_multi_unique / n_multi_steps, (double) n_multi_unique_bank / n_multi_steps);
+     }
+     {
+@@ -159,7 +159,67 @@ void llama_expert_cache::upload_tables(llama_expert_cache_layer & L) {
+     }
+ }
+ 
+-bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml, size_t budget, const char * profile) {
++// Layer il as init() caches it on `dev`: its experts in host buffers, the
++// layer itself on `dev` (a GPU), types whose kernels take the cache, its
++// tensors' bytes in a GGUF file. `out` (when not null) gets the layer.
++static bool qualify(const llama_model & model, const llama_model_loader & ml, int il, ggml_backend_dev_t dev, bool warn,
++                    llama_expert_cache_layer * out) {
++    const llama_layer & ly = model.layers[il];
++    ggml_tensor * t[3] = { ly.ffn_gate_exps, ly.ffn_up_exps, ly.ffn_down_exps };
++    if (!t[0] || !t[1] || !t[2] || ly.ffn_gate_up_exps || !on_cpu(t[0]) || !on_cpu(t[1]) || !on_cpu(t[2])) {
++        return false;
++    }
++    ggml_backend_dev_t d = model.dev_layer(il);
++    if (d == nullptr || d != dev || ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) {
++        return false;   // another card's layer: that card's cache
++    }
++    // the types whose kq kernels skip a pair (gate/up), or whose down
++    // projection takes the zero-entry tables (Q8_0)
++    // and the low-bit types of patch 0022 (IQ2_XXS, IQ2_S, IQ1_M, Q2_0, IQ3_S)
++    auto kq_skip = [](ggml_type ty) {
++        return ty == GGML_TYPE_IQ3_XXS || ty == GGML_TYPE_IQ4_XS || ty == GGML_TYPE_IQ4_NL || ty == GGML_TYPE_IQ2_XXS ||
++               ty == GGML_TYPE_IQ2_S || ty == GGML_TYPE_IQ1_M || ty == GGML_TYPE_Q2_0 || ty == GGML_TYPE_IQ3_S;
++    };
++    if (!kq_skip(t[0]->type) || !kq_skip(t[1]->type) || !(kq_skip(t[2]->type) || t[2]->type == GGML_TYPE_Q8_0)) {
++        if (warn) {
++            LLAMA_LOG_WARN("%s: layer %d: experts %s/%s/%s, not cached (IQ and low-bit types; Q8_0 down)\n", __func__, il,
++                           ggml_type_name(t[0]->type), ggml_type_name(t[1]->type), ggml_type_name(t[2]->type));
++        }
++        return false;
++    }
++    llama_expert_cache_layer L;
++    L.il       = il;
++    L.n_expert = (int) t[2]->ne[2];
++    if (L.n_expert > 512) {   // the OpenCL MoE GEMM takes up to 512 matrices
++        return false;
++    }
++    for (int k = 0; k < 3; ++k) {
++        auto it = ml.weights_map.find(ggml_get_name(t[k]));
++        if (it == ml.weights_map.end() || it->second.idx >= ml.file_paths.size() || ml.file_paths[it->second.idx].empty() ||
++            t[k]->ne[2] != L.n_expert || !ggml_is_contiguous(t[k])) {
++            return false;
++        }
++        L.src[k]       = t[k];
++        L.file_idx[k]  = it->second.idx;
++        L.file_offs[k] = it->second.offs;
++        L.nb2[k]       = t[k]->nb[2];
++    }
++    if (out) {
++        *out = std::move(L);
++    }
++    return true;
++}
++
++bool llama_expert_cache::has_layers(const llama_model & model, const llama_model_loader & ml, ggml_backend_dev_t dev) {
++    for (int il = 0; il < (int) model.layers.size(); ++il) {
++        if (qualify(model, ml, il, dev, false, nullptr)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml, ggml_backend_dev_t dev, size_t budget, const char * profile) {
+     if (const char * m = getenv("LLAMA_EXPERT_CACHE_MUTATE")) {
+         mutate = atoi(m);
+     }
+@@ -171,65 +231,25 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+     if (const char * a = getenv("LLAMA_EXPERT_CACHE_ADAPT_EVERY")) {
+         adapt_every = (uint32_t) atoi(a);   // 0: the profile's placement, never adapted
+     }
+-    ggml_backend_dev_t dev = nullptr;
++    dev_ = dev;
+     layers.reserve(model.layers.size());   // the registry holds pointers into it
+-    for (int il = 0; il < (int) model.layers.size(); ++il) {
+-        const llama_layer & ly = model.layers[il];
+-        ggml_tensor * t[3] = { ly.ffn_gate_exps, ly.ffn_up_exps, ly.ffn_down_exps };
+-        if (!t[0] || !t[1] || !t[2] || ly.ffn_gate_up_exps || !on_cpu(t[0]) || !on_cpu(t[1]) || !on_cpu(t[2])) {
+-            continue;
+-        }
+-        ggml_backend_dev_t d = model.dev_layer(il);
+-        if (d == nullptr || ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+-            continue;
+-        }
+-        if (dev == nullptr) {
+-            dev = d;
+-        } else if (d != dev) {
+-            continue;   // one card
+-        }
+-        // the types whose kq kernels skip a pair (gate/up), or whose down
+-        // projection takes the zero-entry tables (Q8_0)
+-        // and the low-bit types of patch 0022 (IQ2_XXS, IQ2_S, IQ1_M, Q2_0, IQ3_S)
+-        auto kq_skip = [](ggml_type ty) {
+-            return ty == GGML_TYPE_IQ3_XXS || ty == GGML_TYPE_IQ4_XS || ty == GGML_TYPE_IQ4_NL || ty == GGML_TYPE_IQ2_XXS ||
+-                   ty == GGML_TYPE_IQ2_S || ty == GGML_TYPE_IQ1_M || ty == GGML_TYPE_Q2_0 || ty == GGML_TYPE_IQ3_S;
+-        };
+-        if (!kq_skip(t[0]->type) || !kq_skip(t[1]->type) || !(kq_skip(t[2]->type) || t[2]->type == GGML_TYPE_Q8_0)) {
+-            LLAMA_LOG_WARN("%s: layer %d: experts %s/%s/%s, not cached (IQ and low-bit types; Q8_0 down)\n", __func__, il,
+-                           ggml_type_name(t[0]->type), ggml_type_name(t[1]->type), ggml_type_name(t[2]->type));
+-            continue;
+-        }
++    for (int il = 0; dev != nullptr && il < (int) model.layers.size(); ++il) {
+         llama_expert_cache_layer L;
+-        L.il       = il;
+-        L.n_expert = (int) t[2]->ne[2];
+-        L.owner    = this;
+-        bool ok    = L.n_expert <= 512;   // the OpenCL MoE GEMM takes up to 512 matrices
+-        for (int k = 0; ok && k < 3; ++k) {
+-            auto it = ml.weights_map.find(ggml_get_name(t[k]));
+-            if (it == ml.weights_map.end() || it->second.idx >= ml.file_paths.size() || ml.file_paths[it->second.idx].empty() ||
+-                t[k]->ne[2] != L.n_expert || !ggml_is_contiguous(t[k])) {
+-                ok = false;
+-                break;
+-            }
+-            L.src[k]       = t[k];
+-            L.file_idx[k]  = it->second.idx;
+-            L.file_offs[k] = it->second.offs;
+-            L.nb2[k]       = t[k]->nb[2];
+-        }
+-        if (!ok) {
++        if (!qualify(model, ml, il, dev, true, &L)) {
+             continue;
+         }
++        L.owner = this;
+         L.slot_of.assign(L.n_expert, -1);
+         L.bank_of.assign(L.n_expert, -1);
+         L.usage.assign(L.n_expert, 0.0f);
+         layers.push_back(std::move(L));
+     }
+-    if (layers.empty() || dev == nullptr) {
++    if (layers.empty()) {
+         const llama_layer & l0 = model.layers[0];
+         ggml_backend_dev_t  d0 = model.dev_layer(0);
+-        LLAMA_LOG_WARN("%s: no MoE layer with its experts in host memory and a GPU for slots (layer 0: gate %s/%s, down %s, gate_up %d, device %s)\n",
+-                       __func__, l0.ffn_gate_exps ? ggml_get_name(l0.ffn_gate_exps) : "-",
++        LLAMA_LOG_WARN("%s: no MoE layer on %s with its experts in host memory (layer 0: gate %s/%s, down %s, gate_up %d, device %s)\n",
++                       __func__, dev ? ggml_backend_dev_name(dev) : "-",
++                       l0.ffn_gate_exps ? ggml_get_name(l0.ffn_gate_exps) : "-",
+                        l0.ffn_gate_exps && l0.ffn_gate_exps->buffer ? ggml_backend_buffer_name(l0.ffn_gate_exps->buffer) : "-",
+                        l0.ffn_down_exps && l0.ffn_down_exps->buffer ? ggml_backend_buffer_name(l0.ffn_down_exps->buffer) : "-",
+                        l0.ffn_gate_up_exps != nullptr, d0 ? ggml_backend_dev_name(d0) : "-");
+@@ -464,7 +484,8 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+                 }
+             }
+         }
+-        LLAMA_LOG_WARN("%s: copy check, layer %d: %d of %d slots and bank entries differ from the file\n", __func__, L.il, bad, n);
++        LLAMA_LOG_WARN("%s: copy check, %s, layer %d: %d of %d slots and bank entries differ from the file\n", __func__,
++                       ggml_backend_dev_name(dev), L.il, bad, n);
+         if (bad) {
+             return false;
+         }
+@@ -475,10 +496,11 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+             g_registry[L.src[2]] = &L;
+         }
+     }
+-    LLAMA_LOG_WARN("%s: %zu layers, %lld expert slots (%lld-%lld a layer), %.2f GiB on %s (with the Q8_0 banks), bank %.2f GiB in host memory, from %s; filled in %.1f s\n",
+-                   __func__, layers.size(), (long long) n_slots_all, (long long) lo, (long long) hi, n_bytes / 1073741824.0,
+-                   ggml_backend_dev_name(dev), n_bank_bytes / 1073741824.0, from_profile ? profile : "round robin",
+-                   (ggml_time_us() - t_fill) / 1e6);
++    LLAMA_LOG_WARN("%s: %s: %zu layers (%d-%d), %lld expert slots (%lld-%lld a layer), %.2f GiB on the card (with the Q8_0 banks), "
++                   "bank %.2f GiB in host memory, budget %.2f GiB, from %s; filled in %.1f s\n",
++                   __func__, ggml_backend_dev_name(dev), layers.size(), layers.front().il, layers.back().il, (long long) n_slots_all,
++                   (long long) lo, (long long) hi, n_bytes / 1073741824.0, n_bank_bytes / 1073741824.0, budget / 1073741824.0,
++                   from_profile ? profile : "round robin", (ggml_time_us() - t_fill) / 1e6);
+     return true;
+ }
+ 
+@@ -487,7 +509,7 @@ void llama_expert_cache::count(uint32_t n_tokens) {
+     for (auto & L : layers) {
+         if (L.ids_out == nullptr || L.ids_out->buffer == nullptr || L.ids_out->ne[1] != (int64_t) n_tokens ||
+             ggml_backend_buffer_get_type(L.ids_out->buffer) != ggml_backend_buffer_get_type(L.slot[0]->buffer)) {
+-            return;   // not the graph that just ran, or the ids not on the card
++            return;   // not the graph that just ran, or the ids not on this cache's card
+         }
+     }
+     std::vector<std::vector<int32_t>> ids_read;
+@@ -527,15 +549,16 @@ void llama_expert_cache::count(uint32_t n_tokens) {
+         }
+     }
+     if (n_tokens > 1 && ++n_multi_steps % 200 == 0) {
+-        LLAMA_LOG_INFO("%s: %llu multi-token decode steps: %.1f routed pairs, %.1f distinct experts (%.1f in the bank) a step over the layers\n",
+-                       __func__, (unsigned long long) n_multi_steps, (double) n_multi_pairs / n_multi_steps,
++        LLAMA_LOG_INFO("%s: %s: %llu multi-token decode steps: %.1f routed pairs, %.1f distinct experts (%.1f in the bank) a step over its layers\n",
++                       __func__, dev_ ? ggml_backend_dev_name(dev_) : "-", (unsigned long long) n_multi_steps, (double) n_multi_pairs / n_multi_steps,
+                        (double) n_multi_unique / n_multi_steps, (double) n_multi_unique_bank / n_multi_steps);
+     }
+ }
+ 
+-void llama_expert_cache::plan() {
+-    struct cand { int layer; float gain; int slot; int expert; };
+-    std::vector<cand> all;
++// this cache's swap candidates (Strata's rule, generate.cpp:4433-4452): per
++// layer, the hottest bank experts against the coldest slots while the gain
++// holds
++void llama_expert_cache::candidates(std::vector<llama_expert_cache_swap> & out) {
+     for (int i = 0; i < (int) layers.size(); ++i) {
+         auto & L = layers[i];
+         std::vector<std::pair<float, int>> c, v;
+@@ -553,12 +576,34 @@ void llama_expert_cache::plan() {
+             if (c[j].first < v[j].first + min_gain) {
+                 break;
+             }
+-            all.push_back({ i, c[j].first - v[j].first, v[j].second, c[j].second });
++            out.push_back({ this, i, c[j].first - v[j].first, v[j].second, c[j].second });
+         }
+     }
++}
++
++// Strata plans one adapt over every stage's layers, the max_swaps largest
++// gains in all (generate.cpp:4453-4454), and each swap lands in its layer's
++// own cache on that card's stream (4462-4471): the same here, over the caches
++void llama_expert_cache::plan(const std::vector<std::unique_ptr<llama_expert_cache>> & caches) {
++    std::vector<llama_expert_cache_swap> all;
++    for (const auto & ec : caches) {
++        ec->candidates(all);
++    }
+     std::sort(all.begin(), all.end(), [](auto & a, auto & b) { return a.gain > b.gain; });
+-    if ((int) all.size() > max_swaps) {
+-        all.resize(max_swaps);
++    if ((int) all.size() > caches.front()->max_swaps) {
++        all.resize(caches.front()->max_swaps);
++    }
++    for (const auto & ec : caches) {
++        ec->adapt(all);
++    }
++}
++
++void llama_expert_cache::adapt(const std::vector<llama_expert_cache_swap> & all_caches) {
++    std::vector<llama_expert_cache_swap> all;
++    for (const auto & c : all_caches) {
++        if (c.cache == this) {
++            all.push_back(c);
++        }
+     }
+     for (auto & L : layers) {
+         for (float & u : L.usage) {
+@@ -613,32 +658,47 @@ void llama_expert_cache::plan() {
+             bad += verify(L, L.slot[k], k, c.slot, c.expert) ? 0 : 1;
+             bad += verify(L, L.bank[k], k, first_entry, first_victim) ? 0 : 1;
+         }
+-        LLAMA_LOG_WARN("%s: swap check, layer %d slot %d <- expert %d, bank %d <- expert %d: %d of 6 copies differ from the file\n",
+-                       __func__, L.il, c.slot, c.expert, first_entry, first_victim, bad);
++        LLAMA_LOG_WARN("%s: swap check, %s, layer %d slot %d <- expert %d, bank %d <- expert %d: %d of 6 copies differ from the file\n",
++                       __func__, ggml_backend_dev_name(dev_), L.il, c.slot, c.expert, first_entry, first_victim, bad);
+     }
+     n_apply_us += (uint64_t) (ggml_time_us() - t0);
+ }
+ 
+-void llama_expert_cache::step(ggml_backend_sched_t sched, uint32_t n_tokens) {
++// The owner context's ubatch: counts the previous decode ubatch's routing;
++// true when an adapt is due
++bool llama_expert_cache::advance(ggml_backend_sched_t sched, uint32_t n_tokens) {
+     // the first context to decode drives the cache (an MTP draft context on
+     // the same model would count its drafts and shift the cadence)
+     if (owner_sched == nullptr) {
+         owner_sched = sched;
+     } else if (sched != owner_sched) {
+-        return;
++        return false;
+     }
+     if (last_n > 0 && last_n <= decode_max) {
+         count(last_n);   // waits for the queue
+     }
+     last_n = n_tokens;
+-    GGML_UNUSED(sched);   // the exchanges and the next graph share the card's in-order queue
++    // the exchanges and the next graph share the card's in-order queue
+     if (n_tokens <= decode_max) {
+         since_adapt += n_tokens;
+         if (adapt_every > 0 && since_adapt >= adapt_every) {
+             since_adapt = 0;
+-            plan();
++            return true;
+         }
+     }
++    return false;
++}
++
++void llama_expert_cache::step(const std::vector<std::unique_ptr<llama_expert_cache>> & caches, ggml_backend_sched_t sched,
++                              uint32_t n_tokens) {
++    // every cache counts its own layers; they share the owner and the cadence
++    bool due = false;
++    for (const auto & ec : caches) {
++        due = ec->advance(sched, n_tokens) || due;
++    }
++    if (due) {
++        plan(caches);
++    }
+ }
+ 
+ void llama_expert_cache::after_graph(ggml_backend_sched_t sched, uint32_t n_tokens) {
+@@ -649,6 +709,8 @@ void llama_expert_cache::after_graph(ggml_backend_sched_t sched, uint32_t n_toke
+     if (!async_ids || sched != owner_sched || n_tokens == 0 || n_tokens > decode_max) {
+         return;
+     }
++    // each id copy on this cache's card (its buffer type is the card's own
++    // under 0023): the reads below go to one queue, which get_tensors asserts
+     for (auto & L : layers) {
+         if (L.ids_out == nullptr || L.ids_out->buffer == nullptr || L.ids_out->ne[1] != (int64_t) n_tokens ||
+             ggml_backend_buffer_get_type(L.ids_out->buffer) != ggml_backend_buffer_get_type(L.slot[0]->buffer)) {
+diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
+index 0314ca0..143bda3 100644
+--- a/src/llama-expert-cache.h
++++ b/src/llama-expert-cache.h
+@@ -16,11 +16,18 @@
+ // with cold slot experts of the same layer: an exchange of the two on the
+ // card's queue (newcomer into the slot, victim into its bank entry), ahead of
+ // the next graph, with no host copy.
++//
++// Under a layer split (LLAMA_SPLIT_MODE_LAYER) each GPU gets its own cache
++// over the layers it runs (Strata's per-stage expert cache, generate.cpp
++// 2286-2307): its slots and tables on that card, its bank in USM host memory
++// of that card's context (a USM allocation belongs to one context), its own
++// budget, tables, queue and counters.
+ 
+ #include "ggml.h"
+ #include "ggml-backend.h"
+ 
+ #include <cstdint>
++#include <memory>
+ #include <string>
+ #include <vector>
+ 
+@@ -58,6 +65,15 @@ struct llama_expert_cache_layer {
+     llama_expert_cache * owner = nullptr;
+ };
+ 
++// a planned swap: in `cache`, layers[layer]'s bank expert `expert` into slot `slot`
++struct llama_expert_cache_swap {
++    llama_expert_cache * cache;
++    int   layer;
++    float gain;
++    int   slot;
++    int   expert;
++};
++
+ struct llama_expert_cache_stats {
+     uint64_t decode_hits   = 0;
+     uint64_t decode_misses = 0;
+@@ -72,17 +88,22 @@ struct llama_expert_cache_stats {
+ struct llama_expert_cache {
+     ~llama_expert_cache();
+ 
+-    // After the weights are loaded: the layers whose expert tensors live in
+-    // host buffers get slots on that layer's device, up to `budget` bytes,
+-    // in the order of `profile` (Strata's STRP file; empty: expert-major
+-    // round robin over the layers), and a bank of the rest. False when
+-    // nothing qualifies or the memory cannot be had.
+-    bool init(llama_model & model, const llama_model_loader & ml, size_t budget, const char * profile);
++    // After the weights are loaded: the layers on `dev` whose expert tensors
++    // live in host buffers get slots on `dev`, up to `budget` bytes, in the
++    // order of `profile` (Strata's STRP file, its pairs of these layers;
++    // empty: expert-major round robin over these layers), and a bank of the
++    // rest. False when nothing qualifies or the memory cannot be had.
++    bool init(llama_model & model, const llama_model_loader & ml, ggml_backend_dev_t dev, size_t budget, const char * profile);
+ 
+-    // Between ubatches of llama_context::decode, before the next graph:
+-    // counts the previous decode ubatch's routing and, every adapt_every
+-    // decode tokens, plans and enqueues the swaps.
+-    void step(ggml_backend_sched_t sched, uint32_t n_tokens);
++    // `dev` runs at least one layer init() would cache
++    static bool has_layers(const llama_model & model, const llama_model_loader & ml, ggml_backend_dev_t dev);
++
++    // Between ubatches of llama_context::decode, before the next graph, over
++    // the model's caches (one per card): each counts the previous decode
++    // ubatch's routing of its layers; every adapt_every decode tokens the
++    // swaps are planned over all of them (the max_swaps largest gains) and
++    // each cache enqueues its own on its card's queue.
++    static void step(const std::vector<std::unique_ptr<llama_expert_cache>> & caches, ggml_backend_sched_t sched, uint32_t n_tokens);
+ 
+     // Right after a decode graph is enqueued: its routed ids are read behind
+     // it (no wait), for step() to count once the host has synchronized
+@@ -91,6 +112,8 @@ struct llama_expert_cache {
+ 
+     llama_expert_cache_stats stats() const;
+ 
++    ggml_backend_dev_t device() const { return dev_; }
++
+     std::vector<llama_expert_cache_layer> layers;
+     ggml_tensor * tab_id = nullptr;     // I32 [1, n_expert] identity: the routed ids' copy for read-back
+ 
+@@ -106,13 +129,17 @@ struct llama_expert_cache {
+     uint32_t decode_max  = 8;           // a ubatch up to this many tokens counts as decode (Strata MAXT 8)
+ 
+ private:
++    bool advance(ggml_backend_sched_t sched, uint32_t n_tokens);
+     void count(uint32_t n_tokens);
+-    void plan();
++    void candidates(std::vector<llama_expert_cache_swap> & out);
++    void adapt(const std::vector<llama_expert_cache_swap> & all);
++    static void plan(const std::vector<std::unique_ptr<llama_expert_cache>> & caches);
+     bool read_expert(const llama_expert_cache_layer & L, int expert, int k, uint8_t * dst) const;
+     void write_slices(ggml_tensor * t, int64_t i2, const uint8_t * data, size_t nb2);
+     bool verify(const llama_expert_cache_layer & L, ggml_tensor * t, int k, int i2, int expert) const;
+     void upload_tables(llama_expert_cache_layer & L);
+ 
++    ggml_backend_dev_t dev_ = nullptr;  // the card of these layers: slots, tables, the bank's context, the queue
+     std::vector<int>   fds;             // per GGUF file
+     ggml_context *     ctx = nullptr;
+     ggml_context *     bank_ctx_ = nullptr;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 6cac5b7..a6dd118 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1959,28 +1959,65 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     }
+ 
+     // LLAMA_EXPERT_CACHE_MIB / LLAMA_EXPERT_CACHE_PROFILE: the same for tools
+-    // that do not set the parameters (llama-bench, llama-perplexity)
++    // that do not set the parameters (llama-bench, llama-perplexity); "A,B"
++    // gives one budget per device, as expert_cache_bytes_dev
++    std::vector<size_t> ec_dev;
++    if (params.expert_cache_bytes_dev != nullptr) {
++        ec_dev.assign(params.expert_cache_bytes_dev, params.expert_cache_bytes_dev + params.n_expert_cache_bytes_dev);
++    }
+     size_t       ec_bytes   = params.expert_cache_bytes;
+     const char * ec_profile = params.expert_cache_profile;
+-    if (ec_bytes == 0 && getenv("LLAMA_EXPERT_CACHE_MIB")) {
+-        ec_bytes   = (size_t) atoll(getenv("LLAMA_EXPERT_CACHE_MIB")) << 20;
++    if (ec_bytes == 0 && ec_dev.empty() && getenv("LLAMA_EXPERT_CACHE_MIB")) {
++        const std::string v = getenv("LLAMA_EXPERT_CACHE_MIB");
++        if (v.find(',') == std::string::npos) {
++            ec_bytes = (size_t) atoll(v.c_str()) << 20;
++        } else {
++            for (size_t at = 0; at <= v.size();) {
++                const size_t comma = std::min(v.find(',', at), v.size());
++                ec_dev.push_back((size_t) atoll(v.substr(at, comma - at).c_str()) << 20);
++                at = comma + 1;
++            }
++        }
+         ec_profile = getenv("LLAMA_EXPERT_CACHE_PROFILE");
+     }
+-    if (ec_bytes > 0) {
+-        expert_cache = std::make_unique<llama_expert_cache>();
+-        if (!expert_cache->init(*this, ml, ec_bytes, ec_profile)) {
+-            expert_cache.reset();
++    // one cache per GPU that runs MoE layers with experts in host memory: with
++    // per-device budgets, device i of the model takes ec_dev[i]; with one
++    // budget, the first such device takes it and the others keep none
++    bool budget_taken = false;
++    for (size_t i = 0; i < devices.size(); ++i) {
++        ggml_backend_dev_t dev = devices[i].dev;
++        if (devices[i].is_meta || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
++            continue;
++        }
++        size_t budget = 0;
++        if (!ec_dev.empty()) {
++            budget = i < ec_dev.size() ? ec_dev[i] : 0;
++        } else if (!budget_taken && ec_bytes > 0 && llama_expert_cache::has_layers(*this, ml, dev)) {
++            budget       = ec_bytes;
++            budget_taken = true;
++        }
++        if (budget == 0) {
++            continue;
++        }
++        auto ec = std::make_unique<llama_expert_cache>();
++        if (ec->init(*this, ml, dev, budget, ec_profile)) {
++            expert_caches.push_back(std::move(ec));
++        }
++    }
++    if (ec_bytes > 0 && ec_dev.empty() && !budget_taken) {
++        // no device qualified: init's reason (layer 0's placement) for the first GPU
++        for (const auto & d : devices) {
++            if (!d.is_meta && ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++                llama_expert_cache().init(*this, ml, d.dev, ec_bytes, ec_profile);
++                break;
++            }
+         }
+     }
+ 
+     return true;
+ }
+ 
+-bool llama_model_expert_cache_info(const llama_model * model, llama_expert_cache_info * info) {
+-    if (model == nullptr || !model->expert_cache || info == nullptr) {
+-        return false;
+-    }
+-    const llama_expert_cache_stats s = model->expert_cache->stats();
++static void llama_expert_cache_info_from(const llama_expert_cache_stats & s, llama_expert_cache_info * info) {
+     info->decode_hits   = s.decode_hits;
+     info->decode_misses = s.decode_misses;
+     info->swaps         = s.swaps;
+@@ -1989,9 +2026,48 @@ bool llama_model_expert_cache_info(const llama_model * model, llama_expert_cache
+     info->slots         = s.slots;
+     info->bytes         = s.bytes;
+     info->bank_bytes    = s.bank_bytes;
++}
++
++bool llama_model_expert_cache_info(const llama_model * model, llama_expert_cache_info * info) {
++    if (model == nullptr || model->expert_caches.empty() || info == nullptr) {
++        return false;
++    }
++    llama_expert_cache_stats sum;
++    for (const auto & ec : model->expert_caches) {
++        const llama_expert_cache_stats s = ec->stats();
++        sum.decode_hits   += s.decode_hits;
++        sum.decode_misses += s.decode_misses;
++        sum.swaps         += s.swaps;
++        sum.adapts         = std::max(sum.adapts, s.adapts);   // one global plan adapts every cache at once
++        sum.apply_us      += s.apply_us;
++        sum.slots         += s.slots;
++        sum.bytes         += s.bytes;
++        sum.bank_bytes    += s.bank_bytes;
++    }
++    llama_expert_cache_info_from(sum, info);
++    return true;
++}
++
++int llama_model_expert_cache_count(const llama_model * model) {
++    return model ? (int) model->expert_caches.size() : 0;
++}
++
++bool llama_model_expert_cache_info_dev(const llama_model * model, int i, llama_expert_cache_info * info) {
++    if (model == nullptr || info == nullptr || i < 0 || i >= (int) model->expert_caches.size()) {
++        return false;
++    }
++    llama_expert_cache_info_from(model->expert_caches[i]->stats(), info);
+     return true;
+ }
+ 
++const char * llama_model_expert_cache_device(const llama_model * model, int i) {
++    if (model == nullptr || i < 0 || i >= (int) model->expert_caches.size()) {
++        return nullptr;
++    }
++    ggml_backend_dev_t dev = model->expert_caches[i]->device();
++    return dev ? ggml_backend_dev_name(dev) : nullptr;
++}
++
+ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+     return ml.create_tensor(
+@@ -2962,6 +3038,8 @@ llama_model_params llama_model_default_params() {
+         /*.kv_overrides                =*/ nullptr,
+         /*.expert_cache_bytes          =*/ 0,
+         /*.expert_cache_profile        =*/ nullptr,
++        /*.expert_cache_bytes_dev      =*/ nullptr,
++        /*.n_expert_cache_bytes_dev    =*/ 0,
+         /*.vocab_only                  =*/ false,
+         /*.check_tensors               =*/ false,
+         /*.use_extra_bufts             =*/ true,
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 946e22f..b33ee43 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -721,8 +721,10 @@ struct llama_model {
+ 
+     std::vector<llama_layer> layers;
+ 
+-    // the per-expert GPU cache (llama_model_params.expert_cache_bytes)
+-    std::unique_ptr<struct llama_expert_cache> expert_cache;
++    // the per-expert GPU caches (llama_model_params.expert_cache_bytes[_dev]),
++    // one per GPU that runs MoE layers with experts in host memory, in the
++    // order of `devices`
++    std::vector<std::unique_ptr<struct llama_expert_cache>> expert_caches;
+ 
+     //Dense linear projections for SentenceTransformers models like embeddinggemma
+     // For Sentence Transformers models structure see
