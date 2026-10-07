@@ -100,6 +100,24 @@ On the record before the work starts.
 - **The B60 unit** at 98,304 tokens with 11,500 MiB of slots: no eviction
   (GTT stayed at the bank, 947 MiB free at the peak). 20k needle right,
   prefill 410 t/s, decode 21.0 t/s on the long answer.
+- **0024 measured** (`measured-here`, 2026-10-07; Flash-Next IQ2_XS, MTP 2,
+  f16 KV, 131,072 tokens of context; the 20k needle and the long answer;
+  answers right in every arm; no eviction on either card, GTT at each bank
+  throughout):
+
+  | arm | prefill 20k | decode | experts on the cards | free at the peak |
+  |---|---|---|---|---|
+  | B60 alone, 9,500 MiB | 408 t/s | 19.8 t/s | 84.4 % | B60 1.0 GiB |
+  | split K=24, 14,000 + 5,000 MiB | 224 t/s | 12.1 t/s | 93.5 % (98.5 / 88.5) | B60 3.6, A770 0.5 GiB |
+  | split K=40, 10,500 + 6,000 MiB | 378 t/s | 18.6 t/s | 90.4 % (88.4 / 100) | B60 4.6, A770 2.1 GiB |
+
+  - **K=24:** the A770's misses and its prefill gathers cross its PCIe 3.0
+    x4 link (1.83 GB/s); the hit rate rises and the speed falls.
+  - **K=40:** the A770 holds every expert of its 8 layers (bank 0.02 GiB).
+    The rest of the gap is the MTP draft on the A770, which proposes in
+    1.95 s a request against 0.94 s on the B60.
+  - **Next:** the MTP model on the B60, and the B60's 4.6 GiB of headroom as
+    slots.
 - **Two OpenCL platforms** (`measured-here`, Intel compute runtime
   26.27.39122.11): the runtime lists the B60 and the A770 as two platforms,
   one device each. A cl_context spans one platform. A USM host allocation
