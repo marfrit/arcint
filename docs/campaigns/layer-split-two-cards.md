@@ -118,6 +118,22 @@ On the record before the work starts.
     1.95 s a request against 0.94 s on the B60.
   - **Next:** the MTP model on the B60, and the B60's 4.6 GiB of headroom as
     slots.
+- **The levers** (`measured-here`, 2026-10-08, the same night and the same
+  binary family; 131,072 tokens; answers right in every arm; no eviction,
+  each process's GTT at its banks):
+
+  | arm | prefill 20k | decode | experts on the cards | free at the peak |
+  |---|---|---|---|---|
+  | K=40, MTP on the B60 (`--llama-mtp-card 0`), 10,500 + 6,000 MiB | 390 t/s | 20.4 t/s | 90.1 % (88.1 / 100) | B60 1.6, A770 5.2 GiB |
+  | K=36, MTP on the B60, 11,500 + 8,000 MiB | 392 t/s | 21.7 t/s | 93.5 % (91.5 / 99.6) | B60 1.1, A770 2.5 GiB |
+
+  - **MTP on the first card:** the draft took 0.95 s a request instead of
+    1.95 s.
+  - **K=36:** the A770 holds 12 layers with a 0.70 GiB bank.
+  - Against the B60 alone at the same context (408 / 19.8): decode +9.6 %,
+    prefill -4 %. One run each. The B60's run-to-run spread on this request
+    has been ~3-5 %.
+  - **Next:** the A770's 2.5 GiB of headroom as slots, or K=34.
 - **Two OpenCL platforms** (`measured-here`, Intel compute runtime
   26.27.39122.11): the runtime lists the B60 and the A770 as two platforms,
   one device each. A cl_context spans one platform. A USM host allocation
