@@ -1339,3 +1339,62 @@ differ. Before the patch's decode work: 16.0 and
 greedy. With the rest of the patch (2026-10-07): MTP 2 30.7-31.6 t/s
 (13,500-14,500 MiB), MTP 3 with arcint's `--llama-mtp-min-p 0.5` 31.3, the
 needle's prefill 383 t/s; the residents unchanged (38.2 / 43.5).
+
+## 0023-opencl-one-context-per-platform-multi-device.patch
+
+One process on two Intel Arc cards, for llama.cpp's layer split. Intel's
+OpenCL runtime (26.27) lists two different GPUs as two platforms, one device
+each, and ggml-opencl probed one platform and made one context for all its
+devices. With the patch:
+
+- **Selection:** `GGML_OPENCL_DEVICES="P:D[,P:D...]"` selects devices across
+  platforms, in that order; the first is the main device. Each platform gets
+  one context holding its selected devices. When the variable is unset,
+  `GGML_OPENCL_PLATFORM`/`GGML_OPENCL_DEVICE` and the default behave as
+  before.
+- **Builds:** programs are built for the one device that uses them
+  (`clBuildProgram` with that device). The program cache saves that device's
+  binary; its key already carries the device name and driver.
+- **Buffers:** `supports_buft` accepts only the device's own buffer type.
+  Activations crossing devices go through the scheduler's host copy (the
+  backend has no events and no `cpy_tensor`).
+- **Names:** devices `GPUOpenCL`, `GPUOpenCL1`, ...; buffer types and
+  backends `OpenCL`, `OpenCL1`, ...
+- **Per-device state** that was process-static:
+  - the maximum allocation size;
+  - the 512-wide flash-attention failure flags;
+  - the transpose, `get_tensor` and cumsum scratch buffers;
+  - 0021's USM entry points (resolved per platform);
+  - its exchange scratch and its keep ring (finished on the owning queue);
+  - 0022's prefetch state.
+  `get_tensors(_async)` and `exchange_slices` assert that their tensors
+  share one device.
+- **Synchronisation:** `sync_with_other_backends` waits only on backends in
+  its own context. An event cannot cross contexts.
+
+Measured on the B60 + A770 (`measured-here`, 2026-10-07, both cards on their
+own platforms):
+
+- **Device lists:**
+  - `GGML_OPENCL_DEVICES=0:0,1:0` lists both cards;
+  - unset, the B60 alone, as before;
+  - the 0001-0022 build with the variable set lists one OpenCL device (the
+    red case).
+- **`test-backend-ops` with both devices in the process:**
+  - MUL_MAT 1201/1201 on each card;
+  - GET_ROWS 29/29 on each;
+  - MUL_MAT_ID 520/520 on the A770;
+  - the same counts as the A770 alone under `GGML_OPENCL_PLATFORM=1`.
+  - On the B60, MUL_MAT_ID 446/520: the 74 MXFP4 cases noted under 0022,
+    the same set as the 0001-0022 build's.
+- **The coder Q4_K_M** (14.94 GiB), llama-bench `-fa 1`:
+
+  | | pp512 | pp4096 | tg64 |
+  |---|---|---|---|
+  | B60 alone | 2,618 | 2,470 | 77.2 |
+  | split `-ts 3/2` | 2,210 | 2,945 | 57.5 |
+  | split `-ts 1/1` | 2,148 | 2,976 | 55.0 |
+
+  This model fits on the B60 alone, so a split costs decode: the A770 runs
+  its layers slower, and every token crosses once.
+- **Answer:** the capital question across both cards is right ("Paris").

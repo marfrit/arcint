@@ -73,6 +73,7 @@ ranking (`research-reference-audit.md` §4).
 | [kquant-host-storage](kquant-host-storage.md) | native blocks on the host tier, quantised dot for decode-shaped calls (0043, 0074) | Strata `src/kernels/cpu/iq_avx2.cpp` (multi-token AVX2) |
 | [kv-checkpoint-restore](kv-checkpoint-restore.md) | in process on both engines (libllama: context checkpoints, 2026-10-05); across a restart open | Strata conversation cache (`src/core/conversation_snapshot.cpp`) |
 | [served-prefill-determinism](served-prefill-determinism.md) | B60 run-to-run variance, located in the GDN state; not gating | upstream openvinotoolkit/openvino#38099 |
+| [layer-split-two-cards](layer-split-two-cards.md) | opened 2026-10-07: Flash-Next across the B60 and the A770, a layer range, KV and expert cache per card; recon done, two OpenCL platforms (`measured-here`), design: a context per card (0023), an expert cache per card (0024) | Strata `src/program/generate.cpp:690-708, 2286-2391, 2860-2906`, `src/core/verify.cpp:815-820, 1128-1171`, `src/prefill/prefill.cpp:1866-1882` |
 | [direct-submission-fault](direct-submission-fault.md) | mechanism on record; the N ≥ 5 confirmation on the current kernel owed | upstream `linux-7.1.y` ring-ordering fix |
 
 FreeToken paths are under `~/src/FreeToken-ref/python/freetoken/`; Strata
