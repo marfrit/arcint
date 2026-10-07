@@ -1292,8 +1292,8 @@ the decode-path work Flash-Next and its MTP verify needed on Intel:
   (320 x 10240 at 512 tokens 1,907 -> 468 us); the needle's prefill 342.8 ->
   383.4 t/s.
 - Opt-in, measured no faster served: the hyper-connection read fused into
-  two kernels (`GGML_OPENCL_FUSE_HC_MIX=1`, after Strata's `fused_gr`;
-  31.2 t/s off, 30.8 on), a projection's matvec copying the next
+  three kernels (`GGML_OPENCL_FUSE_HC_MIX=1`, after Strata's `fused_gr` v3
+  split by stream and K half; 30.8 t/s off, 30.4 on), a projection's matvec copying the next
   projection's misses into a card-side mirror (`GGML_OPENCL_MOE_PREFETCH=1`,
   31.4 -> 31.6), the K-split F16 kernel with 4 rows a work-group
   (`GGML_OPENCL_F16_KSPLIT4=1`). `GGML_OPENCL_IQ_OPTS` adds defines to the IQ

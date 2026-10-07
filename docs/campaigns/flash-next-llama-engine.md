@@ -379,7 +379,17 @@ Kernel microbenchmarks (test-backend-ops perf, B60, weights in VRAM):
 | BF16 320 x 10240, 3 columns | 17.9 us | 4 rows a K-split work-group (`GGML_OPENCL_F16_KSPLIT4=1`): 12.7 | faster in isolation (weights in L2); off by default |
 
 The constant-memory gathers stay the fastest IQ4 decode found on the B60
-(register selects were slower too, stage 3b).
+(register selects were slower too, stage 3b). Layout is not the bound at a
+verify's width either: IQ4_NL in flat planes against IQ4_XS as stored, the
+same codebook, 6144 x 2560: 36.2 vs 44.3 us at one column, 47.8 vs 49.2 at
+three. A planar IQ4_XS was not built.
+
+The combined settings, one window each (`measured-here`, f16 KV, answers
+right): MTP 3 with the 0.5 stop at 14,500 MiB 30.5 t/s; with the MTP file's
+head in IQ4_XS (1,212 -> ~330 MiB on the card, the same acceptance) at
+14,700 MiB (10,667 slots) 31.1 t/s, prefill 386.5. The single settings move
+decode by less than the run-to-run spread (30.5-31.6 t/s across today's
+arms of the same configuration).
 
 - **The draft head over Strata's 106,299-token subset** (its
   `data/draft_vocab.bin`, `--llama-mtp-vocab`, now also for hyper-connection
@@ -431,9 +441,20 @@ The constant-memory gathers stay the fastest IQ4 decode found on the B60
   50 us and the up kernel 35 us a site against ~75 us for the five kernels
   (and 288 fewer launches a verify, 3,679 -> 3,391): the down kernel's 80
   work-groups, each staging its stream's activations, are slower than the
-  K-split product's 320. Opt-in (`GGML_OPENCL_FUSE_HC_MIX=1`); Strata's
-  answer to the same limit is its v3 split by stream and K half
-  (`fused_gr.cu:300`, `code`), not built here.
+  K-split product's 320. A second version after Strata's v3 split
+  (`fused_gr.cu:300`, `code`: the down product per 8-row block x stream x K
+  half, 320 groups; a one-group kernel for the rms scales and `lo`; the up
+  product 16 columns a group with 8 lanes a row) is correct (HC_MIX 10/10,
+  red 9 of 10 failing) and no faster: down 52.7 us, lo 4.7, up 29.8, ~87 us
+  a site against ~75 unfused; served 30.4 on, 30.8 off, one binary. The
+  staged activations and the weights cost the fused down kernel about what
+  the K-split product's cached reads cost. Opt-in
+  (`GGML_OPENCL_FUSE_HC_MIX=1`), the second version kept.
+- **The BF16 tensors as Q8_0** (1,457 MiB: the hyper-connection products
+  1,212, routers 120, the rest small) were sized and not tried: the MTP
+  layer's own Q8_0 products on this backend take 42.6 us for the 4-row
+  inject (9.3 us on the F16 K-split) and 33.7 us for the down product at two
+  tokens (37 at three in F16); they would need few-row Q8_0 kernels first.
 
 - **The order of a verify's expert pairs**, from a permutation computed once
   per layer (`kernel_moe_pair_perm`, one work-group; the three projections
@@ -473,6 +494,11 @@ The constant-memory gathers stay the fastest IQ4 decode found on the B60
   prefills it at 620.5. What the chunk spends besides (window 25): the
   expert GEMMs of both branches ~1.5 s, the bank gathers 0.81 s (the link),
   attention 0.37 s.
+
+- **KV q8_0** (the agent unit's setting) to free ~450 MiB for slots: 23.6
+  t/s (MTP 3 with the 0.5 stop, 14,500 MiB; verify 18.52 s, propose 2.57 s,
+  prefill 364 t/s) against 31.3 on f16 KV. Flash-Next's attention heads are
+  256 wide; the quantized-KV attention kernels were searched at 128. Not used.
 
 Tried and measured slower (`measured-here`, B60, MTP 2, one binary, the long
 text identical): the bank's pairs first in the expert matvec (each
