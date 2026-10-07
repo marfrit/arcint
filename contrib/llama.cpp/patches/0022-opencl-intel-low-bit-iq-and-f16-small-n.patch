@@ -1,3 +1,80 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -20,6 +20,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <algorithm>
++#include <map>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -1799,9 +1800,20 @@
+     return true;
+ }
+ 
++// GGML_SCHED_TIMING=1: the host's time per graph in input copies and split
++// computes by backend, logged and reset every 50 graphs per scheduler (measurement)
++struct sched_timing { int64_t n = 0, splits = 0, t_in[4] = {}, t_cmp[4] = {}; };
++static bool sched_timing_on() {
++    static const bool on = [] { const char * e = getenv("GGML_SCHED_TIMING"); return e != nullptr && atoi(e) != 0; }();
++    return on;
++}
++
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
++    const bool st_on = sched_timing_on();
++    static std::map<ggml_backend_sched_t, sched_timing> st_acc;   // per scheduler (a context)
++    sched_timing & st = st_acc[sched];
+ 
+     ggml_tensor * prev_ids_tensor = nullptr;
+     std::vector<int32_t> ids;
+@@ -1824,6 +1836,7 @@
+             }
+         }
+ 
++        const int64_t st_t0 = st_on ? ggml_time_us() : 0;
+         // copy the input tensors to the split backend
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
+@@ -1951,11 +1964,17 @@
+             }
+         }
+ 
++        const int64_t st_t1 = st_on ? ggml_time_us() : 0;
+         if (!sched->callback_eval) {
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
+                 return ec;
+             }
++            if (st_on) {
++                const int b = split_backend_id < 4 ? split_backend_id : 3;
++                st.t_in[b]  += st_t1 - st_t0;
++                st.t_cmp[b] += ggml_time_us() - st_t1;
++            }
+         } else {
+             // similar to ggml_backend_compare_graph_backend
+             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
+@@ -1998,6 +2017,18 @@
+         prev_backend_id = split_backend_id;
+     }
+ 
++    if (st_on) {
++        st.splits += sched->n_splits;
++        if (++st.n % 50 == 0) {
++            const double n = (double) st.n;
++            GGML_LOG_WARN("sched timing (sched %p, %s): %lld graphs, %.1f splits each; us per graph: backend 0 (%s) inputs %.0f compute %.0f; "
++                          "backend 1 (%s) inputs %.0f compute %.0f\n", (void *) sched, sched->n_splits > 1 ? "split" : "one split",
++                          (long long) st.n, st.splits / n, ggml_backend_name(sched->backends[0]), st.t_in[0] / n, st.t_cmp[0] / n,
++                          sched->n_backends > 1 ? ggml_backend_name(sched->backends[1]) : "-", st.t_in[1] / n, st.t_cmp[1] / n);
++            st = sched_timing{};
++        }
++    }
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
@@ -807,7 +884,15 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
      ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer->buft->device->context;
      ggml_backend_opencl_context *backend_ctx = dev_ctx->backend_ctx;
-@@ -13933,11 +14454,18 @@
+@@ -13926,6 +14447,7 @@
+ static void ggml_backend_opencl_set_tensor_slices(ggml_tensor * tensor, const void * data, int64_t i2, int64_t n);
+ 
+ static void ggml_backend_opencl_get_tensors(const ggml_tensor * const * tensors, void * const * dsts, int n);
++static void ggml_backend_opencl_get_tensors_async(const ggml_tensor * const * tensors, void * const * dsts, int n);
+ static void ggml_backend_opencl_get_tensor_slices(const ggml_tensor * tensor, void * data, int64_t i2, int64_t n);
+ static void ggml_backend_opencl_exchange_slices(ggml_tensor * a, int64_t sa, ggml_tensor * b, int64_t sb);
+ 
+@@ -13933,11 +14455,18 @@
      g_cache_pairs[slot] = { bank, n_split };
  }
  
@@ -826,7 +911,17 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  }
  
  static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
-@@ -13959,6 +14487,9 @@
+@@ -13950,6 +14479,9 @@
+     if (strcmp(name, "ggml_backend_opencl_get_tensors") == 0) {
+         return (void *) ggml_backend_opencl_get_tensors;
+     }
++    if (strcmp(name, "ggml_backend_opencl_get_tensors_async") == 0) {
++        return (void *) ggml_backend_opencl_get_tensors_async;
++    }
+     if (strcmp(name, "ggml_backend_opencl_get_tensor_slices") == 0) {
+         return (void *) ggml_backend_opencl_get_tensor_slices;
+     }
+@@ -13959,6 +14491,9 @@
      if (strcmp(name, "ggml_backend_opencl_reserve_gather") == 0) {
          return (void *) ggml_backend_opencl_reserve_gather;
      }
@@ -836,7 +931,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      if (strcmp(name, "ggml_backend_opencl_pair_bank") == 0) {
          return (void *) ggml_backend_opencl_pair_bank;
      }
-@@ -14360,6 +14891,9 @@
+@@ -14360,6 +14895,9 @@
                      memcpy(dst + b * blk, dq.first + (i2 * bps + b) * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
                      memcpy(dst + b * blk + sizeof(ggml_fp16_t), dq.second + (i2 * bps + b) * qb, qb);
                  }
@@ -846,7 +941,30 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              } else {
                  ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
                  memcpy(data, (const char *) bctx->usm + e->offset + (size_t) i2 * tensor->nb[2], (size_t) n * tensor->nb[2]);
-@@ -14492,6 +15026,9 @@
+@@ -14470,6 +15008,22 @@
+     CL_CHECK(clFinish(queue));
+ }
+ 
++// The same without the wait: the reads queue behind what was enqueued before
++// (an expert cache's ids right after the graph that routes them); the caller
++// synchronizes before it reads dsts.
++static void ggml_backend_opencl_get_tensors_async(const ggml_tensor * const * tensors, void * const * dsts, int n) {
++    if (n <= 0) {
++        return;
++    }
++    ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) tensors[0]->buffer->buft->device->context;
++    cl_command_queue queue = dev_ctx->backend_ctx->queue;
++    for (int i = 0; i < n; ++i) {
++        const ggml_tensor * t = tensors[i];
++        ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) t->extra;
++        CL_CHECK(clEnqueueReadBuffer(queue, extra->data_device, CL_FALSE, extra->offset + t->view_offs, ggml_nbytes(t), dsts[i], 0, NULL, NULL));
++    }
++}
++
+ // Writes slices [i2, i2 + n) along dimension 2 of a weight tensor from
+ // GGUF-layout bytes, in the layout the tensor keeps on the card: Q8_0 (once
+ // converted) and IQ4_NL as all scales, then all quants, block by block as
+@@ -14492,6 +15046,9 @@
                      memcpy(dq.first + (i2 * bps + b) * sizeof(ggml_fp16_t), src + b * blk, sizeof(ggml_fp16_t));
                      memcpy(dq.second + (i2 * bps + b) * qb, src + b * blk + sizeof(ggml_fp16_t), qb);
                  }
@@ -856,7 +974,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              } else {
                  ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
                  memcpy((char *) bctx->usm + e->offset + (size_t) i2 * tensor->nb[2], data, (size_t) n * tensor->nb[2]);
-@@ -14537,6 +15074,10 @@
+@@ -14537,6 +15094,10 @@
          return;
      }
  #endif
@@ -867,7 +985,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      {
          // a plain tensor: a non-blocking write; the caller keeps `data` until the
          // next synchronization (llama_expert_cache's tables live in the layer)
-@@ -14615,6 +15156,12 @@
+@@ -14615,6 +15176,12 @@
                              : backend_ctx->kernel_set_rows_f32_i32;
                  break;
              case GGML_TYPE_F16:
@@ -880,7 +998,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                  kernel = (src1->type == GGML_TYPE_I64)
                              ? backend_ctx->kernel_set_rows_f16_i64
                              : backend_ctx->kernel_set_rows_f16_i32;
-@@ -14779,9 +15326,17 @@
+@@ -14779,9 +15346,17 @@
  
      cl_kernel kernel;
  
@@ -900,7 +1018,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          GGML_ASSERT(ggml_is_contiguous(src0));
          GGML_ASSERT(ne11 == 1);
      }
-@@ -14790,7 +15345,7 @@
+@@ -14790,7 +15365,7 @@
          GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
          if (bcast_row) {
              kernel = backend_ctx->kernel_add_row;
@@ -909,7 +1027,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
              CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
              CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra1->data_device));
-@@ -16014,13 +16569,21 @@
+@@ -16014,13 +16589,21 @@
      memcpy(&v, ((int32_t *) dst->op_params), sizeof(float));
  
      const int64_t n = ggml_nelements(dst);
@@ -934,7 +1052,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
      size_t local_work_size[1] = { 256 };
      size_t global_work_size[1] = { ((size_t)n + local_work_size[0] - 1) / local_work_size[0] * local_work_size[0] };
-@@ -17225,7 +17788,7 @@
+@@ -17225,7 +17808,7 @@
      const cl_ulong nb2 = dst->nb[2];
      const cl_ulong nb3 = dst->nb[3];
  
@@ -943,7 +1061,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
      CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
      CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
-@@ -17577,6 +18140,70 @@
+@@ -17577,6 +18160,70 @@
      }
  }
  
@@ -1014,7 +1132,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  static void ggml_cl_timestep_embedding(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -24733,6 +25360,21 @@
+@@ -24733,6 +25380,21 @@
  // the single branch: the mirror for the matvec's trailing arguments
  static cl_mem g_kq_single_q = nullptr, g_kq_single_d = nullptr;
  static int    g_kq_single_split = 0;
@@ -1036,7 +1154,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
  static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, cl_uint & a) {
      const ggml_tensor * soa0 = src0->view_src != nullptr ? src0->view_src : src0;
-@@ -24748,7 +25390,7 @@
+@@ -24748,7 +25410,7 @@
          // base and the offset, or IQ4_NL's scales and quants)
          auto * bctx = (ggml_backend_opencl_buffer_context *) soa0->buffer->context;
          if (bctx->usm) {
@@ -1045,7 +1163,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                  ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *)src0->extra;
                  const cl_ulong off = e->offset + src0->view_offs;
                  CL_CHECK(g_cl_set_arg_ptr(kernel, a++, bctx->usm));
-@@ -24756,7 +25398,7 @@
+@@ -24756,7 +25418,7 @@
                  CL_CHECK(g_cl_set_arg_ptr(kernel, a++, bctx->usm));
                  return;
              }
@@ -1054,7 +1172,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              const auto & dq = bctx->usm_split.at(soa0);
              const cl_ulong off = 0;
              CL_CHECK(g_cl_set_arg_ptr(kernel, a++, dq.second));
-@@ -24765,7 +25407,7 @@
+@@ -24765,7 +25427,7 @@
              return;
          }
      }
@@ -1063,7 +1181,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *)src0->extra;
          const cl_ulong off = e->offset + src0->view_offs;
          CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &e->data_device));
-@@ -24807,13 +25449,19 @@
+@@ -24807,13 +25469,19 @@
          case GGML_TYPE_IQ3_XXS: return 3;
          case GGML_TYPE_IQ4_XS:  return 4;
          case GGML_TYPE_IQ4_NL:  return 5;
@@ -1085,7 +1203,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  }
  
  // Q4_K and Q5_K subtract a min per sub-block: their kernels read the
-@@ -25062,14 +25710,28 @@
+@@ -25062,14 +25730,28 @@
  // over a work-group; more: the tiled GEMM with K cut into slices run as its
  // batch dimension, then the slices summed. GGML_OPENCL_F32_SKINNY=0 keeps
  // ggml's paths. Returns whether it took the product.
@@ -1115,7 +1233,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
          return false;
      }
-@@ -25167,10 +25829,111 @@
+@@ -25167,10 +25849,111 @@
  
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
  
@@ -1227,7 +1345,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      // quant kv without FA
      // used for non-contiguous src0 (the usual head-major permuted K view when n_head_kv>1)
      // AND for the contiguous case that occurs when n_head_kv==1 (e.g. Gemma-4 E2B)
-@@ -27611,6 +28374,27 @@
+@@ -27611,6 +28394,27 @@
      const bool id2 = gemm && (id2_env == nullptr ? id2_default : atoi(id2_env) != 0) && backend_ctx->kernel_mul_mm_id2_kq_f16[ti] != nullptr;
      cl_kernel kernel = id2 ? backend_ctx->kernel_mul_mm_id2_kq_f16[ti] :
                         gemm ? backend_ctx->kernel_mul_mm_id_kq_f16[ti] : backend_ctx->kernel_mul_mv_id_kq_q8_1[ti];
@@ -1255,7 +1373,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      if (kernel == nullptr) {
          return false;
      }
-@@ -27651,14 +28435,62 @@
+@@ -27651,14 +28455,62 @@
              if (it != g_cache_pairs.end()) { bank0 = it->second.first; n_split = it->second.second; single = true; }
          }
          auto * bctx0 = (ggml_backend_opencl_buffer_context *) bank0->buffer->context;
@@ -1322,7 +1440,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                      cl_kernel kg = backend_ctx->kernel_moe_gather_pairs;
                      CL_CHECK(g_cl_set_arg_ptr(kg, 0, src));
                      CL_CHECK(clSetKernelArg(kg, 1, sizeof(cl_mem),   &stage.buffer));
-@@ -27669,7 +28501,7 @@
+@@ -27669,7 +28521,7 @@
                      CL_CHECK(clSetKernelArg(kg, 6, sizeof(int),      &n_used));
                      CL_CHECK(clSetKernelArg(kg, 7, sizeof(int),      &n_split));
                      size_t g_local[2]  = { 256, 1 };
@@ -1331,7 +1449,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                      backend_ctx->enqueue_ndrange_kernel(kg, 2, g_global, g_local, dst);
                      return stage.buffer;
                  }
-@@ -27682,8 +28514,10 @@
+@@ -27682,8 +28534,10 @@
                  CL_CHECK(clSetKernelArg(kg, 5, sizeof(cl_ulong), &nbi1));
                  CL_CHECK(clSetKernelArg(kg, 6, sizeof(int),      &n_used));
                  CL_CHECK(clSetKernelArg(kg, 7, sizeof(int),      &n_tok));
@@ -1343,7 +1461,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                  backend_ctx->enqueue_ndrange_kernel(kg, 2, g_global, g_local, dst);
                  return stage.buffer;
              };
-@@ -27701,11 +28535,12 @@
+@@ -27701,11 +28555,12 @@
                  // goes in the matvec's trailing ones (below)
                  g_kq_single_q = g_kq_stage_q; g_kq_single_d = g_kq_stage_d != nullptr ? g_kq_stage_d : g_kq_stage_q;
                  g_kq_single_split = n_split;
@@ -1357,7 +1475,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
      cl_uint a = 0;
      if (!gemm) {
-@@ -27735,11 +28570,132 @@
+@@ -27735,11 +28590,132 @@
              const cl_mem q2 = g_kq_single_q != nullptr ? g_kq_single_q : extrad->data_device;
              const cl_mem d2 = g_kq_single_d != nullptr ? g_kq_single_d : extrad->data_device;
              const int    ns = g_kq_single_q != nullptr ? g_kq_single_split : INT_MAX;
@@ -1492,7 +1610,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          size_t global_work_size[] = { (size_t)CEIL_DIV(ne01, rows_per_wg) * 16, 4, (size_t)n_used * n_tok };
          size_t local_work_size[]  = { 16, 4, 1 };
          backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
-@@ -30361,6 +31317,9 @@
+@@ -30361,6 +31337,9 @@
                      kernel = ne00 < 32 ? backend_ctx->kernel_cpy_f32_f32_pack
                                         : backend_ctx->kernel_cpy_f32_f32;
                      break;
@@ -1502,7 +1620,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                  default:
                      GGML_ASSERT(false && "not implemented");
              }
-@@ -30382,6 +31341,9 @@
+@@ -30382,6 +31361,9 @@
                  case GGML_TYPE_I32:
                      kernel = backend_ctx->kernel_cpy_i32_i32;
                      break;
@@ -1512,7 +1630,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                  default:
                      GGML_ASSERT(false && "not implemented");
              }
-@@ -31095,6 +32057,49 @@
+@@ -31095,6 +32077,49 @@
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
  }
  
@@ -1562,7 +1680,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  static void ggml_cl_argsort(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -31955,6 +32960,18 @@
+@@ -31955,6 +32980,18 @@
              }
              ggml_cl_timestep_embedding(backend, tensor->src[0], tensor);
              return true;
@@ -1581,7 +1699,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          case GGML_OP_MUL_MAT:
              if (!any_on_device && !ggml_cl_can_mul_mat(tensor->src[0], tensor->src[1], tensor)) {
                  return false;
-@@ -32024,6 +33041,12 @@
+@@ -32024,6 +33061,12 @@
              }
              func = ggml_cl_argsort;
              break;
@@ -5331,6 +5449,123 @@ diff --git a/ggml/src/ggml-opencl/kernels/set_rows.cl b/ggml/src/ggml-opencl/ker
 +        dst_row[ind] = src_row[ind];
 +    }
 +}
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1396,6 +1396,28 @@
+     return res;
+ }
+ 
++// LLAMA_DECODE_TIMING=1: the host's time in decode() by phase, summed per
++// context type, logged and reset every 100 decodes (measurement)
++namespace {
++struct decode_timing {
++    int64_t n = 0, reused = 0, built = 0;
++    int64_t t_total = 0, t_pre = 0, t_step = 0, t_build = 0, t_alloc = 0, t_inputs = 0, t_compute = 0, t_post = 0;
++};
++static bool decode_timing_on() {
++    static const bool on = [] { const char * e = getenv("LLAMA_DECODE_TIMING"); return e != nullptr && atoi(e) != 0; }();
++    return on;
++}
++static decode_timing g_dt[8];
++static decode_timing * g_dt_cur = nullptr;
++static void decode_timing_log(int type, const decode_timing & d) {
++    const double n = d.n > 0 ? (double) d.n : 1.0;
++    LLAMA_LOG_WARN("decode timing (ctx type %d): %lld decodes, %lld reused / %lld built graphs; us per decode: total %.0f, "
++                   "pre %.0f, expert step %.0f, build %.0f, alloc %.0f, inputs %.0f, compute %.0f, post %.0f\n",
++                   type, (long long) d.n, (long long) d.reused, (long long) d.built, d.t_total / n, d.t_pre / n, d.t_step / n,
++                   d.t_build / n, d.t_alloc / n, d.t_inputs / n, d.t_compute / n, d.t_post / n);
++}
++}
++
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+@@ -1410,6 +1432,8 @@
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+ 
++    decode_timing * dt = g_dt_cur;
++    int64_t dt_t = dt ? ggml_time_us() : 0;
+     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+@@ -1421,7 +1445,9 @@
+         }
+ 
+         n_reused++;
++        if (dt) dt->reused++;
+     } else {
++        if (dt) dt->built++;
+         gf_res_prev_active = nullptr;
+         res->reset();
+ 
+@@ -1440,11 +1466,13 @@
+             return nullptr;
+         }
+ 
++        if (dt) { const int64_t t = ggml_time_us(); dt->t_build += t - dt_t; dt_t = t; }
+         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+             ret = GGML_STATUS_ALLOC_FAILED;
+             return nullptr;
+         }
++        if (dt) { const int64_t t = ggml_time_us(); dt->t_alloc += t - dt_t; dt_t = t; }
+ 
+         gf_res_prev_active = res;
+     }
+@@ -1454,12 +1482,15 @@
+         //const auto t_start_us = ggml_time_us();
+ 
+         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
++        if (dt) dt_t = ggml_time_us();
+         res->set_inputs(&ubatch);
++        if (dt) { const int64_t t = ggml_time_us(); dt->t_inputs += t - dt_t; dt_t = t; }
+ 
+         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+     }
+ 
+     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
++    if (dt) dt->t_compute += ggml_time_us() - dt_t;
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+         ret = status;
+@@ -1721,6 +1752,15 @@
+         return -1;
+     }
+ 
++    const bool    dt_on = decode_timing_on();
++    const int64_t dt_t0 = dt_on ? ggml_time_us() : 0;
++    decode_timing * dt  = dt_on ? &g_dt[(int) cparams.ctx_type & 7] : nullptr;
++    g_dt_cur = dt;
++    struct dt_end_t {
++        decode_timing * dt; int64_t t0; int type;
++        ~dt_end_t() { if (dt) { dt->t_total += ggml_time_us() - t0; if (++dt->n % 100 == 0) { decode_timing_log(type, *dt); *dt = decode_timing{}; } } }
++    } dt_end_ { dt, dt_t0, (int) cparams.ctx_type };
++
+     if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
+         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
+                 __func__, batch_inp.n_embd, batch_inp.n_embd_inp);
+@@ -1891,11 +1931,19 @@
+ 
+         // the expert cache: swaps whose bytes are staged land now, between
+         // graphs; decode tokens are counted toward the next adapt
++        if (dt && n_outputs_prev == 0) dt->t_pre += ggml_time_us() - dt_t0;   // the first ubatch: everything before it
++        const int64_t dt_s0 = dt ? ggml_time_us() : 0;
+         if (model.expert_cache) {
+             model.expert_cache->step(sched.get(), ubatch.n_tokens);
+         }
++        if (dt) dt->t_step += ggml_time_us() - dt_s0;
+ 
+         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
++        if (res && model.expert_cache) {
++            model.expert_cache->after_graph(sched.get(), ubatch.n_tokens);
++        }
++        const int64_t dt_p0 = dt ? ggml_time_us() : 0;
++        struct dt_post_t { decode_timing * dt; int64_t t0; ~dt_post_t() { if (dt) dt->t_post += ggml_time_us() - t0; } } dt_post_ { dt, dt_p0 };
+ 
+         if (!res) {
+             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp
@@ -5374,7 +5609,17 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
                             ggml_type_name(t[0]->type), ggml_type_name(t[1]->type), ggml_type_name(t[2]->type));
              continue;
          }
-@@ -242,6 +256,8 @@
+@@ -237,11 +251,18 @@
+     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+     set_slices  = (decltype(set_slices)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_set_tensor_slices");
+     get_tensors = (decltype(get_tensors)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_get_tensors");
++    get_tensors_async = (decltype(get_tensors_async)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_get_tensors_async");
++    {
++        const char * e = getenv("LLAMA_EXPERT_CACHE_ASYNC_IDS");
++        async_ids = get_tensors_async != nullptr && (e == nullptr || atoi(e) != 0);
++    }
+     get_slices  = (decltype(get_slices)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_get_tensor_slices");
+     exchange    = (decltype(exchange)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_exchange_slices");
      auto set_alloc_host = (void (*)(bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_set_alloc_host");
      auto reserve_gather = (void (*)(ggml_backend_dev_t, size_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_reserve_gather");
      auto pair_bank      = (void (*)(const ggml_tensor *, const ggml_tensor *, int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_pair_bank");
@@ -5383,7 +5628,7 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
      if (!set_slices || !get_tensors || !get_slices || !exchange || !set_alloc_host || !reserve_gather || !pair_bank) {
          LLAMA_LOG_WARN("%s: %s lacks the expert cache's entry points (contrib/llama.cpp patch 0021)\n", __func__, ggml_backend_dev_name(dev));
          return false;
-@@ -388,6 +404,14 @@
+@@ -388,6 +409,14 @@
              }
          }
      }
@@ -5398,7 +5643,40 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
  
      // fill: each tensor whole (a converted layout is set up by its first write)
      const int64_t t_fill = ggml_time_us();
-@@ -479,6 +503,19 @@
+@@ -461,15 +490,24 @@
+             return;   // not the graph that just ran, or the ids not on the card
+         }
+     }
+-    std::vector<const ggml_tensor *> ts;
+-    std::vector<std::vector<int32_t>> ids(layers.size());
+-    std::vector<void *> dsts;
+-    for (size_t i = 0; i < layers.size(); ++i) {
+-        ids[i].resize(ggml_nelements(layers[i].ids_out));
+-        ts.push_back(layers[i].ids_out);
+-        dsts.push_back(ids[i].data());
++    std::vector<std::vector<int32_t>> ids_read;
++    if (ids_pending == n_tokens && ids_host.size() == layers.size()) {
++        // read behind the graph by after_graph: complete once the queue is
++        ggml_backend_sched_synchronize(owner_sched);
++        ids_pending = 0;
++    } else {
++        ids_pending = 0;
++        std::vector<const ggml_tensor *> ts;
++        std::vector<void *> dsts;
++        ids_read.resize(layers.size());
++        for (size_t i = 0; i < layers.size(); ++i) {
++            ids_read[i].resize(ggml_nelements(layers[i].ids_out));
++            ts.push_back(layers[i].ids_out);
++            dsts.push_back(ids_read[i].data());
++        }
++        get_tensors(ts.data(), dsts.data(), (int) ts.size());
+     }
+-    get_tensors(ts.data(), dsts.data(), (int) ts.size());
++    std::vector<std::vector<int32_t>> & ids = ids_read.empty() ? ids_host : ids_read;
+     for (size_t i = 0; i < layers.size(); ++i) {
+         auto & L = layers[i];
+         for (int32_t e : ids[i]) {
+@@ -479,6 +517,19 @@
              L.usage[e] += 1.0f;
              (L.slot_of[e] >= 0 ? n_hits : n_misses) += 1;
          }
@@ -5418,10 +5696,66 @@ diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
      }
  }
  
+@@ -590,6 +641,32 @@
+     }
+ }
+ 
++void llama_expert_cache::after_graph(ggml_backend_sched_t sched, uint32_t n_tokens) {
++    if (ids_pending != 0 && owner_sched != nullptr) {
++        ggml_backend_sched_synchronize(owner_sched);   // an unconsumed read still targets ids_host
++    }
++    ids_pending = 0;
++    if (!async_ids || sched != owner_sched || n_tokens == 0 || n_tokens > decode_max) {
++        return;
++    }
++    for (auto & L : layers) {
++        if (L.ids_out == nullptr || L.ids_out->buffer == nullptr || L.ids_out->ne[1] != (int64_t) n_tokens ||
++            ggml_backend_buffer_get_type(L.ids_out->buffer) != ggml_backend_buffer_get_type(L.slot[0]->buffer)) {
++            return;
++        }
++    }
++    ids_host.resize(layers.size());
++    std::vector<const ggml_tensor *> ts;
++    std::vector<void *> dsts;
++    for (size_t i = 0; i < layers.size(); ++i) {
++        ids_host[i].resize(ggml_nelements(layers[i].ids_out));
++        ts.push_back(layers[i].ids_out);
++        dsts.push_back(ids_host[i].data());
++    }
++    get_tensors_async(ts.data(), dsts.data(), (int) ts.size());
++    ids_pending = n_tokens;
++}
++
+ llama_expert_cache_stats llama_expert_cache::stats() const {
+     llama_expert_cache_stats s;
+     s.decode_hits   = n_hits;
 diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
 --- a/src/llama-expert-cache.h
 +++ b/src/llama-expert-cache.h
-@@ -121,6 +121,8 @@
+@@ -84,6 +84,11 @@
+     // decode tokens, plans and enqueues the swaps.
+     void step(ggml_backend_sched_t sched, uint32_t n_tokens);
+ 
++    // Right after a decode graph is enqueued: its routed ids are read behind
++    // it (no wait), for step() to count once the host has synchronized
++    // (LLAMA_EXPERT_CACHE_ASYNC_IDS=0: step() reads them with a wait)
++    void after_graph(ggml_backend_sched_t sched, uint32_t n_tokens);
++
+     llama_expert_cache_stats stats() const;
+ 
+     std::vector<llama_expert_cache_layer> layers;
+@@ -114,6 +119,10 @@
+     std::vector<ggml_backend_buffer_t> bufs;
+     void (*set_slices)(ggml_tensor *, const void *, int64_t, int64_t) = nullptr;
+     void (*get_tensors)(const ggml_tensor * const *, void * const *, int) = nullptr;
++    void (*get_tensors_async)(const ggml_tensor * const *, void * const *, int) = nullptr;
++    std::vector<std::vector<int32_t>> ids_host;   // after_graph's reads, per layer
++    uint32_t           ids_pending = 0;   // their graph's tokens; 0: none queued
++    bool               async_ids = true;
+     void (*get_slices)(const ggml_tensor *, void *, int64_t, int64_t) = nullptr;
+     void (*exchange)(ggml_tensor *, int64_t, ggml_tensor *, int64_t) = nullptr;
+ 
+@@ -121,6 +130,8 @@
      ggml_backend_sched_t owner_sched = nullptr;   // the context that drives the cache
      uint32_t           last_n = 0;      // the previous ubatch's tokens
      uint64_t           n_swaps = 0, n_adapts = 0, n_apply_us = 0, n_hits = 0, n_misses = 0;

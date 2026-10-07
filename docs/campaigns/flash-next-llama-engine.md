@@ -615,6 +615,20 @@ text, decoded at 37.0 t/s (verify 14.42 -> 12.16 s, the same drafts): the
 misses cost ~11 ms a round on this text. Strata's profile placement does not
 adapt, so that run is no comparison; it prices the slot count.
 
+**What a round's host does now** (`LLAMA_DECODE_TIMING=1`, per decode,
+steady state, the normal build, `measured-here`): a verify reuses its graph
+every time and takes 66.6-68.2 ms, of which the host enqueues for 20.0 ms
+(~5.9 us a kernel, overlapping the GPU's ~60 ms) and counts the previous
+step's routing (the expert cache's step) for 0.72 ms; a draft decode takes
+2.9 ms (0.7 enqueue, the rest its GPU work), its graph rebuilt in 86 of 100
+calls at ~0.08 ms. The cache's step read the 48 layers' routed ids with a
+wait at the start of the next verify (1.17 ms); the ids are now read behind
+the graph that routes them and counted after the host's sync
+(`LLAMA_EXPERT_CACHE_ASYNC_IDS=0` restores the wait): 32.8 -> 33.4 / 32.9
+t/s, the long text identical, within the spread. Per round ~75 ms against
+~64.5 ms of kernels: ~10 ms of host time remains, ~6.5 of it inside the
+verify. `GGML_SCHED_TIMING=1` times the scheduler's splits per context.
+
 ### Stage 4 (closed 2026-10-07, not built) — Strata's CPU share of the misses
 
 **Retracted premise.** The reference measured here does not use a CPU share
