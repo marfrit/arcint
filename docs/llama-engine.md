@@ -124,29 +124,46 @@ replaced it at no measured decode cost on either card.
 
 ## Flash-Next
 
-`qwen4exp` with `--llama-cpu-moe N`: the first N layers' experts stay in host
-memory, memory-mapped, computed by llama.cpp's CPU backend; the IQ kernels
-of patch 0002 run the rest on the card. Served on the B60 with 16 expert
-layers on the card: the needle answered, 49.2 t/s prefill at 20k, 10.9 t/s
-decode (`docs/campaigns/flash-next-llama-engine.md`).
+Qwen3.8-Flash-Next (`qwen4exp`) serves on the B60 from ISTA-DASLab's IQ2_XS
+GGUF (`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`, revision `ed59f920`),
+with every expert computed on the card and its MTP layer drafting:
+
+    arcint --engine llama --gguf Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+        --device GPU.0 --n-ctx 32768 --llama-cpu-moe 48 \
+        --llama-expert-cache 14500 --llama-expert-profile expert-profile.bin \
+        --llama-mtp 2 --llama-mtp-gguf mtp-flash-next-q8e4n.gguf
+
+- `expert-profile.bin` is Strata's decode profile (`data/expert-profile.bin`
+  in github.com/Niko1221/Strata, MIT; it fills the slots in rank order).
+- `mtp-flash-next-q8e4n.gguf` is built by `tools/flash_next_mtp_gguf.sh`
+  from the checkpoint's 31 `mtp.*` tensors (the GGUFs carry no MTP layer).
+
+Measured on the B60 (`measured-here`, 2026-10-07, the 20,045-token needle,
+then the 500-token long answer, greedy, thinking off): prefill 421-431 t/s,
+decode 33.0-34.8 t/s with 72-74 % of the drafts accepted; the capital, the
+needle and the long answer right. Strata's own engine (its SYCL port, 37.2-37.8
+t/s decode, 620 t/s prefill on this card) is the reference
+(`docs/campaigns/strata-sycl-b60.md`). The KL of IQ2_XS against a reference
+is owed (the existing CPU reference is the UD-Q3_K_XL file).
 
 **The expert cache** (`--llama-expert-cache MIB --llama-expert-profile FILE`
-with `--llama-cpu-moe 48`; `contrib/llama.cpp` 0021, 2026-10-06). Every
-expert runs on the card. The hot ones sit in slots in VRAM, filled from
-Strata's decode profile and swapped as decode's usage moves. The rest sit in a
-bank in USM host memory, and the routed ones are gathered over the link before
-their kernels run. On the B60 with 12,800 MiB of slots
-(`measured-here`, the same window):
-- the 20,045-token needle prefills at 235.0 t/s with one ubatch per
-  2,048-token chunk (149.6 with 512-token ubatches; 258.4 with
-  `--prefill-chunk 4096`), against 81.9 with 16 expert layers on the card,
-  and is answered;
-- decode 12.2-12.3 t/s, against 10.5-12.4; 75 % of decode's routed experts
-  on the card after adaptation;
-- KL against the CPU reference +0.0004 nats, same top-1 -0.15 points.
+with `--llama-cpu-moe 48`; `contrib/llama.cpp` 0021 and 0022). The hot
+experts sit in slots in VRAM, filled from the profile and swapped as decode's
+usage moves; the rest sit in a bank in USM host memory (pinned: the host needs
+its size free beside the page cache). A decode step runs one branch: the
+matvec reads a missed expert from the bank by pointer over the link, as
+Strata's kernels read its pinned mirror; prefill gathers the routed bank
+experts into a card-side mirror first. Its constants take
+`LLAMA_EXPERT_CACHE_{ADAPT_EVERY,MAX_SWAPS,MIN_GAIN,MIN_USAGE,DECAY}`.
 
-The bank takes 36.5 GiB of host memory, pinned: the host needs that much
-free beside the page cache.
+What 0022 adds for it (`contrib/llama.cpp/README.md`): the low-bit IQ and
+Q2_0 kernels in planes, F16/BF16 products on XMX, and the QSA indexer's ops
+on the card (TOP_K, F32<->I32 casts, F16 FILL/REPEAT/SET_ROWS) -- without
+them the scheduler ran four CPU islands per attention layer, each draining
+the queue (decode 32.0 -> 33.0-34.2, prefill 381 -> 422).
+
+The UD-Q3_K_XL file (52 GiB of experts) serves the same way at 235 t/s
+prefill and 12-13 t/s decode without MTP (2026-10-06).
 
 ## MTP (`--llama-mtp N`)
 
@@ -458,9 +475,8 @@ T=0 cell is one case flipping with the batch layout.
 
 ## Not yet on this engine
 
-Flash-Next's MTP (`qwen4exp` is in llama.cpp at the pin), conversation
-state kept across a restart (P6; in process it is the context checkpoints
-above) and GPU prefill from the pinned bank (P5) are open.
+Conversation state kept across a restart (P6; in process it is the context
+checkpoints above) and GPU prefill from the pinned bank (P5) are open.
 
 Open observation: on the B60, xe logged GPU page faults with compute-engine
 resets in windows where `test-backend-ops` ran (2026-10-03); a run of every

@@ -1,3 +1,15 @@
+arcint (0.6.0-1) trixie; urgency=medium
+
+  * 0.6.0: Qwen3.8-Flash-Next on the libllama engine: ISTA-DASLab's IQ2_XS
+    GGUF with every expert on the B60 (an expert cache: VRAM slots and a USM
+    bank in host memory), MTP from a separate MTP-only GGUF, and llama.cpp
+    patch 0022's Intel kernels. 422 t/s prefill at 20k tokens, 33-35 t/s
+    decode with MTP 2. The residents gain from 0022: the agent 35.5 -> 38.3
+    t/s, the coder 40.5 -> 43.3 t/s. Runtime floor unchanged at
+    marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Wed, 07 Oct 2026 12:00:00 +0200
+
 arcint (0.5.12-1) trixie; urgency=medium
 
   * 0.5.12: llama.cpp server's context checkpoints on the libllama engine

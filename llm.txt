@@ -13,13 +13,15 @@
 
 ## Status
 
-Release 0.5.12 (2026-10-05). Runtime dependency: marfrit-openvino +p25, the
+Release 0.6.0 (2026-10-07): Qwen3.8-Flash-Next on the libllama engine
+(IQ2_XS, every expert on the B60 through an expert cache, MTP; 422 t/s
+prefill at 20k, 33-35 t/s decode; docs/llama-engine.md). Runtime dependency: marfrit-openvino +p25, the
 pinned OpenVINO nightly 71640275 with patches 0003-0074
 (contrib/packaging/marfrit-openvino/patches/); +p27 (0076-0077) for the
 Flash-Next tier's opt-in switches MOE_CPU_TIER_ADAPTIVE and MOE_DOORBELL.
 Two engines: OpenVINO (default; Flash-Next, the coder's way back) and
 libllama (the agent and, since 2026-10-05, the coder service; --engine llama --gguf,
-llama.cpp bed0a85 with contrib/llama.cpp/patches 0001-0017, ggml's OpenCL
+llama.cpp bed0a85 with contrib/llama.cpp/patches 0001-0022, ggml's OpenCL
 backend). The libllama engine decodes faster with the GGUF's MTP head.
 --llama-kv q8_0 (or q8_0:q4_0) quantizes its KV cache on arcint's
 attention kernels (0015). With MTP and an 8:8 cache the dense model serves
@@ -58,6 +60,12 @@ multi-draft MTP for Flash-Next; prefill on the GPU.
 - Qwen3.6-35B-A3B, qwen3.6-35b-a3b-native-d40packed-u8 (native IQ2_S /
   IQ3_XXS expert blocks, u8 dense projections), all resident on the A770,
   u8 KV: prefill ~960 t/s at 4096 tokens, decode ~28 t/s.
+- Qwen3.8-Flash-Next, IQ2_XS GGUF (ISTA-DASLab GSQ-RCO) on the libllama
+  engine, B60: --llama-cpu-moe 48 --llama-expert-cache 14500
+  --llama-expert-profile (Strata's) --llama-mtp 2 --llama-mtp-gguf
+  (tools/flash_next_mtp_gguf.sh). 20045-token needle: prefill 422 t/s;
+  500-token answer: decode 33.0-34.8 t/s, 72-74 % of drafts accepted. KL
+  against a reference owed.
 - Qwen3.8-Flash-Next, qwen3.8-flash-next-d48q8 on the B60: --offload-ratio
   75 --moe-cpu-tier, census seed of 128 experts per layer, 30 GiB host
   expert bank, u8 KV, chunk 2048. At a 20085-token prompt: prefill 63.1 t/s,

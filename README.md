@@ -29,14 +29,15 @@ expert engines [Strata](https://github.com/Niko1221/Strata) and
 | Qwen3.8-27B | `qwen3_5` dense, 64 layers, MTP head | Q4_K_M GGUF on the libllama engine (production since 0.5.6); int4 IR, or a GGUF on that IR | B60 (production) |
 | Qwen3.6-35B-A3B | `qwen3_5_moe`, 40 layers, 256 experts | the checkpoint's own IQ2_S/IQ3_XXS expert blocks, all resident | A770 |
 | Cydonia 24B v4.3 (Mistral Small 3.2 finetune) | `llama`, 40 layers, all full attention, 32 query heads on 8, head size 128 | imatrix Q4_K_M GGUF on the libllama engine, q8_0 KV, 98,304 ctx | B60, on demand (creative writing, since 0.5.8) |
-| Qwen3.8-Flash-Next | `qwen4_exp`, 48 layers, 512 experts (10 routed + 1 shared), n-gram embedding table | the checkpoint's own expert blocks, Q8_0 dense projections, experts split between card and a host RAM bank | B60 |
+| Qwen3.8-Flash-Next | `qwen4_exp`, 48 layers, 512 experts (10 routed + 1 shared), n-gram embedding table | ISTA-DASLab's IQ2_XS GGUF on the libllama engine, every expert on the card through an expert cache, MTP (since 0.6.0); or the checkpoint's own expert blocks on the OpenVINO engine, experts split between card and a host RAM bank | B60 |
 
 ## Two engines
 
 arcint has two inference backends behind the same HTTP surface, sampler,
 lanes and chat templates. Both services run on the second: the agent from
-0.5.6, the coder from 2026-10-05. The first carries Flash-Next and stays as
-the coder's way back.
+0.5.6, the coder from 2026-10-05, and Flash-Next from 0.6.0. The first
+carries Flash-Next's full-depth checkpoint blocks and stays as the coder's
+way back.
 
 **OpenVINO (the default).** The model is an OpenVINO IR, or a GGUF fed
 through it. Runs on the patched `marfrit-openvino` runtime. arcint owns the
@@ -108,8 +109,10 @@ Production (operator, 2026-10-04):
     reuses the prefix it holds, and llama.cpp's context checkpoints let a
     hybrid model resume a follow-up or an edited message
     (`--llama-checkpoints`).
-- Flash-Next at speed: experts not on the card run on llama.cpp's CPU
-  backend (`--llama-cpu-moe`).
+- Flash-Next (since 0.6.0): an expert cache keeps the hot experts in VRAM
+  slots and the rest in a USM bank in host memory, every expert computed on
+  the card (`--llama-expert-cache`, `--llama-expert-profile`); the
+  checkpoint's MTP layer drafts from a separate GGUF (`--llama-mtp-gguf`).
 
 `docs/llama-engine.md` has the details.
 
@@ -152,6 +155,12 @@ prompts through arcint):
 projections, all resident on the A770, u8 KV: prefill about 960 t/s at 4,096
 tokens, decode about 28 t/s (`qwen3.6-35b-a3b-native-d40packed-u8`, plugin
 patches 0059–0067).
+
+**Qwen3.8-Flash-Next**, IQ2_XS (ISTA-DASLab GSQ-RCO) on the libllama engine,
+B60, 14,500 MiB of expert slots, MTP 2: the 20,045-token needle prefills at
+422 t/s, the 500-token long answer decodes at 33.0-34.8 t/s, the needle
+answered (0.6.0; Strata's own engine: 620 / 37.2-37.8 t/s on the same card).
+The KL of IQ2_XS against a reference is owed.
 
 **Qwen3.8-Flash-Next**, full depth (`qwen3.8-flash-next-d48q8`) on the B60:
 `--offload-ratio 75 --moe-cpu-tier`, a 128-expert-per-layer census seed, a
