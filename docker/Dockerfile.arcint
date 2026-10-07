@@ -1,0 +1,173 @@
+# syntax=docker/dockerfile:1
+# ---------------------------------------------------------------------------
+# Tier 2: the arcint engine image -- BOTH engines (OpenVINO and libllama).
+#
+# FROM the tier-1 patched-OpenVINO base for both stages: the base carries the
+# CMake package, headers and libopenvino_tokenizers.so, so the engine build
+# needs only a compiler and the OpenCL dev packages on top of it.
+#
+# The CMake flags are byte-for-byte contrib/packaging/arcint/build-deb.sh --
+# the image and the .deb consume the same recipe, neither forks the other.
+#
+# Design, caveats and the CPU-baseline rationale: docs/docker.md.
+#
+# Build from the REPO ROOT (needs the tier-1 image built or pulled):
+#   docker build -t arcint:dev \
+#     --build-arg OV_BASE=arcint-ov:2026.4.0-ov71640275-marfrit-p27 \
+#     -f docker/Dockerfile.arcint .
+# ---------------------------------------------------------------------------
+
+ARG OV_BASE=arcint-ov:2026.4.0-ov71640275-marfrit-p27
+
+# --- builder ---------------------------------------------------------------
+FROM ${OV_BASE} AS builder
+
+# opencl-headers + ocl-icd-devel: the libllama engine's `find_package(OpenCL
+# REQUIRED)` (CMakeLists.txt:166) and the deb recipe's own gate, the presence
+# of /usr/include/CL/cl.h. python3 (already in the base) is what embeds the
+# OpenCL kernels; git is what applies the patch series.
+RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
+      gcc gcc-c++ cmake git which binutils curl python3 \
+      opencl-headers ocl-icd-devel \
+  && dnf clean all && rm -rf /var/cache/dnf/*
+RUN [ -f /usr/include/CL/cl.h ] || { echo "opencl-headers did not provide /usr/include/CL/cl.h" >&2; exit 1; }
+
+ARG ARCINT_GIT_SHA=unknown
+ARG OV_PREFIX=/usr/lib/marfrit-openvino
+
+WORKDIR /src
+COPY . /src/arcint
+
+# The second engine: llama.cpp at the pin, fetched as a GitHub tarball of the
+# commit and checked by sha256, then contrib/llama.cpp/patches/*.patch applied
+# in order -- the same way build-deb.sh does it. A patch that does not apply
+# to the pin is a bug in contrib/llama.cpp/patches, not a reason to move the
+# pin. The pin and checksum are gated against the recipe below, so the image
+# cannot claim an engine the recipe does not build.
+ARG LLAMA_COMMIT=bed0a856606ee4a24a164066f73d2379447033f5
+ARG LLAMA_TARBALL_SHA256=0984123c33b7e959f8003f9169e9109897112d9448b681737813911083eca4cc
+ARG LLAMA_URL=https://github.com/ggml-org/llama.cpp/archive
+COPY contrib/packaging/arcint/build-deb.sh /opt/recipe-build-deb.sh
+RUN set -eu; \
+    r_commit=$(sed -n 's/^LLAMA_COMMIT=\([0-9a-f]\{40\}\).*/\1/p' /opt/recipe-build-deb.sh | head -1); \
+    r_sha=$(sed -n 's/^LLAMA_TARBALL_SHA256=\([0-9a-f]\{64\}\).*/\1/p' /opt/recipe-build-deb.sh | head -1); \
+    [ -n "$r_commit" ] && [ -n "$r_sha" ] \
+      || { echo "could not read LLAMA_COMMIT/LLAMA_TARBALL_SHA256 from build-deb.sh" >&2; exit 1; }; \
+    [ "${LLAMA_COMMIT}" = "$r_commit" ] \
+      || { echo "LLAMA_COMMIT=${LLAMA_COMMIT} != ${r_commit} in contrib/packaging/arcint/build-deb.sh" >&2; exit 1; }; \
+    [ "${LLAMA_TARBALL_SHA256}" = "$r_sha" ] \
+      || { echo "LLAMA_TARBALL_SHA256 != the recipe's -- the image would build an unverified llama.cpp" >&2; exit 1; }; \
+    echo "tier 2 agrees with the deb recipe: llama.cpp ${r_commit:0:12}"
+
+RUN set -eu; mkdir -p /src/llama && cd /src/llama; \
+    curl --connect-timeout 10 --max-time 600 --retry 3 --retry-delay 5 \
+         -sSLfo llama.tar.gz "${LLAMA_URL}/${LLAMA_COMMIT}.tar.gz"; \
+    echo "${LLAMA_TARBALL_SHA256}  llama.tar.gz" | sha256sum -c; \
+    tar xzf llama.tar.gz; rm llama.tar.gz; \
+    cd "llama.cpp-${LLAMA_COMMIT}"; \
+    shopt -s nullglob; \
+    for p in /src/arcint/contrib/llama.cpp/patches/*.patch; do \
+      [ -e "$p" ] || { echo "no contrib/llama.cpp/patches in the tree" >&2; exit 1; }; \
+      echo "applying $(basename "$p")"; \
+      git apply --whitespace=nowarn "$p" \
+        || { echo "patch does not apply to the pin: $p" >&2; exit 1; }; \
+    done; \
+    echo "llama.cpp patched: $(ls /src/arcint/contrib/llama.cpp/patches/*.patch | wc -l) patches"
+
+# The gates are the product (build-deb.sh's words): the device-free unit
+# ladder runs here on every image build — no card needed. --no-tests=error
+# turns "ctest found nothing to run" into a build failure.
+RUN cmake -S /src/arcint -B /src/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DARCINT_OPENVINO=ON \
+      -DARCINT_LLAMA=ON \
+      -DARCINT_LLAMA_DIR="/src/llama/llama.cpp-${LLAMA_COMMIT}" \
+      -DGGML_NATIVE=OFF \
+      -DARCINT_WERROR=ON \
+      -DARCINT_TESTS=ON \
+      -DARCINT_GIT_SHA="${ARCINT_GIT_SHA}" \
+      -DOpenVINO_DIR="${OV_PREFIX}/openvino/cmake" \
+      -DARCINT_TOKENIZERS_SO="${OV_PREFIX}/openvino_tokenizers/lib/libopenvino_tokenizers.so" \
+      -DCMAKE_INSTALL_PREFIX=/usr \
+      -DCMAKE_INSTALL_RPATH="${OV_PREFIX}/openvino/libs" \
+      -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+      -DCMAKE_SKIP_BUILD_RPATH=OFF \
+  && cmake --build /src/build -j"$(nproc)" \
+  && ctest --test-dir /src/build --output-on-failure --no-tests=error -L unit
+
+RUN DESTDIR=/install cmake --install /src/build > /dev/null \
+  && [ -x /install/usr/bin/arcint ] || { echo "MISSING: /usr/bin/arcint" >&2; exit 1; }
+
+# RPATH probe (from build-deb.sh — the same SIGPIPE-safe shape).
+RUN RP=$(objdump -x /install/usr/bin/arcint | awk '/RUNPATH|RPATH/ && !seen {seen=1; print $2}'); \
+    case "$RP" in *"${OV_PREFIX}/openvino/libs"*) ;; \
+      *) echo "RPATH does not point at ${OV_PREFIX}/openvino/libs (is: '$RP')" >&2; exit 1 ;; esac
+RUN LDD_OUT=$(ldd /install/usr/bin/arcint); \
+    case "$LDD_OUT" in *"not found"*) echo "unresolved libraries:" >&2; printf '%s\n' "$LDD_OUT" >&2; exit 1 ;; esac; \
+    case "$LDD_OUT" in *"${OV_PREFIX}/openvino/libs/libopenvino.so"*) ;; \
+      *) echo "libopenvino not loading from ${OV_PREFIX}" >&2; printf '%s\n' "$LDD_OUT" >&2; exit 1 ;; esac
+
+# The base runtime must be the level this engine was built against -- checking
+# at build time beats finding out at load time that the base was an older
+# tier-1 tag. The level string is a usable identity (docs/docker.md, Tagging).
+ARG OV_LEVEL=marfrit-p27
+RUN strings -a ${OV_PREFIX}/openvino/libs/libopenvino.so.2640 \
+      | grep -F -- "${OV_LEVEL}" > /dev/null \
+  || { echo "base runtime is not ${OV_LEVEL} — wrong tier-1 base image?" >&2; exit 1; }
+
+# Both engines must be in the binary. The `--help` text advertises
+# `--engine llama` whether or not the backend was compiled in, so check the
+# linked artifacts instead: the libllama symbols, and -- with
+# GGML_OPENCL_EMBED_KERNELS=ON (CMakeLists.txt:154) -- one of the Intel
+# kernel names this repo's own patches introduce, which stock llama.cpp
+# cannot produce.
+RUN nm -C /install/usr/bin/arcint 2>/dev/null | grep -qE '\bllama_(backend_init|init_from_model|model_load_from_file)\b' \
+  || { echo "binary carries no libllama symbols -- ARCINT_LLAMA did not link" >&2; exit 1; };
+RUN strings -a /install/usr/bin/arcint | grep -qF 'mul_mv_kq_q8_1' \
+  || { echo "the patched Intel K-quant kernels are not embedded -- contrib/llama.cpp/patches did not reach the build" >&2; exit 1; }; \
+    echo "both engines linked: $(nm -C /install/usr/bin/arcint | grep -cE '\bllama_[a-z_]+\b') libllama symbols, patched OpenCL kernels embedded"
+
+# Portability gate: assert the x86-64-v3 baseline rather than trusting
+# -DGGML_NATIVE=OFF. zmm registers mean AVX-512 got in; their total absence
+# means the build fell back to SSE. Rationale: docs/docker.md, CPU baseline.
+RUN if objdump -d /install/usr/bin/arcint 2>/dev/null | grep -qE '%zmm[0-9]+'; then \
+      echo "AVX-512 (zmm) in the binary -- this image SIGILLs on pre-AVX512 CPUs (Zen <=3, pre-Skylake Xeon). GGML_NATIVE did not take." >&2; \
+      exit 1; \
+    fi; \
+    if ! objdump -d /install/usr/bin/arcint 2>/dev/null | grep -qE '%ymm[0-9]+'; then \
+      echo "no AVX2 (ymm) in the binary either -- the build fell back to the SSE baseline, not x86-64-v3. GGML_NATIVE=OFF should leave INS_ENB=ON." >&2; \
+      exit 1; \
+    fi; \
+    echo "portability gate: no AVX-512 (zmm), AVX2 (ymm) present -- x86-64-v3 baseline confirmed"
+
+# --- final -----------------------------------------------------------------
+FROM ${OV_BASE}
+
+COPY --from=builder /install/usr /usr
+
+# The builder resolved everything with a compiler installed; the image the
+# user runs has none. Resolve here, where it counts (a fresh trixie install
+# of the .deb lacked libgomp exactly this way, fixed in arcint 0.6.0-2).
+RUN LDD_OUT=$(ldd /usr/bin/arcint); \
+    case "$LDD_OUT" in *"not found"*) echo "unresolved in the final image:" >&2; printf '%s\n' "$LDD_OUT" >&2; exit 1 ;; esac; \
+    /usr/bin/arcint --version
+
+# The stub smoke test needs no GPU: the engine serves its HTTP surface
+# without a model. If /props answers, the binary, its RPATH and the
+# tokenizer .so all resolve inside the image.
+RUN /usr/bin/arcint --stub --port 8090 & STUB=$!; \
+    sleep 2; \
+    curl -fsS http://127.0.0.1:8090/props > /dev/null \
+      || { echo "stub smoke test: /props did not answer" >&2; kill $STUB 2>/dev/null; exit 1; }; \
+    kill $STUB 2>/dev/null; wait $STUB 2>/dev/null || true
+
+# LAN only: no auth, permissive CORS, no TLS (DEVELOPMENT.md). Put a
+# reverse proxy in front; do not expose this port to the internet.
+EXPOSE 8080
+
+ENV ARCINT_HEALTH_URL=http://127.0.0.1:8080/props
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5m --retries=3 \
+  CMD curl -fsS "$ARCINT_HEALTH_URL" > /dev/null || exit 1
+
+ENTRYPOINT ["/usr/bin/arcint"]
+CMD ["--help"]

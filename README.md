@@ -262,6 +262,13 @@ anywhere; the directory
 contains everything needed to build the same thing, and it is the shortest
 path to reproducing a number.
 
+**Containers.** The same two halves are available as pull-and-run images: a
+tier-1 base carrying the patched OpenVINO runtime, and a thin tier-2 engine
+image on top, built with both engines. `docker/Dockerfile.openvino-patched`
+and `docker/Dockerfile.arcint`, with
+`.github/workflows/build-toolbox.yml` to build and publish both. See
+`docs/docker.md` for the run recipe and the tagging scheme.
+
 ## Supported model formats
 
 - **An OpenVINO IR directory**: `openvino_language_model.{xml,bin}`,

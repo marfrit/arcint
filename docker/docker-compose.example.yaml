@@ -1,0 +1,59 @@
+# Run recipe for the arcint toolbox, in compose form.
+#
+# Mirrors kyuz0's device recipe: /dev/dri passthrough + video/render groups
+# + seccomp unconfined. Models are mounted read-only, never baked in.
+#
+# The command line is the coder service as it runs on the A770 since
+# 2026-10-05: a GGUF on the libllama engine with its MTP head (docs/llama-engine.md).
+# For an OpenVINO IR instead, replace it with --model <ir-dir> --model-id <id>
+# (docs/docker.md, Running).
+services:
+  arcint:
+    image: ghcr.io/<OWNER>/arcint:edge          # your registry + namespace
+    restart: unless-stopped
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      # OpenVINO IR model directories + any GGUF files, read-only.
+      - ${MODELS_ROOT:-/models}:/models:ro
+      # The kernel caches (ggml-opencl's programs; the OpenVINO engine's blob
+      # cache with --cache-dir). Writable, persistent: a cold cache turns every
+      # start into a recompile.
+      - arcint-cache:/var/cache/arcint
+    ports:
+      - "8080:8080"          # LAN only — no auth, no TLS (DEVELOPMENT.md)
+    environment:
+      # Keep the healthcheck pointed at the port you actually serve on.
+      ARCINT_HEALTH_URL: http://127.0.0.1:8080/props
+      # ggml-opencl's compiled-program cache; its default is under $HOME,
+      # which does not survive the container.
+      GGML_OPENCL_KERNEL_CACHE_DIR: /var/cache/arcint/opencl
+    command:
+      - --engine
+      - llama
+      - --gguf
+      - /models/gguf/<coder>.gguf
+      - --served-model-name
+      - qwen3.6-coder
+      - --device
+      - GPU.0
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --n-ctx
+      - "98304"
+      - --llama-mtp
+      - "4"
+      - --llama-kv
+      - q8_0:q4_0
+      - --queue-timeout
+      - "30"
+
+volumes:
+  arcint-cache:
