@@ -1,0 +1,50 @@
+# arcint-writer — Cydonia 24B v4.3 (a Mistral Small 3.2 finetune) for creative
+# writing on the 24 GB card, on demand.
+#
+# Starting it stops the agent (same card, Conflicts=). No tool calls, no
+# speculation. The libllama engine with contrib/llama.cpp 0017 (head size 128
+# on XMX).
+#
+# Measured on the Arc Pro B60 (2026-10-04):
+# - --n-ctx 98304 with q8_0 KV loads;
+# - prefill 1,407 t/s at 512 tokens, 1,225 at 4,096, 451 at 16k depth;
+# - decode 22-25 t/s.
+# The sampling defaults are community practice for Mistral Small finetunes;
+# the model card names none: temperature 1.0, min-p 0.05, top-p and top-k off,
+# repetition penalty 1.05. A request's own fields win.
+
+[Unit]
+Description=arcint-writer — Cydonia 24B v4.3 on libllama, GPU.0, :8088, on demand
+Documentation=https://github.com/marfrit/arcint
+After=default.target
+Conflicts=arcint-agent.service arcint-flashnext.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/arcint \
+    --engine llama \
+    --gguf /models/gguf/TheDrummer_Cydonia-24B-v4.3-Q4_K_M.gguf \
+    --served-model-name cydonia-24b \
+    --device GPU.0 \
+    --host 0.0.0.0 \
+    --port 8088 \
+    --n-ctx 98304 \
+    --llama-kv q8_0 \
+    --temp 1.0 \
+    --min-p 0.05 \
+    --top-p 1.0 \
+    --top-k 0 \
+    --repetition-penalty 1.05 \
+    --queue-timeout 30
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=20min
+TimeoutStopSec=60s
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target

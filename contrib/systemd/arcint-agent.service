@@ -1,35 +1,44 @@
-# arcint-agent — Qwen3.8-27B dense + MTP on the 24 GB card, the agent endpoint.
+# arcint-agent — Qwen3.8-27B dense + MTP on the libllama engine, the 24 GB card.
 #
-# The dense 27B on GPU.0 (the 24 GB card). Weights+graph 13.4 GiB of 22.71
-# usable, the reservation admitting 151,552 tokens at u8:i4 KV with an 8 GiB
-# prefix cache and MTP on. Acceptance task 10/10 greedy, tool probe 3/3.
+# The agent endpoint since 0.5.6 (2026-10-04). Before it, the same model on the
+# OpenVINO engine: arcint-agent-openvino.service.
 #
-# --n-ctx (0.3.0+, M7 fit pass): the fit verifies an explicit depth against
-# a measured reservation at start and refuses loudly if the card cannot hold
-# it; the prefix cache's reserve pages are trimmed before any refusal.
+# Measured on the Arc Pro B60 with exactly these flags (arcint 0.5.6,
+# contrib/llama.cpp 0015 for the quantized KV):
+# - 131,072 tokens load, VRAM peak 23.06 of 25.7 GB. With f16 KV and MTP this
+#   context does not load.
+# - A 128,133-token prompt prefilled in 772 s (166 t/s); decode there 7.5 t/s.
+# - Decode 47.1 t/s on a fresh context.
+# - Acceptance task 10/10 (temperature 0).
+# - KL 0.003966 against the reference (f16 KV: 0.004034).
+# The price against the OpenVINO agent: no shared prefix cache, prefill 896
+# instead of 1,141 t/s at 4k.
+#
+# --llama-mtp-vocab: the draft head scores a 40,960-token vocabulary
+# (HyperQwen's, docs/campaigns/research-hyperqwen.md) instead of the full one.
 
 [Unit]
-Description=arcint-agent — Qwen3.8-27B dense + MTP on OpenVINO, GPU.0, :8087
+Description=arcint-agent — Qwen3.8-27B dense + MTP on libllama (q8_0 KV, 131072 tokens), GPU.0, :8087
 Documentation=https://github.com/marfrit/arcint
 After=default.target
+# One card, one resident model: the units that want the same card
+Conflicts=arcint-writer.service arcint-flashnext.service arcint-agent-openvino.service
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/arcint \
-    --model /models/ov/qwen38-b7c1-ov \
-    --model-id qwen3.8-27b \
+    --engine llama \
+    --gguf /models/gguf/Qwen3.8-27B-Q4_K_M.gguf \
     --served-model-name qwen3.8-agent \
     --device GPU.0 \
     --host 0.0.0.0 \
     --port 8087 \
-    --n-ctx 151552 \
-    --prefix-cache-mib 8192 \
-    --cache-dir %h/.cache/arcint-agent \
+    --n-ctx 131072 \
+    --llama-kv q8_0 \
+    --llama-mtp 5 \
+    --llama-mtp-vocab %h/.local/share/arcint/hyperqwen-40960.json \
     --queue-timeout 30 \
-    --prefill-chunk 512 \
-    --paged-kv u8:i4 \
-    --mtp on \
-    --cache-host-mib 4096
+    --repetition-penalty 1.0
 Restart=on-failure
 RestartSec=30
 TimeoutStartSec=20min
@@ -39,7 +48,6 @@ StandardError=journal
 NoNewPrivileges=true
 PrivateTmp=false
 ProtectHome=read-only
-ReadWritePaths=%h/.cache/arcint-agent
 
 [Install]
 WantedBy=default.target

@@ -105,6 +105,19 @@ Production (operator, 2026-10-04):
   separate GGUF (`--llama-mtp-gguf`, `tools/flash_next_mtp_gguf.sh`). On the
   B60: 422 t/s prefill at 20k tokens, 33-35 t/s decode with MTP 2
   (`measured-here`; Strata's own engine: 620 / 37.5 on the same card).
+  At 131,072 tokens of context, 9,500 MiB of slots: 408 t/s and 19.8 t/s
+  (`contrib/systemd/arcint-flashnext.service`).
+- One model across two different Arc cards (in progress on the `qfndev`
+  branch, `docs/campaigns/layer-split-two-cards.md` there): Flash-Next split
+  by layers across the B60 (Xe2) and the A770 (Xe-HPG).
+  - Each card runs its own layer range with its own KV and its own expert
+    cache, after Strata's layer split, which lists Intel GPUs as unsupported.
+  - Intel's runtime lists the two generations as two OpenCL platforms;
+    `contrib/llama.cpp` 0023 gives each its own context and builds every
+    kernel for its own card.
+  - At 131,072 tokens: 90 % of the routed experts on a card against 84 % on
+    the B60 alone. Decode 18.6 against 19.8 t/s; the A770's PCIe 3.0 x4 link
+    and its slower MTP drafting are the gap being worked on.
 
 `docs/llama-engine.md` has the details.
 

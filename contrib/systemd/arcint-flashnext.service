@@ -1,0 +1,62 @@
+# arcint-flashnext — Qwen3.8-Flash-Next (IQ2_XS) on the 24 GB card, on demand.
+#
+# The libllama engine (arcint 0.6.0, contrib/llama.cpp 0021 + 0022) with the
+# expert cache: 9,500 MiB of expert slots on the card, every other expert in a
+# bank of pinned host memory (~24 GiB) that the card reads over its link, MTP 2
+# from an MTP-only GGUF (tools/flash_next_mtp_gguf.sh), f16 KV.
+#
+# Measured on the Arc Pro B60 (2026-10-07, 131,072 tokens of context):
+# - a 20k-token prompt read at 408 t/s; the long answer decoded at 19.8 t/s
+#   with 84 % of the routed experts on the card;
+# - the needle and the capital right;
+# - no eviction (the process's GTT stayed at the bank's size).
+#
+# Size the slots for the VRAM a request takes after the load, not for what
+# is free after it:
+# - the first request keeps ~0.9 GiB;
+# - a 20k prefill needs ~3 GiB more for a while.
+# Neither is in the cache's budget. With less room, xe evicts buffers to host
+# memory and leaves them there: a verify took 4.5 s instead of ~25 ms.
+# The trade on this card, all measured:
+# - 32,768 tokens with 14,500 MiB of slots decode at 33-35 t/s;
+# - 98,304 tokens with 11,500 MiB at 21.0 t/s;
+# - 131,072 tokens with 9,500 MiB at 19.8 t/s.
+# q8_0 KV was slower on this model (23.6 against 31-33 t/s at 32k).
+#
+# Loading takes ~7 minutes (the slots and the bank are filled from the file).
+
+[Unit]
+Description=arcint-flashnext — Qwen3.8-Flash-Next IQ2_XS on libllama, expert cache + MTP, GPU.0, :8089
+Documentation=https://github.com/marfrit/arcint
+After=default.target
+Conflicts=arcint-agent.service arcint-writer.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/arcint \
+    --engine llama \
+    --gguf /models/gguf/qwen38-flash-next-iq2xs/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+    --served-model-name qwen3.8-flash-next \
+    --device GPU.0 \
+    --host 0.0.0.0 \
+    --port 8089 \
+    --n-ctx 131072 \
+    --llama-cpu-moe 48 \
+    --llama-threads 8 \
+    --llama-expert-cache 9500 \
+    --llama-expert-profile %h/.local/share/arcint/expert-profile-strata.bin \
+    --llama-mtp 2 \
+    --llama-mtp-gguf /models/gguf/fn-mtp/mtp-flash-next-q8e4n.gguf \
+    --queue-timeout 30
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=30min
+TimeoutStopSec=90s
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target

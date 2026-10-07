@@ -8,11 +8,29 @@ and a journal can both read the port, the served name and the context there.
 
 | unit | card | model | port |
 |---|---|---|---|
-| `arcint-agent.service` | GPU.0 (Arc Pro B60, 24 GB) | Qwen3.8-27B dense, this project's AWQ export (`qwen38-b7c1-ov`) with the reconstructed MTP head, MTP on | 8087 |
-| `arcint-coder.service` | GPU.1 (Arc A770, 16 GiB) | Qwen3.6-27B-A3B coder, MoE (the b5 export) | 8080 |
+| `arcint-agent.service` | GPU.0 (Arc Pro B60, 24 GB) | Qwen3.8-27B dense, Q4_K_M GGUF on the libllama engine, q8_0 KV, 131,072 tokens, MTP 5 | 8087 |
+| `arcint-writer.service` | GPU.0, on demand | Cydonia 24B v4.3 (Mistral Small 3.2 finetune), Q4_K_M GGUF on the libllama engine, 98,304 tokens | 8088 |
+| `arcint-flashnext.service` | GPU.0, on demand | Qwen3.8-Flash-Next IQ2_XS on the libllama engine: expert cache (9,500 MiB of slots, the rest in pinned host memory), MTP 2, 131,072 tokens | 8089 |
+| `arcint-coder.service` | GPU.1 (Arc A770, 16 GB) | Qwen3.6-27B-A3B coder, the searched `c5f495ac shq8` GGUF on the libllama engine, q8_0:q4_0 KV, 98,304 tokens, MTP 4 | 8080 |
+| `arcint-coder-openvino.service` | GPU.1 | the coder's OpenVINO export (the b5 IR); the coder until 2026-10-05, kept as its rollback | 8080 |
+| `arcint-agent-openvino.service` | GPU.0 | Qwen3.8-27B dense, Intel's public int4 IR on the OpenVINO engine, MTP on; the agent until 0.5.5 | 8087 |
 | `arcint-qwen38-mtp.service` | GPU.0 | Qwen3.8-27B, Intel's public int4 IR with the reconstructed MTP head | 8088 — an example, not deployed |
 
+The three GPU.0 units take turns on one card (`Conflicts=`); on the host
+they come from, a unit manager switches between them on demand. The
+OpenVINO units' notes below (`--paged-kv`, `--prefill-chunk`,
+`--cache-host-mib`, the reservation) apply to the `-openvino` units; the
+libllama units take their context from `--n-ctx` and their KV type from
+`--llama-kv`.
+
 Things worth copying rather than re-learning:
+
+- **Size an expert cache for what a request takes, not for what is free
+  after the load** (`arcint-flashnext.service`). On the B60 the first request
+  keeps ~0.9 GiB and a 20k prefill needs ~3 GiB more for a while; with less
+  room, xe evicts buffers to host memory and leaves them there (verify 4.5 s
+  instead of ~25 ms). Watch the process's `drm-resident-gtt` in
+  `/proc/<pid>/fdinfo`: above the bank's size, something was evicted.
 
 - **`Conflicts=`, not arithmetic, keeps a card exclusive.** A resident model
   holds its VRAM for the process lifetime, and a second engine loading beside
@@ -22,24 +40,19 @@ Things worth copying rather than re-learning:
 - **`--served-model-name` names the endpoint, `--model-id` asserts the
   artifact.** A proxy pins its roster to the former; the latter refuses to
   start on the wrong directory.
-- **The reservation decides whether the context fits.** `--n-ctx 151552` on
-  the 24 GB card and `--n-ctx 131072` on the 16 GiB card are explicit, so they
-  are verify-only: the load either admits them (trimming the prefix-cache
-  reserve first) or refuses with every reservation term printed — it never
-  lowers them silently. Omit `--n-ctx` to adopt the largest depth the card
-  admits instead.
-- **`--gate-pad 16` is a no-op on a dense model.** It widens the MoE
-  shared-expert gate: −13% prefill wall, −5% decode (DESIGN 7.0.2g), a win
-  only for prefill-heavy MoE traffic. The dense agent omits it; the coder
-  (MoE, but decode-bound one-shot coding traffic) leaves it off.
-- **`--paged-kv u8:i4`** on the agent (eight-bit keys, four-bit values) buys
-  +28% context at u8's prefill rate on `marfrit-openvino +p6` and later;
-  `--paged-kv u8` on the coder is the default precision. Both score 10/10 on
-  the acceptance task.
-- **`--prefill-chunk 512`** on the agent is a context lever: on a card this
-  full the activation reservation grows with the chunk, and 512 is what lets
-  151,552 tokens fit with MTP on (DESIGN's fit and served-configuration sections). The coder leaves it at
-  the default.
+- **The reservation decides the context, not the flag.** `--n-ctx 151552` on
+  the 24 GB card and `--n-ctx 131072` on the 16 GB card are the flags; the
+  actual served context is whatever the reservation arithmetic on that card
+  allows, printed at boot, not a defect.
+- **`--gate-pad 16` is a no-op on a dense model.** It matters only for MoE
+  traffic patterns (the old 35B agent); the dense 27B agent omits it. On the
+  coder (also dense, one-shot coding traffic that is decode-bound) it was never
+  set. DESIGN 7.0.2g has the break-even for MoE.
+- **`--paged-kv u8:i4`** on the agent (half-precision keys, quarter-precision
+  values) extends the context window; `--paged-kv u8` on the coder halves the
+  KV pages. Both are byte-equal on the acceptance task.
+- **`--prefill-chunk 512`** on the agent keeps prompt ingestion chunked so
+  chunked-prefill scheduling works; the coder leaves it at the default.
 - **`--cache-host-mib 4096`** on the agent enables the host KV tier (§4.4):
   evicted prefix-cache entries are demoted to host RAM instead of being
   discarded, so a returning session restores from host memory (~0.1 s) rather
@@ -53,10 +66,9 @@ Adjust `--model` to where your artifacts are, `--cache-dir` to a writable
 place (it is the only thing the process writes), and the `Conflicts=` lines to
 the units that actually share a card on your host.
 
-A GGUF-opened unit is the same unit with `--gguf FILE` added and `--model`
-naming the served IR of the same architecture as the template; it needs
-`marfrit-openvino` at `+p7` or later (patch 0021; the release floor is `+p20`).
-None of the units above is served that way: on the 24 GB card the GGUF of the
-dense 27B is larger resident than the IR (16.54 against 13.06 GiB) and slower
-at decode (FURTHER-READING.md, *Measured*); its case is serving the file's own
-quantisation.
+A GGUF-opened unit (0.4.0 stage 1) is the same unit with `--gguf FILE` added
+and `--model` naming the served IR of the same architecture as the template;
+it needs `marfrit-openvino` at `+p7` (patch 0021). None of the units above is
+served that way yet: the K-quant path prefills at chunk 256 and decodes at
+about half the IR's rate on the 24 GB card (*FURTHER-READING.md*'s *Measured*
+section), which is 0.4.1's work.

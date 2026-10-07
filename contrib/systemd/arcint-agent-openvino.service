@@ -1,0 +1,46 @@
+# arcint-agent-openvino — Qwen3.8-27B dense + MTP on the OpenVINO engine, the 24 GB card (the agent until 0.5.5).
+#
+# The dense 27B on GPU.0 (the 24 GB card). Weights+graph 13.4 GiB of 22.71
+# usable, the reservation admitting 151,552 tokens at u8:i4 KV with an 8 GiB
+# prefix cache and MTP on. Acceptance task 10/10 greedy, tool probe 3/3.
+#
+# --n-ctx (0.3.0+, M7 fit pass): the fit verifies an explicit depth against
+# a measured reservation at start and refuses loudly if the card cannot hold
+# it; the prefix cache's reserve pages are trimmed before any refusal.
+
+[Unit]
+Description=arcint-agent-openvino — Qwen3.8-27B dense + MTP on OpenVINO, GPU.0, :8087
+Conflicts=arcint-agent.service arcint-writer.service arcint-flashnext.service
+Documentation=https://github.com/marfrit/arcint
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/arcint \
+    --model /models/ov/qwen38-b7c1-ov \
+    --model-id qwen3.8-27b \
+    --served-model-name qwen3.8-agent \
+    --device GPU.0 \
+    --host 0.0.0.0 \
+    --port 8087 \
+    --n-ctx 151552 \
+    --prefix-cache-mib 8192 \
+    --cache-dir %h/.cache/arcint-agent \
+    --queue-timeout 30 \
+    --prefill-chunk 512 \
+    --paged-kv u8:i4 \
+    --mtp on \
+    --cache-host-mib 4096
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=20min
+TimeoutStopSec=60s
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectHome=read-only
+ReadWritePaths=%h/.cache/arcint-agent
+
+[Install]
+WantedBy=default.target
