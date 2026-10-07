@@ -203,6 +203,14 @@ Our llama.cpp pin (bed0a85, patches 0001-0022), `code`:
     in its own context holding exactly its layers' other experts, its own
     budget, residency table and stats.
   - The routed-ids readback and the swaps run per queue.
+  - Budget: Strata sizes each card's cache after the session, the prompt
+    buffers and a reserve are placed (G:2286-2307). llama.cpp loads the
+    model, and with it the cache, before the context allocates KV and
+    compute buffers. So the budget per card is the operator's value
+    (`--llama-expert-cache A,B`), set from the measured late allocation:
+    ~0.9 GiB kept after the first request plus ~3 GiB during a 20k
+    prefill (B60). Deviation recorded 2026-10-07; a reservation computed
+    at context creation is the follow-up.
   - Strata's arena is one pinned region read by every stage. Here each card
     reads only its own layers' bank, which is the same access pattern, in
     two allocations, because a USM allocation cannot span two platforms.

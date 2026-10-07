@@ -11,8 +11,16 @@ and a journal can both read the port, the served name and the context there.
 | `arcint-agent.service` | GPU.0 (Arc Pro B60, 24 GB) | Qwen3.8-27B dense, Intel's public int4 IR, MTP on | 8087 |
 | `arcint-coder.service` | GPU.1 (Arc A770, 16 GB) | Qwen3.6-27B-A3B coder (the b5 export) | 8080 |
 | `arcint-qwen38-mtp.service` | GPU.0 | Qwen3.8-27B, Intel's public int4 IR with the reconstructed MTP head | 8088 — an example, not deployed |
+| `arcint-flashnext.service` | GPU.0, on demand | Qwen3.8-Flash-Next IQ2_XS on the libllama engine: expert cache (9,500 MiB of slots, the rest in pinned host memory), MTP 2, 131,072 tokens | 8089 |
 
 Things worth copying rather than re-learning:
+
+- **Size an expert cache for what a request takes, not for what is free
+  after the load** (`arcint-flashnext.service`). On the B60 the first request
+  keeps ~0.9 GiB and a 20k prefill needs ~3 GiB more for a while; with less
+  room, xe evicts buffers to host memory and leaves them there (verify 4.5 s
+  instead of ~25 ms). Watch the process's `drm-resident-gtt` in
+  `/proc/<pid>/fdinfo`: above the bank's size, something was evicted.
 
 - **`Conflicts=`, not arithmetic, keeps a card exclusive.** A resident model
   holds its VRAM for the process lifetime, and a second engine loading beside
