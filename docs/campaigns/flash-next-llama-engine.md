@@ -500,6 +500,69 @@ arms of the same configuration).
   prefill 364 t/s) against 31.3 on f16 KV. Flash-Next's attention heads are
   256 wide; the quantized-KV attention kernels were searched at 128. Not used.
 
+- **The adaptation's constants** (`LLAMA_EXPERT_CACHE_ADAPT_EVERY`,
+  `_MAX_SWAPS`, `_MIN_GAIN`, `_MIN_USAGE`, `_DECAY`), one binary, MTP 2,
+  13,500 MiB: every 6 tokens (Strata's constants) 90.4 % of decode's routed
+  experts on the card, 30.7 t/s; every 3: 90.1 %, 31.1; every 12: 89.9 %,
+  31.0; 192 swaps with a gain bar of 1.0: 90.5 %, 29.9; decay 0.85: 90.7 %,
+  31.1. The hit rate is set by the slot count, not the policy.
+- **What a verify routes** (counted by the cache, 209 MTP 2 steps): 1,440
+  pairs over the 48 layers go to 1,041 distinct experts (72 %); ~128
+  distinct experts are in the bank against ~135 bank pairs. Grouping a
+  verify's pairs by expert can save ~28 % of the decode work on the card's
+  experts and ~5 % of the link's bytes. The misses are ~128 experts x 3
+  projections x ~0.5 MB, ~190 MB a verify, ~13 ms at 14.3 GB/s: the floor of
+  reading misses over the link at this slot count. The host's RAM reads at
+  roughly three times the link; Strata computes part of its misses on the
+  CPU concurrently, which stage 2a found too costly through llama.cpp's
+  graph splits (~1.2 ms a layer for the hand-off).
+
+- **A verify's pairs grouped by expert, decoded once** (Strata's
+  `row_dot_multi` with up to 4 entries; groups from a per-layer kernel, the
+  bank's experts first; `GGML_OPENCL_KQ_GROUPED=1`): correct (MUL_MAT_ID
+  193/193, the long text identical) and slower: 30.5 -> 29.5 t/s, verify
+  15.01 -> 15.56 s (test-backend-ops on random routing: IQ2_S 120.6 ->
+  146.9 us). The 28 % overlap does not repay the per-entry cost of this
+  kernel shape. Opt-in.
+
+### Stage 4 (open) — Strata's CPU share of the misses
+
+What Strata does on this card (`measured-here`, its log here: "PCIe probe:
+13.7 GB/s host->device -> pcie_frac 0.38"; `code`: `generate.cpp:1704-1723`,
+`expert_source.hpp:185-360`): per layer the host receives the activations
+and routed ids through mapped memory, publishes the GPU's plan (the VRAM
+hits and `pcie_num`/256 of the layer's distinct missed experts, read over
+the link), and its CPU pool computes the other missed experts from host RAM
+at the same time, each distinct expert once for its tokens; both land in
+`parts` at the router's index before the combine. On the B60 38 % of the
+misses cross the link and 62 % never do. arcint reads all of them over the
+link (~13 ms a verify, above). Stage 2a's "a CPU hand-off costs ~1.2 ms a
+layer" measured llama.cpp's synchronous graph split, not this mechanism.
+
+Plan, for the libllama engine (no DESIGN invariant against it: §3.4 names "a
+timing-probed miss split" as acceptable):
+1. A split both sides compute from the ids alone (a hash of the bank entry
+   against `pcie_num`), so nothing about the split crosses the link.
+2. At a layer's gate product the GPU writes the activations and ids to a
+   host mailbox and raises the layer's flag; the down product's kernel
+   leaves the CPU's pairs at zero, and a kernel after it waits for the CPU's
+   flag (bounded spin, LSC uncached loads: memory
+   `project-b60-host-flag-needs-lsc-uncached`, ~5 us) and copies the CPU's
+   rows in before the combine.
+3. A CPU worker pool (the host's 16 threads less the submitting one) polls
+   the flags, computes gate, up, SwiGLU and down for its experts from the
+   USM bank (planar on the card's side: converted back per expert, or read
+   by its own dot products), and writes the rows.
+4. First a standalone handshake microbenchmark on the B60 (GPU -> CPU flag,
+   CPU -> GPU flag, bounded spins), because a GPU spin that never sees its
+   flag can wedge the card, and a wedged xe card has needed a host reboot
+   (the operator's call).
+
+Expected (estimate, not measured): the CPU's share at ~20 GB/s (Strata
+measured its pool at ~19 GB/s in the engine) is ~125 us a layer against
+~330 us of GPU expert work, so it hides behind it; the link's share drops to
+~5 ms: up to ~7 ms of an ~80 ms round.
+
 Tried and measured slower (`measured-here`, B60, MTP 2, one binary, the long
 text identical): the bank's pairs first in the expert matvec (each
 work-group maps its index so the pairs read over the link start first, to

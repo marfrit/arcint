@@ -1296,7 +1296,12 @@ the decode-path work Flash-Next and its MTP verify needed on Intel:
   split by stream and K half; 30.8 t/s off, 30.4 on), a projection's matvec copying the next
   projection's misses into a card-side mirror (`GGML_OPENCL_MOE_PREFETCH=1`,
   31.4 -> 31.6), the K-split F16 kernel with 4 rows a work-group
-  (`GGML_OPENCL_F16_KSPLIT4=1`). `GGML_OPENCL_IQ_OPTS` adds defines to the IQ
+  (`GGML_OPENCL_F16_KSPLIT4=1`); measured slower and kept opt-in: a verify's
+  pairs grouped by expert and decoded once (`GGML_OPENCL_KQ_GROUPED=1`,
+  30.5 -> 29.5). The expert cache's adaptation constants take
+  `LLAMA_EXPERT_CACHE_{ADAPT_EVERY,MAX_SWAPS,MIN_GAIN,MIN_USAGE,DECAY}`
+  (the hit rate stayed at 89.9-90.7 % across them), and it counts a
+  verify's distinct experts (logged every 200 steps). `GGML_OPENCL_IQ_OPTS` adds defines to the IQ
   matvec builds. Measured slower and removed: the IQ4 codebook by byte
   pairs and per lane in local memory, a per-work-group scan for the pair
   order.
