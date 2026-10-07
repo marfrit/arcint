@@ -15,7 +15,8 @@
 # instead of 1,141 t/s at 4k.
 #
 # --llama-mtp-vocab: the draft head scores a 40,960-token vocabulary
-# (HyperQwen's, docs/campaigns/research-hyperqwen.md) instead of the full one.
+# (HyperQwen's; docs/campaigns/research-hyperqwen.md on the qfndev branch)
+# instead of the full one.
 
 [Unit]
 Description=arcint-agent — Qwen3.8-27B dense + MTP on libllama (q8_0 KV, 131072 tokens), GPU.0, :8087
