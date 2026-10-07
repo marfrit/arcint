@@ -68,7 +68,23 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      int       kq_id2_xt = 32, kq_id2_xsg = 16;
      // the route in prealloc_kq_pairs / _tiles / _ntiles: a MoE layer's gate,
      // up and down share their ids tensor, so it is computed once a layer
-@@ -2240,22 +2270,55 @@
+@@ -2204,10 +2234,14 @@
+             // columns 106 -> 355 GB/s on Q4_K, the cost of one column). A build
+             // the device refuses leaves its kernels null: ggml's path then.
+             const char * mv_n[3] = { "kernel_mul_mv_q4_K_q8_1", "kernel_mul_mv_q5_K_q8_1", "kernel_mul_mv_q6_K_q8_1" };
++            // GGML_OPENCL_KQ_ONE_TERM=1: the activation's residual term left out of
++            // the K-quant and IQ dot products (llama.cpp's and Strata's single q8_1)
++            static const char * ot_env = getenv("GGML_OPENCL_KQ_ONE_TERM");
++            const std::string one_term = ot_env != nullptr && atoi(ot_env) != 0 ? " -DKQ_ONE_TERM" : "";
+             for (int nc = 1; nc <= 4; ++nc) {
+                 const std::string opts = compile_opts + " -DN_DST=" + std::to_string(backend_ctx->kq_q8_1_ndst) +
+                     " -DN_SIMDGROUP=4 -DNCOLS=" + std::to_string(nc) + (nc > 1 ? " -cl-intel-256-GRF-per-thread" : "") +
+-                    " -DQSG=" + std::to_string(sg8 ? 8 : 16);
++                    " -DQSG=" + std::to_string(sg8 ? 8 : 16) + one_term;
+                 cl_program prog = build_program_from_source_optional(backend_ctx, kernel_src.c_str(), opts);
+                 if (prog == nullptr) {
+                     GGML_LOG_WARN("ggml_opencl: K-quant matvec for %d column(s) not built; ggml's kernels take it\n", nc);
+@@ -2240,22 +2274,55 @@
  #else
                  const std::string iq_src = read_file("mul_mv_iq_q8_1.cl");
  #endif
@@ -88,7 +104,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                      const std::string opts = compile_opts + " -DN_DST=" + std::to_string(backend_ctx->kq_q8_1_ndst) +
 -                        " -DN_SIMDGROUP=4 -DNCOLS=" + std::to_string(nc) + (nc > 1 ? " -cl-intel-256-GRF-per-thread" : "");
 +                        " -DN_SIMDGROUP=4 -DNCOLS=" + std::to_string(nc) + (nc > 1 ? " -cl-intel-256-GRF-per-thread" : "") +
-+                        (sg8 ? " -DIQ4_KV_SELECT" : "") + iq_extra_opts;
++                        (sg8 ? " -DIQ4_KV_SELECT" : "") + one_term + iq_extra_opts;
                      cl_program prog = build_program_from_source_optional(backend_ctx, iq_src.c_str(), opts);
                      if (prog == nullptr) {
                          GGML_LOG_WARN("ggml_opencl: IQ matvec for %d column(s) not built; IQ weights go to the CPU\n", nc);
@@ -128,7 +144,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                      CL_CHECK(clReleaseProgram(prog));
                      GGML_LOG_CONT(".");
                  }
-@@ -2486,10 +2549,14 @@
+@@ -2486,10 +2553,14 @@
                          }
                      }
                  }
@@ -147,7 +163,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                  // the tokens-as-a MUL_MAT_ID kernel: pairs per tile, sub-groups per
                  // work-group, 32 x 16 on SG 8 (measured-here, the coder's prefill on
                  // an A770: 32 x 16, 32 x 32 and 16 x 32 within 3 %, 64 x 16 1.7x
-@@ -2524,12 +2591,15 @@
+@@ -2524,12 +2595,15 @@
                          CL_CHECK((backend_ctx->kernel_moe_route_tiles = clCreateKernel(mm_prog, "kernel_moe_route_tiles", &err), err));
                          CL_CHECK((backend_ctx->kernel_moe_gather_experts = clCreateKernel(mm_prog, "kernel_moe_gather_experts", &err), err));
                          CL_CHECK((backend_ctx->kernel_moe_gather_pairs   = clCreateKernel(mm_prog, "kernel_moe_gather_pairs", &err), err));
@@ -165,7 +181,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                                  std::string id2 = id_n[i];
                                  id2.replace(id2.find("_id_"), 4, "_id2_");
                                  CL_CHECK((backend_ctx->kernel_mul_mm_id2_kq_f16[i] = clCreateKernel(mm_prog, id2.c_str(), &err), err));
-@@ -9192,9 +9262,323 @@
+@@ -9192,9 +9266,323 @@
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
  }
  
@@ -489,7 +505,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
-@@ -9212,6 +9596,25 @@
+@@ -9212,6 +9600,25 @@
              continue;
          }
  
@@ -515,7 +531,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
              ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
              i += 2;
-@@ -9824,6 +10227,14 @@
+@@ -9824,6 +10231,14 @@
              }
          case GGML_OP_TIMESTEP_EMBEDDING:
              return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
@@ -530,7 +546,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          case GGML_OP_GROUP_NORM:
              return ggml_is_contiguous(op->src[0]);
          case GGML_OP_MUL_MAT:
-@@ -9832,6 +10243,11 @@
+@@ -9832,6 +10247,11 @@
              // (ggml_cl_mul_mv_kq_q8_1, ggml_cl_mul_mm_kq_f16), and are the only
              // path for IQ3_XXS / IQ4_XS; ahead of the Adreno rule below that
              // declines 512 or more columns without the Adreno GEMM
@@ -542,7 +558,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              if (ggml_cl_kq_type_index(op->src[0]->type) >= 0 && kq_q8_1_enabled(backend_ctx) &&
                  op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % ggml_cl_kq_k_unit(op->src[0]->type) == 0 &&
                  op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 && op->src[0]->view_offs == 0 &&
-@@ -9910,6 +10326,10 @@
+@@ -9910,6 +10330,10 @@
                  }
              }
  #ifdef GGML_OPENCL_SOA_Q
@@ -553,7 +569,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              if (ggml_cl_kq_type_index(op->src[0]->type) >= 0 && kq_q8_1_enabled(backend_ctx)) {
                  return op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % ggml_cl_kq_k_unit(op->src[0]->type) == 0 &&
                         op->src[0]->view_offs == 0 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
-@@ -10710,6 +11130,49 @@
+@@ -10710,6 +11134,49 @@
  
  // USM host buffers: bytes by memcpy; IQ4_NL whole tensors split into scales
  // and quants (as kernel_convert_block_iq4_nl lays them out), each 128-aligned
@@ -603,7 +619,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  static void ggml_cl_usm_set_tensor(ggml_backend_opencl_buffer_context * ctx, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
      ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
      char * base = (char *) ctx->usm + e->offset + tensor->view_offs;
-@@ -10727,6 +11190,11 @@
+@@ -10727,6 +11194,11 @@
          ctx->usm_split[tensor] = { d, q };
          return;
      }
@@ -615,7 +631,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      memcpy(base + offset, data, size);
  }
  
-@@ -10741,6 +11209,16 @@
+@@ -10741,6 +11213,16 @@
      cl_context context = backend_ctx->context;
      cl_command_queue queue = backend_ctx->queue;
  
@@ -632,7 +648,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  #ifdef GGML_OPENCL_SOA_Q
      if (tensor->type == GGML_TYPE_Q1_0) {
          ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
-@@ -12401,6 +12879,21 @@
+@@ -12401,6 +12883,21 @@
  
  static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
      GGML_ASSERT(tensor->extra);
@@ -654,7 +670,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
      ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer->buft->device->context;
      ggml_backend_opencl_context *backend_ctx = dev_ctx->backend_ctx;
-@@ -13933,11 +14426,18 @@
+@@ -13933,11 +14430,18 @@
      g_cache_pairs[slot] = { bank, n_split };
  }
  
@@ -673,7 +689,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  }
  
  static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
-@@ -13959,6 +14459,9 @@
+@@ -13959,6 +14463,9 @@
      if (strcmp(name, "ggml_backend_opencl_reserve_gather") == 0) {
          return (void *) ggml_backend_opencl_reserve_gather;
      }
@@ -683,7 +699,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      if (strcmp(name, "ggml_backend_opencl_pair_bank") == 0) {
          return (void *) ggml_backend_opencl_pair_bank;
      }
-@@ -14360,6 +14863,9 @@
+@@ -14360,6 +14867,9 @@
                      memcpy(dst + b * blk, dq.first + (i2 * bps + b) * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
                      memcpy(dst + b * blk + sizeof(ggml_fp16_t), dq.second + (i2 * bps + b) * qb, qb);
                  }
@@ -693,7 +709,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              } else {
                  ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
                  memcpy(data, (const char *) bctx->usm + e->offset + (size_t) i2 * tensor->nb[2], (size_t) n * tensor->nb[2]);
-@@ -14492,6 +14998,9 @@
+@@ -14492,6 +15002,9 @@
                      memcpy(dq.first + (i2 * bps + b) * sizeof(ggml_fp16_t), src + b * blk, sizeof(ggml_fp16_t));
                      memcpy(dq.second + (i2 * bps + b) * qb, src + b * blk + sizeof(ggml_fp16_t), qb);
                  }
@@ -703,7 +719,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              } else {
                  ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
                  memcpy((char *) bctx->usm + e->offset + (size_t) i2 * tensor->nb[2], data, (size_t) n * tensor->nb[2]);
-@@ -14537,6 +15046,10 @@
+@@ -14537,6 +15050,10 @@
          return;
      }
  #endif
@@ -714,7 +730,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      {
          // a plain tensor: a non-blocking write; the caller keeps `data` until the
          // next synchronization (llama_expert_cache's tables live in the layer)
-@@ -14779,9 +15292,17 @@
+@@ -14779,9 +15296,17 @@
  
      cl_kernel kernel;
  
@@ -734,7 +750,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          GGML_ASSERT(ggml_is_contiguous(src0));
          GGML_ASSERT(ne11 == 1);
      }
-@@ -14790,7 +15311,7 @@
+@@ -14790,7 +15315,7 @@
          GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
          if (bcast_row) {
              kernel = backend_ctx->kernel_add_row;
@@ -743,7 +759,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
              CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
              CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra1->data_device));
-@@ -17577,6 +18098,70 @@
+@@ -17577,6 +18102,70 @@
      }
  }
  
@@ -814,7 +830,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  static void ggml_cl_timestep_embedding(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -24733,6 +25318,21 @@
+@@ -24733,6 +25322,21 @@
  // the single branch: the mirror for the matvec's trailing arguments
  static cl_mem g_kq_single_q = nullptr, g_kq_single_d = nullptr;
  static int    g_kq_single_split = 0;
@@ -836,7 +852,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
  static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, cl_uint & a) {
      const ggml_tensor * soa0 = src0->view_src != nullptr ? src0->view_src : src0;
-@@ -24748,7 +25348,7 @@
+@@ -24748,7 +25352,7 @@
          // base and the offset, or IQ4_NL's scales and quants)
          auto * bctx = (ggml_backend_opencl_buffer_context *) soa0->buffer->context;
          if (bctx->usm) {
@@ -845,7 +861,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                  ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *)src0->extra;
                  const cl_ulong off = e->offset + src0->view_offs;
                  CL_CHECK(g_cl_set_arg_ptr(kernel, a++, bctx->usm));
-@@ -24756,7 +25356,7 @@
+@@ -24756,7 +25360,7 @@
                  CL_CHECK(g_cl_set_arg_ptr(kernel, a++, bctx->usm));
                  return;
              }
@@ -854,7 +870,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              const auto & dq = bctx->usm_split.at(soa0);
              const cl_ulong off = 0;
              CL_CHECK(g_cl_set_arg_ptr(kernel, a++, dq.second));
-@@ -24765,7 +25365,7 @@
+@@ -24765,7 +25369,7 @@
              return;
          }
      }
@@ -863,7 +879,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *)src0->extra;
          const cl_ulong off = e->offset + src0->view_offs;
          CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &e->data_device));
-@@ -24807,13 +25407,19 @@
+@@ -24807,13 +25411,19 @@
          case GGML_TYPE_IQ3_XXS: return 3;
          case GGML_TYPE_IQ4_XS:  return 4;
          case GGML_TYPE_IQ4_NL:  return 5;
@@ -885,7 +901,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  }
  
  // Q4_K and Q5_K subtract a min per sub-block: their kernels read the
-@@ -25062,14 +25668,28 @@
+@@ -25062,14 +25672,28 @@
  // over a work-group; more: the tiled GEMM with K cut into slices run as its
  // batch dimension, then the slices summed. GGML_OPENCL_F32_SKINNY=0 keeps
  // ggml's paths. Returns whether it took the product.
@@ -915,7 +931,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
          return false;
      }
-@@ -25167,10 +25787,111 @@
+@@ -25167,10 +25791,111 @@
  
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
  
@@ -1027,7 +1043,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      // quant kv without FA
      // used for non-contiguous src0 (the usual head-major permuted K view when n_head_kv>1)
      // AND for the contiguous case that occurs when n_head_kv==1 (e.g. Gemma-4 E2B)
-@@ -27611,6 +28332,27 @@
+@@ -27611,6 +28336,27 @@
      const bool id2 = gemm && (id2_env == nullptr ? id2_default : atoi(id2_env) != 0) && backend_ctx->kernel_mul_mm_id2_kq_f16[ti] != nullptr;
      cl_kernel kernel = id2 ? backend_ctx->kernel_mul_mm_id2_kq_f16[ti] :
                         gemm ? backend_ctx->kernel_mul_mm_id_kq_f16[ti] : backend_ctx->kernel_mul_mv_id_kq_q8_1[ti];
@@ -1055,7 +1071,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      if (kernel == nullptr) {
          return false;
      }
-@@ -27651,14 +28393,62 @@
+@@ -27651,14 +28397,62 @@
              if (it != g_cache_pairs.end()) { bank0 = it->second.first; n_split = it->second.second; single = true; }
          }
          auto * bctx0 = (ggml_backend_opencl_buffer_context *) bank0->buffer->context;
@@ -1122,7 +1138,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                      cl_kernel kg = backend_ctx->kernel_moe_gather_pairs;
                      CL_CHECK(g_cl_set_arg_ptr(kg, 0, src));
                      CL_CHECK(clSetKernelArg(kg, 1, sizeof(cl_mem),   &stage.buffer));
-@@ -27669,7 +28459,7 @@
+@@ -27669,7 +28463,7 @@
                      CL_CHECK(clSetKernelArg(kg, 6, sizeof(int),      &n_used));
                      CL_CHECK(clSetKernelArg(kg, 7, sizeof(int),      &n_split));
                      size_t g_local[2]  = { 256, 1 };
@@ -1131,7 +1147,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                      backend_ctx->enqueue_ndrange_kernel(kg, 2, g_global, g_local, dst);
                      return stage.buffer;
                  }
-@@ -27682,8 +28472,10 @@
+@@ -27682,8 +28476,10 @@
                  CL_CHECK(clSetKernelArg(kg, 5, sizeof(cl_ulong), &nbi1));
                  CL_CHECK(clSetKernelArg(kg, 6, sizeof(int),      &n_used));
                  CL_CHECK(clSetKernelArg(kg, 7, sizeof(int),      &n_tok));
@@ -1143,7 +1159,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                  backend_ctx->enqueue_ndrange_kernel(kg, 2, g_global, g_local, dst);
                  return stage.buffer;
              };
-@@ -27701,11 +28493,12 @@
+@@ -27701,11 +28497,12 @@
                  // goes in the matvec's trailing ones (below)
                  g_kq_single_q = g_kq_stage_q; g_kq_single_d = g_kq_stage_d != nullptr ? g_kq_stage_d : g_kq_stage_q;
                  g_kq_single_split = n_split;
@@ -1157,7 +1173,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
      cl_uint a = 0;
      if (!gemm) {
-@@ -27735,11 +28528,132 @@
+@@ -27735,11 +28532,132 @@
              const cl_mem q2 = g_kq_single_q != nullptr ? g_kq_single_q : extrad->data_device;
              const cl_mem d2 = g_kq_single_d != nullptr ? g_kq_single_d : extrad->data_device;
              const int    ns = g_kq_single_q != nullptr ? g_kq_single_split : INT_MAX;
@@ -1292,7 +1308,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          size_t global_work_size[] = { (size_t)CEIL_DIV(ne01, rows_per_wg) * 16, 4, (size_t)n_used * n_tok };
          size_t local_work_size[]  = { 16, 4, 1 };
          backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
-@@ -31955,6 +32869,18 @@
+@@ -31955,6 +32873,18 @@
              }
              ggml_cl_timestep_embedding(backend, tensor->src[0], tensor);
              return true;
@@ -2605,7 +2621,23 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl b/ggml/src/ggml-openc
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
 --- a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
-@@ -86,6 +86,1105 @@
+@@ -25,6 +25,15 @@
+ #ifndef NCOLS
+ #define NCOLS 1
+ #endif
++// the activation's residual term (kernel_quantize_q8_1: x = d q + d2 q2);
++// -DKQ_ONE_TERM drops it from the dot products, as llama.cpp's and Strata's
++// single q8_1 do (the residual's loads are then dead)
++#ifdef KQ_ONE_TERM
++#define KQ_RES(e) 0.f
++#else
++#define KQ_RES(e) (e)
++#endif
++
+ #define QK_K 256
+ 
+ // ggml-common.h tables (byte-exact copies)
+@@ -86,6 +95,1105 @@
      -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
  };
  
@@ -3711,7 +3743,7 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
  static inline int dot8_ss(const uint * w, uint4 x0, uint4 x1) {
      int a = 0;
      a = dot_acc_sat_4x8packed_ss_int(w[0], x0.s0, a);
-@@ -107,6 +1206,18 @@
+@@ -107,6 +1215,18 @@
  
  // 16 code bytes -> the 32 weights' int8 values: low nibbles are weights
  // 0..15, high nibbles 16..31 (dequantize_row_iq4_nl / _iq4_xs)
@@ -3730,7 +3762,7 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
  static inline void iq4_expand(uint4 q, uint * w) {
      w[0] = kv4(q.s0 & 0x0F0F0F0Fu);        w[1] = kv4(q.s1 & 0x0F0F0F0Fu);
      w[2] = kv4(q.s2 & 0x0F0F0F0Fu);        w[3] = kv4(q.s3 & 0x0F0F0F0Fu);
-@@ -158,6 +1269,96 @@
+@@ -158,6 +1278,96 @@
      }
  }
  
@@ -3781,8 +3813,8 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
 +            lb_expand(TYPE, S, nblk, LB_BI(TYPE, first_row + r, nbr, b32), LB_P(TYPE, b32), w, &s0, &s1, lt);
 +            #pragma unroll
 +            for (int c = 0; c < NCOLS; ++c) {
-+                acc[r][c] += s0 * (dx[c] * (float)dot4_ss(w, xa[c]) + dy[c] * (float)dot4_ss(w, ya[c])) +
-+                             s1 * (dx[c] * (float)dot4_ss(w + 4, xb[c]) + dy[c] * (float)dot4_ss(w + 4, yb[c]));
++                acc[r][c] += s0 * (dx[c] * (float)dot4_ss(w, xa[c]) + KQ_RES(dy[c] * (float)dot4_ss(w, ya[c]))) +
++                             s1 * (dx[c] * (float)dot4_ss(w + 4, xb[c]) + KQ_RES(dy[c] * (float)dot4_ss(w + 4, yb[c])));
 +            }
 +        }
 +    }
@@ -3813,8 +3845,8 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
 +            uint w[8];
 +            float s0, s1;
 +            lb_expand(TYPE, S, nblk, LB_BI(TYPE, row, nbr, b32), LB_P(TYPE, b32), w, &s0, &s1, lt);
-+            acc += s0 * (dx * (float)dot4_ss(w, xa) + dy * (float)dot4_ss(w, ya)) +
-+                   s1 * (dx * (float)dot4_ss(w + 4, xb) + dy * (float)dot4_ss(w + 4, yb));
++            acc += s0 * (dx * (float)dot4_ss(w, xa) + KQ_RES(dy * (float)dot4_ss(w, ya))) +
++                   s1 * (dx * (float)dot4_ss(w + 4, xb) + KQ_RES(dy * (float)dot4_ss(w + 4, yb)));
 +        }
 +    }
 +    acc += intel_sub_group_shuffle_xor(acc, 1);
@@ -3827,7 +3859,25 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
  // TYPE 0: IQ3_XXS, 1: IQ4_XS (row_bytes: the row stride in bytes), 2: IQ4_NL
  // flat (q: code plane, dp: scale plane, rows of nb*8 blocks). xq/xd: column
  // 0's codes and scales, the residual term at + res.
-@@ -256,15 +1457,32 @@
+@@ -197,7 +1407,7 @@
+             const float s = vload_half(blk, dp);
+             #pragma unroll
+             for (int c = 0; c < NCOLS; ++c) {
+-                acc[r][c] += s * (dx[c] * (float)dot8_ss(w, xa[c], xb[c]) + dy[c] * (float)dot8_ss(w, ya[c], yb[c]));
++                acc[r][c] += s * (dx[c] * (float)dot8_ss(w, xa[c], xb[c]) + KQ_RES(dy[c] * (float)dot8_ss(w, ya[c], yb[c])));
+             }
+         }
+     }
+@@ -244,7 +1454,7 @@
+             }
+             #pragma unroll
+             for (int c = 0; c < NCOLS; ++c) {
+-                acc[r][c] += s * (dx[c] * (float)dot8_ss(w, xa[c], xb[c]) + dy[c] * (float)dot8_ss(w, ya[c], yb[c]));
++                acc[r][c] += s * (dx[c] * (float)dot8_ss(w, xa[c], xb[c]) + KQ_RES(dy[c] * (float)dot8_ss(w, ya[c], yb[c])));
+             }
+         }
+     }
+@@ -256,15 +1466,32 @@
  // IQ3_XXS reads its grid and sign tables from local memory: each lane looks
  // up its own entries, and gathers from constant memory measured 74 GB/s
  // against 200 for the IQ4 types (A770).
@@ -3866,7 +3916,7 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
      }
  
  // row byte strides of the blocked types: IQ3_XXS nb*98, IQ4_XS nb*136
-@@ -282,6 +1500,12 @@
+@@ -282,6 +1509,12 @@
      const int first_row = FIRST_ROW;                                                           \
      if (first_row >= ne01) return;                                                             \
      const int nb = ne00 / QK_K;                                                                \
@@ -3879,7 +3929,7 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
      if ((TYPE) == 2) {                                                                         \
          mv_iq4_nl(q + offq, dp, (ulong)first_row * (ne00 / 32), ne00 / 32, first_row, ne01,    \
                    xq, xd, (ulong)ne00 * NCOLS, (global float *)(dst + offd), nb1 / sizeof(float)); \
-@@ -294,25 +1518,105 @@
+@@ -294,25 +1527,105 @@
  MV_KERNEL(kernel_mul_mv_iq3_xxs_q8_1, 0)
  MV_KERNEL(kernel_mul_mv_iq4_xs_q8_1, 1)
  MV_KERNEL(kernel_mul_mv_iq4_nl_q8_1, 2)
@@ -3989,7 +4039,7 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
      /* an expert cache's single branch: ids >= n_split are bank experts, gathered into the     \
         mirror q2 / dp2 at e - n_split */                                                       \
      if (e >= n_split) { q = q2; offq = 0; dp = dp2; e -= n_split; }                            \
-@@ -324,6 +1628,18 @@
+@@ -324,6 +1637,18 @@
          return;                                                                                \
      }                                                                                          \
      const int col = (i % ne11) + t * ne11;                                                     \
@@ -4008,7 +4058,7 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
      if ((TYPE) == 2) {                                                                         \
          mv_iq4_nl(q + offq, dp, ((ulong)e * ne01 + first_row) * (ne00 / 32), ne00 / 32, first_row, ne01, \
                    xq + (ulong)col * ne00, xd + (ulong)col * (ne00 / 32), res,                  \
-@@ -337,3 +1653,624 @@
+@@ -337,3 +1662,624 @@
  MV_ID_KERNEL(kernel_mul_mv_id_iq3_xxs_q8_1, 0)
  MV_ID_KERNEL(kernel_mul_mv_id_iq4_xs_q8_1, 1)
  MV_ID_KERNEL(kernel_mul_mv_id_iq4_nl_q8_1, 2)
@@ -4058,8 +4108,8 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
 +            #pragma unroll
 +            for (int j = 0; j < GRP_MAX; ++j) {
 +                if (j < cnt) {
-+                    acc[r][j] += s0 * (dx[j] * (float)dot4_ss(w, xa[j]) + dy[j] * (float)dot4_ss(w, ya[j])) +
-+                                 s1 * (dx[j] * (float)dot4_ss(w + 4, xb[j]) + dy[j] * (float)dot4_ss(w + 4, yb[j]));
++                    acc[r][j] += s0 * (dx[j] * (float)dot4_ss(w, xa[j]) + KQ_RES(dy[j] * (float)dot4_ss(w, ya[j]))) +
++                                 s1 * (dx[j] * (float)dot4_ss(w + 4, xb[j]) + KQ_RES(dy[j] * (float)dot4_ss(w + 4, yb[j])));
 +                }
 +            }
 +        }
@@ -4299,8 +4349,8 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
 +            const float dx = xd[(ulong)colk[k] * n32 + b32], dy = xd[res / 32 + (ulong)colk[k] * n32 + b32];
 +            #pragma unroll
 +            for (int r = 0; r < N_DST; ++r) {
-+                acc[r][k] += s0[r] * (dx * (float)dot4_ss(w[r], xa) + dy * (float)dot4_ss(w[r], ya)) +
-+                             s1[r] * (dx * (float)dot4_ss(w[r] + 4, xb) + dy * (float)dot4_ss(w[r] + 4, yb));
++                acc[r][k] += s0[r] * (dx * (float)dot4_ss(w[r], xa) + KQ_RES(dy * (float)dot4_ss(w[r], ya))) +
++                             s1[r] * (dx * (float)dot4_ss(w[r] + 4, xb) + KQ_RES(dy * (float)dot4_ss(w[r] + 4, yb)));
 +            }
 +        }
 +    }
@@ -4633,6 +4683,45 @@ diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-open
 +        ((global float *)(mixed + offm + t * nbm1))[d] = s_mix * sv;
 +    }
 +}
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl
+--- a/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mv_kq_q8_1.cl
+@@ -15,6 +15,15 @@
+ // MUL_MAT_ID: work-group dimension 2 is one (expert slot, token) pair, whose
+ // expert is read from `ids` on the device.
+ 
++// the activation's residual term (x = d q + d2 q2, below); -DKQ_ONE_TERM
++// drops it from the dot products, as llama.cpp's and Strata's single q8_1 do
++// (the residual's loads are then dead)
++#ifdef KQ_ONE_TERM
++#define KQ_RES(e) 0.f
++#else
++#define KQ_RES(e) (e)
++#endif
++
+ #define QK_K 256
+ #ifndef N_DST
+ #define N_DST 4
+@@ -203,7 +212,7 @@
+                         const int il = dot4_us(wl, xl[c]),  ih = dot4_us(wh, xh[c]);
+                 const int il2 = dot4_us(wl, xl2[c]), ih2 = dot4_us(wh, xh2[c]);
+                 // each sub-block's sum is split over two lanes (h = 0, 1): half each
+-                acc[r][c] += d * (sc0 * (dl[c] * (float)il + dl2[c] * (float)il2) + sc1 * (dh[c] * (float)ih + dh2[c] * (float)ih2))
++                acc[r][c] += d * (sc0 * (dl[c] * (float)il + KQ_RES(dl2[c] * (float)il2)) + sc1 * (dh[c] * (float)ih + KQ_RES(dh2[c] * (float)ih2)))
+                            - dm * 0.5f * (m0 * sl[c] + m1 * sh[c]);
+             }
+         }
+@@ -281,8 +290,8 @@
+                 const int i2 = dot2_ss(w2, x2[cc]), i3 = dot2_ss(w3, x3[cc]);
+                 const int k0 = dot2_ss(w0, y0[cc]), k1 = dot2_ss(w1, y1[cc]);
+                 const int k2 = dot2_ss(w2, y2[cc]), k3 = dot2_ss(w3, y3[cc]);
+-                acc[r][cc] += d * (s0 * (d0[cc] * (float)i0 + e0[cc] * (float)k0) + s1 * (d1[cc] * (float)i1 + e1[cc] * (float)k1) +
+-                                   s2 * (d2[cc] * (float)i2 + e2[cc] * (float)k2) + s3 * (d3[cc] * (float)i3 + e3[cc] * (float)k3));
++                acc[r][cc] += d * (s0 * (d0[cc] * (float)i0 + KQ_RES(e0[cc] * (float)k0)) + s1 * (d1[cc] * (float)i1 + KQ_RES(e1[cc] * (float)k1)) +
++                                   s2 * (d2[cc] * (float)i2 + KQ_RES(e2[cc] * (float)k2)) + s3 * (d3[cc] * (float)i3 + KQ_RES(e3[cc] * (float)k3)));
+             }
+         }
+     }
 diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
 --- a/src/llama-expert-cache.cpp
 +++ b/src/llama-expert-cache.cpp

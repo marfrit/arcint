@@ -525,7 +525,63 @@ arms of the same configuration).
   146.9 us). The 28 % overlap does not repay the per-entry cost of this
   kernel shape. Opt-in.
 
-### Stage 4 (open) — Strata's CPU share of the misses
+### Stage 3d — the activation as one int8 term (2026-10-07)
+
+ggml-opencl's K-quant and IQ matvecs quantize the activation to two int8
+terms (codes plus the codes of what they leave, `kernel_quantize_q8_1`;
+added because q8_1 alone moved the dense 27B's decode KL by 0.0026 nats) and
+do every integer dot product twice. llama.cpp's MMVQ and Strata's kernels
+use a single q8_1 (`code`). `GGML_OPENCL_KQ_ONE_TERM=1` builds the kernels
+without the residual's dot products (its loads are then dead). One binary
+(src-fn31), B60, `measured-here`:
+
+| kernel (test-backend-ops perf) | two terms | one term |
+|---|---|---|
+| IQ4_XS 6144 x 2560, 1 / 3 columns | 44.0 / 49.6 us | 41.4 / 43.9 |
+| IQ4_XS 4096 x 14336, 2 columns | 178.7 | 174.0 |
+| MUL_MAT_ID 30 pairs, 3 tokens: IQ2_S / IQ2_XXS / Q2_0 640 x 2560 / Q2_0 2560 x 640 | 119.8 / 96.2 / 83.2 / 90.0 | 117.7 / 92.0 / 79.8 / 83.8 |
+| Q4_K, Q6_K (already at 400-430 GB/s) | | unchanged |
+
+MUL_MAT and MUL_MAT_ID for the IQ, Q2_0 and K types: 294/294 and 286/286
+against the CPU in both builds.
+
+| served, 500-token long answer | one term | two terms |
+|---|---|---|
+| Flash-Next IQ2_XS, MTP 2, 14,500 MiB (on, off, on) | 31.8, 31.6 | 31.0 |
+| the agent (dense 27B, B60) | 38.3 / 38.3 | 38.2 / 38.3 (text identical: its kernels do not take this path) |
+| the coder (A770, MTP 4) | 40.7 / 40.8, drafts accepted 38.2 % | 43.3 / 43.3, 42.7 % |
+
+Flash-Next answers right in every arm (Paris, ORANGE-FALCON-77, the long
+answer; its text differs between the arms). On the coder the coarser target
+logits agree less with the MTP head's drafts, and decode loses 6 %. The
+switch stays opt-in: +2 % on Flash-Next does not repay a default that costs
+the coder. Its KL against the reference was not measured.
+
+The kernels stay well under the card's bandwidth with either activation:
+the expert matvecs read ~131 GB/s (IQ2_S) to ~173 GB/s (Q2_0, whose decode
+is shifts only) at 3 tokens, against 400-430 GB/s for the dense Q4_K/Q6_K
+products, so the low-bit decode is not bounded by the codebook alone.
+
+### Stage 4 (closed 2026-10-07, not built) — Strata's CPU share of the misses
+
+**Retracted premise.** The reference measured here does not use a CPU share
+(`code`, Strata 7ba023e): it ran with `STRATA_VERIFY_DEVICE_PLAN=1
+STRATA_VERIFY_NO_HOST=1` (`sycl/serve/strata-sycl.sh:24`, the port's own
+serving script). With those the host does no per-layer work at all: the
+per-layer wait-and-pool loop is skipped (`sycl/src/core/verify.cpp:1356-1364`,
+"on this platform a kernel's writes to host-mapped memory are not reliably
+visible while the graph runs"), the GPU plans every layer itself
+(`resident_plan`), and an expert missing from VRAM counts as resident when
+the pinned mirror holds it (`resident_plan_set_mirror`,
+`sycl/src/kernels/cuda/verify_kernels.dp.cpp:1115-1126`; the mirror table
+from `sycl/src/program/generate.cpp:3815-3827`), so the GPU's expert kernels
+read every miss over the link and the CPU rows are zeros
+(`copy_or_zero_from_mapped`, `verify.cpp:985`). The "pcie_frac 0.38" its log
+prints is computed and unused in that mode. 37.2-37.8 t/s is therefore
+Strata with all misses over the link, as arcint's direct read does; the
+per-round gap (~80 ms here against its 63 ms at about the same tokens per
+round) is not a CPU share. The text below is the plan as it was written;
+nothing of it was built.
 
 What Strata does on this card (`measured-here`, its log here: "PCIe probe:
 13.7 GB/s host->device -> pcie_frac 0.38"; `code`: `generate.cpp:1704-1723`,

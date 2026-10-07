@@ -1298,7 +1298,11 @@ the decode-path work Flash-Next and its MTP verify needed on Intel:
   31.4 -> 31.6), the K-split F16 kernel with 4 rows a work-group
   (`GGML_OPENCL_F16_KSPLIT4=1`); measured slower and kept opt-in: a verify's
   pairs grouped by expert and decoded once (`GGML_OPENCL_KQ_GROUPED=1`,
-  30.5 -> 29.5). The expert cache's adaptation constants take
+  30.5 -> 29.5); the activation as one int8 term in the K-quant and IQ
+  matvecs (`GGML_OPENCL_KQ_ONE_TERM=1`, llama.cpp's and Strata's single
+  q8_1 instead of codes plus residual codes): IQ4_XS 49.6 -> 43.9 us at 3
+  columns, Flash-Next 31.0 -> 31.6-31.8 t/s, but the coder 43.3 -> 40.7 (its
+  MTP drafts accepted 42.7 -> 38.2 %). The expert cache's adaptation constants take
   `LLAMA_EXPERT_CACHE_{ADAPT_EVERY,MAX_SWAPS,MIN_GAIN,MIN_USAGE,DECAY}`
   (the hit rate stayed at 89.9-90.7 % across them), and it counts a
   verify's distinct experts (logged every 200 steps). `GGML_OPENCL_IQ_OPTS` adds defines to the IQ
