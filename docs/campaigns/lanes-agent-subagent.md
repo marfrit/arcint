@@ -401,6 +401,34 @@ On the record before the work starts.
     alone within the spread of today's. KL of the batched path against one
     sequence within the answer-level bar (the mixed-ubatch arm, now right
     with 0027). Answers right on both lanes.
+- **Stage 1, shared verifies** (`measured-here`, 2026-10-09, B60, the dense
+  27B, MTP 5, the same 300-token answer on both lanes at once):
+  - **The combiner** (`verify_combined`, `LlamaSpec::decode_multi`): the
+    first lane leads, waits up to 20 ms for the other lanes in their decode
+    loop, and decodes every posted verify at once. One target decode, then
+    one MTP-context decode with every lane's entries. A lane alone decodes
+    as before: 31.9-32.0 t/s.
+  - **First build:** 114 verifies of each request were shared, but each lane
+    ran 2.3 t/s, and one step outran xe's job timeout (an engine reset,
+    23:51 UTC). The profile (unitrace, small lanes): a shared step's 12
+    query rows left 0016's verify kernel for the prefill kernel (2,034
+    calls at 4.3 ms).
+  - **0028** (attention of 9-64 rows in blocks of 8): 7.6 t/s a lane at
+    full lane sizes, 18.2 with small lanes. What was left is the windows'
+    whole-stream fallback: both lanes' rows attended over the pool, the
+    subagent's cells sitting at 131,072 and up.
+  - **0029** (per-sequence attention in a mixed ubatch): 19.7-22.4 t/s a
+    lane, 40-42 together, against 15.9 + 15.8 taking turns (+30 %). A
+    shared step takes 92 ms against ~55 for one lane's verify.
+  - **KL:** the mixed path equals one sequence (0.004099); the red case
+    proves the per-sequence path runs.
+  - **Text:** the shared answers differ from the solo ones (another
+    rounding).
+  - **Left in the shared step** (profile, small lanes): the MTP snapshots
+    of two sequences (+1.2 s per answer pair, memory-bound) and twice the
+    columns per product.
+  - **Next:** stage 2, one draft step for all lanes (drafting is serial
+    today, each lane under the context lock).
 - **Flash-Next with lanes** (5,500 and 7,500 MiB of slots): eviction both
   times; aborted, numbers void. llama.cpp reserves 6,679 MiB of OpenCL
   compute buffer: the 2,048-token prefill ubatch against the 163,840-cell

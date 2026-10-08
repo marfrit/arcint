@@ -1611,3 +1611,57 @@ Qwen3.8-27B Q4_K_M, q8_0 KV, `llama-perplexity` KL against the Q8 reference,
 - arcint decodes one sequence per call, so its served path never took the
   stale hit. The patch matters for llama.cpp's own batching with these
   patches (`llama-server -np N`) and for batching lanes into one decode.
+
+## 0028-opencl-fa-row-blocks.patch
+
+Intel: an attention call with 9 to 64 query rows runs in blocks of up to 8.
+Each block is a recursive call on views: q's rows, the mask's rows and the
+output's rows, offset by their strides. The small-row kernels (the q1 split
+kernels and 0016's GQA kernel) take at most 8 rows. Without blocks, a verify
+of two lanes (12 rows) fell to the prefill kernel, which pays a K/V
+conversion every call. Rows of attention are independent, so a block attends
+as the whole call would. Calls without a mask (a kernel may derive causality
+from the row index) are not split. `GGML_OPENCL_FA_ROW_BLOCKS=0` keeps one
+call.
+
+Measured on the B60 (`measured-here`, 2026-10-09):
+
+- **`test-backend-ops -o FLASH_ATTN_EXT`:** 2805/2806 with and without
+  blocks; the one failure is the softcap case noted under 0022.
+  - The red case: the block's mask offset dropped fails 426 cases
+    (2380/2806); the same build with blocks off passes 2805.
+- **Two lanes of the dense 27B in shared verifies** (arcint's combiner, MTP
+  5): the prefill kernel had taken 2,034 calls at 4.3 ms. With 131,072 +
+  32,768 lanes, one such step outran xe's job timeout (an engine reset).
+  With blocks, a shared step takes 282 ms instead of 1,030.
+
+## 0029-kv-windows-per-sequence-attention.patch
+
+0026's windows, inside a ubatch of several sequences. 0026 fell back to the
+whole stream's view there, so each sequence attended over every window's
+cells, masked. With this patch, when windows are set, flash attention is on
+and the ubatch is an equal split of windowed sequences, the attention
+builder runs one op per sequence. Each op takes the sequence's query rows,
+its window's K/V (`get_k_part`, `get_v_part`) and its slice of the mask. The
+slice is made contiguous once a graph and shared by all layers. The outputs
+are concatenated along the tokens.
+
+- `llama_kv_cache::get_win_parts` checks the ubatch's tokens are grouped by
+  sequence, one per row, each with a window. Otherwise the whole-stream
+  view stays, as before.
+- The mask spans every part's cells (`n_kv` up to the furthest window's
+  end).
+- Graph reuse compares the parts.
+
+Measured on the B60 (`measured-here`, 2026-10-09; the dense Qwen3.8-27B
+Q4_K_M, q8_0 KV):
+
+- **KL** against the Q8 reference, four sequences a batch in mixed ubatches,
+  windows on: 0.004099 / 97.745 %, equal to one sequence and to the same
+  batch without windows.
+  - The red case: every part's window offset forced to 0 gives 1.3291 /
+    61.79 % with windows; without windows the same build stays at 0.004099.
+- **Two lanes in shared verifies** (131,072 + 32,768, MTP 5, a 300-token
+  answer on each at once): 19.7-22.4 t/s a lane, 40-42 together, against
+  15.9 + 15.8 taking turns. A shared step takes 92 ms (282 with 0028
+  alone).

@@ -1,0 +1,215 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 814261f..5f6c826 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -505,6 +505,9 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
+ 
+     bool res = true;
+ 
++    // the parts' views carry their windows' offsets and sizes
++    res &= mctx->get_win_parts() == win_parts;
++
+     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+ 
+@@ -2986,6 +2989,44 @@ ggml_tensor * llm_graph_context::build_attn(
+             ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+         }
+ 
++        // several windowed sequences in one ubatch (a batched decode of lanes): each
++        // sequence attends over its own window, so one sequence's attention does not
++        // span another's cells (the whole-pool view would, masked). One attention op
++        // a sequence, on its rows, its window's K/V and its slice of the mask
++        const auto & parts = mctx_cur->get_win_parts();
++        if (!parts.empty() && cparams.flash_attn && kq_b == nullptr && sinks == nullptr) {
++            ggml_tensor * mask = inp->get_kq_mask();
++            if (inp->self_kq_mask_parts.size() != parts.size()) {
++                inp->win_parts = parts;
++                inp->self_kq_mask_parts.clear();
++                for (const auto & p : parts) {
++                    ggml_tensor * mv = ggml_view_2d(ctx0, mask, p.n_kv, p.n_rows, mask->nb[1],
++                                                    p.row0 * mask->nb[1] + (size_t) p.kv_off * ggml_element_size(mask));
++                    inp->self_kq_mask_parts.push_back(ggml_cont(ctx0, mv));
++                }
++            }
++            ggml_tensor * cur = nullptr;
++            for (size_t i = 0; i < parts.size(); ++i) {
++                const auto &  p  = parts[i];
++                ggml_tensor * qs = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], p.n_rows, q->nb[1], q->nb[2], p.row0 * q->nb[2]);
++                ggml_tensor * o  = build_attn_mha(qs, mctx_cur->get_k_part(ctx0, il, p), mctx_cur->get_v_part(ctx0, il, p),
++                                                  nullptr, inp->self_kq_mask_parts[i], nullptr, v_mla, 0, kq_scale, il);
++                cur = cur == nullptr ? o : ggml_concat(ctx0, cur, o, 1);
++            }
++            cb(cur, "kqv_out", il);
++
++            if (inp->self_v_rot) {
++                cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
++            }
++            if (wo) {
++                cur = build_lora_mm(wo, cur, wo_s);
++            }
++            if (wo_b) {
++                cur = ggml_add(ctx0, cur, wo_b);
++            }
++            return cur;
++        }
++
+         k = mctx_cur->get_k(ctx0, il);
+         v = mctx_cur->get_v(ctx0, il);
+     }
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 3daa425..a45b212 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -24,6 +24,19 @@ struct llama_prec_policy;
+ struct llama_memory_context_i;
+ 
+ class llama_kv_cache_context;
++
++// a sequence's share of a ubatch that mixes windowed sequences (llama_kv_cache::set_seq_windows):
++// its rows of the ubatch and its window's cells, so its attention runs over that window only
++struct llama_kv_win_part {
++    uint32_t kv_off = 0;
++    uint32_t n_kv   = 0;
++    uint32_t row0   = 0;
++    uint32_t n_rows = 0;
++
++    bool operator==(const llama_kv_win_part & o) const {
++        return kv_off == o.kv_off && n_kv == o.n_kv && row0 == o.row0 && n_rows == o.n_rows;
++    }
++};
+ class llama_kv_cache_dsa_context;
+ class llama_kv_cache_dsa_iswa_context;
+ class llama_kv_cache_msa_context;
+@@ -346,6 +359,11 @@ public:
+     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
+     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+ 
++    // a ubatch of several windowed sequences (llama_kv_cache::set_seq_windows): each
++    // part's rows and window, and its slice of the mask, made once for all layers
++    std::vector<llama_kv_win_part> win_parts;
++    std::vector<ggml_tensor *>     self_kq_mask_parts;
++
+     // note: assumes v_rot^2 == I
+     ggml_tensor * self_k_rot = nullptr;
+     ggml_tensor * self_v_rot = nullptr;
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index dab9cf9..980d72e 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1288,6 +1288,36 @@ int32_t llama_kv_cache::win_of(uint32_t idx) const {
+     return -1;
+ }
+ 
++std::vector<llama_kv_cache::win_part> llama_kv_cache::get_win_parts(const slot_info & sinfo, const llama_ubatch & ubatch) const {
++    std::vector<win_part> res;
++    if (win_size.empty() || sinfo.kv_win != 0 || n_stream != 1 || ubatch.n_seqs_unq < 2 || !ubatch.equal_seqs()) {
++        return res;
++    }
++    const uint32_t nst = ubatch.n_seq_tokens;
++    if (nst == 0 || nst * ubatch.n_seqs != ubatch.n_tokens || ubatch.n_seqs != ubatch.n_seqs_unq) {
++        return res;
++    }
++    const auto &   cells     = v_cells[0];
++    const uint32_t n_pad_cur = std::max(n_pad, 256u);
++    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
++        const uint32_t     row0 = s * nst;
++        const llama_seq_id seq  = ubatch.seq_id[row0][0];
++        for (uint32_t i = 0; i < nst; ++i) {
++            if (ubatch.n_seq_id[row0 + i] != 1 || ubatch.seq_id[row0 + i][0] != seq) {
++                return {};
++            }
++        }
++        if ((size_t) seq >= win_size.size() || win_size[seq] == 0) {
++            return {};
++        }
++        const uint32_t base = win_base[seq];
++        const uint32_t m    = cells.used_max_p1_in(base, base + win_size[seq]) - base;
++        const uint32_t n    = std::min(win_size[seq], std::max(n_pad_cur, (uint32_t) GGML_PAD(m, n_pad_cur)));
++        res.push_back({ base, n, row0, nst });
++    }
++    return res;
++}
++
+ bool llama_kv_cache::set_seq_windows(const uint32_t * n_cells, int32_t n_seq) {
+     if (n_seq <= 0) {
+         win_base.clear();
+@@ -3011,6 +3041,17 @@ bool llama_kv_cache_context::apply() {
+     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
+     n_kv = kv->get_n_kv(sinfos[i_cur]);
+ 
++    // several windowed sequences in one ubatch: each attends over its own window
++    // (llm_graph_context::build_attn); the mask spans every part's cells
++    win_parts = kv->get_win_parts(sinfos[i_cur], ubatches[i_cur]);
++    if (!win_parts.empty()) {
++        uint32_t end = 0;
++        for (const auto & p : win_parts) {
++            end = std::max(end, p.kv_off + p.n_kv);
++        }
++        n_kv = (int32_t) end;
++    }
++
+     return true;
+ }
+ 
+@@ -3028,6 +3069,20 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
+     return n_kv;
+ }
+ 
++ggml_tensor * llama_kv_cache_context::get_k_part(ggml_context * ctx, int32_t il, const llama_kv_cache::win_part & p) const {
++    llama_kv_cache::slot_info si = sinfos[i_cur];
++    si.kv_off = p.kv_off;
++    si.kv_win = p.n_kv;
++    return kv->get_k(ctx, il, p.n_kv, si);
++}
++
++ggml_tensor * llama_kv_cache_context::get_v_part(ggml_context * ctx, int32_t il, const llama_kv_cache::win_part & p) const {
++    llama_kv_cache::slot_info si = sinfos[i_cur];
++    si.kv_off = p.kv_off;
++    si.kv_win = p.n_kv;
++    return kv->get_v(ctx, il, p.n_kv, si);
++}
++
+ uint32_t llama_kv_cache_context::get_kv_off() const {
+     return sinfos.empty() ? 0 : sinfos[i_cur].kv_off;
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 8bfc3c4..f514041 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -191,6 +191,13 @@ public:
+     // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
+     void state_clear(llama_seq_id seq_id);
+ 
++    // a sequence's share of a ubatch that mixes windowed sequences (llama-graph.h)
++    using win_part = llama_kv_win_part;
++
++    // the parts of a ubatch whose sequences each have a window (empty: no windows, a
++    // ubatch of one sequence, or tokens not grouped by sequence)
++    std::vector<win_part> get_win_parts(const slot_info & sinfo, const llama_ubatch & ubatch) const;
++
+     // cell windows in a unified cache: sequence i gets the cells [sum of n_cells[0..i), + n_cells[i]),
+     // finds its slots there and attends over its own window only, so one sequence's attention does
+     // not span another's cells. call on an empty cache; false when it cannot apply (several streams,
+@@ -422,6 +429,13 @@ public:
+     // the first cell of the current ubatch's window (set_seq_windows), 0 without windows
+     uint32_t get_kv_off() const;
+ 
++    // a ubatch of several windowed sequences: each sequence's rows and window (empty otherwise)
++    const std::vector<llama_kv_cache::win_part> & get_win_parts() const { return win_parts; }
++
++    // views of one part's window
++    ggml_tensor * get_k_part(ggml_context * ctx, int32_t il, const llama_kv_cache::win_part & p) const;
++    ggml_tensor * get_v_part(ggml_context * ctx, int32_t il, const llama_kv_cache::win_part & p) const;
++
+     ggml_type type_k() const;
+     ggml_type type_v() const;
+ 
+@@ -492,4 +506,7 @@ private:
+     // a heuristic, to avoid attending the full cache if it is not yet utilized
+     // as the cache gets filled, the benefit from this heuristic disappears
+     int32_t n_kv;
++
++    // set_seq_windows: the parts of a ubatch of several windowed sequences
++    std::vector<llama_kv_cache::win_part> win_parts;
+ };

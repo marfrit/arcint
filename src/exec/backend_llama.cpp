@@ -13,7 +13,9 @@
 #include <llama.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -869,6 +871,12 @@ private:
         FinishReason reason   = FinishReason::Stop;
         int          id_last  = prompt.back();
         std::vector<int> batch;
+        // a lane in this loop: another lane's verify waits a moment for its step
+        struct Decoding {
+            std::atomic<int>& n;
+            explicit Decoding(std::atomic<int>& c) : n(c) { ++n; }
+            ~Decoding() { --n; }
+        } decoding{ lanes_decoding_ };
         while (true) {
             if (static_cast<int>(have.size()) + 1 >= cap) {
                 reason = FinishReason::Length;
@@ -892,18 +900,13 @@ private:
             batch.assign(1, id_last);
             batch.insert(batch.end(), draft.begin(), draft.end());
             {
-                // the verified rows' logits leave the context under the lock:
-                // another lane's decode would overwrite them
-                std::lock_guard<std::mutex> lk(mu_);
+                // the verify, in one target decode with the other lanes' verifies
+                // that are ready (llama.cpp's server batches its slots the same
+                // way); the rows leave the context under the lock, before another
+                // decode overwrites them
                 const auto t_v = clock_type::now();
-                if (spec_->decode(batch.data(), batch.size(), have.size(), seq, true) != 0)
-                    throw std::runtime_error("llama_decode failed during verify");
-                rows.resize(batch.size() * n_vocab_);
-                for (size_t i = 0; i < batch.size(); ++i) {
-                    const float* l = llama_get_logits_ith(ctx_, static_cast<int32_t>(i));
-                    if (l == nullptr) throw std::runtime_error("llama.cpp returned no logits");
-                    std::copy(l, l + n_vocab_, rows.begin() + static_cast<long>(i * n_vocab_));
-                }
+                VerifyReq  req{ seq, &batch, have.size(), &rows };
+                if (verify_combined(req) != 0) throw std::runtime_error("llama_decode failed during verify");
                 stats.draft_verify_seconds += seconds_since(t_v);
             }
             double     emit_s = 0.0;
@@ -939,6 +942,11 @@ private:
             }
         }
         stats.decode_seconds = seconds_since(t_decode);
+        if (lanes_ > 1) {
+            std::lock_guard<std::mutex> lk(mu_);
+            log::info("slot", "lane %d: %llu verifies so far shared a decode with another lane's (process-wide)", seq,
+                      static_cast<unsigned long long>(n_combined_));
+        }
         log_expert_cache(seq);
         return reason;
     }
@@ -1078,6 +1086,74 @@ private:
 
     // One llama_decode of n tokens of `seq` at positions [pos, pos + n), with
     // logits for the last one when `want_last`. Caller holds mu_.
+    // A lane's verify [last, drafts...], handed to the combiner
+    struct VerifyReq {
+        int                     seq  = 0;
+        const std::vector<int>* toks = nullptr;
+        size_t                  pos  = 0;
+        std::vector<float>*     rows = nullptr;
+        bool                    done = false;
+        int                     rc   = 0;
+    };
+
+    // Verifies of several lanes in one target decode. The first lane to arrive
+    // leads: while other lanes are in their decode loop and have not posted
+    // their step yet it waits for them (at most comb_wait_), then decodes every
+    // posted verify at once under mu_ and hands each lane its rows. A lane that
+    // arrives during a decode posts for the next one. One lane alone decodes at
+    // once, as before.
+    int verify_combined(VerifyReq& r) {
+        std::unique_lock<std::mutex> ul(comb_mu_);
+        comb_q_.push_back(&r);
+        comb_cv_.notify_all();
+        while (!r.done) {
+            if (comb_leader_) {
+                comb_cv_.wait(ul);
+                continue;
+            }
+            comb_leader_        = true;
+            const auto deadline = clock_type::now() + comb_wait_;
+            while (static_cast<int>(comb_q_.size()) < lanes_decoding_.load() &&
+                   comb_cv_.wait_until(ul, deadline) != std::cv_status::timeout) {
+            }
+            std::vector<VerifyReq*> reqs;
+            reqs.swap(comb_q_);
+            ul.unlock();
+            int rc = 0;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                std::vector<SpecPart> parts;
+                parts.reserve(reqs.size());
+                for (const VerifyReq* q : reqs)
+                    parts.push_back(SpecPart{ q->seq, q->toks->data(), q->toks->size(), q->pos, true });
+                rc = spec_->decode_multi(parts.data(), parts.size());
+                size_t off = 0;
+                for (VerifyReq* q : reqs) {
+                    const size_t n = q->toks->size();
+                    q->rows->resize(n * n_vocab_);
+                    for (size_t i = 0; rc == 0 && i < n; ++i) {
+                        const float* l = llama_get_logits_ith(ctx_, static_cast<int32_t>(off + i));
+                        if (l == nullptr) {
+                            rc = -1;
+                            break;
+                        }
+                        std::copy(l, l + n_vocab_, q->rows->begin() + static_cast<long>(i * n_vocab_));
+                    }
+                    off += n;
+                }
+                if (reqs.size() > 1) ++n_combined_;
+            }
+            ul.lock();
+            for (VerifyReq* q : reqs) {
+                q->rc   = rc;
+                q->done = true;
+            }
+            comb_leader_ = false;
+            comb_cv_.notify_all();
+        }
+        return r.rc;
+    }
+
     bool decode_locked(int seq, const int* toks, size_t n, size_t pos, bool want_last) {
         llama_batch b = llama_batch_init(static_cast<int32_t>(n), 0, 1);
         for (size_t i = 0; i < n; ++i) {
@@ -1133,6 +1209,14 @@ private:
     std::vector<int>                      cap_;       // per lane (seq): its context
     int                                   n_batch_ = 2048;
     std::mutex                            mu_;    // llama_context is not thread-safe: one call at a time
+    // the verify combiner (verify_combined)
+    std::mutex                            comb_mu_;
+    std::condition_variable               comb_cv_;
+    std::vector<VerifyReq*>               comb_q_;
+    bool                                  comb_leader_   = false;
+    std::atomic<int>                      lanes_decoding_{ 0 };
+    uint64_t                              n_combined_    = 0;   // verifies decoded with another lane's
+    std::chrono::microseconds             comb_wait_{ 20000 };
     std::vector<std::vector<int>>         slot_tokens_;
     std::unique_ptr<LlamaSpec>            spec_;      // --llama-mtp
     int                                   n_draft_ = 0;
