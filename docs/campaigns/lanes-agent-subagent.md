@@ -366,6 +366,41 @@ On the record before the work starts.
       0027 build give the same text on two prompts, the same draft
       acceptance (172/634; 1159/2005) and the same acceptance-task code,
       10/10. The mixed-batch KL on the revised patch: 0.004099.
+- **Next: both lanes in one decode** (opened 2026-10-08, operator: "getting
+  the batching up to the state of the art"; after the Flash-Next KL).
+  - **Reference** (`code`, llama.cpp server at the pin,
+    `tools/server/server-context.cpp:3088-3240`, `:3854`, `:4081-4114`):
+    1. every generating slot that can batch with the first joins one
+       iteration;
+    2. one `common_speculative_draft()` drafts for all of them, one token per
+       sequence a draft step (`common/speculative.cpp:1648ff`);
+    3. each slot's [sampled, drafts...] goes into one batch, and the slot
+       records its rows (`spec_i_batch`);
+    4. pending prompts fill the rest of `n_batch`, so decode goes first;
+    5. one `llama_decode`; each slot accepts against its own rows
+       (`common_sampler_sample_and_accept_n`).
+  - **arcint today** (`code`, `backend_llama.cpp` `generate_spec_lane`): a
+    lane's request thread drafts, verifies and rolls back under one mutex
+    per call, so the lanes take turns. Each step reads the weights once per
+    lane, and with both busy each lane runs at half its alone rate
+    (15.9 + 15.8 against 32.1 t/s, `measured-here`).
+  - **Design, first build: the reference's mechanism.**
+    - A step combiner in the backend: a lane's draft and verify become
+      requests. The thread that takes the context leads: it collects the
+      other lanes' pending steps, drafts for all, builds one batch with each
+      lane's rows, decodes once, and hands each lane its rows.
+    - Accept and rollback stay per lane.
+    - Prefill takes what is left of `n_batch` after the generating rows, as
+      the server does.
+  - **Known cost, kept from the reference:** a step with both lanes is a
+    mixed ubatch. 0026 then falls back to the whole pool's view, so the
+    subagent's rows attend over the agent's cells, masked, as in llama.cpp's
+    unified pool. Measure it first; per-lane attention inside one graph is a
+    later step, beyond the reference.
+  - **Gate:** both lanes busy, a sum well above one lane's rate. One lane
+    alone within the spread of today's. KL of the batched path against one
+    sequence within the answer-level bar (the mixed-ubatch arm, now right
+    with 0027). Answers right on both lanes.
 - **Flash-Next with lanes** (5,500 and 7,500 MiB of slots): eviction both
   times; aborted, numbers void. llama.cpp reserves 6,679 MiB of OpenCL
   compute buffer: the 2,048-token prefill ubatch against the 163,840-cell
