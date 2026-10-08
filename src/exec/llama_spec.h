@@ -26,6 +26,16 @@ struct SpecPart {
     bool       all_logits = false;
 };
 
+// One lane's drafting in a draft step shared by several lanes: up to n_max
+// drafts after id_last at pos0, into *out
+struct DraftPart {
+    int               seq     = 0;
+    int               id_last = 0;
+    size_t            pos0    = 0;
+    int               n_max   = 0;
+    std::vector<int>* out     = nullptr;
+};
+
 class LlamaSpec {
 public:
     virtual ~LlamaSpec() = default;
@@ -40,6 +50,10 @@ public:
     // llama.cpp's server batches its slots), then one MTP-context decode with
     // every lane's entries. The parts' sequences are distinct.
     virtual int decode_multi(const SpecPart* parts, size_t n_parts) = 0;
+    // Several lanes' drafts, one MTP-context decode a draft step for all the
+    // lanes still drafting (llama.cpp's common_speculative_draft drafts for
+    // every slot at once). The parts' sequences are distinct.
+    virtual void draft_multi(DraftPart* parts, size_t n_parts) = 0;
     // Up to n_max tokens following `id_last` at position pos0.
     virtual std::vector<int> draft(int seq, int id_last, size_t pos0, int n_max) = 0;
     // The sequence's context no longer ends where the drafter's carried

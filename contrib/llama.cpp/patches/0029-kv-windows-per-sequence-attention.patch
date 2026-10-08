@@ -94,39 +94,42 @@ index 3daa425..a45b212 100644
      ggml_tensor * self_k_rot = nullptr;
      ggml_tensor * self_v_rot = nullptr;
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index dab9cf9..980d72e 100644
+index dab9cf9..5c55f9e 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -1288,6 +1288,36 @@ int32_t llama_kv_cache::win_of(uint32_t idx) const {
+@@ -1288,6 +1288,39 @@ int32_t llama_kv_cache::win_of(uint32_t idx) const {
      return -1;
  }
  
 +std::vector<llama_kv_cache::win_part> llama_kv_cache::get_win_parts(const slot_info & sinfo, const llama_ubatch & ubatch) const {
 +    std::vector<win_part> res;
-+    if (win_size.empty() || sinfo.kv_win != 0 || n_stream != 1 || ubatch.n_seqs_unq < 2 || !ubatch.equal_seqs()) {
++    if (win_size.empty() || sinfo.kv_win != 0 || n_stream != 1 || ubatch.n_seqs_unq < 2 || ubatch.n_tokens == 0) {
 +        return res;
 +    }
-+    const uint32_t nst = ubatch.n_seq_tokens;
-+    if (nst == 0 || nst * ubatch.n_seqs != ubatch.n_tokens || ubatch.n_seqs != ubatch.n_seqs_unq) {
-+        return res;
-+    }
++    // one contiguous run of rows a sequence (an equal split of a hybrid memory, or a
++    // batch that adds each sequence's tokens together), every sequence windowed
 +    const auto &   cells     = v_cells[0];
 +    const uint32_t n_pad_cur = std::max(n_pad, 256u);
-+    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
-+        const uint32_t     row0 = s * nst;
-+        const llama_seq_id seq  = ubatch.seq_id[row0][0];
-+        for (uint32_t i = 0; i < nst; ++i) {
-+            if (ubatch.n_seq_id[row0 + i] != 1 || ubatch.seq_id[row0 + i][0] != seq) {
-+                return {};
-+            }
-+        }
-+        if ((size_t) seq >= win_size.size() || win_size[seq] == 0) {
++    std::vector<bool> seen(win_size.size(), false);
++    uint32_t row0 = 0;
++    while (row0 < ubatch.n_tokens) {
++        if (ubatch.n_seq_id[row0] != 1) {
 +            return {};
++        }
++        const llama_seq_id seq = ubatch.seq_id[row0][0];
++        if ((size_t) seq >= win_size.size() || win_size[seq] == 0 || seen[seq]) {
++            return {};
++        }
++        seen[seq] = true;
++        uint32_t end = row0 + 1;
++        while (end < ubatch.n_tokens && ubatch.n_seq_id[end] == 1 && ubatch.seq_id[end][0] == seq) {
++            ++end;
 +        }
 +        const uint32_t base = win_base[seq];
 +        const uint32_t m    = cells.used_max_p1_in(base, base + win_size[seq]) - base;
 +        const uint32_t n    = std::min(win_size[seq], std::max(n_pad_cur, (uint32_t) GGML_PAD(m, n_pad_cur)));
-+        res.push_back({ base, n, row0, nst });
++        res.push_back({ base, n, row0, end - row0 });
++        row0 = end;
 +    }
 +    return res;
 +}
@@ -134,7 +137,7 @@ index dab9cf9..980d72e 100644
  bool llama_kv_cache::set_seq_windows(const uint32_t * n_cells, int32_t n_seq) {
      if (n_seq <= 0) {
          win_base.clear();
-@@ -3011,6 +3041,17 @@ bool llama_kv_cache_context::apply() {
+@@ -3011,6 +3044,17 @@ bool llama_kv_cache_context::apply() {
      kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
      n_kv = kv->get_n_kv(sinfos[i_cur]);
  
@@ -152,7 +155,7 @@ index dab9cf9..980d72e 100644
      return true;
  }
  
-@@ -3028,6 +3069,20 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
+@@ -3028,6 +3072,20 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
      return n_kv;
  }
  

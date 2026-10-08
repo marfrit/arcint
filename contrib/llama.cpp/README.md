@@ -1646,8 +1646,10 @@ its window's K/V (`get_k_part`, `get_v_part`) and its slice of the mask. The
 slice is made contiguous once a graph and shared by all layers. The outputs
 are concatenated along the tokens.
 
-- `llama_kv_cache::get_win_parts` checks the ubatch's tokens are grouped by
-  sequence, one per row, each with a window. Otherwise the whole-stream
+- `llama_kv_cache::get_win_parts` takes a ubatch whose tokens come in one
+  contiguous run per sequence, each sequence windowed: a hybrid memory's
+  equal split, or a batch that adds each sequence's tokens together (an MTP
+  draft context's split is simple, not equal). Otherwise the whole-stream
   view stays, as before.
 - The mask spans every part's cells (`n_kv` up to the furthest window's
   end).

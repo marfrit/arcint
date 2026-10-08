@@ -427,8 +427,21 @@ On the record before the work starts.
   - **Left in the shared step** (profile, small lanes): the MTP snapshots
     of two sequences (+1.2 s per answer pair, memory-bound) and twice the
     columns per product.
-  - **Next:** stage 2, one draft step for all lanes (drafting is serial
-    today, each lane under the context lock).
+- **Stage 2, shared drafts** (`measured-here`, 2026-10-09): the combiner
+  takes a lane's whole step. One shared draft loop
+  (`LlamaSpec::draft_multi`, one MTP-context decode a draft step for every
+  lane still drafting) feeds the shared verify.
+  - The first build drafted 4x slower (5.5 s an answer): the MTP context's
+    attention-only cache splits batches simply, not equally, so 0029's
+    per-sequence attention did not engage. 0029 now takes any ubatch with
+    one contiguous run per sequence.
+  - After: 19.3-22.2 t/s a lane, drafting 2.0 s an answer for both, against
+    stage 1's 19.7-22.4. The shared draft step costs ~15 ms against two
+    serial 10 ms drafts, so drafting is no longer serial, but the gain is
+    small.
+  - KL of the mixed path still equals one sequence's (0.004099).
+  - Acceptance with both lanes busy was 23-30 % in stage 1 and stage 2
+    alike (solo 28.6 %): the shared texts differ.
 - **Flash-Next with lanes** (5,500 and 7,500 MiB of slots): eviction both
   times; aborted, numbers void. llama.cpp reserves 6,679 MiB of OpenCL
   compute buffer: the 2,048-token prefill ubatch against the 163,840-cell

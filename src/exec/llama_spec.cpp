@@ -480,49 +480,94 @@ public:
     }
 
     std::vector<int> draft(int seq, int id_last, size_t pos0, int n_max) override {
-        Lane&            ln = lanes_[static_cast<size_t>(seq)];
         std::vector<int> out;
-        const int        n  = std::min(n_max, n_draft_);
-        if (n <= 0 || ln.pending <= 0 || ln.base + static_cast<size_t>(ln.pending) != pos0) return out;
-        // the pending rows with what followed them; the last one's output is draft 0
-        // (kept if the MTP context refuses it: the verify's decode writes them)
-        const int pending = ln.pending;
+        DraftPart        p{ seq, id_last, pos0, n_max, &out };
+        draft_multi(&p, 1);
+        return out;
+    }
+
+    void draft_multi(DraftPart* parts, size_t n_parts) override {
+        // per part: its draft budget, its batch index in the current step, its
+        // carried row, whether it is still drafting, its pending count before
+        struct St {
+            int                n = 0, idx = -1, pending = 0;
+            bool               on = false;
+            std::vector<float> row;
+        };
+        std::vector<St> st(n_parts);
+        const bool      out_logits = head_ == nullptr;
         clear_d();
-        if (!add_pending(ln, id_last, seq, head_ == nullptr)) return out;
-        const float* row = nullptr;
-        for (int i = 0; i < n; ++i) {
+        bool any = false;
+        for (size_t k = 0; k < n_parts; ++k) {
+            DraftPart& p  = parts[k];
+            Lane&      ln = lanes_[static_cast<size_t>(p.seq)];
+            p.out->clear();
+            st[k].n = std::min(p.n_max, n_draft_);
+            if (st[k].n <= 0 || ln.pending <= 0 || ln.base + static_cast<size_t>(ln.pending) != p.pos0) continue;
+            // the pending rows with what followed them; the last one's output is draft 0
+            // (kept if the MTP context refuses it: the verify's decode writes them)
+            st[k].pending = ln.pending;
+            if (!add_pending(ln, p.id_last, p.seq, out_logits)) {
+                ln.pending = st[k].pending;
+                continue;
+            }
+            st[k].idx = nd_ - 1;
+            st[k].on  = true;
+            any       = true;
+        }
+        for (int i = 0; any; ++i) {
             if (i > 0) {
                 clear_d();
-                if (!add(bd_, out.back(), pos0 + static_cast<size_t>(i), seq, head_ == nullptr, row)) break;
+                any = false;
+                for (size_t k = 0; k < n_parts; ++k) {
+                    if (!st[k].on) continue;
+                    if (i >= st[k].n || !add(bd_, parts[k].out->back(), parts[k].pos0 + static_cast<size_t>(i), parts[k].seq,
+                                             out_logits, st[k].row.data())) {
+                        st[k].on = false;
+                        continue;
+                    }
+                    st[k].idx = nd_ - 1;
+                    any       = true;
+                }
+                if (!any) break;
             }
             if (llama_process(ctx_dft_, LLAMA_PROCESS_TYPE_DECODE, bd_) != 0) {
-                if (i == 0) ln.pending = pending;
+                if (i == 0)
+                    for (size_t k = 0; k < n_parts; ++k)
+                        if (st[k].on) lanes_[static_cast<size_t>(parts[k].seq)].pending = st[k].pending;
                 break;
             }
-            if (i == 0) ln.mtp_end = pos0 + 1;
-            int tok = -1;
-            float prob = 1.0f;
-            const float* h = nullptr;
-            if (head_) {
-                h   = llama_get_embeddings_nextn_ith(ctx_dft_, nd_ - 1);   // unmasked: the batch index
-                tok = h != nullptr ? head_->pick(h, min_p_ > 0.0f ? &prob : nullptr) : -1;
-            } else {
-                const float* l = llama_get_logits_ith(ctx_dft_, -1);
-                h   = llama_get_embeddings_nextn_ith(ctx_dft_, -1);
-                tok = l != nullptr ? static_cast<int>(std::max_element(l, l + n_vocab_) - l) : -1;
-                if (tok >= 0 && min_p_ > 0.0f) prob = DraftHead::top_prob(l, static_cast<size_t>(n_vocab_), l[tok]);
+            any = false;
+            for (size_t k = 0; k < n_parts; ++k) {
+                if (!st[k].on) continue;
+                if (i == 0) lanes_[static_cast<size_t>(parts[k].seq)].mtp_end = parts[k].pos0 + 1;
+                int          tok  = -1;
+                float        prob = 1.0f;
+                const float* h    = nullptr;
+                if (head_) {
+                    h   = llama_get_embeddings_nextn_ith(ctx_dft_, st[k].idx);   // unmasked: the batch index
+                    tok = h != nullptr ? head_->pick(h, min_p_ > 0.0f ? &prob : nullptr) : -1;
+                } else {
+                    const float* l = llama_get_logits_ith(ctx_dft_, st[k].idx);
+                    h   = llama_get_embeddings_nextn_ith(ctx_dft_, st[k].idx);
+                    tok = l != nullptr ? static_cast<int>(std::max_element(l, l + n_vocab_) - l) : -1;
+                    if (tok >= 0 && min_p_ > 0.0f) prob = DraftHead::top_prob(l, static_cast<size_t>(n_vocab_), l[tok]);
+                }
+                // Strata's spec-min-p (src/core/mtp.cpp:804): the chain goes on while
+                // the drafts are likely enough to be verified; one below stays out
+                if (h == nullptr || tok < 0 || prob < min_p_) {
+                    st[k].on = false;
+                    continue;
+                }
+                parts[k].out->push_back(tok);
+                st[k].row.assign(h, h + n_embd_);
+                any = true;
             }
-            if (h == nullptr || tok < 0) break;
-            // Strata's spec-min-p (src/core/mtp.cpp:804): the chain goes on while
-            // the drafts are likely enough to be verified; one below stays out
-            if (prob < min_p_) break;
-            out.push_back(tok);
-            std::memcpy(h_step_.data(), h, static_cast<size_t>(n_embd_) * sizeof(float));
-            row = h_step_.data();
         }
         // the drafts leave; the entry of pos0 (id_last, a target row) stays
-        llama_memory_seq_rm(llama_get_memory(ctx_dft_), seq, static_cast<llama_pos>(pos0 + 1), -1);
-        return out;
+        for (size_t k = 0; k < n_parts; ++k)
+            if (st[k].idx >= 0)
+                llama_memory_seq_rm(llama_get_memory(ctx_dft_), parts[k].seq, static_cast<llama_pos>(parts[k].pos0 + 1), -1);
     }
 
     // as the reference starts a sequence: the next entry takes a zero row

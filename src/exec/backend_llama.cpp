@@ -891,24 +891,17 @@ private:
             const int n_max = std::max(0, std::min(n_draft_, budget - 1));
             std::vector<int> draft;
             {
-                const auto t_p = clock_type::now();
-                std::lock_guard<std::mutex> lk(mu_);
-                if (n_max > 0) draft = spec_->draft(seq, id_last, have.size(), n_max);
-                stats.draft_propose_seconds += seconds_since(t_p);
+                // the step, with the other lanes' steps that are ready: one draft
+                // step for all, then one target decode for all the verifies
+                // (llama.cpp's server drafts and batches its slots the same way);
+                // the rows leave the context under the lock, before another
+                // decode overwrites them
+                StepReq req{ seq, id_last, have.size(), n_max, &draft, &batch, &rows };
+                if (step_combined(req) != 0) throw std::runtime_error("llama_decode failed during verify");
+                stats.draft_propose_seconds += req.t_propose;
+                stats.draft_verify_seconds += req.t_verify;
             }
             stats.draft_proposed += static_cast<int>(draft.size());
-            batch.assign(1, id_last);
-            batch.insert(batch.end(), draft.begin(), draft.end());
-            {
-                // the verify, in one target decode with the other lanes' verifies
-                // that are ready (llama.cpp's server batches its slots the same
-                // way); the rows leave the context under the lock, before another
-                // decode overwrites them
-                const auto t_v = clock_type::now();
-                VerifyReq  req{ seq, &batch, have.size(), &rows };
-                if (verify_combined(req) != 0) throw std::runtime_error("llama_decode failed during verify");
-                stats.draft_verify_seconds += seconds_since(t_v);
-            }
             double     emit_s = 0.0;
             const auto t_walk = clock_type::now();
             const VerifyWalk w = walk_verify(
@@ -944,7 +937,7 @@ private:
         stats.decode_seconds = seconds_since(t_decode);
         if (lanes_ > 1) {
             std::lock_guard<std::mutex> lk(mu_);
-            log::info("slot", "lane %d: %llu verifies so far shared a decode with another lane's (process-wide)", seq,
+            log::info("slot", "lane %d: %llu steps so far shared with another lane's (process-wide)", seq,
                       static_cast<unsigned long long>(n_combined_));
         }
         log_expert_cache(seq);
@@ -1086,23 +1079,28 @@ private:
 
     // One llama_decode of n tokens of `seq` at positions [pos, pos + n), with
     // logits for the last one when `want_last`. Caller holds mu_.
-    // A lane's verify [last, drafts...], handed to the combiner
-    struct VerifyReq {
-        int                     seq  = 0;
-        const std::vector<int>* toks = nullptr;
-        size_t                  pos  = 0;
-        std::vector<float>*     rows = nullptr;
-        bool                    done = false;
-        int                     rc   = 0;
+    // A lane's step, handed to the combiner: its drafts (up to n_max after
+    // id_last at pos), then the verify of [id_last, drafts...]
+    struct StepReq {
+        int                 seq     = 0;
+        int                 id_last = 0;
+        size_t              pos     = 0;
+        int                 n_max   = 0;
+        std::vector<int>*   draft   = nullptr;
+        std::vector<int>*   batch   = nullptr;
+        std::vector<float>* rows    = nullptr;
+        bool                done    = false;
+        int                 rc      = 0;
+        double              t_propose = 0.0, t_verify = 0.0;
     };
 
-    // Verifies of several lanes in one target decode. The first lane to arrive
-    // leads: while other lanes are in their decode loop and have not posted
-    // their step yet it waits for them (at most comb_wait_), then decodes every
-    // posted verify at once under mu_ and hands each lane its rows. A lane that
-    // arrives during a decode posts for the next one. One lane alone decodes at
-    // once, as before.
-    int verify_combined(VerifyReq& r) {
+    // Steps of several lanes at once. The first lane to arrive leads: while
+    // other lanes are in their decode loop and have not posted their step yet
+    // it waits for them (at most comb_wait_), then, under mu_, drafts for every
+    // posted step in shared draft steps, verifies them in one target decode and
+    // hands each lane its drafts and rows. A lane that arrives meanwhile posts
+    // for the next round. One lane alone runs at once, as before.
+    int step_combined(StepReq& r) {
         std::unique_lock<std::mutex> ul(comb_mu_);
         comb_q_.push_back(&r);
         comb_cv_.notify_all();
@@ -1116,20 +1114,33 @@ private:
             while (static_cast<int>(comb_q_.size()) < lanes_decoding_.load() &&
                    comb_cv_.wait_until(ul, deadline) != std::cv_status::timeout) {
             }
-            std::vector<VerifyReq*> reqs;
+            std::vector<StepReq*> reqs;
             reqs.swap(comb_q_);
             ul.unlock();
-            int rc = 0;
+            int    rc = 0;
+            double t_p = 0.0, t_v = 0.0;
             {
                 std::lock_guard<std::mutex> lk(mu_);
+                const auto             t0 = clock_type::now();
+                std::vector<DraftPart> dparts;
+                dparts.reserve(reqs.size());
+                for (StepReq* q : reqs)
+                    if (q->n_max > 0) dparts.push_back(DraftPart{ q->seq, q->id_last, q->pos, q->n_max, q->draft });
+                    else q->draft->clear();
+                if (!dparts.empty()) spec_->draft_multi(dparts.data(), dparts.size());
+                t_p = seconds_since(t0);
+                const auto            t1 = clock_type::now();
                 std::vector<SpecPart> parts;
                 parts.reserve(reqs.size());
-                for (const VerifyReq* q : reqs)
-                    parts.push_back(SpecPart{ q->seq, q->toks->data(), q->toks->size(), q->pos, true });
+                for (StepReq* q : reqs) {
+                    q->batch->assign(1, q->id_last);
+                    q->batch->insert(q->batch->end(), q->draft->begin(), q->draft->end());
+                    parts.push_back(SpecPart{ q->seq, q->batch->data(), q->batch->size(), q->pos, true });
+                }
                 rc = spec_->decode_multi(parts.data(), parts.size());
                 size_t off = 0;
-                for (VerifyReq* q : reqs) {
-                    const size_t n = q->toks->size();
+                for (StepReq* q : reqs) {
+                    const size_t n = q->batch->size();
                     q->rows->resize(n * n_vocab_);
                     for (size_t i = 0; rc == 0 && i < n; ++i) {
                         const float* l = llama_get_logits_ith(ctx_, static_cast<int32_t>(off + i));
@@ -1141,12 +1152,15 @@ private:
                     }
                     off += n;
                 }
+                t_v = seconds_since(t1);
                 if (reqs.size() > 1) ++n_combined_;
             }
             ul.lock();
-            for (VerifyReq* q : reqs) {
-                q->rc   = rc;
-                q->done = true;
+            for (StepReq* q : reqs) {
+                q->rc        = rc;
+                q->t_propose = t_p;
+                q->t_verify  = t_v;
+                q->done      = true;
             }
             comb_leader_ = false;
             comb_cv_.notify_all();
@@ -1209,13 +1223,13 @@ private:
     std::vector<int>                      cap_;       // per lane (seq): its context
     int                                   n_batch_ = 2048;
     std::mutex                            mu_;    // llama_context is not thread-safe: one call at a time
-    // the verify combiner (verify_combined)
+    // the step combiner (step_combined)
     std::mutex                            comb_mu_;
     std::condition_variable               comb_cv_;
-    std::vector<VerifyReq*>               comb_q_;
+    std::vector<StepReq*>                 comb_q_;
     bool                                  comb_leader_   = false;
     std::atomic<int>                      lanes_decoding_{ 0 };
-    uint64_t                              n_combined_    = 0;   // verifies decoded with another lane's
+    uint64_t                              n_combined_    = 0;   // steps shared with another lane's
     std::chrono::microseconds             comb_wait_{ 20000 };
     std::vector<std::vector<int>>         slot_tokens_;
     std::unique_ptr<LlamaSpec>            spec_;      // --llama-mtp
