@@ -199,6 +199,47 @@ On the record before the work starts.
     into one decode with drafts across the sequences (llama.cpp server
     `update_slots`); decode before prefill; a per-lane draft budget as
     the priority knob. Then Flash-Next's lane memory.
+- **The gate after 0025** (`measured-here`, 2026-10-08, B60, the
+  test-drive unit: lanes 131,072 + 32,768, shared pool, MTP 5; the
+  repository's source as context, cold prefixes, 400 tokens greedy; one
+  lane decoding at a time, in this order):
+
+  | cell | prefill | decode |
+  |---|---|---|
+  | agent 4k, pool empty | 824 t/s | 36.8 t/s |
+  | subagent 4k, agent holds 4k | 707 t/s | 31.8 t/s |
+  | subagent 29k | 527 t/s | 25.6 t/s |
+  | agent 4k, subagent holds 29k | 606 t/s | 28.3 t/s |
+  | agent 130k, subagent holds 29k | 191 t/s | 14.3 t/s |
+  | subagent 4k, agent holds 130k | 339 t/s | 14.2 t/s |
+  | agent 4k, subagent holds 4k | 782 t/s | 36.7 t/s |
+
+  The single-lane window, the same build and prompts:
+  - 4k: 36.6 t/s;
+  - 29k: 32.3 t/s;
+  - 130k: 19.3 t/s, prefill 252 t/s.
+
+  Acceptance is 32-38 % in every cell, so the drafts do not explain the
+  gap.
+  - **The gate fails:** with the agent lane 130k deep, the subagent decodes
+    14.2 t/s, under 20. A lane's speed follows the pool's total fill, not
+    its own.
+  - **The record agrees:** on the served unit before this window, with
+    80k of agent context left in the pool, the agent lane decoded a 4k
+    cell at 24.5 t/s and a 29k cell at 25.2 t/s.
+  - **Hypothesis, not measured:** the `n_kv = used_max_p1` cost listed
+    under Known costs. The subagent's cells sit above the agent's in the
+    one stream, so its attention spans both (`code`). The KV debug that
+    withdrew this earlier ran with an empty pool. The next check is n_kv
+    in the "agent holds 130k" cell.
+  - **The fallback is out:** one stream per lane at the largest cap needs
+    2 x 131,072 cells of q8_0 KV. That is about 3.3 GiB more than the shared
+    pool's 163,840 cells (5.44 GiB, scaled). The card has 22.7 GiB usable,
+    and the single-lane unit already peaks at 21.4.
+  - **For the operator:** pin the subagent lane to the pool's low cells, so
+    its n_kv stays under its cap whatever the agent holds. Or build
+    per-sequence attention ranges. Either goes beyond the reference, whose
+    unified pool has the same cost.
 - **Flash-Next with lanes** (5,500 and 7,500 MiB of slots): eviction both
   times; aborted, numbers void. llama.cpp reserves 6,679 MiB of OpenCL
   compute buffer: the 2,048-token prefill ubatch against the 163,840-cell

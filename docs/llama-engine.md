@@ -258,6 +258,22 @@ The prices, KL and speed are in the 0015 section of
   at 131,072 overcommitted the card: a copy-engine reset;
 - a 128,133-token prompt prefills in 772 s (166 t/s), and decodes at
   7.5 t/s at that depth (38 % draft acceptance, a repetitive prompt);
+- re-measured 2026-10-08 (`measured-here`; the qfndev build after 0025, one
+  lane, `--n-ctx 131072`, the agent's flags; the repository's source as
+  context with a cold prefix per run; 400 tokens greedy; one run per cell):
+
+  | prompt | prefill | decode, MTP 5 | drafts accepted | decode, no MTP |
+  |---:|---:|---:|---:|---:|
+  | 4,109 | 824-910 t/s | 36.6 t/s | 37 % | 18.4 t/s |
+  | 28,833 | 589-638 t/s | 32.3 t/s | 43 % | 15.1 t/s |
+  | 129,981 | 252-272 t/s | 19.3 t/s | 47 % | 9.7 t/s |
+
+  The prefill range is the MTP arm against the plain one. At 129,981 tokens
+  both arms answer a question about the context's first file correctly.
+  Peak VRAM is 21.4 GiB with MTP and 19.8 without, with GTT at 24 MiB (no
+  eviction). MTP doubles decode at every depth. Since the 7.5 t/s above,
+  0016 changed the verify attention; the prompt differs too, so the gain is
+  not attributed to 0016 alone;
 - the acceptance task scores 10/10 at temperature 0, decode 47.1 t/s.
   The 52.6 t/s in the table above is the same prompt and drafts with f16 KV
   at the default 32,768 context. The difference, 10 %, is more than
