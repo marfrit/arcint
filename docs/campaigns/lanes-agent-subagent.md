@@ -105,19 +105,58 @@ On the record before the work starts.
 
 ## Current state
 
-- Recon done (2026-10-07).
-- Implementation written (2026-10-07), red-first on the device-free suites:
-  the flags and their refusals (`tests/test_config.cpp`), lane resolution,
-  the per-lane 400/404/503 and the endpoints (`tests/test_lanes.cpp`), the
-  HTTP wiring (`tests/roundtrip.sh`, named lanes on the stub). The libllama
-  side (`kv_unified`, the pool assert, `cap[seq]`, the MTP draft context) is
-  syntax-checked only: nothing measured, no card touched.
-- Decisions taken in the implementation, for review: `--lane-ctx` with one
-  name is refused (one lane's context is `--n-ctx`); `--n-ctx` alongside is
-  refused; a name given twice is refused; at most 4 lanes; the canonical id
-  resolves to the first lane, as an empty name does; `--stub` accepts named
-  lanes (the device-free suites).
-- Next: the gate's window on the B60.
+- **First window** (`measured-here`, 2026-10-08, B60; the dense Qwen3.8-27B
+  Q4_K_M, q8_0 KV, MTP 5; lanes 131,072 + 32,768, shared pool of 163,840
+  cells):
+  - **Mechanics:**
+    - `/v1/models` lists both names with their `n_ctx`;
+    - an unknown name gets 404 `model_not_found`;
+    - a 44,432-token prompt on the subagent gets the 400 at 32,768;
+    - capital and the 20k needle are right on both lanes;
+    - no eviction (KV 5.44 GiB; at a 68k agent fill, 379 MiB of VRAM free).
+  - **Speed:** the same 300-token answer.
+
+    | arm | decode | a verify |
+    |---|---|---|
+    | one lane, this build or 0.6.0 | 32.1 / 32.2 t/s | ~66 ms |
+    | subagent, agent lane at ~20k / ~64k / ~122k | 7.7 / 7.3 / 6.5 t/s | ~300 ms |
+    | agent lane, the other lane near empty | 8.4 t/s | ~280 ms |
+    | both lanes at once | 4.2 + 4.2 t/s | each waits half the time |
+
+  - **Not the shared pool's attention:** llama.cpp's KV debug shows n_kv at
+    87-131 cells (padded to 256) while a verify still takes ~280 ms. The
+    hypothesis that the pool's `used_max_p1` makes the subagent attend the
+    agent's cells is withdrawn. What costs is lane mode itself; the split
+    test (two sequences without `kv_unified`, lanes without MTP) locates it.
+  - **Both lanes at once:** arcint decodes one sequence per `llama_decode`
+    (`decode_locked`), so the lanes take turns. llama.cpp's server batches
+    its slots into one decode: the reference for doubling the throughput.
+- **Located** (`measured-here`, the split test and llama.cpp's decode
+  timers; the dense agent, the same 300-token answer):
+
+  | arm | decode |
+  |---|---|
+  | one lane, MTP 5 | 31.0-32.2 t/s |
+  | `--parallel 2` (two streams, not unified), MTP 5 | 8.5 t/s |
+  | named lanes, MTP 5 | 8.3-8.5 t/s |
+  | one lane, no MTP | 18.6 t/s |
+  | named lanes, no MTP | 18.6 t/s |
+
+  - **Lanes without MTP cost nothing.** The cost is MTP with two
+    sequences, whether the pool is unified or not. It predates this
+    campaign: `--parallel 2` has it.
+  - **The target context's verify decode** (LLAMA_DECODE_TIMING):
+    - enqueue ("compute") is 12.4 against 12.3 ms;
+    - the wait for its results ("post") is 55.6 against 262.7 ms;
+    - the graphs are reused alike (97 of 100).
+    So the card does ~5x the work per verify with two sequences.
+  - **Next:** a per-kernel profile of one verify, one lane against two, to
+    name the kernel that scales with the sequences.
+- **Flash-Next with lanes** (5,500 and 7,500 MiB of slots): eviction both
+  times; aborted, numbers void. llama.cpp reserves 6,679 MiB of OpenCL
+  compute buffer: the 2,048-token prefill ubatch against the 163,840-cell
+  pool, two sequences. On top come the doubled recurrent state (675 MiB)
+  and the MTP context in the same mode.
 
 ## Where it lives
 
