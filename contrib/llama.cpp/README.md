@@ -13,6 +13,11 @@ A patch that does not apply cleanly to the pin is a bug in this directory, not
 a reason to move the pin. Each patch stays PR-shaped, so it can be offered
 upstream.
 
+A patch's KL check runs two arms: one sequence a batch, and four sequences a
+batch (`llama-perplexity -b 4*c`, ubatches that mix the sequences). arcint
+decodes one sequence per call, but llama.cpp's own batching does not. 0022
+shipped a defect only the second arm sees (fixed by 0027).
+
 ## 0001-opencl-intel-kquant-integer-dot-and-xmx.patch
 
 ggml's OpenCL kernels are tuned for Adreno; on Intel Arc the K-quant matrix
