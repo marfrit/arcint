@@ -338,6 +338,20 @@ On the record before the work starts.
     write whose victim moves when the graph splits, or a missing
     synchronisation that a split hides. Not localised; open. Next: a
     per-node comparison of the mixed graph against the CPU.
+  - **Found and fixed (2026-10-08, llama.cpp patch 0027):** not a kernel.
+    0022's flat-columns path multiplies a 3D `src1` through a stack copy whose
+    address repeats, and the Intel activation cache keys on that address. A
+    mixed ubatch's `final_output` (3D) took that path in every GDN layer, and
+    layer N+1 reused layer N's converted activation. Evidence
+    (`measured-here`):
+    - `GGML_OPENCL_KQ_DEDUP=0` alone fixes it;
+    - per-node dumps hide it, and the KL fell with the share of graphs
+      dumped (0.2438 -> 0.2401 -> 0.1789). This retracts the first dump's
+      "not a race" reading: it had covered only the warm-up graph;
+    - a slot log shows `linear_attn_out-9` hitting the slot
+      `linear_attn_out-8` had filled.
+    With 0027, every mixed arm scores 0.004099 / 97.745 %, and Flash-Next's
+    answers are byte-identical before and after.
 - **Flash-Next with lanes** (5,500 and 7,500 MiB of slots): eviction both
   times; aborted, numbers void. llama.cpp reserves 6,679 MiB of OpenCL
   compute buffer: the 2,048-token prefill ubatch against the 163,840-cell

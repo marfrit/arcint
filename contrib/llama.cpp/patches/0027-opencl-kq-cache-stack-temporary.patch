@@ -1,0 +1,20 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 5088b0e..605721d 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -26008,6 +26008,15 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+             s1.ne[1] = fc; s1.ne[2] = s1.ne[3] = 1; s1.nb[2] = s1.nb[3] = fc * s1.nb[1];
+             d.ne[1]  = fc; d.ne[2]  = d.ne[3]  = 1; d.nb[2]  = d.nb[3]  = fc * d.nb[1];
+             ggml_cl_mul_mat(backend, src0, &s1, &d);
++            // s1 lives on this stack frame, so the next 3D / 4D product's s1 has the same
++            // address: an activation cached under it (kq_q8 and the others are keyed by the
++            // tensor, its buffer, offset and size in this graph) would match another layer's
++            // input at the same offset and hand it this one's conversion. Forget it here
++            for (ggml_cl_kq_act * a : { &backend_ctx->kq_q8, &backend_ctx->kq_f16, &backend_ctx->kq_few, &backend_ctx->kq_i8 }) {
++                if (a->src1 == &s1) {
++                    *a = {};
++                }
++            }
+             return;
+         }
+     }
