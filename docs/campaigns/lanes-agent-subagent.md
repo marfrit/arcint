@@ -352,6 +352,20 @@ On the record before the work starts.
       `linear_attn_out-8` had filled.
     With 0027, every mixed arm scores 0.004099 / 97.745 %, and Flash-Next's
     answers are byte-identical before and after.
+    - **The shape:** in a mixed ubatch of four sequences of 128 tokens,
+      `final_output` is [6144, 128, 4]; one sequence gives [6144, 512, 1] and
+      never takes the flat path.
+    - **Flash-Next cells:** B60, the served flags at 32,768 tokens; the
+      capital, the 20k needle and a 300-token answer, byte-identical with and
+      without 0027; decode 23.4 against 23.3 t/s.
+    - **Review:** the Adreno broadcast loop builds the same kind of stack
+      temporary (not compiled into arcint). The clearing is a helper
+      (`ggml_cl_kq_forget`) called after both, and the Adreno build compiles.
+    - **Dense agent cells** (the review asked: the MTP draft context could
+      take the flat path): one lane, q8_0 KV, MTP 5, 32k. 0.7.0 and the
+      0027 build give the same text on two prompts, the same draft
+      acceptance (172/634; 1159/2005) and the same acceptance-task code,
+      10/10. The mixed-batch KL on the revised patch: 0.004099.
 - **Flash-Next with lanes** (5,500 and 7,500 MiB of slots): eviction both
   times; aborted, numbers void. llama.cpp reserves 6,679 MiB of OpenCL
   compute buffer: the 2,048-token prefill ubatch against the 163,840-cell

@@ -1583,7 +1583,8 @@ sequences gave wrong logits on the Intel path.
   flat path in every GDN layer. One sequence per ubatch keeps `src1` 2D and
   never takes it.
 - **The fix:** after the flat product, a slot keyed by the temporary is
-  cleared.
+  cleared (`ggml_cl_kq_forget`), also after the Adreno broadcast loop, which
+  builds the same kind of temporary (that build compiles; it is not arcint's).
 
 Found and measured on the B60 (`measured-here`, 2026-10-08; the dense
 Qwen3.8-27B Q4_K_M, q8_0 KV, `llama-perplexity` KL against the Q8 reference,
@@ -1603,6 +1604,10 @@ Qwen3.8-27B Q4_K_M, q8_0 KV, `llama-perplexity` KL against the Q8 reference,
   products): the capital, the 20k needle and a 300-token answer are
   byte-identical with and without the patch (23.4 / 23.3 t/s, the served
   flags at 32,768 tokens). No stale hit happened there.
+- **The dense agent** (one lane, q8_0 KV, MTP 5, 32k; its draft context
+  could take the flat path too): with and without the patch, the same text
+  on two prompts, the same draft acceptance (172/634 and 1159/2005), and the
+  same acceptance-task code (10/10).
 - arcint decodes one sequence per call, so its served path never took the
-  stale hit; the patch matters for llama.cpp's own batching with these
+  stale hit. The patch matters for llama.cpp's own batching with these
   patches (`llama-server -np N`) and for batching lanes into one decode.

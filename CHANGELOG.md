@@ -31,8 +31,14 @@ builds llama.cpp `bed0a85` with `contrib/llama.cpp/patches` 0001-0027.
   - **Measured** (`measured-here`, B60, the dense Qwen3.8-27B, four sequences
     a batch): KL 0.2438 / top-1 81.96 % before; 0.004099 / 97.745 % after,
     equal to one sequence.
-  - **Not affected:** arcint's served path (one sequence per call) never took
-    it. Flash-Next's answers are byte-identical with and without the patch.
+  - **Not affected** (`measured-here`, with and without the patch): arcint's
+    served path decodes one sequence per call.
+    - The dense agent with MTP 5: the same text, the same draft acceptance
+      and the same acceptance-task code (10/10 at 32k).
+    - Flash-Next: the capital, the 20k needle and a 300-token answer
+      byte-identical.
+  - **The Adreno build:** its broadcast loop takes the same kind of stack
+    temporary and is covered too.
 - **A patch's KL check** now has a four-sequence arm
   (`contrib/llama.cpp/README.md`).
 
