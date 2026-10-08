@@ -541,15 +541,23 @@ A context is a multiple of 256, at most the model's trained context, at most
   layout, else a sequence's stream there would be the pool divided by the
   lanes, under the agent lane's context. Recurrent state and checkpoints
   stay per lane. Equal lanes (`--parallel N` alone) keep a stream each.
-- **The cost, to be measured**: in one stream, `n_kv` follows the highest
-  used cell of the pool (`llama-kv-cache.cpp:1260-1270`), so a lane's
-  attention (and on Flash-Next the indexer's scoring) runs over the other
-  lane's cells too, masked. The gate is the subagent lane's decode at 20 t/s
-  or more while the agent lane holds 0, 64k and 120k cells; below it, the
-  fallback is a stream per lane at the largest context
-  (`docs/campaigns/lanes-agent-subagent.md`). The expert cache's counters
-  are the model's: with more than one lane its per-request line is labelled
-  process-wide.
+- **A window per lane** (`contrib/llama.cpp` 0026): in one stream, `n_kv`
+  followed the highest used cell of the pool (`llama-kv-cache.cpp:1260-1270`),
+  so a lane's attention ran over the other lane's cells too, masked. With
+  the agent lane 29k deep the subagent read `n = 33,741` for its 4,508
+  cells and decoded 30.3 t/s against 38.4 (`measured-here`). arcint now sets
+  a cell window per lane (`llama_memory_seq_windows`) on the target and the
+  MTP draft context: lane i finds its cells in its own range and attends
+  over that range only. The subagent's 300-token answer decodes 32.0-32.1
+  t/s whether the agent lane holds 20k, 64k or 118k tokens; KL equals one
+  lane's (`docs/campaigns/lanes-agent-subagent.md`). Flash-Next's indexed
+  memory refuses windows and keeps the whole-pool views, with a warning at
+  load. The expert cache's counters are the model's: with more than one lane
+  its per-request line is labelled process-wide.
+- **Both lanes busy**: arcint decodes one lane per `llama_decode`, so the
+  lanes take turns and their sum is one lane's rate (15.9 + 15.8 t/s against
+  32.1 alone). Batching them into one decode, as llama.cpp's server does, is
+  open.
 
 ## Not yet on this engine
 

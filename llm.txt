@@ -38,22 +38,24 @@ top-1 -0.10 points against Q4_K_M, acceptance 10/10). The libllama engine keeps 
 checkpoints (--llama-checkpoints): a follow-up after a thinking turn or an
 edited message resumes instead of re-prefilling (24.3k tokens: 38.75 s ->
 0.61 s on the B60, measured-here); no shared prefix cache across lanes.
-Since 0.6.0, unreleased on this branch (measured-here):
+Release 0.7.0 (2026-10-08), measured-here:
+- named lanes (--served-model-name A,B --lane-ctx CA,CB): an agent and a
+  subagent lane on one set of weights, picked by the model field, each in
+  its own window of one KV pool (contrib/llama.cpp 0026). The dense agent's
+  subagent lane decodes 32.0-32.1 t/s whether the agent lane holds 20k,
+  64k or 118k tokens; KL equal to one lane
+  (docs/campaigns/lanes-agent-subagent.md);
 - one model across two different Arc cards (contrib/llama.cpp 0023, 0024;
   --device GPU.0,GPU.1 --llama-layer-split K, --llama-expert-cache A,B,
   --llama-mtp-card): Flash-Next at 131,072 tokens, K=36 with MTP on the
   B60, decodes 21.7 t/s against 19.8 on the B60 alone
   (docs/campaigns/layer-split-two-cards.md);
-- named lanes (--served-model-name A,B --lane-ctx CA,CB): an agent and a
-  subagent lane on one set of weights, one shared KV pool. Its gate fails
-  so far: a lane slows with the other lane's fill (subagent 14.2 t/s with
-  the agent lane 130k deep; docs/campaigns/lanes-agent-subagent.md);
 - contrib/llama.cpp 0025: a row-parallel copy for the MTP snapshot write
   with two sequences configured and one busy (10.9 -> 40.9 t/s).
 Open work is one document per campaign under docs/campaigns/ (README
-there: rules, template, index). Next: per-lane attention ranges; a prefix
-cache shared across lanes; multi-draft MTP for Flash-Next; prefill on the
-GPU.
+there: rules, template, index). Next: batching both lanes into one decode;
+a prefix cache shared across lanes; multi-draft MTP for Flash-Next; prefill
+on the GPU.
 
 ## Current numbers (measured-here; card and configuration named)
 

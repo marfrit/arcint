@@ -17,6 +17,59 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.7.0 — 2026-10-08
+
+**Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine
+builds llama.cpp `bed0a85` with `contrib/llama.cpp/patches` 0001-0026.
+
+An agent and a subagent on one set of weights, and one model across two
+different Arc cards.
+
+- **Named lanes** (`--served-model-name A,B --lane-ctx CA,CB`): one process
+  serves lanes of different context, picked by the request's `model` field
+  (an empty name goes to the first lane, an unknown one gets a 404; DESIGN
+  §4.2 amended). Each lane has its own cap, slot pool and 503; `/v1/models`
+  lists each at its `n_ctx`. The lanes share one KV pool, in which patch
+  0026 gives each lane its own window of cells, so a lane attends over its
+  own cells only.
+- **Two cards** (`--device GPU.0,GPU.1 --llama-layer-split K`,
+  `--llama-expert-cache A,B`, `--llama-mtp-card N`; patches 0023, 0024):
+  llama.cpp's layer split across an Arc Pro B60 and an Arc A770, which
+  Intel's runtime lists as two OpenCL platforms. Each card has its own
+  context, kernels, KV and expert cache.
+- **Patch 0025:** a row-parallel copy for the MTP snapshot write. With two
+  sequences configured and one busy it had taken a generic kernel, one
+  work-group a row.
+- **Patch 0026:** KV cell windows (`llama_memory_seq_windows`), set by
+  arcint for named lanes on the target and the MTP draft context.
+  Flash-Next's indexed memory refuses them and keeps the whole-pool views.
+
+Measured (`measured-here`, 2026-10-08; B60; the dense Qwen3.8-27B Q4_K_M,
+q8_0 KV, MTP 5):
+- **One lane busy, two configured:** 10.9 t/s before 0025, 40.9 after,
+  against 41.0 with one lane configured.
+- **The subagent lane** (32,768) with the agent lane (131,072) holding about
+  20k, 64k or 118k tokens: 32.1 / 32.0 / 32.0 t/s on a 300-token answer,
+  the same text as the agent lane alone. Before 0025 and 0026: 7.7 / 7.3 /
+  6.5. Both lanes at once share the card: 15.9 + 15.8 t/s.
+- **Answers:** the capital and the 20k needle are right on both lanes. The
+  acceptance task on the agent lane scores 8/10 greedy, as the one-lane
+  unit does; sampled, 10, 8, 10.
+- **KL** against the Q8 reference: four sequences decoded one at a time in
+  a shared pool, with windows and without, equal one sequence's (0.004099,
+  top-1 97.745 %).
+- **Depth on one lane:** 36.6 / 32.3 / 19.3 t/s at 4k / 29k / 130k prompt
+  tokens with MTP, 18.4 / 15.1 / 9.7 without; prefill 252-272 t/s at 130k.
+- **Two cards:** Flash-Next at 131,072 tokens, split at layer 36 with the
+  draft on the B60, decodes 21.7 t/s against 19.8 on the B60 alone.
+
+**Known defect, open:** with patch 0022 (since 0.6.0), a llama.cpp batch
+whose ubatches mix sequences (`llama-server -np N` or `llama-perplexity`
+built from these patches) gives wrong logits on the B60: KL 0.2438 against
+0.0041 for one sequence. Pin + 0001-0021 is right. arcint decodes one
+sequence per call and is not affected; the bisection is in
+`docs/campaigns/lanes-agent-subagent.md` (on the `qfndev` branch).
+
 ## 0.6.0 — 2026-10-07
 
 **Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine

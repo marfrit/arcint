@@ -308,8 +308,25 @@ On the record before the work starts.
     Pin + 0001-0022 (0.6.0's series) does not.
   - Turning off 0022's default-on paths (`F16_XMX`, `F32_SKINNY`,
     `FUSE_SCALE_ACT`) does not fix it.
-  - arcint decodes one sequence a `llama_decode` and is not affected. The
-    bisection continues below.
+  - arcint decodes one sequence a `llama_decode` and is not affected.
+  - **Bisection** (`measured-here`, the same KL setup, four sequences in
+    mixed ubatches):
+    - pin + 0001-0021 is right (0.004183, as its one-sequence arm), so 0022
+      brings it;
+    - none of 0022's switches fixes it: `F16_XMX`, `F32_SKINNY`,
+      `FUSE_SCALE_ACT`, `CPY_FLAT`, `DISABLE_FUSION`, `GDN_INTEL`
+      (0.2428-0.2444);
+    - moving ops to the CPU (`GGML_OPENCL_OPFILTER`): `CONCAT` alone
+      (0.004099), `GATED_DELTA_NET` alone (0.004093) or `SSM_CONV` alone
+      (0.004185) fixes it; `REPEAT`, `FILL` or `FLASH_ATTN_EXT` alone do
+      not;
+    - `test-backend-ops` passes `CONCAT`, `SSM_CONV`, `GATED_DELTA_NET`,
+      `REPEAT` and `FILL` on the B60.
+    0022 does not touch those three ops (`code`), and each of them alone
+    fixes it. So the fault is likely elsewhere in 0022: an out-of-bounds
+    write whose victim moves when the graph splits, or a missing
+    synchronisation that a split hides. Not localised; open. Next: a
+    per-node comparison of the mixed graph against the CPU.
 - **Flash-Next with lanes** (5,500 and 7,500 MiB of slots): eviction both
   times; aborted, numbers void. llama.cpp reserves 6,679 MiB of OpenCL
   compute buffer: the 2,048-token prefill ubatch against the 163,840-cell

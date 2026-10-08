@@ -1,3 +1,17 @@
+arcint (0.7.0-1) trixie; urgency=medium
+
+  * 0.7.0: named lanes on the libllama engine (--served-model-name A,B
+    --lane-ctx CA,CB): an agent and a subagent lane on one set of weights,
+    picked by the request's model field, each in its own window of one KV
+    pool (llama.cpp patch 0026). The dense agent's subagent lane decodes
+    32 t/s whatever the agent lane holds. One model across two different
+    Arc cards (--device GPU.0,GPU.1 --llama-layer-split K,
+    --llama-expert-cache A,B, --llama-mtp-card; patches 0023, 0024).
+    Patch 0025 fixes MTP with more than one sequence configured (one busy
+    lane 10.9 -> 40.9 t/s). Runtime floor unchanged at marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Thu, 08 Oct 2026 18:00:00 +0200
+
 arcint (0.6.0-2) trixie; urgency=medium
 
   * Package fixes found by a fresh trixie install (the binaries are 0.6.0-1's

@@ -139,7 +139,10 @@ From 0.5.6 the agent runs the libllama engine (2026-10-04, a different
 protocol: llama-bench and the served acceptance prompt):
 - Q4_K_M GGUF, `--llama-kv q8_0`, 131,072 ctx, MTP 5 drafts;
 - prefill 896 t/s at 4k and 435 at 16k depth (llama-bench, no MTP);
-- decode 47.1 t/s on the acceptance prompt, 7.5 t/s at 128k depth;
+- decode 47.1 t/s on the acceptance prompt; with the repository's source as
+  context (2026-10-08, one lane), 36.6 / 32.3 / 19.3 t/s at 4k / 29k / 130k
+  prompt tokens with MTP 5 (18.4 / 15.1 / 9.7 without), prefill 252-272 t/s
+  at 130k;
 - the acceptance task 8/10 at temperature 0 on the deployed unit; sampled,
   30 runs, mean 7.4 against f16's 8.1, within the noise
   (`docs/llama-engine.md`).
@@ -164,9 +167,10 @@ B60, 14,500 MiB of expert slots, MTP 2: the 20,045-token needle prefills at
 answered (0.6.0; Strata's own engine: 620 / 37.2-37.8 t/s on the same card).
 The KL of IQ2_XS against a reference is owed.
 
-**One model across two different Arc cards** (in progress on `qfndev`;
+**One model across two different Arc cards** (since 0.7.0;
 `docs/campaigns/layer-split-two-cards.md`): Flash-Next split by layers
-across the Arc Pro B60 (Xe2) and the Arc A770 (Xe-HPG).
+across the Arc Pro B60 (Xe2) and the Arc A770 (Xe-HPG), with
+`--device GPU.0,GPU.1 --llama-layer-split K`.
 - **How:** each card runs its own layer range with its own KV and its own
   expert cache, after Strata's layer split. Strata itself lists Intel GPUs as
   unsupported for its split.
@@ -176,9 +180,20 @@ across the Arc Pro B60 (Xe2) and the Arc A770 (Xe-HPG).
 - **Measured** at 131,072 tokens of context (`measured-here`): every expert
   of the A770's eight layers is held on the A770, and 90 % of all routed
   experts are on a card, against 84 % on the B60 alone.
-  - The split decodes at 18.6 t/s against the B60 alone's 19.8.
-  - The A770's PCIe 3.0 x4 link and its slower MTP drafting are the gap.
-    Moving the draft to the B60 is the next measurement.
+  - With the MTP draft on the B60 (`--llama-mtp-card 0`) and the split at
+    layer 36, it decodes 21.7 t/s against the B60 alone's 19.8 (18.6 with
+    the draft on the A770, whose PCIe 3.0 x4 link is the slower path).
+
+**An agent and a subagent lane on one set of weights** (since 0.7.0;
+`--served-model-name A,B --lane-ctx CA,CB`): the request's `model` field
+picks the lane, an unknown name gets a 404, and each lane has its own
+context cap. The dense agent on the B60 serves `qwen3.8-agent` at 131,072
+tokens and `qwen3.8-subagent` at 32,768 from one process and one KV pool,
+in which `contrib/llama.cpp` 0026 gives each lane its own window of cells,
+so a lane attends over its own cells only. Measured (`measured-here`, MTP
+5): the subagent's 300-token answer decodes 32.0-32.1 t/s whether the agent
+lane holds 20k, 64k or 118k tokens, the same text as the agent lane alone;
+both lanes at once share the card (15.9 + 15.8 t/s); KL equal to one lane.
 
 **Qwen3.8-Flash-Next**, full depth (`qwen3.8-flash-next-d48q8`) on the B60:
 `--offload-ratio 75 --moe-cpu-tier`, a 128-expert-per-layer census seed, a

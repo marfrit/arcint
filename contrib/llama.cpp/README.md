@@ -1340,6 +1340,14 @@ greedy. With the rest of the patch (2026-10-07): MTP 2 30.7-31.6 t/s
 (13,500-14,500 MiB), MTP 3 with arcint's `--llama-mtp-min-p 0.5` 31.3, the
 needle's prefill 383 t/s; the residents unchanged (38.2 / 43.5).
 
+**Known defect (found 2026-10-08, open):** with 0022 applied, a batch
+whose ubatches mix sequences (llama.cpp's own batching: `llama-server -np
+N`, `llama-perplexity` with several sequences a batch) gives wrong logits
+on the B60. The dense Qwen3.8-27B scores KL 0.2438 (top-1 81.96 %) against
+0.0041 for one sequence; pin + 0001-0021 is right. arcint decodes one
+sequence per call and is not affected. The bisection is in
+`docs/campaigns/lanes-agent-subagent.md` (on the `qfndev` branch).
+
 ## 0023-opencl-one-context-per-platform-multi-device.patch
 
 One process on two Intel Arc cards, for llama.cpp's layer split. Intel's
