@@ -163,13 +163,22 @@ On the record before the work starts.
   | two sequences | 8,926 | 27,366 ms |
 
   The 6,192 extra calls equal the `kernel_gated_delta_net_pp` calls.
-- **The likely source** (`code`, `src/llama-graph.cpp` `build_rs`):
-  - Every graph copies the recurrent memory's "extra states", rows
-    `[n_seqs, n_rs)`, onto themselves with `get_rows` + `ggml_cpy`. The
-    comment says they "won't be changed further".
-  - With a second sequence configured, the range apparently spans that
-    sequence's rows and its MTP snapshots (`1 + n_rs_seq` a sequence).
-  - The fix is in llama.cpp (patch 0025), after checking upstream for one.
+- **The source** (`code`, with the arithmetic matching the trace):
+  - **Retracted:** the `build_rs` extra-state copy. With one sequence in a
+    ubatch `n_rs` is 1 and no extra rows are copied (`find_slot` takes
+    min/max over the ubatch's own sequences).
+  - **The cause:** the MTP snapshot write (`src/models/delta-net-base.cpp:617-627`,
+    and `mamba-base.cpp:275-279` alike) copies K = 1 + n_rs_seq planes into a
+    view `[D, n_seqs, K]` whose planes are `mem_size` rows apart. That view
+    is contiguous only when `n_seqs == mem_size`: one sequence configured, or
+    all of them busy. Two configured with one busy miss ggml-opencl's flat
+    copy and run its generic `kernel_cpy_f32_f32`, one 64-item work-group a
+    786,432-float row: ~4.4 ms x 48 GDN layers = ~211 ms a verify, against
+    the measured 207 ms.
+  - **Upstream:** at master the code is unchanged; no fix to follow.
+  - **The fix** (llama.cpp patch 0025): a row-parallel f32 copy kernel in
+    ggml-opencl for strided rows. Same rows, same addresses, so the
+    semantics are unchanged.
 - **Flash-Next with lanes** (5,500 and 7,500 MiB of slots): eviction both
   times; aborted, numbers void. llama.cpp reserves 6,679 MiB of OpenCL
   compute buffer: the 2,048-token prefill ubatch against the 163,840-cell

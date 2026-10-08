@@ -116,4 +116,5 @@ paths under `~/src/Strata-ref/`.
 | [research-speculative-cycle](research-speculative-cycle.md) | MTP and speculative cycles |
 | [research-sub4bit-weights](research-sub4bit-weights.md) | sub-4-bit weight formats and kernels |
 | [research-kv-quantisation](research-kv-quantisation.md) | KV quantisation and prefill cost |
+| [research-agent-lanes](research-agent-lanes.md) | serving an agent and its subagents from one model: per-slot caps, routing, batching lanes with speculative decoding, priority, prefix sharing on hybrid models; llama.cpp, vLLM, SGLang, ExLlamaV3, ollama, MLC-LLM read at source |
 | [research-cold-start](research-cold-start.md) | kernel caches and warm-up |
