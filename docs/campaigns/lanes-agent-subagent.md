@@ -240,6 +240,76 @@ On the record before the work starts.
     its n_kv stays under its cap whatever the agent holds. Or build
     per-sequence attention ranges. Either goes beyond the reference, whose
     unified pool has the same cost.
+  - **Operator, 2026-10-08:** per-lane ranges (a window per lane), then
+    the release.
+- **The cause, measured** (`measured-here`, a lanes window with llama.cpp's
+  KV debug, `-vv`): the subagent lane holds 4,508 cells.
+  - With the pool empty, its decode reads `n = 4,508` and runs 38.4 t/s
+    (prefill 772 t/s).
+  - With the agent lane holding 29k, the same request reads `n = 33,741` and
+    runs 30.3 t/s (prefill 606 t/s).
+- **The fix: llama.cpp patch 0026, cell windows** (`code`;
+  `contrib/llama.cpp/README.md`). Lane i finds its cells in its own range
+  of the pool and attends over that range only. arcint sets the windows
+  (`llama_memory_seq_windows`) on the target and the MTP draft context when
+  lanes are named; Flash-Next's indexed memory refuses them and keeps the
+  whole-pool views.
+- **After 0026** (`measured-here`, B60, the first build):
+
+  | cell | before | after |
+  |---|---|---|
+  | subagent 4k, pool empty | 38.4 t/s | 38.0 t/s |
+  | agent 29k (one lane: 32.3) | 30.6 t/s | 32.2 t/s |
+  | subagent 4k, agent holding 29k | 30.3 t/s | 37.5 t/s |
+
+  The lanes probe (`lanes_probe.py`, a 300-token answer on the subagent):
+  - with the agent lane at about 20k / 64k / 118k: 28.7 / 28.5 / 28.3 t/s,
+    the same text each time. The first window, before 0025: 7.7 / 7.3 / 6.5;
+  - 404 and 400 as before; the capital and the 20k needle right on both
+    lanes;
+  - both lanes at once: 14.7 + 14.5 t/s. The lanes take turns, and the sum
+    equals one lane alone (28.3-31.6 on this prompt);
+  - the acceptance task on the agent lane: 8/10 greedy, as the one-lane unit
+    scores; 10, 10, 10 sampled.
+- **The gate on the final build** (`measured-here`, after the review
+  fixes, `6cb712afef80c7a0`; the same probe):
+  - the subagent's answer with the agent lane at about 20k / 64k / 118k:
+    32.1 / 32.0 / 32.0 t/s, the same text each time and the same as the
+    agent lane's alone (32.1 t/s). The first build's 28.x carried the
+    search-head defect: the subagent's request landed above its earlier
+    20k needle;
+  - both lanes at once: 15.9 + 15.8 t/s;
+  - the capital and the needle right, 404 and 400 as before;
+  - the acceptance task on the agent lane: 8/10 greedy; 10, 8, 10 sampled.
+  The speed gate holds: the subagent stays at 32 t/s whatever the agent
+  lane holds, against a bar of 20.
+- **KL** (`measured-here`, `llama-perplexity` with 0026's test switches,
+  16 chunks of 512 against the Q8 reference, q8_0 KV): one sequence 0.004099
+  (top-1 97.745 %). Four sequences decoded one at a time in a shared pool,
+  arcint's path, give the same values with windows and without, on the
+  first build and after the review fixes. The answer-level bar holds.
+- **Review** (an outside model, before the push):
+  - the window's search head was never reset, so a lane's fresh request
+    after a long one landed above the old high-water mark. The red case, an
+    agent request of 29k and then a fresh 4k one: 34.1 t/s and 22.7 s before
+    the fix, 37.8 t/s and 15.6 s after;
+  - Flash-Next's QSA k-pool selects cells by absolute index, so windows are
+    refused for that memory;
+  - `seq_cp` across windows and a whole-cache restore are refused; the
+    relative-position buckets read from the offset;
+  - accepted: a lane switch rebuilds the graph, since its K/V views carry
+    the window's offset. With both lanes busy the sum is one lane's rate, as
+    measured above.
+- **Found on the way, not the lanes' path:** a batch whose ubatches mix
+  sequences (llama.cpp's own batching: `llama-perplexity` with several
+  sequences, `llama-server -np N`) scores KL 0.2438, top-1 81.96 %. This
+  happens with windows or without, unified or in separate streams.
+  - The bare pin and pin + 0001-0020 score the same as one sequence.
+    Pin + 0001-0022 (0.6.0's series) does not.
+  - Turning off 0022's default-on paths (`F16_XMX`, `F32_SKINNY`,
+    `FUSE_SCALE_ACT`) does not fix it.
+  - arcint decodes one sequence a `llama_decode` and is not affected. The
+    bisection continues below.
 - **Flash-Next with lanes** (5,500 and 7,500 MiB of slots): eviction both
   times; aborted, numbers void. llama.cpp reserves 6,679 MiB of OpenCL
   compute buffer: the 2,048-token prefill ubatch against the 163,840-cell

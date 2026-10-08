@@ -1,0 +1,645 @@
+diff --git a/include/llama.h b/include/llama.h
+index 9433013..c9b9371 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -849,6 +849,17 @@ extern "C" {
+             llama_memory_t mem,
+               llama_seq_id seq_id);
+ 
++    // Cell windows in a unified KV cache (kv_unified, no shared source cache): sequence i finds its cells in
++    // [sum of n_cells[0..i), + n_cells[i]) and its attention spans that window only, so a sequence's decode
++    // does not grow with another sequence's cells. Each size a multiple of 256; the sum at most the cache.
++    // Call on an empty memory, before the first decode; n_seq == 0 clears the windows.
++    // Returns false (and changes nothing) when the memory's attention cache cannot take windows
++    // (several streams, a shared or indexed cache, sliding-window caches).
++    LLAMA_API bool llama_memory_seq_windows(
++            llama_memory_t mem,
++            const uint32_t * n_cells,
++                   int32_t   n_seq);
++
+     // Check if the memory supports shifting
+     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 07ab52b..761fc59 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -8,6 +8,9 @@
+ #include "llama-batch.h"
+ #include "llama-io.h"
+ #include "llama-memory.h"
++#include "llama-kv-cache.h"
++#include "llama-memory-hybrid.h"
++#include "llama-memory-hybrid-idx.h"
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ #include "llama-ext.h"
+@@ -4296,6 +4299,31 @@ llama_pos llama_memory_seq_pos_min(
+     return mem->seq_pos_min(seq_id);
+ }
+ 
++bool llama_memory_seq_windows(llama_memory_t mem, const uint32_t * n_cells, int32_t n_seq) {
++    if (!mem) {
++        return false;
++    }
++
++    // the indexed hybrid (qwen4exp's QSA) selects k-pool cells by absolute index: not windowed yet
++    if (dynamic_cast<llama_memory_hybrid_idx *>(mem) != nullptr) {
++        LLAMA_LOG_WARN("%s: the indexed hybrid memory takes no cell windows\n", __func__);
++        return false;
++    }
++
++    // the attention cache of a plain or a hybrid memory; other memories keep the whole-stream views
++    llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(mem);
++    if (kv == nullptr) {
++        if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
++            kv = hyb->get_mem_attn();
++        }
++    }
++    if (kv == nullptr) {
++        return false;
++    }
++
++    return kv->set_seq_windows(n_cells, n_seq);
++}
++
+ llama_pos llama_memory_seq_pos_max(
+         llama_memory_t mem,
+           llama_seq_id seq_id) {
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 9fd35f3..814261f 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -43,6 +43,9 @@ static ggml_tensor * build_attn_inp_kq_mask(
+     ggml_set_input(res);
+     ggml_set_name(res, "attn_inp_kq_mask");
+ 
++    // the cell window's first cell: the K/V views of this graph start there (llama_kv_cache::set_seq_windows)
++    ((int32_t *) res->op_params)[0] = (int32_t) mctx->get_kv_off();
++
+     return res;
+ }
+ 
+@@ -62,6 +65,9 @@ static bool can_reuse_kq_mask(
+     res &= (kq_mask->ne[2] == 1);
+     res &= (kq_mask->ne[3] == n_stream);
+ 
++    // views into another cell window cannot be reused
++    res &= (((const int32_t *) kq_mask->op_params)[0] == (int32_t) mctx->get_kv_off());
++
+     return res;
+ }
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 1d0554f..dab9cf9 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -372,6 +372,10 @@ void llama_kv_cache::clear(bool data) {
+         v_heads[s] = 0;
+     }
+ 
++    for (size_t i = 0; i < win_head.size(); ++i) {
++        win_head[i] = win_base[i];
++    }
++
+     if (data) {
+         for (auto & [_, buf] : ctxs_bufs) {
+             ggml_backend_buffer_clear(buf.get(), 0);
+@@ -460,6 +464,12 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
+     const auto s0 = seq_to_stream[seq_id_src];
+     const auto s1 = seq_to_stream[seq_id_dst];
+ 
++    if (!win_size.empty() && seq_id_src != seq_id_dst) {
++        // the source's cells lie in its own window, which the destination never attends over
++        LLAMA_LOG_WARN("%s: not copying sequence %d to %d: they have separate cell windows\n", __func__, seq_id_src, seq_id_dst);
++        return;
++    }
++
+     if (s0 == s1) {
+         // since both sequences are in the same stream, no data copy is necessary
+         // we just have to update the cells meta data
+@@ -751,6 +761,9 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool
+ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+     llama_kv_cache::slot_info_vec_t res;
+ 
++    // apply_ubatch() below moves the window heads too; they go back with the cells
++    const std::vector<uint32_t> win_head_old = win_head;
++
+     struct state_t {
+         slot_info sinfo; // slot info for the ubatch
+ 
+@@ -807,6 +820,8 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
+         }
+     }
+ 
++    win_head = win_head_old;
++
+     if (!success) {
+         return {};
+     }
+@@ -1000,14 +1015,81 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+ 
+         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
+ 
+-        // if we have enough unused cells before the current head ->
+-        //   better to start searching from the beginning of the cache, hoping to fill it
+-        if (head_cur > cells.get_used() + 2*n_tokens) {
++        // the cells this search may use: the whole stream, or the sequence's window
++        uint32_t lo = 0;
++        uint32_t hi = cells.size();
++
++        if (!win_size.empty()) {
++            // the tokens' own ids decide the window, not seq_id_unq
++            const llama_seq_id wseq = ubatch.n_tokens > 0 ? ubatch.seq_id[0][0] : seq_id;
++            bool mixed = false;
++            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++                if (ubatch.n_seq_id[i] != 1) {
++                    LLAMA_LOG_ERROR("%s: cell windows take one sequence a token (token %u has %d)\n", __func__, i, ubatch.n_seq_id[i]);
++                    return { };
++                }
++                const llama_seq_id si = ubatch.seq_id[i][0];
++                if ((size_t) si >= win_size.size() || win_size[si] == 0) {
++                    LLAMA_LOG_ERROR("%s: sequence %d has no cell window\n", __func__, si);
++                    return { };
++                }
++                mixed |= si != wseq;
++            }
++
++            if (mixed) {
++                // a ubatch of several sequences (a hybrid memory's equal split) has no single window:
++                // each token takes a cell in its own sequence's window, and the views span the stream
++                std::vector<uint32_t> heads = win_head;
++                std::vector<uint8_t>  taken_map(cells.size(), 0);
++                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++                    const llama_seq_id si = ubatch.seq_id[i][0];
++                    const uint32_t wlo = win_base[si];
++                    const uint32_t whi = wlo + win_size[si];
++                    uint32_t h = heads[si] < wlo || heads[si] >= whi ? wlo : heads[si];
++                    uint32_t n = 0;
++                    while (n < whi - wlo) {
++                        const bool taken = taken_map[h] != 0;
++                        bool can_use = !taken && cells.is_empty(h);
++                        if (!can_use && !taken && cells.seq_count(h) == 1) {
++                            const llama_seq_id seq_id_cell = cells.seq_get(h);
++                            can_use = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(h), cells.seq_pos_max(seq_id_cell) + 1);
++                        }
++                        if (can_use) {
++                            break;
++                        }
++                        h = h + 1 >= whi ? wlo : h + 1;
++                        ++n;
++                    }
++                    if (n >= whi - wlo) {
++                        return { };
++                    }
++                    res.idxs[s].push_back(h);
++                    taken_map[h] = 1;
++                    heads[si] = h + 1;
++                }
++                continue;
++            }
++
++            lo = win_base[wseq];
++            hi = lo + win_size[wseq];
++
++            // the cells above the window's last used one are all free: start there at the latest, so a
++            // sequence cut back by seq_rm refills from its end instead of above its old high-water mark
++            head_cur = std::min(win_head[wseq], cells.used_max_p1_in(lo, hi));
++            if (head_cur < lo || head_cur >= hi) {
++                head_cur = lo;
++            }
++
++            res.kv_off = lo;
++            res.kv_win = win_size[wseq];
++        } else if (head_cur > cells.get_used() + 2*n_tokens) {
++            // if we have enough unused cells before the current head ->
++            //   better to start searching from the beginning of the cache, hoping to fill it
+             head_cur = 0;
+         }
+ 
+-        if (n_tokens > cells.size()) {
+-            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
++        if (n_tokens > hi - lo) {
++            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, hi - lo);
+             return { };
+         }
+ 
+@@ -1018,9 +1100,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+         const uint32_t n_test = cont ? n_tokens : 1;
+ 
+         while (true) {
+-            if (head_cur + n_test > cells.size()) {
+-                n_tested += cells.size() - head_cur;
+-                head_cur = 0;
++            if (head_cur + n_test > hi) {
++                n_tested += hi - head_cur;
++                head_cur = lo;
+                 continue;
+             }
+ 
+@@ -1077,7 +1159,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+                 res.idxs[s].clear();
+             }
+ 
+-            if (n_tested >= cells.size()) {
++            if (n_tested >= hi - lo) {
+                 //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
+                 return { };
+             }
+@@ -1183,6 +1265,71 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch &
+ 
+         head = sinfo.idxs[s].back() + 1;
+     }
++
++    if (!win_size.empty()) {
++        // each window's head follows its last cell in this ubatch
++        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
++            for (const uint32_t idx : sinfo.idxs[s]) {
++                const int32_t w = win_of(idx);
++                if (w >= 0) {
++                    win_head[w] = idx + 1;
++                }
++            }
++        }
++    }
++}
++
++int32_t llama_kv_cache::win_of(uint32_t idx) const {
++    for (size_t i = 0; i < win_size.size(); ++i) {
++        if (win_size[i] > 0 && idx >= win_base[i] && idx < win_base[i] + win_size[i]) {
++            return (int32_t) i;
++        }
++    }
++    return -1;
++}
++
++bool llama_kv_cache::set_seq_windows(const uint32_t * n_cells, int32_t n_seq) {
++    if (n_seq <= 0) {
++        win_base.clear();
++        win_size.clear();
++        win_head.clear();
++        return true;
++    }
++    if (n_stream != 1 || other != nullptr || (uint32_t) n_seq > n_seq_max) {
++        LLAMA_LOG_WARN("%s: windows need one unified stream of its own (streams %u, shared %d, %d of %u sequences)\n",
++                __func__, n_stream, other != nullptr, n_seq, n_seq_max);
++        return false;
++    }
++    const auto & cells = v_cells[0];
++    if (cells.get_used() != 0) {
++        LLAMA_LOG_WARN("%s: windows are set on an empty cache (%u cells used)\n", __func__, cells.get_used());
++        return false;
++    }
++    const uint32_t n_pad_cur = std::max(n_pad, 256u);
++    uint64_t sum = 0;
++    for (int32_t i = 0; i < n_seq; ++i) {
++        if (n_cells[i] == 0 || n_cells[i] % n_pad_cur != 0) {
++            LLAMA_LOG_WARN("%s: window %d holds %u cells, not a positive multiple of %u\n", __func__, i, n_cells[i], n_pad_cur);
++            return false;
++        }
++        sum += n_cells[i];
++    }
++    if (sum > cells.size()) {
++        LLAMA_LOG_WARN("%s: windows of %llu cells over a cache of %u\n", __func__, (unsigned long long) sum, cells.size());
++        return false;
++    }
++    win_base.assign(n_seq, 0);
++    win_size.assign(n_seq, 0);
++    win_head.assign(n_seq, 0);
++    uint32_t base = 0;
++    for (int32_t i = 0; i < n_seq; ++i) {
++        win_base[i] = base;
++        win_size[i] = n_cells[i];
++        win_head[i] = base;
++        base += n_cells[i];
++    }
++    LLAMA_LOG_INFO("%s: %d windows over %u cells\n", __func__, n_seq, cells.size());
++    return true;
+ }
+ 
+ bool llama_kv_cache::get_can_shift() const {
+@@ -1264,6 +1411,15 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
+     const uint32_t n_pad_cur = std::max(n_pad, 256u);
+ 
++    if (sinfo.kv_win > 0) {
++        // the window's views start at kv_off: count up to its last used cell
++        const auto & cells = v_cells[sinfo.strm[0]];
++
++        const uint32_t m = cells.used_max_p1_in(sinfo.kv_off, sinfo.kv_off + sinfo.kv_win) - sinfo.kv_off;
++
++        return std::min(sinfo.kv_win, std::max(n_pad_cur, (uint32_t) GGML_PAD(m, n_pad_cur)));
++    }
++
+     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+         const auto & cells = v_cells[sinfo.strm[s]];
+ 
+@@ -1290,7 +1446,7 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
+             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
+             ggml_row_size(k->type, n_embd_k_gqa),
+             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
+-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
++            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0 + ggml_row_size(k->type, n_embd_k_gqa)*sinfo.kv_off);
+ }
+ 
+ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+@@ -1313,7 +1469,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
+                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
+                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
+                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
+-                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
++                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0 + ggml_row_size(v->type, n_embd_v_gqa)*sinfo.kv_off);
+     }
+ 
+     // note: v->nb[1] > v->nb[2]
+@@ -1322,7 +1478,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
+             ggml_row_size(v->type, kv_size*hparams.n_embd_head_v(il)),  // v->nb[1]
+             ggml_row_size(v->type, kv_size),                        // v->nb[2]
+             ggml_row_size(v->type, kv_size*n_embd_v_gqa),           // v->nb[3]
+-            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
++            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0 + ggml_row_size(v->type, sinfo.kv_off));
+ }
+ 
+ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+@@ -1561,6 +1717,8 @@ struct args_set_input_kq_mask {
+     int64_t n_kv;
+     int64_t n_stream;
+     int64_t n_tps;
++
++    uint32_t kv_off; // the window's first cell: column j is cell j + kv_off
+ };
+ 
+ template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
+@@ -1578,6 +1736,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
+     const int64_t n_stream = args.n_stream;
+     const int64_t n_tps    = args.n_tps;
+ 
++    const uint32_t kv_off  = args.kv_off;
++
+     const T mask_keep = llama_cast<T>(0.0f);
+     const T mask_drop = llama_cast<T>(-INFINITY);
+ 
+@@ -1653,16 +1813,16 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
+                     }
+                 }
+ 
+-                if (cells.is_empty(j)) {
++                if (cells.is_empty(j + kv_off)) {
+                     goto skip;
+                 }
+ 
+                 // mask the token if not the same sequence
+-                if (!cells.seq_has(j, seq_id)) {
++                if (!cells.seq_has(j + kv_off, seq_id)) {
+                     goto skip;
+                 }
+ 
+-                p0 = cells.pos_get(j);
++                p0 = cells.pos_get(j + kv_off);
+ 
+                 if (!alibi) {
+                     if (!prev) {
+@@ -1682,7 +1842,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
+                     // M-RoPE causal mask
+                     if (is_2d) {
+                         if (p0 == p1) {
+-                            const auto & p0_ext = cells.ext_get(j);
++                            const auto & p0_ext = cells.ext_get(j + kv_off);
+ 
+                             if (p0_ext.is_2d_gt(p1_x, p1_y)) {
+                                 goto skip;
+@@ -1753,7 +1913,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
+     }
+ }
+ 
+-void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
++void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t kv_off) const {
+     const uint32_t n_tokens = ubatch->n_tokens;
+ 
+     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+@@ -1784,6 +1944,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+         /*.n_kv             =*/ n_kv,
+         /*.n_stream         =*/ n_stream,
+         /*.n_tps            =*/ n_tps,
++        /*.kv_off           =*/ kv_off,
+     };
+ 
+     if (dst->type == GGML_TYPE_F16) {
+@@ -1797,7 +1958,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+ }
+ 
+-void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
++void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t kv_off) const {
+     const int64_t n_tokens = ubatch->n_tokens;
+ 
+     GGML_ASSERT(n_stream == 1 && "TODO: support multiple streams");
+@@ -1814,7 +1975,7 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
+         for (int i = 0; i < n_tokens; ++i) {
+             for (int j = 0; j < n_kv; ++j) {
+                 // the position when the cells is empty is irrelevant - it will be masked out later in the attention
+-                const llama_pos p0 = cells.is_empty(j) ? -1 : cells.pos_get(j);
++                const llama_pos p0 = cells.is_empty(j + kv_off) ? -1 : cells.pos_get(j + kv_off);
+ 
+                 data[h*(n_kv*n_tokens) + i*n_kv + j] = llama_relative_position_bucket(p0, ubatch->pos[i], hparams.n_rel_attn_bkts, false);
+             }
+@@ -2462,6 +2623,12 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
+     } else {
+         // whole KV cache restore
+ 
++        if (!win_size.empty()) {
++            // the saved cells would go in from 0, across the windows
++            LLAMA_LOG_ERROR("%s: a whole-cache restore does not place cells into cell windows\n", __func__);
++            return false;
++        }
++
+         if (cell_count > cells.size()) {
+             LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
+             return false;
+@@ -2861,6 +3028,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
+     return n_kv;
+ }
+ 
++uint32_t llama_kv_cache_context::get_kv_off() const {
++    return sinfos.empty() ? 0 : sinfos[i_cur].kv_off;
++}
++
+ ggml_type llama_kv_cache_context::type_k() const {
+     return kv->type_k();
+ }
+@@ -2914,11 +3085,11 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
+ }
+ 
+ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+-    kv->set_input_kq_mask(dst, ubatch, causal_attn);
++    kv->set_input_kq_mask(dst, ubatch, causal_attn, sinfos.empty() ? 0 : sinfos[i_cur].kv_off);
+ }
+ 
+ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+-    kv->set_input_pos_bucket(dst, ubatch);
++    kv->set_input_pos_bucket(dst, ubatch, sinfos.empty() ? 0 : sinfos[i_cur].kv_off);
+ }
+ 
+ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 52cc8cd..8bfc3c4 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -42,6 +42,11 @@ public:
+         std::vector<llama_seq_id> strm; // [ns]
+         std::vector<idx_vec_t>    idxs; // [ns]
+ 
++        // the sequence's cell window (set_seq_windows): the attention views start at kv_off and
++        // span at most kv_win cells; kv_win == 0: the whole stream
++        uint32_t kv_off = 0;
++        uint32_t kv_win = 0;
++
+         uint32_t head() const {
+             GGML_ASSERT(idxs.size() == 1);
+             GGML_ASSERT(!idxs[0].empty());
+@@ -186,6 +191,12 @@ public:
+     // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
+     void state_clear(llama_seq_id seq_id);
+ 
++    // cell windows in a unified cache: sequence i gets the cells [sum of n_cells[0..i), + n_cells[i]),
++    // finds its slots there and attends over its own window only, so one sequence's attention does
++    // not span another's cells. call on an empty cache; false when it cannot apply (several streams,
++    // a shared source cache, sizes over the cache or not multiples of the padding)
++    bool set_seq_windows(const uint32_t * n_cells, int32_t n_seq);
++
+     //
+     // graph_build API
+     //
+@@ -233,8 +244,8 @@ public:
+ 
+     void set_input_k_shift(ggml_tensor * dst) const;
+ 
+-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+-    void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
++    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t kv_off = 0) const;
++    void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t kv_off = 0) const;
+ 
+     void set_input_k_rot(ggml_tensor * dst) const;
+     void set_input_v_rot(ggml_tensor * dst) const;
+@@ -312,6 +323,14 @@ private:
+     // maps from a sequence id to a stream id
+     std::vector<uint32_t> seq_to_stream;
+ 
++    // set_seq_windows: per sequence id, the window's first cell, its size and its search head
++    std::vector<uint32_t> win_base;
++    std::vector<uint32_t> win_size;
++    std::vector<uint32_t> win_head;
++
++    // the window holding cell idx, -1 if none
++    int32_t win_of(uint32_t idx) const;
++
+     // pending stream copies that will be applied during the next update
+     stream_copy_info sc_info;
+ 
+@@ -400,6 +419,9 @@ public:
+ 
+     uint32_t get_n_kv() const;
+ 
++    // the first cell of the current ubatch's window (set_seq_windows), 0 without windows
++    uint32_t get_kv_off() const;
++
+     ggml_type type_k() const;
+     ggml_type type_v() const;
+ 
+diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
+index 9c0d51e..be0b6ac 100644
+--- a/src/llama-kv-cells.h
++++ b/src/llama-kv-cells.h
+@@ -98,6 +98,16 @@ public:
+         return used.empty() ? 0 : *used.rbegin() + 1;
+     }
+ 
++    // the index of the last used cell in [lo, hi) + 1, or lo if none is used there
++    uint32_t used_max_p1_in(uint32_t lo, uint32_t hi) const {
++        auto it = used.lower_bound(hi);
++        if (it == used.begin()) {
++            return lo;
++        }
++        --it;
++        return *it >= lo ? *it + 1 : lo;
++    }
++
+     bool get_has_shift() const {
+         return has_shift;
+     }
+diff --git a/tools/perplexity/perplexity.cpp b/tools/perplexity/perplexity.cpp
+index 601361a..4d1f51f 100644
+--- a/tools/perplexity/perplexity.cpp
++++ b/tools/perplexity/perplexity.cpp
+@@ -1771,6 +1771,11 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+ 
+     const int first = n_ctx/2;
+ 
++    // test hook (not shipped): LLAMA_PPL_PER_SEQ=1 decodes each sequence of a batch in its own llama_decode,
++    // as arcint's lanes do, keeping each sequence's logits
++    const bool per_seq = getenv("LLAMA_PPL_PER_SEQ") != nullptr;
++    std::vector<std::vector<float>> seq_logits(n_seq);
++
+     for (int i = 0; i < n_chunk; i += n_seq) {
+         const int start =     i * n_ctx;
+         const int end   = start + n_ctx;
+@@ -1782,7 +1787,31 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+         // clear the KV cache
+         llama_memory_clear(llama_get_memory(ctx), true);
+ 
+-        for (int j = 0; j < num_batches; ++j) {
++        if (per_seq) {
++            GGML_ASSERT(num_batches == 1);
++            for (int seq = 0; seq < n_seq_batch; seq++) {
++                const int seq_start = start + seq*n_ctx;
++                batch.clear();
++                int n_outputs = 0;
++                for (int k = 0; k < (int) n_ctx; ++k) {
++                    const bool need_logits = k >= first;
++                    llama_token t = tokens[seq_start + k];
++                    if (add_bos && k == 0) {
++                        t = llama_vocab_bos(vocab);
++                    }
++                    batch.add(t, k, seq, need_logits);
++                    n_outputs += need_logits;
++                }
++                if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
++                    LOG_ERR("%s : failed to decode sequence %d\n", __func__, seq);
++                    return;
++                }
++                const float * l = llama_get_logits(ctx);
++                seq_logits[seq].assign(l, l + size_t(n_outputs) * n_vocab);
++            }
++        }
++
++        for (int j = 0; j < (per_seq ? 0 : num_batches); ++j) {
+             const int batch_start = start + j * n_batch;
+             const int batch_size  = std::min(end - batch_start, n_batch);
+ 
+@@ -1844,7 +1873,8 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+                 return;
+             }
+ 
+-            const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
++            const float * all_logits = per_seq ? seq_logits[seq].data() :
++                num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
+ 
+             process_logits(n_vocab, all_logits, tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
+                     workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);
+@@ -2039,6 +2069,16 @@ int llama_perplexity(int argc, char ** argv) {
+         return 1;
+     }
+ 
++    // test hook (not shipped): LLAMA_PPL_SEQ_WINDOWS=1 gives every sequence a cell window of n_ctx (0026)
++    if (getenv("LLAMA_PPL_SEQ_WINDOWS") != nullptr && params.n_parallel > 1) {
++        std::vector<uint32_t> w(params.n_parallel, (uint32_t) n_ctx);
++        if (!llama_memory_seq_windows(llama_get_memory(ctx), w.data(), params.n_parallel)) {
++            LOG_ERR("%s: llama_memory_seq_windows refused\n", __func__);
++            return 1;
++        }
++        LOG_INF("%s: %d cell windows of %d\n", __func__, params.n_parallel, n_ctx);
++    }
++
+     const int n_ctx_train = llama_model_n_ctx_train(model);
+ 
+     if (params.n_ctx > n_ctx_train) {

@@ -44,6 +44,10 @@ public:
     // each checkpoint (common_speculative_get_state).
     virtual std::vector<float> carried_row(int seq, size_t n) const = 0;
     virtual void               set_carried_row(int seq, size_t n, const std::vector<float>& row) = 0;
+    // Named lanes: the draft context's cell windows, as the target's
+    // (llama_memory_seq_windows, contrib/llama.cpp 0026); false when its
+    // memory cannot take them.
+    virtual bool set_kv_windows(const uint32_t* n_cells, int n) = 0;
 };
 
 // model: loaded with load_mtp from `gguf`; ctx_tgt: n_rs_seq >= n_draft.

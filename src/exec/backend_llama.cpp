@@ -433,6 +433,20 @@ public:
         if (named_ && static_cast<int64_t>(llama_n_ctx(ctx_)) != pool)
             throw std::runtime_error(log::format("named lanes: llama.cpp made a KV pool of %u tokens, not the lanes' %lld",
                                                  llama_n_ctx(ctx_), static_cast<long long>(pool)));
+        // a cell window per lane in the pool (contrib/llama.cpp 0026): lane i
+        // finds its cells in its own range and attends over that range only.
+        // Without it a lane's attention spans the pool up to its highest used
+        // cell, the other lane's included: the subagent decoded 14.2 t/s with
+        // the agent lane 130k deep, 38.4 with the pool empty (measured-here,
+        // docs/campaigns/lanes-agent-subagent.md)
+        std::vector<uint32_t> windows;
+        if (named_) {
+            windows.assign(cap_.begin(), cap_.end());
+            windows_ = llama_memory_seq_windows(llama_get_memory(ctx_), windows.data(), lanes_);
+            if (!windows_)
+                log::warn("load", "named lanes: this model's KV cache takes no cell windows; a lane's attention "
+                                  "spans the pool's used cells");
+        }
         if (cfg.llama_mtp > 0) {
             // --llama-mtp-gguf: the MTP block (with its own embeddings and LM
             // head) as a second model, as llama.cpp loads an MTP-only file
@@ -464,6 +478,9 @@ public:
                                    cfg.llama_mtp_vocab, cfg.llama_mtp_min_p, cp.type_k, cp.type_v, cp.kv_unified, err);
             if (!spec_) throw std::runtime_error(log::format("--llama-mtp %d: %s", cfg.llama_mtp, err.c_str()));
             n_draft_ = cfg.llama_mtp;
+            if (windows_ && !spec_->set_kv_windows(windows.data(), lanes_))
+                log::warn("load", "named lanes: the MTP draft context takes no cell windows; its attention spans "
+                                  "the pool's used cells");
         }
         status_.mtp_enabled = n_draft_ > 0;
         slot_tokens_.resize(static_cast<size_t>(lanes_));
@@ -526,9 +543,11 @@ public:
             for (int i = 0; i < lanes_; ++i)
                 log::info("load", "lane %d '%s': cap %d tokens", i, cfg.lane_names[static_cast<size_t>(i)].c_str(),
                           cap_[static_cast<size_t>(i)]);
-            log::info("load", "KV pool: %u tokens shared by %d lanes (kv_unified: a lane's attention runs over the "
-                              "pool's used cells, masked)%s",
-                      llama_n_ctx(ctx_), lanes_, spec_ ? "; the MTP draft context likewise" : "");
+            log::info("load", "KV pool: %u tokens shared by %d lanes (kv_unified; %s)%s",
+                      llama_n_ctx(ctx_), lanes_,
+                      windows_ ? "a cell window per lane: a lane attends over its own cells"
+                               : "a lane's attention runs over the pool's used cells, masked",
+                      spec_ ? "; the MTP draft context likewise" : "");
         }
         if (split)
             log::info("load", "layer split: layers 0-%d on %s, %d-%d and the output on %s (tensor_split %.1f/%.1f)%s",
@@ -1110,6 +1129,7 @@ private:
     int                                   lanes_   = 1;
     int                                   n_ctx_   = 0;   // the first lane's cap (status, the load line)
     bool                                  named_   = false;   // --lane-ctx: kv_unified, a cap per lane
+    bool                                  windows_ = false;   // named lanes: a KV cell window per lane (0026)
     std::vector<int>                      cap_;       // per lane (seq): its context
     int                                   n_batch_ = 2048;
     std::mutex                            mu_;    // llama_context is not thread-safe: one call at a time

@@ -1472,3 +1472,78 @@ Measured on the B60 (`measured-here`, 2026-10-08):
   - both lanes decoding at once: 18.3 + 20.1 t/s; the subagent lane's text
     identical to its run alone, the agent lane's diverging at char 372 into
     an equivalent sentence.
+
+## 0026-kv-cache-cell-windows.patch
+
+Cell windows in a unified KV cache (`kv_unified`): sequence i finds its
+cells in its own range of the pool, and its attention runs over that range
+only. Without it, a sequence's attention spans the pool up to the highest
+used cell, so it grows with another sequence's cells, masked
+(`get_n_kv`, the stream's `used_max_p1`). That was arcint's named lanes'
+cost: a subagent lane slowed with the agent lane's fill.
+
+- **API:** `llama_memory_seq_windows(mem, n_cells, n_seq)`. Sequence i gets
+  the cells from the sum of the sizes before it, `n_cells[i]` long. Each size
+  is a multiple of 256 and the sum at most the cache. Call it on an empty
+  memory, before the first decode. It returns false and changes nothing for
+  a memory whose attention cache cannot take windows: several streams, a
+  shared source cache, the indexed hybrid (qwen4exp's QSA k-pool selects
+  cells by absolute index), or a memory other than `llama_kv_cache` and the
+  attention half of `llama_memory_hybrid`.
+- **The cache:**
+  - `find_slot` searches the window of the ubatch's sequence. It starts at
+    the window's search head, or lower if the window's last used cell is
+    lower: a sequence cut back by `seq_rm` refills from its end, not above
+    its old high-water mark. `clear()` resets the heads.
+  - `slot_info` carries the window's first cell and size. `get_n_kv` counts
+    to the window's last used cell, and `get_k`/`get_v` view from its first
+    cell. The KQ mask fills column j from cell j plus that offset.
+  - `prepare()` restores the window heads with the cells. A sequence's
+    state restore goes through `find_slot`, so it lands in its window; the
+    tokens' own sequence ids choose the window. A whole-cache restore is
+    refused while windows are set, and so is `seq_cp` between two
+    windowed sequences (the destination never attends over the source's
+    window). The relative-position buckets read cells from the offset too.
+- **A ubatch of several sequences** (a hybrid memory's equal split): each
+  token takes a cell in its own window, and the views span the whole stream
+  as before. It is correct, without the speed-up.
+- **Graph reuse:** the mask input records the window's first cell, and a
+  graph is reused only for the same one: a graph's K/V views have the
+  offset built in.
+- **`llama-perplexity` test switches:** `LLAMA_PPL_SEQ_WINDOWS=1` gives each
+  sequence a window of `n_ctx`, and `LLAMA_PPL_PER_SEQ=1` decodes each
+  sequence of a KL batch in its own `llama_decode` (arcint's lanes).
+
+Upstream has no per-sequence cap or range in a unified cache: the server's
+`--kv-unified-per-slot` is one cap for all slots, and non-unified streams
+are one size each (`docs/campaigns/research-agent-lanes.md` on the `qfndev`
+branch).
+
+Measured on the B60 (`measured-here`, 2026-10-08; the dense Qwen3.8-27B
+Q4_K_M, q8_0 KV, MTP 5; arcint's named lanes, 131,072 + 32,768):
+
+- **The red case for the search head** (found in review): an agent request
+  of 29k, then a fresh 4k request in the same lane. Without the reset, the
+  4k request decodes 34.1 t/s and finishes in 22.7 s (its cells above the
+  old 29k). With it, 37.8 t/s and 15.6 s.
+- **The cause, before the patch:** llama.cpp's KV debug shows `n = 33,741`
+  while the subagent lane, holding 4,508 cells, decodes next to an agent lane
+  of 29k. That cell decodes 30.3 t/s against 38.4 with the pool empty.
+- **After:**
+  - subagent 4k with the agent at 29k: 37.5 t/s (38.0 with the pool empty);
+  - agent 29k: 32.2 t/s, against 32.3 in a one-lane server;
+  - the subagent's 300-token answer with the agent lane at about 20k, 64k
+    and 118k: 28.7 / 28.5 / 28.3 t/s, the same text each time. Before 0025
+    and this patch: 7.7 / 7.3 / 6.5. With 0025 alone, a 4k subagent cell
+    next to a 130k agent: 14.2.
+- **Answers:** the capital and the 20k needle are right on both lanes. The
+  acceptance task on the agent lane scores 8/10 greedy, as the one-lane
+  unit does, and 10, 10, 10 sampled.
+- **KL** against the Q8 reference (`llama-perplexity`, 16 chunks of 512):
+  - one sequence: 0.004099, top-1 97.745 %;
+  - four sequences decoded one at a time in a shared pool: the same values
+    without windows and with them.
+- **Not this patch:** four sequences in ubatches that mix them score
+  0.2438 / 81.96 %, with windows or without, unified or in separate streams.
+  arcint decodes one sequence a call and never takes that path; see
+  `docs/campaigns/lanes-agent-subagent.md` (on the `qfndev` branch).

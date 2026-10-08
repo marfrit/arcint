@@ -551,6 +551,10 @@ public:
         return std::vector<float>(at, at + n_embd_);
     }
 
+    bool set_kv_windows(const uint32_t* n_cells, int n) override {
+        return llama_memory_seq_windows(llama_get_memory(ctx_dft_), n_cells, n);
+    }
+
     void set_carried_row(int seq, size_t n, const std::vector<float>& row) override {
         if (n == 0 || row.size() != static_cast<size_t>(n_embd_)) return;
         Lane& ln   = lanes_[static_cast<size_t>(seq)];
