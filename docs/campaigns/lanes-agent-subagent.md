@@ -287,6 +287,13 @@ On the record before the work starts.
   score and lost cases' count as the one-lane unit (four runs of four,
   `docs/llama-engine.md`). Parity with the one-lane unit as the bar is the
   operator's decision, asked at the release.
+  - **Operator, 2026-10-08:** parity accepted for the time being.
+  - **Evidence** (`measured-here`): the greedy answer is byte-identical
+    across the agent lane on the first 0026 build, on the final one, and
+    on the deployed one-lane 0.7.0 unit. It loses the same two cases (CRLF
+    and LF-only input: the last field and row repeated at the end of
+    input), as at 0.5.6. A greedy score is one trajectory and flips with
+    the configuration at equal KL; the sampled means are the measure.
 - **KL** (`measured-here`, `llama-perplexity` with 0026's test switches,
   16 chunks of 512 against the Q8 reference, q8_0 KV): one sequence 0.004099
   (top-1 97.745 %). Four sequences decoded one at a time in a shared pool,
