@@ -53,8 +53,8 @@
 namespace lgc {
 namespace {
 
-// The output head's rows of a token subset, on the device the model runs on
-// (the OpenCL backend exposes the one card GGML_OPENCL_PLATFORM selected):
+// The output head's rows of a token subset, on the device the output head
+// runs on (the one card, or a layer split's last):
 // read from the GGUF in its own quantization, multiplied with a draft step's
 // head input, the subset's argmax mapped back to a token id.
 class DraftHead {
@@ -152,11 +152,14 @@ public:
             }
         }
 
-        // the model's card: the build's one GPU backend is OpenCL, and the
-        // engine pins its platform and device before the model loads
-        // (backend_llama.cpp); a second GPU backend would need the model's
-        // device named here
-        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        // the output head's card: the build's one GPU backend is OpenCL, and
+        // the engine pins its devices before the model loads
+        // (backend_llama.cpp). With one card it is that card; under
+        // --llama-layer-split the last, where the output head and the MTP
+        // model run
+        ggml_backend_dev_t dev = nullptr;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i)
+            if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) dev = ggml_backend_dev_get(i);
         if (dev == nullptr || (be_ = ggml_backend_dev_init(dev, nullptr)) == nullptr) {
             err = "no GPU backend for the draft head";
             return false;
@@ -325,7 +328,7 @@ class LlamaMtp final : public LlamaSpec {
 public:
     LlamaMtp(llama_model* model, llama_context* ctx_tgt, int n_draft, int n_seq, int n_batch, int n_ubatch,
              int threads, const std::string& gguf, const std::string& vocab, double min_p, ggml_type type_k,
-             ggml_type type_v, std::string& err)
+             ggml_type type_v, bool kv_unified, std::string& err)
         : ctx_tgt_(ctx_tgt), n_draft_(n_draft), min_p_(static_cast<float>(min_p)) {
         const int n_heads = llama_model_n_layer_nextn(model);
         if (n_heads <= 0) {
@@ -351,6 +354,15 @@ public:
         llama_context_params cp = llama_context_default_params();
         cp.ctx_type        = LLAMA_CONTEXT_TYPE_MTP;
         cp.n_ctx           = llama_n_ctx(ctx_tgt);
+        // the target's stream layout: with named lanes one pool of n_ctx that
+        // any sequence reaches (else a sequence's stream would be n_ctx /
+        // n_seq, under the agent lane's cap). llama.cpp's own draft context
+        // takes the target's kv_unified with the rest of its params
+        // (common/speculative.cpp at the pin). The MTP context of a qwen35 /
+        // qwen4exp model keeps its own cache: llama.cpp drops ctx_other for
+        // these architectures (llama-context.cpp:145-163), so the source-size
+        // override of llama-kv-cache.cpp:92-97 does not apply
+        cp.kv_unified      = kv_unified;
         // a prompt batch, the rows a verify left pending before it (up to
         // n_draft + 1: a follow-up turn continues where the last verify
         // stopped), and a sequence's first (zero-row) entry
@@ -373,6 +385,11 @@ public:
         ctx_dft_           = llama_init_from_model(model, cp);
         if (ctx_dft_ == nullptr) {
             err = "llama.cpp could not create the MTP draft context";
+            return;
+        }
+        if (kv_unified && llama_n_ctx(ctx_dft_) != llama_n_ctx(ctx_tgt)) {
+            err = log::format("the MTP draft context holds %u tokens, the target %u", llama_n_ctx(ctx_dft_),
+                              llama_n_ctx(ctx_tgt));
             return;
         }
         if (!vocab.empty()) {
@@ -534,6 +551,10 @@ public:
         return std::vector<float>(at, at + n_embd_);
     }
 
+    bool set_kv_windows(const uint32_t* n_cells, int n) override {
+        return llama_memory_seq_windows(llama_get_memory(ctx_dft_), n_cells, n);
+    }
+
     void set_carried_row(int seq, size_t n, const std::vector<float>& row) override {
         if (n == 0 || row.size() != static_cast<size_t>(n_embd_)) return;
         Lane& ln   = lanes_[static_cast<size_t>(seq)];
@@ -611,9 +632,9 @@ private:
 std::unique_ptr<LlamaSpec> make_llama_mtp(llama_model* model, llama_context* ctx_tgt, int n_draft, int n_seq,
                                           int n_batch, int n_ubatch, int threads, const std::string& gguf,
                                           const std::string& vocab, double min_p, ggml_type type_k, ggml_type type_v,
-                                          std::string& err) {
+                                          bool kv_unified, std::string& err) {
     auto s = std::make_unique<LlamaMtp>(model, ctx_tgt, n_draft, n_seq, n_batch, n_ubatch, threads, gguf, vocab,
-                                        min_p, type_k, type_v, err);
+                                        min_p, type_k, type_v, kv_unified, err);
     if (!s->ok() || !err.empty()) return nullptr;
     if (s->head_rows() > 0) log::info("mtp", "draft head: %zu token rows", s->head_rows());
     return s;

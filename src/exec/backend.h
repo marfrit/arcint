@@ -312,9 +312,12 @@ public:
 // M0: no OpenVINO, no weights, deterministic synthetic output.
 // `delay_ms` inserts artificial per-token latency so that cancellation and
 // streaming can be observed; zero for the fastest possible round-trip.
+// `lane_ctx`: named lanes' caps (--lane-ctx), by slot; generation on a lane
+// stops at its cap. Empty: every slot at n_ctx.
 std::unique_ptr<Backend> make_stub_backend(const ModelEntry& entry, Quant quant, int n_ctx,
                                            int delay_ms = 0,
-                                           const std::string& served_name = {});
+                                           const std::string& served_name = {},
+                                           const std::vector<int>& lane_ctx = {});
 
 #ifdef ARCINT_LLAMA
 // 0.5.3.1459: the libllama executor (ggml OpenCL), the GGUF in --gguf.

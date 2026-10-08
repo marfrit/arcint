@@ -1,7 +1,9 @@
 #include "config.h"
 #include "core/model_registry.h"
+#include "exec/llama_layer_split.h"
 #include "harness.h"
 
+#include <cstdio>
 #include <vector>
 
 using namespace lgc;
@@ -1213,4 +1215,236 @@ TEST(config_llama_expert_cache) {
         const char* argv[] = {"arcint", "--stub", "--llama-expert-cache", "64"};
         CHECK(!parse_args(4, const_cast<char**>(argv), cfg).ok);   // an option of the libllama engine only
     }
+}
+
+// --llama-mtp-card N: the card of a layer split that runs the MTP model
+// (default 0, the first: it drafted in half the time of the A770 there)
+TEST(config_llama_mtp_card) {
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split", "40"}, cfg).ok);
+        CHECK_EQ(cfg.llama_mtp_card, 0);
+    }
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split", "40", "--llama-mtp", "2", "--llama-mtp-gguf", "/m/mtp.gguf", "--llama-mtp-card", "1"}, cfg).ok);
+        CHECK_EQ(cfg.llama_mtp_card, 1);
+    }
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split", "40", "--llama-mtp-card", "2"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split", "40", "--llama-mtp-card", "-1"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split", "40", "--llama-mtp-card", "x"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-mtp-card", "1"}));   // one card: nothing to choose
+    // only the --llama-mtp-gguf model is placed by it (the GGUF's own MTP layer is the last layer's)
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split", "40", "--llama-mtp-card", "1"}));
+    CHECK(rejected({"--stub", "--llama-mtp-card", "0"}));   // an option of the libllama engine only
+}
+
+// --device GPU.0,GPU.1 --llama-layer-split K: the libllama engine's layer split
+// over two cards (docs/campaigns/layer-split-two-cards.md, 0024)
+TEST(config_llama_layer_split) {
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split", "30"}, cfg).ok);
+        CHECK(cfg.llama_devices == (std::vector<std::string>{"GPU.0", "GPU.1"}));
+        CHECK_EQ(cfg.llama_layer_split, 30);
+    }
+    {
+        // one card: as before, the list holds it
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--device", "GPU.1"}, cfg).ok);
+        CHECK(cfg.llama_devices == (std::vector<std::string>{"GPU.1"}));
+        CHECK_EQ(cfg.llama_layer_split, 0);
+    }
+    {
+        // names as well as ordinals
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--device", "B60,A770", "--llama-layer-split", "24"}, cfg).ok);
+        CHECK(cfg.llama_devices == (std::vector<std::string>{"B60", "A770"}));
+    }
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1"}));                                // no automatic split
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-layer-split", "24"}));                              // one card
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split", "0"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split", "-3"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split", "x"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1,GPU.2", "--llama-layer-split", "24"}));   // two cards
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,,GPU.1", "--llama-layer-split", "24"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,", "--llama-layer-split", "24"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.0", "--llama-layer-split", "24"}));   // one card twice
+    CHECK(rejected({"--stub", "--llama-layer-split", "24"}));   // an option of the libllama engine only
+    {
+        // OpenVINO's own device strings keep their commas
+        Config cfg;
+        CHECK(run({"--stub", "--device", "HETERO:GPU.0,GPU.1"}, cfg).ok);
+        CHECK_EQ(cfg.device, std::string("HETERO:GPU.0,GPU.1"));
+        CHECK(cfg.llama_devices.empty());
+    }
+}
+
+// --llama-expert-cache A,B: a cache per card, in --device order
+TEST(config_llama_expert_cache_per_card) {
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split", "24", "--llama-cpu-moe", "48",
+                   "--llama-expert-cache", "11000,7000"}, cfg).ok);
+        CHECK(cfg.llama_expert_cache_mib_dev == (std::vector<int>{11000, 7000}));
+        CHECK_EQ(cfg.llama_expert_cache_mib, 11000);
+        CHECK(cfg.llama_expert_cache_on());
+    }
+    {
+        // none on the first card: still a cache
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split", "24", "--llama-cpu-moe", "48",
+                   "--llama-expert-cache", "0,7000"}, cfg).ok);
+        CHECK_EQ(cfg.llama_expert_cache_mib, 0);
+        CHECK(cfg.llama_expert_cache_on());
+    }
+    {
+        // one value, one card: today's meaning
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--llama-cpu-moe", "48", "--llama-expert-cache", "14500"}, cfg).ok);
+        CHECK_EQ(cfg.llama_expert_cache_mib, 14500);
+        CHECK(cfg.llama_expert_cache_mib_dev == (std::vector<int>{14500}));
+    }
+    // one size per --device entry
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-cpu-moe", "48", "--llama-expert-cache", "11000,7000"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split", "24", "--llama-cpu-moe", "48",
+                    "--llama-expert-cache", "11000"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split", "24", "--llama-cpu-moe", "48",
+                    "--llama-expert-cache", "11000,-1"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split", "24", "--llama-cpu-moe", "48",
+                    "--llama-expert-cache", "11000,"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split", "24", "--llama-cpu-moe", "48",
+                    "--llama-expert-cache", "11000,x"}));
+    // a cache on either card holds experts --llama-cpu-moe keeps in host memory
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split", "24",
+                    "--llama-expert-cache", "0,7000"}));
+    // no cache anywhere: no profile
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--device", "GPU.0,GPU.1", "--llama-layer-split", "24", "--llama-cpu-moe", "48",
+                    "--llama-expert-cache", "0,0", "--llama-expert-profile", "/p/x.bin"}));
+    CHECK(rejected({"--stub", "--llama-expert-cache", "64,64"}));
+}
+
+// llama.cpp's layer placement (llama-model.cpp load_tensors) with the
+// fractions --llama-layer-split K sets: layers [0, K) on the first card, the
+// rest and the output on the second, for every K and depth
+TEST(llama_layer_split_fractions_place_k_exactly) {
+    for (int n = 2; n <= 200; ++n) {
+        for (int k = 1; k < n; ++k) {
+            const auto ts = llama_layer_split_fractions(n, k);
+            int wrong = 0;
+            for (int il = 0; il < n; ++il) wrong += llama_layer_split_device(ts.data(), 2, n, il) != (il < k ? 0 : 1);
+            wrong += llama_layer_split_device(ts.data(), 2, n, n) != 1;   // the output
+            if (wrong != 0) {
+                CHECK_EQ(n * 1000 + k, -1);   // names the failing (n, k)
+                return;
+            }
+        }
+    }
+    const auto a = llama_layer_split_fractions(48, 24), b = llama_layer_split_fractions(48, 30);
+    CHECK_NEAR(a[0], 23.5, 1e-6);
+    CHECK_NEAR(a[1], 25.5, 1e-6);
+    CHECK_NEAR(b[0], 29.5, 1e-6);
+    CHECK_NEAR(b[1], 19.5, 1e-6);
+    CHECK(llama_layer_split_valid(48, 1) && llama_layer_split_valid(48, 47));
+    CHECK(!llama_layer_split_valid(48, 0) && !llama_layer_split_valid(48, 48) && !llama_layer_split_valid(1, 1));
+    // the proportional {K, n - K} is not exact: layer 24 of 48 stays on the first card
+    const float naive[2] = { 24.0f, 24.0f };
+    CHECK_EQ(llama_layer_split_device(naive, 2, 48, 24), 0);
+}
+
+// Named lanes (DESIGN §4.2, amended 2026-10-07;
+// docs/campaigns/lanes-agent-subagent.md): --served-model-name A,B with
+// --lane-ctx CA,CB on the libllama engine, paired by index; the lane count is
+// the number of names.
+namespace {
+// The refusal, and that it is the lanes' refusal and not some earlier one.
+bool refused_for(std::vector<const char*> args, const char* needle) {
+    Config         cfg;
+    const ArgParse r = run(std::move(args), cfg);
+    if (r.ok) return false;
+    if (r.error.find(needle) == std::string::npos) {
+        std::fprintf(stderr, "    (refused, but for: %s)\n", r.error.c_str());
+        return false;
+    }
+    return true;
+}
+}  // namespace
+
+TEST(config_named_lanes_pair_names_with_contexts) {
+    Config cfg;
+    CHECK(run({"--gguf", "/m/q.gguf", "--served-model-name", "qwen3.8-agent,qwen3.8-subagent",
+               "--lane-ctx", "131072,32768"}, cfg).ok);
+    CHECK(cfg.named_lanes());
+    CHECK_EQ(cfg.lane_names, (std::vector<std::string>{"qwen3.8-agent", "qwen3.8-subagent"}));
+    CHECK_EQ(cfg.lane_ctx, (std::vector<int>{131072, 32768}));
+    CHECK_EQ(cfg.parallel, 2);   // the lane count is the number of names
+    // the first name is the served one (where an unnamed request goes)
+    CHECK_EQ(cfg.served_model_name, std::string("qwen3.8-agent"));
+
+    // --parallel that agrees is accepted, one that disagrees is refused
+    Config agree;
+    CHECK(run({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "512,256",
+               "--parallel", "2"}, agree).ok);
+    CHECK_EQ(agree.parallel, 2);
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "512,256",
+                       "--parallel", "1"}, "--parallel"));
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "512,256",
+                       "--parallel", "3"}, "--parallel"));
+
+    // the stub serves them too, for the device-free suites
+    Config stub;
+    CHECK(run({"--stub", "--served-model-name", "a,b", "--lane-ctx", "512,256"}, stub).ok);
+    CHECK_EQ(stub.parallel, 2);
+}
+
+TEST(config_named_lanes_refusals) {
+    // a name with whitespace ("a, b" in a unit file) would make a lane named " b"
+    // that its proxy name never reaches
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a, b", "--lane-ctx", "512,256"}, "whitespace"));
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a ,b", "--lane-ctx", "512,256"}, "whitespace"));
+    // named lanes are the libllama engine's
+    CHECK(rejected({"--model", "/m/ir", "--served-model-name", "a,b", "--lane-ctx", "512,256"}));
+    // lists of different lengths
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "512"}, "--lane-ctx"));
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b,c", "--lane-ctx", "512,256"}, "--lane-ctx"));
+    // a cap that is not a multiple of 256 (llama.cpp pads the pool to 256)
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "512,1000"}, "256"));
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "0,256"}, "256"));
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "-256,256"}, "256"));
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "512,x"}, "--lane-ctx"));
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "512,"}, "--lane-ctx"));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx"}));
+    // --lane-ctx without names, or with one: one lane's context is --n-ctx
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--lane-ctx", "512,256"}, "--served-model-name"));
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a", "--lane-ctx", "512"}, "--n-ctx"));
+    // names without contexts
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b"}, "--lane-ctx"));
+    // an empty or blank name, and the same name twice (a name picks one lane)
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--served-model-name", "a,,b", "--lane-ctx", "512,256,256"}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--served-model-name", "a, ", "--lane-ctx", "512,256"}));
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,a", "--lane-ctx", "512,256"}, "twice"));
+    // more than four lanes
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b,c,d,e",
+                       "--lane-ctx", "256,256,256,256,256"}, "4"));
+    Config four;
+    CHECK(run({"--gguf", "/m/q.gguf", "--served-model-name", "a,b,c,d", "--lane-ctx", "256,256,256,256"}, four).ok);
+    CHECK_EQ(four.parallel, 4);
+    // --n-ctx alongside: the lanes' contexts are the context
+    CHECK(refused_for({"--gguf", "/m/q.gguf", "--served-model-name", "a,b", "--lane-ctx", "512,256",
+                       "--n-ctx", "768"}, "--n-ctx"));
+}
+
+TEST(config_one_name_is_unchanged) {
+    Config cfg;
+    CHECK(run({"--gguf", "/m/q.gguf", "--served-model-name", "qwen3.8-agent"}, cfg).ok);
+    CHECK(!cfg.named_lanes());
+    CHECK(cfg.lane_names.empty());
+    CHECK_EQ(cfg.served_model_name, std::string("qwen3.8-agent"));
+    CHECK_EQ(cfg.parallel, 1);
+    // --parallel N alone: equal lanes, no names
+    Config eq;
+    CHECK(run({"--gguf", "/m/q.gguf", "--parallel", "2"}, eq).ok);
+    CHECK(!eq.named_lanes());
+    CHECK_EQ(eq.parallel, 2);
 }

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <optional>
+#include <vector>
 
 #include "core/model_registry.h"
 
@@ -59,8 +60,29 @@ struct Config {
     // robin); the other experts in a bank in pinned host memory the card reads
     // over the link, hot ones swapped in during decode (contrib/llama.cpp
     // patch 0021). 0 off.
+    // Under a layer split, --llama-expert-cache A,B: a cache per card, in
+    // --device order (patch 0024); 0 keeps none on that card. One value is
+    // the one card's. llama_expert_cache_mib is the first entry.
     int         llama_expert_cache_mib = 0;
+    std::vector<int> llama_expert_cache_mib_dev;
     std::string llama_expert_profile;
+    // --device GPU.0,GPU.1 with --engine llama: the cards of a layer split,
+    // in layer order (filled from --device by parse_args; one entry for one
+    // card). --llama-layer-split K: layers [0, K) on the first card, [K,
+    // n_layer) and the output head (and the MTP layer) on the second
+    // (llama.cpp's LLAMA_SPLIT_MODE_LAYER over two OpenCL platforms, patch
+    // 0023). Two cards need K: there is no automatic split.
+    std::vector<std::string> llama_devices;
+    int llama_layer_split = 0;
+    // --llama-mtp-card N: the card (index into llama_devices) that runs the
+    // --llama-mtp-gguf model under the split; it reads only the last
+    // layer's rows, through host memory. -1: unset, the first card.
+    int llama_mtp_card = -1;
+    bool llama_expert_cache_on() const {
+        for (int m : llama_expert_cache_mib_dev)
+            if (m > 0) return true;
+        return llama_expert_cache_mib > 0;
+    }
     int llama_checkpoint_step = 8192;
     std::string flash_next_ngram_path;  // --flash-next-ngram: FIX D per_layer_token_embd table (24-byte ARCINGRM header + block-quantised payload); admitted only when the artifact's config.json declares an n-gram table (docs/design-qwen-flash-next.md FIX D Link 2)
     // --ngram-gguf: the GGUF shard whose per_layer_token_embd.weight binds a
@@ -102,6 +124,16 @@ struct Config {
     // --model-id, which is about artifact identity and keeps refusing a wrong
     // artifact either way (DESIGN.md §4.2).
     std::string served_model_name;
+    // Named lanes (DESIGN.md §4.2, amended 2026-10-07;
+    // docs/campaigns/lanes-agent-subagent.md): --served-model-name A,B with
+    // --lane-ctx CA,CB, paired by index. A lane's name picks it, and its cap
+    // is its context. lane_names is empty unless the name list has two or
+    // more entries; served_model_name is then the first (the agent lane, where
+    // a request without a name goes). parallel is set to the lane count.
+    // The libllama engine (and --stub, for the device-free suites) only.
+    std::vector<std::string> lane_names;
+    std::vector<int>         lane_ctx;
+    bool named_lanes() const { return !lane_ctx.empty(); }
     Quant       quant = Quant::Q4;
 
     // OpenVINO device string. GPU.0 is the B60 and GPU.1 the A770 on the dev host;
@@ -123,6 +155,7 @@ struct Config {
     // rather than being silently lowered.
     bool n_ctx_explicit = false;
     int parallel = 1;  // lanes (DESIGN.md §4 /health reports free/total)
+    bool parallel_explicit = false;  // --parallel was given (named lanes refuse a disagreeing one)
 
     // How long a request waits for a lane before it is refused with the
     // reservation numbers (DESIGN.md §4.3). Zero refuses immediately, which is

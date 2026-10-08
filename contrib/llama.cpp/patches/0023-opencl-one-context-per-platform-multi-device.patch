@@ -1,0 +1,797 @@
+diff --git a/ggml/src/ggml-opencl/cl-program-cache.cpp b/ggml/src/ggml-opencl/cl-program-cache.cpp
+index 1a4a281..425ffcf 100644
+--- a/ggml/src/ggml-opencl/cl-program-cache.cpp
++++ b/ggml/src/ggml-opencl/cl-program-cache.cpp
+@@ -382,7 +382,7 @@ cl_program cl_program_cache_try_load(
+         return nullptr;
+     }
+ 
+-    err = clBuildProgram(p, 0, nullptr, compile_opts.c_str(), nullptr, nullptr);
++    err = clBuildProgram(p, 1, &device, compile_opts.c_str(), nullptr, nullptr);
+     if (err != CL_SUCCESS) {
+         clReleaseProgram(p);
+         return nullptr;
+@@ -395,7 +395,7 @@ cl_program cl_program_cache_try_load(
+ void cl_program_cache_try_save(
+     const cl_program_cache_state & state,
+     cl_program                     program,
+-    cl_device_id                   /*device*/,
++    cl_device_id                   device,
+     const char *                   source,
+     const std::string &            compile_opts) {
+ 
+@@ -408,11 +408,25 @@ void cl_program_cache_try_save(
+         return;
+     }
+ 
++    // The program belongs to every device of its context, but is built for
++    // `device` only (the other devices' binaries are empty): save that one.
++    std::vector<cl_device_id> devs(n_dev);
++    if (clGetProgramInfo(program, CL_PROGRAM_DEVICES, sizeof(cl_device_id) * n_dev, devs.data(), nullptr) != CL_SUCCESS) {
++        return;
++    }
++    cl_uint idx = 0;
++    while (idx < n_dev && devs[idx] != device) {
++        ++idx;
++    }
++    if (idx == n_dev) {
++        return;
++    }
++
+     std::vector<size_t> sizes(n_dev);
+     if (clGetProgramInfo(program, CL_PROGRAM_BINARY_SIZES, sizeof(size_t) * n_dev, sizes.data(), nullptr) != CL_SUCCESS) {
+         return;
+     }
+-    if (sizes.empty() || sizes[0] == 0) {
++    if (sizes[idx] == 0) {
+         return;
+     }
+ 
+@@ -426,10 +440,9 @@ void cl_program_cache_try_save(
+         return;
+     }
+ 
+-    // We only care about the first device's binary — that's the one we'd
+-    // re-load with on a future cache hit. Multi-device contexts aren't a
+-    // pattern this backend uses today.
+-    const std::vector<uint8_t> & bin = binaries[0];
++    // `device`'s binary: the one a future cache hit re-loads (the key names the
++    // device, its driver and its platform, so two devices never share an entry).
++    const std::vector<uint8_t> & bin = binaries[idx];
+ 
+     std::vector<uint8_t> file;
+     file.reserve(16 + bin.size());
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 5fdde22..6d62658 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -476,6 +476,12 @@ struct ggml_backend_opencl_device_context {
+     std::regex *opfilter = nullptr; // regex of ops to not claim
+     std::string opfilter_str = ""; // regex string for opfilter
+     size_t global_mem_size = 0;
++
++    // Registry names, distinct per device so -dev / ggml_backend_dev_by_name can
++    // pick one: the first device keeps "GPUOpenCL" / "OpenCL", the others get
++    // their index appended ("GPUOpenCL1" / "OpenCL1", ...).
++    std::string name      = "GPUOpenCL";
++    std::string buft_name = "OpenCL";
+ };
+ 
+ // Lazily-compiled flash-attention kernels and their per-(dk,dv) tile metadata.
+@@ -572,6 +578,8 @@ struct ggml_opencl_fa_kernels {
+     // attempted (variant, (dk, dv))
+     // all attempted FA kernels appear here, but those not registered failed compilation
+     std::set<std::pair<int, std::pair<int, int>>> variant_attempted;
++    // the DK=512 prefill tile (plain, split) failed to build on this device: not retried
++    bool prefill_512_failed[2] = { false, false };
+ 
+     // FA bin kernels
+ #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+@@ -651,6 +659,17 @@ struct ggml_cl_kq_tile {
+     int nsg() const { return nsgm * nsgn; }
+ };
+ 
++// cl_intel_unified_shared_memory entry points. Extension functions are
++// resolved per platform (clGetExtensionFunctionAddressForPlatform), so each
++// device keeps its own (see ggml_cl_init).
++typedef void * (*ggml_cl_host_alloc_t)(cl_context, const cl_ulong *, size_t, cl_uint, cl_int *);
++typedef cl_int (*ggml_cl_mem_free_t)(cl_context, void *);
++typedef cl_int (*ggml_cl_set_arg_ptr_t)(cl_kernel, cl_uint, const void *);
++
++// GGML_OPENCL_MOE_PREFETCH: the mirror the previous projection's matvec filled
++// for the next one (per backend: reset at each graph_compute)
++struct ggml_cl_pf_state { const ggml_tensor * slot = nullptr; const ggml_tensor * ids = nullptr; cl_mem mirror = nullptr; };
++
+ struct ggml_backend_opencl_context {
+     int ref_count;
+ 
+@@ -759,6 +778,12 @@ struct ggml_backend_opencl_context {
+     ggml_cl_buffer prealloc_kq_tiles;  // its tiles (expert, first pair, count)
+     ggml_cl_buffer prealloc_kq_ntiles; // and their number
+     ggml_cl_buffer prealloc_splitk_partial;  // [ksplit * M] partials for split-K GEMV
++    ggml_cl_buffer prealloc_cumsum_tmp;      // ggml_cl_cumsum's per-workgroup sums
++
++    // scratch of the helpers that kept a function-local static ggml_cl_buffer:
++    // a cl_mem belongs to one cl_context, so each device keeps its own, by tag
++    std::map<std::string, ggml_cl_buffer> scratch_bufs;
++    ggml_cl_buffer & scratch_buffer(const char * tag) { return scratch_bufs[tag]; }
+ 
+     // pool of persistent image1d_buffer views over kv-cache layers, keyed by
+     // (parent buffer, offset within parent)
+@@ -1026,6 +1051,15 @@ struct ggml_backend_opencl_context {
+     // the ids tensor the permutation was computed for (reset at each graph: a later
+     // graph's ids reuse the tensors with new contents)
+     const ggml_tensor * pair_perm_t = nullptr; int pair_perm_split = 0;
++    // USM entry points of this device's platform (null without cl_intel_unified_shared_memory)
++    ggml_cl_host_alloc_t  usm_host_alloc  = nullptr;
++    ggml_cl_mem_free_t    usm_mem_free    = nullptr;
++    ggml_cl_set_arg_ptr_t usm_set_arg_ptr = nullptr;
++    ggml_cl_pf_state      moe_pf;           // GGML_OPENCL_MOE_PREFETCH state of the current graph
++    // ggml_backend_opencl_exchange_slices' staging slice, and the host copies
++    // ggml_backend_opencl_set_tensor_slices keeps until this queue has passed them
++    ggml_cl_buffer prealloc_exchange;
++    std::vector<std::vector<uint8_t>> slices_keep;
+     // the MoE router's softmax + top-k + normalized weights in one kernel, Intel
+     cl_kernel kernel_topk_moe = nullptr;
+     // SCALE -> SILU / SCALE -> SIGMOID -> SCALE fused, Intel
+@@ -1495,7 +1529,9 @@ static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev,
+             return NULL;
+         }
+ 
+-        err = clBuildProgram(p, 0, NULL, compile_opts.c_str(), NULL, NULL);
++        // build for this backend's device only: a context may hold several
++        // devices, and their compilers need not accept the same options
++        err = clBuildProgram(p, 1, &dev, compile_opts.c_str(), NULL, NULL);
+         if (err == CL_SUCCESS) {
+             return p;
+         }
+@@ -1573,7 +1609,7 @@ static cl_program build_program_from_binary(cl_context ctx, cl_device_id dev, co
+         exit(1);
+     }
+ 
+-    err = clBuildProgram(p, 0, NULL, compile_opts.c_str(), NULL, NULL);
++    err = clBuildProgram(p, 1, &dev, compile_opts.c_str(), NULL, NULL);
+     if(err < 0) {
+         clGetProgramBuildInfo(p, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
+         program_log = (char*) malloc(log_size + 1);
+@@ -6404,7 +6440,7 @@ static bool ggml_opencl_ensure_fa_f32_f16_prefill_512(ggml_backend_opencl_contex
+     auto & target = split ? backend_ctx->fa.f32_f16_split : backend_ctx->fa.f32_f16;
+     if (target.count(dk_dv) > 0) { return true; }
+ 
+-    static bool failed[2] = { false, false };
++    bool * failed = backend_ctx->fa.prefill_512_failed;   // per device: the B60 and the A770 compile differently
+     if (failed[split ? 1 : 0]) { return false; }
+ 
+     const ggml_opencl_fa_dim * cfg = nullptr;
+@@ -7218,6 +7254,50 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
+     cl_device * candidate_devices    = nullptr;
+     unsigned    n_candidate_devices  = 0;
+ 
++    // The devices to register, the default one first.
++    std::vector<struct cl_device *> selected;
++
++    // GGML_OPENCL_DEVICES="P:D[,P:D...]": devices by platform index and device
++    // index within that platform (as `clinfo -l` numbers them), across
++    // platforms, in that order. The Intel runtime exposes Arc cards of
++    // different generations as separate platforms, so a multi-GPU split needs
++    // devices of several platforms. Without it, one platform is chosen as before.
++    const char * user_devices_string = getenv("GGML_OPENCL_DEVICES");
++    if (user_devices_string != NULL && user_devices_string[0] != 0) {
++        if (user_platform_string != NULL || user_device_string != NULL) {
++            GGML_LOG_WARN("ggml_opencl: GGML_OPENCL_DEVICES is set; ignoring GGML_OPENCL_PLATFORM / GGML_OPENCL_DEVICE\n");
++        }
++        for (const char * c = user_devices_string; *c != 0; ) {
++            unsigned pi, di;
++            int      len = 0;
++            if (sscanf(c, " %u : %u %n", &pi, &di, &len) != 2 || len == 0) {
++                GGML_LOG_ERROR("ggml_opencl: GGML_OPENCL_DEVICES='%s': expected platform:device[,platform:device...]\n", user_devices_string);
++                exit(1);
++            }
++            if (pi >= n_platforms || di >= platforms[pi].n_devices) {
++                GGML_LOG_ERROR("ggml_opencl: GGML_OPENCL_DEVICES: no device %u:%u (%u platforms)\n", pi, di, n_platforms);
++                exit(1);
++            }
++            struct cl_device * d = &platforms[pi].devices[di];
++            if (std::find(selected.begin(), selected.end(), d) != selected.end()) {
++                GGML_LOG_ERROR("ggml_opencl: GGML_OPENCL_DEVICES: device %u:%u listed twice\n", pi, di);
++                exit(1);
++            }
++            selected.push_back(d);
++            c += len;
++            if (*c == ',' && c[1] != 0) {
++                c++;
++            } else if (*c != 0) {
++                GGML_LOG_ERROR("ggml_opencl: GGML_OPENCL_DEVICES='%s': expected platform:device[,platform:device...]\n", user_devices_string);
++                exit(1);
++            }
++        }
++        if (selected.empty()) {
++            GGML_LOG_ERROR("ggml_opencl: GGML_OPENCL_DEVICES='%s' selects no device\n", user_devices_string);
++            exit(1);
++        }
++    }
++
+     unsigned n;
+     if (user_platform_string != NULL && sscanf(user_platform_string, " %u", &n) == 1 && n < n_platforms) {
+         user_platform_number = (int)n;
+@@ -7225,7 +7305,10 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
+     if (user_device_string != NULL && sscanf(user_device_string, " %u", &n) == 1 && n < n_devices) {
+         user_device_number = (int)n;
+     }
+-    if (user_platform_number != -1 && user_device_number != -1) {
++    if (!selected.empty()) {
++        // GGML_OPENCL_DEVICES: the first listed device is the default one
++        default_device = selected[0];
++    } else if (user_platform_number != -1 && user_device_number != -1) {
+         cl_platform* platform = &platforms[user_platform_number];
+         if ((unsigned)user_device_number >= platform->n_devices) {
+             GGML_LOG_ERROR("ggml_opencl: invalid device number %d\n", user_device_number);
+@@ -7287,34 +7370,62 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
+         }
+     }
+ 
+-    GGML_ASSERT(n_candidate_devices != 0 && candidate_devices);
++    if (selected.empty()) {
++        GGML_ASSERT(n_candidate_devices != 0 && candidate_devices);
+ 
+-    // Put the default device in front.
+-    for (unsigned i = 1; i < n_candidate_devices; i++) {
+-        if (&candidate_devices[i] == default_device) {
+-            std::swap(candidate_devices[0], candidate_devices[i]);
+-            default_device = &candidate_devices[0];
+-            break;
++        // Put the default device in front.
++        for (unsigned i = 1; i < n_candidate_devices; i++) {
++            if (&candidate_devices[i] == default_device) {
++                std::swap(candidate_devices[0], candidate_devices[i]);
++                default_device = &candidate_devices[0];
++                break;
++            }
++        }
++
++        for (auto dev = candidate_devices, dev_end = candidate_devices + n_candidate_devices; dev != dev_end; dev++) {
++            selected.push_back(dev);
+         }
+     }
+ 
+-    GGML_LOG_INFO("ggml_opencl: selected platform: '%s'\n", default_device->platform->name);
++    // One cl_context per platform: the selected devices of a platform share it
++    // (as with a single platform before); devices of different platforms cannot.
++    std::vector<std::pair<struct cl_platform *, cl_context>> platform_contexts;
++    for (struct cl_device * d : selected) {
++        bool have = false;
++        for (auto & pc : platform_contexts) {
++            have = have || pc.first == d->platform;
++        }
++        if (have) {
++            continue;
++        }
++        GGML_LOG_INFO("ggml_opencl: selected platform: '%s'\n", d->platform->name);
+ 
+-    std::vector<cl_device_id> device_ids;
+-    for (auto dev = candidate_devices, dev_end = candidate_devices + n_candidate_devices; dev != dev_end; dev++) {
+-        device_ids.push_back(dev->id);
+-    }
++        std::vector<cl_device_id> device_ids;
++        for (struct cl_device * e : selected) {
++            if (e->platform == d->platform) {
++                device_ids.push_back(e->id);
++            }
++        }
+ 
+-    cl_int                err;
+-    cl_context            shared_context;
+-    cl_context_properties properties[] = { (intptr_t) CL_CONTEXT_PLATFORM, (intptr_t) default_device->platform->id, 0 };
++        cl_int                err;
++        cl_context            platform_context;
++        cl_context_properties properties[] = { (intptr_t) CL_CONTEXT_PLATFORM, (intptr_t) d->platform->id, 0 };
+ 
+-    CL_CHECK(
+-        (shared_context = clCreateContext(properties, device_ids.size(), device_ids.data(), NULL, NULL, &err), err));
++        CL_CHECK(
++            (platform_context = clCreateContext(properties, device_ids.size(), device_ids.data(), NULL, NULL, &err), err));
++        platform_contexts.emplace_back(d->platform, platform_context);
++    }
+ 
+-    for (auto dev = candidate_devices, dev_end = candidate_devices + n_candidate_devices; dev != dev_end; dev++) {
++    for (struct cl_device * dev : selected) {
+         GGML_LOG_INFO("\nggml_opencl: device: '%s (%s)'\n", dev->name, dev->version);
+ 
++        cl_context context = nullptr;
++        for (auto & pc : platform_contexts) {
++            if (pc.first == dev->platform) {
++                context = pc.second;
++            }
++        }
++
+         auto dev_ctx = std::unique_ptr<ggml_backend_opencl_device_context>(new ggml_backend_opencl_device_context{
+             /*.platform         =*/dev->platform->id,
+             /*.platform_nane    =*/dev->platform->name,
+@@ -7324,7 +7435,7 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
+             /*.device_version   =*/dev->version,
+             /*.backend_ctx      =*/nullptr,
+             /*.buffer_type      =*/{},
+-            /*.context          =*/shared_context,
++            /*.context          =*/context,
+         });
+ 
+         found_devices.push_back(ggml_backend_device{
+@@ -7339,6 +7450,12 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
+             continue;
+         }
+ 
++        const size_t index = found_devices.size() - 1;
++        if (index > 0) {
++            dev_ctx->name      = "GPUOpenCL" + std::to_string(index);
++            dev_ctx->buft_name = "OpenCL" + std::to_string(index);
++        }
++
+         g_ggml_backend_opencl_dev_ctxs.push_back(std::move(dev_ctx));
+     }
+ 
+@@ -7706,6 +7823,12 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+ #endif
+     CL_CHECK((backend_ctx->queue = clCreateCommandQueue(context, device, command_queue_props, &err), err));
+ 
++    // USM entry points of this device's platform (an expert cache's host bank);
++    // null where the platform lacks cl_intel_unified_shared_memory
++    backend_ctx->usm_host_alloc  = (ggml_cl_host_alloc_t)  clGetExtensionFunctionAddressForPlatform(dev_ctx->platform, "clHostMemAllocINTEL");
++    backend_ctx->usm_mem_free    = (ggml_cl_mem_free_t)    clGetExtensionFunctionAddressForPlatform(dev_ctx->platform, "clMemFreeINTEL");
++    backend_ctx->usm_set_arg_ptr = (ggml_cl_set_arg_ptr_t) clGetExtensionFunctionAddressForPlatform(dev_ctx->platform, "clSetKernelArgMemPointerINTEL");
++
+     // delay kernel loading until the first buffer is created
+     // load_cl_kernels(backend_ctx.get());
+ 
+@@ -7770,7 +7893,7 @@ static void transpose_2d(
+     bool blocking = true,
+     bool auto_local = false // let driver pick local size for non-uniform workgroups
+ ) {
+-    static ggml_cl_buffer buf;
++    ggml_cl_buffer & buf = backend_ctx->scratch_buffer("transpose_2d");
+ 
+     cl_event evt;
+     cl_int err;
+@@ -8410,9 +8533,9 @@ struct ggml_tensor_extra_cl_q6_K {
+ // backend
+ //
+ static const char * ggml_backend_opencl_name(ggml_backend_t backend) {
+-    return "OpenCL";
+-
+-    UNUSED(backend);
++    // as the device's buffer type: "OpenCL", "OpenCL1", ...
++    ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) backend->device->context;
++    return dev_ctx->buft_name.c_str();
+ }
+ 
+ static void ggml_backend_opencl_free(ggml_backend_t backend) {
+@@ -8454,6 +8577,16 @@ static void ggml_backend_opencl_synchronize(ggml_backend_t backend) {
+ // Synchronizes the 'backend_ctx's device with others so that commands
+ // enqueued to it won't start until commands in the other devices have
+ // completed.
++//
++// Only devices in this backend's cl_context: an event can be waited on only in
++// the context it was created in (CL_INVALID_CONTEXT otherwise), and devices of
++// different platforms have different contexts. Across contexts no device-side
++// ordering is needed: OpenCL backends have no cpy_tensor_async, no buffer
++// cpy_tensor and no events, so the scheduler moves a split's inputs with
++// ggml_backend_synchronize() on both backends followed by a blocking
++// ggml_backend_tensor_copy() through host memory (ggml-backend.cpp,
++// ggml_backend_sched_compute_splits), and synchronizes the previous backend
++// before a split without inputs.
+ static void sync_with_other_backends(ggml_backend_opencl_context * backend_ctx) {
+     if (g_ggml_backend_opencl_devices.size() < 2) {
+         return; // No other devices to synchronize with.
+@@ -8466,7 +8599,8 @@ static void sync_with_other_backends(ggml_backend_opencl_context * backend_ctx)
+         ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) backend_dev.context;
+         auto * other_backend_ctx = dev_ctx->backend_ctx;
+ 
+-        if (backend_ctx != other_backend_ctx) {
++        if (other_backend_ctx != nullptr && backend_ctx != other_backend_ctx &&
++            other_backend_ctx->context == backend_ctx->context) {
+             cl_event ev;
+             CL_CHECK(clEnqueueMarkerWithWaitList(other_backend_ctx->queue, 0, nullptr, &ev));
+             CL_CHECK(clFlush(other_backend_ctx->queue));
+@@ -8474,6 +8608,10 @@ static void sync_with_other_backends(ggml_backend_opencl_context * backend_ctx)
+         }
+     }
+ 
++    if (events.empty()) {
++        return; // No other device shares this context.
++    }
++
+     CL_CHECK(clEnqueueBarrierWithWaitList(backend_ctx->queue, events.size(), events.data(), nullptr));
+     for (auto ev : events) {
+         CL_CHECK(clReleaseEvent(ev));
+@@ -9579,10 +9717,10 @@ static void ggml_cl_scale_act_fused(ggml_backend_t backend, ggml_cgraph * cgraph
+ // GGML_OPENCL_MOE_PREFETCH: an expert cache's decode matvec of one projection
+ // copies the next projection's missed experts of the same layer (gate -> up ->
+ // down, the same ids) into a card-side mirror while it computes, and the next
+-// projection reads its misses there: their link time overlaps a matvec
++// projection reads its misses there: their link time overlaps a matvec. The
++// chain is keyed by tensor (process-wide); the mirror filled for the next
++// projection is per device (ggml_backend_opencl_context::moe_pf)
+ static std::unordered_map<const ggml_tensor *, const ggml_tensor *> g_cache_chain;
+-struct ggml_cl_pf_state { const ggml_tensor * slot = nullptr; const ggml_tensor * ids = nullptr; cl_mem mirror = nullptr; };
+-static ggml_cl_pf_state g_pf;
+ static bool ggml_cl_moe_prefetch_on() {
+     static const char * env = getenv("GGML_OPENCL_MOE_PREFETCH");
+     static const bool on = env != nullptr && atoi(env) != 0;
+@@ -9594,7 +9732,7 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+     backend_ctx->graph_gen++;
+     backend_ctx->pair_perm_t = nullptr;
+     backend_ctx->pair_grp_t = nullptr;
+-    g_pf = {};
++    backend_ctx->moe_pf = {};
+ 
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
+@@ -10598,13 +10736,8 @@ bool ggml_backend_is_opencl(ggml_backend_t backend) {
+ // USM host memory (cl_intel_unified_shared_memory) for an expert cache's
+ // bank: kernels read it over the link through pointer arguments (a cl_mem
+ // over host memory is migrated to the card by the driver: 1.1 TB/s kernel
+-// reads against 14.3 GB/s for USM host on the B60, measured-here)
+-typedef void * (*ggml_cl_host_alloc_t)(cl_context, const cl_ulong *, size_t, cl_uint, cl_int *);
+-typedef cl_int (*ggml_cl_mem_free_t)(cl_context, void *);
+-typedef cl_int (*ggml_cl_set_arg_ptr_t)(cl_kernel, cl_uint, const void *);
+-static ggml_cl_host_alloc_t  g_cl_host_alloc  = nullptr;
+-static ggml_cl_mem_free_t    g_cl_mem_free    = nullptr;
+-static ggml_cl_set_arg_ptr_t g_cl_set_arg_ptr = nullptr;
++// reads against 14.3 GB/s for USM host on the B60, measured-here); the
++// entry points are per device (ggml_backend_opencl_context::usm_*)
+ // an expert cache's single branch (decode): slot tensor -> its bank and the
+ // split (ids at or above it are the bank's, gathered into the mirror)
+ static std::unordered_map<const ggml_tensor *, std::pair<const ggml_tensor *, int>> g_cache_pairs;
+@@ -10625,11 +10758,14 @@ struct ggml_backend_opencl_buffer_context {
+     // IQ4_NL tensors as their scales, then their quants
+     void *     usm     = nullptr;
+     cl_context usm_ctx = nullptr;
++    // the entry points of the platform the memory came from
++    ggml_cl_mem_free_t    usm_free    = nullptr;
++    ggml_cl_set_arg_ptr_t usm_set_arg = nullptr;
+     std::unordered_map<const ggml_tensor *, std::pair<char *, char *>> usm_split;   // tensor -> (d, q)
+ 
+     ~ggml_backend_opencl_buffer_context() {
+-        if (usm && g_cl_mem_free) {
+-            g_cl_mem_free(usm_ctx, usm);
++        if (usm && usm_free) {
++            usm_free(usm_ctx, usm);
+         }
+         for (cl_mem buf : buffer) {
+             CL_CHECK(clReleaseMemObject(buf));
+@@ -13138,10 +13274,10 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             return;
+         }
+         if (use_adreno_kernels(backend_ctx, tensor)) {
+-            static ggml_cl_buffer buf_trans_q;
+-            static ggml_cl_buffer buf_trans_m;
+-            static ggml_cl_buffer buf_trans_d;
+-            static ggml_cl_buffer buf_unpacked;
++            ggml_cl_buffer & buf_trans_q = backend_ctx->scratch_buffer("get_tensor.q4_1.buf_trans_q");
++            ggml_cl_buffer & buf_trans_m = backend_ctx->scratch_buffer("get_tensor.q4_1.buf_trans_m");
++            ggml_cl_buffer & buf_trans_d = backend_ctx->scratch_buffer("get_tensor.q4_1.buf_trans_d");
++            ggml_cl_buffer & buf_unpacked = backend_ctx->scratch_buffer("get_tensor.q4_1.buf_unpacked");
+ 
+             cl_int M = tensor->ne[1];
+             cl_int K = tensor->ne[0];
+@@ -13541,9 +13677,9 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+ 
+ #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+         if (use_adreno_kernels(backend_ctx, tensor)) {
+-            static ggml_cl_buffer buf_trans_q;
+-            static ggml_cl_buffer buf_trans_d;
+-            static ggml_cl_buffer buf_unpacked;
++            ggml_cl_buffer & buf_trans_q = backend_ctx->scratch_buffer("get_tensor.iq4_nl.buf_trans_q");
++            ggml_cl_buffer & buf_trans_d = backend_ctx->scratch_buffer("get_tensor.iq4_nl.buf_trans_d");
++            ggml_cl_buffer & buf_unpacked = backend_ctx->scratch_buffer("get_tensor.iq4_nl.buf_unpacked");
+ 
+             cl_int M = tensor->ne[1];
+             cl_int K = tensor->ne[0];
+@@ -13702,10 +13838,10 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             size_t size_dm = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
+             size_t size_s  = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*12;
+ 
+-            static ggml_cl_buffer buf_trans_q;
+-            static ggml_cl_buffer buf_trans_d;
+-            static ggml_cl_buffer buf_trans_dm;
+-            static ggml_cl_buffer buf_trans_s;
++            ggml_cl_buffer & buf_trans_q = backend_ctx->scratch_buffer("get_tensor.q4_k.buf_trans_q");
++            ggml_cl_buffer & buf_trans_d = backend_ctx->scratch_buffer("get_tensor.q4_k.buf_trans_d");
++            ggml_cl_buffer & buf_trans_dm = backend_ctx->scratch_buffer("get_tensor.q4_k.buf_trans_dm");
++            ggml_cl_buffer & buf_trans_s = backend_ctx->scratch_buffer("get_tensor.q4_k.buf_trans_s");
+ 
+             buf_trans_q.allocate(backend_ctx->context, size_q);
+             buf_trans_d.allocate(backend_ctx->context, size_d);
+@@ -13817,11 +13953,11 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             size_t size_d  = extra->size_d;
+             size_t size_dm = extra->size_dm;
+ 
+-            static ggml_cl_buffer buf_trans_q;
+-            static ggml_cl_buffer buf_trans_qh;
+-            static ggml_cl_buffer buf_trans_s;
+-            static ggml_cl_buffer buf_trans_d;
+-            static ggml_cl_buffer buf_trans_dm;
++            ggml_cl_buffer & buf_trans_q = backend_ctx->scratch_buffer("get_tensor.q5_k.buf_trans_q");
++            ggml_cl_buffer & buf_trans_qh = backend_ctx->scratch_buffer("get_tensor.q5_k.buf_trans_qh");
++            ggml_cl_buffer & buf_trans_s = backend_ctx->scratch_buffer("get_tensor.q5_k.buf_trans_s");
++            ggml_cl_buffer & buf_trans_d = backend_ctx->scratch_buffer("get_tensor.q5_k.buf_trans_d");
++            ggml_cl_buffer & buf_trans_dm = backend_ctx->scratch_buffer("get_tensor.q5_k.buf_trans_dm");
+ 
+             buf_trans_q.allocate(backend_ctx->context, size_q);
+             buf_trans_qh.allocate(backend_ctx->context, size_qh);
+@@ -13983,11 +14119,11 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+             return;
+         }
+         if (use_adreno_kernels(backend_ctx, tensor) && !use_flat_gemv_for_large_m_q6_K(backend_ctx, tensor)) {
+-            static ggml_cl_buffer buf_trans_ql;
+-            static ggml_cl_buffer buf_trans_qh;
+-            static ggml_cl_buffer buf_trans_s;
+-            static ggml_cl_buffer buf_trans_d;
+-            static ggml_cl_buffer buf_unpacked;
++            ggml_cl_buffer & buf_trans_ql = backend_ctx->scratch_buffer("get_tensor.q6_k.buf_trans_ql");
++            ggml_cl_buffer & buf_trans_qh = backend_ctx->scratch_buffer("get_tensor.q6_k.buf_trans_qh");
++            ggml_cl_buffer & buf_trans_s = backend_ctx->scratch_buffer("get_tensor.q6_k.buf_trans_s");
++            ggml_cl_buffer & buf_trans_d = backend_ctx->scratch_buffer("get_tensor.q6_k.buf_trans_d");
++            ggml_cl_buffer & buf_unpacked = backend_ctx->scratch_buffer("get_tensor.q6_k.buf_unpacked");
+ 
+             cl_int M = tensor->ne[1];   // ne01
+             cl_int K = tensor->ne[0];   // ne00
+@@ -14155,13 +14291,16 @@ static ggml_backend_buffer_i ggml_backend_opencl_buffer_interface = {
+ //
+ 
+ static const char * ggml_backend_opencl_buffer_type_get_name(ggml_backend_buffer_type_t buffer_type) {
+-    return "OpenCL";
+-
+-    GGML_UNUSED(buffer_type);
++    ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer_type->device->context;
++    return dev_ctx->buft_name.c_str();
+ }
+ 
+ // set through get_proc_address ("ggml_backend_opencl_set_alloc_host"): the
+-// next allocations of this device's buffer type go to GPU-visible host memory
++// next allocations of an OpenCL buffer type go to GPU-visible host memory.
++// One switch for all devices is safe: the caller (llama_expert_cache) brackets
++// one synchronous allocation with it on the loading thread, and that
++// allocation takes the context and the USM entry points of the buffer type's
++// own device. It is not a per-device setting.
+ static bool g_opencl_alloc_host = false;
+ static void ggml_backend_opencl_set_alloc_host(bool host) { g_opencl_alloc_host = host; }
+ 
+@@ -14180,14 +14319,11 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
+     cl_int err;
+     cl_mem mem = nullptr;
+     if (g_opencl_alloc_host) {
+-        // USM host memory (an expert cache's bank: the kernels read it over the link)
+-        ggml_backend_opencl_device_context * dctx = (ggml_backend_opencl_device_context *) buffer_type->device->context;
+-        if (!g_cl_host_alloc) {
+-            g_cl_host_alloc  = (ggml_cl_host_alloc_t)  clGetExtensionFunctionAddressForPlatform(dctx->platform, "clHostMemAllocINTEL");
+-            g_cl_mem_free    = (ggml_cl_mem_free_t)    clGetExtensionFunctionAddressForPlatform(dctx->platform, "clMemFreeINTEL");
+-            g_cl_set_arg_ptr = (ggml_cl_set_arg_ptr_t) clGetExtensionFunctionAddressForPlatform(dctx->platform, "clSetKernelArgMemPointerINTEL");
+-        }
+-        void * usm = g_cl_host_alloc && g_cl_set_arg_ptr ? g_cl_host_alloc(backend_ctx->context, NULL, size, 0, &err) : nullptr;
++        // USM host memory (an expert cache's bank: the kernels read it over the link),
++        // through this device's platform's entry points
++        err = CL_INVALID_OPERATION;
++        void * usm = backend_ctx->usm_host_alloc && backend_ctx->usm_mem_free && backend_ctx->usm_set_arg_ptr
++                         ? backend_ctx->usm_host_alloc(backend_ctx->context, NULL, size, 0, &err) : nullptr;
+         if (usm == nullptr) {
+             GGML_LOG_ERROR("%s: failed to allocate %.2f MiB of USM host memory (err=%d)\n", __func__, size / 1024.0 / 1024.0, err);
+             return nullptr;
+@@ -14195,8 +14331,10 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
+         mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, 64, NULL, &err);   // a placeholder for the tensors' extras
+         CL_CHECK(err);
+         ggml_backend_opencl_buffer_context * hctx = new ggml_backend_opencl_buffer_context(mem);
+-        hctx->usm     = usm;
+-        hctx->usm_ctx = backend_ctx->context;
++        hctx->usm         = usm;
++        hctx->usm_ctx     = backend_ctx->context;
++        hctx->usm_free    = backend_ctx->usm_mem_free;
++        hctx->usm_set_arg = backend_ctx->usm_set_arg_ptr;
+         return ggml_backend_buffer_init(buffer_type, ggml_backend_opencl_buffer_interface, hctx, size);
+     }
+     mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, size, NULL, &err);
+@@ -14248,17 +14386,12 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
+ }
+ 
+ static size_t ggml_backend_opencl_buffer_type_get_alignment(ggml_backend_buffer_type_t buffer_type) {
+-    ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer_type->device->context;
+-    return dev_ctx->backend_ctx->alignment;
++    return ggml_cl_init(buffer_type->device)->alignment;
+ }
+ 
+ static size_t ggml_backend_opencl_buffer_type_get_max_size(ggml_backend_buffer_type_t buffer_type) {
+-    static size_t max_size = -1;
+-    if (max_size == (size_t)-1) {
+-        ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer_type->device->context;
+-        max_size = dev_ctx->backend_ctx->max_alloc_size;
+-    }
+-    return max_size;
++    // per device: CL_DEVICE_MAX_MEM_ALLOC_SIZE differs between devices
++    return ggml_cl_init(buffer_type->device)->max_alloc_size;
+ }
+ 
+ static bool ggml_backend_opencl_buffer_type_supports_backend(ggml_backend_buffer_type_t buft, ggml_backend_t backend) {
+@@ -14301,9 +14434,8 @@ static ggml_backend_buffer_type_i ggml_backend_opencl_buffer_type_interface = {
+ //
+ 
+ static const char * ggml_backend_opencl_device_get_name(ggml_backend_dev_t dev) {
+-    return "GPUOpenCL";
+-
+-    GGML_UNUSED(dev);
++    ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) dev->context;
++    return dev_ctx->name.c_str();
+ }
+ 
+ static const char * ggml_backend_opencl_device_get_description(ggml_backend_dev_t dev) {
+@@ -14394,11 +14526,12 @@ static bool ggml_backend_opencl_device_supports_buft(ggml_backend_dev_t dev, ggm
+         return false;
+     }
+ 
+-    // Check cl_context is the same. clEnqueue* commands may not use
+-    // buffers from another cl_context.
+-    ggml_backend_opencl_context * backend_ctx0 = ggml_cl_init(dev);
+-    ggml_backend_opencl_context * backend_ctx1 = ggml_cl_init(buft->device);
+-    return backend_ctx0->context == backend_ctx1->context;
++    // Only this device's own buffers. clEnqueue* commands may not use buffers
++    // from another cl_context, and a buffer of another device in the same
++    // context would be migrated by the driver behind the scheduler's back; the
++    // scheduler copies such tensors instead. A device's kernels, scratch and
++    // USM entry points are its own as well.
++    return buft->device == dev;
+ }
+ 
+ namespace /* anonymous */ {
+@@ -14971,13 +15104,15 @@ static int ggml_cl_regions(const ggml_tensor * t, ggml_cl_region r[2]) {
+ // after them.
+ static void ggml_backend_opencl_exchange_slices(ggml_tensor * a, int64_t sa, ggml_tensor * b, int64_t sb) {
+     GGML_ASSERT(a->type == b->type && a->ne[0] == b->ne[0] && a->ne[1] == b->ne[1]);
++    // both on one device: the copies below run on a's queue and context
++    GGML_ASSERT(a->buffer->buft->device == b->buffer->buft->device);
+     ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) a->buffer->buft->device->context;
+     ggml_backend_opencl_context * bctx = dev_ctx->backend_ctx;
+     cl_command_queue queue = bctx->queue;
+     ggml_cl_region ra[2], rb[2];
+     const int n = ggml_cl_regions(a, ra);
+     GGML_ASSERT(ggml_cl_regions(b, rb) == n && ra[0].mem != nullptr);
+-    static ggml_cl_buffer scratch;
++    ggml_cl_buffer & scratch = bctx->prealloc_exchange;   // per device: the queue below is this device's
+     for (int i = 0; i < n; ++i) {
+         const size_t per = ra[i].per, oa = ra[i].off + (size_t) sa * per, ob = rb[i].off + (size_t) sb * per;
+         scratch.allocate(bctx->context, per);
+@@ -15002,6 +15137,8 @@ static void ggml_backend_opencl_get_tensors(const ggml_tensor * const * tensors,
+     cl_command_queue queue = dev_ctx->backend_ctx->queue;
+     for (int i = 0; i < n; ++i) {
+         const ggml_tensor * t = tensors[i];
++        // one device: every read goes to tensors[0]'s queue
++        GGML_ASSERT(t->buffer->buft->device == tensors[0]->buffer->buft->device);
+         ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) t->extra;
+         CL_CHECK(clEnqueueReadBuffer(queue, extra->data_device, CL_FALSE, extra->offset + t->view_offs, ggml_nbytes(t), dsts[i], 0, NULL, NULL));
+     }
+@@ -15019,6 +15156,8 @@ static void ggml_backend_opencl_get_tensors_async(const ggml_tensor * const * te
+     cl_command_queue queue = dev_ctx->backend_ctx->queue;
+     for (int i = 0; i < n; ++i) {
+         const ggml_tensor * t = tensors[i];
++        // one device: every read goes to tensors[0]'s queue
++        GGML_ASSERT(t->buffer->buft->device == tensors[0]->buffer->buft->device);
+         ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) t->extra;
+         CL_CHECK(clEnqueueReadBuffer(queue, extra->data_device, CL_FALSE, extra->offset + t->view_offs, ggml_nbytes(t), dsts[i], 0, NULL, NULL));
+     }
+@@ -15080,7 +15219,8 @@ static void ggml_backend_opencl_set_tensor_slices(ggml_tensor * tensor, const vo
+             d = e->d; q = e->q;
+         }
+         // non-blocking: the split copies live in a ring until the queue has passed them
+-        static std::vector<std::vector<uint8_t>> keep;
++        // (the ring of this device's backend: the clFinish below drains its queue only)
++        std::vector<std::vector<uint8_t>> & keep = dev_ctx->backend_ctx->slices_keep;
+         keep.push_back(std::move(dh));
+         keep.push_back(std::move(qh));
+         const auto & kd = keep[keep.size() - 2];
+@@ -25413,17 +25553,17 @@ static void ggml_cl_kq_weight_args(cl_kernel kernel, const ggml_tensor * src0, c
+             if (ggml_cl_kq_as_stored(src0->type)) {
+                 ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *)src0->extra;
+                 const cl_ulong off = e->offset + src0->view_offs;
+-                CL_CHECK(g_cl_set_arg_ptr(kernel, a++, bctx->usm));
++                CL_CHECK(bctx->usm_set_arg(kernel, a++, bctx->usm));
+                 CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &off));
+-                CL_CHECK(g_cl_set_arg_ptr(kernel, a++, bctx->usm));
++                CL_CHECK(bctx->usm_set_arg(kernel, a++, bctx->usm));
+                 return;
+             }
+             GGML_ASSERT(src0->type == GGML_TYPE_IQ4_NL && "an expert cache's USM bank holds IQ and low-bit types");
+             const auto & dq = bctx->usm_split.at(soa0);
+             const cl_ulong off = 0;
+-            CL_CHECK(g_cl_set_arg_ptr(kernel, a++, dq.second));
++            CL_CHECK(bctx->usm_set_arg(kernel, a++, dq.second));
+             CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &off));
+-            CL_CHECK(g_cl_set_arg_ptr(kernel, a++, dq.first));
++            CL_CHECK(bctx->usm_set_arg(kernel, a++, dq.first));
+             return;
+         }
+     }
+@@ -28469,12 +28609,12 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+             g_kq_single_nbank = (int) bank0->ne[2];
+             // this projection's misses, copied by the previous projection's matvec
+             cl_mem read_mirror = nullptr;
+-            if (g_pf.slot == src0 && g_pf.ids == ids && g_pf.mirror != nullptr) {
+-                read_mirror     = g_pf.mirror;
++            if (backend_ctx->moe_pf.slot == src0 && backend_ctx->moe_pf.ids == ids && backend_ctx->moe_pf.mirror != nullptr) {
++                read_mirror     = backend_ctx->moe_pf.mirror;
+                 g_kq_single_ptr = nullptr;
+                 g_kq_single_q   = g_kq_single_d = read_mirror;
+             }
+-            g_pf = {};
++            backend_ctx->moe_pf = {};
+             // the next projection's, copied by this one
+             auto ic = ggml_cl_moe_prefetch_on() ? g_cache_chain.find(src0) : g_cache_chain.end();
+             if (ic != g_cache_chain.end() && backend_ctx->prealloc_kq_pf_b.buffer != nullptr) {
+@@ -28490,7 +28630,7 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+                         g_kq_pf_src = (const char *) nctx->usm + en->offset + nb_->view_offs;
+                         g_kq_pf_dst = dstm;
+                         g_kq_pf_n16 = nb_->nb[2] / 16;
+-                        g_pf = { ic->second, ids, dstm };
++                        backend_ctx->moe_pf = { ic->second, ids, dstm };
+                     }
+                 }
+             }
+@@ -28512,7 +28652,7 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+                     // expert two tokens route to is copied once (the pair grid spent
+                     // ~650 us a projection on a 4-token step, B60, profiled)
+                     cl_kernel kg = backend_ctx->kernel_moe_gather_pairs;
+-                    CL_CHECK(g_cl_set_arg_ptr(kg, 0, src));
++                    CL_CHECK(bctx0->usm_set_arg(kg, 0, src));
+                     CL_CHECK(clSetKernelArg(kg, 1, sizeof(cl_mem),   &stage.buffer));
+                     CL_CHECK(clSetKernelArg(kg, 2, sizeof(cl_ulong), &n16));
+                     CL_CHECK(clSetKernelArg(kg, 3, sizeof(cl_mem),   &extra2->data_device));
+@@ -28526,7 +28666,7 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+                     return stage.buffer;
+                 }
+                 cl_kernel kg = backend_ctx->kernel_moe_gather_experts;
+-                CL_CHECK(g_cl_set_arg_ptr(kg, 0, src));
++                CL_CHECK(bctx0->usm_set_arg(kg, 0, src));
+                 CL_CHECK(clSetKernelArg(kg, 1, sizeof(cl_mem),   &stage.buffer));
+                 CL_CHECK(clSetKernelArg(kg, 2, sizeof(cl_ulong), &n16));
+                 CL_CHECK(clSetKernelArg(kg, 3, sizeof(cl_mem),   &extra2->data_device));
+@@ -28591,8 +28731,8 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+             const cl_mem d2 = g_kq_single_d != nullptr ? g_kq_single_d : extrad->data_device;
+             const int    ns = g_kq_single_q != nullptr ? g_kq_single_split : INT_MAX;
+             if (g_kq_single_ptr != nullptr) {
+-                CL_CHECK(g_cl_set_arg_ptr(kernel, a++, g_kq_single_ptr));
+-                CL_CHECK(g_cl_set_arg_ptr(kernel, a++, g_kq_single_ptr));
++                CL_CHECK(backend_ctx->usm_set_arg_ptr(kernel, a++, g_kq_single_ptr));
++                CL_CHECK(backend_ctx->usm_set_arg_ptr(kernel, a++, g_kq_single_ptr));
+             } else {
+                 CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &q2));
+                 CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &d2));
+@@ -28619,7 +28759,7 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+                 }
+                 CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_pair_grp.buffer));
+                 CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_pair_ngrp.buffer));
+-                g_pf = {};   // the grouped kernel copies nothing for the next projection
++                backend_ctx->moe_pf = {};   // the grouped kernel copies nothing for the next projection
+                 const int rows_per_wg_g = backend_ctx->kq_q8_1_ndst * 4;
+                 size_t gws_g[] = { (size_t)CEIL_DIV(ne01, rows_per_wg_g) * 16, 4, (size_t)n_used * n_tok };
+                 size_t lws_g[] = { 16, 4, 1 };
+@@ -28662,13 +28802,13 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+             CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &perm));
+             CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &pf_first));
+             if (pf && pf_first != nullptr) {
+-                CL_CHECK(g_cl_set_arg_ptr(kernel, a++, g_kq_pf_src));
++                CL_CHECK(backend_ctx->usm_set_arg_ptr(kernel, a++, g_kq_pf_src));
+                 CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &g_kq_pf_dst));
+             } else {
+                 const cl_mem none = nullptr;
+                 CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &none));
+                 CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &none));
+-                if (pf) g_pf = {};   // no copy made: the next projection reads its misses where they lie
++                if (pf) backend_ctx->moe_pf = {};   // no copy made: the next projection reads its misses where they lie
+             }
+             CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &g_kq_pf_n16));
+         }
+@@ -32274,7 +32414,7 @@ static void ggml_cl_cumsum(ggml_backend_t backend, const ggml_tensor * src0, con
+     const cl_ulong nbt2 = net1*nbt1;
+     const cl_ulong nbt3 = net2*nbt2;
+ 
+-    static ggml_cl_buffer tmp_buffer;
++    ggml_cl_buffer & tmp_buffer = backend_ctx->prealloc_cumsum_tmp;
+     tmp_buffer.allocate(backend_ctx->context, net0*ne01*ne02*ne03*sizeof(float));
+ 
+     CL_CHECK(clSetKernelArg(kernel,   0, sizeof(cl_mem),   &extra0->data_device));

@@ -447,6 +447,14 @@ context from the same object, so both are published there:
 - The model object carries `n_ctx` (what this process is **running with**) and
   `n_ctx_train` (the artifact's ceiling) as separate fields, plus `quant`,
   `lanes` and `canonical_id`.
+- [Amended 2026-10-07, operator.] Named lanes on the libllama engine
+  (`--served-model-name A,B --lane-ctx CA,CB`) make the `model` field
+  binding: a lane's name picks that lane. An empty name and the artifact's
+  canonical id go to the first lane, and an unknown name gets a 404.
+  `/health` adds a `lanes` array with each lane's free count. `/v1/models`
+  carries one entry per lane name with that lane's `n_ctx`, and `/props`
+  reports `enforces_model_field: true` there. One name keeps the behaviour
+  above. `docs/campaigns/lanes-agent-subagent.md` (on the `qfndev` branch).
 
 ### 4.3 Admission: a lane is a memory reservation
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 0.6.0 LANGUAGES CXX)
+project(arcint VERSION 0.7.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -174,6 +174,10 @@ if(ARCINT_LLAMA)
   file(READ "${ARCINT_LLAMA_DIR}/include/llama.h" ARCINT_LLAMA_H)
   if(ARCINT_LLAMA_H MATCHES "expert_cache_bytes")
     target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_EXPERT_CACHE=1)
+    # 0024: an expert cache per card under the layer split
+    if(ARCINT_LLAMA_H MATCHES "llama_model_expert_cache_count")
+      target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_EXPERT_CACHE_DEV=1)
+    endif()
   else()
     message(WARNING "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0021: --llama-expert-cache is refused")
   endif()
@@ -258,6 +262,7 @@ if(ARCINT_TESTS)
     tests/test_verify_walk.cpp
     tests/test_token_ids.cpp
     tests/test_props.cpp
+    tests/test_lanes.cpp
     tests/test_artifact.cpp
     tests/test_ngram_admit.cpp
     tests/test_prefix_cache.cpp

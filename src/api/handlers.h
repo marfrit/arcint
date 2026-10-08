@@ -2,6 +2,7 @@
 
 #include <condition_variable>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -61,16 +62,46 @@ private:
     int                     waiting_ = 0;
 };
 
+// A named lane (DESIGN.md §4.2, amended 2026-10-07;
+// docs/campaigns/lanes-agent-subagent.md): the name that picks it, its cap
+// (the §3.8 400 is against this, not the process's n_ctx), the backend
+// sequence it owns (the `slot` Backend::generate takes) and its own pool, so
+// a request for one lane waits for, or is refused by, that lane alone.
+struct Lane {
+    std::string name;
+    int         n_ctx = 0;
+    int         seq   = 0;
+    SlotPool*   pool  = nullptr;
+};
+
 struct Context {
     const Config* cfg     = nullptr;
     Backend*      backend = nullptr;
     SlotPool*     slots   = nullptr;
+    // Named lanes, in --served-model-name order. Empty: one name, `slots`
+    // admits and the model field is not binding (the behaviour before them).
+    std::vector<Lane> lanes{};
 };
 
 struct HttpResult {
     int            status = 200;
     nlohmann::json body;
 };
+
+// The lanes --served-model-name A,B --lane-ctx CA,CB configure, a pool of one
+// each, appended to `pools` (which must outlive the lanes). Empty without
+// named lanes.
+std::vector<Lane> make_lanes(const Config& cfg, std::vector<std::unique_ptr<SlotPool>>& pools);
+
+// The lane a request's `model` picks. Without named lanes: -1, whatever the
+// name (one process serves one model and there is nothing else it could
+// mean). With them: the lane of that name; an empty name, or the artifact's
+// canonical id, the first lane; any other name the 404.
+std::optional<HttpResult> resolve_lane(const Context& ctx, const std::string& model, int& lane);
+
+// The context a request on `lane` is admitted against (§3.8): the lane's cap,
+// or the process's n_ctx for -1.
+int lane_n_ctx(const Context& ctx, int lane);
 
 // What the served decode line's "other" term is, after every segment that
 // has its own timer is subtracted out. M11 (DESIGN §7.0.2aa row): on a
@@ -89,9 +120,19 @@ double decode_other_seconds(const GenerationStats& stats);
 // Takes a lane for one request, or returns the 503 that says why not — with
 // the reservation arithmetic in it, so "busy" is a number and not a mood.
 std::optional<HttpResult> acquire_slot(const Context& ctx, SlotPool::Lease& out);
+// The same for a request resolved to `lane` (resolve_lane; -1: no named
+// lanes). `slot` is the backend sequence to generate on: the lease's index
+// without named lanes, the lane's own sequence with them. A busy lane is
+// waited for (--queue-timeout) or refused on its own; another lane is never
+// taken instead.
+std::optional<HttpResult> acquire_slot(const Context& ctx, int lane, SlotPool::Lease& out,
+                                       int& slot);
 
 nlohmann::json health(const Context& ctx);
 nlohmann::json props(const Context& ctx);
+// GET /v1/models: one entry per served name, each with the context it is
+// admitted against (a discovering proxy reads n_ctx from here, §4.2).
+nlohmann::json models(const Context& ctx);
 
 // Writes one SSE frame. Returns false when the client is gone, which aborts the
 // request's work at the next boundary (DESIGN.md §3.7).
@@ -107,6 +148,8 @@ struct PreparedChat {
     std::string     id;
     int64_t         created       = 0;
     int             prompt_tokens = 0;
+    int             lane          = -1;  // resolve_lane's answer
+    std::string     model;               // the name the response carries
 };
 
 struct PreparedCompletion {
@@ -115,6 +158,8 @@ struct PreparedCompletion {
     std::string       id;
     int64_t           created       = 0;
     int               prompt_tokens = 0;
+    int               lane          = -1;
+    std::string       model;
 };
 
 // Everything that can be rejected happens here, before a single response byte

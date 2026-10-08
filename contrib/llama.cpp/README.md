@@ -1339,3 +1339,222 @@ differ. Before the patch's decode work: 16.0 and
 greedy. With the rest of the patch (2026-10-07): MTP 2 30.7-31.6 t/s
 (13,500-14,500 MiB), MTP 3 with arcint's `--llama-mtp-min-p 0.5` 31.3, the
 needle's prefill 383 t/s; the residents unchanged (38.2 / 43.5).
+
+**Known defect (found 2026-10-08, open):** with 0022 applied, a batch
+whose ubatches mix sequences (llama.cpp's own batching: `llama-server -np
+N`, `llama-perplexity` with several sequences a batch) gives wrong logits
+on the B60. The dense Qwen3.8-27B scores KL 0.2438 (top-1 81.96 %) against
+0.0041 for one sequence; pin + 0001-0021 is right. arcint decodes one
+sequence per call and is not affected. The bisection is in
+`docs/campaigns/lanes-agent-subagent.md` (on the `qfndev` branch).
+
+## 0023-opencl-one-context-per-platform-multi-device.patch
+
+One process on two Intel Arc cards, for llama.cpp's layer split. Intel's
+OpenCL runtime (26.27) lists two different GPUs as two platforms, one device
+each, and ggml-opencl probed one platform and made one context for all its
+devices. With the patch:
+
+- **Selection:** `GGML_OPENCL_DEVICES="P:D[,P:D...]"` selects devices across
+  platforms, in that order; the first is the main device. Each platform gets
+  one context holding its selected devices. When the variable is unset,
+  `GGML_OPENCL_PLATFORM`/`GGML_OPENCL_DEVICE` and the default behave as
+  before.
+- **Builds:** programs are built for the one device that uses them
+  (`clBuildProgram` with that device). The program cache saves that device's
+  binary; its key already carries the device name and driver.
+- **Buffers:** `supports_buft` accepts only the device's own buffer type.
+  Activations crossing devices go through the scheduler's host copy (the
+  backend has no events and no `cpy_tensor`).
+- **Names:** devices `GPUOpenCL`, `GPUOpenCL1`, ...; buffer types and
+  backends `OpenCL`, `OpenCL1`, ...
+- **Per-device state** that was process-static:
+  - the maximum allocation size;
+  - the 512-wide flash-attention failure flags;
+  - the transpose, `get_tensor` and cumsum scratch buffers;
+  - 0021's USM entry points (resolved per platform);
+  - its exchange scratch and its keep ring (finished on the owning queue);
+  - 0022's prefetch state.
+  `get_tensors(_async)` and `exchange_slices` assert that their tensors
+  share one device.
+- **Synchronisation:** `sync_with_other_backends` waits only on backends in
+  its own context. An event cannot cross contexts.
+
+Measured on the B60 + A770 (`measured-here`, 2026-10-07, both cards on their
+own platforms):
+
+- **Device lists:**
+  - `GGML_OPENCL_DEVICES=0:0,1:0` lists both cards;
+  - unset, the B60 alone, as before;
+  - the 0001-0022 build with the variable set lists one OpenCL device (the
+    red case).
+- **`test-backend-ops` with both devices in the process:**
+  - MUL_MAT 1201/1201 on each card;
+  - GET_ROWS 29/29 on each;
+  - MUL_MAT_ID 520/520 on the A770;
+  - the same counts as the A770 alone under `GGML_OPENCL_PLATFORM=1`.
+  - On the B60, MUL_MAT_ID 446/520: the 74 MXFP4 cases noted under 0022,
+    the same set as the 0001-0022 build's.
+- **The coder Q4_K_M** (14.94 GiB), llama-bench `-fa 1`:
+
+  | | pp512 | pp4096 | tg64 |
+  |---|---|---|---|
+  | B60 alone | 2,618 | 2,470 | 77.2 |
+  | split `-ts 3/2` | 2,210 | 2,945 | 57.5 |
+  | split `-ts 1/1` | 2,148 | 2,976 | 55.0 |
+
+  This model fits on the B60 alone, so a split costs decode: the A770 runs
+  its layers slower, and every token crosses once.
+- **Answer:** the capital question across both cards is right ("Paris").
+
+## 0024-expert-cache-per-device.patch
+
+The expert cache of 0021, one per GPU under llama.cpp's layer split (0023):
+each card keeps slots, tables and a USM bank for the layers it runs, in its
+own context, with its own budget and counters.
+
+- **API:**
+  - `llama_model_params.expert_cache_bytes_dev` /
+    `n_expert_cache_bytes_dev` give a budget per device, in device order;
+    without them `expert_cache_bytes` goes to the first card with cached
+    layers, as before. `LLAMA_EXPERT_CACHE_MIB` takes `A,B`.
+  - `llama_model_expert_cache_count`, `_info_dev` and `_device` report each
+    cache. `llama_model_expert_cache_info` sums them; `adapts` counts the
+    shared plan once.
+- **Swap planning:** one plan over every cache, with one cap. The largest
+  gains win wherever they are, and each swap runs on the queue of the card
+  that owns its layer, as Strata's adapt does across its stages
+  (`code`: generate.cpp:4430-4471).
+- **The profile:** each cache ranks only its own layers' pairs.
+- **Single card unchanged:** the same layers, budget, plan order and logs
+  (the log lines now name the device and the layer range).
+
+Measured on the B60 + A770 (`measured-here`, 2026-10-07; Flash-Next IQ2_XS,
+MTP 2, 131,072 tokens of context):
+
+- **Copy checks:** 0 differences on both cards.
+- **Answers:** right in every arm.
+- **Eviction:** none (each process's GTT stayed at its bank).
+- **Split at layer 40:** the A770 holds every expert of its 8 layers, 90.4 %
+  of the routed experts are on a card, prefill 378 t/s, decode 18.6 t/s.
+  The B60 alone: 84.4 %, 408 and 19.8. The campaign gate (decode above the
+  one-card arm) is not met yet:
+  `docs/campaigns/layer-split-two-cards.md` (on the `qfndev` branch).
+
+## 0025-opencl-strided-rows-f32-copy.patch
+
+A row-parallel f32 copy (`kernel_cpy_f32_f32_rows`) for same-shape copies
+with contiguous rows of at least 256 floats whose destination is not
+contiguous. Each work item moves one float4 of a row; one extra item copies a
+row's last up to 3 floats. Before it, ggml-opencl ran such copies through its
+generic `kernel_cpy_f32_f32`, one 64-item work-group a row.
+
+- **Which copy:** the case that mattered is the MTP snapshot write of the
+  hybrid models (`src/models/delta-net-base.cpp`, the recurrent state's
+  `1 + n_rs_seq` planes into a view whose planes are `mem_size` rows apart).
+  It is contiguous only when every configured sequence is in the ubatch.
+- **When it hit:** with two sequences configured (arcint's named lanes, or
+  `--parallel 2`) and one busy, each GDN layer's write took ~4.4 ms. A verify
+  of the dense Qwen3.8-27B took ~260 ms instead of ~55.
+- **Switch:** `GGML_OPENCL_CPY_FLAT=0` turns off this path and the flat one
+  (the old behaviour). The kernel is loaded as optional; without it the old
+  path runs.
+
+Measured on the B60 (`measured-here`, 2026-10-08):
+
+- **`test-backend-ops -o CPY`:** 146/146, with three new strided-destination
+  cases.
+  - The red case: the destination row stride taken from the source, the
+    mutation checked in the built kernel file. It fails 2 of 146; with the
+    old path forced the same build passes 146/146.
+  - A first mutant missed its target and passed 146/146; it ran the
+    unchanged kernel, so it is not counted.
+- **Perf, every CPY case:** the snapshot-sized case (786,432 floats x 6
+  planes into a strided view) 4,595.6 -> 95.2 us; two cases faster by more
+  than 10 %; none slower by more than 10 %.
+- **The dense Qwen3.8-27B** (Q4_K_M, q8_0 KV, MTP 5), the same 300-token
+  answer:
+  - one lane 41.0 t/s;
+  - two lanes with one busy 10.9 t/s before, 40.9 t/s after;
+  - the text byte-identical across the three, on two questions;
+  - both lanes decoding at once: 18.3 + 20.1 t/s; the subagent lane's text
+    identical to its run alone, the agent lane's diverging at char 372 into
+    an equivalent sentence.
+
+## 0026-kv-cache-cell-windows.patch
+
+Cell windows in a unified KV cache (`kv_unified`): sequence i finds its
+cells in its own range of the pool, and its attention runs over that range
+only. Without it, a sequence's attention spans the pool up to the highest
+used cell, so it grows with another sequence's cells, masked
+(`get_n_kv`, the stream's `used_max_p1`). That was arcint's named lanes'
+cost: a subagent lane slowed with the agent lane's fill.
+
+- **API:** `llama_memory_seq_windows(mem, n_cells, n_seq)`. Sequence i gets
+  the cells from the sum of the sizes before it, `n_cells[i]` long. Each size
+  is a multiple of 256 and the sum at most the cache. Call it on an empty
+  memory, before the first decode. It returns false and changes nothing for
+  a memory whose attention cache cannot take windows: several streams, a
+  shared source cache, the indexed hybrid (qwen4exp's QSA k-pool selects
+  cells by absolute index), or a memory other than `llama_kv_cache` and the
+  attention half of `llama_memory_hybrid`.
+- **The cache:**
+  - `find_slot` searches the window of the ubatch's sequence. It starts at
+    the window's search head, or lower if the window's last used cell is
+    lower: a sequence cut back by `seq_rm` refills from its end, not above
+    its old high-water mark. `clear()` resets the heads.
+  - `slot_info` carries the window's first cell and size. `get_n_kv` counts
+    to the window's last used cell, and `get_k`/`get_v` view from its first
+    cell. The KQ mask fills column j from cell j plus that offset.
+  - `prepare()` restores the window heads with the cells. A sequence's
+    state restore goes through `find_slot`, so it lands in its window; the
+    tokens' own sequence ids choose the window. A whole-cache restore is
+    refused while windows are set, and so is `seq_cp` between two
+    windowed sequences (the destination never attends over the source's
+    window). The relative-position buckets read cells from the offset too.
+- **A ubatch of several sequences** (a hybrid memory's equal split): each
+  token takes a cell in its own window, and the views span the whole stream
+  as before. It is correct, without the speed-up.
+- **Graph reuse:** the mask input records the window's first cell, and a
+  graph is reused only for the same one: a graph's K/V views have the
+  offset built in.
+- **`llama-perplexity` test switches:** `LLAMA_PPL_SEQ_WINDOWS=1` gives each
+  sequence a window of `n_ctx`, and `LLAMA_PPL_PER_SEQ=1` decodes each
+  sequence of a KL batch in its own `llama_decode` (arcint's lanes).
+
+Upstream has no per-sequence cap or range in a unified cache: the server's
+`--kv-unified-per-slot` is one cap for all slots, and non-unified streams
+are one size each (`docs/campaigns/research-agent-lanes.md` on the `qfndev`
+branch).
+
+Measured on the B60 (`measured-here`, 2026-10-08; the dense Qwen3.8-27B
+Q4_K_M, q8_0 KV, MTP 5; arcint's named lanes, 131,072 + 32,768):
+
+- **The red case for the search head** (found in review): an agent request
+  of 29k, then a fresh 4k request in the same lane. Without the reset, the
+  4k request decodes 34.1 t/s and finishes in 22.7 s (its cells above the
+  old 29k). With it, 37.8 t/s and 15.6 s.
+- **The cause, before the patch:** llama.cpp's KV debug shows `n = 33,741`
+  while the subagent lane, holding 4,508 cells, decodes next to an agent lane
+  of 29k. That cell decodes 30.3 t/s against 38.4 with the pool empty.
+- **After:**
+  - subagent 4k with the agent at 29k: 37.5 t/s (38.0 with the pool empty);
+  - agent 29k: 32.2 t/s, against 32.3 in a one-lane server;
+  - the subagent's 300-token answer with the agent lane at about 20k, 64k
+    and 118k: 32.1 / 32.0 / 32.0 t/s, the same text each time and the same
+    as the agent lane's alone (32.1 t/s). The first build, before the
+    search-head reset: 28.7 / 28.5 / 28.3. Before 0025 and this patch:
+    7.7 / 7.3 / 6.5. With 0025 alone, a 4k subagent cell next to a 130k
+    agent: 14.2;
+  - both lanes at once: 15.9 + 15.8 t/s, the sum of one lane's rate.
+- **Answers:** the capital and the 20k needle are right on both lanes. The
+  acceptance task on the agent lane scores 8/10 greedy, as the one-lane
+  unit does, and 10, 8, 10 sampled.
+- **KL** against the Q8 reference (`llama-perplexity`, 16 chunks of 512):
+  - one sequence: 0.004099, top-1 97.745 %;
+  - four sequences decoded one at a time in a shared pool: the same values
+    without windows and with them.
+- **Not this patch:** four sequences in ubatches that mix them score
+  0.2438 / 81.96 %, with windows or without, unified or in separate streams.
+  arcint decodes one sequence a call and never takes that path; see
+  `docs/campaigns/lanes-agent-subagent.md` (on the `qfndev` branch).

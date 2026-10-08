@@ -12,7 +12,7 @@
 > sampling and HTTP serving. NInfer philosophy (specialize, then be honest
 > about numbers), Intel substrate.
 
-## Status (0.6.0)
+## Status (0.7.0)
 
 Runtime floor: marfrit-openvino +p25 = OpenVINO upstream commit 71640275 (the
 2026.4.0 nightly of 2026-08-21) + patches 0003-0074
@@ -23,7 +23,7 @@ and MOE_DOORBELL.
 Two engines (README "Two engines"): OpenVINO (default; Flash-Next, the
 coder's way back) and libllama (--engine llama --gguf, the agent service
 from 0.5.6, the coder service from 2026-10-05: llama.cpp
-bed0a85 with contrib/llama.cpp/patches 0001-0022, ggml's OpenCL backend,
+bed0a85 with contrib/llama.cpp/patches 0001-0026, ggml's OpenCL backend,
 arcint's Intel kernels; MTP from the GGUF's own head; --llama-kv q8_0 or
 q8_0:q4_0 quantizes its KV cache). libllama, measured-here:
 - coder (A770): decode 79.3 t/s with 4 drafts, prefill 1,431 t/s at 4k;
@@ -44,7 +44,19 @@ tools/flash_next_mtp_gguf.sh): 422 t/s prefill at 20k tokens, 33-35 t/s
 decode with MTP 2, the needle answered; the KL of IQ2_XS against a
 reference is owed. Patch 0022's kernels lift the residents: the agent 35.5
 -> 38.3 t/s (identical text), the coder 40.5 -> 43.3 t/s (KL +0.0001
-nats, acceptance task unchanged). Every
+nats, acceptance task unchanged). 0.7.0 adds named lanes
+(--served-model-name A,B --lane-ctx CA,CB): an agent and a subagent lane on
+one set of weights, picked by the model field, each in its own window of
+one KV pool (patch 0026); the dense agent's subagent lane decodes 32.0-32.1
+t/s whether the agent lane holds 20k, 64k or 118k tokens, KL equal to one
+lane. It adds one model across two different Arc cards (patches 0023, 0024;
+--device GPU.0,GPU.1 --llama-layer-split K, --llama-expert-cache A,B,
+--llama-mtp-card): Flash-Next at 131,072 tokens decodes 21.7 t/s split at
+layer 36 against 19.8 on the B60 alone. Patch 0025 fixes MTP with two
+sequences configured and one busy (10.9 -> 40.9 t/s). Known defect: with
+patch 0022, llama.cpp batches whose ubatches mix sequences give wrong
+logits on the B60 (KL 0.2438); arcint decodes one sequence a call and is
+not affected. Every
 number below is measured-here on the named card; DESIGN.md §7 has each one's
 standing value and evidence class. The dated measurement record, campaigns
 and design notes live on the development branch `qfndev`, not on `main`.
@@ -226,7 +238,9 @@ model
   --model-id ID             allowlist entry to assert (default: from the
                             artifact directory name)
   --quant q4|q8             weight format (default: q4)
-  --device DEV              OpenVINO device (default: GPU.0)
+  --device DEV              OpenVINO device (default: GPU.0); --engine llama:
+                            GPU.N or a device name substring (B60), or two
+                            cards GPU.0,GPU.1 for --llama-layer-split
   --cache-dir PATH          compiled-blob cache directory
   --vision                  (reserved; refused) v1 is text-only; the vision
                             tower and projector IRs a VLM checkpoint ships are
@@ -240,6 +254,14 @@ server
                             artifact's allowlist id). Presentation
                             only: --model-id still decides which
                             artifact is accepted
+                            A,B (libllama, with --lane-ctx): named lanes,
+                            one per name; the request's model field picks
+                            the lane (empty: the first; unknown: 404)
+  --lane-ctx CA,CB          libllama: each named lane's context, paired with
+                            --served-model-name A,B by index; multiples of
+                            256, at most 4 lanes. The lanes share one KV pool
+                            of their sum (llama.cpp's kv_unified); --parallel
+                            and --n-ctx follow from them
   --parallel N              number of lanes (default: 1)
   --queue-timeout S         seconds a request waits for a lane before a
                             503 with the reservation numbers (default: 0)
@@ -455,7 +477,14 @@ misc
                             read by the card over the link; hot experts swapped
                             in during decode. The card also holds a Q8_0 down
                             projection's bank and a gather mirror beyond MIB
-                            (default 0, off; contrib/llama.cpp 0021)
+                            (default 0, off; contrib/llama.cpp 0021). Two cards:
+                            A,B, a cache per card for its own layers, in
+                            --device order (0: none on that card; 0024)
+  --llama-layer-split K     libllama, two cards (--device GPU.0,GPU.1): layers
+                            [0, K) on the first, the rest, the output head and
+                            the MTP layer on the second (contrib/llama.cpp 0023)
+  --llama-mtp-card N        libllama, two cards: the card running the
+                            --llama-mtp-gguf model (default 0, the first)
   --llama-expert-profile F  libllama: the expert ranking that fills the cache
                             (Strata's STRP profile; default round robin)
   --llama-kv K[:V]          libllama: the attention cache types, f16, q8_0 or

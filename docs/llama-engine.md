@@ -13,7 +13,8 @@ commit `bed0a85` (ggml-org/llama.cpp, 2026-10-02) with
 warns when they are missing). It builds as a static subproject with
 `GGML_OPENCL=ON`, Adreno kernels off, kernels embedded. `--device GPU.N` is
 the N-th GPU in OpenCL's enumeration, or a substring of the device name
-(`B60`, `A770`).
+(`B60`, `A770`). Two cards, `--device GPU.0,GPU.1`, run a layer split
+(`--llama-layer-split K`, below).
 
 ## Kernels
 
@@ -165,6 +166,34 @@ the queue (decode 32.0 -> 33.0-34.2, prefill 381 -> 422).
 The UD-Q3_K_XL file (52 GiB of experts) serves the same way at 235 t/s
 prefill and 12-13 t/s decode without MTP (2026-10-06).
 
+**Two cards** (`--device GPU.0,GPU.1 --llama-layer-split K`;
+`contrib/llama.cpp` 0023 and 0024, `docs/campaigns/layer-split-two-cards.md` on
+the `qfndev` branch).
+llama.cpp's layer split runs layers [0, K) on the
+first card and [K, n_layer) with the output head on the second; each card
+keeps the KV and recurrent state of its own layers. The cards are named as
+above, each by its own OpenCL platform (`GGML_OPENCL_DEVICES`); two cards
+need K, there is no automatic split. arcint reads n_layer from the GGUF
+(`<arch>.block_count`, MTP layers included) and sets `tensor_split` to
+{K - 0.5, n_layer + 1 - (K - 0.5)}, which places the boundary at K exactly
+(`src/exec/llama_layer_split.h`); K runs from 1 to the last layer that runs: the
+GGUF's MTP layers count only when this GGUF's MTP block is loaded
+(`--llama-mtp` without `--llama-mtp-gguf`).
+
+- `--llama-expert-cache A,B`: one expert cache per card, over its own layers,
+  in `--device` order (MiB; 0 keeps none on that card): its own slots, its
+  own bank in USM host memory of that card's context, its own tables, swaps
+  on its own queue and its own counters, ranked from its layers' share of
+  the profile. Each card's budget leaves room for what a request allocates
+  late (the campaign's eviction note).
+- The MTP model of `--llama-mtp-gguf` runs on `--llama-mtp-card N`
+  (default 0, the first card). It reads only the last layer's rows, through
+  host memory, so any card can run it. On the B60 + A770 it proposes in
+  about half the time on the B60. The draft head of `--llama-mtp-vocab`
+  sits on the second card, next to the output head.
+- The load log has an `expert cache:` line per card, and after each request
+  a line per card next to the summed one.
+
 ## MTP (`--llama-mtp N`)
 
 The GGUF's own MTP head drafts up to N tokens; the target verifies them in
@@ -232,6 +261,22 @@ The prices, KL and speed are in the 0015 section of
   at 131,072 overcommitted the card: a copy-engine reset;
 - a 128,133-token prompt prefills in 772 s (166 t/s), and decodes at
   7.5 t/s at that depth (38 % draft acceptance, a repetitive prompt);
+- re-measured 2026-10-08 (`measured-here`; the qfndev build after 0025, one
+  lane, `--n-ctx 131072`, the agent's flags; the repository's source as
+  context with a cold prefix per run; 400 tokens greedy; one run per cell):
+
+  | prompt | prefill | decode, MTP 5 | drafts accepted | decode, no MTP |
+  |---:|---:|---:|---:|---:|
+  | 4,109 | 824-910 t/s | 36.6 t/s | 37 % | 18.4 t/s |
+  | 28,833 | 589-638 t/s | 32.3 t/s | 43 % | 15.1 t/s |
+  | 129,981 | 252-272 t/s | 19.3 t/s | 47 % | 9.7 t/s |
+
+  The prefill range is the MTP arm against the plain one. At 129,981 tokens
+  both arms answer a question about the context's first file correctly.
+  Peak VRAM is 21.4 GiB with MTP and 19.8 without, with GTT at 24 MiB (no
+  eviction). MTP doubles decode at every depth. Since the 7.5 t/s above,
+  0016 changed the verify attention; the prompt differs too, so the gain is
+  not attributed to 0016 alone;
 - the acceptance task scores 10/10 at temperature 0, decode 47.1 t/s.
   The 52.6 t/s in the table above is the same prompt and drafts with f16 KV
   at the default 32,768 context. The difference, 10 %, is more than
@@ -472,6 +517,51 @@ batches break:
 
 The same count of perfect runs; the arms differ by the one 5/10 run. The
 T=0 cell is one case flipping with the batch layout.
+
+## Two lanes (`--served-model-name A,B --lane-ctx CA,CB`)
+
+One process and one copy of the weights serve lanes of different context:
+`--served-model-name qwen3.8-agent,qwen3.8-subagent --lane-ctx 131072,32768`
+pairs each name with its context, by index; the lane count is the number of
+names (`--parallel`, if given, must agree; `--n-ctx` is refused alongside).
+A context is a multiple of 256, at most the model's trained context, at most
+4 lanes. One name without `--lane-ctx` is the server as before.
+
+- **Routing**: the request's `model` picks the lane (DESIGN §4.2, amended
+  2026-10-07). An empty name, or the GGUF's canonical id, goes to the first
+  lane; any other name gets a 404 (`model_not_found`). The name is resolved
+  before the prompt is counted, so the §3.8 400 quotes that lane's context.
+  Each lane has its own slot pool: a busy lane waits `--queue-timeout` or
+  answers 503 for itself, and never takes another lane. `/v1/models` lists
+  one entry per name at its `n_ctx`; `/props` answers to every name with
+  `enforces_model_field: true`; `/health` and the 503 carry each lane's
+  free count.
+- **The pool**: the lanes share one KV pool of the sum of their contexts
+  (llama.cpp's `kv_unified`, as its server's `--kv-unified`; `code`:
+  `llama-context.cpp:293-294`, `llama-kv-cache.cpp:84`), so a lane's caps
+  are what keep it in its share: a prompt, the generation and an MTP verify
+  stay below the lane's context. The MTP draft context takes the same
+  layout, else a sequence's stream there would be the pool divided by the
+  lanes, under the agent lane's context. Recurrent state and checkpoints
+  stay per lane. Equal lanes (`--parallel N` alone) keep a stream each.
+- **A window per lane** (`contrib/llama.cpp` 0026): in one stream, `n_kv`
+  followed the highest used cell of the pool (`llama-kv-cache.cpp:1260-1270`),
+  so a lane's attention ran over the other lane's cells too, masked. With
+  the agent lane 29k deep the subagent read `n = 33,741` for its 4,508
+  cells and decoded 30.3 t/s against 38.4 (`measured-here`). arcint now sets
+  a cell window per lane (`llama_memory_seq_windows`) on the target and the
+  MTP draft context: lane i finds its cells in its own range and attends
+  over that range only. The subagent's 300-token answer decodes 32.0-32.1
+  t/s whether the agent lane holds 20k, 64k or 118k tokens; KL equals one
+  lane's (`docs/campaigns/lanes-agent-subagent.md` on the `qfndev` branch).
+  Flash-Next's indexed
+  memory refuses windows and keeps the whole-pool views, with a warning at
+  load. The expert cache's counters are the model's: with more than one lane
+  its per-request line is labelled process-wide.
+- **Both lanes busy**: arcint decodes one lane per `llama_decode`, so the
+  lanes take turns and their sum is one lane's rate (15.9 + 15.8 t/s against
+  32.1 alone). Batching them into one decode, as llama.cpp's server does, is
+  open.
 
 ## Not yet on this engine
 

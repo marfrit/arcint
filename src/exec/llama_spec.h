@@ -44,18 +44,25 @@ public:
     // each checkpoint (common_speculative_get_state).
     virtual std::vector<float> carried_row(int seq, size_t n) const = 0;
     virtual void               set_carried_row(int seq, size_t n, const std::vector<float>& row) = 0;
+    // Named lanes: the draft context's cell windows, as the target's
+    // (llama_memory_seq_windows, contrib/llama.cpp 0026); false when its
+    // memory cannot take them.
+    virtual bool set_kv_windows(const uint32_t* n_cells, int n) = 0;
 };
 
 // model: loaded with load_mtp from `gguf`; ctx_tgt: n_rs_seq >= n_draft.
 // vocab: the file of token ids the drafts are drawn from (empty: all).
 // min_p: drafting stops at a token the head gives less than min_p, which is
 // left out (0: always n_draft).
+// kv_unified: the target's (named lanes, --lane-ctx): the draft context then
+// holds one pool of the target's n_ctx that every sequence can reach, as the
+// target does; else n_ctx / n_seq per sequence, the target's stream.
 // Null with `err` set when the model has no MTP layer, a context cannot be
 // made or the draft vocabulary cannot be built.
 std::unique_ptr<LlamaSpec> make_llama_mtp(llama_model* model, llama_context* ctx_tgt, int n_draft, int n_seq,
                                           int n_batch, int n_ubatch, int threads, const std::string& gguf,
                                           const std::string& vocab, double min_p, ggml_type type_k, ggml_type type_v,
-                                          std::string& err);
+                                          bool kv_unified, std::string& err);
 
 }  // namespace lgc
 

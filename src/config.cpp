@@ -33,6 +33,18 @@ bool parse_int(std::string_view s, int& out) {
     return true;
 }
 
+// "A,B,...": comma-separated items, none empty
+bool split_list(std::string_view s, std::vector<std::string>& out) {
+    out.clear();
+    for (size_t at = 0;;) {
+        const size_t comma = s.find(',', at);
+        out.emplace_back(s.substr(at, comma == std::string_view::npos ? std::string_view::npos : comma - at));
+        if (out.back().empty()) return false;
+        if (comma == std::string_view::npos) return true;
+        at = comma + 1;
+    }
+}
+
 bool parse_double(std::string_view s, double& out) {
     if (s.empty()) return false;
 
@@ -215,7 +227,9 @@ std::string usage_text() {
         "  --model-id ID             allowlist entry to assert (default: from the\n"
         "                            artifact directory name)\n"
         "  --quant q4|q8             weight format (default: q4)\n"
-        "  --device DEV              OpenVINO device (default: GPU.0)\n"
+        "  --device DEV              OpenVINO device (default: GPU.0); --engine llama:\n"
+        "                            GPU.N or a device name substring (B60), or two\n"
+        "                            cards GPU.0,GPU.1 for --llama-layer-split\n"
         "  --cache-dir PATH          compiled-blob cache directory\n"
         "  --vision                  (reserved; refused) v1 is text-only; the vision\n"
         "                            tower and projector IRs a VLM checkpoint ships are\n"
@@ -229,6 +243,14 @@ std::string usage_text() {
         "                            artifact's allowlist id). Presentation\n"
         "                            only: --model-id still decides which\n"
         "                            artifact is accepted\n"
+        "                            A,B (libllama, with --lane-ctx): named lanes,\n"
+        "                            one per name; the request's model field picks\n"
+        "                            the lane (empty: the first; unknown: 404)\n"
+        "  --lane-ctx CA,CB          libllama: each named lane's context, paired with\n"
+        "                            --served-model-name A,B by index; multiples of\n"
+        "                            256, at most 4 lanes. The lanes share one KV pool\n"
+        "                            of their sum (llama.cpp's kv_unified); --parallel\n"
+        "                            and --n-ctx follow from them\n"
         "  --parallel N              number of lanes (default: 1)\n"
         "  --queue-timeout S         seconds a request waits for a lane before a\n"
         "                            503 with the reservation numbers (default: 0)\n"
@@ -444,7 +466,14 @@ std::string usage_text() {
         "                            read by the card over the link; hot experts swapped\n"
         "                            in during decode. The card also holds a Q8_0 down\n"
         "                            projection's bank and a gather mirror beyond MIB\n"
-        "                            (default 0, off; contrib/llama.cpp 0021)\n"
+        "                            (default 0, off; contrib/llama.cpp 0021). Two cards:\n"
+        "                            A,B, a cache per card for its own layers, in\n"
+        "                            --device order (0: none on that card; 0024)\n"
+        "  --llama-layer-split K     libllama, two cards (--device GPU.0,GPU.1): layers\n"
+        "                            [0, K) on the first, the rest, the output head and\n"
+        "                            the MTP layer on the second (contrib/llama.cpp 0023)\n"
+        "  --llama-mtp-card N        libllama, two cards: the card running the\n"
+        "                            --llama-mtp-gguf model (default 0, the first)\n"
         "  --llama-expert-profile F  libllama: the expert ranking that fills the cache\n"
         "                            (Strata's STRP profile; default round robin)\n"
         "  --llama-kv K[:V]          libllama: the attention cache types, f16, q8_0 or\n"
@@ -505,8 +534,23 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.llama_checkpoint_step) || cfg.llama_checkpoint_step < 1)
                 return fail("--llama-checkpoint-step needs a token count >= 1");
         } else if (arg == "--llama-expert-cache") {
-            if (!value(v) || !parse_int(v, cfg.llama_expert_cache_mib) || cfg.llama_expert_cache_mib < 0)
-                return fail("--llama-expert-cache needs a size in MiB >= 0 (0: off)");
+            std::vector<std::string> items;
+            if (!value(v) || !split_list(v, items))
+                return fail("--llama-expert-cache needs a size in MiB >= 0 (0: off), or one per --device card (A,B)");
+            cfg.llama_expert_cache_mib_dev.clear();
+            for (const std::string& it : items) {
+                int mib = 0;
+                if (!parse_int(it, mib) || mib < 0)
+                    return fail("--llama-expert-cache needs a size in MiB >= 0 (0: off), or one per --device card (A,B)");
+                cfg.llama_expert_cache_mib_dev.push_back(mib);
+            }
+            cfg.llama_expert_cache_mib = cfg.llama_expert_cache_mib_dev.front();
+        } else if (arg == "--llama-layer-split") {
+            if (!value(v) || !parse_int(v, cfg.llama_layer_split) || cfg.llama_layer_split < 1)
+                return fail("--llama-layer-split needs a layer index K >= 1 (layers [0, K) on the first card)");
+        } else if (arg == "--llama-mtp-card") {
+            if (!value(v) || !parse_int(v, cfg.llama_mtp_card) || cfg.llama_mtp_card < 0)
+                return fail("--llama-mtp-card needs a card index (0: the first --device card)");
         } else if (arg == "--llama-expert-profile") {
             if (!value(v)) return fail("--llama-expert-profile needs a profile file");
             cfg.llama_expert_profile = std::string(v);
@@ -626,6 +670,19 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--parallel") {
             if (!value(v) || !parse_int(v, cfg.parallel)) {
                 return fail("--parallel needs an integer");
+            }
+            cfg.parallel_explicit = true;
+        } else if (arg == "--lane-ctx") {
+            // one context per --served-model-name, paired by index; checked
+            // against the names below
+            std::vector<std::string> items;
+            if (!value(v) || !split_list(v, items))
+                return fail("--lane-ctx needs a context per named lane (CA,CB in tokens)");
+            cfg.lane_ctx.clear();
+            for (const std::string& it : items) {
+                int c = 0;
+                if (!parse_int(it, c)) return fail("--lane-ctx needs a context per named lane (CA,CB in tokens), not '" + it + "'");
+                cfg.lane_ctx.push_back(c);
             }
         } else if (arg == "--cache-grid") {
             if (!value(v) || !parse_int(v, cfg.cache_grid)) return fail("--cache-grid needs an integer");
@@ -862,6 +919,23 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         return fail("--served-model-name cannot be blank");
     }
     if (cfg.parallel < 1) return fail("--parallel must be >= 1");
+    // --served-model-name A,B: named lanes (a single name, as before, may not
+    // contain a comma). The first name is the served one.
+    if (cfg.served_model_name.find(',') != std::string::npos) {
+        std::vector<std::string> names;
+        if (!split_list(cfg.served_model_name, names))
+            return fail("--served-model-name A,B: a list of names, none empty");
+        for (size_t i = 0; i < names.size(); ++i) {
+            if (names[i].find_first_not_of(" \t\r\n") == std::string::npos)
+                return fail("--served-model-name A,B: a name cannot be blank");
+            if (names[i].find_first_of(" \t\r\n") != std::string::npos)
+                return fail("--served-model-name A,B: '" + names[i] + "' contains whitespace (a request's model field would not reach it)");
+            for (size_t j = 0; j < i; ++j)
+                if (names[i] == names[j]) return fail("--served-model-name names " + names[i] + " twice: a name picks one lane");
+        }
+        cfg.served_model_name = names[0];
+        cfg.lane_names        = std::move(names);
+    }
     if (!(cfg.queue_timeout_s >= 0.0 && cfg.queue_timeout_s <= 3600.0)) {
         return fail("--queue-timeout must be between 0 and 3600 seconds");
     }
@@ -985,22 +1059,75 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     // The default follows what was given: a GGUF alone is the libllama
     // engine's model, an IR directory the OpenVINO executor's.
     if (cfg.engine.empty()) cfg.engine = (!cfg.gguf_path.empty() && cfg.model_path.empty()) ? "llama" : "ov";
+    // Named lanes (DESIGN §4.2, amended 2026-10-07): the libllama engine's
+    // shared KV pool (docs/campaigns/lanes-agent-subagent.md), and the stub's
+    // admission for the device-free suites
+    if (!cfg.lane_names.empty() || !cfg.lane_ctx.empty()) {
+        constexpr size_t kMaxLanes = 4;
+        if (cfg.lane_ctx.empty())
+            return fail("--served-model-name A,B names lanes: give each its context with --lane-ctx CA,CB");
+        if (cfg.lane_names.empty())
+            return fail(cfg.served_model_name.empty()
+                            ? "--lane-ctx needs the lanes' names: --served-model-name A,B"
+                            : "--lane-ctx with one name: one lane's context is --n-ctx (named lanes are two or more)");
+        if (cfg.lane_names.size() != cfg.lane_ctx.size())
+            return fail(log::format("--served-model-name lists %zu names and --lane-ctx %zu contexts: they pair by index",
+                                    cfg.lane_names.size(), cfg.lane_ctx.size()));
+        if (cfg.lane_names.size() > kMaxLanes)
+            return fail(log::format("%zu named lanes: at most %zu", cfg.lane_names.size(), kMaxLanes));
+        long long sum = 0;
+        for (int c : cfg.lane_ctx) {
+            // llama.cpp pads the context to 256 (llama-context.cpp:291): a cap
+            // off that grid would make the pool larger than the lanes' sum
+            if (c <= 0 || c % 256 != 0)
+                return fail(log::format("--lane-ctx %d: a lane's context is a positive multiple of 256", c));
+            sum += c;
+        }
+        if (sum > INT32_MAX) return fail("--lane-ctx: the lanes' contexts sum past 2^31 tokens");
+        if (cfg.n_ctx_explicit)
+            return fail("--n-ctx and --lane-ctx: the lanes' contexts are the context; give --lane-ctx alone");
+        if (cfg.parallel_explicit && cfg.parallel != static_cast<int>(cfg.lane_names.size()))
+            return fail(log::format("--parallel %d disagrees with %zu named lanes (the lane count is the number of names)",
+                                    cfg.parallel, cfg.lane_names.size()));
+        if (!cfg.stub && cfg.engine != "llama")
+            return fail("--served-model-name A,B --lane-ctx CA,CB: named lanes are the libllama engine's (--engine llama --gguf)");
+        cfg.parallel = static_cast<int>(cfg.lane_names.size());
+    }
     if (cfg.engine == "llama") {
         if (cfg.gguf_path.empty()) return fail("--engine llama serves a GGUF: give --gguf");
         if (!cfg.llama_mtp_vocab.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-vocab needs --llama-mtp");
         if (!cfg.llama_mtp_gguf.empty() && cfg.llama_mtp <= 0) return fail("--llama-mtp-gguf needs --llama-mtp");
         if (cfg.llama_mtp_min_p > 0.0 && cfg.llama_mtp <= 0) return fail("--llama-mtp-min-p needs --llama-mtp");
-        if (cfg.llama_expert_cache_mib > 0 && cfg.llama_cpu_moe <= 0)
+        if (cfg.llama_expert_cache_on() && cfg.llama_cpu_moe <= 0)
             return fail("--llama-expert-cache caches experts --llama-cpu-moe keeps in host memory: give --llama-cpu-moe");
-        if (!cfg.llama_expert_profile.empty() && cfg.llama_expert_cache_mib <= 0)
+        if (!cfg.llama_expert_profile.empty() && !cfg.llama_expert_cache_on())
             return fail("--llama-expert-profile needs --llama-expert-cache");
+        // --device: one card, or the two of a layer split (no automatic split:
+        // the split point decides each card's VRAM, so it is the operator's)
+        if (!split_list(cfg.device, cfg.llama_devices))
+            return fail("--device GPU.0,GPU.1: a list of cards, none empty");
+        for (size_t i = 0; i < cfg.llama_devices.size(); ++i)
+            for (size_t j = 0; j < i; ++j)
+                if (cfg.llama_devices[i] == cfg.llama_devices[j]) return fail("--device names " + cfg.llama_devices[i] + " twice");
+        if (cfg.llama_devices.size() > 2) return fail("--device takes one card, or two for --llama-layer-split");
+        if (cfg.llama_devices.size() == 2 && cfg.llama_layer_split <= 0)
+            return fail("two cards need --llama-layer-split K (layers [0, K) on the first card; there is no automatic split)");
+        if (cfg.llama_layer_split > 0 && cfg.llama_devices.size() != 2)
+            return fail("--llama-layer-split needs two cards: --device GPU.0,GPU.1");
+        if (cfg.llama_mtp_card >= 0 && (cfg.llama_devices.size() != 2 || cfg.llama_mtp_card >= static_cast<int>(cfg.llama_devices.size())))
+            return fail("--llama-mtp-card N: a card of the layer split (0 or 1)");
+        if (cfg.llama_mtp_card >= 0 && cfg.llama_mtp_gguf.empty())
+            return fail("--llama-mtp-card places the --llama-mtp-gguf model (the GGUF's own MTP layer runs with the last layer)");
+        if (cfg.llama_devices.size() == 2 && cfg.llama_mtp_card < 0) cfg.llama_mtp_card = 0;
+        if (!cfg.llama_expert_cache_mib_dev.empty() && cfg.llama_expert_cache_mib_dev.size() != cfg.llama_devices.size())
+            return fail("--llama-expert-cache takes one size per --device card (A,B in MiB; 0: none on that card)");
     } else {
     if (cfg.llama_cpu_moe > 0 || cfg.llama_threads > 0 || cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty() ||
         !cfg.llama_mtp_gguf.empty() || cfg.llama_mtp_min_p > 0.0 ||
         cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192 ||
-        cfg.llama_expert_cache_mib > 0 || !cfg.llama_expert_profile.empty())
-        return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab/-gguf/-min-p, --llama-kv, --llama-checkpoints/-step "
-                    "and --llama-expert-cache/-profile are --engine llama options");
+        cfg.llama_expert_cache_on() || !cfg.llama_expert_profile.empty() || cfg.llama_layer_split > 0 || cfg.llama_mtp_card >= 0)
+        return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab/-gguf/-min-p, --llama-kv, --llama-checkpoints/-step, "
+                    "--llama-expert-cache/-profile, --llama-layer-split and --llama-mtp-card are --engine llama options");
     if (!cfg.gguf_path.empty() && cfg.model_path.empty()) return fail("--gguf needs --model (the template IR directory)");
     if (!cfg.gguf_path.empty() && !cfg.paged) return fail("--gguf serves on the paged path only");
     }

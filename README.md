@@ -72,7 +72,9 @@ arcint's attention kernels (`contrib/llama.cpp` 0015). `--n-ctx` defaults to
   and `--llama-kv q8_0`, 131,072 tokens:
   - peak VRAM 23.06 GB;
   - a 128,133-token prompt in 772 s (166 t/s), then decode at 7.5 t/s at
-    that depth;
+    that depth (0.5.6). Re-measured 2026-10-08 with the repository's source
+    as context: 36.6 / 32.3 / 19.3 t/s at 4k / 29k / 130k prompt tokens
+    with MTP 5, 18.4 / 15.1 / 9.7 without, prefill 252-272 t/s at 130k;
   - the acceptance task 8/10 at temperature 0 as deployed; sampled, q8_0
     within the noise of f16 (`docs/llama-engine.md`).
 
@@ -109,17 +111,30 @@ Production (operator, 2026-10-04):
   (`measured-here`; Strata's own engine: 620 / 37.5 on the same card).
   At 131,072 tokens of context, 9,500 MiB of slots: 408 t/s and 19.8 t/s
   (`contrib/systemd/arcint-flashnext.service`).
-- One model across two different Arc cards (in progress on the `qfndev`
-  branch, `docs/campaigns/layer-split-two-cards.md` there): Flash-Next split
-  by layers across the B60 (Xe2) and the A770 (Xe-HPG).
+- One model across two different Arc cards (since 0.7.0,
+  `--device GPU.0,GPU.1 --llama-layer-split K`;
+  `docs/campaigns/layer-split-two-cards.md` on the `qfndev` branch):
+  Flash-Next split by layers across the B60 (Xe2) and the A770 (Xe-HPG).
   - Each card runs its own layer range with its own KV and its own expert
     cache, after Strata's layer split, which lists Intel GPUs as unsupported.
   - Intel's runtime lists the two generations as two OpenCL platforms;
     `contrib/llama.cpp` 0023 gives each its own context and builds every
     kernel for its own card.
-  - At 131,072 tokens: 90 % of the routed experts on a card against 84 % on
-    the B60 alone. Decode 18.6 against 19.8 t/s; the A770's PCIe 3.0 x4 link
-    and its slower MTP drafting are the gap being worked on.
+  - At 131,072 tokens, against the B60 alone's 19.8 t/s (84.4 % of routed
+    experts on the card): split at layer 40, 90.4 % on a card, 18.6 t/s
+    with the MTP draft on the A770 and 20.4 with it on the B60
+    (`--llama-mtp-card 0`); split at layer 36 with the draft on the B60,
+    21.7 t/s and 93.5 %.
+- An agent and a subagent lane on one set of weights (since 0.7.0,
+  `--served-model-name A,B --lane-ctx CA,CB`): the request's `model` field
+  picks the lane, an unknown name gets a 404, and each lane has its own
+  context cap. One process and one KV pool serve `qwen3.8-agent` at 131,072
+  tokens and `qwen3.8-subagent` at 32,768 on the B60; `contrib/llama.cpp`
+  0026 gives each lane its own window of cells, so a lane attends over its
+  own cells only. The subagent's 300-token answer decodes 32.0-32.1 t/s
+  whether the agent lane holds 20k, 64k or 118k tokens; both lanes at once
+  share the card (15.9 + 15.8 t/s); KL equal to one lane
+  (`docs/campaigns/lanes-agent-subagent.md` on the `qfndev` branch).
 
 `docs/llama-engine.md` has the details.
 
