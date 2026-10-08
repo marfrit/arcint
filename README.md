@@ -1,6 +1,8 @@
 # arcint
 
-A deliberately narrow LLM inference engine for Intel Arc GPUs.
+Intel Arc LLM inference engine, deliberately narrow: an OpenAI-compatible
+server for a short list of models on the Arc A770 and the Arc Pro B60, from
+the dense Qwen3.8-27B to the 512-expert Qwen3.8-Flash-Next.
 
 arcint runs a short allowlist of hybrid Qwen models on two Intel cards — the
 Arc A770 (16 GiB) and the Arc Pro B60 (24 GB) — and tries to do that better
