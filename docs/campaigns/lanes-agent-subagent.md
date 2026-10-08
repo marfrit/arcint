@@ -463,6 +463,15 @@ On the record before the work starts.
     min-p off, the default.
   - Not changed: per-lane timing reports the shared step's time; 0028
     prepares K/V once per block.
+- **The gate on the final build** (`measured-here`, 2026-10-09, binary
+  `171e4f384402addc`, lanes_probe + the acceptance task):
+  - 404 for an unknown name, 400 for 44,432 tokens on the subagent;
+  - the capital and the 20k needle right on both lanes;
+  - the subagent's answer with the agent at ~20k / 64k / 118k: 31.8 / 31.7
+    / 31.7 t/s, the same text and drafts (175/621) as alone;
+  - both lanes at once: 21.6 + 21.7 t/s, against 15.9 + 15.8 taking turns;
+  - the acceptance task on the agent lane: 8/10 greedy (parity, operator
+    2026-10-08); 10, 10, 10 sampled.
 - **Flash-Next with lanes** (5,500 and 7,500 MiB of slots): eviction both
   times; aborted, numbers void. llama.cpp reserves 6,679 MiB of OpenCL
   compute buffer: the 2,048-token prefill ubatch against the 163,840-cell
