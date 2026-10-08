@@ -1,5 +1,5 @@
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 814261f..5f6c826 100644
+index 814261f..d5e094e 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -505,6 +505,9 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -12,7 +12,20 @@ index 814261f..5f6c826 100644
      res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
    //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
  
-@@ -2986,6 +2989,44 @@ ggml_tensor * llm_graph_context::build_attn(
+@@ -1137,6 +1140,12 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
+ 
+     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+ 
++    // the per-sequence attention's views carry each part's rows and window: a graph
++    // built for other parts (the sequences in another order, a window grown by a
++    // padding step) attends the wrong cells. The attention input is not registered
++    // on its own here, so its check (llm_graph_input_attn_kv::can_reuse) never runs
++    res &= mctx->get_attn()->get_win_parts() == inp_attn->win_parts;
++
+     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+ 
+     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
+@@ -2986,6 +2995,44 @@ ggml_tensor * llm_graph_context::build_attn(
              ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
          }
  
@@ -216,3 +229,41 @@ index 8bfc3c4..f514041 100644
 +    // set_seq_windows: the parts of a ubatch of several windowed sequences
 +    std::vector<llama_kv_cache::win_part> win_parts;
  };
+diff --git a/tools/perplexity/perplexity.cpp b/tools/perplexity/perplexity.cpp
+index 4d1f51f..9dd3744 100644
+--- a/tools/perplexity/perplexity.cpp
++++ b/tools/perplexity/perplexity.cpp
+@@ -1774,6 +1774,11 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+     // test hook (not shipped): LLAMA_PPL_PER_SEQ=1 decodes each sequence of a batch in its own llama_decode,
+     // as arcint's lanes do, keeping each sequence's logits
+     const bool per_seq = getenv("LLAMA_PPL_PER_SEQ") != nullptr;
++    // test hook (not shipped): LLAMA_PPL_SEQ_FLIP=1 adds every other batch's sequences in
++    // reverse order (the same shapes, the sequences' rows swapped: a graph reused across
++    // the two must not keep the other order's per-sequence views)
++    const bool seq_flip = getenv("LLAMA_PPL_SEQ_FLIP") != nullptr;
++    int        n_flip   = 0;
+     std::vector<std::vector<float>> seq_logits(n_seq);
+ 
+     for (int i = 0; i < n_chunk; i += n_seq) {
+@@ -1818,7 +1823,9 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+             int n_outputs = 0;
+ 
+             batch.clear();
+-            for (int seq = 0; seq < n_seq_batch; seq++) {
++            const bool flip = seq_flip && (n_flip++ % 2 == 1);
++            for (int sq = 0; sq < n_seq_batch; sq++) {
++                const int seq = flip ? n_seq_batch - 1 - sq : sq;
+                 int seq_start = batch_start + seq*n_ctx;
+ 
+                 // save original token and restore it after eval
+@@ -1873,8 +1880,9 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+                 return;
+             }
+ 
++            const int     at         = (seq_flip && (n_flip - 1) % 2 == 1) ? n_seq_batch - 1 - seq : seq;
+             const float * all_logits = per_seq ? seq_logits[seq].data() :
+-                num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
++                num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, at*n_ctx + first);
+ 
+             process_logits(n_vocab, all_logits, tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
+                     workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);

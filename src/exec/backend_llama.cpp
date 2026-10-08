@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <optional>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -876,7 +877,8 @@ private:
             std::atomic<int>& n;
             explicit Decoding(std::atomic<int>& c) : n(c) { ++n; }
             ~Decoding() { --n; }
-        } decoding{ lanes_decoding_ };
+        };
+        std::optional<Decoding> decoding(std::in_place, lanes_decoding_);
         while (true) {
             if (static_cast<int>(have.size()) + 1 >= cap) {
                 reason = FinishReason::Length;
@@ -934,11 +936,13 @@ private:
                 break;
             }
         }
+        decoding.reset();   // this lane posts no more steps
         stats.decode_seconds = seconds_since(t_decode);
         if (lanes_ > 1) {
             std::lock_guard<std::mutex> lk(mu_);
-            log::info("slot", "lane %d: %llu steps so far shared with another lane's (process-wide)", seq,
-                      static_cast<unsigned long long>(n_combined_));
+            log::info("slot", "lane %d: %llu steps so far shared with another lane's, %llu of them with verifies of "
+                              "different lengths (process-wide)", seq,
+                      static_cast<unsigned long long>(n_combined_), static_cast<unsigned long long>(n_uneven_));
         }
         log_expert_cache(seq);
         return reason;
@@ -1119,7 +1123,9 @@ private:
             ul.unlock();
             int    rc = 0;
             double t_p = 0.0, t_v = 0.0;
-            {
+            // a throw here would leave the other lanes waiting: every exception is a
+            // failed step for the lanes in it
+            try {
                 std::lock_guard<std::mutex> lk(mu_);
                 const auto             t0 = clock_type::now();
                 std::vector<DraftPart> dparts;
@@ -1137,27 +1143,49 @@ private:
                     q->batch->insert(q->batch->end(), q->draft->begin(), q->draft->end());
                     parts.push_back(SpecPart{ q->seq, q->batch->data(), q->batch->size(), q->pos, true });
                 }
-                rc = spec_->decode_multi(parts.data(), parts.size());
-                size_t off = 0;
-                for (StepReq* q : reqs) {
-                    const size_t n = q->batch->size();
-                    q->rows->resize(n * n_vocab_);
-                    for (size_t i = 0; rc == 0 && i < n; ++i) {
-                        const float* l = llama_get_logits_ith(ctx_, static_cast<int32_t>(off + i));
-                        if (l == nullptr) {
-                            rc = -1;
-                            break;
+                // the rows of `idx` parts of `reqs`, decoded from batch offset 0
+                auto copy_rows = [&](const std::vector<StepReq*>& qs) {
+                    size_t off = 0;
+                    for (StepReq* q : qs) {
+                        const size_t n = q->batch->size();
+                        q->rows->resize(n * n_vocab_);
+                        for (size_t i = 0; i < n; ++i) {
+                            const float* l = llama_get_logits_ith(ctx_, static_cast<int32_t>(off + i));
+                            if (l == nullptr) return -1;
+                            std::copy(l, l + n_vocab_, q->rows->begin() + static_cast<long>(i * n_vocab_));
                         }
-                        std::copy(l, l + n_vocab_, q->rows->begin() + static_cast<long>(i * n_vocab_));
+                        off += n;
                     }
-                    off += n;
+                    return 0;
+                };
+                rc = spec_->decode_multi(parts.data(), parts.size());
+                if (rc == 0) rc = copy_rows(reqs);
+                for (StepReq* q : reqs) q->rc = rc;
+                if (rc != 0 && reqs.size() > 1) {
+                    // lane by lane, so only the lane that fails errors
+                    for (size_t k = 0; k < reqs.size(); ++k) {
+                        reqs[k]->rc = spec_->decode_multi(&parts[k], 1);
+                        if (reqs[k]->rc == 0) reqs[k]->rc = copy_rows({ reqs[k] });
+                    }
                 }
                 t_v = seconds_since(t1);
-                if (reqs.size() > 1) ++n_combined_;
+                if (reqs.size() > 1) {
+                    ++n_combined_;
+                    for (const SpecPart& p : parts)
+                        if (p.n != parts[0].n) {
+                            // a hybrid model's equal split then runs them one by one
+                            ++n_uneven_;
+                            break;
+                        }
+                }
+            } catch (const std::exception& e) {
+                log::error("slot", "a shared step failed: %s", e.what());
+                for (StepReq* q : reqs) q->rc = -1;
+            } catch (...) {
+                for (StepReq* q : reqs) q->rc = -1;
             }
             ul.lock();
             for (StepReq* q : reqs) {
-                q->rc        = rc;
                 q->t_propose = t_p;
                 q->t_verify  = t_v;
                 q->done      = true;
@@ -1230,6 +1258,7 @@ private:
     bool                                  comb_leader_   = false;
     std::atomic<int>                      lanes_decoding_{ 0 };
     uint64_t                              n_combined_    = 0;   // steps shared with another lane's
+    uint64_t                              n_uneven_      = 0;   // of them, verifies of different lengths
     std::chrono::microseconds             comb_wait_{ 20000 };
     std::vector<std::vector<int>>         slot_tokens_;
     std::unique_ptr<LlamaSpec>            spec_;      // --llama-mtp

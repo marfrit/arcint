@@ -441,7 +441,28 @@ On the record before the work starts.
     small.
   - KL of the mixed path still equals one sequence's (0.004099).
   - Acceptance with both lanes busy was 23-30 % in stage 1 and stage 2
-    alike (solo 28.6 %): the shared texts differ.
+    (solo 28.6 %). This was a defect, not the text (below).
+- **Review** (an outside model): one blocker, now fixed and measured.
+  - **0029, stale graph reuse:** the hybrid memory's input never compared
+    the window parts, so a graph built for other parts was reused (the
+    lanes in another order, a window grown by a padding step). With a
+    diagnostic on the new check, two 300-token runs refused 60 such
+    reuses.
+  - After the fix: 21.6-21.7 t/s a lane with both busy (43.3 together,
+    +37 % over taking turns), acceptance 28.0-28.2 % as alone, one lane's
+    text equal to its run alone.
+  - Combiner fixes:
+    - the leader turns an exception into a failed step, instead of leaving
+      the other lanes waiting;
+    - a failed shared decode is retried lane by lane, so only the failing
+      lane errors;
+    - a partial add to the shared draft batch drops the step's drafts;
+    - the decoding-lane count ends with the loop.
+  - Measured: only 6 of 250 shared steps had verifies of different lengths
+    (a hybrid model's equal split runs those one lane at a time), with
+    min-p off, the default.
+  - Not changed: per-lane timing reports the shared step's time; 0028
+    prepares K/V once per block.
 - **Flash-Next with lanes** (5,500 and 7,500 MiB of slots): eviction both
   times; aborted, numbers void. llama.cpp reserves 6,679 MiB of OpenCL
   compute buffer: the 2,048-token prefill ubatch against the 163,840-cell

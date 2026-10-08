@@ -1653,7 +1653,17 @@ are concatenated along the tokens.
   view stays, as before.
 - The mask spans every part's cells (`n_kv` up to the furthest window's
   end).
-- Graph reuse compares the parts.
+- Graph reuse compares the parts, also in the hybrid memory's input. That
+  one holds the attention input without registering it, so the attention
+  input's own check never ran there. Found in review: a graph built for
+  other parts (the lanes in another order, a window grown by a padding
+  step while the furthest end stayed) was reused with stale views.
+  - Measured (two lanes busy, a diagnostic on the new check): it refused 60
+    such reuses in two 300-token runs. Before the fix, acceptance with both
+    lanes busy was 23-26 %; after it, 28.0-28.2 %, as alone (28.2 %).
+  - `llama-perplexity`'s `LLAMA_PPL_SEQ_FLIP=1` (every other batch's
+    sequences in reverse order) did not reach it: another check refused the
+    reuse there, so it is no red case.
 
 Measured on the B60 (`measured-here`, 2026-10-09; the dense Qwen3.8-27B
 Q4_K_M, q8_0 KV):
@@ -1663,7 +1673,7 @@ Q4_K_M, q8_0 KV):
   batch without windows.
   - The red case: every part's window offset forced to 0 gives 1.3291 /
     61.79 % with windows; without windows the same build stays at 0.004099.
-- **Two lanes in shared verifies** (131,072 + 32,768, MTP 5, a 300-token
-  answer on each at once): 19.7-22.4 t/s a lane, 40-42 together, against
-  15.9 + 15.8 taking turns. A shared step takes 92 ms (282 with 0028
-  alone).
+- **Two lanes in shared steps** (131,072 + 32,768, MTP 5, a 300-token
+  answer on each at once, with the reuse fix): 21.6-21.7 t/s a lane, 43.3
+  together, against 15.9 + 15.8 taking turns. One lane's text equals its
+  run alone.

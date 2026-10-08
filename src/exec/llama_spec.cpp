@@ -508,8 +508,13 @@ public:
             // (kept if the MTP context refuses it: the verify's decode writes them)
             st[k].pending = ln.pending;
             if (!add_pending(ln, p.id_last, p.seq, out_logits)) {
+                // its rows may already be in the shared batch: no drafts this step
+                // for any lane, every lane's pending rows as they were
                 ln.pending = st[k].pending;
-                continue;
+                for (size_t j = 0; j < k; ++j)
+                    if (st[j].on) lanes_[static_cast<size_t>(parts[j].seq)].pending = st[j].pending;
+                clear_d();
+                return;
             }
             st[k].idx = nd_ - 1;
             st[k].on  = true;
