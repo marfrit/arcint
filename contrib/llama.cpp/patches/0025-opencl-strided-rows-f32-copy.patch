@@ -1,0 +1,143 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 6d62658..5088b0e 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -938,6 +938,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_f32_f32_pack, kernel_cpy_i32_i32;
+     cl_kernel kernel_cpy_f32_i32 = nullptr, kernel_cpy_i32_f32 = nullptr;   // the casts
+     cl_kernel kernel_cpy_f32_f32_flat = nullptr;
++    cl_kernel kernel_cpy_f32_f32_rows = nullptr;
+     cl_kernel kernel_mul_mat_f32_f32;
+     cl_kernel kernel_mul_mat_f16_f16;
+     cl_kernel kernel_mul_mat_f16_f32_1row;
+@@ -1848,6 +1849,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 backend_ctx->kernel_cpy_f32_f32_flat = k;
+             }
+         }
++        {   // optional: without it ggml_cl_cpy keeps the row-mapped kernel for strided rows
++            cl_int err_rows = CL_SUCCESS;
++            cl_kernel k = clCreateKernel(prog, "kernel_cpy_f32_f32_rows", &err_rows);
++            if (err_rows == CL_SUCCESS) {
++                backend_ctx->kernel_cpy_f32_f32_rows = k;
++            }
++        }
+         CL_CHECK((backend_ctx->kernel_cpy_i32_i32 = clCreateKernel(prog, "kernel_cpy_i32_i32", &err), err));
+         CL_CHECK((backend_ctx->kernel_cpy_f32_i32 = clCreateKernel(prog, "kernel_cpy_f32_i32", &err), err));
+         CL_CHECK((backend_ctx->kernel_cpy_i32_f32 = clCreateKernel(prog, "kernel_cpy_i32_f32", &err), err));
+@@ -31465,6 +31473,42 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const
+         return;
+     }
+ 
++    // Same shape, rows contiguous on both sides, rows strided (a view into a larger tensor, e.g.
++    // the recurrent-state snapshot planes mem_size rows apart): the row-mapped kernel gives each
++    // row one workgroup of at most 64 items, so a few long rows run on a few compute units.
++    // Spread each row over the device instead. Short rows stay on the row-mapped kernels.
++    if (cpy_flat_on && backend_ctx->kernel_cpy_f32_f32_rows != nullptr &&
++        src0t == GGML_TYPE_F32 && src1t == GGML_TYPE_F32 &&
++        ggml_are_same_shape(src0, src1) &&
++        nb00 == sizeof(float) && nb10 == sizeof(float) &&
++        ne00 >= 256) {
++        cl_kernel k = backend_ctx->kernel_cpy_f32_f32_rows;
++
++        CL_CHECK(clSetKernelArg(k,  0, sizeof(cl_mem),   &extra0->data_device));
++        CL_CHECK(clSetKernelArg(k,  1, sizeof(cl_ulong), &offset0));
++        CL_CHECK(clSetKernelArg(k,  2, sizeof(cl_mem),   &extra1->data_device));
++        CL_CHECK(clSetKernelArg(k,  3, sizeof(cl_ulong), &offset1));
++        CL_CHECK(clSetKernelArg(k,  4, sizeof(int),      &ne00));
++        CL_CHECK(clSetKernelArg(k,  5, sizeof(int),      &ne01));
++        CL_CHECK(clSetKernelArg(k,  6, sizeof(int),      &ne02));
++        CL_CHECK(clSetKernelArg(k,  7, sizeof(cl_ulong), &nb01));
++        CL_CHECK(clSetKernelArg(k,  8, sizeof(cl_ulong), &nb02));
++        CL_CHECK(clSetKernelArg(k,  9, sizeof(cl_ulong), &nb03));
++        CL_CHECK(clSetKernelArg(k, 10, sizeof(cl_ulong), &nb11));
++        CL_CHECK(clSetKernelArg(k, 11, sizeof(cl_ulong), &nb12));
++        CL_CHECK(clSetKernelArg(k, 12, sizeof(cl_ulong), &nb13));
++
++        // one work item per float4 of a row, plus one for the trailing scalars
++        const size_t items = (size_t) ne00 / 4 + ((ne00 % 4) ? 1 : 0);
++        const size_t lsz   = MIN((size_t) 64, backend_ctx->max_workgroup_size);
++        const size_t nrows = (size_t) ne01 * ne02 * ne03;
++        size_t global_work_size[] = { ((items + lsz - 1) / lsz) * lsz, nrows, 1 };
++        size_t local_work_size[]  = { lsz, 1, 1 };
++
++        backend_ctx->enqueue_ndrange_kernel(k, 2, global_work_size, local_work_size, src1);
++        return;
++    }
++
+     cl_kernel kernel;
+ 
+     switch (src0t) {
+diff --git a/ggml/src/ggml-opencl/kernels/cpy.cl b/ggml/src/ggml-opencl/kernels/cpy.cl
+index 936e366..6484ca8 100644
+--- a/ggml/src/ggml-opencl/kernels/cpy.cl
++++ b/ggml/src/ggml-opencl/kernels/cpy.cl
+@@ -312,6 +312,46 @@ kernel void kernel_cpy_f32_f32_flat(
+     }
+ }
+ 
++// f32 copy between tensors of the same shape whose rows are contiguous on both sides but whose
++// rows are strided (a view into a larger tensor, e.g. the recurrent-state snapshot planes, which
++// sit mem_size rows apart). One work item per float4 of a row, dimension 1 over the rows: the
++// row-mapped kernel above runs such a copy (a few rows of ~10^6 floats) on a handful of workgroups.
++kernel void kernel_cpy_f32_f32_rows(
++        global char * src0,
++        ulong offset0,
++        global char * dst,
++        ulong offsetd,
++        int ne00,
++        int ne01,
++        int ne02,
++        ulong nb01,
++        ulong nb02,
++        ulong nb03,
++        ulong nb1,
++        ulong nb2,
++        ulong nb3
++) {
++    const ulong i  = get_global_id(0); // float4 within the row
++    const int   ir = get_global_id(1); // row, over ne01*ne02*ne03
++
++    const int i01 = ir % ne01;
++    const int i02 = (ir / ne01) % ne02;
++    const int i03 = ir / (ne01*ne02);
++
++    global const float * s = (global const float *)(src0 + offset0 + i01*nb01 + i02*nb02 + i03*nb03);
++    global       float * d = (global       float *)(dst  + offsetd + i01*nb1  + i02*nb2  + i03*nb3);
++
++    const ulong n4 = (ulong) ne00 / 4;
++
++    if (i < n4) {
++        vstore4(vload4(i, s), i, d);
++    } else if (i == n4) {
++        for (ulong t = n4 * 4; t < (ulong) ne00; ++t) {
++            d[t] = s[t];
++        }
++    }
++}
++
+ // the casts F32 -> I32 (truncation, as ggml-cpu) and I32 -> F32, laid out as kernel_cpy_i32_i32
+ kernel void kernel_cpy_f32_i32(
+         global float * src0,
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index cf72e6c..db758ec 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9950,6 +9950,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {128, 2, 3, 1}, {128, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {128, 4, 3, 1})); // strided dst
+     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {64, 16, 1, 1}, {1, 64, 16, 1}, {1, 2, 0, 3}, {0, 0, 0, 0}, false, {32, 64, 16, 1})); // permuted src, strided dst
+     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {64, 16, 1, 1}, {1, 64, 16, 1}, {1, 2, 0, 3}, {0, 0, 0, 0}, false, {32, 64, 16, 1})); // permuted src, strided dst
++    // long contiguous rows into a strided dst: the recurrent-state snapshot planes (mem_size rows apart)
++    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {4099, 1, 6, 1}, {4099, 1, 6, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {4099, 2, 6, 1}));
++    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {1024, 3, 2, 2}, {1024, 3, 2, 2}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {1024, 5, 3, 2}));
+ 
+     // CPY - different src/dst shapes (reshaping via CPY)
+     // Use permutations of {3, 5, 7, 32}. Total elements: 3*5*7*32 = 3360.
+@@ -11747,6 +11750,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {768, 1024, 256, 1}, {-1,-1,-1,-1}, {1, 0, 2, 3}, {0, 0, 0, 0}));
+     test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, GGML_TYPE_BF16, {768, 1024, 256, 1}, {-1,-1,-1,-1}, {1, 0, 2, 3}, {0, 0, 0, 0}));
+ 
++    // one GDN layer's rollback snapshots (6 x 768Ki floats) into the cache with two sequences configured
++    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {768*1024, 1, 6, 1}, {768*1024, 1, 6, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {768*1024, 2, 6, 1}));
+     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {768*1024, 256, 1, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
+     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {768, 1024, 256, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
+     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {768*1024, 256, 1, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));

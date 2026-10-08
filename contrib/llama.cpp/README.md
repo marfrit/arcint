@@ -1432,3 +1432,43 @@ MTP 2, 131,072 tokens of context):
   The B60 alone: 84.4 %, 408 and 19.8. The campaign gate (decode above the
   one-card arm) is not met yet:
   `docs/campaigns/layer-split-two-cards.md`.
+
+## 0025-opencl-strided-rows-f32-copy.patch
+
+A row-parallel f32 copy (`kernel_cpy_f32_f32_rows`) for same-shape copies
+with contiguous rows of at least 256 floats whose destination is not
+contiguous. Each work item moves one float4 of a row; one extra item copies a
+row's last up to 3 floats. Before it, ggml-opencl ran such copies through its
+generic `kernel_cpy_f32_f32`, one 64-item work-group a row.
+
+- **Which copy:** the case that mattered is the MTP snapshot write of the
+  hybrid models (`src/models/delta-net-base.cpp`, the recurrent state's
+  `1 + n_rs_seq` planes into a view whose planes are `mem_size` rows apart).
+  It is contiguous only when every configured sequence is in the ubatch.
+- **When it hit:** with two sequences configured (arcint's named lanes, or
+  `--parallel 2`) and one busy, each GDN layer's write took ~4.4 ms. A verify
+  of the dense Qwen3.8-27B took ~260 ms instead of ~55.
+- **Switch:** `GGML_OPENCL_CPY_FLAT=0` turns off this path and the flat one
+  (the old behaviour). The kernel is loaded as optional; without it the old
+  path runs.
+
+Measured on the B60 (`measured-here`, 2026-10-08):
+
+- **`test-backend-ops -o CPY`:** 146/146, with three new strided-destination
+  cases.
+  - The red case: the destination row stride taken from the source, the
+    mutation checked in the built kernel file. It fails 2 of 146; with the
+    old path forced the same build passes 146/146.
+  - A first mutant missed its target and passed 146/146; it ran the
+    unchanged kernel, so it is not counted.
+- **Perf, every CPY case:** the snapshot-sized case (786,432 floats x 6
+  planes into a strided view) 4,595.6 -> 95.2 us; two cases faster by more
+  than 10 %; none slower by more than 10 %.
+- **The dense Qwen3.8-27B** (Q4_K_M, q8_0 KV, MTP 5), the same 300-token
+  answer:
+  - one lane 41.0 t/s;
+  - two lanes with one busy 10.9 t/s before, 40.9 t/s after;
+  - the text byte-identical across the three, on two questions;
+  - both lanes decoding at once: 18.3 + 20.1 t/s; the subagent lane's text
+    identical to its run alone, the agent lane's diverging at char 372 into
+    an equivalent sentence.

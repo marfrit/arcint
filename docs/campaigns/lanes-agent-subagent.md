@@ -179,6 +179,26 @@ On the record before the work starts.
   - **The fix** (llama.cpp patch 0025): a row-parallel f32 copy kernel in
     ggml-opencl for strided rows. Same rows, same addresses, so the
     semantics are unchanged.
+- **Fixed** (llama.cpp patch 0025, `measured-here`, B60, the dense agent,
+  MTP 5, the same 300-token answer):
+
+  | arm | decode |
+  |---|---|
+  | one lane | 41.0 t/s |
+  | two lanes, one busy, before | 10.9 t/s |
+  | two lanes, one busy, after | 40.9 t/s |
+  | both lanes at once, after | 18.3 + 20.1 t/s |
+
+  - **Text:** byte-identical one lane / two lanes before / after, on two
+    questions. With both lanes at once the subagent lane is identical to
+    its run alone; the agent lane diverges at char 372 of 1,613 into an
+    equivalent sentence (a near-tie). Likely the shared pool's
+    interleaved cells changing the attention's reduction order; not
+    measured. Answer-level: right; the KL with both lanes busy is owed.
+  - **Next** (prior art: `research-agent-lanes.md`): batch both lanes
+    into one decode with drafts across the sequences (llama.cpp server
+    `update_slots`); decode before prefill; a per-lane draft budget as
+    the priority knob. Then Flash-Next's lane memory.
 - **Flash-Next with lanes** (5,500 and 7,500 MiB of slots): eviction both
   times; aborted, numbers void. llama.cpp reserves 6,679 MiB of OpenCL
   compute buffer: the 2,048-token prefill ubatch against the 163,840-cell
