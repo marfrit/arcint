@@ -1,3 +1,14 @@
+arcint (0.7.1-1) trixie; urgency=medium
+
+  * 0.7.1: llama.cpp patch 0027 fixes a defect shipped with patch 0022
+    (since 0.6.0): a llama.cpp batch whose ubatches mix sequences reused a
+    stale K-quant activation (KL 0.2438 against 0.0041 on the B60). arcint
+    decodes one sequence per call and was not affected; the fix matters for
+    llama.cpp's own batching with these patches. Runtime floor unchanged at
+    marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Thu, 08 Oct 2026 22:00:00 +0200
+
 arcint (0.7.0-1) trixie; urgency=medium
 
   * 0.7.0: named lanes on the libllama engine (--served-model-name A,B

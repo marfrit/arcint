@@ -13,6 +13,11 @@ A patch that does not apply cleanly to the pin is a bug in this directory, not
 a reason to move the pin. Each patch stays PR-shaped, so it can be offered
 upstream.
 
+A patch's KL check runs two arms: one sequence a batch, and four sequences a
+batch (`llama-perplexity -b 4*c`, ubatches that mix the sequences). arcint
+decodes one sequence per call, but llama.cpp's own batching does not. 0022
+shipped a defect only the second arm sees (fixed by 0027).
+
 ## 0001-opencl-intel-kquant-integer-dot-and-xmx.patch
 
 ggml's OpenCL kernels are tuned for Adreno; on Intel Arc the K-quant matrix
@@ -1340,7 +1345,7 @@ greedy. With the rest of the patch (2026-10-07): MTP 2 30.7-31.6 t/s
 (13,500-14,500 MiB), MTP 3 with arcint's `--llama-mtp-min-p 0.5` 31.3, the
 needle's prefill 383 t/s; the residents unchanged (38.2 / 43.5).
 
-**Known defect (found 2026-10-08, open):** with 0022 applied, a batch
+**Known defect (found 2026-10-08, fixed by 0027):** with 0022 applied, a batch
 whose ubatches mix sequences (llama.cpp's own batching: `llama-server -np
 N`, `llama-perplexity` with several sequences a batch) gives wrong logits
 on the B60. The dense Qwen3.8-27B scores KL 0.2438 (top-1 81.96 %) against
@@ -1558,3 +1563,51 @@ Q4_K_M, q8_0 KV, MTP 5; arcint's named lanes, 131,072 + 32,768):
   0.2438 / 81.96 %, with windows or without, unified or in separate streams.
   arcint decodes one sequence a call and never takes that path; see
   `docs/campaigns/lanes-agent-subagent.md` (on the `qfndev` branch).
+
+## 0027-opencl-kq-cache-stack-temporary.patch
+
+Fixes the known defect noted under 0022: a llama.cpp batch whose ubatches mix
+sequences gave wrong logits on the Intel path.
+
+- **The cache:** the Intel K-quant products convert their f32 activation once
+  per graph and reuse it for every product that shares the input (q/k/v,
+  gate/up). The four conversion slots (`kq_q8`, `kq_f16`, `kq_few`, `kq_i8`)
+  are keyed by the tensor, its buffer, offset and size, and the graph count.
+- **The temporary:** 0022's flat-columns path multiplies a 3D / 4D `src1` as
+  one 2D product through a stack copy (`ggml_tensor s1 = *src1`). That copy
+  has the same address in every call. ggml-alloc puts each layer's input at
+  the same offset, so layer N+1's product matched layer N's conversion and
+  multiplied stale data.
+- **When it hit:** a mixed ubatch's recurrent output projection
+  (`final_output`, [6144, 128, 4] for four sequences of 128 tokens) took the
+  flat path in every GDN layer. One sequence per ubatch keeps `src1` 2D and
+  never takes it.
+- **The fix:** after the flat product, a slot keyed by the temporary is
+  cleared (`ggml_cl_kq_forget`), also after the Adreno broadcast loop, which
+  builds the same kind of temporary (that build compiles; it is not arcint's).
+
+Found and measured on the B60 (`measured-here`, 2026-10-08; the dense
+Qwen3.8-27B Q4_K_M, q8_0 KV, `llama-perplexity` KL against the Q8 reference,
+16 chunks of 512, four sequences a batch):
+
+- **Before:** mixed ubatches score KL 0.2438, top-1 81.96 %; one sequence
+  scores 0.004099, top-1 97.745 %. Pin + 0001-0021 is right.
+- **Localised:**
+  - `GGML_OPENCL_KQ_DEDUP=0` alone fixes it;
+  - a per-node dump hides it (each node is its own graph);
+  - a log of every slot lookup and write shows `linear_attn_out-9` hitting
+    a slot that `linear_attn_out-8` had filled, whose key tensor then read
+    `final_output-9`.
+- **After:** mixed ubatches, unified or in separate streams, score 0.004099
+  and 97.745 %, the same as one sequence and as arcint's per-sequence path.
+- **Flash-Next** (its hyper-connection streams take the flat path as 3D
+  products): the capital, the 20k needle and a 300-token answer are
+  byte-identical with and without the patch (23.4 / 23.3 t/s, the served
+  flags at 32,768 tokens). No stale hit happened there.
+- **The dense agent** (one lane, q8_0 KV, MTP 5, 32k; its draft context
+  could take the flat path too): with and without the patch, the same text
+  on two prompts, the same draft acceptance (172/634 and 1159/2005), and the
+  same acceptance-task code (10/10).
+- arcint decodes one sequence per call, so its served path never took the
+  stale hit. The patch matters for llama.cpp's own batching with these
+  patches (`llama-server -np N`) and for batching lanes into one decode.

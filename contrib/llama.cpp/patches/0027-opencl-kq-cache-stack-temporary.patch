@@ -1,0 +1,39 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 5088b0e..8804d7c 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -25467,6 +25467,18 @@ static bool ggml_cl_kq_cached(const ggml_cl_kq_act & c, const ggml_backend_openc
+     return dd_on && c.src1 == src1 && c.gen == backend_ctx->graph_gen && c.mem == mem && c.off == off && c.n == n_vals;
+ }
+ 
++// a product through a temporary src1 (a stack copy): the next call's copy has the same
++// address, so an activation cached under it would match another tensor's input at the
++// same buffer offset and hand it this one's conversion. Forget the temporary after the
++// product (the slots are keyed by the tensor, its buffer, offset and size in this graph)
++static void ggml_cl_kq_forget(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * tmp) {
++    for (ggml_cl_kq_act * a : { &backend_ctx->kq_q8, &backend_ctx->kq_f16, &backend_ctx->kq_few, &backend_ctx->kq_i8 }) {
++        if (a->src1 == tmp) {
++            *a = {};
++        }
++    }
++}
++
+ static void ggml_cl_kq_quantize_src1(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src1,
+                                      int n_vals, const ggml_tensor * dst) {
+     ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+@@ -26008,6 +26020,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+             s1.ne[1] = fc; s1.ne[2] = s1.ne[3] = 1; s1.nb[2] = s1.nb[3] = fc * s1.nb[1];
+             d.ne[1]  = fc; d.ne[2]  = d.ne[3]  = 1; d.nb[2]  = d.nb[3]  = fc * d.nb[1];
+             ggml_cl_mul_mat(backend, src0, &s1, &d);
++            ggml_cl_kq_forget(backend_ctx, &s1);
+             return;
+         }
+     }
+@@ -26184,6 +26197,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                 d.ne[2] = 1; d.ne[3] = 1;
+                 d.view_offs = dst->view_offs + (size_t)i12*nb2 + (size_t)i13*nb3;
+                 ggml_cl_mul_mat(backend, src0, &s1, &d);
++                ggml_cl_kq_forget(backend_ctx, &s1);
+             }
+         }
+         return;

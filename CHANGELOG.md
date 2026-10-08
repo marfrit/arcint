@@ -18,6 +18,31 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.7.1 — 2026-10-08
+
+**Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine
+builds llama.cpp `bed0a85` with `contrib/llama.cpp/patches` 0001-0027.
+
+- **Patch 0027** fixes the known defect of 0.6.0 and 0.7.0.
+  - **The cause:** 0022's flat-columns path multiplies a 3D / 4D activation
+    through a stack copy whose address repeats on every call, and the Intel
+    K-quant activation cache keys on that address. In a llama.cpp batch whose
+    ubatches mix sequences, layer N+1's recurrent output projection reused
+    layer N's converted activation.
+  - **Measured** (`measured-here`, B60, the dense Qwen3.8-27B, four sequences
+    a batch): KL 0.2438 / top-1 81.96 % before; 0.004099 / 97.745 % after,
+    equal to one sequence.
+  - **Not affected** (`measured-here`, with and without the patch): arcint's
+    served path decodes one sequence per call.
+    - The dense agent with MTP 5: the same text, the same draft acceptance
+      and the same acceptance-task code (10/10 at 32k).
+    - Flash-Next: the capital, the 20k needle and a 300-token answer
+      byte-identical.
+  - **The Adreno build:** its broadcast loop takes the same kind of stack
+    temporary and is covered too.
+- **A patch's KL check** now has a four-sequence arm
+  (`contrib/llama.cpp/README.md`).
+
 ## 0.7.0 — 2026-10-08
 
 **Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine
