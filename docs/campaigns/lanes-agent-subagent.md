@@ -152,6 +152,24 @@ On the record before the work starts.
     So the card does ~5x the work per verify with two sequences.
   - **Next:** a per-kernel profile of one verify, one lane against two, to
     name the kernel that scales with the sequences.
+- **The kernel** (`measured-here`, unitrace `-d --opencl`, the same
+  300-token answer, one sequence against two configured with one busy):
+  every kernel's device time is equal within 1 % except ggml-opencl's
+  generic `kernel_cpy_f32_f32`:
+
+  | | calls | time |
+  |---|---|---|
+  | one sequence | 2,734 | 8.6 ms |
+  | two sequences | 8,926 | 27,366 ms |
+
+  The 6,192 extra calls equal the `kernel_gated_delta_net_pp` calls.
+- **The likely source** (`code`, `src/llama-graph.cpp` `build_rs`):
+  - Every graph copies the recurrent memory's "extra states", rows
+    `[n_seqs, n_rs)`, onto themselves with `get_rows` + `ggml_cpy`. The
+    comment says they "won't be changed further".
+  - With a second sequence configured, the range apparently spans that
+    sequence's rows and its MTP snapshots (`1 + n_rs_seq` a sequence).
+  - The fix is in llama.cpp (patch 0025), after checking upstream for one.
 - **Flash-Next with lanes** (5,500 and 7,500 MiB of slots): eviction both
   times; aborted, numbers void. llama.cpp reserves 6,679 MiB of OpenCL
   compute buffer: the 2,048-token prefill ubatch against the 163,840-cell
