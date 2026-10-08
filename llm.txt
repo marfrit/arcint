@@ -1,14 +1,16 @@
 # arcint
 
-> Narrow LLM inference engine for Intel Arc GPUs (Arc A770 16 GiB, Arc Pro
-> B60 24 GB). Serves an allowlist of hybrid GatedDeltaNet/attention Qwen
-> models: Qwen3.6-27B-A3B-Coder and Qwen3.6-35B-A3B (qwen3_5_moe), Qwen3.8-27B
-> dense (qwen3_5, also from a GGUF), Qwen3.8 Flash-Next (qwen4_exp). Uses
-> OpenVINO as compiler and kernel library, with a published patch series on a
-> pinned nightly; owns scheduling, the paged KV cache, the GDN recurrent-state
-> rows, prefix caching, speculative decoding, sampling, and HTTP serving.
-> NInfer philosophy (specialize, then be honest about numbers), Intel
-> substrate.
+> Intel Arc LLM inference engine, deliberately narrow (Arc A770 16 GiB, Arc
+> Pro B60 24 GB), with an OpenAI-compatible HTTP API. Serves an allowlist:
+> the hybrid GatedDeltaNet/attention Qwens Qwen3.6-27B-A3B-Coder and
+> Qwen3.6-35B-A3B (qwen3_5_moe), Qwen3.8-27B dense (qwen3_5) and Qwen3.8
+> Flash-Next (qwen4_exp), plus Cydonia 24B (llama) for writing. Two engines:
+> OpenVINO with a published GPU-plugin patch series on a pinned nightly, and
+> libllama (llama.cpp with arcint's OpenCL kernels for Intel). arcint owns
+> scheduling, the KV cache and the GDN recurrent state, prefix caching and
+> context checkpoints, admission, expert placement, speculative decoding,
+> sampling and HTTP serving. NInfer philosophy (specialize, then be honest
+> about numbers), Intel substrate.
 
 ## Status (0.6.0)
 
@@ -61,9 +63,14 @@ Served configurations:
 - agent (from 0.5.6): Qwen3.8-27B Q4_K_M GGUF on the libllama engine, B60,
   --llama-kv q8_0, --n-ctx 131072, MTP 5 drafts from a 40,960-id head.
   Acceptance task 8/10 greedy, sampled mean 7.4 over 30 (f16: 8.13, within
-  the noise); decode 47.1 t/s on its prompt; a 128,133-token
-  prompt prefills at 166 t/s, then decodes at 7.5 t/s (0.5.6); at 62,597
-  tokens of depth 0.5.7 decodes at 15.6 t/s (0.5.6: 11.0). Before 0.5.6:
+  the noise); decode 47.1 t/s on its prompt; at 62,597 tokens of depth
+  0.5.7 decodes at 15.6 t/s (0.5.6: 11.0). Depth re-measured 2026-10-08
+  (the development build, one lane: the same path as 0.6.0 by code; the
+  repository's source as context, cold prefix, 400 tokens greedy):
+  4,109 / 28,833 / 129,981 prompt tokens prefill at 824-910 / 589-638 /
+  252-272 t/s and decode at 36.6 / 32.3 / 19.3 t/s with MTP 5 (37-47 % of
+  drafts accepted), 18.4 / 15.1 / 9.7 t/s without; the 130k answer right
+  (0.5.6 had 166 t/s prefill and 7.5 t/s decode at 128k). Before 0.5.6:
   qwen38-b7c1-ov on OpenVINO, i8:u8 KV, 122,880 tokens, DFlash2 drafter,
   prefix cache 8 GiB, host KV tier 4 GiB.
 
@@ -429,6 +436,28 @@ misc
   --llama-mtp-vocab FILE    libllama: the token ids the MTP head may draft
                             (int32, or a JSON list): a draft step reads only
                             those rows of the output head
+  --llama-mtp-gguf FILE     libllama: the MTP layer from this MTP-only GGUF
+                            (llama.cpp's converter --mtp) instead of the
+                            model's own file
+  --llama-mtp-min-p P       libllama: stop drafting at a token the MTP head
+                            gives less than P, and leave it out of the verify
+                            (0-1; 0 off: always --llama-mtp drafts)
+  --llama-checkpoints N     libllama: per lane, up to N snapshots of a hybrid
+                            model's recurrent state (near the prompt's end,
+                            at user messages), so a follow-up or an edited
+                            message resumes instead of re-prefilling
+                            (default 32; 0 off)
+  --llama-checkpoint-step T libllama: the least spacing of snapshots at
+                            earlier user messages (default 8192)
+  --llama-expert-cache MIB  libllama: MIB of expert slots on the card for the
+                            MoE layers --llama-cpu-moe keeps in host memory;
+                            the other experts in a bank in host memory (pinned)
+                            read by the card over the link; hot experts swapped
+                            in during decode. The card also holds a Q8_0 down
+                            projection's bank and a gather mirror beyond MIB
+                            (default 0, off; contrib/llama.cpp 0021)
+  --llama-expert-profile F  libllama: the expert ranking that fills the cache
+                            (Strata's STRP profile; default round robin)
   --llama-kv K[:V]          libllama: the attention cache types, f16, q8_0 or
                             q8_0:q4_0 (default f16): q8_0 takes the cache to
                             53 %, q8_0:q4_0 to 41 %
