@@ -177,12 +177,12 @@ across the Arc Pro B60 (Xe2) and the Arc A770 (Xe-HPG), with
 - **Two OpenCL platforms:** Intel's runtime lists the two generations as two
   platforms. `contrib/llama.cpp` 0023 gives each its own context and builds
   every kernel for its own card.
-- **Measured** at 131,072 tokens of context (`measured-here`): every expert
-  of the A770's eight layers is held on the A770, and 90 % of all routed
-  experts are on a card, against 84 % on the B60 alone.
-  - With the MTP draft on the B60 (`--llama-mtp-card 0`) and the split at
-    layer 36, it decodes 21.7 t/s against the B60 alone's 19.8 (18.6 with
-    the draft on the A770, whose PCIe 3.0 x4 link is the slower path).
+- **Measured** at 131,072 tokens of context (`measured-here`; the B60
+  alone: 19.8 t/s, 84.4 % of routed experts on the card):
+  - split at layer 40: the A770 holds every expert of its eight layers and
+    90.4 % of all routed experts are on a card; 18.6 t/s with the MTP draft
+    on the A770, 20.4 with it on the B60 (`--llama-mtp-card 0`);
+  - split at layer 36 with the draft on the B60: 21.7 t/s, 93.5 % on a card.
 
 **An agent and a subagent lane on one set of weights** (since 0.7.0;
 `--served-model-name A,B --lane-ctx CA,CB`): the request's `model` field

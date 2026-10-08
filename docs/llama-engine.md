@@ -175,7 +175,9 @@ above, each by its own OpenCL platform (`GGML_OPENCL_DEVICES`); two cards
 need K, there is no automatic split. arcint reads n_layer from the GGUF
 (`<arch>.block_count`, MTP layers included) and sets `tensor_split` to
 {K - 0.5, n_layer + 1 - (K - 0.5)}, which places the boundary at K exactly
-(`src/exec/llama_layer_split.h`); K runs from 1 to n_layer - 1.
+(`src/exec/llama_layer_split.h`); K runs from 1 to the last layer that runs: the
+GGUF's MTP layers count only when this GGUF's MTP block is loaded
+(`--llama-mtp` without `--llama-mtp-gguf`).
 
 - `--llama-expert-cache A,B`: one expert cache per card, over its own layers,
   in `--device` order (MiB; 0 keeps none on that card): its own slots, its

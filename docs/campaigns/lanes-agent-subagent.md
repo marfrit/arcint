@@ -282,7 +282,11 @@ On the record before the work starts.
   - the capital and the needle right, 404 and 400 as before;
   - the acceptance task on the agent lane: 8/10 greedy; 10, 8, 10 sampled.
   The speed gate holds: the subagent stays at 32 t/s whatever the agent
-  lane holds, against a bar of 20.
+  lane holds, against a bar of 20. The answers gate's "acceptance task
+  10/10 on the agent lane" is **not met** as written: 8/10 greedy, the same
+  score and lost cases' count as the one-lane unit (four runs of four,
+  `docs/llama-engine.md`). Parity with the one-lane unit as the bar is the
+  operator's decision, asked at the release.
 - **KL** (`measured-here`, `llama-perplexity` with 0026's test switches,
   16 chunks of 512 against the Q8 reference, q8_0 KV): one sequence 0.004099
   (top-1 97.745 %). Four sequences decoded one at a time in a shared pool,

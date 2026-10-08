@@ -1541,12 +1541,15 @@ Q4_K_M, q8_0 KV, MTP 5; arcint's named lanes, 131,072 + 32,768):
   - subagent 4k with the agent at 29k: 37.5 t/s (38.0 with the pool empty);
   - agent 29k: 32.2 t/s, against 32.3 in a one-lane server;
   - the subagent's 300-token answer with the agent lane at about 20k, 64k
-    and 118k: 28.7 / 28.5 / 28.3 t/s, the same text each time. Before 0025
-    and this patch: 7.7 / 7.3 / 6.5. With 0025 alone, a 4k subagent cell
-    next to a 130k agent: 14.2.
+    and 118k: 32.1 / 32.0 / 32.0 t/s, the same text each time and the same
+    as the agent lane's alone (32.1 t/s). The first build, before the
+    search-head reset: 28.7 / 28.5 / 28.3. Before 0025 and this patch:
+    7.7 / 7.3 / 6.5. With 0025 alone, a 4k subagent cell next to a 130k
+    agent: 14.2;
+  - both lanes at once: 15.9 + 15.8 t/s, the sum of one lane's rate.
 - **Answers:** the capital and the 20k needle are right on both lanes. The
   acceptance task on the agent lane scores 8/10 greedy, as the one-lane
-  unit does, and 10, 10, 10 sampled.
+  unit does, and 10, 8, 10 sampled.
 - **KL** against the Q8 reference (`llama-perplexity`, 16 chunks of 512):
   - one sequence: 0.004099, top-1 97.745 %;
   - four sequences decoded one at a time in a shared pool: the same values
