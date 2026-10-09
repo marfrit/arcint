@@ -501,6 +501,12 @@ On the record before the work starts.
     (both busy: 22.3 + 20.9 t/s with it off). It fires on a short prompt
     tail over a deep context: 17-25 new tokens over 122,383 prefill in
     0.65-0.88 s with it, 1.35-1.59 s without. It stays on.
+  - **The gate on the release build** (`measured-here`, binary
+    `858818d40c2bf7eb`, with both fixes): 404 and 400 as before; the
+    capital and the 20k needle right on both lanes; the subagent's answer
+    with the agent at ~20k / 64k / 118k: 31.9 / 31.8 / 31.7 t/s; both lanes
+    at once 21.7 + 22.0 t/s (126 shared steps); the acceptance task on the
+    agent lane 8/10 greedy, 10, 10, 10 sampled.
 - **Flash-Next with lanes** (5,500 and 7,500 MiB of slots): eviction both
   times; aborted, numbers void. llama.cpp reserves 6,679 MiB of OpenCL
   compute buffer: the 2,048-token prefill ubatch against the 163,840-cell
