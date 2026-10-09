@@ -111,6 +111,7 @@ paths under `~/src/Strata-ref/`.
 |---|---|
 | [research-reference-audit](research-reference-audit.md) | Strata and FreeToken against arcint's record; the ranked levers |
 | [research-hybrid-expert-execution](research-hybrid-expert-execution.md) | CPU/GPU expert execution, Flash-Next comparables, Strata read at source |
+| [research-infernix](research-infernix.md) | Infernix (CUDA, Flash-Next on a 5090) at source: global LFRU cache, layer-walk prefill, shared prefix cache, CPU miss service; ranked for the B60 |
 | [research-hyperqwen](research-hyperqwen.md) | HyperQwen (vLLM, Qwen3.8-27B on one 3090) read at source: draft vocabulary, multi-row verify, lookup drafting |
 | [research-qsa](research-qsa.md) | serving Qwen Sparse Attention |
 | [research-speculative-cycle](research-speculative-cycle.md) | MTP and speculative cycles |
