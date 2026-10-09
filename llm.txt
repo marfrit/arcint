@@ -93,7 +93,8 @@ on the GPU.
   --llama-expert-profile (Strata's) --llama-mtp 2 --llama-mtp-gguf
   (tools/flash_next_mtp_gguf.sh). 20045-token needle: prefill 422 t/s;
   500-token answer: decode 33.0-34.8 t/s, 72-74 % of drafts accepted. KL
-  against a reference owed.
+  against unsloth's Q8_0 (2026-10-09): 0.294 nats, top-1 87.1 %, against
+  UD-Q3_K_XL's 0.100 / 93.3 %: the 2-bit quant misses the answer-level bar.
 - Qwen3.8-Flash-Next, qwen3.8-flash-next-d48q8 on the B60: --offload-ratio
   75 --moe-cpu-tier, census seed of 128 experts per layer, 30 GiB host
   expert bank, u8 KV, chunk 2048. At a 20085-token prompt: prefill 63.1 t/s,

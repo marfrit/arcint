@@ -165,7 +165,9 @@ patches 0059–0067).
 B60, 14,500 MiB of expert slots, MTP 2: the 20,045-token needle prefills at
 422 t/s, the 500-token long answer decodes at 33.0-34.8 t/s, the needle
 answered (0.6.0; Strata's own engine: 620 / 37.2-37.8 t/s on the same card).
-The KL of IQ2_XS against a reference is owed.
+Quality (`measured-here`, KL against unsloth's Q8_0, 16 x 512): IQ2_XS 0.294
+nats, top-1 87.1 %, against UD-Q3_K_XL's 0.100, 93.3 %; the 2-bit quant
+misses the answer-level bar, the served engine adds nothing to it.
 
 **One model across two different Arc cards** (since 0.7.0;
 `docs/campaigns/layer-split-two-cards.md`): Flash-Next split by layers

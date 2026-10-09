@@ -101,9 +101,32 @@ without `--mtp`, and a native pack refuses `--spec` below 2.
 Load: 495 s, almost all of it the slot fill and the mirror read from ZFS
 (0.11 GB/s), which is a load cost only.
 
-Owed: the quality of IQ2_XS against UD-Q3_K_XL at the answer-level bar
-(the existing KL reference is the UD-Q3_K_XL GGUF on the CPU, so it cannot
-judge a different quant); the task battery on Strata's answers.
+The quality of IQ2_XS against UD-Q3_K_XL at the answer-level bar (the
+earlier reference was the UD-Q3_K_XL GGUF on the CPU, which cannot judge a
+different quant).
+
+**Measured** (`measured-here`, 2026-10-09; `llama-perplexity` KL against
+unsloth's Q8_0 on the CPU backend, 16 chunks of 512, reference PPL 1.8554):
+
+| quant | mean KL | same top-1 | PPL ratio |
+|---|---|---|---|
+| UD-Q3_K_XL (CPU) | 0.1002 | 93.31 % | 1.042 |
+| IQ2_XS (CPU) | 0.2944 | 87.21 % | 1.140 |
+| IQ2_XS as served (B60, expert cache 9,500 MiB, `-ncmoe 48`) | 0.2941 | 87.08 % | 1.144 |
+
+- **The bar:** IQ2_XS misses the answer-level bar against UD-Q3_K_XL by
+  +0.194 nats and -6.2 points of top-1.
+- **The engine is faithful:** served and CPU agree within the error bars.
+  The loss is the 2-bit quant's.
+- **The quant's own record** (`paper` class): ISTA-DASLab report IQ2_XS
+  about 4 points under BF16 on AIME25 / GPQA-D / LCB v6, and IQ3_XXS within
+  0.6.
+- **Next:** the IQ3_XXS of the same series (75.8 GB), KL and speed.
+- **The served arm of UD-Q3_K_XL** was killed by the host's OOM (its pinned
+  expert bank is larger than data's RAM). The CPU arm measures the same
+  quant.
+
+Still owed: the task battery on Strata's answers.
 
 ## Where it lives
 

@@ -144,8 +144,11 @@ then the 500-token long answer, greedy, thinking off): prefill 421-431 t/s,
 decode 33.0-34.8 t/s with 72-74 % of the drafts accepted; the capital, the
 needle and the long answer right. Strata's own engine (its SYCL port, 37.2-37.8
 t/s decode, 620 t/s prefill on this card) is the reference
-(`docs/campaigns/strata-sycl-b60.md`). The KL of IQ2_XS against a reference
-is owed (the existing CPU reference is the UD-Q3_K_XL file).
+(`docs/campaigns/strata-sycl-b60.md`). Its quality, measured since
+(2026-10-09, KL against unsloth's Q8_0 on the CPU, 16 x 512): IQ2_XS 0.2944 nats
+and top-1 87.2 % on the CPU, 0.2941 / 87.1 % served on the B60, against
+UD-Q3_K_XL's 0.1002 / 93.3 %. The 2-bit quant misses the answer-level bar;
+the engine adds nothing to it.
 
 **The expert cache** (`--llama-expert-cache MIB --llama-expert-profile FILE`
 with `--llama-cpu-moe 48`; `contrib/llama.cpp` 0021 and 0022). The hot
