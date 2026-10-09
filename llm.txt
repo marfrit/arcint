@@ -12,7 +12,7 @@
 > sampling and HTTP serving. NInfer philosophy (specialize, then be honest
 > about numbers), Intel substrate.
 
-## Status (0.7.1)
+## Status (0.7.2)
 
 Runtime floor: marfrit-openvino +p25 = OpenVINO upstream commit 71640275 (the
 2026.4.0 nightly of 2026-08-21) + patches 0003-0074
@@ -23,7 +23,7 @@ and MOE_DOORBELL.
 Two engines (README "Two engines"): OpenVINO (default; Flash-Next, the
 coder's way back) and libllama (--engine llama --gguf, the agent service
 from 0.5.6, the coder service from 2026-10-05: llama.cpp
-bed0a85 with contrib/llama.cpp/patches 0001-0027, ggml's OpenCL backend,
+bed0a85 with contrib/llama.cpp/patches 0001-0029, ggml's OpenCL backend,
 arcint's Intel kernels; MTP from the GGUF's own head; --llama-kv q8_0 or
 q8_0:q4_0 quantizes its KV cache). libllama, measured-here:
 - coder (A770): decode 79.3 t/s with 4 drafts, prefill 1,431 t/s at 4k;
@@ -57,7 +57,11 @@ sequences configured and one busy (10.9 -> 40.9 t/s). 0.7.1: patch 0027
 fixes a defect shipped with 0022 (llama.cpp batches whose ubatches mix
 sequences reused a stale K-quant activation: KL 0.2438 -> 0.0041 on the
 B60); arcint decodes one sequence a call and was not affected (the dense
-agent and Flash-Next give the same answers with and without it). Every
+agent and Flash-Next give the same answers with and without it). 0.7.2:
+lanes in one decode. With MTP, two busy lanes share each draft and verify
+step in one llama_decode (patches 0028, 0029): 21.7 + 22.0 t/s on the dense
+agent against 15.9 + 15.8 taking turns, a lane alone unchanged, the mixed
+path's KL equal to one sequence (0.004099). Every
 number below is measured-here on the named card; DESIGN.md §7 has each one's
 standing value and evidence class. The dated measurement record, campaigns
 and design notes live on the development branch `qfndev`, not on `main`.

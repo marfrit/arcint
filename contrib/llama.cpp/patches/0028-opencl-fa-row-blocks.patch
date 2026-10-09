@@ -1,0 +1,41 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 8804d7c..c157f3f 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -19789,6 +19789,36 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     const int n_head_kv = k->ne[2];
+     const int n_batch = q->ne[3];
+ 
++    // Intel: 9 to 64 query rows (a verify of several sequences in one ubatch, as
++    // llama.cpp's server batches its slots: two lanes of 1 + 5 drafts are 12) in
++    // blocks of up to 8. The small-row kernels (the q1 split ones and the GQA one)
++    // take at most 8 rows, and the prefill kernel they would fall to costs a call
++    // its K/V conversion: two lanes' verifies at 4k spent 4.3 ms an attention call
++    // there (measured-here, B60). Rows are independent, so each block attends as
++    // the whole call would. GGML_OPENCL_FA_ROW_BLOCKS=0 keeps one call
++    {
++        static const char * rb_env = getenv("GGML_OPENCL_FA_ROW_BLOCKS");
++        static const bool   rb_on  = rb_env == nullptr || atoi(rb_env) != 0;
++        if (rb_on && backend_ctx->gpu_family == INTEL && n_q > 8 && n_q <= 64 && n_batch == 1 &&
++            q->type == GGML_TYPE_F32 && mask != nullptr && mask->ne[2] == 1) {
++            for (int r0 = 0; r0 < n_q; r0 += 8) {
++                const int nr = std::min(8, n_q - r0);
++                ggml_tensor qv = *q, dv = *dst, mv;
++                qv.ne[1]     = nr;
++                qv.view_offs = q->view_offs + (size_t) r0 * q->nb[1];
++                dv.ne[2]     = nr;
++                dv.view_offs = dst->view_offs + (size_t) r0 * dst->nb[2];
++                dv.src[0]    = &qv;
++                mv           = *mask;
++                mv.ne[1]     = nr;
++                mv.view_offs = mask->view_offs + (size_t) r0 * mask->nb[1];
++                dv.src[3]    = &mv;
++                ggml_cl_flash_attn(backend, &qv, k, &dv);
++            }
++            return;
++        }
++    }
++
+ #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+     if (ggml_cl_adreno_xmem_attn_can_use(backend_ctx, q, k, dst)) {
+         ggml_cl_adreno_xmem_attn_run(backend, q, k, dst);

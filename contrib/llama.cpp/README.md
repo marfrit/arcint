@@ -1611,3 +1611,84 @@ Qwen3.8-27B Q4_K_M, q8_0 KV, `llama-perplexity` KL against the Q8 reference,
 - arcint decodes one sequence per call, so its served path never took the
   stale hit. The patch matters for llama.cpp's own batching with these
   patches (`llama-server -np N`) and for batching lanes into one decode.
+
+## 0028-opencl-fa-row-blocks.patch
+
+Intel: an attention call with 9 to 64 query rows runs in blocks of up to 8.
+Each block is a recursive call on views: q's rows, the mask's rows and the
+output's rows, offset by their strides. The small-row kernels (the q1 split
+kernels and 0016's GQA kernel) take at most 8 rows. Without blocks, a verify
+of two lanes (12 rows) fell to the prefill kernel, which pays a K/V
+conversion every call. Rows of attention are independent, so a block attends
+as the whole call would. Calls without a mask (a kernel may derive causality
+from the row index) are not split. `GGML_OPENCL_FA_ROW_BLOCKS=0` keeps one
+call.
+
+Measured on the B60 (`measured-here`, 2026-10-09):
+
+- **`test-backend-ops -o FLASH_ATTN_EXT`:** 2805/2806 with and without
+  blocks; the one failure is the softcap case noted under 0022.
+  - The red case: the block's mask offset dropped fails 426 cases
+    (2380/2806); the same build with blocks off passes 2805.
+- **Two lanes of the dense 27B in shared verifies** (arcint's combiner, MTP
+  5): the prefill kernel had taken 2,034 calls at 4.3 ms. With 131,072 +
+  32,768 lanes, one such step outran xe's job timeout (an engine reset).
+  With blocks, a shared step takes 282 ms instead of 1,030.
+- **Since 0029** a shared step's attention runs one op per lane (about 6
+  rows each), so blocks no longer fire on the lanes' path: both lanes busy
+  decode 22.3 + 20.9 t/s with blocks off, as with them on. They fire on a
+  prompt tail of 9-64 tokens over a deep context (release review,
+  2026-10-09): a 17-25-token follow-up over the dense agent's 122,383 tokens
+  prefills in 0.65-0.88 s with blocks and 1.35-1.59 s without (three
+  follow-ups each, the same answers).
+
+## 0029-kv-windows-per-sequence-attention.patch
+
+0026's windows, inside a ubatch of several sequences. 0026 fell back to the
+whole stream's view there, so each sequence attended over every window's
+cells, masked. With this patch, when windows are set, flash attention is on
+and the ubatch is an equal split of windowed sequences, the attention
+builder runs one op per sequence. Each op takes the sequence's query rows,
+its window's K/V (`get_k_part`, `get_v_part`) and its slice of the mask. The
+slice is made contiguous once a graph and shared by all layers. The outputs
+are concatenated along the tokens.
+
+- `llama_kv_cache::get_win_parts` takes a ubatch whose tokens come in one
+  contiguous run per sequence, each sequence windowed: a hybrid memory's
+  equal split, or a batch that adds each sequence's tokens together (an MTP
+  draft context's split is simple, not equal). Otherwise the whole-stream
+  view stays, as before.
+- The mask spans every part's cells (`n_kv` up to the furthest window's
+  end).
+- The slot search of a mixed ubatch starts each window's head at its last
+  used cell at the latest, as 0026's single-sequence path does. Found in
+  the release review: without it a lane's verify cells went above the
+  previous step's high-water mark every step, and the rollback's freed
+  cells stayed holes. Measured (two lanes, 1,500 tokens each at once): a
+  lane's span of cells 3,070 for 1,525 tokens without the clamp, 1,524 for
+  1,518 with it; 53.4 s against 43.6 s for both answers.
+- Graph reuse compares the parts, also in the hybrid memory's input. That
+  one holds the attention input without registering it, so the attention
+  input's own check never ran there. Found in review: a graph built for
+  other parts (the lanes in another order, a window grown by a padding
+  step while the furthest end stayed) was reused with stale views.
+  - Measured (two lanes busy, a diagnostic on the new check): it refused 60
+    such reuses in two 300-token runs. Before the fix, acceptance with both
+    lanes busy was 23-26 %; after it, 28.0-28.2 %, as alone (28.2 %).
+  - `llama-perplexity`'s `LLAMA_PPL_SEQ_FLIP=1` (every other batch's
+    sequences in reverse order) did not reach it: another check refused the
+    reuse there, so it is no red case.
+
+Measured on the B60 (`measured-here`, 2026-10-09; the dense Qwen3.8-27B
+Q4_K_M, q8_0 KV):
+
+- **KL** against the Q8 reference, four sequences a batch in mixed ubatches,
+  windows on: 0.004099 / 97.745 %, equal to one sequence and to the same
+  batch without windows; the same with the slot-search clamp, per-sequence
+  decoding and the flipped order.
+  - The red case: every part's window offset forced to 0 gives 1.3291 /
+    61.79 % with windows; without windows the same build stays at 0.004099.
+- **Two lanes in shared steps** (131,072 + 32,768, MTP 5, a 300-token
+  answer on each at once, with the reuse fix): 21.6-21.7 t/s a lane, 43.3
+  together, against 15.9 + 15.8 taking turns. One lane's text equals its
+  run alone.

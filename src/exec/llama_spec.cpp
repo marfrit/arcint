@@ -418,93 +418,161 @@ public:
     size_t head_rows() const { return head_ ? head_->rows() : 0; }
 
     int decode(const int* toks, size_t n, size_t pos, int seq, bool all_logits) override {
-        Lane& ln = lanes_[static_cast<size_t>(seq)];
+        const SpecPart p{ seq, toks, n, pos, all_logits };
+        return decode_multi(&p, 1);
+    }
+
+    int decode_multi(const SpecPart* parts, size_t n_parts) override {
         llama_batch_ext_clear(bt_);
-        for (size_t i = 0; i < n; ++i)
-            if (!add(bt_, toks[i], pos + i, seq, all_logits, nullptr)) return -1;
+        for (size_t k = 0; k < n_parts; ++k)
+            for (size_t i = 0; i < parts[k].n; ++i)
+                if (!add(bt_, parts[k].toks[i], parts[k].pos + i, parts[k].seq, parts[k].all_logits, nullptr)) return -1;
         const int r = llama_process(ctx_tgt_, LLAMA_PROCESS_TYPE_DECODE, bt_);
         if (r != 0) return r;
-        const float* h_tgt = llama_get_embeddings_nextn(ctx_tgt_);
-        if (h_tgt == nullptr) return -1;
+        // unmasked: a row for every token, in batch order (llama.cpp puts a
+        // split batch's rows back in order, output_reorder)
+        const float* h_all = llama_get_embeddings_nextn(ctx_tgt_);
+        if (h_all == nullptr) return -1;
 
-        // the MTP context up to this batch's first token: rows a previous batch
-        // left pending, or, at a sequence's start, the reference's zero row
         clear_d();
-        if (ln.pending > 0 && ln.base + static_cast<size_t>(ln.pending) == pos) {
-            if (!add_pending(ln, toks[0], seq, false)) return -1;
-        } else {
-            ln.pending = 0;
-            if (ln.mtp_end == pos && !add(bd_, toks[0], pos, seq, false, zero_.data())) return -1;
-        }
         const size_t row_bytes = static_cast<size_t>(n_embd_) * sizeof(float);
-        if (all_logits) {
-            // a verify: which rows stand is known after the walk
-            ln.rows.assign(h_tgt, h_tgt + n * static_cast<size_t>(n_embd_));
-            ln.next.assign(toks + 1, toks + n);
-            ln.base    = pos;
-            ln.pending = static_cast<int>(n);
-        } else {
-            // a prompt: every row but the last is followed by a known token
-            for (size_t i = 0; i + 1 < n; ++i)
-                if (!add(bd_, toks[i + 1], pos + i + 1, seq, false, h_tgt + i * static_cast<size_t>(n_embd_))) return -1;
-            ln.rows.resize(static_cast<size_t>(n_embd_));
-            std::memcpy(ln.rows.data(), h_tgt + (n - 1) * static_cast<size_t>(n_embd_), row_bytes);
-            ln.next.clear();
-            ln.base    = pos + n - 1;
-            ln.pending = 1;
+        size_t       off       = 0;
+        for (size_t k = 0; k < n_parts; ++k) {
+            const SpecPart& p     = parts[k];
+            Lane&           ln    = lanes_[static_cast<size_t>(p.seq)];
+            const float*    h_tgt = h_all + off * static_cast<size_t>(n_embd_);
+            off += p.n;
+            // the MTP context up to this part's first token: rows a previous
+            // batch left pending, or, at a sequence's start, the reference's zero row
+            if (ln.pending > 0 && ln.base + static_cast<size_t>(ln.pending) == p.pos) {
+                if (!add_pending(ln, p.toks[0], p.seq, false)) return -1;
+            } else {
+                ln.pending = 0;
+                if (ln.mtp_end == p.pos && !add(bd_, p.toks[0], p.pos, p.seq, false, zero_.data())) return -1;
+            }
+            if (p.all_logits) {
+                // a verify: which rows stand is known after the walk
+                ln.rows.assign(h_tgt, h_tgt + p.n * static_cast<size_t>(n_embd_));
+                ln.next.assign(p.toks + 1, p.toks + p.n);
+                ln.base    = p.pos;
+                ln.pending = static_cast<int>(p.n);
+            } else {
+                // a prompt: every row but the last is followed by a known token
+                for (size_t i = 0; i + 1 < p.n; ++i)
+                    if (!add(bd_, p.toks[i + 1], p.pos + i + 1, p.seq, false, h_tgt + i * static_cast<size_t>(n_embd_)))
+                        return -1;
+                ln.rows.resize(static_cast<size_t>(n_embd_));
+                std::memcpy(ln.rows.data(), h_tgt + (p.n - 1) * static_cast<size_t>(n_embd_), row_bytes);
+                ln.next.clear();
+                ln.base    = p.pos + p.n - 1;
+                ln.pending = 1;
+            }
         }
         if (nd_ > 0) {
             const int rd = llama_process(ctx_dft_, LLAMA_PROCESS_TYPE_DECODE, bd_);
             if (rd != 0) return rd;
         }
-        ln.mtp_end = std::max(ln.mtp_end, pos + (all_logits ? 1 : n));
+        for (size_t k = 0; k < n_parts; ++k) {
+            Lane& ln   = lanes_[static_cast<size_t>(parts[k].seq)];
+            ln.mtp_end = std::max(ln.mtp_end, parts[k].pos + (parts[k].all_logits ? 1 : parts[k].n));
+        }
         return 0;
     }
 
     std::vector<int> draft(int seq, int id_last, size_t pos0, int n_max) override {
-        Lane&            ln = lanes_[static_cast<size_t>(seq)];
         std::vector<int> out;
-        const int        n  = std::min(n_max, n_draft_);
-        if (n <= 0 || ln.pending <= 0 || ln.base + static_cast<size_t>(ln.pending) != pos0) return out;
-        // the pending rows with what followed them; the last one's output is draft 0
-        // (kept if the MTP context refuses it: the verify's decode writes them)
-        const int pending = ln.pending;
+        DraftPart        p{ seq, id_last, pos0, n_max, &out };
+        draft_multi(&p, 1);
+        return out;
+    }
+
+    void draft_multi(DraftPart* parts, size_t n_parts) override {
+        // per part: its draft budget, its batch index in the current step, its
+        // carried row, whether it is still drafting, its pending count before
+        struct St {
+            int                n = 0, idx = -1, pending = 0;
+            bool               on = false;
+            std::vector<float> row;
+        };
+        std::vector<St> st(n_parts);
+        const bool      out_logits = head_ == nullptr;
         clear_d();
-        if (!add_pending(ln, id_last, seq, head_ == nullptr)) return out;
-        const float* row = nullptr;
-        for (int i = 0; i < n; ++i) {
+        bool any = false;
+        for (size_t k = 0; k < n_parts; ++k) {
+            DraftPart& p  = parts[k];
+            Lane&      ln = lanes_[static_cast<size_t>(p.seq)];
+            p.out->clear();
+            st[k].n = std::min(p.n_max, n_draft_);
+            if (st[k].n <= 0 || ln.pending <= 0 || ln.base + static_cast<size_t>(ln.pending) != p.pos0) continue;
+            // the pending rows with what followed them; the last one's output is draft 0
+            // (kept if the MTP context refuses it: the verify's decode writes them)
+            st[k].pending = ln.pending;
+            if (!add_pending(ln, p.id_last, p.seq, out_logits)) {
+                // its rows may already be in the shared batch: no drafts this step
+                // for any lane, every lane's pending rows as they were
+                ln.pending = st[k].pending;
+                for (size_t j = 0; j < k; ++j)
+                    if (st[j].on) lanes_[static_cast<size_t>(parts[j].seq)].pending = st[j].pending;
+                clear_d();
+                return;
+            }
+            st[k].idx = nd_ - 1;
+            st[k].on  = true;
+            any       = true;
+        }
+        for (int i = 0; any; ++i) {
             if (i > 0) {
                 clear_d();
-                if (!add(bd_, out.back(), pos0 + static_cast<size_t>(i), seq, head_ == nullptr, row)) break;
+                any = false;
+                for (size_t k = 0; k < n_parts; ++k) {
+                    if (!st[k].on) continue;
+                    if (i >= st[k].n || !add(bd_, parts[k].out->back(), parts[k].pos0 + static_cast<size_t>(i), parts[k].seq,
+                                             out_logits, st[k].row.data())) {
+                        st[k].on = false;
+                        continue;
+                    }
+                    st[k].idx = nd_ - 1;
+                    any       = true;
+                }
+                if (!any) break;
             }
             if (llama_process(ctx_dft_, LLAMA_PROCESS_TYPE_DECODE, bd_) != 0) {
-                if (i == 0) ln.pending = pending;
+                if (i == 0)
+                    for (size_t k = 0; k < n_parts; ++k)
+                        if (st[k].on) lanes_[static_cast<size_t>(parts[k].seq)].pending = st[k].pending;
                 break;
             }
-            if (i == 0) ln.mtp_end = pos0 + 1;
-            int tok = -1;
-            float prob = 1.0f;
-            const float* h = nullptr;
-            if (head_) {
-                h   = llama_get_embeddings_nextn_ith(ctx_dft_, nd_ - 1);   // unmasked: the batch index
-                tok = h != nullptr ? head_->pick(h, min_p_ > 0.0f ? &prob : nullptr) : -1;
-            } else {
-                const float* l = llama_get_logits_ith(ctx_dft_, -1);
-                h   = llama_get_embeddings_nextn_ith(ctx_dft_, -1);
-                tok = l != nullptr ? static_cast<int>(std::max_element(l, l + n_vocab_) - l) : -1;
-                if (tok >= 0 && min_p_ > 0.0f) prob = DraftHead::top_prob(l, static_cast<size_t>(n_vocab_), l[tok]);
+            any = false;
+            for (size_t k = 0; k < n_parts; ++k) {
+                if (!st[k].on) continue;
+                if (i == 0) lanes_[static_cast<size_t>(parts[k].seq)].mtp_end = parts[k].pos0 + 1;
+                int          tok  = -1;
+                float        prob = 1.0f;
+                const float* h    = nullptr;
+                if (head_) {
+                    h   = llama_get_embeddings_nextn_ith(ctx_dft_, st[k].idx);   // unmasked: the batch index
+                    tok = h != nullptr ? head_->pick(h, min_p_ > 0.0f ? &prob : nullptr) : -1;
+                } else {
+                    const float* l = llama_get_logits_ith(ctx_dft_, st[k].idx);
+                    h   = llama_get_embeddings_nextn_ith(ctx_dft_, st[k].idx);
+                    tok = l != nullptr ? static_cast<int>(std::max_element(l, l + n_vocab_) - l) : -1;
+                    if (tok >= 0 && min_p_ > 0.0f) prob = DraftHead::top_prob(l, static_cast<size_t>(n_vocab_), l[tok]);
+                }
+                // Strata's spec-min-p (src/core/mtp.cpp:804): the chain goes on while
+                // the drafts are likely enough to be verified; one below stays out
+                if (h == nullptr || tok < 0 || prob < min_p_) {
+                    st[k].on = false;
+                    continue;
+                }
+                parts[k].out->push_back(tok);
+                st[k].row.assign(h, h + n_embd_);
+                any = true;
             }
-            if (h == nullptr || tok < 0) break;
-            // Strata's spec-min-p (src/core/mtp.cpp:804): the chain goes on while
-            // the drafts are likely enough to be verified; one below stays out
-            if (prob < min_p_) break;
-            out.push_back(tok);
-            std::memcpy(h_step_.data(), h, static_cast<size_t>(n_embd_) * sizeof(float));
-            row = h_step_.data();
         }
         // the drafts leave; the entry of pos0 (id_last, a target row) stays
-        llama_memory_seq_rm(llama_get_memory(ctx_dft_), seq, static_cast<llama_pos>(pos0 + 1), -1);
-        return out;
+        for (size_t k = 0; k < n_parts; ++k)
+            if (st[k].idx >= 0)
+                llama_memory_seq_rm(llama_get_memory(ctx_dft_), parts[k].seq, static_cast<llama_pos>(parts[k].pos0 + 1), -1);
     }
 
     // as the reference starts a sequence: the next entry takes a zero row

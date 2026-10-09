@@ -132,9 +132,11 @@ Production (operator, 2026-10-04):
   tokens and `qwen3.8-subagent` at 32,768 on the B60; `contrib/llama.cpp`
   0026 gives each lane its own window of cells, so a lane attends over its
   own cells only. The subagent's 300-token answer decodes 32.0-32.1 t/s
-  whether the agent lane holds 20k, 64k or 118k tokens; both lanes at once
-  share the card (15.9 + 15.8 t/s); KL equal to one lane
-  (`docs/campaigns/lanes-agent-subagent.md` on the `qfndev` branch).
+  whether the agent lane holds 20k, 64k or 118k tokens; KL equal to one
+  lane. Since 0.7.2, with MTP, two busy lanes share each draft and verify
+  step in one decode (0028, 0029): 21.7 + 22.0 t/s at once, against 15.9 +
+  15.8 taking turns (`docs/campaigns/lanes-agent-subagent.md` on the
+  `qfndev` branch).
 
 `docs/llama-engine.md` has the details.
 

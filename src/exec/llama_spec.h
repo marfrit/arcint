@@ -16,6 +16,26 @@ struct llama_context;
 
 namespace lgc {
 
+// One lane's tokens in a target decode shared by several lanes: the target's
+// logits rows of a part start at the sum of the earlier parts' n
+struct SpecPart {
+    int        seq        = 0;
+    const int* toks       = nullptr;
+    size_t     n          = 0;
+    size_t     pos        = 0;
+    bool       all_logits = false;
+};
+
+// One lane's drafting in a draft step shared by several lanes: up to n_max
+// drafts after id_last at pos0, into *out
+struct DraftPart {
+    int               seq     = 0;
+    int               id_last = 0;
+    size_t            pos0    = 0;
+    int               n_max   = 0;
+    std::vector<int>* out     = nullptr;
+};
+
 class LlamaSpec {
 public:
     virtual ~LlamaSpec() = default;
@@ -26,6 +46,14 @@ public:
     // hidden row). The logits of token i are llama_get_logits_ith(ctx, i).
     // llama.cpp's return code.
     virtual int decode(const int* toks, size_t n, size_t pos, int seq, bool all_logits) = 0;
+    // Several lanes' tokens in one target decode (each lane's verify rows, as
+    // llama.cpp's server batches its slots), then one MTP-context decode with
+    // every lane's entries. The parts' sequences are distinct.
+    virtual int decode_multi(const SpecPart* parts, size_t n_parts) = 0;
+    // Several lanes' drafts, one MTP-context decode a draft step for all the
+    // lanes still drafting (llama.cpp's common_speculative_draft drafts for
+    // every slot at once). The parts' sequences are distinct.
+    virtual void draft_multi(DraftPart* parts, size_t n_parts) = 0;
     // Up to n_max tokens following `id_last` at position pos0.
     virtual std::vector<int> draft(int seq, int id_last, size_t pos0, int n_max) = 0;
     // The sequence's context no longer ends where the drafter's carried
