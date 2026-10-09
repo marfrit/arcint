@@ -24,7 +24,7 @@ pinned OpenVINO nightly 71640275 with patches 0003-0074
 Flash-Next tier's opt-in switches MOE_CPU_TIER_ADAPTIVE and MOE_DOORBELL.
 Two engines: OpenVINO (default; Flash-Next, the coder's way back) and
 libllama (the agent and, since 2026-10-05, the coder service; --engine llama --gguf,
-llama.cpp bed0a85 with contrib/llama.cpp/patches 0001-0027, ggml's OpenCL
+llama.cpp bed0a85 with contrib/llama.cpp/patches 0001-0029, ggml's OpenCL
 backend). The libllama engine decodes faster with the GGUF's MTP head.
 --llama-kv q8_0 (or q8_0:q4_0) quantizes its KV cache on arcint's
 attention kernels (0015). With MTP and an 8:8 cache the dense model serves
@@ -38,6 +38,11 @@ top-1 -0.10 points against Q4_K_M, acceptance 10/10). The libllama engine keeps 
 checkpoints (--llama-checkpoints): a follow-up after a thinking turn or an
 edited message resumes instead of re-prefilling (24.3k tokens: 38.75 s ->
 0.61 s on the B60, measured-here); no shared prefix cache across lanes.
+Release 0.7.2 (2026-10-09), measured-here: lanes in one decode. With MTP,
+two busy lanes share each draft and verify step in one llama_decode: 21.6 +
+21.7 t/s on the dense agent against 15.9 + 15.8 taking turns (+37 %), a lane
+alone unchanged, KL of the mixed path equal to one sequence
+(contrib/llama.cpp 0028, 0029; docs/campaigns/lanes-agent-subagent.md).
 Release 0.7.1 (2026-10-08): contrib/llama.cpp 0027 fixes 0022's defect (a
 llama.cpp batch mixing sequences reused a stale K-quant activation; KL 0.2438
 -> 0.0041 on the B60; arcint's per-sequence path was not affected).
@@ -56,8 +61,7 @@ Release 0.7.0 (2026-10-08), measured-here:
 - contrib/llama.cpp 0025: a row-parallel copy for the MTP snapshot write
   with two sequences configured and one busy (10.9 -> 40.9 t/s).
 Open work is one document per campaign under docs/campaigns/ (README
-there: rules, template, index). Next: batching both lanes into one decode;
-a prefix cache shared across lanes; multi-draft MTP for Flash-Next; prefill
+there: rules, template, index). Next: a prefix cache shared across lanes; multi-draft MTP for Flash-Next; prefill
 on the GPU.
 
 ## Current numbers (measured-here; card and configuration named)

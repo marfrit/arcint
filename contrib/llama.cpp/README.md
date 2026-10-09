@@ -1634,6 +1634,13 @@ Measured on the B60 (`measured-here`, 2026-10-09):
   5): the prefill kernel had taken 2,034 calls at 4.3 ms. With 131,072 +
   32,768 lanes, one such step outran xe's job timeout (an engine reset).
   With blocks, a shared step takes 282 ms instead of 1,030.
+- **Since 0029** a shared step's attention runs one op per lane (about 6
+  rows each), so blocks no longer fire on the lanes' path: both lanes busy
+  decode 22.3 + 20.9 t/s with blocks off, as with them on. They fire on a
+  prompt tail of 9-64 tokens over a deep context (release review,
+  2026-10-09): a 17-25-token follow-up over the dense agent's 122,383 tokens
+  prefills in 0.65-0.88 s with blocks and 1.35-1.59 s without (three
+  follow-ups each, the same answers).
 
 ## 0029-kv-windows-per-sequence-attention.patch
 
@@ -1653,6 +1660,13 @@ are concatenated along the tokens.
   view stays, as before.
 - The mask spans every part's cells (`n_kv` up to the furthest window's
   end).
+- The slot search of a mixed ubatch starts each window's head at its last
+  used cell at the latest, as 0026's single-sequence path does. Found in
+  the release review: without it a lane's verify cells went above the
+  previous step's high-water mark every step, and the rollback's freed
+  cells stayed holes. Measured (two lanes, 1,500 tokens each at once): a
+  lane's span of cells 3,070 for 1,525 tokens without the clamp, 1,524 for
+  1,518 with it; 53.4 s against 43.6 s for both answers.
 - Graph reuse compares the parts, also in the hybrid memory's input. That
   one holds the attention input without registering it, so the attention
   input's own check never ran there. Found in review: a graph built for
@@ -1670,7 +1684,8 @@ Q4_K_M, q8_0 KV):
 
 - **KL** against the Q8 reference, four sequences a batch in mixed ubatches,
   windows on: 0.004099 / 97.745 %, equal to one sequence and to the same
-  batch without windows.
+  batch without windows; the same with the slot-search clamp, per-sequence
+  decoding and the flipped order.
   - The red case: every part's window offset forced to 0 gives 1.3291 /
     61.79 % with windows; without windows the same build stays at 0.004099.
 - **Two lanes in shared steps** (131,072 + 32,768, MTP 5, a 300-token

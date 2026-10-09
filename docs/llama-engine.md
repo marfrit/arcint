@@ -561,10 +561,23 @@ A context is a multiple of 256, at most the model's trained context, at most
   memory refuses windows and keeps the whole-pool views, with a warning at
   load. The expert cache's counters are the model's: with more than one lane
   its per-request line is labelled process-wide.
-- **Both lanes busy**: arcint decodes one lane per `llama_decode`, so the
-  lanes take turns and their sum is one lane's rate (15.9 + 15.8 t/s against
-  32.1 alone). Batching them into one decode, as llama.cpp's server does, is
-  open.
+- **Both lanes busy** (since 0.7.2, with `--llama-mtp`): a step combiner
+  takes each lane's step. The first lane to arrive leads, waits up to 20 ms
+  for the other lanes still decoding, then drafts for all of them in one MTP
+  draft loop and verifies all of them in one target `llama_decode`, as
+  llama.cpp's server batches its slots. Accept and rollback stay per lane;
+  a failed shared decode is retried lane by lane. A lane that misses the
+  wait (its client stalls the stream) is not waited for again until it
+  posts. Such a step mixes
+  sequences in one ubatch: `contrib/llama.cpp` 0029 gives each sequence's
+  rows attention over its own window, and 0028 runs the 9-64 query rows of
+  a shared verify in blocks of 8 on 0016's kernel. Measured (`measured-here`,
+  the dense agent, MTP 5, B60): 21.6 + 21.7 t/s with both lanes busy against
+  15.9 + 15.8 taking turns (+37 %); a lane alone 31.7-31.8 t/s as before;
+  the mixed path's KL equals one sequence's (0.004099); the capital, the
+  needle and the acceptance task as on one lane
+  (`docs/campaigns/lanes-agent-subagent.md`). Without MTP the lanes still
+  take turns, one lane per `llama_decode`.
 
 ## Not yet on this engine
 

@@ -196,7 +196,9 @@ in which `contrib/llama.cpp` 0026 gives each lane its own window of cells,
 so a lane attends over its own cells only. Measured (`measured-here`, MTP
 5): the subagent's 300-token answer decodes 32.0-32.1 t/s whether the agent
 lane holds 20k, 64k or 118k tokens, the same text as the agent lane alone;
-both lanes at once share the card (15.9 + 15.8 t/s); KL equal to one lane.
+KL equal to one lane. Since 0.7.2 two busy lanes share each MTP draft and
+verify step in one decode (0028, 0029): 21.6 + 21.7 t/s at once, against
+15.9 + 15.8 taking turns.
 
 **Qwen3.8-Flash-Next**, full depth (`qwen3.8-flash-next-d48q8`) on the B60:
 `--offload-ratio 75 --moe-cpu-tier`, a 128-expert-per-layer census seed, a

@@ -472,6 +472,35 @@ On the record before the work starts.
   - both lanes at once: 21.6 + 21.7 t/s, against 15.9 + 15.8 taking turns;
   - the acceptance task on the agent lane: 8/10 greedy (parity, operator
     2026-10-08); 10, 10, 10 sampled.
+- **Release review for 0.7.2** (an outside model; each finding measured
+  with a diagnostic build on the B60 before its disposition, `measured-here`,
+  2026-10-09, lanes 131,072 + 32,768, MTP 5):
+  - **0029's mixed slot search never clamped a window's head** to its last
+    used cell, as 0026's single-sequence path does, so each shared step put
+    a lane's verify cells above the last step's and the rollback's freed
+    cells stayed holes. Two lanes, 1,500 tokens each at once: a lane's span
+    3,070 cells for 1,525 tokens without the clamp, 1,524 for 1,518 with
+    it; 53.4 s against 43.6 s; the slower lane 28.1 against 34.5 t/s.
+    Fixed in 0029. KL with the fix: 0.004099 in the one-sequence, mixed,
+    per-sequence and flipped arms.
+  - **A stalled lane cost the other lane the 20 ms wait every step**: the
+    leader waited for every lane in its decode loop, also one blocked in
+    its client's stream. Now a lane that misses a round's deadline is not
+    waited for until it posts again. The subagent's emit slowed by 50 ms a
+    token: the agent lane 21.7 -> 24.2 t/s.
+  - **Not a defect: the lane-by-lane retry of a failed shared step.** The
+    review read that a lane whose part the target already holds would be
+    decoded twice. An injected failure after the target's decode: both
+    lanes' retries were refused by llama.cpp ("inconsistent sequence
+    positions"), both requests got a 500, and both lanes answered the next
+    question right, the same as a build without the retry. The retry
+    stays; it lets the lane whose part was not committed (a later ubatch of
+    an uneven split) continue.
+  - **0028 on one lane:** with 0029 a shared step's attention is one op of
+    about 6 rows per lane, so 0028 no longer fires on the lanes' path
+    (both busy: 22.3 + 20.9 t/s with it off). It fires on a short prompt
+    tail over a deep context: 17-25 new tokens over 122,383 prefill in
+    0.65-0.88 s with it, 1.35-1.59 s without. It stays on.
 - **Flash-Next with lanes** (5,500 and 7,500 MiB of slots): eviction both
   times; aborted, numbers void. llama.cpp reserves 6,679 MiB of OpenCL
   compute buffer: the 2,048-token prefill ubatch against the 163,840-cell

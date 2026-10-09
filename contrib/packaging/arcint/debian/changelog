@@ -1,3 +1,16 @@
+arcint (0.7.2-1) trixie; urgency=medium
+
+  * 0.7.2: lanes in one decode. With --llama-mtp, two busy lanes share each
+    draft and verify step in one llama_decode instead of taking turns: the
+    dense agent's lanes decode 21.6 + 21.7 t/s at once against 15.9 + 15.8
+    (+37 %); a lane alone is unchanged. llama.cpp patches 0028 (OpenCL flash
+    attention of 9-64 rows in blocks of 8) and 0029 (per-sequence attention
+    in a ubatch that mixes sequences; a window's slot search starts at its
+    last used cell). A stalled lane is no longer waited for every step.
+    Runtime floor unchanged at marfrit-openvino +p25.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Fri, 09 Oct 2026 12:00:00 +0200
+
 arcint (0.7.1-1) trixie; urgency=medium
 
   * 0.7.1: llama.cpp patch 0027 fixes a defect shipped with patch 0022

@@ -17,6 +17,45 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## 0.7.2 — 2026-10-09
+
+**Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine
+builds llama.cpp `bed0a85` with `contrib/llama.cpp/patches` 0001-0029.
+
+- **Lanes in one decode.** With `--llama-mtp`, two busy lanes no longer take
+  turns: a step combiner takes each lane's step, and the lane that arrives
+  first drafts for every waiting lane in one MTP draft loop and verifies
+  them in one target `llama_decode`, as llama.cpp's server batches its
+  slots. Accept and rollback stay per lane; a failed shared decode is
+  retried lane by lane. Without MTP the lanes take turns as before.
+  - **Measured** (`measured-here`, the dense agent, Qwen3.8-27B Q4_K_M, MTP
+    5, the B60): 21.6 + 21.7 t/s with both lanes busy, against 15.9 + 15.8
+    taking turns (+37 %); a lane alone 31.7-31.8 t/s, unchanged; the
+    capital, the 20k needle and the acceptance task as on one lane (8/10
+    greedy; 10, 10, 10 sampled).
+  - **KL** of the mixed path against the Q8 reference equals one
+    sequence's (0.004099).
+  - **Release review** (an outside model): a lane that misses a round's
+    deadline (a client stalling the stream) is no longer waited for until
+    it posts again. With the subagent's emit slowed by 50 ms a token, the
+    agent lane decodes 24.2 t/s against 21.7 before. The lane-by-lane retry
+    of a failed shared step was suspected of decoding twice; an injected
+    failure showed llama.cpp refusing positions the target already holds,
+    so the retry stays.
+- **Patch 0028:** Intel OpenCL flash attention with 9-64 query rows runs in
+  blocks of 8 on 0016's verify kernel instead of the prefill kernel (a
+  shared verify's 12 rows took 4.3 ms a call there).
+  `GGML_OPENCL_FA_ROW_BLOCKS=0` turns it off. It also speeds up a short
+  follow-up over a deep context: 17-25 new tokens over 122k prefill in
+  0.65-0.88 s, against 1.35-1.59 s.
+- **Patch 0029:** in a ubatch that mixes sequences, each sequence's
+  contiguous run of rows attends over its own KV window (0026), one flash
+  attention per run, instead of the whole pool's view. A graph is reused
+  only for the same runs. The slot search starts each window at its last
+  used cell (release review): without it a lane's cells spread to twice
+  its tokens over a long answer (3,070 for 1,525), and both lanes' 1,500
+  tokens took 53.4 s against 43.6.
+
 ## 0.7.1 — 2026-10-08
 
 **Runtime:** `marfrit-openvino +p25` remains the floor; the libllama engine

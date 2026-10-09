@@ -107,10 +107,25 @@ index 3daa425..a45b212 100644
      ggml_tensor * self_k_rot = nullptr;
      ggml_tensor * self_v_rot = nullptr;
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index dab9cf9..5c55f9e 100644
+index dab9cf9..897b4e9 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -1288,6 +1288,39 @@ int32_t llama_kv_cache::win_of(uint32_t idx) const {
+@@ -1039,7 +1039,14 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+             if (mixed) {
+                 // a ubatch of several sequences (a hybrid memory's equal split) has no single window:
+                 // each token takes a cell in its own sequence's window, and the views span the stream
++                // each window's search head at its last used cell at the latest, as in the
++                // single-sequence path below: a rollback's freed cells refill first
+                 std::vector<uint32_t> heads = win_head;
++                for (size_t sj = 0; sj < heads.size(); ++sj) {
++                    if (win_size[sj] > 0) {
++                        heads[sj] = std::min(heads[sj], cells.used_max_p1_in(win_base[sj], win_base[sj] + win_size[sj]));
++                    }
++                }
+                 std::vector<uint8_t>  taken_map(cells.size(), 0);
+                 for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                     const llama_seq_id si = ubatch.seq_id[i][0];
+@@ -1288,6 +1295,39 @@ int32_t llama_kv_cache::win_of(uint32_t idx) const {
      return -1;
  }
  
@@ -150,7 +165,7 @@ index dab9cf9..5c55f9e 100644
  bool llama_kv_cache::set_seq_windows(const uint32_t * n_cells, int32_t n_seq) {
      if (n_seq <= 0) {
          win_base.clear();
-@@ -3011,6 +3044,17 @@ bool llama_kv_cache_context::apply() {
+@@ -3011,6 +3051,17 @@ bool llama_kv_cache_context::apply() {
      kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
      n_kv = kv->get_n_kv(sinfos[i_cur]);
  
@@ -168,7 +183,7 @@ index dab9cf9..5c55f9e 100644
      return true;
  }
  
-@@ -3028,6 +3072,20 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
+@@ -3028,6 +3079,20 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
      return n_kv;
  }
  
