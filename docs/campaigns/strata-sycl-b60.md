@@ -138,9 +138,21 @@ unsloth's Q8_0 on the CPU backend, 16 chunks of 512, reference PPL 1.8554):
 - **IQ3_XXS with llama.cpp 0030** (an IQ2_XS kernel set, `measured-here`,
   2026-10-09, the same arm). All 48 layers are cached: 7,814 slots
   (13.03 GiB) and a 27.43 GiB bank. The answers are right.
-  - The 300-token answer decodes at 27.6-28.0 t/s from the second answer
-    on. The first answer of a process runs at 6.3-9.3 t/s: the cache hits
-    86.8 % against 93.5 % warm, and xe evicts nothing (fdinfo).
+  - **Retracted (2026-10-09):** "27.6-28.0 t/s from the second answer on",
+    and its "first answer slower: hit rate 86.8 % against 93.5 %".
+    - Those runs repeated one prompt, so the pages each answer reads were
+      already in the page cache.
+    - Three different prompts per process: 4.2-5.0 t/s on every answer.
+      Each takes 4,000-4,700 major page faults and 860-1,005 MiB of storage
+      reads, from the ZFS pool where the IQ3_XXS files sit. The faults and
+      bytes were counted per request from `/proc/<pid>/stat` and `io`.
+    - IQ2_XS on the ext4 NVMe reads up to 600 MiB an answer and decodes
+      ~33 t/s.
+    - Which mmap'd region the reads come from (likely the 26.8 GiB n-gram
+      shard) is not attributed. xe evicts nothing (fdinfo).
+    - Before 0030 (3.7 t/s) the same storage bound applied, so 0030's speed
+      gain on this pool is small. The kernels' correctness and the KL
+      stand.
   - KL as served: 0.2180 / 89.90 %, equal to the CPU arm (0.2211 /
     89.73 %): the kernels are faithful, and the quant is still short of
     the bar against UD-Q3_K_XL (+0.118 nats, -3.4 points).

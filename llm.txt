@@ -99,9 +99,10 @@ on the GPU.
   500-token answer: decode 33.0-34.8 t/s, 72-74 % of drafts accepted. KL
   against unsloth's Q8_0 (2026-10-09): 0.294 nats, top-1 87.1 %, against
   UD-Q3_K_XL's 0.100 / 93.3 %: the 2-bit quant misses the answer-level bar.
-  The series' IQ3_XXS: 0.221 / 89.7 %, also short; served 27.6-28.0 t/s warm
-  with contrib/llama.cpp 0030 (its 10 layers of IQ2_XS gate/up experts in the
-  expert cache; 3.7 t/s without), KL as served 0.218.
+  The series' IQ3_XXS: 0.221 / 89.7 %, also short; with contrib/llama.cpp
+  0030 every layer is cached (KL as served 0.218), but from the ZFS pool it
+  decodes 4-5 t/s, bound by ~1 GB of storage reads an answer (an earlier
+  28 t/s was a warm page cache from a repeated prompt, retracted).
 - Qwen3.8-Flash-Next, qwen3.8-flash-next-d48q8 on the B60: --offload-ratio
   75 --moe-cpu-tier, census seed of 128 experts per layer, 30 GiB host
   expert bank, u8 KV, chunk 2048. At a 20085-token prompt: prefill 63.1 t/s,

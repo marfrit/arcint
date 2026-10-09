@@ -1733,15 +1733,15 @@ Measured (`measured-here`, 2026-10-09):
   - all 48 layers cached (38 before);
   - 7,814 slots on the card and a 27.43 GiB bank in host memory;
   - the capital, the 20k needle and the long answer right;
-  - the 300-token answer decodes at 27.6-28.0 t/s from the second answer on,
-    against 3.7 t/s without the patch.
-  - The first long answer of a process is slower: 8.2-9.3 t/s after the
-    needle and 6.3 without it.
-    - Not xe eviction: the process's GTT stays at the bank's 28.1 GB and
-      VRAM at 21.7 GB with 2.7 GB free on the card (fdinfo every 0.5 s).
-    - The cache hits 86.8 % of decode's routed experts there and 93.5 %
-      from the second answer on. Missed experts run on the CPU; that this
-      costs the 3x is likely, not measured.
+  - speed: 4.2-5.0 t/s on 300-token answers to three different prompts,
+    against 3.7 t/s without the patch. The decode is bound by storage
+    reads: 4,000-4,700 major faults and ~1 GB per answer from the ZFS pool
+    where this file sits. IQ2_XS on the NVMe decodes ~33 t/s.
+  - **Retracted:** "27.6-28.0 t/s from the second answer on". Those answers
+    repeated one prompt, whose pages were already in the page cache; the
+    "first answer slower because of the hit rate" reading goes with it.
+  - xe evicts nothing: the process's GTT stays at the bank's 28.1 GB
+    (fdinfo every 0.5 s).
 - **KL as served** (16 x 512 against unsloth's Q8_0): 0.2180 nats, top-1
   89.90 %. The CPU arm gives 0.2211 / 89.73 %, within the error bars.
 

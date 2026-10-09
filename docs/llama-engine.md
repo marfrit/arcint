@@ -151,8 +151,11 @@ UD-Q3_K_XL's 0.1002 / 93.3 %. The 2-bit quant misses the answer-level bar;
 the engine adds nothing to it. The IQ3_XXS of the same series (0.2211 / 89.7 %)
 misses it too. 10 of its layers carry IQ2_XS gate/up experts, which the
 expert cache took only with `contrib/llama.cpp` 0030: before it, those layers
-ran on the CPU and the answer decoded at 3.7 t/s; with it, at 27.6-28.0 t/s
-warm (13,000 MiB of slots, MTP 2), KL as served 0.2180, equal to the CPU's.
+ran on the CPU. With it every layer is cached and the KL as served is 0.2180,
+equal to the CPU's. From the ZFS pool the answer still decodes at 4-5 t/s
+(3.7 before): about 1 GB of storage reads an answer
+(`docs/campaigns/strata-sycl-b60.md`; an earlier 28 t/s was a warm page
+cache from a repeated prompt, retracted).
 
 **The expert cache** (`--llama-expert-cache MIB --llama-expert-profile FILE`
 with `--llama-cpu-moe 48`; `contrib/llama.cpp` 0021 and 0022). The hot
